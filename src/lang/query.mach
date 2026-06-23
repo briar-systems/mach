@@ -53,7 +53,9 @@ pub def QueryKind: u16;
 pub val Q_PROJECT_ROOT: QueryKind = 0;
 # Q_TARGET: input — selected target description bytes.
 pub val Q_TARGET: QueryKind = 1;
-# Q_FILE_TEXT: metadata — per-file source text; revision read from SourceFile.revision.
+# Q_FILE_TEXT: input — per-file source text, keyed on src.FileId; set by
+# session.load_source. set_input's byte-equality cutoff is what makes an
+# unchanged file's Q_PARSE entry stay valid across rebuilds.
 pub val Q_FILE_TEXT: QueryKind = 2;
 # Q_TOKENIZE: derived — TokenStream for a file, keyed on src.FileId.
 pub val Q_TOKENIZE: QueryKind = 3;
@@ -93,9 +95,18 @@ pub val SHARD_METADATA: ShardRole = 2;
 # ComputeFn: the signature every derived query's compute function shares:
 # a pure function from `(db, key)` to a produced byte buffer. uniform
 # across all derived kinds, so it is a real typed function pointer with no
-# erasure. the function may call get on db for further deps; those reads
-# are recorded into the requesting entry's dep list by get itself.
+# erasure. the function records its inter-query deps via record_dep and
+# reaches the compiler's services (sources, interner, diagnostics) through
+# the opaque `db.ctx` the owner installs with set_ctx.
 pub def ComputeFn: fun(*QueryDb, u64, *Allocator) Result[QueryOutput, str];
+
+# FinalizeFn: releases the heavy artifact a derived query's opaque-handle
+# value refers to (an AST / resolve graph the handle bytes point at), called
+# by the engine just before it frees the handle buffer itself — on a
+# recompute that replaces the handle, on invalidate/remove, and in dnit. it
+# must not free the handle buffer; the engine does that. bound by
+# register_derived_owned; absent (nil) for plain byte-valued derived kinds.
+pub def FinalizeFn: fun(*u8, u32, *Allocator);
 
 # RevisionFn: the signature every metadata source's revision-lookup
 # shares: maps a key to that source's current revision. invoked by the
@@ -152,6 +163,11 @@ pub rec QueryEntry {
 # role:      input / derived / metadata discriminator
 # compute:   compute function for derived kinds; nil otherwise
 # revisions: revision-lookup function for metadata kinds; nil otherwise
+# finalize:  releases the heavy artifact behind an opaque-handle value
+#            (register_derived_owned); nil for plain byte-valued kinds. a
+#            non-nil finalize also marks the shard as never early-cutting —
+#            its handle differs every compute, so the value always replaces
+#            and the old handle is finalized
 # registered: whether a register_* call has claimed this shard
 # entries:   cached entries keyed by QueryEntry.key
 # len:       number of entries
@@ -161,6 +177,7 @@ pub rec QueryShard {
     role:       ShardRole;
     compute:    ComputeFn;
     revisions:  RevisionFn;
+    finalize:   FinalizeFn;
     registered: bool;
     entries:    *QueryEntry;
     len:        u32;
@@ -174,11 +191,15 @@ pub rec QueryShard {
 # revision: current revision; bumped by set_input
 # storage:  shard array indexed by kind
 # kinds:    number of shard slots allocated (length of storage)
+# ctx:      opaque context handle a derived ComputeFn casts back to reach the
+#           compiler's services (e.g. the Session); installed by set_ctx, nil
+#           until then
 pub rec QueryDb {
     alloc:    *Allocator;
     revision: Revision;
     storage:  *QueryShard;
     kinds:    u32;
+    ctx:      ptr;
 }
 
 val INITIAL_DEP_CAP:   u32 = 4;
@@ -195,6 +216,7 @@ pub fun init(alloc: *Allocator) Result[QueryDb, str] {
     db.revision = 0;
     db.storage  = nil;
     db.kinds    = 0;
+    db.ctx      = nil;
     ret ok[QueryDb, str](db);
 }
 
@@ -239,6 +261,49 @@ pub fun register_input(db: *QueryDb, kind: QueryKind) Result[bool, str] {
 # ret:     true on success, or an allocation error from growing the shard array
 pub fun register_derived(db: *QueryDb, kind: QueryKind, compute: ComputeFn) Result[bool, str] {
     ret register(db, kind, SHARD_DERIVED, compute, nil::RevisionFn);
+}
+
+# register_derived_owned: reserve shard `kind` as a derived query whose value
+# is an opaque handle onto a heavy heap artifact (a parsed AST, a resolve
+# graph) rather than the artifact's own bytes. the engine owns the artifact
+# through `finalize`, which it calls before freeing each handle, and never
+# applies output early-cutoff to the shard — the handle differs every compute
+# and the artifact propagates to consumers purely by input change. the
+# convention for pointer-graph artifacts in the byte-buffer DB; early cutoff
+# lives only at fingerprint queries (Q_EXPORTS).
+# ---
+# db:       the database
+# kind:     kind value to claim as a derived shard
+# compute:  the ComputeFn that produces the handle (and owns the artifact it points at)
+# finalize: releases the artifact a handle refers to; invoked by the engine on every free
+# ret:      true on success, or an allocation error from growing the shard array
+pub fun register_derived_owned(db: *QueryDb, kind: QueryKind, compute: ComputeFn, finalize: FinalizeFn) Result[bool, str] {
+    val r: Result[bool, str] = register(db, kind, SHARD_DERIVED, compute, nil::RevisionFn);
+    if (is_err[bool, str](r)) { ret r; }
+    val sh: *QueryShard = ?db.storage[kind::u32];
+    sh.finalize = finalize;
+    ret ok[bool, str](true);
+}
+
+# set_ctx: install the opaque context handle derived compute functions read
+# back through `db.ctx` to reach the compiler's services. the owner calls
+# this once the context (e.g. the Session) sits at its final address.
+# ---
+# db:  the database
+# ctx: opaque handle stored verbatim and never dereferenced by the engine
+pub fun set_ctx(db: *QueryDb, ctx: ptr) {
+    db.ctx = ctx;
+}
+
+# registered: whether shard `kind` has been claimed by a register_* call.
+# lets an owner lazily register a derived kind exactly once across rebuilds.
+# ---
+# db:   the database
+# kind: kind value to test
+# ret:  true when the shard is in range and registered
+pub fun registered(db: *QueryDb, kind: QueryKind) bool {
+    if (kind::u32 >= db.kinds) { ret false; }
+    ret (?db.storage[kind::u32]).registered;
 }
 
 # register_metadata: reserve shard `kind` as a metadata source. no value
@@ -334,7 +399,7 @@ fun remove_entry(db: *QueryDb, sh: *QueryShard, key: u64) {
     for (i < sh.len) {
         val e: *QueryEntry = ?sh.entries[i];
         if (e.key == key) {
-            free_entry(db, e);
+            free_entry(db, sh, e);
             val last: u32 = sh.len - 1;
             if (i != last) { sh.entries[i] = sh.entries[last]; }
             sh.len = last;
@@ -429,6 +494,7 @@ fun grow_storage(db: *QueryDb, need: u32) Result[bool, str] {
         sh.role       = SHARD_INPUT;
         sh.compute    = nil::ComputeFn;
         sh.revisions  = nil::RevisionFn;
+        sh.finalize   = nil::FinalizeFn;
         sh.registered = false;
         sh.entries    = nil;
         sh.len        = 0;
@@ -548,16 +614,23 @@ fun recompute(db: *QueryDb, sh: *QueryShard, e: *QueryEntry, key: u64) Result[*Q
     }
     val out: QueryOutput = unwrap_ok[QueryOutput, str](rout);
 
-    val same: bool = e.value_len == out.len
-        && mem.raw_equal(e.value::ptr, out.bytes::ptr, out.len::usize);
-    if (same) {
-        if (out.bytes != nil && out.len > 0) {
-            deallocate[u8](db.alloc, out.bytes, out.len::usize);
+    # owned-handle shards never early-cut: the handle differs every compute and
+    # the artifact behind it propagates by input change, so skip the byte
+    # comparison and always replace, finalizing the prior handle's artifact.
+    val owned: bool = sh.finalize != nil;
+    if (!owned) {
+        val same: bool = e.value_len == out.len
+            && mem.raw_equal(e.value::ptr, out.bytes::ptr, out.len::usize);
+        if (same) {
+            if (out.bytes != nil && out.len > 0) {
+                deallocate[u8](db.alloc, out.bytes, out.len::usize);
+            }
+            ret ok[*QueryEntry, str](e);
         }
-        ret ok[*QueryEntry, str](e);
     }
 
     if (e.value != nil && e.value_len > 0) {
+        if (owned) { sh.finalize(e.value, e.value_len, db.alloc); }
         deallocate[u8](db.alloc, e.value, e.value_len::usize);
     }
     e.value        = out.bytes;
@@ -623,8 +696,11 @@ fun reserve_deps(db: *QueryDb, e: *QueryEntry, need: u32) Result[bool, str] {
 }
 
 # free_entry: free an entry's owned value and deps buffers and zero their slots.
-fun free_entry(db: *QueryDb, e: *QueryEntry) {
+# on an owned-handle shard the value's artifact is finalized before the handle
+# buffer itself is freed.
+fun free_entry(db: *QueryDb, sh: *QueryShard, e: *QueryEntry) {
     if (e.value != nil && e.value_len > 0) {
+        if (sh.finalize != nil) { sh.finalize(e.value, e.value_len, db.alloc); }
         deallocate[u8](db.alloc, e.value, e.value_len::usize);
     }
     if (e.deps != nil && e.dep_cap > 0) {
@@ -642,7 +718,7 @@ fun free_shard_entries(db: *QueryDb, sh: *QueryShard) {
     if (sh.entries == nil) { ret; }
     var i: u32 = 0;
     for (i < sh.len) {
-        free_entry(db, ?sh.entries[i]);
+        free_entry(db, sh, ?sh.entries[i]);
         i = i + 1;
     }
     if (sh.cap > 0) {
@@ -682,6 +758,56 @@ fun t_tok_compute(db: *QueryDb, key: u64, alloc: *Allocator) Result[QueryOutput,
     out.bytes = buf;
     out.len = 1;
     ret ok[QueryOutput, str](out);
+}
+
+# t_live: live count of artifacts the owned-handle finalizer test tracks; the
+# compute bumps it, the finalizer drops it, so a balanced 0 at teardown means
+# every handle's artifact was finalized exactly once (no leak, no double-free).
+var t_live: i64 = 0;
+
+# t_handle_ptr: decode the opaque artifact pointer an owned-handle entry stores.
+fun t_handle_ptr(e: *QueryEntry) ptr {
+    if (e.value == nil || e.value_len::usize < $size_of(ptr)) { ret nil; }
+    val base: ptr = e.value::ptr;
+    val slot: *ptr = base::*ptr;
+    ret slot[0];
+}
+
+# t_owned_compute: allocate a heap artifact, bump the live count, and return its
+# pointer as an opaque handle. records a dep on Q_FILE_TEXT so an input change recomputes.
+fun t_owned_compute(db: *QueryDb, key: u64, alloc: *Allocator) Result[QueryOutput, str] {
+    val rr: Result[bool, str] = record_dep(db, Q_PARSE, key, Q_FILE_TEXT, key);
+    if (is_err[bool, str](rr)) { ret err[QueryOutput, str](unwrap_err[bool, str](rr)); }
+    val ra: Result[*u64, str] = allocate[u64](alloc, 1::usize);
+    if (is_err[*u64, str](ra)) { ret err[QueryOutput, str](unwrap_err[*u64, str](ra)); }
+    val art: *u64 = unwrap_ok[*u64, str](ra);
+    art[0] = key;
+    t_live = t_live + 1;
+
+    val n: u32 = $size_of(ptr)::u32;
+    val rb: Result[*u8, str] = allocate[u8](alloc, n::usize);
+    if (is_err[*u8, str](rb)) {
+        deallocate[u64](alloc, art, 1::usize);
+        t_live = t_live - 1;
+        ret err[QueryOutput, str](unwrap_err[*u8, str](rb));
+    }
+    val buf: *u8 = unwrap_ok[*u8, str](rb);
+    val slot: *ptr = buf::ptr::*ptr;
+    slot[0] = art::ptr;
+    var out: QueryOutput;
+    out.bytes = buf;
+    out.len   = n;
+    ret ok[QueryOutput, str](out);
+}
+
+# t_owned_finalize: release a handle's artifact and drop the live count.
+fun t_owned_finalize(value: *u8, value_len: u32, alloc: *Allocator) {
+    if (value == nil || value_len::usize < $size_of(ptr)) { ret; }
+    val slot: *ptr = value::ptr::*ptr;
+    val art: *u64 = slot[0]::*u64;
+    if (art == nil) { ret; }
+    deallocate[u64](alloc, art, 1::usize);
+    t_live = t_live - 1;
 }
 
 test "query: a failed recompute is not laundered into a cached success (#1249)" {
@@ -772,5 +898,49 @@ test "query: derived dep-tracking and early cutoff across input changes (#1242)"
     if (lc3 != lc_warm) { dnit(?db); ret 1; }
 
     dnit(?db);
+    ret 0;
+}
+
+test "query: owned-handle finalizer frees artifacts on recompute and dnit (#1580)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    val dr: Result[QueryDb, str] = init(?alloc);
+    if (is_err[QueryDb, str](dr)) { ret 1; }
+    var db: QueryDb = unwrap_ok[QueryDb, str](dr);
+    t_live = 0;
+
+    if (is_err[bool, str](register_input(?db, Q_FILE_TEXT))) { dnit(?db); ret 1; }
+    if (is_err[bool, str](register_derived_owned(?db, Q_PARSE, t_owned_compute, t_owned_finalize))) { dnit(?db); ret 1; }
+
+    # first get computes exactly one artifact behind the handle.
+    if (is_err[bool, str](set_input(?db, Q_FILE_TEXT, 1, "a"::*u8, 1))) { dnit(?db); ret 1; }
+    val g1: Result[*QueryEntry, str] = get(?db, Q_PARSE, 1);
+    if (is_err[*QueryEntry, str](g1)) { dnit(?db); ret 1; }
+    if (t_live != 1) { dnit(?db); ret 1; }
+    val p1: ptr = t_handle_ptr(unwrap_ok[*QueryEntry, str](g1));
+
+    # unchanged input: entry stays valid, no recompute, no new artifact, same handle.
+    if (is_err[bool, str](set_input(?db, Q_FILE_TEXT, 1, "a"::*u8, 1))) { dnit(?db); ret 1; }
+    val g2: Result[*QueryEntry, str] = get(?db, Q_PARSE, 1);
+    if (is_err[*QueryEntry, str](g2)) { dnit(?db); ret 1; }
+    if (t_live != 1) { dnit(?db); ret 1; }
+    if (t_handle_ptr(unwrap_ok[*QueryEntry, str](g2)) != p1) { dnit(?db); ret 1; }
+
+    # changed input: recompute replaces the handle and finalizes the prior artifact,
+    # so the live count stays balanced and the handle is a fresh pointer.
+    if (is_err[bool, str](set_input(?db, Q_FILE_TEXT, 1, "b"::*u8, 1))) { dnit(?db); ret 1; }
+    val g3: Result[*QueryEntry, str] = get(?db, Q_PARSE, 1);
+    if (is_err[*QueryEntry, str](g3)) { dnit(?db); ret 1; }
+    if (t_live != 1) { dnit(?db); ret 1; }
+    if (t_handle_ptr(unwrap_ok[*QueryEntry, str](g3)) == p1) { dnit(?db); ret 1; }
+
+    # a second key adds a second live artifact.
+    if (is_err[bool, str](set_input(?db, Q_FILE_TEXT, 2, "c"::*u8, 1))) { dnit(?db); ret 1; }
+    if (is_err[*QueryEntry, str](get(?db, Q_PARSE, 2))) { dnit(?db); ret 1; }
+    if (t_live != 2) { dnit(?db); ret 1; }
+
+    # dnit finalizes every live handle; a balanced count proves no leak / double-free.
+    dnit(?db);
+    if (t_live != 0) { ret 1; }
     ret 0;
 }

@@ -9,6 +9,7 @@ use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 use std.types.result.Result;
 use std.types.result.ok;
 use std.types.result.err;
@@ -37,7 +38,6 @@ use query:  mach.lang.query;
 use target: mach.lang.target;
 use modid:  mach.lang.module;
 use ast:    mach.lang.fe.ast;
-use astcache: mach.lang.astcache;
 
 # re-export the project-wide module id so consumers can spell it as
 # `session.ModuleId` / `session.MODULE_NIL`.
@@ -51,8 +51,7 @@ fwd modid.MODULE_NIL;
 # diags:    diagnostic sink shared by all phases
 # interner: shared string interner used by sema and downstream phases
 # types:    shared type universe used by sema, middle-end, and backend
-# queries:  memoization database holding every input and derived compiler artifact; the public surface every consumer (CLI, LSP, tests) drives the compiler through
-# ast_cache: FileId-keyed cache of parsed ASTs, owning each `ast.Ast` and the source revision it was parsed at; the first slice of incremental rebuild (#1164) — survives a build's dnit_project so a long-lived session reuses an unchanged module's AST instead of re-parsing it, freed only here in session.dnit
+# queries:  memoization database holding every input and derived compiler artifact; the public surface every consumer (CLI, LSP, tests) drives the compiler through. owns parsed ASTs as opaque Q_PARSE handles (#1580), so a long-lived session reuses an unchanged module's AST across rebuilds instead of re-parsing it
 # module_asts: parsed AST of every loaded module, indexed by project-wide ModuleId; populated by the driver after the load pass so any phase can reach a cross-module declaration (e.g. an imported record's fields, or a generic instantiated from a transitive dependency) by ModuleId
 # module_ast_count: number of registered module ASTs (the registry's logical length)
 # module_ast_cap:   allocated capacity of the module-AST registry
@@ -71,7 +70,6 @@ pub rec Session {
     interner: intern.Interner;
     types:    ty.TypeInterner;
     queries:  query.QueryDb;
-    ast_cache:        astcache.AstCache;
     module_asts:      **ast.Ast;
     module_ast_count: u32;
     module_ast_cap:   u32;
@@ -114,7 +112,6 @@ pub fun init(alloc: *Allocator) Result[Session, str] {
     s.sources  = source.init(alloc);
     s.diags    = diag.init(alloc);
     s.interner = intern.init(alloc);
-    s.ast_cache        = astcache.init(alloc);
     s.module_asts      = nil;
     s.module_ast_count = 0;
     s.module_ast_cap   = 0;
@@ -133,7 +130,6 @@ pub fun init(alloc: *Allocator) Result[Session, str] {
 
     val r_types: Result[ty.TypeInterner, str] = ty.init(alloc);
     if (is_err[ty.TypeInterner, str](r_types)) {
-        astcache.dnit(?s.ast_cache);
         intern.dnit(?s.interner);
         diag.dnit(?s.diags);
         source.dnit(?s.sources);
@@ -144,7 +140,6 @@ pub fun init(alloc: *Allocator) Result[Session, str] {
     val r_queries: Result[query.QueryDb, str] = query.init(alloc);
     if (is_err[query.QueryDb, str](r_queries)) {
         ty.dnit(?s.types);
-        astcache.dnit(?s.ast_cache);
         intern.dnit(?s.interner);
         diag.dnit(?s.diags);
         source.dnit(?s.sources);
@@ -156,7 +151,6 @@ pub fun init(alloc: *Allocator) Result[Session, str] {
     if (is_err[bool, str](r_cat)) {
         query.dnit(?s.queries);
         ty.dnit(?s.types);
-        astcache.dnit(?s.ast_cache);
         intern.dnit(?s.interner);
         diag.dnit(?s.diags);
         source.dnit(?s.sources);
@@ -166,13 +160,13 @@ pub fun init(alloc: *Allocator) Result[Session, str] {
     ret ok[Session, str](s);
 }
 
-# register_catalog: register the catalog input kinds owned by the session. the two input
-# queries (project root, target) are self-contained and bound here.
-# Q_FILE_TEXT is a metadata source whose revision is owned by the source
-# map; its registration is deferred to the query layer that supplies the
-# source-map context the bare RevisionFn cannot reach, and derived kinds
-# are reserved by their owning phase modules, which bind the compute
-# functions the database invokes.
+# register_catalog: register the catalog input kinds owned by the session. the
+# three input queries (project root, target, per-file source text) are
+# self-contained and bound here. Q_FILE_TEXT holds each file's source text,
+# set by load_source; its byte-equality cutoff is what keeps an unchanged
+# file's Q_PARSE entry valid across rebuilds. derived kinds are reserved by
+# their owning phase modules (e.g. the driver registers Q_PARSE), which bind
+# the compute functions the database invokes.
 # ---
 # db:  the freshly constructed query database
 # ret: true once every session-owned input kind is registered, or the first registration error
@@ -182,6 +176,9 @@ fun register_catalog(db: *query.QueryDb) Result[bool, str] {
 
     val r_target: Result[bool, str] = query.register_input(db, query.Q_TARGET);
     if (is_err[bool, str](r_target)) { ret r_target; }
+
+    val r_text: Result[bool, str] = query.register_input(db, query.Q_FILE_TEXT);
+    if (is_err[bool, str](r_text)) { ret r_text; }
 
     ret ok[bool, str](true);
 }
@@ -207,7 +204,6 @@ pub fun dnit(s: *Session) {
     map.dnit[modid.ModuleId, ptr](?s.module_comptime);
     query.dnit(?s.queries);
     ty.dnit(?s.types);
-    astcache.dnit(?s.ast_cache);
     intern.dnit(?s.interner);
     diag.dnit(?s.diags);
     source.dnit(?s.sources);
@@ -524,13 +520,22 @@ pub fun module_comptime_ptr(s: *Session, mid: modid.ModuleId) ptr {
 # delegates to source.load, which dedups by path: a path loaded for the first
 # time is appended, a path already loaded reuses its FileId and is text-swapped
 # in place — so a long-lived session (an LSP reloading on save) does not grow on
-# reload. either path bumps s.queries.revision so derived entries depending on
-# this file invalidate.
+# reload. the loaded text is then mirrored into the Q_FILE_TEXT query input,
+# keyed by FileId: set_input's byte-equality cutoff leaves the input's
+# last_changed untouched for an unchanged reload (so a dependent Q_PARSE entry
+# stays valid and the AST is reused) and advances it on a real edit (so Q_PARSE
+# recomputes).
 # ---
 # s:    the session
 # path: file path to associate with this file
 # text: null-terminated source text to index and store
 # ret:  FileId the path is registered under (stable across reloads of the same path), or an allocation error
 pub fun load_source(s: *Session, path: str, text: str) Result[source.FileId, str] {
-    ret source.load(?s.sources, ?s.queries, ?s.interner, path, text);
+    val fid_r: Result[source.FileId, str] = source.load(?s.sources, ?s.queries, ?s.interner, path, text);
+    if (is_err[source.FileId, str](fid_r)) { ret fid_r; }
+    val fid: source.FileId = unwrap_ok[source.FileId, str](fid_r);
+
+    val si_r: Result[bool, str] = query.set_input(?s.queries, query.Q_FILE_TEXT, fid::u64, text::*u8, str_len(text)::u32);
+    if (is_err[bool, str](si_r)) { ret err[source.FileId, str](unwrap_err[bool, str](si_r)); }
+    ret ok[source.FileId, str](fid);
 }

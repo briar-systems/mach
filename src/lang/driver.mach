@@ -58,7 +58,7 @@ use src:    mach.lang.source;
 use diag:   mach.lang.diagnostic;
 use intern: mach.lang.intern;
 use sess:   mach.lang.session;
-use astcache: mach.lang.astcache;
+use query:  mach.lang.query;
 
 use lexer:  mach.lang.fe.lexer;
 use parser: mach.lang.fe.parser;
@@ -221,7 +221,7 @@ pub rec PubConst {
 # ---
 # fqn:            interned fully-qualified module path (e.g. "std.types.bool")
 # file_id:        FileId of the module's source in session.sources
-# a:              borrowed parsed AST, owned by the session AST cache (keyed by file_id); nil until parse_module sets it. NOT freed by dnit_project — the cache owns it and reuses it across rebuilds of an unchanged file (#1164)
+# a:              borrowed parsed AST, owned by the session query DB as the Q_PARSE handle (keyed by file_id); nil until parse_module sets it. NOT freed by dnit_project — the query DB owns it (and its finalizer frees it) and reuses it across rebuilds of an unchanged file (#1580)
 # ctx:            comptime context populated during DFS load: target params,
 #                 imports' pub consts, and this-module's pub comptime vals
 # pub_consts:     snapshot of comptime vals declared `pub` in this module
@@ -454,6 +454,14 @@ pub fun enumerate_matrix(alloc: *Allocator, project_root: str,
 fun build_project_impl(s: *sess.Session, project_root: str, sel: *manifest.Selection, for_union: bool) Result[Project, str] {
     var p: Project;
     init_project(?p, s);
+
+    # bind the query db's compute context and register Q_PARSE (once per session)
+    # before any module loads, so parse_module can route through the engine.
+    val q_r: Result[bool, str] = ensure_query_pipeline(s);
+    if (is_err[bool, str](q_r)) {
+        dnit_project(?p);
+        ret err[Project, str](unwrap_err[bool, str](q_r));
+    }
 
     val cfg_r: Result[bool, str] = load_project_config(?p, project_root, sel, for_union);
     if (is_err[bool, str](cfg_r)) {
@@ -908,10 +916,10 @@ fun span_eq_str(source: str, span: token.Span, s: str) bool {
 # reset_module_registry drops the borrowed AST/sema/resolve/comptime references the
 # freed Project leaves behind — so memory stays bounded and the session stays clean
 # across rebuilds. parsed ASTs ARE reused across builds: each `ModuleEntry.a` is
-# borrowed from the session AST cache, which this teardown leaves intact, so an
-# unchanged module's AST survives to the next build (the first slice of incremental
-# rebuild, #1164). resolve results are NOT reused — each reload re-resolves the full
-# closure (resolve-level incremental is a separate, larger effort).
+# borrowed from the session query DB (the Q_PARSE handle), which this teardown
+# leaves intact, so an unchanged module's AST survives to the next build (#1580).
+# resolve results are NOT reused — each reload re-resolves the full closure
+# (resolve-level incremental is a separate, larger effort).
 # ---
 # p: project to tear down; nil is a no-op
 pub fun dnit_project(p: *Project) {
@@ -923,8 +931,8 @@ pub fun dnit_project(p: *Project) {
             resolve.dnit_result(?m.resolve_result);
         }
         comptime.dnit(?m.ctx);
-        # m.a is BORROWED from the session AST cache (parse_module), which owns and
-        # frees it (and reuses it across rebuilds). do NOT free it here.
+        # m.a is BORROWED from the session query DB (the Q_PARSE handle), which owns
+        # and frees it (and reuses it across rebuilds). do NOT free it here.
         if (m.pub_consts != nil && m.pub_const_cap > 0) {
             deallocate[PubConst](p.s.alloc, m.pub_consts, m.pub_const_cap::usize);
         }
@@ -2142,77 +2150,137 @@ fun parse_module(p: *Project, mid: sess.ModuleId, fqn: intern.StrId) Result[bool
     }
     val text: str = unwrap_ok[str, str](text_r);
 
+    # load_source mirrors the text into the Q_FILE_TEXT input; an unchanged file's
+    # input keeps its last_changed (byte-equality cutoff), so the Q_PARSE entry
+    # below stays valid and its AST is reused without re-parsing.
     val fid_r: Result[src.FileId, str] = sess.load_source(p.s, file_path, text);
     str_free(p.s.alloc, file_path);
     str_free(p.s.alloc, text);
     if (is_err[src.FileId, str](fid_r)) { ret err[bool, str](unwrap_err[src.FileId, str](fid_r)); }
     val file_id: src.FileId = unwrap_ok[src.FileId, str](fid_r);
 
-    val file_opt: Option[*src.SourceFile] = src.get(?p.s.sources, file_id);
-    if (is_none[*src.SourceFile](file_opt)) { ret err[bool, str]("registered FileId not found in SourceMap"); }
-    val file: *src.SourceFile = unwrap[*src.SourceFile](file_opt);
-
     val m: *ModuleEntry = ?p.modules[mid::u32];
     m.file_id = file_id;
 
-    # incremental parse cache (#1164): an unchanged file across rebuilds keeps its
-    # source revision (source.update's identical-text cutoff), so a cache entry at
-    # that revision is a hit — borrow the cached AST and skip tokenize + parse. the
-    # cache owns the AST; m.a only borrows it (dnit_project never frees it).
-    val cached: *ast.Ast = astcache.lookup(?p.s.ast_cache, file_id, file.revision);
-    if (cached != nil) {
-        m.a = cached;
-        ret ok[bool, str](true);
-    }
-
-    emit_stage(p, "lex", fqn);
-    val tok_r: Result[lexer.TokenStream, str] = lexer.tokenize(file.text, p.s.alloc, file_id);
-    if (is_err[lexer.TokenStream, str](tok_r)) { ret err[bool, str](unwrap_err[lexer.TokenStream, str](tok_r)); }
-    var stream: lexer.TokenStream = unwrap_ok[lexer.TokenStream, str](tok_r);
-
-    # allocate the heap AST the cache will own; parse writes into it. on any failure
-    # before it is published to the cache, free it here (it is owned by nobody yet).
-    val ar: Result[*ast.Ast, str] = allocate[ast.Ast](p.s.alloc, 1::usize);
-    if (is_err[*ast.Ast, str](ar)) {
-        lexer.dnit(?stream, p.s.alloc);
-        ret err[bool, str](unwrap_err[*ast.Ast, str](ar));
-    }
-    val a: *ast.Ast = unwrap_ok[*ast.Ast, str](ar);
-    a[0] = ast.init(p.s.alloc, file_id);
-
-    val le_r: Result[bool, str] = lexer.emit_diagnostics(?stream, ?p.s.diags);
-    if (is_err[bool, str](le_r)) {
-        free_uncached_ast(p, a);
-        lexer.dnit(?stream, p.s.alloc);
-        ret err[bool, str](unwrap_err[bool, str](le_r));
-    }
-    emit_stage(p, "parse", fqn);
-    val fatal: bool = parser.parse(?stream, a, ?p.s.diags);
-    lexer.dnit(?stream, p.s.alloc);
-    # a fatal allocation failure leaves the AST incomplete; refuse to walk it
-    # (the parser already emitted the OOM diagnostic onto the sink).
-    if (fatal) {
-        free_uncached_ast(p, a);
-        ret err[bool, str]("out of memory while parsing module");
-    }
-
-    # publish into the cache, which takes ownership and frees any stale entry for
-    # this FileId from a prior, now-superseded revision. m.a then borrows it.
-    val store_r: Result[bool, str] = astcache.store(?p.s.ast_cache, file_id, file.revision, a);
-    if (is_err[bool, str](store_r)) {
-        free_uncached_ast(p, a);
-        ret err[bool, str](unwrap_err[bool, str](store_r));
-    }
+    # route the parse through the query engine: Q_PARSE reads Q_FILE_TEXT and
+    # returns the AST as an opaque handle. an unchanged file revalidates and
+    # reuses its cached AST; an edited file recomputes (re-lex + re-parse). the
+    # query DB owns the AST through the Q_PARSE finalizer; m.a only borrows it.
+    val e_r: Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_PARSE, file_id::u64);
+    if (is_err[*query.QueryEntry, str](e_r)) { ret err[bool, str](unwrap_err[*query.QueryEntry, str](e_r)); }
+    val a: *ast.Ast = ast_handle_decode(unwrap_ok[*query.QueryEntry, str](e_r));
+    if (a == nil) { ret err[bool, str]("Q_PARSE produced no AST handle"); }
     m.a = a;
     ret ok[bool, str](true);
 }
 
-# free_uncached_ast: tear down a freshly-parsed heap AST that never reached the
-# session cache (an error path in parse_module). the cache owns every AST it
-# accepts, so this only fires before the store hands ownership over.
-fun free_uncached_ast(p: *Project, a: *ast.Ast) {
+# ensure_query_pipeline: bind the query db's compute context to the session and
+# register the driver-owned derived kinds the build routes through. set_ctx is
+# refreshed every build (the session address is stable); Q_PARSE is registered
+# exactly once per session (registered() guards the idempotent re-call).
+fun ensure_query_pipeline(s: *sess.Session) Result[bool, str] {
+    query.set_ctx(?s.queries, s::ptr);
+    if (query.registered(?s.queries, query.Q_PARSE)) { ret ok[bool, str](true); }
+    ret query.register_derived_owned(?s.queries, query.Q_PARSE, q_parse_compute, q_parse_finalize);
+}
+
+# q_parse_compute: the Q_PARSE derived compute — lex + parse one file into a heap
+# AST and return it as an opaque handle. reaches the session (sources, interner,
+# diagnostics, allocator) through db.ctx, and records the Q_FILE_TEXT dep so a
+# text edit invalidates the entry. the returned handle owns the AST; the engine
+# frees it through q_parse_finalize.
+fun q_parse_compute(db: *query.QueryDb, key: u64, alloc: *Allocator) Result[query.QueryOutput, str] {
+    val s: *sess.Session = db.ctx::*sess.Session;
+    if (s == nil) { ret err[query.QueryOutput, str]("Q_PARSE: query db has no session context"); }
+    val file_id: src.FileId = key::u32;
+
+    val rd: Result[bool, str] = query.record_dep(db, query.Q_PARSE, key, query.Q_FILE_TEXT, key);
+    if (is_err[bool, str](rd)) { ret err[query.QueryOutput, str](unwrap_err[bool, str](rd)); }
+
+    val file_opt: Option[*src.SourceFile] = src.get(?s.sources, file_id);
+    if (is_none[*src.SourceFile](file_opt)) { ret err[query.QueryOutput, str]("Q_PARSE: FileId not registered with the session"); }
+    val file: *src.SourceFile = unwrap[*src.SourceFile](file_opt);
+
+    if (s.verbose) { q_parse_emit_stage(s, "lex", file.path); }
+    val tok_r: Result[lexer.TokenStream, str] = lexer.tokenize(file.text, alloc, file_id);
+    if (is_err[lexer.TokenStream, str](tok_r)) { ret err[query.QueryOutput, str](unwrap_err[lexer.TokenStream, str](tok_r)); }
+    var stream: lexer.TokenStream = unwrap_ok[lexer.TokenStream, str](tok_r);
+
+    val ar: Result[*ast.Ast, str] = allocate[ast.Ast](alloc, 1::usize);
+    if (is_err[*ast.Ast, str](ar)) {
+        lexer.dnit(?stream, alloc);
+        ret err[query.QueryOutput, str](unwrap_err[*ast.Ast, str](ar));
+    }
+    val a: *ast.Ast = unwrap_ok[*ast.Ast, str](ar);
+    a[0] = ast.init(alloc, file_id);
+
+    val le_r: Result[bool, str] = lexer.emit_diagnostics(?stream, ?s.diags);
+    if (is_err[bool, str](le_r)) {
+        ast.dnit(a);
+        deallocate[ast.Ast](alloc, a, 1::usize);
+        lexer.dnit(?stream, alloc);
+        ret err[query.QueryOutput, str](unwrap_err[bool, str](le_r));
+    }
+    if (s.verbose) { q_parse_emit_stage(s, "parse", file.path); }
+    val fatal: bool = parser.parse(?stream, a, ?s.diags);
+    lexer.dnit(?stream, alloc);
+    # a fatal allocation failure leaves the AST incomplete; refuse to publish it
+    # (the parser already emitted the OOM diagnostic onto the sink).
+    if (fatal) {
+        ast.dnit(a);
+        deallocate[ast.Ast](alloc, a, 1::usize);
+        ret err[query.QueryOutput, str]("out of memory while parsing module");
+    }
+
+    ret ast_handle_encode(alloc, a);
+}
+
+# q_parse_finalize: release the AST a Q_PARSE handle owns, called by the engine
+# before it frees the handle buffer (on recompute, invalidate, and dnit).
+fun q_parse_finalize(value: *u8, value_len: u32, alloc: *Allocator) {
+    if (value == nil || value_len::usize < $size_of(ptr)) { ret; }
+    val slot: *ptr = value::ptr::*ptr;
+    val a: *ast.Ast = slot[0]::*ast.Ast;
+    if (a == nil) { ret; }
     ast.dnit(a);
-    deallocate[ast.Ast](p.s.alloc, a, 1::usize);
+    deallocate[ast.Ast](alloc, a, 1::usize);
+}
+
+# ast_handle_encode: wrap a heap AST pointer as a pointer-sized opaque handle
+# buffer — the Q_PARSE query value. heavy pointer-graph artifacts live in the
+# byte-buffer DB as handles, never serialized (#1580).
+fun ast_handle_encode(alloc: *Allocator, a: *ast.Ast) Result[query.QueryOutput, str] {
+    val n: u32 = $size_of(ptr)::u32;
+    val rb: Result[*u8, str] = allocate[u8](alloc, n::usize);
+    if (is_err[*u8, str](rb)) {
+        ast.dnit(a);
+        deallocate[ast.Ast](alloc, a, 1::usize);
+        ret err[query.QueryOutput, str](unwrap_err[*u8, str](rb));
+    }
+    val buf: *u8 = unwrap_ok[*u8, str](rb);
+    val slot: *ptr = buf::ptr::*ptr;
+    slot[0] = a::ptr;
+    var out: query.QueryOutput;
+    out.bytes = buf;
+    out.len   = n;
+    ret ok[query.QueryOutput, str](out);
+}
+
+# ast_handle_decode: read the AST pointer back out of a Q_PARSE handle entry, or
+# nil when the entry carries no value.
+fun ast_handle_decode(e: *query.QueryEntry) *ast.Ast {
+    if (e.value == nil || e.value_len::usize < $size_of(ptr)) { ret nil; }
+    val slot: *ptr = e.value::ptr::*ptr;
+    ret slot[0]::*ast.Ast;
+}
+
+# q_parse_emit_stage: the verbose front-end progress line for a Q_PARSE compute,
+# labeled by source path (the compute's identifier; the FQN is the driver's).
+fun q_parse_emit_stage(s: *sess.Session, stage: str, path: str) {
+    print.eprint(stage);
+    print.eprint(" ");
+    print.eprint(path);
+    print.eprint("\n");
 }
 
 # walk_module_for_load: walk the module's decls in source order,
@@ -3163,6 +3231,19 @@ fun ut_has(p: *Project, s: *sess.Session, fqn: str) bool {
     ret is_ok[*sess.ModuleId, str](map.get[intern.StrId, sess.ModuleId](?p.by_fqn, ?id));
 }
 
+# ut_ast: the parsed AST pointer of module `fqn` in project `p` (the Q_PARSE
+# handle the query DB owns), or nil when the module is absent. used by the
+# incremental reuse test to assert handle identity across rebuilds.
+fun ut_ast(p: *Project, s: *sess.Session, fqn: str) *ast.Ast {
+    val idr: Result[intern.StrId, str] = intern.intern(?s.interner, fqn);
+    if (is_err[intern.StrId, str](idr)) { ret nil; }
+    var id: intern.StrId = unwrap_ok[intern.StrId, str](idr);
+    val mr: Result[*sess.ModuleId, str] = map.get[intern.StrId, sess.ModuleId](?p.by_fqn, ?id);
+    if (is_err[*sess.ModuleId, str](mr)) { ret nil; }
+    val mid: sess.ModuleId = @unwrap_ok[*sess.ModuleId, str](mr);
+    ret p.modules[mid::u32].a;
+}
+
 # ut_ctx: the comptime ctx of the named module, or nil if it was not loaded.
 fun ut_ctx(p: *Project, s: *sess.Session, fqn: str) *comptime.ComptimeCtx {
     val idr: Result[intern.StrId, str] = intern.intern(?s.interner, fqn);
@@ -3677,7 +3758,7 @@ test "driver reload: a Session rebuilds after dnit_project, deduping changed sou
     ret bad;
 }
 
-test "driver incremental: an unchanged rebuild reuses cached ASTs; an edit re-parses only the changed file (#1576)" {
+test "driver incremental: an unchanged rebuild reuses Q_PARSE ASTs; an edit re-parses only the changed file (#1576, #1580)" {
     var alloc: Allocator;
     if (is_some[str](page.make(?alloc))) { ret 1; }
     val sr: Result[sess.Session, str] = sess.init(?alloc);
@@ -3694,37 +3775,36 @@ test "driver incremental: an unchanged rebuild reuses cached ASTs; an edit re-pa
     texts[1] = "pub fun fa() i32 { ret 1; }\n";
 
     # one root, three builds on it: the source paths stay identical so each module's
-    # FileId is stable and the session AST cache can hit across builds.
+    # FileId is stable and the engine reuses its Q_PARSE AST handle across builds.
     val root_r: Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
     if (is_err[str, str](root_r)) { sess.dnit(?s); ret 1; }
     val root: str = unwrap_ok[str, str](root_r);
 
     var bad: i32 = 0;
 
-    # build 1: a cold cache — every module parses and is stored, none reused.
+    # build 1: cold. capture each module's AST handle (owned by the query DB, which
+    # dnit_project leaves intact — so the pointers stay valid to compare).
     val p1r: Result[Project, str] = build_project_union(?s, root);
     if (is_err[Project, str](p1r)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
     var p1: Project = unwrap_ok[Project, str](p1r);
-    val n_mods: u32 = s.ast_cache.len;
-    if (n_mods == 0) { bad = 1; }
-    if (s.ast_cache.hits != 0) { bad = 1; }
-    if (s.ast_cache.misses != n_mods::u64) { bad = 1; }
+    val main1: *ast.Ast = ut_ast(?p1, ?s, "uniontest.main");
+    val a1:    *ast.Ast = ut_ast(?p1, ?s, "uniontest.a");
+    if (main1 == nil || a1 == nil) { bad = 1; }
     dnit_project(?p1);
 
-    # build 2: nothing changed. source.update's identical-text cutoff keeps every
-    # file's revision, so every module is a cache hit — no module re-parses and the
-    # cache neither grows nor records a new miss.
+    # build 2: nothing changed. every file's Q_FILE_TEXT keeps its last_changed
+    # (set_input's byte-equality cutoff), so each Q_PARSE entry revalidates and
+    # returns the SAME AST handle — no module re-parses.
     val p2r: Result[Project, str] = build_project_union(?s, root);
     if (is_err[Project, str](p2r)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
     var p2: Project = unwrap_ok[Project, str](p2r);
-    if (s.ast_cache.len != n_mods) { bad = 1; }
-    if (s.ast_cache.hits != n_mods::u64) { bad = 1; }
-    if (s.ast_cache.misses != n_mods::u64) { bad = 1; }
+    if (ut_ast(?p2, ?s, "uniontest.main") != main1) { bad = 1; }
+    if (ut_ast(?p2, ?s, "uniontest.a")    != a1)    { bad = 1; }
     dnit_project(?p2);
 
-    # edit a.mach in place (same path → same FileId). its revision bumps, so it is a
-    # cache miss that re-parses and replaces the stale AST; main is unchanged and
-    # still hits. exactly one new miss, one new hit, and no new cache entry.
+    # edit a.mach in place (same path → same FileId). its Q_FILE_TEXT input changes,
+    # so Q_PARSE recomputes a fresh AST (a new handle) and finalizes the stale one;
+    # main is unchanged and reuses its AST.
     val src_dir: str = ut_cc3(?alloc, root, "/", "src");
     val a_path: str = ut_cc3(?alloc, src_dir, "/", "a.mach");
     val new_a: str = "pub fun fa() i32 { ret 2; }\n";
@@ -3734,9 +3814,8 @@ test "driver incremental: an unchanged rebuild reuses cached ASTs; an edit re-pa
     val p3r: Result[Project, str] = build_project_union(?s, root);
     if (is_err[Project, str](p3r)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
     var p3: Project = unwrap_ok[Project, str](p3r);
-    if (s.ast_cache.len != n_mods) { bad = 1; }
-    if (s.ast_cache.misses != (n_mods + 1)::u64) { bad = 1; }
-    if (s.ast_cache.hits != (n_mods + n_mods - 1)::u64) { bad = 1; }
+    if (ut_ast(?p3, ?s, "uniontest.main") != main1) { bad = 1; }   # unchanged: reused
+    if (ut_ast(?p3, ?s, "uniontest.a")    == a1)    { bad = 1; }   # edited: re-parsed
     dnit_project(?p3);
 
     fs.remove_all(?alloc, root);
