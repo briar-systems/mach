@@ -1,0 +1,224 @@
+# mach.lang.astcache: session-owned cache of parsed ASTs, keyed by source FileId.
+#
+# the first slice of incremental rebuild (#1164): a long-lived Session reuses the
+# AST of a module whose source is unchanged across builds instead of re-lexing and
+# re-parsing it. each entry owns one `ast.Ast` and records the `source` revision it
+# was parsed at; a lookup at the same revision is a hit, a lookup at a newer
+# revision (a real edit bumped it) is a miss that store replaces. the cache lives
+# on the Session, survives `driver.dnit_project`, and is freed only in
+# `session.dnit` — so the cached ASTs (which reference the session interner's
+# StrIds and a stable FileId) stay valid for as long as their source is unchanged.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.result.Result;
+use std.types.result.ok;
+use std.types.result.err;
+use std.types.result.is_err;
+use std.types.result.unwrap_ok;
+use std.types.result.unwrap_err;
+
+use std.allocator.Allocator;
+use std.allocator.allocate;
+use std.allocator.deallocate;
+use std.allocator.reallocate;
+use page: std.allocator.page;
+
+use src:   mach.lang.source;
+use query: mach.lang.query;
+use ast:   mach.lang.fe.ast;
+
+# AstEntry: one cached AST for a source file.
+# ---
+# file_id:  FileId the AST was parsed from; the cache key
+# revision: source revision the AST was parsed at (SourceFile.revision)
+# a:        owned heap AST; freed by the cache on replacement or dnit
+pub rec AstEntry {
+    file_id:  src.FileId;
+    revision: query.Revision;
+    a:        *ast.Ast;
+}
+
+# AstCache: a FileId-keyed registry of owned parsed ASTs on the Session.
+# ---
+# alloc:   allocator backing the entry array and every owned AST
+# entries: contiguous AstEntry array
+# len:     number of entries currently stored
+# cap:     allocated slots in entries
+# hits:    cumulative lookups served from the cache (observability + reuse tests)
+# misses:  cumulative lookups that missed (absent or stale)
+pub rec AstCache {
+    alloc:   *Allocator;
+    entries: *AstEntry;
+    len:     u32;
+    cap:     u32;
+    hits:    u64;
+    misses:  u64;
+}
+
+val INITIAL_CACHE_CAP: u32 = 16;
+
+# init: construct an empty AST cache backed by the given allocator.
+# ---
+# alloc: allocator used for the entry array and every owned AST
+# ret:   a new empty AstCache
+pub fun init(alloc: *Allocator) AstCache {
+    var c: AstCache;
+    c.alloc   = alloc;
+    c.entries = nil;
+    c.len     = 0;
+    c.cap     = 0;
+    c.hits    = 0;
+    c.misses  = 0;
+    ret c;
+}
+
+# dnit: free every owned AST and the entry array, then zero the cache. nil is a no-op.
+# ---
+# c: the cache to tear down
+pub fun dnit(c: *AstCache) {
+    if (c == nil) { ret; }
+    var i: u32 = 0;
+    for (i < c.len) {
+        val e: *AstEntry = ?c.entries[i];
+        free_ast(c, e.a);
+        i = i + 1;
+    }
+    if (c.entries != nil && c.cap > 0) {
+        deallocate[AstEntry](c.alloc, c.entries, c.cap::usize);
+    }
+    c.entries = nil;
+    c.len     = 0;
+    c.cap     = 0;
+}
+
+# lookup: the cached AST for `fid` parsed at `rev`, or nil on a miss. an entry
+# present at a different revision (a stale parse a later edit superseded) is left
+# in place for store to replace and counts as a miss. updates hits/misses.
+# ---
+# c:   the cache
+# fid: FileId to look up
+# rev: source revision the caller requires the AST to have been parsed at
+# ret: borrowed pointer to the cached AST on a hit, or nil on a miss
+pub fun lookup(c: *AstCache, fid: src.FileId, rev: query.Revision) *ast.Ast {
+    val e: *AstEntry = find(c, fid);
+    if (e != nil && e.revision == rev) {
+        c.hits = c.hits + 1;
+        ret e.a;
+    }
+    c.misses = c.misses + 1;
+    ret nil;
+}
+
+# store: take ownership of `a` as the cached AST for `fid` at `rev`. an existing
+# entry for `fid` (a stale AST from a superseded revision) is freed and replaced;
+# a new FileId appends, growing the entry array on demand. the cache owns `a` from
+# here and frees it on a later replacement or in dnit.
+# ---
+# c:   the cache
+# fid: FileId the AST was parsed from
+# rev: source revision the AST was parsed at
+# a:   heap AST whose ownership transfers into the cache
+# ret: true on success, or an allocation error from growing the entry array
+pub fun store(c: *AstCache, fid: src.FileId, rev: query.Revision, a: *ast.Ast) Result[bool, str] {
+    val existing: *AstEntry = find(c, fid);
+    if (existing != nil) {
+        free_ast(c, existing.a);
+        existing.a        = a;
+        existing.revision = rev;
+        ret ok[bool, str](true);
+    }
+
+    if (c.entries == nil) {
+        val r: Result[*AstEntry, str] = allocate[AstEntry](c.alloc, INITIAL_CACHE_CAP::usize);
+        if (is_err[*AstEntry, str](r)) { ret err[bool, str](unwrap_err[*AstEntry, str](r)); }
+        c.entries = unwrap_ok[*AstEntry, str](r);
+        c.cap     = INITIAL_CACHE_CAP;
+    }
+    or (c.len == c.cap) {
+        val new_cap: u32 = c.cap * 2;
+        val r: Result[*AstEntry, str] = reallocate[AstEntry](c.alloc, c.entries, c.cap::usize, new_cap::usize);
+        if (is_err[*AstEntry, str](r)) { ret err[bool, str](unwrap_err[*AstEntry, str](r)); }
+        c.entries = unwrap_ok[*AstEntry, str](r);
+        c.cap     = new_cap;
+    }
+
+    val e: *AstEntry = ?c.entries[c.len];
+    e.file_id  = fid;
+    e.revision = rev;
+    e.a        = a;
+    c.len = c.len + 1;
+    ret ok[bool, str](true);
+}
+
+# find: the entry for `fid`, or nil when absent. linear scan; the per-build module
+# count is small, so a flat array beats a map's overhead.
+fun find(c: *AstCache, fid: src.FileId) *AstEntry {
+    var i: u32 = 0;
+    for (i < c.len) {
+        val e: *AstEntry = ?c.entries[i];
+        if (e.file_id == fid) { ret e; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# free_ast: tear down an owned AST and free its heap struct. nil is a no-op.
+fun free_ast(c: *AstCache, a: *ast.Ast) {
+    if (a == nil) { ret; }
+    ast.dnit(a);
+    deallocate[ast.Ast](c.alloc, a, 1::usize);
+}
+
+# t_make: allocate and init a fresh empty heap AST for cache tests, or nil on OOM.
+fun t_make(alloc: *Allocator, fid: src.FileId) *ast.Ast {
+    val r: Result[*ast.Ast, str] = allocate[ast.Ast](alloc, 1::usize);
+    if (is_err[*ast.Ast, str](r)) { ret nil; }
+    val a: *ast.Ast = unwrap_ok[*ast.Ast, str](r);
+    a[0] = ast.init(alloc, fid);
+    ret a;
+}
+
+test "astcache: hit on matching revision, miss on stale, replace frees and reuses the slot (#1576)" {
+    var alloc: Allocator;
+    page.make(?alloc);
+    var c: AstCache = init(?alloc);
+
+    val a1: *ast.Ast = t_make(?alloc, 0);
+    if (a1 == nil) { dnit(?c); ret 1; }
+    if (is_err[bool, str](store(?c, 0, 1, a1))) { dnit(?c); ret 1; }
+
+    # a hit at the parsed revision returns the same pointer and bumps hits.
+    if (lookup(?c, 0, 1) != a1) { dnit(?c); ret 1; }
+    if (c.hits != 1) { dnit(?c); ret 1; }
+
+    # a newer revision (a real edit) misses without disturbing the entry.
+    if (lookup(?c, 0, 2) != nil) { dnit(?c); ret 1; }
+    if (c.misses != 1) { dnit(?c); ret 1; }
+
+    # an unknown FileId misses.
+    if (lookup(?c, 9, 1) != nil) { dnit(?c); ret 1; }
+    if (c.misses != 2) { dnit(?c); ret 1; }
+
+    # storing a fresh AST at the new revision replaces in place (frees a1), reusing
+    # the slot rather than appending.
+    val a2: *ast.Ast = t_make(?alloc, 0);
+    if (a2 == nil) { dnit(?c); ret 1; }
+    if (is_err[bool, str](store(?c, 0, 2, a2))) { dnit(?c); ret 1; }
+    if (c.len != 1) { dnit(?c); ret 1; }
+    if (lookup(?c, 0, 2) != a2) { dnit(?c); ret 1; }
+    if (lookup(?c, 0, 1) != nil) { dnit(?c); ret 1; }
+
+    # a distinct FileId appends a new entry.
+    val a3: *ast.Ast = t_make(?alloc, 1);
+    if (a3 == nil) { dnit(?c); ret 1; }
+    if (is_err[bool, str](store(?c, 1, 5, a3))) { dnit(?c); ret 1; }
+    if (c.len != 2) { dnit(?c); ret 1; }
+    if (lookup(?c, 1, 5) != a3) { dnit(?c); ret 1; }
+
+    # dnit frees a2 and a3; a1 was already freed by the replace (no double-free).
+    dnit(?c);
+    ret 0;
+}
