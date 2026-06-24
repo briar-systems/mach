@@ -112,6 +112,14 @@ pub val SYM_FLAG_MODULE: u8 = 4;
 #         TypeKind ordinal for SYM_PRIM, otherwise 0
 # origin: ModuleId of the module that owns `decl` (this module for locally
 #         declared symbols, the dependency for SYM_USE / SYM_IMPORTED)
+# origin_stable: build-stable identity of `origin`, captured at resolve time. a
+#         ResolveResult reused across builds carries the per-build `origin` of the
+#         build that produced it; remap_result rewrites `origin` from this stable
+#         snapshot into the new build's ModuleId space (#1582). STABLE_MODULE_NIL
+#         when origin is MODULE_NIL or has no stable id
+# slot_stable: build-stable identity of the SYM_USE target `slot` names, the slot's
+#         twin of origin_stable. STABLE_MODULE_NIL for every non-SYM_USE symbol
+#         (their slot is an index, not a ModuleId, and is build-independent)
 pub rec Symbol {
     kind:   SymKind;
     flags:  u8;
@@ -119,6 +127,8 @@ pub rec Symbol {
     decl:   id.DeclId;
     slot:   u32;
     origin: sess.ModuleId;
+    origin_stable: sess.StableModuleId;
+    slot_stable:   sess.StableModuleId;
 }
 
 # PublicSymbol: a snapshot of one pub symbol, copied by the driver into a dependent module's ResolveDeps so resolve can bind cross-module references.
@@ -244,6 +254,14 @@ val PRIM_COUNT: u32 = 11;
 # param_index:   (decl::u64 << 32 | slot) -> SymbolId for every SYM_PARAM, so a
 #                consumer resolves a function parameter by (owning decl, ordinal)
 #                in O(1) instead of scanning the whole symbol universe per param
+# pub_const_fp:  owned byte fingerprint of this module's pub module-level comptime
+#                constant VALUES (name + evaluated CTValue), in pub-symbol order. an
+#                importer's resolution forks on these via `$if` over imported
+#                consts, but the values live in the comptime ctx, not in the symbol
+#                identities — so Q_EXPORTS folds this blob into the firewall
+#                fingerprint to re-resolve importers when a dep's const value (even
+#                a transitively-derived one) changes (#1582). nil/0 when none
+# pub_const_fp_len: length of pub_const_fp in bytes
 pub rec ResolveResult {
     alloc:         *Allocator;
     symbols:       *Symbol;
@@ -257,6 +275,9 @@ pub rec ResolveResult {
     decl_count:    u32;
 
     param_index:   map.Map[u64, SymbolId];
+
+    pub_const_fp:     *u8;
+    pub_const_fp_len: u32;
 }
 
 # param_symbol: the SymbolId of function `decl`'s parameter at ordinal `slot`,
@@ -272,6 +293,42 @@ pub fun param_symbol(r: *ResolveResult, decl: id.DeclId, slot: u32) SymbolId {
     val g: Result[*SymbolId, str] = map.get[u64, SymbolId](?r.param_index, ?key);
     if (is_ok[*SymbolId, str](g)) { ret @unwrap_ok[*SymbolId, str](g); }
     ret SYMBOL_NIL;
+}
+
+# stable_of_module: the build-stable identity of ModuleId `mid` on session `s`, or
+# STABLE_MODULE_NIL when `mid` is MODULE_NIL or names no registered module. resolve
+# runs after register_module_asts, so every loaded module's FQN and stable id are
+# already present; a lookup miss therefore means a synthetic/absent origin.
+fun stable_of_module(s: *sess.Session, mid: sess.ModuleId) sess.StableModuleId {
+    if (mid == sess.MODULE_NIL) { ret sess.STABLE_MODULE_NIL; }
+    val fqn: intern.StrId = sess.module_fqn(s, mid);
+    if (fqn == intern.STR_NIL) { ret sess.STABLE_MODULE_NIL; }
+    ret sess.stable_module_id_lookup(s, fqn);
+}
+
+# remap_result: rewrite every ModuleId-valued field of `r` from the build-stable
+# snapshot captured at resolve time into session `s`'s CURRENT per-build ModuleId
+# numbering. the cross-build-reuse correctness step (#1582): a ResolveResult reused
+# from an earlier build still carries that build's `origin` / SYM_USE `slot`
+# ModuleIds, which a graph reshape may have renumbered. driven once per build by the
+# driver after fetching the (possibly reused) result; idempotent — a freshly
+# computed result already holds the current build's mids, and re-deriving them from
+# the immutable stable snapshot reproduces the same values. every ModuleId-valued
+# field is covered: Symbol.origin (all symbols) and Symbol.slot (SYM_USE only).
+# ---
+# r: the result to remap in place
+# s: the session whose per-build StableModuleId -> ModuleId map drives the rewrite
+pub fun remap_result(r: *ResolveResult, s: *sess.Session) {
+    if (r == nil || r.symbols == nil) { ret; }
+    var i: u32 = 0;
+    for (i < r.symbol_count) {
+        val sym: *Symbol = ?r.symbols[i];
+        sym.origin = sess.module_id_for_stable(s, sym.origin_stable);
+        if (sym.kind == SYM_USE) {
+            sym.slot = sess.module_id_for_stable(s, sym.slot_stable)::u32;
+        }
+        i = i + 1;
+    }
 }
 
 # dnit_result: releases every array owned by the result and zeroes its fields.
@@ -291,6 +348,9 @@ pub fun dnit_result(r: *ResolveResult) {
     if (r.decl_symbol != nil) {
         deallocate[SymbolId](r.alloc, r.decl_symbol, r.decl_count::usize);
     }
+    if (r.pub_const_fp != nil && r.pub_const_fp_len > 0) {
+        deallocate[u8](r.alloc, r.pub_const_fp, r.pub_const_fp_len::usize);
+    }
     map.dnit[u64, SymbolId](?r.param_index);
     r.symbols       = nil;
     r.symbol_count  = 0;
@@ -301,6 +361,8 @@ pub fun dnit_result(r: *ResolveResult) {
     r.expr_count    = 0;
     r.type_count    = 0;
     r.decl_count    = 0;
+    r.pub_const_fp     = nil;
+    r.pub_const_fp_len = 0;
 }
 
 # resolve: resolves one module against its already-resolved dependencies.
@@ -578,6 +640,9 @@ fun add_symbol(rc: *ResolveContext, kind: SymKind, flags: u8, name: intern.StrId
     sym.decl   = decl_id;
     sym.slot   = slot;
     sym.origin = origin;
+    # the stable snapshots are filled in build_result once every symbol exists.
+    sym.origin_stable = sess.STABLE_MODULE_NIL;
+    sym.slot_stable   = sess.STABLE_MODULE_NIL;
     val sid: SymbolId = rc.sym_len;
     rc.symbols[rc.sym_len] = sym;
     rc.sym_len = rc.sym_len + 1;
@@ -2482,6 +2547,24 @@ fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
 
     if (remap != nil) { deallocate[u32](rc.s.alloc, remap, rc.sym_len::usize); }
 
+    # snapshot each symbol's ModuleId-valued fields in build-stable space, so a
+    # ResolveResult reused in a later build can be remapped into that build's
+    # ModuleId numbering (#1582). origin is captured for every symbol; the SYM_USE
+    # target in `slot` is captured too (other kinds' slot is a build-independent
+    # index and needs no snapshot).
+    var si: u32 = 0;
+    for (si < rc.sym_len) {
+        val sym: *Symbol = ?out_syms[si];
+        sym.origin_stable = stable_of_module(rc.s, sym.origin);
+        if (sym.kind == SYM_USE) {
+            sym.slot_stable = stable_of_module(rc.s, sym.slot::sess.ModuleId);
+        }
+        or {
+            sym.slot_stable = sess.STABLE_MODULE_NIL;
+        }
+        si = si + 1;
+    }
+
     # index every parameter by (owning decl, ordinal) over the final symbol
     # array, so lowering resolves a parameter symbol in O(1) rather than scanning
     # the whole universe per parameter.
@@ -2501,6 +2584,18 @@ fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
         pk = pk + 1;
     }
 
+    # fingerprint the evaluated values of this module's pub module-level comptime
+    # constants, so the export firewall re-resolves importers when a const value an
+    # importer's `$if` reads changes (the value lives in the ctx, not the symbols).
+    var fp_len: u32 = 0;
+    val fp_r: Result[*u8, str] = pub_const_fp_build(rc, out_syms, pub_count, ?fp_len);
+    if (is_err[*u8, str](fp_r)) {
+        map.dnit[u64, SymbolId](?param_index);
+        deallocate[Symbol](rc.s.alloc, out_syms, rc.sym_len::usize);
+        dnit_context(rc);
+        ret err[ResolveResult, str](unwrap_err[*u8, str](fp_r));
+    }
+
     var out: ResolveResult;
     out.alloc         = rc.s.alloc;
     out.symbols       = out_syms;
@@ -2513,6 +2608,8 @@ fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
     out.type_count    = rc.a.type_len::u32;
     out.decl_count    = rc.a.decl_len::u32;
     out.param_index   = param_index;
+    out.pub_const_fp     = unwrap_ok[*u8, str](fp_r);
+    out.pub_const_fp_len = fp_len;
 
     rc.expr_resolved = nil;
     rc.type_resolved = nil;
@@ -2520,4 +2617,84 @@ fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
 
     dnit_context(rc);
     ret ok[ResolveResult, str](out);
+}
+
+# PUB_CONST_FP_ENTRY: bytes one pub comptime constant contributes to the value
+# fingerprint — name(u32) + CTValue kind(u8) + int_unsigned(u8) + payload bits(u64).
+val PUB_CONST_FP_ENTRY: u32 = 14;
+
+# ct_value_bits: the 8 payload bytes of a CTValue as a canonical u64, set per kind
+# so the fingerprint is deterministic (a bool writes 0/1, never the union's stale
+# upper bytes; a float's bit pattern travels verbatim through the i64 view).
+fun ct_value_bits(v: *comptime.CTValue) u64 {
+    if (v.kind == comptime.CT_KIND_BOOL) {
+        if (v.data.b) { ret 1; }
+        ret 0;
+    }
+    if (v.kind == comptime.CT_KIND_STR)  { ret v.data.s::u64; }
+    if (v.kind == comptime.CT_KIND_TYPE) { ret v.data.t::u64; }
+    ret v.data.i::u64;
+}
+
+# pub_const_fp_build: serialize the evaluated CTValue of every pub module-level
+# comptime constant in `syms[0, pub_count)` into a fresh byte blob, in pub-symbol
+# order. the values are read from the comptime ctx (bound during load); a constant
+# not foldable there records a sentinel kind. *out_len gets the blob length; a
+# module with no pub comptime constants yields nil/0.
+fun pub_const_fp_build(rc: *ResolveContext, syms: *Symbol, pub_count: u32, out_len: *u32) Result[*u8, str] {
+    @out_len = 0;
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < pub_count) {
+        if (syms[i].kind == SYM_VAL && (syms[i].flags & SYM_FLAG_MODULE) != 0) { n = n + 1; }
+        i = i + 1;
+    }
+    if (n == 0) { ret ok[*u8, str](nil); }
+
+    val total: u32 = n * PUB_CONST_FP_ENTRY;
+    val r: Result[*u8, str] = allocate[u8](rc.s.alloc, total::usize);
+    if (is_err[*u8, str](r)) { ret r; }
+    val buf: *u8 = unwrap_ok[*u8, str](r);
+
+    var off: u32 = 0;
+    i = 0;
+    for (i < pub_count) {
+        val sym: *Symbol = ?syms[i];
+        if (sym.kind == SYM_VAL && (sym.flags & SYM_FLAG_MODULE) != 0) {
+            fp_put_u32(buf, off, sym.name::u32); off = off + 4;
+            val nc: Option[*comptime.NamedConst] = comptime.lookup(rc.ctx, sym.name);
+            if (is_some[*comptime.NamedConst](nc)) {
+                val v: *comptime.CTValue = ?unwrap[*comptime.NamedConst](nc).value;
+                buf[off] = v.kind::u8; off = off + 1;
+                if (v.int_unsigned) { buf[off] = 1; } or { buf[off] = 0; }
+                off = off + 1;
+                fp_put_u64(buf, off, ct_value_bits(v)); off = off + 8;
+            }
+            or {
+                buf[off] = 0xFF; off = off + 1;   # sentinel: not a foldable constant
+                buf[off] = 0;    off = off + 1;
+                fp_put_u64(buf, off, 0); off = off + 8;
+            }
+        }
+        i = i + 1;
+    }
+
+    @out_len = total;
+    ret ok[*u8, str](buf);
+}
+
+# fp_put_u32 / fp_put_u64: write a little-endian integer into `buf` at `off`.
+fun fp_put_u32(buf: *u8, off: u32, v: u32) {
+    buf[off]     = (v & 0xFF)::u8;
+    buf[off + 1] = ((v >> 8) & 0xFF)::u8;
+    buf[off + 2] = ((v >> 16) & 0xFF)::u8;
+    buf[off + 3] = ((v >> 24) & 0xFF)::u8;
+}
+
+fun fp_put_u64(buf: *u8, off: u32, v: u64) {
+    var j: u32 = 0;
+    for (j < 8) {
+        buf[off + j] = ((v >> (j * 8)) & 0xFF)::u8;
+        j = j + 1;
+    }
 }

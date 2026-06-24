@@ -228,7 +228,11 @@ pub rec PubConst {
 #                 imports' pub consts, and this-module's pub comptime vals
 # pub_consts:     snapshot of comptime vals declared `pub` in this module
 # deps:           ModuleIds this module directly depends on (active uses only)
-# resolve_result: filled in by run_resolve_pass (zero-initialized otherwise)
+# resolve_result: borrowed pointer to this module's ResolveResult, owned by the
+#                 session query DB as the Q_RESOLVE handle (keyed by stable_id) and
+#                 reused across rebuilds of an unchanged module; set by
+#                 run_resolve_one, nil until then. NOT freed by dnit_project — the
+#                 query DB owns it (its finalizer frees it) (#1582)
 # resolved:       true once resolve has run
 # stable_id:      this module's build-stable identity (session-assigned by FQN);
 #                 unlike the discovery-order ModuleId, it survives a graph reshape,
@@ -244,7 +248,7 @@ pub rec ModuleEntry {
     deps:              *sess.ModuleId;
     dep_count:         u32;
     dep_cap:           u32;
-    resolve_result:    resolve.ResolveResult;
+    resolve_result:    *resolve.ResolveResult;
     resolved:          bool;
     stable_id:         sess.StableModuleId;
 }
@@ -522,6 +526,16 @@ fun build_project_impl(s: *sess.Session, project_root: str, sel: *manifest.Selec
     if (is_err[bool, str](reg_r)) {
         dnit_project(?p);
         ret err[Project, str](unwrap_err[bool, str](reg_r));
+    }
+
+    # mirror the build configuration (target tuple + manifest defines) into the
+    # Q_TARGET input. resolve forks on it through `$if`, so Q_RESOLVE records a dep
+    # on it: a config change advances Q_TARGET's last_changed and re-resolves every
+    # module, while an identical reconfigure early-cuts and keeps reuse valid (#1582).
+    val cfg_in_r: Result[bool, str] = set_build_config_input(?p);
+    if (is_err[bool, str](cfg_in_r)) {
+        dnit_project(?p);
+        ret err[Project, str](unwrap_err[bool, str](cfg_in_r));
     }
 
     val resolve_r: Result[bool, str] = run_resolve_pass(?p);
@@ -924,8 +938,9 @@ fun span_eq_str(source: str, span: token.Span, s: str) bool {
 # across rebuilds. parsed ASTs ARE reused across builds: each `ModuleEntry.a` is
 # borrowed from the session query DB (the Q_PARSE handle), which this teardown
 # leaves intact, so an unchanged module's AST survives to the next build (#1580).
-# resolve results are NOT reused — each reload re-resolves the full closure
-# (resolve-level incremental is a separate, larger effort).
+# resolve results are likewise borrowed from the query DB (the Q_RESOLVE handle)
+# and reused across rebuilds of an unchanged closure; this teardown leaves them
+# intact too (#1582).
 # ---
 # p: project to tear down; nil is a no-op
 pub fun dnit_project(p: *Project) {
@@ -933,9 +948,9 @@ pub fun dnit_project(p: *Project) {
     var i: u32 = 0;
     for (i < p.module_len) {
         val m: *ModuleEntry = ?p.modules[i];
-        if (m.resolved) {
-            resolve.dnit_result(?m.resolve_result);
-        }
+        # m.resolve_result is BORROWED from the session query DB (the Q_RESOLVE
+        # handle), which owns and frees it (and reuses it across rebuilds). do NOT
+        # free it here.
         comptime.dnit(?m.ctx);
         # m.a is BORROWED from the session query DB (the Q_PARSE handle), which owns
         # and frees it (and reuses it across rebuilds). do NOT free it here.
@@ -1988,6 +2003,7 @@ fun register_module_slot(p: *Project, fqn: intern.StrId) Result[sess.ModuleId, s
     m.deps              = nil;
     m.dep_count         = 0;
     m.dep_cap           = 0;
+    m.resolve_result    = nil;
     m.resolved          = false;
     p.modules[p.module_len] = m;
     p.module_len = p.module_len + 1;
@@ -2191,13 +2207,19 @@ fun parse_module(p: *Project, mid: sess.ModuleId, fqn: intern.StrId) Result[bool
 # register the driver-owned derived kinds the build routes through. set_ctx is
 # refreshed every build (the session address is stable); each kind is registered
 # exactly once per session (registered() guards the idempotent re-call). Q_PARSE
-# carries an opaque AST handle (owned); Q_EXPORTS is a plain byte fingerprint with
-# output early-cutoff — the firewall — so it is a plain derived kind.
+# and Q_RESOLVE carry opaque heap handles (owned); Q_EXPORTS is a plain byte
+# fingerprint with output early-cutoff — the firewall — so it is a plain derived
+# kind. Q_PARSE is keyed by FileId; Q_RESOLVE and Q_EXPORTS by StableModuleId, the
+# cross-build-stable key a reused result remaps through (#1582).
 fun ensure_query_pipeline(s: *sess.Session) Result[bool, str] {
     query.set_ctx(?s.queries, s::ptr);
     if (!query.registered(?s.queries, query.Q_PARSE)) {
         val rp: Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_PARSE, q_parse_compute, q_parse_finalize);
         if (is_err[bool, str](rp)) { ret rp; }
+    }
+    if (!query.registered(?s.queries, query.Q_RESOLVE)) {
+        val rr: Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_RESOLVE, q_resolve_compute, q_resolve_finalize);
+        if (is_err[bool, str](rr)) { ret rr; }
     }
     if (!query.registered(?s.queries, query.Q_EXPORTS)) {
         val re: Result[bool, str] = query.register_derived(?s.queries, query.Q_EXPORTS, q_exports_compute);
@@ -2306,26 +2328,29 @@ fun q_parse_emit_stage(s: *sess.Session, stage: str, path: str) {
 }
 
 # q_exports_compute: the Q_EXPORTS derived compute — a deterministic byte
-# fingerprint of one module's public surface (#1581). reaches the module's parsed
-# AST through db.ctx and records the Q_PARSE dep, so any re-parse re-runs this;
-# but the fingerprint covers only each pub decl's kind, name, and signature shape
-# (a function body is excluded), so a private-only edit reproduces identical
-# bytes and the engine's output early-cutoff firewalls importers. a plain
-# byte-valued derived kind (early-cutoff ON), not an owned handle.
+# fingerprint of one module's RESOLVED public surface (#1581/#1582). reads the
+# module's ResolveResult through Q_RESOLVE (recording the dep) and fingerprints
+# exactly what an importer's resolution binds against: per pub symbol, its kind,
+# name, originating DeclId, build-stable origin, and (for a `fwd`/`use` module
+# re-export) the build-stable target the alias names. this is the surface
+# build_module_exports hands a dependent resolve, so the fingerprint changes iff a
+# dependent's resolution could change — including a re-exported dep whose own kind
+# shifted without this module's text changing (the syntactic fingerprint missed
+# that). a private-only edit re-runs Q_RESOLVE but leaves the pub surface identical,
+# so this reproduces identical bytes and the engine's output early-cutoff firewalls
+# importers. build-stable ids (not per-build ModuleIds) keep the bytes reshape-
+# stable. a plain byte-valued derived kind (early-cutoff ON), keyed by StableModuleId.
 fun q_exports_compute(db: *query.QueryDb, key: u64, alloc: *Allocator) Result[query.QueryOutput, str] {
     val s: *sess.Session = db.ctx::*sess.Session;
     if (s == nil) { ret err[query.QueryOutput, str]("Q_EXPORTS: query db has no session context"); }
-    val mid: sess.ModuleId = key::u32;
 
-    val a: *ast.Ast = sess.module_ast(s, mid);
-    if (a == nil) { ret err[query.QueryOutput, str]("Q_EXPORTS: module has no registered AST"); }
+    val e_r: Result[*query.QueryEntry, str] = query.get(db, query.Q_RESOLVE, key);
+    if (is_err[*query.QueryEntry, str](e_r)) { ret err[query.QueryOutput, str](unwrap_err[*query.QueryEntry, str](e_r)); }
+    val rr: *resolve.ResolveResult = resolve_handle_decode(unwrap_ok[*query.QueryEntry, str](e_r));
+    if (rr == nil) { ret err[query.QueryOutput, str]("Q_EXPORTS: module has no resolve result"); }
 
-    val rd: Result[bool, str] = query.record_dep(db, query.Q_EXPORTS, key, query.Q_PARSE, a.file_id::u64);
+    val rd: Result[bool, str] = query.record_dep(db, query.Q_EXPORTS, key, query.Q_RESOLVE, key);
     if (is_err[bool, str](rd)) { ret err[query.QueryOutput, str](unwrap_err[bool, str](rd)); }
-
-    val src_opt: Option[*src.SourceFile] = src.get(?s.sources, a.file_id);
-    if (is_none[*src.SourceFile](src_opt)) { ret err[query.QueryOutput, str]("Q_EXPORTS: FileId not registered with the session"); }
-    val source: str = unwrap[*src.SourceFile](src_opt).text;
 
     var fb: FpBuf;
     fb.alloc = alloc;
@@ -2333,20 +2358,54 @@ fun q_exports_compute(db: *query.QueryDb, key: u64, alloc: *Allocator) Result[qu
     fb.len   = 0;
     fb.cap   = 0;
 
-    val m_opt: Option[*module.Module] = ast.get_module(a, a.root_module);
-    if (is_some[*module.Module](m_opt)) {
-        val mnode: *module.Module = unwrap[*module.Module](m_opt);
-        val wr: Result[bool, str] = fp_walk_decls(?fb, a, source, mnode.decls_start, mnode.decls_len);
-        if (is_err[bool, str](wr)) {
-            if (fb.buf != nil && fb.cap > 0) { deallocate[u8](alloc, fb.buf, fb.cap::usize); }
-            ret err[query.QueryOutput, str](unwrap_err[bool, str](wr));
-        }
+    val wr: Result[bool, str] = fp_pub_surface(?fb, rr);
+    if (is_err[bool, str](wr)) {
+        if (fb.buf != nil && fb.cap > 0) { deallocate[u8](alloc, fb.buf, fb.cap::usize); }
+        ret err[query.QueryOutput, str](unwrap_err[bool, str](wr));
     }
 
     var out: query.QueryOutput;
     out.bytes = fb.buf;
     out.len   = fb.len;
     ret ok[query.QueryOutput, str](out);
+}
+
+# fp_pub_surface: append the resolved pub surface of `rr` to the fingerprint — the
+# pub symbols occupy indices [0, pub_count) in source-deterministic order. each
+# symbol contributes the exact tuple build_module_exports exposes to a dependent
+# resolve (kind, name, decl, origin, slot), with origin/slot in build-stable space.
+# the resolved pub comptime constant VALUES are appended too (rr.pub_const_fp): an
+# importer's resolution forks on them via `$if` over imported consts, but they are
+# not in the symbol identities, so they must enter the firewall fingerprint (#1582).
+fun fp_pub_surface(fb: *FpBuf, rr: *resolve.ResolveResult) Result[bool, str] {
+    val pc: Result[bool, str] = fp_u32(fb, rr.pub_count);
+    if (is_err[bool, str](pc)) { ret pc; }
+    if (rr.symbols == nil) { ret ok[bool, str](true); }
+    var i: u32 = 0;
+    for (i < rr.pub_count) {
+        val sym: *resolve.Symbol = ?rr.symbols[i];
+        val rk: Result[bool, str] = fp_u8(fb, sym.kind::u8);             if (is_err[bool, str](rk)) { ret rk; }
+        val rn: Result[bool, str] = fp_u32(fb, sym.name::u32);          if (is_err[bool, str](rn)) { ret rn; }
+        val rdl: Result[bool, str] = fp_u32(fb, sym.decl::u32);         if (is_err[bool, str](rdl)) { ret rdl; }
+        val ro: Result[bool, str] = fp_u32(fb, sym.origin_stable::u32); if (is_err[bool, str](ro)) { ret ro; }
+        # SYM_USE's slot is a module reference (its build-stable twin); every other
+        # kind's slot is a build-independent index — fingerprint each in its own space.
+        var slot_fp: u32 = sym.slot;
+        if (sym.kind == resolve.SYM_USE) { slot_fp = sym.slot_stable::u32; }
+        val rs: Result[bool, str] = fp_u32(fb, slot_fp);                if (is_err[bool, str](rs)) { ret rs; }
+        i = i + 1;
+    }
+
+    # append the pub comptime constant value fingerprint (length-prefixed).
+    val rl: Result[bool, str] = fp_u32(fb, rr.pub_const_fp_len);
+    if (is_err[bool, str](rl)) { ret rl; }
+    var b: u32 = 0;
+    for (b < rr.pub_const_fp_len) {
+        val rb: Result[bool, str] = fp_u8(fb, rr.pub_const_fp[b]);
+        if (is_err[bool, str](rb)) { ret rb; }
+        b = b + 1;
+    }
+    ret ok[bool, str](true);
 }
 
 # FpBuf: a growable byte buffer the export fingerprint is appended into.
@@ -2400,103 +2459,6 @@ fun fp_u32(b: *FpBuf, v: u32) Result[bool, str] {
     b.buf[b.len + 3] = ((v >> 24) & 0xFF)::u8;
     b.len = b.len + 4;
     ret ok[bool, str](true);
-}
-
-# fp_span: append a length prefix and the source bytes covered by `span`.
-fun fp_span(b: *FpBuf, source: str, span: token.Span) Result[bool, str] {
-    val n: u32 = span.len::u32;
-    val rl: Result[bool, str] = fp_u32(b, n);
-    if (is_err[bool, str](rl)) { ret rl; }
-    val rr: Result[bool, str] = fp_reserve(b, n);
-    if (is_err[bool, str](rr)) { ret rr; }
-    var i: usize = 0;
-    for (i < span.len) {
-        b.buf[b.len] = source[span.offset + i];
-        b.len = b.len + 1;
-        i = i + 1;
-    }
-    ret ok[bool, str](true);
-}
-
-# fp_walk_decls: append every pub declaration in a decl list to the fingerprint,
-# recursing into comptime-if branches (where target-gated pub decls live). decls
-# are walked in source order, which is deterministic for a given AST.
-fun fp_walk_decls(b: *FpBuf, a: *ast.Ast, source: str, start: u32, len: u32) Result[bool, str] {
-    var i: u32 = 0;
-    for (i < len) {
-        val did: id.DeclId = a.decl_ids[start + i];
-        val d_opt: Option[*decl.Decl] = ast.get_decl(a, did);
-        if (is_some[*decl.Decl](d_opt)) {
-            val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
-            if ((d.flags & decl.DECL_FLAG_PUB) != 0::u8) {
-                val r: Result[bool, str] = fp_emit_decl(b, a, source, d);
-                if (is_err[bool, str](r)) { ret r; }
-            }
-            if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
-                val ci: *decl.DeclComptimeIf = ?d.data.comptime_if;
-                var bi: u32 = 0;
-                for (bi < ci.branches_len) {
-                    val br: *decl.ComptimeBranch = ?a.comptime_branches[ci.branches_start + bi];
-                    val rb: Result[bool, str] = fp_walk_decls(b, a, source, br.body_start, br.body_len);
-                    if (is_err[bool, str](rb)) { ret rb; }
-                    bi = bi + 1;
-                }
-            }
-        }
-        i = i + 1;
-    }
-    ret ok[bool, str](true);
-}
-
-# fp_emit_decl: append one pub decl's kind, name, and signature shape. the shape
-# is the decl's source span with a function body excluded (so a body-only edit is
-# invisible to the fingerprint); for every other kind the whole decl span is the
-# public contract (a record's fields, a pub val's initializer, a def's underlying
-# type all matter to importers).
-fun fp_emit_decl(b: *FpBuf, a: *ast.Ast, source: str, d: *decl.Decl) Result[bool, str] {
-    val rk: Result[bool, str] = fp_u8(b, d.kind::u8);
-    if (is_err[bool, str](rk)) { ret rk; }
-    val rn: Result[bool, str] = fp_span(b, source, decl_name_span(d));
-    if (is_err[bool, str](rn)) { ret rn; }
-    ret fp_span(b, source, decl_shape_span(a, d));
-}
-
-# decl_name_span: the span of a decl's declared identifier (the alias for a
-# use/fwd re-export, falling back to its path when the alias is elided).
-fun decl_name_span(d: *decl.Decl) token.Span {
-    if (d.kind == decl.DECL_KIND_FUN) { ret d.data.fun_.name; }
-    if (d.kind == decl.DECL_KIND_REC) { ret d.data.rec_.name; }
-    if (d.kind == decl.DECL_KIND_UNI) { ret d.data.uni_.name; }
-    if (d.kind == decl.DECL_KIND_VAL || d.kind == decl.DECL_KIND_VAR) { ret d.data.bind.name; }
-    if (d.kind == decl.DECL_KIND_DEF) { ret d.data.def_.name; }
-    if (d.kind == decl.DECL_KIND_USE) {
-        if (d.data.use_.alias.len > 0::usize) { ret d.data.use_.alias; }
-        ret d.data.use_.path;
-    }
-    if (d.kind == decl.DECL_KIND_FWD) {
-        if (d.data.fwd_.alias.len > 0::usize) { ret d.data.fwd_.alias; }
-        ret d.data.fwd_.path;
-    }
-    ret d.span;
-}
-
-# decl_shape_span: the source span that is a decl's public contract — a function's
-# signature (its decl span up to the body block, body excluded) or the whole decl
-# span otherwise.
-fun decl_shape_span(a: *ast.Ast, d: *decl.Decl) token.Span {
-    if (d.kind == decl.DECL_KIND_FUN && d.data.fun_.body != id.STMT_NIL) {
-        val s_opt: Option[*stmt.Stmt] = ast.get_stmt(a, d.data.fun_.body);
-        if (is_some[*stmt.Stmt](s_opt)) {
-            val body_off: usize = unwrap[*stmt.Stmt](s_opt).span.offset;
-            if (body_off > d.span.offset) {
-                var sig: token.Span;
-                sig.offset = d.span.offset;
-                sig.len    = body_off - d.span.offset;
-                ret sig;
-            }
-        }
-    }
-    ret d.span;
 }
 
 # walk_module_for_load: walk the module's decls in source order,
@@ -3074,19 +3036,193 @@ fun register_module_asts(p: *Project) Result[bool, str] {
         if (is_err[bool, str](r)) { ret r; }
         val rf: Result[bool, str] = sess.register_module_fqn(p.s, i, m.fqn);
         if (is_err[bool, str](rf)) { ret rf; }
+        # record this build's StableModuleId -> ModuleId so a reused ResolveResult
+        # remaps its stale ModuleIds into this build's numbering (#1582).
+        val rs: Result[bool, str] = sess.register_stable_mid(p.s, m.stable_id, i);
+        if (is_err[bool, str](rs)) { ret rs; }
         i = i + 1;
     }
     ret ok[bool, str](true);
 }
 
+# run_resolve_pass: resolve every module in topo order through the Q_RESOLVE query.
+# the active Project is installed on the session for the pass so the compute can
+# reach the per-build module graph; topo order guarantees each module's deps are
+# already resolved (and their Q_RESOLVE/Q_EXPORTS entries valid) before it runs, so
+# the firewall gets the compute issues never recurse into an unresolved dep.
 fun run_resolve_pass(p: *Project) Result[bool, str] {
-    # dep-closure scratch reused across every module: a `visited` mark array and a
-    # worklist, both bounded by module_len. allocating them once per build (not once
-    # per module in build_resolve_deps) keeps dep-set construction O(modules) in
-    # allocation rather than O(modules^2). visited is zeroed once here and each call
-    # restores it to all-false on success, so successive calls start clean.
+    sess.set_active_project(p.s, p::ptr);
+
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val mid: sess.ModuleId = p.topo[i];
+        val r: Result[bool, str] = run_resolve_one(p, mid);
+        if (is_err[bool, str](r)) {
+            sess.set_active_project(p.s, nil);
+            ret r;
+        }
+        i = i + 1;
+    }
+    sess.set_active_project(p.s, nil);
+    ret ok[bool, str](true);
+}
+
+# run_resolve_one: fetch module `mid`'s ResolveResult through Q_RESOLVE — computed
+# fresh when its AST or any dep's export fingerprint changed, reused otherwise — and
+# remap the (possibly cross-build) result into this build's ModuleId numbering. the
+# result is borrowed from the query DB; m.resolve_result only points at it.
+fun run_resolve_one(p: *Project, mid: sess.ModuleId) Result[bool, str] {
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+
+    emit_stage(p, "resolve", m.fqn);
+
+    val e_r: Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_RESOLVE, m.stable_id::u64);
+    if (is_err[*query.QueryEntry, str](e_r)) { ret err[bool, str](unwrap_err[*query.QueryEntry, str](e_r)); }
+    val rr: *resolve.ResolveResult = resolve_handle_decode(unwrap_ok[*query.QueryEntry, str](e_r));
+    if (rr == nil) { ret err[bool, str]("Q_RESOLVE produced no result handle"); }
+
+    # refresh this module's export fingerprint NOW, in topo order. the engine's
+    # validator compares a dep's STORED last_changed (it does not recursively
+    # recompute derived deps), so an importer is only invalidated correctly if its
+    # deps' Q_EXPORTS are already refreshed when it is validated. resolving in topo
+    # order and refreshing each module's Q_EXPORTS here guarantees that: every dep's
+    # fingerprint is current before any importer's Q_RESOLVE is revalidated, so the
+    # firewall both holds (private edit: identical bytes, early-cut) and fires
+    # (visible-surface change: bytes differ, importer re-resolves) (#1582).
+    val ex_r: Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_EXPORTS, m.stable_id::u64);
+    if (is_err[*query.QueryEntry, str](ex_r)) { ret err[bool, str](unwrap_err[*query.QueryEntry, str](ex_r)); }
+
+    # translate the result's ModuleId-valued fields into THIS build's numbering: a
+    # reused result still carries the producing build's mids (#1582). idempotent for
+    # a freshly computed result (its mids already match this build).
+    resolve.remap_result(rr, p.s);
+
+    m.resolve_result = rr;
+    m.resolved       = true;
+    ret ok[bool, str](true);
+}
+
+# q_resolve_compute: the Q_RESOLVE derived compute — resolve one module against its
+# dependencies and return the ResolveResult as an opaque owned handle. reaches the
+# per-build module graph through the session's active Project (the engine's ComputeFn
+# signature cannot carry it), and records the deps that make the entry incremental:
+#   - Q_PARSE(file): a text edit re-parses the AST and re-resolves this module;
+#   - Q_TARGET:      a build-config change re-resolves every module ($if forks on it);
+#   - Q_EXPORTS(dep) for every module in the resolve dep closure: a dep's VISIBLE
+#     surface change re-resolves this module, while a private-only edit early-cuts
+#     at Q_EXPORTS and leaves this entry valid (the firewall).
+fun q_resolve_compute(db: *query.QueryDb, key: u64, alloc: *Allocator) Result[query.QueryOutput, str] {
+    val s: *sess.Session = db.ctx::*sess.Session;
+    if (s == nil) { ret err[query.QueryOutput, str]("Q_RESOLVE: query db has no session context"); }
+    val pp: ptr = sess.active_project(s);
+    if (pp == nil) { ret err[query.QueryOutput, str]("Q_RESOLVE: no active project for the resolve pass"); }
+    val p: *Project = pp::*Project;
+
+    val stable: sess.StableModuleId = key::u32::sess.StableModuleId;
+    val mid: sess.ModuleId = sess.module_id_for_stable(s, stable);
+    if (mid == sess.MODULE_NIL) { ret err[query.QueryOutput, str]("Q_RESOLVE: stable id not loaded this build"); }
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    val a: *ast.Ast = m.a;
+    if (a == nil) { ret err[query.QueryOutput, str]("Q_RESOLVE: module has no parsed AST"); }
+
+    val rp: Result[bool, str] = query.record_dep(db, query.Q_RESOLVE, key, query.Q_PARSE, a.file_id::u64);
+    if (is_err[bool, str](rp)) { ret err[query.QueryOutput, str](unwrap_err[bool, str](rp)); }
+    val rt: Result[bool, str] = query.record_dep(db, query.Q_RESOLVE, key, query.Q_TARGET, 0);
+    if (is_err[bool, str](rt)) { ret err[query.QueryOutput, str](unwrap_err[bool, str](rt)); }
+
+    val deps_r: Result[resolve.ResolveDeps, str] = build_resolve_deps_owned(p, m);
+    if (is_err[resolve.ResolveDeps, str](deps_r)) { ret err[query.QueryOutput, str](unwrap_err[resolve.ResolveDeps, str](deps_r)); }
+    var deps: resolve.ResolveDeps = unwrap_ok[resolve.ResolveDeps, str](deps_r);
+
+    # record the firewall dep on each dep's Q_EXPORTS, fetching it first so the
+    # recorded revision is current. duplicate entries (a bare-alias dep appears
+    # twice) record a redundant — harmless — dep.
+    var di: u32 = 0;
+    for (di < deps.count) {
+        val dep_mid: sess.ModuleId = deps.entries[di].module;
+        if (dep_mid::u32 < p.module_len) {
+            val dep_stable: sess.StableModuleId = p.modules[dep_mid::u32].stable_id;
+            val ge: Result[*query.QueryEntry, str] = query.get(db, query.Q_EXPORTS, dep_stable::u64);
+            if (is_err[*query.QueryEntry, str](ge)) {
+                free_resolve_deps(s.alloc, ?deps);
+                ret err[query.QueryOutput, str](unwrap_err[*query.QueryEntry, str](ge));
+            }
+            val rd: Result[bool, str] = query.record_dep(db, query.Q_RESOLVE, key, query.Q_EXPORTS, dep_stable::u64);
+            if (is_err[bool, str](rd)) {
+                free_resolve_deps(s.alloc, ?deps);
+                ret err[query.QueryOutput, str](unwrap_err[bool, str](rd));
+            }
+        }
+        di = di + 1;
+    }
+
+    val rr_r: Result[resolve.ResolveResult, str] = resolve.resolve(s, a, ?deps, ?m.ctx, mid);
+    free_resolve_deps(s.alloc, ?deps);
+    if (is_err[resolve.ResolveResult, str](rr_r)) { ret err[query.QueryOutput, str](unwrap_err[resolve.ResolveResult, str](rr_r)); }
+    var result: resolve.ResolveResult = unwrap_ok[resolve.ResolveResult, str](rr_r);
+
+    val br: Result[*resolve.ResolveResult, str] = allocate[resolve.ResolveResult](alloc, 1::usize);
+    if (is_err[*resolve.ResolveResult, str](br)) {
+        resolve.dnit_result(?result);
+        ret err[query.QueryOutput, str](unwrap_err[*resolve.ResolveResult, str](br));
+    }
+    val box: *resolve.ResolveResult = unwrap_ok[*resolve.ResolveResult, str](br);
+    box[0] = result;
+    ret resolve_handle_encode(alloc, box);
+}
+
+# q_resolve_finalize: release the ResolveResult a Q_RESOLVE handle owns, called by
+# the engine before it frees the handle buffer (on recompute, invalidate, dnit).
+fun q_resolve_finalize(value: *u8, value_len: u32, alloc: *Allocator) {
+    if (value == nil || value_len::usize < $size_of(ptr)) { ret; }
+    val slot: *ptr = value::ptr::*ptr;
+    val r: *resolve.ResolveResult = slot[0]::*resolve.ResolveResult;
+    if (r == nil) { ret; }
+    resolve.dnit_result(r);
+    deallocate[resolve.ResolveResult](alloc, r, 1::usize);
+}
+
+# resolve_handle_encode: wrap a heap ResolveResult pointer as a pointer-sized opaque
+# handle buffer — the Q_RESOLVE query value. like the Q_PARSE AST handle, the heavy
+# pointer-graph artifact lives in the byte-buffer DB as a handle, never serialized.
+fun resolve_handle_encode(alloc: *Allocator, r: *resolve.ResolveResult) Result[query.QueryOutput, str] {
+    val n: u32 = $size_of(ptr)::u32;
+    val rb: Result[*u8, str] = allocate[u8](alloc, n::usize);
+    if (is_err[*u8, str](rb)) {
+        resolve.dnit_result(r);
+        deallocate[resolve.ResolveResult](alloc, r, 1::usize);
+        ret err[query.QueryOutput, str](unwrap_err[*u8, str](rb));
+    }
+    val buf: *u8 = unwrap_ok[*u8, str](rb);
+    val slot: *ptr = buf::ptr::*ptr;
+    slot[0] = r::ptr;
+    var out: query.QueryOutput;
+    out.bytes = buf;
+    out.len   = n;
+    ret ok[query.QueryOutput, str](out);
+}
+
+# resolve_handle_decode: read the ResolveResult pointer back out of a Q_RESOLVE
+# handle entry, or nil when the entry carries no value.
+fun resolve_handle_decode(e: *query.QueryEntry) *resolve.ResolveResult {
+    if (e.value == nil || e.value_len::usize < $size_of(ptr)) { ret nil; }
+    val slot: *ptr = e.value::ptr::*ptr;
+    ret slot[0]::*resolve.ResolveResult;
+}
+
+# build_resolve_deps_owned: build_resolve_deps with its own dep-closure scratch
+# (`visited` mark array + worklist, both bounded by module_len), so the Q_RESOLVE
+# compute — which has no access to a caller-owned scratch — can call it. the scratch
+# is allocated and freed per compute; a recompute is the cold path, so this is not
+# the per-module-in-a-tight-loop allocation the shared scratch once guarded against.
+fun build_resolve_deps_owned(p: *Project, m: *ModuleEntry) Result[resolve.ResolveDeps, str] {
+    var deps: resolve.ResolveDeps;
+    deps.entries = nil;
+    deps.count   = 0;
+    if (m.dep_count == 0) { ret ok[resolve.ResolveDeps, str](deps); }
+
     val vr: Result[*bool, str] = allocate[bool](p.s.alloc, p.module_len::usize);
-    if (is_err[*bool, str](vr)) { ret err[bool, str](unwrap_err[*bool, str](vr)); }
+    if (is_err[*bool, str](vr)) { ret err[resolve.ResolveDeps, str](unwrap_err[*bool, str](vr)); }
     val visited: *bool = unwrap_ok[*bool, str](vr);
     var vi: u32 = 0;
     for (vi < p.module_len) { visited[vi] = false; vi = vi + 1; }
@@ -3094,41 +3230,71 @@ fun run_resolve_pass(p: *Project) Result[bool, str] {
     val lr: Result[*sess.ModuleId, str] = allocate[sess.ModuleId](p.s.alloc, p.module_len::usize);
     if (is_err[*sess.ModuleId, str](lr)) {
         deallocate[bool](p.s.alloc, visited, p.module_len::usize);
-        ret err[bool, str](unwrap_err[*sess.ModuleId, str](lr));
+        ret err[resolve.ResolveDeps, str](unwrap_err[*sess.ModuleId, str](lr));
     }
     val list: *sess.ModuleId = unwrap_ok[*sess.ModuleId, str](lr);
 
-    var i: u32 = 0;
-    for (i < p.topo_len) {
-        val mid: sess.ModuleId = p.topo[i];
-        val r: Result[bool, str] = run_resolve_one(p, mid, visited, list);
-        if (is_err[bool, str](r)) {
-            deallocate[sess.ModuleId](p.s.alloc, list, p.module_len::usize);
-            deallocate[bool](p.s.alloc, visited, p.module_len::usize);
-            ret r;
-        }
-        i = i + 1;
-    }
+    val r: Result[resolve.ResolveDeps, str] = build_resolve_deps(p, m, visited, list);
     deallocate[sess.ModuleId](p.s.alloc, list, p.module_len::usize);
     deallocate[bool](p.s.alloc, visited, p.module_len::usize);
-    ret ok[bool, str](true);
+    ret r;
 }
 
-fun run_resolve_one(p: *Project, mid: sess.ModuleId, visited: *bool, list: *sess.ModuleId) Result[bool, str] {
-    val m: *ModuleEntry = ?p.modules[mid::u32];
+# set_build_config_input: serialize the build configuration the comptime ctx forks
+# on — target os/isa/abi tuple, optimization mode, pointer width, the manifest
+# project identity, and the active defines — into the Q_TARGET input. set_input's
+# byte-equality cutoff leaves last_changed untouched for an identical reconfigure
+# (so Q_RESOLVE stays valid) and advances it on any real change (so every module
+# re-resolves). the value is build-wide, so it is keyed under 0 (#1582).
+fun set_build_config_input(p: *Project) Result[bool, str] {
+    var build_mode_id: u32 = comptime.MODE_DEBUG;
+    if (p.s.opt_explicit) {
+        if (p.s.opt_release) { build_mode_id = comptime.MODE_RELEASE; }
+    } or (p.target_entry.opt == TARGET_OPT_RELEASE) {
+        build_mode_id = comptime.MODE_RELEASE;
+    }
 
-    emit_stage(p, "resolve", m.fqn);
+    var fb: FpBuf;
+    fb.alloc = p.s.alloc;
+    fb.buf   = nil;
+    fb.len   = 0;
+    fb.cap   = 0;
 
-    val deps_r: Result[resolve.ResolveDeps, str] = build_resolve_deps(p, m, visited, list);
-    if (is_err[resolve.ResolveDeps, str](deps_r)) { ret err[bool, str](unwrap_err[resolve.ResolveDeps, str](deps_r)); }
-    var deps: resolve.ResolveDeps = unwrap_ok[resolve.ResolveDeps, str](deps_r);
+    val w: Result[bool, str] = write_build_config(?fb, p, build_mode_id);
+    if (is_err[bool, str](w)) {
+        if (fb.buf != nil && fb.cap > 0) { deallocate[u8](p.s.alloc, fb.buf, fb.cap::usize); }
+        ret w;
+    }
 
-    val rr_r: Result[resolve.ResolveResult, str] = resolve.resolve(p.s, m.a, ?deps, ?m.ctx, mid);
-    free_resolve_deps(p.s.alloc, ?deps);
-    if (is_err[resolve.ResolveResult, str](rr_r)) { ret err[bool, str](unwrap_err[resolve.ResolveResult, str](rr_r)); }
+    val si: Result[bool, str] = query.set_input(?p.s.queries, query.Q_TARGET, 0, fb.buf, fb.len);
+    if (fb.buf != nil && fb.cap > 0) { deallocate[u8](p.s.alloc, fb.buf, fb.cap::usize); }
+    ret si;
+}
 
-    m.resolve_result = unwrap_ok[resolve.ResolveResult, str](rr_r);
-    m.resolved       = true;
+# write_build_config: append the comptime-relevant build axes into `fb`. every value
+# an importer-independent `$if` can read is captured, so a change to any of them
+# advances Q_TARGET and re-resolves the graph.
+fun write_build_config(fb: *FpBuf, p: *Project, build_mode_id: u32) Result[bool, str] {
+    val a0: Result[bool, str] = fp_u32(fb, p.target.os_id);        if (is_err[bool, str](a0)) { ret a0; }
+    val a1: Result[bool, str] = fp_u32(fb, p.target.arch_id);      if (is_err[bool, str](a1)) { ret a1; }
+    val a2: Result[bool, str] = fp_u32(fb, p.target.abi_id);       if (is_err[bool, str](a2)) { ret a2; }
+    val a3: Result[bool, str] = fp_u32(fb, build_mode_id);         if (is_err[bool, str](a3)) { ret a3; }
+    val a4: Result[bool, str] = fp_u32(fb, p.target.arch.pointer_width); if (is_err[bool, str](a4)) { ret a4; }
+    val a5: Result[bool, str] = fp_u32(fb, p.target_entry.os_name::u32);  if (is_err[bool, str](a5)) { ret a5; }
+    val a6: Result[bool, str] = fp_u32(fb, p.target_entry.isa_name::u32); if (is_err[bool, str](a6)) { ret a6; }
+    val a7: Result[bool, str] = fp_u32(fb, p.target_entry.abi_name::u32); if (is_err[bool, str](a7)) { ret a7; }
+    val a8: Result[bool, str] = fp_u32(fb, p.config.id::u32);      if (is_err[bool, str](a8)) { ret a8; }
+    val a9: Result[bool, str] = fp_u32(fb, p.config.version::u32); if (is_err[bool, str](a9)) { ret a9; }
+    val aa: Result[bool, str] = fp_u32(fb, p.config.name::u32);    if (is_err[bool, str](aa)) { ret aa; }
+    val ab: Result[bool, str] = fp_u32(fb, p.config.bin_name::u32); if (is_err[bool, str](ab)) { ret ab; }
+
+    val ac: Result[bool, str] = fp_u32(fb, p.config.define_count); if (is_err[bool, str](ac)) { ret ac; }
+    var i: u32 = 0;
+    for (i < p.config.define_count) {
+        val ad: Result[bool, str] = fp_u32(fb, p.config.defines[i]::u32);
+        if (is_err[bool, str](ad)) { ret ad; }
+        i = i + 1;
+    }
     ret ok[bool, str](true);
 }
 
@@ -3276,8 +3442,8 @@ fun canonical_module_fqn_is(p: *Project, id: intern.StrId, module: intern.StrId,
 # revisits a module.
 fun add_reexport_targets(p: *Project, mid: sess.ModuleId, visited: *bool, list: *sess.ModuleId, list_len: *u32) {
     val dep: *ModuleEntry = ?p.modules[mid::u32];
-    if (!dep.resolved) { ret; }
-    val rr: *resolve.ResolveResult = ?dep.resolve_result;
+    if (!dep.resolved || dep.resolve_result == nil) { ret; }
+    val rr: *resolve.ResolveResult = dep.resolve_result;
     if (rr.symbols == nil) { ret; }
     var i: u32 = 0;
     for (i < rr.pub_count) {
@@ -3300,7 +3466,7 @@ fun build_module_exports(p: *Project, dep_id: sess.ModuleId, dep: *ModuleEntry) 
     mx.module  = dep_id;
     mx.symbols = nil;
     mx.count   = 0;
-    if (!dep.resolved || dep.resolve_result.pub_count == 0) {
+    if (!dep.resolved || dep.resolve_result == nil || dep.resolve_result.pub_count == 0) {
         ret ok[resolve.ModuleExports, str](mx);
     }
     val pcount: u32 = dep.resolve_result.pub_count;
@@ -4127,7 +4293,7 @@ test "driver incremental: a module keeps its stable identity across a graph resh
     ret bad;
 }
 
-test "driver incremental: Q_EXPORTS fingerprints the pub surface, firewalls a private body edit (#1581)" {
+test "driver incremental: Q_EXPORTS fingerprints the resolved pub surface, firewalls a private body edit (#1581/#1582)" {
     var alloc: Allocator;
     if (is_some[str](page.make(?alloc))) { ret 1; }
     val sr: Result[sess.Session, str] = sess.init(?alloc);
@@ -4148,13 +4314,14 @@ test "driver incremental: Q_EXPORTS fingerprints the pub surface, firewalls a pr
 
     var bad: i32 = 0;
 
-    # build 1: capture the module's Q_EXPORTS fingerprint and its last_changed.
+    # build 1: capture the module's Q_EXPORTS fingerprint and its last_changed. the
+    # query is keyed by the build-stable id (#1582), captured here while p1 is alive.
     val p1r: Result[Project, str] = build_project_union(?s, root);
     if (is_err[Project, str](p1r)) { fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
     var p1: Project = unwrap_ok[Project, str](p1r);
-    val mid: sess.ModuleId = ut_mid(?p1, ?s, "uniontest.main");
-    if (mid == sess.MODULE_NIL) { bad = 1; }
-    val q1: Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_EXPORTS, mid::u64);
+    val stable: sess.StableModuleId = ut_stable(?p1, ?s, "uniontest.main");
+    if (stable == sess.STABLE_MODULE_NIL) { bad = 1; }
+    val q1: Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_EXPORTS, stable::u64);
     if (is_err[*query.QueryEntry, str](q1)) { dnit_project(?p1); fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
     val ent1: *query.QueryEntry = unwrap_ok[*query.QueryEntry, str](q1);
     val lc1: query.Revision = ent1.last_changed;
@@ -4167,8 +4334,11 @@ test "driver incremental: Q_EXPORTS fingerprints the pub surface, firewalls a pr
     if (len1 == 0) { bad = 1; }
     dnit_project(?p1);
 
-    # edit only the body: the signature is byte-identical, so Q_EXPORTS reproduces
-    # the same fingerprint and the engine early-cuts — last_changed must NOT advance.
+    # edit only the body: f's resolved pub symbol (kind/name/decl/origin) is
+    # unchanged, so Q_EXPORTS re-resolves but reproduces the same fingerprint and the
+    # engine early-cuts — last_changed must NOT advance. a type-only signature edit
+    # would behave identically: it does not change what importers BIND to (that is a
+    # sema-level concern), only their typing, so the resolve firewall holds.
     val src_dir: str = ut_cc3(?alloc, root, "/", "src");
     val main_path: str = ut_cc3(?alloc, src_dir, "/", "main.mach");
     val body_edit: str = "pub fun f(a: i32) i32 { val t: i32 = a; ret t; }\n";
@@ -4178,7 +4348,7 @@ test "driver incremental: Q_EXPORTS fingerprints the pub surface, firewalls a pr
     val p2r: Result[Project, str] = build_project_union(?s, root);
     if (is_err[Project, str](p2r)) { deallocate[u8](?alloc, fp1, len1::usize); fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
     var p2: Project = unwrap_ok[Project, str](p2r);
-    val q2: Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_EXPORTS, mid::u64);
+    val q2: Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_EXPORTS, stable::u64);
     if (is_err[*query.QueryEntry, str](q2)) { dnit_project(?p2); deallocate[u8](?alloc, fp1, len1::usize); fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
     val ent2: *query.QueryEntry = unwrap_ok[*query.QueryEntry, str](q2);
     if (ent2.last_changed != lc1) { bad = 1; }                                   # firewall: no change
@@ -4186,23 +4356,399 @@ test "driver incremental: Q_EXPORTS fingerprints the pub surface, firewalls a pr
     or (!mem.raw_equal(ent2.value::ptr, fp1::ptr, len1::usize)) { bad = 1; }      # byte-identical
     dnit_project(?p2);
 
-    # edit the pub signature: the fingerprint must change and last_changed advance.
-    val sig_edit: str = "pub fun f(a: i64) i32 { ret 0::i32; }\n";
-    val w3: Result[bool, str] = fs.write_file(main_path, sig_edit, str_len(sig_edit), 420);
+    # change the resolved pub surface (add a second pub symbol): the fingerprint must
+    # change and last_changed advance.
+    val surf_edit: str = "pub fun f(a: i32) i32 { ret a; }\npub fun g() i32 { ret 0; }\n";
+    val w3: Result[bool, str] = fs.write_file(main_path, surf_edit, str_len(surf_edit), 420);
     if (is_err[bool, str](w3)) { deallocate[u8](?alloc, fp1, len1::usize); fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
 
     val p3r: Result[Project, str] = build_project_union(?s, root);
     if (is_err[Project, str](p3r)) { deallocate[u8](?alloc, fp1, len1::usize); fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
     var p3: Project = unwrap_ok[Project, str](p3r);
-    val q3: Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_EXPORTS, mid::u64);
+    val q3: Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_EXPORTS, stable::u64);
     if (is_err[*query.QueryEntry, str](q3)) { dnit_project(?p3); deallocate[u8](?alloc, fp1, len1::usize); fs.remove_all(?alloc, root); sess.dnit(?s); ret 1; }
     val ent3: *query.QueryEntry = unwrap_ok[*query.QueryEntry, str](q3);
-    if (ent3.last_changed == lc1) { bad = 1; }                                   # pub change: advanced
+    if (ent3.last_changed == lc1) { bad = 1; }                                   # surface change: advanced
     if (ent3.value_len == len1 && mem.raw_equal(ent3.value::ptr, fp1::ptr, len1::usize)) { bad = 1; }
     dnit_project(?p3);
 
     deallocate[u8](?alloc, fp1, len1::usize);
     fs.remove_all(?alloc, root);
     sess.dnit(?s);
+    ret bad;
+}
+
+# ut_resolve_lc: the last_changed revision of module `stable`'s Q_RESOLVE entry on
+# session `s`, or a sentinel when absent. an owned-handle shard never early-cuts, so
+# an unchanged value means the entry was NOT recomputed — the test's reuse probe.
+fun ut_resolve_lc(s: *sess.Session, stable: sess.StableModuleId) query.Revision {
+    val e: Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_RESOLVE, stable::u64);
+    if (is_err[*query.QueryEntry, str](e)) { ret 0xFFFFFFFFFFFFFFFF; }
+    ret unwrap_ok[*query.QueryEntry, str](e).last_changed;
+}
+
+# ut_name_text_equal: whether two name StrIds spell the same text across two
+# sessions. the incremental and from-scratch results live in different interners
+# that number StrIds independently, so a symbol's name is compared by TEXT.
+fun ut_name_text_equal(sa: *sess.Session, na: intern.StrId, sb: *sess.Session, nb: intern.StrId) bool {
+    val oa: Option[str] = intern.lookup(?sa.interner, na);
+    val ob: Option[str] = intern.lookup(?sb.interner, nb);
+    if (is_none[str](oa) && is_none[str](ob)) { ret true; }
+    if (is_none[str](oa) || is_none[str](ob)) { ret false; }
+    val ta: str = unwrap[str](oa);
+    val tb: str = unwrap[str](ob);
+    val la: usize = str_len(ta);
+    if (la != str_len(tb)) { ret false; }
+    ret mem.raw_equal(ta::ptr, tb::ptr, la);
+}
+
+# rr_struct_equal: whether two ResolveResults are structurally identical — the
+# resolution-correctness comparison the incremental tests assert a reused (or
+# remapped) result against an independent from-scratch build. compares the binding
+# OUTPUT (the SymbolId-resolved parallel arrays — what each expr/type/decl binds to)
+# and every symbol's fields. `name` is compared by interned text (cross-session
+# interners differ); origin/slot ModuleIds match numerically because an identical
+# module graph yields an identical discovery order, the same numbering both builds
+# produce (the incremental side after remap_result).
+fun rr_struct_equal(sa: *sess.Session, ra: *resolve.ResolveResult, sb: *sess.Session, rb: *resolve.ResolveResult) bool {
+    if (ra == nil || rb == nil) { ret false; }
+    if (ra.symbol_count != rb.symbol_count) { ret false; }
+    if (ra.pub_count != rb.pub_count) { ret false; }
+    if (ra.expr_count != rb.expr_count) { ret false; }
+    if (ra.type_count != rb.type_count) { ret false; }
+    if (ra.decl_count != rb.decl_count) { ret false; }
+
+    var i: u32 = 0;
+    for (i < ra.expr_count) {
+        if (ra.expr_resolved[i] != rb.expr_resolved[i]) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < ra.type_count) {
+        if (ra.type_resolved[i] != rb.type_resolved[i]) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < ra.decl_count) {
+        if (ra.decl_symbol[i] != rb.decl_symbol[i]) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < ra.symbol_count) {
+        val xa: *resolve.Symbol = ?ra.symbols[i];
+        val xb: *resolve.Symbol = ?rb.symbols[i];
+        if (xa.kind != xb.kind) { ret false; }
+        if (xa.flags != xb.flags) { ret false; }
+        if (xa.decl != xb.decl) { ret false; }
+        if (xa.slot != xb.slot) { ret false; }
+        if (xa.origin != xb.origin) { ret false; }
+        if (!ut_name_text_equal(sa, xa.name, sb, xb.name)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# ut_rr_of: the borrowed ResolveResult of module `fqn` in project `p`, or nil.
+fun ut_rr_of(p: *Project, s: *sess.Session, fqn: str) *resolve.ResolveResult {
+    val mid: sess.ModuleId = ut_mid(p, s, fqn);
+    if (mid == sess.MODULE_NIL) { ret nil; }
+    ret p.modules[mid::u32].resolve_result;
+}
+
+test "driver incremental: a leaf's private body edit firewalls the importer's resolve, which still equals a from-scratch build (#1582)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var sA: sess.Session = unwrap_ok[sess.Session, str](sr);
+    if (is_err[bool, str](tgt.register_all(?sA.registry))) { sess.dnit(?sA); ret 1; }
+
+    # main imports leaf.fa and calls it; leaf exports fa. editing fa's BODY is a
+    # private change that — with the parser reserving fa's DeclId before its body —
+    # leaves leaf's resolved pub surface byte-identical, so the firewall must hold.
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.fa;\nfun main() i32 { ret fa(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+
+    val root_r: Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (is_err[str, str](root_r)) { sess.dnit(?sA); ret 1; }
+    val root: str = unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val pA1r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA1r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA1: Project = unwrap_ok[Project, str](pA1r);
+    val st_main: sess.StableModuleId = ut_stable(?pA1, ?sA, "uniontest.main");
+    val st_leaf: sess.StableModuleId = ut_stable(?pA1, ?sA, "uniontest.leaf");
+    val lc_main_1: query.Revision = ut_resolve_lc(?sA, st_main);
+    val lc_leaf_1: query.Revision = ut_resolve_lc(?sA, st_leaf);
+    dnit_project(?pA1);
+
+    # private body edit: fa's signature/identity unchanged.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val leaf_path: str = ut_cc3(?alloc, src_dir, "/", "leaf.mach");
+    val leaf_v2: str = "pub fun fa() i32 { val t: i32 = 1; ret t; }\n";
+    if (is_err[bool, str](fs.write_file(leaf_path, leaf_v2, str_len(leaf_v2), 420))) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+
+    val pA2r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA2r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA2: Project = unwrap_ok[Project, str](pA2r);
+    val lc_main_2: query.Revision = ut_resolve_lc(?sA, st_main);
+    val lc_leaf_2: query.Revision = ut_resolve_lc(?sA, st_leaf);
+
+    # firewall: the importer was NOT re-resolved; the edited leaf WAS.
+    if (lc_main_2 != lc_main_1) { bad = 1; }
+    if (lc_leaf_2 == lc_leaf_1) { bad = 1; }
+
+    # from-scratch build of the SAME (v2) source on a fresh session.
+    val sr2: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr2)) { dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var sB: sess.Session = unwrap_ok[sess.Session, str](sr2);
+    if (is_err[bool, str](tgt.register_all(?sB.registry))) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val pBr: Result[Project, str] = build_project_union(?sB, root);
+    if (is_err[Project, str](pBr)) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pB: Project = unwrap_ok[Project, str](pBr);
+
+    # the reused importer result and the re-resolved leaf result each equal the
+    # independent from-scratch resolution.
+    if (!rr_struct_equal(?sA, ut_rr_of(?pA2, ?sA, "uniontest.main"), ?sB, ut_rr_of(?pB, ?sB, "uniontest.main"))) { bad = 1; }
+    if (!rr_struct_equal(?sA, ut_rr_of(?pA2, ?sA, "uniontest.leaf"), ?sB, ut_rr_of(?pB, ?sB, "uniontest.leaf"))) { bad = 1; }
+
+    dnit_project(?pB);
+    sess.dnit(?sB);
+    dnit_project(?pA2);
+    fs.remove_all(?alloc, root);
+    sess.dnit(?sA);
+    ret bad;
+}
+
+test "driver incremental: a leaf's pub-surface change re-resolves the importer, which still equals a from-scratch build (#1582)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var sA: sess.Session = unwrap_ok[sess.Session, str](sr);
+    if (is_err[bool, str](tgt.register_all(?sA.registry))) { sess.dnit(?sA); ret 1; }
+
+    # main imports leaf.fa. adding a pub `fz` BEFORE fa shifts fa's DeclId (0 -> 1),
+    # a change the importer's resolution genuinely depends on (resolve.Symbol.decl):
+    # the firewall fingerprint must change, the importer must re-resolve, and its new
+    # result must reflect fa's shifted decl and equal a from-scratch build.
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.fa;\nfun main() i32 { ret fa(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+
+    val root_r: Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (is_err[str, str](root_r)) { sess.dnit(?sA); ret 1; }
+    val root: str = unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val pA1r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA1r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA1: Project = unwrap_ok[Project, str](pA1r);
+    val st_main: sess.StableModuleId = ut_stable(?pA1, ?sA, "uniontest.main");
+    val lc_main_1: query.Revision = ut_resolve_lc(?sA, st_main);
+    # fa is the importer's single imported symbol; capture its bound decl id.
+    val rr_main_1: *resolve.ResolveResult = ut_rr_of(?pA1, ?sA, "uniontest.main");
+    var fa_decl_1: u32 = 0xFFFFFFFF;
+    var si: u32 = 0;
+    for (si < rr_main_1.symbol_count) {
+        if (rr_main_1.symbols[si].kind == resolve.SYM_IMPORTED) { fa_decl_1 = rr_main_1.symbols[si].decl::u32; }
+        si = si + 1;
+    }
+    dnit_project(?pA1);
+
+    # pub-surface change: prepend a new pub function, shifting fa's decl id.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val leaf_path: str = ut_cc3(?alloc, src_dir, "/", "leaf.mach");
+    val leaf_v2: str = "pub fun fz() i32 { ret 0; }\npub fun fa() i32 { ret 1; }\n";
+    if (is_err[bool, str](fs.write_file(leaf_path, leaf_v2, str_len(leaf_v2), 420))) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+
+    val pA2r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA2r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA2: Project = unwrap_ok[Project, str](pA2r);
+    val lc_main_2: query.Revision = ut_resolve_lc(?sA, st_main);
+
+    # the importer WAS re-resolved (its dep's visible surface changed) ...
+    if (lc_main_2 == lc_main_1) { bad = 1; }
+    # ... and its binding now reflects fa's shifted decl id.
+    val rr_main_2: *resolve.ResolveResult = ut_rr_of(?pA2, ?sA, "uniontest.main");
+    var fa_decl_2: u32 = 0xFFFFFFFF;
+    si = 0;
+    for (si < rr_main_2.symbol_count) {
+        if (rr_main_2.symbols[si].kind == resolve.SYM_IMPORTED) { fa_decl_2 = rr_main_2.symbols[si].decl::u32; }
+        si = si + 1;
+    }
+    if (fa_decl_2 == fa_decl_1) { bad = 1; }
+
+    # from-scratch build of the SAME (v2) source on a fresh session.
+    val sr2: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr2)) { dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var sB: sess.Session = unwrap_ok[sess.Session, str](sr2);
+    if (is_err[bool, str](tgt.register_all(?sB.registry))) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val pBr: Result[Project, str] = build_project_union(?sB, root);
+    if (is_err[Project, str](pBr)) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pB: Project = unwrap_ok[Project, str](pBr);
+
+    # the re-resolved importer and leaf each equal the independent from-scratch build.
+    if (!rr_struct_equal(?sA, rr_main_2, ?sB, ut_rr_of(?pB, ?sB, "uniontest.main"))) { bad = 1; }
+    if (!rr_struct_equal(?sA, ut_rr_of(?pA2, ?sA, "uniontest.leaf"), ?sB, ut_rr_of(?pB, ?sB, "uniontest.leaf"))) { bad = 1; }
+
+    dnit_project(?pB);
+    sess.dnit(?sB);
+    dnit_project(?pA2);
+    fs.remove_all(?alloc, root);
+    sess.dnit(?sA);
+    ret bad;
+}
+
+test "driver incremental: a dep's pub comptime-const value change re-resolves an importer that forks on it, matching from-scratch (#1582)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var sA: sess.Session = unwrap_ok[sess.Session, str](sr);
+    if (is_err[bool, str](tgt.register_all(?sA.registry))) { sess.dnit(?sA); ret 1; }
+
+    # main imports leaf.FLAG (a pub comptime bool) and forks a `$if` on it — the fork
+    # gates a function declaration, so main's RESOLVED surface depends on FLAG's
+    # VALUE, which lives in the comptime ctx, not in leaf's symbol identities. flipping
+    # FLAG must change leaf's export fingerprint and re-resolve main.
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.FLAG;\n$if (FLAG) {\n  fun extra() i32 { ret 1; }\n}\nfun main() i32 { ret 0; }\n";
+    texts[1] = "pub val FLAG = true;\n";
+
+    val root_r: Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (is_err[str, str](root_r)) { sess.dnit(?sA); ret 1; }
+    val root: str = unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val pA1r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA1r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA1: Project = unwrap_ok[Project, str](pA1r);
+    val st_main: sess.StableModuleId = ut_stable(?pA1, ?sA, "uniontest.main");
+    val lc_main_1: query.Revision = ut_resolve_lc(?sA, st_main);
+    val sc_main_1: u32 = ut_rr_of(?pA1, ?sA, "uniontest.main").symbol_count;
+    dnit_project(?pA1);
+
+    # flip the comptime constant: main's `$if (FLAG)` now drops `extra`.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val leaf_path: str = ut_cc3(?alloc, src_dir, "/", "leaf.mach");
+    val leaf_v2: str = "pub val FLAG = false;\n";
+    if (is_err[bool, str](fs.write_file(leaf_path, leaf_v2, str_len(leaf_v2), 420))) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+
+    val pA2r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA2r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA2: Project = unwrap_ok[Project, str](pA2r);
+
+    # main WAS re-resolved (the dep's const value it forks on changed) and its surface
+    # actually changed (the gated `extra` is gone).
+    if (ut_resolve_lc(?sA, st_main) == lc_main_1) { bad = 1; }
+    if (ut_rr_of(?pA2, ?sA, "uniontest.main").symbol_count == sc_main_1) { bad = 1; }
+
+    # from-scratch build of the flipped source on a fresh session.
+    val sr2: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr2)) { dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var sB: sess.Session = unwrap_ok[sess.Session, str](sr2);
+    if (is_err[bool, str](tgt.register_all(?sB.registry))) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val pBr: Result[Project, str] = build_project_union(?sB, root);
+    if (is_err[Project, str](pBr)) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pB: Project = unwrap_ok[Project, str](pBr);
+
+    if (!rr_struct_equal(?sA, ut_rr_of(?pA2, ?sA, "uniontest.main"), ?sB, ut_rr_of(?pB, ?sB, "uniontest.main"))) { bad = 1; }
+    if (!rr_struct_equal(?sA, ut_rr_of(?pA2, ?sA, "uniontest.leaf"), ?sB, ut_rr_of(?pB, ?sB, "uniontest.leaf"))) { bad = 1; }
+
+    dnit_project(?pB);
+    sess.dnit(?sB);
+    dnit_project(?pA2);
+    fs.remove_all(?alloc, root);
+    sess.dnit(?sA);
+    ret bad;
+}
+
+test "driver incremental: a re-exporter propagates a leaf surface change two hops, and the importer equals from-scratch (#1582)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var sA: sess.Session = unwrap_ok[sess.Session, str](sr);
+    if (is_err[bool, str](tgt.register_all(?sA.registry))) { sess.dnit(?sA); ret 1; }
+
+    # main -> mid (re-exports leaf.fa via `fwd`) -> leaf. a pub-surface change to
+    # leaf must propagate THROUGH the re-exporter: leaf re-resolves, mid's Q_EXPORTS
+    # changes (its re-exported fa shifts), and main re-resolves — the re-export case
+    # the syntactic fingerprint missed. a private body edit to leaf must NOT
+    # propagate past mid (transitive firewall).
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "mid.mach"; names[2] = "leaf.mach";
+    var texts: [3]str;
+    texts[0] = "use uniontest.mid;\nfun main() i32 { ret mid.fa(); }\n";
+    texts[1] = "fwd uniontest.leaf.fa;\n";
+    texts[2] = "pub fun fa() i32 { ret 1; }\n";
+
+    val root_r: Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 3);
+    if (is_err[str, str](root_r)) { sess.dnit(?sA); ret 1; }
+    val root: str = unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val leaf_path: str = ut_cc3(?alloc, src_dir, "/", "leaf.mach");
+
+    val pA1r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA1r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA1: Project = unwrap_ok[Project, str](pA1r);
+    val st_main: sess.StableModuleId = ut_stable(?pA1, ?sA, "uniontest.main");
+    val st_mid:  sess.StableModuleId = ut_stable(?pA1, ?sA, "uniontest.mid");
+    val lc_main_1: query.Revision = ut_resolve_lc(?sA, st_main);
+    val lc_mid_1:  query.Revision = ut_resolve_lc(?sA, st_mid);
+    dnit_project(?pA1);
+
+    # phase 1 — private body edit to leaf: must NOT propagate to mid or main.
+    val leaf_priv: str = "pub fun fa() i32 { val t: i32 = 1; ret t; }\n";
+    if (is_err[bool, str](fs.write_file(leaf_path, leaf_priv, str_len(leaf_priv), 420))) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val pPr: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pPr)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pP: Project = unwrap_ok[Project, str](pPr);
+    if (ut_resolve_lc(?sA, st_mid)  != lc_mid_1)  { bad = 1; }   # firewall held at mid
+    if (ut_resolve_lc(?sA, st_main) != lc_main_1) { bad = 1; }   # firewall held at main
+    dnit_project(?pP);
+
+    # phase 2 — pub-surface change to leaf: must propagate to mid AND main.
+    val leaf_pub: str = "pub fun fz() i32 { ret 0; }\npub fun fa() i32 { ret 1; }\n";
+    if (is_err[bool, str](fs.write_file(leaf_path, leaf_pub, str_len(leaf_pub), 420))) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val pA2r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA2r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA2: Project = unwrap_ok[Project, str](pA2r);
+    if (ut_resolve_lc(?sA, st_mid)  == lc_mid_1)  { bad = 1; }   # mid re-resolved
+    if (ut_resolve_lc(?sA, st_main) == lc_main_1) { bad = 1; }   # main re-resolved
+
+    # from-scratch build of the final source on a fresh session.
+    val sr2: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr2)) { dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var sB: sess.Session = unwrap_ok[sess.Session, str](sr2);
+    if (is_err[bool, str](tgt.register_all(?sB.registry))) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val pBr: Result[Project, str] = build_project_union(?sB, root);
+    if (is_err[Project, str](pBr)) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pB: Project = unwrap_ok[Project, str](pBr);
+
+    # importer, re-exporter, and leaf each equal the independent from-scratch build.
+    if (!rr_struct_equal(?sA, ut_rr_of(?pA2, ?sA, "uniontest.main"), ?sB, ut_rr_of(?pB, ?sB, "uniontest.main"))) { bad = 1; }
+    if (!rr_struct_equal(?sA, ut_rr_of(?pA2, ?sA, "uniontest.mid"),  ?sB, ut_rr_of(?pB, ?sB, "uniontest.mid")))  { bad = 1; }
+    if (!rr_struct_equal(?sA, ut_rr_of(?pA2, ?sA, "uniontest.leaf"), ?sB, ut_rr_of(?pB, ?sB, "uniontest.leaf"))) { bad = 1; }
+
+    dnit_project(?pB);
+    sess.dnit(?sB);
+    dnit_project(?pA2);
+    fs.remove_all(?alloc, root);
+    sess.dnit(?sA);
     ret bad;
 }
