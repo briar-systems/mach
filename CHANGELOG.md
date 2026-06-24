@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.9] - 2026-06-24
+
+Fixes a latent miscompile: a runtime array/pointer index narrower than the
+machine word (e.g. a `u8`) was passed to the GEP at its source width, so the
+back end scaled an index register carrying undefined high bits and computed a
+wild address.
+
+### Fixed
+
+- lower: `lower_index_lvalue` widens a sub-word runtime GEP index to the
+  machine-word index type (zext unsigned / sext signed) before `emit_gep`, so
+  the back end scales a clean register. In-tree index sites cast (`::u32` /
+  `::usize`) and masked it; an uncast sub-word index miscompiled (#1596). The
+  64-bit widen lives in the target-agnostic lowering for now; #1598 tracks
+  moving index normalization into the target-aware codegen.
+
 ## [2.5.8] - 2026-06-24
 
 Incremental type-checking (#1164), completing the incremental front-end: parse,
