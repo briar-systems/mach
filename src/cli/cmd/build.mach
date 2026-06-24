@@ -57,7 +57,6 @@ use diag:     mach.lang.diagnostic;
 use driver:   mach.lang.driver;
 use manifest: mach.lang.manifest;
 
-use sema:    mach.lang.fe.sema;
 use token:   mach.lang.fe.token;
 
 use ir:         mach.lang.me.ir;
@@ -187,59 +186,6 @@ fun emit_stage(p: *driver.Project, stage: *u8, fqn: intern.StrId) {
     print.eprint("\n");
 }
 
-# build_sema_deps: build the SemaDeps for module `m`, one ModuleSema entry
-# per already-analysed module in the project, copying each module's
-# SemaResult decl table. cross-module symbol types are looked up by the
-# symbol's origin ModuleId, and a `fwd` re-export carries the originating
-# (transitive) module as the origin — so the snapshot must cover every
-# transitively-reachable module, not only `m`'s direct dependencies. all of
-# them are strictly earlier in topo order and thus already analysed, so
-# exposing the full set of ready modules (keyed by ModuleId) is both correct
-# and harmless: lookups match an exact origin and never a sibling.
-fun build_sema_deps(p: *driver.Project, m: *driver.ModuleEntry,
-                    results: *sema.SemaResult, ready: *bool) Result[sema.SemaDeps, str] {
-    var deps: sema.SemaDeps;
-    deps.entries = nil;
-    deps.count   = 0;
-
-    var ready_count: u32 = 0;
-    var j: u32 = 0;
-    for (j < p.module_len) {
-        if (ready[j]) { ready_count = ready_count + 1; }
-        j = j + 1;
-    }
-    if (ready_count == 0) { ret ok[sema.SemaDeps, str](deps); }
-
-    val r: Result[*sema.ModuleSema, str] = allocate[sema.ModuleSema](p.s.alloc, ready_count::usize);
-    if (is_err[*sema.ModuleSema, str](r)) { ret err[sema.SemaDeps, str](unwrap_err[*sema.ModuleSema, str](r)); }
-    deps.entries = unwrap_ok[*sema.ModuleSema, str](r);
-    deps.count   = ready_count;
-
-    var i: u32 = 0;
-    var k: u32 = 0;
-    for (i < p.module_len) {
-        if (ready[i]) {
-            val dep: *driver.ModuleEntry = ?p.modules[i];
-            var ms: sema.ModuleSema;
-            ms.path       = dep.fqn;
-            ms.module     = i::sess.ModuleId;
-            ms.decl_type  = results[i].decl_type;
-            ms.decl_count = results[i].decl_count;
-            deps.entries[k] = ms;
-            k = k + 1;
-        }
-        i = i + 1;
-    }
-    ret ok[sema.SemaDeps, str](deps);
-}
-
-fun free_sema_deps(alloc: *Allocator, deps: *sema.SemaDeps) {
-    if (deps.entries == nil) { ret; }
-    deallocate[sema.ModuleSema](alloc, deps.entries, deps.count::usize);
-    deps.entries = nil;
-    deps.count   = 0;
-}
-
 # compile_modules: drive every reachable module through the back half of the
 # pipeline. semantic analysis runs over the whole module graph first; only if
 # no module reported an error does the build proceed to lower + optimise +
@@ -251,41 +197,15 @@ fun free_sema_deps(alloc: *Allocator, deps: *sema.SemaDeps) {
 # the per-module `.ir` (written right after lowering) and `.s` (written from the
 # fully-resolved MIR inside codegen) debug artifacts.
 fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: bool, verbose: bool, ea: *EmitArtifacts,
-                    results: *sema.SemaResult, ready: *bool,
                     irs: *ir.Module, ir_ready: *bool,
                     images: *of.ObjectImage, image_ready: *bool) Result[bool, str] {
-    var ti: u32 = 0;
-    for (ti < p.topo_len) {
-        val mid: sess.ModuleId = p.topo[ti];
-        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
-
-        if (verbose) { emit_stage(p, "sema", m.fqn); }
-
-        val deps_r: Result[sema.SemaDeps, str] = build_sema_deps(p, m, results, ready);
-        if (is_err[sema.SemaDeps, str](deps_r)) { ret err[bool, str](unwrap_err[sema.SemaDeps, str](deps_r)); }
-        var deps: sema.SemaDeps = unwrap_ok[sema.SemaDeps, str](deps_r);
-
-        val sema_r: Result[sema.SemaResult, str] = sema.sema(p.s, m.a, m.resolve_result, ?deps, ?m.ctx, mid);
-        free_sema_deps(p.s.alloc, ?deps);
-        if (is_err[sema.SemaResult, str](sema_r)) { ret err[bool, str](unwrap_err[sema.SemaResult, str](sema_r)); }
-        results[mid::u32] = unwrap_ok[sema.SemaResult, str](sema_r);
-        ready[mid::u32]   = true;
-
-        # publish this module's typing and name-resolution to the session so the
-        # back-end monomorphizer can lower a generic template body (declared in
-        # any module) against the typing of its declaring module.
-        val rs: Result[bool, str] = sess.register_module_sema(p.s, mid, (?results[mid::u32])::ptr);
-        if (is_err[bool, str](rs)) { ret err[bool, str](unwrap_err[bool, str](rs)); }
-        val rr2: Result[bool, str] = sess.register_module_resolve(p.s, mid, (m.resolve_result)::ptr);
-        if (is_err[bool, str](rr2)) { ret err[bool, str](unwrap_err[bool, str](rr2)); }
-        # publish this module's comptime context too, so a value-parameter instance
-        # of a function declared here can fold its `$if` gates against this module's
-        # own `pub val`s when lowered from a calling module.
-        val rc: Result[bool, str] = sess.register_module_comptime(p.s, mid, (?m.ctx)::ptr);
-        if (is_err[bool, str](rc)) { ret err[bool, str](unwrap_err[bool, str](rc)); }
-
-        ti = ti + 1;
-    }
+    # type-check the whole module graph through Q_SEMA in topo order — memoized and
+    # incremental across rebuilds on a long-lived session, computed fresh each CLI
+    # build (fresh session, cold cache). run_sema_pass borrows each module's
+    # SemaResult onto its ModuleEntry and publishes its typing / resolution /
+    # comptime ctx to the session for the back-end monomorphizer (#1583).
+    val sema_pass_r: Result[bool, str] = driver.run_sema_pass(p);
+    if (is_err[bool, str](sema_pass_r)) { ret err[bool, str](unwrap_err[bool, str](sema_pass_r)); }
 
     # do not lower or codegen a semantically broken module graph.
     if (diag.has_errors(?p.s.diags)) { ret ok[bool, str](true); }
@@ -293,14 +213,14 @@ fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: b
     # lower + optimise every module first. in test mode the project's `main` is
     # then neutralised (the runner supplies the program entry) before any module
     # is codegen'd, so the dropped `main` body never reaches an object.
-    ti = 0;
+    var ti: u32 = 0;
     for (ti < p.topo_len) {
         val mid: sess.ModuleId = p.topo[ti];
         val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
 
         if (verbose) { emit_stage(p, "lower", m.fqn); }
 
-        val lower_r: Result[ir.Module, str] = lower.lower_module(p.s, ?p.target, m.a, m.fqn, mid, ?results[mid::u32], m.resolve_result, ?m.ctx);
+        val lower_r: Result[ir.Module, str] = lower.lower_module(p.s, ?p.target, m.a, m.fqn, mid, m.sema_result, m.resolve_result, ?m.ctx);
         if (is_err[ir.Module, str](lower_r)) { ret err[bool, str](unwrap_err[ir.Module, str](lower_r)); }
         irs[mid::u32]     = unwrap_ok[ir.Module, str](lower_r);
         ir_ready[mid::u32] = true;
@@ -367,15 +287,17 @@ fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: b
     ret ok[bool, str](true);
 }
 
+# free_modules: tear down the per-module IR and object images. SemaResults are NOT
+# freed here — they are borrowed from the session query DB (the Q_SEMA handles),
+# which owns and frees them (and reuses them across rebuilds), mirroring resolve
+# results and parsed ASTs (#1583).
 fun free_modules(p: *driver.Project,
-                 results: *sema.SemaResult, ready: *bool,
                  irs: *ir.Module, ir_ready: *bool,
                  images: *of.ObjectImage, image_ready: *bool) {
     var i: u32 = 0;
     for (i < p.module_len) {
         if (image_ready[i]) { obj.dnit(?images[i]); }
         if (ir_ready[i])    { ir.dnit_module(?irs[i]); }
-        if (ready[i])       { sema.dnit_result(?results[i]); }
         i = i + 1;
     }
 }
@@ -642,40 +564,34 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
         }
     }
 
-    val rr: Result[*sema.SemaResult, str] = allocate[sema.SemaResult](p.s.alloc, n);
-    if (is_err[*sema.SemaResult, str](rr)) { print.eprint("error: out of memory\n"); ret 2; }
-    val results: *sema.SemaResult = unwrap_ok[*sema.SemaResult, str](rr);
-
-    val rdy: Result[*bool, str] = allocate[bool](p.s.alloc, n);
-    if (is_err[*bool, str](rdy)) { deallocate[sema.SemaResult](p.s.alloc, results, n); print.eprint("error: out of memory\n"); ret 2; }
-    val ready: *bool = unwrap_ok[*bool, str](rdy);
-
+    # per-module SemaResults are owned by the session query DB (the Q_SEMA handles)
+    # and borrowed onto each ModuleEntry by run_sema_pass, so no per-build sema array
+    # is allocated here (#1583); only the IR and object-image arrays are.
     val iri: Result[*ir.Module, str] = allocate[ir.Module](p.s.alloc, n);
-    if (is_err[*ir.Module, str](iri)) { deallocate[bool](p.s.alloc, ready, n); deallocate[sema.SemaResult](p.s.alloc, results, n); print.eprint("error: out of memory\n"); ret 2; }
+    if (is_err[*ir.Module, str](iri)) { print.eprint("error: out of memory\n"); ret 2; }
     val irs: *ir.Module = unwrap_ok[*ir.Module, str](iri);
 
     val irr: Result[*bool, str] = allocate[bool](p.s.alloc, n);
-    if (is_err[*bool, str](irr)) { deallocate[ir.Module](p.s.alloc, irs, n); deallocate[bool](p.s.alloc, ready, n); deallocate[sema.SemaResult](p.s.alloc, results, n); print.eprint("error: out of memory\n"); ret 2; }
+    if (is_err[*bool, str](irr)) { deallocate[ir.Module](p.s.alloc, irs, n); print.eprint("error: out of memory\n"); ret 2; }
     val ir_ready: *bool = unwrap_ok[*bool, str](irr);
 
     val imi: Result[*of.ObjectImage, str] = allocate[of.ObjectImage](p.s.alloc, n);
-    if (is_err[*of.ObjectImage, str](imi)) { deallocate[bool](p.s.alloc, ir_ready, n); deallocate[ir.Module](p.s.alloc, irs, n); deallocate[bool](p.s.alloc, ready, n); deallocate[sema.SemaResult](p.s.alloc, results, n); print.eprint("error: out of memory\n"); ret 2; }
+    if (is_err[*of.ObjectImage, str](imi)) { deallocate[bool](p.s.alloc, ir_ready, n); deallocate[ir.Module](p.s.alloc, irs, n); print.eprint("error: out of memory\n"); ret 2; }
     val images: *of.ObjectImage = unwrap_ok[*of.ObjectImage, str](imi);
 
     val imr: Result[*bool, str] = allocate[bool](p.s.alloc, n);
-    if (is_err[*bool, str](imr)) { deallocate[of.ObjectImage](p.s.alloc, images, n); deallocate[bool](p.s.alloc, ir_ready, n); deallocate[ir.Module](p.s.alloc, irs, n); deallocate[bool](p.s.alloc, ready, n); deallocate[sema.SemaResult](p.s.alloc, results, n); print.eprint("error: out of memory\n"); ret 2; }
+    if (is_err[*bool, str](imr)) { deallocate[of.ObjectImage](p.s.alloc, images, n); deallocate[bool](p.s.alloc, ir_ready, n); deallocate[ir.Module](p.s.alloc, irs, n); print.eprint("error: out of memory\n"); ret 2; }
     val image_ready: *bool = unwrap_ok[*bool, str](imr);
 
     var i: u32 = 0;
     for (i < p.module_len) {
-        ready[i]       = false;
         ir_ready[i]    = false;
         image_ready[i] = false;
         i = i + 1;
     }
 
     var code: i64 = 0;
-    val comp_r: Result[bool, str] = compile_modules(p, level, test_mode, verify_ir, verbose, ?ea, results, ready, irs, ir_ready, images, image_ready);
+    val comp_r: Result[bool, str] = compile_modules(p, level, test_mode, verify_ir, verbose, ?ea, irs, ir_ready, images, image_ready);
     if (is_err[bool, str](comp_r)) {
         # a `lower:reported` sentinel means lowering already filed a located
         # diagnostic on the sink; the flush prints it, so skip the raw reprint.
@@ -697,13 +613,11 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
         code = link_artifact(p, emit_obj, verbose, root, out_override, argc, argv, images, out_path);
     }
 
-    free_modules(p, results, ready, irs, ir_ready, images, image_ready);
+    free_modules(p, irs, ir_ready, images, image_ready);
     deallocate[bool](p.s.alloc, image_ready, n);
     deallocate[of.ObjectImage](p.s.alloc, images, n);
     deallocate[bool](p.s.alloc, ir_ready, n);
     deallocate[ir.Module](p.s.alloc, irs, n);
-    deallocate[bool](p.s.alloc, ready, n);
-    deallocate[sema.SemaResult](p.s.alloc, results, n);
     ret code;
 }
 

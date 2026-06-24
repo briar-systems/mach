@@ -73,6 +73,8 @@ use token:  mach.lang.fe.token;
 
 use comptime: mach.lang.fe.comptime;
 use resolve:  mach.lang.fe.resolve;
+use sema:     mach.lang.fe.sema;
+use type:     mach.lang.type;
 
 use os:  mach.lang.target.os;
 use isa: mach.lang.target.isa;
@@ -234,6 +236,11 @@ pub rec PubConst {
 #                 run_resolve_one, nil until then. NOT freed by dnit_project — the
 #                 query DB owns it (its finalizer frees it) (#1582)
 # resolved:       true once resolve has run
+# sema_result:    borrowed pointer to this module's SemaResult, owned by the
+#                 session query DB as the Q_SEMA handle (keyed by stable_id) and
+#                 reused across rebuilds of an unchanged module; set by
+#                 run_sema_one, nil until then. NOT freed by dnit_project — the
+#                 query DB owns it (its finalizer frees it) (#1583)
 # stable_id:      this module's build-stable identity (session-assigned by FQN);
 #                 unlike the discovery-order ModuleId, it survives a graph reshape,
 #                 so cross-build resolve/sema reuse remaps through it (#1579)
@@ -250,6 +257,7 @@ pub rec ModuleEntry {
     dep_cap:           u32;
     resolve_result:    *resolve.ResolveResult;
     resolved:          bool;
+    sema_result:       *sema.SemaResult;
     stable_id:         sess.StableModuleId;
 }
 
@@ -948,9 +956,9 @@ pub fun dnit_project(p: *Project) {
     var i: u32 = 0;
     for (i < p.module_len) {
         val m: *ModuleEntry = ?p.modules[i];
-        # m.resolve_result is BORROWED from the session query DB (the Q_RESOLVE
-        # handle), which owns and frees it (and reuses it across rebuilds). do NOT
-        # free it here.
+        # m.resolve_result / m.sema_result are BORROWED from the session query DB
+        # (the Q_RESOLVE / Q_SEMA handles), which own and free them (and reuse them
+        # across rebuilds). do NOT free them here.
         comptime.dnit(?m.ctx);
         # m.a is BORROWED from the session query DB (the Q_PARSE handle), which owns
         # and frees it (and reuses it across rebuilds). do NOT free it here.
@@ -2005,6 +2013,7 @@ fun register_module_slot(p: *Project, fqn: intern.StrId) Result[sess.ModuleId, s
     m.dep_cap           = 0;
     m.resolve_result    = nil;
     m.resolved          = false;
+    m.sema_result       = nil;
     p.modules[p.module_len] = m;
     p.module_len = p.module_len + 1;
 
@@ -2224,6 +2233,14 @@ fun ensure_query_pipeline(s: *sess.Session) Result[bool, str] {
     if (!query.registered(?s.queries, query.Q_EXPORTS)) {
         val re: Result[bool, str] = query.register_derived(?s.queries, query.Q_EXPORTS, q_exports_compute);
         if (is_err[bool, str](re)) { ret re; }
+    }
+    if (!query.registered(?s.queries, query.Q_SEMA)) {
+        val rsm: Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_SEMA, q_sema_compute, q_sema_finalize);
+        if (is_err[bool, str](rsm)) { ret rsm; }
+    }
+    if (!query.registered(?s.queries, query.Q_TYPED_EXPORTS)) {
+        val rte: Result[bool, str] = query.register_derived(?s.queries, query.Q_TYPED_EXPORTS, q_typed_exports_compute);
+        if (is_err[bool, str](rte)) { ret rte; }
     }
     ret ok[bool, str](true);
 }
@@ -3040,6 +3057,14 @@ fun register_module_asts(p: *Project) Result[bool, str] {
         # remaps its stale ModuleIds into this build's numbering (#1582).
         val rs: Result[bool, str] = sess.register_stable_mid(p.s, m.stable_id, i);
         if (is_err[bool, str](rs)) { ret rs; }
+        # publish this module's current per-build ModuleId as the Q_MODULE_NUMBER
+        # input, keyed by its stable id. set_input's early-cutoff leaves last_changed
+        # untouched when the number is unchanged (a content-only edit), and advances
+        # it on a graph reshape that renumbers the module — the signal Q_SEMA depends
+        # on to re-type-check a module whose interned type identities went stale (#1583).
+        var num: u32 = i::u32;
+        val rn: Result[bool, str] = query.set_input(?p.s.queries, query.Q_MODULE_NUMBER, m.stable_id::u64, (?num)::*u8, 4);
+        if (is_err[bool, str](rn)) { ret rn; }
         i = i + 1;
     }
     ret ok[bool, str](true);
@@ -3238,6 +3263,360 @@ fun build_resolve_deps_owned(p: *Project, m: *ModuleEntry) Result[resolve.Resolv
     deallocate[sess.ModuleId](p.s.alloc, list, p.module_len::usize);
     deallocate[bool](p.s.alloc, visited, p.module_len::usize);
     ret r;
+}
+
+# run_sema_pass: type-check every module in topo order through the Q_SEMA query.
+# the active Project is installed on the session for the pass so the compute can
+# reach the per-build module graph; topo order guarantees each module's deps are
+# already type-checked (their Q_SEMA / Q_TYPED_EXPORTS entries valid) before it
+# runs. resolve must have run first (each module's resolve_result is borrowed by
+# the compute). callable standalone (the CLI compile path and the tests drive it);
+# build_project deliberately stops at resolve (#1583).
+# ---
+# p:   the active project; its topo order and per-build module graph drive the pass
+# ret: true once every module is type-checked, or the first error
+pub fun run_sema_pass(p: *Project) Result[bool, str] {
+    sess.set_active_project(p.s, p::ptr);
+
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val mid: sess.ModuleId = p.topo[i];
+        val r: Result[bool, str] = run_sema_one(p, mid);
+        if (is_err[bool, str](r)) {
+            sess.set_active_project(p.s, nil);
+            ret r;
+        }
+        i = i + 1;
+    }
+    sess.set_active_project(p.s, nil);
+    ret ok[bool, str](true);
+}
+
+# run_sema_one: fetch module `mid`'s SemaResult through Q_SEMA — computed fresh
+# when its resolution, a dep's typed surface, the build config, or its own module
+# number changed, reused otherwise — borrow it onto the ModuleEntry, refresh its
+# typed-export fingerprint in topo order (so dependents validate against current
+# fingerprints), and publish its typing / resolution / comptime ctx to the session
+# for the back-end monomorphizer. the result is borrowed from the query DB.
+fun run_sema_one(p: *Project, mid: sess.ModuleId) Result[bool, str] {
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+
+    emit_stage(p, "sema", m.fqn);
+
+    val e_r: Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_SEMA, m.stable_id::u64);
+    if (is_err[*query.QueryEntry, str](e_r)) { ret err[bool, str](unwrap_err[*query.QueryEntry, str](e_r)); }
+    val sr: *sema.SemaResult = sema_handle_decode(unwrap_ok[*query.QueryEntry, str](e_r));
+    if (sr == nil) { ret err[bool, str]("Q_SEMA produced no result handle"); }
+
+    # refresh this module's typed-export fingerprint NOW, in topo order. the engine's
+    # validator compares a dep's STORED last_changed without recomputing derived deps,
+    # so a dependent is only firewalled (private edit: identical bytes) or invalidated
+    # (pub type change: bytes differ) correctly when its deps' fingerprints are already
+    # current. mirror of run_resolve_one's Q_EXPORTS refresh (#1582/#1583).
+    val tx_r: Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_TYPED_EXPORTS, m.stable_id::u64);
+    if (is_err[*query.QueryEntry, str](tx_r)) { ret err[bool, str](unwrap_err[*query.QueryEntry, str](tx_r)); }
+
+    m.sema_result = sr;
+
+    # publish this module's typing and name-resolution to the session so the back-end
+    # monomorphizer can lower a generic template body (declared in any module) against
+    # the typing of its declaring module. the comptime ctx is published too, so a
+    # value-parameter instance folds its `$if` gates against this module's `pub val`s.
+    val rs: Result[bool, str] = sess.register_module_sema(p.s, mid, sr::ptr);
+    if (is_err[bool, str](rs)) { ret err[bool, str](unwrap_err[bool, str](rs)); }
+    val rr2: Result[bool, str] = sess.register_module_resolve(p.s, mid, m.resolve_result::ptr);
+    if (is_err[bool, str](rr2)) { ret err[bool, str](unwrap_err[bool, str](rr2)); }
+    val rc: Result[bool, str] = sess.register_module_comptime(p.s, mid, (?m.ctx)::ptr);
+    if (is_err[bool, str](rc)) { ret err[bool, str](unwrap_err[bool, str](rc)); }
+    ret ok[bool, str](true);
+}
+
+# q_sema_compute: the Q_SEMA derived compute — type-check one module against its
+# dependencies and return the SemaResult as an opaque owned handle. reaches the
+# per-build module graph through the session's active Project, and records the deps
+# that make the entry incremental:
+#   - Q_RESOLVE(module):       a resolution change re-type-checks this module;
+#   - Q_TARGET:                a build-config change re-checks every module ($if forks);
+#   - Q_MODULE_NUMBER(module): a graph reshape that renumbers this module re-checks it,
+#                              since its nominal/instance TypeIds embed the per-build
+#                              ModuleId — a reused result whose own id moved is stale;
+#   - Q_TYPED_EXPORTS(dep) for every module in the resolve dep closure: a dep's
+#                              visible TYPE change re-checks this module, while an
+#                              impl-only edit early-cuts at Q_TYPED_EXPORTS (firewall).
+fun q_sema_compute(db: *query.QueryDb, key: u64, alloc: *Allocator) Result[query.QueryOutput, str] {
+    val s: *sess.Session = db.ctx::*sess.Session;
+    if (s == nil) { ret err[query.QueryOutput, str]("Q_SEMA: query db has no session context"); }
+    val pp: ptr = sess.active_project(s);
+    if (pp == nil) { ret err[query.QueryOutput, str]("Q_SEMA: no active project for the sema pass"); }
+    val p: *Project = pp::*Project;
+
+    val stable: sess.StableModuleId = key::u32::sess.StableModuleId;
+    val mid: sess.ModuleId = sess.module_id_for_stable(s, stable);
+    if (mid == sess.MODULE_NIL) { ret err[query.QueryOutput, str]("Q_SEMA: stable id not loaded this build"); }
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    val a: *ast.Ast = m.a;
+    if (a == nil) { ret err[query.QueryOutput, str]("Q_SEMA: module has no parsed AST"); }
+    val rr: *resolve.ResolveResult = m.resolve_result;
+    if (rr == nil) { ret err[query.QueryOutput, str]("Q_SEMA: module has no resolve result"); }
+
+    val rrd: Result[bool, str] = query.record_dep(db, query.Q_SEMA, key, query.Q_RESOLVE, key);
+    if (is_err[bool, str](rrd)) { ret err[query.QueryOutput, str](unwrap_err[bool, str](rrd)); }
+    val rt: Result[bool, str] = query.record_dep(db, query.Q_SEMA, key, query.Q_TARGET, 0);
+    if (is_err[bool, str](rt)) { ret err[query.QueryOutput, str](unwrap_err[bool, str](rt)); }
+    val rn: Result[bool, str] = query.record_dep(db, query.Q_SEMA, key, query.Q_MODULE_NUMBER, key);
+    if (is_err[bool, str](rn)) { ret err[query.QueryOutput, str](unwrap_err[bool, str](rn)); }
+
+    # record the typed-export firewall dep on each module in the resolve dep closure
+    # (direct deps plus re-export targets), fetching it first so the recorded revision
+    # is current. a duplicate (a bare-alias dep appears twice) records a redundant —
+    # harmless — dep. the resolve closure suffices: a transitively-referenced type's
+    # change cascades hop by hop through each importer's typed export (#1583).
+    val deps_r: Result[resolve.ResolveDeps, str] = build_resolve_deps_owned(p, m);
+    if (is_err[resolve.ResolveDeps, str](deps_r)) { ret err[query.QueryOutput, str](unwrap_err[resolve.ResolveDeps, str](deps_r)); }
+    var deps: resolve.ResolveDeps = unwrap_ok[resolve.ResolveDeps, str](deps_r);
+    var di: u32 = 0;
+    for (di < deps.count) {
+        val dep_mid: sess.ModuleId = deps.entries[di].module;
+        if (dep_mid::u32 < p.module_len) {
+            val dep_stable: sess.StableModuleId = p.modules[dep_mid::u32].stable_id;
+            val ge: Result[*query.QueryEntry, str] = query.get(db, query.Q_TYPED_EXPORTS, dep_stable::u64);
+            if (is_err[*query.QueryEntry, str](ge)) {
+                free_resolve_deps(s.alloc, ?deps);
+                ret err[query.QueryOutput, str](unwrap_err[*query.QueryEntry, str](ge));
+            }
+            val rd: Result[bool, str] = query.record_dep(db, query.Q_SEMA, key, query.Q_TYPED_EXPORTS, dep_stable::u64);
+            if (is_err[bool, str](rd)) {
+                free_resolve_deps(s.alloc, ?deps);
+                ret err[query.QueryOutput, str](unwrap_err[bool, str](rd));
+            }
+        }
+        di = di + 1;
+    }
+    free_resolve_deps(s.alloc, ?deps);
+
+    # the typing snapshots sema reads for cross-module symbol types: every module
+    # already type-checked this build (topo-earlier), keyed by ModuleId — exactly the
+    # set the in-place compile path's build_sema_deps exposed. correct because each
+    # lookup matches an exact origin and never a sibling.
+    val sdeps_r: Result[sema.SemaDeps, str] = build_sema_deps_query(p);
+    if (is_err[sema.SemaDeps, str](sdeps_r)) { ret err[query.QueryOutput, str](unwrap_err[sema.SemaDeps, str](sdeps_r)); }
+    var sdeps: sema.SemaDeps = unwrap_ok[sema.SemaDeps, str](sdeps_r);
+
+    val sem_r: Result[sema.SemaResult, str] = sema.sema(s, a, rr, ?sdeps, ?m.ctx, mid);
+    free_sema_deps_query(s.alloc, ?sdeps);
+    if (is_err[sema.SemaResult, str](sem_r)) { ret err[query.QueryOutput, str](unwrap_err[sema.SemaResult, str](sem_r)); }
+    var result: sema.SemaResult = unwrap_ok[sema.SemaResult, str](sem_r);
+
+    val br: Result[*sema.SemaResult, str] = allocate[sema.SemaResult](alloc, 1::usize);
+    if (is_err[*sema.SemaResult, str](br)) {
+        sema.dnit_result(?result);
+        ret err[query.QueryOutput, str](unwrap_err[*sema.SemaResult, str](br));
+    }
+    val box: *sema.SemaResult = unwrap_ok[*sema.SemaResult, str](br);
+    box[0] = result;
+    ret sema_handle_encode(alloc, box);
+}
+
+# q_sema_finalize: release the SemaResult a Q_SEMA handle owns, called by the engine
+# before it frees the handle buffer (on recompute, invalidate, dnit).
+fun q_sema_finalize(value: *u8, value_len: u32, alloc: *Allocator) {
+    if (value == nil || value_len::usize < $size_of(ptr)) { ret; }
+    val slot: *ptr = value::ptr::*ptr;
+    val r: *sema.SemaResult = slot[0]::*sema.SemaResult;
+    if (r == nil) { ret; }
+    sema.dnit_result(r);
+    deallocate[sema.SemaResult](alloc, r, 1::usize);
+}
+
+# sema_handle_encode: wrap a heap SemaResult pointer as a pointer-sized opaque handle
+# buffer — the Q_SEMA query value. like the Q_PARSE / Q_RESOLVE handles, the heavy
+# pointer-graph artifact lives in the byte-buffer DB as a handle, never serialized.
+fun sema_handle_encode(alloc: *Allocator, r: *sema.SemaResult) Result[query.QueryOutput, str] {
+    val n: u32 = $size_of(ptr)::u32;
+    val rb: Result[*u8, str] = allocate[u8](alloc, n::usize);
+    if (is_err[*u8, str](rb)) {
+        sema.dnit_result(r);
+        deallocate[sema.SemaResult](alloc, r, 1::usize);
+        ret err[query.QueryOutput, str](unwrap_err[*u8, str](rb));
+    }
+    val buf: *u8 = unwrap_ok[*u8, str](rb);
+    val slot: *ptr = buf::ptr::*ptr;
+    slot[0] = r::ptr;
+    var out: query.QueryOutput;
+    out.bytes = buf;
+    out.len   = n;
+    ret ok[query.QueryOutput, str](out);
+}
+
+# sema_handle_decode: read the SemaResult pointer back out of a Q_SEMA handle entry,
+# or nil when the entry carries no value.
+fun sema_handle_decode(e: *query.QueryEntry) *sema.SemaResult {
+    if (e.value == nil || e.value_len::usize < $size_of(ptr)) { ret nil; }
+    val slot: *ptr = e.value::ptr::*ptr;
+    ret slot[0]::*sema.SemaResult;
+}
+
+# build_sema_deps_query: assemble the SemaDeps for a Q_SEMA compute — one ModuleSema
+# entry per module already type-checked this build (its sema_result is borrowed onto
+# the ModuleEntry by an earlier run_sema_one). topo order guarantees the set covers
+# every module the analysed one references; the module being analysed has a nil
+# sema_result (set only after its compute), so it is naturally excluded. each entry
+# borrows the producer's decl_type array (owned by the query DB), so the SemaDeps is
+# freed with free_sema_deps_query — which frees only the entries array.
+fun build_sema_deps_query(p: *Project) Result[sema.SemaDeps, str] {
+    var deps: sema.SemaDeps;
+    deps.entries = nil;
+    deps.count   = 0;
+
+    var ready_count: u32 = 0;
+    var j: u32 = 0;
+    for (j < p.module_len) {
+        if (p.modules[j].sema_result != nil) { ready_count = ready_count + 1; }
+        j = j + 1;
+    }
+    if (ready_count == 0) { ret ok[sema.SemaDeps, str](deps); }
+
+    val r: Result[*sema.ModuleSema, str] = allocate[sema.ModuleSema](p.s.alloc, ready_count::usize);
+    if (is_err[*sema.ModuleSema, str](r)) { ret err[sema.SemaDeps, str](unwrap_err[*sema.ModuleSema, str](r)); }
+    val arr: *sema.ModuleSema = unwrap_ok[*sema.ModuleSema, str](r);
+
+    var i: u32 = 0;
+    var k: u32 = 0;
+    for (i < p.module_len) {
+        val sr: *sema.SemaResult = p.modules[i].sema_result;
+        if (sr != nil) {
+            var ms: sema.ModuleSema;
+            ms.path       = p.modules[i].fqn;
+            ms.module     = i::sess.ModuleId;
+            ms.decl_type  = sr.decl_type;
+            ms.decl_count = sr.decl_count;
+            arr[k] = ms;
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+
+    deps.entries = arr;
+    deps.count   = ready_count;
+    ret ok[sema.SemaDeps, str](deps);
+}
+
+# free_sema_deps_query: release the entries array build_sema_deps_query allocated. the
+# borrowed decl_type arrays it points into are owned by the query DB, NOT freed here.
+fun free_sema_deps_query(alloc: *Allocator, deps: *sema.SemaDeps) {
+    if (deps.entries == nil) { ret; }
+    deallocate[sema.ModuleSema](alloc, deps.entries, deps.count::usize);
+    deps.entries = nil;
+    deps.count   = 0;
+}
+
+# q_typed_exports_compute: the Q_TYPED_EXPORTS derived compute — a deterministic
+# byte fingerprint of one module's TYPED public surface (#1583). reads the module's
+# SemaResult through Q_SEMA (recording the dep, so any re-type-check refreshes this)
+# and fingerprints exactly what an importer's type-checking binds against from this
+# module DIRECTLY: per locally-declared pub symbol, its kind, name, declared type
+# (raw TypeId), and — for a nominal — its field table (name + field TypeId per
+# field). re-exported pub symbols contribute identity only; their types are
+# fingerprinted by their origin module's Q_TYPED_EXPORTS, which a dependent depends
+# on directly via the resolve dep closure. raw TypeIds are renumber-sensitive on
+# purpose: a dep whose nominal TypeId moved (graph reshape) changes these bytes and
+# re-checks importers, while an impl-only edit leaves them identical (the firewall).
+# a plain byte-valued derived kind (early-cutoff ON), keyed by StableModuleId.
+fun q_typed_exports_compute(db: *query.QueryDb, key: u64, alloc: *Allocator) Result[query.QueryOutput, str] {
+    val s: *sess.Session = db.ctx::*sess.Session;
+    if (s == nil) { ret err[query.QueryOutput, str]("Q_TYPED_EXPORTS: query db has no session context"); }
+    val pp: ptr = sess.active_project(s);
+    if (pp == nil) { ret err[query.QueryOutput, str]("Q_TYPED_EXPORTS: no active project for the sema pass"); }
+    val p: *Project = pp::*Project;
+
+    val stable: sess.StableModuleId = key::u32::sess.StableModuleId;
+    val mid: sess.ModuleId = sess.module_id_for_stable(s, stable);
+    if (mid == sess.MODULE_NIL) { ret err[query.QueryOutput, str]("Q_TYPED_EXPORTS: stable id not loaded this build"); }
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    val rr: *resolve.ResolveResult = m.resolve_result;
+    if (rr == nil) { ret err[query.QueryOutput, str]("Q_TYPED_EXPORTS: module has no resolve result"); }
+
+    val e_r: Result[*query.QueryEntry, str] = query.get(db, query.Q_SEMA, key);
+    if (is_err[*query.QueryEntry, str](e_r)) { ret err[query.QueryOutput, str](unwrap_err[*query.QueryEntry, str](e_r)); }
+    val sr: *sema.SemaResult = sema_handle_decode(unwrap_ok[*query.QueryEntry, str](e_r));
+    if (sr == nil) { ret err[query.QueryOutput, str]("Q_TYPED_EXPORTS: module has no sema result"); }
+
+    val rd: Result[bool, str] = query.record_dep(db, query.Q_TYPED_EXPORTS, key, query.Q_SEMA, key);
+    if (is_err[bool, str](rd)) { ret err[query.QueryOutput, str](unwrap_err[bool, str](rd)); }
+
+    var fb: FpBuf;
+    fb.alloc = alloc;
+    fb.buf   = nil;
+    fb.len   = 0;
+    fb.cap   = 0;
+
+    val wr: Result[bool, str] = fp_typed_surface(?fb, s, mid, rr, sr);
+    if (is_err[bool, str](wr)) {
+        if (fb.buf != nil && fb.cap > 0) { deallocate[u8](alloc, fb.buf, fb.cap::usize); }
+        ret err[query.QueryOutput, str](unwrap_err[bool, str](wr));
+    }
+
+    var out: query.QueryOutput;
+    out.bytes = fb.buf;
+    out.len   = fb.len;
+    ret ok[query.QueryOutput, str](out);
+}
+
+# fp_typed_surface: append the typed pub surface of module `mid` to the fingerprint.
+# the pub symbols occupy indices [0, pub_count) of `rr` in source-deterministic order.
+# each contributes (kind, name); a LOCALLY-declared symbol (origin == mid) also
+# contributes its declared type (sr.decl_type[decl], raw) and, when that type has a
+# field table, the table — so a pub field-type change re-checks importers. a
+# re-exported symbol (origin != mid) contributes a sentinel in place of a type: its
+# type lives in its origin module's typed export, which a dependent depends on
+# directly. a resolution-level surface change (added/removed/reordered pub symbol,
+# changed identity) recomputes Q_SEMA and so this fingerprint transitively (#1583).
+fun fp_typed_surface(fb: *FpBuf, s: *sess.Session, mid: sess.ModuleId, rr: *resolve.ResolveResult, sr: *sema.SemaResult) Result[bool, str] {
+    val pc: Result[bool, str] = fp_u32(fb, rr.pub_count);
+    if (is_err[bool, str](pc)) { ret pc; }
+    if (rr.symbols == nil) { ret ok[bool, str](true); }
+
+    var i: u32 = 0;
+    for (i < rr.pub_count) {
+        val sym: *resolve.Symbol = ?rr.symbols[i];
+        val rk: Result[bool, str] = fp_u8(fb, sym.kind::u8);    if (is_err[bool, str](rk)) { ret rk; }
+        val rn: Result[bool, str] = fp_u32(fb, sym.name::u32);  if (is_err[bool, str](rn)) { ret rn; }
+        if (sym.origin == mid && sym.decl::u32 < sr.decl_count) {
+            val ty: type.TypeId = sr.decl_type[sym.decl];
+            val rty: Result[bool, str] = fp_u32(fb, ty::u32);   if (is_err[bool, str](rty)) { ret rty; }
+            val rf:  Result[bool, str] = fp_type_fields(fb, s, ty); if (is_err[bool, str](rf)) { ret rf; }
+        }
+        or {
+            # re-export / out-of-range: a type sentinel, no field table.
+            val rty: Result[bool, str] = fp_u32(fb, 0xFFFFFFFF); if (is_err[bool, str](rty)) { ret rty; }
+            val rf:  Result[bool, str] = fp_u32(fb, 0);          if (is_err[bool, str](rf)) { ret rf; }
+        }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
+}
+
+# fp_type_fields: append a nominal type's field table to the fingerprint — the field
+# count followed by each field's (name, raw field TypeId) in declaration order — so a
+# pub record/union whose field name or field type changes advances the firewall. a
+# type with no registered field table (a primitive, function, pointer, or a record
+# never resolved this build) contributes a zero count. raw field TypeIds are
+# renumber-sensitive on purpose (a field of a renumbered dep's type changes here).
+fun fp_type_fields(fb: *FpBuf, s: *sess.Session, ty: type.TypeId) Result[bool, str] {
+    if (ty == type.TYPE_NIL || ty == type.TYPE_ERROR) { ret fp_u32(fb, 0); }
+    val ft_opt: Option[*type.FieldTable] = type.field_table_for(?s.types, ty);
+    if (is_none[*type.FieldTable](ft_opt)) { ret fp_u32(fb, 0); }
+    val ft: *type.FieldTable = unwrap[*type.FieldTable](ft_opt);
+    val rc: Result[bool, str] = fp_u32(fb, ft.fields_len);
+    if (is_err[bool, str](rc)) { ret rc; }
+    var i: u32 = 0;
+    for (i < ft.fields_len) {
+        val fe: *type.FieldEntry = type.field_entry_at(?s.types, ft, i);
+        val rn: Result[bool, str] = fp_u32(fb, fe.name::u32); if (is_err[bool, str](rn)) { ret rn; }
+        val rt: Result[bool, str] = fp_u32(fb, fe.ty::u32);   if (is_err[bool, str](rt)) { ret rt; }
+        i = i + 1;
+    }
+    ret ok[bool, str](true);
 }
 
 # set_build_config_input: serialize the build configuration the comptime ctx forks
