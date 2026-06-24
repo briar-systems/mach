@@ -2374,6 +2374,9 @@ fun q_exports_compute(db: *query.QueryDb, key: u64, alloc: *Allocator) Result[qu
 # pub symbols occupy indices [0, pub_count) in source-deterministic order. each
 # symbol contributes the exact tuple build_module_exports exposes to a dependent
 # resolve (kind, name, decl, origin, slot), with origin/slot in build-stable space.
+# the resolved pub comptime constant VALUES are appended too (rr.pub_const_fp): an
+# importer's resolution forks on them via `$if` over imported consts, but they are
+# not in the symbol identities, so they must enter the firewall fingerprint (#1582).
 fun fp_pub_surface(fb: *FpBuf, rr: *resolve.ResolveResult) Result[bool, str] {
     val pc: Result[bool, str] = fp_u32(fb, rr.pub_count);
     if (is_err[bool, str](pc)) { ret pc; }
@@ -2391,6 +2394,16 @@ fun fp_pub_surface(fb: *FpBuf, rr: *resolve.ResolveResult) Result[bool, str] {
         if (sym.kind == resolve.SYM_USE) { slot_fp = sym.slot_stable::u32; }
         val rs: Result[bool, str] = fp_u32(fb, slot_fp);                if (is_err[bool, str](rs)) { ret rs; }
         i = i + 1;
+    }
+
+    # append the pub comptime constant value fingerprint (length-prefixed).
+    val rl: Result[bool, str] = fp_u32(fb, rr.pub_const_fp_len);
+    if (is_err[bool, str](rl)) { ret rl; }
+    var b: u32 = 0;
+    for (b < rr.pub_const_fp_len) {
+        val rb: Result[bool, str] = fp_u8(fb, rr.pub_const_fp[b]);
+        if (is_err[bool, str](rb)) { ret rb; }
+        b = b + 1;
     }
     ret ok[bool, str](true);
 }
@@ -4585,6 +4598,73 @@ test "driver incremental: a leaf's pub-surface change re-resolves the importer, 
 
     # the re-resolved importer and leaf each equal the independent from-scratch build.
     if (!rr_struct_equal(?sA, rr_main_2, ?sB, ut_rr_of(?pB, ?sB, "uniontest.main"))) { bad = 1; }
+    if (!rr_struct_equal(?sA, ut_rr_of(?pA2, ?sA, "uniontest.leaf"), ?sB, ut_rr_of(?pB, ?sB, "uniontest.leaf"))) { bad = 1; }
+
+    dnit_project(?pB);
+    sess.dnit(?sB);
+    dnit_project(?pA2);
+    fs.remove_all(?alloc, root);
+    sess.dnit(?sA);
+    ret bad;
+}
+
+test "driver incremental: a dep's pub comptime-const value change re-resolves an importer that forks on it, matching from-scratch (#1582)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var sA: sess.Session = unwrap_ok[sess.Session, str](sr);
+    if (is_err[bool, str](tgt.register_all(?sA.registry))) { sess.dnit(?sA); ret 1; }
+
+    # main imports leaf.FLAG (a pub comptime bool) and forks a `$if` on it — the fork
+    # gates a function declaration, so main's RESOLVED surface depends on FLAG's
+    # VALUE, which lives in the comptime ctx, not in leaf's symbol identities. flipping
+    # FLAG must change leaf's export fingerprint and re-resolve main.
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.FLAG;\n$if (FLAG) {\n  fun extra() i32 { ret 1; }\n}\nfun main() i32 { ret 0; }\n";
+    texts[1] = "pub val FLAG = true;\n";
+
+    val root_r: Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (is_err[str, str](root_r)) { sess.dnit(?sA); ret 1; }
+    val root: str = unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val pA1r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA1r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA1: Project = unwrap_ok[Project, str](pA1r);
+    val st_main: sess.StableModuleId = ut_stable(?pA1, ?sA, "uniontest.main");
+    val lc_main_1: query.Revision = ut_resolve_lc(?sA, st_main);
+    val sc_main_1: u32 = ut_rr_of(?pA1, ?sA, "uniontest.main").symbol_count;
+    dnit_project(?pA1);
+
+    # flip the comptime constant: main's `$if (FLAG)` now drops `extra`.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val leaf_path: str = ut_cc3(?alloc, src_dir, "/", "leaf.mach");
+    val leaf_v2: str = "pub val FLAG = false;\n";
+    if (is_err[bool, str](fs.write_file(leaf_path, leaf_v2, str_len(leaf_v2), 420))) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+
+    val pA2r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA2r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA2: Project = unwrap_ok[Project, str](pA2r);
+
+    # main WAS re-resolved (the dep's const value it forks on changed) and its surface
+    # actually changed (the gated `extra` is gone).
+    if (ut_resolve_lc(?sA, st_main) == lc_main_1) { bad = 1; }
+    if (ut_rr_of(?pA2, ?sA, "uniontest.main").symbol_count == sc_main_1) { bad = 1; }
+
+    # from-scratch build of the flipped source on a fresh session.
+    val sr2: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr2)) { dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var sB: sess.Session = unwrap_ok[sess.Session, str](sr2);
+    if (is_err[bool, str](tgt.register_all(?sB.registry))) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val pBr: Result[Project, str] = build_project_union(?sB, root);
+    if (is_err[Project, str](pBr)) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pB: Project = unwrap_ok[Project, str](pBr);
+
+    if (!rr_struct_equal(?sA, ut_rr_of(?pA2, ?sA, "uniontest.main"), ?sB, ut_rr_of(?pB, ?sB, "uniontest.main"))) { bad = 1; }
     if (!rr_struct_equal(?sA, ut_rr_of(?pA2, ?sA, "uniontest.leaf"), ?sB, ut_rr_of(?pB, ?sB, "uniontest.leaf"))) { bad = 1; }
 
     dnit_project(?pB);
