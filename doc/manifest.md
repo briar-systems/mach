@@ -303,22 +303,22 @@ CLI `-L`/`-l`/object arguments. See
 
 ## Annotated example
 
-The compiler's own manifest builds one binary (`mach`) for two targets, keeping
-its output paths flat (no `{profile}` segment) so released paths stay stable:
+The compiler's own manifest builds one binary (`mach`) for three targets, with
+profile-segmented output paths and explicit `debug`/`release` profiles so the
+optimized release never clobbers a debug build:
 
 ```toml
 [project]
 id      = "mach"          # module-path root: this project's code is `mach.*`
 name    = "Mach Compiler" # metadata
-version = "1.3.0"
+version = "2.5.8"
 src     = "src"           # sources under ./src
 dep     = "dep"           # vendored deps under ./dep
 target  = "native"        # default target: the host-matching tuple below
-out     = "out/{target}/bin/{name}{ext}"  # e.g. out/linux/bin/mach
-obj     = "out/{target}/obj"
-ir      = "out/{target}/ir"
-asm     = "out/{target}/asm"
-tests   = "out/{target}/test/{name}"      # e.g. out/linux/test/2-parses_empty_input
+out     = "out/{target}/{profile}/bin/{name}{ext}"  # e.g. out/linux/debug/bin/mach
+obj     = "out/{target}/{profile}/obj"
+ir      = "out/{target}/{profile}/ir"
+asm     = "out/{target}/{profile}/asm"
 
 [target.linux]
 isa = "x86_64"
@@ -329,23 +329,36 @@ abi = "sysv64"
 isa  = "x86_64"
 os   = "windows"
 abi  = "win64"
-ext  = ".exe"            # the windows artifact is out/windows/bin/mach.exe
-libs = ["kernel32.dll"]  # the windows platform link requirement
+ext  = ".exe"            # the windows artifact is out/windows/<profile>/bin/mach.exe
+
+[target.linux-arm64]
+isa = "aarch64"
+os  = "linux"
+abi = "aapcs64"
 
 [bin.mach]
 entry = "main.mach"      # entry module mach.main, at src/main.mach
 
+[profile.debug]          # declared first, so a flagless `mach build .` selects it
+opt = 0
+
+[profile.release]        # `mach build . --release` selects this (opt=2)
+opt = 2
+
 [deps.mach-std]
 git = "https://github.com/octalide/mach-std"
-ref = "branch/dev"
+ref = "branch/main"
 ```
 
-`mach build .` (no `--target`) selects `linux` because `[project].target = "native"`
-resolves to the host-matching tuple, compiles `src/main.mach` and its transitive
+`mach build .` (no `--target`, no `--release`) selects `linux` because
+`[project].target = "native"` resolves to the host-matching tuple and the `debug`
+profile because it is declared first, compiles `src/main.mach` and its transitive
 imports — including modules from `mach-std` vendored at `dep/mach-std/` — into
-objects under `out/linux/obj/`, and links `out/linux/bin/mach`. `mach-std` is
-realized into `dep/mach-std/` by `mach dep pull` from the manifest pin, and
-`mach build .` then resolves it purely by that vendor path — no git at build time.
+objects under `out/linux/debug/obj/`, and links `out/linux/debug/bin/mach`.
+`mach build . --release` instead selects the `release` profile and links the
+optimized binary at `out/linux/release/bin/mach`. `mach-std` is realized into
+`dep/mach-std/` by `mach dep pull` from the manifest pin, and `mach build .` then
+resolves it purely by that vendor path — no git at build time.
 
 ## See also
 
