@@ -9,6 +9,7 @@ use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 use std.types.result.Result;
 use std.types.result.ok;
 use std.types.result.err;
@@ -37,12 +38,13 @@ use query:  mach.lang.query;
 use target: mach.lang.target;
 use modid:  mach.lang.module;
 use ast:    mach.lang.fe.ast;
-use astcache: mach.lang.astcache;
 
 # re-export the project-wide module id so consumers can spell it as
 # `session.ModuleId` / `session.MODULE_NIL`.
 fwd modid.ModuleId;
 fwd modid.MODULE_NIL;
+fwd modid.StableModuleId;
+fwd modid.STABLE_MODULE_NIL;
 
 # Session: top-level driver state shared across compilation phases; owns the allocator-backed services every phase reads or writes.
 # ---
@@ -51,8 +53,7 @@ fwd modid.MODULE_NIL;
 # diags:    diagnostic sink shared by all phases
 # interner: shared string interner used by sema and downstream phases
 # types:    shared type universe used by sema, middle-end, and backend
-# queries:  memoization database holding every input and derived compiler artifact; the public surface every consumer (CLI, LSP, tests) drives the compiler through
-# ast_cache: FileId-keyed cache of parsed ASTs, owning each `ast.Ast` and the source revision it was parsed at; the first slice of incremental rebuild (#1164) — survives a build's dnit_project so a long-lived session reuses an unchanged module's AST instead of re-parsing it, freed only here in session.dnit
+# queries:  memoization database holding every input and derived compiler artifact; the public surface every consumer (CLI, LSP, tests) drives the compiler through. owns parsed ASTs as opaque Q_PARSE handles (#1580), so a long-lived session reuses an unchanged module's AST across rebuilds instead of re-parsing it
 # module_asts: parsed AST of every loaded module, indexed by project-wide ModuleId; populated by the driver after the load pass so any phase can reach a cross-module declaration (e.g. an imported record's fields, or a generic instantiated from a transitive dependency) by ModuleId
 # module_ast_count: number of registered module ASTs (the registry's logical length)
 # module_ast_cap:   allocated capacity of the module-AST registry
@@ -71,7 +72,6 @@ pub rec Session {
     interner: intern.Interner;
     types:    ty.TypeInterner;
     queries:  query.QueryDb;
-    ast_cache:        astcache.AstCache;
     module_asts:      **ast.Ast;
     module_ast_count: u32;
     module_ast_cap:   u32;
@@ -83,6 +83,27 @@ pub rec Session {
     module_sema:      map.Map[modid.ModuleId, ptr];
     module_resolve:   map.Map[modid.ModuleId, ptr];
     module_comptime:  map.Map[modid.ModuleId, ptr];
+    # stable_ids: persistent FQN StrId -> StableModuleId, assigned in first-seen
+    # order and never renumbered, so a module keeps one identity across rebuilds
+    # even as discovery-order ModuleIds are reassigned (#1579). NOT cleared by
+    # reset_module_registry — it must outlive a build to serve the next one
+    # stable_id_next: monotonic source of the next StableModuleId to hand out
+    stable_ids:       map.Map[intern.StrId, modid.StableModuleId];
+    stable_id_next:   modid.StableModuleId;
+    # stable_to_mid: the PER-BUILD inverse of the active build's identity
+    # assignment — StableModuleId -> the discovery-order ModuleId it holds THIS
+    # build. populated by the driver alongside register_module_ast and cleared by
+    # reset_module_registry, it is the table a reused ResolveResult is remapped
+    # through (resolve.remap_result), translating a prior build's ModuleIds back
+    # into this build's numbering (#1582)
+    stable_to_mid:    map.Map[modid.StableModuleId, modid.ModuleId];
+    # active_project: opaque handle to the *driver.Project of the build currently
+    # running, installed for the span of the resolve pass so the Q_RESOLVE compute
+    # can reach the per-build module graph (deps, comptime ctxs) the engine's
+    # ComputeFn signature cannot carry. stored as `ptr` to keep this leaf module
+    # free of a driver import cycle, exactly like module_resolve/module_comptime;
+    # nil outside a resolve pass and never dereferenced by the session itself
+    active_project:   ptr;
     registry:         target.TargetRegistry;
     # the CLI optimization intent, set before build_project so the comptime ctx
     # can resolve `$mach.build.mode`: opt_explicit when a `-O*`/`--release` flag
@@ -114,7 +135,6 @@ pub fun init(alloc: *Allocator) Result[Session, str] {
     s.sources  = source.init(alloc);
     s.diags    = diag.init(alloc);
     s.interner = intern.init(alloc);
-    s.ast_cache        = astcache.init(alloc);
     s.module_asts      = nil;
     s.module_ast_count = 0;
     s.module_ast_cap   = 0;
@@ -126,6 +146,10 @@ pub fun init(alloc: *Allocator) Result[Session, str] {
     s.module_sema      = map.init[modid.ModuleId, ptr](alloc, maphash.hash_u32, maphash.eq_u32);
     s.module_resolve   = map.init[modid.ModuleId, ptr](alloc, maphash.hash_u32, maphash.eq_u32);
     s.module_comptime  = map.init[modid.ModuleId, ptr](alloc, maphash.hash_u32, maphash.eq_u32);
+    s.stable_ids       = map.init[intern.StrId, modid.StableModuleId](alloc, maphash.hash_u32, maphash.eq_u32);
+    s.stable_id_next   = 0;
+    s.stable_to_mid    = map.init[modid.StableModuleId, modid.ModuleId](alloc, maphash.hash_u32, maphash.eq_u32);
+    s.active_project   = nil;
     s.registry         = target.registry_init();
     s.opt_explicit     = false;
     s.opt_release      = false;
@@ -133,7 +157,6 @@ pub fun init(alloc: *Allocator) Result[Session, str] {
 
     val r_types: Result[ty.TypeInterner, str] = ty.init(alloc);
     if (is_err[ty.TypeInterner, str](r_types)) {
-        astcache.dnit(?s.ast_cache);
         intern.dnit(?s.interner);
         diag.dnit(?s.diags);
         source.dnit(?s.sources);
@@ -144,7 +167,6 @@ pub fun init(alloc: *Allocator) Result[Session, str] {
     val r_queries: Result[query.QueryDb, str] = query.init(alloc);
     if (is_err[query.QueryDb, str](r_queries)) {
         ty.dnit(?s.types);
-        astcache.dnit(?s.ast_cache);
         intern.dnit(?s.interner);
         diag.dnit(?s.diags);
         source.dnit(?s.sources);
@@ -156,7 +178,6 @@ pub fun init(alloc: *Allocator) Result[Session, str] {
     if (is_err[bool, str](r_cat)) {
         query.dnit(?s.queries);
         ty.dnit(?s.types);
-        astcache.dnit(?s.ast_cache);
         intern.dnit(?s.interner);
         diag.dnit(?s.diags);
         source.dnit(?s.sources);
@@ -166,13 +187,13 @@ pub fun init(alloc: *Allocator) Result[Session, str] {
     ret ok[Session, str](s);
 }
 
-# register_catalog: register the catalog input kinds owned by the session. the two input
-# queries (project root, target) are self-contained and bound here.
-# Q_FILE_TEXT is a metadata source whose revision is owned by the source
-# map; its registration is deferred to the query layer that supplies the
-# source-map context the bare RevisionFn cannot reach, and derived kinds
-# are reserved by their owning phase modules, which bind the compute
-# functions the database invokes.
+# register_catalog: register the catalog input kinds owned by the session. the
+# three input queries (project root, target, per-file source text) are
+# self-contained and bound here. Q_FILE_TEXT holds each file's source text,
+# set by load_source; its byte-equality cutoff is what keeps an unchanged
+# file's Q_PARSE entry valid across rebuilds. derived kinds are reserved by
+# their owning phase modules (e.g. the driver registers Q_PARSE), which bind
+# the compute functions the database invokes.
 # ---
 # db:  the freshly constructed query database
 # ret: true once every session-owned input kind is registered, or the first registration error
@@ -182,6 +203,9 @@ fun register_catalog(db: *query.QueryDb) Result[bool, str] {
 
     val r_target: Result[bool, str] = query.register_input(db, query.Q_TARGET);
     if (is_err[bool, str](r_target)) { ret r_target; }
+
+    val r_text: Result[bool, str] = query.register_input(db, query.Q_FILE_TEXT);
+    if (is_err[bool, str](r_text)) { ret r_text; }
 
     ret ok[bool, str](true);
 }
@@ -205,9 +229,10 @@ pub fun dnit(s: *Session) {
     map.dnit[modid.ModuleId, ptr](?s.module_sema);
     map.dnit[modid.ModuleId, ptr](?s.module_resolve);
     map.dnit[modid.ModuleId, ptr](?s.module_comptime);
+    map.dnit[intern.StrId, modid.StableModuleId](?s.stable_ids);
+    map.dnit[modid.StableModuleId, modid.ModuleId](?s.stable_to_mid);
     query.dnit(?s.queries);
     ty.dnit(?s.types);
-    astcache.dnit(?s.ast_cache);
     intern.dnit(?s.interner);
     diag.dnit(?s.diags);
     source.dnit(?s.sources);
@@ -228,6 +253,10 @@ pub fun dnit(s: *Session) {
 # repurposes. call this at the END of a project teardown (after the Project frees),
 # so the next build starts from a clean registry rather than entries pointing at
 # freed Project storage.
+#
+# the FQN -> StableModuleId registry (`stable_ids`) is deliberately NOT cleared:
+# its whole purpose is to outlive a build so a module keeps one identity across
+# rebuilds (#1579), the key future resolve/sema reuse remaps against.
 # ---
 # s: the session whose module registries are emptied
 pub fun reset_module_registry(s: *Session) {
@@ -246,6 +275,10 @@ pub fun reset_module_registry(s: *Session) {
     map.clear[modid.ModuleId, ptr](?s.module_sema);
     map.clear[modid.ModuleId, ptr](?s.module_resolve);
     map.clear[modid.ModuleId, ptr](?s.module_comptime);
+    # the per-build StableModuleId -> ModuleId inverse is rebuilt from scratch each
+    # build; clear it so a reshape's new numbering never collides with a stale entry.
+    map.clear[modid.StableModuleId, modid.ModuleId](?s.stable_to_mid);
+    s.active_project = nil;
 }
 
 # register_module_ast: record `a` as the AST of module `mid` in the session
@@ -331,6 +364,89 @@ pub fun module_fqn(s: *Session, mid: modid.ModuleId) intern.StrId {
     val r: Result[*intern.StrId, str] = map.get[modid.ModuleId, intern.StrId](?s.module_fqns, ?key);
     if (is_ok[*intern.StrId, str](r)) { ret @unwrap_ok[*intern.StrId, str](r); }
     ret intern.STR_NIL;
+}
+
+# stable_module_id: the build-stable identity of the module named by `fqn`,
+# assigning the next id on first sight and returning the existing one on every
+# later request — across rebuilds too, since the registry persists. this is the
+# cross-build identity the discovery-order ModuleId is NOT: the same FQN keeps
+# the same StableModuleId even when a changed graph shape renumbers ModuleIds.
+# ---
+# s:   the session
+# fqn: interned fully-qualified module path
+# ret: the module's StableModuleId, or an allocation error from the registry map
+pub fun stable_module_id(s: *Session, fqn: intern.StrId) Result[modid.StableModuleId, str] {
+    var key: intern.StrId = fqn;
+    val r: Result[*modid.StableModuleId, str] = map.get[intern.StrId, modid.StableModuleId](?s.stable_ids, ?key);
+    if (is_ok[*modid.StableModuleId, str](r)) { ret ok[modid.StableModuleId, str](@unwrap_ok[*modid.StableModuleId, str](r)); }
+
+    val id: modid.StableModuleId = s.stable_id_next;
+    val ins: Result[bool, str] = map.insert[intern.StrId, modid.StableModuleId](?s.stable_ids, fqn, id);
+    if (is_err[bool, str](ins)) { ret err[modid.StableModuleId, str](unwrap_err[bool, str](ins)); }
+    s.stable_id_next = s.stable_id_next + 1;
+    ret ok[modid.StableModuleId, str](id);
+}
+
+# stable_module_id_lookup: the StableModuleId already assigned to `fqn`, or
+# STABLE_MODULE_NIL when the module has never been seen. a read-only probe that,
+# unlike stable_module_id, never assigns a new id.
+# ---
+# s:   the session
+# fqn: interned fully-qualified module path
+# ret: the module's StableModuleId, or STABLE_MODULE_NIL
+pub fun stable_module_id_lookup(s: *Session, fqn: intern.StrId) modid.StableModuleId {
+    var key: intern.StrId = fqn;
+    val r: Result[*modid.StableModuleId, str] = map.get[intern.StrId, modid.StableModuleId](?s.stable_ids, ?key);
+    if (is_ok[*modid.StableModuleId, str](r)) { ret @unwrap_ok[*modid.StableModuleId, str](r); }
+    ret modid.STABLE_MODULE_NIL;
+}
+
+# register_stable_mid: record that StableModuleId `stable` holds discovery-order
+# ModuleId `mid` in the build currently running. the driver calls this once per
+# module each build (alongside register_module_ast); reset_module_registry clears
+# the table so each build's numbering stands alone. registering twice overwrites.
+# ---
+# s:      the session
+# stable: the module's build-stable identity
+# mid:    the per-build ModuleId it holds this build
+# ret:    true on success, or an allocation error from the registry map
+pub fun register_stable_mid(s: *Session, stable: modid.StableModuleId, mid: modid.ModuleId) Result[bool, str] {
+    ret map.insert[modid.StableModuleId, modid.ModuleId](?s.stable_to_mid, stable, mid);
+}
+
+# module_id_for_stable: the current build's ModuleId for StableModuleId `stable`,
+# or MODULE_NIL when `stable` is STABLE_MODULE_NIL or names no module loaded this
+# build. the lookup resolve.remap_result drives to translate a reused result's
+# stale ModuleIds into the active build's numbering (#1582).
+# ---
+# s:      the session
+# stable: a build-stable module identity
+# ret:    the per-build ModuleId, or MODULE_NIL
+pub fun module_id_for_stable(s: *Session, stable: modid.StableModuleId) modid.ModuleId {
+    if (stable == modid.STABLE_MODULE_NIL) { ret modid.MODULE_NIL; }
+    var key: modid.StableModuleId = stable;
+    val r: Result[*modid.ModuleId, str] = map.get[modid.StableModuleId, modid.ModuleId](?s.stable_to_mid, ?key);
+    if (is_ok[*modid.ModuleId, str](r)) { ret @unwrap_ok[*modid.ModuleId, str](r); }
+    ret modid.MODULE_NIL;
+}
+
+# set_active_project: install (or clear, with nil) the opaque handle to the build's
+# *driver.Project for the span of the resolve pass, so the Q_RESOLVE compute can
+# reach the per-build module graph. stored verbatim and never dereferenced here.
+# ---
+# s: the session
+# p: the active Project as `ptr`, or nil to clear
+pub fun set_active_project(s: *Session, p: ptr) {
+    s.active_project = p;
+}
+
+# active_project: the opaque *driver.Project handle installed for the running
+# resolve pass, or nil outside one. the caller casts it back to *driver.Project.
+# ---
+# s:   the session
+# ret: the active Project `ptr`, or nil
+pub fun active_project(s: *Session) ptr {
+    ret s.active_project;
 }
 
 # register_export_name: record a literal link-name override for decl `did` in
@@ -524,13 +640,22 @@ pub fun module_comptime_ptr(s: *Session, mid: modid.ModuleId) ptr {
 # delegates to source.load, which dedups by path: a path loaded for the first
 # time is appended, a path already loaded reuses its FileId and is text-swapped
 # in place — so a long-lived session (an LSP reloading on save) does not grow on
-# reload. either path bumps s.queries.revision so derived entries depending on
-# this file invalidate.
+# reload. the loaded text is then mirrored into the Q_FILE_TEXT query input,
+# keyed by FileId: set_input's byte-equality cutoff leaves the input's
+# last_changed untouched for an unchanged reload (so a dependent Q_PARSE entry
+# stays valid and the AST is reused) and advances it on a real edit (so Q_PARSE
+# recomputes).
 # ---
 # s:    the session
 # path: file path to associate with this file
 # text: null-terminated source text to index and store
 # ret:  FileId the path is registered under (stable across reloads of the same path), or an allocation error
 pub fun load_source(s: *Session, path: str, text: str) Result[source.FileId, str] {
-    ret source.load(?s.sources, ?s.queries, ?s.interner, path, text);
+    val fid_r: Result[source.FileId, str] = source.load(?s.sources, ?s.queries, ?s.interner, path, text);
+    if (is_err[source.FileId, str](fid_r)) { ret fid_r; }
+    val fid: source.FileId = unwrap_ok[source.FileId, str](fid_r);
+
+    val si_r: Result[bool, str] = query.set_input(?s.queries, query.Q_FILE_TEXT, fid::u64, text::*u8, str_len(text)::u32);
+    if (is_err[bool, str](si_r)) { ret err[source.FileId, str](unwrap_err[bool, str](si_r)); }
+    ret ok[source.FileId, str](fid);
 }
