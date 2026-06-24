@@ -3278,6 +3278,13 @@ fun build_resolve_deps_owned(p: *Project, m: *ModuleEntry) Result[resolve.Resolv
 pub fun run_sema_pass(p: *Project) Result[bool, str] {
     sess.set_active_project(p.s, p::ptr);
 
+    # open a fresh field-table epoch for this build: a record keeps its TypeId across
+    # rebuilds while its field types may have changed, so a builder must rebuild a
+    # table stamped with an older epoch rather than reuse its stale layout (#1583). a
+    # fresh CLI session runs its single build at epoch 1 — no observable difference
+    # from the pre-epoch build-once behaviour.
+    type.field_epoch_bump(?p.s.types);
+
     var i: u32 = 0;
     for (i < p.topo_len) {
         val mid: sess.ModuleId = p.topo[i];
@@ -5123,6 +5130,423 @@ test "driver incremental: a re-exporter propagates a leaf surface change two hop
     if (!rr_struct_equal(?sA, ut_rr_of(?pA2, ?sA, "uniontest.main"), ?sB, ut_rr_of(?pB, ?sB, "uniontest.main"))) { bad = 1; }
     if (!rr_struct_equal(?sA, ut_rr_of(?pA2, ?sA, "uniontest.mid"),  ?sB, ut_rr_of(?pB, ?sB, "uniontest.mid")))  { bad = 1; }
     if (!rr_struct_equal(?sA, ut_rr_of(?pA2, ?sA, "uniontest.leaf"), ?sB, ut_rr_of(?pB, ?sB, "uniontest.leaf"))) { bad = 1; }
+
+    dnit_project(?pB);
+    sess.dnit(?sB);
+    dnit_project(?pA2);
+    fs.remove_all(?alloc, root);
+    sess.dnit(?sA);
+    ret bad;
+}
+
+# ut_sema_lc: the last_changed revision of module `stable`'s Q_SEMA entry on session
+# `s`, or a sentinel when absent. an owned-handle shard never early-cuts, so an
+# unchanged value means the entry was NOT recomputed — the sema reuse probe (#1583).
+fun ut_sema_lc(s: *sess.Session, stable: sess.StableModuleId) query.Revision {
+    val e: Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_SEMA, stable::u64);
+    if (is_err[*query.QueryEntry, str](e)) { ret 0xFFFFFFFFFFFFFFFF; }
+    ret unwrap_ok[*query.QueryEntry, str](e).last_changed;
+}
+
+# ut_module_fqn_text_equal: whether two ModuleIds name the same module by FQN text
+# across two sessions. an anonymous nominal's origin is MODULE_NIL in both; the test
+# fixtures use only named records, so two MODULE_NIL origins (with a matched decl
+# key) are treated as equal here.
+fun ut_module_fqn_text_equal(sa: *sess.Session, ma: sess.ModuleId, sb: *sess.Session, mb: sess.ModuleId) bool {
+    if (ma == sess.MODULE_NIL && mb == sess.MODULE_NIL) { ret true; }
+    if (ma == sess.MODULE_NIL || mb == sess.MODULE_NIL) { ret false; }
+    ret ut_name_text_equal(sa, sess.module_fqn(sa, ma), sb, sess.module_fqn(sb, mb));
+}
+
+# ty_struct_equal: whether two TypeIds denote the same semantic type across two
+# sessions — the cross-session comparison the sema incremental tests assert a reused
+# (or recomputed) SemaResult against an independent from-scratch build. the incremental
+# session interned its types in a different order (and a graph reshape renumbered the
+# ModuleId embedded in nominal identities), so a raw TypeId equality would not hold;
+# this compares STRUCTURALLY: primitives by kind, ptr/array/fun by recursion, nominals
+# by (declaring module FQN text, decl) — reshape-stable — and generic params by
+# (owner, index). recursion terminates because a nominal compares by identity, never
+# by recursing into its (possibly self-referential) field types. anonymous aggregates
+# (MODULE_NIL origin, per-session structural key) are out of the fixtures' scope.
+fun ty_struct_equal(sa: *sess.Session, ta: type.TypeId, sb: *sess.Session, tb: type.TypeId) bool {
+    if (ta == type.TYPE_NIL && tb == type.TYPE_NIL) { ret true; }
+    if (ta == type.TYPE_ERROR && tb == type.TYPE_ERROR) { ret true; }
+    if (ta == type.TYPE_NIL || tb == type.TYPE_NIL) { ret false; }
+    if (ta == type.TYPE_ERROR || tb == type.TYPE_ERROR) { ret false; }
+
+    val oa: Option[*type.Type] = type.get(?sa.types, ta);
+    val ob: Option[*type.Type] = type.get(?sb.types, tb);
+    if (is_none[*type.Type](oa) || is_none[*type.Type](ob)) { ret false; }
+    val a: *type.Type = unwrap[*type.Type](oa);
+    val b: *type.Type = unwrap[*type.Type](ob);
+    if (a.kind != b.kind) { ret false; }
+    val k: type.TypeKind = a.kind;
+
+    # kinds below TYPE_POINTER are the payload-free primitives; equal by kind alone.
+    if (k::u32 < type.TYPE_POINTER::u32) { ret true; }
+    if (k == type.TYPE_PACK) { ret true; }
+    if (k == type.TYPE_POINTER) {
+        ret ty_struct_equal(sa, a.data.pointer.base, sb, b.data.pointer.base);
+    }
+    if (k == type.TYPE_ARRAY) {
+        if (a.data.array.count != b.data.array.count) { ret false; }
+        ret ty_struct_equal(sa, a.data.array.base, sb, b.data.array.base);
+    }
+    if (k == type.TYPE_FUN) {
+        if (a.data.fn.params_len != b.data.fn.params_len) { ret false; }
+        if (!ty_struct_equal(sa, a.data.fn.ret_ty, sb, b.data.fn.ret_ty)) { ret false; }
+        var i: u32 = 0;
+        for (i < a.data.fn.params_len) {
+            val pa: Option[type.TypeId] = type.get_param(?sa.types, a.data.fn.params_start + i);
+            val pb: Option[type.TypeId] = type.get_param(?sb.types, b.data.fn.params_start + i);
+            if (is_none[type.TypeId](pa) || is_none[type.TypeId](pb)) { ret false; }
+            if (!ty_struct_equal(sa, unwrap[type.TypeId](pa), sb, unwrap[type.TypeId](pb))) { ret false; }
+            i = i + 1;
+        }
+        ret true;
+    }
+    if (k == type.TYPE_REC || k == type.TYPE_UNI) {
+        if (a.data.nominal.decl != b.data.nominal.decl) { ret false; }
+        ret ut_module_fqn_text_equal(sa, a.data.nominal.origin, sb, b.data.nominal.origin);
+    }
+    if (k == type.TYPE_GENERIC_PARAM) {
+        ret a.data.generic_param.owner == b.data.generic_param.owner
+            && a.data.generic_param.index == b.data.generic_param.index;
+    }
+    if (k == type.TYPE_INSTANCE) {
+        if (a.data.instance.target_decl != b.data.instance.target_decl) { ret false; }
+        if (a.data.instance.args_len != b.data.instance.args_len) { ret false; }
+        if (!ut_module_fqn_text_equal(sa, a.data.instance.target_origin, sb, b.data.instance.target_origin)) { ret false; }
+        var i: u32 = 0;
+        for (i < a.data.instance.args_len) {
+            val pa: Option[type.TypeId] = type.get_param(?sa.types, a.data.instance.args_start + i);
+            val pb: Option[type.TypeId] = type.get_param(?sb.types, b.data.instance.args_start + i);
+            if (is_none[type.TypeId](pa) || is_none[type.TypeId](pb)) { ret false; }
+            if (!ty_struct_equal(sa, unwrap[type.TypeId](pa), sb, unwrap[type.TypeId](pb))) { ret false; }
+            i = i + 1;
+        }
+        ret true;
+    }
+    ret false;
+}
+
+# sr_struct_equal: whether two SemaResults are structurally identical — the
+# type-checking-correctness comparison the incremental tests assert a reused (or
+# recomputed) result against an independent from-scratch build. compares the three
+# parallel TypeId arrays (every expr, syntactic type, and decl) element-wise under
+# ty_struct_equal, so a reused result whose interned TypeIds differ numerically from
+# the fresh build's still compares equal iff they denote the same types.
+fun sr_struct_equal(sa: *sess.Session, sra: *sema.SemaResult, sb: *sess.Session, srb: *sema.SemaResult) bool {
+    if (sra == nil || srb == nil) { ret false; }
+    if (sra.expr_count != srb.expr_count) { ret false; }
+    if (sra.type_count != srb.type_count) { ret false; }
+    if (sra.decl_count != srb.decl_count) { ret false; }
+
+    var i: u32 = 0;
+    for (i < sra.expr_count) {
+        if (!ty_struct_equal(sa, sra.expr_type[i], sb, srb.expr_type[i])) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < sra.type_count) {
+        if (!ty_struct_equal(sa, sra.type_resolved_ty[i], sb, srb.type_resolved_ty[i])) { ret false; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < sra.decl_count) {
+        if (!ty_struct_equal(sa, sra.decl_type[i], sb, srb.decl_type[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# ut_sr_of: the borrowed SemaResult of module `fqn` in project `p` (set by
+# run_sema_pass), or nil.
+fun ut_sr_of(p: *Project, s: *sess.Session, fqn: str) *sema.SemaResult {
+    val mid: sess.ModuleId = ut_mid(p, s, fqn);
+    if (mid == sess.MODULE_NIL) { ret nil; }
+    ret p.modules[mid::u32].sema_result;
+}
+
+test "driver incremental: a leaf's private body edit firewalls the importer's sema, which still equals a from-scratch build (#1583)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var sA: sess.Session = unwrap_ok[sess.Session, str](sr);
+    if (is_err[bool, str](tgt.register_all(?sA.registry))) { sess.dnit(?sA); ret 1; }
+
+    # main imports leaf.fa and types its return; editing fa's BODY (not its signature)
+    # leaves leaf's typed surface byte-identical, so main's type-checking is firewalled.
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.fa;\nfun main() i32 { val x = fa(); ret x; }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+
+    val root_r: Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (is_err[str, str](root_r)) { sess.dnit(?sA); ret 1; }
+    val root: str = unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val pA1r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA1r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA1: Project = unwrap_ok[Project, str](pA1r);
+    if (is_err[bool, str](run_sema_pass(?pA1))) { dnit_project(?pA1); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val st_main: sess.StableModuleId = ut_stable(?pA1, ?sA, "uniontest.main");
+    val st_leaf: sess.StableModuleId = ut_stable(?pA1, ?sA, "uniontest.leaf");
+    val lc_main_1: query.Revision = ut_sema_lc(?sA, st_main);
+    val lc_leaf_1: query.Revision = ut_sema_lc(?sA, st_leaf);
+    dnit_project(?pA1);
+
+    # private body edit: fa's signature/type unchanged.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val leaf_path: str = ut_cc3(?alloc, src_dir, "/", "leaf.mach");
+    val leaf_v2: str = "pub fun fa() i32 { val t: i32 = 1; ret t; }\n";
+    if (is_err[bool, str](fs.write_file(leaf_path, leaf_v2, str_len(leaf_v2), 420))) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+
+    val pA2r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA2r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA2: Project = unwrap_ok[Project, str](pA2r);
+    if (is_err[bool, str](run_sema_pass(?pA2))) { dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val lc_main_2: query.Revision = ut_sema_lc(?sA, st_main);
+    val lc_leaf_2: query.Revision = ut_sema_lc(?sA, st_leaf);
+
+    # firewall: the importer was NOT re-type-checked; the edited leaf WAS.
+    if (lc_main_2 != lc_main_1) { bad = 1; }
+    if (lc_leaf_2 == lc_leaf_1) { bad = 1; }
+
+    # from-scratch build of the SAME (v2) source on a fresh session.
+    val sr2: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr2)) { dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var sB: sess.Session = unwrap_ok[sess.Session, str](sr2);
+    if (is_err[bool, str](tgt.register_all(?sB.registry))) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val pBr: Result[Project, str] = build_project_union(?sB, root);
+    if (is_err[Project, str](pBr)) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pB: Project = unwrap_ok[Project, str](pBr);
+    if (is_err[bool, str](run_sema_pass(?pB))) { dnit_project(?pB); sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+
+    # the reused importer result and the re-checked leaf result each equal the
+    # independent from-scratch type-checking.
+    if (!sr_struct_equal(?sA, ut_sr_of(?pA2, ?sA, "uniontest.main"), ?sB, ut_sr_of(?pB, ?sB, "uniontest.main"))) { bad = 1; }
+    if (!sr_struct_equal(?sA, ut_sr_of(?pA2, ?sA, "uniontest.leaf"), ?sB, ut_sr_of(?pB, ?sB, "uniontest.leaf"))) { bad = 1; }
+
+    dnit_project(?pB);
+    sess.dnit(?sB);
+    dnit_project(?pA2);
+    fs.remove_all(?alloc, root);
+    sess.dnit(?sA);
+    ret bad;
+}
+
+test "driver incremental: a leaf's pub return-type change re-checks the importer, which still equals a from-scratch build (#1583)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var sA: sess.Session = unwrap_ok[sess.Session, str](sr);
+    if (is_err[bool, str](tgt.register_all(?sA.registry))) { sess.dnit(?sA); ret 1; }
+
+    # main binds `val x = fa()`, so x's inferred type IS fa's return type. changing
+    # fa's signature i32 -> i64 genuinely changes main's typing (x: i32 -> i64): a
+    # reused result would be a miscompile, so the typed firewall must re-check main.
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.fa;\nfun main() i32 { val x = fa(); ret x::i32; }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+
+    val root_r: Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (is_err[str, str](root_r)) { sess.dnit(?sA); ret 1; }
+    val root: str = unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val pA1r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA1r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA1: Project = unwrap_ok[Project, str](pA1r);
+    if (is_err[bool, str](run_sema_pass(?pA1))) { dnit_project(?pA1); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val st_main: sess.StableModuleId = ut_stable(?pA1, ?sA, "uniontest.main");
+    val lc_main_1: query.Revision = ut_sema_lc(?sA, st_main);
+    dnit_project(?pA1);
+
+    # pub return-type change.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val leaf_path: str = ut_cc3(?alloc, src_dir, "/", "leaf.mach");
+    val leaf_v2: str = "pub fun fa() i64 { ret 1; }\n";
+    if (is_err[bool, str](fs.write_file(leaf_path, leaf_v2, str_len(leaf_v2), 420))) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+
+    val pA2r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA2r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA2: Project = unwrap_ok[Project, str](pA2r);
+    if (is_err[bool, str](run_sema_pass(?pA2))) { dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+
+    # the importer WAS re-type-checked (its dep's typed surface changed).
+    if (ut_sema_lc(?sA, st_main) == lc_main_1) { bad = 1; }
+
+    # from-scratch build of the v2 source on a fresh session.
+    val sr2: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr2)) { dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var sB: sess.Session = unwrap_ok[sess.Session, str](sr2);
+    if (is_err[bool, str](tgt.register_all(?sB.registry))) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val pBr: Result[Project, str] = build_project_union(?sB, root);
+    if (is_err[Project, str](pBr)) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pB: Project = unwrap_ok[Project, str](pBr);
+    if (is_err[bool, str](run_sema_pass(?pB))) { dnit_project(?pB); sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+
+    # the re-checked importer and the changed leaf each equal the from-scratch build.
+    if (!sr_struct_equal(?sA, ut_sr_of(?pA2, ?sA, "uniontest.main"), ?sB, ut_sr_of(?pB, ?sB, "uniontest.main"))) { bad = 1; }
+    if (!sr_struct_equal(?sA, ut_sr_of(?pA2, ?sA, "uniontest.leaf"), ?sB, ut_sr_of(?pB, ?sB, "uniontest.leaf"))) { bad = 1; }
+
+    dnit_project(?pB);
+    sess.dnit(?sB);
+    dnit_project(?pA2);
+    fs.remove_all(?alloc, root);
+    sess.dnit(?sA);
+    ret bad;
+}
+
+test "driver incremental: a dep's pub record field-type change re-checks a field-accessing importer the resolve firewall misses, matching from-scratch (#1583)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var sA: sess.Session = unwrap_ok[sess.Session, str](sr);
+    if (is_err[bool, str](tgt.register_all(?sA.registry))) { sess.dnit(?sA); ret 1; }
+
+    # main reads leaf.P's field `x`. changing P's FIELD TYPE (i32 -> i64) does NOT
+    # change leaf's RESOLVED surface (resolve never types fields), so the resolve
+    # firewall leaves main un-re-resolved — but it changes leaf's TYPED surface, so
+    # the typed firewall must re-type-check main. without it, main's `p.x` would stay
+    # i32 (a miscompile). this is the case Q_TYPED_EXPORTS catches and Q_EXPORTS misses.
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.P;\nfun main() i64 { var p: P; p.x = 1; ret p.x::i64; }\n";
+    texts[1] = "pub rec P { x: i32; }\n";
+
+    val root_r: Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (is_err[str, str](root_r)) { sess.dnit(?sA); ret 1; }
+    val root: str = unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val pA1r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA1r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA1: Project = unwrap_ok[Project, str](pA1r);
+    if (is_err[bool, str](run_sema_pass(?pA1))) { dnit_project(?pA1); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val st_main: sess.StableModuleId = ut_stable(?pA1, ?sA, "uniontest.main");
+    val lc_sema_main_1: query.Revision = ut_sema_lc(?sA, st_main);
+    val lc_res_main_1:  query.Revision = ut_resolve_lc(?sA, st_main);
+    dnit_project(?pA1);
+
+    # pub record field-type change.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val leaf_path: str = ut_cc3(?alloc, src_dir, "/", "leaf.mach");
+    val leaf_v2: str = "pub rec P { x: i64; }\n";
+    if (is_err[bool, str](fs.write_file(leaf_path, leaf_v2, str_len(leaf_v2), 420))) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+
+    val pA2r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA2r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA2: Project = unwrap_ok[Project, str](pA2r);
+    if (is_err[bool, str](run_sema_pass(?pA2))) { dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+
+    # the resolve firewall held (main NOT re-resolved: the resolved surface is identical) ...
+    if (ut_resolve_lc(?sA, st_main) != lc_res_main_1) { bad = 1; }
+    # ... but the TYPED firewall fired (main re-type-checked: the field type changed).
+    if (ut_sema_lc(?sA, st_main) == lc_sema_main_1) { bad = 1; }
+
+    # from-scratch build of the v2 source on a fresh session.
+    val sr2: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr2)) { dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var sB: sess.Session = unwrap_ok[sess.Session, str](sr2);
+    if (is_err[bool, str](tgt.register_all(?sB.registry))) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val pBr: Result[Project, str] = build_project_union(?sB, root);
+    if (is_err[Project, str](pBr)) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pB: Project = unwrap_ok[Project, str](pBr);
+    if (is_err[bool, str](run_sema_pass(?pB))) { dnit_project(?pB); sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+
+    if (!sr_struct_equal(?sA, ut_sr_of(?pA2, ?sA, "uniontest.main"), ?sB, ut_sr_of(?pB, ?sB, "uniontest.main"))) { bad = 1; }
+    if (!sr_struct_equal(?sA, ut_sr_of(?pA2, ?sA, "uniontest.leaf"), ?sB, ut_sr_of(?pB, ?sB, "uniontest.leaf"))) { bad = 1; }
+
+    dnit_project(?pB);
+    sess.dnit(?sB);
+    dnit_project(?pA2);
+    fs.remove_all(?alloc, root);
+    sess.dnit(?sA);
+    ret bad;
+}
+
+test "driver incremental: a graph reshape renumbers a module's nominal types; Q_SEMA re-checks it and the importer, matching from-scratch (#1583)" {
+    var alloc: Allocator;
+    if (is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr)) { ret 1; }
+    var sA: sess.Session = unwrap_ok[sess.Session, str](sr);
+    if (is_err[bool, str](tgt.register_all(?sA.registry))) { sess.dnit(?sA); ret 1; }
+
+    # main imports a.Q (a record) and b.fb. swapping main's use order renumbers a and
+    # b's discovery-order ModuleIds — and a.Q's nominal TypeId embeds a's ModuleId, so
+    # a reused SemaResult for `a` would hold a stale type identity. Q_MODULE_NUMBER must
+    # re-type-check the renumbered `a`, and the changed typed surface must re-check main;
+    # both must equal a from-scratch build of the reshaped graph.
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    texts[0] = "use uniontest.a.Q;\nuse uniontest.b.fb;\nfun main() i32 { var q: Q; q.x = 1; ret q.x + fb(); }\n";
+    texts[1] = "pub rec Q { x: i32; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+
+    val root_r: Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 3);
+    if (is_err[str, str](root_r)) { sess.dnit(?sA); ret 1; }
+    val root: str = unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val pA1r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA1r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA1: Project = unwrap_ok[Project, str](pA1r);
+    if (is_err[bool, str](run_sema_pass(?pA1))) { dnit_project(?pA1); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val mid_a1: sess.ModuleId = ut_mid(?pA1, ?sA, "uniontest.a");
+    val st_main: sess.StableModuleId = ut_stable(?pA1, ?sA, "uniontest.main");
+    val st_a:    sess.StableModuleId = ut_stable(?pA1, ?sA, "uniontest.a");
+    val lc_main_1: query.Revision = ut_sema_lc(?sA, st_main);
+    val lc_a_1:    query.Revision = ut_sema_lc(?sA, st_a);
+    dnit_project(?pA1);
+
+    # reshape: swap the use order so a and b's discovery-order ModuleIds swap.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val main_path: str = ut_cc3(?alloc, src_dir, "/", "main.mach");
+    val main_v2: str = "use uniontest.b.fb;\nuse uniontest.a.Q;\nfun main() i32 { var q: Q; q.x = 1; ret q.x + fb(); }\n";
+    if (is_err[bool, str](fs.write_file(main_path, main_v2, str_len(main_v2), 420))) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+
+    val pA2r: Result[Project, str] = build_project_union(?sA, root);
+    if (is_err[Project, str](pA2r)) { fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pA2: Project = unwrap_ok[Project, str](pA2r);
+    if (is_err[bool, str](run_sema_pass(?pA2))) { dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+
+    # the reshape actually renumbered `a` (so its nominal TypeId identity moved) ...
+    if (ut_mid(?pA2, ?sA, "uniontest.a") == mid_a1) { bad = 1; }
+    # ... so Q_SEMA re-type-checked the renumbered `a` (the self-number gate fired) ...
+    if (ut_sema_lc(?sA, st_a) == lc_a_1) { bad = 1; }
+    # ... and re-type-checked main (its edited text re-resolves and re-types it).
+    if (ut_sema_lc(?sA, st_main) == lc_main_1) { bad = 1; }
+
+    # from-scratch build of the reshaped source on a fresh session.
+    val sr2: Result[sess.Session, str] = sess.init(?alloc);
+    if (is_err[sess.Session, str](sr2)) { dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var sB: sess.Session = unwrap_ok[sess.Session, str](sr2);
+    if (is_err[bool, str](tgt.register_all(?sB.registry))) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    val pBr: Result[Project, str] = build_project_union(?sB, root);
+    if (is_err[Project, str](pBr)) { sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+    var pB: Project = unwrap_ok[Project, str](pBr);
+    if (is_err[bool, str](run_sema_pass(?pB))) { dnit_project(?pB); sess.dnit(?sB); dnit_project(?pA2); fs.remove_all(?alloc, root); sess.dnit(?sA); ret 1; }
+
+    # the renumbered leaf and the importer each equal the independent from-scratch build,
+    # proving the reused/recomputed type identities are consistent across the reshape.
+    if (!sr_struct_equal(?sA, ut_sr_of(?pA2, ?sA, "uniontest.a"),    ?sB, ut_sr_of(?pB, ?sB, "uniontest.a")))    { bad = 1; }
+    if (!sr_struct_equal(?sA, ut_sr_of(?pA2, ?sA, "uniontest.main"), ?sB, ut_sr_of(?pB, ?sB, "uniontest.main"))) { bad = 1; }
 
     dnit_project(?pB);
     sess.dnit(?sB);
