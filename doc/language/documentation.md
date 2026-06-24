@@ -7,15 +7,14 @@ component block.
 ## Grammar
 
 ```
-# <name>: <summary>.
+# <summary>
 # ---
 # <component>: <description>
 # <component>: <description>
 ```
 
-- **Summary line.** `<name>` is the declared identifier; for modules it
-  is the full dotted path. `<summary>` is a single sentence ending in a
-  period.
+- **Summary line.** `<summary>` is a single sentance by convention. Additional
+  information may be added in subsequent paragraphs separated by blank `#` lines.
 - **Separator.** `# ---` is present when one or more component lines
   follow; absent when the docstring is summary-only.
 - **Component lines.** Each is `# <component>: <description>`. One line
@@ -39,7 +38,7 @@ The docstring is the first thing above the declaration. Backtick decorators
 follow the docstring, immediately above the decl:
 
 ```mach
-# panic: terminate the program with a message.
+# terminate the program with a message
 # ---
 # msg: text to emit before terminating
 #[symbol("panic")]
@@ -49,7 +48,7 @@ pub fun panic(msg: *u8) { ... }
 ## Function
 
 ```mach
-# realtime: read the wall-clock time.
+# read the wall-clock time
 # ---
 # out: pointer to Timespec to populate
 # ret: 0 on success, negative errno on failure
@@ -60,7 +59,7 @@ Generic and comptime parameters appear in the component block under their
 syntactic form:
 
 ```mach
-# load: atomic load through a typed pointer.
+# atomic load through a typed pointer
 # ---
 # [T]:    element type
 # $order: memory ordering constraint
@@ -72,14 +71,14 @@ pub fun load[T]($order: Order, ptr: *T) T { ... }
 Summary-only — no separator, no component block:
 
 ```mach
-# spin_hint: yield the CPU to other threads.
+# yield the CPU to other threads
 pub fun spin_hint() { ... }
 ```
 
 ## Record / union / def
 
 ```mach
-# Point: a 2D Cartesian point with i64 coordinates.
+# a 2D Cartesian point with i64 coordinates
 # ---
 # x: horizontal coordinate
 # y: vertical coordinate
@@ -87,7 +86,7 @@ pub rec Point { x: i64; y: i64; }
 ```
 
 ```mach
-# Number: holds either an integer or a float.
+# holds either an integer or a float
 # ---
 # i: integer interpretation
 # f: float interpretation
@@ -95,18 +94,17 @@ pub uni Number { i: i64; f: f64; }
 ```
 
 ```mach
-# Age: an i64 representing years since birth.
+# an i64 representing years since birth
 pub def Age: i64;
 ```
 
 ## Module
 
 A `.mach` file begins with a module docstring as the first content in the
-file — before any `use`, `fwd`, or decorator. The summary uses the
-module's full dotted path as `<name>`.
+file — before any `use`, `fwd`, or decorator.
 
 ```mach
-# myproj.system.os: cross-platform OS interface.
+# cross-platform OS interface
 #
 # forwards the portable intersection of all supported targets.
 # for platform-specific functionality, import the target module
@@ -120,10 +118,10 @@ beyond the summary and the component block.
 ## Value
 
 ```mach
-# MAX: maximum counter value before saturation.
+# maximum counter value before saturation
 pub val MAX: i64 = 100;
 
-# calls: module-local request counter.
+# module-local request counter
 var calls: i64 = 0;
 ```
 
