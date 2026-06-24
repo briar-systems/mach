@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.8] - 2026-06-24
+
+Incremental type-checking (#1164), completing the incremental front-end: parse,
+name resolution, and now sema all run as memoized queries, so an edit re-checks
+only the changed module plus dependents whose typed public surface moved.
+
+### Added
+
+- sema: `Q_SEMA` (owned-handle query keyed by StableModuleId) with a
+  `Q_TYPED_EXPORTS` fingerprint firewall — an impl-only edit firewalls type
+  dependents while a public-type change re-checks them. `Q_MODULE_NUMBER` gates
+  re-check on a graph reshape that renumbers a module's nominal TypeIds.
+
+### Fixed
+
+- type: field tables (keyed by TypeId) are rebuilt per build via a field-table
+  epoch, so a record's field-type change on a long-lived session no longer
+  leaves a stale layout (latent; fresh-session builds were unaffected).
+
 ## [2.5.7] - 2026-06-23
 
 Incremental name resolution (#1164). The front-end is now query-engine-driven
