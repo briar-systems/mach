@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.7] - 2026-06-23
+
+Incremental name resolution (#1164). The front-end is now query-engine-driven
+through resolve: an edit re-resolves only the changed module plus importers
+whose public surface actually moved, instead of the whole closure.
+
+### Added
+
+- query: parsing and name resolution run as memoized queries (`Q_PARSE`,
+  `Q_RESOLVE`) with owned pointer-graph handles; a `Q_EXPORTS` fingerprint of
+  each module's resolved public surface is the early-cutoff firewall, so a
+  private-body edit does not re-resolve importers while a public-signature or
+  public comptime-const-value change does. Build-stable `StableModuleId`s key
+  the cached results across rebuilds.
+
+### Fixed
+
+- parser: a function's `DeclId` is reserved before its body is parsed, so a body
+  edit no longer shifts the function's id (which silently staled importers
+  indexing it).
+- driver: each module's `Q_EXPORTS` is refreshed in topological order during the
+  resolve pass, so an importer is never validated against a stale dependency
+  fingerprint.
+
 ## [2.5.6] - 2026-06-23
 
 Incremental parse caching (first increment of #1164): unchanged modules are no
