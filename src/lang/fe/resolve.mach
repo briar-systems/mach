@@ -1,77 +1,60 @@
-# mach.lang.fe.resolve: per-module name resolution.
+# per-module name resolution
 #
 # walks one parsed Ast in two passes:
 #
-#   1. collect — registers a Symbol for every binding decl reachable
-#      from module scope, evaluating `$if` predicates via the comptime
-#      evaluator and binding comptime-evaluable module-level val
-#      initializers into the comptime module frame (idempotent against the
-#      driver's load-pass binding). `use` decls bind a single leaf name into
-#      the module scope (a module alias when the path ends at a module, a
-#      symbol binding when it ends at a pub symbol).
-#   2. bind — walks every decl, stmt, expr, and type, looking up name
-#      references against the scope chain and writing the resolved
-#      SymbolId into parallel arrays sized to the AST. `fwd` decls are
-#      resolved here and re-published into this module's pub surface.
+#   1. collect - registers a Symbol for every binding decl reachable from
+#      module scope, evaluating `$if` predicates via the comptime evaluator
+#      and binding comptime-evaluable module-level val initializers into the
+#      comptime module frame (idempotent against the driver's load-pass
+#      binding). `use` decls bind a single leaf name into the module scope (a
+#      module alias when the path ends at a module, a symbol binding when it
+#      ends at a pub symbol).
+#   2. bind - walks every decl, stmt, expr, and type, looking up name
+#      references against the scope chain and writing the resolved SymbolId
+#      into parallel arrays sized to the AST. `fwd` decls are resolved here and
+#      re-published into this module's pub surface.
 #
-# unresolved names become SYMBOL_NIL and emit an error diagnostic but
-# do not halt the pass; sema treats SYMBOL_NIL bindings as having an
-# error type that absorbs further operations.
+# unresolved names become SYMBOL_NIL and emit an error diagnostic but do not
+# halt the pass; sema treats SYMBOL_NIL bindings as having an error type that
+# absorbs further operations.
 
+use std.collections.map;
+use std.memory;
+use std.text.string.str_free;
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
-use std.types.option.Option;
-use std.types.option.some;
-use std.types.option.none;
-use std.types.option.is_none;
-use std.types.option.is_some;
-use std.types.option.unwrap;
-use std.types.size.usize;
+use std.types.bool.true;
 use std.types.char.char;
+use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.text.string.str_free;
-use std.types.result.Result;
-use std.types.result.ok;
-use std.types.result.err;
-use std.types.result.is_ok;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.unwrap_err;
 
-use std.allocator.Allocator;
-use std.allocator.allocate;
-use std.allocator.deallocate;
-use std.allocator.reallocate;
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
 
-use mem: std.memory;
+use mach.lang.diagnostic;
+use mach.lang.fe.ast;
+use mach.lang.fe.ast.decl;
+use mach.lang.fe.ast.expr;
+use mach.lang.fe.ast.id;
+use mach.lang.fe.ast.module;
+use mach.lang.fe.ast.stmt;
+use atype: mach.lang.fe.ast.type;
+use mach.lang.fe.comptime;
+use mach.lang.fe.token;
+use mach.lang.intern;
+use mach.lang.session;
+use src: mach.lang.source;
+use mach.lang.type;
 
-use src:    mach.lang.source;
-use diag:   mach.lang.diagnostic;
-use intern: mach.lang.intern;
-use sess:   mach.lang.session;
-use type:   mach.lang.type;
-
-use map: std.collections.map;
-
-use ast:      mach.lang.fe.ast;
-use id:       mach.lang.fe.ast.id;
-use module:   mach.lang.fe.ast.module;
-use decl:     mach.lang.fe.ast.decl;
-use stmt:     mach.lang.fe.ast.stmt;
-use expr:     mach.lang.fe.ast.expr;
-use atype:    mach.lang.fe.ast.type;
-use token:    mach.lang.fe.token;
-use comptime: mach.lang.fe.comptime;
-
-# SymbolId: identifier for a Symbol within one ResolveResult / ResolveContext.
+# identifier for a Symbol within one ResolveResult / ResolveContext
 pub def SymbolId: u32;
 
 # sentinel value marking an absent or unresolved symbol
 pub val SYMBOL_NIL: SymbolId = 0xFFFFFFFF;
 
-# SymKind: kind of a resolved Symbol.
+# kind of a resolved Symbol
 pub def SymKind: u8;
 
 # the SymKind variants a resolved symbol may take
@@ -88,20 +71,22 @@ pub val SYM_TEST:     SymKind = 9;
 pub val SYM_UNI:      SymKind = 10;
 pub val SYM_PRIM:     SymKind = 11;
 
-# SYM_FLAG_PUB: pub-flag bit, set when the symbol's source decl is `pub` (or re-exported by `fwd`).
+# pub-flag bit, set when the symbol's source decl is `pub`, or when it is
+# re-exported by `fwd`
 pub val SYM_FLAG_PUB: u8 = 1;
 
-# SYM_FLAG_COMPTIME: comptime-flag bit, set on a SYM_PARAM declared with a leading `$` (comptime value parameter).
+# comptime-flag bit, set on a SYM_PARAM declared with a leading `$`
+# (a comptime value parameter)
 pub val SYM_FLAG_COMPTIME: u8 = 2;
 
-# SYM_FLAG_MODULE: module-scope bit, set on every symbol declared at module
+# module-scope bit, set on every symbol declared at module
 # scope. distinguishes a module-level `val` (a comptime-foldable constant whose
 # name is unique in its module) from a block-local `val` that merely shares a
 # name with one, so the comptime-gate check folds on resolution identity rather
 # than on name text a shadowing local would spuriously satisfy.
 pub val SYM_FLAG_MODULE: u8 = 4;
 
-# Symbol: a resolved symbol.
+# a resolved symbol
 # ---
 # kind:   one of SYM_*
 # flags:  bitfield of SYM_FLAG_*
@@ -126,12 +111,13 @@ pub rec Symbol {
     name:   intern.StrId;
     decl:   id.DeclId;
     slot:   u32;
-    origin: sess.ModuleId;
-    origin_stable: sess.StableModuleId;
-    slot_stable:   sess.StableModuleId;
+    origin: session.ModuleId;
+    origin_stable: session.StableModuleId;
+    slot_stable:   session.StableModuleId;
 }
 
-# PublicSymbol: a snapshot of one pub symbol, copied by the driver into a dependent module's ResolveDeps so resolve can bind cross-module references.
+# a snapshot of one pub symbol, copied by the driver into a dependent
+# module's ResolveDeps so resolve can bind cross-module references
 # ---
 # kind:   one of SYM_*
 # name:   interned identifier
@@ -145,10 +131,11 @@ pub rec PublicSymbol {
     name:   intern.StrId;
     decl:   id.DeclId;
     slot:   u32;
-    origin: sess.ModuleId;
+    origin: session.ModuleId;
 }
 
-# ModuleExports: the public surface of one module, indexed by interned path text, produced by the driver from a previously resolved module's ResolveResult.
+# the public surface of one module, indexed by interned path text, produced
+# by the driver from a previously resolved module's ResolveResult
 # ---
 # path:    interned FQN of the module (e.g. "std.types.bool")
 # module:  ModuleId of the module
@@ -156,12 +143,13 @@ pub rec PublicSymbol {
 # count:   number of entries in symbols
 pub rec ModuleExports {
     path:    intern.StrId;
-    module:  sess.ModuleId;
+    module:  session.ModuleId;
     symbols: *PublicSymbol;
     count:   u32;
 }
 
-# ResolveDeps: every dependency's exports, supplied by the driver; resolve looks these up by interned path when handling `use` decls.
+# every dependency's exports, supplied by the driver; resolve looks these up
+# by interned path when handling `use` decls
 # ---
 # entries: array of ModuleExports records, one per loaded dep
 # count:   number of entries
@@ -192,11 +180,11 @@ val INITIAL_SYMBOLS_CAP:     u32 = 32;
 
 # resolve's working state for one module
 rec ResolveContext {
-    s:          *sess.Session;
+    s:          *session.Session;
     a:          *ast.Ast;
     deps:       *ResolveDeps;
     ctx:        *comptime.ComptimeCtx;
-    own_module: sess.ModuleId;
+    own_module: session.ModuleId;
     source:     str;
 
     symbols:    *Symbol;
@@ -239,7 +227,7 @@ rec ResolveContext {
 # number of primitive type names (u8..f64, ptr).
 val PRIM_COUNT: u32 = 11;
 
-# ResolveResult: the contract resolve produces for sema and the driver's export step.
+# the contract resolve produces for sema and the driver's export step
 # ---
 # alloc:         allocator backing all owned arrays
 # symbols:       universe of symbols; pub symbols sorted to indices [0, pub_count)
@@ -258,12 +246,12 @@ val PRIM_COUNT: u32 = 11;
 #                constant VALUES (name + evaluated CTValue), in pub-symbol order. an
 #                importer's resolution forks on these via `$if` over imported
 #                consts, but the values live in the comptime ctx, not in the symbol
-#                identities — so Q_EXPORTS folds this blob into the firewall
+#                identities - so Q_EXPORTS folds this blob into the firewall
 #                fingerprint to re-resolve importers when a dep's const value (even
 #                a transitively-derived one) changes (#1582). nil/0 when none
 # pub_const_fp_len: length of pub_const_fp in bytes
 pub rec ResolveResult {
-    alloc:         *Allocator;
+    alloc:         *A.Allocator;
     symbols:       *Symbol;
     symbol_count:  u32;
     pub_count:     u32;
@@ -280,7 +268,7 @@ pub rec ResolveResult {
     pub_const_fp_len: u32;
 }
 
-# param_symbol: the SymbolId of function `decl`'s parameter at ordinal `slot`,
+# the SymbolId of function `decl`'s parameter at ordinal `slot`,
 # or SYMBOL_NIL when no such parameter exists. resolves through `param_index`
 # in O(1).
 # ---
@@ -290,66 +278,70 @@ pub rec ResolveResult {
 # ret:  the parameter's SymbolId, or SYMBOL_NIL
 pub fun param_symbol(r: *ResolveResult, decl: id.DeclId, slot: u32) SymbolId {
     var key: u64 = (decl::u64 << 32) | slot::u64;
-    val g: Result[*SymbolId, str] = map.get[u64, SymbolId](?r.param_index, ?key);
-    if (is_ok[*SymbolId, str](g)) { ret @unwrap_ok[*SymbolId, str](g); }
+    val g: R.Result[*SymbolId, str] = map.get[u64, SymbolId](?r.param_index, ?key);
+    if (R.is_ok[*SymbolId, str](g)) { ret @R.unwrap_ok[*SymbolId, str](g); }
     ret SYMBOL_NIL;
 }
 
-# stable_of_module: the build-stable identity of ModuleId `mid` on session `s`, or
+# the build-stable identity of ModuleId `mid` on session `s`, or
 # STABLE_MODULE_NIL when `mid` is MODULE_NIL or names no registered module. resolve
 # runs after register_module_asts, so every loaded module's FQN and stable id are
 # already present; a lookup miss therefore means a synthetic/absent origin.
-fun stable_of_module(s: *sess.Session, mid: sess.ModuleId) sess.StableModuleId {
-    if (mid == sess.MODULE_NIL) { ret sess.STABLE_MODULE_NIL; }
-    val fqn: intern.StrId = sess.module_fqn(s, mid);
-    if (fqn == intern.STR_NIL) { ret sess.STABLE_MODULE_NIL; }
-    ret sess.stable_module_id_lookup(s, fqn);
+# ---
+# s:   the session resolve is running against
+# mid: the per-build module id to translate
+# ret: mid's build-stable id, or STABLE_MODULE_NIL when absent
+fun stable_of_module(s: *session.Session, mid: session.ModuleId) session.StableModuleId {
+    if (mid == session.MODULE_NIL) { ret session.STABLE_MODULE_NIL; }
+    val fqn: intern.StrId = session.module_fqn(s, mid);
+    if (fqn == intern.STR_NIL) { ret session.STABLE_MODULE_NIL; }
+    ret session.stable_module_id_lookup(s, fqn);
 }
 
-# remap_result: rewrite every ModuleId-valued field of `r` from the build-stable
+# rewrite every ModuleId-valued field of `r` from the build-stable
 # snapshot captured at resolve time into session `s`'s CURRENT per-build ModuleId
 # numbering. the cross-build-reuse correctness step (#1582): a ResolveResult reused
 # from an earlier build still carries that build's `origin` / SYM_USE `slot`
 # ModuleIds, which a graph reshape may have renumbered. driven once per build by the
-# driver after fetching the (possibly reused) result; idempotent — a freshly
+# driver after fetching the (possibly reused) result; idempotent - a freshly
 # computed result already holds the current build's mids, and re-deriving them from
 # the immutable stable snapshot reproduces the same values. every ModuleId-valued
 # field is covered: Symbol.origin (all symbols) and Symbol.slot (SYM_USE only).
 # ---
 # r: the result to remap in place
 # s: the session whose per-build StableModuleId -> ModuleId map drives the rewrite
-pub fun remap_result(r: *ResolveResult, s: *sess.Session) {
+pub fun remap_result(r: *ResolveResult, s: *session.Session) {
     if (r == nil || r.symbols == nil) { ret; }
     var i: u32 = 0;
     for (i < r.symbol_count) {
         val sym: *Symbol = ?r.symbols[i];
-        sym.origin = sess.module_id_for_stable(s, sym.origin_stable);
+        sym.origin = session.module_id_for_stable(s, sym.origin_stable);
         if (sym.kind == SYM_USE) {
-            sym.slot = sess.module_id_for_stable(s, sym.slot_stable)::u32;
+            sym.slot = session.module_id_for_stable(s, sym.slot_stable)::u32;
         }
         i = i + 1;
     }
 }
 
-# dnit_result: releases every array owned by the result and zeroes its fields.
+# releases every array owned by the result and zeroes its fields.
 # ---
 # r: result to tear down
 pub fun dnit_result(r: *ResolveResult) {
     if (r == nil) { ret; }
     if (r.symbols != nil && r.symbol_count > 0) {
-        deallocate[Symbol](r.alloc, r.symbols, r.symbol_count::usize);
+        A.deallocate[Symbol](r.alloc, r.symbols, r.symbol_count::usize);
     }
     if (r.expr_resolved != nil) {
-        deallocate[SymbolId](r.alloc, r.expr_resolved, r.expr_count::usize);
+        A.deallocate[SymbolId](r.alloc, r.expr_resolved, r.expr_count::usize);
     }
     if (r.type_resolved != nil) {
-        deallocate[SymbolId](r.alloc, r.type_resolved, r.type_count::usize);
+        A.deallocate[SymbolId](r.alloc, r.type_resolved, r.type_count::usize);
     }
     if (r.decl_symbol != nil) {
-        deallocate[SymbolId](r.alloc, r.decl_symbol, r.decl_count::usize);
+        A.deallocate[SymbolId](r.alloc, r.decl_symbol, r.decl_count::usize);
     }
     if (r.pub_const_fp != nil && r.pub_const_fp_len > 0) {
-        deallocate[u8](r.alloc, r.pub_const_fp, r.pub_const_fp_len::usize);
+        A.deallocate[u8](r.alloc, r.pub_const_fp, r.pub_const_fp_len::usize);
     }
     map.dnit[u64, SymbolId](?r.param_index);
     r.symbols       = nil;
@@ -365,7 +357,7 @@ pub fun dnit_result(r: *ResolveResult) {
     r.pub_const_fp_len = 0;
 }
 
-# resolve: resolves one module against its already-resolved dependencies.
+# resolves one module against its already-resolved dependencies.
 # ---
 # s:          shared session (allocator, sources, diagnostics, interner)
 # a:          parsed Ast for the module being resolved
@@ -376,73 +368,82 @@ pub fun dnit_result(r: *ResolveResult) {
 # own_module: project-wide ModuleId of the module being resolved
 # ret:        the populated ResolveResult, or an allocation error
 pub fun resolve(
-    s:          *sess.Session,
+    s:          *session.Session,
     a:          *ast.Ast,
     deps:       *ResolveDeps,
     ctx:        *comptime.ComptimeCtx,
-    own_module: sess.ModuleId
-) Result[ResolveResult, str] {
+    own_module: session.ModuleId
+) R.Result[ResolveResult, str] {
     var rc: ResolveContext;
-    val init_r: Result[bool, str] = init_context(?rc, s, a, deps, ctx, own_module);
-    if (is_err[bool, str](init_r)) {
-        ret err[ResolveResult, str](unwrap_err[bool, str](init_r));
+    val init_r: R.Result[bool, str] = init_context(?rc, s, a, deps, ctx, own_module);
+    if (R.is_err[bool, str](init_r)) {
+        ret R.err[ResolveResult, str](R.unwrap_err[bool, str](init_r));
     }
 
-    val ms_r: Result[ScopeId, str] = open_scope(?rc, SCOPE_NIL);
-    if (is_err[ScopeId, str](ms_r)) {
+    val ms_r: R.Result[ScopeId, str] = open_scope(?rc, SCOPE_NIL);
+    if (R.is_err[ScopeId, str](ms_r)) {
         dnit_context(?rc);
-        ret err[ResolveResult, str](unwrap_err[ScopeId, str](ms_r));
+        ret R.err[ResolveResult, str](R.unwrap_err[ScopeId, str](ms_r));
     }
-    rc.module_scope  = unwrap_ok[ScopeId, str](ms_r);
+    rc.module_scope  = R.unwrap_ok[ScopeId, str](ms_r);
     rc.current_scope = rc.module_scope;
 
-    val sp_r: Result[bool, str] = seed_primitives(?rc);
-    if (is_err[bool, str](sp_r)) {
+    val sp_r: R.Result[bool, str] = seed_primitives(?rc);
+    if (R.is_err[bool, str](sp_r)) {
         dnit_context(?rc);
-        ret err[ResolveResult, str](unwrap_err[bool, str](sp_r));
+        ret R.err[ResolveResult, str](R.unwrap_err[bool, str](sp_r));
     }
 
-    val m_opt: Option[*module.Module] = ast.get_module(a, a.root_module);
-    if (is_none[*module.Module](m_opt)) {
+    val m_opt: O.Option[*module.Module] = ast.get_module(a, a.root_module);
+    if (O.is_none[*module.Module](m_opt)) {
         dnit_context(?rc);
-        ret err[ResolveResult, str]("root_module is not set on this Ast");
+        ret R.err[ResolveResult, str]("root_module is not set on this Ast");
     }
-    val mnode: *module.Module = unwrap[*module.Module](m_opt);
+    val mnode: *module.Module = O.unwrap[*module.Module](m_opt);
 
-    val c1: Result[bool, str] = collect_decl_list(?rc, mnode.decls_start, mnode.decls_len, rc.module_scope, true);
-    if (is_err[bool, str](c1)) {
+    val c1: R.Result[bool, str] = collect_decl_list(?rc, mnode.decls_start, mnode.decls_len, rc.module_scope, true);
+    if (R.is_err[bool, str](c1)) {
         dnit_context(?rc);
-        ret err[ResolveResult, str](unwrap_err[bool, str](c1));
+        ret R.err[ResolveResult, str](R.unwrap_err[bool, str](c1));
     }
 
-    val b1: Result[bool, str] = bind_decl_list(?rc, mnode.decls_start, mnode.decls_len);
-    if (is_err[bool, str](b1)) {
+    val b1: R.Result[bool, str] = bind_decl_list(?rc, mnode.decls_start, mnode.decls_len);
+    if (R.is_err[bool, str](b1)) {
         dnit_context(?rc);
-        ret err[ResolveResult, str](unwrap_err[bool, str](b1));
+        ret R.err[ResolveResult, str](R.unwrap_err[bool, str](b1));
     }
 
     ret build_result(?rc);
 }
 
+# populate `rc` for resolving one module, allocating its side tables
+# ---
+# rc:         the context to populate
+# s:          the shared session
+# a:          the parsed Ast to resolve
+# deps:       the dependency exports supplied by the driver
+# ctx:        the comptime evaluator context
+# own_module: project-wide module id of this module
+# ret:        ok(true) once populated, or an allocation error (rc is torn down)
 fun init_context(
     rc:         *ResolveContext,
-    s:          *sess.Session,
+    s:          *session.Session,
     a:          *ast.Ast,
     deps:       *ResolveDeps,
     ctx:        *comptime.ComptimeCtx,
-    own_module: sess.ModuleId
-) Result[bool, str] {
+    own_module: session.ModuleId
+) R.Result[bool, str] {
     rc.s          = s;
     rc.a          = a;
     rc.deps       = deps;
     rc.ctx        = ctx;
     rc.own_module = own_module;
 
-    val src_opt: Option[*src.SourceFile] = src.get(?s.sources, a.file_id);
-    if (is_none[*src.SourceFile](src_opt)) {
-        ret err[bool, str]("Ast.file_id not registered with the session");
+    val src_opt: O.Option[*src.SourceFile] = src.get(?s.sources, a.file_id);
+    if (O.is_none[*src.SourceFile](src_opt)) {
+        ret R.err[bool, str]("Ast.file_id not registered with the session");
     }
-    rc.source = unwrap[*src.SourceFile](src_opt).text;
+    rc.source = O.unwrap[*src.SourceFile](src_opt).text;
 
     rc.symbols  = nil;
     rc.sym_len  = 0;
@@ -472,44 +473,48 @@ fun init_context(
     # dnit_context tears down whatever has been allocated so far (the array
     # handles are nil and the cache is initialised), leaving no partial state
     # leaked on the OOM path.
-    val sa: Result[*Symbol, str] = allocate[Symbol](s.alloc, INITIAL_SYMBOLS_CAP::usize);
-    if (is_err[*Symbol, str](sa)) {
+    val sa: R.Result[*Symbol, str] = A.allocate[Symbol](s.alloc, INITIAL_SYMBOLS_CAP::usize);
+    if (R.is_err[*Symbol, str](sa)) {
         dnit_context(rc);
-        ret err[bool, str](unwrap_err[*Symbol, str](sa));
+        ret R.err[bool, str](R.unwrap_err[*Symbol, str](sa));
     }
-    rc.symbols = unwrap_ok[*Symbol, str](sa);
+    rc.symbols = R.unwrap_ok[*Symbol, str](sa);
     rc.sym_cap = INITIAL_SYMBOLS_CAP;
 
-    val sca: Result[*Scope, str] = allocate[Scope](s.alloc, INITIAL_SCOPES_CAP::usize);
-    if (is_err[*Scope, str](sca)) {
+    val sca: R.Result[*Scope, str] = A.allocate[Scope](s.alloc, INITIAL_SCOPES_CAP::usize);
+    if (R.is_err[*Scope, str](sca)) {
         dnit_context(rc);
-        ret err[bool, str](unwrap_err[*Scope, str](sca));
+        ret R.err[bool, str](R.unwrap_err[*Scope, str](sca));
     }
-    rc.scopes    = unwrap_ok[*Scope, str](sca);
+    rc.scopes    = R.unwrap_ok[*Scope, str](sca);
     rc.scope_cap = INITIAL_SCOPES_CAP;
 
     if (a.expr_len > 0) {
-        val r: Result[*SymbolId, str] = allocate[SymbolId](s.alloc, a.expr_len);
-        if (is_err[*SymbolId, str](r)) { dnit_context(rc); ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
-        rc.expr_resolved = unwrap_ok[*SymbolId, str](r);
+        val r: R.Result[*SymbolId, str] = A.allocate[SymbolId](s.alloc, a.expr_len);
+        if (R.is_err[*SymbolId, str](r)) { dnit_context(rc); ret R.err[bool, str](R.unwrap_err[*SymbolId, str](r)); }
+        rc.expr_resolved = R.unwrap_ok[*SymbolId, str](r);
         fill_nil(rc.expr_resolved, a.expr_len::u32);
     }
     if (a.type_len > 0) {
-        val r: Result[*SymbolId, str] = allocate[SymbolId](s.alloc, a.type_len);
-        if (is_err[*SymbolId, str](r)) { dnit_context(rc); ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
-        rc.type_resolved = unwrap_ok[*SymbolId, str](r);
+        val r: R.Result[*SymbolId, str] = A.allocate[SymbolId](s.alloc, a.type_len);
+        if (R.is_err[*SymbolId, str](r)) { dnit_context(rc); ret R.err[bool, str](R.unwrap_err[*SymbolId, str](r)); }
+        rc.type_resolved = R.unwrap_ok[*SymbolId, str](r);
         fill_nil(rc.type_resolved, a.type_len::u32);
     }
     if (a.decl_len > 0) {
-        val r: Result[*SymbolId, str] = allocate[SymbolId](s.alloc, a.decl_len);
-        if (is_err[*SymbolId, str](r)) { dnit_context(rc); ret err[bool, str](unwrap_err[*SymbolId, str](r)); }
-        rc.decl_symbol = unwrap_ok[*SymbolId, str](r);
+        val r: R.Result[*SymbolId, str] = A.allocate[SymbolId](s.alloc, a.decl_len);
+        if (R.is_err[*SymbolId, str](r)) { dnit_context(rc); ret R.err[bool, str](R.unwrap_err[*SymbolId, str](r)); }
+        rc.decl_symbol = R.unwrap_ok[*SymbolId, str](r);
         fill_nil(rc.decl_symbol, a.decl_len::u32);
     }
 
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
+# fill `arr` with SYMBOL_NIL
+# ---
+# arr: the SymbolId array to clear
+# len: number of slots to fill
 fun fill_nil(arr: *SymbolId, len: u32) {
     var i: u32 = 0;
     for (i < len) {
@@ -518,42 +523,50 @@ fun fill_nil(arr: *SymbolId, len: u32) {
     }
 }
 
+# release every array and map owned by `rc`
+# ---
+# rc: the context to tear down
 fun dnit_context(rc: *ResolveContext) {
     var i: u32 = 0;
     for (i < rc.scope_len) {
         val sc: *Scope = ?rc.scopes[i];
         if (sc.entries != nil && sc.cap > 0) {
-            deallocate[ScopeEntry](rc.s.alloc, sc.entries, sc.cap::usize);
+            A.deallocate[ScopeEntry](rc.s.alloc, sc.entries, sc.cap::usize);
         }
         i = i + 1;
     }
     if (rc.scopes != nil && rc.scope_cap > 0) {
-        deallocate[Scope](rc.s.alloc, rc.scopes, rc.scope_cap::usize);
+        A.deallocate[Scope](rc.s.alloc, rc.scopes, rc.scope_cap::usize);
     }
     if (rc.symbols != nil && rc.sym_cap > 0) {
-        deallocate[Symbol](rc.s.alloc, rc.symbols, rc.sym_cap::usize);
+        A.deallocate[Symbol](rc.s.alloc, rc.symbols, rc.sym_cap::usize);
     }
     if (rc.expr_resolved != nil) {
-        deallocate[SymbolId](rc.s.alloc, rc.expr_resolved, rc.a.expr_len);
+        A.deallocate[SymbolId](rc.s.alloc, rc.expr_resolved, rc.a.expr_len);
     }
     if (rc.type_resolved != nil) {
-        deallocate[SymbolId](rc.s.alloc, rc.type_resolved, rc.a.type_len);
+        A.deallocate[SymbolId](rc.s.alloc, rc.type_resolved, rc.a.type_len);
     }
     if (rc.decl_symbol != nil) {
-        deallocate[SymbolId](rc.s.alloc, rc.decl_symbol, rc.a.decl_len);
+        A.deallocate[SymbolId](rc.s.alloc, rc.decl_symbol, rc.a.decl_len);
     }
     map.dnit[u64, SymbolId](?rc.imported_cache);
     map.dnit[intern.StrId, SymbolId](?rc.module_index);
 }
 
-fun open_scope(rc: *ResolveContext, parent: ScopeId) Result[ScopeId, str] {
+# push a fresh empty scope as a child of `parent` and return its id
+# ---
+# rc:     resolver state for the module being resolved
+# parent: the parent scope, or SCOPE_NIL for a root
+# ret:    the new scope's id, or an allocation error
+fun open_scope(rc: *ResolveContext, parent: ScopeId) R.Result[ScopeId, str] {
     if (rc.scope_len == rc.scope_cap) {
         val new_cap: u32 = rc.scope_cap * 2;
-        val r: Result[*Scope, str] = reallocate[Scope](rc.s.alloc, rc.scopes, rc.scope_cap::usize, new_cap::usize);
-        if (is_err[*Scope, str](r)) {
-            ret err[ScopeId, str](unwrap_err[*Scope, str](r));
+        val r: R.Result[*Scope, str] = A.reallocate[Scope](rc.s.alloc, rc.scopes, rc.scope_cap::usize, new_cap::usize);
+        if (R.is_err[*Scope, str](r)) {
+            ret R.err[ScopeId, str](R.unwrap_err[*Scope, str](r));
         }
-        rc.scopes    = unwrap_ok[*Scope, str](r);
+        rc.scopes    = R.unwrap_ok[*Scope, str](r);
         rc.scope_cap = new_cap;
     }
     var sc: Scope;
@@ -564,22 +577,29 @@ fun open_scope(rc: *ResolveContext, parent: ScopeId) Result[ScopeId, str] {
     val sid: ScopeId = rc.scope_len;
     rc.scopes[rc.scope_len] = sc;
     rc.scope_len = rc.scope_len + 1;
-    ret ok[ScopeId, str](sid);
+    ret R.ok[ScopeId, str](sid);
 }
 
-fun scope_add(rc: *ResolveContext, scope: ScopeId, name: intern.StrId, sym: SymbolId) Result[bool, str] {
+# bind `name` to `sym` in `scope`, mirroring module-scope adds into the name index
+# ---
+# rc:    resolver state for the module being resolved
+# scope: the scope to add to
+# name:  interned name to bind
+# sym:   the symbol to bind it to
+# ret:   ok(true), or an allocation error
+fun scope_add(rc: *ResolveContext, scope: ScopeId, name: intern.StrId, sym: SymbolId) R.Result[bool, str] {
     val sc: *Scope = ?rc.scopes[scope];
     if (sc.entries == nil) {
-        val r: Result[*ScopeEntry, str] = allocate[ScopeEntry](rc.s.alloc, INITIAL_SCOPE_ENTRY_CAP::usize);
-        if (is_err[*ScopeEntry, str](r)) { ret err[bool, str](unwrap_err[*ScopeEntry, str](r)); }
-        sc.entries = unwrap_ok[*ScopeEntry, str](r);
+        val r: R.Result[*ScopeEntry, str] = A.allocate[ScopeEntry](rc.s.alloc, INITIAL_SCOPE_ENTRY_CAP::usize);
+        if (R.is_err[*ScopeEntry, str](r)) { ret R.err[bool, str](R.unwrap_err[*ScopeEntry, str](r)); }
+        sc.entries = R.unwrap_ok[*ScopeEntry, str](r);
         sc.cap     = INITIAL_SCOPE_ENTRY_CAP;
     }
     or (sc.len == sc.cap) {
         val new_cap: u32 = sc.cap * 2;
-        val r: Result[*ScopeEntry, str] = reallocate[ScopeEntry](rc.s.alloc, sc.entries, sc.cap::usize, new_cap::usize);
-        if (is_err[*ScopeEntry, str](r)) { ret err[bool, str](unwrap_err[*ScopeEntry, str](r)); }
-        sc.entries = unwrap_ok[*ScopeEntry, str](r);
+        val r: R.Result[*ScopeEntry, str] = A.reallocate[ScopeEntry](rc.s.alloc, sc.entries, sc.cap::usize, new_cap::usize);
+        if (R.is_err[*ScopeEntry, str](r)) { ret R.err[bool, str](R.unwrap_err[*ScopeEntry, str](r)); }
+        sc.entries = R.unwrap_ok[*ScopeEntry, str](r);
         sc.cap     = new_cap;
     }
     var e: ScopeEntry;
@@ -591,17 +611,23 @@ fun scope_add(rc: *ResolveContext, scope: ScopeId, name: intern.StrId, sym: Symb
     # mirror module-scope adds into the name index so scope_lookup_local can answer
     # in O(1); other scopes stay linear-only.
     if (scope == rc.module_scope) {
-        val ins: Result[bool, str] = map.insert[intern.StrId, SymbolId](?rc.module_index, name, sym);
-        if (is_err[bool, str](ins)) { ret err[bool, str](unwrap_err[bool, str](ins)); }
+        val ins: R.Result[bool, str] = map.insert[intern.StrId, SymbolId](?rc.module_index, name, sym);
+        if (R.is_err[bool, str](ins)) { ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
+# look `name` up in `scope` alone, not its parents
+# ---
+# rc:    resolver state for the module being resolved
+# scope: the scope to search
+# name:  interned name to find
+# ret:   the bound SymbolId, or SYMBOL_NIL when unbound
 fun scope_lookup_local(rc: *ResolveContext, scope: ScopeId, name: intern.StrId) SymbolId {
     if (scope == SCOPE_NIL) { ret SYMBOL_NIL; }
     if (scope == rc.module_scope) {
-        val g: Result[*SymbolId, str] = map.get[intern.StrId, SymbolId](?rc.module_index, ?name);
-        if (is_ok[*SymbolId, str](g)) { ret @unwrap_ok[*SymbolId, str](g); }
+        val g: R.Result[*SymbolId, str] = map.get[intern.StrId, SymbolId](?rc.module_index, ?name);
+        if (R.is_ok[*SymbolId, str](g)) { ret @R.unwrap_ok[*SymbolId, str](g); }
         ret SYMBOL_NIL;
     }
     val sc: *Scope = ?rc.scopes[scope];
@@ -613,6 +639,12 @@ fun scope_lookup_local(rc: *ResolveContext, scope: ScopeId, name: intern.StrId) 
     ret SYMBOL_NIL;
 }
 
+# look `name` up through `scope` and every ancestor
+# ---
+# rc:    resolver state for the module being resolved
+# scope: the innermost scope to search from
+# name:  interned name to find
+# ret:   the nearest bound SymbolId, or SYMBOL_NIL
 fun scope_lookup_chain(rc: *ResolveContext, scope: ScopeId, name: intern.StrId) SymbolId {
     var cur: ScopeId = scope;
     for (cur != SCOPE_NIL) {
@@ -623,14 +655,24 @@ fun scope_lookup_chain(rc: *ResolveContext, scope: ScopeId, name: intern.StrId) 
     ret SYMBOL_NIL;
 }
 
-fun add_symbol(rc: *ResolveContext, kind: SymKind, flags: u8, name: intern.StrId, decl_id: id.DeclId, slot: u32, origin: sess.ModuleId) Result[SymbolId, str] {
+# append a Symbol to the universe and return its id
+# ---
+# rc:      resolver state for the module being resolved
+# kind:    the symbol's SymKind
+# flags:   its SYM_FLAG_* bitfield
+# name:    interned identifier
+# decl_id: originating DeclId
+# slot:    kind-dependent payload
+# origin:  owning module id
+# ret:     the new SymbolId, or an allocation error
+fun add_symbol(rc: *ResolveContext, kind: SymKind, flags: u8, name: intern.StrId, decl_id: id.DeclId, slot: u32, origin: session.ModuleId) R.Result[SymbolId, str] {
     if (rc.sym_len == rc.sym_cap) {
         val new_cap: u32 = rc.sym_cap * 2;
-        val r: Result[*Symbol, str] = reallocate[Symbol](rc.s.alloc, rc.symbols, rc.sym_cap::usize, new_cap::usize);
-        if (is_err[*Symbol, str](r)) {
-            ret err[SymbolId, str](unwrap_err[*Symbol, str](r));
+        val r: R.Result[*Symbol, str] = A.reallocate[Symbol](rc.s.alloc, rc.symbols, rc.sym_cap::usize, new_cap::usize);
+        if (R.is_err[*Symbol, str](r)) {
+            ret R.err[SymbolId, str](R.unwrap_err[*Symbol, str](r));
         }
-        rc.symbols = unwrap_ok[*Symbol, str](r);
+        rc.symbols = R.unwrap_ok[*Symbol, str](r);
         rc.sym_cap = new_cap;
     }
     var sym: Symbol;
@@ -641,14 +683,25 @@ fun add_symbol(rc: *ResolveContext, kind: SymKind, flags: u8, name: intern.StrId
     sym.slot   = slot;
     sym.origin = origin;
     # the stable snapshots are filled in build_result once every symbol exists.
-    sym.origin_stable = sess.STABLE_MODULE_NIL;
-    sym.slot_stable   = sess.STABLE_MODULE_NIL;
+    sym.origin_stable = session.STABLE_MODULE_NIL;
+    sym.slot_stable   = session.STABLE_MODULE_NIL;
     val sid: SymbolId = rc.sym_len;
     rc.symbols[rc.sym_len] = sym;
     rc.sym_len = rc.sym_len + 1;
-    ret ok[SymbolId, str](sid);
+    ret R.ok[SymbolId, str](sid);
 }
 
+# intern `name`, reject a duplicate in `scope`, then add and bind a Symbol
+# ---
+# rc:      resolver state for the module being resolved
+# kind:    the symbol's SymKind
+# flags:   its SYM_FLAG_* bitfield
+# name:    source span of the identifier
+# decl_id: originating DeclId
+# slot:    kind-dependent payload
+# origin:  owning module id
+# scope:   scope to bind into
+# ret:     the bound SymbolId, SYMBOL_NIL for an empty or duplicate name, or an error
 fun declare(
     rc:      *ResolveContext,
     kind:    SymKind,
@@ -656,37 +709,37 @@ fun declare(
     name:    token.Span,
     decl_id: id.DeclId,
     slot:    u32,
-    origin:  sess.ModuleId,
+    origin:  session.ModuleId,
     scope:   ScopeId
-) Result[SymbolId, str] {
+) R.Result[SymbolId, str] {
     if (name.len == 0) {
-        ret ok[SymbolId, str](SYMBOL_NIL);
+        ret R.ok[SymbolId, str](SYMBOL_NIL);
     }
-    val r_id: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, name);
-    if (is_err[intern.StrId, str](r_id)) {
-        ret err[SymbolId, str](unwrap_err[intern.StrId, str](r_id));
+    val r_id: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, name);
+    if (R.is_err[intern.StrId, str](r_id)) {
+        ret R.err[SymbolId, str](R.unwrap_err[intern.StrId, str](r_id));
     }
-    val name_id: intern.StrId = unwrap_ok[intern.StrId, str](r_id);
+    val name_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_id);
 
     val existing: SymbolId = scope_lookup_local(rc, scope, name_id);
     if (existing != SYMBOL_NIL) {
-        val de: Result[bool, str] = report_named(rc, name, "duplicate definition: `", name_id, "` is already bound in this scope");
-        if (is_ok[bool, str](de)) {
-            diag.attach_note(?rc.s.diags, "a name with this spelling is already bound here");
+        val de: R.Result[bool, str] = report_named(rc, name, "duplicate definition: `", name_id, "` is already bound in this scope");
+        if (R.is_ok[bool, str](de)) {
+            diagnostic.attach_note(?rc.s.diags, "a name with this spelling is already bound here");
         }
-        ret ok[SymbolId, str](SYMBOL_NIL);
+        ret R.ok[SymbolId, str](SYMBOL_NIL);
     }
 
-    val r_sym: Result[SymbolId, str] = add_symbol(rc, kind, flags, name_id, decl_id, slot, origin);
-    if (is_err[SymbolId, str](r_sym)) { ret r_sym; }
-    val sid: SymbolId = unwrap_ok[SymbolId, str](r_sym);
+    val r_sym: R.Result[SymbolId, str] = add_symbol(rc, kind, flags, name_id, decl_id, slot, origin);
+    if (R.is_err[SymbolId, str](r_sym)) { ret r_sym; }
+    val sid: SymbolId = R.unwrap_ok[SymbolId, str](r_sym);
 
-    val r_add: Result[bool, str] = scope_add(rc, scope, name_id, sid);
-    if (is_err[bool, str](r_add)) {
-        ret err[SymbolId, str](unwrap_err[bool, str](r_add));
+    val r_add: R.Result[bool, str] = scope_add(rc, scope, name_id, sid);
+    if (R.is_err[bool, str](r_add)) {
+        ret R.err[SymbolId, str](R.unwrap_err[bool, str](r_add));
     }
 
-    ret ok[SymbolId, str](sid);
+    ret R.ok[SymbolId, str](sid);
 }
 
 # seeds the primitive type names (u8..f64, ptr) into the resolver's primitive
@@ -695,40 +748,53 @@ fun declare(
 # `prim_symbol_for`), never bound into a value scope, so a declaration may
 # reuse a primitive spelling (e.g. `fun u64()`) without colliding. mirrors
 # cmach's string-based primitive resolution in sema_resolve_type.
-fun seed_primitives(rc: *ResolveContext) Result[bool, str] {
-    val r0:  Result[bool, str] = seed_one_primitive(rc, 0,  "u8",  type.TYPE_U8::u32);  if (is_err[bool, str](r0))  { ret r0; }
-    val r1:  Result[bool, str] = seed_one_primitive(rc, 1,  "u16", type.TYPE_U16::u32); if (is_err[bool, str](r1))  { ret r1; }
-    val r2:  Result[bool, str] = seed_one_primitive(rc, 2,  "u32", type.TYPE_U32::u32); if (is_err[bool, str](r2))  { ret r2; }
-    val r3:  Result[bool, str] = seed_one_primitive(rc, 3,  "u64", type.TYPE_U64::u32); if (is_err[bool, str](r3))  { ret r3; }
-    val r4:  Result[bool, str] = seed_one_primitive(rc, 4,  "i8",  type.TYPE_I8::u32);  if (is_err[bool, str](r4))  { ret r4; }
-    val r5:  Result[bool, str] = seed_one_primitive(rc, 5,  "i16", type.TYPE_I16::u32); if (is_err[bool, str](r5))  { ret r5; }
-    val r6:  Result[bool, str] = seed_one_primitive(rc, 6,  "i32", type.TYPE_I32::u32); if (is_err[bool, str](r6))  { ret r6; }
-    val r7:  Result[bool, str] = seed_one_primitive(rc, 7,  "i64", type.TYPE_I64::u32); if (is_err[bool, str](r7))  { ret r7; }
-    val r8:  Result[bool, str] = seed_one_primitive(rc, 8,  "f32", type.TYPE_F32::u32); if (is_err[bool, str](r8))  { ret r8; }
-    val r9:  Result[bool, str] = seed_one_primitive(rc, 9,  "f64", type.TYPE_F64::u32); if (is_err[bool, str](r9))  { ret r9; }
-    val r10: Result[bool, str] = seed_one_primitive(rc, 10, "ptr", type.TYPE_PTR::u32); if (is_err[bool, str](r10)) { ret r10; }
-    ret ok[bool, str](true);
+# ---
+# rc:  resolver state for the module being resolved
+# ret: ok(true), or an allocation error
+fun seed_primitives(rc: *ResolveContext) R.Result[bool, str] {
+    val r0:  R.Result[bool, str] = seed_one_primitive(rc, 0,  "u8",  type.TYPE_U8::u32);  if (R.is_err[bool, str](r0))  { ret r0; }
+    val r1:  R.Result[bool, str] = seed_one_primitive(rc, 1,  "u16", type.TYPE_U16::u32); if (R.is_err[bool, str](r1))  { ret r1; }
+    val r2:  R.Result[bool, str] = seed_one_primitive(rc, 2,  "u32", type.TYPE_U32::u32); if (R.is_err[bool, str](r2))  { ret r2; }
+    val r3:  R.Result[bool, str] = seed_one_primitive(rc, 3,  "u64", type.TYPE_U64::u32); if (R.is_err[bool, str](r3))  { ret r3; }
+    val r4:  R.Result[bool, str] = seed_one_primitive(rc, 4,  "i8",  type.TYPE_I8::u32);  if (R.is_err[bool, str](r4))  { ret r4; }
+    val r5:  R.Result[bool, str] = seed_one_primitive(rc, 5,  "i16", type.TYPE_I16::u32); if (R.is_err[bool, str](r5))  { ret r5; }
+    val r6:  R.Result[bool, str] = seed_one_primitive(rc, 6,  "i32", type.TYPE_I32::u32); if (R.is_err[bool, str](r6))  { ret r6; }
+    val r7:  R.Result[bool, str] = seed_one_primitive(rc, 7,  "i64", type.TYPE_I64::u32); if (R.is_err[bool, str](r7))  { ret r7; }
+    val r8:  R.Result[bool, str] = seed_one_primitive(rc, 8,  "f32", type.TYPE_F32::u32); if (R.is_err[bool, str](r8))  { ret r8; }
+    val r9:  R.Result[bool, str] = seed_one_primitive(rc, 9,  "f64", type.TYPE_F64::u32); if (R.is_err[bool, str](r9))  { ret r9; }
+    val r10: R.Result[bool, str] = seed_one_primitive(rc, 10, "ptr", type.TYPE_PTR::u32); if (R.is_err[bool, str](r10)) { ret r10; }
+    ret R.ok[bool, str](true);
 }
 
 # interns one primitive name and records it in the registry at `index` as a
 # SYM_PRIM symbol carrying the TypeKind ordinal in `slot`.
-fun seed_one_primitive(rc: *ResolveContext, index: u32, name: str, kind_ordinal: u32) Result[bool, str] {
-    val r_id: Result[intern.StrId, str] = intern.intern(?rc.s.interner, name);
-    if (is_err[intern.StrId, str](r_id)) { ret err[bool, str](unwrap_err[intern.StrId, str](r_id)); }
-    val name_id: intern.StrId = unwrap_ok[intern.StrId, str](r_id);
+# ---
+# rc:           resolver state for the module being resolved
+# index:        registry slot to fill
+# name:         the primitive spelling
+# kind_ordinal: the primitive's TypeKind ordinal
+# ret:          ok(true), or an allocation error
+fun seed_one_primitive(rc: *ResolveContext, index: u32, name: str, kind_ordinal: u32) R.Result[bool, str] {
+    val r_id: R.Result[intern.StrId, str] = intern.intern(?rc.s.interner, name);
+    if (R.is_err[intern.StrId, str](r_id)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](r_id)); }
+    val name_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_id);
 
-    val r_sym: Result[SymbolId, str] = add_symbol(rc, SYM_PRIM, 0, name_id, id.DECL_NIL, kind_ordinal, rc.own_module);
-    if (is_err[SymbolId, str](r_sym)) { ret err[bool, str](unwrap_err[SymbolId, str](r_sym)); }
-    val sid: SymbolId = unwrap_ok[SymbolId, str](r_sym);
+    val r_sym: R.Result[SymbolId, str] = add_symbol(rc, SYM_PRIM, 0, name_id, id.DECL_NIL, kind_ordinal, rc.own_module);
+    if (R.is_err[SymbolId, str](r_sym)) { ret R.err[bool, str](R.unwrap_err[SymbolId, str](r_sym)); }
+    val sid: SymbolId = R.unwrap_ok[SymbolId, str](r_sym);
 
     rc.prim_names[index] = name_id;
     rc.prim_syms[index]  = sid;
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
 # returns the SYM_PRIM symbol for a primitive type spelling, or SYMBOL_NIL
 # when `name` is not a primitive. consulted in type position, taking priority
 # over scope so a same-named value declaration never shadows the type.
+# ---
+# rc:   resolver state for the module being resolved
+# name: interned spelling to test
+# ret:  the SYM_PRIM symbol, or SYMBOL_NIL when `name` is not a primitive
 fun prim_symbol_for(rc: *ResolveContext, name: intern.StrId) SymbolId {
     var i: u32 = 0;
     for (i < PRIM_COUNT) {
@@ -738,36 +804,51 @@ fun prim_symbol_for(rc: *ResolveContext, name: intern.StrId) SymbolId {
     ret SYMBOL_NIL;
 }
 
-fun collect_decl_list(rc: *ResolveContext, start: u32, len: u32, scope: ScopeId, at_module_scope: bool) Result[bool, str] {
+# collect every decl in `[start, start + len)` of the decl-id pool
+# ---
+# rc:              resolver state for the module being resolved
+# start:           first index into the decl-id pool
+# len:             number of decls
+# scope:           scope to declare into
+# at_module_scope: whether these are module-scope decls
+# ret:             ok(true), or an error from collecting a decl
+fun collect_decl_list(rc: *ResolveContext, start: u32, len: u32, scope: ScopeId, at_module_scope: bool) R.Result[bool, str] {
     var i: u32 = 0;
     for (i < len) {
         val decl_id: id.DeclId = rc.a.decl_ids[start + i];
-        val r: Result[bool, str] = collect_one_decl(rc, decl_id, scope, at_module_scope);
-        if (is_err[bool, str](r)) { ret r; }
+        val r: R.Result[bool, str] = collect_one_decl(rc, decl_id, scope, at_module_scope);
+        if (R.is_err[bool, str](r)) { ret r; }
         i = i + 1;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-fun collect_one_decl(rc: *ResolveContext, decl_id: id.DeclId, scope: ScopeId, at_module_scope: bool) Result[bool, str] {
-    val d_opt: Option[*decl.Decl] = ast.get_decl(rc.a, decl_id);
-    if (is_none[*decl.Decl](d_opt)) { ret err[bool, str]("DeclId out of range"); }
-    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+# register the binding (if any) introduced by one decl
+# ---
+# rc:              resolver state for the module being resolved
+# decl_id:         the decl to collect
+# scope:           scope to declare into
+# at_module_scope: whether the decl sits at module scope
+# ret:             ok(true), or an allocation or eval error
+fun collect_one_decl(rc: *ResolveContext, decl_id: id.DeclId, scope: ScopeId, at_module_scope: bool) R.Result[bool, str] {
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(rc.a, decl_id);
+    if (O.is_none[*decl.Decl](d_opt)) { ret R.err[bool, str]("DeclId out of range"); }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
     val flags_in: u8 = d.flags;
 
     if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
         ret collect_comptime_if(rc, ?d.data.comptime_if, scope, at_module_scope, true);
     }
     if (d.kind == decl.DECL_KIND_COMPTIME_ATTR) {
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
     if (d.kind == decl.DECL_KIND_TEST || d.kind == decl.DECL_KIND_ERROR) {
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
 
     # fwd re-exports are resolved in the bind pass once dep symbols are reachable
     if (d.kind == decl.DECL_KIND_FWD) {
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
 
     val sym_flags: u8 = symbol_flags_from(flags_in, at_module_scope);
@@ -788,29 +869,43 @@ fun collect_one_decl(rc: *ResolveContext, decl_id: id.DeclId, scope: ScopeId, at
         ret declare_decl(rc, SYM_DEF, sym_flags, d.data.def_.name, decl_id, scope);
     }
     if (d.kind == decl.DECL_KIND_VAL) {
-        val r: Result[bool, str] = declare_decl(rc, SYM_VAL, sym_flags, d.data.bind.name, decl_id, scope);
-        if (is_err[bool, str](r)) { ret r; }
+        val r: R.Result[bool, str] = declare_decl(rc, SYM_VAL, sym_flags, d.data.bind.name, decl_id, scope);
+        if (R.is_err[bool, str](r)) { ret r; }
         if (d.data.bind.init != id.EXPR_NIL) {
-            val rcr: Result[bool, str] = try_register_comptime_const(rc, d.data.bind.name, d.data.bind.init);
-            if (is_err[bool, str](rcr)) { ret rcr; }
+            val rcr: R.Result[bool, str] = try_register_comptime_const(rc, d.data.bind.name, d.data.bind.init);
+            if (R.is_err[bool, str](rcr)) { ret rcr; }
         }
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
     if (d.kind == decl.DECL_KIND_VAR) {
         ret declare_decl(rc, SYM_VAR, sym_flags, d.data.bind.name, decl_id, scope);
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-fun declare_decl(rc: *ResolveContext, kind: SymKind, flags: u8, name_span: token.Span, decl_id: id.DeclId, scope: ScopeId) Result[bool, str] {
-    val r: Result[SymbolId, str] = declare(rc, kind, flags, name_span, decl_id, 0, rc.own_module, scope);
-    if (is_err[SymbolId, str](r)) { ret err[bool, str](unwrap_err[SymbolId, str](r)); }
+# declare a named decl's symbol and record it on `decl_symbol`
+# ---
+# rc:        resolver state for the module being resolved
+# kind:      the symbol's SymKind
+# flags:     its SYM_FLAG_* bitfield
+# name_span: span of the decl's name
+# decl_id:   the decl's DeclId
+# scope:     scope to bind into
+# ret:       ok(true), or an allocation error
+fun declare_decl(rc: *ResolveContext, kind: SymKind, flags: u8, name_span: token.Span, decl_id: id.DeclId, scope: ScopeId) R.Result[bool, str] {
+    val r: R.Result[SymbolId, str] = declare(rc, kind, flags, name_span, decl_id, 0, rc.own_module, scope);
+    if (R.is_err[SymbolId, str](r)) { ret R.err[bool, str](R.unwrap_err[SymbolId, str](r)); }
     if (rc.decl_symbol != nil) {
-        rc.decl_symbol[decl_id] = unwrap_ok[SymbolId, str](r);
+        rc.decl_symbol[decl_id] = R.unwrap_ok[SymbolId, str](r);
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
+# derive a symbol's flag bits from its decl flags and scope
+# ---
+# decl_flags:      the decl's flag bits
+# at_module_scope: whether the decl sits at module scope
+# ret:             the SYM_FLAG_* bitfield
 fun symbol_flags_from(decl_flags: u8, at_module_scope: bool) u8 {
     if (!at_module_scope) { ret 0; }
     var f: u8 = SYM_FLAG_MODULE;
@@ -825,76 +920,100 @@ fun symbol_flags_from(decl_flags: u8, at_module_scope: bool) u8 {
 # name never drops a legitimate distinct binding. a non-foldable initializer is
 # skipped (ok): the comptime requirement is enforced at the use site, not here.
 # only a bind failure (allocation) propagates.
-fun try_register_comptime_const(rc: *ResolveContext, name_span: token.Span, init_expr: id.ExprId) Result[bool, str] {
-    if (name_span.len == 0) { ret ok[bool, str](true); }
-    val r_id: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, name_span);
-    if (is_err[intern.StrId, str](r_id)) { ret ok[bool, str](true); }
-    val name_id: intern.StrId = unwrap_ok[intern.StrId, str](r_id);
+# ---
+# rc:        resolver state for the module being resolved
+# name_span: span of the val's name
+# init_expr: the initializer expression
+# ret:       ok(true); only a bind allocation failure is reported as an error
+fun try_register_comptime_const(rc: *ResolveContext, name_span: token.Span, init_expr: id.ExprId) R.Result[bool, str] {
+    if (name_span.len == 0) { ret R.ok[bool, str](true); }
+    val r_id: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, name_span);
+    if (R.is_err[intern.StrId, str](r_id)) { ret R.ok[bool, str](true); }
+    val name_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_id);
 
-    if (is_some[*comptime.NamedConst](comptime.lookup(rc.ctx, name_id))) { ret ok[bool, str](true); }
+    if (O.is_some[*comptime.NamedConst](comptime.lookup(rc.ctx, name_id))) { ret R.ok[bool, str](true); }
 
-    val r_val: Result[comptime.CTValue, str] = comptime.eval(rc.ctx, rc.a, rc.source, init_expr, ?rc.s.interner);
-    if (is_err[comptime.CTValue, str](r_val)) { ret ok[bool, str](true); }
-    val v: comptime.CTValue = unwrap_ok[comptime.CTValue, str](r_val);
+    val r_val: R.Result[comptime.CTValue, str] = comptime.eval(rc.ctx, rc.a, rc.source, init_expr, ?rc.s.interner);
+    if (R.is_err[comptime.CTValue, str](r_val)) { ret R.ok[bool, str](true); }
+    val v: comptime.CTValue = R.unwrap_ok[comptime.CTValue, str](r_val);
 
     ret comptime.bind(rc.ctx, name_id, v);
 }
 
-fun collect_comptime_if(rc: *ResolveContext, ci: *decl.DeclComptimeIf, scope: ScopeId, at_module_scope: bool, at_decl_scope: bool) Result[bool, str] {
+# collect the first comptime-active arm of a `$if` decl chain
+# ---
+# rc:              resolver state for the module being resolved
+# ci:              the comptime-if decl payload
+# scope:           scope to declare into
+# at_module_scope: whether the chain sits at module scope
+# at_decl_scope:   whether the chain sits in decl position
+# ret:             ok(true), or an eval or allocation error
+fun collect_comptime_if(rc: *ResolveContext, ci: *decl.DeclComptimeIf, scope: ScopeId, at_module_scope: bool, at_decl_scope: bool) R.Result[bool, str] {
     var bi: u32 = 0;
     for (bi < ci.branches_len) {
         val br: *decl.ComptimeBranch = ?rc.a.comptime_branches[ci.branches_start + bi];
-        val take_r: Result[bool, str] = comptime_branch_active(rc, br);
-        if (is_err[bool, str](take_r)) { ret take_r; }
-        if (unwrap_ok[bool, str](take_r)) {
+        val take_r: R.Result[bool, str] = comptime_branch_active(rc, br);
+        if (R.is_err[bool, str](take_r)) { ret take_r; }
+        if (R.unwrap_ok[bool, str](take_r)) {
             if (at_decl_scope) {
                 ret collect_decl_list(rc, br.body_start, br.body_len, scope, at_module_scope);
             }
-            ret ok[bool, str](true);
+            ret R.ok[bool, str](true);
         }
         bi = bi + 1;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-fun comptime_branch_active(rc: *ResolveContext, br: *decl.ComptimeBranch) Result[bool, str] {
-    if (br.cond == id.EXPR_NIL) { ret ok[bool, str](true); }
-    val r: Result[comptime.CTValue, str] = comptime.eval(rc.ctx, rc.a, rc.source, br.cond, ?rc.s.interner);
-    val e_opt: Option[*expr.Expr] = ast.get_expr(rc.a, br.cond);
-    if (is_none[*expr.Expr](e_opt)) { ret err[bool, str]("comptime branch cond ExprId out of range"); }
-    val cond_span: token.Span = unwrap[*expr.Expr](e_opt).span;
-    if (is_err[comptime.CTValue, str](r)) {
-        val de: Result[bool, str] = diag.error(?rc.s.diags, rc.a.file_id, cond_span, unwrap_err[comptime.CTValue, str](r));
-        if (is_err[bool, str](de)) { ret de; }
-        ret ok[bool, str](false);
+# evaluate a `$if` branch condition to a bool, reporting a non-bool value
+# ---
+# rc:  resolver state for the module being resolved
+# br:  the branch to test
+# ret: ok(true) when the branch is taken, ok(false) otherwise, or an error
+fun comptime_branch_active(rc: *ResolveContext, br: *decl.ComptimeBranch) R.Result[bool, str] {
+    if (br.cond == id.EXPR_NIL) { ret R.ok[bool, str](true); }
+    val r: R.Result[comptime.CTValue, str] = comptime.eval(rc.ctx, rc.a, rc.source, br.cond, ?rc.s.interner);
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, br.cond);
+    if (O.is_none[*expr.Expr](e_opt)) { ret R.err[bool, str]("comptime branch cond ExprId out of range"); }
+    val cond_span: token.Span = O.unwrap[*expr.Expr](e_opt).span;
+    if (R.is_err[comptime.CTValue, str](r)) {
+        val de: R.Result[bool, str] = diagnostic.error(?rc.s.diags, rc.a.file_id, cond_span, R.unwrap_err[comptime.CTValue, str](r));
+        if (R.is_err[bool, str](de)) { ret de; }
+        ret R.ok[bool, str](false);
     }
-    val v: comptime.CTValue = unwrap_ok[comptime.CTValue, str](r);
+    val v: comptime.CTValue = R.unwrap_ok[comptime.CTValue, str](r);
     if (v.kind != comptime.CT_KIND_BOOL) {
         # the BOOL case is excluded above, so the value is int, float, or str.
         var msg: str = "comptime branch condition must be a bool, found int";
         if (v.kind == comptime.CT_KIND_FLOAT) { msg = "comptime branch condition must be a bool, found float"; }
         or (v.kind == comptime.CT_KIND_STR)   { msg = "comptime branch condition must be a bool, found str"; }
-        val de: Result[bool, str] = diag.error(?rc.s.diags, rc.a.file_id, cond_span, msg);
-        if (is_err[bool, str](de)) { ret de; }
-        ret ok[bool, str](false);
+        val de: R.Result[bool, str] = diagnostic.error(?rc.s.diags, rc.a.file_id, cond_span, msg);
+        if (R.is_err[bool, str](de)) { ret de; }
+        ret R.ok[bool, str](false);
     }
-    ret ok[bool, str](v.data.b);
+    ret R.ok[bool, str](v.data.b);
 }
 
 # binds a single `use PATH;` / `use ALIAS: PATH;` decl. with no implicit
 # splat: a no-alias `use` binds the single leaf name of PATH (a module
 # alias when PATH ends at a module, a pub symbol when it ends at a symbol);
 # an aliased `use` binds the alias to the same target.
-fun collect_use(rc: *ResolveContext, decl_id: id.DeclId, du: *decl.DeclUse, scope: ScopeId) Result[bool, str] {
+# ---
+# rc:      resolver state for the module being resolved
+# decl_id: the use decl
+# du:      the use payload
+# scope:   scope to bind into
+# ret:     ok(true), or an allocation error
+fun collect_use(rc: *ResolveContext, decl_id: id.DeclId, du: *decl.DeclUse, scope: ScopeId) R.Result[bool, str] {
     if (du.path.len == 0) {
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
 
-    val r_path: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, du.path);
-    if (is_err[intern.StrId, str](r_path)) {
-        ret err[bool, str](unwrap_err[intern.StrId, str](r_path));
+    val r_path: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, du.path);
+    if (R.is_err[intern.StrId, str](r_path)) {
+        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](r_path));
     }
-    val path_id: intern.StrId = unwrap_ok[intern.StrId, str](r_path);
+    val path_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_path);
 
     # PATH ends at a module: bind a module alias (explicit alias span, or the
     # leaf segment of PATH when no alias is written).
@@ -904,12 +1023,12 @@ fun collect_use(rc: *ResolveContext, decl_id: id.DeclId, du: *decl.DeclUse, scop
         if (alias_span.len == 0) {
             alias_span = leaf_span(rc, du.path);
         }
-        val r: Result[SymbolId, str] = declare(rc, SYM_USE, 0, alias_span, decl_id, mx.module::u32, rc.own_module, scope);
-        if (is_err[SymbolId, str](r)) { ret err[bool, str](unwrap_err[SymbolId, str](r)); }
+        val r: R.Result[SymbolId, str] = declare(rc, SYM_USE, 0, alias_span, decl_id, mx.module::u32, rc.own_module, scope);
+        if (R.is_err[SymbolId, str](r)) { ret R.err[bool, str](R.unwrap_err[SymbolId, str](r)); }
         if (rc.decl_symbol != nil) {
-            rc.decl_symbol[decl_id] = unwrap_ok[SymbolId, str](r);
+            rc.decl_symbol[decl_id] = R.unwrap_ok[SymbolId, str](r);
         }
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
 
     # PATH ends at a symbol: split into prefix module + leaf symbol, look the
@@ -918,26 +1037,26 @@ fun collect_use(rc: *ResolveContext, decl_id: id.DeclId, du: *decl.DeclUse, scop
     val leaf: token.Span = leaf_span(rc, du.path);
     val prefix: token.Span = prefix_span(rc, du.path);
     if (prefix.len == 0 || leaf.len == 0) {
-        diag.error(?rc.s.diags, rc.a.file_id, du.path, "imported module is not in the dep set");
-        ret ok[bool, str](true);
+        diagnostic.error(?rc.s.diags, rc.a.file_id, du.path, "imported module is not in the dep set");
+        ret R.ok[bool, str](true);
     }
 
     val pmx: *ModuleExports = find_module_exports_span(rc, prefix);
     if (pmx == nil) {
-        diag.error(?rc.s.diags, rc.a.file_id, du.path, "imported module is not in the dep set");
-        ret ok[bool, str](true);
+        diagnostic.error(?rc.s.diags, rc.a.file_id, du.path, "imported module is not in the dep set");
+        ret R.ok[bool, str](true);
     }
 
-    val r_leaf: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, leaf);
-    if (is_err[intern.StrId, str](r_leaf)) {
-        ret err[bool, str](unwrap_err[intern.StrId, str](r_leaf));
+    val r_leaf: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, leaf);
+    if (R.is_err[intern.StrId, str](r_leaf)) {
+        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](r_leaf));
     }
-    val leaf_id: intern.StrId = unwrap_ok[intern.StrId, str](r_leaf);
+    val leaf_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_leaf);
 
     val ps: *PublicSymbol = find_export(pmx, leaf_id);
     if (ps == nil) {
         report_named2(rc, du.path, "`", leaf_id, "` is not exported by `", pmx.path, "`");
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
 
     var bind_span: token.Span = du.alias;
@@ -949,30 +1068,37 @@ fun collect_use(rc: *ResolveContext, decl_id: id.DeclId, du: *decl.DeclUse, scop
 
 # adds a SYM_IMPORTED binding for `ps` under `bind_span`, deduping the
 # underlying (origin, decl) Symbol through `imported_cache`.
-fun bind_imported_symbol(rc: *ResolveContext, decl_id: id.DeclId, bind_span: token.Span, ps: *PublicSymbol, scope: ScopeId) Result[bool, str] {
-    if (bind_span.len == 0) { ret ok[bool, str](true); }
-    val r_name: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, bind_span);
-    if (is_err[intern.StrId, str](r_name)) {
-        ret err[bool, str](unwrap_err[intern.StrId, str](r_name));
+# ---
+# rc:        resolver state for the module being resolved
+# decl_id:   the use decl
+# bind_span: span to bind the import under
+# ps:        the source pub symbol
+# scope:     scope to bind into
+# ret:       ok(true), or an allocation error
+fun bind_imported_symbol(rc: *ResolveContext, decl_id: id.DeclId, bind_span: token.Span, ps: *PublicSymbol, scope: ScopeId) R.Result[bool, str] {
+    if (bind_span.len == 0) { ret R.ok[bool, str](true); }
+    val r_name: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, bind_span);
+    if (R.is_err[intern.StrId, str](r_name)) {
+        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](r_name));
     }
-    val name_id: intern.StrId = unwrap_ok[intern.StrId, str](r_name);
+    val name_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_name);
 
     val existing: SymbolId = scope_lookup_local(rc, scope, name_id);
     if (existing != SYMBOL_NIL) {
         report_named(rc, bind_span, "imported name `", name_id, "` is already defined in this scope");
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
 
-    val sid_r: Result[SymbolId, str] = imported_symbol_for(rc, ps);
-    if (is_err[SymbolId, str](sid_r)) { ret err[bool, str](unwrap_err[SymbolId, str](sid_r)); }
-    val sid: SymbolId = unwrap_ok[SymbolId, str](sid_r);
+    val sid_r: R.Result[SymbolId, str] = imported_symbol_for(rc, ps);
+    if (R.is_err[SymbolId, str](sid_r)) { ret R.err[bool, str](R.unwrap_err[SymbolId, str](sid_r)); }
+    val sid: SymbolId = R.unwrap_ok[SymbolId, str](sid_r);
 
-    val r_add: Result[bool, str] = scope_add(rc, scope, name_id, sid);
-    if (is_err[bool, str](r_add)) { ret r_add; }
+    val r_add: R.Result[bool, str] = scope_add(rc, scope, name_id, sid);
+    if (R.is_err[bool, str](r_add)) { ret r_add; }
     if (rc.decl_symbol != nil) {
         rc.decl_symbol[decl_id] = sid;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
 # returns a Symbol for `ps`, reusing the cached one when an earlier use-site
@@ -980,11 +1106,15 @@ fun bind_imported_symbol(rc: *ResolveContext, decl_id: id.DeclId, bind_span: tok
 # a plain SYM_IMPORTED reference; a re-exported module alias (SYM_USE) keeps its
 # kind and target-module slot so a downstream consumer can resolve through the
 # `fwd` (the slot is a project-wide ModuleId, shared across the one build).
-fun imported_symbol_for(rc: *ResolveContext, ps: *PublicSymbol) Result[SymbolId, str] {
+# ---
+# rc:  resolver state for the module being resolved
+# ps:  the pub symbol to import
+# ret: the cached or freshly minted SymbolId, or an allocation error
+fun imported_symbol_for(rc: *ResolveContext, ps: *PublicSymbol) R.Result[SymbolId, str] {
     val key: u64 = (ps.origin::u64 << 32) | ps.decl::u64;
-    val cached: Result[*SymbolId, str] = map.get[u64, SymbolId](?rc.imported_cache, ?key);
-    if (is_ok[*SymbolId, str](cached)) {
-        ret ok[SymbolId, str](@unwrap_ok[*SymbolId, str](cached));
+    val cached: R.Result[*SymbolId, str] = map.get[u64, SymbolId](?rc.imported_cache, ?key);
+    if (R.is_ok[*SymbolId, str](cached)) {
+        ret R.ok[SymbolId, str](@R.unwrap_ok[*SymbolId, str](cached));
     }
     var kind: SymKind = SYM_IMPORTED;
     var slot: u32     = 0;
@@ -992,15 +1122,19 @@ fun imported_symbol_for(rc: *ResolveContext, ps: *PublicSymbol) Result[SymbolId,
         kind = SYM_USE;
         slot = ps.slot;
     }
-    val r: Result[SymbolId, str] = add_symbol(rc, kind, 0, ps.name, ps.decl, slot, ps.origin);
-    if (is_err[SymbolId, str](r)) { ret r; }
-    val sid: SymbolId = unwrap_ok[SymbolId, str](r);
-    val ins: Result[bool, str] = map.insert[u64, SymbolId](?rc.imported_cache, key, sid);
-    if (is_err[bool, str](ins)) { ret err[SymbolId, str](unwrap_err[bool, str](ins)); }
-    ret ok[SymbolId, str](sid);
+    val r: R.Result[SymbolId, str] = add_symbol(rc, kind, 0, ps.name, ps.decl, slot, ps.origin);
+    if (R.is_err[SymbolId, str](r)) { ret r; }
+    val sid: SymbolId = R.unwrap_ok[SymbolId, str](r);
+    val ins: R.Result[bool, str] = map.insert[u64, SymbolId](?rc.imported_cache, key, sid);
+    if (R.is_err[bool, str](ins)) { ret R.err[SymbolId, str](R.unwrap_err[bool, str](ins)); }
+    ret R.ok[SymbolId, str](sid);
 }
 
 # byte offset of the last `.` within `path`, or path.offset when there is none
+# ---
+# rc:   resolver state for the module being resolved
+# path: the dotted path span
+# ret:  byte offset of the final `.`, or path.offset when there is none
 fun last_dot_offset(rc: *ResolveContext, path: token.Span) usize {
     val start: usize = path.offset;
     val end:   usize = path.offset + path.len;
@@ -1020,6 +1154,10 @@ fun last_dot_offset(rc: *ResolveContext, path: token.Span) usize {
 
 # span of the final dotted segment of `path` (the leaf component). for a
 # single-segment path the whole span is returned.
+# ---
+# rc:   resolver state for the module being resolved
+# path: the dotted path span
+# ret:  span of the path's final segment
 fun leaf_span(rc: *ResolveContext, path: token.Span) token.Span {
     val end: usize = path.offset + path.len;
     val dot: usize = last_dot_offset(rc, path);
@@ -1036,6 +1174,10 @@ fun leaf_span(rc: *ResolveContext, path: token.Span) token.Span {
 
 # span covering everything before the final `.` of `path` (the module prefix),
 # or an empty span when `path` is a single segment.
+# ---
+# rc:   resolver state for the module being resolved
+# path: the dotted path span
+# ret:  span before the final `.`, empty for a single-segment path
 fun prefix_span(rc: *ResolveContext, path: token.Span) token.Span {
     val dot: usize = last_dot_offset(rc, path);
     var out: token.Span;
@@ -1049,6 +1191,11 @@ fun prefix_span(rc: *ResolveContext, path: token.Span) token.Span {
     ret out;
 }
 
+# the dependency exports whose interned FQN equals `path`
+# ---
+# rc:   resolver state for the module being resolved
+# path: interned module FQN to find
+# ret:  the matching exports, or nil when not a dep
 fun find_module_exports(rc: *ResolveContext, path: intern.StrId) *ModuleExports {
     var i: u32 = 0;
     for (i < rc.deps.count) {
@@ -1060,7 +1207,11 @@ fun find_module_exports(rc: *ResolveContext, path: intern.StrId) *ModuleExports 
 }
 
 # finds the dependency exports for module id `mid`, or nil when not a dep.
-fun find_module_exports_by_module(rc: *ResolveContext, mid: sess.ModuleId) *ModuleExports {
+# ---
+# rc:  resolver state for the module being resolved
+# mid: the module id to find
+# ret: the matching exports, or nil when not a dep
+fun find_module_exports_by_module(rc: *ResolveContext, mid: session.ModuleId) *ModuleExports {
     var i: u32 = 0;
     for (i < rc.deps.count) {
         val mx: *ModuleExports = ?rc.deps.entries[i];
@@ -1072,9 +1223,9 @@ fun find_module_exports_by_module(rc: *ResolveContext, mid: sess.ModuleId) *Modu
 
 # resolves a qualified member access `alias.symbol`, recording the referenced
 # symbol on the member expression. when the object expression resolves to a
-# module alias (a `SYM_USE` whose `slot` names the aliased module) — a bare
+# module alias (a `SYM_USE` whose `slot` names the aliased module) - a bare
 # ident bound by `use`, or a nested member that itself resolved to a `fwd`
-# module re-export — the leaf names a public symbol of that module rather than
+# module re-export - the leaf names a public symbol of that module rather than
 # a record field; this looks it up among the module's exports and records an
 # imported symbol on the member's `expr_resolved` slot so sema can type it
 # directly. the object is bound before this runs, so a chain resolves left to
@@ -1082,79 +1233,96 @@ fun find_module_exports_by_module(rc: *ResolveContext, mid: sess.ModuleId) *Modu
 # value) is left for sema's field-access path; an unexported or missing leaf
 # reports an error. `member` is the ExprMember payload and `eid` its
 # expression id.
-fun bind_member_qualified(rc: *ResolveContext, eid: id.ExprId, member: *expr.ExprMember) Result[bool, str] {
-    if (rc.expr_resolved == nil) { ret ok[bool, str](true); }
+# ---
+# rc:     resolver state for the module being resolved
+# eid:    the member expression id
+# member: the member payload
+# ret:    ok(true), or an allocation error
+fun bind_member_qualified(rc: *ResolveContext, eid: id.ExprId, member: *expr.ExprMember) R.Result[bool, str] {
+    if (rc.expr_resolved == nil) { ret R.ok[bool, str](true); }
 
-    val obj_opt: Option[*expr.Expr] = ast.get_expr(rc.a, member.object);
-    if (is_none[*expr.Expr](obj_opt)) { ret ok[bool, str](true); }
+    val obj_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, member.object);
+    if (O.is_none[*expr.Expr](obj_opt)) { ret R.ok[bool, str](true); }
 
     val osid: SymbolId = rc.expr_resolved[member.object];
-    if (osid == SYMBOL_NIL || osid >= rc.sym_len) { ret ok[bool, str](true); }
+    if (osid == SYMBOL_NIL || osid >= rc.sym_len) { ret R.ok[bool, str](true); }
     val osym: *Symbol = ?rc.symbols[osid];
-    if (osym.kind != SYM_USE) { ret ok[bool, str](true); }
+    if (osym.kind != SYM_USE) { ret R.ok[bool, str](true); }
 
-    val target: sess.ModuleId = osym.slot::sess.ModuleId;
+    val target: session.ModuleId = osym.slot::session.ModuleId;
     val mx: *ModuleExports = find_module_exports_by_module(rc, target);
     if (mx == nil) {
         # a SYM_USE always names a module the driver's dep-set closure included,
         # so a miss is a broken build graph; report it rather than silently
         # falling through to sema's field-access path.
-        diag.error(?rc.s.diags, rc.a.file_id, member.name, "module alias names a module that is not in the dep set");
-        ret ok[bool, str](true);
+        diagnostic.error(?rc.s.diags, rc.a.file_id, member.name, "module alias names a module that is not in the dep set");
+        ret R.ok[bool, str](true);
     }
 
-    val r_leaf: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, member.name);
-    if (is_err[intern.StrId, str](r_leaf)) { ret err[bool, str](unwrap_err[intern.StrId, str](r_leaf)); }
-    val leaf_id: intern.StrId = unwrap_ok[intern.StrId, str](r_leaf);
+    val r_leaf: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, member.name);
+    if (R.is_err[intern.StrId, str](r_leaf)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](r_leaf)); }
+    val leaf_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_leaf);
 
     val ps: *PublicSymbol = find_export(mx, leaf_id);
     if (ps == nil) {
         # the object is a real module but the leaf names no public export of
-        # it — a genuinely undefined or non-`pub` qualified member. cmach
+        # it - a genuinely undefined or non-`pub` qualified member. cmach
         # (`sema.c:3634`) errors for `!sym || !sym->is_public`; mirror that
         # here, since sema's later TYPE_NIL early-out would otherwise drop the
         # access silently.
         report_named2(rc, member.name, "no symbol `", leaf_id, "` exported by `", mx.path, "`");
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
 
     # reuse the imported-symbol cache instead of minting a fresh Symbol per
     # qualified reference, the exact use-case the cache documents; this also
     # preserves a re-exported module alias as SYM_USE so `alias.member` chains
     # through a `fwd`.
-    val r_sym: Result[SymbolId, str] = imported_symbol_for(rc, ps);
-    if (is_err[SymbolId, str](r_sym)) { ret err[bool, str](unwrap_err[SymbolId, str](r_sym)); }
-    rc.expr_resolved[eid] = unwrap_ok[SymbolId, str](r_sym);
-    ret ok[bool, str](true);
+    val r_sym: R.Result[SymbolId, str] = imported_symbol_for(rc, ps);
+    if (R.is_err[SymbolId, str](r_sym)) { ret R.err[bool, str](R.unwrap_err[SymbolId, str](r_sym)); }
+    rc.expr_resolved[eid] = R.unwrap_ok[SymbolId, str](r_sym);
+    ret R.ok[bool, str](true);
 }
 
 # resolves a ModuleExports entry whose FQN equals the interned text of `span`
+# ---
+# rc:   resolver state for the module being resolved
+# span: source span naming a module FQN
+# ret:  the matching exports, or nil
 fun find_module_exports_span(rc: *ResolveContext, span: token.Span) *ModuleExports {
-    val r: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, span);
-    if (is_err[intern.StrId, str](r)) { ret nil; }
-    ret find_module_exports(rc, unwrap_ok[intern.StrId, str](r));
+    val r: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, span);
+    if (R.is_err[intern.StrId, str](r)) { ret nil; }
+    ret find_module_exports(rc, R.unwrap_ok[intern.StrId, str](r));
 }
 
 # resolves the module prefix of a `use`/`fwd` path to its exports. mirrors
 # cmach's two-step prefix resolution: a `use`-alias bound into the module scope
 # names its target module directly, otherwise the prefix text is a literal FQN.
 # nil only when the prefix names no in-scope alias and no dependency.
+# ---
+# rc:     resolver state for the module being resolved
+# prefix: the path-prefix span
+# ret:    the prefix module's exports, or nil
 fun resolve_prefix_module(rc: *ResolveContext, prefix: token.Span) *ModuleExports {
-    val r: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, prefix);
-    if (is_err[intern.StrId, str](r)) { ret nil; }
-    val prefix_id: intern.StrId = unwrap_ok[intern.StrId, str](r);
+    val r: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, prefix);
+    if (R.is_err[intern.StrId, str](r)) { ret nil; }
+    val prefix_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r);
 
     val sid: SymbolId = scope_lookup_chain(rc, rc.module_scope, prefix_id);
     if (sid != SYMBOL_NIL && sid < rc.sym_len) {
         val sym: *Symbol = ?rc.symbols[sid];
         if (sym.kind == SYM_USE) {
-            ret find_module_exports_by_module(rc, sym.slot::sess.ModuleId);
+            ret find_module_exports_by_module(rc, sym.slot::session.ModuleId);
         }
     }
     ret find_module_exports(rc, prefix_id);
 }
 
 # finds the pub symbol named `name` among a module's exports
+# ---
+# mx:   the module's exports
+# name: interned symbol name
+# ret:  the matching pub symbol, or nil
 fun find_export(mx: *ModuleExports, name: intern.StrId) *PublicSymbol {
     var i: u32 = 0;
     for (i < mx.count) {
@@ -1165,49 +1333,64 @@ fun find_export(mx: *ModuleExports, name: intern.StrId) *PublicSymbol {
     ret nil;
 }
 
-fun bind_decl_list(rc: *ResolveContext, start: u32, len: u32) Result[bool, str] {
+# bind every decl in `[start, start + len)` of the decl-id pool
+# ---
+# rc:    resolver state for the module being resolved
+# start: first index into the decl-id pool
+# len:   number of decls
+# ret:   ok(true), or an error from binding a decl
+fun bind_decl_list(rc: *ResolveContext, start: u32, len: u32) R.Result[bool, str] {
     var i: u32 = 0;
     for (i < len) {
         val decl_id: id.DeclId = rc.a.decl_ids[start + i];
-        val r: Result[bool, str] = bind_one_decl(rc, decl_id);
-        if (is_err[bool, str](r)) { ret r; }
+        val r: R.Result[bool, str] = bind_one_decl(rc, decl_id);
+        if (R.is_err[bool, str](r)) { ret r; }
         i = i + 1;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
 # binds the identifiers in each of decl `d`'s backtick decorator arguments.
-fun bind_decorator_args(rc: *ResolveContext, d: *decl.Decl) Result[bool, str] {
+# ---
+# rc:  resolver state for the module being resolved
+# d:   the decl whose decorator arguments to bind
+# ret: ok(true), or a binding error
+fun bind_decorator_args(rc: *ResolveContext, d: *decl.Decl) R.Result[bool, str] {
     var k: u32 = 0;
     for (k < d.decorators_len) {
         val dec: *decl.Decorator = ?rc.a.decorators[d.decorators_start + k];
         var j: u32 = 0;
         for (j < dec.args_len) {
-            val r: Result[bool, str] = bind_expr(rc, rc.a.expr_ids[dec.args_start + j]);
-            if (is_err[bool, str](r)) { ret r; }
+            val r: R.Result[bool, str] = bind_expr(rc, rc.a.expr_ids[dec.args_start + j]);
+            if (R.is_err[bool, str](r)) { ret r; }
             j = j + 1;
         }
         k = k + 1;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-fun bind_one_decl(rc: *ResolveContext, decl_id: id.DeclId) Result[bool, str] {
-    val d_opt: Option[*decl.Decl] = ast.get_decl(rc.a, decl_id);
-    if (is_none[*decl.Decl](d_opt)) { ret err[bool, str]("DeclId out of range"); }
-    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+# bind the types and bodies referenced by one decl
+# ---
+# rc:      resolver state for the module being resolved
+# decl_id: the decl to bind
+# ret:     ok(true), or a binding error
+fun bind_one_decl(rc: *ResolveContext, decl_id: id.DeclId) R.Result[bool, str] {
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(rc.a, decl_id);
+    if (O.is_none[*decl.Decl](d_opt)) { ret R.err[bool, str]("DeclId out of range"); }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
 
     # a decl's backtick decorator arguments are comptime expressions; bind their
     # identifiers (e.g. the operand of `#[align($size_of(T))]`) so sema can type them.
-    val rda: Result[bool, str] = bind_decorator_args(rc, d);
-    if (is_err[bool, str](rda)) { ret rda; }
+    val rda: R.Result[bool, str] = bind_decorator_args(rc, d);
+    if (R.is_err[bool, str](rda)) { ret rda; }
 
     if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
         val ci: *decl.DeclComptimeIf = ?d.data.comptime_if;
         ret bind_comptime_if(rc, ci.branches_start, ci.branches_len, true);
     }
     if (d.kind == decl.DECL_KIND_USE || d.kind == decl.DECL_KIND_ERROR) {
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
     if (d.kind == decl.DECL_KIND_FWD) {
         ret bind_fwd(rc, decl_id, ?d.data.fwd_, d.flags);
@@ -1215,7 +1398,7 @@ fun bind_one_decl(rc: *ResolveContext, decl_id: id.DeclId) Result[bool, str] {
     if (d.kind == decl.DECL_KIND_COMPTIME_ATTR) {
         # a bare comptime directive (`$error(...)`) binds nothing; its evaluation
         # is handled out of band.
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
     if (d.kind == decl.DECL_KIND_FUN) {
         ret bind_fun(rc, ?d.data.fun_, decl_id);
@@ -1231,34 +1414,40 @@ fun bind_one_decl(rc: *ResolveContext, decl_id: id.DeclId) Result[bool, str] {
     }
     if (d.kind == decl.DECL_KIND_VAL || d.kind == decl.DECL_KIND_VAR) {
         if (d.data.bind.ty != id.TYPE_NIL) {
-            val r: Result[bool, str] = bind_type(rc, d.data.bind.ty);
-            if (is_err[bool, str](r)) { ret r; }
+            val r: R.Result[bool, str] = bind_type(rc, d.data.bind.ty);
+            if (R.is_err[bool, str](r)) { ret r; }
         }
         if (d.data.bind.init != id.EXPR_NIL) {
             ret bind_expr(rc, d.data.bind.init);
         }
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
     if (d.kind == decl.DECL_KIND_TEST) {
         if (d.data.test_.body != id.STMT_NIL) {
             ret bind_stmt(rc, d.data.test_.body);
         }
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
 # resolves a `fwd ALIAS: PATH;` / `fwd PATH;` re-export. the path must end at
 # a pub symbol of a dependency; that symbol is re-published into this module's
 # pub surface (SYM_FLAG_PUB) under the alias (or the leaf name), with origin
 # and decl pointing at the originator so consumers bind through to the source.
-fun bind_fwd(rc: *ResolveContext, decl_id: id.DeclId, df: *decl.DeclFwd, flags: u8) Result[bool, str] {
+# ---
+# rc:      resolver state for the module being resolved
+# decl_id: the fwd decl
+# df:      the fwd payload
+# flags:   the decl's flag bits
+# ret:     ok(true), or an allocation error
+fun bind_fwd(rc: *ResolveContext, decl_id: id.DeclId, df: *decl.DeclFwd, flags: u8) R.Result[bool, str] {
     if ((flags & decl.DECL_FLAG_PUB) != 0) {
-        diag.error(?rc.s.diags, rc.a.file_id, df.path, "`fwd` always re-exports; `pub fwd` is not allowed");
-        ret ok[bool, str](true);
+        diagnostic.error(?rc.s.diags, rc.a.file_id, df.path, "`fwd` always re-exports; `pub fwd` is not allowed");
+        ret R.ok[bool, str](true);
     }
     if (df.path.len == 0) {
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
 
     # PATH ends at a module: re-export it as a public module alias (the explicit
@@ -1267,11 +1456,11 @@ fun bind_fwd(rc: *ResolveContext, decl_id: id.DeclId, df: *decl.DeclFwd, flags: 
     # submodules (`fwd std.types.bool;`) takes this path; the prefix+symbol split
     # below would otherwise misread the module leaf as a symbol of a non-module
     # prefix.
-    val r_full: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, df.path);
-    if (is_err[intern.StrId, str](r_full)) {
-        ret err[bool, str](unwrap_err[intern.StrId, str](r_full));
+    val r_full: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, df.path);
+    if (R.is_err[intern.StrId, str](r_full)) {
+        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](r_full));
     }
-    val full_id: intern.StrId = unwrap_ok[intern.StrId, str](r_full);
+    val full_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_full);
     val full_mx: *ModuleExports = find_module_exports(rc, full_id);
     if (full_mx != nil) {
         ret bind_fwd_module(rc, decl_id, df, full_mx.module);
@@ -1280,26 +1469,26 @@ fun bind_fwd(rc: *ResolveContext, decl_id: id.DeclId, df: *decl.DeclFwd, flags: 
     val leaf: token.Span = leaf_span(rc, df.path);
     val prefix: token.Span = prefix_span(rc, df.path);
     if (prefix.len == 0 || leaf.len == 0) {
-        diag.error(?rc.s.diags, rc.a.file_id, df.path, "`fwd` path must name a symbol of a module");
-        ret ok[bool, str](true);
+        diagnostic.error(?rc.s.diags, rc.a.file_id, df.path, "`fwd` path must name a symbol of a module");
+        ret R.ok[bool, str](true);
     }
 
     val pmx: *ModuleExports = resolve_prefix_module(rc, prefix);
     if (pmx == nil) {
-        diag.error(?rc.s.diags, rc.a.file_id, df.path, "re-exported module is not in the dep set");
-        ret ok[bool, str](true);
+        diagnostic.error(?rc.s.diags, rc.a.file_id, df.path, "re-exported module is not in the dep set");
+        ret R.ok[bool, str](true);
     }
 
-    val r_leaf: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, leaf);
-    if (is_err[intern.StrId, str](r_leaf)) {
-        ret err[bool, str](unwrap_err[intern.StrId, str](r_leaf));
+    val r_leaf: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, leaf);
+    if (R.is_err[intern.StrId, str](r_leaf)) {
+        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](r_leaf));
     }
-    val leaf_id: intern.StrId = unwrap_ok[intern.StrId, str](r_leaf);
+    val leaf_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_leaf);
 
     val ps: *PublicSymbol = find_export(pmx, leaf_id);
     if (ps == nil) {
-        diag.error(?rc.s.diags, rc.a.file_id, df.path, "re-exported symbol is not exported by its module");
-        ret ok[bool, str](true);
+        diagnostic.error(?rc.s.diags, rc.a.file_id, df.path, "re-exported symbol is not exported by its module");
+        ret R.ok[bool, str](true);
     }
 
     var bind_span: token.Span = df.alias;
@@ -1307,16 +1496,16 @@ fun bind_fwd(rc: *ResolveContext, decl_id: id.DeclId, df: *decl.DeclFwd, flags: 
         bind_span = leaf;
     }
 
-    val r_name: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, bind_span);
-    if (is_err[intern.StrId, str](r_name)) {
-        ret err[bool, str](unwrap_err[intern.StrId, str](r_name));
+    val r_name: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, bind_span);
+    if (R.is_err[intern.StrId, str](r_name)) {
+        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](r_name));
     }
-    val name_id: intern.StrId = unwrap_ok[intern.StrId, str](r_name);
+    val name_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_name);
 
     val existing: SymbolId = scope_lookup_local(rc, rc.module_scope, name_id);
     if (existing != SYMBOL_NIL) {
         report_named(rc, bind_span, "re-exported name `", name_id, "` is already defined in this scope");
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
 
     # a leaf that is itself a module re-export (SYM_USE) keeps its target-module
@@ -1325,68 +1514,80 @@ fun bind_fwd(rc: *ResolveContext, decl_id: id.DeclId, df: *decl.DeclFwd, flags: 
     var slot: u32 = 0;
     if (ps.kind == SYM_USE) { slot = ps.slot; }
 
-    val r_sym: Result[SymbolId, str] = add_symbol(rc, ps.kind, SYM_FLAG_PUB, name_id, ps.decl, slot, ps.origin);
-    if (is_err[SymbolId, str](r_sym)) { ret err[bool, str](unwrap_err[SymbolId, str](r_sym)); }
-    val sid: SymbolId = unwrap_ok[SymbolId, str](r_sym);
+    val r_sym: R.Result[SymbolId, str] = add_symbol(rc, ps.kind, SYM_FLAG_PUB, name_id, ps.decl, slot, ps.origin);
+    if (R.is_err[SymbolId, str](r_sym)) { ret R.err[bool, str](R.unwrap_err[SymbolId, str](r_sym)); }
+    val sid: SymbolId = R.unwrap_ok[SymbolId, str](r_sym);
 
-    val r_add: Result[bool, str] = scope_add(rc, rc.module_scope, name_id, sid);
-    if (is_err[bool, str](r_add)) { ret r_add; }
+    val r_add: R.Result[bool, str] = scope_add(rc, rc.module_scope, name_id, sid);
+    if (R.is_err[bool, str](r_add)) { ret r_add; }
     if (rc.decl_symbol != nil) {
         rc.decl_symbol[decl_id] = sid;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
 # re-exports module `mid` as a public module alias under a `fwd`'s alias (or the
 # path's leaf segment when none is written). a SYM_USE bound at module scope whose
 # slot names the target module, but carrying SYM_FLAG_PUB so it joins this
-# module's pub surface — the public counterpart of `collect_use`'s module branch.
-fun bind_fwd_module(rc: *ResolveContext, decl_id: id.DeclId, df: *decl.DeclFwd, mid: sess.ModuleId) Result[bool, str] {
+# module's pub surface - the public counterpart of `collect_use`'s module branch.
+# ---
+# rc:      resolver state for the module being resolved
+# decl_id: the fwd decl
+# df:      the fwd payload
+# mid:     module id to re-export
+# ret:     ok(true), or an allocation error
+fun bind_fwd_module(rc: *ResolveContext, decl_id: id.DeclId, df: *decl.DeclFwd, mid: session.ModuleId) R.Result[bool, str] {
     var alias_span: token.Span = df.alias;
     if (alias_span.len == 0) {
         alias_span = leaf_span(rc, df.path);
     }
 
-    val r_name: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, alias_span);
-    if (is_err[intern.StrId, str](r_name)) {
-        ret err[bool, str](unwrap_err[intern.StrId, str](r_name));
+    val r_name: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, alias_span);
+    if (R.is_err[intern.StrId, str](r_name)) {
+        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](r_name));
     }
-    val name_id: intern.StrId = unwrap_ok[intern.StrId, str](r_name);
+    val name_id: intern.StrId = R.unwrap_ok[intern.StrId, str](r_name);
 
     val existing: SymbolId = scope_lookup_local(rc, rc.module_scope, name_id);
     if (existing != SYMBOL_NIL) {
         report_named(rc, alias_span, "re-exported name `", name_id, "` is already defined in this scope");
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
 
-    val r: Result[SymbolId, str] = declare(rc, SYM_USE, SYM_FLAG_PUB, alias_span, decl_id, mid::u32, rc.own_module, rc.module_scope);
-    if (is_err[SymbolId, str](r)) { ret err[bool, str](unwrap_err[SymbolId, str](r)); }
+    val r: R.Result[SymbolId, str] = declare(rc, SYM_USE, SYM_FLAG_PUB, alias_span, decl_id, mid::u32, rc.own_module, rc.module_scope);
+    if (R.is_err[SymbolId, str](r)) { ret R.err[bool, str](R.unwrap_err[SymbolId, str](r)); }
     if (rc.decl_symbol != nil) {
-        rc.decl_symbol[decl_id] = unwrap_ok[SymbolId, str](r);
+        rc.decl_symbol[decl_id] = R.unwrap_ok[SymbolId, str](r);
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
 # binds the bodies of a `$if` / `$or` chain. ordinarily only the comptime-active
 # arm is bound (discarded arms never reach name resolution). but a chain gated on
-# a comptime VALUE PARAMETER cannot be selected during resolve — the parameter's
-# value is fixed only per call site, at lowering — so EVERY arm is bound
+# a comptime VALUE PARAMETER cannot be selected during resolve - the parameter's
+# value is fixed only per call site, at lowering - so EVERY arm is bound
 # structurally; arm selection is deferred to per-value monomorphization.
-fun bind_comptime_if(rc: *ResolveContext, branches_start: u32, branches_len: u32, at_decl_scope: bool) Result[bool, str] {
+# ---
+# rc:             resolver state for the module being resolved
+# branches_start: first branch index
+# branches_len:   number of branches
+# at_decl_scope:  whether the chain sits in decl position
+# ret:            ok(true), or a binding or eval error
+fun bind_comptime_if(rc: *ResolveContext, branches_start: u32, branches_len: u32, at_decl_scope: bool) R.Result[bool, str] {
     if (!at_decl_scope && (comptime_if_gated_on_param(rc, branches_start, branches_len)
                         || comptime_if_has_type_comparison(rc, branches_start, branches_len))) {
         var ai: u32 = 0;
         for (ai < branches_len) {
             val arm: *decl.ComptimeBranch = ?rc.a.comptime_branches[branches_start + ai];
             if (arm.cond != id.EXPR_NIL) {
-                val rc_e: Result[bool, str] = bind_expr(rc, arm.cond);
-                if (is_err[bool, str](rc_e)) { ret rc_e; }
+                val rc_e: R.Result[bool, str] = bind_expr(rc, arm.cond);
+                if (R.is_err[bool, str](rc_e)) { ret rc_e; }
             }
-            val rb: Result[bool, str] = bind_stmt_list(rc, arm.body_start, arm.body_len);
-            if (is_err[bool, str](rb)) { ret rb; }
+            val rb: R.Result[bool, str] = bind_stmt_list(rc, arm.body_start, arm.body_len);
+            if (R.is_err[bool, str](rb)) { ret rb; }
             ai = ai + 1;
         }
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
 
     var bi: u32 = 0;
@@ -1399,14 +1600,14 @@ fun bind_comptime_if(rc: *ResolveContext, branches_start: u32, branches_len: u32
         # comptime_branch_active; this check covers exactly the case where the
         # fold SUCCEEDS against the wrong binding.
         if (br.cond != id.EXPR_NIL) {
-            val rce: Result[bool, str] = bind_expr(rc, br.cond);
-            if (is_err[bool, str](rce)) { ret rce; }
-            val rcs: Result[bool, str] = check_gate_shadowing(rc, br.cond);
-            if (is_err[bool, str](rcs)) { ret rcs; }
+            val rce: R.Result[bool, str] = bind_expr(rc, br.cond);
+            if (R.is_err[bool, str](rce)) { ret rce; }
+            val rcs: R.Result[bool, str] = check_gate_shadowing(rc, br.cond);
+            if (R.is_err[bool, str](rcs)) { ret rcs; }
         }
-        val take_r: Result[bool, str] = comptime_branch_active(rc, br);
-        if (is_err[bool, str](take_r)) { ret take_r; }
-        if (unwrap_ok[bool, str](take_r)) {
+        val take_r: R.Result[bool, str] = comptime_branch_active(rc, br);
+        if (R.is_err[bool, str](take_r)) { ret take_r; }
+        if (R.unwrap_ok[bool, str](take_r)) {
             if (at_decl_scope) {
                 ret bind_decl_list(rc, br.body_start, br.body_len);
             }
@@ -1414,36 +1615,40 @@ fun bind_comptime_if(rc: *ResolveContext, branches_start: u32, branches_len: u32
         }
         bi = bi + 1;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# check_gate_shadowing: walks a folded (non-param) `$if` gate and rejects any
+# walks a folded (non-param) `$if` gate and rejects any
 # leaf identifier that resolves to a runtime binding whose NAME also names a
 # comptime constant in the env. the comptime fold is name-keyed, so such a gate
 # folds against the constant while the resolver bound the ident to the runtime
-# local / parameter — a silent wrong-arm miscompile. a runtime ident whose name
+# local / parameter - a silent wrong-arm miscompile. a runtime ident whose name
 # is not in the env is left alone: the fold fails on it and
 # comptime_branch_active reports that failure, so reporting here would
 # duplicate it. reports at the offending leaf's span.
-fun check_gate_shadowing(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] {
-    if (eid == id.EXPR_NIL) { ret ok[bool, str](true); }
-    val e_opt: Option[*expr.Expr] = ast.get_expr(rc.a, eid);
-    if (is_none[*expr.Expr](e_opt)) { ret ok[bool, str](true); }
-    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+# ---
+# rc:  resolver state for the module being resolved
+# eid: the gate expression to walk
+# ret: ok(true), or a reported shadowing error
+fun check_gate_shadowing(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str] {
+    if (eid == id.EXPR_NIL) { ret R.ok[bool, str](true); }
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, eid);
+    if (O.is_none[*expr.Expr](e_opt)) { ret R.ok[bool, str](true); }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
 
     if (e.kind == expr.EXPR_KIND_BINARY) {
-        val rl: Result[bool, str] = check_gate_shadowing(rc, e.data.binary.lhs);
-        if (is_err[bool, str](rl)) { ret rl; }
+        val rl: R.Result[bool, str] = check_gate_shadowing(rc, e.data.binary.lhs);
+        if (R.is_err[bool, str](rl)) { ret rl; }
         ret check_gate_shadowing(rc, e.data.binary.rhs);
     }
     if (e.kind == expr.EXPR_KIND_UNARY) {
         ret check_gate_shadowing(rc, e.data.unary.operand);
     }
-    if (e.kind != expr.EXPR_KIND_IDENT) { ret ok[bool, str](true); }
+    if (e.kind != expr.EXPR_KIND_IDENT) { ret R.ok[bool, str](true); }
 
-    if (rc.expr_resolved == nil) { ret ok[bool, str](true); }
+    if (rc.expr_resolved == nil) { ret R.ok[bool, str](true); }
     val sid: SymbolId = rc.expr_resolved[eid];
-    if (sid == SYMBOL_NIL || sid >= rc.sym_len) { ret ok[bool, str](true); }
+    if (sid == SYMBOL_NIL || sid >= rc.sym_len) { ret R.ok[bool, str](true); }
     val sym: *Symbol = ?rc.symbols[sid];
 
     # runtime by resolution identity: a block-local val/var, or a non-`$`
@@ -1455,14 +1660,14 @@ fun check_gate_shadowing(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] 
     if (sym.kind == SYM_PARAM) {
         runtime = (sym.flags & SYM_FLAG_COMPTIME) == 0;
     }
-    if (!runtime) { ret ok[bool, str](true); }
+    if (!runtime) { ret R.ok[bool, str](true); }
 
-    val id_r: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, e.span);
-    if (is_err[intern.StrId, str](id_r)) { ret err[bool, str](unwrap_err[intern.StrId, str](id_r)); }
-    val nc: Option[*comptime.NamedConst] = comptime.lookup(rc.ctx, unwrap_ok[intern.StrId, str](id_r));
-    if (is_none[*comptime.NamedConst](nc)) { ret ok[bool, str](true); }
+    val id_r: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, e.span);
+    if (R.is_err[intern.StrId, str](id_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](id_r)); }
+    val nc: O.Option[*comptime.NamedConst] = comptime.lookup(rc.ctx, R.unwrap_ok[intern.StrId, str](id_r));
+    if (O.is_none[*comptime.NamedConst](nc)) { ret R.ok[bool, str](true); }
 
-    ret diag.error(?rc.s.diags, rc.a.file_id, e.span,
+    ret diagnostic.error(?rc.s.diags, rc.a.file_id, e.span,
         "comptime branch condition references a runtime binding that shadows a comptime constant");
 }
 
@@ -1470,6 +1675,11 @@ fun check_gate_shadowing(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] 
 # parameter in scope. such a gate cannot be folded during resolve (the
 # parameter's value is per-call-site), so the chain's arms are all bound and arm
 # selection deferred to lowering.
+# ---
+# rc:             resolver state for the module being resolved
+# branches_start: first branch index
+# branches_len:   number of branches
+# ret:            true when an arm gate reads a comptime value parameter
 fun comptime_if_gated_on_param(rc: *ResolveContext, branches_start: u32, branches_len: u32) bool {
     var bi: u32 = 0;
     for (bi < branches_len) {
@@ -1484,8 +1694,13 @@ fun comptime_if_gated_on_param(rc: *ResolveContext, branches_start: u32, branche
 
 # reports whether any arm of a `$if` chain is gated on a type comparison
 # (`$type_of(...) == TypeName`, #1472). a type comparison cannot fold before
-# types exist, so — like a comptime-param gate — its chain binds every arm and
+# types exist, so - like a comptime-param gate - its chain binds every arm and
 # defers arm selection to lowering, where the type resolver is installed.
+# ---
+# rc:             resolver state for the module being resolved
+# branches_start: first branch index
+# branches_len:   number of branches
+# ret:            true when an arm gate contains a type comparison
 fun comptime_if_has_type_comparison(rc: *ResolveContext, branches_start: u32, branches_len: u32) bool {
     var bi: u32 = 0;
     for (bi < branches_len) {
@@ -1498,13 +1713,17 @@ fun comptime_if_has_type_comparison(rc: *ResolveContext, branches_start: u32, br
     ret false;
 }
 
-# walks a `$if` gate reporting whether it contains a type comparison — an
-# `==` / `!=` with a `$type_of(...)` operand — at any depth.
+# walks a `$if` gate reporting whether it contains a type comparison - an
+# `==` / `!=` with a `$type_of(...)` operand - at any depth.
+# ---
+# rc:  resolver state for the module being resolved
+# eid: the gate expression to walk
+# ret: true when a type comparison appears at any depth
 fun gate_has_type_comparison(rc: *ResolveContext, eid: id.ExprId) bool {
     if (eid == id.EXPR_NIL) { ret false; }
-    val e_opt: Option[*expr.Expr] = ast.get_expr(rc.a, eid);
-    if (is_none[*expr.Expr](e_opt)) { ret false; }
-    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, eid);
+    if (O.is_none[*expr.Expr](e_opt)) { ret false; }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
     if (e.kind == expr.EXPR_KIND_BINARY) {
         if ((e.data.binary.op == expr.BIN_EQ || e.data.binary.op == expr.BIN_NEQ)
             && (comptime.is_type_comparison(rc.a, rc.source, ?e.data.binary)
@@ -1525,16 +1744,20 @@ fun gate_has_type_comparison(rc: *ResolveContext, eid: id.ExprId) bool {
 # scope chain, to a comptime value parameter (SYM_PARAM with SYM_FLAG_COMPTIME).
 # the lookup is valid here because parameters are already declared in the
 # enclosing param scope before a body's statements are bound.
+# ---
+# rc:  resolver state for the module being resolved
+# eid: the expression to walk
+# ret: true when a leaf resolves to a comptime value parameter
 fun expr_references_comptime_param(rc: *ResolveContext, eid: id.ExprId) bool {
     if (eid == id.EXPR_NIL) { ret false; }
-    val e_opt: Option[*expr.Expr] = ast.get_expr(rc.a, eid);
-    if (is_none[*expr.Expr](e_opt)) { ret false; }
-    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, eid);
+    if (O.is_none[*expr.Expr](e_opt)) { ret false; }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
 
     if (e.kind == expr.EXPR_KIND_IDENT) {
-        val r: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, e.span);
-        if (is_err[intern.StrId, str](r)) { ret false; }
-        val name: intern.StrId = unwrap_ok[intern.StrId, str](r);
+        val r: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, e.span);
+        if (R.is_err[intern.StrId, str](r)) { ret false; }
+        val name: intern.StrId = R.unwrap_ok[intern.StrId, str](r);
         val sid: SymbolId = scope_lookup_chain(rc, rc.current_scope, name);
         if (sid == SYMBOL_NIL) { ret false; }
         val sym: *Symbol = ?rc.symbols[sid];
@@ -1550,100 +1773,131 @@ fun expr_references_comptime_param(rc: *ResolveContext, eid: id.ExprId) bool {
     ret false;
 }
 
-fun bind_fun(rc: *ResolveContext, f: *decl.DeclFun, decl_id: id.DeclId) Result[bool, str] {
-    val r_g: Result[ScopeId, str] = open_scope(rc, rc.current_scope);
-    if (is_err[ScopeId, str](r_g)) { ret err[bool, str](unwrap_err[ScopeId, str](r_g)); }
-    val gen_scope: ScopeId = unwrap_ok[ScopeId, str](r_g);
+# bind a function's generics, parameter types, return type, and body
+#
+# generics and parameters open fresh nested scopes restored on the way out.
+# ---
+# rc:      resolver state for the module being resolved
+# f:       the function decl payload
+# decl_id: the function's DeclId
+# ret:     ok(true), or a binding error
+fun bind_fun(rc: *ResolveContext, f: *decl.DeclFun, decl_id: id.DeclId) R.Result[bool, str] {
+    val r_g: R.Result[ScopeId, str] = open_scope(rc, rc.current_scope);
+    if (R.is_err[ScopeId, str](r_g)) { ret R.err[bool, str](R.unwrap_err[ScopeId, str](r_g)); }
+    val gen_scope: ScopeId = R.unwrap_ok[ScopeId, str](r_g);
     val saved_scope: ScopeId = rc.current_scope;
     rc.current_scope = gen_scope;
 
     var gi: u32 = 0;
     for (gi < f.generics_len) {
         val name: token.Span = rc.a.generic_names[f.generics_start + gi];
-        val r: Result[SymbolId, str] = declare(rc, SYM_GENERIC, 0, name, decl_id, gi, rc.own_module, gen_scope);
-        if (is_err[SymbolId, str](r)) {
+        val r: R.Result[SymbolId, str] = declare(rc, SYM_GENERIC, 0, name, decl_id, gi, rc.own_module, gen_scope);
+        if (R.is_err[SymbolId, str](r)) {
             rc.current_scope = saved_scope;
-            ret err[bool, str](unwrap_err[SymbolId, str](r));
+            ret R.err[bool, str](R.unwrap_err[SymbolId, str](r));
         }
         gi = gi + 1;
     }
 
-    val r_p: Result[ScopeId, str] = open_scope(rc, gen_scope);
-    if (is_err[ScopeId, str](r_p)) {
+    val r_p: R.Result[ScopeId, str] = open_scope(rc, gen_scope);
+    if (R.is_err[ScopeId, str](r_p)) {
         rc.current_scope = saved_scope;
-        ret err[bool, str](unwrap_err[ScopeId, str](r_p));
+        ret R.err[bool, str](R.unwrap_err[ScopeId, str](r_p));
     }
-    val param_scope: ScopeId = unwrap_ok[ScopeId, str](r_p);
+    val param_scope: ScopeId = R.unwrap_ok[ScopeId, str](r_p);
     rc.current_scope = param_scope;
 
     var pi: u32 = 0;
     for (pi < f.params_len) {
         val tn: *decl.TypedName = ?rc.a.typed_names[f.params_start + pi];
-        val rt: Result[bool, str] = bind_type(rc, tn.ty);
-        if (is_err[bool, str](rt)) {
+        val rt: R.Result[bool, str] = bind_type(rc, tn.ty);
+        if (R.is_err[bool, str](rt)) {
             rc.current_scope = saved_scope;
             ret rt;
         }
         val pflags: u8 = param_flags(tn);
-        val r: Result[SymbolId, str] = declare(rc, SYM_PARAM, pflags, tn.name, decl_id, pi, rc.own_module, param_scope);
-        if (is_err[SymbolId, str](r)) {
+        val r: R.Result[SymbolId, str] = declare(rc, SYM_PARAM, pflags, tn.name, decl_id, pi, rc.own_module, param_scope);
+        if (R.is_err[SymbolId, str](r)) {
             rc.current_scope = saved_scope;
-            ret err[bool, str](unwrap_err[SymbolId, str](r));
+            ret R.err[bool, str](R.unwrap_err[SymbolId, str](r));
         }
         pi = pi + 1;
     }
 
     if (f.return_type != id.TYPE_NIL) {
-        val rt: Result[bool, str] = bind_type(rc, f.return_type);
-        if (is_err[bool, str](rt)) {
+        val rt: R.Result[bool, str] = bind_type(rc, f.return_type);
+        if (R.is_err[bool, str](rt)) {
             rc.current_scope = saved_scope;
             ret rt;
         }
     }
 
     if (f.body != id.STMT_NIL) {
-        val rb: Result[bool, str] = bind_stmt(rc, f.body);
-        if (is_err[bool, str](rb)) {
+        val rb: R.Result[bool, str] = bind_stmt(rc, f.body);
+        if (R.is_err[bool, str](rb)) {
             rc.current_scope = saved_scope;
             ret rb;
         }
     }
 
     rc.current_scope = saved_scope;
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
 # maps a parameter's comptime marker to a SYM_PARAM flag bitfield
+# ---
+# tn:  the typed-name (parameter) to inspect
+# ret: the SYM_PARAM flag bitfield
 fun param_flags(tn: *decl.TypedName) u8 {
     if (tn.comptime) { ret SYM_FLAG_COMPTIME; }
     ret 0;
 }
 
-fun bind_rec(rc: *ResolveContext, r: *decl.DeclRec, decl_id: id.DeclId) Result[bool, str] {
+# bind a record declaration's generics and field types
+# ---
+# rc:      resolver state for the module being resolved
+# r:       the record decl payload
+# decl_id: the record's DeclId
+# ret:     ok(true), or a binding error
+fun bind_rec(rc: *ResolveContext, r: *decl.DeclRec, decl_id: id.DeclId) R.Result[bool, str] {
     ret bind_aggregate(rc, r.generics_start, r.generics_len, r.fields_start, r.fields_len, decl_id);
 }
 
-fun bind_uni(rc: *ResolveContext, u: *decl.DeclUni, decl_id: id.DeclId) Result[bool, str] {
+# bind a union declaration's generics and field types
+# ---
+# rc:      resolver state for the module being resolved
+# u:       the union decl payload
+# decl_id: the union's DeclId
+# ret:     ok(true), or a binding error
+fun bind_uni(rc: *ResolveContext, u: *decl.DeclUni, decl_id: id.DeclId) R.Result[bool, str] {
     ret bind_aggregate(rc, u.generics_start, u.generics_len, u.fields_start, u.fields_len, decl_id);
 }
 
 # binds the generic params and field types of a rec/uni declaration. generics
 # are declared in a fresh scope so field types can reference them; the fields
 # themselves are not scope bindings (member access is resolved later by sema).
-fun bind_aggregate(rc: *ResolveContext, generics_start: u32, generics_len: u32, fields_start: u32, fields_len: u32, decl_id: id.DeclId) Result[bool, str] {
-    val r_g: Result[ScopeId, str] = open_scope(rc, rc.current_scope);
-    if (is_err[ScopeId, str](r_g)) { ret err[bool, str](unwrap_err[ScopeId, str](r_g)); }
-    val gen_scope: ScopeId = unwrap_ok[ScopeId, str](r_g);
+# ---
+# rc:             resolver state for the module being resolved
+# generics_start: first generic-name index
+# generics_len:   number of generics
+# fields_start:   first field index
+# fields_len:     number of fields
+# decl_id:        the aggregate's DeclId
+# ret:            ok(true), or a binding error
+fun bind_aggregate(rc: *ResolveContext, generics_start: u32, generics_len: u32, fields_start: u32, fields_len: u32, decl_id: id.DeclId) R.Result[bool, str] {
+    val r_g: R.Result[ScopeId, str] = open_scope(rc, rc.current_scope);
+    if (R.is_err[ScopeId, str](r_g)) { ret R.err[bool, str](R.unwrap_err[ScopeId, str](r_g)); }
+    val gen_scope: ScopeId = R.unwrap_ok[ScopeId, str](r_g);
     val saved_scope: ScopeId = rc.current_scope;
     rc.current_scope = gen_scope;
 
     var gi: u32 = 0;
     for (gi < generics_len) {
         val name: token.Span = rc.a.generic_names[generics_start + gi];
-        val rd: Result[SymbolId, str] = declare(rc, SYM_GENERIC, 0, name, decl_id, gi, rc.own_module, gen_scope);
-        if (is_err[SymbolId, str](rd)) {
+        val rd: R.Result[SymbolId, str] = declare(rc, SYM_GENERIC, 0, name, decl_id, gi, rc.own_module, gen_scope);
+        if (R.is_err[SymbolId, str](rd)) {
             rc.current_scope = saved_scope;
-            ret err[bool, str](unwrap_err[SymbolId, str](rd));
+            ret R.err[bool, str](R.unwrap_err[SymbolId, str](rd));
         }
         gi = gi + 1;
     }
@@ -1651,8 +1905,8 @@ fun bind_aggregate(rc: *ResolveContext, generics_start: u32, generics_len: u32, 
     var fi: u32 = 0;
     for (fi < fields_len) {
         val tn: *decl.TypedName = ?rc.a.typed_names[fields_start + fi];
-        val rt: Result[bool, str] = bind_type(rc, tn.ty);
-        if (is_err[bool, str](rt)) {
+        val rt: R.Result[bool, str] = bind_type(rc, tn.ty);
+        if (R.is_err[bool, str](rt)) {
             rc.current_scope = saved_scope;
             ret rt;
         }
@@ -1660,47 +1914,58 @@ fun bind_aggregate(rc: *ResolveContext, generics_start: u32, generics_len: u32, 
     }
 
     rc.current_scope = saved_scope;
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-fun bind_stmt_list(rc: *ResolveContext, start: u32, len: u32) Result[bool, str] {
+# bind every statement in `[start, start + len)` of the stmt-id pool
+# ---
+# rc:    resolver state for the module being resolved
+# start: first index into the stmt-id pool
+# len:   number of statements
+# ret:   ok(true), or a binding error
+fun bind_stmt_list(rc: *ResolveContext, start: u32, len: u32) R.Result[bool, str] {
     var i: u32 = 0;
     for (i < len) {
         val sid: id.StmtId = rc.a.stmt_ids[start + i];
-        val r: Result[bool, str] = bind_stmt(rc, sid);
-        if (is_err[bool, str](r)) { ret r; }
+        val r: R.Result[bool, str] = bind_stmt(rc, sid);
+        if (R.is_err[bool, str](r)) { ret r; }
         i = i + 1;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-fun bind_stmt(rc: *ResolveContext, sid: id.StmtId) Result[bool, str] {
-    if (sid == id.STMT_NIL) { ret ok[bool, str](true); }
-    val s_opt: Option[*stmt.Stmt] = ast.get_stmt(rc.a, sid);
-    if (is_none[*stmt.Stmt](s_opt)) { ret err[bool, str]("StmtId out of range"); }
-    val s: *stmt.Stmt = unwrap[*stmt.Stmt](s_opt);
+# bind the names referenced by one statement and its substatements
+# ---
+# rc:  resolver state for the module being resolved
+# sid: the statement to bind
+# ret: ok(true), or a binding error
+fun bind_stmt(rc: *ResolveContext, sid: id.StmtId) R.Result[bool, str] {
+    if (sid == id.STMT_NIL) { ret R.ok[bool, str](true); }
+    val s_opt: O.Option[*stmt.Stmt] = ast.get_stmt(rc.a, sid);
+    if (O.is_none[*stmt.Stmt](s_opt)) { ret R.err[bool, str]("StmtId out of range"); }
+    val s: *stmt.Stmt = O.unwrap[*stmt.Stmt](s_opt);
 
     if (s.kind == stmt.STMT_KIND_BLOCK) { ret bind_block(rc, ?s.data.block); }
     if (s.kind == stmt.STMT_KIND_EXPR)  { ret bind_expr(rc, s.data.expr.expr); }
     if (s.kind == stmt.STMT_KIND_RET) {
-        if (s.data.ret_.value == id.EXPR_NIL) { ret ok[bool, str](true); }
+        if (s.data.ret_.value == id.EXPR_NIL) { ret R.ok[bool, str](true); }
         ret bind_expr(rc, s.data.ret_.value);
     }
     if (s.kind == stmt.STMT_KIND_FIN)   { ret bind_stmt(rc, s.data.fin_.body); }
     if (s.kind == stmt.STMT_KIND_BRK || s.kind == stmt.STMT_KIND_CNT) {
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
     if (s.kind == stmt.STMT_KIND_IF) {
-        val rc_e: Result[bool, str] = bind_expr(rc, s.data.if_.cond);
-        if (is_err[bool, str](rc_e)) { ret rc_e; }
-        val rt: Result[bool, str] = bind_stmt(rc, s.data.if_.then_block);
-        if (is_err[bool, str](rt)) { ret rt; }
+        val rc_e: R.Result[bool, str] = bind_expr(rc, s.data.if_.cond);
+        if (R.is_err[bool, str](rc_e)) { ret rc_e; }
+        val rt: R.Result[bool, str] = bind_stmt(rc, s.data.if_.then_block);
+        if (R.is_err[bool, str](rt)) { ret rt; }
         ret bind_stmt(rc, s.data.if_.else_block);
     }
     if (s.kind == stmt.STMT_KIND_FOR) {
         if (s.data.for_.cond != id.EXPR_NIL) {
-            val rc_e: Result[bool, str] = bind_expr(rc, s.data.for_.cond);
-            if (is_err[bool, str](rc_e)) { ret rc_e; }
+            val rc_e: R.Result[bool, str] = bind_expr(rc, s.data.for_.cond);
+            if (R.is_err[bool, str](rc_e)) { ret rc_e; }
         }
         ret bind_stmt(rc, s.data.for_.body);
     }
@@ -1708,7 +1973,7 @@ fun bind_stmt(rc: *ResolveContext, sid: id.StmtId) Result[bool, str] {
         ret bind_local_decl(rc, s.data.decl.decl);
     }
     if (s.kind == stmt.STMT_KIND_ASM) {
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
     if (s.kind == stmt.STMT_KIND_COMPTIME_IF) {
         ret bind_comptime_if(rc, s.data.comptime_if.branches_start, s.data.comptime_if.branches_len, false);
@@ -1719,48 +1984,57 @@ fun bind_stmt(rc: *ResolveContext, sid: id.StmtId) Result[bool, str] {
     if (s.kind == stmt.STMT_KIND_COMPTIME_ATTR) {
         # a bare comptime directive (`$error(...)`) binds nothing; its evaluation
         # is handled out of band at sema.
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
 # binds a `$each <ident> in <seq> { body }` (#1473): the sequence's `$fields(T)`
 # binds T as a type; the loop variable is declared in a fresh scope as a comptime
 # binding visible to the body, which is then bound. arm selection / expansion is
 # deferred to sema + lowering.
-fun bind_comptime_each(rc: *ResolveContext, ce: *stmt.StmtComptimeEach) Result[bool, str] {
+# ---
+# rc:  resolver state for the module being resolved
+# ce:  the `$each` statement payload
+# ret: ok(true), or a binding error
+fun bind_comptime_each(rc: *ResolveContext, ce: *stmt.StmtComptimeEach) R.Result[bool, str] {
     if (comptime.is_fields_call(rc.a, rc.source, ce.seq)) {
         val targ: id.ExprId = comptime.fields_type_arg(rc.a, ce.seq);
         if (targ != id.EXPR_NIL) {
-            val rt: Result[bool, str] = bind_intrinsic_type_arg(rc, targ);
-            if (is_err[bool, str](rt)) { ret rt; }
+            val rt: R.Result[bool, str] = bind_intrinsic_type_arg(rc, targ);
+            if (R.is_err[bool, str](rt)) { ret rt; }
         }
     }
     or {
-        val rs: Result[bool, str] = bind_expr(rc, ce.seq);
-        if (is_err[bool, str](rs)) { ret rs; }
+        val rs: R.Result[bool, str] = bind_expr(rc, ce.seq);
+        if (R.is_err[bool, str](rs)) { ret rs; }
     }
 
-    val r_s: Result[ScopeId, str] = open_scope(rc, rc.current_scope);
-    if (is_err[ScopeId, str](r_s)) { ret err[bool, str](unwrap_err[ScopeId, str](r_s)); }
+    val r_s: R.Result[ScopeId, str] = open_scope(rc, rc.current_scope);
+    if (R.is_err[ScopeId, str](r_s)) { ret R.err[bool, str](R.unwrap_err[ScopeId, str](r_s)); }
     val saved: ScopeId = rc.current_scope;
-    rc.current_scope = unwrap_ok[ScopeId, str](r_s);
+    rc.current_scope = R.unwrap_ok[ScopeId, str](r_s);
 
-    val rd: Result[SymbolId, str] = declare(rc, SYM_VAL, SYM_FLAG_COMPTIME, ce.var_name, id.DECL_NIL, 0, rc.own_module, rc.current_scope);
-    if (is_err[SymbolId, str](rd)) { rc.current_scope = saved; ret err[bool, str](unwrap_err[SymbolId, str](rd)); }
+    val rd: R.Result[SymbolId, str] = declare(rc, SYM_VAL, SYM_FLAG_COMPTIME, ce.var_name, id.DECL_NIL, 0, rc.own_module, rc.current_scope);
+    if (R.is_err[SymbolId, str](rd)) { rc.current_scope = saved; ret R.err[bool, str](R.unwrap_err[SymbolId, str](rd)); }
 
-    val rb: Result[bool, str] = bind_stmt_list(rc, ce.body_start, ce.body_len);
+    val rb: R.Result[bool, str] = bind_stmt_list(rc, ce.body_start, ce.body_len);
     rc.current_scope = saved;
     ret rb;
 }
 
-fun bind_block(rc: *ResolveContext, b: *stmt.StmtBlock) Result[bool, str] {
-    val r_s: Result[ScopeId, str] = open_scope(rc, rc.current_scope);
-    if (is_err[ScopeId, str](r_s)) { ret err[bool, str](unwrap_err[ScopeId, str](r_s)); }
+# bind a block's statements in a fresh child scope
+# ---
+# rc:  resolver state for the module being resolved
+# b:   the block payload
+# ret: ok(true), or a binding error
+fun bind_block(rc: *ResolveContext, b: *stmt.StmtBlock) R.Result[bool, str] {
+    val r_s: R.Result[ScopeId, str] = open_scope(rc, rc.current_scope);
+    if (R.is_err[ScopeId, str](r_s)) { ret R.err[bool, str](R.unwrap_err[ScopeId, str](r_s)); }
     val saved: ScopeId = rc.current_scope;
-    rc.current_scope = unwrap_ok[ScopeId, str](r_s);
+    rc.current_scope = R.unwrap_ok[ScopeId, str](r_s);
 
-    val r: Result[bool, str] = bind_stmt_list(rc, b.stmts_start, b.stmts_len);
+    val r: R.Result[bool, str] = bind_stmt_list(rc, b.stmts_start, b.stmts_len);
     rc.current_scope = saved;
     ret r;
 }
@@ -1768,32 +2042,36 @@ fun bind_block(rc: *ResolveContext, b: *stmt.StmtBlock) Result[bool, str] {
 # locals (val/var inside a block) introduce sequentially visible bindings:
 # the type and initializer are bound first against the existing scope, then
 # the new symbol is added so subsequent statements can see it.
-fun bind_local_decl(rc: *ResolveContext, decl_id: id.DeclId) Result[bool, str] {
-    if (decl_id == id.DECL_NIL) { ret ok[bool, str](true); }
-    val d_opt: Option[*decl.Decl] = ast.get_decl(rc.a, decl_id);
-    if (is_none[*decl.Decl](d_opt)) { ret err[bool, str]("DeclId out of range"); }
-    val d: *decl.Decl = unwrap[*decl.Decl](d_opt);
+# ---
+# rc:      resolver state for the module being resolved
+# decl_id: the local val/var decl
+# ret:     ok(true), or an allocation error
+fun bind_local_decl(rc: *ResolveContext, decl_id: id.DeclId) R.Result[bool, str] {
+    if (decl_id == id.DECL_NIL) { ret R.ok[bool, str](true); }
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(rc.a, decl_id);
+    if (O.is_none[*decl.Decl](d_opt)) { ret R.err[bool, str]("DeclId out of range"); }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
 
     if (d.kind != decl.DECL_KIND_VAL && d.kind != decl.DECL_KIND_VAR) {
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
 
     if (d.data.bind.ty != id.TYPE_NIL) {
-        val rt: Result[bool, str] = bind_type(rc, d.data.bind.ty);
-        if (is_err[bool, str](rt)) { ret rt; }
+        val rt: R.Result[bool, str] = bind_type(rc, d.data.bind.ty);
+        if (R.is_err[bool, str](rt)) { ret rt; }
     }
     if (d.data.bind.init != id.EXPR_NIL) {
-        val re: Result[bool, str] = bind_expr(rc, d.data.bind.init);
-        if (is_err[bool, str](re)) { ret re; }
+        val re: R.Result[bool, str] = bind_expr(rc, d.data.bind.init);
+        if (R.is_err[bool, str](re)) { ret re; }
     }
 
     val kind: SymKind = if_val_kind(d.kind == decl.DECL_KIND_VAL);
-    val r_sym: Result[SymbolId, str] = declare(rc, kind, 0, d.data.bind.name, decl_id, 0, rc.own_module, rc.current_scope);
-    if (is_err[SymbolId, str](r_sym)) {
-        ret err[bool, str](unwrap_err[SymbolId, str](r_sym));
+    val r_sym: R.Result[SymbolId, str] = declare(rc, kind, 0, d.data.bind.name, decl_id, 0, rc.own_module, rc.current_scope);
+    if (R.is_err[SymbolId, str](r_sym)) {
+        ret R.err[bool, str](R.unwrap_err[SymbolId, str](r_sym));
     }
     if (rc.decl_symbol != nil) {
-        rc.decl_symbol[decl_id] = unwrap_ok[SymbolId, str](r_sym);
+        rc.decl_symbol[decl_id] = R.unwrap_ok[SymbolId, str](r_sym);
     }
 
     # a block-local comptime val is deliberately NOT bound into the comptime ctx:
@@ -1803,19 +2081,28 @@ fun bind_local_decl(rc: *ResolveContext, decl_id: id.DeclId) Result[bool, str] {
     # const in a later function (the #1143 leak). its lexical scope above still
     # makes runtime uses of the local resolve.
 
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
+# SYM_VAL when `is_val`, otherwise SYM_VAR
+# ---
+# is_val: whether the local is a `val`
+# ret:    the matching SymKind
 fun if_val_kind(is_val: bool) SymKind {
     if (is_val) { ret SYM_VAL; }
     ret SYM_VAR;
 }
 
-fun bind_expr(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] {
-    if (eid == id.EXPR_NIL) { ret ok[bool, str](true); }
-    val e_opt: Option[*expr.Expr] = ast.get_expr(rc.a, eid);
-    if (is_none[*expr.Expr](e_opt)) { ret err[bool, str]("ExprId out of range"); }
-    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+# bind the names referenced by one expression and its subexpressions
+# ---
+# rc:  resolver state for the module being resolved
+# eid: the expression to bind
+# ret: ok(true), or a binding error
+fun bind_expr(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str] {
+    if (eid == id.EXPR_NIL) { ret R.ok[bool, str](true); }
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, eid);
+    if (O.is_none[*expr.Expr](e_opt)) { ret R.err[bool, str]("ExprId out of range"); }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
 
     if (e.kind == expr.EXPR_KIND_IDENT) {
         ret bind_ident(rc, eid, e.span);
@@ -1831,8 +2118,8 @@ fun bind_expr(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] {
              || is_field_type_operand(rc, e.data.binary.rhs))) {
             ret bind_type_comparison(rc, ?e.data.binary);
         }
-        val rl: Result[bool, str] = bind_expr(rc, e.data.binary.lhs);
-        if (is_err[bool, str](rl)) { ret rl; }
+        val rl: R.Result[bool, str] = bind_expr(rc, e.data.binary.lhs);
+        if (R.is_err[bool, str](rl)) { ret rl; }
         ret bind_expr(rc, e.data.binary.rhs);
     }
     if (e.kind == expr.EXPR_KIND_UNARY) {
@@ -1854,77 +2141,87 @@ fun bind_expr(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] {
         # a comptime value intrinsic (`$size_of`/`$align_of`/`$offset_of`) takes
         # a type-naming first argument (and, for `$offset_of`, a bare field name)
         # rather than value expressions, so it binds its arguments specially.
-        val intr: Option[Result[bool, str]] = bind_comptime_intrinsic_call(rc, ?e.data.call);
-        if (is_some[Result[bool, str]](intr)) { ret unwrap[Result[bool, str]](intr); }
+        val intr: O.Option[R.Result[bool, str]] = bind_comptime_intrinsic_call(rc, ?e.data.call);
+        if (O.is_some[R.Result[bool, str]](intr)) { ret O.unwrap[R.Result[bool, str]](intr); }
 
-        val rc_e: Result[bool, str] = bind_expr(rc, e.data.call.callee);
-        if (is_err[bool, str](rc_e)) { ret rc_e; }
+        val rc_e: R.Result[bool, str] = bind_expr(rc, e.data.call.callee);
+        if (R.is_err[bool, str](rc_e)) { ret rc_e; }
         ret bind_generic_call(rc, e.data.call.type_args_start, e.data.call.type_args_len, e.data.call.args_start, e.data.call.args_len);
     }
     if (e.kind == expr.EXPR_KIND_INDEX) {
-        val ro: Result[bool, str] = bind_expr(rc, e.data.index.object);
-        if (is_err[bool, str](ro)) { ret ro; }
+        val ro: R.Result[bool, str] = bind_expr(rc, e.data.index.object);
+        if (R.is_err[bool, str](ro)) { ret ro; }
         ret bind_expr(rc, e.data.index.index);
     }
     if (e.kind == expr.EXPR_KIND_PROJECT) {
         # `v.[f]`: bind the instance, then the field descriptor (the `$each` loop
         # variable, resolved against the enclosing `$each` scope).
-        val ro: Result[bool, str] = bind_expr(rc, e.data.project.object);
-        if (is_err[bool, str](ro)) { ret ro; }
+        val ro: R.Result[bool, str] = bind_expr(rc, e.data.project.object);
+        if (R.is_err[bool, str](ro)) { ret ro; }
         ret bind_expr(rc, e.data.project.field);
     }
     if (e.kind == expr.EXPR_KIND_MEMBER) {
-        val ro: Result[bool, str] = bind_expr(rc, e.data.member.object);
-        if (is_err[bool, str](ro)) { ret ro; }
+        val ro: R.Result[bool, str] = bind_expr(rc, e.data.member.object);
+        if (R.is_err[bool, str](ro)) { ret ro; }
         ret bind_member_qualified(rc, eid, ?e.data.member);
     }
     if (e.kind == expr.EXPR_KIND_CAST) {
-        val rv: Result[bool, str] = bind_expr(rc, e.data.cast.value);
-        if (is_err[bool, str](rv)) { ret rv; }
+        val rv: R.Result[bool, str] = bind_expr(rc, e.data.cast.value);
+        if (R.is_err[bool, str](rv)) { ret rv; }
         ret bind_type(rc, e.data.cast.ty);
     }
     if (e.kind == expr.EXPR_KIND_ARRAY_LIT) {
-        val rt: Result[bool, str] = bind_type(rc, e.data.array_lit.ty);
-        if (is_err[bool, str](rt)) { ret rt; }
+        val rt: R.Result[bool, str] = bind_type(rc, e.data.array_lit.ty);
+        if (R.is_err[bool, str](rt)) { ret rt; }
         ret bind_expr_list(rc, e.data.array_lit.elems_start, e.data.array_lit.elems_len);
     }
     if (e.kind == expr.EXPR_KIND_STRUCT_LIT) {
-        val rt: Result[bool, str] = bind_type(rc, e.data.struct_lit.ty);
-        if (is_err[bool, str](rt)) { ret rt; }
+        val rt: R.Result[bool, str] = bind_type(rc, e.data.struct_lit.ty);
+        if (R.is_err[bool, str](rt)) { ret rt; }
         var fi: u32 = 0;
         for (fi < e.data.struct_lit.fields_len) {
             val finit: *expr.FieldInit = ?rc.a.field_inits[e.data.struct_lit.fields_start + fi];
-            val rf: Result[bool, str] = bind_expr(rc, finit.value);
-            if (is_err[bool, str](rf)) { ret rf; }
+            val rf: R.Result[bool, str] = bind_expr(rc, finit.value);
+            if (R.is_err[bool, str](rf)) { ret rf; }
             fi = fi + 1;
         }
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-fun bind_expr_list(rc: *ResolveContext, start: u32, len: u32) Result[bool, str] {
+# bind every expression in `[start, start + len)` of the expr-id pool
+# ---
+# rc:    resolver state for the module being resolved
+# start: first index into the expr-id pool
+# len:   number of expressions
+# ret:   ok(true), or a binding error
+fun bind_expr_list(rc: *ResolveContext, start: u32, len: u32) R.Result[bool, str] {
     var i: u32 = 0;
     for (i < len) {
         val eid: id.ExprId = rc.a.expr_ids[start + i];
-        val r: Result[bool, str] = bind_expr(rc, eid);
-        if (is_err[bool, str](r)) { ret r; }
+        val r: R.Result[bool, str] = bind_expr(rc, eid);
+        if (R.is_err[bool, str](r)) { ret r; }
         i = i + 1;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
 # resolves a provisional bracket call `callee[x](args)` (ExprCall.index_callee
 # set) that the parser could not classify: `[x]` read as both a type-argument
-# list and an index expression. the choice is the callee's resolved kind — a
+# list and an index expression. the choice is the callee's resolved kind - a
 # function, type, or imported name takes the type arguments (a generic call); a
 # value, or any non-name callee, makes `[x]` an index (index-then-call). the
 # node is canonicalized to the chosen shape (index_callee cleared) and its parts
 # bound exactly once, so sema sees an ordinary generic call or index-then-call.
-fun resolve_bracket_call(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] {
-    val e_opt: Option[*expr.Expr] = ast.get_expr(rc.a, eid);
-    if (is_none[*expr.Expr](e_opt)) { ret err[bool, str]("ExprId out of range"); }
-    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+# ---
+# rc:  resolver state for the module being resolved
+# eid: the provisional bracket-call expression
+# ret: ok(true), or a binding error
+fun resolve_bracket_call(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str] {
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, eid);
+    if (O.is_none[*expr.Expr](e_opt)) { ret R.err[bool, str]("ExprId out of range"); }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
 
     val callee:          id.ExprId = e.data.call.callee;
     val index_callee:    id.ExprId = e.data.call.index_callee;
@@ -1936,12 +2233,12 @@ fun resolve_bracket_call(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] 
     # bind the callee once and read its kind: a function, type, or imported name
     # takes the type arguments; anything else (a value, an index/call result, or
     # an unresolved name) makes the bracket an index.
-    val rc_e: Result[bool, str] = bind_expr(rc, callee);
-    if (is_err[bool, str](rc_e)) { ret rc_e; }
+    val rc_e: R.Result[bool, str] = bind_expr(rc, callee);
+    if (R.is_err[bool, str](rc_e)) { ret rc_e; }
 
     if (callee_accepts_type_args(rc, callee)) {
         # generic call: drop the index reading and bind the type arguments.
-        # `e` stays valid — resolve binding never appends to ast.exprs.
+        # `e` stays valid - resolve binding never appends to ast.exprs.
         e.data.call.index_callee = id.EXPR_NIL;
         ret bind_generic_call(rc, type_args_start, type_args_len, args_start, args_len);
     }
@@ -1949,11 +2246,11 @@ fun resolve_bracket_call(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] 
     # index-then-call: the effective callee is the pre-built `INDEX(callee, x)`,
     # whose object (the now-bound callee) needs no rebinding. bind the subscript,
     # then canonicalize the call onto the index.
-    val idx_opt: Option[*expr.Expr] = ast.get_expr(rc.a, index_callee);
-    if (is_none[*expr.Expr](idx_opt)) { ret err[bool, str]("ExprId out of range"); }
-    val idxn: *expr.Expr = unwrap[*expr.Expr](idx_opt);
-    val rs: Result[bool, str] = bind_expr(rc, idxn.data.index.index);
-    if (is_err[bool, str](rs)) { ret rs; }
+    val idx_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, index_callee);
+    if (O.is_none[*expr.Expr](idx_opt)) { ret R.err[bool, str]("ExprId out of range"); }
+    val idxn: *expr.Expr = O.unwrap[*expr.Expr](idx_opt);
+    val rs: R.Result[bool, str] = bind_expr(rc, idxn.data.index.index);
+    if (R.is_err[bool, str](rs)) { ret rs; }
 
     e.data.call.callee          = index_callee;
     e.data.call.index_callee    = id.EXPR_NIL;
@@ -1962,15 +2259,22 @@ fun resolve_bracket_call(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] 
     ret bind_expr_list(rc, args_start, args_len);
 }
 
-# binds a generic call's type arguments and value arguments — the tail shared by
+# binds a generic call's type arguments and value arguments - the tail shared by
 # the ordinary call path and a provisional bracket call resolved to a generic
 # call.
-fun bind_generic_call(rc: *ResolveContext, type_args_start: u32, type_args_len: u32, args_start: u32, args_len: u32) Result[bool, str] {
+# ---
+# rc:              resolver state for the module being resolved
+# type_args_start: first type-argument index
+# type_args_len:   number of type arguments
+# args_start:      first value-argument index
+# args_len:        number of value arguments
+# ret:             ok(true), or a binding error
+fun bind_generic_call(rc: *ResolveContext, type_args_start: u32, type_args_len: u32, args_start: u32, args_len: u32) R.Result[bool, str] {
     var ti: u32 = 0;
     for (ti < type_args_len) {
         val arg_id: id.TypeId = rc.a.type_ids[type_args_start + ti];
-        val rt: Result[bool, str] = bind_type(rc, arg_id);
-        if (is_err[bool, str](rt)) { ret rt; }
+        val rt: R.Result[bool, str] = bind_type(rc, arg_id);
+        if (R.is_err[bool, str](rt)) { ret rt; }
         ti = ti + 1;
     }
     ret bind_expr_list(rc, args_start, args_len);
@@ -1978,16 +2282,20 @@ fun bind_generic_call(rc: *ResolveContext, type_args_start: u32, type_args_len: 
 
 # true when a provisional bracket call's callee resolves to a name that can take
 # generic type arguments (a function, type, or imported symbol). a value callee
-# — or a non-name callee such as an index or call result — means the bracket was
+# - or a non-name callee such as an index or call result - means the bracket was
 # an index. an unresolved name returns false so the index reading is taken and
 # the single unresolved diagnostic from binding the callee is not compounded by
 # spurious type-argument errors.
+# ---
+# rc:     resolver state for the module being resolved
+# callee: the resolved callee expression
+# ret:    true when the callee can take generic type arguments
 fun callee_accepts_type_args(rc: *ResolveContext, callee: id.ExprId) bool {
-    val e_opt: Option[*expr.Expr] = ast.get_expr(rc.a, callee);
-    if (is_none[*expr.Expr](e_opt)) { ret false; }
-    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, callee);
+    if (O.is_none[*expr.Expr](e_opt)) { ret false; }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
     if (e.kind != expr.EXPR_KIND_IDENT && e.kind != expr.EXPR_KIND_MEMBER) { ret false; }
-    if (rc.expr_resolved == nil) { ret false; }
+    if (rc.expr_resolved == nil)                                           { ret false; }
     val sid: SymbolId = rc.expr_resolved[callee];
     if (sid == SYMBOL_NIL || sid >= rc.sym_len) { ret false; }
     val sym: *Symbol = ?rc.symbols[sid];
@@ -1996,33 +2304,42 @@ fun callee_accepts_type_args(rc: *ResolveContext, callee: id.ExprId) bool {
      || sym.kind == SYM_IMPORTED;
 }
 
-fun bind_ident(rc: *ResolveContext, eid: id.ExprId, span: token.Span) Result[bool, str] {
-    val r: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, span);
-    if (is_err[intern.StrId, str](r)) {
-        ret err[bool, str](unwrap_err[intern.StrId, str](r));
+# resolve an identifier against the scope chain, reporting an unresolved name
+# ---
+# rc:   resolver state for the module being resolved
+# eid:  the identifier expression
+# span: the identifier's source span
+# ret:  ok(true) (an unresolved name is reported, not failed), or an allocation error
+fun bind_ident(rc: *ResolveContext, eid: id.ExprId, span: token.Span) R.Result[bool, str] {
+    val r: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, span);
+    if (R.is_err[intern.StrId, str](r)) {
+        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](r));
     }
-    val name: intern.StrId = unwrap_ok[intern.StrId, str](r);
+    val name: intern.StrId = R.unwrap_ok[intern.StrId, str](r);
     val sid: SymbolId = scope_lookup_chain(rc, rc.current_scope, name);
     if (sid == SYMBOL_NIL) {
-        val re: Result[bool, str] = report_named(rc, span, "unresolved identifier `", name, "`");
-        if (is_ok[bool, str](re)) { attach_suggestion(rc, name); }
+        val re: R.Result[bool, str] = report_named(rc, span, "unresolved identifier `", name, "`");
+        if (R.is_ok[bool, str](re)) { attach_suggestion(rc, name); }
     }
     or {
         if (rc.expr_resolved != nil) { rc.expr_resolved[eid] = sid; }
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# attach_suggestion: scan the visible scope chain for the in-scope name
+# scan the visible scope chain for the in-scope name
 # closest to the unresolved `target` and, when one is near enough, attach a
 # `did you mean `<name>`?` note to the just-reported diagnostic. names within
 # edit distance MAX_SUGGEST_DISTANCE (and no further than half the target's
 # length) qualify; the nearest qualifying name wins. a no-op when nothing is
 # close enough.
+# ---
+# rc:     resolver state for the module being resolved
+# target: the unresolved name
 fun attach_suggestion(rc: *ResolveContext, target: intern.StrId) {
-    val to: Option[str] = intern.lookup(?rc.s.interner, target);
-    if (is_none[str](to)) { ret; }
-    val tname: str = unwrap[str](to);
+    val to: O.Option[str] = intern.lookup(?rc.s.interner, target);
+    if (O.is_none[str](to)) { ret; }
+    val tname: str = O.unwrap[str](to);
     val tlen: usize = str_len(tname);
     if (tlen == 0) { ret; }
 
@@ -2038,9 +2355,9 @@ fun attach_suggestion(rc: *ResolveContext, target: intern.StrId) {
         for (i < sc.len) {
             val cname_id: intern.StrId = sc.entries[i].name;
             if (cname_id != target) {
-                val co: Option[str] = intern.lookup(?rc.s.interner, cname_id);
-                if (is_some[str](co)) {
-                    val cname: str = unwrap[str](co);
+                val co: O.Option[str] = intern.lookup(?rc.s.interner, cname_id);
+                if (O.is_some[str](co)) {
+                    val cname: str = O.unwrap[str](co);
                     val dist: usize = edit_distance(tname, cname, best_dist);
                     if (dist <= max_dist && dist < best_dist) {
                         best_dist = dist;
@@ -2054,61 +2371,77 @@ fun attach_suggestion(rc: *ResolveContext, target: intern.StrId) {
     }
 
     if (best_sym == SYMBOL_NIL) { ret; }
-    val bo: Option[str] = intern.lookup(?rc.s.interner, rc.symbols[best_sym].name);
-    if (is_none[str](bo)) { ret; }
-    val bname: str = unwrap[str](bo);
+    val bo: O.Option[str] = intern.lookup(?rc.s.interner, rc.symbols[best_sym].name);
+    if (O.is_none[str](bo)) { ret; }
+    val bname: str = O.unwrap[str](bo);
 
-    val note: str = diag.build_suggestion(rc.s.alloc, bname);
+    val note: str = diagnostic.build_suggestion(rc.s.alloc, bname);
     if (note == nil) { ret; }
-    diag.attach_note(?rc.s.diags, note);
+    diagnostic.attach_note(?rc.s.diags, note);
     str_free(rc.s.alloc, note);
 }
 
-# report_named: emit an error at `span` whose message embeds the interned name
+# emit an error at `span` whose message embeds the interned name
 # `name_id` between `prefix` and `suffix`, e.g. `unresolved identifier `<name>``.
 # returns the sink's append result so a caller can gate an attached note on the
 # error actually landing. on any allocation failure the message degrades to the
 # static `prefix` text alone so the diagnostic is always reported.
-fun report_named(rc: *ResolveContext, span: token.Span, prefix: str, name_id: intern.StrId, suffix: str) Result[bool, str] {
-    val no: Option[str] = intern.lookup(?rc.s.interner, name_id);
-    if (is_none[str](no)) {
-        ret diag.error(?rc.s.diags, rc.a.file_id, span, prefix);
+# ---
+# rc:      resolver state for the module being resolved
+# span:    span to report at
+# prefix:  text before the name
+# name_id: interned name to embed
+# suffix:  text after the name
+# ret:     the diagnostic sink's append result
+fun report_named(rc: *ResolveContext, span: token.Span, prefix: str, name_id: intern.StrId, suffix: str) R.Result[bool, str] {
+    val no: O.Option[str] = intern.lookup(?rc.s.interner, name_id);
+    if (O.is_none[str](no)) {
+        ret diagnostic.error(?rc.s.diags, rc.a.file_id, span, prefix);
     }
-    val name: str = unwrap[str](no);
+    val name: str = O.unwrap[str](no);
 
     val pn: usize = str_len(prefix);
     val nn: usize = str_len(name);
     val sn: usize = str_len(suffix);
     val total: usize = pn + nn + sn;
 
-    val r: Result[*char, str] = allocate[char](rc.s.alloc, total + 1);
-    if (is_err[*char, str](r)) {
-        ret diag.error(?rc.s.diags, rc.a.file_id, span, prefix);
+    val r: R.Result[*char, str] = A.allocate[char](rc.s.alloc, total + 1);
+    if (R.is_err[*char, str](r)) {
+        ret diagnostic.error(?rc.s.diags, rc.a.file_id, span, prefix);
     }
-    val buf: str = unwrap_ok[*char, str](r);
+    val buf: str = R.unwrap_ok[*char, str](r);
 
-    mem.raw_copy(buf::ptr, prefix::ptr, pn);
-    mem.raw_copy((buf::usize + pn)::ptr, name::ptr, nn);
-    mem.raw_copy((buf::usize + pn + nn)::ptr, suffix::ptr, sn);
+    memory.raw_copy(buf::ptr, prefix::ptr, pn);
+    memory.raw_copy((buf::usize + pn)::ptr, name::ptr, nn);
+    memory.raw_copy((buf::usize + pn + nn)::ptr, suffix::ptr, sn);
     buf[total] = 0;
 
-    val emit: Result[bool, str] = diag.error(?rc.s.diags, rc.a.file_id, span, buf);
-    deallocate[char](rc.s.alloc, buf, total + 1);
+    val emit: R.Result[bool, str] = diagnostic.error(?rc.s.diags, rc.a.file_id, span, buf);
+    A.deallocate[char](rc.s.alloc, buf, total + 1);
     ret emit;
 }
 
-# report_named2: emit an error at `span` interpolating two interned names into
+# emit an error at `span` interpolating two interned names into
 # `<prefix><a><mid><b><suffix>`, e.g. ``no symbol `x` exported by `mod` ``. like
 # report_named it degrades to the static `prefix` on any lookup or allocation
 # failure so the diagnostic always lands.
-fun report_named2(rc: *ResolveContext, span: token.Span, prefix: str, a_id: intern.StrId, mid: str, b_id: intern.StrId, suffix: str) Result[bool, str] {
-    val ao: Option[str] = intern.lookup(?rc.s.interner, a_id);
-    val bo: Option[str] = intern.lookup(?rc.s.interner, b_id);
-    if (is_none[str](ao) || is_none[str](bo)) {
-        ret diag.error(?rc.s.diags, rc.a.file_id, span, prefix);
+# ---
+# rc:     resolver state for the module being resolved
+# span:   span to report at
+# prefix: text before the first name
+# a_id:   first interned name
+# mid:    text between the names
+# b_id:   second interned name
+# suffix: text after the second name
+# ret:    the diagnostic sink's append result
+fun report_named2(rc: *ResolveContext, span: token.Span, prefix: str, a_id: intern.StrId, mid: str, b_id: intern.StrId, suffix: str) R.Result[bool, str] {
+    val ao: O.Option[str] = intern.lookup(?rc.s.interner, a_id);
+    val bo: O.Option[str] = intern.lookup(?rc.s.interner, b_id);
+    if (O.is_none[str](ao) || O.is_none[str](bo)) {
+        ret diagnostic.error(?rc.s.diags, rc.a.file_id, span, prefix);
     }
-    val a: str = unwrap[str](ao);
-    val b: str = unwrap[str](bo);
+    val a: str = O.unwrap[str](ao);
+    val b: str = O.unwrap[str](bo);
 
     val pn: usize = str_len(prefix);
     val an: usize = str_len(a);
@@ -2117,33 +2450,38 @@ fun report_named2(rc: *ResolveContext, span: token.Span, prefix: str, a_id: inte
     val sn: usize = str_len(suffix);
     val total: usize = pn + an + mn + bn + sn;
 
-    val r: Result[*char, str] = allocate[char](rc.s.alloc, total + 1);
-    if (is_err[*char, str](r)) {
-        ret diag.error(?rc.s.diags, rc.a.file_id, span, prefix);
+    val r: R.Result[*char, str] = A.allocate[char](rc.s.alloc, total + 1);
+    if (R.is_err[*char, str](r)) {
+        ret diagnostic.error(?rc.s.diags, rc.a.file_id, span, prefix);
     }
-    val buf: str = unwrap_ok[*char, str](r);
+    val buf: str = R.unwrap_ok[*char, str](r);
 
     var off: usize = 0;
-    mem.raw_copy((buf::usize + off)::ptr, prefix::ptr, pn); off = off + pn;
-    mem.raw_copy((buf::usize + off)::ptr, a::ptr, an);      off = off + an;
-    mem.raw_copy((buf::usize + off)::ptr, mid::ptr, mn);    off = off + mn;
-    mem.raw_copy((buf::usize + off)::ptr, b::ptr, bn);      off = off + bn;
-    mem.raw_copy((buf::usize + off)::ptr, suffix::ptr, sn);
+    memory.raw_copy((buf::usize + off)::ptr, prefix::ptr, pn); off = off + pn;
+    memory.raw_copy((buf::usize + off)::ptr, a::ptr, an);      off = off + an;
+    memory.raw_copy((buf::usize + off)::ptr, mid::ptr, mn);    off = off + mn;
+    memory.raw_copy((buf::usize + off)::ptr, b::ptr, bn);      off = off + bn;
+    memory.raw_copy((buf::usize + off)::ptr, suffix::ptr, sn);
     buf[total] = 0;
 
-    val emit: Result[bool, str] = diag.error(?rc.s.diags, rc.a.file_id, span, buf);
-    deallocate[char](rc.s.alloc, buf, total + 1);
+    val emit: R.Result[bool, str] = diagnostic.error(?rc.s.diags, rc.a.file_id, span, buf);
+    A.deallocate[char](rc.s.alloc, buf, total + 1);
     ret emit;
 }
 
-# MAX_SUGGEST_DISTANCE: largest edit distance a "did you mean" candidate may
+# largest edit distance a "did you mean" candidate may
 # differ from the unresolved name by.
 val MAX_SUGGEST_DISTANCE: usize = 2;
 
-# edit_distance: Levenshtein distance between `a` and `b`, capped so the search
+# Levenshtein distance between `a` and `b`, capped so the search
 # can abandon a candidate early. returns a value strictly greater than `cap`
 # (specifically `cap + 1`) the moment every cell in a row exceeds `cap`,
 # letting callers prune candidates that cannot beat the current best.
+# ---
+# a:   first string
+# b:   second string
+# cap: abandon threshold
+# ret: the Levenshtein distance, or cap + 1 once every row exceeds cap
 fun edit_distance(a: str, b: str, cap: usize) usize {
     val la: usize = str_len(a);
     val lb: usize = str_len(b);
@@ -2182,7 +2520,7 @@ fun edit_distance(a: str, b: str, cap: usize) usize {
     ret prev[lb];
 }
 
-# SUGGEST_ROW: capacity of the edit-distance DP rows (matches the literal row
+# capacity of the edit-distance DP rows (matches the literal row
 # array length); candidates whose length reaches this bound are skipped, since
 # their distance cannot be small anyway.
 val SUGGEST_ROW: usize = 128;
@@ -2193,17 +2531,21 @@ val SUGGEST_ROW: usize = 128;
 # in the bind pass lets its type-naming argument resolve through the primitive
 # registry (so `$size_of(i64)` works) and lets `$offset_of`'s bare field name
 # escape value-scope lookup.
+# ---
+# rc:     resolver state for the module being resolved
+# callee: the call's callee expression
+# ret:    1 for a one-type intrinsic, 2 for `$offset_of`, 0 otherwise
 fun comptime_intrinsic_kind(rc: *ResolveContext, callee: id.ExprId) u8 {
-    val ce_opt: Option[*expr.Expr] = ast.get_expr(rc.a, callee);
-    if (is_none[*expr.Expr](ce_opt)) { ret 0; }
-    val ce: *expr.Expr = unwrap[*expr.Expr](ce_opt);
+    val ce_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, callee);
+    if (O.is_none[*expr.Expr](ce_opt)) { ret 0; }
+    val ce: *expr.Expr = O.unwrap[*expr.Expr](ce_opt);
     if (ce.kind != expr.EXPR_KIND_COMPTIME_IDENT) { ret 0; }
 
     val ns: token.Span = comptime.comptime_ident_name(ce.span);
     if (ns.len == 0) { ret 0; }
-    val r: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, ns);
-    if (is_err[intern.StrId, str](r)) { ret 0; }
-    val name: intern.StrId = unwrap_ok[intern.StrId, str](r);
+    val r: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, ns);
+    if (R.is_err[intern.StrId, str](r)) { ret 0; }
+    val name: intern.StrId = R.unwrap_ok[intern.StrId, str](r);
 
     if (name == interned_literal(rc, "size_of"))   { ret 1; }
     if (name == interned_literal(rc, "align_of"))  { ret 1; }
@@ -2217,13 +2559,17 @@ fun comptime_intrinsic_kind(rc: *ResolveContext, callee: id.ExprId) u8 {
 # second argument is a bare field name resolved against the record at lowering
 # time and is left unbound here. returns none when the call is not an intrinsic,
 # letting the caller fall back to ordinary call binding.
-fun bind_comptime_intrinsic_call(rc: *ResolveContext, c: *expr.ExprCall) Option[Result[bool, str]] {
+# ---
+# rc:  resolver state for the module being resolved
+# c:   the call payload
+# ret: some(result) when handled as an intrinsic, none to fall through
+fun bind_comptime_intrinsic_call(rc: *ResolveContext, c: *expr.ExprCall) O.Option[R.Result[bool, str]] {
     val kind: u8 = comptime_intrinsic_kind(rc, c.callee);
-    if (kind == 0) { ret none[Result[bool, str]](); }
-    if (c.args_len < 1) { ret some[Result[bool, str]](ok[bool, str](true)); }
+    if (kind == 0)      { ret O.none[R.Result[bool, str]](); }
+    if (c.args_len < 1) { ret O.some[R.Result[bool, str]](R.ok[bool, str](true)); }
 
     val arg0: id.ExprId = rc.a.expr_ids[c.args_start];
-    ret some[Result[bool, str]](bind_intrinsic_type_arg(rc, arg0));
+    ret O.some[R.Result[bool, str]](bind_intrinsic_type_arg(rc, arg0));
 }
 
 # resolves an intrinsic's type-naming argument expression. a bare single
@@ -2231,35 +2577,39 @@ fun bind_comptime_intrinsic_call(rc: *ResolveContext, c: *expr.ExprCall) Option[
 # value scope, mirroring `resolve_type_path`; a `module.Type` member chain
 # resolves through the module's exports. the resolved SymbolId is recorded in
 # `expr_resolved` so sema can recover the operand type.
-fun bind_intrinsic_type_arg(rc: *ResolveContext, eid: id.ExprId) Result[bool, str] {
-    if (eid == id.EXPR_NIL) { ret ok[bool, str](true); }
-    val e_opt: Option[*expr.Expr] = ast.get_expr(rc.a, eid);
-    if (is_none[*expr.Expr](e_opt)) { ret ok[bool, str](true); }
-    val e: *expr.Expr = unwrap[*expr.Expr](e_opt);
+# ---
+# rc:  resolver state for the module being resolved
+# eid: the type-naming argument expression
+# ret: ok(true), or a binding error
+fun bind_intrinsic_type_arg(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str] {
+    if (eid == id.EXPR_NIL) { ret R.ok[bool, str](true); }
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, eid);
+    if (O.is_none[*expr.Expr](e_opt)) { ret R.ok[bool, str](true); }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
 
     if (e.kind == expr.EXPR_KIND_IDENT) {
-        val r: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, e.span);
-        if (is_err[intern.StrId, str](r)) { ret err[bool, str](unwrap_err[intern.StrId, str](r)); }
-        val name: intern.StrId = unwrap_ok[intern.StrId, str](r);
+        val r: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, e.span);
+        if (R.is_err[intern.StrId, str](r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](r)); }
+        val name: intern.StrId = R.unwrap_ok[intern.StrId, str](r);
 
         var sid: SymbolId = prim_symbol_for(rc, name);
         if (sid == SYMBOL_NIL) { sid = scope_lookup_chain(rc, rc.current_scope, name); }
         if (sid == SYMBOL_NIL) {
-            val re: Result[bool, str] = report_named(rc, e.span, "unresolved type name `", name, "`");
-            if (is_ok[bool, str](re)) { attach_suggestion(rc, name); }
+            val re: R.Result[bool, str] = report_named(rc, e.span, "unresolved type name `", name, "`");
+            if (R.is_ok[bool, str](re)) { attach_suggestion(rc, name); }
         }
         or {
             if (rc.expr_resolved != nil) { rc.expr_resolved[eid] = sid; }
         }
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
 
     if (e.kind == expr.EXPR_KIND_MEMBER) {
         # a qualified `module.Type` argument: bind the object alias first, then
         # resolve the leaf against the module's exports (reuses the qualified
         # member machinery used for value-position module references).
-        val ro: Result[bool, str] = bind_expr(rc, e.data.member.object);
-        if (is_err[bool, str](ro)) { ret ro; }
+        val ro: R.Result[bool, str] = bind_expr(rc, e.data.member.object);
+        if (R.is_err[bool, str](ro)) { ret ro; }
         ret bind_member_qualified(rc, eid, ?e.data.member);
     }
 
@@ -2270,9 +2620,13 @@ fun bind_intrinsic_type_arg(rc: *ResolveContext, eid: id.ExprId) Result[bool, st
 
 # binds the two operands of a type comparison (`$type_of(...) == TypeName`,
 # #1472). each operand binds through `bind_type_operand`.
-fun bind_type_comparison(rc: *ResolveContext, bin: *expr.ExprBinary) Result[bool, str] {
-    val rl: Result[bool, str] = bind_type_operand(rc, bin.lhs);
-    if (is_err[bool, str](rl)) { ret rl; }
+# ---
+# rc:  resolver state for the module being resolved
+# bin: the comparison's binary payload
+# ret: ok(true), or a binding error
+fun bind_type_comparison(rc: *ResolveContext, bin: *expr.ExprBinary) R.Result[bool, str] {
+    val rl: R.Result[bool, str] = bind_type_operand(rc, bin.lhs);
+    if (R.is_err[bool, str](rl)) { ret rl; }
     ret bind_type_operand(rc, bin.rhs);
 }
 
@@ -2280,18 +2634,22 @@ fun bind_type_comparison(rc: *ResolveContext, bin: *expr.ExprBinary) Result[bool
 # value `e` (the `$`-rooted comptime-ident callee is a builtin, bound nowhere); a
 # type-name operand binds as a type spelling so its resolved symbol is recorded
 # for sema to recover the named type.
-fun bind_type_operand(rc: *ResolveContext, operand: id.ExprId) Result[bool, str] {
+# ---
+# rc:      resolver state for the module being resolved
+# operand: the operand expression
+# ret:     ok(true), or a binding error
+fun bind_type_operand(rc: *ResolveContext, operand: id.ExprId) R.Result[bool, str] {
     if (comptime.is_type_of_call(rc.a, rc.source, operand)) {
         val arg: id.ExprId = comptime.type_of_arg(rc.a, operand);
-        if (arg == id.EXPR_NIL) { ret ok[bool, str](true); }
+        if (arg == id.EXPR_NIL) { ret R.ok[bool, str](true); }
         ret bind_expr(rc, arg);
     }
     # an `f.type` field-descriptor type (#1473): bind only the object (the `$each`
     # loop variable); `.type` is a descriptor projection, not a record field.
     if (is_field_type_operand(rc, operand)) {
-        val n_opt: Option[*expr.Expr] = ast.get_expr(rc.a, operand);
-        if (is_none[*expr.Expr](n_opt)) { ret ok[bool, str](true); }
-        ret bind_expr(rc, unwrap[*expr.Expr](n_opt).data.member.object);
+        val n_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, operand);
+        if (O.is_none[*expr.Expr](n_opt)) { ret R.ok[bool, str](true); }
+        ret bind_expr(rc, O.unwrap[*expr.Expr](n_opt).data.member.object);
     }
     ret bind_intrinsic_type_arg(rc, operand);
 }
@@ -2300,18 +2658,22 @@ fun bind_type_operand(rc: *ResolveContext, operand: id.ExprId) Result[bool, str]
 # scope, to a `$each` comptime loop variable (a field descriptor). this keys the
 # `f.type` type-comparison recognition on the loop variable, so a real record
 # field named `type` (`s.type`) is never treated as a descriptor projection.
+# ---
+# rc:  resolver state for the module being resolved
+# eid: the candidate `f.type` expression
+# ret: true when `eid` is a `$each` field descriptor's `.type`
 fun is_field_type_operand(rc: *ResolveContext, eid: id.ExprId) bool {
     if (!comptime.is_field_type_member(rc.a, rc.source, eid)) { ret false; }
-    val n_opt: Option[*expr.Expr] = ast.get_expr(rc.a, eid);
-    if (is_none[*expr.Expr](n_opt)) { ret false; }
-    val obj: id.ExprId = unwrap[*expr.Expr](n_opt).data.member.object;
-    val o_opt: Option[*expr.Expr] = ast.get_expr(rc.a, obj);
-    if (is_none[*expr.Expr](o_opt)) { ret false; }
-    val oe: *expr.Expr = unwrap[*expr.Expr](o_opt);
+    val n_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, eid);
+    if (O.is_none[*expr.Expr](n_opt)) { ret false; }
+    val obj: id.ExprId = O.unwrap[*expr.Expr](n_opt).data.member.object;
+    val o_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, obj);
+    if (O.is_none[*expr.Expr](o_opt)) { ret false; }
+    val oe: *expr.Expr = O.unwrap[*expr.Expr](o_opt);
     if (oe.kind != expr.EXPR_KIND_IDENT) { ret false; }
-    val r: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, oe.span);
-    if (is_err[intern.StrId, str](r)) { ret false; }
-    val sid: SymbolId = scope_lookup_chain(rc, rc.current_scope, unwrap_ok[intern.StrId, str](r));
+    val r: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, oe.span);
+    if (R.is_err[intern.StrId, str](r)) { ret false; }
+    val sid: SymbolId = scope_lookup_chain(rc, rc.current_scope, R.unwrap_ok[intern.StrId, str](r));
     if (sid == SYMBOL_NIL) { ret false; }
     val sym: *Symbol = ?rc.symbols[sid];
     ret sym.kind == SYM_VAL && (sym.flags & SYM_FLAG_COMPTIME) != 0;
@@ -2319,17 +2681,26 @@ fun is_field_type_operand(rc: *ResolveContext, eid: id.ExprId) bool {
 
 # interns a static literal in the session interner, returning its StrId or
 # STR_NIL on allocation failure (a STR_NIL never matches a real span name).
+# ---
+# rc:   resolver state for the module being resolved
+# text: the literal text to intern
+# ret:  the interned StrId, or STR_NIL on failure
 fun interned_literal(rc: *ResolveContext, text: str) intern.StrId {
-    val r: Result[intern.StrId, str] = intern.intern(?rc.s.interner, text);
-    if (is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
-    ret unwrap_ok[intern.StrId, str](r);
+    val r: R.Result[intern.StrId, str] = intern.intern(?rc.s.interner, text);
+    if (R.is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+    ret R.unwrap_ok[intern.StrId, str](r);
 }
 
-fun bind_type(rc: *ResolveContext, tid: id.TypeId) Result[bool, str] {
-    if (tid == id.TYPE_NIL) { ret ok[bool, str](true); }
-    val t_opt: Option[*atype.Type] = ast.get_type(rc.a, tid);
-    if (is_none[*atype.Type](t_opt)) { ret err[bool, str]("TypeId out of range"); }
-    val t: *atype.Type = unwrap[*atype.Type](t_opt);
+# resolve the names inside one syntactic type node
+# ---
+# rc:  resolver state for the module being resolved
+# tid: the type node to bind
+# ret: ok(true), or a binding error
+fun bind_type(rc: *ResolveContext, tid: id.TypeId) R.Result[bool, str] {
+    if (tid == id.TYPE_NIL) { ret R.ok[bool, str](true); }
+    val t_opt: O.Option[*atype.Type] = ast.get_type(rc.a, tid);
+    if (O.is_none[*atype.Type](t_opt)) { ret R.err[bool, str]("TypeId out of range"); }
+    val t: *atype.Type = O.unwrap[*atype.Type](t_opt);
 
     if (t.kind == atype.TYPE_KIND_NAMED) {
         val sid: SymbolId = resolve_type_path(rc, ?t.data.named, t.span);
@@ -2337,26 +2708,26 @@ fun bind_type(rc: *ResolveContext, tid: id.TypeId) Result[bool, str] {
         var ai: u32 = 0;
         for (ai < t.data.named.args_len) {
             val arg_id: id.TypeId = rc.a.type_ids[t.data.named.args_start + ai];
-            val r: Result[bool, str] = bind_type(rc, arg_id);
-            if (is_err[bool, str](r)) { ret r; }
+            val r: R.Result[bool, str] = bind_type(rc, arg_id);
+            if (R.is_err[bool, str](r)) { ret r; }
             ai = ai + 1;
         }
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
     if (t.kind == atype.TYPE_KIND_PTR) {
         ret bind_type(rc, t.data.ptr.pointee);
     }
     if (t.kind == atype.TYPE_KIND_ARRAY) {
-        val re: Result[bool, str] = bind_expr(rc, t.data.array.length);
-        if (is_err[bool, str](re)) { ret re; }
+        val re: R.Result[bool, str] = bind_expr(rc, t.data.array.length);
+        if (R.is_err[bool, str](re)) { ret re; }
         ret bind_type(rc, t.data.array.element);
     }
     if (t.kind == atype.TYPE_KIND_FUN) {
         var pi: u32 = 0;
         for (pi < t.data.fun_.params_len) {
             val pt: id.TypeId = rc.a.type_ids[t.data.fun_.params_start + pi];
-            val r: Result[bool, str] = bind_type(rc, pt);
-            if (is_err[bool, str](r)) { ret r; }
+            val r: R.Result[bool, str] = bind_type(rc, pt);
+            if (R.is_err[bool, str](r)) { ret r; }
             pi = pi + 1;
         }
         ret bind_type(rc, t.data.fun_.ret_type);
@@ -2375,18 +2746,23 @@ fun bind_type(rc: *ResolveContext, tid: id.TypeId) Result[bool, str] {
         var fi: u32 = 0;
         for (fi < fields_len) {
             val tn: *decl.TypedName = ?rc.a.typed_names[fields_start + fi];
-            val r: Result[bool, str] = bind_type(rc, tn.ty);
-            if (is_err[bool, str](r)) { ret r; }
+            val r: R.Result[bool, str] = bind_type(rc, tn.ty);
+            if (R.is_err[bool, str](r)) { ret r; }
             fi = fi + 1;
         }
-        ret ok[bool, str](true);
+        ret R.ok[bool, str](true);
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
 # walks a TYPE_KIND_NAMED path. single-segment names look up in the local
 # scope chain. multi-segment names start with an in-scope SYM_USE alias and
 # index into that alias's target module's pub symbols.
+# ---
+# rc:    resolver state for the module being resolved
+# named: the named-type payload
+# full:  the full path span, for diagnostics
+# ret:   the resolved SymbolId, or SYMBOL_NIL
 fun resolve_type_path(rc: *ResolveContext, named: *atype.TypeNamed, full: token.Span) SymbolId {
     val path: token.Span = named.name;
     if (path.len == 0) { ret SYMBOL_NIL; }
@@ -2395,7 +2771,7 @@ fun resolve_type_path(rc: *ResolveContext, named: *atype.TypeNamed, full: token.
     val end:       usize = path.offset + path.len;
     var seg_end:   usize = seg_start;
 
-    var current_module: sess.ModuleId = sess.MODULE_NIL;
+    var current_module: session.ModuleId = session.MODULE_NIL;
     var current_sym:    SymbolId      = SYMBOL_NIL;
     var first:          bool          = true;
 
@@ -2408,9 +2784,9 @@ fun resolve_type_path(rc: *ResolveContext, named: *atype.TypeNamed, full: token.
         seg_span.offset = seg_start;
         seg_span.len    = seg_end - seg_start;
 
-        val r: Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, seg_span);
-        if (is_err[intern.StrId, str](r)) { ret SYMBOL_NIL; }
-        val seg_name: intern.StrId = unwrap_ok[intern.StrId, str](r);
+        val r: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, seg_span);
+        if (R.is_err[intern.StrId, str](r)) { ret SYMBOL_NIL; }
+        val seg_name: intern.StrId = R.unwrap_ok[intern.StrId, str](r);
 
         if (first) {
             # a single-segment name that spells a primitive type resolves to
@@ -2432,8 +2808,8 @@ fun resolve_type_path(rc: *ResolveContext, named: *atype.TypeNamed, full: token.
             # offer a suggestion; a qualified `mod.Type` miss reports on the whole
             # path without a (cross-module) suggestion.
             if (seg_start == path.offset && seg_end >= end) {
-                val re: Result[bool, str] = report_named(rc, full, "unresolved type name `", seg_name, "`");
-                if (is_ok[bool, str](re)) { attach_suggestion(rc, seg_name); }
+                val re: R.Result[bool, str] = report_named(rc, full, "unresolved type name `", seg_name, "`");
+                if (R.is_ok[bool, str](re)) { attach_suggestion(rc, seg_name); }
             }
             or {
                 report_named(rc, full, "unresolved type name `", seg_name, "`");
@@ -2445,10 +2821,10 @@ fun resolve_type_path(rc: *ResolveContext, named: *atype.TypeNamed, full: token.
 
         val sym: *Symbol = ?rc.symbols[current_sym];
         if (sym.kind == SYM_USE) {
-            current_module = sym.slot::sess.ModuleId;
+            current_module = sym.slot::session.ModuleId;
         }
         or {
-            diag.error(?rc.s.diags, rc.a.file_id, full, "expected a module alias before `.`");
+            diagnostic.error(?rc.s.diags, rc.a.file_id, full, "expected a module alias before `.`");
             ret SYMBOL_NIL;
         }
 
@@ -2461,26 +2837,30 @@ fun resolve_type_path(rc: *ResolveContext, named: *atype.TypeNamed, full: token.
 # looks up `name` among the pub symbols exported by ModuleId `m`. returns
 # a SYM_IMPORTED symbol, reusing an existing one when an earlier use-site
 # already imported the same (origin, decl) pair via `imported_cache`.
-fun lookup_in_module(rc: *ResolveContext, m: sess.ModuleId, name: intern.StrId) SymbolId {
-    var i: u32 = 0;
-    for (i < rc.deps.count) {
-        val mx: *ModuleExports = ?rc.deps.entries[i];
-        if (mx.module == m) {
-            val ps: *PublicSymbol = find_export(mx, name);
-            if (ps == nil) { ret SYMBOL_NIL; }
-            val sid_r: Result[SymbolId, str] = imported_symbol_for(rc, ps);
-            if (is_err[SymbolId, str](sid_r)) { ret SYMBOL_NIL; }
-            ret unwrap_ok[SymbolId, str](sid_r);
-        }
-        i = i + 1;
-    }
-    ret SYMBOL_NIL;
+# ---
+# rc:   resolver state for the module being resolved
+# m:    the module to search
+# name: interned symbol name
+# ret:  the imported SymbolId, or SYMBOL_NIL
+fun lookup_in_module(rc: *ResolveContext, m: session.ModuleId, name: intern.StrId) SymbolId {
+    val mx: *ModuleExports = find_module_exports_by_module(rc, m);
+    if (mx == nil) { ret SYMBOL_NIL; }
+    val ps: *PublicSymbol = find_export(mx, name);
+    if (ps == nil) { ret SYMBOL_NIL; }
+    val sid_r: R.Result[SymbolId, str] = imported_symbol_for(rc, ps);
+    if (R.is_err[SymbolId, str](sid_r)) { ret SYMBOL_NIL; }
+    ret R.unwrap_ok[SymbolId, str](sid_r);
 }
 
 # rewrites every non-nil SymbolId in a resolved-reference array through the
 # `remap` permutation produced by build_result's pub-front partition, so the
 # references index the reordered symbol array. SYMBOL_NIL and out-of-range
 # ids are left untouched.
+# ---
+# refs:    the reference array to rewrite
+# len:     number of references
+# remap:   old to new index permutation
+# sym_len: number of symbols
 fun remap_symbol_refs(refs: *SymbolId, len: u32, remap: *u32, sym_len: u32) {
     if (refs == nil) { ret; }
     var i: u32 = 0;
@@ -2493,7 +2873,13 @@ fun remap_symbol_refs(refs: *SymbolId, len: u32, remap: *u32, sym_len: u32) {
     }
 }
 
-fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
+# partition pub symbols to the front and assemble the owned ResolveResult
+#
+# consumes `rc`: its side tables are moved into the result or torn down.
+# ---
+# rc:  the context to finalize
+# ret: the populated ResolveResult, or an allocation error
+fun build_result(rc: *ResolveContext) R.Result[ResolveResult, str] {
     var pub_count: u32 = 0;
     var i: u32 = 0;
     for (i < rc.sym_len) {
@@ -2503,25 +2889,25 @@ fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
         i = i + 1;
     }
 
-    val r_syms: Result[*Symbol, str] = allocate[Symbol](rc.s.alloc, rc.sym_len::usize);
-    if (is_err[*Symbol, str](r_syms)) {
+    val r_syms: R.Result[*Symbol, str] = A.allocate[Symbol](rc.s.alloc, rc.sym_len::usize);
+    if (R.is_err[*Symbol, str](r_syms)) {
         dnit_context(rc);
-        ret err[ResolveResult, str](unwrap_err[*Symbol, str](r_syms));
+        ret R.err[ResolveResult, str](R.unwrap_err[*Symbol, str](r_syms));
     }
-    val out_syms: *Symbol = unwrap_ok[*Symbol, str](r_syms);
+    val out_syms: *Symbol = R.unwrap_ok[*Symbol, str](r_syms);
 
     # partition pub symbols to the front; `remap[old] = new` records the
     # index permutation so the resolved-reference arrays (which hold
     # pre-partition SymbolIds) can be rewritten to the new positions.
     var remap: *u32 = nil;
     if (rc.sym_len > 0) {
-        val r_remap: Result[*u32, str] = allocate[u32](rc.s.alloc, rc.sym_len::usize);
-        if (is_err[*u32, str](r_remap)) {
-            deallocate[Symbol](rc.s.alloc, out_syms, rc.sym_len::usize);
+        val r_remap: R.Result[*u32, str] = A.allocate[u32](rc.s.alloc, rc.sym_len::usize);
+        if (R.is_err[*u32, str](r_remap)) {
+            A.deallocate[Symbol](rc.s.alloc, out_syms, rc.sym_len::usize);
             dnit_context(rc);
-            ret err[ResolveResult, str](unwrap_err[*u32, str](r_remap));
+            ret R.err[ResolveResult, str](R.unwrap_err[*u32, str](r_remap));
         }
-        remap = unwrap_ok[*u32, str](r_remap);
+        remap = R.unwrap_ok[*u32, str](r_remap);
     }
 
     var pi: u32 = 0;
@@ -2545,7 +2931,7 @@ fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
     remap_symbol_refs(rc.type_resolved, rc.a.type_len::u32, remap, rc.sym_len);
     remap_symbol_refs(rc.decl_symbol,   rc.a.decl_len::u32, remap, rc.sym_len);
 
-    if (remap != nil) { deallocate[u32](rc.s.alloc, remap, rc.sym_len::usize); }
+    if (remap != nil) { A.deallocate[u32](rc.s.alloc, remap, rc.sym_len::usize); }
 
     # snapshot each symbol's ModuleId-valued fields in build-stable space, so a
     # ResolveResult reused in a later build can be remapped into that build's
@@ -2557,10 +2943,10 @@ fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
         val sym: *Symbol = ?out_syms[si];
         sym.origin_stable = stable_of_module(rc.s, sym.origin);
         if (sym.kind == SYM_USE) {
-            sym.slot_stable = stable_of_module(rc.s, sym.slot::sess.ModuleId);
+            sym.slot_stable = stable_of_module(rc.s, sym.slot::session.ModuleId);
         }
         or {
-            sym.slot_stable = sess.STABLE_MODULE_NIL;
+            sym.slot_stable = session.STABLE_MODULE_NIL;
         }
         si = si + 1;
     }
@@ -2573,12 +2959,12 @@ fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
     for (pk < rc.sym_len) {
         if (out_syms[pk].kind == SYM_PARAM) {
             val key: u64 = (out_syms[pk].decl::u64 << 32) | out_syms[pk].slot::u64;
-            val ins: Result[bool, str] = map.insert[u64, SymbolId](?param_index, key, pk);
-            if (is_err[bool, str](ins)) {
+            val ins: R.Result[bool, str] = map.insert[u64, SymbolId](?param_index, key, pk);
+            if (R.is_err[bool, str](ins)) {
                 map.dnit[u64, SymbolId](?param_index);
-                deallocate[Symbol](rc.s.alloc, out_syms, rc.sym_len::usize);
+                A.deallocate[Symbol](rc.s.alloc, out_syms, rc.sym_len::usize);
                 dnit_context(rc);
-                ret err[ResolveResult, str](unwrap_err[bool, str](ins));
+                ret R.err[ResolveResult, str](R.unwrap_err[bool, str](ins));
             }
         }
         pk = pk + 1;
@@ -2588,12 +2974,12 @@ fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
     # constants, so the export firewall re-resolves importers when a const value an
     # importer's `$if` reads changes (the value lives in the ctx, not the symbols).
     var fp_len: u32 = 0;
-    val fp_r: Result[*u8, str] = pub_const_fp_build(rc, out_syms, pub_count, ?fp_len);
-    if (is_err[*u8, str](fp_r)) {
+    val fp_r: R.Result[*u8, str] = pub_const_fp_build(rc, out_syms, pub_count, ?fp_len);
+    if (R.is_err[*u8, str](fp_r)) {
         map.dnit[u64, SymbolId](?param_index);
-        deallocate[Symbol](rc.s.alloc, out_syms, rc.sym_len::usize);
+        A.deallocate[Symbol](rc.s.alloc, out_syms, rc.sym_len::usize);
         dnit_context(rc);
-        ret err[ResolveResult, str](unwrap_err[*u8, str](fp_r));
+        ret R.err[ResolveResult, str](R.unwrap_err[*u8, str](fp_r));
     }
 
     var out: ResolveResult;
@@ -2608,7 +2994,7 @@ fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
     out.type_count    = rc.a.type_len::u32;
     out.decl_count    = rc.a.decl_len::u32;
     out.param_index   = param_index;
-    out.pub_const_fp     = unwrap_ok[*u8, str](fp_r);
+    out.pub_const_fp     = R.unwrap_ok[*u8, str](fp_r);
     out.pub_const_fp_len = fp_len;
 
     rc.expr_resolved = nil;
@@ -2616,16 +3002,19 @@ fun build_result(rc: *ResolveContext) Result[ResolveResult, str] {
     rc.decl_symbol   = nil;
 
     dnit_context(rc);
-    ret ok[ResolveResult, str](out);
+    ret R.ok[ResolveResult, str](out);
 }
 
-# PUB_CONST_FP_ENTRY: bytes one pub comptime constant contributes to the value
-# fingerprint — name(u32) + CTValue kind(u8) + int_unsigned(u8) + payload bits(u64).
+# bytes one pub comptime constant contributes to the value
+# fingerprint - name(u32) + CTValue kind(u8) + int_unsigned(u8) + payload bits(u64).
 val PUB_CONST_FP_ENTRY: u32 = 14;
 
-# ct_value_bits: the 8 payload bytes of a CTValue as a canonical u64, set per kind
+# the 8 payload bytes of a CTValue as a canonical u64, set per kind
 # so the fingerprint is deterministic (a bool writes 0/1, never the union's stale
 # upper bytes; a float's bit pattern travels verbatim through the i64 view).
+# ---
+# v:   the comptime value
+# ret: its 8 payload bytes as a canonical u64
 fun ct_value_bits(v: *comptime.CTValue) u64 {
     if (v.kind == comptime.CT_KIND_BOOL) {
         if (v.data.b) { ret 1; }
@@ -2636,12 +3025,18 @@ fun ct_value_bits(v: *comptime.CTValue) u64 {
     ret v.data.i::u64;
 }
 
-# pub_const_fp_build: serialize the evaluated CTValue of every pub module-level
+# serialize the evaluated CTValue of every pub module-level
 # comptime constant in `syms[0, pub_count)` into a fresh byte blob, in pub-symbol
 # order. the values are read from the comptime ctx (bound during load); a constant
 # not foldable there records a sentinel kind. *out_len gets the blob length; a
 # module with no pub comptime constants yields nil/0.
-fun pub_const_fp_build(rc: *ResolveContext, syms: *Symbol, pub_count: u32, out_len: *u32) Result[*u8, str] {
+# ---
+# rc:        resolver state for the module being resolved
+# syms:      the final symbol array
+# pub_count: number of pub symbols at the front
+# out_len:   set to the blob length in bytes
+# ret:       the fingerprint blob (nil when none), or an allocation error
+fun pub_const_fp_build(rc: *ResolveContext, syms: *Symbol, pub_count: u32, out_len: *u32) R.Result[*u8, str] {
     @out_len = 0;
     var n: u32 = 0;
     var i: u32 = 0;
@@ -2649,12 +3044,12 @@ fun pub_const_fp_build(rc: *ResolveContext, syms: *Symbol, pub_count: u32, out_l
         if (syms[i].kind == SYM_VAL && (syms[i].flags & SYM_FLAG_MODULE) != 0) { n = n + 1; }
         i = i + 1;
     }
-    if (n == 0) { ret ok[*u8, str](nil); }
+    if (n == 0) { ret R.ok[*u8, str](nil); }
 
     val total: u32 = n * PUB_CONST_FP_ENTRY;
-    val r: Result[*u8, str] = allocate[u8](rc.s.alloc, total::usize);
-    if (is_err[*u8, str](r)) { ret r; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
+    val r: R.Result[*u8, str] = A.allocate[u8](rc.s.alloc, total::usize);
+    if (R.is_err[*u8, str](r)) { ret r; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](r);
 
     var off: u32 = 0;
     i = 0;
@@ -2662,9 +3057,9 @@ fun pub_const_fp_build(rc: *ResolveContext, syms: *Symbol, pub_count: u32, out_l
         val sym: *Symbol = ?syms[i];
         if (sym.kind == SYM_VAL && (sym.flags & SYM_FLAG_MODULE) != 0) {
             fp_put_u32(buf, off, sym.name::u32); off = off + 4;
-            val nc: Option[*comptime.NamedConst] = comptime.lookup(rc.ctx, sym.name);
-            if (is_some[*comptime.NamedConst](nc)) {
-                val v: *comptime.CTValue = ?unwrap[*comptime.NamedConst](nc).value;
+            val nc: O.Option[*comptime.NamedConst] = comptime.lookup(rc.ctx, sym.name);
+            if (O.is_some[*comptime.NamedConst](nc)) {
+                val v: *comptime.CTValue = ?O.unwrap[*comptime.NamedConst](nc).value;
                 buf[off] = v.kind::u8; off = off + 1;
                 if (v.int_unsigned) { buf[off] = 1; } or { buf[off] = 0; }
                 off = off + 1;
@@ -2680,10 +3075,14 @@ fun pub_const_fp_build(rc: *ResolveContext, syms: *Symbol, pub_count: u32, out_l
     }
 
     @out_len = total;
-    ret ok[*u8, str](buf);
+    ret R.ok[*u8, str](buf);
 }
 
-# fp_put_u32 / fp_put_u64: write a little-endian integer into `buf` at `off`.
+# write a little-endian u32 into `buf` at byte offset `off`
+# ---
+# buf: destination buffer
+# off: byte offset
+# v:   value to write
 fun fp_put_u32(buf: *u8, off: u32, v: u32) {
     buf[off]     = (v & 0xFF)::u8;
     buf[off + 1] = ((v >> 8) & 0xFF)::u8;
@@ -2691,6 +3090,11 @@ fun fp_put_u32(buf: *u8, off: u32, v: u32) {
     buf[off + 3] = ((v >> 24) & 0xFF)::u8;
 }
 
+# write a little-endian u64 into `buf` at byte offset `off`
+# ---
+# buf: destination buffer
+# off: byte offset
+# v:   value to write
 fun fp_put_u64(buf: *u8, off: u32, v: u64) {
     var j: u32 = 0;
     for (j < 8) {
