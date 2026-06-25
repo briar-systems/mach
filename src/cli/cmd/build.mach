@@ -1,84 +1,61 @@
-# mach.cli.cmd.build: `mach build` — compiles the current project to per-module objects and, in executable mode, a linked binary.
+# `mach build` - compile the current project to per-module objects and, in
+# executable mode, a linked binary.
 #
-# resolves the project root by walking up from the working directory until
-# a mach.toml is found, initialises a Session, and loads the full module
-# graph through driver.build_project (config parse + DFS load + resolve).
-# it then drives each reachable module, in topo order, through sema ->
-# lower -> the optimisation pipeline -> codegen, collecting one
-# ObjectImage per module. each image is written to a relocatable object
-# whose path mirrors the module FQN under the manifest's resolved `obj`
-# directory: FQN `a.b.c` -> `<root>/<resolved obj>/a/b/c.o` (parent directories
-# created as needed). in executable mode the collected object paths are
-# linked into the resolved artifact path (`<root>/<bin_out>`); in library mode
-# the per-module objects are the deliverable and no executable is linked. finally
-# diagnostics are flushed. exit codes: 0 ok, 1 user error (missing
-# mach.toml, unknown target, compile errors), 2 internal error.
+# Resolves the project root by walking up from the working directory until a
+# mach.toml is found, initializes a Session, and loads the full module graph
+# through driver.build_project (config parse + DFS load + resolve). It then
+# drives each reachable module, in topo order, through sema -> lower -> the
+# optimization pipeline -> codegen, collecting one ObjectImage per module. Each
+# image is written to a relocatable object whose path mirrors the module FQN
+# under the manifest's resolved `obj` directory: FQN `a.b.c` ->
+# `<root>/<resolved obj>/a/b/c.o` (parent directories created as needed). In
+# executable mode the collected object paths are linked into the resolved
+# artifact path (`<root>/<bin_out>`); in library mode the per-module objects are
+# the deliverable and no executable is linked. Finally diagnostics are flushed.
+# Exit codes: 0 ok, 1 user error (missing mach.toml, unknown target, compile
+# errors), 2 internal error.
 
+use std.allocator.arena;
+use std.allocator.page;
+use std.filesystem;
+use std.io.writer;
+use std.print;
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_contains;
 use std.types.string.str_empty;
 use std.types.string.str_equals;
 use std.types.string.str_len;
-use std.types.string.str_contains;
-use std.types.option.Option;
-use std.types.option.some;
-use std.types.option.none;
-use std.types.option.is_some;
-use std.types.option.is_none;
-use std.types.option.unwrap;
-use std.types.result.Result;
-use std.types.result.ok;
-use std.types.result.err;
-use std.types.result.is_ok;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.unwrap_err;
 
-use std.allocator.Allocator;
-use std.allocator.allocate;
-use std.allocator.deallocate;
-use std.allocator.reallocate;
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
 
-use page:  std.allocator.page;
-use arena: std.allocator.arena;
-
-use fs: std.filesystem;
-
-use writer: std.io.writer;
-use print:  std.print;
-
-use intern:   mach.lang.intern;
-use sess:     mach.lang.session;
-use src:      mach.lang.source;
-use diag:     mach.lang.diagnostic;
-use driver:   mach.lang.driver;
-use manifest: mach.lang.manifest;
-
-use token:   mach.lang.fe.token;
-
-use ir:         mach.lang.me.ir;
-use ir_printer: mach.lang.me.ir.printer;
-use lower:      mach.lang.me.lower;
-use lowctx:     mach.lang.me.lower.context;
-use testrunner: mach.lang.me.lower.testrunner;
-use pipeline:   mach.lang.me.pipeline;
-
-use tgt:      mach.lang.target;
-use of:       mach.lang.target.of;
-use codegen:  mach.lang.be.codegen;
-use linker:   mach.lang.be.linker;
-use obj:      mach.lang.be.obj;
-
-use cfg:      mach.cli.config;
-use util:     mach.cli.util;
+use cfg: mach.cli.config;
 use cli_diag: mach.cli.diagnostic;
+use mach.cli.util;
+use mach.lang.be.codegen;
+use mach.lang.be.linker;
+use mach.lang.be.obj;
+use mach.lang.diagnostic;
+use mach.lang.driver;
+use mach.lang.intern;
+use mach.lang.manifest;
+use mach.lang.me.ir;
+use mach.lang.me.ir.printer;
+use mach.lang.me.lower;
+use mach.lang.me.lower.context;
+use mach.lang.me.lower.testrunner;
+use mach.lang.me.pipeline;
+use mach.lang.session;
+use mach.lang.source;
+use mach.lang.target;
+use mach.lang.target.of;
 
-# BuildResult: the outcome of a single `build` invocation: the exit code
-# to return plus the absolute path of the produced artifact (nil when the
-# build failed before emission).
+# the outcome of a single `build` invocation
 # ---
 # code:        process exit code (0 ok, 1 user error, 2 internal error)
 # output_path: owned path of the produced artifact, or nil on failure
@@ -87,8 +64,9 @@ pub rec BuildResult {
     output_path: *u8;
 }
 
-# TestArtifact: one built test — its reporting metadata and the executable path.
-# all owned strings come from the build allocator, so they outlive the session
+# one built test - its reporting metadata and the executable path
+#
+# All owned strings come from the build allocator, so they outlive the session
 # teardown inside `build_tests` and stay valid until the caller frees that
 # allocator (after it has run every test).
 # ---
@@ -103,36 +81,39 @@ pub rec TestArtifact {
     exe:   *u8;
 }
 
-# TestList: the growing `TestArtifact` array a test build fills, in collection
-# order. allocated from the build allocator.
+# the growing TestArtifact array a test build fills, in collection order
+#
+# Allocated from the build allocator.
 # ---
 # tests: owned array of artifacts
-# count: number of populated entries
+# len:   number of populated entries
 # cap:   allocated length of `tests`
-pub rec TestList {
+rec TestList {
     tests: *TestArtifact;
-    count: u32;
+    len:   u32;
     cap:   u32;
 }
 
-# TestBuildResult: the outcome of a `build_tests` invocation: the exit code plus
-# the collected test artifacts (owned by the caller's allocator).
+# the outcome of a `build_tests` invocation
+#
+# The collected test artifacts are owned by the caller's allocator.
 # ---
 # code:  process exit code (0 ok, 1 user error, 2 internal error)
 # tests: built test artifacts; nil when the build failed before collection
-# count: number of artifacts
+# len:   number of artifacts
 pub rec TestBuildResult {
     code:  i64;
     tests: *TestArtifact;
-    count: u32;
+    len:   u32;
 }
 
-# EmitArtifacts: the debug-artifact emission settings threaded into the per-module
-# compile loop. `ir_base` / `asm_base` are the resolved directories under which the
-# per-module `.ir` / `.s` files are written, FQN-mirrored (borrowed pointers into
-# the caller's path buffers, valid for the compile), each from the manifest's
-# resolved `ir`/`asm` template. `want_asm` / `want_ir` toggle each artifact; an off
-# toggle leaves the corresponding base unused.
+# the debug-artifact emission settings threaded into the per-module compile loop
+#
+# `ir_base` / `asm_base` are the resolved directories under which the per-module
+# `.ir` / `.s` files are written, FQN-mirrored (borrowed pointers into the
+# caller's path buffers, valid for the compile), each from the manifest's
+# resolved `ir`/`asm` template. `want_asm` / `want_ir` toggle each artifact; an
+# off toggle leaves the corresponding base unused.
 # ---
 # ir_base:  resolved directory for per-module `.ir` files (borrowed)
 # asm_base: resolved directory for per-module `.s` files (borrowed)
@@ -145,24 +126,24 @@ rec EmitArtifacts {
     want_ir:  bool;
 }
 
-# emit_id: resolve an interned StrId against the project interner and write
-# it to stderr; a miss writes "<?>".
+# resolve an interned StrId against the project interner and write it to stderr;
+# a miss writes "<?>"
 # ---
 # p:  the project (for its session interner)
 # id: the interned string to render
 fun emit_id(p: *driver.Project, id: intern.StrId) {
-    val o: Option[str] = intern.lookup(?p.s.interner, id);
-    if (is_some[str](o)) {
-        val v: str = unwrap[str](o);
-        print.eprint(v);
+    val opt_name: O.Option[str] = intern.lookup(?p.s.interner, id);
+    if (O.is_some[str](opt_name)) {
+        print.eprint(O.unwrap[str](opt_name));
     }
     or {
         print.eprint("<?>");
     }
 }
 
-# emit_target: write the resolved target name and module count to stderr.
-# the leading line of verbose output, emitted once after graph discovery.
+# write the resolved target name and module count to stderr
+#
+# The leading line of verbose output, emitted once after graph discovery.
 # ---
 # p: the project carrying the selected target and module graph
 fun emit_target(p: *driver.Project) {
@@ -174,10 +155,10 @@ fun emit_target(p: *driver.Project) {
     print.eprint(" module(s))\n");
 }
 
-# emit_stage: write a `<stage> <fqn>` progress line to stderr for one module.
+# write a `<stage> <fqn>` progress line to stderr for one module
 # ---
 # p:     the project (for its interner)
-# stage: a short stage label (e.g. "sema", "lower/codegen")
+# stage: a short stage label (e.g. "sema", "codegen")
 # fqn:   the module's interned fully-qualified name
 fun emit_stage(p: *driver.Project, stage: *u8, fqn: intern.StrId) {
     print.eprint(stage::str);
@@ -186,111 +167,174 @@ fun emit_stage(p: *driver.Project, stage: *u8, fqn: intern.StrId) {
     print.eprint("\n");
 }
 
-# compile_modules: drive every reachable module through the back half of the
-# pipeline. semantic analysis runs over the whole module graph first; only if
-# no module reported an error does the build proceed to lower + optimise +
-# codegen each module to an ObjectImage. this ordering keeps the lowering and
-# codegen passes off a semantically broken AST. `images` (caller-owned, sized
-# to p.module_len) is filled in topo order. on failure the partial images and
-# IR modules are torn down by the caller via `free_modules`. when `verbose`
-# is set, each module's stage transitions are written to stderr. `ea` requests
-# the per-module `.ir` (written right after lowering) and `.s` (written from the
-# fully-resolved MIR inside codegen) debug artifacts.
+# drive every reachable module through the back half of the pipeline
+#
+# Semantic analysis runs over the whole module graph first; only if no module
+# reported an error does the build proceed to lower + optimize + codegen each
+# module to an ObjectImage. This ordering keeps the lowering and codegen passes
+# off a semantically broken AST. `images` (caller-owned, sized to p.module_len)
+# is filled in topo order. On failure the partial images and IR modules are torn
+# down by the caller via `free_modules`.
+# ---
+# p:           the project carrying the module graph and session
+# level:       optimization pipeline level
+# test_mode:   neutralize the project `main` before codegen (the runner supplies entry)
+# verify_ir:   run the IR verifier after each module's pipeline
+# verbose:     write per-module stage lines to stderr
+# ea:          requested `.ir` / `.s` debug artifacts
+# irs:         caller-owned IR-module array, filled in topo order
+# ir_ready:    per-module flag set true once `irs[mid]` holds a built module
+# images:      caller-owned ObjectImage array, filled in topo order
+# image_ready: per-module flag set true once `images[mid]` holds a built image
+# ret:         ok(true) on success, or err with the first failure message
 fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: bool, verbose: bool, ea: *EmitArtifacts,
                     irs: *ir.Module, ir_ready: *bool,
-                    images: *of.ObjectImage, image_ready: *bool) Result[bool, str] {
-    # type-check the whole module graph through Q_SEMA in topo order — memoized and
-    # incremental across rebuilds on a long-lived session, computed fresh each CLI
-    # build (fresh session, cold cache). run_sema_pass borrows each module's
-    # SemaResult onto its ModuleEntry and publishes its typing / resolution /
-    # comptime ctx to the session for the back-end monomorphizer (#1583).
-    val sema_pass_r: Result[bool, str] = driver.run_sema_pass(p);
-    if (is_err[bool, str](sema_pass_r)) { ret err[bool, str](unwrap_err[bool, str](sema_pass_r)); }
+                    images: *of.ObjectImage, image_ready: *bool) R.Result[bool, str] {
+    # type-check the whole module graph through Q_SEMA in topo order - memoized
+    # and incremental across rebuilds on a long-lived session, computed fresh
+    # each CLI build (fresh session, cold cache). run_sema_pass borrows each
+    # module's SemaResult onto its ModuleEntry and publishes its typing /
+    # resolution / comptime ctx to the session for the back-end monomorphizer.
+    val res_sema: R.Result[bool, str] = driver.run_sema_pass(p);
+    if (R.is_err[bool, str](res_sema)) {
+        ret R.err[bool, str](R.unwrap_err[bool, str](res_sema));
+    }
 
     # do not lower or codegen a semantically broken module graph.
-    if (diag.has_errors(?p.s.diags)) { ret ok[bool, str](true); }
+    if (diagnostic.has_errors(?p.s.diags)) { ret R.ok[bool, str](true); }
 
-    # lower + optimise every module first. in test mode the project's `main` is
-    # then neutralised (the runner supplies the program entry) before any module
+    # lower + optimize every module first. in test mode the project's `main` is
+    # then neutralized (the runner supplies the program entry) before any module
     # is codegen'd, so the dropped `main` body never reaches an object.
-    var ti: u32 = 0;
-    for (ti < p.topo_len) {
-        val mid: sess.ModuleId = p.topo[ti];
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId   = p.topo[i];
         val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
 
         if (verbose) { emit_stage(p, "lower", m.fqn); }
 
-        val lower_r: Result[ir.Module, str] = lower.lower_module(p.s, ?p.target, m.a, m.fqn, mid, m.sema_result, m.resolve_result, ?m.ctx);
-        if (is_err[ir.Module, str](lower_r)) { ret err[bool, str](unwrap_err[ir.Module, str](lower_r)); }
-        irs[mid::u32]     = unwrap_ok[ir.Module, str](lower_r);
+        val res_lower: R.Result[ir.Module, str] = lower.lower_module(p.s, ?p.target, m.a, m.fqn, mid, m.sema_result, m.resolve_result, ?m.ctx);
+        if (R.is_err[ir.Module, str](res_lower)) {
+            ret R.err[bool, str](R.unwrap_err[ir.Module, str](res_lower));
+        }
+        irs[mid::u32]      = R.unwrap_ok[ir.Module, str](res_lower);
         ir_ready[mid::u32] = true;
 
         # textual SSA IR, rendered straight after lowering.
         if (ea.want_ir) {
-            val fqn_opt: Option[str] = intern.lookup(?p.s.interner, m.fqn);
-            if (is_none[str](fqn_opt)) { ret err[bool, str]("module FQN not interned"); }
-            val fqn: str = unwrap[str](fqn_opt);
-
-            var irf: fs.File;
-            var irw: writer.Writer;
-            val oir: Result[bool, str] = open_artifact(ea.ir_base, fqn, "ir", ?irf, ?irw);
-            if (is_err[bool, str](oir)) { ret err[bool, str](unwrap_err[bool, str](oir)); }
-            val pir: Result[bool, str] = ir_printer.print_module(?irw, ?irs[mid::u32], ?p.s.interner);
-            val cir: Result[bool, str] = fs.close(?irf);
-            if (is_err[bool, str](pir)) { ret err[bool, str](unwrap_err[bool, str](pir)); }
-            if (is_err[bool, str](cir)) { ret err[bool, str](unwrap_err[bool, str](cir)); }
+            val res_emit: R.Result[bool, str] = emit_ir(p, ea, m.fqn, ?irs[mid::u32]);
+            if (R.is_err[bool, str](res_emit)) {
+                ret R.err[bool, str](R.unwrap_err[bool, str](res_emit));
+            }
         }
 
-        val opt_r: Result[bool, str] = pipeline.run(?irs[mid::u32], ?p.target, level, verify_ir);
-        if (is_err[bool, str](opt_r)) { ret err[bool, str](unwrap_err[bool, str](opt_r)); }
+        val res_opt: R.Result[bool, str] = pipeline.run(?irs[mid::u32], ?p.target, level, verify_ir);
+        if (R.is_err[bool, str](res_opt)) {
+            ret R.err[bool, str](R.unwrap_err[bool, str](res_opt));
+        }
 
-        ti = ti + 1;
+        i = i + 1;
     }
 
     if (test_mode) {
-        val nr: Result[bool, str] = testrunner.neutralize_project_main(p.s, irs, p.module_len);
-        if (is_err[bool, str](nr)) { ret err[bool, str](unwrap_err[bool, str](nr)); }
+        val res_neutralize: R.Result[bool, str] = testrunner.neutralize_project_main(p.s, irs, p.module_len);
+        if (R.is_err[bool, str](res_neutralize)) {
+            ret R.err[bool, str](R.unwrap_err[bool, str](res_neutralize));
+        }
     }
 
-    ti = 0;
-    for (ti < p.topo_len) {
-        val mid: sess.ModuleId = p.topo[ti];
+    i = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId   = p.topo[i];
         val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
 
         if (verbose) { emit_stage(p, "codegen", m.fqn); }
 
         # codegen, optionally rendering the resolved MIR to a `.s` artifact.
-        var asmf: fs.File;
-        var asmw: writer.Writer;
-        var asm_out: *writer.Writer = nil;
+        var asm_file: filesystem.File;
+        var asm_w:    writer.Writer;
+        var asm_out:  *writer.Writer = nil;
         if (ea.want_asm) {
-            val fqn_opt: Option[str] = intern.lookup(?p.s.interner, m.fqn);
-            if (is_none[str](fqn_opt)) { ret err[bool, str]("module FQN not interned"); }
-            val fqn: str = unwrap[str](fqn_opt);
-            val oas: Result[bool, str] = open_artifact(ea.asm_base, fqn, "s", ?asmf, ?asmw);
-            if (is_err[bool, str](oas)) { ret err[bool, str](unwrap_err[bool, str](oas)); }
-            asm_out = ?asmw;
+            val res_open: R.Result[bool, str] = open_asm(p, ea, m.fqn, ?asm_file, ?asm_w);
+            if (R.is_err[bool, str](res_open)) {
+                ret R.err[bool, str](R.unwrap_err[bool, str](res_open));
+            }
+            asm_out = ?asm_w;
         }
-        val cg_r: Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, ?irs[mid::u32], asm_out);
+
+        val res_codegen: R.Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, ?irs[mid::u32], asm_out);
         if (ea.want_asm) {
-            val cas: Result[bool, str] = fs.close(?asmf);
-            if (is_ok[of.ObjectImage, str](cg_r) && is_err[bool, str](cas)) {
-                ret err[bool, str](unwrap_err[bool, str](cas));
+            val res_close: R.Result[bool, str] = filesystem.close(?asm_file);
+            if (R.is_ok[of.ObjectImage, str](res_codegen) && R.is_err[bool, str](res_close)) {
+                ret R.err[bool, str](R.unwrap_err[bool, str](res_close));
             }
         }
-        if (is_err[of.ObjectImage, str](cg_r)) { ret err[bool, str](unwrap_err[of.ObjectImage, str](cg_r)); }
-        images[mid::u32]      = unwrap_ok[of.ObjectImage, str](cg_r);
+        if (R.is_err[of.ObjectImage, str](res_codegen)) {
+            ret R.err[bool, str](R.unwrap_err[of.ObjectImage, str](res_codegen));
+        }
+        images[mid::u32]      = R.unwrap_ok[of.ObjectImage, str](res_codegen);
         image_ready[mid::u32] = true;
 
-        ti = ti + 1;
+        i = i + 1;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# free_modules: tear down the per-module IR and object images. SemaResults are NOT
-# freed here — they are borrowed from the session query DB (the Q_SEMA handles),
-# which owns and frees them (and reuses them across rebuilds), mirroring resolve
-# results and parsed ASTs (#1583).
+# render one module's textual SSA IR to its `.ir` artifact, straight after
+# lowering
+# ---
+# p:   the project (for its interner)
+# ea:  the emission settings (for `ir_base`)
+# fqn: the module's interned fully-qualified name
+# m:   the lowered IR module to render
+# ret: ok(true) on success, or err with the failure message
+fun emit_ir(p: *driver.Project, ea: *EmitArtifacts, fqn: intern.StrId, m: *ir.Module) R.Result[bool, str] {
+    val opt_fqn: O.Option[str] = intern.lookup(?p.s.interner, fqn);
+    if (O.is_none[str](opt_fqn)) { ret R.err[bool, str]("module FQN not interned"); }
+
+    var file: filesystem.File;
+    var w:    writer.Writer;
+    val res_open: R.Result[bool, str] = open_artifact(ea.ir_base, O.unwrap[str](opt_fqn), "ir", ?file, ?w);
+    if (R.is_err[bool, str](res_open)) {
+        ret R.err[bool, str](R.unwrap_err[bool, str](res_open));
+    }
+
+    val res_print: R.Result[bool, str] = printer.print_module(?w, m, ?p.s.interner);
+    val res_close: R.Result[bool, str] = filesystem.close(?file);
+    if (R.is_err[bool, str](res_print)) {
+        ret R.err[bool, str](R.unwrap_err[bool, str](res_print));
+    }
+    if (R.is_err[bool, str](res_close)) {
+        ret R.err[bool, str](R.unwrap_err[bool, str](res_close));
+    }
+    ret R.ok[bool, str](true);
+}
+
+# open one module's `.s` assembly artifact and wire `w` to stream into it
+# ---
+# p:    the project (for its interner)
+# ea:   the emission settings (for `asm_base`)
+# fqn:  the module's interned fully-qualified name
+# file: receives the created file; the caller closes it
+# w:    receives a writer streaming into `file`
+# ret:  ok(true) on success, or err with the failure message
+fun open_asm(p: *driver.Project, ea: *EmitArtifacts, fqn: intern.StrId, file: *filesystem.File, w: *writer.Writer) R.Result[bool, str] {
+    val opt_fqn: O.Option[str] = intern.lookup(?p.s.interner, fqn);
+    if (O.is_none[str](opt_fqn)) { ret R.err[bool, str]("module FQN not interned"); }
+    ret open_artifact(ea.asm_base, O.unwrap[str](opt_fqn), "s", file, w);
+}
+
+# tear down the per-module IR and object images
+#
+# SemaResults are NOT freed here - they are borrowed from the session query DB
+# (the Q_SEMA handles), which owns and frees them (and reuses them across
+# rebuilds), mirroring resolve results and parsed ASTs.
+# ---
+# p:           the project carrying the module count
+# irs:         the IR-module array to tear down
+# ir_ready:    per-module flag marking which `irs` entries are live
+# images:      the ObjectImage array to tear down
+# image_ready: per-module flag marking which `images` entries are live
 fun free_modules(p: *driver.Project,
                  irs: *ir.Module, ir_ready: *bool,
                  images: *of.ObjectImage, image_ready: *bool) {
@@ -302,79 +346,94 @@ fun free_modules(p: *driver.Project,
     }
 }
 
-
-# build: compile a single build unit selected from the CLI flags. the shared body
-# behind `run` that `cmd.run` reuses so it can build one artifact and then exec it;
-# `mach build` itself iterates the build matrix (`run` below). the returned
-# `output_path`, when non-nil, is owned by `alloc` — the caller frees it (and tears
-# `alloc` down) once done with it.
+# compile a single build unit selected from the CLI flags
+#
+# The shared body behind `run` that `cmd.run` reuses so it can build one
+# artifact and then exec it; `mach build` itself iterates the build matrix
+# (`run` below). The returned `output_path`, when non-nil, is owned by `a` - the
+# caller frees it (and tears `a` down) once done with it.
 # ---
-# alloc:    allocator owning the session and the returned artifact path;
+# a:        allocator owning the session and the returned artifact path;
 #           must outlive the returned BuildResult
 # argc:     argument count including argv[0]
 # argv:     the argument vector (argc null-terminated byte pointers)
 # emit_obj: when true, emit a relocatable object instead of an executable
 # ret:      a BuildResult carrying the exit code and artifact path
-pub fun build(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool) BuildResult {
-    ret build_unit(alloc, argc, argv, emit_obj, false, nil, nil, false);
+pub fun build(a: *A.Allocator, argc: usize, argv: **u8, emit_obj: bool) BuildResult {
+    ret build_unit(a, argc, argv, emit_obj, false, nil, nil, false);
 }
 
-# build_tests: build one standalone executable per `test` declaration, returning
-# the per-test artifacts (label, source `file:line`, and executable path) for the
-# `mach test` runner to spawn. every test executable is the project's transitive
-# code plus a synthesized `main` that calls just that test and exits with its
-# `i32` result — independently runnable, never the project's own binary path
-# (#1274). with `list_only` the build stops after collecting the tests, leaving
-# each artifact's `exe` nil. the returned strings are owned by `alloc` and outlive
-# this call's internal session teardown, so the caller frees `alloc` once it has
-# run every test.
+# build one standalone executable per `test` declaration
+#
+# Returns the per-test artifacts (label, source `file:line`, and executable
+# path) for the `mach test` runner to spawn. Every test executable is the
+# project's transitive code plus a synthesized `main` that calls just that test
+# and exits with its `i32` result - independently runnable, never the project's
+# own binary path. With `list_only` the build stops after collecting the tests,
+# leaving each artifact's `exe` nil. The returned strings are owned by `a` and
+# outlive this call's internal session teardown, so the caller frees `a` once it
+# has run every test.
 # ---
-# alloc:     allocator owning the session and the returned artifacts; must outlive
-#            the returned TestBuildResult
+# a:         allocator owning the session and the returned artifacts; must
+#            outlive the returned TestBuildResult
 # argc:      argument count including argv[0]
 # argv:      the argument vector (argc null-terminated byte pointers)
 # list_only: collect the tests without building executables (`--list`)
 # ret:       a TestBuildResult carrying the exit code and the test artifacts
-pub fun build_tests(alloc: *Allocator, argc: usize, argv: **u8, list_only: bool) TestBuildResult {
+pub fun build_tests(a: *A.Allocator, argc: usize, argv: **u8, list_only: bool) TestBuildResult {
     var list: TestList;
     list.tests = nil;
-    list.count = 0;
+    list.len   = 0;
     list.cap   = 0;
-    val br: BuildResult = build_unit(alloc, argc, argv, false, true, nil, ?list, list_only);
+
+    val br: BuildResult = build_unit(a, argc, argv, false, true, nil, ?list, list_only);
+
     var tbr: TestBuildResult;
     tbr.code  = br.code;
     tbr.tests = list.tests;
-    tbr.count = list.count;
+    tbr.len   = list.len;
     ret tbr;
 }
 
-# build_unit: the single-unit build body. with `ovr` nil the target/artifact are
-# derived from the CLI flags (the `cmd.run`/`cmd.test` path); with `ovr` set they
-# come from one enumerated matrix cell (the `mach build` loop), the only field the
-# override replaces — profile and every other flag still apply to each unit. when
-# `tests_out` is non-nil the build is a test build: it produces one executable per
-# `test` declaration and fills `tests_out` instead of linking a single artifact
+# the single-unit build body
+#
+# With `ovr` nil the target/artifact are derived from the CLI flags (the
+# `cmd.run`/`cmd.test` path); with `ovr` set they come from one enumerated
+# matrix cell (the `mach build` loop), the only field the override replaces -
+# profile and every other flag still apply to each unit. When `tests_out` is
+# non-nil the build is a test build: it produces one executable per `test`
+# declaration and fills `tests_out` instead of linking a single artifact
 # (`list_only` stops after collection). `test_mode` mirrors `tests_out != nil`.
-fun build_unit(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_mode: bool, ovr: *driver.MatrixUnit, tests_out: *TestList, list_only: bool) BuildResult {
+# ---
+# a:         allocator owning the session and the returned artifact path
+# argc:      argument count including argv[0]
+# argv:      the argument vector (argc null-terminated byte pointers)
+# emit_obj:  emit a relocatable object instead of an executable
+# test_mode: build per-test executables rather than a single artifact
+# ovr:       the enumerated matrix cell, or nil to derive from CLI flags
+# tests_out: the list a test build fills, or nil for a normal build
+# list_only: collect the tests without building executables (`--list`)
+# ret:       a BuildResult carrying the exit code and artifact path
+fun build_unit(a: *A.Allocator, argc: usize, argv: **u8, emit_obj: bool, test_mode: bool, ovr: *driver.MatrixUnit, tests_out: *TestList, list_only: bool) BuildResult {
     var br: BuildResult;
     br.code        = 2;
     br.output_path = nil;
 
-    # everything at or after a `--` separator is a program argument (forwarded
-    # by `mach run`), never a build flag or link input. clip the count the build
+    # everything at or after a `--` separator is a program argument (forwarded by
+    # `mach run`), never a build flag or link input. clip the count the build
     # scanners see so post-`--` args cannot leak into config parsing, the link
     # scan, or the project-path positional. with no `--` present this is argc.
     val eff: usize = util.separator_index(argc, argv);
 
-    val cfg_r: Result[cfg.Config, str] = cfg.parse(eff, argv);
-    if (is_err[cfg.Config, str](cfg_r)) {
+    val res_config: R.Result[cfg.Config, str] = cfg.parse(eff, argv);
+    if (R.is_err[cfg.Config, str](res_config)) {
         print.eprint("error: ");
-        print.eprint(unwrap_err[cfg.Config, str](cfg_r));
+        print.eprint(R.unwrap_err[cfg.Config, str](res_config));
         print.eprint("\n");
         br.code = 1;
         ret br;
     }
-    val config: cfg.Config = unwrap_ok[cfg.Config, str](cfg_r);
+    val config: cfg.Config = R.unwrap_ok[cfg.Config, str](res_config);
 
     # the project root is the required non-flag positional after the subcommand
     # (`mach build <path>`); a bare invocation with no path is a user error.
@@ -393,17 +452,18 @@ fun build_unit(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_
         ret br;
     }
 
-    # optimisation level: an explicit CLI flag (`-O0` debug, `-O1`/`-O2`/`--release`
-    # release) wins outright; absent any flag the level falls to the selected
-    # profile's `opt`, then to the debug pipeline (mem2reg, constfold, dce) — what
-    # the bootstrap uses, kept fixpoint-stable. the CLI choice is resolved here; the
-    # manifest default is folded in after the target is selected (resolve_opt_level),
-    # since the target entry is only known post build_project.
-    var cli_level: u8 = pipeline.OPT_DEBUG;
+    # optimization level: an explicit CLI flag (`-O0` debug, `-O1`/`-O2`/
+    # `--release` release) wins outright; absent any flag the level falls to the
+    # selected profile's `opt`, then to the debug pipeline (mem2reg, constfold,
+    # dce) - what the bootstrap uses, kept fixpoint-stable. the CLI choice is
+    # resolved here; the manifest default is folded in after the target is
+    # selected (resolve_opt_level), since the target entry is only known post
+    # build_project.
+    var cli_level: u8   = pipeline.OPT_DEBUG;
     var cli_set:   bool = false;
-    if (util.has_flag(eff, argv, "-O0"))      { cli_level = pipeline.OPT_DEBUG;   cli_set = true; }
-    or (util.has_flag(eff, argv, "-O1"))      { cli_level = pipeline.OPT_RELEASE; cli_set = true; }
-    or (util.has_flag(eff, argv, "-O2"))      { cli_level = pipeline.OPT_RELEASE; cli_set = true; }
+    if (util.has_flag(eff, argv, "-O0"))       { cli_level = pipeline.OPT_DEBUG;   cli_set = true; }
+    or (util.has_flag(eff, argv, "-O1"))       { cli_level = pipeline.OPT_RELEASE; cli_set = true; }
+    or (util.has_flag(eff, argv, "-O2"))       { cli_level = pipeline.OPT_RELEASE; cli_set = true; }
     or (util.has_flag(eff, argv, "--release")) { cli_level = pipeline.OPT_RELEASE; cli_set = true; }
 
     # the build selection threaded to the driver; it narrows target/profile/
@@ -412,7 +472,7 @@ fun build_unit(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_
     # from the flags even under an override.
     var profile_name: *u8 = config.profile;
     if (profile_name == nil && config.release) { profile_name = "release"; }
-    if (profile_name == nil) { profile_name = ""; }
+    if (profile_name == nil)                   { profile_name = ""; }
 
     var sel: manifest.Selection;
     sel.profile = util.cstr_str(profile_name);
@@ -428,9 +488,9 @@ fun build_unit(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_
         # (the driver resolves "native"/"host" to the host-matching entry).
         var target_name: *u8 = config.target;
         if (target_name == nil) { target_name = ""; }
-        var artifact_name: *u8 = "";
-        var want_lib:      bool = false;
-        var has_artifact:  bool = false;
+        var artifact_name: *u8   = "";
+        var want_lib:      bool  = false;
+        var has_artifact:  bool  = false;
         if (config.bin != nil && config.lib != nil) {
             print.eprint("error: --bin and --lib cannot be combined\n");
             br.code = 1;
@@ -444,24 +504,24 @@ fun build_unit(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_
         sel.has_artifact = has_artifact;
     }
 
-    val sess_r: Result[sess.Session, str] = sess.init(alloc);
-    if (is_err[sess.Session, str](sess_r)) {
+    val res_session: R.Result[session.Session, str] = session.init(a);
+    if (R.is_err[session.Session, str](res_session)) {
         print.eprint("error: failed to initialise compiler session: ");
-        print.eprint(unwrap_err[sess.Session, str](sess_r));
+        print.eprint(R.unwrap_err[session.Session, str](res_session));
         print.eprint("\n");
         br.code = 2;
         ret br;
     }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sess_r);
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
 
-    # populate the session's target registry. register_all needs no interner —
+    # populate the session's target registry. register_all needs no interner -
     # every vtable names itself with an immutable `str` constant. idempotent.
-    val reg_r: Result[bool, str] = tgt.register_all(?s.registry);
-    if (is_err[bool, str](reg_r)) {
+    val res_register: R.Result[bool, str] = target.register_all(?s.registry);
+    if (R.is_err[bool, str](res_register)) {
         print.eprint("error: ");
-        print.eprint(unwrap_err[bool, str](reg_r));
+        print.eprint(R.unwrap_err[bool, str](res_register));
         print.eprint("\n");
-        sess.dnit(?s);
+        session.dnit(?s);
         br.code = 2;
         ret br;
     }
@@ -471,21 +531,21 @@ fun build_unit(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_
     s.opt_explicit = cli_set;
     s.opt_release  = cli_level == pipeline.OPT_RELEASE;
 
-    # thread the CLI `--verbose` intent into the session so the front-end load walk
-    # emits per-module `lex`/`parse`/`resolve` progress lines, matching the
-    # back-end stage lines `compile_and_link` prints from `config.verbose`.
+    # thread the CLI `--verbose` intent into the session so the front-end load
+    # walk emits per-module `lex`/`parse`/`resolve` progress lines, matching the
+    # back-end stage lines this command prints from `config.verbose`.
     s.verbose = config.verbose;
 
-    val proj_r: Result[driver.Project, str] = driver.build_project_sel(?s, util.cstr_str(?root[0]), ?sel);
-    if (is_err[driver.Project, str](proj_r)) {
+    val res_project: R.Result[driver.Project, str] = driver.build_project_sel(?s, util.cstr_str(?root[0]), ?sel);
+    if (R.is_err[driver.Project, str](res_project)) {
         print.eprint("error: ");
-        print.eprint(unwrap_err[driver.Project, str](proj_r));
+        print.eprint(R.unwrap_err[driver.Project, str](res_project));
         print.eprint("\n");
-        sess.dnit(?s);
+        session.dnit(?s);
         br.code = 1;
         ret br;
     }
-    var p: driver.Project = unwrap_ok[driver.Project, str](proj_r);
+    var p: driver.Project = R.unwrap_ok[driver.Project, str](res_project);
 
     # fold the manifest default into the level: a CLI `-O*`/`--release` flag wins,
     # otherwise the selected profile's opt applies, else debug.
@@ -504,15 +564,21 @@ fun build_unit(alloc: *Allocator, argc: usize, argv: **u8, emit_obj: bool, test_
 
     cli_diag.flush(?s, ?s.diags, cfg.color_enabled(config.color));
     driver.dnit_project(?p);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret br;
 }
 
-# resolve_opt_level: pick the optimization pipeline level for this build. an
-# explicit CLI flag (`cli_set`) wins outright. otherwise the selected profile's
-# `opt` decides — TARGET_OPT_RELEASE -> release, TARGET_OPT_DEBUG -> debug — and an
-# unset/absent manifest opt falls to the debug pipeline, the fixpoint-stable
-# default the bootstrap builds at.
+# pick the optimization pipeline level for this build
+#
+# An explicit CLI flag (`cli_set`) wins outright. Otherwise the selected
+# profile's `opt` decides - TARGET_OPT_RELEASE -> release, TARGET_OPT_DEBUG ->
+# debug - and an unset/absent manifest opt falls to the debug pipeline, the
+# fixpoint-stable default the bootstrap builds at.
+# ---
+# p:         the project carrying the selected target entry
+# cli_level: the level the CLI flags resolved to
+# cli_set:   whether a CLI `-O*`/`--release` flag was present
+# ret:       the pipeline level (pipeline.OPT_DEBUG or pipeline.OPT_RELEASE)
 fun resolve_opt_level(p: *driver.Project, cli_level: u8, cli_set: bool) u8 {
     if (cli_set) { ret cli_level; }
     val te: *driver.TargetEntry = p.target_entry;
@@ -520,15 +586,32 @@ fun resolve_opt_level(p: *driver.Project, cli_level: u8, cli_set: bool) u8 {
     ret pipeline.OPT_DEBUG;
 }
 
-# compile_and_link: orchestrate the per-module compile + link, allocating
-# and freeing the parallel module-state arrays. returns the exit code and
-# sets `*out_path` to the produced artifact path on success. `out_override`
-# (-o), when non-nil, replaces the resolved artifact path. when `verbose` is set,
-# per-stage progress is written to stderr. `emit_asm` / `emit_ir` request the
-# per-module `.s` / `.ir` debug artifacts. when `tests_out` is non-nil the build
-# is a test build: per-module objects are written once and one executable is
-# linked per `test` (filling `tests_out`) rather than a single artifact;
-# `list_only` stops after collecting the tests.
+# orchestrate the per-module compile + link, allocating and freeing the parallel
+# module-state arrays
+#
+# Returns the exit code and sets `*out_path` to the produced artifact path on
+# success. `out_override` (-o), when non-nil, replaces the resolved artifact
+# path. When `tests_out` is non-nil the build is a test build: per-module
+# objects are written once and one executable is linked per `test` (filling
+# `tests_out`) rather than a single artifact; `list_only` stops after collecting
+# the tests.
+# ---
+# p:            the project carrying the module graph and session
+# level:        optimization pipeline level
+# emit_obj:     emit a relocatable object instead of an executable
+# test_mode:    neutralize the project `main` before codegen
+# verify_ir:    run the IR verifier after each module's pipeline
+# verbose:      write per-stage progress to stderr
+# emit_asm:     request the per-module `.s` debug artifacts
+# emit_ir:      request the per-module `.ir` debug artifacts
+# root:         the resolved project root directory
+# out_override: the `-o` artifact path, or nil to use the resolved path
+# argc:         argument count including argv[0]
+# argv:         the argument vector (argc null-terminated byte pointers)
+# out_path:     receives the owned produced-artifact path on success
+# tests_out:    the list a test build fills, or nil for a normal build
+# list_only:    collect the tests without building executables (`--list`)
+# ret:          the process exit code
 fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: bool, verify_ir: bool, verbose: bool,
                      emit_asm: bool, emit_ir: bool,
                      root: *u8, out_override: *u8,
@@ -564,24 +647,43 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
         }
     }
 
-    # per-module SemaResults are owned by the session query DB (the Q_SEMA handles)
-    # and borrowed onto each ModuleEntry by run_sema_pass, so no per-build sema array
-    # is allocated here (#1583); only the IR and object-image arrays are.
-    val iri: Result[*ir.Module, str] = allocate[ir.Module](p.s.alloc, n);
-    if (is_err[*ir.Module, str](iri)) { print.eprint("error: out of memory\n"); ret 2; }
-    val irs: *ir.Module = unwrap_ok[*ir.Module, str](iri);
+    # per-module SemaResults are owned by the session query DB (the Q_SEMA
+    # handles) and borrowed onto each ModuleEntry by run_sema_pass, so no
+    # per-build sema array is allocated here; only the IR and object-image arrays
+    # are.
+    val res_irs: R.Result[*ir.Module, str] = A.allocate[ir.Module](p.s.alloc, n);
+    if (R.is_err[*ir.Module, str](res_irs)) {
+        print.eprint("error: out of memory\n");
+        ret 2;
+    }
+    val irs: *ir.Module = R.unwrap_ok[*ir.Module, str](res_irs);
 
-    val irr: Result[*bool, str] = allocate[bool](p.s.alloc, n);
-    if (is_err[*bool, str](irr)) { deallocate[ir.Module](p.s.alloc, irs, n); print.eprint("error: out of memory\n"); ret 2; }
-    val ir_ready: *bool = unwrap_ok[*bool, str](irr);
+    val res_ir_ready: R.Result[*bool, str] = A.allocate[bool](p.s.alloc, n);
+    if (R.is_err[*bool, str](res_ir_ready)) {
+        A.deallocate[ir.Module](p.s.alloc, irs, n);
+        print.eprint("error: out of memory\n");
+        ret 2;
+    }
+    val ir_ready: *bool = R.unwrap_ok[*bool, str](res_ir_ready);
 
-    val imi: Result[*of.ObjectImage, str] = allocate[of.ObjectImage](p.s.alloc, n);
-    if (is_err[*of.ObjectImage, str](imi)) { deallocate[bool](p.s.alloc, ir_ready, n); deallocate[ir.Module](p.s.alloc, irs, n); print.eprint("error: out of memory\n"); ret 2; }
-    val images: *of.ObjectImage = unwrap_ok[*of.ObjectImage, str](imi);
+    val res_images: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](p.s.alloc, n);
+    if (R.is_err[*of.ObjectImage, str](res_images)) {
+        A.deallocate[bool](p.s.alloc, ir_ready, n);
+        A.deallocate[ir.Module](p.s.alloc, irs, n);
+        print.eprint("error: out of memory\n");
+        ret 2;
+    }
+    val images: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](res_images);
 
-    val imr: Result[*bool, str] = allocate[bool](p.s.alloc, n);
-    if (is_err[*bool, str](imr)) { deallocate[of.ObjectImage](p.s.alloc, images, n); deallocate[bool](p.s.alloc, ir_ready, n); deallocate[ir.Module](p.s.alloc, irs, n); print.eprint("error: out of memory\n"); ret 2; }
-    val image_ready: *bool = unwrap_ok[*bool, str](imr);
+    val res_image_ready: R.Result[*bool, str] = A.allocate[bool](p.s.alloc, n);
+    if (R.is_err[*bool, str](res_image_ready)) {
+        A.deallocate[of.ObjectImage](p.s.alloc, images, n);
+        A.deallocate[bool](p.s.alloc, ir_ready, n);
+        A.deallocate[ir.Module](p.s.alloc, irs, n);
+        print.eprint("error: out of memory\n");
+        ret 2;
+    }
+    val image_ready: *bool = R.unwrap_ok[*bool, str](res_image_ready);
 
     var i: u32 = 0;
     for (i < p.module_len) {
@@ -591,19 +693,19 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
     }
 
     var code: i64 = 0;
-    val comp_r: Result[bool, str] = compile_modules(p, level, test_mode, verify_ir, verbose, ?ea, irs, ir_ready, images, image_ready);
-    if (is_err[bool, str](comp_r)) {
+    val res_compile: R.Result[bool, str] = compile_modules(p, level, test_mode, verify_ir, verbose, ?ea, irs, ir_ready, images, image_ready);
+    if (R.is_err[bool, str](res_compile)) {
         # a `lower:reported` sentinel means lowering already filed a located
         # diagnostic on the sink; the flush prints it, so skip the raw reprint.
-        val emsg: str = unwrap_err[bool, str](comp_r);
-        if (!str_equals(emsg, lowctx.REPORTED)) {
+        val emsg: str = R.unwrap_err[bool, str](res_compile);
+        if (!str_equals(emsg, context.REPORTED)) {
             print.eprint("error: ");
             print.eprint(emsg);
             print.eprint("\n");
         }
         code = 1;
     }
-    or (diag.has_errors(?p.s.diags)) {
+    or (diagnostic.has_errors(?p.s.diags)) {
         code = 1;
     }
     or (tests_out != nil) {
@@ -614,35 +716,48 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
     }
 
     free_modules(p, irs, ir_ready, images, image_ready);
-    deallocate[bool](p.s.alloc, image_ready, n);
-    deallocate[of.ObjectImage](p.s.alloc, images, n);
-    deallocate[bool](p.s.alloc, ir_ready, n);
-    deallocate[ir.Module](p.s.alloc, irs, n);
+    A.deallocate[bool](p.s.alloc, image_ready, n);
+    A.deallocate[of.ObjectImage](p.s.alloc, images, n);
+    A.deallocate[bool](p.s.alloc, ir_ready, n);
+    A.deallocate[ir.Module](p.s.alloc, irs, n);
     ret code;
 }
 
-# build_test_executables: build one standalone executable per collected `test`.
-# the per-module objects are written once under the resolved `obj` template; the
-# external link inputs (libc, manifest/CLI libs) are resolved once. then, for each
-# `test`, a tiny entry module (`main(){ret <test>();}`) is synthesized, optimised,
-# codegen'd to its own object, and linked with the shared object set into a
-# standalone executable at the resolved `tests` template path. each test's
-# reporting metadata (label, source `file:line`) and executable path are appended
-# to `tests_out`. with `list_only` the collection alone is reported and no objects
-# or executables are produced. a build with no tests is a user error. returns 0 on
-# success, 1 on a user error, 2 on an internal error.
+# build one standalone executable per collected `test`
+#
+# The per-module objects are written once under the resolved `obj` template; the
+# external link inputs (libc, manifest/CLI libs) are resolved once. Then, for
+# each `test`, a tiny entry module (`main(){ret <test>();}`) is synthesized,
+# optimized, codegen'd to its own object, and linked with the shared object set
+# into a standalone executable at the resolved `tests` template path. Each
+# test's reporting metadata (label, source `file:line`) and executable path are
+# appended to `tests_out`. With `list_only` the collection alone is reported and
+# no objects or executables are produced. A build with no tests is a user error.
+# ---
+# p:         the project carrying the module graph and session
+# level:     optimization pipeline level
+# verify_ir: run the IR verifier on each synthesized entry module
+# verbose:   write the test-executable count to stderr
+# root:      the resolved project root directory
+# argc:      argument count including argv[0]
+# argv:      the argument vector (argc null-terminated byte pointers)
+# images:    the per-module object images to write once and share
+# irs:       the per-module IR (for `test` collection)
+# list_only: report the collected tests without building (`--list`)
+# tests_out: the list to append each test's artifact to
+# ret:       0 on success, 1 on a user error, 2 on an internal error
 fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool, verbose: bool,
                            root: *u8, argc: usize, argv: **u8,
                            images: *of.ObjectImage, irs: *ir.Module,
                            list_only: bool, tests_out: *TestList) i64 {
-    val cr: Result[testrunner.Collected, str] = testrunner.collect(p.s, irs, p.module_len);
-    if (is_err[testrunner.Collected, str](cr)) {
+    val res_collect: R.Result[testrunner.Collected, str] = testrunner.collect(p.s, irs, p.module_len);
+    if (R.is_err[testrunner.Collected, str](res_collect)) {
         print.eprint("error: ");
-        print.eprint(unwrap_err[testrunner.Collected, str](cr));
+        print.eprint(R.unwrap_err[testrunner.Collected, str](res_collect));
         print.eprint("\n");
         ret 2;
     }
-    var col: testrunner.Collected = unwrap_ok[testrunner.Collected, str](cr);
+    var col: testrunner.Collected = R.unwrap_ok[testrunner.Collected, str](res_collect);
     if (col.count == 0) {
         testrunner.free(p.s, ?col);
         print.eprint("error: no 'test' declarations found (add 'test \"name\" { ... }' blocks)\n");
@@ -656,20 +771,24 @@ fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool, verbo
 
     # `--list`: report each selected test's metadata without producing any object.
     if (list_only) {
-        var ti: u32 = 0;
-        for (ti < col.count) {
-            if (test_selected(p, ?col.tests[ti], filter)) {
-                val rc: i64 = record_test(p, ?col.tests[ti], nil, tests_out);
+        var i: u32 = 0;
+        for (i < col.count) {
+            if (test_selected(p, ?col.tests[i], filter)) {
+                val rc: i64 = record_test(p, ?col.tests[i], nil, tests_out);
                 if (rc != 0) { testrunner.free(p.s, ?col); ret rc; }
             }
-            ti = ti + 1;
+            i = i + 1;
         }
         testrunner.free(p.s, ?col);
         ret 0;
     }
 
     val te: *driver.TargetEntry = p.target_entry;
-    if (te == nil) { testrunner.free(p.s, ?col); print.eprint("error: no target selected\n"); ret 2; }
+    if (te == nil) {
+        testrunner.free(p.s, ?col);
+        print.eprint("error: no target selected\n");
+        ret 2;
+    }
 
     var obj_base: [4096]u8;
     if (!resolve_obj_base(p, root, ?obj_base[0], 4096)) {
@@ -682,15 +801,15 @@ fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool, verbo
     var shared: **u8 = nil;
     val oc: i64 = write_objects(p, images, ?obj_base[0], ?shared);
     if (oc != 0) { testrunner.free(p.s, ?col); ret oc; }
-    var shared_count: u32 = p.topo_len;
+    var shared_len: u32 = p.topo_len;
 
     # the external link inputs (libc, manifest/CLI libs), resolved once and shared.
-    var sonames: *intern.StrId = nil;
-    var soname_count: u32 = 0;
-    val ec: i64 = append_external_inputs(p, root, argc, argv, ?shared, ?shared_count, ?sonames, ?soname_count);
+    var sonames:    *intern.StrId = nil;
+    var soname_len: u32           = 0;
+    val ec: i64 = append_external_inputs(p, root, argc, argv, ?shared, ?shared_len, ?sonames, ?soname_len);
     if (ec != 0) {
-        free_paths(p.s.alloc, shared, shared_count, shared_count);
-        free_sonames(p.s.alloc, sonames, soname_count);
+        free_paths(p.s.alloc, shared, shared_len, shared_len);
+        free_sonames(p.s.alloc, sonames, soname_len);
         testrunner.free(p.s, ?col);
         ret ec;
     }
@@ -702,77 +821,104 @@ fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool, verbo
     }
 
     var code: i64 = 0;
-    var ti: u32 = 0;
-    for (ti < col.count) {
-        if (test_selected(p, ?col.tests[ti], filter)) {
-            # `ti` is the stable collection index, so a test's executable name is
+    var i: u32 = 0;
+    for (i < col.count) {
+        if (test_selected(p, ?col.tests[i], filter)) {
+            # `i` is the stable collection index, so a test's executable name is
             # unchanged whether or not a filter is in effect.
-            code = build_one_test(p, level, verify_ir, ?obj_base[0], root, ti, ?col.tests[ti],
-                                  shared, shared_count, sonames, soname_count, tests_out);
+            code = build_one_test(p, level, verify_ir, ?obj_base[0], root, i, ?col.tests[i],
+                                  shared, shared_len, sonames, soname_len, tests_out);
             if (code != 0) { brk; }
         }
-        ti = ti + 1;
+        i = i + 1;
     }
 
-    free_paths(p.s.alloc, shared, shared_count, shared_count);
-    free_sonames(p.s.alloc, sonames, soname_count);
+    free_paths(p.s.alloc, shared, shared_len, shared_len);
+    free_sonames(p.s.alloc, sonames, soname_len);
     testrunner.free(p.s, ?col);
     ret code;
 }
 
-# filter_value: the `--filter <substr>` value from argv, or nil when absent.
+# the `--filter <substr>` value from argv, or nil when absent
+# ---
+# argc: argument count including argv[0]
+# argv: the argument vector (argc null-terminated byte pointers)
+# ret:  the filter substring, or nil when `--filter` is absent
 fun filter_value(argc: usize, argv: **u8) *u8 {
-    val o: Option[*u8] = util.get_value(argc, argv, "--filter");
-    if (is_some[*u8](o)) { ret unwrap[*u8](o); }
+    val opt_filter: O.Option[*u8] = util.get_value(argc, argv, "--filter");
+    if (O.is_some[*u8](opt_filter)) { ret O.unwrap[*u8](opt_filter); }
     ret nil;
 }
 
-# test_selected: whether a test passes the name filter — every test when `filter`
-# is nil, else those whose label contains the filter substring.
+# whether a test passes the name filter
+#
+# Every test when `filter` is nil, else those whose label contains the filter
+# substring.
+# ---
+# p:      the project (for its interner)
+# t:      the test to test
+# filter: the filter substring, or nil to select every test
+# ret:    true when the test is selected
 fun test_selected(p: *driver.Project, t: *testrunner.Test, filter: *u8) bool {
     if (filter == nil) { ret true; }
-    val lo: Option[str] = intern.lookup(?p.s.interner, t.label);
-    if (is_none[str](lo)) { ret false; }
-    ret str_contains(unwrap[str](lo), util.cstr_str(filter));
+    val opt_label: O.Option[str] = intern.lookup(?p.s.interner, t.label);
+    if (O.is_none[str](opt_label)) { ret false; }
+    ret str_contains(O.unwrap[str](opt_label), util.cstr_str(filter));
 }
 
-# build_one_test: synthesize, codegen, and link a single test's executable, then
-# record its artifact. the entry module is `main(){ret <test>();}`; its object is
-# written to `<obj_base>/__mach_test_entry_<idx>.o` and linked with the shared
-# object set into the resolved `tests` path. returns 0 on success or a non-zero
-# exit code; all per-test resources are released before returning.
+# synthesize, codegen, and link a single test's executable, then record its
+# artifact
+#
+# The entry module is `main(){ret <test>();}`; its object is written to
+# `<obj_base>/__mach_test_entry_<idx>.o` and linked with the shared object set
+# into the resolved `tests` path. All per-test resources are released before
+# returning.
+# ---
+# p:          the project carrying the module graph and session
+# level:      optimization pipeline level
+# verify_ir:  run the IR verifier on the synthesized entry module
+# obj_base:   the resolved per-module object tree root
+# root:       the resolved project root directory
+# idx:        the test's stable collection index
+# t:          the test to build
+# shared:     the shared per-module object path set
+# shared_len: number of shared object paths
+# sonames:    the shared dynamic-dependency soname list
+# soname_len: number of sonames
+# tests_out:  the list to append the test's artifact to
+# ret:        0 on success, or a non-zero exit code
 fun build_one_test(p: *driver.Project, level: u8, verify_ir: bool, obj_base: *u8, root: *u8,
                    idx: u32, t: *testrunner.Test,
-                   shared: **u8, shared_count: u32,
-                   sonames: *intern.StrId, soname_count: u32,
+                   shared: **u8, shared_len: u32,
+                   sonames: *intern.StrId, soname_len: u32,
                    tests_out: *TestList) i64 {
-    val syn_r: Result[ir.Module, str] = testrunner.synthesize_entry(p.s, t.linkage);
-    if (is_err[ir.Module, str](syn_r)) {
+    val res_synth: R.Result[ir.Module, str] = testrunner.synthesize_entry(p.s, t.linkage);
+    if (R.is_err[ir.Module, str](res_synth)) {
         print.eprint("error: ");
-        print.eprint(unwrap_err[ir.Module, str](syn_r));
+        print.eprint(R.unwrap_err[ir.Module, str](res_synth));
         print.eprint("\n");
         ret 2;
     }
-    var entry_ir: ir.Module = unwrap_ok[ir.Module, str](syn_r);
+    var entry_ir: ir.Module = R.unwrap_ok[ir.Module, str](res_synth);
 
-    val opt_r: Result[bool, str] = pipeline.run(?entry_ir, ?p.target, level, verify_ir);
-    if (is_err[bool, str](opt_r)) {
+    val res_opt: R.Result[bool, str] = pipeline.run(?entry_ir, ?p.target, level, verify_ir);
+    if (R.is_err[bool, str](res_opt)) {
         ir.dnit(?entry_ir);
         print.eprint("error: ");
-        print.eprint(unwrap_err[bool, str](opt_r));
+        print.eprint(R.unwrap_err[bool, str](res_opt));
         print.eprint("\n");
         ret 2;
     }
 
-    val cg_r: Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, ?entry_ir, nil);
-    if (is_err[of.ObjectImage, str](cg_r)) {
+    val res_codegen: R.Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, ?entry_ir, nil);
+    if (R.is_err[of.ObjectImage, str](res_codegen)) {
         ir.dnit(?entry_ir);
         print.eprint("error: ");
-        print.eprint(unwrap_err[of.ObjectImage, str](cg_r));
+        print.eprint(R.unwrap_err[of.ObjectImage, str](res_codegen));
         print.eprint("\n");
         ret 2;
     }
-    var entry_img: of.ObjectImage = unwrap_ok[of.ObjectImage, str](cg_r);
+    var entry_img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](res_codegen);
 
     # write the entry object alongside the per-module objects.
     var entry_path: [4096]u8;
@@ -782,17 +928,17 @@ fun build_one_test(p: *driver.Project, level: u8, verify_ir: bool, obj_base: *u8
         print.eprint("error: failed to create test object directory\n");
         ret 2;
     }
-    val em: Result[bool, str] = obj.emit(?entry_img, ?p.target, ?entry_path[0]);
+    val res_emit: R.Result[bool, str] = obj.emit(?entry_img, ?p.target, ?entry_path[0]);
     obj.dnit(?entry_img);
     ir.dnit(?entry_ir);
-    if (is_err[bool, str](em)) {
+    if (R.is_err[bool, str](res_emit)) {
         print.eprint("error: ");
-        print.eprint(unwrap_err[bool, str](em));
+        print.eprint(R.unwrap_err[bool, str](res_emit));
         print.eprint("\n");
         ret 1;
     }
 
-    # the executable path: `<root>/<tests template with {name} = the sanitized name>`.
+    # the executable path: `<root>/<tests template with {name} = sanitized name>`.
     var name_buf: [256]u8;
     sanitize_test_name(?name_buf[0], 256, idx, t.label, ?p.s.interner);
     var exe_path: [4096]u8;
@@ -801,107 +947,138 @@ fun build_one_test(p: *driver.Project, level: u8, verify_ir: bool, obj_base: *u8
         ret 2;
     }
 
-    val lc: i64 = link_one_test(p, shared, shared_count, sonames, soname_count, ?entry_path[0], ?exe_path[0]);
+    val lc: i64 = link_one_test(p, shared, shared_len, sonames, soname_len, ?entry_path[0], ?exe_path[0]);
     if (lc != 0) { ret lc; }
 
     ret record_test(p, t, ?exe_path[0], tests_out);
 }
 
-# link_one_test: link the shared object set plus one test's entry object into the
-# test executable at `exe_path`. the shared paths are reused across tests, so the
-# combined array borrows their string pointers and only the array wrapper is
-# freed. returns 0 on success or a non-zero exit code.
-fun link_one_test(p: *driver.Project, shared: **u8, shared_count: u32,
-                  sonames: *intern.StrId, soname_count: u32,
+# link the shared object set plus one test's entry object into the test
+# executable at `exe_path`
+#
+# The shared paths are reused across tests, so the combined array borrows their
+# string pointers and only the array wrapper is freed.
+# ---
+# p:          the project carrying the session and target
+# shared:     the shared per-module object path set
+# shared_len: number of shared object paths
+# sonames:    the shared dynamic-dependency soname list
+# soname_len: number of sonames
+# entry_path: the test's entry-object path
+# exe_path:   the executable path to link into
+# ret:        0 on success, or a non-zero exit code
+fun link_one_test(p: *driver.Project, shared: **u8, shared_len: u32,
+                  sonames: *intern.StrId, soname_len: u32,
                   entry_path: *u8, exe_path: *u8) i64 {
-    val total: u32 = shared_count + 1;
-    val ar: Result[**u8, str] = allocate[*u8](p.s.alloc, total::usize);
-    if (is_err[**u8, str](ar)) { print.eprint("error: out of memory\n"); ret 2; }
-    val paths: **u8 = unwrap_ok[**u8, str](ar);
-    var i: u32 = 0;
-    for (i < shared_count) { paths[i] = shared[i]; i = i + 1; }
-    paths[shared_count] = entry_path;
+    val total: u32 = shared_len + 1;
+    val res_paths: R.Result[**u8, str] = A.allocate[*u8](p.s.alloc, total::usize);
+    if (R.is_err[**u8, str](res_paths)) { print.eprint("error: out of memory\n"); ret 2; }
+    val paths: **u8 = R.unwrap_ok[**u8, str](res_paths);
 
-    val link_r: Result[bool, str] =
-        linker.link(p.s, ?p.target, paths, total, sonames, soname_count, exe_path, linker.LINK_EXE);
-    deallocate[*u8](p.s.alloc, paths, total::usize);
-    if (is_err[bool, str](link_r)) {
+    var i: u32 = 0;
+    for (i < shared_len) { paths[i] = shared[i]; i = i + 1; }
+    paths[shared_len] = entry_path;
+
+    val res_link: R.Result[bool, str] =
+        linker.link(p.s, ?p.target, paths, total, sonames, soname_len, exe_path, linker.LINK_EXE);
+    A.deallocate[*u8](p.s.alloc, paths, total::usize);
+    if (R.is_err[bool, str](res_link)) {
         print.eprint("error: ");
-        print.eprint(unwrap_err[bool, str](link_r));
+        print.eprint(R.unwrap_err[bool, str](res_link));
         print.eprint("\n");
         ret 1;
     }
     ret 0;
 }
 
-# record_test: append a test's reporting artifact (label, source `file:line`, and
-# executable path) to `tests_out`, duplicating every string into the build
-# allocator so it outlives the session teardown. `exe` is nil in `--list` mode.
-# returns 0 on success or a non-zero exit code.
+# append a test's reporting artifact to `tests_out`
+#
+# Duplicates every string into the build allocator so it outlives the session
+# teardown. `exe` is nil in `--list` mode.
+# ---
+# p:         the project (for its interner and source map)
+# t:         the test to record
+# exe:       the executable path, or nil in `--list` mode
+# tests_out: the list to append the artifact to
+# ret:       0 on success, or a non-zero exit code
 fun record_test(p: *driver.Project, t: *testrunner.Test, exe: *u8, tests_out: *TestList) i64 {
-    var a: TestArtifact;
-    a.line = t.line;
+    var artifact: TestArtifact;
+    artifact.line = t.line;
 
-    val lo: Option[str] = intern.lookup(?p.s.interner, t.label);
+    val opt_label: O.Option[str] = intern.lookup(?p.s.interner, t.label);
     var label_src: *u8 = "<test>";
-    if (is_some[str](lo)) { label_src = unwrap[str](lo)::*u8; }
-    a.label = dup_cstr(p.s.alloc, label_src);
-    if (a.label == nil) { print.eprint("error: out of memory\n"); ret 2; }
+    if (O.is_some[str](opt_label)) { label_src = O.unwrap[str](opt_label)::*u8; }
+    artifact.label = dup_cstr(p.s.alloc, label_src);
+    if (artifact.label == nil) { print.eprint("error: out of memory\n"); ret 2; }
 
-    a.file = dup_cstr(p.s.alloc, test_source_path(p, t.mod_idx));
-    if (a.file == nil) { print.eprint("error: out of memory\n"); ret 2; }
+    artifact.file = dup_cstr(p.s.alloc, test_source_path(p, t.mod_idx));
+    if (artifact.file == nil) { print.eprint("error: out of memory\n"); ret 2; }
 
-    a.exe = nil;
+    artifact.exe = nil;
     if (exe != nil) {
-        a.exe = dup_cstr(p.s.alloc, exe);
-        if (a.exe == nil) { print.eprint("error: out of memory\n"); ret 2; }
+        artifact.exe = dup_cstr(p.s.alloc, exe);
+        if (artifact.exe == nil) { print.eprint("error: out of memory\n"); ret 2; }
     }
 
-    if (!push_artifact(p.s.alloc, tests_out, a)) { print.eprint("error: out of memory\n"); ret 2; }
+    if (!test_list_push(p.s.alloc, tests_out, artifact)) { print.eprint("error: out of memory\n"); ret 2; }
     ret 0;
 }
 
-# push_artifact: append one artifact to a TestList, doubling the backing array
-# when full. returns false on allocation failure.
-fun push_artifact(alloc: *Allocator, list: *TestList, a: TestArtifact) bool {
-    if (list.count == list.cap) {
+# append one artifact to a TestList, doubling the backing array when full
+# ---
+# a:    allocator backing the list
+# list: the list to append to
+# t:    the artifact to append
+# ret:  false on allocation failure
+fun test_list_push(a: *A.Allocator, list: *TestList, t: TestArtifact) bool {
+    if (list.len == list.cap) {
         var new_cap: u32 = list.cap * 2;
         if (new_cap < 8) { new_cap = 8; }
         if (list.tests == nil) {
-            val r: Result[*TestArtifact, str] = allocate[TestArtifact](alloc, new_cap::usize);
-            if (is_err[*TestArtifact, str](r)) { ret false; }
-            list.tests = unwrap_ok[*TestArtifact, str](r);
+            val res_alloc: R.Result[*TestArtifact, str] = A.allocate[TestArtifact](a, new_cap::usize);
+            if (R.is_err[*TestArtifact, str](res_alloc)) { ret false; }
+            list.tests = R.unwrap_ok[*TestArtifact, str](res_alloc);
         }
         or {
-            val r: Result[*TestArtifact, str] = reallocate[TestArtifact](alloc, list.tests, list.cap::usize, new_cap::usize);
-            if (is_err[*TestArtifact, str](r)) { ret false; }
-            list.tests = unwrap_ok[*TestArtifact, str](r);
+            val res_realloc: R.Result[*TestArtifact, str] = A.reallocate[TestArtifact](a, list.tests, list.cap::usize, new_cap::usize);
+            if (R.is_err[*TestArtifact, str](res_realloc)) { ret false; }
+            list.tests = R.unwrap_ok[*TestArtifact, str](res_realloc);
         }
         list.cap = new_cap;
     }
-    list.tests[list.count] = a;
-    list.count = list.count + 1;
+    list.tests[list.len] = t;
+    list.len = list.len + 1;
     ret true;
 }
 
-# test_source_path: the source file path of the module a test was declared in,
-# borrowed from the session source map (caller duplicates). "<unknown>" when the
-# module's file is not registered.
+# the source file path of the module a test was declared in
+#
+# Borrowed from the session source map (the caller duplicates). "<unknown>" when
+# the module's file is not registered.
+# ---
+# p:       the project (for its source map)
+# mod_idx: the declaring module's index
+# ret:     the borrowed source path, or "<unknown>"
 fun test_source_path(p: *driver.Project, mod_idx: u32) *u8 {
     if (mod_idx >= p.module_len) { ret "<unknown>"; }
     val m: *driver.ModuleEntry = ?p.modules[mod_idx];
-    val sf_o: Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
-    if (is_none[*src.SourceFile](sf_o)) { ret "<unknown>"; }
-    ret unwrap[*src.SourceFile](sf_o).path::*u8;
+    val opt_file: O.Option[*source.SourceFile] = source.get(?p.s.sources, m.file_id);
+    if (O.is_none[*source.SourceFile](opt_file)) { ret "<unknown>"; }
+    ret O.unwrap[*source.SourceFile](opt_file).path::*u8;
 }
 
-# entry_object_path: compose `<obj_base>/__mach_test_entry_<idx>.o` into `buf`.
-# returns false if it would not fit.
+# compose `<obj_base>/__mach_test_entry_<idx>.o` into `buf`
+# ---
+# obj_base: the per-module object tree root
+# idx:      the test's collection index
+# buf:      the destination buffer
+# cap:      the buffer capacity
+# ret:      false if it would not fit
 fun entry_object_path(obj_base: *u8, idx: u32, buf: *u8, cap: usize) bool {
     var leaf: [64]u8;
-    var k: usize = 0;
-    val prefix: str = "__mach_test_entry_";
-    val pl: usize = str_len(prefix);
+    var k:    usize = 0;
+    val prefix: str   = "__mach_test_entry_";
+    val pl:     usize = str_len(prefix);
     var i: usize = 0;
     for (i < pl) { leaf[k] = prefix[i]; k = k + 1; i = i + 1; }
     k = k + write_u32(?leaf[k], 64 - k, idx);
@@ -911,70 +1088,98 @@ fun entry_object_path(obj_base: *u8, idx: u32, buf: *u8, cap: usize) bool {
     ret util.join_into(buf, cap, obj_base, ?leaf[0]) > 0;
 }
 
-# sanitize_test_name: write the `{name}` for a test's executable into `buf` as
-# `<idx>-<sanitized label>` — the collection index keeps it unique (labels are not
-# globally unique) and stable, and every byte of the label outside
-# `[A-Za-z0-9._-]` becomes `_` so the name is filesystem-safe. the label portion
-# is truncated to keep the name bounded. always null-terminated.
+# write the `{name}` for a test's executable into `buf` as `<idx>-<label>`
+#
+# The collection index keeps it unique (labels are not globally unique) and
+# stable, and every byte of the label outside `[A-Za-z0-9._-]` becomes `_` so
+# the name is filesystem-safe. The label portion is truncated to keep the name
+# bounded. Always null-terminated.
+# ---
+# buf:   the destination buffer
+# cap:   the buffer capacity
+# idx:   the test's collection index
+# label: the interned test label
+# i:     the interner to resolve `label` against
+# ret:   the byte length written (excluding the terminator)
 fun sanitize_test_name(buf: *u8, cap: usize, idx: u32, label: intern.StrId, i: *intern.Interner) usize {
     var k: usize = write_u32(buf, cap, idx);
     if (k + 1 < cap) { buf[k] = '-'; k = k + 1; }
 
-    val lo: Option[str] = intern.lookup(i, label);
-    if (is_some[str](lo)) {
-        val s: str = unwrap[str](lo);
-        val n: usize = str_len(s);
-        var j: usize = 0;
+    val opt_label: O.Option[str] = intern.lookup(i, label);
+    if (O.is_some[str](opt_label)) {
+        val label_str: str   = O.unwrap[str](opt_label);
+        val n:         usize = str_len(label_str);
+        var ii: usize = 0;
         # bound the label portion so the file name stays short and path-safe.
-        for (j < n && j < 60::usize && k + 1 < cap) {
-            buf[k] = sanitize_byte(s[j]);
+        for (ii < n && ii < 60::usize && k + 1 < cap) {
+            buf[k] = sanitize_byte(label_str[ii]);
             k = k + 1;
-            j = j + 1;
+            ii = ii + 1;
         }
     }
     if (k < cap) { buf[k] = 0; }
-    or { buf[cap - 1] = 0; }
+    or          { buf[cap - 1] = 0; }
     ret k;
 }
 
-# sanitize_byte: keep `[A-Za-z0-9._-]`; map every other byte to `_`.
+# keep `[A-Za-z0-9._-]`; map every other byte to `_`
+# ---
+# c:   the byte to sanitize
+# ret: `c` when path-safe, else `_`
 fun sanitize_byte(c: u8) u8 {
-    if (c >= 'a' && c <= 'z') { ret c; }
-    if (c >= 'A' && c <= 'Z') { ret c; }
-    if (c >= '0' && c <= '9') { ret c; }
+    if (c >= 'a' && c <= 'z')             { ret c; }
+    if (c >= 'A' && c <= 'Z')             { ret c; }
+    if (c >= '0' && c <= '9')             { ret c; }
     if (c == '.' || c == '_' || c == '-') { ret c; }
     ret '_';
 }
 
-# write_u32: write the decimal text of `n` into `buf` (null terminator excluded),
-# returning the number of digits written. a single `0` for zero.
+# write the decimal text of `n` into `buf` (null terminator excluded)
+#
+# A single `0` for zero.
+# ---
+# buf: the destination buffer
+# cap: the buffer capacity
+# n:   the value to render
+# ret: the number of digits written
 fun write_u32(buf: *u8, cap: usize, n: u32) usize {
     if (cap == 0) { ret 0; }
-    if (n == 0) { buf[0] = '0'; ret 1; }
+    if (n == 0)   { buf[0] = '0'; ret 1; }
     var tmp: [16]u8;
-    var t: usize = 0;
-    var v: u32 = n;
+    var t:   usize = 0;
+    var v:   u32   = n;
     for (v > 0) { tmp[t] = (v % 10)::u8 + '0'; v = v / 10; t = t + 1; }
     var k: usize = 0;
     for (k < t && k < cap) { buf[k] = tmp[t - 1 - k]; k = k + 1; }
     ret k;
 }
 
-# resolve_test_exe: write `<root>/<tests template with {name} = name>` into `buf`.
-# the resolved `tests` template carries a literal `{name}` placeholder (filled
-# here per test). returns false when the template is not interned or it would not
-# fit.
+# write `<root>/<tests template with {name} = name>` into `buf`
+#
+# The resolved `tests` template carries a literal `{name}` placeholder (filled
+# here per test).
+# ---
+# p:    the project (for its interner and config)
+# root: the resolved project root directory
+# name: the sanitized test name to substitute
+# buf:  the destination buffer
+# cap:  the buffer capacity
+# ret:  false when the template is not interned or it would not fit
 fun resolve_test_exe(p: *driver.Project, root: *u8, name: str, buf: *u8, cap: usize) bool {
-    val o: Option[str] = intern.lookup(?p.s.interner, p.config.test_root);
-    if (is_none[str](o)) { ret false; }
+    val opt_tmpl: O.Option[str] = intern.lookup(?p.s.interner, p.config.test_root);
+    if (O.is_none[str](opt_tmpl)) { ret false; }
     var rel: [4096]u8;
-    if (subst_name(unwrap[str](o), name, ?rel[0], 4096) == 0) { ret false; }
+    if (subst_name(O.unwrap[str](opt_tmpl), name, ?rel[0], 4096) == 0) { ret false; }
     ret join_into_str(buf, cap, root, util.cstr_str(?rel[0])) > 0;
 }
 
-# subst_name: copy `tmpl` into `out`, replacing every `{name}` occurrence with
-# `name`. returns the byte length written (excluding the terminator), or 0 if it
-# would not fit.
+# copy `tmpl` into `out`, replacing every `{name}` occurrence with `name`
+# ---
+# tmpl: the template text
+# name: the substitution value
+# out:  the destination buffer
+# cap:  the buffer capacity
+# ret:  the byte length written (excluding the terminator), or 0 if it would not fit
 fun subst_name(tmpl: str, name: str, out: *u8, cap: usize) usize {
     val tn: usize = str_len(tmpl);
     val nn: usize = str_len(name);
@@ -999,20 +1204,28 @@ fun subst_name(tmpl: str, name: str, out: *u8, cap: usize) usize {
     ret k;
 }
 
-# link_artifact: write each per-module image to a relocatable `.o` on disk
-# whose path mirrors the module FQN under the manifest's resolved `obj`
-# directory, then — in executable mode — link the on-disk object set into the
-# resolved artifact path. the layout is `<root>/<resolved obj>/<rel>.o`, where
-# `<rel>` is the FQN with '.' turned into '/'; the executable is the resolved
-# `<root>/<bin_out>`. `out_override` (-o), when non-nil, replaces the artifact
-# path: an absolute path is used verbatim; a relative path is rooted at `<root>`.
-# in library mode (or with
-# `--emit obj`) no executable is linked and the per-module objects are the
-# deliverable. returns the exit code and sets `*out_path` on success — the
-# binary in executable mode, the object tree root in library mode. the linker
-# reads its inputs from disk, so the per-module objects are materialised
-# before linking. when `verbose` is set, the object count and output path are
-# written to stderr.
+# write each per-module image to a relocatable `.o` on disk, then - in
+# executable mode - link the on-disk object set into the resolved artifact path
+#
+# The object layout is `<root>/<resolved obj>/<rel>.o`, where `<rel>` is the FQN
+# with '.' turned into '/'; the executable is the resolved `<root>/<bin_out>`.
+# `out_override` (-o), when non-nil, replaces the artifact path: an absolute path
+# is used verbatim; a relative path is rooted at `<root>`. In library mode (or
+# with `--emit obj`) no executable is linked and the per-module objects are the
+# deliverable. Sets `*out_path` on success - the binary in executable mode, the
+# object tree root in library mode. The linker reads its inputs from disk, so the
+# per-module objects are materialized before linking.
+# ---
+# p:            the project carrying the module graph and session
+# emit_obj:     emit the per-module objects only, linking no executable
+# verbose:      write the object count and output path to stderr
+# root:         the resolved project root directory
+# out_override: the `-o` artifact path, or nil to use the resolved path
+# argc:         argument count including argv[0]
+# argv:         the argument vector (argc null-terminated byte pointers)
+# images:       the per-module object images to write
+# out_path:     receives the owned produced-artifact path on success
+# ret:          0 on success, 1 on a user error, 2 on an internal error
 fun link_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root: *u8,
                   out_override: *u8,
                   argc: usize, argv: **u8,
@@ -1030,7 +1243,7 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root: *u8,
     var paths: **u8 = nil;
     val obj_code: i64 = write_objects(p, images, ?obj_base[0], ?paths);
     if (obj_code != 0) { ret obj_code; }
-    var count: u32 = p.topo_len;
+    var len: u32 = p.topo_len;
 
     # library mode (or `--emit obj`): the per-module objects are the deliverable;
     # do not link an executable.
@@ -1040,33 +1253,33 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root: *u8,
             print.eprint((?obj_base[0])::str);
             print.eprint("\n");
         }
-        free_paths(p.s.alloc, paths, count, count);
+        free_paths(p.s.alloc, paths, len, len);
         @out_path = dup_cstr(p.s.alloc, ?obj_base[0]);
         ret 0;
     }
 
-    # append every external link input — the manifest's merged link overlay plus
-    # the `-L`/`-l`/explicit-object CLI flags. each resolves either STATICALLY to a
-    # loose `.o` object or `.a` archive on disk (appended to `paths`, an archive
+    # append every external link input - the manifest's merged link overlay plus
+    # the `-L`/`-l`/explicit-object CLI flags. each resolves either STATICALLY to
+    # a loose `.o` object or `.a` archive on disk (appended to `paths`, an archive
     # contributing its member objects), or DYNAMICALLY to a shared library `.so`
     # (recorded as a soname in `sonames`, a DT_NEEDED dependency bound at run
     # time). `paths` and `sonames` are grown and re-bound here.
-    var sonames: *intern.StrId = nil;
-    var soname_count: u32 = 0;
-    val ext_code: i64 = append_external_inputs(p, root, argc, argv, ?paths, ?count, ?sonames, ?soname_count);
+    var sonames:    *intern.StrId = nil;
+    var soname_len: u32           = 0;
+    val ext_code: i64 = append_external_inputs(p, root, argc, argv, ?paths, ?len, ?sonames, ?soname_len);
     if (ext_code != 0) {
-        free_paths(p.s.alloc, paths, count, count);
-        free_sonames(p.s.alloc, sonames, soname_count);
+        free_paths(p.s.alloc, paths, len, len);
+        free_sonames(p.s.alloc, sonames, soname_len);
         ret ext_code;
     }
 
     if (verbose) {
         print.eprint("link ");
-        print.eu64(count::u64);
+        print.eu64(len::u64);
         print.eprint(" object(s)");
-        if (soname_count > 0) {
+        if (soname_len > 0) {
             print.eprint(", ");
-            print.eu64(soname_count::u64);
+            print.eu64(soname_len::u64);
             print.eprint(" shared lib(s)");
         }
         print.eprint("\n");
@@ -1079,29 +1292,29 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root: *u8,
         util.path_into(?artifact[0], 4096, root, out_override);
     }
     or {
-        val bin_opt: Option[str] = intern.lookup(?p.s.interner, p.config.bin_out);
-        if (is_none[str](bin_opt) || str_empty(unwrap[str](bin_opt))) {
-            free_paths(p.s.alloc, paths, count, count);
-            free_sonames(p.s.alloc, sonames, soname_count);
+        val opt_bin: O.Option[str] = intern.lookup(?p.s.interner, p.config.bin_out);
+        if (O.is_none[str](opt_bin) || str_empty(O.unwrap[str](opt_bin))) {
+            free_paths(p.s.alloc, paths, len, len);
+            free_sonames(p.s.alloc, sonames, soname_len);
             print.eprint("error: selected artifact has no output path; set the `out` template in mach.toml\n");
             ret 1;
         }
-        join_into_str(?artifact[0], 4096, root, unwrap[str](bin_opt));
+        join_into_str(?artifact[0], 4096, root, O.unwrap[str](opt_bin));
     }
     if (!util.ensure_parents(?artifact[0])) {
-        free_paths(p.s.alloc, paths, count, count);
-        free_sonames(p.s.alloc, sonames, soname_count);
+        free_paths(p.s.alloc, paths, len, len);
+        free_sonames(p.s.alloc, sonames, soname_len);
         print.eprint("error: failed to create binary directory\n");
         ret 2;
     }
 
-    val link_r: Result[bool, str] =
-        linker.link(p.s, ?p.target, paths, count, sonames, soname_count, ?artifact[0], linker.LINK_EXE);
-    free_paths(p.s.alloc, paths, count, count);
-    free_sonames(p.s.alloc, sonames, soname_count);
-    if (is_err[bool, str](link_r)) {
+    val res_link: R.Result[bool, str] =
+        linker.link(p.s, ?p.target, paths, len, sonames, soname_len, ?artifact[0], linker.LINK_EXE);
+    free_paths(p.s.alloc, paths, len, len);
+    free_sonames(p.s.alloc, sonames, soname_len);
+    if (R.is_err[bool, str](res_link)) {
         print.eprint("error: ");
-        print.eprint(unwrap_err[bool, str](link_r));
+        print.eprint(R.unwrap_err[bool, str](res_link));
         print.eprint("\n");
         ret 1;
     }
@@ -1116,10 +1329,14 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root: *u8,
     ret 0;
 }
 
-# is_object_path: whether a link-input token denotes an explicit link-input file
-# path rather than a bare `-l`-style library name. a token is treated as a path
-# when it contains a '/' (any directory component) or ends in `.o` (a loose
-# object) or `.a` (a static archive).
+# whether a link-input token denotes an explicit file path rather than a bare
+# `-l`-style library name
+#
+# A token is treated as a path when it contains a '/' (any directory component)
+# or ends in `.o` (a loose object) or `.a` (a static archive).
+# ---
+# tok: the token to classify
+# ret: true when `tok` is an explicit object/archive path
 fun is_object_path(tok: *u8) bool {
     if (tok == nil) { ret false; }
     val n: usize = str_len(tok::str);
@@ -1133,14 +1350,21 @@ fun is_object_path(tok: *u8) bool {
     ret false;
 }
 
-# resolve_input_into: resolve one link-input token to an existing input file,
-# writing the absolute-or-relative path into `buf`. an explicit object/archive
-# path (`is_object_path`, i.e. a `.o` or `.a`) is taken verbatim. a bare
-# `-l`-style name is searched in each `-L <dir>` as `<dir>/lib<name>.o`,
-# `<dir>/<name>.o`, `<dir>/lib<name>.a`, `<dir>/<name>.a`, then the same four
-# candidates relative to the working directory. returns true once an existing
-# file is found and written; false when nothing resolves. `.so` shared libraries
-# are not handled — only loose `.o` objects and static `.a` archives.
+# resolve one link-input token to an existing input file, writing the
+# absolute-or-relative path into `buf`
+#
+# An explicit object/archive path (`is_object_path`, i.e. a `.o` or `.a`) is
+# taken verbatim. A bare `-l`-style name is searched in each `-L <dir>` as
+# `<dir>/lib<name>.o`, `<dir>/<name>.o`, `<dir>/lib<name>.a`, `<dir>/<name>.a`,
+# then the same four candidates relative to the working directory. `.so` shared
+# libraries are not handled - only loose `.o` objects and static `.a` archives.
+# ---
+# tok:  the token to resolve
+# argc: argument count including argv[0]
+# argv: the argument vector (argc null-terminated byte pointers)
+# buf:  the destination buffer
+# cap:  the buffer capacity
+# ret:  true once an existing file is found and written
 fun resolve_input_into(tok: *u8, argc: usize, argv: **u8, buf: *u8, cap: usize) bool {
     if (tok == nil || str_empty(tok::str)) { ret false; }
 
@@ -1150,42 +1374,55 @@ fun resolve_input_into(tok: *u8, argc: usize, argv: **u8, buf: *u8, cap: usize) 
         var i: usize = 0;
         for (i < n) { buf[i] = tok[i]; i = i + 1; }
         buf[n] = 0;
-        ret fs.is_file(util.cstr_str(buf));
+        ret filesystem.is_file(util.cstr_str(buf));
     }
 
     # bare name: search each `-L` dir, then the working directory, for the
     # `lib<name>.o` and `<name>.o` candidates in turn.
-    var li: usize = 0;
-    for (li < argc) {
-        if (str_equals(argv[li]::str, "-L") && li + 1 < argc) {
-            if (try_named_object(argv[li + 1], tok, buf, cap)) { ret true; }
+    var i: usize = 0;
+    for (i < argc) {
+        if (str_equals(argv[i]::str, "-L") && i + 1 < argc) {
+            if (try_named_object(argv[i + 1], tok, buf, cap)) { ret true; }
         }
-        li = li + 1;
+        i = i + 1;
     }
     if (try_named_object(nil, tok, buf, cap)) { ret true; }
     ret false;
 }
 
-# try_named_object: probe the `lib<name>` / `<name>` candidates with a `.o`
-# (loose object) then `.a` (static archive) extension, writing the first existing
-# hit into `buf`. a nil `dir` probes them relative to the working directory; a
-# non-nil `dir` roots them under it. loose objects are preferred over archives so
-# resolution is unchanged for an `-l` name that has a loose `.o`. returns true on
-# the first existing candidate.
+# probe the `lib<name>` / `<name>` candidates with a `.o` then `.a` extension,
+# writing the first existing hit into `buf`
+#
+# A nil `dir` probes them relative to the working directory; a non-nil `dir`
+# roots them under it. Loose objects are preferred over archives so resolution
+# is unchanged for an `-l` name that has a loose `.o`.
+# ---
+# dir:  the directory to root the probes under, or nil for the working directory
+# name: the bare library name
+# buf:  the destination buffer
+# cap:  the buffer capacity
+# ret:  true on the first existing candidate
 fun try_named_object(dir: *u8, name: *u8, buf: *u8, cap: usize) bool {
-    if (write_named_candidate(dir, "lib", name, "o", buf, cap) && fs.is_file(util.cstr_str(buf))) { ret true; }
-    if (write_named_candidate(dir, "", name, "o", buf, cap) && fs.is_file(util.cstr_str(buf)))    { ret true; }
-    if (write_named_candidate(dir, "lib", name, "a", buf, cap) && fs.is_file(util.cstr_str(buf))) { ret true; }
-    if (write_named_candidate(dir, "", name, "a", buf, cap) && fs.is_file(util.cstr_str(buf)))    { ret true; }
+    if (write_named_candidate(dir, "lib", name, "o", buf, cap) && filesystem.is_file(util.cstr_str(buf))) { ret true; }
+    if (write_named_candidate(dir, "", name, "o", buf, cap) && filesystem.is_file(util.cstr_str(buf)))    { ret true; }
+    if (write_named_candidate(dir, "lib", name, "a", buf, cap) && filesystem.is_file(util.cstr_str(buf))) { ret true; }
+    if (write_named_candidate(dir, "", name, "a", buf, cap) && filesystem.is_file(util.cstr_str(buf)))    { ret true; }
     ret false;
 }
 
-# write_named_candidate: compose `<dir>/<prefix><name>.<ext>` (or
-# `<prefix><name>.<ext>` when `dir` is nil) into `buf`, null-terminated. returns
-# false if it would not fit. `prefix` is "lib" or ""; `ext` is "o" or "a".
+# compose `<dir>/<prefix><name>.<ext>` (or `<prefix><name>.<ext>` when `dir` is
+# nil) into `buf`, null-terminated
+# ---
+# dir:    the directory to root the path under, or nil
+# prefix: "lib" or ""
+# name:   the library name
+# ext:    "o" or "a"
+# buf:    the destination buffer
+# cap:    the buffer capacity
+# ret:    false if it would not fit
 fun write_named_candidate(dir: *u8, prefix: *u8, name: *u8, ext: *u8, buf: *u8, cap: usize) bool {
-    # dir is nil for a working-directory probe; util.cstr_len is the nil-safe length
-    # adapter (str_len derefs nil — mach-std#204). the rest are never nil.
+    # dir is nil for a working-directory probe; util.cstr_len is the nil-safe
+    # length adapter (str_len derefs nil). the rest are never nil.
     val dl: usize = util.cstr_len(dir);
     val pl: usize = str_len(prefix::str);
     val nl: usize = str_len(name::str);
@@ -1212,159 +1449,202 @@ fun write_named_candidate(dir: *u8, prefix: *u8, name: *u8, ext: *u8, buf: *u8, 
     ret true;
 }
 
-# count_external_tokens: number of external link-input tokens — the selected
-# target's manifest libs, the cascading transitive dep libs (#1218), and every
-# `-l <name>` flag and bare object-file path argument in argv. argv[0] (the
+# number of external link-input tokens
+#
+# The selected target's manifest libs, the cascading transitive dep libs, and
+# every `-l <name>` flag and bare object-file path argument in argv. argv[0] (the
 # program), the subcommand, every known flag and its value, and the project-path
 # positional are skipped so only real link inputs are counted.
+# ---
+# p:    the project carrying the target entry and config
+# argc: argument count including argv[0]
+# argv: the argument vector (argc null-terminated byte pointers)
+# ret:  the external link-input token count
 fun count_external_tokens(p: *driver.Project, argc: usize, argv: **u8) u32 {
     var n: u32 = 0;
     val te: *driver.TargetEntry = p.target_entry;
     if (te != nil) { n = n + te.lib_count; }
-    # cascading transitive dep libs (#1218); 0 when no dep contributes any.
+    # cascading transitive dep libs; 0 when no dep contributes any.
     n = n + p.config.cascade_lib_count;
 
     val proj_ix: usize = util.positional_index(argc, argv, 2);
     var i: usize = 0;
     for (i < argc) {
         val a: *u8 = argv[i];
-        if (str_equals(a::str, "-l") && i + 1 < argc)      { n = n + 1; i = i + 2; cnt; }
-        if (util.is_value_flag(a) && i + 1 < argc) { i = i + 2; cnt; }
+        if (str_equals(a::str, "-l") && i + 1 < argc)                              { n = n + 1; i = i + 2; cnt; }
+        if (util.is_value_flag(a) && i + 1 < argc)                                 { i = i + 2; cnt; }
         if (i > 1 && i != proj_ix && a != nil && a[0] != '-' && is_object_path(a)) { n = n + 1; }
         i = i + 1;
     }
     ret n;
 }
 
-# append_external_inputs: resolve every external link input (the manifest's
-# merged link overlay plus the CLI `-L`/`-l`/explicit-object flags) and classify
-# each as STATIC (a loose `.o` or static `.a`, appended to `*paths`) or DYNAMIC
-# (a shared `.so`, whose soname is interned and appended to `*sonames`).
+# resolve every external link input and classify each as STATIC or DYNAMIC
 #
-# `*paths` is pre-grown by the token count (the worst case where every input is
-# an object) and then shrunk to the true object count `*count`, so the array is
-# dense (no nil holes) and `free_paths(.., count, count)` frees it correctly.
-# `*sonames` grows one slot per shared dependency. an input that resolves to no
-# existing file is a hard error so a typo never silently drops a dependency.
-# returns 0 on success, or a non-zero exit code.
+# The manifest's merged link overlay plus the CLI `-L`/`-l`/explicit-object flags
+# are each resolved as STATIC (a loose `.o` or static `.a`, appended to `*paths`)
+# or DYNAMIC (a shared `.so`, whose soname is interned and appended to
+# `*sonames`). `*paths` is pre-grown by the token count (the worst case where
+# every input is an object) and then shrunk to the true object count `*len`, so
+# the array is dense (no nil holes) and `free_paths(.., len, len)` frees it
+# correctly. `*sonames` grows one slot per shared dependency. An input that
+# resolves to no existing file is a hard error so a typo never silently drops a
+# dependency.
+# ---
+# p:          the project carrying the target entry, config, and session
+# root:       the resolved project root directory
+# argc:       argument count including argv[0]
+# argv:       the argument vector (argc null-terminated byte pointers)
+# paths:      the static object-path array to grow and fill
+# len:        the static object-path count, updated to the true count
+# sonames:    the dynamic-dependency soname array to grow and fill
+# soname_len: the soname count
+# ret:        0 on success, or a non-zero exit code
 fun append_external_inputs(p: *driver.Project, root: *u8, argc: usize, argv: **u8,
-                           paths: ***u8, count: *u32,
-                           sonames: **intern.StrId, soname_count: *u32) i64 {
-    @sonames = nil;
-    @soname_count = 0;
+                           paths: ***u8, len: *u32,
+                           sonames: **intern.StrId, soname_len: *u32) i64 {
+    @sonames    = nil;
+    @soname_len = 0;
     val extra: u32 = count_external_tokens(p, argc, argv);
     if (extra == 0) { ret 0; }
 
-    val base: u32 = @count;
+    val base:  u32 = @len;
     val grown: u32 = base + extra;
-    val gr: Result[**u8, str] = reallocate[*u8](p.s.alloc, @paths, base::usize, grown::usize);
-    if (is_err[**u8, str](gr)) { print.eprint("error: out of memory\n"); ret 2; }
-    @paths = unwrap_ok[**u8, str](gr);
+    val res_grow: R.Result[**u8, str] = A.reallocate[*u8](p.s.alloc, @paths, base::usize, grown::usize);
+    if (R.is_err[**u8, str](res_grow)) { print.eprint("error: out of memory\n"); ret 2; }
+    @paths = R.unwrap_ok[**u8, str](res_grow);
 
     var z: u32 = base;
     for (z < grown) { (@paths)[z] = nil; z = z + 1; }
-    @count = grown;
+    @len = grown;
 
     var written: u32 = base;
     var buf: [4096]u8;
 
     # the consumer's own manifest libs first, then the cascading transitive dep
-    # libs (#1218), then the CLI tokens — a stable order keeps the link
-    # deterministic across runs.
+    # libs, then the CLI tokens - a stable order keeps the link deterministic
+    # across runs.
     val te: *driver.TargetEntry = p.target_entry;
     if (te != nil) {
-        var li: u32 = 0;
-        for (li < te.lib_count) {
-            val lib_opt: Option[str] = intern.lookup(?p.s.interner, te.libs[li]);
-            if (is_none[str](lib_opt)) { ret 2; }
-            val tok: *u8 = unwrap[str](lib_opt)::*u8;
+        var i: u32 = 0;
+        for (i < te.lib_count) {
+            val opt_lib: O.Option[str] = intern.lookup(?p.s.interner, te.libs[i]);
+            if (O.is_none[str](opt_lib)) { ret 2; }
+            val tok: *u8 = O.unwrap[str](opt_lib)::*u8;
             val code: i64 = resolve_and_store_input(p, tok, root, argc, argv, ?buf[0], 4096,
-                                                    @paths, ?written, sonames, soname_count);
-            if (code != 0) { shrink_paths(p, paths, count, written, grown); ret code; }
-            li = li + 1;
+                                                    @paths, ?written, sonames, soname_len);
+            if (code != 0) { shrink_paths(p, paths, len, written, grown); ret code; }
+            i = i + 1;
         }
     }
 
-    var ci: u32 = 0;
-    for (ci < p.config.cascade_lib_count) {
-        val lib_opt: Option[str] = intern.lookup(?p.s.interner, p.config.cascade_libs[ci]);
-        if (is_none[str](lib_opt)) { ret 2; }
-        val tok: *u8 = unwrap[str](lib_opt)::*u8;
+    var i: u32 = 0;
+    for (i < p.config.cascade_lib_count) {
+        val opt_lib: O.Option[str] = intern.lookup(?p.s.interner, p.config.cascade_libs[i]);
+        if (O.is_none[str](opt_lib)) { ret 2; }
+        val tok: *u8 = O.unwrap[str](opt_lib)::*u8;
         val code: i64 = resolve_and_store_input(p, tok, root, argc, argv, ?buf[0], 4096,
-                                                @paths, ?written, sonames, soname_count);
-        if (code != 0) { shrink_paths(p, paths, count, written, grown); ret code; }
-        ci = ci + 1;
-    }
-
-    val proj_ix: usize = util.positional_index(argc, argv, 2);
-    var i: usize = 0;
-    for (i < argc) {
-        val a: *u8 = argv[i];
-        if (str_equals(a::str, "-l") && i + 1 < argc) {
-            val code: i64 = resolve_and_store_input(p, argv[i + 1], root, argc, argv, ?buf[0], 4096,
-                                                    @paths, ?written, sonames, soname_count);
-            if (code != 0) { shrink_paths(p, paths, count, written, grown); ret code; }
-            i = i + 2; cnt;
-        }
-        if (util.is_value_flag(a) && i + 1 < argc) { i = i + 2; cnt; }
-        if (i > 1 && i != proj_ix && a != nil && a[0] != '-' && is_object_path(a)) {
-            val code: i64 = resolve_and_store_input(p, a, root, argc, argv, ?buf[0], 4096,
-                                                    @paths, ?written, sonames, soname_count);
-            if (code != 0) { shrink_paths(p, paths, count, written, grown); ret code; }
-        }
+                                                @paths, ?written, sonames, soname_len);
+        if (code != 0) { shrink_paths(p, paths, len, written, grown); ret code; }
         i = i + 1;
     }
 
-    shrink_paths(p, paths, count, written, grown);
+    val proj_ix: usize = util.positional_index(argc, argv, 2);
+    var ii: usize = 0;
+    for (ii < argc) {
+        val a: *u8 = argv[ii];
+        if (str_equals(a::str, "-l") && ii + 1 < argc) {
+            val code: i64 = resolve_and_store_input(p, argv[ii + 1], root, argc, argv, ?buf[0], 4096,
+                                                    @paths, ?written, sonames, soname_len);
+            if (code != 0) { shrink_paths(p, paths, len, written, grown); ret code; }
+            ii = ii + 2; cnt;
+        }
+        if (util.is_value_flag(a) && ii + 1 < argc) { ii = ii + 2; cnt; }
+        if (ii > 1 && ii != proj_ix && a != nil && a[0] != '-' && is_object_path(a)) {
+            val code: i64 = resolve_and_store_input(p, a, root, argc, argv, ?buf[0], 4096,
+                                                    @paths, ?written, sonames, soname_len);
+            if (code != 0) { shrink_paths(p, paths, len, written, grown); ret code; }
+        }
+        ii = ii + 1;
+    }
+
+    shrink_paths(p, paths, len, written, grown);
     ret 0;
 }
 
-# shrink_paths: shrink the over-grown object-path array to its true object count
-# `written` and set `*count` to it, so the array is dense and frees at its size.
-# a shrink failure leaves the array at its grown size, which `free_paths` still
+# shrink the over-grown object-path array to its true object count and set `*len`
+# to it, so the array is dense and frees at its size
+#
+# A shrink failure leaves the array at its grown size, which `free_paths` still
 # frees correctly (the unfilled tail slots are nil).
-fun shrink_paths(p: *driver.Project, paths: ***u8, count: *u32, written: u32, grown: u32) {
+# ---
+# p:       the project (for its session allocator)
+# paths:   the over-grown object-path array
+# len:     receives the true object count
+# written: the true object count
+# grown:   the over-grown array length
+fun shrink_paths(p: *driver.Project, paths: ***u8, len: *u32, written: u32, grown: u32) {
     if (written < grown) {
-        val sr: Result[**u8, str] = reallocate[*u8](p.s.alloc, @paths, grown::usize, written::usize);
-        if (is_ok[**u8, str](sr)) { @paths = unwrap_ok[**u8, str](sr); @count = written; ret; }
+        val res_shrink: R.Result[**u8, str] = A.reallocate[*u8](p.s.alloc, @paths, grown::usize, written::usize);
+        if (R.is_ok[**u8, str](res_shrink)) {
+            @paths = R.unwrap_ok[**u8, str](res_shrink);
+            @len   = written;
+            ret;
+        }
     }
-    @count = grown;
+    @len = grown;
 }
 
-# append_soname: intern a shared library's soname and append it to the dynamic
-# dependency list, growing it one slot at a time. returns 0 on success or a
-# non-zero exit code.
-fun append_soname(p: *driver.Project, name: *u8, sonames: **intern.StrId, soname_count: *u32) i64 {
-    val ir: Result[intern.StrId, str] = intern.intern(?p.s.interner, util.cstr_str(name));
-    if (is_err[intern.StrId, str](ir)) { print.eprint("error: out of memory\n"); ret 2; }
-    val id: intern.StrId = unwrap_ok[intern.StrId, str](ir);
+# intern a shared library's soname and append it to the dynamic dependency list,
+# growing it one slot at a time
+# ---
+# p:          the project (for its interner and session allocator)
+# name:       the soname to intern
+# sonames:    the dynamic-dependency soname array to grow
+# soname_len: the soname count
+# ret:        0 on success, or a non-zero exit code
+fun append_soname(p: *driver.Project, name: *u8, sonames: **intern.StrId, soname_len: *u32) i64 {
+    val res_intern: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, util.cstr_str(name));
+    if (R.is_err[intern.StrId, str](res_intern)) { print.eprint("error: out of memory\n"); ret 2; }
+    val id: intern.StrId = R.unwrap_ok[intern.StrId, str](res_intern);
 
-    val old: u32 = @soname_count;
-    val gr: Result[*intern.StrId, str] =
-        reallocate[intern.StrId](p.s.alloc, @sonames, old::usize, (old + 1)::usize);
-    if (is_err[*intern.StrId, str](gr)) { print.eprint("error: out of memory\n"); ret 2; }
-    @sonames = unwrap_ok[*intern.StrId, str](gr);
+    val old: u32 = @soname_len;
+    val res_grow: R.Result[*intern.StrId, str] =
+        A.reallocate[intern.StrId](p.s.alloc, @sonames, old::usize, (old + 1)::usize);
+    if (R.is_err[*intern.StrId, str](res_grow)) { print.eprint("error: out of memory\n"); ret 2; }
+    @sonames = R.unwrap_ok[*intern.StrId, str](res_grow);
     (@sonames)[old] = id;
-    @soname_count = old + 1;
+    @soname_len = old + 1;
     ret 0;
 }
 
-# free_sonames: release the dynamic-dependency soname array.
-fun free_sonames(alloc: *Allocator, sonames: *intern.StrId, soname_count: u32) {
-    if (sonames != nil && soname_count > 0) {
-        deallocate[intern.StrId](alloc, sonames, soname_count::usize);
+# release the dynamic-dependency soname array
+# ---
+# a:          allocator backing the array
+# sonames:    the soname array, or nil
+# soname_len: the soname count
+fun free_sonames(a: *A.Allocator, sonames: *intern.StrId, soname_len: u32) {
+    if (sonames != nil && soname_len > 0) {
+        A.deallocate[intern.StrId](a, sonames, soname_len::usize);
     }
 }
 
-# store_shared: record an explicit shared-library `.so` file as a dynamic
-# dependency under its DT_SONAME (or basename when the object carries none). the
-# file must be a loadable ELF shared object; a non-loadable `.so` (a GNU ld
+# record an explicit shared-library `.so` file as a dynamic dependency under its
+# DT_SONAME (or basename when the object carries none)
+#
+# The file must be a loadable ELF shared object; a non-loadable `.so` (a GNU ld
 # linker script, or a non-ELF/non-shared file) is a hard error rather than a
 # silently-recorded DT_NEEDED that would make the binary fail to exec.
-fun store_shared(p: *driver.Project, path: *u8, sonames: **intern.StrId, soname_count: *u32) i64 {
+# ---
+# p:          the project (for its session allocator)
+# path:       the shared-library path
+# sonames:    the dynamic-dependency soname array to grow
+# soname_len: the soname count
+# ret:        0 on success, or a non-zero exit code
+fun store_shared(p: *driver.Project, path: *u8, sonames: **intern.StrId, soname_len: *u32) i64 {
     var sname: [4096]u8;
     if (read_so_soname(p, path, ?sname[0], 4096)) {
-        ret append_soname(p, ?sname[0], sonames, soname_count);
+        ret append_soname(p, ?sname[0], sonames, soname_len);
     }
     print.eprint("error: '");
     print.eprint(path::str);
@@ -1372,16 +1652,30 @@ fun store_shared(p: *driver.Project, path: *u8, sonames: **intern.StrId, soname_
     ret 1;
 }
 
-# resolve_and_store_input: resolve one link-input token and route it to the right
-# bucket. a `.o`/`.a` object or archive is stored into `paths[*written]` (a static
+# resolve one link-input token and route it to the right bucket
+#
+# A `.o`/`.a` object or archive is stored into `paths[*written]` (a static
 # input); a shared `.so` library has its soname recorded in `*sonames` (a dynamic
-# dependency). a bare `-l` name prefers a static `.o`/`.a` (so existing object
-# resolution is unchanged), then falls back to a shared `lib<name>.so`. an
-# unresolvable input is a hard error. returns 0 on success or a non-zero code.
+# dependency). A bare `-l` name prefers a static `.o`/`.a` (so existing object
+# resolution is unchanged), then falls back to a shared `lib<name>.so`. An
+# unresolvable input is a hard error.
+# ---
+# p:          the project carrying the target, interner, and session
+# tok:        the link-input token to resolve
+# root:       the resolved project root directory
+# argc:       argument count including argv[0]
+# argv:       the argument vector (argc null-terminated byte pointers)
+# buf:        a scratch buffer for the resolved path
+# cap:        the scratch buffer capacity
+# paths:      the static object-path array to append into
+# written:    the next free index in `paths`, advanced on a static input
+# sonames:    the dynamic-dependency soname array to grow
+# soname_len: the soname count
+# ret:        0 on success, or a non-zero exit code
 fun resolve_and_store_input(p: *driver.Project, tok: *u8, root: *u8, argc: usize, argv: **u8,
                             buf: *u8, cap: usize, paths: **u8, written: *u32,
-                            sonames: **intern.StrId, soname_count: *u32) i64 {
-    # a Windows `.dll` is a PE import-directory dependency named by string alone —
+                            sonames: **intern.StrId, soname_len: *u32) i64 {
+    # a Windows `.dll` is a PE import-directory dependency named by string alone -
     # the loader resolves it by name from the system path at run time, so it is
     # recorded verbatim (by basename) with no on-disk probe, unlike an ELF `.so`.
     # only a COFF/PE target consumes an import-directory dependency, so a `.dll`
@@ -1395,29 +1689,29 @@ fun resolve_and_store_input(p: *driver.Project, tok: *u8, root: *u8, argc: usize
             print.eprint("' is a Windows DLL; .dll inputs require a PE/COFF target\n");
             ret 1;
         }
-        ret append_soname(p, dll_basename(tok), sonames, soname_count);
+        ret append_soname(p, dll_basename(tok), sonames, soname_len);
     }
 
     var found: bool = resolve_input_into(tok, argc, argv, buf, cap);
 
-    # a relative explicit path that misses the working directory is retried
-    # rooted at the project root, so manifest `libs` paths are project-relative.
+    # a relative explicit path that misses the working directory is retried rooted
+    # at the project root, so manifest `libs` paths are project-relative.
     if (!found && (is_object_path(tok) || is_shared_path(tok)) && tok[0] != '/') {
-        if (util.join_into(buf, cap, root, tok) > 0 && fs.is_file(util.cstr_str(buf))) { found = true; }
+        if (util.join_into(buf, cap, root, tok) > 0 && filesystem.is_file(util.cstr_str(buf))) { found = true; }
     }
 
     # a resolved input that is a shared object (an explicit `.so` path, or an
     # archive/object search that landed on one) is a dynamic dependency: record
     # its DT_SONAME (or basename) instead of adding it as a static object.
     if (found && is_shared_path(buf)) {
-        ret store_shared(p, buf, sonames, soname_count);
+        ret store_shared(p, buf, sonames, soname_len);
     }
 
     # an explicit `.so` token taken verbatim (it has no '/' so `is_object_path`
-    # skipped it) — resolve it as a file and record its soname.
+    # skipped it) - resolve it as a file and record its soname.
     if (!found && is_shared_path(tok)) {
-        if (fs.is_file(util.cstr_str(tok))) {
-            ret store_shared(p, tok, sonames, soname_count);
+        if (filesystem.is_file(util.cstr_str(tok))) {
+            ret store_shared(p, tok, sonames, soname_len);
         }
     }
 
@@ -1427,7 +1721,7 @@ fun resolve_and_store_input(p: *driver.Project, tok: *u8, root: *u8, argc: usize
     if (!found && !is_object_path(tok) && !is_shared_path(tok)) {
         var sname: [4096]u8;
         if (resolve_shared_into(p, tok, argc, argv, ?sname[0], 4096)) {
-            ret append_soname(p, ?sname[0], sonames, soname_count);
+            ret append_soname(p, ?sname[0], sonames, soname_len);
         }
     }
 
@@ -1445,58 +1739,84 @@ fun resolve_and_store_input(p: *driver.Project, tok: *u8, root: *u8, argc: usize
     ret 0;
 }
 
-# read a u16 little-endian from a buffer.
+# read a u16 little-endian from a buffer
+# ---
+# buf: the buffer to read from
+# off: the byte offset
+# ret: the decoded value
 fun rd_u16(buf: *u8, off: usize) u16 {
     ret buf[off]::u16 | (buf[off + 1]::u16 << 8);
 }
 
-# read a u32 little-endian from a buffer.
+# read a u32 little-endian from a buffer
+# ---
+# buf: the buffer to read from
+# off: the byte offset
+# ret: the decoded value
 fun rd_u32(buf: *u8, off: usize) u32 {
     ret buf[off]::u32 | (buf[off + 1]::u32 << 8) | (buf[off + 2]::u32 << 16) | (buf[off + 3]::u32 << 24);
 }
 
-# read a u64 little-endian from a buffer.
+# read a u64 little-endian from a buffer
+# ---
+# buf: the buffer to read from
+# off: the byte offset
+# ret: the decoded value
 fun rd_u64(buf: *u8, off: usize) u64 {
     ret rd_u32(buf, off)::u64 | (rd_u32(buf, off + 4)::u64 << 32);
 }
 
-# read_so_soname: read a shared object's DT_SONAME and write it (null-terminated)
-# into `out`. accepts only a real ELF64 shared object (magic + ET_DYN): it writes
-# the object's DT_SONAME (tag 14, parsed from the SHT_DYNAMIC section and its
-# linked string table) when present, else the path's basename, and returns true.
-# returns false for anything that is NOT a loadable ELF shared object — a non-ELF
+# read a shared object's DT_SONAME and write it (null-terminated) into `out`
+#
+# Accepts only a real ELF64 shared object (magic + ET_DYN): it writes the
+# object's DT_SONAME (tag 14, parsed from the SHT_DYNAMIC section and its linked
+# string table) when present, else the path's basename, and returns true.
+# Returns false for anything that is NOT a loadable ELF shared object - a non-ELF
 # file (e.g. a GNU ld linker script like `libc.so` on some distros) or a
-# non-ET_DYN object — so a caller never records a DT_NEEDED for something the
-# loader cannot map. the DT_SONAME is the canonical dependency name, so a
+# non-ET_DYN object - so a caller never records a DT_NEEDED for something the
+# loader cannot map. The DT_SONAME is the canonical dependency name, so a
 # versioned `libc.so.6` is recorded even when the probe matched a `libc.so` link.
+# ---
+# p:    the project (for its session allocator)
+# path: the shared-object path to read
+# out:  the destination buffer for the soname
+# cap:  the buffer capacity
+# ret:  true when `path` is a loadable ELF shared object
 fun read_so_soname(p: *driver.Project, path: *u8, out: *u8, cap: usize) bool {
-    val rb: Result[fs.Buffer, str] = fs.read_all_sized(p.s.alloc, util.cstr_str(path));
-    if (is_err[fs.Buffer, str](rb)) { ret false; }
-    val b: fs.Buffer = unwrap_ok[fs.Buffer, str](rb);
-    var ok_res: bool = false;
-    # ELF64 magic and e_type == ET_DYN (3) — a loadable shared object.
+    val res_read: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(p.s.alloc, util.cstr_str(path));
+    if (R.is_err[filesystem.Buffer, str](res_read)) { ret false; }
+    val b: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](res_read);
+    var ok: bool = false;
+    # ELF64 magic and e_type == ET_DYN (3) - a loadable shared object.
     if (b.len >= 64 && b.data[0] == 0x7F && b.data[1] == 0x45 && b.data[2] == 0x4C
         && b.data[3] == 0x46 && rd_u16(b.data, 16) == 3) {
         if (!extract_soname(b.data, b.len, out, cap)) {
             # a loadable shared object with no DT_SONAME: the basename is the
             # canonical dependency name.
-            val base: *u8 = soname_basename(path);
-            val bl: usize = str_len(base::str);
+            val base: *u8   = soname_basename(path);
+            val bl:   usize = str_len(base::str);
             if (bl + 1 <= cap) {
                 var k: usize = 0;
                 for (k < bl) { out[k] = base[k]; k = k + 1; }
                 out[bl] = 0;
             }
         }
-        ok_res = true;
+        ok = true;
     }
-    if (b.data != nil) { deallocate[u8](p.s.alloc, b.data, b.len + 1); }
-    ret ok_res;
+    if (b.data != nil) { A.deallocate[u8](p.s.alloc, b.data, b.len + 1); }
+    ret ok;
 }
 
-# extract_soname: locate the DT_SONAME string in a parsed ELF64 image and copy it
-# into `out`. returns false when there is no dynamic section or DT_SONAME, so the
-# caller substitutes the file's basename.
+# locate the DT_SONAME string in a parsed ELF64 image and copy it into `out`
+#
+# Returns false when there is no dynamic section or DT_SONAME, so the caller
+# substitutes the file's basename.
+# ---
+# buf: the parsed ELF64 image
+# len: the image length
+# out: the destination buffer for the soname
+# cap: the buffer capacity
+# ret: true when a DT_SONAME was found and written
 fun extract_soname(buf: *u8, len: usize, out: *u8, cap: usize) bool {
     val e_shoff:     usize = rd_u64(buf, 40)::usize;
     val e_shentsize: usize = rd_u16(buf, 58)::usize;
@@ -1504,8 +1824,8 @@ fun extract_soname(buf: *u8, len: usize, out: *u8, cap: usize) bool {
     if (e_shoff == 0 || e_shnum == 0) { ret false; }
 
     # find SHT_DYNAMIC (type 6); its sh_link names the dynamic string table.
-    var dyn_off: usize = 0;
-    var dyn_size: usize = 0;
+    var dyn_off:    usize = 0;
+    var dyn_size:   usize = 0;
     var dynstr_off: usize = 0;
     var sh: usize = 0;
     for (sh < e_shnum) {
@@ -1546,9 +1866,13 @@ fun extract_soname(buf: *u8, len: usize, out: *u8, cap: usize) bool {
     ret false;
 }
 
-# is_shared_path: whether a path/token names a shared library — it contains a
-# `.so` segment followed by end-of-string or a `.<version>` suffix (e.g. an
-# explicit `libc.so.6` or `path/to/libfoo.so`).
+# whether a path/token names a shared library
+#
+# It contains a `.so` segment followed by end-of-string or a `.<version>` suffix
+# (e.g. an explicit `libc.so.6` or `path/to/libfoo.so`).
+# ---
+# tok: the token to classify
+# ret: true when `tok` names a shared library
 fun is_shared_path(tok: *u8) bool {
     if (tok == nil) { ret false; }
     val n: usize = str_len(tok::str);
@@ -1564,26 +1888,36 @@ fun is_shared_path(tok: *u8) bool {
     ret false;
 }
 
-# is_dll_path: whether a token names a Windows dynamic-link library — it ends in
-# a `.dll` extension (case-insensitive). a `.dll` is a PE import-directory
-# dependency named by string alone: the loader resolves it by name at run time,
-# so unlike an ELF `.so` it is recorded verbatim with no on-disk probe.
+# whether a token names a Windows dynamic-link library - it ends in a `.dll`
+# extension (case-insensitive)
+#
+# A `.dll` is a PE import-directory dependency named by string alone: the loader
+# resolves it by name at run time, so unlike an ELF `.so` it is recorded verbatim
+# with no on-disk probe.
+# ---
+# tok: the token to classify
+# ret: true when `tok` ends in `.dll`
 fun is_dll_path(tok: *u8) bool {
     if (tok == nil) { ret false; }
     val n: usize = str_len(tok::str);
     if (n < 4) { ret false; }
-    val d: u8 = tok[n - 4];
+    val d:  u8 = tok[n - 4];
     val l1: u8 = tok[n - 3] | 0x20;
     val l2: u8 = tok[n - 2] | 0x20;
     val l3: u8 = tok[n - 1] | 0x20;
     ret d == '.' && l1 == 'd' && l2 == 'l' && l3 == 'l';
 }
 
-# dll_basename: the final path component of a DLL path, stripping both POSIX `/`
-# and Windows `\` separators (a `.dll` token may carry either) so the recorded PE
-# import name is the bare DLL name the loader resolves (e.g.
-# `C:\Windows\System32\kernel32.dll` -> `kernel32.dll`). returns a pointer into
+# the final path component of a DLL path, stripping both POSIX `/` and Windows
+# `\` separators
+#
+# A `.dll` token may carry either separator, so the recorded PE import name is
+# the bare DLL name the loader resolves (e.g.
+# `C:\Windows\System32\kernel32.dll` -> `kernel32.dll`). Returns a pointer into
 # `path` (no copy); the caller interns it.
+# ---
+# path: the DLL path
+# ret:  a borrowed pointer to the final path component
 fun dll_basename(path: *u8) *u8 {
     val n: usize = str_len(path::str);
     var last: usize = 0;
@@ -1595,9 +1929,14 @@ fun dll_basename(path: *u8) *u8 {
     ret (path::usize + last)::*u8;
 }
 
-# soname_basename: the final path component of a shared-library path — the soname
-# the loader resolves (e.g. `/usr/lib/libc.so.6` -> `libc.so.6`). returns the
-# pointer to the component within `path` (no copy); the caller interns it.
+# the final path component of a shared-library path - the soname the loader
+# resolves (e.g. `/usr/lib/libc.so.6` -> `libc.so.6`)
+#
+# Returns the pointer to the component within `path` (no copy); the caller
+# interns it.
+# ---
+# path: the shared-library path
+# ret:  a borrowed pointer to the final path component
 fun soname_basename(path: *u8) *u8 {
     val n: usize = str_len(path::str);
     var last: usize = 0;
@@ -1609,19 +1948,29 @@ fun soname_basename(path: *u8) *u8 {
     ret (path::usize + last)::*u8;
 }
 
-# resolve_shared_into: resolve a bare `-l` name to a shared library `lib<name>.so`
-# (or a `.so.<version>`), searching each `-L <dir>`, then the OS default library
-# directory, then the common system library directories. writes the soname to
-# record for DT_NEEDED (the library's own DT_SONAME) into `buf`. returns true once
-# a real ELF shared library is found. a non-ELF match (a GNU ld linker script at
-# `lib<name>.so`) is skipped so a versioned `lib<name>.so.N` is preferred.
+# resolve a bare `-l` name to a shared library `lib<name>.so` (or a
+# `.so.<version>`)
+#
+# Searches each `-L <dir>`, then the OS default library directory, then the
+# common system library directories. Writes the soname to record for DT_NEEDED
+# (the library's own DT_SONAME) into `buf`. A non-ELF match (a GNU ld linker
+# script at `lib<name>.so`) is skipped so a versioned `lib<name>.so.N` is
+# preferred.
+# ---
+# p:    the project carrying the target and session
+# name: the bare library name
+# argc: argument count including argv[0]
+# argv: the argument vector (argc null-terminated byte pointers)
+# buf:  the destination buffer for the soname
+# cap:  the buffer capacity
+# ret:  true once a real ELF shared library is found
 fun resolve_shared_into(p: *driver.Project, name: *u8, argc: usize, argv: **u8, buf: *u8, cap: usize) bool {
-    var li: usize = 0;
-    for (li < argc) {
-        if (str_equals(argv[li]::str, "-L") && li + 1 < argc) {
-            if (try_shared_in_dir(p, argv[li + 1], name, buf, cap)) { ret true; }
+    var i: usize = 0;
+    for (i < argc) {
+        if (str_equals(argv[i]::str, "-L") && i + 1 < argc) {
+            if (try_shared_in_dir(p, argv[i + 1], name, buf, cap)) { ret true; }
         }
-        li = li + 1;
+        i = i + 1;
     }
     # the OS default library directory from the target vtable (a plain str).
     if (p.target.os != nil) {
@@ -1633,21 +1982,29 @@ fun resolve_shared_into(p: *driver.Project, name: *u8, argc: usize, argv: **u8, 
     # the common multiarch/system library directories. NOTE: the x86_64-linux
     # entries are host-specific assumptions baked into the CLI link path, wrong
     # for cross targets (aarch64/darwin/windows). the proper home is an ordered
-    # libdir list owned by the target OS vtable; deferred to the ABI-boundary
-    # work with #1045 rather than redesigned here (see #1258).
-    if (try_shared_in_dir(p, "/lib64"::*u8, name, buf, cap)) { ret true; }
-    if (try_shared_in_dir(p, "/usr/lib64"::*u8, name, buf, cap)) { ret true; }
-    if (try_shared_in_dir(p, "/lib/x86_64-linux-gnu"::*u8, name, buf, cap)) { ret true; }
+    # libdir list owned by the target OS vtable; deferred to the ABI-boundary work
+    # with #1045 rather than redesigned here (see #1258).
+    if (try_shared_in_dir(p, "/lib64"::*u8, name, buf, cap))                    { ret true; }
+    if (try_shared_in_dir(p, "/usr/lib64"::*u8, name, buf, cap))                { ret true; }
+    if (try_shared_in_dir(p, "/lib/x86_64-linux-gnu"::*u8, name, buf, cap))     { ret true; }
     if (try_shared_in_dir(p, "/usr/lib/x86_64-linux-gnu"::*u8, name, buf, cap)) { ret true; }
-    if (try_shared_in_dir(p, "/usr/lib"::*u8, name, buf, cap)) { ret true; }
-    if (try_shared_in_dir(p, "/lib"::*u8, name, buf, cap)) { ret true; }
+    if (try_shared_in_dir(p, "/usr/lib"::*u8, name, buf, cap))                  { ret true; }
+    if (try_shared_in_dir(p, "/lib"::*u8, name, buf, cap))                      { ret true; }
     ret false;
 }
 
-# try_shared_in_dir: probe `<dir>/lib<name>.so` then the common SONAME-bearing
-# `lib<name>.so.<N>` files for `N` in 6..0, accepting the first that is a real
-# ELF shared object (skipping a linker-script `lib<name>.so`). on a hit, writes
-# the library's own DT_SONAME (the canonical DT_NEEDED name) into `buf`.
+# probe `<dir>/lib<name>.so` then the common SONAME-bearing `lib<name>.so.<N>`
+# files for `N` in 6..0, accepting the first that is a real ELF shared object
+#
+# Skips a linker-script `lib<name>.so`. On a hit, writes the library's own
+# DT_SONAME (the canonical DT_NEEDED name) into `buf`.
+# ---
+# p:    the project (for its session allocator)
+# dir:  the directory to probe
+# name: the bare library name
+# buf:  the destination buffer for the soname
+# cap:  the buffer capacity
+# ret:  true on the first accepted candidate
 fun try_shared_in_dir(p: *driver.Project, dir: *u8, name: *u8, buf: *u8, cap: usize) bool {
     var cand: [4096]u8;
     if (write_named_candidate(dir, "lib", name, "so", ?cand[0], 4096) && accept_shared(p, ?cand[0], buf, cap)) { ret true; }
@@ -1659,33 +2016,51 @@ fun try_shared_in_dir(p: *driver.Project, dir: *u8, name: *u8, buf: *u8, cap: us
     ret false;
 }
 
-# accept_shared: accept `cand` as a shared dependency if it is an existing real
-# ELF shared object, writing its DT_SONAME (or, lacking one, its basename) into
-# `buf`. returns false for a missing file or a non-ELF match (a linker script).
+# accept `cand` as a shared dependency if it is an existing real ELF shared
+# object, writing its DT_SONAME (or, lacking one, its basename) into `buf`
+# ---
+# p:    the project (for its session allocator)
+# cand: the candidate path
+# buf:  the destination buffer for the soname
+# cap:  the buffer capacity
+# ret:  false for a missing file or a non-ELF match (a linker script)
 fun accept_shared(p: *driver.Project, cand: *u8, buf: *u8, cap: usize) bool {
-    if (!fs.is_file(util.cstr_str(cand))) { ret false; }
-    if (read_so_soname(p, cand, buf, cap)) { ret true; }
+    if (!filesystem.is_file(util.cstr_str(cand))) { ret false; }
+    if (read_so_soname(p, cand, buf, cap))        { ret true; }
     ret false;
 }
 
-# write_named_versioned: compose `<dir>/lib<name>.so.<v>` into `buf`,
-# null-terminated. returns false if it would not fit or `v` exceeds one digit.
+# compose `<dir>/lib<name>.so.<v>` into `buf`, null-terminated
+# ---
+# dir:  the directory to root the path under
+# name: the bare library name
+# v:    the single-digit version
+# buf:  the destination buffer
+# cap:  the buffer capacity
+# ret:  false if it would not fit or `v` exceeds one digit
 fun write_named_versioned(dir: *u8, name: *u8, v: u32, buf: *u8, cap: usize) bool {
-    if (v > 9) { ret false; }
+    if (v > 9)                                                    { ret false; }
     if (!write_named_candidate(dir, "lib", name, "so", buf, cap)) { ret false; }
     val n: usize = str_len(buf::str);
     if (n + 3 > cap) { ret false; }
-    buf[n] = '.';
+    buf[n]     = '.';
     buf[n + 1] = ('0'::u32 + v)::u8;
     buf[n + 2] = 0;
     ret true;
 }
 
-# join_into_str: join `dir` and the fat-string `leaf` with a single '/'
-# separator into the caller's buffer and null-terminate. `dir` may alias `buf`
-# (the copy is then an identity self-copy). behaves like join_into but consumes
-# a `str` (length-counted) rather than a null-terminated `*u8`. returns the byte
-# length written, or 0 if it would not fit.
+# join `dir` and the fat-string `leaf` with a single '/' separator into the
+# caller's buffer and null-terminate
+#
+# `dir` may alias `buf` (the copy is then an identity self-copy). Behaves like
+# util.join_into but consumes a `str` (length-counted) rather than a
+# null-terminated `*u8`.
+# ---
+# buf:  the destination buffer
+# cap:  the buffer capacity
+# dir:  the directory component
+# leaf: the leaf component
+# ret:  the byte length written, or 0 if it would not fit
 fun join_into_str(buf: *u8, cap: usize, dir: *u8, leaf: str) usize {
     val dl: usize = str_len(dir::str);
     val ll: usize = str_len(leaf);
@@ -1701,89 +2076,122 @@ fun join_into_str(buf: *u8, cap: usize, dir: *u8, leaf: str) usize {
     ret k;
 }
 
-# join_dir: write `<root>/<resolved template>` into `buf` for a manifest output
-# dir. returns true on success; false when the template is not interned.
+# write `<root>/<resolved template>` into `buf` for a manifest output dir
+# ---
+# p:      the project (for its interner)
+# root:   the resolved project root directory
+# dir_id: the interned output-dir template
+# buf:    the destination buffer
+# cap:    the buffer capacity
+# ret:    true on success; false when the template is not interned
 fun join_dir(p: *driver.Project, root: *u8, dir_id: intern.StrId, buf: *u8, cap: usize) bool {
-    val o: Option[str] = intern.lookup(?p.s.interner, dir_id);
-    if (is_none[str](o)) { ret false; }
-    join_into_str(buf, cap, root, unwrap[str](o));
+    val opt_tmpl: O.Option[str] = intern.lookup(?p.s.interner, dir_id);
+    if (O.is_none[str](opt_tmpl)) { ret false; }
+    join_into_str(buf, cap, root, O.unwrap[str](opt_tmpl));
     ret true;
 }
 
-# resolve_obj_base: write the per-module object tree root into `buf` —
-# `<root>/<resolved obj template>`.
+# write the per-module object tree root into `buf` -
+# `<root>/<resolved obj template>`
+# ---
+# p:    the project (for its config)
+# root: the resolved project root directory
+# buf:  the destination buffer
+# cap:  the buffer capacity
+# ret:  true on success; false when the template is not interned
 fun resolve_obj_base(p: *driver.Project, root: *u8, buf: *u8, cap: usize) bool {
     ret join_dir(p, root, p.config.obj_root, buf, cap);
 }
 
-# resolve_emit_base: write the per-module `.ir` (when `is_ir`) or `.s` output
-# directory into `buf` — `<root>/<resolved ir|asm template>`.
+# write the per-module `.ir` (when `is_ir`) or `.s` output directory into `buf` -
+# `<root>/<resolved ir|asm template>`
+# ---
+# p:     the project (for its config)
+# root:  the resolved project root directory
+# is_ir: select the `ir` template over the `asm` template
+# buf:   the destination buffer
+# cap:   the buffer capacity
+# ret:   true on success; false when the template is not interned
 fun resolve_emit_base(p: *driver.Project, root: *u8, is_ir: bool, buf: *u8, cap: usize) bool {
     var dir_id: intern.StrId = p.config.asm_root;
     if (is_ir) { dir_id = p.config.ir_root; }
     ret join_dir(p, root, dir_id, buf, cap);
 }
 
-# write_objects: write each per-module image to a relocatable object whose path
-# mirrors the module FQN under `obj_base` (FQN `a.b.c` -> `<obj_base>/a/b/c.o`,
-# creating parent directories), collecting the owned path strings — one per
-# topo entry, in topo order — into a fresh `**u8` array stored through
-# `paths_out`. returns 0 on success; on failure any paths produced so far are
-# released and a non-zero code returned.
+# write each per-module image to a relocatable object whose path mirrors the
+# module FQN under `obj_base`, collecting the owned path strings
+#
+# FQN `a.b.c` -> `<obj_base>/a/b/c.o`, creating parent directories. The owned
+# path strings - one per topo entry, in topo order - are collected into a fresh
+# `**u8` array stored through `paths_out`. On failure any paths produced so far
+# are released.
+# ---
+# p:         the project carrying the module graph and session
+# images:    the per-module object images to write
+# obj_base:  the per-module object tree root
+# paths_out: receives the fresh owned object-path array on success
+# ret:       0 on success, 1 on a user error, 2 on an internal error
 fun write_objects(p: *driver.Project, images: *of.ObjectImage,
                   obj_base: *u8, paths_out: ***u8) i64 {
-    val count: u32 = p.topo_len;
-    val ar: Result[**u8, str] = allocate[*u8](p.s.alloc, count::usize);
-    if (is_err[**u8, str](ar)) { print.eprint("error: out of memory\n"); ret 2; }
-    val paths: **u8 = unwrap_ok[**u8, str](ar);
+    val len: u32 = p.topo_len;
+    val res_paths: R.Result[**u8, str] = A.allocate[*u8](p.s.alloc, len::usize);
+    if (R.is_err[**u8, str](res_paths)) { print.eprint("error: out of memory\n"); ret 2; }
+    val paths: **u8 = R.unwrap_ok[**u8, str](res_paths);
 
-    var ti: u32 = 0;
-    for (ti < p.topo_len) {
-        val mid: sess.ModuleId = p.topo[ti];
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId   = p.topo[i];
         val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
 
-        val fqn_opt: Option[str] = intern.lookup(?p.s.interner, m.fqn);
-        if (is_none[str](fqn_opt)) {
-            free_paths(p.s.alloc, paths, ti, count);
+        val opt_fqn: O.Option[str] = intern.lookup(?p.s.interner, m.fqn);
+        if (O.is_none[str](opt_fqn)) {
+            free_paths(p.s.alloc, paths, i, len);
             print.eprint("error: module FQN not interned\n");
             ret 2;
         }
 
         var path: [4096]u8;
-        mirror_fqn(?path[0], 4096, obj_base, unwrap[str](fqn_opt), "o");
+        mirror_fqn(?path[0], 4096, obj_base, O.unwrap[str](opt_fqn), "o");
 
         if (!util.ensure_parents(?path[0])) {
-            free_paths(p.s.alloc, paths, ti, count);
+            free_paths(p.s.alloc, paths, i, len);
             print.eprint("error: failed to create object directory\n");
             ret 2;
         }
 
-        val em: Result[bool, str] = obj.emit(?images[mid::u32], ?p.target, ?path[0]);
-        if (is_err[bool, str](em)) {
-            free_paths(p.s.alloc, paths, ti, count);
+        val res_emit: R.Result[bool, str] = obj.emit(?images[mid::u32], ?p.target, ?path[0]);
+        if (R.is_err[bool, str](res_emit)) {
+            free_paths(p.s.alloc, paths, i, len);
             print.eprint("error: ");
-            print.eprint(unwrap_err[bool, str](em));
+            print.eprint(R.unwrap_err[bool, str](res_emit));
             print.eprint("\n");
             ret 1;
         }
 
-        paths[ti] = dup_cstr(p.s.alloc, ?path[0]);
-        if (paths[ti] == nil) {
-            free_paths(p.s.alloc, paths, ti, count);
+        paths[i] = dup_cstr(p.s.alloc, ?path[0]);
+        if (paths[i] == nil) {
+            free_paths(p.s.alloc, paths, i, len);
             print.eprint("error: out of memory\n");
             ret 2;
         }
-        ti = ti + 1;
+        i = i + 1;
     }
 
     @paths_out = paths;
     ret 0;
 }
 
-# mirror_fqn: write `<base>/<rel>.<ext>` into `buf`, where `<rel>` is the module
-# FQN with every '.' replaced by '/' (so `a.b.c` with ext `o` becomes
-# `<base>/a/b/c.o`). returns the byte length written (excluding the terminator),
-# or 0 if it would not fit.
+# write `<base>/<rel>.<suffix>` into `buf`, where `<rel>` is the module FQN with
+# every '.' replaced by '/'
+#
+# So `a.b.c` with suffix `o` becomes `<base>/a/b/c.o`.
+# ---
+# buf:    the destination buffer
+# cap:    the buffer capacity
+# base:   the base directory
+# fqn:    the module fully-qualified name
+# suffix: the file extension (without the dot)
+# ret:    the byte length written (excluding the terminator), or 0 if it would not fit
 fun mirror_fqn(buf: *u8, cap: usize, base: *u8, fqn: str, suffix: str) usize {
     val bl: usize = str_len(base::str);
     val fl: usize = str_len(fqn);
@@ -1813,73 +2221,89 @@ fun mirror_fqn(buf: *u8, cap: usize, base: *u8, fqn: str, suffix: str) usize {
     ret k;
 }
 
-# open_artifact: create `<base>/<rel>.<ext>` (making any parent directories) and
-# wire `w` to stream into it through the returned `file`. the FQN is mapped to
-# `<rel>` exactly as the object tree is. the caller owns `file` and must close it
-# once writing is done — the Writer borrows the File and must not outlive it.
+# create `<base>/<rel>.<suffix>` (making any parent directories) and wire `w` to
+# stream into it through the returned `file`
+#
+# The FQN is mapped to `<rel>` exactly as the object tree is. The caller owns
+# `file` and must close it once writing is done - the Writer borrows the File and
+# must not outlive it.
+# ---
+# base:   the base directory
+# fqn:    the module fully-qualified name
+# suffix: the file extension (without the dot)
+# file:   receives the created file; the caller closes it
+# w:      receives a writer streaming into `file`
+# ret:    ok(true) on success, or err with the failure message
 fun open_artifact(base: *u8, fqn: str, suffix: str,
-                  file: *fs.File, w: *writer.Writer) Result[bool, str] {
+                  file: *filesystem.File, w: *writer.Writer) R.Result[bool, str] {
     var path: [4096]u8;
     if (mirror_fqn(?path[0], 4096, base, fqn, suffix) == 0) {
-        ret err[bool, str]("artifact path too long");
+        ret R.err[bool, str]("artifact path too long");
     }
     if (!util.ensure_parents(?path[0])) {
-        ret err[bool, str]("failed to create artifact directory");
+        ret R.err[bool, str]("failed to create artifact directory");
     }
 
-    val cr: Result[fs.File, str] = fs.create(util.cstr_str(?path[0]), 0o644);
-    if (is_err[fs.File, str](cr)) { ret err[bool, str](unwrap_err[fs.File, str](cr)); }
-    @file = unwrap_ok[fs.File, str](cr);
-    fs.get_writer(file, w);
-    ret ok[bool, str](true);
+    val res_create: R.Result[filesystem.File, str] = filesystem.create(util.cstr_str(?path[0]), 0o644);
+    if (R.is_err[filesystem.File, str](res_create)) {
+        ret R.err[bool, str](R.unwrap_err[filesystem.File, str](res_create));
+    }
+    @file = R.unwrap_ok[filesystem.File, str](res_create);
+    filesystem.get_writer(file, w);
+    ret R.ok[bool, str](true);
 }
 
-# free_paths: release the first `n` owned path strings of a path array and the
-# `cap`-long array itself. `n` may be less than `cap` when unwinding a
-# partially-filled array; the array is always freed at its full capacity.
+# release the first `n` owned path strings of a path array and the `cap`-long
+# array itself
+#
+# `n` may be less than `cap` when unwinding a partially-filled array; the array
+# is always freed at its full capacity.
 # ---
-# alloc: allocator backing the array and its strings
+# a:     allocator backing the array and its strings
 # paths: the path array (its first n entries are populated)
 # n:     number of populated path strings to free
 # cap:   full allocated length of the array
-fun free_paths(alloc: *Allocator, paths: **u8, n: u32, cap: u32) {
+fun free_paths(a: *A.Allocator, paths: **u8, n: u32, cap: u32) {
     if (paths == nil) { ret; }
     var i: u32 = 0;
     for (i < n) {
-        if (paths[i] != nil) { deallocate[u8](alloc, paths[i], (str_len(paths[i]::str) + 1)::usize); }
+        if (paths[i] != nil) { A.deallocate[u8](a, paths[i], (str_len(paths[i]::str) + 1)::usize); }
         i = i + 1;
     }
-    if (cap > 0) { deallocate[*u8](alloc, paths, cap::usize); }
+    if (cap > 0) { A.deallocate[*u8](a, paths, cap::usize); }
 }
 
-# dup_cstr: duplicate a null-terminated string into freshly allocated
-# storage. returns nil on allocation failure (the caller treats that as
-# "no path").
-fun dup_cstr(alloc: *Allocator, s: *u8) *u8 {
+# duplicate a null-terminated string into freshly allocated storage
+# ---
+# a:   allocator backing the duplicate
+# s:   the null-terminated string to copy
+# ret: the owned copy, or nil on allocation failure (the caller treats that as "no path")
+fun dup_cstr(a: *A.Allocator, s: *u8) *u8 {
     val n: usize = str_len(s::str);
-    val r: Result[*u8, str] = allocate[u8](alloc, n + 1);
-    if (is_err[*u8, str](r)) { ret nil; }
-    val buf: *u8 = unwrap_ok[*u8, str](r);
+    val res_buf: R.Result[*u8, str] = A.allocate[u8](a, n + 1);
+    if (R.is_err[*u8, str](res_buf)) { ret nil; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
     var i: usize = 0;
     for (i < n) { buf[i] = s[i]; i = i + 1; }
     buf[n] = 0;
     ret buf;
 }
 
-# run: `mach build` subcommand entry point. builds the current project to
-# an executable (or a relocatable object with `--emit obj`) under
-# `<project_root>/out/`. called by cmd.dispatch.
+# `mach build` subcommand entry point
+#
+# Builds the current project to an executable (or a relocatable object with
+# `--emit obj`) under `<project_root>/out/`. Called by cmd.dispatch.
 # ---
 # argc: argument count including argv[0]
 # argv: the argument vector (argc null-terminated byte pointers)
 # ret:  0 on success, 1 on a user error, 2 on an internal error
 pub fun run(argc: usize, argv: **u8) i64 {
     var emit_obj: bool = false;
-    val emit_opt: Option[*u8] = emit_kind(argc, argv);
-    if (is_some[*u8](emit_opt)) {
-        val kind: *u8 = unwrap[*u8](emit_opt);
-        if (str_equals(kind::str, "obj"))      { emit_obj = true; }
-        or (str_equals(kind::str, "exe"))      { emit_obj = false; }
+    val opt_emit: O.Option[*u8] = emit_kind(argc, argv);
+    if (O.is_some[*u8](opt_emit)) {
+        val kind: *u8 = O.unwrap[*u8](opt_emit);
+        if (str_equals(kind::str, "obj")) { emit_obj = true; }
+        or (str_equals(kind::str, "exe")) { emit_obj = false; }
         or {
             print.eprint("error: --emit expects 'obj' or 'exe'\n");
             ret 1;
@@ -1888,25 +2312,25 @@ pub fun run(argc: usize, argv: **u8) i64 {
 
     # back the build with a page allocator; the matrix enumeration and each unit
     # get their own arena over it so a unit's compile memory is reclaimed before
-    # the next, while the enumerated selectors (owned by `menu_ar`) outlive the
+    # the next, while the enumerated selectors (owned by `menu_alloc`) outlive the
     # loop. the page allocator mmaps per allocation, so the allocation-heavy
     # compile is suballocated through an arena and reclaimed in one dnit.
-    var backing: Allocator;
-    if (is_some[str](page.make(?backing))) {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) {
         print.eprint("error: failed to initialise allocator\n");
         ret 2;
     }
 
     # post-`--` args are program arguments, never build flags; clip the scanners.
     val eff: usize = util.separator_index(argc, argv);
-    val cfg_r: Result[cfg.Config, str] = cfg.parse(eff, argv);
-    if (is_err[cfg.Config, str](cfg_r)) {
+    val res_config: R.Result[cfg.Config, str] = cfg.parse(eff, argv);
+    if (R.is_err[cfg.Config, str](res_config)) {
         print.eprint("error: ");
-        print.eprint(unwrap_err[cfg.Config, str](cfg_r));
+        print.eprint(R.unwrap_err[cfg.Config, str](res_config));
         print.eprint("\n");
         ret 1;
     }
-    val config: cfg.Config = unwrap_ok[cfg.Config, str](cfg_r);
+    val config: cfg.Config = R.unwrap_ok[cfg.Config, str](res_config);
     if (config.bin != nil && config.lib != nil) {
         print.eprint("error: --bin and --lib cannot be combined\n");
         ret 1;
@@ -1929,29 +2353,29 @@ pub fun run(argc: usize, argv: **u8) i64 {
     # enumerate the build matrix in its own arena, kept alive across the loop so
     # the unit selectors it owns stay valid.
     var menu_ar: arena.Arena;
-    if (is_some[str](arena.init(?menu_ar, ?backing, 0))) {
+    if (O.is_some[str](arena.init(?menu_ar, ?backing, 0))) {
         print.eprint("error: failed to initialise allocator\n");
         ret 2;
     }
-    var menu_alloc: Allocator;
-    if (is_some[str](arena.make(?menu_alloc, ?menu_ar))) {
+    var menu_alloc: A.Allocator;
+    if (O.is_some[str](arena.make(?menu_alloc, ?menu_ar))) {
         arena.dnit(?menu_ar);
         print.eprint("error: failed to initialise allocator\n");
         ret 2;
     }
 
-    val mx_r: Result[driver.Matrix, str] = driver.enumerate_matrix(?menu_alloc, util.cstr_str(?root[0]),
+    val res_matrix: R.Result[driver.Matrix, str] = driver.enumerate_matrix(?menu_alloc, util.cstr_str(?root[0]),
         util.cstr_str(cstr_or(config.target)), config.all_targets,
         util.cstr_str(cstr_or(config.bin)), util.cstr_str(cstr_or(config.lib)),
         config.bin != nil, config.lib != nil);
-    if (is_err[driver.Matrix, str](mx_r)) {
+    if (R.is_err[driver.Matrix, str](res_matrix)) {
         print.eprint("error: ");
-        print.eprint(unwrap_err[driver.Matrix, str](mx_r));
+        print.eprint(R.unwrap_err[driver.Matrix, str](res_matrix));
         print.eprint("\n");
         arena.dnit(?menu_ar);
         ret 1;
     }
-    val mx: driver.Matrix = unwrap_ok[driver.Matrix, str](mx_r);
+    val mx: driver.Matrix = R.unwrap_ok[driver.Matrix, str](res_matrix);
     if (mx.count == 0) {
         print.eprint("error: nothing to build\n");
         arena.dnit(?menu_ar);
@@ -1961,19 +2385,19 @@ pub fun run(argc: usize, argv: **u8) i64 {
     # build each unit in a fresh arena (its compile memory reclaimed per unit);
     # report per unit when more than one, and fail the invocation if any unit does.
     var code: i64 = 0;
-    var ui: u32 = 0;
-    for (ui < mx.count) {
-        val unit: *driver.MatrixUnit = ?mx.units[ui];
+    var i: u32 = 0;
+    for (i < mx.count) {
+        val unit: *driver.MatrixUnit = ?mx.units[i];
         if (mx.count > 1) { report_unit(unit); }
 
         var u_ar: arena.Arena;
-        if (is_some[str](arena.init(?u_ar, ?backing, 0))) {
+        if (O.is_some[str](arena.init(?u_ar, ?backing, 0))) {
             print.eprint("error: failed to initialise allocator\n");
             arena.dnit(?menu_ar);
             ret 2;
         }
-        var u_alloc: Allocator;
-        if (is_some[str](arena.make(?u_alloc, ?u_ar))) {
+        var u_alloc: A.Allocator;
+        if (O.is_some[str](arena.make(?u_alloc, ?u_ar))) {
             arena.dnit(?u_ar);
             arena.dnit(?menu_ar);
             print.eprint("error: failed to initialise allocator\n");
@@ -1983,22 +2407,29 @@ pub fun run(argc: usize, argv: **u8) i64 {
         val br: BuildResult = build_unit(?u_alloc, argc, argv, emit_obj, false, unit, nil, false);
         if (br.code != 0 && code == 0) { code = br.code; }
         arena.dnit(?u_ar);
-        ui = ui + 1;
+        i = i + 1;
     }
 
     arena.dnit(?menu_ar);
     ret code;
 }
 
-# cstr_or: a non-nil view of an optional flag value — the value itself, or the
-# empty string when the flag is absent (so cstr_str always sees a valid pointer).
+# a non-nil view of an optional flag value - the value itself, or the empty
+# string when the flag is absent (so cstr_str always sees a valid pointer)
+# ---
+# p:   the optional flag value, or nil when absent
+# ret: `p` when non-nil, else the empty string
 fun cstr_or(p: *u8) *u8 {
     if (p == nil) { ret ""; }
     ret p;
 }
 
-# report_unit: write a `building <artifact> (<target>)` progress line to stderr
-# before a matrix unit compiles. the target is omitted when it is the default.
+# write a `building <artifact> (<target>)` progress line to stderr before a
+# matrix unit compiles
+#
+# The target is omitted when it is the default.
+# ---
+# u: the matrix unit about to compile
 fun report_unit(u: *driver.MatrixUnit) {
     print.eprint("building ");
     if (u.has_artifact) { print.eprint(u.artifact); }
@@ -2011,21 +2442,20 @@ fun report_unit(u: *driver.MatrixUnit) {
     print.eprint("\n");
 }
 
-# emit_kind: scan argv for the value following `--emit`, exposed so
-# `cmd.run` can reject the flag before it builds. returns none when
-# `--emit` is absent or is the final argument with no value.
+# scan argv for the value following `--emit`, exposed so `cmd.run` can reject the
+# flag before it builds
 # ---
 # argc: argument count including argv[0]
 # argv: the argument vector (argc null-terminated byte pointers)
 # ret:  some(kind) when `--emit <kind>` is present, else none
-pub fun emit_kind(argc: usize, argv: **u8) Option[*u8] {
+pub fun emit_kind(argc: usize, argv: **u8) O.Option[*u8] {
     var i: usize = 0;
     for (i < argc) {
         if (str_equals(argv[i]::str, "--emit")) {
-            if (i + 1 < argc) { ret some[*u8](argv[i + 1]); }
-            ret none[*u8]();
+            if (i + 1 < argc) { ret O.some[*u8](argv[i + 1]); }
+            ret O.none[*u8]();
         }
         i = i + 1;
     }
-    ret none[*u8]();
+    ret O.none[*u8]();
 }
