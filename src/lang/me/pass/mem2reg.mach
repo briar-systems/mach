@@ -1,90 +1,80 @@
-# mach.lang.me.pass.mem2reg: promote address-not-taken allocas to SSA registers.
+# promote address-not-taken allocas to SSA registers
 #
-# The lowerer emits every
-# mutable local as an `alloca` plus `load`/`store` traffic; this pass is what
-# turns that back into real SSA, inserting the phi nodes needed to merge a
-# value across control flow. It is the dominant optimisation by impact, and the
-# code generator expects mostly-SSA input.
+# The lowerer emits every mutable local as an alloca plus load/store traffic;
+# this pass turns that back into real SSA, inserting the phi nodes needed to
+# merge a value across control flow. It is the dominant optimisation by impact,
+# and the code generator expects mostly-SSA input.
 #
 # The algorithm is textbook Cytron et al.: classify promotable allocas (those
 # whose result is only ever the pointer of a load or store), compute the
 # dominator tree and dominance frontiers over the CFG, place phis at the
 # iterated frontier of each alloca's defining blocks, then rename in
 # dominator-tree order with a per-alloca value stack. Aliasing is intentionally
-# trivial — only allocas whose address never escapes are touched.
+# trivial -- only allocas whose address never escapes are touched.
 
+use std.allocator.page;
+use std.collections.map;
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.option.Option;
-use std.types.option.is_some;
-use std.types.option.is_none;
-use std.types.option.unwrap;
-use std.types.result.Result;
-use std.types.result.ok;
-use std.types.result.err;
-use std.types.result.is_ok;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.unwrap_err;
 
-use std.allocator.Allocator;
-use std.allocator.allocate;
-use std.allocator.deallocate;
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
 
-use ir:      mach.lang.me.ir;
-use instr:   mach.lang.me.ir.instruction;
-use value:   mach.lang.me.ir.value;
-use ir_type: mach.lang.me.ir.type;
-use id:      mach.lang.me.ir.id;
-use builder: mach.lang.me.ir.builder;
-use intern:  mach.lang.intern;
+use mach.lang.intern;
+use mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
 
-use map:     std.collections.map;
-use page:    std.allocator.page;
-
-# sentinel marking an unprocessed entry in u32 work arrays (idom / rpo index).
+# sentinel marking an unprocessed entry in a u32 work array (idom / rpo index /
+# alloca lookup)
 val NONE_U32: u32 = 0xFFFFFFFF;
 
-# per-function working state for the promotion algorithm. Every array is sized
-# to the function's block count, alloca count, or instruction pool length and
-# freed in `dnit_state`.
+# per-function working state for the promotion algorithm
+#
+# Every array is sized to the function's block count, alloca count, or
+# instruction pool length and freed in state_dnit.
 # ---
-# alloc:        backing allocator (the module's)
-# m:            module under mutation
-# fn:           function being promoted
-# block_count:  number of blocks in the function
-# rpo:          reverse-postorder block ids (defs precede uses on dominator paths)
-# rpo_len:      number of reachable blocks in `rpo`
-# rpo_index:    block id -> its position in `rpo`, or NONE_U32 if unreachable
-# idom:         block id -> immediate dominator block id (entry's idom is itself)
-# df:           flattened dominance-frontier sets; df_start/df_len index per block
-# df_start:     block id -> start offset into `df`
-# df_len:       block id -> frontier size
-# df_total:     allocated length of `df`
-# pool_len:     snapshot of fn.instr_len at entry; sizes the per-instruction maps
-# instr_block:  instruction id -> owning block, filled from the block lists (the
-#               liveness source of truth); BLOCK_NIL marks a pool ghost a prior
-#               pass unlinked, which every sweep here skips
-# alloca_of:    instruction id -> index into the promotable set (NONE_U32 when
-#               not a promotable alloca); the O(1) alloca lookup
-# cand_cap:     allocation size of alloca_ids / alloca_ty
-# alloca_ids:   the promotable alloca InstructionIds, in pool-id order
-# alloca_ty:    parallel to alloca_ids: each promotable alloca's value (slot)
-#               type, derived from a load/store on it — NOT the alloca's own
-#               result type, which is always the IR pointer type
-# alloca_count: number of promotable allocas
-# store_start:  per-alloca slice start into store_blocks
-# store_len:    per-alloca slice length
-# store_blocks: flattened per-alloca lists of the blocks storing to the alloca,
-#               in store-id order; seeds the phi-insertion worklist
-# store_total:  allocation size of store_blocks
-# phi_alloca:   instruction id -> the alloca a phi resolves (INSTR_NIL if not a
-#               mem2reg phi); sized to the instruction pool
+# alloc:          backing allocator (the module's)
+# m:              module under mutation
+# fn:             function being promoted
+# block_count:    number of blocks in the function
+# rpo:            reverse-postorder block ids (defs precede uses on dominator paths)
+# rpo_len:        number of reachable blocks in rpo
+# rpo_index:      block id -> its position in rpo, or NONE_U32 if unreachable
+# idom:           block id -> immediate dominator block id (entry's idom is itself)
+# df:             flattened dominance-frontier sets; df_start/df_len index per block
+# df_start:       block id -> start offset into df
+# df_len:         block id -> frontier size
+# df_total:       allocated length of df
+# pool_len:       snapshot of fn.instr_len at entry; sizes the per-instruction maps
+# instr_block:    instruction id -> owning block, filled from the block lists (the
+#                 liveness source of truth); BLOCK_NIL marks a pool ghost a prior
+#                 pass unlinked, which every sweep here skips
+# alloca_of:      instruction id -> index into the promotable set (NONE_U32 when
+#                 not a promotable alloca); the O(1) alloca lookup
+# cand_cap:       allocation size of alloca_ids / alloca_ty
+# alloca_ids:     the promotable alloca InstructionIds, in pool-id order
+# alloca_ty:      parallel to alloca_ids: each promotable alloca's value (slot)
+#                 type, derived from a load/store on it -- NOT the alloca's own
+#                 result type, which is always the IR pointer type
+# alloca_count:   number of promotable allocas
+# store_start:    per-alloca slice start into store_blocks
+# store_len:      per-alloca slice length
+# store_blocks:   flattened per-alloca lists of the blocks storing to the alloca,
+#                 in store-id order; seeds the phi-insertion worklist
+# store_total:    allocation size of store_blocks
+# phi_alloca:     instruction id -> the alloca a phi resolves (INSTR_NIL if not a
+#                 mem2reg phi); sized to the instruction pool
+# phi_alloca_cap: allocation size of phi_alloca
 rec State {
-    alloc:        *Allocator;
+    alloc:        *A.Allocator;
     m:            *ir.Module;
     fn:           *ir.Function;
     block_count:  u32;
@@ -105,7 +95,7 @@ rec State {
 
     cand_cap:     u32;
     alloca_ids:   *id.InstructionId;
-    alloca_ty:    *ir_type.IrTypeId;
+    alloca_ty:    *type.IrTypeId;
     alloca_count: u32;
 
     store_start:  *u32;
@@ -117,206 +107,263 @@ rec State {
     phi_alloca_cap: u32;
 }
 
-# Pass entry. Runs the promotion algorithm independently on every function in
-# the module.
+# run the promotion algorithm independently on every defined function in the
+# module
 # ---
 # m:   module to mutate in place
 # ret: ok(true) after a full pass, or the first allocation error encountered
-pub fun run(m: *ir.Module) Result[bool, str] {
+pub fun run(m: *ir.Module) R.Result[bool, str] {
     var f: u32 = 0;
     for (f < m.function_len) {
         val fn: *ir.Function = ?m.functions[f];
         if ((fn.flags & ir.FN_FLAG_EXTERN) == 0) {
-            val r: Result[bool, str] = promote_function(m, fn);
-            if (is_err[bool, str](r)) { ret r; }
+            val res_promote: R.Result[bool, str] = promote_function(m, fn);
+            if (R.is_err[bool, str](res_promote)) { ret res_promote; }
         }
         f = f + 1;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# Runs the full pipeline on one function: classify allocas, compute dominance,
-# insert phis, rename, and drop the promoted memory ops. A function with no
-# promotable allocas is left untouched.
-fun promote_function(m: *ir.Module, fn: *ir.Function) Result[bool, str] {
+# run the full pipeline on one function: classify allocas, compute dominance,
+# insert phis, rename, and drop the promoted memory ops
+#
+# A function with no promotable allocas is left untouched.
+# ---
+# m:   module under mutation
+# fn:  function to promote
+# ret: ok(true) on success, or the first allocation error encountered
+fun promote_function(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
     var st: State;
-    st.alloc        = m.alloc;
-    st.m            = m;
-    st.fn           = fn;
-    st.block_count  = fn.block_count;
-    st.rpo          = nil;
-    st.rpo_len      = 0;
-    st.rpo_index    = nil;
-    st.idom         = nil;
-    st.df           = nil;
-    st.df_start     = nil;
-    st.df_len       = nil;
-    st.df_total     = 0;
-    st.pool_len     = 0;
-    st.instr_block  = nil;
-    st.alloca_of    = nil;
-    st.cand_cap       = 0;
-    st.alloca_ids     = nil;
-    st.alloca_ty      = nil;
-    st.alloca_count   = 0;
-    st.store_start    = nil;
-    st.store_len      = nil;
-    st.store_blocks   = nil;
-    st.store_total    = 0;
+    state_init(?st, m, fn);
+
+    if (fn.block_count == 0) { ret R.ok[bool, str](true); }
+
+    val res_collect: R.Result[bool, str] = collect_promotable(?st);
+    if (R.is_err[bool, str](res_collect)) { state_dnit(?st); ret res_collect; }
+    if (st.alloca_count == 0)             { state_dnit(?st); ret R.ok[bool, str](true); }
+
+    val res_phi: R.Result[bool, str] = phi_table_init(?st);
+    if (R.is_err[bool, str](res_phi)) { state_dnit(?st); ret res_phi; }
+
+    val res_dom: R.Result[bool, str] = compute_dominance(?st);
+    if (R.is_err[bool, str](res_dom)) { state_dnit(?st); ret res_dom; }
+
+    val res_insert: R.Result[bool, str] = insert_phis(?st);
+    if (R.is_err[bool, str](res_insert)) { state_dnit(?st); ret res_insert; }
+
+    val res_rename: R.Result[bool, str] = rename(?st);
+    if (R.is_err[bool, str](res_rename)) { state_dnit(?st); ret res_rename; }
+
+    state_dnit(?st);
+    ret R.ok[bool, str](true);
+}
+
+# zero a working state for fn ahead of promotion
+#
+# Every owned array starts nil so a partially constructed state is still safe to
+# hand to state_dnit.
+# ---
+# st: working state to initialise in place
+# m:  module under mutation (also the allocator source)
+# fn: function being promoted
+fun state_init(st: *State, m: *ir.Module, fn: *ir.Function) {
+    st.alloc       = m.alloc;
+    st.m           = m;
+    st.fn          = fn;
+    st.block_count = fn.block_count;
+
+    st.rpo       = nil;
+    st.rpo_len   = 0;
+    st.rpo_index = nil;
+    st.idom      = nil;
+
+    st.df       = nil;
+    st.df_start = nil;
+    st.df_len   = nil;
+    st.df_total = 0;
+
+    st.pool_len    = 0;
+    st.instr_block = nil;
+    st.alloca_of   = nil;
+
+    st.cand_cap     = 0;
+    st.alloca_ids   = nil;
+    st.alloca_ty    = nil;
+    st.alloca_count = 0;
+
+    st.store_start  = nil;
+    st.store_len    = nil;
+    st.store_blocks = nil;
+    st.store_total  = 0;
+
     st.phi_alloca     = nil;
     st.phi_alloca_cap = 0;
-
-    if (fn.block_count == 0) { ret ok[bool, str](true); }
-
-    val rc: Result[bool, str] = collect_promotable(?st);
-    if (is_err[bool, str](rc)) { dnit_state(?st); ret rc; }
-    if (st.alloca_count == 0) { dnit_state(?st); ret ok[bool, str](true); }
-
-    # phi ids are assigned past the current pool length as add_instruction
-    # grows it. an alloca contributes at most one phi per block, so the highest
-    # possible phi id is instr_len + block_count*alloca_count - 1. size the
-    # alloca-tag table to cover every id we might assign.
-    val phi_cap: u32 = fn.instr_len + st.block_count * st.alloca_count;
-    val rphi: Result[*id.InstructionId, str] =
-        allocate[id.InstructionId](st.alloc, phi_cap::usize);
-    if (is_err[*id.InstructionId, str](rphi)) {
-        dnit_state(?st);
-        ret err[bool, str](unwrap_err[*id.InstructionId, str](rphi));
-    }
-    st.phi_alloca     = unwrap_ok[*id.InstructionId, str](rphi);
-    st.phi_alloca_cap = phi_cap;
-    var pi: u32 = 0;
-    for (pi < phi_cap) { st.phi_alloca[pi] = id.INSTR_NIL; pi = pi + 1; }
-
-    val rd: Result[bool, str] = compute_dominance(?st);
-    if (is_err[bool, str](rd)) { dnit_state(?st); ret rd; }
-
-    val rp: Result[bool, str] = insert_phis(?st);
-    if (is_err[bool, str](rp)) { dnit_state(?st); ret rp; }
-
-    val rr: Result[bool, str] = rename(?st);
-    if (is_err[bool, str](rr)) { dnit_state(?st); ret rr; }
-
-    dnit_state(?st);
-    ret ok[bool, str](true);
 }
 
-# frees every owned array in the working state by its allocation size. safe to
-# call partway through construction — each array is nil until allocated.
-fun dnit_state(st: *State) {
-    if (st.rpo != nil)        { deallocate[id.BlockId](st.alloc, st.rpo, st.block_count::usize); }
-    if (st.rpo_index != nil)  { deallocate[u32](st.alloc, st.rpo_index, st.block_count::usize); }
-    if (st.idom != nil)       { deallocate[u32](st.alloc, st.idom, st.block_count::usize); }
-    if (st.df != nil)         { deallocate[id.BlockId](st.alloc, st.df, st.df_total::usize); }
-    if (st.df_start != nil)   { deallocate[u32](st.alloc, st.df_start, st.block_count::usize); }
-    if (st.df_len != nil)     { deallocate[u32](st.alloc, st.df_len, st.block_count::usize); }
-    if (st.instr_block != nil)  { deallocate[id.BlockId](st.alloc, st.instr_block, st.pool_len::usize); }
-    if (st.alloca_of != nil)    { deallocate[u32](st.alloc, st.alloca_of, st.pool_len::usize); }
-    if (st.alloca_ids != nil)   { deallocate[id.InstructionId](st.alloc, st.alloca_ids, st.cand_cap::usize); }
-    if (st.alloca_ty != nil)    { deallocate[ir_type.IrTypeId](st.alloc, st.alloca_ty, st.cand_cap::usize); }
-    if (st.store_start != nil)  { deallocate[u32](st.alloc, st.store_start, st.alloca_count::usize); }
-    if (st.store_len != nil)    { deallocate[u32](st.alloc, st.store_len, st.alloca_count::usize); }
-    if (st.store_blocks != nil) { deallocate[id.BlockId](st.alloc, st.store_blocks, st.store_total::usize); }
-    if (st.phi_alloca != nil) { deallocate[id.InstructionId](st.alloc, st.phi_alloca, st.phi_alloca_cap::usize); }
+# free every owned array in the working state by its allocation size
+#
+# Safe to call partway through construction -- each array is nil until allocated.
+# ---
+# st: state to tear down
+fun state_dnit(st: *State) {
+    if (st.rpo != nil)          { A.deallocate[id.BlockId](st.alloc, st.rpo, st.block_count::usize); }
+    if (st.rpo_index != nil)    { A.deallocate[u32](st.alloc, st.rpo_index, st.block_count::usize); }
+    if (st.idom != nil)         { A.deallocate[u32](st.alloc, st.idom, st.block_count::usize); }
+    if (st.df != nil)           { A.deallocate[id.BlockId](st.alloc, st.df, st.df_total::usize); }
+    if (st.df_start != nil)     { A.deallocate[u32](st.alloc, st.df_start, st.block_count::usize); }
+    if (st.df_len != nil)       { A.deallocate[u32](st.alloc, st.df_len, st.block_count::usize); }
+    if (st.instr_block != nil)  { A.deallocate[id.BlockId](st.alloc, st.instr_block, st.pool_len::usize); }
+    if (st.alloca_of != nil)    { A.deallocate[u32](st.alloc, st.alloca_of, st.pool_len::usize); }
+    if (st.alloca_ids != nil)   { A.deallocate[id.InstructionId](st.alloc, st.alloca_ids, st.cand_cap::usize); }
+    if (st.alloca_ty != nil)    { A.deallocate[type.IrTypeId](st.alloc, st.alloca_ty, st.cand_cap::usize); }
+    if (st.store_start != nil)  { A.deallocate[u32](st.alloc, st.store_start, st.alloca_count::usize); }
+    if (st.store_len != nil)    { A.deallocate[u32](st.alloc, st.store_len, st.alloca_count::usize); }
+    if (st.store_blocks != nil) { A.deallocate[id.BlockId](st.alloc, st.store_blocks, st.store_total::usize); }
+    if (st.phi_alloca != nil)   { A.deallocate[id.InstructionId](st.alloc, st.phi_alloca, st.phi_alloca_cap::usize); }
+}
+
+# allocate and clear the phi -> alloca tag table, sized to cover every phi id
+# the pass might assign
+#
+# Phi ids are handed out past the current pool length as instruction_add grows
+# it. An alloca contributes at most one phi per block, so the highest possible
+# phi id is instr_len + block_count*alloca_count - 1; the table spans that range
+# so place_phi can tag each phi by id.
+# ---
+# st:  state with alloca_count and block_count already set
+# ret: ok(true) once phi_alloca is allocated and cleared, or an allocation error
+fun phi_table_init(st: *State) R.Result[bool, str] {
+    val phi_cap: u32 = st.fn.instr_len + st.block_count * st.alloca_count;
+
+    val res_phi: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](st.alloc, phi_cap::usize);
+    if (R.is_err[*id.InstructionId, str](res_phi)) {
+        ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](res_phi));
+    }
+    st.phi_alloca     = R.unwrap_ok[*id.InstructionId, str](res_phi);
+    st.phi_alloca_cap = phi_cap;
+
+    var i: u32 = 0;
+    for (i < phi_cap) { st.phi_alloca[i] = id.INSTR_NIL; i = i + 1; }
+    ret R.ok[bool, str](true);
 }
 
 # classify promotable allocas: an OP_ALLOCA whose result Value is referenced
-# only as the pointer operand of an OP_LOAD or OP_STORE. Any other reference
-# (the stored value of a store, a gep base, a call argument, …) means the
-# address escaped and the alloca stays in memory. Each accepted alloca's value
-# (slot) type is recorded in the parallel `alloca_ty` array, derived from its
-# first (lowest-id) load/store — the alloca's own result type is always the IR
-# pointer type.
+# only as the pointer operand of an OP_LOAD or OP_STORE
+#
+# Any other reference (the stored value of a store, a gep base, a call argument,
+# ...) means the address escaped and the alloca stays in memory. Each accepted
+# alloca's value (slot) type is recorded in the parallel alloca_ty array, derived
+# from its first (lowest-id) load/store -- the alloca's own result type is always
+# the IR pointer type.
 #
 # Block lists are the liveness source of truth (mirroring dce): the per-
-# instruction `instr_block` map is filled from them first, and every sweep
-# skips pool ghosts — so a call a prior inline unlinked cannot poison escape
-# analysis, and a store in a block reachability-dce removed cannot seed a phi.
-# All sweeps run in ascending pool-id order and the whole classification is a
-# fixed number of linear passes, replacing the per-alloca pool rescans.
-fun collect_promotable(st: *State) Result[bool, str] {
+# instruction instr_block map is filled from them first, and every sweep skips
+# pool ghosts -- so a call a prior inline unlinked cannot poison escape analysis,
+# and a store in a block reachability-dce removed cannot seed a phi. All sweeps
+# run in ascending pool-id order, a fixed number of linear passes replacing the
+# per-alloca pool rescans.
+# ---
+# st:  state to populate (instr_block, alloca_*, store_*)
+# ret: ok(true) once the promotable set and its store blocks are gathered, or an
+#      allocation error
+fun collect_promotable(st: *State) R.Result[bool, str] {
     val fn: *ir.Function = st.fn;
     val ilen: u32 = fn.instr_len;
-    if (ilen == 0) { ret ok[bool, str](true); }
+    if (ilen == 0) { ret R.ok[bool, str](true); }
     st.pool_len = ilen;
 
-    val ra: Result[*id.InstructionId, str] = allocate[id.InstructionId](st.alloc, ilen::usize);
-    if (is_err[*id.InstructionId, str](ra)) {
-        ret err[bool, str](unwrap_err[*id.InstructionId, str](ra));
+    val res_alloca_ids: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](st.alloc, ilen::usize);
+    if (R.is_err[*id.InstructionId, str](res_alloca_ids)) {
+        ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](res_alloca_ids));
     }
-    st.alloca_ids = unwrap_ok[*id.InstructionId, str](ra);
+    st.alloca_ids = R.unwrap_ok[*id.InstructionId, str](res_alloca_ids);
 
-    val rt: Result[*ir_type.IrTypeId, str] = allocate[ir_type.IrTypeId](st.alloc, ilen::usize);
-    if (is_err[*ir_type.IrTypeId, str](rt)) {
-        ret err[bool, str](unwrap_err[*ir_type.IrTypeId, str](rt));
+    val res_alloca_ty: R.Result[*type.IrTypeId, str] = A.allocate[type.IrTypeId](st.alloc, ilen::usize);
+    if (R.is_err[*type.IrTypeId, str](res_alloca_ty)) {
+        ret R.err[bool, str](R.unwrap_err[*type.IrTypeId, str](res_alloca_ty));
     }
-    st.alloca_ty = unwrap_ok[*ir_type.IrTypeId, str](rt);
+    st.alloca_ty = R.unwrap_ok[*type.IrTypeId, str](res_alloca_ty);
     st.cand_cap  = ilen;
 
-    val rib: Result[*id.BlockId, str] = allocate[id.BlockId](st.alloc, ilen::usize);
-    if (is_err[*id.BlockId, str](rib)) {
-        ret err[bool, str](unwrap_err[*id.BlockId, str](rib));
+    val res_instr_block: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](st.alloc, ilen::usize);
+    if (R.is_err[*id.BlockId, str](res_instr_block)) {
+        ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](res_instr_block));
     }
-    st.instr_block = unwrap_ok[*id.BlockId, str](rib);
+    st.instr_block = R.unwrap_ok[*id.BlockId, str](res_instr_block);
 
-    val rao: Result[*u32, str] = allocate[u32](st.alloc, ilen::usize);
-    if (is_err[*u32, str](rao)) {
-        ret err[bool, str](unwrap_err[*u32, str](rao));
+    val res_alloca_of: R.Result[*u32, str] = A.allocate[u32](st.alloc, ilen::usize);
+    if (R.is_err[*u32, str](res_alloca_of)) {
+        ret R.err[bool, str](R.unwrap_err[*u32, str](res_alloca_of));
     }
-    st.alloca_of = unwrap_ok[*u32, str](rao);
+    st.alloca_of = R.unwrap_ok[*u32, str](res_alloca_of);
 
-    var z: u32 = 0;
-    for (z < ilen) {
-        st.instr_block[z] = id.BLOCK_NIL;
-        st.alloca_of[z]   = NONE_U32;
-        z = z + 1;
+    var i: u32 = 0;
+    for (i < ilen) {
+        st.instr_block[i] = id.BLOCK_NIL;
+        st.alloca_of[i]   = NONE_U32;
+        i = i + 1;
     }
     map_instr_blocks(st);
 
     # candidates in pool-id order: every alloca still listed in a block.
-    var i: u32 = 0;
-    for (i < ilen) {
-        if (fn.instrs[i].kind == instr.OP_ALLOCA && st.instr_block[i] != id.BLOCK_NIL) {
-            st.alloca_of[i] = st.alloca_count;
-            st.alloca_ids[st.alloca_count] = i::id.InstructionId;
-            st.alloca_ty[st.alloca_count]  = ir_type.IRT_NIL;
+    var ii: u32 = 0;
+    for (ii < ilen) {
+        if (fn.instrs[ii].kind == instruction.OP_ALLOCA && st.instr_block[ii] != id.BLOCK_NIL) {
+            st.alloca_of[ii] = st.alloca_count;
+            st.alloca_ids[st.alloca_count] = ii::id.InstructionId;
+            st.alloca_ty[st.alloca_count]  = type.IRT_NIL;
             st.alloca_count = st.alloca_count + 1;
         }
-        i = i + 1;
+        ii = ii + 1;
     }
-    if (st.alloca_count == 0) { ret ok[bool, str](true); }
+    if (st.alloca_count == 0) { ret R.ok[bool, str](true); }
 
     val cand_n: u32 = st.alloca_count;
-    val re: Result[*bool, str] = allocate[bool](st.alloc, cand_n::usize);
-    if (is_err[*bool, str](re)) { ret err[bool, str](unwrap_err[*bool, str](re)); }
-    val escaped: *bool = unwrap_ok[*bool, str](re);
+    val res_escaped: R.Result[*bool, str] = A.allocate[bool](st.alloc, cand_n::usize);
+    if (R.is_err[*bool, str](res_escaped)) { ret R.err[bool, str](R.unwrap_err[*bool, str](res_escaped)); }
+    val escaped: *bool = R.unwrap_ok[*bool, str](res_escaped);
     var e: u32 = 0;
     for (e < cand_n) { escaped[e] = false; e = e + 1; }
 
-    # one classification sweep over the live instructions: record each
-    # candidate's slot type from its first load/store and mark every escape
-    # (any reference outside load-slot-0 / store-slot-1, or an inline-asm
-    # `{name}` binding — an asm-referenced alloca is addressed as
-    # `[rbp + offset]` at encode time, so its storage must survive).
+    classify_escapes(st, escaped);
+    compact_promotable(st, escaped);
+    A.deallocate[bool](st.alloc, escaped, cand_n::usize);
+    if (st.alloca_count == 0) { ret R.ok[bool, str](true); }
+
+    ret collect_store_blocks(st);
+}
+
+# one classification sweep over the live instructions: record each candidate's
+# slot type from its first load/store and mark every escape
+#
+# An escape is any reference outside load-slot-0 / store-slot-1, or an inline-asm
+# {name} binding -- an asm-referenced alloca is addressed as [rbp + offset] at
+# encode time, so its storage must survive.
+# ---
+# st:      state with the candidate set already gathered
+# escaped: per-candidate escape flags, written true where the address escapes
+fun classify_escapes(st: *State, escaped: *bool) {
+    val fn: *ir.Function = st.fn;
     var c: u32 = 0;
-    for (c < ilen) {
+    for (c < st.pool_len) {
         if (st.instr_block[c] != id.BLOCK_NIL) {
-            val inst: *instr.Instruction = ?fn.instrs[c];
-            if (inst.kind == instr.OP_ASM) {
+            val inst: *instruction.Instruction = ?fn.instrs[c];
+            if (inst.kind == instruction.OP_ASM) {
                 mark_asm_binds_escaped(st, c::id.InstructionId, escaped);
             }
             var o: u32 = 0;
             for (o < inst.operand_count) {
                 val op: value.Value = inst.operands[o];
-                if (op.kind == value.VAL_INSTR && op.data.instr::u32 < ilen) {
+                if (op.kind == value.VAL_INSTR && op.data.instr::u32 < st.pool_len) {
                     val ai: u32 = st.alloca_of[op.data.instr::u32];
                     if (ai != NONE_U32) {
-                        val ok_load:  bool = inst.kind == instr.OP_LOAD  && o == 0;
-                        val ok_store: bool = inst.kind == instr.OP_STORE && o == 1;
+                        val ok_load:  bool = inst.kind == instruction.OP_LOAD  && o == 0;
+                        val ok_store: bool = inst.kind == instruction.OP_STORE && o == 1;
                         if (ok_load == false && ok_store == false) {
                             escaped[ai] = true;
                         } or {
-                            if (st.alloca_ty[ai] == ir_type.IRT_NIL) {
+                            if (st.alloca_ty[ai] == type.IRT_NIL) {
                                 if (ok_load) { st.alloca_ty[ai] = inst.ty; }
                                 or           { st.alloca_ty[ai] = inst.operands[0].ty; }
                             }
@@ -328,16 +375,22 @@ fun collect_promotable(st: *State) Result[bool, str] {
         }
         c = c + 1;
     }
+}
 
-    # compact the escaped candidates out (keeping pool-id order) and retag the
-    # alloca_of map with the surviving indices.
+# compact the escaped candidates out (keeping pool-id order) and retag the
+# alloca_of map with the surviving indices
+# ---
+# st:      state whose alloca_ids / alloca_ty / alloca_of are rewritten in place
+# escaped: per-candidate escape flags from classify_escapes
+fun compact_promotable(st: *State, escaped: *bool) {
+    val cand_n: u32 = st.alloca_count;
     var w: u32 = 0;
     var r: u32 = 0;
     for (r < cand_n) {
         val aid: id.InstructionId = st.alloca_ids[r];
         if (escaped[r] == false) {
-            st.alloca_ids[w] = aid;
-            st.alloca_ty[w]  = st.alloca_ty[r];
+            st.alloca_ids[w]       = aid;
+            st.alloca_ty[w]        = st.alloca_ty[r];
             st.alloca_of[aid::u32] = w;
             w = w + 1;
         } or {
@@ -346,14 +399,12 @@ fun collect_promotable(st: *State) Result[bool, str] {
         r = r + 1;
     }
     st.alloca_count = w;
-    deallocate[bool](st.alloc, escaped, cand_n::usize);
-    if (w == 0) { ret ok[bool, str](true); }
-
-    ret collect_store_blocks(st);
 }
 
-# fills `instr_block` from the block lists: every listed phi, body instruction,
-# and terminator maps to its owning block. unlisted pool entries stay BLOCK_NIL.
+# fill instr_block from the block lists: every listed phi, body instruction, and
+# terminator maps to its owning block; unlisted pool entries stay BLOCK_NIL
+# ---
+# st: state with instr_block allocated and cleared to BLOCK_NIL
 fun map_instr_blocks(st: *State) {
     val fn: *ir.Function = st.fn;
     var b: u32 = 0;
@@ -378,17 +429,23 @@ fun map_instr_blocks(st: *State) {
     }
 }
 
-# marks every candidate alloca referenced by the OP_ASM's `{name}` bindings as
-# escaped. the bindings live in the asm payload (not the instruction's operand
-# array), so escape analysis must consult them explicitly.
+# mark every candidate alloca referenced by an OP_ASM's {name} bindings as
+# escaped
+#
+# The bindings live in the asm payload (not the instruction's operand array), so
+# escape analysis must consult them explicitly.
+# ---
+# st:      state with the candidate set already gathered
+# asm_id:  the OP_ASM instruction whose bindings to scan
+# escaped: per-candidate escape flags, written true for each bound alloca
 fun mark_asm_binds_escaped(st: *State, asm_id: id.InstructionId, escaped: *bool) {
     var key: id.InstructionId = asm_id;
-    val r: Result[*ir.IrAsm, str] = map.get[id.InstructionId, ir.IrAsm](?st.fn.asm_blocks, ?key);
-    if (is_err[*ir.IrAsm, str](r)) { ret; }
-    val pl: *ir.IrAsm = unwrap_ok[*ir.IrAsm, str](r);
+    val res_asm: R.Result[*ir.IrAsm, str] = map.get[id.InstructionId, ir.IrAsm](?st.fn.asm_blocks, ?key);
+    if (R.is_err[*ir.IrAsm, str](res_asm)) { ret; }
+    val payload: *ir.IrAsm = R.unwrap_ok[*ir.IrAsm, str](res_asm);
     var b: u32 = 0;
-    for (b < pl.bind_count) {
-        val bid: id.InstructionId = pl.binds[b].instr;
+    for (b < payload.bind_count) {
+        val bid: id.InstructionId = payload.binds[b].instr;
         if (bid::u32 < st.pool_len && st.alloca_of[bid::u32] != NONE_U32) {
             escaped[st.alloca_of[bid::u32]] = true;
         }
@@ -396,20 +453,24 @@ fun mark_asm_binds_escaped(st: *State, asm_id: id.InstructionId, escaped: *bool)
     }
 }
 
-# gathers, per promotable alloca, the blocks containing its stores into the
-# flattened `store_blocks` slices, in ascending store-id order (matching the
-# pool-scan seed order the per-alloca rescans used). count, prefix-sum, fill.
-fun collect_store_blocks(st: *State) Result[bool, str] {
-    val fn: *ir.Function = st.fn;
+# gather, per promotable alloca, the blocks containing its stores into the
+# flattened store_blocks slices, in ascending store-id order
+#
+# The slice order matches the pool-scan seed order the per-alloca rescans used.
+# Count, prefix-sum, then fill.
+# ---
+# st:  state whose store_start / store_len / store_blocks are allocated and filled
+# ret: ok(true) on success, or an allocation error
+fun collect_store_blocks(st: *State) R.Result[bool, str] {
     val na: u32 = st.alloca_count;
 
-    val rs: Result[*u32, str] = allocate[u32](st.alloc, na::usize);
-    if (is_err[*u32, str](rs)) { ret err[bool, str](unwrap_err[*u32, str](rs)); }
-    st.store_start = unwrap_ok[*u32, str](rs);
+    val res_start: R.Result[*u32, str] = A.allocate[u32](st.alloc, na::usize);
+    if (R.is_err[*u32, str](res_start)) { ret R.err[bool, str](R.unwrap_err[*u32, str](res_start)); }
+    st.store_start = R.unwrap_ok[*u32, str](res_start);
 
-    val rl: Result[*u32, str] = allocate[u32](st.alloc, na::usize);
-    if (is_err[*u32, str](rl)) { ret err[bool, str](unwrap_err[*u32, str](rl)); }
-    st.store_len = unwrap_ok[*u32, str](rl);
+    val res_len: R.Result[*u32, str] = A.allocate[u32](st.alloc, na::usize);
+    if (R.is_err[*u32, str](res_len)) { ret R.err[bool, str](R.unwrap_err[*u32, str](res_len)); }
+    st.store_len = R.unwrap_ok[*u32, str](res_len);
 
     var a: u32 = 0;
     for (a < na) { st.store_len[a] = 0; st.store_start[a] = 0; a = a + 1; }
@@ -432,9 +493,9 @@ fun collect_store_blocks(st: *State) Result[bool, str] {
     if (alloc_n == 0) { alloc_n = 1; }   # always allocate so dnit frees cleanly.
     st.store_total = alloc_n;
 
-    val rb: Result[*id.BlockId, str] = allocate[id.BlockId](st.alloc, alloc_n::usize);
-    if (is_err[*id.BlockId, str](rb)) { ret err[bool, str](unwrap_err[*id.BlockId, str](rb)); }
-    st.store_blocks = unwrap_ok[*id.BlockId, str](rb);
+    val res_blocks: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](st.alloc, alloc_n::usize);
+    if (R.is_err[*id.BlockId, str](res_blocks)) { ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](res_blocks)); }
+    st.store_blocks = R.unwrap_ok[*id.BlockId, str](res_blocks);
 
     var f: u32 = 0;
     for (f < na) { st.store_len[f] = 0; f = f + 1; }
@@ -447,40 +508,51 @@ fun collect_store_blocks(st: *State) Result[bool, str] {
         }
         j = j + 1;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# the promotable-set index of the alloca a live OP_STORE at pool id `i` writes,
-# or NONE_U32 when `i` is not such a store (a ghost, another opcode, or a store
-# to something other than a promotable alloca).
+# the promotable-set index of the alloca a live OP_STORE at pool id i writes, or
+# NONE_U32 when i is not such a store
+#
+# i is rejected when it is a ghost, another opcode, or a store to something other
+# than a promotable alloca.
+# ---
+# st:  state with instr_block and alloca_of populated
+# i:   pool id to test
+# ret: the alloca's promotable index, or NONE_U32
 fun store_alloca_index(st: *State, i: u32) u32 {
     if (st.instr_block[i] == id.BLOCK_NIL) { ret NONE_U32; }
-    val inst: *instr.Instruction = ?st.fn.instrs[i];
-    if (inst.kind != instr.OP_STORE) { ret NONE_U32; }
-    if (inst.operand_count < 2) { ret NONE_U32; }
+    val inst: *instruction.Instruction = ?st.fn.instrs[i];
+    if (inst.kind != instruction.OP_STORE) { ret NONE_U32; }
+    if (inst.operand_count < 2)            { ret NONE_U32; }
     val ptr: value.Value = inst.operands[1];
-    if (ptr.kind != value.VAL_INSTR) { ret NONE_U32; }
+    if (ptr.kind != value.VAL_INSTR)        { ret NONE_U32; }
     if (ptr.data.instr::u32 >= st.pool_len) { ret NONE_U32; }
     ret st.alloca_of[ptr.data.instr::u32];
 }
 
-# Compute reverse postorder, the dominator tree (Cooper-Harvey-Kennedy), and
-# dominance frontiers. Only reachable blocks participate; unreachable blocks
-# get rpo_index == NONE_U32 and are skipped by later phases.
-fun compute_dominance(st: *State) Result[bool, str] {
+# compute reverse postorder, the dominator tree (Cooper-Harvey-Kennedy), and
+# dominance frontiers
+#
+# Only reachable blocks participate; unreachable blocks get rpo_index == NONE_U32
+# and are skipped by later phases.
+# ---
+# st:  state whose rpo / rpo_index / idom / df arrays are filled
+# ret: ok(true) on success, or an allocation error
+fun compute_dominance(st: *State) R.Result[bool, str] {
     val n: u32 = st.block_count;
 
-    val r1: Result[*id.BlockId, str] = allocate[id.BlockId](st.alloc, n::usize);
-    if (is_err[*id.BlockId, str](r1)) { ret err[bool, str](unwrap_err[*id.BlockId, str](r1)); }
-    st.rpo = unwrap_ok[*id.BlockId, str](r1);
+    val res_rpo: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](st.alloc, n::usize);
+    if (R.is_err[*id.BlockId, str](res_rpo)) { ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](res_rpo)); }
+    st.rpo = R.unwrap_ok[*id.BlockId, str](res_rpo);
 
-    val r2: Result[*u32, str] = allocate[u32](st.alloc, n::usize);
-    if (is_err[*u32, str](r2)) { ret err[bool, str](unwrap_err[*u32, str](r2)); }
-    st.rpo_index = unwrap_ok[*u32, str](r2);
+    val res_index: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](res_index)) { ret R.err[bool, str](R.unwrap_err[*u32, str](res_index)); }
+    st.rpo_index = R.unwrap_ok[*u32, str](res_index);
 
-    val r3: Result[*u32, str] = allocate[u32](st.alloc, n::usize);
-    if (is_err[*u32, str](r3)) { ret err[bool, str](unwrap_err[*u32, str](r3)); }
-    st.idom = unwrap_ok[*u32, str](r3);
+    val res_idom: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](res_idom)) { ret R.err[bool, str](R.unwrap_err[*u32, str](res_idom)); }
+    st.idom = R.unwrap_ok[*u32, str](res_idom);
 
     var b: u32 = 0;
     for (b < n) {
@@ -489,38 +561,42 @@ fun compute_dominance(st: *State) Result[bool, str] {
         b = b + 1;
     }
 
-    val rr: Result[bool, str] = build_rpo(st);
-    if (is_err[bool, str](rr)) { ret rr; }
+    val res_rpo_build: R.Result[bool, str] = build_rpo(st);
+    if (R.is_err[bool, str](res_rpo_build)) { ret res_rpo_build; }
 
-    val rdom: Result[bool, str] = build_idom(st);
-    if (is_err[bool, str](rdom)) { ret rdom; }
+    val res_idom_build: R.Result[bool, str] = build_idom(st);
+    if (R.is_err[bool, str](res_idom_build)) { ret res_idom_build; }
 
     ret build_frontiers(st);
 }
 
-# Depth-first traversal from the entry block producing reverse postorder.
+# depth-first traversal from the entry block producing reverse postorder
+#
 # Uses an explicit stack to avoid recursion; postorder is reversed in place.
-fun build_rpo(st: *State) Result[bool, str] {
+# ---
+# st:  state with rpo / rpo_index allocated; rpo_len is set on return
+# ret: ok(true) on success, or an allocation error
+fun build_rpo(st: *State) R.Result[bool, str] {
     val n: u32 = st.block_count;
 
-    val rv: Result[*bool, str] = allocate[bool](st.alloc, n::usize);
-    if (is_err[*bool, str](rv)) { ret err[bool, str](unwrap_err[*bool, str](rv)); }
-    val visited: *bool = unwrap_ok[*bool, str](rv);
+    val res_visited: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
+    if (R.is_err[*bool, str](res_visited)) { ret R.err[bool, str](R.unwrap_err[*bool, str](res_visited)); }
+    val visited: *bool = R.unwrap_ok[*bool, str](res_visited);
 
-    val rsb: Result[*u32, str] = allocate[u32](st.alloc, n::usize);
-    if (is_err[*u32, str](rsb)) {
-        deallocate[bool](st.alloc, visited, n::usize);
-        ret err[bool, str](unwrap_err[*u32, str](rsb));
+    val res_stk_block: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](res_stk_block)) {
+        A.deallocate[bool](st.alloc, visited, n::usize);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](res_stk_block));
     }
-    val stk_block: *u32 = unwrap_ok[*u32, str](rsb);
+    val stk_block: *u32 = R.unwrap_ok[*u32, str](res_stk_block);
 
-    val rsi: Result[*u32, str] = allocate[u32](st.alloc, n::usize);
-    if (is_err[*u32, str](rsi)) {
-        deallocate[bool](st.alloc, visited, n::usize);
-        deallocate[u32](st.alloc, stk_block, n::usize);
-        ret err[bool, str](unwrap_err[*u32, str](rsi));
+    val res_stk_succ: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](res_stk_succ)) {
+        A.deallocate[bool](st.alloc, visited, n::usize);
+        A.deallocate[u32](st.alloc, stk_block, n::usize);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](res_stk_succ));
     }
-    val stk_succ: *u32 = unwrap_ok[*u32, str](rsi);
+    val stk_succ: *u32 = R.unwrap_ok[*u32, str](res_stk_succ);
 
     val post: *id.BlockId = st.rpo;     # fill postorder, reverse at the end.
     var post_len: u32 = 0;
@@ -576,22 +652,34 @@ fun build_rpo(st: *State) Result[bool, str] {
         p = p + 1;
     }
 
-    deallocate[bool](st.alloc, visited, n::usize);
-    deallocate[u32](st.alloc, stk_block, n::usize);
-    deallocate[u32](st.alloc, stk_succ, n::usize);
-    ret ok[bool, str](true);
+    A.deallocate[bool](st.alloc, visited, n::usize);
+    A.deallocate[u32](st.alloc, stk_block, n::usize);
+    A.deallocate[u32](st.alloc, stk_succ, n::usize);
+    ret R.ok[bool, str](true);
 }
 
-# writes the (up to two) successor block ids of `bid` into out0/out1 and returns
-# the count, delegating to the shared ir.block_successors so the block-target
-# encoding lives in one place.
+# write the (up to two) successor block ids of bid into out0/out1 and return the
+# count
+#
+# Delegates to the shared ir.block_successors so the block-target encoding lives
+# in one place.
+# ---
+# st:   promotion state
+# bid:  block whose successors to read
+# out0: receives the first successor (BLOCK_NIL when none)
+# out1: receives the second successor (BLOCK_NIL when none)
+# ret:  number of successors written (0, 1, or 2)
 fun block_successors(st: *State, bid: id.BlockId, out0: *id.BlockId, out1: *id.BlockId) u32 {
     ret ir.block_successors(st.fn, ?st.fn.blocks[bid::u32], out0, out1);
 }
 
-# Cooper-Harvey-Kennedy iterative dominator construction over reverse
-# postorder. idom[entry] = entry; the rest converge in a few passes.
-fun build_idom(st: *State) Result[bool, str] {
+# Cooper-Harvey-Kennedy iterative dominator construction over reverse postorder
+#
+# idom[entry] = entry; the rest converge in a few passes.
+# ---
+# st:  state with rpo / rpo_index filled; idom is written
+# ret: ok(true) on success
+fun build_idom(st: *State) R.Result[bool, str] {
     val entry: u32 = 0;
     st.idom[entry] = entry;
 
@@ -624,12 +712,18 @@ fun build_idom(st: *State) Result[bool, str] {
             r = r + 1;
         }
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# walks both fingers up the partially built dominator tree until they meet,
-# comparing by reverse-postorder number. the meeting point is the nearest
-# common dominator of b1 and b2.
+# walk both fingers up the partially built dominator tree until they meet,
+# comparing by reverse-postorder number
+#
+# The meeting point is the nearest common dominator of b1 and b2.
+# ---
+# st:  state with rpo_index and idom populated
+# b1:  first block
+# b2:  second block
+# ret: the nearest common dominator block of b1 and b2
 fun intersect(st: *State, b1: u32, b2: u32) u32 {
     var f1: u32 = b1;
     var f2: u32 = b2;
@@ -644,20 +738,24 @@ fun intersect(st: *State, b1: u32, b2: u32) u32 {
     ret f1;
 }
 
-# Dominance frontiers via the standard predecessor-walk: for each join block b
-# and each predecessor p, walk from p up the dominator tree until idom[b],
-# adding b to the frontier of every node passed. Computed in two sweeps so the
-# flattened `df` arrays can be exactly sized.
-fun build_frontiers(st: *State) Result[bool, str] {
+# dominance frontiers via the standard predecessor-walk
+#
+# For each join block b and each predecessor p, walk from p up the dominator tree
+# until idom[b], adding b to the frontier of every node passed. Computed in two
+# sweeps so the flattened df arrays can be exactly sized.
+# ---
+# st:  state with idom filled; df / df_start / df_len are written
+# ret: ok(true) on success, or an allocation error
+fun build_frontiers(st: *State) R.Result[bool, str] {
     val n: u32 = st.block_count;
 
-    val rs: Result[*u32, str] = allocate[u32](st.alloc, n::usize);
-    if (is_err[*u32, str](rs)) { ret err[bool, str](unwrap_err[*u32, str](rs)); }
-    st.df_start = unwrap_ok[*u32, str](rs);
+    val res_start: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](res_start)) { ret R.err[bool, str](R.unwrap_err[*u32, str](res_start)); }
+    st.df_start = R.unwrap_ok[*u32, str](res_start);
 
-    val rl: Result[*u32, str] = allocate[u32](st.alloc, n::usize);
-    if (is_err[*u32, str](rl)) { ret err[bool, str](unwrap_err[*u32, str](rl)); }
-    st.df_len = unwrap_ok[*u32, str](rl);
+    val res_len: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](res_len)) { ret R.err[bool, str](R.unwrap_err[*u32, str](res_len)); }
+    st.df_len = R.unwrap_ok[*u32, str](res_len);
 
     var b: u32 = 0;
     for (b < n) { st.df_len[b] = 0; st.df_start[b] = 0; b = b + 1; }
@@ -676,19 +774,23 @@ fun build_frontiers(st: *State) Result[bool, str] {
     if (alloc_n == 0) { alloc_n = 1; }   # always allocate so dnit frees cleanly.
     st.df_total = alloc_n;
 
-    val rd: Result[*id.BlockId, str] = allocate[id.BlockId](st.alloc, alloc_n::usize);
-    if (is_err[*id.BlockId, str](rd)) { ret err[bool, str](unwrap_err[*id.BlockId, str](rd)); }
-    st.df = unwrap_ok[*id.BlockId, str](rd);
+    val res_df: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](st.alloc, alloc_n::usize);
+    if (R.is_err[*id.BlockId, str](res_df)) { ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](res_df)); }
+    st.df = R.unwrap_ok[*id.BlockId, str](res_df);
 
     var z: u32 = 0;
     for (z < n) { st.df_len[z] = 0; z = z + 1; }
     fill_frontiers(st);
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# first frontier sweep: increments df_len[runner] for every (b, runner) pair a
-# fill sweep would emit. Slight over-count (no dedup here) is harmless — it only
-# sizes the array; fill_frontiers dedups.
+# first frontier sweep: increment df_len[runner] for every (b, runner) pair a
+# fill sweep would emit
+#
+# A slight over-count (no dedup here) is harmless -- it only sizes the array;
+# fill_frontiers dedups.
+# ---
+# st: state with idom filled; df_len is accumulated
 fun count_frontiers(st: *State) {
     var b: u32 = 0;
     for (b < st.block_count) {
@@ -713,8 +815,10 @@ fun count_frontiers(st: *State) {
     }
 }
 
-# second frontier sweep: appends b to df[runner] for each pair, skipping
-# duplicates already present in the runner's slice.
+# second frontier sweep: append b to df[runner] for each pair, skipping
+# duplicates already present in the runner's slice
+# ---
+# st: state with df / df_start / df_len sized; df is filled
 fun fill_frontiers(st: *State) {
     var b: u32 = 0;
     for (b < st.block_count) {
@@ -739,8 +843,13 @@ fun fill_frontiers(st: *State) {
     }
 }
 
-# appends `target` to block `node`'s frontier slice if not already present.
-# the slice occupies df[df_start[node] .. df_start[node]+df_len[node]).
+# append target to block node's frontier slice if not already present
+#
+# The slice occupies df[df_start[node] .. df_start[node]+df_len[node]).
+# ---
+# st:     state with df / df_start / df_len populated
+# node:   the block whose frontier to extend
+# target: the join block to add
 fun frontier_add(st: *State, node: u32, target: id.BlockId) {
     val start: u32 = st.df_start[node];
     val len:   u32 = st.df_len[node];
@@ -753,32 +862,37 @@ fun frontier_add(st: *State, node: u32, target: id.BlockId) {
     st.df_len[node] = len + 1;
 }
 
-# Phi-insertion (iterated dominance frontier per alloca). For each promotable
-# alloca, the set of blocks that store to it seeds a worklist; a phi is placed
-# in every dominance-frontier block, and those phi blocks themselves rejoin the
-# worklist (iterated frontier). Each inserted phi records the alloca it stands
-# for in `phi_alloca` so the rename pass can wire its incoming values.
-fun insert_phis(st: *State) Result[bool, str] {
+# phi insertion via the iterated dominance frontier per alloca
+#
+# For each promotable alloca, the set of blocks that store to it seeds a
+# worklist; a phi is placed in every dominance-frontier block, and those phi
+# blocks themselves rejoin the worklist (iterated frontier). Each inserted phi
+# records the alloca it stands for in phi_alloca so rename can wire its incoming
+# values.
+# ---
+# st:  state with store blocks and dominance frontiers ready
+# ret: ok(true) once every phi is placed, or the first error encountered
+fun insert_phis(st: *State) R.Result[bool, str] {
     val n: u32 = st.block_count;
 
-    val rh: Result[*bool, str] = allocate[bool](st.alloc, n::usize);
-    if (is_err[*bool, str](rh)) { ret err[bool, str](unwrap_err[*bool, str](rh)); }
-    val has_phi: *bool = unwrap_ok[*bool, str](rh);
+    val res_has_phi: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
+    if (R.is_err[*bool, str](res_has_phi)) { ret R.err[bool, str](R.unwrap_err[*bool, str](res_has_phi)); }
+    val has_phi: *bool = R.unwrap_ok[*bool, str](res_has_phi);
 
-    val rq: Result[*bool, str] = allocate[bool](st.alloc, n::usize);
-    if (is_err[*bool, str](rq)) {
-        deallocate[bool](st.alloc, has_phi, n::usize);
-        ret err[bool, str](unwrap_err[*bool, str](rq));
+    val res_on_work: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
+    if (R.is_err[*bool, str](res_on_work)) {
+        A.deallocate[bool](st.alloc, has_phi, n::usize);
+        ret R.err[bool, str](R.unwrap_err[*bool, str](res_on_work));
     }
-    val on_work: *bool = unwrap_ok[*bool, str](rq);
+    val on_work: *bool = R.unwrap_ok[*bool, str](res_on_work);
 
-    val rw: Result[*id.BlockId, str] = allocate[id.BlockId](st.alloc, n::usize);
-    if (is_err[*id.BlockId, str](rw)) {
-        deallocate[bool](st.alloc, has_phi, n::usize);
-        deallocate[bool](st.alloc, on_work, n::usize);
-        ret err[bool, str](unwrap_err[*id.BlockId, str](rw));
+    val res_work: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](st.alloc, n::usize);
+    if (R.is_err[*id.BlockId, str](res_work)) {
+        A.deallocate[bool](st.alloc, has_phi, n::usize);
+        A.deallocate[bool](st.alloc, on_work, n::usize);
+        ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](res_work));
     }
-    val work: *id.BlockId = unwrap_ok[*id.BlockId, str](rw);
+    val work: *id.BlockId = R.unwrap_ok[*id.BlockId, str](res_work);
 
     var err_msg: str = nil;
     var a: u32 = 0;
@@ -814,8 +928,8 @@ fun insert_phis(st: *State) Result[bool, str] {
                 val y: u32 = st.df[fstart + k]::u32;
                 if (has_phi[y] == false) {
                     has_phi[y] = true;
-                    val rp: Result[bool, str] = place_phi(st, y::id.BlockId, alloca_id);
-                    if (is_err[bool, str](rp)) { err_msg = unwrap_err[bool, str](rp); }
+                    val res_place: R.Result[bool, str] = place_phi(st, y::id.BlockId, alloca_id);
+                    if (R.is_err[bool, str](res_place)) { err_msg = R.unwrap_err[bool, str](res_place); }
                     if (on_work[y] == false) {
                         on_work[y] = true;
                         work[wlen] = y::id.BlockId;
@@ -828,120 +942,62 @@ fun insert_phis(st: *State) Result[bool, str] {
         a = a + 1;
     }
 
-    deallocate[bool](st.alloc, has_phi, n::usize);
-    deallocate[bool](st.alloc, on_work, n::usize);
-    deallocate[id.BlockId](st.alloc, work, n::usize);
-    if (err_msg != nil) { ret err[bool, str](err_msg); }
-    ret ok[bool, str](true);
+    A.deallocate[bool](st.alloc, has_phi, n::usize);
+    A.deallocate[bool](st.alloc, on_work, n::usize);
+    A.deallocate[id.BlockId](st.alloc, work, n::usize);
+    if (err_msg != nil) { ret R.err[bool, str](err_msg); }
+    ret R.ok[bool, str](true);
 }
 
-# Materialises an empty OP_PHI in block `bid` carrying the alloca's value (slot)
-# type and records, in `phi_alloca`, which alloca it resolves. The phi starts
-# with zero operands; the rename pass appends one (block, value) pair per
-# predecessor. The phi's result type is the alloca's value type from the
-# parallel `alloca_ty` array — NOT the alloca instruction's own result type,
-# which is the IR pointer type.
-fun place_phi(st: *State, bid: id.BlockId, alloca_id: id.InstructionId) Result[bool, str] {
+# materialise an empty OP_PHI in block bid carrying the alloca's value (slot)
+# type and record, in phi_alloca, which alloca it resolves
+#
+# The phi starts with zero operands; rename appends one (block, value) pair per
+# predecessor. The phi's result type is the alloca's value type from the parallel
+# alloca_ty array -- NOT the alloca instruction's own result type, which is the
+# IR pointer type.
+# ---
+# st:        promotion state
+# bid:       block to place the phi in
+# alloca_id: the alloca this phi resolves
+# ret:       ok(true) once the phi is added and tagged, or an error
+fun place_phi(st: *State, bid: id.BlockId, alloca_id: id.InstructionId) R.Result[bool, str] {
     val ai: u32 = alloca_index(st, alloca_id);
     if (ai == NONE_U32) {
-        ret err[bool, str]("mem2reg: phi placed for a non-promotable alloca");
+        ret R.err[bool, str]("mem2reg: phi placed for a non-promotable alloca");
     }
 
-    var phi: instr.Instruction;
-    phi.kind          = instr.OP_PHI;
+    var phi: instruction.Instruction;
+    phi.kind          = instruction.OP_PHI;
     phi.ty            = st.alloca_ty[ai];
     phi.operands      = nil;
     phi.operand_count = 0;
     phi.flags         = 0;
-    phi.aux_ty        = ir_type.IRT_NIL;
+    phi.aux_ty        = type.IRT_NIL;
 
-    val rid: Result[id.InstructionId, str] = ir.instruction_add(st.m, st.fn, phi);
-    if (is_err[id.InstructionId, str](rid)) {
-        ret err[bool, str](unwrap_err[id.InstructionId, str](rid));
+    val res_id: R.Result[id.InstructionId, str] = ir.instruction_add(st.m, st.fn, phi);
+    if (R.is_err[id.InstructionId, str](res_id)) {
+        ret R.err[bool, str](R.unwrap_err[id.InstructionId, str](res_id));
     }
-    val phi_id: id.InstructionId = unwrap_ok[id.InstructionId, str](rid);
+    val phi_id: id.InstructionId = R.unwrap_ok[id.InstructionId, str](res_id);
 
     if (phi_id::u32 < st.phi_alloca_cap) {
         st.phi_alloca[phi_id::u32] = alloca_id;
     } or {
-        ret err[bool, str]("mem2reg: phi id exceeds phi_alloca capacity");
+        ret R.err[bool, str]("mem2reg: phi id exceeds phi_alloca capacity");
     }
 
     val blk: *ir.Block = ?st.fn.blocks[bid::u32];
     ret ir.block_append_phi(st.m, blk, phi_id);
 }
 
-# The rename pass: a pre-order walk of the dominator tree maintaining one
-# current-value slot per promotable alloca. Each load is recorded for
-# substitution by the stack top; each store updates the slot; each inserted phi
-# defines a new slot value. Successor phi operands are filled as edges are
-# taken. Promoted loads/stores/allocas are then stripped from their blocks and
-# all references to promoted loads rewritten to their SSA values.
-fun rename(st: *State) Result[bool, str] {
-    val na: u32 = st.alloca_count;
-    val ilen: u32 = st.fn.instr_len;
-
-    val rsub: Result[*value.Value, str] = allocate[value.Value](st.alloc, ilen::usize);
-    if (is_err[*value.Value, str](rsub)) { ret err[bool, str](unwrap_err[*value.Value, str](rsub)); }
-    val subst: *value.Value = unwrap_ok[*value.Value, str](rsub);
-
-    val rhas: Result[*bool, str] = allocate[bool](st.alloc, ilen::usize);
-    if (is_err[*bool, str](rhas)) {
-        deallocate[value.Value](st.alloc, subst, ilen::usize);
-        ret err[bool, str](unwrap_err[*bool, str](rhas));
-    }
-    val has_sub: *bool = unwrap_ok[*bool, str](rhas);
-    var hi: u32 = 0;
-    for (hi < ilen) { has_sub[hi] = false; hi = hi + 1; }
-
-    val rcur: Result[*value.Value, str] = allocate[value.Value](st.alloc, na::usize);
-    if (is_err[*value.Value, str](rcur)) {
-        deallocate[value.Value](st.alloc, subst, ilen::usize);
-        deallocate[bool](st.alloc, has_sub, ilen::usize);
-        ret err[bool, str](unwrap_err[*value.Value, str](rcur));
-    }
-    val cur: *value.Value = unwrap_ok[*value.Value, str](rcur);
-
-    val rdef: Result[*bool, str] = allocate[bool](st.alloc, na::usize);
-    if (is_err[*bool, str](rdef)) {
-        deallocate[value.Value](st.alloc, subst, ilen::usize);
-        deallocate[bool](st.alloc, has_sub, ilen::usize);
-        deallocate[value.Value](st.alloc, cur, na::usize);
-        ret err[bool, str](unwrap_err[*bool, str](rdef));
-    }
-    val defined: *bool = unwrap_ok[*bool, str](rdef);
-
-    var rc: RenameCtx;
-    rc.st       = st;
-    rc.subst    = subst;
-    rc.has_sub  = has_sub;
-    rc.cur      = cur;
-    rc.defined  = defined;
-    rc.instr_len = ilen;
-
-    var a: u32 = 0;
-    for (a < na) { defined[a] = false; a = a + 1; }
-
-    val rr: Result[bool, str] = rename_walk(?rc);
-    if (is_ok[bool, str](rr)) {
-        apply_substitutions(?rc);
-        strip_promoted(st);
-    }
-
-    deallocate[value.Value](st.alloc, subst, ilen::usize);
-    deallocate[bool](st.alloc, has_sub, ilen::usize);
-    deallocate[value.Value](st.alloc, cur, na::usize);
-    deallocate[bool](st.alloc, defined, na::usize);
-    ret rr;
-}
-
-# rename traversal context, threaded through the dominator-tree walk.
+# rename traversal context, threaded through the dominator-tree walk
 # ---
 # st:        promotion state
 # subst:     removed-load result id -> replacement SSA Value
-# has_sub:   which instruction ids have an entry in `subst`
+# has_sub:   which instruction ids have an entry in subst
 # cur:       per-alloca current SSA Value (stack top)
-# defined:   per-alloca whether `cur` holds a live value yet
+# defined:   per-alloca whether cur holds a live value yet
 # instr_len: snapshot of the instruction pool length when rename began
 rec RenameCtx {
     st:        *State;
@@ -952,89 +1008,193 @@ rec RenameCtx {
     instr_len: u32;
 }
 
-# returns the index of `alloca_id` within the promotable set via the O(1)
-# alloca_of map, or NONE_U32 if it is not a promoted alloca.
+# the rename pass: a pre-order walk of the dominator tree maintaining one
+# current-value slot per promotable alloca
+#
+# Each load is recorded for substitution by the stack top; each store updates the
+# slot; each inserted phi defines a new slot value. Successor phi operands are
+# filled as edges are taken. Promoted loads/stores/allocas are then stripped from
+# their blocks and all references to promoted loads rewritten to their SSA values.
+# ---
+# st:  state with phis already inserted
+# ret: ok(true) once renaming, substitution, and stripping complete, or an error
+fun rename(st: *State) R.Result[bool, str] {
+    val na: u32 = st.alloca_count;
+    val ilen: u32 = st.fn.instr_len;
+
+    var rc: RenameCtx;
+    rc.st        = st;
+    rc.subst     = nil;
+    rc.has_sub   = nil;
+    rc.cur       = nil;
+    rc.defined   = nil;
+    rc.instr_len = ilen;
+
+    val res_init: R.Result[bool, str] = rename_ctx_init(?rc, na, ilen);
+    if (R.is_err[bool, str](res_init)) { ret res_init; }
+
+    val res_walk: R.Result[bool, str] = rename_walk(?rc);
+    if (R.is_ok[bool, str](res_walk)) {
+        apply_substitutions(?rc);
+        strip_promoted(st);
+    }
+
+    rename_ctx_dnit(?rc, na, ilen);
+    ret res_walk;
+}
+
+# allocate and clear the rename context's per-instruction and per-alloca tables
+# ---
+# rc:   context whose subst / has_sub / cur / defined are filled
+# na:   number of promotable allocas (sizes cur / defined)
+# ilen: instruction pool length (sizes subst / has_sub)
+# ret:  ok(true) on success, or an allocation error
+fun rename_ctx_init(rc: *RenameCtx, na: u32, ilen: u32) R.Result[bool, str] {
+    val a: *A.Allocator = rc.st.alloc;
+
+    val res_subst: R.Result[*value.Value, str] = A.allocate[value.Value](a, ilen::usize);
+    if (R.is_err[*value.Value, str](res_subst)) { ret R.err[bool, str](R.unwrap_err[*value.Value, str](res_subst)); }
+    rc.subst = R.unwrap_ok[*value.Value, str](res_subst);
+
+    val res_has_sub: R.Result[*bool, str] = A.allocate[bool](a, ilen::usize);
+    if (R.is_err[*bool, str](res_has_sub)) {
+        A.deallocate[value.Value](a, rc.subst, ilen::usize);
+        ret R.err[bool, str](R.unwrap_err[*bool, str](res_has_sub));
+    }
+    rc.has_sub = R.unwrap_ok[*bool, str](res_has_sub);
+
+    val res_cur: R.Result[*value.Value, str] = A.allocate[value.Value](a, na::usize);
+    if (R.is_err[*value.Value, str](res_cur)) {
+        A.deallocate[value.Value](a, rc.subst, ilen::usize);
+        A.deallocate[bool](a, rc.has_sub, ilen::usize);
+        ret R.err[bool, str](R.unwrap_err[*value.Value, str](res_cur));
+    }
+    rc.cur = R.unwrap_ok[*value.Value, str](res_cur);
+
+    val res_defined: R.Result[*bool, str] = A.allocate[bool](a, na::usize);
+    if (R.is_err[*bool, str](res_defined)) {
+        A.deallocate[value.Value](a, rc.subst, ilen::usize);
+        A.deallocate[bool](a, rc.has_sub, ilen::usize);
+        A.deallocate[value.Value](a, rc.cur, na::usize);
+        ret R.err[bool, str](R.unwrap_err[*bool, str](res_defined));
+    }
+    rc.defined = R.unwrap_ok[*bool, str](res_defined);
+
+    var i: u32 = 0;
+    for (i < ilen) { rc.has_sub[i] = false; i = i + 1; }
+    var ai: u32 = 0;
+    for (ai < na) { rc.defined[ai] = false; ai = ai + 1; }
+    ret R.ok[bool, str](true);
+}
+
+# free the rename context's tables by their allocation sizes
+# ---
+# rc:   context to tear down
+# na:   number of promotable allocas (the cur / defined size)
+# ilen: instruction pool length (the subst / has_sub size)
+fun rename_ctx_dnit(rc: *RenameCtx, na: u32, ilen: u32) {
+    val a: *A.Allocator = rc.st.alloc;
+    if (rc.subst != nil)   { A.deallocate[value.Value](a, rc.subst, ilen::usize); }
+    if (rc.has_sub != nil) { A.deallocate[bool](a, rc.has_sub, ilen::usize); }
+    if (rc.cur != nil)     { A.deallocate[value.Value](a, rc.cur, na::usize); }
+    if (rc.defined != nil) { A.deallocate[bool](a, rc.defined, na::usize); }
+}
+
+# return the index of alloca_id within the promotable set via the O(1) alloca_of
+# map, or NONE_U32 if it is not a promoted alloca
+# ---
+# st:        promotion state
+# alloca_id: the instruction id to look up
+# ret:       the promotable-set index, or NONE_U32
 fun alloca_index(st: *State, alloca_id: id.InstructionId) u32 {
-    if (alloca_id == id.INSTR_NIL) { ret NONE_U32; }
+    if (alloca_id == id.INSTR_NIL)     { ret NONE_U32; }
     if (alloca_id::u32 >= st.pool_len) { ret NONE_U32; }
     ret st.alloca_of[alloca_id::u32];
 }
 
-# Iterative pre-order walk of the dominator tree. At each block: bind phis as
-# the new current value, rewrite body loads/stores, fill successor phi
-# incomings, recurse into dominated children, then restore the per-alloca slots
-# saved on entry. Implemented with an explicit frame stack over the dominator
-# tree's children.
-fun rename_walk(rc: *RenameCtx) Result[bool, str] {
+# iterative pre-order walk of the dominator tree
+#
+# At each block: bind phis as the new current value, rewrite body loads/stores,
+# fill successor phi incomings, recurse into dominated children, then restore the
+# per-alloca slots saved on entry. Implemented with an explicit frame stack over
+# the dominator tree's children.
+# ---
+# rc:  rename context with tables allocated
+# ret: ok(true) once every block is renamed, or the first error encountered
+fun rename_walk(rc: *RenameCtx) R.Result[bool, str] {
     val st: *State = rc.st;
     val n: u32 = st.block_count;
     val na: u32 = st.alloca_count;
 
-    val rcs: Result[*u32, str] = allocate[u32](st.alloc, n::usize);
-    if (is_err[*u32, str](rcs)) { ret err[bool, str](unwrap_err[*u32, str](rcs)); }
-    val child_start: *u32 = unwrap_ok[*u32, str](rcs);
-    val rcl: Result[*u32, str] = allocate[u32](st.alloc, n::usize);
-    if (is_err[*u32, str](rcl)) {
-        deallocate[u32](st.alloc, child_start, n::usize);
-        ret err[bool, str](unwrap_err[*u32, str](rcl));
+    val res_child_start: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](res_child_start)) { ret R.err[bool, str](R.unwrap_err[*u32, str](res_child_start)); }
+    val child_start: *u32 = R.unwrap_ok[*u32, str](res_child_start);
+
+    val res_child_len: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](res_child_len)) {
+        A.deallocate[u32](st.alloc, child_start, n::usize);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](res_child_len));
     }
-    val child_len: *u32 = unwrap_ok[*u32, str](rcl);
-    val rch: Result[*id.BlockId, str] = allocate[id.BlockId](st.alloc, n::usize);
-    if (is_err[*id.BlockId, str](rch)) {
-        deallocate[u32](st.alloc, child_start, n::usize);
-        deallocate[u32](st.alloc, child_len, n::usize);
-        ret err[bool, str](unwrap_err[*id.BlockId, str](rch));
+    val child_len: *u32 = R.unwrap_ok[*u32, str](res_child_len);
+
+    val res_children: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](st.alloc, n::usize);
+    if (R.is_err[*id.BlockId, str](res_children)) {
+        A.deallocate[u32](st.alloc, child_start, n::usize);
+        A.deallocate[u32](st.alloc, child_len, n::usize);
+        ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](res_children));
     }
-    val children: *id.BlockId = unwrap_ok[*id.BlockId, str](rch);
+    val children: *id.BlockId = R.unwrap_ok[*id.BlockId, str](res_children);
 
     build_dom_children(st, child_start, child_len, children);
 
     var snap_n: u32 = n * na;
     if (snap_n == 0) { snap_n = 1; }
-    val rsv: Result[*value.Value, str] = allocate[value.Value](st.alloc, snap_n::usize);
-    if (is_err[*value.Value, str](rsv)) {
-        deallocate[u32](st.alloc, child_start, n::usize);
-        deallocate[u32](st.alloc, child_len, n::usize);
-        deallocate[id.BlockId](st.alloc, children, n::usize);
-        ret err[bool, str](unwrap_err[*value.Value, str](rsv));
+    val res_save_cur: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, snap_n::usize);
+    if (R.is_err[*value.Value, str](res_save_cur)) {
+        A.deallocate[u32](st.alloc, child_start, n::usize);
+        A.deallocate[u32](st.alloc, child_len, n::usize);
+        A.deallocate[id.BlockId](st.alloc, children, n::usize);
+        ret R.err[bool, str](R.unwrap_err[*value.Value, str](res_save_cur));
     }
-    val save_cur: *value.Value = unwrap_ok[*value.Value, str](rsv);
-    val rsd: Result[*bool, str] = allocate[bool](st.alloc, snap_n::usize);
-    if (is_err[*bool, str](rsd)) {
-        deallocate[value.Value](st.alloc, save_cur, snap_n::usize);
-        deallocate[u32](st.alloc, child_start, n::usize);
-        deallocate[u32](st.alloc, child_len, n::usize);
-        deallocate[id.BlockId](st.alloc, children, n::usize);
-        ret err[bool, str](unwrap_err[*bool, str](rsd));
-    }
-    val save_def: *bool = unwrap_ok[*bool, str](rsd);
+    val save_cur: *value.Value = R.unwrap_ok[*value.Value, str](res_save_cur);
 
-    val rfb: Result[*u32, str] = allocate[u32](st.alloc, n::usize);
-    if (is_err[*u32, str](rfb)) {
-        deallocate[value.Value](st.alloc, save_cur, snap_n::usize);
-        deallocate[bool](st.alloc, save_def, snap_n::usize);
-        deallocate[u32](st.alloc, child_start, n::usize);
-        deallocate[u32](st.alloc, child_len, n::usize);
-        deallocate[id.BlockId](st.alloc, children, n::usize);
-        ret err[bool, str](unwrap_err[*u32, str](rfb));
+    val res_save_def: R.Result[*bool, str] = A.allocate[bool](st.alloc, snap_n::usize);
+    if (R.is_err[*bool, str](res_save_def)) {
+        A.deallocate[value.Value](st.alloc, save_cur, snap_n::usize);
+        A.deallocate[u32](st.alloc, child_start, n::usize);
+        A.deallocate[u32](st.alloc, child_len, n::usize);
+        A.deallocate[id.BlockId](st.alloc, children, n::usize);
+        ret R.err[bool, str](R.unwrap_err[*bool, str](res_save_def));
     }
-    val frame_block: *u32 = unwrap_ok[*u32, str](rfb);
-    val rfc: Result[*u32, str] = allocate[u32](st.alloc, n::usize);
-    if (is_err[*u32, str](rfc)) {
-        deallocate[u32](st.alloc, frame_block, n::usize);
-        deallocate[value.Value](st.alloc, save_cur, snap_n::usize);
-        deallocate[bool](st.alloc, save_def, snap_n::usize);
-        deallocate[u32](st.alloc, child_start, n::usize);
-        deallocate[u32](st.alloc, child_len, n::usize);
-        deallocate[id.BlockId](st.alloc, children, n::usize);
-        ret err[bool, str](unwrap_err[*u32, str](rfc));
+    val save_def: *bool = R.unwrap_ok[*bool, str](res_save_def);
+
+    val res_frame_block: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](res_frame_block)) {
+        A.deallocate[value.Value](st.alloc, save_cur, snap_n::usize);
+        A.deallocate[bool](st.alloc, save_def, snap_n::usize);
+        A.deallocate[u32](st.alloc, child_start, n::usize);
+        A.deallocate[u32](st.alloc, child_len, n::usize);
+        A.deallocate[id.BlockId](st.alloc, children, n::usize);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](res_frame_block));
     }
-    val frame_child: *u32 = unwrap_ok[*u32, str](rfc);
+    val frame_block: *u32 = R.unwrap_ok[*u32, str](res_frame_block);
+
+    val res_frame_child: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](res_frame_child)) {
+        A.deallocate[u32](st.alloc, frame_block, n::usize);
+        A.deallocate[value.Value](st.alloc, save_cur, snap_n::usize);
+        A.deallocate[bool](st.alloc, save_def, snap_n::usize);
+        A.deallocate[u32](st.alloc, child_start, n::usize);
+        A.deallocate[u32](st.alloc, child_len, n::usize);
+        A.deallocate[id.BlockId](st.alloc, children, n::usize);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](res_frame_child));
+    }
+    val frame_child: *u32 = R.unwrap_ok[*u32, str](res_frame_child);
 
     var err_msg: str = nil;
     snapshot(rc, save_cur, save_def, 0);
-    val r0: Result[bool, str] = rename_enter_block(rc, 0::id.BlockId);
-    if (is_err[bool, str](r0)) { err_msg = unwrap_err[bool, str](r0); }
+    val res_entry: R.Result[bool, str] = rename_enter_block(rc, 0::id.BlockId);
+    if (R.is_err[bool, str](res_entry)) { err_msg = R.unwrap_err[bool, str](res_entry); }
     frame_block[0] = 0;
     frame_child[0] = 0;
     var sp: u32 = 1;
@@ -1049,8 +1209,8 @@ fun rename_walk(rc: *RenameCtx) Result[bool, str] {
             frame_child[top] = ci + 1;
             val child: u32 = children[cstart + ci]::u32;
             snapshot(rc, save_cur, save_def, sp);
-            val rb: Result[bool, str] = rename_enter_block(rc, child::id.BlockId);
-            if (is_err[bool, str](rb)) { err_msg = unwrap_err[bool, str](rb); }
+            val res_child: R.Result[bool, str] = rename_enter_block(rc, child::id.BlockId);
+            if (R.is_err[bool, str](res_child)) { err_msg = R.unwrap_err[bool, str](res_child); }
             frame_block[sp] = child;
             frame_child[sp] = 0;
             sp = sp + 1;
@@ -1060,19 +1220,24 @@ fun rename_walk(rc: *RenameCtx) Result[bool, str] {
         }
     }
 
-    deallocate[u32](st.alloc, frame_block, n::usize);
-    deallocate[u32](st.alloc, frame_child, n::usize);
-    deallocate[value.Value](st.alloc, save_cur, snap_n::usize);
-    deallocate[bool](st.alloc, save_def, snap_n::usize);
-    deallocate[u32](st.alloc, child_start, n::usize);
-    deallocate[u32](st.alloc, child_len, n::usize);
-    deallocate[id.BlockId](st.alloc, children, n::usize);
+    A.deallocate[u32](st.alloc, frame_block, n::usize);
+    A.deallocate[u32](st.alloc, frame_child, n::usize);
+    A.deallocate[value.Value](st.alloc, save_cur, snap_n::usize);
+    A.deallocate[bool](st.alloc, save_def, snap_n::usize);
+    A.deallocate[u32](st.alloc, child_start, n::usize);
+    A.deallocate[u32](st.alloc, child_len, n::usize);
+    A.deallocate[id.BlockId](st.alloc, children, n::usize);
 
-    if (err_msg != nil) { ret err[bool, str](err_msg); }
-    ret ok[bool, str](true);
+    if (err_msg != nil) { ret R.err[bool, str](err_msg); }
+    ret R.ok[bool, str](true);
 }
 
-# saves the current cur/defined slots into the depth-`d` snapshot region.
+# save the current cur/defined slots into the depth-d snapshot region
+# ---
+# rc:       rename context
+# save_cur: per-depth backing store for cur
+# save_def: per-depth backing store for defined
+# d:        recursion depth (the snapshot region index)
 fun snapshot(rc: *RenameCtx, save_cur: *value.Value, save_def: *bool, d: u32) {
     val na: u32 = rc.st.alloca_count;
     var a: u32 = 0;
@@ -1083,7 +1248,12 @@ fun snapshot(rc: *RenameCtx, save_cur: *value.Value, save_def: *bool, d: u32) {
     }
 }
 
-# restores the cur/defined slots from the depth-`d` snapshot region.
+# restore the cur/defined slots from the depth-d snapshot region
+# ---
+# rc:       rename context
+# save_cur: per-depth backing store for cur
+# save_def: per-depth backing store for defined
+# d:        recursion depth (the snapshot region index)
 fun restore(rc: *RenameCtx, save_cur: *value.Value, save_def: *bool, d: u32) {
     val na: u32 = rc.st.alloca_count;
     var a: u32 = 0;
@@ -1094,9 +1264,15 @@ fun restore(rc: *RenameCtx, save_cur: *value.Value, save_def: *bool, d: u32) {
     }
 }
 
-# builds the dominator-tree child lists from the idom array, flattened into
-# children[] with per-block (child_start, child_len). reachable non-entry
-# blocks are children of their idom.
+# build the dominator-tree child lists from the idom array, flattened into
+# children[] with per-block (child_start, child_len)
+#
+# Reachable non-entry blocks are children of their idom.
+# ---
+# st:          promotion state with idom / rpo_index filled
+# child_start: per-block start offset into children
+# child_len:   per-block child count
+# children:    flattened child lists
 fun build_dom_children(st: *State, child_start: *u32, child_len: *u32, children: *id.BlockId) {
     val n: u32 = st.block_count;
     var b: u32 = 0;
@@ -1126,10 +1302,14 @@ fun build_dom_children(st: *State, child_start: *u32, child_len: *u32, children:
     }
 }
 
-# processes one block during rename: bind its phis as new current values,
-# rewrite its body loads/stores against the per-alloca current values, then
-# record the value carried along each outgoing edge into successor phis.
-fun rename_enter_block(rc: *RenameCtx, bid: id.BlockId) Result[bool, str] {
+# process one block during rename: bind its phis as new current values, rewrite
+# its body loads/stores against the per-alloca current values, then record the
+# value carried along each outgoing edge into successor phis
+# ---
+# rc:  rename context
+# bid: the block to process
+# ret: ok(true) once the block and its outgoing phi edges are handled, or an error
+fun rename_enter_block(rc: *RenameCtx, bid: id.BlockId) R.Result[bool, str] {
     val st: *State = rc.st;
     val blk: *ir.Block = ?st.fn.blocks[bid::u32];
 
@@ -1138,9 +1318,9 @@ fun rename_enter_block(rc: *RenameCtx, bid: id.BlockId) Result[bool, str] {
         val phi_id: id.InstructionId = blk.phis[pi];
         val ai: u32 = phi_alloca_index(rc, phi_id);
         if (ai != NONE_U32) {
-            val phi_opt: Option[*instr.Instruction] = ir.instruction_get(st.fn, phi_id);
-            if (is_some[*instr.Instruction](phi_opt)) {
-                val phi: *instr.Instruction = unwrap[*instr.Instruction](phi_opt);
+            val opt_phi: O.Option[*instruction.Instruction] = ir.instruction_get(st.fn, phi_id);
+            if (O.is_some[*instruction.Instruction](opt_phi)) {
+                val phi: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_phi);
                 rc.cur[ai]     = value.instr(phi_id, phi.ty);
                 rc.defined[ai] = true;
             }
@@ -1151,10 +1331,10 @@ fun rename_enter_block(rc: *RenameCtx, bid: id.BlockId) Result[bool, str] {
     var ii: u32 = 0;
     for (ii < blk.instr_count) {
         val iid: id.InstructionId = blk.instructions[ii];
-        val inst_opt: Option[*instr.Instruction] = ir.instruction_get(st.fn, iid);
-        if (is_some[*instr.Instruction](inst_opt)) {
-            val inst: *instr.Instruction = unwrap[*instr.Instruction](inst_opt);
-            if (inst.kind == instr.OP_LOAD && inst.operand_count >= 1) {
+        val opt_inst: O.Option[*instruction.Instruction] = ir.instruction_get(st.fn, iid);
+        if (O.is_some[*instruction.Instruction](opt_inst)) {
+            val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_inst);
+            if (inst.kind == instruction.OP_LOAD && inst.operand_count >= 1) {
                 val ptr: value.Value = inst.operands[0];
                 if (ptr.kind == value.VAL_INSTR) {
                     val ai: u32 = alloca_index(st, ptr.data.instr);
@@ -1167,7 +1347,7 @@ fun rename_enter_block(rc: *RenameCtx, bid: id.BlockId) Result[bool, str] {
                         rc.has_sub[iid::u32] = true;
                     }
                 }
-            } or (inst.kind == instr.OP_STORE && inst.operand_count >= 2) {
+            } or (inst.kind == instruction.OP_STORE && inst.operand_count >= 2) {
                 val ptr: value.Value = inst.operands[1];
                 if (ptr.kind == value.VAL_INSTR) {
                     val ai: u32 = alloca_index(st, ptr.data.instr);
@@ -1185,22 +1365,26 @@ fun rename_enter_block(rc: *RenameCtx, bid: id.BlockId) Result[bool, str] {
     var succ1: id.BlockId = id.BLOCK_NIL;
     val sn: u32 = block_successors(st, bid, ?succ0, ?succ1);
     if (sn >= 1) {
-        val ra: Result[bool, str] = add_phi_incomings(rc, bid, succ0);
-        if (is_err[bool, str](ra)) { ret ra; }
+        val res_first: R.Result[bool, str] = add_phi_incomings(rc, bid, succ0);
+        if (R.is_err[bool, str](res_first)) { ret res_first; }
     }
     # an equal-target CBR (succ1 == succ0) contributes a single predecessor edge
-    # (block_append_pred dedups), so its phis take one incoming — guarding succ1
+    # (block_append_pred dedups), so its phis take one incoming -- guarding succ1
     # against succ0 keeps phi operand counts consistent with the pred list, the
     # same invariant inline's rekey_successor_phis enforces.
     if (sn >= 2 && succ1 != succ0) {
-        val rb: Result[bool, str] = add_phi_incomings(rc, bid, succ1);
-        if (is_err[bool, str](rb)) { ret rb; }
+        val res_second: R.Result[bool, str] = add_phi_incomings(rc, bid, succ1);
+        if (R.is_err[bool, str](res_second)) { ret res_second; }
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# returns the index, within the promotable set, of the alloca that phi `phi_id`
-# resolves, or NONE_U32 if it is not a mem2reg phi.
+# return the index, within the promotable set, of the alloca that phi phi_id
+# resolves, or NONE_U32 if it is not a mem2reg phi
+# ---
+# rc:     rename context
+# phi_id: the phi instruction id to classify
+# ret:    the promotable-set index of the phi's alloca, or NONE_U32
 fun phi_alloca_index(rc: *RenameCtx, phi_id: id.InstructionId) u32 {
     if (phi_id::u32 >= rc.st.phi_alloca_cap) { ret NONE_U32; }
     val alloca_id: id.InstructionId = rc.st.phi_alloca[phi_id::u32];
@@ -1208,49 +1392,56 @@ fun phi_alloca_index(rc: *RenameCtx, phi_id: id.InstructionId) u32 {
     ret alloca_index(rc.st, alloca_id);
 }
 
-# appends, to every mem2reg phi in `succ`, the current value of the phi's
-# alloca paired with predecessor `pred`. Phi operands follow the standard
-# [block0, val0, block1, val1, …] convention; block ids are encoded via the
-# shared block-target form (matching OP_CBR/OP_BR targets and the builder).
-fun add_phi_incomings(rc: *RenameCtx, pred: id.BlockId, succ: id.BlockId) Result[bool, str] {
+# append, to every mem2reg phi in succ, the current value of the phi's alloca
+# paired with predecessor pred
+#
+# Phi operands follow the standard [block0, val0, block1, val1, ...] convention;
+# block ids are encoded via the shared block-target form (matching OP_CBR/OP_BR
+# targets and the builder).
+# ---
+# rc:   rename context
+# pred: the predecessor block taking the edge
+# succ: the successor block whose phis receive an incoming
+# ret:  ok(true) once every phi in succ is extended, or an error
+fun add_phi_incomings(rc: *RenameCtx, pred: id.BlockId, succ: id.BlockId) R.Result[bool, str] {
     val st: *State = rc.st;
-    if (succ::u32 >= st.block_count) { ret ok[bool, str](true); }
+    if (succ::u32 >= st.block_count) { ret R.ok[bool, str](true); }
     val blk: *ir.Block = ?st.fn.blocks[succ::u32];
     var pi: u32 = 0;
     for (pi < blk.phi_count) {
         val phi_id: id.InstructionId = blk.phis[pi];
         val ai: u32 = phi_alloca_index(rc, phi_id);
         if (ai != NONE_U32) {
-            val phi_opt: Option[*instr.Instruction] = ir.instruction_get(st.fn, phi_id);
-            if (is_some[*instr.Instruction](phi_opt)) {
-                val phi: *instr.Instruction = unwrap[*instr.Instruction](phi_opt);
+            val opt_phi: O.Option[*instruction.Instruction] = ir.instruction_get(st.fn, phi_id);
+            if (O.is_some[*instruction.Instruction](opt_phi)) {
+                val phi: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_phi);
                 var incoming: value.Value;
                 if (rc.defined[ai]) {
                     incoming = rc.cur[ai];
                 } or {
                     incoming = value.const_null(phi.ty);
                 }
-                val r: Result[bool, str] = phi_push_incoming(rc, phi, pred, incoming);
-                if (is_err[bool, str](r)) { ret r; }
+                val res_push: R.Result[bool, str] = ir.phi_append_incoming(st.m, phi, pred, incoming);
+                if (R.is_err[bool, str](res_push)) { ret res_push; }
             }
         }
         pi = pi + 1;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# grows a phi's operand array by one (block, value) pair through the single
-# capacity-maintaining ir.phi_append_incoming primitive.
-fun phi_push_incoming(rc: *RenameCtx, phi: *instr.Instruction, pred: id.BlockId, incoming: value.Value) Result[bool, str] {
-    ret ir.phi_append_incoming(rc.st.m, phi, pred, incoming);
-}
-
-# resolves a Value through the substitution table: if it names a promoted load,
-# follow to the load's replacement (transitively). the use's own type is carried
-# onto the replacement: a load's natural type matches the stored value's, so this
-# is a no-op for scalars, but an aggregate rvalue retypes a pointer-valued load to
-# the aggregate (an aggregate value IS its storage pointer) — dropping that type
-# for the promoted pointer's would turn a sized struct copy into an 8-byte store.
+# resolve a Value through the substitution table: if it names a promoted load,
+# follow to the load's replacement (transitively)
+#
+# The use's own type is carried onto the replacement: a load's natural type
+# matches the stored value's, so this is a no-op for scalars, but an aggregate
+# rvalue retypes a pointer-valued load to the aggregate (an aggregate value IS
+# its storage pointer) -- dropping that type for the promoted pointer's would
+# turn a sized struct copy into an 8-byte store.
+# ---
+# rc:  rename context
+# v:   the Value to resolve
+# ret: the resolved Value (v unchanged when it is not a promoted load)
 fun resolve_value(rc: *RenameCtx, v: value.Value) value.Value {
     var cur: value.Value = v;
     for (cur.kind == value.VAL_INSTR) {
@@ -1264,14 +1455,16 @@ fun resolve_value(rc: *RenameCtx, v: value.Value) value.Value {
     ret cur;
 }
 
-# applies the substitution table to every operand of every surviving
-# instruction (including phi incomings), so references to promoted loads become
-# their resolved SSA Values.
+# apply the substitution table to every operand of every surviving instruction
+# (including phi incomings), so references to promoted loads become their
+# resolved SSA Values
+# ---
+# rc: rename context with subst / has_sub filled
 fun apply_substitutions(rc: *RenameCtx) {
     val st: *State = rc.st;
     var i: u32 = 0;
     for (i < st.fn.instr_len) {
-        val inst: *instr.Instruction = ?st.fn.instrs[i];
+        val inst: *instruction.Instruction = ?st.fn.instrs[i];
         var o: u32 = 0;
         for (o < inst.operand_count) {
             val op: value.Value = inst.operands[o];
@@ -1287,9 +1480,13 @@ fun apply_substitutions(rc: *RenameCtx) {
     }
 }
 
-# strips promoted instructions (the allocas, and every load/store on them) from
-# their block instruction lists. The pool entries remain but are unreferenced;
-# the lists no longer name them, so the backend never sees them.
+# strip promoted instructions (the allocas, and every load/store on them) from
+# their block instruction lists
+#
+# The pool entries remain but are unreferenced; the lists no longer name them, so
+# the backend never sees them.
+# ---
+# st: promotion state with the promotable set finalised
 fun strip_promoted(st: *State) {
     var b: u32 = 0;
     for (b < st.block_count) {
@@ -1309,22 +1506,26 @@ fun strip_promoted(st: *State) {
     }
 }
 
-# true when an instruction is an alloca we promoted, or a load/store whose
-# pointer is one of those allocas.
+# whether an instruction is an alloca we promoted, or a load/store whose pointer
+# is one of those allocas
+# ---
+# st:  promotion state
+# iid: the instruction id to test
+# ret: true when iid is a promoted alloca or a memop on one
 fun is_promoted_memop(st: *State, iid: id.InstructionId) bool {
-    val inst_opt: Option[*instr.Instruction] = ir.instruction_get(st.fn, iid);
-    if (is_none[*instr.Instruction](inst_opt)) { ret false; }
-    val inst: *instr.Instruction = unwrap[*instr.Instruction](inst_opt);
-    if (inst.kind == instr.OP_ALLOCA) {
+    val opt_inst: O.Option[*instruction.Instruction] = ir.instruction_get(st.fn, iid);
+    if (O.is_none[*instruction.Instruction](opt_inst)) { ret false; }
+    val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_inst);
+    if (inst.kind == instruction.OP_ALLOCA) {
         ret alloca_index(st, iid) != NONE_U32;
     }
-    if (inst.kind == instr.OP_LOAD && inst.operand_count >= 1) {
+    if (inst.kind == instruction.OP_LOAD && inst.operand_count >= 1) {
         val ptr: value.Value = inst.operands[0];
         if (ptr.kind == value.VAL_INSTR) {
             ret alloca_index(st, ptr.data.instr) != NONE_U32;
         }
     }
-    if (inst.kind == instr.OP_STORE && inst.operand_count >= 2) {
+    if (inst.kind == instruction.OP_STORE && inst.operand_count >= 2) {
         val ptr: value.Value = inst.operands[1];
         if (ptr.kind == value.VAL_INSTR) {
             ret alloca_index(st, ptr.data.instr) != NONE_U32;
@@ -1333,23 +1534,30 @@ fun is_promoted_memop(st: *State, iid: id.InstructionId) bool {
     ret false;
 }
 
-# counts the OP_ALLOCA instructions still listed in a block's instruction stream
-# (test helper).
+# count the OP_ALLOCA instructions still listed in a block's instruction stream
+# (test helper)
+# ---
+# fn:  the function owning blk
+# blk: the block to scan
+# ret: number of live allocas in blk's instruction list
 fun live_alloca_count(fn: *ir.Function, blk: *ir.Block) u32 {
     var n: u32 = 0;
     var ix: u32 = 0;
     for (ix < blk.instr_count) {
-        val opt: Option[*instr.Instruction] = ir.instruction_get(fn, blk.instructions[ix]);
-        if (is_some[*instr.Instruction](opt)) {
-            if (unwrap[*instr.Instruction](opt).kind == instr.OP_ALLOCA) { n = n + 1; }
+        val opt_inst: O.Option[*instruction.Instruction] = ir.instruction_get(fn, blk.instructions[ix]);
+        if (O.is_some[*instruction.Instruction](opt_inst)) {
+            if (O.unwrap[*instruction.Instruction](opt_inst).kind == instruction.OP_ALLOCA) { n = n + 1; }
         }
         ix = ix + 1;
     }
     ret n;
 }
 
-# unlinks instruction `iid` from a block's instruction list, leaving it in the
-# pool as a ghost — the exact state inline leaves a removed call in (test helper).
+# unlink instruction iid from a block's instruction list, leaving it in the pool
+# as a ghost -- the exact state inline leaves a removed call in (test helper)
+# ---
+# blk: the block to edit
+# iid: the instruction id to unlink
 fun unlink_block_instr(blk: *ir.Block, iid: id.InstructionId) {
     var w: u32 = 0;
     var ix: u32 = 0;
@@ -1363,63 +1571,65 @@ fun unlink_block_instr(blk: *ir.Block, iid: id.InstructionId) {
     blk.instr_count = w;
 }
 
-test "mem2reg: an alloca whose escaping call is removed (as inline does) promotes on a re-run (#1281)" {
-    var alloc: Allocator;
+# a regression for #1281: inline can unlink an alloca's escaping call, leaving a
+# pool ghost; a re-run must skip the ghost and promote the now-unescaped alloca.
+test "mach.lang.me.pass.mem2reg.run:promote_after_escaping_call_removed" {
+    var alloc: A.Allocator;
     page.make(?alloc);
-    val mr: Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
-    if (is_err[ir.Module, str](mr)) { ret 1; }
-    var m: ir.Module = unwrap_ok[ir.Module, str](mr);
+    val res_module: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_module)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_module);
 
-    val tr: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
-    if (is_err[ir_type.IrTypeId, str](tr)) { ret 1; }
-    val i64t: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
-    val vr: Result[ir_type.IrTypeId, str] = ir_type.intern_void(?m.types);
-    if (is_err[ir_type.IrTypeId, str](vr)) { ret 1; }
-    val voidt: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](vr);
-    val ppr: Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
-    if (is_err[ir_type.IrTypeId, str](ppr)) { ret 1; }
-    val ptrt: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](ppr);
+    val res_i64: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64)) { ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
+    val res_void: R.Result[type.IrTypeId, str] = type.intern_void(?m.types);
+    if (R.is_err[type.IrTypeId, str](res_void)) { ret 1; }
+    val voidt: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_void);
+    val res_ptr: R.Result[type.IrTypeId, str] = type.intern_ptr(?m.types);
+    if (R.is_err[type.IrTypeId, str](res_ptr)) { ret 1; }
+    val ptrt: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_ptr);
 
     # a dummy callee for the escaping call to name.
-    val cer: Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
-    if (is_err[u32, str](cer)) { ret 1; }
-    val callee_ix: u32 = unwrap_ok[u32, str](cer);
+    val res_callee: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_callee)) { ret 1; }
+    val callee_ix: u32 = R.unwrap_ok[u32, str](res_callee);
 
     # caller: p = alloca i64; store 0 -> p; call dummy(p); v = load p; ret v.
-    val car: Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
-    if (is_err[u32, str](car)) { ret 1; }
-    val caller_ix: u32 = unwrap_ok[u32, str](car);
+    val res_caller: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_caller)) { ret 1; }
+    val caller_ix: u32 = R.unwrap_ok[u32, str](res_caller);
     val fn: *ir.Function = ?m.functions[caller_ix];
 
     var bld: builder.Builder = builder.init(?m);
     builder.set_function(?bld, fn);
-    val e0: Result[id.BlockId, str] = builder.new_block(?bld);
-    if (is_err[id.BlockId, str](e0)) { ret 1; }
-    val entry: id.BlockId = unwrap_ok[id.BlockId, str](e0);
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](res_entry);
     builder.set_block(?bld, entry);
 
-    val ar: Result[value.Value, str] = builder.emit_alloca(?bld, i64t, value.const_int(1, i64t));
-    if (is_err[value.Value, str](ar)) { ret 1; }
-    val p: value.Value = unwrap_ok[value.Value, str](ar);
+    val res_alloca: R.Result[value.Value, str] = builder.emit_alloca(?bld, i64t, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](res_alloca)) { ret 1; }
+    val p: value.Value = R.unwrap_ok[value.Value, str](res_alloca);
 
-    if (is_err[bool, str](builder.emit_store(?bld, value.const_int(0, i64t), p))) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?bld, value.const_int(0, i64t), p))) { ret 1; }
 
     var args: [1]value.Value;
     args[0] = p;
     val callee_val: value.Value = value.fn(callee_ix, ptrt);
-    val crr: Result[value.Value, str] = builder.emit_call(?bld, callee_val, ?args[0], 1, voidt);
-    if (is_err[value.Value, str](crr)) { ret 1; }
-    val call_v: value.Value = unwrap_ok[value.Value, str](crr);
+    val res_call: R.Result[value.Value, str] = builder.emit_call(?bld, callee_val, ?args[0], 1, voidt);
+    if (R.is_err[value.Value, str](res_call)) { ret 1; }
+    val call_v: value.Value = R.unwrap_ok[value.Value, str](res_call);
     val call_id: id.InstructionId = call_v.data.instr;
 
-    val lr: Result[value.Value, str] = builder.emit_load(?bld, p, i64t);
-    if (is_err[value.Value, str](lr)) { ret 1; }
-    if (is_err[bool, str](builder.emit_ret(?bld, unwrap_ok[value.Value, str](lr)))) { ret 1; }
+    val res_load: R.Result[value.Value, str] = builder.emit_load(?bld, p, i64t);
+    if (R.is_err[value.Value, str](res_load))                                                 { ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?bld, R.unwrap_ok[value.Value, str](res_load)))) { ret 1; }
 
     val entry_blk: *ir.Block = ?fn.blocks[entry::u32];
 
     # first mem2reg: p's address escapes into the call, so it is not promoted.
-    if (is_err[bool, str](run(?m))) { ret 1; }
+    if (R.is_err[bool, str](run(?m)))          { ret 1; }
     if (live_alloca_count(fn, entry_blk) != 1) { ret 1; }
 
     # simulate inline removing the call: unlink it, leaving a pool ghost.
@@ -1427,7 +1637,7 @@ test "mem2reg: an alloca whose escaping call is removed (as inline does) promote
 
     # second mem2reg: the escaping call is gone (and the ghost is skipped), so p
     # promotes to SSA and its alloca leaves the block.
-    if (is_err[bool, str](run(?m))) { ret 1; }
+    if (R.is_err[bool, str](run(?m)))          { ret 1; }
     if (live_alloca_count(fn, entry_blk) != 0) { ret 1; }
     ret 0;
 }
