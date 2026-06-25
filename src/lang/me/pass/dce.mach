@@ -1,267 +1,329 @@
-# mach.lang.me.pass.dce: dead code elimination.
+# dead code elimination over the SSA IR.
 #
-# Two cooperating sweeps over each function:
+# Two cooperating sweeps run on each non-extern function:
 #
-#   1. value DCE — an instruction whose result Value is unused and which is
-#      removable-when-unused (a pure value op, or an OP_PHI — a phi is not
-#      `is_pure`, but it has no side effects) is dead. A use-count map drives a
-#      worklist: removing one instruction decrements its operands' counts, which
-#      may expose more dead instructions. Volatile loads and every store/call
-#      survive even when unused, since they may carry side effects. Block lists
-#      (not the instruction pool) are the source of truth for liveness: a pool
-#      entry no longer named by any block — a ghost left by a pass that unlinked
-#      it — contributes no uses and is never seeded, so it cannot pin live values.
-#   2. reachability DCE — blocks not reachable from the entry block (BlockId 0)
+#   1. value DCE - an instruction whose result is unused and which is removable
+#      once unused (a pure value op, or an OP_PHI, which is not `is_pure` but has
+#      no side effects) is dead. A per-instruction use count drives a worklist:
+#      removing one instruction decrements its operands' counts, which may expose
+#      further dead instructions. Volatile loads and every store/call survive
+#      even when unused, since they may carry side effects. Block lists, not the
+#      instruction pool, are the source of truth for liveness: a pool entry no
+#      longer named by any block - a ghost left by a pass that unlinked it -
+#      contributes no uses and is never seeded, so it cannot pin live values.
+#   2. reachability DCE - blocks unreachable from the entry block (BlockId 0)
 #      along terminator edges are removed. The block array compacts, every
 #      BlockId reference (terminator targets, predecessor lists, phi incomings)
 #      is remapped, and phi incomings from removed predecessors are dropped.
 
+use std.allocator.page;
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.option.Option;
-use std.types.option.is_some;
-use std.types.option.is_none;
-use std.types.option.unwrap;
-use std.types.result.Result;
-use std.types.result.ok;
-use std.types.result.err;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.unwrap_err;
 
-use std.allocator.allocate;
-use std.allocator.deallocate;
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
 
-use ir:      mach.lang.me.ir;
-use instr:   mach.lang.me.ir.instruction;
-use value:   mach.lang.me.ir.value;
-use id:      mach.lang.me.ir.id;
+use mach.lang.intern;
+use mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
 
-use std.allocator.Allocator;
-use page:    std.allocator.page;
-use intern:  mach.lang.intern;
-use ir_type: mach.lang.me.ir.type;
-use builder: mach.lang.me.ir.builder;
-
-# sentinel for a removed/absent block in the compaction remap.
+# sentinel for a removed block in the reachability compaction remap
 val BLOCK_GONE: u32 = 0xFFFFFFFF;
 
-# Pass entry. Runs value DCE then reachability DCE on every function.
+# run dead code elimination over every non-extern function in `m`: value DCE
+# followed by reachability DCE
 # ---
-# m:   module to mutate in place
-# ret: ok(true) on a successful pass, or the first allocation error
-pub fun run(m: *ir.Module) Result[bool, str] {
-    var f: u32 = 0;
-    for (f < m.function_len) {
-        val fn: *ir.Function = ?m.functions[f];
+# m:   the module to mutate in place
+# ret: ok(true) on success, or the first allocation error encountered
+pub fun run(m: *ir.Module) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < m.function_len) {
+        val fn: *ir.Function = ?m.functions[i];
         if ((fn.flags & ir.FN_FLAG_EXTERN) == 0) {
-            val rv: Result[bool, str] = value_dce(m, fn);
-            if (is_err[bool, str](rv)) { ret rv; }
-            val rr: Result[bool, str] = reachability_dce(m, fn);
-            if (is_err[bool, str](rr)) { ret rr; }
+            val res_value_dce: R.Result[bool, str] = value_dce(m, fn);
+            if (R.is_err[bool, str](res_value_dce)) { ret res_value_dce; }
+            val res_reach_dce: R.Result[bool, str] = reachability_dce(m, fn);
+            if (R.is_err[bool, str](res_reach_dce)) { ret res_reach_dce; }
         }
-        f = f + 1;
+        i = i + 1;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# true when an instruction may be deleted once its result is unused. Pure
-# value-producing opcodes qualify. OP_PHI also qualifies: it is not `is_pure`
-# (a phi is position-dependent, so CSE must never merge phis) but it has no side
-# effects, so an unused phi is dead. Every side-effecting opcode (store, call,
-# memzero, alloca, asm, va_*, terminators) and any volatile load is kept
-# regardless of use.
-fun removable_when_unused(inst: *instr.Instruction) bool {
-    if (inst.kind == instr.OP_PHI) { ret true; }
-    if (instr.is_pure(inst.kind) == false) { ret false; }
-    if ((inst.flags & instr.INSTR_FLAG_VOLATILE) != 0) { ret false; }
-    ret true;
-}
-
-# Value DCE: builds a per-instruction use count, seeds a worklist with the
-# unused-and-pure instructions, and drains it — each removal decrements operand
-# counts and may enqueue freshly dead instructions. Removed instructions are
-# dropped from their block lists at the end in a single compacting sweep.
-fun value_dce(m: *ir.Module, fn: *ir.Function) Result[bool, str] {
+# value DCE for one function
+#
+# Builds a per-instruction use count, seeds a worklist with the unused
+# removable-when-unused instructions, and drains it: each removal decrements its
+# operands' counts and may expose further dead instructions. Block lists are the
+# source of truth for liveness - a pool entry no longer named by any block (a
+# ghost left by an earlier pass) contributes no uses and is never seeded.
+# Survivors are compacted out of their block lists in a final sweep.
+# ---
+# m:   the owning module; its allocator backs the scratch arrays
+# fn:  the function to process
+# ret: ok(true) on success, or an allocation error
+fun value_dce(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
     val ilen: u32 = fn.instr_len;
-    if (ilen == 0) { ret ok[bool, str](true); }
+    if (ilen == 0) { ret R.ok[bool, str](true); }
 
-    val ru: Result[*u32, str] = allocate[u32](m.alloc, ilen::usize);
-    if (is_err[*u32, str](ru)) { ret err[bool, str](unwrap_err[*u32, str](ru)); }
-    val use_count: *u32 = unwrap_ok[*u32, str](ru);
-
-    val rd: Result[*bool, str] = allocate[bool](m.alloc, ilen::usize);
-    if (is_err[*bool, str](rd)) {
-        deallocate[u32](m.alloc, use_count, ilen::usize);
-        ret err[bool, str](unwrap_err[*bool, str](rd));
+    val res_use_count: R.Result[*u32, str] = A.allocate[u32](m.alloc, ilen::usize);
+    if (R.is_err[*u32, str](res_use_count)) {
+        ret R.err[bool, str](R.unwrap_err[*u32, str](res_use_count));
     }
-    val dead: *bool = unwrap_ok[*bool, str](rd);
+    val use_count: *u32 = R.unwrap_ok[*u32, str](res_use_count);
 
-    val rw: Result[*id.InstructionId, str] = allocate[id.InstructionId](m.alloc, ilen::usize);
-    if (is_err[*id.InstructionId, str](rw)) {
-        deallocate[u32](m.alloc, use_count, ilen::usize);
-        deallocate[bool](m.alloc, dead, ilen::usize);
-        ret err[bool, str](unwrap_err[*id.InstructionId, str](rw));
+    val res_dead: R.Result[*bool, str] = A.allocate[bool](m.alloc, ilen::usize);
+    if (R.is_err[*bool, str](res_dead)) {
+        A.deallocate[u32](m.alloc, use_count, ilen::usize);
+        ret R.err[bool, str](R.unwrap_err[*bool, str](res_dead));
     }
-    val work: *id.InstructionId = unwrap_ok[*id.InstructionId, str](rw);
+    val dead: *bool = R.unwrap_ok[*bool, str](res_dead);
+
+    val res_work: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](m.alloc, ilen::usize);
+    if (R.is_err[*id.InstructionId, str](res_work)) {
+        A.deallocate[u32](m.alloc, use_count, ilen::usize);
+        A.deallocate[bool](m.alloc, dead, ilen::usize);
+        ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](res_work));
+    }
+    val work: *id.InstructionId = R.unwrap_ok[*id.InstructionId, str](res_work);
 
     var i: u32 = 0;
-    for (i < ilen) { use_count[i] = 0; dead[i] = false; i = i + 1; }
+    for (i < ilen) {
+        use_count[i] = 0;
+        dead[i]      = false;
+        i = i + 1;
+    }
 
-    # count uses across the operands of every block-listed instruction. Block
-    # lists are the source of truth for liveness: a pool entry no longer named by
-    # any block (a ghost left by mem2reg's stripped stores or inline's unlinked
-    # calls) is not live, so its operands must not count as uses — counting them
-    # would pin otherwise-dead computations forever.
     count_uses(fn, use_count);
 
-    # seed: block-listed instructions that are removable-when-unused and unused.
+    # seed: every block-listed instruction that is removable-when-unused and unused.
     var wlen: u32 = 0;
-    var b0: u32 = 0;
-    for (b0 < fn.block_count) {
-        val blk: *ir.Block = ?fn.blocks[b0];
-        var pi: u32 = 0;
-        for (pi < blk.phi_count) {
-            seed_if_dead(fn, blk.phis[pi], use_count, dead, work, ?wlen, ilen);
-            pi = pi + 1;
-        }
+    i = 0;
+    for (i < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[i];
+
         var ii: u32 = 0;
+        for (ii < blk.phi_count) {
+            seed_if_dead(fn, blk.phis[ii], use_count, dead, work, ?wlen, ilen);
+            ii = ii + 1;
+        }
+
+        ii = 0;
         for (ii < blk.instr_count) {
             seed_if_dead(fn, blk.instructions[ii], use_count, dead, work, ?wlen, ilen);
             ii = ii + 1;
         }
+
         if (blk.terminator != id.INSTR_NIL) {
             seed_if_dead(fn, blk.terminator, use_count, dead, work, ?wlen, ilen);
         }
-        b0 = b0 + 1;
+
+        i = i + 1;
     }
 
-    # drain: each removal decrements the use counts of its operands.
+    # drain: each removal decrements its operands' use counts, possibly exposing
+    # a freshly dead instruction. `work` doubles as the worklist stack.
     for (wlen > 0) {
         wlen = wlen - 1;
-        val did: u32 = work[wlen]::u32;
-        val inst: *instr.Instruction = ?fn.instrs[did];
-        var o: u32 = 0;
-        for (o < inst.operand_count) {
-            if (operand_is_value_use(inst, o)) {
-                val op: value.Value = inst.operands[o];
-                if (op.kind == value.VAL_INSTR) {
-                    val u: u32 = op.data.instr::u32;
-                    if (u < ilen && use_count[u] > 0) {
-                        use_count[u] = use_count[u] - 1;
-                        if (use_count[u] == 0 && dead[u] == false) {
-                            val target: *instr.Instruction = ?fn.instrs[u];
-                            if (removable_when_unused(target)) {
-                                dead[u] = true;
-                                work[wlen] = u::id.InstructionId;
-                                wlen = wlen + 1;
-                            }
+        val did:  u32                      = work[wlen]::u32;
+        val inst: *instruction.Instruction = ?fn.instrs[did];
+
+        var ii: u32 = 0;
+        for (ii < inst.operand_count) {
+            val opt_def: O.Option[u32] = operand_instr_use(inst, ii, ilen);
+            if (O.is_some[u32](opt_def)) {
+                val def_id: u32 = O.unwrap[u32](opt_def);
+                if (use_count[def_id] > 0) {
+                    use_count[def_id] = use_count[def_id] - 1;
+                    if (use_count[def_id] == 0 && dead[def_id] == false) {
+                        val target: *instruction.Instruction = ?fn.instrs[def_id];
+                        if (is_removable_when_unused(target)) {
+                            dead[def_id] = true;
+                            work[wlen]   = def_id::id.InstructionId;
+                            wlen         = wlen + 1;
                         }
                     }
                 }
             }
-            o = o + 1;
+            ii = ii + 1;
         }
     }
 
-    # remove dead instructions from each block's instruction and phi lists.
-    var b: u32 = 0;
-    for (b < fn.block_count) {
-        val blk: *ir.Block = ?fn.blocks[b];
+    # drop the dead instructions from each block's instruction and phi lists.
+    i = 0;
+    for (i < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[i];
         blk.instr_count = compact_ids(blk.instructions, blk.instr_count, dead, ilen);
         blk.phi_count   = compact_ids(blk.phis, blk.phi_count, dead, ilen);
-        b = b + 1;
+        i = i + 1;
     }
 
-    deallocate[u32](m.alloc, use_count, ilen::usize);
-    deallocate[bool](m.alloc, dead, ilen::usize);
-    deallocate[id.InstructionId](m.alloc, work, ilen::usize);
-    ret ok[bool, str](true);
+    A.deallocate[u32](m.alloc, use_count, ilen::usize);
+    A.deallocate[bool](m.alloc, dead, ilen::usize);
+    A.deallocate[id.InstructionId](m.alloc, work, ilen::usize);
+    ret R.ok[bool, str](true);
 }
 
-# increments use_count for each VAL_INSTR operand of every instruction listed in
-# a block (its phis, body, and terminator). Pool entries not named by any block
-# are skipped — they are ghosts, not live uses. Operands naming a block target
-# (BR/CBR slots, phi incoming block slots) are NOT uses of an instruction result,
-# so they are skipped via the opcode's operand layout.
-fun count_uses(fn: *ir.Function, use_count: *u32) {
-    var b: u32 = 0;
-    for (b < fn.block_count) {
-        val blk: *ir.Block = ?fn.blocks[b];
-        var pi: u32 = 0;
-        for (pi < blk.phi_count) { count_instr_uses(fn, blk.phis[pi], use_count); pi = pi + 1; }
-        var ii: u32 = 0;
-        for (ii < blk.instr_count) { count_instr_uses(fn, blk.instructions[ii], use_count); ii = ii + 1; }
-        if (blk.terminator != id.INSTR_NIL) { count_instr_uses(fn, blk.terminator, use_count); }
-        b = b + 1;
-    }
-}
-
-# increments use_count for each value-use operand of the instruction `iid`.
-fun count_instr_uses(fn: *ir.Function, iid: id.InstructionId, use_count: *u32) {
-    val opt: Option[*instr.Instruction] = ir.instruction_get(fn, iid);
-    if (is_none[*instr.Instruction](opt)) { ret; }
-    val inst: *instr.Instruction = unwrap[*instr.Instruction](opt);
-    var o: u32 = 0;
-    for (o < inst.operand_count) {
-        if (operand_is_value_use(inst, o)) {
-            val op: value.Value = inst.operands[o];
-            if (op.kind == value.VAL_INSTR) {
-                val u: u32 = op.data.instr::u32;
-                if (u < fn.instr_len) { use_count[u] = use_count[u] + 1; }
-            }
-        }
-        o = o + 1;
-    }
-}
-
-# seeds the dead worklist with instruction `iid` when it is removable-when-unused
-# and currently unused. `wlen` is the live worklist length, advanced on a seed.
-fun seed_if_dead(fn: *ir.Function, iid: id.InstructionId, use_count: *u32,
-                 dead: *bool, work: *id.InstructionId, wlen: *u32, ilen: u32) {
-    val s: u32 = iid::u32;
-    if (s >= ilen) { ret; }
-    if (dead[s]) { ret; }
-    val opt: Option[*instr.Instruction] = ir.instruction_get(fn, iid);
-    if (is_none[*instr.Instruction](opt)) { ret; }
-    val inst: *instr.Instruction = unwrap[*instr.Instruction](opt);
-    if (removable_when_unused(inst) && use_count[s] == 0) {
-        dead[s] = true;
-        work[@wlen] = iid;
-        @wlen = @wlen + 1;
-    }
-}
-
-# true when operand slot `o` of `inst` names an SSA value (as opposed to a block
-# target). For BR the sole operand is a block; for CBR operands 1 and 2 are
-# blocks; for PHI the even slots are blocks and the odd slots are values.
-fun operand_is_value_use(inst: *instr.Instruction, o: u32) bool {
-    if (inst.kind == instr.OP_BR)  { ret false; }
-    if (inst.kind == instr.OP_CBR) {
-        if (o == 0) { ret true; }
-        ret false;
-    }
-    if (inst.kind == instr.OP_PHI) {
-        # [block0, val0, block1, val1, …]: odd slots are values.
-        ret (o % 2) == 1;
-    }
+# whether `inst` may be deleted once its result is unused
+#
+# Pure value-producing opcodes qualify, as does OP_PHI: a phi is not `is_pure`
+# (it is position-dependent, so CSE must never merge phis) but it has no side
+# effects, so an unused phi is dead. Every side-effecting opcode (store, call,
+# memzero, alloca, asm, va_*, terminators) and any volatile load is kept
+# regardless of use.
+# ---
+# inst: the instruction to test
+# ret:  true when the instruction is dead once its result is unused
+fun is_removable_when_unused(inst: *instruction.Instruction) bool {
+    if (inst.kind == instruction.OP_PHI)                     { ret true; }
+    if (instruction.is_pure(inst.kind) == false)             { ret false; }
+    if ((inst.flags & instruction.INSTR_FLAG_VOLATILE) != 0) { ret false; }
     ret true;
 }
 
-# compacts an InstructionId list in place, dropping ids flagged dead. returns
-# the new length. ids out of range of the dead map are conservatively kept.
+# count value uses of every instruction result across `fn`'s block lists
+#
+# Only block-listed instructions (phis, bodies, terminators) contribute; ghost
+# pool entries are skipped, so their operands never pin otherwise-dead values.
+# ---
+# fn:        the function to scan
+# use_count: per-instruction use counter, indexed by InstructionId, to fill
+fun count_uses(fn: *ir.Function, use_count: *u32) {
+    var i: u32 = 0;
+    for (i < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[i];
+
+        var ii: u32 = 0;
+        for (ii < blk.phi_count) {
+            count_instr_uses(fn, blk.phis[ii], use_count);
+            ii = ii + 1;
+        }
+
+        ii = 0;
+        for (ii < blk.instr_count) {
+            count_instr_uses(fn, blk.instructions[ii], use_count);
+            ii = ii + 1;
+        }
+
+        if (blk.terminator != id.INSTR_NIL) {
+            count_instr_uses(fn, blk.terminator, use_count);
+        }
+
+        i = i + 1;
+    }
+}
+
+# add the value uses contributed by instruction `iid`'s operands to `use_count`
+#
+# A ghost id (not named by any live instruction) is skipped via the bounds-checked
+# lookup, so it contributes nothing.
+# ---
+# fn:        the function owning the instruction
+# iid:       the instruction whose operands to count
+# use_count: per-instruction use counter to increment
+fun count_instr_uses(fn: *ir.Function, iid: id.InstructionId, use_count: *u32) {
+    val opt_inst: O.Option[*instruction.Instruction] = ir.instruction_get(fn, iid);
+    if (O.is_none[*instruction.Instruction](opt_inst)) { ret; }
+    val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_inst);
+
+    var i: u32 = 0;
+    for (i < inst.operand_count) {
+        val opt_def: O.Option[u32] = operand_instr_use(inst, i, fn.instr_len);
+        if (O.is_some[u32](opt_def)) {
+            val def_id: u32 = O.unwrap[u32](opt_def);
+            use_count[def_id] = use_count[def_id] + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# seed the worklist with `iid` when it is removable-when-unused and currently
+# unused, marking it dead and pushing it
+# ---
+# fn:        the function owning the instruction
+# iid:       the candidate instruction
+# use_count: per-instruction use counts
+# dead:      per-instruction dead flags, indexed by InstructionId
+# work:      the worklist stack of dead instruction ids
+# wlen:      in/out worklist length, advanced when `iid` is seeded
+# ilen:      the instruction pool length (the bound on every per-instruction array)
+fun seed_if_dead(fn: *ir.Function, iid: id.InstructionId, use_count: *u32, dead: *bool, work: *id.InstructionId, wlen: *u32, ilen: u32) {
+    val idx: u32 = iid::u32;
+    if (idx >= ilen) { ret; }
+    if (dead[idx])   { ret; }
+
+    val opt_inst: O.Option[*instruction.Instruction] = ir.instruction_get(fn, iid);
+    if (O.is_none[*instruction.Instruction](opt_inst)) { ret; }
+    val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_inst);
+
+    if (is_removable_when_unused(inst) && use_count[idx] == 0) {
+        dead[idx]   = true;
+        work[@wlen] = iid;
+        @wlen       = @wlen + 1;
+    }
+}
+
+# whether operand slot `o` of `inst` names an SSA value rather than a block target
+#
+# OP_BR's sole operand is a block; OP_CBR operand 0 is the condition value and
+# operands 1 and 2 are blocks; OP_PHI alternates [block, value, ...], so odd
+# slots are values.
+# ---
+# inst: the instruction
+# o:    the operand slot
+# ret:  true when slot `o` is a value use
+fun operand_is_value_use(inst: *instruction.Instruction, o: u32) bool {
+    if (inst.kind == instruction.OP_BR)  { ret false; }
+    if (inst.kind == instruction.OP_CBR) { ret o == 0; }
+    if (inst.kind == instruction.OP_PHI) { ret (o % 2) == 1; }
+    ret true;
+}
+
+# the InstructionId defining the value used by operand `o` of `inst`, when that
+# operand is an in-range value use of an instruction result, or none
+#
+# Folds the value-use, VAL_INSTR, and bounds checks shared by the use counter
+# and the worklist drain into one decode.
+# ---
+# inst: the instruction
+# o:    the operand slot
+# ilen: the instruction pool length (the in-range bound)
+# ret:  some(id) for an in-range instruction-result operand, none otherwise
+fun operand_instr_use(inst: *instruction.Instruction, o: u32, ilen: u32) O.Option[u32] {
+    if (operand_is_value_use(inst, o) == false) { ret O.none[u32](); }
+    val op: value.Value = inst.operands[o];
+    if (op.kind != value.VAL_INSTR) { ret O.none[u32](); }
+    val def_id: u32 = op.data.instr::u32;
+    if (def_id >= ilen) { ret O.none[u32](); }
+    ret O.some[u32](def_id);
+}
+
+# compact an InstructionId list in place, dropping ids flagged dead
+#
+# An id outside the dead map's range is conservatively kept.
+# ---
+# ids:  the list to compact in place
+# len:  the list's current length
+# dead: per-instruction dead flags
+# ilen: the dead map's length (the in-range bound)
+# ret:  the compacted length
 fun compact_ids(ids: *id.InstructionId, len: u32, dead: *bool, ilen: u32) u32 {
     var w: u32 = 0;
     var r: u32 = 0;
     for (r < len) {
-        val v: id.InstructionId = ids[r];
+        val iid: id.InstructionId = ids[r];
         var drop: bool = false;
-        if (v::u32 < ilen) { drop = dead[v::u32]; }
+        if (iid::u32 < ilen) { drop = dead[iid::u32]; }
         if (drop == false) {
-            ids[w] = v;
+            ids[w] = iid;
             w = w + 1;
         }
         r = r + 1;
@@ -269,135 +331,165 @@ fun compact_ids(ids: *id.InstructionId, len: u32, dead: *bool, ilen: u32) u32 {
     ret w;
 }
 
-# Reachability DCE: marks blocks reachable from the entry along terminator
-# edges, then compacts the block array, remapping every BlockId reference and
-# pruning phi incomings whose predecessor block was removed.
-fun reachability_dce(m: *ir.Module, fn: *ir.Function) Result[bool, str] {
+# reachability DCE for one function
+#
+# Marks blocks reachable from the entry block (BlockId 0) along terminator
+# edges, frees the unreachable blocks, compacts the survivors, and remaps every
+# BlockId reference - terminator targets, predecessor lists, and phi incomings -
+# dropping phi incomings whose predecessor was removed.
+# ---
+# m:   the owning module; its allocator backs the scratch arrays
+# fn:  the function to process
+# ret: ok(true) on success, or an allocation error
+fun reachability_dce(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
     val n: u32 = fn.block_count;
-    if (n == 0) { ret ok[bool, str](true); }
+    if (n == 0) { ret R.ok[bool, str](true); }
 
-    val rr: Result[*bool, str] = allocate[bool](m.alloc, n::usize);
-    if (is_err[*bool, str](rr)) { ret err[bool, str](unwrap_err[*bool, str](rr)); }
-    val reach: *bool = unwrap_ok[*bool, str](rr);
-
-    val rq: Result[*id.BlockId, str] = allocate[id.BlockId](m.alloc, n::usize);
-    if (is_err[*id.BlockId, str](rq)) {
-        deallocate[bool](m.alloc, reach, n::usize);
-        ret err[bool, str](unwrap_err[*id.BlockId, str](rq));
+    val res_reach: R.Result[*bool, str] = A.allocate[bool](m.alloc, n::usize);
+    if (R.is_err[*bool, str](res_reach)) {
+        ret R.err[bool, str](R.unwrap_err[*bool, str](res_reach));
     }
-    val queue: *id.BlockId = unwrap_ok[*id.BlockId, str](rq);
+    val reach: *bool = R.unwrap_ok[*bool, str](res_reach);
+
+    val res_queue: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](m.alloc, n::usize);
+    if (R.is_err[*id.BlockId, str](res_queue)) {
+        A.deallocate[bool](m.alloc, reach, n::usize);
+        ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](res_queue));
+    }
+    val queue: *id.BlockId = R.unwrap_ok[*id.BlockId, str](res_queue);
 
     var i: u32 = 0;
-    for (i < n) { reach[i] = false; i = i + 1; }
+    for (i < n) {
+        reach[i] = false;
+        i = i + 1;
+    }
 
-    # BFS from entry block 0 along terminator successor edges.
+    # BFS from the entry block along terminator successor edges.
     var qhead: u32 = 0;
     var qtail: u32 = 0;
-    reach[0] = true;
+    reach[0]     = true;
     queue[qtail] = 0::id.BlockId;
-    qtail = qtail + 1;
+    qtail        = qtail + 1;
     for (qhead < qtail) {
         val bid: id.BlockId = queue[qhead];
         qhead = qhead + 1;
+
         var s0: id.BlockId = id.BLOCK_NIL;
         var s1: id.BlockId = id.BLOCK_NIL;
         val sn: u32 = ir.block_successors(fn, ?fn.blocks[bid::u32], ?s0, ?s1);
+
         if (sn >= 1 && s0 != id.BLOCK_NIL && s0::u32 < n && reach[s0::u32] == false) {
-            reach[s0::u32] = true; queue[qtail] = s0; qtail = qtail + 1;
+            reach[s0::u32] = true;
+            queue[qtail]   = s0;
+            qtail          = qtail + 1;
         }
         if (sn >= 2 && s1 != id.BLOCK_NIL && s1::u32 < n && reach[s1::u32] == false) {
-            reach[s1::u32] = true; queue[qtail] = s1; qtail = qtail + 1;
+            reach[s1::u32] = true;
+            queue[qtail]   = s1;
+            qtail          = qtail + 1;
         }
     }
 
-    # if every block is reachable, nothing to compact.
+    # nothing to compact when every block is reachable.
     var all_reach: bool = true;
-    var c: u32 = 0;
-    for (c < n) { if (reach[c] == false) { all_reach = false; } c = c + 1; }
+    i = 0;
+    for (i < n) {
+        if (reach[i] == false) {
+            all_reach = false;
+            brk;
+        }
+        i = i + 1;
+    }
     if (all_reach) {
-        deallocate[bool](m.alloc, reach, n::usize);
-        deallocate[id.BlockId](m.alloc, queue, n::usize);
-        ret ok[bool, str](true);
+        A.deallocate[bool](m.alloc, reach, n::usize);
+        A.deallocate[id.BlockId](m.alloc, queue, n::usize);
+        ret R.ok[bool, str](true);
     }
 
-    # build the old-BlockId -> new-BlockId remap (entry stays at 0).
-    val rmp: Result[*u32, str] = allocate[u32](m.alloc, n::usize);
-    if (is_err[*u32, str](rmp)) {
-        deallocate[bool](m.alloc, reach, n::usize);
-        deallocate[id.BlockId](m.alloc, queue, n::usize);
-        ret err[bool, str](unwrap_err[*u32, str](rmp));
+    # build the old-BlockId -> new-BlockId remap; the entry stays at 0.
+    val res_remap: R.Result[*u32, str] = A.allocate[u32](m.alloc, n::usize);
+    if (R.is_err[*u32, str](res_remap)) {
+        A.deallocate[bool](m.alloc, reach, n::usize);
+        A.deallocate[id.BlockId](m.alloc, queue, n::usize);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](res_remap));
     }
-    val remap: *u32 = unwrap_ok[*u32, str](rmp);
+    val remap: *u32 = R.unwrap_ok[*u32, str](res_remap);
 
     var next: u32 = 0;
-    var b: u32 = 0;
-    for (b < n) {
-        if (reach[b]) {
-            remap[b] = next;
-            next = next + 1;
-        } or {
-            remap[b] = BLOCK_GONE;
+    i = 0;
+    for (i < n) {
+        if (reach[i]) {
+            remap[i] = next;
+            next     = next + 1;
         }
-        b = b + 1;
+        or {
+            remap[i] = BLOCK_GONE;
+        }
+        i = i + 1;
     }
 
-    # free the owned arrays of every removed block, then compact survivors into
-    # place, rewriting their id field and remapping their predecessor lists.
-    var d: u32 = 0;
-    for (d < n) {
-        if (reach[d] == false) {
-            free_block_arrays(m, ?fn.blocks[d]);
+    # free every removed block's owned arrays before the survivors move over them.
+    i = 0;
+    for (i < n) {
+        if (reach[i] == false) {
+            block_arrays_free(m, ?fn.blocks[i]);
         }
-        d = d + 1;
+        i = i + 1;
     }
 
+    # compact survivors down, rewriting each block's id and remapping its preds.
     var w: u32 = 0;
-    var rdx: u32 = 0;
-    for (rdx < n) {
-        if (reach[rdx]) {
-            if (w != rdx) { fn.blocks[w] = fn.blocks[rdx]; }
+    var r: u32 = 0;
+    for (r < n) {
+        if (reach[r]) {
+            if (w != r) { fn.blocks[w] = fn.blocks[r]; }
             var blk: *ir.Block = ?fn.blocks[w];
-            blk.id = w::id.BlockId;
+            blk.id         = w::id.BlockId;
             blk.pred_count = remap_preds(blk.preds, blk.pred_count, remap);
             w = w + 1;
         }
-        rdx = rdx + 1;
+        r = r + 1;
     }
     fn.block_count = w;
 
-    # remap terminator block targets and prune phi incomings from gone preds.
-    var t: u32 = 0;
-    for (t < fn.block_count) {
-        val blk: *ir.Block = ?fn.blocks[t];
+    # remap terminator block targets and prune phi incomings from removed preds.
+    i = 0;
+    for (i < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[i];
         remap_terminator(fn, blk, remap);
         prune_phis(fn, blk, remap);
-        t = t + 1;
+        i = i + 1;
     }
 
-    deallocate[bool](m.alloc, reach, n::usize);
-    deallocate[id.BlockId](m.alloc, queue, n::usize);
-    deallocate[u32](m.alloc, remap, n::usize);
-    ret ok[bool, str](true);
+    A.deallocate[bool](m.alloc, reach, n::usize);
+    A.deallocate[id.BlockId](m.alloc, queue, n::usize);
+    A.deallocate[u32](m.alloc, remap, n::usize);
+    ret R.ok[bool, str](true);
 }
 
-# frees a removed block's owned instruction, phi, and predecessor arrays.
-fun free_block_arrays(m: *ir.Module, blk: *ir.Block) {
+# free a removed block's owned instruction, phi, and predecessor arrays
+# ---
+# m:   the owning module; its allocator owns the arrays
+# blk: the block whose storage to release
+fun block_arrays_free(m: *ir.Module, blk: *ir.Block) {
     if (blk.instructions != nil && blk.instr_cap > 0) {
-        deallocate[id.InstructionId](m.alloc, blk.instructions, blk.instr_cap::usize);
+        A.deallocate[id.InstructionId](m.alloc, blk.instructions, blk.instr_cap::usize);
     }
     if (blk.phis != nil && blk.phi_cap > 0) {
-        deallocate[id.InstructionId](m.alloc, blk.phis, blk.phi_cap::usize);
+        A.deallocate[id.InstructionId](m.alloc, blk.phis, blk.phi_cap::usize);
     }
     if (blk.preds != nil && blk.pred_cap > 0) {
-        deallocate[id.BlockId](m.alloc, blk.preds, blk.pred_cap::usize);
+        A.deallocate[id.BlockId](m.alloc, blk.preds, blk.pred_cap::usize);
     }
-    blk.instructions = nil; blk.instr_count = 0; blk.instr_cap = 0;
-    blk.phis = nil; blk.phi_count = 0; blk.phi_cap = 0;
-    blk.preds = nil; blk.pred_count = 0; blk.pred_cap = 0;
 }
 
-# compacts a predecessor list in place, remapping surviving ids and dropping
-# any predecessor that was removed. returns the new length.
+# compact a predecessor list in place, remapping surviving ids through `remap`
+# and dropping any predecessor that was removed
+# ---
+# preds: the predecessor list to compact in place
+# len:   its current length
+# remap: old-BlockId -> new-BlockId table (BLOCK_GONE marks a removed block)
+# ret:   the compacted length
 fun remap_preds(preds: *id.BlockId, len: u32, remap: *u32) u32 {
     var w: u32 = 0;
     var r: u32 = 0;
@@ -412,47 +504,59 @@ fun remap_preds(preds: *id.BlockId, len: u32, remap: *u32) u32 {
     ret w;
 }
 
-# rewrites a block's terminator block targets through the remap. Block ids ride
-# in operand int_lit slots (the shared block-target encoding). Surviving blocks'
-# terminators only ever point at surviving blocks, so no target is gone.
+# rewrite `blk`'s terminator block targets through `remap`
+#
+# Block ids ride in the terminator's operand int_lit slots (the shared
+# block-target encoding). A surviving block's terminator only targets survivors,
+# so no live target is ever gone.
+# ---
+# fn:    the function owning the terminator
+# blk:   the block whose terminator to rewrite
+# remap: old-BlockId -> new-BlockId table
 fun remap_terminator(fn: *ir.Function, blk: *ir.Block, remap: *u32) {
     if (blk.terminator == id.INSTR_NIL) { ret; }
-    val t_opt: Option[*instr.Instruction] = ir.instruction_get(fn, blk.terminator);
-    if (is_none[*instr.Instruction](t_opt)) { ret; }
-    val t: *instr.Instruction = unwrap[*instr.Instruction](t_opt);
-    if (t.kind == instr.OP_BR && t.operand_count >= 1) {
-        val old: u32 = t.operands[0].data.int_lit::u32;
+    val opt_term: O.Option[*instruction.Instruction] = ir.instruction_get(fn, blk.terminator);
+    if (O.is_none[*instruction.Instruction](opt_term)) { ret; }
+    val term: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_term);
+
+    if (term.kind == instruction.OP_BR && term.operand_count >= 1) {
+        val old: u32 = term.operands[0].data.int_lit::u32;
         if (remap[old] != BLOCK_GONE) {
-            t.operands[0].data.int_lit = remap[old]::u64;
+            term.operands[0].data.int_lit = remap[old]::u64;
         }
-    } or (t.kind == instr.OP_CBR && t.operand_count >= 3) {
-        val o1: u32 = t.operands[1].data.int_lit::u32;
-        val o2: u32 = t.operands[2].data.int_lit::u32;
-        if (remap[o1] != BLOCK_GONE) { t.operands[1].data.int_lit = remap[o1]::u64; }
-        if (remap[o2] != BLOCK_GONE) { t.operands[2].data.int_lit = remap[o2]::u64; }
+    }
+    or (term.kind == instruction.OP_CBR && term.operand_count >= 3) {
+        val old_true:  u32 = term.operands[1].data.int_lit::u32;
+        val old_false: u32 = term.operands[2].data.int_lit::u32;
+        if (remap[old_true]  != BLOCK_GONE) { term.operands[1].data.int_lit = remap[old_true]::u64; }
+        if (remap[old_false] != BLOCK_GONE) { term.operands[2].data.int_lit = remap[old_false]::u64; }
     }
 }
 
-# prunes and remaps phi incomings: each phi's operand list is [block0, val0, …];
-# pairs whose predecessor block was removed are dropped, and surviving block ids
-# are remapped to their new BlockId. The operand array is compacted in place;
-# operand_count shrinks accordingly.
+# prune and remap `blk`'s phi incomings
+#
+# Each phi's operands are [block0, val0, block1, val1, ...]; a pair whose
+# predecessor block was removed is dropped, and a surviving block id is remapped
+# to its new BlockId. Operands are compacted in place and operand_count shrinks.
+# ---
+# fn:    the function owning the phis
+# blk:   the block whose phis to prune
+# remap: old-BlockId -> new-BlockId table
 fun prune_phis(fn: *ir.Function, blk: *ir.Block, remap: *u32) {
-    var pi: u32 = 0;
-    for (pi < blk.phi_count) {
-        val phi_id: id.InstructionId = blk.phis[pi];
-        val phi_opt: Option[*instr.Instruction] = ir.instruction_get(fn, phi_id);
-        if (is_some[*instr.Instruction](phi_opt)) {
-            val phi: *instr.Instruction = unwrap[*instr.Instruction](phi_opt);
-            if (phi.kind == instr.OP_PHI) {
-                var w: u32 = 0;     # write pair cursor (in operands)
-                var r: u32 = 0;     # read pair cursor
+    var i: u32 = 0;
+    for (i < blk.phi_count) {
+        val opt_phi: O.Option[*instruction.Instruction] = ir.instruction_get(fn, blk.phis[i]);
+        if (O.is_some[*instruction.Instruction](opt_phi)) {
+            val phi: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_phi);
+            if (phi.kind == instruction.OP_PHI) {
+                var w: u32 = 0;
+                var r: u32 = 0;
                 for (r + 1 < phi.operand_count) {
                     val old: u32 = phi.operands[r].data.int_lit::u32;
                     if (remap[old] != BLOCK_GONE) {
-                        phi.operands[w]     = phi.operands[r];
+                        phi.operands[w]              = phi.operands[r];
                         phi.operands[w].data.int_lit = remap[old]::u64;
-                        phi.operands[w + 1] = phi.operands[r + 1];
+                        phi.operands[w + 1]          = phi.operands[r + 1];
                         w = w + 2;
                     }
                     r = r + 2;
@@ -460,116 +564,120 @@ fun prune_phis(fn: *ir.Function, blk: *ir.Block, remap: *u32) {
                 phi.operand_count = w;
             }
         }
-        pi = pi + 1;
+        i = i + 1;
     }
 }
 
-# appends a fresh, empty non-extern function to `m` and returns its index. Fields
-# the dead-phi test does not exercise are left at their `var` zero default (the
-# builder grows blocks/instrs; asm_blocks stays an inert empty map).
-fun new_fn(m: *ir.Module) u32 {
-    val idx: u32 = m.function_len;
-    var f: ir.Function;
-    f.name  = intern.STR_NIL;
-    f.sig   = ir_type.IRT_NIL;
-    f.flags = 0;
-    m.functions[idx] = f;
-    m.function_len   = m.function_len + 1;
-    ret idx;
-}
-
-test "dce: an unused phi is removed (must be removable, not just is_pure-kept)" {
-    var alloc: Allocator;
+# an unused phi must be removed: a phi is not `is_pure`, so DCE must recognize it
+# as removable-when-unused rather than keeping it like a side-effecting op.
+test "mach.lang.me.pass.dce.run:unused_phi_removed" {
+    var alloc: A.Allocator;
     page.make(?alloc);
-    val mr: Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
-    if (is_err[ir.Module, str](mr)) { ret 1; }
-    var m: ir.Module = unwrap_ok[ir.Module, str](mr);
-    val tr: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
-    if (is_err[ir_type.IrTypeId, str](tr)) { ret 1; }
-    val i64t: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
 
-    val fi: u32 = new_fn(?m);
+    val res_module: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_module)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_module);
+
+    val res_i64: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64)) { ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
+
+    val res_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { ret 1; }
+    val fi: u32 = R.unwrap_ok[u32, str](res_fn);
     val fn: *ir.Function = ?m.functions[fi];
+
     var bld: builder.Builder = builder.init(?m);
     builder.set_function(?bld, fn);
 
-    val e0: Result[id.BlockId, str] = builder.new_block(?bld);
-    if (is_err[id.BlockId, str](e0)) { ret 1; }
-    val entry: id.BlockId = unwrap_ok[id.BlockId, str](e0);
-    val e1: Result[id.BlockId, str] = builder.new_block(?bld);
-    if (is_err[id.BlockId, str](e1)) { ret 1; }
-    val join: id.BlockId = unwrap_ok[id.BlockId, str](e1);
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](res_entry);
+
+    val res_join: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_join)) { ret 1; }
+    val join: id.BlockId = R.unwrap_ok[id.BlockId, str](res_join);
 
     builder.set_block(?bld, entry);
-    val rbr: Result[bool, str] = builder.emit_br(?bld, join);
-    if (is_err[bool, str](rbr)) { ret 1; }
+    val res_br: R.Result[bool, str] = builder.emit_br(?bld, join);
+    if (R.is_err[bool, str](res_br)) { ret 1; }
 
     builder.set_block(?bld, join);
-    val rp: Result[value.Value, str] = builder.emit_phi(?bld, i64t);   # unused phi
-    if (is_err[value.Value, str](rp)) { ret 1; }
-    val phi: value.Value = unwrap_ok[value.Value, str](rp);
-    val ra: Result[bool, str] = builder.phi_add_incoming(?bld, phi, entry, value.const_int(5, i64t));
-    if (is_err[bool, str](ra)) { ret 1; }
-    val rr: Result[bool, str] = builder.emit_ret(?bld, value.const_int(9, i64t));
-    if (is_err[bool, str](rr)) { ret 1; }
+    # an unused phi
+    val res_phi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
+    if (R.is_err[value.Value, str](res_phi)) { ret 1; }
+    val phi: value.Value = R.unwrap_ok[value.Value, str](res_phi);
 
-    val dr: Result[bool, str] = run(?m);
-    if (is_err[bool, str](dr)) { ret 1; }
+    val res_incoming: R.Result[bool, str] = builder.phi_add_incoming(?bld, phi, entry, value.const_int(5, i64t));
+    if (R.is_err[bool, str](res_incoming)) { ret 1; }
+    val res_ret: R.Result[bool, str] = builder.emit_ret(?bld, value.const_int(9, i64t));
+    if (R.is_err[bool, str](res_ret)) { ret 1; }
 
-    # before the fix the phi (non-pure, so must_keep) survives unconditionally.
+    val res_run: R.Result[bool, str] = run(?m);
+    if (R.is_err[bool, str](res_run)) { ret 1; }
+
     if ((?fn.blocks[join::u32]).phi_count != 0) { ret 1; }
     ret 0;
 }
 
-test "dce: reachability removes a dead block and prunes its phi incoming" {
-    var alloc: Allocator;
+# reachability DCE removes an unreachable block and prunes the phi incoming that
+# came from it.
+test "mach.lang.me.pass.dce.run:dead_block_and_phi_pruned" {
+    var alloc: A.Allocator;
     page.make(?alloc);
-    val mr: Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
-    if (is_err[ir.Module, str](mr)) { ret 1; }
-    var m: ir.Module = unwrap_ok[ir.Module, str](mr);
-    val tr: Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
-    if (is_err[ir_type.IrTypeId, str](tr)) { ret 1; }
-    val i64t: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](tr);
 
-    val fi: u32 = new_fn(?m);
+    val res_module: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_module)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_module);
+
+    val res_i64: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64)) { ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
+
+    val res_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { ret 1; }
+    val fi: u32 = R.unwrap_ok[u32, str](res_fn);
     val fn: *ir.Function = ?m.functions[fi];
+
     var bld: builder.Builder = builder.init(?m);
     builder.set_function(?bld, fn);
 
-    val re: Result[id.BlockId, str] = builder.new_block(?bld);
-    if (is_err[id.BlockId, str](re)) { ret 1; }
-    val entry: id.BlockId = unwrap_ok[id.BlockId, str](re);
-    val rl: Result[id.BlockId, str] = builder.new_block(?bld);
-    if (is_err[id.BlockId, str](rl)) { ret 1; }
-    val b_live: id.BlockId = unwrap_ok[id.BlockId, str](rl);
-    val rd: Result[id.BlockId, str] = builder.new_block(?bld);
-    if (is_err[id.BlockId, str](rd)) { ret 1; }
-    val b_dead: id.BlockId = unwrap_ok[id.BlockId, str](rd);
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](res_entry);
+
+    val res_live: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_live)) { ret 1; }
+    val b_live: id.BlockId = R.unwrap_ok[id.BlockId, str](res_live);
+
+    val res_dead: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_dead)) { ret 1; }
+    val b_dead: id.BlockId = R.unwrap_ok[id.BlockId, str](res_dead);
 
     # entry: unconditional branch to b_live; b_dead is never reached.
     builder.set_block(?bld, entry);
-    if (is_err[bool, str](builder.emit_br(?bld, b_live))) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_br(?bld, b_live))) { ret 1; }
 
-    # b_live: phi with incomings from both entry (live) and b_dead (stale); ret(phi)
+    # b_live: phi with incomings from entry (live) and b_dead (stale); ret(phi).
     builder.set_block(?bld, b_live);
-    val rp: Result[value.Value, str] = builder.emit_phi(?bld, i64t);
-    if (is_err[value.Value, str](rp)) { ret 1; }
-    val phi: value.Value = unwrap_ok[value.Value, str](rp);
-    if (is_err[bool, str](builder.phi_add_incoming(?bld, phi, entry, value.const_int(10, i64t)))) { ret 1; }
-    if (is_err[bool, str](builder.phi_add_incoming(?bld, phi, b_dead, value.const_int(20, i64t)))) { ret 1; }
-    if (is_err[bool, str](builder.emit_ret(?bld, phi))) { ret 1; }
+    val res_phi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
+    if (R.is_err[value.Value, str](res_phi)) { ret 1; }
+    val phi: value.Value = R.unwrap_ok[value.Value, str](res_phi);
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, entry, value.const_int(10, i64t))))  { ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, b_dead, value.const_int(20, i64t)))) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?bld, phi)))                                            { ret 1; }
 
-    # b_dead: unreachable block that branches to b_live (gives the phi a source to prune)
+    # b_dead: unreachable block branching to b_live, giving the phi a source to prune.
     builder.set_block(?bld, b_dead);
-    if (is_err[bool, str](builder.emit_br(?bld, b_live))) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_br(?bld, b_live))) { ret 1; }
 
-    if (is_err[bool, str](run(?m))) { ret 1; }
+    if (R.is_err[bool, str](run(?m))) { ret 1; }
 
     # b_dead removed; exactly entry + b_live remain.
     if (fn.block_count != 2) { ret 1; }
-    # b_live is now block 1; its phi has only the entry incoming (2 operands: one pair).
+    # b_live is now block 1; its phi keeps only the entry incoming (one pair).
     val phi_id: id.InstructionId = fn.blocks[1].phis[0];
-    val phi_inst: *instr.Instruction = ?fn.instrs[phi_id];
+    val phi_inst: *instruction.Instruction = ?fn.instrs[phi_id];
     if (phi_inst.operand_count != 2) { ret 1; }
     ret 0;
 }
