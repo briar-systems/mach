@@ -1,78 +1,103 @@
-# mach.lang.fe.parser.state: the Parser record plus the shared helpers every other parser file builds on.
+# the Parser record and the shared helpers every other parser file builds on
 #
-# provides cursor (current, peek, advance), predicate (at, at_kw, eat,
-# eat_kw), error reporting (error_at, error_at_current, expect, sync_to),
-# span arithmetic (span_of), and the push_* wrappers that log allocation
-# failures and return *_NIL rather than aborting. all sibling files depend
-# on this one; nothing here depends back on them.
+# Provides the cursor (current, peek, advance), token predicates (at, at_kw,
+# at_eof, at_decl_start), consumers (eat, eat_kw, expect), error reporting
+# (error_at, error_at_current, fatal_oom, fatal_ice_at), recovery (sync_to,
+# sync_to_decl), span arithmetic (span_of), and the push_* / *_buf_flush
+# wrappers that append nodes and node-id lists to the AST, flagging a fatal
+# allocation failure rather than aborting. Every sibling parser file depends on
+# this one; nothing here depends back on them.
 
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_region_equals;
-use std.types.size.usize;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
 
-use std.allocator.deallocate;
+use A: std.allocator;
+use R: std.types.result;
 
-use token:  mach.lang.fe.token;
-use lexer:  mach.lang.fe.lexer;
-use diag:   mach.lang.diagnostic;
-use ast:    mach.lang.fe.ast;
-use pool:   mach.lang.fe.pool;
-use id:     mach.lang.fe.ast.id;
-use expr:   mach.lang.fe.ast.expr;
-use stmt:   mach.lang.fe.ast.stmt;
-use decl:   mach.lang.fe.ast.decl;
-use m_type: mach.lang.fe.ast.type;
-use module: mach.lang.fe.ast.module;
+use mach.lang.diagnostic;
+use mach.lang.fe.ast;
+use mach.lang.fe.ast.decl;
+use mach.lang.fe.ast.expr;
+use mach.lang.fe.ast.id;
+use mach.lang.fe.ast.module;
+use mach.lang.fe.ast.stmt;
+use mach.lang.fe.ast.type;
+use mach.lang.fe.lexer;
+use mach.lang.fe.pool;
+use mach.lang.fe.token;
 
-# Parser: parser cursor and output sinks; lives for the duration of one parse.
+# parser cursor and output sinks; lives for the duration of one parse
 # ---
-# tokens: stream produced by the lexer
-# pos:    index into tokens.tokens of the current token
-# ast:    output AST; nodes are appended here as parsing progresses
-# diags:  diagnostic sink for parse errors and recovery messages
-# panic:  true while skipping tokens during error recovery; cleared at the next synchronization point
-# fatal:  sticky flag set by any allocation failure during parsing, independent
-#         of panic so an OOM hit mid-recovery is never swallowed; the driver
-#         treats a fatal parse as failed rather than consuming a corrupt AST
-# no_struct_lit: while true, a bare `Name { ... }` does not parse as a struct
-#         literal — the `{` opens an enclosing block instead. set for the
-#         sequence of a paren-less `$each <ident> in <seq> { body }` (#1474) so a
-#         pack-ident sequence (`va`) does not swallow the loop body's braces.
+# tokens:        token stream produced by the lexer
+# pos:           index into tokens.tokens of the current token
+# ast:           output AST; nodes are appended here as parsing progresses
+# diags:         diagnostic sink for parse errors and recovery messages
+# panic:         true while skipping tokens during error recovery; cleared at the next synchronization point
+# fatal:         sticky flag set by any allocation failure, independent of panic
+#                so an OOM hit mid-recovery is never swallowed; the driver treats
+#                a fatal parse as failed rather than consuming a corrupt AST
+# no_struct_lit: while true, a bare `Name { ... }` is not a struct literal - the
+#                `{` opens an enclosing block instead. set for the sequence of a
+#                paren-less `$each <ident> in <seq> { body }` so a pack-ident
+#                sequence does not swallow the loop body's braces
 pub rec Parser {
-    tokens: *lexer.TokenStream;
-    pos:    usize;
-    ast:    *ast.Ast;
-    diags:  *diag.DiagList;
-    panic:  bool;
-    fatal:  bool;
+    tokens:        *lexer.TokenStream;
+    pos:           usize;
+    ast:           *ast.Ast;
+    diags:         *diagnostic.DiagList;
+    panic:         bool;
+    fatal:         bool;
     no_struct_lit: bool;
 }
 
-# init: initializes a Parser over the given token stream, filling output into ast and diags.
+# a temporary, contiguous buffer of elements collected while parsing one nested
+# list
+#
+# The matching `ast.*` pool is shared and append-only, and fully parsing one
+# element can append that element's own children to the same pool mid-parse.
+# Buffering the parent's direct elements here and flushing them as one block
+# after every nested parse keeps each node's (start, len) slice contiguous and
+# disjoint. Each pool keeps its own thin `*_buf_flush` helper that appends the
+# buffer to its pool and frees it.
+# ---
+# data: heap buffer of collected elements
+# len:  number of elements buffered
+# cap:  allocated slots
+pub rec ListBuf[T] {
+    data: *T;
+    len:  usize;
+    cap:  usize;
+}
+
+# seed capacity for a ListBuf's first growth, doubled on each subsequent grow
+val LIST_BUF_SEED_CAP: usize = 8;
+
+# construct a Parser positioned at the first token of `tokens`
+#
+# Parser borrows `tokens`, `out`, and `diags` and owns no memory, so there is no
+# matching dnit.
 # ---
 # tokens: lexer output to consume
 # out:    AST to append parsed nodes into
 # diags:  diagnostic sink
-# ret:    a fresh Parser positioned at the first token
-pub fun init(tokens: *lexer.TokenStream, out: *ast.Ast, diags: *diag.DiagList) Parser {
+# ret:    a fresh Parser at the first token
+pub fun make(tokens: *lexer.TokenStream, out: *ast.Ast, diags: *diagnostic.DiagList) Parser {
     var p: Parser;
-    p.tokens = tokens;
-    p.pos    = 0;
-    p.ast    = out;
-    p.diags  = diags;
-    p.panic  = false;
-    p.fatal  = false;
+    p.tokens        = tokens;
+    p.pos           = 0;
+    p.ast           = out;
+    p.diags         = diags;
+    p.panic         = false;
+    p.fatal         = false;
     p.no_struct_lit = false;
     ret p;
 }
 
-# current: returns the current token without consuming it.
+# return the current token without consuming it
 # ---
 # p:   parser state
 # ret: token at p.pos
@@ -80,7 +105,7 @@ pub fun current(p: *Parser) token.Token {
     ret p.tokens.tokens[p.pos];
 }
 
-# peek: returns the token at an offset from the current position without consuming it.
+# return the token at `offset` from the current position without consuming it
 # ---
 # p:      parser state
 # offset: positive offset from the current position
@@ -93,7 +118,7 @@ pub fun peek(p: *Parser, offset: usize) token.Token {
     ret p.tokens.tokens[idx];
 }
 
-# advance: consumes the current token and returns it.
+# consume the current token and return it
 # ---
 # p:   parser state
 # ret: the token that was current before the call
@@ -105,7 +130,7 @@ pub fun advance(p: *Parser) token.Token {
     ret t;
 }
 
-# at: reports whether the current token has the given kind.
+# report whether the current token has the given kind
 # ---
 # p:    parser state
 # kind: token kind to test against
@@ -114,7 +139,42 @@ pub fun at(p: *Parser, kind: token.Kind) bool {
     ret current(p).kind == kind;
 }
 
-# eat: consumes the current token if its kind matches, reporting whether it did.
+# report whether the current token is an IDENT whose text equals `kw`
+# ---
+# p:   parser state
+# kw:  keyword to match against the current IDENT's source text
+# ret: true when the current token is an IDENT whose text equals kw
+pub fun at_kw(p: *Parser, kw: str) bool {
+    if (!at(p, token.KIND_IDENT)) { ret false; }
+    val t: token.Token = current(p);
+    ret str_region_equals(p.tokens.source, t.span.offset, t.span.len, kw);
+}
+
+# report whether the parser has reached the trailing EOF token
+# ---
+# p:   parser state
+# ret: true if no more real tokens remain
+pub fun at_eof(p: *Parser) bool {
+    ret at(p, token.KIND_EOF);
+}
+
+# report whether the current token can begin a top-level declaration
+#
+# A `$` directive, a `pub`/`ext` flag, or one of the declaration keywords. Used
+# to find a genuine declaration boundary during recovery.
+# ---
+# p:   parser state
+# ret: true if the current token can start a declaration
+pub fun at_decl_start(p: *Parser) bool {
+    if (at(p, token.KIND_DOLLAR)) { ret true; }
+    if (!at(p, token.KIND_IDENT)) { ret false; }
+    ret at_kw(p, "pub") || at_kw(p, "ext")
+     || at_kw(p, "use") || at_kw(p, "fwd") || at_kw(p, "fun")
+     || at_kw(p, "rec") || at_kw(p, "uni") || at_kw(p, "val")
+     || at_kw(p, "var") || at_kw(p, "def") || at_kw(p, "test");
+}
+
+# consume the current token if its kind matches, reporting whether it did
 # ---
 # p:    parser state
 # kind: token kind to match and consume
@@ -127,18 +187,7 @@ pub fun eat(p: *Parser, kind: token.Kind) bool {
     ret false;
 }
 
-# at_kw: reports whether the current IDENT token matches the given keyword text.
-# ---
-# p:   parser state
-# kw:  keyword to match against the current IDENT's source text
-# ret: true when the current token is an IDENT whose text equals kw
-pub fun at_kw(p: *Parser, kw: str) bool {
-    if (!at(p, token.KIND_IDENT)) { ret false; }
-    val t: token.Token = current(p);
-    ret str_region_equals(p.tokens.source, t.span.offset, t.span.len, kw);
-}
-
-# eat_kw: consumes the current IDENT token if it matches the given keyword text.
+# consume the current IDENT token if it matches the given keyword text
 # ---
 # p:   parser state
 # kw:  keyword to match and consume
@@ -151,7 +200,7 @@ pub fun eat_kw(p: *Parser, kw: str) bool {
     ret false;
 }
 
-# expect: consumes the current token when its kind matches, emitting an error otherwise.
+# consume the current token when its kind matches, emitting an error otherwise
 # ---
 # p:       parser state
 # kind:    expected token kind
@@ -165,7 +214,10 @@ pub fun expect(p: *Parser, kind: token.Kind, message: str) bool {
     ret false;
 }
 
-# error_at_current: emits an error-severity diagnostic pinned to the current token's span.
+# emit an error-severity diagnostic pinned to the current token's span
+#
+# Suppressed while already in panic recovery. The diagnostic sink's own
+# allocation failure is best-effort and ignored here.
 # ---
 # p:       parser state
 # message: diagnostic text to record
@@ -173,11 +225,13 @@ pub fun error_at_current(p: *Parser, message: str) {
     if (p.panic) { ret; }
     p.panic = true;
     val t: token.Token = current(p);
-    val r: Result[bool, str] = diag.error(p.diags, p.tokens.file_id, t.span, message);
-    if (is_err[bool, str](r)) { ret; }
+    diagnostic.error(p.diags, p.tokens.file_id, t.span, message);
 }
 
-# error_at: emits an error-severity diagnostic pinned to the given span.
+# emit an error-severity diagnostic pinned to `span`
+#
+# Suppressed while already in panic recovery. The sink's own allocation failure
+# is best-effort and ignored here.
 # ---
 # p:       parser state
 # span:    span to pin the diagnostic to
@@ -185,34 +239,39 @@ pub fun error_at_current(p: *Parser, message: str) {
 pub fun error_at(p: *Parser, span: token.Span, message: str) {
     if (p.panic) { ret; }
     p.panic = true;
-    val r: Result[bool, str] = diag.error(p.diags, p.tokens.file_id, span, message);
-    if (is_err[bool, str](r)) { ret; }
+    diagnostic.error(p.diags, p.tokens.file_id, span, message);
 }
 
-# fatal_oom_at: records an unrecoverable allocation failure at `span`. an OOM is
-# not recoverable by error recovery, so this sets the sticky `fatal` flag and
-# emits the diagnostic directly, bypassing the `panic` guard that would otherwise
-# swallow an allocation failure hit while already recovering. the driver checks
-# `fatal` after the parse and refuses to consume the (now incomplete) AST.
+# record an unrecoverable allocation failure at `span`
+#
+# An OOM is not recoverable by error recovery, so this sets the sticky `fatal`
+# flag and emits directly, bypassing the `panic` guard that would otherwise
+# swallow a failure hit while already recovering. The driver checks `fatal`
+# after the parse and refuses to consume the incomplete AST. Reported once: the
+# flag is sticky, so a later failure during teardown needs no new message.
+# ---
+# p:    parser state
+# span: span to pin the diagnostic to
 pub fun fatal_oom_at(p: *Parser, span: token.Span) {
-    # report the first allocation failure once: the flag is sticky and the driver
-    # aborts after parse, so a later failure during teardown needs no new message.
     if (p.fatal) { ret; }
     p.fatal = true;
-    val r: Result[bool, str] = diag.error(p.diags, p.tokens.file_id, span, "out of memory while parsing");
-    if (is_err[bool, str](r)) { ret; }
+    diagnostic.error(p.diags, p.tokens.file_id, span, "out of memory while parsing");
 }
 
-# fatal_oom: fatal_oom_at pinned to the current token's span.
+# record an unrecoverable allocation failure at the current token's span
+# ---
+# p: parser state
 pub fun fatal_oom(p: *Parser) {
     fatal_oom_at(p, current(p).span);
 }
 
-# fatal_ice_at: records an internal compiler error at `span`. an ICE is a real
-# compiler defect (not a malformed program), so it bypasses the `panic` guard,
-# carries the `internal compiler error:` prefix, and sets the sticky `fatal`
-# flag so the driver refuses to consume the (now suspect) AST instead of
-# letting downstream passes read it out of bounds.
+# record an internal compiler error at `span`
+#
+# An ICE is a real compiler defect, not a malformed program, so it bypasses the
+# `panic` guard and sets the sticky `fatal` flag - the driver then refuses to
+# consume the suspect AST rather than letting downstream passes read it out of
+# bounds. The caller supplies the full message, including any
+# `internal compiler error:` prefix.
 # ---
 # p:       parser state
 # span:    span to pin the diagnostic to
@@ -220,16 +279,16 @@ pub fun fatal_oom(p: *Parser) {
 pub fun fatal_ice_at(p: *Parser, span: token.Span, message: str) {
     if (p.fatal) { ret; }
     p.fatal = true;
-    val r: Result[bool, str] = diag.error(p.diags, p.tokens.file_id, span, message);
-    if (is_err[bool, str](r)) { ret; }
+    diagnostic.error(p.diags, p.tokens.file_id, span, message);
 }
 
-# sync_to: advances until the current token is EOF or matches one of the synchronization kinds, then clears panic.
+# advance until the current token is EOF or matches a synchronization kind, then
+# clear panic
 # ---
 # p:  parser state
 # k0: first synchronization kind
-# k1: second synchronization kind (use KIND_ERROR if only one is needed)
-# k2: third synchronization kind (use KIND_ERROR if not needed)
+# k1: second synchronization kind (pass KIND_ERROR when only one is needed)
+# k2: third synchronization kind (pass KIND_ERROR when not needed)
 pub fun sync_to(p: *Parser, k0: token.Kind, k1: token.Kind, k2: token.Kind) {
     for (!at(p, token.KIND_EOF)) {
         val k: token.Kind = current(p).kind;
@@ -242,31 +301,21 @@ pub fun sync_to(p: *Parser, k0: token.Kind, k1: token.Kind, k2: token.Kind) {
     p.panic = false;
 }
 
-# at_decl_start: true when the current token can begin a top-level
-# declaration — a `$` directive, a `pub`/`ext` flag, or one of the decl
-# keywords. used to find a genuine declaration boundary during recovery.
-pub fun at_decl_start(p: *Parser) bool {
-    if (at(p, token.KIND_DOLLAR)) { ret true; }
-    if (!at(p, token.KIND_IDENT)) { ret false; }
-    ret at_kw(p, "pub") || at_kw(p, "ext")
-     || at_kw(p, "use") || at_kw(p, "fwd") || at_kw(p, "fun")
-     || at_kw(p, "rec") || at_kw(p, "uni") || at_kw(p, "val")
-     || at_kw(p, "var") || at_kw(p, "def") || at_kw(p, "test");
-}
-
-# sync_to_decl: advance until the current token begins a top-level
-# declaration (`at_decl_start`) or EOF, then clear panic. recovery at module
-# or comptime-branch scope uses this so one malformed declaration does not
-# turn every following body token into its own "expected a declaration"
-# error — the parser realigns on the next real declaration boundary instead.
+# advance until the current token begins a top-level declaration or EOF, then
+# clear panic
+#
+# Recovery at module or comptime-branch scope uses this so one malformed
+# declaration does not turn every following body token into its own "expected a
+# declaration" error - the parser realigns on the next real declaration boundary.
+# ---
+# p: parser state
 pub fun sync_to_decl(p: *Parser) {
     # only skip the current token when it is not itself a declaration boundary.
-    # an error that consumed its malformed construct in-place (a removed-setter
-    # `$sym.attr = ...` or a `...` variadic directive) leaves the parser already
-    # at the NEXT real declaration; skipping it unconditionally would drop that
-    # decl and reparse its body at module scope, turning every non-decl statement
-    # into a spurious "expected a declaration". the caller's forward-progress
-    # guard still advances when a malformed decl-start fails to consume anything.
+    # an error that consumed its malformed construct in place leaves the parser
+    # already at the next real declaration; skipping unconditionally would drop
+    # that decl and reparse its body at module scope. the caller's
+    # forward-progress guard still advances when a malformed decl-start consumes
+    # nothing.
     if (!at_decl_start(p)) { advance(p); }
     for (!at(p, token.KIND_EOF) && !at_decl_start(p)) {
         advance(p);
@@ -274,19 +323,11 @@ pub fun sync_to_decl(p: *Parser) {
     p.panic = false;
 }
 
-# at_eof: true when the parser has consumed every token up to and including EOF.
-# ---
-# p:   parser state
-# ret: true if no more real tokens remain
-pub fun at_eof(p: *Parser) bool {
-    ret at(p, token.KIND_EOF);
-}
-
-# span_of: joins two spans into the minimal span that covers both.
+# join two spans into the minimal span that covers both
 # ---
 # start: span at the beginning of the region
 # end:   span at the end of the region
-# ret:   span from start.offset to end.offset + end.len
+# ret:   span from start.offset through end.offset + end.len
 pub fun span_of(start: token.Span, end: token.Span) token.Span {
     var s: token.Span;
     s.offset = start.offset;
@@ -294,108 +335,147 @@ pub fun span_of(start: token.Span, end: token.Span) token.Span {
     ret s;
 }
 
-# push_expr: appends an Expr to the AST, reporting an allocation error and returning EXPR_NIL on failure.
+# append an Expr to the AST, flagging a fatal OOM and returning EXPR_NIL on failure
 # ---
 # p:   parser state
 # e:   expression to append
 # ret: the new ExprId, or EXPR_NIL if storage could not be allocated
 pub fun push_expr(p: *Parser, e: expr.Expr) id.ExprId {
-    val r: Result[id.ExprId, str] = ast.add_expr(p.ast, e);
-    if (is_err[id.ExprId, str](r)) {
+    val res_add: R.Result[id.ExprId, str] = ast.add_expr(p.ast, e);
+    if (R.is_err[id.ExprId, str](res_add)) {
         fatal_oom_at(p, e.span);
         ret id.EXPR_NIL;
     }
-    ret unwrap_ok[id.ExprId, str](r);
+    ret R.unwrap_ok[id.ExprId, str](res_add);
 }
 
-# push_stmt: appends a Stmt to the AST, reporting an allocation error and returning STMT_NIL on failure.
+# append a Stmt to the AST, flagging a fatal OOM and returning STMT_NIL on failure
 # ---
 # p:   parser state
 # s:   statement to append
 # ret: the new StmtId, or STMT_NIL if storage could not be allocated
 pub fun push_stmt(p: *Parser, s: stmt.Stmt) id.StmtId {
-    val r: Result[id.StmtId, str] = ast.add_stmt(p.ast, s);
-    if (is_err[id.StmtId, str](r)) {
+    val res_add: R.Result[id.StmtId, str] = ast.add_stmt(p.ast, s);
+    if (R.is_err[id.StmtId, str](res_add)) {
         fatal_oom_at(p, s.span);
         ret id.STMT_NIL;
     }
-    ret unwrap_ok[id.StmtId, str](r);
+    ret R.unwrap_ok[id.StmtId, str](res_add);
 }
 
-# push_decl: appends a Decl to the AST, reporting an allocation error and returning DECL_NIL on failure.
+# append a Decl to the AST, flagging a fatal OOM and returning DECL_NIL on failure
 # ---
 # p:   parser state
 # d:   declaration to append
 # ret: the new DeclId, or DECL_NIL if storage could not be allocated
 pub fun push_decl(p: *Parser, d: decl.Decl) id.DeclId {
-    val r: Result[id.DeclId, str] = ast.add_decl(p.ast, d);
-    if (is_err[id.DeclId, str](r)) {
+    val res_add: R.Result[id.DeclId, str] = ast.add_decl(p.ast, d);
+    if (R.is_err[id.DeclId, str](res_add)) {
         fatal_oom_at(p, d.span);
         ret id.DECL_NIL;
     }
-    ret unwrap_ok[id.DeclId, str](r);
+    ret R.unwrap_ok[id.DeclId, str](res_add);
 }
 
-# push_type: appends a Type to the AST, reporting an allocation error and returning TYPE_NIL on failure.
+# append a Type to the AST, flagging a fatal OOM and returning TYPE_NIL on failure
 # ---
 # p:   parser state
 # t:   type to append
 # ret: the new TypeId, or TYPE_NIL if storage could not be allocated
-pub fun push_type(p: *Parser, t: m_type.Type) id.TypeId {
-    val r: Result[id.TypeId, str] = ast.add_type(p.ast, t);
-    if (is_err[id.TypeId, str](r)) {
+pub fun push_type(p: *Parser, t: type.Type) id.TypeId {
+    val res_add: R.Result[id.TypeId, str] = ast.add_type(p.ast, t);
+    if (R.is_err[id.TypeId, str](res_add)) {
         fatal_oom_at(p, t.span);
         ret id.TYPE_NIL;
     }
-    ret unwrap_ok[id.TypeId, str](r);
+    ret R.unwrap_ok[id.TypeId, str](res_add);
 }
 
-# push_module: appends a Module to the AST, reporting an allocation error and returning MODULE_NIL on failure.
+# append a Module to the AST, flagging a fatal OOM and returning MODULE_NIL on failure
 # ---
 # p:   parser state
 # m:   module to append
 # ret: the new ModuleId, or MODULE_NIL if storage could not be allocated
 pub fun push_module(p: *Parser, m: module.Module) id.ModuleId {
-    val r: Result[id.ModuleId, str] = ast.add_module(p.ast, m);
-    if (is_err[id.ModuleId, str](r)) {
+    val res_add: R.Result[id.ModuleId, str] = ast.add_module(p.ast, m);
+    if (R.is_err[id.ModuleId, str](res_add)) {
         fatal_oom_at(p, m.span);
         ret id.MODULE_NIL;
     }
-    ret unwrap_ok[id.ModuleId, str](r);
+    ret R.unwrap_ok[id.ModuleId, str](res_add);
 }
 
-# push_decl_id: appends a DeclId to ast.decl_ids; on allocation failure it flags the parse fatal (fatal_oom) and returns 0, which flush ignores since it derives the appended count from the pool.
+# append a DeclId to ast.decl_ids, flagging a fatal OOM on failure
+#
+# Returns 0 on failure, which a `*_buf_flush` ignores: the flushed length is
+# derived from the pool, not from this return.
 # ---
 # p:   parser state
 # id_: DeclId to append
 # ret: index into ast.decl_ids, or 0 on allocation failure
 pub fun push_decl_id(p: *Parser, id_: id.DeclId) u32 {
-    val r: Result[u32, str] = ast.add_decl_id(p.ast, id_);
-    if (is_err[u32, str](r)) {
+    val res_add: R.Result[u32, str] = ast.add_decl_id(p.ast, id_);
+    if (R.is_err[u32, str](res_add)) {
         fatal_oom(p);
         ret 0;
     }
-    ret unwrap_ok[u32, str](r);
+    ret R.unwrap_ok[u32, str](res_add);
 }
 
-# ListBuf: a temporary, contiguous buffer of elements collected while parsing
-# one nested list. the matching `ast.*` pool is shared and append-only, and
-# fully parsing one element can append that element's own children to the same
-# pool mid-parse; buffering the parent's direct elements here and flushing them
-# as one block after every nested parse keeps each node's (start, len) slice
-# contiguous and disjoint. each pool keeps its own thin `*_buf_flush` helper
-# that appends the buffer to its pool and frees it.
+# append a StmtId to ast.stmt_ids, flagging a fatal OOM on failure
+#
+# Returns 0 on failure, which a `*_buf_flush` ignores: the flushed length is
+# derived from the pool, not from this return.
 # ---
-# data: heap buffer of collected elements
-# len:  number of elements buffered
-# cap:  allocated slots
-pub rec ListBuf[T] {
-    data: *T;
-    len:  usize;
-    cap:  usize;
+# p:   parser state
+# id_: StmtId to append
+# ret: index into ast.stmt_ids, or 0 on allocation failure
+pub fun push_stmt_id(p: *Parser, id_: id.StmtId) u32 {
+    val res_add: R.Result[u32, str] = ast.add_stmt_id(p.ast, id_);
+    if (R.is_err[u32, str](res_add)) {
+        fatal_oom(p);
+        ret 0;
+    }
+    ret R.unwrap_ok[u32, str](res_add);
 }
 
-# list_buf_init: start an empty ListBuf.
+# append an ExprId to ast.expr_ids, flagging a fatal OOM on failure
+#
+# Returns 0 on failure, which a `*_buf_flush` ignores: the flushed length is
+# derived from the pool, not from this return.
+# ---
+# p:   parser state
+# id_: ExprId to append
+# ret: index into ast.expr_ids, or 0 on allocation failure
+pub fun push_expr_id(p: *Parser, id_: id.ExprId) u32 {
+    val res_add: R.Result[u32, str] = ast.add_expr_id(p.ast, id_);
+    if (R.is_err[u32, str](res_add)) {
+        fatal_oom(p);
+        ret 0;
+    }
+    ret R.unwrap_ok[u32, str](res_add);
+}
+
+# append a TypeId to ast.type_ids, flagging a fatal OOM on failure
+#
+# Returns 0 on failure, which a `*_buf_flush` ignores: the flushed length is
+# derived from the pool, not from this return.
+# ---
+# p:   parser state
+# id_: TypeId to append
+# ret: index into ast.type_ids, or 0 on allocation failure
+pub fun push_type_id(p: *Parser, id_: id.TypeId) u32 {
+    val res_add: R.Result[u32, str] = ast.add_type_id(p.ast, id_);
+    if (R.is_err[u32, str](res_add)) {
+        fatal_oom(p);
+        ret 0;
+    }
+    ret R.unwrap_ok[u32, str](res_add);
+}
+
+# construct an empty ListBuf
+# ---
+# ret: a ListBuf with no backing storage
 pub fun list_buf_init[T]() ListBuf[T] {
     var b: ListBuf[T];
     b.data = nil;
@@ -404,33 +484,51 @@ pub fun list_buf_init[T]() ListBuf[T] {
     ret b;
 }
 
-# list_buf_push: buffer one element, growing on demand (seeded at 8, then
-# doubling). on allocation failure it flags the parse fatal and leaves the
-# buffer unchanged.
+# buffer one element, growing on demand
+#
+# Seeded at LIST_BUF_SEED_CAP, then doubling. On allocation failure it flags the
+# parse fatal and leaves the buffer unchanged.
+# ---
+# p: parser state
+# b: buffer to append to
+# x: element to buffer
 pub fun list_buf_push[T](p: *Parser, b: *ListBuf[T], x: T) {
     if (b.len == b.cap) {
-        val r: Result[*T, str] = pool.grow[T](p.ast.a, b.data, b.cap, 8, ?b.cap);
-        if (is_err[*T, str](r)) { fatal_oom(p); ret; }
-        b.data = unwrap_ok[*T, str](r);
+        val res_grow: R.Result[*T, str] = pool.grow[T](p.ast.a, b.data, b.cap, LIST_BUF_SEED_CAP, ?b.cap);
+        if (R.is_err[*T, str](res_grow)) {
+            fatal_oom(p);
+            ret;
+        }
+        b.data = R.unwrap_ok[*T, str](res_grow);
     }
     b.data[b.len] = x;
     b.len = b.len + 1;
 }
 
-# list_buf_free: release a buffer's storage and reset it to empty. the shared
-# tail of every `*_buf_flush`.
+# release a buffer's storage and reset it to empty
+#
+# The shared tail of every `*_buf_flush`.
+# ---
+# p: parser state
+# b: buffer to free
 pub fun list_buf_free[T](p: *Parser, b: *ListBuf[T]) {
     if (b.data != nil && b.cap > 0) {
-        deallocate[T](p.ast.a, b.data, b.cap);
+        A.deallocate[T](p.ast.a, b.data, b.cap);
     }
     b.data = nil;
     b.len  = 0;
     b.cap  = 0;
 }
 
-# decl_id_buf_flush: append the buffered DeclIds to `ast.decl_ids` as one
-# contiguous block and free the buffer. returns the pool start index of the
-# block (the run's `decls_start`/`body_start`); `*out_len` receives its length.
+# append the buffered DeclIds to ast.decl_ids as one contiguous block and free
+# the buffer
+#
+# Returns the pool start index of the block (a run's `decls_start`/`body_start`).
+# ---
+# p:       parser state
+# b:       buffer of DeclIds to flush
+# out_len: receives the number of ids appended
+# ret:     pool start index of the flushed block
 pub fun decl_id_buf_flush(p: *Parser, b: *ListBuf[id.DeclId], out_len: *u32) u32 {
     val start: u32 = p.ast.decl_id_len::u32;
     var i: usize = 0;
@@ -438,86 +536,22 @@ pub fun decl_id_buf_flush(p: *Parser, b: *ListBuf[id.DeclId], out_len: *u32) u32
         push_decl_id(p, b.data[i]);
         i = i + 1;
     }
-    # the count actually appended, not b.len: a fatal alloc failure mid-flush
-    # leaves the slice covering only the ids that reached the pool.
+    # appended count, not b.len: a fatal failure mid-flush leaves the slice
+    # covering only the ids that reached the pool.
     @out_len = (p.ast.decl_id_len::u32) - start;
     list_buf_free[id.DeclId](p, b);
     ret start;
 }
 
-# expr_id_buf_flush: append the buffered ExprIds to `ast.expr_ids` as one
-# contiguous block and free the buffer. returns the pool start index of the
-# block (the list's `args_start`/`elems_start`); `*out_len` receives its length.
-pub fun expr_id_buf_flush(p: *Parser, b: *ListBuf[id.ExprId], out_len: *u32) u32 {
-    val start: u32 = p.ast.expr_id_len::u32;
-    var i: usize = 0;
-    for (i < b.len) {
-        push_expr_id(p, b.data[i]);
-        i = i + 1;
-    }
-    # the count actually appended, not b.len: a fatal alloc failure mid-flush
-    # leaves the slice covering only the ids that reached the pool.
-    @out_len = (p.ast.expr_id_len::u32) - start;
-    list_buf_free[id.ExprId](p, b);
-    ret start;
-}
-
-# type_id_buf_flush: append the buffered TypeIds to `ast.type_ids` as one
-# contiguous block and free the buffer. returns the pool start index of the
-# block (the list's `args_start`/`params_start`); `*out_len` receives its length.
-pub fun type_id_buf_flush(p: *Parser, b: *ListBuf[id.TypeId], out_len: *u32) u32 {
-    val start: u32 = p.ast.type_id_len::u32;
-    var i: usize = 0;
-    for (i < b.len) {
-        push_type_id(p, b.data[i]);
-        i = i + 1;
-    }
-    # the count actually appended, not b.len: a fatal alloc failure mid-flush
-    # leaves the slice covering only the ids that reached the pool.
-    @out_len = (p.ast.type_id_len::u32) - start;
-    list_buf_free[id.TypeId](p, b);
-    ret start;
-}
-
-# field_init_buf_flush: append the buffered FieldInits to `ast.field_inits` as
-# one contiguous block and free the buffer. returns the pool start index of the
-# block (the literal's `fields_start`); `*out_len` receives its length.
-pub fun field_init_buf_flush(p: *Parser, b: *ListBuf[expr.FieldInit], out_len: *u32) u32 {
-    val start: u32 = p.ast.field_init_len::u32;
-    var i: usize = 0;
-    for (i < b.len) {
-        val r: Result[u32, str] = ast.add_field_init(p.ast, b.data[i]);
-        if (is_err[u32, str](r)) { fatal_oom(p); }
-        i = i + 1;
-    }
-    # the count actually appended, not b.len: a fatal alloc failure mid-flush
-    # leaves the slice covering only the entries that reached the pool.
-    @out_len = (p.ast.field_init_len::u32) - start;
-    list_buf_free[expr.FieldInit](p, b);
-    ret start;
-}
-
-# typed_name_buf_flush: append the buffered TypedNames to `ast.typed_names` as
-# one contiguous block and free the buffer. returns the pool start index of the
-# block (the list's `params_start`/`fields_start`); `*out_len` receives its length.
-pub fun typed_name_buf_flush(p: *Parser, b: *ListBuf[decl.TypedName], out_len: *u32) u32 {
-    val start: u32 = p.ast.typed_name_len::u32;
-    var i: usize = 0;
-    for (i < b.len) {
-        val r: Result[u32, str] = ast.add_typed_name(p.ast, b.data[i]);
-        if (is_err[u32, str](r)) { fatal_oom(p); }
-        i = i + 1;
-    }
-    # the count actually appended, not b.len: a fatal alloc failure mid-flush
-    # leaves the slice covering only the entries that reached the pool.
-    @out_len = (p.ast.typed_name_len::u32) - start;
-    list_buf_free[decl.TypedName](p, b);
-    ret start;
-}
-
-# stmt_id_buf_flush: append the buffered StmtIds to `ast.stmt_ids` as one
-# contiguous block and free the buffer. returns the pool start index of the
-# block (the body's `stmts_start`/`body_start`); `*out_len` receives its length.
+# append the buffered StmtIds to ast.stmt_ids as one contiguous block and free
+# the buffer
+#
+# Returns the pool start index of the block (a body's `stmts_start`/`body_start`).
+# ---
+# p:       parser state
+# b:       buffer of StmtIds to flush
+# out_len: receives the number of ids appended
+# ret:     pool start index of the flushed block
 pub fun stmt_id_buf_flush(p: *Parser, b: *ListBuf[id.StmtId], out_len: *u32) u32 {
     val start: u32 = p.ast.stmt_id_len::u32;
     var i: usize = 0;
@@ -525,70 +559,127 @@ pub fun stmt_id_buf_flush(p: *Parser, b: *ListBuf[id.StmtId], out_len: *u32) u32
         push_stmt_id(p, b.data[i]);
         i = i + 1;
     }
-    # the count actually appended, not b.len: a fatal alloc failure mid-flush
-    # leaves the slice covering only the ids that reached the pool.
+    # appended count, not b.len: a fatal failure mid-flush leaves the slice
+    # covering only the ids that reached the pool.
     @out_len = (p.ast.stmt_id_len::u32) - start;
     list_buf_free[id.StmtId](p, b);
     ret start;
 }
 
-# comptime_branch_buf_flush: append the buffered ComptimeBranches to
-# `ast.comptime_branches` as one contiguous block and free the buffer. returns
-# the pool start index of the block (the chain's `branches_start`); `*out_len`
-# receives its length.
+# append the buffered ExprIds to ast.expr_ids as one contiguous block and free
+# the buffer
+#
+# Returns the pool start index of the block (a list's `args_start`/`elems_start`).
+# ---
+# p:       parser state
+# b:       buffer of ExprIds to flush
+# out_len: receives the number of ids appended
+# ret:     pool start index of the flushed block
+pub fun expr_id_buf_flush(p: *Parser, b: *ListBuf[id.ExprId], out_len: *u32) u32 {
+    val start: u32 = p.ast.expr_id_len::u32;
+    var i: usize = 0;
+    for (i < b.len) {
+        push_expr_id(p, b.data[i]);
+        i = i + 1;
+    }
+    # appended count, not b.len: a fatal failure mid-flush leaves the slice
+    # covering only the ids that reached the pool.
+    @out_len = (p.ast.expr_id_len::u32) - start;
+    list_buf_free[id.ExprId](p, b);
+    ret start;
+}
+
+# append the buffered TypeIds to ast.type_ids as one contiguous block and free
+# the buffer
+#
+# Returns the pool start index of the block (a list's `args_start`/`params_start`).
+# ---
+# p:       parser state
+# b:       buffer of TypeIds to flush
+# out_len: receives the number of ids appended
+# ret:     pool start index of the flushed block
+pub fun type_id_buf_flush(p: *Parser, b: *ListBuf[id.TypeId], out_len: *u32) u32 {
+    val start: u32 = p.ast.type_id_len::u32;
+    var i: usize = 0;
+    for (i < b.len) {
+        push_type_id(p, b.data[i]);
+        i = i + 1;
+    }
+    # appended count, not b.len: a fatal failure mid-flush leaves the slice
+    # covering only the ids that reached the pool.
+    @out_len = (p.ast.type_id_len::u32) - start;
+    list_buf_free[id.TypeId](p, b);
+    ret start;
+}
+
+# append the buffered FieldInits to ast.field_inits as one contiguous block and
+# free the buffer
+#
+# Returns the pool start index of the block (a literal's `fields_start`).
+# ---
+# p:       parser state
+# b:       buffer of FieldInits to flush
+# out_len: receives the number of entries appended
+# ret:     pool start index of the flushed block
+pub fun field_init_buf_flush(p: *Parser, b: *ListBuf[expr.FieldInit], out_len: *u32) u32 {
+    val start: u32 = p.ast.field_init_len::u32;
+    var i: usize = 0;
+    for (i < b.len) {
+        val res_add: R.Result[u32, str] = ast.add_field_init(p.ast, b.data[i]);
+        if (R.is_err[u32, str](res_add)) { fatal_oom(p); }
+        i = i + 1;
+    }
+    # appended count, not b.len: a fatal failure mid-flush leaves the slice
+    # covering only the entries that reached the pool.
+    @out_len = (p.ast.field_init_len::u32) - start;
+    list_buf_free[expr.FieldInit](p, b);
+    ret start;
+}
+
+# append the buffered TypedNames to ast.typed_names as one contiguous block and
+# free the buffer
+#
+# Returns the pool start index of the block (a list's `params_start`/`fields_start`).
+# ---
+# p:       parser state
+# b:       buffer of TypedNames to flush
+# out_len: receives the number of entries appended
+# ret:     pool start index of the flushed block
+pub fun typed_name_buf_flush(p: *Parser, b: *ListBuf[decl.TypedName], out_len: *u32) u32 {
+    val start: u32 = p.ast.typed_name_len::u32;
+    var i: usize = 0;
+    for (i < b.len) {
+        val res_add: R.Result[u32, str] = ast.add_typed_name(p.ast, b.data[i]);
+        if (R.is_err[u32, str](res_add)) { fatal_oom(p); }
+        i = i + 1;
+    }
+    # appended count, not b.len: a fatal failure mid-flush leaves the slice
+    # covering only the entries that reached the pool.
+    @out_len = (p.ast.typed_name_len::u32) - start;
+    list_buf_free[decl.TypedName](p, b);
+    ret start;
+}
+
+# append the buffered ComptimeBranches to ast.comptime_branches as one
+# contiguous block and free the buffer
+#
+# Returns the pool start index of the block (the chain's `branches_start`).
+# ---
+# p:       parser state
+# b:       buffer of ComptimeBranches to flush
+# out_len: receives the number of branches appended
+# ret:     pool start index of the flushed block
 pub fun comptime_branch_buf_flush(p: *Parser, b: *ListBuf[decl.ComptimeBranch], out_len: *u32) u32 {
     val start: u32 = p.ast.comptime_branch_len::u32;
     var i: usize = 0;
     for (i < b.len) {
-        val r: Result[u32, str] = ast.add_comptime_branch(p.ast, b.data[i]);
-        if (is_err[u32, str](r)) { fatal_oom(p); }
+        val res_add: R.Result[u32, str] = ast.add_comptime_branch(p.ast, b.data[i]);
+        if (R.is_err[u32, str](res_add)) { fatal_oom(p); }
         i = i + 1;
     }
-    # the count actually appended, not b.len: a fatal alloc failure mid-flush
-    # leaves the slice covering only the branches that reached the pool.
+    # appended count, not b.len: a fatal failure mid-flush leaves the slice
+    # covering only the branches that reached the pool.
     @out_len = (p.ast.comptime_branch_len::u32) - start;
     list_buf_free[decl.ComptimeBranch](p, b);
     ret start;
-}
-
-# push_stmt_id: appends a StmtId to ast.stmt_ids; on allocation failure it flags the parse fatal (fatal_oom) and returns 0, which flush ignores since it derives the appended count from the pool.
-# ---
-# p:   parser state
-# id_: StmtId to append
-# ret: index into ast.stmt_ids, or 0 on allocation failure
-pub fun push_stmt_id(p: *Parser, id_: id.StmtId) u32 {
-    val r: Result[u32, str] = ast.add_stmt_id(p.ast, id_);
-    if (is_err[u32, str](r)) {
-        fatal_oom(p);
-        ret 0;
-    }
-    ret unwrap_ok[u32, str](r);
-}
-
-# push_expr_id: appends an ExprId to ast.expr_ids; on allocation failure it flags the parse fatal (fatal_oom) and returns 0, which flush ignores since it derives the appended count from the pool.
-# ---
-# p:   parser state
-# id_: ExprId to append
-# ret: index into ast.expr_ids, or 0 on allocation failure
-pub fun push_expr_id(p: *Parser, id_: id.ExprId) u32 {
-    val r: Result[u32, str] = ast.add_expr_id(p.ast, id_);
-    if (is_err[u32, str](r)) {
-        fatal_oom(p);
-        ret 0;
-    }
-    ret unwrap_ok[u32, str](r);
-}
-
-# push_type_id: appends a TypeId to ast.type_ids; on allocation failure it flags the parse fatal (fatal_oom) and returns 0, which flush ignores since it derives the appended count from the pool.
-# ---
-# p:   parser state
-# id_: TypeId to append
-# ret: index into ast.type_ids, or 0 on allocation failure
-pub fun push_type_id(p: *Parser, id_: id.TypeId) u32 {
-    val r: Result[u32, str] = ast.add_type_id(p.ast, id_);
-    if (is_err[u32, str](r)) {
-        fatal_oom(p);
-        ret 0;
-    }
-    ret unwrap_ok[u32, str](r);
 }
