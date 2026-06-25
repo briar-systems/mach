@@ -1,345 +1,365 @@
-# mach.lang.session: top-level service container shared across compilation phases.
+# top-level service container shared across every compilation phase
 #
-# owns the source registry, diagnostic sink, string interner, type
-# interner, and query database. every phase takes a `*Session` and routes
-# service interactions through it.
+# Owns the source registry, diagnostic sink, string interner, type interner,
+# and query database, plus the per-build module registries the incremental
+# engine remaps against. Every phase takes a `*Session` and routes its service
+# interactions through it.
 
+use std.collections.map;
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.result.Result;
-use std.types.result.ok;
-use std.types.result.err;
-use std.types.result.is_ok;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.unwrap_err;
 
+use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
-use std.types.option.Option;
-use std.types.option.some;
-use std.types.option.none;
+use mach.lang.diagnostic;
+use mach.lang.fe.ast;
+use mach.lang.intern;
+use mach.lang.module;
+use mach.lang.query;
+use mach.lang.source;
+use mach.lang.target;
+use mach.lang.type;
 
-use std.allocator.Allocator;
-use std.allocator.allocate;
-use std.allocator.deallocate;
-use std.allocator.reallocate;
+# re-export the project-wide module identity so consumers can spell it
+# `session.ModuleId` / `session.MODULE_NIL` without importing mach.lang.module.
+fwd module.ModuleId;
+fwd module.MODULE_NIL;
+fwd module.StableModuleId;
+fwd module.STABLE_MODULE_NIL;
 
-use map:     std.collections.map;
-use maphash: std.collections.map;
-
-use source: mach.lang.source;
-use diag:   mach.lang.diagnostic;
-use intern: mach.lang.intern;
-use ty:     mach.lang.type;
-use query:  mach.lang.query;
-use target: mach.lang.target;
-use modid:  mach.lang.module;
-use ast:    mach.lang.fe.ast;
-
-# re-export the project-wide module id so consumers can spell it as
-# `session.ModuleId` / `session.MODULE_NIL`.
-fwd modid.ModuleId;
-fwd modid.MODULE_NIL;
-fwd modid.StableModuleId;
-fwd modid.STABLE_MODULE_NIL;
-
-# Session: top-level driver state shared across compilation phases; owns the allocator-backed services every phase reads or writes.
+# top-level driver state shared across every compilation phase
+#
+# Built once over an Allocator and threaded through the pipeline as `*Session`.
+# Owns the allocator-backed services every phase reads or writes plus the
+# per-build module registries the incremental engine remaps against.
 # ---
-# alloc:    allocator used for all owned storage on the session
-# sources:  registry of loaded source files
-# diags:    diagnostic sink shared by all phases
-# interner: shared string interner used by sema and downstream phases
-# types:    shared type universe used by sema, middle-end, and backend
-# queries:  memoization database holding every input and derived compiler artifact; the public surface every consumer (CLI, LSP, tests) drives the compiler through. owns parsed ASTs as opaque Q_PARSE handles (#1580), so a long-lived session reuses an unchanged module's AST across rebuilds instead of re-parsing it
-# module_asts: parsed AST of every loaded module, indexed by project-wide ModuleId; populated by the driver after the load pass so any phase can reach a cross-module declaration (e.g. an imported record's fields, or a generic instantiated from a transitive dependency) by ModuleId
-# module_ast_count: number of registered module ASTs (the registry's logical length)
+# alloc:            allocator used for all owned storage on the session
+# sources:          registry of loaded source files
+# diags:            diagnostic sink shared by every phase
+# interner:         shared string interner used by sema and downstream phases
+# types:            shared type universe used by sema, middle end, and backend
+# module_asts:      ModuleId-indexed array of borrowed module ASTs, grown on demand
+# module_ast_count: number of registered module ASTs (the registry's length)
 # module_ast_cap:   allocated capacity of the module-AST registry
-# module_fqns:  ModuleId -> the module's fully-qualified path StrId; populated by the driver alongside module_asts, read by the back-end symbol mangler so a cross-module reference can name the defining module's mangled symbol (a reference is keyed on the referent's origin ModuleId, the definition on its own)
-# export_names: `(ModuleId << 32 | DeclId)` -> the literal link-name override declared by a `#[symbol("...")]` decorator (or an `ext fun` foreign symbol); a decl present in this map keeps its literal name rather than being mangled, the sole exemption keeping the program entry, runtime, and foreign symbols linkable against the names written in inline asm
-# export_libraries: `(ModuleId << 32 | DeclId)` -> the dynamic library a `#[library("...")]` decorator pins an `ext` import to (e.g. `"ws2_32.dll"`); consulted by the driver to build `import_libraries` once link names are final
-# type_aligns: nominal TypeId -> the explicit byte alignment an `#[align(...)]` decorator pins a record/union to; folded once by sema (where the decl is visible) and read by the middle end when lowering the nominal to an IR struct so its layout honors the override
-# import_libraries: link symbol name StrId -> the library StrId an import is pinned to; the link-name-keyed projection of `export_libraries` the back-end linker consults to attribute each PE import descriptor to a specific dependency rather than the first one
-# module_sema:    ModuleId -> its `*sema.SemaResult`, stored opaque (as `ptr`) to keep this leaf module free of an import cycle on the front end; the back-end monomorphizer casts it back to lower a generic template body against the typing of the module that declared it
-# module_resolve: ModuleId -> its `*resolve.ResolveResult`, stored opaque like module_sema, so a generic instance body is lowered against the declaring module's name resolution
-# registry: the owned target registry (isa/os/abi/of vtable tables); zeroed at init and populated by the owner's target.register_all call, then read by target.select to compose a Target
+# module_fqns:      ModuleId -> the module's fully-qualified path StrId, read by the
+#                    back-end mangler to name a cross-module symbol against its module
+# export_names:     (ModuleId << 32 | DeclId) -> a literal link-name override from a
+#                    `#[symbol(...)]` decorator or an `ext fun`; a registered decl keeps
+#                    its literal name instead of being mangled
+# export_libraries: (ModuleId << 32 | DeclId) -> the dynamic library a `#[library(...)]`
+#                    decorator pins an `ext` import to (e.g. "ws2_32.dll")
+# type_aligns:      nominal TypeId -> the explicit byte alignment an `#[align(...)]`
+#                    decorator pins it to, folded by sema and read by the middle end
+# import_libraries: link-name StrId -> the library StrId an import is pinned to, the
+#                    link-name-keyed projection of export_libraries the linker consults
+# module_sema:      ModuleId -> its *sema.SemaResult, stored opaque as `ptr` to keep
+#                    this leaf module free of a front-end import cycle
+# module_resolve:   ModuleId -> its *resolve.ResolveResult, stored opaque like module_sema
+# module_comptime:  ModuleId -> its *comptime.ComptimeCtx, stored opaque like module_sema
+# registry:         owned target registry (isa/os/abi/of vtables), zeroed at init and
+#                    populated by the owner's target.register_all call
 pub rec Session {
-    alloc:    *Allocator;
+    alloc:    *A.Allocator;
     sources:  source.SourceMap;
-    diags:    diag.DiagList;
+    diags:    diagnostic.DiagList;
     interner: intern.Interner;
-    types:    ty.TypeInterner;
-    queries:  query.QueryDb;
+    types:    type.TypeInterner;
+
+    # the memoization database every consumer (CLI, LSP, tests) drives the
+    # compiler through. owns parsed ASTs as opaque Q_PARSE handles, so a
+    # long-lived session reuses an unchanged module's AST across rebuilds
+    # instead of re-parsing it.
+    queries: query.QueryDb;
+
     module_asts:      **ast.Ast;
     module_ast_count: u32;
     module_ast_cap:   u32;
-    module_fqns:      map.Map[modid.ModuleId, intern.StrId];
+
+    module_fqns:      map.Map[module.ModuleId, intern.StrId];
     export_names:     map.Map[u64, intern.StrId];
     export_libraries: map.Map[u64, intern.StrId];
     type_aligns:      map.Map[u32, u32];
     import_libraries: map.Map[intern.StrId, intern.StrId];
-    module_sema:      map.Map[modid.ModuleId, ptr];
-    module_resolve:   map.Map[modid.ModuleId, ptr];
-    module_comptime:  map.Map[modid.ModuleId, ptr];
-    # stable_ids: persistent FQN StrId -> StableModuleId, assigned in first-seen
-    # order and never renumbered, so a module keeps one identity across rebuilds
-    # even as discovery-order ModuleIds are reassigned (#1579). NOT cleared by
-    # reset_module_registry — it must outlive a build to serve the next one
-    # stable_id_next: monotonic source of the next StableModuleId to hand out
-    stable_ids:       map.Map[intern.StrId, modid.StableModuleId];
-    stable_id_next:   modid.StableModuleId;
-    # stable_to_mid: the PER-BUILD inverse of the active build's identity
-    # assignment — StableModuleId -> the discovery-order ModuleId it holds THIS
-    # build. populated by the driver alongside register_module_ast and cleared by
-    # reset_module_registry, it is the table a reused ResolveResult is remapped
-    # through (resolve.remap_result), translating a prior build's ModuleIds back
-    # into this build's numbering (#1582)
-    stable_to_mid:    map.Map[modid.StableModuleId, modid.ModuleId];
-    # active_project: opaque handle to the *driver.Project of the build currently
-    # running, installed for the span of the resolve pass so the Q_RESOLVE compute
-    # can reach the per-build module graph (deps, comptime ctxs) the engine's
-    # ComputeFn signature cannot carry. stored as `ptr` to keep this leaf module
-    # free of a driver import cycle, exactly like module_resolve/module_comptime;
-    # nil outside a resolve pass and never dereferenced by the session itself
-    active_project:   ptr;
-    registry:         target.TargetRegistry;
-    # the CLI optimization intent, set before build_project so the comptime ctx
-    # can resolve `$mach.build.mode`: opt_explicit when a `-O*`/`--release` flag
-    # was given (it wins over the manifest), opt_release its release-vs-debug sense.
-    opt_explicit:     bool;
-    opt_release:      bool;
-    # the CLI `--verbose` intent, set before build_project so the front-end load
-    # walk emits a per-module `lex`/`parse`/`resolve` progress line to stderr,
-    # matching the back-end's `--verbose` stage lines. off leaves the load silent.
-    verbose:          bool;
+
+    module_sema:     map.Map[module.ModuleId, ptr];
+    module_resolve:  map.Map[module.ModuleId, ptr];
+    module_comptime: map.Map[module.ModuleId, ptr];
+
+    # persistent FQN StrId -> StableModuleId, assigned in first-seen order and
+    # never renumbered, so a module keeps one identity across rebuilds even as
+    # discovery-order ModuleIds are reassigned. deliberately NOT cleared by
+    # reset_module_registry - it must outlive a build to serve the next one.
+    # stable_id_next is the monotonic source of the next id to hand out.
+    stable_ids:     map.Map[intern.StrId, module.StableModuleId];
+    stable_id_next: module.StableModuleId;
+
+    # the PER-BUILD inverse of the active build's identity assignment:
+    # StableModuleId -> the discovery-order ModuleId it holds this build.
+    # populated alongside register_module_ast and cleared each build, it is the
+    # table a reused ResolveResult is remapped through (resolve.remap_result).
+    stable_to_mid: map.Map[module.StableModuleId, module.ModuleId];
+
+    # opaque handle to the *driver.Project of the running build, installed for
+    # the span of the resolve pass so the Q_RESOLVE compute can reach the
+    # per-build module graph. nil outside a resolve pass; never dereferenced here.
+    active_project: ptr;
+
+    registry: target.TargetRegistry;
+
+    # CLI optimization intent, set before the build so the comptime ctx can
+    # resolve `$mach.build.mode`. opt_explicit marks an explicit `-O*`/`--release`
+    # flag (it wins over the manifest); opt_release is its release-vs-debug sense.
+    opt_explicit: bool;
+    opt_release:  bool;
+
+    # CLI `--verbose` intent, set before the build so the front-end load walk
+    # emits a per-module progress line to stderr. off leaves the load silent.
+    verbose: bool;
 }
 
-# init: construct an empty Session backed by the given allocator. sub-services
-# are built in order: sources, diags, interner (infallible), then types
-# and queries (fallible). queries registers the canonical catalog — the
-# input and metadata kinds whose registration needs nothing from a phase
-# module; derived kinds bind their compute functions when their owning
-# phase modules register them. the owned target registry is zeroed here but its
-# vtables are NOT installed: the owner calls target.register_all on the session's
-# registry and interner after this by-value return, so the vtable name strings
-# are interned into the session's final interner. on any failure the prior
-# sub-services are torn down in reverse construction order.
+# seed capacity of the module-AST registry, doubled on demand from there
+val MODULE_AST_SEED_CAP: u32 = 16;
+
+# construct an empty Session backed by the given allocator
+#
+# Sub-services are built in order: sources, diags, interner (infallible), then
+# types and queries (fallible), and finally the session-owned query catalog. The
+# target registry is zeroed here but its vtables are NOT installed: the owner
+# calls target.register_all on the returned session so the vtable name strings
+# intern into the session's final interner. On any failure the prior sub-services
+# are torn down in reverse construction order.
 # ---
 # alloc: allocator used for all session-owned storage
 # ret:   a new empty Session, or an allocation error from a fallible sub-service
-pub fun init(alloc: *Allocator) Result[Session, str] {
+pub fun init(alloc: *A.Allocator) R.Result[Session, str] {
     var s: Session;
-    s.alloc    = alloc;
-    s.sources  = source.init(alloc);
-    s.diags    = diag.init(alloc);
-    s.interner = intern.init(alloc);
+    s.alloc            = alloc;
+    s.sources          = source.init(alloc);
+    s.diags            = diagnostic.init(alloc);
+    s.interner         = intern.init(alloc);
     s.module_asts      = nil;
     s.module_ast_count = 0;
     s.module_ast_cap   = 0;
-    s.module_fqns      = map.init[modid.ModuleId, intern.StrId](alloc, maphash.hash_u32, maphash.eq_u32);
-    s.export_names     = map.init[u64, intern.StrId](alloc, maphash.hash_u64, maphash.eq_u64);
-    s.export_libraries = map.init[u64, intern.StrId](alloc, maphash.hash_u64, maphash.eq_u64);
-    s.type_aligns      = map.init[u32, u32](alloc, maphash.hash_u32, maphash.eq_u32);
-    s.import_libraries = map.init[intern.StrId, intern.StrId](alloc, maphash.hash_u32, maphash.eq_u32);
-    s.module_sema      = map.init[modid.ModuleId, ptr](alloc, maphash.hash_u32, maphash.eq_u32);
-    s.module_resolve   = map.init[modid.ModuleId, ptr](alloc, maphash.hash_u32, maphash.eq_u32);
-    s.module_comptime  = map.init[modid.ModuleId, ptr](alloc, maphash.hash_u32, maphash.eq_u32);
-    s.stable_ids       = map.init[intern.StrId, modid.StableModuleId](alloc, maphash.hash_u32, maphash.eq_u32);
+    s.module_fqns      = map.init[module.ModuleId, intern.StrId](alloc, map.hash_u32, map.eq_u32);
+    s.export_names     = map.init[u64, intern.StrId](alloc, map.hash_u64, map.eq_u64);
+    s.export_libraries = map.init[u64, intern.StrId](alloc, map.hash_u64, map.eq_u64);
+    s.type_aligns      = map.init[u32, u32](alloc, map.hash_u32, map.eq_u32);
+    s.import_libraries = map.init[intern.StrId, intern.StrId](alloc, map.hash_u32, map.eq_u32);
+    s.module_sema      = map.init[module.ModuleId, ptr](alloc, map.hash_u32, map.eq_u32);
+    s.module_resolve   = map.init[module.ModuleId, ptr](alloc, map.hash_u32, map.eq_u32);
+    s.module_comptime  = map.init[module.ModuleId, ptr](alloc, map.hash_u32, map.eq_u32);
+    s.stable_ids       = map.init[intern.StrId, module.StableModuleId](alloc, map.hash_u32, map.eq_u32);
     s.stable_id_next   = 0;
-    s.stable_to_mid    = map.init[modid.StableModuleId, modid.ModuleId](alloc, maphash.hash_u32, maphash.eq_u32);
+    s.stable_to_mid    = map.init[module.StableModuleId, module.ModuleId](alloc, map.hash_u32, map.eq_u32);
     s.active_project   = nil;
     s.registry         = target.registry_init();
     s.opt_explicit     = false;
     s.opt_release      = false;
     s.verbose          = false;
 
-    val res_ti_init: Option[str] = ty.init(?s.types, alloc);
-    if (O.is_some[str](res_ti_init)) {
+    val res_types: O.Option[str] = type.init(?s.types, alloc);
+    if (O.is_some[str](res_types)) {
         intern.dnit(?s.interner);
-        diag.dnit(?s.diags);
+        diagnostic.dnit(?s.diags);
         source.dnit(?s.sources);
-        ret err[Session, str](O.unwrap[str](res_ti_init));
+        ret R.err[Session, str](O.unwrap[str](res_types));
     }
 
-    val r_queries: Result[query.QueryDb, str] = query.init(alloc);
-    if (is_err[query.QueryDb, str](r_queries)) {
-        ty.dnit(?s.types);
+    val res_queries: R.Result[query.QueryDb, str] = query.init(alloc);
+    if (R.is_err[query.QueryDb, str](res_queries)) {
+        type.dnit(?s.types);
         intern.dnit(?s.interner);
-        diag.dnit(?s.diags);
+        diagnostic.dnit(?s.diags);
         source.dnit(?s.sources);
-        ret err[Session, str](unwrap_err[query.QueryDb, str](r_queries));
+        ret R.err[Session, str](R.unwrap_err[query.QueryDb, str](res_queries));
     }
-    s.queries = unwrap_ok[query.QueryDb, str](r_queries);
+    s.queries = R.unwrap_ok[query.QueryDb, str](res_queries);
 
-    val r_cat: Result[bool, str] = register_catalog(?s.queries);
-    if (is_err[bool, str](r_cat)) {
+    val res_catalog: R.Result[bool, str] = register_catalog(?s.queries);
+    if (R.is_err[bool, str](res_catalog)) {
         query.dnit(?s.queries);
-        ty.dnit(?s.types);
+        type.dnit(?s.types);
         intern.dnit(?s.interner);
-        diag.dnit(?s.diags);
+        diagnostic.dnit(?s.diags);
         source.dnit(?s.sources);
-        ret err[Session, str](unwrap_err[bool, str](r_cat));
+        ret R.err[Session, str](R.unwrap_err[bool, str](res_catalog));
     }
 
-    ret ok[Session, str](s);
+    ret R.ok[Session, str](s);
 }
 
-# register_catalog: register the catalog input kinds owned by the session. the
-# three input queries (project root, target, per-file source text) are
-# self-contained and bound here. Q_FILE_TEXT holds each file's source text,
-# set by load_source; its byte-equality cutoff is what keeps an unchanged
-# file's Q_PARSE entry valid across rebuilds. derived kinds are reserved by
-# their owning phase modules (e.g. the driver registers Q_PARSE), which bind
-# the compute functions the database invokes.
+# register the catalog input kinds owned by the session
+#
+# The input queries (project root, target, per-file text, per-module number) are
+# self-contained and bound here. Derived kinds are reserved by their owning phase
+# modules (e.g. the driver registers Q_PARSE), which bind the compute functions
+# the database invokes. Q_FILE_TEXT holds each file's source text, set by
+# load_source; its byte-equality cutoff is what keeps an unchanged file's Q_PARSE
+# entry valid across rebuilds.
 # ---
 # db:  the freshly constructed query database
-# ret: true once every session-owned input kind is registered, or the first registration error
-fun register_catalog(db: *query.QueryDb) Result[bool, str] {
-    val r_root: Result[bool, str] = query.register_input(db, query.Q_PROJECT_ROOT);
-    if (is_err[bool, str](r_root)) { ret r_root; }
+# ret: true once every session-owned input kind is registered, or the first error
+fun register_catalog(db: *query.QueryDb) R.Result[bool, str] {
+    val res_root: R.Result[bool, str] = query.register_input(db, query.Q_PROJECT_ROOT);
+    if (R.is_err[bool, str](res_root)) { ret res_root; }
 
-    val r_target: Result[bool, str] = query.register_input(db, query.Q_TARGET);
-    if (is_err[bool, str](r_target)) { ret r_target; }
+    val res_target: R.Result[bool, str] = query.register_input(db, query.Q_TARGET);
+    if (R.is_err[bool, str](res_target)) { ret res_target; }
 
-    val r_text: Result[bool, str] = query.register_input(db, query.Q_FILE_TEXT);
-    if (is_err[bool, str](r_text)) { ret r_text; }
+    val res_text: R.Result[bool, str] = query.register_input(db, query.Q_FILE_TEXT);
+    if (R.is_err[bool, str](res_text)) { ret res_text; }
 
-    # Q_MODULE_NUMBER: each module's current per-build ModuleId, set by the driver
-    # so Q_SEMA can detect a graph reshape that renumbers a module's interned type
-    # identities (#1583). its early-cutoff keeps a content-only edit's sema reuse valid.
-    val r_num: Result[bool, str] = query.register_input(db, query.Q_MODULE_NUMBER);
-    if (is_err[bool, str](r_num)) { ret r_num; }
+    # Q_MODULE_NUMBER carries each module's current per-build ModuleId so Q_SEMA
+    # can detect a graph reshape that renumbers a module's interned type
+    # identities. its early cutoff keeps a content-only edit's sema reuse valid.
+    val res_number: R.Result[bool, str] = query.register_input(db, query.Q_MODULE_NUMBER);
+    if (R.is_err[bool, str](res_number)) { ret res_number; }
 
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# dnit: release every resource held by the Session.
+# release every resource held by the session
 # ---
 # s: session to tear down; sub-structures are dnit'd in reverse construction order
 pub fun dnit(s: *Session) {
     if (s == nil) { ret; }
+
     if (s.module_asts != nil && s.module_ast_cap > 0) {
-        deallocate[*ast.Ast](s.alloc, s.module_asts, s.module_ast_cap::usize);
+        A.deallocate[*ast.Ast](s.alloc, s.module_asts, s.module_ast_cap::usize);
         s.module_asts      = nil;
         s.module_ast_count = 0;
         s.module_ast_cap   = 0;
     }
-    map.dnit[modid.ModuleId, intern.StrId](?s.module_fqns);
+
+    map.dnit[module.ModuleId, intern.StrId](?s.module_fqns);
     map.dnit[u64, intern.StrId](?s.export_names);
     map.dnit[u64, intern.StrId](?s.export_libraries);
     map.dnit[u32, u32](?s.type_aligns);
     map.dnit[intern.StrId, intern.StrId](?s.import_libraries);
-    map.dnit[modid.ModuleId, ptr](?s.module_sema);
-    map.dnit[modid.ModuleId, ptr](?s.module_resolve);
-    map.dnit[modid.ModuleId, ptr](?s.module_comptime);
-    map.dnit[intern.StrId, modid.StableModuleId](?s.stable_ids);
-    map.dnit[modid.StableModuleId, modid.ModuleId](?s.stable_to_mid);
+    map.dnit[module.ModuleId, ptr](?s.module_sema);
+    map.dnit[module.ModuleId, ptr](?s.module_resolve);
+    map.dnit[module.ModuleId, ptr](?s.module_comptime);
+    map.dnit[intern.StrId, module.StableModuleId](?s.stable_ids);
+    map.dnit[module.StableModuleId, module.ModuleId](?s.stable_to_mid);
+
     query.dnit(?s.queries);
-    ty.dnit(?s.types);
+    type.dnit(?s.types);
     intern.dnit(?s.interner);
-    diag.dnit(?s.diags);
+    diagnostic.dnit(?s.diags);
     source.dnit(?s.sources);
 }
 
-# reset_module_registry: clear the per-build module registries so the session can
-# be reused for a fresh build. frees the module-AST array (reallocated lazily on
-# the next register_module_ast) and empties every per-build map.
+# clear the per-build module registries so the session can be reused for a fresh
+# build
 #
-# the module_sema/resolve/comptime maps hold BORROWED pointers into Project-owned
-# storage that the driver frees in dnit_project; the FQN / export / import maps are
-# keyed by per-build ModuleId/DeclId. NONE of the values are session-owned (they are
-# StrIds interned in the session's persistent interner, or borrowed Project pointers
-# already freed by the caller), so map.clear is used throughout — it empties the
-# slots while leaving value storage untouched, never freeing a borrowed pointer or a
-# live interned string. clearing the export/import maps too keeps a reused session
-# from inheriting a prior build's overrides for a ModuleId/DeclId the next build
-# repurposes. call this at the END of a project teardown (after the Project frees),
-# so the next build starts from a clean registry rather than entries pointing at
-# freed Project storage.
+# Frees the module-AST array (reallocated lazily on the next register_module_ast)
+# and empties every per-build map. The module_sema/resolve/comptime maps hold
+# BORROWED pointers into Project-owned storage the driver frees in dnit_project,
+# and the FQN / export / import maps hold persistent StrIds or per-build keys, so
+# map.clear is used throughout - it empties the slots while leaving value storage
+# untouched, never freeing a borrowed pointer or a live interned string. Call this
+# at the END of a project teardown (after the Project frees) so the next build
+# starts from a clean registry rather than entries pointing at freed storage.
 #
-# the FQN -> StableModuleId registry (`stable_ids`) is deliberately NOT cleared:
+# The FQN -> StableModuleId registry (`stable_ids`) is deliberately NOT cleared:
 # its whole purpose is to outlive a build so a module keeps one identity across
-# rebuilds (#1579), the key future resolve/sema reuse remaps against.
+# rebuilds, the key future resolve/sema reuse remaps against.
 # ---
-# s: the session whose module registries are emptied
+# s: the session whose per-build module registries are emptied
 pub fun reset_module_registry(s: *Session) {
     if (s == nil) { ret; }
+
     if (s.module_asts != nil && s.module_ast_cap > 0) {
-        deallocate[*ast.Ast](s.alloc, s.module_asts, s.module_ast_cap::usize);
+        A.deallocate[*ast.Ast](s.alloc, s.module_asts, s.module_ast_cap::usize);
     }
     s.module_asts      = nil;
     s.module_ast_count = 0;
     s.module_ast_cap   = 0;
-    map.clear[modid.ModuleId, intern.StrId](?s.module_fqns);
+
+    map.clear[module.ModuleId, intern.StrId](?s.module_fqns);
     map.clear[u64, intern.StrId](?s.export_names);
     map.clear[u64, intern.StrId](?s.export_libraries);
     map.clear[u32, u32](?s.type_aligns);
     map.clear[intern.StrId, intern.StrId](?s.import_libraries);
-    map.clear[modid.ModuleId, ptr](?s.module_sema);
-    map.clear[modid.ModuleId, ptr](?s.module_resolve);
-    map.clear[modid.ModuleId, ptr](?s.module_comptime);
-    # the per-build StableModuleId -> ModuleId inverse is rebuilt from scratch each
-    # build; clear it so a reshape's new numbering never collides with a stale entry.
-    map.clear[modid.StableModuleId, modid.ModuleId](?s.stable_to_mid);
+    map.clear[module.ModuleId, ptr](?s.module_sema);
+    map.clear[module.ModuleId, ptr](?s.module_resolve);
+    map.clear[module.ModuleId, ptr](?s.module_comptime);
+
+    # the per-build StableModuleId -> ModuleId inverse is rebuilt from scratch
+    # each build; clear it so a reshape's new numbering never collides with a
+    # stale entry.
+    map.clear[module.StableModuleId, module.ModuleId](?s.stable_to_mid);
+
     s.active_project = nil;
 }
 
-# register_module_ast: record `a` as the AST of module `mid` in the session
-# registry, growing it to cover `mid` and zero-filling any gap. the registry
-# borrows `a`; the caller (the driver) owns the storage and must keep it alive
-# for the registry's lifetime. registering the same id twice overwrites.
+# record `a` as the AST of module `mid`, growing the registry to cover `mid` and
+# zero-filling any gap
+#
+# The registry borrows `a`; the caller (the driver) owns the storage and must
+# keep it alive for the registry's lifetime. Registering the same id overwrites.
 # ---
 # s:   the session
 # mid: project-wide ModuleId the AST belongs to
 # a:   borrowed pointer to the module's parsed AST
 # ret: true on success, or an allocation error
-pub fun register_module_ast(s: *Session, mid: modid.ModuleId, a: *ast.Ast) Result[bool, str] {
+pub fun register_module_ast(s: *Session, mid: module.ModuleId, a: *ast.Ast) R.Result[bool, str] {
     val needed: u32 = mid::u32 + 1;
     if (needed > s.module_ast_cap) {
         var new_cap: u32 = s.module_ast_cap;
-        if (new_cap == 0) { new_cap = 16; }
+        if (new_cap == 0) { new_cap = MODULE_AST_SEED_CAP; }
         for (new_cap < needed) { new_cap = new_cap * 2; }
+
         if (s.module_asts == nil) {
-            val ar: Result[**ast.Ast, str] = allocate[*ast.Ast](s.alloc, new_cap::usize);
-            if (is_err[**ast.Ast, str](ar)) { ret err[bool, str](unwrap_err[**ast.Ast, str](ar)); }
-            s.module_asts = unwrap_ok[**ast.Ast, str](ar);
+            val res_alloc: R.Result[**ast.Ast, str] = A.allocate[*ast.Ast](s.alloc, new_cap::usize);
+            if (R.is_err[**ast.Ast, str](res_alloc)) {
+                ret R.err[bool, str](R.unwrap_err[**ast.Ast, str](res_alloc));
+            }
+            s.module_asts = R.unwrap_ok[**ast.Ast, str](res_alloc);
         } or {
-            val rr: Result[**ast.Ast, str] = reallocate[*ast.Ast](s.alloc, s.module_asts, s.module_ast_cap::usize, new_cap::usize);
-            if (is_err[**ast.Ast, str](rr)) { ret err[bool, str](unwrap_err[**ast.Ast, str](rr)); }
-            s.module_asts = unwrap_ok[**ast.Ast, str](rr);
+            val res_realloc: R.Result[**ast.Ast, str] = A.reallocate[*ast.Ast](s.alloc, s.module_asts, s.module_ast_cap::usize, new_cap::usize);
+            if (R.is_err[**ast.Ast, str](res_realloc)) {
+                ret R.err[bool, str](R.unwrap_err[**ast.Ast, str](res_realloc));
+            }
+            s.module_asts = R.unwrap_ok[**ast.Ast, str](res_realloc);
         }
-        var z: u32 = s.module_ast_cap;
-        for (z < new_cap) {
-            s.module_asts[z] = nil;
-            z = z + 1;
+
+        var i: u32 = s.module_ast_cap;
+        for (i < new_cap) {
+            s.module_asts[i] = nil;
+            i = i + 1;
         }
         s.module_ast_cap = new_cap;
     }
+
     s.module_asts[mid::u32] = a;
     if (needed > s.module_ast_count) { s.module_ast_count = needed; }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# module_ast: the registered AST of module `mid`, or nil when the id is out of
-# range or no AST was registered for it.
+# the registered AST of module `mid`, or nil when the id is out of range or no AST
+# was registered for it
 # ---
 # s:   the session
 # mid: project-wide ModuleId to look up
 # ret: borrowed pointer to the module's AST, or nil
-pub fun module_ast(s: *Session, mid: modid.ModuleId) *ast.Ast {
-    if (mid == modid.MODULE_NIL) { ret nil; }
+pub fun module_ast(s: *Session, mid: module.ModuleId) *ast.Ast {
+    if (mid == module.MODULE_NIL)                               { ret nil; }
     if (s.module_asts == nil || mid::u32 >= s.module_ast_count) { ret nil; }
     ret s.module_asts[mid::u32];
 }
 
-# module_count: the number of registered modules — the dense upper bound on
-# ModuleIds (`0 .. module_count`). lets a phase enumerate every loaded module
-# (e.g. to assemble a typing-snapshot set for cross-module lookups).
+# the number of registered modules - the dense upper bound on ModuleIds
+# (`0 .. module_count`)
+#
+# Lets a phase enumerate every loaded module, e.g. to assemble a typing-snapshot
+# set for cross-module lookups.
 # ---
 # s:   the session
 # ret: the registered module count
@@ -347,100 +367,114 @@ pub fun module_count(s: *Session) u32 {
     ret s.module_ast_count;
 }
 
-# register_module_fqn: record `fqn` as the fully-qualified path of module `mid`,
-# so the back-end mangler can name a cross-module symbol against its defining
-# module. populated by the driver alongside register_module_ast. registering the
-# same id twice overwrites.
+# record `fqn` as the fully-qualified path of module `mid`
+#
+# Read by the back-end mangler to name a cross-module symbol against its defining
+# module. Populated by the driver alongside register_module_ast. Registering the
+# same id overwrites.
 # ---
 # s:   the session
 # mid: project-wide ModuleId the fqn belongs to
 # fqn: interned FQN StrId (e.g. "std.allocator")
 # ret: true on success, or an allocation error from the registry map
-pub fun register_module_fqn(s: *Session, mid: modid.ModuleId, fqn: intern.StrId) Result[bool, str] {
-    ret map.insert[modid.ModuleId, intern.StrId](?s.module_fqns, mid, fqn);
+pub fun register_module_fqn(s: *Session, mid: module.ModuleId, fqn: intern.StrId) R.Result[bool, str] {
+    ret map.insert[module.ModuleId, intern.StrId](?s.module_fqns, mid, fqn);
 }
 
-# module_fqn: the registered FQN of module `mid`, or STR_NIL when the id is
-# MODULE_NIL or no FQN was registered for it.
+# the registered FQN of module `mid`, or STR_NIL when the id is MODULE_NIL or no
+# FQN was registered for it
 # ---
 # s:   the session
 # mid: project-wide ModuleId to look up
 # ret: the module's FQN StrId, or intern.STR_NIL
-pub fun module_fqn(s: *Session, mid: modid.ModuleId) intern.StrId {
-    if (mid == modid.MODULE_NIL) { ret intern.STR_NIL; }
-    var key: modid.ModuleId = mid;
-    val r: Result[*intern.StrId, str] = map.get[modid.ModuleId, intern.StrId](?s.module_fqns, ?key);
-    if (is_ok[*intern.StrId, str](r)) { ret @unwrap_ok[*intern.StrId, str](r); }
+pub fun module_fqn(s: *Session, mid: module.ModuleId) intern.StrId {
+    if (mid == module.MODULE_NIL) { ret intern.STR_NIL; }
+    val res_get: R.Result[*intern.StrId, str] = map.get[module.ModuleId, intern.StrId](?s.module_fqns, ?mid);
+    if (R.is_ok[*intern.StrId, str](res_get)) {
+        ret @R.unwrap_ok[*intern.StrId, str](res_get);
+    }
     ret intern.STR_NIL;
 }
 
-# stable_module_id: the build-stable identity of the module named by `fqn`,
-# assigning the next id on first sight and returning the existing one on every
-# later request — across rebuilds too, since the registry persists. this is the
-# cross-build identity the discovery-order ModuleId is NOT: the same FQN keeps
-# the same StableModuleId even when a changed graph shape renumbers ModuleIds.
+# the build-stable identity of the module named by `fqn`, assigning the next id on
+# first sight and returning the existing one on every later request
+#
+# This is the cross-build identity the discovery-order ModuleId is not: the same
+# FQN keeps the same StableModuleId even when a changed graph shape renumbers
+# ModuleIds, since the registry persists across rebuilds.
 # ---
 # s:   the session
 # fqn: interned fully-qualified module path
 # ret: the module's StableModuleId, or an allocation error from the registry map
-pub fun stable_module_id(s: *Session, fqn: intern.StrId) Result[modid.StableModuleId, str] {
-    var key: intern.StrId = fqn;
-    val r: Result[*modid.StableModuleId, str] = map.get[intern.StrId, modid.StableModuleId](?s.stable_ids, ?key);
-    if (is_ok[*modid.StableModuleId, str](r)) { ret ok[modid.StableModuleId, str](@unwrap_ok[*modid.StableModuleId, str](r)); }
+pub fun stable_module_id(s: *Session, fqn: intern.StrId) R.Result[module.StableModuleId, str] {
+    val res_get: R.Result[*module.StableModuleId, str] = map.get[intern.StrId, module.StableModuleId](?s.stable_ids, ?fqn);
+    if (R.is_ok[*module.StableModuleId, str](res_get)) {
+        ret R.ok[module.StableModuleId, str](@R.unwrap_ok[*module.StableModuleId, str](res_get));
+    }
 
-    val id: modid.StableModuleId = s.stable_id_next;
-    val ins: Result[bool, str] = map.insert[intern.StrId, modid.StableModuleId](?s.stable_ids, fqn, id);
-    if (is_err[bool, str](ins)) { ret err[modid.StableModuleId, str](unwrap_err[bool, str](ins)); }
+    val id: module.StableModuleId = s.stable_id_next;
+    val res_insert: R.Result[bool, str] = map.insert[intern.StrId, module.StableModuleId](?s.stable_ids, fqn, id);
+    if (R.is_err[bool, str](res_insert)) {
+        ret R.err[module.StableModuleId, str](R.unwrap_err[bool, str](res_insert));
+    }
     s.stable_id_next = s.stable_id_next + 1;
-    ret ok[modid.StableModuleId, str](id);
+    ret R.ok[module.StableModuleId, str](id);
 }
 
-# stable_module_id_lookup: the StableModuleId already assigned to `fqn`, or
-# STABLE_MODULE_NIL when the module has never been seen. a read-only probe that,
-# unlike stable_module_id, never assigns a new id.
+# the StableModuleId already assigned to `fqn`, or STABLE_MODULE_NIL when the
+# module has never been seen
+#
+# A read-only probe that, unlike stable_module_id, never assigns a new id.
 # ---
 # s:   the session
 # fqn: interned fully-qualified module path
 # ret: the module's StableModuleId, or STABLE_MODULE_NIL
-pub fun stable_module_id_lookup(s: *Session, fqn: intern.StrId) modid.StableModuleId {
-    var key: intern.StrId = fqn;
-    val r: Result[*modid.StableModuleId, str] = map.get[intern.StrId, modid.StableModuleId](?s.stable_ids, ?key);
-    if (is_ok[*modid.StableModuleId, str](r)) { ret @unwrap_ok[*modid.StableModuleId, str](r); }
-    ret modid.STABLE_MODULE_NIL;
+pub fun stable_module_id_lookup(s: *Session, fqn: intern.StrId) module.StableModuleId {
+    val res_get: R.Result[*module.StableModuleId, str] = map.get[intern.StrId, module.StableModuleId](?s.stable_ids, ?fqn);
+    if (R.is_ok[*module.StableModuleId, str](res_get)) {
+        ret @R.unwrap_ok[*module.StableModuleId, str](res_get);
+    }
+    ret module.STABLE_MODULE_NIL;
 }
 
-# register_stable_mid: record that StableModuleId `stable` holds discovery-order
-# ModuleId `mid` in the build currently running. the driver calls this once per
-# module each build (alongside register_module_ast); reset_module_registry clears
-# the table so each build's numbering stands alone. registering twice overwrites.
+# record that StableModuleId `stable` holds discovery-order ModuleId `mid` in the
+# build currently running
+#
+# The driver calls this once per module each build (alongside register_module_ast);
+# reset_module_registry clears the table so each build's numbering stands alone.
+# Registering the same key overwrites.
 # ---
 # s:      the session
 # stable: the module's build-stable identity
 # mid:    the per-build ModuleId it holds this build
 # ret:    true on success, or an allocation error from the registry map
-pub fun register_stable_mid(s: *Session, stable: modid.StableModuleId, mid: modid.ModuleId) Result[bool, str] {
-    ret map.insert[modid.StableModuleId, modid.ModuleId](?s.stable_to_mid, stable, mid);
+pub fun register_stable_mid(s: *Session, stable: module.StableModuleId, mid: module.ModuleId) R.Result[bool, str] {
+    ret map.insert[module.StableModuleId, module.ModuleId](?s.stable_to_mid, stable, mid);
 }
 
-# module_id_for_stable: the current build's ModuleId for StableModuleId `stable`,
-# or MODULE_NIL when `stable` is STABLE_MODULE_NIL or names no module loaded this
-# build. the lookup resolve.remap_result drives to translate a reused result's
-# stale ModuleIds into the active build's numbering (#1582).
+# the current build's ModuleId for StableModuleId `stable`, or MODULE_NIL when
+# `stable` is STABLE_MODULE_NIL or names no module loaded this build
+#
+# The lookup resolve.remap_result drives to translate a reused result's stale
+# ModuleIds into the active build's numbering.
 # ---
 # s:      the session
 # stable: a build-stable module identity
 # ret:    the per-build ModuleId, or MODULE_NIL
-pub fun module_id_for_stable(s: *Session, stable: modid.StableModuleId) modid.ModuleId {
-    if (stable == modid.STABLE_MODULE_NIL) { ret modid.MODULE_NIL; }
-    var key: modid.StableModuleId = stable;
-    val r: Result[*modid.ModuleId, str] = map.get[modid.StableModuleId, modid.ModuleId](?s.stable_to_mid, ?key);
-    if (is_ok[*modid.ModuleId, str](r)) { ret @unwrap_ok[*modid.ModuleId, str](r); }
-    ret modid.MODULE_NIL;
+pub fun module_id_for_stable(s: *Session, stable: module.StableModuleId) module.ModuleId {
+    if (stable == module.STABLE_MODULE_NIL) { ret module.MODULE_NIL; }
+    val res_get: R.Result[*module.ModuleId, str] = map.get[module.StableModuleId, module.ModuleId](?s.stable_to_mid, ?stable);
+    if (R.is_ok[*module.ModuleId, str](res_get)) {
+        ret @R.unwrap_ok[*module.ModuleId, str](res_get);
+    }
+    ret module.MODULE_NIL;
 }
 
-# set_active_project: install (or clear, with nil) the opaque handle to the build's
-# *driver.Project for the span of the resolve pass, so the Q_RESOLVE compute can
-# reach the per-build module graph. stored verbatim and never dereferenced here.
+# install (or clear, with nil) the opaque handle to the build's *driver.Project
+# for the span of the resolve pass
+#
+# Lets the Q_RESOLVE compute reach the per-build module graph. Stored verbatim and
+# never dereferenced here.
 # ---
 # s: the session
 # p: the active Project as `ptr`, or nil to clear
@@ -448,8 +482,10 @@ pub fun set_active_project(s: *Session, p: ptr) {
     s.active_project = p;
 }
 
-# active_project: the opaque *driver.Project handle installed for the running
-# resolve pass, or nil outside one. the caller casts it back to *driver.Project.
+# the opaque *driver.Project handle installed for the running resolve pass, or nil
+# outside one
+#
+# The caller casts it back to *driver.Project.
 # ---
 # s:   the session
 # ret: the active Project `ptr`, or nil
@@ -457,213 +493,237 @@ pub fun active_project(s: *Session) ptr {
     ret s.active_project;
 }
 
-# register_export_name: record a literal link-name override for decl `did` in
-# module `mid`. a decl so registered keeps its literal name through lowering
-# instead of being mangled — the exemption mechanism for `#[symbol(...)]` entry /
-# runtime decorators and `ext fun` foreign symbols. registering twice overwrites.
+# record a literal link-name override for decl `did` in module `mid`
+#
+# A registered decl keeps its literal name through lowering instead of being
+# mangled - the exemption mechanism for `#[symbol(...)]` entry / runtime
+# decorators and `ext fun` foreign symbols. Registering the same key overwrites.
 # ---
 # s:    the session
 # mid:  ModuleId owning the decl
 # did:  DeclId of the overridden function / global in `mid`'s AST
 # name: the literal symbol name to emit
 # ret:  true on success, or an allocation error from the registry map
-pub fun register_export_name(s: *Session, mid: modid.ModuleId, did: u32, name: intern.StrId) Result[bool, str] {
+pub fun register_export_name(s: *Session, mid: module.ModuleId, did: u32, name: intern.StrId) R.Result[bool, str] {
     val key: u64 = (mid::u64 << 32) | did::u64;
     ret map.insert[u64, intern.StrId](?s.export_names, key, name);
 }
 
-# export_name: the literal link-name override registered for decl `did` in
-# module `mid`, or none when the decl is to be mangled normally.
+# the literal link-name override registered for decl `did` in module `mid`, or
+# none when the decl is to be mangled normally
 # ---
 # s:   the session
 # mid: ModuleId owning the decl
 # did: DeclId to look up
 # ret: some(name) when an override is registered, none otherwise
-pub fun export_name(s: *Session, mid: modid.ModuleId, did: u32) Option[intern.StrId] {
+pub fun export_name(s: *Session, mid: module.ModuleId, did: u32) O.Option[intern.StrId] {
     var key: u64 = (mid::u64 << 32) | did::u64;
-    val r: Result[*intern.StrId, str] = map.get[u64, intern.StrId](?s.export_names, ?key);
-    if (is_ok[*intern.StrId, str](r)) { ret some[intern.StrId](@unwrap_ok[*intern.StrId, str](r)); }
-    ret none[intern.StrId]();
+    val res_get: R.Result[*intern.StrId, str] = map.get[u64, intern.StrId](?s.export_names, ?key);
+    if (R.is_ok[*intern.StrId, str](res_get)) {
+        ret O.some[intern.StrId](@R.unwrap_ok[*intern.StrId, str](res_get));
+    }
+    ret O.none[intern.StrId]();
 }
 
-# register_export_library: record the dynamic library a `#[library("...")]`
-# decorator pins decl `did` (an `ext` import) to, keyed by (ModuleId, DeclId). the
-# driver later projects this onto `import_libraries` by the decl's final link name
-# so the back-end linker can attribute the import to a specific dependency.
+# record the dynamic library a `#[library(...)]` decorator pins decl `did` (an
+# `ext` import) to, keyed by (ModuleId, DeclId)
+#
+# The driver later projects this onto import_libraries by the decl's final link
+# name so the linker can attribute the import to a specific dependency.
+# Registering the same key overwrites.
 # ---
-# s:    the session
-# mid:  ModuleId owning the decl
-# did:  DeclId of the `ext` import named by the directive
-# lib:  the library name to pin the import to (e.g. `"ws2_32.dll"`)
-# ret:  true on success, or an allocation error from the registry map
-pub fun register_export_library(s: *Session, mid: modid.ModuleId, did: u32, lib: intern.StrId) Result[bool, str] {
+# s:   the session
+# mid: ModuleId owning the decl
+# did: DeclId of the `ext` import named by the directive
+# lib: the library name to pin the import to (e.g. "ws2_32.dll")
+# ret: true on success, or an allocation error from the registry map
+pub fun register_export_library(s: *Session, mid: module.ModuleId, did: u32, lib: intern.StrId) R.Result[bool, str] {
     val key: u64 = (mid::u64 << 32) | did::u64;
     ret map.insert[u64, intern.StrId](?s.export_libraries, key, lib);
 }
 
-# export_library: the library decl `did` in module `mid` is pinned to by a
-# `#[library(...)]` decorator, or none when the import is unattributed.
+# the library decl `did` in module `mid` is pinned to by a `#[library(...)]`
+# decorator, or none when the import is unattributed
 # ---
 # s:   the session
 # mid: ModuleId owning the decl
 # did: DeclId to look up
 # ret: some(lib) when a library directive is registered, none otherwise
-pub fun export_library(s: *Session, mid: modid.ModuleId, did: u32) Option[intern.StrId] {
+pub fun export_library(s: *Session, mid: module.ModuleId, did: u32) O.Option[intern.StrId] {
     var key: u64 = (mid::u64 << 32) | did::u64;
-    val r: Result[*intern.StrId, str] = map.get[u64, intern.StrId](?s.export_libraries, ?key);
-    if (is_ok[*intern.StrId, str](r)) { ret some[intern.StrId](@unwrap_ok[*intern.StrId, str](r)); }
-    ret none[intern.StrId]();
+    val res_get: R.Result[*intern.StrId, str] = map.get[u64, intern.StrId](?s.export_libraries, ?key);
+    if (R.is_ok[*intern.StrId, str](res_get)) {
+        ret O.some[intern.StrId](@R.unwrap_ok[*intern.StrId, str](res_get));
+    }
+    ret O.none[intern.StrId]();
 }
 
-# register_type_align: record the explicit alignment an `#[align(...)]` decorator
-# pins nominal TypeId `tid` to. folded once by sema; the middle end reads it when
-# lowering the nominal so its IR struct carries the override. registering twice
-# overwrites.
+# record the explicit alignment an `#[align(...)]` decorator pins nominal TypeId
+# `tid` to
+#
+# Folded once by sema; the middle end reads it when lowering the nominal so its IR
+# struct carries the override. Registering the same key overwrites.
 # ---
 # s:     the session
 # tid:   nominal TypeId (a `type.TypeId`, cast to u32)
 # align: the byte alignment (a power of two)
 # ret:   true on success, or an allocation error from the registry map
-pub fun register_type_align(s: *Session, tid: u32, align: u32) Result[bool, str] {
+pub fun register_type_align(s: *Session, tid: u32, align: u32) R.Result[bool, str] {
     ret map.insert[u32, u32](?s.type_aligns, tid, align);
 }
 
-# type_align: the explicit alignment registered for nominal TypeId `tid`, or none
-# when the type uses its natural alignment.
+# the explicit alignment registered for nominal TypeId `tid`, or none when the
+# type uses its natural alignment
 # ---
 # s:   the session
 # tid: nominal TypeId (cast to u32)
 # ret: some(align) when an override is registered, none otherwise
-pub fun type_align(s: *Session, tid: u32) Option[u32] {
-    var key: u32 = tid;
-    val r: Result[*u32, str] = map.get[u32, u32](?s.type_aligns, ?key);
-    if (is_ok[*u32, str](r)) { ret some[u32](@unwrap_ok[*u32, str](r)); }
-    ret none[u32]();
+pub fun type_align(s: *Session, tid: u32) O.Option[u32] {
+    val res_get: R.Result[*u32, str] = map.get[u32, u32](?s.type_aligns, ?tid);
+    if (R.is_ok[*u32, str](res_get)) {
+        ret O.some[u32](@R.unwrap_ok[*u32, str](res_get));
+    }
+    ret O.none[u32]();
 }
 
-# register_import_library: pin the import emitted under link name `name` to
-# library `lib`. the driver builds this link-name-keyed projection of the
-# per-decl `export_libraries` once link names are final; the linker reads it to
-# route each import to its dependency. registering twice overwrites.
+# pin the import emitted under link name `name` to library `lib`
+#
+# The driver builds this link-name-keyed projection of the per-decl
+# export_libraries once link names are final; the linker reads it to route each
+# import to its dependency. Registering the same key overwrites.
 # ---
 # s:    the session
 # name: the import's final link symbol name (the object symbol the linker sees)
 # lib:  the library name to pin it to
 # ret:  true on success, or an allocation error from the registry map
-pub fun register_import_library(s: *Session, name: intern.StrId, lib: intern.StrId) Result[bool, str] {
+pub fun register_import_library(s: *Session, name: intern.StrId, lib: intern.StrId) R.Result[bool, str] {
     ret map.insert[intern.StrId, intern.StrId](?s.import_libraries, name, lib);
 }
 
-# import_library: the library the import emitted under link symbol `name` is
-# pinned to, or none when the import is unattributed (binds to the first
-# dependency).
+# the library the import emitted under link symbol `name` is pinned to, or none
+# when the import is unattributed (binds to the first dependency)
 # ---
 # s:    the session
 # name: the import's link symbol name
 # ret:  some(lib) when the import is pinned, none otherwise
-pub fun import_library(s: *Session, name: intern.StrId) Option[intern.StrId] {
-    val r: Result[*intern.StrId, str] = map.get[intern.StrId, intern.StrId](?s.import_libraries, ?name);
-    if (is_ok[*intern.StrId, str](r)) { ret some[intern.StrId](@unwrap_ok[*intern.StrId, str](r)); }
-    ret none[intern.StrId]();
+pub fun import_library(s: *Session, name: intern.StrId) O.Option[intern.StrId] {
+    val res_get: R.Result[*intern.StrId, str] = map.get[intern.StrId, intern.StrId](?s.import_libraries, ?name);
+    if (R.is_ok[*intern.StrId, str](res_get)) {
+        ret O.some[intern.StrId](@R.unwrap_ok[*intern.StrId, str](res_get));
+    }
+    ret O.none[intern.StrId]();
 }
 
-# register_module_sema: record module `mid`'s `*sema.SemaResult` (passed as an
-# opaque `ptr`) so the back-end monomorphizer can lower a generic template body
-# against the declaring module's typing. the caller owns the storage and must
-# keep it alive for the build's lifetime.
+# record module `mid`'s `*sema.SemaResult` (passed as an opaque `ptr`)
+#
+# Lets the back-end monomorphizer lower a generic template body against the
+# declaring module's typing. The caller owns the storage and must keep it alive
+# for the build's lifetime.
 # ---
 # s:   the session
 # mid: ModuleId the result belongs to
 # p:   the module's SemaResult, cast to `ptr`
 # ret: true on success, or an allocation error from the registry map
-pub fun register_module_sema(s: *Session, mid: modid.ModuleId, p: ptr) Result[bool, str] {
-    ret map.insert[modid.ModuleId, ptr](?s.module_sema, mid, p);
+pub fun register_module_sema(s: *Session, mid: module.ModuleId, p: ptr) R.Result[bool, str] {
+    ret map.insert[module.ModuleId, ptr](?s.module_sema, mid, p);
 }
 
-# module_sema_ptr: module `mid`'s registered SemaResult as an opaque `ptr`, or
-# nil when none is registered. the caller casts it back to `*sema.SemaResult`.
+# module `mid`'s registered SemaResult as an opaque `ptr`, or nil when none is
+# registered
+#
+# The caller casts it back to *sema.SemaResult.
 # ---
 # s:   the session
 # mid: ModuleId to look up
 # ret: the SemaResult `ptr`, or nil
-pub fun module_sema_ptr(s: *Session, mid: modid.ModuleId) ptr {
-    var key: modid.ModuleId = mid;
-    val r: Result[*ptr, str] = map.get[modid.ModuleId, ptr](?s.module_sema, ?key);
-    if (is_ok[*ptr, str](r)) { ret @unwrap_ok[*ptr, str](r); }
+pub fun module_sema_ptr(s: *Session, mid: module.ModuleId) ptr {
+    val res_get: R.Result[*ptr, str] = map.get[module.ModuleId, ptr](?s.module_sema, ?mid);
+    if (R.is_ok[*ptr, str](res_get)) {
+        ret @R.unwrap_ok[*ptr, str](res_get);
+    }
     ret nil;
 }
 
-# register_module_resolve: record module `mid`'s `*resolve.ResolveResult` as an
-# opaque `ptr`, the name-resolution twin of register_module_sema.
+# record module `mid`'s `*resolve.ResolveResult` as an opaque `ptr`, the
+# name-resolution twin of register_module_sema
 # ---
 # s:   the session
 # mid: ModuleId the result belongs to
 # p:   the module's ResolveResult, cast to `ptr`
 # ret: true on success, or an allocation error from the registry map
-pub fun register_module_resolve(s: *Session, mid: modid.ModuleId, p: ptr) Result[bool, str] {
-    ret map.insert[modid.ModuleId, ptr](?s.module_resolve, mid, p);
+pub fun register_module_resolve(s: *Session, mid: module.ModuleId, p: ptr) R.Result[bool, str] {
+    ret map.insert[module.ModuleId, ptr](?s.module_resolve, mid, p);
 }
 
-# module_resolve_ptr: module `mid`'s registered ResolveResult as an opaque
-# `ptr`, or nil. the caller casts it back to `*resolve.ResolveResult`.
+# module `mid`'s registered ResolveResult as an opaque `ptr`, or nil
+#
+# The caller casts it back to *resolve.ResolveResult.
 # ---
 # s:   the session
 # mid: ModuleId to look up
 # ret: the ResolveResult `ptr`, or nil
-pub fun module_resolve_ptr(s: *Session, mid: modid.ModuleId) ptr {
-    var key: modid.ModuleId = mid;
-    val r: Result[*ptr, str] = map.get[modid.ModuleId, ptr](?s.module_resolve, ?key);
-    if (is_ok[*ptr, str](r)) { ret @unwrap_ok[*ptr, str](r); }
+pub fun module_resolve_ptr(s: *Session, mid: module.ModuleId) ptr {
+    val res_get: R.Result[*ptr, str] = map.get[module.ModuleId, ptr](?s.module_resolve, ?mid);
+    if (R.is_ok[*ptr, str](res_get)) {
+        ret @R.unwrap_ok[*ptr, str](res_get);
+    }
     ret nil;
 }
 
-# register_module_comptime: record module `mid`'s `*comptime.ComptimeCtx` as an
-# opaque `ptr`, the comptime twin of register_module_sema. the back-end value-
-# parameter monomorphizer casts it back to bind `$param -> CTValue` and fold a
-# value-instance body's `$if` gates against the comptime constants of the module
-# that declared the function, not the calling module's.
+# record module `mid`'s `*comptime.ComptimeCtx` as an opaque `ptr`, the comptime
+# twin of register_module_sema
+#
+# The back-end value-parameter monomorphizer casts it back to bind `$param ->
+# CTValue` and fold a value-instance body's `$if` gates against the comptime
+# constants of the module that declared the function, not the calling module's.
 # ---
 # s:   the session
 # mid: ModuleId the context belongs to
 # p:   the module's ComptimeCtx, cast to `ptr`
 # ret: true on success, or an allocation error from the registry map
-pub fun register_module_comptime(s: *Session, mid: modid.ModuleId, p: ptr) Result[bool, str] {
-    ret map.insert[modid.ModuleId, ptr](?s.module_comptime, mid, p);
+pub fun register_module_comptime(s: *Session, mid: module.ModuleId, p: ptr) R.Result[bool, str] {
+    ret map.insert[module.ModuleId, ptr](?s.module_comptime, mid, p);
 }
 
-# module_comptime_ptr: module `mid`'s registered ComptimeCtx as an opaque `ptr`,
-# or nil. the caller casts it back to `*comptime.ComptimeCtx`.
+# module `mid`'s registered ComptimeCtx as an opaque `ptr`, or nil
+#
+# The caller casts it back to *comptime.ComptimeCtx.
 # ---
 # s:   the session
 # mid: ModuleId to look up
 # ret: the ComptimeCtx `ptr`, or nil
-pub fun module_comptime_ptr(s: *Session, mid: modid.ModuleId) ptr {
-    var key: modid.ModuleId = mid;
-    val r: Result[*ptr, str] = map.get[modid.ModuleId, ptr](?s.module_comptime, ?key);
-    if (is_ok[*ptr, str](r)) { ret @unwrap_ok[*ptr, str](r); }
+pub fun module_comptime_ptr(s: *Session, mid: module.ModuleId) ptr {
+    val res_get: R.Result[*ptr, str] = map.get[module.ModuleId, ptr](?s.module_comptime, ?mid);
+    if (R.is_ok[*ptr, str](res_get)) {
+        ret @R.unwrap_ok[*ptr, str](res_get);
+    }
     ret nil;
 }
 
-# load_source: register a source file with the session and return its FileId.
-# delegates to source.load, which dedups by path: a path loaded for the first
-# time is appended, a path already loaded reuses its FileId and is text-swapped
-# in place — so a long-lived session (an LSP reloading on save) does not grow on
-# reload. the loaded text is then mirrored into the Q_FILE_TEXT query input,
-# keyed by FileId: set_input's byte-equality cutoff leaves the input's
-# last_changed untouched for an unchanged reload (so a dependent Q_PARSE entry
-# stays valid and the AST is reused) and advances it on a real edit (so Q_PARSE
-# recomputes).
+# register a source file with the session and return its FileId
+#
+# Delegates to source.load, which dedups by path: a first-seen path is appended, a
+# known path reuses its FileId and is text-swapped in place, so a long-lived
+# session (an LSP reloading on save) does not grow on reload. The loaded text is
+# then mirrored into the Q_FILE_TEXT query input keyed by FileId; set_input's
+# byte-equality cutoff leaves the input unchanged on an identical reload (so a
+# dependent Q_PARSE entry stays valid and the AST is reused) and advances it on a
+# real edit (so Q_PARSE recomputes).
 # ---
 # s:    the session
 # path: file path to associate with this file
 # text: null-terminated source text to index and store
-# ret:  FileId the path is registered under (stable across reloads of the same path), or an allocation error
-pub fun load_source(s: *Session, path: str, text: str) Result[source.FileId, str] {
-    val fid_r: Result[source.FileId, str] = source.load(?s.sources, ?s.queries, ?s.interner, path, text);
-    if (is_err[source.FileId, str](fid_r)) { ret fid_r; }
-    val fid: source.FileId = unwrap_ok[source.FileId, str](fid_r);
+# ret:  FileId the path is registered under (stable across reloads), or an allocation error
+pub fun load_source(s: *Session, path: str, text: str) R.Result[source.FileId, str] {
+    val res_fid: R.Result[source.FileId, str] = source.load(?s.sources, ?s.queries, ?s.interner, path, text);
+    if (R.is_err[source.FileId, str](res_fid)) {
+        ret res_fid;
+    }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val si_r: Result[bool, str] = query.set_input(?s.queries, query.Q_FILE_TEXT, fid::u64, text::*u8, str_len(text)::u32);
-    if (is_err[bool, str](si_r)) { ret err[source.FileId, str](unwrap_err[bool, str](si_r)); }
-    ret ok[source.FileId, str](fid);
+    val res_input: R.Result[bool, str] = query.set_input(?s.queries, query.Q_FILE_TEXT, fid::u64, text::*u8, str_len(text)::u32);
+    if (R.is_err[bool, str](res_input)) {
+        ret R.err[source.FileId, str](R.unwrap_err[bool, str](res_input));
+    }
+    ret R.ok[source.FileId, str](fid);
 }
