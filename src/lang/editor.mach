@@ -1,109 +1,92 @@
-# mach.lang.editor: the compiler-as-library query surface for editor tooling.
+# the compiler-as-library query surface for editor tooling.
 #
-# the single entry every editor (LSP server, plugin) binds to. an editor
-# holds dirty, possibly-broken in-memory buffers and wants best-effort
-# analysis of one buffer at a time without a full `driver.build_project`.
-# this module is that path: register a buffer's TEXT directly, then ask for
-# its tokens, its parsed `ast.Ast`, its `res.ResolveResult` side tables,
-# or its diagnostics — each tolerant of a malformed buffer, each returning a
-# usable partial result rather than bailing at the first error.
+# the single entry an editor (LSP server, plugin) binds to. an editor holds
+# dirty, possibly-broken in-memory buffers and wants best-effort analysis of one
+# buffer at a time, without a full `driver.build_project`. register a buffer's
+# text directly, then ask for its tokens, its parsed `ast.Ast`, its
+# `res.ResolveResult` side tables, or its diagnostics. each phase tolerates a
+# malformed buffer and returns a usable partial result rather than bailing at the
+# first error.
 #
-# an `EditorSession` borrows a caller-owned `session.Session` (whose
-# `SourceMap` holds the buffer text and whose `DiagList` collects every
-# phase's diagnostics) and owns one `*ast.Ast` plus one `*res.ResolveResult`
-# per registered buffer, indexed by `source.FileId`. teardown frees those.
+# an `EditorSession` borrows a caller-owned `session.Session` (whose `SourceMap`
+# holds the buffer text and whose `DiagList` collects diagnostics) and owns one
+# `*ast.Ast` plus one `*res.ResolveResult` per registered buffer, keyed by
+# `source.FileId`. teardown frees those; the borrowed session is left untouched.
 #
-# diagnostics are the proven first consumer slice: `diagnostics` runs
-# tokenize -> emit-lex-errors -> parse and leaves every reported span on the
-# session's `DiagList` for the editor to translate into LSP `Diagnostic`s.
-# resolution layers the `ResolveResult` side tables on top for the
-# hover / go-to-def / references features that pivot on offset -> id lookup
-# (see `ast.offset_to_expr` and friends).
+# a buffer is resolved in isolation against an empty dependency set, so local
+# names bind while cross-module references resolve to SYMBOL_NIL. its comptime
+# context is seeded from the host target, so `$if` predicates evaluate against
+# the running compiler rather than an unknown placeholder.
 #
-# this surface deliberately drives the front-end phases directly rather than
-# routing through `query.QueryDb.get(Q_PARSE / Q_RESOLVE)`. load_source already
-# mirrors the buffer text into the `Q_FILE_TEXT` query input, and the driver
-# registers the `Q_PARSE` derived shard (#1580), but the editor keeps its own
-# per-buffer parse path for now; routing these entries through `get` lands with
-# the LSP query integration (lsp #117) without changing this module's signatures.
+# this surface drives the front-end phases directly rather than routing through
+# `query.QueryDb.get`. routing these entries through `get` lands with the LSP
+# query integration without changing this module's signatures.
 
+use std.allocator.page;
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_contains;
-use std.types.result.Result;
-use std.types.result.ok;
-use std.types.result.err;
-use std.types.result.is_ok;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.unwrap_err;
 
-use std.types.option.Option;
-use std.types.option.some;
-use std.types.option.none;
-use std.types.option.is_none;
-use std.types.option.unwrap;
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
 
-use std.allocator.Allocator;
-use std.allocator.allocate;
-use std.allocator.deallocate;
-use std.allocator.reallocate;
+use mach.lang.diagnostic;
+use mach.lang.fe.ast;
+use mach.lang.fe.ast.id;
+use mach.lang.fe.comptime;
+use mach.lang.fe.lexer;
+use mach.lang.fe.parser;
+use res: mach.lang.fe.resolve;
+use mach.lang.fe.sema;
+use mach.lang.fe.sema.context;
+use mach.lang.intern;
+use mach.lang.session;
+use mach.lang.source;
+use mach.lang.target;
 
-use page: std.allocator.page;
-
-use sess:    mach.lang.session;
-use src:     mach.lang.source;
-use diag:    mach.lang.diagnostic;
-use lexer:   mach.lang.fe.lexer;
-use parser:  mach.lang.fe.parser;
-use res:     mach.lang.fe.resolve;
-use sema:    mach.lang.fe.sema;
-use ctxm:    mach.lang.fe.sema.context;
-use comptime: mach.lang.fe.comptime;
-use ast:     mach.lang.fe.ast;
-use id:      mach.lang.fe.ast.id;
-use intern:  mach.lang.intern;
-use target:  mach.lang.target;
-
-# Buffer: the per-file analysis state the editor session owns for one
-# registered buffer.
+# the per-buffer analysis state an EditorSession owns for one registered file
 # ---
-# file_id:  source FileId the buffer is registered under
-# in_use:   whether this slot holds a live buffer (slots are indexed by FileId)
-# a:        owned parsed Ast, or nil before the first `parse`
-# rr:       owned ResolveResult side tables, or nil before the first `resolve`
-# ctx:      comptime context resolve mutates; seeded from the host target
+# file_id: FileId the buffer is registered under
+# in_use:  whether this slot holds a live buffer (slots are indexed by FileId)
+# a:       owned parsed Ast, or nil before the first parse
+# rr:      owned ResolveResult side tables, or nil before the first resolve
+# ctx:     comptime context resolve evaluates against; a dnit-safe value at all times
 pub rec Buffer {
-    file_id: src.FileId;
+    file_id: source.FileId;
     in_use:  bool;
     a:       *ast.Ast;
     rr:      *res.ResolveResult;
     ctx:     comptime.ComptimeCtx;
 }
 
-# EditorSession: the editor-facing facade over a borrowed compiler session.
+# the editor-facing facade over a borrowed compiler session
 # ---
-# s:        borrowed session; owns the SourceMap (buffer text) and DiagList
-# alloc:    allocator for the buffer registry and the per-buffer Ast / ResolveResult
-# buffers:  registry of Buffers indexed by FileId
-# buf_len:  number of slots in `buffers`
+# s:       borrowed session; owns the SourceMap (buffer text) and DiagList
+# alloc:   allocator for the buffer registry and per-buffer analysis
+# buffers: Buffer registry indexed by FileId
+# buf_len: number of slots in `buffers`
 pub rec EditorSession {
-    s:       *sess.Session;
-    alloc:   *Allocator;
+    s:       *session.Session;
+    alloc:   *A.Allocator;
     buffers: *Buffer;
     buf_len: u32;
 }
 
-# init: construct an editor session over a caller-owned compiler session.
-# the session must outlive the editor session; the editor borrows its
-# SourceMap and DiagList and never tears them down.
+# seed slot count for the buffer registry on its first growth
+val BUFFERS_SEED: u32 = 8;
+
+# construct an editor session over a caller-owned compiler session
+#
+# The session must outlive the editor session; the editor borrows its SourceMap
+# and DiagList and never tears them down.
 # ---
-# s: the compiler session whose SourceMap and DiagList back this editor
+# s:   the compiler session whose SourceMap and DiagList back this editor
 # ret: a new empty EditorSession
-pub fun init(s: *sess.Session) EditorSession {
+pub fun init(s: *session.Session) EditorSession {
     var es: EditorSession;
     es.s       = s;
     es.alloc   = s.alloc;
@@ -112,309 +95,356 @@ pub fun init(s: *sess.Session) EditorSession {
     ret es;
 }
 
-# dnit: release every owned Ast, ResolveResult, and comptime context, plus
-# the buffer registry. the borrowed session is left untouched.
+# release every owned Ast, ResolveResult, and comptime context, plus the buffer
+# registry; the borrowed session is left untouched
 # ---
-# es: the editor session to tear down; all owned fields are zeroed
+# es: the editor session to tear down
 pub fun dnit(es: *EditorSession) {
     if (es == nil) { ret; }
     if (es.buffers != nil && es.buf_len > 0) {
         var i: u32 = 0;
         for (i < es.buf_len) {
-            free_buffer(es, ?es.buffers[i]);
+            buffer_free(es, ?es.buffers[i]);
             i = i + 1;
         }
-        deallocate[Buffer](es.alloc, es.buffers, es.buf_len::usize);
+        A.deallocate[Buffer](es.alloc, es.buffers, es.buf_len::usize);
     }
     es.buffers = nil;
     es.buf_len = 0;
 }
 
-# open: register an unsaved buffer's TEXT directly and return its FileId.
-# this is the editor's entry into the compiler without a build_project:
-# the text is loaded into the session's SourceMap (bumping the query DB
-# revision so any derived entry over this file invalidates), and a fresh
-# analysis slot is reserved for it. the buffer is not yet parsed.
+# register an unsaved buffer's text and return its FileId
+#
+# The text is copied into the session's SourceMap and a fresh analysis slot is
+# reserved. The buffer is not yet parsed.
 # ---
 # es:   the editor session
 # path: a display path for the buffer (the LSP document URI, or any label)
 # text: the buffer's full source text; copied into the session
 # ret:  the FileId the buffer is registered under, or an allocation error
-pub fun open(es: *EditorSession, path: str, text: str) Result[src.FileId, str] {
-    val fid_r: Result[src.FileId, str] = sess.load_source(es.s, path, text);
-    if (is_err[src.FileId, str](fid_r)) { ret fid_r; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fid_r);
+pub fun open(es: *EditorSession, path: str, text: str) R.Result[source.FileId, str] {
+    val res_fid: R.Result[source.FileId, str] = session.load_source(es.s, path, text);
+    if (R.is_err[source.FileId, str](res_fid)) { ret res_fid; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val br: Result[*Buffer, str] = ensure_slot(es, fid);
-    if (is_err[*Buffer, str](br)) { ret err[src.FileId, str](unwrap_err[*Buffer, str](br)); }
-
-    ret ok[src.FileId, str](fid);
+    val res_slot: R.Result[*Buffer, str] = slot_ensure(es, fid);
+    if (R.is_err[*Buffer, str](res_slot)) {
+        ret R.err[source.FileId, str](R.unwrap_err[*Buffer, str](res_slot));
+    }
+    ret R.ok[source.FileId, str](fid);
 }
 
-# update: replace the text of an already-open buffer (an editor keystroke
-# edit). the session's SourceMap text is rebuilt and the query DB revision
-# bumped; the buffer's cached Ast and ResolveResult are dropped so the next
-# `parse` / `resolve` recomputes against the new text. out-of-range or
-# never-opened ids are a no-op returning false.
+# replace the text of an open buffer, dropping its cached analysis
+#
+# The SourceMap text is rebuilt and the next parse / resolve recomputes against
+# it. An unknown or out-of-range id is a no-op returning false.
 # ---
 # es:   the editor session
 # fid:  FileId of the buffer to replace
 # text: the buffer's new full source text
 # ret:  true when the buffer was updated, false when fid is unknown, or an allocation error
-pub fun update(es: *EditorSession, fid: src.FileId, text: str) Result[bool, str] {
-    val b: *Buffer = slot(es, fid);
-    if (b == nil || !b.in_use) { ret ok[bool, str](false); }
+pub fun update(es: *EditorSession, fid: source.FileId, text: str) R.Result[bool, str] {
+    val b: *Buffer = slot_live(es, fid);
+    if (b == nil) { ret R.ok[bool, str](false); }
 
-    val ur: Result[bool, str] = src.update(?es.s.sources, ?es.s.queries, fid, text);
-    if (is_err[bool, str](ur)) { ret ur; }
-    if (!unwrap_ok[bool, str](ur)) { ret ok[bool, str](false); }
+    val res_update: R.Result[bool, str] = source.update(?es.s.sources, ?es.s.queries, fid, text);
+    if (R.is_err[bool, str](res_update))     { ret res_update; }
+    if (!R.unwrap_ok[bool, str](res_update)) { ret R.ok[bool, str](false); }
 
-    drop_analysis(es, b);
-    ret ok[bool, str](true);
+    analysis_drop(es, b);
+    ret R.ok[bool, str](true);
 }
 
-# reset_diags: replace the borrowed session DiagList with a fresh empty one so a
-# public analysis entry reflects only its own current run. the single owner of
-# the editor's diagnostic-reset policy: every public entry point resets on the
-# way in, and the internal `*_inner` workers never touch the lifecycle, so
-# repeated calls cannot accumulate duplicates and analyses of different buffers
-# never mix on the list.
-fun reset_diags(es: *EditorSession) {
-    diag.dnit(?es.s.diags);
-    es.s.diags = diag.init(es.alloc);
-}
-
-# tokenize: lex the buffer and surface any lex errors as diagnostics on the
-# session's DiagList. returns the owning TokenStream; the caller frees it
-# with `lexer.dnit`. malformed input is recorded, never aborted. resets the
-# session DiagList so the result reflects only this buffer's lex pass.
+# lex an open buffer, surfacing lex errors as diagnostics
+#
+# Returns the owning TokenStream; the caller frees it with `lexer.dnit`.
+# Malformed input is recorded, never aborted. Resets the session DiagList so the
+# result reflects only this buffer's lex pass.
 # ---
 # es:  the editor session
 # fid: FileId of an open buffer
 # ret: the owning TokenStream, or an error when fid is unknown / on allocation failure
-pub fun tokenize(es: *EditorSession, fid: src.FileId) Result[lexer.TokenStream, str] {
-    reset_diags(es);
+pub fun tokenize(es: *EditorSession, fid: source.FileId) R.Result[lexer.TokenStream, str] {
+    diags_reset(es);
     ret tokenize_inner(es, fid);
 }
 
-# tokenize_inner: the lex pass without the diagnostic reset, so callers that
-# already reset (parse / diagnostics) do not wipe accumulated diagnostics.
-fun tokenize_inner(es: *EditorSession, fid: src.FileId) Result[lexer.TokenStream, str] {
-    val fopt: Option[*src.SourceFile] = src.get(?es.s.sources, fid);
-    if (is_none[*src.SourceFile](fopt)) {
-        ret err[lexer.TokenStream, str]("editor: buffer not open");
-    }
-    val file: *src.SourceFile = unwrap[*src.SourceFile](fopt);
-
-    val tr: Result[lexer.TokenStream, str] = lexer.tokenize(file.text, es.alloc, fid);
-    if (is_err[lexer.TokenStream, str](tr)) { ret tr; }
-    var stream: lexer.TokenStream = unwrap_ok[lexer.TokenStream, str](tr);
-
-    val er: Result[bool, str] = lexer.emit_diagnostics(?stream, ?es.s.diags);
-    if (is_err[bool, str](er)) {
-        lexer.dnit(?stream, es.alloc);
-        ret err[lexer.TokenStream, str](unwrap_err[bool, str](er));
-    }
-    ret ok[lexer.TokenStream, str](stream);
-}
-
-# parse: tokenize and parse the buffer best-effort, returning its `ast.Ast`.
-# lex errors and parse errors land on the session's DiagList; the AST is a
-# usable partial tree even for a broken buffer. the returned Ast is owned by
-# the editor session and cached for this buffer — repeated calls reparse and
-# replace the cached tree. drives `ast.offset_to_*` for position lookups.
+# tokenize and parse an open buffer best-effort, returning its Ast
+#
+# Lex and parse errors land on the session DiagList; the AST is a usable partial
+# tree even for a broken buffer. The returned Ast is owned by the editor and
+# cached for this buffer; repeated calls reparse and replace it.
 # ---
 # es:  the editor session
 # fid: FileId of an open buffer
 # ret: a borrowed pointer to the buffer's parsed Ast, or an error when fid is unknown / on allocation failure
-pub fun parse(es: *EditorSession, fid: src.FileId) Result[*ast.Ast, str] {
-    reset_diags(es);
+pub fun parse(es: *EditorSession, fid: source.FileId) R.Result[*ast.Ast, str] {
+    diags_reset(es);
     ret parse_inner(es, fid);
 }
 
-# parse_inner: the tokenize + parse pass without the diagnostic reset, shared by
-# the public `parse`, `resolve`, and `diagnostics` entries (each of which resets
-# once on the way in).
-fun parse_inner(es: *EditorSession, fid: src.FileId) Result[*ast.Ast, str] {
-    val b: *Buffer = slot(es, fid);
-    if (b == nil || !b.in_use) { ret err[*ast.Ast, str]("editor: buffer not open"); }
+# name-resolve an open buffer best-effort, returning its ResolveResult tables
+#
+# Parses first if needed. The buffer is resolved in isolation against an empty
+# dependency set, so cross-module references resolve to SYMBOL_NIL while local
+# names bind. Name errors land on the session DiagList. The returned
+# ResolveResult is owned by the editor and cached.
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# ret: a borrowed pointer to the buffer's ResolveResult, or an error when fid is unknown / on allocation failure
+pub fun resolve(es: *EditorSession, fid: source.FileId) R.Result[*res.ResolveResult, str] {
+    diags_reset(es);
 
-    val tr: Result[lexer.TokenStream, str] = tokenize_inner(es, fid);
-    if (is_err[lexer.TokenStream, str](tr)) { ret err[*ast.Ast, str](unwrap_err[lexer.TokenStream, str](tr)); }
-    var stream: lexer.TokenStream = unwrap_ok[lexer.TokenStream, str](tr);
+    val b: *Buffer = slot_live(es, fid);
+    if (b == nil) { ret R.err[*res.ResolveResult, str]("editor: buffer not open"); }
 
-    drop_analysis(es, b);
-
-    val ar: Result[*ast.Ast, str] = alloc_ast(es, fid);
-    if (is_err[*ast.Ast, str](ar)) {
-        lexer.dnit(?stream, es.alloc);
-        ret ar;
+    if (b.a == nil) {
+        val res_parse: R.Result[*ast.Ast, str] = parse_inner(es, fid);
+        if (R.is_err[*ast.Ast, str](res_parse)) {
+            ret R.err[*res.ResolveResult, str](R.unwrap_err[*ast.Ast, str](res_parse));
+        }
     }
-    val a: *ast.Ast = unwrap_ok[*ast.Ast, str](ar);
+
+    var deps: res.ResolveDeps;
+    deps.entries = nil;
+    deps.count   = 0;
+    ret buffer_resolve(es, b, ?deps);
+}
+
+# analyze an open buffer and return the session DiagList of reported diagnostics
+#
+# Runs tokenize -> emit-lex-errors -> parse, so the list reflects the buffer's
+# syntactic diagnostics. The DiagList is borrowed from the session and reset on
+# entry so the result reflects only this buffer's current analysis.
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# ret: a borrowed pointer to the session DiagList, or an error when fid is unknown / on allocation failure
+pub fun diagnostics(es: *EditorSession, fid: source.FileId) R.Result[*diagnostic.DiagList, str] {
+    diags_reset(es);
+
+    val res_parse: R.Result[*ast.Ast, str] = parse_inner(es, fid);
+    if (R.is_err[*ast.Ast, str](res_parse)) {
+        ret R.err[*diagnostic.DiagList, str](R.unwrap_err[*ast.Ast, str](res_parse));
+    }
+    ret R.ok[*diagnostic.DiagList, str](?es.s.diags);
+}
+
+# the buffer's cached parsed Ast, or nil when it has not been parsed
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# ret: a borrowed pointer to the cached Ast, or nil
+pub fun ast_of(es: *EditorSession, fid: source.FileId) *ast.Ast {
+    val b: *Buffer = slot_live(es, fid);
+    if (b == nil) { ret nil; }
+    ret b.a;
+}
+
+# the buffer's cached ResolveResult, or nil when it has not been resolved
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# ret: a borrowed pointer to the cached ResolveResult, or nil
+pub fun resolve_of(es: *EditorSession, fid: source.FileId) *res.ResolveResult {
+    val b: *Buffer = slot_live(es, fid);
+    if (b == nil) { ret nil; }
+    ret b.rr;
+}
+
+# replace the borrowed session DiagList with a fresh empty one
+#
+# The single owner of the editor's diagnostic-reset policy: every public
+# analysis entry resets on the way in, and the `*_inner` workers never touch the
+# lifecycle, so repeated calls cannot accumulate duplicates.
+# ---
+# es: the editor session
+fun diags_reset(es: *EditorSession) {
+    diagnostic.dnit(?es.s.diags);
+    es.s.diags = diagnostic.init(es.alloc);
+}
+
+# the lex pass without the diagnostic reset, shared by `tokenize` and `parse_inner`
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# ret: the owning TokenStream, or an error when fid is unknown / on allocation failure
+fun tokenize_inner(es: *EditorSession, fid: source.FileId) R.Result[lexer.TokenStream, str] {
+    val opt_file: O.Option[*source.SourceFile] = source.get(?es.s.sources, fid);
+    if (O.is_none[*source.SourceFile](opt_file)) {
+        ret R.err[lexer.TokenStream, str]("editor: buffer not open");
+    }
+    val file: *source.SourceFile = O.unwrap[*source.SourceFile](opt_file);
+
+    val res_tokens: R.Result[lexer.TokenStream, str] = lexer.tokenize(file.text, es.alloc, fid);
+    if (R.is_err[lexer.TokenStream, str](res_tokens)) { ret res_tokens; }
+    var stream: lexer.TokenStream = R.unwrap_ok[lexer.TokenStream, str](res_tokens);
+
+    val res_emit: R.Result[bool, str] = lexer.emit_diagnostics(?stream, ?es.s.diags);
+    if (R.is_err[bool, str](res_emit)) {
+        lexer.dnit(?stream, es.alloc);
+        ret R.err[lexer.TokenStream, str](R.unwrap_err[bool, str](res_emit));
+    }
+    ret R.ok[lexer.TokenStream, str](stream);
+}
+
+# the tokenize + parse pass without the diagnostic reset, shared by the public
+# `parse`, `resolve`, and `diagnostics` entries
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# ret: a borrowed pointer to the buffer's parsed Ast, or an error
+fun parse_inner(es: *EditorSession, fid: source.FileId) R.Result[*ast.Ast, str] {
+    val b: *Buffer = slot_live(es, fid);
+    if (b == nil) { ret R.err[*ast.Ast, str]("editor: buffer not open"); }
+
+    val res_tokens: R.Result[lexer.TokenStream, str] = tokenize_inner(es, fid);
+    if (R.is_err[lexer.TokenStream, str](res_tokens)) {
+        ret R.err[*ast.Ast, str](R.unwrap_err[lexer.TokenStream, str](res_tokens));
+    }
+    var stream: lexer.TokenStream = R.unwrap_ok[lexer.TokenStream, str](res_tokens);
+
+    analysis_drop(es, b);
+
+    val res_ast: R.Result[*ast.Ast, str] = ast_alloc(es, fid);
+    if (R.is_err[*ast.Ast, str](res_ast)) {
+        lexer.dnit(?stream, es.alloc);
+        ret res_ast;
+    }
+    val a: *ast.Ast = R.unwrap_ok[*ast.Ast, str](res_ast);
 
     parser.parse(?stream, a, ?es.s.diags);
     lexer.dnit(?stream, es.alloc);
 
     b.a = a;
-    ret ok[*ast.Ast, str](a);
+    ret R.ok[*ast.Ast, str](a);
 }
 
-# resolve: name-resolve the buffer best-effort, returning its
-# `res.ResolveResult` side tables (expr_resolved / type_resolved /
-# decl_symbol). parses first if needed. dependencies are not resolved — the
-# buffer is analyzed in isolation with an empty dep set, so cross-module
-# references resolve to SYMBOL_NIL while everything local still binds. name
-# errors land on the session's DiagList; the side tables remain usable. the
-# returned ResolveResult is owned by the editor session and cached.
+# re-resolve a parsed buffer against `deps`, replacing its cached ResolveResult,
+# and return a borrowed pointer to the new side tables
+#
+# The comptime context is reseeded from the host target first. The buffer must
+# already hold a parsed Ast. Shared by the public `resolve` (empty deps) and the
+# test-only `t_resolve_deps` (explicit deps).
 # ---
-# es:  the editor session
-# fid: FileId of an open buffer
-# ret: a borrowed pointer to the buffer's ResolveResult, or an error when fid is unknown / on allocation failure
-pub fun resolve(es: *EditorSession, fid: src.FileId) Result[*res.ResolveResult, str] {
-    reset_diags(es);
+# es:   the editor session
+# b:    the buffer to resolve; its `a` must be non-nil
+# deps: the dependency set to resolve against
+# ret:  a borrowed pointer to the cached ResolveResult, or an error
+fun buffer_resolve(es: *EditorSession, b: *Buffer, deps: *res.ResolveDeps) R.Result[*res.ResolveResult, str] {
+    rr_drop(es, b);
+    ctx_seed(es, b);
 
-    val b: *Buffer = slot(es, fid);
-    if (b == nil || !b.in_use) { ret err[*res.ResolveResult, str]("editor: buffer not open"); }
-
-    if (b.a == nil) {
-        val pr: Result[*ast.Ast, str] = parse_inner(es, fid);
-        if (is_err[*ast.Ast, str](pr)) { ret err[*res.ResolveResult, str](unwrap_err[*ast.Ast, str](pr)); }
+    val res_resolve: R.Result[res.ResolveResult, str] = res.resolve(es.s, b.a, deps, ?b.ctx, b.file_id::session.ModuleId);
+    if (R.is_err[res.ResolveResult, str](res_resolve)) {
+        ret R.err[*res.ResolveResult, str](R.unwrap_err[res.ResolveResult, str](res_resolve));
     }
 
-    if (b.rr != nil) {
-        res.dnit_result(b.rr);
-        deallocate[res.ResolveResult](es.alloc, b.rr, 1);
-        b.rr = nil;
+    val res_slot: R.Result[*res.ResolveResult, str] = A.allocate[res.ResolveResult](es.alloc, 1);
+    if (R.is_err[*res.ResolveResult, str](res_slot)) {
+        var rr_owned: res.ResolveResult = R.unwrap_ok[res.ResolveResult, str](res_resolve);
+        res.dnit_result(?rr_owned);
+        ret res_slot;
     }
-
-    seed_ctx(es, b);
-
-    var deps: res.ResolveDeps;
-    deps.entries = nil;
-    deps.count   = 0;
-
-    val rr_r: Result[res.ResolveResult, str] = res.resolve(es.s, b.a, ?deps, ?b.ctx, fid::sess.ModuleId);
-    if (is_err[res.ResolveResult, str](rr_r)) { ret err[*res.ResolveResult, str](unwrap_err[res.ResolveResult, str](rr_r)); }
-
-    val rr: Result[*res.ResolveResult, str] = allocate[res.ResolveResult](es.alloc, 1);
-    if (is_err[*res.ResolveResult, str](rr)) {
-        var local: res.ResolveResult = unwrap_ok[res.ResolveResult, str](rr_r);
-        res.dnit_result(?local);
-        ret rr;
-    }
-    val slot_rr: *res.ResolveResult = unwrap_ok[*res.ResolveResult, str](rr);
-    @slot_rr = unwrap_ok[res.ResolveResult, str](rr_r);
-    b.rr = slot_rr;
-    ret ok[*res.ResolveResult, str](slot_rr);
+    val rr: *res.ResolveResult = R.unwrap_ok[*res.ResolveResult, str](res_slot);
+    @rr = R.unwrap_ok[res.ResolveResult, str](res_resolve);
+    b.rr = rr;
+    ret R.ok[*res.ResolveResult, str](rr);
 }
 
-# diagnostics: the first consumer slice — analyze the buffer and return the
-# session's DiagList holding every reported diagnostic's `(severity, span,
-# message)`. runs tokenize -> emit-lex-errors -> parse, so the list reflects
-# the buffer's syntactic diagnostics; the editor reads `items[].span` and
-# maps each through `source.position` into an LSP range. the DiagList is
-# borrowed from the session and reset on entry so the result reflects only
-# this buffer's current analysis.
+# the Buffer slot for a FileId, or nil when the id is out of the registry's range
 # ---
 # es:  the editor session
-# fid: FileId of an open buffer
-# ret: a borrowed pointer to the session DiagList, or an error when fid is unknown / on allocation failure
-pub fun diagnostics(es: *EditorSession, fid: src.FileId) Result[*diag.DiagList, str] {
-    reset_diags(es);
-
-    val pr: Result[*ast.Ast, str] = parse_inner(es, fid);
-    if (is_err[*ast.Ast, str](pr)) { ret err[*diag.DiagList, str](unwrap_err[*ast.Ast, str](pr)); }
-
-    ret ok[*diag.DiagList, str](?es.s.diags);
-}
-
-# ast_of: the buffer's cached parsed Ast, or nil when it has not been parsed.
-# ---
-# es:  the editor session
-# fid: FileId of an open buffer
-# ret: borrowed pointer to the cached Ast, or nil
-pub fun ast_of(es: *EditorSession, fid: src.FileId) *ast.Ast {
-    val b: *Buffer = slot(es, fid);
-    if (b == nil || !b.in_use) { ret nil; }
-    ret b.a;
-}
-
-# resolve_of: the buffer's cached ResolveResult, or nil when it has not been
-# resolved.
-# ---
-# es:  the editor session
-# fid: FileId of an open buffer
-# ret: borrowed pointer to the cached ResolveResult, or nil
-pub fun resolve_of(es: *EditorSession, fid: src.FileId) *res.ResolveResult {
-    val b: *Buffer = slot(es, fid);
-    if (b == nil || !b.in_use) { ret nil; }
-    ret b.rr;
-}
-
-# slot: the Buffer for a FileId, or nil when the id is out of the registry's range.
-fun slot(es: *EditorSession, fid: src.FileId) *Buffer {
+# fid: candidate FileId
+# ret: a borrowed pointer to the slot, or nil
+fun slot_get(es: *EditorSession, fid: source.FileId) *Buffer {
     if (es.buffers == nil || fid::u32 >= es.buf_len) { ret nil; }
     ret ?es.buffers[fid::u32];
 }
 
-# ensure_slot: grow the buffer registry to cover `fid` and mark its slot in
-# use, returning a pointer to it. new slots between the old length and `fid`
-# are zeroed and left free.
-fun ensure_slot(es: *EditorSession, fid: src.FileId) Result[*Buffer, str] {
+# the live Buffer for a FileId, or nil when the id is out of range or its slot is free
+# ---
+# es:  the editor session
+# fid: candidate FileId
+# ret: a borrowed pointer to the open buffer, or nil
+fun slot_live(es: *EditorSession, fid: source.FileId) *Buffer {
+    val b: *Buffer = slot_get(es, fid);
+    if (b == nil || !b.in_use) { ret nil; }
+    ret b;
+}
+
+# grow the registry to cover `fid`, mark its slot in use, and return it
+#
+# New slots between the old length and `fid` are left free, each holding a
+# dnit-safe host-seeded comptime context. Reopening a live slot drops its prior
+# analysis first.
+# ---
+# es:  the editor session
+# fid: FileId to reserve a slot for
+# ret: a borrowed pointer to the now-live slot, or an allocation error
+fun slot_ensure(es: *EditorSession, fid: source.FileId) R.Result[*Buffer, str] {
     val needed: u32 = fid::u32 + 1;
     if (needed > es.buf_len) {
         var new_len: u32 = es.buf_len;
-        if (new_len == 0) { new_len = 8; }
+        if (new_len == 0) { new_len = BUFFERS_SEED; }
         for (new_len < needed) { new_len = new_len * 2; }
 
         if (es.buffers == nil) {
-            val r: Result[*Buffer, str] = allocate[Buffer](es.alloc, new_len::usize);
-            if (is_err[*Buffer, str](r)) { ret r; }
-            es.buffers = unwrap_ok[*Buffer, str](r);
+            val res_alloc: R.Result[*Buffer, str] = A.allocate[Buffer](es.alloc, new_len::usize);
+            if (R.is_err[*Buffer, str](res_alloc)) { ret res_alloc; }
+            es.buffers = R.unwrap_ok[*Buffer, str](res_alloc);
         }
         or {
-            val r: Result[*Buffer, str] = reallocate[Buffer](es.alloc, es.buffers, es.buf_len::usize, new_len::usize);
-            if (is_err[*Buffer, str](r)) { ret r; }
-            es.buffers = unwrap_ok[*Buffer, str](r);
+            val res_realloc: R.Result[*Buffer, str] = A.reallocate[Buffer](es.alloc, es.buffers, es.buf_len::usize, new_len::usize);
+            if (R.is_err[*Buffer, str](res_realloc)) { ret res_realloc; }
+            es.buffers = R.unwrap_ok[*Buffer, str](res_realloc);
         }
 
-        var z: u32 = es.buf_len;
-        for (z < new_len) {
-            val nb: *Buffer = ?es.buffers[z];
-            nb.file_id = z::src.FileId;
+        var i: u32 = es.buf_len;
+        for (i < new_len) {
+            val nb: *Buffer = ?es.buffers[i];
+            nb.file_id = i::source.FileId;
             nb.in_use  = false;
             nb.a       = nil;
             nb.rr      = nil;
             nb.ctx     = host_ctx(es);
-            z = z + 1;
+            i = i + 1;
         }
         es.buf_len = new_len;
     }
 
     val b: *Buffer = ?es.buffers[fid::u32];
     if (b.in_use) {
-        drop_analysis(es, b);
+        analysis_drop(es, b);
     }
     b.file_id = fid;
     b.in_use  = true;
-    ret ok[*Buffer, str](b);
+    ret R.ok[*Buffer, str](b);
 }
 
-# alloc_ast: heap a fresh empty Ast for the buffer so the editor can hand
-# back a stable `*ast.Ast` and free it on teardown.
-fun alloc_ast(es: *EditorSession, fid: src.FileId) Result[*ast.Ast, str] {
-    val r: Result[*ast.Ast, str] = allocate[ast.Ast](es.alloc, 1);
-    if (is_err[*ast.Ast, str](r)) { ret r; }
-    val a: *ast.Ast = unwrap_ok[*ast.Ast, str](r);
+# heap a fresh empty Ast for the buffer so the editor can hand back a stable
+# pointer and free it on teardown
+# ---
+# es:  the editor session
+# fid: FileId the Ast is parsed under
+# ret: a borrowed pointer to the new Ast, or an allocation error
+fun ast_alloc(es: *EditorSession, fid: source.FileId) R.Result[*ast.Ast, str] {
+    val res_alloc: R.Result[*ast.Ast, str] = A.allocate[ast.Ast](es.alloc, 1);
+    if (R.is_err[*ast.Ast, str](res_alloc)) { ret res_alloc; }
+    val a: *ast.Ast = R.unwrap_ok[*ast.Ast, str](res_alloc);
     @a = ast.init(es.alloc, fid);
-    ret ok[*ast.Ast, str](a);
+    ret R.ok[*ast.Ast, str](a);
 }
 
-# host_ctx: a fresh comptime context seeded from the host target — the os, arch,
-# and pointer width this compiler binary was built for. the editor resolves a
-# buffer in isolation with no project-selected target, so `$if` predicates
-# evaluate against the running compiler's own target rather than an unknown
-# placeholder. the single definition of the editor's neutral-target policy.
+# a fresh comptime context seeded from the host target
+#
+# The os, arch, abi, and pointer width this compiler binary was built for. The
+# editor resolves a buffer with no project-selected target, so `$if` predicates
+# evaluate against the running compiler rather than an unknown placeholder.
+# ---
+# es:  the editor session
+# ret: a host-seeded ComptimeCtx
 fun host_ctx(es: *EditorSession) comptime.ComptimeCtx {
     ret comptime.init(
         es.alloc,
@@ -428,138 +458,66 @@ fun host_ctx(es: *EditorSession) comptime.ComptimeCtx {
     );
 }
 
-# seed_ctx: (re)initialize the buffer's comptime context from the host target,
-# resetting any prior context first.
-fun seed_ctx(es: *EditorSession, b: *Buffer) {
+# reseed a buffer's comptime context from the host target, dnit-ing any prior one
+# ---
+# es: the editor session
+# b:  the buffer whose context is reset
+fun ctx_seed(es: *EditorSession, b: *Buffer) {
     comptime.dnit(?b.ctx);
     b.ctx = host_ctx(es);
 }
 
-# drop_analysis: free a buffer's cached Ast, ResolveResult, and comptime
-# context, leaving the slot in use with empty analysis.
-fun drop_analysis(es: *EditorSession, b: *Buffer) {
-    if (b.rr != nil) {
-        res.dnit_result(b.rr);
-        deallocate[res.ResolveResult](es.alloc, b.rr, 1);
-        b.rr = nil;
-    }
+# free a buffer's cached ResolveResult and nil the field
+# ---
+# es: the editor session
+# b:  the buffer whose ResolveResult is released
+fun rr_drop(es: *EditorSession, b: *Buffer) {
+    if (b.rr == nil) { ret; }
+    res.dnit_result(b.rr);
+    A.deallocate[res.ResolveResult](es.alloc, b.rr, 1);
+    b.rr = nil;
+}
+
+# free a buffer's cached Ast, ResolveResult, and comptime context, leaving the
+# slot in use with empty analysis
+# ---
+# es: the editor session
+# b:  the buffer whose analysis is released
+fun analysis_drop(es: *EditorSession, b: *Buffer) {
+    rr_drop(es, b);
     if (b.a != nil) {
         ast.dnit(b.a);
-        deallocate[ast.Ast](es.alloc, b.a, 1);
+        A.deallocate[ast.Ast](es.alloc, b.a, 1);
         b.a = nil;
     }
     comptime.dnit(?b.ctx);
 }
 
-# free_buffer: fully release a registry slot, including its analysis.
-fun free_buffer(es: *EditorSession, b: *Buffer) {
+# fully release a registry slot, including its analysis, marking it free
+# ---
+# es: the editor session
+# b:  the buffer slot to release
+fun buffer_free(es: *EditorSession, b: *Buffer) {
     if (!b.in_use) { ret; }
-    drop_analysis(es, b);
+    analysis_drop(es, b);
     b.in_use = false;
 }
 
-# t_session: build a Session over a page allocator for the editor tests, or
-# ret 1 from the caller on failure.
-fun t_session(alloc: *Allocator) Result[sess.Session, str] {
-    page.make(alloc);
-    ret sess.init(alloc);
+# build a Session over a page allocator for the editor tests
+# ---
+# a:   uninitialized allocator to back the session
+# ret: an initialized Session, or an allocation error
+fun t_session(a: *A.Allocator) R.Result[session.Session, str] {
+    page.make(a);
+    ret session.init(a);
 }
 
-test "editor: single-file entry parses a clean buffer with no diagnostics" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
-    var es: EditorSession = init(?s);
-
-    val fr: Result[src.FileId, str] = open(?es, "buf.mach", "fun f(a: i64) i64 { ret a; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
-
-    val ar: Result[*ast.Ast, str] = parse(?es, fid);
-    if (is_err[*ast.Ast, str](ar)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val a: *ast.Ast = unwrap_ok[*ast.Ast, str](ar);
-    if (a.decl_len == 0) { dnit(?es); sess.dnit(?s); ret 1; }
-
-    val dr: Result[*diag.DiagList, str] = diagnostics(?es, fid);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (diag.has_errors(unwrap_ok[*diag.DiagList, str](dr))) { dnit(?es); sess.dnit(?s); ret 1; }
-
-    dnit(?es);
-    sess.dnit(?s);
-    ret 0;
-}
-
-test "editor: broken buffer yields partial AST + diagnostics, never bails" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
-    var es: EditorSession = init(?s);
-
-    # a missing ')' plus a stray backtick: the parser recovers and the lexer
-    # records the bad char, so we expect both error diagnostics AND a usable
-    # partial AST that still contains the broken function decl.
-    val fr: Result[src.FileId, str] = open(?es, "broken.mach", "fun g(a: i64 { ret a ` ; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
-
-    val dr: Result[*diag.DiagList, str] = diagnostics(?es, fid);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val list: *diag.DiagList = unwrap_ok[*diag.DiagList, str](dr);
-    if (!diag.has_errors(list)) { dnit(?es); sess.dnit(?s); ret 1; }
-
-    val a: *ast.Ast = ast_of(?es, fid);
-    if (a == nil) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (a.decl_len == 0) { dnit(?es); sess.dnit(?s); ret 1; }
-
-    # offset 0 falls on the `fun g` declaration; the partial tree still
-    # answers an offset -> id query.
-    if (ast.offset_to_decl(a, 2) == id.DECL_NIL) { dnit(?es); sess.dnit(?s); ret 1; }
-
-    # resolve still produces usable side tables over the broken buffer.
-    val rr: Result[*res.ResolveResult, str] = resolve(?es, fid);
-    if (is_err[*res.ResolveResult, str](rr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val rrp: *res.ResolveResult = unwrap_ok[*res.ResolveResult, str](rr);
-    if (rrp.decl_count != a.decl_len::u32) { dnit(?es); sess.dnit(?s); ret 1; }
-
-    dnit(?es);
-    sess.dnit(?s);
-    ret 0;
-}
-
-test "editor: update drops cached analysis and reparses against new text" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
-    var es: EditorSession = init(?s);
-
-    val fr: Result[src.FileId, str] = open(?es, "buf.mach", "fun a() {}\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
-
-    val p1: Result[*ast.Ast, str] = parse(?es, fid);
-    if (is_err[*ast.Ast, str](p1)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val n1: usize = unwrap_ok[*ast.Ast, str](p1).decl_len;
-
-    val ur: Result[bool, str] = update(?es, fid, "fun a() {}\nfun b() {}\n");
-    if (is_err[bool, str](ur)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!unwrap_ok[bool, str](ur)) { dnit(?es); sess.dnit(?s); ret 1; }
-    # the cached AST is dropped on update.
-    if (ast_of(?es, fid) != nil) { dnit(?es); sess.dnit(?s); ret 1; }
-
-    val p2: Result[*ast.Ast, str] = parse(?es, fid);
-    if (is_err[*ast.Ast, str](p2)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (unwrap_ok[*ast.Ast, str](p2).decl_len <= n1) { dnit(?es); sess.dnit(?s); ret 1; }
-
-    dnit(?es);
-    sess.dnit(?s);
-    ret 0;
-}
-
-# diag_has: true when any diagnostic on `list` has a message containing `sub`.
-fun diag_has(list: *diag.DiagList, sub: str) bool {
+# true when any diagnostic on `list` has a message containing `sub`
+# ---
+# list: the diagnostic list to scan
+# sub:  substring to search each message for
+# ret:  true on the first match, false when none match
+fun diag_has(list: *diagnostic.DiagList, sub: str) bool {
     var i: usize = 0;
     for (i < list.len) {
         if (str_contains(list.items[i].message, sub)) { ret true; }
@@ -568,8 +526,12 @@ fun diag_has(list: *diag.DiagList, sub: str) bool {
     ret false;
 }
 
-# diag_note_has: true when any diagnostic on `list` carries a note containing `sub`.
-fun diag_note_has(list: *diag.DiagList, sub: str) bool {
+# true when any diagnostic on `list` carries a note containing `sub`
+# ---
+# list: the diagnostic list to scan
+# sub:  substring to search each note for
+# ret:  true on the first match, false when none match
+fun diag_note_has(list: *diagnostic.DiagList, sub: str) bool {
     var i: usize = 0;
     for (i < list.len) {
         if (list.items[i].note != nil && str_contains(list.items[i].note, sub)) { ret true; }
@@ -578,106 +540,123 @@ fun diag_note_has(list: *diag.DiagList, sub: str) bool {
     ret false;
 }
 
-# diag_count: the number of diagnostics on `list` whose message contains `sub`.
-fun diag_count(list: *diag.DiagList, sub: str) u32 {
-    var n: u32 = 0;
-    var i: usize = 0;
+# the number of diagnostics on `list` whose message contains `sub`
+# ---
+# list: the diagnostic list to scan
+# sub:  substring to match against each message
+# ret:  the count of matching diagnostics
+fun diag_count(list: *diagnostic.DiagList, sub: str) u32 {
+    var hits: u32   = 0;
+    var i:    usize = 0;
     for (i < list.len) {
-        if (str_contains(list.items[i].message, sub)) { n = n + 1; }
+        if (str_contains(list.items[i].message, sub)) { hits = hits + 1; }
         i = i + 1;
     }
-    ret n;
+    ret hits;
 }
 
-# t_run_sema: parse, resolve, and run full semantic analysis over one open
-# buffer in isolation (empty dependency set), with the comptime context's
-# pointer width forced to `pw`. every diagnostic lands on the session DiagList,
-# which is reset on entry and returned. test-only: drives the front-end the way
-# the build does for a single self-contained module.
-fun t_run_sema(es: *EditorSession, fid: src.FileId, pw: u32) Result[*diag.DiagList, str] {
-    val rr_r: Result[*res.ResolveResult, str] = resolve(es, fid);
-    if (is_err[*res.ResolveResult, str](rr_r)) { ret err[*diag.DiagList, str](unwrap_err[*res.ResolveResult, str](rr_r)); }
-    val rr: *res.ResolveResult = unwrap_ok[*res.ResolveResult, str](rr_r);
+# parse, resolve, and run full semantic analysis over one open buffer in
+# isolation, with the comptime pointer width forced to `pw`
+#
+# Every diagnostic lands on the session DiagList, which is reset before sema runs
+# and returned. Test-only: drives the front-end the way the build does for a
+# single self-contained module.
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# pw:  pointer width to force on the buffer's comptime context
+# ret: a borrowed pointer to the session DiagList, or an error
+fun t_run_sema(es: *EditorSession, fid: source.FileId, pw: u32) R.Result[*diagnostic.DiagList, str] {
+    val res_resolve: R.Result[*res.ResolveResult, str] = resolve(es, fid);
+    if (R.is_err[*res.ResolveResult, str](res_resolve)) {
+        ret R.err[*diagnostic.DiagList, str](R.unwrap_err[*res.ResolveResult, str](res_resolve));
+    }
+    val rr: *res.ResolveResult = R.unwrap_ok[*res.ResolveResult, str](res_resolve);
 
-    val b: *Buffer = slot(es, fid);
-    if (b == nil) { ret err[*diag.DiagList, str]("editor: buffer not open"); }
+    val b: *Buffer = slot_live(es, fid);
+    if (b == nil) { ret R.err[*diagnostic.DiagList, str]("editor: buffer not open"); }
     b.ctx.pointer_width = pw;
 
     # sema's generic machinery reads a declaration's origin AST through the
     # session registry, so the buffer's own module must be registered first.
-    val reg: Result[bool, str] = sess.register_module_ast(es.s, fid::sess.ModuleId, b.a);
-    if (is_err[bool, str](reg)) { ret err[*diag.DiagList, str](unwrap_err[bool, str](reg)); }
+    val res_register: R.Result[bool, str] = session.register_module_ast(es.s, fid::session.ModuleId, b.a);
+    if (R.is_err[bool, str](res_register)) {
+        ret R.err[*diagnostic.DiagList, str](R.unwrap_err[bool, str](res_register));
+    }
 
-    diag.dnit(?es.s.diags);
-    es.s.diags = diag.init(es.alloc);
+    diags_reset(es);
 
-    var deps: ctxm.SemaDeps;
+    var deps: context.SemaDeps;
     deps.entries = nil;
     deps.count   = 0;
 
-    val sres: Result[ctxm.SemaResult, str] = sema.sema(es.s, b.a, rr, ?deps, ?b.ctx, fid::sess.ModuleId);
-    if (is_err[ctxm.SemaResult, str](sres)) { ret err[*diag.DiagList, str](unwrap_err[ctxm.SemaResult, str](sres)); }
-    var sr: ctxm.SemaResult = unwrap_ok[ctxm.SemaResult, str](sres);
-    sema.dnit_result(?sr);
+    val res_sema: R.Result[context.SemaResult, str] = sema.sema(es.s, b.a, rr, ?deps, ?b.ctx, fid::session.ModuleId);
+    if (R.is_err[context.SemaResult, str](res_sema)) {
+        ret R.err[*diagnostic.DiagList, str](R.unwrap_err[context.SemaResult, str](res_sema));
+    }
+    var sema_result: context.SemaResult = R.unwrap_ok[context.SemaResult, str](res_sema);
+    sema.dnit_result(?sema_result);
 
-    ret ok[*diag.DiagList, str](?es.s.diags);
+    ret R.ok[*diagnostic.DiagList, str](?es.s.diags);
 }
 
-# t_resolve_deps: name-resolve an open buffer against an explicit dependency set
-# (the editor's own `resolve` always uses an empty one), caching and returning
-# the ResolveResult. test-only, for cross-module scenarios.
-fun t_resolve_deps(es: *EditorSession, fid: src.FileId, deps: *res.ResolveDeps) Result[*res.ResolveResult, str] {
-    val b: *Buffer = slot(es, fid);
-    if (b == nil || !b.in_use) { ret err[*res.ResolveResult, str]("editor: buffer not open"); }
+# name-resolve an open buffer against an explicit dependency set, caching and
+# returning the ResolveResult
+#
+# Test-only, for cross-module scenarios; the editor's own `resolve` always uses
+# an empty dependency set.
+# ---
+# es:   the editor session
+# fid:  FileId of an open buffer
+# deps: the dependency set to resolve against
+# ret:  a borrowed pointer to the cached ResolveResult, or an error
+fun t_resolve_deps(es: *EditorSession, fid: source.FileId, deps: *res.ResolveDeps) R.Result[*res.ResolveResult, str] {
+    val b: *Buffer = slot_live(es, fid);
+    if (b == nil) { ret R.err[*res.ResolveResult, str]("editor: buffer not open"); }
     if (b.a == nil) {
-        val pr: Result[*ast.Ast, str] = parse(es, fid);
-        if (is_err[*ast.Ast, str](pr)) { ret err[*res.ResolveResult, str](unwrap_err[*ast.Ast, str](pr)); }
+        val res_parse: R.Result[*ast.Ast, str] = parse(es, fid);
+        if (R.is_err[*ast.Ast, str](res_parse)) {
+            ret R.err[*res.ResolveResult, str](R.unwrap_err[*ast.Ast, str](res_parse));
+        }
     }
-    if (b.rr != nil) {
-        res.dnit_result(b.rr);
-        deallocate[res.ResolveResult](es.alloc, b.rr, 1);
-        b.rr = nil;
-    }
-    seed_ctx(es, b);
-
-    val rr_r: Result[res.ResolveResult, str] = res.resolve(es.s, b.a, deps, ?b.ctx, fid::sess.ModuleId);
-    if (is_err[res.ResolveResult, str](rr_r)) { ret err[*res.ResolveResult, str](unwrap_err[res.ResolveResult, str](rr_r)); }
-
-    val sr: Result[*res.ResolveResult, str] = allocate[res.ResolveResult](es.alloc, 1);
-    if (is_err[*res.ResolveResult, str](sr)) {
-        var local: res.ResolveResult = unwrap_ok[res.ResolveResult, str](rr_r);
-        res.dnit_result(?local);
-        ret sr;
-    }
-    val slot_rr: *res.ResolveResult = unwrap_ok[*res.ResolveResult, str](sr);
-    @slot_rr = unwrap_ok[res.ResolveResult, str](rr_r);
-    b.rr = slot_rr;
-    ret ok[*res.ResolveResult, str](slot_rr);
+    ret buffer_resolve(es, b, deps);
 }
 
-# t_exports: snapshot an already-resolved buffer's pub surface as a
-# ModuleExports keyed by `fqn`, mirroring the driver's build_module_exports
-# (slot included) so a dependent buffer can resolve against it. test-only; the
-# returned `symbols` array is owned by the caller.
-fun t_exports(es: *EditorSession, fid: src.FileId, fqn: str) Result[res.ModuleExports, str] {
-    val b: *Buffer = slot(es, fid);
-    if (b == nil || b.rr == nil) { ret err[res.ModuleExports, str]("editor: buffer not resolved"); }
-    val fqn_r: Result[intern.StrId, str] = intern.intern(?es.s.interner, fqn);
-    if (is_err[intern.StrId, str](fqn_r)) { ret err[res.ModuleExports, str](unwrap_err[intern.StrId, str](fqn_r)); }
+# snapshot an already-resolved buffer's pub surface as a ModuleExports keyed by
+# `fqn`, mirroring the driver's build_module_exports
+#
+# Test-only; the returned `symbols` array is owned by the caller.
+# ---
+# es:  the editor session
+# fid: FileId of a resolved buffer
+# fqn: fully-qualified module name to key the exports under
+# ret: the ModuleExports snapshot, or an error
+fun t_exports(es: *EditorSession, fid: source.FileId, fqn: str) R.Result[res.ModuleExports, str] {
+    val b: *Buffer = slot_get(es, fid);
+    if (b == nil || b.rr == nil) { ret R.err[res.ModuleExports, str]("editor: buffer not resolved"); }
+
+    val res_fqn: R.Result[intern.StrId, str] = intern.intern(?es.s.interner, fqn);
+    if (R.is_err[intern.StrId, str](res_fqn)) {
+        ret R.err[res.ModuleExports, str](R.unwrap_err[intern.StrId, str](res_fqn));
+    }
 
     var mx: res.ModuleExports;
-    mx.path    = unwrap_ok[intern.StrId, str](fqn_r);
-    mx.module  = fid::sess.ModuleId;
+    mx.path    = R.unwrap_ok[intern.StrId, str](res_fqn);
+    mx.module  = fid::session.ModuleId;
     mx.symbols = nil;
     mx.count   = 0;
-    val pcount: u32 = b.rr.pub_count;
-    if (pcount == 0) { ret ok[res.ModuleExports, str](mx); }
 
-    val r: Result[*res.PublicSymbol, str] = allocate[res.PublicSymbol](es.alloc, pcount::usize);
-    if (is_err[*res.PublicSymbol, str](r)) { ret err[res.ModuleExports, str](unwrap_err[*res.PublicSymbol, str](r)); }
-    val syms: *res.PublicSymbol = unwrap_ok[*res.PublicSymbol, str](r);
+    val pub_len: u32 = b.rr.pub_count;
+    if (pub_len == 0) { ret R.ok[res.ModuleExports, str](mx); }
+
+    val res_syms: R.Result[*res.PublicSymbol, str] = A.allocate[res.PublicSymbol](es.alloc, pub_len::usize);
+    if (R.is_err[*res.PublicSymbol, str](res_syms)) {
+        ret R.err[res.ModuleExports, str](R.unwrap_err[*res.PublicSymbol, str](res_syms));
+    }
+    val syms: *res.PublicSymbol = R.unwrap_ok[*res.PublicSymbol, str](res_syms);
+
     var i: u32 = 0;
-    for (i < pcount) {
+    for (i < pub_len) {
         val sym: *res.Symbol = ?b.rr.symbols[i];
         var ps: res.PublicSymbol;
         ps.kind   = sym.kind;
@@ -689,15 +668,112 @@ fun t_exports(es: *EditorSession, fid: src.FileId, fqn: str) Result[res.ModuleEx
         i = i + 1;
     }
     mx.symbols = syms;
-    mx.count   = pcount;
-    ret ok[res.ModuleExports, str](mx);
+    mx.count   = pub_len;
+    ret R.ok[res.ModuleExports, str](mx);
 }
 
-test "resolve: a re-exported module alias resolves through downstream (#1248)" {
-    var alloc: Allocator;
-    val srr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](srr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](srr);
+# a clean single-file buffer parses to a non-empty AST and reports no diagnostics
+test "mach.lang.editor.parse:clean_buffer" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
+    var es: EditorSession = init(?s);
+
+    val res_fid: R.Result[source.FileId, str] = open(?es, "buf.mach", "fun f(a: i64) i64 { ret a; }\n");
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
+
+    val res_ast: R.Result[*ast.Ast, str] = parse(?es, fid);
+    if (R.is_err[*ast.Ast, str](res_ast)) { dnit(?es); session.dnit(?s); ret 1; }
+    val a: *ast.Ast = R.unwrap_ok[*ast.Ast, str](res_ast);
+    if (a.decl_len == 0) { dnit(?es); session.dnit(?s); ret 1; }
+
+    val res_diags: R.Result[*diagnostic.DiagList, str] = diagnostics(?es, fid);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                           { dnit(?es); session.dnit(?s); ret 1; }
+    if (diagnostic.has_errors(R.unwrap_ok[*diagnostic.DiagList, str](res_diags))) { dnit(?es); session.dnit(?s); ret 1; }
+
+    dnit(?es);
+    session.dnit(?s);
+    ret 0;
+}
+
+# a broken buffer yields a partial AST plus diagnostics and never bails
+test "mach.lang.editor.diagnostics:partial_on_broken_buffer" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
+    var es: EditorSession = init(?s);
+
+    # a missing ')' plus a stray backtick: the parser recovers and the lexer
+    # records the bad char, so we expect both error diagnostics AND a usable
+    # partial AST that still contains the broken function decl.
+    val res_fid: R.Result[source.FileId, str] = open(?es, "broken.mach", "fun g(a: i64 { ret a ` ; }\n");
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
+
+    val res_diags: R.Result[*diagnostic.DiagList, str] = diagnostics(?es, fid);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags)) { dnit(?es); session.dnit(?s); ret 1; }
+    val list: *diagnostic.DiagList = R.unwrap_ok[*diagnostic.DiagList, str](res_diags);
+    if (!diagnostic.has_errors(list)) { dnit(?es); session.dnit(?s); ret 1; }
+
+    val a: *ast.Ast = ast_of(?es, fid);
+    if (a == nil)        { dnit(?es); session.dnit(?s); ret 1; }
+    if (a.decl_len == 0) { dnit(?es); session.dnit(?s); ret 1; }
+
+    # offset 2 falls on the `fun g` declaration; the partial tree still answers an
+    # offset -> id query.
+    if (ast.offset_to_decl(a, 2) == id.DECL_NIL) { dnit(?es); session.dnit(?s); ret 1; }
+
+    # resolve still produces usable side tables over the broken buffer.
+    val res_resolve: R.Result[*res.ResolveResult, str] = resolve(?es, fid);
+    if (R.is_err[*res.ResolveResult, str](res_resolve)) { dnit(?es); session.dnit(?s); ret 1; }
+    val rrp: *res.ResolveResult = R.unwrap_ok[*res.ResolveResult, str](res_resolve);
+    if (rrp.decl_count != a.decl_len::u32) { dnit(?es); session.dnit(?s); ret 1; }
+
+    dnit(?es);
+    session.dnit(?s);
+    ret 0;
+}
+
+# update drops cached analysis and reparses against the new text
+test "mach.lang.editor.update:drops_cached_analysis" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
+    var es: EditorSession = init(?s);
+
+    val res_fid: R.Result[source.FileId, str] = open(?es, "buf.mach", "fun a() {}\n");
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
+
+    val res_parse_1: R.Result[*ast.Ast, str] = parse(?es, fid);
+    if (R.is_err[*ast.Ast, str](res_parse_1)) { dnit(?es); session.dnit(?s); ret 1; }
+    val decls_1: usize = R.unwrap_ok[*ast.Ast, str](res_parse_1).decl_len;
+
+    val res_update: R.Result[bool, str] = update(?es, fid, "fun a() {}\nfun b() {}\n");
+    if (R.is_err[bool, str](res_update))     { dnit(?es); session.dnit(?s); ret 1; }
+    if (!R.unwrap_ok[bool, str](res_update)) { dnit(?es); session.dnit(?s); ret 1; }
+    # the cached AST is dropped on update.
+    if (ast_of(?es, fid) != nil) { dnit(?es); session.dnit(?s); ret 1; }
+
+    val res_parse_2: R.Result[*ast.Ast, str] = parse(?es, fid);
+    if (R.is_err[*ast.Ast, str](res_parse_2))                        { dnit(?es); session.dnit(?s); ret 1; }
+    if (R.unwrap_ok[*ast.Ast, str](res_parse_2).decl_len <= decls_1) { dnit(?es); session.dnit(?s); ret 1; }
+
+    dnit(?es);
+    session.dnit(?s);
+    ret 0;
+}
+
+# a re-exported module alias resolves through to a downstream consumer (#1248)
+test "mach.lang.editor.resolve:reexported_module_alias" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # inner exports a type `Thing`; surface re-exports the inner module as alias
@@ -705,34 +781,34 @@ test "resolve: a re-exported module alias resolves through downstream (#1248)" {
     # position. before the fix the surface's SYM_USE slot was dropped through the
     # export pipeline, so the consumer imported `al` as a plain symbol and the
     # type path reported `expected a module alias before .`.
-    val ir: Result[src.FileId, str] = open(?es, "inner.mach", "pub rec Thing { x: i64; }\n");
-    if (is_err[src.FileId, str](ir)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val inner: src.FileId = unwrap_ok[src.FileId, str](ir);
+    val res_inner: R.Result[source.FileId, str] = open(?es, "inner.mach", "pub rec Thing { x: i64; }\n");
+    if (R.is_err[source.FileId, str](res_inner)) { dnit(?es); session.dnit(?s); ret 1; }
+    val inner: source.FileId = R.unwrap_ok[source.FileId, str](res_inner);
 
     var empty: res.ResolveDeps;
     empty.entries = nil;
     empty.count   = 0;
-    if (is_err[*res.ResolveResult, str](t_resolve_deps(?es, inner, ?empty))) { dnit(?es); sess.dnit(?s); ret 1; }
-    val ex_inner_r: Result[res.ModuleExports, str] = t_exports(?es, inner, "t.inner");
-    if (is_err[res.ModuleExports, str](ex_inner_r)) { dnit(?es); sess.dnit(?s); ret 1; }
-    var ex_inner: res.ModuleExports = unwrap_ok[res.ModuleExports, str](ex_inner_r);
+    if (R.is_err[*res.ResolveResult, str](t_resolve_deps(?es, inner, ?empty))) { dnit(?es); session.dnit(?s); ret 1; }
+    val res_ex_inner: R.Result[res.ModuleExports, str] = t_exports(?es, inner, "t.inner");
+    if (R.is_err[res.ModuleExports, str](res_ex_inner)) { dnit(?es); session.dnit(?s); ret 1; }
+    var ex_inner: res.ModuleExports = R.unwrap_ok[res.ModuleExports, str](res_ex_inner);
 
-    val fr: Result[src.FileId, str] = open(?es, "surface.mach", "fwd al: t.inner;\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val surface: src.FileId = unwrap_ok[src.FileId, str](fr);
+    val res_surface: R.Result[source.FileId, str] = open(?es, "surface.mach", "fwd al: t.inner;\n");
+    if (R.is_err[source.FileId, str](res_surface)) { dnit(?es); session.dnit(?s); ret 1; }
+    val surface: source.FileId = R.unwrap_ok[source.FileId, str](res_surface);
 
     var sdeps: res.ResolveDeps;
     sdeps.entries = ?ex_inner;
     sdeps.count   = 1;
-    if (is_err[*res.ResolveResult, str](t_resolve_deps(?es, surface, ?sdeps))) { dnit(?es); sess.dnit(?s); ret 1; }
-    val ex_surface_r: Result[res.ModuleExports, str] = t_exports(?es, surface, "t.surface");
-    if (is_err[res.ModuleExports, str](ex_surface_r)) { dnit(?es); sess.dnit(?s); ret 1; }
-    var ex_surface: res.ModuleExports = unwrap_ok[res.ModuleExports, str](ex_surface_r);
+    if (R.is_err[*res.ResolveResult, str](t_resolve_deps(?es, surface, ?sdeps))) { dnit(?es); session.dnit(?s); ret 1; }
+    val res_ex_surface: R.Result[res.ModuleExports, str] = t_exports(?es, surface, "t.surface");
+    if (R.is_err[res.ModuleExports, str](res_ex_surface)) { dnit(?es); session.dnit(?s); ret 1; }
+    var ex_surface: res.ModuleExports = R.unwrap_ok[res.ModuleExports, str](res_ex_surface);
 
-    val cr: Result[src.FileId, str] = open(?es, "consumer.mach",
+    val res_consumer: R.Result[source.FileId, str] = open(?es, "consumer.mach",
         "use al: t.surface.al;\nfun take(p: al.Thing) i64 { ret p.x; }\n");
-    if (is_err[src.FileId, str](cr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val consumer: src.FileId = unwrap_ok[src.FileId, str](cr);
+    if (R.is_err[source.FileId, str](res_consumer)) { dnit(?es); session.dnit(?s); ret 1; }
+    val consumer: source.FileId = R.unwrap_ok[source.FileId, str](res_consumer);
 
     var cdeps_arr: [2]res.ModuleExports;
     cdeps_arr[0] = ex_surface;
@@ -741,789 +817,823 @@ test "resolve: a re-exported module alias resolves through downstream (#1248)" {
     cdeps.entries = ?cdeps_arr[0];
     cdeps.count   = 2;
 
-    diag.dnit(?es.s.diags);
-    es.s.diags = diag.init(es.alloc);
-    if (is_err[*res.ResolveResult, str](t_resolve_deps(?es, consumer, ?cdeps))) { dnit(?es); sess.dnit(?s); ret 1; }
+    diags_reset(?es);
+    if (R.is_err[*res.ResolveResult, str](t_resolve_deps(?es, consumer, ?cdeps))) { dnit(?es); session.dnit(?s); ret 1; }
 
-    val ok_clean: bool = !diag.has_errors(?es.s.diags);
-    deallocate[res.PublicSymbol](es.alloc, ex_inner.symbols, ex_inner.count::usize);
-    deallocate[res.PublicSymbol](es.alloc, ex_surface.symbols, ex_surface.count::usize);
-    if (!ok_clean) { dnit(?es); sess.dnit(?s); ret 1; }
+    val is_clean: bool = !diagnostic.has_errors(?es.s.diags);
+    A.deallocate[res.PublicSymbol](es.alloc, ex_inner.symbols, ex_inner.count::usize);
+    A.deallocate[res.PublicSymbol](es.alloc, ex_surface.symbols, ex_surface.count::usize);
+    if (!is_clean) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: a generic parameter nested two anonymous-aggregate levels deep is substituted (#1248)" {
-    var alloc: Allocator;
-    val srr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](srr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](srr);
+# a generic parameter nested two anonymous-aggregate levels deep is substituted (#1248)
+test "mach.lang.editor.sema:nested_generic_param_substituted" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
-    val fr: Result[src.FileId, str] = open(?es, "box.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "box.mach",
         "rec Box[T] { outer: rec { inner: rec { v: T; }; }; }\nfun main() i64 { var b: Box[u32]; b.outer.inner.v = 5; ret 0; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags)) { dnit(?es); session.dnit(?s); ret 1; }
     # before the fix the placeholder T leaked into Box[u32], so the concrete
     # assignment reported `expected T, found i64`. it must now type clean.
-    if (diag.has_errors(unwrap_ok[*diag.DiagList, str](dr))) { dnit(?es); sess.dnit(?s); ret 1; }
+    if (diagnostic.has_errors(R.unwrap_ok[*diagnostic.DiagList, str](res_diags))) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: an array length above the u32 range is rejected, not truncated (#1248)" {
-    var alloc: Allocator;
-    val srr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](srr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](srr);
+# an array length above the u32 range is rejected, not truncated (#1248)
+test "mach.lang.editor.sema:array_length_overflow_rejected" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # 0x100000001 truncates to 1 in u32; before the fix the array silently
     # interned as [1]u8 with no diagnostic. it must now be rejected outright.
-    val fr: Result[src.FileId, str] = open(?es, "arr.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "arr.mach",
         "fun main() i64 { var a: [0x100000001]u8; ret 0; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(unwrap_ok[*diag.DiagList, str](dr), "array length exceeds")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                                       { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "array length exceeds")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: a module-scope unannotated val reports an initializer error once (#1248)" {
-    var alloc: Allocator;
-    val srr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](srr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](srr);
+# a module-scope unannotated val reports an initializer error exactly once (#1248)
+test "mach.lang.editor.sema:unannotated_val_error_once" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # the decl-type pass and the body pass both walked an unannotated
     # initializer, so the operand-type error was reported verbatim twice.
-    val fr: Result[src.FileId, str] = open(?es, "dbl.mach", "val bad = 1 + nil;\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    val res_fid: R.Result[source.FileId, str] = open(?es, "dbl.mach", "val bad = 1 + nil;\n");
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (diag_count(unwrap_ok[*diag.DiagList, str](dr), "incompatible operand types") != 1) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                                                   { dnit(?es); session.dnit(?s); ret 1; }
+    if (diag_count(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "incompatible operand types") != 1) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: mixed-signedness integer comparison is accepted (#1248)" {
-    var alloc: Allocator;
-    val srr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](srr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](srr);
+# mixed-signedness integer comparison is accepted (#1248)
+test "mach.lang.editor.sema:mixed_sign_int_compare" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # i32 vs u64 compares mathematical values; sema must accept it without a
     # type-mismatch, the lowering handles the value-correct sequence.
-    val fr: Result[src.FileId, str] = open(?es, "mix.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "mix.mach",
         "fun main() i64 { var a: i32 = 0; var b: u64 = 0; val c: u8 = a < b; ret c::i64; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (diag_has(unwrap_ok[*diag.DiagList, str](dr), "type mismatch")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                               { dnit(?es); session.dnit(?s); ret 1; }
+    if (diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "type mismatch")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: mixed-width float comparison is accepted (#1248)" {
-    var alloc: Allocator;
-    val srr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](srr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](srr);
+# mixed-width float comparison is accepted (#1248)
+test "mach.lang.editor.sema:mixed_width_float_compare" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # f32 vs f64 widens exactly; sema must accept the comparison.
-    val fr: Result[src.FileId, str] = open(?es, "fmix.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "fmix.mach",
         "fun main() i64 { var a: f32 = 0.0; var b: f64 = 0.0; val c: u8 = a < b; ret c::i64; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (diag_has(unwrap_ok[*diag.DiagList, str](dr), "type mismatch")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                               { dnit(?es); session.dnit(?s); ret 1; }
+    if (diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "type mismatch")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: integer-vs-float comparison is rejected and asks for an explicit cast (#1248)" {
-    var alloc: Allocator;
-    val srr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](srr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](srr);
+# an integer-vs-float comparison is rejected and asks for an explicit cast (#1248)
+test "mach.lang.editor.sema:int_float_compare_rejected" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # an int vs float comparison is an error: a silent widening would hide f64
     # rounding above 2^53. the diagnostic must tell the author to cast.
-    val fr: Result[src.FileId, str] = open(?es, "if.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "if.mach",
         "fun main() i64 { var a: i32 = 0; var f: f64 = 0.0; val c: u8 = a < f; ret c::i64; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(unwrap_ok[*diag.DiagList, str](dr), "cast one operand explicitly")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                                              { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "cast one operand explicitly")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "diagnostics: unresolved identifier names the symbol and suggests a near match" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# an unresolved identifier names the symbol and suggests a near match
+test "mach.lang.editor.resolve:unresolved_ident_suggestion" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # `helpr` is one edit from the in-scope `helper`, so the message embeds the
     # unresolved name and a `did you mean` note points at the near match.
-    val fr: Result[src.FileId, str] = open(?es, "ident.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "ident.mach",
         "fun helper() i64 { ret 0; }\nfun main() i64 { ret helpr(); }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val rr: Result[*res.ResolveResult, str] = resolve(?es, fid);
-    if (is_err[*res.ResolveResult, str](rr)) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_resolve: R.Result[*res.ResolveResult, str] = resolve(?es, fid);
+    if (R.is_err[*res.ResolveResult, str](res_resolve)) { dnit(?es); session.dnit(?s); ret 1; }
 
-    val list: *diag.DiagList = ?es.s.diags;
-    if (!diag_has(list, "unresolved identifier `helpr`")) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_note_has(list, "did you mean `helper`?")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val list: *diagnostic.DiagList = ?es.s.diags;
+    if (!diag_has(list, "unresolved identifier `helpr`")) { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_note_has(list, "did you mean `helper`?"))   { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "diagnostics: unresolved type name names the type and suggests a near match" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# an unresolved type name names the type and suggests a near match
+test "mach.lang.editor.resolve:unresolved_type_suggestion" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # `Widgt` is one edit from the in-scope record `Widget`, so the type-name
     # error embeds the misspelling and suggests the near match.
-    val fr: Result[src.FileId, str] = open(?es, "type.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "type.mach",
         "rec Widget { x: i64; }\nfun main(w: Widgt) i64 { ret 0; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val rr: Result[*res.ResolveResult, str] = resolve(?es, fid);
-    if (is_err[*res.ResolveResult, str](rr)) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_resolve: R.Result[*res.ResolveResult, str] = resolve(?es, fid);
+    if (R.is_err[*res.ResolveResult, str](res_resolve)) { dnit(?es); session.dnit(?s); ret 1; }
 
-    val list: *diag.DiagList = ?es.s.diags;
-    if (!diag_has(list, "unresolved type name `Widgt`")) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_note_has(list, "did you mean `Widget`?")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val list: *diagnostic.DiagList = ?es.s.diags;
+    if (!diag_has(list, "unresolved type name `Widgt`")) { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_note_has(list, "did you mean `Widget`?"))  { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "diagnostics: a stray control character names the offending byte class (#1046)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# a stray control character names the offending byte class (#1046)
+test "mach.lang.editor.tokenize:stray_control_char" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # a NUL-region control byte (here a vertical tab, 0x0B) is not valid source;
     # the lexer reports it as a stray control character with a 1-byte span.
-    val fr: Result[src.FileId, str] = open(?es, "ctrl.mach", "fun main() i64 { ret 0; }\n\x0B\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    val res_fid: R.Result[source.FileId, str] = open(?es, "ctrl.mach", "fun main() i64 { ret 0; }\n\x0B\n");
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val tr: Result[lexer.TokenStream, str] = tokenize(?es, fid);
-    if (is_err[lexer.TokenStream, str](tr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    var stream: lexer.TokenStream = unwrap_ok[lexer.TokenStream, str](tr);
+    val res_tokens: R.Result[lexer.TokenStream, str] = tokenize(?es, fid);
+    if (R.is_err[lexer.TokenStream, str](res_tokens)) { dnit(?es); session.dnit(?s); ret 1; }
+    var stream: lexer.TokenStream = R.unwrap_ok[lexer.TokenStream, str](res_tokens);
 
     val hit: bool = diag_has(?es.s.diags, "stray control character in source");
     lexer.dnit(?stream, es.alloc);
-    if (!hit) { dnit(?es); sess.dnit(?s); ret 1; }
+    if (!hit) { dnit(?es); session.dnit(?s); ret 1; }
+
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "diagnostics: an unrecognized top-level token lists the valid declaration starters (#1046)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# an unrecognized top-level token lists the valid declaration starters (#1046)
+test "mach.lang.editor.parse:invalid_decl_starter" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
-    val fr: Result[src.FileId, str] = open(?es, "decl.mach", "garbage\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    val res_fid: R.Result[source.FileId, str] = open(?es, "decl.mach", "garbage\n");
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val pr: Result[*ast.Ast, str] = parse(?es, fid);
-    if (is_err[*ast.Ast, str](pr)) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_ast: R.Result[*ast.Ast, str] = parse(?es, fid);
+    if (R.is_err[*ast.Ast, str](res_ast)) { dnit(?es); session.dnit(?s); ret 1; }
 
-    if (!diag_has(?es.s.diags, "expected a declaration; valid starters: use, fwd, fun, rec, uni, val, var, def, test")) { dnit(?es); sess.dnit(?s); ret 1; }
+    if (!diag_has(?es.s.diags, "expected a declaration; valid starters: use, fwd, fun, rec, uni, val, var, def, test")) { dnit(?es); session.dnit(?s); ret 1; }
+
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "diagnostics: a value name used as a type is told it does not name a type (#1046)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# a value name used as a type is told it does not name a type (#1046)
+test "mach.lang.editor.sema:value_used_as_type" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # `f` names a function, not a type; using it in a parameter's type position
     # reports that it does not name a type, embedding the symbol name.
-    val fr: Result[src.FileId, str] = open(?es, "nt.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "nt.mach",
         "fun f() i64 { ret 0; }\nfun main(p: f) i64 { ret 0; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(unwrap_ok[*diag.DiagList, str](dr), "`f` does not name a type")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                                           { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "`f` does not name a type")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "diagnostics: an unknown decorator is rejected (#1476)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# an unknown decorator is rejected (#1476)
+test "mach.lang.editor.sema:unknown_decorator" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
-    val fr: Result[src.FileId, str] = open(?es, "ud.mach", "#[bogus] fun f() i64 { ret 0; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    val res_fid: R.Result[source.FileId, str] = open(?es, "ud.mach", "#[bogus] fun f() i64 { ret 0; }\n");
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(unwrap_ok[*diag.DiagList, str](dr), "unknown decorator; valid directives are symbol, section, inline, align, library")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                                                                                                  { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "unknown decorator; valid directives are symbol, section, inline, align, library")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "diagnostics: a decorator on an incompatible target is rejected (#1476)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# a decorator on an incompatible target is rejected (#1476)
+test "mach.lang.editor.sema:decorator_wrong_target" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
-    # `align` targets records, unions, and globals, not a function — reported.
-    val fr: Result[src.FileId, str] = open(?es, "wt.mach", "#[align(8)] fun f() i64 { ret 0; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    # `align` targets records, unions, and globals, not a function - reported.
+    val res_fid: R.Result[source.FileId, str] = open(?es, "wt.mach", "#[align(8)] fun f() i64 { ret 0; }\n");
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(unwrap_ok[*diag.DiagList, str](dr), "`align` decorator applies only to records, unions, and globals")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                                                                                 { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "`align` decorator applies only to records, unions, and globals")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "diagnostics: a section decorator on a function or global is accepted; on a type is rejected (#1476)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# a section decorator on a function or global is accepted; on a type is rejected (#1476)
+test "mach.lang.editor.sema:section_decorator_target" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # `section` applies to functions and globals (placed, no error); a `def` type
     # is not a symbol-bearing decl, so a section on it is reported.
-    val fr: Result[src.FileId, str] = open(?es, "se.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "se.mach",
         "#[section(\".s\")] pub var g: u64 = 0;\n#[section(\".s\")] fun f() i64 { ret 0; }\n#[section(\".s\")] def D: u64;\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val list: *diag.DiagList = unwrap_ok[*diag.DiagList, str](dr);
-    if (!diag_has(list, "`section` decorator applies only to functions and globals")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags)) { dnit(?es); session.dnit(?s); ret 1; }
+    val list: *diagnostic.DiagList = R.unwrap_ok[*diagnostic.DiagList, str](res_diags);
+    if (!diag_has(list, "`section` decorator applies only to functions and globals")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "diagnostics: a negative align on a type is reported, not silently dropped (#1490)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# a negative align on a type is reported, not silently dropped (#1490)
+test "mach.lang.editor.sema:negative_align_reported" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
-    # `#[align(-8)]` on a record folds to a negative integer-typed constant — the
+    # `#[align(-8)]` on a record folds to a negative integer-typed constant - the
     # body-pass validator can't catch it (it's integer-typed), so the decl-pass
     # fold must report it rather than `ret` silently.
-    val fr: Result[src.FileId, str] = open(?es, "na.mach", "#[align(-8)] rec R { a: u8; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    val res_fid: R.Result[source.FileId, str] = open(?es, "na.mach", "#[align(-8)] rec R { a: u8; }\n");
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(unwrap_ok[*diag.DiagList, str](dr), "`align` value must be a non-zero power of two")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                                                                { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "`align` value must be a non-zero power of two")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "diagnostics: align on a def alias is rejected, not silently ignored (#1490)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# align on a def alias is rejected, not silently ignored (#1490)
+test "mach.lang.editor.sema:align_on_def_alias_rejected" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # a `def` alias has no layout of its own and emits no symbol, so an `align` on
     # it would silently no-op; it is rejected as an invalid target instead.
-    val fr: Result[src.FileId, str] = open(?es, "da.mach", "#[align(8)] def D: u64;\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    val res_fid: R.Result[source.FileId, str] = open(?es, "da.mach", "#[align(8)] def D: u64;\n");
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(unwrap_ok[*diag.DiagList, str](dr), "`align` decorator applies only to records, unions, and globals")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                                                                                 { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "`align` decorator applies only to records, unions, and globals")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: a `va: ...` pack declares; `va.len` and `$each a in va` typecheck (#1474)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# a `va: ...` pack declares; `va.len` and `$each a in va` typecheck (#1474)
+test "mach.lang.editor.sema:variadic_pack_declares" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # a named trailing pack parameter; `va.len` is the comptime element count and
     # `$each a in va` iterates it (element body deferred to monomorphization).
-    val fr: Result[src.FileId, str] = open(?es, "pk.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "pk.mach",
         "fun take(va: ...) i64 { var n: i64 = va.len::i64; $each a in va { } ret n; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (diag.has_errors(unwrap_ok[*diag.DiagList, str](dr))) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                           { dnit(?es); session.dnit(?s); ret 1; }
+    if (diagnostic.has_errors(R.unwrap_ok[*diagnostic.DiagList, str](res_diags))) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: a `$each` over a non-pack, non-`$fields` sequence is rejected (#1474)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# a `$each` over a non-pack, non-`$fields` sequence is rejected (#1474)
+test "mach.lang.editor.sema:each_over_non_pack_rejected" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
-    val fr: Result[src.FileId, str] = open(?es, "bad.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "bad.mach",
         "fun f() i64 { var x: i64 = 0; $each a in x { } ret 0; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(unwrap_ok[*diag.DiagList, str](dr), "must be `$fields(T)` or a variadic pack")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                                                          { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "must be `$fields(T)` or a variadic pack")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: a call collects trailing args into a `va: ...` pack param (#1474)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# a call collects trailing args into a `va: ...` pack param (#1474)
+test "mach.lang.editor.sema:call_collects_pack_args" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # the pack param absorbs every trailing argument (variable arity); a leading
     # fixed param is still checked, and the collected args are typed but not
     # checked against a concrete type (fixed at monomorphization, #1475).
-    val fr: Result[src.FileId, str] = open(?es, "col.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "col.mach",
         "fun take(tag: i64, va: ...) i64 { ret tag; } fun sum(va: ...) i64 { ret 0; } fun main() i64 { ret take(1, 2, 3) + sum() + sum(4, 5); }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (diag.has_errors(unwrap_ok[*diag.DiagList, str](dr))) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                           { dnit(?es); session.dnit(?s); ret 1; }
+    if (diagnostic.has_errors(R.unwrap_ok[*diagnostic.DiagList, str](res_diags))) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: a call below a pack's leading fixed arity is rejected (#1474)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# a call below a pack's leading fixed arity is rejected (#1474)
+test "mach.lang.editor.sema:pack_below_fixed_arity_rejected" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # `take` requires its leading fixed `tag`; a bare `take()` supplies fewer than
     # the fixed count and is an arity error even though the pack accepts any tail.
-    val fr: Result[src.FileId, str] = open(?es, "few.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "few.mach",
         "fun take(tag: i64, va: ...) i64 { ret tag; } fun main() i64 { ret take(); }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(unwrap_ok[*diag.DiagList, str](dr), "arity mismatch: expected at least")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                                                    { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "arity mismatch: expected at least")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: `va...` forwards a whole pack into a trailing pack param (#1474)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# `va...` forwards a whole pack into a trailing pack param (#1474)
+test "mach.lang.editor.sema:pack_forward_spread" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # `inner` has a leading fixed param then a pack; `fwd` has only a pack. each
     # forward passes the whole pack as the sole trailing argument.
-    val fr: Result[src.FileId, str] = open(?es, "fwd.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "fwd.mach",
         "fun inner(tag: i64, va: ...) i64 { ret tag; } fun fwd(va: ...) i64 { ret inner(7, va...); } fun bare(va: ...) i64 { ret fwd(va...); }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (diag.has_errors(unwrap_ok[*diag.DiagList, str](dr))) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                           { dnit(?es); session.dnit(?s); ret 1; }
+    if (diagnostic.has_errors(R.unwrap_ok[*diagnostic.DiagList, str](res_diags))) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: spreading `...` into fixed parameters is rejected (#1474)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# spreading `...` into fixed parameters is rejected (#1474)
+test "mach.lang.editor.sema:spread_into_fixed_rejected" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # `point` has no pack parameter, so the whole pack cannot be spread into it.
-    val fr: Result[src.FileId, str] = open(?es, "intofixed.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "intofixed.mach",
         "fun point(x: i64, y: i64) i64 { ret x; } fun outer(va: ...) i64 { ret point(va...); }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(unwrap_ok[*diag.DiagList, str](dr), "cannot spread `...` into fixed parameters")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                                                            { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "cannot spread `...` into fixed parameters")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: a `...` spread of a non-pack operand is rejected (#1474)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# a `...` spread of a non-pack operand is rejected (#1474)
+test "mach.lang.editor.sema:spread_non_pack_rejected" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # `z` is an ordinary value, not a pack; spreading it is malformed.
-    val fr: Result[src.FileId, str] = open(?es, "nonpack.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "nonpack.mach",
         "fun g(va: ...) i64 { ret 0; } fun f() i64 { var z: i64 = 0; ret g(z...); }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(unwrap_ok[*diag.DiagList, str](dr), "may only spread a variadic pack")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                                                  { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "may only spread a variadic pack")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: a `...` spread mixed with other trailing args is rejected (#1474)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# a `...` spread mixed with other trailing args is rejected (#1474)
+test "mach.lang.editor.sema:spread_mixed_args_rejected" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # `inner` is a pure pack; the spread must be the sole trailing argument, so a
     # leading collected `1` alongside `va...` is rejected.
-    val fr: Result[src.FileId, str] = open(?es, "mixed.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "mixed.mach",
         "fun inner(va: ...) i64 { ret 0; } fun outer(va: ...) i64 { ret inner(1, va...); }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(unwrap_ok[*diag.DiagList, str](dr), "sole trailing argument")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                                         { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "sole trailing argument")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "diagnostics: calling a non-function renders the callee type (#1046)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# calling a non-function renders the callee type (#1046)
+test "mach.lang.editor.sema:call_non_function" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # `x` is an i64, not a function; calling it reports the callee's rendered
     # type rather than a bare "callee is not a function".
-    val fr: Result[src.FileId, str] = open(?es, "nc.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "nc.mach",
         "fun main() i64 { var x: i64 = 0; ret x(); }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(unwrap_ok[*diag.DiagList, str](dr), "not callable: `i64` is not a function")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                                                        { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "not callable: `i64` is not a function")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: pointer reinterpret legality follows the target pointer width (#1248)" {
-    var alloc: Allocator;
-    val srr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](srr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](srr);
+# pointer reinterpret legality follows the target pointer width (#1248)
+test "mach.lang.editor.sema:reinterpret_pointer_width" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # a `*u8` reinterpreted to u32 is legal exactly when a pointer is 4 bytes;
     # byte_size must read the width from the target, not a hardcoded 8.
-    val fr: Result[src.FileId, str] = open(?es, "pw.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "pw.mach",
         "fun main() i64 { var p: *u8; var x: u32; x = p:~u32; ret 0; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val d4: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 4);
-    if (is_err[*diag.DiagList, str](d4)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (diag_has(unwrap_ok[*diag.DiagList, str](d4), "bit reinterpret")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags_4: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 4);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags_4))                                 { dnit(?es); session.dnit(?s); ret 1; }
+    if (diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags_4), "bit reinterpret")) { dnit(?es); session.dnit(?s); ret 1; }
 
-    val d8: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](d8)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(unwrap_ok[*diag.DiagList, str](d8), "bit reinterpret")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags_8: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags_8))                                  { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags_8), "bit reinterpret")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "editor: a buffer's comptime ctx is seeded from the host target, not a placeholder (#1249)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# a buffer's comptime ctx is seeded from the host target, not a placeholder (#1249)
+test "mach.lang.editor.open:ctx_seeded_from_host" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
-    val fr: Result[src.FileId, str] = open(?es, "buf.mach", "fun f() {}\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    val res_fid: R.Result[source.FileId, str] = open(?es, "buf.mach", "fun f() {}\n");
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val b: *Buffer = slot(?es, fid);
-    if (b == nil) { dnit(?es); sess.dnit(?s); ret 1; }
+    val b: *Buffer = slot_live(?es, fid);
+    if (b == nil) { dnit(?es); session.dnit(?s); ret 1; }
     # the ctx target params reflect the running compiler's host, not the old
     # os=0 / arch=0 / ptr=8 placeholder that made the LSP read target-gated code
     # as a freestanding/unknown target.
-    if (b.ctx.target_os_id != target.host_os_id()) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (b.ctx.target_arch_id != target.host_arch_id()) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (b.ctx.pointer_width != target.host_pointer_width()) { dnit(?es); sess.dnit(?s); ret 1; }
+    if (b.ctx.target_os_id != target.host_os_id())          { dnit(?es); session.dnit(?s); ret 1; }
+    if (b.ctx.target_arch_id != target.host_arch_id())      { dnit(?es); session.dnit(?s); ret 1; }
+    if (b.ctx.pointer_width != target.host_pointer_width()) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "editor: repeated resolve resets diagnostics instead of accumulating them (#1249)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# repeated resolve resets diagnostics instead of accumulating them (#1249)
+test "mach.lang.editor.resolve:repeated_resets_diags" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # an unbound `undef` makes every resolve emit a diagnostic; the count must
     # stay stable across repeated calls rather than doubling.
-    val fr: Result[src.FileId, str] = open(?es, "buf.mach", "fun f() i64 { ret undef; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    val res_fid: R.Result[source.FileId, str] = open(?es, "buf.mach", "fun f() i64 { ret undef; }\n");
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val r1: Result[*res.ResolveResult, str] = resolve(?es, fid);
-    if (is_err[*res.ResolveResult, str](r1)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val n1: usize = es.s.diags.len;
-    if (n1 == 0) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_resolve_1: R.Result[*res.ResolveResult, str] = resolve(?es, fid);
+    if (R.is_err[*res.ResolveResult, str](res_resolve_1)) { dnit(?es); session.dnit(?s); ret 1; }
+    val len_1: usize = es.s.diags.len;
+    if (len_1 == 0) { dnit(?es); session.dnit(?s); ret 1; }
 
-    val r2: Result[*res.ResolveResult, str] = resolve(?es, fid);
-    if (is_err[*res.ResolveResult, str](r2)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val n2: usize = es.s.diags.len;
+    val res_resolve_2: R.Result[*res.ResolveResult, str] = resolve(?es, fid);
+    if (R.is_err[*res.ResolveResult, str](res_resolve_2)) { dnit(?es); session.dnit(?s); ret 1; }
+    val len_2: usize = es.s.diags.len;
 
     # without the reset-on-entry, the second resolve appends a duplicate set.
-    if (n2 != n1) { dnit(?es); sess.dnit(?s); ret 1; }
+    if (len_2 != len_1) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "resolve: a runtime local shadowing a module const is rejected in a $if gate, not folded to the const (#1249)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# a runtime local shadowing a module const is rejected in a $if gate, not folded (#1249)
+test "mach.lang.editor.resolve:local_shadows_comptime_const" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # `N` is a module comptime const; the runtime local `N` shadows it. the
     # comptime env is name-keyed, so the gate fold silently succeeds against the
-    # module const 4 while the resolver bound the ident to the local — resolve
+    # module const 4 while the resolver bound the ident to the local - resolve
     # must reject the gate on resolution identity instead of miscompiling it.
-    val fr: Result[src.FileId, str] = open(?es, "shadow.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "shadow.mach",
         "pub val N: i64 = 4;\nfun g(x: i64) i64 {\n    val N: i64 = x;\n    $if (N > 2) { ret 1; }\n    ret 0;\n}\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val rr: Result[*res.ResolveResult, str] = resolve(?es, fid);
-    if (is_err[*res.ResolveResult, str](rr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(?es.s.diags, "shadows a comptime constant")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_resolve: R.Result[*res.ResolveResult, str] = resolve(?es, fid);
+    if (R.is_err[*res.ResolveResult, str](res_resolve))        { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(?es.s.diags, "shadows a comptime constant")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "resolve: a runtime parameter shadowing a module const is rejected in a $if gate (#1249)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# a runtime parameter shadowing a module const is rejected in a $if gate (#1249)
+test "mach.lang.editor.resolve:param_shadows_comptime_const" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # same miscompile through a runtime (non-`$`) parameter named after the
     # module const: the fold would silently use the const, not the parameter.
-    val fr: Result[src.FileId, str] = open(?es, "pshadow.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "pshadow.mach",
         "pub val N: i64 = 4;\nfun g(N: i64) i64 {\n    $if (N > 2) { ret 1; }\n    ret 0;\n}\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val rr: Result[*res.ResolveResult, str] = resolve(?es, fid);
-    if (is_err[*res.ResolveResult, str](rr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(?es.s.diags, "shadows a comptime constant")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_resolve: R.Result[*res.ResolveResult, str] = resolve(?es, fid);
+    if (R.is_err[*res.ResolveResult, str](res_resolve))        { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(?es.s.diags, "shadows a comptime constant")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "resolve: a standalone bare $ident gate is rejected with the teaching diagnostic (#1249)" {
-    var alloc: Allocator;
-    val sr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](sr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](sr);
+# a standalone bare $ident gate is rejected with the teaching diagnostic (#1249)
+test "mach.lang.editor.resolve:bare_dollar_ident_gate_rejected" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # a lone `$mode` is none of the closed comptime channel shapes: a comptime
     # parameter is referenced without `$`, and comptime paths are rooted. the
     # gate must be rejected with the single teaching diagnostic owned by eval,
     # not folded nor reported with a path-root message.
-    val fr: Result[src.FileId, str] = open(?es, "bareident.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "bareident.mach",
         "fun g() i64 {\n    $if ($mode) { ret 1; }\n    ret 0;\n}\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val rr: Result[*res.ResolveResult, str] = resolve(?es, fid);
-    if (is_err[*res.ResolveResult, str](rr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(?es.s.diags, "comptime parameters are referenced without")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_resolve: R.Result[*res.ResolveResult, str] = resolve(?es, fid);
+    if (R.is_err[*res.ResolveResult, str](res_resolve))                       { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(?es.s.diags, "comptime parameters are referenced without")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: nil coerces to fun types in every position (#1369)" {
-    var alloc: Allocator;
-    val srr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](srr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](srr);
+# nil coerces to fun types in every position (#1369)
+test "mach.lang.editor.sema:nil_coerces_to_fun" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # nil is the null address and takes any pointer-like type, function types
     # included. it must coerce uniformly into a fun-typed global (bare and
     # `nil::F`), a local, a record field, an argument, and a return slot, and an
     # `== nil` comparison must still type. none of these may report a mismatch.
-    val fr: Result[src.FileId, str] = open(?es, "nilfun.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "nilfun.mach",
         "def F: fun(u32);\npub var gq: fun(u32) = nil;\npub var gr: F = nil::F;\nrec T { cb: fun(); k: F; }\nfun take(c: fun(u32)) u8 { if (c == nil) { ret 1; } ret 0; }\nfun give() fun(u32) { ret nil; }\nfun givec() F { ret nil::F; }\nfun main() i64 { var lq: fun(u32) = nil; var lr: F = nil::F; var t: T = T{ cb: nil, k: nil::F }; if (gq != nil) { ret 1; } if (lr != nil) { ret 2; } if (t.k != nil) { ret 3; } ret take(lq)::i64; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (diag_has(unwrap_ok[*diag.DiagList, str](dr), "type mismatch")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                               { dnit(?es); session.dnit(?s); ret 1; }
+    if (diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "type mismatch")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
 
-test "sema: nil into a non-pointer binding is still rejected (#1369)" {
-    var alloc: Allocator;
-    val srr: Result[sess.Session, str] = t_session(?alloc);
-    if (is_err[sess.Session, str](srr)) { ret 1; }
-    var s: sess.Session = unwrap_ok[sess.Session, str](srr);
+# nil into a non-pointer binding is still rejected (#1369)
+test "mach.lang.editor.sema:nil_into_non_pointer_rejected" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
     var es: EditorSession = init(?s);
 
     # the coercion admits only pointer-like targets; nil into an integer slot is
     # still a mismatch, so widening nil to a non-address type stays an error.
-    val fr: Result[src.FileId, str] = open(?es, "nilint.mach",
+    val res_fid: R.Result[source.FileId, str] = open(?es, "nilint.mach",
         "fun main() i64 { var bad: u32 = nil; ret 0; }\n");
-    if (is_err[src.FileId, str](fr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    val fid: src.FileId = unwrap_ok[src.FileId, str](fr);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
 
-    val dr: Result[*diag.DiagList, str] = t_run_sema(?es, fid, 8);
-    if (is_err[*diag.DiagList, str](dr)) { dnit(?es); sess.dnit(?s); ret 1; }
-    if (!diag_has(unwrap_ok[*diag.DiagList, str](dr), "type mismatch")) { dnit(?es); sess.dnit(?s); ret 1; }
+    val res_diags: R.Result[*diagnostic.DiagList, str] = t_run_sema(?es, fid, 8);
+    if (R.is_err[*diagnostic.DiagList, str](res_diags))                                { dnit(?es); session.dnit(?s); ret 1; }
+    if (!diag_has(R.unwrap_ok[*diagnostic.DiagList, str](res_diags), "type mismatch")) { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
-    sess.dnit(?s);
+    session.dnit(?s);
     ret 0;
 }
