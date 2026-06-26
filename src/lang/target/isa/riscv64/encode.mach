@@ -1,0 +1,1657 @@
+# RISC-V (RV64) machine-code encoding - the riscv64 ISA's `encode` entry point.
+#
+# This is the RV64 implementation of the ISA vtable's `encode` operation, reached
+# only through `tgt.arch.encode` by the shared `be.codegen.encode` dispatcher. It
+# turns the resolved (post-isel, post-regalloc, post-frame) `MirModule` into
+# fixed-width little-endian 32-bit RISC-V `.text` words, driving the shared
+# two-pass `encode.encode_driver` with two per-ISA hooks: `encode_function_riscv64`
+# (prologue / instruction stream / epilogue, recording symbol marks and intra-
+# module branch fixups) and `patch_branch_riscv64` (the B-type / J-type immediate
+# scatter in pass 2). The ISA-general driving - state lifetime, the function loop,
+# pass-2 block resolution, text right-sizing, and `encode.EncoderOutput` assembly -
+# lives in the shared `encode` module; this backend supplies only the RV64 bitfield
+# packers, prologue/epilogue emission, and branch patching.
+#
+# SCOPE (slice 2 of the riscv64 backend, #1626 / #1172): the R/I/S/B/U/J
+# instruction-format packers, the integer ALU (register and immediate), the shifts,
+# neg / not / mv, constant materialization (`li`), the width-driven loads / stores,
+# the alloca / gep address arithmetic, the integer compares, the unconditional /
+# conditional block branches with their pass-2 fixups, the direct / indirect call
+# (the direct call records an `RK_PLT32` marker), the prologue / epilogue, and the
+# `asm_clobbers` analyzer. The families DEFERRED to later slices fail loudly rather
+# than emit wrong bytes: instruction selection (slice 3) feeds this encoder, the
+# inline-asm assembler and the float / divide / conversion families arrive with
+# their slices, and the pc-relative GLOBAL-symbol relocations (`la` hi20/lo12) wait
+# on the linker / ELF relocation seam (slice 4), which owns the new abstract reloc
+# kinds RISC-V needs.
+#
+# WIDTH-HONESTY: the 32-bit instruction-word format machinery (pack_r/i/s/b/u/j),
+# the register field positions, the immediate bit-scatter, and the branch / jump
+# fixups are IDENTICAL across RV32 and RV64 and carry no XLEN assumption. The
+# RV64-specific choices - the `*W` word ALU (OP_32 / OP_IMM_32), the LD / SD memory
+# width, and the 64-bit `li` length - are each driven off the operation's OPERAND
+# SIZE (read from the MIR width, itself derived from the machine model) and are
+# localized and commented, so an RV32 (ilp32) sibling extracts cleanly by changing
+# only those width branches.
+
+use std.allocator.page;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.char.char;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.be.codegen.encode;
+use mach.lang.be.codegen.mir;
+use mach.lang.intern;
+use mach.lang.target.isa;
+use mach.lang.target.isa.riscv64;
+use mach.lang.target.of;
+use mach.lang.target.resolved;
+
+# the concrete signature the erased `isa.IsaVTable.encode` pointer is cast back to,
+# matching the shared `be.codegen.encode.EncodeFn`. the vtable stores `encode`
+# type-erased (`*u8`); the shared dispatcher casts it back to this type before
+# calling it.
+# ---
+# alloc: allocator backing the encoder output's owned arrays
+# tgt:   resolved compilation target (must be RISC-V)
+# m:     the fully-resolved MIR module to encode
+# ret:   the populated encode.EncoderOutput, or an error string
+pub def EncodeFn: fun(*A.Allocator, *resolved.Target, *mir.MirModule) R.Result[encode.EncoderOutput, str];
+
+# the seven-bit major opcodes (instruction bits [6:0]). these are the same on RV32
+# and RV64 EXCEPT OP_32 / OP_IMM_32, which name the RV64 word (`*W`) ALU groups an
+# RV32 sibling does not have - the only XLEN-specific major opcodes here.
+val OP:        u32 = 0x33;  # register ALU (add/sub/and/or/xor/sll/srl/sra/slt + M-ext)
+val OP_IMM:    u32 = 0x13;  # immediate ALU (addi/andi/ori/xori/slli/srli/srai/slti)
+val OP_32:     u32 = 0x3B;  # RV64 word register ALU (addw/subw/sllw/srlw/sraw/mulw)
+val OP_IMM_32: u32 = 0x1B;  # RV64 word immediate ALU (addiw/slliw/srliw/sraiw)
+val LOAD:      u32 = 0x03;  # loads (lb/lh/lw/ld/lbu/lhu/lwu)
+val STORE:     u32 = 0x23;  # stores (sb/sh/sw/sd)
+val BRANCH:    u32 = 0x63;  # conditional branches (beq/bne/blt/bge/bltu/bgeu)
+val JAL:       u32 = 0x6F;  # jump and link (J-type)
+val JALR:      u32 = 0x67;  # jump and link register (I-type)
+val LUI:       u32 = 0x37;  # load upper immediate (U-type)
+val AUIPC:     u32 = 0x17;  # add upper immediate to pc (U-type)
+val SYSTEM:    u32 = 0x73;  # ecall / ebreak
+
+# the three-bit funct3 selectors. for the ALU groups these name the operation; for
+# loads / stores / branches they name the access width / relation (see the width
+# and relation helpers below).
+val F3_ADD:  u32 = 0x0;  # add/sub/addi (also beq, jalr, lb, sb, ecall)
+val F3_SLL:  u32 = 0x1;  # sll/slli (also bne, lh, sh)
+val F3_SLT:  u32 = 0x2;  # slt/slti (also lw, sw)
+val F3_SLTU: u32 = 0x3;  # sltu/sltiu (also ld, sd)
+val F3_XOR:  u32 = 0x4;  # xor/xori (also blt, lbu)
+val F3_SRL:  u32 = 0x5;  # srl/sra/srli/srai (also bge, lhu)
+val F3_OR:   u32 = 0x6;  # or/ori (also bltu, lwu)
+val F3_AND:  u32 = 0x7;  # and/andi (also bgeu)
+
+# the seven-bit funct7 selectors. add/and/or/xor/sll/srl/slt all share funct7 0;
+# sub and sra set bit 5 (0x20); the M extension (mul/div/rem) sets funct7 0x01.
+val F7_ZERO:   u32 = 0x00;
+val F7_SUB:    u32 = 0x20;  # sub / sra (and the srai immediate's funct7)
+val F7_MULDIV: u32 = 0x01;  # M extension
+
+# branch relation funct3: equal / not-equal and the signed / unsigned orderings.
+val F3_BEQ:  u32 = 0x0;
+val F3_BNE:  u32 = 0x1;
+
+# the register roles the encoder uses directly, the leaf module's psABI ids cast to
+# the 5-bit register fields. ZERO discards writes and reads as 0; RA is the link
+# register; SP / FP are the frame registers. SCRATCH (t0) is the encoder's address /
+# right-operand materialization register and SCRATCH2 (t1) the left-operand / value
+# materialization register - both reserved from value allocation by the vtable.
+val RZERO:    u32 = 0;  # riscv64.ZERO (x0)
+val RRA:      u32 = 1;  # riscv64.RA (x1)
+val RSP:      u32 = 2;  # riscv64.SP (x2)
+val RFP:      u32 = 8;  # riscv64.FP (x8 / s0)
+val SCRATCH:  u32 = 5;  # riscv64.SCRATCH_REG (t0)
+val SCRATCH2: u32 = 6;  # riscv64.SCRATCH_REG2 (t1)
+
+# the caller-saved GP register mask an inline-asm call clobbers: ra, t0-t2, a0-a7,
+# t3-t6. none is callee-saved, so a body whose only writes are a call adds no frame.
+val CALLER_SAVED_GP: u32 = 0xF003FCE2;
+
+# the B-type immediate bit-scatter (the signed byte displacement spread across the
+# instruction word): imm[12]->31, imm[10:5]->30:25, imm[4:1]->11:8, imm[11]->7. bit
+# 0 is always zero (instructions are at least 2-aligned). shared by `pack_b` and the
+# pass-2 branch patcher so one definition drives emission and fixup alike.
+fun b_imm(imm: u32) u32 {
+    ret (((imm >> 12) & 0x1) << 31) | (((imm >> 5) & 0x3F) << 25) |
+        (((imm >> 1) & 0xF) << 8)   | (((imm >> 11) & 0x1) << 7);
+}
+
+# the J-type immediate bit-scatter: imm[20]->31, imm[10:1]->30:21, imm[11]->20,
+# imm[19:12]->19:12. bit 0 is always zero. shared by `pack_j` and the patcher.
+fun j_imm(imm: u32) u32 {
+    ret (((imm >> 20) & 0x1) << 31) | (((imm >> 1) & 0x3FF) << 21) |
+        (((imm >> 11) & 0x1) << 20) | (((imm >> 12) & 0xFF) << 12);
+}
+
+# an R-type word - funct7[31:25], rs2[24:20], rs1[19:15], funct3[14:12],
+# rd[11:7], opcode[6:0]. the register-register ALU forms and their `*W` twins.
+fun pack_r(opcode: u32, funct3: u32, funct7: u32, rd: u32, rs1: u32, rs2: u32) u32 {
+    ret ((funct7 & 0x7F) << 25) | ((rs2 & 0x1F) << 20) | ((rs1 & 0x1F) << 15) |
+        ((funct3 & 0x7) << 12)  | ((rd & 0x1F) << 7)   | (opcode & 0x7F);
+}
+
+# an I-type word - imm[31:20] (signed 12-bit), rs1[19:15], funct3[14:12],
+# rd[11:7], opcode[6:0]. the immediate ALU, loads, jalr, and ecall/ebreak forms. an
+# immediate shift passes its 6-bit (or RV64-word 5-bit) shift amount as `imm12`,
+# with the srai/sraiw funct7 folded into imm[10].
+fun pack_i(opcode: u32, funct3: u32, rd: u32, rs1: u32, imm12: u32) u32 {
+    ret ((imm12 & 0xFFF) << 20) | ((rs1 & 0x1F) << 15) | ((funct3 & 0x7) << 12) |
+        ((rd & 0x1F) << 7)      | (opcode & 0x7F);
+}
+
+# an S-type word - imm[11:5] in [31:25], rs2[24:20], rs1[19:15],
+# funct3[14:12], imm[4:0] in [11:7], opcode[6:0]. the stores.
+fun pack_s(opcode: u32, funct3: u32, rs1: u32, rs2: u32, imm12: u32) u32 {
+    val imm: u32 = imm12 & 0xFFF;
+    ret (((imm >> 5) & 0x7F) << 25) | ((rs2 & 0x1F) << 20) | ((rs1 & 0x1F) << 15) |
+        ((funct3 & 0x7) << 12)      | ((imm & 0x1F) << 7)  | (opcode & 0x7F);
+}
+
+# a B-type word - the scattered branch displacement, rs2[24:20],
+# rs1[19:15], funct3[14:12], opcode[6:0]. `imm` is the signed byte displacement.
+fun pack_b(opcode: u32, funct3: u32, rs1: u32, rs2: u32, imm: u32) u32 {
+    ret b_imm(imm) | ((rs2 & 0x1F) << 20) | ((rs1 & 0x1F) << 15) |
+        ((funct3 & 0x7) << 12) | (opcode & 0x7F);
+}
+
+# a U-type word - imm[31:12] (the upper 20 bits), rd[11:7], opcode[6:0].
+# lui and auipc.
+fun pack_u(opcode: u32, rd: u32, imm20: u32) u32 {
+    ret ((imm20 & 0xFFFFF) << 12) | ((rd & 0x1F) << 7) | (opcode & 0x7F);
+}
+
+# a J-type word - the scattered jump displacement, rd[11:7], opcode[6:0].
+# `imm` is the signed byte displacement.
+fun pack_j(opcode: u32, rd: u32, imm: u32) u32 {
+    ret j_imm(imm) | ((rd & 0x1F) << 7) | (opcode & 0x7F);
+}
+
+# append one 32-bit RISC-V instruction word to the text sink (little-endian).
+fun emit_word(st: *encode.EncodeState, word: u32) {
+    encode.emit_u32(?st.buf, word);
+}
+
+# read the 32-bit little-endian word at `pos` in the text sink.
+fun read_word(buf: *encode.ByteBuf, pos: usize) u32 {
+    ret buf.data[pos]::u32 |
+        (buf.data[pos + 1]::u32 << 8) |
+        (buf.data[pos + 2]::u32 << 16) |
+        (buf.data[pos + 3]::u32 << 24);
+}
+
+# overwrite the 32-bit little-endian word at `pos` in the text sink.
+fun write_word(buf: *encode.ByteBuf, pos: usize, word: u32) {
+    buf.data[pos]     = (word & 0xFF)::u8;
+    buf.data[pos + 1] = ((word >> 8) & 0xFF)::u8;
+    buf.data[pos + 2] = ((word >> 16) & 0xFF)::u8;
+    buf.data[pos + 3] = ((word >> 24) & 0xFF)::u8;
+}
+
+# the major opcode of the register ALU group for an operation width. RV64-SPECIFIC:
+# a 32-bit operation selects the word ALU (OP_32 -> addw/subw/...), every other
+# width the full-register ALU (OP). an RV32 sibling always returns OP here.
+fun alu_opcode(width: u8) u32 {
+    if (width == 4) { ret OP_32; }
+    ret OP;
+}
+
+# the major opcode of the immediate ALU group for an operation width. RV64-SPECIFIC:
+# a 32-bit operation selects OP_IMM_32 (addiw/slliw/...), every other width OP_IMM.
+fun alu_imm_opcode(width: u8) u32 {
+    if (width == 4) { ret OP_IMM_32; }
+    ret OP_IMM;
+}
+
+# the load funct3 for an access width, choosing the zero-extending sub-word forms so
+# a narrow load defines the whole register (the AArch64 / x86-64 convention).
+# RV64-SPECIFIC: width 4 is `lwu` and width 8 is `ld`, neither of which an RV32
+# sibling has (its width-4 load is the full-register `lw`, funct3 2).
+fun load_funct3(width: u8) u32 {
+    if (width == 1) { ret 0x4; }  # lbu
+    if (width == 2) { ret 0x5; }  # lhu
+    if (width == 4) { ret 0x6; }  # lwu (RV64)
+    ret 0x3;                       # ld (RV64)
+}
+
+# the store funct3 for an access width. RV64-SPECIFIC: width 8 is `sd`, which an
+# RV32 sibling lacks (its widest store is `sw`, funct3 2).
+fun store_funct3(width: u8) u32 {
+    if (width == 1) { ret 0x0; }  # sb
+    if (width == 2) { ret 0x1; }  # sh
+    if (width == 4) { ret 0x2; }  # sw
+    ret 0x3;                       # sd (RV64)
+}
+
+# the GP register index a post-regalloc register operand names. only a physical
+# register survives to encode; a surviving virtual register is a register-allocation
+# bug, and a memory operand reaches the dedicated load/store/address paths, so both
+# are rejected loudly here.
+fun req_gpr(op: *mir.MirOperand) R.Result[i32, str] {
+    if (op.kind == mir.MIR_OP_PREG) {
+        ret R.ok[i32, str](isa.regid_index(op.preg::i32));
+    }
+    if (op.kind == mir.MIR_OP_VREG) {
+        ret R.err[i32, str]("encode: virtual register survived register allocation");
+    }
+    ret R.err[i32, str]("encode: expected a register operand");
+}
+
+# sign-extend the low 12 bits of a value (the reach of an I/S-type immediate).
+fun sext12(v: i64) i64 {
+    var x: i64 = v & 0xFFF;
+    if ((x & 0x800) != 0) { x = x - 0x1000; }
+    ret x;
+}
+
+# materialize a 32-bit constant into `rd`: `lui rd, hi20 ; addiw rd, rd, lo12` (the
+# +0x800 rounding folds the signed low-12 back), or a bare `lui` when the low 12 are
+# zero. the caller has already handled a value that fits a single `addi`.
+fun emit_li32(st: *encode.EncodeState, rd: u32, v: i32) {
+    val hi20: u32 = ((v + 0x800) >> 12)::u32 & 0xFFFFF;
+    val lo12: u32 = v::u32 & 0xFFF;
+    emit_word(st, pack_u(LUI, rd, hi20));
+    if (lo12 != 0) { emit_word(st, pack_i(OP_IMM_32, F3_ADD, rd, rd, lo12)); }
+}
+
+# materialize the signed immediate `value` into GP register `rd`. a value within the
+# 12-bit signed immediate is a single `addi rd, x0, value`; a 32-bit value takes the
+# `lui ; addiw` pair. RV64-SPECIFIC: a value wider than 32 bits takes the recursive
+# (materialize the high part ; `slli rd, rd, 12` ; `addi rd, rd, lo12`) sequence -
+# the 64-bit constant length an RV32 sibling never reaches, since its widest
+# immediate is 32-bit and it stops at the `lui ; addiw` path above.
+fun emit_li(st: *encode.EncodeState, rd: u32, value: i64) {
+    if (value >= -2048 && value <= 2047) {
+        emit_word(st, pack_i(OP_IMM, F3_ADD, rd, RZERO, value::u32 & 0xFFF));
+        ret;
+    }
+    if (value >= -2147483648 && value <= 2147483647) {
+        emit_li32(st, rd, value::i32);
+        ret;
+    }
+    val lo12: i64 = sext12(value);
+    val hi: i64 = (value - lo12) >> 12;
+    emit_li(st, rd, hi);
+    emit_word(st, pack_i(OP_IMM, F3_SLL, rd, rd, 12));  # slli rd, rd, 12
+    if (lo12 != 0) { emit_word(st, pack_i(OP_IMM, F3_ADD, rd, rd, lo12::u32 & 0xFFF)); }
+}
+
+# the GP register index a source operand contributes. a physical register is used
+# directly; an immediate is materialized into `scratch` (and that index returned).
+# every other shape is rejected through `req_gpr`.
+fun resolve_source(st: *encode.EncodeState, op: *mir.MirOperand, scratch: u32) R.Result[i32, str] {
+    if (op.kind == mir.MIR_OP_IMM) {
+        emit_li(st, scratch, op.imm);
+        ret R.ok[i32, str](scratch::i32);
+    }
+    ret req_gpr(op);
+}
+
+# `rd = rs1 + off` as a pointer-width address computation. a `off` within the 12-bit
+# signed immediate folds into a single `addi`; a wider `off` is materialized into the
+# scratch register and added with a full-register `add`.
+fun emit_addi(st: *encode.EncodeState, rd: u32, rs1: u32, off: i64) {
+    if (off >= -2048 && off <= 2047) {
+        emit_word(st, pack_i(OP_IMM, F3_ADD, rd, rs1, off::u32 & 0xFFF));
+        ret;
+    }
+    emit_li(st, SCRATCH, off);
+    emit_word(st, pack_r(OP, F3_ADD, F7_ZERO, rd, rs1, SCRATCH));
+}
+
+# emit a width-sized integer load or store of register `rt` at `[base + off]`. a
+# `off` within the 12-bit signed immediate uses the direct I-type load / S-type
+# store; a wider `off` is materialized into the scratch register, added to the base,
+# and the access addressed at `[scratch + 0]`. loads use the zero-extending forms, so
+# a sub-word load defines the whole register.
+fun emit_mem_access(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width: u8, is_load: bool) {
+    var b: u32 = base;
+    var d: i64 = off;
+    if (off < -2048 || off > 2047) {
+        emit_li(st, SCRATCH2, off);
+        emit_word(st, pack_r(OP, F3_ADD, F7_ZERO, SCRATCH2, base, SCRATCH2));
+        b = SCRATCH2;
+        d = 0;
+    }
+    if (is_load) {
+        emit_word(st, pack_i(LOAD, load_funct3(width), rt, b, d::u32 & 0xFFF));
+        ret;
+    }
+    emit_word(st, pack_s(STORE, store_funct3(width), b, rt, d::u32 & 0xFFF));
+}
+
+# the frame-pointer offset of the slot a MIR value owns, or none when it owns no
+# slot. the slot table is keyed on the slot-owning vreg ids, so a physical-register
+# base (carrying MIR_VREG_NIL) never matches.
+fun frame_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
+    val frame: *mir.MirFrame = ?f.frame;
+    if (frame.slots == nil) { ret O.none[i64](); }
+    var i: u32 = 0;
+    for (i < frame.slot_count) {
+        if (frame.slots[i].value == v) { ret O.some[i64](frame.slots[i].offset); }
+        i = i + 1;
+    }
+    ret O.none[i64]();
+}
+
+# a resolved memory operand - a base register, a constant byte displacement folded
+# onto it, and an optional scaled index register. a frame-slot-key base resolves to
+# the frame pointer (s0) with the slot offset folded into `off`; a physical-register
+# base keeps its register and displacement.
+# ---
+# base:      base register index (s0 for a frame slot, else the physical base)
+# off:       constant byte displacement folded onto the base
+# has_index: true when a scaled runtime index rides the address
+# index:     scaled index register index (when has_index)
+# scale:     index scale (1/2/4/8) (when has_index)
+rec RvMem {
+    base:      u32;
+    off:       i64;
+    has_index: bool;
+    index:     u32;
+    scale:     u8;
+}
+
+# lower a post-regalloc MIR_OP_MEM operand to its base / offset / scaled-index form.
+# a frame-slot-key base folds the slot offset onto s0; a physical-register base keeps
+# `preg`. a surviving value vreg in the base or index is a register-allocation bug,
+# rejected loudly. a symbol-relative memory operand (a folded global) is deferred to
+# the relocation slice.
+fun resolve_mem(f: *mir.MirFunction, op: *mir.MirOperand) R.Result[RvMem, str] {
+    if (op.kind != mir.MIR_OP_MEM) {
+        ret R.err[RvMem, str]("encode: expected a memory operand");
+    }
+    if (op.sym != intern.STR_NIL) {
+        ret R.err[RvMem, str]("encode: riscv64 folded-global memory operands await the relocation slice");
+    }
+    var m: RvMem;
+    m.has_index = false;
+    m.index     = 0;
+    m.scale     = 0;
+    if (op.index != mir.MIR_VREG_NIL) {
+        if (!op.index_is_preg) {
+            ret R.err[RvMem, str]("encode: value vreg survived in a memory-operand index");
+        }
+        m.has_index = true;
+        m.index     = op.index;
+        m.scale     = op.scale;
+    }
+    if (op.vreg != mir.MIR_VREG_NIL) {
+        val slot: O.Option[i64] = frame_slot_offset(f, op.vreg);
+        if (!O.is_some[i64](slot)) {
+            ret R.err[RvMem, str]("encode: value vreg survived in a memory-operand base");
+        }
+        m.base = RFP;
+        m.off  = O.unwrap[i64](slot) + op.imm;
+        ret R.ok[RvMem, str](m);
+    }
+    m.base = op.preg;
+    m.off  = op.imm;
+    ret R.ok[RvMem, str](m);
+}
+
+# the log2 of an index scale (1/2/4/8 -> 0/1/2/3) for a scaled-index `gep`. an
+# unmodeled scale takes 0 (a bare add).
+fun scale_shift(scale: u8) u32 {
+    if (scale == 2) { ret 1; }
+    if (scale == 4) { ret 2; }
+    if (scale == 8) { ret 3; }
+    ret 0;
+}
+
+# a three-address integer ALU op `op rd, rs1, rs2`. the operands resolve to
+# registers (an immediate source is materialized into the scratch register); the
+# width selects the full-register or RV64 word group through `alu_opcode`.
+fun encode_alu3(st: *encode.EncodeState, mi: *mir.MirInstr, funct3: u32, funct7: u32) R.Result[bool, str] {
+    if (mi.operand_count < 3) { ret R.err[bool, str]("encode: ALU op missing operands"); }
+
+    val rdr: R.Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
+    val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
+
+    val rnr: R.Result[i32, str] = resolve_source(st, ?mi.operands[1], SCRATCH2);
+    if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
+    val rs1: u32 = R.unwrap_ok[i32, str](rnr)::u32;
+
+    val rmr: R.Result[i32, str] = resolve_source(st, ?mi.operands[2], SCRATCH);
+    if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
+    val rs2: u32 = R.unwrap_ok[i32, str](rmr)::u32;
+
+    emit_word(st, pack_r(alu_opcode(mi.width), funct3, funct7, rd, rs1, rs2));
+    ret R.ok[bool, str](true);
+}
+
+# integer add / subtract. a small-immediate right operand folds into `addi` (or, for
+# subtract, `addi` of the negated immediate); otherwise the register form is emitted
+# (an out-of-range immediate materialized into the scratch register). RISC-V has no
+# subtract-immediate, so subtract-immediate is add of the negation.
+fun encode_addsub(st: *encode.EncodeState, mi: *mir.MirInstr, is_sub: bool) R.Result[bool, str] {
+    if (mi.operand_count < 3) { ret R.err[bool, str]("encode: add/sub missing operands"); }
+
+    val rdr: R.Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
+    val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
+
+    val rnr: R.Result[i32, str] = resolve_source(st, ?mi.operands[1], SCRATCH2);
+    if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
+    val rs1: u32 = R.unwrap_ok[i32, str](rnr)::u32;
+
+    val rhs: *mir.MirOperand = ?mi.operands[2];
+    if (rhs.kind == mir.MIR_OP_IMM) {
+        var v: i64 = rhs.imm;
+        if (is_sub) { v = 0 - v; }
+        if (v >= -2048 && v <= 2047) {
+            emit_word(st, pack_i(alu_imm_opcode(mi.width), F3_ADD, rd, rs1, v::u32 & 0xFFF));
+            ret R.ok[bool, str](true);
+        }
+    }
+
+    val rmr: R.Result[i32, str] = resolve_source(st, rhs, SCRATCH);
+    if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
+    val rs2: u32 = R.unwrap_ok[i32, str](rmr)::u32;
+
+    var f7: u32 = F7_ZERO;
+    if (is_sub) { f7 = F7_SUB; }
+    emit_word(st, pack_r(alu_opcode(mi.width), F3_ADD, f7, rd, rs1, rs2));
+    ret R.ok[bool, str](true);
+}
+
+# a shift `op rd, rs1, rs2|shamt`. an immediate shift amount uses the immediate form
+# (slli/srli/srai, or the RV64 word slliw/srliw/sraiw), masking the amount to 6 bits
+# (5 for the word form) and folding the srai funct7 into imm[10]; a register amount
+# uses the register form. `funct3` is SLL for left and SRL for right; `is_arith`
+# selects the arithmetic (sign-filling) right shift.
+fun encode_shift(st: *encode.EncodeState, mi: *mir.MirInstr, funct3: u32, is_arith: bool) R.Result[bool, str] {
+    if (mi.operand_count < 3) { ret R.err[bool, str]("encode: shift missing operands"); }
+
+    val rdr: R.Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
+    val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
+
+    val rnr: R.Result[i32, str] = req_gpr(?mi.operands[1]);
+    if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
+    val rs1: u32 = R.unwrap_ok[i32, str](rnr)::u32;
+
+    val rhs: *mir.MirOperand = ?mi.operands[2];
+    if (rhs.kind == mir.MIR_OP_IMM) {
+        # the RV64 full-register shift takes a 6-bit amount; the word shift 5-bit.
+        var mask: u32 = 0x3F;
+        if (mi.width == 4) { mask = 0x1F; }
+        var imm: u32 = rhs.imm::u32 & mask;
+        if (is_arith) { imm = imm | 0x400; }  # funct7 0x20 -> imm[10]
+        emit_word(st, pack_i(alu_imm_opcode(mi.width), funct3, rd, rs1, imm));
+        ret R.ok[bool, str](true);
+    }
+
+    val rmr: R.Result[i32, str] = req_gpr(rhs);
+    if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
+    val rs2: u32 = R.unwrap_ok[i32, str](rmr)::u32;
+
+    var f7: u32 = F7_ZERO;
+    if (is_arith) { f7 = F7_SUB; }
+    emit_word(st, pack_r(alu_opcode(mi.width), funct3, f7, rd, rs1, rs2));
+    ret R.ok[bool, str](true);
+}
+
+# integer negate `neg rd, rs` (the `sub rd, x0, rs` alias; the RV64 word negw at
+# 32-bit width). operand 0 is the destination, operand 1 the source.
+fun encode_neg(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 2) { ret R.err[bool, str]("encode: neg missing operands"); }
+    val rdr: R.Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
+    val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
+    val rsr: R.Result[i32, str] = req_gpr(?mi.operands[1]);
+    if (R.is_err[i32, str](rsr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rsr)); }
+    val rs: u32 = R.unwrap_ok[i32, str](rsr)::u32;
+    emit_word(st, pack_r(alu_opcode(mi.width), F3_ADD, F7_SUB, rd, RZERO, rs));
+    ret R.ok[bool, str](true);
+}
+
+# bitwise complement `not rd, rs` (the `xori rd, rs, -1` alias). bit-for-bit
+# inversion is width-independent, so the full-register `xori` is always correct.
+fun encode_not(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 2) { ret R.err[bool, str]("encode: not missing operands"); }
+    val rdr: R.Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
+    val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
+    val rsr: R.Result[i32, str] = req_gpr(?mi.operands[1]);
+    if (R.is_err[i32, str](rsr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rsr)); }
+    val rs: u32 = R.unwrap_ok[i32, str](rsr)::u32;
+    emit_word(st, pack_i(OP_IMM, F3_XOR, rd, rs, 0xFFF));  # xori rd, rs, -1
+    ret R.ok[bool, str](true);
+}
+
+# a register move or immediate load `[dst, src]`. a memory destination is a spill
+# store; a memory source is a spill reload; an immediate source is an `li`; a
+# register source is `mv` (the `addi dst, src, 0` alias).
+fun encode_mov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 2) { ret R.err[bool, str]("encode: mov missing operands"); }
+    val dst: *mir.MirOperand = ?mi.operands[0];
+    val src: *mir.MirOperand = ?mi.operands[1];
+
+    if (dst.kind == mir.MIR_OP_MEM) {
+        ret emit_store_mem(st, f, dst, src, mi.width);
+    }
+
+    val rdr: R.Result[i32, str] = req_gpr(dst);
+    if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
+    val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
+
+    if (src.kind == mir.MIR_OP_MEM) {
+        val mr: R.Result[RvMem, str] = resolve_mem(f, src);
+        if (R.is_err[RvMem, str](mr)) { ret R.err[bool, str](R.unwrap_err[RvMem, str](mr)); }
+        val m: RvMem = R.unwrap_ok[RvMem, str](mr);
+        emit_mem_access(st, rd, m.base, m.off, mi.width, true);
+        ret R.ok[bool, str](true);
+    }
+    if (src.kind == mir.MIR_OP_IMM) {
+        emit_li(st, rd, src.imm);
+        ret R.ok[bool, str](true);
+    }
+
+    val rsr: R.Result[i32, str] = req_gpr(src);
+    if (R.is_err[i32, str](rsr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rsr)); }
+    val rs: u32 = R.unwrap_ok[i32, str](rsr)::u32;
+    emit_word(st, pack_i(OP_IMM, F3_ADD, rd, rs, 0));  # mv rd, rs
+    ret R.ok[bool, str](true);
+}
+
+# store register / immediate `val_op` to the resolved memory destination. a
+# non-register value (an immediate) is materialized into the scratch register first.
+fun emit_store_mem(st: *encode.EncodeState, f: *mir.MirFunction, dst_mem: *mir.MirOperand, val_op: *mir.MirOperand, width: u8) R.Result[bool, str] {
+    val mr: R.Result[RvMem, str] = resolve_mem(f, dst_mem);
+    if (R.is_err[RvMem, str](mr)) { ret R.err[bool, str](R.unwrap_err[RvMem, str](mr)); }
+    val m: RvMem = R.unwrap_ok[RvMem, str](mr);
+
+    var rt: u32 = RZERO;
+    if (val_op.kind == mir.MIR_OP_IMM) {
+        if (val_op.imm != 0) {
+            emit_li(st, SCRATCH, val_op.imm);
+            rt = SCRATCH;
+        }
+    } or {
+        val rr: R.Result[i32, str] = req_gpr(val_op);
+        if (R.is_err[i32, str](rr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rr)); }
+        rt = R.unwrap_ok[i32, str](rr)::u32;
+    }
+    emit_mem_access(st, rt, m.base, m.off, width, false);
+    ret R.ok[bool, str](true);
+}
+
+# a non-symbol load `[dst, mem]`. a folded-global symbol load is deferred to the
+# relocation slice through `resolve_mem`.
+fun encode_load(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 2) { ret R.err[bool, str]("encode: load missing operands"); }
+    val rdr: R.Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
+    val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
+    val mr: R.Result[RvMem, str] = resolve_mem(f, ?mi.operands[1]);
+    if (R.is_err[RvMem, str](mr)) { ret R.err[bool, str](R.unwrap_err[RvMem, str](mr)); }
+    val m: RvMem = R.unwrap_ok[RvMem, str](mr);
+    emit_mem_access(st, rd, m.base, m.off, mi.width, true);
+    ret R.ok[bool, str](true);
+}
+
+# a non-symbol store `[mem, val]`.
+fun encode_store(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 2) { ret R.err[bool, str]("encode: store missing operands"); }
+    ret emit_store_mem(st, f, ?mi.operands[0], ?mi.operands[1], mi.width);
+}
+
+# alloca / gep address arithmetic `[dst, mem]` - `dst = base + index*scale + off`.
+# a scaled index is shifted into the scratch register and added to the base, then the
+# constant displacement folds onto the result.
+fun encode_addr(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 2) { ret R.err[bool, str]("encode: address op missing operands"); }
+    val rdr: R.Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
+    val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
+    val mr: R.Result[RvMem, str] = resolve_mem(f, ?mi.operands[1]);
+    if (R.is_err[RvMem, str](mr)) { ret R.err[bool, str](R.unwrap_err[RvMem, str](mr)); }
+    val m: RvMem = R.unwrap_ok[RvMem, str](mr);
+
+    if (m.has_index) {
+        var idx: u32 = m.index;
+        val sh: u32 = scale_shift(m.scale);
+        if (sh != 0) {
+            emit_word(st, pack_i(OP_IMM, F3_SLL, SCRATCH, m.index, sh));  # slli t0, index, sh
+            idx = SCRATCH;
+        }
+        emit_word(st, pack_r(OP, F3_ADD, F7_ZERO, rd, m.base, idx));      # add rd, base, idx
+        if (m.off != 0) { emit_addi(st, rd, rd, m.off); }
+        ret R.ok[bool, str](true);
+    }
+    emit_addi(st, rd, m.base, m.off);
+    ret R.ok[bool, str](true);
+}
+
+# true when a post-isel opcode is a surviving generic comparison sentinel - the
+# encoder materializes the slt / sltu / seqz / snez byte sequence from it.
+fun is_mir_compare(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_SEL_CMP_EQ || op == mir.MIR_SEL_CMP_NE ||
+        op == mir.MIR_SEL_CMP_LT_S || op == mir.MIR_SEL_CMP_LT_U ||
+        op == mir.MIR_SEL_CMP_LE_S || op == mir.MIR_SEL_CMP_LE_U;
+}
+
+# materialize a surviving comparison `[dst, lhs, rhs]` into a 0/1 result. RISC-V has
+# no flags register, so each relation synthesizes its boolean from the set-less-than
+# primitives: equal / not-equal through `xor` then `seqz`/`snez` (the `sltiu rd,t,1`
+# / `sltu rd,x0,t` idioms), the less-than relations directly with `slt`/`sltu`, and
+# the less-or-equal relations as the negation of the swapped strict relation. the
+# `xor` is bit-for-bit so it needs no width branch; the orderings ride the operands
+# isel sign- or zero-extended to the operation width.
+fun encode_compare(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 3) { ret R.err[bool, str]("encode: compare missing operands"); }
+
+    val rdr: R.Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
+    val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
+
+    val rnr: R.Result[i32, str] = resolve_source(st, ?mi.operands[1], SCRATCH2);
+    if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
+    val lhs: u32 = R.unwrap_ok[i32, str](rnr)::u32;
+
+    val rmr: R.Result[i32, str] = resolve_source(st, ?mi.operands[2], SCRATCH);
+    if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
+    val rhs: u32 = R.unwrap_ok[i32, str](rmr)::u32;
+
+    val op: mir.MirOpcode = mi.opcode;
+    if (op == mir.MIR_SEL_CMP_EQ) {
+        emit_word(st, pack_r(OP, F3_XOR, F7_ZERO, rd, lhs, rhs));   # xor rd, lhs, rhs
+        emit_word(st, pack_i(OP_IMM, F3_SLTU, rd, rd, 1));          # seqz rd, rd
+        ret R.ok[bool, str](true);
+    }
+    if (op == mir.MIR_SEL_CMP_NE) {
+        emit_word(st, pack_r(OP, F3_XOR, F7_ZERO, rd, lhs, rhs));   # xor rd, lhs, rhs
+        emit_word(st, pack_r(OP, F3_SLTU, F7_ZERO, rd, RZERO, rd)); # snez rd, rd
+        ret R.ok[bool, str](true);
+    }
+    if (op == mir.MIR_SEL_CMP_LT_S) {
+        emit_word(st, pack_r(OP, F3_SLT, F7_ZERO, rd, lhs, rhs));   # slt rd, lhs, rhs
+        ret R.ok[bool, str](true);
+    }
+    if (op == mir.MIR_SEL_CMP_LT_U) {
+        emit_word(st, pack_r(OP, F3_SLTU, F7_ZERO, rd, lhs, rhs));  # sltu rd, lhs, rhs
+        ret R.ok[bool, str](true);
+    }
+    if (op == mir.MIR_SEL_CMP_LE_S) {
+        emit_word(st, pack_r(OP, F3_SLT, F7_ZERO, rd, rhs, lhs));   # slt rd, rhs, lhs
+        emit_word(st, pack_i(OP_IMM, F3_XOR, rd, rd, 1));           # xori rd, rd, 1
+        ret R.ok[bool, str](true);
+    }
+    # MIR_SEL_CMP_LE_U
+    emit_word(st, pack_r(OP, F3_SLTU, F7_ZERO, rd, rhs, lhs));      # sltu rd, rhs, lhs
+    emit_word(st, pack_i(OP_IMM, F3_XOR, rd, rd, 1));               # xori rd, rd, 1
+    ret R.ok[bool, str](true);
+}
+
+# an unconditional branch to a block. emits `j label` (the `jal x0` alias) with a
+# zero displacement placeholder and records a fixup (patch site = the instruction
+# word start) for pass 2 to scatter the resolved displacement.
+fun encode_branch(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 1 || mi.operands[0].kind != mir.MIR_OP_BLOCK) {
+        ret R.err[bool, str]("encode: branch target is not a block");
+    }
+    val target_block: u32 = mi.operands[0].imm::u32;
+    val patch_pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_j(JAL, RZERO, 0));
+    val next_ip: u32 = st.buf.len::u32;
+    ret encode.push_fixup(st, patch_pos, next_ip, target_block, fn_base);
+}
+
+# a conditional branch `[cond, then_block, else_block]` materialized as
+# `bne cond, x0, then` (taken when the condition is non-zero) ; `j else` (the
+# fall-through edge). each branch records a fixup against its target block; pass 2
+# scatters the B-type / J-type displacement once both block offsets are known.
+fun encode_cbr(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 3) { ret R.err[bool, str]("encode: conditional branch missing operands"); }
+    if (mi.operands[1].kind != mir.MIR_OP_BLOCK || mi.operands[2].kind != mir.MIR_OP_BLOCK) {
+        ret R.err[bool, str]("encode: conditional branch target is not a block");
+    }
+    val then_block: u32 = mi.operands[1].imm::u32;
+    val else_block: u32 = mi.operands[2].imm::u32;
+
+    val rcr: R.Result[i32, str] = req_gpr(?mi.operands[0]);
+    if (R.is_err[i32, str](rcr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rcr)); }
+    val cond: u32 = R.unwrap_ok[i32, str](rcr)::u32;
+
+    val bne_pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_b(BRANCH, F3_BNE, cond, RZERO, 0));
+    val bne_next: u32 = st.buf.len::u32;
+    val f1: R.Result[bool, str] = encode.push_fixup(st, bne_pos, bne_next, then_block, fn_base);
+    if (R.is_err[bool, str](f1)) { ret f1; }
+
+    val j_pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_j(JAL, RZERO, 0));
+    val j_next: u32 = st.buf.len::u32;
+    ret encode.push_fixup(st, j_pos, j_next, else_block, fn_base);
+}
+
+# a direct or indirect call. a MIR_OP_SYM callee emits the `auipc ra, 0 ; jalr ra,
+# ra, 0` call pair with zero placeholders and records an `RK_PLT32` marker at the
+# auipc (the abstract direct-call kind the linker maps to R_RISCV_CALL_PLT in the
+# relocation slice; the addend is the symbol's own constant). a register callee
+# emits the register-indirect `jalr ra, rs, 0`. MIR_CALL stays the caller-saved
+# clobber barrier the allocator keyed on; this only emits its bytes.
+fun encode_call(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 1) { ret R.err[bool, str]("encode: call missing callee operand"); }
+    val callee: *mir.MirOperand = ?mi.operands[0];
+    if (callee.kind == mir.MIR_OP_SYM) {
+        if (callee.sym == intern.STR_NIL) {
+            ret R.err[bool, str]("encode: direct call has no resolved symbol name");
+        }
+        val pos: u32 = st.buf.len::u32;
+        emit_word(st, pack_u(AUIPC, RRA, 0));
+        emit_word(st, pack_i(JALR, F3_ADD, RRA, RRA, 0));
+        ret encode.push_reloc(st, pos, of.RK_PLT32, callee.sym, callee.sym_off);
+    }
+    val rr: R.Result[i32, str] = req_gpr(callee);
+    if (R.is_err[i32, str](rr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rr)); }
+    emit_word(st, pack_i(JALR, F3_ADD, RRA, R.unwrap_ok[i32, str](rr)::u32, 0));
+    ret R.ok[bool, str](true);
+}
+
+# the number of set bits in a 32-bit mask.
+fun popcount32(m: u32) u32 {
+    var n: u32 = 0;
+    var x: u32 = m;
+    for (x != 0) {
+        n = n + (x & 1);
+        x = x >> 1;
+    }
+    ret n;
+}
+
+# round a byte count up to a 16-byte boundary (the RISC-V stack alignment).
+fun align16(n: u32) u32 {
+    ret (n + 15) & ~15::u32;
+}
+
+# the 16-byte-aligned total the prologue allocates below the entry stack pointer: the
+# 16-byte ra / s0 record, the callee-saved GP save area, the local frame, and the
+# outgoing-argument region, read from the shared frame facts. unlike AArch64 the
+# record is part of this single allocation rather than a separate pre-index push.
+fun frame_total(f: *mir.MirFunction) u32 {
+    val gp_bytes: u32 = popcount32(f.callee_mask) * 8;
+    ret align16(16 + gp_bytes + f.frame.size + f.frame.outgoing_size);
+}
+
+# adjust SP by `delta` bytes (subtract on entry, add on exit). a delta within the
+# 12-bit signed immediate folds into a single `addi sp, sp, +-delta`; a larger delta
+# is materialized into the scratch register and applied with a full-register add /
+# sub. `delta` is the positive frame size; `subtract` selects entry vs exit.
+fun emit_sp_adjust(st: *encode.EncodeState, delta: u32, subtract: bool) {
+    var signed: i64 = delta::i64;
+    if (subtract) { signed = 0 - signed; }
+    if (signed >= -2048 && signed <= 2047) {
+        emit_word(st, pack_i(OP_IMM, F3_ADD, RSP, RSP, signed::u32 & 0xFFF));
+        ret;
+    }
+    emit_li(st, SCRATCH, delta::i64);
+    if (subtract) { emit_word(st, pack_r(OP, F3_ADD, F7_SUB, RSP, RSP, SCRATCH)); }
+    or            { emit_word(st, pack_r(OP, F3_ADD, F7_ZERO, RSP, RSP, SCRATCH)); }
+}
+
+# save (or restore) the callee-saved GP registers `callee_mask` selects, in ascending
+# register order, in the area just below the ra / s0 record. each register takes an
+# 8-byte slot, the first at `total - 24` (8 below the s0 slot at `total - 16`),
+# addressed SP-relative. the area sits within `frame_total`'s GP region.
+fun save_callee_gp(st: *encode.EncodeState, f: *mir.MirFunction, total: u32, store: bool) {
+    var n: u32 = 0;
+    var r: u32 = 0;
+    for (r < 32) {
+        if ((f.callee_mask & (1::u32 << r)) != 0) {
+            val off: i64 = (total::i64) - 16 - 8 - (8 * n)::i64;
+            emit_mem_access(st, r, RSP, off, 8, !store);
+            n = n + 1;
+        }
+        r = r + 1;
+    }
+}
+
+# the RISC-V prologue. `addi sp, sp, -total` allocates the frame, `sd ra` / `sd s0`
+# save the record at the top of it, `addi s0, sp, total` pins the frame pointer at
+# the entry stack pointer (so incoming stack arguments sit at `[s0+0]`), and the
+# callee-saved GP registers are saved just below the record.
+fun emit_prologue(st: *encode.EncodeState, f: *mir.MirFunction, total: u32) {
+    emit_sp_adjust(st, total, true);
+    emit_mem_access(st, RRA, RSP, (total::i64) - 8, 8, false);   # sd ra, total-8(sp)
+    emit_mem_access(st, RFP, RSP, (total::i64) - 16, 8, false);  # sd s0, total-16(sp)
+    emit_addi(st, RFP, RSP, total::i64);                         # addi s0, sp, total
+    save_callee_gp(st, f, total, true);
+}
+
+# the RISC-V epilogue. it restores the callee-saved GP registers, reloads the ra / s0
+# record, then deallocates the frame with `addi sp, sp, total`. the RET that follows
+# returns through ra.
+fun emit_epilogue(st: *encode.EncodeState, f: *mir.MirFunction, total: u32) {
+    save_callee_gp(st, f, total, false);
+    emit_mem_access(st, RRA, RSP, (total::i64) - 8, 8, true);    # ld ra, total-8(sp)
+    emit_mem_access(st, RFP, RSP, (total::i64) - 16, 8, true);   # ld s0, total-16(sp)
+    emit_sp_adjust(st, total, false);
+}
+
+# a function whose inline asm owns the stack and must be emitted with NO compiler
+# prologue / epilogue - no frame, no callee-saved registers, no outgoing-argument
+# area, and a body containing an inline-asm block. the entry point `_start` reads the
+# kernel-supplied SP directly, so a frame allocation ahead of it would shift SP and
+# corrupt the argc / argv it extracts. mirrors x86-64 / AArch64's `function_is_naked`.
+fun function_is_naked(f: *mir.MirFunction) bool {
+    if (f.frame.size != 0)          { ret false; }
+    if (f.callee_mask != 0)         { ret false; }
+    if (f.callee_mask_fp != 0)      { ret false; }
+    if (f.frame.outgoing_size != 0) { ret false; }
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            if (mi.opcode == mir.MIR_ASM) { ret true; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+# translate one post-regalloc MIR instruction into RV64 bytes, recording any
+# intra-module branch fixup or symbol relocation. the regalloc parallel-copy /
+# liveness pseudos emit nothing; the surviving comparison / conditional-branch /
+# memory opcodes expand into their byte sequences; MIR_CALL emits the call (recording
+# its RK_PLT32 marker); the families awaiting later slices (float / divide /
+# conversion / inline-asm) are rejected loudly rather than emitting wrong bytes.
+fun encode_mir_instr(st: *encode.EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *mir.MirInstr) R.Result[bool, str] {
+    val op: u16 = mi.opcode::u16;
+
+    # pseudo-opcodes the regalloc phase leaves behind emit no bytes.
+    if (op == isa.ISA_PCOPY || op == isa.ISA_PCOPY_FENCE ||
+        op == isa.ISA_USE || op == isa.ISA_LABEL) {
+        ret R.ok[bool, str](true);
+    }
+    if (mi.opcode == mir.MIR_CALL_RES || mi.opcode == mir.MIR_ARG) {
+        ret R.ok[bool, str](true);
+    }
+    if (mi.opcode == mir.MIR_PHI) {
+        ret R.err[bool, str]("internal compiler error: phi survived register allocation");
+    }
+
+    # the surviving comparison / conditional-branch sentinels expand into their byte
+    # sequences.
+    if (is_mir_compare(mi.opcode))    { ret encode_compare(st, mi); }
+    if (mi.opcode == mir.MIR_SEL_CBR) { ret encode_cbr(st, fn_base, mi); }
+
+    # the register-allocator's spill reload / store carries the generic MIR_MOV
+    # opcode; route it to the move encoder, which handles its frame-slot MEM operand.
+    if (mi.opcode == mir.MIR_MOV) { ret encode_mov(st, f, mi); }
+
+    # memory: alloca / gep address arithmetic, and non-symbol load / store.
+    if (mi.opcode == mir.MIR_ALLOCA || mi.opcode == mir.MIR_GEP) { ret encode_addr(st, f, mi); }
+    if (mi.opcode == mir.MIR_LOAD)                               { ret encode_load(st, f, mi); }
+    if (mi.opcode == mir.MIR_STORE)                              { ret encode_store(st, f, mi); }
+
+    if (mi.opcode == mir.MIR_CALL) { ret encode_call(st, mi); }
+
+    # concrete RV64 opcodes.
+    if (op == riscv64.ADD::u16)    { ret encode_addsub(st, mi, false); }
+    if (op == riscv64.SUB::u16)    { ret encode_addsub(st, mi, true); }
+    if (op == riscv64.MUL::u16)    { ret encode_alu3(st, mi, F3_ADD, F7_MULDIV); }
+    if (op == riscv64.AND::u16)    { ret encode_alu3(st, mi, F3_AND, F7_ZERO); }
+    if (op == riscv64.OR::u16)     { ret encode_alu3(st, mi, F3_OR, F7_ZERO); }
+    if (op == riscv64.XOR::u16)    { ret encode_alu3(st, mi, F3_XOR, F7_ZERO); }
+    if (op == riscv64.SLL::u16)    { ret encode_shift(st, mi, F3_SLL, false); }
+    if (op == riscv64.SRL::u16)    { ret encode_shift(st, mi, F3_SRL, false); }
+    if (op == riscv64.SRA::u16)    { ret encode_shift(st, mi, F3_SRL, true); }
+    if (op == riscv64.NEG::u16)    { ret encode_neg(st, mi); }
+    if (op == riscv64.NOT::u16)    { ret encode_not(st, mi); }
+    if (op == riscv64.MOV::u16)    { ret encode_mov(st, f, mi); }
+    if (op == riscv64.JMP::u16)    { ret encode_branch(st, fn_base, mi); }
+    if (op == riscv64.RET::u16)    { emit_word(st, pack_i(JALR, F3_ADD, RZERO, RRA, 0)); ret R.ok[bool, str](true); }
+    if (op == riscv64.NOP::u16)    { emit_word(st, pack_i(OP_IMM, F3_ADD, RZERO, RZERO, 0)); ret R.ok[bool, str](true); }
+    if (op == riscv64.EBREAK::u16) { emit_word(st, pack_i(SYSTEM, F3_ADD, RZERO, RZERO, 1)); ret R.ok[bool, str](true); }
+
+    ret R.err[bool, str]("encode: unhandled opcode in riscv64 encode (awaits a later slice)");
+}
+
+# the per-function encode hook (pass 1). marks the function entry symbol, emits the
+# prologue (skipped for a naked asm-only function, whose inline asm owns the stack),
+# then each block - emitting the epilogue before every RET - recording each block's
+# `.text` offset for branch patching. extern / body-less functions contribute no
+# text. callee-saved FP registers are deferred to the float slice and rejected loudly.
+fun encode_function_riscv64(st: *encode.EncodeState, f: *mir.MirFunction) R.Result[bool, str] {
+    val fn_base: u32 = st.buf.len::u32;
+    if (f.block_count == 0) { ret R.ok[bool, str](true); }
+    if (f.callee_mask_fp != 0) {
+        ret R.err[bool, str]("encode: riscv64 float callee-saves await the float slice");
+    }
+
+    val ms: R.Result[bool, str] = encode.push_symbol(st, f.name, fn_base, of.SYM_OBJ_FLAG_FUNCTION);
+    if (R.is_err[bool, str](ms)) { ret ms; }
+
+    val naked: bool = function_is_naked(f);
+    val total: u32 = frame_total(f);
+    if (!naked) { emit_prologue(st, f, total); }
+
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        val rb: R.Result[bool, str] = encode.push_block(st, fn_base, blk.id, st.buf.len::u32);
+        if (R.is_err[bool, str](rb)) { ret rb; }
+
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            if (mi.opcode::u16 == riscv64.RET::u16 && !naked) {
+                emit_epilogue(st, f, total);
+            }
+            val ei: R.Result[bool, str] = encode_mir_instr(st, f, fn_base, mi);
+            if (R.is_err[bool, str](ei)) { ret ei; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# the per-branch patch hook (pass 2). reads the placeholder instruction word at the
+# fixup's patch site, computes the instruction-relative signed displacement
+# (`target_off - patch_pos`, with no next-instruction bias - RISC-V branch / jump
+# offsets are relative to the branch's own address), range-checks it against the
+# field width, scatters it into the B-type (13-bit, +-4 KiB) or J-type (21-bit,
+# +-1 MiB) immediate, and writes the word back. an out-of-range displacement is
+# rejected loudly rather than truncated into a miscompile.
+fun patch_branch_riscv64(st: *encode.EncodeState, fx: *encode.BranchFixup, target_off: u32) R.Result[bool, str] {
+    val pos: usize = fx.patch_pos::usize;
+    if (pos + 4 > st.buf.len) {
+        ret R.err[bool, str]("encode: branch fixup site is outside the text buffer");
+    }
+    val word: u32 = read_word(?st.buf, pos);
+    val sdisp: i64 = (target_off::i64) - (fx.patch_pos::i64);
+    if ((sdisp & 1) != 0) {
+        ret R.err[bool, str]("encode: riscv64 branch displacement is not 2-byte aligned");
+    }
+    val disp: u32 = target_off - fx.patch_pos;
+    val opcode: u32 = word & 0x7F;
+
+    if (opcode == JAL) {
+        # J-type: +-1 MiB. the non-immediate bits are rd[11:7] and opcode[6:0].
+        if (sdisp < -1048576 || sdisp > 1048574) {
+            ret R.err[bool, str]("encode: riscv64 jump displacement exceeds the +-1MiB range");
+        }
+        write_word(?st.buf, pos, (word & 0xFFF) | j_imm(disp));
+        ret R.ok[bool, str](true);
+    }
+    if (opcode == BRANCH) {
+        # B-type: +-4 KiB. the kept bits are rs2 / rs1 / funct3 / opcode.
+        if (sdisp < -4096 || sdisp > 4094) {
+            ret R.err[bool, str]("encode: riscv64 branch displacement exceeds the +-4KiB range");
+        }
+        write_word(?st.buf, pos, (word & 0x01FFF07F) | b_imm(disp));
+        ret R.ok[bool, str](true);
+    }
+    ret R.err[bool, str]("encode: branch fixup site is not a B-type or J-type instruction");
+}
+
+# the RV64 ISA's `encode` entry point - a thin wrapper that supplies the two RISC-V
+# `encode.EncodeHooks` and runs the shared two-pass driver. the ISA-general driving
+# lives in `encode.encode_driver`; this backend contributes only its per-function
+# encode (`encode_function_riscv64`) and per-branch patch (`patch_branch_riscv64`).
+# the erased vtable pointer is cast back to this exact signature, so it must not
+# change.
+# ---
+# alloc: allocator backing the encoder output's owned arrays
+# tgt:   resolved target; must be RISC-V
+# m:     the fully-resolved MIR module (post isel / regalloc / frame)
+# ret:   the populated encode.EncoderOutput (owned arrays), or an error string
+pub fun encode_riscv64(alloc: *A.Allocator, tgt: *resolved.Target, m: *mir.MirModule) R.Result[encode.EncoderOutput, str] {
+    var hooks: encode.EncodeHooks;
+    hooks.encode_function = encode_function_riscv64;
+    hooks.patch_branch    = patch_branch_riscv64;
+    ret encode.encode_driver(alloc, tgt, m, ?hooks);
+}
+
+# true when `c` is inline-asm intra-line whitespace.
+fun asm_is_space(c: char) bool {
+    ret c == ' '::char || c == '\t'::char || c == '\r'::char;
+}
+
+# the GP register index a RISC-V inline-asm register token names, or -1 when the
+# token is not a register. accepts the numeric `xN` spelling and the psABI aliases
+# (zero/ra/sp/gp/tp, t0-t6, s0/fp, s1-s11, a0-a7). the slice-3 inline-asm assembler
+# reuses this resolver; the names are stable psABI facts, not an encoder choice.
+fun asm_reg_index(tok: str) i32 {
+    if (str_equals(tok, "zero")) { ret 0; }
+    if (str_equals(tok, "ra"))   { ret 1; }
+    if (str_equals(tok, "sp"))   { ret 2; }
+    if (str_equals(tok, "gp"))   { ret 3; }
+    if (str_equals(tok, "tp"))   { ret 4; }
+    if (str_equals(tok, "t0"))   { ret 5; }
+    if (str_equals(tok, "t1"))   { ret 6; }
+    if (str_equals(tok, "t2"))   { ret 7; }
+    if (str_equals(tok, "s0"))   { ret 8; }
+    if (str_equals(tok, "fp"))   { ret 8; }
+    if (str_equals(tok, "s1"))   { ret 9; }
+    if (str_equals(tok, "a0"))   { ret 10; }
+    if (str_equals(tok, "a1"))   { ret 11; }
+    if (str_equals(tok, "a2"))   { ret 12; }
+    if (str_equals(tok, "a3"))   { ret 13; }
+    if (str_equals(tok, "a4"))   { ret 14; }
+    if (str_equals(tok, "a5"))   { ret 15; }
+    if (str_equals(tok, "a6"))   { ret 16; }
+    if (str_equals(tok, "a7"))   { ret 17; }
+    if (str_equals(tok, "s2"))   { ret 18; }
+    if (str_equals(tok, "s3"))   { ret 19; }
+    if (str_equals(tok, "s4"))   { ret 20; }
+    if (str_equals(tok, "s5"))   { ret 21; }
+    if (str_equals(tok, "s6"))   { ret 22; }
+    if (str_equals(tok, "s7"))   { ret 23; }
+    if (str_equals(tok, "s8"))   { ret 24; }
+    if (str_equals(tok, "s9"))   { ret 25; }
+    if (str_equals(tok, "s10"))  { ret 26; }
+    if (str_equals(tok, "s11"))  { ret 27; }
+    if (str_equals(tok, "t3"))   { ret 28; }
+    if (str_equals(tok, "t4"))   { ret 29; }
+    if (str_equals(tok, "t5"))   { ret 30; }
+    if (str_equals(tok, "t6"))   { ret 31; }
+    if (tok[0] == 'x'::char) {
+        var n: i32 = 0;
+        var i: usize = 1;
+        if (tok[1] == 0) { ret -1; }
+        for (tok[i] != 0) {
+            if (tok[i] < '0'::char || tok[i] > '9'::char) { ret -1; }
+            n = n * 10 + (tok[i]::i32 - '0'::char::i32);
+            i = i + 1;
+        }
+        if (n >= 0 && n < 32) { ret n; }
+    }
+    ret -1;
+}
+
+# copy the first whitespace / comma-delimited token of `s` into `out` (null-
+# terminated) and report the index in `s` just past it. used to lift the mnemonic and
+# the first operand of an inline-asm statement.
+fun asm_token(s: str, start: usize, out: *u8, cap: usize, next: *usize) bool {
+    var i: usize = start;
+    for (s[i] != 0 && asm_is_space(s[i])) { i = i + 1; }
+    var j: usize = 0;
+    for (s[i] != 0 && !asm_is_space(s[i]) && s[i] != ','::char && j < cap - 1) {
+        out[j] = s[i]::u8;
+        i = i + 1;
+        j = j + 1;
+    }
+    out[j] = 0;
+    @next = i;
+    ret j > 0;
+}
+
+# OR the registers one trimmed RISC-V inline-asm statement writes into `@gp`. a
+# leading `label:` is stripped and the remainder re-dispatched. a call clobbers the
+# caller-saved file; the stores / branches / system / fence / return forms write
+# nothing; the recognized destination-writing forms clobber their first register
+# operand; an unrecognized statement conservatively clobbers everything.
+fun asm_stmt_clobbers(s: str, gp: *u32, fp: *u32) {
+    var mbuf: [32]u8;
+    var after: usize = 0;
+    if (!asm_token(s, 0, ?mbuf[0], 32, ?after)) { ret; }
+    var mnem: str = (?mbuf[0])::str;
+
+    # a `label:` prefix (named or numeric) carries no write; re-dispatch the rest.
+    val mlen: usize = str_len(mnem);
+    if (mlen > 0 && mnem[mlen - 1] == ':'::char) {
+        var rest: usize = after;
+        for (s[rest] != 0 && asm_is_space(s[rest])) { rest = rest + 1; }
+        if (s[rest] != 0) { asm_stmt_clobbers((s::usize + rest)::str, gp, fp); }
+        ret;
+    }
+
+    # write nothing: stores, conditional branches (including the pseudo-branch
+    # spellings), unconditional jumps, return, system, fence, nop.
+    if (str_equals(mnem, "sb") || str_equals(mnem, "sh") || str_equals(mnem, "sw") ||
+        str_equals(mnem, "sd") || str_equals(mnem, "nop") || str_equals(mnem, "ret") ||
+        str_equals(mnem, "ecall") || str_equals(mnem, "ebreak") || str_equals(mnem, "fence") ||
+        str_equals(mnem, "j") || str_equals(mnem, "jr") ||
+        str_equals(mnem, "beq") || str_equals(mnem, "bne") || str_equals(mnem, "blt") ||
+        str_equals(mnem, "bge") || str_equals(mnem, "bltu") || str_equals(mnem, "bgeu") ||
+        str_equals(mnem, "bgt") || str_equals(mnem, "ble") || str_equals(mnem, "bgtu") ||
+        str_equals(mnem, "bleu") || str_equals(mnem, "beqz") || str_equals(mnem, "bnez") ||
+        str_equals(mnem, "bltz") || str_equals(mnem, "bgez") || str_equals(mnem, "blez") ||
+        str_equals(mnem, "bgtz")) {
+        ret;
+    }
+
+    # a call clobbers the caller-saved file (ra, t0-t6, a0-a7); none callee-saved.
+    if (str_equals(mnem, "call") || str_equals(mnem, "tail") ||
+        str_equals(mnem, "jal") || str_equals(mnem, "jalr")) {
+        @gp = @gp | CALLER_SAVED_GP;
+        ret;
+    }
+
+    # the destination-writing forms clobber their first register operand (rd).
+    if (str_equals(mnem, "li") || str_equals(mnem, "la") || str_equals(mnem, "lui") ||
+        str_equals(mnem, "auipc") || str_equals(mnem, "mv") || str_equals(mnem, "neg") ||
+        str_equals(mnem, "not") || str_equals(mnem, "seqz") || str_equals(mnem, "snez") ||
+        str_equals(mnem, "add") || str_equals(mnem, "addi") || str_equals(mnem, "sub") ||
+        str_equals(mnem, "and") || str_equals(mnem, "andi") || str_equals(mnem, "or") ||
+        str_equals(mnem, "ori") || str_equals(mnem, "xor") || str_equals(mnem, "xori") ||
+        str_equals(mnem, "sll") || str_equals(mnem, "slli") || str_equals(mnem, "srl") ||
+        str_equals(mnem, "srli") || str_equals(mnem, "sra") || str_equals(mnem, "srai") ||
+        str_equals(mnem, "slt") || str_equals(mnem, "slti") || str_equals(mnem, "sltu") ||
+        str_equals(mnem, "sltiu") || str_equals(mnem, "addw") || str_equals(mnem, "addiw") ||
+        str_equals(mnem, "subw") || str_equals(mnem, "sllw") || str_equals(mnem, "slliw") ||
+        str_equals(mnem, "srlw") || str_equals(mnem, "srliw") || str_equals(mnem, "sraw") ||
+        str_equals(mnem, "sraiw") || str_equals(mnem, "negw") || str_equals(mnem, "sext.w") ||
+        str_equals(mnem, "mul") || str_equals(mnem, "mulw") || str_equals(mnem, "mulh") ||
+        str_equals(mnem, "mulhu") || str_equals(mnem, "mulhsu") || str_equals(mnem, "div") ||
+        str_equals(mnem, "divu") || str_equals(mnem, "divw") || str_equals(mnem, "rem") ||
+        str_equals(mnem, "remu") || str_equals(mnem, "remw") || str_equals(mnem, "lb") ||
+        str_equals(mnem, "lh") || str_equals(mnem, "lw") || str_equals(mnem, "ld") ||
+        str_equals(mnem, "lbu") || str_equals(mnem, "lhu") || str_equals(mnem, "lwu")) {
+        var rbuf: [32]u8;
+        var rnext: usize = 0;
+        if (asm_token(s, after, ?rbuf[0], 32, ?rnext)) {
+            val ri: i32 = asm_reg_index((?rbuf[0])::str);
+            if (ri >= 0 && ri < 32) { @gp = @gp | (1::u32 << ri::u32); }
+        }
+        ret;
+    }
+
+    # unrecognized: opaque, clobber everything (a sound over-approximation).
+    @gp = @gp | 0xFFFFFFFF;
+    @fp = @fp | 0xFFFFFFFF;
+}
+
+# the AsmClobbersFn the RV64 ISA vtable exposes - infer the GP registers an
+# inline-asm body writes, so the allocator leaves no live value in one and the
+# prologue preserves any callee-saved register the body clobbers. without this hook a
+# nil slot forces a conservative all-register clobber, framing every asm function
+# (e.g. `_start`, whose frame allocation then mis-reads argc off the entry stack). the
+# body is split into statements on newline / `;`, each trimmed and classified. the
+# grammar has no FP write yet, so `fp_out` stays empty unless an unrecognized
+# statement forces the conservative all-clobber.
+# ---
+# body:   the inline-asm body text
+# gp_out: out - the GP registers the body writes (bit n = register n)
+# fp_out: out - the FP registers the body writes (bit n = register n)
+pub fun asm_clobbers(body: str, gp_out: *u32, fp_out: *u32) {
+    var gp: u32 = 0;
+    var fp: u32 = 0;
+    val len: usize = str_len(body);
+    var start: usize = 0;
+    for (start < len) {
+        var end: usize = start;
+        for (end < len && body[end] != '\n'::char && body[end] != ';'::char) { end = end + 1; }
+        var lo: usize = start;
+        for (lo < end && asm_is_space(body[lo])) { lo = lo + 1; }
+        var hi: usize = end;
+        for (hi > lo && asm_is_space(body[hi - 1])) { hi = hi - 1; }
+        if (hi > lo) {
+            var line: [512]u8;
+            val ll: usize = hi - lo;
+            if (ll >= 512) { gp = 0xFFFFFFFF; fp = 0xFFFFFFFF; }
+            or {
+                var c: usize = 0;
+                for (c < ll) { line[c] = body[lo + c]::u8; c = c + 1; }
+                line[ll] = 0;
+                asm_stmt_clobbers((?line[0])::str, ?gp, ?fp);
+            }
+        }
+        start = end + 1;
+    }
+    @gp_out = gp;
+    @fp_out = fp;
+}
+
+# a fresh page-backed EncodeState carrying only a byte sink, for exercising the
+# emit-level helpers (packers / prologue / epilogue / branch patch) directly.
+fun tbuf(st: *encode.EncodeState, alloc: *A.Allocator) {
+    page.make(alloc);
+    st.buf = encode.buf_init(alloc);
+}
+
+# the R/I/S/U-type packers are byte-exact against `llvm-mc -triple=riscv64
+# --show-encoding`. registers a0/a1/a2 = x10/x11/x12.
+test "mach.lang.target.isa.riscv64.encode:rtype_itype_stype_utype_packers" {
+    var bad: i32 = 0;
+    # add a0, a1, a2 = 0x00c58533 ; sub = 0x40c58533 ; addw = 0x00c5853b ; subw = 0x40c5853b
+    if (pack_r(OP, F3_ADD, F7_ZERO, 10, 11, 12)  != 0x00C58533) { bad = 1; }
+    if (pack_r(OP, F3_ADD, F7_SUB, 10, 11, 12)   != 0x40C58533) { bad = 1; }
+    if (pack_r(OP_32, F3_ADD, F7_ZERO, 10, 11, 12) != 0x00C5853B) { bad = 1; }
+    if (pack_r(OP_32, F3_ADD, F7_SUB, 10, 11, 12)  != 0x40C5853B) { bad = 1; }
+    # and/or/xor a0,a1,a2 = 0x00c5f533 / 0x00c5e533 / 0x00c5c533
+    if (pack_r(OP, F3_AND, F7_ZERO, 10, 11, 12) != 0x00C5F533) { bad = 1; }
+    if (pack_r(OP, F3_OR, F7_ZERO, 10, 11, 12)  != 0x00C5E533) { bad = 1; }
+    if (pack_r(OP, F3_XOR, F7_ZERO, 10, 11, 12) != 0x00C5C533) { bad = 1; }
+    # mul a0,a1,a2 = 0x02c58533 ; sll = 0x00c59533 ; srl = 0x00c5d533 ; sra = 0x40c5d533
+    if (pack_r(OP, F3_ADD, F7_MULDIV, 10, 11, 12) != 0x02C58533) { bad = 1; }
+    if (pack_r(OP, F3_SLL, F7_ZERO, 10, 11, 12)   != 0x00C59533) { bad = 1; }
+    if (pack_r(OP, F3_SRL, F7_ZERO, 10, 11, 12)   != 0x00C5D533) { bad = 1; }
+    if (pack_r(OP, F3_SRL, F7_SUB, 10, 11, 12)    != 0x40C5D533) { bad = 1; }
+    # addi a0,a1,5 = 0x00558513 ; andi a0,a1,5 = 0x0055f513 ; addiw = 0x0055851b
+    if (pack_i(OP_IMM, F3_ADD, 10, 11, 5) != 0x00558513) { bad = 1; }
+    if (pack_i(OP_IMM, F3_AND, 10, 11, 5) != 0x0055F513) { bad = 1; }
+    if (pack_i(OP_IMM_32, F3_ADD, 10, 11, 5) != 0x0055851B) { bad = 1; }
+    # ld a0,16(a1) = 0x0105b503 ; lw a0,16(a1) = 0x0105a503 ; lbu a0,16(a1) = 0x0105c503
+    if (pack_i(LOAD, F3_SLTU, 10, 11, 16) != 0x0105B503) { bad = 1; }
+    if (pack_i(LOAD, F3_SLT, 10, 11, 16)  != 0x0105A503) { bad = 1; }
+    if (pack_i(LOAD, F3_XOR, 10, 11, 16)  != 0x0105C503) { bad = 1; }
+    # jalr ra,a0,0 = 0x000500e7 ; ret = jalr x0,ra,0 = 0x00008067
+    if (pack_i(JALR, F3_ADD, 1, 10, 0) != 0x000500E7) { bad = 1; }
+    if (pack_i(JALR, F3_ADD, 0, 1, 0)  != 0x00008067) { bad = 1; }
+    # sd a0,16(a1) = 0x00a5b823 ; sw a0,16(a1) = 0x00a5a823 ; sb a0,16(a1) = 0x00a58823
+    if (pack_s(STORE, F3_SLTU, 11, 10, 16) != 0x00A5B823) { bad = 1; }
+    if (pack_s(STORE, F3_SLT, 11, 10, 16)  != 0x00A5A823) { bad = 1; }
+    if (pack_s(STORE, F3_ADD, 11, 10, 16)  != 0x00A58823) { bad = 1; }
+    # lui a0,0x12345 = 0x12345537 ; auipc a0,0 = 0x00000517
+    if (pack_u(LUI, 10, 0x12345) != 0x12345537) { bad = 1; }
+    if (pack_u(AUIPC, 10, 0)     != 0x00000517) { bad = 1; }
+    ret bad;
+}
+
+# the B-type / J-type immediate scatter is byte-exact against llvm-mc.
+test "mach.lang.target.isa.riscv64.encode:btype_jtype_immediate_scatter" {
+    var bad: i32 = 0;
+    # beq a0,a1,0 = 0x00b50063 ; beq a0,a1,16 = 0x00b50863 ; bne a0,a1,16 = 0x00b51863
+    if (pack_b(BRANCH, F3_BEQ, 10, 11, 0)  != 0x00B50063) { bad = 1; }
+    if (pack_b(BRANCH, F3_BEQ, 10, 11, 16) != 0x00B50863) { bad = 1; }
+    if (pack_b(BRANCH, F3_BNE, 10, 11, 16) != 0x00B51863) { bad = 1; }
+    # beq a0,a1,-4 (0xFFC) = 0x feb50ee3 (backward); bne a0,x0,8 = 0x00051463
+    if (pack_b(BRANCH, F3_BEQ, 10, 11, (0 - 4)::u32) != 0xFEB50EE3) { bad = 1; }
+    if (pack_b(BRANCH, F3_BNE, 10, 0, 8) != 0x00051463) { bad = 1; }
+    # jal ra,0 = 0x000000ef ; jal ra,16 = 0x010000ef ; jal x0,0 (j) = 0x0000006f
+    if (pack_j(JAL, 1, 0)  != 0x000000EF) { bad = 1; }
+    if (pack_j(JAL, 1, 16) != 0x010000EF) { bad = 1; }
+    if (pack_j(JAL, 0, 0)  != 0x0000006F) { bad = 1; }
+    # jal ra,-4 (backward) = 0xffdff0ef
+    if (pack_j(JAL, 1, (0 - 4)::u32) != 0xFFDFF0EF) { bad = 1; }
+    ret bad;
+}
+
+# constant materialization (`li`): the 12-bit, 32-bit (lui+addiw), and RV64 64-bit
+# (recursive shift sequence) forms, byte-exact against llvm-mc / gnu as `li`.
+test "mach.lang.target.isa.riscv64.encode:li_constant_materialization" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+
+    # li a0, 5 -> addi a0, x0, 5 = 0x00500513
+    emit_li(?st, 10, 5);
+    if (st.buf.len != 4) { bad = 1; }
+    or { if (read_word(?st.buf, 0) != 0x00500513) { bad = 1; } }
+
+    # li a0, -1 -> addi a0, x0, -1 = 0xfff00513
+    st.buf.len = 0;
+    emit_li(?st, 10, 0 - 1);
+    if (read_word(?st.buf, 0) != 0xFFF00513) { bad = 1; }
+
+    # li a0, 0x12345678 -> lui a0,0x12345 = 0x12345537 ; addiw a0,a0,0x678 = 0x6785051b
+    st.buf.len = 0;
+    emit_li(?st, 10, 0x12345678);
+    if (st.buf.len != 8) { bad = 1; }
+    or {
+        if (read_word(?st.buf, 0) != 0x12345537) { bad = 1; }
+        if (read_word(?st.buf, 4) != 0x6785051B) { bad = 1; }
+    }
+
+    # li a0, 0x100000000 (1<<32): hi=0x100000, lo12=0 -> lui a0,0x100 ; slli a0,a0,12
+    # lui a0,0x100 = 0x00100537 ; slli a0,a0,12 = 0x00c51513
+    st.buf.len = 0;
+    emit_li(?st, 10, 0x100000000);
+    if (st.buf.len != 8) { bad = 1; }
+    or {
+        if (read_word(?st.buf, 0) != 0x00100537) { bad = 1; }
+        if (read_word(?st.buf, 4) != 0x00C51513) { bad = 1; }
+    }
+
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# width-driven loads / stores and the in-register ALU helpers select the right
+# RV64 form off operand size, byte-exact against llvm-mc.
+test "mach.lang.target.isa.riscv64.encode:width_driven_loads_stores_and_alu" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+
+    # loads of a0 from 0(a1): lbu/lhu/lwu/ld by width (1/2/4/8)
+    emit_mem_access(?st, 10, 11, 0, 1, true);   # lbu a0,0(a1) = 0x0005c503
+    emit_mem_access(?st, 10, 11, 0, 2, true);   # lhu a0,0(a1) = 0x0005d503
+    emit_mem_access(?st, 10, 11, 0, 4, true);   # lwu a0,0(a1) = 0x0005e503
+    emit_mem_access(?st, 10, 11, 0, 8, true);   # ld  a0,0(a1) = 0x0005b503
+    if (read_word(?st.buf, 0)  != 0x0005C503) { bad = 1; }
+    if (read_word(?st.buf, 4)  != 0x0005D503) { bad = 1; }
+    if (read_word(?st.buf, 8)  != 0x0005E503) { bad = 1; }
+    if (read_word(?st.buf, 12) != 0x0005B503) { bad = 1; }
+
+    # stores of a0 to 0(a1): sb/sh/sw/sd by width
+    st.buf.len = 0;
+    emit_mem_access(?st, 10, 11, 0, 1, false);  # sb a0,0(a1) = 0x00a58023
+    emit_mem_access(?st, 10, 11, 0, 2, false);  # sh a0,0(a1) = 0x00a59023
+    emit_mem_access(?st, 10, 11, 0, 4, false);  # sw a0,0(a1) = 0x00a5a023
+    emit_mem_access(?st, 10, 11, 0, 8, false);  # sd a0,0(a1) = 0x00a5b023
+    if (read_word(?st.buf, 0)  != 0x00A58023) { bad = 1; }
+    if (read_word(?st.buf, 4)  != 0x00A59023) { bad = 1; }
+    if (read_word(?st.buf, 8)  != 0x00A5A023) { bad = 1; }
+    if (read_word(?st.buf, 12) != 0x00A5B023) { bad = 1; }
+
+    # alu_opcode / alu_imm_opcode select the RV64 word group only at 32-bit width.
+    if (alu_opcode(8) != OP)         { bad = 1; }
+    if (alu_opcode(4) != OP_32)      { bad = 1; }
+    if (alu_opcode(1) != OP)         { bad = 1; }
+    if (alu_imm_opcode(8) != OP_IMM) { bad = 1; }
+    if (alu_imm_opcode(4) != OP_IMM_32) { bad = 1; }
+
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# the MIR ALU / shift / mv / neg / not dispatch emits the expected words, byte-exact
+# against llvm-mc. operands a0/a1/a2 = x10/x11/x12.
+test "mach.lang.target.isa.riscv64.encode:mir_alu_shift_mov_neg_not" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+
+    var mi: mir.MirInstr;
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(10); ops[1] = mir.op_preg(11); ops[2] = mir.op_preg(12);
+    mi.operands = ?ops[0]; mi.operand_count = 3;
+
+    # add a0,a1,a2 (width 8) = 0x00c58533 ; addw (width 4) = 0x00c5853b
+    mi.width = 8; encode_addsub(?st, ?mi, false);
+    if (read_word(?st.buf, 0) != 0x00C58533) { bad = 1; }
+    mi.width = 4; encode_addsub(?st, ?mi, false);
+    if (read_word(?st.buf, 4) != 0x00C5853B) { bad = 1; }
+
+    # addi a0,a1,#5 (width 8) = 0x00558513 ; subi via add of negation: addi a0,a1,-5 = 0xffb58513
+    st.buf.len = 0;
+    ops[2] = mir.op_imm(5);
+    mi.width = 8; encode_addsub(?st, ?mi, false);
+    if (read_word(?st.buf, 0) != 0x00558513) { bad = 1; }
+    encode_addsub(?st, ?mi, true);  # sub a0,a1,#5 -> addi a0,a1,-5
+    if (read_word(?st.buf, 4) != 0xFFB58513) { bad = 1; }
+
+    # slli a0,a1,#3 = 0x00359513 ; slliw a0,a1,#3 = 0x0035951b ; srai a0,a1,#3 = 0x4035d513
+    st.buf.len = 0;
+    ops[2] = mir.op_imm(3);
+    mi.width = 8; encode_shift(?st, ?mi, F3_SLL, false);
+    if (read_word(?st.buf, 0) != 0x00359513) { bad = 1; }
+    mi.width = 4; encode_shift(?st, ?mi, F3_SLL, false);
+    if (read_word(?st.buf, 4) != 0x0035951B) { bad = 1; }
+    mi.width = 8; encode_shift(?st, ?mi, F3_SRL, true);
+    if (read_word(?st.buf, 8) != 0x4035D513) { bad = 1; }
+
+    # mv a0,a1 = 0x00058513 ; neg a0,a1 = 0x40b00533 ; not a0,a1 = 0xfff5c513
+    st.buf.len = 0;
+    var mv: mir.MirInstr;
+    var mvo: [2]mir.MirOperand;
+    mvo[0] = mir.op_preg(10); mvo[1] = mir.op_preg(11);
+    mv.operands = ?mvo[0]; mv.operand_count = 2; mv.width = 8;
+    encode_mov(?st, nil, ?mv);
+    if (read_word(?st.buf, 0) != 0x00058513) { bad = 1; }
+    encode_neg(?st, ?mv);
+    if (read_word(?st.buf, 4) != 0x40B00533) { bad = 1; }
+    encode_not(?st, ?mv);
+    if (read_word(?st.buf, 8) != 0xFFF5C513) { bad = 1; }
+
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# the integer compares synthesize their 0/1 result from the set-less-than
+# primitives, byte-exact against llvm-mc. operands a0/a1/a2 = x10/x11/x12.
+test "mach.lang.target.isa.riscv64.encode:integer_compare_sequences" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+
+    var mi: mir.MirInstr;
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(10); ops[1] = mir.op_preg(11); ops[2] = mir.op_preg(12);
+    mi.operands = ?ops[0]; mi.operand_count = 3; mi.width = 8;
+
+    # eq: xor a0,a1,a2 = 0x00c5c533 ; seqz a0,a0 (sltiu a0,a0,1) = 0x00153513
+    mi.opcode = mir.MIR_SEL_CMP_EQ; encode_compare(?st, ?mi);
+    if (read_word(?st.buf, 0) != 0x00C5C533) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x00153513) { bad = 1; }
+
+    # ne: xor a0,a1,a2 ; snez a0,a0 (sltu a0,x0,a0) = 0x00a03533
+    st.buf.len = 0;
+    mi.opcode = mir.MIR_SEL_CMP_NE; encode_compare(?st, ?mi);
+    if (read_word(?st.buf, 0) != 0x00C5C533) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x00A03533) { bad = 1; }
+
+    # lt_s: slt a0,a1,a2 = 0x00c5a533 ; lt_u: sltu a0,a1,a2 = 0x00c5b533
+    st.buf.len = 0;
+    mi.opcode = mir.MIR_SEL_CMP_LT_S; encode_compare(?st, ?mi);
+    if (read_word(?st.buf, 0) != 0x00C5A533) { bad = 1; }
+    st.buf.len = 0;
+    mi.opcode = mir.MIR_SEL_CMP_LT_U; encode_compare(?st, ?mi);
+    if (read_word(?st.buf, 0) != 0x00C5B533) { bad = 1; }
+
+    # le_s: slt a0,a2,a1 = 0x00b62533 ; xori a0,a0,1 = 0x00154513
+    st.buf.len = 0;
+    mi.opcode = mir.MIR_SEL_CMP_LE_S; encode_compare(?st, ?mi);
+    if (read_word(?st.buf, 0) != 0x00B62533) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x00154513) { bad = 1; }
+
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# the prologue / epilogue of a leaf frame (no callee-saves, no locals) - the 16-byte
+# ra / s0 record - is byte-exact against llvm-mc.
+test "mach.lang.target.isa.riscv64.encode:leaf_prologue_epilogue" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+
+    var f: mir.MirFunction;
+    f.callee_mask = 0; f.callee_mask_fp = 0;
+    f.frame.size = 0; f.frame.outgoing_size = 0; f.frame.slots = nil; f.frame.slot_count = 0;
+
+    val total: u32 = frame_total(?f);
+    if (total != 16) { bad = 1; }
+
+    emit_prologue(?st, ?f, total);
+    if (read_word(?st.buf, 0)  != 0xFF010113) { bad = 1; }  # addi sp,sp,-16
+    if (read_word(?st.buf, 4)  != 0x00113423) { bad = 1; }  # sd ra,8(sp)
+    if (read_word(?st.buf, 8)  != 0x00813023) { bad = 1; }  # sd s0,0(sp)
+    if (read_word(?st.buf, 12) != 0x01010413) { bad = 1; }  # addi s0,sp,16
+
+    st.buf.len = 0;
+    emit_epilogue(?st, ?f, total);
+    if (read_word(?st.buf, 0)  != 0x00813083) { bad = 1; }  # ld ra,8(sp)
+    if (read_word(?st.buf, 4)  != 0x00013403) { bad = 1; }  # ld s0,0(sp)
+    if (read_word(?st.buf, 8)  != 0x01010113) { bad = 1; }  # addi sp,sp,16
+
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# a frame with callee-saved GP registers saves / restores them below the record,
+# byte-exact against llvm-mc.
+test "mach.lang.target.isa.riscv64.encode:callee_save_gp_frame" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+
+    var f: mir.MirFunction;
+    # callee-saved s1 (x9) and s2 (x18); gp_bytes = 16 -> total = align16(16+16) = 32.
+    f.callee_mask = (1::u32 << 9) | (1::u32 << 18);
+    f.callee_mask_fp = 0;
+    f.frame.size = 0; f.frame.outgoing_size = 0; f.frame.slots = nil; f.frame.slot_count = 0;
+
+    val total: u32 = frame_total(?f);
+    if (total != 32) { bad = 1; }
+
+    emit_prologue(?st, ?f, total);
+    # addi sp,sp,-32 = 0xfe010113 ; sd ra,24(sp) = 0x00113c23 ; sd s0,16(sp) = 0x00813823 ;
+    # addi s0,sp,32 = 0x02010413 ; sd s1,8(sp) = 0x00913423 ; sd s2,0(sp) = 0x01213023
+    if (read_word(?st.buf, 0)  != 0xFE010113) { bad = 1; }
+    if (read_word(?st.buf, 4)  != 0x00113C23) { bad = 1; }
+    if (read_word(?st.buf, 8)  != 0x00813823) { bad = 1; }
+    if (read_word(?st.buf, 12) != 0x02010413) { bad = 1; }
+    if (read_word(?st.buf, 16) != 0x00913423) { bad = 1; }
+    if (read_word(?st.buf, 20) != 0x01213023) { bad = 1; }
+
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# the branch fixups scatter the resolved displacement into the B-type / J-type
+# immediate and reject out-of-range displacements, byte-exact against llvm-objdump.
+test "mach.lang.target.isa.riscv64.encode:branch_fixups_scatter_and_range" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+
+    # j placeholder at 0, bne a0,x0 placeholder at 4.
+    emit_word(?st, pack_j(JAL, RZERO, 0));            # off 0
+    emit_word(?st, pack_b(BRANCH, F3_BNE, 10, 0, 0)); # off 4
+
+    var fx: encode.BranchFixup;
+    # j at 0 -> target 16: disp 16 -> jal x0,16 = 0x0100006f
+    fx.patch_pos = 0; fx.next_ip = 4;
+    patch_branch_riscv64(?st, ?fx, 16);
+    if (read_word(?st.buf, 0) != 0x0100006F) { bad = 1; }
+    # bne at 4 -> target 12: disp 8 -> bne a0,x0,8 = 0x00051463
+    fx.patch_pos = 4; fx.next_ip = 8;
+    patch_branch_riscv64(?st, ?fx, 12);
+    if (read_word(?st.buf, 4) != 0x00051463) { bad = 1; }
+
+    # backward j at 4 -> target 0: disp -4 -> jal x0,-4 = 0xffdff06f
+    fx.patch_pos = 4; fx.next_ip = 8;
+    emit_word(?st, pack_j(JAL, RZERO, 0));
+    st.buf.data[4] = 0x6F; st.buf.data[5] = 0; st.buf.data[6] = 0; st.buf.data[7] = 0;
+    patch_branch_riscv64(?st, ?fx, 0);
+    if (read_word(?st.buf, 4) != 0xFFDFF06F) { bad = 1; }
+
+    # an out-of-range branch (past +-4KiB) is rejected.
+    st.buf.len = 0;
+    emit_word(?st, pack_b(BRANCH, F3_BNE, 10, 0, 0));
+    fx.patch_pos = 0; fx.next_ip = 4;
+    val r1: R.Result[bool, str] = patch_branch_riscv64(?st, ?fx, 8192);
+    if (!R.is_err[bool, str](r1)) { bad = 1; }
+
+    # an out-of-range jump (past +-1MiB) is rejected.
+    st.buf.len = 0;
+    emit_word(?st, pack_j(JAL, RZERO, 0));
+    fx.patch_pos = 0; fx.next_ip = 4;
+    val r2: R.Result[bool, str] = patch_branch_riscv64(?st, ?fx, 2000000);
+    if (!R.is_err[bool, str](r2)) { bad = 1; }
+
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# the direct / indirect call emits the call bytes and records the direct-call
+# RK_PLT32 marker at the auipc; the indirect call records no reloc.
+test "mach.lang.target.isa.riscv64.encode:call_records_plt32_marker" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+    st.alloc       = ?alloc;
+    st.relocs      = nil;
+    st.reloc_count = 0;
+    st.reloc_cap   = 0;
+
+    val sym: intern.StrId = 7::intern.StrId;
+
+    # direct call: auipc ra,0 = 0x00000097 ; jalr ra,ra,0 = 0x000080e7, RK_PLT32 @0.
+    var ci: mir.MirInstr;
+    var cops: [1]mir.MirOperand;
+    cops[0] = mir.op_sym(sym, 0);
+    ci.operands = ?cops[0]; ci.operand_count = 1;
+    encode_call(?st, ?ci);
+    if (read_word(?st.buf, 0) != 0x00000097) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x000080E7) { bad = 1; }
+    if (st.reloc_count != 1)                 { bad = 1; }
+    or {
+        if (st.relocs[0].kind != of.RK_PLT32) { bad = 1; }
+        if (st.relocs[0].offset != 0)         { bad = 1; }
+        if (st.relocs[0].sym != sym)          { bad = 1; }
+    }
+
+    # indirect call: jalr ra,a0,0 = 0x000500e7, no new reloc.
+    var ii: mir.MirInstr;
+    var iops: [1]mir.MirOperand;
+    iops[0] = mir.op_preg(10);
+    ii.operands = ?iops[0]; ii.operand_count = 1;
+    encode_call(?st, ?ii);
+    if (read_word(?st.buf, 8) != 0x000500E7) { bad = 1; }
+    if (st.reloc_count != 1)                 { bad = 1; }
+
+    encode.buf_dnit(?st.buf);
+    if (st.relocs != nil && st.reloc_cap > 0) {
+        A.deallocate[encode.PendingReloc](?alloc, st.relocs, st.reloc_cap::usize);
+    }
+    ret bad;
+}
+
+# the inline-asm clobber analyzer classifies the RISC-V statement grammar: a call
+# clobbers the caller-saved file, destination-writing forms their first register, the
+# store / branch / system / fence forms nothing, and an unrecognized statement
+# conservatively clobbers everything.
+test "mach.lang.target.isa.riscv64.encode:asm_clobbers_classification" {
+    var bad: i32 = 0;
+    var gp: u32 = 0;
+    var fp: u32 = 0;
+
+    # a load + store + jal call body: ld writes a0(10), addi writes a1(11), the call
+    # clobbers the caller-saved file; sd writes nothing.
+    asm_clobbers("ld a0, 0(sp)\naddi a1, sp, 8\nsd a0, 0(a1)\njal main", ?gp, ?fp);
+    if ((gp & (1::u32 << 10)) == 0) { bad = 1; }  # a0 written by ld
+    if ((gp & (1::u32 << 11)) == 0) { bad = 1; }  # a1 written by addi
+    if ((gp & CALLER_SAVED_GP) != CALLER_SAVED_GP) { bad = 1; }  # call clobbers caller-saved
+    if (fp != 0) { bad = 1; }
+
+    # a pure store / branch / ecall body writes no register.
+    gp = 0; fp = 0;
+    asm_clobbers("sd a0, 0(sp)\nbeq a0, a1, end\necall", ?gp, ?fp);
+    if (gp != 0) { bad = 1; }
+
+    # a label prefix is skipped; the following addi still writes its destination.
+    gp = 0; fp = 0;
+    asm_clobbers("loop: addi t0, t0, 1", ?gp, ?fp);
+    if ((gp & (1::u32 << 5)) == 0) { bad = 1; }  # t0 = x5
+    if ((gp & ~(1::u32 << 5)) != 0) { bad = 1; } # nothing else
+
+    # an unrecognized statement conservatively clobbers everything.
+    gp = 0; fp = 0;
+    asm_clobbers("frobnicate a0, a1", ?gp, ?fp);
+    if (gp != 0xFFFFFFFF) { bad = 1; }
+    if (fp != 0xFFFFFFFF) { bad = 1; }
+
+    # the register-name resolver covers numeric and psABI spellings.
+    if (asm_reg_index("x0") != 0)   { bad = 1; }
+    if (asm_reg_index("x31") != 31) { bad = 1; }
+    if (asm_reg_index("sp") != 2)   { bad = 1; }
+    if (asm_reg_index("fp") != 8)   { bad = 1; }
+    if (asm_reg_index("a7") != 17)  { bad = 1; }
+    if (asm_reg_index("t6") != 31)  { bad = 1; }
+    if (asm_reg_index("notareg") != (0 - 1)) { bad = 1; }
+
+    ret bad;
+}
