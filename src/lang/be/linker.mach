@@ -1946,6 +1946,145 @@ fun ldst_lo12_scale(kind: of.RelocKind) i32 {
     ret -1;
 }
 
+# the byte gap from a riscv pc-relative low-12 instruction back to its paired auipc in
+# the `la` (load-address) sequence. the auipc immediately precedes the low instruction
+# (load / addi / store), so the low instruction's patch_va minus this gap recovers the
+# auipc's pc - the pc the low-12 displacement is measured from. baking the gap in lets
+# the lo12 relocation name the same global as its paired hi20 and be resolved
+# independently, without the on-disk hi/lo label chase the standard psABI uses.
+val RISCV_LA_HI_LO_GAP: u64 = 4;
+
+# whether a 32-bit pc-relative displacement fits the riscv auipc + low-12 split. the
+# +0x800-rounded high part must stay within a signed 32-bit value, which guarantees the
+# 20-bit auipc imm and the signed 12-bit low field together reach the displacement.
+# ---
+# delta: the pc-relative displacement (S + A - P)
+# ret:   true when the displacement is representable by an auipc + lo12 pair
+fun riscv_pcrel32_ok(delta: i64) bool {
+    val adj: i64 = delta + 0x800;
+    ret adj >= -2147483648 && adj <= 2147483647;
+}
+
+# set the U-type imm[31:12] of an auipc / lui word to ((delta + 0x800) >> 12), keeping
+# the rd[11:7] and opcode[6:0] bits. the +0x800 rounds so the paired signed 12-bit low
+# field folds back exactly.
+# ---
+# word:  the original instruction word
+# delta: the pc-relative displacement the hi/lo pair materializes
+# ret:   the word with its high-20 immediate field replaced
+fun riscv_set_hi20(word: u32, delta: i64) u32 {
+    val hi20: u32 = (((delta + 0x800) >> 12)::u64 & 0xFFFFF)::u32;
+    ret (word & 0xFFF) | (hi20 << 12);
+}
+
+# set the I-type imm[31:20] of a load / addi / jalr word to (delta & 0xFFF), keeping the
+# rd / funct3 / rs1 / opcode bits in [19:0]. the hardware sign-extends the 12-bit field,
+# which the +0x800 hi20 rounding accounts for.
+# ---
+# word:  the original instruction word
+# delta: the pc-relative displacement (relative to the paired auipc)
+# ret:   the word with its I-type immediate field replaced
+fun riscv_set_lo12_i(word: u32, delta: i64) u32 {
+    val lo12: u32 = (delta::u64 & 0xFFF)::u32;
+    ret (word & 0x000FFFFF) | (lo12 << 20);
+}
+
+# set the S-type immediate of a store word to (delta & 0xFFF), scattered into imm[11:5]
+# (bits[31:25]) and imm[4:0] (bits[11:7]), keeping the rs2 / rs1 / funct3 / opcode bits.
+# ---
+# word:  the original instruction word
+# delta: the pc-relative displacement (relative to the paired auipc)
+# ret:   the word with its S-type immediate field replaced
+fun riscv_set_lo12_s(word: u32, delta: i64) u32 {
+    val lo12: u32 = (delta::u64 & 0xFFF)::u32;
+    ret (word & 0x01FFF07F) | ((lo12 >> 5) << 25) | ((lo12 & 0x1F) << 7);
+}
+
+# apply one riscv64 relocation, the packer the be-layer registrar wires onto the
+# riscv64 vtable. The shared RK_ABS64 / RK_PC32 kinds are flat little-endian writes
+# (R_RISCV_64 / R_RISCV_32_PCREL); every other kind is a RISC-V instruction-word
+# relocation, a read-modify-write of the 32-bit little-endian word(s) at the patch
+# site that scatters the displacement into the U / I / S immediate field without
+# disturbing the opcode or register bits. RK_PLT32 patches the auipc + jalr CALL pair
+# (R_RISCV_CALL_PLT, two words); RK_PCREL_HI20 the auipc high-20; RK_PCREL_LO12_I / _S
+# the paired low-12 in an I / S immediate, measured from the paired auipc one word
+# back. an unknown kind is reported as unsupported.
+# ---
+# s:         shared session, for the overflow/unsupported diagnostics
+# kind:      the relocation kind to apply
+# dst:       the merged section bytes to patch
+# patch_off: byte offset of the instruction word within `dst`
+# sec_len:   length of the section `dst` backs, for the bounds check
+# sym_va:    the target symbol's final virtual address
+# addend:    the relocation addend
+# patch_va:  the patch site's own virtual address
+# sym_name:  interned symbol name for the overflow diagnostic (STR_NIL if absent)
+# ret:       ok(true) once written, or an overflow/unsupported error
+fun riscv64_apply_reloc(s: *session.Session, kind: of.RelocKind,
+                        dst: *u8, patch_off: u32, sec_len: u32,
+                        sym_va: u64, addend: i64, patch_va: u64,
+                        sym_name: intern.StrId) R.Result[bool, str] {
+    # the shared kinds are flat writes, not instruction-field packers.
+    if (kind == of.RK_ABS64) {
+        ret apply_abs64(s, kind, dst, patch_off, sec_len, sym_va, addend, sym_name);
+    }
+    if (kind == of.RK_PC32) {
+        ret apply_pcrel32(s, kind, dst, patch_off, sec_len, sym_va, addend, patch_va, sym_name);
+    }
+
+    # RK_PLT32 -> R_RISCV_CALL_PLT: the auipc + jalr call pair (8 bytes). the hi20 lands
+    # in the auipc at the patch site, the lo12 in the jalr one word later; both share the
+    # one displacement measured from the auipc (the patch site itself).
+    if (kind == of.RK_PLT32) {
+        if (patch_off::u64 + 8 > sec_len::u64) {
+            ret R.err[bool, str](overflow_message(s, kind, sym_name));
+        }
+        val delta: i64 = (sym_va::i64) + addend - (patch_va::i64);
+        if (!riscv_pcrel32_ok(delta)) {
+            ret R.err[bool, str](overflow_message(s, kind, sym_name));
+        }
+        val auipc: u32 = bin.read_u32_le(dst, patch_off::usize);
+        bin.write_u32_le(dst, patch_off::usize, riscv_set_hi20(auipc, delta));
+        val jalr: u32 = bin.read_u32_le(dst, (patch_off + 4)::usize);
+        bin.write_u32_le(dst, (patch_off + 4)::usize, riscv_set_lo12_i(jalr, delta));
+        ret R.ok[bool, str](true);
+    }
+
+    # every remaining riscv relocation patches a single 32-bit instruction word.
+    if (patch_off::u64 + 4 > sec_len::u64) {
+        ret R.err[bool, str](overflow_message(s, kind, sym_name));
+    }
+    val word: u32 = bin.read_u32_le(dst, patch_off::usize);
+
+    # RK_PCREL_HI20 -> R_RISCV_PCREL_HI20: auipc high-20, pc-relative to the auipc (the
+    # patch site).
+    if (kind == of.RK_PCREL_HI20) {
+        val delta: i64 = (sym_va::i64) + addend - (patch_va::i64);
+        if (!riscv_pcrel32_ok(delta)) {
+            ret R.err[bool, str](overflow_message(s, kind, sym_name));
+        }
+        bin.write_u32_le(dst, patch_off::usize, riscv_set_hi20(word, delta));
+        ret R.ok[bool, str](true);
+    }
+
+    # RK_PCREL_LO12_I / _S -> R_RISCV_PCREL_LO12_I / _S: the low-12 measured from the
+    # paired auipc, recovered as patch_va - gap (the auipc sits one word before in the la
+    # sequence). no range check: the 12-bit field always fits once the hi20 carried the
+    # high part.
+    if (kind == of.RK_PCREL_LO12_I) {
+        val delta: i64 = (sym_va::i64) + addend - ((patch_va - RISCV_LA_HI_LO_GAP)::i64);
+        bin.write_u32_le(dst, patch_off::usize, riscv_set_lo12_i(word, delta));
+        ret R.ok[bool, str](true);
+    }
+    if (kind == of.RK_PCREL_LO12_S) {
+        val delta: i64 = (sym_va::i64) + addend - ((patch_va - RISCV_LA_HI_LO_GAP)::i64);
+        bin.write_u32_le(dst, patch_off::usize, riscv_set_lo12_s(word, delta));
+        ret R.ok[bool, str](true);
+    }
+
+    ret R.err[bool, str](unsupported_message(s, kind));
+}
+
 # wire each registered arch's relocation packer onto its
 # vtable - the be-layer linker registrar. The relocation kind-set is owned by the
 # arch (one hook per vtable), but the packing bodies and their wiring live in this
@@ -1961,6 +2100,7 @@ pub fun register_reloc_hooks(reg: *isa.IsaRegistry) R.Result[bool, str] {
         val vt: *isa.IsaVTable = O.unwrap[*isa.IsaVTable](isa.registered(reg, i));
         if (str_equals(vt.name, "x86_64"))  { vt.apply_reloc = x64_apply_reloc::*u8; }
         if (str_equals(vt.name, "aarch64")) { vt.apply_reloc = arm64_apply_reloc::*u8; }
+        if (str_equals(vt.name, "riscv64")) { vt.apply_reloc = riscv64_apply_reloc::*u8; }
         i = i + 1;
     }
     ret R.ok[bool, str](true);
@@ -2551,6 +2691,91 @@ test "mach.lang.be.linker.arm64_apply_reloc:overflow_rejection" {
     bin.write_u32_le(?dst[0], 0, 0x90000000);
     val o4: R.Result[bool, str] = arm64_apply_reloc(?s, of.RK_PAGE21, ?dst[0], 0, 8, 4294967296, 0, 0, intern.STR_NIL);
     if (!R.is_err[bool, str](o4)) { ret 1; }
+
+    ret 0;
+}
+
+# the riscv64 bit-packers scatter the resolved displacement into the exact U / I / S
+# instruction-word fields, reproducing the `auipc t0, 0x12345 ; addi/sd/jalr ...`
+# words for a displacement of 0x12345678 (hi20 0x12345, lo12 0x678). the lo12 packers
+# measure the displacement from the paired auipc one word back, so a low instruction
+# at patch_va recovers the auipc pc as patch_va - 4 (#1628).
+test "mach.lang.be.linker.riscv64_apply_reloc:bitpackers" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var dst: [8]u8;
+    dst[4] = 0; dst[5] = 0; dst[6] = 0; dst[7] = 0;
+
+    # PCREL_HI20: `auipc t0, 0` (0x00000297) + delta 0x12345678 -> `auipc t0, 0x12345`
+    bin.write_u32_le(?dst[0], 0, 0x00000297);
+    val h1: R.Result[bool, str] = riscv64_apply_reloc(?s, of.RK_PCREL_HI20, ?dst[0], 0, 8, 0x12345678, 0, 0, intern.STR_NIL);
+    if (R.is_err[bool, str](h1))                   { ret 1; }
+    if (bin.read_u32_le(?dst[0], 0) != 0x12345297) { ret 1; }
+
+    # PCREL_LO12_I: `addi t0, t0, 0` (0x00028293) + lo12 0x678; the paired auipc sits at
+    # patch_va-4, so a low instruction at patch_va 4 and sym 0x12345678 yields lo12 0x678.
+    bin.write_u32_le(?dst[0], 0, 0x00028293);
+    val li: R.Result[bool, str] = riscv64_apply_reloc(?s, of.RK_PCREL_LO12_I, ?dst[0], 0, 8, 0x12345678, 0, 4, intern.STR_NIL);
+    if (R.is_err[bool, str](li))                   { ret 1; }
+    if (bin.read_u32_le(?dst[0], 0) != 0x67828293) { ret 1; }
+
+    # PCREL_LO12_S: `sd t0, 0(t0)` (0x0052B023) + lo12 0x678 -> `sd t0, 0x678(t0)`
+    bin.write_u32_le(?dst[0], 0, 0x0052B023);
+    val ls: R.Result[bool, str] = riscv64_apply_reloc(?s, of.RK_PCREL_LO12_S, ?dst[0], 0, 8, 0x12345678, 0, 4, intern.STR_NIL);
+    if (R.is_err[bool, str](ls))                   { ret 1; }
+    if (bin.read_u32_le(?dst[0], 0) != 0x6652BC23) { ret 1; }
+
+    # PLT32 -> R_RISCV_CALL_PLT: the `auipc ra, 0` (0x00000097) ; `jalr ra, ra, 0`
+    # (0x000080E7) pair patched with delta 0x12345678 -> hi20 0x12345, lo12 0x678.
+    bin.write_u32_le(?dst[0], 0, 0x00000097);
+    bin.write_u32_le(?dst[0], 4, 0x000080E7);
+    val c1: R.Result[bool, str] = riscv64_apply_reloc(?s, of.RK_PLT32, ?dst[0], 0, 8, 0x12345678, 0, 0, intern.STR_NIL);
+    if (R.is_err[bool, str](c1))                   { ret 1; }
+    if (bin.read_u32_le(?dst[0], 0) != 0x12345097) { ret 1; }
+    if (bin.read_u32_le(?dst[0], 4) != 0x678080E7) { ret 1; }
+
+    # RK_ABS64: a flat 64-bit absolute (R_RISCV_64) shared with the other arches.
+    bin.write_u32_le(?dst[0], 0, 0); bin.write_u32_le(?dst[0], 4, 0);
+    val a1: R.Result[bool, str] = riscv64_apply_reloc(?s, of.RK_ABS64, ?dst[0], 0, 8, 0xDEADBEEF, 0x11, 0, intern.STR_NIL);
+    if (R.is_err[bool, str](a1))                          { ret 1; }
+    if (bin.read_u32_le(?dst[0], 0) != 0xDEADBF00)        { ret 1; }
+    if (bin.read_u32_le(?dst[0], 4) != 0)                 { ret 1; }
+
+    ret 0;
+}
+
+# the riscv pc-relative hi20 / call reach is the auipc + lo12 split's signed 32-bit
+# window: a displacement whose +0x800-rounded high part overflows a signed 32-bit
+# value is rejected; the lo12 kinds never overflow once the hi20 carried the high part.
+test "mach.lang.be.linker.riscv64_apply_reloc:overflow_rejection" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var dst: [8]u8;
+    dst[4] = 0; dst[5] = 0; dst[6] = 0; dst[7] = 0;
+
+    # HI20: delta 0x80000000 is past the signed 32-bit auipc+lo12 reach -> reject
+    bin.write_u32_le(?dst[0], 0, 0x00000297);
+    val o1: R.Result[bool, str] = riscv64_apply_reloc(?s, of.RK_PCREL_HI20, ?dst[0], 0, 8, 0x80000000, 0, 0, intern.STR_NIL);
+    if (!R.is_err[bool, str](o1)) { ret 1; }
+
+    # HI20: delta 2147481599 (= 2^31 - 1 - 2048) rounds to exactly INT32_MAX -> succeed
+    bin.write_u32_le(?dst[0], 0, 0x00000297);
+    val o2: R.Result[bool, str] = riscv64_apply_reloc(?s, of.RK_PCREL_HI20, ?dst[0], 0, 8, 2147481599, 0, 0, intern.STR_NIL);
+    if (R.is_err[bool, str](o2)) { ret 1; }
+
+    # CALL pair: same signed 32-bit reach as the bare hi20 -> reject 0x80000000
+    bin.write_u32_le(?dst[0], 0, 0x00000097);
+    bin.write_u32_le(?dst[0], 4, 0x000080E7);
+    val o3: R.Result[bool, str] = riscv64_apply_reloc(?s, of.RK_PLT32, ?dst[0], 0, 8, 0x80000000, 0, 0, intern.STR_NIL);
+    if (!R.is_err[bool, str](o3)) { ret 1; }
 
     ret 0;
 }
