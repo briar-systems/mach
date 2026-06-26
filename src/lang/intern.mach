@@ -1,204 +1,288 @@
-# mach.lang.intern: identifier interner mapping text to stable `StrId` handles.
+# identifier interner mapping text to stable `StrId` handles
 #
-# the same byte sequence presented twice resolves to the same `StrId`;
-# the resolved bytes remain valid for the interner's lifetime.
+# The same byte sequence presented twice resolves to the same `StrId`, and the
+# resolved bytes stay valid for the interner's lifetime. Owned copies are keyed
+# by content in a dedup map, so re-interning an identifier (the common lexer
+# path) costs one map lookup and no allocation.
 
+use std.allocator.page;
+use std.collections.map;
+use std.text.string;
 use std.types.bool.bool;
-use std.types.option.Option;
-use std.types.option.some;
-use std.types.option.none;
 use std.types.size.usize;
 use std.types.string.str;
-use std.text.string.str_dup;
-use std.text.string.str_dup_range;
-use std.text.string.str_free;
-use std.types.result.Result;
-use std.types.result.ok;
-use std.types.result.err;
-use std.types.result.is_ok;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.unwrap_err;
 
-use std.allocator.Allocator;
-use std.allocator.allocate;
-use std.allocator.deallocate;
-use std.allocator.reallocate;
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
 
-use map: std.collections.map;
+use mach.lang.fe.token;
 
-use token: mach.lang.fe.token;
-
-# StrId: stable handle into an Interner's universe.
+# a stable handle into an `Interner`'s string universe
 pub def StrId: u32;
 
-# STR_NIL: sentinel StrId denoting the absence of an interned string.
+# sentinel StrId denoting the absence of an interned string
 pub val STR_NIL: StrId = 0xFFFFFFFF;
 
-# Interner: dedupes inserts and assigns each unique string a stable u32 id.
+# content-deduplicating string interner
+#
+# Assigns each unique string a stable u32 id and collapses repeated inserts of
+# the same bytes onto a single id and a single owned copy.
 # ---
-# alloc:   allocator used for owned copies, the index, and the dedup map
+# a:       allocator backing owned copies, the index array, and the dedup map
 # strings: array of owned strings indexed by StrId
 # len:     number of strings stored
 # cap:     allocated slots in strings
 # dedup:   text -> StrId map keyed by content for O(1) interning
 pub rec Interner {
-    alloc:   *Allocator;
+    a:       *A.Allocator;
     strings: *str;
     len:     usize;
     cap:     usize;
     dedup:   map.Map[str, StrId];
 }
 
+# initial capacity of the strings array on first intern
 val INITIAL_CAP: usize = 32;
 
-# init: construct an empty Interner backed by the given allocator.
+# construct an empty interner backed by the given allocator
+#
+# Storage is allocated lazily on first intern, so init cannot fail.
 # ---
-# alloc: allocator used for owned strings, the index, and the dedup map
-# ret:   a new empty Interner
-pub fun init(alloc: *Allocator) Interner {
-    var i: Interner;
-    i.alloc   = alloc;
-    i.strings = nil;
-    i.len     = 0;
-    i.cap     = 0;
-    i.dedup   = map.init[str, StrId](alloc, map.hash_str, map.eq_str);
-    ret i;
+# a:   allocator used for owned strings, the index array, and the dedup map
+# ret: a new empty interner
+pub fun init(a: *A.Allocator) Interner {
+    var itn: Interner;
+    itn.a       = a;
+    itn.strings = nil;
+    itn.len     = 0;
+    itn.cap     = 0;
+    itn.dedup   = map.init[str, StrId](a, map.hash_str, map.eq_str);
+    ret itn;
 }
 
-# dnit: free every owned string, the index, and the dedup map.
+# free every owned string, the index array, and the dedup map, leaving a clean slate
 # ---
-# i: the interner to tear down; all fields are zeroed
-pub fun dnit(i: *Interner) {
-    if (i == nil) { ret; }
+# itn: the interner to tear down; all fields are zeroed
+pub fun dnit(itn: *Interner) {
+    if (itn == nil) { ret; }
 
-    var k: usize = 0;
-    for (k < i.len) {
-        str_free(i.alloc, i.strings[k]);
-        k = k + 1;
+    var i: usize = 0;
+    for (i < itn.len) {
+        string.str_free(itn.a, itn.strings[i]);
+        i = i + 1;
     }
 
-    if (i.strings != nil && i.cap > 0) {
-        deallocate[str](i.alloc, i.strings, i.cap);
+    if (itn.strings != nil && itn.cap > 0) {
+        A.deallocate[str](itn.a, itn.strings, itn.cap);
     }
 
-    map.dnit[str, StrId](?i.dedup);
+    map.dnit[str, StrId](?itn.dedup);
 
-    i.strings = nil;
-    i.len     = 0;
-    i.cap     = 0;
+    itn.strings = nil;
+    itn.len     = 0;
+    itn.cap     = 0;
 }
 
-# intern: return the StrId for text, allocating an owned copy and a fresh id only on first occurrence.
+# the text for a previously interned id, or none when id is out of range
+#
+# The returned str is stable for the interner's lifetime.
 # ---
-# i:    the interner
-# text: text to intern
+# itn: the interner
+# id:  a StrId returned by a prior intern / intern_span / intern_bytes
+# ret: some(text) when id is in range, none otherwise
+pub fun lookup(itn: *Interner, id: StrId) O.Option[str] {
+    if (id::usize >= itn.len) { ret O.none[str](); }
+    ret O.some[str](itn.strings[id]);
+}
+
+# intern text, returning its StrId and allocating an owned copy only on first occurrence
+#
+# Checks the dedup map before copying, so re-interning a known string costs no
+# allocation.
+# ---
+# itn:  the interner
+# text: null-terminated text to intern
 # ret:  the StrId for text (existing or new), or an allocation error
-pub fun intern(i: *Interner, text: str) Result[StrId, str] {
-    val existing: Result[*StrId, str] = map.get[str, StrId](?i.dedup, ?text);
-    if (is_ok[*StrId, str](existing)) {
-        ret ok[StrId, str](@unwrap_ok[*StrId, str](existing));
+pub fun intern(itn: *Interner, text: str) R.Result[StrId, str] {
+    val res_existing: R.Result[*StrId, str] = map.get[str, StrId](?itn.dedup, ?text);
+    if (R.is_ok[*StrId, str](res_existing)) {
+        ret R.ok[StrId, str](@R.unwrap_ok[*StrId, str](res_existing));
     }
 
-    val cp_r: Result[str, str] = str_dup(i.alloc, text);
-    if (is_err[str, str](cp_r)) {
-        ret err[StrId, str](unwrap_err[str, str](cp_r));
+    val res_dup: R.Result[str, str] = string.str_dup(itn.a, text);
+    if (R.is_err[str, str](res_dup)) {
+        ret R.err[StrId, str](R.unwrap_err[str, str](res_dup));
     }
-    val owned: str = unwrap_ok[str, str](cp_r);
 
-    ret store_and_index(i, owned);
+    ret store_and_index(itn, R.unwrap_ok[str, str](res_dup));
 }
 
-# intern_span: return the StrId for a substring of source, allocating only on first occurrence.
+# intern the substring of `source` covered by `span`, allocating only on first occurrence
+#
+# Unlike intern, the slice is materialized before the dedup check, since the
+# map keys on a contiguous, null-terminated copy.
 # ---
-# i:      the interner
-# source: source string the slice is taken from
+# itn:    the interner
+# source: source text the slice is taken from
 # span:   byte range within source to intern
 # ret:    the StrId for the substring (existing or new), or an allocation error
-pub fun intern_span(i: *Interner, source: str, span: token.Span) Result[StrId, str] {
-    val cp_r: Result[str, str] = str_dup_range(i.alloc, source, span.offset, span.len);
-    if (is_err[str, str](cp_r)) {
-        ret err[StrId, str](unwrap_err[str, str](cp_r));
-    }
-    val owned: str = unwrap_ok[str, str](cp_r);
-
-    val existing: Result[*StrId, str] = map.get[str, StrId](?i.dedup, ?owned);
-    if (is_ok[*StrId, str](existing)) {
-        str_free(i.alloc, owned);
-        ret ok[StrId, str](@unwrap_ok[*StrId, str](existing));
-    }
-
-    ret store_and_index(i, owned);
+pub fun intern_span(itn: *Interner, source: str, span: token.Span) R.Result[StrId, str] {
+    ret intern_range(itn, source, span.offset, span.len);
 }
 
-# intern_bytes: return the StrId for the first `len` bytes of `data`,
-# allocating only on first occurrence. unlike intern_span this works over a
-# raw, possibly non-null-terminated buffer (e.g. a decoded string literal).
+# intern the first `len` bytes of `data`, allocating only on first occurrence
+#
+# Works over a raw, possibly non-null-terminated buffer (a decoded string
+# literal, say) where intern_span's source span does not apply.
 # ---
-# i:    the interner
+# itn:  the interner
 # data: pointer to the bytes to intern
 # len:  number of bytes
 # ret:  the StrId for the byte range (existing or new), or an allocation error
-pub fun intern_bytes(i: *Interner, data: str, len: usize) Result[StrId, str] {
-    val cp_r: Result[str, str] = str_dup_range(i.alloc, data, 0, len);
-    if (is_err[str, str](cp_r)) {
-        ret err[StrId, str](unwrap_err[str, str](cp_r));
-    }
-    val owned: str = unwrap_ok[str, str](cp_r);
-
-    val existing: Result[*StrId, str] = map.get[str, StrId](?i.dedup, ?owned);
-    if (is_ok[*StrId, str](existing)) {
-        str_free(i.alloc, owned);
-        ret ok[StrId, str](@unwrap_ok[*StrId, str](existing));
-    }
-
-    ret store_and_index(i, owned);
+pub fun intern_bytes(itn: *Interner, data: str, len: usize) R.Result[StrId, str] {
+    ret intern_range(itn, data, 0, len);
 }
 
-# lookup: return the text for a previously interned id, or none when id
-# is out of range; the returned str is stable for the interner's lifetime.
+# copy [offset, offset + len) of `source`, then dedup the copy: free it and
+# return the existing id on a hit, otherwise store it and return a fresh id
 # ---
-# i:   the interner
-# id:  StrId returned by a previous intern() or intern_span() call
-# ret: some(text) when id is in range, none otherwise
-pub fun lookup(i: *Interner, id: StrId) Option[str] {
-    if (id::usize >= i.len) { ret none[str](); }
-    ret some[str](i.strings[id]);
+# itn:    the interner
+# source: text to slice from
+# offset: starting byte offset of the slice
+# len:    length of the slice in bytes
+# ret:    the StrId for the slice (existing or new), or an allocation error
+fun intern_range(itn: *Interner, source: str, offset: usize, len: usize) R.Result[StrId, str] {
+    val res_dup: R.Result[str, str] = string.str_dup_range(itn.a, source, offset, len);
+    if (R.is_err[str, str](res_dup)) {
+        ret R.err[StrId, str](R.unwrap_err[str, str](res_dup));
+    }
+    val owned: str = R.unwrap_ok[str, str](res_dup);
+
+    val res_existing: R.Result[*StrId, str] = map.get[str, StrId](?itn.dedup, ?owned);
+    if (R.is_ok[*StrId, str](res_existing)) {
+        string.str_free(itn.a, owned);
+        ret R.ok[StrId, str](@R.unwrap_ok[*StrId, str](res_existing));
+    }
+
+    ret store_and_index(itn, owned);
 }
 
-# store_and_index: store `owned` in the strings array, index it in the dedup map, and return its new StrId.
-fun store_and_index(i: *Interner, owned: str) Result[StrId, str] {
-    if (i.strings == nil) {
-        val r: Result[*str, str] = allocate[str](i.alloc, INITIAL_CAP);
-        if (is_err[*str, str](r)) {
-            str_free(i.alloc, owned);
-            ret err[StrId, str](unwrap_err[*str, str](r));
+# take ownership of `owned`, append it to the strings array, index it in the
+# dedup map, and return its new StrId
+#
+# On any allocation failure `owned` is freed and the partial append is rolled
+# back, so the interner is left unchanged.
+# ---
+# itn:   the interner
+# owned: an owned, heap-allocated string the interner takes ownership of
+# ret:   the freshly assigned StrId, or an allocation error
+fun store_and_index(itn: *Interner, owned: str) R.Result[StrId, str] {
+    if (itn.strings == nil) {
+        val res_alloc: R.Result[*str, str] = A.allocate[str](itn.a, INITIAL_CAP);
+        if (R.is_err[*str, str](res_alloc)) {
+            string.str_free(itn.a, owned);
+            ret R.err[StrId, str](R.unwrap_err[*str, str](res_alloc));
         }
-        i.strings = unwrap_ok[*str, str](r);
-        i.cap     = INITIAL_CAP;
+        itn.strings = R.unwrap_ok[*str, str](res_alloc);
+        itn.cap     = INITIAL_CAP;
     }
-    or (i.len == i.cap) {
-        val new_cap: usize = i.cap * 2;
-        val r: Result[*str, str] = reallocate[str](i.alloc, i.strings, i.cap, new_cap);
-        if (is_err[*str, str](r)) {
-            str_free(i.alloc, owned);
-            ret err[StrId, str](unwrap_err[*str, str](r));
+    or (itn.len == itn.cap) {
+        val new_cap: usize = itn.cap * 2;
+        val res_realloc: R.Result[*str, str] = A.reallocate[str](itn.a, itn.strings, itn.cap, new_cap);
+        if (R.is_err[*str, str](res_realloc)) {
+            string.str_free(itn.a, owned);
+            ret R.err[StrId, str](R.unwrap_err[*str, str](res_realloc));
         }
-        i.strings = unwrap_ok[*str, str](r);
-        i.cap     = new_cap;
+        itn.strings = R.unwrap_ok[*str, str](res_realloc);
+        itn.cap     = new_cap;
     }
 
-    val new_id: StrId = i.len::u32;
-    i.strings[i.len] = owned;
-    i.len = i.len + 1;
+    val new_id: StrId = itn.len::u32;
+    itn.strings[itn.len] = owned;
+    itn.len = itn.len + 1;
 
-    val ins_r: Result[bool, str] = map.insert[str, StrId](?i.dedup, owned, new_id);
-    if (is_err[bool, str](ins_r)) {
-        str_free(i.alloc, owned);
-        i.strings[i.len - 1] = nil;
-        i.len = i.len - 1;
-        ret err[StrId, str](unwrap_err[bool, str](ins_r));
+    val res_insert: R.Result[bool, str] = map.insert[str, StrId](?itn.dedup, owned, new_id);
+    if (R.is_err[bool, str](res_insert)) {
+        string.str_free(itn.a, owned);
+        itn.strings[itn.len - 1] = nil;
+        itn.len = itn.len - 1;
+        ret R.err[StrId, str](R.unwrap_err[bool, str](res_insert));
     }
 
-    ret ok[StrId, str](new_id);
+    ret R.ok[StrId, str](new_id);
+}
+
+# interning the same text twice yields the same id; distinct text yields a
+# distinct id; lookup round-trips back to the same id
+test "mach.lang.intern.intern:dedups_and_roundtrips" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: Interner = init(?alloc);
+
+    val res_a1: R.Result[StrId, str] = intern(?itn, "alpha");
+    val res_a2: R.Result[StrId, str] = intern(?itn, "alpha");
+    val res_b:  R.Result[StrId, str] = intern(?itn, "beta");
+    if (R.is_err[StrId, str](res_a1)) { dnit(?itn); ret 1; }
+    if (R.is_err[StrId, str](res_a2)) { dnit(?itn); ret 1; }
+    if (R.is_err[StrId, str](res_b))  { dnit(?itn); ret 1; }
+
+    val alpha_id: StrId = R.unwrap_ok[StrId, str](res_a1);
+    val beta_id:  StrId = R.unwrap_ok[StrId, str](res_b);
+    if (alpha_id != R.unwrap_ok[StrId, str](res_a2)) { dnit(?itn); ret 1; }
+    if (alpha_id == beta_id)                         { dnit(?itn); ret 1; }
+
+    # lookup returns the stored text, which re-interns to the very same id
+    val opt_text: O.Option[str] = lookup(?itn, alpha_id);
+    if (O.is_none[str](opt_text)) { dnit(?itn); ret 1; }
+    val res_round: R.Result[StrId, str] = intern(?itn, O.unwrap[str](opt_text));
+    if (R.is_err[StrId, str](res_round))                { dnit(?itn); ret 1; }
+    if (R.unwrap_ok[StrId, str](res_round) != alpha_id) { dnit(?itn); ret 1; }
+
+    dnit(?itn);
+    ret 0;
+}
+
+# a span slice and a raw byte range dedup against an equal whole-string intern
+test "mach.lang.intern.intern_span:dedups_against_intern" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: Interner = init(?alloc);
+
+    val res_full: R.Result[StrId, str] = intern(?itn, "hello");
+    if (R.is_err[StrId, str](res_full)) { dnit(?itn); ret 1; }
+    val hello_id: StrId = R.unwrap_ok[StrId, str](res_full);
+
+    var sp: token.Span;
+    sp.offset = 1;
+    sp.len    = 5;
+    val res_span: R.Result[StrId, str] = intern_span(?itn, "xhellox", sp);
+    if (R.is_err[StrId, str](res_span))                { dnit(?itn); ret 1; }
+    if (R.unwrap_ok[StrId, str](res_span) != hello_id) { dnit(?itn); ret 1; }
+
+    val res_bytes: R.Result[StrId, str] = intern_bytes(?itn, "hello!!", 5);
+    if (R.is_err[StrId, str](res_bytes))                { dnit(?itn); ret 1; }
+    if (R.unwrap_ok[StrId, str](res_bytes) != hello_id) { dnit(?itn); ret 1; }
+
+    dnit(?itn);
+    ret 0;
+}
+
+# lookup misses out-of-range ids and the STR_NIL sentinel, and hits in range
+test "mach.lang.intern.lookup:out_of_range_is_none" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: Interner = init(?alloc);
+
+    if (O.is_some[str](lookup(?itn, 0::StrId))) { dnit(?itn); ret 1; }
+    if (O.is_some[str](lookup(?itn, STR_NIL)))  { dnit(?itn); ret 1; }
+
+    val res_x: R.Result[StrId, str] = intern(?itn, "x");
+    if (R.is_err[StrId, str](res_x)) { dnit(?itn); ret 1; }
+    val x_id: StrId = R.unwrap_ok[StrId, str](res_x);
+    if (O.is_none[str](lookup(?itn, x_id)))     { dnit(?itn); ret 1; }
+    if (O.is_some[str](lookup(?itn, x_id + 1))) { dnit(?itn); ret 1; }
+
+    dnit(?itn);
+    ret 0;
 }

@@ -1,322 +1,376 @@
 # mach.lang.me.pass.inline: function inliner.
 #
-# Replaces a direct call whose callee passes the inlining
-# heuristic with a clone of the callee body, rewriting parameters to the call's
-# actual arguments and stitching the control-flow graph: the call's block is
-# split, the callee's blocks are cloned in with fresh ids, each callee return
-# becomes a branch to the continuation, and the call's result is replaced by a
-# phi over the return values (or the single return value when there is one).
-# Because the call block's original terminator (and thus its outgoing edges)
-# moves to the continuation, any phi in a successor that named the call block as
-# an incoming predecessor is re-keyed to the continuation block.
+# Replaces a direct call whose callee passes the inlining heuristic with a clone
+# of the callee body, rewriting parameters to the call's actual arguments and
+# stitching the control-flow graph: the call's block is split, the callee's
+# blocks are cloned in with fresh ids, each callee return becomes a branch to the
+# continuation, and the call's result is replaced by a phi over the return values
+# (or the single return value when there is one). Because the call block's
+# original terminator (and thus its outgoing edges) moves to the continuation,
+# any phi in a successor that named the call block as an incoming predecessor is
+# re-keyed to the continuation block.
 #
-# The inliner deliberately produces mechanical, un-cleaned output — the release
-# pipeline re-runs mem2reg immediately afterward (so a caller alloca whose
-# address only stops escaping once a callee is inlined gets promoted to SSA),
-# then a late constfold / algebraic / cse / constfold / dce sweep to tidy it.
-# Recursive functions and calls reaching through inline asm are never inlined.
+# The inliner deliberately produces mechanical, un-cleaned output -- the release
+# pipeline re-runs mem2reg immediately afterward (so a caller alloca whose address
+# only stops escaping once a callee is inlined gets promoted to SSA), then a late
+# constfold / algebraic / cse / constfold / dce sweep to tidy it. Recursive
+# functions and calls reaching through inline asm are never inlined.
 
+use std.allocator.page;
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.option.Option;
-use std.types.option.is_some;
-use std.types.option.is_none;
-use std.types.option.unwrap;
-use std.types.result.Result;
-use std.types.result.ok;
-use std.types.result.err;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.unwrap_err;
 
-use std.allocator.allocate;
-use std.allocator.deallocate;
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
 
-use std.allocator.Allocator;
-use page:    std.allocator.page;
-use intern:  mach.lang.intern;
-use builder: mach.lang.me.ir.builder;
-
-use ir:      mach.lang.me.ir;
-use instr:   mach.lang.me.ir.instruction;
-use value:   mach.lang.me.ir.value;
-use ir_type: mach.lang.me.ir.type;
-use id:      mach.lang.me.ir.id;
-use target:  mach.lang.target;
+use mach.lang.intern;
+use mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.target;
 
 # instruction-count ceiling below which a callee is small enough to inline
 # unconditionally. fixed for the rewrite; future cost models read it off the
 # target.
 val INLINE_INSTR_THRESHOLD: u32 = 25;
 
-# global ceiling on inlines per pass invocation. With the call-graph recursion
+# global ceiling on inlines per pass invocation. with the call-graph recursion
 # guard below, inlining only contracts the graph along a DAG and terminates on
 # its own; the budget is kept solely as an ICE-grade backstop against an
 # unforeseen runaway, not as the termination mechanism.
 val INLINE_BUDGET: u32 = 1024;
 
-# Pass entry. Inlines eligible call sites until none remain or the budget is
-# exhausted. Functions are processed in index order, each driven to a local
-# fixpoint before moving on: inlining a call site only ever mutates the caller
-# (the callee body is cloned into it), so an exhausted earlier function never
-# regains an eligible site. That makes the left-to-right walk equivalent to
-# repeatedly restarting a whole-module scan from function 0, but without the
-# per-inline cross-function rescan.
+# inline eligible call sites across the module until none remain or the budget is
+# exhausted
+#
+# Functions are processed in index order, each driven to a local fixpoint before
+# moving on: inlining a call site only ever mutates the caller (the callee body
+# is cloned into it), so an exhausted earlier function never regains an eligible
+# site. That makes the left-to-right walk equivalent to repeatedly restarting a
+# whole-module scan from function 0, but without the per-inline cross-function
+# rescan. The recursion-cycle members are marked once on the original call graph
+# and are never inlined; function_len never changes during the pass, so the
+# marking stays valid. A per-callee live call-count table is maintained
+# incrementally so the single-use test in should_inline is an O(1) lookup.
 # ---
 # m:   module to mutate
-# tgt: target — reserved for target-derived cost-model parameters
+# tgt: target -- reserved for target-derived cost-model parameters
 # ret: ok(true) after a full pass, or the first allocation error
-pub fun run(m: *ir.Module, tgt: *target.Target) Result[bool, str] {
-    if (m.function_len == 0) { ret ok[bool, str](true); }
+pub fun run(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
+    if (m.function_len == 0) { ret R.ok[bool, str](true); }
 
-    # mark the recursion-cycle members once on the original call graph; they are
-    # never inlined (see should_inline). function_len does not change during the
-    # pass — inlining never adds functions — so this marking stays valid.
-    val rr: Result[*bool, str] = allocate[bool](m.alloc, m.function_len::usize);
-    if (is_err[*bool, str](rr)) { ret err[bool, str](unwrap_err[*bool, str](rr)); }
-    val recursive: *bool = unwrap_ok[*bool, str](rr);
-    val rm: Result[bool, str] = mark_recursive(m, recursive);
-    if (is_err[bool, str](rm)) {
-        deallocate[bool](m.alloc, recursive, m.function_len::usize);
-        ret rm;
+    val res_recursive: R.Result[*bool, str] = A.allocate[bool](m.alloc, m.function_len::usize);
+    if (R.is_err[*bool, str](res_recursive)) {
+        ret R.err[bool, str](R.unwrap_err[*bool, str](res_recursive));
+    }
+    val recursive: *bool = R.unwrap_ok[*bool, str](res_recursive);
+    val res_mark: R.Result[bool, str] = mark_recursive(m, recursive);
+    if (R.is_err[bool, str](res_mark)) {
+        A.deallocate[bool](m.alloc, recursive, m.function_len::usize);
+        ret res_mark;
     }
 
-    # per-callee live direct-call count, built once and maintained incrementally
-    # by do_inline — so the single-use test in should_inline is an O(1) lookup
-    # rather than a full-module scan per candidate.
-    val rc: Result[*u32, str] = allocate[u32](m.alloc, m.function_len::usize);
-    if (is_err[*u32, str](rc)) {
-        deallocate[bool](m.alloc, recursive, m.function_len::usize);
-        ret err[bool, str](unwrap_err[*u32, str](rc));
+    val res_counts: R.Result[*u32, str] = A.allocate[u32](m.alloc, m.function_len::usize);
+    if (R.is_err[*u32, str](res_counts)) {
+        A.deallocate[bool](m.alloc, recursive, m.function_len::usize);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](res_counts));
     }
-    val counts: *u32 = unwrap_ok[*u32, str](rc);
+    val counts: *u32 = R.unwrap_ok[*u32, str](res_counts);
     build_call_counts(m, counts);
 
     var budget: u32 = INLINE_BUDGET;
-    var fi: u32 = 0;
-    for (fi < m.function_len && budget > 0) {
-        val caller: *ir.Function = ?m.functions[fi];
+    var i: u32 = 0;
+    for (i < m.function_len && budget > 0) {
+        val caller: *ir.Function = ?m.functions[i];
         if ((caller.flags & ir.FN_FLAG_EXTERN) == 0) {
             var progress: bool = true;
             for (progress && budget > 0) {
-                progress = false;
-                val r: Result[bool, str] = inline_one_in_fn(m, recursive, counts, fi, caller, ?progress);
-                if (is_err[bool, str](r)) {
-                    deallocate[u32](m.alloc, counts, m.function_len::usize);
-                    deallocate[bool](m.alloc, recursive, m.function_len::usize);
-                    ret r;
+                val res_inlined: R.Result[bool, str] = inline_one_in_fn(m, recursive, counts, caller);
+                if (R.is_err[bool, str](res_inlined)) {
+                    A.deallocate[u32](m.alloc, counts, m.function_len::usize);
+                    A.deallocate[bool](m.alloc, recursive, m.function_len::usize);
+                    ret res_inlined;
                 }
+                progress = R.unwrap_ok[bool, str](res_inlined);
                 if (progress) { budget = budget - 1; }
             }
         }
-        fi = fi + 1;
+        i = i + 1;
     }
 
-    deallocate[u32](m.alloc, counts, m.function_len::usize);
-    deallocate[bool](m.alloc, recursive, m.function_len::usize);
-    ret ok[bool, str](true);
+    A.deallocate[u32](m.alloc, counts, m.function_len::usize);
+    A.deallocate[bool](m.alloc, recursive, m.function_len::usize);
+    ret R.ok[bool, str](true);
 }
 
-# scans one function for the first eligible call site and inlines it. sets
-# `did` to true when an inline happened. returns ok(false-in-did) when the
-# function has no eligible site left. `recursive` flags the call-graph cycle
-# members that must never be inlined; `counts` is the live per-callee call count.
-fun inline_one_in_fn(m: *ir.Module, recursive: *bool, counts: *u32, fi: u32, caller: *ir.Function, did: *bool) Result[bool, str] {
-    @did = false;
-    var bi: u32 = 0;
-    for (bi < caller.block_count) {
-        val blk: *ir.Block = ?caller.blocks[bi];
+# inline the first eligible call site in `caller`, if any
+#
+# `recursive` flags the call-graph cycle members that must never be inlined;
+# `counts` is the live per-callee call count.
+# ---
+# m:         module under mutation
+# recursive: per-function recursion-cycle flags, length function_len
+# counts:    live per-callee direct-call counts, length function_len
+# caller:    function to scan and mutate
+# ret:       ok(true) when a call site was inlined, ok(false) when none remained,
+#            or the first allocation error
+fun inline_one_in_fn(m: *ir.Module, recursive: *bool, counts: *u32, caller: *ir.Function) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < caller.block_count) {
+        val blk: *ir.Block = ?caller.blocks[i];
         var ii: u32 = 0;
         for (ii < blk.instr_count) {
             val iid: id.InstructionId = blk.instructions[ii];
-            val inst_opt: Option[*instr.Instruction] = ir.get_instruction(caller, iid);
-            if (is_some[*instr.Instruction](inst_opt)) {
-                val inst: *instr.Instruction = unwrap[*instr.Instruction](inst_opt);
-                if (inst.kind == instr.OP_CALL && inst.operand_count >= 1) {
+            val opt_inst: O.Option[*instruction.Instruction] = ir.instruction_get(caller, iid);
+            if (O.is_some[*instruction.Instruction](opt_inst)) {
+                val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_inst);
+                if (inst.kind == instruction.OP_CALL && inst.operand_count >= 1) {
                     val callee_ix: u32 = callee_index(inst);
                     if (callee_ix != 0xFFFFFFFF && callee_ix < m.function_len) {
                         val callee: *ir.Function = ?m.functions[callee_ix];
-                        if (should_inline(m, recursive, counts, fi, callee_ix, caller, callee)) {
-                            val r: Result[bool, str] =
-                                do_inline(m, counts, caller, bi, ii, iid, callee_ix, callee);
-                            if (is_err[bool, str](r)) { ret r; }
-                            @did = true;
-                            ret ok[bool, str](true);
+                        if (should_inline(recursive, counts, callee_ix, callee)) {
+                            val res_inline: R.Result[bool, str] =
+                                do_inline(m, counts, caller, i, ii, iid, callee_ix, callee);
+                            if (R.is_err[bool, str](res_inline)) { ret res_inline; }
+                            ret R.ok[bool, str](true);
                         }
                     }
                 }
             }
             ii = ii + 1;
         }
-        bi = bi + 1;
+        i = i + 1;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](false);
 }
 
-# returns the callee function index of an OP_CALL whose first operand is a
-# VAL_FN, or 0xFFFFFFFF for an indirect call (which is never inlined).
-fun callee_index(call: *instr.Instruction) u32 {
+# the callee function index of an OP_CALL whose first operand is a VAL_FN
+# ---
+# call: the OP_CALL instruction
+# ret:  callee function index, or 0xFFFFFFFF for an indirect call (never inlined)
+fun callee_index(call: *instruction.Instruction) u32 {
     val callee: value.Value = call.operands[0];
     if (callee.kind == value.VAL_FN) { ret callee.data.fn_ix; }
     ret 0xFFFFFFFF;
 }
 
-# inlining heuristic: a direct call to a non-extern, non-recursive callee is
-# inlined when the callee is flagged INLINE, is small (under the instruction
-# threshold), or is called exactly once across the module. A callee containing
-# inline asm is never inlined: its OP_ASM payload lives in the callee's
-# Function.asm map keyed by the callee-side InstructionId, which the clone does
-# not carry over, so inlining it would silently drop the asm body/ISA/operands.
-# A recursion-cycle member (`recursive[callee_ix]`) is never inlined — direct or
-# mutual; inlining one re-introduces a call into the cycle every iteration, so
-# the budget would be the only thing stopping the loop.
-fun should_inline(m: *ir.Module, recursive: *bool, counts: *u32, caller_ix: u32, callee_ix: u32, caller: *ir.Function, callee: *ir.Function) bool {
-    if ((callee.flags & ir.FN_FLAG_EXTERN) != 0) { ret false; }
-    if (recursive[callee_ix]) { ret false; }         # direct or mutual recursion
-    if (callee.block_count == 0) { ret false; }      # no body to inline
-    if (callee_has_asm(callee)) { ret false; }       # inline asm is never inlined
-    if ((callee.flags & ir.FN_FLAG_INLINE) != 0) { ret true; }
+# decide whether a direct call to `callee` should be inlined
+#
+# A direct call to a non-extern, non-recursive callee is inlined when the callee
+# is flagged INLINE, is small (under the instruction threshold), or is called
+# exactly once across the module. A callee containing inline asm is never
+# inlined: its OP_ASM payload lives in the callee's Function.asm map keyed by the
+# callee-side InstructionId, which the clone does not carry over, so inlining it
+# would silently drop the asm body. A recursion-cycle member is never inlined --
+# direct or mutual -- because inlining one re-introduces a call into the cycle
+# every iteration, leaving the budget as the only thing stopping the loop.
+# ---
+# recursive: per-function recursion-cycle flags, length function_len
+# counts:    live per-callee direct-call counts, length function_len
+# callee_ix: function index of the callee
+# callee:    the callee function
+# ret:       true when the call site should be inlined
+fun should_inline(recursive: *bool, counts: *u32, callee_ix: u32, callee: *ir.Function) bool {
+    if ((callee.flags & ir.FN_FLAG_EXTERN) != 0)             { ret false; }
+    if (recursive[callee_ix])                                { ret false; }
+    if (callee.block_count == 0)                             { ret false; }
+    if (callee_has_asm(callee))                              { ret false; }
+    if ((callee.flags & ir.FN_FLAG_INLINE) != 0)             { ret true; }
     if (callee_instr_count(callee) < INLINE_INSTR_THRESHOLD) { ret true; }
-    if (counts[callee_ix] == 1) { ret true; }
+    if (counts[callee_ix] == 1)                              { ret true; }
     ret false;
 }
 
-# true when the callee contains any OP_ASM instruction in its pool. clone copies
-# the whole instruction pool, so any OP_ASM — whether live in a block or
-# orphaned by a prior pass — would be carried over without its Function.asm
+# true when the callee contains any OP_ASM instruction in its pool
+#
+# clone copies the whole instruction pool, so any OP_ASM -- live in a block or
+# orphaned by a prior pass -- would be carried over without its Function.asm
 # payload; refusing to inline such a callee preserves the asm intact.
+# ---
+# callee: the callee function
+# ret:    true when an OP_ASM instruction is present
 fun callee_has_asm(callee: *ir.Function) bool {
     var i: u32 = 0;
     for (i < callee.instr_len) {
-        val inst: *instr.Instruction = ?callee.instrs[i];
-        if (inst.kind == instr.OP_ASM) { ret true; }
+        val inst: *instruction.Instruction = ?callee.instrs[i];
+        if (inst.kind == instruction.OP_ASM) { ret true; }
         i = i + 1;
     }
     ret false;
 }
 
-# counts the instructions that actually live in the callee's blocks (pool
-# entries orphaned by earlier passes are not counted).
+# count the instructions that live in the callee's blocks
+#
+# Pool entries orphaned by earlier passes are not counted.
+# ---
+# callee: the callee function
+# ret:    total live phi, body, and terminator instructions
 fun callee_instr_count(callee: *ir.Function) u32 {
     var total: u32 = 0;
-    var b: u32 = 0;
-    for (b < callee.block_count) {
-        val blk: *ir.Block = ?callee.blocks[b];
+    var i: u32 = 0;
+    for (i < callee.block_count) {
+        val blk: *ir.Block = ?callee.blocks[i];
         total = total + blk.phi_count + blk.instr_count;
         if (blk.terminator != id.INSTR_NIL) { total = total + 1; }
-        b = b + 1;
+        i = i + 1;
     }
     ret total;
 }
 
-# fills `counts[callee] = number of live direct (VAL_FN) call sites of that
-# function across the module`, in one pass. Only calls still listed in a block's
-# instruction stream count — calls orphaned by a prior inline (left in the pool
-# but unlinked) are ignored, mirroring the block-list-as-liveness convention.
+# fill counts[callee] with the number of live direct call sites of that function
+# across the module, in one pass
+#
+# Only calls still listed in a block's instruction stream count -- calls orphaned
+# by a prior inline (left in the pool but unlinked) are ignored, mirroring the
+# block-list-as-liveness convention.
+# ---
+# m:      module to scan
+# counts: per-callee call-count table to fill, length function_len
 fun build_call_counts(m: *ir.Module, counts: *u32) {
     var i: u32 = 0;
-    for (i < m.function_len) { counts[i] = 0; i = i + 1; }
-    var fi: u32 = 0;
-    for (fi < m.function_len) {
-        add_fn_call_counts(m, ?m.functions[fi], counts);
-        fi = fi + 1;
+    for (i < m.function_len) {
+        counts[i] = 0;
+        i = i + 1;
+    }
+    i = 0;
+    for (i < m.function_len) {
+        add_fn_call_counts(m, ?m.functions[i], counts);
+        i = i + 1;
     }
 }
 
-# adds every live direct call site in `fn` to the per-callee `counts` table.
-# used both to seed the table and, after an inline clones a callee body into a
+# add every live direct call site in `fn` to the per-callee counts table
+#
+# Used both to seed the table and, after an inline clones a callee body into a
 # caller, to fold the freshly cloned calls into the live counts.
+# ---
+# m:      module the function belongs to
+# fn:     function whose call sites to count
+# counts: per-callee call-count table to add into
 fun add_fn_call_counts(m: *ir.Module, fn: *ir.Function, counts: *u32) {
-    var b: u32 = 0;
-    for (b < fn.block_count) {
-        val blk: *ir.Block = ?fn.blocks[b];
+    var i: u32 = 0;
+    for (i < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[i];
         var ii: u32 = 0;
         for (ii < blk.instr_count) {
-            val opt: Option[*instr.Instruction] = ir.get_instruction(fn, blk.instructions[ii]);
-            if (is_some[*instr.Instruction](opt)) {
-                val inst: *instr.Instruction = unwrap[*instr.Instruction](opt);
-                if (inst.kind == instr.OP_CALL && inst.operand_count >= 1) {
-                    val c: u32 = callee_index(inst);
-                    if (c != 0xFFFFFFFF && c < m.function_len) { counts[c] = counts[c] + 1; }
+            val opt_inst: O.Option[*instruction.Instruction] = ir.instruction_get(fn, blk.instructions[ii]);
+            if (O.is_some[*instruction.Instruction](opt_inst)) {
+                val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_inst);
+                if (inst.kind == instruction.OP_CALL && inst.operand_count >= 1) {
+                    val callee_ix: u32 = callee_index(inst);
+                    if (callee_ix != 0xFFFFFFFF && callee_ix < m.function_len) {
+                        counts[callee_ix] = counts[callee_ix] + 1;
+                    }
                 }
             }
             ii = ii + 1;
         }
-        b = b + 1;
+        i = i + 1;
     }
 }
 
-# marks every function that lies on a recursion cycle (it can transitively reach
-# itself through direct calls). `recursive` is caller-owned of length
-# function_len. Allocates the BFS scratch once and reuses it across the
-# per-function reachability walks.
-fun mark_recursive(m: *ir.Module, recursive: *bool) Result[bool, str] {
+# mark every function that lies on a recursion cycle
+#
+# A function is on a cycle when it can transitively reach itself through direct
+# calls. The BFS scratch is allocated once and reused across the per-function
+# reachability walks.
+# ---
+# m:         module to analyze
+# recursive: per-function flags to fill, caller-owned, length function_len
+# ret:       ok(true) on success, or the first allocation error
+fun mark_recursive(m: *ir.Module, recursive: *bool) R.Result[bool, str] {
     val n: u32 = m.function_len;
-    val rv: Result[*bool, str] = allocate[bool](m.alloc, n::usize);
-    if (is_err[*bool, str](rv)) { ret err[bool, str](unwrap_err[*bool, str](rv)); }
-    val visited: *bool = unwrap_ok[*bool, str](rv);
-    val rq: Result[*u32, str] = allocate[u32](m.alloc, n::usize);
-    if (is_err[*u32, str](rq)) {
-        deallocate[bool](m.alloc, visited, n::usize);
-        ret err[bool, str](unwrap_err[*u32, str](rq));
+    val res_visited: R.Result[*bool, str] = A.allocate[bool](m.alloc, n::usize);
+    if (R.is_err[*bool, str](res_visited)) {
+        ret R.err[bool, str](R.unwrap_err[*bool, str](res_visited));
     }
-    val queue: *u32 = unwrap_ok[*u32, str](rq);
+    val visited: *bool = R.unwrap_ok[*bool, str](res_visited);
+    val res_queue: R.Result[*u32, str] = A.allocate[u32](m.alloc, n::usize);
+    if (R.is_err[*u32, str](res_queue)) {
+        A.deallocate[bool](m.alloc, visited, n::usize);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](res_queue));
+    }
+    val queue: *u32 = R.unwrap_ok[*u32, str](res_queue);
 
-    var f: u32 = 0;
-    for (f < n) {
-        recursive[f] = reaches_self(m, f, visited, queue, n);
-        f = f + 1;
+    var i: u32 = 0;
+    for (i < n) {
+        recursive[i] = reaches_self(m, i, visited, queue, n);
+        i = i + 1;
     }
 
-    deallocate[bool](m.alloc, visited, n::usize);
-    deallocate[u32](m.alloc, queue, n::usize);
-    ret ok[bool, str](true);
+    A.deallocate[bool](m.alloc, visited, n::usize);
+    A.deallocate[u32](m.alloc, queue, n::usize);
+    ret R.ok[bool, str](true);
 }
 
-# true when function `start` can transitively reach itself through direct
-# (VAL_FN) calls — i.e. it is part of a recursion cycle. BFS over the call graph
-# from start's callees; reaching `start` again closes a cycle. `visited`/`queue`
-# are caller-owned scratch of length n, reset on entry. Each function is enqueued
-# at most once, so the queue never overflows n.
+# true when function `start` can transitively reach itself through direct calls
+#
+# BFS over the call graph from start's callees; reaching `start` again closes a
+# cycle. `visited` and `queue` are caller-owned scratch of length n, reset on
+# entry. Each function is enqueued at most once, so the queue never overflows n.
+# ---
+# m:       module to walk
+# start:   function index to test for self-reachability
+# visited: per-function visited scratch, length n
+# queue:   BFS frontier scratch, length n
+# n:       function count
+# ret:     true when `start` lies on a recursion cycle
 fun reaches_self(m: *ir.Module, start: u32, visited: *bool, queue: *u32, n: u32) bool {
     var i: u32 = 0;
-    for (i < n) { visited[i] = false; i = i + 1; }
+    for (i < n) {
+        visited[i] = false;
+        i = i + 1;
+    }
 
     var qt: u32 = 0;
     if (scan_callees(m, start, start, visited, queue, ?qt)) { ret true; }
     var qh: u32 = 0;
     for (qh < qt) {
-        val g: u32 = queue[qh];
+        val fn_ix: u32 = queue[qh];
         qh = qh + 1;
-        if (scan_callees(m, g, start, visited, queue, ?qt)) { ret true; }
+        if (scan_callees(m, fn_ix, start, visited, queue, ?qt)) { ret true; }
     }
     ret false;
 }
 
-# scans function `fn_ix`'s live call sites; for each direct callee c, returns
-# true when c == target (the cycle is closed) and otherwise enqueues c the first
-# time it is seen. Considers only calls live in a block's instruction stream —
-# pool entries orphaned by a prior inline are not edges.
-fun scan_callees(m: *ir.Module, fn_ix: u32, target: u32, visited: *bool, queue: *u32, qt: *u32) bool {
+# scan one function's live call sites, closing a cycle or extending the frontier
+#
+# For each direct callee, returns true when it equals `target_ix` (the cycle is
+# closed) and otherwise enqueues it the first time it is seen. Considers only
+# calls live in a block's instruction stream -- pool entries orphaned by a prior
+# inline are not edges.
+# ---
+# m:         module to walk
+# fn_ix:     function whose call sites to scan
+# target_ix: cycle target; reaching it closes the cycle
+# visited:   per-function visited scratch, length function_len
+# queue:     BFS frontier scratch, length function_len
+# qt:        frontier tail index, advanced as functions are enqueued
+# ret:       true when `target_ix` is among `fn_ix`'s direct callees
+fun scan_callees(m: *ir.Module, fn_ix: u32, target_ix: u32, visited: *bool, queue: *u32, qt: *u32) bool {
     val fn: *ir.Function = ?m.functions[fn_ix];
-    var b: u32 = 0;
-    for (b < fn.block_count) {
-        val blk: *ir.Block = ?fn.blocks[b];
+    var i: u32 = 0;
+    for (i < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[i];
         var ii: u32 = 0;
         for (ii < blk.instr_count) {
-            val opt: Option[*instr.Instruction] = ir.get_instruction(fn, blk.instructions[ii]);
-            if (is_some[*instr.Instruction](opt)) {
-                val inst: *instr.Instruction = unwrap[*instr.Instruction](opt);
-                if (inst.kind == instr.OP_CALL && inst.operand_count >= 1) {
-                    val c: u32 = callee_index(inst);
-                    if (c != 0xFFFFFFFF && c < m.function_len) {
-                        if (c == target) { ret true; }
-                        if (visited[c] == false) {
-                            visited[c] = true;
-                            queue[@qt] = c;
+            val opt_inst: O.Option[*instruction.Instruction] = ir.instruction_get(fn, blk.instructions[ii]);
+            if (O.is_some[*instruction.Instruction](opt_inst)) {
+                val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_inst);
+                if (inst.kind == instruction.OP_CALL && inst.operand_count >= 1) {
+                    val callee_ix: u32 = callee_index(inst);
+                    if (callee_ix != 0xFFFFFFFF && callee_ix < m.function_len) {
+                        if (callee_ix == target_ix) { ret true; }
+                        if (visited[callee_ix] == false) {
+                            visited[callee_ix] = true;
+                            queue[@qt] = callee_ix;
                             @qt = @qt + 1;
                         }
                     }
@@ -324,24 +378,26 @@ fun scan_callees(m: *ir.Module, fn_ix: u32, target: u32, visited: *bool, queue: 
             }
             ii = ii + 1;
         }
-        b = b + 1;
+        i = i + 1;
     }
     ret false;
 }
 
-# clone bookkeeping for one inline: maps from callee block/instruction ids to
-# the freshly allocated caller-side ids, plus the call's actual arguments.
+# clone bookkeeping for one inline
+#
+# Maps from callee block and instruction ids to the freshly allocated caller-side
+# ids, plus the call's actual arguments.
 # ---
-# m:          module under mutation
-# caller:     function receiving the clone
-# callee:     function being cloned
-# block_map:  callee BlockId -> caller BlockId
-# instr_map:  callee InstructionId -> caller InstructionId
-# args:       the call's actual argument Values (one per callee parameter)
-# arg_count:  number of arguments
-# entry_blk:  caller BlockId of the cloned callee entry block
-# cont_blk:   caller BlockId of the continuation block
-# ret_ty:     callee return IR type (void type id if the callee returns nothing)
+# m:         module under mutation
+# caller:    function receiving the clone
+# callee:    function being cloned
+# block_map: callee BlockId -> caller BlockId
+# instr_map: callee InstructionId -> caller InstructionId
+# args:      the call's actual argument Values (one per callee parameter)
+# arg_count: number of arguments
+# entry_blk: caller BlockId of the cloned callee entry block
+# cont_blk:  caller BlockId of the continuation block
+# ret_type:  callee return IR type (void type id when the callee returns nothing)
 rec InlineCtx {
     m:         *ir.Module;
     caller:    *ir.Function;
@@ -352,13 +408,25 @@ rec InlineCtx {
     arg_count: u32;
     entry_blk: id.BlockId;
     cont_blk:  id.BlockId;
-    ret_ty:    ir_type.IrTypeId;
+    ret_type:  type.IrTypeId;
 }
 
-# performs one inline: split the call block, clone the callee, wire returns into
-# a continuation phi, and replace the call result. On success it keeps `counts`
-# in step with the mutation: the inlined call is gone (one fewer live call to
-# `callee_ix`) and the cloned callee body adds its own live calls to the caller.
+# perform one inline at the located call site
+#
+# Splits the call block, clones the callee, wires returns into a continuation
+# phi, and replaces the call result. On success it keeps `counts` in step with
+# the mutation: the inlined call is gone (one fewer live call to `callee_ix`) and
+# the cloned callee body adds its own live calls to the caller.
+# ---
+# m:         module under mutation
+# counts:    live per-callee direct-call counts, length function_len
+# caller:    function containing the call site
+# call_bi:   block index of the call within the caller
+# call_ii:   instruction index of the call within its block
+# call_id:   InstructionId of the call
+# callee_ix: function index of the callee
+# callee:    the callee function being cloned
+# ret:       ok(true) on success, or the first allocation error
 fun do_inline(
     m: *ir.Module,
     counts: *u32,
@@ -368,23 +436,28 @@ fun do_inline(
     call_id: id.InstructionId,
     callee_ix: u32,
     callee: *ir.Function
-) Result[bool, str] {
-    val call_opt: Option[*instr.Instruction] = ir.get_instruction(caller, call_id);
-    if (is_none[*instr.Instruction](call_opt)) {
-        ret err[bool, str]("inline: call id out of range");
+) R.Result[bool, str] {
+    val opt_call: O.Option[*instruction.Instruction] = ir.instruction_get(caller, call_id);
+    if (O.is_none[*instruction.Instruction](opt_call)) {
+        ret R.err[bool, str]("inline: call id out of range");
     }
-    val call: *instr.Instruction = unwrap[*instr.Instruction](call_opt);
-    val ret_ty: ir_type.IrTypeId = call.ty;
+    val call: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_call);
+    val ret_type: type.IrTypeId = call.ty;
 
     # snapshot the actual arguments (operands [1..]) before any mutation.
     val arg_count: u32 = call.operand_count - 1;
     var args: *value.Value = nil;
     if (arg_count > 0) {
-        val ra: Result[*value.Value, str] = allocate[value.Value](m.alloc, arg_count::usize);
-        if (is_err[*value.Value, str](ra)) { ret err[bool, str](unwrap_err[*value.Value, str](ra)); }
-        args = unwrap_ok[*value.Value, str](ra);
-        var k: u32 = 0;
-        for (k < arg_count) { args[k] = call.operands[k + 1]; k = k + 1; }
+        val res_args: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, arg_count::usize);
+        if (R.is_err[*value.Value, str](res_args)) {
+            ret R.err[bool, str](R.unwrap_err[*value.Value, str](res_args));
+        }
+        args = R.unwrap_ok[*value.Value, str](res_args);
+        var i: u32 = 0;
+        for (i < arg_count) {
+            args[i] = call.operands[i + 1];
+            i = i + 1;
+        }
     }
 
     var cx: InlineCtx;
@@ -397,96 +470,122 @@ fun do_inline(
     cx.arg_count = arg_count;
     cx.entry_blk = id.BLOCK_NIL;
     cx.cont_blk  = id.BLOCK_NIL;
-    cx.ret_ty    = ret_ty;
+    cx.ret_type  = ret_type;
 
-    val r: Result[bool, str] = run_inline(?cx, call_bi, call_ii, call_id);
+    val res_run: R.Result[bool, str] = run_inline(?cx, call_bi, call_ii, call_id);
 
-    if (cx.block_map != nil) { deallocate[u32](m.alloc, cx.block_map, callee.block_count::usize); }
-    if (cx.instr_map != nil) { deallocate[u32](m.alloc, cx.instr_map, callee.instr_len::usize); }
-    if (args != nil) { deallocate[value.Value](m.alloc, args, arg_count::usize); }
+    if (cx.block_map != nil) {
+        A.deallocate[u32](m.alloc, cx.block_map, callee.block_count::usize);
+    }
+    if (cx.instr_map != nil) {
+        A.deallocate[u32](m.alloc, cx.instr_map, callee.instr_len::usize);
+    }
+    if (args != nil) {
+        A.deallocate[value.Value](m.alloc, args, arg_count::usize);
+    }
 
     # maintain the live call-count table: the inlined call no longer exists (it
     # was a live call to callee_ix, so the count is at least 1), and the cloned
     # callee body's own live calls now live in the caller.
-    if (!is_err[bool, str](r)) {
+    if (!R.is_err[bool, str](res_run)) {
         counts[callee_ix] = counts[callee_ix] - 1;
         add_fn_call_counts(m, callee, counts);
     }
-    ret r;
+    ret res_run;
 }
 
-# the inline body proper, operating on the prepared context. split out so
-# do_inline can own allocation/cleanup of the maps and argument snapshot.
-fun run_inline(cx: *InlineCtx, call_bi: u32, call_ii: u32, call_id: id.InstructionId) Result[bool, str] {
+# the inline body proper, operating on the prepared context
+#
+# Split out so do_inline can own allocation and cleanup of the maps and argument
+# snapshot regardless of where the body fails.
+# ---
+# cx:      prepared inline context (maps allocated here, freed by do_inline)
+# call_bi: block index of the call within the caller
+# call_ii: instruction index of the call within its block
+# call_id: InstructionId of the call
+# ret:     ok(true) on success, or the first allocation error
+fun run_inline(cx: *InlineCtx, call_bi: u32, call_ii: u32, call_id: id.InstructionId) R.Result[bool, str] {
     val m: *ir.Module = cx.m;
     val caller: *ir.Function = cx.caller;
     val callee: *ir.Function = cx.callee;
 
     # allocate the clone maps.
     if (callee.block_count > 0) {
-        val rb: Result[*u32, str] = allocate[u32](m.alloc, callee.block_count::usize);
-        if (is_err[*u32, str](rb)) { ret err[bool, str](unwrap_err[*u32, str](rb)); }
-        cx.block_map = unwrap_ok[*u32, str](rb);
+        val res_block_map: R.Result[*u32, str] = A.allocate[u32](m.alloc, callee.block_count::usize);
+        if (R.is_err[*u32, str](res_block_map)) {
+            ret R.err[bool, str](R.unwrap_err[*u32, str](res_block_map));
+        }
+        cx.block_map = R.unwrap_ok[*u32, str](res_block_map);
     }
     if (callee.instr_len > 0) {
-        val ri: Result[*u32, str] = allocate[u32](m.alloc, callee.instr_len::usize);
-        if (is_err[*u32, str](ri)) { ret err[bool, str](unwrap_err[*u32, str](ri)); }
-        cx.instr_map = unwrap_ok[*u32, str](ri);
+        val res_instr_map: R.Result[*u32, str] = A.allocate[u32](m.alloc, callee.instr_len::usize);
+        if (R.is_err[*u32, str](res_instr_map)) {
+            ret R.err[bool, str](R.unwrap_err[*u32, str](res_instr_map));
+        }
+        cx.instr_map = R.unwrap_ok[*u32, str](res_instr_map);
     }
 
-    # 1. create one fresh caller block per callee block.
-    var cb: u32 = 0;
-    for (cb < callee.block_count) {
-        val rnb: Result[id.BlockId, str] = ir.add_block(m, caller);
-        if (is_err[id.BlockId, str](rnb)) { ret err[bool, str](unwrap_err[id.BlockId, str](rnb)); }
-        cx.block_map[cb] = unwrap_ok[id.BlockId, str](rnb)::u32;
-        cb = cb + 1;
+    # create one fresh caller block per callee block.
+    var i: u32 = 0;
+    for (i < callee.block_count) {
+        val res_block: R.Result[id.BlockId, str] = ir.block_add(m, caller);
+        if (R.is_err[id.BlockId, str](res_block)) {
+            ret R.err[bool, str](R.unwrap_err[id.BlockId, str](res_block));
+        }
+        cx.block_map[i] = R.unwrap_ok[id.BlockId, str](res_block)::u32;
+        i = i + 1;
     }
     cx.entry_blk = cx.block_map[0]::id.BlockId;
 
-    # 2. create the continuation block; everything after the call moves here.
-    val rcont: Result[id.BlockId, str] = ir.add_block(m, caller);
-    if (is_err[id.BlockId, str](rcont)) { ret err[bool, str](unwrap_err[id.BlockId, str](rcont)); }
-    cx.cont_blk = unwrap_ok[id.BlockId, str](rcont);
+    # create the continuation block; everything after the call moves here.
+    val res_cont: R.Result[id.BlockId, str] = ir.block_add(m, caller);
+    if (R.is_err[id.BlockId, str](res_cont)) {
+        ret R.err[bool, str](R.unwrap_err[id.BlockId, str](res_cont));
+    }
+    cx.cont_blk = R.unwrap_ok[id.BlockId, str](res_cont);
 
-    # 3. clone every callee instruction (phis, bodies, terminators) into the
-    #    caller pool, recording the id mapping. operands are remapped in a
-    #    second pass once all ids exist.
-    val rcl: Result[bool, str] = clone_instructions(cx);
-    if (is_err[bool, str](rcl)) { ret rcl; }
+    # clone every callee instruction into the caller pool, recording the id
+    # mapping. operands are remapped in a later pass once all ids exist.
+    val res_clone: R.Result[bool, str] = clone_instructions(cx);
+    if (R.is_err[bool, str](res_clone)) { ret res_clone; }
 
-    # 4. populate cloned blocks' instruction/phi/terminator/pred lists.
-    val rpb: Result[bool, str] = populate_blocks(cx);
-    if (is_err[bool, str](rpb)) { ret rpb; }
+    # populate cloned blocks' instruction / phi / terminator lists.
+    val res_populate: R.Result[bool, str] = populate_blocks(cx);
+    if (R.is_err[bool, str](res_populate)) { ret res_populate; }
 
-    # 5. remap operands of every cloned instruction (params -> args, callee
-    #    instr ids -> clone ids, callee block ids -> clone block ids).
+    # remap operands of every cloned instruction (params -> args, callee instr
+    # ids -> clone ids, callee block ids -> clone block ids).
     remap_clone_operands(cx);
 
-    # 6. split the call's block: move post-call instructions + terminator into
-    #    the continuation, point the call block at the clone entry.
-    val rsp: Result[bool, str] = split_call_block(cx, call_bi, call_ii);
-    if (is_err[bool, str](rsp)) { ret rsp; }
+    # split the call's block: move post-call instructions and terminator into the
+    # continuation, point the call block at the clone entry.
+    val res_split: R.Result[bool, str] = split_call_block(cx, call_bi, call_ii);
+    if (R.is_err[bool, str](res_split)) { ret res_split; }
 
-    # 7. turn cloned returns into branches to the continuation and build the
-    #    result phi; replace the call's result everywhere with it.
-    val rfin: Result[bool, str] = finish_returns(cx, call_id);
-    if (is_err[bool, str](rfin)) { ret rfin; }
+    # turn cloned returns into branches to the continuation and build the result
+    # phi; replace the call's result everywhere with it.
+    val res_returns: R.Result[bool, str] = finish_returns(cx, call_id);
+    if (R.is_err[bool, str](res_returns)) { ret res_returns; }
 
-    # 8. control flow is fully rewired; restore predecessor consistency for the
-    #    whole caller from the terminator edges.
-    ret ir.rebuild_preds(m, caller);
+    # control flow is fully rewired; restore predecessor consistency for the
+    # whole caller from the terminator edges.
+    ret ir.preds_rebuild(m, caller);
 }
 
-# clones each callee instruction into the caller pool, leaving operands as raw
-# copies (remapped later). records callee-id -> caller-id in instr_map.
-fun clone_instructions(cx: *InlineCtx) Result[bool, str] {
+# clone each callee instruction into the caller pool
+#
+# Operands are left as raw copies (remapped later by remap_clone_operands). The
+# callee-id -> caller-id mapping is recorded in cx.instr_map.
+# ---
+# cx:  inline context (instr_map filled here)
+# ret: ok(true) on success, or the first allocation error
+fun clone_instructions(cx: *InlineCtx) R.Result[bool, str] {
     val m: *ir.Module = cx.m;
     val callee: *ir.Function = cx.callee;
     var i: u32 = 0;
     for (i < callee.instr_len) {
-        val src: *instr.Instruction = ?callee.instrs[i];
-        var clone: instr.Instruction;
+        val src: *instruction.Instruction = ?callee.instrs[i];
+        var clone: instruction.Instruction;
         clone.kind          = src.kind;
         clone.ty            = src.ty;
         clone.operand_count = src.operand_count;
@@ -494,277 +593,336 @@ fun clone_instructions(cx: *InlineCtx) Result[bool, str] {
         clone.aux_ty        = src.aux_ty;        # preserve GEP source pointee type
         clone.operands      = nil;
         if (src.operand_count > 0) {
-            val ro: Result[*value.Value, str] = allocate[value.Value](m.alloc, src.operand_count::usize);
-            if (is_err[*value.Value, str](ro)) { ret err[bool, str](unwrap_err[*value.Value, str](ro)); }
-            val ops: *value.Value = unwrap_ok[*value.Value, str](ro);
-            var o: u32 = 0;
-            for (o < src.operand_count) { ops[o] = src.operands[o]; o = o + 1; }
+            val res_ops: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, src.operand_count::usize);
+            if (R.is_err[*value.Value, str](res_ops)) {
+                ret R.err[bool, str](R.unwrap_err[*value.Value, str](res_ops));
+            }
+            val ops: *value.Value = R.unwrap_ok[*value.Value, str](res_ops);
+            var ii: u32 = 0;
+            for (ii < src.operand_count) {
+                ops[ii] = src.operands[ii];
+                ii = ii + 1;
+            }
             clone.operands = ops;
         }
-        val rid: Result[id.InstructionId, str] = ir.add_instruction(m, cx.caller, clone);
-        if (is_err[id.InstructionId, str](rid)) {
-            if (clone.operands != nil) { deallocate[value.Value](m.alloc, clone.operands, src.operand_count::usize); }
-            ret err[bool, str](unwrap_err[id.InstructionId, str](rid));
+        val res_id: R.Result[id.InstructionId, str] = ir.instruction_add(m, cx.caller, clone);
+        if (R.is_err[id.InstructionId, str](res_id)) {
+            if (clone.operands != nil) {
+                A.deallocate[value.Value](m.alloc, clone.operands, src.operand_count::usize);
+            }
+            ret R.err[bool, str](R.unwrap_err[id.InstructionId, str](res_id));
         }
-        cx.instr_map[i] = unwrap_ok[id.InstructionId, str](rid)::u32;
+        cx.instr_map[i] = R.unwrap_ok[id.InstructionId, str](res_id)::u32;
         i = i + 1;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# fills each cloned caller block's phi/instruction/terminator/pred lists by
-# mapping the corresponding callee block's lists through instr_map and
-# block_map.
-fun populate_blocks(cx: *InlineCtx) Result[bool, str] {
+# fill each cloned caller block's phi / instruction / terminator lists
+#
+# Maps the corresponding callee block's lists through instr_map and block_map.
+# Predecessor lists are rebuilt wholesale in run_inline once all control flow is
+# wired.
+# ---
+# cx:  inline context (block_map and instr_map populated)
+# ret: ok(true) on success, or the first allocation error
+fun populate_blocks(cx: *InlineCtx) R.Result[bool, str] {
     val m: *ir.Module = cx.m;
     val callee: *ir.Function = cx.callee;
-    var cb: u32 = 0;
-    for (cb < callee.block_count) {
-        val src: *ir.Block = ?callee.blocks[cb];
-        val dst_id: id.BlockId = cx.block_map[cb]::id.BlockId;
+    var i: u32 = 0;
+    for (i < callee.block_count) {
+        val src: *ir.Block = ?callee.blocks[i];
+        val dst_id: id.BlockId = cx.block_map[i]::id.BlockId;
         val dst: *ir.Block = ?cx.caller.blocks[dst_id::u32];
 
-        var p: u32 = 0;
-        for (p < src.phi_count) {
-            val new_iid: id.InstructionId = cx.instr_map[src.phis[p]::u32]::id.InstructionId;
-            val r: Result[bool, str] = ir.block_append_phi(m, dst, new_iid);
-            if (is_err[bool, str](r)) { ret r; }
-            p = p + 1;
-        }
         var ii: u32 = 0;
+        for (ii < src.phi_count) {
+            val new_iid: id.InstructionId = cx.instr_map[src.phis[ii]::u32]::id.InstructionId;
+            val res_phi: R.Result[bool, str] = ir.block_append_phi(m, dst, new_iid);
+            if (R.is_err[bool, str](res_phi)) { ret res_phi; }
+            ii = ii + 1;
+        }
+        ii = 0;
         for (ii < src.instr_count) {
             val new_iid: id.InstructionId = cx.instr_map[src.instructions[ii]::u32]::id.InstructionId;
-            val r: Result[bool, str] = ir.block_append_instr(m, dst, new_iid);
-            if (is_err[bool, str](r)) { ret r; }
+            val res_instr: R.Result[bool, str] = ir.block_append_instr(m, dst, new_iid);
+            if (R.is_err[bool, str](res_instr)) { ret res_instr; }
             ii = ii + 1;
         }
         if (src.terminator != id.INSTR_NIL) {
             val new_term: id.InstructionId = cx.instr_map[src.terminator::u32]::id.InstructionId;
             dst.terminator = new_term;
         }
-        # predecessor lists are rebuilt wholesale from terminator edges once all
-        # control flow is wired (ir.rebuild_preds in run_inline).
-        cb = cb + 1;
+        i = i + 1;
     }
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# rewrites operands of every cloned instruction: VAL_PARAM -> the matching
-# actual argument; VAL_INSTR naming a callee instruction -> its clone id; block
-# targets in BR/CBR and phi block slots -> the cloned block id.
+# rewrite operands of every cloned instruction
+#
+# VAL_PARAM -> the matching actual argument; VAL_INSTR naming a callee
+# instruction -> its clone id; block targets in BR/CBR and phi block slots -> the
+# cloned block id.
+# ---
+# cx: inline context (block_map, instr_map, and args populated)
 fun remap_clone_operands(cx: *InlineCtx) {
     val callee: *ir.Function = cx.callee;
     var i: u32 = 0;
     for (i < callee.instr_len) {
         val clone_id: id.InstructionId = cx.instr_map[i]::id.InstructionId;
-        val opt: Option[*instr.Instruction] = ir.get_instruction(cx.caller, clone_id);
-        if (is_none[*instr.Instruction](opt)) { i = i + 1; cnt; }
-        val clone: *instr.Instruction = unwrap[*instr.Instruction](opt);
-        var o: u32 = 0;
-        for (o < clone.operand_count) {
-            if (operand_is_block(clone.kind, o)) {
+        val opt_clone: O.Option[*instruction.Instruction] = ir.instruction_get(cx.caller, clone_id);
+        if (O.is_none[*instruction.Instruction](opt_clone)) {
+            i = i + 1;
+            cnt;
+        }
+        val clone: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_clone);
+        var ii: u32 = 0;
+        for (ii < clone.operand_count) {
+            if (operand_is_block(clone.kind, ii)) {
                 # block-target operand (int_lit-encoded): callee BlockId -> clone.
-                val ob: u32 = clone.operands[o].data.int_lit::u32;
-                if (ob < callee.block_count) {
-                    clone.operands[o].data.int_lit = cx.block_map[ob]::u64;
+                val callee_bid: u32 = clone.operands[ii].data.int_lit::u32;
+                if (callee_bid < callee.block_count) {
+                    clone.operands[ii].data.int_lit = cx.block_map[callee_bid]::u64;
                 }
             } or {
-                val op: value.Value = clone.operands[o];
+                val op: value.Value = clone.operands[ii];
                 if (op.kind == value.VAL_PARAM) {
-                    val pix: u32 = op.data.param_ix;
-                    if (pix < cx.arg_count) {
-                        clone.operands[o] = cx.args[pix];
+                    val param_ix: u32 = op.data.param_ix;
+                    if (param_ix < cx.arg_count) {
+                        clone.operands[ii] = cx.args[param_ix];
                     }
                 } or (op.kind == value.VAL_INSTR) {
-                    val ci: u32 = op.data.instr::u32;
-                    if (ci < callee.instr_len) {
-                        clone.operands[o].data.instr = cx.instr_map[ci]::id.InstructionId;
+                    val callee_iid: u32 = op.data.instr::u32;
+                    if (callee_iid < callee.instr_len) {
+                        clone.operands[ii].data.instr = cx.instr_map[callee_iid]::id.InstructionId;
                     }
                 }
             }
-            o = o + 1;
+            ii = ii + 1;
         }
         i = i + 1;
     }
 }
 
-# true when operand slot `o` of opcode `k` holds a block target rather than a
-# value: BR slot 0; CBR slots 1 and 2; PHI even slots (block0, block1, …).
-fun operand_is_block(k: instr.InstrKind, o: u32) bool {
-    if (k == instr.OP_BR)  { ret o == 0; }
-    if (k == instr.OP_CBR) { ret o == 1 || o == 2; }
-    if (k == instr.OP_PHI) { ret (o % 2) == 0; }
+# true when operand slot `o` of opcode `k` holds a block target rather than a value
+#
+# BR slot 0; CBR slots 1 and 2; PHI even slots (block0, block1, ...).
+# ---
+# k:   the opcode
+# o:   operand slot index
+# ret: true when the slot is a block target
+fun operand_is_block(k: instruction.InstrKind, o: u32) bool {
+    if (k == instruction.OP_BR)  { ret o == 0; }
+    if (k == instruction.OP_CBR) { ret o == 1 || o == 2; }
+    if (k == instruction.OP_PHI) { ret (o % 2) == 0; }
     ret false;
 }
 
-# splits the call's block at the call site: the call and everything before it
-# stay; the call is dropped; the instructions after it and the original
-# terminator move into the continuation block. The call block then branches to
-# the cloned callee entry.
-fun split_call_block(cx: *InlineCtx, call_bi: u32, call_ii: u32) Result[bool, str] {
+# split the call's block at the call site
+#
+# The call and everything before it stay; the call is dropped; the instructions
+# after it and the original terminator move into the continuation block. The call
+# block then branches to the cloned callee entry.
+# ---
+# cx:      inline context (entry_blk and cont_blk set)
+# call_bi: block index of the call within the caller
+# call_ii: instruction index of the call within its block
+# ret:     ok(true) on success, or the first allocation error
+fun split_call_block(cx: *InlineCtx, call_bi: u32, call_ii: u32) R.Result[bool, str] {
     val m: *ir.Module = cx.m;
     val caller: *ir.Function = cx.caller;
     val blk: *ir.Block = ?caller.blocks[call_bi];
     val cont: *ir.Block = ?caller.blocks[cx.cont_blk::u32];
 
     # move post-call body instructions into the continuation.
-    var ii: u32 = call_ii + 1;
-    for (ii < blk.instr_count) {
-        val mv: id.InstructionId = blk.instructions[ii];
-        val r: Result[bool, str] = ir.block_append_instr(m, cont, mv);
-        if (is_err[bool, str](r)) { ret r; }
-        ii = ii + 1;
+    var i: u32 = call_ii + 1;
+    for (i < blk.instr_count) {
+        val moved: id.InstructionId = blk.instructions[i];
+        val res_move: R.Result[bool, str] = ir.block_append_instr(m, cont, moved);
+        if (R.is_err[bool, str](res_move)) { ret res_move; }
+        i = i + 1;
     }
     # the original terminator becomes the continuation's terminator.
     cont.terminator = blk.terminator;
 
     # the continuation inherits the call block's outgoing edges, so every
-    # successor of the moved terminator now reaches that edge from `cont`, not
-    # the call block. any phi in a successor that names the call block as its
-    # incoming predecessor must be re-keyed to the continuation before preds are
-    # rebuilt, or the phi would name a block that no longer branches to it.
+    # successor of the moved terminator now reaches that edge from `cont`, not the
+    # call block. any phi in a successor that names the call block as its incoming
+    # predecessor must be re-keyed to the continuation before preds are rebuilt,
+    # or the phi would name a block that no longer branches to it.
     rekey_successor_phis(caller, cont, call_bi::id.BlockId, cx.cont_blk);
 
     # truncate the call block to the instructions strictly before the call.
     blk.instr_count = call_ii;
 
     # the call block now branches unconditionally to the cloned callee entry.
-    val rbr: Result[id.InstructionId, str] = emit_br(cx, cx.entry_blk);
-    if (is_err[id.InstructionId, str](rbr)) { ret err[bool, str](unwrap_err[id.InstructionId, str](rbr)); }
-    blk.terminator = unwrap_ok[id.InstructionId, str](rbr);
+    val res_br: R.Result[id.InstructionId, str] = emit_br(cx, cx.entry_blk);
+    if (R.is_err[id.InstructionId, str](res_br)) {
+        ret R.err[bool, str](R.unwrap_err[id.InstructionId, str](res_br));
+    }
+    blk.terminator = R.unwrap_ok[id.InstructionId, str](res_br);
 
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# re-keys phi incomings in the successors of `cont`'s terminator from the old
-# call-block id to the continuation id. After the call block is split, control to
-# each successor flows through `cont`, so a phi incoming keyed on the call block
-# now names a non-predecessor; rewriting it to `cont` keeps the phi consistent
-# with the rebuilt predecessor list.
+# re-key phi incomings in the successors of `cont`'s terminator
+#
+# After the call block is split, control to each successor flows through `cont`,
+# so a phi incoming keyed on the old call-block id now names a non-predecessor;
+# rewriting it to the continuation id keeps the phi consistent with the rebuilt
+# predecessor list.
+# ---
+# caller:  function being rewired
+# cont:    continuation block that inherited the outgoing edges
+# old_blk: the original call-block id
+# new_blk: the continuation block id
 fun rekey_successor_phis(caller: *ir.Function, cont: *ir.Block, old_blk: id.BlockId, new_blk: id.BlockId) {
     var s0: id.BlockId = id.BLOCK_NIL;
     var s1: id.BlockId = id.BLOCK_NIL;
     val sn: u32 = ir.block_successors(caller, cont, ?s0, ?s1);
-    if (sn >= 1) { rekey_block_phis(caller, s0, old_blk, new_blk); }
+    if (sn >= 1)             { rekey_block_phis(caller, s0, old_blk, new_blk); }
     if (sn >= 2 && s1 != s0) { rekey_block_phis(caller, s1, old_blk, new_blk); }
 }
 
-# rewrites every phi-incoming block slot in block `bid` that names `old_blk` to
-# name `new_blk`. Phi operands are [block0, val0, block1, val1, …] with block ids
-# riding in the block-target const_int encoding (even slots).
+# rewrite every phi-incoming block slot in block `bid` that names `old_blk`
+#
+# Phi operands are [block0, val0, block1, val1, ...] with block ids riding in the
+# block-target const_int encoding (even slots).
+# ---
+# caller:  function owning the block
+# bid:     block whose phis to rewrite
+# old_blk: incoming block id to replace
+# new_blk: replacement incoming block id
 fun rekey_block_phis(caller: *ir.Function, bid: id.BlockId, old_blk: id.BlockId, new_blk: id.BlockId) {
     if (bid::u32 >= caller.block_count) { ret; }
     val blk: *ir.Block = ?caller.blocks[bid::u32];
-    var pi: u32 = 0;
-    for (pi < blk.phi_count) {
-        val opt: Option[*instr.Instruction] = ir.get_instruction(caller, blk.phis[pi]);
-        if (is_some[*instr.Instruction](opt)) {
-            val phi: *instr.Instruction = unwrap[*instr.Instruction](opt);
-            if (phi.kind == instr.OP_PHI) {
-                var o: u32 = 0;
-                for (o + 1 < phi.operand_count) {
-                    if (ir.block_target(phi.operands[o]) == old_blk) {
-                        phi.operands[o].data.int_lit = new_blk::u64;
+    var i: u32 = 0;
+    for (i < blk.phi_count) {
+        val opt_phi: O.Option[*instruction.Instruction] = ir.instruction_get(caller, blk.phis[i]);
+        if (O.is_some[*instruction.Instruction](opt_phi)) {
+            val phi: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_phi);
+            if (phi.kind == instruction.OP_PHI) {
+                var ii: u32 = 0;
+                for (ii + 1 < phi.operand_count) {
+                    if (ir.block_target(phi.operands[ii]) == old_blk) {
+                        phi.operands[ii].data.int_lit = new_blk::u64;
                     }
-                    o = o + 2;
+                    ii = ii + 2;
                 }
             }
         }
-        pi = pi + 1;
+        i = i + 1;
     }
 }
 
-# emits a fresh OP_BR terminator targeting `target` and returns the new
-# instruction id. Predecessor edges are restored later by the wholesale
-# ir.rebuild_preds.
-fun emit_br(cx: *InlineCtx, target: id.BlockId) Result[id.InstructionId, str] {
+# emit a fresh OP_BR terminator targeting `target_blk`
+#
+# Predecessor edges are restored later by the wholesale ir.preds_rebuild.
+# ---
+# cx:         inline context
+# target_blk: block the branch targets
+# ret:        the new branch InstructionId, or the first allocation error
+fun emit_br(cx: *InlineCtx, target_blk: id.BlockId) R.Result[id.InstructionId, str] {
     val m: *ir.Module = cx.m;
-    val rbt: Result[value.Value, str] = ir.make_block_target(m, target);
-    if (is_err[value.Value, str](rbt)) { ret err[id.InstructionId, str](unwrap_err[value.Value, str](rbt)); }
-    val ro: Result[*value.Value, str] = allocate[value.Value](m.alloc, 1::usize);
-    if (is_err[*value.Value, str](ro)) { ret err[id.InstructionId, str](unwrap_err[*value.Value, str](ro)); }
-    val ops: *value.Value = unwrap_ok[*value.Value, str](ro);
-    ops[0] = unwrap_ok[value.Value, str](rbt);
-    val rvt: Result[ir_type.IrTypeId, str] = void_ty(m);
-    if (is_err[ir_type.IrTypeId, str](rvt)) {
-        deallocate[value.Value](m.alloc, ops, 1::usize);
-        ret err[id.InstructionId, str](unwrap_err[ir_type.IrTypeId, str](rvt));
+    val res_target: R.Result[value.Value, str] = ir.block_target_make(m, target_blk);
+    if (R.is_err[value.Value, str](res_target)) {
+        ret R.err[id.InstructionId, str](R.unwrap_err[value.Value, str](res_target));
     }
-    var br: instr.Instruction;
-    br.kind          = instr.OP_BR;
-    br.ty            = unwrap_ok[ir_type.IrTypeId, str](rvt);
+    val res_ops: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, 1::usize);
+    if (R.is_err[*value.Value, str](res_ops)) {
+        ret R.err[id.InstructionId, str](R.unwrap_err[*value.Value, str](res_ops));
+    }
+    val ops: *value.Value = R.unwrap_ok[*value.Value, str](res_ops);
+    ops[0] = R.unwrap_ok[value.Value, str](res_target);
+    val res_void: R.Result[type.IrTypeId, str] = void_ty(m);
+    if (R.is_err[type.IrTypeId, str](res_void)) {
+        A.deallocate[value.Value](m.alloc, ops, 1::usize);
+        ret R.err[id.InstructionId, str](R.unwrap_err[type.IrTypeId, str](res_void));
+    }
+    var br: instruction.Instruction;
+    br.kind          = instruction.OP_BR;
+    br.ty            = R.unwrap_ok[type.IrTypeId, str](res_void);
     br.operands      = ops;
     br.operand_count = 1;
     br.flags         = 0;
-    br.aux_ty        = ir_type.IRT_NIL;
-    val rid: Result[id.InstructionId, str] = ir.add_instruction(m, cx.caller, br);
-    if (is_err[id.InstructionId, str](rid)) {
-        deallocate[value.Value](m.alloc, ops, 1::usize);
-        ret rid;
+    br.aux_ty        = type.IRT_NIL;
+    val res_id: R.Result[id.InstructionId, str] = ir.instruction_add(m, cx.caller, br);
+    if (R.is_err[id.InstructionId, str](res_id)) {
+        A.deallocate[value.Value](m.alloc, ops, 1::usize);
+        ret res_id;
     }
-    ret rid;
+    ret res_id;
 }
 
-# rewrites every cloned `ret` into a branch to the continuation and wires the
-# call's result. With a single returning predecessor (the common case) the call
-# result is replaced directly by that return value — no phi is built, matching
-# the header; this also avoids a single-aggregate-return phi the verifier would
-# reject (an aggregate flows by address, and a phi is not address-producing). With
-# two or more returning predecessors a result phi over the return values is built
-# in the continuation. A non-returning callee leaves the result unwired (its
+# rewrite every cloned `ret` into a branch to the continuation and wire the result
+#
+# With a single returning predecessor (the common case) the call result is
+# replaced directly by that return value -- no phi is built, matching the header;
+# this also avoids a single-aggregate-return phi the verifier would reject (an
+# aggregate flows by address, and a phi is not address-producing). With two or
+# more returning predecessors a result phi over the return values is built in the
+# continuation. A non-returning callee leaves the result unwired (its
 # continuation is unreachable and the later dce removes it).
-fun finish_returns(cx: *InlineCtx, call_id: id.InstructionId) Result[bool, str] {
+# ---
+# cx:      inline context
+# call_id: InstructionId of the original call whose result is replaced
+# ret:     ok(true) on success, or the first allocation error
+fun finish_returns(cx: *InlineCtx, call_id: id.InstructionId) R.Result[bool, str] {
     val m: *ir.Module = cx.m;
     val caller: *ir.Function = cx.caller;
     val callee: *ir.Function = cx.callee;
-    val rvt: Result[ir_type.IrTypeId, str] = void_ty(m);
-    if (is_err[ir_type.IrTypeId, str](rvt)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](rvt)); }
-    val returns_value: bool = cx.ret_ty != unwrap_ok[ir_type.IrTypeId, str](rvt);
+    val res_void: R.Result[type.IrTypeId, str] = void_ty(m);
+    if (R.is_err[type.IrTypeId, str](res_void)) {
+        ret R.err[bool, str](R.unwrap_err[type.IrTypeId, str](res_void));
+    }
+    val returns_value: bool = cx.ret_type != R.unwrap_ok[type.IrTypeId, str](res_void);
 
-    # count the cloned blocks that return a value, choosing the wiring strategy.
+    # count the value-returning cloned blocks to choose the wiring strategy.
     val value_rets: u32 = count_value_returns(cx, returns_value);
     var phi_id: id.InstructionId = id.INSTR_NIL;
     if (returns_value && value_rets >= 2) {
-        var phi: instr.Instruction;
-        phi.kind          = instr.OP_PHI;
-        phi.ty            = cx.ret_ty;
+        var phi: instruction.Instruction;
+        phi.kind          = instruction.OP_PHI;
+        phi.ty            = cx.ret_type;
         phi.operands      = nil;
         phi.operand_count = 0;
         phi.flags         = 0;
-        phi.aux_ty        = ir_type.IRT_NIL;
-        val rp: Result[id.InstructionId, str] = ir.add_instruction(m, caller, phi);
-        if (is_err[id.InstructionId, str](rp)) { ret err[bool, str](unwrap_err[id.InstructionId, str](rp)); }
-        phi_id = unwrap_ok[id.InstructionId, str](rp);
+        phi.aux_ty        = type.IRT_NIL;
+        val res_phi: R.Result[id.InstructionId, str] = ir.instruction_add(m, caller, phi);
+        if (R.is_err[id.InstructionId, str](res_phi)) {
+            ret R.err[bool, str](R.unwrap_err[id.InstructionId, str](res_phi));
+        }
+        phi_id = R.unwrap_ok[id.InstructionId, str](res_phi);
     }
 
-    # walk the cloned returns, capturing the single value (or filling the phi) and
-    # converting each ret into a branch to the continuation in place.
+    # walk the cloned returns: capture the single value (or fill the phi) and
+    # convert each ret into a branch to the continuation in place.
     var single_val: value.Value;
     var have_single: bool = false;
-    var cb: u32 = 0;
-    for (cb < callee.block_count) {
-        val clone_bid: id.BlockId = cx.block_map[cb]::id.BlockId;
+    var i: u32 = 0;
+    for (i < callee.block_count) {
+        val clone_bid: id.BlockId = cx.block_map[i]::id.BlockId;
         val blk: *ir.Block = ?caller.blocks[clone_bid::u32];
         if (blk.terminator != id.INSTR_NIL) {
-            val topt: Option[*instr.Instruction] = ir.get_instruction(caller, blk.terminator);
-            if (is_some[*instr.Instruction](topt)) {
-                val term: *instr.Instruction = unwrap[*instr.Instruction](topt);
-                if (term.kind == instr.OP_RET) {
+            val opt_term: O.Option[*instruction.Instruction] = ir.instruction_get(caller, blk.terminator);
+            if (O.is_some[*instruction.Instruction](opt_term)) {
+                val term: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_term);
+                if (term.kind == instruction.OP_RET) {
                     if (returns_value && term.operand_count >= 1) {
                         if (value_rets == 1) {
                             single_val  = term.operands[0];
                             have_single = true;
                         } or {
-                            val pa: Result[bool, str] = phi_append(cx, phi_id, clone_bid, term.operands[0]);
-                            if (is_err[bool, str](pa)) { ret pa; }
+                            val res_phi_append: R.Result[bool, str] = phi_append(cx, phi_id, clone_bid, term.operands[0]);
+                            if (R.is_err[bool, str](res_phi_append)) { ret res_phi_append; }
                         }
                     }
-                    val rconv: Result[bool, str] = convert_ret_to_br(cx, term);
-                    if (is_err[bool, str](rconv)) { ret rconv; }
+                    val res_convert: R.Result[bool, str] = convert_ret_to_br(cx, term);
+                    if (R.is_err[bool, str](res_convert)) { ret res_convert; }
                 }
             }
         }
-        cb = cb + 1;
+        i = i + 1;
     }
 
     # wire the call's result to the single return value or the result phi.
@@ -772,134 +930,179 @@ fun finish_returns(cx: *InlineCtx, call_id: id.InstructionId) Result[bool, str] 
         replace_value_uses(caller, call_id, single_val);
     } or (returns_value && value_rets >= 2) {
         val cont: *ir.Block = ?caller.blocks[cx.cont_blk::u32];
-        val ap: Result[bool, str] = ir.block_append_phi(m, cont, phi_id);
-        if (is_err[bool, str](ap)) { ret ap; }
-        val replacement: value.Value = value.instr_value(phi_id, cx.ret_ty);
+        val res_append_phi: R.Result[bool, str] = ir.block_append_phi(m, cont, phi_id);
+        if (R.is_err[bool, str](res_append_phi)) { ret res_append_phi; }
+        val replacement: value.Value = value.instr(phi_id, cx.ret_type);
         replace_value_uses(caller, call_id, replacement);
     }
 
-    # the original call instruction is already unlinked: it sat at call_ii and
+    # the original call is already unlinked: it sat at call_ii, and
     # split_call_block truncated the call block to call_ii, so it is no longer
-    # listed in any block. nothing more to do.
-    ret ok[bool, str](true);
+    # listed in any block.
+    ret R.ok[bool, str](true);
 }
 
-# counts the cloned callee blocks whose terminator is a value-carrying `ret`.
+# count the cloned callee blocks whose terminator is a value-carrying `ret`
+#
 # Zero when the callee returns void or never returns; the result selects the
 # direct-value vs result-phi wiring in finish_returns.
+# ---
+# cx:            inline context (block_map populated)
+# returns_value: whether the callee's return type is non-void
+# ret:           number of value-returning cloned blocks
 fun count_value_returns(cx: *InlineCtx, returns_value: bool) u32 {
     if (returns_value == false) { ret 0; }
     val caller: *ir.Function = cx.caller;
     val callee: *ir.Function = cx.callee;
     var n: u32 = 0;
-    var cb: u32 = 0;
-    for (cb < callee.block_count) {
-        val clone_bid: id.BlockId = cx.block_map[cb]::id.BlockId;
+    var i: u32 = 0;
+    for (i < callee.block_count) {
+        val clone_bid: id.BlockId = cx.block_map[i]::id.BlockId;
         val blk: *ir.Block = ?caller.blocks[clone_bid::u32];
         if (blk.terminator != id.INSTR_NIL) {
-            val topt: Option[*instr.Instruction] = ir.get_instruction(caller, blk.terminator);
-            if (is_some[*instr.Instruction](topt)) {
-                val term: *instr.Instruction = unwrap[*instr.Instruction](topt);
-                if (term.kind == instr.OP_RET && term.operand_count >= 1) { n = n + 1; }
+            val opt_term: O.Option[*instruction.Instruction] = ir.instruction_get(caller, blk.terminator);
+            if (O.is_some[*instruction.Instruction](opt_term)) {
+                val term: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_term);
+                if (term.kind == instruction.OP_RET && term.operand_count >= 1) {
+                    n = n + 1;
+                }
             }
         }
-        cb = cb + 1;
+        i = i + 1;
     }
     ret n;
 }
 
-# converts a cloned OP_RET into an OP_BR to the continuation block. The old
-# operands are released by their true capacity and replaced through the single
-# ir.instr_replace_operands primitive; predecessor edges are restored later by
-# the wholesale ir.rebuild_preds.
-fun convert_ret_to_br(cx: *InlineCtx, term: *instr.Instruction) Result[bool, str] {
+# convert a cloned OP_RET into an OP_BR to the continuation block
+#
+# The old operands are released by their true capacity and replaced through the
+# single ir.instr_replace_operands primitive; predecessor edges are restored
+# later by the wholesale ir.preds_rebuild.
+# ---
+# cx:   inline context (cont_blk set)
+# term: the OP_RET instruction to rewrite in place
+# ret:  ok(true) on success, or the first allocation error
+fun convert_ret_to_br(cx: *InlineCtx, term: *instruction.Instruction) R.Result[bool, str] {
     val m: *ir.Module = cx.m;
-    val rbt: Result[value.Value, str] = ir.make_block_target(m, cx.cont_blk);
-    if (is_err[value.Value, str](rbt)) { ret err[bool, str](unwrap_err[value.Value, str](rbt)); }
-    val rvt: Result[ir_type.IrTypeId, str] = void_ty(m);
-    if (is_err[ir_type.IrTypeId, str](rvt)) { ret err[bool, str](unwrap_err[ir_type.IrTypeId, str](rvt)); }
-    val ro: Result[*value.Value, str] = allocate[value.Value](m.alloc, 1::usize);
-    if (is_err[*value.Value, str](ro)) { ret err[bool, str](unwrap_err[*value.Value, str](ro)); }
-    val ops: *value.Value = unwrap_ok[*value.Value, str](ro);
-    ops[0] = unwrap_ok[value.Value, str](rbt);
-    term.kind = instr.OP_BR;
-    term.ty   = unwrap_ok[ir_type.IrTypeId, str](rvt);
+    val res_target: R.Result[value.Value, str] = ir.block_target_make(m, cx.cont_blk);
+    if (R.is_err[value.Value, str](res_target)) {
+        ret R.err[bool, str](R.unwrap_err[value.Value, str](res_target));
+    }
+    val res_void: R.Result[type.IrTypeId, str] = void_ty(m);
+    if (R.is_err[type.IrTypeId, str](res_void)) {
+        ret R.err[bool, str](R.unwrap_err[type.IrTypeId, str](res_void));
+    }
+    val res_ops: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, 1::usize);
+    if (R.is_err[*value.Value, str](res_ops)) {
+        ret R.err[bool, str](R.unwrap_err[*value.Value, str](res_ops));
+    }
+    val ops: *value.Value = R.unwrap_ok[*value.Value, str](res_ops);
+    ops[0] = R.unwrap_ok[value.Value, str](res_target);
+    term.kind = instruction.OP_BR;
+    term.ty   = R.unwrap_ok[type.IrTypeId, str](res_void);
     ir.instr_replace_operands(m, term, ops, 1);
-    ret ok[bool, str](true);
+    ret R.ok[bool, str](true);
 }
 
-# appends a (predecessor-block, value) pair to a phi's operand list through the
-# single capacity-maintaining ir.phi_append_incoming primitive.
-fun phi_append(cx: *InlineCtx, phi_id: id.InstructionId, pred: id.BlockId, v: value.Value) Result[bool, str] {
-    val opt: Option[*instr.Instruction] = ir.get_instruction(cx.caller, phi_id);
-    if (is_none[*instr.Instruction](opt)) { ret err[bool, str]("inline: phi id out of range"); }
-    ret ir.phi_append_incoming(cx.m, unwrap[*instr.Instruction](opt), pred, v);
+# append a (predecessor-block, value) pair to a phi's operand list
+#
+# Goes through the single capacity-maintaining ir.phi_append_incoming primitive.
+# ---
+# cx:     inline context
+# phi_id: InstructionId of the result phi
+# pred:   predecessor block of the incoming value
+# v:      the incoming Value
+# ret:    ok(true) on success, or the first allocation error
+fun phi_append(cx: *InlineCtx, phi_id: id.InstructionId, pred: id.BlockId, v: value.Value) R.Result[bool, str] {
+    val opt_phi: O.Option[*instruction.Instruction] = ir.instruction_get(cx.caller, phi_id);
+    if (O.is_none[*instruction.Instruction](opt_phi)) {
+        ret R.err[bool, str]("inline: phi id out of range");
+    }
+    ret ir.phi_append_incoming(cx.m, O.unwrap[*instruction.Instruction](opt_phi), pred, v);
 }
 
-# replaces every VAL_INSTR operand naming `old_id` with `replacement` across all
-# of the caller's instructions. block-target operands are left untouched (they
-# never name a value result).
+# replace every VAL_INSTR operand naming `old_id` with `replacement`
+#
+# Walks all of the caller's instructions. Block-target operands are left
+# untouched (they never name a value result).
+# ---
+# caller:      function whose operands to rewrite
+# old_id:      the value-producing instruction id being replaced
+# replacement: the Value to substitute in
 fun replace_value_uses(caller: *ir.Function, old_id: id.InstructionId, replacement: value.Value) {
     var i: u32 = 0;
     for (i < caller.instr_len) {
-        val inst: *instr.Instruction = ?caller.instrs[i];
-        var o: u32 = 0;
-        for (o < inst.operand_count) {
-            if (operand_is_block(inst.kind, o) == false) {
-                val op: value.Value = inst.operands[o];
+        val inst: *instruction.Instruction = ?caller.instrs[i];
+        var ii: u32 = 0;
+        for (ii < inst.operand_count) {
+            if (operand_is_block(inst.kind, ii) == false) {
+                val op: value.Value = inst.operands[ii];
                 if (op.kind == value.VAL_INSTR && op.data.instr == old_id) {
-                    inst.operands[o] = replacement;
+                    inst.operands[ii] = replacement;
                 }
             }
-            o = o + 1;
+            ii = ii + 1;
         }
         i = i + 1;
     }
 }
 
-# the module's interned void IrTypeId — the result type every terminator
-# carries, matching the builder's terminator construction.
-fun void_ty(m: *ir.Module) Result[ir_type.IrTypeId, str] {
-    ret ir_type.intern_void(?m.types);
+# the module's interned void IrTypeId
+#
+# The result type every terminator carries, matching the builder's terminator
+# construction.
+# ---
+# m:   module owning the IR type interner
+# ret: the void IrTypeId, or the first allocation error
+fun void_ty(m: *ir.Module) R.Result[type.IrTypeId, str] {
+    ret type.intern_void(?m.types);
 }
 
-test "inline: mark_recursive flags a direct self-calling function as recursive" {
-    var alloc: Allocator;
+# a function that directly calls itself is flagged as recursive
+test "mach.lang.me.pass.inline.mark_recursive:direct_self_call" {
+    var alloc: A.Allocator;
     page.make(?alloc);
-    val mr: Result[ir.Module, str] = ir.init_module(?alloc, intern.STR_NIL);
-    if (is_err[ir.Module, str](mr)) { ret 1; }
-    var m: ir.Module = unwrap_ok[ir.Module, str](mr);
-    val rvt: Result[ir_type.IrTypeId, str] = ir_type.intern_void(?m.types);
-    if (is_err[ir_type.IrTypeId, str](rvt)) { ret 1; }
-    val voidty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](rvt);
-    val rst: Result[ir_type.IrTypeId, str] = ir_type.intern_fn(?m.types, voidty, nil, 0);
-    if (is_err[ir_type.IrTypeId, str](rst)) { ret 1; }
-    val sigty: ir_type.IrTypeId = unwrap_ok[ir_type.IrTypeId, str](rst);
-    val rfn: Result[u32, str] = ir.add_function(?m, intern.STR_NIL, sigty, 0);
-    if (is_err[u32, str](rfn)) { ret 1; }
+    val res_module: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_module)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_module);
+
+    val res_void: R.Result[type.IrTypeId, str] = type.intern_void(?m.types);
+    if (R.is_err[type.IrTypeId, str](res_void)) { ir.dnit(?m); ret 1; }
+    val voidty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_void);
+    val res_sig: R.Result[type.IrTypeId, str] = type.intern_fn(?m.types, voidty, nil, 0);
+    if (R.is_err[type.IrTypeId, str](res_sig)) { ir.dnit(?m); ret 1; }
+    val sigty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_sig);
+    val res_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, sigty, 0);
+    if (R.is_err[u32, str](res_fn)) { ir.dnit(?m); ret 1; }
 
     var bld: builder.Builder = builder.init(?m);
     builder.set_function(?bld, ?m.functions[0]);
 
-    val rb: Result[id.BlockId, str] = builder.new_block(?bld);
-    if (is_err[id.BlockId, str](rb)) { ret 1; }
-    val b0: id.BlockId = unwrap_ok[id.BlockId, str](rb);
+    val res_block: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_block)) { ir.dnit(?m); ret 1; }
+    val b0: id.BlockId = R.unwrap_ok[id.BlockId, str](res_block);
     builder.set_block(?bld, b0);
 
     # direct self-call: callee is function 0 (itself)
-    val callee: value.Value = value.fn_value(0, sigty);
-    val rc: Result[value.Value, str] = builder.emit_call(?bld, callee, nil, 0, voidty);
-    if (is_err[value.Value, str](rc)) { ret 1; }
-    if (is_err[bool, str](builder.emit_ret_void(?bld))) { ret 1; }
+    val callee: value.Value = value.fn(0, sigty);
+    val res_call: R.Result[value.Value, str] = builder.emit_call(?bld, callee, nil, 0, voidty);
+    if (R.is_err[value.Value, str](res_call))             { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?bld))) { ir.dnit(?m); ret 1; }
 
-    val rr: Result[*bool, str] = allocate[bool](m.alloc, 1::usize);
-    if (is_err[*bool, str](rr)) { ret 1; }
-    val recursive: *bool = unwrap_ok[*bool, str](rr);
+    val res_recursive: R.Result[*bool, str] = A.allocate[bool](m.alloc, 1::usize);
+    if (R.is_err[*bool, str](res_recursive)) { ir.dnit(?m); ret 1; }
+    val recursive: *bool = R.unwrap_ok[*bool, str](res_recursive);
     recursive[0] = false;
-    val rm: Result[bool, str] = mark_recursive(?m, recursive);
-    if (is_err[bool, str](rm)) { ret 1; }
+    val res_mark: R.Result[bool, str] = mark_recursive(?m, recursive);
+    if (R.is_err[bool, str](res_mark)) {
+        A.deallocate[bool](m.alloc, recursive, 1::usize);
+        ir.dnit(?m);
+        ret 1;
+    }
 
-    if (recursive[0] == false) { ret 1; }
+    val is_recursive: bool = recursive[0];
+    A.deallocate[bool](m.alloc, recursive, 1::usize);
+    ir.dnit(?m);
+    if (is_recursive == false) { ret 1; }
     ret 0;
 }
-

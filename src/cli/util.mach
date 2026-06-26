@@ -1,58 +1,81 @@
-# mach.cli.util: shared CLI argv and path helpers, plus thin std bridges.
+# shared CLI argv and path helpers, plus thin `*u8` bridges.
 #
-# every subcommand needs the same handful of argv-scanning and project-path
-# operations over the raw `**u8`/`*u8` argument vector; this module owns the
-# single copy of each so a fix lands once. it frames no parse state: the argv
-# helpers are exact-match, allocation-free scans over the raw vector,
-# mirroring `mach.cli.args` (which this supersedes), and the path helpers
-# operate on caller-provided buffers (`resolve_cmd` alone allocates, through
-# the caller's allocator). `--flag=value` and bundled short flags are
+# Every subcommand needs the same handful of argv-scanning and project-path
+# operations over the raw `**u8` / `*u8` argument vector, so this module owns
+# the single copy of each. It frames no parse state: the argv helpers are
+# exact-match, allocation-free scans over the raw vector, and the path helpers
+# operate on caller-provided buffers. `resolve_cmd` alone allocates, through
+# the caller's allocator. `--flag=value` and bundled short flags are
 # intentionally not recognized.
 #
-# `slen` and `cstr_str` are the remaining thin `*u8` bridges: `slen` is the
-# nil-safe length adapter (std `str_len` derefs nil — mach-std#204) and
-# `cstr_str` views a `*u8` as a `str`. the equality and stderr-emit
-# reimplementations were removed in favour of `std.types.string` / `std.print`
-# at the call sites (#1296, #1302).
+# `cstr_len` and `cstr_str` are the remaining thin `*u8` bridges: `cstr_len` is
+# the nil-safe length adapter (std `str_len` derefs nil, mach-std#204) and
+# `cstr_str` views a `*u8` as a `str`.
 
+use std.allocator.arena;
+use std.allocator.page;
+use std.filesystem;
+use std.system.os;
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_equals;
 use std.types.string.str_len;
-use std.types.option.Option;
-use std.types.option.some;
-use std.types.option.none;
-use std.types.result.Result;
-use std.types.result.ok;
-use std.types.result.err;
-use std.types.result.is_ok;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
 
-use std.allocator.Allocator;
-use std.allocator.allocate;
-use std.allocator.deallocate;
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
 
-use os:    std.system.os;
-use fs:    std.filesystem;
+# permission bits for a directory the CLI creates (octal 0755, rwxr-xr-x)
+val DIR_MODE: i32 = 493;
 
-# slen: length in bytes of a null-terminated `*u8` string, excluding the
-# terminator. the nil-safe length adapter over `std.types.string.str_len` (which
-# derefs nil); returns 0 for nil. kept for the CLI `*u8` call sites that can see
-# nil (mach-std#204 tracks the std-side gap).
+# bring up an arena allocator over a fresh page allocator
+#
+# Wires three caller-owned cells: a page allocator (`backing`), an arena over it
+# (`ar`), and the arena's Allocator interface (`alloc`). The caller owns the
+# storage so the internal back-pointers (alloc -> ar -> backing) stay valid for
+# the arena's lifetime, and tears it down with `arena.dnit(ar)` when done. On a
+# partial failure the arena is rolled back, so the caller frees nothing on error.
+# Every command that drives a build shares this so the bring-up stays identical.
+# ---
+# backing: cell for the page allocator the arena draws from
+# ar:      cell for the arena
+# alloc:   cell for the arena's Allocator interface, used for all allocation
+# ret:     none on success, or the error string of the step that failed
+pub fun bootstrap_arena(backing: *A.Allocator, ar: *arena.Arena, alloc: *A.Allocator) O.Option[str] {
+    val opt_page: O.Option[str] = page.make(backing);
+    if (O.is_some[str](opt_page)) { ret opt_page; }
+
+    val opt_arena: O.Option[str] = arena.init(ar, backing, 0);
+    if (O.is_some[str](opt_arena)) { ret opt_arena; }
+
+    val opt_make: O.Option[str] = arena.make(alloc, ar);
+    if (O.is_some[str](opt_make)) {
+        arena.dnit(ar);
+        ret opt_make;
+    }
+
+    ret O.none[str]();
+}
+
+# length in bytes of a null-terminated `*u8`, excluding the terminator
+#
+# The nil-safe adapter over `std.types.string.str_len` (which derefs nil);
+# returns 0 for nil. The CLI `*u8` call sites can see nil (mach-std#204 tracks
+# the std-side gap).
 # ---
 # s:   null-terminated byte string
 # ret: number of bytes before the terminator (0 for nil)
-pub fun slen(s: *u8) usize {
+pub fun cstr_len(s: *u8) usize {
     if (s == nil) { ret 0; }
     ret str_len(s::str);
 }
 
-# cstr_str: view a null-terminated `*u8` as a length-counted `str`. the result
-# borrows the same bytes — it must not outlive `s`.
+# view a null-terminated `*u8` as a length-counted `str`
+#
+# The result borrows the same bytes; it must not outlive `s`.
 # ---
 # s:   null-terminated byte string
 # ret: a `str` over the same bytes
@@ -60,40 +83,42 @@ pub fun cstr_str(s: *u8) str {
     ret s::str;
 }
 
-# has_flag: returns true if argv contains an exact match for `flag`.
+# whether argv contains an exact match for `flag`
 # ---
-# argc: the number of arguments to scan
-# argv: the argument vector (argc null-terminated byte pointers)
+# argc: number of arguments to scan
+# argv: argument vector (argc null-terminated byte pointers)
 # flag: the flag to search for
-# ret:  true if the flag appears in argv[0..argc)
+# ret:  true when the flag appears in argv[0, argc)
 pub fun has_flag(argc: usize, argv: **u8, flag: *u8) bool {
-    var i: usize = 0;
+    val want: str   = flag::str;
+    var i:    usize = 0;
     for (i < argc) {
-        if (str_equals(argv[i]::str, flag::str)) { ret true; }
+        if (str_equals(argv[i]::str, want)) { ret true; }
         i = i + 1;
     }
     ret false;
 }
 
-# get_value: returns the argument following the given flag, if present.
+# the argument following `flag`, when `flag` is present and is not the last token
 # ---
-# argc: the number of arguments to scan
-# argv: the argument vector (argc null-terminated byte pointers)
+# argc: number of arguments to scan
+# argv: argument vector (argc null-terminated byte pointers)
 # flag: the flag to search for
 # ret:  some(next arg) when the flag is found and followed by a value, else none
-pub fun get_value(argc: usize, argv: **u8, flag: *u8) Option[*u8] {
-    var i: usize = 0;
+pub fun get_value(argc: usize, argv: **u8, flag: *u8) O.Option[*u8] {
+    val want: str   = flag::str;
+    var i:    usize = 0;
     for (i < argc) {
-        if (str_equals(argv[i]::str, flag::str)) {
-            if (i + 1 < argc) { ret some[*u8](argv[i + 1]); }
-            ret none[*u8]();
+        if (str_equals(argv[i]::str, want)) {
+            if (i + 1 < argc) { ret O.some[*u8](argv[i + 1]); }
+            ret O.none[*u8]();
         }
         i = i + 1;
     }
-    ret none[*u8]();
+    ret O.none[*u8]();
 }
 
-# is_flag: returns true when `s` looks like a flag (begins with '-').
+# whether `s` looks like a flag (a non-nil token beginning with '-')
 # ---
 # s:   the token to test
 # ret: true when `s` is non-nil and starts with '-'
@@ -101,87 +126,42 @@ pub fun is_flag(s: *u8) bool {
     ret s != nil && s[0] == '-';
 }
 
-# is_value_flag: whether a token is a known flag that consumes the following
-# argv entry as its value. one table for every value flag the CLI recognizes,
-# so the positional and link-input scanners step over a flag's value rather
-# than mistaking it for a positional or an object path.
+# whether `a` is a known flag that consumes the following argv entry as its value
+#
+# One table for every value-taking flag the CLI recognizes, so the positional
+# and link-input scanners step over a flag's value rather than mistaking it for
+# a positional or an object path.
 # ---
 # a:   the token to test
 # ret: true when `a` is a value-taking flag
 pub fun is_value_flag(a: *u8) bool {
-    ret str_equals(a::str, "-L") || str_equals(a::str, "-l") || str_equals(a::str, "-o") ||
-        str_equals(a::str, "--target") || str_equals(a::str, "--color") ||
-        str_equals(a::str, "--artifacts") || str_equals(a::str, "--emit") || str_equals(a::str, "--filter") ||
-        str_equals(a::str, "--out") || str_equals(a::str, "--name") || str_equals(a::str, "--ref") ||
-        str_equals(a::str, "--profile") || str_equals(a::str, "--bin") || str_equals(a::str, "--lib") ||
-        str_equals(a::str, "--runner");
+    val s: str = a::str;
+    ret str_equals(s, "-L")
+        || str_equals(s, "-l")
+        || str_equals(s, "-o")
+        || str_equals(s, "--target")
+        || str_equals(s, "--color")
+        || str_equals(s, "--artifacts")
+        || str_equals(s, "--emit")
+        || str_equals(s, "--filter")
+        || str_equals(s, "--out")
+        || str_equals(s, "--name")
+        || str_equals(s, "--ref")
+        || str_equals(s, "--profile")
+        || str_equals(s, "--bin")
+        || str_equals(s, "--lib")
+        || str_equals(s, "--runner");
 }
 
-# resolve_cmd: resolve a command name to a concrete executable path for
-# `os.spawn` (execve performs no PATH search). a name already containing a path
-# separator is returned verbatim; a bare name is resolved by scanning the `PATH`
-# environment variable. the resolved path is allocated from `alloc`.
+# index of the `--` separator in argv, or argc when absent
 #
-# the PATH list separator and the path component separator are platform-specific:
-# posix uses ':' and '/', windows uses ';' and '\'. the windows list separator
-# must not be ':', since drive-letter prefixes (`C:\...`) embed a ':' that would
-# otherwise shatter every entry (#1538).
-# ---
-# alloc: allocator for the resolved path
-# name:  command name or path to resolve
-# ret:   the executable path, or an error message ("PATH unset" / "not found on PATH")
-pub fun resolve_cmd(alloc: *Allocator, name: *u8) Result[*u8, str] {
-    var list_sep: u8 = ':';
-    var path_sep: u8 = '/';
-    $if ($mach.build.os == $mach.os.windows) { list_sep = ';'; path_sep = '\\'; }
-
-    val nlen: usize = slen(name);
-    var h: usize = 0;
-    for (h < nlen) {
-        if (name[h] == '/' || name[h] == path_sep) { ret ok[*u8, str](name); }
-        h = h + 1;
-    }
-
-    var path_buf: [4096]u8;
-    val pl: i64 = os.getenv("PATH", ?path_buf[0], 4096);
-    if (pl <= 0) { ret err[*u8, str]("PATH unset"); }
-    val plen: usize = pl::usize;
-
-    var i: usize = 0;
-    for (i < plen) {
-        val start: usize = i;
-        for (i < plen && path_buf[i] != list_sep) { i = i + 1; }
-        val end: usize = i;
-        if (i < plen) { i = i + 1; }
-        if (end == start) { cnt; }
-
-        val seg_len: usize = end - start;
-        val cand_len: usize = seg_len + 1 + nlen;
-        val r: Result[*u8, str] = allocate[u8](alloc, cand_len + 1);
-        if (is_err[*u8, str](r)) { ret err[*u8, str]("out of memory"); }
-        val cand: *u8 = unwrap_ok[*u8, str](r);
-        var k: usize = 0;
-        var j: usize = start;
-        for (j < end) { cand[k] = path_buf[j]; k = k + 1; j = j + 1; }
-        cand[k] = path_sep; k = k + 1;
-        j = 0;
-        for (j < nlen) { cand[k] = name[j]; k = k + 1; j = j + 1; }
-        cand[k] = 0;
-
-        if (fs.is_file(cand::str)) { ret ok[*u8, str](cand); }
-        deallocate[u8](alloc, cand, cand_len + 1);
-    }
-    ret err[*u8, str]("not found on PATH");
-}
-
-# separator_index: index of the `--` separator in argv, or argc when absent.
-# the value doubles as the effective argument count for the build: everything
+# The value doubles as the effective argument count for the build: everything
 # at or after `--` is a program argument the build must not scan, so callers
 # pass this index as the argc handed to the build's flag and link scanners.
 # ---
-# argc: the number of arguments
-# argv: the argument vector (argc null-terminated byte pointers)
-# ret:  the index of the first `--`, or argc when there is none
+# argc: number of arguments
+# argv: argument vector (argc null-terminated byte pointers)
+# ret:  index of the first `--`, or argc when there is none
 pub fun separator_index(argc: usize, argv: **u8) usize {
     var i: usize = 1;
     for (i < argc) {
@@ -191,28 +171,30 @@ pub fun separator_index(argc: usize, argv: **u8) usize {
     ret argc;
 }
 
-# positional_index: index of the first bare (non-flag) argument at or after
-# `start`, skipping each known value flag together with its value. returns
-# argc when no positional is present.
+# index of the first bare (non-flag) argument at or after `start`, skipping each
+# known value flag together with its value, or argc when none is present
 # ---
-# argc:  the number of arguments to scan
-# argv:  the argument vector (argc null-terminated byte pointers)
-# start: the index to begin scanning from (typically 2, past the subcommand)
-# ret:   the index of the first positional, or argc when there is none
+# argc:  number of arguments to scan
+# argv:  argument vector (argc null-terminated byte pointers)
+# start: index to begin scanning from (typically 2, past the subcommand)
+# ret:   index of the first positional, or argc when there is none
 pub fun positional_index(argc: usize, argv: **u8, start: usize) usize {
     var i: usize = start;
     for (i < argc) {
         val a: *u8 = argv[i];
-        if (is_value_flag(a) && i + 1 < argc) { i = i + 2; cnt; }
-        if (a != nil && a[0] != '-') { ret i; }
+        if (is_value_flag(a) && i + 1 < argc) {
+            i = i + 2;
+            cnt;
+        }
+        if (a != nil && !is_flag(a)) { ret i; }
         i = i + 1;
     }
     ret argc;
 }
 
-# join_into: join `dir` and `leaf` with a single '/' into the caller-provided
-# buffer and null-terminate. `dir` may alias `buf`. returns the byte length
-# written (excluding the terminator), or 0 if it would not fit.
+# join `dir` and `leaf` with a single '/' into `buf` and null-terminate
+#
+# `dir` may alias `buf`. A trailing '/' already on `dir` is not doubled.
 # ---
 # buf:  destination buffer
 # cap:  capacity of `buf` in bytes
@@ -220,24 +202,36 @@ pub fun positional_index(argc: usize, argv: **u8, start: usize) usize {
 # leaf: trailing component to append under `dir`
 # ret:  bytes written excluding the terminator, or 0 when it would overflow
 pub fun join_into(buf: *u8, cap: usize, dir: *u8, leaf: *u8) usize {
-    val dl: usize = slen(dir);
-    val ll: usize = slen(leaf);
-    val need: usize = dl + 1 + ll + 1;
+    val dir_len:  usize = cstr_len(dir);
+    val leaf_len: usize = cstr_len(leaf);
+    val need:     usize = dir_len + 1 + leaf_len + 1;
     if (need > cap) { ret 0; }
-    var k: usize = 0;
+
+    var w: usize = 0;
     var i: usize = 0;
-    for (i < dl) { buf[k] = dir[i]; k = k + 1; i = i + 1; }
-    if (k > 0 && buf[k - 1] != '/') { buf[k] = '/'; k = k + 1; }
+    for (i < dir_len) {
+        buf[w] = dir[i];
+        w = w + 1;
+        i = i + 1;
+    }
+    if (w > 0 && buf[w - 1] != '/') {
+        buf[w] = '/';
+        w = w + 1;
+    }
     i = 0;
-    for (i < ll) { buf[k] = leaf[i]; k = k + 1; i = i + 1; }
-    buf[k] = 0;
-    ret k;
+    for (i < leaf_len) {
+        buf[w] = leaf[i];
+        w = w + 1;
+        i = i + 1;
+    }
+    buf[w] = 0;
+    ret w;
 }
 
-# path_into: write `path` into `buf`, resolving it against `base` when
-# relative, or copying it verbatim when absolute (starts with '/'). an absolute
-# `path` ignores `base` entirely. returns the byte length written (excluding the
-# terminator), or 0 when it would not fit.
+# write `path` into `buf`, resolving it against `base` when relative or copying
+# it verbatim when absolute (begins with '/')
+#
+# An absolute `path` ignores `base` entirely.
 # ---
 # buf:  destination buffer
 # cap:  capacity of `buf` in bytes
@@ -245,107 +239,194 @@ pub fun join_into(buf: *u8, cap: usize, dir: *u8, leaf: *u8) usize {
 # path: the path to resolve (absolute or relative)
 # ret:  bytes written excluding the terminator, or 0 when it would overflow
 pub fun path_into(buf: *u8, cap: usize, base: *u8, path: *u8) usize {
-    val pl: usize = slen(path);
-    if (pl > 0 && path[0] == '/') {
-        val need: usize = pl + 1;
-        if (need > cap) { ret 0; }
+    val path_len: usize = cstr_len(path);
+    if (path_len > 0 && path[0] == '/') {
+        if (path_len + 1 > cap) { ret 0; }
         var i: usize = 0;
-        for (i < pl) { buf[i] = path[i]; i = i + 1; }
-        buf[pl] = 0;
-        ret pl;
+        for (i < path_len) {
+            buf[i] = path[i];
+            i = i + 1;
+        }
+        buf[path_len] = 0;
+        ret path_len;
     }
     ret join_into(buf, cap, base, path);
 }
 
-# parent_dir: strip the final path component of `path` in place, turning the
-# last '/' into a terminator. returns true if a parent component remained,
-# false when `path` had no separator (already at a root or bare name).
-# ---
-# path: the null-terminated path to truncate in place
-# ret:  true when a parent remained, false at a root or bare name
-pub fun parent_dir(path: *u8) bool {
-    var last: usize = 0;
-    var found: bool = false;
-    var i: usize = 0;
-    for (path[i] != 0) {
-        if (path[i] == '/') { last = i; found = true; }
-        i = i + 1;
-    }
-    if (!found) { ret false; }
-    if (last == 0) {
-        # path is "/<leaf>" — keep the root slash
-        path[1] = 0;
-        ret false;
-    }
-    path[last] = 0;
-    ret true;
-}
-
-# find_project_root: walk up from `start` until a directory containing mach.toml
-# is found, writing the resolved root into `out_buf` (caller-provided, must hold
-# at least 4096 bytes). returns true on success; false when no ancestor directory
-# holds a mach.toml.
+# walk up from `start` until a directory containing mach.toml is found, writing
+# the resolved root into `out_buf`
+#
+# `out_buf` must hold at least 4096 bytes. The search probes each ancestor for a
+# mach.toml until one is found or the filesystem root is reached.
 # ---
 # start:   starting directory (required, non-nil)
 # out_buf: destination buffer for the resolved root
 # cap:     capacity of `out_buf` in bytes
 # ret:     true when a mach.toml-bearing ancestor was found
 pub fun find_project_root(start: *u8, out_buf: *u8, cap: usize) bool {
-    val n: usize = slen(start);
-    if (n + 1 > cap) { ret false; }
+    val start_len: usize = cstr_len(start);
+    if (start_len + 1 > cap) { ret false; }
     var i: usize = 0;
-    for (i < n) { out_buf[i] = start[i]; i = i + 1; }
-    out_buf[n] = 0;
+    for (i < start_len) {
+        out_buf[i] = start[i];
+        i = i + 1;
+    }
+    out_buf[start_len] = 0;
 
     var probe: [4096]u8;
     for (true) {
-        val plen: usize = join_into(?probe[0], 4096, out_buf, "mach.toml");
-        if (plen > 0 && fs.is_file(cstr_str(?probe[0]))) { ret true; }
-        if (!parent_dir(out_buf)) { ret false; }
+        val probe_len: usize = join_into(?probe[0], 4096, out_buf, "mach.toml");
+        if (probe_len > 0 && filesystem.is_file(cstr_str(?probe[0]))) { ret true; }
+        if (!parent_dir(out_buf))                                     { ret false; }
     }
     ret false;
 }
 
-# ensure_dir: create the directory at `path` if it does not already exist.
-# returns true on success or when it already exists.
+# create the directory at `path` if it does not already exist
 # ---
 # path: the null-terminated directory path to create
 # ret:  true when the directory exists after the call
 pub fun ensure_dir(path: *u8) bool {
     val p: str = cstr_str(path);
-    if (fs.is_dir(p)) { ret true; }
-    val mk: Result[bool, str] = fs.create_dir(p, 493);
-    if (is_ok[bool, str](mk)) { ret true; }
-    ret fs.is_dir(p);
+    if (filesystem.is_dir(p)) { ret true; }
+    val res_create: R.Result[bool, str] = filesystem.create_dir(p, DIR_MODE);
+    if (R.is_ok[bool, str](res_create)) { ret true; }
+    # tolerate a concurrent creation: re-check existence after a failed create
+    ret filesystem.is_dir(p);
 }
 
-# ensure_parents: create every parent directory of the file path `path`
-# (mkdir-p over the leading components, excluding the final leaf). each
-# intermediate prefix is created in turn so deeply nested paths materialise
-# their directories. the path buffer is restored after each temporary
-# truncation. returns true once every parent exists.
+# create every parent directory of the file path `path` (mkdir -p over the
+# leading components, excluding the final leaf)
+#
+# Each intermediate prefix is created in turn so a deeply nested path
+# materialises its directories. `path` is restored after each temporary
+# truncation.
 # ---
 # path: the null-terminated file path whose parents are created
 # ret:  true once every parent directory exists
 pub fun ensure_parents(path: *u8) bool {
-    val n: usize = slen(path);
+    val path_len: usize = cstr_len(path);
     var i: usize = 1;
-    for (i < n) {
+    for (i < path_len) {
         if (path[i] == '/') {
-            val saved: u8 = path[i];
             path[i] = 0;
-            val ok_dir: bool = ensure_dir(path);
-            path[i] = saved;
-            if (!ok_dir) { ret false; }
+            val parent_ok: bool = ensure_dir(path);
+            path[i] = '/';
+            if (!parent_ok) { ret false; }
         }
         i = i + 1;
     }
     ret true;
 }
 
-test "util: path_into uses absolute path verbatim and joins relative path" {
+# resolve a command name to a concrete executable path for `os.spawn`
+#
+# execve performs no PATH search, so a bare name is resolved by scanning the
+# `PATH` environment variable; a name already containing a path separator is
+# returned verbatim. The resolved path is allocated from `a`.
+#
+# The PATH list separator and the path component separator are platform
+# specific: posix uses ':' and '/', windows uses ';' and '\'. The windows list
+# separator must not be ':', since drive-letter prefixes (`C:\...`) embed a ':'
+# that would otherwise shatter every entry.
+# ---
+# a:    allocator for the resolved path
+# name: command name or path to resolve
+# ret:  the executable path, or an error ("PATH unset" / "not found on PATH" / allocator error)
+pub fun resolve_cmd(a: *A.Allocator, name: *u8) R.Result[*u8, str] {
+    var list_sep: u8 = ':';
+    var path_sep: u8 = '/';
+    $if ($mach.build.os == $mach.os.windows) {
+        list_sep = ';';
+        path_sep = '\\';
+    }
+
+    # a name that already spells a path is returned verbatim; only bare names
+    # are searched on PATH.
+    val nlen: usize = cstr_len(name);
+    var i: usize = 0;
+    for (i < nlen) {
+        if (name[i] == '/' || name[i] == path_sep) { ret R.ok[*u8, str](name); }
+        i = i + 1;
+    }
+
+    var path_buf: [4096]u8;
+    val getenv_len: i64 = os.getenv("PATH", ?path_buf[0], 4096);
+    if (getenv_len <= 0) { ret R.err[*u8, str]("PATH unset"); }
+    val plen: usize = getenv_len::usize;
+
+    i = 0;
+    for (i < plen) {
+        val start: usize = i;
+        for (i < plen && path_buf[i] != list_sep) { i = i + 1; }
+        val end: usize = i;
+        if (i < plen)     { i = i + 1; }
+        if (end == start) { cnt; }
+
+        val seg_len:  usize = end - start;
+        val cand_len: usize = seg_len + 1 + nlen;
+        val res_alloc: R.Result[*u8, str] = A.allocate[u8](a, cand_len + 1);
+        if (R.is_err[*u8, str](res_alloc)) {
+            ret R.err[*u8, str](R.unwrap_err[*u8, str](res_alloc));
+        }
+        val cand: *u8 = R.unwrap_ok[*u8, str](res_alloc);
+
+        var w:  usize = 0;
+        var ii: usize = start;
+        for (ii < end) {
+            cand[w] = path_buf[ii];
+            w  = w + 1;
+            ii = ii + 1;
+        }
+        cand[w] = path_sep;
+        w = w + 1;
+        ii = 0;
+        for (ii < nlen) {
+            cand[w] = name[ii];
+            w  = w + 1;
+            ii = ii + 1;
+        }
+        cand[w] = 0;
+
+        if (filesystem.is_file(cand::str)) { ret R.ok[*u8, str](cand); }
+        A.deallocate[u8](a, cand, cand_len + 1);
+    }
+    ret R.err[*u8, str]("not found on PATH");
+}
+
+# strip the final path component of `path` in place, turning the last '/' into a
+# terminator
+#
+# Returns false when `path` has no separator (already a root or bare name); a
+# "/leaf" path keeps its root slash.
+# ---
+# path: the null-terminated path to truncate in place
+# ret:  true when a parent component remained
+fun parent_dir(path: *u8) bool {
+    var last_sep: usize = 0;
+    var found:    bool  = false;
+    var i:        usize = 0;
+    for (path[i] != 0) {
+        if (path[i] == '/') {
+            last_sep = i;
+            found    = true;
+        }
+        i = i + 1;
+    }
+    if (!found) { ret false; }
+    if (last_sep == 0) {
+        # path is "/<leaf>" - keep the root slash
+        path[1] = 0;
+        ret false;
+    }
+    path[last_sep] = 0;
+    ret true;
+}
+
+# path_into copies an absolute path verbatim (ignoring base) and joins a
+# relative path against base.
+test "mach.cli.util.path_into:absolute_and_relative" {
     var buf: [256]u8;
-    # absolute path must land at exactly that path, ignoring base.
     val al: usize = path_into(?buf[0], 256, "/base", "/tmp/out/mach");
     if (al == 0) { ret 1; }
     var i: usize = 0;
@@ -355,7 +436,7 @@ test "util: path_into uses absolute path verbatim and joins relative path" {
         i = i + 1;
     }
     if (want[i] != 0) { ret 1; }
-    # relative path must be joined with base.
+
     val rl: usize = path_into(?buf[0], 256, "/base", "rel/out");
     if (rl == 0) { ret 1; }
     val rwant: *u8 = "/base/rel/out";
@@ -368,7 +449,9 @@ test "util: path_into uses absolute path verbatim and joins relative path" {
     ret 0;
 }
 
-test "util: separator_index reports the -- boundary as the effective argc" {
+# separator_index reports the `--` boundary as the effective argc, and argc
+# itself when there is no separator.
+test "mach.cli.util.separator_index:boundary_as_argc" {
     var argv: [4]*u8;
     argv[0] = "mach"; argv[1] = "run"; argv[2] = "--"; argv[3] = "x";
     if (separator_index(4, ?argv[0]) != 2) { ret 1; }
@@ -379,7 +462,9 @@ test "util: separator_index reports the -- boundary as the effective argc" {
     ret 0;
 }
 
-test "util: positional_index skips a value flag's value (mach init --name)" {
+# positional_index skips a value flag together with its value, finds an explicit
+# positional, and resolves `mach build .`.
+test "mach.cli.util.positional_index:skips_value_flag" {
     # [mach, init, --name, myproj] has no positional: --name eats myproj.
     var a: [4]*u8;
     a[0] = "mach"; a[1] = "init"; a[2] = "--name"; a[3] = "myproj";

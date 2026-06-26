@@ -1,93 +1,70 @@
-# mach.cli.cmd.run: `mach run` — builds the project and executes the produced binary.
+# `mach run` - build the project and execute the produced binary
 #
-# builds the project through the same pipeline as `build` and then
-# executes the produced binary, forwarding any arguments after a `--`
-# separator to the child as its argv. the child inherits the parent's
-# environment. the child's exit code becomes this subcommand's exit code.
-# `--emit obj` is rejected since running a relocatable object is not
-# meaningful. `--runner <cmd>` executes the binary as `<cmd> <binary>
-# <args...>` instead of exec'ing it directly — the host-side launcher for
-# foreign-target artifacts (e.g. wine for a windows target, #1345). absent
-# the flag, the binary is exec'd directly and a spawn failure reports
-# exactly that.
+# Builds through the same pipeline as `build`, then executes the produced
+# binary, forwarding any arguments after a `--` separator to the child as its
+# argv. The child inherits the parent's environment, and its exit code becomes
+# this subcommand's exit code. `--emit obj` is rejected, since running a
+# relocatable object is not meaningful. `--runner <cmd>` executes the binary as
+# `<cmd> <binary> <args...>` instead of exec'ing it directly - the host-side
+# launcher for foreign-target artifacts (e.g. wine for a windows target). Absent
+# the flag, the binary is exec'd directly and a spawn failure reports exactly
+# that.
 
-use std.types.bool.bool;
-use std.types.bool.true;
+use std.allocator.arena;
+use std.print;
+use std.process.env;
+use std.process.exec;
 use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.option.Option;
-use std.types.option.is_some;
-use std.types.option.unwrap;
-use std.types.result.Result;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.unwrap_err;
 
-use std.allocator.Allocator;
-use std.allocator.allocate;
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
 
-use page:  std.allocator.page;
-use arena: std.allocator.arena;
+use mach.cli.cmd.build;
+use mach.cli.util;
 
-use os:    std.system.os;
-use env:   std.process.env;
-use exec:  std.process.exec;
-use print: std.print;
-
-use build: mach.cli.cmd.build;
-use util:  mach.cli.util;
-
-# run: `mach run` subcommand entry point. builds the project to an
-# executable, then execs it forwarding the post-`--` arguments. called by
-# cmd.dispatch.
+# `mach run` subcommand entry point
+#
+# Builds the project to an executable, then execs it forwarding the post-`--`
+# arguments. Called by cmd.dispatch.
 # ---
 # argc: argument count including argv[0]
 # argv: the argument vector (argc null-terminated byte pointers)
-# ret:  the child's exit code, 1 on a build/user error, 2 on internal error
+# ret:  the child's exit code, 1 on a build or user error, 2 on internal error
 pub fun run(argc: usize, argv: **u8) i64 {
     # the build sees only the args before `--`; everything after is the child's
     # argv. clip the build's view here too so a post-`--` `--emit` is the
     # program's argument, not a flag this command rejects.
     val sep: usize = util.separator_index(argc, argv);
 
-    val emit_opt: Option[*u8] = build.emit_kind(sep, argv);
-    if (is_some[*u8](emit_opt)) {
+    val opt_emit: O.Option[*u8] = build.emit_kind(sep, argv);
+    if (O.is_some[*u8](opt_emit)) {
         print.eprint("error: 'mach run' does not support --emit\n");
         ret 1;
     }
 
-    # back the build with an arena over a page allocator, matching `mach
-    # build`. the build's internal teardown (`sess.dnit`/`dnit_project`)
-    # frees through this allocator; the page allocator would munmap each
-    # block individually, unmapping the page `output_path` lives in before
-    # we exec it. the arena defers all reclamation to a single `arena.dnit`,
-    # so `output_path` stays mapped until we are done with the child.
-    var backing: Allocator;
-    if (is_some[str](page.make(?backing))) {
+    # back the build with an arena over a page allocator, matching `mach build`.
+    # the build's internal teardown (`sess.dnit` / `dnit_project`) frees through
+    # this allocator; the page allocator would munmap each block individually,
+    # unmapping the page `output_path` lives in before we exec it. the arena
+    # defers all reclamation to a single `arena.dnit`, so `output_path` stays
+    # mapped until we are done with the child.
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var alloc:   A.Allocator;
+    if (O.is_some[str](util.bootstrap_arena(?backing, ?ar, ?alloc))) {
         print.eprint("error: failed to initialise allocator\n");
         ret 2;
     }
 
-    var ar: arena.Arena;
-    if (is_some[str](arena.init(?ar, ?backing, 0))) {
-        print.eprint("error: failed to initialise allocator\n");
-        ret 2;
-    }
-
-    var alloc: Allocator;
-    if (is_some[str](arena.make(?alloc, ?ar))) {
+    val build_result: build.BuildResult = build.build(?alloc, argc, argv, false);
+    if (build_result.code != 0) {
         arena.dnit(?ar);
-        print.eprint("error: failed to initialise allocator\n");
-        ret 2;
+        ret build_result.code;
     }
-
-    val br: build.BuildResult = build.build(?alloc, argc, argv, false);
-    if (br.code != 0) {
-        arena.dnit(?ar);
-        ret br.code;
-    }
-    if (br.output_path == nil) {
+    if (build_result.output_path == nil) {
         arena.dnit(?ar);
         print.eprint("error: build produced no executable\n");
         ret 2;
@@ -97,58 +74,61 @@ pub fun run(argc: usize, argv: **u8) i64 {
     # binary as `<cmd> <binary> <args...>`. resolved to a concrete path up front
     # since execve does no PATH search.
     var runner: *u8 = nil;
-    val runner_opt: Option[*u8] = util.get_value(sep, argv, "--runner");
-    if (is_some[*u8](runner_opt)) {
-        val name: *u8 = unwrap[*u8](runner_opt);
-        val rr: Result[*u8, str] = util.resolve_cmd(?alloc, name);
-        if (is_err[*u8, str](rr)) {
+    val opt_runner: O.Option[*u8] = util.get_value(sep, argv, "--runner");
+    if (O.is_some[*u8](opt_runner)) {
+        val name: *u8 = O.unwrap[*u8](opt_runner);
+        val res_runner: R.Result[*u8, str] = util.resolve_cmd(?alloc, name);
+        if (R.is_err[*u8, str](res_runner)) {
             arena.dnit(?ar);
             print.eprint("error: --runner '");
             print.eprint(name::str);
             print.eprint("': ");
-            print.eprint(unwrap_err[*u8, str](rr));
+            print.eprint(R.unwrap_err[*u8, str](res_runner));
             print.eprint("\n");
             ret 1;
         }
-        runner = unwrap_ok[*u8, str](rr);
+        runner = R.unwrap_ok[*u8, str](res_runner);
     }
 
-    var fwd_count: usize = 0;
-    if (sep < argc) { fwd_count = argc - sep - 1; }
+    var fwd_len: usize = 0;
+    if (sep < argc) { fwd_len = argc - sep - 1; }
 
-    # child argv: [binary, <forwarded...>, nil], prefixed by the runner when given.
-    var rn: usize = 0;
-    if (runner != nil) { rn = 1; }
-    val total: usize = rn + 1 + fwd_count + 1;
-    val cv_r: Result[**u8, str] = allocate[*u8](?alloc, total);
-    if (is_err[**u8, str](cv_r)) {
+    # child argv: [runner?, binary, forwarded..., nil]. the runner, when given,
+    # occupies one leading slot.
+    var lead: usize = 0;
+    if (runner != nil) { lead = 1; }
+
+    val child_len: usize = lead + 1 + fwd_len + 1;
+    val res_child_argv: R.Result[**u8, str] = A.allocate[*u8](?alloc, child_len);
+    if (R.is_err[**u8, str](res_child_argv)) {
         arena.dnit(?ar);
         print.eprint("error: out of memory\n");
         ret 2;
     }
-    val child_argv: **u8 = unwrap_ok[**u8, str](cv_r);
-    if (runner != nil) { child_argv[0] = runner; }
-    child_argv[rn] = br.output_path;
-    var k: usize = 0;
-    for (k < fwd_count) {
-        child_argv[rn + 1 + k] = argv[sep + 1 + k];
-        k = k + 1;
-    }
-    child_argv[rn + 1 + fwd_count] = nil;
+    val child_argv: **u8 = R.unwrap_ok[**u8, str](res_child_argv);
 
-    var exe: *u8 = br.output_path;
+    if (runner != nil) { child_argv[0] = runner; }
+    child_argv[lead] = build_result.output_path;
+    var i: usize = 0;
+    for (i < fwd_len) {
+        child_argv[lead + 1 + i] = argv[sep + 1 + i];
+        i = i + 1;
+    }
+    child_argv[lead + 1 + fwd_len] = nil;
+
+    # exec the runner when present, otherwise the built binary directly.
+    var exe: *u8 = build_result.output_path;
     if (runner != nil) { exe = runner; }
 
     # the child inherits the parent's environment unmodified.
-    val exec_r: Result[exec.ExitStatus, str] = exec.run(exe, child_argv, env.environ());
-
-    if (is_err[exec.ExitStatus, str](exec_r)) {
+    val res_exec: R.Result[exec.ExitStatus, str] = exec.run(exe::str, child_argv, env.environ());
+    if (R.is_err[exec.ExitStatus, str](res_exec)) {
         arena.dnit(?ar);
         if (runner != nil) { print.eprint("error: failed to execute the runner\n"); }
-        or { print.eprint("error: failed to execute the built binary\n"); }
+        or                 { print.eprint("error: failed to execute the built binary\n"); }
         ret 1;
     }
-    val status: exec.ExitStatus = unwrap_ok[exec.ExitStatus, str](exec_r);
+    val status: exec.ExitStatus = R.unwrap_ok[exec.ExitStatus, str](res_exec);
     arena.dnit(?ar);
 
     if (exec.exited(status)) {

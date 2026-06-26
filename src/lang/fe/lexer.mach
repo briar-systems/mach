@@ -1,55 +1,52 @@
-# mach.lang.fe.lexer: tokenises source text into a TokenStream terminated by a KIND_EOF token.
+# lex source text into a flat token stream terminated by KIND_EOF
 #
-# lex errors are accumulated in a sibling LexError buffer rather than
-# aborting the pass; the parser later cross-references the stream and the
-# errors.
+# Lex errors accumulate in a sibling buffer on the stream rather than aborting
+# the pass; the parser later cross-references the token stream and the error
+# buffer. Consecutive `#` comment lines fold into CommentRun blocks so the
+# parser can recover a declaration's doc-comment block.
 
+use std.allocator.page;
 use std.types.bool.bool;
-use std.types.bool.true;
 use std.types.bool.false;
+use std.types.bool.true;
 use std.types.size.usize;
+use std.types.string.StrView;
 use std.types.string.str;
-use std.types.result.Result;
-use std.types.result.ok;
-use std.types.result.err;
-use std.types.result.is_err;
-use std.types.result.unwrap_ok;
-use std.types.result.unwrap_err;
+use std.types.string.view;
 
-use std.allocator.Allocator;
-use std.allocator.allocate;
-use std.allocator.deallocate;
+use A: std.allocator;
+use R: std.types.result;
 
-use page: std.allocator.page;
+use mach.lang.diagnostic;
+use mach.lang.fe.pool;
+use mach.lang.fe.token;
+use src: mach.lang.source;
 
-use token:   mach.lang.fe.token;
-use src:     mach.lang.source;
-use diag:    mach.lang.diagnostic;
-use strutil: std.types.string;
-use pool:    mach.lang.fe.pool;
+# error category stored in LexError.code, one per malformed-input class
+pub def LexErrorCode: u8;
 
-# error code stored in LexError.code, one per malformed-input category
-pub val LEX_ERR_UNEXPECTED_CHAR:   u8 = 1;
-pub val LEX_ERR_UNTERMINATED_STR:  u8 = 2;
-pub val LEX_ERR_UNTERMINATED_CHAR: u8 = 3;
-pub val LEX_ERR_CONTROL_CHAR:      u8 = 4;
+pub val LEX_ERR_UNEXPECTED_CHAR:   LexErrorCode = 1;
+pub val LEX_ERR_UNTERMINATED_STR:  LexErrorCode = 2;
+pub val LEX_ERR_UNTERMINATED_CHAR: LexErrorCode = 3;
+pub val LEX_ERR_CONTROL_CHAR:      LexErrorCode = 4;
 
-# LexError: a structured lexer error pairing a bad span with an error code.
+# a structured lexer error pairing a malformed span with a category code
 # ---
 # span: byte range that was malformed
-# code: one of the LEX_ERR_* constants
+# code: which malformed-input category this error is
 pub rec LexError {
     span: token.Span;
-    code: u8;
+    code: LexErrorCode;
 }
 
-# CommentRun: a maximal block of consecutive `#` comment lines, recorded so the
-# parser can attach a declaration's doc-comment block. a run grows while each
-# successive comment line sits directly under the previous one (no blank or code
-# line between); a gap starts a new run. `#[...]` attribute decorators are real
-# tokens, never comments, so they never appear in a run.
+# a maximal block of consecutive `#` comment lines
+#
+# A run grows while each successive comment line sits directly under the
+# previous one with no blank or code line between; a gap starts a new run.
+# `#[...]` attribute decorators are real tokens, never comments, so they never
+# join a run.
 # ---
-# span:       byte range spanning the first comment line's `#` to the end of the last
+# span:       byte range from the first comment line's `#` to the end of the last
 # start_line: 1-based source line of the first comment line
 # end_line:   1-based source line of the last comment line
 pub rec CommentRun {
@@ -58,61 +55,64 @@ pub rec CommentRun {
     end_line:   usize;
 }
 
-# TokenStream: a flat, owning buffer of tokens and lex errors produced over one source file.
+# a flat, owning buffer of tokens, lex errors, and comment runs for one source file
 # ---
-# tokens:    contiguous array of tokens ending in KIND_EOF
-# len:       number of tokens currently stored
-# cap:       allocated slots in tokens
-# source:    pointer to the source text that was lexed
-# file_id:   identifier of the file this stream came from
-# errors:    contiguous array of LexError; nil if none
-# error_len: number of errors currently stored
-# error_cap: allocated slots in errors (0 when errors is nil)
-# comments:    contiguous array of CommentRun in source order; nil if none
-# comment_len: number of comment runs currently stored
-# comment_cap: allocated slots in comments (0 when comments is nil)
+# tokens:      contiguous token array ending in KIND_EOF
+# len:         number of tokens stored
+# cap:         allocated slots in tokens
+# source:      the source text that was lexed
+# file_id:     identifier of the file this stream came from
+# errors:      contiguous LexError array; nil when none
+# error_len:   number of errors stored
+# error_cap:   allocated slots in errors, 0 when errors is nil
+# comments:    contiguous CommentRun array in source order; nil when none
+# comment_len: number of comment runs stored
+# comment_cap: allocated slots in comments, 0 when comments is nil
 pub rec TokenStream {
-    tokens:    *token.Token;
-    len:       usize;
-    cap:       usize;
-    source:    str;
-    file_id:   src.FileId;
+    tokens: *token.Token;
+    len:    usize;
+    cap:    usize;
+
+    source:  str;
+    file_id: src.FileId;
+
     errors:    *LexError;
     error_len: usize;
     error_cap: usize;
+
     comments:    *CommentRun;
     comment_len: usize;
     comment_cap: usize;
 }
 
-val INITIAL_CAP:         usize = 256;
+# seed capacities for the stream's three growable buffers
+val INITIAL_TOKEN_CAP:   usize = 256;
 val INITIAL_ERROR_CAP:   usize = 8;
 val INITIAL_COMMENT_CAP: usize = 16;
 
-# tokenize: lexes source text into a TokenStream terminated by KIND_EOF.
+# lex source text into an owning TokenStream terminated by KIND_EOF
+#
+# Malformed input is recorded on the stream and the scan recovers; only an
+# allocation failure aborts, in which case every buffer is released before the
+# error is returned.
 # ---
 # source:  null-terminated source text
-# alloc:   allocator used for the token and error buffers
+# alloc:   allocator backing the token, error, and comment buffers
 # file_id: file identifier stored on the stream for downstream diagnostics
 # ret:     an owning TokenStream, or an allocation error
-pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[TokenStream, str] {
+pub fun tokenize(source: str, alloc: *A.Allocator, file_id: src.FileId) R.Result[TokenStream, str] {
     var stream: TokenStream;
+    stream.tokens      = nil;
+    stream.len         = 0;
+    stream.cap         = 0;
     stream.source      = source;
     stream.file_id     = file_id;
-    stream.len         = 0;
-    stream.cap         = INITIAL_CAP;
     stream.errors      = nil;
     stream.error_len   = 0;
     stream.error_cap   = 0;
     stream.comments    = nil;
     stream.comment_len = 0;
     stream.comment_cap = 0;
-
-    val r_init: Result[*token.Token, str] = allocate[token.Token](alloc, stream.cap);
-    if (is_err[*token.Token, str](r_init)) {
-        ret err[TokenStream, str](unwrap_err[*token.Token, str](r_init));
-    }
-    stream.tokens = unwrap_ok[*token.Token, str](r_init);
 
     var pos:  usize = 0;
     var line: usize = 1;
@@ -125,55 +125,46 @@ pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[Tok
             cnt;
         }
 
-        # `#` immediately followed by `[` opens an attribute decorator (#1532);
-        # any other `#` is a line comment to end-of-line. a literal comment that
-        # begins `#[` therefore needs an intervening space (`# [...]`).
+        # `#` immediately followed by `[` opens an attribute decorator; any other
+        # `#` is a line comment to end-of-line. a literal comment beginning `#[`
+        # therefore needs an intervening space (`# [...]`).
         if (c == '#' && source[pos + 1] != '[') {
             val comment_start: usize = pos;
             val comment_line:  usize = line;
             for (source[pos] != 0 && source[pos] != '\n') {
                 pos = pos + 1;
             }
-            val r_cmt: Result[bool, str] = record_comment(?stream, alloc, comment_start, pos, comment_line);
-            if (is_err[bool, str](r_cmt)) {
-                deallocate[token.Token](alloc, stream.tokens, stream.cap);
-                ret err[TokenStream, str](unwrap_err[bool, str](r_cmt));
+            val res_comment: R.Result[bool, str] = comment_add(?stream, alloc, comment_start, pos, comment_line);
+            if (R.is_err[bool, str](res_comment)) {
+                dnit(?stream, alloc);
+                ret R.err[TokenStream, str](R.unwrap_err[bool, str](res_comment));
             }
             cnt;
         }
 
         var tok: token.Token;
 
-        if (c == '(')  { tok = token.make(token.KIND_LPAREN,   pos, 1); pos = pos + 1; }
-        or (c == ')')  { tok = token.make(token.KIND_RPAREN,   pos, 1); pos = pos + 1; }
-        or (c == '{')  { tok = token.make(token.KIND_LBRACE,   pos, 1); pos = pos + 1; }
-        or (c == '}')  { tok = token.make(token.KIND_RBRACE,   pos, 1); pos = pos + 1; }
-        or (c == '[')  { tok = token.make(token.KIND_LBRACKET, pos, 1); pos = pos + 1; }
-        or (c == ']')  { tok = token.make(token.KIND_RBRACKET, pos, 1); pos = pos + 1; }
-        or (c == ';')  { tok = token.make(token.KIND_SEMI,     pos, 1); pos = pos + 1; }
-        or (c == ',')  { tok = token.make(token.KIND_COMMA,    pos, 1); pos = pos + 1; }
-        or (c == '?')  { tok = token.make(token.KIND_QUESTION, pos, 1); pos = pos + 1; }
-        or (c == '@')  { tok = token.make(token.KIND_AT,       pos, 1); pos = pos + 1; }
-        or (c == '$')  { tok = token.make(token.KIND_DOLLAR,   pos, 1); pos = pos + 1; }
-        or (c == '~')  { tok = token.make(token.KIND_TILDE,    pos, 1); pos = pos + 1; }
-        or (c == '+')  { tok = token.make(token.KIND_PLUS,     pos, 1); pos = pos + 1; }
-        or (c == '-')  { tok = token.make(token.KIND_MINUS,    pos, 1); pos = pos + 1; }
-        or (c == '*')  { tok = token.make(token.KIND_STAR,     pos, 1); pos = pos + 1; }
-        or (c == '/')  { tok = token.make(token.KIND_SLASH,    pos, 1); pos = pos + 1; }
-        or (c == '%')  { tok = token.make(token.KIND_PERCENT,  pos, 1); pos = pos + 1; }
-        or (c == '^')  { tok = token.make(token.KIND_CARET,    pos, 1); pos = pos + 1; }
-        or (c == '`')  { tok = token.make(token.KIND_BACKTICK, pos, 1); pos = pos + 1; }
-        # reaching here with `#` means the comment guard let it through, so the
-        # next byte is `[`: emit the two-byte attribute-open token.
-        or (c == '#')  { tok = token.make(token.KIND_ATTR_OPEN, pos, 2); pos = pos + 2; }
-        or (c == ':')  {
+        val punct: token.Kind = punct_kind(c);
+        if (punct != token.KIND_ERROR) {
+            tok = token.make(punct, pos, 1);
+            pos = pos + 1;
+        }
+        or (c == '#') {
+            # the comment guard above consumed every plain `#`, so reaching here
+            # means the next byte is `[`: emit the two-byte attribute opener.
+            tok = token.make(token.KIND_ATTR_OPEN, pos, 2);
+            pos = pos + 2;
+        }
+        or (c == ':') {
             if (source[pos + 1] == ':') {
                 tok = token.make(token.KIND_COLON_COLON, pos, 2);
                 pos = pos + 2;
-            } or (source[pos + 1] == '~') {
+            }
+            or (source[pos + 1] == '~') {
                 tok = token.make(token.KIND_COLON_TILDE, pos, 2);
                 pos = pos + 2;
-            } or {
+            }
+            or {
                 tok = token.make(token.KIND_COLON, pos, 1);
                 pos = pos + 1;
             }
@@ -182,7 +173,8 @@ pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[Tok
             if (source[pos + 1] == '.' && source[pos + 2] == '.') {
                 tok = token.make(token.KIND_DOT_DOT_DOT, pos, 3);
                 pos = pos + 3;
-            } or {
+            }
+            or {
                 tok = token.make(token.KIND_DOT, pos, 1);
                 pos = pos + 1;
             }
@@ -191,7 +183,8 @@ pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[Tok
             if (source[pos + 1] == '=') {
                 tok = token.make(token.KIND_EQ_EQ, pos, 2);
                 pos = pos + 2;
-            } or {
+            }
+            or {
                 tok = token.make(token.KIND_EQ, pos, 1);
                 pos = pos + 1;
             }
@@ -200,7 +193,8 @@ pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[Tok
             if (source[pos + 1] == '=') {
                 tok = token.make(token.KIND_BANG_EQ, pos, 2);
                 pos = pos + 2;
-            } or {
+            }
+            or {
                 tok = token.make(token.KIND_BANG, pos, 1);
                 pos = pos + 1;
             }
@@ -237,7 +231,8 @@ pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[Tok
             if (source[pos + 1] == '&') {
                 tok = token.make(token.KIND_AMP_AMP, pos, 2);
                 pos = pos + 2;
-            } or {
+            }
+            or {
                 tok = token.make(token.KIND_AMP, pos, 1);
                 pos = pos + 1;
             }
@@ -246,7 +241,8 @@ pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[Tok
             if (source[pos + 1] == '|') {
                 tok = token.make(token.KIND_PIPE_PIPE, pos, 2);
                 pos = pos + 2;
-            } or {
+            }
+            or {
                 tok = token.make(token.KIND_PIPE, pos, 1);
                 pos = pos + 1;
             }
@@ -254,9 +250,8 @@ pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[Tok
         or (c == '"') {
             val start: usize = pos;
             pos = pos + 1;
-            # a string literal is single-line (literals.md): stop at an unescaped
-            # newline and report it unterminated rather than swallowing the rest
-            # of the file until the next quote.
+            # a string literal is single-line: stop at an unescaped newline and
+            # report it unterminated rather than swallowing the rest of the file.
             for (source[pos] != 0 && source[pos] != '"' && source[pos] != '\n') {
                 if (source[pos] == '\\' && source[pos + 1] != 0 && source[pos + 1] != '\n') {
                     pos = pos + 2;
@@ -266,11 +261,12 @@ pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[Tok
             }
             if (source[pos] == '"') {
                 pos = pos + 1;
-            } or {
-                val r_err: Result[bool, str] = push_error(?stream, alloc, start, pos - start, LEX_ERR_UNTERMINATED_STR);
-                if (is_err[bool, str](r_err)) {
-                    deallocate[token.Token](alloc, stream.tokens, stream.cap);
-                    ret err[TokenStream, str](unwrap_err[bool, str](r_err));
+            }
+            or {
+                val res_err: R.Result[bool, str] = error_add(?stream, alloc, start, pos - start, LEX_ERR_UNTERMINATED_STR);
+                if (R.is_err[bool, str](res_err)) {
+                    dnit(?stream, alloc);
+                    ret R.err[TokenStream, str](R.unwrap_err[bool, str](res_err));
                 }
             }
             tok = token.make(token.KIND_LIT_STR, start, pos - start);
@@ -278,7 +274,7 @@ pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[Tok
         or (c == '\'') {
             val start: usize = pos;
             pos = pos + 1;
-            # a char literal is single-line too; terminate the scan at an
+            # a char literal is single-line too: terminate the scan at an
             # unescaped newline so a missing closing quote does not run on.
             for (source[pos] != 0 && source[pos] != '\'' && source[pos] != '\n') {
                 if (source[pos] == '\\' && source[pos + 1] != 0 && source[pos + 1] != '\n') {
@@ -289,18 +285,19 @@ pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[Tok
             }
             if (source[pos] == '\'') {
                 pos = pos + 1;
-            } or {
-                val r_err: Result[bool, str] = push_error(?stream, alloc, start, pos - start, LEX_ERR_UNTERMINATED_CHAR);
-                if (is_err[bool, str](r_err)) {
-                    deallocate[token.Token](alloc, stream.tokens, stream.cap);
-                    ret err[TokenStream, str](unwrap_err[bool, str](r_err));
+            }
+            or {
+                val res_err: R.Result[bool, str] = error_add(?stream, alloc, start, pos - start, LEX_ERR_UNTERMINATED_CHAR);
+                if (R.is_err[bool, str](res_err)) {
+                    dnit(?stream, alloc);
+                    ret R.err[TokenStream, str](R.unwrap_err[bool, str](res_err));
                 }
             }
             tok = token.make(token.KIND_LIT_CHAR, start, pos - start);
         }
         or (c >= '0' && c <= '9') {
-            val start: usize = pos;
-            var is_float: bool = false;
+            val start:    usize = pos;
+            var is_float: bool  = false;
 
             if (c == '0' && source[pos + 1] == 'x') {
                 pos = pos + 2;
@@ -351,7 +348,8 @@ pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[Tok
                     }
                 }
                 tok = token.make(token.KIND_LIT_FLOAT, start, pos - start);
-            } or {
+            }
+            or {
                 if (source[pos] == 'u' || source[pos] == 'i') {
                     pos = pos + 1;
                     for (source[pos] >= '0' && source[pos] <= '9') {
@@ -370,61 +368,46 @@ pub fun tokenize(source: str, alloc: *Allocator, file_id: src.FileId) Result[Tok
         }
         or {
             tok = token.make(token.KIND_ERROR, pos, 1);
-            var lex_code: u8 = LEX_ERR_UNEXPECTED_CHAR;
-            if (c < 0x20 || c == 0x7f) { lex_code = LEX_ERR_CONTROL_CHAR; }
-            val r_err: Result[bool, str] = push_error(?stream, alloc, pos, 1, lex_code);
-            if (is_err[bool, str](r_err)) {
-                deallocate[token.Token](alloc, stream.tokens, stream.cap);
-                ret err[TokenStream, str](unwrap_err[bool, str](r_err));
+            var code: LexErrorCode = LEX_ERR_UNEXPECTED_CHAR;
+            if (c < 0x20 || c == 0x7f) { code = LEX_ERR_CONTROL_CHAR; }
+            val res_err: R.Result[bool, str] = error_add(?stream, alloc, pos, 1, code);
+            if (R.is_err[bool, str](res_err)) {
+                dnit(?stream, alloc);
+                ret R.err[TokenStream, str](R.unwrap_err[bool, str](res_err));
             }
             pos = pos + 1;
         }
 
-        val r_push: Result[bool, str] = push_token(?stream, alloc, tok);
-        if (is_err[bool, str](r_push)) {
-            ret err[TokenStream, str](unwrap_err[bool, str](r_push));
+        val res_push: R.Result[bool, str] = token_add(?stream, alloc, tok);
+        if (R.is_err[bool, str](res_push)) {
+            dnit(?stream, alloc);
+            ret R.err[TokenStream, str](R.unwrap_err[bool, str](res_push));
         }
     }
 
-    val r_eof: Result[bool, str] = push_token(?stream, alloc, token.make(token.KIND_EOF, pos, 0));
-    if (is_err[bool, str](r_eof)) {
-        ret err[TokenStream, str](unwrap_err[bool, str](r_eof));
+    val res_eof: R.Result[bool, str] = token_add(?stream, alloc, token.make(token.KIND_EOF, pos, 0));
+    if (R.is_err[bool, str](res_eof)) {
+        dnit(?stream, alloc);
+        ret R.err[TokenStream, str](R.unwrap_err[bool, str](res_eof));
     }
 
-    ret ok[TokenStream, str](stream);
+    ret R.ok[TokenStream, str](stream);
 }
 
-# push_token: append a token to the stream, growing the buffer (doubling) when
-# full. on allocation failure the token buffer is freed and the error returned
-# (the caller's error path frees the rest of the stream).
-fun push_token(stream: *TokenStream, alloc: *Allocator, tok: token.Token) Result[bool, str] {
-    if (stream.len == stream.cap) {
-        val r: Result[*token.Token, str] = pool.grow[token.Token](alloc, stream.tokens, stream.cap, INITIAL_CAP, ?stream.cap);
-        if (is_err[*token.Token, str](r)) {
-            deallocate[token.Token](alloc, stream.tokens, stream.cap);
-            ret err[bool, str](unwrap_err[*token.Token, str](r));
-        }
-        stream.tokens = unwrap_ok[*token.Token, str](r);
-    }
-    stream.tokens[stream.len] = tok;
-    stream.len = stream.len + 1;
-    ret ok[bool, str](true);
-}
-
-# dnit: releases the token and error buffers and clears the stream.
+# release the token, error, and comment buffers and clear the stream
 # ---
-# stream: the stream to tear down; all fields are zeroed
-# alloc:  the allocator originally passed to tokenize
-pub fun dnit(stream: *TokenStream, alloc: *Allocator) {
+# stream: stream to tear down; every field is zeroed
+# alloc:  allocator originally passed to tokenize
+pub fun dnit(stream: *TokenStream, alloc: *A.Allocator) {
     if (stream == nil) { ret; }
     if (stream.tokens != nil && stream.cap > 0) {
-        deallocate[token.Token](alloc, stream.tokens, stream.cap);
+        A.deallocate[token.Token](alloc, stream.tokens, stream.cap);
     }
     if (stream.errors != nil && stream.error_cap > 0) {
-        deallocate[LexError](alloc, stream.errors, stream.error_cap);
+        A.deallocate[LexError](alloc, stream.errors, stream.error_cap);
     }
     if (stream.comments != nil && stream.comment_cap > 0) {
-        deallocate[CommentRun](alloc, stream.comments, stream.comment_cap);
+        A.deallocate[CommentRun](alloc, stream.comments, stream.comment_cap);
     }
     stream.tokens      = nil;
     stream.len         = 0;
@@ -437,97 +420,22 @@ pub fun dnit(stream: *TokenStream, alloc: *Allocator) {
     stream.comment_cap = 0;
 }
 
-# text: returns a length-counted view into the source buffer covering the token's span.
+# return a length-counted view into the source covering a token's span
 # ---
 # stream: stream whose source the token belongs to
 # tok:    token to extract text for
-# ret:    view into the source buffer; valid for the source buffer's lifetime
-pub fun text(stream: *TokenStream, tok: token.Token) strutil.StrView {
-    ret strutil.view(?stream.source[tok.span.offset], tok.span.len);
+# ret:    a view into the source buffer, valid for the source buffer's lifetime
+pub fun token_text(stream: *TokenStream, tok: token.Token) StrView {
+    ret view(?stream.source[tok.span.offset], tok.span.len);
 }
 
-# err_message: the human-readable message for a LEX_ERR_* code.
-# ---
-# code: one of the LEX_ERR_* constants
-# ret:  a static message describing the malformed-input category
-fun err_message(code: u8) str {
-    if (code == LEX_ERR_UNTERMINATED_STR)  { ret "unterminated string literal"; }
-    if (code == LEX_ERR_UNTERMINATED_CHAR) { ret "unterminated character literal"; }
-    if (code == LEX_ERR_CONTROL_CHAR)      { ret "stray control character in source; only printable ASCII and whitespace are allowed"; }
-    ret "unexpected character; only ASCII source text is supported";
-}
-
-# emit_diagnostics: push every accumulated lex error onto a diagnostic sink
-# as a SEVERITY_ERROR carrying the error's span and the stream's file id.
-# the lexer records malformed input on the stream rather than aborting, and
-# the parser never reads that buffer, so a caller wanting complete
-# diagnostics for a buffer must drain the lex errors through this before
-# tearing the stream down. a no-op when the stream has no errors.
-# ---
-# stream: the lexed stream whose errors are drained
-# diags:  diagnostic sink the lex errors are appended to
-# ret:    true on success, or the first allocation error from the sink
-pub fun emit_diagnostics(stream: *TokenStream, diags: *diag.DiagList) Result[bool, str] {
-    var i: usize = 0;
-    for (i < stream.error_len) {
-        val e: *LexError = ?stream.errors[i];
-        val r: Result[bool, str] = diag.error(diags, stream.file_id, e.span, err_message(e.code));
-        if (is_err[bool, str](r)) { ret r; }
-        i = i + 1;
-    }
-    ret ok[bool, str](true);
-}
-
-# record_comment: fold one `#` comment line into the stream's comment runs. when
-# the line sits directly under the previous run's last line the run is extended
-# (its span and end_line grow to cover this line); otherwise a new run begins. on
-# allocation failure the comment buffer is freed and the error returned.
-# ---
-# stream: stream whose comment runs are updated
-# alloc:  allocator backing the comment buffer
-# start:  byte offset of the `#` opening this comment line
-# end:    byte offset just past the comment line (exclusive of any newline)
-# line:   1-based source line of this comment line
-# ret:    true on success, or an allocation error
-fun record_comment(stream: *TokenStream, alloc: *Allocator, start: usize, end: usize, line: usize) Result[bool, str] {
-    if (stream.comment_len > 0) {
-        val last: *CommentRun = ?stream.comments[stream.comment_len - 1];
-        if (line == last.end_line + 1) {
-            last.span.len = end - last.span.offset;
-            last.end_line = line;
-            ret ok[bool, str](true);
-        }
-    }
-
-    if (stream.comment_len == stream.comment_cap) {
-        val r: Result[*CommentRun, str] = pool.grow[CommentRun](alloc, stream.comments, stream.comment_cap, INITIAL_COMMENT_CAP, ?stream.comment_cap);
-        if (is_err[*CommentRun, str](r)) {
-            if (stream.comments != nil && stream.comment_cap > 0) {
-                deallocate[CommentRun](alloc, stream.comments, stream.comment_cap);
-            }
-            stream.comments    = nil;
-            stream.comment_cap = 0;
-            ret err[bool, str](unwrap_err[*CommentRun, str](r));
-        }
-        stream.comments = unwrap_ok[*CommentRun, str](r);
-    }
-
-    var run: CommentRun;
-    run.span.offset = start;
-    run.span.len    = end - start;
-    run.start_line  = line;
-    run.end_line    = line;
-    stream.comments[stream.comment_len] = run;
-    stream.comment_len = stream.comment_len + 1;
-    ret ok[bool, str](true);
-}
-
-# doc_run_above: the byte span of the comment run whose last line sits directly
-# above the declaration starting at `decl_offset`, or an empty span (len 0) when
-# no comment run abuts it. the parser passes the offset of a declaration's first
-# leading token — its first `#[...]` decorator when decorators are present, else
-# the keyword — so the run found is the doc block above the whole declaration
-# unit, with any attribute lines (which are tokens, not comments) skipped.
+# the byte span of the comment run whose last line sits directly above the
+# declaration at `decl_offset`, or a zero-length span when none abuts it
+#
+# The parser passes the offset of a declaration's first leading token - its
+# first `#[...]` decorator when decorators are present, else the keyword - so the
+# run found is the doc block above the whole declaration unit, with attribute
+# lines (which are tokens, not comments) skipped.
 # ---
 # stream:      lexed stream whose comment runs are searched
 # decl_offset: byte offset of the declaration's first leading token
@@ -537,49 +445,82 @@ pub fun doc_run_above(stream: *TokenStream, decl_offset: usize) token.Span {
     empty.offset = 0;
     empty.len    = 0;
 
-    if (stream.comment_len == 0) { ret empty; }
-
-    val decl_line: usize = line_at(stream.source, decl_offset);
-
     var i: usize = stream.comment_len;
     for (i > 0) {
         i = i - 1;
-        val run: *CommentRun = ?stream.comments[i];
-        if (run.end_line + 1 == decl_line) { ret run.span; }
-        # runs are stored in source order; once a run ends above the decl line we
-        # can stop — earlier runs end even higher.
-        if (run.end_line < decl_line) { ret empty; }
+        val run:     *CommentRun = ?stream.comments[i];
+        val run_end: usize       = run.span.offset + run.span.len;
+        # skip comment runs at or below the decl; the doc block sits above it.
+        if (run_end > decl_offset) { cnt; }
+        # the nearest run ending above the decl abuts it iff exactly one newline
+        # separates the run's last line from the decl's line. earlier runs end
+        # higher still, so none can abut once this one does not.
+        if (newlines_capped(stream.source, run_end, decl_offset) == 1) { ret run.span; }
+        ret empty;
     }
     ret empty;
 }
 
-# line_at: the 1-based source line containing byte `offset`, counting newlines
-# from the start of `source`. used by doc_run_above to place a declaration's
-# first token relative to the recorded comment runs.
-fun line_at(source: str, offset: usize) usize {
-    var line: usize = 1;
-    var i:    usize = 0;
-    for (i < offset && source[i] != 0) {
-        if (source[i] == '\n') { line = line + 1; }
+# push every accumulated lex error onto a diagnostic sink
+#
+# Each error becomes a SEVERITY_ERROR carrying its span and the stream's file id.
+# The lexer records malformed input on the stream rather than aborting, and the
+# parser never reads that buffer, so a caller wanting complete diagnostics must
+# drain the lex errors through this before tearing the stream down. A no-op when
+# the stream has no errors.
+# ---
+# stream: lexed stream whose errors are drained
+# diags:  diagnostic sink the lex errors are appended to
+# ret:    true on success, or the first allocation error from the sink
+pub fun emit_diagnostics(stream: *TokenStream, diags: *diagnostic.DiagList) R.Result[bool, str] {
+    var i: usize = 0;
+    for (i < stream.error_len) {
+        val e:   *LexError           = ?stream.errors[i];
+        val res: R.Result[bool, str] = diagnostic.error(diags, stream.file_id, e.span, error_message(e.code));
+        if (R.is_err[bool, str](res)) { ret res; }
         i = i + 1;
     }
-    ret line;
+    ret R.ok[bool, str](true);
 }
 
-fun push_error(stream: *TokenStream, alloc: *Allocator, offset: usize, len: usize, code: u8) Result[bool, str] {
-    if (stream.error_len == stream.error_cap) {
-        val r: Result[*LexError, str] = pool.grow[LexError](alloc, stream.errors, stream.error_cap, INITIAL_ERROR_CAP, ?stream.error_cap);
-        if (is_err[*LexError, str](r)) {
-            # free the existing error buffer (if any) since the caller's error
-            # path only tears down the token buffer.
-            if (stream.errors != nil && stream.error_cap > 0) {
-                deallocate[LexError](alloc, stream.errors, stream.error_cap);
-            }
-            stream.errors    = nil;
-            stream.error_cap = 0;
-            ret err[bool, str](unwrap_err[*LexError, str](r));
+# append a token to the stream, doubling the token buffer when it is full
+#
+# On allocation failure the stream is left intact for the caller to tear down.
+# ---
+# stream: stream the token is appended to
+# alloc:  allocator backing the token buffer
+# tok:    token to append
+# ret:    true on success, or an allocation error
+fun token_add(stream: *TokenStream, alloc: *A.Allocator, tok: token.Token) R.Result[bool, str] {
+    if (stream.len == stream.cap) {
+        val res_grow: R.Result[*token.Token, str] = pool.grow[token.Token](alloc, stream.tokens, stream.cap, INITIAL_TOKEN_CAP, ?stream.cap);
+        if (R.is_err[*token.Token, str](res_grow)) {
+            ret R.err[bool, str](R.unwrap_err[*token.Token, str](res_grow));
         }
-        stream.errors = unwrap_ok[*LexError, str](r);
+        stream.tokens = R.unwrap_ok[*token.Token, str](res_grow);
+    }
+    stream.tokens[stream.len] = tok;
+    stream.len = stream.len + 1;
+    ret R.ok[bool, str](true);
+}
+
+# append a lex error to the stream, doubling the error buffer when it is full
+#
+# On allocation failure the stream is left intact for the caller to tear down.
+# ---
+# stream: stream the error is appended to
+# alloc:  allocator backing the error buffer
+# offset: byte offset of the malformed span
+# len:    byte length of the malformed span
+# code:   which malformed-input category this error is
+# ret:    true on success, or an allocation error
+fun error_add(stream: *TokenStream, alloc: *A.Allocator, offset: usize, len: usize, code: LexErrorCode) R.Result[bool, str] {
+    if (stream.error_len == stream.error_cap) {
+        val res_grow: R.Result[*LexError, str] = pool.grow[LexError](alloc, stream.errors, stream.error_cap, INITIAL_ERROR_CAP, ?stream.error_cap);
+        if (R.is_err[*LexError, str](res_grow)) {
+            ret R.err[bool, str](R.unwrap_err[*LexError, str](res_grow));
+        }
+        stream.errors = R.unwrap_ok[*LexError, str](res_grow);
     }
 
     var e: LexError;
@@ -588,8 +529,109 @@ fun push_error(stream: *TokenStream, alloc: *Allocator, offset: usize, len: usiz
     e.code        = code;
     stream.errors[stream.error_len] = e;
     stream.error_len = stream.error_len + 1;
+    ret R.ok[bool, str](true);
+}
 
-    ret ok[bool, str](true);
+# fold one `#` comment line into the stream's comment runs
+#
+# When the line sits directly under the previous run's last line the run is
+# extended to cover it; otherwise a new run begins. On allocation failure the
+# stream is left intact for the caller to tear down.
+# ---
+# stream: stream whose comment runs are updated
+# alloc:  allocator backing the comment buffer
+# start:  byte offset of the `#` opening this comment line
+# end:    byte offset just past the comment line, exclusive of any newline
+# line:   1-based source line of this comment line
+# ret:    true on success, or an allocation error
+fun comment_add(stream: *TokenStream, alloc: *A.Allocator, start: usize, end: usize, line: usize) R.Result[bool, str] {
+    if (stream.comment_len > 0) {
+        val last: *CommentRun = ?stream.comments[stream.comment_len - 1];
+        if (line == last.end_line + 1) {
+            last.span.len = end - last.span.offset;
+            last.end_line = line;
+            ret R.ok[bool, str](true);
+        }
+    }
+
+    if (stream.comment_len == stream.comment_cap) {
+        val res_grow: R.Result[*CommentRun, str] = pool.grow[CommentRun](alloc, stream.comments, stream.comment_cap, INITIAL_COMMENT_CAP, ?stream.comment_cap);
+        if (R.is_err[*CommentRun, str](res_grow)) {
+            ret R.err[bool, str](R.unwrap_err[*CommentRun, str](res_grow));
+        }
+        stream.comments = R.unwrap_ok[*CommentRun, str](res_grow);
+    }
+
+    var run: CommentRun;
+    run.span.offset = start;
+    run.span.len    = end - start;
+    run.start_line  = line;
+    run.end_line    = line;
+    stream.comments[stream.comment_len] = run;
+    stream.comment_len = stream.comment_len + 1;
+    ret R.ok[bool, str](true);
+}
+
+# the human-readable message for a LEX_ERR_* code
+# ---
+# code: one of the LEX_ERR_* constants
+# ret:  a static message describing the malformed-input category
+fun error_message(code: LexErrorCode) str {
+    if (code == LEX_ERR_UNTERMINATED_STR)  { ret "unterminated string literal"; }
+    if (code == LEX_ERR_UNTERMINATED_CHAR) { ret "unterminated character literal"; }
+    if (code == LEX_ERR_CONTROL_CHAR)      { ret "stray control character in source; only printable ASCII and whitespace are allowed"; }
+    ret "unexpected character; only ASCII source text is supported";
+}
+
+# the number of newlines in source[start..end), saturated at 2
+#
+# doc_run_above only needs to tell "directly above" (one newline) apart from "a
+# blank line or more between" (two or more), so the scan stops at the second
+# newline. It is therefore bounded by at most two source lines, no matter how far
+# the comment run sits from the start of the file.
+# ---
+# source: source text being scanned
+# start:  byte offset to count from, inclusive
+# end:    byte offset to count to, exclusive
+# ret:    the newline count, saturated at 2
+fun newlines_capped(source: str, start: usize, end: usize) usize {
+    var n: usize = 0;
+    var i: usize = start;
+    for (i < end && source[i] != 0) {
+        if (source[i] == '\n') {
+            n = n + 1;
+            if (n == 2) { ret 2; }
+        }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# map a single-byte punctuation character to its token kind
+# ---
+# c:   candidate source byte
+# ret: the one-byte token kind, or KIND_ERROR when c is not single-byte punctuation
+fun punct_kind(c: u8) token.Kind {
+    if (c == '(') { ret token.KIND_LPAREN; }
+    if (c == ')') { ret token.KIND_RPAREN; }
+    if (c == '{') { ret token.KIND_LBRACE; }
+    if (c == '}') { ret token.KIND_RBRACE; }
+    if (c == '[') { ret token.KIND_LBRACKET; }
+    if (c == ']') { ret token.KIND_RBRACKET; }
+    if (c == ';') { ret token.KIND_SEMI; }
+    if (c == ',') { ret token.KIND_COMMA; }
+    if (c == '?') { ret token.KIND_QUESTION; }
+    if (c == '@') { ret token.KIND_AT; }
+    if (c == '$') { ret token.KIND_DOLLAR; }
+    if (c == '~') { ret token.KIND_TILDE; }
+    if (c == '+') { ret token.KIND_PLUS; }
+    if (c == '-') { ret token.KIND_MINUS; }
+    if (c == '*') { ret token.KIND_STAR; }
+    if (c == '/') { ret token.KIND_SLASH; }
+    if (c == '%') { ret token.KIND_PERCENT; }
+    if (c == '^') { ret token.KIND_CARET; }
+    if (c == '`') { ret token.KIND_BACKTICK; }
+    ret token.KIND_ERROR;
 }
 
 # reports whether the byte at pos begins a scientific-notation exponent
@@ -608,102 +650,118 @@ fun is_exponent_start(source: str, pos: usize) bool {
     ret source[next] >= '0' && source[next] <= '9';
 }
 
+# reports whether c can begin an identifier
+# ---
+# c:   candidate byte
+# ret: true for an ASCII letter or underscore
 fun is_ident_start(c: u8) bool {
     ret (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
 }
 
+# reports whether c can continue an identifier
+# ---
+# c:   candidate byte
+# ret: true for an identifier-start byte or an ASCII digit
 fun is_ident_char(c: u8) bool {
     ret is_ident_start(c) || (c >= '0' && c <= '9');
 }
 
+# reports whether c is a hexadecimal digit
+# ---
+# c:   candidate byte
+# ret: true for 0-9, a-f, or A-F
 fun is_hex_char(c: u8) bool {
     ret (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
-test "lexer: emit_diagnostics drains lex errors onto the sink" {
-    var alloc: Allocator;
+# emit_diagnostics drains the recorded lex errors onto a diagnostic sink. a
+# stray backslash is not a valid token, so the lexer records it rather than
+# aborting and the drain surfaces it as a diagnostic.
+test "mach.lang.fe.lexer.emit_diagnostics:drains_to_sink" {
+    var alloc: A.Allocator;
     page.make(?alloc);
 
-    # a backslash is not a valid token; the lexer records it as a lex error
-    # rather than aborting, and emit_diagnostics surfaces it as a diagnostic.
-    val tr: Result[TokenStream, str] = tokenize("a \\ b", ?alloc, 0::src.FileId);
-    if (is_err[TokenStream, str](tr)) { ret 1; }
-    var stream: TokenStream = unwrap_ok[TokenStream, str](tr);
+    val tr: R.Result[TokenStream, str] = tokenize("a \\ b", ?alloc, 0::src.FileId);
+    if (R.is_err[TokenStream, str](tr)) { ret 1; }
+    var stream: TokenStream = R.unwrap_ok[TokenStream, str](tr);
     if (stream.error_len == 0) { dnit(?stream, ?alloc); ret 1; }
 
-    var diags: diag.DiagList = diag.init(?alloc);
-    val er: Result[bool, str] = emit_diagnostics(?stream, ?diags);
-    if (is_err[bool, str](er)) { dnit(?stream, ?alloc); diag.dnit(?diags); ret 1; }
+    var diags: diagnostic.DiagList = diagnostic.init(?alloc);
+    val er: R.Result[bool, str] = emit_diagnostics(?stream, ?diags);
+    if (R.is_err[bool, str](er)) { dnit(?stream, ?alloc); diagnostic.dnit(?diags); ret 1; }
 
-    if (diags.len != stream.error_len) { dnit(?stream, ?alloc); diag.dnit(?diags); ret 1; }
-    if (diags.items[0].severity != diag.SEVERITY_ERROR) { dnit(?stream, ?alloc); diag.dnit(?diags); ret 1; }
-    if (diags.items[0].span.offset != 2) { dnit(?stream, ?alloc); diag.dnit(?diags); ret 1; }
+    if (diags.len != stream.error_len)                        { dnit(?stream, ?alloc); diagnostic.dnit(?diags); ret 1; }
+    if (diags.items[0].severity != diagnostic.SEVERITY_ERROR) { dnit(?stream, ?alloc); diagnostic.dnit(?diags); ret 1; }
+    if (diags.items[0].span.offset != 2)                      { dnit(?stream, ?alloc); diagnostic.dnit(?diags); ret 1; }
 
-    diag.dnit(?diags);
+    diagnostic.dnit(?diags);
     dnit(?stream, ?alloc);
     ret 0;
 }
 
-test "lexer: 0b and 0o integer prefixes produce correct token spans (#1242)" {
-    var alloc: Allocator;
+# the 0b and 0o radix prefixes produce tokens whose spans cover the whole literal
+test "mach.lang.fe.lexer.tokenize:radix_prefix_spans" {
+    var alloc: A.Allocator;
     page.make(?alloc);
 
-    val tr: Result[TokenStream, str] = tokenize("0b1010 0o755 0xFF", ?alloc, 0::src.FileId);
-    if (is_err[TokenStream, str](tr)) { ret 1; }
-    var stream: TokenStream = unwrap_ok[TokenStream, str](tr);
+    val tr: R.Result[TokenStream, str] = tokenize("0b1010 0o755 0xFF", ?alloc, 0::src.FileId);
+    if (R.is_err[TokenStream, str](tr)) { ret 1; }
+    var stream: TokenStream = R.unwrap_ok[TokenStream, str](tr);
 
     var rc: i32 = 0;
     # 3 integer tokens + EOF = 4
-    if (stream.len != 4)        { rc = 1; }
-    or (stream.error_len != 0)  { rc = 1; }
+    if (stream.len != 4)       { rc = 1; }
+    or (stream.error_len != 0) { rc = 1; }
     or {
         if (stream.tokens[0].kind != token.KIND_LIT_INT) { rc = 1; }
-        or (stream.tokens[0].span.offset != 0) { rc = 1; }
-        or (stream.tokens[0].span.len    != 6) { rc = 1; }
+        or (stream.tokens[0].span.offset != 0)           { rc = 1; }
+        or (stream.tokens[0].span.len    != 6)           { rc = 1; }
         or (stream.tokens[1].kind != token.KIND_LIT_INT) { rc = 1; }
-        or (stream.tokens[1].span.offset != 7) { rc = 1; }
-        or (stream.tokens[1].span.len    != 5) { rc = 1; }
+        or (stream.tokens[1].span.offset != 7)           { rc = 1; }
+        or (stream.tokens[1].span.len    != 5)           { rc = 1; }
         or (stream.tokens[2].kind != token.KIND_LIT_INT) { rc = 1; }
-        or (stream.tokens[2].span.len    != 4) { rc = 1; }
+        or (stream.tokens[2].span.len    != 4)           { rc = 1; }
     }
 
     dnit(?stream, ?alloc);
     ret rc;
 }
 
-test "lexer: a backtick lexes as KIND_BACKTICK (#1476)" {
-    var alloc: Allocator;
+# a backtick lexes as a real KIND_BACKTICK token, not a lex error
+test "mach.lang.fe.lexer.tokenize:backtick" {
+    var alloc: A.Allocator;
     page.make(?alloc);
 
-    val tr: Result[TokenStream, str] = tokenize("`", ?alloc, 0::src.FileId);
-    if (is_err[TokenStream, str](tr)) { ret 1; }
-    var stream: TokenStream = unwrap_ok[TokenStream, str](tr);
+    val tr: R.Result[TokenStream, str] = tokenize("`", ?alloc, 0::src.FileId);
+    if (R.is_err[TokenStream, str](tr)) { ret 1; }
+    var stream: TokenStream = R.unwrap_ok[TokenStream, str](tr);
 
     var rc: i32 = 0;
-    # one backtick token + EOF = 2, with no lex error (it is a real token now)
+    # one backtick token + EOF = 2, with no lex error
     if (stream.len != 2)       { rc = 1; }
     or (stream.error_len != 0) { rc = 1; }
     or {
         if (stream.tokens[0].kind != token.KIND_BACKTICK) { rc = 1; }
-        or (stream.tokens[0].span.offset != 0) { rc = 1; }
-        or (stream.tokens[0].span.len    != 1) { rc = 1; }
+        or (stream.tokens[0].span.offset != 0)            { rc = 1; }
+        or (stream.tokens[0].span.len    != 1)            { rc = 1; }
     }
 
     dnit(?stream, ?alloc);
     ret rc;
 }
 
-test "lexer: `#[` lexes as KIND_ATTR_OPEN while a spaced `#` stays a comment (#1532)" {
-    var alloc: Allocator;
+# `#[` opens an attribute (KIND_ATTR_OPEN) while a spaced `# [` stays a comment
+test "mach.lang.fe.lexer.tokenize:attr_open_vs_comment" {
+    var alloc: A.Allocator;
     page.make(?alloc);
 
     # (1) `#[` opens an attribute: a single 2-byte token then EOF, no lex error
-    val tr1: Result[TokenStream, str] = tokenize("#[", ?alloc, 0::src.FileId);
-    if (is_err[TokenStream, str](tr1)) { ret 1; }
-    var s1: TokenStream = unwrap_ok[TokenStream, str](tr1);
+    val tr1: R.Result[TokenStream, str] = tokenize("#[", ?alloc, 0::src.FileId);
+    if (R.is_err[TokenStream, str](tr1)) { ret 1; }
+    var s1: TokenStream = R.unwrap_ok[TokenStream, str](tr1);
     var rc: i32 = 0;
-    if (s1.len != 2)        { rc = 1; }
-    or (s1.error_len != 0)  { rc = 1; }
+    if (s1.len != 2)       { rc = 1; }
+    or (s1.error_len != 0) { rc = 1; }
     or {
         if (s1.tokens[0].kind != token.KIND_ATTR_OPEN) { rc = 1; }
         or (s1.tokens[0].span.offset != 0)             { rc = 1; }
@@ -713,31 +771,33 @@ test "lexer: `#[` lexes as KIND_ATTR_OPEN while a spaced `#` stays a comment (#1
     if (rc != 0) { ret rc; }
 
     # (2) `# [...]` with a space is still a line comment: only EOF survives
-    val tr2: Result[TokenStream, str] = tokenize("# [not an attr]", ?alloc, 0::src.FileId);
-    if (is_err[TokenStream, str](tr2)) { ret 1; }
-    var s2: TokenStream = unwrap_ok[TokenStream, str](tr2);
+    val tr2: R.Result[TokenStream, str] = tokenize("# [not an attr]", ?alloc, 0::src.FileId);
+    if (R.is_err[TokenStream, str](tr2)) { ret 1; }
+    var s2: TokenStream = R.unwrap_ok[TokenStream, str](tr2);
     if (s2.len != 1)                         { rc = 1; }
     or (s2.tokens[0].kind != token.KIND_EOF) { rc = 1; }
     dnit(?s2, ?alloc);
     if (rc != 0) { ret rc; }
 
     # (3) a plain `#` comment runs to EOL; the token on the next line still lexes
-    val tr3: Result[TokenStream, str] = tokenize("# comment\nval", ?alloc, 0::src.FileId);
-    if (is_err[TokenStream, str](tr3)) { ret 1; }
-    var s3: TokenStream = unwrap_ok[TokenStream, str](tr3);
+    val tr3: R.Result[TokenStream, str] = tokenize("# comment\nval", ?alloc, 0::src.FileId);
+    if (R.is_err[TokenStream, str](tr3)) { ret 1; }
+    var s3: TokenStream = R.unwrap_ok[TokenStream, str](tr3);
     if (s3.tokens[0].kind != token.KIND_IDENT) { rc = 1; }
     dnit(?s3, ?alloc);
     ret rc;
 }
 
-test "lexer: char literal, escape in char, and unterminated char recovery (#1242)" {
-    var alloc: Allocator;
+# char literals lex with the right span, escapes are counted, and an
+# unterminated char recovers at the newline so the next token still lexes
+test "mach.lang.fe.lexer.tokenize:char_literal_recovery" {
+    var alloc: A.Allocator;
     page.make(?alloc);
 
     # (1) plain char literal: span covers all 3 bytes, no error
-    val tr1: Result[TokenStream, str] = tokenize("'a'", ?alloc, 0::src.FileId);
-    if (is_err[TokenStream, str](tr1)) { ret 1; }
-    var s1: TokenStream = unwrap_ok[TokenStream, str](tr1);
+    val tr1: R.Result[TokenStream, str] = tokenize("'a'", ?alloc, 0::src.FileId);
+    if (R.is_err[TokenStream, str](tr1)) { ret 1; }
+    var s1: TokenStream = R.unwrap_ok[TokenStream, str](tr1);
     var rc: i32 = 0;
     if (s1.tokens[0].kind     != token.KIND_LIT_CHAR) { rc = 1; }
     or (s1.tokens[0].span.len != 3)                   { rc = 1; }
@@ -745,10 +805,10 @@ test "lexer: char literal, escape in char, and unterminated char recovery (#1242
     dnit(?s1, ?alloc);
     if (rc != 0) { ret rc; }
 
-    # (2) escape sequence in char literal: '\n' spans 4 bytes ('\\','n' plus quotes), no error
-    val tr2: Result[TokenStream, str] = tokenize("'\\n'", ?alloc, 0::src.FileId);
-    if (is_err[TokenStream, str](tr2)) { ret 1; }
-    var s2: TokenStream = unwrap_ok[TokenStream, str](tr2);
+    # (2) escape sequence in char literal: '\n' spans 4 bytes ('\\','n' plus quotes)
+    val tr2: R.Result[TokenStream, str] = tokenize("'\\n'", ?alloc, 0::src.FileId);
+    if (R.is_err[TokenStream, str](tr2)) { ret 1; }
+    var s2: TokenStream = R.unwrap_ok[TokenStream, str](tr2);
     if (s2.tokens[0].kind     != token.KIND_LIT_CHAR) { rc = 1; }
     or (s2.tokens[0].span.len != 4)                   { rc = 1; }
     or (s2.error_len          != 0)                   { rc = 1; }
@@ -757,31 +817,31 @@ test "lexer: char literal, escape in char, and unterminated char recovery (#1242
 
     # (3) unterminated char: scan stops at the embedded newline; recovery
     # continues so the subsequent `val` identifier is still lexed
-    val tr3: Result[TokenStream, str] = tokenize("'x\nval b: u8 = 1;", ?alloc, 0::src.FileId);
-    if (is_err[TokenStream, str](tr3)) { ret 1; }
-    var s3: TokenStream = unwrap_ok[TokenStream, str](tr3);
-    if (s3.error_len                  != 1)                         { rc = 1; }
-    or (s3.errors[0].code             != LEX_ERR_UNTERMINATED_CHAR) { rc = 1; }
-    or (s3.tokens[1].kind             != token.KIND_IDENT)          { rc = 1; }
+    val tr3: R.Result[TokenStream, str] = tokenize("'x\nval b: u8 = 1;", ?alloc, 0::src.FileId);
+    if (R.is_err[TokenStream, str](tr3)) { ret 1; }
+    var s3: TokenStream = R.unwrap_ok[TokenStream, str](tr3);
+    if (s3.error_len      != 1)                         { rc = 1; }
+    or (s3.errors[0].code != LEX_ERR_UNTERMINATED_CHAR) { rc = 1; }
+    or (s3.tokens[1].kind != token.KIND_IDENT)          { rc = 1; }
     dnit(?s3, ?alloc);
     ret rc;
 }
 
-test "lexer: a string literal stops at a newline and is reported unterminated (#1247)" {
-    var alloc: Allocator;
+# a string literal stops at the first newline, is reported unterminated, and the
+# token on the next line still lexes so the missing quote does not swallow it
+test "mach.lang.fe.lexer.tokenize:string_unterminated_at_newline" {
+    var alloc: A.Allocator;
     page.make(?alloc);
 
-    # the missing closing quote on line one must not swallow line two: the scan
-    # stops at the newline, records LEX_ERR_UNTERMINATED_STR, and `b` still lexes.
-    val tr: Result[TokenStream, str] = tokenize("\"line one\nval b: u8 = 1;", ?alloc, 0::src.FileId);
-    if (is_err[TokenStream, str](tr)) { ret 1; }
-    var stream: TokenStream = unwrap_ok[TokenStream, str](tr);
+    val tr: R.Result[TokenStream, str] = tokenize("\"line one\nval b: u8 = 1;", ?alloc, 0::src.FileId);
+    if (R.is_err[TokenStream, str](tr)) { ret 1; }
+    var stream: TokenStream = R.unwrap_ok[TokenStream, str](tr);
 
-    if (stream.error_len != 1) { dnit(?stream, ?alloc); ret 1; }
+    if (stream.error_len != 1)                             { dnit(?stream, ?alloc); ret 1; }
     if (stream.errors[0].code != LEX_ERR_UNTERMINATED_STR) { dnit(?stream, ?alloc); ret 1; }
     # the string token spans only line one (offset 0 up to the newline at 9)
     if (stream.tokens[0].kind != token.KIND_LIT_STR) { dnit(?stream, ?alloc); ret 1; }
-    if (stream.tokens[0].span.len != 9) { dnit(?stream, ?alloc); ret 1; }
+    if (stream.tokens[0].span.len != 9)              { dnit(?stream, ?alloc); ret 1; }
     # the next token is the `val` keyword on line two, proving recovery
     if (stream.tokens[1].kind != token.KIND_IDENT) { dnit(?stream, ?alloc); ret 1; }
 
@@ -789,45 +849,43 @@ test "lexer: a string literal stops at a newline and is reported unterminated (#
     ret 0;
 }
 
-test "lexer: consecutive comment lines fold into one run, a gap splits runs" {
-    var alloc: Allocator;
+# two stacked comment lines fold into one run; a blank line splits the third off
+# into its own run
+test "mach.lang.fe.lexer.comment_add:run_folding" {
+    var alloc: A.Allocator;
     page.make(?alloc);
 
-    # two comment lines directly stacked, then a blank line, then a third comment:
-    # the first two fold into one run; the blank line breaks it so the third is
-    # its own run.
-    val tr: Result[TokenStream, str] = tokenize("# a\n# b\n\n# c\nval x: i64 = 1;", ?alloc, 0::src.FileId);
-    if (is_err[TokenStream, str](tr)) { ret 1; }
-    var stream: TokenStream = unwrap_ok[TokenStream, str](tr);
+    val tr: R.Result[TokenStream, str] = tokenize("# a\n# b\n\n# c\nval x: i64 = 1;", ?alloc, 0::src.FileId);
+    if (R.is_err[TokenStream, str](tr)) { ret 1; }
+    var stream: TokenStream = R.unwrap_ok[TokenStream, str](tr);
 
     var rc: i32 = 0;
     if (stream.comment_len != 2) { rc = 1; }
     or {
         # run 0 spans "# a\n# b" (offset 0, lines 1..2)
-        if (stream.comments[0].start_line != 1) { rc = 1; }
-        or (stream.comments[0].end_line  != 2) { rc = 1; }
+        if (stream.comments[0].start_line != 1)  { rc = 1; }
+        or (stream.comments[0].end_line  != 2)   { rc = 1; }
         or (stream.comments[0].span.offset != 0) { rc = 1; }
-        or (stream.comments[0].span.len  != 7) { rc = 1; }
+        or (stream.comments[0].span.len  != 7)   { rc = 1; }
         # run 1 is the lone "# c" on line 4
         or (stream.comments[1].start_line != 4) { rc = 1; }
-        or (stream.comments[1].end_line  != 4) { rc = 1; }
+        or (stream.comments[1].end_line  != 4)  { rc = 1; }
     }
 
     dnit(?stream, ?alloc);
     ret rc;
 }
 
-test "lexer: doc_run_above finds the run abutting a decl and skips attribute lines" {
-    var alloc: Allocator;
+# doc_run_above finds the comment run abutting a declaration and skips the
+# intervening `#[...]` attribute line, which is a token and not a comment
+test "mach.lang.fe.lexer.doc_run_above:skips_attribute_lines" {
+    var alloc: A.Allocator;
     page.make(?alloc);
 
-    # doc block, then a `#[...]` attribute line (a real token, never a comment),
-    # then the decl. the doc run ends on line 1; the decl unit's first token is
-    # the `#[` on line 2, so doc_run_above keyed on that offset finds the run.
     val source: str = "# the doc\n#[inline]\npub fun f() {}";
-    val tr: Result[TokenStream, str] = tokenize(source, ?alloc, 0::src.FileId);
-    if (is_err[TokenStream, str](tr)) { ret 1; }
-    var stream: TokenStream = unwrap_ok[TokenStream, str](tr);
+    val tr: R.Result[TokenStream, str] = tokenize(source, ?alloc, 0::src.FileId);
+    if (R.is_err[TokenStream, str](tr)) { ret 1; }
+    var stream: TokenStream = R.unwrap_ok[TokenStream, str](tr);
 
     var rc: i32 = 0;
     # exactly one comment run (the attribute is not a comment)
@@ -836,12 +894,12 @@ test "lexer: doc_run_above finds the run abutting a decl and skips attribute lin
         # the first non-comment token is the `#[` attribute opener at offset 10
         val attr_off: usize = stream.tokens[0].span.offset;
         if (stream.tokens[0].kind != token.KIND_ATTR_OPEN) { rc = 1; }
-        or (attr_off != 10) { rc = 1; }
+        or (attr_off != 10)                                { rc = 1; }
         or {
             val span: token.Span = doc_run_above(?stream, attr_off);
-            if (span.len == 0) { rc = 1; }
+            if (span.len == 0)    { rc = 1; }
             or (span.offset != 0) { rc = 1; }
-            or (span.len != 9) { rc = 1; }
+            or (span.len != 9)    { rc = 1; }
         }
         # a decl with no abutting comment yields an empty span
         val none_span: token.Span = doc_run_above(?stream, 999);

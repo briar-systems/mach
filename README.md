@@ -11,7 +11,7 @@ We have an official [Discord](https://discord.com/invite/dfWG9NhGj7)!
 
 # Overview
 
-Mach is a statically-typed, compiled systems language designed to be simple, fast, verbose, and intuitive. Mach is built for projects like compilers, runtimes, operating systems, tooling -- anywhere performance is a requirement and hidden behavior is a liability. The language is deliberately small and explicit: what you read is what executes, every cost is visible in the code that incurs it. Nothing happens by convention or inference.
+Mach is a self hosted, statically-typed, compiled systems language designed to be simple, fast, verbose, and intuitive. Mach was created for projects like compilers, runtimes, operating systems, tooling, and embedded systems -- anywhere performance is a requirement and hidden behavior is a liability. The language is deliberately small and explicit: what you read is what executes, every cost is visible in the code that incurs it.
 
 Mach does not rely on any external dependencies for the compiler or during runtime -- no LLVM, no linking to libc, no system linker or other tools. The entire compiler and all base language features are written in native Mach. 
 
@@ -41,9 +41,7 @@ On Windows (PowerShell):
 irm https://machlang.org/install.ps1 | iex
 ```
 
-The scripts verify the download against the release `SHA256SUMS` and install to
-`~/.local/bin` (`%LOCALAPPDATA%\mach\bin` on Windows). Precompiled binaries are
-also available directly on the [releases](https://github.com/octalide/mach/releases) page.
+Precompiled binaries are also available directly on the [releases](https://github.com/octalide/mach/releases) page.
 
 
 ## Building Mach

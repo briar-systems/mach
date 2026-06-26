@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0] - 2026-06-26
+
+Retargeting foundation. A compilation target is now a composition of named
+substrates (isa, abi, os, object-format) carrying a by-value machine model, so a
+new register-machine target plugs in as substrate modules plus vtable hooks with
+no shared-backend edits. Adds the first bare-metal capability: a freestanding os
+and a raw flat-image object format. No syntax changes, and existing x86_64 and
+aarch64 builds are unaffected.
+
+### Added
+
+- target: a `freestanding` os substrate (no syscalls, no OS runtime, custom
+  `_start`, image base 0) and a `raw` flat-image object-format writer that lays
+  each segment at its virtual address and emits the bytes with no container,
+  entered at the image base (#1613).
+- target: object-format selection by name. An optional `of` key on a
+  `[target.<name>]` table picks the object format explicitly (e.g. `of = "raw"`);
+  omitting it derives the format from the os default, as before (#1615).
+- target: a `MachineModel` record carrying the machine description (widths,
+  register file and classes, addressing modes, frame model) as data, read by the
+  shared backend stages (#1606).
+
+### Changed
+
+- target: targets compose by name through name-keyed substrate registries. The
+  legacy os/arch/abi/of ids are derived from the resolved substrates rather than
+  authored, and the central `canonical_*` switches are gone (#1609).
+- codegen: lowering, register allocation, and frame layout read the widths, the
+  register file, and the index/address width from the machine model instead of
+  shared constants (#1603, #1607, #1608). Behavior-preserving for the existing
+  targets.
+- link: each isa owns its relocation packing through an `apply_reloc` vtable hook
+  and declares its own ELF `e_machine`, replacing the `arch_id` switches in the
+  linker (#1610, #1612).
+- target: removed the dead `syscall_layer` os field and consolidated
+  primitive-type classification behind a `prim_desc` table (#1604, #1601).
+
 ## [2.5.9] - 2026-06-24
 
 Fixes a latent miscompile: a runtime array/pointer index narrower than the
