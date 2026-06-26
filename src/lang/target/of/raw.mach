@@ -1,0 +1,334 @@
+# raw flat-image object-format writer
+#
+# Implements the `of.OfVTable` for `OF_RAW`: a container-free flat binary for
+# bare-metal (freestanding) targets. `emit_exec` lays the linker's load segments
+# out by file offset `vaddr - image_base`, where `image_base` is the lowest
+# segment virtual address, zero-fills the inter-segment gaps, and writes the raw
+# bytes with no header, no program headers, and no section table. Segment bytes
+# are copied already-encoded, so the writer is endianness-agnostic.
+#
+# A flat image carries no entry record: execution begins at the image base (the
+# reset vector / load address jumps there), so the program entry must sit at
+# `image_base`. `emit_exec` rejects an entry that is not the image base rather
+# than silently producing an image that enters at the wrong address. Only file
+# bytes (`filesz`) are stored - a trailing zero-fill (`memsz > filesz`, bss) is
+# not written, since bare-metal startup zeroes bss itself.
+#
+# `emit_object` and `emit_dyn_exec` are unsupported - a flat image is neither a
+# relocatable object nor a dynamically-linked executable - and return a clear
+# error, mirroring the macho stub's unsupported-format style.
+
+use std.allocator.page;
+use std.filesystem;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.intern;
+use mach.lang.target.isa;
+use mach.lang.target.of;
+use mach.lang.target.of.bin;
+
+# error the raw writer returns for the formats it does not produce (relocatable
+# objects and dynamically-linked executables)
+val RAW_UNSUPPORTED: str = "raw output supports only executables";
+
+# lay the load segments out into a freshly allocated flat-image buffer
+#
+# The image base is the lowest segment virtual address; each segment's file bytes
+# are copied at offset `vaddr - image_base`, and the inter-segment gaps are left
+# zero (the buffer is zero-allocated). The total size spans from the image base
+# to the highest segment file end. Only `filesz` bytes are stored; a trailing
+# zero-fill (memsz > filesz) is not written. Reports the image base and total
+# size through `out_base`/`out_size`.
+# ---
+# alloc:     allocator backing the returned buffer
+# segs:      loadable segments (need not be sorted; the base is the minimum vaddr)
+# seg_count: number of segments (must be > 0)
+# out_base:  receives the image base virtual address
+# out_size:  receives the flat image byte length
+# ret:       the flat image buffer (caller frees `out_size` bytes), or an error
+fun build_flat_image(alloc: *A.Allocator, segs: *of.LoadSegment, seg_count: u32,
+                     out_base: *u64, out_size: *usize) R.Result[*u8, str] {
+    if (seg_count == 0) { ret R.err[*u8, str]("raw: no loadable segments"); }
+
+    var base: u64 = segs[0].vaddr;
+    var end:  u64 = segs[0].vaddr + segs[0].filesz::u64;
+    var i: u32 = 1;
+    for (i < seg_count) {
+        if (segs[i].vaddr < base)                      { base = segs[i].vaddr; }
+        if (segs[i].vaddr + segs[i].filesz::u64 > end) { end  = segs[i].vaddr + segs[i].filesz::u64; }
+        i = i + 1;
+    }
+
+    val size: usize = (end - base)::usize;
+    if (size == 0) { ret R.err[*u8, str]("raw: flat image has no bytes"); }
+
+    val rb: R.Result[*u8, str] = A.zallocate[u8](alloc, size);
+    if (R.is_err[*u8, str](rb)) { ret R.err[*u8, str]("raw: flat image buffer alloc failed"); }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+
+    i = 0;
+    for (i < seg_count) {
+        if (segs[i].bytes != nil && segs[i].filesz > 0) {
+            val off: usize = (segs[i].vaddr - base)::usize;
+            memory.raw_copy((buf::usize + off)::ptr, segs[i].bytes::ptr, segs[i].filesz);
+        }
+        i = i + 1;
+    }
+
+    @out_base = base;
+    @out_size = size;
+    ret R.ok[*u8, str](buf);
+}
+
+# serialize an ObjectImage to a raw relocatable object file
+#
+# Unsupported: a flat image is not a relocatable object, so this always returns
+# the unsupported-format error rather than writing a malformed file. Matches the
+# of.WriterFn signature exactly.
+# ---
+# isa_vt: instruction-set vtable describing the machine
+# image:  object image to serialize
+# path:   null-terminated output file path
+# ret:    the unsupported-format error
+fun emit_object(isa_vt: *isa.IsaVTable, image: *of.ObjectImage, path: *u8) R.Result[bool, str] {
+    ret R.err[bool, str](RAW_UNSUPPORTED);
+}
+
+# parse a raw object file into an ObjectImage
+#
+# Unsupported: a flat image carries no section/symbol/relocation structure to
+# parse back, so this always returns the unsupported-format error. Matches the
+# of.ParserFn signature exactly.
+# ---
+# a:       allocator backing the image and its arrays
+# itn:     interner the parsed names would be interned into
+# buf:     object file bytes
+# buf_len: length of the object file bytes
+# out:     image to populate
+# ret:     the unsupported-format error
+fun parse_object(a: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_len: usize, out: *of.ObjectImage) R.Result[bool, str] {
+    ret R.err[bool, str](RAW_UNSUPPORTED);
+}
+
+# write a flat binary, installed in the raw `of.OfVTable` as its `of.ExecFn`
+#
+# Lays the load segments out by file offset `vaddr - image_base` into a
+# zero-filled buffer (so inter-segment gaps are zero), then writes the raw bytes
+# with no container. The entry must equal the image base because a flat image has
+# no entry record - an entry elsewhere is rejected rather than silently dropped.
+#
+# `funcs`/`func_count` are accepted for `of.ExecFn` conformance; the flat writer
+# emits no metadata and does not consume them.
+# ---
+# alloc:      allocator for the output buffer
+# itn:        interner backing any I/O error message
+# tgt_isa:    instruction-set vtable describing the machine (unused beyond the
+#             nil check; a flat image embeds no machine field)
+# segs:       loadable segments, in ascending virtual-address order
+# seg_count:  number of segments
+# entry:      program entry-point virtual address (must equal the image base)
+# funcs:      per-function metadata (unused; see above)
+# func_count: number of entries in funcs (unused; see above)
+# path:       null-terminated output file path
+# ret:        ok(true) on success, or an error string
+fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTable, segs: *of.LoadSegment,
+              seg_count: u32, entry: u64, funcs: *of.ExecFunction,
+              func_count: u32, path: *u8) R.Result[bool, str] {
+    if (tgt_isa == nil) { ret R.err[bool, str]("raw: nil exec isa"); }
+    if (path == nil)    { ret R.err[bool, str]("raw: nil exec path"); }
+
+    var base: u64   = 0;
+    var size: usize = 0;
+    val rb: R.Result[*u8, str] = build_flat_image(alloc, segs, seg_count, ?base, ?size);
+    if (R.is_err[*u8, str](rb)) { ret R.err[bool, str](R.unwrap_err[*u8, str](rb)); }
+    var buf: *u8 = R.unwrap_ok[*u8, str](rb);
+
+    # a flat image has no entry record, so it must enter at its base; an entry
+    # elsewhere cannot be expressed and is an error, not a silent drop.
+    if (entry != base) {
+        A.deallocate[u8](alloc, buf, size);
+        ret R.err[bool, str]("raw: flat image must enter at its base address");
+    }
+
+    val res_file: R.Result[filesystem.File, str] = filesystem.create(path, 0o755);
+    if (R.is_err[filesystem.File, str](res_file)) {
+        val cm: str = bin.io_message(itn, alloc, "raw: cannot create executable", path::str, R.unwrap_err[filesystem.File, str](res_file), "raw: could not create executable file");
+        A.deallocate[u8](alloc, buf, size);
+        ret R.err[bool, str](cm);
+    }
+    var f: filesystem.File = R.unwrap_ok[filesystem.File, str](res_file);
+    val res_write: R.Result[usize, str] = filesystem.write(?f, buf, size);
+    filesystem.close(?f);
+    A.deallocate[u8](alloc, buf, size);
+
+    if (R.is_err[usize, str](res_write)) { ret R.err[bool, str](bin.io_message(itn, alloc, "raw: exec write failed on", path::str, R.unwrap_err[usize, str](res_write), "raw: exec write failed")); }
+    ret R.ok[bool, str](true);
+}
+
+# serialize laid-out load segments into a dynamically-linked flat image
+#
+# Unsupported: a flat image has no dynamic-linking structures, so this always
+# returns the unsupported-format error. Matches the of.DynExecFn signature
+# exactly.
+# ---
+# alloc:      allocator for the output buffer
+# itn:        interner resolving the DynamicInfo names
+# tgt_isa:    instruction-set vtable describing the machine
+# segs:       loadable segments
+# seg_count:  number of segments
+# entry:      program entry-point virtual address
+# funcs:      per-function metadata
+# func_count: number of entries in funcs
+# dyn:        the dynamic-link plan
+# fixups:     the import call-site fixups
+# fixup_count: number of fixups
+# path:       null-terminated output file path
+# ret:        the unsupported-format error
+fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTable, segs: *of.LoadSegment,
+                  seg_count: u32, entry: u64, funcs: *of.ExecFunction, func_count: u32,
+                  dyn: *of.DynamicInfo, fixups: *of.PltFixup, fixup_count: u32,
+                  path: *u8) R.Result[bool, str] {
+    ret R.err[bool, str](RAW_UNSUPPORTED);
+}
+
+# the raw object-format vtable, populated by register on first call and handed to
+# the registry as a borrowed pointer for the process lifetime
+var raw_vtable: of.OfVTable;
+
+# build and install the raw of.OfVTable
+#
+# Fills the vtable with the format name and the flat-image writers, installing
+# the executable emitter and the unsupported-format stubs for objects and dynamic
+# executables, then installs it into `reg` under `of.OF_RAW`. Idempotent:
+# `of.register` keeps the first write-once entry. Must run at compiler startup
+# before `target.select` requests a freestanding target.
+# ---
+# reg: object-format registry to install the vtable into
+# ret: ok(true) on success
+pub fun register(reg: *of.OfRegistry) R.Result[bool, str] {
+    raw_vtable.id            = of.OF_RAW;
+    raw_vtable.name          = "raw";
+    raw_vtable.emit_object   = emit_object;
+    raw_vtable.parse_object  = parse_object;
+    raw_vtable.emit_exec     = emit_exec;
+    raw_vtable.emit_dyn_exec = emit_dyn_exec;
+
+    of.register(reg, ?raw_vtable);
+    ret R.ok[bool, str](true);
+}
+
+# register installs the raw vtable and the unsupported stubs reject non-executable
+# emission
+test "mach.lang.target.of.raw.register:installs_vtable" {
+    var reg: of.OfRegistry = of.registry_init();
+
+    val res_register: R.Result[bool, str] = register(?reg);
+    if (R.is_err[bool, str](res_register)) { ret 1; }
+
+    val opt_vt: O.Option[*of.OfVTable] = of.lookup(?reg, "raw");
+    if (!O.is_some[*of.OfVTable](opt_vt)) { ret 1; }
+    if (O.unwrap[*of.OfVTable](opt_vt).id != of.OF_RAW) { ret 1; }
+
+    var isa_vt: isa.IsaVTable;
+    var image:  of.ObjectImage;
+
+    val res_obj: R.Result[bool, str] = emit_object(?isa_vt, ?image, nil::*u8);
+    if (!R.is_err[bool, str](res_obj))                                   { ret 1; }
+    if (!str_contains(R.unwrap_err[bool, str](res_obj), "executables")) { ret 1; }
+    ret 0;
+}
+
+# emit_exec writes a flat binary: segments laid out by file offset
+# `vaddr - image_base`, inter-segment gaps zero-filled, no ELF magic, and the
+# image begins with the entry-segment bytes
+test "mach.lang.target.of.raw.emit_exec:flat_layout" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    # entry segment at the image base (0x1000), then a second segment after a gap
+    # so the zero-fill between them is exercised.
+    var code_bytes: [4]u8;
+    code_bytes[0] = 0xEB; code_bytes[1] = 0xFE; code_bytes[2] = 0x90; code_bytes[3] = 0x90;
+    var data_bytes: [4]u8;
+    data_bytes[0] = 0xDE; data_bytes[1] = 0xAD; data_bytes[2] = 0xBE; data_bytes[3] = 0xEF;
+
+    var segs: [2]of.LoadSegment;
+    segs[0].vaddr = 0x1000; segs[0].filesz = 4; segs[0].memsz = 4;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?code_bytes[0];
+    segs[1].vaddr = 0x1010; segs[1].filesz = 4; segs[1].memsz = 4;
+    segs[1].flags = of.SEG_FLAG_READ; segs[1].bytes = ?data_bytes[0];
+
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "raw_flat");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val tpath: str = filesystem.temp_path(?tf);
+
+    val em: R.Result[bool, str] =
+        emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 2, 0x1000, nil::*of.ExecFunction, 0, tpath::*u8);
+    if (R.is_err[bool, str](em)) { filesystem.temp_close_and_remove(?tf); ret 1; }
+
+    val rr: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tpath);
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_err[filesystem.Buffer, str](rr)) { ret 1; }
+    val b: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rr);
+
+    # the file spans base (0x1000) to the second segment's end (0x1014): 0x14 bytes.
+    if (b.len != 0x14) { A.deallocate[u8](?alloc, b.data, b.len + 1); ret 1; }
+
+    # it begins with the entry-segment bytes, not the ELF magic.
+    if (b.data[0] == 0x7F)   { A.deallocate[u8](?alloc, b.data, b.len + 1); ret 1; }
+    if (b.data[0] != 0xEB)   { A.deallocate[u8](?alloc, b.data, b.len + 1); ret 1; }
+    if (b.data[1] != 0xFE)   { A.deallocate[u8](?alloc, b.data, b.len + 1); ret 1; }
+
+    # the gap between the segments (0x1004..0x1010 -> file 0x4..0x10) is zero-filled.
+    var k: usize = 4;
+    for (k < 0x10) {
+        if (b.data[k] != 0x00) { A.deallocate[u8](?alloc, b.data, b.len + 1); ret 1; }
+        k = k + 1;
+    }
+
+    # the second segment lands at file offset 0x10 (its vaddr 0x1010 minus base).
+    if (b.data[0x10] != 0xDE) { A.deallocate[u8](?alloc, b.data, b.len + 1); ret 1; }
+    if (b.data[0x13] != 0xEF) { A.deallocate[u8](?alloc, b.data, b.len + 1); ret 1; }
+
+    A.deallocate[u8](?alloc, b.data, b.len + 1);
+    ret 0;
+}
+
+# emit_exec rejects an entry that is not the image base: a flat image has no
+# entry record, so it must enter at its base address
+test "mach.lang.target.of.raw.emit_exec:entry_must_be_base" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    var code_bytes: [4]u8;
+    code_bytes[0] = 0x90; code_bytes[1] = 0x90; code_bytes[2] = 0x90; code_bytes[3] = 0x90;
+
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = 0x1000; segs[0].filesz = 4; segs[0].memsz = 4;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?code_bytes[0];
+
+    # entry 0x1008 != image base 0x1000 must be rejected.
+    val em: R.Result[bool, str] =
+        emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1, 0x1008, nil::*of.ExecFunction, 0, "raw_should_not_exist"::*u8);
+    if (!R.is_err[bool, str](em))                                { ret 1; }
+    if (!str_contains(R.unwrap_err[bool, str](em), "base"))      { ret 1; }
+    ret 0;
+}
