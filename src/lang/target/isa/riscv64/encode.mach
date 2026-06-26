@@ -26,11 +26,13 @@
 # (`fadd` / `fsub` / `fmul` / `fdiv`, `fsgnjn`, `feq` / `flt` / `fle`), the float
 # conversions (`fcvt` between S / D and to / from the integer file), the `fmv` float
 # move / cross-bank reinterpret, the float loads / stores (`flw` / `fld` / `fsw` /
-# `fsd`), and the callee-saved FP spill / reload. The families still DEFERRED fail
-# loudly rather than emit wrong bytes: the inline-asm assembler arrives with its
-# slice, and the pc-relative GLOBAL-symbol relocations (`la` hi20/lo12) wait on the
-# linker / ELF relocation seam (slice 4 / #1628), which owns the new abstract reloc
-# kinds RISC-V needs - the `resolve_mem` folded-global path still routes there.
+# `fsd`), and the callee-saved FP spill / reload. Slice 4 (#1628) adds the pc-relative
+# GLOBAL-symbol references: the auipc-based `la` sequence (`auipc %pcrel_hi` +
+# `addi`/load/store `%pcrel_lo`) for an address-of (`emit_global_addr`), a folded-global
+# load (`emit_global_load`), and a folded-global store (`emit_global_store`), each
+# recording the RK_PCREL_HI20 + RK_PCREL_LO12_I / _S markers the linker / ELF relocation
+# seam packs. The one family still DEFERRED is the inline-asm assembler, which arrives
+# with its own slice and fails loudly until then rather than emitting wrong bytes.
 #
 # WIDTH-HONESTY: the 32-bit instruction-word format machinery (pack_r/i/s/b/u/j),
 # the register field positions, the immediate bit-scatter, and the branch / jump
@@ -447,14 +449,11 @@ rec RvMem {
 # lower a post-regalloc MIR_OP_MEM operand to its base / offset / scaled-index form.
 # a frame-slot-key base folds the slot offset onto s0; a physical-register base keeps
 # `preg`. a surviving value vreg in the base or index is a register-allocation bug,
-# rejected loudly. a symbol-relative memory operand (a folded global) is deferred to
-# the relocation slice.
+# rejected loudly. a folded global arrives as a MIR_OP_SYM operand (not a MEM), so the
+# encoders route it to the auipc-based `la` sequence before reaching here.
 fun resolve_mem(f: *mir.MirFunction, op: *mir.MirOperand) R.Result[RvMem, str] {
     if (op.kind != mir.MIR_OP_MEM) {
         ret R.err[RvMem, str]("encode: expected a memory operand");
-    }
-    if (op.sym != intern.STR_NIL) {
-        ret R.err[RvMem, str]("encode: riscv64 folded-global memory operands await the relocation slice");
     }
     var m: RvMem;
     m.has_index = false;
@@ -649,8 +648,12 @@ fun encode_mov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) 
 }
 
 # store register / immediate `val_op` to the resolved memory destination. a
-# non-register value (an immediate) is materialized into the scratch register first.
+# folded-global symbol destination emits the auipc-based `la` store sequence; otherwise
+# a non-register value (an immediate) is materialized into the scratch register first.
 fun emit_store_mem(st: *encode.EncodeState, f: *mir.MirFunction, dst_mem: *mir.MirOperand, val_op: *mir.MirOperand, width: u8) R.Result[bool, str] {
+    if (dst_mem.kind == mir.MIR_OP_SYM) {
+        ret emit_global_store(st, dst_mem, val_op, width);
+    }
     val mr: R.Result[RvMem, str] = resolve_mem(f, dst_mem);
     if (R.is_err[RvMem, str](mr)) { ret R.err[bool, str](R.unwrap_err[RvMem, str](mr)); }
     val m: RvMem = R.unwrap_ok[RvMem, str](mr);
@@ -670,21 +673,93 @@ fun emit_store_mem(st: *encode.EncodeState, f: *mir.MirFunction, dst_mem: *mir.M
     ret R.ok[bool, str](true);
 }
 
-# a non-symbol load `[dst, mem]`. a folded-global symbol load is deferred to the
-# relocation slice through `resolve_mem`.
+# emit the high half of a symbol reference - `auipc rd, %pcrel_hi(sym)` with a zero
+# placeholder - and record the RK_PCREL_HI20 relocation at the auipc word start. the
+# linker fills imm[31:12] with ((S + A - P) + 0x800) >> 12, P being this auipc's own
+# address. the caller pairs it with a `%pcrel_lo` low half (addi / load / store) naming
+# the same symbol, which the linker measures from this auipc one word back.
+fun emit_pcrel_hi(st: *encode.EncodeState, rd: u32, sym: intern.StrId, addend: i32) R.Result[bool, str] {
+    val pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_u(AUIPC, rd, 0));
+    ret encode.push_reloc(st, pos, of.RK_PCREL_HI20, sym, addend);
+}
+
+# a symbol address as an rvalue (the `la` / lea equivalent) - `auipc rd, %pcrel_hi(sym)`
+# (RK_PCREL_HI20) ; `addi rd, rd, %pcrel_lo(sym)` (RK_PCREL_LO12_I). both immediates are
+# zero placeholders the linker fills from the paired relocations naming the same symbol;
+# the addend is the symbol's own constant only.
+fun emit_global_addr(st: *encode.EncodeState, rd: u32, symop: *mir.MirOperand) R.Result[bool, str] {
+    if (symop.sym == intern.STR_NIL) {
+        ret R.err[bool, str]("encode: address-of has no resolved symbol name");
+    }
+    val hr: R.Result[bool, str] = emit_pcrel_hi(st, rd, symop.sym, symop.sym_off);
+    if (R.is_err[bool, str](hr)) { ret hr; }
+    val lo_pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_i(OP_IMM, F3_ADD, rd, rd, 0));   # addi rd, rd, %pcrel_lo(sym)
+    ret encode.push_reloc(st, lo_pos, of.RK_PCREL_LO12_I, symop.sym, symop.sym_off);
+}
+
+# a folded-global load - `auipc t0, %pcrel_hi(sym)` (RK_PCREL_HI20) ;
+# `ld/lwu/lhu/lbu rt, %pcrel_lo(sym)(t0)` (RK_PCREL_LO12_I, the zero-extending width
+# form). t0 (the reserved scratch) holds the high half; the load imm12 is a zero
+# placeholder the linker fills. the zero-extending form covers a sub-word access exactly
+# as the non-symbol path does.
+fun emit_global_load(st: *encode.EncodeState, rt: u32, symop: *mir.MirOperand, width: u8) R.Result[bool, str] {
+    if (symop.sym == intern.STR_NIL) {
+        ret R.err[bool, str]("encode: folded-global load has no resolved symbol name");
+    }
+    val hr: R.Result[bool, str] = emit_pcrel_hi(st, SCRATCH, symop.sym, symop.sym_off);
+    if (R.is_err[bool, str](hr)) { ret hr; }
+    val lo_pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_i(LOAD, load_funct3(width), rt, SCRATCH, 0));
+    ret encode.push_reloc(st, lo_pos, of.RK_PCREL_LO12_I, symop.sym, symop.sym_off);
+}
+
+# a folded-global store - the value resolves first (the zero register for an immediate
+# 0, t1 for a non-zero immediate, the value's own register otherwise) so the t0 high-
+# half materialization never clobbers it; `auipc t0, %pcrel_hi(sym)` (RK_PCREL_HI20) ;
+# `sd/sw/sh/sb rt, %pcrel_lo(sym)(t0)` (RK_PCREL_LO12_S). t0 / t1 are reserved scratch,
+# never an allocated value.
+fun emit_global_store(st: *encode.EncodeState, symop: *mir.MirOperand, val_op: *mir.MirOperand, width: u8) R.Result[bool, str] {
+    if (symop.sym == intern.STR_NIL) {
+        ret R.err[bool, str]("encode: folded-global store has no resolved symbol name");
+    }
+    var rt: u32 = RZERO;
+    if (val_op.kind == mir.MIR_OP_IMM) {
+        if (val_op.imm != 0) {
+            emit_li(st, SCRATCH2, val_op.imm);
+            rt = SCRATCH2;
+        }
+    } or {
+        val rr: R.Result[i32, str] = req_gpr(val_op);
+        if (R.is_err[i32, str](rr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rr)); }
+        rt = R.unwrap_ok[i32, str](rr)::u32;
+    }
+    val hr: R.Result[bool, str] = emit_pcrel_hi(st, SCRATCH, symop.sym, symop.sym_off);
+    if (R.is_err[bool, str](hr)) { ret hr; }
+    val lo_pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_s(STORE, store_funct3(width), SCRATCH, rt, 0));
+    ret encode.push_reloc(st, lo_pos, of.RK_PCREL_LO12_S, symop.sym, symop.sym_off);
+}
+
+# a load `[dst, mem]`. a folded-global symbol source emits the auipc-based `la` load
+# sequence; a frame-slot / pointer source resolves to a base + displacement access.
 fun encode_load(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 2) { ret R.err[bool, str]("encode: load missing operands"); }
     val rdr: R.Result[i32, str] = req_gpr(?mi.operands[0]);
     if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
     val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
-    val mr: R.Result[RvMem, str] = resolve_mem(f, ?mi.operands[1]);
+    val src: *mir.MirOperand = ?mi.operands[1];
+    if (src.kind == mir.MIR_OP_SYM) { ret emit_global_load(st, rd, src, mi.width); }
+    val mr: R.Result[RvMem, str] = resolve_mem(f, src);
     if (R.is_err[RvMem, str](mr)) { ret R.err[bool, str](R.unwrap_err[RvMem, str](mr)); }
     val m: RvMem = R.unwrap_ok[RvMem, str](mr);
     emit_mem_access(st, rd, m.base, m.off, mi.width, true);
     ret R.ok[bool, str](true);
 }
 
-# a non-symbol store `[mem, val]`.
+# a store `[mem, val]`. a folded-global symbol destination emits the auipc-based `la`
+# store sequence (handled in `emit_store_mem`).
 fun encode_store(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 2) { ret R.err[bool, str]("encode: store missing operands"); }
     ret emit_store_mem(st, f, ?mi.operands[0], ?mi.operands[1], mi.width);
@@ -692,13 +767,16 @@ fun encode_store(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr
 
 # alloca / gep address arithmetic `[dst, mem]` - `dst = base + index*scale + off`.
 # a scaled index is shifted into the scratch register and added to the base, then the
-# constant displacement folds onto the result.
+# constant displacement folds onto the result. a symbol base is the address-of
+# `auipc rd, %pcrel_hi(sym)` + `addi rd, rd, %pcrel_lo(sym)` rvalue sequence.
 fun encode_addr(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 2) { ret R.err[bool, str]("encode: address op missing operands"); }
     val rdr: R.Result[i32, str] = req_gpr(?mi.operands[0]);
     if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
     val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
-    val mr: R.Result[RvMem, str] = resolve_mem(f, ?mi.operands[1]);
+    val memop: *mir.MirOperand = ?mi.operands[1];
+    if (memop.kind == mir.MIR_OP_SYM) { ret emit_global_addr(st, rd, memop); }
+    val mr: R.Result[RvMem, str] = resolve_mem(f, memop);
     if (R.is_err[RvMem, str](mr)) { ret R.err[bool, str](R.unwrap_err[RvMem, str](mr)); }
     val m: RvMem = R.unwrap_ok[RvMem, str](mr);
 
@@ -1432,8 +1510,9 @@ fun align16(n: u32) u32 {
 # 16-byte ra / s0 record, the callee-saved GP and FP save areas, the local frame, and
 # the outgoing-argument region, read from the shared frame facts. unlike AArch64 the
 # record is part of this single allocation rather than a separate pre-index push.
-# each callee-saved register (GP or FP) takes one 8-byte slot.
-fun frame_total(f: *mir.MirFunction) u32 {
+# each callee-saved register (GP or FP) takes one 8-byte slot. pub so the assembly
+# printer renders the exact reservation the encoder subtracts from sp.
+pub fun frame_total(f: *mir.MirFunction) u32 {
     val gp_bytes: u32 = popcount32(f.callee_mask) * 8;
     val fp_bytes: u32 = popcount32(f.callee_mask_fp) * 8;
     ret align16(16 + gp_bytes + fp_bytes + f.frame.size + f.frame.outgoing_size);
@@ -2300,6 +2379,79 @@ test "mach.lang.target.isa.riscv64.encode:call_records_plt32_marker" {
     encode_call(?st, ?ii);
     if (read_word(?st.buf, 8) != 0x000500E7) { bad = 1; }
     if (st.reloc_count != 1)                 { bad = 1; }
+
+    encode.buf_dnit(?st.buf);
+    if (st.relocs != nil && st.reloc_cap > 0) {
+        A.deallocate[encode.PendingReloc](?alloc, st.relocs, st.reloc_cap::usize);
+    }
+    ret bad;
+}
+
+# the pc-relative global-symbol `la` sequences emit the auipc high half plus the low
+# half (addi for address-of, the width-driven load / store for a folded access) and
+# record the RK_PCREL_HI20 + RK_PCREL_LO12_I / _S markers naming the same symbol at the
+# two instruction-word offsets. the words match the `auipc a0, 0` / `addi a0, a0, 0` /
+# `ld a0, 0(t0)` / `sd a1, 0(t0)` forms a RISC-V assembler emits with zero placeholders.
+test "mach.lang.target.isa.riscv64.encode:global_la_sequences" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+    st.alloc       = ?alloc;
+    st.relocs      = nil;
+    st.reloc_count = 0;
+    st.reloc_cap   = 0;
+
+    val sym: intern.StrId = 9::intern.StrId;
+
+    # address-of: auipc a0,0 (0x00000517) ; addi a0,a0,0 (0x00050513).
+    var ao: mir.MirOperand = mir.op_sym(sym, 0);
+    emit_global_addr(?st, 10, ?ao);
+    if (read_word(?st.buf, 0) != 0x00000517) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x00050513) { bad = 1; }
+    if (st.reloc_count != 2) { bad = 1; }
+    or {
+        if (st.relocs[0].kind != of.RK_PCREL_HI20)   { bad = 1; }
+        if (st.relocs[0].offset != 0)                { bad = 1; }
+        if (st.relocs[0].sym != sym)                 { bad = 1; }
+        if (st.relocs[1].kind != of.RK_PCREL_LO12_I) { bad = 1; }
+        if (st.relocs[1].offset != 4)                { bad = 1; }
+        if (st.relocs[1].sym != sym)                 { bad = 1; }
+    }
+
+    # folded-global load (width 8): auipc t0,0 (0x00000297) ; ld a0,0(t0) (0x0002B503).
+    st.buf.len = 0; st.reloc_count = 0;
+    var lo: mir.MirOperand = mir.op_sym(sym, 0);
+    emit_global_load(?st, 10, ?lo, 8);
+    if (read_word(?st.buf, 0) != 0x00000297) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x0002B503) { bad = 1; }
+    if (st.reloc_count != 2) { bad = 1; }
+    or {
+        if (st.relocs[0].kind != of.RK_PCREL_HI20)   { bad = 1; }
+        if (st.relocs[1].kind != of.RK_PCREL_LO12_I) { bad = 1; }
+        if (st.relocs[1].offset != 4)                { bad = 1; }
+    }
+
+    # a sub-word folded load selects the zero-extending form (lbu a0,0(t0), funct3 4).
+    st.buf.len = 0; st.reloc_count = 0;
+    var l1: mir.MirOperand = mir.op_sym(sym, 0);
+    emit_global_load(?st, 10, ?l1, 1);
+    if (read_word(?st.buf, 4) != 0x0002C503) { bad = 1; }
+
+    # folded-global store (width 8, value a1): auipc t0,0 ; sd a1,0(t0) (0x00B2B023),
+    # RK_PCREL_LO12_S on the store low half.
+    st.buf.len = 0; st.reloc_count = 0;
+    var so: mir.MirOperand = mir.op_sym(sym, 0);
+    var sv: mir.MirOperand = mir.op_preg(11);
+    emit_global_store(?st, ?so, ?sv, 8);
+    if (read_word(?st.buf, 0) != 0x00000297) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x00B2B023) { bad = 1; }
+    if (st.reloc_count != 2) { bad = 1; }
+    or {
+        if (st.relocs[0].kind != of.RK_PCREL_HI20)   { bad = 1; }
+        if (st.relocs[1].kind != of.RK_PCREL_LO12_S) { bad = 1; }
+        if (st.relocs[1].offset != 4)                { bad = 1; }
+    }
 
     encode.buf_dnit(?st.buf);
     if (st.relocs != nil && st.reloc_cap > 0) {
