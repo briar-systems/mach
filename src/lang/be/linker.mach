@@ -171,30 +171,101 @@ pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
     if (obj_paths == nil || obj_count == 0) {
         ret R.err[bool, str]("link: no input objects");
     }
-    # a dynamic link is requested when shared dependencies are present and the
-    # output is an executable; libraries/relocatables ignore dependencies.
-    val dynamic: bool = (mode == LINK_EXE) && (soname_count > 0);
 
     val alloc: *A.Allocator = s.alloc;
 
-    # read and parse every input object file into an in-memory image array. the
-    # array and each populated image are torn down on every exit path below. an
+    # read and parse every input object file into an in-memory image array. an
     # `.a` archive input expands into one image per member object, so the parsed
     # image count can exceed the input-path count - `read_objects` reports the
     # true module count through `module_count`.
-    var modules: *of.ObjectImage = nil;
     var module_count: u32 = 0;
     val read_r: R.Result[*of.ObjectImage, str] = read_objects(s, tgt, obj_paths, obj_count, ?module_count);
     if (R.is_err[*of.ObjectImage, str](read_r)) {
         ret R.err[bool, str](R.unwrap_err[*of.ObjectImage, str](read_r));
     }
-    modules = R.unwrap_ok[*of.ObjectImage, str](read_r);
+    val modules: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](read_r);
 
-    # every input resolved to zero modules (e.g. an empty archive or one holding
-    # only bookkeeping members) - there is nothing to link, so reject rather than
-    # emit an empty artifact.
+    # the parsed images are owned here (read from disk), so they are torn down
+    # after linking regardless of outcome.
+    val r: R.Result[bool, str] =
+        link_modules(s, tgt, modules, module_count, sonames, soname_count, out_path, mode);
+    free_modules(alloc, modules, module_count);
+    ret r;
+}
+
+# combine an array of in-memory codegen images into the requested artifact,
+# bypassing the per-module `.o` emit/parse round-trip.
+#
+# the image-producing build path for a flat-image object format
+# (`tgt.of.produces_image` true): the back end's codegen images are linked
+# straight from memory rather than written to relocatable `.o` files and read
+# back through `parse_object`, which a flat-image format has no parser for. the
+# merge, symbol resolution, relocation patching, and segment layout are identical
+# to `link`; only the input source differs. the caller owns `images` and frees
+# them - this never tears them down.
+# ---
+# s:            shared session (allocator, interner, diagnostics)
+# tgt:          active target - selects OS base address, entry symbol, and writers
+# images:       the in-memory codegen images, one per module
+# image_count:  number of images
+# sonames:      interned shared-library sonames to depend on dynamically (or nil)
+# soname_count: number of shared-library dependencies
+# out_path:     null-terminated output file path
+# mode:         executable, relocatable (library), or shared
+# ret:          true once the artifact is written, or an error string
+pub fun link_images(s: *session.Session, tgt: *target.Target, images: *of.ObjectImage,
+                    image_count: u32, sonames: *intern.StrId, soname_count: u32,
+                    out_path: *u8, mode: LinkMode) R.Result[bool, str] {
+    if (s == nil)      { ret R.err[bool, str]("link: nil session"); }
+    if (tgt == nil)    { ret R.err[bool, str]("link: nil target"); }
+    if (tgt.of == nil) { ret R.err[bool, str]("link: target has no object-format vtable"); }
+    if (tgt.os == nil) { ret R.err[bool, str]("link: target has no OS vtable"); }
+    if (mode == LINK_SHARED) {
+        ret R.err[bool, str]("link: shared-object output is not yet supported");
+    }
+    if (images == nil || image_count == 0) {
+        ret R.err[bool, str]("link: no input objects");
+    }
+    ret link_modules(s, tgt, images, image_count, sonames, soname_count, out_path, mode);
+}
+
+# combine an already-built module-image array into the requested artifact.
+#
+# the shared core of `link` (disk inputs read + parsed) and `link_images`
+# (in-memory codegen images): merges symbols (rejecting duplicate strong
+# definitions), lays out the concatenated sections, and either (executable)
+# assigns virtual addresses, patches relocations, and writes page-aligned load
+# segments through `tgt.of.emit_exec`, or (library / relocatable) carries the
+# input relocations forward and writes a single merged object through
+# `obj.emit`. it never owns `modules` - the caller frees them - and frees only
+# its own scratch.
+#
+# DYNAMIC vs STATIC resolution of an undefined `ext` mirrors `link`: with no
+# shared dependencies every undefined `ext` must resolve against an input module
+# or the link fails; with shared dependencies any `ext` left undefined becomes a
+# dynamic import bound at run time, and the executable is emitted through
+# `emit_dyn_exec`.
+# ---
+# s:            shared session (allocator, interner, diagnostics)
+# tgt:          active target - selects OS base address, entry symbol, and writers
+# modules:      the input module images (caller-owned)
+# module_count: number of modules
+# sonames:      interned shared-library sonames to depend on dynamically (or nil)
+# soname_count: number of shared-library dependencies
+# out_path:     null-terminated output file path
+# mode:         executable, relocatable (library), or shared
+# ret:          true once the artifact is written, or an error string
+fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectImage,
+                 module_count: u32, sonames: *intern.StrId, soname_count: u32,
+                 out_path: *u8, mode: LinkMode) R.Result[bool, str] {
+    val alloc: *A.Allocator = s.alloc;
+    # a dynamic link is requested when shared dependencies are present and the
+    # output is an executable; libraries/relocatables ignore dependencies.
+    val dynamic: bool = (mode == LINK_EXE) && (soname_count > 0);
+
+    # an empty module set (e.g. an archive holding only bookkeeping members) has
+    # nothing to link, so reject rather than emit an empty artifact.
     if (module_count == 0) {
-        free_modules(alloc, modules, module_count);
         ret R.err[bool, str]("link: no input objects");
     }
 
@@ -211,7 +282,6 @@ pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
     if (sec_total > 0) {
         val pr: R.Result[*Placement, str] = A.zallocate[Placement](alloc, sec_total::usize);
         if (R.is_err[*Placement, str](pr)) {
-            free_modules(alloc, modules, module_count);
             ret R.err[bool, str](R.unwrap_err[*Placement, str](pr));
         }
         placements = R.unwrap_ok[*Placement, str](pr);
@@ -222,7 +292,6 @@ pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
     val br: R.Result[*u32, str] = A.zallocate[u32](alloc, module_count::usize);
     if (R.is_err[*u32, str](br)) {
         free_placements(alloc, placements, sec_total);
-        free_modules(alloc, modules, module_count);
         ret R.err[bool, str](R.unwrap_err[*u32, str](br));
     }
     sec_base = R.unwrap_ok[*u32, str](br);
@@ -231,7 +300,6 @@ pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
         accumulate_sections(s, modules, module_count, ?merged[0], placements, sec_base);
     if (R.is_err[bool, str](acc_r)) {
         free_scratch(alloc, placements, sec_total, sec_base, module_count);
-        free_modules(alloc, modules, module_count);
         ret R.err[bool, str](R.unwrap_err[bool, str](acc_r));
     }
 
@@ -253,7 +321,6 @@ pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
     if (R.is_err[bool, str](collect_r)) {
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
         free_scratch(alloc, placements, sec_total, sec_base, module_count);
-        free_modules(alloc, modules, module_count);
         ret R.err[bool, str](R.unwrap_err[bool, str](collect_r));
     }
 
@@ -264,7 +331,6 @@ pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
     if (R.is_err[of.ObjectImage, str](img_r)) {
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
         free_scratch(alloc, placements, sec_total, sec_base, module_count);
-        free_modules(alloc, modules, module_count);
         ret R.err[bool, str](R.unwrap_err[of.ObjectImage, str](img_r));
     }
     out_img = R.unwrap_ok[of.ObjectImage, str](img_r);
@@ -275,7 +341,6 @@ pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
         free_scratch(alloc, placements, sec_total, sec_base, module_count);
-        free_modules(alloc, modules, module_count);
         ret R.err[bool, str](R.unwrap_err[bool, str](build_r));
     }
 
@@ -296,7 +361,6 @@ pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
                 obj.dnit(?out_img);
                 map.dnit[intern.StrId, SymbolLoc](?sym_locs);
                 free_scratch(alloc, placements, sec_total, sec_base, module_count);
-                free_modules(alloc, modules, module_count);
                 ret R.err[bool, str](R.unwrap_err[bool, str](dr));
             }
         }
@@ -308,7 +372,6 @@ pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
             obj.dnit(?out_img);
             map.dnit[intern.StrId, SymbolLoc](?sym_locs);
             free_scratch(alloc, placements, sec_total, sec_base, module_count);
-            free_modules(alloc, modules, module_count);
             ret R.err[bool, str](R.unwrap_err[bool, str](patch_r));
         }
 
@@ -324,7 +387,6 @@ pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
         free_scratch(alloc, placements, sec_total, sec_base, module_count);
-        free_modules(alloc, modules, module_count);
 
         if (R.is_err[bool, str](emit_r)) {
             ret R.err[bool, str](R.unwrap_err[bool, str](emit_r));
@@ -340,7 +402,6 @@ pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
         free_scratch(alloc, placements, sec_total, sec_base, module_count);
-        free_modules(alloc, modules, module_count);
         ret R.err[bool, str](R.unwrap_err[bool, str](carry_r));
     }
 
@@ -349,7 +410,6 @@ pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
     obj.dnit(?out_img);
     map.dnit[intern.StrId, SymbolLoc](?sym_locs);
     free_scratch(alloc, placements, sec_total, sec_base, module_count);
-    free_modules(alloc, modules, module_count);
 
     if (R.is_err[bool, str](obj_r)) {
         ret R.err[bool, str](R.unwrap_err[bool, str](obj_r));

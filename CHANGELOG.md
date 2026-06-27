@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.0] - 2026-06-26
+
+The first working bare-metal build, plus a riscv64 codegen fix surfaced by the
+new backend. The freestanding `raw` object format now has a real flat-image
+build path, so an `os=freestanding, of=raw` target builds end to end.
+
+### Added
+
+- build: a flat-image build path for image-producing object formats. An object
+  format declares through a `produces_image` predicate whether it round-trips
+  through relocatable `.o` files, and an image format (the freestanding `raw`
+  writer) now links straight from the in-memory codegen output, bypassing the
+  per-module `.o` emit/parse round-trip. This is the last gap to a real
+  `os=freestanding, of=raw` build (#1616).
+
+### Fixed
+
+- codegen: a riscv64 variable-amount shift with a constant value operand
+  (`1 << node`) used as a call argument now materializes the constant into a
+  register before the shift instead of failing to encode. The shift was the lone
+  reg-reg ALU encoder not materializing an immediate operand (#1657).
+- diag: the unknown-os diagnostic now lists `freestanding` among the expected
+  values (#1617).
+
 ## [2.7.0] - 2026-06-26
 
 First targets on the retargeting foundation. riscv64 lands end to end as the
