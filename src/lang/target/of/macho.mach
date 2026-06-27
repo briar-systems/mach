@@ -68,11 +68,21 @@ val MH_EXECUTE: u32 = 2;
 # header flag set on a fully-resolved static executable (no undefined symbols).
 val MH_NOUNDEFS: u32 = 0x1;
 
+# header flags for a dynamically-linked image: it is bound by dyld and uses the
+# two-level namespace (each undefined symbol names the dylib that defines it).
+val MH_DYLDLINK: u32 = 0x4;
+val MH_TWOLEVEL: u32 = 0x80;
+
 # load-command ids.
-val LC_SEGMENT_64: u32 = 0x19;
-val LC_SYMTAB:     u32 = 0x2;
-val LC_DYSYMTAB:   u32 = 0xB;
-val LC_UNIXTHREAD: u32 = 0x5;
+val LC_SEGMENT_64:    u32 = 0x19;
+val LC_SYMTAB:        u32 = 0x2;
+val LC_DYSYMTAB:      u32 = 0xB;
+val LC_UNIXTHREAD:    u32 = 0x5;
+val LC_LOAD_DYLIB:    u32 = 0xC;
+val LC_LOAD_DYLINKER: u32 = 0xE;
+# the LC_REQ_DYLD bit is set on LC_DYLD_INFO_ONLY so a loader that cannot read
+# the compressed dyld-info stream refuses the image rather than mis-loading it.
+val LC_DYLD_INFO_ONLY: u32 = 0x80000022;
 
 # VM protection bits used for segment maxprot/initprot.
 val VM_PROT_READ:    u32 = 1;
@@ -94,6 +104,13 @@ val N_SECT: u8 = 0x0e;  # defined in section n_sect
 # nlist n_desc bit marking a weak definition.
 val N_WEAK_DEF: u16 = 0x0080;
 
+# nlist n_desc reference-type field (low 3 bits) and the value marking an undefined
+# symbol referenced lazily - a function call. Mach-O gives undefined symbols no
+# n_type/n_sect class, so this is how the object format round-trips a symbol's
+# function-ness, which the linker reads to give a dynamic import a call stub.
+val REFERENCE_TYPE_MASK:          u16 = 0x7;
+val REFERENCE_FLAG_UNDEFINED_LAZY: u16 = 0x1;
+
 # x86_64 relocation types (X86_64_RELOC_*).
 val X86_64_RELOC_UNSIGNED: u32 = 0;
 val X86_64_RELOC_SIGNED:   u32 = 1;
@@ -114,8 +131,37 @@ val SEGMENT_CMD_64_SIZE: usize = 72;
 val SECTION_64_SIZE:     usize = 80;
 val SYMTAB_CMD_SIZE:     usize = 24;
 val DYSYMTAB_CMD_SIZE:   usize = 80;
+val DYLD_INFO_CMD_SIZE:  usize = 48;   # cmd + cmdsize + 5 (off,size) pairs
+val DYLINKER_CMD_BASE:   usize = 12;   # cmd + cmdsize + name lc_str offset
+val DYLIB_CMD_BASE:      usize = 24;   # the dylib lc_str, then 3 version words
 val NLIST_64_SIZE:       usize = 16;
 val RELOC_INFO_SIZE:     usize = 8;
+
+# dyld bind-opcode bytes (the high nibble is the opcode, the low nibble an
+# immediate). a non-lazy pointer is bound by selecting the dylib, naming the
+# symbol, setting the pointer type, locating the slot, then DO_BIND.
+val BIND_OPCODE_DONE:                          u8 = 0x00;
+val BIND_OPCODE_SET_DYLIB_ORDINAL_IMM:         u8 = 0x10;
+val BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB:        u8 = 0x20;
+val BIND_OPCODE_SET_DYLIB_SPECIAL_IMM:         u8 = 0x30;
+val BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM: u8 = 0x40;
+val BIND_OPCODE_SET_TYPE_IMM:                  u8 = 0x50;
+val BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB:   u8 = 0x70;
+val BIND_OPCODE_DO_BIND:                       u8 = 0x90;
+
+# bind type for an absolute pointer slot, and the n_desc/bind code for a symbol
+# resolved by a flat (whole-process) search rather than a named dylib.
+val BIND_TYPE_POINTER:               u8  = 0x1;
+val BIND_SPECIAL_DYLIB_FLAT_LOOKUP:  u8  = 0xE;    # -2 as a 4-bit immediate
+val DYNAMIC_LOOKUP_ORDINAL:          u16 = 0xFE;   # n_desc library-ordinal byte
+
+# the dynamic loader Darwin executables name in LC_LOAD_DYLINKER.
+val DARWIN_DYLD_PATH: str = "/usr/lib/dyld";
+
+# per-arch import stub sizes: x86_64 is a 6-byte `jmp *got(%rip)`, arm64 a 12-byte
+# adrp/ldr/br through the bound got slot.
+val MACHO_X86_STUB_SIZE:   usize = 6;
+val MACHO_ARM64_STUB_SIZE: usize = 12;
 
 # thread-state flavors and u32 counts for the LC_UNIXTHREAD entry record.
 val X86_THREAD_STATE64:       u32 = 4;
@@ -569,6 +615,12 @@ fun write_nlist(buf: *u8, sym_off: usize, str_base: usize, str_pos: *usize,
         n_value = sec_addr[sym.section] + sym.offset::u64;
         if ((sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0) { n_desc = N_WEAK_DEF; }
     }
+    or ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0) {
+        # an undefined symbol carries no n_type/n_sect class, so its function-ness
+        # (which the linker needs to give a dynamic import a call stub) is recorded
+        # as REFERENCE_FLAG_UNDEFINED_LAZY in n_desc and recovered by parse_object.
+        n_desc = REFERENCE_FLAG_UNDEFINED_LAZY;
+    }
     if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0 || sym.section == of.SECTION_EXTERNAL) {
         n_type = n_type | N_EXT;
     }
@@ -942,21 +994,23 @@ var macho_vtable: of.OfVTable;
 
 # build the Mach-O OfVTable and install it into a registry
 #
-# Sets the format name ("macho") and the object writer, parser, and static-exec
-# writer; `emit_dyn_exec` is left nil because the dyld bind/rebase writer (and the
-# libSystem dynamic linkage modern macOS requires) is the Darwin-runtime follow-up
-# (#1178), not this object-format substrate. Idempotent through `of.register`.
+# Sets the format name ("macho") and the object writer, parser, static-exec writer,
+# and dynamic-exec writer; `emit_dyn_exec` frames a dyld-loadable executable
+# (LC_LOAD_DYLINKER, LC_LOAD_DYLIB, an LC_DYLD_INFO_ONLY bind stream, and an
+# __LINKEDIT symbol/string table) for the dynamic-link plan the linker hands it.
+# Idempotent through `of.register`.
 # ---
 # reg: the object-format registry to install the vtable into
 # ret: ok(true) on success
 pub fun register_macho(reg: *of.OfRegistry) R.Result[bool, str] {
     macho_vtable.id             = of.OF_MACHO;
     macho_vtable.name           = "macho";
+    # Mach-O round-trips a relocatable .o, so it is not a flat-image format.
     macho_vtable.produces_image = false;
     macho_vtable.emit_object    = emit_object;
     macho_vtable.parse_object   = parse_object;
     macho_vtable.emit_exec      = emit_exec;
-    macho_vtable.emit_dyn_exec  = nil::of.DynExecFn;
+    macho_vtable.emit_dyn_exec  = emit_dyn_exec;
 
     of.register(reg, ?macho_vtable);
     ret R.ok[bool, str](true);
@@ -1122,6 +1176,829 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
     if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
 
     val wr: R.Result[bool, str] = write_file(itn, alloc, path, buf, total_size, "macho: exec");
+    A.deallocate[u8](alloc, buf, total_size);
+    ret wr;
+}
+
+# the laid-out file offsets and virtual addresses of a dynamic executable's
+# synthesized structures
+#
+# Computed once up front so the load-command writer, the segment-byte copy, the
+# stub writer, the bind/symbol writers, and the call-site patcher all read the same
+# placement. Offsets are file byte offsets; the `_va` fields are virtual addresses.
+# ---
+# hdr_span:      file/vm bytes reserved for the mach header + load commands ahead
+#                of the first linker segment, so __TEXT maps the header
+# pagezero_size: __PAGEZERO span ([0, base - hdr_span)); 0 leaves it out
+# text_va:       __TEXT virtual address (header maps here, the linker text follows)
+# stubs_off:     file offset of the import-stub section (when nimp > 0)
+# stubs_va:      virtual address of the import stubs
+# stubs_size:    total stub bytes (nimp * per-arch stub size)
+# got_off:       file offset of the bound pointer slots (when nimp > 0)
+# got_va:        virtual address of the bound pointer slots
+# got_size:      total got bytes (nimp * 8)
+# got_seg_index: index of the got segment among the image's segment commands, for
+#                the bind opcodes' segment selector
+# linkedit_off:  file offset of the __LINKEDIT segment
+# linkedit_va:   virtual address of the __LINKEDIT segment
+# linkedit_size: __LINKEDIT byte length (bind stream + symbols + strings)
+# bind_off:      file offset of the dyld bind opcode stream
+# bind_size:     bind opcode stream byte length
+# symtab_off:    file offset of the nlist_64 array
+# strtab_off:    file offset of the symbol string table
+# strtab_size:   symbol string table byte length
+rec MachoDynLayout {
+    hdr_span:      usize;
+    pagezero_size: u64;
+    text_va:       u64;
+
+    stubs_off:     usize;
+    stubs_va:      u64;
+    stubs_size:    usize;
+
+    got_off:       usize;
+    got_va:        u64;
+    got_size:      usize;
+    got_seg_index: u32;
+
+    linkedit_off:  usize;
+    linkedit_va:   u64;
+    linkedit_size: usize;
+
+    bind_off:      usize;
+    bind_size:     usize;
+    symtab_off:    usize;
+    strtab_off:    usize;
+    strtab_size:   usize;
+}
+
+# encode `v` as unsigned LEB128 into `buf` at `off`, returning the next offset.
+# ---
+# buf: the output buffer
+# off: byte offset to write at
+# v:   the value to encode
+# ret: the byte offset just past the encoding
+fun write_uleb(buf: *u8, off: usize, v: u64) usize {
+    var value: u64 = v;
+    var p:     usize = off;
+    var more:  bool = true;
+    for (more) {
+        var byte: u8 = (value & 0x7F)::u8;
+        value = value >> 7;
+        if (value != 0) { byte = byte | 0x80; } or { more = false; }
+        buf[p] = byte;
+        p = p + 1;
+    }
+    ret p;
+}
+
+# the number of bytes the unsigned LEB128 encoding of `v` occupies.
+# ---
+# v:   the value to measure
+# ret: the encoding byte length (at least 1)
+fun uleb_size(v: u64) usize {
+    var value: u64 = v;
+    var n:     usize = 1;
+    for (value >= 0x80) { value = value >> 7; n = n + 1; }
+    ret n;
+}
+
+# the number of function imports in a dynamic-link plan (data imports get no stub
+# or got slot).
+# ---
+# dyn: the dynamic-link plan
+# ret: the function-import count
+fun func_import_count(dyn: *of.DynamicInfo) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < dyn.import_count) {
+        if (dyn.imports[i].is_func) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the per-arch import-stub byte size: x86_64 a 6-byte rip-relative jump, arm64 a
+# 12-byte adrp/ldr/br through the bound got slot.
+# ---
+# arch_id: the target ISA id
+# ret:     the stub byte size for the architecture
+fun macho_stub_size(arch_id: u32) usize {
+    if (arch_is_arm64(arch_id)) { ret MACHO_ARM64_STUB_SIZE; }
+    ret MACHO_X86_STUB_SIZE;
+}
+
+# write one import stub that branches indirectly through its bound got slot
+#
+# x86_64 emits `jmp qword [rip + d]` reaching the slot from the instruction's end;
+# arm64 emits `adrp x16, page(got); ldr x16, [x16, lo12(got)]; br x16`. The got
+# slot is bound by dyld at load (non-lazy), so the first call through the stub
+# reaches the resolved target.
+# ---
+# buf:      the output buffer
+# arch_id:  the target ISA id selecting the encoding
+# stub_off: file offset of this stub
+# stub_va:  virtual address of this stub
+# slot_va:  virtual address of the bound got slot the stub jumps through
+fun write_macho_stub(buf: *u8, arch_id: u32, stub_off: usize, stub_va: u64, slot_va: u64) {
+    if (arch_is_arm64(arch_id)) {
+        # adrp x16, page(slot): the signed page delta packed into immlo/immhi.
+        val slot_page: u64 = (slot_va >> 12) << 12;
+        val stub_page: u64 = (stub_va >> 12) << 12;
+        val delta:     i64 = (slot_page::i64) - (stub_page::i64);
+        val imm21:     u64 = ((delta >> 12)::u64) & 0x1FFFFF;
+        val immlo:     u32 = (imm21 & 0x3)::u32;
+        val immhi:     u32 = ((imm21 >> 2) & 0x7FFFF)::u32;
+        bin.write_u32_le(buf, stub_off, 0x90000000 | (immlo << 29) | (immhi << 5) | 16);
+        # ldr x16, [x16, #lo12(slot)]: the unsigned offset is scaled by 8.
+        val imm12: u32 = (((slot_va & 0xFFF) >> 3) & 0xFFF)::u32;
+        bin.write_u32_le(buf, stub_off + 4, 0xF9400000 | (imm12 << 10) | (16 << 5) | 16);
+        # br x16.
+        bin.write_u32_le(buf, stub_off + 8, 0xD61F0200);
+        ret;
+    }
+    # x86_64: jmp qword [rip + d]  (FF 25 d) -> the got slot.
+    buf[stub_off] = 0xFF; buf[stub_off + 1] = 0x25;
+    val next: u64 = stub_va + 6;
+    bin.write_u32_le(buf, stub_off + 2, (slot_va - next)::u32);
+}
+
+# the byte size of an LC_LOAD_DYLINKER command (the fixed head plus the loader
+# path, 8-byte aligned).
+# ---
+# ret: the command byte size
+fun dylinker_cmd_size() usize {
+    ret bin.align_up(DYLINKER_CMD_BASE + str_len(DARWIN_DYLD_PATH) + 1, 8);
+}
+
+# the byte size of an LC_LOAD_DYLIB command for a dependency named `name` (the
+# fixed head plus the name, 8-byte aligned).
+# ---
+# name: the dylib install name
+# ret:  the command byte size
+fun dylib_cmd_size(name: str) usize {
+    var n: usize = 0;
+    if (name != nil) { n = str_len(name); }
+    ret bin.align_up(DYLIB_CMD_BASE + n + 1, 8);
+}
+
+# write the LC_LOAD_DYLINKER command naming the dynamic loader.
+# ---
+# buf: the output buffer
+# off: byte offset of the command
+# ret: the byte offset just past the command
+fun write_load_dylinker(buf: *u8, off: usize) usize {
+    val sz: usize = dylinker_cmd_size();
+    bin.write_u32_le(buf, off, LC_LOAD_DYLINKER);
+    bin.write_u32_le(buf, off + 4, sz::u32);
+    bin.write_u32_le(buf, off + 8, DYLINKER_CMD_BASE::u32);
+    bin.write_str(buf, off + DYLINKER_CMD_BASE, DARWIN_DYLD_PATH);
+    ret off + sz;
+}
+
+# write one LC_LOAD_DYLIB command naming a shared dependency
+#
+# The timestamp is 0 and both version fields are 1.0.0; dyld resolves the
+# dependency by install name at load, so the exact versions are not load-bearing.
+# ---
+# buf:  the output buffer
+# off:  byte offset of the command
+# name: the dylib install name
+# ret:  the byte offset just past the command
+fun write_load_dylib(buf: *u8, off: usize, name: str) usize {
+    val sz: usize = dylib_cmd_size(name);
+    bin.write_u32_le(buf, off, LC_LOAD_DYLIB);
+    bin.write_u32_le(buf, off + 4, sz::u32);
+    bin.write_u32_le(buf, off + 8, DYLIB_CMD_BASE::u32);
+    bin.write_u32_le(buf, off + 12, 0);
+    bin.write_u32_le(buf, off + 16, 0x10000);
+    bin.write_u32_le(buf, off + 20, 0x10000);
+    bin.write_str(buf, off + DYLIB_CMD_BASE, name);
+    ret off + sz;
+}
+
+# write one LC_SEGMENT_64 head, holding `nsects` following section_64 entries
+#
+# The `cmdsize` covers the segment command plus its sections; the caller writes the
+# section_64 entries into the returned offset and continues past them.
+# ---
+# buf:      the output buffer
+# off:      byte offset of the command
+# name:     the 16-byte-clamped segment name
+# vmaddr:   the segment virtual address
+# vmsize:   the segment in-memory byte size
+# fileoff:  the segment file offset
+# filesize: the segment on-disk byte size
+# maxprot:  the maximum VM protection
+# initprot: the initial VM protection
+# nsects:   the number of section_64 entries that follow
+# ret:      the byte offset of the first following section_64 entry
+fun write_segment_cmd(buf: *u8, off: usize, name: str, vmaddr: u64, vmsize: u64,
+                      fileoff: u64, filesize: u64, maxprot: u32, initprot: u32, nsects: u32) usize {
+    bin.write_u32_le(buf, off, LC_SEGMENT_64);
+    bin.write_u32_le(buf, off + 4, (SEGMENT_CMD_64_SIZE + nsects::usize * SECTION_64_SIZE)::u32);
+    write_fixed16(buf, off + 8, name);
+    bin.write_u64_le(buf, off + 24, vmaddr);
+    bin.write_u64_le(buf, off + 32, vmsize);
+    bin.write_u64_le(buf, off + 40, fileoff);
+    bin.write_u64_le(buf, off + 48, filesize);
+    bin.write_u32_le(buf, off + 56, maxprot);
+    bin.write_u32_le(buf, off + 60, initprot);
+    bin.write_u32_le(buf, off + 64, nsects);
+    bin.write_u32_le(buf, off + 68, 0);
+    ret off + SEGMENT_CMD_64_SIZE;
+}
+
+# write one section_64 entry; reloc, indirect, and reserved fields are zero
+#
+# The synthesized stub and got sections are plain (no S_SYMBOL_STUBS /
+# S_NON_LAZY_SYMBOL_POINTERS flags), so they need no indirect symbol table: dyld
+# binds the got slots through the LC_DYLD_INFO bind opcodes, which address the slot
+# by segment and offset, and the stubs are ordinary code. A real section lets the
+# llvm/otool readers map the segment index and the bind address.
+# ---
+# buf:      the output buffer
+# off:      byte offset of the section_64 entry
+# sectname: the 16-byte-clamped section name
+# segname:  the 16-byte-clamped enclosing segment name
+# addr:     the section virtual address
+# size:     the section byte size
+# fileoff:  the section file offset
+# flags:    the section flags word
+# ret:      the byte offset just past the entry
+fun write_section_64(buf: *u8, off: usize, sectname: str, segname: str, addr: u64, size: u64,
+                     fileoff: u32, flags: u32) usize {
+    write_fixed16(buf, off, sectname);
+    write_fixed16(buf, off + 16, segname);
+    bin.write_u64_le(buf, off + 32, addr);
+    bin.write_u64_le(buf, off + 40, size);
+    bin.write_u32_le(buf, off + 48, fileoff);
+    bin.write_u32_le(buf, off + 52, 0);
+    bin.write_u32_le(buf, off + 56, 0);
+    bin.write_u32_le(buf, off + 60, 0);
+    bin.write_u32_le(buf, off + 64, flags);
+    bin.write_u32_le(buf, off + 68, 0);
+    bin.write_u32_le(buf, off + 72, 0);
+    bin.write_u32_le(buf, off + 76, 0);
+    ret off + SECTION_64_SIZE;
+}
+
+# the two-level-namespace library ordinal for a function import: the 1-based index
+# of its dylib among the dependencies, or the flat-lookup ordinal when the import
+# is unattributed.
+# ---
+# dyn:          the dynamic-link plan
+# import_index: the raw import index
+# ret:          the dylib ordinal (1-based), or DYNAMIC_LOOKUP_ORDINAL for ANY
+fun dylib_ordinal_for(dyn: *of.DynamicInfo, import_index: u32) u32 {
+    val li: u32 = dyn.imports[import_index].lib_index;
+    if (li == of.DYNLIB_ANY) { ret DYNAMIC_LOOKUP_ORDINAL::u32; }
+    ret li + 1;
+}
+
+# the byte length of the dyld bind opcode stream for the plan's function imports.
+# ---
+# itn: interner resolving the import symbol names
+# dyn: the dynamic-link plan
+# ret: the bind stream byte length (0 when there are no function imports)
+fun measure_bind_info(itn: *intern.Interner, dyn: *of.DynamicInfo) usize {
+    var size: usize = 0;
+    var n:    u32 = 0;
+    var i:    u32 = 0;
+    for (i < dyn.import_count) {
+        if (dyn.imports[i].is_func) {
+            val ord: u32 = dylib_ordinal_for(dyn, i);
+            if (dyn.imports[i].lib_index == of.DYNLIB_ANY) { size = size + 1; }
+            or (ord <= 15)                                 { size = size + 1; }
+            or                                             { size = size + 1 + uleb_size(ord::u64); }
+            val name: str = resolve(itn, dyn.imports[i].symbol);
+            var nl: usize = 0;
+            if (name != nil) { nl = str_len(name); }
+            size = size + 1 + nl + 1;                       # SET_SYMBOL + name + nul
+            size = size + 1;                               # SET_TYPE_IMM
+            size = size + 1 + uleb_size(n::u64 * 8);        # SET_SEGMENT_AND_OFFSET
+            size = size + 1;                               # DO_BIND
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    if (n > 0) { size = size + 1; }                        # BIND_OPCODE_DONE
+    ret size;
+}
+
+# write the dyld bind opcode stream binding each function import's got slot
+#
+# Each import selects its dylib, names the symbol, sets the pointer type, locates
+# its got slot by segment + offset, and binds it. The binds are non-lazy, so dyld
+# resolves every slot at load.
+# ---
+# buf:           the output buffer
+# off:           byte offset of the bind stream
+# itn:           interner resolving the import symbol names
+# dyn:           the dynamic-link plan
+# got_seg_index: the got segment's index for the segment selector
+# ret:           the byte offset just past the stream
+fun write_bind_info(buf: *u8, off: usize, itn: *intern.Interner, dyn: *of.DynamicInfo, got_seg_index: u32) usize {
+    var p: usize = off;
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < dyn.import_count) {
+        if (dyn.imports[i].is_func) {
+            if (dyn.imports[i].lib_index == of.DYNLIB_ANY) {
+                buf[p] = BIND_OPCODE_SET_DYLIB_SPECIAL_IMM | BIND_SPECIAL_DYLIB_FLAT_LOOKUP;
+                p = p + 1;
+            }
+            or {
+                val ord: u32 = dylib_ordinal_for(dyn, i);
+                if (ord <= 15) {
+                    buf[p] = BIND_OPCODE_SET_DYLIB_ORDINAL_IMM | (ord::u8 & 0xF);
+                    p = p + 1;
+                }
+                or {
+                    buf[p] = BIND_OPCODE_SET_DYLIB_ORDINAL_ULEB;
+                    p = write_uleb(buf, p + 1, ord::u64);
+                }
+            }
+
+            buf[p] = BIND_OPCODE_SET_SYMBOL_TRAILING_FLAGS_IMM;
+            p = p + 1 + bin.write_str(buf, p + 1, resolve(itn, dyn.imports[i].symbol));
+
+            buf[p] = BIND_OPCODE_SET_TYPE_IMM | BIND_TYPE_POINTER;
+            p = p + 1;
+
+            buf[p] = BIND_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (got_seg_index::u8 & 0xF);
+            p = write_uleb(buf, p + 1, n::u64 * 8);
+
+            buf[p] = BIND_OPCODE_DO_BIND;
+            p = p + 1;
+
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    if (n > 0) { buf[p] = BIND_OPCODE_DONE; p = p + 1; }
+    ret p;
+}
+
+# rewrite each deferred import call site to a pc-relative branch to its stub
+#
+# The linker recorded a `PltFixup` for every call to a function import it could not
+# resolve, carrying the patch site's segment, in-segment offset, and virtual
+# address. With the stub virtual address `S` the displacement is `S + A - P`:
+# x86_64 stores it as a 4-byte rip-relative field, arm64 packs `(disp >> 2)` into a
+# BL's imm26. The 4-byte field must lie within the segment's file bytes and the
+# displacement must fit the instruction's range, or the link fails rather than
+# writing a corrupt branch.
+# ---
+# buf:         the output buffer being patched
+# arch_id:     the target ISA id selecting the field encoding
+# lay:         the resolved dynamic-structure layout (stub addresses)
+# dyn:         the dynamic-link plan (maps import index to stub ordinal)
+# fixups:      the deferred import call-site fixups
+# fixup_count: number of fixups
+# seg_offsets: per-segment file offsets of the linker's segments
+# segs:        the linker's loadable segments
+# seg_count:   number of segments
+# nimp:        number of function imports; zero short-circuits to ok
+# ret:         ok(true), or an error on an out-of-range or overflowing fixup
+fun patch_macho_fixups(buf: *u8, arch_id: u32, lay: *MachoDynLayout, dyn: *of.DynamicInfo,
+                       fixups: *of.PltFixup, fixup_count: u32, seg_offsets: *usize,
+                       segs: *of.LoadSegment, seg_count: u32, nimp: u32) R.Result[bool, str] {
+    if (nimp == 0) { ret R.ok[bool, str](true); }
+    val stub_sz: usize = macho_stub_size(arch_id);
+    var i: u32 = 0;
+    for (i < fixup_count) {
+        val fx: *of.PltFixup = ?fixups[i];
+        if (fx.seg_index >= seg_count) {
+            ret R.err[bool, str]("macho: dynamic call-site fixup references an out-of-range segment");
+        }
+        val n: u32 = macho_func_ordinal(dyn, fx.import_index);
+        if (n == 0xFFFFFFFF) {
+            ret R.err[bool, str]("macho: dynamic call-site fixup targets a non-function import");
+        }
+        if (fx.seg_offset::usize + 4 > segs[fx.seg_index].filesz) {
+            ret R.err[bool, str]("macho: dynamic call-site fixup offset out of range");
+        }
+
+        val stub_va: u64 = lay.stubs_va + n::u64 * stub_sz::u64;
+        val disp:    i64 = (stub_va::i64) + fx.addend - (fx.patch_vaddr::i64);
+        val file_off: usize = seg_offsets[fx.seg_index] + fx.seg_offset::usize;
+
+        if (arch_is_arm64(arch_id)) {
+            val lim: i64 = 134217728;   # +-128 MiB CALL26 range
+            if (disp < -lim || disp >= lim || (disp & 3) != 0) {
+                ret R.err[bool, str]("macho: dynamic call-site displacement overflows a 26-bit branch");
+            }
+            val word:  u32 = bin.read_u32_le(buf, file_off);
+            val imm26: u32 = (((disp::u64) & 0x0FFFFFFC) >> 2)::u32;
+            bin.write_u32_le(buf, file_off, (word & 0xFC000000) | imm26);
+        }
+        or {
+            if (disp > 2147483647 || disp < -2147483648) {
+                ret R.err[bool, str]("macho: dynamic call-site displacement overflows 32 bits");
+            }
+            bin.write_u32_le(buf, file_off, (disp::u64)::u32);
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# the stub ordinal (0-based among function imports) for a raw import index, or
+# 0xFFFFFFFF when the import is not a function. The stubs and got slots are laid
+# out in function-import order.
+# ---
+# dyn:          the dynamic-link plan
+# import_index: the raw import index
+# ret:          the stub ordinal, or 0xFFFFFFFF for a non-function import
+fun macho_func_ordinal(dyn: *of.DynamicInfo, import_index: u32) u32 {
+    if (import_index >= dyn.import_count)   { ret 0xFFFFFFFF; }
+    if (!dyn.imports[import_index].is_func) { ret 0xFFFFFFFF; }
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < import_index) {
+        if (dyn.imports[i].is_func) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the section name for a linker load segment, chosen from its permissions and
+# whether it is zero-fill (bss): executable is __text, zero-fill is __bss, other
+# writable is __data, read-only is __const.
+# ---
+# flags:    the segment's SEG_FLAG_* permission bits
+# zerofill: whether the segment carries no file bytes (bss)
+# ret:      the section name
+fun dyn_sectname(flags: u32, zerofill: bool) str {
+    if ((flags & of.SEG_FLAG_EXECUTE) != 0) { ret "__text"; }
+    if (zerofill)                           { ret "__bss"; }
+    if ((flags & of.SEG_FLAG_WRITE) != 0)   { ret "__data"; }
+    ret "__const";
+}
+
+# the section flags word for a linker load segment: executable code is pure
+# instructions, zero-fill is S_ZEROFILL, the rest are regular.
+# ---
+# flags:    the segment's SEG_FLAG_* permission bits
+# zerofill: whether the segment carries no file bytes (bss)
+# ret:      the section flags word
+fun dyn_sect_flags(flags: u32, zerofill: bool) u32 {
+    if ((flags & of.SEG_FLAG_EXECUTE) != 0) { ret S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS; }
+    if (zerofill)                           { ret S_ZEROFILL; }
+    ret 0;
+}
+
+# write a dynamically-linked MH_EXECUTE Mach-O, installed as the of.DynExecFn
+#
+# Frames the linker's laid-out load segments into a dyld-loadable executable: a
+# leading __PAGEZERO, a __TEXT that maps the mach header below the linker's text so
+# dyld can read the load commands, the linker's remaining segments, synthesized
+# import-stub and got segments (when there are function imports), and a __LINKEDIT
+# carrying the LC_DYLD_INFO_ONLY bind stream plus the symbol and string tables. The
+# load commands name the dynamic loader (LC_LOAD_DYLINKER), each shared dependency
+# (LC_LOAD_DYLIB), the symbol tables (LC_SYMTAB/LC_DYSYMTAB), and the static entry
+# (LC_UNIXTHREAD). Each function import's got slot is bound non-lazily by dyld, and
+# every deferred call site is redirected to its stub.
+#
+# The image uses fixed virtual addresses (no MH_PIE): the linker assigned absolute
+# addresses from the OS base and the back end emits absolute addressing, so a load
+# bias would invalidate them. Apple Silicon additionally requires a code signature
+# the kernel verifies before exec; this writer emits no LC_CODE_SIGNATURE, so its
+# output is byte-verifiable but not runnable on arm64 without an external ad-hoc
+# sign step.
+# ---
+# alloc:       allocator for the output buffer and the scratch offset table
+# itn:         interner resolving the dynamic-plan names (sonames, imports)
+# isa_vt:      the instruction-set vtable selecting the cputype and stub encoding
+# segs:        loadable segments, in ascending virtual-address order
+# seg_count:   number of segments
+# entry:       program entry-point virtual address
+# funcs:       per-function metadata (unused)
+# func_count:  number of entries in funcs (unused)
+# dyn:         the dynamic-link plan (dependencies + imports)
+# fixups:      the deferred import call-site fixups
+# fixup_count: number of fixups
+# path:        null-terminated output file path
+# ret:         ok(true) on success, or an error string
+fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
+                  seg_count: u32, entry: u64, funcs: *of.ExecFunction, func_count: u32,
+                  dyn: *of.DynamicInfo, fixups: *of.PltFixup, fixup_count: u32,
+                  path: *u8) R.Result[bool, str] {
+    if (isa_vt == nil) { ret R.err[bool, str]("macho: nil dyn-exec isa"); }
+    if (path == nil)   { ret R.err[bool, str]("macho: nil dyn-exec path"); }
+    if (dyn == nil)    { ret R.err[bool, str]("macho: nil dynamic plan"); }
+    if (itn == nil)    { ret R.err[bool, str]("macho: no interner for dyn-exec"); }
+    if (seg_count == 0) { ret R.err[bool, str]("macho: dyn-exec has no load segments"); }
+    val arch_id: u32 = isa_vt.id;
+    val ct: R.Result[u32, str] = cpu_type_for(arch_id);
+    if (R.is_err[u32, str](ct)) { ret R.err[bool, str](R.unwrap_err[u32, str](ct)); }
+
+    val page:     usize = EXEC_PAGE_SIZE::usize;
+    val nimp:     u32 = func_import_count(dyn);
+    val stub_sz:  usize = macho_stub_size(arch_id);
+
+    # load-command byte size. the segment count is __PAGEZERO + the linker segments
+    # + (stubs, got when there are function imports) + __LINKEDIT.
+    var seg_cmds: u32 = seg_count + 1;              # linker segments + __LINKEDIT
+    if (segs[0].vaddr > 0) { seg_cmds = seg_cmds + 1; }   # __PAGEZERO
+    if (nimp > 0)          { seg_cmds = seg_cmds + 2; }   # __STUBS + __DATA(got)
+
+    var thread_state: usize = X86_THREAD_STATE64_COUNT::usize * 4;
+    if (arch_is_arm64(arch_id)) { thread_state = ARM_THREAD_STATE64_COUNT::usize * 4; }
+    val thread_cmd_size: usize = 16 + thread_state;
+
+    # every loadable segment carries one section_64 entry (the linker's segments
+    # plus the synthesized stub and got segments) so the llvm/otool readers and the
+    # bind-opcode segment index resolve against a real section table.
+    var sect_total: u32 = seg_count;
+    if (nimp > 0) { sect_total = sect_total + 2; }
+
+    var sizeofcmds: usize = seg_cmds::usize * SEGMENT_CMD_64_SIZE
+                          + sect_total::usize * SECTION_64_SIZE
+                          + DYLD_INFO_CMD_SIZE + SYMTAB_CMD_SIZE + DYSYMTAB_CMD_SIZE
+                          + dylinker_cmd_size() + thread_cmd_size;
+    var di: u32 = 0;
+    for (di < dyn.lib_count) { sizeofcmds = sizeofcmds + dylib_cmd_size(resolve(itn, dyn.libs[di].soname)); di = di + 1; }
+
+    var ncmds: u32 = seg_cmds + 5 + dyn.lib_count;   # dyld_info,symtab,dysymtab,dylinker,unixthread
+
+    var lay: MachoDynLayout;
+    lay.hdr_span = bin.align_up(MACH_HEADER_64_SIZE + sizeofcmds, page);
+    if (segs[0].vaddr < lay.hdr_span::u64) {
+        ret R.err[bool, str]("macho: dyn-exec base address too low to map the header");
+    }
+    lay.text_va       = segs[0].vaddr - lay.hdr_span::u64;
+    lay.pagezero_size = lay.text_va;
+
+    # per-linker-segment file offsets. the first segment shares __TEXT with the
+    # header (its bytes follow at hdr_span); the rest are page-aligned in turn.
+    val ro: R.Result[*usize, str] = A.zallocate[usize](alloc, seg_count::usize);
+    if (R.is_err[*usize, str](ro)) { ret R.err[bool, str]("macho: dyn-exec seg-offset alloc failed"); }
+    var seg_offsets: *usize = R.unwrap_ok[*usize, str](ro);
+
+    seg_offsets[0] = lay.hdr_span;
+    var file: usize = lay.hdr_span + segs[0].filesz;
+    var li: u32 = 1;
+    for (li < seg_count) {
+        file = bin.align_up(file, page);
+        seg_offsets[li] = file;
+        file = file + segs[li].filesz;
+        li = li + 1;
+    }
+
+    # the highest linker virtual address; the synthesized segments are placed
+    # page-aligned above it.
+    var hi_va: u64 = 0;
+    li = 0;
+    for (li < seg_count) {
+        val end: u64 = segs[li].vaddr + segs[li].memsz::u64;
+        if (end > hi_va) { hi_va = end; }
+        li = li + 1;
+    }
+    var va: u64 = bin.align_up_u64(hi_va, EXEC_PAGE_SIZE);
+
+    lay.stubs_size = 0;
+    lay.got_size = 0;
+    lay.got_seg_index = 0;
+    if (nimp > 0) {
+        file = bin.align_up(file, page);
+        lay.stubs_off  = file;
+        lay.stubs_va   = va;
+        lay.stubs_size = nimp::usize * stub_sz;
+        file = file + lay.stubs_size;
+        va   = bin.align_up_u64(va + lay.stubs_size::u64, EXEC_PAGE_SIZE);
+
+        file = bin.align_up(file, page);
+        lay.got_off  = file;
+        lay.got_va   = va;
+        lay.got_size = nimp::usize * 8;
+        file = file + lay.got_size;
+        va   = bin.align_up_u64(va + lay.got_size::u64, EXEC_PAGE_SIZE);
+
+        var pz: u32 = 0;
+        if (lay.pagezero_size > 0) { pz = 1; }
+        lay.got_seg_index = pz + seg_count + 1;   # pagezero + linker segs + stubs
+    }
+
+    # __LINKEDIT: the bind stream, then the nlist array (8-aligned), then strings.
+    file = bin.align_up(file, page);
+    lay.linkedit_off = file;
+    lay.linkedit_va  = va;
+
+    lay.bind_off  = lay.linkedit_off;
+    lay.bind_size = measure_bind_info(itn, dyn);
+    lay.symtab_off = bin.align_up(lay.bind_off + lay.bind_size, 8);
+
+    lay.strtab_size = 1;
+    var si: u32 = 0;
+    for (si < dyn.import_count) {
+        if (dyn.imports[si].is_func) {
+            val name: str = resolve(itn, dyn.imports[si].symbol);
+            if (name != nil) { lay.strtab_size = lay.strtab_size + str_len(name) + 1; } or { lay.strtab_size = lay.strtab_size + 1; }
+        }
+        si = si + 1;
+    }
+    lay.strtab_off  = lay.symtab_off + nimp::usize * NLIST_64_SIZE;
+    val total_size: usize = lay.strtab_off + lay.strtab_size;
+    lay.linkedit_size = total_size - lay.linkedit_off;
+
+    val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_size);
+    if (R.is_err[*u8, str](res_buf)) {
+        A.deallocate[usize](alloc, seg_offsets, seg_count::usize);
+        ret R.err[bool, str]("macho: dyn-exec buffer alloc failed");
+    }
+    var buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
+
+    # mach_header_64: a two-level, dyld-linked executable. MH_NOUNDEFS is not set
+    # because the imports are undefined until dyld binds them.
+    bin.write_u32_le(buf, 0, MH_MAGIC_64);
+    bin.write_u32_le(buf, 4, R.unwrap_ok[u32, str](ct));
+    bin.write_u32_le(buf, 8, cpu_subtype_for(arch_id));
+    bin.write_u32_le(buf, 12, MH_EXECUTE);
+    bin.write_u32_le(buf, 16, ncmds);
+    bin.write_u32_le(buf, 20, sizeofcmds::u32);
+    bin.write_u32_le(buf, 24, MH_DYLDLINK | MH_TWOLEVEL);
+    bin.write_u32_le(buf, 28, 0);
+
+    var lc: usize = MACH_HEADER_64_SIZE;
+
+    # __PAGEZERO.
+    if (lay.pagezero_size > 0) {
+        lc = write_segment_cmd(buf, lc, "__PAGEZERO", 0, lay.pagezero_size, 0, 0, 0, 0, 0);
+    }
+
+    # __TEXT maps the mach header below the linker's text segment (its __text
+    # section starts at the linker's text address, after the header), then the rest
+    # of the linker's segments at their assigned addresses, each with one section.
+    val text_prot: u32 = vm_prot_for(segs[0].flags);
+    var tsec: usize = write_segment_cmd(buf, lc, "__TEXT", lay.text_va,
+                           bin.align_up_u64(lay.hdr_span::u64 + segs[0].memsz::u64, EXEC_PAGE_SIZE),
+                           0, lay.hdr_span::u64 + segs[0].filesz::u64, text_prot, text_prot, 1);
+    write_section_64(buf, tsec, dyn_sectname(segs[0].flags, false), "__TEXT", segs[0].vaddr,
+                     segs[0].memsz::u64, seg_offsets[0]::u32, dyn_sect_flags(segs[0].flags, false));
+    lc = tsec + SECTION_64_SIZE;
+    li = 1;
+    for (li < seg_count) {
+        val prot: u32 = vm_prot_for(segs[li].flags);
+        val zf:   bool = segs[li].filesz == 0 && segs[li].memsz > 0;
+        var lsec: usize = write_segment_cmd(buf, lc, exec_segname(segs[li].flags), segs[li].vaddr,
+                               bin.align_up_u64(segs[li].memsz::u64, EXEC_PAGE_SIZE),
+                               seg_offsets[li]::u64, segs[li].filesz::u64, prot, prot, 1);
+        var soff: u32 = seg_offsets[li]::u32;
+        if (zf) { soff = 0; }
+        write_section_64(buf, lsec, dyn_sectname(segs[li].flags, zf), exec_segname(segs[li].flags),
+                         segs[li].vaddr, segs[li].memsz::u64, soff, dyn_sect_flags(segs[li].flags, zf));
+        lc = lsec + SECTION_64_SIZE;
+        li = li + 1;
+    }
+
+    # synthesized stub (R+X) and got (R+W) segments, each with one section so the
+    # llvm/otool readers resolve the bind opcodes' segment index and address. they
+    # are named __STUBS / __GOT (not __TEXT / __DATA) so they never collide with a
+    # linker segment name, keeping the bind segment index unambiguous.
+    if (nimp > 0) {
+        var sec: usize = write_segment_cmd(buf, lc, "__STUBS", lay.stubs_va,
+                               bin.align_up_u64(lay.stubs_size::u64, EXEC_PAGE_SIZE),
+                               lay.stubs_off::u64, lay.stubs_size::u64,
+                               VM_PROT_READ | VM_PROT_EXECUTE, VM_PROT_READ | VM_PROT_EXECUTE, 1);
+        write_section_64(buf, sec, "__stubs", "__STUBS", lay.stubs_va, lay.stubs_size::u64,
+                         lay.stubs_off::u32, S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
+        lc = sec + SECTION_64_SIZE;
+
+        sec = write_segment_cmd(buf, lc, "__GOT", lay.got_va,
+                               bin.align_up_u64(lay.got_size::u64, EXEC_PAGE_SIZE),
+                               lay.got_off::u64, lay.got_size::u64,
+                               VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, 1);
+        write_section_64(buf, sec, "__got", "__GOT", lay.got_va, lay.got_size::u64,
+                         lay.got_off::u32, 0);
+        lc = sec + SECTION_64_SIZE;
+    }
+
+    # __LINKEDIT.
+    lc = write_segment_cmd(buf, lc, "__LINKEDIT", lay.linkedit_va,
+                           bin.align_up_u64(lay.linkedit_size::u64, EXEC_PAGE_SIZE),
+                           lay.linkedit_off::u64, lay.linkedit_size::u64,
+                           VM_PROT_READ, VM_PROT_READ, 0);
+
+    # LC_DYLD_INFO_ONLY: only the bind stream is non-empty (fixed addresses need no
+    # rebase, and binding is eager so the lazy stream is empty).
+    bin.write_u32_le(buf, lc, LC_DYLD_INFO_ONLY);
+    bin.write_u32_le(buf, lc + 4, DYLD_INFO_CMD_SIZE::u32);
+    bin.write_u32_le(buf, lc + 8, 0);                       # rebase_off
+    bin.write_u32_le(buf, lc + 12, 0);                      # rebase_size
+    bin.write_u32_le(buf, lc + 16, lay.bind_off::u32);
+    bin.write_u32_le(buf, lc + 20, lay.bind_size::u32);
+    bin.write_u32_le(buf, lc + 24, 0);                      # weak_bind_off
+    bin.write_u32_le(buf, lc + 28, 0);                      # weak_bind_size
+    bin.write_u32_le(buf, lc + 32, 0);                      # lazy_bind_off
+    bin.write_u32_le(buf, lc + 36, 0);                      # lazy_bind_size
+    bin.write_u32_le(buf, lc + 40, 0);                      # export_off
+    bin.write_u32_le(buf, lc + 44, 0);                      # export_size
+    lc = lc + DYLD_INFO_CMD_SIZE;
+
+    # LC_SYMTAB: the undefined import symbols and their string table.
+    bin.write_u32_le(buf, lc, LC_SYMTAB);
+    bin.write_u32_le(buf, lc + 4, SYMTAB_CMD_SIZE::u32);
+    bin.write_u32_le(buf, lc + 8, lay.symtab_off::u32);
+    bin.write_u32_le(buf, lc + 12, nimp);
+    bin.write_u32_le(buf, lc + 16, lay.strtab_off::u32);
+    bin.write_u32_le(buf, lc + 20, lay.strtab_size::u32);
+    lc = lc + SYMTAB_CMD_SIZE;
+
+    # LC_DYSYMTAB: every symbol is an undefined import (no locals or external
+    # definitions); the indirect/toc tables are empty since dyld binds via opcodes.
+    bin.write_u32_le(buf, lc, LC_DYSYMTAB);
+    bin.write_u32_le(buf, lc + 4, DYSYMTAB_CMD_SIZE::u32);
+    bin.write_u32_le(buf, lc + 8, 0);                       # ilocalsym
+    bin.write_u32_le(buf, lc + 12, 0);                      # nlocalsym
+    bin.write_u32_le(buf, lc + 16, 0);                      # iextdefsym
+    bin.write_u32_le(buf, lc + 20, 0);                      # nextdefsym
+    bin.write_u32_le(buf, lc + 24, 0);                      # iundefsym
+    bin.write_u32_le(buf, lc + 28, nimp);                   # nundefsym
+    lc = lc + DYSYMTAB_CMD_SIZE;
+
+    # LC_LOAD_DYLINKER, then one LC_LOAD_DYLIB per dependency.
+    lc = write_load_dylinker(buf, lc);
+    di = 0;
+    for (di < dyn.lib_count) {
+        lc = write_load_dylib(buf, lc, resolve(itn, dyn.libs[di].soname));
+        di = di + 1;
+    }
+
+    # LC_UNIXTHREAD: the static thread entry, program counter set to the entry.
+    bin.write_u32_le(buf, lc, LC_UNIXTHREAD);
+    bin.write_u32_le(buf, lc + 4, thread_cmd_size::u32);
+    if (arch_is_arm64(arch_id)) {
+        bin.write_u32_le(buf, lc + 8, ARM_THREAD_STATE64);
+        bin.write_u32_le(buf, lc + 12, ARM_THREAD_STATE64_COUNT);
+        bin.write_u64_le(buf, lc + 16 + ARM_PC_STATE_OFFSET, entry);
+    }
+    or {
+        bin.write_u32_le(buf, lc + 8, X86_THREAD_STATE64);
+        bin.write_u32_le(buf, lc + 12, X86_THREAD_STATE64_COUNT);
+        bin.write_u64_le(buf, lc + 16 + X86_RIP_STATE_OFFSET, entry);
+    }
+
+    # copy the linker's segment bytes to their file offsets.
+    li = 0;
+    for (li < seg_count) {
+        if (segs[li].bytes != nil && segs[li].filesz > 0) {
+            memory.raw_copy((buf::usize + seg_offsets[li])::ptr, segs[li].bytes::ptr, segs[li].filesz);
+        }
+        li = li + 1;
+    }
+
+    # the import stubs.
+    if (nimp > 0) {
+        var n: u32 = 0;
+        for (n < nimp) {
+            val stub_va: u64 = lay.stubs_va + n::u64 * stub_sz::u64;
+            val slot_va: u64 = lay.got_va + n::u64 * 8;
+            write_macho_stub(buf, arch_id, lay.stubs_off + n::usize * stub_sz, stub_va, slot_va);
+            n = n + 1;
+        }
+    }
+
+    # the dyld bind stream and the symbol/string tables in __LINKEDIT.
+    write_bind_info(buf, lay.bind_off, itn, dyn, lay.got_seg_index);
+
+    buf[lay.strtab_off] = 0;
+    var str_pos: usize = 1;
+    var sym_off: usize = lay.symtab_off;
+    var di2: u32 = 0;
+    for (di2 < dyn.import_count) {
+        if (dyn.imports[di2].is_func) {
+            val name: str = resolve(itn, dyn.imports[di2].symbol);
+            var n_strx: u32 = 0;
+            if (name != nil) {
+                n_strx = str_pos::u32;
+                str_pos = str_pos + bin.write_str(buf, lay.strtab_off + str_pos, name);
+            }
+            or {
+                buf[lay.strtab_off + str_pos] = 0;
+                str_pos = str_pos + 1;
+            }
+            bin.write_u32_le(buf, sym_off, n_strx);
+            buf[sym_off + 4] = N_UNDF | N_EXT;
+            buf[sym_off + 5] = 0;
+            bin.write_u16_le(buf, sym_off + 6, dylib_ordinal_for(dyn, di2)::u16 << 8);
+            bin.write_u64_le(buf, sym_off + 8, 0);
+            sym_off = sym_off + NLIST_64_SIZE;
+        }
+        di2 = di2 + 1;
+    }
+
+    # redirect every deferred call site to its stub.
+    val fx_r: R.Result[bool, str] =
+        patch_macho_fixups(buf, arch_id, ?lay, dyn, fixups, fixup_count, seg_offsets, segs, seg_count, nimp);
+    A.deallocate[usize](alloc, seg_offsets, seg_count::usize);
+    if (R.is_err[bool, str](fx_r)) {
+        A.deallocate[u8](alloc, buf, total_size);
+        ret R.err[bool, str](R.unwrap_err[bool, str](fx_r));
+    }
+
+    val wr: R.Result[bool, str] = write_file(itn, alloc, path, buf, total_size, "macho: dyn-exec");
     A.deallocate[u8](alloc, buf, total_size);
     ret wr;
 }
@@ -1312,6 +2189,9 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
         if ((n_desc & N_WEAK_DEF) != 0) { flags = flags | of.SYM_OBJ_FLAG_WEAK; }
         if ((n_type & N_TYPE) == N_UNDF) {
             flags = flags | of.SYM_OBJ_FLAG_EXTERN;
+            # recover the function-ness emit_object encoded in the reference type so
+            # the linker can give a dynamic function import its call stub.
+            if ((n_desc & REFERENCE_TYPE_MASK) == REFERENCE_FLAG_UNDEFINED_LAZY) { flags = flags | of.SYM_OBJ_FLAG_FUNCTION; }
             out.symbols[si].section = of.SECTION_EXTERNAL;
             out.symbols[si].offset = 0;
         } or (n_sect >= 1 && (n_sect - 1)::u32 < sec_n) {
@@ -1910,8 +2790,8 @@ fun ts_exec_arm64() u8 {
     ret 0;
 }
 
-# register installs the Mach-O vtable under "macho" with the object/exec writers
-# bound and emit_dyn_exec left nil (the Darwin-runtime follow-up).
+# register installs the Mach-O vtable under "macho" with the object, static-exec,
+# and dynamic-exec writers all bound.
 fun ts_register() u8 {
     var reg: of.OfRegistry = of.registry_init();
     val rr: R.Result[bool, str] = register_macho(?reg);
@@ -1924,7 +2804,137 @@ fun ts_register() u8 {
     if (vt.emit_object == nil)     { ret 1; }
     if (vt.parse_object == nil)    { ret 1; }
     if (vt.emit_exec == nil)       { ret 1; }
-    if (vt.emit_dyn_exec != nil)   { ret 1; }
+    if (vt.emit_dyn_exec == nil)   { ret 1; }
+    ret 0;
+}
+
+# whether the byte range [start, start+len) of buf contains the bytes of `needle`.
+# ---
+# buf:    the buffer to scan
+# start:  range start offset
+# len:    range byte length
+# needle: the substring to find
+# ret:    true when `needle` occurs in the range
+fun t_bytes_contain(buf: *u8, start: usize, len: usize, needle: str) bool {
+    val nl: usize = str_len(needle);
+    if (nl == 0 || nl > len) { ret false; }
+    var i: usize = 0;
+    for (i + nl <= len) {
+        var j: usize = 0;
+        var hit: bool = true;
+        for (j < nl) {
+            if (buf[start + i + j] != needle[j]) { hit = false; brk; }
+            j = j + 1;
+        }
+        if (hit) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# emit_dyn_exec frames a dyld-loadable executable: a dylib import drives the
+# LC_LOAD_DYLINKER / LC_LOAD_DYLIB / LC_DYLD_INFO_ONLY (bind stream) / symbol-table
+# load commands, the entry lands in the per-arch thread state, and the deferred
+# call site is redirected to a non-zero displacement. checks both architectures.
+fun ts_dyn_exec(arch_id: u32) u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = arch_id;
+
+    # a single text segment whose first instruction is a call to the import: the
+    # x86_64 `call rel32` (E8 + 4 bytes) and the arm64 `bl` (one word) both put a
+    # branch displacement field the writer must redirect to the stub.
+    var code: [8]u8;
+    var k: usize = 0;
+    for (k < 8) { code[k] = 0; k = k + 1; }
+    var fixup_off: u32 = 0;
+    var fixup_add: i64 = 0;
+    if (arch_id == isa.ARCH_AARCH64) {
+        bin.write_u32_le(?code[0], 0, 0x94000000);   # bl #0
+        fixup_off = 0;
+        fixup_add = 0;
+    }
+    or {
+        code[0] = 0xE8;                               # call rel32
+        fixup_off = 1;
+        fixup_add = -4;
+    }
+    val base:  u64 = 0x100000000;
+    val entry: u64 = base;
+
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = base; segs[0].filesz = 8; segs[0].memsz = 8;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?code[0];
+
+    var libs: [1]of.DynLib;
+    libs[0].soname = t_intern(?itn, "libprobe.dylib");
+    var imps: [1]of.DynImport;
+    imps[0].symbol = t_intern(?itn, "probe_add");
+    imps[0].lib_index = 0;
+    imps[0].is_func = true;
+
+    var dyn: of.DynamicInfo;
+    dyn.libs = ?libs[0]; dyn.lib_count = 1;
+    dyn.imports = ?imps[0]; dyn.import_count = 1;
+    dyn.interp = intern.STR_NIL;
+
+    var fx: [1]of.PltFixup;
+    fx[0].seg_index = 0; fx[0].seg_offset = fixup_off; fx[0].import_index = 0;
+    fx[0].patch_vaddr = base + fixup_off::u64; fx[0].addend = fixup_add;
+
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "macho_dyn");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val tpath: str = filesystem.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_dyn_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 1, entry,
+                                                nil::*of.ExecFunction, 0, ?dyn, ?fx[0], 1, tpath::*u8);
+    if (R.is_err[bool, str](em)) { filesystem.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tpath);
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_err[filesystem.Buffer, str](rb)) { ret 1; }
+    val buf: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rb);
+
+    if (bin.read_u32_le(buf.data, 0) != MH_MAGIC_64)                       { ret 1; }
+    if (bin.read_u32_le(buf.data, 12) != MH_EXECUTE)                       { ret 1; }
+    if (bin.read_u32_le(buf.data, 24) != (MH_DYLDLINK | MH_TWOLEVEL))      { ret 1; }
+
+    # the loader, the dependency, and the dyld bind stream.
+    val dl: usize = t_find_lc(buf.data, LC_LOAD_DYLINKER);
+    if (dl == 0)                                                           { ret 1; }
+    if (!t_bytes_contain(buf.data, dl, bin.read_u32_le(buf.data, dl + 4)::usize, "/usr/lib/dyld")) { ret 1; }
+    val ld: usize = t_find_lc(buf.data, LC_LOAD_DYLIB);
+    if (ld == 0)                                                           { ret 1; }
+    if (!t_bytes_contain(buf.data, ld, bin.read_u32_le(buf.data, ld + 4)::usize, "libprobe.dylib")) { ret 1; }
+
+    val info: usize = t_find_lc(buf.data, LC_DYLD_INFO_ONLY);
+    if (info == 0)                                                         { ret 1; }
+    val bind_off:  usize = bin.read_u32_le(buf.data, info + 16)::usize;
+    val bind_size: usize = bin.read_u32_le(buf.data, info + 20)::usize;
+    if (bind_size == 0)                                                    { ret 1; }
+    if (!t_bytes_contain(buf.data, bind_off, bind_size, "probe_add"))      { ret 1; }
+
+    # one undefined import symbol in both tables.
+    val sy: usize = t_find_lc(buf.data, LC_SYMTAB);
+    if (sy == 0)                                                           { ret 1; }
+    if (bin.read_u32_le(buf.data, sy + 12) != 1)                          { ret 1; }
+    val dsy: usize = t_find_lc(buf.data, LC_DYSYMTAB);
+    if (dsy == 0)                                                          { ret 1; }
+    if (bin.read_u32_le(buf.data, dsy + 28) != 1)                         { ret 1; }
+
+    # the entry in the per-arch thread state.
+    val th: usize = t_find_lc(buf.data, LC_UNIXTHREAD);
+    if (th == 0)                                                           { ret 1; }
+    if (arch_id == isa.ARCH_AARCH64) {
+        if (bin.read_u64_le(buf.data, th + 16 + ARM_PC_STATE_OFFSET) != entry) { ret 1; }
+    }
+    or {
+        if (bin.read_u64_le(buf.data, th + 16 + X86_RIP_STATE_OFFSET) != entry) { ret 1; }
+    }
     ret 0;
 }
 
@@ -2020,5 +3030,14 @@ test "mach.lang.target.of.macho:exec_vtable_and_rejections" {
     if (ts_register() != 0)         { ret 1; }
     if (ts_unsupported_kind() != 0) { ret 1; }
     if (ts_bad_input() != 0)        { ret 1; }
+    ret 0;
+}
+
+# the dynamic-executable writer: the x86_64 and arm64 dyld-loadable skeletons
+# (loader + dependency load commands, the bind stream, the symbol tables, and the
+# thread entry).
+test "mach.lang.target.of.macho:dyn_exec" {
+    if (ts_dyn_exec(isa.ARCH_X86_64) != 0)  { ret 1; }
+    if (ts_dyn_exec(isa.ARCH_AARCH64) != 0) { ret 1; }
     ret 0;
 }

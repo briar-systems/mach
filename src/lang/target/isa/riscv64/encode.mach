@@ -94,7 +94,8 @@ val JALR:      u32 = 0x67;  # jump and link register (I-type)
 val LUI:       u32 = 0x37;  # load upper immediate (U-type)
 val AUIPC:     u32 = 0x17;  # add upper immediate to pc (U-type)
 val SYSTEM:    u32 = 0x73;  # ecall / ebreak
-val MISC_MEM:  u32 = 0x0F;  # fence (the only inline-asm consumer of this group)
+val MISC_MEM:  u32 = 0x0F;  # fence / pause (the inline-asm consumers of this group)
+val AMO:       u32 = 0x2F;  # RV64A atomics (lr / sc / amo*), R-type with aq/rl bits
 
 # the three-bit funct3 selectors. for the ALU groups these name the operation; for
 # loads / stores / branches they name the access width / relation (see the width
@@ -189,6 +190,27 @@ val FMT_D: u32 = 0x1;
 # assigned value.
 val FP_SCRATCH:  u32 = 31;
 val FP_SCRATCH2: u32 = 30;
+
+# the RV64A atomic width selector (funct3 of an AMO word): W is the 32-bit form, D the
+# 64-bit form. an rv32 reuses the W forms, so this split is the only XLEN-specific bit.
+val F3_AMO_W: u32 = 0x2;
+val F3_AMO_D: u32 = 0x3;
+
+# the RV64A atomic operation selectors (the 5-bit funct5 in an AMO word's bits [31:27]).
+# the aq / rl ordering bits sit just below in [26:25], so the assembled funct7 is
+# `(funct5 << 2) | (aq << 1) | rl`. lr / sc are the load-reserved / store-conditional
+# pair; the amo* forms are the read-modify-write atomics.
+val A5_LR:      u32 = 0x02;
+val A5_SC:      u32 = 0x03;
+val A5_AMOSWAP: u32 = 0x01;
+val A5_AMOADD:  u32 = 0x00;
+val A5_AMOXOR:  u32 = 0x04;
+val A5_AMOAND:  u32 = 0x0C;
+val A5_AMOOR:   u32 = 0x08;
+val A5_AMOMIN:  u32 = 0x10;
+val A5_AMOMAX:  u32 = 0x14;
+val A5_AMOMINU: u32 = 0x18;
+val A5_AMOMAXU: u32 = 0x1C;
 
 # the register roles the encoder uses directly, the leaf module's psABI ids cast to
 # the 5-bit register fields. ZERO discards writes and reads as 0; RA is the link
@@ -418,15 +440,33 @@ fun emit_mem_access(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width
     emit_word(st, pack_s(STORE, store_funct3(width), b, rt, d::u32 & 0xFFF));
 }
 
-# the frame-pointer offset of the slot a MIR value owns, or none when it owns no
-# slot. the slot table is keyed on the slot-owning vreg ids, so a physical-register
-# base (carrying MIR_VREG_NIL) never matches.
+# the bytes the prologue reserves at the top of the frame, just below the frame
+# pointer: the 16-byte ra / s0 record plus the callee-saved GP and FP save areas.
+# `s0` is pinned at the entry stack pointer (the frame top), so the shared frame
+# phase's frame-pointer-relative local offsets - which assume locals sit immediately
+# below the frame pointer - must be biased down past this reserved region or they
+# would alias the saved record. mirrors the layout `frame_total` / `emit_prologue`
+# / `save_callee_gp` emit. pub so the assembly printer biases its rendered slot
+# offsets by the exact reservation the encoder applies.
+pub fun frame_reserved_top(f: *mir.MirFunction) i64 {
+    val gp_bytes: u32 = popcount32(f.callee_mask) * 8;
+    val fp_bytes: u32 = popcount32(f.callee_mask_fp) * 8;
+    ret (16 + gp_bytes + fp_bytes)::i64;
+}
+
+# the frame-pointer (s0) relative offset of the slot a MIR value owns, or none when
+# it owns no slot. the shared frame phase assigns each slot an offset just below the
+# frame pointer; `s0` sits at the frame top with the ra / s0 record and the
+# callee-saved areas occupying the bytes immediately below it, so the stored offset
+# is biased down past that reserved region to land in the locals area. the slot
+# table is keyed on the slot-owning vreg ids, so a physical-register base (carrying
+# MIR_VREG_NIL) never matches.
 fun frame_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
     val frame: *mir.MirFrame = ?f.frame;
     if (frame.slots == nil) { ret O.none[i64](); }
     var i: u32 = 0;
     for (i < frame.slot_count) {
-        if (frame.slots[i].value == v) { ret O.some[i64](frame.slots[i].offset); }
+        if (frame.slots[i].value == v) { ret O.some[i64](frame.slots[i].offset - frame_reserved_top(f)); }
         i = i + 1;
     }
     ret O.none[i64]();
@@ -495,9 +535,14 @@ fun scale_shift(scale: u8) u32 {
 }
 
 # a three-address integer ALU op `op rd, rs1, rs2`. the operands resolve to
-# registers (an immediate source is materialized into the scratch register); the
-# width selects the full-register or RV64 word group through `alu_opcode`.
-fun encode_alu3(st: *encode.EncodeState, mi: *mir.MirInstr, funct3: u32, funct7: u32) R.Result[bool, str] {
+# registers (an immediate source is materialized into the scratch register).
+# `word_form` selects whether a 32-bit operation uses the RV64 word group: `mul` has
+# a `mulw` word form, so it sets it and `alu_opcode` picks OP_32 at 32-bit width; the
+# bitwise `and` / `or` / `xor` have NO word form (RISC-V defines no andw / orw /
+# xorw), so they clear it and always encode as the full-register OP. a bitwise op of
+# two consistently extended 32-bit operands yields a consistently extended result, so
+# the full-register form is correct at every width.
+fun encode_alu3(st: *encode.EncodeState, mi: *mir.MirInstr, funct3: u32, funct7: u32, word_form: bool) R.Result[bool, str] {
     if (mi.operand_count < 3) { ret R.err[bool, str]("encode: ALU op missing operands"); }
 
     val rdr: R.Result[i32, str] = req_gpr(?mi.operands[0]);
@@ -512,7 +557,9 @@ fun encode_alu3(st: *encode.EncodeState, mi: *mir.MirInstr, funct3: u32, funct7:
     if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
     val rs2: u32 = R.unwrap_ok[i32, str](rmr)::u32;
 
-    emit_word(st, pack_r(alu_opcode(mi.width), funct3, funct7, rd, rs1, rs2));
+    var opcode: u32 = OP;
+    if (word_form) { opcode = alu_opcode(mi.width); }
+    emit_word(st, pack_r(opcode, funct3, funct7, rd, rs1, rs2));
     ret R.ok[bool, str](true);
 }
 
@@ -1703,10 +1750,10 @@ fun encode_mir_instr(st: *encode.EncodeState, f: *mir.MirFunction, fn_base: u32,
     # concrete RV64 opcodes.
     if (op == riscv64.ADD::u16)    { ret encode_addsub(st, mi, false); }
     if (op == riscv64.SUB::u16)    { ret encode_addsub(st, mi, true); }
-    if (op == riscv64.MUL::u16)    { ret encode_alu3(st, mi, F3_ADD, F7_MULDIV); }
-    if (op == riscv64.AND::u16)    { ret encode_alu3(st, mi, F3_AND, F7_ZERO); }
-    if (op == riscv64.OR::u16)     { ret encode_alu3(st, mi, F3_OR, F7_ZERO); }
-    if (op == riscv64.XOR::u16)    { ret encode_alu3(st, mi, F3_XOR, F7_ZERO); }
+    if (op == riscv64.MUL::u16)    { ret encode_alu3(st, mi, F3_ADD, F7_MULDIV, true); }
+    if (op == riscv64.AND::u16)    { ret encode_alu3(st, mi, F3_AND, F7_ZERO, false); }
+    if (op == riscv64.OR::u16)     { ret encode_alu3(st, mi, F3_OR, F7_ZERO, false); }
+    if (op == riscv64.XOR::u16)    { ret encode_alu3(st, mi, F3_XOR, F7_ZERO, false); }
     if (op == riscv64.SLL::u16)    { ret encode_shift(st, mi, F3_SLL, false); }
     if (op == riscv64.SRL::u16)    { ret encode_shift(st, mi, F3_SRL, false); }
     if (op == riscv64.SRA::u16)    { ret encode_shift(st, mi, F3_SRL, true); }
@@ -1722,15 +1769,120 @@ fun encode_mir_instr(st: *encode.EncodeState, f: *mir.MirFunction, fn_base: u32,
     ret R.err[bool, str]("encode: unhandled opcode in riscv64 encode");
 }
 
+# the signed byte reach of a B-type conditional branch (13-bit immediate) and a
+# J-type jump (21-bit immediate). a fixup whose displacement falls outside its form's
+# range is relaxed into a longer reaching sequence before pass 2 fills the field.
+val B_DISP_MIN: i64 = -4096;
+val B_DISP_MAX: i64 = 4094;
+val J_DISP_MIN: i64 = -1048576;
+val J_DISP_MAX: i64 = 1048574;
+
+# repack the B-type word at `pos` with a new forward displacement, keeping its
+# relation funct3 and its rs1 / rs2. used to widen a relaxed conditional's inverted
+# guard when its trampoline grows.
+fun set_branch_disp(buf: *encode.ByteBuf, pos: usize, disp: u32) {
+    val word: u32 = read_word(buf, pos);
+    write_word(buf, pos, (word & 0x01FFF07F) | b_imm(disp));
+}
+
+# write the inverted guard of a relaxed conditional at `pos`: the original B-type
+# `bne` word with its relation inverted (funct3 ^ 1 flips the eq/ne, lt/ge, ltu/geu
+# pairs) and a forward `disp` that jumps over the trampoline carrying the far target.
+fun write_inverted_guard(buf: *encode.ByteBuf, pos: usize, bne_word: u32, disp: u32) {
+    val funct3: u32 = ((bne_word >> 12) & 0x7) ^ 0x1;
+    val rs1: u32 = (bne_word >> 15) & 0x1F;
+    val rs2: u32 = (bne_word >> 20) & 0x1F;
+    write_word(buf, pos, pack_b(BRANCH, funct3, rs1, rs2, disp));
+}
+
+# relax every out-of-range intra-function branch this function just emitted into a
+# reaching sequence, iterating to a fixpoint
+#
+# RISC-V conditional branches reach only +-4 KiB and unconditional `jal` only
+# +-1 MiB, so a large function body overflows a B-type displacement that the
+# +-4 KiB field cannot hold. a conditional past +-4 KiB becomes its inverted guard
+# (a short branch skipping the trampoline) followed by a `jal` to the real target;
+# a `jal` past +-1 MiB (an unconditional branch, or the `jal` a relaxed conditional
+# now points at) becomes an `auipc t0,%hi ; jalr x0,t0,%lo` pc-relative trampoline
+# reaching the full 32-bit range. each growth opens a text gap through
+# `encode.insert_text`, which slides the rest of the function down and fixes the
+# block / fixup / symbol / relocation tables, so each rescan remeasures against the
+# grown layout - the relaxation therefore iterates to a fixpoint. the inverted guard
+# is fully resolved here (its skip is purely local); the trampoline's real-target
+# displacement is left to pass 2 through the repointed fixup, whose patch word now
+# carries the `jal` / `auipc` opcode the patcher dispatches on. only fixups this
+# function recorded ([fixup_start, fixup_count)) are considered.
+fun relax_function_riscv64(st: *encode.EncodeState, fn_base: u32, fixup_start: u32) R.Result[bool, str] {
+    val count: u32 = st.fixup_count - fixup_start;
+    if (count == 0) { ret R.ok[bool, str](true); }
+
+    # one marker per fixup: set once the fixup has become a relaxed conditional, so a
+    # later jal->trampoline growth knows to widen the inverted guard at patch_pos - 4.
+    val res_marks: R.Result[*u8, str] = A.allocate[u8](st.alloc, count::usize);
+    if (R.is_err[*u8, str](res_marks)) { ret R.err[bool, str](R.unwrap_err[*u8, str](res_marks)); }
+    val relaxed: *u8 = R.unwrap_ok[*u8, str](res_marks);
+    var z: u32 = 0;
+    for (z < count) { relaxed[z] = 0; z = z + 1; }
+
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var i: u32 = fixup_start;
+        for (i < st.fixup_count) {
+            val fx: *encode.BranchFixup = ?st.fixups[i];
+            val res_off: R.Result[u32, str] = encode.block_offset(st, fn_base, fx.target_block);
+            if (R.is_err[u32, str](res_off)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_off)); }
+            val target_off: u32 = R.unwrap_ok[u32, str](res_off);
+            val word: u32 = read_word(?st.buf, fx.patch_pos::usize);
+            val opcode: u32 = word & 0x7F;
+            val sdisp: i64 = (target_off::i64) - (fx.patch_pos::i64);
+
+            if (opcode == BRANCH && (sdisp < B_DISP_MIN || sdisp > B_DISP_MAX)) {
+                val guard_pos: u32 = fx.patch_pos;
+                val jal_pos: u32 = fx.patch_pos + 4;
+                val ins: R.Result[bool, str] = encode.insert_text(st, jal_pos, 4);
+                if (R.is_err[bool, str](ins)) { ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
+                write_inverted_guard(?st.buf, guard_pos::usize, word, 8);
+                write_word(?st.buf, jal_pos::usize, pack_j(JAL, RZERO, 0));
+                fx.patch_pos = jal_pos;
+                fx.next_ip   = jal_pos + 4;
+                relaxed[i - fixup_start] = 1;
+                changed = true;
+                brk;
+            }
+            if (opcode == JAL && (sdisp < J_DISP_MIN || sdisp > J_DISP_MAX)) {
+                val auipc_pos: u32 = fx.patch_pos;
+                val jalr_pos: u32 = fx.patch_pos + 4;
+                val ins: R.Result[bool, str] = encode.insert_text(st, jalr_pos, 4);
+                if (R.is_err[bool, str](ins)) { ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
+                write_word(?st.buf, auipc_pos::usize, pack_u(AUIPC, SCRATCH, 0));
+                write_word(?st.buf, jalr_pos::usize, pack_i(JALR, F3_ADD, RZERO, SCRATCH, 0));
+                fx.next_ip = auipc_pos + 8;
+                if (relaxed[i - fixup_start] != 0) {
+                    val guard_pos: u32 = auipc_pos - 4;
+                    set_branch_disp(?st.buf, guard_pos::usize, fx.next_ip - guard_pos);
+                }
+                changed = true;
+                brk;
+            }
+            i = i + 1;
+        }
+    }
+    A.deallocate[u8](st.alloc, relaxed, count::usize);
+    ret R.ok[bool, str](true);
+}
+
 # the per-function encode hook (pass 1). marks the function entry symbol, emits the
 # prologue (skipped for a naked asm-only function, whose inline asm owns the stack),
 # then each block - emitting the epilogue before every RET - recording each block's
-# `.text` offset for branch patching. extern / body-less functions contribute no
-# text. the callee-saved GP and FP registers are spilled / reloaded by the prologue /
-# epilogue from the frame facts.
+# `.text` offset for branch patching, and finally relaxes any branch whose body grew
+# past its displacement range. extern / body-less functions contribute no text. the
+# callee-saved GP and FP registers are spilled / reloaded by the prologue / epilogue
+# from the frame facts.
 fun encode_function_riscv64(st: *encode.EncodeState, f: *mir.MirFunction) R.Result[bool, str] {
     val fn_base: u32 = st.buf.len::u32;
     if (f.block_count == 0) { ret R.ok[bool, str](true); }
+    val fixup_start: u32 = st.fixup_count;
 
     val ms: R.Result[bool, str] = encode.push_symbol(st, f.name, fn_base, of.SYM_OBJ_FLAG_FUNCTION);
     if (R.is_err[bool, str](ms)) { ret ms; }
@@ -1757,15 +1909,18 @@ fun encode_function_riscv64(st: *encode.EncodeState, f: *mir.MirFunction) R.Resu
         }
         bi = bi + 1;
     }
-    ret R.ok[bool, str](true);
+    ret relax_function_riscv64(st, fn_base, fixup_start);
 }
 
 # the per-branch patch hook (pass 2). reads the placeholder instruction word at the
 # fixup's patch site, computes the instruction-relative signed displacement
 # (`target_off - patch_pos`, with no next-instruction bias - RISC-V branch / jump
 # offsets are relative to the branch's own address), range-checks it against the
-# field width, scatters it into the B-type (13-bit, +-4 KiB) or J-type (21-bit,
-# +-1 MiB) immediate, and writes the word back. an out-of-range displacement is
+# field width, scatters it into the B-type (13-bit, +-4 KiB), J-type (21-bit,
+# +-1 MiB), or relaxed `auipc + jalr` (32-bit pc-relative) immediate, and writes the
+# word(s) back. branch relaxation (`relax_function_riscv64`) runs before pass 2, so a
+# fixup whose target was out of range now carries a `jal` / `auipc` opcode that
+# reaches it; a displacement still out of its form's range here is a backend bug,
 # rejected loudly rather than truncated into a miscompile.
 fun patch_branch_riscv64(st: *encode.EncodeState, fx: *encode.BranchFixup, target_off: u32) R.Result[bool, str] {
     val pos: usize = fx.patch_pos::usize;
@@ -1782,7 +1937,7 @@ fun patch_branch_riscv64(st: *encode.EncodeState, fx: *encode.BranchFixup, targe
 
     if (opcode == JAL) {
         # J-type: +-1 MiB. the non-immediate bits are rd[11:7] and opcode[6:0].
-        if (sdisp < -1048576 || sdisp > 1048574) {
+        if (sdisp < J_DISP_MIN || sdisp > J_DISP_MAX) {
             ret R.err[bool, str]("encode: riscv64 jump displacement exceeds the +-1MiB range");
         }
         write_word(?st.buf, pos, (word & 0xFFF) | j_imm(disp));
@@ -1790,13 +1945,29 @@ fun patch_branch_riscv64(st: *encode.EncodeState, fx: *encode.BranchFixup, targe
     }
     if (opcode == BRANCH) {
         # B-type: +-4 KiB. the kept bits are rs2 / rs1 / funct3 / opcode.
-        if (sdisp < -4096 || sdisp > 4094) {
+        if (sdisp < B_DISP_MIN || sdisp > B_DISP_MAX) {
             ret R.err[bool, str]("encode: riscv64 branch displacement exceeds the +-4KiB range");
         }
         write_word(?st.buf, pos, (word & 0x01FFF07F) | b_imm(disp));
         ret R.ok[bool, str](true);
     }
-    ret R.err[bool, str]("encode: branch fixup site is not a B-type or J-type instruction");
+    if (opcode == AUIPC) {
+        # relaxed far trampoline: `auipc t0,%hi(disp) ; jalr x0,t0,%lo(disp)`, both
+        # pc-relative from the auipc, so the displacement spans the 32-bit signed
+        # range (the +0x800 rounding folds the signed low 12 back into the high 20).
+        if (pos + 8 > st.buf.len) {
+            ret R.err[bool, str]("encode: riscv64 trampoline fixup site is outside the text buffer");
+        }
+        if (sdisp < -2147483648 || sdisp > 2147483647) {
+            ret R.err[bool, str]("encode: riscv64 trampoline displacement exceeds the 32-bit pc-relative range");
+        }
+        val hi20: u32 = ((disp + 0x800) >> 12) & 0xFFFFF;
+        val lo12: u32 = disp & 0xFFF;
+        write_word(?st.buf, pos, pack_u(AUIPC, SCRATCH, hi20));
+        write_word(?st.buf, pos + 4, pack_i(JALR, F3_ADD, RZERO, SCRATCH, lo12));
+        ret R.ok[bool, str](true);
+    }
+    ret R.err[bool, str]("encode: branch fixup site is not a B-type, J-type, or trampoline instruction");
 }
 
 # the RV64 ISA's `encode` entry point - a thin wrapper that supplies the two RISC-V
@@ -1891,11 +2062,23 @@ fun asm_token(s: str, start: usize, out: *u8, cap: usize, next: *usize) bool {
     ret j > 0;
 }
 
+# true when `mnem` names an RV64A atomic (lr / sc / amo*). the width (.w/.d) and
+# ordering (.aq/.rl/.aqrl) suffixes ride along, so a prefix test classifies the whole
+# family. used by the clobber classifier - lr / sc / amo* all write their rd operand.
+fun rv_mnem_is_amo(mnem: str) bool {
+    val len: usize = str_len(mnem);
+    if (len >= 3 && mnem[0] == 'l'::char && mnem[1] == 'r'::char && mnem[2] == '.'::char) { ret true; }
+    if (len >= 3 && mnem[0] == 's'::char && mnem[1] == 'c'::char && mnem[2] == '.'::char) { ret true; }
+    if (len >= 3 && mnem[0] == 'a'::char && mnem[1] == 'm'::char && mnem[2] == 'o'::char) { ret true; }
+    ret false;
+}
+
 # OR the registers one trimmed RISC-V inline-asm statement writes into `@gp`. a
 # leading `label:` is stripped and the remainder re-dispatched. a call clobbers the
-# caller-saved file; the stores / branches / system / fence / return forms write
-# nothing; the recognized destination-writing forms clobber their first register
-# operand; an unrecognized statement conservatively clobbers everything.
+# caller-saved file; the stores / branches / system / fence / pause / return forms write
+# nothing; the recognized destination-writing forms (including the RV64A atomics) clobber
+# their first register operand; an unrecognized statement conservatively clobbers
+# everything.
 fun asm_stmt_clobbers(s: str, gp: *u32, fp: *u32) {
     var mbuf: [32]u8;
     var after: usize = 0;
@@ -1916,6 +2099,7 @@ fun asm_stmt_clobbers(s: str, gp: *u32, fp: *u32) {
     if (str_equals(mnem, "sb") || str_equals(mnem, "sh") || str_equals(mnem, "sw") ||
         str_equals(mnem, "sd") || str_equals(mnem, "nop") || str_equals(mnem, "ret") ||
         str_equals(mnem, "ecall") || str_equals(mnem, "ebreak") || str_equals(mnem, "fence") ||
+        str_equals(mnem, "pause") ||
         str_equals(mnem, "j") || str_equals(mnem, "jr") ||
         str_equals(mnem, "beq") || str_equals(mnem, "bne") || str_equals(mnem, "blt") ||
         str_equals(mnem, "bge") || str_equals(mnem, "bltu") || str_equals(mnem, "bgeu") ||
@@ -1933,8 +2117,10 @@ fun asm_stmt_clobbers(s: str, gp: *u32, fp: *u32) {
         ret;
     }
 
-    # the destination-writing forms clobber their first register operand (rd).
-    if (str_equals(mnem, "li") || str_equals(mnem, "la") || str_equals(mnem, "lui") ||
+    # the destination-writing forms clobber their first register operand (rd). the
+    # RV64A atomics (lr / sc / amo*) join this set: each writes rd, the leftmost operand.
+    if (rv_mnem_is_amo(mnem) ||
+        str_equals(mnem, "li") || str_equals(mnem, "la") || str_equals(mnem, "lui") ||
         str_equals(mnem, "auipc") || str_equals(mnem, "mv") || str_equals(mnem, "neg") ||
         str_equals(mnem, "not") || str_equals(mnem, "seqz") || str_equals(mnem, "snez") ||
         str_equals(mnem, "add") || str_equals(mnem, "addi") || str_equals(mnem, "sub") ||
@@ -2677,6 +2863,84 @@ fun rv_jalr(st: *encode.EncodeState, args: str, default_rd: u32) R.Result[bool, 
     ret R.err[bool, str]("encode: inline-asm jalr expects rs or rd, rs, imm");
 }
 
+# strip a trailing RV64A ordering suffix (`.aqrl` / `.aq` / `.rl`) from atomic mnemonic
+# `mnem` of length `len`, returning the length without the suffix and setting the aq / rl
+# bits. an atomic with no ordering suffix leaves both clear.
+fun rv_amo_ordering(mnem: str, len: usize, aq_out: *bool, rl_out: *bool) usize {
+    @aq_out = false; @rl_out = false;
+    if (len >= 5 && str_region_equals(mnem, len - 5, 5, ".aqrl")) { @aq_out = true; @rl_out = true; ret len - 5; }
+    if (len >= 3 && str_region_equals(mnem, len - 3, 3, ".aq"))   { @aq_out = true; ret len - 3; }
+    if (len >= 3 && str_region_equals(mnem, len - 3, 3, ".rl"))   { @rl_out = true; ret len - 3; }
+    ret len;
+}
+
+# map an atomic base name `mnem[0..len)` (the mnemonic with its width and ordering
+# suffixes already stripped) to its 5-bit funct5, setting `is_lr_out` for the two-operand
+# `lr` form. returns false when the base is not an RV64A atomic.
+fun rv_amo_base(mnem: str, len: usize, funct5_out: *u32, is_lr_out: *bool) bool {
+    @is_lr_out = false;
+    if (str_region_equals(mnem, 0, len, "lr"))      { @funct5_out = A5_LR; @is_lr_out = true; ret true; }
+    if (str_region_equals(mnem, 0, len, "sc"))      { @funct5_out = A5_SC;      ret true; }
+    if (str_region_equals(mnem, 0, len, "amoswap")) { @funct5_out = A5_AMOSWAP; ret true; }
+    if (str_region_equals(mnem, 0, len, "amoadd"))  { @funct5_out = A5_AMOADD;  ret true; }
+    if (str_region_equals(mnem, 0, len, "amoand"))  { @funct5_out = A5_AMOAND;  ret true; }
+    if (str_region_equals(mnem, 0, len, "amoor"))   { @funct5_out = A5_AMOOR;   ret true; }
+    if (str_region_equals(mnem, 0, len, "amoxor"))  { @funct5_out = A5_AMOXOR;  ret true; }
+    if (str_region_equals(mnem, 0, len, "amomax"))  { @funct5_out = A5_AMOMAX;  ret true; }
+    if (str_region_equals(mnem, 0, len, "amomin"))  { @funct5_out = A5_AMOMIN;  ret true; }
+    if (str_region_equals(mnem, 0, len, "amomaxu")) { @funct5_out = A5_AMOMAXU; ret true; }
+    if (str_region_equals(mnem, 0, len, "amominu")) { @funct5_out = A5_AMOMINU; ret true; }
+    ret false;
+}
+
+# encode one RV64A atomic statement (the AMO major opcode, R-type with the aq / rl
+# ordering bits folded into funct7). `lr` is `rd, (rs1)` with rs2 forced to x0; `sc` and
+# the `amo*` read-modify-writes are `rd, rs2, (rs1)`. the address is the base-only
+# `(rs1)` form atomics require - a displacement is rejected, unlike a regular load /
+# store. `matched` is set only when `mnem` decodes to a real atomic, so an unrelated
+# mnemonic falls through to the dispatch's unsupported-mnemonic error.
+fun rv_amo(st: *encode.EncodeState, mnem: str, args: str, matched: *bool) R.Result[bool, str] {
+    @matched = false;
+    val len: usize = str_len(mnem);
+    var aq: bool = false; var rl: bool = false;
+    val wlen: usize = rv_amo_ordering(mnem, len, ?aq, ?rl);
+    if (wlen < 4) { ret R.ok[bool, str](true); }
+    var funct3: u32 = 0;
+    if (str_region_equals(mnem, wlen - 2, 2, ".w")) { funct3 = F3_AMO_W; }
+    or (str_region_equals(mnem, wlen - 2, 2, ".d")) { funct3 = F3_AMO_D; }
+    or { ret R.ok[bool, str](true); }
+    var funct5: u32 = 0; var is_lr: bool = false;
+    if (!rv_amo_base(mnem, wlen - 2, ?funct5, ?is_lr)) { ret R.ok[bool, str](true); }
+    @matched = true;
+
+    var funct7: u32 = funct5 << 2;
+    if (aq) { funct7 = funct7 | 0x2; }
+    if (rl) { funct7 = funct7 | 0x1; }
+
+    var b0: [64]u8; var b1: [64]u8; var b2: [64]u8; var b3: [64]u8;
+    var n: u32 = 0;
+    if (!rv_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 64, ?n)) { ret R.err[bool, str]("encode: malformed inline-asm atomic operands"); }
+
+    if (is_lr) {
+        if (n != 2)                                                         { ret R.err[bool, str]("encode: inline-asm 'lr' expects rd, (rs1)"); }
+        var rd: RvAsmOp; var mem: RvAsmOp;
+        if (!rv_parse_operand((?b0[0])::str, ?rd) || rd.kind != RVOP_REG)   { ret R.err[bool, str]("encode: inline-asm 'lr' destination must be a register"); }
+        if (!rv_parse_operand((?b1[0])::str, ?mem) || mem.kind != RVOP_MEM) { ret R.err[bool, str]("encode: inline-asm 'lr' address must be (rs1)"); }
+        if (mem.imm != 0)                                                   { ret R.err[bool, str]("encode: inline-asm atomic address takes no displacement"); }
+        emit_word(st, pack_r(AMO, funct3, funct7, rd.reg::u32, mem.reg::u32, RZERO));
+        ret R.ok[bool, str](true);
+    }
+
+    if (n != 3)                                                        { ret R.err[bool, str]("encode: inline-asm atomic expects rd, rs2, (rs1)"); }
+    var rd: RvAsmOp; var rs2: RvAsmOp; var mem: RvAsmOp;
+    if (!rv_parse_operand((?b0[0])::str, ?rd) || rd.kind != RVOP_REG)   { ret R.err[bool, str]("encode: inline-asm atomic destination must be a register"); }
+    if (!rv_parse_operand((?b1[0])::str, ?rs2) || rs2.kind != RVOP_REG) { ret R.err[bool, str]("encode: inline-asm atomic source must be a register"); }
+    if (!rv_parse_operand((?b2[0])::str, ?mem) || mem.kind != RVOP_MEM) { ret R.err[bool, str]("encode: inline-asm atomic address must be (rs1)"); }
+    if (mem.imm != 0)                                                   { ret R.err[bool, str]("encode: inline-asm atomic address takes no displacement"); }
+    emit_word(st, pack_r(AMO, funct3, funct7, rd.reg::u32, mem.reg::u32, rs2.reg::u32));
+    ret R.ok[bool, str](true);
+}
+
 # parse and encode one trimmed inline-asm statement. a numeric local-label definition
 # `<digits>:` records the current offset (resolving forward references) and re-dispatches
 # any instruction following it. an unrecognized mnemonic is a hard error so the
@@ -2703,6 +2967,7 @@ fun encode_asm_stmt_riscv64(st: *encode.EncodeState, f: *mir.MirFunction, fn_bas
     if (str_equals(mnem, "nop"))    { emit_word(st, pack_i(OP_IMM, F3_ADD, RZERO, RZERO, 0)); ret R.ok[bool, str](true); }
     if (str_equals(mnem, "ret"))    { emit_word(st, pack_i(JALR, F3_ADD, RZERO, RRA, 0)); ret R.ok[bool, str](true); }
     if (str_equals(mnem, "fence"))  { emit_word(st, pack_i(MISC_MEM, F3_ADD, RZERO, RZERO, 0xFF)); ret R.ok[bool, str](true); }
+    if (str_equals(mnem, "pause"))  { emit_word(st, pack_i(MISC_MEM, F3_ADD, RZERO, RZERO, 0x010)); ret R.ok[bool, str](true); }
 
     # register-register ALU (R-type).
     if (str_equals(mnem, "add"))    { ret rv_three_reg(st, args, OP, F3_ADD, F7_ZERO); }
@@ -2843,6 +3108,12 @@ fun encode_asm_stmt_riscv64(st: *encode.EncodeState, f: *mir.MirFunction, fn_bas
         emit_word(st, pack_i(OP_IMM_32, F3_ADD, rd, rs, 0));
         ret R.ok[bool, str](true);
     }
+
+    # atomics (RV64A) - lr / sc / amo* with their width (.w/.d) and ordering
+    # (.aq/.rl/.aqrl) suffixes parsed inline; only a real atomic claims the dispatch.
+    var amo_matched: bool = false;
+    val amo_r: R.Result[bool, str] = rv_amo(st, mnem, args, ?amo_matched);
+    if (amo_matched) { ret amo_r; }
 
     ret R.err[bool, str](rv_named_err(st, "encode: unsupported riscv64 inline-asm mnemonic '", mnem, "'", "encode: unsupported riscv64 inline-asm mnemonic"));
 }
@@ -3626,6 +3897,17 @@ test "mach.lang.target.isa.riscv64.encode:asm_clobbers_classification" {
     if ((gp & (1::u32 << 5)) == 0) { bad = 1; }  # t0 = x5
     if ((gp & ~(1::u32 << 5)) != 0) { bad = 1; } # nothing else
 
+    # the RV64A atomics write their rd operand (the leftmost register); pause writes
+    # nothing. lr / sc / amo* must classify precisely, not fall to the all-clobber path.
+    gp = 0; fp = 0;
+    asm_clobbers("lr.d t0, (a1)\nsc.d t1, a2, (a1)\namoadd.d.aqrl a0, a2, (a1)\npause", ?gp, ?fp);
+    if ((gp & (1::u32 << 5)) == 0)  { bad = 1; }  # t0 = x5 written by lr.d
+    if ((gp & (1::u32 << 6)) == 0)  { bad = 1; }  # t1 = x6 written by sc.d
+    if ((gp & (1::u32 << 10)) == 0) { bad = 1; }  # a0 = x10 written by amoadd.d.aqrl
+    val amo_mask: u32 = (1::u32 << 5) | (1::u32 << 6) | (1::u32 << 10);
+    if ((gp & ~amo_mask) != 0) { bad = 1; }       # nothing else (pause writes none)
+    if (fp != 0) { bad = 1; }
+
     # an unrecognized statement conservatively clobbers everything.
     gp = 0; fp = 0;
     asm_clobbers("frobnicate a0, a1", ?gp, ?fp);
@@ -3828,6 +4110,110 @@ test "mach.lang.target.isa.riscv64.encode:inline_asm_symbol_relocs" {
 
     # an unknown mnemonic is a hard error, not silent bytes.
     val ur: R.Result[bool, str] = encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "frobnicate a0, a1");
+    if (!R.is_err[bool, str](ur)) { bad = 1; }
+    or { if (!str_contains(R.unwrap_err[bool, str](ur), "unsupported riscv64 inline-asm mnemonic")) { bad = 1; } }
+
+    rv_labels_dnit(?labels);
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# the RV64A atomic family (lr / sc / amo*) selects the AMO opcode, the .w / .d width
+# funct3, the per-operation funct5, and the .aq / .rl / .aqrl ordering bits, all
+# byte-exact against `llvm-mc -triple=riscv64 -mattr=+a --show-encoding`. `pause` is the
+# fence hint. registers a0/a1/a2 = x10/x11/x12; the address is the base-only `(a1)` form.
+test "mach.lang.target.isa.riscv64.encode:inline_asm_atomics" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: RvLabels;
+    rv_labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "lr.w a0, (a1)");           # 0
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "lr.d a0, (a1)");           # 4
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "sc.w a0, a2, (a1)");       # 8
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "sc.d a0, a2, (a1)");       # 12
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoswap.w a0, a2, (a1)");  # 16
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoswap.d a0, a2, (a1)");  # 20
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoadd.w a0, a2, (a1)");   # 24
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoadd.d a0, a2, (a1)");   # 28
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoand.w a0, a2, (a1)");   # 32
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoand.d a0, a2, (a1)");   # 36
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoor.w a0, a2, (a1)");    # 40
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoor.d a0, a2, (a1)");    # 44
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoxor.w a0, a2, (a1)");   # 48
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoxor.d a0, a2, (a1)");   # 52
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amomax.w a0, a2, (a1)");   # 56
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amomax.d a0, a2, (a1)");   # 60
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amomin.w a0, a2, (a1)");   # 64
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amomin.d a0, a2, (a1)");   # 68
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amomaxu.w a0, a2, (a1)");  # 72
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amomaxu.d a0, a2, (a1)");  # 76
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amominu.w a0, a2, (a1)");  # 80
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amominu.d a0, a2, (a1)");  # 84
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "lr.w.aq a0, (a1)");        # 88
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "lr.d.aq a0, (a1)");        # 92
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "lr.w.aqrl a0, (a1)");      # 96
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "sc.w.rl a0, a2, (a1)");    # 100
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "sc.d.rl a0, a2, (a1)");    # 104
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "sc.d.aqrl a0, a2, (a1)");  # 108
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoswap.w.aq a0, a2, (a1)");  # 112
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoswap.d.rl a0, a2, (a1)");  # 116
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoadd.w.aqrl a0, a2, (a1)"); # 120
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoadd.d.aq a0, a2, (a1)");   # 124
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoadd.d.rl a0, a2, (a1)");   # 128
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoadd.d.aqrl a0, a2, (a1)"); # 132
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amomaxu.d.aqrl a0, a2, (a1)");# 136
+    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "pause");                   # 140
+
+    if (read_word(?st.buf, 0)   != 0x1005A52F) { bad = 1; }
+    if (read_word(?st.buf, 4)   != 0x1005B52F) { bad = 1; }
+    if (read_word(?st.buf, 8)   != 0x18C5A52F) { bad = 1; }
+    if (read_word(?st.buf, 12)  != 0x18C5B52F) { bad = 1; }
+    if (read_word(?st.buf, 16)  != 0x08C5A52F) { bad = 1; }
+    if (read_word(?st.buf, 20)  != 0x08C5B52F) { bad = 1; }
+    if (read_word(?st.buf, 24)  != 0x00C5A52F) { bad = 1; }
+    if (read_word(?st.buf, 28)  != 0x00C5B52F) { bad = 1; }
+    if (read_word(?st.buf, 32)  != 0x60C5A52F) { bad = 1; }
+    if (read_word(?st.buf, 36)  != 0x60C5B52F) { bad = 1; }
+    if (read_word(?st.buf, 40)  != 0x40C5A52F) { bad = 1; }
+    if (read_word(?st.buf, 44)  != 0x40C5B52F) { bad = 1; }
+    if (read_word(?st.buf, 48)  != 0x20C5A52F) { bad = 1; }
+    if (read_word(?st.buf, 52)  != 0x20C5B52F) { bad = 1; }
+    if (read_word(?st.buf, 56)  != 0xA0C5A52F) { bad = 1; }
+    if (read_word(?st.buf, 60)  != 0xA0C5B52F) { bad = 1; }
+    if (read_word(?st.buf, 64)  != 0x80C5A52F) { bad = 1; }
+    if (read_word(?st.buf, 68)  != 0x80C5B52F) { bad = 1; }
+    if (read_word(?st.buf, 72)  != 0xE0C5A52F) { bad = 1; }
+    if (read_word(?st.buf, 76)  != 0xE0C5B52F) { bad = 1; }
+    if (read_word(?st.buf, 80)  != 0xC0C5A52F) { bad = 1; }
+    if (read_word(?st.buf, 84)  != 0xC0C5B52F) { bad = 1; }
+    if (read_word(?st.buf, 88)  != 0x1405A52F) { bad = 1; }
+    if (read_word(?st.buf, 92)  != 0x1405B52F) { bad = 1; }
+    if (read_word(?st.buf, 96)  != 0x1605A52F) { bad = 1; }
+    if (read_word(?st.buf, 100) != 0x1AC5A52F) { bad = 1; }
+    if (read_word(?st.buf, 104) != 0x1AC5B52F) { bad = 1; }
+    if (read_word(?st.buf, 108) != 0x1EC5B52F) { bad = 1; }
+    if (read_word(?st.buf, 112) != 0x0CC5A52F) { bad = 1; }
+    if (read_word(?st.buf, 116) != 0x0AC5B52F) { bad = 1; }
+    if (read_word(?st.buf, 120) != 0x06C5A52F) { bad = 1; }
+    if (read_word(?st.buf, 124) != 0x04C5B52F) { bad = 1; }
+    if (read_word(?st.buf, 128) != 0x02C5B52F) { bad = 1; }
+    if (read_word(?st.buf, 132) != 0x06C5B52F) { bad = 1; }
+    if (read_word(?st.buf, 136) != 0xE6C5B52F) { bad = 1; }
+    if (read_word(?st.buf, 140) != 0x0100000F) { bad = 1; }
+
+    # an atomic address takes no displacement, unlike a regular load / store.
+    val dr: R.Result[bool, str] = encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "lr.d a0, 8(a1)");
+    if (!R.is_err[bool, str](dr)) { bad = 1; }
+    or { if (!str_contains(R.unwrap_err[bool, str](dr), "no displacement")) { bad = 1; } }
+
+    # a non-atomic mnemonic that shares the `amo` prefix is still unsupported, not
+    # silently swallowed by the atomic dispatch.
+    val ur: R.Result[bool, str] = encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amobogus.q a0, a2, (a1)");
     if (!R.is_err[bool, str](ur)) { bad = 1; }
     or { if (!str_contains(R.unwrap_err[bool, str](ur), "unsupported riscv64 inline-asm mnemonic")) { bad = 1; } }
 

@@ -9,9 +9,13 @@
 # and qemu-riscv64 (or qemu-riscv64-static) for the exit-code run.
 set -euo pipefail
 
-# the computed exit code the fixture returns (sum 0..9 plus the const-shift call
-# argument 1 << 3 = 8, i.e. 45 + 8), the qemu e2e asserts it.
-expect_code=53
+# the computed exit code the fixture returns, low 8 bits of the running sum: sum 0..9
+# (45) plus the const-shift call argument 1 << 3 (8), the stack-local frame-slot probe
+# (#1670), the >4KiB long-branch relaxation probe (#1666), the 32-bit bitwise
+# word-group probe (#1672), and the RV64A atomics probe (#1668, 18 = swapped 7 +
+# post-rmw cell 11), wrapping to 70. the qemu e2e asserts the exact code, so a
+# regression in any of those changes it.
+expect_code=70
 
 mach="${1:-mach}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -41,26 +45,64 @@ rm -rf out
 "$mach" build . --target "$target" --profile debug
 obj="$(find out -name '*.o' -print -quit)"
 
+# the disassembly checks read from here-strings rather than `echo "$x" | grep`: under
+# `pipefail` a `grep -q` that matches early closes the pipe, and on a large
+# disassembly the producing `echo` then dies with SIGPIPE and fails the pipeline
+# despite the match. a here-string has no pipe writer to kill.
 echo "verifying elf header of $exe"
 hdr="$("$readelf" -h "$exe")"
-echo "$hdr" | grep -q 'Class:.*ELF64'            || fail "exe is not ELFCLASS64"
-echo "$hdr" | grep -q 'Machine:.*RISC-V'         || fail "exe e_machine is not EM_RISCV"
-echo "$hdr" | grep -q 'Type:.*EXEC'              || fail "exe is not ET_EXEC"
-echo "$hdr" | grep -qE 'Entry point address:.*0x[0-9a-fA-F]+' || fail "exe has no entry point"
-echo "$hdr" | grep -q 'Entry point address:.*0x0$' && fail "exe entry point is zero"
+grep -q 'Class:.*ELF64'            <<< "$hdr" || fail "exe is not ELFCLASS64"
+grep -q 'Machine:.*RISC-V'         <<< "$hdr" || fail "exe e_machine is not EM_RISCV"
+grep -q 'Type:.*EXEC'              <<< "$hdr" || fail "exe is not ET_EXEC"
+grep -qE 'Entry point address:.*0x[0-9a-fA-F]+' <<< "$hdr" || fail "exe has no entry point"
+grep -q 'Entry point address:.*0x0$' <<< "$hdr" && fail "exe entry point is zero"
 
+# the backend emits M (mul / div / rem), F/D (scalar float), and A (atomics)
+# instructions but does not yet write a `.riscv.attributes` ISA-string section, so
+# objdump defaults to base RV64I and renders those valid words as `<unknown>`. decode
+# with the extensions the backend actually emits so the `<unknown>` guard still
+# catches a genuinely malformed word rather than a correctly-encoded M / F / D / A
+# instruction.
 echo "verifying disassembly of $exe"
-dis="$("$objdump" -d "$exe")"
-echo "$dis" | grep -q 'file format elf64-littleriscv' || fail "objdump did not parse a little-endian rv64 elf"
-echo "$dis" | grep -qi '<unknown>'                    && fail "objdump found an unknown instruction word"
+dis="$("$objdump" -d --mattr=+m,+f,+d,+a "$exe")"
+grep -q 'file format elf64-littleriscv' <<< "$dis" || fail "objdump did not parse a little-endian rv64 elf"
+grep -qi '<unknown>'                    <<< "$dis" && fail "objdump found an unknown instruction word"
 for mnem in auipc jalr ld sd addi sll ret ecall; do
-    echo "$dis" | grep -qw "$mnem" || fail "expected mnemonic '$mnem' not in disassembly"
+    grep -qw "$mnem" <<< "$dis" || fail "expected mnemonic '$mnem' not in disassembly"
 done
+# the RV64A atomics the probe emits must disassemble as the real instructions.
+for mnem in lr.d sc.d amoadd.d; do
+    grep -qw "$mnem" <<< "$dis" || fail "expected RV64A mnemonic '$mnem' not in disassembly"
+done
+
+# assert the >4KiB probe forced long-branch relaxation (#1666): an inverted guard
+# that skips exactly its own +8 (the trampoline word) immediately followed by an
+# unconditional `j` to a target beyond the B-type +-4KiB range. without relaxation
+# the build would have failed to encode, so this confirms the relaxed form shipped.
+echo "verifying long-branch relaxation in $exe"
+mapfile -t dlines < <(printf '%s\n' "$dis")
+relax_found=0
+for ((li=0; li<${#dlines[@]}-1; li++)); do
+    l1="${dlines[li]}"; l2="${dlines[li+1]}"
+    grep -qE $'\t(beqz|bnez|bltz|bgez|blez|bgtz|beq|bne|blt|bge|bltu|bgeu)\t' <<< "$l1" || continue
+    grep -qE $'\tj\t' <<< "$l2" || continue
+    a1="$(echo "${l1%%:*}" | tr -d '[:space:]')"
+    aj="$(echo "${l2%%:*}" | tr -d '[:space:]')"
+    [[ "$a1" =~ ^[0-9a-fA-F]+$ && "$aj" =~ ^[0-9a-fA-F]+$ ]] || continue
+    t1="$(echo "$l1" | grep -oE '0x[0-9a-f]+' | head -1)"
+    tj="$(echo "$l2" | grep -oE '0x[0-9a-f]+' | head -1)"
+    [ -n "$t1" ] && [ -n "$tj" ] || continue
+    da1=$((16#$a1)); daj=$((16#$aj)); dt1=$((t1)); dtj=$((tj))
+    [ "$dt1" -eq $((da1 + 8)) ] || continue
+    dd=$(( dtj > daj ? dtj - daj : daj - dtj ))
+    if [ "$dd" -gt 4094 ]; then relax_found=1; break; fi
+done
+[ "$relax_found" -eq 1 ] || fail "no relaxed out-of-range conditional branch (inverted guard + jal) found"
 
 echo "verifying relocations in $obj"
 rel="$("$readobj" -r "$obj")"
 for r in R_RISCV_PCREL_HI20 R_RISCV_PCREL_LO12_I R_RISCV_PCREL_LO12_S R_RISCV_CALL_PLT; do
-    echo "$rel" | grep -q "$r" || fail "expected relocation '$r' not emitted"
+    grep -q "$r" <<< "$rel" || fail "expected relocation '$r' not emitted"
 done
 
 echo "running $exe under qemu-riscv64"

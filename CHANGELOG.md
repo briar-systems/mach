@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.0] - 2026-06-27
+
+Darwin executables, the constant-time secret qualifier in the type checker, and
+the riscv64 backend hardened against real code. macOS now has working dynamic
+executables, completing both Darwin triples, and a sweep driven by compiling and
+running real std under qemu closed every riscv64 codegen gap real programs hit.
+No breaking changes.
+
+### Added
+
+- target: a macOS / Darwin OS substrate plus Mach-O dynamic executables (an
+  `emit_dyn_exec` that writes `LC_LOAD_DYLINKER`, `LC_LOAD_DYLIB`, an
+  `LC_DYLD_INFO_ONLY` bind stream, `LC_SYMTAB`/`LC_DYSYMTAB`, `LC_UNIXTHREAD`,
+  and per-arch import stubs), completing the `x86_64-darwin` and `aarch64-darwin`
+  cross-compile triples. Byte-verified static and dynamic for both (#1178).
+- target: riscv64 RV64A atomic inline-asm mnemonics, `lr`/`sc`, the `amo*`
+  family, the `.aq`/`.rl`/`.aqrl` ordering suffixes, and `pause`, so atomic
+  read-modify-write can be expressed for the riscv64 std atomics and runtime
+  (#1668).
+- sema: constant-time secret-qualifier flow typing. The `^` qualifier carries a
+  public-to-secret lattice (public coerces up, any secret operand taints the
+  result), the type checker gates what a leakage model can observe (no secret
+  branch condition, memory index, or variable-latency operand), `:^` is the only
+  downgrade, and secret pointers are welded and non-launderable. Type-checking
+  only, with codegen taint a later step (#1645, epic #1643).
+
+### Fixed
+
+- codegen(riscv64): long-branch relaxation. An out-of-range B-type conditional
+  becomes an inverted guard plus a `jal`, and an out-of-range `jal` becomes an
+  `auipc`+`jalr` trampoline, resolved by a per-function relaxation fixpoint.
+  Large functions no longer fail to encode (#1666).
+- codegen(riscv64): local frame slots no longer overlap the saved ra/s0 record,
+  fixing a silent SIGSEGV for any function with an address-taken or spilled local
+  (#1670).
+- codegen(riscv64): 32-bit `and`/`or`/`xor` now encode full-register ops instead
+  of nonexistent word-group instructions, fixing a SIGILL (#1672).
+
 ## [2.8.0] - 2026-06-26
 
 The first working bare-metal build, plus a riscv64 codegen fix surfaced by the
