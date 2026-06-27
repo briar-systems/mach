@@ -1722,15 +1722,120 @@ fun encode_mir_instr(st: *encode.EncodeState, f: *mir.MirFunction, fn_base: u32,
     ret R.err[bool, str]("encode: unhandled opcode in riscv64 encode");
 }
 
+# the signed byte reach of a B-type conditional branch (13-bit immediate) and a
+# J-type jump (21-bit immediate). a fixup whose displacement falls outside its form's
+# range is relaxed into a longer reaching sequence before pass 2 fills the field.
+val B_DISP_MIN: i64 = -4096;
+val B_DISP_MAX: i64 = 4094;
+val J_DISP_MIN: i64 = -1048576;
+val J_DISP_MAX: i64 = 1048574;
+
+# repack the B-type word at `pos` with a new forward displacement, keeping its
+# relation funct3 and its rs1 / rs2. used to widen a relaxed conditional's inverted
+# guard when its trampoline grows.
+fun set_branch_disp(buf: *encode.ByteBuf, pos: usize, disp: u32) {
+    val word: u32 = read_word(buf, pos);
+    write_word(buf, pos, (word & 0x01FFF07F) | b_imm(disp));
+}
+
+# write the inverted guard of a relaxed conditional at `pos`: the original B-type
+# `bne` word with its relation inverted (funct3 ^ 1 flips the eq/ne, lt/ge, ltu/geu
+# pairs) and a forward `disp` that jumps over the trampoline carrying the far target.
+fun write_inverted_guard(buf: *encode.ByteBuf, pos: usize, bne_word: u32, disp: u32) {
+    val funct3: u32 = ((bne_word >> 12) & 0x7) ^ 0x1;
+    val rs1: u32 = (bne_word >> 15) & 0x1F;
+    val rs2: u32 = (bne_word >> 20) & 0x1F;
+    write_word(buf, pos, pack_b(BRANCH, funct3, rs1, rs2, disp));
+}
+
+# relax every out-of-range intra-function branch this function just emitted into a
+# reaching sequence, iterating to a fixpoint
+#
+# RISC-V conditional branches reach only +-4 KiB and unconditional `jal` only
+# +-1 MiB, so a large function body overflows a B-type displacement that the
+# +-4 KiB field cannot hold. a conditional past +-4 KiB becomes its inverted guard
+# (a short branch skipping the trampoline) followed by a `jal` to the real target;
+# a `jal` past +-1 MiB (an unconditional branch, or the `jal` a relaxed conditional
+# now points at) becomes an `auipc t0,%hi ; jalr x0,t0,%lo` pc-relative trampoline
+# reaching the full 32-bit range. each growth opens a text gap through
+# `encode.insert_text`, which slides the rest of the function down and fixes the
+# block / fixup / symbol / relocation tables, so each rescan remeasures against the
+# grown layout - the relaxation therefore iterates to a fixpoint. the inverted guard
+# is fully resolved here (its skip is purely local); the trampoline's real-target
+# displacement is left to pass 2 through the repointed fixup, whose patch word now
+# carries the `jal` / `auipc` opcode the patcher dispatches on. only fixups this
+# function recorded ([fixup_start, fixup_count)) are considered.
+fun relax_function_riscv64(st: *encode.EncodeState, fn_base: u32, fixup_start: u32) R.Result[bool, str] {
+    val count: u32 = st.fixup_count - fixup_start;
+    if (count == 0) { ret R.ok[bool, str](true); }
+
+    # one marker per fixup: set once the fixup has become a relaxed conditional, so a
+    # later jal->trampoline growth knows to widen the inverted guard at patch_pos - 4.
+    val res_marks: R.Result[*u8, str] = A.allocate[u8](st.alloc, count::usize);
+    if (R.is_err[*u8, str](res_marks)) { ret R.err[bool, str](R.unwrap_err[*u8, str](res_marks)); }
+    val relaxed: *u8 = R.unwrap_ok[*u8, str](res_marks);
+    var z: u32 = 0;
+    for (z < count) { relaxed[z] = 0; z = z + 1; }
+
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var i: u32 = fixup_start;
+        for (i < st.fixup_count) {
+            val fx: *encode.BranchFixup = ?st.fixups[i];
+            val res_off: R.Result[u32, str] = encode.block_offset(st, fn_base, fx.target_block);
+            if (R.is_err[u32, str](res_off)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_off)); }
+            val target_off: u32 = R.unwrap_ok[u32, str](res_off);
+            val word: u32 = read_word(?st.buf, fx.patch_pos::usize);
+            val opcode: u32 = word & 0x7F;
+            val sdisp: i64 = (target_off::i64) - (fx.patch_pos::i64);
+
+            if (opcode == BRANCH && (sdisp < B_DISP_MIN || sdisp > B_DISP_MAX)) {
+                val guard_pos: u32 = fx.patch_pos;
+                val jal_pos: u32 = fx.patch_pos + 4;
+                val ins: R.Result[bool, str] = encode.insert_text(st, jal_pos, 4);
+                if (R.is_err[bool, str](ins)) { ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
+                write_inverted_guard(?st.buf, guard_pos::usize, word, 8);
+                write_word(?st.buf, jal_pos::usize, pack_j(JAL, RZERO, 0));
+                fx.patch_pos = jal_pos;
+                fx.next_ip   = jal_pos + 4;
+                relaxed[i - fixup_start] = 1;
+                changed = true;
+                brk;
+            }
+            if (opcode == JAL && (sdisp < J_DISP_MIN || sdisp > J_DISP_MAX)) {
+                val auipc_pos: u32 = fx.patch_pos;
+                val jalr_pos: u32 = fx.patch_pos + 4;
+                val ins: R.Result[bool, str] = encode.insert_text(st, jalr_pos, 4);
+                if (R.is_err[bool, str](ins)) { ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
+                write_word(?st.buf, auipc_pos::usize, pack_u(AUIPC, SCRATCH, 0));
+                write_word(?st.buf, jalr_pos::usize, pack_i(JALR, F3_ADD, RZERO, SCRATCH, 0));
+                fx.next_ip = auipc_pos + 8;
+                if (relaxed[i - fixup_start] != 0) {
+                    val guard_pos: u32 = auipc_pos - 4;
+                    set_branch_disp(?st.buf, guard_pos::usize, fx.next_ip - guard_pos);
+                }
+                changed = true;
+                brk;
+            }
+            i = i + 1;
+        }
+    }
+    A.deallocate[u8](st.alloc, relaxed, count::usize);
+    ret R.ok[bool, str](true);
+}
+
 # the per-function encode hook (pass 1). marks the function entry symbol, emits the
 # prologue (skipped for a naked asm-only function, whose inline asm owns the stack),
 # then each block - emitting the epilogue before every RET - recording each block's
-# `.text` offset for branch patching. extern / body-less functions contribute no
-# text. the callee-saved GP and FP registers are spilled / reloaded by the prologue /
-# epilogue from the frame facts.
+# `.text` offset for branch patching, and finally relaxes any branch whose body grew
+# past its displacement range. extern / body-less functions contribute no text. the
+# callee-saved GP and FP registers are spilled / reloaded by the prologue / epilogue
+# from the frame facts.
 fun encode_function_riscv64(st: *encode.EncodeState, f: *mir.MirFunction) R.Result[bool, str] {
     val fn_base: u32 = st.buf.len::u32;
     if (f.block_count == 0) { ret R.ok[bool, str](true); }
+    val fixup_start: u32 = st.fixup_count;
 
     val ms: R.Result[bool, str] = encode.push_symbol(st, f.name, fn_base, of.SYM_OBJ_FLAG_FUNCTION);
     if (R.is_err[bool, str](ms)) { ret ms; }
@@ -1757,15 +1862,18 @@ fun encode_function_riscv64(st: *encode.EncodeState, f: *mir.MirFunction) R.Resu
         }
         bi = bi + 1;
     }
-    ret R.ok[bool, str](true);
+    ret relax_function_riscv64(st, fn_base, fixup_start);
 }
 
 # the per-branch patch hook (pass 2). reads the placeholder instruction word at the
 # fixup's patch site, computes the instruction-relative signed displacement
 # (`target_off - patch_pos`, with no next-instruction bias - RISC-V branch / jump
 # offsets are relative to the branch's own address), range-checks it against the
-# field width, scatters it into the B-type (13-bit, +-4 KiB) or J-type (21-bit,
-# +-1 MiB) immediate, and writes the word back. an out-of-range displacement is
+# field width, scatters it into the B-type (13-bit, +-4 KiB), J-type (21-bit,
+# +-1 MiB), or relaxed `auipc + jalr` (32-bit pc-relative) immediate, and writes the
+# word(s) back. branch relaxation (`relax_function_riscv64`) runs before pass 2, so a
+# fixup whose target was out of range now carries a `jal` / `auipc` opcode that
+# reaches it; a displacement still out of its form's range here is a backend bug,
 # rejected loudly rather than truncated into a miscompile.
 fun patch_branch_riscv64(st: *encode.EncodeState, fx: *encode.BranchFixup, target_off: u32) R.Result[bool, str] {
     val pos: usize = fx.patch_pos::usize;
@@ -1782,7 +1890,7 @@ fun patch_branch_riscv64(st: *encode.EncodeState, fx: *encode.BranchFixup, targe
 
     if (opcode == JAL) {
         # J-type: +-1 MiB. the non-immediate bits are rd[11:7] and opcode[6:0].
-        if (sdisp < -1048576 || sdisp > 1048574) {
+        if (sdisp < J_DISP_MIN || sdisp > J_DISP_MAX) {
             ret R.err[bool, str]("encode: riscv64 jump displacement exceeds the +-1MiB range");
         }
         write_word(?st.buf, pos, (word & 0xFFF) | j_imm(disp));
@@ -1790,13 +1898,29 @@ fun patch_branch_riscv64(st: *encode.EncodeState, fx: *encode.BranchFixup, targe
     }
     if (opcode == BRANCH) {
         # B-type: +-4 KiB. the kept bits are rs2 / rs1 / funct3 / opcode.
-        if (sdisp < -4096 || sdisp > 4094) {
+        if (sdisp < B_DISP_MIN || sdisp > B_DISP_MAX) {
             ret R.err[bool, str]("encode: riscv64 branch displacement exceeds the +-4KiB range");
         }
         write_word(?st.buf, pos, (word & 0x01FFF07F) | b_imm(disp));
         ret R.ok[bool, str](true);
     }
-    ret R.err[bool, str]("encode: branch fixup site is not a B-type or J-type instruction");
+    if (opcode == AUIPC) {
+        # relaxed far trampoline: `auipc t0,%hi(disp) ; jalr x0,t0,%lo(disp)`, both
+        # pc-relative from the auipc, so the displacement spans the 32-bit signed
+        # range (the +0x800 rounding folds the signed low 12 back into the high 20).
+        if (pos + 8 > st.buf.len) {
+            ret R.err[bool, str]("encode: riscv64 trampoline fixup site is outside the text buffer");
+        }
+        if (sdisp < -2147483648 || sdisp > 2147483647) {
+            ret R.err[bool, str]("encode: riscv64 trampoline displacement exceeds the 32-bit pc-relative range");
+        }
+        val hi20: u32 = ((disp + 0x800) >> 12) & 0xFFFFF;
+        val lo12: u32 = disp & 0xFFF;
+        write_word(?st.buf, pos, pack_u(AUIPC, SCRATCH, hi20));
+        write_word(?st.buf, pos + 4, pack_i(JALR, F3_ADD, RZERO, SCRATCH, lo12));
+        ret R.ok[bool, str](true);
+    }
+    ret R.err[bool, str]("encode: branch fixup site is not a B-type, J-type, or trampoline instruction");
 }
 
 # the RV64 ISA's `encode` entry point - a thin wrapper that supplies the two RISC-V
