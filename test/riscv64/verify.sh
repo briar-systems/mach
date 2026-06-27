@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# cross-compile the freestanding rv64 fixture and byte-verify the result with the
-# llvm tools. proves the riscv64 backend emits a correct, fully linked RV64 ELF
-# without running it (no exit syscall path exists until the inline-asm slice lands).
+# cross-compile the freestanding rv64 fixture, byte-verify the result with the llvm
+# tools, then run it under qemu-riscv64 and assert its exit code. proves the riscv64
+# backend emits a correct, fully linked RV64 ELF that runs to its inline-asm `exit`.
 #
 # usage: verify.sh [path-to-mach]   (defaults to `mach` on PATH)
 #
-# requires: llvm-readelf, llvm-objdump, llvm-readobj (unversioned or `-NN` suffixed).
+# requires: llvm-readelf, llvm-objdump, llvm-readobj (unversioned or `-NN` suffixed)
+# and qemu-riscv64 (or qemu-riscv64-static) for the exit-code run.
 set -euo pipefail
+
+# the computed exit code the fixture returns (sum 0..9), the qemu e2e asserts it.
+expect_code=45
 
 mach="${1:-mach}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,7 +52,7 @@ echo "verifying disassembly of $exe"
 dis="$("$objdump" -d "$exe")"
 echo "$dis" | grep -q 'file format elf64-littleriscv' || fail "objdump did not parse a little-endian rv64 elf"
 echo "$dis" | grep -qi '<unknown>'                    && fail "objdump found an unknown instruction word"
-for mnem in auipc jalr ld sd addi ret; do
+for mnem in auipc jalr ld sd addi ret ecall; do
     echo "$dis" | grep -qw "$mnem" || fail "expected mnemonic '$mnem' not in disassembly"
 done
 
@@ -58,4 +62,13 @@ for r in R_RISCV_PCREL_HI20 R_RISCV_PCREL_LO12_I R_RISCV_PCREL_LO12_S R_RISCV_CA
     echo "$rel" | grep -q "$r" || fail "expected relocation '$r' not emitted"
 done
 
-echo "OK: riscv64 backend emits a correct, fully linked RV64 ELF"
+echo "running $exe under qemu-riscv64"
+qemu="$(command -v qemu-riscv64 || command -v qemu-riscv64-static || true)"
+[ -n "$qemu" ] || fail "qemu-riscv64 not found"
+set +e
+"$qemu" "$exe"
+code=$?
+set -e
+[ "$code" -eq "$expect_code" ] || fail "exit code $code, expected $expect_code"
+
+echo "OK: riscv64 backend emits a correct RV64 ELF that runs to exit code $expect_code"
