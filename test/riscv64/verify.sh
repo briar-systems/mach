@@ -9,11 +9,12 @@
 # and qemu-riscv64 (or qemu-riscv64-static) for the exit-code run.
 set -euo pipefail
 
-# the computed exit code the fixture returns: sum 0..9 (45) plus the const-shift
-# call argument 1 << 3 (8), plus the stack-local frame-slot probe and the >4KiB
-# long-branch relaxation probe. the qemu e2e asserts the exact sum, so a frame-slot
-# (#1670) or branch-relaxation (#1666) regression changes it.
-expect_code=68
+# the computed exit code the fixture returns: sum 0..9 (45) plus the const-shift call
+# argument 1 << 3 (8), plus the stack-local frame-slot probe (#1670), the >4KiB
+# long-branch relaxation probe (#1666), the 32-bit bitwise word-group probe (#1672),
+# and the RV64A atomics probe (#1668, 18 = swapped 7 + post-rmw cell 11). the qemu
+# e2e asserts the exact sum, so a regression in any of those changes it.
+expect_code=86
 
 mach="${1:-mach}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,17 +56,22 @@ grep -q 'Type:.*EXEC'              <<< "$hdr" || fail "exe is not ET_EXEC"
 grep -qE 'Entry point address:.*0x[0-9a-fA-F]+' <<< "$hdr" || fail "exe has no entry point"
 grep -q 'Entry point address:.*0x0$' <<< "$hdr" && fail "exe entry point is zero"
 
-# the backend emits M (mul / div / rem) and F/D (scalar float) instructions but does
-# not yet write a `.riscv.attributes` ISA-string section, so objdump defaults to base
-# RV64I and renders those valid words as `<unknown>`. decode with the extensions the
-# backend actually emits so the `<unknown>` guard still catches a genuinely malformed
-# word rather than a correctly-encoded M / F / D instruction.
+# the backend emits M (mul / div / rem), F/D (scalar float), and A (atomics)
+# instructions but does not yet write a `.riscv.attributes` ISA-string section, so
+# objdump defaults to base RV64I and renders those valid words as `<unknown>`. decode
+# with the extensions the backend actually emits so the `<unknown>` guard still
+# catches a genuinely malformed word rather than a correctly-encoded M / F / D / A
+# instruction.
 echo "verifying disassembly of $exe"
-dis="$("$objdump" -d --mattr=+m,+f,+d "$exe")"
+dis="$("$objdump" -d --mattr=+m,+f,+d,+a "$exe")"
 grep -q 'file format elf64-littleriscv' <<< "$dis" || fail "objdump did not parse a little-endian rv64 elf"
 grep -qi '<unknown>'                    <<< "$dis" && fail "objdump found an unknown instruction word"
 for mnem in auipc jalr ld sd addi sll ret ecall; do
     grep -qw "$mnem" <<< "$dis" || fail "expected mnemonic '$mnem' not in disassembly"
+done
+# the RV64A atomics the probe emits must disassemble as the real instructions.
+for mnem in lr.d sc.d amoadd.d; do
+    grep -qw "$mnem" <<< "$dis" || fail "expected RV64A mnemonic '$mnem' not in disassembly"
 done
 
 # assert the >4KiB probe forced long-branch relaxation (#1666): an inverted guard

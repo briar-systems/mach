@@ -7,8 +7,9 @@
 # variable-amount shift used as a call argument (`1 << node`, which must
 # materialize the constant value into a register before the reg-reg `sll`), a
 # stack-local buffer (frame-slot addressing, #1670), a function whose encoded body
-# exceeds the +-4KiB B-type branch range (long-branch relaxation, #1666), and an
-# inline-asm exit syscall (the only way to emit `ecall`). the exit code is the
+# exceeds the +-4KiB B-type branch range (long-branch relaxation, #1666), the RV64A
+# atomics (an lr/sc compare-and-swap loop and an amoadd.d read-modify-write, #1668),
+# and an inline-asm exit syscall (the only way to emit `ecall`). the exit code is the
 # computed sum, so the qemu e2e proves the whole pipeline runs end to end.
 
 var total: i64 = 0;
@@ -49,7 +50,10 @@ fun stack_probe() i64 {
     ret s & 15;
 }
 
-# a small classifier reached by a direct call from the >4KiB probe below.
+# a small classifier reached by a direct call from the >4KiB probe below. the
+# 32-bit-wide arithmetic the parse performs also exercises the bitwise word-group
+# fix (#1672): RISC-V has no and/or/xor word forms, so they must encode as the
+# full-register ops.
 fun classify(v: u8) i64 {
     if (v == 0) { ret 0; } or (v == 1) { ret 7; } or (v == 2) { ret 13; }
     or (v == 3) { ret 21; } or (v == 4) { ret 34; } or (v == 5) { ret 55; }
@@ -63,7 +67,8 @@ fun classify(v: u8) i64 {
 # early-return guards this inflates the encoded body well past 4KiB and leaves a
 # conditional branch whose target is out of the B-type +-4KiB range. the encoder
 # relaxes it into an inverted guard plus a `jal`; the result matches the unrelaxed
-# x86_64 / aarch64 build, so a relaxation regression changes the exit code.
+# x86_64 / aarch64 build, so a relaxation regression changes the exit code. the
+# 32-bit `&` masks also exercise the bitwise word-group fix (#1672).
 fun parse_probe(seed: u64) i64 {
     var buf: [2048]u8;
     var i: u64 = 0;
@@ -103,10 +108,27 @@ fun parse_probe(seed: u64) i64 {
     ret (sum & 255) + (runs & 127) + (hi & 63) + (lo & 31) + (mid & 31) + (toks & 15) + (bias & 15);
 }
 
+# a 32-bit bitwise mix that exercises the word-group fix directly (#1672): each `&`,
+# `|`, and `^` is at u32 width, which must encode as the full-register and / or / xor
+# (RISC-V has no andw / orw / xorw). the deterministic result folds into the exit
+# code, so a regression that re-emits the illegal word forms faults under qemu.
+fun bitmix(x: u32, y: u32) i64 {
+    val a: u32 = (x & y) | (x ^ y);
+    val b: u32 = (a & 0x0f0f0f0f) | ((a ^ 0xffffffff) & 0xf0f0f0f0);
+    ret (b ^ a)::i64 & 255;
+}
+
 # the program entry. the `_start` symbol the linux linker resolves as the entry
 # point; the calls and the global read-modify-write give the relocations the lane
-# checks, and the inline-asm `exit` syscall returns the computed sum as the process
-# exit code (sum_to(10)=45 + na(3)=8 + stack_probe + parse_probe(1)).
+# checks, the inline-asm block exercises the RV64A atomics (#1668), and the
+# inline-asm `exit` syscall returns the computed sum as the process exit code
+# (sum_to(10)=45 + na(3)=8 + stack_probe + parse_probe(1) + bitmix + atomics).
+#
+# the atomics run on a stack cell (`{cell}`, address taken through `p`): an lr/sc
+# compare-and-swap loop swaps it from 0 to 7 - the reservation-retry (1b) and
+# mismatch (2f) arms are encoded though the fast path takes neither - then amoadd.d
+# adds 4 and returns the swapped 7. the folded result (prior 7 + post-rmw 11 = 18)
+# is added to the exit code, so a wrong atomic encoding or a lost store changes it.
 #[symbol("_start")]
 fun start() {
     var code: i64 = sum_to(10);          # sum 0..9 = 45
@@ -114,6 +136,28 @@ fun start() {
     code = code + na(3)::i64;             # 1 << 3 = 8, so code = 53
     code = code + stack_probe();          # frame-slot probe (#1670)
     code = code + parse_probe(1);         # >4KiB long-branch relaxation probe (#1666)
+    code = code + bitmix(0xdeadbeef, 0x12345678);  # 32-bit bitwise word-group probe (#1672)
+
+    var cell:  i64  = 0;
+    var p:     *i64 = ?cell;
+    var probe: i64  = 0;
+    asm riscv64 {
+        ld   t2, {p}            # t2 = &cell
+        li   a3, 7              # the compare-and-swap new value
+    1:
+        lr.d t0, (t2)           # load-reserved *cell
+        bnez t0, 2f             # swap only while the cell is still zero
+        sc.d t1, a3, (t2)       # store-conditional 7
+        bnez t1, 1b             # retry if the reservation was lost
+    2:
+        li   a4, 4
+        amoadd.d t3, a4, (t2)   # *cell += 4; t3 = the prior value (7)
+        ld   t4, (t2)           # observe the final *cell (11)
+        add  t5, t3, t4         # 7 + 11 = 18
+        sd   t5, {probe}        # fold the result back into a local
+    }
+    code = code + probe;                  # + 18
+
     asm riscv64 {
         li a7, 93        # __NR_exit
         ld a0, {code}    # exit code = the computed sum
