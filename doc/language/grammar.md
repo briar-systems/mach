@@ -408,8 +408,10 @@ Notes:
 - `^T` marks `T` as carrying secret data for the constant-time guarantee
   (#1643). It is a prefix qualifier binding to the type immediately to its
   right, so it nests with `*` and `[N]` in any order (`*^u8`, `^*u8`,
-  `[N]^u8`). The grammar accepts it in every type position; its flow-typing
-  semantics are not yet enforced (tracked by #1645).
+  `[N]^u8`). The grammar accepts it in every type position. Its flow-typing
+  semantics - the secrecy lattice and join, the leakage-model gates, and the
+  welded-storage pointer rules - are enforced by sema (#1645) and documented in
+  [secrecy.md](secrecy.md).
 - `*T` is a pointer; the untyped pointer type is the primitive name `ptr`
   (an ordinary `named-type`, not its own syntax).
 - `[N]T` is a fixed-length array; `N` is a full expression (a comptime
@@ -487,12 +489,13 @@ cast         ::= ( "::" | ":~" ) type
 ```
 
 `::` is a value conversion and `:~` a same-size bit reinterpret; see
-[operators.md](operators.md#cast). `:^` strips the `^` secret qualifier from
-the operand's type (#1643): a bare `:^` needs no target, while `:^Type` takes
-an optional named target for parallelism with `:~Type`. A non-`named-type`
-lead (`*`, `[`, ...) after `:^` leaves a bare strip so it still binds as a
-multiply/index on the stripped value. Its semantics are not yet enforced
-(tracked by #1645). All three bind as postfix.
+[operators.md](operators.md#cast). Neither `::` nor `:~` may add or drop the
+`^` secret qualifier. `:^` is the only downgrade: it strips `^` from the
+operand's type, producing a new public value (#1643, [secrecy.md](secrecy.md)).
+A bare `:^` needs no target, while `:^Type` names the operand's stripped public
+type (`:^` never reinterprets storage). A non-`named-type` lead (`*`, `[`, ...)
+after `:^` leaves a bare strip so it still binds as a multiply/index on the
+stripped value. All three bind as postfix.
 
 Disambiguating a postfix `[`: a bracket whose matching `]` is **not** followed
 by `(` is always an index `obj[idx]`. When it **is** followed by `(`, the

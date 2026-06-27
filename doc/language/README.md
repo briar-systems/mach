@@ -31,6 +31,7 @@ neighboring links; start from the index below.
 
 - [literals.md](literals.md) — numeric, char, string
 - [types.md](types.md) — primitive grammar, compound types
+- [secrecy.md](secrecy.md) — the `^` secret qualifier, flow typing, gates, `:^`
 - [operators.md](operators.md) — arithmetic, bitwise, comparison, logical, pointer, cast
 - [expressions.md](expressions.md) — construction, access, calls, generic instantiation
 

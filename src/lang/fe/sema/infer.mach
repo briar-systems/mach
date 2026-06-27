@@ -168,8 +168,35 @@ fun infer_nominal_uni(sc: *context.SemaContext, did: id.DeclId, name_span: token
     val ty: type.TypeId = R.unwrap_ok[type.TypeId, str](tr);
 
     build_field_table(sc, ty, u.fields_start, u.fields_len);
+    check_uni_secrecy(sc, u.fields_start, u.fields_len);
     record_type_align(sc, did, ty);
     ret ty;
+}
+
+# enforce that a union's overlapping variants agree on secrecy (#1645)
+#
+# A `uni`'s fields share storage, so a mixed-secrecy union would let the same
+# bytes be read as both secret and public - the welded-storage aliasing leak. All
+# variants must be uniformly secret or uniformly public. The first variant whose
+# secrecy disagrees with the first variant's is reported on its own field span.
+# ---
+# sc:           sema context
+# fields_start: start index into ast.typed_names
+# fields_len:   number of variants
+fun check_uni_secrecy(sc: *context.SemaContext, fields_start: u32, fields_len: u32) {
+    if (fields_len < 2) { ret; }
+
+    val first_tn:     *decl.TypedName = ?sc.a.typed_names[fields_start];
+    val first_secret: bool            = type.is_secret(?sc.s.types, context.resolved_type_of(sc, first_tn.ty));
+
+    var i: u32 = 1;
+    for (i < fields_len) {
+        val tn: *decl.TypedName = ?sc.a.typed_names[fields_start + i];
+        if (type.is_secret(?sc.s.types, context.resolved_type_of(sc, tn.ty)) != first_secret) {
+            context.report(sc, tn.name, "union variants must agree on secrecy: overlapping fields are part secret `^` and part public, which would alias the same storage at two classifications");
+        }
+        i = i + 1;
+    }
 }
 
 # fold an `#[align(...)]` decorator on `did` and record the resulting alignment
@@ -357,6 +384,9 @@ pub fun infer_expr(sc: *context.SemaContext, eid: id.ExprId) type.TypeId {
     }
     or (e.kind == expr.EXPR_KIND_CAST) {
         t = infer_cast(sc, ?e.data.cast, e.span);
+    }
+    or (e.kind == expr.EXPR_KIND_STRIP) {
+        t = infer_strip(sc, ?e.data.strip, e.span);
     }
     or (e.kind == expr.EXPR_KIND_ARRAY_LIT) {
         t = infer_array_lit(sc, ?e.data.array_lit, e.span);
@@ -573,6 +603,20 @@ fun infer_binary(sc: *context.SemaContext, eid: id.ExprId, b: *expr.ExprBinary, 
     var rt: type.TypeId = infer_expr(sc, b.rhs);
     if (lt == type.TYPE_ERROR || rt == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
 
+    # secrecy JOIN: an operation with any secret operand yields a secret result
+    # (public is the bottom of the lattice). taint is read from the original
+    # operands here and reapplied to whatever result type each operator computes.
+    val lhs_secret:    bool = type.is_secret(?sc.s.types, lt);
+    val either_secret: bool = lhs_secret || type.is_secret(?sc.s.types, rt);
+
+    # GATE: `/` and `%` are variable-latency on every target (the leakage model
+    # always observes them), so a secret operand is a compile error here. the
+    # float-default and integer-multiply gates are target-CT-capability dependent
+    # and land with the taint-to-MIR contract (#1646).
+    if ((b.op == expr.BIN_DIV || b.op == expr.BIN_MOD) && either_secret) {
+        context.report(sc, span, "secret value used as an operand of a variable-latency `/` or `%`; a secret divisor or dividend leaks through timing");
+    }
+
     # let a literal operand take the shape of the other side
     val co: O.Option[type.TypeId] = unify_literals(sc, b.lhs, lt, b.rhs, rt);
     if (O.is_some[type.TypeId](co)) {
@@ -608,28 +652,53 @@ fun infer_binary(sc: *context.SemaContext, eid: id.ExprId, b: *expr.ExprBinary, 
         if (int_float_mix) { report_int_float_cmp(sc, span); ret type.TYPE_ERROR; }
         val addr_ok: bool = is_pointer_like(sc, lt) && is_pointer_like(sc, rt);
         if (!operands_ok && !both_float && !addr_ok) { type_mismatch(sc, span, lt, rt); ret type.TYPE_ERROR; }
-        ret u8t;
+        ret join_secret(sc, u8t, either_secret);
     }
     if (b.op == expr.BIN_LT || b.op == expr.BIN_LEQ || b.op == expr.BIN_GT || b.op == expr.BIN_GEQ) {
         if (int_float_mix)            { report_int_float_cmp(sc, span); ret type.TYPE_ERROR; }
         if (!both_int && !both_float) { type_mismatch(sc, span, lt, rt); ret type.TYPE_ERROR; }
-        ret u8t;
+        ret join_secret(sc, u8t, either_secret);
     }
     if (b.op == expr.BIN_AND || b.op == expr.BIN_OR) {
         if (!both_int) {
             context.report(sc, span, "type mismatch: logical operands must be integer types");
             ret type.TYPE_ERROR;
         }
-        ret u8t;
+        # GATE: `&&` / `||` short-circuit by branching on the LEFT operand (the
+        # right is evaluated conditionally), so a secret left operand is the
+        # secret-dependent branch the leakage model observes. a secret right
+        # operand only taints the result (no branch keys on it).
+        if (lhs_secret) {
+            context.report(sc, span, "secret value used as the left operand of a short-circuiting `&&` / `||`; the branch it controls leaks through control flow");
+        }
+        ret join_secret(sc, u8t, either_secret);
     }
     if (b.op == expr.BIN_BIT_AND || b.op == expr.BIN_BIT_OR || b.op == expr.BIN_BIT_XOR
         || b.op == expr.BIN_SHL || b.op == expr.BIN_SHR) {
         if (!both_int) { type_mismatch(sc, span, lt, rt); ret type.TYPE_ERROR; }
-        ret lt;
+        ret join_secret(sc, lt, either_secret);
     }
     # arithmetic: ADD, SUB, MUL, DIV, MOD
     if (!operands_ok || !is_numeric(sc, lt)) { type_mismatch(sc, span, lt, rt); ret type.TYPE_ERROR; }
-    ret lt;
+    ret join_secret(sc, lt, either_secret);
+}
+
+# apply the secrecy JOIN to a binary/unary result base type (#1645)
+#
+# Strips any secrecy already on `base` and re-wraps in `^` exactly when an
+# operand was secret, so a doubled qualifier never forms and the result's
+# secrecy is precisely the join of its operands'.
+# ---
+# sc:     sema context
+# base:   the operator's computed result type
+# secret: true when any operand was secret
+# ret:    `^strip(base)` when `secret`, else `strip(base)`
+fun join_secret(sc: *context.SemaContext, base: type.TypeId, secret: bool) type.TypeId {
+    val pub: type.TypeId = type.strip_secret(?sc.s.types, base);
+    if (!secret) { ret pub; }
+    val r: R.Result[type.TypeId, str] = type.intern_secret(?sc.s.types, pub);
+    if (R.is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
+    ret R.unwrap_ok[type.TypeId, str](r);
 }
 
 # type a type comparison (`$type_of(...) == TypeName`)
@@ -749,7 +818,9 @@ fun infer_assign(sc: *context.SemaContext, b: *expr.ExprBinary, span: token.Span
 #
 # NEG returns the operand type, NOT returns u8, BIT_NOT returns the operand
 # type, ADDR returns a pointer to the operand type, DEREF returns the pointee of
-# a pointer operand.
+# a pointer operand. The value operators (`-`, `!`, `~`) join the operand's
+# secrecy onto their result; `&` instead nests it (`&^T` is the public pointer
+# `*^T`), and DEREF recovers it from the pointee (`@(*^T)` is `^T`).
 # ---
 # sc:   sema context
 # u:    the unary operation payload
@@ -759,17 +830,19 @@ fun infer_unary(sc: *context.SemaContext, u: *expr.ExprUnary, span: token.Span) 
     val ot: type.TypeId = infer_expr(sc, u.operand);
     if (ot == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
 
+    val ot_secret: bool = type.is_secret(?sc.s.types, ot);
+
     if (u.op == expr.UN_NEG) {
         if (!is_numeric(sc, ot)) { context.report(sc, span, "type mismatch: unary - requires a numeric operand"); ret type.TYPE_ERROR; }
-        ret ot;
+        ret join_secret(sc, ot, ot_secret);
     }
     if (u.op == expr.UN_NOT) {
         if (!is_integer(sc, ot)) { context.report(sc, span, "type mismatch: unary ! requires an integer operand"); ret type.TYPE_ERROR; }
-        ret prim_or_error(sc, type.TYPE_U8);
+        ret join_secret(sc, prim_or_error(sc, type.TYPE_U8), ot_secret);
     }
     if (u.op == expr.UN_BIT_NOT) {
         if (!is_integer(sc, ot)) { context.report(sc, span, "type mismatch: unary ~ requires an integer operand"); ret type.TYPE_ERROR; }
-        ret ot;
+        ret join_secret(sc, ot, ot_secret);
     }
     if (u.op == expr.UN_ADDR) {
         # a comptime value parameter has no runtime storage -- it folds to a
@@ -1490,6 +1563,43 @@ fun infer_cast(sc: *context.SemaContext, c: *expr.ExprCast, span: token.Span) ty
     ret O.unwrap[type.TypeId](r);
 }
 
+# STRIP: the `:^` secret-qualifier strip cast - the sole downgrade (#1645)
+#
+# Removes the outer `^` from the operand's type, producing a NEW public value
+# (the only secret->public crossing the type system permits). It peels exactly
+# the top-level qualifier: a welded `*^T` pointer's pointee secrecy is never
+# laundered by `:^` since the outer type there is a (public) pointer. A bare
+# `value:^` strips in place; `value:^Type` strips to an explicit target, which
+# must itself be public (a `^Type` target would re-add the qualifier the cast
+# removes).
+# ---
+# sc:   sema context
+# st:   the strip payload
+# span: the cast span for diagnostics
+# ret:  the stripped (public) TypeId, or TYPE_ERROR
+fun infer_strip(sc: *context.SemaContext, st: *expr.ExprStrip, span: token.Span) type.TypeId {
+    val vt: type.TypeId = infer_expr(sc, st.value);
+    if (vt == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+
+    val stripped: type.TypeId = type.strip_secret(?sc.s.types, vt);
+
+    if (st.ty == id.TYPE_NIL) { ret stripped; }
+
+    val tt: type.TypeId = context.resolved_type_of(sc, st.ty);
+    if (tt == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+    if (type.is_secret(?sc.s.types, tt)) {
+        context.report(sc, span, "secret strip: a `:^` target type must be public; `:^` only removes the `^` qualifier");
+        ret type.TYPE_ERROR;
+    }
+    # `:^` removes secrecy only; it never reinterprets storage, so an explicit
+    # target must name the operand's own stripped type.
+    if (tt != stripped) {
+        context.report(sc, span, "secret strip: a `:^Type` target must name the operand's stripped (public) type; `:^` does not convert the value");
+        ret type.TYPE_ERROR;
+    }
+    ret tt;
+}
+
 # ARRAY_LIT: result is [count]elem of the declared array type
 #
 # Every element is checked against the element type via check.check_assignable,
@@ -1588,9 +1698,10 @@ pub fun resolve_type_ref(sc: *context.SemaContext, tid: id.TypeId) type.TypeId {
     if (O.is_none[*atype.Type](t_opt)) { ret type.TYPE_ERROR; }
     val t: *atype.Type = O.unwrap[*atype.Type](t_opt);
 
-    if (t.kind == atype.TYPE_KIND_NAMED) { ret resolve_type_named(sc, tid, ?t.data.named, t.span); }
-    if (t.kind == atype.TYPE_KIND_PTR)   { ret resolve_type_ptr(sc, ?t.data.ptr); }
-    if (t.kind == atype.TYPE_KIND_ARRAY) { ret resolve_type_array(sc, ?t.data.array, t.span); }
+    if (t.kind == atype.TYPE_KIND_NAMED)  { ret resolve_type_named(sc, tid, ?t.data.named, t.span); }
+    if (t.kind == atype.TYPE_KIND_PTR)    { ret resolve_type_ptr(sc, ?t.data.ptr); }
+    if (t.kind == atype.TYPE_KIND_SECRET) { ret resolve_type_secret(sc, ?t.data.secret); }
+    if (t.kind == atype.TYPE_KIND_ARRAY)  { ret resolve_type_array(sc, ?t.data.array, t.span); }
     if (t.kind == atype.TYPE_KIND_FUN)   { ret resolve_type_fun(sc, ?t.data.fun_); }
     if (t.kind == atype.TYPE_KIND_REC)   { ret resolve_type_anon(sc, tid, t.data.rec_.fields_start, t.data.rec_.fields_len, type.TYPE_REC); }
     if (t.kind == atype.TYPE_KIND_UNI)   { ret resolve_type_anon(sc, tid, t.data.uni_.fields_start, t.data.uni_.fields_len, type.TYPE_UNI); }
@@ -1729,6 +1840,22 @@ fun instantiate_named(sc: *context.SemaContext, sym: *resolve.Symbol, named: *at
 fun resolve_type_ptr(sc: *context.SemaContext, p: *atype.TypePtr) type.TypeId {
     val base: type.TypeId = resolve_type_ref(sc, p.pointee);
     ret ptr_to(sc, base);
+}
+
+# SECRET: recurse on the inner type and intern a `^inner` qualifier (#1645)
+#
+# A poisoned inner poisons the qualifier. `^^T` collapses in intern_secret, so
+# the secrecy lattice stays two-point.
+# ---
+# sc:  sema context
+# s:   the secret-type payload
+# ret: the `^inner` TypeId, or TYPE_ERROR
+fun resolve_type_secret(sc: *context.SemaContext, s: *atype.TypeSecret) type.TypeId {
+    val inner: type.TypeId = resolve_type_ref(sc, s.inner);
+    if (inner == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+    val r: R.Result[type.TypeId, str] = type.intern_secret(?sc.s.types, inner);
+    if (R.is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
+    ret R.unwrap_ok[type.TypeId, str](r);
 }
 
 # ARRAY: resolve the element type, evaluate the length via the comptime
@@ -1929,14 +2056,18 @@ fun ptr_to(sc: *context.SemaContext, base: type.TypeId) type.TypeId {
 
 # the pointee type of a pointer
 #
-# Non-pointer operands report a diagnostic and yield TYPE_ERROR.
+# Non-pointer operands report a diagnostic and yield TYPE_ERROR. A secret pointer
+# `^*T` is peeled to its pointer first, so dereferencing recovers the pointee
+# `T`; the canonical welded form `*^T` is already a (public) pointer whose
+# pointee is the secret `^T`.
 # ---
 # sc:   sema context
 # ty:   the operand TypeId
 # span: the operand span for diagnostics
 # ret:  the pointee TypeId, or TYPE_ERROR
 fun pointee_of(sc: *context.SemaContext, ty: type.TypeId, span: token.Span) type.TypeId {
-    val t_opt: O.Option[*type.Type] = type.get(?sc.s.types, ty);
+    val base: type.TypeId = type.strip_secret(?sc.s.types, ty);
+    val t_opt: O.Option[*type.Type] = type.get(?sc.s.types, base);
     if (O.is_none[*type.Type](t_opt)) { ret type.TYPE_ERROR; }
     val t: *type.Type = O.unwrap[*type.Type](t_opt);
     if (t.kind != type.TYPE_POINTER) {
