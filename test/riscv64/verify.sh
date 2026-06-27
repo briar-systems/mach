@@ -9,9 +9,10 @@
 # and qemu-riscv64 (or qemu-riscv64-static) for the exit-code run.
 set -euo pipefail
 
-# the computed exit code the fixture returns (sum 0..9 plus the const-shift call
-# argument 1 << 3 = 8, i.e. 45 + 8), the qemu e2e asserts it.
-expect_code=53
+# the computed exit code the fixture returns (sum 0..9 = 45, plus the const-shift call
+# argument 1 << 3 = 8, plus the RV64A atomics probe 18 = cas-stored 7 + post-rmw cell
+# 11), the qemu e2e asserts it.
+expect_code=71
 
 mach="${1:-mach}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -50,11 +51,17 @@ echo "$hdr" | grep -qE 'Entry point address:.*0x[0-9a-fA-F]+' || fail "exe has n
 echo "$hdr" | grep -q 'Entry point address:.*0x0$' && fail "exe entry point is zero"
 
 echo "verifying disassembly of $exe"
-dis="$("$objdump" -d "$exe")"
+# +a enables the A-extension decode so the fixture's lr/sc/amo* words disassemble as
+# the real atomics rather than `<unknown>`.
+dis="$("$objdump" -d --mattr=+a "$exe")"
 echo "$dis" | grep -q 'file format elf64-littleriscv' || fail "objdump did not parse a little-endian rv64 elf"
 echo "$dis" | grep -qi '<unknown>'                    && fail "objdump found an unknown instruction word"
 for mnem in auipc jalr ld sd addi sll ret ecall; do
     echo "$dis" | grep -qw "$mnem" || fail "expected mnemonic '$mnem' not in disassembly"
+done
+# the RV64A atomics the probe emits must disassemble as the real instructions.
+for mnem in lr.d sc.d amoadd.d; do
+    echo "$dis" | grep -qw "$mnem" || fail "expected RV64A mnemonic '$mnem' not in disassembly"
 done
 
 echo "verifying relocations in $obj"
