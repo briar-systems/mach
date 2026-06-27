@@ -1,0 +1,610 @@
+# RISC-V (RV64) assembly text printer - the riscv64 ISA's `emit_asm` entry point.
+#
+# This is the RV64 implementation of the ISA vtable's `emit_asm` operation, reached
+# only through `tgt.arch.emit_asm` by the shared `be.codegen.encode.print_asm`
+# dispatcher. It formats a fully-resolved (post-isel, post-regalloc, post-frame)
+# `mir.MirModule` as human-readable RISC-V assembly text into a writer - a debug /
+# transparency artifact paralleling the `.o` the encoder emits from the same MIR.
+#
+# Unlike the encoder this is NOT byte-exact: it renders the MIR instruction stream at
+# the level the allocator left it (a three-address ALU op prints as a single
+# `add dst, lhs, rhs`, a comparison as one `cmp.eq dst, lhs, rhs`), so a `.s` line maps
+# to a MIR instruction rather than to the exact words the encoder expands it into. A
+# `# <symbol>:` header introduces each function and the prologue / epilogue are
+# rendered as comment-flagged `addi sp, sp, -N` / `addi sp, sp, N` lines so the frame
+# shape is visible.
+#
+# Register names are the RISC-V psABI mnemonics (zero / ra / sp / a0 / t0 / s0 / ...
+# and ft0 / fa0 / fs0 / ... for the float bank); a register operand names its own bank
+# from the composite register id's class tag, so a cross-bank `fmv` prints each side in
+# its own file. The opcode mnemonics cover the concrete RV64 forms the selector emits
+# (`riscv64.ADD` ...) and the surviving generic / selection-output sentinels (the
+# divide, compare, conditional-branch, float, conversion, and memory families).
+
+use std.format;
+use std.io.writer;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.be.codegen.mir;
+use mach.lang.intern;
+use mach.lang.target.isa;
+use mach.lang.target.isa.riscv64;
+use mach.lang.target.isa.riscv64.encode;
+use mach.lang.target.resolved;
+
+# format a fully-resolved MIR module as RISC-V assembly text
+#
+# The `emit_asm` entry point the riscv64 ISA registers; matches
+# `be.codegen.encode.PrintAsmFn`. Emits each function in turn, each introduced by a
+# `# <symbol>:` label and its rendered prologue / body / epilogue. An extern /
+# body-less function (no blocks) contributes nothing, mirroring the encoder.
+# ---
+# tgt: resolved compilation target (its interner resolves symbol names)
+# m:   the fully-resolved MIR module to format
+# out: destination writer
+# ret: true on success, or the first write error
+pub fun print_asm_riscv64(tgt: *resolved.Target, m: *mir.MirModule, out: *writer.Writer) R.Result[bool, str] {
+    if (m == nil)   { ret R.err[bool, str]("print_asm_riscv64: nil mir module"); }
+    if (out == nil) { ret R.err[bool, str]("print_asm_riscv64: nil writer"); }
+
+    var i: u32 = 0;
+    for (i < m.function_len) {
+        val res_function: R.Result[bool, str] = print_function(out, m, ?m.functions[i]);
+        if (R.is_err[bool, str](res_function)) { ret res_function; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# render one MIR function: its `# <symbol>:` header, prologue, every block (each
+# preceded by a `.<id>:` local label), and epilogue
+#
+# A body-less (extern) function emits nothing.
+# ---
+# out: destination writer
+# m:   the owning module (its interner resolves the function / symbol names)
+# f:   the function to render
+# ret: true on success, or the first write error
+fun print_function(out: *writer.Writer, m: *mir.MirModule, f: *mir.MirFunction) R.Result[bool, str] {
+    if (f.block_count == 0) { ret R.ok[bool, str](true); }
+
+    val res_hash: R.Result[bool, str] = emit_str(out, "# ");
+    if (R.is_err[bool, str](res_hash)) { ret res_hash; }
+    val res_name: R.Result[bool, str] = emit_name(out, m.interner, f.name);
+    if (R.is_err[bool, str](res_name)) { ret res_name; }
+    val res_colon: R.Result[bool, str] = emit_str(out, ":\n");
+    if (R.is_err[bool, str](res_colon)) { ret res_colon; }
+
+    val naked: bool = function_is_naked(f);
+    val total: u32 = encode.frame_total(f);
+    if (!naked) {
+        val res_prologue: R.Result[bool, str] = print_prologue(out, total);
+        if (R.is_err[bool, str](res_prologue)) { ret res_prologue; }
+    }
+
+    var i: u32 = 0;
+    for (i < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[i];
+
+        val res_dot: R.Result[bool, str] = emit_str(out, ".");
+        if (R.is_err[bool, str](res_dot)) { ret res_dot; }
+        val res_label: R.Result[bool, str] = emit_u64(out, blk.id::u64);
+        if (R.is_err[bool, str](res_label)) { ret res_label; }
+        val res_label_colon: R.Result[bool, str] = emit_str(out, ":\n");
+        if (R.is_err[bool, str](res_label_colon)) { ret res_label_colon; }
+
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            if (mi.opcode::u16 == riscv64.RET::u16 && !naked) {
+                val res_epilogue: R.Result[bool, str] = print_epilogue(out, total);
+                if (R.is_err[bool, str](res_epilogue)) { ret res_epilogue; }
+            }
+            val res_instr: R.Result[bool, str] = print_instr(out, m, f, mi);
+            if (R.is_err[bool, str](res_instr)) { ret res_instr; }
+            ii = ii + 1;
+        }
+        i = i + 1;
+    }
+
+    ret emit_str(out, "\n");
+}
+
+# render the RISC-V prologue as a comment-flagged line so the frame shape is visible
+# without re-deriving it
+#
+# Mirrors the encoder's live `encode.emit_prologue`: the single `addi sp, sp, -total`
+# frame allocation, with the ra / s0 record and callee-saved spills it covers noted in
+# the comment. The reservation byte count is the encoder's `encode.frame_total`, so the
+# debug `.s` reports the exact amount the encoder subtracts from sp.
+# ---
+# out:   destination writer
+# total: the 16-byte-aligned frame reservation in bytes
+# ret:   true on success, or the first write error
+fun print_prologue(out: *writer.Writer, total: u32) R.Result[bool, str] {
+    if (total == 0) { ret R.ok[bool, str](true); }
+    val res_addi: R.Result[bool, str] = emit_str(out, "  addi  sp, sp, -");
+    if (R.is_err[bool, str](res_addi)) { ret res_addi; }
+    val res_amount: R.Result[bool, str] = emit_u64(out, total::u64);
+    if (R.is_err[bool, str](res_amount)) { ret res_amount; }
+    ret emit_str(out, "        # prologue (saves ra, s0, callee-saved)\n");
+}
+
+# render the RISC-V epilogue as a single comment-flagged line
+#
+# Mirrors the encoder's live `encode.emit_epilogue` (callee-saved restores, ra / s0
+# reload, then the `addi sp, sp, total` teardown), rendered compactly since this
+# artifact need not be byte-exact.
+# ---
+# out:   destination writer
+# total: the 16-byte-aligned frame reservation in bytes
+# ret:   true on success, or the first write error
+fun print_epilogue(out: *writer.Writer, total: u32) R.Result[bool, str] {
+    if (total == 0) { ret R.ok[bool, str](true); }
+    val res_addi: R.Result[bool, str] = emit_str(out, "  addi  sp, sp, ");
+    if (R.is_err[bool, str](res_addi)) { ret res_addi; }
+    val res_amount: R.Result[bool, str] = emit_u64(out, total::u64);
+    if (R.is_err[bool, str](res_amount)) { ret res_amount; }
+    ret emit_str(out, "         # epilogue\n");
+}
+
+# whether an asm-carrying function needs no frame, so its inline asm owns the stack and
+# gets no compiler prologue / epilogue
+#
+# True only when the function reserves no locals, preserves no callee-saved registers,
+# has no outgoing-argument area, and carries an inline-asm block. Mirrors the encoder's
+# `function_is_naked`.
+# ---
+# f:   the function to classify
+# ret: true when the function is naked
+fun function_is_naked(f: *mir.MirFunction) bool {
+    if (f.frame.size != 0)          { ret false; }
+    if (f.callee_mask != 0)         { ret false; }
+    if (f.callee_mask_fp != 0)      { ret false; }
+    if (f.frame.outgoing_size != 0) { ret false; }
+
+    var i: u32 = 0;
+    for (i < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[i];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            if (blk.instrs[ii].opcode == mir.MIR_ASM) { ret true; }
+            ii = ii + 1;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# render one fully-resolved MIR instruction
+#
+# The lowering-only pseudos that emit no bytes (PCOPY / USE / LABEL fences, the
+# CALL_RES / ARG liveness markers) are skipped. An inline-asm block prints a
+# `# <inline asm>` marker rather than its expanded body. Every other instruction prints
+# `<mnemonic> <op0>, <op1>, ...` with operands resolved through the same frame layout
+# the encoder reads.
+# ---
+# out: destination writer
+# m:   the owning module (its interner resolves symbol names)
+# f:   the owning function (its frame layout resolves memory operands)
+# mi:  the instruction to render
+# ret: true on success, or the first write error
+fun print_instr(out: *writer.Writer, m: *mir.MirModule, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.opcode == isa.ISA_PCOPY || mi.opcode == isa.ISA_PCOPY_FENCE ||
+        mi.opcode == isa.ISA_USE || mi.opcode == isa.ISA_LABEL ||
+        mi.opcode == mir.MIR_CALL_RES || mi.opcode == mir.MIR_ARG) {
+        ret R.ok[bool, str](true);
+    }
+
+    if (mi.opcode == mir.MIR_ASM) {
+        ret emit_str(out, "  # <inline asm>\n");
+    }
+
+    val res_indent: R.Result[bool, str] = emit_str(out, "  ");
+    if (R.is_err[bool, str](res_indent)) { ret res_indent; }
+    val res_mnemonic: R.Result[bool, str] = emit_str(out, mnemonic(mi.opcode));
+    if (R.is_err[bool, str](res_mnemonic)) { ret res_mnemonic; }
+
+    var i: u32 = 0;
+    for (i < mi.operand_count) {
+        if (i == 0) {
+            val res_sep: R.Result[bool, str] = emit_str(out, " ");
+            if (R.is_err[bool, str](res_sep)) { ret res_sep; }
+        }
+        or {
+            val res_sep: R.Result[bool, str] = emit_str(out, ", ");
+            if (R.is_err[bool, str](res_sep)) { ret res_sep; }
+        }
+        val res_operand: R.Result[bool, str] = print_operand(out, m, f, ?mi.operands[i]);
+        if (R.is_err[bool, str](res_operand)) { ret res_operand; }
+        i = i + 1;
+    }
+    ret emit_str(out, "\n");
+}
+
+# render one MIR operand in RISC-V syntax
+#
+# A register names its physical register from its composite class tag (GP or float); an
+# immediate prints its value; a memory operand resolves a frame-slot base to
+# `off(s0)` and a physical base to `disp(reg)`, folding any scaled index; a symbol
+# prints `<name>` (with a `+off` addend); a block prints its `.<id>` local-label
+# target. A surviving virtual register is a regalloc bug and prints `<vreg N>` so the
+# artifact stays legible rather than failing the whole dump.
+# ---
+# out: destination writer
+# m:   the owning module (its interner resolves symbol names)
+# f:   the owning function (its frame layout resolves memory operands)
+# op:  the operand to render
+# ret: true on success, or the first write error
+fun print_operand(out: *writer.Writer, m: *mir.MirModule, f: *mir.MirFunction, op: *mir.MirOperand) R.Result[bool, str] {
+    if (op.kind == mir.MIR_OP_PREG) {
+        ret emit_reg(out, op.preg::i32);
+    }
+    if (op.kind == mir.MIR_OP_VREG) {
+        val res_open: R.Result[bool, str] = emit_str(out, "<vreg ");
+        if (R.is_err[bool, str](res_open)) { ret res_open; }
+        val res_vreg: R.Result[bool, str] = emit_u64(out, op.vreg::u64);
+        if (R.is_err[bool, str](res_vreg)) { ret res_vreg; }
+        ret emit_str(out, ">");
+    }
+    if (op.kind == mir.MIR_OP_IMM) {
+        ret emit_i64(out, op.imm);
+    }
+    if (op.kind == mir.MIR_OP_MEM) {
+        ret print_mem(out, f, op);
+    }
+    if (op.kind == mir.MIR_OP_SYM) {
+        val res_name: R.Result[bool, str] = emit_name(out, m.interner, op.sym);
+        if (R.is_err[bool, str](res_name)) { ret res_name; }
+        if (op.sym_off != 0) {
+            val res_plus: R.Result[bool, str] = emit_str(out, "+");
+            if (R.is_err[bool, str](res_plus)) { ret res_plus; }
+            ret emit_i64(out, op.sym_off::i64);
+        }
+        ret R.ok[bool, str](true);
+    }
+    if (op.kind == mir.MIR_OP_BLOCK) {
+        val res_dot: R.Result[bool, str] = emit_str(out, ".");
+        if (R.is_err[bool, str](res_dot)) { ret res_dot; }
+        ret emit_u64(out, op.imm::u64);
+    }
+    ret emit_str(out, "?");
+}
+
+# render a memory operand as `disp(base)` (RISC-V base + displacement syntax)
+#
+# A frame-slot-key base (`vreg != MIR_VREG_NIL`) resolves to `slot.offset + imm`
+# off s0; a physical-register base (`vreg == MIR_VREG_NIL`) forms `imm(reg)`. A scaled
+# index is appended as `+ index*scale` ahead of the base (RISC-V has no native scaled-
+# index addressing, so the printer renders the folded GEP form the encoder expands). A
+# slot key owning no slot prints `<vreg N>` so a regalloc leak stays legible rather than
+# aborting the dump.
+# ---
+# out: destination writer
+# f:   the owning function (its frame layout resolves a slot-key base)
+# op:  the memory operand to render
+# ret: true on success, or the first write error
+fun print_mem(out: *writer.Writer, f: *mir.MirFunction, op: *mir.MirOperand) R.Result[bool, str] {
+    var disp: i64 = op.imm;
+    var base: str = nil;
+    if (op.vreg != mir.MIR_VREG_NIL) {
+        val opt_slot: O.Option[i64] = frame_slot_offset(f, op.vreg);
+        if (O.is_some[i64](opt_slot)) {
+            base = "s0";
+            disp = O.unwrap[i64](opt_slot) + op.imm;
+        }
+        or {
+            val res_open: R.Result[bool, str] = emit_str(out, "<vreg ");
+            if (R.is_err[bool, str](res_open)) { ret res_open; }
+            val res_vreg: R.Result[bool, str] = emit_u64(out, op.vreg::u64);
+            if (R.is_err[bool, str](res_vreg)) { ret res_vreg; }
+            ret emit_str(out, ">");
+        }
+    }
+    or {
+        base = gp_name(op.preg::i32);
+    }
+
+    val res_disp: R.Result[bool, str] = emit_i64(out, disp);
+    if (R.is_err[bool, str](res_disp)) { ret res_disp; }
+    val res_open: R.Result[bool, str] = emit_str(out, "(");
+    if (R.is_err[bool, str](res_open)) { ret res_open; }
+    val res_base: R.Result[bool, str] = emit_str(out, base);
+    if (R.is_err[bool, str](res_base)) { ret res_base; }
+
+    if (op.index != mir.MIR_VREG_NIL && op.index_is_preg) {
+        val res_plus: R.Result[bool, str] = emit_str(out, " + ");
+        if (R.is_err[bool, str](res_plus)) { ret res_plus; }
+        val res_index: R.Result[bool, str] = emit_str(out, gp_name(op.index::i32));
+        if (R.is_err[bool, str](res_index)) { ret res_index; }
+        if (op.scale > 1) {
+            val res_star: R.Result[bool, str] = emit_str(out, "*");
+            if (R.is_err[bool, str](res_star)) { ret res_star; }
+            val res_scale: R.Result[bool, str] = emit_u64(out, op.scale::u64);
+            if (R.is_err[bool, str](res_scale)) { ret res_scale; }
+        }
+    }
+    ret emit_str(out, ")");
+}
+
+# return the frame-pointer offset of the slot a MIR value owns, or none when it owns no
+# slot
+#
+# Mirrors the encoder's lookup over the laid-out frame.
+# ---
+# f:   the owning function (carries the laid-out frame)
+# v:   the MIR value whose slot is sought
+# ret: some(offset) when v owns a slot, or none
+fun frame_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
+    val frame: *mir.MirFrame = ?f.frame;
+    if (frame.slots == nil) { ret O.none[i64](); }
+    var i: u32 = 0;
+    for (i < frame.slot_count) {
+        if (frame.slots[i].value == v) { ret O.some[i64](frame.slots[i].offset); }
+        i = i + 1;
+    }
+    ret O.none[i64]();
+}
+
+# write a register name from a composite register id, naming its own bank (GP or float)
+# from the class tag - a cross-bank `fmv` prints each side in its own file.
+# ---
+# out: destination writer
+# id:  the composite register id to name
+# ret: true on success, or the write error
+fun emit_reg(out: *writer.Writer, id: i32) R.Result[bool, str] {
+    if (isa.regid_class(id) == isa.REG_CLASS_ID_XMM) { ret emit_str(out, fp_name(isa.regid_index(id))); }
+    ret emit_str(out, gp_name(isa.regid_index(id)));
+}
+
+# the RISC-V psABI integer-register mnemonic for a register index (x0-x31)
+# ---
+# idx: the integer register index
+# ret: the psABI name, or `x?` for an out-of-range index
+fun gp_name(idx: i32) str {
+    if (idx == 0)  { ret "zero"; }
+    if (idx == 1)  { ret "ra"; }
+    if (idx == 2)  { ret "sp"; }
+    if (idx == 3)  { ret "gp"; }
+    if (idx == 4)  { ret "tp"; }
+    if (idx == 5)  { ret "t0"; }
+    if (idx == 6)  { ret "t1"; }
+    if (idx == 7)  { ret "t2"; }
+    if (idx == 8)  { ret "s0"; }
+    if (idx == 9)  { ret "s1"; }
+    if (idx == 10) { ret "a0"; }
+    if (idx == 11) { ret "a1"; }
+    if (idx == 12) { ret "a2"; }
+    if (idx == 13) { ret "a3"; }
+    if (idx == 14) { ret "a4"; }
+    if (idx == 15) { ret "a5"; }
+    if (idx == 16) { ret "a6"; }
+    if (idx == 17) { ret "a7"; }
+    if (idx == 18) { ret "s2"; }
+    if (idx == 19) { ret "s3"; }
+    if (idx == 20) { ret "s4"; }
+    if (idx == 21) { ret "s5"; }
+    if (idx == 22) { ret "s6"; }
+    if (idx == 23) { ret "s7"; }
+    if (idx == 24) { ret "s8"; }
+    if (idx == 25) { ret "s9"; }
+    if (idx == 26) { ret "s10"; }
+    if (idx == 27) { ret "s11"; }
+    if (idx == 28) { ret "t3"; }
+    if (idx == 29) { ret "t4"; }
+    if (idx == 30) { ret "t5"; }
+    if (idx == 31) { ret "t6"; }
+    ret "x?";
+}
+
+# the RISC-V psABI float-register mnemonic for a register index (f0-f31)
+# ---
+# idx: the float register index
+# ret: the psABI name, or `f?` for an out-of-range index
+fun fp_name(idx: i32) str {
+    if (idx == 0)  { ret "ft0"; }
+    if (idx == 1)  { ret "ft1"; }
+    if (idx == 2)  { ret "ft2"; }
+    if (idx == 3)  { ret "ft3"; }
+    if (idx == 4)  { ret "ft4"; }
+    if (idx == 5)  { ret "ft5"; }
+    if (idx == 6)  { ret "ft6"; }
+    if (idx == 7)  { ret "ft7"; }
+    if (idx == 8)  { ret "fs0"; }
+    if (idx == 9)  { ret "fs1"; }
+    if (idx == 10) { ret "fa0"; }
+    if (idx == 11) { ret "fa1"; }
+    if (idx == 12) { ret "fa2"; }
+    if (idx == 13) { ret "fa3"; }
+    if (idx == 14) { ret "fa4"; }
+    if (idx == 15) { ret "fa5"; }
+    if (idx == 16) { ret "fa6"; }
+    if (idx == 17) { ret "fa7"; }
+    if (idx == 18) { ret "fs2"; }
+    if (idx == 19) { ret "fs3"; }
+    if (idx == 20) { ret "fs4"; }
+    if (idx == 21) { ret "fs5"; }
+    if (idx == 22) { ret "fs6"; }
+    if (idx == 23) { ret "fs7"; }
+    if (idx == 24) { ret "fs8"; }
+    if (idx == 25) { ret "fs9"; }
+    if (idx == 26) { ret "fs10"; }
+    if (idx == 27) { ret "fs11"; }
+    if (idx == 28) { ret "ft8"; }
+    if (idx == 29) { ret "ft9"; }
+    if (idx == 30) { ret "ft10"; }
+    if (idx == 31) { ret "ft11"; }
+    ret "f?";
+}
+
+# return the assembly mnemonic for a fully-resolved RV64 MIR opcode
+#
+# The concrete RV64 opcodes the selector emits map to their natural mnemonic, as do the
+# surviving generic / selection-output sentinels (the divide, compare, conditional-
+# branch, float, conversion, and memory families plus the CALL pseudo).
+# ---
+# op:  the MIR opcode to name
+# ret: the mnemonic text, or `???` for an unrecognized opcode
+fun mnemonic(op: mir.MirOpcode) str {
+    # the surviving generic / selection-output sentinels (high opcode values).
+    if (op == mir.MIR_CALL)      { ret "call"; }
+    if (op == mir.MIR_LOAD)      { ret "ld"; }
+    if (op == mir.MIR_STORE)     { ret "sd"; }
+    if (op == mir.MIR_GEP)       { ret "lea"; }
+    if (op == mir.MIR_ALLOCA)    { ret "lea"; }
+
+    if (op == mir.MIR_SEL_DIV_S) { ret "div"; }
+    if (op == mir.MIR_SEL_DIV_U) { ret "divu"; }
+    if (op == mir.MIR_SEL_REM_S) { ret "rem"; }
+    if (op == mir.MIR_SEL_REM_U) { ret "remu"; }
+
+    if (op == mir.MIR_SEL_CMP_EQ)   { ret "cmp.eq"; }
+    if (op == mir.MIR_SEL_CMP_NE)   { ret "cmp.ne"; }
+    if (op == mir.MIR_SEL_CMP_LT_S) { ret "cmp.lt_s"; }
+    if (op == mir.MIR_SEL_CMP_LT_U) { ret "cmp.lt_u"; }
+    if (op == mir.MIR_SEL_CMP_LE_S) { ret "cmp.le_s"; }
+    if (op == mir.MIR_SEL_CMP_LE_U) { ret "cmp.le_u"; }
+    if (op == mir.MIR_SEL_CBR)      { ret "cbr"; }
+
+    if (op == mir.MIR_FADD) { ret "fadd"; }
+    if (op == mir.MIR_FSUB) { ret "fsub"; }
+    if (op == mir.MIR_FMUL) { ret "fmul"; }
+    if (op == mir.MIR_FDIV) { ret "fdiv"; }
+    if (op == mir.MIR_FCMP) { ret "fcmp"; }
+    if (op == mir.MIR_FNEG) { ret "fneg"; }
+
+    if (op == mir.MIR_TRUNC)   { ret "trunc"; }
+    if (op == mir.MIR_SEXT)    { ret "sext"; }
+    if (op == mir.MIR_ZEXT)    { ret "zext"; }
+    if (op == mir.MIR_BITCAST) { ret "bitcast"; }
+    if (op == mir.MIR_FP_TRUNC) { ret "fcvt.s.d"; }
+    if (op == mir.MIR_FP_EXT)   { ret "fcvt.d.s"; }
+    if (op == mir.MIR_FP_TO_SI) { ret "fcvt.l.fp"; }
+    if (op == mir.MIR_FP_TO_UI) { ret "fcvt.lu.fp"; }
+    if (op == mir.MIR_SI_TO_FP) { ret "fcvt.fp.l"; }
+    if (op == mir.MIR_UI_TO_FP) { ret "fcvt.fp.lu"; }
+
+    ret riscv64_mnemonic(op::u16);
+}
+
+# return the mnemonic for a concrete RV64 opcode the selector emitted
+# ---
+# op:  the concrete riscv64 opcode to name
+# ret: the mnemonic text, or `???` for an unrecognized opcode
+fun riscv64_mnemonic(op: u16) str {
+    if (op == riscv64.NOP)    { ret "nop"; }
+    if (op == riscv64.RET)    { ret "ret"; }
+    if (op == riscv64.ADD)    { ret "add"; }
+    if (op == riscv64.SUB)    { ret "sub"; }
+    if (op == riscv64.MUL)    { ret "mul"; }
+    if (op == riscv64.AND)    { ret "and"; }
+    if (op == riscv64.OR)     { ret "or"; }
+    if (op == riscv64.XOR)    { ret "xor"; }
+    if (op == riscv64.SLL)    { ret "sll"; }
+    if (op == riscv64.SRL)    { ret "srl"; }
+    if (op == riscv64.SRA)    { ret "sra"; }
+    if (op == riscv64.NEG)    { ret "neg"; }
+    if (op == riscv64.NOT)    { ret "not"; }
+    if (op == riscv64.MOV)    { ret "mv"; }
+    if (op == riscv64.JMP)    { ret "j"; }
+    if (op == riscv64.EBREAK) { ret "ebreak"; }
+    if (op == riscv64.FMV)    { ret "fmv"; }
+    ret "???";
+}
+
+# write a string, mapping a format error to the bool/str result shape
+# ---
+# out: destination writer
+# s:   the string to write
+# ret: true on success, or the write error
+fun emit_str(out: *writer.Writer, s: str) R.Result[bool, str] {
+    val res_write: R.Result[usize, str] = format.write_str(out, s);
+    if (R.is_err[usize, str](res_write)) { ret R.err[bool, str](R.unwrap_err[usize, str](res_write)); }
+    ret R.ok[bool, str](true);
+}
+
+# write an unsigned integer
+# ---
+# out: destination writer
+# n:   the value to write
+# ret: true on success, or the write error
+fun emit_u64(out: *writer.Writer, n: u64) R.Result[bool, str] {
+    val res_write: R.Result[usize, str] = format.write_u64(out, n);
+    if (R.is_err[usize, str](res_write)) { ret R.err[bool, str](R.unwrap_err[usize, str](res_write)); }
+    ret R.ok[bool, str](true);
+}
+
+# write a signed integer
+# ---
+# out: destination writer
+# n:   the value to write
+# ret: true on success, or the write error
+fun emit_i64(out: *writer.Writer, n: i64) R.Result[bool, str] {
+    val res_write: R.Result[usize, str] = format.write_i64(out, n);
+    if (R.is_err[usize, str](res_write)) { ret R.err[bool, str](R.unwrap_err[usize, str](res_write)); }
+    ret R.ok[bool, str](true);
+}
+
+# write an interned name, or `<?name>` when the id does not resolve
+# ---
+# out:      destination writer
+# interner: the interner that resolves the id to text
+# id:       the interned string id to write
+# ret:      true on success, or the first write error
+fun emit_name(out: *writer.Writer, interner: *intern.Interner, id: intern.StrId) R.Result[bool, str] {
+    val opt_name: O.Option[str] = intern.lookup(interner, id);
+    if (O.is_some[str](opt_name)) { ret emit_str(out, O.unwrap[str](opt_name)); }
+    ret emit_str(out, "<?name>");
+}
+
+# the register-name tables map the integer and float bank indices to the RISC-V psABI
+# mnemonics (the role names a reader expects), and the opcode tables name each concrete
+# RV64 form and surviving generic / selection-output sentinel.
+test "mach.lang.target.isa.riscv64.printer.names:abi_mnemonics" {
+    if (!str_equals(gp_name(0), "zero"))  { ret 1; }
+    if (!str_equals(gp_name(1), "ra"))    { ret 1; }
+    if (!str_equals(gp_name(2), "sp"))    { ret 1; }
+    if (!str_equals(gp_name(8), "s0"))    { ret 1; }
+    if (!str_equals(gp_name(10), "a0"))   { ret 1; }
+    if (!str_equals(gp_name(5), "t0"))    { ret 1; }
+    if (!str_equals(gp_name(17), "a7"))   { ret 1; }
+    if (!str_equals(gp_name(31), "t6"))   { ret 1; }
+    if (!str_equals(gp_name(99), "x?"))   { ret 1; }
+
+    if (!str_equals(fp_name(0), "ft0"))   { ret 1; }
+    if (!str_equals(fp_name(8), "fs0"))   { ret 1; }
+    if (!str_equals(fp_name(10), "fa0"))  { ret 1; }
+    if (!str_equals(fp_name(31), "ft11")) { ret 1; }
+    if (!str_equals(fp_name(99), "f?"))   { ret 1; }
+    ret 0;
+}
+
+# the opcode-to-mnemonic mapping covers the concrete RV64 forms the selector emits and
+# the surviving generic / selection-output sentinels (memory, divide, compare, branch,
+# and float families).
+test "mach.lang.target.isa.riscv64.printer.mnemonic:opcode_names" {
+    if (!str_equals(riscv64_mnemonic(riscv64.ADD::u16), "add")) { ret 1; }
+    if (!str_equals(riscv64_mnemonic(riscv64.MOV::u16), "mv"))  { ret 1; }
+    if (!str_equals(riscv64_mnemonic(riscv64.JMP::u16), "j"))   { ret 1; }
+    if (!str_equals(riscv64_mnemonic(riscv64.RET::u16), "ret")) { ret 1; }
+    if (!str_equals(riscv64_mnemonic(riscv64.FMV::u16), "fmv")) { ret 1; }
+
+    if (!str_equals(mnemonic(mir.MIR_CALL), "call"))         { ret 1; }
+    if (!str_equals(mnemonic(mir.MIR_LOAD), "ld"))           { ret 1; }
+    if (!str_equals(mnemonic(mir.MIR_STORE), "sd"))          { ret 1; }
+    if (!str_equals(mnemonic(mir.MIR_GEP), "lea"))           { ret 1; }
+    if (!str_equals(mnemonic(mir.MIR_SEL_DIV_U), "divu"))    { ret 1; }
+    if (!str_equals(mnemonic(mir.MIR_SEL_CMP_EQ), "cmp.eq")) { ret 1; }
+    if (!str_equals(mnemonic(mir.MIR_FADD), "fadd"))         { ret 1; }
+    # a concrete RV64 opcode routes through the riscv64 table.
+    if (!str_equals(mnemonic(riscv64.SUB::mir.MirOpcode), "sub")) { ret 1; }
+    ret 0;
+}

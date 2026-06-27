@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] - 2026-06-26
+
+First targets on the retargeting foundation. riscv64 lands end to end as the
+register-machine validator (substrate authoring plus vtable hooks, no
+shared-backend edits), Mach-O joins ELF and COFF as an object format, and the
+constant-time work begins with the secret type qualifier in the front end.
+Releases now ship optimized (opt=2) binaries. No breaking changes, and existing
+x86_64 and aarch64 builds are unaffected.
+
+### Added
+
+- target: a full riscv64 (RV64) isa backend (machine model, instruction
+  selection, encoder, relocations) and an lp64/lp64d ABI, composing the
+  `riscv64-linux` cross-compile target. Byte-verified against llvm-mc and run to
+  its exit code under qemu (#1172).
+- target: a riscv64 inline-asm assembler so `asm riscv64 { ... }` blocks encode
+  to RV64 bytes, including `ecall`. The cross lane now runs a qemu exit-code e2e
+  (#1642).
+- target: a Mach-O object format (writer, reader, static executable) for x86_64
+  and arm64, keyed on the isa with no new shared backend hook. Cross-compile
+  byte-verified for the darwin triples (#1176).
+- frontend: the secret type qualifier `^` (`^u32`, `*^u8`, `[N]^u8`, `^MyRec`)
+  and the `:^` strip-cast token. Lexer, parser, and grammar only, the
+  de-risking first slice of the constant-time guarantees epic (#1643); no
+  type-checking behavior yet (#1644).
+- build: `[profile.debug]` and `[profile.release]` profiles with
+  profile-segmented output paths, so debug and release builds no longer clobber
+  each other. Releases build with `--profile release` (opt=2) gated by a
+  self-host fixpoint, and a release-profile CI lane catches -O2 regressions on
+  PRs (#1591, #1592).
+
+### Changed
+
+- link: the relocation and ELF-class seam is widened onto the substrate, so a
+  new isa owns its reloc packing and object-format mapping rather than editing
+  shared linker and ELF code (#1625, #1635).
+
+### Fixed
+
+- test: `mach test` bounds per-test link memory with a per-test scratch arena
+  reset after every test. Memory was O(test count) through the session arena and
+  tripped the windows runner ceiling at `coff: unwind table alloc failed` once
+  the suite grew (#1653).
+- codegen: riscv64 sub-word loads read the source width rather than the clamped
+  width, fixing a sub-word load miscompile (#1639).
+- codegen: `fp_class_index` finds the float bank by RegClass kind instead of
+  assuming a >=128-bit float bank (#1624).
+- docs: `doc/language/files.md` no longer misframes `main()` as compiler-known
+  (#1631).
+
 ## [2.6.0] - 2026-06-26
 
 Retargeting foundation. A compilation target is now a composition of named

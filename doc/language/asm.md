@@ -16,7 +16,7 @@ asm <isa> {
 ```
 
 - The ISA tag is mandatory. Bare `asm { ... }` does not exist.
-- The tag comes from a closed set: `x86_64`, `aarch64`. Only `x86_64` has a working code generator today; `aarch64` is recognized for portable target-conditional source but is not yet a buildable target (see issue #1045).
+- The tag comes from a closed set: `x86_64`, `aarch64`, `riscv64`. Each has a working assembler that emits native bytes. `riscv64` is cross-compile-only: its assembler is complete (it emits `ecall` and the rest of the RV64 grammar), but mach-std has no riscv64 runtime yet, so the compiler cannot be built for it.
 - Each line is an instruction in the ISA's native syntax.
 - `#` introduces a line comment: everything from `#` to the end of the line is ignored, whatever it contains (`;`, `{}`, `%`, and so on are all inert inside a comment).
 
