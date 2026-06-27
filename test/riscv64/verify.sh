@@ -9,8 +9,9 @@
 # and qemu-riscv64 (or qemu-riscv64-static) for the exit-code run.
 set -euo pipefail
 
-# the computed exit code the fixture returns (sum 0..9), the qemu e2e asserts it.
-expect_code=45
+# the computed exit code the fixture returns (sum 0..9 plus the const-shift call
+# argument 1 << 3 = 8, i.e. 45 + 8), the qemu e2e asserts it.
+expect_code=53
 
 mach="${1:-mach}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,7 +53,7 @@ echo "verifying disassembly of $exe"
 dis="$("$objdump" -d "$exe")"
 echo "$dis" | grep -q 'file format elf64-littleriscv' || fail "objdump did not parse a little-endian rv64 elf"
 echo "$dis" | grep -qi '<unknown>'                    && fail "objdump found an unknown instruction word"
-for mnem in auipc jalr ld sd addi ret ecall; do
+for mnem in auipc jalr ld sd addi sll ret ecall; do
     echo "$dis" | grep -qw "$mnem" || fail "expected mnemonic '$mnem' not in disassembly"
 done
 
