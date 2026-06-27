@@ -46,7 +46,8 @@ A secret may not reach a position the leakage model observes. Each is a compile
 error decided by operand type:
 
 - a secret branch or loop condition (`if`, `for`)
-- a secret short-circuiting `&&` / `||` operand (it controls a branch)
+- a secret left operand of a short-circuiting `&&` / `||` (it is the branch the
+  operator keys on; a secret right operand only taints the result)
 - a secret memory index (`table[i]` with `i` secret)
 - a secret operand of the always-variable-latency `/` or `%`
 
