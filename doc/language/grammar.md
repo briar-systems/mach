@@ -51,7 +51,7 @@ token ::= IDENT
 punctuation ::= "(" | ")" | "{" | "}" | "[" | "]"
               | ";" | ":" | "," | "." | "?" | "@" | "$" | "`"
               | "#["    (* attribute-open: "#" immediately followed by "[" *)
-              | "::" | ":~" | "..."
+              | "::" | ":~" | ":^" | "..."
 
 operator ::= "+" | "-" | "*" | "/" | "%"
            | "&" | "|" | "^" | "~"
@@ -66,9 +66,11 @@ Notes:
   tokens; the parser recognizes them contextually by their text
   (`at_kw` / `eat_kw` in `parser/state.mach`). The same applies to the
   primitive type names and `nil`.
-- The maximal-munch multi-character operators are `::`, `:~`, `...`, `==`,
-  `!=`, `<=`, `<<`, `>=`, `>>`, `&&`, `||`. A leading `:` lexes as `::` or
-  `:~` before a bare `:`, so `expr:~Type` is one cast, never `:` then `~`.
+- The maximal-munch multi-character operators are `::`, `:~`, `:^`, `...`,
+  `==`, `!=`, `<=`, `<<`, `>=`, `>>`, `&&`, `||`. A leading `:` lexes as `::`,
+  `:~`, or `:^` before a bare `:`, so `expr:~Type` is one cast, never `:` then
+  `~`. A space after the annotation colon (`k: ^[32]u8`) keeps `:` and `^`
+  separate, the same adjacency rule `::`/`:~` rely on.
 - The lexer recognizes the standalone characters `=`, `!`, `<`, `>`, `&`,
   `|` and the two-character forms above. There is no `+=`, `-=`, etc. —
   compound assignment does not exist.
@@ -379,17 +381,19 @@ a statement-list body (see [Statements](#statements)).
 ## Types
 
 ```ebnf
-type ::= ptr-type
+type ::= secret-type
+       | ptr-type
        | array-type
        | fun-type
        | rec-type
        | uni-type
        | named-type
 
-ptr-type   ::= "*" type
-array-type ::= "[" expr "]" type
-named-type ::= dotted-path [ type-args ]
-type-args  ::= "[" [ type { "," type } [ "," ] ] "]"
+secret-type ::= "^" type
+ptr-type    ::= "*" type
+array-type  ::= "[" expr "]" type
+named-type  ::= dotted-path [ type-args ]
+type-args   ::= "[" [ type { "," type } [ "," ] ] "]"
 
 fun-type ::= "fun" "(" [ fun-type-params ] ")" [ type ]
 fun-type-params ::= "..."
@@ -401,6 +405,11 @@ anon-field-block ::= "{" { IDENT ":" type ";" } "}"
 ```
 
 Notes:
+- `^T` marks `T` as carrying secret data for the constant-time guarantee
+  (#1643). It is a prefix qualifier binding to the type immediately to its
+  right, so it nests with `*` and `[N]` in any order (`*^u8`, `^*u8`,
+  `[N]^u8`). The grammar accepts it in every type position; its flow-typing
+  semantics are not yet enforced (tracked by #1645).
 - `*T` is a pointer; the untyped pointer type is the primitive name `ptr`
   (an ordinary `named-type`, not its own syntax).
 - `[N]T` is a fixed-length array; `N` is a full expression (a comptime
@@ -474,10 +483,16 @@ index        ::= "[" expr "]"
 member       ::= "." IDENT
 project      ::= "." "[" expr "]"          (* v.[f]: comptime field projection *)
 cast         ::= ( "::" | ":~" ) type
+              | ":^" [ named-type ]        (* secret-qualifier strip cast *)
 ```
 
 `::` is a value conversion and `:~` a same-size bit reinterpret; see
-[operators.md](operators.md#cast). Both bind as postfix.
+[operators.md](operators.md#cast). `:^` strips the `^` secret qualifier from
+the operand's type (#1643): a bare `:^` needs no target, while `:^Type` takes
+an optional named target for parallelism with `:~Type`. A non-`named-type`
+lead (`*`, `[`, ...) after `:^` leaves a bare strip so it still binds as a
+multiply/index on the stripped value. Its semantics are not yet enforced
+(tracked by #1645). All three bind as postfix.
 
 Disambiguating a postfix `[`: a bracket whose matching `]` is **not** followed
 by `(` is always an index `obj[idx]`. When it **is** followed by `(`, the
