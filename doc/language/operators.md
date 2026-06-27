@@ -104,7 +104,12 @@ val b: u64 = 1.5:~u64;          # 0x3FF8000000000000 (raw IEEE-754 bits)
 val f: f64 = b:~f64;            # 1.5                (bits read back as a float)
 ```
 
+Neither `::` nor `:~` may add or drop the `^` secret qualifier, and neither can
+erase a secret-welded pointer to `ptr`. The only downgrade is the `:^` strip
+cast. See [secrecy.md](secrecy.md).
+
 ## See also
 
 - [expressions.md](expressions.md) — how operators compose into expressions
 - [types.md](types.md) — which types support which operators
+- [secrecy.md](secrecy.md) — the `^` secret qualifier and the `:^` strip cast

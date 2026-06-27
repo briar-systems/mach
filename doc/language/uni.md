@@ -33,6 +33,11 @@ pub uni Maybe[T] {
 A `uni`'s size is the size of its largest field, plus any alignment
 padding.
 
+A `uni`'s overlapping variants must agree on secrecy: every field is either
+secret (`^`) or every field is public. A mixed union would let the same storage
+be read at two secrecy classifications, the aliasing leak the welded-storage
+rules forbid. See [secrecy.md](secrecy.md).
+
 ## Discriminated values — by convention
 
 Mach has no tagged-union construct and no pattern-matching dispatch.
@@ -57,3 +62,4 @@ the composed form already expresses honestly.
 
 - [rec.md](rec.md) — the discriminator-and-payload outer shape
 - [statements.md](statements.md) — `if`/`or` chains for discrimination
+- [secrecy.md](secrecy.md) — why overlapping variants must agree on secrecy
