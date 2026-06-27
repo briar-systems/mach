@@ -261,7 +261,21 @@ pub fun imported_module_const_sym(sc: *context.SemaContext, sym: *resolve.Symbol
 pub fun check_index(sc: *context.SemaContext, object: type.TypeId, index: type.TypeId, span: token.Span) O.Option[type.TypeId] {
     if (object == type.TYPE_ERROR) { ret O.some[type.TypeId](type.TYPE_ERROR); }
 
-    val opt_object: O.Option[*type.Type] = type.get(?sc.s.types, object);
+    # GATE: a secret index becomes a secret-dependent memory address the leakage
+    # model observes through the access trace (#1645). reported before the integer
+    # check, which sees through the `^` and would otherwise accept it.
+    if (index != type.TYPE_ERROR && type.is_secret(?sc.s.types, index)) {
+        report_note(sc, span, "secret value used as a memory index",
+            "a secret may not address memory; the access pattern leaks through the cache trace. index by a public value, or load the whole table obliviously");
+    }
+
+    # a secret container `^[N]T` / `^*T` is indexed through its inner type, and
+    # the secrecy joins onto the element (every element of a secret aggregate is
+    # secret). `[N]^T` carries the `^` on the element directly.
+    val obj_secret: bool = type.is_secret(?sc.s.types, object);
+    val base_obj:   type.TypeId = type.strip_secret(?sc.s.types, object);
+
+    val opt_object: O.Option[*type.Type] = type.get(?sc.s.types, base_obj);
     if (O.is_none[*type.Type](opt_object)) {
         report(sc, span, "not indexable: object is neither a pointer nor an array");
         ret O.none[type.TypeId]();
@@ -283,6 +297,7 @@ pub fun check_index(sc: *context.SemaContext, object: type.TypeId, index: type.T
     if (index != type.TYPE_ERROR && !is_integer(sc, index)) {
         report(sc, span, "type mismatch: index must be an integer");
     }
+    if (obj_secret) { elem = secret_of(sc, elem); }
     ret O.some[type.TypeId](elem);
 }
 
@@ -302,9 +317,19 @@ pub fun check_index(sc: *context.SemaContext, object: type.TypeId, index: type.T
 pub fun check_member(sc: *context.SemaContext, object: type.TypeId, name: intern.StrId, span: token.Span) O.Option[type.TypeId] {
     if (object == type.TYPE_ERROR) { ret O.some[type.TypeId](type.TYPE_ERROR); }
 
-    val record: type.TypeId = deref_one(sc, object);
+    # a secret container taints every field read out of it: accessing a field of a
+    # `^Rec` (or through a `*^Rec`) yields a secret value. the field's own
+    # declared `^` (e.g. `d: ^[32]u8`) joins with the container's.
+    val deref:          type.TypeId = deref_one(sc, type.strip_secret(?sc.s.types, object));
+    val container_secret: bool      = type.is_secret(?sc.s.types, object) || type.is_secret(?sc.s.types, deref);
+    val record:         type.TypeId = type.strip_secret(?sc.s.types, deref);
+
     val opt_field: O.Option[type.TypeId] = context.field_lookup(sc, record, name);
-    if (O.is_some[type.TypeId](opt_field)) { ret opt_field; }
+    if (O.is_some[type.TypeId](opt_field)) {
+        var fty: type.TypeId = O.unwrap[type.TypeId](opt_field);
+        if (container_secret) { fty = secret_of(sc, fty); }
+        ret O.some[type.TypeId](fty);
+    }
 
     report_no_field(sc, span, name, record);
     ret O.none[type.TypeId]();
@@ -325,7 +350,14 @@ pub fun check_cast(sc: *context.SemaContext, from: type.TypeId, to: type.TypeId,
     if (from == type.TYPE_ERROR || to == type.TYPE_ERROR) { ret O.some[type.TypeId](to); }
     if (from == to)                                       { ret O.some[type.TypeId](to); }
 
-    # primitive numeric <-> primitive numeric conversion
+    # the welded-storage discipline (#1645): `::` may neither launder a secret
+    # pointer to the untyped `ptr` nor add / drop a `^`. checked before the
+    # value-conversion rules, which strip secrecy to size and classify operands.
+    if (!check_secrecy_cast(sc, from, to, span)) { ret O.none[type.TypeId](); }
+
+    # primitive numeric <-> primitive numeric conversion (secrecy preserved: the
+    # secrecy check above already proved from and to agree, so the result keeps
+    # whatever `^` the target was written with)
     if (is_numeric(sc, from) && is_numeric(sc, to)) {
         ret O.some[type.TypeId](to);
     }
@@ -343,6 +375,36 @@ pub fun check_cast(sc: *context.SemaContext, from: type.TypeId, to: type.TypeId,
     ret O.none[type.TypeId]();
 }
 
+# enforce the welded-storage secrecy rules common to `::` and `:~` (#1645)
+#
+# Two prohibitions keep the public/secret aliasing leak unconstructable with no
+# alias analysis: a secret-welded pointer (`*^T` and friends) may never be erased
+# to the untyped `ptr`, and a cast may never add or drop a `^` (that is the sole
+# job of the implicit up-coerce and the `:^` strip). Differing inner leaf shapes
+# the cast genuinely converts are unaffected - only `^` placement is compared.
+# ---
+# sc:   the active sema context
+# from: the operand's type
+# to:   the target type
+# span: source range of the cast
+# ret:  true when the cast respects secrecy, false (with a diagnostic) otherwise
+fun check_secrecy_cast(sc: *context.SemaContext, from: type.TypeId, to: type.TypeId, span: token.Span) bool {
+    val from_raw_ptr: bool = from == type.TYPE_PTR;
+    val to_raw_ptr:   bool = to == type.TYPE_PTR;
+    if ((from_raw_ptr && type.carries_secret(?sc.s.types, to))
+        || (to_raw_ptr && type.carries_secret(?sc.s.types, from))) {
+        report_note(sc, span, "cast: a secret-welded pointer cannot be erased to the untyped `ptr`",
+            "secret memory is reached only through secrecy-typed pointers; erasing `^` to `ptr` would let a public alias read it");
+        ret false;
+    }
+    if (!type.secrecy_structure_equal(?sc.s.types, from, to)) {
+        report_note(sc, span, "cast: `::` and `:~` cannot add or drop the secret qualifier `^`",
+            "a public value coerces up to secret with no syntax; `:^` is the only downgrade");
+        ret false;
+    }
+    ret true;
+}
+
 # checks a bit-reinterpret cast `value:~Type`
 #
 # legal only when `from` and `to` have a known, identical byte size; the
@@ -357,6 +419,10 @@ pub fun check_cast(sc: *context.SemaContext, from: type.TypeId, to: type.TypeId,
 # ret:  some(to) when the reinterpret is legal, none (with a diagnostic) otherwise
 pub fun check_reinterpret(sc: *context.SemaContext, from: type.TypeId, to: type.TypeId, span: token.Span) O.Option[type.TypeId] {
     if (from == type.TYPE_ERROR || to == type.TYPE_ERROR) { ret O.some[type.TypeId](to); }
+
+    # `:~` is bound by the same welded-storage secrecy rules as `::` - it can
+    # neither erase a secret pointer to `ptr` nor change a `^` (#1645).
+    if (!check_secrecy_cast(sc, from, to, span)) { ret O.none[type.TypeId](); }
 
     val size_from: u32 = byte_size(sc, from);
     val size_to:   u32 = byte_size(sc, to);
@@ -403,6 +469,14 @@ pub fun check_return(sc: *context.SemaContext, fn_ret: type.TypeId, value: type.
 # ret:  true when the condition is an integer primitive, false otherwise
 pub fun check_condition(sc: *context.SemaContext, cond: type.TypeId, span: token.Span) bool {
     if (cond == type.TYPE_ERROR) { ret true; }
+    # GATE: a secret condition is a secret-dependent branch the leakage model
+    # observes through the control-flow trace (#1645). reported before the integer
+    # check, which sees through the `^` and would otherwise accept it.
+    if (type.is_secret(?sc.s.types, cond)) {
+        report_note(sc, span, "secret value used as a branch condition",
+            "a secret may not steer control flow; branching on it leaks through timing. compute branch-free, or `:^` to a public value when disclosure is intended");
+        ret false;
+    }
     if (is_integer(sc, cond))    { ret true; }
     report_note(sc, span, "type mismatch: condition must be an integer",
         "mach has no `bool` type; comparisons yield an integer truth value");
@@ -431,18 +505,34 @@ pub fun is_integer(sc: *context.SemaContext, t: type.TypeId) bool {
     ret type.is_integer(?sc.s.types, t);
 }
 
+# wrap `t` in the secret qualifier `^t`, used by the secrecy JOIN when a secret
+# container taints a value read out of it (#1645)
+#
+# A doubled qualifier collapses in intern_secret; an allocation failure degrades
+# to `t` unchanged (the diagnostic for the real error lands elsewhere).
+# ---
+# sc:  the active sema context
+# t:   the type to qualify
+# ret: `^t`, or `t` unchanged on an allocation failure
+fun secret_of(sc: *context.SemaContext, t: type.TypeId) type.TypeId {
+    val r: R.Result[type.TypeId, str] = type.intern_secret(?sc.s.types, t);
+    if (R.is_err[type.TypeId, str](r)) { ret t; }
+    ret R.unwrap_ok[type.TypeId, str](r);
+}
+
 # the byte size of a type, resolving pointers/arrays/records via the interner
 #
 # pointer and function values are pointer-sized, read from the target's pointer
 # width; records and unions report 0 because their layout is not computed in
 # sema (the backend owns layout). a 0 result signals "size unknown" and disables
-# same-size cast reinterpretation.
+# same-size cast reinterpretation. secrecy has no runtime width, so a `^T` sizes
+# exactly as `T`.
 # ---
 # sc:  the active sema context
 # t:   a TypeId
 # ret: the size in bytes, or 0 when the size is not known at this layer
 pub fun byte_size(sc: *context.SemaContext, t: type.TypeId) u32 {
-    val opt_type: O.Option[*type.Type] = type.get(?sc.s.types, t);
+    val opt_type: O.Option[*type.Type] = type.get(?sc.s.types, type.strip_secret(?sc.s.types, t));
     if (O.is_none[*type.Type](opt_type)) { ret 0; }
     val tp: *type.Type    = O.unwrap[*type.Type](opt_type);
     val k:  type.TypeKind = tp.kind;
@@ -1087,6 +1177,9 @@ fun type_str_len(sc: *context.SemaContext, t: type.TypeId) usize {
     if (k == type.TYPE_POINTER) {
         ret 1 + type_str_len(sc, tp.data.pointer.base);
     }
+    if (k == type.TYPE_SECRET) {
+        ret 1 + type_str_len(sc, tp.data.secret.base);
+    }
     if (k == type.TYPE_ARRAY) {
         ret 1 + decimal_len(tp.data.array.count::usize) + 1 + type_str_len(sc, tp.data.array.base);
     }
@@ -1134,6 +1227,10 @@ fun write_type_str(sc: *context.SemaContext, buf: str, k: usize, t: type.TypeId)
     if (kind == type.TYPE_POINTER) {
         val w: usize = write_char(buf, k, '*');
         ret write_type_str(sc, buf, w, tp.data.pointer.base);
+    }
+    if (kind == type.TYPE_SECRET) {
+        val w: usize = write_char(buf, k, '^');
+        ret write_type_str(sc, buf, w, tp.data.secret.base);
     }
     if (kind == type.TYPE_ARRAY) {
         var w: usize = write_char(buf, k, '[');
