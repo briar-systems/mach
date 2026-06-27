@@ -78,5 +78,6 @@ val r:  i64   = op(2, 3);
 
 ## See also
 
+- [secrecy.md](secrecy.md) — the `^` secret qualifier over any of these types
 - [operators.md](operators.md) — what operations work on each type
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`, `$align_of`
