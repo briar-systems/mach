@@ -774,7 +774,7 @@ fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool, verbo
         var i: u32 = 0;
         for (i < col.count) {
             if (test_selected(p, ?col.tests[i], filter)) {
-                val rc: i64 = record_test(p, ?col.tests[i], nil, tests_out);
+                val rc: i64 = record_test(p, ?col.tests[i], nil, tests_out, p.s.alloc);
                 if (rc != 0) { testrunner.free(p.s, ?col); ret rc; }
             }
             i = i + 1;
@@ -820,19 +820,62 @@ fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool, verbo
         print.eprint(" executable(s)\n");
     }
 
+    # each test's compile/link allocations (the synthesized entry IR, its codegen
+    # object image, the parsed link inputs, the merged output image, and the
+    # format unwind tables) route through a per-test scratch arena that is reset
+    # after every test, so peak memory stays bounded by a single test link rather
+    # than growing with the suite. a fresh page allocator backs the scratch arena
+    # so its reset actually returns the chunks to the OS; the shared per-module
+    # objects, the collected list, and each recorded artifact stay on the
+    # persistent allocator, which the reset never touches.
+    var scratch_backing: A.Allocator;
+    if (O.is_some[str](page.make(?scratch_backing))) {
+        free_paths(p.s.alloc, shared, shared_len, shared_len);
+        free_sonames(p.s.alloc, sonames, soname_len);
+        testrunner.free(p.s, ?col);
+        print.eprint("error: failed to initialise test allocator\n");
+        ret 2;
+    }
+    var scratch_ar: arena.Arena;
+    if (O.is_some[str](arena.init(?scratch_ar, ?scratch_backing, 0))) {
+        free_paths(p.s.alloc, shared, shared_len, shared_len);
+        free_sonames(p.s.alloc, sonames, soname_len);
+        testrunner.free(p.s, ?col);
+        print.eprint("error: failed to initialise test allocator\n");
+        ret 2;
+    }
+    var scratch_alloc: A.Allocator;
+    if (O.is_some[str](arena.make(?scratch_alloc, ?scratch_ar))) {
+        arena.dnit(?scratch_ar);
+        free_paths(p.s.alloc, shared, shared_len, shared_len);
+        free_sonames(p.s.alloc, sonames, soname_len);
+        testrunner.free(p.s, ?col);
+        print.eprint("error: failed to initialise test allocator\n");
+        ret 2;
+    }
+
+    # the persistent build allocator, swapped back after every per-test build so
+    # the shared inputs, the collected list, and the recorded artifacts outlive
+    # the scratch reset.
+    val persistent: *A.Allocator = p.s.alloc;
+
     var code: i64 = 0;
     var i: u32 = 0;
     for (i < col.count) {
         if (test_selected(p, ?col.tests[i], filter)) {
             # `i` is the stable collection index, so a test's executable name is
             # unchanged whether or not a filter is in effect.
+            p.s.alloc = ?scratch_alloc;
             code = build_one_test(p, level, verify_ir, ?obj_base[0], root, i, ?col.tests[i],
-                                  shared, shared_len, sonames, soname_len, tests_out);
+                                  shared, shared_len, sonames, soname_len, tests_out, persistent);
+            p.s.alloc = persistent;
+            arena.reset(?scratch_ar);
             if (code != 0) { brk; }
         }
         i = i + 1;
     }
 
+    arena.dnit(?scratch_ar);
     free_paths(p.s.alloc, shared, shared_len, shared_len);
     free_sonames(p.s.alloc, sonames, soname_len);
     testrunner.free(p.s, ?col);
@@ -871,8 +914,10 @@ fun test_selected(p: *driver.Project, t: *testrunner.Test, filter: *u8) bool {
 #
 # The entry module is `main(){ret <test>();}`; its object is written to
 # `<obj_base>/__mach_test_entry_<idx>.o` and linked with the shared object set
-# into the resolved `tests` path. All per-test resources are released before
-# returning.
+# into the resolved `tests` path. The transient compile/link allocations come
+# from the session allocator, which the caller points at a per-test scratch arena
+# it resets afterward; the recorded artifact is duplicated into `persistent` so it
+# outlives that reset.
 # ---
 # p:          the project carrying the module graph and session
 # level:      optimization pipeline level
@@ -886,12 +931,14 @@ fun test_selected(p: *driver.Project, t: *testrunner.Test, filter: *u8) bool {
 # sonames:    the shared dynamic-dependency soname list
 # soname_len: number of sonames
 # tests_out:  the list to append the test's artifact to
+# persistent: allocator the recorded artifact is duplicated into, outliving the
+#             per-test scratch reset
 # ret:        0 on success, or a non-zero exit code
 fun build_one_test(p: *driver.Project, level: u8, verify_ir: bool, obj_base: *u8, root: *u8,
                    idx: u32, t: *testrunner.Test,
                    shared: **u8, shared_len: u32,
                    sonames: *intern.StrId, soname_len: u32,
-                   tests_out: *TestList) i64 {
+                   tests_out: *TestList, persistent: *A.Allocator) i64 {
     val res_synth: R.Result[ir.Module, str] = testrunner.synthesize_entry(p.s, t.linkage);
     if (R.is_err[ir.Module, str](res_synth)) {
         print.eprint("error: ");
@@ -950,7 +997,7 @@ fun build_one_test(p: *driver.Project, level: u8, verify_ir: bool, obj_base: *u8
     val lc: i64 = link_one_test(p, shared, shared_len, sonames, soname_len, ?entry_path[0], ?exe_path[0]);
     if (lc != 0) { ret lc; }
 
-    ret record_test(p, t, ?exe_path[0], tests_out);
+    ret record_test(p, t, ?exe_path[0], tests_out, persistent);
 }
 
 # link the shared object set plus one test's entry object into the test
@@ -993,34 +1040,35 @@ fun link_one_test(p: *driver.Project, shared: **u8, shared_len: u32,
 
 # append a test's reporting artifact to `tests_out`
 #
-# Duplicates every string into the build allocator so it outlives the session
-# teardown. `exe` is nil in `--list` mode.
+# Duplicates every string into `a` so it outlives the session teardown and the
+# per-test scratch reset. `exe` is nil in `--list` mode.
 # ---
 # p:         the project (for its interner and source map)
 # t:         the test to record
 # exe:       the executable path, or nil in `--list` mode
 # tests_out: the list to append the artifact to
+# a:         allocator backing the duplicated strings and the list
 # ret:       0 on success, or a non-zero exit code
-fun record_test(p: *driver.Project, t: *testrunner.Test, exe: *u8, tests_out: *TestList) i64 {
+fun record_test(p: *driver.Project, t: *testrunner.Test, exe: *u8, tests_out: *TestList, a: *A.Allocator) i64 {
     var artifact: TestArtifact;
     artifact.line = t.line;
 
     val opt_label: O.Option[str] = intern.lookup(?p.s.interner, t.label);
     var label_src: *u8 = "<test>";
     if (O.is_some[str](opt_label)) { label_src = O.unwrap[str](opt_label)::*u8; }
-    artifact.label = dup_cstr(p.s.alloc, label_src);
+    artifact.label = dup_cstr(a, label_src);
     if (artifact.label == nil) { print.eprint("error: out of memory\n"); ret 2; }
 
-    artifact.file = dup_cstr(p.s.alloc, test_source_path(p, t.mod_idx));
+    artifact.file = dup_cstr(a, test_source_path(p, t.mod_idx));
     if (artifact.file == nil) { print.eprint("error: out of memory\n"); ret 2; }
 
     artifact.exe = nil;
     if (exe != nil) {
-        artifact.exe = dup_cstr(p.s.alloc, exe);
+        artifact.exe = dup_cstr(a, exe);
         if (artifact.exe == nil) { print.eprint("error: out of memory\n"); ret 2; }
     }
 
-    if (!test_list_push(p.s.alloc, tests_out, artifact)) { print.eprint("error: out of memory\n"); ret 2; }
+    if (!test_list_push(a, tests_out, artifact)) { print.eprint("error: out of memory\n"); ret 2; }
     ret 0;
 }
 
