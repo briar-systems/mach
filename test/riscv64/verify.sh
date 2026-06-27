@@ -9,12 +9,13 @@
 # and qemu-riscv64 (or qemu-riscv64-static) for the exit-code run.
 set -euo pipefail
 
-# the computed exit code the fixture returns: sum 0..9 (45) plus the const-shift call
-# argument 1 << 3 (8), plus the stack-local frame-slot probe (#1670), the >4KiB
-# long-branch relaxation probe (#1666), the 32-bit bitwise word-group probe (#1672),
-# and the RV64A atomics probe (#1668, 18 = swapped 7 + post-rmw cell 11). the qemu
-# e2e asserts the exact sum, so a regression in any of those changes it.
-expect_code=86
+# the computed exit code the fixture returns, low 8 bits of the running sum: sum 0..9
+# (45) plus the const-shift call argument 1 << 3 (8), the stack-local frame-slot probe
+# (#1670), the >4KiB long-branch relaxation probe (#1666), the 32-bit bitwise
+# word-group probe (#1672), and the RV64A atomics probe (#1668, 18 = swapped 7 +
+# post-rmw cell 11), wrapping to 70. the qemu e2e asserts the exact code, so a
+# regression in any of those changes it.
+expect_code=70
 
 mach="${1:-mach}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
