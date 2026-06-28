@@ -41,6 +41,8 @@ use std.types.string.str;
 use std.types.string.str_contains;
 use std.types.string.str_len;
 
+use std.crypto.hash.sha256;
+
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
@@ -83,6 +85,8 @@ val LC_LOAD_DYLINKER: u32 = 0xE;
 # the LC_REQ_DYLD bit is set on LC_DYLD_INFO_ONLY so a loader that cannot read
 # the compressed dyld-info stream refuses the image rather than mis-loading it.
 val LC_DYLD_INFO_ONLY: u32 = 0x80000022;
+# points at the embedded code signature in __LINKEDIT.
+val LC_CODE_SIGNATURE: u32 = 0x1D;
 
 # VM protection bits used for segment maxprot/initprot.
 val VM_PROT_READ:    u32 = 1;
@@ -177,6 +181,30 @@ val ARM_PC_STATE_OFFSET:  usize = 256;
 # default page size for the static executable layout; segment file offsets are
 # page-aligned to keep each segment's `fileoff` congruent with its `vmaddr`.
 val EXEC_PAGE_SIZE: u64 = 4096;
+
+# embedded code-signing magics and the single code-directory sub-blob slot. all
+# code-signing structures are big-endian, unlike the little-endian Mach-O around
+# them.
+val CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xFADE0CC0;
+val CSMAGIC_CODEDIRECTORY:      u32 = 0xFADE0C02;
+val CSSLOT_CODEDIRECTORY:       u32 = 0;
+
+# CodeDirectory version 0x20400 carries the executable-segment fields the Apple
+# Silicon kernel reads to authorize a main binary; the adhoc flag marks a
+# signature with no CMS (certificate) blob, which is what makes it ad-hoc.
+val CS_CODEDIRECTORY_VERSION: u32 = 0x00020400;
+val CS_ADHOC_FLAG:            u32 = 0x0002;
+val CS_HASHTYPE_SHA256:       u8  = 2;
+val CS_HASH_SIZE_SHA256:      u8  = 32;
+val CS_PAGE_SHIFT:            u8  = 12;    # log2(4096)
+val CS_EXECSEG_MAIN_BINARY:   u64 = 0x1;
+
+# on-disk sizes of the code-signing structures and the LC_CODE_SIGNATURE command.
+val LINKEDIT_DATA_CMD_SIZE: usize = 16;   # cmd, cmdsize, dataoff, datasize
+val SUPERBLOB_HEADER_SIZE:  usize = 20;   # magic, length, count, one blob index
+val CODEDIR_HEADER_SIZE:    usize = 88;   # the fixed version-0x20400 header
+val CODE_SIG_PAGE_SIZE:     usize = 4096; # the 4 KiB hashing page (pageSize 12)
+val CODE_SIG_ALIGN:         usize = 16;   # the signature blob is 16-byte aligned
 
 # the machine relocation a Mach-O writer emits for one abstract kind.
 # ---
@@ -1041,6 +1069,139 @@ fun exec_segname(flags: u32) str {
     ret "__DATA_CONST";
 }
 
+# the offset of the output basename within a null-terminated path: the first byte
+# after the last '/', or 0 when the path has no separator.
+# ---
+# path: the null-terminated output path
+# ret:  the byte offset of the basename within `path`
+fun codesign_ident_start(path: *u8) usize {
+    var len:   usize = 0;
+    for (path[len] != 0) { len = len + 1; }
+    var start: usize = 0;
+    var i:     usize = 0;
+    for (i < len) {
+        if (path[i] == 47) { start = i + 1; }   # '/'
+        i = i + 1;
+    }
+    ret start;
+}
+
+# the basename length of a null-terminated path, used as the CodeDirectory
+# identifier length (excludes the terminator).
+# ---
+# path: the null-terminated output path
+# ret:  the basename byte length
+fun codesign_ident_len(path: *u8) usize {
+    var len: usize = 0;
+    for (path[len] != 0) { len = len + 1; }
+    ret len - codesign_ident_start(path);
+}
+
+# the number of 4 KiB code slots covering the file bytes [0, code_limit), rounded
+# up so the final (possibly short) page gets its own slot.
+# ---
+# code_limit: the file offset where the signature begins
+# ret:        the code-slot count
+fun codesign_code_slots(code_limit: usize) usize {
+    ret (code_limit + CODE_SIG_PAGE_SIZE - 1) / CODE_SIG_PAGE_SIZE;
+}
+
+# the byte length of the CodeDirectory blob: the fixed header, the nul-terminated
+# identifier, then one SHA-256 hash per code slot.
+# ---
+# ident_len:  the identifier byte length (excludes the terminator)
+# code_limit: the file offset where the signature begins
+# ret:        the CodeDirectory blob byte length
+fun codedir_blob_size(ident_len: usize, code_limit: usize) usize {
+    ret CODEDIR_HEADER_SIZE + ident_len + 1 + codesign_code_slots(code_limit) * CS_HASH_SIZE_SHA256::usize;
+}
+
+# the byte length of the embedded-signature SuperBlob wrapping one CodeDirectory.
+# ---
+# ident_len:  the identifier byte length (excludes the terminator)
+# code_limit: the file offset where the signature begins
+# ret:        the total signature byte length
+fun code_signature_size(ident_len: usize, code_limit: usize) usize {
+    ret SUPERBLOB_HEADER_SIZE + codedir_blob_size(ident_len, code_limit);
+}
+
+# write an ad-hoc embedded code signature into `buf` at `sig_off`
+#
+# Lays out a CSMAGIC_EMBEDDED_SIGNATURE SuperBlob wrapping a single
+# CSMAGIC_CODEDIRECTORY (version 0x20400, adhoc flag, SHA-256). The CodeDirectory
+# hashes the file bytes [0, code_limit) in 4 KiB pages - so every byte before the
+# signature is covered - and records the executable segment so the Apple Silicon
+# kernel authorizes the main binary. All code-signing fields are big-endian. The
+# result is deterministic: a pure function of the input bytes, the identifier, and
+# the layout, with no timestamp or nonce, so identical input yields identical bytes.
+# ---
+# buf:        the output buffer (the file bytes [0, code_limit) already written)
+# sig_off:    file offset the signature is written at (equal to code_limit)
+# path:       null-terminated output path; its basename is the identifier
+# code_limit: file offset where the signature begins (hashes cover [0, code_limit))
+# exec_base:  file offset of the executable (__TEXT) segment
+# exec_limit: file byte size of the executable (__TEXT) segment
+fun write_code_signature(buf: *u8, sig_off: usize, path: *u8, code_limit: usize,
+                         exec_base: u64, exec_limit: u64) {
+    val ident_start: usize = codesign_ident_start(path);
+    val ident_len:   usize = codesign_ident_len(path);
+    val n_slots:     usize = codesign_code_slots(code_limit);
+    val cd_size:     usize = codedir_blob_size(ident_len, code_limit);
+    val sig_size:    usize = SUPERBLOB_HEADER_SIZE + cd_size;
+
+    # SuperBlob header, then one blob index pointing at the CodeDirectory.
+    bin.write_u32_be(buf, sig_off,      CSMAGIC_EMBEDDED_SIGNATURE);
+    bin.write_u32_be(buf, sig_off + 4,  sig_size::u32);
+    bin.write_u32_be(buf, sig_off + 8,  1);
+    bin.write_u32_be(buf, sig_off + 12, CSSLOT_CODEDIRECTORY);
+    bin.write_u32_be(buf, sig_off + 16, SUPERBLOB_HEADER_SIZE::u32);
+
+    # CodeDirectory: the identifier follows the fixed header, then the code hashes.
+    val cd:        usize = sig_off + SUPERBLOB_HEADER_SIZE;
+    val ident_off: usize = CODEDIR_HEADER_SIZE;
+    val hash_off:  usize = CODEDIR_HEADER_SIZE + ident_len + 1;
+
+    bin.write_u32_be(buf, cd,      CSMAGIC_CODEDIRECTORY);
+    bin.write_u32_be(buf, cd + 4,  cd_size::u32);
+    bin.write_u32_be(buf, cd + 8,  CS_CODEDIRECTORY_VERSION);
+    bin.write_u32_be(buf, cd + 12, CS_ADHOC_FLAG);
+    bin.write_u32_be(buf, cd + 16, hash_off::u32);            # hashOffset (slot 0)
+    bin.write_u32_be(buf, cd + 20, ident_off::u32);           # identOffset
+    bin.write_u32_be(buf, cd + 24, 0);                        # nSpecialSlots
+    bin.write_u32_be(buf, cd + 28, n_slots::u32);             # nCodeSlots
+    bin.write_u32_be(buf, cd + 32, code_limit::u32);          # codeLimit
+    buf[cd + 36] = CS_HASH_SIZE_SHA256;                       # hashSize
+    buf[cd + 37] = CS_HASHTYPE_SHA256;                        # hashType
+    buf[cd + 38] = 0;                                         # platform
+    buf[cd + 39] = CS_PAGE_SHIFT;                             # pageSize (log2)
+    bin.write_u32_be(buf, cd + 40, 0);                        # spare2
+    bin.write_u32_be(buf, cd + 44, 0);                        # scatterOffset
+    bin.write_u32_be(buf, cd + 48, 0);                        # teamOffset
+    bin.write_u32_be(buf, cd + 52, 0);                        # spare3
+    bin.write_u64_be(buf, cd + 56, 0);                        # codeLimit64 (unused)
+    bin.write_u64_be(buf, cd + 64, exec_base);                # execSegBase
+    bin.write_u64_be(buf, cd + 72, exec_limit);               # execSegLimit
+    bin.write_u64_be(buf, cd + 80, CS_EXECSEG_MAIN_BINARY);   # execSegFlags
+
+    # the identifier C-string (the basename of the output path).
+    var k: usize = 0;
+    for (k < ident_len) {
+        buf[cd + ident_off + k] = path[ident_start + k];
+        k = k + 1;
+    }
+    buf[cd + ident_off + ident_len] = 0;
+
+    # one SHA-256 per 4 KiB page of [0, code_limit); the final page may be short.
+    var slot: usize = 0;
+    for (slot < n_slots) {
+        val page_off: usize = slot * CODE_SIG_PAGE_SIZE;
+        var page_len: usize = CODE_SIG_PAGE_SIZE;
+        if (page_off + page_len > code_limit) { page_len = code_limit - page_off; }
+        sha256.hash(?buf[page_off], page_len, ?buf[cd + hash_off + slot * CS_HASH_SIZE_SHA256::usize]);
+        slot = slot + 1;
+    }
+}
+
 # write a static MH_EXECUTE Mach-O, installed as the of.ExecFn
 #
 # Frames the linker's laid-out load segments with a leading __PAGEZERO (the
@@ -1048,9 +1209,9 @@ fun exec_segname(flags: u32) str {
 # LC_UNIXTHREAD whose thread state carries the entry point - the static thread
 # entry, with no dyld dependency. The mach header and load commands occupy the
 # file head; each segment's file bytes follow at a page-aligned offset congruent
-# with its virtual address. A runnable Darwin image (header inside __TEXT, dyld /
-# LC_MAIN, code signature) is the Darwin-runtime follow-up (#1178); this writer
-# emits the structurally complete static skeleton the byte-verify lane checks.
+# with its virtual address. A trailing __LINKEDIT segment carries an ad-hoc
+# LC_CODE_SIGNATURE so the Apple Silicon kernel admits the image (it SIGKILLs an
+# unsigned arm64 executable).
 #
 # `funcs`/`func_count` are accepted for of.ExecFn conformance; no unwind table is
 # emitted.
@@ -1078,14 +1239,17 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
     # (freestanding) there is none.
     var pagezero_size: u64 = 0;
     if (seg_count > 0) { pagezero_size = segs[0].vaddr & ~(EXEC_PAGE_SIZE - 1); }
-    var ncmds: u32 = seg_count + 1;                 # one LC_UNIXTHREAD
-    if (pagezero_size > 0) { ncmds = ncmds + 1; }   # plus __PAGEZERO
+    # the linker segments, a trailing __LINKEDIT (carrying the code signature),
+    # LC_UNIXTHREAD, LC_CODE_SIGNATURE, and __PAGEZERO when the base is non-zero.
+    var ncmds: u32 = seg_count + 3;
+    if (pagezero_size > 0) { ncmds = ncmds + 1; }
 
     var thread_state: usize = X86_THREAD_STATE64_COUNT::usize * 4;
     if (arch_is_arm64(arch_id)) { thread_state = ARM_THREAD_STATE64_COUNT::usize * 4; }
     val thread_cmd_size: usize = 16 + thread_state;
 
-    var sizeofcmds: usize = seg_count::usize * SEGMENT_CMD_64_SIZE + thread_cmd_size;
+    var sizeofcmds: usize = seg_count::usize * SEGMENT_CMD_64_SIZE + thread_cmd_size
+                          + SEGMENT_CMD_64_SIZE + LINKEDIT_DATA_CMD_SIZE;   # __LINKEDIT + LC_CODE_SIGNATURE
     if (pagezero_size > 0) { sizeofcmds = sizeofcmds + SEGMENT_CMD_64_SIZE; }
     val header_end: usize = MACH_HEADER_64_SIZE + sizeofcmds;
 
@@ -1104,6 +1268,35 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
         total_size = total_size + segs[li].filesz;
         li = li + 1;
     }
+
+    # the highest mapped virtual address and the executable segment, for the trailing
+    # __LINKEDIT placement and the code signature's executable-segment fields.
+    var hi_va:      u64 = 0;
+    var exec_base:  u64 = 0;
+    var exec_limit: u64 = 0;
+    var found_exec: bool = false;
+    li = 0;
+    for (li < seg_count) {
+        val end: u64 = segs[li].vaddr + bin.align_up_u64(segs[li].memsz::u64, EXEC_PAGE_SIZE);
+        if (end > hi_va) { hi_va = end; }
+        if (!found_exec && (segs[li].flags & of.SEG_FLAG_EXECUTE) != 0) {
+            exec_base  = seg_offsets[li]::u64;
+            exec_limit = segs[li].filesz::u64;
+            found_exec = true;
+        }
+        li = li + 1;
+    }
+
+    # the ad-hoc code signature lives in a trailing __LINKEDIT segment and covers
+    # every byte before it, so it is laid out last and page-aligned. codeLimit is the
+    # signature's file offset; the bytes between the last segment and it hash as zero.
+    val ident_len:     usize = codesign_ident_len(path);
+    val linkedit_off:  usize = bin.align_up(total_size, EXEC_PAGE_SIZE::usize);
+    val code_limit:    usize = linkedit_off;
+    val sig_size:      usize = code_signature_size(ident_len, code_limit);
+    val linkedit_size: usize = sig_size;
+    val linkedit_va:   u64 = bin.align_up_u64(hi_va, EXEC_PAGE_SIZE);
+    total_size = linkedit_off + sig_size;
 
     val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_size);
     if (R.is_err[*u8, str](res_buf)) {
@@ -1159,6 +1352,12 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
         li = li + 1;
     }
 
+    # __LINKEDIT carries only the ad-hoc code signature.
+    lc = write_segment_cmd(buf, lc, "__LINKEDIT", linkedit_va,
+                           bin.align_up_u64(linkedit_size::u64, EXEC_PAGE_SIZE),
+                           linkedit_off::u64, linkedit_size::u64,
+                           VM_PROT_READ, VM_PROT_READ, 0);
+
     # LC_UNIXTHREAD: the static entry, with the program counter in the thread
     # state. the surrounding state is zero (the buffer is zero-initialized).
     bin.write_u32_le(buf, lc, LC_UNIXTHREAD);
@@ -1172,6 +1371,16 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
         bin.write_u32_le(buf, lc + 12, X86_THREAD_STATE64_COUNT);
         bin.write_u64_le(buf, lc + 16 + X86_RIP_STATE_OFFSET, entry);
     }
+    lc = lc + thread_cmd_size;
+
+    # LC_CODE_SIGNATURE points at the ad-hoc signature in __LINKEDIT.
+    bin.write_u32_le(buf, lc, LC_CODE_SIGNATURE);
+    bin.write_u32_le(buf, lc + 4, LINKEDIT_DATA_CMD_SIZE::u32);
+    bin.write_u32_le(buf, lc + 8, code_limit::u32);
+    bin.write_u32_le(buf, lc + 12, sig_size::u32);
+
+    # all file bytes [0, code_limit) are now in place; hash them into the signature.
+    write_code_signature(buf, code_limit, path, code_limit, exec_base, exec_limit);
 
     if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
 
