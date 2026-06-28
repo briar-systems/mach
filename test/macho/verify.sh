@@ -182,10 +182,32 @@ verify_dynamic() {
     verify_codesig "$target" "$exe"
 }
 
+# verify_filename_independent <dir> <target>
+#
+# builds the fixture in <dir> twice under two different `-o` output names and
+# asserts the two signed images are byte-identical. the code-signing identifier is
+# the artifact's product name, not the `-o` basename, so the output filename must
+# not perturb a single byte - this is exactly what the darwin self-host fixpoint
+# (a -> b -> c, b == c) depends on, and it is the only filename-sensitive part of
+# the writer, so it is the part worth locking down.
+verify_filename_independent() {
+    local dir="$1" target="$2"
+    echo "checking $target signed-image filename-independence in $dir"
+    mkdir -p "$PWD/$dir/out"
+    local a="$PWD/$dir/out/fnind_a" b="$PWD/$dir/out/fnind_b"
+    "$mach" build "$dir" --target "$target" --profile debug -o "$a"
+    "$mach" build "$dir" --target "$target" --profile debug -o "$b"
+    cmp -s "$a" "$b" \
+        || fail "$target: signed image differs under a different -o name (identifier leaks the filename)"
+    echo "verified $target signed image is identical regardless of the -o name"
+}
+
 rm -rf out dynamic/out
 verify_static  darwin-x86_64  x86_64 x86_THREAD_STATE64 SIGNED
 verify_static  darwin-aarch64 arm64  ARM_THREAD_STATE64 PAGE21 PAGOF12 BR26
 verify_dynamic darwin-x86_64  x86_64
 verify_dynamic darwin-aarch64 arm64
+verify_filename_independent .       darwin-aarch64
+verify_filename_independent dynamic darwin-aarch64
 
 echo "OK: Mach-O emits correct objects and ad-hoc-signed static + dynamic executables for both Darwin triples"
