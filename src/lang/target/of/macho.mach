@@ -616,9 +616,10 @@ fun is_extdef_sym(sym: *of.Symbol) bool {
 # str_pos:  in/out string-table cursor, advanced past the written name
 # img:      the object image the symbol is drawn from
 # idx:      index of the symbol within the image symbol table
-# sec_addr: per-section in-segment base addresses
+# sec_addr: per-input-section in-segment base addresses
+# kind_out: per-kind coalesced output-section index (recovers the 1-based n_sect)
 fun write_nlist(buf: *u8, sym_off: usize, str_base: usize, str_pos: *usize,
-                img: *of.ObjectImage, idx: u32, sec_addr: *u64) {
+                img: *of.ObjectImage, idx: u32, sec_addr: *u64, kind_out: *u32) {
     val sym: *of.Symbol = ?img.symbols[idx];
     val name: str = resolve(img.interner, sym.name);
     var n_strx: u32 = 0;
@@ -639,7 +640,10 @@ fun write_nlist(buf: *u8, sym_off: usize, str_base: usize, str_pos: *usize,
     var n_value: u64 = 0;
     if (sym.section != of.SECTION_EXTERNAL && sym.section < img.section_count) {
         n_type = N_SECT;
-        n_sect = (sym.section + 1)::u8;
+        # the symbol's defining input section was coalesced by kind into one
+        # output section; n_sect is that 1-based coalesced index (within the
+        # 255-section byte), and n_value its absolute in-segment address.
+        n_sect = (kind_out[img.sections[sym.section].kind::u32] + 1)::u8;
         n_value = sec_addr[sym.section] + sym.offset::u64;
         if ((sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0) { n_desc = N_WEAK_DEF; }
     }
@@ -724,14 +728,53 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     val num_secs: u32 = img.section_count;
     val num_syms: u32 = img.symbol_count;
 
-    # load commands: one segment (with every section), symtab, dysymtab.
-    val seg_cmd_size: usize = SEGMENT_CMD_64_SIZE + num_secs::usize * SECTION_64_SIZE;
+    # Mach-O's nlist `n_sect` is a single byte, so an object cannot address more
+    # than 255 sections. the back end emits one input section per data global,
+    # which for a non-trivial module reaches the hundreds, overflowing that byte
+    # and corrupting (or dropping, when the index lands on a multiple of 256) every
+    # local constant-pool symbol past the limit. a real Mach-O object groups its
+    # content by kind into a handful of sections, so coalesce the input sections
+    # into one output section per kind, laying each kind's members contiguously and
+    # remapping every symbol and relocation onto the coalesced section. the
+    # canonical order keeps the zero-fill __bss section last, where the segment's
+    # file image ends.
+    var korder: [5]of.SectionKind;
+    korder[0] = of.SK_TEXT;
+    korder[1] = of.SK_RODATA;
+    korder[2] = of.SK_DATA;
+    korder[3] = of.SK_DEBUG;
+    korder[4] = of.SK_BSS;
+
+    # kind -> coalesced output-section index (0xFFFFFFFF when the kind is absent),
+    # and the kind of each coalesced section in emission order.
+    var kind_to_out: [5]u32;
+    var ki: u32 = 0;
+    for (ki < 5) { kind_to_out[ki] = 0xFFFFFFFF; ki = ki + 1; }
+    var out_kind: [5]of.SectionKind;
+    var num_out:  u32 = 0;
+    var ko: u32 = 0;
+    for (ko < 5) {
+        var present: bool = false;
+        var sp: u32 = 0;
+        for (sp < num_secs) {
+            if (img.sections[sp].kind == korder[ko]) { present = true; brk; }
+            sp = sp + 1;
+        }
+        if (present) {
+            kind_to_out[korder[ko]::u32] = num_out;
+            out_kind[num_out] = korder[ko];
+            num_out = num_out + 1;
+        }
+        ko = ko + 1;
+    }
+
+    # load commands: one segment (with the coalesced sections), symtab, dysymtab.
+    val seg_cmd_size: usize = SEGMENT_CMD_64_SIZE + num_out::usize * SECTION_64_SIZE;
     val sizeofcmds:   usize = seg_cmd_size + SYMTAB_CMD_SIZE + DYSYMTAB_CMD_SIZE;
     val header_end:   usize = MACH_HEADER_64_SIZE + sizeofcmds;
 
-    # per-section in-segment addresses (vm) and file offsets. addresses advance
-    # for every section so vmsize covers the zero-fill tail; file offsets advance
-    # only for sections that carry bytes.
+    # per-input-section absolute vm address and file offset within the single
+    # segment; both advance through the coalesced section the input section joins.
     val res_addr: R.Result[*u64, str] = A.zallocate[u64](alloc, (num_secs + 1)::usize);
     if (R.is_err[*u64, str](res_addr)) { ret R.err[bool, str]("macho: section address table alloc failed"); }
     var sec_addr: *u64 = R.unwrap_ok[*u64, str](res_addr);
@@ -743,55 +786,91 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     }
     var data_off: *usize = R.unwrap_ok[*usize, str](res_doff);
 
+    # per-coalesced-section vm address, vm size, file offset, alignment, relocation
+    # array offset, and relocation_info entry count.
+    var out_addr:   [5]u64;
+    var out_size:   [5]u64;
+    var out_fileo:  [5]usize;
+    var out_align:  [5]u32;
+    var out_reloff: [5]usize;
+    var out_nrel:   [5]u32;
+
+    # vm layout: lay every coalesced section in canonical order, its members (the
+    # input sections of that kind) contiguous and each individually aligned. the
+    # section's alignment is the strictest of its members'.
     var vm: u64 = 0;
-    var s: u32 = 0;
-    for (s < num_secs) {
-        var a: u32 = img.sections[s].align;
-        if (a < 1) { a = 1; }
-        vm = bin.align_up_u64(vm, a::u64);
-        sec_addr[s] = vm;
-        vm = vm + img.sections[s].len::u64;
-        s = s + 1;
+    var s:  u32 = 0;
+    ko = 0;
+    for (ko < num_out) {
+        var a_sec: u32 = 1;
+        var sp: u32 = 0;
+        for (sp < num_secs) {
+            if (img.sections[sp].kind == out_kind[ko] && img.sections[sp].align > a_sec) { a_sec = img.sections[sp].align; }
+            sp = sp + 1;
+        }
+        out_align[ko] = a_sec;
+        vm = bin.align_up_u64(vm, a_sec::u64);
+        out_addr[ko] = vm;
+        sp = 0;
+        for (sp < num_secs) {
+            if (img.sections[sp].kind != out_kind[ko]) { sp = sp + 1; cnt; }
+            var a: u32 = img.sections[sp].align;
+            if (a < 1) { a = 1; }
+            vm = bin.align_up_u64(vm, a::u64);
+            sec_addr[sp] = vm;
+            vm = vm + img.sections[sp].len::u64;
+            sp = sp + 1;
+        }
+        out_size[ko] = vm - out_addr[ko];
+        ko = ko + 1;
     }
     val seg_vmsize: u64 = vm;
 
+    # file layout: the non-zero-fill coalesced sections carry bytes after the
+    # header; __bss occupies vm only, so its members keep a zero file offset. each
+    # member's file offset mirrors its in-section vm offset, so the in-place addend
+    # fields and the parsed-back relocation sites stay aligned.
     val seg_fileoff: usize = bin.align_up(header_end, 8);
     var file: usize = seg_fileoff;
-    s = 0;
-    for (s < num_secs) {
-        if (img.sections[s].kind != of.SK_BSS) {
-            var a: u32 = img.sections[s].align;
-            if (a < 1) { a = 1; }
-            file = bin.align_up(file, a::usize);
-            data_off[s] = file;
-            file = file + img.sections[s].len::usize;
-        } or {
-            data_off[s] = 0;
+    ko = 0;
+    for (ko < num_out) {
+        var sp: u32 = 0;
+        if (out_kind[ko] == of.SK_BSS) {
+            out_fileo[ko] = 0;
+            for (sp < num_secs) {
+                if (img.sections[sp].kind == of.SK_BSS) { data_off[sp] = 0; }
+                sp = sp + 1;
+            }
+            ko = ko + 1;
+            cnt;
         }
-        s = s + 1;
+        file = bin.align_up(file, out_align[ko]::usize);
+        out_fileo[ko] = file;
+        for (sp < num_secs) {
+            if (img.sections[sp].kind != out_kind[ko]) { sp = sp + 1; cnt; }
+            data_off[sp] = out_fileo[ko] + (sec_addr[sp] - out_addr[ko])::usize;
+            sp = sp + 1;
+        }
+        file = out_fileo[ko] + out_size[ko]::usize;
+        ko = ko + 1;
     }
     val seg_filesize: usize = file - seg_fileoff;
 
-    # relocation arrays follow the section data, 4-byte aligned.
-    val res_roff: R.Result[*usize, str] = A.zallocate[usize](alloc, (num_secs + 1)::usize);
-    if (R.is_err[*usize, str](res_roff)) {
-        A.deallocate[u64](alloc, sec_addr, (num_secs + 1)::usize);
-        A.deallocate[usize](alloc, data_off, (num_secs + 1)::usize);
-        ret R.err[bool, str]("macho: reloc offset table alloc failed");
-    }
-    var reloc_off: *usize = R.unwrap_ok[*usize, str](res_roff);
-
+    # relocation arrays follow the section data, 4-byte aligned, one per coalesced
+    # section (covering every member's relocations).
     var roff: usize = bin.align_up(file, 4);
-    s = 0;
-    for (s < num_secs) {
-        val n: u32 = reloc_entries_for_section(img, s, arch_id);
-        if (n > 0) {
-            reloc_off[s] = roff;
-            roff = roff + n::usize * RELOC_INFO_SIZE;
-        } or {
-            reloc_off[s] = 0;
+    ko = 0;
+    for (ko < num_out) {
+        var n: u32 = 0;
+        var sp: u32 = 0;
+        for (sp < num_secs) {
+            if (img.sections[sp].kind == out_kind[ko]) { n = n + reloc_entries_for_section(img, sp, arch_id); }
+            sp = sp + 1;
         }
-        s = s + 1;
+        out_nrel[ko] = n;
+        if (n > 0) { out_reloff[ko] = roff; roff = roff + n::usize * RELOC_INFO_SIZE; }
+        or         { out_reloff[ko] = 0; }
+        ko = ko + 1;
     }
 
     val symtab_off: usize = bin.align_up(roff, 8);
@@ -804,7 +883,6 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     if (R.is_err[*u8, str](res_buf)) {
         A.deallocate[u64](alloc, sec_addr, (num_secs + 1)::usize);
         A.deallocate[usize](alloc, data_off, (num_secs + 1)::usize);
-        A.deallocate[usize](alloc, reloc_off, (num_secs + 1)::usize);
         ret R.err[bool, str]("macho: output buffer alloc failed");
     }
     var buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
@@ -830,28 +908,30 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     bin.write_u64_le(buf, lc + 48, seg_filesize::u64);
     bin.write_u32_le(buf, lc + 56, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
     bin.write_u32_le(buf, lc + 60, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-    bin.write_u32_le(buf, lc + 64, num_secs);
+    bin.write_u32_le(buf, lc + 64, num_out);
     bin.write_u32_le(buf, lc + 68, 0);
 
-    # section_64 entries.
+    # section_64 entries, one per coalesced section. a zero-fill (__bss) section
+    # keeps a zero file offset; the rest point at their coalesced byte run.
     var sh: usize = lc + SEGMENT_CMD_64_SIZE;
-    s = 0;
-    for (s < num_secs) {
-        write_fixed16(buf, sh, macho_sectname(img.sections[s].kind));
-        write_fixed16(buf, sh + 16, macho_segname(img.sections[s].kind));
-        bin.write_u64_le(buf, sh + 32, sec_addr[s]);
-        bin.write_u64_le(buf, sh + 40, img.sections[s].len::u64);
-        bin.write_u32_le(buf, sh + 48, data_off[s]::u32);
-        bin.write_u32_le(buf, sh + 52, align_log2(img.sections[s].align));
-        val nrel: u32 = reloc_entries_for_section(img, s, arch_id);
-        bin.write_u32_le(buf, sh + 56, reloc_off[s]::u32);
-        bin.write_u32_le(buf, sh + 60, nrel);
-        bin.write_u32_le(buf, sh + 64, macho_section_flags(img.sections[s].kind));
+    ko = 0;
+    for (ko < num_out) {
+        write_fixed16(buf, sh, macho_sectname(out_kind[ko]));
+        write_fixed16(buf, sh + 16, macho_segname(out_kind[ko]));
+        bin.write_u64_le(buf, sh + 32, out_addr[ko]);
+        bin.write_u64_le(buf, sh + 40, out_size[ko]);
+        var foff: u32 = 0;
+        if (out_kind[ko] != of.SK_BSS) { foff = out_fileo[ko]::u32; }
+        bin.write_u32_le(buf, sh + 48, foff);
+        bin.write_u32_le(buf, sh + 52, align_log2(out_align[ko]));
+        bin.write_u32_le(buf, sh + 56, out_reloff[ko]::u32);
+        bin.write_u32_le(buf, sh + 60, out_nrel[ko]);
+        bin.write_u32_le(buf, sh + 64, macho_section_flags(out_kind[ko]));
         bin.write_u32_le(buf, sh + 68, 0);
         bin.write_u32_le(buf, sh + 72, 0);
         bin.write_u32_le(buf, sh + 76, 0);
         sh = sh + SECTION_64_SIZE;
-        s = s + 1;
+        ko = ko + 1;
     }
 
     # symbol partition counts for LC_DYSYMTAB and the nlist ordering.
@@ -915,7 +995,6 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
         if (R.is_err[*u32, str](res_remap)) {
             A.deallocate[u64](alloc, sec_addr, (num_secs + 1)::usize);
             A.deallocate[usize](alloc, data_off, (num_secs + 1)::usize);
-            A.deallocate[usize](alloc, reloc_off, (num_secs + 1)::usize);
             A.deallocate[u8](alloc, buf, total_size);
             ret R.err[bool, str]("macho: symbol remap alloc failed");
         }
@@ -931,7 +1010,7 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     for (symi < num_syms) {
         if (!is_local_sym(?img.symbols[symi])) { symi = symi + 1; cnt; }
         if (remap != nil) { remap[symi] = nlist_idx; }
-        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr);
+        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr, ?kind_to_out[0]);
         sym_off = sym_off + NLIST_64_SIZE;
         nlist_idx = nlist_idx + 1;
         symi = symi + 1;
@@ -941,7 +1020,7 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     for (symi < num_syms) {
         if (!is_extdef_sym(?img.symbols[symi])) { symi = symi + 1; cnt; }
         if (remap != nil) { remap[symi] = nlist_idx; }
-        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr);
+        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr, ?kind_to_out[0]);
         sym_off = sym_off + NLIST_64_SIZE;
         nlist_idx = nlist_idx + 1;
         symi = symi + 1;
@@ -951,42 +1030,49 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     for (symi < num_syms) {
         if (img.symbols[symi].section != of.SECTION_EXTERNAL) { symi = symi + 1; cnt; }
         if (remap != nil) { remap[symi] = nlist_idx; }
-        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr);
+        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr, ?kind_to_out[0]);
         sym_off = sym_off + NLIST_64_SIZE;
         nlist_idx = nlist_idx + 1;
         symi = symi + 1;
     }
 
-    # per-section relocation_info arrays, in image order, each preceded by an
-    # ARM64_RELOC_ADDEND entry when the abstract addend cannot live in-place.
-    s = 0;
-    for (s < num_secs) {
-        if (reloc_off[s] != 0) {
-            var ro: usize = reloc_off[s];
+    # relocation_info arrays, one per coalesced section: each member's relocations
+    # rebased onto the coalesced section (r_address offset by the member's position
+    # within it), with an ARM64_RELOC_ADDEND entry ahead of a relocation whose
+    # addend cannot live in-place.
+    ko = 0;
+    for (ko < num_out) {
+        if (out_reloff[ko] == 0) { ko = ko + 1; cnt; }
+        var ro: usize = out_reloff[ko];
+        var sp: u32 = 0;
+        for (sp < num_secs) {
+            if (img.sections[sp].kind != out_kind[ko]) { sp = sp + 1; cnt; }
+            val base: u32 = (sec_addr[sp] - out_addr[ko])::u32;
             var ri: u32 = 0;
             for (ri < img.reloc_count) {
-                if (img.relocations[ri].section == s) {
+                if (img.relocations[ri].section == sp) {
+                    val radr: u32 = base + img.relocations[ri].offset;
                     val rsi: u32 = R.unwrap_ok[u32, str](reloc_sym_index(img, img.relocations[ri].symbol));
                     val symnum: u32 = remap[rsi];
                     val mr: MachoReloc = R.unwrap_ok[MachoReloc, str](macho_reloc_for(img.interner, alloc, arch_id, img.relocations[ri].kind));
                     if (needs_addend_entry(arch_id, img.relocations[ri].kind, img.relocations[ri].addend)) {
-                        write_reloc_info(buf, ro, img.relocations[ri].offset, (img.relocations[ri].addend::u64)::u32 & 0xFFFFFF,
+                        write_reloc_info(buf, ro, radr, (img.relocations[ri].addend::u64)::u32 & 0xFFFFFF,
                                          0, 2, 0, ARM64_RELOC_ADDEND);
                         ro = ro + RELOC_INFO_SIZE;
                     }
-                    write_reloc_info(buf, ro, img.relocations[ri].offset, symnum, mr.pcrel, mr.length, 1, mr.r_type);
+                    write_reloc_info(buf, ro, radr, symnum, mr.pcrel, mr.length, 1, mr.r_type);
                     ro = ro + RELOC_INFO_SIZE;
                 }
                 ri = ri + 1;
             }
+            sp = sp + 1;
         }
-        s = s + 1;
+        ko = ko + 1;
     }
 
     if (remap != nil) { A.deallocate[u32](alloc, remap, num_syms::usize); }
     A.deallocate[u64](alloc, sec_addr, (num_secs + 1)::usize);
     A.deallocate[usize](alloc, data_off, (num_secs + 1)::usize);
-    A.deallocate[usize](alloc, reloc_off, (num_secs + 1)::usize);
 
     val wr: R.Result[bool, str] = write_file(img.interner, alloc, path, buf, total_size, "macho: object");
     A.deallocate[u8](alloc, buf, total_size);
@@ -2863,6 +2949,109 @@ fun ts_arm64_roundtrip() u8 {
     ret 0;
 }
 
+# a module with more than 255 sections (the back end emits one section per data
+# global) overflows Mach-O's single-byte nlist `n_sect`. emit_object coalesces the
+# input sections by kind, so a local constant-pool symbol defined past the 255th
+# section round-trips as a defined local rather than being silently dropped to an
+# undefined external by the overflow - the exact `.Lc.*` link defect. the section
+# whose 1-based index is 256 lands on `n_sect == 0` without coalescing, the worst
+# case, so the fixture's target local lives there.
+fun ts_many_sections_coalesce() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    val ndata:   u32 = 260;   # rodata input sections at indices 1..260
+    val total:   u32 = 1 + ndata;
+    val tgt_sec: u32 = 255;   # 1-based nlist index 256 - the overflow-to-zero slot
+
+    val rsec: R.Result[*of.Section, str] = A.zallocate[of.Section](?alloc, total::usize);
+    if (R.is_err[*of.Section, str](rsec)) { ret 1; }
+    var secs: *of.Section = R.unwrap_ok[*of.Section, str](rsec);
+
+    var text_bytes: [8]u8;
+    var k: usize = 0;
+    for (k < 8) { text_bytes[k] = 0; k = k + 1; }
+    text_bytes[0] = 0xE8;     # call rel32, PC32 field at offset 1
+
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 8; secs[0].align = 16;
+
+    var data_bytes: [8]u8;
+    k = 0;
+    for (k < 8) { data_bytes[k] = 0; k = k + 1; }
+
+    var s: u32 = 1;
+    for (s < total) {
+        secs[s].name = t_intern(?i, ".rodata"); secs[s].kind = of.SK_RODATA; secs[s].align = 8;
+        if (s == tgt_sec) { secs[s].bytes = ?data_bytes[0]; secs[s].len = 8; }
+        or                { secs[s].bytes = nil;            secs[s].len = 0; }
+        s = s + 1;
+    }
+
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "_main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 8; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, ".Lc.target"); syms[1].section = tgt_sec; syms[1].offset = 0;
+    syms[1].size = 8; syms[1].flags = of.SYM_OBJ_FLAG_OBJECT;
+
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = of.RK_PC32;
+    relocs[0].symbol = syms[1].name; relocs[0].addend = -4;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = secs; img.section_count = total;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "macho_many");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val tpath: str = filesystem.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { filesystem.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tpath);
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_err[filesystem.Buffer, str](rb)) { ret 1; }
+    val buf: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rb);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+
+    # the 261 input sections coalesce to two by kind (__text + __const).
+    if (out.section_count != 2) { ret 1; }
+
+    # the relocation still names the section-255 local, and that local round-trips
+    # as a defined rodata local - not the overflow's undefined external.
+    if (out.reloc_count != 1)                      { ret 1; }
+    if (out.relocations[0].symbol != syms[1].name) { ret 1; }
+
+    var found: bool = false;
+    var si: u32 = 0;
+    for (si < out.symbol_count) {
+        if (out.symbols[si].name == syms[1].name) {
+            found = true;
+            if (out.symbols[si].section == of.SECTION_EXTERNAL)            { ret 1; }
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_EXTERN) != 0)     { ret 1; }
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_GLOBAL) != 0)     { ret 1; }
+            if (out.symbols[si].section >= out.section_count)              { ret 1; }
+            if (out.sections[out.symbols[si].section].kind != of.SK_RODATA) { ret 1; }
+        }
+        si = si + 1;
+    }
+    if (!found) { ret 1; }
+    ret 0;
+}
+
 # the forward relocation map is machine-keyed: a kind resolves to the x86_64
 # X86_64_RELOC_* type for x86_64 and the arm64 ARM64_RELOC_* type for arm64, and a
 # kind an architecture has no type for is an error naming it.
@@ -3250,13 +3439,14 @@ fun ts_bad_input() u8 {
 }
 
 # the object writer/reader and the relocation maps: the x86_64 and arm64
-# emit/parse round-trips, the machine-keyed forward map, and the PAGEOFF12
-# instruction-decode reverse map.
+# emit/parse round-trips, the over-255-section coalescing, the machine-keyed
+# forward map, and the PAGEOFF12 instruction-decode reverse map.
 test "mach.lang.target.of.macho:object_round_trip_and_reloc_maps" {
-    if (ts_x64_roundtrip() != 0)   { ret 1; }
-    if (ts_arm64_roundtrip() != 0) { ret 1; }
-    if (ts_reloc_map() != 0)       { ret 1; }
-    if (ts_pageoff12() != 0)       { ret 1; }
+    if (ts_x64_roundtrip() != 0)         { ret 1; }
+    if (ts_arm64_roundtrip() != 0)       { ret 1; }
+    if (ts_many_sections_coalesce() != 0) { ret 1; }
+    if (ts_reloc_map() != 0)             { ret 1; }
+    if (ts_pageoff12() != 0)             { ret 1; }
     ret 0;
 }
 
