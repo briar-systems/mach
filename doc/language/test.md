@@ -72,16 +72,14 @@ in the example above.
 ### Collection across modules
 
 Tests are not tied to a single file. Every `test` declaration in every
-module that is part of the build — the project and its dependencies — is
-collected. `mach test` drives a build whose entry point is a synthesized
-test runner that iterates the collected tests rather than the project's
-normal `main`.
+module of the current project is collected, and `mach test` builds and runs
+one standalone executable per test in place of the project's normal `main`.
 
-> **Note.** Because dependency tests are collected too, a project that
-> depends on a library carrying tests that do not follow the `0` = pass
-> convention will see those tests reported as failures. Use `--filter` to
-> scope a run to your own tests while a dependency's suite is being
-> reconciled.
+By default collection is scoped to the current project's own modules: tests
+declared in dependency modules are excluded, so a library's own suite never
+runs (or fails) as part of your project's `mach test`. Pass `--include-deps`
+to collect dependency tests as well — useful when working on a dependency
+in-tree. `--filter` narrows the run by test name in either mode.
 
 ## The `mach test` workflow
 
@@ -95,6 +93,7 @@ build the project's tests and run them.
 
 options:
   --filter <pattern>  run only tests whose name contains <pattern>
+  --include-deps      also run tests declared in dependency modules
   --list              list the collected tests and exit
 
 exit: 0 all passed, 1 any failed, 2 build/internal error
