@@ -180,9 +180,14 @@ then spawns each as a separate process and reports a per-test
 `name file:line PASS|FAIL` line. A crashing test reports its signal and the run
 continues. A test build always links executables, even for a library target.
 
+Only `test` blocks declared in the current project's own modules are collected by
+default; tests in dependency modules are excluded unless `--include-deps` is
+passed.
+
 | Flag                | Value   | Effect |
 |---------------------|---------|--------|
 | `--filter <pattern>`| pattern | run only tests whose name contains `<pattern>` |
+| `--include-deps`    | —       | also collect tests declared in dependency modules |
 | `--list`            | —       | list the collected tests and exit |
 | `--runner <cmd>`    | command | launch every test as `<cmd> <exe>` instead of exec'ing it directly |
 
