@@ -10,14 +10,14 @@ set -eu
 err() { echo "install.sh: $*" >&2; exit 1; }
 
 main() {
-    base="${MACH_BASE_URL:-https://github.com/octalide/mach/releases}"
+    base="${MACH_BASE_URL:-https://github.com/briar-systems/mach/releases}"
 
     command -v curl >/dev/null || err "curl is required"
 
     case "$(uname -s)-$(uname -m)" in
         Linux-x86_64) target="x86_64-linux" ;;
         Linux-aarch64|Linux-arm64) target="aarch64-linux" ;;
-        *) err "unsupported host $(uname -s)-$(uname -m); prebuilt binaries: https://github.com/octalide/mach/releases" ;;
+        *) err "unsupported host $(uname -s)-$(uname -m); prebuilt binaries: https://github.com/briar-systems/mach/releases" ;;
     esac
 
     # mach magenta (0xff00ff) on a tty

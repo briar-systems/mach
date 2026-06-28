@@ -1,11 +1,11 @@
 MACH
 ===
 
-![CI](https://github.com/octalide/mach/actions/workflows/ci.yml/badge.svg?branch=dev)
-![License](https://img.shields.io/github/license/octalide/mach)
-![Code Size](https://img.shields.io/github/languages/code-size/octalide/mach)
-![Last Commit](https://img.shields.io/github/last-commit/octalide/mach)
-![Issues](https://img.shields.io/github/issues/octalide/mach)
+![CI](https://github.com/briar-systems/mach/actions/workflows/ci.yml/badge.svg?branch=dev)
+![License](https://img.shields.io/github/license/briar-systems/mach)
+![Code Size](https://img.shields.io/github/languages/code-size/briar-systems/mach)
+![Last Commit](https://img.shields.io/github/last-commit/briar-systems/mach)
+![Issues](https://img.shields.io/github/issues/briar-systems/mach)
 
 We have an official [Discord](https://discord.com/invite/dfWG9NhGj7)!
 
@@ -41,7 +41,7 @@ On Windows (PowerShell):
 irm https://machlang.org/install.ps1 | iex
 ```
 
-Precompiled binaries are also available directly on the [releases](https://github.com/octalide/mach/releases) page.
+Precompiled binaries are also available directly on the [releases](https://github.com/briar-systems/mach/releases) page.
 
 
 ## Building Mach
@@ -49,7 +49,7 @@ Precompiled binaries are also available directly on the [releases](https://githu
 Mach builds itself, so building from source needs an existing `mach` installation.
 
 ```bash
-git clone https://github.com/octalide/mach
+git clone https://github.com/briar-systems/mach
 cd mach
 mach dep pull
 mach build .
