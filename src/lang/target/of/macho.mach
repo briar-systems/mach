@@ -1280,11 +1280,13 @@ fun write_code_signature(buf: *u8, sig_off: usize, name: *u8, code_limit: usize,
 # Frames the linker's laid-out load segments with a leading __PAGEZERO (the
 # unmapped low region below the image base), one LC_SEGMENT_64 per segment, and an
 # LC_UNIXTHREAD whose thread state carries the entry point - the static thread
-# entry, with no dyld dependency. The mach header and load commands occupy the
-# file head; each segment's file bytes follow at a page-aligned offset congruent
-# with its virtual address. A trailing __LINKEDIT segment carries an ad-hoc
-# LC_CODE_SIGNATURE so the Apple Silicon kernel admits the image (it SIGKILLs an
-# unsigned arm64 executable).
+# entry, with no dyld dependency. The mach header and load commands map into the
+# first segment (__TEXT): __TEXT starts at file offset 0 and virtual address
+# `base - hdr_span`, so the header sits inside the signed, mapped executable
+# segment ahead of the linker's text, which follows at `hdr_span`. A trailing
+# __LINKEDIT segment carries an ad-hoc LC_CODE_SIGNATURE so the Apple Silicon
+# kernel admits the image - it SIGKILLs an arm64 executable whose signature does
+# not cover the mapped header (and any unsigned arm64 executable).
 #
 # `funcs`/`func_count` are accepted for of.ExecFn conformance; no unwind table is
 # emitted.
@@ -1309,14 +1311,14 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
     val ct: R.Result[u32, str] = cpu_type_for(arch_id);
     if (R.is_err[u32, str](ct)) { ret R.err[bool, str](R.unwrap_err[u32, str](ct)); }
 
-    # __PAGEZERO spans the low region below the image base; with a zero base
-    # (freestanding) there is none.
-    var pagezero_size: u64 = 0;
-    if (seg_count > 0) { pagezero_size = segs[0].vaddr & ~(EXEC_PAGE_SIZE - 1); }
+    # __PAGEZERO spans the low region below __TEXT; it is present whenever the image
+    # base is non-zero (darwin executables always carry one). its exact span depends
+    # on hdr_span, computed once the load-command size is known below.
+    var has_pagezero: bool = seg_count > 0 && segs[0].vaddr > 0;
     # the linker segments, a trailing __LINKEDIT (carrying the code signature),
     # LC_UNIXTHREAD, LC_CODE_SIGNATURE, and __PAGEZERO when the base is non-zero.
     var ncmds: u32 = seg_count + 3;
-    if (pagezero_size > 0) { ncmds = ncmds + 1; }
+    if (has_pagezero) { ncmds = ncmds + 1; }
 
     var thread_state: usize = X86_THREAD_STATE64_COUNT::usize * 4;
     if (arch_is_arm64(arch_id)) { thread_state = ARM_THREAD_STATE64_COUNT::usize * 4; }
@@ -1324,8 +1326,23 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
 
     var sizeofcmds: usize = seg_count::usize * SEGMENT_CMD_64_SIZE + thread_cmd_size
                           + SEGMENT_CMD_64_SIZE + LINKEDIT_DATA_CMD_SIZE;   # __LINKEDIT + LC_CODE_SIGNATURE
-    if (pagezero_size > 0) { sizeofcmds = sizeofcmds + SEGMENT_CMD_64_SIZE; }
+    if (has_pagezero) { sizeofcmds = sizeofcmds + SEGMENT_CMD_64_SIZE; }
     val header_end: usize = MACH_HEADER_64_SIZE + sizeofcmds;
+
+    # the mach header + load commands map into __TEXT's first hdr_span bytes: the
+    # Apple Silicon kernel admits a signed image only when the header lies inside the
+    # signed, mapped __TEXT. the first linker segment must therefore sit at least
+    # hdr_span above the image base, leaving room for the header below it.
+    val hdr_span: usize = bin.align_up(header_end, EXEC_PAGE_SIZE::usize);
+    if (seg_count > 0 && segs[0].vaddr < hdr_span::u64) {
+        ret R.err[bool, str]("macho: exec base address too low to map the header");
+    }
+    var text_va:       u64 = 0;
+    var pagezero_size: u64 = 0;
+    if (seg_count > 0) {
+        text_va       = segs[0].vaddr - hdr_span::u64;
+        pagezero_size = text_va;
+    }
 
     var seg_offsets: *usize = nil;
     if (seg_count > 0) {
@@ -1334,7 +1351,10 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
         seg_offsets = R.unwrap_ok[*usize, str](ro);
     }
 
-    var total_size: usize = bin.align_up(header_end, EXEC_PAGE_SIZE::usize);
+    # the first linker segment's bytes follow the header at hdr_span; the rest are
+    # page-aligned in turn. __TEXT (the first segment) therefore shares its file
+    # region with the header.
+    var total_size: usize = hdr_span;
     var li: u32 = 0;
     for (li < seg_count) {
         total_size = bin.align_up(total_size, EXEC_PAGE_SIZE::usize);
@@ -1343,23 +1363,21 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
         li = li + 1;
     }
 
-    # the highest mapped virtual address and the executable segment, for the trailing
-    # __LINKEDIT placement and the code signature's executable-segment fields.
-    var hi_va:      u64 = 0;
-    var exec_base:  u64 = 0;
-    var exec_limit: u64 = 0;
-    var found_exec: bool = false;
+    # the highest mapped virtual address, for the trailing __LINKEDIT placement.
+    var hi_va: u64 = 0;
     li = 0;
     for (li < seg_count) {
         val end: u64 = segs[li].vaddr + bin.align_up_u64(segs[li].memsz::u64, EXEC_PAGE_SIZE);
         if (end > hi_va) { hi_va = end; }
-        if (!found_exec && (segs[li].flags & of.SEG_FLAG_EXECUTE) != 0) {
-            exec_base  = seg_offsets[li]::u64;
-            exec_limit = segs[li].filesz::u64;
-            found_exec = true;
-        }
         li = li + 1;
     }
+
+    # __TEXT - the first segment, now carrying the header - is the executable segment
+    # the code signature authorizes: it starts at file offset 0 and spans the header
+    # plus the linker's text bytes.
+    var exec_base:  u64 = 0;
+    var exec_limit: u64 = 0;
+    if (seg_count > 0) { exec_limit = hdr_span::u64 + segs[0].filesz::u64; }
 
     # the ad-hoc code signature lives in a trailing __LINKEDIT segment and covers
     # every byte before it, so it is laid out last and page-aligned. codeLimit is the
@@ -1407,13 +1425,26 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
     li = 0;
     for (li < seg_count) {
         val prot: u32 = vm_prot_for(segs[li].flags);
+        # the first segment is __TEXT: it maps the mach header + load commands ahead
+        # of the linker's text (fileoff 0, vmaddr text_va), so the signed header lies
+        # inside the mapped executable segment. the rest map at their own offsets.
+        var seg_vaddr:  u64 = segs[li].vaddr;
+        var seg_vmsize: u64 = bin.align_up_u64(segs[li].memsz::u64, EXEC_PAGE_SIZE);
+        var seg_foff:   u64 = seg_offsets[li]::u64;
+        var seg_fsz:    u64 = segs[li].filesz::u64;
+        if (li == 0) {
+            seg_vaddr  = text_va;
+            seg_vmsize = bin.align_up_u64(hdr_span::u64 + segs[0].memsz::u64, EXEC_PAGE_SIZE);
+            seg_foff   = 0;
+            seg_fsz    = hdr_span::u64 + segs[0].filesz::u64;
+        }
         bin.write_u32_le(buf, lc, LC_SEGMENT_64);
         bin.write_u32_le(buf, lc + 4, SEGMENT_CMD_64_SIZE::u32);
         write_fixed16(buf, lc + 8, exec_segname(segs[li].flags));
-        bin.write_u64_le(buf, lc + 24, segs[li].vaddr);
-        bin.write_u64_le(buf, lc + 32, bin.align_up_u64(segs[li].memsz::u64, EXEC_PAGE_SIZE));
-        bin.write_u64_le(buf, lc + 40, seg_offsets[li]::u64);
-        bin.write_u64_le(buf, lc + 48, segs[li].filesz::u64);
+        bin.write_u64_le(buf, lc + 24, seg_vaddr);
+        bin.write_u64_le(buf, lc + 32, seg_vmsize);
+        bin.write_u64_le(buf, lc + 40, seg_foff);
+        bin.write_u64_le(buf, lc + 48, seg_fsz);
         bin.write_u32_le(buf, lc + 56, prot);
         bin.write_u32_le(buf, lc + 60, prot);
         bin.write_u32_le(buf, lc + 64, 0);
@@ -3142,11 +3173,23 @@ fun ts_exec_x64() u8 {
     # ncmds: __PAGEZERO + one segment + __LINKEDIT + LC_UNIXTHREAD + LC_CODE_SIGNATURE.
     if (bin.read_u32_le(buf.data, 16) != 5) { ret 1; }
 
-    # the first load command is __PAGEZERO spanning the image base.
+    # __PAGEZERO spans [0, __TEXT.vmaddr); __TEXT (the next command) maps the mach
+    # header at file offset 0 and virtual address base - hdr_span, so the image base
+    # (the linker's code address) falls inside the signed, mapped executable segment.
     val pz: usize = MACH_HEADER_64_SIZE;
     if (bin.read_u32_le(buf.data, pz) != LC_SEGMENT_64)     { ret 1; }
     if (!fixed16_equals(buf.data, pz + 8, "__PAGEZERO"))    { ret 1; }
-    if (bin.read_u64_le(buf.data, pz + 32) != base)         { ret 1; }
+    if (bin.read_u64_le(buf.data, pz + 24) != 0)            { ret 1; }   # __PAGEZERO vmaddr
+
+    val tx: usize = pz + SEGMENT_CMD_64_SIZE;
+    if (bin.read_u32_le(buf.data, tx) != LC_SEGMENT_64)     { ret 1; }
+    if (!fixed16_equals(buf.data, tx + 8, "__TEXT"))        { ret 1; }
+    val text_va:   u64 = bin.read_u64_le(buf.data, tx + 24);
+    val text_vmsz: u64 = bin.read_u64_le(buf.data, tx + 32);
+    if (bin.read_u64_le(buf.data, tx + 40) != 0)            { ret 1; }   # __TEXT fileoff: header inside __TEXT
+    if (bin.read_u64_le(buf.data, pz + 32) != text_va)      { ret 1; }   # __PAGEZERO ends where __TEXT begins
+    if (text_va > base)                                     { ret 1; }   # base sits at or above __TEXT's start
+    if (base >= text_va + text_vmsz)                        { ret 1; }   # ... and inside __TEXT's mapping
 
     # LC_UNIXTHREAD carries the entry in the x86_64 rip slot.
     val th: usize = t_find_lc(buf.data, LC_UNIXTHREAD);
