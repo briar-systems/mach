@@ -1,9 +1,11 @@
-# `mach run` - build the project and execute the produced binary
+# `mach run` - execute the already-built artifact for the project
 #
-# Builds through the same pipeline as `build`, then executes the produced
-# binary, forwarding any arguments after a `--` separator to the child as its
-# argv. The child inherits the parent's environment, and its exit code becomes
-# this subcommand's exit code. `--emit obj` is rejected, since running a
+# Locates the binary `mach build` produced for the same selection and executes
+# it, forwarding any arguments after a `--` separator to the child as its argv.
+# This is a post-`mach build` convenience: it does NOT build. When the artifact
+# does not exist yet it errors and points at `mach build` rather than silently
+# building. The child inherits the parent's environment, and its exit code
+# becomes this subcommand's exit code. `--emit obj` is rejected, since running a
 # relocatable object is not meaningful. `--runner <cmd>` executes the binary as
 # `<cmd> <binary> <args...>` instead of exec'ing it directly - the host-side
 # launcher for foreign-target artifacts (e.g. wine for a windows target). Absent
@@ -11,10 +13,11 @@
 # that.
 
 use std.allocator.arena;
+use std.filesystem;
 use std.print;
 use std.process.env;
 use std.process.exec;
-use std.types.bool.false;
+use std.types.bool.bool;
 use std.types.size.usize;
 use std.types.string.str;
 
@@ -22,21 +25,25 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
+use cfg: mach.cli.config;
 use mach.cli.cmd.build;
 use mach.cli.util;
+use mach.lang.driver;
+use mach.lang.manifest;
 
 # `mach run` subcommand entry point
 #
-# Builds the project to an executable, then execs it forwarding the post-`--`
-# arguments. Called by cmd.dispatch.
+# Resolves the selected artifact's output path from the manifest, requires it to
+# already exist on disk, then execs it forwarding the post-`--` arguments. Called
+# by cmd.dispatch.
 # ---
 # argc: argument count including argv[0]
 # argv: the argument vector (argc null-terminated byte pointers)
-# ret:  the child's exit code, 1 on a build or user error, 2 on internal error
+# ret:  the child's exit code, 1 on a resolution or user error, 2 on internal error
 pub fun run(argc: usize, argv: **u8) i64 {
-    # the build sees only the args before `--`; everything after is the child's
-    # argv. clip the build's view here too so a post-`--` `--emit` is the
-    # program's argument, not a flag this command rejects.
+    # the resolution sees only the args before `--`; everything after is the
+    # child's argv. clip the count here so a post-`--` `--emit` is the program's
+    # argument, not a flag this command rejects.
     val sep: usize = util.separator_index(argc, argv);
 
     val opt_emit: O.Option[*u8] = build.emit_kind(sep, argv);
@@ -45,12 +52,9 @@ pub fun run(argc: usize, argv: **u8) i64 {
         ret 1;
     }
 
-    # back the build with an arena over a page allocator, matching `mach build`.
-    # the build's internal teardown (`sess.dnit` / `dnit_project`) frees through
-    # this allocator; the page allocator would munmap each block individually,
-    # unmapping the page `output_path` lives in before we exec it. the arena
-    # defers all reclamation to a single `arena.dnit`, so `output_path` stays
-    # mapped until we are done with the child.
+    # the resolved artifact path is suballocated through one arena over a page
+    # allocator. a direct exec never returns, so the arena is reclaimed only on the
+    # error and runner paths, where `arena.dnit` runs after the path is last used.
     var backing: A.Allocator;
     var ar:      arena.Arena;
     var alloc:   A.Allocator;
@@ -59,15 +63,63 @@ pub fun run(argc: usize, argv: **u8) i64 {
         ret 2;
     }
 
-    val build_result: build.BuildResult = build.build(?alloc, argc, argv, false);
-    if (build_result.code != 0) {
+    # the same CLI flags (`--target`/`--profile`/`--bin`/...) that narrow a build
+    # narrow the artifact here, so `mach run` resolves the exact path `mach build`
+    # produced. the args are read clipped at `--` so a forwarded flag never leaks
+    # into the selection.
+    val res_cfg: R.Result[cfg.Config, str] = cfg.parse(sep, argv);
+    if (R.is_err[cfg.Config, str](res_cfg)) {
+        print.eprint("error: ");
+        print.eprint(R.unwrap_err[cfg.Config, str](res_cfg));
+        print.eprint("\n");
         arena.dnit(?ar);
-        ret build_result.code;
+        ret 1;
     }
-    if (build_result.output_path == nil) {
+    val config: cfg.Config = R.unwrap_ok[cfg.Config, str](res_cfg);
+
+    # the project root is the required non-flag positional after the subcommand
+    # (`mach run <path>`); a bare invocation with no path is a user error.
+    val pix: usize = util.positional_index(sep, argv, 2);
+    if (pix >= sep) {
+        print.eprint("error: missing project path; pass the project root (e.g. '.')\n");
         arena.dnit(?ar);
-        print.eprint("error: build produced no executable\n");
-        ret 2;
+        ret 1;
+    }
+    var root: [4096]u8;
+    if (!util.find_project_root(argv[pix], ?root[0], 4096)) {
+        print.eprint("error: no mach.toml found in the working directory or any parent\n");
+        arena.dnit(?ar);
+        ret 1;
+    }
+
+    var sel: manifest.Selection;
+    val res_sel: R.Result[bool, str] = build.selection_from_config(?config, ?sel);
+    if (R.is_err[bool, str](res_sel)) {
+        print.eprint("error: ");
+        print.eprint(R.unwrap_err[bool, str](res_sel));
+        print.eprint("\n");
+        arena.dnit(?ar);
+        ret 1;
+    }
+
+    val res_path: R.Result[str, str] = driver.resolve_artifact_path(?alloc, util.cstr_str(?root[0]), ?sel);
+    if (R.is_err[str, str](res_path)) {
+        print.eprint("error: ");
+        print.eprint(R.unwrap_err[str, str](res_path));
+        print.eprint("\n");
+        arena.dnit(?ar);
+        ret 1;
+    }
+    val output_path: str = R.unwrap_ok[str, str](res_path);
+
+    # a post-build execute, not a rebuild: when the artifact is absent point at
+    # `mach build` instead of silently producing it.
+    if (!filesystem.is_file(output_path)) {
+        print.eprint("error: no built artifact at '");
+        print.eprint(output_path);
+        print.eprint("'; run `mach build` first\n");
+        arena.dnit(?ar);
+        ret 1;
     }
 
     # `--runner <cmd>` (scanned before `--`, like every other flag): execute the
@@ -79,12 +131,12 @@ pub fun run(argc: usize, argv: **u8) i64 {
         val name: *u8 = O.unwrap[*u8](opt_runner);
         val res_runner: R.Result[*u8, str] = util.resolve_cmd(?alloc, name);
         if (R.is_err[*u8, str](res_runner)) {
-            arena.dnit(?ar);
             print.eprint("error: --runner '");
             print.eprint(name::str);
             print.eprint("': ");
             print.eprint(R.unwrap_err[*u8, str](res_runner));
             print.eprint("\n");
+            arena.dnit(?ar);
             ret 1;
         }
         runner = R.unwrap_ok[*u8, str](res_runner);
@@ -101,14 +153,14 @@ pub fun run(argc: usize, argv: **u8) i64 {
     val child_len: usize = lead + 1 + fwd_len + 1;
     val res_child_argv: R.Result[**u8, str] = A.allocate[*u8](?alloc, child_len);
     if (R.is_err[**u8, str](res_child_argv)) {
-        arena.dnit(?ar);
         print.eprint("error: out of memory\n");
+        arena.dnit(?ar);
         ret 2;
     }
     val child_argv: **u8 = R.unwrap_ok[**u8, str](res_child_argv);
 
     if (runner != nil) { child_argv[0] = runner; }
-    child_argv[lead] = build_result.output_path;
+    child_argv[lead] = output_path;
     var i: usize = 0;
     for (i < fwd_len) {
         child_argv[lead + 1 + i] = argv[sep + 1 + i];
@@ -117,15 +169,15 @@ pub fun run(argc: usize, argv: **u8) i64 {
     child_argv[lead + 1 + fwd_len] = nil;
 
     # exec the runner when present, otherwise the built binary directly.
-    var exe: *u8 = build_result.output_path;
+    var exe: *u8 = output_path;
     if (runner != nil) { exe = runner; }
 
     # the child inherits the parent's environment unmodified.
     val res_exec: R.Result[exec.ExitStatus, str] = exec.run(exe::str, child_argv, env.environ());
     if (R.is_err[exec.ExitStatus, str](res_exec)) {
-        arena.dnit(?ar);
         if (runner != nil) { print.eprint("error: failed to execute the runner\n"); }
         or                 { print.eprint("error: failed to execute the built binary\n"); }
+        arena.dnit(?ar);
         ret 1;
     }
     val status: exec.ExitStatus = R.unwrap_ok[exec.ExitStatus, str](res_exec);
