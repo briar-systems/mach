@@ -277,7 +277,7 @@ and resolved `commit` (path deps have no lock entry):
 version = 1
 
 [deps.mach-std]
-url = "https://github.com/octalide/mach-std"
+url = "https://github.com/briar-systems/mach-std"
 ref = "branch/dev"
 commit = "6b78ae1e8c3c9cc45e4ab4b916fd191d61e76aff"
 ```

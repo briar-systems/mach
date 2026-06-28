@@ -232,7 +232,7 @@ brackets and are a separate mechanism.
 ## Reference
 
 The authoritative comptime reference lives in the Mach repository under
-[`doc/language/`](https://github.com/octalide/mach/tree/dev/doc/language) —
+[`doc/language/`](https://github.com/briar-systems/mach/tree/dev/doc/language) —
 `comptime.md`, `comptime-mach.md`, `comptime-attrs.md`,
 `comptime-intrinsics.md`, and `comptime-control.md`. When a skill and the
 reference disagree, the reference wins.

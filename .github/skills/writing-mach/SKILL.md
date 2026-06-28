@@ -360,6 +360,6 @@ comptime/asm grammar is out of scope here — see the **mach-comptime** skill.
 
 The authoritative per-feature language reference lives in the Mach repository
 under
-[`doc/language/`](https://github.com/octalide/mach/tree/dev/doc/language),
+[`doc/language/`](https://github.com/briar-systems/mach/tree/dev/doc/language),
 including the EBNF in `grammar.md`. When a skill and the reference disagree, the
 reference wins.

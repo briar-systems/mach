@@ -12,7 +12,7 @@ Security fixes are applied to the latest release.
 ## Reporting a Vulnerability
 
 Please report security vulnerabilities privately through GitHub's
-[private vulnerability reporting](https://github.com/octalide/mach/security/advisories/new)
+[private vulnerability reporting](https://github.com/briar-systems/mach/security/advisories/new)
 rather than opening a public issue.
 
 Expect an acknowledgement within a few days. If the report is confirmed we will

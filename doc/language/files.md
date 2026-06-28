@@ -60,7 +60,7 @@ entrypoint = "main.mach"
 
 [deps.mach-std]
 type    = "remote"
-path    = "https://github.com/octalide/mach-std"
+path    = "https://github.com/briar-systems/mach-std"
 version = "branch/dev"
 ```
 

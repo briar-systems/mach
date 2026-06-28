@@ -36,5 +36,5 @@ language reference disagree, the reference wins and the skill is the bug.
 The skills are the fast path, not the contract. The complete, per-feature
 language reference — grammar, semantics, and implementation status — lives in
 the Mach repository under
-[`doc/language/`](https://github.com/octalide/mach/tree/dev/doc/language). Each
+[`doc/language/`](https://github.com/briar-systems/mach/tree/dev/doc/language). Each
 skill points there for exhaustive detail.
