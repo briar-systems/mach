@@ -6,14 +6,14 @@
 # segments, LC_UNIXTHREAD entry), and a dyld-loadable DYNAMIC executable
 # (LC_LOAD_DYLINKER, LC_LOAD_DYLIB, an LC_DYLD_INFO_ONLY bind stream, the
 # LC_SYMTAB/LC_DYSYMTAB pair, and an import stub the call site is redirected to).
-# nothing is run: Darwin binaries cannot run on this Linux host, and an arm64
-# Darwin binary additionally needs a code signature the kernel verifies, which
-# this writer does not emit. this mirrors the riscv64 cross lane - byte
-# verification, no execution step.
+# both executables also carry an ad-hoc LC_CODE_SIGNATURE, whose embedded
+# SuperBlob + CodeDirectory this script parses and validates by hand (codesign is
+# macOS-only). nothing is run: Darwin binaries cannot run on this Linux host. this
+# mirrors the riscv64 cross lane - byte verification, no execution step.
 #
 # usage: verify.sh [path-to-mach]   (defaults to `mach` on PATH)
 #
-# requires: file, llvm-objdump, llvm-otool (unversioned or `-NN` suffixed).
+# requires: file, od, llvm-objdump, llvm-otool (unversioned or `-NN` suffixed).
 set -euo pipefail
 
 mach="${1:-mach}"
@@ -34,6 +34,68 @@ resolve_tool() {
 
 objdump="$(resolve_tool llvm-objdump)" || fail "llvm-objdump not found"
 otool="$(resolve_tool llvm-otool)"     || fail "llvm-otool not found"
+
+# read a big-endian u32 at byte offset $2 of file $1, as a decimal value. the code
+# signing structures are big-endian, unlike the little-endian Mach-O around them.
+be32() {
+    local hex; hex="$(od -An -tx1 -j "$2" -N 4 "$1" | tr -d ' \n')"
+    printf '%d' "0x$hex"
+}
+
+# read a u8 at byte offset $2 of file $1, as a decimal value.
+u8() {
+    local hex; hex="$(od -An -tx1 -j "$2" -N 1 "$1" | tr -d ' \n')"
+    printf '%d' "0x$hex"
+}
+
+# verify_codesig <target> <exe>
+#
+# asserts the executable carries an LC_CODE_SIGNATURE and that the bytes it points
+# at are a well-formed embedded ad-hoc signature: a CSMAGIC_EMBEDDED_SIGNATURE
+# SuperBlob whose sole sub-blob is a CSMAGIC_CODEDIRECTORY with the adhoc flag,
+# SHA-256 hashes, a 4 KiB page size, codeLimit equal to the signature offset, and
+# one code slot per page of [0, codeLimit). all fields are big-endian.
+verify_codesig() {
+    local target="$1" exe="$2"
+    local lc; lc="$("$otool" -l "$exe")"
+    echo "$lc" | grep -q 'LC_CODE_SIGNATURE' || fail "$target: executable missing LC_CODE_SIGNATURE"
+
+    local dataoff datasize
+    dataoff="$(echo "$lc"  | awk '/cmd LC_CODE_SIGNATURE/{f=1} f&&$1=="dataoff" {print $2; exit}')"
+    datasize="$(echo "$lc" | awk '/cmd LC_CODE_SIGNATURE/{f=1} f&&$1=="datasize"{print $2; exit}')"
+    [ -n "$dataoff" ] && [ -n "$datasize" ] || fail "$target: LC_CODE_SIGNATURE has no dataoff/datasize"
+
+    # the signature must lie inside the __LINKEDIT segment's file range.
+    local le_off le_size
+    le_off="$(echo "$lc"  | awk '/segname __LINKEDIT/{f=1} f&&$1=="fileoff" {print $2; exit}')"
+    le_size="$(echo "$lc" | awk '/segname __LINKEDIT/{f=1} f&&$1=="filesize"{print $2; exit}')"
+    [ -n "$le_off" ] && [ -n "$le_size" ] || fail "$target: no __LINKEDIT segment for the signature"
+    [ "$dataoff" -ge "$le_off" ] && [ $((dataoff + datasize)) -le $((le_off + le_size)) ] \
+        || fail "$target: signature escapes __LINKEDIT"
+
+    # SuperBlob: magic, total length == datasize, and a CSSLOT_CODEDIRECTORY index.
+    [ "$(be32 "$exe" "$dataoff")" = "$((0xFADE0CC0))" ] || fail "$target: bad CSMAGIC_EMBEDDED_SIGNATURE"
+    [ "$(be32 "$exe" $((dataoff + 4)))" = "$datasize" ] || fail "$target: SuperBlob length != datasize"
+    [ "$(be32 "$exe" $((dataoff + 8)))" -ge 1 ]         || fail "$target: SuperBlob has no sub-blobs"
+    [ "$(be32 "$exe" $((dataoff + 12)))" = 0 ]          || fail "$target: first slot is not CSSLOT_CODEDIRECTORY"
+    local cd=$((dataoff + $(be32 "$exe" $((dataoff + 16)))))
+
+    # CodeDirectory: magic, adhoc flag, SHA-256, 4 KiB pages, codeLimit, slot count.
+    [ "$(be32 "$exe" "$cd")" = "$((0xFADE0C02))" ]      || fail "$target: bad CSMAGIC_CODEDIRECTORY"
+    [ $(( $(be32 "$exe" $((cd + 12))) & 0x2 )) -ne 0 ]  || fail "$target: CodeDirectory adhoc flag not set"
+    [ "$(be32 "$exe" $((cd + 24)))" = 0 ]               || fail "$target: CodeDirectory has special slots"
+    [ "$(u8   "$exe" $((cd + 36)))" = 32 ]              || fail "$target: hashSize is not 32 (SHA-256)"
+    [ "$(u8   "$exe" $((cd + 37)))" = 2 ]               || fail "$target: hashType is not SHA-256"
+    [ "$(u8   "$exe" $((cd + 39)))" = 12 ]              || fail "$target: pageSize is not 12 (4 KiB)"
+    local code_limit n_code expect
+    code_limit="$(be32 "$exe" $((cd + 32)))"
+    [ "$code_limit" = "$dataoff" ]                      || fail "$target: codeLimit != signature offset"
+    n_code="$(be32 "$exe" $((cd + 28)))"
+    expect=$(( (code_limit + 4095) / 4096 ))
+    [ "$n_code" = "$expect" ]                           || fail "$target: nCodeSlots != ceil(codeLimit/4096)"
+
+    echo "verified $target ad-hoc code signature (codeLimit=$code_limit, nCodeSlots=$n_code)"
+}
 
 # verify_static <target> <machine> <thread-flavor> <reloc>...
 #
@@ -70,8 +132,11 @@ verify_static() {
     lc="$("$otool" -l "$exe")"
     echo "$lc" | grep -q '__PAGEZERO'    || fail "$target: executable missing __PAGEZERO"
     echo "$lc" | grep -q '__TEXT'        || fail "$target: executable missing __TEXT segment"
+    echo "$lc" | grep -q '__LINKEDIT'    || fail "$target: executable missing __LINKEDIT segment"
     echo "$lc" | grep -q 'LC_UNIXTHREAD' || fail "$target: executable missing LC_UNIXTHREAD"
     echo "$lc" | grep -q "$flavor"       || fail "$target: executable thread state is not $flavor"
+
+    verify_codesig "$target" "$exe"
 }
 
 # verify_dynamic <target> <machine>
@@ -113,6 +178,8 @@ verify_dynamic() {
     local dis
     dis="$("$objdump" --macho -d --section=__stubs "$exe")"
     if echo "$dis" | grep -qi 'unknown'; then fail "$target: __stubs disassembly has an unknown instruction"; fi
+
+    verify_codesig "$target" "$exe"
 }
 
 rm -rf out dynamic/out
@@ -121,4 +188,4 @@ verify_static  darwin-aarch64 arm64  ARM_THREAD_STATE64 PAGE21 PAGOF12 BR26
 verify_dynamic darwin-x86_64  x86_64
 verify_dynamic darwin-aarch64 arm64
 
-echo "OK: Mach-O emits correct objects and static + dynamic executables for both Darwin triples"
+echo "OK: Mach-O emits correct objects and ad-hoc-signed static + dynamic executables for both Darwin triples"
