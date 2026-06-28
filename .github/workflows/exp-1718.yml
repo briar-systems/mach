@@ -1,0 +1,153 @@
+name: exp-1718 (arm64 darwin image-shape scoping)
+
+# throwaway workflow_dispatch experiment for epic #1718. cross-builds minimal
+# arm64-darwin fixtures on ubuntu (each a few-instruction program that exits 42),
+# then on a macos-14 (Apple Silicon) runner runs each and prints its exit code, so
+# we can find the minimum Mach-O image shape macOS arm64 will exec. NOT a release
+# path and NOT merged: it carries no tag gating and exists only to size the rework.
+#
+# the escalation ladder (all cross-built for darwin-aarch64, mach self-signed):
+#   exp_static     static control (emit_exec, LC_UNIXTHREAD, no dyld) - expect Killed:9
+#   exp_raw_B      dyn (emit_dyn_exec) + libSystem LC_LOAD_DYLIB + LC_UNIXTHREAD + raw svc
+#   exp_raw_C      dyn + LC_MAIN entry + raw svc
+#   exp_raw_E      dyn + LC_MAIN + LC_BUILD_VERSION(macOS) + raw svc
+#   exp_libcall_E  dyn + LC_MAIN + LC_BUILD_VERSION + libSystem _exit call (no raw svc)
+#
+# each binary is run twice on the Mac: as mach-signed, then re-signed with Apple's
+# `codesign -s -` (to separate a signature problem from an image-shape problem).
+# reference binaries built with the system toolchain enumerate the load commands a
+# known-good minimal arm64 binary carries that mach does not.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: cross-build arm64-darwin fixtures (ubuntu)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: fetch released mach seed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEED: mach-*-x86_64-linux.tar.gz
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          gh release download -R "$GITHUB_REPOSITORY" -p "$SEED" -D "$tmp"
+          tar -xzf "$tmp"/$SEED -C /usr/local/bin mach
+          chmod +x /usr/local/bin/mach
+
+      - name: build experimental compiler from source
+        run: |
+          set -euo pipefail
+          mach dep pull
+          mach build . -o m
+
+      - name: cross-compile the fixture ladder
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          T=darwin-aarch64
+          ./m build exp/static  --target "$T" --profile debug -o "$PWD/artifacts/exp_static"
+          ./m build exp/raw     --target "$T" --profile debug -o "$PWD/artifacts/exp_raw_B"
+          MACH_EXP_LC_MAIN=1 \
+            ./m build exp/raw   --target "$T" --profile debug -o "$PWD/artifacts/exp_raw_C"
+          MACH_EXP_LC_MAIN=1 MACH_EXP_BUILD_VERSION=1 \
+            ./m build exp/raw   --target "$T" --profile debug -o "$PWD/artifacts/exp_raw_E"
+          MACH_EXP_LC_MAIN=1 MACH_EXP_BUILD_VERSION=1 \
+            ./m build exp/libcall --target "$T" --profile debug -o "$PWD/artifacts/exp_libcall_E"
+          ls -la artifacts
+
+      - name: upload fixtures
+        uses: actions/upload-artifact@v4
+        with:
+          name: exp-1718-fixtures
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 3
+
+  run-macos:
+    name: run fixtures on macos-14 (Apple Silicon)
+    needs: build
+    runs-on: macos-14
+    steps:
+      - name: download fixtures
+        uses: actions/download-artifact@v4
+        with:
+          name: exp-1718-fixtures
+          path: artifacts
+
+      - name: environment
+        run: |
+          uname -a
+          sw_vers || true
+          echo "arch: $(arch)"
+
+      - name: run each fixture and report exit codes
+        run: |
+          set -uo pipefail
+          chmod +x artifacts/*
+
+          run_one() {
+            local bin="$1"
+            echo "==================================================================="
+            echo "### $bin"
+            echo "--- file ---"
+            file "$bin" || true
+            echo "--- load commands ---"
+            otool -l "$bin" | grep -iE 'cmd (LC|MH)|magic|filetype|flags 0x|platform|entryoff|name /usr|^ *minos|^ *sdk' || true
+            echo "--- signature (mach self-signed) ---"
+            codesign -dvvv "$bin" 2>&1 | head -20 || true
+
+            echo "--- RUN (mach self-signed) ---"
+            set +e
+            "$bin"
+            local code=$?
+            set -e
+            echo "exit_code(mach-signed) = $code"
+
+            echo "--- RE-SIGN with Apple codesign -s - and RUN again ---"
+            set +e
+            codesign --remove-signature "$bin" 2>&1 | head -3
+            codesign -s - --force "$bin" 2>&1 | head -3
+            local rs=$?
+            set -e
+            if [ "$rs" -ne 0 ]; then echo "codesign re-sign FAILED ($rs)"; fi
+            set +e
+            "$bin"
+            local code2=$?
+            set -e
+            echo "exit_code(codesign-resigned) = $code2"
+            echo
+          }
+
+          for b in exp_static exp_raw_B exp_raw_C exp_raw_E exp_libcall_E; do
+            run_one "artifacts/$b"
+          done
+
+      - name: reference binaries (system toolchain ground truth)
+        run: |
+          set -uo pipefail
+          echo "### reference: clang int main(){return 42;}"
+          printf 'int main(void){return 42;}\n' > ref.c
+          cc -arch arm64 -o ref_c ref.c
+          otool -l ref_c | grep -iE 'cmd (LC|MH)|magic|filetype|platform|entryoff|name /usr' || true
+          set +e; ./ref_c; echo "ref_c exit = $?"; set -e
+          echo
+          echo "### reference: clang -nostdlib raw-svc exit(42)"
+          printf '.global _main\n.align 2\n_main:\n    mov x0, #42\n    mov x16, #1\n    svc #0x80\n' > ref_svc.s
+          set +e
+          cc -arch arm64 -nostdlib -e _main -o ref_svc ref_svc.s 2>&1 | head -10
+          set -e
+          if [ -f ref_svc ]; then
+            otool -l ref_svc | grep -iE 'cmd (LC|MH)|magic|filetype|platform|entryoff|name /usr' || true
+            codesign -s - --force ref_svc 2>&1 | head -3 || true
+            set +e; ./ref_svc; echo "ref_svc exit = $?"; set -e
+          else
+            echo "ref_svc did not link (system ld refuses a no-dylib main on arm64?) - informative"
+          fi
