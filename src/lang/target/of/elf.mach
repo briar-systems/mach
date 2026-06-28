@@ -32,6 +32,7 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_contains;
+use std.types.string.str_equals;
 use std.types.string.str_len;
 
 use A: std.allocator;
@@ -60,6 +61,11 @@ val SHT_SYMTAB:   u32 = 2;
 val SHT_STRTAB:   u32 = 3;
 val SHT_RELA:     u32 = 4;
 val SHT_NOBITS:   u32 = 8;
+
+# the RISC-V build-attributes section type (SHT_LOPROC + 3). pub so the riscv64
+# ISA's `BuildAttributes` descriptor names it; the writer reads the type off the
+# descriptor rather than the arch id, the section-type analogue of `elf_machine`.
+pub val SHT_RISCV_ATTRIBUTES: u32 = 0x70000003;
 
 # ELF section header flags.
 val SHF_WRITE:     u64 = 1;
@@ -117,6 +123,20 @@ pub val R_RISCV_32_PCREL:     u32 = 57;
 # not collide with each other, but riscv reuses x86_64's low numbers with different
 # meanings, so a riscv object must be mapped through its own table.
 val EM_RISCV: u16 = 243;
+
+# the format-version byte that opens an ELF build-attributes section ('A', the only
+# version defined). the same container the ARM EABI and the RISC-V psABI use, so it
+# is owned here by the generic serializer, not by any one arch.
+val ELF_ATTR_VERSION_A: u8 = 'A';
+
+# the build-attributes `Tag_File` sub-sub-section tag: the attributes that follow it
+# apply to the whole file (as opposed to a section or symbol). shared across vendors.
+val ELF_ATTR_TAG_FILE: u32 = 1;
+
+# the RISC-V `Tag_RISCV_arch` build-attribute tag, whose value is the ISA arch string
+# (an NTBS). pub so the riscv64 ISA's `BuildAttributes` descriptor names it; the
+# serializer reads the tag number off the descriptor, never the arch id.
+pub val TAG_RISCV_ARCH: u32 = 5;
 
 # ELF program header types and flags.
 val PT_LOAD:    u32 = 1;
@@ -481,6 +501,141 @@ fun write_symbol(buf: *u8, sym_off: usize, str_off: usize, str_pos: *usize,
     bin.write_u64_le(buf, sym_off + 16, img.symbols[idx].size::u64);
 }
 
+# a target's ELF build-attributes: the description of the `.riscv.attributes`-style
+# ISA-string section the ELF writer stamps into objects and executables
+#
+# Supplied by the ISA through `IsaVTable.elf_attributes` so the writer never branches
+# on the arch id - it reads the section name, type, vendor, tag, and arch string off
+# this descriptor and serializes the standard ELF build-attributes container. The
+# same container backs the ARM EABI's `.ARM.attributes`, so only the values here are
+# arch-specific. An arch that emits no attributes wires a nil hook and the section is
+# simply absent.
+# ---
+# section:  the attributes section name (e.g. ".riscv.attributes")
+# sht:      the ELF section type (e.g. SHT_RISCV_ATTRIBUTES)
+# vendor:   the vendor sub-section name (e.g. "riscv")
+# arch_tag: the build-attribute tag carrying the arch string (e.g. TAG_RISCV_ARCH)
+# arch:     the ISA arch string (e.g. "rv64i2p1_m2p0_a2p1_f2p2_d2p2")
+pub rec BuildAttributes {
+    section:  str;
+    sht:      u32;
+    vendor:   str;
+    arch_tag: u32;
+    arch:     str;
+}
+
+# the concrete signature the erased `isa.IsaVTable.elf_attributes` pointer is cast
+# back to before it is called
+#
+# Mirrors `ElfRelocTypeFn`: the hook is stored type-erased (`*u8`) because its return
+# type names `of`/`elf` types the isa-interface layer cannot import without closing a
+# cycle. It returns the arch's process-lifetime `BuildAttributes` descriptor, or nil
+# for an arch that emits no attributes.
+# ---
+# ret: the arch's build-attributes descriptor, or nil when it has none
+pub def ElfAttributesFn: fun() *BuildAttributes;
+
+# the target ISA's ELF build-attributes descriptor, or nil when it emits none
+#
+# Dispatches through the `elf_attributes` hook so the writer reads the description
+# instead of branching on the arch id. A nil ISA, a nil hook, or a hook returning nil
+# all mean "no attributes section", which the writer simply omits.
+# ---
+# tgt_isa: the target ISA vtable supplying the hook
+# ret:     the build-attributes descriptor, or nil
+fun attributes_for(tgt_isa: *isa.IsaVTable) *BuildAttributes {
+    if (tgt_isa == nil)                { ret nil; }
+    if (tgt_isa.elf_attributes == nil) { ret nil; }
+    ret tgt_isa.elf_attributes::ElfAttributesFn();
+}
+
+# the number of bytes the unsigned LEB128 encoding of `value` occupies
+# ---
+# value: the value to measure
+# ret:   the encoded length in bytes (at least 1)
+fun uleb128_size(value: u32) usize {
+    var v: u32 = value;
+    var n: usize = 1;
+    for (v >= 0x80) { v = v >> 7; n = n + 1; }
+    ret n;
+}
+
+# write `value` as an unsigned LEB128 into `buf` at `offset`, returning the bytes
+# written
+# ---
+# buf:    destination buffer
+# offset: byte offset to write at
+# value:  the value to encode
+# ret:    the number of bytes written (== uleb128_size(value))
+fun write_uleb128(buf: *u8, offset: usize, value: u32) usize {
+    var v: u32 = value;
+    var n: usize = 0;
+    var more: bool = true;
+    for (more) {
+        var b: u8 = (v & 0x7F)::u8;
+        v = v >> 7;
+        if (v != 0) { b = b | 0x80; } or { more = false; }
+        buf[offset + n] = b;
+        n = n + 1;
+    }
+    ret n;
+}
+
+# the on-disk byte length of the serialized build-attributes section for `attr`
+#
+# The container is a format-version byte, then one vendor sub-section holding a single
+# `Tag_File` sub-sub-section that carries the lone arch-string attribute. Pairs with
+# `write_build_attributes`, which serializes exactly this many bytes.
+# ---
+# attr: the build-attributes descriptor to measure
+# ret:  the section's byte length
+fun build_attributes_size(attr: *BuildAttributes) usize {
+    # the lone attribute: <arch_tag uleb><arch NTBS>.
+    val attr_data: usize = uleb128_size(attr.arch_tag) + str_len(attr.arch) + 1;
+    # Tag_File sub-sub-section: <tag uleb><u32 length><attribute>; the length covers
+    # the tag, the length field, and the attribute bytes.
+    val file_subsec: usize = uleb128_size(ELF_ATTR_TAG_FILE) + 4 + attr_data;
+    # vendor sub-section: <u32 length><vendor NTBS><Tag_File sub-sub-section>; the
+    # length covers itself, the vendor name, and the sub-sub-section.
+    val vendor_subsec: usize = 4 + (str_len(attr.vendor) + 1) + file_subsec;
+    # the leading format-version byte plus the single vendor sub-section.
+    ret 1 + vendor_subsec;
+}
+
+# serialize the build-attributes section for `attr` into `buf` at `offset`
+#
+# Lays out the ELF build-attributes container the RISC-V psABI (and ARM EABI) define:
+# an 'A' format-version byte, a vendor sub-section, and a `Tag_File` sub-sub-section
+# carrying the single arch-string attribute. Writes exactly `build_attributes_size`
+# bytes.
+# ---
+# buf:    the output buffer
+# offset: byte offset to serialize at
+# attr:   the build-attributes descriptor to serialize
+fun write_build_attributes(buf: *u8, offset: usize, attr: *BuildAttributes) {
+    var p: usize = offset;
+    buf[p] = ELF_ATTR_VERSION_A;
+    p = p + 1;
+
+    val attr_data:     usize = uleb128_size(attr.arch_tag) + str_len(attr.arch) + 1;
+    val file_subsec:   usize = uleb128_size(ELF_ATTR_TAG_FILE) + 4 + attr_data;
+    val vendor_subsec: usize = 4 + (str_len(attr.vendor) + 1) + file_subsec;
+
+    # vendor sub-section: <u32 length><vendor NTBS><Tag_File sub-sub-section>.
+    bin.write_u32_le(buf, p, vendor_subsec::u32);
+    p = p + 4;
+    p = p + bin.write_str(buf, p, attr.vendor);
+
+    # Tag_File sub-sub-section: <tag uleb><u32 length><attribute>.
+    p = p + write_uleb128(buf, p, ELF_ATTR_TAG_FILE);
+    bin.write_u32_le(buf, p, file_subsec::u32);
+    p = p + 4;
+
+    # the lone attribute: <arch_tag uleb><arch NTBS>.
+    p = p + write_uleb128(buf, p, attr.arch_tag);
+    bin.write_str(buf, p, attr.arch);
+}
+
 # serialize an ObjectImage to a relocatable ELF64 .o file
 #
 # The format-writer entry installed in the ELF `of.OfVTable`. Lays out section
@@ -511,12 +666,21 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
     val vrk: R.Result[bool, str] = validate_reloc_kinds(img, tgt_isa);
     if (R.is_err[bool, str](vrk)) { ret R.err[bool, str](R.unwrap_err[bool, str](vrk)); }
 
+    # the ELF build-attributes section (the ISA-string `.riscv.attributes` on riscv)
+    # is appended after the regular sections, the symtab/strtab/shstrtab, and the rela
+    # tables, so it never perturbs their indices. nil for an arch that emits none.
+    val attr: *BuildAttributes = attributes_for(tgt_isa);
+    var attr_size: usize = 0;
+    if (attr != nil) { attr_size = build_attributes_size(attr); }
+
     val num_secs:      u32 = img.section_count;
     val num_syms:      u32 = img.symbol_count;
     val num_rela_secs: u32 = sections_with_relocs(img);
 
-    # 1 null + sections + .symtab + .strtab + .shstrtab + per-rela sections
-    val total_shdr: u32 = 1 + num_secs + 3 + num_rela_secs;
+    # 1 null + sections + .symtab + .strtab + .shstrtab + per-rela sections, plus the
+    # build-attributes section when the ISA emits one
+    var total_shdr: u32 = 1 + num_secs + 3 + num_rela_secs;
+    if (attr != nil) { total_shdr = total_shdr + 1; }
     # e_shnum is a u16 and 0xFF00 (SHN_LORESERVE) up are reserved indices, so the
     # real section-header count must stay below 0xFF00. real ELF escapes a larger
     # count through section[0].sh_size; that is not implemented here, so reject a
@@ -535,6 +699,7 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
         s = s + 1;
     }
     shstrtab_cap = shstrtab_cap + 8 + 8 + 10;
+    if (attr != nil) { shstrtab_cap = shstrtab_cap + str_len(attr.section) + 1; }
     s = 0;
     for (s < num_secs) {
         if (count_relocs_for_section(img, s) > 0) {
@@ -576,6 +741,11 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
     shstrtab_off = shstrtab_off + bin.write_str(shstrtab, shstrtab_off, ".strtab");
     val shstrtab_name_off: u32 = shstrtab_off::u32;
     shstrtab_off = shstrtab_off + bin.write_str(shstrtab, shstrtab_off, ".shstrtab");
+    var attr_name_off: u32 = 0;
+    if (attr != nil) {
+        attr_name_off = shstrtab_off::u32;
+        shstrtab_off = shstrtab_off + bin.write_str(shstrtab, shstrtab_off, attr.section);
+    }
 
     s = 0;
     for (s < num_secs) {
@@ -630,6 +800,14 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
             rela_offset = rela_offset + rc::usize * RELA_SIZE;
         }
         s = s + 1;
+    }
+
+    # the build-attributes section data sits after the rela tables and before the
+    # section-header table; it is non-alloc metadata with byte alignment.
+    var attr_offset: usize = 0;
+    if (attr != nil) {
+        attr_offset = rela_offset;
+        rela_offset = rela_offset + attr_size;
     }
 
     val shdr_offset: usize = bin.align_up(rela_offset, 8);
@@ -760,7 +938,11 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
         s = s + 1;
     }
 
-    # section-header table: null, sections, .symtab, .strtab, .shstrtab, relas.
+    # the build-attributes section data, after the rela tables.
+    if (attr != nil) { write_build_attributes(buf, attr_offset, attr); }
+
+    # section-header table: null, sections, .symtab, .strtab, .shstrtab, relas, then
+    # the build-attributes section last (so the indices above stay fixed).
     var shdr_pos: usize = shdr_offset;
     memory.raw_zero((buf::usize + shdr_pos)::ptr, SHDR_SIZE);
     shdr_pos = shdr_pos + SHDR_SIZE;
@@ -852,6 +1034,22 @@ fun emit_object(tgt_isa: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resu
         s = s + 1;
     }
 
+    # the build-attributes section header: non-alloc (zero flags), byte-aligned, no
+    # link/info; its type comes from the descriptor, never the arch id.
+    if (attr != nil) {
+        bin.write_u32_le(buf, shdr_pos, attr_name_off);
+        bin.write_u32_le(buf, shdr_pos + 4, attr.sht);
+        bin.write_u64_le(buf, shdr_pos + 8, 0);
+        bin.write_u64_le(buf, shdr_pos + 16, 0);
+        bin.write_u64_le(buf, shdr_pos + 24, attr_offset::u64);
+        bin.write_u64_le(buf, shdr_pos + 32, attr_size::u64);
+        bin.write_u32_le(buf, shdr_pos + 40, 0);
+        bin.write_u32_le(buf, shdr_pos + 44, 0);
+        bin.write_u64_le(buf, shdr_pos + 48, 1);
+        bin.write_u64_le(buf, shdr_pos + 56, 0);
+        shdr_pos = shdr_pos + SHDR_SIZE;
+    }
+
     if (sym_remap != nil) { A.deallocate[u32](alloc, sym_remap, num_syms::usize); }
 
     val res_file: R.Result[filesystem.File, str] = filesystem.create(path, 0o644);
@@ -921,6 +1119,35 @@ fun pf_flags_for(flags: u32) u32 {
     ret f;
 }
 
+# the conventional ELF section name for a load segment's permissions
+#
+# Used when the static-exe writer synthesizes a section-header table alongside the
+# build-attributes section so external tools name and disassemble the segments. The
+# neutral `LoadSegment` carries no section identity, so it is derived from the
+# permission bits: executable is `.text`, writable `.data`, read-only `.rodata`.
+# ---
+# flags: the segment's SEG_FLAG_* permission bits
+# ret:   the conventional section name for those permissions
+fun seg_section_name(flags: u32) str {
+    if ((flags & of.SEG_FLAG_EXECUTE) != 0) { ret ".text"; }
+    if ((flags & of.SEG_FLAG_WRITE) != 0)   { ret ".data"; }
+    ret ".rodata";
+}
+
+# the ELF section flags (SHF_*) for a load segment's permissions
+#
+# The section-header analogue of `pf_flags_for`: every loadable segment is SHF_ALLOC,
+# plus SHF_EXECINSTR / SHF_WRITE as its permissions imply.
+# ---
+# flags: the segment's SEG_FLAG_* permission bits
+# ret:   the SHF_* flag set for those permissions
+fun seg_section_flags(flags: u32) u64 {
+    var f: u64 = SHF_ALLOC;
+    if ((flags & of.SEG_FLAG_EXECUTE) != 0) { f = f | SHF_EXECINSTR; }
+    if ((flags & of.SEG_FLAG_WRITE) != 0)   { f = f | SHF_WRITE; }
+    ret f;
+}
+
 # write a static ET_EXEC executable, installed in the ELF `of.OfVTable` as its
 # `of.ExecFn`
 #
@@ -951,6 +1178,12 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
     if (tgt_isa == nil) { ret R.err[bool, str]("elf: nil exec isa"); }
     if (path == nil)    { ret R.err[bool, str]("elf: nil exec path"); }
 
+    # the ELF build-attributes section (the ISA-string `.riscv.attributes` on riscv)
+    # the ISA describes, framed in its own minimal section-header table after the load
+    # segments. nil for an arch that emits none, which leaves the static exe
+    # section-header-less exactly as before.
+    val attr: *BuildAttributes = attributes_for(tgt_isa);
+
     val phdr_count: u32 = seg_count + 1;
     val phdr_offset: usize = ELF_HEADER_SIZE;
     val phdr_table_size: usize = phdr_count::usize * PHDR_SIZE;
@@ -973,6 +1206,45 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
         li = li + 1;
     }
 
+    # when the ISA emits build attributes, frame the load segments with a section
+    # header table so external tools both read the ISA string and disassemble the
+    # code: one PROGBITS section per load segment (named by its permissions), then the
+    # non-alloc build-attributes section, then the section-name string table. all of
+    # this trails the segments outside every PT_LOAD, so the loader ignores it and the
+    # runtime image is unchanged. an arch with no attributes stays section-header-less.
+    var attr_off:       usize = 0;
+    var attr_sz:        usize = 0;
+    var shstr_off:      usize = 0;
+    var shstr_sz:       usize = 0;
+    var attr_name_rel:  usize = 0;
+    var shstr_name_rel: usize = 0;
+    var shdr_off:       usize = 0;
+    if (attr != nil) {
+        attr_sz    = build_attributes_size(attr);
+        attr_off   = total_size;
+        total_size = total_size + attr_sz;
+
+        # .shstrtab: leading nul, one name per load segment, the attributes section
+        # name, then ".shstrtab". the per-segment name offsets are recomputed in the
+        # header-write pass, which walks the segments in the same order.
+        shstr_off = total_size;
+        shstr_sz  = 1;
+        li = 0;
+        for (li < seg_count) {
+            shstr_sz = shstr_sz + str_len(seg_section_name(segs[li].flags)) + 1;
+            li = li + 1;
+        }
+        attr_name_rel = shstr_sz;
+        shstr_sz = shstr_sz + str_len(attr.section) + 1;
+        shstr_name_rel = shstr_sz;
+        shstr_sz = shstr_sz + str_len(".shstrtab") + 1;
+        total_size = total_size + shstr_sz;
+
+        shdr_off   = bin.align_up(total_size, 8);
+        # the section-header table: null + one per segment + attributes + .shstrtab.
+        total_size = shdr_off + SHDR_SIZE * (seg_count + 3)::usize;
+    }
+
     val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_size);
     if (R.is_err[*u8, str](res_buf)) {
         if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
@@ -991,14 +1263,21 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
     bin.write_u32_le(buf, 20, 1);
     bin.write_u64_le(buf, 24, entry);
     bin.write_u64_le(buf, 32, phdr_offset::u64);
-    bin.write_u64_le(buf, 40, 0);
+    if (attr != nil) { bin.write_u64_le(buf, 40, shdr_off::u64); } or { bin.write_u64_le(buf, 40, 0); }
     bin.write_u32_le(buf, 48, 0);
     bin.write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
     bin.write_u16_le(buf, 54, PHDR_SIZE::u16);
     bin.write_u16_le(buf, 56, phdr_count::u16);
     bin.write_u16_le(buf, 58, SHDR_SIZE::u16);
-    bin.write_u16_le(buf, 60, 0);
-    bin.write_u16_le(buf, 62, 0);
+    if (attr != nil) {
+        # the section-header table is null + one per segment + attributes + .shstrtab;
+        # .shstrtab (the section-name string table) is the last section.
+        bin.write_u16_le(buf, 60, (seg_count + 3)::u16);
+        bin.write_u16_le(buf, 62, (seg_count + 2)::u16);
+    } or {
+        bin.write_u16_le(buf, 60, 0);
+        bin.write_u16_le(buf, 62, 0);
+    }
 
     var phdr_pos: usize = phdr_offset;
 
@@ -1032,6 +1311,71 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
             memory.raw_copy((buf::usize + seg_offsets[li])::ptr, segs[li].bytes::ptr, segs[li].filesz);
         }
         li = li + 1;
+    }
+
+    # the build-attributes section data, its name string table, and the section
+    # headers, all after the load segments and outside every PT_LOAD.
+    if (attr != nil) {
+        write_build_attributes(buf, attr_off, attr);
+
+        # .shstrtab: leading nul, one name per load segment, the attributes section
+        # name, then ".shstrtab".
+        buf[shstr_off] = 0;
+        var np: usize = 1;
+        li = 0;
+        for (li < seg_count) {
+            np = np + bin.write_str(buf, shstr_off + np, seg_section_name(segs[li].flags));
+            li = li + 1;
+        }
+        np = np + bin.write_str(buf, shstr_off + np, attr.section);
+        bin.write_str(buf, shstr_off + np, ".shstrtab");
+
+        # section headers: [0] reserved null (already zeroed by the zalloc), [1..N] a
+        # PROGBITS section per load segment, then the attributes section, then
+        # .shstrtab. each segment section maps the segment's file bytes at its vaddr so
+        # external tools disassemble the code; its name offset walks the same order the
+        # names were written above.
+        var hp: usize = shdr_off + SHDR_SIZE;
+        var name_cursor: usize = 1;
+        li = 0;
+        for (li < seg_count) {
+            bin.write_u32_le(buf, hp, name_cursor::u32);
+            bin.write_u32_le(buf, hp + 4, SHT_PROGBITS);
+            bin.write_u64_le(buf, hp + 8, seg_section_flags(segs[li].flags));
+            bin.write_u64_le(buf, hp + 16, segs[li].vaddr);
+            bin.write_u64_le(buf, hp + 24, seg_offsets[li]::u64);
+            bin.write_u64_le(buf, hp + 32, segs[li].filesz::u64);
+            bin.write_u32_le(buf, hp + 40, 0);
+            bin.write_u32_le(buf, hp + 44, 0);
+            bin.write_u64_le(buf, hp + 48, EXEC_PAGE_SIZE);
+            bin.write_u64_le(buf, hp + 56, 0);
+            hp = hp + SHDR_SIZE;
+            name_cursor = name_cursor + str_len(seg_section_name(segs[li].flags)) + 1;
+            li = li + 1;
+        }
+
+        bin.write_u32_le(buf, hp, attr_name_rel::u32);
+        bin.write_u32_le(buf, hp + 4, attr.sht);
+        bin.write_u64_le(buf, hp + 8, 0);
+        bin.write_u64_le(buf, hp + 16, 0);
+        bin.write_u64_le(buf, hp + 24, attr_off::u64);
+        bin.write_u64_le(buf, hp + 32, attr_sz::u64);
+        bin.write_u32_le(buf, hp + 40, 0);
+        bin.write_u32_le(buf, hp + 44, 0);
+        bin.write_u64_le(buf, hp + 48, 1);
+        bin.write_u64_le(buf, hp + 56, 0);
+        hp = hp + SHDR_SIZE;
+
+        bin.write_u32_le(buf, hp, shstr_name_rel::u32);
+        bin.write_u32_le(buf, hp + 4, SHT_STRTAB);
+        bin.write_u64_le(buf, hp + 8, 0);
+        bin.write_u64_le(buf, hp + 16, 0);
+        bin.write_u64_le(buf, hp + 24, shstr_off::u64);
+        bin.write_u64_le(buf, hp + 32, shstr_sz::u64);
+        bin.write_u32_le(buf, hp + 40, 0);
+        bin.write_u32_le(buf, hp + 44, 0);
+        bin.write_u64_le(buf, hp + 48, 1);
+        bin.write_u64_le(buf, hp + 56, 0);
     }
 
     if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
@@ -2211,6 +2555,21 @@ fun t_riscv_elf_reloc_type(kind: of.RelocKind) u32 {
     ret 0;
 }
 
+# a test-only riscv64 build-attributes descriptor, returned by `t_riscv_attributes`
+# and wired onto a test `IsaVTable.elf_attributes` so the attributes emit test can
+# assert the writer stamps a `.riscv.attributes` section. process-static so the hook
+# can return a borrowed pointer; the test fills it before emitting.
+var t_riscv_attrs: BuildAttributes;
+
+# the test `elf_attributes` hook, mirroring how the production descriptor is wired in
+# target/isa/riscv64/register.mach, duplicated here for the same import-cycle reason as
+# t_riscv_elf_reloc_type.
+# ---
+# ret: the test build-attributes descriptor
+fun t_riscv_attributes() *BuildAttributes {
+    ret ?t_riscv_attrs;
+}
+
 # emit_object must reject a relocation naming a symbol absent from the image
 # symbol table (a back-end invariant violation, #1196) rather than silently
 # aliasing the reserved undefined entry (index 0).
@@ -2611,5 +2970,132 @@ test "mach.lang.target.of.elf.parse_object:truncated" {
     val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, ELF_HEADER_SIZE, ?out);
     if (!R.is_err[bool, str](pr))                                    { ret 1; }
     if (!str_contains(R.unwrap_err[bool, str](pr), "out of bounds")) { ret 1; }
+    ret 0;
+}
+
+# the build-attributes serializer lays out the ELF attributes container the RISC-V
+# psABI defines: a format-version 'A' byte, a vendor sub-section, and a Tag_File
+# sub-sub-section carrying the single Tag_RISCV_arch (5) arch string. this pins the
+# whole byte layout - both u32 length fields, the uleb tags, and the NTBS values - so
+# a malformed container that tools silently ignore is caught (#1673).
+test "mach.lang.target.of.elf.write_build_attributes:riscv_arch_layout" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var attr: BuildAttributes;
+    attr.section  = ".riscv.attributes";
+    attr.sht      = SHT_RISCV_ATTRIBUTES;
+    attr.vendor   = "riscv";
+    attr.arch_tag = TAG_RISCV_ARCH;
+    attr.arch     = "rv64i2p0";
+
+    # 'A'(1) + [vendor-len(4) + "riscv\0"(6) + Tag_File(1) + file-len(4) + arch-tag(1)
+    # + "rv64i2p0\0"(9)] = 1 + 25 = 26; the inner Tag_File sub-sub-section is 15.
+    val sz: usize = build_attributes_size(?attr);
+    if (sz != 26) { ret 1; }
+
+    val rb: R.Result[*u8, str] = A.zallocate[u8](?alloc, sz);
+    if (R.is_err[*u8, str](rb)) { ret 1; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+    write_build_attributes(buf, 0, ?attr);
+
+    var bad: bool = false;
+    if (buf[0] != ELF_ATTR_VERSION_A)      { bad = true; }
+    if (bin.read_u32_le(buf, 1) != 25)     { bad = true; }
+    val rv: R.Result[str, str] = bin.cstr_at(buf, sz, 5);
+    if (R.is_err[str, str](rv))                          { bad = true; }
+    or (!str_equals(R.unwrap_ok[str, str](rv), "riscv")) { bad = true; }
+    if (buf[11]::u32 != ELF_ATTR_TAG_FILE) { bad = true; }
+    if (bin.read_u32_le(buf, 12) != 15)    { bad = true; }
+    if (buf[16]::u32 != TAG_RISCV_ARCH)    { bad = true; }
+    val ra: R.Result[str, str] = bin.cstr_at(buf, sz, 17);
+    if (R.is_err[str, str](ra))                             { bad = true; }
+    or (!str_equals(R.unwrap_ok[str, str](ra), "rv64i2p0")) { bad = true; }
+
+    A.deallocate[u8](?alloc, buf, sz);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+# emit_object stamps a `.riscv.attributes` section for an ISA that wires the
+# `elf_attributes` hook (#1673): the emitted object carries a SHT_RISCV_ATTRIBUTES
+# section whose single Tag_RISCV_arch attribute decodes back to the ISA arch string,
+# so external tools read the full instruction set with no manual `--mattr`.
+test "mach.lang.target.of.elf.emit_object:riscv_attributes_section" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var of_reg: of.OfRegistry = of.registry_init();
+    if (R.is_err[bool, str](register(?of_reg))) { ret 1; }
+
+    t_riscv_attrs.section  = ".riscv.attributes";
+    t_riscv_attrs.sht      = SHT_RISCV_ATTRIBUTES;
+    t_riscv_attrs.vendor   = "riscv";
+    t_riscv_attrs.arch_tag = TAG_RISCV_ARCH;
+    t_riscv_attrs.arch     = "rv64i2p0_m2p0";
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id             = isa.ARCH_RISCV64;
+    isa_vt.elf_machine    = EM_RISCV::u32;
+    isa_vt.pointer_width  = 8;
+    isa_vt.elf_reloc_type = t_riscv_elf_reloc_type::*u8;
+    isa_vt.elf_attributes = t_riscv_attributes::*u8;
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x13; k = k + 1; }  # riscv nop pattern
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
+
+    var syms: [1]of.Symbol;
+    syms[0].name = t_intern(?i, "g"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 1;
+    img.relocations = nil; img.reloc_count = 0;
+
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "elf_attr");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val tpath: str = filesystem.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { filesystem.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tpath);
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_err[filesystem.Buffer, str](rb)) { ret 1; }
+    val buf: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rb);
+
+    # walk the section-header table for the SHT_RISCV_ATTRIBUTES section.
+    val e_shoff:     usize = bin.read_u64_le(buf.data, 40)::usize;
+    val e_shentsize: usize = bin.read_u16_le(buf.data, 58)::usize;
+    val e_shnum:     usize = bin.read_u16_le(buf.data, 60)::usize;
+    var attr_off: usize = 0;
+    var sh: usize = 0;
+    for (sh < e_shnum) {
+        val so: usize = e_shoff + sh * e_shentsize;
+        if (bin.read_u32_le(buf.data, so + 4) == SHT_RISCV_ATTRIBUTES) {
+            attr_off = bin.read_u64_le(buf.data, so + 24)::usize;
+        }
+        sh = sh + 1;
+    }
+    if (attr_off == 0) { ret 1; }
+
+    # the section opens with 'A'; the arch NTBS follows the version, the vendor
+    # sub-section length, "riscv\0", Tag_File, the file length, and the arch tag - 17
+    # bytes in for this vendor and single-byte tags, the layout the serializer test pins.
+    if (buf.data[attr_off] != ELF_ATTR_VERSION_A) { ret 1; }
+    val ra: R.Result[str, str] = bin.cstr_at(buf.data, buf.len, attr_off + 17);
+    if (R.is_err[str, str](ra)) { ret 1; }
+    if (!str_equals(R.unwrap_ok[str, str](ra), "rv64i2p0_m2p0")) { ret 1; }
     ret 0;
 }
