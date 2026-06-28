@@ -789,7 +789,7 @@ updated to its windows-complete release. The native lane passes 468/468.
   page-walk (mach links no runtime) when the target OS commits incrementally — a
   new `OsVTable.stack_probe` flag (true on Windows, false on Linux/Darwin) gated
   by the OS `page_size`. This was the root cause of the native-Windows exec
-  failures in octalide/mach-std#262 (a 32 KiB `spawn_redirected` cmdline frame)
+  failures in briar-systems/mach-std#262 (a 32 KiB `spawn_redirected` cmdline frame)
   (#1395).
 - PE import call-thunks for the **last** import descriptor jumped through the
   previous descriptor's null IAT slot (a `jmp 0` access violation on the first

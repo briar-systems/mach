@@ -6,7 +6,7 @@
 
 $ErrorActionPreference = 'Stop'
 
-$base = if ($env:MACH_BASE_URL) { $env:MACH_BASE_URL } else { 'https://github.com/octalide/mach/releases' }
+$base = if ($env:MACH_BASE_URL) { $env:MACH_BASE_URL } else { 'https://github.com/briar-systems/mach/releases' }
 $target = 'x86_64-windows'
 
 if (-not [System.Environment]::Is64BitOperatingSystem) {

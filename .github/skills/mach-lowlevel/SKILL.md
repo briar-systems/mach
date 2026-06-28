@@ -23,7 +23,7 @@ asm <isa> {
 Locked rules:
 
 - The ISA tag is **mandatory**. Bare `asm { ... }` does not exist.
-- ISA tags are a closed set: `x86_64`, `aarch64`. **Only `x86_64` has a working backend today**; `aarch64` is a recognized tag for portable target-conditional source but has no code generator yet ([#1045](https://github.com/octalide/mach/issues/1045)). An `asm aarch64` block is therefore valid only inside a branch that gets comptime-discarded on an `x86_64` build.
+- ISA tags are a closed set: `x86_64`, `aarch64`. **Only `x86_64` has a working backend today**; `aarch64` is a recognized tag for portable target-conditional source but has no code generator yet ([#1045](https://github.com/briar-systems/mach/issues/1045)). An `asm aarch64` block is therefore valid only inside a branch that gets comptime-discarded on an `x86_64` build.
 - Body is **unquoted raw lines**, one instruction per line, in the ISA's native syntax. No surrounding quotes, no string concatenation. (Mach has no multi-line string; the `asm` body is not a string.)
 - `#` introduces a line comment.
 
@@ -124,7 +124,7 @@ Vector types follow `<u|i|f><width>x<count>`: `f32x4`, `i32x8`, `u8x16`. Higher 
 ## Reference
 
 The authoritative low-level reference lives in the Mach repository under
-[`doc/language/`](https://github.com/octalide/mach/tree/dev/doc/language) —
+[`doc/language/`](https://github.com/briar-systems/mach/tree/dev/doc/language) —
 `asm.md` (the `asm` form, operand substitution, inferred clobbers, multi-arch
 dispatch), `comptime-control.md` (`$if`/`$or` over `$mach.build.arch`), and
 `policy.md` (the full compiler-vs-stdlib boundary). When a skill and the

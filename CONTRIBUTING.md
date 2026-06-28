@@ -14,14 +14,14 @@ Be respectful, constructive, and professional. Treat Mach like a passion project
 
 ### Prerequisites
 - Git
-- An existing `mach` binary — Mach is self-hosting, so building from source needs one. Install the latest [release](https://github.com/octalide/mach/releases).
+- An existing `mach` binary — Mach is self-hosting, so building from source needs one. Install the latest [release](https://github.com/briar-systems/mach/releases).
 
 ### Building
 
 Mach builds its own source with an existing `mach`:
 
 ```bash
-git clone https://github.com/octalide/mach.git
+git clone https://github.com/briar-systems/mach.git
 cd mach
 mach dep pull
 mach build .
@@ -131,9 +131,9 @@ mach/
 └── mach.toml          # project configuration
 ```
 
-The standard library lives in a separate repository ([mach-std](https://github.com/octalide/mach-std)) and is realized into `dep/mach-std/` by `mach dep pull` from the pin in `mach.toml`. The dep is currently frozen at an immutable `commit/<sha>` (the v1.7 self-host seed freeze, [#1486](https://github.com/octalide/mach/issues/1486)); it reverts to `branch/main` after the post-v1.7 re-seed.
+The standard library lives in a separate repository ([mach-std](https://github.com/briar-systems/mach-std)) and is realized into `dep/mach-std/` by `mach dep pull` from the pin in `mach.toml`. The dep is currently frozen at an immutable `commit/<sha>` (the v1.7 self-host seed freeze, [#1486](https://github.com/briar-systems/mach/issues/1486)); it reverts to `branch/main` after the post-v1.7 re-seed.
 
-Building from source uses an existing `mach` (the latest release) — see [Getting Started](#getting-started). The original bootstrap seed ([mach-boot](https://github.com/octalide/mach-boot)) is no longer part of the build; it remains only as a from-scratch cold-start hatch.
+Building from source uses an existing `mach` (the latest release) — see [Getting Started](#getting-started). The original bootstrap seed ([mach-boot](https://github.com/briar-systems/mach-boot)) is no longer part of the build; it remains only as a from-scratch cold-start hatch.
 
 ---
 

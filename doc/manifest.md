@@ -61,7 +61,7 @@ emit_ir  = true            # emit per-module IR for this profile (default false)
 emit_asm = false           # emit per-module assembly for this profile (default false)
 
 [deps.mach-std]            # a dependency: exactly one of git|path, plus ref for git
-git = "https://github.com/octalide/mach-std"
+git = "https://github.com/briar-systems/mach-std"
 ref = "v0.4.0"
 ```
 
@@ -336,7 +336,7 @@ libs = ["kernel32.dll"]  # the windows platform link requirement
 entry = "main.mach"      # entry module mach.main, at src/main.mach
 
 [deps.mach-std]
-git = "https://github.com/octalide/mach-std"
+git = "https://github.com/briar-systems/mach-std"
 ref = "branch/dev"
 ```
 
