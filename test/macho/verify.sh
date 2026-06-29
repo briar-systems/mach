@@ -202,12 +202,124 @@ verify_filename_independent() {
     echo "verified $target signed image is identical regardless of the -o name"
 }
 
-rm -rf out dynamic/out
-verify_static  darwin-x86_64  x86_64 x86_THREAD_STATE64 SIGNED
-verify_static  darwin-aarch64 arm64  ARM_THREAD_STATE64 PAGE21 PAGOF12 BR26
-verify_dynamic darwin-x86_64  x86_64
-verify_dynamic darwin-aarch64 arm64
+# verify_pie <target> <machine> <reloc>...
+#
+# cross-compiles the static fixture for a target whose main executables must be
+# position-independent (arm64 Darwin: the Apple Silicon kernel refuses a non-PIE
+# image), so the linker routes it through the dynamic/PIE writer even with no shared
+# dependency. checks the relocatable object, then the PIE executable shape: MH_PIE,
+# an LC_MAIN entry, LC_LOAD_DYLINKER, LC_BUILD_VERSION, LC_UUID, and no LC_UNIXTHREAD.
+verify_pie() {
+    local target="$1" machine="$2"; shift 2
+    local exe="out/$target/machoprobe"
+
+    echo "cross-compiling PIE fixture for $target with $mach"
+    "$mach" build . --target "$target" --profile debug
+    local obj
+    obj="$(find "out/$target/obj" -name '*.o' -print -quit)"
+    [ -n "$obj" ] || fail "$target: no object emitted"
+
+    echo "verifying $target object $obj"
+    file "$obj" | grep -q "Mach-O 64-bit $machine object" || fail "$target: object is not a Mach-O $machine object"
+    "$objdump" --macho -t "$obj" | grep -qw 'start'       || fail "$target: object missing the 'start' entry symbol"
+
+    local dis
+    dis="$("$objdump" --macho -d "$obj")"
+    if echo "$dis" | grep -qi 'unknown'; then fail "$target: object disassembly has an unknown instruction"; fi
+
+    local rel
+    rel="$("$objdump" --macho -r "$obj")"
+    local r
+    for r in "$@"; do
+        echo "$rel" | grep -q "$r" || fail "$target: expected relocation '$r' not emitted"
+    done
+
+    echo "verifying $target PIE executable $exe"
+    file "$exe" | grep -q "Mach-O 64-bit $machine executable" || fail "$target: not a Mach-O $machine executable"
+    file "$exe" | grep -q 'PIE'                               || fail "$target: executable is not MH_PIE"
+    local lc
+    lc="$("$otool" -l "$exe")"
+    echo "$lc" | grep -q '__PAGEZERO'       || fail "$target: PIE exe missing __PAGEZERO"
+    echo "$lc" | grep -q '__TEXT'           || fail "$target: PIE exe missing __TEXT segment"
+    echo "$lc" | grep -q '__LINKEDIT'       || fail "$target: PIE exe missing __LINKEDIT segment"
+    echo "$lc" | grep -q 'LC_MAIN'          || fail "$target: PIE exe missing LC_MAIN entry"
+    echo "$lc" | grep -q 'LC_LOAD_DYLINKER' || fail "$target: PIE exe missing LC_LOAD_DYLINKER"
+    echo "$lc" | grep -q '/usr/lib/dyld'    || fail "$target: PIE exe dylinker is not /usr/lib/dyld"
+    echo "$lc" | grep -q 'LC_BUILD_VERSION' || fail "$target: PIE exe missing LC_BUILD_VERSION"
+    echo "$lc" | grep -q 'LC_UUID'          || fail "$target: PIE exe missing LC_UUID"
+    echo "$lc" | grep -q 'LC_DYLD_INFO'     || fail "$target: PIE exe missing LC_DYLD_INFO"
+    if echo "$lc" | grep -q 'LC_UNIXTHREAD'; then fail "$target: PIE exe must not carry LC_UNIXTHREAD"; fi
+
+    verify_codesig "$target" "$exe"
+}
+
+# verify_pie_dynamic <target> <machine>
+#
+# cross-compiles the dynamic fixture for a PIE target: it carries a libprobe.dylib
+# dependency and a `probe_add` import, so the PIE writer must combine the rebase/bind
+# dyld-info streams - MH_PIE + LC_MAIN with a real LC_LOAD_DYLIB, bind record, and
+# import stub.
+verify_pie_dynamic() {
+    local target="$1" machine="$2"
+    local exe="dynamic/out/$target/machodyn"
+
+    echo "cross-compiling dynamic PIE fixture for $target with $mach"
+    "$mach" build dynamic --target "$target" --profile debug
+
+    echo "verifying $target dynamic PIE executable $exe"
+    file "$exe" | grep -q "Mach-O 64-bit $machine executable" || fail "$target: not a Mach-O $machine executable"
+    file "$exe" | grep -q 'PIE'                               || fail "$target: dyn PIE exe is not MH_PIE"
+
+    local lc
+    lc="$("$otool" -l "$exe")"
+    echo "$lc" | grep -q 'LC_MAIN'           || fail "$target: dyn PIE exe missing LC_MAIN"
+    echo "$lc" | grep -q 'LC_BUILD_VERSION'  || fail "$target: dyn PIE exe missing LC_BUILD_VERSION"
+    echo "$lc" | grep -q 'LC_DYLD_INFO'      || fail "$target: dyn PIE exe missing LC_DYLD_INFO"
+    echo "$lc" | grep -q 'LC_LOAD_DYLINKER'  || fail "$target: dyn PIE exe missing LC_LOAD_DYLINKER"
+    echo "$lc" | grep -q 'LC_LOAD_DYLIB'     || fail "$target: dyn PIE exe missing LC_LOAD_DYLIB"
+    if echo "$lc" | grep -q 'LC_UNIXTHREAD'; then fail "$target: dyn PIE exe must not carry LC_UNIXTHREAD"; fi
+
+    "$otool" -L "$exe" | grep -q 'libprobe.dylib' || fail "$target: dyn PIE exe does not link libprobe.dylib"
+    "$objdump" --macho -t "$exe"     | grep -q 'probe_add' || fail "$target: dyn PIE exe missing the probe_add import symbol"
+    "$objdump" --macho --bind "$exe" | grep -q 'probe_add' || fail "$target: dyn PIE exe has no bind record for probe_add"
+    "$otool" -l "$exe" | grep -q '__stubs' || fail "$target: dyn PIE exe missing the __stubs section"
+
+    verify_codesig "$target" "$exe"
+}
+
+# verify_rebase <target>
+#
+# cross-compiles the rebase fixture (globals initialized to the address of other
+# globals, so __DATA holds absolute pointers) for a PIE target and asserts the
+# emitted LC_DYLD_INFO rebase stream names the __DATA pointer slots and resolves to
+# the right addresses (llvm-objdump --rebase decodes the opcode stream).
+verify_rebase() {
+    local target="$1"
+    local exe="rebase/out/$target/machorebase"
+
+    echo "cross-compiling rebase fixture for $target with $mach"
+    "$mach" build rebase --target "$target" --profile debug
+
+    echo "verifying $target rebase stream in $exe"
+    file "$exe" | grep -q 'PIE' || fail "$target: rebase exe is not MH_PIE"
+    local rb
+    rb="$("$objdump" --macho --rebase "$exe")"
+    echo "$rb" | grep -q '__DATA' || fail "$target: rebase table has no __DATA entries"
+    local n
+    n="$(echo "$rb" | grep -c 'pointer')"
+    [ "$n" -ge 2 ] || fail "$target: expected at least 2 rebased pointers, got $n"
+
+    verify_codesig "$target" "$exe"
+}
+
+rm -rf out dynamic/out rebase/out
+verify_static      darwin-x86_64  x86_64 x86_THREAD_STATE64 SIGNED
+verify_pie         darwin-aarch64 arm64  PAGE21 PAGOF12 BR26
+verify_dynamic     darwin-x86_64  x86_64
+verify_pie_dynamic darwin-aarch64 arm64
+verify_rebase      darwin-aarch64
 verify_filename_independent .       darwin-aarch64
 verify_filename_independent dynamic darwin-aarch64
+verify_filename_independent rebase  darwin-aarch64
 
-echo "OK: Mach-O emits correct objects and ad-hoc-signed static + dynamic executables for both Darwin triples"
+echo "OK: Mach-O emits correct objects, x86_64 static/dynamic execs, and arm64 PIE execs (LC_MAIN + rebase) for both Darwin triples"
