@@ -46,6 +46,7 @@ use std.crypto.hash.sha256;
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
+use sort: std.collections.sort;
 
 use mach.lang.intern;
 use mach.lang.target.isa;
@@ -87,6 +88,32 @@ val LC_LOAD_DYLINKER: u32 = 0xE;
 val LC_DYLD_INFO_ONLY: u32 = 0x80000022;
 # points at the embedded code signature in __LINKEDIT.
 val LC_CODE_SIGNATURE: u32 = 0x1D;
+# the modern main-executable entry: a file-offset entry point dyld jumps to (with
+# a load bias), replacing the absolute-pc LC_UNIXTHREAD thread state for PIE images.
+val LC_MAIN:          u32 = 0x80000028;
+# names the target platform and minimum OS; dyld validates it on Apple Silicon.
+val LC_BUILD_VERSION: u32 = 0x32;
+# the image's 128-bit identifier, required in a modern signed main executable.
+val LC_UUID:          u32 = 0x1B;
+
+# fixed sizes for the PIE load commands.
+val ENTRY_POINT_CMD_SIZE:   usize = 24;   # cmd + cmdsize + entryoff + stacksize
+val BUILD_VERSION_CMD_SIZE: usize = 24;   # cmd + cmdsize + platform + minos + sdk + ntools(0)
+val UUID_CMD_SIZE:          usize = 24;   # cmd + cmdsize + 16-byte uuid
+
+# LC_BUILD_VERSION platform id for macOS, and the minimum-OS / SDK version it names
+# (11.0.0, packed as 0x00xxyyzz = xx.yy.zz) - the first macOS to ship Apple Silicon.
+val PLATFORM_MACOS: u32 = 1;
+val MACOS_MIN_VERSION: u32 = 0x000B0000;
+
+# MH_PIE marks a position-independent main executable: dyld may load it at a random
+# bias, and the loader slides every segment and applies the rebase stream.
+val MH_PIE: u32 = 0x200000;
+
+# SG_READ_ONLY (a segment flag) marks a segment dyld maps writable, applies its
+# fixups to, then re-protects read-only - how __DATA_CONST holds rebased const
+# pointers in a PIE image without staying writable at run time.
+val SG_READ_ONLY: u32 = 0x10;
 
 # VM protection bits used for segment maxprot/initprot.
 val VM_PROT_READ:    u32 = 1;
@@ -159,6 +186,15 @@ val BIND_TYPE_POINTER:               u8  = 0x1;
 val BIND_SPECIAL_DYLIB_FLAT_LOOKUP:  u8  = 0xE;    # -2 as a 4-bit immediate
 val DYNAMIC_LOOKUP_ORDINAL:          u16 = 0xFE;   # n_desc library-ordinal byte
 
+# dyld rebase-opcode bytes (the high nibble is the opcode, the low nibble an
+# immediate). a position-independent image rebases each in-image absolute pointer:
+# set the pointer type once, then per slot select the segment + offset and apply.
+val REBASE_OPCODE_DONE:                    u8 = 0x00;
+val REBASE_OPCODE_SET_TYPE_IMM:            u8 = 0x10;
+val REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: u8 = 0x20;
+val REBASE_OPCODE_DO_REBASE_IMM_TIMES:     u8 = 0x50;
+val REBASE_TYPE_POINTER:                   u8 = 0x1;
+
 # the dynamic loader Darwin executables name in LC_LOAD_DYLINKER.
 val DARWIN_DYLD_PATH: str = "/usr/lib/dyld";
 
@@ -191,9 +227,13 @@ val CSSLOT_CODEDIRECTORY:       u32 = 0;
 
 # CodeDirectory version 0x20400 carries the executable-segment fields the Apple
 # Silicon kernel reads to authorize a main binary; the adhoc flag marks a
-# signature with no CMS (certificate) blob, which is what makes it ad-hoc.
+# signature with no CMS (certificate) blob, which is what makes it ad-hoc. The
+# linker-signed flag marks an ad-hoc signature applied by the linker itself (as ld
+# does on Apple Silicon): CoreTrust admits a linker-signed ad-hoc main executable,
+# but rejects a hand-rolled ad-hoc one - so mach, being the linker, sets both.
 val CS_CODEDIRECTORY_VERSION: u32 = 0x00020400;
 val CS_ADHOC_FLAG:            u32 = 0x0002;
+val CS_LINKER_SIGNED_FLAG:    u32 = 0x20000;
 val CS_HASHTYPE_SHA256:       u8  = 2;
 val CS_HASH_SIZE_SHA256:      u8  = 32;
 val CS_PAGE_SHIFT:            u8  = 12;    # log2(4096)
@@ -237,6 +277,17 @@ fun resolve(itn: *intern.Interner, id: intern.StrId) str {
 # ret:     true for aarch64
 fun arch_is_arm64(arch_id: u32) bool {
     ret arch_id == isa.ARCH_AARCH64;
+}
+
+# the Mach-O segment page size for an ISA: arm64 Darwin maps memory in 16 KiB pages
+# and the kernel requires every segment vmaddr/fileoff to be 16 KiB aligned, while
+# x86_64 uses 4 KiB. segments laid out at the wrong granularity are rejected at exec.
+# ---
+# arch_id: the target ISA id
+# ret:     the segment alignment page size in bytes
+fun macho_page_size(arch_id: u32) u64 {
+    if (arch_is_arm64(arch_id)) { ret 16384; }
+    ret 4096;
 }
 
 # the Mach-O cputype for an ISA id, or an error for an unsupported architecture.
@@ -1237,7 +1288,7 @@ fun write_code_signature(buf: *u8, sig_off: usize, name: *u8, code_limit: usize,
     bin.write_u32_be(buf, cd,      CSMAGIC_CODEDIRECTORY);
     bin.write_u32_be(buf, cd + 4,  cd_size::u32);
     bin.write_u32_be(buf, cd + 8,  CS_CODEDIRECTORY_VERSION);
-    bin.write_u32_be(buf, cd + 12, CS_ADHOC_FLAG);
+    bin.write_u32_be(buf, cd + 12, CS_ADHOC_FLAG | CS_LINKER_SIGNED_FLAG);
     bin.write_u32_be(buf, cd + 16, hash_off::u32);            # hashOffset (slot 0)
     bin.write_u32_be(buf, cd + 20, ident_off::u32);           # identOffset
     bin.write_u32_be(buf, cd + 24, 0);                        # nSpecialSlots
@@ -1539,6 +1590,8 @@ rec MachoDynLayout {
     linkedit_va:   u64;
     linkedit_size: usize;
 
+    rebase_off:    usize;
+    rebase_size:   usize;
     bind_off:      usize;
     bind_size:     usize;
     symtab_off:    usize;
@@ -1854,6 +1907,125 @@ fun write_bind_info(buf: *u8, off: usize, itn: *intern.Interner, dyn: *of.Dynami
     ret p;
 }
 
+# write the 16-byte LC_UUID payload, derived deterministically from the product name
+#
+# The uuid must be stable across the darwin self-host fixpoint (it is covered by the
+# ad-hoc signature), so it is a name-based RFC 4122 uuid: the first 16 bytes of
+# SHA-256(name), with the version (5) and variant bits set. Keying it on the product
+# name (not the `-o` path) keeps the signed image filename-independent.
+# ---
+# buf:  the output buffer
+# off:  byte offset of the 16-byte uuid field
+# name: null-terminated product name (the stable signing identity)
+fun write_macho_uuid(buf: *u8, off: usize, name: *u8) {
+    var digest: [32]u8;
+    var n: usize = 0;
+    if (name != nil) { n = str_len(name::str); }
+    sha256.hash(name, n, ?digest[0]);
+    var i: usize = 0;
+    for (i < 16) { buf[off + i] = digest[i]; i = i + 1; }
+    buf[off + 6] = (buf[off + 6] & 0x0F) | 0x50;           # version 5 (name-based)
+    buf[off + 8] = (buf[off + 8] & 0x3F) | 0x80;           # RFC 4122 variant
+}
+
+# order two base relocations by (segment, in-segment offset)
+#
+# The rebase stream is emitted in this order so the signed image is byte-identical
+# across the darwin self-host fixpoint (the rebase bytes hash into the signature).
+# ---
+# a, b: the base relocations to compare
+# ret:  negative, zero, or positive per the (seg_index, seg_offset) order
+fun base_reloc_cmp(a: *of.BaseReloc, b: *of.BaseReloc) i64 {
+    if (a.seg_index != b.seg_index) {
+        if (a.seg_index < b.seg_index) { ret -1; }
+        ret 1;
+    }
+    if (a.seg_offset < b.seg_offset) { ret -1; }
+    if (a.seg_offset > b.seg_offset) { ret 1; }
+    ret 0;
+}
+
+# locate one base relocation in the emitted image
+#
+# Resolves the Mach-O segment index (the load-command ordering, __PAGEZERO included)
+# and the slot's byte offset from that segment's virtual address - the two operands a
+# `REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB` needs. The linker's first segment maps
+# as __TEXT, whose vaddr is `text_va` (the header sits below the linker text), so its
+# offsets are measured from there; every other segment maps at its assigned vaddr.
+# ---
+# br:      the base relocation to locate
+# segs:    the linker's load segments
+# text_va: the __TEXT virtual address (the linker's first segment maps above it)
+# pz:      1 when a __PAGEZERO precedes the linker segments, else 0
+# out_seg: receives the Mach-O segment index
+# out_off: receives the slot's byte offset from that segment's virtual address
+fun base_reloc_loc(br: *of.BaseReloc, segs: *of.LoadSegment, text_va: u64, pz: u32,
+                   out_seg: *u32, out_off: *u64) {
+    val ls: u32 = br.seg_index;
+    @out_seg = pz + ls;
+    var seg_vmaddr: u64 = segs[ls].vaddr;
+    if (ls == 0) { seg_vmaddr = text_va; }
+    @out_off = (segs[ls].vaddr + br.seg_offset::u64) - seg_vmaddr;
+}
+
+# the byte length of the dyld rebase opcode stream for the image's base relocations
+# ---
+# dyn:     the dynamic-link plan carrying the base-relocation set
+# segs:    the linker's load segments
+# text_va: the __TEXT virtual address
+# pz:      1 when a __PAGEZERO precedes the linker segments, else 0
+# ret:     the rebase stream byte length (0 when there are no base relocations)
+fun measure_rebase_info(dyn: *of.DynamicInfo, segs: *of.LoadSegment, text_va: u64, pz: u32) usize {
+    if (dyn.base_reloc_count == 0) { ret 0; }
+    var size: usize = 1;                                   # SET_TYPE_IMM
+    var i: u32 = 0;
+    for (i < dyn.base_reloc_count) {
+        var seg: u32 = 0;
+        var off: u64 = 0;
+        base_reloc_loc(?dyn.base_relocs[i], segs, text_va, pz, ?seg, ?off);
+        size = size + 1 + uleb_size(off) + 1;             # SET_SEGMENT_AND_OFFSET + DO_REBASE_IMM_TIMES
+        i = i + 1;
+    }
+    size = size + 1;                                       # REBASE_OPCODE_DONE
+    ret size;
+}
+
+# write the dyld rebase opcode stream that slides each in-image absolute pointer
+#
+# Sets the pointer rebase type once, then for each base relocation selects its
+# segment + in-segment offset and rebases one pointer there; dyld adds the image's
+# load bias to the slot at map time. The relocations are pre-sorted so the stream is
+# deterministic.
+# ---
+# buf:     the output buffer
+# off:     byte offset of the rebase stream
+# dyn:     the dynamic-link plan carrying the (sorted) base-relocation set
+# segs:    the linker's load segments
+# text_va: the __TEXT virtual address
+# pz:      1 when a __PAGEZERO precedes the linker segments, else 0
+# ret:     the byte offset just past the stream
+fun write_rebase_info(buf: *u8, off: usize, dyn: *of.DynamicInfo, segs: *of.LoadSegment,
+                      text_va: u64, pz: u32) usize {
+    if (dyn.base_reloc_count == 0) { ret off; }
+    var p: usize = off;
+    buf[p] = REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER;
+    p = p + 1;
+    var i: u32 = 0;
+    for (i < dyn.base_reloc_count) {
+        var seg: u32 = 0;
+        var slot: u64 = 0;
+        base_reloc_loc(?dyn.base_relocs[i], segs, text_va, pz, ?seg, ?slot);
+        buf[p] = REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (seg::u8 & 0xF);
+        p = write_uleb(buf, p + 1, slot);
+        buf[p] = REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1;
+        p = p + 1;
+        i = i + 1;
+    }
+    buf[p] = REBASE_OPCODE_DONE;
+    p = p + 1;
+    ret p;
+}
+
 # rewrite each deferred import call site to a pc-relative branch to its stub
 #
 # The linker recorded a `PltFixup` for every call to a function import it could not
@@ -1966,21 +2138,25 @@ fun dyn_sect_flags(flags: u32, zerofill: bool) u32 {
 # write a dynamically-linked MH_EXECUTE Mach-O, installed as the of.DynExecFn
 #
 # Frames the linker's laid-out load segments into a dyld-loadable executable: a
-# leading __PAGEZERO, a __TEXT that maps the mach header below the linker's text so
-# dyld can read the load commands, the linker's remaining segments, synthesized
-# import-stub and got segments (when there are function imports), and a __LINKEDIT
-# carrying the LC_DYLD_INFO_ONLY bind stream, the symbol and string tables, and a
-# trailing ad-hoc code signature. The load commands name the dynamic loader
-# (LC_LOAD_DYLINKER), each shared dependency (LC_LOAD_DYLIB), the symbol tables
-# (LC_SYMTAB/LC_DYSYMTAB), the static entry (LC_UNIXTHREAD), and the signature
-# (LC_CODE_SIGNATURE). Each function import's got slot is bound non-lazily by dyld,
-# and every deferred call site is redirected to its stub.
+# leading __PAGEZERO, a __TEXT that maps the mach header so dyld can read the load
+# commands, the linker's remaining segments, synthesized import-stub and got
+# segments (when there are function imports), and a __LINKEDIT carrying the
+# LC_DYLD_INFO_ONLY rebase/bind streams, the symbol and string tables, and a trailing
+# ad-hoc code signature. The load commands name the dynamic loader (LC_LOAD_DYLINKER),
+# each shared dependency (LC_LOAD_DYLIB), the symbol tables (LC_SYMTAB/LC_DYSYMTAB),
+# the entry, and the signature (LC_CODE_SIGNATURE). Each function import's got slot is
+# bound non-lazily by dyld, and every deferred call site is redirected to its stub.
 #
-# The image uses fixed virtual addresses (no MH_PIE): the linker assigned absolute
-# addresses from the OS base and the back end emits absolute addressing, so a load
-# bias would invalidate them. The ad-hoc LC_CODE_SIGNATURE the kernel verifies
-# before exec is emitted last (it covers everything before it), so the image runs on
-# Apple Silicon, which SIGKILLs an unsigned arm64 executable.
+# When `dyn.pie` (arm64 Darwin, where the kernel refuses a non-PIE main executable)
+# the image is position-independent: MH_PIE is set, __TEXT maps the header at the OS
+# base (the linker reserved a one-page header gap above the base), the entry is an
+# LC_MAIN file offset, LC_BUILD_VERSION/LC_UUID are emitted, and the LC_DYLD_INFO
+# rebase stream slides every in-image absolute pointer (`dyn.base_relocs`) by dyld's
+# load bias. A non-PIE image keeps the fixed-address shape: the header maps below the
+# linker text, the entry is an absolute-pc LC_UNIXTHREAD, and there is no rebase
+# stream. The ad-hoc LC_CODE_SIGNATURE the kernel verifies before exec is emitted last
+# (it covers everything before it), so the image runs on Apple Silicon, which SIGKILLs
+# an unsigned arm64 executable.
 # ---
 # alloc:       allocator for the output buffer and the scratch offset table
 # itn:         interner resolving the dynamic-plan names (sonames, imports)
@@ -2009,9 +2185,22 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     val ct: R.Result[u32, str] = cpu_type_for(arch_id);
     if (R.is_err[u32, str](ct)) { ret R.err[bool, str](R.unwrap_err[u32, str](ct)); }
 
-    val page:     usize = EXEC_PAGE_SIZE::usize;
+    # arm64 Darwin maps memory in 16 KiB pages and requires 16 KiB-aligned segments.
+    val exec_page: u64 = macho_page_size(arch_id);
+    val page:     usize = exec_page::usize;
     val nimp:     u32 = func_import_count(dyn);
     val stub_sz:  usize = macho_stub_size(arch_id);
+
+    # a position-independent image (arm64 Darwin): MH_PIE, an LC_MAIN entry, the
+    # platform/uuid load commands, and an LC_DYLD_INFO rebase stream sliding every
+    # in-image absolute pointer. a non-PIE image keeps the fixed-address shape: an
+    # LC_UNIXTHREAD entry and no rebase stream.
+    val pie: bool = dyn.pie;
+    # the rebase relocations are emitted in a deterministic (segment, offset) order so
+    # the signed image is byte-identical across the self-host fixpoint.
+    if (pie && dyn.base_reloc_count > 1) {
+        sort.sort[of.BaseReloc](dyn.base_relocs, dyn.base_reloc_count::usize, base_reloc_cmp);
+    }
 
     # load-command byte size. the segment count is __PAGEZERO + the linker segments
     # + (stubs, got when there are function imports) + __LINKEDIT.
@@ -2022,6 +2211,10 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     var thread_state: usize = X86_THREAD_STATE64_COUNT::usize * 4;
     if (arch_is_arm64(arch_id)) { thread_state = ARM_THREAD_STATE64_COUNT::usize * 4; }
     val thread_cmd_size: usize = 16 + thread_state;
+    # the entry command is an LC_MAIN file-offset entry for a PIE image, else the
+    # LC_UNIXTHREAD thread state.
+    var entry_cmd_size: usize = thread_cmd_size;
+    if (pie) { entry_cmd_size = ENTRY_POINT_CMD_SIZE; }
 
     # every loadable segment carries one section_64 entry (the linker's segments
     # plus the synthesized stub and got segments) so the llvm/otool readers and the
@@ -2032,14 +2225,27 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     var sizeofcmds: usize = seg_cmds::usize * SEGMENT_CMD_64_SIZE
                           + sect_total::usize * SECTION_64_SIZE
                           + DYLD_INFO_CMD_SIZE + SYMTAB_CMD_SIZE + DYSYMTAB_CMD_SIZE
-                          + dylinker_cmd_size() + thread_cmd_size + LINKEDIT_DATA_CMD_SIZE;   # + LC_CODE_SIGNATURE
+                          + dylinker_cmd_size() + entry_cmd_size + LINKEDIT_DATA_CMD_SIZE;   # + LC_CODE_SIGNATURE
+    if (pie) { sizeofcmds = sizeofcmds + BUILD_VERSION_CMD_SIZE + UUID_CMD_SIZE; }
     var di: u32 = 0;
     for (di < dyn.lib_count) { sizeofcmds = sizeofcmds + dylib_cmd_size(resolve(itn, dyn.libs[di].soname)); di = di + 1; }
 
-    var ncmds: u32 = seg_cmds + 6 + dyn.lib_count;   # dyld_info,symtab,dysymtab,dylinker,unixthread,code_signature
+    var ncmds: u32 = seg_cmds + 6 + dyn.lib_count;   # dyld_info,symtab,dysymtab,dylinker,entry,code_signature
+    if (pie) { ncmds = ncmds + 2; }                  # LC_BUILD_VERSION + LC_UUID
 
     var lay: MachoDynLayout;
-    lay.hdr_span = bin.align_up(MACH_HEADER_64_SIZE + sizeofcmds, page);
+    # a PIE image reserves exactly one page for the header so __TEXT maps at the OS
+    # base (the linker reserved that page above the base when assigning vaddrs); a
+    # non-PIE image maps the header below the linker's first segment, sized to fit.
+    if (pie) {
+        if (MACH_HEADER_64_SIZE + sizeofcmds > page) {
+            ret R.err[bool, str]("macho: dyn-exec PIE header exceeds the one-page reservation");
+        }
+        lay.hdr_span = page;
+    }
+    or {
+        lay.hdr_span = bin.align_up(MACH_HEADER_64_SIZE + sizeofcmds, page);
+    }
     if (segs[0].vaddr < lay.hdr_span::u64) {
         ret R.err[bool, str]("macho: dyn-exec base address too low to map the header");
     }
@@ -2071,7 +2277,12 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
         if (end > hi_va) { hi_va = end; }
         li = li + 1;
     }
-    var va: u64 = bin.align_up_u64(hi_va, EXEC_PAGE_SIZE);
+    var va: u64 = bin.align_up_u64(hi_va, exec_page);
+
+    # whether a __PAGEZERO precedes the linker segments; it shifts every Mach-O
+    # segment index the bind and rebase opcodes select.
+    var pz: u32 = 0;
+    if (lay.pagezero_size > 0) { pz = 1; }
 
     lay.stubs_size = 0;
     lay.got_size = 0;
@@ -2082,26 +2293,27 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
         lay.stubs_va   = va;
         lay.stubs_size = nimp::usize * stub_sz;
         file = file + lay.stubs_size;
-        va   = bin.align_up_u64(va + lay.stubs_size::u64, EXEC_PAGE_SIZE);
+        va   = bin.align_up_u64(va + lay.stubs_size::u64, exec_page);
 
         file = bin.align_up(file, page);
         lay.got_off  = file;
         lay.got_va   = va;
         lay.got_size = nimp::usize * 8;
         file = file + lay.got_size;
-        va   = bin.align_up_u64(va + lay.got_size::u64, EXEC_PAGE_SIZE);
+        va   = bin.align_up_u64(va + lay.got_size::u64, exec_page);
 
-        var pz: u32 = 0;
-        if (lay.pagezero_size > 0) { pz = 1; }
         lay.got_seg_index = pz + seg_count + 1;   # pagezero + linker segs + stubs
     }
 
-    # __LINKEDIT: the bind stream, then the nlist array (8-aligned), then strings.
+    # __LINKEDIT: the rebase stream (PIE only), then the bind stream, then the nlist
+    # array (8-aligned), then strings.
     file = bin.align_up(file, page);
     lay.linkedit_off = file;
     lay.linkedit_va  = va;
 
-    lay.bind_off  = lay.linkedit_off;
+    lay.rebase_off  = lay.linkedit_off;
+    lay.rebase_size = measure_rebase_info(dyn, segs, lay.text_va, pz);
+    lay.bind_off  = lay.rebase_off + lay.rebase_size;
     lay.bind_size = measure_bind_info(itn, dyn);
     lay.symtab_off = bin.align_up(lay.bind_off + lay.bind_size, 8);
 
@@ -2140,7 +2352,9 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     bin.write_u32_le(buf, 12, MH_EXECUTE);
     bin.write_u32_le(buf, 16, ncmds);
     bin.write_u32_le(buf, 20, sizeofcmds::u32);
-    bin.write_u32_le(buf, 24, MH_DYLDLINK | MH_TWOLEVEL);
+    var hdr_flags: u32 = MH_DYLDLINK | MH_TWOLEVEL;
+    if (pie) { hdr_flags = hdr_flags | MH_PIE; }
+    bin.write_u32_le(buf, 24, hdr_flags);
     bin.write_u32_le(buf, 28, 0);
 
     var lc: usize = MACH_HEADER_64_SIZE;
@@ -2155,18 +2369,27 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     # of the linker's segments at their assigned addresses, each with one section.
     val text_prot: u32 = vm_prot_for(segs[0].flags);
     var tsec: usize = write_segment_cmd(buf, lc, "__TEXT", lay.text_va,
-                           bin.align_up_u64(lay.hdr_span::u64 + segs[0].memsz::u64, EXEC_PAGE_SIZE),
+                           bin.align_up_u64(lay.hdr_span::u64 + segs[0].memsz::u64, exec_page),
                            0, lay.hdr_span::u64 + segs[0].filesz::u64, text_prot, text_prot, 1);
     write_section_64(buf, tsec, dyn_sectname(segs[0].flags, false), "__TEXT", segs[0].vaddr,
                      segs[0].memsz::u64, seg_offsets[0]::u32, dyn_sect_flags(segs[0].flags, false));
     lc = tsec + SECTION_64_SIZE;
     li = 1;
     for (li < seg_count) {
-        val prot: u32 = vm_prot_for(segs[li].flags);
+        var prot: u32 = vm_prot_for(segs[li].flags);
+        # a PIE image rebases the absolute pointers in read-only const data, so that
+        # segment (__DATA_CONST) maps read-write for dyld's fixups and is re-protected
+        # read-only afterward via SG_READ_ONLY; without it dyld cannot slide the slots.
+        var seg_flags: u32 = 0;
+        if (pie && prot == VM_PROT_READ) {
+            prot = VM_PROT_READ | VM_PROT_WRITE;
+            seg_flags = SG_READ_ONLY;
+        }
         val zf:   bool = segs[li].filesz == 0 && segs[li].memsz > 0;
         var lsec: usize = write_segment_cmd(buf, lc, exec_segname(segs[li].flags), segs[li].vaddr,
-                               bin.align_up_u64(segs[li].memsz::u64, EXEC_PAGE_SIZE),
+                               bin.align_up_u64(segs[li].memsz::u64, exec_page),
                                seg_offsets[li]::u64, segs[li].filesz::u64, prot, prot, 1);
+        if (seg_flags != 0) { bin.write_u32_le(buf, lc + 68, seg_flags); }
         var soff: u32 = seg_offsets[li]::u32;
         if (zf) { soff = 0; }
         write_section_64(buf, lsec, dyn_sectname(segs[li].flags, zf), exec_segname(segs[li].flags),
@@ -2181,7 +2404,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     # linker segment name, keeping the bind segment index unambiguous.
     if (nimp > 0) {
         var sec: usize = write_segment_cmd(buf, lc, "__STUBS", lay.stubs_va,
-                               bin.align_up_u64(lay.stubs_size::u64, EXEC_PAGE_SIZE),
+                               bin.align_up_u64(lay.stubs_size::u64, exec_page),
                                lay.stubs_off::u64, lay.stubs_size::u64,
                                VM_PROT_READ | VM_PROT_EXECUTE, VM_PROT_READ | VM_PROT_EXECUTE, 1);
         write_section_64(buf, sec, "__stubs", "__STUBS", lay.stubs_va, lay.stubs_size::u64,
@@ -2189,7 +2412,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
         lc = sec + SECTION_64_SIZE;
 
         sec = write_segment_cmd(buf, lc, "__GOT", lay.got_va,
-                               bin.align_up_u64(lay.got_size::u64, EXEC_PAGE_SIZE),
+                               bin.align_up_u64(lay.got_size::u64, exec_page),
                                lay.got_off::u64, lay.got_size::u64,
                                VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, 1);
         write_section_64(buf, sec, "__got", "__GOT", lay.got_va, lay.got_size::u64,
@@ -2199,16 +2422,19 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
 
     # __LINKEDIT.
     lc = write_segment_cmd(buf, lc, "__LINKEDIT", lay.linkedit_va,
-                           bin.align_up_u64(lay.linkedit_size::u64, EXEC_PAGE_SIZE),
+                           bin.align_up_u64(lay.linkedit_size::u64, exec_page),
                            lay.linkedit_off::u64, lay.linkedit_size::u64,
                            VM_PROT_READ, VM_PROT_READ, 0);
 
-    # LC_DYLD_INFO_ONLY: only the bind stream is non-empty (fixed addresses need no
-    # rebase, and binding is eager so the lazy stream is empty).
+    # LC_DYLD_INFO_ONLY: a PIE image carries a rebase stream (sliding its absolute
+    # pointers); binding is eager so the lazy stream is empty.
+    var rebase_cmd_off: u32 = 0;
+    var rebase_cmd_size: u32 = 0;
+    if (lay.rebase_size > 0) { rebase_cmd_off = lay.rebase_off::u32; rebase_cmd_size = lay.rebase_size::u32; }
     bin.write_u32_le(buf, lc, LC_DYLD_INFO_ONLY);
     bin.write_u32_le(buf, lc + 4, DYLD_INFO_CMD_SIZE::u32);
-    bin.write_u32_le(buf, lc + 8, 0);                       # rebase_off
-    bin.write_u32_le(buf, lc + 12, 0);                      # rebase_size
+    bin.write_u32_le(buf, lc + 8, rebase_cmd_off);          # rebase_off
+    bin.write_u32_le(buf, lc + 12, rebase_cmd_size);        # rebase_size
     bin.write_u32_le(buf, lc + 16, lay.bind_off::u32);
     bin.write_u32_le(buf, lc + 20, lay.bind_size::u32);
     bin.write_u32_le(buf, lc + 24, 0);                      # weak_bind_off
@@ -2248,20 +2474,47 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
         di = di + 1;
     }
 
-    # LC_UNIXTHREAD: the static thread entry, program counter set to the entry.
-    bin.write_u32_le(buf, lc, LC_UNIXTHREAD);
-    bin.write_u32_le(buf, lc + 4, thread_cmd_size::u32);
-    if (arch_is_arm64(arch_id)) {
-        bin.write_u32_le(buf, lc + 8, ARM_THREAD_STATE64);
-        bin.write_u32_le(buf, lc + 12, ARM_THREAD_STATE64_COUNT);
-        bin.write_u64_le(buf, lc + 16 + ARM_PC_STATE_OFFSET, entry);
+    # a PIE image names its platform (LC_BUILD_VERSION) and identity (LC_UUID) and
+    # enters through an LC_MAIN file-offset entry dyld jumps to after applying the
+    # load bias; a non-PIE image carries only the absolute-pc LC_UNIXTHREAD entry.
+    if (pie) {
+        bin.write_u32_le(buf, lc, LC_BUILD_VERSION);
+        bin.write_u32_le(buf, lc + 4, BUILD_VERSION_CMD_SIZE::u32);
+        bin.write_u32_le(buf, lc + 8, PLATFORM_MACOS);
+        bin.write_u32_le(buf, lc + 12, MACOS_MIN_VERSION);     # minos
+        bin.write_u32_le(buf, lc + 16, MACOS_MIN_VERSION);     # sdk
+        bin.write_u32_le(buf, lc + 20, 0);                     # ntools
+        lc = lc + BUILD_VERSION_CMD_SIZE;
+
+        bin.write_u32_le(buf, lc, LC_UUID);
+        bin.write_u32_le(buf, lc + 4, UUID_CMD_SIZE::u32);
+        write_macho_uuid(buf, lc + 8, name);
+        lc = lc + UUID_CMD_SIZE;
+
+        # entryoff is the entry's file offset: __TEXT maps the header at file offset 0
+        # / virtual address text_va, so the offset is entry - text_va.
+        bin.write_u32_le(buf, lc, LC_MAIN);
+        bin.write_u32_le(buf, lc + 4, ENTRY_POINT_CMD_SIZE::u32);
+        bin.write_u64_le(buf, lc + 8, entry - lay.text_va);    # entryoff
+        bin.write_u64_le(buf, lc + 16, 0);                     # stacksize
+        lc = lc + ENTRY_POINT_CMD_SIZE;
     }
     or {
-        bin.write_u32_le(buf, lc + 8, X86_THREAD_STATE64);
-        bin.write_u32_le(buf, lc + 12, X86_THREAD_STATE64_COUNT);
-        bin.write_u64_le(buf, lc + 16 + X86_RIP_STATE_OFFSET, entry);
+        # LC_UNIXTHREAD: the static thread entry, program counter set to the entry.
+        bin.write_u32_le(buf, lc, LC_UNIXTHREAD);
+        bin.write_u32_le(buf, lc + 4, thread_cmd_size::u32);
+        if (arch_is_arm64(arch_id)) {
+            bin.write_u32_le(buf, lc + 8, ARM_THREAD_STATE64);
+            bin.write_u32_le(buf, lc + 12, ARM_THREAD_STATE64_COUNT);
+            bin.write_u64_le(buf, lc + 16 + ARM_PC_STATE_OFFSET, entry);
+        }
+        or {
+            bin.write_u32_le(buf, lc + 8, X86_THREAD_STATE64);
+            bin.write_u32_le(buf, lc + 12, X86_THREAD_STATE64_COUNT);
+            bin.write_u64_le(buf, lc + 16 + X86_RIP_STATE_OFFSET, entry);
+        }
+        lc = lc + thread_cmd_size;
     }
-    lc = lc + thread_cmd_size;
 
     # LC_CODE_SIGNATURE points at the ad-hoc signature trailing __LINKEDIT.
     bin.write_u32_le(buf, lc, LC_CODE_SIGNATURE);
@@ -2289,7 +2542,8 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
         }
     }
 
-    # the dyld bind stream and the symbol/string tables in __LINKEDIT.
+    # the dyld rebase stream (PIE), then the bind stream and symbol/string tables.
+    write_rebase_info(buf, lay.rebase_off, dyn, segs, lay.text_va, pz);
     write_bind_info(buf, lay.bind_off, itn, dyn, lay.got_seg_index);
 
     buf[lay.strtab_off] = 0;
