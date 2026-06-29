@@ -17,6 +17,7 @@ main() {
     case "$(uname -s)-$(uname -m)" in
         Linux-x86_64) target="x86_64-linux" ;;
         Linux-aarch64|Linux-arm64) target="aarch64-linux" ;;
+        Darwin-arm64|Darwin-aarch64) target="aarch64-darwin" ;;
         *) err "unsupported host $(uname -s)-$(uname -m); prebuilt binaries: https://github.com/briar-systems/mach/releases" ;;
     esac
 
