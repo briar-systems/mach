@@ -13,10 +13,13 @@ set -euo pipefail
 # (45) plus the const-shift call argument 1 << 3 (8), the stack-local frame-slot probe
 # (#1670), the >4KiB long-branch relaxation probe (#1666), the 32-bit bitwise
 # word-group probe (#1672), the lp64d register-plus-stack split probe (#1637, 35 =
-# 1+..+7 + struct halves 2 + 5), and the RV64A atomics probe (#1668, 18 = swapped 7 +
-# post-rmw cell 11), wrapping to 105. the qemu e2e asserts the exact code, so a
-# regression in any of those changes it.
-expect_code=105
+# 1+..+7 + struct halves 2 + 5), the lp64d mixed float+integer probe (#1637 case A, 7 =
+# f 2.0 in fa0 + i 5 in a0), the lp64d different-width float-pair probe (#1637 case B,
+# 12 = a 4.0 in fa0 + b 8.0 in fa1), the lp64d sub-word mixed probe (#1637 case A
+# sub-word, 9 = f 3.0 in fa0 + j 6 in a0 at offset 4, the 4-byte GP chunk), and the
+# RV64A atomics probe (#1668, 18 = swapped 7 + post-rmw cell 11), wrapping to 133. the
+# qemu e2e asserts the exact code, so a regression in any of those changes it.
+expect_code=133
 
 mach="${1:-mach}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
