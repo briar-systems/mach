@@ -33,6 +33,7 @@
 
 use std.allocator.page;
 use std.collections.map;
+use sort: std.collections.sort;
 use std.filesystem;
 use std.memory;
 use std.types.bool.bool;
@@ -107,13 +108,26 @@ val IMAGE_FILE_LARGE_ADDRESS_AWARE: u16 = 0x0020;
 # the loader reads to map and start the image.
 val PE32PLUS_MAGIC:                u16 = 0x020B;
 val IMAGE_SUBSYSTEM_WINDOWS_CUI:   u16 = 3;
+# the image opts in to ASLR (the loader maps it at a randomized base and applies the
+# `.reloc` fixups) and is compatible with hardware DEP / no-execute data pages.
+val IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: u16 = 0x0040;
 val IMAGE_DLLCHARACTERISTICS_NX_COMPAT: u16 = 0x0100;
 
 # data-directory indices in the PE32+ optional header.
 val IMAGE_DIRECTORY_ENTRY_IMPORT:    u32 = 1;
 val IMAGE_DIRECTORY_ENTRY_EXCEPTION: u32 = 3;
+val IMAGE_DIRECTORY_ENTRY_BASERELOC: u32 = 5;
 val IMAGE_DIRECTORY_ENTRY_IAT:       u32 = 12;
 val IMAGE_NUMBEROF_DIRECTORY_ENTRIES: u32 = 16;
+
+# PE base-relocation (.reloc) encoding. fixups are grouped into per-4-KiB-page
+# IMAGE_BASE_RELOCATION blocks (an 8-byte header: PageRVA u32 + BlockSize u32, then one
+# u16 per fixup: (type << 12) | offset-in-page). a 64-bit absolute pointer is a DIR64
+# fixup; an ABSOLUTE (type 0) entry pads a block to its 4-byte boundary.
+val IMAGE_REL_BASED_ABSOLUTE: u16 = 0;
+val IMAGE_REL_BASED_DIR64:    u16 = 10;
+val BASE_RELOC_PAGE:          u64 = 0x1000;
+val BASE_RELOC_BLOCK_HEADER:  usize = 8;
 
 # PE32+ on-disk structure sizes and alignments. SectionAlignment is the in-memory
 # page granularity; FileAlignment the on-disk granularity. ImageBase sits one
@@ -1643,17 +1657,21 @@ rec PeLayout {
     idata_sec:   PeSection;
     xdata_sec:   PeSection;
     pdata_sec:   PeSection;
+    reloc_sec:   PeSection;
     iat_rva:     u64;
     iat_size:    u64;
     import_dir_rva:  u64;
     import_dir_size: u64;
     exception_rva:   u64;
     exception_size:  u64;
+    basereloc_rva:   u64;
+    basereloc_size:  u64;
     nimp:        u32;
     have_stub:   bool;
     have_idata:  bool;
     have_xdata:  bool;
     have_pdata:  bool;
+    have_reloc:  bool;
     sec_total:   u32;
 }
 
@@ -1733,6 +1751,90 @@ fun pe_section_flags(flags: u32, has_data: bool) u32 {
 # IMAGE_IMPORT_DESCRIPTOR per dependency plus a null terminator.
 fun import_dir_bytes(dyn: *of.DynamicInfo) usize {
     ret (dyn.lib_count + 1)::usize * IMPORT_DESCRIPTOR_SIZE;
+}
+
+# sort base relocations by ascending image location (segment, then in-segment offset).
+# segments are laid out in ascending RVA, so this is ascending-RVA order - the order the
+# per-page `.reloc` block grouping needs.
+fun base_reloc_cmp(a: *of.BaseReloc, b: *of.BaseReloc) i64 {
+    if (a.seg_index != b.seg_index) {
+        if (a.seg_index < b.seg_index) { ret -1; }
+        ret 1;
+    }
+    if (a.seg_offset < b.seg_offset) { ret -1; }
+    if (a.seg_offset > b.seg_offset) { ret 1; }
+    ret 0;
+}
+
+# the image RVA of a base relocation's fixup slot: the patched segment's RVA plus the
+# slot's byte offset within it.
+fun base_reloc_rva(br: *of.BaseReloc, seg_secs: *PeSection) u64 {
+    ret seg_secs[br.seg_index].rva + br.seg_offset::u64;
+}
+
+# the 4-KiB page base RVA a fixup falls in (the IMAGE_BASE_RELOCATION block key).
+fun base_reloc_page(rva: u64) u64 {
+    ret (rva / BASE_RELOC_PAGE) * BASE_RELOC_PAGE;
+}
+
+# the byte length of the `.reloc` section for the image's base relocations: the
+# (pre-sorted) fixups grouped into per-page IMAGE_BASE_RELOCATION blocks, each an 8-byte
+# header plus one u16 per fixup, padded to a 4-byte boundary (an odd fixup count adds one
+# ABSOLUTE entry). 0 when there are no base relocations.
+fun measure_reloc_bytes(dyn: *of.DynamicInfo, seg_secs: *PeSection) usize {
+    if (dyn == nil || dyn.base_reloc_count == 0) { ret 0; }
+    var total: usize = 0;
+    var i: u32 = 0;
+    for (i < dyn.base_reloc_count) {
+        val page: u64 = base_reloc_page(base_reloc_rva(?dyn.base_relocs[i], seg_secs));
+        var j: u32 = i;
+        for (j < dyn.base_reloc_count && base_reloc_page(base_reloc_rva(?dyn.base_relocs[j], seg_secs)) == page) {
+            j = j + 1;
+        }
+        var entries: u32 = j - i;
+        if ((entries & 1) != 0) { entries = entries + 1; }
+        total = total + BASE_RELOC_BLOCK_HEADER + entries::usize * 2;
+        i = j;
+    }
+    ret total;
+}
+
+# write the `.reloc` section: the (pre-sorted) base relocations grouped into per-page
+# IMAGE_BASE_RELOCATION blocks - each { PageRVA u32, BlockSize u32, (DIR64 <<
+# 12 | offset-in-page) u16... } padded to 4 bytes with an ABSOLUTE entry. mirrors
+# `measure_reloc_bytes` exactly. returns the byte offset just past the section.
+fun write_reloc_section(buf: *u8, off: usize, dyn: *of.DynamicInfo, seg_secs: *PeSection) usize {
+    if (dyn == nil || dyn.base_reloc_count == 0) { ret off; }
+    var p: usize = off;
+    var i: u32 = 0;
+    for (i < dyn.base_reloc_count) {
+        val page: u64 = base_reloc_page(base_reloc_rva(?dyn.base_relocs[i], seg_secs));
+        var j: u32 = i;
+        for (j < dyn.base_reloc_count && base_reloc_page(base_reloc_rva(?dyn.base_relocs[j], seg_secs)) == page) {
+            j = j + 1;
+        }
+        val n: u32 = j - i;
+        var entries: u32 = n;
+        if ((entries & 1) != 0) { entries = entries + 1; }
+        val block_size: usize = BASE_RELOC_BLOCK_HEADER + entries::usize * 2;
+        bin.write_u32_le(buf, p, page::u32);
+        bin.write_u32_le(buf, p + 4, block_size::u32);
+        var q: usize = p + BASE_RELOC_BLOCK_HEADER;
+        var k: u32 = i;
+        for (k < j) {
+            val rva: u64 = base_reloc_rva(?dyn.base_relocs[k], seg_secs);
+            val entry: u16 = (IMAGE_REL_BASED_DIR64 << 12) | (rva - page)::u16;
+            bin.write_u16_le(buf, q, entry);
+            q = q + 2;
+            k = k + 1;
+        }
+        if ((n & 1) != 0) {
+            bin.write_u16_le(buf, q, IMAGE_REL_BASED_ABSOLUTE);
+        }
+        p = p + block_size;
+        i = j;
+    }
+    ret p;
 }
 
 # append one unwind code (with up to two extra operand slots)
@@ -1995,14 +2097,16 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
     lay.have_idata = dyn != nil && (dyn.lib_count > 0 || dyn.import_count > 0);
     lay.have_xdata = xdata_vsize > 0;
     lay.have_pdata = pdata_vsize > 0;
+    lay.have_reloc = dyn != nil && dyn.base_reloc_count > 0;
 
-    # the synthesized section count: the linker segments, then the stub and idata
-    # sections when present.
+    # the synthesized section count: the linker segments, then the stub, idata, unwind,
+    # and base-relocation sections when present.
     var nsec: u32 = seg_count;
     if (lay.have_stub)  { nsec = nsec + 1; }
     if (lay.have_idata) { nsec = nsec + 1; }
     if (lay.have_xdata) { nsec = nsec + 1; }
     if (lay.have_pdata) { nsec = nsec + 1; }
+    if (lay.have_reloc) { nsec = nsec + 1; }
     lay.sec_total = nsec;
 
     # headers: DOS header + PE signature + COFF header + optional header + the
@@ -2126,6 +2230,22 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
         rva = rva + bin.align_up_u64(lay.pdata_sec.vsize, PE_SECTION_ALIGN);
     }
 
+    # the .reloc section (read-only, discardable): the base-relocation blocks the loader
+    # applies after ASLR slides the image. the fixup RVAs read the segment RVAs assigned
+    # above, so the base_relocs must already be sorted (the writer sorts before this).
+    if (lay.have_reloc) {
+        rva = bin.align_up_u64(rva, PE_SECTION_ALIGN);
+        val rsize: usize = measure_reloc_bytes(dyn, seg_secs);
+        lay.reloc_sec.rva       = rva;
+        lay.reloc_sec.vsize     = rsize::u64;
+        lay.reloc_sec.file_off  = file_off;
+        lay.reloc_sec.file_size = bin.align_up(rsize, PE_FILE_ALIGN::usize);
+        lay.basereloc_rva       = rva;
+        lay.basereloc_size      = rsize::u64;
+        file_off = file_off + lay.reloc_sec.file_size;
+        rva = rva + bin.align_up_u64(rsize::u64, PE_SECTION_ALIGN);
+    }
+
     lay.image_size = bin.align_up_u64(rva, PE_SECTION_ALIGN);
     ret file_off;
 }
@@ -2225,6 +2345,13 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
         pdata_vsize = uw_count::usize * RUNTIME_FUNCTION_SIZE;
     }
 
+    # sort the base relocations by ascending image location so the per-page .reloc block
+    # grouping is deterministic and contiguous; both the layout measure and the section
+    # write below read this sorted order.
+    if (dyn != nil && dyn.base_reloc_count > 0) {
+        sort.sort[of.BaseReloc](dyn.base_relocs, dyn.base_reloc_count::usize, base_reloc_cmp);
+    }
+
     var lay: PeLayout;
     val total_size: usize = compute_pe_layout(itn, ?lay, segs, seg_count, dyn, seg_secs, xdata_vsize, pdata_vsize);
 
@@ -2250,6 +2377,7 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
     if (lay.have_idata)                   { write_pe_imports(itn, buf, ?lay, dyn); }
     if (lay.have_stub)                    { write_pe_stubs(buf, ?lay, dyn); }
     if (lay.have_xdata || lay.have_pdata) { write_pe_unwind(buf, ?lay, uw_all, uw_count); }
+    if (lay.have_reloc)                   { write_reloc_section(buf, lay.reloc_sec.file_off, dyn, seg_secs); }
 
     # redirect each import call site to its stub (a non-import call site never
     # reaches here - the linker only records fixups for function imports).
@@ -2261,8 +2389,10 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
         ret R.err[bool, str](R.unwrap_err[bool, str](fx_r));
     }
 
-    # the headers, then the section table.
-    write_pe_headers(buf, ?lay, segs, seg_count, entry);
+    # the headers, then the section table. a position-independent image (Windows ASLR)
+    # clears RELOCS_STRIPPED and sets DYNAMIC_BASE.
+    val pie: bool = dyn != nil && dyn.pie;
+    write_pe_headers(buf, ?lay, segs, seg_count, entry, pie);
 
     A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
     if (uw_all != nil && func_count > 0) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
@@ -2584,7 +2714,7 @@ fun write_pe_section_header(buf: *u8, pos: usize, name: str, sec: *PeSection, ch
 # 16 data directories), and the section table. the entry RVA is the program
 # entry vaddr relative to ImageBase. called last so the section RVAs/offsets the
 # layout fixed are known.
-fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32, entry: u64) {
+fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32, entry: u64, pie: bool) {
     # DOS header: 'MZ', e_lfanew (offset 0x3C) -> the PE signature. the rest of
     # the DOS stub is left zero - Windows reads only the magic and e_lfanew.
     buf[0] = 'M'; buf[1] = 'Z';
@@ -2602,8 +2732,12 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
     bin.write_u32_le(buf, ch + 8, 0);
     bin.write_u32_le(buf, ch + 12, 0);
     bin.write_u16_le(buf, ch + 16, OPTIONAL_HEADER_SIZE::u16);
-    bin.write_u16_le(buf, ch + 18, IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE
-        | IMAGE_FILE_LINE_NUMS_STRIPPED | IMAGE_FILE_LOCAL_SYMS_STRIPPED | IMAGE_FILE_RELOCS_STRIPPED);
+    # a position-independent (ASLR) image carries base relocations, so RELOCS_STRIPPED is
+    # cleared; a fixed-base image keeps it (the loader must map it at its preferred base).
+    var characteristics: u16 = IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE
+        | IMAGE_FILE_LINE_NUMS_STRIPPED | IMAGE_FILE_LOCAL_SYMS_STRIPPED;
+    if (!pie) { characteristics = characteristics | IMAGE_FILE_RELOCS_STRIPPED; }
+    bin.write_u16_le(buf, ch + 18, characteristics);
 
     # PE32+ optional header.
     val oh: usize = ch + COFF_HEADER_SIZE;
@@ -2645,9 +2779,12 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
     bin.write_u32_le(buf, oh + 60, lay.header_size::u32);
     bin.write_u32_le(buf, oh + 64, 0);
 
-    # Subsystem (console), DllCharacteristics (NX-compatible).
+    # Subsystem (console), DllCharacteristics (NX-compatible always; DYNAMIC_BASE / ASLR
+    # for a position-independent image).
     bin.write_u16_le(buf, oh + 68, IMAGE_SUBSYSTEM_WINDOWS_CUI);
-    bin.write_u16_le(buf, oh + 70, IMAGE_DLLCHARACTERISTICS_NX_COMPAT);
+    var dllchars: u16 = IMAGE_DLLCHARACTERISTICS_NX_COMPAT;
+    if (pie) { dllchars = dllchars | IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE; }
+    bin.write_u16_le(buf, oh + 70, dllchars);
 
     # stack/heap reserve+commit (PE32+ are 8 bytes each): 1 MiB reserve / 4 KiB
     # commit for both, the conventional console defaults.
@@ -2670,6 +2807,11 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
     if (lay.have_pdata) {
         bin.write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_EXCEPTION::usize * DATA_DIR_SIZE, lay.exception_rva::u32);
         bin.write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_EXCEPTION::usize * DATA_DIR_SIZE + 4, lay.exception_size::u32);
+    }
+    # BASERELOC directory (index 5) - the .reloc base-relocation blocks the loader applies.
+    if (lay.have_reloc) {
+        bin.write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_BASERELOC::usize * DATA_DIR_SIZE, lay.basereloc_rva::u32);
+        bin.write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_BASERELOC::usize * DATA_DIR_SIZE + 4, lay.basereloc_size::u32);
     }
 
     # the section table follows the optional header.
@@ -2701,6 +2843,11 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
     if (lay.have_pdata) {
         write_pe_section_header(buf, pos, ".pdata", ?lay.pdata_sec,
             IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
+        pos = pos + SECTION_HEADER_SIZE;
+    }
+    if (lay.have_reloc) {
+        write_pe_section_header(buf, pos, ".reloc", ?lay.reloc_sec,
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE);
         pos = pos + SECTION_HEADER_SIZE;
     }
 }
