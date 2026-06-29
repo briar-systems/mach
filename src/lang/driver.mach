@@ -468,6 +468,53 @@ pub fun enumerate_matrix(alloc: *A.Allocator, project_root: str,
     ret R.ok[Matrix, str](mx);
 }
 
+# resolve a build selection's output-artifact path WITHOUT compiling.
+#
+# Reads `project_root/mach.toml`, resolves the selection (target, profile,
+# artifact) into one build unit, and returns the produced-artifact path rooted at
+# `project_root` - the exact path `mach build` produces for the same selection.
+# `mach run` uses it to locate and execute the already-built binary instead of
+# rebuilding. Only the manifest is read: no module graph is loaded and no
+# dependencies are resolved. The transient toml table, interner, and manifest are
+# all suballocated from `alloc` and reclaimed when it is (pass an arena); the
+# returned path is owned by `alloc`.
+# ---
+# alloc:        allocator for the transient manifest state and the returned path
+# project_root: the resolved project root directory (containing mach.toml)
+# sel:          the build selection narrowing target/profile/artifact
+# ret:          ok(owned absolute artifact path), or err(manifest/selection message)
+pub fun resolve_artifact_path(alloc: *A.Allocator, project_root: str, sel: *manifest.Selection) R.Result[str, str] {
+    val toml_path_r: R.Result[str, str] = join_path(alloc, project_root, "mach.toml");
+    if (R.is_err[str, str](toml_path_r)) { ret toml_path_r; }
+    val toml_path: str = R.unwrap_ok[str, str](toml_path_r);
+
+    val toml_r: R.Result[toml.Table, str] = parse_toml_file(alloc, toml_path);
+    str_free(alloc, toml_path);
+    if (R.is_err[toml.Table, str](toml_r)) { ret R.err[str, str](R.unwrap_err[toml.Table, str](toml_r)); }
+    var t: toml.Table = R.unwrap_ok[toml.Table, str](toml_r);
+
+    var itn: intern.Interner = intern.init(alloc);
+    val mr: R.Result[manifest.Manifest, str] = manifest.parse(alloc, ?itn, ?t);
+    if (R.is_err[manifest.Manifest, str](mr)) { ret R.err[str, str](R.unwrap_err[manifest.Manifest, str](mr)); }
+    var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](mr);
+
+    val ur: R.Result[manifest.BuildUnit, str] = manifest.resolve_build_unit(alloc, ?itn, ?m, @sel);
+    if (R.is_err[manifest.BuildUnit, str](ur)) {
+        manifest.dnit(?m, alloc);
+        ret R.err[str, str](R.unwrap_err[manifest.BuildUnit, str](ur));
+    }
+    val bu: manifest.BuildUnit = R.unwrap_ok[manifest.BuildUnit, str](ur);
+
+    val bin_opt: O.Option[str] = intern.lookup(?itn, bu.bin_path);
+    if (O.is_none[str](bin_opt) || str_empty(O.unwrap[str](bin_opt))) {
+        manifest.dnit(?m, alloc);
+        ret R.err[str, str]("selected artifact has no output path; set the `out` template in mach.toml");
+    }
+    val abs_r: R.Result[str, str] = join_path(alloc, project_root, O.unwrap[str](bin_opt));
+    manifest.dnit(?m, alloc);
+    ret abs_r;
+}
+
 # build_project_sel: load `project_root/mach.toml` and build the module graph
 # for the given build selection (target, profile, and one artifact). the manifest
 # reader resolves the selection into the project's single target entry and
@@ -3849,6 +3896,29 @@ fun build_resolve_deps(p: *Project, m: *ModuleEntry, visited: *bool, list: *sess
     ret R.ok[resolve.ResolveDeps, str](deps);
 }
 
+# whether module `fqn` belongs to the current project's own source tree (its head
+# segment is the project id) rather than a dependency. `mach test` uses this to
+# scope a default test run to the current project, excluding dependency tests
+# (#1556).
+# ---
+# p:   the project carrying the config id and session interner
+# fqn: the module's interned fully-qualified name
+# ret: true when `fqn`'s head segment equals the project id
+pub fun module_in_current_project(p: *Project, fqn: intern.StrId) bool {
+    val fqn_opt: O.Option[str] = intern.lookup(?p.s.interner, fqn);
+    if (O.is_none[str](fqn_opt)) { ret false; }
+    val fqn_text: str = O.unwrap[str](fqn_opt);
+
+    val pid_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.id);
+    if (O.is_none[str](pid_opt)) { ret false; }
+    val proj_id_text: str = O.unwrap[str](pid_opt);
+
+    val fqn_len: usize = str_len(fqn_text);
+    var head_end: usize = 0;
+    for (head_end < fqn_len && fqn_text[head_end] != '.') { head_end = head_end + 1; }
+    ret view_eq_str(view(fqn_text::*char, head_end), proj_id_text);
+}
+
 # the project id whose declared `[project].module` resolves
 # to module `mod_fqn`, or STR_NIL when `mod_fqn` is not any project's declared
 # module. lets resolve name such a module by the project's bare id (#1326). a
@@ -3972,10 +4042,15 @@ fun ut_cc3(alloc: *A.Allocator, a: str, b: str, c: str) str {
     ret buf::str;
 }
 
-# the shared three-target manifest the union tests scaffold. `native`
-# resolves the default to the host-matching target (linux, windows, or linux-arm64 in CI).
+# the shared five-target manifest the union tests scaffold. `native` resolves the
+# default to the host-matching target: linux (x86_64-linux), windows (x86_64-windows),
+# linux-arm64 (aarch64-linux), darwin-x86_64 (x86_64-darwin), or darwin-arm64
+# (aarch64-darwin) in CI. both darwin targets are declared so either a macos-13
+# (x86_64) or a macos-14 (arm64) host has a matching native target - otherwise
+# `resolve_native` falls back to the first target (linux) and the host-tie assertions in
+# union_ctx_restored_to_default_tuple read the wrong default for a darwin host (#1724).
 fun ut_manifest() str {
-    ret "[project]\nid = \"uniontest\"\nname = \"u\"\nversion = \"0.0.0\"\nsrc = \"src\"\ntarget = \"native\"\nout = \"out/{target}/bin/{name}{ext}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\next = \".exe\"\n\n[target.linux-arm64]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n\n[bin.uniontest]\nentry = \"main.mach\"\n";
+    ret "[project]\nid = \"uniontest\"\nname = \"u\"\nversion = \"0.0.0\"\nsrc = \"src\"\ntarget = \"native\"\nout = \"out/{target}/bin/{name}{ext}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\next = \".exe\"\n\n[target.linux-arm64]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n\n[target.darwin-x86_64]\nisa = \"x86_64\"\nos = \"darwin\"\nabi = \"sysv64\"\n\n[target.darwin-arm64]\nisa = \"aarch64\"\nos = \"darwin\"\nabi = \"aapcs64\"\n\n[bin.uniontest]\nentry = \"main.mach\"\n";
 }
 
 # a two-target, two-bin manifest for the multi-artifact union
@@ -4553,6 +4628,44 @@ test "mach.lang.driver:union_ambiguous_multi_artifact_default" {
 
     filesystem.remove_all(?alloc, root);
     session.dnit(?s);
+    ret bad;
+}
+
+# resolve_artifact_path returns the build's output path from the manifest alone,
+# without loading the module graph or a session (#1482). an explicit target keeps
+# the expanded path host-independent; an unknown selector surfaces verbatim.
+test "mach.lang.driver:resolve_artifact_path" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = "fun main() i32 { ret 0; }\n";
+
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # the manifest's `out` template resolves to the build's output path, rooted.
+    var sel: manifest.Selection;
+    sel.target = "linux"; sel.profile = ""; sel.artifact = ""; sel.want_lib = false; sel.has_artifact = false;
+    val pr: R.Result[str, str] = resolve_artifact_path(?alloc, root, ?sel);
+    if (R.is_err[str, str](pr)) { bad = 1; }
+    or {
+        val want: str = ut_cc3(?alloc, root, "/", "out/linux/bin/uniontest");
+        if (!str_equals(R.unwrap_ok[str, str](pr), want)) { bad = 1; }
+    }
+
+    # an unknown artifact selection surfaces the manifest error, never a path.
+    var sel_bad: manifest.Selection;
+    sel_bad.target = "linux"; sel_bad.profile = ""; sel_bad.artifact = "nope"; sel_bad.want_lib = false; sel_bad.has_artifact = true;
+    val pr_bad: R.Result[str, str] = resolve_artifact_path(?alloc, root, ?sel_bad);
+    if (R.is_ok[str, str](pr_bad)) { bad = 1; }
+
+    filesystem.remove_all(?alloc, root);
     ret bad;
 }
 

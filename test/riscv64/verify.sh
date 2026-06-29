@@ -58,21 +58,32 @@ grep -qE 'Entry point address:.*0x[0-9a-fA-F]+' <<< "$hdr" || fail "exe has no e
 grep -q 'Entry point address:.*0x0$' <<< "$hdr" && fail "exe entry point is zero"
 
 # the backend emits M (mul / div / rem), F/D (scalar float), and A (atomics)
-# instructions but does not yet write a `.riscv.attributes` ISA-string section, so
-# objdump defaults to base RV64I and renders those valid words as `<unknown>`. decode
-# with the extensions the backend actually emits so the `<unknown>` guard still
-# catches a genuinely malformed word rather than a correctly-encoded M / F / D / A
-# instruction.
+# instructions and now writes a `.riscv.attributes` ISA-string section (#1673), so
+# objdump reads the arch string off the section and decodes the full instruction set
+# with no `--mattr` on the command line. the `<unknown>` guard then catches a
+# genuinely malformed word rather than a correctly-encoded M / F / D / A instruction.
 echo "verifying disassembly of $exe"
-dis="$("$objdump" -d --mattr=+m,+f,+d,+a "$exe")"
+dis="$("$objdump" -d "$exe")"
 grep -q 'file format elf64-littleriscv' <<< "$dis" || fail "objdump did not parse a little-endian rv64 elf"
 grep -qi '<unknown>'                    <<< "$dis" && fail "objdump found an unknown instruction word"
 for mnem in auipc jalr ld sd addi sll ret ecall; do
     grep -qw "$mnem" <<< "$dis" || fail "expected mnemonic '$mnem' not in disassembly"
 done
-# the RV64A atomics the probe emits must disassemble as the real instructions.
+# the RV64A atomics the probe emits must disassemble as the real instructions -
+# decoded here with no `--mattr`, so this also proves the attributes section took.
 for mnem in lr.d sc.d amoadd.d; do
     grep -qw "$mnem" <<< "$dis" || fail "expected RV64A mnemonic '$mnem' not in disassembly"
+done
+
+# the `.riscv.attributes` section the build now emits (#1673) is what lets objdump
+# decode imafd above with no `--mattr`. assert it is present and carries the arch
+# string naming the integer base plus the M / A / F / D extensions the backend uses,
+# in both the linked exe and the relocatable object.
+echo "verifying .riscv.attributes ISA string in $exe and $obj"
+for f in "$exe" "$obj"; do
+    attrs="$("$readelf" -A "$f")"
+    grep -q 'riscv'              <<< "$attrs" || fail "$f has no .riscv.attributes vendor section"
+    grep -qE 'rv64i.*m.*a.*f.*d' <<< "$attrs" || fail "$f Tag_RISCV_arch missing an imafd extension"
 done
 
 # assert the >4KiB probe forced long-branch relaxation (#1666): an inverted guard

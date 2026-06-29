@@ -56,24 +56,24 @@ form. The same word followed by anything else is an ordinary identifier — a
 variable named `cnt` reads and assigns normally (`cnt = x;`), even inside a
 loop that also uses bare `cnt;` for control flow.
 
-## `fin` — deferred statement
+## `fin` — deferred block
 
-`fin` schedules a statement (or block) to execute when the enclosing scope
-exits, in reverse order of declaration. Useful for cleanup that should
-happen regardless of how the scope exits.
+`fin` schedules a block to execute when the enclosing scope exits, in reverse
+order of declaration. Useful for cleanup that should happen regardless of how
+the scope exits.
 
 ```mach
 {
-    fin counter = counter - 1;
+    fin { counter = counter - 1; }
     fin { counter = counter * 2; }
 
     # ... code ...
 }
-# at scope exit: fin block runs first, then fin counter = counter - 1
+# at scope exit, in reverse order: counter * 2 runs first, then counter - 1
 ```
 
-`fin` takes either a single statement (`fin stmt;`) or a block
-(`fin { ... }`). No bare-expression form.
+`fin` requires a block body (`fin { ... }`). The bare single-statement form
+(`fin stmt;`) is rejected.
 
 ## Block
 

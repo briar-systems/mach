@@ -41,9 +41,12 @@ use std.types.string.str;
 use std.types.string.str_contains;
 use std.types.string.str_len;
 
+use std.crypto.hash.sha256;
+
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
+use sort: std.collections.sort;
 
 use mach.lang.intern;
 use mach.lang.target.isa;
@@ -83,6 +86,34 @@ val LC_LOAD_DYLINKER: u32 = 0xE;
 # the LC_REQ_DYLD bit is set on LC_DYLD_INFO_ONLY so a loader that cannot read
 # the compressed dyld-info stream refuses the image rather than mis-loading it.
 val LC_DYLD_INFO_ONLY: u32 = 0x80000022;
+# points at the embedded code signature in __LINKEDIT.
+val LC_CODE_SIGNATURE: u32 = 0x1D;
+# the modern main-executable entry: a file-offset entry point dyld jumps to (with
+# a load bias), replacing the absolute-pc LC_UNIXTHREAD thread state for PIE images.
+val LC_MAIN:          u32 = 0x80000028;
+# names the target platform and minimum OS; dyld validates it on Apple Silicon.
+val LC_BUILD_VERSION: u32 = 0x32;
+# the image's 128-bit identifier, required in a modern signed main executable.
+val LC_UUID:          u32 = 0x1B;
+
+# fixed sizes for the PIE load commands.
+val ENTRY_POINT_CMD_SIZE:   usize = 24;   # cmd + cmdsize + entryoff + stacksize
+val BUILD_VERSION_CMD_SIZE: usize = 24;   # cmd + cmdsize + platform + minos + sdk + ntools(0)
+val UUID_CMD_SIZE:          usize = 24;   # cmd + cmdsize + 16-byte uuid
+
+# LC_BUILD_VERSION platform id for macOS, and the minimum-OS / SDK version it names
+# (11.0.0, packed as 0x00xxyyzz = xx.yy.zz) - the first macOS to ship Apple Silicon.
+val PLATFORM_MACOS: u32 = 1;
+val MACOS_MIN_VERSION: u32 = 0x000B0000;
+
+# MH_PIE marks a position-independent main executable: dyld may load it at a random
+# bias, and the loader slides every segment and applies the rebase stream.
+val MH_PIE: u32 = 0x200000;
+
+# SG_READ_ONLY (a segment flag) marks a segment dyld maps writable, applies its
+# fixups to, then re-protects read-only - how __DATA_CONST holds rebased const
+# pointers in a PIE image without staying writable at run time.
+val SG_READ_ONLY: u32 = 0x10;
 
 # VM protection bits used for segment maxprot/initprot.
 val VM_PROT_READ:    u32 = 1;
@@ -155,6 +186,15 @@ val BIND_TYPE_POINTER:               u8  = 0x1;
 val BIND_SPECIAL_DYLIB_FLAT_LOOKUP:  u8  = 0xE;    # -2 as a 4-bit immediate
 val DYNAMIC_LOOKUP_ORDINAL:          u16 = 0xFE;   # n_desc library-ordinal byte
 
+# dyld rebase-opcode bytes (the high nibble is the opcode, the low nibble an
+# immediate). a position-independent image rebases each in-image absolute pointer:
+# set the pointer type once, then per slot select the segment + offset and apply.
+val REBASE_OPCODE_DONE:                    u8 = 0x00;
+val REBASE_OPCODE_SET_TYPE_IMM:            u8 = 0x10;
+val REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB: u8 = 0x20;
+val REBASE_OPCODE_DO_REBASE_IMM_TIMES:     u8 = 0x50;
+val REBASE_TYPE_POINTER:                   u8 = 0x1;
+
 # the dynamic loader Darwin executables name in LC_LOAD_DYLINKER.
 val DARWIN_DYLD_PATH: str = "/usr/lib/dyld";
 
@@ -177,6 +217,34 @@ val ARM_PC_STATE_OFFSET:  usize = 256;
 # default page size for the static executable layout; segment file offsets are
 # page-aligned to keep each segment's `fileoff` congruent with its `vmaddr`.
 val EXEC_PAGE_SIZE: u64 = 4096;
+
+# embedded code-signing magics and the single code-directory sub-blob slot. all
+# code-signing structures are big-endian, unlike the little-endian Mach-O around
+# them.
+val CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xFADE0CC0;
+val CSMAGIC_CODEDIRECTORY:      u32 = 0xFADE0C02;
+val CSSLOT_CODEDIRECTORY:       u32 = 0;
+
+# CodeDirectory version 0x20400 carries the executable-segment fields the Apple
+# Silicon kernel reads to authorize a main binary; the adhoc flag marks a
+# signature with no CMS (certificate) blob, which is what makes it ad-hoc. The
+# linker-signed flag marks an ad-hoc signature applied by the linker itself (as ld
+# does on Apple Silicon): CoreTrust admits a linker-signed ad-hoc main executable,
+# but rejects a hand-rolled ad-hoc one - so mach, being the linker, sets both.
+val CS_CODEDIRECTORY_VERSION: u32 = 0x00020400;
+val CS_ADHOC_FLAG:            u32 = 0x0002;
+val CS_LINKER_SIGNED_FLAG:    u32 = 0x20000;
+val CS_HASHTYPE_SHA256:       u8  = 2;
+val CS_HASH_SIZE_SHA256:      u8  = 32;
+val CS_PAGE_SHIFT:            u8  = 12;    # log2(4096)
+val CS_EXECSEG_MAIN_BINARY:   u64 = 0x1;
+
+# on-disk sizes of the code-signing structures and the LC_CODE_SIGNATURE command.
+val LINKEDIT_DATA_CMD_SIZE: usize = 16;   # cmd, cmdsize, dataoff, datasize
+val SUPERBLOB_HEADER_SIZE:  usize = 20;   # magic, length, count, one blob index
+val CODEDIR_HEADER_SIZE:    usize = 88;   # the fixed version-0x20400 header
+val CODE_SIG_PAGE_SIZE:     usize = 4096; # the 4 KiB hashing page (pageSize 12)
+val CODE_SIG_ALIGN:         usize = 16;   # the signature blob is 16-byte aligned
 
 # the machine relocation a Mach-O writer emits for one abstract kind.
 # ---
@@ -209,6 +277,17 @@ fun resolve(itn: *intern.Interner, id: intern.StrId) str {
 # ret:     true for aarch64
 fun arch_is_arm64(arch_id: u32) bool {
     ret arch_id == isa.ARCH_AARCH64;
+}
+
+# the Mach-O segment page size for an ISA: arm64 Darwin maps memory in 16 KiB pages
+# and the kernel requires every segment vmaddr/fileoff to be 16 KiB aligned, while
+# x86_64 uses 4 KiB. segments laid out at the wrong granularity are rejected at exec.
+# ---
+# arch_id: the target ISA id
+# ret:     the segment alignment page size in bytes
+fun macho_page_size(arch_id: u32) u64 {
+    if (arch_is_arm64(arch_id)) { ret 16384; }
+    ret 4096;
 }
 
 # the Mach-O cputype for an ISA id, or an error for an unsupported architecture.
@@ -588,9 +667,10 @@ fun is_extdef_sym(sym: *of.Symbol) bool {
 # str_pos:  in/out string-table cursor, advanced past the written name
 # img:      the object image the symbol is drawn from
 # idx:      index of the symbol within the image symbol table
-# sec_addr: per-section in-segment base addresses
+# sec_addr: per-input-section in-segment base addresses
+# kind_out: per-kind coalesced output-section index (recovers the 1-based n_sect)
 fun write_nlist(buf: *u8, sym_off: usize, str_base: usize, str_pos: *usize,
-                img: *of.ObjectImage, idx: u32, sec_addr: *u64) {
+                img: *of.ObjectImage, idx: u32, sec_addr: *u64, kind_out: *u32) {
     val sym: *of.Symbol = ?img.symbols[idx];
     val name: str = resolve(img.interner, sym.name);
     var n_strx: u32 = 0;
@@ -611,7 +691,10 @@ fun write_nlist(buf: *u8, sym_off: usize, str_base: usize, str_pos: *usize,
     var n_value: u64 = 0;
     if (sym.section != of.SECTION_EXTERNAL && sym.section < img.section_count) {
         n_type = N_SECT;
-        n_sect = (sym.section + 1)::u8;
+        # the symbol's defining input section was coalesced by kind into one
+        # output section; n_sect is that 1-based coalesced index (within the
+        # 255-section byte), and n_value its absolute in-segment address.
+        n_sect = (kind_out[img.sections[sym.section].kind::u32] + 1)::u8;
         n_value = sec_addr[sym.section] + sym.offset::u64;
         if ((sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0) { n_desc = N_WEAK_DEF; }
     }
@@ -696,14 +779,53 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     val num_secs: u32 = img.section_count;
     val num_syms: u32 = img.symbol_count;
 
-    # load commands: one segment (with every section), symtab, dysymtab.
-    val seg_cmd_size: usize = SEGMENT_CMD_64_SIZE + num_secs::usize * SECTION_64_SIZE;
+    # Mach-O's nlist `n_sect` is a single byte, so an object cannot address more
+    # than 255 sections. the back end emits one input section per data global,
+    # which for a non-trivial module reaches the hundreds, overflowing that byte
+    # and corrupting (or dropping, when the index lands on a multiple of 256) every
+    # local constant-pool symbol past the limit. a real Mach-O object groups its
+    # content by kind into a handful of sections, so coalesce the input sections
+    # into one output section per kind, laying each kind's members contiguously and
+    # remapping every symbol and relocation onto the coalesced section. the
+    # canonical order keeps the zero-fill __bss section last, where the segment's
+    # file image ends.
+    var korder: [5]of.SectionKind;
+    korder[0] = of.SK_TEXT;
+    korder[1] = of.SK_RODATA;
+    korder[2] = of.SK_DATA;
+    korder[3] = of.SK_DEBUG;
+    korder[4] = of.SK_BSS;
+
+    # kind -> coalesced output-section index (0xFFFFFFFF when the kind is absent),
+    # and the kind of each coalesced section in emission order.
+    var kind_to_out: [5]u32;
+    var ki: u32 = 0;
+    for (ki < 5) { kind_to_out[ki] = 0xFFFFFFFF; ki = ki + 1; }
+    var out_kind: [5]of.SectionKind;
+    var num_out:  u32 = 0;
+    var ko: u32 = 0;
+    for (ko < 5) {
+        var present: bool = false;
+        var sp: u32 = 0;
+        for (sp < num_secs) {
+            if (img.sections[sp].kind == korder[ko]) { present = true; brk; }
+            sp = sp + 1;
+        }
+        if (present) {
+            kind_to_out[korder[ko]::u32] = num_out;
+            out_kind[num_out] = korder[ko];
+            num_out = num_out + 1;
+        }
+        ko = ko + 1;
+    }
+
+    # load commands: one segment (with the coalesced sections), symtab, dysymtab.
+    val seg_cmd_size: usize = SEGMENT_CMD_64_SIZE + num_out::usize * SECTION_64_SIZE;
     val sizeofcmds:   usize = seg_cmd_size + SYMTAB_CMD_SIZE + DYSYMTAB_CMD_SIZE;
     val header_end:   usize = MACH_HEADER_64_SIZE + sizeofcmds;
 
-    # per-section in-segment addresses (vm) and file offsets. addresses advance
-    # for every section so vmsize covers the zero-fill tail; file offsets advance
-    # only for sections that carry bytes.
+    # per-input-section absolute vm address and file offset within the single
+    # segment; both advance through the coalesced section the input section joins.
     val res_addr: R.Result[*u64, str] = A.zallocate[u64](alloc, (num_secs + 1)::usize);
     if (R.is_err[*u64, str](res_addr)) { ret R.err[bool, str]("macho: section address table alloc failed"); }
     var sec_addr: *u64 = R.unwrap_ok[*u64, str](res_addr);
@@ -715,55 +837,91 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     }
     var data_off: *usize = R.unwrap_ok[*usize, str](res_doff);
 
+    # per-coalesced-section vm address, vm size, file offset, alignment, relocation
+    # array offset, and relocation_info entry count.
+    var out_addr:   [5]u64;
+    var out_size:   [5]u64;
+    var out_fileo:  [5]usize;
+    var out_align:  [5]u32;
+    var out_reloff: [5]usize;
+    var out_nrel:   [5]u32;
+
+    # vm layout: lay every coalesced section in canonical order, its members (the
+    # input sections of that kind) contiguous and each individually aligned. the
+    # section's alignment is the strictest of its members'.
     var vm: u64 = 0;
-    var s: u32 = 0;
-    for (s < num_secs) {
-        var a: u32 = img.sections[s].align;
-        if (a < 1) { a = 1; }
-        vm = bin.align_up_u64(vm, a::u64);
-        sec_addr[s] = vm;
-        vm = vm + img.sections[s].len::u64;
-        s = s + 1;
+    var s:  u32 = 0;
+    ko = 0;
+    for (ko < num_out) {
+        var a_sec: u32 = 1;
+        var sp: u32 = 0;
+        for (sp < num_secs) {
+            if (img.sections[sp].kind == out_kind[ko] && img.sections[sp].align > a_sec) { a_sec = img.sections[sp].align; }
+            sp = sp + 1;
+        }
+        out_align[ko] = a_sec;
+        vm = bin.align_up_u64(vm, a_sec::u64);
+        out_addr[ko] = vm;
+        sp = 0;
+        for (sp < num_secs) {
+            if (img.sections[sp].kind != out_kind[ko]) { sp = sp + 1; cnt; }
+            var a: u32 = img.sections[sp].align;
+            if (a < 1) { a = 1; }
+            vm = bin.align_up_u64(vm, a::u64);
+            sec_addr[sp] = vm;
+            vm = vm + img.sections[sp].len::u64;
+            sp = sp + 1;
+        }
+        out_size[ko] = vm - out_addr[ko];
+        ko = ko + 1;
     }
     val seg_vmsize: u64 = vm;
 
+    # file layout: the non-zero-fill coalesced sections carry bytes after the
+    # header; __bss occupies vm only, so its members keep a zero file offset. each
+    # member's file offset mirrors its in-section vm offset, so the in-place addend
+    # fields and the parsed-back relocation sites stay aligned.
     val seg_fileoff: usize = bin.align_up(header_end, 8);
     var file: usize = seg_fileoff;
-    s = 0;
-    for (s < num_secs) {
-        if (img.sections[s].kind != of.SK_BSS) {
-            var a: u32 = img.sections[s].align;
-            if (a < 1) { a = 1; }
-            file = bin.align_up(file, a::usize);
-            data_off[s] = file;
-            file = file + img.sections[s].len::usize;
-        } or {
-            data_off[s] = 0;
+    ko = 0;
+    for (ko < num_out) {
+        var sp: u32 = 0;
+        if (out_kind[ko] == of.SK_BSS) {
+            out_fileo[ko] = 0;
+            for (sp < num_secs) {
+                if (img.sections[sp].kind == of.SK_BSS) { data_off[sp] = 0; }
+                sp = sp + 1;
+            }
+            ko = ko + 1;
+            cnt;
         }
-        s = s + 1;
+        file = bin.align_up(file, out_align[ko]::usize);
+        out_fileo[ko] = file;
+        for (sp < num_secs) {
+            if (img.sections[sp].kind != out_kind[ko]) { sp = sp + 1; cnt; }
+            data_off[sp] = out_fileo[ko] + (sec_addr[sp] - out_addr[ko])::usize;
+            sp = sp + 1;
+        }
+        file = out_fileo[ko] + out_size[ko]::usize;
+        ko = ko + 1;
     }
     val seg_filesize: usize = file - seg_fileoff;
 
-    # relocation arrays follow the section data, 4-byte aligned.
-    val res_roff: R.Result[*usize, str] = A.zallocate[usize](alloc, (num_secs + 1)::usize);
-    if (R.is_err[*usize, str](res_roff)) {
-        A.deallocate[u64](alloc, sec_addr, (num_secs + 1)::usize);
-        A.deallocate[usize](alloc, data_off, (num_secs + 1)::usize);
-        ret R.err[bool, str]("macho: reloc offset table alloc failed");
-    }
-    var reloc_off: *usize = R.unwrap_ok[*usize, str](res_roff);
-
+    # relocation arrays follow the section data, 4-byte aligned, one per coalesced
+    # section (covering every member's relocations).
     var roff: usize = bin.align_up(file, 4);
-    s = 0;
-    for (s < num_secs) {
-        val n: u32 = reloc_entries_for_section(img, s, arch_id);
-        if (n > 0) {
-            reloc_off[s] = roff;
-            roff = roff + n::usize * RELOC_INFO_SIZE;
-        } or {
-            reloc_off[s] = 0;
+    ko = 0;
+    for (ko < num_out) {
+        var n: u32 = 0;
+        var sp: u32 = 0;
+        for (sp < num_secs) {
+            if (img.sections[sp].kind == out_kind[ko]) { n = n + reloc_entries_for_section(img, sp, arch_id); }
+            sp = sp + 1;
         }
-        s = s + 1;
+        out_nrel[ko] = n;
+        if (n > 0) { out_reloff[ko] = roff; roff = roff + n::usize * RELOC_INFO_SIZE; }
+        or         { out_reloff[ko] = 0; }
+        ko = ko + 1;
     }
 
     val symtab_off: usize = bin.align_up(roff, 8);
@@ -776,7 +934,6 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     if (R.is_err[*u8, str](res_buf)) {
         A.deallocate[u64](alloc, sec_addr, (num_secs + 1)::usize);
         A.deallocate[usize](alloc, data_off, (num_secs + 1)::usize);
-        A.deallocate[usize](alloc, reloc_off, (num_secs + 1)::usize);
         ret R.err[bool, str]("macho: output buffer alloc failed");
     }
     var buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
@@ -802,28 +959,30 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     bin.write_u64_le(buf, lc + 48, seg_filesize::u64);
     bin.write_u32_le(buf, lc + 56, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
     bin.write_u32_le(buf, lc + 60, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE);
-    bin.write_u32_le(buf, lc + 64, num_secs);
+    bin.write_u32_le(buf, lc + 64, num_out);
     bin.write_u32_le(buf, lc + 68, 0);
 
-    # section_64 entries.
+    # section_64 entries, one per coalesced section. a zero-fill (__bss) section
+    # keeps a zero file offset; the rest point at their coalesced byte run.
     var sh: usize = lc + SEGMENT_CMD_64_SIZE;
-    s = 0;
-    for (s < num_secs) {
-        write_fixed16(buf, sh, macho_sectname(img.sections[s].kind));
-        write_fixed16(buf, sh + 16, macho_segname(img.sections[s].kind));
-        bin.write_u64_le(buf, sh + 32, sec_addr[s]);
-        bin.write_u64_le(buf, sh + 40, img.sections[s].len::u64);
-        bin.write_u32_le(buf, sh + 48, data_off[s]::u32);
-        bin.write_u32_le(buf, sh + 52, align_log2(img.sections[s].align));
-        val nrel: u32 = reloc_entries_for_section(img, s, arch_id);
-        bin.write_u32_le(buf, sh + 56, reloc_off[s]::u32);
-        bin.write_u32_le(buf, sh + 60, nrel);
-        bin.write_u32_le(buf, sh + 64, macho_section_flags(img.sections[s].kind));
+    ko = 0;
+    for (ko < num_out) {
+        write_fixed16(buf, sh, macho_sectname(out_kind[ko]));
+        write_fixed16(buf, sh + 16, macho_segname(out_kind[ko]));
+        bin.write_u64_le(buf, sh + 32, out_addr[ko]);
+        bin.write_u64_le(buf, sh + 40, out_size[ko]);
+        var foff: u32 = 0;
+        if (out_kind[ko] != of.SK_BSS) { foff = out_fileo[ko]::u32; }
+        bin.write_u32_le(buf, sh + 48, foff);
+        bin.write_u32_le(buf, sh + 52, align_log2(out_align[ko]));
+        bin.write_u32_le(buf, sh + 56, out_reloff[ko]::u32);
+        bin.write_u32_le(buf, sh + 60, out_nrel[ko]);
+        bin.write_u32_le(buf, sh + 64, macho_section_flags(out_kind[ko]));
         bin.write_u32_le(buf, sh + 68, 0);
         bin.write_u32_le(buf, sh + 72, 0);
         bin.write_u32_le(buf, sh + 76, 0);
         sh = sh + SECTION_64_SIZE;
-        s = s + 1;
+        ko = ko + 1;
     }
 
     # symbol partition counts for LC_DYSYMTAB and the nlist ordering.
@@ -887,7 +1046,6 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
         if (R.is_err[*u32, str](res_remap)) {
             A.deallocate[u64](alloc, sec_addr, (num_secs + 1)::usize);
             A.deallocate[usize](alloc, data_off, (num_secs + 1)::usize);
-            A.deallocate[usize](alloc, reloc_off, (num_secs + 1)::usize);
             A.deallocate[u8](alloc, buf, total_size);
             ret R.err[bool, str]("macho: symbol remap alloc failed");
         }
@@ -903,7 +1061,7 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     for (symi < num_syms) {
         if (!is_local_sym(?img.symbols[symi])) { symi = symi + 1; cnt; }
         if (remap != nil) { remap[symi] = nlist_idx; }
-        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr);
+        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr, ?kind_to_out[0]);
         sym_off = sym_off + NLIST_64_SIZE;
         nlist_idx = nlist_idx + 1;
         symi = symi + 1;
@@ -913,7 +1071,7 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     for (symi < num_syms) {
         if (!is_extdef_sym(?img.symbols[symi])) { symi = symi + 1; cnt; }
         if (remap != nil) { remap[symi] = nlist_idx; }
-        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr);
+        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr, ?kind_to_out[0]);
         sym_off = sym_off + NLIST_64_SIZE;
         nlist_idx = nlist_idx + 1;
         symi = symi + 1;
@@ -923,42 +1081,49 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     for (symi < num_syms) {
         if (img.symbols[symi].section != of.SECTION_EXTERNAL) { symi = symi + 1; cnt; }
         if (remap != nil) { remap[symi] = nlist_idx; }
-        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr);
+        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr, ?kind_to_out[0]);
         sym_off = sym_off + NLIST_64_SIZE;
         nlist_idx = nlist_idx + 1;
         symi = symi + 1;
     }
 
-    # per-section relocation_info arrays, in image order, each preceded by an
-    # ARM64_RELOC_ADDEND entry when the abstract addend cannot live in-place.
-    s = 0;
-    for (s < num_secs) {
-        if (reloc_off[s] != 0) {
-            var ro: usize = reloc_off[s];
+    # relocation_info arrays, one per coalesced section: each member's relocations
+    # rebased onto the coalesced section (r_address offset by the member's position
+    # within it), with an ARM64_RELOC_ADDEND entry ahead of a relocation whose
+    # addend cannot live in-place.
+    ko = 0;
+    for (ko < num_out) {
+        if (out_reloff[ko] == 0) { ko = ko + 1; cnt; }
+        var ro: usize = out_reloff[ko];
+        var sp: u32 = 0;
+        for (sp < num_secs) {
+            if (img.sections[sp].kind != out_kind[ko]) { sp = sp + 1; cnt; }
+            val base: u32 = (sec_addr[sp] - out_addr[ko])::u32;
             var ri: u32 = 0;
             for (ri < img.reloc_count) {
-                if (img.relocations[ri].section == s) {
+                if (img.relocations[ri].section == sp) {
+                    val radr: u32 = base + img.relocations[ri].offset;
                     val rsi: u32 = R.unwrap_ok[u32, str](reloc_sym_index(img, img.relocations[ri].symbol));
                     val symnum: u32 = remap[rsi];
                     val mr: MachoReloc = R.unwrap_ok[MachoReloc, str](macho_reloc_for(img.interner, alloc, arch_id, img.relocations[ri].kind));
                     if (needs_addend_entry(arch_id, img.relocations[ri].kind, img.relocations[ri].addend)) {
-                        write_reloc_info(buf, ro, img.relocations[ri].offset, (img.relocations[ri].addend::u64)::u32 & 0xFFFFFF,
+                        write_reloc_info(buf, ro, radr, (img.relocations[ri].addend::u64)::u32 & 0xFFFFFF,
                                          0, 2, 0, ARM64_RELOC_ADDEND);
                         ro = ro + RELOC_INFO_SIZE;
                     }
-                    write_reloc_info(buf, ro, img.relocations[ri].offset, symnum, mr.pcrel, mr.length, 1, mr.r_type);
+                    write_reloc_info(buf, ro, radr, symnum, mr.pcrel, mr.length, 1, mr.r_type);
                     ro = ro + RELOC_INFO_SIZE;
                 }
                 ri = ri + 1;
             }
+            sp = sp + 1;
         }
-        s = s + 1;
+        ko = ko + 1;
     }
 
     if (remap != nil) { A.deallocate[u32](alloc, remap, num_syms::usize); }
     A.deallocate[u64](alloc, sec_addr, (num_secs + 1)::usize);
     A.deallocate[usize](alloc, data_off, (num_secs + 1)::usize);
-    A.deallocate[usize](alloc, reloc_off, (num_secs + 1)::usize);
 
     val wr: R.Result[bool, str] = write_file(img.interner, alloc, path, buf, total_size, "macho: object");
     A.deallocate[u8](alloc, buf, total_size);
@@ -1041,16 +1206,138 @@ fun exec_segname(flags: u32) str {
     ret "__DATA_CONST";
 }
 
+# the CodeDirectory identifier length: the byte length of the null-terminated
+# product name (excludes the terminator; 0 for a nil name)
+#
+# The identifier is the artifact's stable product name (e.g. "mach"), not the `-o`
+# output basename, so the signed image is byte-identical regardless of the output
+# filename - which the rename-based self-host fixpoint (a -> b -> c) requires.
+# ---
+# name: the null-terminated product name
+# ret:  the identifier byte length
+fun codesign_ident_len(name: *u8) usize {
+    if (name == nil) { ret 0; }
+    var len: usize = 0;
+    for (name[len] != 0) { len = len + 1; }
+    ret len;
+}
+
+# the number of 4 KiB code slots covering the file bytes [0, code_limit), rounded
+# up so the final (possibly short) page gets its own slot.
+# ---
+# code_limit: the file offset where the signature begins
+# ret:        the code-slot count
+fun codesign_code_slots(code_limit: usize) usize {
+    ret (code_limit + CODE_SIG_PAGE_SIZE - 1) / CODE_SIG_PAGE_SIZE;
+}
+
+# the byte length of the CodeDirectory blob: the fixed header, the nul-terminated
+# identifier, then one SHA-256 hash per code slot.
+# ---
+# ident_len:  the identifier byte length (excludes the terminator)
+# code_limit: the file offset where the signature begins
+# ret:        the CodeDirectory blob byte length
+fun codedir_blob_size(ident_len: usize, code_limit: usize) usize {
+    ret CODEDIR_HEADER_SIZE + ident_len + 1 + codesign_code_slots(code_limit) * CS_HASH_SIZE_SHA256::usize;
+}
+
+# the byte length of the embedded-signature SuperBlob wrapping one CodeDirectory.
+# ---
+# ident_len:  the identifier byte length (excludes the terminator)
+# code_limit: the file offset where the signature begins
+# ret:        the total signature byte length
+fun code_signature_size(ident_len: usize, code_limit: usize) usize {
+    ret SUPERBLOB_HEADER_SIZE + codedir_blob_size(ident_len, code_limit);
+}
+
+# write an ad-hoc embedded code signature into `buf` at `sig_off`
+#
+# Lays out a CSMAGIC_EMBEDDED_SIGNATURE SuperBlob wrapping a single
+# CSMAGIC_CODEDIRECTORY (version 0x20400, adhoc flag, SHA-256). The CodeDirectory
+# hashes the file bytes [0, code_limit) in 4 KiB pages - so every byte before the
+# signature is covered - and records the executable segment so the Apple Silicon
+# kernel authorizes the main binary. All code-signing fields are big-endian. The
+# result is deterministic: a pure function of the input bytes, the identifier, and
+# the layout, with no timestamp or nonce, so identical input yields identical bytes.
+# ---
+# buf:        the output buffer (the file bytes [0, code_limit) already written)
+# sig_off:    file offset the signature is written at (equal to code_limit)
+# name:       null-terminated product name used as the identifier (filename-stable)
+# code_limit: file offset where the signature begins (hashes cover [0, code_limit))
+# exec_base:  file offset of the executable (__TEXT) segment
+# exec_limit: file byte size of the executable (__TEXT) segment
+fun write_code_signature(buf: *u8, sig_off: usize, name: *u8, code_limit: usize,
+                         exec_base: u64, exec_limit: u64) {
+    val ident_len:   usize = codesign_ident_len(name);
+    val n_slots:     usize = codesign_code_slots(code_limit);
+    val cd_size:     usize = codedir_blob_size(ident_len, code_limit);
+    val sig_size:    usize = SUPERBLOB_HEADER_SIZE + cd_size;
+
+    # SuperBlob header, then one blob index pointing at the CodeDirectory.
+    bin.write_u32_be(buf, sig_off,      CSMAGIC_EMBEDDED_SIGNATURE);
+    bin.write_u32_be(buf, sig_off + 4,  sig_size::u32);
+    bin.write_u32_be(buf, sig_off + 8,  1);
+    bin.write_u32_be(buf, sig_off + 12, CSSLOT_CODEDIRECTORY);
+    bin.write_u32_be(buf, sig_off + 16, SUPERBLOB_HEADER_SIZE::u32);
+
+    # CodeDirectory: the identifier follows the fixed header, then the code hashes.
+    val cd:        usize = sig_off + SUPERBLOB_HEADER_SIZE;
+    val ident_off: usize = CODEDIR_HEADER_SIZE;
+    val hash_off:  usize = CODEDIR_HEADER_SIZE + ident_len + 1;
+
+    bin.write_u32_be(buf, cd,      CSMAGIC_CODEDIRECTORY);
+    bin.write_u32_be(buf, cd + 4,  cd_size::u32);
+    bin.write_u32_be(buf, cd + 8,  CS_CODEDIRECTORY_VERSION);
+    bin.write_u32_be(buf, cd + 12, CS_ADHOC_FLAG | CS_LINKER_SIGNED_FLAG);
+    bin.write_u32_be(buf, cd + 16, hash_off::u32);            # hashOffset (slot 0)
+    bin.write_u32_be(buf, cd + 20, ident_off::u32);           # identOffset
+    bin.write_u32_be(buf, cd + 24, 0);                        # nSpecialSlots
+    bin.write_u32_be(buf, cd + 28, n_slots::u32);             # nCodeSlots
+    bin.write_u32_be(buf, cd + 32, code_limit::u32);          # codeLimit
+    buf[cd + 36] = CS_HASH_SIZE_SHA256;                       # hashSize
+    buf[cd + 37] = CS_HASHTYPE_SHA256;                        # hashType
+    buf[cd + 38] = 0;                                         # platform
+    buf[cd + 39] = CS_PAGE_SHIFT;                             # pageSize (log2)
+    bin.write_u32_be(buf, cd + 40, 0);                        # spare2
+    bin.write_u32_be(buf, cd + 44, 0);                        # scatterOffset
+    bin.write_u32_be(buf, cd + 48, 0);                        # teamOffset
+    bin.write_u32_be(buf, cd + 52, 0);                        # spare3
+    bin.write_u64_be(buf, cd + 56, 0);                        # codeLimit64 (unused)
+    bin.write_u64_be(buf, cd + 64, exec_base);                # execSegBase
+    bin.write_u64_be(buf, cd + 72, exec_limit);               # execSegLimit
+    bin.write_u64_be(buf, cd + 80, CS_EXECSEG_MAIN_BINARY);   # execSegFlags
+
+    # the identifier C-string (the product name).
+    var k: usize = 0;
+    for (k < ident_len) {
+        buf[cd + ident_off + k] = name[k];
+        k = k + 1;
+    }
+    buf[cd + ident_off + ident_len] = 0;
+
+    # one SHA-256 per 4 KiB page of [0, code_limit); the final page may be short.
+    var slot: usize = 0;
+    for (slot < n_slots) {
+        val page_off: usize = slot * CODE_SIG_PAGE_SIZE;
+        var page_len: usize = CODE_SIG_PAGE_SIZE;
+        if (page_off + page_len > code_limit) { page_len = code_limit - page_off; }
+        sha256.hash(?buf[page_off], page_len, ?buf[cd + hash_off + slot * CS_HASH_SIZE_SHA256::usize]);
+        slot = slot + 1;
+    }
+}
+
 # write a static MH_EXECUTE Mach-O, installed as the of.ExecFn
 #
 # Frames the linker's laid-out load segments with a leading __PAGEZERO (the
 # unmapped low region below the image base), one LC_SEGMENT_64 per segment, and an
 # LC_UNIXTHREAD whose thread state carries the entry point - the static thread
-# entry, with no dyld dependency. The mach header and load commands occupy the
-# file head; each segment's file bytes follow at a page-aligned offset congruent
-# with its virtual address. A runnable Darwin image (header inside __TEXT, dyld /
-# LC_MAIN, code signature) is the Darwin-runtime follow-up (#1178); this writer
-# emits the structurally complete static skeleton the byte-verify lane checks.
+# entry, with no dyld dependency. The mach header and load commands map into the
+# first segment (__TEXT): __TEXT starts at file offset 0 and virtual address
+# `base - hdr_span`, so the header sits inside the signed, mapped executable
+# segment ahead of the linker's text, which follows at `hdr_span`. A trailing
+# __LINKEDIT segment carries an ad-hoc LC_CODE_SIGNATURE so the Apple Silicon
+# kernel admits the image - it SIGKILLs an arm64 executable whose signature does
+# not cover the mapped header (and any unsigned arm64 executable).
 #
 # `funcs`/`func_count` are accepted for of.ExecFn conformance; no unwind table is
 # emitted.
@@ -1064,30 +1351,49 @@ fun exec_segname(flags: u32) str {
 # funcs:      per-function metadata (unused)
 # func_count: number of entries in funcs (unused)
 # path:       null-terminated output file path
+# name:       null-terminated product name; the filename-stable code-sign identifier
 # ret:        ok(true) on success, or an error string
 fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
               seg_count: u32, entry: u64, funcs: *of.ExecFunction, func_count: u32,
-              path: *u8) R.Result[bool, str] {
+              path: *u8, name: *u8) R.Result[bool, str] {
     if (isa_vt == nil) { ret R.err[bool, str]("macho: nil exec isa"); }
     if (path == nil)   { ret R.err[bool, str]("macho: nil exec path"); }
     val arch_id: u32 = isa_vt.id;
     val ct: R.Result[u32, str] = cpu_type_for(arch_id);
     if (R.is_err[u32, str](ct)) { ret R.err[bool, str](R.unwrap_err[u32, str](ct)); }
 
-    # __PAGEZERO spans the low region below the image base; with a zero base
-    # (freestanding) there is none.
-    var pagezero_size: u64 = 0;
-    if (seg_count > 0) { pagezero_size = segs[0].vaddr & ~(EXEC_PAGE_SIZE - 1); }
-    var ncmds: u32 = seg_count + 1;                 # one LC_UNIXTHREAD
-    if (pagezero_size > 0) { ncmds = ncmds + 1; }   # plus __PAGEZERO
+    # __PAGEZERO spans the low region below __TEXT; it is present whenever the image
+    # base is non-zero (darwin executables always carry one). its exact span depends
+    # on hdr_span, computed once the load-command size is known below.
+    var has_pagezero: bool = seg_count > 0 && segs[0].vaddr > 0;
+    # the linker segments, a trailing __LINKEDIT (carrying the code signature),
+    # LC_UNIXTHREAD, LC_CODE_SIGNATURE, and __PAGEZERO when the base is non-zero.
+    var ncmds: u32 = seg_count + 3;
+    if (has_pagezero) { ncmds = ncmds + 1; }
 
     var thread_state: usize = X86_THREAD_STATE64_COUNT::usize * 4;
     if (arch_is_arm64(arch_id)) { thread_state = ARM_THREAD_STATE64_COUNT::usize * 4; }
     val thread_cmd_size: usize = 16 + thread_state;
 
-    var sizeofcmds: usize = seg_count::usize * SEGMENT_CMD_64_SIZE + thread_cmd_size;
-    if (pagezero_size > 0) { sizeofcmds = sizeofcmds + SEGMENT_CMD_64_SIZE; }
+    var sizeofcmds: usize = seg_count::usize * SEGMENT_CMD_64_SIZE + thread_cmd_size
+                          + SEGMENT_CMD_64_SIZE + LINKEDIT_DATA_CMD_SIZE;   # __LINKEDIT + LC_CODE_SIGNATURE
+    if (has_pagezero) { sizeofcmds = sizeofcmds + SEGMENT_CMD_64_SIZE; }
     val header_end: usize = MACH_HEADER_64_SIZE + sizeofcmds;
+
+    # the mach header + load commands map into __TEXT's first hdr_span bytes: the
+    # Apple Silicon kernel admits a signed image only when the header lies inside the
+    # signed, mapped __TEXT. the first linker segment must therefore sit at least
+    # hdr_span above the image base, leaving room for the header below it.
+    val hdr_span: usize = bin.align_up(header_end, EXEC_PAGE_SIZE::usize);
+    if (seg_count > 0 && segs[0].vaddr < hdr_span::u64) {
+        ret R.err[bool, str]("macho: exec base address too low to map the header");
+    }
+    var text_va:       u64 = 0;
+    var pagezero_size: u64 = 0;
+    if (seg_count > 0) {
+        text_va       = segs[0].vaddr - hdr_span::u64;
+        pagezero_size = text_va;
+    }
 
     var seg_offsets: *usize = nil;
     if (seg_count > 0) {
@@ -1096,7 +1402,10 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
         seg_offsets = R.unwrap_ok[*usize, str](ro);
     }
 
-    var total_size: usize = bin.align_up(header_end, EXEC_PAGE_SIZE::usize);
+    # the first linker segment's bytes follow the header at hdr_span; the rest are
+    # page-aligned in turn. __TEXT (the first segment) therefore shares its file
+    # region with the header.
+    var total_size: usize = hdr_span;
     var li: u32 = 0;
     for (li < seg_count) {
         total_size = bin.align_up(total_size, EXEC_PAGE_SIZE::usize);
@@ -1104,6 +1413,33 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
         total_size = total_size + segs[li].filesz;
         li = li + 1;
     }
+
+    # the highest mapped virtual address, for the trailing __LINKEDIT placement.
+    var hi_va: u64 = 0;
+    li = 0;
+    for (li < seg_count) {
+        val end: u64 = segs[li].vaddr + bin.align_up_u64(segs[li].memsz::u64, EXEC_PAGE_SIZE);
+        if (end > hi_va) { hi_va = end; }
+        li = li + 1;
+    }
+
+    # __TEXT - the first segment, now carrying the header - is the executable segment
+    # the code signature authorizes: it starts at file offset 0 and spans the header
+    # plus the linker's text bytes.
+    var exec_base:  u64 = 0;
+    var exec_limit: u64 = 0;
+    if (seg_count > 0) { exec_limit = hdr_span::u64 + segs[0].filesz::u64; }
+
+    # the ad-hoc code signature lives in a trailing __LINKEDIT segment and covers
+    # every byte before it, so it is laid out last and page-aligned. codeLimit is the
+    # signature's file offset; the bytes between the last segment and it hash as zero.
+    val ident_len:     usize = codesign_ident_len(name);
+    val linkedit_off:  usize = bin.align_up(total_size, EXEC_PAGE_SIZE::usize);
+    val code_limit:    usize = linkedit_off;
+    val sig_size:      usize = code_signature_size(ident_len, code_limit);
+    val linkedit_size: usize = sig_size;
+    val linkedit_va:   u64 = bin.align_up_u64(hi_va, EXEC_PAGE_SIZE);
+    total_size = linkedit_off + sig_size;
 
     val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_size);
     if (R.is_err[*u8, str](res_buf)) {
@@ -1140,13 +1476,26 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
     li = 0;
     for (li < seg_count) {
         val prot: u32 = vm_prot_for(segs[li].flags);
+        # the first segment is __TEXT: it maps the mach header + load commands ahead
+        # of the linker's text (fileoff 0, vmaddr text_va), so the signed header lies
+        # inside the mapped executable segment. the rest map at their own offsets.
+        var seg_vaddr:  u64 = segs[li].vaddr;
+        var seg_vmsize: u64 = bin.align_up_u64(segs[li].memsz::u64, EXEC_PAGE_SIZE);
+        var seg_foff:   u64 = seg_offsets[li]::u64;
+        var seg_fsz:    u64 = segs[li].filesz::u64;
+        if (li == 0) {
+            seg_vaddr  = text_va;
+            seg_vmsize = bin.align_up_u64(hdr_span::u64 + segs[0].memsz::u64, EXEC_PAGE_SIZE);
+            seg_foff   = 0;
+            seg_fsz    = hdr_span::u64 + segs[0].filesz::u64;
+        }
         bin.write_u32_le(buf, lc, LC_SEGMENT_64);
         bin.write_u32_le(buf, lc + 4, SEGMENT_CMD_64_SIZE::u32);
         write_fixed16(buf, lc + 8, exec_segname(segs[li].flags));
-        bin.write_u64_le(buf, lc + 24, segs[li].vaddr);
-        bin.write_u64_le(buf, lc + 32, bin.align_up_u64(segs[li].memsz::u64, EXEC_PAGE_SIZE));
-        bin.write_u64_le(buf, lc + 40, seg_offsets[li]::u64);
-        bin.write_u64_le(buf, lc + 48, segs[li].filesz::u64);
+        bin.write_u64_le(buf, lc + 24, seg_vaddr);
+        bin.write_u64_le(buf, lc + 32, seg_vmsize);
+        bin.write_u64_le(buf, lc + 40, seg_foff);
+        bin.write_u64_le(buf, lc + 48, seg_fsz);
         bin.write_u32_le(buf, lc + 56, prot);
         bin.write_u32_le(buf, lc + 60, prot);
         bin.write_u32_le(buf, lc + 64, 0);
@@ -1158,6 +1507,12 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
         }
         li = li + 1;
     }
+
+    # __LINKEDIT carries only the ad-hoc code signature.
+    lc = write_segment_cmd(buf, lc, "__LINKEDIT", linkedit_va,
+                           bin.align_up_u64(linkedit_size::u64, EXEC_PAGE_SIZE),
+                           linkedit_off::u64, linkedit_size::u64,
+                           VM_PROT_READ, VM_PROT_READ, 0);
 
     # LC_UNIXTHREAD: the static entry, with the program counter in the thread
     # state. the surrounding state is zero (the buffer is zero-initialized).
@@ -1172,6 +1527,16 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
         bin.write_u32_le(buf, lc + 12, X86_THREAD_STATE64_COUNT);
         bin.write_u64_le(buf, lc + 16 + X86_RIP_STATE_OFFSET, entry);
     }
+    lc = lc + thread_cmd_size;
+
+    # LC_CODE_SIGNATURE points at the ad-hoc signature in __LINKEDIT.
+    bin.write_u32_le(buf, lc, LC_CODE_SIGNATURE);
+    bin.write_u32_le(buf, lc + 4, LINKEDIT_DATA_CMD_SIZE::u32);
+    bin.write_u32_le(buf, lc + 8, code_limit::u32);
+    bin.write_u32_le(buf, lc + 12, sig_size::u32);
+
+    # all file bytes [0, code_limit) are now in place; hash them into the signature.
+    write_code_signature(buf, code_limit, name, code_limit, exec_base, exec_limit);
 
     if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
 
@@ -1225,6 +1590,8 @@ rec MachoDynLayout {
     linkedit_va:   u64;
     linkedit_size: usize;
 
+    rebase_off:    usize;
+    rebase_size:   usize;
     bind_off:      usize;
     bind_size:     usize;
     symtab_off:    usize;
@@ -1540,6 +1907,125 @@ fun write_bind_info(buf: *u8, off: usize, itn: *intern.Interner, dyn: *of.Dynami
     ret p;
 }
 
+# write the 16-byte LC_UUID payload, derived deterministically from the product name
+#
+# The uuid must be stable across the darwin self-host fixpoint (it is covered by the
+# ad-hoc signature), so it is a name-based RFC 4122 uuid: the first 16 bytes of
+# SHA-256(name), with the version (5) and variant bits set. Keying it on the product
+# name (not the `-o` path) keeps the signed image filename-independent.
+# ---
+# buf:  the output buffer
+# off:  byte offset of the 16-byte uuid field
+# name: null-terminated product name (the stable signing identity)
+fun write_macho_uuid(buf: *u8, off: usize, name: *u8) {
+    var digest: [32]u8;
+    var n: usize = 0;
+    if (name != nil) { n = str_len(name::str); }
+    sha256.hash(name, n, ?digest[0]);
+    var i: usize = 0;
+    for (i < 16) { buf[off + i] = digest[i]; i = i + 1; }
+    buf[off + 6] = (buf[off + 6] & 0x0F) | 0x50;           # version 5 (name-based)
+    buf[off + 8] = (buf[off + 8] & 0x3F) | 0x80;           # RFC 4122 variant
+}
+
+# order two base relocations by (segment, in-segment offset)
+#
+# The rebase stream is emitted in this order so the signed image is byte-identical
+# across the darwin self-host fixpoint (the rebase bytes hash into the signature).
+# ---
+# a, b: the base relocations to compare
+# ret:  negative, zero, or positive per the (seg_index, seg_offset) order
+fun base_reloc_cmp(a: *of.BaseReloc, b: *of.BaseReloc) i64 {
+    if (a.seg_index != b.seg_index) {
+        if (a.seg_index < b.seg_index) { ret -1; }
+        ret 1;
+    }
+    if (a.seg_offset < b.seg_offset) { ret -1; }
+    if (a.seg_offset > b.seg_offset) { ret 1; }
+    ret 0;
+}
+
+# locate one base relocation in the emitted image
+#
+# Resolves the Mach-O segment index (the load-command ordering, __PAGEZERO included)
+# and the slot's byte offset from that segment's virtual address - the two operands a
+# `REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB` needs. The linker's first segment maps
+# as __TEXT, whose vaddr is `text_va` (the header sits below the linker text), so its
+# offsets are measured from there; every other segment maps at its assigned vaddr.
+# ---
+# br:      the base relocation to locate
+# segs:    the linker's load segments
+# text_va: the __TEXT virtual address (the linker's first segment maps above it)
+# pz:      1 when a __PAGEZERO precedes the linker segments, else 0
+# out_seg: receives the Mach-O segment index
+# out_off: receives the slot's byte offset from that segment's virtual address
+fun base_reloc_loc(br: *of.BaseReloc, segs: *of.LoadSegment, text_va: u64, pz: u32,
+                   out_seg: *u32, out_off: *u64) {
+    val ls: u32 = br.seg_index;
+    @out_seg = pz + ls;
+    var seg_vmaddr: u64 = segs[ls].vaddr;
+    if (ls == 0) { seg_vmaddr = text_va; }
+    @out_off = (segs[ls].vaddr + br.seg_offset::u64) - seg_vmaddr;
+}
+
+# the byte length of the dyld rebase opcode stream for the image's base relocations
+# ---
+# dyn:     the dynamic-link plan carrying the base-relocation set
+# segs:    the linker's load segments
+# text_va: the __TEXT virtual address
+# pz:      1 when a __PAGEZERO precedes the linker segments, else 0
+# ret:     the rebase stream byte length (0 when there are no base relocations)
+fun measure_rebase_info(dyn: *of.DynamicInfo, segs: *of.LoadSegment, text_va: u64, pz: u32) usize {
+    if (dyn.base_reloc_count == 0) { ret 0; }
+    var size: usize = 1;                                   # SET_TYPE_IMM
+    var i: u32 = 0;
+    for (i < dyn.base_reloc_count) {
+        var seg: u32 = 0;
+        var off: u64 = 0;
+        base_reloc_loc(?dyn.base_relocs[i], segs, text_va, pz, ?seg, ?off);
+        size = size + 1 + uleb_size(off) + 1;             # SET_SEGMENT_AND_OFFSET + DO_REBASE_IMM_TIMES
+        i = i + 1;
+    }
+    size = size + 1;                                       # REBASE_OPCODE_DONE
+    ret size;
+}
+
+# write the dyld rebase opcode stream that slides each in-image absolute pointer
+#
+# Sets the pointer rebase type once, then for each base relocation selects its
+# segment + in-segment offset and rebases one pointer there; dyld adds the image's
+# load bias to the slot at map time. The relocations are pre-sorted so the stream is
+# deterministic.
+# ---
+# buf:     the output buffer
+# off:     byte offset of the rebase stream
+# dyn:     the dynamic-link plan carrying the (sorted) base-relocation set
+# segs:    the linker's load segments
+# text_va: the __TEXT virtual address
+# pz:      1 when a __PAGEZERO precedes the linker segments, else 0
+# ret:     the byte offset just past the stream
+fun write_rebase_info(buf: *u8, off: usize, dyn: *of.DynamicInfo, segs: *of.LoadSegment,
+                      text_va: u64, pz: u32) usize {
+    if (dyn.base_reloc_count == 0) { ret off; }
+    var p: usize = off;
+    buf[p] = REBASE_OPCODE_SET_TYPE_IMM | REBASE_TYPE_POINTER;
+    p = p + 1;
+    var i: u32 = 0;
+    for (i < dyn.base_reloc_count) {
+        var seg: u32 = 0;
+        var slot: u64 = 0;
+        base_reloc_loc(?dyn.base_relocs[i], segs, text_va, pz, ?seg, ?slot);
+        buf[p] = REBASE_OPCODE_SET_SEGMENT_AND_OFFSET_ULEB | (seg::u8 & 0xF);
+        p = write_uleb(buf, p + 1, slot);
+        buf[p] = REBASE_OPCODE_DO_REBASE_IMM_TIMES | 1;
+        p = p + 1;
+        i = i + 1;
+    }
+    buf[p] = REBASE_OPCODE_DONE;
+    p = p + 1;
+    ret p;
+}
+
 # rewrite each deferred import call site to a pc-relative branch to its stub
 #
 # The linker recorded a `PltFixup` for every call to a function import it could not
@@ -1652,21 +2138,25 @@ fun dyn_sect_flags(flags: u32, zerofill: bool) u32 {
 # write a dynamically-linked MH_EXECUTE Mach-O, installed as the of.DynExecFn
 #
 # Frames the linker's laid-out load segments into a dyld-loadable executable: a
-# leading __PAGEZERO, a __TEXT that maps the mach header below the linker's text so
-# dyld can read the load commands, the linker's remaining segments, synthesized
-# import-stub and got segments (when there are function imports), and a __LINKEDIT
-# carrying the LC_DYLD_INFO_ONLY bind stream plus the symbol and string tables. The
-# load commands name the dynamic loader (LC_LOAD_DYLINKER), each shared dependency
-# (LC_LOAD_DYLIB), the symbol tables (LC_SYMTAB/LC_DYSYMTAB), and the static entry
-# (LC_UNIXTHREAD). Each function import's got slot is bound non-lazily by dyld, and
-# every deferred call site is redirected to its stub.
+# leading __PAGEZERO, a __TEXT that maps the mach header so dyld can read the load
+# commands, the linker's remaining segments, synthesized import-stub and got
+# segments (when there are function imports), and a __LINKEDIT carrying the
+# LC_DYLD_INFO_ONLY rebase/bind streams, the symbol and string tables, and a trailing
+# ad-hoc code signature. The load commands name the dynamic loader (LC_LOAD_DYLINKER),
+# each shared dependency (LC_LOAD_DYLIB), the symbol tables (LC_SYMTAB/LC_DYSYMTAB),
+# the entry, and the signature (LC_CODE_SIGNATURE). Each function import's got slot is
+# bound non-lazily by dyld, and every deferred call site is redirected to its stub.
 #
-# The image uses fixed virtual addresses (no MH_PIE): the linker assigned absolute
-# addresses from the OS base and the back end emits absolute addressing, so a load
-# bias would invalidate them. Apple Silicon additionally requires a code signature
-# the kernel verifies before exec; this writer emits no LC_CODE_SIGNATURE, so its
-# output is byte-verifiable but not runnable on arm64 without an external ad-hoc
-# sign step.
+# When `dyn.pie` (arm64 Darwin, where the kernel refuses a non-PIE main executable)
+# the image is position-independent: MH_PIE is set, __TEXT maps the header at the OS
+# base (the linker reserved a one-page header gap above the base), the entry is an
+# LC_MAIN file offset, LC_BUILD_VERSION/LC_UUID are emitted, and the LC_DYLD_INFO
+# rebase stream slides every in-image absolute pointer (`dyn.base_relocs`) by dyld's
+# load bias. A non-PIE image keeps the fixed-address shape: the header maps below the
+# linker text, the entry is an absolute-pc LC_UNIXTHREAD, and there is no rebase
+# stream. The ad-hoc LC_CODE_SIGNATURE the kernel verifies before exec is emitted last
+# (it covers everything before it), so the image runs on Apple Silicon, which SIGKILLs
+# an unsigned arm64 executable.
 # ---
 # alloc:       allocator for the output buffer and the scratch offset table
 # itn:         interner resolving the dynamic-plan names (sonames, imports)
@@ -1680,11 +2170,12 @@ fun dyn_sect_flags(flags: u32, zerofill: bool) u32 {
 # fixups:      the deferred import call-site fixups
 # fixup_count: number of fixups
 # path:        null-terminated output file path
+# name:        null-terminated product name; the filename-stable code-sign identifier
 # ret:         ok(true) on success, or an error string
 fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
                   seg_count: u32, entry: u64, funcs: *of.ExecFunction, func_count: u32,
                   dyn: *of.DynamicInfo, fixups: *of.PltFixup, fixup_count: u32,
-                  path: *u8) R.Result[bool, str] {
+                  path: *u8, name: *u8) R.Result[bool, str] {
     if (isa_vt == nil) { ret R.err[bool, str]("macho: nil dyn-exec isa"); }
     if (path == nil)   { ret R.err[bool, str]("macho: nil dyn-exec path"); }
     if (dyn == nil)    { ret R.err[bool, str]("macho: nil dynamic plan"); }
@@ -1694,9 +2185,22 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     val ct: R.Result[u32, str] = cpu_type_for(arch_id);
     if (R.is_err[u32, str](ct)) { ret R.err[bool, str](R.unwrap_err[u32, str](ct)); }
 
-    val page:     usize = EXEC_PAGE_SIZE::usize;
+    # arm64 Darwin maps memory in 16 KiB pages and requires 16 KiB-aligned segments.
+    val exec_page: u64 = macho_page_size(arch_id);
+    val page:     usize = exec_page::usize;
     val nimp:     u32 = func_import_count(dyn);
     val stub_sz:  usize = macho_stub_size(arch_id);
+
+    # a position-independent image (arm64 Darwin): MH_PIE, an LC_MAIN entry, the
+    # platform/uuid load commands, and an LC_DYLD_INFO rebase stream sliding every
+    # in-image absolute pointer. a non-PIE image keeps the fixed-address shape: an
+    # LC_UNIXTHREAD entry and no rebase stream.
+    val pie: bool = dyn.pie;
+    # the rebase relocations are emitted in a deterministic (segment, offset) order so
+    # the signed image is byte-identical across the self-host fixpoint.
+    if (pie && dyn.base_reloc_count > 1) {
+        sort.sort[of.BaseReloc](dyn.base_relocs, dyn.base_reloc_count::usize, base_reloc_cmp);
+    }
 
     # load-command byte size. the segment count is __PAGEZERO + the linker segments
     # + (stubs, got when there are function imports) + __LINKEDIT.
@@ -1707,6 +2211,10 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     var thread_state: usize = X86_THREAD_STATE64_COUNT::usize * 4;
     if (arch_is_arm64(arch_id)) { thread_state = ARM_THREAD_STATE64_COUNT::usize * 4; }
     val thread_cmd_size: usize = 16 + thread_state;
+    # the entry command is an LC_MAIN file-offset entry for a PIE image, else the
+    # LC_UNIXTHREAD thread state.
+    var entry_cmd_size: usize = thread_cmd_size;
+    if (pie) { entry_cmd_size = ENTRY_POINT_CMD_SIZE; }
 
     # every loadable segment carries one section_64 entry (the linker's segments
     # plus the synthesized stub and got segments) so the llvm/otool readers and the
@@ -1717,14 +2225,27 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     var sizeofcmds: usize = seg_cmds::usize * SEGMENT_CMD_64_SIZE
                           + sect_total::usize * SECTION_64_SIZE
                           + DYLD_INFO_CMD_SIZE + SYMTAB_CMD_SIZE + DYSYMTAB_CMD_SIZE
-                          + dylinker_cmd_size() + thread_cmd_size;
+                          + dylinker_cmd_size() + entry_cmd_size + LINKEDIT_DATA_CMD_SIZE;   # + LC_CODE_SIGNATURE
+    if (pie) { sizeofcmds = sizeofcmds + BUILD_VERSION_CMD_SIZE + UUID_CMD_SIZE; }
     var di: u32 = 0;
     for (di < dyn.lib_count) { sizeofcmds = sizeofcmds + dylib_cmd_size(resolve(itn, dyn.libs[di].soname)); di = di + 1; }
 
-    var ncmds: u32 = seg_cmds + 5 + dyn.lib_count;   # dyld_info,symtab,dysymtab,dylinker,unixthread
+    var ncmds: u32 = seg_cmds + 6 + dyn.lib_count;   # dyld_info,symtab,dysymtab,dylinker,entry,code_signature
+    if (pie) { ncmds = ncmds + 2; }                  # LC_BUILD_VERSION + LC_UUID
 
     var lay: MachoDynLayout;
-    lay.hdr_span = bin.align_up(MACH_HEADER_64_SIZE + sizeofcmds, page);
+    # a PIE image reserves exactly one page for the header so __TEXT maps at the OS
+    # base (the linker reserved that page above the base when assigning vaddrs); a
+    # non-PIE image maps the header below the linker's first segment, sized to fit.
+    if (pie) {
+        if (MACH_HEADER_64_SIZE + sizeofcmds > page) {
+            ret R.err[bool, str]("macho: dyn-exec PIE header exceeds the one-page reservation");
+        }
+        lay.hdr_span = page;
+    }
+    or {
+        lay.hdr_span = bin.align_up(MACH_HEADER_64_SIZE + sizeofcmds, page);
+    }
     if (segs[0].vaddr < lay.hdr_span::u64) {
         ret R.err[bool, str]("macho: dyn-exec base address too low to map the header");
     }
@@ -1756,7 +2277,12 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
         if (end > hi_va) { hi_va = end; }
         li = li + 1;
     }
-    var va: u64 = bin.align_up_u64(hi_va, EXEC_PAGE_SIZE);
+    var va: u64 = bin.align_up_u64(hi_va, exec_page);
+
+    # whether a __PAGEZERO precedes the linker segments; it shifts every Mach-O
+    # segment index the bind and rebase opcodes select.
+    var pz: u32 = 0;
+    if (lay.pagezero_size > 0) { pz = 1; }
 
     lay.stubs_size = 0;
     lay.got_size = 0;
@@ -1767,26 +2293,27 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
         lay.stubs_va   = va;
         lay.stubs_size = nimp::usize * stub_sz;
         file = file + lay.stubs_size;
-        va   = bin.align_up_u64(va + lay.stubs_size::u64, EXEC_PAGE_SIZE);
+        va   = bin.align_up_u64(va + lay.stubs_size::u64, exec_page);
 
         file = bin.align_up(file, page);
         lay.got_off  = file;
         lay.got_va   = va;
         lay.got_size = nimp::usize * 8;
         file = file + lay.got_size;
-        va   = bin.align_up_u64(va + lay.got_size::u64, EXEC_PAGE_SIZE);
+        va   = bin.align_up_u64(va + lay.got_size::u64, exec_page);
 
-        var pz: u32 = 0;
-        if (lay.pagezero_size > 0) { pz = 1; }
         lay.got_seg_index = pz + seg_count + 1;   # pagezero + linker segs + stubs
     }
 
-    # __LINKEDIT: the bind stream, then the nlist array (8-aligned), then strings.
+    # __LINKEDIT: the rebase stream (PIE only), then the bind stream, then the nlist
+    # array (8-aligned), then strings.
     file = bin.align_up(file, page);
     lay.linkedit_off = file;
     lay.linkedit_va  = va;
 
-    lay.bind_off  = lay.linkedit_off;
+    lay.rebase_off  = lay.linkedit_off;
+    lay.rebase_size = measure_rebase_info(dyn, segs, lay.text_va, pz);
+    lay.bind_off  = lay.rebase_off + lay.rebase_size;
     lay.bind_size = measure_bind_info(itn, dyn);
     lay.symtab_off = bin.align_up(lay.bind_off + lay.bind_size, 8);
 
@@ -1800,7 +2327,14 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
         si = si + 1;
     }
     lay.strtab_off  = lay.symtab_off + nimp::usize * NLIST_64_SIZE;
-    val total_size: usize = lay.strtab_off + lay.strtab_size;
+
+    # the ad-hoc code signature trails the symbol/string tables inside __LINKEDIT,
+    # 16-byte aligned; it covers everything before it, so codeLimit is its offset.
+    val ident_len:  usize = codesign_ident_len(name);
+    val sig_off:    usize = bin.align_up(lay.strtab_off + lay.strtab_size, CODE_SIG_ALIGN);
+    val sig_size:   usize = code_signature_size(ident_len, sig_off);
+    val exec_limit: u64 = lay.hdr_span::u64 + segs[0].filesz::u64;   # __TEXT file size
+    val total_size: usize = sig_off + sig_size;
     lay.linkedit_size = total_size - lay.linkedit_off;
 
     val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_size);
@@ -1818,7 +2352,9 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     bin.write_u32_le(buf, 12, MH_EXECUTE);
     bin.write_u32_le(buf, 16, ncmds);
     bin.write_u32_le(buf, 20, sizeofcmds::u32);
-    bin.write_u32_le(buf, 24, MH_DYLDLINK | MH_TWOLEVEL);
+    var hdr_flags: u32 = MH_DYLDLINK | MH_TWOLEVEL;
+    if (pie) { hdr_flags = hdr_flags | MH_PIE; }
+    bin.write_u32_le(buf, 24, hdr_flags);
     bin.write_u32_le(buf, 28, 0);
 
     var lc: usize = MACH_HEADER_64_SIZE;
@@ -1833,18 +2369,27 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     # of the linker's segments at their assigned addresses, each with one section.
     val text_prot: u32 = vm_prot_for(segs[0].flags);
     var tsec: usize = write_segment_cmd(buf, lc, "__TEXT", lay.text_va,
-                           bin.align_up_u64(lay.hdr_span::u64 + segs[0].memsz::u64, EXEC_PAGE_SIZE),
+                           bin.align_up_u64(lay.hdr_span::u64 + segs[0].memsz::u64, exec_page),
                            0, lay.hdr_span::u64 + segs[0].filesz::u64, text_prot, text_prot, 1);
     write_section_64(buf, tsec, dyn_sectname(segs[0].flags, false), "__TEXT", segs[0].vaddr,
                      segs[0].memsz::u64, seg_offsets[0]::u32, dyn_sect_flags(segs[0].flags, false));
     lc = tsec + SECTION_64_SIZE;
     li = 1;
     for (li < seg_count) {
-        val prot: u32 = vm_prot_for(segs[li].flags);
+        var prot: u32 = vm_prot_for(segs[li].flags);
+        # a PIE image rebases the absolute pointers in read-only const data, so that
+        # segment (__DATA_CONST) maps read-write for dyld's fixups and is re-protected
+        # read-only afterward via SG_READ_ONLY; without it dyld cannot slide the slots.
+        var seg_flags: u32 = 0;
+        if (pie && prot == VM_PROT_READ) {
+            prot = VM_PROT_READ | VM_PROT_WRITE;
+            seg_flags = SG_READ_ONLY;
+        }
         val zf:   bool = segs[li].filesz == 0 && segs[li].memsz > 0;
         var lsec: usize = write_segment_cmd(buf, lc, exec_segname(segs[li].flags), segs[li].vaddr,
-                               bin.align_up_u64(segs[li].memsz::u64, EXEC_PAGE_SIZE),
+                               bin.align_up_u64(segs[li].memsz::u64, exec_page),
                                seg_offsets[li]::u64, segs[li].filesz::u64, prot, prot, 1);
+        if (seg_flags != 0) { bin.write_u32_le(buf, lc + 68, seg_flags); }
         var soff: u32 = seg_offsets[li]::u32;
         if (zf) { soff = 0; }
         write_section_64(buf, lsec, dyn_sectname(segs[li].flags, zf), exec_segname(segs[li].flags),
@@ -1859,7 +2404,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     # linker segment name, keeping the bind segment index unambiguous.
     if (nimp > 0) {
         var sec: usize = write_segment_cmd(buf, lc, "__STUBS", lay.stubs_va,
-                               bin.align_up_u64(lay.stubs_size::u64, EXEC_PAGE_SIZE),
+                               bin.align_up_u64(lay.stubs_size::u64, exec_page),
                                lay.stubs_off::u64, lay.stubs_size::u64,
                                VM_PROT_READ | VM_PROT_EXECUTE, VM_PROT_READ | VM_PROT_EXECUTE, 1);
         write_section_64(buf, sec, "__stubs", "__STUBS", lay.stubs_va, lay.stubs_size::u64,
@@ -1867,7 +2412,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
         lc = sec + SECTION_64_SIZE;
 
         sec = write_segment_cmd(buf, lc, "__GOT", lay.got_va,
-                               bin.align_up_u64(lay.got_size::u64, EXEC_PAGE_SIZE),
+                               bin.align_up_u64(lay.got_size::u64, exec_page),
                                lay.got_off::u64, lay.got_size::u64,
                                VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, 1);
         write_section_64(buf, sec, "__got", "__GOT", lay.got_va, lay.got_size::u64,
@@ -1877,16 +2422,19 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
 
     # __LINKEDIT.
     lc = write_segment_cmd(buf, lc, "__LINKEDIT", lay.linkedit_va,
-                           bin.align_up_u64(lay.linkedit_size::u64, EXEC_PAGE_SIZE),
+                           bin.align_up_u64(lay.linkedit_size::u64, exec_page),
                            lay.linkedit_off::u64, lay.linkedit_size::u64,
                            VM_PROT_READ, VM_PROT_READ, 0);
 
-    # LC_DYLD_INFO_ONLY: only the bind stream is non-empty (fixed addresses need no
-    # rebase, and binding is eager so the lazy stream is empty).
+    # LC_DYLD_INFO_ONLY: a PIE image carries a rebase stream (sliding its absolute
+    # pointers); binding is eager so the lazy stream is empty.
+    var rebase_cmd_off: u32 = 0;
+    var rebase_cmd_size: u32 = 0;
+    if (lay.rebase_size > 0) { rebase_cmd_off = lay.rebase_off::u32; rebase_cmd_size = lay.rebase_size::u32; }
     bin.write_u32_le(buf, lc, LC_DYLD_INFO_ONLY);
     bin.write_u32_le(buf, lc + 4, DYLD_INFO_CMD_SIZE::u32);
-    bin.write_u32_le(buf, lc + 8, 0);                       # rebase_off
-    bin.write_u32_le(buf, lc + 12, 0);                      # rebase_size
+    bin.write_u32_le(buf, lc + 8, rebase_cmd_off);          # rebase_off
+    bin.write_u32_le(buf, lc + 12, rebase_cmd_size);        # rebase_size
     bin.write_u32_le(buf, lc + 16, lay.bind_off::u32);
     bin.write_u32_le(buf, lc + 20, lay.bind_size::u32);
     bin.write_u32_le(buf, lc + 24, 0);                      # weak_bind_off
@@ -1926,19 +2474,53 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
         di = di + 1;
     }
 
-    # LC_UNIXTHREAD: the static thread entry, program counter set to the entry.
-    bin.write_u32_le(buf, lc, LC_UNIXTHREAD);
-    bin.write_u32_le(buf, lc + 4, thread_cmd_size::u32);
-    if (arch_is_arm64(arch_id)) {
-        bin.write_u32_le(buf, lc + 8, ARM_THREAD_STATE64);
-        bin.write_u32_le(buf, lc + 12, ARM_THREAD_STATE64_COUNT);
-        bin.write_u64_le(buf, lc + 16 + ARM_PC_STATE_OFFSET, entry);
+    # a PIE image names its platform (LC_BUILD_VERSION) and identity (LC_UUID) and
+    # enters through an LC_MAIN file-offset entry dyld jumps to after applying the
+    # load bias; a non-PIE image carries only the absolute-pc LC_UNIXTHREAD entry.
+    if (pie) {
+        bin.write_u32_le(buf, lc, LC_BUILD_VERSION);
+        bin.write_u32_le(buf, lc + 4, BUILD_VERSION_CMD_SIZE::u32);
+        bin.write_u32_le(buf, lc + 8, PLATFORM_MACOS);
+        bin.write_u32_le(buf, lc + 12, MACOS_MIN_VERSION);     # minos
+        bin.write_u32_le(buf, lc + 16, MACOS_MIN_VERSION);     # sdk
+        bin.write_u32_le(buf, lc + 20, 0);                     # ntools
+        lc = lc + BUILD_VERSION_CMD_SIZE;
+
+        bin.write_u32_le(buf, lc, LC_UUID);
+        bin.write_u32_le(buf, lc + 4, UUID_CMD_SIZE::u32);
+        write_macho_uuid(buf, lc + 8, name);
+        lc = lc + UUID_CMD_SIZE;
+
+        # entryoff is the entry's file offset: __TEXT maps the header at file offset 0
+        # / virtual address text_va, so the offset is entry - text_va.
+        bin.write_u32_le(buf, lc, LC_MAIN);
+        bin.write_u32_le(buf, lc + 4, ENTRY_POINT_CMD_SIZE::u32);
+        bin.write_u64_le(buf, lc + 8, entry - lay.text_va);    # entryoff
+        bin.write_u64_le(buf, lc + 16, 0);                     # stacksize
+        lc = lc + ENTRY_POINT_CMD_SIZE;
     }
     or {
-        bin.write_u32_le(buf, lc + 8, X86_THREAD_STATE64);
-        bin.write_u32_le(buf, lc + 12, X86_THREAD_STATE64_COUNT);
-        bin.write_u64_le(buf, lc + 16 + X86_RIP_STATE_OFFSET, entry);
+        # LC_UNIXTHREAD: the static thread entry, program counter set to the entry.
+        bin.write_u32_le(buf, lc, LC_UNIXTHREAD);
+        bin.write_u32_le(buf, lc + 4, thread_cmd_size::u32);
+        if (arch_is_arm64(arch_id)) {
+            bin.write_u32_le(buf, lc + 8, ARM_THREAD_STATE64);
+            bin.write_u32_le(buf, lc + 12, ARM_THREAD_STATE64_COUNT);
+            bin.write_u64_le(buf, lc + 16 + ARM_PC_STATE_OFFSET, entry);
+        }
+        or {
+            bin.write_u32_le(buf, lc + 8, X86_THREAD_STATE64);
+            bin.write_u32_le(buf, lc + 12, X86_THREAD_STATE64_COUNT);
+            bin.write_u64_le(buf, lc + 16 + X86_RIP_STATE_OFFSET, entry);
+        }
+        lc = lc + thread_cmd_size;
     }
+
+    # LC_CODE_SIGNATURE points at the ad-hoc signature trailing __LINKEDIT.
+    bin.write_u32_le(buf, lc, LC_CODE_SIGNATURE);
+    bin.write_u32_le(buf, lc + 4, LINKEDIT_DATA_CMD_SIZE::u32);
+    bin.write_u32_le(buf, lc + 8, sig_off::u32);
+    bin.write_u32_le(buf, lc + 12, sig_size::u32);
 
     # copy the linker's segment bytes to their file offsets.
     li = 0;
@@ -1960,7 +2542,8 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
         }
     }
 
-    # the dyld bind stream and the symbol/string tables in __LINKEDIT.
+    # the dyld rebase stream (PIE), then the bind stream and symbol/string tables.
+    write_rebase_info(buf, lay.rebase_off, dyn, segs, lay.text_va, pz);
     write_bind_info(buf, lay.bind_off, itn, dyn, lay.got_seg_index);
 
     buf[lay.strtab_off] = 0;
@@ -1997,6 +2580,10 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
         A.deallocate[u8](alloc, buf, total_size);
         ret R.err[bool, str](R.unwrap_err[bool, str](fx_r));
     }
+
+    # the signature hashes the finished file, so it is written last - after the
+    # segment bytes, the bind/symbol tables, and the call-site fixups are all placed.
+    write_code_signature(buf, sig_off, name, sig_off, 0, exec_limit);
 
     val wr: R.Result[bool, str] = write_file(itn, alloc, path, buf, total_size, "macho: dyn-exec");
     A.deallocate[u8](alloc, buf, total_size);
@@ -2647,6 +3234,109 @@ fun ts_arm64_roundtrip() u8 {
     ret 0;
 }
 
+# a module with more than 255 sections (the back end emits one section per data
+# global) overflows Mach-O's single-byte nlist `n_sect`. emit_object coalesces the
+# input sections by kind, so a local constant-pool symbol defined past the 255th
+# section round-trips as a defined local rather than being silently dropped to an
+# undefined external by the overflow - the exact `.Lc.*` link defect. the section
+# whose 1-based index is 256 lands on `n_sect == 0` without coalescing, the worst
+# case, so the fixture's target local lives there.
+fun ts_many_sections_coalesce() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    val ndata:   u32 = 260;   # rodata input sections at indices 1..260
+    val total:   u32 = 1 + ndata;
+    val tgt_sec: u32 = 255;   # 1-based nlist index 256 - the overflow-to-zero slot
+
+    val rsec: R.Result[*of.Section, str] = A.zallocate[of.Section](?alloc, total::usize);
+    if (R.is_err[*of.Section, str](rsec)) { ret 1; }
+    var secs: *of.Section = R.unwrap_ok[*of.Section, str](rsec);
+
+    var text_bytes: [8]u8;
+    var k: usize = 0;
+    for (k < 8) { text_bytes[k] = 0; k = k + 1; }
+    text_bytes[0] = 0xE8;     # call rel32, PC32 field at offset 1
+
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 8; secs[0].align = 16;
+
+    var data_bytes: [8]u8;
+    k = 0;
+    for (k < 8) { data_bytes[k] = 0; k = k + 1; }
+
+    var s: u32 = 1;
+    for (s < total) {
+        secs[s].name = t_intern(?i, ".rodata"); secs[s].kind = of.SK_RODATA; secs[s].align = 8;
+        if (s == tgt_sec) { secs[s].bytes = ?data_bytes[0]; secs[s].len = 8; }
+        or                { secs[s].bytes = nil;            secs[s].len = 0; }
+        s = s + 1;
+    }
+
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "_main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 8; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, ".Lc.target"); syms[1].section = tgt_sec; syms[1].offset = 0;
+    syms[1].size = 8; syms[1].flags = of.SYM_OBJ_FLAG_OBJECT;
+
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = of.RK_PC32;
+    relocs[0].symbol = syms[1].name; relocs[0].addend = -4;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = secs; img.section_count = total;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "macho_many");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val tpath: str = filesystem.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { filesystem.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tpath);
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_err[filesystem.Buffer, str](rb)) { ret 1; }
+    val buf: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rb);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+
+    # the 261 input sections coalesce to two by kind (__text + __const).
+    if (out.section_count != 2) { ret 1; }
+
+    # the relocation still names the section-255 local, and that local round-trips
+    # as a defined rodata local - not the overflow's undefined external.
+    if (out.reloc_count != 1)                      { ret 1; }
+    if (out.relocations[0].symbol != syms[1].name) { ret 1; }
+
+    var found: bool = false;
+    var si: u32 = 0;
+    for (si < out.symbol_count) {
+        if (out.symbols[si].name == syms[1].name) {
+            found = true;
+            if (out.symbols[si].section == of.SECTION_EXTERNAL)            { ret 1; }
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_EXTERN) != 0)     { ret 1; }
+            if ((out.symbols[si].flags & of.SYM_OBJ_FLAG_GLOBAL) != 0)     { ret 1; }
+            if (out.symbols[si].section >= out.section_count)              { ret 1; }
+            if (out.sections[out.symbols[si].section].kind != of.SK_RODATA) { ret 1; }
+        }
+        si = si + 1;
+    }
+    if (!found) { ret 1; }
+    ret 0;
+}
+
 # the forward relocation map is machine-keyed: a kind resolves to the x86_64
 # X86_64_RELOC_* type for x86_64 and the arm64 ARM64_RELOC_* type for arm64, and a
 # kind an architecture has no type for is an error naming it.
@@ -2722,7 +3412,9 @@ fun ts_exec_x64() u8 {
     var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
     val tpath: str = filesystem.temp_path(?tf);
 
-    val em: R.Result[bool, str] = emit_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 1, entry, nil::*of.ExecFunction, 0, tpath::*u8);
+    # the product name is deliberately not the temp-file basename, to prove the
+    # code-sign identifier tracks the name, not the output path.
+    val em: R.Result[bool, str] = emit_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 1, entry, nil::*of.ExecFunction, 0, tpath::*u8, "machoexe"::*u8);
     if (R.is_err[bool, str](em)) { filesystem.temp_close_and_remove(?tf); ret 1; }
 
     val rb: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tpath);
@@ -2732,20 +3424,46 @@ fun ts_exec_x64() u8 {
 
     if (bin.read_u32_le(buf.data, 0) != MH_MAGIC_64) { ret 1; }
     if (bin.read_u32_le(buf.data, 12) != MH_EXECUTE) { ret 1; }
-    # ncmds: __PAGEZERO + one segment + LC_UNIXTHREAD.
-    if (bin.read_u32_le(buf.data, 16) != 3) { ret 1; }
+    # ncmds: __PAGEZERO + one segment + __LINKEDIT + LC_UNIXTHREAD + LC_CODE_SIGNATURE.
+    if (bin.read_u32_le(buf.data, 16) != 5) { ret 1; }
 
-    # the first load command is __PAGEZERO spanning the image base.
+    # __PAGEZERO spans [0, __TEXT.vmaddr); __TEXT (the next command) maps the mach
+    # header at file offset 0 and virtual address base - hdr_span, so the image base
+    # (the linker's code address) falls inside the signed, mapped executable segment.
     val pz: usize = MACH_HEADER_64_SIZE;
     if (bin.read_u32_le(buf.data, pz) != LC_SEGMENT_64)     { ret 1; }
     if (!fixed16_equals(buf.data, pz + 8, "__PAGEZERO"))    { ret 1; }
-    if (bin.read_u64_le(buf.data, pz + 32) != base)         { ret 1; }
+    if (bin.read_u64_le(buf.data, pz + 24) != 0)            { ret 1; }   # __PAGEZERO vmaddr
+
+    val tx: usize = pz + SEGMENT_CMD_64_SIZE;
+    if (bin.read_u32_le(buf.data, tx) != LC_SEGMENT_64)     { ret 1; }
+    if (!fixed16_equals(buf.data, tx + 8, "__TEXT"))        { ret 1; }
+    val text_va:   u64 = bin.read_u64_le(buf.data, tx + 24);
+    val text_vmsz: u64 = bin.read_u64_le(buf.data, tx + 32);
+    if (bin.read_u64_le(buf.data, tx + 40) != 0)            { ret 1; }   # __TEXT fileoff: header inside __TEXT
+    if (bin.read_u64_le(buf.data, pz + 32) != text_va)      { ret 1; }   # __PAGEZERO ends where __TEXT begins
+    if (text_va > base)                                     { ret 1; }   # base sits at or above __TEXT's start
+    if (base >= text_va + text_vmsz)                        { ret 1; }   # ... and inside __TEXT's mapping
 
     # LC_UNIXTHREAD carries the entry in the x86_64 rip slot.
     val th: usize = t_find_lc(buf.data, LC_UNIXTHREAD);
     if (th == 0)                                                        { ret 1; }
     if (bin.read_u32_le(buf.data, th + 8) != X86_THREAD_STATE64)        { ret 1; }
     if (bin.read_u64_le(buf.data, th + 16 + X86_RIP_STATE_OFFSET) != entry) { ret 1; }
+
+    # the ad-hoc code signature: LC_CODE_SIGNATURE points at an embedded-signature
+    # SuperBlob whose codeLimit (big-endian) equals its own file offset.
+    val cs: usize = t_find_lc(buf.data, LC_CODE_SIGNATURE);
+    if (cs == 0)                                          { ret 1; }
+    val sig_off: usize = bin.read_u32_le(buf.data, cs + 8)::usize;
+    if (bin.read_u32_be(buf.data, sig_off) != CSMAGIC_EMBEDDED_SIGNATURE) { ret 1; }
+    val cd: usize = sig_off + SUPERBLOB_HEADER_SIZE;
+    if (bin.read_u32_be(buf.data, cd) != CSMAGIC_CODEDIRECTORY)           { ret 1; }
+    if (bin.read_u32_be(buf.data, cd + 32) != sig_off::u32)               { ret 1; }
+    # the identifier is the product name "machoexe", not the temp-path basename.
+    val id_off: usize = cd + bin.read_u32_be(buf.data, cd + 20)::usize;
+    if (!t_bytes_contain(buf.data, id_off, str_len("machoexe"), "machoexe")) { ret 1; }
+    if (buf.data[id_off + str_len("machoexe")] != 0)                         { ret 1; }
     ret 0;
 }
 
@@ -2773,7 +3491,7 @@ fun ts_exec_arm64() u8 {
     var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
     val tpath: str = filesystem.temp_path(?tf);
 
-    val em: R.Result[bool, str] = emit_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 1, entry, nil::*of.ExecFunction, 0, tpath::*u8);
+    val em: R.Result[bool, str] = emit_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 1, entry, nil::*of.ExecFunction, 0, tpath::*u8, "machoa64"::*u8);
     if (R.is_err[bool, str](em)) { filesystem.temp_close_and_remove(?tf); ret 1; }
 
     val rb: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tpath);
@@ -2891,7 +3609,7 @@ fun ts_dyn_exec(arch_id: u32) u8 {
     val tpath: str = filesystem.temp_path(?tf);
 
     val em: R.Result[bool, str] = emit_dyn_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 1, entry,
-                                                nil::*of.ExecFunction, 0, ?dyn, ?fx[0], 1, tpath::*u8);
+                                                nil::*of.ExecFunction, 0, ?dyn, ?fx[0], 1, tpath::*u8, "machodyn"::*u8);
     if (R.is_err[bool, str](em)) { filesystem.temp_close_and_remove(?tf); ret 1; }
 
     val rb: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tpath);
@@ -2935,6 +3653,13 @@ fun ts_dyn_exec(arch_id: u32) u8 {
     or {
         if (bin.read_u64_le(buf.data, th + 16 + X86_RIP_STATE_OFFSET) != entry) { ret 1; }
     }
+
+    # the ad-hoc code signature trailing __LINKEDIT.
+    val cs: usize = t_find_lc(buf.data, LC_CODE_SIGNATURE);
+    if (cs == 0)                                                          { ret 1; }
+    val sig_off: usize = bin.read_u32_le(buf.data, cs + 8)::usize;
+    if (bin.read_u32_be(buf.data, sig_off) != CSMAGIC_EMBEDDED_SIGNATURE) { ret 1; }
+    if (bin.read_u32_be(buf.data, sig_off + SUPERBLOB_HEADER_SIZE) != CSMAGIC_CODEDIRECTORY) { ret 1; }
     ret 0;
 }
 
@@ -3011,13 +3736,14 @@ fun ts_bad_input() u8 {
 }
 
 # the object writer/reader and the relocation maps: the x86_64 and arm64
-# emit/parse round-trips, the machine-keyed forward map, and the PAGEOFF12
-# instruction-decode reverse map.
+# emit/parse round-trips, the over-255-section coalescing, the machine-keyed
+# forward map, and the PAGEOFF12 instruction-decode reverse map.
 test "mach.lang.target.of.macho:object_round_trip_and_reloc_maps" {
-    if (ts_x64_roundtrip() != 0)   { ret 1; }
-    if (ts_arm64_roundtrip() != 0) { ret 1; }
-    if (ts_reloc_map() != 0)       { ret 1; }
-    if (ts_pageoff12() != 0)       { ret 1; }
+    if (ts_x64_roundtrip() != 0)         { ret 1; }
+    if (ts_arm64_roundtrip() != 0)       { ret 1; }
+    if (ts_many_sections_coalesce() != 0) { ret 1; }
+    if (ts_reloc_map() != 0)             { ret 1; }
+    if (ts_pageoff12() != 0)             { ret 1; }
     ret 0;
 }
 

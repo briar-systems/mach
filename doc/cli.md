@@ -20,7 +20,7 @@ matched exactly: `--flag value` (a value follows in the next argument) or a bare
 | Command | Summary |
 |---------|---------|
 | `build` | compile the project to objects and (for a `[bin.*]`) a linked binary |
-| `run`   | build, then execute the produced binary |
+| `run`   | execute the already-built binary (a post-`build` convenience, not a rebuild) |
 | `test`  | build the test binary and run the collected tests |
 | `dep`   | manage git-backed dependencies (clone, lock, vendor) under `<dep>` |
 | `init`  | scaffold a new project |
@@ -145,13 +145,18 @@ unknown target, compile errors, an unresolvable link input), `2` internal error.
 mach run <path> [options] [-- args...]
 ```
 
-Builds the project at `<path>` exactly like `mach build`, then executes the
-produced binary.
+Executes the binary `mach build` already produced for `<path>` — a post-build
+convenience, **not** a rebuild. The same selection flags (`--target`,
+`--profile`/`--release`, `--bin`) that narrow a build resolve which artifact to
+run; its path is read from the manifest's `out` template and the existing file
+is exec'd. When the artifact does not exist yet, `mach run` errors and points at
+`mach build` rather than building it.
 Arguments after a `--` separator are forwarded to the child as its `argv`. The
 child's exit code becomes this command's exit code.
 
-`--emit` is rejected — running a relocatable object is not meaningful. All other
-`build` and global flags apply.
+`--emit` is rejected — running a relocatable object is not meaningful. The
+`build` selection and global flags apply; build-only flags (`-O*`, `--emit-*`)
+are accepted but have no effect, since nothing is built.
 
 | Flag             | Value   | Effect |
 |------------------|---------|--------|
@@ -165,8 +170,8 @@ command name or path (no shell-style word splitting); a bare name is resolved on
 as a failure — exit `127` when `execve` rejects the binary in the spawned
 child — with no auto-detection.
 
-Exit codes: the child's exit code, `1` on a build/user error, `2` on internal
-error.
+Exit codes: the child's exit code, `1` on a resolution/user error (including a
+missing artifact), `2` on internal error.
 
 ## `mach test`
 
@@ -180,9 +185,14 @@ then spawns each as a separate process and reports a per-test
 `name file:line PASS|FAIL` line. A crashing test reports its signal and the run
 continues. A test build always links executables, even for a library target.
 
+Only `test` blocks declared in the current project's own modules are collected by
+default; tests in dependency modules are excluded unless `--include-deps` is
+passed.
+
 | Flag                | Value   | Effect |
 |---------------------|---------|--------|
 | `--filter <pattern>`| pattern | run only tests whose name contains `<pattern>` |
+| `--include-deps`    | —       | also collect tests declared in dependency modules |
 | `--list`            | —       | list the collected tests and exit |
 | `--runner <cmd>`    | command | launch every test as `<cmd> <exe>` instead of exec'ing it directly |
 

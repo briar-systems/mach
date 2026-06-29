@@ -369,10 +369,12 @@ pub fun build(a: *A.Allocator, argc: usize, argv: **u8, emit_obj: bool) BuildRes
 # path) for the `mach test` runner to spawn. Every test executable is the
 # project's transitive code plus a synthesized `main` that calls just that test
 # and exits with its `i32` result - independently runnable, never the project's
-# own binary path. With `list_only` the build stops after collecting the tests,
-# leaving each artifact's `exe` nil. The returned strings are owned by `a` and
-# outlive this call's internal session teardown, so the caller frees `a` once it
-# has run every test.
+# own binary path. Only tests declared in the current project's own modules are
+# built by default; `--include-deps` widens the build to dependency tests (#1556).
+# With `list_only` the build stops after collecting the tests, leaving each
+# artifact's `exe` nil. The returned strings are owned by `a` and outlive this
+# call's internal session teardown, so the caller frees `a` once it has run every
+# test.
 # ---
 # a:         allocator owning the session and the returned artifacts; must
 #            outlive the returned TestBuildResult
@@ -393,6 +395,51 @@ pub fun build_tests(a: *A.Allocator, argc: usize, argv: **u8, list_only: bool) T
     tbr.tests = list.tests;
     tbr.len   = list.len;
     ret tbr;
+}
+
+# resolve the selected profile name from CLI config
+#
+# `--profile <name>` wins; `--release` is sugar for the `release` profile; absent
+# both, the empty string defers to the manifest default. Shared by the `mach
+# build` matrix-override path and selection_from_config.
+# ---
+# config: the parsed CLI config
+# ret:    the selected profile name, empty for the manifest default
+fun profile_selection(config: *cfg.Config) str {
+    var profile_name: *u8 = config.profile;
+    if (profile_name == nil && config.release) { profile_name = "release"; }
+    if (profile_name == nil)                   { profile_name = ""; }
+    ret util.cstr_str(profile_name);
+}
+
+# build the manifest selection from CLI config
+#
+# Maps `--target`/`--profile`/`--release`/`--bin`/`--lib` onto `out_sel`, shared
+# by `mach build` and `mach run` so both narrow the (target, profile, artifact)
+# the same way. An absent `--target` leaves the target empty so the driver defers
+# to `[project].target` (resolving `native`/`host` to the host-matching entry).
+# `--bin` and `--lib` are mutually exclusive.
+# ---
+# config:  the parsed CLI config
+# out_sel: receives the populated selection
+# ret:     ok(true), or err when `--bin` and `--lib` are combined
+pub fun selection_from_config(config: *cfg.Config, out_sel: *manifest.Selection) R.Result[bool, str] {
+    if (config.bin != nil && config.lib != nil) {
+        ret R.err[bool, str]("--bin and --lib cannot be combined");
+    }
+    var target_name: *u8 = config.target;
+    if (target_name == nil) { target_name = ""; }
+    var artifact_name: *u8  = "";
+    var want_lib:      bool = false;
+    var has_artifact:  bool = false;
+    if (config.bin != nil) { artifact_name = config.bin; has_artifact = true; }
+    or (config.lib != nil) { artifact_name = config.lib; want_lib = true; has_artifact = true; }
+    out_sel.profile      = profile_selection(config);
+    out_sel.target       = util.cstr_str(target_name);
+    out_sel.artifact     = util.cstr_str(artifact_name);
+    out_sel.want_lib     = want_lib;
+    out_sel.has_artifact = has_artifact;
+    ret R.ok[bool, str](true);
 }
 
 # the single-unit build body
@@ -467,41 +514,27 @@ fun build_unit(a: *A.Allocator, argc: usize, argv: **u8, emit_obj: bool, test_mo
     or (util.has_flag(eff, argv, "--release")) { cli_level = pipeline.OPT_RELEASE; cli_set = true; }
 
     # the build selection threaded to the driver; it narrows target/profile/
-    # artifact. `--release` is sugar for `--profile release`, and `--bin`/`--lib`
-    # are mutually exclusive. profile applies to every matrix unit, so it is read
-    # from the flags even under an override.
-    var profile_name: *u8 = config.profile;
-    if (profile_name == nil && config.release) { profile_name = "release"; }
-    if (profile_name == nil)                   { profile_name = ""; }
-
+    # artifact. an enumerated matrix cell pins target and artifact, but the profile
+    # still comes from the flags (it applies to every cell); otherwise the whole
+    # selection is read from the flags via selection_from_config, which `mach run`
+    # shares so it narrows the artifact identically.
     var sel: manifest.Selection;
-    sel.profile = util.cstr_str(profile_name);
     if (ovr != nil) {
-        # one enumerated matrix cell: target and artifact are pre-selected.
+        sel.profile      = profile_selection(?config);
         sel.target       = ovr.target;
         sel.artifact     = ovr.artifact;
         sel.want_lib     = ovr.want_lib;
         sel.has_artifact = ovr.has_artifact;
     }
     or {
-        # when --target is absent, defer to [project].target from mach.toml
-        # (the driver resolves "native"/"host" to the host-matching entry).
-        var target_name: *u8 = config.target;
-        if (target_name == nil) { target_name = ""; }
-        var artifact_name: *u8   = "";
-        var want_lib:      bool  = false;
-        var has_artifact:  bool  = false;
-        if (config.bin != nil && config.lib != nil) {
-            print.eprint("error: --bin and --lib cannot be combined\n");
+        val sr: R.Result[bool, str] = selection_from_config(?config, ?sel);
+        if (R.is_err[bool, str](sr)) {
+            print.eprint("error: ");
+            print.eprint(R.unwrap_err[bool, str](sr));
+            print.eprint("\n");
             br.code = 1;
             ret br;
         }
-        if (config.bin != nil) { artifact_name = config.bin; has_artifact = true; }
-        or (config.lib != nil) { artifact_name = config.lib; want_lib = true; has_artifact = true; }
-        sel.target       = util.cstr_str(target_name);
-        sel.artifact     = util.cstr_str(artifact_name);
-        sel.want_lib     = want_lib;
-        sel.has_artifact = has_artifact;
     }
 
     val res_session: R.Result[session.Session, str] = session.init(a);
@@ -727,12 +760,15 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
 #
 # The per-module objects are written once under the resolved `obj` template; the
 # external link inputs (libc, manifest/CLI libs) are resolved once. Then, for
-# each `test`, a tiny entry module (`main(){ret <test>();}`) is synthesized,
-# optimized, codegen'd to its own object, and linked with the shared object set
-# into a standalone executable at the resolved `tests` template path. Each
-# test's reporting metadata (label, source `file:line`) and executable path are
-# appended to `tests_out`. With `list_only` the collection alone is reported and
-# no objects or executables are produced. A build with no tests is a user error.
+# each selected `test`, a tiny entry module (`main(){ret <test>();}`) is
+# synthesized, optimized, codegen'd to its own object, and linked with the shared
+# object set into a standalone executable at the resolved `tests` template path.
+# Only tests declared in the current project's own modules are selected by
+# default; `--include-deps` widens the selection to dependency tests (#1556), and
+# `--filter` narrows it by name. Each test's reporting metadata (label, source
+# `file:line`) and executable path are appended to `tests_out`. With `list_only`
+# the collection alone is reported and no objects or executables are produced. A
+# build with no tests is a user error.
 # ---
 # p:         the project carrying the module graph and session
 # level:     optimization pipeline level
@@ -769,11 +805,16 @@ fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool, verbo
     # matching executables. nil filter = every test.
     val filter: *u8 = filter_value(argc, argv);
 
+    # `--include-deps`: by default a test run is scoped to the current project's
+    # own modules; this flag also builds and runs tests declared in dependency
+    # modules (#1556).
+    val include_deps: bool = util.has_flag(argc, argv, "--include-deps");
+
     # `--list`: report each selected test's metadata without producing any object.
     if (list_only) {
         var i: u32 = 0;
         for (i < col.count) {
-            if (test_selected(p, ?col.tests[i], filter)) {
+            if (test_selected(p, ?col.tests[i], filter, include_deps)) {
                 val rc: i64 = record_test(p, ?col.tests[i], nil, tests_out, p.s.alloc);
                 if (rc != 0) { testrunner.free(p.s, ?col); ret rc; }
             }
@@ -862,7 +903,7 @@ fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool, verbo
     var code: i64 = 0;
     var i: u32 = 0;
     for (i < col.count) {
-        if (test_selected(p, ?col.tests[i], filter)) {
+        if (test_selected(p, ?col.tests[i], filter, include_deps)) {
             # `i` is the stable collection index, so a test's executable name is
             # unchanged whether or not a filter is in effect.
             p.s.alloc = ?scratch_alloc;
@@ -893,20 +934,36 @@ fun filter_value(argc: usize, argv: **u8) *u8 {
     ret nil;
 }
 
-# whether a test passes the name filter
+# whether a test is selected for this run
 #
-# Every test when `filter` is nil, else those whose label contains the filter
-# substring.
+# A test is selected when it is in scope - its declaring module is part of the
+# current project, unless `include_deps` opts dependency tests in (#1556) - and
+# passes the name filter (every test when `filter` is nil, else those whose label
+# contains the filter substring).
 # ---
-# p:      the project (for its interner)
-# t:      the test to test
-# filter: the filter substring, or nil to select every test
-# ret:    true when the test is selected
-fun test_selected(p: *driver.Project, t: *testrunner.Test, filter: *u8) bool {
+# p:            the project (for its interner and module table)
+# t:            the test to test
+# filter:       the filter substring, or nil to select every test
+# include_deps: also select tests declared in dependency modules
+# ret:          true when the test is selected
+fun test_selected(p: *driver.Project, t: *testrunner.Test, filter: *u8, include_deps: bool) bool {
+    if (!include_deps && !test_in_project(p, t)) { ret false; }
     if (filter == nil) { ret true; }
     val opt_label: O.Option[str] = intern.lookup(?p.s.interner, t.label);
     if (O.is_none[str](opt_label)) { ret false; }
     ret str_contains(O.unwrap[str](opt_label), util.cstr_str(filter));
+}
+
+# whether a collected test was declared in a current-project module rather than a
+# dependency. `t.mod_idx` is the declaring module's id.
+# ---
+# p:   the project (for its module table)
+# t:   the test to locate
+# ret: true when the declaring module is part of the current project
+fun test_in_project(p: *driver.Project, t: *testrunner.Test) bool {
+    if (t.mod_idx >= p.module_len) { ret false; }
+    val m: *driver.ModuleEntry = ?p.modules[t.mod_idx];
+    ret driver.module_in_current_project(p, m.fqn);
 }
 
 # synthesize, codegen, and link a single test's executable, then record its
@@ -1000,6 +1057,21 @@ fun build_one_test(p: *driver.Project, level: u8, verify_ir: bool, obj_base: *u8
     ret record_test(p, t, ?exe_path[0], tests_out, persistent);
 }
 
+# the selected artifact's product name (the `[bin.<name>]`), resolved to a
+# borrowed null-terminated string, or "" when unset
+#
+# This is the writer's stable signing identity (the Mach-O code-signing
+# identifier), deliberately independent of the `-o` output path so a rename-based
+# self-host fixpoint (a -> b -> c) produces byte-identical signed images.
+# ---
+# p:   the project carrying the session and selected artifact config
+# ret: the borrowed product name, or "" when no artifact name is set
+fun artifact_product_name(p: *driver.Project) *u8 {
+    val nm: O.Option[str] = intern.lookup(?p.s.interner, p.config.bin_name);
+    if (O.is_some[str](nm)) { ret O.unwrap[str](nm)::*u8; }
+    ret ""::*u8;
+}
+
 # link the shared object set plus one test's entry object into the test
 # executable at `exe_path`
 #
@@ -1027,7 +1099,7 @@ fun link_one_test(p: *driver.Project, shared: **u8, shared_len: u32,
     paths[shared_len] = entry_path;
 
     val res_link: R.Result[bool, str] =
-        linker.link(p.s, ?p.target, paths, total, sonames, soname_len, exe_path, linker.LINK_EXE);
+        linker.link(p.s, ?p.target, paths, total, sonames, soname_len, exe_path, artifact_product_name(p), linker.LINK_EXE);
     A.deallocate[*u8](p.s.alloc, paths, total::usize);
     if (R.is_err[bool, str](res_link)) {
         print.eprint("error: ");
@@ -1365,7 +1437,7 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root: *u8,
     }
 
     val res_link: R.Result[bool, str] =
-        linker.link(p.s, ?p.target, paths, len, sonames, soname_len, ?artifact[0], linker.LINK_EXE);
+        linker.link(p.s, ?p.target, paths, len, sonames, soname_len, ?artifact[0], artifact_product_name(p), linker.LINK_EXE);
     free_paths(p.s.alloc, paths, len, len);
     free_sonames(p.s.alloc, sonames, soname_len);
     if (R.is_err[bool, str](res_link)) {
@@ -1456,7 +1528,7 @@ fun link_image_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root:
     }
 
     val res_link: R.Result[bool, str] =
-        linker.link_images(p.s, ?p.target, ordered, len, nil::*intern.StrId, 0, ?artifact[0], linker.LINK_EXE);
+        linker.link_images(p.s, ?p.target, ordered, len, nil::*intern.StrId, 0, ?artifact[0], artifact_product_name(p), linker.LINK_EXE);
     A.deallocate[of.ObjectImage](p.s.alloc, ordered, len::usize);
     if (R.is_err[bool, str](res_link)) {
         print.eprint("error: ");
