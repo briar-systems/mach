@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,10 +12,18 @@ permissions:
 # a tagged push builds the release binary for each target on its native host
 # (each to its own self-host fixpoint), then publishes the archives + SHA256SUMS.
 # correctness is CI's job — every change reaches main through a PR it gates.
+#
+# darwin has no prior release to self-seed from, so seed-darwin cross-builds the
+# stage-0 seed on linux first; collapse that bootstrap once a darwin archive ships.
+#
+# workflow_dispatch runs the darwin lane (seed + native fixpoint + self-test) on a
+# branch with no tag, so on-Mac validation needs no release; the tag-verify and
+# publish steps are gated to tag pushes and stay skipped on dispatch.
 jobs:
   verify:
     name: verify tag
     runs-on: ubuntu-latest
+    if: github.event_name == 'push'
     steps:
       - uses: actions/checkout@v6
       - name: tag matches mach.toml version
@@ -148,9 +157,127 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # bootstrap: no prior darwin release exists to seed the native fixpoint, so
+  # cross-build the stage-0 seed on linux (the cross-darwin path mach already
+  # proves in ci) and hand it to the macOS runner. retire this once the first
+  # darwin archive ships and build-darwin can self-seed like every other target.
+  seed-darwin:
+    name: seed ${{ matrix.target }}
+    needs: verify
+    if: ${{ !cancelled() && (needs.verify.result == 'success' || needs.verify.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-darwin
+            triple: darwin-x86_64
+          - target: aarch64-darwin
+            triple: darwin-aarch64
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: fetch released mach
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SEED: mach-*-x86_64-linux.tar.gz
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          gh release download -R "$GITHUB_REPOSITORY" -p "$SEED" -D "$tmp"
+          tar -xzf "$tmp"/$SEED -C /usr/local/bin mach
+          chmod +x /usr/local/bin/mach
+
+      - name: cross-build the darwin seed
+        env:
+          TRIPLE: ${{ matrix.triple }}
+        run: |
+          set -euo pipefail
+          mach dep pull
+          mach build . -o m
+          ./m build . --target "$TRIPLE" --profile release -o mach-darwin-seed
+
+      - name: upload seed
+        uses: actions/upload-artifact@v4
+        with:
+          name: seed-${{ matrix.target }}
+          path: mach-darwin-seed
+          if-no-files-found: error
+          retention-days: 1
+
+  build-darwin:
+    name: build ${{ matrix.target }}
+    needs: seed-darwin
+    # explicit, since the default success() skips through verify's dispatch-skip
+    if: ${{ !cancelled() && needs.seed-darwin.result == 'success' }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-darwin
+            runs-on: macos-13
+          - target: aarch64-darwin
+            runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: download the darwin seed
+        uses: actions/download-artifact@v4
+        with:
+          name: seed-${{ matrix.target }}
+          path: seed
+
+      - name: build fixpoint
+        run: |
+          set -euo pipefail
+          chmod +x seed/mach-darwin-seed
+
+          # native stage-0 is the cross-built seed; a/b/c are native self-hosts
+          ./seed/mach-darwin-seed dep pull
+          ./seed/mach-darwin-seed build . --profile release -o a
+          ./a build . --profile release -o b
+          ./b build . --profile release -o c
+
+          # ship the fixpoint: b == c (stage2 vs stage3) or the build is non-deterministic
+          if ! cmp -s b c; then
+            echo "::error::darwin build did not converge to the fixpoint"
+            exit 1
+          fi
+
+      - name: self test
+        run: |
+          set -euo pipefail
+          # exercises a mach-built native darwin binary: arm64 must run under the
+          # ad-hoc signature (no SIGKILL) for the fixpoint and these tests to pass
+          ./c test .
+
+      - name: package archive
+        if: github.event_name == 'push'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+          mkdir -p dist stage
+          cp c stage/mach
+          cp LICENSE stage/
+          tar -C stage -czf "dist/mach-$ver-$TARGET.tar.gz" mach LICENSE
+
+      - name: upload archive
+        if: github.event_name == 'push'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/mach-*-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
   release:
     name: publish release
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-windows, build-darwin]
+    # success() keeps the build gate the default if dropped when adding the event check
+    if: ${{ github.event_name == 'push' && success() }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
