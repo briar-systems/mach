@@ -144,14 +144,22 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     for profile in $case_profiles; do
         ran=$((ran + 1))
         label="$case_id [$target/$profile]"
-        tmp=$(mktemp -d)
-        bin="$tmp/prog$exe"
 
-        if ! (cd "$dir" && "$compiler" dep pull && "$compiler" build . --target "$target" --profile "$profile" -o "$bin") >"$tmp/build.log" 2>&1; then
+        # the build artifact goes under the case's gitignored out/ via a path
+        # relative to the case dir: a native windows compiler resolves it against
+        # its cwd, where an absolute MSYS scratch path (/tmp/...) would not. the
+        # mktemp scratch holds only logs and captured output, read by bash alone.
+        tmp=$(mktemp -d)
+        relbin="out/int/prog$exe"
+        bin="$dir/$relbin"
+        rm -rf "$dir/out/int"
+        mkdir -p "$dir/out/int"
+
+        if ! (cd "$dir" && "$compiler" dep pull && "$compiler" build . --target "$target" --profile "$profile" -o "$relbin") >"$tmp/build.log" 2>&1; then
             echo "FAIL $label (build)"
             sed 's/^/    /' "$tmp/build.log" >&2
             fails=$((fails + 1))
-            rm -rf "$tmp"
+            rm -rf "$tmp" "$dir/out/int"
             continue
         fi
 
@@ -164,21 +172,21 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
             echo "FAIL $label (producer exit $prc)"
             sed 's/^/    /' "$tmp/err.txt" >&2
             fails=$((fails + 1))
-            rm -rf "$tmp"
+            rm -rf "$tmp" "$dir/out/int"
             continue
         fi
 
         if [ "$bless" -eq 1 ]; then
             cp "$tmp/out.txt" "$golden"
             echo "BLESS $label -> ${golden#"$here"/}"
-            rm -rf "$tmp"
+            rm -rf "$tmp" "$dir/out/int"
             continue
         fi
 
         if [ ! -f "$golden" ]; then
             echo "FAIL $label (no golden ${golden#"$here"/}; run with --bless)"
             fails=$((fails + 1))
-            rm -rf "$tmp"
+            rm -rf "$tmp" "$dir/out/int"
             continue
         fi
 
@@ -189,7 +197,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
             sed 's/^/    /' "$tmp/diff.txt" >&2
             fails=$((fails + 1))
         fi
-        rm -rf "$tmp"
+        rm -rf "$tmp" "$dir/out/int"
     done
 done
 
