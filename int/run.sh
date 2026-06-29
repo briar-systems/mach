@@ -60,6 +60,12 @@ case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*) exe=.exe ;;
 esac
 
+# accept a compiler given without its host suffix (CI passes ./m uniformly; on
+# windows the file is m.exe).
+if [ ! -f "$compiler" ] && [ -f "$compiler$exe" ]; then
+    compiler=$compiler$exe
+fi
+
 # conf_runmode <target> — print the run-mode column for a target, or fail.
 conf_runmode() {
     while read -r name runner runmode rowcadence rest; do
