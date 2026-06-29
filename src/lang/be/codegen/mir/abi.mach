@@ -127,59 +127,91 @@ fun mark_eightbyte_range(classes: *u8, off: u64, size: u64, cls: u8) {
     }
 }
 
-# classify each leaf scalar of an aggregate into the eightbyte(s) it occupies
+# the most scalar leaves a flattened aggregate is enumerated into: a <=16 byte
+# aggregate (the only size the SSE mask and the lp64d flatten inspect) holds at most
+# sixteen one-byte leaves.
+val AGG_LEAF_CAP: u32 = 16;
+
+# enumerate the scalar leaves of `ty` into `out` (capacity `cap`) in offset order
 #
-# Recurses from absolute byte offset `base_off`. A float leaf marks its eightbytes
-# SSE; an integer / pointer / function leaf marks them INTEGER; structs recurse at
-# each field offset, unions at offset 0 (members overlap), arrays at each element
-# offset. `classes[0..1]` accumulate the merged per-eightbyte class for the SysV
-# SSE-aggregate classification.
+# The one shared leaf traversal behind the SysV SSE-eightbyte mask and the lp64d
+# AggLayout descriptor. Recurses structs at each field offset and arrays at each
+# element offset from `base_off`, recording each IRT_FLOAT leaf as a float field and
+# each integer / pointer / function leaf as a non-float field. Returns the running leaf
+# count, or a value past `cap` when the aggregate is non-flattenable at that cap.
+#
+# `strict` selects the two consumers' divergent treatment of what an offset-ordered
+# enumeration cannot represent. A union's members overlap at one offset: in `strict`
+# mode (the AggLayout flatten) the aggregate is rejected -- it stops with a past-cap
+# sentinel; in lenient mode (the SSE mask, where each overlapping member contributes to
+# its eightbyte's class) every member is enumerated at the shared offset. An
+# unresolvable type likewise poisons in `strict` mode and is skipped in lenient mode.
+# `hfa_walk` does NOT ride this iterator -- it is a homogeneity reduction, not an
+# enumeration (see its note).
 # ---
 # ctx:      the active lowering context (supplies the IR type oracle and target)
-# ty:       the type whose leaves are classified
+# ty:       the type whose leaves are enumerated
 # base_off: the type's absolute byte offset within the enclosing aggregate
-# classes:  the two-entry per-eightbyte class array to accumulate into
-fun mark_eightbyte_classes(ctx: *context.LowerCtx, ty: type.IrTypeId, base_off: u64, classes: *u8) {
+# strict:   reject unions / unresolvable types (the flatten) vs enumerate through (the mask)
+# out:      the leaf array, written for indices in [0, cap)
+# cap:      the capacity of `out` (the flatten's two-leaf cap, the mask's sixteen)
+# count:    the running leaf count before this type's leaves
+# ret:      the running leaf count after this type's leaves (> cap when non-flattenable)
+fun collect_leaves(ctx: *context.LowerCtx, ty: type.IrTypeId, base_off: u64, strict: bool,
+                   out: *abi.AggField, cap: u32, count: u32) u32 {
+    if (count > cap) { ret count; }
     val it: O.Option[*type.IrType] = type.get(ctx.types, ty);
-    if (!O.is_some[*type.IrType](it)) { ret; }
+    if (!O.is_some[*type.IrType](it)) {
+        if (strict) { ret cap + 1; }
+        ret count;
+    }
     val t: *type.IrType = O.unwrap[*type.IrType](it);
 
-    if (t.kind == type.IRT_FLOAT) {
-        mark_eightbyte_range(classes, base_off, type.byte_size(ctx.types, ty, ctx.tgt)::u64, EB_SSE);
-        ret;
-    }
     if (t.kind == type.IRT_STRUCT) {
+        var c: u32 = count;
         var i: u32 = 0;
         for (i < t.data.struct_.field_count) {
-            val fid: type.IrTypeId = t.data.struct_.fields[i];
-            val fo:  u64 = type.byte_offset(ctx.types, ty, i, ctx.tgt)::u64;
-            mark_eightbyte_classes(ctx, fid, base_off + fo, classes);
+            val fo: u64 = type.byte_offset(ctx.types, ty, i, ctx.tgt)::u64;
+            c = collect_leaves(ctx, t.data.struct_.fields[i], base_off + fo, strict, out, cap, c);
+            if (strict && c > cap) { ret c; }
             i = i + 1;
         }
-        ret;
-    }
-    if (t.kind == type.IRT_UNION) {
-        # union members all overlap at offset 0; merge each member's classes.
-        var i: u32 = 0;
-        for (i < t.data.struct_.field_count) {
-            mark_eightbyte_classes(ctx, t.data.struct_.fields[i], base_off, classes);
-            i = i + 1;
-        }
-        ret;
+        ret c;
     }
     if (t.kind == type.IRT_ARRAY) {
         val elem: type.IrTypeId = t.data.array_.element;
         val es:   u64 = type.byte_size(ctx.types, elem, ctx.tgt)::u64;
         val n:    u32 = type.array_count(ctx.types, ty);
+        var c: u32 = count;
         var i: u32 = 0;
         for (i < n) {
-            mark_eightbyte_classes(ctx, elem, base_off + i::u64 * es, classes);
+            c = collect_leaves(ctx, elem, base_off + i::u64 * es, strict, out, cap, c);
+            if (strict && c > cap) { ret c; }
             i = i + 1;
         }
-        ret;
+        ret c;
     }
-    # integer / pointer / function leaf: an INTEGER-class eightbyte.
-    mark_eightbyte_range(classes, base_off, type.byte_size(ctx.types, ty, ctx.tgt)::u64, EB_INTEGER);
+    if (t.kind == type.IRT_UNION) {
+        # a union's members overlap at one offset. the strict flatten rejects it; the
+        # lenient mask enumerates each member at the shared offset (its eightbyte class).
+        if (strict) { ret cap + 1; }
+        var c: u32 = count;
+        var i: u32 = 0;
+        for (i < t.data.struct_.field_count) {
+            c = collect_leaves(ctx, t.data.struct_.fields[i], base_off, strict, out, cap, c);
+            i = i + 1;
+        }
+        ret c;
+    }
+
+    # a scalar leaf (IRT_FLOAT or an integer / pointer / function): record it when
+    # within the cap, then count it.
+    if (count < cap) {
+        out[count].is_float = t.kind == type.IRT_FLOAT;
+        out[count].offset   = base_off::u32;
+        out[count].width    = type.byte_size(ctx.types, ty, ctx.tgt)::u8;
+    }
+    ret count + 1;
 }
 
 # the per-eightbyte SSE mask for a <=16 byte aggregate type
@@ -196,10 +228,20 @@ fun aggregate_sse_mask(ctx: *context.LowerCtx, ty: type.IrTypeId) u8 {
     if (!context.value_is_aggregate(ctx, ty)) { ret 0; }
     val size: u64 = type.byte_size(ctx.types, ty, ctx.tgt)::u64;
     if (size == 0 || size > 16) { ret 0; }
+    # enumerate the leaves (lenient: a union's overlapping members each contribute to
+    # their eightbyte's class), then merge each leaf's range into its eightbyte(s).
+    var leaves: [16]abi.AggField;
+    val n: u32 = collect_leaves(ctx, ty, 0, false, ?leaves[0], AGG_LEAF_CAP, 0);
     var classes: [2]u8;
     classes[0] = EB_NO_CLASS;
     classes[1] = EB_NO_CLASS;
-    mark_eightbyte_classes(ctx, ty, 0, ?classes[0]);
+    var i: u32 = 0;
+    for (i < n) {
+        var cls: u8 = EB_INTEGER;
+        if (leaves[i].is_float) { cls = EB_SSE; }
+        mark_eightbyte_range(?classes[0], leaves[i].offset::u64, leaves[i].width::u64, cls);
+        i = i + 1;
+    }
     var mask: u8 = 0;
     if (classes[0] == EB_SSE) { mask = mask | 1; }
     if (classes[1] == EB_SSE) { mask = mask | 2; }
@@ -214,6 +256,13 @@ fun aggregate_sse_mask(ctx: *context.LowerCtx, ty: type.IrTypeId) u8 {
 # overlap). Any non-FP leaf, an empty aggregate, or a mix of fundamental widths
 # makes the whole aggregate non-homogeneous. Member counting is by recursion, never
 # `size / width`, so an explicit `#[align(...)]` padding the size never inflates it.
+#
+# This deliberately does NOT ride the shared `collect_leaves` iterator: it is a
+# homogeneity REDUCTION, not a leaf enumeration. Its union arm takes the widest
+# member's count (max), where the offset-ordered enumeration would sum every member's
+# leaves -- routing it through `collect_leaves` would silently change union-of-floats
+# HFA placement (a count of sum vs max), a divergence no test or fixture covers. Keep
+# the reduction here; do not "unify" it with the enumeration walk.
 # ---
 # ctx:       the active lowering context (supplies the IR type oracle and target)
 # ty:        the type to test
@@ -307,71 +356,6 @@ fun hfa_info(ctx: *context.LowerCtx, ty: type.IrTypeId, out_members: *u8, out_el
 # non-flattenable (the lp64d mixed / float-pair rules act on at most two leaves).
 val AGG_MAX_LEAVES: u32 = 2;
 
-# flatten the scalar leaves of `ty` into `out`, returning the running leaf count
-#
-# Recurses from absolute byte offset `base_off`, recording each IRT_FLOAT leaf as a
-# float field and each integer / pointer / function leaf as a non-float field, in
-# offset order: a struct recurses at each field offset, an array at each element
-# offset. A union cannot flatten to offset-ordered leaves (its members overlap), so
-# it poisons the walk by returning a count past the cap. Once more than two leaves
-# are seen the walk only counts (it records no further fields), so the caller can
-# reject the aggregate.
-# ---
-# ctx:      the active lowering context (supplies the IR type oracle and target)
-# ty:       the type whose leaves are flattened
-# base_off: the type's absolute byte offset within the enclosing aggregate
-# out:      the descriptor whose `fields` receive the first two leaves
-# count:    the running leaf count before this type's leaves
-# ret:      the running leaf count after this type's leaves (> 2 when non-flattenable)
-fun agg_flatten(ctx: *context.LowerCtx, ty: type.IrTypeId, base_off: u64,
-                out: *abi.AggLayout, count: u32) u32 {
-    if (count > AGG_MAX_LEAVES) { ret count; }
-    val it: O.Option[*type.IrType] = type.get(ctx.types, ty);
-    # an unresolvable type has no known leaf to record; poison the walk past the cap so
-    # the caller rejects the whole aggregate (it falls to the integer convention).
-    if (!O.is_some[*type.IrType](it)) { ret AGG_MAX_LEAVES + 1; }
-    val t: *type.IrType = O.unwrap[*type.IrType](it);
-
-    if (t.kind == type.IRT_STRUCT) {
-        var c: u32 = count;
-        var i: u32 = 0;
-        for (i < t.data.struct_.field_count) {
-            val fid: type.IrTypeId = t.data.struct_.fields[i];
-            val fo:  u64 = type.byte_offset(ctx.types, ty, i, ctx.tgt)::u64;
-            c = agg_flatten(ctx, fid, base_off + fo, out, c);
-            if (c > AGG_MAX_LEAVES) { ret c; }
-            i = i + 1;
-        }
-        ret c;
-    }
-    if (t.kind == type.IRT_ARRAY) {
-        val elem: type.IrTypeId = t.data.array_.element;
-        val es:   u64 = type.byte_size(ctx.types, elem, ctx.tgt)::u64;
-        val n:    u32 = type.array_count(ctx.types, ty);
-        var c: u32 = count;
-        var i: u32 = 0;
-        for (i < n) {
-            c = agg_flatten(ctx, elem, base_off + i::u64 * es, out, c);
-            if (c > AGG_MAX_LEAVES) { ret c; }
-            i = i + 1;
-        }
-        ret c;
-    }
-    if (t.kind == type.IRT_UNION) {
-        # a union's members overlap, so it has no offset-ordered leaf flattening;
-        # poison the walk past the cap so the caller rejects the whole aggregate.
-        ret AGG_MAX_LEAVES + 1;
-    }
-
-    # a scalar leaf: record it when still within the cap, then count it.
-    if (count < AGG_MAX_LEAVES) {
-        out.fields[count].is_float = t.kind == type.IRT_FLOAT;
-        out.fields[count].offset   = base_off::u32;
-        out.fields[count].width    = type.byte_size(ctx.types, ty, ctx.tgt)::u8;
-    }
-    ret count + 1;
-}
-
 # the <=2-leaf flattened-aggregate descriptor for a type
 #
 # Flattens an aggregate's scalar leaves in offset order, capped at two, for the
@@ -390,8 +374,10 @@ fun agg_layout(ctx: *context.LowerCtx, ty: type.IrTypeId, is_aggr: bool) abi.Agg
     var out: abi.AggLayout;
     out.field_count = 0;
     if (!is_aggr) { ret out; }
-    val c: u32 = agg_flatten(ctx, ty, 0, ?out, 0);
-    if (c == 1 || c == 2) { out.field_count = c::u8; }
+    # strict enumeration straight into the two-leaf `fields`: more than two leaves, a
+    # union, or an empty aggregate leaves field_count 0 (the integer convention).
+    val n: u32 = collect_leaves(ctx, ty, 0, true, ?out.fields[0], AGG_MAX_LEAVES, 0);
+    if (n == 1 || n == 2) { out.field_count = n::u8; }
     ret out;
 }
 
@@ -560,7 +546,12 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
     var ret_hm:    u8   = 0;
     var ret_he:    u8   = 0;
     hfa_info(ctx, ret_type, ?ret_hm, ?ret_he);
-    out.ret_slot = classify_ret(ret_size, 0, ret_float, ret_eb, ret_aggr, ret_hm, ret_he, agg_layout(ctx, ret_type, ret_aggr));
+    # only the lp64d classifier reads the flattened-aggregate descriptor; for every
+    # other convention skip the per-value flatten walk and pass the no-information one.
+    val wants_agg: bool = ctx.tgt.abi.consumes_agg_layout;
+    var ret_agg: abi.AggLayout = abi.agg_none();
+    if (wants_agg) { ret_agg = agg_layout(ctx, ret_type, ret_aggr); }
+    out.ret_slot = classify_ret(ret_size, 0, ret_float, ret_eb, ret_aggr, ret_hm, ret_he, ret_agg);
 
     var gp_used:   i32 = 0;
     var fp_used:   i32 = 0;
@@ -614,7 +605,9 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
         var phm:  u8   = 0;
         var phe:  u8   = 0;
         hfa_info(ctx, pty, ?phm, ?phe);
-        var slot: abi.ParamSlot = classify_arg(i::i32, psz, pal, pfl, peb, pag, gp_used, fp_used, phm, phe, agg_layout(ctx, pty, pag));
+        var pagg: abi.AggLayout = abi.agg_none();
+        if (wants_agg) { pagg = agg_layout(ctx, pty, pag); }
+        var slot: abi.ParamSlot = classify_arg(i::i32, psz, pal, pfl, peb, pag, gp_used, fp_used, phm, phe, pagg);
 
         # record the real outgoing stack offset on the slot (the ABI classifier
         # returns a sizing-only slot with offset 0); the param / call lowering
@@ -942,6 +935,85 @@ fun lower_value_addr(ctx: *context.LowerCtx, mb: *mir.MirBlock, v: value.Value) 
     ret R.ok[mir.MirOperand, str](mir.op_vreg(addr));
 }
 
+# how `materialize_pieces` transfers a placement's register / stack chunks: the
+# direction (register load vs store), the per-chunk register-side memory operand, and
+# the stack-side base for a register-plus-stack split's PIECE_STACK chunk.
+# ---
+# store:      true to store each register chunk to its memory operand (a callee spill /
+#             a call result's storage); false to load each chunk into its register (a
+#             caller's outgoing argument, a callee's return value)
+# mem_base:   the base the register chunk's memory operand is formed from -- a spill
+#             slot key when `mem_slot` is true, else a pointer vreg
+# mem_slot:   true to form `op_mem_slot(mem_base, src_off)`, false `op_mem_value`
+# stack_base: physical register a PIECE_STACK chunk's stack side is addressed off (the
+#             stack pointer for an outgoing slot, the frame pointer for an incoming one)
+# stack_off:  byte offset of the slot's stack region from `stack_base`
+# stack_ok:   false when the placement must carry no PIECE_STACK chunk (a return value);
+#             such a chunk is then a classifier bug reported loudly
+rec PiecePlan {
+    store:      bool;
+    mem_base:   u32;
+    mem_slot:   bool;
+    stack_base: u32;
+    stack_off:  i64;
+    stack_ok:   bool;
+}
+
+# materialize a register / register-plus-stack placement's pieces, the one path behind
+# the caller-argument, callee-parameter, callee-return, and call-result reconstructions.
+#
+# Each register chunk loads from / stores to `[mem_base + src_off]` at the chunk width,
+# the move's machine form following the register's bank (a GP word, an FP `width`-byte
+# move) -- so a single, a pair, a CLASS_HFA run, a mixed GP / FP aggregate, and a split
+# all flow through one loop. A PIECE_STACK chunk (a register-plus-stack split's tail)
+# transfers a full word between that memory operand and `[stack_base + stack_off +
+# stk_off]`, in the direction `plan.store` selects.
+# ---
+# ctx:  the active lowering context
+# mb:   the MIR block the move(s) are appended to
+# slot: the classified slot whose pieces are materialized
+# plan: the transfer direction, register-side memory operand, and stack-side base
+# ret:  ok(true) on success, or a loud error
+fun materialize_pieces(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, plan: PiecePlan) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < slot.piece_count) {
+        val p: abi.ParamPiece = slot.pieces[i];
+        var mem: mir.MirOperand = mir.op_mem_value(plan.mem_base, p.src_off);
+        if (plan.mem_slot) { mem = mir.op_mem_slot(plan.mem_base, p.src_off); }
+        if (p.kind == abi.PIECE_STACK) {
+            if (!plan.stack_ok) {
+                ret R.err[bool, str]("mir.lower_ir: return slot carries an outgoing stack chunk");
+            }
+            # a full-word transfer between the register-side memory operand and the
+            # stack slot, through a scratch GP register; the direction follows `store`.
+            val stk: mir.MirOperand = mir.op_mem_preg(plan.stack_base, plan.stack_off + p.stk_off);
+            val tr: R.Result[u32, str] = context.new_vreg(ctx, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](tr)) { ret R.err[bool, str](R.unwrap_err[u32, str](tr)); }
+            val tmp: u32 = R.unwrap_ok[u32, str](tr);
+            var src: mir.MirOperand = mem;
+            var dst: mir.MirOperand = stk;
+            if (plan.store) { src = stk; dst = mem; }
+            val ld: R.Result[bool, str] = context.emit_mov(ctx, mb, mir.op_vreg(tmp), src);
+            if (R.is_err[bool, str](ld)) { ret ld; }
+            val st: R.Result[bool, str] = context.emit_store_to(ctx, mb, dst, mir.op_vreg(tmp));
+            if (R.is_err[bool, str](st)) { ret st; }
+        } or {
+            # a register chunk: the GP and FP banks share the move (a MOV at `width`); the
+            # register id's class tag drives the machine form, GP word or FP move.
+            val reg: mir.MirOperand = mir.op_preg(p.reg::u32);
+            if (plan.store) {
+                val st: R.Result[bool, str] = context.emit_store_to_w(ctx, mb, mem, reg, p.width);
+                if (R.is_err[bool, str](st)) { ret st; }
+            } or {
+                val mr: R.Result[bool, str] = context.emit_mov_w(ctx, mb, reg, mem, p.width);
+                if (R.is_err[bool, str](mr)) { ret mr; }
+            }
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
 # emit the pre-coloring move(s) placing one classified argument
 #
 # A BYREF argument moves the aggregate's address into the register; a STACK argument
@@ -1007,35 +1079,14 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
         var base: u32 = mir.MIR_VREG_NIL;
         val ar: R.Result[bool, str] = context.addr_to_vreg(ctx, mb, argop, ?base);
         if (R.is_err[bool, str](ar)) { ret ar; }
-        val sp: u32 = ctx.tgt.arch.stack_ptr_reg::u32;
-        var i: u32 = 0;
-        for (i < slot.piece_count) {
-            val p: abi.ParamPiece = slot.pieces[i];
-            if (p.kind == abi.PIECE_GP) {
-                val mr: R.Result[bool, str] = context.emit_mov_w(ctx, mb,
-                    mir.op_preg(p.reg::u32), mir.op_mem_value(base, p.src_off), p.width);
-                if (R.is_err[bool, str](mr)) { ret mr; }
-            } or (p.kind == abi.PIECE_FP) {
-                val mr: R.Result[bool, str] = context.emit_fmov(ctx, mb,
-                    mir.op_preg(p.reg::u32), mir.op_mem_value(base, p.src_off), p.width);
-                if (R.is_err[bool, str](mr)) { ret mr; }
-            } or {
-                # PIECE_STACK: the split's tail rides an outgoing stack slot. load the
-                # chunk word from storage into a scratch register, then store it at
-                # `[sp + stack_off + stk_off]`.
-                val tr: R.Result[u32, str] = context.new_vreg(ctx, mir.REG_CLASS_GP);
-                if (R.is_err[u32, str](tr)) { ret R.err[bool, str](R.unwrap_err[u32, str](tr)); }
-                val tmp: u32 = R.unwrap_ok[u32, str](tr);
-                val ld: R.Result[bool, str] = context.emit_mov(ctx, mb,
-                    mir.op_vreg(tmp), mir.op_mem_value(base, p.src_off));
-                if (R.is_err[bool, str](ld)) { ret ld; }
-                val st: R.Result[bool, str] = context.emit_store_to(ctx, mb,
-                    mir.op_mem_preg(sp, stack_off + p.stk_off), mir.op_vreg(tmp));
-                if (R.is_err[bool, str](st)) { ret st; }
-            }
-            i = i + 1;
-        }
-        ret R.ok[bool, str](true);
+        var plan: PiecePlan;
+        plan.store      = false;
+        plan.mem_base   = base;
+        plan.mem_slot   = false;
+        plan.stack_base = ctx.tgt.arch.stack_ptr_reg::u32;
+        plan.stack_off  = stack_off;
+        plan.stack_ok   = true;
+        ret materialize_pieces(ctx, mb, slot, plan);
     }
     # single FP register scalar argument: a float copy into the XMM argument
     # register. the XMM argument preg carries the SSE class, so the encoder
@@ -1095,23 +1146,14 @@ fun record_outgoing_size(ctx: *context.LowerCtx, bytes: i64) {
 # ret:     ok(true) on success, or a loud error
 fun emit_ret_slot_to_vreg(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, dst: u32, is_aggr: bool) R.Result[bool, str] {
     if (is_aggr) {
-        var i: u32 = 0;
-        for (i < slot.piece_count) {
-            val p: abi.ParamPiece = slot.pieces[i];
-            if (p.kind == abi.PIECE_GP) {
-                val st: R.Result[bool, str] = context.emit_store_to_w(ctx, mb,
-                    mir.op_mem_value(dst, p.src_off), mir.op_preg(p.reg::u32), p.width);
-                if (R.is_err[bool, str](st)) { ret st; }
-            } or (p.kind == abi.PIECE_FP) {
-                val st: R.Result[bool, str] = context.emit_store_to_w(ctx, mb,
-                    mir.op_mem_value(dst, p.src_off), mir.op_preg(p.reg::u32), p.width);
-                if (R.is_err[bool, str](st)) { ret st; }
-            } or {
-                ret R.err[bool, str]("mir.lower_ir: return slot carries an outgoing stack chunk");
-            }
-            i = i + 1;
-        }
-        ret R.ok[bool, str](true);
+        var plan: PiecePlan;
+        plan.store      = true;
+        plan.mem_base   = dst;
+        plan.mem_slot   = false;
+        plan.stack_base = 0;
+        plan.stack_off  = 0;
+        plan.stack_ok   = false;
+        ret materialize_pieces(ctx, mb, slot, plan);
     }
     ret context.emit_mov(ctx, mb, mir.op_vreg(dst), mir.op_preg(slot.reg::u32));
 }
@@ -1240,34 +1282,14 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSl
         # names the storage for downstream uses.
         val sr: R.Result[bool, str] = context.add_spill_slot(ctx, pv, size);
         if (R.is_err[bool, str](sr)) { ret sr; }
-        val fp: u32 = ctx.tgt.arch.frame_ptr_reg::u32;
-        var i: u32 = 0;
-        for (i < slot.piece_count) {
-            val p: abi.ParamPiece = slot.pieces[i];
-            if (p.kind == abi.PIECE_GP) {
-                val st: R.Result[bool, str] = context.emit_store_to_w(ctx, mb,
-                    mir.op_mem_slot(pv, p.src_off), mir.op_preg(p.reg::u32), p.width);
-                if (R.is_err[bool, str](st)) { ret st; }
-            } or (p.kind == abi.PIECE_FP) {
-                val st: R.Result[bool, str] = context.emit_store_to_w(ctx, mb,
-                    mir.op_mem_slot(pv, p.src_off), mir.op_preg(p.reg::u32), p.width);
-                if (R.is_err[bool, str](st)) { ret st; }
-            } or {
-                # PIECE_STACK: the caller placed this chunk in an incoming stack slot;
-                # load it off the frame pointer and store it into the spill slot.
-                val tr: R.Result[u32, str] = context.new_vreg(ctx, mir.REG_CLASS_GP);
-                if (R.is_err[u32, str](tr)) { ret R.err[bool, str](R.unwrap_err[u32, str](tr)); }
-                val tmp: u32 = R.unwrap_ok[u32, str](tr);
-                val ld: R.Result[bool, str] = context.emit_mov(ctx, mb,
-                    mir.op_vreg(tmp), mir.op_mem_preg(fp, arg_base + stack_off + p.stk_off));
-                if (R.is_err[bool, str](ld)) { ret ld; }
-                val st: R.Result[bool, str] = context.emit_store_to(ctx, mb,
-                    mir.op_mem_slot(pv, p.src_off), mir.op_vreg(tmp));
-                if (R.is_err[bool, str](st)) { ret st; }
-            }
-            i = i + 1;
-        }
-        ret R.ok[bool, str](true);
+        var plan: PiecePlan;
+        plan.store      = true;
+        plan.mem_base   = pv;
+        plan.mem_slot   = true;
+        plan.stack_base = ctx.tgt.arch.frame_ptr_reg::u32;
+        plan.stack_off  = arg_base + stack_off;
+        plan.stack_ok   = true;
+        ret materialize_pieces(ctx, mb, slot, plan);
     }
     ret context.emit_mov(ctx, mb, mir.op_vreg(pv), mir.op_preg(slot.reg::u32));
 }
@@ -1333,22 +1355,15 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
         var base: u32 = mir.MIR_VREG_NIL;
         val ar: R.Result[bool, str] = context.addr_to_vreg(ctx, mb, rvop, ?base);
         if (R.is_err[bool, str](ar)) { ret ar; }
-        var i: u32 = 0;
-        for (i < slot.piece_count) {
-            val p: abi.ParamPiece = slot.pieces[i];
-            if (p.kind == abi.PIECE_GP) {
-                val mr: R.Result[bool, str] = context.emit_mov_w(ctx, mb,
-                    mir.op_preg(p.reg::u32), mir.op_mem_value(base, p.src_off), p.width);
-                if (R.is_err[bool, str](mr)) { ret mr; }
-            } or (p.kind == abi.PIECE_FP) {
-                val mr: R.Result[bool, str] = context.emit_fmov(ctx, mb,
-                    mir.op_preg(p.reg::u32), mir.op_mem_value(base, p.src_off), p.width);
-                if (R.is_err[bool, str](mr)) { ret mr; }
-            } or {
-                ret R.err[bool, str]("mir.lower_ir: return slot carries an outgoing stack chunk");
-            }
-            i = i + 1;
-        }
+        var plan: PiecePlan;
+        plan.store      = false;
+        plan.mem_base   = base;
+        plan.mem_slot   = false;
+        plan.stack_base = 0;
+        plan.stack_off  = 0;
+        plan.stack_ok   = false;
+        val mr: R.Result[bool, str] = materialize_pieces(ctx, mb, slot, plan);
+        if (R.is_err[bool, str](mr)) { ret mr; }
     } or (slot.class == abi.CLASS_FP) {
         # scalar float return: a float copy into XMM0. the XMM0 return preg carries
         # the SSE class, so the encoder dispatches the move on operand class and emits
