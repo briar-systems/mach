@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.0] - 2026-06-29
+
+Native arm64 macOS. mach now compiles, ad-hoc code-signs, and self-hosts
+position-independent arm64 Darwin executables that run on Apple Silicon - the
+first published Darwin release binary. Also a format-neutral base-relocation
+foundation for position independence, project-scoped `mach test`, `mach run`
+without a rebuild, a riscv64 ELF build-attributes section, and a parser
+correction. No breaking changes.
+
+### Added
+
+- target: native **arm64 Darwin (Apple Silicon)**. mach emits position-independent
+  Mach-O executables (`MH_PIE`, `LC_MAIN`, an `LC_DYLD_INFO` rebase stream, and an
+  ad-hoc `CS_LINKER_SIGNED` code signature) that exec and self-host on Apple
+  Silicon; CD publishes an `aarch64-darwin` archive (#1679, #1717, #1722). x86_64
+  Darwin stays cross-compile-only (#1728).
+- link: a format-neutral image base-relocation set - the linker collects every
+  in-image absolute pointer once and each object format encodes it, the foundation
+  for PIE/ASLR across targets (#1722).
+- arm64: `cset` in the inline-asm assembler (#1714).
+- target: a riscv64 `.riscv.attributes` ISA-string ELF section (#1673).
+- run: `mach run` executes the already-built artifact without recompiling (#1482).
+- test: `mach test` collects only the current project's tests by default; pass
+  `--include-deps` to widen (#1556).
+
+### Fixed
+
+- macho: coalesce object sections by kind so modules with more than 255 sections
+  link (Mach-O's `n_sect` is a single byte) (#1682).
+- macho: map the mach header into `__TEXT` so the Apple Silicon kernel admits the
+  signed image (#1717).
+- parser: require a block body for `fin`; a bare `fin stmt;` was never intended to
+  parse (#1548).
+
+### Changed
+
+- deps: mach-std v0.16.2 - the arm64 Darwin runtime (`LC_MAIN` entry, syscall layer).
+
 ## [2.9.0] - 2026-06-27
 
 Darwin executables, the constant-time secret qualifier in the type checker, and
