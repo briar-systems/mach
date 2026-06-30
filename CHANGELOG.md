@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- build: `-v` prints a per-phase readout (load / resolve / sema / lower /
+  optimize / codegen / link) with item counts and timing, closed by a
+  `built <path>  N modules  <size>  in <time>` summary; `-vv` adds a
+  per-module/file line under each phase with its own duration and a `(slow)`
+  marker on the slowest item. Fixed-width ASCII on stderr, identical across
+  platforms - timing via `chrono.monotonic`, durations via
+  `chrono.format_duration`, columns via the `{:<N}`/`{:N}` format spec (#1775).
+
+### Removed
+
+- build: the `--verbose` flag, replaced by `-v`/`-vv` (#1775).
+
 ## [2.10.0] - 2026-06-29
 
 Native arm64 macOS. mach now compiles, ad-hoc code-signs, and self-hosts
