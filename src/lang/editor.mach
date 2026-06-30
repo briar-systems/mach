@@ -4,14 +4,15 @@
 # dirty, possibly-broken in-memory buffers and wants best-effort analysis of one
 # buffer at a time, without a full `driver.build_project`. register a buffer's
 # text directly, then ask for its tokens, its parsed `ast.Ast`, its
-# `res.ResolveResult` side tables, or its diagnostics. each phase tolerates a
-# malformed buffer and returns a usable partial result rather than bailing at the
-# first error.
+# `res.ResolveResult` side tables, its semantic expression types, or its
+# diagnostics. each phase tolerates a malformed buffer and returns a usable
+# partial result rather than bailing at the first error.
 #
 # an `EditorSession` borrows a caller-owned `session.Session` (whose `SourceMap`
 # holds the buffer text and whose `DiagList` collects diagnostics) and owns one
-# `*ast.Ast` plus one `*res.ResolveResult` per registered buffer, keyed by
-# `source.FileId`. teardown frees those; the borrowed session is left untouched.
+# `*ast.Ast`, one `*res.ResolveResult`, and an optional `*context.SemaResult`
+# per registered buffer, keyed by `source.FileId`. teardown frees those; the
+# borrowed session is left untouched.
 #
 # a buffer is resolved in isolation against an empty dependency set, so local
 # names bind while cross-module references resolve to SYMBOL_NIL. its comptime
@@ -29,6 +30,7 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_contains;
+use std.types.string.str_index_of;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -47,6 +49,7 @@ use mach.lang.intern;
 use mach.lang.session;
 use mach.lang.source;
 use mach.lang.target;
+use mach.lang.type;
 
 # the per-buffer analysis state an EditorSession owns for one registered file
 # ---
@@ -54,12 +57,15 @@ use mach.lang.target;
 # in_use:  whether this slot holds a live buffer (slots are indexed by FileId)
 # a:       owned parsed Ast, or nil before the first parse
 # rr:      owned ResolveResult side tables, or nil before the first resolve
+# sr:      owned SemaResult expression-type side tables, or nil until `analyze`;
+#          derived from `rr`, so dropping `rr` drops it
 # ctx:     comptime context resolve evaluates against; a dnit-safe value at all times
 pub rec Buffer {
     file_id: source.FileId;
     in_use:  bool;
     a:       *ast.Ast;
     rr:      *res.ResolveResult;
+    sr:      *context.SemaResult;
     ctx:     comptime.ComptimeCtx;
 }
 
@@ -253,6 +259,131 @@ pub fun resolve_of(es: *EditorSession, fid: source.FileId) *res.ResolveResult {
     ret b.rr;
 }
 
+# parse, resolve, and run full semantic analysis over one open buffer in
+# isolation, caching and returning its SemaResult expression-type side tables
+#
+# Opt-in: the cheap `resolve` path never runs sema, so a non-type-aware consumer
+# pays nothing. An editor that needs an expression's resolved type calls this
+# once, then maps a cursor `ExprId` / `DeclId` to its `TypeId` with `expr_type_of`
+# / `decl_type_of` and walks the session type interner's field tables
+# (`type.field_table_for`) for member completion and value go-to-def. The buffer
+# is analysed against an empty dependency set, mirroring `resolve`, so
+# cross-module references type as TYPE_ERROR while local expressions type fully.
+#
+# The cached SemaResult is owned by the editor and invalidated whenever the
+# buffer is reparsed, updated, or re-resolved (it is derived from the
+# ResolveResult). Diagnostics accumulate on the session DiagList, reset by the
+# resolve on entry.
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# ret: a borrowed pointer to the buffer's cached SemaResult, or an error
+pub fun analyze(es: *EditorSession, fid: source.FileId) R.Result[*context.SemaResult, str] {
+    val res_resolve: R.Result[*res.ResolveResult, str] = resolve(es, fid);
+    if (R.is_err[*res.ResolveResult, str](res_resolve)) {
+        ret R.err[*context.SemaResult, str](R.unwrap_err[*res.ResolveResult, str](res_resolve));
+    }
+    val rr: *res.ResolveResult = R.unwrap_ok[*res.ResolveResult, str](res_resolve);
+
+    val b: *Buffer = slot_live(es, fid);
+    if (b == nil) { ret R.err[*context.SemaResult, str]("editor: buffer not open"); }
+
+    # sema's generic machinery reads a declaration's origin AST through the
+    # session registry, so the buffer's own module must be registered first.
+    val res_register: R.Result[bool, str] = session.register_module_ast(es.s, fid::session.ModuleId, b.a);
+    if (R.is_err[bool, str](res_register)) {
+        ret R.err[*context.SemaResult, str](R.unwrap_err[bool, str](res_register));
+    }
+
+    var deps: context.SemaDeps;
+    deps.entries = nil;
+    deps.count   = 0;
+
+    val res_sema: R.Result[context.SemaResult, str] = sema.sema(es.s, b.a, rr, ?deps, ?b.ctx, fid::session.ModuleId);
+    if (R.is_err[context.SemaResult, str](res_sema)) {
+        ret R.err[*context.SemaResult, str](R.unwrap_err[context.SemaResult, str](res_sema));
+    }
+
+    # the resolve above already invalidated any prior SemaResult via rr_drop, so
+    # b.sr is nil here; heap the fresh result and cache it.
+    val sr_slot: R.Result[*context.SemaResult, str] = A.allocate[context.SemaResult](es.alloc, 1);
+    if (R.is_err[*context.SemaResult, str](sr_slot)) {
+        var sr_owned: context.SemaResult = R.unwrap_ok[context.SemaResult, str](res_sema);
+        sema.dnit_result(?sr_owned);
+        ret sr_slot;
+    }
+    val sr: *context.SemaResult = R.unwrap_ok[*context.SemaResult, str](sr_slot);
+    @sr = R.unwrap_ok[context.SemaResult, str](res_sema);
+    b.sr = sr;
+    ret R.ok[*context.SemaResult, str](sr);
+}
+
+# the buffer's cached SemaResult, or nil when it has not been analyzed
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# ret: a borrowed pointer to the cached SemaResult, or nil
+pub fun sema_of(es: *EditorSession, fid: source.FileId) *context.SemaResult {
+    val b: *Buffer = slot_live(es, fid);
+    if (b == nil) { ret nil; }
+    ret b.sr;
+}
+
+# the semantic type inferred for an expression in an analyzed buffer
+#
+# Maps an `ExprId` (e.g. from `ast.offset_to_expr` at the cursor) to its `TypeId`,
+# the bridge an editor walks to the type interner's field tables for member
+# completion and value go-to-def. Yields TYPE_NIL for the nil id and TYPE_ERROR
+# when the buffer is unanalyzed or the id is out of range.
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# eid: the expression id to type
+# ret: the expression's semantic TypeId, TYPE_NIL, or TYPE_ERROR
+pub fun expr_type_of(es: *EditorSession, fid: source.FileId, eid: id.ExprId) type.TypeId {
+    if (eid == id.EXPR_NIL) { ret type.TYPE_NIL; }
+    val b: *Buffer = slot_live(es, fid);
+    if (b == nil || b.sr == nil || b.sr.expr_type == nil) { ret type.TYPE_ERROR; }
+    if (eid >= b.sr.expr_count) { ret type.TYPE_ERROR; }
+    ret b.sr.expr_type[eid];
+}
+
+# the declared (or inferred) type of a binding declaration in an analyzed buffer
+#
+# Maps a `DeclId` (e.g. from `ast.offset_to_decl`) to its `TypeId`. Yields
+# TYPE_NIL for the nil id and TYPE_ERROR when the buffer is unanalyzed or the id
+# is out of range.
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# did: the declaration id to type
+# ret: the declaration's semantic TypeId, TYPE_NIL, or TYPE_ERROR
+pub fun decl_type_of(es: *EditorSession, fid: source.FileId, did: id.DeclId) type.TypeId {
+    if (did == id.DECL_NIL) { ret type.TYPE_NIL; }
+    val b: *Buffer = slot_live(es, fid);
+    if (b == nil || b.sr == nil || b.sr.decl_type == nil) { ret type.TYPE_ERROR; }
+    if (did >= b.sr.decl_count) { ret type.TYPE_ERROR; }
+    ret b.sr.decl_type[did];
+}
+
+# the interned semantic type a syntactic AstType resolved to in an analyzed buffer
+#
+# Maps a syntactic `ast.id.TypeId` (e.g. from `ast.offset_to_type`) to the
+# semantic `TypeId` sema resolved it to. Yields TYPE_NIL for the nil id and
+# TYPE_ERROR when the buffer is unanalyzed or the id is out of range.
+# ---
+# es:  the editor session
+# fid: FileId of an open buffer
+# tid: the syntactic AstType id to resolve
+# ret: the resolved semantic TypeId, TYPE_NIL, or TYPE_ERROR
+pub fun resolved_type_of(es: *EditorSession, fid: source.FileId, tid: id.TypeId) type.TypeId {
+    if (tid == id.TYPE_NIL) { ret type.TYPE_NIL; }
+    val b: *Buffer = slot_live(es, fid);
+    if (b == nil || b.sr == nil || b.sr.type_resolved_ty == nil) { ret type.TYPE_ERROR; }
+    if (tid >= b.sr.type_count) { ret type.TYPE_ERROR; }
+    ret b.sr.type_resolved_ty[tid];
+}
+
 # replace the borrowed session DiagList with a fresh empty one
 #
 # The single owner of the editor's diagnostic-reset policy: every public
@@ -408,6 +539,7 @@ fun slot_ensure(es: *EditorSession, fid: source.FileId) R.Result[*Buffer, str] {
             nb.in_use  = false;
             nb.a       = nil;
             nb.rr      = nil;
+            nb.sr      = nil;
             nb.ctx     = host_ctx(es);
             i = i + 1;
         }
@@ -452,6 +584,7 @@ fun host_ctx(es: *EditorSession) comptime.ComptimeCtx {
         target.host_arch_id(),
         target.host_abi_id(),
         comptime.MODE_DEBUG,
+        0,
         target.host_pointer_width(),
         intern.STR_NIL,
         intern.STR_NIL
@@ -467,11 +600,27 @@ fun ctx_seed(es: *EditorSession, b: *Buffer) {
     b.ctx = host_ctx(es);
 }
 
-# free a buffer's cached ResolveResult and nil the field
+# free a buffer's cached SemaResult and nil the field
+# ---
+# es: the editor session
+# b:  the buffer whose SemaResult is released
+fun sema_drop(es: *EditorSession, b: *Buffer) {
+    if (b.sr == nil) { ret; }
+    sema.dnit_result(b.sr);
+    A.deallocate[context.SemaResult](es.alloc, b.sr, 1);
+    b.sr = nil;
+}
+
+# free a buffer's cached ResolveResult and the SemaResult derived from it, niling
+# both fields
+#
+# The SemaResult's expression-type tables are computed atop the ResolveResult, so
+# any path that replaces `rr` (a re-resolve, a reparse) must invalidate `sr` too.
 # ---
 # es: the editor session
 # b:  the buffer whose ResolveResult is released
 fun rr_drop(es: *EditorSession, b: *Buffer) {
+    sema_drop(es, b);
     if (b.rr == nil) { ret; }
     res.dnit_result(b.rr);
     A.deallocate[res.ResolveResult](es.alloc, b.rr, 1);
@@ -824,6 +973,65 @@ test "mach.lang.editor.resolve:reexported_module_alias" {
     A.deallocate[res.PublicSymbol](es.alloc, ex_inner.symbols, ex_inner.count::usize);
     A.deallocate[res.PublicSymbol](es.alloc, ex_surface.symbols, ex_surface.count::usize);
     if (!is_clean) { dnit(?es); session.dnit(?s); ret 1; }
+
+    dnit(?es);
+    session.dnit(?s);
+    ret 0;
+}
+
+# the retained SemaResult bridges a cursor ExprId to its TypeId and the type
+# interner's field tables, and is invalidated when the buffer changes (#1501)
+test "mach.lang.editor.analyze:expr_type_bridges_to_field_table" {
+    var alloc: A.Allocator;
+    val res_session: R.Result[session.Session, str] = t_session(?alloc);
+    if (R.is_err[session.Session, str](res_session)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
+    var es: EditorSession = init(?s);
+
+    val src: str = "rec P { x: i64; y: i64; }\nfun f(p: P) i64 { ret p.x; }\n";
+    val res_fid: R.Result[source.FileId, str] = open(?es, "p.mach", src);
+    if (R.is_err[source.FileId, str](res_fid)) { dnit(?es); session.dnit(?s); ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
+
+    val res_an: R.Result[*context.SemaResult, str] = analyze(?es, fid);
+    if (R.is_err[*context.SemaResult, str](res_an)) { dnit(?es); session.dnit(?s); ret 1; }
+
+    val a: *ast.Ast = ast_of(?es, fid);
+    if (a == nil) { dnit(?es); session.dnit(?s); ret 1; }
+
+    # locate the receiver `p` and the member `x` in `ret p.x` by source offset
+    val res_idx: R.Result[usize, str] = str_index_of(src, "p.x");
+    if (R.is_err[usize, str](res_idx)) { dnit(?es); session.dnit(?s); ret 1; }
+    val off_p: usize = R.unwrap_ok[usize, str](res_idx);
+
+    # the receiver ident `p` types as the nominal `P`
+    val eid_p: id.ExprId = ast.offset_to_expr(a, off_p);
+    if (eid_p == id.EXPR_NIL) { dnit(?es); session.dnit(?s); ret 1; }
+    val ty_p: type.TypeId = expr_type_of(?es, fid, eid_p);
+    if (ty_p == type.TYPE_ERROR || ty_p == type.TYPE_NIL) { dnit(?es); session.dnit(?s); ret 1; }
+
+    # P carries a two-field table the editor enumerates for member completion
+    if (O.is_none[*type.FieldTable](type.field_table_for(?s.types, ty_p))) { dnit(?es); session.dnit(?s); ret 1; }
+    if (type.field_count(?s.types, ty_p) != 2)                             { dnit(?es); session.dnit(?s); ret 1; }
+
+    # field `x` and the member access `p.x` both type as i64
+    val i64_opt: O.Option[type.TypeId] = type.prim(?s.types, type.TYPE_I64);
+    if (O.is_none[type.TypeId](i64_opt)) { dnit(?es); session.dnit(?s); ret 1; }
+    val i64_id: type.TypeId = O.unwrap[type.TypeId](i64_opt);
+
+    val f0_opt: O.Option[*type.FieldEntry] = type.field_at(?s.types, ty_p, 0);
+    if (O.is_none[*type.FieldEntry](f0_opt)) { dnit(?es); session.dnit(?s); ret 1; }
+    val f0: *type.FieldEntry = O.unwrap[*type.FieldEntry](f0_opt);
+    if (f0.ty != i64_id) { dnit(?es); session.dnit(?s); ret 1; }
+
+    val eid_px: id.ExprId = ast.offset_to_expr(a, off_p + 2);
+    if (eid_px == id.EXPR_NIL)                  { dnit(?es); session.dnit(?s); ret 1; }
+    if (expr_type_of(?es, fid, eid_px) != i64_id) { dnit(?es); session.dnit(?s); ret 1; }
+
+    # editing the buffer drops the cached SemaResult (it derives from the resolve)
+    val res_up: R.Result[bool, str] = update(?es, fid, "fun g() i64 { ret 0; }\n");
+    if (R.is_err[bool, str](res_up)) { dnit(?es); session.dnit(?s); ret 1; }
+    if (sema_of(?es, fid) != nil)    { dnit(?es); session.dnit(?s); ret 1; }
 
     dnit(?es);
     session.dnit(?s);

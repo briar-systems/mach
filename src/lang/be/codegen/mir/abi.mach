@@ -127,59 +127,91 @@ fun mark_eightbyte_range(classes: *u8, off: u64, size: u64, cls: u8) {
     }
 }
 
-# classify each leaf scalar of an aggregate into the eightbyte(s) it occupies
+# the most scalar leaves a flattened aggregate is enumerated into: a <=16 byte
+# aggregate (the only size the SSE mask and the lp64d flatten inspect) holds at most
+# sixteen one-byte leaves.
+val AGG_LEAF_CAP: u32 = 16;
+
+# enumerate the scalar leaves of `ty` into `out` (capacity `cap`) in offset order
 #
-# Recurses from absolute byte offset `base_off`. A float leaf marks its eightbytes
-# SSE; an integer / pointer / function leaf marks them INTEGER; structs recurse at
-# each field offset, unions at offset 0 (members overlap), arrays at each element
-# offset. `classes[0..1]` accumulate the merged per-eightbyte class for the SysV
-# SSE-aggregate classification.
+# The one shared leaf traversal behind the SysV SSE-eightbyte mask and the lp64d
+# AggLayout descriptor. Recurses structs at each field offset and arrays at each
+# element offset from `base_off`, recording each IRT_FLOAT leaf as a float field and
+# each integer / pointer / function leaf as a non-float field. Returns the running leaf
+# count, or a value past `cap` when the aggregate is non-flattenable at that cap.
+#
+# `strict` selects the two consumers' divergent treatment of what an offset-ordered
+# enumeration cannot represent. A union's members overlap at one offset: in `strict`
+# mode (the AggLayout flatten) the aggregate is rejected -- it stops with a past-cap
+# sentinel; in lenient mode (the SSE mask, where each overlapping member contributes to
+# its eightbyte's class) every member is enumerated at the shared offset. An
+# unresolvable type likewise poisons in `strict` mode and is skipped in lenient mode.
+# `hfa_walk` does NOT ride this iterator -- it is a homogeneity reduction, not an
+# enumeration (see its note).
 # ---
 # ctx:      the active lowering context (supplies the IR type oracle and target)
-# ty:       the type whose leaves are classified
+# ty:       the type whose leaves are enumerated
 # base_off: the type's absolute byte offset within the enclosing aggregate
-# classes:  the two-entry per-eightbyte class array to accumulate into
-fun mark_eightbyte_classes(ctx: *context.LowerCtx, ty: type.IrTypeId, base_off: u64, classes: *u8) {
+# strict:   reject unions / unresolvable types (the flatten) vs enumerate through (the mask)
+# out:      the leaf array, written for indices in [0, cap)
+# cap:      the capacity of `out` (the flatten's two-leaf cap, the mask's sixteen)
+# count:    the running leaf count before this type's leaves
+# ret:      the running leaf count after this type's leaves (> cap when non-flattenable)
+fun collect_leaves(ctx: *context.LowerCtx, ty: type.IrTypeId, base_off: u64, strict: bool,
+                   out: *abi.AggField, cap: u32, count: u32) u32 {
+    if (count > cap) { ret count; }
     val it: O.Option[*type.IrType] = type.get(ctx.types, ty);
-    if (!O.is_some[*type.IrType](it)) { ret; }
+    if (!O.is_some[*type.IrType](it)) {
+        if (strict) { ret cap + 1; }
+        ret count;
+    }
     val t: *type.IrType = O.unwrap[*type.IrType](it);
 
-    if (t.kind == type.IRT_FLOAT) {
-        mark_eightbyte_range(classes, base_off, type.byte_size(ctx.types, ty, ctx.tgt)::u64, EB_SSE);
-        ret;
-    }
     if (t.kind == type.IRT_STRUCT) {
+        var c: u32 = count;
         var i: u32 = 0;
         for (i < t.data.struct_.field_count) {
-            val fid: type.IrTypeId = t.data.struct_.fields[i];
-            val fo:  u64 = type.byte_offset(ctx.types, ty, i, ctx.tgt)::u64;
-            mark_eightbyte_classes(ctx, fid, base_off + fo, classes);
+            val fo: u64 = type.byte_offset(ctx.types, ty, i, ctx.tgt)::u64;
+            c = collect_leaves(ctx, t.data.struct_.fields[i], base_off + fo, strict, out, cap, c);
+            if (strict && c > cap) { ret c; }
             i = i + 1;
         }
-        ret;
-    }
-    if (t.kind == type.IRT_UNION) {
-        # union members all overlap at offset 0; merge each member's classes.
-        var i: u32 = 0;
-        for (i < t.data.struct_.field_count) {
-            mark_eightbyte_classes(ctx, t.data.struct_.fields[i], base_off, classes);
-            i = i + 1;
-        }
-        ret;
+        ret c;
     }
     if (t.kind == type.IRT_ARRAY) {
         val elem: type.IrTypeId = t.data.array_.element;
         val es:   u64 = type.byte_size(ctx.types, elem, ctx.tgt)::u64;
         val n:    u32 = type.array_count(ctx.types, ty);
+        var c: u32 = count;
         var i: u32 = 0;
         for (i < n) {
-            mark_eightbyte_classes(ctx, elem, base_off + i::u64 * es, classes);
+            c = collect_leaves(ctx, elem, base_off + i::u64 * es, strict, out, cap, c);
+            if (strict && c > cap) { ret c; }
             i = i + 1;
         }
-        ret;
+        ret c;
     }
-    # integer / pointer / function leaf: an INTEGER-class eightbyte.
-    mark_eightbyte_range(classes, base_off, type.byte_size(ctx.types, ty, ctx.tgt)::u64, EB_INTEGER);
+    if (t.kind == type.IRT_UNION) {
+        # a union's members overlap at one offset. the strict flatten rejects it; the
+        # lenient mask enumerates each member at the shared offset (its eightbyte class).
+        if (strict) { ret cap + 1; }
+        var c: u32 = count;
+        var i: u32 = 0;
+        for (i < t.data.struct_.field_count) {
+            c = collect_leaves(ctx, t.data.struct_.fields[i], base_off, strict, out, cap, c);
+            i = i + 1;
+        }
+        ret c;
+    }
+
+    # a scalar leaf (IRT_FLOAT or an integer / pointer / function): record it when
+    # within the cap, then count it.
+    if (count < cap) {
+        out[count].is_float = t.kind == type.IRT_FLOAT;
+        out[count].offset   = base_off::u32;
+        out[count].width    = type.byte_size(ctx.types, ty, ctx.tgt)::u8;
+    }
+    ret count + 1;
 }
 
 # the per-eightbyte SSE mask for a <=16 byte aggregate type
@@ -196,10 +228,20 @@ fun aggregate_sse_mask(ctx: *context.LowerCtx, ty: type.IrTypeId) u8 {
     if (!context.value_is_aggregate(ctx, ty)) { ret 0; }
     val size: u64 = type.byte_size(ctx.types, ty, ctx.tgt)::u64;
     if (size == 0 || size > 16) { ret 0; }
+    # enumerate the leaves (lenient: a union's overlapping members each contribute to
+    # their eightbyte's class), then merge each leaf's range into its eightbyte(s).
+    var leaves: [16]abi.AggField;
+    val n: u32 = collect_leaves(ctx, ty, 0, false, ?leaves[0], AGG_LEAF_CAP, 0);
     var classes: [2]u8;
     classes[0] = EB_NO_CLASS;
     classes[1] = EB_NO_CLASS;
-    mark_eightbyte_classes(ctx, ty, 0, ?classes[0]);
+    var i: u32 = 0;
+    for (i < n) {
+        var cls: u8 = EB_INTEGER;
+        if (leaves[i].is_float) { cls = EB_SSE; }
+        mark_eightbyte_range(?classes[0], leaves[i].offset::u64, leaves[i].width::u64, cls);
+        i = i + 1;
+    }
     var mask: u8 = 0;
     if (classes[0] == EB_SSE) { mask = mask | 1; }
     if (classes[1] == EB_SSE) { mask = mask | 2; }
@@ -214,6 +256,13 @@ fun aggregate_sse_mask(ctx: *context.LowerCtx, ty: type.IrTypeId) u8 {
 # overlap). Any non-FP leaf, an empty aggregate, or a mix of fundamental widths
 # makes the whole aggregate non-homogeneous. Member counting is by recursion, never
 # `size / width`, so an explicit `#[align(...)]` padding the size never inflates it.
+#
+# This deliberately does NOT ride the shared `collect_leaves` iterator: it is a
+# homogeneity REDUCTION, not a leaf enumeration. Its union arm takes the widest
+# member's count (max), where the offset-ordered enumeration would sum every member's
+# leaves -- routing it through `collect_leaves` would silently change union-of-floats
+# HFA placement (a count of sum vs max), a divergence no test or fixture covers. Keep
+# the reduction here; do not "unify" it with the enumeration walk.
 # ---
 # ctx:       the active lowering context (supplies the IR type oracle and target)
 # ty:        the type to test
@@ -303,53 +352,100 @@ fun hfa_info(ctx: *context.LowerCtx, ty: type.IrTypeId, out_members: *u8, out_el
     @out_elem    = elem::u8;
 }
 
-# the physical V register for member `i` of a CLASS_HFA run
+# the most scalar leaves `agg_layout` records before rejecting an aggregate as
+# non-flattenable (the lp64d mixed / float-pair rules act on at most two leaves).
+val AGG_MAX_LEAVES: u32 = 2;
+
+# the <=2-leaf flattened-aggregate descriptor for a type
 #
-# The i-th register above the run's base (`slot.reg`), used to place each HFA member
-# into its consecutive argument / return register.
+# Flattens an aggregate's scalar leaves in offset order, capped at two, for the
+# lp64d mixed float-plus-integer and different-width float-pair rules. Reports
+# field_count 1 or 2 with the leaves filled for a one- or two-leaf struct / array
+# aggregate; field_count 0 for a non-aggregate, a union, an empty aggregate, or an
+# aggregate of more than two leaves (each of which falls to the integer
+# convention). Only the lp64d classifier acts on it; the other conventions ignore
+# it, as they do the HFA descriptor.
 # ---
-# base_reg: the run's base V register id
-# i:        zero-based member index within the run
-# ret:      the physical V register id for member `i`
-fun hfa_member_reg(base_reg: i32, i: u32) i32 {
-    ret isa.regid_make(isa.REG_CLASS_ID_XMM, isa.regid_index(base_reg) + i::i32);
+# ctx:     the active lowering context (supplies the IR type oracle and target)
+# ty:      the type to describe
+# is_aggr: whether `ty` is an aggregate (the caller already computed it)
+# ret:     the flattened-aggregate descriptor (field_count 0 when not applicable)
+fun agg_layout(ctx: *context.LowerCtx, ty: type.IrTypeId, is_aggr: bool) abi.AggLayout {
+    var out: abi.AggLayout;
+    out.field_count = 0;
+    if (!is_aggr) { ret out; }
+    # strict enumeration straight into the two-leaf `fields`: more than two leaves, a
+    # union, or an empty aggregate leaves field_count 0 (the integer convention).
+    val n: u32 = collect_leaves(ctx, ty, 0, true, ?out.fields[0], AGG_MAX_LEAVES, 0);
+    if (n == 1 || n == 2) { out.field_count = n::u8; }
+    ret out;
 }
 
-# advance the GP or FP argument-register cursor for one assigned register
+# advance the GP / FP argument-register cursors past a register-passed slot
 #
-# Dispatches on the register's bank (the composite id encodes it). A negative id
-# (no register) advances neither, so a register aggregate's GP and SSE eightbytes
-# each consume from the right file.
-# ---
-# reg:     the assigned physical register id, or negative for none
-# gp_used: the running GP argument-register cursor, advanced in place
-# fp_used: the running FP argument-register cursor, advanced in place
-fun advance_one_cursor(reg: i32, gp_used: *i32, fp_used: *i32) {
-    if (reg < 0) { ret; }
-    if (isa.regid_class(reg) == isa.REG_CLASS_ID_XMM) {
-        @fp_used = @fp_used + 1;
-    } or {
-        @gp_used = @gp_used + 1;
-    }
-}
-
-# advance the GP / FP cursors for a register-passed slot by the bank of each register
+# Walks the slot's placement pieces and advances the bank cursor of each register
+# chunk: a PIECE_GP consumes one GP register, a PIECE_FP one FP register, and a
+# PIECE_STACK (a register-plus-stack split's tail) consumes neither. This covers a
+# scalar, a by-reference pointer, a two-register pair, a CLASS_HFA run, a mixed
+# GP / FP aggregate, and a split uniformly, since every placement carries its pieces.
 #
-# A scalar, a by-reference pointer, and a mixed GP/SSE aggregate each consume their
-# correct registers (`reg` and, for a two-register aggregate, `reg2`). A CLASS_HFA
-# run consumes `reg_count` consecutive V registers from the FP bank. Stack slots
-# carry no register and advance neither.
+# A bank cursor advances only by the registers a slot actually consumes; a fully
+# stack-passed argument advances neither. AAPCS64 saturates the bank cursor to its
+# limit when a register-eligible argument spills for lack of a fitting run (psABI
+# C.4 / C.13) so no later same-bank argument back-fills a left-behind register -- a
+# documented AAPCS64 simplification (see `target.abi.aapcs64`), not modeled here.
 # ---
-# slot:    the classified slot whose registers are consumed
+# slot:    the classified slot whose register chunks are consumed
 # gp_used: the running GP argument-register cursor, advanced in place
 # fp_used: the running FP argument-register cursor, advanced in place
 fun advance_arg_cursors(slot: *abi.ParamSlot, gp_used: *i32, fp_used: *i32) {
-    if (slot.class == abi.CLASS_HFA) {
-        @fp_used = @fp_used + slot.reg_count::i32;
-        ret;
+    var i: u32 = 0;
+    for (i < slot.piece_count) {
+        val k: abi.PieceKind = slot.pieces[i].kind;
+        if (k == abi.PIECE_GP) {
+            @gp_used = @gp_used + 1;
+        } or (k == abi.PIECE_FP) {
+            @fp_used = @fp_used + 1;
+        }
+        i = i + 1;
     }
-    advance_one_cursor(slot.reg, gp_used, fp_used);
-    advance_one_cursor(slot.reg2, gp_used, fp_used);
+}
+
+# whether a slot carries a register-plus-stack split's stack chunk
+#
+# True for a placement with a PIECE_STACK chunk (the RISC-V lp64d 9-16 byte aggregate
+# that rides its last integer register plus an outgoing stack slot); the signature
+# walk assigns and advances the outgoing offset of such a chunk in addition to
+# advancing the register banks for the slot's register chunks.
+# ---
+# slot: the classified slot
+# ret:  true when any piece is PIECE_STACK
+fun slot_has_stack_piece(slot: *abi.ParamSlot) bool {
+    var i: u32 = 0;
+    for (i < slot.piece_count) {
+        if (slot.pieces[i].kind == abi.PIECE_STACK) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the outgoing stack bytes a split slot's stack chunk(s) consume
+#
+# Each PIECE_STACK chunk occupies an eight-byte-granular outgoing slot sized from its
+# byte width; the sum is the slot's stack footprint above its register chunks.
+# ---
+# slot: the classified slot
+# ret:  the outgoing stack bytes the slot's stack chunks consume
+fun split_stack_bytes(slot: *abi.ParamSlot) i64 {
+    var total: i64 = 0;
+    var i: u32 = 0;
+    for (i < slot.piece_count) {
+        if (slot.pieces[i].kind == abi.PIECE_STACK) {
+            total = total + context.stack_slot_bytes(slot.pieces[i].width::u64);
+        }
+        i = i + 1;
+    }
+    ret total;
 }
 
 # whether a CLASS_SRET return reserves the first GP argument register
@@ -456,7 +552,12 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
     var ret_hm:    u8   = 0;
     var ret_he:    u8   = 0;
     hfa_info(ctx, ret_type, ?ret_hm, ?ret_he);
-    out.ret_slot = classify_ret(ret_size, 0, ret_float, ret_eb, ret_aggr, ret_hm, ret_he);
+    # only the lp64d classifier reads the flattened-aggregate descriptor; for every
+    # other convention skip the per-value flatten walk and pass the no-information one.
+    val wants_agg: bool = ctx.tgt.abi.consumes_agg_layout;
+    var ret_agg: abi.AggLayout = abi.agg_none();
+    if (wants_agg) { ret_agg = agg_layout(ctx, ret_type, ret_aggr); }
+    out.ret_slot = classify_ret(ret_size, 0, ret_float, ret_eb, ret_aggr, ret_hm, ret_he, ret_agg);
 
     var gp_used:   i32 = 0;
     var fp_used:   i32 = 0;
@@ -510,7 +611,9 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
         var phm:  u8   = 0;
         var phe:  u8   = 0;
         hfa_info(ctx, pty, ?phm, ?phe);
-        var slot: abi.ParamSlot = classify_arg(i::i32, psz, pal, pfl, peb, pag, gp_used, fp_used, phm, phe);
+        var pagg: abi.AggLayout = abi.agg_none();
+        if (wants_agg) { pagg = agg_layout(ctx, pty, pag); }
+        var slot: abi.ParamSlot = classify_arg(i::i32, psz, pal, pfl, peb, pag, gp_used, fp_used, phm, phe, pagg);
 
         # record the real outgoing stack offset on the slot (the ABI classifier
         # returns a sizing-only slot with offset 0); the param / call lowering
@@ -527,6 +630,14 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
             stack_off   = stack_off + context.stack_slot_bytes(slot.size);
         } or {
             advance_arg_cursors(?slot, ?gp_used, ?fp_used);
+            # a register-plus-stack split also reserves an outgoing stack slot for its
+            # stack chunk: assign the running offset as the chunk's stack base and
+            # advance past it (eight-byte-granular), so the next argument clears it.
+            if (slot_has_stack_piece(?slot)) {
+                stack_off   = round_up_i64(stack_off, 8);
+                slot.offset = stack_off;
+                stack_off   = stack_off + split_stack_bytes(?slot);
+            }
         }
 
         slots[i] = slot;
@@ -673,16 +784,20 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         } or {
             val aal: u64  = type.byte_align(ctx.types, av.ty, ctx.tgt)::u64;
             val afl: bool = context.value_is_float(ctx, av.ty);
-            # a variadic tail aggregate is classified as integer eightbytes (mask 0)
-            # and never as an HFA (members 0): the va_arg read path walks the GP
-            # register-save / overflow areas, so the caller and callee stay
-            # consistent. SSE-eightbyte and HFA V-register passing are for fixed
-            # parameters and returns (the C-FFI boundary), not the varargs tail.
-            slot = classify_arg(pidx::i32, asz, aal, afl, 0, aag, gp_used, fp_used, 0, 0);
+            # a variadic tail aggregate is classified as integer eightbytes (mask 0),
+            # never as an HFA (members 0), and with no flattened-aggregate descriptor
+            # (agg_none): the va_arg read path walks the GP register-save / overflow
+            # areas, so the caller and callee stay consistent. SSE-eightbyte, HFA
+            # V-register, and lp64d fa-register passing are for fixed parameters and
+            # returns (the C-FFI boundary), not the varargs tail.
+            slot = classify_arg(pidx::i32, asz, aal, afl, 0, aag, gp_used, fp_used, 0, 0, abi.agg_none());
             # round a stack-passed tail argument up to its slot alignment before
             # placing it (identity on x86; honors a 16-aligned AAPCS64 by-value arg).
+            # a register-plus-stack split's tail stack chunk is eight-byte-granular.
             if (slot.class == abi.CLASS_STACK || slot.class == abi.CLASS_STACK_BYREF) {
                 stack_off = round_up_i64(stack_off, stack_arg_align(slot.class, aal));
+            } or (slot_has_stack_piece(?slot)) {
+                stack_off = round_up_i64(stack_off, 8);
             }
             soff = stack_off;
         }
@@ -731,6 +846,10 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
                 stack_off = stack_off + context.stack_slot_bytes(slot.size);
             } or {
                 advance_arg_cursors(?slot, ?gp_used, ?fp_used);
+                # a split tail also consumes its stack chunk's outgoing slot.
+                if (slot_has_stack_piece(?slot)) {
+                    stack_off = stack_off + split_stack_bytes(?slot);
+                }
             }
         }
 
@@ -822,47 +941,112 @@ fun lower_value_addr(ctx: *context.LowerCtx, mb: *mir.MirBlock, v: value.Value) 
     ret R.ok[mir.MirOperand, str](mir.op_vreg(addr));
 }
 
+# how `materialize_pieces` transfers a placement's register / stack chunks: the
+# direction (register load vs store), the per-chunk register-side memory operand, and
+# the stack-side base for a register-plus-stack split's PIECE_STACK chunk.
+# ---
+# store:      true to store each register chunk to its memory operand (a callee spill /
+#             a call result's storage); false to load each chunk into its register (a
+#             caller's outgoing argument, a callee's return value)
+# mem_base:   the base the register chunk's memory operand is formed from -- a spill
+#             slot key when `mem_slot` is true, else a pointer vreg
+# mem_slot:   true to form `op_mem_slot(mem_base, src_off)`, false `op_mem_value`
+# stack_base: physical register a PIECE_STACK chunk's stack side is addressed off (the
+#             stack pointer for an outgoing slot, the frame pointer for an incoming one)
+# stack_off:  byte offset of the slot's stack region from `stack_base`
+# stack_ok:   false when the placement must carry no PIECE_STACK chunk (a return value);
+#             such a chunk is then a classifier bug reported loudly
+rec PiecePlan {
+    store:      bool;
+    mem_base:   u32;
+    mem_slot:   bool;
+    stack_base: u32;
+    stack_off:  i64;
+    stack_ok:   bool;
+}
+
+# materialize a register / register-plus-stack placement's pieces, the one path behind
+# the caller-argument, callee-parameter, callee-return, and call-result reconstructions.
+#
+# Each register chunk loads from / stores to `[mem_base + src_off]` at the chunk width,
+# the move's machine form following the register's bank (a GP word, an FP `width`-byte
+# move) -- so a single, a pair, a CLASS_HFA run, a mixed GP / FP aggregate, and a split
+# all flow through one loop. A PIECE_STACK chunk (a register-plus-stack split's tail)
+# transfers a full word between that memory operand and `[stack_base + stack_off +
+# stk_off]`, in the direction `plan.store` selects.
+# ---
+# ctx:  the active lowering context
+# mb:   the MIR block the move(s) are appended to
+# slot: the classified slot whose pieces are materialized
+# plan: the transfer direction, register-side memory operand, and stack-side base
+# ret:  ok(true) on success, or a loud error
+fun materialize_pieces(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, plan: PiecePlan) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < slot.piece_count) {
+        val p: abi.ParamPiece = slot.pieces[i];
+        var mem: mir.MirOperand = mir.op_mem_value(plan.mem_base, p.src_off);
+        if (plan.mem_slot) { mem = mir.op_mem_slot(plan.mem_base, p.src_off); }
+        if (p.kind == abi.PIECE_STACK) {
+            if (!plan.stack_ok) {
+                ret R.err[bool, str]("mir.lower_ir: return slot carries an outgoing stack chunk");
+            }
+            # a full-word transfer between the register-side memory operand and the
+            # stack slot, through a scratch GP register; the direction follows `store`.
+            val stk: mir.MirOperand = mir.op_mem_preg(plan.stack_base, plan.stack_off + p.stk_off);
+            val tr: R.Result[u32, str] = context.new_vreg(ctx, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](tr)) { ret R.err[bool, str](R.unwrap_err[u32, str](tr)); }
+            val tmp: u32 = R.unwrap_ok[u32, str](tr);
+            var src: mir.MirOperand = mem;
+            var dst: mir.MirOperand = stk;
+            if (plan.store) { src = stk; dst = mem; }
+            val ld: R.Result[bool, str] = context.emit_mov(ctx, mb, mir.op_vreg(tmp), src);
+            if (R.is_err[bool, str](ld)) { ret ld; }
+            val st: R.Result[bool, str] = context.emit_store_to(ctx, mb, dst, mir.op_vreg(tmp));
+            if (R.is_err[bool, str](st)) { ret st; }
+        } or {
+            # a register chunk: the GP and FP banks share the move (a MOV at `width`); the
+            # register id's class tag drives the machine form, GP word or FP move.
+            val reg: mir.MirOperand = mir.op_preg(p.reg::u32);
+            if (plan.store) {
+                val st: R.Result[bool, str] = context.emit_store_to_w(ctx, mb, mem, reg, p.width);
+                if (R.is_err[bool, str](st)) { ret st; }
+            } or {
+                val mr: R.Result[bool, str] = context.emit_mov_w(ctx, mb, reg, mem, p.width);
+                if (R.is_err[bool, str](mr)) { ret mr; }
+            }
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
 # emit the pre-coloring move(s) placing one classified argument
 #
-# A GP/FP register argument moves the value into the argument register (a 9-16 byte
-# aggregate in two GP registers moves each half from `[base+0]` / `[base+8]`); a
-# BYREF argument moves the aggregate's address into the register; a STACK argument
-# stores the value at `[sp + stack_off]`. A by-value stack aggregate (CLASS_STACK)
-# copies its bytes to the outgoing slot; a by-reference stack spill
-# (CLASS_STACK_BYREF, the win64 exhausted-slot case) stores only the pointer, the
-# stack analog of BYREF. A CLASS_HFA argument loads each member from
-# `[base + i*reg_width]` into its consecutive V argument register.
+# A BYREF argument moves the aggregate's address into the register; a STACK argument
+# stores the value at `[sp + stack_off]` (a by-value aggregate copies its bytes, a
+# scalar stores its word); a by-reference stack spill (CLASS_STACK_BYREF, the win64
+# exhausted-slot case) stores only the pointer, the stack analog of BYREF. Every
+# other aggregate -- a single register, a two-register pair, a CLASS_HFA run, a mixed
+# GP / FP aggregate, or a register-plus-stack split -- is placed piece by piece: each
+# register chunk loads from `[storage + src_off]` into its GP register (a full-word
+# MOV) or FP register (a `width`-byte SSE move), and a split's PIECE_STACK chunk loads
+# its word from storage and stores it at `[sp + stack_off + stk_off]`. A scalar argop
+# is the value itself, placed directly into its register.
 #
 # An aggregate argop is a pointer to the aggregate's storage (aggregates flow by
-# address), normalized through `context.addr_to_vreg` so the two-register /
-# by-reference forms index a register pointer base; a scalar argop is the value
-# itself, placed directly.
+# address), normalized through `context.addr_to_vreg` so the piece loads index a
+# register pointer base.
 # ---
 # ctx:       the active lowering context
 # mb:        the MIR block the move(s) are appended to
 # slot:      the argument's classified slot
 # argop:     the lowered argument operand (a storage pointer for an aggregate)
-# stack_off: the running outgoing-argument offset for a STACK slot
+# stack_off: the slot's outgoing stack base (a STACK slot, or a split's stack chunk)
 # is_aggr:   whether the argument is an aggregate flowing by address
 # size:      the argument's byte size (the copy length for a by-value aggregate)
 # ret:       ok(true) on success, or a loud error
 fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, argop: mir.MirOperand,
                   stack_off: i64, is_aggr: bool, size: u64) R.Result[bool, str] {
-    if (slot.class == abi.CLASS_HFA) {
-        # an HFA argument flows by address; load each member into its V register.
-        var base: u32 = mir.MIR_VREG_NIL;
-        val ar: R.Result[bool, str] = context.addr_to_vreg(ctx, mb, argop, ?base);
-        if (R.is_err[bool, str](ar)) { ret ar; }
-        var i: u32 = 0;
-        for (i < slot.reg_count::u32) {
-            val off: i64 = (i * slot.reg_width::u32)::i64;
-            val mr: R.Result[bool, str] = context.emit_fmov(ctx, mb,
-                mir.op_preg(hfa_member_reg(slot.reg, i)::u32), mir.op_mem_value(base, off), slot.reg_width);
-            if (R.is_err[bool, str](mr)) { ret mr; }
-            i = i + 1;
-        }
-        ret R.ok[bool, str](true);
-    }
     if (slot.class == abi.CLASS_STACK_BYREF) {
         # win64 by-reference overflow: store the hidden aggregate pointer into the
         # outgoing stack slot, not a by-value copy of the aggregate bytes.
@@ -894,24 +1078,21 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
         if (R.is_err[bool, str](ar)) { ret ar; }
         ret context.emit_mov(ctx, mb, mir.op_preg(slot.reg::u32), mir.op_vreg(base));
     }
-    if (slot.reg2 >= 0) {
-        # two-register aggregate: load each 8-byte half from the aggregate's
-        # storage (a value-pointer base) into the two GP registers.
-        var base: u32 = mir.MIR_VREG_NIL;
-        val ar: R.Result[bool, str] = context.addr_to_vreg(ctx, mb, argop, ?base);
-        if (R.is_err[bool, str](ar)) { ret ar; }
-        val lo: R.Result[bool, str] = context.emit_mov(ctx, mb,
-            mir.op_preg(slot.reg::u32), mir.op_mem_value(base, 0));
-        if (R.is_err[bool, str](lo)) { ret lo; }
-        ret context.emit_mov(ctx, mb, mir.op_preg(slot.reg2::u32), mir.op_mem_value(base, 8));
-    }
     if (is_aggr) {
-        # <=8 byte single-register aggregate: load its one word from the aggregate's
-        # storage into the argument register, normalizing a global's address first.
+        # register / register-plus-stack aggregate: place each chunk from the
+        # aggregate's storage into its register or outgoing stack slot. argop is a
+        # pointer to the storage, normalized to a register base.
         var base: u32 = mir.MIR_VREG_NIL;
         val ar: R.Result[bool, str] = context.addr_to_vreg(ctx, mb, argop, ?base);
         if (R.is_err[bool, str](ar)) { ret ar; }
-        ret context.emit_mov(ctx, mb, mir.op_preg(slot.reg::u32), mir.op_mem_value(base, 0));
+        var plan: PiecePlan;
+        plan.store      = false;
+        plan.mem_base   = base;
+        plan.mem_slot   = false;
+        plan.stack_base = ctx.tgt.arch.stack_ptr_reg::u32;
+        plan.stack_off  = stack_off;
+        plan.stack_ok   = true;
+        ret materialize_pieces(ctx, mb, slot, plan);
     }
     # single FP register scalar argument: a float copy into the XMM argument
     # register. the XMM argument preg carries the SSE class, so the encoder
@@ -919,22 +1100,41 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
     # for a float-constant immediate) rather than a general-purpose MOV of the GP
     # register that aliases the XMM index.
     if (slot.class == abi.CLASS_FP) {
-        ret context.emit_fmov(ctx, mb, mir.op_preg(slot.reg::u32), argop, fp_move_width(size));
+        val fw: R.Result[u8, str] = fp_move_width(size);
+        if (R.is_err[u8, str](fw)) { ret R.err[bool, str](R.unwrap_err[u8, str](fw)); }
+        ret context.emit_fmov(ctx, mb, mir.op_preg(slot.reg::u32), argop, R.unwrap_ok[u8, str](fw));
     }
-    # single GP register scalar argument.
-    ret context.emit_mov(ctx, mb, mir.op_preg(slot.reg::u32), argop);
+    # single GP register scalar argument. a 32-bit value rides a width-4 move so the
+    # backend re-extends it to the register width by its own convention (RV64 lp64
+    # sign-extends a 32-bit register).
+    ret context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), argop, scalar_reg_move_width(ctx, size));
 }
 
 # the SSE move width (4 for f32, 8 for f64) for a CLASS_FP scalar of `size` bytes
 #
 # A CLASS_FP slot is always a 4- or 8-byte scalar float; any other size is an
-# ABI-classification bug, defaulted to the f64 form.
+# ABI-classification bug, reported loudly rather than defaulted to a move width
+# that would silently mis-size the float copy.
 # ---
 # size: the scalar's byte size
-# ret:  the SSE move width in bytes (4 or 8)
-fun fp_move_width(size: u64) u8 {
+# ret:  the SSE move width in bytes (4 or 8), or a loud error on an unexpected size
+fun fp_move_width(size: u64) R.Result[u8, str] {
+    if (size == 4) { ret R.ok[u8, str](4); }
+    if (size == 8) { ret R.ok[u8, str](8); }
+    ret R.err[u8, str]("mir.abi.fp_move_width: CLASS_FP scalar of unsupported size (expected 4 or 8 bytes)");
+}
+
+# the move width for materializing a scalar GP value into its argument / return
+# register. a 32-bit value rides a width-4 move so a backend can re-extend it to the
+# register width by its own convention -- RV64 lp64 holds a 32-bit register
+# sign-extended, so a directly materialized i32 constant must be re-signed there, and
+# the carried width is what lets it. every other size keeps the full gpr-width move:
+# a 64-bit value / pointer is already register-width, and narrowing below 32 bits
+# would leave a target's upper register bits unspecified (an x86 `mov al` does not
+# clear them). value-equivalent on x86 / arm64, where a 32-bit move zero-extends.
+fun scalar_reg_move_width(ctx: *context.LowerCtx, size: u64) u8 {
     if (size == 4) { ret 4; }
-    ret 8;
+    ret ctx.tgt.model.gpr_width::u8;
 }
 
 # grow the function's reserved outgoing-argument region to cover one call's footprint
@@ -956,11 +1156,12 @@ fun record_outgoing_size(ctx: *context.LowerCtx, bytes: i64) {
 # move a call's return value out of its canonical return register(s) into `dst`
 #
 # For an aggregate return `dst` is the caller-owned result storage pointer (see
-# `context.alloc_result_storage`): an HFA stores each V member into
-# `[dst + i*reg_width]`, a 9-16 byte register pair stores each half into `[dst+0]` /
-# `[dst+8]`, and a <=8 byte single-register aggregate stores its word into `[dst+0]`,
-# so `dst` stays the storage pointer downstream consumers read by. A scalar return
-# is a plain move into the value vreg `dst`.
+# `context.alloc_result_storage`): each register chunk of the placement is stored
+# into `[dst + src_off]` -- an HFA / mixed run stores each member, a 9-16 byte pair
+# each half, a <=8 byte single-register aggregate its one word -- so `dst` stays the
+# storage pointer downstream consumers read by. A scalar return is a plain move into
+# the value vreg `dst`. A return never carries a stack chunk (a too-large aggregate
+# returns via the sret pointer), so a PIECE_STACK here is a classifier bug.
 # ---
 # ctx:     the active lowering context
 # mb:      the MIR block the move(s) are appended to
@@ -969,26 +1170,15 @@ fun record_outgoing_size(ctx: *context.LowerCtx, bytes: i64) {
 # is_aggr: whether the return is an aggregate flowing by address
 # ret:     ok(true) on success, or a loud error
 fun emit_ret_slot_to_vreg(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, dst: u32, is_aggr: bool) R.Result[bool, str] {
-    if (slot.class == abi.CLASS_HFA) {
-        # an HFA return arrives in V0..V(reg_count-1); store each member into the
-        # caller-owned result storage so `dst` stays the storage pointer.
-        var i: u32 = 0;
-        for (i < slot.reg_count::u32) {
-            val off: i64 = (i * slot.reg_width::u32)::i64;
-            val st: R.Result[bool, str] = context.emit_store_to_w(ctx, mb,
-                mir.op_mem_value(dst, off), mir.op_preg(hfa_member_reg(slot.reg, i)::u32), slot.reg_width);
-            if (R.is_err[bool, str](st)) { ret st; }
-            i = i + 1;
-        }
-        ret R.ok[bool, str](true);
-    }
-    if (slot.reg2 >= 0) {
-        val lo: R.Result[bool, str] = context.emit_store_to(ctx, mb, mir.op_mem_value(dst, 0), mir.op_preg(slot.reg::u32));
-        if (R.is_err[bool, str](lo)) { ret lo; }
-        ret context.emit_store_to(ctx, mb, mir.op_mem_value(dst, 8), mir.op_preg(slot.reg2::u32));
-    }
     if (is_aggr) {
-        ret context.emit_store_to(ctx, mb, mir.op_mem_value(dst, 0), mir.op_preg(slot.reg::u32));
+        var plan: PiecePlan;
+        plan.store      = true;
+        plan.mem_base   = dst;
+        plan.mem_slot   = false;
+        plan.stack_base = 0;
+        plan.stack_off  = 0;
+        plan.stack_ok   = false;
+        ret materialize_pieces(ctx, mb, slot, plan);
     }
     ret context.emit_mov(ctx, mb, mir.op_vreg(dst), mir.op_preg(slot.reg::u32));
 }
@@ -1064,21 +1254,22 @@ pub fun lower_params(ctx: *context.LowerCtx, mb: *mir.MirBlock) R.Result[bool, s
 # emit the entry pre-coloring move(s) for one classified incoming parameter
 #
 # An aggregate parameter ends with `pv` holding a pointer to the aggregate's
-# incoming bytes (aggregates flow by address): a register-passed aggregate (one or
-# two GP halves) is spilled into a fresh frame slot keyed on `pv` so `pv` names that
-# storage; a BYREF aggregate takes the hidden pointer directly; a STACK aggregate is
-# the caller's by-value copy, whose address is LEA'd into `pv`; a STACK_BYREF
-# aggregate is the caller's spilled hidden pointer, loaded into `pv` (the stack
-# analog of BYREF). An HFA parameter arrives in V[reg]..V[reg+reg_count-1] and each
-# member is stored into a fresh spill slot keyed on `pv`. A scalar parameter moves
-# its single register / stack word into the parameter value vreg `pv`.
+# incoming bytes (aggregates flow by address): a register / register-plus-stack
+# aggregate is reconstructed into a fresh frame slot keyed on `pv` so `pv` names that
+# storage -- each register chunk is stored into `[pv + src_off]` (a GP chunk full
+# width, an FP chunk at its `width`) and a split's PIECE_STACK chunk is read from the
+# caller's incoming stack slot into the same offset; a BYREF aggregate takes the
+# hidden pointer directly; a STACK aggregate is the caller's by-value copy, whose
+# address is LEA'd into `pv`; a STACK_BYREF aggregate is the caller's spilled hidden
+# pointer, loaded into `pv` (the stack analog of BYREF). A scalar parameter moves its
+# single register / stack word into the parameter value vreg `pv`.
 # ---
 # ctx:       the active lowering context
 # mb:        the entry MIR block the move(s) are appended to
 # slot:      the parameter's classified slot
 # pv:        the parameter vreg, rebound to a storage pointer for an aggregate
 # size:      the parameter's byte size (the spill-slot size for an aggregate)
-# stack_off: the running incoming-argument offset for a STACK slot
+# stack_off: the slot's incoming stack base (a STACK slot, or a split's stack chunk)
 # is_aggr:   whether the parameter is an aggregate flowing by address
 # ret:       ok(true) on success, or a loud error
 fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, pv: u32, size: u64,
@@ -1088,22 +1279,6 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSl
     # frame-pointer register is named through the ISA vtable and the base offset
     # through `tgt.model`, never bare literals.
     val arg_base: i64 = ctx.tgt.model.incoming_arg_base;
-    if (slot.class == abi.CLASS_HFA) {
-        # spill each incoming V member into a slot keyed on `pv` so `pv` is the
-        # aggregate's storage pointer for downstream uses (the FP twin of the
-        # register-aggregate spill).
-        val sr: R.Result[bool, str] = context.add_spill_slot(ctx, pv, size);
-        if (R.is_err[bool, str](sr)) { ret sr; }
-        var i: u32 = 0;
-        for (i < slot.reg_count::u32) {
-            val off: i64 = (i * slot.reg_width::u32)::i64;
-            val st: R.Result[bool, str] = context.emit_store_to_w(ctx, mb,
-                mir.op_mem_slot(pv, off), mir.op_preg(hfa_member_reg(slot.reg, i)::u32), slot.reg_width);
-            if (R.is_err[bool, str](st)) { ret st; }
-            i = i + 1;
-        }
-        ret R.ok[bool, str](true);
-    }
     if (slot.class == abi.CLASS_STACK_BYREF) {
         # win64 by-reference overflow: the caller stored the hidden aggregate
         # pointer into this stack slot; load it so `pv` is the aggregate's address,
@@ -1125,23 +1300,21 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSl
     if (slot.class == abi.CLASS_BYREF) {
         ret context.emit_mov(ctx, mb, mir.op_vreg(pv), mir.op_preg(slot.reg::u32));
     }
-    if (slot.reg2 >= 0) {
-        # two-register aggregate: materialize a spill slot keyed on the parameter
-        # vreg and store both halves into it. the slot base is the slot key, so the
-        # encoder resolves it to `[rbp + offset]` and the param vreg names the
-        # slot's storage for downstream uses.
-        val sr: R.Result[bool, str] = context.add_spill_slot(ctx, pv, size);
-        if (R.is_err[bool, str](sr)) { ret sr; }
-        val lo: R.Result[bool, str] = context.emit_store_to(ctx, mb, mir.op_mem_slot(pv, 0), mir.op_preg(slot.reg::u32));
-        if (R.is_err[bool, str](lo)) { ret lo; }
-        ret context.emit_store_to(ctx, mb, mir.op_mem_slot(pv, 8), mir.op_preg(slot.reg2::u32));
-    }
     if (is_aggr) {
-        # <=8 byte single-register aggregate: spill the register into a slot keyed on
-        # the parameter vreg so `pv` is a storage pointer like the two-register form.
+        # register / register-plus-stack aggregate: materialize a spill slot keyed on
+        # the parameter vreg and reconstruct the aggregate into it chunk by chunk, so
+        # the encoder resolves `[pv + off]` to `[rbp + slot_off]` and the param vreg
+        # names the storage for downstream uses.
         val sr: R.Result[bool, str] = context.add_spill_slot(ctx, pv, size);
         if (R.is_err[bool, str](sr)) { ret sr; }
-        ret context.emit_store_to(ctx, mb, mir.op_mem_slot(pv, 0), mir.op_preg(slot.reg::u32));
+        var plan: PiecePlan;
+        plan.store      = true;
+        plan.mem_base   = pv;
+        plan.mem_slot   = true;
+        plan.stack_base = ctx.tgt.arch.frame_ptr_reg::u32;
+        plan.stack_off  = arg_base + stack_off;
+        plan.stack_ok   = true;
+        ret materialize_pieces(ctx, mb, slot, plan);
     }
     ret context.emit_mov(ctx, mb, mir.op_vreg(pv), mir.op_preg(slot.reg::u32));
 }
@@ -1197,49 +1370,39 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
         if (R.is_err[bool, str](cr)) { ret cr; }
         val mr: R.Result[bool, str] = context.emit_mov(ctx, mb, mir.op_preg(slot.reg::u32), mir.op_vreg(ctx.sret_vreg));
         if (R.is_err[bool, str](mr)) { ret mr; }
-    } or (slot.class == abi.CLASS_HFA) {
-        # HFA return: the aggregate flows by address; load each member from its
-        # storage into the consecutive V return register (V0..V(reg_count-1)).
+    } or (rag) {
+        # aggregate return by address: load each register chunk from the aggregate's
+        # storage (a value-pointer base, a global's symbol address materialized first)
+        # into its return register -- an HFA / mixed run's members, a 9-16 byte pair's
+        # halves, or a <=8 byte single word -- rather than returning the pointer,
+        # which would hand back the address of a dead local. A return never carries a
+        # stack chunk (a too-large aggregate returns via the sret pointer above).
         var base: u32 = mir.MIR_VREG_NIL;
         val ar: R.Result[bool, str] = context.addr_to_vreg(ctx, mb, rvop, ?base);
         if (R.is_err[bool, str](ar)) { ret ar; }
-        var i: u32 = 0;
-        for (i < slot.reg_count::u32) {
-            val off: i64 = (i * slot.reg_width::u32)::i64;
-            val mr: R.Result[bool, str] = context.emit_fmov(ctx, mb,
-                mir.op_preg(hfa_member_reg(slot.reg, i)::u32), mir.op_mem_value(base, off), slot.reg_width);
-            if (R.is_err[bool, str](mr)) { ret mr; }
-            i = i + 1;
-        }
-    } or (slot.reg2 >= 0 && rag) {
-        # 9-16 byte aggregate: load each half from the aggregate's storage (a
-        # value-pointer base), materializing a global's symbol address first.
-        var base: u32 = mir.MIR_VREG_NIL;
-        val ar: R.Result[bool, str] = context.addr_to_vreg(ctx, mb, rvop, ?base);
-        if (R.is_err[bool, str](ar)) { ret ar; }
-        val lo: R.Result[bool, str] = context.emit_mov(ctx, mb, mir.op_preg(slot.reg::u32), mir.op_mem_value(base, 0));
-        if (R.is_err[bool, str](lo)) { ret lo; }
-        val hi: R.Result[bool, str] = context.emit_mov(ctx, mb, mir.op_preg(slot.reg2::u32), mir.op_mem_value(base, 8));
-        if (R.is_err[bool, str](hi)) { ret hi; }
-    } or (slot.reg >= 0 && rag) {
-        # <=8 byte aggregate: the single eightbyte returns in one register, but the
-        # value flows by address (rvop is a value-pointer base), so load the
-        # eightbyte from the aggregate's storage rather than returning the pointer -
-        # otherwise the callee returns the address of a dead local.
-        var base: u32 = mir.MIR_VREG_NIL;
-        val ar: R.Result[bool, str] = context.addr_to_vreg(ctx, mb, rvop, ?base);
-        if (R.is_err[bool, str](ar)) { ret ar; }
-        val mr: R.Result[bool, str] = context.emit_mov(ctx, mb, mir.op_preg(slot.reg::u32), mir.op_mem_value(base, 0));
+        var plan: PiecePlan;
+        plan.store      = false;
+        plan.mem_base   = base;
+        plan.mem_slot   = false;
+        plan.stack_base = 0;
+        plan.stack_off  = 0;
+        plan.stack_ok   = false;
+        val mr: R.Result[bool, str] = materialize_pieces(ctx, mb, slot, plan);
         if (R.is_err[bool, str](mr)) { ret mr; }
     } or (slot.class == abi.CLASS_FP) {
         # scalar float return: a float copy into XMM0. the XMM0 return preg carries
         # the SSE class, so the encoder dispatches the move on operand class and emits
         # MOVSS / MOVSD (or MOVABS + MOVQ for a float-constant immediate) rather than a
         # general-purpose MOV of RAX, which aliases XMM0's index.
-        val mr: R.Result[bool, str] = context.emit_fmov(ctx, mb, mir.op_preg(slot.reg::u32), rvop, fp_move_width(rsz));
+        val fw: R.Result[u8, str] = fp_move_width(rsz);
+        if (R.is_err[u8, str](fw)) { ret R.err[bool, str](R.unwrap_err[u8, str](fw)); }
+        val mr: R.Result[bool, str] = context.emit_fmov(ctx, mb, mir.op_preg(slot.reg::u32), rvop, R.unwrap_ok[u8, str](fw));
         if (R.is_err[bool, str](mr)) { ret mr; }
     } or (slot.reg >= 0) {
-        val mr: R.Result[bool, str] = context.emit_mov(ctx, mb, mir.op_preg(slot.reg::u32), rvop);
+        # scalar GP return: a 32-bit value rides a width-4 move so the backend
+        # re-extends it to the register width by its own convention (RV64 lp64
+        # sign-extends a 32-bit register).
+        val mr: R.Result[bool, str] = context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), rvop, scalar_reg_move_width(ctx, rsz));
         if (R.is_err[bool, str](mr)) { ret mr; }
     }
 

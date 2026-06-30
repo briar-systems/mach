@@ -75,6 +75,7 @@ and nothing is linked.
 | `-O1`          | —              | select the release pipeline |
 | `-O2`          | —              | select the release pipeline |
 | `--emit <kind>`| `obj`\|`exe`   | `obj` stops at the relocatable objects; `exe` (default) links a binary |
+| `--pie`        | —              | emit a position-independent (ET_DYN) executable for ASLR instead of the default fixed-address one; opt-in (see below) |
 | `-L <dir>`     | dir            | add a search directory for `-l`-resolved inputs; repeatable |
 | `-l <name>`    | name           | link a named object, archive, or shared library, resolved through the `-L` dirs (see below); repeatable |
 | *(positional)* | input path     | a bare argument that contains `/`, ends in `.o` / `.a`, or names a `.so` is linked verbatim |
@@ -83,6 +84,13 @@ Plus the global flags above. The `-O<n>` flags override `--release` when both
 are present; absent any optimisation flag the build uses the debug pipeline
 (the bootstrap-stable default). `-O1` and `-O2` currently select the same
 release pipeline.
+
+`--pie` is an opt-in: without it, a linux executable links fixed-address
+(`ET_EXEC`) exactly as before — a normal build is byte-identical. With it, the
+linker emits a position-independent `ET_DYN` image the kernel loads at a
+randomized base (ASLR), self-relocated by the runtime before `main` (no `ld.so`).
+It applies to a static executable; combining `--pie` with a dynamic `-l<lib>`
+dependency is rejected.
 
 ### External link inputs
 

@@ -54,6 +54,7 @@ val ELFOSABI_NONE: u8 = 0;
 # ELF object file types.
 val ET_REL:  u16 = 1;
 val ET_EXEC: u16 = 2;
+val ET_DYN:  u16 = 3;
 
 # ELF section header types.
 val SHT_PROGBITS: u32 = 1;
@@ -150,6 +151,13 @@ val PF_R: u32 = 4;
 # ELF PLT/GOT dynamic relocation types.
 val R_X86_64_JUMP_SLOT:  u32 = 7;
 val R_AARCH64_JUMP_SLOT: u32 = 1026;
+val R_RISCV_JUMP_SLOT:   u32 = 5;
+
+# ELF base (load-bias) relocation types: the loader adds the image's load bias to
+# the slot. one per in-image absolute pointer in a PIE image's `.rela.dyn`.
+val R_X86_64_RELATIVE:  u32 = 8;
+val R_AARCH64_RELATIVE: u32 = 1027;
+val R_RISCV_RELATIVE:   u32 = 3;
 
 # ELF `.dynamic` tag ids consumed by the loader. only the tags a minimal
 # dynamically-linked PLT image needs are listed.
@@ -162,12 +170,23 @@ val DT_STRTAB:   u64 = 5;
 val DT_SYMTAB:   u64 = 6;
 val DT_STRSZ:    u64 = 10;
 val DT_SYMENT:   u64 = 11;
+val DT_RELA:     u64 = 7;
+val DT_RELASZ:   u64 = 8;
+val DT_RELAENT:  u64 = 9;
 val DT_PLTREL:   u64 = 20;
 val DT_JMPREL:   u64 = 23;
+val DT_BIND_NOW: u64 = 24;
+val DT_FLAGS:    u64 = 30;
+val DT_RELACOUNT: u64 = 0x6FFFFFF9;
 
 # DT_PLTREL value declaring the PLT relocations use the RELA (addend-bearing)
 # form - the only form this writer emits.
 val DT_RELA_TAG: u64 = 7;
+
+# DT_FLAGS bit requesting eager binding: the loader resolves every relocation
+# (including every PLT JUMP_SLOT) at load time. set, alongside DT_BIND_NOW, on the
+# aarch64/riscv64 images so their PLT needs no lazy-resolution trampoline.
+val DF_BIND_NOW: u64 = 0x8;
 
 # fixed on-disk sizes of the dynamic-link structures (ELF64).
 val DYN_SIZE:       usize = 16;
@@ -1395,16 +1414,322 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
     ret R.ok[bool, str](true);
 }
 
+# write a position-independent (PIE / ET_DYN) static executable for linux ASLR
+#
+# A static-PIE: an ET_DYN image the kernel loads at a randomized base, self-relocated
+# by the program's own startup (mach-std's relocation pass) before main - there is no
+# PT_INTERP and no run-time loader. The only relocations are the in-image absolute
+# pointers the linker collected as the format-neutral `BaseReloc` set; each becomes an
+# `R_*_RELATIVE` entry in a synthesized `.rela.dyn`, and a minimal `.dynamic`
+# (DT_RELA/DT_RELASZ/DT_RELAENT/DT_RELACOUNT) plus a PT_DYNAMIC let the startup find
+# them. The linker laid the segments out PIE-relative (a one-page header gap above the
+# base), so the writer extends the first segment down to cover the ELF header and the
+# program headers, exactly as the dynamic writer does, and a PT_PHDR lets the startup
+# recover the load bias from the kernel's AT_PHDR.
+#
+# Segment vaddrs and the entry are link-time addresses; the kernel adds a load bias and
+# the startup slides every RELATIVE slot by it. An image with zero base relocations is
+# still valid (an empty .rela.dyn).
+# ---
+# alloc:     allocator for the output buffer and the segment-offset scratch
+# itn:       interner backing any I/O error message
+# tgt_isa:   the instruction-set vtable selecting the ELF machine + RELATIVE type
+# segs:      the linker's loadable segments, ascending virtual-address order
+# seg_count: number of segments
+# entry:     program entry-point virtual address (link-time)
+# dyn:       the dynamic-link plan carrying the base-relocation set
+# path:      null-terminated output file path
+# ret:       ok(true) on success, or an error string
+fun emit_pie_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTable,
+                  segs: *of.LoadSegment, seg_count: u32, entry: u64,
+                  dyn: *of.DynamicInfo, path: *u8) R.Result[bool, str] {
+    val nrel: u32 = dyn.base_reloc_count;
+
+    # the highest virtual address the linker's segments reach; the synthesized
+    # .rela.dyn/.dynamic are placed page-aligned above it.
+    var hi_va: u64 = 0;
+    var li: u32 = 0;
+    for (li < seg_count) {
+        val end: u64 = segs[li].vaddr + segs[li].memsz::u64;
+        if (end > hi_va) { hi_va = end; }
+        li = li + 1;
+    }
+
+    # program headers: PT_PHDR + one PT_LOAD per linker segment + the synthesized RO
+    # PT_LOAD (.rela.dyn/.dynamic) + PT_DYNAMIC. the first linker segment also maps the
+    # ELF header + phdrs (extended down a page), so no separate header PT_LOAD.
+    val phdr_count: u32 = seg_count + 3;
+    val phdr_offset: usize = ELF_HEADER_SIZE;
+    val phdr_table_size: usize = phdr_count::usize * PHDR_SIZE;
+
+    # per-segment file offsets, page-aligned so `offset % page == vaddr % page` holds.
+    var struct_file: usize = bin.align_up(phdr_offset + phdr_table_size, EXEC_PAGE_SIZE::usize);
+    var seg_offsets: *usize = nil;
+    if (seg_count > 0) {
+        val ro: R.Result[*usize, str] = A.zallocate[usize](alloc, seg_count::usize);
+        if (R.is_err[*usize, str](ro)) { ret R.err[bool, str]("elf: pie seg-offset alloc failed"); }
+        seg_offsets = R.unwrap_ok[*usize, str](ro);
+        li = 0;
+        for (li < seg_count) {
+            struct_file = bin.align_up(struct_file, EXEC_PAGE_SIZE::usize);
+            seg_offsets[li] = struct_file;
+            struct_file = struct_file + segs[li].filesz;
+            li = li + 1;
+        }
+    }
+
+    # the synthesized read-only segment: .rela.dyn (Elf64_Rela[nrel]) then .dynamic,
+    # page-aligned above the linker segments. file offset and vaddr advance in lockstep.
+    val ro_off: usize = bin.align_up(struct_file, EXEC_PAGE_SIZE::usize);
+    val ro_va:  u64   = bin.align_up_u64(hi_va, EXEC_PAGE_SIZE);
+    val reladyn_off:  usize = ro_off;
+    val reladyn_va:   u64   = ro_va;
+    val reladyn_size: usize = nrel::usize * RELA_SIZE;
+
+    val dyn_off: usize = bin.align_up(reladyn_off + reladyn_size, 8);
+    val dyn_va:  u64   = bin.align_up_u64(reladyn_va + reladyn_size::u64, 8);
+    # .dynamic: DT_RELA/RELASZ/RELAENT/RELACOUNT (when there are relocations) + DT_NULL.
+    var dyn_entries: u32 = 1;
+    if (nrel > 0) { dyn_entries = dyn_entries + 4; }
+    val dyn_size: usize = dyn_entries::usize * DYN_SIZE;
+
+    val total_size: usize = dyn_off + dyn_size;
+    val ro_size: usize = total_size - ro_off;
+
+    val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_size);
+    if (R.is_err[*u8, str](res_buf)) {
+        if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+        ret R.err[bool, str]("elf: pie buffer alloc failed");
+    }
+    var buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
+
+    # ELF header: ET_DYN, e_shoff = 0 (a runtime image, not a tooling object).
+    buf[0] = 0x7F; buf[1] = 0x45; buf[2] = 0x4C; buf[3] = 0x46;
+    buf[4] = elf_class_for(tgt_isa); buf[5] = ELFDATA2LSB; buf[6] = EV_CURRENT; buf[7] = ELFOSABI_NONE;
+    bin.write_u16_le(buf, 16, ET_DYN);
+    bin.write_u16_le(buf, 18, tgt_isa.elf_machine::u16);
+    bin.write_u32_le(buf, 20, 1);
+    bin.write_u64_le(buf, 24, entry);
+    bin.write_u64_le(buf, 32, phdr_offset::u64);
+    bin.write_u64_le(buf, 40, 0);
+    bin.write_u32_le(buf, 48, 0);
+    bin.write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
+    bin.write_u16_le(buf, 54, PHDR_SIZE::u16);
+    bin.write_u16_le(buf, 56, phdr_count::u16);
+    bin.write_u16_le(buf, 58, SHDR_SIZE::u16);
+    bin.write_u16_le(buf, 60, 0);
+    bin.write_u16_le(buf, 62, 0);
+
+    # copy the linker's segment bytes into their file offsets.
+    li = 0;
+    for (li < seg_count) {
+        if (segs[li].bytes != nil && segs[li].filesz > 0) {
+            memory.raw_copy((buf::usize + seg_offsets[li])::ptr, segs[li].bytes::ptr, segs[li].filesz);
+        }
+        li = li + 1;
+    }
+
+    # .rela.dyn: one R_*_RELATIVE per in-image absolute pointer. r_offset is the
+    # pointer's link-time vaddr, r_addend the link-time absolute value stored there; the
+    # startup writes load_bias + addend, sliding the slot to its run-time target.
+    val rel_type: u32 = relative_type_for(tgt_isa.id);
+    var ri: u32 = 0;
+    for (ri < nrel) {
+        val br: *of.BaseReloc = ?dyn.base_relocs[ri];
+        var loc_va: u64 = 0;
+        if (br.seg_index < seg_count) { loc_va = segs[br.seg_index].vaddr + br.seg_offset::u64; }
+        val rela_off: usize = reladyn_off + ri::usize * RELA_SIZE;
+        bin.write_u64_le(buf, rela_off, loc_va);
+        bin.write_u64_le(buf, rela_off + 8, rel_type::u64);
+        bin.write_u64_le(buf, rela_off + 16, br.target);
+        ri = ri + 1;
+    }
+
+    # .dynamic: only what the self-relocation startup reads.
+    var dpos: usize = dyn_off;
+    if (nrel > 0) {
+        dpos = write_dyn_entry(buf, dpos, DT_RELA,      reladyn_va);
+        dpos = write_dyn_entry(buf, dpos, DT_RELASZ,    reladyn_size::u64);
+        dpos = write_dyn_entry(buf, dpos, DT_RELAENT,   RELA_SIZE::u64);
+        dpos = write_dyn_entry(buf, dpos, DT_RELACOUNT, nrel::u64);
+    }
+    dpos = write_dyn_entry(buf, dpos, DT_NULL, 0);
+
+    write_pie_phdrs(buf, phdr_offset, phdr_count, segs, seg_offsets, seg_count,
+                    ro_off, ro_va, ro_size, dyn_off, dyn_va, dyn_size, dyn);
+
+    if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+
+    val res_file: R.Result[filesystem.File, str] = filesystem.create(path, 0o755);
+    if (R.is_err[filesystem.File, str](res_file)) {
+        val cm: str = bin.io_message(itn, alloc, "elf: cannot create PIE executable", path::str, R.unwrap_err[filesystem.File, str](res_file), "elf: could not create PIE executable file");
+        A.deallocate[u8](alloc, buf, total_size);
+        ret R.err[bool, str](cm);
+    }
+    var f: filesystem.File = R.unwrap_ok[filesystem.File, str](res_file);
+    val res_write: R.Result[usize, str] = filesystem.write(?f, buf, total_size);
+    filesystem.close(?f);
+    A.deallocate[u8](alloc, buf, total_size);
+
+    if (R.is_err[usize, str](res_write)) { ret R.err[bool, str](bin.io_message(itn, alloc, "elf: pie write failed on", path::str, R.unwrap_err[usize, str](res_write), "elf: pie write failed")); }
+    ret R.ok[bool, str](true);
+}
+
+# write the program-header table for a static-PIE executable
+#
+# PT_PHDR locates the table (so the kernel passes AT_PHDR and the startup recovers the
+# load bias); each linker segment is a PT_LOAD, the first extended down one page to file
+# offset 0 so a single PT_LOAD covers the ELF header + program headers with no
+# overlapping page; the synthesized .rela.dyn/.dynamic share a read-only PT_LOAD; and
+# PT_DYNAMIC points the startup at the .dynamic table.
+# ---
+# buf:          the output buffer
+# phdr_offset:  byte offset of the program-header table in `buf`
+# phdr_count:   number of program headers
+# segs:         the linker's loadable segments
+# seg_offsets:  per-segment file offsets of the linker's segments
+# seg_count:    number of segments
+# ro_off/ro_va/ro_size:    the synthesized read-only segment (.rela.dyn + .dynamic)
+# dyn_off/dyn_va/dyn_size:  the .dynamic table
+# dyn:          the dynamic-link plan, for the per-segment writable check
+fun write_pie_phdrs(buf: *u8, phdr_offset: usize, phdr_count: u32,
+                    segs: *of.LoadSegment, seg_offsets: *usize, seg_count: u32,
+                    ro_off: usize, ro_va: u64, ro_size: usize,
+                    dyn_off: usize, dyn_va: u64, dyn_size: usize, dyn: *of.DynamicInfo) {
+    var pos: usize = phdr_offset;
+    val phdr_bytes: usize = phdr_count::usize * PHDR_SIZE;
+
+    # the page the ELF header + phdrs map at: one page below the first segment's base,
+    # so extending the first segment down to file offset 0 covers them.
+    var hdr_vaddr: u64 = 0;
+    if (seg_count > 0) { hdr_vaddr = (segs[0].vaddr & ~(EXEC_PAGE_SIZE - 1)) - EXEC_PAGE_SIZE; }
+
+    # PT_PHDR -> the program-header table (within the first, header-covering PT_LOAD).
+    pos = write_phdr(buf, pos, PT_PHDR, PF_R, phdr_offset, hdr_vaddr + phdr_offset::u64,
+                     phdr_bytes, phdr_bytes, 8);
+
+    var li: u32 = 0;
+    for (li < seg_count) {
+        if (li == 0) {
+            val first_filesz: usize = seg_offsets[0] + segs[0].filesz;
+            val first_memsz:  usize = seg_offsets[0] + segs[0].memsz;
+            pos = write_phdr(buf, pos, PT_LOAD, pie_seg_flags(segs, li, seg_count, dyn), 0,
+                             hdr_vaddr, first_filesz, first_memsz, EXEC_PAGE_SIZE);
+        }
+        or {
+            pos = write_phdr(buf, pos, PT_LOAD, pie_seg_flags(segs, li, seg_count, dyn), seg_offsets[li],
+                             segs[li].vaddr, segs[li].filesz, segs[li].memsz, EXEC_PAGE_SIZE);
+        }
+        li = li + 1;
+    }
+
+    # the synthesized .rela.dyn/.dynamic read-only segment.
+    pos = write_phdr(buf, pos, PT_LOAD, PF_R, ro_off, ro_va, ro_size, ro_size, EXEC_PAGE_SIZE);
+    # PT_DYNAMIC -> the .dynamic table.
+    pos = write_phdr(buf, pos, PT_DYNAMIC, PF_R, dyn_off, dyn_va, dyn_size, dyn_size, 8);
+}
+
+# the program-header permission flags for PIE load segment `li`
+#
+# A static-PIE has no run-time loader to set up RELRO, so any segment holding an
+# in-image absolute pointer (a `.rela.dyn` RELATIVE target) must be writable when the
+# self-relocation startup slides it - including an otherwise read-only data segment.
+# This trades the read-only hardening of relocated constants for a working static-PIE;
+# a proper PT_GNU_RELRO (mapped writable, relocated, then re-protected) is a later
+# refinement.
+# ---
+# segs:      the linker's loadable segments
+# li:        the segment index
+# seg_count: number of segments (bounds the reloc scan's segment ids)
+# dyn:       the dynamic-link plan whose base relocations are scanned
+# ret:       the PF_* flags, with PF_W forced when the segment bears a base relocation
+fun pie_seg_flags(segs: *of.LoadSegment, li: u32, seg_count: u32, dyn: *of.DynamicInfo) u32 {
+    var f: u32 = pf_flags_for(segs[li].flags);
+    var i: u32 = 0;
+    for (i < dyn.base_reloc_count) {
+        if (dyn.base_relocs[i].seg_index == li && dyn.base_relocs[i].seg_index < seg_count) {
+            ret f | PF_W;
+        }
+        i = i + 1;
+    }
+    ret f;
+}
+
 # the ELF machine JUMP_SLOT (PLT) relocation type for an ISA
 #
-# Defaults to the x86-64 type for unknown ISAs (the dynamic writer is x86-64-only
-# for now).
+# Defaults to the x86-64 type for an unrecognized ISA.
 # ---
 # arch_id: the target ISA id
 # ret:     the ELF R_*_JUMP_SLOT relocation type
 fun jump_slot_for(arch_id: u32) u32 {
     if (arch_id == isa.ARCH_AARCH64) { ret R_AARCH64_JUMP_SLOT; }
+    if (arch_id == isa.ARCH_RISCV64) { ret R_RISCV_JUMP_SLOT; }
     ret R_X86_64_JUMP_SLOT;
+}
+
+# the ELF machine RELATIVE (load-bias) relocation type for an ISA
+#
+# Defaults to the x86-64 type for an unrecognized ISA.
+# ---
+# arch_id: the target ISA id
+# ret:     the ELF R_*_RELATIVE relocation type
+fun relative_type_for(arch_id: u32) u32 {
+    if (arch_id == isa.ARCH_AARCH64) { ret R_AARCH64_RELATIVE; }
+    if (arch_id == isa.ARCH_RISCV64) { ret R_RISCV_RELATIVE; }
+    ret R_X86_64_RELATIVE;
+}
+
+# whether `emit_dyn_exec` can frame a dynamic image for an ISA
+#
+# x86_64 uses the lazy PLT path (a PLT[0] resolver trampoline); aarch64 and
+# riscv64 use the eager (BIND_NOW) path - the loader resolves every JUMP_SLOT at
+# load, so their PLT stubs jump straight through the GOT with no PLT[0]. mach's
+# targets have no in-tree dynamic loader, so a lazy resolver trampoline for the
+# latter two could not be execution-verified; eager binding keeps every emitted
+# byte derivable from the psABI/ARM-ARM and independently testable. lazy binding
+# for them can be added later if a way to execute-verify the loader-coupled PLT[0]
+# appears. any other ISA is rejected.
+# ---
+# arch_id: the target ISA id
+# ret:     true when the dynamic writer supports the ISA
+fun dyn_arch_supported(arch_id: u32) bool {
+    ret arch_id == isa.ARCH_X86_64 || arch_id == isa.ARCH_AARCH64 || arch_id == isa.ARCH_RISCV64;
+}
+
+# whether an ISA's dynamic image binds eagerly (BIND_NOW)
+#
+# Only x86_64 keeps the lazy PLT[0] resolver trampoline; every other supported arch
+# binds eagerly, which selects the DT_FLAGS/DT_BIND_NOW emission, the absence of a
+# PLT[0], and a zero (loader-filled) GOT slot per import.
+# ---
+# arch_id: the target ISA id
+# ret:     true when the image binds eagerly
+fun dyn_bind_now(arch_id: u32) bool {
+    ret arch_id != isa.ARCH_X86_64;
+}
+
+# the byte size of PLT[0], the lazy-resolution trampoline
+#
+# Only the x86_64 lazy path emits a PLT[0]; the eager arches have none, so their
+# per-import stubs begin at the PLT base.
+# ---
+# arch_id: the target ISA id
+# ret:     the PLT[0] byte size (0 for the eager arches)
+fun plt_header_size(arch_id: u32) usize {
+    if (arch_id == isa.ARCH_X86_64) { ret PLT_ENTRY_SIZE; }
+    ret 0;
+}
+
+# the virtual address of the per-import PLT stub for function-import ordinal `n`
+#
+# The stubs follow PLT[0] (absent on the eager arches), each `PLT_ENTRY_SIZE` wide.
+# ---
+# lay:     the resolved dynamic-structure layout (.plt base address)
+# n:       the function-import ordinal (0-based)
+# arch_id: the target ISA id selecting whether a PLT[0] precedes the stubs
+# ret:     the stub's virtual address
+fun plt_stub_va(lay: *DynLayout, n: u32, arch_id: u32) u64 {
+    ret lay.plt_va + plt_header_size(arch_id)::u64 + n::u64 * PLT_ENTRY_SIZE::u64;
 }
 
 # the resolved layout of every synthesized dynamic-link structure, computed once
@@ -1420,7 +1745,8 @@ fun jump_slot_for(arch_id: u32) u32 {
 # dynstr_off/dynstr_va/size:  .dynstr (NUL + names + sonames)
 # hash_off/hash_va:           .hash (SysV: nbucket,nchain,buckets,chain)
 # relaplt_off/relaplt_va/sz:  .rela.plt (Elf64_Rela[func_import_count])
-# plt_off/plt_va/plt_size:    .plt (R+X), header + one stub per func import
+# plt_off/plt_va/plt_size:    .plt (R+X); x86_64 PLT[0] + one stub each, eager arches
+#                             one stub each (no PLT[0])
 # rw_off/rw_va/rw_size:       writable segment span (.got.plt + .dynamic)
 # gotplt_off/gotplt_va:       .got.plt (GOT[0..2] reserved + one per func import)
 # dynamic_off/dynamic_va/sz:  .dynamic (Elf64_Dyn array)
@@ -1480,6 +1806,13 @@ fun dynstr_name_len(itn: *intern.Interner, id: intern.StrId) usize {
 # (a fixed-address dynamic executable, not a PIE) so the linker's absolute virtual
 # addresses stay valid; the static `emit_exec` path is untouched.
 #
+# Binding mode is per-arch: x86_64 keeps a lazy PLT[0] resolver trampoline, while
+# aarch64 and riscv64 bind eagerly (DT_FLAGS=DF_BIND_NOW + DT_BIND_NOW), so their
+# stubs jump straight through the loader-filled GOT with no PLT[0]. mach's targets
+# have no in-tree dynamic loader, so eager binding keeps every emitted byte
+# derivable from the psABI/ARM-ARM and independently testable rather than depending
+# on an unexecutable lazy-resolver convention.
+#
 # `funcs`/`func_count` are accepted for `of.DynExecFn` conformance; this writer
 # emits no unwind table and does not consume them.
 # ---
@@ -1506,12 +1839,25 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
     if (dyn == nil)     { ret R.err[bool, str]("elf: nil dynamic plan"); }
     if (itn == nil)     { ret R.err[bool, str]("elf: no interner for dyn-exec"); }
 
-    # the PLT/GOT stubs below are raw x86-64 instruction bytes, so this writer is
-    # x86-64-only; another ISA needs its own per-arch PLT writer. reject it loudly
-    # rather than emit invalid code (e.g. a JUMP_SLOT type is mapped for aarch64
-    # but the stub encoding is not).
-    if (tgt_isa.id != isa.ARCH_X86_64) {
-        ret R.err[bool, str]("elf: dynamic linking is only implemented for x86-64");
+    # the per-arch PLT/GOT writers below cover x86_64 (lazy), aarch64, and riscv64
+    # (eager). an unsupported ISA is rejected loudly rather than emitting a PLT with
+    # no stub encoding for it.
+    if (!dyn_arch_supported(tgt_isa.id)) {
+        ret R.err[bool, str]("elf: dynamic linking is not implemented for this architecture");
+    }
+
+    # a position-independent image (--pie, linux ASLR) takes the static-PIE path: an
+    # ET_DYN executable self-relocated by its own runtime startup, with no PT_INTERP,
+    # no dynamic symbol table, and no PLT. it carries only the in-image absolute
+    # pointers as `.rela.dyn` RELATIVE entries. dynamic imports alongside PIE (a
+    # ld.so-loaded dynamic-PIE) are not yet supported - a no-libc linux executable
+    # never has them, and mixing the self-relocating path with a run-time loader needs
+    # its own design.
+    if (dyn.pie) {
+        if (dyn.import_count > 0 || dyn.lib_count > 0) {
+            ret R.err[bool, str]("elf: PIE with dynamic imports is not supported (static-PIE only)");
+        }
+        ret emit_pie_exec(alloc, itn, tgt_isa, segs, seg_count, entry, dyn, path);
     }
 
     val nimp: u32 = func_import_count(dyn);
@@ -1554,7 +1900,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
     }
 
     var lay: DynLayout;
-    compute_dyn_layout(itn, ?lay, dyn, nimp, bin.align_up(struct_file, EXEC_PAGE_SIZE::usize),
+    compute_dyn_layout(itn, ?lay, dyn, nimp, tgt_isa.id, bin.align_up(struct_file, EXEC_PAGE_SIZE::usize),
                        bin.align_up_u64(hi_va, EXEC_PAGE_SIZE));
 
     val total_size: usize = lay.rw_off + lay.rw_size;
@@ -1624,7 +1970,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
     # write the synthesized structures, then patch the import call sites.
     write_dyn_structures(itn, buf, ?lay, dyn, nimp, tgt_isa.id, imp_str, lib_str);
     val fx_r: R.Result[bool, str] =
-        patch_plt_fixups(buf, ?lay, dyn, fixups, fixup_count, seg_offsets, segs, seg_count, nimp);
+        patch_plt_fixups(buf, ?lay, dyn, fixups, fixup_count, seg_offsets, segs, seg_count, nimp, tgt_isa.id);
 
     if (imp_str != nil) { A.deallocate[usize](alloc, imp_str, dyn.import_count::usize); }
     if (lib_str != nil) { A.deallocate[usize](alloc, lib_str, dyn.lib_count::usize); }
@@ -1668,10 +2014,11 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
 # lay:         layout record to populate
 # dyn:         the dynamic-link plan being laid out
 # nimp:        number of function imports (PLT/GOT/.rela.plt entry count)
+# arch_id:     the target ISA id selecting the PLT[0] size and BIND_NOW entries
 # struct_file: file offset the synthesized structures start at
 # struct_va:   virtual address the synthesized structures start at
 fun compute_dyn_layout(itn: *intern.Interner, lay: *DynLayout, dyn: *of.DynamicInfo, nimp: u32,
-                       struct_file: usize, struct_va: u64) {
+                       arch_id: u32, struct_file: usize, struct_va: u64) {
     val page_sz: usize = EXEC_PAGE_SIZE::usize;
 
     # read-only metadata segment.
@@ -1735,13 +2082,13 @@ fun compute_dyn_layout(itn: *intern.Interner, lay: *DynLayout, dyn: *of.DynamicI
 
     lay.ro_size = off - lay.ro_off;
 
-    # .plt: read+execute, its own page-aligned segment. header stub + one per
-    # import. empty (size 0) when there are no function imports.
+    # .plt: read+execute, its own page-aligned segment. PLT[0] (x86_64 lazy only)
+    # plus one stub per import. empty (size 0) when there are no function imports.
     off = bin.align_up(off, page_sz);
     va  = bin.align_up_u64(va, page_sz::u64);
     lay.plt_off = off;
     lay.plt_va  = va;
-    if (nimp > 0) { lay.plt_size = PLT_ENTRY_SIZE * (nimp + 1)::usize; } or { lay.plt_size = 0; }
+    if (nimp > 0) { lay.plt_size = plt_header_size(arch_id) + PLT_ENTRY_SIZE * nimp::usize; } or { lay.plt_size = 0; }
     off = off + lay.plt_size;
     va  = va  + lay.plt_size::u64;
 
@@ -1762,9 +2109,10 @@ fun compute_dyn_layout(itn: *intern.Interner, lay: *DynLayout, dyn: *of.DynamicI
     lay.dynamic_off = off;
     lay.dynamic_va  = va;
     # DT_NEEDED per lib + HASH,STRTAB,SYMTAB,STRSZ,SYMENT + (PLT tags when imports)
-    # + DT_NULL.
+    # + (FLAGS,BIND_NOW on the eager arches) + DT_NULL.
     var dyn_entries: u32 = dyn.lib_count + 6;
-    if (nimp > 0) { dyn_entries = dyn_entries + 4; }
+    if (nimp > 0)              { dyn_entries = dyn_entries + 4; }
+    if (dyn_bind_now(arch_id)) { dyn_entries = dyn_entries + 2; }
     lay.dynamic_size = dyn_entries::usize * DYN_SIZE;
     off = off + lay.dynamic_size;
     va  = va  + lay.dynamic_size::u64;
@@ -1849,28 +2197,33 @@ fun write_dyn_structures(itn: *intern.Interner, buf: *u8, lay: *DynLayout, dyn: 
         c = c + 1;
     }
 
-    # GOT.PLT: GOT[0] = &.dynamic, GOT[1]/GOT[2] = 0 (filled by the loader with
-    # the link_map and the lazy-resolver). GOT[3+n] points at the push in PLT[n]
-    # so the first call triggers lazy resolution.
+    # GOT.PLT: GOT[0] = &.dynamic, GOT[1]/GOT[2] = 0 (the lazy link_map / resolver
+    # slots, used only by the x86_64 lazy path and left zero otherwise). Each
+    # GOT[3+n] is the import's binding slot: on x86_64 it is pre-pointed at the push
+    # in PLT[n] so the first call triggers lazy resolution; on the eager arches it
+    # stays zero and the loader fills it with the resolved address at load time.
     bin.write_u64_le(buf, lay.gotplt_off, lay.dynamic_va);
     bin.write_u64_le(buf, lay.gotplt_off + 8, 0);
     bin.write_u64_le(buf, lay.gotplt_off + 16, 0);
 
     # .plt and .rela.plt, per function import.
     if (nimp > 0) {
-        write_plt_header(buf, lay);
+        if (arch_id == isa.ARCH_X86_64) { write_plt_header(buf, lay); }
         var rela_off: usize = lay.relaplt_off;
         var n: u32 = 0;
         var sym_index: u32 = 1;
         i = 0;
         for (i < dyn.import_count) {
             if (dyn.imports[i].is_func) {
-                write_plt_stub(buf, lay, n);
+                write_plt_stub(buf, lay, n, arch_id);
 
-                # GOT[3+n] -> PLT[n] + 6 (the `push` after the indirect jump).
+                # GOT[3+n]: the x86_64 lazy path points it at PLT[n] + 6 (the `push`
+                # after the indirect jump); the eager arches leave it zero (loader-
+                # filled).
                 val got_slot_off: usize = lay.gotplt_off + (3 + n)::usize * GOT_ENTRY_SIZE;
-                val plt_stub_va: u64 = lay.plt_va + (n + 1)::u64 * PLT_ENTRY_SIZE::u64;
-                bin.write_u64_le(buf, got_slot_off, plt_stub_va + 6);
+                if (arch_id == isa.ARCH_X86_64) {
+                    bin.write_u64_le(buf, got_slot_off, plt_stub_va(lay, n, arch_id) + 6);
+                }
 
                 # .rela.plt JUMP_SLOT: r_offset = &GOT[3+n], r_sym = dynsym slot.
                 val got_slot_va: u64 = lay.gotplt_va + (3 + n)::u64 * GOT_ENTRY_SIZE::u64;
@@ -1905,6 +2258,13 @@ fun write_dyn_structures(itn: *intern.Interner, buf: *u8, lay: *DynLayout, dyn: 
         dpos = write_dyn_entry(buf, dpos, DT_PLTRELSZ, lay.relaplt_size::u64);
         dpos = write_dyn_entry(buf, dpos, DT_PLTREL,   DT_RELA_TAG);
         dpos = write_dyn_entry(buf, dpos, DT_JMPREL,   lay.relaplt_va);
+    }
+    # the eager arches have no lazy-resolution trampoline, so the loader must bind
+    # every JUMP_SLOT at load: DT_FLAGS(DF_BIND_NOW) for modern loaders, plus the
+    # legacy DT_BIND_NOW marker (its d_un is ignored).
+    if (dyn_bind_now(arch_id)) {
+        dpos = write_dyn_entry(buf, dpos, DT_FLAGS,    DF_BIND_NOW);
+        dpos = write_dyn_entry(buf, dpos, DT_BIND_NOW, 0);
     }
     dpos = write_dyn_entry(buf, dpos, DT_NULL, 0);
 }
@@ -1946,7 +2306,88 @@ fun write_plt_header(buf: *u8, lay: *DynLayout) {
     buf[p + 12] = 0x0F; buf[p + 13] = 0x1F; buf[p + 14] = 0x40; buf[p + 15] = 0x00;
 }
 
-# write PLT[n+1], the per-import stub
+# base instruction words for the eager-arch (aarch64 / riscv64) PLT stubs: the
+# opcode and registers with a zero immediate field, into which the per-slot GOT
+# displacement is OR-ed. derived from the ARM ARM / RISC-V psABI instruction
+# encodings (not an emitter dump), so the byte tests assert against them directly.
+val A64_PLT_ADRP_X16: u32 = 0x90000010;  # adrp x16, #0
+val A64_PLT_LDR_X16:  u32 = 0xF9400210;  # ldr  x16, [x16, #0]
+val A64_PLT_BR_X16:   u32 = 0xD61F0200;  # br   x16
+val A64_NOP:          u32 = 0xD503201F;  # nop
+val RV_PLT_AUIPC_T3:  u32 = 0x00000E17;  # auipc t3, 0
+val RV_PLT_LD_T3:     u32 = 0x000E3E03;  # ld    t3, 0(t3)
+val RV_PLT_JR_T3:     u32 = 0x000E0067;  # jr    t3  (jalr x0, 0(t3))
+val RV_NOP:           u32 = 0x00000013;  # nop  (addi x0, x0, 0)
+
+# the ADRP word reaching `target`'s page from `pc`: (Page(target) - Page(pc)) >> 12
+# packed into immlo[30:29] / immhi[23:5], the R_AARCH64_ADR_PREL_PG_HI21 layout.
+# `base` carries the opcode + Rd with a zero immediate.
+# ---
+# base:   the adrp opcode + destination register, immediate field zero
+# pc:     the adrp instruction's own virtual address
+# target: the address whose page the adrp computes
+# ret:    the assembled adrp instruction word
+fun arm64_adrp_word(base: u32, pc: u64, target: u64) u32 {
+    val tgt_page: i64 = (target::i64) - ((target::i64) & 0xFFF);
+    val pc_page:  i64 = (pc::i64)     - ((pc::i64)     & 0xFFF);
+    val delta: i64 = tgt_page - pc_page;
+    val imm21: u32 = (((delta::u64) >> 12) & 0x1FFFFF)::u32;
+    val immlo: u32 = imm21 & 0x3;
+    val immhi: u32 = (imm21 >> 2) & 0x7FFFF;
+    ret base | (immlo << 29) | (immhi << 5);
+}
+
+# the 64-bit LDR word loading `[Rn + :lo12:target]`: imm12 = (target & 0xFFF) >> 3
+# (the unsigned-offset scale for an 8-byte access) into bits[21:10], the
+# R_AARCH64_LDST64_ABS_LO12_NC layout. `base` carries the opcode + registers with a
+# zero immediate.
+# ---
+# base:   the ldr opcode + registers, immediate field zero
+# target: the address whose low 12 bits form the offset
+# ret:    the assembled ldr instruction word
+fun arm64_ldr64_lo12_word(base: u32, target: u64) u32 {
+    val imm12: u32 = (((target & 0xFFF) >> 3)::u32);
+    ret base | (imm12 << 10);
+}
+
+# the auipc / lui word whose U-type imm[31:12] is ((delta + 0x800) >> 12), the
+# RISC-V %pcrel_hi high part; the +0x800 rounds so the paired signed lo12 folds back
+# exactly. `base` carries the opcode + rd with a zero immediate.
+# ---
+# base:  the auipc opcode + destination register, immediate field zero
+# delta: the pc-relative displacement the hi/lo pair materializes
+# ret:   the assembled auipc instruction word
+fun riscv_hi20_word(base: u32, delta: i64) u32 {
+    val hi20: u32 = (((delta + 0x800) >> 12)::u64 & 0xFFFFF)::u32;
+    ret base | (hi20 << 12);
+}
+
+# the I-type word whose imm[31:20] is (delta & 0xFFF), the RISC-V %pcrel_lo low part
+# (the hardware sign-extends the 12-bit field). `base` carries the opcode +
+# registers with a zero immediate.
+# ---
+# base:  the I-type opcode + registers, immediate field zero
+# delta: the pc-relative displacement (relative to the paired auipc)
+# ret:   the assembled instruction word
+fun riscv_lo12_i_word(base: u32, delta: i64) u32 {
+    val lo12: u32 = (delta::u64 & 0xFFF)::u32;
+    ret base | (lo12 << 20);
+}
+
+# write the per-import PLT stub for function-import ordinal `n`, dispatching to the
+# arch's stub encoding
+# ---
+# buf:     the output buffer
+# lay:     the resolved dynamic-structure layout (.plt and .got.plt addresses)
+# n:       the function-import ordinal (0-based) this stub serves
+# arch_id: the target ISA id selecting the stub encoding
+fun write_plt_stub(buf: *u8, lay: *DynLayout, n: u32, arch_id: u32) {
+    if (arch_id == isa.ARCH_AARCH64) { write_plt_stub_aarch64(buf, lay, n); ret; }
+    if (arch_id == isa.ARCH_RISCV64) { write_plt_stub_riscv64(buf, lay, n); ret; }
+    write_plt_stub_x86_64(buf, lay, n);
+}
+
+# write PLT[n+1], the x86_64 lazy per-import stub
 #
 # It jumps through GOT[3+n] (initially pointing back at the stub's push,
 # triggering resolution), pushes the relocation index, and jumps to PLT[0].
@@ -1954,7 +2395,7 @@ fun write_plt_header(buf: *u8, lay: *DynLayout) {
 # buf: the output buffer
 # lay: the resolved dynamic-structure layout (.plt and .got.plt addresses)
 # n:   the function-import ordinal (0-based) this stub serves
-fun write_plt_stub(buf: *u8, lay: *DynLayout, n: u32) {
+fun write_plt_stub_x86_64(buf: *u8, lay: *DynLayout, n: u32) {
     val stub_off: usize = lay.plt_off + (n + 1)::usize * PLT_ENTRY_SIZE;
     val stub_va:  u64   = lay.plt_va + (n + 1)::u64 * PLT_ENTRY_SIZE::u64;
     # jmp qword [rip + d]  (FF 25 d) -> GOT[3+n]
@@ -1972,16 +2413,63 @@ fun write_plt_stub(buf: *u8, lay: *DynLayout, n: u32) {
     bin.write_u32_le(buf, stub_off + 12, (plt0 - after)::u32);
 }
 
+# write the aarch64 eager per-import stub: a three-instruction load-and-branch
+# through GOT[3+n] (which the loader has resolved under BIND_NOW), padded to
+# `PLT_ENTRY_SIZE` with a nop. there is no PLT[0] on the eager path.
+# ---
+# buf: the output buffer
+# lay: the resolved dynamic-structure layout (.plt and .got.plt addresses)
+# n:   the function-import ordinal (0-based) this stub serves
+fun write_plt_stub_aarch64(buf: *u8, lay: *DynLayout, n: u32) {
+    val stub_off: usize = lay.plt_off + n::usize * PLT_ENTRY_SIZE;
+    val stub_va:  u64   = plt_stub_va(lay, n, isa.ARCH_AARCH64);
+    val got_va:   u64   = lay.gotplt_va + (3 + n)::u64 * GOT_ENTRY_SIZE::u64;
+    # adrp x16, Page(GOT[3+n])
+    bin.write_u32_le(buf, stub_off,      arm64_adrp_word(A64_PLT_ADRP_X16, stub_va, got_va));
+    # ldr  x16, [x16, #:lo12:GOT[3+n]]
+    bin.write_u32_le(buf, stub_off + 4,  arm64_ldr64_lo12_word(A64_PLT_LDR_X16, got_va));
+    # br   x16
+    bin.write_u32_le(buf, stub_off + 8,  A64_PLT_BR_X16);
+    # nop (pad to PLT_ENTRY_SIZE)
+    bin.write_u32_le(buf, stub_off + 12, A64_NOP);
+}
+
+# write the riscv64 eager per-import stub: an auipc/ld pair materializing GOT[3+n]
+# into t3 then `jr t3` (which the loader has resolved under BIND_NOW), padded to
+# `PLT_ENTRY_SIZE` with a nop. there is no PLT[0] on the eager path. the ld's
+# %pcrel_lo is measured from the auipc (the stub start), so both share one delta.
+# ---
+# buf: the output buffer
+# lay: the resolved dynamic-structure layout (.plt and .got.plt addresses)
+# n:   the function-import ordinal (0-based) this stub serves
+fun write_plt_stub_riscv64(buf: *u8, lay: *DynLayout, n: u32) {
+    val stub_off: usize = lay.plt_off + n::usize * PLT_ENTRY_SIZE;
+    val stub_va:  u64   = plt_stub_va(lay, n, isa.ARCH_RISCV64);
+    val got_va:   u64   = lay.gotplt_va + (3 + n)::u64 * GOT_ENTRY_SIZE::u64;
+    val delta: i64 = (got_va::i64) - (stub_va::i64);
+    # auipc t3, %pcrel_hi(GOT[3+n])
+    bin.write_u32_le(buf, stub_off,      riscv_hi20_word(RV_PLT_AUIPC_T3, delta));
+    # ld    t3, %pcrel_lo(GOT[3+n])(t3)
+    bin.write_u32_le(buf, stub_off + 4,  riscv_lo12_i_word(RV_PLT_LD_T3, delta));
+    # jr    t3
+    bin.write_u32_le(buf, stub_off + 8,  RV_PLT_JR_T3);
+    # nop (pad to PLT_ENTRY_SIZE)
+    bin.write_u32_le(buf, stub_off + 12, RV_NOP);
+}
+
 # rewrite each deferred import call site to a pc-relative call to its PLT stub
 #
 # Each `PltFixup` the linker could not resolve records the segment + offset of the
-# 4-byte displacement field and the patch-site vaddr; with the stub vaddr `S` the
-# patched value is `S + A - P`.
+# call's relocation field and the patch-site vaddr; with the stub vaddr `S` the call
+# is redirected to `S + A - P`. The field's encoding is the arch's own call form, so
+# the redirect reproduces the same packing the linker's `apply_one` would have used
+# had `S` been known then: x86_64 a flat 4-byte rel32, aarch64 the BL imm26
+# (R_AARCH64_CALL26), riscv64 the auipc+jalr CALL pair (R_RISCV_CALL_PLT, 8 bytes).
 #
-# Because the linker deferred this site, `apply_one`'s pc32 range/bounds checks
-# never ran for it, so they are enforced here: the 4-byte field must lie within the
-# segment's file bytes and the displacement must fit a signed 32-bit value. A
-# violation fails the link rather than writing out of bounds or truncating.
+# Because the linker deferred this site, `apply_one`'s range/bounds checks never ran
+# for it, so they are enforced here: the field must lie within the segment's file
+# bytes and the displacement must fit the arch's branch range. A violation fails the
+# link rather than writing out of bounds or truncating.
 #
 # The linker only records a fixup for a function import in a real segment, so an
 # out-of-range segment index or a non-function target is an internal consistency
@@ -1998,11 +2486,13 @@ fun write_plt_stub(buf: *u8, lay: *DynLayout, n: u32) {
 # segs:        the linker's loadable segments
 # seg_count:   number of segments
 # nimp:        number of function imports; zero short-circuits to ok
+# arch_id:     the target ISA id selecting the call-field encoding
 # ret:         ok(true) on success, or an error on an out-of-range or overflowing fixup
 fun patch_plt_fixups(buf: *u8, lay: *DynLayout, dyn: *of.DynamicInfo,
                      fixups: *of.PltFixup, fixup_count: u32, seg_offsets: *usize,
-                     segs: *of.LoadSegment, seg_count: u32, nimp: u32) R.Result[bool, str] {
+                     segs: *of.LoadSegment, seg_count: u32, nimp: u32, arch_id: u32) R.Result[bool, str] {
     if (nimp == 0) { ret R.ok[bool, str](true); }
+    val width: usize = call_patch_width(arch_id);
     var i: u32 = 0;
     for (i < fixup_count) {
         val fx: *of.PltFixup = ?fixups[i];
@@ -2016,24 +2506,93 @@ fun patch_plt_fixups(buf: *u8, lay: *DynLayout, dyn: *of.DynamicInfo,
             ret R.err[bool, str]("elf: dynamic call-site fixup targets a non-function import");
         }
 
-        # the 4-byte displacement field must lie fully within the segment's file
+        # the call's relocation field must lie fully within the segment's file
         # bytes; the writer placed those bytes at `seg_offsets[seg_index]`.
         val seg_filesz: usize = segs[fx.seg_index].filesz;
-        if (fx.seg_offset::usize + 4 > seg_filesz) {
+        if (fx.seg_offset::usize + width > seg_filesz) {
             ret R.err[bool, str]("elf: dynamic call-site fixup offset out of range");
         }
 
-        val stub_va: u64 = lay.plt_va + (n + 1)::u64 * PLT_ENTRY_SIZE::u64;
-        val disp: i64 = (stub_va::i64) + fx.addend - (fx.patch_vaddr::i64);
-        if (disp > 2147483647 || disp < -2147483648) {
-            ret R.err[bool, str]("elf: dynamic call-site displacement overflows 32 bits");
-        }
-
+        val stub_va:  u64   = plt_stub_va(lay, n, arch_id);
         val file_off: usize = seg_offsets[fx.seg_index] + fx.seg_offset::usize;
-        bin.write_u32_le(buf, file_off, (disp::u64)::u32);
+        val pr: R.Result[bool, str] = patch_call_site(buf, file_off, arch_id, stub_va, fx.addend, fx.patch_vaddr);
+        if (R.is_err[bool, str](pr)) { ret R.err[bool, str](R.unwrap_err[bool, str](pr)); }
         i = i + 1;
     }
     ret R.ok[bool, str](true);
+}
+
+# the byte width of an arch's deferred call-site relocation field: the x86_64 rel32
+# and the aarch64 BL are a single 4-byte word; the riscv64 auipc+jalr CALL pair
+# spans 8 bytes.
+# ---
+# arch_id: the target ISA id
+# ret:     the relocation field's byte width
+fun call_patch_width(arch_id: u32) usize {
+    if (arch_id == isa.ARCH_RISCV64) { ret 8; }
+    ret 4;
+}
+
+# redirect one deferred call site at `file_off` to the PLT stub at `stub_va`,
+# reproducing the arch's call encoding for `S + A - P`
+#
+# Mirrors the linker's RK_PLT32 packers (it deferred this exact site), so a stub now
+# reachable patches identically to a directly-resolved call. A displacement outside
+# the arch's branch range (or, on aarch64, unaligned) fails the link.
+# ---
+# buf:      the output buffer being patched
+# file_off: byte offset of the call's relocation field in `buf`
+# arch_id:  the target ISA id selecting the call encoding
+# stub_va:  the PLT stub's virtual address (`S`)
+# addend:   the relocation addend (`A`)
+# patch_va: the patch site's own virtual address (`P`)
+# ret:      ok(true) once written, or an overflow/alignment error
+fun patch_call_site(buf: *u8, file_off: usize, arch_id: u32, stub_va: u64,
+                    addend: i64, patch_va: u64) R.Result[bool, str] {
+    # aarch64: BL imm26 = (S + A - P) >> 2 into bits[25:0], range +-128MB, 4-aligned.
+    if (arch_id == isa.ARCH_AARCH64) {
+        val disp: i64 = (stub_va::i64) + addend - (patch_va::i64);
+        val lim: i64 = 134217728;   # 1 << 27
+        if (disp < -lim || disp >= lim || (disp & 3) != 0) {
+            ret R.err[bool, str]("elf: dynamic call-site displacement overflows the BL +-128MB range");
+        }
+        val word: u32 = bin.read_u32_le(buf, file_off);
+        val imm26: u32 = (((disp::u64) & 0x0FFFFFFC) >> 2)::u32;
+        bin.write_u32_le(buf, file_off, (word & 0xFC000000) | imm26);
+        ret R.ok[bool, str](true);
+    }
+
+    # riscv64: the auipc + jalr CALL pair shares one displacement measured from the
+    # auipc (the patch site); the hi20 lands in the auipc, the lo12 in the jalr.
+    if (arch_id == isa.ARCH_RISCV64) {
+        val delta: i64 = (stub_va::i64) + addend - (patch_va::i64);
+        if (!riscv_pcrel_ok(delta)) {
+            ret R.err[bool, str]("elf: dynamic call-site displacement overflows the auipc+jalr +-2GB range");
+        }
+        val auipc: u32 = bin.read_u32_le(buf, file_off);
+        bin.write_u32_le(buf, file_off, riscv_hi20_word(auipc & 0xFFF, delta));
+        val jalr: u32 = bin.read_u32_le(buf, (file_off + 4));
+        bin.write_u32_le(buf, (file_off + 4), riscv_lo12_i_word(jalr & 0x000FFFFF, delta));
+        ret R.ok[bool, str](true);
+    }
+
+    # x86_64: a flat 4-byte pc-relative displacement.
+    val disp: i64 = (stub_va::i64) + addend - (patch_va::i64);
+    if (disp > 2147483647 || disp < -2147483648) {
+        ret R.err[bool, str]("elf: dynamic call-site displacement overflows 32 bits");
+    }
+    bin.write_u32_le(buf, file_off, (disp::u64)::u32);
+    ret R.ok[bool, str](true);
+}
+
+# whether a riscv pc-relative displacement fits the auipc + lo12 split: the
+# +0x800-rounded high part must stay within a signed 32-bit value.
+# ---
+# delta: the pc-relative displacement (S + A - P)
+# ret:   true when representable by an auipc + lo12 pair
+fun riscv_pcrel_ok(delta: i64) bool {
+    val adj: i64 = delta + 0x800;
+    ret adj >= -2147483648 && adj <= 2147483647;
 }
 
 # the PLT slot index (0-based among function imports) for a raw import index
@@ -3097,5 +3656,420 @@ test "mach.lang.target.of.elf.emit_object:riscv_attributes_section" {
     val ra: R.Result[str, str] = bin.cstr_at(buf.data, buf.len, attr_off + 17);
     if (R.is_err[str, str](ra)) { ret 1; }
     if (!str_equals(R.unwrap_ok[str, str](ra), "rv64i2p0_m2p0")) { ret 1; }
+    ret 0;
+}
+
+# serialize a minimal one-function-import / zero-dependency dynamic image's
+# structures into a fresh buffer for the byte tests, laying them out for `arch_id`
+# from a fixed file offset 0 and virtual base. the caller owns the returned buffer
+# (size `lay.rw_off + lay.rw_size`) and frees it; nil signals an allocation failure.
+# ---
+# alloc:   allocator for the output buffer
+# itn:     interner the import/interp names are interned into
+# arch_id: the target ISA id selecting the layout and stub encoding
+# lay:     out - the resolved layout the assertions index by
+# ret:     the serialized buffer, or nil on allocation failure
+fun t_emit_dyn_one(alloc: *A.Allocator, itn: *intern.Interner, arch_id: u32, lay: *DynLayout) *u8 {
+    var imports: [1]of.DynImport;
+    imports[0].symbol = t_intern(itn, "getpid");
+    imports[0].lib_index = of.DYNLIB_ANY;
+    imports[0].is_func = true;
+
+    var dyn: of.DynamicInfo;
+    dyn.libs = nil;            dyn.lib_count = 0;
+    dyn.imports = ?imports[0]; dyn.import_count = 1;
+    dyn.interp = t_intern(itn, "/lib/ld.so.1");
+    dyn.base_relocs = nil;     dyn.base_reloc_count = 0;
+    dyn.pie = false;
+
+    compute_dyn_layout(itn, lay, ?dyn, 1, arch_id, 0, 0x400000);
+    val total: usize = lay.rw_off + lay.rw_size;
+    val rb: R.Result[*u8, str] = A.zallocate[u8](alloc, total);
+    if (R.is_err[*u8, str](rb)) { ret nil; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+
+    var imp_str: [1]usize;
+    var lib_str: [1]usize;
+    write_dyn_structures(itn, buf, lay, ?dyn, 1, arch_id, ?imp_str[0], ?lib_str[0]);
+    ret buf;
+}
+
+# whether the serialized .dynamic table holds an entry with tag `tag` and value
+# `value`, scanning to the DT_NULL terminator
+# ---
+# buf:   the serialized image
+# lay:   the resolved layout (.dynamic offset + size)
+# tag:   the DT_* tag to find
+# value: the d_un value the tag must carry
+# ret:   true when the (tag, value) pair is present
+fun t_dyn_has(buf: *u8, lay: *DynLayout, tag: u64, value: u64) bool {
+    val count: usize = lay.dynamic_size / DYN_SIZE;
+    var k: usize = 0;
+    for (k < count) {
+        val off: usize = lay.dynamic_off + k * DYN_SIZE;
+        val t: u64 = bin.read_u64_le(buf, off);
+        if (t == tag && bin.read_u64_le(buf, off + 8) == value) { ret true; }
+        if (t == DT_NULL) { ret false; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# the eager-arch per-import PLT stubs encode exactly the load-and-branch sequence
+# through GOT[3+n] (aarch64 adrp/ldr/br, riscv64 auipc/ld/jr). controlled .plt /
+# .got.plt addresses make every immediate a known constant, so the asserted words
+# are derived from the ARM-ARM / RISC-V psABI instruction encodings, not from the
+# emitter's own output.
+test "mach.lang.target.of.elf.write_plt_stub:eager_arch_bytes" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var lay: DynLayout;
+    lay.plt_off   = 0;
+    lay.plt_va    = 0x2000;
+    lay.gotplt_va = 0x4000;
+
+    val rb: R.Result[*u8, str] = A.zallocate[u8](?alloc, 64);
+    if (R.is_err[*u8, str](rb)) { ret 1; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+
+    var bad: bool = false;
+
+    # aarch64 stub n=0: GOT[3] = 0x4018, pc = 0x2000.
+    #   adrp x16, 0x4000 (page delta 0x2000)  -> 0xD0000010
+    #   ldr  x16, [x16, #:lo12: 0x18>>3 = 3]  -> 0xF9400E10
+    #   br   x16 -> 0xD61F0200 ; nop -> 0xD503201F
+    write_plt_stub(buf, ?lay, 0, isa.ARCH_AARCH64);
+    if (bin.read_u32_le(buf, 0)  != 0xD0000010) { bad = true; }
+    if (bin.read_u32_le(buf, 4)  != 0xF9400E10) { bad = true; }
+    if (bin.read_u32_le(buf, 8)  != 0xD61F0200) { bad = true; }
+    if (bin.read_u32_le(buf, 12) != 0xD503201F) { bad = true; }
+
+    # aarch64 stub n=1: GOT[4] = 0x4020, the ldr imm advances to 0x20>>3 = 4.
+    write_plt_stub(buf, ?lay, 1, isa.ARCH_AARCH64);
+    if (bin.read_u32_le(buf, 16 + 4) != 0xF9401210) { bad = true; }
+
+    # riscv64 stub n=0: GOT[3] = 0x4018, auipc pc = 0x2000, delta = 0x2018.
+    #   auipc t3, ((0x2018 + 0x800) >> 12 = 2) -> 0x00002E17
+    #   ld    t3, (0x2018 & 0xFFF = 0x18)      -> 0x018E3E03
+    #   jr    t3 -> 0x000E0067 ; nop -> 0x00000013
+    write_plt_stub(buf, ?lay, 0, isa.ARCH_RISCV64);
+    if (bin.read_u32_le(buf, 0)  != 0x00002E17) { bad = true; }
+    if (bin.read_u32_le(buf, 4)  != 0x018E3E03) { bad = true; }
+    if (bin.read_u32_le(buf, 8)  != 0x000E0067) { bad = true; }
+    if (bin.read_u32_le(buf, 12) != 0x00000013) { bad = true; }
+
+    A.deallocate[u8](?alloc, buf, 64);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+# the x86_64 lazy per-import stub is byte-unchanged by the per-arch refactor: it
+# still jumps through GOT[3+n], pushes the reloc index, and jumps to PLT[0]. a
+# direct byte assertion guards the x86_64 path's byte-identity.
+test "mach.lang.target.of.elf.write_plt_stub:x86_64_lazy_unchanged" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var lay: DynLayout;
+    lay.plt_off   = 0;
+    lay.plt_va    = 0x2000;
+    lay.gotplt_va = 0x4000;
+
+    val rb: R.Result[*u8, str] = A.zallocate[u8](?alloc, 64);
+    if (R.is_err[*u8, str](rb)) { ret 1; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+
+    # stub n=0 sits at PLT[1] (offset 16), pc = 0x2010. GOT[3] = 0x4018.
+    #   jmp [rip + (0x4018 - 0x2016 = 0x2002)] -> FF 25 02 20 00 00
+    #   push 0                                 -> 68 00 00 00 00
+    #   jmp PLT[0] (0x2000 - 0x2020 = -0x20)   -> E9 E0 FF FF FF
+    write_plt_stub(buf, ?lay, 0, isa.ARCH_X86_64);
+    var bad: bool = false;
+    if (buf[16] != 0xFF || buf[17] != 0x25)        { bad = true; }
+    if (bin.read_u32_le(buf, 18) != 0x2002)        { bad = true; }
+    if (buf[22] != 0x68)                           { bad = true; }
+    if (bin.read_u32_le(buf, 23) != 0)             { bad = true; }
+    if (buf[27] != 0xE9)                           { bad = true; }
+    if (bin.read_u32_le(buf, 28) != 0xFFFFFFE0)    { bad = true; }
+
+    A.deallocate[u8](?alloc, buf, 64);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+# the aarch64 dynamic image binds eagerly: GOT[0] = &.dynamic, each GOT[3+n] is left
+# zero for the loader to fill, .rela.plt carries an R_AARCH64_JUMP_SLOT per import,
+# and .dynamic requests BIND_NOW. asserts the structures against the psABI layout.
+test "mach.lang.target.of.elf.write_dyn_structures:aarch64_bindnow" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var lay: DynLayout;
+    val buf: *u8 = t_emit_dyn_one(?alloc, ?i, isa.ARCH_AARCH64, ?lay);
+    if (buf == nil) { ret 1; }
+
+    var bad: bool = false;
+    val got3_off: usize = lay.gotplt_off + 3 * GOT_ENTRY_SIZE;
+    val got3_va:  u64   = lay.gotplt_va + (3 * GOT_ENTRY_SIZE)::u64;
+
+    # GOT[0] = &.dynamic; GOT[3+0] = 0 (loader-filled under BIND_NOW).
+    if (bin.read_u64_le(buf, lay.gotplt_off) != lay.dynamic_va) { bad = true; }
+    if (bin.read_u64_le(buf, got3_off) != 0)                    { bad = true; }
+
+    # .rela.plt[0]: r_offset = &GOT[3], r_info = (sym 1 << 32) | JUMP_SLOT, addend 0.
+    val want_info: u64 = (1::u64 << 32) | R_AARCH64_JUMP_SLOT::u64;
+    if (bin.read_u64_le(buf, lay.relaplt_off) != got3_va)          { bad = true; }
+    if (bin.read_u64_le(buf, lay.relaplt_off + 8) != want_info)    { bad = true; }
+    if (bin.read_u64_le(buf, lay.relaplt_off + 16) != 0)          { bad = true; }
+
+    # the stub at PLT[0] (no PLT header): adrp x16, Page(GOT[3]) then br x16.
+    val adrp: u32 = arm64_adrp_word(A64_PLT_ADRP_X16, plt_stub_va(?lay, 0, isa.ARCH_AARCH64), got3_va);
+    if (bin.read_u32_le(buf, lay.plt_off) != adrp)         { bad = true; }
+    if (bin.read_u32_le(buf, lay.plt_off + 8) != A64_PLT_BR_X16) { bad = true; }
+
+    # .dynamic requests eager binding.
+    if (!t_dyn_has(buf, ?lay, DT_FLAGS, DF_BIND_NOW)) { bad = true; }
+    if (!t_dyn_has(buf, ?lay, DT_BIND_NOW, 0))        { bad = true; }
+
+    A.deallocate[u8](?alloc, buf, lay.rw_off + lay.rw_size);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+# the riscv64 dynamic image binds eagerly too: its .rela.plt carries the riscv
+# JUMP_SLOT type, GOT[3+n] is loader-filled, the stub is the auipc/ld/jr form, and
+# .dynamic requests BIND_NOW.
+test "mach.lang.target.of.elf.write_dyn_structures:riscv64_jump_slot" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var lay: DynLayout;
+    val buf: *u8 = t_emit_dyn_one(?alloc, ?i, isa.ARCH_RISCV64, ?lay);
+    if (buf == nil) { ret 1; }
+
+    var bad: bool = false;
+    val got3_off: usize = lay.gotplt_off + 3 * GOT_ENTRY_SIZE;
+    val got3_va:  u64   = lay.gotplt_va + (3 * GOT_ENTRY_SIZE)::u64;
+
+    if (bin.read_u64_le(buf, got3_off) != 0) { bad = true; }
+
+    val want_info: u64 = (1::u64 << 32) | R_RISCV_JUMP_SLOT::u64;
+    if (bin.read_u64_le(buf, lay.relaplt_off) != got3_va)       { bad = true; }
+    if (bin.read_u64_le(buf, lay.relaplt_off + 8) != want_info) { bad = true; }
+
+    # the stub at PLT[0] (no PLT header): auipc t3, %pcrel_hi(GOT[3]) then jr t3.
+    val stub_va: u64 = plt_stub_va(?lay, 0, isa.ARCH_RISCV64);
+    val delta: i64 = (got3_va::i64) - (stub_va::i64);
+    if (bin.read_u32_le(buf, lay.plt_off) != riscv_hi20_word(RV_PLT_AUIPC_T3, delta)) { bad = true; }
+    if (bin.read_u32_le(buf, lay.plt_off + 8) != RV_PLT_JR_T3)                        { bad = true; }
+
+    if (!t_dyn_has(buf, ?lay, DT_FLAGS, DF_BIND_NOW)) { bad = true; }
+    if (!t_dyn_has(buf, ?lay, DT_BIND_NOW, 0))        { bad = true; }
+
+    A.deallocate[u8](?alloc, buf, lay.rw_off + lay.rw_size);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+# the x86_64 dynamic image keeps its lazy binding: GOT[3+n] is pre-pointed at the
+# stub's push for first-call resolution, the JUMP_SLOT is the x86_64 type, and
+# .dynamic carries NO BIND_NOW marker - guarding the x86_64 path's behavior.
+test "mach.lang.target.of.elf.write_dyn_structures:x86_64_lazy_got" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var lay: DynLayout;
+    val buf: *u8 = t_emit_dyn_one(?alloc, ?i, isa.ARCH_X86_64, ?lay);
+    if (buf == nil) { ret 1; }
+
+    var bad: bool = false;
+    val got3_off: usize = lay.gotplt_off + 3 * GOT_ENTRY_SIZE;
+
+    # GOT[3+0] -> PLT[0] stub + 6 (the push), the lazy pre-binding (nonzero).
+    if (bin.read_u64_le(buf, got3_off) != plt_stub_va(?lay, 0, isa.ARCH_X86_64) + 6) { bad = true; }
+
+    val want_info: u64 = (1::u64 << 32) | R_X86_64_JUMP_SLOT::u64;
+    if (bin.read_u64_le(buf, lay.relaplt_off + 8) != want_info) { bad = true; }
+
+    # no eager-binding markers on the lazy path.
+    if (t_dyn_has(buf, ?lay, DT_BIND_NOW, 0))         { bad = true; }
+    if (t_dyn_has(buf, ?lay, DT_FLAGS, DF_BIND_NOW))  { bad = true; }
+
+    A.deallocate[u8](?alloc, buf, lay.rw_off + lay.rw_size);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+# the deferred-call redirect reproduces each arch's call encoding to the PLT stub:
+# the aarch64 BL imm26 and the riscv64 auipc+jalr CALL pair, both `S + A - P`. a
+# placeholder call word at the patch site is rewritten in place; the asserted words
+# follow the ARM-ARM / RISC-V psABI field layouts.
+test "mach.lang.target.of.elf.patch_plt_fixups:eager_call_sites" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var lay: DynLayout;
+    lay.plt_va = 0x3000;
+
+    var imports: [1]of.DynImport;
+    imports[0].symbol = intern.STR_NIL;
+    imports[0].lib_index = of.DYNLIB_ANY;
+    imports[0].is_func = true;
+    var dyn: of.DynamicInfo;
+    dyn.libs = nil;            dyn.lib_count = 0;
+    dyn.imports = ?imports[0]; dyn.import_count = 1;
+
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = 0x2000; segs[0].filesz = 0x100; segs[0].memsz = 0x100;
+    segs[0].flags = 0; segs[0].bytes = nil;
+    var seg_offsets: [1]usize;
+    seg_offsets[0] = 0x100;
+
+    var fx: [1]of.PltFixup;
+    fx[0].seg_index = 0; fx[0].seg_offset = 0x10; fx[0].import_index = 0;
+    fx[0].patch_vaddr = 0x2000; fx[0].addend = 0;
+
+    val rb: R.Result[*u8, str] = A.zallocate[u8](?alloc, 0x200);
+    if (R.is_err[*u8, str](rb)) { ret 1; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+
+    var bad: bool = false;
+
+    # aarch64: stub at 0x3000, P = 0x2000, disp = 0x1000 -> imm26 = 0x400. the BL
+    # placeholder 0x94000000 becomes 0x94000400.
+    bin.write_u32_le(buf, 0x110, 0x94000000);
+    val ar: R.Result[bool, str] = patch_plt_fixups(buf, ?lay, ?dyn, ?fx[0], 1, ?seg_offsets[0], ?segs[0], 1, 1, isa.ARCH_AARCH64);
+    if (R.is_err[bool, str](ar))                 { bad = true; }
+    if (bin.read_u32_le(buf, 0x110) != 0x94000400) { bad = true; }
+
+    # riscv64: stub at 0x3000, P = 0x2000, delta = 0x1000. the auipc ra / jalr ra
+    # placeholders take hi20 = 1 (auipc 0x097 -> 0x1097) and lo12 = 0 (jalr unchanged).
+    bin.write_u32_le(buf, 0x110, 0x00000097);
+    bin.write_u32_le(buf, 0x114, 0x000080E7);
+    val rr: R.Result[bool, str] = patch_plt_fixups(buf, ?lay, ?dyn, ?fx[0], 1, ?seg_offsets[0], ?segs[0], 1, 1, isa.ARCH_RISCV64);
+    if (R.is_err[bool, str](rr))                   { bad = true; }
+    if (bin.read_u32_le(buf, 0x110) != 0x00001097) { bad = true; }
+    if (bin.read_u32_le(buf, 0x114) != 0x000080E7) { bad = true; }
+
+    A.deallocate[u8](?alloc, buf, 0x200);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+# emit_pie_exec frames a position-independent ET_DYN: no PT_INTERP, a PT_DYNAMIC
+# whose .dynamic lists DT_RELA/RELASZ/RELAENT/RELACOUNT, and a .rela.dyn holding one
+# R_*_RELATIVE per in-image absolute pointer (r_offset = the pointer's link-time
+# vaddr, r_addend = its link-time value). asserts the written image against the
+# static-PIE layout.
+test "mach.lang.target.of.elf.emit_pie_exec:static_pie_layout" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id            = isa.ARCH_X86_64;
+    isa_vt.elf_machine   = 62;       # EM_X86_64
+    isa_vt.pointer_width = 8;
+
+    # one executable load segment, laid out PIE-relative (base + one-page header gap).
+    var text: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text[k] = 0x90; k = k + 1; }
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = 0x401000; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text[0];
+
+    # one in-image absolute pointer at vaddr 0x401008 holding the link-time 0x401000.
+    var brs: [1]of.BaseReloc;
+    brs[0].seg_index = 0; brs[0].seg_offset = 8; brs[0].target = 0x401000;
+
+    var dyn: of.DynamicInfo;
+    dyn.libs = nil;            dyn.lib_count = 0;
+    dyn.imports = nil;         dyn.import_count = 0;
+    dyn.interp = intern.STR_NIL;
+    dyn.base_relocs = ?brs[0]; dyn.base_reloc_count = 1;
+    dyn.pie = true;
+
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "elf_pie");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val tpath: str = filesystem.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_pie_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1, 0x401000, ?dyn, tpath::*u8);
+    if (R.is_err[bool, str](em)) { filesystem.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tpath);
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_err[filesystem.Buffer, str](rb)) { ret 1; }
+    val buf: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rb);
+
+    var bad: bool = false;
+
+    # ET_DYN.
+    if (bin.read_u16_le(buf.data, 16) != ET_DYN) { bad = true; }
+
+    # walk the program headers: locate PT_DYNAMIC and confirm there is no PT_INTERP.
+    val e_phoff: usize = bin.read_u64_le(buf.data, 32)::usize;
+    val e_phnum: usize = bin.read_u16_le(buf.data, 56)::usize;
+    var dyn_foff: usize = 0;
+    var have_interp: bool = false;
+    var ph: usize = 0;
+    for (ph < e_phnum) {
+        val po: usize = e_phoff + ph * PHDR_SIZE;
+        val pt: u32 = bin.read_u32_le(buf.data, po);
+        if (pt == PT_DYNAMIC) { dyn_foff = bin.read_u64_le(buf.data, po + 8)::usize; }
+        if (pt == PT_INTERP)  { have_interp = true; }
+        ph = ph + 1;
+    }
+    if (have_interp)  { bad = true; }
+    if (dyn_foff == 0) { bad = true; }
+
+    # .dynamic: DT_RELA (the .rela.dyn vaddr) + RELASZ/RELAENT/RELACOUNT.
+    var rela_va: u64 = 0;
+    var relasz:  u64 = 0;
+    var relaent: u64 = 0;
+    var relacnt: u64 = 0;
+    var d: usize = dyn_foff;
+    var seen: u32 = 0;
+    for (seen < 32) {
+        val tag: u64 = bin.read_u64_le(buf.data, d);
+        val v:   u64 = bin.read_u64_le(buf.data, d + 8);
+        if (tag == DT_RELA)      { rela_va = v; }
+        if (tag == DT_RELASZ)    { relasz  = v; }
+        if (tag == DT_RELAENT)   { relaent = v; }
+        if (tag == DT_RELACOUNT) { relacnt = v; }
+        if (tag == DT_NULL) { seen = 32; } or { d = d + DYN_SIZE; seen = seen + 1; }
+    }
+    if (rela_va == 0)  { bad = true; }
+    if (relasz != 24)  { bad = true; }
+    if (relaent != 24) { bad = true; }
+    if (relacnt != 1)  { bad = true; }
+
+    # the .rela.dyn entry: map its vaddr to a file offset through the containing
+    # PT_LOAD, then assert the R_X86_64_RELATIVE record.
+    var rela_off: usize = 0;
+    ph = 0;
+    for (ph < e_phnum) {
+        val po: usize = e_phoff + ph * PHDR_SIZE;
+        if (bin.read_u32_le(buf.data, po) == PT_LOAD) {
+            val pf:  u64 = bin.read_u64_le(buf.data, po + 8);
+            val pv:  u64 = bin.read_u64_le(buf.data, po + 16);
+            val psz: u64 = bin.read_u64_le(buf.data, po + 32);
+            if (rela_va >= pv && rela_va < pv + psz) { rela_off = (pf + (rela_va - pv))::usize; }
+        }
+        ph = ph + 1;
+    }
+    if (rela_off == 0) { bad = true; }
+    or {
+        if (bin.read_u64_le(buf.data, rela_off) != 0x401008)                  { bad = true; }
+        if (bin.read_u64_le(buf.data, rela_off + 8) != R_X86_64_RELATIVE::u64) { bad = true; }
+        if (bin.read_u64_le(buf.data, rela_off + 16) != 0x401000)             { bad = true; }
+    }
+
+    if (bad) { ret 1; }
     ret 0;
 }
