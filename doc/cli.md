@@ -189,9 +189,31 @@ mach test <path> [options]
 
 Builds one standalone executable per `test` declaration (the test plus the
 project's transitive code, with a synthesized `main` calling just that test),
-then spawns each as a separate process and reports a per-test
-`name file:line PASS|FAIL` line. A crashing test reports its signal and the run
-continues. A test build always links executables, even for a library target.
+then spawns each as a separate process, captures its output, and times it.
+A test build always links executables, even for a library target.
+
+The default readout collapses every all-passing module to a single roll-up
+line and expands only modules that have a failure:
+
+```
+mach.lang.intern                     3 ok  568us
+mach.lang.driver                    27 ok     1 FAIL  146ms
+  FAIL  builds:cyclic_import  ./src/lang/driver.mach:142  (exit 1)
+    expected a diagnostic, got none
+
+failures:
+  mach.lang.driver.builds:cyclic_import  ./src/lang/driver.mach:142  (exit 1)
+
+437 passed, 1 failed, 438 total  (268ms)
+```
+
+A roll-up is `<module>  <ok> ok[  <fail> FAIL]  <duration>`. Each expanded
+failure carries the test's `file:line`, its exit code (`(exit N)`) or signal
+(`(signal N)`), and the child's captured stdout indented beneath it; a passing
+test stays quiet. A crashing test reports its signal and the run continues. The
+closing summary re-lists every failure as `<test>  file:line  (reason)`. `-v`
+lists every test, grouped by module, with each test's duration. The layout is
+fixed-width ASCII (no color, no terminal-width queries).
 
 Only `test` blocks declared in the current project's own modules are collected by
 default; tests in dependency modules are excluded unless `--include-deps` is
@@ -204,13 +226,13 @@ passed.
 | `--list`            | —       | list the collected tests and exit |
 | `--runner <cmd>`    | command | launch every test as `<cmd> <exe>` instead of exec'ing it directly |
 
-Plus the `build` and global flags. `--runner` has the same semantics as on
-`mach run`: a single command name or path (no shell-style word splitting),
-resolved on `PATH`, for foreign-target tests the host cannot exec directly —
-e.g. `mach test . --target windows --runner wine`. Without it, a test executable
-the host cannot launch reports a per-test failure — `FAIL(exit 127)` when
-`execve` rejects the binary in the spawned child, `FAIL(spawn)` when the spawn
-itself fails — with no auto-detection.
+Plus the `build` and global flags (`-v` lists every test). `--runner` has the
+same semantics as on `mach run`: a single command name or path (no shell-style
+word splitting), resolved on `PATH`, for foreign-target tests the host cannot
+exec directly — e.g. `mach test . --target windows --runner wine`. Without it, a
+test executable the host cannot launch reports a per-test failure — `(exit 127)`
+when `execve` rejects the binary in the spawned child, `(spawn failed)` when the
+spawn itself fails — with no auto-detection.
 
 Exit codes: `0` all passed, `1` any failed, `2` build/internal error.
 
