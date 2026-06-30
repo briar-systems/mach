@@ -3932,3 +3932,117 @@ test "mach.lang.target.of.elf.patch_plt_fixups:eager_call_sites" {
     if (bad) { ret 1; }
     ret 0;
 }
+
+# emit_pie_exec frames a position-independent ET_DYN: no PT_INTERP, a PT_DYNAMIC
+# whose .dynamic lists DT_RELA/RELASZ/RELAENT/RELACOUNT, and a .rela.dyn holding one
+# R_*_RELATIVE per in-image absolute pointer (r_offset = the pointer's link-time
+# vaddr, r_addend = its link-time value). asserts the written image against the
+# static-PIE layout.
+test "mach.lang.target.of.elf.emit_pie_exec:static_pie_layout" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id            = isa.ARCH_X86_64;
+    isa_vt.elf_machine   = 62;       # EM_X86_64
+    isa_vt.pointer_width = 8;
+
+    # one executable load segment, laid out PIE-relative (base + one-page header gap).
+    var text: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text[k] = 0x90; k = k + 1; }
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = 0x401000; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text[0];
+
+    # one in-image absolute pointer at vaddr 0x401008 holding the link-time 0x401000.
+    var brs: [1]of.BaseReloc;
+    brs[0].seg_index = 0; brs[0].seg_offset = 8; brs[0].target = 0x401000;
+
+    var dyn: of.DynamicInfo;
+    dyn.libs = nil;            dyn.lib_count = 0;
+    dyn.imports = nil;         dyn.import_count = 0;
+    dyn.interp = intern.STR_NIL;
+    dyn.base_relocs = ?brs[0]; dyn.base_reloc_count = 1;
+    dyn.pie = true;
+
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "elf_pie");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val tpath: str = filesystem.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_pie_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1, 0x401000, ?dyn, tpath::*u8);
+    if (R.is_err[bool, str](em)) { filesystem.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tpath);
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_err[filesystem.Buffer, str](rb)) { ret 1; }
+    val buf: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rb);
+
+    var bad: bool = false;
+
+    # ET_DYN.
+    if (bin.read_u16_le(buf.data, 16) != ET_DYN) { bad = true; }
+
+    # walk the program headers: locate PT_DYNAMIC and confirm there is no PT_INTERP.
+    val e_phoff: usize = bin.read_u64_le(buf.data, 32)::usize;
+    val e_phnum: usize = bin.read_u16_le(buf.data, 56)::usize;
+    var dyn_foff: usize = 0;
+    var have_interp: bool = false;
+    var ph: usize = 0;
+    for (ph < e_phnum) {
+        val po: usize = e_phoff + ph * PHDR_SIZE;
+        val pt: u32 = bin.read_u32_le(buf.data, po);
+        if (pt == PT_DYNAMIC) { dyn_foff = bin.read_u64_le(buf.data, po + 8)::usize; }
+        if (pt == PT_INTERP)  { have_interp = true; }
+        ph = ph + 1;
+    }
+    if (have_interp)  { bad = true; }
+    if (dyn_foff == 0) { bad = true; }
+
+    # .dynamic: DT_RELA (the .rela.dyn vaddr) + RELASZ/RELAENT/RELACOUNT.
+    var rela_va: u64 = 0;
+    var relasz:  u64 = 0;
+    var relaent: u64 = 0;
+    var relacnt: u64 = 0;
+    var d: usize = dyn_foff;
+    var seen: u32 = 0;
+    for (seen < 32) {
+        val tag: u64 = bin.read_u64_le(buf.data, d);
+        val v:   u64 = bin.read_u64_le(buf.data, d + 8);
+        if (tag == DT_RELA)      { rela_va = v; }
+        if (tag == DT_RELASZ)    { relasz  = v; }
+        if (tag == DT_RELAENT)   { relaent = v; }
+        if (tag == DT_RELACOUNT) { relacnt = v; }
+        if (tag == DT_NULL) { seen = 32; } or { d = d + DYN_SIZE; seen = seen + 1; }
+    }
+    if (rela_va == 0)  { bad = true; }
+    if (relasz != 24)  { bad = true; }
+    if (relaent != 24) { bad = true; }
+    if (relacnt != 1)  { bad = true; }
+
+    # the .rela.dyn entry: map its vaddr to a file offset through the containing
+    # PT_LOAD, then assert the R_X86_64_RELATIVE record.
+    var rela_off: usize = 0;
+    ph = 0;
+    for (ph < e_phnum) {
+        val po: usize = e_phoff + ph * PHDR_SIZE;
+        if (bin.read_u32_le(buf.data, po) == PT_LOAD) {
+            val pf:  u64 = bin.read_u64_le(buf.data, po + 8);
+            val pv:  u64 = bin.read_u64_le(buf.data, po + 16);
+            val psz: u64 = bin.read_u64_le(buf.data, po + 32);
+            if (rela_va >= pv && rela_va < pv + psz) { rela_off = (pf + (rela_va - pv))::usize; }
+        }
+        ph = ph + 1;
+    }
+    if (rela_off == 0) { bad = true; }
+    or {
+        if (bin.read_u64_le(buf.data, rela_off) != 0x401008)                  { bad = true; }
+        if (bin.read_u64_le(buf.data, rela_off + 8) != R_X86_64_RELATIVE::u64) { bad = true; }
+        if (bin.read_u64_le(buf.data, rela_off + 16) != 0x401000)             { bad = true; }
+    }
+
+    if (bad) { ret 1; }
+    ret 0;
+}
