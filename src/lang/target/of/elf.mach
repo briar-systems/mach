@@ -54,6 +54,7 @@ val ELFOSABI_NONE: u8 = 0;
 # ELF object file types.
 val ET_REL:  u16 = 1;
 val ET_EXEC: u16 = 2;
+val ET_DYN:  u16 = 3;
 
 # ELF section header types.
 val SHT_PROGBITS: u32 = 1;
@@ -152,6 +153,12 @@ val R_X86_64_JUMP_SLOT:  u32 = 7;
 val R_AARCH64_JUMP_SLOT: u32 = 1026;
 val R_RISCV_JUMP_SLOT:   u32 = 5;
 
+# ELF base (load-bias) relocation types: the loader adds the image's load bias to
+# the slot. one per in-image absolute pointer in a PIE image's `.rela.dyn`.
+val R_X86_64_RELATIVE:  u32 = 8;
+val R_AARCH64_RELATIVE: u32 = 1027;
+val R_RISCV_RELATIVE:   u32 = 3;
+
 # ELF `.dynamic` tag ids consumed by the loader. only the tags a minimal
 # dynamically-linked PLT image needs are listed.
 val DT_NULL:     u64 = 0;
@@ -163,10 +170,14 @@ val DT_STRTAB:   u64 = 5;
 val DT_SYMTAB:   u64 = 6;
 val DT_STRSZ:    u64 = 10;
 val DT_SYMENT:   u64 = 11;
+val DT_RELA:     u64 = 7;
+val DT_RELASZ:   u64 = 8;
+val DT_RELAENT:  u64 = 9;
 val DT_PLTREL:   u64 = 20;
 val DT_JMPREL:   u64 = 23;
 val DT_BIND_NOW: u64 = 24;
 val DT_FLAGS:    u64 = 30;
+val DT_RELACOUNT: u64 = 0x6FFFFFF9;
 
 # DT_PLTREL value declaring the PLT relocations use the RELA (addend-bearing)
 # form - the only form this writer emits.
@@ -1403,6 +1414,247 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
     ret R.ok[bool, str](true);
 }
 
+# write a position-independent (PIE / ET_DYN) static executable for linux ASLR
+#
+# A static-PIE: an ET_DYN image the kernel loads at a randomized base, self-relocated
+# by the program's own startup (mach-std's relocation pass) before main - there is no
+# PT_INTERP and no run-time loader. The only relocations are the in-image absolute
+# pointers the linker collected as the format-neutral `BaseReloc` set; each becomes an
+# `R_*_RELATIVE` entry in a synthesized `.rela.dyn`, and a minimal `.dynamic`
+# (DT_RELA/DT_RELASZ/DT_RELAENT/DT_RELACOUNT) plus a PT_DYNAMIC let the startup find
+# them. The linker laid the segments out PIE-relative (a one-page header gap above the
+# base), so the writer extends the first segment down to cover the ELF header and the
+# program headers, exactly as the dynamic writer does, and a PT_PHDR lets the startup
+# recover the load bias from the kernel's AT_PHDR.
+#
+# Segment vaddrs and the entry are link-time addresses; the kernel adds a load bias and
+# the startup slides every RELATIVE slot by it. An image with zero base relocations is
+# still valid (an empty .rela.dyn).
+# ---
+# alloc:     allocator for the output buffer and the segment-offset scratch
+# itn:       interner backing any I/O error message
+# tgt_isa:   the instruction-set vtable selecting the ELF machine + RELATIVE type
+# segs:      the linker's loadable segments, ascending virtual-address order
+# seg_count: number of segments
+# entry:     program entry-point virtual address (link-time)
+# dyn:       the dynamic-link plan carrying the base-relocation set
+# path:      null-terminated output file path
+# ret:       ok(true) on success, or an error string
+fun emit_pie_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTable,
+                  segs: *of.LoadSegment, seg_count: u32, entry: u64,
+                  dyn: *of.DynamicInfo, path: *u8) R.Result[bool, str] {
+    val nrel: u32 = dyn.base_reloc_count;
+
+    # the highest virtual address the linker's segments reach; the synthesized
+    # .rela.dyn/.dynamic are placed page-aligned above it.
+    var hi_va: u64 = 0;
+    var li: u32 = 0;
+    for (li < seg_count) {
+        val end: u64 = segs[li].vaddr + segs[li].memsz::u64;
+        if (end > hi_va) { hi_va = end; }
+        li = li + 1;
+    }
+
+    # program headers: PT_PHDR + one PT_LOAD per linker segment + the synthesized RO
+    # PT_LOAD (.rela.dyn/.dynamic) + PT_DYNAMIC. the first linker segment also maps the
+    # ELF header + phdrs (extended down a page), so no separate header PT_LOAD.
+    val phdr_count: u32 = seg_count + 3;
+    val phdr_offset: usize = ELF_HEADER_SIZE;
+    val phdr_table_size: usize = phdr_count::usize * PHDR_SIZE;
+
+    # per-segment file offsets, page-aligned so `offset % page == vaddr % page` holds.
+    var struct_file: usize = bin.align_up(phdr_offset + phdr_table_size, EXEC_PAGE_SIZE::usize);
+    var seg_offsets: *usize = nil;
+    if (seg_count > 0) {
+        val ro: R.Result[*usize, str] = A.zallocate[usize](alloc, seg_count::usize);
+        if (R.is_err[*usize, str](ro)) { ret R.err[bool, str]("elf: pie seg-offset alloc failed"); }
+        seg_offsets = R.unwrap_ok[*usize, str](ro);
+        li = 0;
+        for (li < seg_count) {
+            struct_file = bin.align_up(struct_file, EXEC_PAGE_SIZE::usize);
+            seg_offsets[li] = struct_file;
+            struct_file = struct_file + segs[li].filesz;
+            li = li + 1;
+        }
+    }
+
+    # the synthesized read-only segment: .rela.dyn (Elf64_Rela[nrel]) then .dynamic,
+    # page-aligned above the linker segments. file offset and vaddr advance in lockstep.
+    val ro_off: usize = bin.align_up(struct_file, EXEC_PAGE_SIZE::usize);
+    val ro_va:  u64   = bin.align_up_u64(hi_va, EXEC_PAGE_SIZE);
+    val reladyn_off:  usize = ro_off;
+    val reladyn_va:   u64   = ro_va;
+    val reladyn_size: usize = nrel::usize * RELA_SIZE;
+
+    val dyn_off: usize = bin.align_up(reladyn_off + reladyn_size, 8);
+    val dyn_va:  u64   = bin.align_up_u64(reladyn_va + reladyn_size::u64, 8);
+    # .dynamic: DT_RELA/RELASZ/RELAENT/RELACOUNT (when there are relocations) + DT_NULL.
+    var dyn_entries: u32 = 1;
+    if (nrel > 0) { dyn_entries = dyn_entries + 4; }
+    val dyn_size: usize = dyn_entries::usize * DYN_SIZE;
+
+    val total_size: usize = dyn_off + dyn_size;
+    val ro_size: usize = total_size - ro_off;
+
+    val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_size);
+    if (R.is_err[*u8, str](res_buf)) {
+        if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+        ret R.err[bool, str]("elf: pie buffer alloc failed");
+    }
+    var buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
+
+    # ELF header: ET_DYN, e_shoff = 0 (a runtime image, not a tooling object).
+    buf[0] = 0x7F; buf[1] = 0x45; buf[2] = 0x4C; buf[3] = 0x46;
+    buf[4] = elf_class_for(tgt_isa); buf[5] = ELFDATA2LSB; buf[6] = EV_CURRENT; buf[7] = ELFOSABI_NONE;
+    bin.write_u16_le(buf, 16, ET_DYN);
+    bin.write_u16_le(buf, 18, tgt_isa.elf_machine::u16);
+    bin.write_u32_le(buf, 20, 1);
+    bin.write_u64_le(buf, 24, entry);
+    bin.write_u64_le(buf, 32, phdr_offset::u64);
+    bin.write_u64_le(buf, 40, 0);
+    bin.write_u32_le(buf, 48, 0);
+    bin.write_u16_le(buf, 52, ELF_HEADER_SIZE::u16);
+    bin.write_u16_le(buf, 54, PHDR_SIZE::u16);
+    bin.write_u16_le(buf, 56, phdr_count::u16);
+    bin.write_u16_le(buf, 58, SHDR_SIZE::u16);
+    bin.write_u16_le(buf, 60, 0);
+    bin.write_u16_le(buf, 62, 0);
+
+    # copy the linker's segment bytes into their file offsets.
+    li = 0;
+    for (li < seg_count) {
+        if (segs[li].bytes != nil && segs[li].filesz > 0) {
+            memory.raw_copy((buf::usize + seg_offsets[li])::ptr, segs[li].bytes::ptr, segs[li].filesz);
+        }
+        li = li + 1;
+    }
+
+    # .rela.dyn: one R_*_RELATIVE per in-image absolute pointer. r_offset is the
+    # pointer's link-time vaddr, r_addend the link-time absolute value stored there; the
+    # startup writes load_bias + addend, sliding the slot to its run-time target.
+    val rel_type: u32 = relative_type_for(tgt_isa.id);
+    var ri: u32 = 0;
+    for (ri < nrel) {
+        val br: *of.BaseReloc = ?dyn.base_relocs[ri];
+        var loc_va: u64 = 0;
+        if (br.seg_index < seg_count) { loc_va = segs[br.seg_index].vaddr + br.seg_offset::u64; }
+        val rela_off: usize = reladyn_off + ri::usize * RELA_SIZE;
+        bin.write_u64_le(buf, rela_off, loc_va);
+        bin.write_u64_le(buf, rela_off + 8, rel_type::u64);
+        bin.write_u64_le(buf, rela_off + 16, br.target);
+        ri = ri + 1;
+    }
+
+    # .dynamic: only what the self-relocation startup reads.
+    var dpos: usize = dyn_off;
+    if (nrel > 0) {
+        dpos = write_dyn_entry(buf, dpos, DT_RELA,      reladyn_va);
+        dpos = write_dyn_entry(buf, dpos, DT_RELASZ,    reladyn_size::u64);
+        dpos = write_dyn_entry(buf, dpos, DT_RELAENT,   RELA_SIZE::u64);
+        dpos = write_dyn_entry(buf, dpos, DT_RELACOUNT, nrel::u64);
+    }
+    dpos = write_dyn_entry(buf, dpos, DT_NULL, 0);
+
+    write_pie_phdrs(buf, phdr_offset, phdr_count, segs, seg_offsets, seg_count,
+                    ro_off, ro_va, ro_size, dyn_off, dyn_va, dyn_size, dyn);
+
+    if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+
+    val res_file: R.Result[filesystem.File, str] = filesystem.create(path, 0o755);
+    if (R.is_err[filesystem.File, str](res_file)) {
+        val cm: str = bin.io_message(itn, alloc, "elf: cannot create PIE executable", path::str, R.unwrap_err[filesystem.File, str](res_file), "elf: could not create PIE executable file");
+        A.deallocate[u8](alloc, buf, total_size);
+        ret R.err[bool, str](cm);
+    }
+    var f: filesystem.File = R.unwrap_ok[filesystem.File, str](res_file);
+    val res_write: R.Result[usize, str] = filesystem.write(?f, buf, total_size);
+    filesystem.close(?f);
+    A.deallocate[u8](alloc, buf, total_size);
+
+    if (R.is_err[usize, str](res_write)) { ret R.err[bool, str](bin.io_message(itn, alloc, "elf: pie write failed on", path::str, R.unwrap_err[usize, str](res_write), "elf: pie write failed")); }
+    ret R.ok[bool, str](true);
+}
+
+# write the program-header table for a static-PIE executable
+#
+# PT_PHDR locates the table (so the kernel passes AT_PHDR and the startup recovers the
+# load bias); each linker segment is a PT_LOAD, the first extended down one page to file
+# offset 0 so a single PT_LOAD covers the ELF header + program headers with no
+# overlapping page; the synthesized .rela.dyn/.dynamic share a read-only PT_LOAD; and
+# PT_DYNAMIC points the startup at the .dynamic table.
+# ---
+# buf:          the output buffer
+# phdr_offset:  byte offset of the program-header table in `buf`
+# phdr_count:   number of program headers
+# segs:         the linker's loadable segments
+# seg_offsets:  per-segment file offsets of the linker's segments
+# seg_count:    number of segments
+# ro_off/ro_va/ro_size:    the synthesized read-only segment (.rela.dyn + .dynamic)
+# dyn_off/dyn_va/dyn_size:  the .dynamic table
+# dyn:          the dynamic-link plan, for the per-segment writable check
+fun write_pie_phdrs(buf: *u8, phdr_offset: usize, phdr_count: u32,
+                    segs: *of.LoadSegment, seg_offsets: *usize, seg_count: u32,
+                    ro_off: usize, ro_va: u64, ro_size: usize,
+                    dyn_off: usize, dyn_va: u64, dyn_size: usize, dyn: *of.DynamicInfo) {
+    var pos: usize = phdr_offset;
+    val phdr_bytes: usize = phdr_count::usize * PHDR_SIZE;
+
+    # the page the ELF header + phdrs map at: one page below the first segment's base,
+    # so extending the first segment down to file offset 0 covers them.
+    var hdr_vaddr: u64 = 0;
+    if (seg_count > 0) { hdr_vaddr = (segs[0].vaddr & ~(EXEC_PAGE_SIZE - 1)) - EXEC_PAGE_SIZE; }
+
+    # PT_PHDR -> the program-header table (within the first, header-covering PT_LOAD).
+    pos = write_phdr(buf, pos, PT_PHDR, PF_R, phdr_offset, hdr_vaddr + phdr_offset::u64,
+                     phdr_bytes, phdr_bytes, 8);
+
+    var li: u32 = 0;
+    for (li < seg_count) {
+        if (li == 0) {
+            val first_filesz: usize = seg_offsets[0] + segs[0].filesz;
+            val first_memsz:  usize = seg_offsets[0] + segs[0].memsz;
+            pos = write_phdr(buf, pos, PT_LOAD, pie_seg_flags(segs, li, seg_count, dyn), 0,
+                             hdr_vaddr, first_filesz, first_memsz, EXEC_PAGE_SIZE);
+        }
+        or {
+            pos = write_phdr(buf, pos, PT_LOAD, pie_seg_flags(segs, li, seg_count, dyn), seg_offsets[li],
+                             segs[li].vaddr, segs[li].filesz, segs[li].memsz, EXEC_PAGE_SIZE);
+        }
+        li = li + 1;
+    }
+
+    # the synthesized .rela.dyn/.dynamic read-only segment.
+    pos = write_phdr(buf, pos, PT_LOAD, PF_R, ro_off, ro_va, ro_size, ro_size, EXEC_PAGE_SIZE);
+    # PT_DYNAMIC -> the .dynamic table.
+    pos = write_phdr(buf, pos, PT_DYNAMIC, PF_R, dyn_off, dyn_va, dyn_size, dyn_size, 8);
+}
+
+# the program-header permission flags for PIE load segment `li`
+#
+# A static-PIE has no run-time loader to set up RELRO, so any segment holding an
+# in-image absolute pointer (a `.rela.dyn` RELATIVE target) must be writable when the
+# self-relocation startup slides it - including an otherwise read-only data segment.
+# This trades the read-only hardening of relocated constants for a working static-PIE;
+# a proper PT_GNU_RELRO (mapped writable, relocated, then re-protected) is a later
+# refinement.
+# ---
+# segs:      the linker's loadable segments
+# li:        the segment index
+# seg_count: number of segments (bounds the reloc scan's segment ids)
+# dyn:       the dynamic-link plan whose base relocations are scanned
+# ret:       the PF_* flags, with PF_W forced when the segment bears a base relocation
+fun pie_seg_flags(segs: *of.LoadSegment, li: u32, seg_count: u32, dyn: *of.DynamicInfo) u32 {
+    var f: u32 = pf_flags_for(segs[li].flags);
+    var i: u32 = 0;
+    for (i < dyn.base_reloc_count) {
+        if (dyn.base_relocs[i].seg_index == li && dyn.base_relocs[i].seg_index < seg_count) {
+            ret f | PF_W;
+        }
+        i = i + 1;
+    }
+    ret f;
+}
+
 # the ELF machine JUMP_SLOT (PLT) relocation type for an ISA
 #
 # Defaults to the x86-64 type for an unrecognized ISA.
@@ -1413,6 +1665,18 @@ fun jump_slot_for(arch_id: u32) u32 {
     if (arch_id == isa.ARCH_AARCH64) { ret R_AARCH64_JUMP_SLOT; }
     if (arch_id == isa.ARCH_RISCV64) { ret R_RISCV_JUMP_SLOT; }
     ret R_X86_64_JUMP_SLOT;
+}
+
+# the ELF machine RELATIVE (load-bias) relocation type for an ISA
+#
+# Defaults to the x86-64 type for an unrecognized ISA.
+# ---
+# arch_id: the target ISA id
+# ret:     the ELF R_*_RELATIVE relocation type
+fun relative_type_for(arch_id: u32) u32 {
+    if (arch_id == isa.ARCH_AARCH64) { ret R_AARCH64_RELATIVE; }
+    if (arch_id == isa.ARCH_RISCV64) { ret R_RISCV_RELATIVE; }
+    ret R_X86_64_RELATIVE;
 }
 
 # whether `emit_dyn_exec` can frame a dynamic image for an ISA
@@ -1580,6 +1844,20 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
     # no stub encoding for it.
     if (!dyn_arch_supported(tgt_isa.id)) {
         ret R.err[bool, str]("elf: dynamic linking is not implemented for this architecture");
+    }
+
+    # a position-independent image (--pie, linux ASLR) takes the static-PIE path: an
+    # ET_DYN executable self-relocated by its own runtime startup, with no PT_INTERP,
+    # no dynamic symbol table, and no PLT. it carries only the in-image absolute
+    # pointers as `.rela.dyn` RELATIVE entries. dynamic imports alongside PIE (a
+    # ld.so-loaded dynamic-PIE) are not yet supported - a no-libc linux executable
+    # never has them, and mixing the self-relocating path with a run-time loader needs
+    # its own design.
+    if (dyn.pie) {
+        if (dyn.import_count > 0 || dyn.lib_count > 0) {
+            ret R.err[bool, str]("elf: PIE with dynamic imports is not supported (static-PIE only)");
+        }
+        ret emit_pie_exec(alloc, itn, tgt_isa, segs, seg_count, entry, dyn, path);
     }
 
     val nimp: u32 = func_import_count(dyn);
@@ -3678,6 +3956,120 @@ test "mach.lang.target.of.elf.patch_plt_fixups:eager_call_sites" {
     if (bin.read_u32_le(buf, 0x114) != 0x000080E7) { bad = true; }
 
     A.deallocate[u8](?alloc, buf, 0x200);
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+# emit_pie_exec frames a position-independent ET_DYN: no PT_INTERP, a PT_DYNAMIC
+# whose .dynamic lists DT_RELA/RELASZ/RELAENT/RELACOUNT, and a .rela.dyn holding one
+# R_*_RELATIVE per in-image absolute pointer (r_offset = the pointer's link-time
+# vaddr, r_addend = its link-time value). asserts the written image against the
+# static-PIE layout.
+test "mach.lang.target.of.elf.emit_pie_exec:static_pie_layout" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id            = isa.ARCH_X86_64;
+    isa_vt.elf_machine   = 62;       # EM_X86_64
+    isa_vt.pointer_width = 8;
+
+    # one executable load segment, laid out PIE-relative (base + one-page header gap).
+    var text: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text[k] = 0x90; k = k + 1; }
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = 0x401000; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text[0];
+
+    # one in-image absolute pointer at vaddr 0x401008 holding the link-time 0x401000.
+    var brs: [1]of.BaseReloc;
+    brs[0].seg_index = 0; brs[0].seg_offset = 8; brs[0].target = 0x401000;
+
+    var dyn: of.DynamicInfo;
+    dyn.libs = nil;            dyn.lib_count = 0;
+    dyn.imports = nil;         dyn.import_count = 0;
+    dyn.interp = intern.STR_NIL;
+    dyn.base_relocs = ?brs[0]; dyn.base_reloc_count = 1;
+    dyn.pie = true;
+
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "elf_pie");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val tpath: str = filesystem.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_pie_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1, 0x401000, ?dyn, tpath::*u8);
+    if (R.is_err[bool, str](em)) { filesystem.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tpath);
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_err[filesystem.Buffer, str](rb)) { ret 1; }
+    val buf: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rb);
+
+    var bad: bool = false;
+
+    # ET_DYN.
+    if (bin.read_u16_le(buf.data, 16) != ET_DYN) { bad = true; }
+
+    # walk the program headers: locate PT_DYNAMIC and confirm there is no PT_INTERP.
+    val e_phoff: usize = bin.read_u64_le(buf.data, 32)::usize;
+    val e_phnum: usize = bin.read_u16_le(buf.data, 56)::usize;
+    var dyn_foff: usize = 0;
+    var have_interp: bool = false;
+    var ph: usize = 0;
+    for (ph < e_phnum) {
+        val po: usize = e_phoff + ph * PHDR_SIZE;
+        val pt: u32 = bin.read_u32_le(buf.data, po);
+        if (pt == PT_DYNAMIC) { dyn_foff = bin.read_u64_le(buf.data, po + 8)::usize; }
+        if (pt == PT_INTERP)  { have_interp = true; }
+        ph = ph + 1;
+    }
+    if (have_interp)  { bad = true; }
+    if (dyn_foff == 0) { bad = true; }
+
+    # .dynamic: DT_RELA (the .rela.dyn vaddr) + RELASZ/RELAENT/RELACOUNT.
+    var rela_va: u64 = 0;
+    var relasz:  u64 = 0;
+    var relaent: u64 = 0;
+    var relacnt: u64 = 0;
+    var d: usize = dyn_foff;
+    var seen: u32 = 0;
+    for (seen < 32) {
+        val tag: u64 = bin.read_u64_le(buf.data, d);
+        val v:   u64 = bin.read_u64_le(buf.data, d + 8);
+        if (tag == DT_RELA)      { rela_va = v; }
+        if (tag == DT_RELASZ)    { relasz  = v; }
+        if (tag == DT_RELAENT)   { relaent = v; }
+        if (tag == DT_RELACOUNT) { relacnt = v; }
+        if (tag == DT_NULL) { seen = 32; } or { d = d + DYN_SIZE; seen = seen + 1; }
+    }
+    if (rela_va == 0)  { bad = true; }
+    if (relasz != 24)  { bad = true; }
+    if (relaent != 24) { bad = true; }
+    if (relacnt != 1)  { bad = true; }
+
+    # the .rela.dyn entry: map its vaddr to a file offset through the containing
+    # PT_LOAD, then assert the R_X86_64_RELATIVE record.
+    var rela_off: usize = 0;
+    ph = 0;
+    for (ph < e_phnum) {
+        val po: usize = e_phoff + ph * PHDR_SIZE;
+        if (bin.read_u32_le(buf.data, po) == PT_LOAD) {
+            val pf:  u64 = bin.read_u64_le(buf.data, po + 8);
+            val pv:  u64 = bin.read_u64_le(buf.data, po + 16);
+            val psz: u64 = bin.read_u64_le(buf.data, po + 32);
+            if (rela_va >= pv && rela_va < pv + psz) { rela_off = (pf + (rela_va - pv))::usize; }
+        }
+        ph = ph + 1;
+    }
+    if (rela_off == 0) { bad = true; }
+    or {
+        if (bin.read_u64_le(buf.data, rela_off) != 0x401008)                  { bad = true; }
+        if (bin.read_u64_le(buf.data, rela_off + 8) != R_X86_64_RELATIVE::u64) { bad = true; }
+        if (bin.read_u64_le(buf.data, rela_off + 16) != 0x401000)             { bad = true; }
+    }
+
     if (bad) { ret 1; }
     ret 0;
 }
