@@ -31,11 +31,12 @@ matched exactly: `--flag value` (a value follows in the next argument) or a bare
 ## Global flags
 
 Read by `build`, `run`, `test`, and `doc` (they share one config parser).
-`--verbose` and `--quiet` together is a parse error.
+A verbosity flag (`-v`/`-vv`) and `--quiet` together is a parse error.
 
 | Flag             | Value            | Effect |
 |------------------|------------------|--------|
-| `--verbose`, `-v`| —                | write extra detail (per-stage compile progress) to stderr |
+| `-v`             | —                | `mach build`: per-phase roll-up (load/resolve/sema/lower/optimize/codegen/link) with item counts + timing, then a `built … N modules … in …` summary, on stderr |
+| `-vv`            | —                | `-v` plus a per-module/file line under each phase with its duration and a `(slow)` marker on the slowest |
 | `--quiet`, `-q`  | —                | suppress non-error output |
 | `--color <mode>` | `auto`\|`always`\|`never` | color preference for terminal output (default `auto`); an unknown mode is a parse error |
 | `--target <name>`| target name      | select a declared target; absent, defers to `[project].target` |
