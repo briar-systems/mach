@@ -13,6 +13,15 @@
 # the harness is the same on every OS (git-bash on windows, bash on linux/macOS);
 # the only target-specific knowledge it holds is the run-mode looked up per target
 # from targets.conf.
+#
+# LEG vs BUILD-TARGET. --target names the LEG: the runner the harness runs on (and
+# the target an exec case builds + runs). a structural case (field / flat-loader)
+# inspects or loads a binary host-side and does not execute it on the target's
+# runner, so it builds a different format than the leg: case.conf `build-target`
+# names the mach target to compile (defaulting to the leg), and the structural
+# golden is keyed by build-target (expect.<build-target>.txt). this lets, e.g., a
+# PE-ASLR or macho-PIE field case cross-build its format on the cheap linux leg and
+# `od` it there, per-PR, with no runner of the format's own OS.
 set -eu
 
 usage() {
@@ -107,6 +116,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     case_exempt=
     case_profiles="debug release"
     case_run=exec
+    case_build_target=
     if [ -f "$dir/case.conf" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
             case "$line" in ''|\#*) continue ;; esac
@@ -115,10 +125,11 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
             key=$(echo "$key" | tr -d '[:space:]')
             value=$(echo "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
             case "$key" in
-                targets)  case_targets=$value ;;
-                exempt)   case_exempt=$value ;;
-                profiles) case_profiles=$value ;;
-                run)      case_run=$value ;;
+                targets)        case_targets=$value ;;
+                exempt)         case_exempt=$value ;;
+                profiles)       case_profiles=$value ;;
+                run)            case_run=$value ;;
+                build-target)   case_build_target=$value ;;
                 *) echo "run.sh: $case_id/case.conf: unknown key '$key'" >&2; exit 2 ;;
             esac
         done < "$dir/case.conf"
@@ -134,11 +145,14 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     if ! in_list "$target" "$allow"; then continue; fi
     if in_list "$target" "$case_exempt"; then continue; fi
 
-    # the golden is shared across targets for exec (target-independent output) and
-    # per-target for structural producers (deferred to #1760).
+    # the mach target to compile: the build-target if set, else the leg itself.
+    build_target=${case_build_target:-$target}
+
+    # the golden is shared across build-targets for exec (target-independent output)
+    # and per-build-target for structural producers (their fact is format-specific).
     case "$case_run" in
         exec) golden="$dir/expect.txt" ;;
-        *)    golden="$dir/expect.$target.txt" ;;
+        *)    golden="$dir/expect.$build_target.txt" ;;
     esac
 
     for profile in $case_profiles; do
@@ -155,7 +169,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
         rm -rf "$dir/out/int"
         mkdir -p "$dir/out/int"
 
-        if ! (cd "$dir" && "$compiler" dep pull && "$compiler" build . --target "$target" --profile "$profile" -o "$relbin") >"$tmp/build.log" 2>&1; then
+        if ! (cd "$dir" && "$compiler" dep pull && "$compiler" build . --target "$build_target" --profile "$profile" -o "$relbin") >"$tmp/build.log" 2>&1; then
             echo "FAIL $label (build)"
             sed 's/^/    /' "$tmp/build.log" >&2
             fails=$((fails + 1))

@@ -4,8 +4,19 @@
 # stdout, which run.sh diffs against the golden. the producer is the only thing
 # that varies between verification modes; the golden-diff core does not change.
 #
-# v1 implements the `exec` producer (run the program, observe its stdout). the
-# `field` and `flat-loader` producers are stubs deferred to #1760.
+# producers:
+#   exec        — run the program, observe its stdout (native / qemu).
+#   field       — coreutils (od/dd) reads of known header offsets, for format facts
+#                 execution cannot observe (PE ASLR bit, macho PIE bit). dispatched
+#                 on the artifact's own magic, so it is independent of how the case
+#                 maps to a leg. no LLVM; reads little-endian fields (every runner is LE).
+#   flat-loader — load an os=freestanding, of=raw flat image via a tiny C loader
+#                 (mmap + jump) and report the image's exit status.
+
+# the directory this file lives in (int/lib), used to find flat_loader.c. resolved
+# from the sourced path so it does not depend on run.sh's variables.
+_produce_lib_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+_flat_loader_bin=
 
 # produce_exec <runmode> <target> <binary>
 # runs the built binary and forwards its stdout as the observable. native mode
@@ -23,16 +34,61 @@ produce_exec() {
     fi
 }
 
-# produce_field — coreutils-header structural read; deferred to #1760.
-produce_field() {
-    echo "int: 'field' producer is deferred to #1760" >&2
-    return 2
+# read_le_uint <file> <offset> <size>
+# print the unsigned little-endian integer of <size> bytes (2 or 4) at <offset>.
+# od reads in host byte order; every CI runner is little-endian.
+read_le_uint() {
+    dd if="$1" bs=1 skip="$2" count="$3" 2>/dev/null | od -An -tu"$3" | tr -d ' \n'
 }
 
-# produce_flat_loader — freestanding flat-image load + run; deferred to #1760.
+# field_pe <binary> — the PE ASLR fact. DllCharacteristics is a u16 in the optional
+# header (at e_lfanew + 4 PE-sig + 20 COFF + 0x46 = e_lfanew + 0x5e); the
+# DYNAMIC_BASE bit (0x40) is IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE.
+field_pe() {
+    bin=$1
+    elfanew=$(read_le_uint "$bin" 60 4)
+    dllchar=$(read_le_uint "$bin" $((elfanew + 0x5e)) 2)
+    echo "DYNAMIC_BASE=$(( (dllchar & 0x40) != 0 ))"
+}
+
+# field_macho <binary> — the macho PIE fact. the mach_header's flags is a u32 at
+# offset 24 (after magic/cputype/cpusubtype/filetype/ncmds/sizeofcmds); MH_PIE is
+# 0x200000.
+field_macho() {
+    bin=$1
+    flags=$(read_le_uint "$bin" 24 4)
+    echo "PIE=$(( (flags & 0x200000) != 0 ))"
+}
+
+# produce_field <runmode> <target> <binary>
+# emits the canonical structural fact for the artifact's format, dispatched on its
+# leading magic bytes so the reader is independent of the leg the case ran on.
+produce_field() {
+    bin=$3
+    magic=$(dd if="$bin" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    case "$magic" in
+        4d5a*)     field_pe "$bin" ;;       # 'MZ' DOS stub -> PE/COFF
+        cffaedfe*) field_macho "$bin" ;;    # MH_MAGIC_64 (little-endian)
+        *) echo "int: field: unrecognized binary format (magic $magic)" >&2; return 2 ;;
+    esac
+}
+
+# produce_flat_loader <runmode> <target> <binary>
+# loads the freestanding raw image through the C loader (built once, cached) and
+# reports the image's exit status as the observable. any stdout the image writes
+# flows first. a loader-infrastructure failure (no cc, mmap denied) returns nonzero.
 produce_flat_loader() {
-    echo "int: 'flat-loader' producer is deferred to #1760" >&2
-    return 2
+    bin=$3
+    if [ -z "$_flat_loader_bin" ]; then
+        _flat_loader_bin=$(mktemp -d)/flat_loader
+        if ! cc -O2 -o "$_flat_loader_bin" "$_produce_lib_dir/flat_loader.c" 2>&1; then
+            echo "int: flat-loader: could not build the C loader (cc required)" >&2
+            _flat_loader_bin=
+            return 2
+        fi
+    fi
+    if "$_flat_loader_bin" "$bin"; then ec=0; else ec=$?; fi
+    printf 'exit=%d\n' "$ec"
 }
 
 # produce <run> <runmode> <target> <binary>
