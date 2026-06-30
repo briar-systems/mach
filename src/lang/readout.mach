@@ -1,0 +1,326 @@
+# build-progress readout - the timed phase roll-up behind `mach build -v`/`-vv`.
+#
+# A single Readout, attached to the Session for the span of one build, collects
+# the seven compile phases (load, resolve, sema, lower, optimize, codegen, link)
+# as the front-end (driver) and back-end (cmd.build) walk the module graph. Each
+# phase is bracketed by `phase_begin`/`phase_end`; each module or file inside a
+# phase is timed with `item_begin`/`item`. At `-v` only the per-phase roll-up
+# line prints; at `-vv` every item prints under its phase with a `(slow)` marker
+# on the slowest. `summary` closes a successful build with one recap line. All
+# output is fixed-width ASCII on stderr, multiplatform: timing comes from
+# `chrono.monotonic` and durations render through `chrono.format_duration`, with
+# columns aligned by the `{:<N}`/`{:N}` format spec. A nil Readout (level 0, the
+# default) makes every call a no-op, so a plain build stays silent.
+
+use std.print;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use R: std.types.result;
+use ctime: std.chrono.time;
+use cdur:  std.chrono.duration;
+
+# phase identifiers, indexing the Readout's fixed phase table in emit order
+pub val PH_LOAD:     u8 = 0;  # read + lex + parse each module's source
+pub val PH_RESOLVE:  u8 = 1;  # name resolution per module
+pub val PH_SEMA:     u8 = 2;  # type checking per module
+pub val PH_LOWER:    u8 = 3;  # AST -> SSA IR per module
+pub val PH_OPTIMIZE: u8 = 4;  # the optimization pipeline per module
+pub val PH_CODEGEN:  u8 = 5;  # IR -> machine code per module
+pub val PH_LINK:     u8 = 6;  # link / emit the final artifact
+
+# number of phases (the fixed phase-table length)
+val PHASE_COUNT: u32 = 7;
+
+# verbosity levels
+pub val LEVEL_PHASES: u8 = 1;  # -v:  per-phase roll-up + summary
+pub val LEVEL_ITEMS:  u8 = 2;  # -vv: per-item detail under each phase
+
+# capacity (incl. terminator) of a rendered duration; 24 holds any i64 duration
+val DUR_CAP: usize = 24;
+
+# one timed item within a phase - a module or file and how long it took
+# ---
+# name: the item's display name (an interned FQN or file path, borrowed)
+# d:    the item's elapsed time
+rec Item {
+    name: str;
+    d:    cdur.Duration;
+}
+
+# a single phase's accumulator
+# ---
+# items:   the per-item array, grown on demand (only populated at -vv)
+# len:     number of populated items
+# cap:     allocated length of `items`
+# started: the phase's start instant, set by `phase_begin`
+rec Phase {
+    items:   *Item;
+    len:     u32;
+    cap:     u32;
+    started: ctime.Time;
+}
+
+# the build-wide readout state
+# ---
+# level:  verbosity (LEVEL_PHASES or LEVEL_ITEMS); never 0 for a live Readout
+# alloc:  allocator backing the per-phase item arrays
+# start:  the build's start instant, for the summary's total duration
+# phases: the per-phase accumulators, indexed by the PH_* ids
+pub rec Readout {
+    level:  u8;
+    alloc:  *A.Allocator;
+    start:  ctime.Time;
+    phases: [PHASE_COUNT]Phase;
+}
+
+# initialize a Readout for a build at verbosity `level`
+#
+# `level` is 1 (-v) or 2 (-vv); a plain build never constructs a Readout (the
+# Session simply holds a nil pointer). The build start instant is captured here.
+# ---
+# ro:    the Readout to initialize
+# alloc: allocator backing the per-phase item arrays
+# level: verbosity (LEVEL_PHASES or LEVEL_ITEMS)
+pub fun init(ro: *Readout, alloc: *A.Allocator, level: u8) {
+    ro.level = level;
+    ro.alloc = alloc;
+    ro.start = ctime.monotonic();
+    var i: u32 = 0;
+    for (i < PHASE_COUNT) {
+        val p: *Phase = ?ro.phases[i];
+        p.items = nil;
+        p.len   = 0;
+        p.cap   = 0;
+        i = i + 1;
+    }
+}
+
+# release any per-phase item arrays still held
+#
+# `phase_end` frees each phase's array as it renders, so this only reclaims
+# phases that were begun but never ended (an aborted build).
+# ---
+# ro: the Readout to tear down
+pub fun dnit(ro: *Readout) {
+    if (ro == nil) { ret; }
+    var i: u32 = 0;
+    for (i < PHASE_COUNT) {
+        free_items(ro, ?ro.phases[i]);
+        i = i + 1;
+    }
+}
+
+# mark the start of phase `ph`
+# ---
+# ro: the Readout, or nil to no-op
+# ph: the phase id (a PH_* constant)
+pub fun phase_begin(ro: *Readout, ph: u8) {
+    if (ro == nil) { ret; }
+    val p: *Phase = ?ro.phases[ph];
+    p.len     = 0;
+    p.started = ctime.monotonic();
+}
+
+# capture an item's start instant
+#
+# Returns the monotonic clock only at -vv, where per-item durations are shown;
+# at -v (or with a nil Readout) it returns the zero instant and `item` ignores
+# it, so item-level timing adds no overhead to a -v build.
+# ---
+# ro:  the Readout, or nil
+# ret: the item's start instant, or the zero instant when item timing is off
+pub fun item_begin(ro: *Readout) ctime.Time {
+    if (ro == nil || ro.level < LEVEL_ITEMS) { ret ctime.Time{sec: 0, nsec: 0}; }
+    ret ctime.monotonic();
+}
+
+# record one completed item in phase `ph`
+#
+# Only retained at -vv (the per-item display); a no-op otherwise. `name` is
+# borrowed and must stay valid until `phase_end` renders the phase (interned
+# FQNs and source paths both outlive the build).
+# ---
+# ro:    the Readout, or nil
+# ph:    the phase id (a PH_* constant)
+# name:  the item's display name (borrowed)
+# start: the instant returned by the matching `item_begin`
+pub fun item(ro: *Readout, ph: u8, name: str, start: ctime.Time) {
+    if (ro == nil || ro.level < LEVEL_ITEMS) { ret; }
+    val d: cdur.Duration = ctime.time_sub(ctime.monotonic(), start);
+    val p: *Phase = ?ro.phases[ph];
+    if (!ensure_item_cap(ro, p)) { ret; }
+    p.items[p.len].name = name;
+    p.items[p.len].d    = d;
+    p.len = p.len + 1;
+}
+
+# close phase `ph` and render it
+#
+# Prints the roll-up line `<phase>  <count> <noun>  <dur>` (`noun_one` when
+# `count` is 1, else `noun_many`), and at -vv every recorded item beneath it
+# with the slowest flagged `(slow)`. The phase's wall-clock duration is the
+# span since `phase_begin`. Frees the phase's item array.
+# ---
+# ro:       the Readout, or nil to no-op
+# ph:       the phase id (a PH_* constant)
+# count:    the item count for the roll-up (e.g. the module count)
+# noun_one: the singular unit noun (e.g. "module")
+# noun_many:the plural unit noun (e.g. "modules")
+pub fun phase_end(ro: *Readout, ph: u8, count: u32, noun_one: str, noun_many: str) {
+    if (ro == nil) { ret; }
+    val p: *Phase = ?ro.phases[ph];
+    val elapsed: cdur.Duration = ctime.time_sub(ctime.monotonic(), p.started);
+
+    var dbuf: [DUR_CAP]u8;
+    val dstr: str = cdur.format_duration(elapsed, ?dbuf[0], DUR_CAP);
+    var noun: str = noun_many;
+    if (count == 1) { noun = noun_one; }
+    print.eprintf("{:<9} {:3} {:<8} {:7}\n", phase_label(ph), count::i64, noun, dstr);
+
+    if (ro.level >= LEVEL_ITEMS) { render_items(p); }
+    free_items(ro, p);
+}
+
+# render a successful build's closing recap line
+#
+# `built <out>  <N> modules  [<size> <unit>  ]in <total>` - the size segment is
+# omitted when `has_size` is false (a library / object-only build has no single
+# binary). The total duration spans from `init`.
+# ---
+# ro:        the Readout, or nil to no-op
+# out:       the produced artifact's path (borrowed)
+# modules:   the module count
+# size:      the artifact size magnitude in `unit`
+# unit:      the size unit ("B"/"KB"/"MB")
+# has_size:  whether to print the size segment
+pub fun summary(ro: *Readout, out: str, modules: u32, size: i64, unit: str, has_size: bool) {
+    if (ro == nil) { ret; }
+    val total: cdur.Duration = ctime.time_sub(ctime.monotonic(), ro.start);
+    var dbuf: [DUR_CAP]u8;
+    val dstr: str = cdur.format_duration(total, ?dbuf[0], DUR_CAP);
+    if (has_size) {
+        print.eprintf("built {}  {} modules  {} {}  in {}\n", out, modules::i64, size, unit, dstr);
+    }
+    or {
+        print.eprintf("built {}  {} modules  in {}\n", out, modules::i64, dstr);
+    }
+}
+
+# split a byte count into a magnitude + unit for the summary
+#
+# Integer-only ASCII: bytes under 1 KiB stay bytes, under 1 MiB round to KB,
+# else round to MB. Used only by the build summary (no cross-area formatter is
+# warranted).
+# ---
+# bytes: the raw byte count
+# unit:  receives the chosen unit string ("B"/"KB"/"MB")
+# ret:   the magnitude in `unit`
+pub fun size_split(bytes: usize, unit: *str) i64 {
+    val b: i64 = bytes::i64;
+    if (b < 1024) {
+        @unit = "B";
+        ret b;
+    }
+    if (b < 1024 * 1024) {
+        @unit = "KB";
+        ret (b + 512) / 1024;
+    }
+    @unit = "MB";
+    ret (b + 512 * 1024) / (1024 * 1024);
+}
+
+# the fixed display label for phase `ph`
+# ---
+# ph:  the phase id (a PH_* constant)
+# ret: the phase's label
+fun phase_label(ph: u8) str {
+    if (ph == PH_LOAD)     { ret "load"; }
+    if (ph == PH_RESOLVE)  { ret "resolve"; }
+    if (ph == PH_SEMA)     { ret "sema"; }
+    if (ph == PH_LOWER)    { ret "lower"; }
+    if (ph == PH_OPTIMIZE) { ret "optimize"; }
+    if (ph == PH_CODEGEN)  { ret "codegen"; }
+    ret "link";
+}
+
+# print every recorded item of phase `p`, flagging the slowest with `(slow)`
+#
+# The slowest is marked only when the phase holds at least two items with a
+# positive duration, so a single-item phase carries no marker.
+# ---
+# p: the phase whose items to render
+fun render_items(p: *Phase) {
+    val slow: i64 = slowest_index(p);
+    var i: u32 = 0;
+    for (i < p.len) {
+        var dbuf: [DUR_CAP]u8;
+        val dstr: str = cdur.format_duration(p.items[i].d, ?dbuf[0], DUR_CAP);
+        if (i::i64 == slow) {
+            print.eprintf("  {:<32} {:7}  (slow)\n", p.items[i].name, dstr);
+        }
+        or {
+            print.eprintf("  {:<32} {:7}\n", p.items[i].name, dstr);
+        }
+        i = i + 1;
+    }
+}
+
+# the index of the slowest item in `p`, or -1 when no item should be flagged
+#
+# Returns -1 for a phase with fewer than two items, so a lone item is never
+# flagged as the slowest.
+# ---
+# p:   the phase to scan
+# ret: the slowest item's index, or -1
+fun slowest_index(p: *Phase) i64 {
+    if (p.len < 2) { ret -1; }
+    var best: u32 = 0;
+    var i: u32 = 1;
+    for (i < p.len) {
+        if (p.items[i].d > p.items[best].d) { best = i; }
+        i = i + 1;
+    }
+    if (p.items[best].d <= 0) { ret -1; }
+    ret best::i64;
+}
+
+# ensure phase `p` has room for one more item, doubling its array when full
+# ---
+# ro: the Readout (for its allocator)
+# p:  the phase whose item array to grow
+# ret: false on allocation failure
+fun ensure_item_cap(ro: *Readout, p: *Phase) bool {
+    if (p.len < p.cap) { ret true; }
+    var new_cap: u32 = p.cap * 2;
+    if (new_cap < 16) { new_cap = 16; }
+    if (p.items == nil) {
+        val r: R.Result[*Item, str] = A.allocate[Item](ro.alloc, new_cap::usize);
+        if (R.is_err[*Item, str](r)) { ret false; }
+        p.items = R.unwrap_ok[*Item, str](r);
+    }
+    or {
+        val r: R.Result[*Item, str] = A.reallocate[Item](ro.alloc, p.items, p.cap::usize, new_cap::usize);
+        if (R.is_err[*Item, str](r)) { ret false; }
+        p.items = R.unwrap_ok[*Item, str](r);
+    }
+    p.cap = new_cap;
+    ret true;
+}
+
+# release phase `p`'s item array
+# ---
+# ro: the Readout (for its allocator)
+# p:  the phase whose item array to free
+fun free_items(ro: *Readout, p: *Phase) {
+    if (p.items != nil && p.cap > 0) {
+        A.deallocate[Item](ro.alloc, p.items, p.cap::usize);
+    }
+    p.items = nil;
+    p.len   = 0;
+    p.cap   = 0;
+}
