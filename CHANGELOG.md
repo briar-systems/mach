@@ -17,6 +17,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   platforms - timing via `chrono.monotonic`, durations via
   `chrono.format_duration`, columns via the `{:<N}`/`{:N}` format spec (#1775).
 
+### Changed
+
+- test: `mach test` builds **one dispatcher executable** covering every
+  collected test instead of one standalone executable per test - one link
+  instead of N (on mach itself: 44.9s → 7.2s wall, 9.4 GB → 7.3 MB on disk).
+  Each test still runs as its own process, spawned as `<exe> <idx>`. `--runner`
+  now receives the executable path and the test index as its two arguments;
+  `--filter` selects at run time, so the built executable is identical
+  regardless of filter; the `tests` template's `{name}` resolves to the product
+  name (falling back to the project id) rather than a per-test name (#1789).
+
 ### Removed
 
 - build: the `--verbose` flag, replaced by `-v`/`-vv` (#1775).
