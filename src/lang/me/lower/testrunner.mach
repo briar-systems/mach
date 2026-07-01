@@ -1,23 +1,24 @@
-# synthesizes one standalone entry per `test`.
+# synthesizes the single test dispatcher entry for a test build.
 #
-# `mach test` builds every `test "..."` block into its own small executable: the
-# test function plus the project's transitive code, with a synthesized `main`
-# that calls just that one test and returns its `i32` result as the process exit
-# status (0 = pass, non-zero = fail). the per-test executables are run as
-# separate processes by `mach test`, so a crashing test reports a signal and the
-# run continues.
+# `mach test` builds one executable per test build: the project's transitive
+# code plus a synthesized dispatcher `main(argc, argv)` that selects one test by
+# its decimal collection index in `argv[1]`, calls it, and returns its `i32`
+# result as the process exit status (0 = pass, non-zero = fail). the runner
+# still spawns one process per test (`<exe> <idx>`), so a crashing test reports
+# a signal and the run continues; a missing, malformed, or out-of-range index
+# exits 2, the harness's internal-error code.
 #
 # this module does two jobs for that build:
 #   - `collect` gathers every `FN_FLAG_TEST` function across the lowered module
 #     set into a `Collected` list (linkage name, printable label, source line,
 #     and the index of the declaring module, for `file:line` reporting).
-#   - `synthesize_entry` builds, for one collected test, a tiny IR module whose
-#     `main` is `ret <test>();` - a signature-only extern for the test symbol
-#     plus a two-instruction body. it carries no OS interaction of its own, so it
-#     works for any target with or without a standard library.
+#   - `synthesize_dispatcher` builds one IR module: a signature-only extern per
+#     selected test plus the dispatching `main`. argv arrives as `main`
+#     parameters from the target runtime, so the synthesized IR itself stays
+#     stdlib-independent.
 #
 # `neutralize_project_main` turns the project's own `main` into a body-less
-# extern so each test executable's sole program entry is the synthesized one.
+# extern so the test executable's sole program entry is the synthesized one.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -123,8 +124,8 @@ pub fun free(s: *session.Session, c: *Collected) {
 }
 
 # turn every function whose linkage name is literally `main` into a body-less
-# extern, so a test executable's sole program entry is the synthesized per-test
-# `main`
+# extern, so the test executable's sole program entry is the synthesized
+# dispatcher `main`
 #
 # The dropped blocks are reclaimed by the module's own dnit; a test build never
 # references the project's `main`, so the extern emits nothing. Called between
@@ -159,20 +160,25 @@ pub fun neutralize_project_main(s: *session.Session, modules: *ir.Module, count:
     ret R.ok[bool, str](true);
 }
 
-# build a fresh IR module whose `main` calls the single test named by `linkage`
-# and returns its i32 result as the process exit status
+# build a fresh IR module whose `main(argc, argv)` dispatches `argv[1]` (a
+# decimal collection index) to the matching test and returns its i32 result as
+# the process exit status
 #
-# The module declares the test symbol as a signature-only `i32()` extern (the
-# linker binds it to the test's defining object) and emits `main` as
-# `ret <test>();`. The caller optimises, codegens, and links it with the
-# project's per-module objects into one standalone test executable. The returned
-# module is owned by the caller (ir.dnit).
+# The module declares each test symbol as a signature-only `i32()` extern (the
+# linker binds them to their defining objects). `main` returns 2 - the
+# harness's internal-error exit code - for a missing, empty, malformed, or
+# out-of-range index. The caller optimises, codegens, and links the module with
+# the project's per-module objects into the single test executable. The
+# returned module is owned by the caller (ir.dnit).
 # ---
-# s:       session holding the string interner and allocator
-# linkage: linkage name of the test symbol `main` should call
-# ret:     the synthesized module, or an allocation error
-pub fun synthesize_entry(s: *session.Session, linkage: intern.StrId) R.Result[ir.Module, str] {
-    val res_name: R.Result[intern.StrId, str] = intern.intern(?s.interner, "__mach_test_entry");
+# s:     session holding the string interner and allocator
+# tests: the selected tests, dispatch index = array position
+# count: number of tests in `tests`
+# ret:   the synthesized module, or an error
+pub fun synthesize_dispatcher(s: *session.Session, tests: *Test, count: u32) R.Result[ir.Module, str] {
+    if (count == 0) { ret R.err[ir.Module, str]("test dispatcher: no tests to dispatch"); }
+
+    val res_name: R.Result[intern.StrId, str] = intern.intern(?s.interner, "__mach_test_dispatch");
     if (R.is_err[intern.StrId, str](res_name)) {
         ret R.err[ir.Module, str](R.unwrap_err[intern.StrId, str](res_name));
     }
@@ -183,7 +189,7 @@ pub fun synthesize_entry(s: *session.Session, linkage: intern.StrId) R.Result[ir
     }
     var m: ir.Module = R.unwrap_ok[ir.Module, str](res_module);
 
-    val res_build: R.Result[bool, str] = build_entry(s, ?m, linkage);
+    val res_build: R.Result[bool, str] = build_dispatcher(s, ?m, tests, count);
     if (R.is_err[bool, str](res_build)) {
         ir.dnit(?m);
         ret R.err[ir.Module, str](R.unwrap_err[bool, str](res_build));
@@ -227,61 +233,240 @@ fun push_test(s: *session.Session, c: *Collected, t: Test) R.Result[bool, str] {
     ret R.ok[bool, str](true);
 }
 
-# emit the test symbol's extern and the `main(){ ret <test>(); }` body into `m`
+# emit the per-test externs and the dispatching `main(argc, argv)` body into `m`
+#
+# The CFG is: entry checks `argc >= 2`; getarg loads `argv[1]` and rejects an
+# empty string; a phi loop parses the decimal index (any non-digit byte exits
+# 2); a compare/branch chain then dispatches the index to its test call, whose
+# i32 result is sign-extended and returned. All failure paths return 2, the
+# harness's internal-error exit code, distinguishable from a test's own failure.
 # ---
-# s:       session holding the string interner
-# m:       the module to populate
-# linkage: linkage name of the test symbol to call
-# ret:     true on success, or an allocation error
-fun build_entry(s: *session.Session, m: *ir.Module, linkage: intern.StrId) R.Result[bool, str] {
+# s:     session holding the string interner
+# m:     the module to populate
+# tests: the selected tests, dispatch index = array position
+# count: number of tests in `tests`
+# ret:   true on success, or an error
+fun build_dispatcher(s: *session.Session, m: *ir.Module, tests: *Test, count: u32) R.Result[bool, str] {
+    val res_i8: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 8);
+    if (R.is_err[type.IrTypeId, str](res_i8)) { ret R.err[bool, str](R.unwrap_err[type.IrTypeId, str](res_i8)); }
+    val i8t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i8);
+
     val res_i32: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 32);
-    if (R.is_err[type.IrTypeId, str](res_i32)) {
-        ret R.err[bool, str](R.unwrap_err[type.IrTypeId, str](res_i32));
-    }
-    val i32: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i32);
+    if (R.is_err[type.IrTypeId, str](res_i32)) { ret R.err[bool, str](R.unwrap_err[type.IrTypeId, str](res_i32)); }
+    val i32t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i32);
 
-    val res_sig: R.Result[type.IrTypeId, str] = type.intern_fn(?m.types, i32, nil, 0);
-    if (R.is_err[type.IrTypeId, str](res_sig)) {
-        ret R.err[bool, str](R.unwrap_err[type.IrTypeId, str](res_sig));
-    }
-    val sig: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_sig);
+    val res_i64: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64)) { ret R.err[bool, str](R.unwrap_err[type.IrTypeId, str](res_i64)); }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
 
-    # the test symbol, declared signature-only so the call resolves across objects
-    val res_ext: R.Result[u32, str] = append_function(m, linkage, sig, ir.FN_FLAG_EXTERN);
-    if (R.is_err[u32, str](res_ext)) {
-        ret R.err[bool, str](R.unwrap_err[u32, str](res_ext));
+    val res_ptr: R.Result[type.IrTypeId, str] = type.intern_ptr(?m.types);
+    if (R.is_err[type.IrTypeId, str](res_ptr)) { ret R.err[bool, str](R.unwrap_err[type.IrTypeId, str](res_ptr)); }
+    val ptrt: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_ptr);
+
+    # every test shares the `i32()` signature; main is `i64(i64, **u8)`, the
+    # contract the runtime start calls (`fun main(argc: i64, argv: **u8) i64`).
+    val res_tsig: R.Result[type.IrTypeId, str] = type.intern_fn(?m.types, i32t, nil, 0);
+    if (R.is_err[type.IrTypeId, str](res_tsig)) { ret R.err[bool, str](R.unwrap_err[type.IrTypeId, str](res_tsig)); }
+    val tsig: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_tsig);
+
+    var main_params: [2]type.IrTypeId;
+    main_params[0] = i64t;
+    main_params[1] = ptrt;
+    val res_msig: R.Result[type.IrTypeId, str] = type.intern_fn(?m.types, i64t, ?main_params[0], 2);
+    if (R.is_err[type.IrTypeId, str](res_msig)) { ret R.err[bool, str](R.unwrap_err[type.IrTypeId, str](res_msig)); }
+    val msig: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_msig);
+
+    # the test symbols, declared signature-only so each call resolves across objects
+    val res_callees: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, count::usize);
+    if (R.is_err[*value.Value, str](res_callees)) { ret R.err[bool, str](R.unwrap_err[*value.Value, str](res_callees)); }
+    val callees: *value.Value = R.unwrap_ok[*value.Value, str](res_callees);
+
+    var k: u32 = 0;
+    for (k < count) {
+        val res_ext: R.Result[u32, str] = append_function(m, tests[k].linkage, tsig, ir.FN_FLAG_EXTERN);
+        if (R.is_err[u32, str](res_ext)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_ext)); }
+        callees[k] = value.fn(R.unwrap_ok[u32, str](res_ext), tsig);
+        k = k + 1;
     }
-    val callee: value.Value = value.fn(R.unwrap_ok[u32, str](res_ext), sig);
 
     # `main` is emitted verbatim: a synthesized module is not run through the
-    # export registry, so the OS entry calls the literal `main`. its body is one
-    # call to the test and a return of the i32 result, which the process exit
-    # status carries (0 = pass).
+    # export registry, so the OS entry calls the literal `main`.
     val res_main: R.Result[intern.StrId, str] = intern.intern(?s.interner, "main");
-    if (R.is_err[intern.StrId, str](res_main)) {
-        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](res_main));
-    }
-    val res_main_idx: R.Result[u32, str] = append_function(m, R.unwrap_ok[intern.StrId, str](res_main), sig, ir.FN_FLAG_PUB);
-    if (R.is_err[u32, str](res_main_idx)) {
-        ret R.err[bool, str](R.unwrap_err[u32, str](res_main_idx));
-    }
+    if (R.is_err[intern.StrId, str](res_main)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](res_main)); }
+    val res_main_idx: R.Result[u32, str] = append_function(m, R.unwrap_ok[intern.StrId, str](res_main), msig, ir.FN_FLAG_PUB);
+    if (R.is_err[u32, str](res_main_idx)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_main_idx)); }
     val main_idx: u32 = R.unwrap_ok[u32, str](res_main_idx);
+
+    # the function's VAL_PARAM array; codegen maps parameter vregs from it, so
+    # a function that reads its params must carry it (function_add leaves none)
+    val res_params: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, 2);
+    if (R.is_err[*value.Value, str](res_params)) { ret R.err[bool, str](R.unwrap_err[*value.Value, str](res_params)); }
+    val params: *value.Value = R.unwrap_ok[*value.Value, str](res_params);
+    params[0] = value.param(0, i64t);
+    params[1] = value.param(1, ptrt);
+    m.functions[main_idx].params      = params;
+    m.functions[main_idx].param_count = 2;
 
     var b: builder.Builder = builder.init(m);
     builder.set_function(?b, ?m.functions[main_idx]);
 
-    val res_block: R.Result[id.BlockId, str] = builder.new_block(?b);
-    if (R.is_err[id.BlockId, str](res_block)) {
-        ret R.err[bool, str](R.unwrap_err[id.BlockId, str](res_block));
-    }
-    builder.set_block(?b, R.unwrap_ok[id.BlockId, str](res_block));
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?b);
+    if (R.is_err[id.BlockId, str](res_entry)) { ret R.err[bool, str](R.unwrap_err[id.BlockId, str](res_entry)); }
+    val b_entry: id.BlockId = R.unwrap_ok[id.BlockId, str](res_entry);
 
-    val res_call: R.Result[value.Value, str] = builder.emit_call(?b, callee, nil, 0, i32);
-    if (R.is_err[value.Value, str](res_call)) {
-        ret R.err[bool, str](R.unwrap_err[value.Value, str](res_call));
+    val res_bad: R.Result[id.BlockId, str] = builder.new_block(?b);
+    if (R.is_err[id.BlockId, str](res_bad)) { ret R.err[bool, str](R.unwrap_err[id.BlockId, str](res_bad)); }
+    val b_bad: id.BlockId = R.unwrap_ok[id.BlockId, str](res_bad);
+
+    val res_getarg: R.Result[id.BlockId, str] = builder.new_block(?b);
+    if (R.is_err[id.BlockId, str](res_getarg)) { ret R.err[bool, str](R.unwrap_err[id.BlockId, str](res_getarg)); }
+    val b_getarg: id.BlockId = R.unwrap_ok[id.BlockId, str](res_getarg);
+
+    val res_head: R.Result[id.BlockId, str] = builder.new_block(?b);
+    if (R.is_err[id.BlockId, str](res_head)) { ret R.err[bool, str](R.unwrap_err[id.BlockId, str](res_head)); }
+    val b_head: id.BlockId = R.unwrap_ok[id.BlockId, str](res_head);
+
+    val res_low: R.Result[id.BlockId, str] = builder.new_block(?b);
+    if (R.is_err[id.BlockId, str](res_low)) { ret R.err[bool, str](R.unwrap_err[id.BlockId, str](res_low)); }
+    val b_low_ok: id.BlockId = R.unwrap_ok[id.BlockId, str](res_low);
+
+    val res_body: R.Result[id.BlockId, str] = builder.new_block(?b);
+    if (R.is_err[id.BlockId, str](res_body)) { ret R.err[bool, str](R.unwrap_err[id.BlockId, str](res_body)); }
+    val b_body: id.BlockId = R.unwrap_ok[id.BlockId, str](res_body);
+
+    # the dispatch chain and call blocks, one pair per test
+    val res_dblocks: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](m.alloc, count::usize);
+    if (R.is_err[*id.BlockId, str](res_dblocks)) { ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](res_dblocks)); }
+    val dblocks: *id.BlockId = R.unwrap_ok[*id.BlockId, str](res_dblocks);
+
+    val res_cblocks: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](m.alloc, count::usize);
+    if (R.is_err[*id.BlockId, str](res_cblocks)) { ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](res_cblocks)); }
+    val cblocks: *id.BlockId = R.unwrap_ok[*id.BlockId, str](res_cblocks);
+
+    k = 0;
+    for (k < count) {
+        val res_d: R.Result[id.BlockId, str] = builder.new_block(?b);
+        if (R.is_err[id.BlockId, str](res_d)) { ret R.err[bool, str](R.unwrap_err[id.BlockId, str](res_d)); }
+        dblocks[k] = R.unwrap_ok[id.BlockId, str](res_d);
+
+        val res_c: R.Result[id.BlockId, str] = builder.new_block(?b);
+        if (R.is_err[id.BlockId, str](res_c)) { ret R.err[bool, str](R.unwrap_err[id.BlockId, str](res_c)); }
+        cblocks[k] = R.unwrap_ok[id.BlockId, str](res_c);
+        k = k + 1;
     }
 
-    ret builder.emit_ret(?b, R.unwrap_ok[value.Value, str](res_call));
+    val argc: value.Value = value.param(0, i64t);
+    val argv: value.Value = value.param(1, ptrt);
+
+    # entry: argc < 2 -> bad
+    builder.set_block(?b, b_entry);
+    val res_lt2: R.Result[value.Value, str] = builder.emit_cmp_lt_s(?b, argc, value.const_int(2, i64t));
+    if (R.is_err[value.Value, str](res_lt2)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_lt2)); }
+    val res_cbr0: R.Result[bool, str] = builder.emit_cbr(?b, R.unwrap_ok[value.Value, str](res_lt2), b_bad, b_getarg);
+    if (R.is_err[bool, str](res_cbr0)) { ret res_cbr0; }
+
+    # bad: every rejection exits 2
+    builder.set_block(?b, b_bad);
+    val res_ret2: R.Result[bool, str] = builder.emit_ret(?b, value.const_int(2, i64t));
+    if (R.is_err[bool, str](res_ret2)) { ret res_ret2; }
+
+    # getarg: arg = argv[1]; an empty string is malformed
+    builder.set_block(?b, b_getarg);
+    var one_idx: [1]value.Value;
+    one_idx[0] = value.const_int(1, i64t);
+    val res_gep1: R.Result[value.Value, str] = builder.emit_gep(?b, argv, ptrt, ?one_idx[0], 1);
+    if (R.is_err[value.Value, str](res_gep1)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_gep1)); }
+    val res_arg: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](res_gep1), ptrt);
+    if (R.is_err[value.Value, str](res_arg)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_arg)); }
+    val arg: value.Value = R.unwrap_ok[value.Value, str](res_arg);
+    val res_c0: R.Result[value.Value, str] = builder.emit_load(?b, arg, i8t);
+    if (R.is_err[value.Value, str](res_c0)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_c0)); }
+    val res_c0z: R.Result[value.Value, str] = builder.emit_cmp_eq(?b, R.unwrap_ok[value.Value, str](res_c0), value.const_int(0, i8t));
+    if (R.is_err[value.Value, str](res_c0z)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_c0z)); }
+    val res_cbr1: R.Result[bool, str] = builder.emit_cbr(?b, R.unwrap_ok[value.Value, str](res_c0z), b_bad, b_head);
+    if (R.is_err[bool, str](res_cbr1)) { ret res_cbr1; }
+
+    # head: p/acc flow around the digit loop; a NUL ends the number
+    builder.set_block(?b, b_head);
+    val res_pphi: R.Result[value.Value, str] = builder.emit_phi(?b, ptrt);
+    if (R.is_err[value.Value, str](res_pphi)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_pphi)); }
+    val p_phi: value.Value = R.unwrap_ok[value.Value, str](res_pphi);
+    val res_aphi: R.Result[value.Value, str] = builder.emit_phi(?b, i64t);
+    if (R.is_err[value.Value, str](res_aphi)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_aphi)); }
+    val acc_phi: value.Value = R.unwrap_ok[value.Value, str](res_aphi);
+
+    val res_c: R.Result[value.Value, str] = builder.emit_load(?b, p_phi, i8t);
+    if (R.is_err[value.Value, str](res_c)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_c)); }
+    val c: value.Value = R.unwrap_ok[value.Value, str](res_c);
+    val res_end: R.Result[value.Value, str] = builder.emit_cmp_eq(?b, c, value.const_int(0, i8t));
+    if (R.is_err[value.Value, str](res_end)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_end)); }
+    val res_cbr2: R.Result[bool, str] = builder.emit_cbr(?b, R.unwrap_ok[value.Value, str](res_end), dblocks[0], b_low_ok);
+    if (R.is_err[bool, str](res_cbr2)) { ret res_cbr2; }
+
+    # low_ok / body: reject bytes outside '0'..'9', else acc = acc*10 + digit
+    builder.set_block(?b, b_low_ok);
+    val res_lt0: R.Result[value.Value, str] = builder.emit_cmp_lt_u(?b, c, value.const_int(48, i8t));
+    if (R.is_err[value.Value, str](res_lt0)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_lt0)); }
+    val res_cbr3: R.Result[bool, str] = builder.emit_cbr(?b, R.unwrap_ok[value.Value, str](res_lt0), b_bad, b_body);
+    if (R.is_err[bool, str](res_cbr3)) { ret res_cbr3; }
+
+    builder.set_block(?b, b_body);
+    val res_gt9: R.Result[value.Value, str] = builder.emit_cmp_lt_u(?b, value.const_int(57, i8t), c);
+    if (R.is_err[value.Value, str](res_gt9)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_gt9)); }
+
+    val res_step: R.Result[id.BlockId, str] = builder.new_block(?b);
+    if (R.is_err[id.BlockId, str](res_step)) { ret R.err[bool, str](R.unwrap_err[id.BlockId, str](res_step)); }
+    val b_step: id.BlockId = R.unwrap_ok[id.BlockId, str](res_step);
+    val res_cbr4: R.Result[bool, str] = builder.emit_cbr(?b, R.unwrap_ok[value.Value, str](res_gt9), b_bad, b_step);
+    if (R.is_err[bool, str](res_cbr4)) { ret res_cbr4; }
+
+    builder.set_block(?b, b_step);
+    val res_cz: R.Result[value.Value, str] = builder.emit_zext(?b, c, i64t);
+    if (R.is_err[value.Value, str](res_cz)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_cz)); }
+    val res_dig: R.Result[value.Value, str] = builder.emit_sub(?b, R.unwrap_ok[value.Value, str](res_cz), value.const_int(48, i64t));
+    if (R.is_err[value.Value, str](res_dig)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_dig)); }
+    val res_m10: R.Result[value.Value, str] = builder.emit_mul(?b, acc_phi, value.const_int(10, i64t));
+    if (R.is_err[value.Value, str](res_m10)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_m10)); }
+    val res_acc: R.Result[value.Value, str] = builder.emit_add(?b, R.unwrap_ok[value.Value, str](res_m10), R.unwrap_ok[value.Value, str](res_dig));
+    if (R.is_err[value.Value, str](res_acc)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_acc)); }
+    val acc_next: value.Value = R.unwrap_ok[value.Value, str](res_acc);
+    val res_pn: R.Result[value.Value, str] = builder.emit_gep(?b, p_phi, i8t, ?one_idx[0], 1);
+    if (R.is_err[value.Value, str](res_pn)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_pn)); }
+    val p_next: value.Value = R.unwrap_ok[value.Value, str](res_pn);
+    val res_br: R.Result[bool, str] = builder.emit_br(?b, b_head);
+    if (R.is_err[bool, str](res_br)) { ret res_br; }
+
+    val res_in1: R.Result[bool, str] = builder.phi_add_incoming(?b, p_phi, b_getarg, arg);
+    if (R.is_err[bool, str](res_in1)) { ret res_in1; }
+    val res_in2: R.Result[bool, str] = builder.phi_add_incoming(?b, p_phi, b_step, p_next);
+    if (R.is_err[bool, str](res_in2)) { ret res_in2; }
+    val res_in3: R.Result[bool, str] = builder.phi_add_incoming(?b, acc_phi, b_getarg, value.const_int(0, i64t));
+    if (R.is_err[bool, str](res_in3)) { ret res_in3; }
+    val res_in4: R.Result[bool, str] = builder.phi_add_incoming(?b, acc_phi, b_step, acc_next);
+    if (R.is_err[bool, str](res_in4)) { ret res_in4; }
+
+    # dispatch chain: acc == k -> call test k; falling off the end is out-of-range
+    k = 0;
+    for (k < count) {
+        builder.set_block(?b, dblocks[k]);
+        val res_eq: R.Result[value.Value, str] = builder.emit_cmp_eq(?b, acc_phi, value.const_int(k::u64, i64t));
+        if (R.is_err[value.Value, str](res_eq)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_eq)); }
+        var miss: id.BlockId = b_bad;
+        if (k + 1 < count) { miss = dblocks[k + 1]; }
+        val res_cbrk: R.Result[bool, str] = builder.emit_cbr(?b, R.unwrap_ok[value.Value, str](res_eq), cblocks[k], miss);
+        if (R.is_err[bool, str](res_cbrk)) { ret res_cbrk; }
+
+        builder.set_block(?b, cblocks[k]);
+        val res_call: R.Result[value.Value, str] = builder.emit_call(?b, callees[k], nil, 0, i32t);
+        if (R.is_err[value.Value, str](res_call)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_call)); }
+        val res_r64: R.Result[value.Value, str] = builder.emit_sext(?b, R.unwrap_ok[value.Value, str](res_call), i64t);
+        if (R.is_err[value.Value, str](res_r64)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_r64)); }
+        val res_retk: R.Result[bool, str] = builder.emit_ret(?b, R.unwrap_ok[value.Value, str](res_r64));
+        if (R.is_err[bool, str](res_retk)) { ret res_retk; }
+        k = k + 1;
+    }
+
+    ret R.ok[bool, str](true);
 }
 
 # append a Function with the given linkage to the module and register it in the
