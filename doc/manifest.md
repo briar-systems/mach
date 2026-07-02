@@ -57,7 +57,7 @@ opt = 0                    # 0 (no optimization) | 1 (standard) | 2 (aggressive)
 
 [profile.release]
 opt      = 2
-emit_ir  = true            # emit per-module IR for this profile (default false)
+emit_ir  = true            # emit per-module post-pipeline IR for this profile (default false)
 emit_asm = false           # emit per-module assembly for this profile (default false)
 
 [deps.mach-std]            # a dependency: exactly one of git|path, plus ref for git
@@ -143,7 +143,7 @@ toggles live here because they are variant concerns.
 | Key        | Type    | Default | Meaning |
 |------------|---------|---------|---------|
 | `opt`      | integer | — (debug) | Optimization level: `0` (no optimization beyond the always-on pipeline), `1` (standard), or `2` (aggressive). `1` and `2` currently select the same pass set; `2` is where future loop/vectorization work lands. Any other integer — or a non-integer — is a manifest error (`profile '<name>': opt must be 0, 1, or 2`). |
-| `emit_ir`  | bool    | `false` | Write per-module IR dumps under the `ir` template for this profile. |
+| `emit_ir`  | bool    | `false` | Write per-module SSA IR dumps under the `ir` template for this profile — the final post-pipeline IR the object is built from, so it varies with `opt`. |
 | `emit_asm` | bool    | `false` | Write per-module assembly dumps under the `asm` template for this profile. |
 
 A CLI `-O0` / `-O1` / `-O2` / `--release` flag overrides the selected profile's

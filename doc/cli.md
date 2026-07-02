@@ -45,10 +45,15 @@ A verbosity flag (`-v`/`-vv`) and `--quiet` together is a parse error.
 | `-o <path>`      | path             | override the artifact path, rooted at the project root (build/run/test) |
 | `--all-targets`  | —                | build every declared `[target.*]`, not just the default |
 | `--emit-asm`     | —                | emit per-module assembly text (`.s`); forces the selected profile's `emit_asm` on |
-| `--emit-ir`      | —                | emit per-module SSA IR text (`.ir`); forces the selected profile's `emit_ir` on |
+| `--emit-ir`      | —                | emit per-module SSA IR text (`.ir`) — the final post-pipeline IR the object is built from, so it varies with `-O`; forces the selected profile's `emit_ir` on |
 | `--no-emit-asm`  | —                | force per-module assembly emission off, overriding the profile's `emit_asm` |
 | `--no-emit-ir`   | —                | force per-module IR emission off, overriding the profile's `emit_ir` |
 | `--verify-ir`    | —                | run the IR verifier after each optimisation pass |
+
+> Under `mach test`, the entry module's `--emit-ir` dump shows the neutralized
+> project `main` the test dispatcher substitutes for the real entry (the final IR
+> that build is made from), so it differs from the same module's `mach build`
+> dump. That divergence is expected.
 
 > `mach dep` and `mach init` do not use the shared config parser; they read only
 > their own flags listed below.
