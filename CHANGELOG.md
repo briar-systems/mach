@@ -5,7 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.12.0] - 2026-07-01
+
+The terminal output & test-harness overhaul: framed source-snippet diagnostics,
+a per-phase build readout, and `mach test` rebuilt around a single dispatcher
+binary with live, parallel, deterministic reporting (epic #1788 - on mach's own
+438-test suite, `mach test .` drops 44.9s -> 7.2s wall and 9.4 GB -> one 7.3 MB
+artifact). Static-PIE self-relocation is now active under `--pie`. Contains
+breaking CLI changes - see Breaking. Built with mach 2.11.0.
+
+### Breaking
+
+- build/test: the `--verbose` flag is gone; use `-v` / `-vv` (#1775).
+- test: `--runner <cmd>` now launches `<cmd> <exe> <idx>` - the runner receives
+  the dispatcher path and a test index instead of a per-test executable (#1789).
+- test: the `tests` manifest template's `{name}` resolves to the product name
+  (one dispatcher binary) rather than a per-test name (#1789).
 
 ### Added
 
@@ -19,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   re-lists the failures; a crashing test reports its signal and the run
   continues (#1776). Extended to a live, parallel readout later in this
   cycle (see the `Changed` entries).
+- link: static-PIE self-relocation is active - under `--pie` the mach-std
+  runtime relocates the image's absolute pointers at startup, covered by an
+  int exec guard (#1727).
 - build: `-v` prints a per-phase readout (load / resolve / sema / lower /
   optimize / codegen / link) with item counts and timing, closed by a
   `built <path>  N modules  <size>  in <time>` summary; `-vv` adds a
@@ -58,6 +76,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 - build: the `--verbose` flag, replaced by `-v`/`-vv` (#1775).
+
+### Fixed
+
+- ci(int): the darwin-x86_64 integration leg never ran - it queued forever on
+  starved `macos-13` runners and died at GitHub's 24h cap; routed to `macos-14`
+  under Rosetta 2, mirroring CD (#1787).
+
+## [2.11.0] - 2026-06-30
+
+Position independence and multi-arch ELF dynamic linking: opt-in static-PIE
+executable emission for linux, PLT/GOT writers for aarch64 and riscv64, plus
+editor groundwork and a loud-error sweep over the backend's silent fallbacks.
+Built with mach 2.10.0.
+
+### Added
+
+- link/elf: opt-in **static-PIE** (`ET_DYN`) linux executables via `--pie` /
+  `$mach.build.pie` - `PT_PHDR` load-bias recovery, a synthesized `.rela.dyn`
+  of `R_*_RELATIVE` base relocations, and `PT_DYNAMIC`; runtime self-relocation
+  activates in the next release (#1727).
+- of/elf: aarch64 and riscv64 **PLT/GOT dynamic-link writers** with byte-level
+  encoding guards, completing dynamic linking across the shipped linux ISAs
+  (#1741).
+- editor: sema retains per-expression types on `SemaResult` for editor/LSP
+  consumption (#1501).
+- ci: an x86_64-darwin release lane via Rosetta 2 on `macos-14` - Intel
+  runners are queue-starved (#1728); darwin integration legs run on merge to
+  main rather than a schedule (#1765).
+- int: structural (field) and freestanding (flat-loader) producers widen what
+  the integration harness can assert (#1760).
+
+### Fixed
+
+- be: silent backend fallbacks now fail loudly, with the AAPCS64 edge rules
+  documented where they were being papered over (#1745).
 
 ## [2.10.0] - 2026-06-29
 
