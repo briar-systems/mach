@@ -42,6 +42,12 @@
 #
 # spawning and output capture go through `std.process`, which is multiplatform
 # (linux, darwin, windows), so the readout behaves identically on every host.
+#
+# `--format json` swaps the human readout for a machine-readable NDJSON event
+# stream (one object per line: `run_start`, one `test` per result, `summary`;
+# `case` per test under `--list`) driven off the same per-test event stream as
+# the human renderer through the `Renderer` vtable. the schema is versioned in
+# `doc/tooling/test-json.md`; `mach.cli.json` owns the ASCII-safe encoding.
 
 use std.allocator.arena;
 use std.print;
@@ -68,6 +74,7 @@ use du:     std.chrono.duration;
 
 use mach.cli.cmd.build;
 use mach.cli.util;
+use json: mach.cli.json;
 
 # a test that passed
 val KIND_PASS:   u8 = 0;
@@ -81,6 +88,10 @@ val KIND_SPAWN:  u8 = 3;
 val KIND_OTHER:  u8 = 4;
 # a test not yet finalized; the render cursor never crosses one
 val KIND_PENDING: u8 = 5;
+
+# the machine-readable output schema version stamped on every JSON event; bump
+# it on any incompatible change to the event shapes (see doc/tooling/test-json.md)
+val SCHEMA_VERSION: i64 = 1;
 
 # most retained bytes per test from its capture file; a file holding more is
 # retained truncated (the file itself keeps the full output)
@@ -126,6 +137,21 @@ pub fun run(argc: usize, argv: **u8) i64 {
     if (util.has_flag(argc, argv, "-v"))  { level = 1; }
     if (util.has_flag(argc, argv, "-vv")) { level = 2; }
 
+    # `--format json` selects the machine-readable NDJSON event stream (one JSON
+    # object per line, no human readout); `human` (the default) keeps the live
+    # readout. an unrecognized value is a usage error.
+    var json_out: bool = false;
+    val opt_format: O.Option[*u8] = util.get_value(argc, argv, "--format");
+    if (O.is_some[*u8](opt_format)) {
+        val fv: str = O.unwrap[*u8](opt_format)::str;
+        if (str_equals(fv, "json"))  { json_out = true; }
+        or (str_equals(fv, "human")) { json_out = false; }
+        or {
+            print.eprint("error: --format expects 'human' or 'json'\n");
+            ret 1;
+        }
+    }
+
     # `--jobs <n>` bounds how many test children run at once; the default is
     # the CPUs available to this process, and 1 serializes.
     var jobs: u32 = 1;
@@ -168,13 +194,19 @@ pub fun run(argc: usize, argv: **u8) i64 {
     val opt_filter: O.Option[*u8] = util.get_value(argc, argv, "--filter");
     if (O.is_some[*u8](opt_filter)) { filter = O.unwrap[*u8](opt_filter); }
 
-    # `--list`: report each selected test's `label file:line`, no execution.
+    # `--list`: report each selected test with no execution - one `case` JSON
+    # object per test under `--format json`, else `label file:line`.
     if (list) {
+        var lw: writer.Writer;
+        if (json_out) { fs.get_writer(?fs.stdout, ?lw); }
         var i: u32 = 0;
         for (i < tbr.len) {
             if (filter_matches(?tbr.tests[i], filter)) {
-                artifact_report(?tbr.tests[i]);
-                print.print("\n");
+                if (json_out) { emit_list_case(?lw, ?tbr.tests[i]); }
+                or {
+                    artifact_report(?tbr.tests[i]);
+                    print.print("\n");
+                }
             }
             i = i + 1;
         }
@@ -225,7 +257,13 @@ pub fun run(argc: usize, argv: **u8) i64 {
 
     # a filtered run that matched nothing has no work and no failures.
     if (sel_len == 0) {
-        print.print("0 passed, 0 failed, 0 total  (0ms)\n");
+        if (json_out) {
+            var jc: JsonCtx;
+            var r:  Renderer = json_renderer(?jc, nil);
+            r.fn_start(r.ctx, nil, 0);
+            r.fn_summary(r.ctx, nil, 0, 0, 0, 0);
+        }
+        or { print.print("0 passed, 0 failed, 0 total  (0ms)\n"); }
         arena.dnit(?ar);
         ret 0;
     }
@@ -256,13 +294,22 @@ pub fun run(argc: usize, argv: **u8) i64 {
     val mod_w:   usize = module_col_width(selected, sel_len);
     val label_w: usize = label_col_width(selected, sel_len);
 
+    # the human readout and the JSON stream are sibling renderers over the same
+    # per-test event stream; only one is live per run.
+    var hc: HumanCtx;
+    var jc: JsonCtx;
+    var r:  Renderer;
+    if (json_out) { r = json_renderer(?jc, ?log_dir[0]); }
+    or           { r = human_renderer(?hc, level, mod_w, label_w, runner, ?log_dir[0]); }
+
     val run_start: tm.Time = tm.monotonic();
-    execute_and_render(?a, selected, sel_len, runner, outcomes, level, mod_w, label_w, jobs, ?log_dir[0]);
+    r.fn_start(r.ctx, selected, sel_len);
+    execute_and_render(?a, selected, sel_len, runner, outcomes, level, jobs, ?log_dir[0], ?r);
     val wall: du.Duration = tm.time_sub(tm.monotonic(), run_start);
 
     val failed: u32 = count_failed(outcomes, sel_len);
     val passed: u32 = sel_len - failed;
-    render_summary(outcomes, sel_len, passed, failed, wall);
+    r.fn_summary(r.ctx, outcomes, sel_len, passed, failed, wall);
 
     arena.dnit(?ar);
     if (failed > 0) { ret 1; }
@@ -285,14 +332,13 @@ rec Slot {
 }
 
 # run every selected test through a sliding window of child processes,
-# rendering the readout live in collection order as results finalize
+# driving the renderer over the finalized outcomes in collection order
 #
 # Up to `jobs` children are in flight at once, each with stdout and stderr
 # bound to its capture file; a blocking wait-any reaps whichever exits first.
-# The render cursor trails completion in collection order, so the readout is
-# deterministic regardless of completion order: at the default level a
-# module's roll-up prints the moment its last test finalizes, and under `-v`
-# the module header and each test line print as the cursor crosses them.
+# The render cursor trails completion in collection order, so the renderer sees
+# each outcome exactly once in test order regardless of completion order, and
+# the readout is deterministic.
 # ---
 # a:        allocator retaining captured output
 # arts:     the selected test artifacts to run, in collection order
@@ -300,13 +346,12 @@ rec Slot {
 # runner:   resolved `--runner` launcher, or nil to exec the dispatcher directly
 # outcomes: caller-owned array (length n) filled in test order
 # level:    verbosity (0 roll-ups, 1 per-test lines, 2 also passing output)
-# mod_w:    module roll-up column width
-# label_w:  `-v` label column width
 # jobs:     window width (1 serializes)
 # log_dir:  the capture-file directory
+# r:        the renderer notified as each outcome finalizes
 fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runner: *u8,
-                       outcomes: *Outcome, level: u8, mod_w: usize, label_w: usize,
-                       jobs: u32, log_dir: *u8) {
+                       outcomes: *Outcome, level: u8, jobs: u32, log_dir: *u8,
+                       r: *Renderer) {
     var i: u32 = 0;
     for (i < n) { outcomes[i].kind = KIND_PENDING; i = i + 1; }
 
@@ -338,7 +383,6 @@ fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runne
     var done:     u32 = 0;
     var inflight: u32 = 0;
     var cursor:   u32 = 0;
-    var first:    u32 = 0;
 
     for (done < n) {
         # top the window back up
@@ -405,20 +449,223 @@ fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runne
             }
         }
 
-        # advance the render cursor across everything finalized so far
+        # advance the render cursor across everything finalized so far,
+        # handing each outcome to the renderer once in collection order
         for (cursor < n && outcomes[cursor].kind != KIND_PENDING) {
-            val mod_name: str = util.cstr_str(arts[cursor].module);
-            if (level > 0 && cursor == first) { print.printf("{}\n", mod_name); }
-            if (level > 0) { print_verbose_test(?outcomes[cursor], label_w, runner, log_dir); }
-            val last_of_module: bool = cursor + 1 == n
-                || !str_equals(util.cstr_str(arts[cursor + 1].module), mod_name);
-            if (last_of_module) {
-                if (level == 0) { render_module_run(outcomes, first, cursor, mod_name, mod_w, runner, log_dir); }
-                first = cursor + 1;
-            }
+            r.fn_test(r.ctx, outcomes, arts, cursor);
             cursor = cursor + 1;
         }
     }
+}
+
+# the run-event renderer: an opaque ctx plus per-event callbacks, so the human
+# readout and the machine-readable JSON stream are sibling consumers of one
+# event stream rather than one scraping the other's text
+# ---
+# ctx:        opaque renderer state handed to each callback
+# fn_start:   run start (selected artifacts, count)
+# fn_test:    one finalized outcome in collection order (outcomes, artifacts, index)
+# fn_summary: run end (outcomes, count, passed, failed, wall time)
+rec Renderer {
+    ctx:        ptr;
+    fn_start:   fun(ptr, *build.TestArtifact, u32);
+    fn_test:    fun(ptr, *Outcome, *build.TestArtifact, u32);
+    fn_summary: fun(ptr, *Outcome, u32, u32, u32, du.Duration);
+}
+
+# state the human readout carries across its per-test callbacks
+# ---
+# level:   verbosity (0 roll-ups, 1 per-test lines, 2 also passing output)
+# mod_w:   module roll-up column width
+# label_w: `-v` label column width
+# runner:  resolved `--runner` launcher, or nil
+# log_dir: the capture-file directory
+# n:       number of selected tests
+# first:   index of the current module's first outcome
+rec HumanCtx {
+    level:   u8;
+    mod_w:   usize;
+    label_w: usize;
+    runner:  *u8;
+    log_dir: *u8;
+    n:       u32;
+    first:   u32;
+}
+
+# state the JSON stream carries across its per-test callbacks
+# ---
+# log_dir: the capture-file directory, source of each test's output reference
+# n:       number of selected tests
+# w:       the stdout writer the NDJSON lines are emitted through
+rec JsonCtx {
+    log_dir: *u8;
+    n:       u32;
+    w:       writer.Writer;
+}
+
+# build a human-readout renderer over caller-owned ctx storage
+# ---
+# hc:      the ctx cell the renderer borrows (must outlive the run)
+# level:   verbosity
+# mod_w:   module roll-up column width
+# label_w: `-v` label column width
+# runner:  resolved `--runner` launcher, or nil
+# log_dir: the capture-file directory
+# ret:     a Renderer bound to `hc`
+fun human_renderer(hc: *HumanCtx, level: u8, mod_w: usize, label_w: usize,
+                   runner: *u8, log_dir: *u8) Renderer {
+    hc.level   = level;
+    hc.mod_w   = mod_w;
+    hc.label_w = label_w;
+    hc.runner  = runner;
+    hc.log_dir = log_dir;
+    hc.n       = 0;
+    hc.first   = 0;
+    var r: Renderer;
+    r.ctx        = hc::ptr;
+    r.fn_start   = human_start;
+    r.fn_test    = human_test;
+    r.fn_summary = human_summary;
+    ret r;
+}
+
+# record the run size; the human readout writes nothing at start
+fun human_start(ctx: ptr, arts: *build.TestArtifact, n: u32) {
+    val hc: *HumanCtx = ctx::*HumanCtx;
+    hc.n     = n;
+    hc.first = 0;
+}
+
+# render one finalized outcome under the live human readout, reproducing the
+# module header, per-test line, and end-of-module roll-up as the cursor crosses
+fun human_test(ctx: ptr, outcomes: *Outcome, arts: *build.TestArtifact, idx: u32) {
+    val hc: *HumanCtx = ctx::*HumanCtx;
+    val mod_name: str = util.cstr_str(arts[idx].module);
+    if (hc.level > 0 && idx == hc.first) { print.printf("{}\n", mod_name); }
+    if (hc.level > 0) { print_verbose_test(?outcomes[idx], hc.label_w, hc.runner, hc.log_dir); }
+    val last_of_module: bool = idx + 1 == hc.n
+        || !str_equals(util.cstr_str(arts[idx + 1].module), mod_name);
+    if (last_of_module) {
+        if (hc.level == 0) { render_module_run(outcomes, hc.first, idx, mod_name, hc.mod_w, hc.runner, hc.log_dir); }
+        hc.first = idx + 1;
+    }
+}
+
+# render the closing human summary
+fun human_summary(ctx: ptr, outcomes: *Outcome, n: u32, passed: u32, failed: u32, wall: du.Duration) {
+    render_summary(outcomes, n, passed, failed, wall);
+}
+
+# build a JSON-stream renderer over caller-owned ctx storage
+# ---
+# jc:      the ctx cell the renderer borrows (must outlive the run)
+# log_dir: the capture-file directory, or nil when no tests will run
+# ret:     a Renderer bound to `jc`
+fun json_renderer(jc: *JsonCtx, log_dir: *u8) Renderer {
+    jc.log_dir = log_dir;
+    jc.n       = 0;
+    fs.get_writer(?fs.stdout, ?jc.w);
+    var r: Renderer;
+    r.ctx        = jc::ptr;
+    r.fn_start   = json_start;
+    r.fn_test    = json_test;
+    r.fn_summary = json_summary;
+    ret r;
+}
+
+# emit the `run_start` event
+fun json_start(ctx: ptr, arts: *build.TestArtifact, n: u32) {
+    val jc: *JsonCtx = ctx::*JsonCtx;
+    jc.n = n;
+    var o: json.Object;
+    json.object_begin(?jc.w, ?o);
+    json.field_i64(?o, "schema", SCHEMA_VERSION);
+    json.field_str(?o, "event", "run_start");
+    json.field_i64(?o, "tests", n::i64);
+    json.object_end(?o);
+}
+
+# emit one `test` event for a finalized outcome
+fun json_test(ctx: ptr, outcomes: *Outcome, arts: *build.TestArtifact, idx: u32) {
+    val jc:  *JsonCtx            = ctx::*JsonCtx;
+    val o0:  *Outcome            = ?outcomes[idx];
+    val art: *build.TestArtifact = ?arts[idx];
+    var o: json.Object;
+    json.object_begin(?jc.w, ?o);
+    json.field_i64(?o, "schema", SCHEMA_VERSION);
+    json.field_str(?o, "event", "test");
+    json.field_str(?o, "label", art.label);
+    json.field_str(?o, "module", art.module);
+    json.field_str(?o, "file", art.file);
+    json.field_i64(?o, "line", art.line::i64);
+    json.field_str(?o, "kind", kind_name(o0.kind));
+    json.field_i64(?o, "code", o0.code::i64);
+    json.field_i64(?o, "duration_ns", du.duration_nsec(o0.elapsed));
+    json.field_i64(?o, "index", art.idx::i64);
+    json.field_str(?o, "exe", art.exe);
+    # `output` references the on-disk capture file when the outcome kept one;
+    # a pass (unlinked) and a spawn failure (never created) have none.
+    var lp: [4096]u8;
+    if (has_capture(o0.kind) && log_path(?lp[0], 4096, jc.log_dir, art.idx)) {
+        json.field_str(?o, "output", ?lp[0]);
+    }
+    or {
+        json.field_str_or_null(?o, "output", nil);
+    }
+    json.object_end(?o);
+}
+
+# emit the `summary` event
+fun json_summary(ctx: ptr, outcomes: *Outcome, n: u32, passed: u32, failed: u32, wall: du.Duration) {
+    val jc: *JsonCtx = ctx::*JsonCtx;
+    var o: json.Object;
+    json.object_begin(?jc.w, ?o);
+    json.field_i64(?o, "schema", SCHEMA_VERSION);
+    json.field_str(?o, "event", "summary");
+    json.field_i64(?o, "passed", passed::i64);
+    json.field_i64(?o, "failed", failed::i64);
+    json.field_i64(?o, "total", n::i64);
+    json.field_i64(?o, "duration_ns", du.duration_nsec(wall));
+    json.object_end(?o);
+}
+
+# emit one `case` event describing a collected test in `--list` mode
+# ---
+# w:   the stdout writer to emit through
+# art: the collected test artifact
+fun emit_list_case(w: *writer.Writer, art: *build.TestArtifact) {
+    var o: json.Object;
+    json.object_begin(w, ?o);
+    json.field_i64(?o, "schema", SCHEMA_VERSION);
+    json.field_str(?o, "event", "case");
+    json.field_str(?o, "label", art.label);
+    json.field_str(?o, "module", art.module);
+    json.field_str(?o, "file", art.file);
+    json.field_i64(?o, "line", art.line::i64);
+    json.field_i64(?o, "index", art.idx::i64);
+    json.object_end(?o);
+}
+
+# the JSON `kind` token for an outcome kind
+# ---
+# kind: a KIND_* outcome
+# ret:  the stable token ("pass", "exit", "signal", "spawn", "other")
+fun kind_name(kind: u8) *u8 {
+    if (kind == KIND_PASS)   { ret "pass"; }
+    if (kind == KIND_EXIT)   { ret "exit"; }
+    if (kind == KIND_SIGNAL) { ret "signal"; }
+    if (kind == KIND_SPAWN)  { ret "spawn"; }
+    ret "other";
+}
+
+# whether a finalized outcome left its capture file on disk (so its output can
+# be referenced): a reaped non-passing outcome keeps its file, while a pass is
+# unlinked and a spawn failure never created one
+# ---
+# kind: a KIND_* outcome
+# ret:  true when the capture file persists
+fun has_capture(kind: u8) bool {
+    ret kind == KIND_EXIT || kind == KIND_SIGNAL || kind == KIND_OTHER;
 }
 
 # spawn one test child into a free slot, its stdout and stderr bound to its
