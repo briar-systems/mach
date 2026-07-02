@@ -66,6 +66,13 @@ secondary spans, and out-of-range integer literals now report their bounds.
   convention (`linux-x86_64`, `windows-x86_64`, `darwin-x86_64` on the host isa),
   matching the root manifest's normalized naming. A fresh project now writes
   `out/linux-x86_64/…` rather than `out/linux/…` (#1832).
+- cli: **JSON emission moved to `std.data.json`** - the streaming NDJSON emitter
+  that backed `mach test --format json` and `mach check --format json` (the
+  `mach.cli.json` module) now lives in mach-std, unified with the tree emitter
+  behind one escape core. `src/cli/json.mach` is deleted and both consumers
+  (`testing.mach`, `diagnostic.mach`) import `std.data.json`; the mach.lock
+  mach-std bump carries the moved code. Both JSON streams are byte-identical
+  before and after (mach-std#338).
 
 ### Removed
 

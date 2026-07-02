@@ -18,7 +18,7 @@ Every line is a complete JSON object carrying a `schema` version integer and an
 characters use their JSON escapes and every byte `>= 0x80` is emitted as a
 `\uXXXX` escape (UTF-8 decoded, astral code points as a surrogate pair), so the
 output is byte-for-byte identical on every platform. Numbers are integers. The
-escaper is the shared `mach.cli.json` emitter, the same one `mach test --format
+escaper is the shared `std.data.json` emitter, the same one `mach test --format
 json` uses (see [test-json.md](test-json.md) for the escaping rationale).
 
 ### Paths and positions
