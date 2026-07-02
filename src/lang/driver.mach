@@ -664,6 +664,44 @@ pub fun build_project_union(s: *session.Session, project_root: str) R.Result[Pro
     ret build_project_impl(s, project_root, ?sel, true);
 }
 
+# file a `warning:` on the session diagnostic sink for a union target this build
+# cannot compose, naming the `<os>-<isa>` tuple and the reason
+#
+# The union path is maximally permissive by design (LSP / rename): one uncoverable
+# declared target must not abort loading the rest. Filing it (rather than a raw
+# stderr write) gives it a `warning:` label and orders it with the structured
+# diagnostics; like the native warning it carries no source span.
+# ---
+# p:        the project whose session sink and allocator back the message
+# os_name:  the target's os name
+# isa_name: the target's isa name
+# why:      the select_of error explaining the missing capability
+fun warn_union_target_skipped(p: *Project, os_name: str, isa_name: str, why: str) {
+    val a: str = "target '";
+    val b: str = "-";
+    val c: str = "' is not supported by this build; skipped in multi-target analysis: ";
+    val total: usize = str_len(a) + str_len(os_name) + str_len(b) + str_len(isa_name) + str_len(c) + str_len(why);
+
+    val r: R.Result[*u8, str] = A.allocate[u8](p.s.alloc, total + 1);
+    if (R.is_err[*u8, str](r)) { ret; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](r);
+    var k: usize = 0;
+    k = dcopy(buf, k, a);
+    k = dcopy(buf, k, os_name);
+    k = dcopy(buf, k, b);
+    k = dcopy(buf, k, isa_name);
+    k = dcopy(buf, k, c);
+    k = dcopy(buf, k, why);
+    buf[total] = 0;
+
+    var span: token.Span;
+    span.offset = 0;
+    span.len    = 0;
+    diagnostic.warning(?p.s.diags, 0xFFFFFFFF::src.FileId, span, buf::str);
+
+    A.deallocate[u8](p.s.alloc, buf, total + 1);
+}
+
 # record one TargetTuple per declared manifest target and
 # turn on union mode (#1391). The union load walk evaluates each `$if` branch
 # under every tuple, so a branch some target takes is followed. A manifest with no
@@ -674,7 +712,8 @@ fun populate_union_tuples(p: *Project, m: *manifest.Manifest) R.Result[bool, str
     val tr: R.Result[*TargetTuple, str] = A.allocate[TargetTuple](p.s.alloc, n::usize);
     if (R.is_err[*TargetTuple, str](tr)) { ret R.err[bool, str](R.unwrap_err[*TargetTuple, str](tr)); }
     val tuples: *TargetTuple = R.unwrap_ok[*TargetTuple, str](tr);
-    var k: u32 = 0;
+    var k:    u32 = 0;
+    var fill: u32 = 0;
     for (k < n) {
         val td: *manifest.TargetDef = ?m.targets[k];
         val os_opt:  O.Option[str] = intern.lookup(?p.s.interner, td.os);
@@ -696,19 +735,24 @@ fun populate_union_tuples(p: *Project, m: *manifest.Manifest) R.Result[bool, str
         if (O.is_some[str](of_opt)) { of_name = O.unwrap[str](of_opt); }
         val sr: R.Result[target.Target, str] = target.select_of(?p.s.registry, isa_name, os_name, abi_name, of_name);
         if (R.is_err[target.Target, str](sr)) {
-            A.deallocate[TargetTuple](p.s.alloc, tuples, n::usize);
-            ret R.err[bool, str](R.unwrap_err[target.Target, str](sr));
+            # the union is maximally permissive (LSP / rename load every declared
+            # target's branches, #1391/#1505): a declared target this build cannot
+            # compose is skipped with a warning, not aborted, so the remaining
+            # targets still load. `mach build <tuple>` stays strict via select_target.
+            warn_union_target_skipped(p, os_name, isa_name, R.unwrap_err[target.Target, str](sr));
+        } or {
+            tuples[fill].os_id         = os_id;
+            tuples[fill].arch_id       = arch_id;
+            tuples[fill].pointer_width = R.unwrap_ok[target.Target, str](sr).arch.pointer_width;
+            tuples[fill].os_name       = td.os;
+            tuples[fill].isa_name      = td.isa;
+            tuples[fill].abi_name      = td.abi;
+            fill = fill + 1;
         }
-        tuples[k].os_id         = os_id;
-        tuples[k].arch_id       = arch_id;
-        tuples[k].pointer_width = R.unwrap_ok[target.Target, str](sr).arch.pointer_width;
-        tuples[k].os_name       = td.os;
-        tuples[k].isa_name      = td.isa;
-        tuples[k].abi_name      = td.abi;
         k = k + 1;
     }
     p.union_tuples      = tuples;
-    p.union_tuple_count = n;
+    p.union_tuple_count = fill;
     p.union             = true;
     ret R.ok[bool, str](true);
 }
@@ -4267,6 +4311,46 @@ test "mach.lang.driver:union_nondefault_target_branch_module_loaded" {
     or (!ut_has(?p, ?s, "uniontest.b"))    { bad = 1; }
 
     dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# driver union: a declared target this build cannot compose is skipped with a
+# warning, not aborted, so the coverable targets still load (#1806). the strict
+# `mach build <tuple>` path (select_target) is unaffected.
+test "mach.lang.driver:union_skips_uncoverable_target" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    # one coverable target (linux/x86_64) and one this build cannot emit
+    # (windows/aarch64: COFF covers x86_64 only).
+    val mf: str = "[project]\nid = \"uskip\"\nname = \"u\"\nversion = \"0.0.0\"\nsrc = \"src\"\ntarget = \"native\"\nout = \"out/{target}/bin/{name}{ext}\"\n\n[target.good]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.bad]\nisa = \"aarch64\"\nos = \"windows\"\nabi = \"aapcs64\"\n\n[bin.uskip]\nentry = \"main.mach\"\n";
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = "fun main() i32 { ret 0; }\n";
+
+    val root_r: R.Result[str, str] = ut_scaffold_m(?alloc, mf, ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    val rr: R.Result[bool, str] = setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { filesystem.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+
+    # the union does NOT abort on the uncoverable target; it keeps the coverable one.
+    val pur: R.Result[Project, str] = build_project_union(?s, root);
+    filesystem.remove_all(?alloc, root);
+    if (R.is_err[Project, str](pur)) { session.dnit(?s); ret 1; }
+    var pu: Project = R.unwrap_ok[Project, str](pur);
+
+    var bad: i32 = 0;
+    if (pu.union_tuple_count != 1)      { bad = 1; }  # only [target.good] survived
+    or (!ut_has(?pu, ?s, "uskip.main")) { bad = 1; }
+
+    dnit_project(?pu);
     session.dnit(?s);
     ret bad;
 }

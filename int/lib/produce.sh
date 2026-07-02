@@ -16,6 +16,10 @@
 #                 (the static-PIE RELRO region). ELF-only; used by the elf-relro guard.
 #   flat-loader — load an os=freestanding, of=raw flat image via a tiny C loader
 #                 (mmap + jump) and report the image's exit status.
+#   built       — build-only: assert the tuple composed and emitted an artifact,
+#                 for a cross-built target with no host runner (a freestanding
+#                 aarch64/riscv64 image on the x86_64 leg). the observable is a
+#                 constant, so the golden is the fact "it emitted".
 
 # the directory this file lives in (int/lib), used to find flat_loader.c. resolved
 # from the sourced path so it does not depend on run.sh's variables.
@@ -153,6 +157,22 @@ produce_flat_loader() {
     printf 'exit=%d\n' "$ec"
 }
 
+# produce_built <runmode> <target> <binary>
+# a build-only observable: prove the tuple composes and emits an artifact without
+# running it. for a cross-built target with no host runner (a freestanding aarch64
+# / riscv64 flat image on the x86_64 linux leg) running is impossible, but the
+# emit path is exactly what must not regress. run.sh has already failed the case if
+# the build failed; this asserts the artifact exists and is non-empty.
+produce_built() {
+    bin=$3
+    if [ -s "$bin" ]; then
+        echo "built=1"
+    else
+        echo "int: built: artifact missing or empty" >&2
+        return 2
+    fi
+}
+
 # produce <run> <runmode> <target> <binary>
 # dispatches to the producer named by <run>, forwarding the remaining arguments.
 produce() {
@@ -164,6 +184,7 @@ produce() {
         field)       produce_field "$@" ;;
         relro)       produce_relro "$@" ;;
         flat-loader) produce_flat_loader "$@" ;;
+        built)       produce_built "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
 }

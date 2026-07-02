@@ -412,7 +412,7 @@ Plus the global flags. Exit codes: `0` ok, `1` user error, `2` internal error.
 ## `mach info`
 
 ```
-mach info [--version]
+mach info [--version | targets]
 ```
 
 Prints an at-a-glance identity of the binary: its version, the host (`os/isa`)
@@ -435,9 +435,29 @@ lines are read from the binary's target registries, so they report exactly what
 this build can target. `mach info --version` prints the version string alone on
 one line, for tooling.
 
-| Flag        | Value | Effect |
+`mach info targets` prints the **supported target-tuple matrix** — one
+`<os>-<isa>` per line — for exactly the tuples this binary can compose and emit
+end-to-end. Run the command to see the current set; it is *derived*, never
+curated, so a snapshot printed here would only drift.
+
+Each dimension is orthogonal on its own, but the joint cells are not: an
+instruction set emits only with a wired code generator, a calling convention is
+per-ISA, an object format relocates and writes only the ISAs it declares, and an
+operating system links and loads only its own object formats. `mach info targets`
+keeps a `<os>-<isa>` tuple only when some registered calling convention and object
+format compose an emittable full tuple — so `windows-aarch64` is absent (COFF
+covers x86-64 only) and `darwin-riscv64` is absent (Mach-O covers x86-64 and
+aarch64), while freestanding tuples appear for every ISA with an encoder.
+Selecting an uncovered tuple fails at composition naming the missing capability
+(for example `object format 'coff' does not cover aarch64 relocations`, or
+`operating system 'windows' does not support object format 'elf'`) rather than
+deep in codegen or link. Adding a capability declaration to a vtable is the only
+step needed for a new tuple to appear.
+
+| Argument    | Value | Effect |
 |-------------|-------|--------|
 | `--version` | —     | print the version string alone, on one line |
+| `targets`   | —     | print the supported target-tuple matrix, one `<os>-<isa>` per line |
 
 Exit codes: `0` ok, `2` internal error.
 
