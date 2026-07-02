@@ -404,7 +404,7 @@ Plus the global flags. Exit codes: `0` ok, `1` user error, `2` internal error.
 ## `mach info`
 
 ```
-mach info [--version]
+mach info [--version | targets]
 ```
 
 Prints an at-a-glance identity of the binary: its version, the host (`os/isa`)
@@ -427,9 +427,38 @@ lines are read from the binary's target registries, so they report exactly what
 this build can target. `mach info --version` prints the version string alone on
 one line, for tooling.
 
-| Flag        | Value | Effect |
+`mach info targets` prints the **supported target-tuple matrix** — one
+`<os>-<isa>` per line — for exactly the tuples this binary can emit end-to-end:
+
+```
+linux-x86_64
+linux-aarch64
+linux-riscv64
+darwin-x86_64
+darwin-aarch64
+windows-x86_64
+freestanding-x86_64
+freestanding-aarch64
+freestanding-riscv64
+```
+
+The matrix is *derived*, never curated. Each dimension is orthogonal on its own,
+but the joint cells are not: a calling convention is per-ISA, and an object
+format relocates and writes only the instruction sets it declares. `mach info
+targets` walks the registered vtables and keeps a `<os>-<isa>` tuple only when
+the ISA has an instruction selector and encoder, the OS's object format covers
+that ISA's relocations, and a calling convention targets it — so `windows-aarch64`
+is absent because COFF declares x86-64 coverage only, and freestanding/raw tuples
+appear for every ISA with an encoder. Selecting an uncovered tuple fails at
+composition naming the missing capability (e.g. `object format 'coff' does not
+cover aarch64 relocations`) rather than deep in codegen or link. Adding a
+capability declaration to a vtable is the only step needed for a new tuple to
+appear here.
+
+| Argument    | Value | Effect |
 |-------------|-------|--------|
 | `--version` | —     | print the version string alone, on one line |
+| `targets`   | —     | print the supported target-tuple matrix, one `<os>-<isa>` per line |
 
 Exit codes: `0` ok, `2` internal error.
 
