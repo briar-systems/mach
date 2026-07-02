@@ -428,32 +428,23 @@ this build can target. `mach info --version` prints the version string alone on
 one line, for tooling.
 
 `mach info targets` prints the **supported target-tuple matrix** — one
-`<os>-<isa>` per line — for exactly the tuples this binary can emit end-to-end:
+`<os>-<isa>` per line — for exactly the tuples this binary can compose and emit
+end-to-end. Run the command to see the current set; it is *derived*, never
+curated, so a snapshot printed here would only drift.
 
-```
-linux-x86_64
-linux-aarch64
-linux-riscv64
-darwin-x86_64
-darwin-aarch64
-windows-x86_64
-freestanding-x86_64
-freestanding-aarch64
-freestanding-riscv64
-```
-
-The matrix is *derived*, never curated. Each dimension is orthogonal on its own,
-but the joint cells are not: a calling convention is per-ISA, and an object
-format relocates and writes only the instruction sets it declares. `mach info
-targets` walks the registered vtables and keeps a `<os>-<isa>` tuple only when
-the ISA has an instruction selector and encoder, the OS's object format covers
-that ISA's relocations, and a calling convention targets it — so `windows-aarch64`
-is absent because COFF declares x86-64 coverage only, and freestanding/raw tuples
-appear for every ISA with an encoder. Selecting an uncovered tuple fails at
-composition naming the missing capability (e.g. `object format 'coff' does not
-cover aarch64 relocations`) rather than deep in codegen or link. Adding a
-capability declaration to a vtable is the only step needed for a new tuple to
-appear here.
+Each dimension is orthogonal on its own, but the joint cells are not: an
+instruction set emits only with a wired code generator, a calling convention is
+per-ISA, an object format relocates and writes only the ISAs it declares, and an
+operating system links and loads only its own object formats. `mach info targets`
+keeps a `<os>-<isa>` tuple only when some registered calling convention and object
+format compose an emittable full tuple — so `windows-aarch64` is absent (COFF
+covers x86-64 only) and `darwin-riscv64` is absent (Mach-O covers x86-64 and
+aarch64), while freestanding tuples appear for every ISA with an encoder.
+Selecting an uncovered tuple fails at composition naming the missing capability
+(for example `object format 'coff' does not cover aarch64 relocations`, or
+`operating system 'windows' does not support object format 'elf'`) rather than
+deep in codegen or link. Adding a capability declaration to a vtable is the only
+step needed for a new tuple to appear.
 
 | Argument    | Value | Effect |
 |-------------|-------|--------|
