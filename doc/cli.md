@@ -15,6 +15,13 @@ matched exactly: `--flag value` (a value follows in the next argument) or a bare
 `--flag` toggle. The combined `--flag=value` form and bundled short flags are
 **not** recognized.
 
+An unrecognized flag is a hard error. Before it resolves positionals, each
+command rejects the first `-`/`--` token it does not accept — `error: unknown
+flag '<flag>' for '<command>'` — so a typo'd or removed flag never silently
+misparses as a project path or link input. Arguments after a `--` separator are
+program arguments, not flags (`mach run` forwards them to the executed binary),
+so a value that must begin with `-` is passed there.
+
 ## Commands
 
 | Command | Summary |
