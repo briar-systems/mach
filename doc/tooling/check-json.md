@@ -10,7 +10,8 @@ The stream is written to **stdout**. Usage errors and internal failures (an
 unreadable file, an analysis that could not run) stay on **stderr**, so a
 consumer reads a clean event stream on stdout regardless of that noise. Exit
 codes are unchanged from the human mode: `0` when the buffer has no
-error-severity diagnostics, `1` when it has any (or on a usage / io error).
+error-severity diagnostics, `1` when it has any (or on a usage / io error), and
+`2` on an allocator bootstrap failure.
 
 Every line is a complete JSON object carrying a `schema` version integer and an
 `event` discriminator. Strings are escaped to printable ASCII: control
@@ -23,12 +24,21 @@ json` uses (see [test-json.md](test-json.md) for the escaping rationale).
 ### Paths and positions
 
 `file` is emitted exactly as the compiler references it — the path passed to
-`mach check`, relative to the working directory or absolute as given. Line and
-column numbers are **1-based**, matching the human renderer and the compiler's
-own convention; a consumer feeding an LSP (whose `Position` is 0-based) subtracts
-one from each. A span is half-open: `start` is the position of its first byte
-and `end` is the position just past its last, so a zero-width span has
-`start == end`.
+`mach check`, relative to the working directory or absolute as given. Positions
+are **1-based**, matching the human renderer and the compiler's own convention:
+`line` is the 1-based line number, and `col` is the 1-based **byte** offset of
+the position within its line (not a character or code-unit count). A span is
+half-open: `start` is the position of its first byte and `end` is the position
+just past its last, so a zero-width span has `start == end`.
+
+Converting to an LSP `Position` is therefore **not** a uniform subtract-one. LSP
+is 0-based and its `Position.character` counts UTF-16 code units by default.
+Subtract one from `line`. For `col`, subtract one to get a 0-based byte offset,
+then convert that byte offset to a UTF-16 code-unit offset against the line's
+text: an ASCII line converts one-to-one, but a line with multibyte content does
+not — on a `héllo` line, mach's byte `col` 4 lands at LSP `character` 2, not 3. A
+consumer that retains the source buffer does this with the line text it already
+holds.
 
 ## Versioning
 
@@ -71,10 +81,28 @@ Each **related** element is:
 | `location` | object / null | the secondary location, or `null` when its file does not resolve |
 | `label`    | string / null | the caption rendered under the secondary span, or `null` for a bare context span |
 
+A diagnostic as `mach check` emits it today — a syntactic error with no note,
+help, or related span:
+
 ```json
 {"schema":1,"event":"diagnostic","severity":"error","message":"expected an expression","location":{"file":"buf.mach","start":{"line":2,"col":12},"end":{"line":2,"col":13}},"note":null,"help":null,"related":[]}
+```
+
+The `note`, `help`, and `related` fields carry the full diagnostic model for a
+diagnostic that populates them — a resolve-stage diagnostic such as a duplicate
+definition, with a `= help:` suggestion and a `previous definition here` related
+span:
+
+```json
 {"schema":1,"event":"diagnostic","severity":"error","message":"duplicate definition of 'dup'","location":{"file":"buf.mach","start":{"line":2,"col":5},"end":{"line":2,"col":8}},"note":null,"help":"rename one of the definitions","related":[{"location":{"file":"buf.mach","start":{"line":1,"col":5},"end":{"line":1,"col":8}},"label":"previous definition here"}]}
 ```
+
+Today `mach check` reports **parse-stage diagnostics only**, so `note`, `help`,
+and `related` are structurally `null` / empty on a real run — the second example
+illustrates the schema's capacity, not current output. `help` and `related` are
+populated at the resolve stage, which `mach check` does not yet run (see
+[editor-api.md](editor-api.md)); whether check should deepen to resolve is
+tracked in [#1839](https://github.com/briar-systems/mach/issues/1839).
 
 ### `summary`
 

@@ -274,21 +274,26 @@ mach check <file> [--format human|json]
 
 Reports diagnostics for a single source file, feeding its text straight through
 the editor query surface — no `mach.toml`, module graph, or link step. It is the
-editor-facing diagnostics slice exposed as a CLI verb.
+editor-facing diagnostics slice exposed as a CLI verb. It reports **parse-stage
+diagnostics only**: it does not run name resolution or sema, so a real run never
+carries the `= help:` suggestions or secondary (`related`) spans those stages
+produce — whether check should deepen to resolve is tracked in
+[#1839](https://github.com/briar-systems/mach/issues/1839).
 
 | Flag              | Value            | Effect |
 |-------------------|------------------|--------|
 | `--format <mode>` | `human`\|`json`  | diagnostic format: framed source snippets on stderr (default `human`), or the machine-readable NDJSON stream on stdout |
 
 `--format json` emits one JSON object per line on stdout — a `diagnostic` object
-per reported diagnostic (severity, message, primary location, note, help, and
-the related list) and a closing `summary` — with no human frames interleaved.
-The schema is versioned and documented in
+per reported diagnostic (severity, message, primary location, and the `note`,
+`help`, and `related` fields, structurally `null` / empty today per the
+parse-only note above) and a closing `summary` — with no human frames
+interleaved. The schema is versioned and documented in
 [tooling/check-json.md](tooling/check-json.md); pin tooling to its `schema`
 integer. Usage and io errors stay on stderr, so the stdout stream is clean.
 
 Exit codes: `0` when the buffer has no error-severity diagnostics, `1` when it
-has any (or on a usage / io error).
+has any (or on a usage / io error), and `2` on an allocator bootstrap failure.
 
 ## `mach dep`
 
