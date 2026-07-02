@@ -72,6 +72,12 @@ secondary spans, and out-of-range integer literals now report their bounds.
 - cli: the orphaned **`--color` flag** and its `ColorMode` surface, dead since
   the ASCII-only diagnostic renderer (#1777) dropped the color argument -
   `--color` had parsed but no-opped (#1784).
+- build/run/test: the inert **`--artifacts <dir>` flag** and its `Config`
+  field - it parsed but no code ever read it, so it silently no-opped. The
+  object-tree location is expressed by the manifest `obj` template
+  (`out/{target}/{profile}/obj`), which expands per target/profile/artifact; a
+  flat CLI override cannot and would collide every target's objects into one
+  directory (#1829).
 
 ### Fixed
 
