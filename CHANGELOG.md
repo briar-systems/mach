@@ -112,6 +112,15 @@ secondary spans, and out-of-range integer literals now report their bounds.
   that one path and overwrote the previous, leaving only the last target's binary
   with no warning. The combination now errors (`-o cannot be combined with
   --all-targets`) at parse; single-target `-o` is unchanged (#1831).
+- driver: **unknown flags are rejected instead of silently misparsing** - an
+  unrecognized flag was never reported and hijacked positional resolution
+  (`mach build --color always .` resolved `always` as the project path). Each
+  command now marks the flags it consumes and rejects the first unmarked
+  `-`-prefixed token before resolving positionals - `error: unknown flag '<flag>'
+  for '<command>'`, exit `1`. `-h` / `--help` are not flags; use `mach help
+  <command>`. The `--` end-of-flags separator is honored only by `mach run`, which
+  forwards every post-`--` token to the executed program as its `argv`; on every
+  other command `--` is itself rejected as an unknown flag (#1810).
 
 ## [2.12.0] - 2026-07-01
 
