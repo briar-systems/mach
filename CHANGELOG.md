@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- diag: a framed source-snippet renderer for driver diagnostics - each
+  reported error/warning shows its source line in a frame with a caret span,
+  file:line:col header, and severity-tagged message, replacing the one-line
+  flush (#1777).
+- test: a per-module roll-up readout for `mach test` - all-passing modules
+  collapse to one line, failures expand with the child's captured stdout,
+  `file:line`, and exit code or signal, and the run ends with a summary that
+  re-lists the failures; a crashing test reports its signal and the run
+  continues (#1776). Extended to a live, parallel readout later in this
+  cycle (see the `Changed` entries).
 - build: `-v` prints a per-phase readout (load / resolve / sema / lower /
   optimize / codegen / link) with item counts and timing, closed by a
   `built <path>  N modules  <size>  in <time>` summary; `-vv` adds a
