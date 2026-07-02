@@ -83,8 +83,10 @@ in-tree. `--filter` narrows the run by test name in either mode.
 
 ## The `mach test` workflow
 
-`mach test` builds the project with the test-runner entry point and then
-runs the resulting binary, surfacing its exit code:
+`mach test` builds one standalone executable per `test` declaration, spawns
+each as its own process, captures its output, and renders a per-module readout —
+collapsing all-passing modules to a single roll-up line and expanding any
+module with a failure to show the failing test's captured output and location:
 
 ```
 usage: mach test [options]
@@ -95,9 +97,15 @@ options:
   --filter <pattern>  run only tests whose name contains <pattern>
   --include-deps      also run tests declared in dependency modules
   --list              list the collected tests and exit
+  -v                  list every test, grouped by module, with durations
 
 exit: 0 all passed, 1 any failed, 2 build/internal error
 ```
+
+A roll-up is `<module>  <ok> ok[  <fail> FAIL]  <duration>`. Each expanded
+failure shows `file:line`, the exit code (`(exit N)`) or signal (`(signal N)`),
+and the child's captured stdout indented beneath; a passing test stays quiet.
+The run closes with a summary that re-lists every failure.
 
 The command itself does two things:
 
@@ -121,19 +129,20 @@ whose label contains the given pattern.
 
 ## The runner
 
-The runner is synthesized in IR by the compiler (`mach.lang.me.lower.testrunner`)
-during a test build and codegen'd into one extra object that joins the link.
-For each collected test it emits a body-less extern referencing the test's
-linkage name plus a private `.rodata` global holding the label; the synthesized
-`main` then walks the table. In a test build the project's own `main` is
-neutralised (turned into a body-less extern) so the runner's `main` is the sole
-program entry, and an executable is always linked — even for a library target.
+For each collected test the compiler (`mach.lang.me.lower.testrunner`)
+synthesizes a tiny IR module whose `main` is `ret <test>();` — a signature-only
+extern for the test symbol plus a two-instruction body — codegen'd into one extra
+object that links with the project's objects into a standalone executable for
+that test. In a test build the project's own `main` is neutralised (turned into a
+body-less extern) so the synthesized `main` is the sole program entry, and an
+executable is always linked — even for a library target.
 
-The runner prints one line per executed test, `PASS <label>` or `FAIL <label>`,
-to stdout, and returns `0` when every selected test passed and `1` otherwise.
-It reads `--list` / `--filter` from its own argv (forwarded by `mach test`). The
-only OS interaction is a `write` syscall emitted as a small inline-asm helper,
-so the runner has no standard-library dependency.
+`mach test` itself spawns each per-test executable, captures the child's stdout,
+times it, and reads its exit status, then renders the per-module readout
+described above (a roll-up per module, expanded failures with captured output
+and `file:line`, a closing failure summary) and returns `0` when every selected
+test passed and `1` otherwise. `--list` / `--filter` select or enumerate which
+tests are built and run; `-v` lists every test with its duration.
 
 Tests live inline alongside the code they cover: write `test "..." { }`
 declarations directly in the relevant `src/` module, or group them under

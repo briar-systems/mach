@@ -31,11 +31,12 @@ matched exactly: `--flag value` (a value follows in the next argument) or a bare
 ## Global flags
 
 Read by `build`, `run`, `test`, and `doc` (they share one config parser).
-`--verbose` and `--quiet` together is a parse error.
+A verbosity flag (`-v`/`-vv`) and `--quiet` together is a parse error.
 
 | Flag             | Value            | Effect |
 |------------------|------------------|--------|
-| `--verbose`, `-v`| —                | write extra detail (per-stage compile progress) to stderr |
+| `-v`             | —                | `mach build`: per-phase roll-up (load/resolve/sema/lower/optimize/codegen/link) with item counts + timing, then a `built … N modules … in …` summary, on stderr |
+| `-vv`            | —                | `-v` plus a per-module/file line under each phase with its duration and a `(slow)` marker on the slowest |
 | `--quiet`, `-q`  | —                | suppress non-error output |
 | `--color <mode>` | `auto`\|`always`\|`never` | color preference for terminal output (default `auto`); an unknown mode is a parse error |
 | `--target <name>`| target name      | select a declared target; absent, defers to `[project].target` |
@@ -189,9 +190,36 @@ mach test <path> [options]
 
 Builds one standalone executable per `test` declaration (the test plus the
 project's transitive code, with a synthesized `main` calling just that test),
-then spawns each as a separate process and reports a per-test
-`name file:line PASS|FAIL` line. A crashing test reports its signal and the run
-continues. A test build always links executables, even for a library target.
+then spawns each as a separate process, captures its output, and times it.
+A test build always links executables, even for a library target.
+
+The readout is live: every all-passing module collapses to a single roll-up
+line that prints the moment the module's last test completes, and a module
+with failures expands each failing test as it happens:
+
+```
+mach.lang.intern      3 ok     568us
+mach.lang.driver     27 ok     1 FAIL    146ms
+  FAIL  mach.lang.driver.builds:cyclic_import  ./src/lang/driver.mach:142  (exit 1)
+    expected a diagnostic, got none
+
+failures:
+  mach.lang.driver.builds:cyclic_import  ./src/lang/driver.mach:142  (exit 1)
+
+437 passed, 1 failed, 438 total  (268ms)
+```
+
+A roll-up is `<module>  <ok> ok[  <fail> FAIL]  <duration>`. Column widths are
+computed from the collected tests before the run (clamped, so one long name
+cannot blow out the table); test labels print verbatim, exactly as declared.
+Each expanded failure carries the test's `file:line`, its exit code
+(`(exit N)`) or signal (`(signal N)`), and the child's captured stdout
+indented beneath it; a passing test stays quiet. A crashing test reports its
+signal and the run continues. The closing summary re-lists every failure as
+`<test>  file:line  (reason)` and reports the run's wall time. `-v` prints a
+module header when its first test starts and a line per test as it completes;
+`-vv` additionally prints passing tests' captured output. The layout is
+fixed-width ASCII (no color, no terminal-width queries).
 
 Only `test` blocks declared in the current project's own modules are collected by
 default; tests in dependency modules are excluded unless `--include-deps` is
@@ -199,18 +227,29 @@ passed.
 
 | Flag                | Value   | Effect |
 |---------------------|---------|--------|
+| `--jobs <n>`        | count   | run up to `<n>` test processes at once (default: the CPUs available; 1 serializes) |
 | `--filter <pattern>`| pattern | run only tests whose name contains `<pattern>` |
 | `--include-deps`    | —       | also collect tests declared in dependency modules |
 | `--list`            | —       | list the collected tests and exit |
-| `--runner <cmd>`    | command | launch every test as `<cmd> <exe>` instead of exec'ing it directly |
+| `--runner <cmd>`    | command | launch every test as `<cmd> <exe> <idx>` instead of exec'ing the dispatcher directly |
 
-Plus the `build` and global flags. `--runner` has the same semantics as on
-`mach run`: a single command name or path (no shell-style word splitting),
-resolved on `PATH`, for foreign-target tests the host cannot exec directly —
-e.g. `mach test . --target windows --runner wine`. Without it, a test executable
-the host cannot launch reports a per-test failure — `FAIL(exit 127)` when
-`execve` rejects the binary in the spawned child, `FAIL(spawn)` when the spawn
-itself fails — with no auto-detection.
+Plus the `build` and global flags (`-v` lists every test). The build produces a
+single dispatcher executable covering every collected test; the runner keeps up
+to `--jobs` children in flight, each spawned as `<exe> <idx>`, so every test
+still runs in its own process. Each child's stdout and stderr are captured to a
+per-test file under `log/` beside the dispatcher: a passing test's file is
+removed on the spot, a failing test's file stays for inspection (the expanded
+failure shows the first 64KB, a `full output:` pointer when that truncates, and
+the exact `rerun:` command). Results render in collection order regardless of
+completion order, so the readout is deterministic. `--filter` selects at run
+time — the built executable is identical regardless of filter. `--runner` has
+the same semantics as on `mach run`: a single command name or path (no
+shell-style word splitting), resolved on `PATH`, for foreign-target tests the
+host cannot exec directly — e.g. `mach test . --target windows --runner wine`
+(the runner receives the executable path and the test index as its two
+arguments). Without it, a test executable the host cannot launch reports a
+per-test failure — `(exit 127)` when `execve` rejects the binary in the spawned
+child, `(spawn failed)` when the spawn itself fails — with no auto-detection.
 
 Exit codes: `0` all passed, `1` any failed, `2` build/internal error.
 

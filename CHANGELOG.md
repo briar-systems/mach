@@ -5,6 +5,113 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.0] - 2026-07-01
+
+The terminal output & test-harness overhaul: framed source-snippet diagnostics,
+a per-phase build readout, and `mach test` rebuilt around a single dispatcher
+binary with live, parallel, deterministic reporting (epic #1788 - on mach's own
+438-test suite, `mach test .` drops 44.9s -> 7.2s wall and 9.4 GB -> one 7.3 MB
+artifact). Static-PIE self-relocation is now active under `--pie`. Contains
+breaking CLI changes - see Breaking. Built with mach 2.11.0.
+
+### Breaking
+
+- build/test: the `--verbose` flag is gone; use `-v` / `-vv` (#1775).
+- test: `--runner <cmd>` now launches `<cmd> <exe> <idx>` - the runner receives
+  the dispatcher path and a test index instead of a per-test executable (#1789).
+- test: the `tests` manifest template's `{name}` resolves to the product name
+  (one dispatcher binary) rather than a per-test name (#1789).
+
+### Added
+
+- diag: a framed source-snippet renderer for driver diagnostics - each
+  reported error/warning shows its source line in a frame with a caret span,
+  file:line:col header, and severity-tagged message, replacing the one-line
+  flush (#1777).
+- test: a per-module roll-up readout for `mach test` - all-passing modules
+  collapse to one line, failures expand with the child's captured stdout,
+  `file:line`, and exit code or signal, and the run ends with a summary that
+  re-lists the failures; a crashing test reports its signal and the run
+  continues (#1776). Extended to a live, parallel readout later in this
+  cycle (see the `Changed` entries).
+- link: static-PIE self-relocation is active - under `--pie` the mach-std
+  runtime relocates the image's absolute pointers at startup, covered by an
+  int exec guard (#1727).
+- build: `-v` prints a per-phase readout (load / resolve / sema / lower /
+  optimize / codegen / link) with item counts and timing, closed by a
+  `built <path>  N modules  <size>  in <time>` summary; `-vv` adds a
+  per-module/file line under each phase with its own duration and a `(slow)`
+  marker on the slowest item. Fixed-width ASCII on stderr, identical across
+  platforms - timing via `chrono.monotonic`, durations via
+  `chrono.format_duration`, columns via the `{:<N}`/`{:N}` format spec (#1775).
+
+### Changed
+
+- test: `mach test` runs tests **in parallel** - a sliding window of `--jobs`
+  child processes (default: the CPUs available to the process; `--jobs 1`
+  serializes), reaped with a blocking wait-any. Each child's stdout *and
+  stderr* are captured to a per-test file under `log/` beside the dispatcher;
+  a passing test's file is removed on reap, a failing test's stays (the
+  expanded failure shows the first 64KB, a `full output:` pointer when
+  truncated, and the exact `rerun: <exe> <idx>` command). Results render in
+  collection order regardless of completion order, so the readout is
+  deterministic (#1791).
+- test: the `mach test` readout is **live** - each module's roll-up prints the
+  moment its last test completes, and failures expand as they happen. Column
+  widths are computed from the collected tests (clamped) instead of hard-coded,
+  test labels print verbatim as declared (the old `<module>.`-prefix stripping
+  is gone), durations right-align, and the closing summary reports the run's
+  wall time. `-v` prints each test's line as it completes; `-vv` now also
+  prints passing tests' captured output (it was a silent alias of `-v`);
+  `mach test --help` documents both (#1790).
+- test: `mach test` builds **one dispatcher executable** covering every
+  collected test instead of one standalone executable per test - one link
+  instead of N (on mach itself: 44.9s → 7.2s wall, 9.4 GB → 7.3 MB on disk).
+  Each test still runs as its own process, spawned as `<exe> <idx>`. `--runner`
+  now receives the executable path and the test index as its two arguments;
+  `--filter` selects at run time, so the built executable is identical
+  regardless of filter; the `tests` template's `{name}` resolves to the product
+  name (falling back to the project id) rather than a per-test name (#1789).
+
+### Removed
+
+- build: the `--verbose` flag, replaced by `-v`/`-vv` (#1775).
+
+### Fixed
+
+- ci(int): the darwin-x86_64 integration leg never ran - it queued forever on
+  starved `macos-13` runners and died at GitHub's 24h cap; routed to `macos-14`
+  under Rosetta 2, mirroring CD (#1787).
+
+## [2.11.0] - 2026-06-30
+
+Position independence and multi-arch ELF dynamic linking: opt-in static-PIE
+executable emission for linux, PLT/GOT writers for aarch64 and riscv64, plus
+editor groundwork and a loud-error sweep over the backend's silent fallbacks.
+Built with mach 2.10.0.
+
+### Added
+
+- link/elf: opt-in **static-PIE** (`ET_DYN`) linux executables via `--pie` /
+  `$mach.build.pie` - `PT_PHDR` load-bias recovery, a synthesized `.rela.dyn`
+  of `R_*_RELATIVE` base relocations, and `PT_DYNAMIC`; runtime self-relocation
+  activates in the next release (#1727).
+- of/elf: aarch64 and riscv64 **PLT/GOT dynamic-link writers** with byte-level
+  encoding guards, completing dynamic linking across the shipped linux ISAs
+  (#1741).
+- editor: sema retains per-expression types on `SemaResult` for editor/LSP
+  consumption (#1501).
+- ci: an x86_64-darwin release lane via Rosetta 2 on `macos-14` - Intel
+  runners are queue-starved (#1728); darwin integration legs run on merge to
+  main rather than a schedule (#1765).
+- int: structural (field) and freestanding (flat-loader) producers widen what
+  the integration harness can assert (#1760).
+
+### Fixed
+
+- be: silent backend fallbacks now fail loudly, with the AAPCS64 edge rules
+  documented where they were being papered over (#1745).
+
 ## [2.10.0] - 2026-06-29
 
 Native arm64 macOS. mach now compiles, ad-hoc code-signs, and self-hosts

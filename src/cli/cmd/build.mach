@@ -25,7 +25,6 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_contains;
 use std.types.string.str_empty;
 use std.types.string.str_equals;
 use std.types.string.str_len;
@@ -33,6 +32,7 @@ use std.types.string.str_len;
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
+use ctime: std.chrono.time;
 
 use cfg: mach.cli.config;
 use cli_diag: mach.cli.diagnostic;
@@ -50,6 +50,7 @@ use mach.lang.me.lower;
 use mach.lang.me.lower.context;
 use mach.lang.me.lower.testrunner;
 use mach.lang.me.pipeline;
+use mach.lang.readout;
 use mach.lang.session;
 use mach.lang.source;
 use mach.lang.target;
@@ -64,21 +65,27 @@ pub rec BuildResult {
     output_path: *u8;
 }
 
-# one built test - its reporting metadata and the executable path
+# one built test - its reporting metadata and its dispatch coordinates
 #
 # All owned strings come from the build allocator, so they outlive the session
 # teardown inside `build_tests` and stay valid until the caller frees that
 # allocator (after it has run every test).
 # ---
-# label: owned printable test name (the `test "..."` literal's inner text)
-# file:  owned source file path of the declaring module
-# line:  1-based source line of the `test` keyword
-# exe:   owned absolute path to the test executable; nil in `--list` mode
+# module: owned fully-qualified name of the declaring module, the runner's
+#         per-module roll-up key (collection order keeps a module's tests adjacent)
+# label:  owned printable test name (the `test "..."` literal's inner text)
+# file:   owned source file path of the declaring module
+# line:   1-based source line of the `test` keyword
+# exe:    owned absolute path to the shared dispatcher executable (the same
+#         path on every artifact of a build); nil in `--list` mode
+# idx:    the test's dispatch index - the dispatcher runs it for `<exe> <idx>`
 pub rec TestArtifact {
-    label: *u8;
-    file:  *u8;
-    line:  u32;
-    exe:   *u8;
+    module: *u8;
+    label:  *u8;
+    file:   *u8;
+    line:   u32;
+    exe:    *u8;
+    idx:    u32;
 }
 
 # the growing TestArtifact array a test build fills, in collection order
@@ -126,45 +133,17 @@ rec EmitArtifacts {
     want_ir:  bool;
 }
 
-# resolve an interned StrId against the project interner and write it to stderr;
-# a miss writes "<?>"
-# ---
-# p:  the project (for its session interner)
-# id: the interned string to render
-fun emit_id(p: *driver.Project, id: intern.StrId) {
-    val opt_name: O.Option[str] = intern.lookup(?p.s.interner, id);
-    if (O.is_some[str](opt_name)) {
-        print.eprint(O.unwrap[str](opt_name));
-    }
-    or {
-        print.eprint("<?>");
-    }
-}
-
-# write the resolved target name and module count to stderr
+# resolve an interned module FQN to its readout display string
 #
-# The leading line of verbose output, emitted once after graph discovery.
+# Falls back to "<?>" for an un-interned id so a readout item always has a name.
 # ---
-# p: the project carrying the selected target and module graph
-fun emit_target(p: *driver.Project) {
-    print.eprint("target ");
-    if (p.target_entry != nil) { emit_id(p, p.target_entry.name); }
-    or                         { print.eprint("<none>"); }
-    print.eprint(" (");
-    print.eu64(p.topo_len::u64);
-    print.eprint(" module(s))\n");
-}
-
-# write a `<stage> <fqn>` progress line to stderr for one module
-# ---
-# p:     the project (for its interner)
-# stage: a short stage label (e.g. "sema", "codegen")
-# fqn:   the module's interned fully-qualified name
-fun emit_stage(p: *driver.Project, stage: *u8, fqn: intern.StrId) {
-    print.eprint(stage::str);
-    print.eprint(" ");
-    emit_id(p, fqn);
-    print.eprint("\n");
+# p:   the project (for its session interner)
+# fqn: the module's interned fully-qualified name
+# ret: the FQN string, or "<?>"
+fun fqn_name(p: *driver.Project, fqn: intern.StrId) str {
+    val opt_name: O.Option[str] = intern.lookup(?p.s.interner, fqn);
+    if (O.is_some[str](opt_name)) { ret O.unwrap[str](opt_name); }
+    ret "<?>";
 }
 
 # drive every reachable module through the back half of the pipeline
@@ -180,21 +159,21 @@ fun emit_stage(p: *driver.Project, stage: *u8, fqn: intern.StrId) {
 # level:       optimization pipeline level
 # test_mode:   neutralize the project `main` before codegen (the runner supplies entry)
 # verify_ir:   run the IR verifier after each module's pipeline
-# verbose:     write per-module stage lines to stderr
 # ea:          requested `.ir` / `.s` debug artifacts
 # irs:         caller-owned IR-module array, filled in topo order
 # ir_ready:    per-module flag set true once `irs[mid]` holds a built module
 # images:      caller-owned ObjectImage array, filled in topo order
 # image_ready: per-module flag set true once `images[mid]` holds a built image
 # ret:         ok(true) on success, or err with the first failure message
-fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: bool, verbose: bool, ea: *EmitArtifacts,
+fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: bool, ea: *EmitArtifacts,
                     irs: *ir.Module, ir_ready: *bool,
                     images: *of.ObjectImage, image_ready: *bool) R.Result[bool, str] {
     # type-check the whole module graph through Q_SEMA in topo order - memoized
     # and incremental across rebuilds on a long-lived session, computed fresh
     # each CLI build (fresh session, cold cache). run_sema_pass borrows each
     # module's SemaResult onto its ModuleEntry and publishes its typing /
-    # resolution / comptime ctx to the session for the back-end monomorphizer.
+    # resolution / comptime ctx to the session for the back-end monomorphizer. it
+    # records the readout's `sema` phase internally.
     val res_sema: R.Result[bool, str] = driver.run_sema_pass(p);
     if (R.is_err[bool, str](res_sema)) {
         ret R.err[bool, str](R.unwrap_err[bool, str](res_sema));
@@ -203,16 +182,19 @@ fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: b
     # do not lower or codegen a semantically broken module graph.
     if (diagnostic.has_errors(?p.s.diags)) { ret R.ok[bool, str](true); }
 
-    # lower + optimize every module first. in test mode the project's `main` is
-    # then neutralized (the runner supplies the program entry) before any module
-    # is codegen'd, so the dropped `main` body never reaches an object.
+    # lower every module to IR (rendering the textual `.ir` straight after each
+    # lowering, before optimization), then optimize, then - in test mode -
+    # neutralize the project `main` (the runner supplies the program entry) before
+    # any module is codegen'd. the three passes are timed as distinct readout
+    # phases; splitting lower from optimize is purely structural and leaves the
+    # produced objects byte-identical.
+    readout.phase_begin(p.s.readout, readout.PH_LOWER);
     var i: u32 = 0;
     for (i < p.topo_len) {
         val mid: session.ModuleId   = p.topo[i];
         val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
 
-        if (verbose) { emit_stage(p, "lower", m.fqn); }
-
+        val t_item: ctime.Time = readout.item_begin(p.s.readout);
         val res_lower: R.Result[ir.Module, str] = lower.lower_module(p.s, ?p.target, m.a, m.fqn, mid, m.sema_result, m.resolve_result, ?m.ctx);
         if (R.is_err[ir.Module, str](res_lower)) {
             ret R.err[bool, str](R.unwrap_err[ir.Module, str](res_lower));
@@ -227,14 +209,26 @@ fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: b
                 ret R.err[bool, str](R.unwrap_err[bool, str](res_emit));
             }
         }
+        readout.item(p.s.readout, readout.PH_LOWER, fqn_name(p, m.fqn), t_item);
+        i = i + 1;
+    }
+    readout.phase_end(p.s.readout, readout.PH_LOWER, p.topo_len, "module", "modules");
 
+    readout.phase_begin(p.s.readout, readout.PH_OPTIMIZE);
+    i = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId   = p.topo[i];
+        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
+
+        val t_item: ctime.Time = readout.item_begin(p.s.readout);
         val res_opt: R.Result[bool, str] = pipeline.run(?irs[mid::u32], ?p.target, level, verify_ir);
         if (R.is_err[bool, str](res_opt)) {
             ret R.err[bool, str](R.unwrap_err[bool, str](res_opt));
         }
-
+        readout.item(p.s.readout, readout.PH_OPTIMIZE, fqn_name(p, m.fqn), t_item);
         i = i + 1;
     }
+    readout.phase_end(p.s.readout, readout.PH_OPTIMIZE, p.topo_len, "module", "modules");
 
     if (test_mode) {
         val res_neutralize: R.Result[bool, str] = testrunner.neutralize_project_main(p.s, irs, p.module_len);
@@ -243,12 +237,13 @@ fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: b
         }
     }
 
+    readout.phase_begin(p.s.readout, readout.PH_CODEGEN);
     i = 0;
     for (i < p.topo_len) {
         val mid: session.ModuleId   = p.topo[i];
         val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
 
-        if (verbose) { emit_stage(p, "codegen", m.fqn); }
+        val t_item: ctime.Time = readout.item_begin(p.s.readout);
 
         # codegen, optionally rendering the resolved MIR to a `.s` artifact.
         var asm_file: filesystem.File;
@@ -275,8 +270,10 @@ fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: b
         images[mid::u32]      = R.unwrap_ok[of.ObjectImage, str](res_codegen);
         image_ready[mid::u32] = true;
 
+        readout.item(p.s.readout, readout.PH_CODEGEN, fqn_name(p, m.fqn), t_item);
         i = i + 1;
     }
+    readout.phase_end(p.s.readout, readout.PH_CODEGEN, p.topo_len, "module", "modules");
     ret R.ok[bool, str](true);
 }
 
@@ -363,14 +360,15 @@ pub fun build(a: *A.Allocator, argc: usize, argv: **u8, emit_obj: bool) BuildRes
     ret build_unit(a, argc, argv, emit_obj, false, nil, nil, false);
 }
 
-# build one standalone executable per `test` declaration
+# build the single dispatcher executable covering every collected `test`
 #
-# Returns the per-test artifacts (label, source `file:line`, and executable
-# path) for the `mach test` runner to spawn. Every test executable is the
-# project's transitive code plus a synthesized `main` that calls just that test
-# and exits with its `i32` result - independently runnable, never the project's
-# own binary path. Only tests declared in the current project's own modules are
-# built by default; `--include-deps` widens the build to dependency tests (#1556).
+# Returns the per-test artifacts (label, source `file:line`, and dispatch
+# coordinates) for the `mach test` runner to spawn. The one executable is the
+# project's transitive code plus a synthesized dispatcher `main` that runs the
+# test selected by a decimal index argument and exits with its `i32` result -
+# never the project's own binary path. Only tests declared in the current
+# project's own modules are collected by default; `--include-deps` widens the
+# collection to dependency tests (#1556), changing what the dispatcher embeds.
 # With `list_only` the build stops after collecting the tests, leaving each
 # artifact's `exe` nil. The returned strings are owned by `a` and outlive this
 # call's internal session teardown, so the caller frees `a` once it has run every
@@ -448,8 +446,8 @@ pub fun selection_from_config(config: *cfg.Config, out_sel: *manifest.Selection)
 # `cmd.run`/`cmd.test` path); with `ovr` set they come from one enumerated
 # matrix cell (the `mach build` loop), the only field the override replaces -
 # profile and every other flag still apply to each unit. When `tests_out` is
-# non-nil the build is a test build: it produces one executable per `test`
-# declaration and fills `tests_out` instead of linking a single artifact
+# non-nil the build is a test build: it produces the single test dispatcher
+# executable and fills `tests_out` instead of linking the project artifact
 # (`list_only` stops after collection). `test_mode` mirrors `tests_out != nil`.
 # ---
 # a:         allocator owning the session and the returned artifact path
@@ -564,10 +562,15 @@ fun build_unit(a: *A.Allocator, argc: usize, argv: **u8, emit_obj: bool, test_mo
     s.opt_explicit = cli_set;
     s.opt_release  = cli_level == pipeline.OPT_RELEASE;
 
-    # thread the CLI `--verbose` intent into the session so the front-end load
-    # walk emits per-module `lex`/`parse`/`resolve` progress lines, matching the
-    # back-end stage lines this command prints from `config.verbose`.
-    s.verbose = config.verbose;
+    # attach the build-progress readout (`-v`/`-vv`) so every phase from the
+    # front-end load walk through the back-end link records into one accumulator.
+    # a plain build (verbosity 0) leaves s.readout nil and stays silent; a test
+    # build's output belongs to the test runner, so the readout is build-only.
+    var ro: readout.Readout;
+    if (!test_mode && config.verbosity > 0) {
+        readout.init(?ro, a, config.verbosity);
+        s.readout = ?ro;
+    }
 
     # thread the CLI `--pie` intent into the session so the linker emits a
     # position-independent (ET_DYN) executable; off leaves the default ET_EXEC output.
@@ -597,12 +600,48 @@ fun build_unit(a: *A.Allocator, argc: usize, argv: **u8, emit_obj: bool, test_mo
     if (config.emit_ir)     { eff_emit_ir = true; }
     if (config.no_emit_ir)  { eff_emit_ir = false; }
 
-    br.code = compile_and_link(?p, level, emit_obj, test_mode, config.verify_ir, config.verbose, eff_emit_asm, eff_emit_ir, ?root[0], config.output, eff, argv, ?br.output_path, tests_out, list_only);
+    br.code = compile_and_link(?p, level, emit_obj, test_mode, config.verify_ir, eff_emit_asm, eff_emit_ir, ?root[0], config.output, eff, argv, ?br.output_path, tests_out, list_only);
 
-    cli_diag.flush(?s, ?s.diags, cfg.color_enabled(config.color));
+    # close the readout with the recap line on a successful, non-test build.
+    if (br.code == 0 && s.readout != nil) {
+        emit_summary(?p, ?ro, emit_obj, br.output_path);
+    }
+
+    cli_diag.flush(?s, ?s.diags);
     driver.dnit_project(?p);
+    readout.dnit(?ro);
     session.dnit(?s);
     ret br;
+}
+
+# render the readout's closing recap for a finished build
+#
+# Reports the module count and total time, plus the linked binary's size when
+# the build produced one (an executable). A library / object-only build has no
+# single binary, so the size segment is omitted.
+# ---
+# p:        the built project (for its module count and target mode)
+# ro:       the active readout
+# emit_obj: whether the build emitted objects only (no linked binary)
+# out:      the produced artifact path, or nil
+fun emit_summary(p: *driver.Project, ro: *readout.Readout, emit_obj: bool, out: *u8) {
+    var out_str: str = "<output>";
+    if (out != nil) { out_str = out::str; }
+
+    val te: *driver.TargetEntry = p.target_entry;
+    val is_lib: bool = emit_obj || (te != nil && te.mode == driver.MODE_LIBRARY);
+
+    if (!is_lib && out != nil) {
+        val fi_r: R.Result[filesystem.FileInfo, str] = filesystem.info_path(out::str);
+        if (R.is_ok[filesystem.FileInfo, str](fi_r)) {
+            val fi: filesystem.FileInfo = R.unwrap_ok[filesystem.FileInfo, str](fi_r);
+            var unit: str = "B";
+            val mag: i64 = readout.size_split(fi.size, ?unit);
+            readout.summary(ro, out_str, p.module_len, mag, unit, true);
+            ret;
+        }
+    }
+    readout.summary(ro, out_str, p.module_len, 0, "B", false);
 }
 
 # pick the optimization pipeline level for this build
@@ -629,8 +668,8 @@ fun resolve_opt_level(p: *driver.Project, cli_level: u8, cli_set: bool) u8 {
 # Returns the exit code and sets `*out_path` to the produced artifact path on
 # success. `out_override` (-o), when non-nil, replaces the resolved artifact
 # path. When `tests_out` is non-nil the build is a test build: per-module
-# objects are written once and one executable is linked per `test` (filling
-# `tests_out`) rather than a single artifact; `list_only` stops after collecting
+# objects are written once and the single test dispatcher executable is linked
+# (filling `tests_out`) rather than the project artifact; `list_only` stops after collecting
 # the tests.
 # ---
 # p:            the project carrying the module graph and session
@@ -638,7 +677,6 @@ fun resolve_opt_level(p: *driver.Project, cli_level: u8, cli_set: bool) u8 {
 # emit_obj:     emit a relocatable object instead of an executable
 # test_mode:    neutralize the project `main` before codegen
 # verify_ir:    run the IR verifier after each module's pipeline
-# verbose:      write per-stage progress to stderr
 # emit_asm:     request the per-module `.s` debug artifacts
 # emit_ir:      request the per-module `.ir` debug artifacts
 # root:         the resolved project root directory
@@ -649,7 +687,7 @@ fun resolve_opt_level(p: *driver.Project, cli_level: u8, cli_set: bool) u8 {
 # tests_out:    the list a test build fills, or nil for a normal build
 # list_only:    collect the tests without building executables (`--list`)
 # ret:          the process exit code
-fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: bool, verify_ir: bool, verbose: bool,
+fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: bool, verify_ir: bool,
                      emit_asm: bool, emit_ir: bool,
                      root: *u8, out_override: *u8,
                      argc: usize, argv: **u8, out_path: **u8,
@@ -659,8 +697,6 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
         print.eprint("error: project graph is empty; the entrypoint loaded no modules\n");
         ret 1;
     }
-
-    if (verbose) { emit_target(p); }
 
     # resolve the per-module `.ir` / `.s` output directories once, up front, each
     # from the manifest's resolved `ir`/`asm` template.
@@ -730,7 +766,7 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
     }
 
     var code: i64 = 0;
-    val res_compile: R.Result[bool, str] = compile_modules(p, level, test_mode, verify_ir, verbose, ?ea, irs, ir_ready, images, image_ready);
+    val res_compile: R.Result[bool, str] = compile_modules(p, level, test_mode, verify_ir, ?ea, irs, ir_ready, images, image_ready);
     if (R.is_err[bool, str](res_compile)) {
         # a `lower:reported` sentinel means lowering already filed a located
         # diagnostic on the sink; the flush prints it, so skip the raw reprint.
@@ -746,10 +782,10 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
         code = 1;
     }
     or (tests_out != nil) {
-        code = build_test_executables(p, level, verify_ir, verbose, root, argc, argv, images, irs, list_only, tests_out);
+        code = build_test_executables(p, level, verify_ir, root, argc, argv, images, irs, list_only, tests_out);
     }
     or {
-        code = link_artifact(p, emit_obj, verbose, root, out_override, argc, argv, images, out_path);
+        code = link_artifact(p, emit_obj, root, out_override, argc, argv, images, out_path);
     }
 
     free_modules(p, irs, ir_ready, images, image_ready);
@@ -760,24 +796,25 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
     ret code;
 }
 
-# build one standalone executable per collected `test`
+# build the single dispatcher executable covering every in-scope `test`
 #
-# The per-module objects are written once under the resolved `obj` template; the
-# external link inputs (libc, manifest/CLI libs) are resolved once. Then, for
-# each selected `test`, a tiny entry module (`main(){ret <test>();}`) is
-# synthesized, optimized, codegen'd to its own object, and linked with the shared
-# object set into a standalone executable at the resolved `tests` template path.
-# Only tests declared in the current project's own modules are selected by
-# default; `--include-deps` widens the selection to dependency tests (#1556), and
-# `--filter` narrows it by name. Each test's reporting metadata (label, source
-# `file:line`) and executable path are appended to `tests_out`. With `list_only`
-# the collection alone is reported and no objects or executables are produced. A
+# The per-module objects are written once under the resolved `obj` template and
+# the external link inputs (libc, manifest/CLI libs) are resolved once. One
+# dispatcher entry module (`main(argc, argv)` selecting a test by decimal
+# index) is then synthesized over the in-scope tests, optimized, codegen'd, and
+# linked with the shared object set into one executable at the resolved `tests`
+# template path. Only tests declared in the current project's own modules are
+# in scope by default; `--include-deps` widens the scope to dependency tests
+# (#1556), changing what the dispatcher embeds. `--filter` is a run-time
+# selection in the runner, so the built executable is identical regardless of
+# filter. Each test's reporting metadata (label, source `file:line`) and its
+# dispatch coordinates are appended to `tests_out`. With `list_only` the
+# collection alone is reported and no objects or executables are produced. A
 # build with no tests is a user error.
 # ---
 # p:         the project carrying the module graph and session
 # level:     optimization pipeline level
-# verify_ir: run the IR verifier on each synthesized entry module
-# verbose:   write the test-executable count to stderr
+# verify_ir: run the IR verifier on the synthesized dispatcher module
 # root:      the resolved project root directory
 # argc:      argument count including argv[0]
 # argv:      the argument vector (argc null-terminated byte pointers)
@@ -786,7 +823,7 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
 # list_only: report the collected tests without building (`--list`)
 # tests_out: the list to append each test's artifact to
 # ret:       0 on success, 1 on a user error, 2 on an internal error
-fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool, verbose: bool,
+fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool,
                            root: *u8, argc: usize, argv: **u8,
                            images: *of.ObjectImage, irs: *ir.Module,
                            list_only: bool, tests_out: *TestList) i64 {
@@ -804,26 +841,44 @@ fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool, verbo
         ret 1;
     }
 
-    # `--filter <substr>`: only the tests whose label contains the substring are
-    # built and reported. applied at build time so a filtered run builds only the
-    # matching executables. nil filter = every test.
-    val filter: *u8 = filter_value(argc, argv);
-
     # `--include-deps`: by default a test run is scoped to the current project's
-    # own modules; this flag also builds and runs tests declared in dependency
+    # own modules; this flag also embeds and runs tests declared in dependency
     # modules (#1556).
     val include_deps: bool = util.has_flag(argc, argv, "--include-deps");
 
-    # `--list`: report each selected test's metadata without producing any object.
-    if (list_only) {
-        var i: u32 = 0;
-        for (i < col.count) {
-            if (test_selected(p, ?col.tests[i], filter, include_deps)) {
-                val rc: i64 = record_test(p, ?col.tests[i], nil, tests_out, p.s.alloc);
-                if (rc != 0) { testrunner.free(p.s, ?col); ret rc; }
-            }
-            i = i + 1;
+    # the in-scope selection the dispatcher embeds; a test's dispatch index is
+    # its position here, stable for the built executable's lifetime.
+    val res_sel: R.Result[*testrunner.Test, str] = A.allocate[testrunner.Test](p.s.alloc, col.count::usize);
+    if (R.is_err[*testrunner.Test, str](res_sel)) {
+        testrunner.free(p.s, ?col);
+        print.eprint("error: out of memory\n");
+        ret 2;
+    }
+    val sel: *testrunner.Test = R.unwrap_ok[*testrunner.Test, str](res_sel);
+    var sel_len: u32 = 0;
+    var i: u32 = 0;
+    for (i < col.count) {
+        if (test_selected(p, ?col.tests[i], include_deps)) {
+            sel[sel_len] = col.tests[i];
+            sel_len = sel_len + 1;
         }
+        i = i + 1;
+    }
+
+    # `--list`: report each in-scope test's metadata without producing any object.
+    if (list_only) {
+        var k: u32 = 0;
+        for (k < sel_len) {
+            val rc: i64 = record_test(p, ?sel[k], nil, k, tests_out, p.s.alloc);
+            if (rc != 0) { testrunner.free(p.s, ?col); ret rc; }
+            k = k + 1;
+        }
+        testrunner.free(p.s, ?col);
+        ret 0;
+    }
+
+    # a scope that selected nothing builds nothing and runs nothing.
+    if (sel_len == 0) {
         testrunner.free(p.s, ?col);
         ret 0;
     }
@@ -859,20 +914,13 @@ fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool, verbo
         ret ec;
     }
 
-    if (verbose) {
-        print.eprint("test ");
-        print.eu64(col.count::u64);
-        print.eprint(" executable(s)\n");
-    }
-
-    # each test's compile/link allocations (the synthesized entry IR, its codegen
-    # object image, the parsed link inputs, the merged output image, and the
-    # format unwind tables) route through a per-test scratch arena that is reset
-    # after every test, so peak memory stays bounded by a single test link rather
-    # than growing with the suite. a fresh page allocator backs the scratch arena
-    # so its reset actually returns the chunks to the OS; the shared per-module
-    # objects, the collected list, and each recorded artifact stay on the
-    # persistent allocator, which the reset never touches.
+    # the dispatcher's compile/link allocations (the synthesized entry IR, its
+    # codegen object image, the parsed link inputs, the merged output image, and
+    # the format unwind tables) route through a scratch arena torn down as soon
+    # as the executable is linked, so the transients never outlive the build. a
+    # fresh page allocator backs the arena so teardown actually returns the
+    # chunks to the OS; the shared per-module objects, the collected list, and
+    # each recorded artifact stay on the persistent allocator.
     var scratch_backing: A.Allocator;
     if (O.is_some[str](page.make(?scratch_backing))) {
         free_paths(p.s.alloc, shared, shared_len, shared_len);
@@ -899,63 +947,47 @@ fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool, verbo
         ret 2;
     }
 
-    # the persistent build allocator, swapped back after every per-test build so
-    # the shared inputs, the collected list, and the recorded artifacts outlive
-    # the scratch reset.
+    # the persistent build allocator, swapped back once the dispatcher is built
+    # so the shared inputs, the collected list, and the recorded artifacts never
+    # touch the scratch arena.
     val persistent: *A.Allocator = p.s.alloc;
 
-    var code: i64 = 0;
-    var i: u32 = 0;
-    for (i < col.count) {
-        if (test_selected(p, ?col.tests[i], filter, include_deps)) {
-            # `i` is the stable collection index, so a test's executable name is
-            # unchanged whether or not a filter is in effect.
-            p.s.alloc = ?scratch_alloc;
-            code = build_one_test(p, level, verify_ir, ?obj_base[0], root, i, ?col.tests[i],
-                                  shared, shared_len, sonames, soname_len, tests_out, persistent);
-            p.s.alloc = persistent;
-            arena.reset(?scratch_ar);
+    var exe_path: [4096]u8;
+    p.s.alloc = ?scratch_alloc;
+    var code: i64 = build_dispatch_executable(p, level, verify_ir, ?obj_base[0], root,
+                                              sel, sel_len, shared, shared_len,
+                                              sonames, soname_len, ?exe_path[0], 4096);
+    p.s.alloc = persistent;
+    arena.dnit(?scratch_ar);
+
+    if (code == 0) {
+        var k: u32 = 0;
+        for (k < sel_len) {
+            code = record_test(p, ?sel[k], ?exe_path[0], k, tests_out, persistent);
             if (code != 0) { brk; }
+            k = k + 1;
         }
-        i = i + 1;
     }
 
-    arena.dnit(?scratch_ar);
     free_paths(p.s.alloc, shared, shared_len, shared_len);
     free_sonames(p.s.alloc, sonames, soname_len);
     testrunner.free(p.s, ?col);
     ret code;
 }
 
-# the `--filter <substr>` value from argv, or nil when absent
-# ---
-# argc: argument count including argv[0]
-# argv: the argument vector (argc null-terminated byte pointers)
-# ret:  the filter substring, or nil when `--filter` is absent
-fun filter_value(argc: usize, argv: **u8) *u8 {
-    val opt_filter: O.Option[*u8] = util.get_value(argc, argv, "--filter");
-    if (O.is_some[*u8](opt_filter)) { ret O.unwrap[*u8](opt_filter); }
-    ret nil;
-}
-
-# whether a test is selected for this run
+# whether a collected test is in scope for this run
 #
-# A test is selected when it is in scope - its declaring module is part of the
-# current project, unless `include_deps` opts dependency tests in (#1556) - and
-# passes the name filter (every test when `filter` is nil, else those whose label
-# contains the filter substring).
+# A test is in scope when its declaring module is part of the current project;
+# `include_deps` opts dependency tests in (#1556). Label filtering (`--filter`)
+# happens at run time in the runner, never here.
 # ---
-# p:            the project (for its interner and module table)
-# t:            the test to test
-# filter:       the filter substring, or nil to select every test
+# p:            the project (for its module table)
+# t:            the test to check
 # include_deps: also select tests declared in dependency modules
-# ret:          true when the test is selected
-fun test_selected(p: *driver.Project, t: *testrunner.Test, filter: *u8, include_deps: bool) bool {
-    if (!include_deps && !test_in_project(p, t)) { ret false; }
-    if (filter == nil) { ret true; }
-    val opt_label: O.Option[str] = intern.lookup(?p.s.interner, t.label);
-    if (O.is_none[str](opt_label)) { ret false; }
-    ret str_contains(O.unwrap[str](opt_label), util.cstr_str(filter));
+# ret:          true when the test is in scope
+fun test_selected(p: *driver.Project, t: *testrunner.Test, include_deps: bool) bool {
+    if (include_deps) { ret true; }
+    ret test_in_project(p, t);
 }
 
 # whether a collected test was declared in a current-project module rather than a
@@ -970,37 +1002,36 @@ fun test_in_project(p: *driver.Project, t: *testrunner.Test) bool {
     ret driver.module_in_current_project(p, m.fqn);
 }
 
-# synthesize, codegen, and link a single test's executable, then record its
-# artifact
+# synthesize, codegen, and link the dispatcher executable
 #
-# The entry module is `main(){ret <test>();}`; its object is written to
-# `<obj_base>/__mach_test_entry_<idx>.o` and linked with the shared object set
-# into the resolved `tests` path. The transient compile/link allocations come
-# from the session allocator, which the caller points at a per-test scratch arena
-# it resets afterward; the recorded artifact is duplicated into `persistent` so it
-# outlives that reset.
+# The entry module is the index dispatcher over `sel`; its object is written to
+# `<obj_base>/__mach_test_dispatch.o` and linked with the shared object set into
+# the resolved `tests` path, whose `{name}` is the product name (falling back to
+# the project id for artifact-less builds). The transient compile/link
+# allocations come from the session allocator, which the caller points at a
+# scratch arena it tears down afterward; the executable path lands in the
+# caller-owned `exe_buf`, which survives that teardown.
 # ---
 # p:          the project carrying the module graph and session
 # level:      optimization pipeline level
-# verify_ir:  run the IR verifier on the synthesized entry module
+# verify_ir:  run the IR verifier on the synthesized dispatcher module
 # obj_base:   the resolved per-module object tree root
 # root:       the resolved project root directory
-# idx:        the test's stable collection index
-# t:          the test to build
+# sel:        the in-scope tests, dispatch index = array position
+# sel_len:    number of tests in `sel`
 # shared:     the shared per-module object path set
 # shared_len: number of shared object paths
 # sonames:    the shared dynamic-dependency soname list
 # soname_len: number of sonames
-# tests_out:  the list to append the test's artifact to
-# persistent: allocator the recorded artifact is duplicated into, outliving the
-#             per-test scratch reset
+# exe_buf:    receives the executable path on success
+# exe_cap:    capacity of `exe_buf`
 # ret:        0 on success, or a non-zero exit code
-fun build_one_test(p: *driver.Project, level: u8, verify_ir: bool, obj_base: *u8, root: *u8,
-                   idx: u32, t: *testrunner.Test,
-                   shared: **u8, shared_len: u32,
-                   sonames: *intern.StrId, soname_len: u32,
-                   tests_out: *TestList, persistent: *A.Allocator) i64 {
-    val res_synth: R.Result[ir.Module, str] = testrunner.synthesize_entry(p.s, t.linkage);
+fun build_dispatch_executable(p: *driver.Project, level: u8, verify_ir: bool, obj_base: *u8, root: *u8,
+                              sel: *testrunner.Test, sel_len: u32,
+                              shared: **u8, shared_len: u32,
+                              sonames: *intern.StrId, soname_len: u32,
+                              exe_buf: *u8, exe_cap: usize) i64 {
+    val res_synth: R.Result[ir.Module, str] = testrunner.synthesize_dispatcher(p.s, sel, sel_len);
     if (R.is_err[ir.Module, str](res_synth)) {
         print.eprint("error: ");
         print.eprint(R.unwrap_err[ir.Module, str](res_synth));
@@ -1028,9 +1059,10 @@ fun build_one_test(p: *driver.Project, level: u8, verify_ir: bool, obj_base: *u8
     }
     var entry_img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](res_codegen);
 
-    # write the entry object alongside the per-module objects.
+    # write the dispatcher object alongside the per-module objects.
     var entry_path: [4096]u8;
-    if (!entry_object_path(obj_base, idx, ?entry_path[0], 4096) || !util.ensure_parents(?entry_path[0])) {
+    if (util.join_into(?entry_path[0], 4096, obj_base, "__mach_test_dispatch.o") == 0
+        || !util.ensure_parents(?entry_path[0])) {
         obj.dnit(?entry_img);
         ir.dnit(?entry_ir);
         print.eprint("error: failed to create test object directory\n");
@@ -1046,19 +1078,27 @@ fun build_one_test(p: *driver.Project, level: u8, verify_ir: bool, obj_base: *u8
         ret 1;
     }
 
-    # the executable path: `<root>/<tests template with {name} = sanitized name>`.
-    var name_buf: [256]u8;
-    sanitize_test_name(?name_buf[0], 256, idx, t.label, ?p.s.interner);
-    var exe_path: [4096]u8;
-    if (!resolve_test_exe(p, root, util.cstr_str(?name_buf[0]), ?exe_path[0], 4096) || !util.ensure_parents(?exe_path[0])) {
+    # the executable path: `<root>/<tests template with {name} = product name>`.
+    if (!resolve_test_exe(p, root, util.cstr_str(dispatch_exe_name(p)), exe_buf, exe_cap)
+        || !util.ensure_parents(exe_buf)) {
         print.eprint("error: failed to resolve the test executable path; check the `tests` template in mach.toml\n");
         ret 2;
     }
 
-    val lc: i64 = link_one_test(p, shared, shared_len, sonames, soname_len, ?entry_path[0], ?exe_path[0]);
-    if (lc != 0) { ret lc; }
+    ret link_one_test(p, shared, shared_len, sonames, soname_len, ?entry_path[0], exe_buf);
+}
 
-    ret record_test(p, t, ?exe_path[0], tests_out, persistent);
+# the dispatcher executable's `{name}`: the selected artifact's product name,
+# falling back to the project id when no artifact is selected (a library build)
+# ---
+# p:   the project carrying the session and selected artifact config
+# ret: the borrowed null-terminated name, never empty
+fun dispatch_exe_name(p: *driver.Project) *u8 {
+    val product: *u8 = artifact_product_name(p);
+    if (str_len(util.cstr_str(product)) > 0) { ret product; }
+    val opt_id: O.Option[str] = intern.lookup(?p.s.interner, p.config.id);
+    if (O.is_some[str](opt_id)) { ret O.unwrap[str](opt_id)::*u8; }
+    ret "tests";
 }
 
 # the selected artifact's product name (the `[bin.<name>]`), resolved to a
@@ -1076,7 +1116,7 @@ fun artifact_product_name(p: *driver.Project) *u8 {
     ret ""::*u8;
 }
 
-# link the shared object set plus one test's entry object into the test
+# link the shared object set plus the dispatcher entry object into the test
 # executable at `exe_path`
 #
 # The shared paths are reused across tests, so the combined array borrows their
@@ -1117,17 +1157,22 @@ fun link_one_test(p: *driver.Project, shared: **u8, shared_len: u32,
 # append a test's reporting artifact to `tests_out`
 #
 # Duplicates every string into `a` so it outlives the session teardown and the
-# per-test scratch reset. `exe` is nil in `--list` mode.
+# dispatcher build's scratch teardown. `exe` is nil in `--list` mode.
 # ---
 # p:         the project (for its interner and source map)
 # t:         the test to record
-# exe:       the executable path, or nil in `--list` mode
+# exe:       the dispatcher executable path, or nil in `--list` mode
+# idx:       the test's dispatch index
 # tests_out: the list to append the artifact to
 # a:         allocator backing the duplicated strings and the list
 # ret:       0 on success, or a non-zero exit code
-fun record_test(p: *driver.Project, t: *testrunner.Test, exe: *u8, tests_out: *TestList, a: *A.Allocator) i64 {
+fun record_test(p: *driver.Project, t: *testrunner.Test, exe: *u8, idx: u32, tests_out: *TestList, a: *A.Allocator) i64 {
     var artifact: TestArtifact;
     artifact.line = t.line;
+    artifact.idx  = idx;
+
+    artifact.module = dup_cstr(a, test_module_fqn(p, t.mod_idx));
+    if (artifact.module == nil) { print.eprint("error: out of memory\n"); ret 2; }
 
     val opt_label: O.Option[str] = intern.lookup(?p.s.interner, t.label);
     var label_src: *u8 = "<test>";
@@ -1175,6 +1220,22 @@ fun test_list_push(a: *A.Allocator, list: *TestList, t: TestArtifact) bool {
     ret true;
 }
 
+# the fully-qualified name of the module a test was declared in
+#
+# Borrowed from the session interner (the caller duplicates). "<unknown>" when
+# the index is out of range or the FQN is not interned.
+# ---
+# p:       the project (for its interner and module table)
+# mod_idx: the declaring module's index
+# ret:     the borrowed module FQN, or "<unknown>"
+fun test_module_fqn(p: *driver.Project, mod_idx: u32) *u8 {
+    if (mod_idx >= p.module_len) { ret "<unknown>"; }
+    val m: *driver.ModuleEntry = ?p.modules[mod_idx];
+    val opt_fqn: O.Option[str] = intern.lookup(?p.s.interner, m.fqn);
+    if (O.is_none[str](opt_fqn)) { ret "<unknown>"; }
+    ret O.unwrap[str](opt_fqn)::*u8;
+}
+
 # the source file path of the module a test was declared in
 #
 # Borrowed from the session source map (the caller duplicates). "<unknown>" when
@@ -1189,27 +1250,6 @@ fun test_source_path(p: *driver.Project, mod_idx: u32) *u8 {
     val opt_file: O.Option[*source.SourceFile] = source.get(?p.s.sources, m.file_id);
     if (O.is_none[*source.SourceFile](opt_file)) { ret "<unknown>"; }
     ret O.unwrap[*source.SourceFile](opt_file).path::*u8;
-}
-
-# compose `<obj_base>/__mach_test_entry_<idx>.o` into `buf`
-# ---
-# obj_base: the per-module object tree root
-# idx:      the test's collection index
-# buf:      the destination buffer
-# cap:      the buffer capacity
-# ret:      false if it would not fit
-fun entry_object_path(obj_base: *u8, idx: u32, buf: *u8, cap: usize) bool {
-    var leaf: [64]u8;
-    var k:    usize = 0;
-    val prefix: str   = "__mach_test_entry_";
-    val pl:     usize = str_len(prefix);
-    var i: usize = 0;
-    for (i < pl) { leaf[k] = prefix[i]; k = k + 1; i = i + 1; }
-    k = k + write_u32(?leaf[k], 64 - k, idx);
-    leaf[k] = '.'; k = k + 1;
-    leaf[k] = 'o'; k = k + 1;
-    leaf[k] = 0;
-    ret util.join_into(buf, cap, obj_base, ?leaf[0]) > 0;
 }
 
 # write the `{name}` for a test's executable into `buf` as `<idx>-<label>`
@@ -1342,7 +1382,6 @@ fun subst_name(tmpl: str, name: str, out: *u8, cap: usize) usize {
 # ---
 # p:            the project carrying the module graph and session
 # emit_obj:     emit the per-module objects only, linking no executable
-# verbose:      write the object count and output path to stderr
 # root:         the resolved project root directory
 # out_override: the `-o` artifact path, or nil to use the resolved path
 # argc:         argument count including argv[0]
@@ -1350,7 +1389,7 @@ fun subst_name(tmpl: str, name: str, out: *u8, cap: usize) usize {
 # images:       the per-module object images to write
 # out_path:     receives the owned produced-artifact path on success
 # ret:          0 on success, 1 on a user error, 2 on an internal error
-fun link_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root: *u8,
+fun link_artifact(p: *driver.Project, emit_obj: bool, root: *u8,
                   out_override: *u8,
                   argc: usize, argv: **u8,
                   images: *of.ObjectImage, out_path: **u8) i64 {
@@ -1360,10 +1399,13 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root: *u8,
     # a flat-image object format (`produces_image`) has no relocatable `.o`
     # container: it cannot emit per-module objects or re-parse them at link time.
     # link the in-memory codegen images straight into the flat executable instead
-    # of round-tripping through `.o` files.
+    # of round-tripping through `.o` files. it records its own link phase.
     if (p.target.of != nil && p.target.of.produces_image) {
-        ret link_image_artifact(p, emit_obj, verbose, root, out_override, images, out_path);
+        ret link_image_artifact(p, emit_obj, root, out_override, images, out_path);
     }
+
+    readout.phase_begin(p.s.readout, readout.PH_LINK);
+    val t_link: ctime.Time = readout.item_begin(p.s.readout);
 
     # the per-module object tree root: `<root>/<resolved obj template>`.
     var obj_base: [4096]u8;
@@ -1380,13 +1422,9 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root: *u8,
     # library mode (or `--emit obj`): the per-module objects are the deliverable;
     # do not link an executable.
     if (te.mode == driver.MODE_LIBRARY || emit_obj) {
-        if (verbose) {
-            print.eprint("output ");
-            print.eprint((?obj_base[0])::str);
-            print.eprint("\n");
-        }
         free_paths(p.s.alloc, paths, len, len);
         @out_path = dup_cstr(p.s.alloc, ?obj_base[0]);
+        readout.phase_end(p.s.readout, readout.PH_LINK, len, "object", "objects");
         ret 0;
     }
 
@@ -1403,18 +1441,6 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root: *u8,
         free_paths(p.s.alloc, paths, len, len);
         free_sonames(p.s.alloc, sonames, soname_len);
         ret ext_code;
-    }
-
-    if (verbose) {
-        print.eprint("link ");
-        print.eu64(len::u64);
-        print.eprint(" object(s)");
-        if (soname_len > 0) {
-            print.eprint(", ");
-            print.eu64(soname_len::u64);
-            print.eprint(" shared lib(s)");
-        }
-        print.eprint("\n");
     }
 
     # the executable path: an absolute `-o` is used verbatim; a relative one is
@@ -1451,13 +1477,9 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root: *u8,
         ret 1;
     }
 
-    if (verbose) {
-        print.eprint("output ");
-        print.eprint((?artifact[0])::str);
-        print.eprint("\n");
-    }
-
     @out_path = dup_cstr(p.s.alloc, ?artifact[0]);
+    readout.item(p.s.readout, readout.PH_LINK, (?artifact[0])::str, t_link);
+    readout.phase_end(p.s.readout, readout.PH_LINK, 1, "binary", "binaries");
     ret 0;
 }
 
@@ -1476,13 +1498,12 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root: *u8,
 # ---
 # p:            the project carrying the module graph and session
 # emit_obj:     reject when set - a flat-image format has no relocatable object output
-# verbose:      write the image count and output path to stderr
 # root:         the resolved project root directory
 # out_override: the `-o` artifact path, or nil to use the resolved path
 # images:       the per-module codegen images, indexed by module id
 # out_path:     receives the owned produced-artifact path on success
 # ret:          0 on success, 1 on a user error, 2 on an internal error
-fun link_image_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root: *u8,
+fun link_image_artifact(p: *driver.Project, emit_obj: bool, root: *u8,
                         out_override: *u8, images: *of.ObjectImage, out_path: **u8) i64 {
     val te: *driver.TargetEntry = p.target_entry;
     if (te == nil) { print.eprint("error: no target selected\n"); ret 2; }
@@ -1492,6 +1513,9 @@ fun link_image_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root:
         print.eprint("error: a flat-image object format produces only executables; library and '--emit obj' outputs are unsupported\n");
         ret 1;
     }
+
+    readout.phase_begin(p.s.readout, readout.PH_LINK);
+    val t_link: ctime.Time = readout.item_begin(p.s.readout);
 
     # the executable path: an absolute `-o` is used verbatim; a relative one is
     # rooted at <root>; otherwise the unit's resolved artifact path is used.
@@ -1525,12 +1549,6 @@ fun link_image_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root:
         i = i + 1;
     }
 
-    if (verbose) {
-        print.eprint("link ");
-        print.eu64(len::u64);
-        print.eprint(" image(s)\n");
-    }
-
     val res_link: R.Result[bool, str] =
         linker.link_images(p.s, ?p.target, ordered, len, nil::*intern.StrId, 0, ?artifact[0], artifact_product_name(p), linker.LINK_EXE);
     A.deallocate[of.ObjectImage](p.s.alloc, ordered, len::usize);
@@ -1541,13 +1559,9 @@ fun link_image_artifact(p: *driver.Project, emit_obj: bool, verbose: bool, root:
         ret 1;
     }
 
-    if (verbose) {
-        print.eprint("output ");
-        print.eprint((?artifact[0])::str);
-        print.eprint("\n");
-    }
-
     @out_path = dup_cstr(p.s.alloc, ?artifact[0]);
+    readout.item(p.s.readout, readout.PH_LINK, (?artifact[0])::str, t_link);
+    readout.phase_end(p.s.readout, readout.PH_LINK, 1, "binary", "binaries");
     ret 0;
 }
 
