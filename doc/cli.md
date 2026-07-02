@@ -235,6 +235,7 @@ passed.
 | `--filter <pattern>`| pattern | run only tests whose name contains `<pattern>` |
 | `--include-deps`    | —       | also collect tests declared in dependency modules |
 | `--list`            | —       | list the collected tests and exit |
+| `--format <mode>`   | `human`\|`json` | output format: the live readout (default `human`), or the machine-readable JSON event stream |
 | `--runner <cmd>`    | command | launch every test as `<cmd> <exe> <idx>` instead of exec'ing the dispatcher directly |
 
 Plus the `build` and global flags (`-v` lists every test). The build produces a
@@ -254,6 +255,13 @@ host cannot exec directly — e.g. `mach test . --target windows --runner wine`
 arguments). Without it, a test executable the host cannot launch reports a
 per-test failure — `(exit 127)` when `execve` rejects the binary in the spawned
 child, `(spawn failed)` when the spawn itself fails — with no auto-detection.
+
+`--format json` replaces the live readout with a machine-readable stream: one
+JSON object per line on stdout (`run_start`, one `test` per result, `summary`),
+with no human text interleaved. `--list --format json` emits one `case` object
+per collected test instead. The schema is versioned and documented in
+[tooling/test-json.md](tooling/test-json.md); pin tooling to its `schema`
+integer. Build diagnostics stay on stderr, so the stdout stream is clean.
 
 Exit codes: `0` all passed, `1` any failed, `2` build/internal error.
 
@@ -447,4 +455,5 @@ non-zero.
 
 - [manifest.md](manifest.md) — the `mach.toml` reference
 - [language/test.md](language/test.md) — the `test` declaration and `mach test`
+- [tooling/test-json.md](tooling/test-json.md) — the `mach test --format json` event schema
 - [language/files.md](language/files.md) — project file layout
