@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- test: the `mach test` readout is **live** - each module's roll-up prints the
+  moment its last test completes, and failures expand as they happen. Column
+  widths are computed from the collected tests (clamped) instead of hard-coded,
+  test labels print verbatim as declared (the old `<module>.`-prefix stripping
+  is gone), durations right-align, and the closing summary reports the run's
+  wall time. `-v` prints each test's line as it completes; `-vv` now also
+  prints passing tests' captured output (it was a silent alias of `-v`);
+  `mach test --help` documents both (#1790).
 - test: `mach test` builds **one dispatcher executable** covering every
   collected test instead of one standalone executable per test - one link
   instead of N (on mach itself: 44.9s → 7.2s wall, 9.4 GB → 7.3 MB on disk).

@@ -8,19 +8,21 @@
 # output, times it, and reads its exit status - per-test process isolation is
 # unchanged, only the build is shared.
 #
-# the default readout collapses every all-passing module to a single roll-up
-# line (`mach.lang.driver  36 ok  41ms`) and expands any module with failures,
-# printing each failing test's captured child output, `file:line`, and exit
-# code or signal. the run ends with a summary that re-lists the failures. a
-# crashing test (a signal) is reported and the run continues, so one SIGSEGV no
-# longer kills the suite. `-v` lists every test, grouped by module, with its
-# duration. timing is `chrono.monotonic`; durations and the column widths use
-# the stdlib formatting primitives; the layout is fixed-width ASCII.
+# the readout is live: each module's roll-up line (`mach.lang.driver  36 ok
+# 41ms`) prints the moment its last test completes, and a module with failures
+# expands each failing test's captured child output, `file:line`, and exit
+# code or signal as it happens. the run ends with a summary that re-lists the
+# failures and reports the run's wall time. a crashing test (a signal) is
+# reported and the run continues, so one SIGSEGV no longer kills the suite.
+# `-v` lists every test under its module header as it completes; `-vv` also
+# prints passing tests' captured output. timing is `chrono.monotonic`; column
+# widths are computed from the collected tests before the run (clamped, so one
+# long name cannot blow out the table); the layout is fixed-width ASCII.
 #
 # child output is captured through `std.process.exec.capture`, which pipes the
 # child's stdout and drains it to EOF before waiting, so a chatty test never
 # deadlocks the runner. only failing tests retain their output (passing tests
-# stay quiet); the captured bytes surface under the expanded failure.
+# stay quiet below `-vv`); the captured bytes surface under the expanded test.
 #
 # by default only `test` blocks declared in the current project's own modules are
 # collected; `--include-deps` widens collection to dependency modules too (#1556).
@@ -47,7 +49,6 @@ use std.types.string.str;
 use std.types.string.str_contains;
 use std.types.string.str_equals;
 use std.types.string.str_len;
-use std.types.string.str_starts_with;
 
 use A:      std.allocator;
 use O:      std.types.option;
@@ -78,9 +79,9 @@ val CAP_OUTPUT: usize = 65536;
 
 # the result of running one test
 #
-# `out` retains the captured child stdout only for a failing test (passing tests
-# discard it); it is owned by the run allocator and aliases nothing in the reused
-# capture buffer.
+# `out` retains the captured child stdout for a failing test (and for a passing
+# one under `-vv`); it is owned by the run allocator and aliases nothing in the
+# reused capture buffer.
 # ---
 # art:       the built test artifact (borrowed; owned by the run allocator)
 # kind:      a KIND_* outcome
@@ -110,9 +111,11 @@ rec Outcome {
 pub fun run(argc: usize, argv: **u8) i64 {
     val list: bool = util.has_flag(argc, argv, "--list");
 
-    # `-v` or `-vv` lists every test; the runner has a single verbose level and
-    # mirrors the shared verbosity flags (`--verbose` was dropped in #1775).
-    val verbose: bool = util.has_flag(argc, argv, "-v") || util.has_flag(argc, argv, "-vv");
+    # verbosity mirrors the shared flags (`--verbose` was dropped in #1775):
+    # `-v` lists every test as it completes, `-vv` also prints passing output.
+    var level: u8 = 0;
+    if (util.has_flag(argc, argv, "-v"))  { level = 1; }
+    if (util.has_flag(argc, argv, "-vv")) { level = 2; }
 
     # back the build with an arena over a page allocator, matching `mach build`.
     # the build's internal teardown frees through this allocator; the page
@@ -218,37 +221,56 @@ pub fun run(argc: usize, argv: **u8) i64 {
     }
     val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
 
-    execute_all(?a, selected, sel_len, runner, outcomes, buf);
+    # column widths come from the selection, so live lines align on the first
+    # write with no second pass; clamping keeps one long name from blowing out
+    # the whole table.
+    val mod_w:   usize = module_col_width(selected, sel_len);
+    val label_w: usize = label_col_width(selected, sel_len);
 
-    if (verbose) { render_verbose(outcomes, sel_len); }
-    or          { render_default(outcomes, sel_len); }
+    val run_start: tm.Time = tm.monotonic();
+    execute_and_render(?a, selected, sel_len, runner, outcomes, buf, level, mod_w, label_w);
+    val wall: du.Duration = tm.time_sub(tm.monotonic(), run_start);
 
     val failed: u32 = count_failed(outcomes, sel_len);
     val passed: u32 = sel_len - failed;
-    render_summary(outcomes, sel_len, passed, failed);
+    render_summary(outcomes, sel_len, passed, failed, wall);
 
     arena.dnit(?ar);
     if (failed > 0) { ret 1; }
     ret 0;
 }
 
-# spawn every selected test, capturing its stdout and timing it, into `outcomes`
+# spawn every selected test in collection order, rendering the readout live as
+# results land
 #
 # Each child is run with its stdout piped and drained to EOF (capture), so a
-# chatty test cannot deadlock the runner; stderr is inherited. A failing test's
-# captured bytes are copied out of the reused buffer into the run allocator so
-# they survive the next test overwriting the buffer.
+# chatty test cannot deadlock the runner; stderr is inherited. A retained
+# test's captured bytes are copied out of the reused buffer into the run
+# allocator so they survive the next test overwriting the buffer (failures
+# always retain; passes retain under `-vv`). At the default level a module's
+# roll-up prints the moment its last test completes; under `-v` a module
+# header prints when its first test starts and each test line prints on
+# completion.
 # ---
-# a:        allocator retaining each failing test's captured output
+# a:        allocator retaining captured output
 # arts:     the selected test artifacts to run, in collection order
 # n:        number of artifacts in `arts`
 # runner:   resolved `--runner` launcher, or nil to exec the dispatcher directly
 # outcomes: caller-owned array (length n) filled in test order
 # buf:      the reused capture buffer (CAP_OUTPUT bytes)
-fun execute_all(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runner: *u8, outcomes: *Outcome, buf: *u8) {
+# level:    verbosity (0 roll-ups, 1 per-test lines, 2 also passing output)
+# mod_w:    module roll-up column width
+# label_w:  `-v` label column width
+fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runner: *u8,
+                       outcomes: *Outcome, buf: *u8, level: u8, mod_w: usize, label_w: usize) {
+    # first index of the module run currently executing
+    var first: u32 = 0;
     var i: u32 = 0;
     for (i < n) {
         val art: *build.TestArtifact = ?arts[i];
+        val mod_name: str = util.cstr_str(art.module);
+
+        if (level > 0 && i == first) { print.printf("{}\n", mod_name); }
 
         # the test's dispatch index, rendered for the child's argv
         var ibuf: [16]u8;
@@ -291,6 +313,8 @@ fun execute_all(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runner: *u8,
             val st:  exec.ExitStatus = cap.status;
             if (exec.exited(st) && exec.code(st) == 0) {
                 o.kind = KIND_PASS;
+                # `-vv` surfaces passing output too, so it is worth retaining
+                if (level >= 2) { retain_output(a, ?o, buf, cap.len); }
             }
             or (exec.signaled(st)) {
                 # a crash reports the signal and the run continues to the next test.
@@ -310,7 +334,48 @@ fun execute_all(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runner: *u8,
         }
 
         outcomes[i] = o;
+
+        if (level > 0) { print_verbose_test(?outcomes[i], label_w); }
+
+        # the module's run is complete when the next artifact starts a new
+        # module (or the selection ends); the roll-up prints right then.
+        val last_of_module: bool = i + 1 == n
+            || !str_equals(util.cstr_str(arts[i + 1].module), mod_name);
+        if (last_of_module) {
+            if (level == 0) { render_module_run(outcomes, first, i, mod_name, mod_w); }
+            first = i + 1;
+        }
         i = i + 1;
+    }
+}
+
+# render one completed module run under the default readout: the roll-up line,
+# then the expanded detail of each failure in the run
+# ---
+# outcomes: the run outcomes in test order
+# first:    index of the module's first outcome
+# last:     index of the module's last outcome (inclusive)
+# mod_name: the module's fully-qualified name
+# mod_w:    module column width
+fun render_module_run(outcomes: *Outcome, first: u32, last: u32, mod_name: str, mod_w: usize) {
+    var ok:      u32 = 0;
+    var fail:    u32 = 0;
+    var elapsed: du.Duration = 0;
+    var j: u32 = first;
+    for (j <= last) {
+        if (outcomes[j].kind == KIND_PASS) { ok = ok + 1; }
+        or                                 { fail = fail + 1; }
+        elapsed = elapsed + outcomes[j].elapsed;
+        j = j + 1;
+    }
+
+    print_rollup(mod_name, ok, fail, elapsed, mod_w);
+    if (fail > 0) {
+        j = first;
+        for (j <= last) {
+            if (outcomes[j].kind != KIND_PASS) { print_fail_detail(?outcomes[j]); }
+            j = j + 1;
+        }
     }
 }
 
@@ -345,64 +410,71 @@ fun retain_output(a: *A.Allocator, o: *Outcome, buf: *u8, full: usize) {
     o.out_len = stored;
 }
 
-# the default readout: one roll-up line per module, expanding only failures
-#
-# Tests arrive grouped by declaring module (collection order), so a module's run
-# is the maximal adjacent run of equal module names. An all-passing module shows
-# only its roll-up; a module with failures additionally expands each failing test.
+# the width of the module roll-up column: the longest selected module FQN,
+# clamped so one deep module tree cannot blow out the table, plus the gutter
 # ---
-# outcomes: the run outcomes in test order
-# len:      number of outcomes
-fun render_default(outcomes: *Outcome, len: u32) {
+# arts: the selected test artifacts
+# n:    number of artifacts
+# ret:  the column width in bytes
+fun module_col_width(arts: *build.TestArtifact, n: u32) usize {
+    var w: usize = 0;
     var i: u32 = 0;
-    for (i < len) {
-        val mod_name: str = util.cstr_str(outcomes[i].art.module);
-
-        var j:       u32 = i;
-        var ok:      u32 = 0;
-        var fail:    u32 = 0;
-        var elapsed: du.Duration = 0;
-        for (j < len) {
-            if (!str_equals(util.cstr_str(outcomes[j].art.module), mod_name)) { brk; }
-            if (outcomes[j].kind == KIND_PASS) { ok = ok + 1; }
-            or                                 { fail = fail + 1; }
-            elapsed = elapsed + outcomes[j].elapsed;
-            j = j + 1;
-        }
-
-        print_rollup(mod_name, ok, fail, elapsed);
-        if (fail > 0) {
-            var k: u32 = i;
-            for (k < j) {
-                if (outcomes[k].kind != KIND_PASS) { print_fail_detail(?outcomes[k], mod_name); }
-                k = k + 1;
-            }
-        }
-        i = j;
+    for (i < n) {
+        val l: usize = str_len(util.cstr_str(arts[i].module));
+        if (l > w) { w = l; }
+        i = i + 1;
     }
+    if (w < 16) { w = 16; }
+    if (w > 48) { w = 48; }
+    ret w + 2;
 }
 
-# the `-v` readout: every test listed under its module with its duration
-#
-# Failing tests additionally carry their location, exit status, and captured
-# output, so `-v` is a superset of the default expansion.
+# the width of the `-v` label column: the longest label (verbatim, as the
+# test declared it), clamped, plus the gutter
 # ---
-# outcomes: the run outcomes in test order
-# len:      number of outcomes
-fun render_verbose(outcomes: *Outcome, len: u32) {
+# arts: the selected test artifacts
+# n:    number of artifacts
+# ret:  the column width in bytes
+fun label_col_width(arts: *build.TestArtifact, n: u32) usize {
+    var w: usize = 0;
     var i: u32 = 0;
-    for (i < len) {
-        val mod_name: str = util.cstr_str(outcomes[i].art.module);
-        print.printf("{}\n", mod_name);
-
-        var j: u32 = i;
-        for (j < len) {
-            if (!str_equals(util.cstr_str(outcomes[j].art.module), mod_name)) { brk; }
-            print_verbose_test(?outcomes[j], mod_name);
-            j = j + 1;
-        }
-        i = j;
+    for (i < n) {
+        val l: usize = str_len(util.cstr_str(arts[i].label));
+        if (l > w) { w = l; }
+        i = i + 1;
     }
+    if (w < 24) { w = 24; }
+    if (w > 72) { w = 72; }
+    ret w + 2;
+}
+
+# write `s` padded with trailing spaces to `width`; a value longer than the
+# column still gets the two-space gutter so the next column never touches it
+# ---
+# s:     the column value
+# width: the column width
+fun print_col(s: str, width: usize) {
+    print.print(s);
+    var pad: usize = 2;
+    val l: usize = str_len(s);
+    if (l + 2 < width) { pad = width - l; }
+    var i: usize = 0;
+    for (i < pad) { print.print(" "); i = i + 1; }
+}
+
+# write the two-space gutter, then a duration right-aligned to a seven-byte
+# column (durations end their line, so the shared right edge keeps the table
+# tidy)
+# ---
+# elapsed: the duration to render
+fun print_dur(elapsed: du.Duration) {
+    var dbuf: [24]u8;
+    val ds: str = du.format_duration(elapsed, ?dbuf[0], 24::usize);
+    val l: usize = str_len(ds);
+    print.print("  ");
+    var i: usize = l;
+    for (i < 7) { print.print(" "); i = i + 1; }
+    print.print(ds);
 }
 
 # write one module's roll-up line: `<module>  <ok> ok[  <fail> FAIL]  <dur>`
@@ -410,43 +482,46 @@ fun render_verbose(outcomes: *Outcome, len: u32) {
 # mod_name: the module's fully-qualified name
 # ok:       number of passing tests
 # fail:     number of failing tests
-# elapsed:  total wall time of the module's tests
-fun print_rollup(mod_name: str, ok: u32, fail: u32, elapsed: du.Duration) {
-    var dbuf: [24]u8;
-    val ds: str = du.format_duration(elapsed, ?dbuf[0], 24::usize);
-    if (fail > 0) {
-        print.printf("{:<34}{:4} ok  {:4} FAIL  {}\n", mod_name, ok::i64, fail::i64, ds);
-    }
-    or {
-        print.printf("{:<34}{:4} ok  {}\n", mod_name, ok::i64, ds);
-    }
+# elapsed:  summed wall time of the module's tests
+# mod_w:    module column width
+fun print_rollup(mod_name: str, ok: u32, fail: u32, elapsed: du.Duration, mod_w: usize) {
+    print_col(mod_name, mod_w);
+    if (fail > 0) { print.printf("{:4} ok  {:4} FAIL", ok::i64, fail::i64); }
+    or           { print.printf("{:4} ok", ok::i64); }
+    print_dur(elapsed);
+    print.print("\n");
 }
 
 # write the expanded detail for one failing test under the default readout
 # ---
-# o:        the failing outcome
-# mod_name: its module's name, stripped from the label for a compact display
-fun print_fail_detail(o: *Outcome, mod_name: str) {
-    val label: str = display_label(mod_name, util.cstr_str(o.art.label));
+# o: the failing outcome
+fun print_fail_detail(o: *Outcome) {
+    val label: str = util.cstr_str(o.art.label);
     print.printf("  FAIL  {}  {}:{}  ", label, util.cstr_str(o.art.file), o.art.line::i64);
     print_reason(o);
     print.print("\n");
     print_captured(o);
 }
 
-# write one test's line under the `-v` readout, expanding a failure inline
+# write one test's line under the `-v` readout as it completes, expanding a
+# failure inline; a passing test's retained output (`-vv`) prints beneath it
 # ---
-# o:        the outcome to list
-# mod_name: its module's name, stripped from the label for a compact display
-fun print_verbose_test(o: *Outcome, mod_name: str) {
-    var dbuf: [24]u8;
-    val ds:    str = du.format_duration(o.elapsed, ?dbuf[0], 24::usize);
-    val label: str = display_label(mod_name, util.cstr_str(o.art.label));
+# o:       the outcome to list
+# label_w: label column width
+fun print_verbose_test(o: *Outcome, label_w: usize) {
+    val label: str = util.cstr_str(o.art.label);
     if (o.kind == KIND_PASS) {
-        print.printf("  {:<4}  {:<40}{}\n", "ok", label, ds);
+        print.print("  ok    ");
+        print_col(label, label_w);
+        print_dur(o.elapsed);
+        print.print("\n");
+        print_captured(o);
     }
     or {
-        print.printf("  {:<4}  {:<40}{}  ", "FAIL", label, ds);
+        print.print("  FAIL  ");
+        print_col(label, label_w);
+        print_dur(o.elapsed);
+        print.print("  ");
         print_reason(o);
         print.printf("  {}:{}\n", util.cstr_str(o.art.file), o.art.line::i64);
         print_captured(o);
@@ -463,8 +538,8 @@ fun print_reason(o: *Outcome) {
     or                         { print.print("(failed)"); }
 }
 
-# write a failing test's retained stdout, each line indented, then a truncation
-# note when the output overflowed the capture buffer
+# write a test's retained stdout, each line indented, then a truncation note
+# when the output overflowed the capture buffer
 #
 # Nothing is written when the test produced no output. The bytes are streamed
 # verbatim through a stdout writer so arbitrary content (not null-terminated)
@@ -499,13 +574,14 @@ fun print_captured(o: *Outcome) {
 }
 
 # write the closing summary: a `failures:` block re-listing each failure, then a
-# `passed/failed/total` count with the run's total wall time
+# `passed/failed/total` count with the run's wall time
 # ---
 # outcomes: the run outcomes in test order
 # len:      number of outcomes
 # passed:   number of passing tests
 # failed:   number of failing tests
-fun render_summary(outcomes: *Outcome, len: u32, passed: u32, failed: u32) {
+# wall:     the run's wall time (start of first spawn to last completion)
+fun render_summary(outcomes: *Outcome, len: u32, passed: u32, failed: u32, wall: du.Duration) {
     print.print("\n");
 
     if (failed > 0) {
@@ -526,7 +602,7 @@ fun render_summary(outcomes: *Outcome, len: u32, passed: u32, failed: u32) {
     }
 
     var dbuf: [24]u8;
-    val ds: str = du.format_duration(total_elapsed(outcomes, len), ?dbuf[0], 24::usize);
+    val ds: str = du.format_duration(wall, ?dbuf[0], 24::usize);
     print.printf("{} passed, {} failed, {} total  ({})\n", passed::i64, failed::i64, len::i64, ds);
 }
 
@@ -543,40 +619,6 @@ fun count_failed(outcomes: *Outcome, len: u32) u32 {
         i = i + 1;
     }
     ret f;
-}
-
-# the summed wall time of every outcome
-# ---
-# outcomes: the run outcomes
-# len:      number of outcomes
-# ret:      total elapsed duration
-fun total_elapsed(outcomes: *Outcome, len: u32) du.Duration {
-    var t: du.Duration = 0;
-    var i: u32 = 0;
-    for (i < len) {
-        t = t + outcomes[i].elapsed;
-        i = i + 1;
-    }
-    ret t;
-}
-
-# strip a leading `<module>.` from a test label for a compact per-module display
-#
-# Mach tests are named with their fully-qualified path by convention (e.g.
-# `mach.lang.driver.builds:trivial`), so under a module roll-up the prefix is
-# redundant. A label that does not carry the prefix is returned unchanged.
-# ---
-# mod_name: the module's fully-qualified name
-# label:    the test's printable label
-# ret:      the label with a matching `<module>.` prefix removed
-fun display_label(mod_name: str, label: str) str {
-    if (str_starts_with(label, mod_name)) {
-        val ml: usize = str_len(mod_name);
-        if (label[ml] == '.') {
-            ret (label::usize + ml + 1::usize)::str;
-        }
-    }
-    ret label;
 }
 
 # write a test's identifying `label file:line` prefix to stdout, no trailing
