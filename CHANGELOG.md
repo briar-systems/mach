@@ -54,6 +54,10 @@ integer literals now report their bounds.
   COFF being x86_64-only) or whose ABI does not match the ISA is rejected with a
   message naming the missing capability, instead of composing and failing deep in
   codegen or link (#1806).
+- driver: **`mach init` scaffold target names** follow the `<os>-<isa>`
+  convention (`linux-x86_64`, `windows-x86_64`, `darwin-x86_64` on the host isa),
+  matching the root manifest's normalized naming. A fresh project now writes
+  `out/linux-x86_64/…` rather than `out/linux/…` (#1832).
 
 ### Removed
 
