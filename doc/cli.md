@@ -38,7 +38,6 @@ A verbosity flag (`-v`/`-vv`) and `--quiet` together is a parse error.
 | `-v`             | —                | `mach build`: per-phase roll-up (load/resolve/sema/lower/optimize/codegen/link) with item counts + timing, then a `built … N modules … in …` summary, on stderr |
 | `-vv`            | —                | `-v` plus a per-module/file line under each phase with its duration and a `(slow)` marker on the slowest |
 | `--quiet`, `-q`  | —                | suppress non-error output |
-| `--color <mode>` | `auto`\|`always`\|`never` | color preference for terminal output (default `auto`); an unknown mode is a parse error |
 | `--target <name>`| target name      | select a declared target; absent, defers to `[project].target` |
 | `--profile <name>`| profile name    | select a `[profile.<name>]` build variant; absent, the first declared profile |
 | `--bin <name>`   | artifact name    | narrow the build to one `[bin.<name>]` artifact |
