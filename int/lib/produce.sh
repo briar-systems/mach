@@ -6,6 +6,8 @@
 #
 # producers:
 #   exec        — run the program, observe its stdout (native / qemu).
+#   relro-fault — run the program and report whether its write to a RELRO'd .rodata
+#                 slot faulted (SIGSEGV -> exit 139); the --pie RELRO runtime guard.
 #   field       — coreutils (od/dd) reads of known header offsets, for format facts
 #                 execution cannot observe (PE ASLR bit, macho PIE bit). dispatched
 #                 on the artifact's own magic, so it is independent of how the case
@@ -33,6 +35,30 @@ produce_exec() {
         "qemu-${target##*-}" "$bin"
     else
         "$bin"
+    fi
+}
+
+# produce_relro_fault <runmode> <target> <binary>
+# runs the built binary (expected to write to a relocated constant's RELRO'd .rodata
+# storage) and reports whether that write faulted. after the --pie startup mprotects
+# the region read-only, the write must raise SIGSEGV, which surfaces as exit 128+11=139
+# both natively and under qemu-user; any other status means the region stayed writable.
+# the program's own stdout is discarded - the observable is purely the fault fact - so
+# this is a runtime (exec-like) producer sharing one target-independent golden.
+produce_relro_fault() {
+    runmode=$1
+    target=$2
+    bin=$3
+    if [ "$runmode" = "qemu" ]; then
+        "qemu-${target##*-}" "$bin" >/dev/null 2>&1
+    else
+        "$bin" >/dev/null 2>&1
+    fi
+    ec=$?
+    if [ "$ec" -eq 139 ]; then
+        echo "relro_write=faulted"
+    else
+        echo "relro_write=exit$ec"
     fi
 }
 
@@ -134,6 +160,7 @@ produce() {
     shift
     case "$run" in
         exec)        produce_exec "$@" ;;
+        relro-fault) produce_relro_fault "$@" ;;
         field)       produce_field "$@" ;;
         relro)       produce_relro "$@" ;;
         flat-loader) produce_flat_loader "$@" ;;
