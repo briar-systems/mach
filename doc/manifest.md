@@ -25,7 +25,7 @@ out     = "out/{target}/{profile}/bin/{name}{ext}"  # artifact path template
 obj     = "out/{target}/{profile}/obj"              # intermediate-object dir template
 ir      = "out/{target}/{profile}/ir"               # IR-dump dir template
 asm     = "out/{target}/{profile}/asm"              # ASM-dump dir template
-tests   = "out/{target}/{profile}/test/{name}"      # per-test executable path template (mach test)
+tests   = "out/{target}/{profile}/test/{name}"      # test dispatcher executable path template (mach test)
 # optional metadata: name, description, license, authors
 
 [target.linux]             # a platform: a fully-spelled tuple, nothing inferred
@@ -79,7 +79,7 @@ ref = "v0.4.0"
 | `obj`     | string | no       | `"out/{target}/{profile}/obj"` | Per-module object tree template. |
 | `ir`      | string | no       | `"out/{target}/{profile}/ir"`  | Per-module IR-dump template (used when emission is on). |
 | `asm`     | string | no       | `"out/{target}/{profile}/asm"` | Per-module assembly-dump template (used when emission is on). |
-| `tests`   | string | no       | `"out/{target}/{profile}/test/{name}"` | Per-test executable path template. `mach test` builds one standalone executable per `test` block here, with `{name}` the sanitized test name (see below). |
+| `tests`   | string | no       | `"out/{target}/{profile}/test/{name}"` | Test dispatcher executable path template. `mach test` builds one executable covering every collected `test` block here, with `{name}` the product name (see below). |
 
 Optional metadata read by the `$project.*` comptime roots but not the build:
 `name`, `description`, `license`, `authors`.
@@ -256,14 +256,12 @@ is a hard error. Two artifacts that resolve to the same `out` path collide and
 fail at build start. A per-artifact or per-cell `out` overrides the project
 template for that artifact.
 
-The `tests` template is expanded the same way, except `{name}` is the **per-test
-name** rather than the artifact name (`{target}`/`{profile}`/`{ext}` resolve as
-usual). `mach test` substitutes `{name}` per test as `<index>-<sanitized label>`:
-the zero-based collection index keeps the name unique — test labels are not
-globally unique across modules — and stable, and every label byte outside
-`[A-Za-z0-9._-]` becomes `_` (the label portion is truncated to keep the name
-short). A test labeled `"parses empty input"` collected third lands at, e.g.,
-`out/linux/debug/test/2-parses_empty_input`.
+The `tests` template is expanded the same way and locates the single test
+dispatcher executable `mach test` builds (`{target}`/`{profile}`/`{ext}` resolve
+as usual). `{name}` is the selected artifact's product name, falling back to the
+project id for artifact-less (library) builds. The dispatcher embeds every
+collected test and runs the one selected by a decimal index argument, so a
+project's test build lands at, e.g., `out/linux/debug/test/mach`.
 
 ## Selection and the build matrix
 
@@ -318,7 +316,7 @@ out     = "out/{target}/bin/{name}{ext}"  # e.g. out/linux/bin/mach
 obj     = "out/{target}/obj"
 ir      = "out/{target}/ir"
 asm     = "out/{target}/asm"
-tests   = "out/{target}/test/{name}"      # e.g. out/linux/test/2-parses_empty_input
+tests   = "out/{target}/test/{name}"      # e.g. out/linux/test/myproj
 
 [target.linux]
 isa = "x86_64"
