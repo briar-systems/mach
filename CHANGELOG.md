@@ -10,9 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 A follow-up hardening, cleanup, and tooling sweep over the 2.12.0 overhaul.
 `--pie` images regain read-only hardening for their relocated constants
 (`PT_GNU_RELRO`), the register allocator sheds redundant copies for a smaller
-binary, `mach test --format json` and `mach info targets` add machine-readable
-surfaces, diagnostics gain `= help:` lines and secondary spans, and out-of-range
-integer literals now report their bounds.
+binary, `mach test --format json`, `mach check --format json`, and `mach info
+targets` add machine-readable surfaces, diagnostics gain `= help:` lines and
+secondary spans, and out-of-range integer literals now report their bounds.
 
 ### Added
 
@@ -30,6 +30,14 @@ integer literals now report their bounds.
   escaped so the stream is byte-identical across platforms; labels are emitted
   verbatim; `test` events arrive in **completion order** (sort by `index` for
   declaration order) (#1792).
+- check: **`mach check --format json`** - a versioned, machine-readable NDJSON
+  diagnostic stream (a `diagnostic` object per diagnostic carrying severity,
+  message, primary location, note, help, and the LSP-shaped related list, then a
+  closing `summary`; `schema: 1`) for editors and CI, documented in
+  `doc/tooling/check-json.md`. JSON goes to stdout with no human frames
+  interleaved; positions are 1-based and spans half-open; it reuses the
+  `mach.cli.json` emitter, which grew nested-object and array support to carry
+  the model (#1815).
 - diag: diagnostics gained a distinct **`= help:` line** and an optional
   **secondary span** - a duplicate definition now points at the prior binding in
   its own `--> file:line:col` frame labelled `previous definition here`, and
