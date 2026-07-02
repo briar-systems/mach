@@ -182,12 +182,12 @@ fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: b
     # do not lower or codegen a semantically broken module graph.
     if (diagnostic.has_errors(?p.s.diags)) { ret R.ok[bool, str](true); }
 
-    # lower every module to IR (rendering the textual `.ir` straight after each
-    # lowering, before optimization), then optimize, then - in test mode -
-    # neutralize the project `main` (the runner supplies the program entry) before
-    # any module is codegen'd. the three passes are timed as distinct readout
-    # phases; splitting lower from optimize is purely structural and leaves the
-    # produced objects byte-identical.
+    # lower every module to IR, then optimize, then - in test mode - neutralize
+    # the project `main` (the runner supplies the program entry) before any module
+    # is codegen'd. the `.ir` and `.s` debug artifacts are both rendered in the
+    # codegen pass, from the final post-pipeline IR the object is built from. the
+    # three passes are timed as distinct readout phases; splitting lower from
+    # optimize is purely structural and leaves the produced objects byte-identical.
     readout.phase_begin(p.s.readout, readout.PH_LOWER);
     var i: u32 = 0;
     for (i < p.topo_len) {
@@ -202,13 +202,6 @@ fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: b
         irs[mid::u32]      = R.unwrap_ok[ir.Module, str](res_lower);
         ir_ready[mid::u32] = true;
 
-        # textual SSA IR, rendered straight after lowering.
-        if (ea.want_ir) {
-            val res_emit: R.Result[bool, str] = emit_ir(p, ea, m.fqn, ?irs[mid::u32]);
-            if (R.is_err[bool, str](res_emit)) {
-                ret R.err[bool, str](R.unwrap_err[bool, str](res_emit));
-            }
-        }
         readout.item(p.s.readout, readout.PH_LOWER, fqn_name(p, m.fqn), t_item);
         i = i + 1;
     }
@@ -245,6 +238,15 @@ fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: b
 
         val t_item: ctime.Time = readout.item_begin(p.s.readout);
 
+        # textual SSA IR, rendered from the final post-pipeline module the object
+        # is built from (matching the `.s` artifact rendered during codegen below).
+        if (ea.want_ir) {
+            val res_emit: R.Result[bool, str] = emit_ir(p, ea, m.fqn, ?irs[mid::u32]);
+            if (R.is_err[bool, str](res_emit)) {
+                ret R.err[bool, str](R.unwrap_err[bool, str](res_emit));
+            }
+        }
+
         # codegen, optionally rendering the resolved MIR to a `.s` artifact.
         var asm_file: filesystem.File;
         var asm_w:    writer.Writer;
@@ -277,13 +279,15 @@ fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: b
     ret R.ok[bool, str](true);
 }
 
-# render one module's textual SSA IR to its `.ir` artifact, straight after
-# lowering
+# render one module's textual SSA IR to its `.ir` artifact
+#
+# Called in the codegen pass, so `m` is the final post-pipeline IR the object is
+# built from - the same module codegen consumes for the `.s` artifact.
 # ---
 # p:   the project (for its interner)
 # ea:  the emission settings (for `ir_base`)
 # fqn: the module's interned fully-qualified name
-# m:   the lowered IR module to render
+# m:   the IR module to render
 # ret: ok(true) on success, or err with the failure message
 fun emit_ir(p: *driver.Project, ea: *EmitArtifacts, fqn: intern.StrId, m: *ir.Module) R.Result[bool, str] {
     val opt_fqn: O.Option[str] = intern.lookup(?p.s.interner, fqn);
@@ -354,10 +358,11 @@ fun free_modules(p: *driver.Project,
 #           must outlive the returned BuildResult
 # argc:     argument count including argv[0]
 # argv:     the argument vector (argc null-terminated byte pointers)
+# marks:    consumption record parallel to argv, for positional/link scanning
 # emit_obj: when true, emit a relocatable object instead of an executable
 # ret:      a BuildResult carrying the exit code and artifact path
-pub fun build(a: *A.Allocator, argc: usize, argv: **u8, emit_obj: bool) BuildResult {
-    ret build_unit(a, argc, argv, emit_obj, false, nil, nil, false);
+pub fun build(a: *A.Allocator, argc: usize, argv: **u8, marks: *bool, emit_obj: bool) BuildResult {
+    ret build_unit(a, argc, argv, marks, emit_obj, false, nil, nil, false);
 }
 
 # build the single dispatcher executable covering every collected `test`
@@ -378,15 +383,16 @@ pub fun build(a: *A.Allocator, argc: usize, argv: **u8, emit_obj: bool) BuildRes
 #            outlive the returned TestBuildResult
 # argc:      argument count including argv[0]
 # argv:      the argument vector (argc null-terminated byte pointers)
+# marks:     consumption record parallel to argv, for positional/link scanning
 # list_only: collect the tests without building executables (`--list`)
 # ret:       a TestBuildResult carrying the exit code and the test artifacts
-pub fun build_tests(a: *A.Allocator, argc: usize, argv: **u8, list_only: bool) TestBuildResult {
+pub fun build_tests(a: *A.Allocator, argc: usize, argv: **u8, marks: *bool, list_only: bool) TestBuildResult {
     var list: TestList;
     list.tests = nil;
     list.len   = 0;
     list.cap   = 0;
 
-    val br: BuildResult = build_unit(a, argc, argv, false, true, nil, ?list, list_only);
+    val br: BuildResult = build_unit(a, argc, argv, marks, false, true, nil, ?list, list_only);
 
     var tbr: TestBuildResult;
     tbr.code  = br.code;
@@ -440,6 +446,40 @@ pub fun selection_from_config(config: *cfg.Config, out_sel: *manifest.Selection)
     ret R.ok[bool, str](true);
 }
 
+# reject a `mach build` flag combination that cannot produce correct output
+#
+# `-o` names a single artifact path; `--all-targets` builds every declared
+# target. Combined, each target would link to that one path and overwrite the
+# previous, leaving only the last target's binary with no warning. A per-target
+# `-o` template could be considered later; an explicit error is the floor.
+# ---
+# config: the parsed CLI config
+# ret:    ok(true) when the combination is valid, err naming the conflict
+fun reject_output_all_targets(config: *cfg.Config) R.Result[bool, str] {
+    if (config.output != nil && config.all_targets) {
+        ret R.err[bool, str]("-o cannot be combined with --all-targets (it names a single output)");
+    }
+    ret R.ok[bool, str](true);
+}
+
+# `-o` and `--all-targets` are rejected together; either alone is accepted.
+test "mach.cli.cmd.build.reject_output_all_targets:rejects_the_pair" {
+    var config: cfg.Config;
+
+    config.output      = "bin/app";
+    config.all_targets = true;
+    if (R.is_ok[bool, str](reject_output_all_targets(?config)))  { ret 1; }
+
+    config.all_targets = false;
+    if (R.is_err[bool, str](reject_output_all_targets(?config))) { ret 1; }
+
+    config.output      = nil;
+    config.all_targets = true;
+    if (R.is_err[bool, str](reject_output_all_targets(?config))) { ret 1; }
+
+    ret 0;
+}
+
 # the single-unit build body
 #
 # With `ovr` nil the target/artifact are derived from the CLI flags (the
@@ -453,24 +493,24 @@ pub fun selection_from_config(config: *cfg.Config, out_sel: *manifest.Selection)
 # a:         allocator owning the session and the returned artifact path
 # argc:      argument count including argv[0]
 # argv:      the argument vector (argc null-terminated byte pointers)
+# marks:     consumption record parallel to argv (from the command entry); the
+#            positional and link scanners step over the marked flag/value indices
 # emit_obj:  emit a relocatable object instead of an executable
 # test_mode: build per-test executables rather than a single artifact
 # ovr:       the enumerated matrix cell, or nil to derive from CLI flags
 # tests_out: the list a test build fills, or nil for a normal build
 # list_only: collect the tests without building executables (`--list`)
 # ret:       a BuildResult carrying the exit code and artifact path
-fun build_unit(a: *A.Allocator, argc: usize, argv: **u8, emit_obj: bool, test_mode: bool, ovr: *driver.MatrixUnit, tests_out: *TestList, list_only: bool) BuildResult {
+fun build_unit(a: *A.Allocator, argc: usize, argv: **u8, marks: *bool, emit_obj: bool, test_mode: bool, ovr: *driver.MatrixUnit, tests_out: *TestList, list_only: bool) BuildResult {
     var br: BuildResult;
     br.code        = 2;
     br.output_path = nil;
 
-    # everything at or after a `--` separator is a program argument (forwarded by
-    # `mach run`), never a build flag or link input. clip the count the build
-    # scanners see so post-`--` args cannot leak into config parsing, the link
-    # scan, or the project-path positional. with no `--` present this is argc.
-    val eff: usize = util.separator_index(argc, argv);
-
-    val res_config: R.Result[cfg.Config, str] = cfg.parse(eff, argv);
+    # the unknown-flag rejection ran in the command entry (`build.run` /
+    # `testing.run`) before this shared body, populating `marks` and rejecting any
+    # stray `--`, so this scans the full argc; a nil marks vector re-parses config
+    # without recording (rejection is already done).
+    val res_config: R.Result[cfg.Config, str] = cfg.parse(argc, argv, nil);
     if (R.is_err[cfg.Config, str](res_config)) {
         print.eprint("error: ");
         print.eprint(R.unwrap_err[cfg.Config, str](res_config));
@@ -482,8 +522,8 @@ fun build_unit(a: *A.Allocator, argc: usize, argv: **u8, emit_obj: bool, test_mo
 
     # the project root is the required non-flag positional after the subcommand
     # (`mach build <path>`); a bare invocation with no path is a user error.
-    val pix: usize = util.positional_index(eff, argv, 2);
-    if (pix >= eff) {
+    val pix: usize = util.positional_index(argc, argv, marks, 2);
+    if (pix >= argc) {
         print.eprint("error: missing project path; pass the project root (e.g. '.')\n");
         br.code = 1;
         ret br;
@@ -506,10 +546,10 @@ fun build_unit(a: *A.Allocator, argc: usize, argv: **u8, emit_obj: bool, test_mo
     # build_project.
     var cli_level: u8   = pipeline.OPT_DEBUG;
     var cli_set:   bool = false;
-    if (util.has_flag(eff, argv, "-O0"))       { cli_level = pipeline.OPT_DEBUG;   cli_set = true; }
-    or (util.has_flag(eff, argv, "-O1"))       { cli_level = pipeline.OPT_RELEASE; cli_set = true; }
-    or (util.has_flag(eff, argv, "-O2"))       { cli_level = pipeline.OPT_RELEASE; cli_set = true; }
-    or (util.has_flag(eff, argv, "--release")) { cli_level = pipeline.OPT_RELEASE; cli_set = true; }
+    if (util.has_flag(argc, argv, "-O0"))       { cli_level = pipeline.OPT_DEBUG;   cli_set = true; }
+    or (util.has_flag(argc, argv, "-O1"))       { cli_level = pipeline.OPT_RELEASE; cli_set = true; }
+    or (util.has_flag(argc, argv, "-O2"))       { cli_level = pipeline.OPT_RELEASE; cli_set = true; }
+    or (util.has_flag(argc, argv, "--release")) { cli_level = pipeline.OPT_RELEASE; cli_set = true; }
 
     # the build selection threaded to the driver; it narrows target/profile/
     # artifact. an enumerated matrix cell pins target and artifact, but the profile
@@ -600,14 +640,16 @@ fun build_unit(a: *A.Allocator, argc: usize, argv: **u8, emit_obj: bool, test_mo
     if (config.emit_ir)     { eff_emit_ir = true; }
     if (config.no_emit_ir)  { eff_emit_ir = false; }
 
-    br.code = compile_and_link(?p, level, emit_obj, test_mode, config.verify_ir, eff_emit_asm, eff_emit_ir, ?root[0], config.output, eff, argv, ?br.output_path, tests_out, list_only);
+    br.code = compile_and_link(?p, level, emit_obj, test_mode, config.verify_ir, eff_emit_asm, eff_emit_ir, ?root[0], config.output, argc, argv, marks, ?br.output_path, tests_out, list_only);
 
     # close the readout with the recap line on a successful, non-test build.
     if (br.code == 0 && s.readout != nil) {
         emit_summary(?p, ?ro, emit_obj, br.output_path);
     }
 
-    cli_diag.flush(?s, ?s.diags);
+    var diag_w: writer.Writer;
+    filesystem.get_writer(?filesystem.stderr, ?diag_w);
+    cli_diag.flush(?diag_w, ?s, ?s.diags);
     driver.dnit_project(?p);
     readout.dnit(?ro);
     session.dnit(?s);
@@ -683,6 +725,7 @@ fun resolve_opt_level(p: *driver.Project, cli_level: u8, cli_set: bool) u8 {
 # out_override: the `-o` artifact path, or nil to use the resolved path
 # argc:         argument count including argv[0]
 # argv:         the argument vector (argc null-terminated byte pointers)
+# marks:        consumption record parallel to argv, for the link-input scanners
 # out_path:     receives the owned produced-artifact path on success
 # tests_out:    the list a test build fills, or nil for a normal build
 # list_only:    collect the tests without building executables (`--list`)
@@ -690,7 +733,7 @@ fun resolve_opt_level(p: *driver.Project, cli_level: u8, cli_set: bool) u8 {
 fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: bool, verify_ir: bool,
                      emit_asm: bool, emit_ir: bool,
                      root: *u8, out_override: *u8,
-                     argc: usize, argv: **u8, out_path: **u8,
+                     argc: usize, argv: **u8, marks: *bool, out_path: **u8,
                      tests_out: *TestList, list_only: bool) i64 {
     val n: usize = p.module_len::usize;
     if (n == 0) {
@@ -782,10 +825,10 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
         code = 1;
     }
     or (tests_out != nil) {
-        code = build_test_executables(p, level, verify_ir, root, argc, argv, images, irs, list_only, tests_out);
+        code = build_test_executables(p, level, verify_ir, root, argc, argv, marks, images, irs, list_only, tests_out);
     }
     or {
-        code = link_artifact(p, emit_obj, root, out_override, argc, argv, images, out_path);
+        code = link_artifact(p, emit_obj, root, out_override, argc, argv, marks, images, out_path);
     }
 
     free_modules(p, irs, ir_ready, images, image_ready);
@@ -818,13 +861,14 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
 # root:      the resolved project root directory
 # argc:      argument count including argv[0]
 # argv:      the argument vector (argc null-terminated byte pointers)
+# marks:     consumption record parallel to argv, for the link-input scanners
 # images:    the per-module object images to write once and share
 # irs:       the per-module IR (for `test` collection)
 # list_only: report the collected tests without building (`--list`)
 # tests_out: the list to append each test's artifact to
 # ret:       0 on success, 1 on a user error, 2 on an internal error
 fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool,
-                           root: *u8, argc: usize, argv: **u8,
+                           root: *u8, argc: usize, argv: **u8, marks: *bool,
                            images: *of.ObjectImage, irs: *ir.Module,
                            list_only: bool, tests_out: *TestList) i64 {
     val res_collect: R.Result[testrunner.Collected, str] = testrunner.collect(p.s, irs, p.module_len);
@@ -906,7 +950,7 @@ fun build_test_executables(p: *driver.Project, level: u8, verify_ir: bool,
     # the external link inputs (libc, manifest/CLI libs), resolved once and shared.
     var sonames:    *intern.StrId = nil;
     var soname_len: u32           = 0;
-    val ec: i64 = append_external_inputs(p, root, argc, argv, ?shared, ?shared_len, ?sonames, ?soname_len);
+    val ec: i64 = append_external_inputs(p, root, argc, argv, marks, ?shared, ?shared_len, ?sonames, ?soname_len);
     if (ec != 0) {
         free_paths(p.s.alloc, shared, shared_len, shared_len);
         free_sonames(p.s.alloc, sonames, soname_len);
@@ -1386,12 +1430,13 @@ fun subst_name(tmpl: str, name: str, out: *u8, cap: usize) usize {
 # out_override: the `-o` artifact path, or nil to use the resolved path
 # argc:         argument count including argv[0]
 # argv:         the argument vector (argc null-terminated byte pointers)
+# marks:        consumption record parallel to argv, for the link-input scanners
 # images:       the per-module object images to write
 # out_path:     receives the owned produced-artifact path on success
 # ret:          0 on success, 1 on a user error, 2 on an internal error
 fun link_artifact(p: *driver.Project, emit_obj: bool, root: *u8,
                   out_override: *u8,
-                  argc: usize, argv: **u8,
+                  argc: usize, argv: **u8, marks: *bool,
                   images: *of.ObjectImage, out_path: **u8) i64 {
     val te: *driver.TargetEntry = p.target_entry;
     if (te == nil) { print.eprint("error: no target selected\n"); ret 2; }
@@ -1436,7 +1481,7 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, root: *u8,
     # time). `paths` and `sonames` are grown and re-bound here.
     var sonames:    *intern.StrId = nil;
     var soname_len: u32           = 0;
-    val ext_code: i64 = append_external_inputs(p, root, argc, argv, ?paths, ?len, ?sonames, ?soname_len);
+    val ext_code: i64 = append_external_inputs(p, root, argc, argv, marks, ?paths, ?len, ?sonames, ?soname_len);
     if (ext_code != 0) {
         free_paths(p.s.alloc, paths, len, len);
         free_sonames(p.s.alloc, sonames, soname_len);
@@ -1692,23 +1737,25 @@ fun write_named_candidate(dir: *u8, prefix: *u8, name: *u8, ext: *u8, buf: *u8, 
 # program), the subcommand, every known flag and its value, and the project-path
 # positional are skipped so only real link inputs are counted.
 # ---
-# p:    the project carrying the target entry and config
-# argc: argument count including argv[0]
-# argv: the argument vector (argc null-terminated byte pointers)
-# ret:  the external link-input token count
-fun count_external_tokens(p: *driver.Project, argc: usize, argv: **u8) u32 {
+# p:     the project carrying the target entry and config
+# argc:  argument count including argv[0]
+# argv:  the argument vector (argc null-terminated byte pointers)
+# marks: consumption record parallel to argv; a marked index is a flag or its
+#        value and is stepped over (the `-l` value alone is a counted input)
+# ret:   the external link-input token count
+fun count_external_tokens(p: *driver.Project, argc: usize, argv: **u8, marks: *bool) u32 {
     var n: u32 = 0;
     val te: *driver.TargetEntry = p.target_entry;
     if (te != nil) { n = n + te.lib_count; }
     # cascading transitive dep libs; 0 when no dep contributes any.
     n = n + p.config.cascade_lib_count;
 
-    val proj_ix: usize = util.positional_index(argc, argv, 2);
+    val proj_ix: usize = util.positional_index(argc, argv, marks, 2);
     var i: usize = 0;
     for (i < argc) {
         val a: *u8 = argv[i];
         if (str_equals(a::str, "-l") && i + 1 < argc)                              { n = n + 1; i = i + 2; cnt; }
-        if (util.is_value_flag(a) && i + 1 < argc)                                 { i = i + 2; cnt; }
+        if (marks[i])                                                              { i = i + 1; cnt; }
         if (i > 1 && i != proj_ix && a != nil && a[0] != '-' && is_object_path(a)) { n = n + 1; }
         i = i + 1;
     }
@@ -1731,17 +1778,18 @@ fun count_external_tokens(p: *driver.Project, argc: usize, argv: **u8) u32 {
 # root:       the resolved project root directory
 # argc:       argument count including argv[0]
 # argv:       the argument vector (argc null-terminated byte pointers)
+# marks:      consumption record parallel to argv, stepping over flag/value pairs
 # paths:      the static object-path array to grow and fill
 # len:        the static object-path count, updated to the true count
 # sonames:    the dynamic-dependency soname array to grow and fill
 # soname_len: the soname count
 # ret:        0 on success, or a non-zero exit code
-fun append_external_inputs(p: *driver.Project, root: *u8, argc: usize, argv: **u8,
+fun append_external_inputs(p: *driver.Project, root: *u8, argc: usize, argv: **u8, marks: *bool,
                            paths: ***u8, len: *u32,
                            sonames: **intern.StrId, soname_len: *u32) i64 {
     @sonames    = nil;
     @soname_len = 0;
-    val extra: u32 = count_external_tokens(p, argc, argv);
+    val extra: u32 = count_external_tokens(p, argc, argv, marks);
     if (extra == 0) { ret 0; }
 
     val base:  u32 = @len;
@@ -1785,7 +1833,7 @@ fun append_external_inputs(p: *driver.Project, root: *u8, argc: usize, argv: **u
         i = i + 1;
     }
 
-    val proj_ix: usize = util.positional_index(argc, argv, 2);
+    val proj_ix: usize = util.positional_index(argc, argv, marks, 2);
     var ii: usize = 0;
     for (ii < argc) {
         val a: *u8 = argv[ii];
@@ -1795,7 +1843,7 @@ fun append_external_inputs(p: *driver.Project, root: *u8, argc: usize, argv: **u
             if (code != 0) { shrink_paths(p, paths, len, written, grown); ret code; }
             ii = ii + 2; cnt;
         }
-        if (util.is_value_flag(a) && ii + 1 < argc) { ii = ii + 2; cnt; }
+        if (marks[ii]) { ii = ii + 1; cnt; }
         if (ii > 1 && ii != proj_ix && a != nil && a[0] != '-' && is_object_path(a)) {
             val code: i64 = resolve_and_store_input(p, a, root, argc, argv, ?buf[0], 4096,
                                                     @paths, ?written, sonames, soname_len);
@@ -2554,15 +2602,51 @@ fun dup_cstr(a: *A.Allocator, s: *u8) *u8 {
     ret buf;
 }
 
+# mark the `-O<n>` optimization-level flags into `marks` for the unknown-flag
+# rejector
+#
+# One home for the `-O` set, shared so `mach build`/`mach test` (which consume it)
+# and `mach run` (which accepts it as a no-op, since it does not build) can never
+# drift on which levels are accepted.
+# ---
+# marks: consumption record parallel to argv
+# argc:  number of arguments to scan (the caller clips at `--`)
+# argv:  argument vector (argc null-terminated byte pointers)
+pub fun mark_opt_flags(marks: *bool, argc: usize, argv: **u8) {
+    util.mark_flag(marks, argc, argv, "-O0");
+    util.mark_flag(marks, argc, argv, "-O1");
+    util.mark_flag(marks, argc, argv, "-O2");
+}
+
+# mark every `mach build`-specific flag (and its value) into `marks` for the
+# unknown-flag rejector
+#
+# The cross-cutting flags are marked by config.parse; this covers only what
+# `build_unit` reads later - the `-O<n>` optimization level, `--emit`, and the
+# `-L`/`-l` link inputs - which are consumed after positional resolution and so
+# must be registered up front, before the rejector runs. Shared by `mach build`
+# and `mach test`, which accepts the build flags too.
+# ---
+# marks: consumption record parallel to argv
+# argc:  number of arguments to scan (the caller clips at `--`)
+# argv:  argument vector (argc null-terminated byte pointers)
+pub fun mark_build_flags(marks: *bool, argc: usize, argv: **u8) {
+    mark_opt_flags(marks, argc, argv);
+    util.mark_value(marks, argc, argv, "--emit");
+    util.mark_value(marks, argc, argv, "-L");
+    util.mark_value(marks, argc, argv, "-l");
+}
+
 # `mach build` subcommand entry point
 #
 # Builds the current project to an executable (or a relocatable object with
 # `--emit obj`) under `<project_root>/out/`. Called by cmd.dispatch.
 # ---
-# argc: argument count including argv[0]
-# argv: the argument vector (argc null-terminated byte pointers)
-# ret:  0 on success, 1 on a user error, 2 on an internal error
-pub fun run(argc: usize, argv: **u8) i64 {
+# argc:  argument count including argv[0]
+# argv:  the argument vector (argc null-terminated byte pointers)
+# marks: consumption record parallel to argv, for the unknown-flag rejector
+# ret:   0 on success, 1 on a user error, 2 on an internal error
+pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     var emit_obj: bool = false;
     val opt_emit: O.Option[*u8] = emit_kind(argc, argv);
     if (O.is_some[*u8](opt_emit)) {
@@ -2586,9 +2670,7 @@ pub fun run(argc: usize, argv: **u8) i64 {
         ret 2;
     }
 
-    # post-`--` args are program arguments, never build flags; clip the scanners.
-    val eff: usize = util.separator_index(argc, argv);
-    val res_config: R.Result[cfg.Config, str] = cfg.parse(eff, argv);
+    val res_config: R.Result[cfg.Config, str] = cfg.parse(argc, argv, marks);
     if (R.is_err[cfg.Config, str](res_config)) {
         print.eprint("error: ");
         print.eprint(R.unwrap_err[cfg.Config, str](res_config));
@@ -2600,11 +2682,25 @@ pub fun run(argc: usize, argv: **u8) i64 {
         print.eprint("error: --bin and --lib cannot be combined\n");
         ret 1;
     }
+    val oc: R.Result[bool, str] = reject_output_all_targets(?config);
+    if (R.is_err[bool, str](oc)) {
+        print.eprint("error: ");
+        print.eprint(R.unwrap_err[bool, str](oc));
+        print.eprint("\n");
+        ret 1;
+    }
+
+    # config.parse marked the cross-cutting flags; mark the build-specific ones,
+    # then reject any unrecognized flag before the project-path positional is
+    # resolved (so an unknown flag can never displace the path). `mach build` gives
+    # `--` no special meaning, so a stray `--` is rejected here like any other flag.
+    mark_build_flags(marks, argc, argv);
+    if (util.reject_unknown(argc, argv, marks, 2, "mach build")) { ret 1; }
 
     # the project root is the required non-flag positional (`mach build <path>`);
     # a bare invocation with no path is a user error.
-    val pix: usize = util.positional_index(eff, argv, 2);
-    if (pix >= eff) {
+    val pix: usize = util.positional_index(argc, argv, marks, 2);
+    if (pix >= argc) {
         print.eprint("error: missing project path; pass the project root (e.g. '.')\n");
         ret 1;
     }
@@ -2669,7 +2765,7 @@ pub fun run(argc: usize, argv: **u8) i64 {
             ret 2;
         }
 
-        val br: BuildResult = build_unit(?u_alloc, argc, argv, emit_obj, false, unit, nil, false);
+        val br: BuildResult = build_unit(?u_alloc, argc, argv, marks, emit_obj, false, unit, nil, false);
         if (br.code != 0 && code == 0) { code = br.code; }
         arena.dnit(?u_ar);
         i = i + 1;

@@ -144,6 +144,10 @@ val PT_LOAD:    u32 = 1;
 val PT_DYNAMIC: u32 = 2;
 val PT_INTERP:  u32 = 3;
 val PT_PHDR:    u32 = 6;
+# marks the RELRO region: memory mapped writable so the self-relocation startup can
+# apply its RELATIVE relocs, then re-protected read-only before `main` (mach-std's
+# `_rt_relocate` mprotects it under `--pie`).
+val PT_GNU_RELRO: u32 = 0x6474E552;
 val PF_X: u32 = 1;
 val PF_W: u32 = 2;
 val PF_R: u32 = 4;
@@ -200,7 +204,10 @@ val PHDR_SIZE:       usize = 56;
 val SYM_SIZE:        usize = 24;
 val RELA_SIZE:       usize = 24;
 
-# default page size for static executables; segment vaddrs are page-aligned.
+# default page size for static executables; segment vaddrs are page-aligned. must match
+# the OS page size the linker laid the segments out with (linux: `LINUX_PAGE_SIZE`, via
+# `assign_section_vaddrs`) - the PIE header gap and the PT_GNU_RELRO page-rounding both
+# assume this writer's page equals the segment-alignment page.
 val EXEC_PAGE_SIZE: u64 = 4096;
 
 # resolve an interned StrId to its backing text, or nil for an absent interner
@@ -1117,6 +1124,13 @@ pub fun register(reg: *of.OfRegistry) R.Result[bool, str] {
     elf_vtable.emit_exec      = emit_exec;
     elf_vtable.emit_dyn_exec  = emit_dyn_exec;
 
+    # elf relocates and writes for every isa with an `elf_reloc_type` map.
+    elf_vtable.covers_isa_any   = false;
+    elf_vtable.covers_isa_count = 0;
+    of.cover_isa(?elf_vtable, isa.ARCH_X86_64);
+    of.cover_isa(?elf_vtable, isa.ARCH_AARCH64);
+    of.cover_isa(?elf_vtable, isa.ARCH_RISCV64);
+
     of.register(reg, ?elf_vtable);
     ret R.ok[bool, str](true);
 }
@@ -1414,6 +1428,24 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
     ret R.ok[bool, str](true);
 }
 
+# whether the ELF header + `phdr_count` program headers fit the single page the linker
+# reserves below the first load segment for a PIE or dynamic image (`assign_section_vaddrs`)
+#
+# The PIE and dynamic writers extend the first PT_LOAD down exactly one page to file offset
+# 0 so it covers the ELF header and the program-header table, mapping them at
+# `segs[0].vaddr - page`. That holds the loader's `p_offset == p_vaddr (mod page)`
+# congruence only while the header block fits that one page: `ELF_HEADER_SIZE + phdr_count
+# * PHDR_SIZE <= page`, i.e. `phdr_count <= 72`. A larger table spills onto a second page,
+# pushing the first segment's file offset a page past `hdr_vaddr + page` so segment 0 no
+# longer maps at its vaddr - an image the kernel refuses to exec. The writer refuses at
+# link time instead.
+# ---
+# phdr_count: the number of program headers the writer will emit
+# ret:        true when the header block still fits its one reserved page
+fun header_fits_reserved_page(phdr_count: u32) bool {
+    ret ELF_HEADER_SIZE + phdr_count::usize * PHDR_SIZE <= EXEC_PAGE_SIZE::usize;
+}
+
 # write a position-independent (PIE / ET_DYN) static executable for linux ASLR
 #
 # A static-PIE: an ET_DYN image the kernel loads at a randomized base, self-relocated
@@ -1426,6 +1458,17 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTabl
 # base), so the writer extends the first segment down to cover the ELF header and the
 # program headers, exactly as the dynamic writer does, and a PT_PHDR lets the startup
 # recover the load bias from the kernel's AT_PHDR.
+#
+# RELRO hardening: a read-only-natured segment (`.rodata`, holding relocated constants
+# such as vtables and `val` pointer globals) is mapped writable at load so the startup
+# can slide its RELATIVE slots; a PT_GNU_RELRO over it is the *cue* for the runtime to
+# re-protect it read-only before `main`. This writer only emits the header - the actual
+# re-protection ships in mach-std's `_rt_relocate` (a `--pie` build linking mach-std);
+# a freestanding or non-mach-std `--pie` image carries the header but is never
+# re-protected. Because mach's 5-kind model keeps all constants in one `.rodata`
+# segment, the whole segment (not just a `.data.rel.ro` split) is writable from load
+# until re-protection - a deliberate simplification, a wider window than a real split.
+# Genuinely writable data (`.data`/`.bss`) is excluded and stays writable.
 #
 # Segment vaddrs and the entry are link-time addresses; the kernel adds a load bias and
 # the startup slides every RELATIVE slot by it. An image with zero base relocations is
@@ -1457,8 +1500,19 @@ fun emit_pie_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
 
     # program headers: PT_PHDR + one PT_LOAD per linker segment + the synthesized RO
     # PT_LOAD (.rela.dyn/.dynamic) + PT_DYNAMIC. the first linker segment also maps the
-    # ELF header + phdrs (extended down a page), so no separate header PT_LOAD.
-    val phdr_count: u32 = seg_count + 3;
+    # ELF header + phdrs (extended down a page), so no separate header PT_LOAD. a
+    # PT_GNU_RELRO is added when a read-only segment carries a base relocation.
+    var relro_extra: u32 = 0;
+    if (pie_relro_seg(segs, seg_count, dyn) >= 0) { relro_extra = 1; }
+    val phdr_count: u32 = seg_count + 3 + relro_extra;
+
+    # the first PT_LOAD covers the ELF header + phdr table by extending one page below
+    # segment 0; a header block larger than that page would break segment 0's mapping, so
+    # refuse rather than emit an image the kernel cannot exec (see #1814).
+    if (!header_fits_reserved_page(phdr_count)) {
+        ret R.err[bool, str]("elf: PIE program headers exceed the one-page header reservation (too many load segments)");
+    }
+
     val phdr_offset: usize = ELF_HEADER_SIZE;
     val phdr_table_size: usize = phdr_count::usize * PHDR_SIZE;
 
@@ -1580,8 +1634,9 @@ fun emit_pie_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
 # PT_PHDR locates the table (so the kernel passes AT_PHDR and the startup recovers the
 # load bias); each linker segment is a PT_LOAD, the first extended down one page to file
 # offset 0 so a single PT_LOAD covers the ELF header + program headers with no
-# overlapping page; the synthesized .rela.dyn/.dynamic share a read-only PT_LOAD; and
-# PT_DYNAMIC points the startup at the .dynamic table.
+# overlapping page; the synthesized .rela.dyn/.dynamic share a read-only PT_LOAD;
+# PT_DYNAMIC points the startup at the .dynamic table; and a trailing PT_GNU_RELRO spans
+# any read-only segment that carries a base relocation, for the startup to re-protect.
 # ---
 # buf:          the output buffer
 # phdr_offset:  byte offset of the program-header table in `buf`
@@ -1627,6 +1682,64 @@ fun write_pie_phdrs(buf: *u8, phdr_offset: usize, phdr_count: u32,
     pos = write_phdr(buf, pos, PT_LOAD, PF_R, ro_off, ro_va, ro_size, ro_size, EXEC_PAGE_SIZE);
     # PT_DYNAMIC -> the .dynamic table.
     pos = write_phdr(buf, pos, PT_DYNAMIC, PF_R, dyn_off, dyn_va, dyn_size, dyn_size, 8);
+
+    # PT_GNU_RELRO over the read-only segment carrying a base relocation (`.rodata` with
+    # relocated constants), when present. the region is mapped writable above for the
+    # self-reloc; this header is the runtime's cue to re-protect it read-only (see the
+    # `pie_seg_flags` contract). p_memsz is page-rounded so the runtime re-protects whole
+    # pages with no arithmetic of its own - safe because every merged kind starts on a
+    # fresh page (assign_section_vaddrs), so the next segment begins where this one ends.
+    val relro_seg: i64 = pie_relro_seg(segs, seg_count, dyn);
+    if (relro_seg >= 0) {
+        val ri: u32 = relro_seg::u32;
+        val relro_size: usize = bin.align_up(segs[ri].memsz, EXEC_PAGE_SIZE::usize);
+        pos = write_phdr(buf, pos, PT_GNU_RELRO, PF_R, seg_offsets[ri], segs[ri].vaddr,
+                         relro_size, relro_size, 1);
+    }
+}
+
+# whether load segment `li` holds an in-image absolute pointer (a base relocation)
+#
+# This single fact drives both forced writability (`pie_seg_flags`, so the self-reloc
+# can slide the pointer) and RELRO selection (`pie_relro_seg`, so a read-only segment is
+# re-protected afterward) - shared so the two decisions can never disagree.
+# ---
+# dyn:       the dynamic-link plan whose base relocations are scanned
+# li:        the segment index
+# seg_count: number of segments (bounds the scanned segment ids)
+# ret:       true when a base relocation targets segment `li`
+fun seg_has_base_reloc(dyn: *of.DynamicInfo, li: u32, seg_count: u32) bool {
+    var i: u32 = 0;
+    for (i < dyn.base_reloc_count) {
+        if (dyn.base_relocs[i].seg_index == li && dyn.base_relocs[i].seg_index < seg_count) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the load segment covered by PT_GNU_RELRO, or -1 when none
+#
+# A RELRO segment is read-only-natured in its source permissions (no write, no execute)
+# yet carries a base relocation: under `--pie` such a segment (`.rodata` holding
+# relocated constants - vtables, `val` pointer globals) is mapped writable at load for
+# the self-reloc, then re-protected read-only. mach's canonical layout (TEXT, DATA,
+# RODATA, BSS) has exactly one such segment - `.rodata` - so this returns that single
+# segment; genuinely writable data (`.data`/`.bss`) and executable code never qualify.
+# ---
+# segs:      the linker's loadable segments
+# seg_count: number of segments
+# dyn:       the dynamic-link plan whose base relocations are scanned
+# ret:       the covered segment index, or -1 when no segment needs PT_GNU_RELRO
+fun pie_relro_seg(segs: *of.LoadSegment, seg_count: u32, dyn: *of.DynamicInfo) i64 {
+    var li: u32 = 0;
+    for (li < seg_count) {
+        val f: u32 = pf_flags_for(segs[li].flags);
+        if ((f & PF_W) == 0 && (f & PF_X) == 0 && seg_has_base_reloc(dyn, li, seg_count)) {
+            ret li::i64;
+        }
+        li = li + 1;
+    }
+    ret -1;
 }
 
 # the program-header permission flags for PIE load segment `li`
@@ -1634,9 +1747,9 @@ fun write_pie_phdrs(buf: *u8, phdr_offset: usize, phdr_count: u32,
 # A static-PIE has no run-time loader to set up RELRO, so any segment holding an
 # in-image absolute pointer (a `.rela.dyn` RELATIVE target) must be writable when the
 # self-relocation startup slides it - including an otherwise read-only data segment.
-# This trades the read-only hardening of relocated constants for a working static-PIE;
-# a proper PT_GNU_RELRO (mapped writable, relocated, then re-protected) is a later
-# refinement.
+# A read-only segment forced writable here is exactly the one `pie_relro_seg` selects
+# for PT_GNU_RELRO (both keyed on `seg_has_base_reloc`), so the runtime that consumes the
+# header re-protects it read-only after relocation - the standard RELRO round-trip.
 # ---
 # segs:      the linker's loadable segments
 # li:        the segment index
@@ -1644,14 +1757,8 @@ fun write_pie_phdrs(buf: *u8, phdr_offset: usize, phdr_count: u32,
 # dyn:       the dynamic-link plan whose base relocations are scanned
 # ret:       the PF_* flags, with PF_W forced when the segment bears a base relocation
 fun pie_seg_flags(segs: *of.LoadSegment, li: u32, seg_count: u32, dyn: *of.DynamicInfo) u32 {
-    var f: u32 = pf_flags_for(segs[li].flags);
-    var i: u32 = 0;
-    for (i < dyn.base_reloc_count) {
-        if (dyn.base_relocs[i].seg_index == li && dyn.base_relocs[i].seg_index < seg_count) {
-            ret f | PF_W;
-        }
-        i = i + 1;
-    }
+    val f: u32 = pf_flags_for(segs[li].flags);
+    if (seg_has_base_reloc(dyn, li, seg_count)) { ret f | PF_W; }
     ret f;
 }
 
@@ -1878,6 +1985,14 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
     # synthesized + PT_DYNAMIC). the first linker segment also maps the ELF
     # header + phdrs, so no separate header-covering PT_LOAD is needed.
     val phdr_count: u32 = seg_count + 6;
+
+    # like the PIE writer, the first PT_LOAD covers the ELF header + phdr table by
+    # extending one page below segment 0; a header block larger than that page would break
+    # segment 0's mapping, so refuse rather than emit an unloadable image (see #1814).
+    if (!header_fits_reserved_page(phdr_count)) {
+        ret R.err[bool, str]("elf: dynamic-exec program headers exceed the one-page header reservation (too many load segments)");
+    }
+
     val phdr_offset: usize = ELF_HEADER_SIZE;
     val phdr_table_size: usize = phdr_count::usize * PHDR_SIZE;
 
@@ -4071,5 +4186,204 @@ test "mach.lang.target.of.elf.emit_pie_exec:static_pie_layout" {
     }
 
     if (bad) { ret 1; }
+    ret 0;
+}
+
+# emit_pie_exec covers a read-only segment that carries a base relocation (`.rodata`
+# holding a relocated constant) with a PT_GNU_RELRO, so the runtime can re-protect it
+# read-only after self-relocation. asserts exactly one RELRO header, page-rounded and
+# spanning the read-only reloc-bearing segment; that a sibling writable reloc-bearing
+# segment is excluded; and that the covered load segment is force-mapped R+W (the
+# precondition the self-reloc write needs).
+test "mach.lang.target.of.elf.emit_pie_exec:relro_covers_ro_reloc_segment" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id            = isa.ARCH_X86_64;
+    isa_vt.elf_machine   = 62;       # EM_X86_64
+    isa_vt.pointer_width = 8;
+
+    # three segments modeling the real PIE layout: text (R+X, no reloc), a writable data
+    # segment (R+W) carrying a reloc, and a read-only data segment (R) carrying a reloc.
+    # only the read-only one is a RELRO region; the writable one must be excluded.
+    var text:   [16]u8;
+    var data:   [16]u8;
+    var rodata: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text[k] = 0x90; data[k] = 0; rodata[k] = 0; k = k + 1; }
+    var segs: [3]of.LoadSegment;
+    segs[0].vaddr = 0x401000; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text[0];
+    segs[1].vaddr = 0x402000; segs[1].filesz = 16; segs[1].memsz = 16;
+    segs[1].flags = of.SEG_FLAG_READ | of.SEG_FLAG_WRITE; segs[1].bytes = ?data[0];
+    segs[2].vaddr = 0x403000; segs[2].filesz = 16; segs[2].memsz = 16;
+    segs[2].flags = of.SEG_FLAG_READ; segs[2].bytes = ?rodata[0];
+
+    # one relocated pointer in the writable segment (index 1) and one in the read-only
+    # segment (index 2). only the latter is a RELRO region.
+    var brs: [2]of.BaseReloc;
+    brs[0].seg_index = 1; brs[0].seg_offset = 8; brs[0].target = 0x401000;
+    brs[1].seg_index = 2; brs[1].seg_offset = 8; brs[1].target = 0x401000;
+
+    var dyn: of.DynamicInfo;
+    dyn.libs = nil;            dyn.lib_count = 0;
+    dyn.imports = nil;         dyn.import_count = 0;
+    dyn.interp = intern.STR_NIL;
+    dyn.base_relocs = ?brs[0]; dyn.base_reloc_count = 2;
+    dyn.pie = true;
+
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "elf_relro");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val tpath: str = filesystem.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_pie_exec(?alloc, ?i, ?isa_vt, ?segs[0], 3, 0x401000, ?dyn, tpath::*u8);
+    if (R.is_err[bool, str](em)) { filesystem.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tpath);
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_err[filesystem.Buffer, str](rb)) { ret 1; }
+    val buf: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rb);
+
+    var bad: bool = false;
+
+    # walk the program headers: exactly one PT_GNU_RELRO, spanning the read-only
+    # reloc-bearing segment (vaddr 0x403000, page-rounded memsz), read-only; the writable
+    # reloc-bearing segment at 0x402000 must not be covered. also confirm the covered load
+    # segment is mapped R+W (the forced-writable precondition the self-reloc needs) and
+    # the writable segment stays R+W.
+    val e_phoff: usize = bin.read_u64_le(buf.data, 32)::usize;
+    val e_phnum: usize = bin.read_u16_le(buf.data, 56)::usize;
+    var relro_seen:        u32 = 0;
+    var rodata_load_flags: u32 = 0;
+    var data_load_flags:   u32 = 0;
+    var ph: usize = 0;
+    for (ph < e_phnum) {
+        val po: usize = e_phoff + ph * PHDR_SIZE;
+        val pt:     u32 = bin.read_u32_le(buf.data, po);
+        val pflags: u32 = bin.read_u32_le(buf.data, po + 4);
+        val pvaddr: u64 = bin.read_u64_le(buf.data, po + 16);
+        if (pt == PT_GNU_RELRO) {
+            relro_seen = relro_seen + 1;
+            val pfilesz: u64 = bin.read_u64_le(buf.data, po + 32);
+            val pmemsz:  u64 = bin.read_u64_le(buf.data, po + 40);
+            if (pflags != PF_R)            { bad = true; }
+            if (pvaddr != 0x403000)        { bad = true; }
+            if (pfilesz != EXEC_PAGE_SIZE) { bad = true; }
+            if (pmemsz != EXEC_PAGE_SIZE)  { bad = true; }
+        }
+        if (pt == PT_LOAD && pvaddr == 0x403000) { rodata_load_flags = pflags; }
+        if (pt == PT_LOAD && pvaddr == 0x402000) { data_load_flags = pflags; }
+        ph = ph + 1;
+    }
+    if (relro_seen != 1)                    { bad = true; }
+    if (rodata_load_flags != (PF_R | PF_W)) { bad = true; }
+    if (data_load_flags != (PF_R | PF_W))   { bad = true; }
+
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+# header_fits_reserved_page pins the one-page header threshold the PIE writer refuses
+# past: the ELF header + phdr table must fit the single page the linker reserves below
+# segment 0, so `64 + 72*56 == 4096` fits exactly and 73 headers (4152 bytes) do not.
+test "mach.lang.target.of.elf.header_fits_reserved_page:one_page_threshold" {
+    var bad: bool = false;
+    if (!header_fits_reserved_page(1))  { bad = true; }
+    if (!header_fits_reserved_page(72)) { bad = true; }
+    if (header_fits_reserved_page(73))  { bad = true; }
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+# emit_pie_exec refuses a header block that overflows the one page the linker reserves
+# below the first load segment: 70 segments emit 73 program headers (seg_count + 3), whose
+# table (4152 bytes) spills onto a second page, so the first PT_LOAD extended down one page
+# could no longer map segment 0 at its vaddr. the writer must return an error at link time
+# rather than emit a silently unloadable image (issue #1814).
+test "mach.lang.target.of.elf.emit_pie_exec:header_overflow_refused" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id            = isa.ARCH_X86_64;
+    isa_vt.elf_machine   = 62;       # EM_X86_64
+    isa_vt.pointer_width = 8;
+
+    # vaddrs are immaterial: the guard fires before segment layout, so the segments carry
+    # no bytes and only their count drives the refusal.
+    var segs: [70]of.LoadSegment;
+    var s: u32 = 0;
+    for (s < 70) {
+        segs[s].vaddr = 0x401000 + s::u64 * EXEC_PAGE_SIZE;
+        segs[s].filesz = 0; segs[s].memsz = 0;
+        segs[s].flags = of.SEG_FLAG_READ; segs[s].bytes = nil;
+        s = s + 1;
+    }
+
+    var dyn: of.DynamicInfo;
+    dyn.libs = nil;            dyn.lib_count = 0;
+    dyn.imports = nil;         dyn.import_count = 0;
+    dyn.interp = intern.STR_NIL;
+    dyn.base_relocs = nil;     dyn.base_reloc_count = 0;
+    dyn.pie = true;
+
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "elf_pie_overflow");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val tpath: str = filesystem.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_pie_exec(?alloc, ?i, ?isa_vt, ?segs[0], 70, 0x401000, ?dyn, tpath::*u8);
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_ok[bool, str](em)) { ret 1; }
+    ret 0;
+}
+
+# emit_dyn_exec shares the PIE writer's one-page header trick with `phdr_count = seg_count
+# + 6`, so it refuses the same overflow: 67 segments emit 73 program headers whose table
+# spills onto a second page. the writer must return an error rather than emit an unloadable
+# dynamic image (issue #1814).
+test "mach.lang.target.of.elf.emit_dyn_exec:header_overflow_refused" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id            = isa.ARCH_X86_64;
+    isa_vt.elf_machine   = 62;       # EM_X86_64
+    isa_vt.pointer_width = 8;
+
+    # vaddrs are immaterial: the guard fires before segment layout, so the segments carry
+    # no bytes and only their count drives the refusal.
+    var segs: [67]of.LoadSegment;
+    var s: u32 = 0;
+    for (s < 67) {
+        segs[s].vaddr = 0x401000 + s::u64 * EXEC_PAGE_SIZE;
+        segs[s].filesz = 0; segs[s].memsz = 0;
+        segs[s].flags = of.SEG_FLAG_READ; segs[s].bytes = nil;
+        s = s + 1;
+    }
+
+    # a non-PIE dynamic plan with no imports so emit_dyn_exec stays on the ET_EXEC path.
+    var dyn: of.DynamicInfo;
+    dyn.libs = nil;            dyn.lib_count = 0;
+    dyn.imports = nil;         dyn.import_count = 0;
+    dyn.interp = intern.STR_NIL;
+    dyn.base_relocs = nil;     dyn.base_reloc_count = 0;
+    dyn.pie = false;
+
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "elf_dyn_overflow");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val tpath: str = filesystem.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_dyn_exec(?alloc, ?i, ?isa_vt, ?segs[0], 67, 0x401000,
+                                                nil::*of.ExecFunction, 0, ?dyn, nil::*of.PltFixup, 0,
+                                                tpath::*u8, "dynoverflow"::*u8);
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_ok[bool, str](em)) { ret 1; }
     ret 0;
 }

@@ -6,12 +6,20 @@
 #
 # producers:
 #   exec        — run the program, observe its stdout (native / qemu).
+#   relro-fault — run the program and report whether its write to a RELRO'd .rodata
+#                 slot faulted (SIGSEGV -> exit 139); the --pie RELRO runtime guard.
 #   field       — coreutils (od/dd) reads of known header offsets, for format facts
 #                 execution cannot observe (PE ASLR bit, macho PIE bit). dispatched
 #                 on the artifact's own magic, so it is independent of how the case
 #                 maps to a leg. no LLVM; reads little-endian fields (every runner is LE).
+#   relro       — like field, but walks the ELF program headers for a PT_GNU_RELRO
+#                 (the static-PIE RELRO region). ELF-only; used by the elf-relro guard.
 #   flat-loader — load an os=freestanding, of=raw flat image via a tiny C loader
 #                 (mmap + jump) and report the image's exit status.
+#   built       — build-only: assert the tuple composed and emitted an artifact,
+#                 for a cross-built target with no host runner (a freestanding
+#                 aarch64/riscv64 image on the x86_64 leg). the observable is a
+#                 constant, so the golden is the fact "it emitted".
 
 # the directory this file lives in (int/lib), used to find flat_loader.c. resolved
 # from the sourced path so it does not depend on run.sh's variables.
@@ -31,6 +39,30 @@ produce_exec() {
         "qemu-${target##*-}" "$bin"
     else
         "$bin"
+    fi
+}
+
+# produce_relro_fault <runmode> <target> <binary>
+# runs the built binary (expected to write to a relocated constant's RELRO'd .rodata
+# storage) and reports whether that write faulted. after the --pie startup mprotects
+# the region read-only, the write must raise SIGSEGV, which surfaces as exit 128+11=139
+# both natively and under qemu-user; any other status means the region stayed writable.
+# the program's own stdout is discarded - the observable is purely the fault fact - so
+# this is a runtime (exec-like) producer sharing one target-independent golden.
+produce_relro_fault() {
+    runmode=$1
+    target=$2
+    bin=$3
+    if [ "$runmode" = "qemu" ]; then
+        "qemu-${target##*-}" "$bin" >/dev/null 2>&1
+    else
+        "$bin" >/dev/null 2>&1
+    fi
+    ec=$?
+    if [ "$ec" -eq 139 ]; then
+        echo "relro_write=faulted"
+    else
+        echo "relro_write=exit$ec"
     fi
 }
 
@@ -83,6 +115,30 @@ produce_field() {
     esac
 }
 
+# produce_relro <runmode> <target> <binary>
+# emits the ELF RELRO fact: relro=1 when a PT_GNU_RELRO program header (p_type
+# 0x6474e552) is present, else relro=0. read host-side from the program headers
+# (e_phoff u64 @32, e_phentsize u16 @54, e_phnum u16 @56), never executing the binary,
+# so it works on every leg including qemu. ELF-only (RELRO is an ELF concept).
+produce_relro() {
+    bin=$3
+    magic=$(dd if="$bin" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    if [ "$magic" != "7f454c46" ]; then
+        echo "int: relro: not an ELF binary (magic $magic)" >&2; return 2
+    fi
+    phoff=$(read_le_uint "$bin" 32 8)
+    phentsize=$(read_le_uint "$bin" 54 2)
+    phnum=$(read_le_uint "$bin" 56 2)
+    relro=0
+    i=0
+    while [ "$i" -lt "$phnum" ]; do
+        ptype=$(read_le_uint "$bin" $((phoff + i * phentsize)) 4)
+        if [ "$ptype" = "1685382482" ]; then relro=1; break; fi   # PT_GNU_RELRO = 0x6474e552
+        i=$((i + 1))
+    done
+    echo "relro=$relro"
+}
+
 # produce_flat_loader <runmode> <target> <binary>
 # loads the freestanding raw image through the C loader (built once, cached) and
 # reports the image's exit status as the observable. any stdout the image writes
@@ -101,6 +157,22 @@ produce_flat_loader() {
     printf 'exit=%d\n' "$ec"
 }
 
+# produce_built <runmode> <target> <binary>
+# a build-only observable: prove the tuple composes and emits an artifact without
+# running it. for a cross-built target with no host runner (a freestanding aarch64
+# / riscv64 flat image on the x86_64 linux leg) running is impossible, but the
+# emit path is exactly what must not regress. run.sh has already failed the case if
+# the build failed; this asserts the artifact exists and is non-empty.
+produce_built() {
+    bin=$3
+    if [ -s "$bin" ]; then
+        echo "built=1"
+    else
+        echo "int: built: artifact missing or empty" >&2
+        return 2
+    fi
+}
+
 # produce <run> <runmode> <target> <binary>
 # dispatches to the producer named by <run>, forwarding the remaining arguments.
 produce() {
@@ -108,8 +180,11 @@ produce() {
     shift
     case "$run" in
         exec)        produce_exec "$@" ;;
+        relro-fault) produce_relro_fault "$@" ;;
         field)       produce_field "$@" ;;
+        relro)       produce_relro "$@" ;;
         flat-loader) produce_flat_loader "$@" ;;
+        built)       produce_built "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
 }

@@ -150,11 +150,12 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     # the mach target to compile: the build-target if set, else the leg itself.
     build_target=${case_build_target:-$target}
 
-    # the golden is shared across build-targets for exec (target-independent output)
-    # and per-build-target for structural producers (their fact is format-specific).
+    # the golden is shared across build-targets for runtime observables (exec and the
+    # relro-fault guard, whose output is target-independent) and per-build-target for
+    # structural producers (their fact is format-specific).
     case "$case_run" in
-        exec) golden="$dir/expect.txt" ;;
-        *)    golden="$dir/expect.$build_target.txt" ;;
+        exec|relro-fault) golden="$dir/expect.txt" ;;
+        *)                golden="$dir/expect.$build_target.txt" ;;
     esac
 
     for profile in $case_profiles; do

@@ -15,6 +15,24 @@ matched exactly: `--flag value` (a value follows in the next argument) or a bare
 `--flag` toggle. The combined `--flag=value` form and bundled short flags are
 **not** recognized.
 
+An unrecognized flag is a hard error. Before it resolves positionals, each
+command rejects the first `-`-prefixed token it does not accept — `error: unknown
+flag '<flag>' for '<command>'`, exit `1` — so a typo'd or removed flag never
+silently misparses as a project path or link input. There is no `-h` / `--help`
+flag; both are rejected as unknown. Use `mach help <command>` for a command's
+usage.
+
+The `--` end-of-flags separator is honored only by `mach run`, which forwards
+every token after `--` to the executed binary as its `argv` — `mach run <path> --
+--flag` passes `--flag` through to the program. On every other command `--` has
+no special meaning: it is an unmarked `-`-prefixed token and is rejected as an
+unknown flag like any other.
+
+Consequently a lone `-`, a `--`, or a negative-number token (e.g. `-1`) at a flag
+position is rejected as an unknown flag. No CLI positional legitimately begins
+with `-`, so a dash-leading positional is unsupported outside `mach run`'s
+argument forwarding.
+
 ## Commands
 
 | Command | Summary |
@@ -22,6 +40,7 @@ matched exactly: `--flag value` (a value follows in the next argument) or a bare
 | `build` | compile the project to objects and (for a `[bin.*]`) a linked binary |
 | `run`   | execute the already-built binary (a post-`build` convenience, not a rebuild) |
 | `test`  | build the test binary and run the collected tests |
+| `check` | report diagnostics for a single source file, without a project |
 | `dep`   | manage git-backed dependencies (clone, lock, vendor) under `<dep>` |
 | `init`  | scaffold a new project |
 | `doc`   | generate Markdown reference docs from source doc-comments |
@@ -38,18 +57,22 @@ A verbosity flag (`-v`/`-vv`) and `--quiet` together is a parse error.
 | `-v`             | —                | `mach build`: per-phase roll-up (load/resolve/sema/lower/optimize/codegen/link) with item counts + timing, then a `built … N modules … in …` summary, on stderr |
 | `-vv`            | —                | `-v` plus a per-module/file line under each phase with its duration and a `(slow)` marker on the slowest |
 | `--quiet`, `-q`  | —                | suppress non-error output |
-| `--color <mode>` | `auto`\|`always`\|`never` | color preference for terminal output (default `auto`); an unknown mode is a parse error |
 | `--target <name>`| target name      | select a declared target; absent, defers to `[project].target` |
 | `--profile <name>`| profile name    | select a `[profile.<name>]` build variant; absent, the first declared profile |
 | `--bin <name>`   | artifact name    | narrow the build to one `[bin.<name>]` artifact |
 | `--lib <name>`   | artifact name    | narrow the build to one `[lib.<name>]` artifact (mutually exclusive with `--bin`) |
 | `-o <path>`      | path             | override the artifact path, rooted at the project root (build/run/test) |
-| `--all-targets`  | —                | build every declared `[target.*]`, not just the default |
+| `--all-targets`  | —                | build every declared `[target.*]`, not just the default (mutually exclusive with `-o`, which names one path) |
 | `--emit-asm`     | —                | emit per-module assembly text (`.s`); forces the selected profile's `emit_asm` on |
-| `--emit-ir`      | —                | emit per-module SSA IR text (`.ir`); forces the selected profile's `emit_ir` on |
+| `--emit-ir`      | —                | emit per-module SSA IR text (`.ir`) — the final post-pipeline IR the object is built from, so it varies with `-O`; forces the selected profile's `emit_ir` on |
 | `--no-emit-asm`  | —                | force per-module assembly emission off, overriding the profile's `emit_asm` |
 | `--no-emit-ir`   | —                | force per-module IR emission off, overriding the profile's `emit_ir` |
 | `--verify-ir`    | —                | run the IR verifier after each optimisation pass |
+
+> Under `mach test`, the entry module's `--emit-ir` dump shows the neutralized
+> project `main` the test dispatcher substitutes for the real entry (the final IR
+> that build is made from), so it differs from the same module's `mach build`
+> dump. That divergence is expected.
 
 > `mach dep` and `mach init` do not use the shared config parser; they read only
 > their own flags listed below.
@@ -231,6 +254,7 @@ passed.
 | `--filter <pattern>`| pattern | run only tests whose name contains `<pattern>` |
 | `--include-deps`    | —       | also collect tests declared in dependency modules |
 | `--list`            | —       | list the collected tests and exit |
+| `--format <mode>`   | `human`\|`json` | output format: the live readout (default `human`), or the machine-readable JSON event stream |
 | `--runner <cmd>`    | command | launch every test as `<cmd> <exe> <idx>` instead of exec'ing the dispatcher directly |
 
 Plus the `build` and global flags (`-v` lists every test). The build produces a
@@ -251,7 +275,43 @@ arguments). Without it, a test executable the host cannot launch reports a
 per-test failure — `(exit 127)` when `execve` rejects the binary in the spawned
 child, `(spawn failed)` when the spawn itself fails — with no auto-detection.
 
+`--format json` replaces the live readout with a machine-readable stream: one
+JSON object per line on stdout (`run_start`, one `test` per result, `summary`),
+with no human text interleaved. `--list --format json` emits one `case` object
+per collected test instead. The schema is versioned and documented in
+[tooling/test-json.md](tooling/test-json.md); pin tooling to its `schema`
+integer. Build diagnostics stay on stderr, so the stdout stream is clean.
+
 Exit codes: `0` all passed, `1` any failed, `2` build/internal error.
+
+## `mach check`
+
+```
+mach check <file> [--format human|json]
+```
+
+Reports diagnostics for a single source file, feeding its text straight through
+the editor query surface — no `mach.toml`, module graph, or link step. It is the
+editor-facing diagnostics slice exposed as a CLI verb. It reports **parse-stage
+diagnostics only**: it does not run name resolution or sema, so a real run never
+carries the `= help:` suggestions or secondary (`related`) spans those stages
+produce — whether check should deepen to resolve is tracked in
+[#1839](https://github.com/briar-systems/mach/issues/1839).
+
+| Flag              | Value            | Effect |
+|-------------------|------------------|--------|
+| `--format <mode>` | `human`\|`json`  | diagnostic format: framed source snippets on stderr (default `human`), or the machine-readable NDJSON stream on stdout |
+
+`--format json` emits one JSON object per line on stdout — a `diagnostic` object
+per reported diagnostic (severity, message, primary location, and the `note`,
+`help`, and `related` fields, structurally `null` / empty today per the
+parse-only note above) and a closing `summary` — with no human frames
+interleaved. The schema is versioned and documented in
+[tooling/check-json.md](tooling/check-json.md); pin tooling to its `schema`
+integer. Usage and io errors stay on stderr, so the stdout stream is clean.
+
+Exit codes: `0` when the buffer has no error-severity diagnostics, `1` when it
+has any (or on a usage / io error), and `2` on an allocator bootstrap failure.
 
 ## `mach dep`
 
@@ -400,7 +460,7 @@ Plus the global flags. Exit codes: `0` ok, `1` user error, `2` internal error.
 ## `mach info`
 
 ```
-mach info [--version]
+mach info [--version | targets]
 ```
 
 Prints an at-a-glance identity of the binary: its version, the host (`os/isa`)
@@ -423,9 +483,29 @@ lines are read from the binary's target registries, so they report exactly what
 this build can target. `mach info --version` prints the version string alone on
 one line, for tooling.
 
-| Flag        | Value | Effect |
+`mach info targets` prints the **supported target-tuple matrix** — one
+`<os>-<isa>` per line — for exactly the tuples this binary can compose and emit
+end-to-end. Run the command to see the current set; it is *derived*, never
+curated, so a snapshot printed here would only drift.
+
+Each dimension is orthogonal on its own, but the joint cells are not: an
+instruction set emits only with a wired code generator, a calling convention is
+per-ISA, an object format relocates and writes only the ISAs it declares, and an
+operating system links and loads only its own object formats. `mach info targets`
+keeps a `<os>-<isa>` tuple only when some registered calling convention and object
+format compose an emittable full tuple — so `windows-aarch64` is absent (COFF
+covers x86-64 only) and `darwin-riscv64` is absent (Mach-O covers x86-64 and
+aarch64), while freestanding tuples appear for every ISA with an encoder.
+Selecting an uncovered tuple fails at composition naming the missing capability
+(for example `object format 'coff' does not cover aarch64 relocations`, or
+`operating system 'windows' does not support object format 'elf'`) rather than
+deep in codegen or link. Adding a capability declaration to a vtable is the only
+step needed for a new tuple to appear.
+
+| Argument    | Value | Effect |
 |-------------|-------|--------|
 | `--version` | —     | print the version string alone, on one line |
+| `targets`   | —     | print the supported target-tuple matrix, one `<os>-<isa>` per line |
 
 Exit codes: `0` ok, `2` internal error.
 
@@ -443,4 +523,6 @@ non-zero.
 
 - [manifest.md](manifest.md) — the `mach.toml` reference
 - [language/test.md](language/test.md) — the `test` declaration and `mach test`
+- [tooling/test-json.md](tooling/test-json.md) — the `mach test --format json` event schema
+- [tooling/check-json.md](tooling/check-json.md) — the `mach check --format json` diagnostic schema
 - [language/files.md](language/files.md) — project file layout

@@ -5,6 +5,139 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.0] - 2026-07-02
+
+A follow-up hardening, cleanup, and tooling sweep over the 2.12.0 overhaul.
+`--pie` images regain read-only hardening for their relocated constants
+(`PT_GNU_RELRO`), the register allocator sheds redundant copies for a smaller
+binary, `mach test --format json`, `mach check --format json`, and `mach info
+targets` add machine-readable surfaces, diagnostics gain `= help:` lines and
+secondary spans, and out-of-range integer literals now report their bounds.
+Contains breaking CLI, manifest, and source-acceptance changes - see Breaking.
+Built with mach 2.12.0.
+
+### Breaking
+
+- sema: an integer literal that overflows a signed destination is a compile
+  error; it previously compiled and silently wrapped (#1804).
+- driver: unknown flags are hard errors on every command; `-h` / `--help` are
+  not flags (use `mach help <command>`); the `--` separator is honored only by
+  `mach run` (#1810).
+- cli: the `--color` and `--artifacts` flags are removed (#1784, #1829).
+- target: incoherent tuples are rejected at composition - an object format that
+  does not cover the ISA, an ABI that does not target it, or an OS that cannot
+  load the format (`windows`+`elf`, or `raw` on any real OS - flat images are
+  `os = "freestanding"`) (#1806).
+- build: `-o` cannot be combined with `--all-targets` (#1831).
+
+### Added
+
+- link/elf: **`PT_GNU_RELRO` under `--pie`** - relocated constant pointers
+  (vtables, `val` pointer globals) that live in read-only data are writable while
+  the static-PIE image self-relocates at startup, then `mprotect`'d read-only
+  before `main`; a write through a relocated constant now faults. The linker
+  emits the page-rounded header over the single read-only reloc-bearing segment,
+  and the mach-std runtime re-protects it after applying its `RELATIVE`
+  relocations (#1778).
+- test: **`mach test --format json`** - a versioned, machine-readable NDJSON
+  event stream (`run_start` / `test` / `summary`, plus `case` under `--list`;
+  `schema: 1`) for editors and CI, documented in `doc/tooling/test-json.md`. JSON
+  goes to stdout and build diagnostics to stderr; strings are `ensure_ascii`
+  escaped so the stream is byte-identical across platforms; labels are emitted
+  verbatim; `test` events arrive in **completion order** (sort by `index` for
+  declaration order) (#1792).
+- check: **`mach check --format json`** - a versioned, machine-readable NDJSON
+  diagnostic stream (a `diagnostic` object per diagnostic carrying severity,
+  message, primary location, note, help, and the LSP-shaped related list, then a
+  closing `summary`; `schema: 1`) for editors and CI, documented in
+  `doc/tooling/check-json.md`. JSON goes to stdout with no human frames
+  interleaved; positions are 1-based and spans half-open; it reuses the
+  `mach.cli.json` emitter, which grew nested-object and array support to carry
+  the model (#1815).
+- diag: diagnostics gained a distinct **`= help:` line** and an optional
+  **secondary span** - a duplicate definition now points at the prior binding in
+  its own `--> file:line:col` frame labelled `previous definition here`, and
+  did-you-mean suggestions moved from `= note:` to `= help:`. Both are structured
+  fields on the shared location model, ready for the coming
+  `mach check --format json` consumer (#1783).
+- driver: **`mach info targets`** prints the supported `<os>-<isa>` target
+  matrix, derived from per-vtable capability declarations (each object format's
+  ISA relocation coverage and each ABI's ISA) rather than a curated list, so a
+  new target appears by declaring its capability (#1806).
+
+### Changed
+
+- codegen: **regalloc copy hygiene** - a dead-def sweep and copy-source
+  allocation hints in the linear-scan allocator, backed by tighter live-range
+  extension, eliminate redundant register moves. On mach's own release build the
+  executable shrinks ~-4.0% and redundant register-to-register self-moves drop
+  -88% (#1801).
+- target: **incoherent target tuples now fail at composition** - `select_of`
+  enforces the joint object-format/ABI capability at selection, so a tuple whose
+  object format does not cover the ISA's relocations (e.g. `windows`+`aarch64`,
+  COFF being x86_64-only) or whose ABI does not match the ISA is rejected with a
+  message naming the missing capability, instead of composing and failing deep in
+  codegen or link (#1806).
+- driver: **`mach init` scaffold target names** follow the `<os>-<isa>`
+  convention (`linux-x86_64`, `windows-x86_64`, `darwin-x86_64` on the host isa),
+  matching the root manifest's normalized naming. A fresh project now writes
+  `out/linux-x86_64/…` rather than `out/linux/…` (#1832).
+- cli: **JSON emission moved to `std.data.json`** - the streaming NDJSON emitter
+  that backed `mach test --format json` and `mach check --format json` (the
+  `mach.cli.json` module) now lives in mach-std, unified with the tree emitter
+  behind one escape core. `src/cli/json.mach` is deleted and both consumers
+  (`testing.mach`, `diagnostic.mach`) import `std.data.json`; the mach.lock
+  mach-std bump carries the moved code. Both JSON streams are byte-identical
+  before and after (mach-std#338).
+
+### Removed
+
+- cli: the orphaned **`--color` flag** and its `ColorMode` surface, dead since
+  the ASCII-only diagnostic renderer (#1777) dropped the color argument -
+  `--color` had parsed but no-opped (#1784).
+- build/run/test: the inert **`--artifacts <dir>` flag** and its `Config`
+  field - it parsed but no code ever read it, so it silently no-opped. The
+  object-tree location is expressed by the manifest `obj` template
+  (`out/{target}/{profile}/obj`), which expands per target/profile/artifact; a
+  flat CLI override cannot and would collide every target's objects into one
+  directory (#1829).
+
+### Fixed
+
+- driver: **`--emit-ir` dumps the final post-pipeline IR** - the dump moved from
+  the lower loop to the codegen loop, beside `--emit-asm`, so the `.ir` reflects
+  the optimized module the objects are built from - it now varies with `-O` and
+  picks up test-mode `main` neutralization, instead of the naive pre-pipeline
+  lowering (#1802).
+- sema: **out-of-range integer literals report their bounds** - a literal that
+  does not fit its destination now reports
+  `literal <v> is out of range for <T> (<min>..<max>)` instead of a generic type
+  mismatch whose cast note advised the truncating `value::Type`. A literal that
+  overflowed a signed slot (e.g. `val mask: i64 = 0xFFFFFFFFFFFFFFFF;`) used to
+  compile and silently wrap at runtime; it is now rejected, while `u64` slots
+  keep their legitimate maximum (#1804).
+- link/elf: **the ELF exec writers refuse a program-header table that overflows
+  its reserved header page** - the PIE and dynamic writers extend the first
+  `PT_LOAD` down exactly one page to cover the ELF header + program headers, which
+  only maps segment 0 at its vaddr while the header block fits that page
+  (`phdr_count <= 72`). Past that the image was silently unloadable; the writers now
+  return a link error instead. Latent (real builds emit ~9 headers), owning the
+  invariant before segment counts grow (#1814).
+- build: **`mach build --all-targets -o <path>` is now rejected** - `-o` names a
+  single artifact path, so combined with `--all-targets` every target linked to
+  that one path and overwrote the previous, leaving only the last target's binary
+  with no warning. The combination now errors (`-o cannot be combined with
+  --all-targets`) at parse; single-target `-o` is unchanged (#1831).
+- driver: **unknown flags are rejected instead of silently misparsing** - an
+  unrecognized flag was never reported and hijacked positional resolution
+  (`mach build --color always .` resolved `always` as the project path). Each
+  command now marks the flags it consumes and rejects the first unmarked
+  `-`-prefixed token before resolving positionals - `error: unknown flag '<flag>'
+  for '<command>'`, exit `1`. `-h` / `--help` are not flags; use `mach help
+  <command>`. The `--` end-of-flags separator is honored only by `mach run`, which
+  forwards every post-`--` token to the executed program as its `argv`; on every
+  other command `--` is itself rejected as an unknown flag (#1810).
+
 ## [2.12.0] - 2026-07-01
 
 The terminal output & test-harness overhaul: framed source-snippet diagnostics,
