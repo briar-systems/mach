@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.13.0] - 2026-07-02
 
 A follow-up hardening, cleanup, and tooling sweep over the 2.12.0 overhaul.
 `--pie` images regain read-only hardening for their relocated constants
@@ -13,6 +13,22 @@ A follow-up hardening, cleanup, and tooling sweep over the 2.12.0 overhaul.
 binary, `mach test --format json`, `mach check --format json`, and `mach info
 targets` add machine-readable surfaces, diagnostics gain `= help:` lines and
 secondary spans, and out-of-range integer literals now report their bounds.
+Contains breaking CLI, manifest, and source-acceptance changes - see Breaking.
+Built with mach 2.12.0.
+
+### Breaking
+
+- sema: an integer literal that overflows a signed destination is a compile
+  error; it previously compiled and silently wrapped (#1804).
+- driver: unknown flags are hard errors on every command; `-h` / `--help` are
+  not flags (use `mach help <command>`); the `--` separator is honored only by
+  `mach run` (#1810).
+- cli: the `--color` and `--artifacts` flags are removed (#1784, #1829).
+- target: incoherent tuples are rejected at composition - an object format that
+  does not cover the ISA, an ABI that does not target it, or an OS that cannot
+  load the format (`windows`+`elf`, or `raw` on any real OS - flat images are
+  `os = "freestanding"`) (#1806).
+- build: `-o` cannot be combined with `--all-targets` (#1831).
 
 ### Added
 
