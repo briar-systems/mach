@@ -193,13 +193,14 @@ project's transitive code, with a synthesized `main` calling just that test),
 then spawns each as a separate process, captures its output, and times it.
 A test build always links executables, even for a library target.
 
-The default readout collapses every all-passing module to a single roll-up
-line and expands only modules that have a failure:
+The readout is live: every all-passing module collapses to a single roll-up
+line that prints the moment the module's last test completes, and a module
+with failures expands each failing test as it happens:
 
 ```
-mach.lang.intern                     3 ok  568us
-mach.lang.driver                    27 ok     1 FAIL  146ms
-  FAIL  builds:cyclic_import  ./src/lang/driver.mach:142  (exit 1)
+mach.lang.intern      3 ok     568us
+mach.lang.driver     27 ok     1 FAIL    146ms
+  FAIL  mach.lang.driver.builds:cyclic_import  ./src/lang/driver.mach:142  (exit 1)
     expected a diagnostic, got none
 
 failures:
@@ -208,12 +209,16 @@ failures:
 437 passed, 1 failed, 438 total  (268ms)
 ```
 
-A roll-up is `<module>  <ok> ok[  <fail> FAIL]  <duration>`. Each expanded
-failure carries the test's `file:line`, its exit code (`(exit N)`) or signal
-(`(signal N)`), and the child's captured stdout indented beneath it; a passing
-test stays quiet. A crashing test reports its signal and the run continues. The
-closing summary re-lists every failure as `<test>  file:line  (reason)`. `-v`
-lists every test, grouped by module, with each test's duration. The layout is
+A roll-up is `<module>  <ok> ok[  <fail> FAIL]  <duration>`. Column widths are
+computed from the collected tests before the run (clamped, so one long name
+cannot blow out the table); test labels print verbatim, exactly as declared.
+Each expanded failure carries the test's `file:line`, its exit code
+(`(exit N)`) or signal (`(signal N)`), and the child's captured stdout
+indented beneath it; a passing test stays quiet. A crashing test reports its
+signal and the run continues. The closing summary re-lists every failure as
+`<test>  file:line  (reason)` and reports the run's wall time. `-v` prints a
+module header when its first test starts and a line per test as it completes;
+`-vv` additionally prints passing tests' captured output. The layout is
 fixed-width ASCII (no color, no terminal-width queries).
 
 Only `test` blocks declared in the current project's own modules are collected by
