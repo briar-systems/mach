@@ -7,25 +7,43 @@
 # job is purely physical. There is no `isa.InstBuf` instruction model here; the
 # allocator consumes and mutates MIR directly.
 #
-# The algorithm is a standard linear scan:
-#   1. blocks are reordered into reverse-postorder so the flat instruction stream
+# The algorithm is an evolved linear scan (hint-biased coloring; live-range
+# splitting is future work):
+#   1. DEAD-DEF SWEEP: before any position-dependent structure is built, every
+#      register move whose destination vreg is never read is deleted (retallied to
+#      a fixpoint, since dropping one copy can make an earlier copy into its source
+#      dead). This runs on the raw blocks, so the flat stream and ranges below are
+#      built once on already-clean instruction lists;
+#   2. blocks are reordered into reverse-postorder so the flat instruction stream
 #      reads in a topological order;
-#   2. one merged live range per vreg is built over that stream from def/use of
-#      `MIR_OP_VREG` operands (including a `MIR_OP_MEM` base vreg), then extended
-#      by per-block live-in/live-out from a backward dataflow fixpoint so values
-#      live across a loop back edge are covered;
-#   3. `MIR_OP_PREG` operands (the ABI param / argument / return pre-coloring
+#   3. one merged live range per vreg is built over that stream from def/use of
+#      `MIR_OP_VREG` operands (including a `MIR_OP_MEM` base vreg), then extended by
+#      per-block live-in/live-out from a backward dataflow fixpoint. THE RANGE MODEL
+#      is a single contiguous [start, end] interval bounding register occupancy:
+#      start = min(operand touches, live-IN block first positions), end =
+#      max(operand touches, live-OUT block last positions). The two bounds extend
+#      independently (see `extend_range_for_block`) - a value live-in but dying
+#      mid-block adds no phantom tail, a value born mid-block and flowing out adds
+#      no phantom head - while a loop-carried value (live-in AND live-out) still
+#      spans its blocks;
+#   4. `MIR_OP_PREG` operands (the ABI param / argument / return pre-coloring
 #      `lower_ir` emitted) are FIXED - their physical register is reserved for
 #      the instruction that names it, and incoming param-register lifetimes are
 #      held busy from entry until the `MOV vreg <- preg` that captures them;
-#   4. ranges are assigned in start order, call-crossing ranges preferring
-#      callee-saved registers (so the value survives a call without a save) and
-#      others preferring caller-saved; on pressure the lowest-density victim is
-#      spilled to a fresh `SLOT_SPILL` frame slot;
-#   5. around each `MIR_CALL` - the caller-saved clobber barrier (see its MIR
+#   5. COPY HINTS: each vreg first defined by a plain register copy records its
+#      source register (step done before the scan);
+#   6. ranges are assigned in start order (ties broken by ascending end, so a copy
+#      source dying at the copy colors before its destination). Each range prefers
+#      its copy-source register when the hint can be honored (`pick_hint`), so the
+#      copy collapses to a self-move dropped at rewrite; otherwise a call-crossing
+#      range prefers callee-saved and others caller-saved. On pressure the
+#      lowest-density victim is spilled to a fresh `SLOT_SPILL` frame slot;
+#   7. around each `MIR_CALL` - the caller-saved clobber barrier (see its MIR
 #      definition) - any live vreg whose assigned register is caller-saved (or
 #      any FP register) is spilled and reloaded;
-#   6. a final pass rewrites every `MIR_OP_VREG` to its assigned `MIR_OP_PREG`;
+#   8. a final pass rewrites every `MIR_OP_VREG` to its assigned `MIR_OP_PREG` and
+#      drops any full-width register move whose operands rewrote to the same
+#      physical register (a coalesced copy);
 #      a `MIR_OP_MEM` base that is a value-pointer vreg becomes a physical-register
 #      base (`preg` set, `vreg` cleared to MIR_VREG_NIL) while a frame-slot-owning
 #      MEM base keeps its slot-key vreg id (the encoder resolves it to `[rbp +
@@ -1338,9 +1356,7 @@ fun extend_liveness(ctx: *AllocCtx) R.Result[bool, str] {
         var v: u32 = 0;
         for (v < nv) {
             val idx: usize = base + v::usize;
-            val lr: *LiveRange = ?ctx.ranges[v];
-            if (live_in[idx] && span.start >= 0 && span.start < lr.start) { lr.start = span.start; }
-            if (live_out[idx] && span.end > lr.end_pos)                   { lr.end_pos = span.end; }
+            extend_range_for_block(?ctx.ranges[v], span, live_in[idx], live_out[idx]);
             v = v + 1;
         }
         bi = bi + 1;
@@ -1351,6 +1367,24 @@ fun extend_liveness(ctx: *AllocCtx) R.Result[bool, str] {
     A.deallocate[bool](ctx.alloc, live_in, total);
     A.deallocate[bool](ctx.alloc, live_out, total);
     ret R.ok[bool, str](true);
+}
+
+# extend one range's occupancy bounds over one block, per the unified
+# range model. A merged range is a single contiguous [start, end] interval bounding
+# where the value occupies its register:
+#   start = min(operand touches, live-in block first positions)
+#   end   = max(operand touches, live-out block last positions)
+# So a live-IN vreg occupies its register from block entry - pull start back to the
+# block's first position - and a live-OUT vreg holds it through the terminator -
+# push end forward to the block's last position. The two are INDEPENDENT: a value
+# live-in but not live-out keeps the in-block last-use end `build_ranges` recorded
+# (no phantom tail to the block end), and a value live-out but not live-in keeps its
+# in-block def start (no phantom head). An empty block (span.start < 0) extends
+# nothing. A loop-carried value is live-in AND live-out, so both bounds extend and
+# the loop stays covered.
+fun extend_range_for_block(lr: *LiveRange, span: BlockSpan, live_in: bool, live_out: bool) {
+    if (live_in && span.start >= 0 && span.start < lr.start) { lr.start = span.start; }
+    if (live_out && span.end > lr.end_pos)                   { lr.end_pos = span.end; }
 }
 
 # precompute each block's [first, last] flat-stream position in
@@ -1986,14 +2020,9 @@ fun pick_hint(ctx: *AllocCtx, v: u32, lr: *LiveRange) i32 {
             ctx.gp_busy[idx] = true;
             ret rid;
         }
-        # busy: honor only by transferring the register from the copy source when
-        # that source vreg dies exactly at the copy (its last use is the read this
-        # move performs), so source and destination provably never coexist even
-        # though the destination's extended range overlaps the source. remove_active
-        # drops the source from the active set while its busy flag stays set, so the
-        # register passes intact to the destination.
-        if (source_dies_at_copy(ctx, h)) {
-            remove_active(ctx, h.src_vreg);
+        # busy: honor only by transferring the register from the copy source.
+        if (can_transfer(ctx, lr, h)) {
+            transfer_source_reg(ctx, h.src_vreg, rid::u32);
             ret rid;
         }
         ret -1;
@@ -2008,22 +2037,62 @@ fun pick_hint(ctx: *AllocCtx, v: u32, lr: *LiveRange) i32 {
             ctx.fp_busy[idx] = true;
             ret rid;
         }
-        if (source_dies_at_copy(ctx, h)) {
-            remove_active(ctx, h.src_vreg);
+        if (can_transfer(ctx, lr, h)) {
+            transfer_source_reg(ctx, h.src_vreg, rid::u32);
             ret rid;
         }
         ret -1;
     }
 }
 
-# true when a copy hint's source is a vreg whose last use is the copy
-# itself - the register it currently holds may then be handed to the copy's
-# destination, since the source is read at the same instruction it dies at and can
-# never coexist with the destination the copy defines.
-fun source_dies_at_copy(ctx: *AllocCtx, h: *CopyHint) bool {
+# true when the copy source's register may be transferred to the copy
+# destination `lr`, freeing the source's busy register for the destination.
+#
+# TWO conditions, both required:
+#   - the source vreg dies exactly at the copy (`end_pos == copy_pos`): its last
+#     use is the read this move performs, so it holds no value past the copy.
+#   - the destination is BORN at the copy (`lr.start == copy_pos`): its range has
+#     no position before the copy. This is the load-bearing guard. A destination
+#     that is live BEFORE the copy - a loop-carried phi target the liveness pass
+#     extended back to its block start, read between the source's def and the copy
+#     (e.g. `next = i + 1 ; arr[i] = x ; i = next`) - genuinely coexists with the
+#     source over that prefix: handing it the source's register lets `next`'s
+#     write clobber `i` before `arr[i]` reads it. Requiring the destination to be
+#     born at the copy admits exactly the param-homing / return / diamond-merge
+#     shapes, where the destination first appears at the copy and the two never
+#     overlap.
+fun can_transfer(ctx: *AllocCtx, lr: *LiveRange, h: *CopyHint) bool {
     if (h.src_vreg == mir.MIR_VREG_NIL) { ret false; }
     if (h.copy_pos < 0)                 { ret false; }
-    ret ctx.ranges[h.src_vreg].end_pos == h.copy_pos;
+    if (ctx.ranges[h.src_vreg].end_pos != h.copy_pos) { ret false; }
+    if (lr.start != h.copy_pos)                       { ret false; }
+    ret true;
+}
+
+# hand the copy source's physical register to the copy destination by
+# dropping the source from the active set while its busy flag stays set, so the
+# register passes intact. Asserts the transfer's cross-pass precondition: the
+# source must still be active and own `rid`. The scan's end tie-break colors the
+# source before the destination and the liveness extension is only-backward, so a
+# source dying at the copy is always still active and holds its register when the
+# destination is colored; a future sort / extension change that breaks that
+# coupling would hand a live value's register to the destination, so it fails
+# loudly here rather than miscompiling silently.
+fun transfer_source_reg(ctx: *AllocCtx, src: u32, rid: u32) {
+    if (!vreg_in_active(ctx, src) || ctx.f.vregs[src].assigned != rid) {
+        panic("regalloc: copy-hint transfer source is not the live owner of its register\n");
+    }
+    remove_active(ctx, src);
+}
+
+# true when vreg `v` is in the active set.
+fun vreg_in_active(ctx: *AllocCtx, v: u32) bool {
+    var i: u32 = 0;
+    for (i < ctx.active_count) {
+        if (ctx.active[i] == v) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # choose a free general-purpose register, preferring caller-saved for a
@@ -3121,6 +3190,149 @@ test "mach.lang.be.codegen.regalloc.seed_reserved:aarch64_reserved_and_fp_bank" 
     # registers the float-op encoder routes spilled operands through (count 30, ids
     # 0..29).
     if (bank_count(?t, fp_class_index(?t)) != 30) { ret 1; }
+
+    ret 0;
+}
+
+# the unified range-model extension is per-bound: live-IN pulls start back to the
+# block's first position, live-OUT pushes end forward to the last, and the two are
+# independent so no phantom head / tail is added. this matrix pins all four cases;
+# the live-in-but-not-live-out row is the tightening that unblocks the return-reg
+# coalescing (it removes the phantom tail that falsely interfered with the precolored
+# return def).
+test "mach.lang.be.codegen.regalloc.extend_range_for_block:in_out_matrix" {
+    var span: BlockSpan;
+    span.start = 100;
+    span.end   = 110;
+
+    # both live-in and live-out: both bounds extend to the block span.
+    var lr1: LiveRange;
+    lr1.start = 105; lr1.end_pos = 106;
+    extend_range_for_block(?lr1, span, true, true);
+    if (lr1.start != 100 || lr1.end_pos != 110) { ret 1; }
+
+    # live-in only: start extends, end keeps the in-block last use (no phantom tail).
+    var lr2: LiveRange;
+    lr2.start = 105; lr2.end_pos = 106;
+    extend_range_for_block(?lr2, span, true, false);
+    if (lr2.start != 100 || lr2.end_pos != 106) { ret 1; }
+
+    # live-out only: end extends, start keeps the in-block def (no phantom head).
+    var lr3: LiveRange;
+    lr3.start = 105; lr3.end_pos = 106;
+    extend_range_for_block(?lr3, span, false, true);
+    if (lr3.start != 105 || lr3.end_pos != 110) { ret 1; }
+
+    # neither: unchanged.
+    var lr4: LiveRange;
+    lr4.start = 105; lr4.end_pos = 106;
+    extend_range_for_block(?lr4, span, false, false);
+    if (lr4.start != 105 || lr4.end_pos != 106) { ret 1; }
+
+    # an empty block (span.start < 0) extends nothing even when live.
+    var empty: BlockSpan;
+    empty.start = -1; empty.end = -1;
+    var lr5: LiveRange;
+    lr5.start = 105; lr5.end_pos = 106;
+    extend_range_for_block(?lr5, empty, true, true);
+    if (lr5.start != 105 || lr5.end_pos != 106) { ret 1; }
+
+    ret 0;
+}
+
+# the copy-hint register transfer is honored only when the source dies exactly at
+# the copy AND the destination is born there. the destination-born clause is the
+# guard against handing a source's register to a loop-carried destination live
+# before the copy (the `next = i + 1 ; arr[i] = x ; i = next` miscompile).
+test "mach.lang.be.codegen.regalloc.can_transfer:destination_born_guard" {
+    var ctx: AllocCtx;
+    var ranges: [4]LiveRange;
+    ctx.ranges = ?ranges[0];
+    # source vreg 1 dies exactly at copy position 10.
+    ranges[1].end_pos = 10;
+
+    var h: CopyHint;
+    h.src_vreg = 1;
+    h.src_preg = -1;
+    h.copy_pos = 10;
+
+    # destination born at the copy (start == copy_pos): the safe homing / return /
+    # diamond shape - transfer allowed.
+    var lr_born: LiveRange;
+    lr_born.start = 10;
+    if (!can_transfer(?ctx, ?lr_born, ?h)) { ret 1; }
+
+    # destination live before the copy (a loop-carried phi target extended back over
+    # its block): transfer must be refused.
+    var lr_live_in: LiveRange;
+    lr_live_in.start = 3;
+    if (can_transfer(?ctx, ?lr_live_in, ?h)) { ret 1; }
+
+    # source does not die at the copy (still live past it): refused.
+    ranges[1].end_pos = 14;
+    if (can_transfer(?ctx, ?lr_born, ?h)) { ret 1; }
+    ranges[1].end_pos = 10;
+
+    # a physical-register-source hint (no vreg to displace): not a transfer.
+    h.src_vreg = mir.MIR_VREG_NIL;
+    h.src_preg = 5;
+    if (can_transfer(?ctx, ?lr_born, ?h)) { ret 1; }
+
+    ret 0;
+}
+
+# the dead-def sweep drops only a plain move whose destination is an unread value
+# vreg: a copy into a physical register (an ABI effect), a still-read vreg, a
+# slot-owning storage vreg, and a width-changing move are all preserved.
+test "mach.lang.be.codegen.regalloc.is_dead_mov:physical_dest_and_read_guards" {
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val ts: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[target.Target, str](ts)) { ret 1; }
+    var t: target.Target = R.unwrap_ok[target.Target, str](ts);
+
+    var f: mir.MirFunction;
+    f.vreg_count = 3;
+    var slot: [3]bool;
+    slot[0] = false; slot[1] = false; slot[2] = true;   # vreg 2 owns a storage slot
+
+    var ctx: AllocCtx;
+    ctx.f = ?f;
+    ctx.vreg_slot_flag = ?slot[0];
+
+    var reads: [3]u32;
+    reads[0] = 0; reads[1] = 1; reads[2] = 0;
+
+    var ops: [2]mir.MirOperand;
+    ops[0] = mir.op_vreg(0);
+    ops[1] = mir.op_vreg(1);
+    var mv: mir.MirInstr;
+    mv.opcode        = mir.MIR_MOV;
+    mv.operands      = ?ops[0];
+    mv.operand_count = 2;
+    mv.width         = 8;
+    mv.src_width     = 8;
+    mv.asm_block     = nil;
+
+    # dst = unread value vreg 0: dead.
+    if (!is_dead_mov(?t, ?ctx, ?mv, ?reads[0], 3)) { ret 1; }
+
+    # dst = vreg 1, read once: not dead.
+    ops[0] = mir.op_vreg(1);
+    if (is_dead_mov(?t, ?ctx, ?mv, ?reads[0], 3)) { ret 1; }
+
+    # dst = vreg 2, unread but slot-owning storage: not dead.
+    ops[0] = mir.op_vreg(2);
+    if (is_dead_mov(?t, ?ctx, ?mv, ?reads[0], 3)) { ret 1; }
+
+    # dst = physical register (precolored, an ABI effect): never dead.
+    ops[0] = mir.op_preg(0);
+    if (is_dead_mov(?t, ?ctx, ?mv, ?reads[0], 3)) { ret 1; }
+
+    # a width-changing move (width != src_width) is not a plain copy: not swept.
+    ops[0] = mir.op_vreg(0);
+    mv.src_width = 4;
+    if (is_dead_mov(?t, ?ctx, ?mv, ?reads[0], 3)) { ret 1; }
 
     ret 0;
 }
