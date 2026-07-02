@@ -5,6 +5,77 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+A follow-up hardening, cleanup, and tooling sweep over the 2.12.0 overhaul.
+`--pie` images regain read-only hardening for their relocated constants
+(`PT_GNU_RELRO`), the register allocator sheds redundant copies for a smaller
+binary, `mach test --format json` and `mach info targets` add machine-readable
+surfaces, diagnostics gain `= help:` lines and secondary spans, and out-of-range
+integer literals now report their bounds.
+
+### Added
+
+- link/elf: **`PT_GNU_RELRO` under `--pie`** - relocated constant pointers
+  (vtables, `val` pointer globals) that live in read-only data are writable while
+  the static-PIE image self-relocates at startup, then `mprotect`'d read-only
+  before `main`; a write through a relocated constant now faults. The linker
+  emits the page-rounded header over the single read-only reloc-bearing segment,
+  and the mach-std runtime re-protects it after applying its `RELATIVE`
+  relocations (#1778).
+- test: **`mach test --format json`** - a versioned, machine-readable NDJSON
+  event stream (`run_start` / `test` / `summary`, plus `case` under `--list`;
+  `schema: 1`) for editors and CI, documented in `doc/tooling/test-json.md`. JSON
+  goes to stdout and build diagnostics to stderr; strings are `ensure_ascii`
+  escaped so the stream is byte-identical across platforms; labels are emitted
+  verbatim; `test` events arrive in **completion order** (sort by `index` for
+  declaration order) (#1792).
+- diag: diagnostics gained a distinct **`= help:` line** and an optional
+  **secondary span** - a duplicate definition now points at the prior binding in
+  its own `--> file:line:col` frame labelled `previous definition here`, and
+  did-you-mean suggestions moved from `= note:` to `= help:`. Both are structured
+  fields on the shared location model, ready for the coming
+  `mach check --format json` consumer (#1783).
+- driver: **`mach info targets`** prints the supported `<os>-<isa>` target
+  matrix, derived from per-vtable capability declarations (each object format's
+  ISA relocation coverage and each ABI's ISA) rather than a curated list, so a
+  new target appears by declaring its capability (#1806).
+
+### Changed
+
+- codegen: **regalloc copy hygiene** - a dead-def sweep and copy-source
+  allocation hints in the linear-scan allocator, backed by tighter live-range
+  extension, eliminate redundant register moves. On mach's own release build the
+  executable shrinks ~-4.0% and redundant register-to-register self-moves drop
+  -88% (#1801).
+- target: **incoherent target tuples now fail at composition** - `select_of`
+  enforces the joint object-format/ABI capability at selection, so a tuple whose
+  object format does not cover the ISA's relocations (e.g. `windows`+`aarch64`,
+  COFF being x86_64-only) or whose ABI does not match the ISA is rejected with a
+  message naming the missing capability, instead of composing and failing deep in
+  codegen or link (#1806).
+
+### Removed
+
+- cli: the orphaned **`--color` flag** and its `ColorMode` surface, dead since
+  the ASCII-only diagnostic renderer (#1777) dropped the color argument -
+  `--color` had parsed but no-opped (#1784).
+
+### Fixed
+
+- driver: **`--emit-ir` dumps the final post-pipeline IR** - the dump moved from
+  the lower loop to the codegen loop, beside `--emit-asm`, so the `.ir` reflects
+  the optimized module the objects are built from - it now varies with `-O` and
+  picks up test-mode `main` neutralization, instead of the naive pre-pipeline
+  lowering (#1802).
+- sema: **out-of-range integer literals report their bounds** - a literal that
+  does not fit its destination now reports
+  `literal <v> is out of range for <T> (<min>..<max>)` instead of a generic type
+  mismatch whose cast note advised the truncating `value::Type`. A literal that
+  overflowed a signed slot (e.g. `val mask: i64 = 0xFFFFFFFFFFFFFFFF;`) used to
+  compile and silently wrap at runtime; it is now rejected, while `u64` slots
+  keep their legitimate maximum (#1804).
+
 ## [2.12.0] - 2026-07-01
 
 The terminal output & test-harness overhaul: framed source-snippet diagnostics,
