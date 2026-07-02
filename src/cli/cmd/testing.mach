@@ -259,7 +259,7 @@ pub fun run(argc: usize, argv: **u8) i64 {
     if (sel_len == 0) {
         if (json_out) {
             var jc: JsonCtx;
-            var r:  Renderer = json_renderer(?jc, nil);
+            var r:  Renderer = json_renderer(?jc, ?a, nil);
             r.fn_start(r.ctx, nil, 0);
             r.fn_summary(r.ctx, nil, 0, 0, 0, 0);
         }
@@ -288,23 +288,24 @@ pub fun run(argc: usize, argv: **u8) i64 {
     }
     wipe_logs(?log_dir[0], tbr.len);
 
-    # column widths come from the selection, so live lines align on the first
-    # write with no second pass; clamping keeps one long name from blowing out
-    # the whole table.
-    val mod_w:   usize = module_col_width(selected, sel_len);
-    val label_w: usize = label_col_width(selected, sel_len);
-
     # the human readout and the JSON stream are sibling renderers over the same
-    # per-test event stream; only one is live per run.
+    # per-test event stream; only one is live per run. the human renderer needs
+    # the column widths (computed from the selection, so lines align on the first
+    # write) and the retained per-test output bytes; the JSON stream needs
+    # neither - it emits paths, not inline output - so both are skipped for it.
     var hc: HumanCtx;
     var jc: JsonCtx;
     var r:  Renderer;
-    if (json_out) { r = json_renderer(?jc, ?log_dir[0]); }
-    or           { r = human_renderer(?hc, level, mod_w, label_w, runner, ?log_dir[0]); }
+    if (json_out) { r = json_renderer(?jc, ?a, ?log_dir[0]); }
+    or {
+        val mod_w:   usize = module_col_width(selected, sel_len);
+        val label_w: usize = label_col_width(selected, sel_len);
+        r = human_renderer(?hc, level, mod_w, label_w, runner, ?log_dir[0]);
+    }
 
     val run_start: tm.Time = tm.monotonic();
     r.fn_start(r.ctx, selected, sel_len);
-    execute_and_render(?a, selected, sel_len, runner, outcomes, level, jobs, ?log_dir[0], ?r);
+    execute_and_render(?a, selected, sel_len, runner, outcomes, level, jobs, ?log_dir[0], !json_out, ?r);
     val wall: du.Duration = tm.time_sub(tm.monotonic(), run_start);
 
     val failed: u32 = count_failed(outcomes, sel_len);
@@ -332,26 +333,29 @@ rec Slot {
 }
 
 # run every selected test through a sliding window of child processes,
-# driving the renderer over the finalized outcomes in collection order
+# notifying the renderer as each outcome finalizes, in completion order
 #
 # Up to `jobs` children are in flight at once, each with stdout and stderr
 # bound to its capture file; a blocking wait-any reaps whichever exits first.
-# The render cursor trails completion in collection order, so the renderer sees
-# each outcome exactly once in test order regardless of completion order, and
-# the readout is deterministic.
+# The renderer's `fn_test` fires the moment an outcome finalizes - in
+# completion order, not collection order - so a live JSON consumer sees each
+# result as it lands and a slow test never head-of-line-blocks the stream. A
+# renderer that wants collection order (the human readout) buffers internally.
 # ---
-# a:        allocator retaining captured output
-# arts:     the selected test artifacts to run, in collection order
-# n:        number of artifacts in `arts`
-# runner:   resolved `--runner` launcher, or nil to exec the dispatcher directly
-# outcomes: caller-owned array (length n) filled in test order
-# level:    verbosity (0 roll-ups, 1 per-test lines, 2 also passing output)
-# jobs:     window width (1 serializes)
-# log_dir:  the capture-file directory
-# r:        the renderer notified as each outcome finalizes
+# a:          allocator retaining captured output
+# arts:       the selected test artifacts to run, in collection order
+# n:          number of artifacts in `arts`
+# runner:     resolved `--runner` launcher, or nil to exec the dispatcher directly
+# outcomes:   caller-owned array (length n) filled in test order
+# level:      verbosity (0 roll-ups, 1 per-test lines, 2 also passing output)
+# jobs:       window width (1 serializes)
+# log_dir:    the capture-file directory
+# want_bytes: retain each failing test's captured output in memory (the human
+#             readout inlines it; the JSON stream references the file instead)
+# r:          the renderer notified as each outcome finalizes
 fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runner: *u8,
                        outcomes: *Outcome, level: u8, jobs: u32, log_dir: *u8,
-                       r: *Renderer) {
+                       want_bytes: bool, r: *Renderer) {
     var i: u32 = 0;
     for (i < n) { outcomes[i].kind = KIND_PENDING; i = i + 1; }
 
@@ -373,6 +377,8 @@ fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runne
             outcomes[i].truncated = false;
             i = i + 1;
         }
+        i = 0;
+        for (i < n) { r.fn_test(r.ctx, outcomes, arts, i); i = i + 1; }
         ret;
     }
     val slots: *Slot = R.unwrap_ok[*Slot, str](res_slots);
@@ -382,7 +388,6 @@ fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runne
     var spawned:  u32 = 0;
     var done:     u32 = 0;
     var inflight: u32 = 0;
-    var cursor:   u32 = 0;
 
     for (done < n) {
         # top the window back up
@@ -402,6 +407,7 @@ fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runne
                 outcomes[idx].out_len   = 0;
                 outcomes[idx].truncated = false;
                 done = done + 1;
+                r.fn_test(r.ctx, outcomes, arts, idx);
             }
         }
 
@@ -416,17 +422,19 @@ fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runne
                 var sx: u32 = 0;
                 for (sx < window) {
                     if (slots[sx].pid != 0) {
+                        val eidx: u32 = slots[sx].idx;
                         fs.close(?slots[sx].f);
-                        outcomes[slots[sx].idx].art       = slots[sx].art;
-                        outcomes[slots[sx].idx].kind      = KIND_OTHER;
-                        outcomes[slots[sx].idx].code      = 0;
-                        outcomes[slots[sx].idx].elapsed   = 0;
-                        outcomes[slots[sx].idx].out       = nil;
-                        outcomes[slots[sx].idx].out_len   = 0;
-                        outcomes[slots[sx].idx].truncated = false;
+                        outcomes[eidx].art       = slots[sx].art;
+                        outcomes[eidx].kind      = KIND_OTHER;
+                        outcomes[eidx].code      = 0;
+                        outcomes[eidx].elapsed   = 0;
+                        outcomes[eidx].out       = nil;
+                        outcomes[eidx].out_len   = 0;
+                        outcomes[eidx].truncated = false;
                         slots[sx].pid = 0;
                         inflight = inflight - 1;
                         done = done + 1;
+                        r.fn_test(r.ctx, outcomes, arts, eidx);
                     }
                     sx = sx + 1;
                 }
@@ -438,22 +446,17 @@ fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runne
                 var sx: u32 = 0;
                 for (sx < window) {
                     if (slots[sx].pid == pid) {
-                        finalize_slot(a, ?slots[sx], st, outcomes, level, log_dir);
+                        val fidx: u32 = slots[sx].idx;
+                        finalize_slot(a, ?slots[sx], st, outcomes, level, want_bytes, log_dir);
                         slots[sx].pid = 0;
                         inflight = inflight - 1;
                         done = done + 1;
+                        r.fn_test(r.ctx, outcomes, arts, fidx);
                         brk;
                     }
                     sx = sx + 1;
                 }
             }
-        }
-
-        # advance the render cursor across everything finalized so far,
-        # handing each outcome to the renderer once in collection order
-        for (cursor < n && outcomes[cursor].kind != KIND_PENDING) {
-            r.fn_test(r.ctx, outcomes, arts, cursor);
-            cursor = cursor + 1;
         }
     }
 }
@@ -464,7 +467,7 @@ fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runne
 # ---
 # ctx:        opaque renderer state handed to each callback
 # fn_start:   run start (selected artifacts, count)
-# fn_test:    one finalized outcome in collection order (outcomes, artifacts, index)
+# fn_test:    one finalized outcome, fired in completion order (outcomes, artifacts, index)
 # fn_summary: run end (outcomes, count, passed, failed, wall time)
 rec Renderer {
     ctx:        ptr;
@@ -474,6 +477,10 @@ rec Renderer {
 }
 
 # state the human readout carries across its per-test callbacks
+#
+# `fn_test` fires in completion order, so the readout keeps its own `cursor`
+# and renders collection order by advancing across contiguous finalized
+# outcomes from the front on each call.
 # ---
 # level:   verbosity (0 roll-ups, 1 per-test lines, 2 also passing output)
 # mod_w:   module roll-up column width
@@ -481,6 +488,7 @@ rec Renderer {
 # runner:  resolved `--runner` launcher, or nil
 # log_dir: the capture-file directory
 # n:       number of selected tests
+# cursor:  index of the next outcome to render in collection order
 # first:   index of the current module's first outcome
 rec HumanCtx {
     level:   u8;
@@ -489,15 +497,18 @@ rec HumanCtx {
     runner:  *u8;
     log_dir: *u8;
     n:       u32;
+    cursor:  u32;
     first:   u32;
 }
 
 # state the JSON stream carries across its per-test callbacks
 # ---
+# a:       allocator for each test's output-reference path
 # log_dir: the capture-file directory, source of each test's output reference
 # n:       number of selected tests
 # w:       the stdout writer the NDJSON lines are emitted through
 rec JsonCtx {
+    a:       *A.Allocator;
     log_dir: *u8;
     n:       u32;
     w:       writer.Writer;
@@ -520,6 +531,7 @@ fun human_renderer(hc: *HumanCtx, level: u8, mod_w: usize, label_w: usize,
     hc.runner  = runner;
     hc.log_dir = log_dir;
     hc.n       = 0;
+    hc.cursor  = 0;
     hc.first   = 0;
     var r: Renderer;
     r.ctx        = hc::ptr;
@@ -530,28 +542,54 @@ fun human_renderer(hc: *HumanCtx, level: u8, mod_w: usize, label_w: usize,
 }
 
 # record the run size; the human readout writes nothing at start
+# ---
+# ctx:  the HumanCtx cell
+# arts: the selected artifacts (unused; the cursor reads them per-test)
+# n:    number of selected tests
 fun human_start(ctx: ptr, arts: *build.TestArtifact, n: u32) {
     val hc: *HumanCtx = ctx::*HumanCtx;
-    hc.n     = n;
-    hc.first = 0;
+    hc.n      = n;
+    hc.cursor = 0;
+    hc.first  = 0;
 }
 
-# render one finalized outcome under the live human readout, reproducing the
-# module header, per-test line, and end-of-module roll-up as the cursor crosses
+# advance the human readout across every outcome that has finalized since the
+# last call, rendering the module header, per-test line, and end-of-module
+# roll-up in collection order
+#
+# `idx` (the just-finalized outcome, in completion order) is not read directly:
+# the cursor renders strictly in collection order, crossing an outcome only once
+# every earlier one has also finalized, so the readout stays deterministic.
+# ---
+# ctx:      the HumanCtx cell
+# outcomes: the run outcomes, finalized in place
+# arts:     the selected artifacts, in collection order
+# idx:      the outcome that just finalized (drives the cursor forward)
 fun human_test(ctx: ptr, outcomes: *Outcome, arts: *build.TestArtifact, idx: u32) {
     val hc: *HumanCtx = ctx::*HumanCtx;
-    val mod_name: str = util.cstr_str(arts[idx].module);
-    if (hc.level > 0 && idx == hc.first) { print.printf("{}\n", mod_name); }
-    if (hc.level > 0) { print_verbose_test(?outcomes[idx], hc.label_w, hc.runner, hc.log_dir); }
-    val last_of_module: bool = idx + 1 == hc.n
-        || !str_equals(util.cstr_str(arts[idx + 1].module), mod_name);
-    if (last_of_module) {
-        if (hc.level == 0) { render_module_run(outcomes, hc.first, idx, mod_name, hc.mod_w, hc.runner, hc.log_dir); }
-        hc.first = idx + 1;
+    for (hc.cursor < hc.n && outcomes[hc.cursor].kind != KIND_PENDING) {
+        val c: u32 = hc.cursor;
+        val mod_name: str = util.cstr_str(arts[c].module);
+        if (hc.level > 0 && c == hc.first) { print.printf("{}\n", mod_name); }
+        if (hc.level > 0) { print_verbose_test(?outcomes[c], hc.label_w, hc.runner, hc.log_dir); }
+        val last_of_module: bool = c + 1 == hc.n
+            || !str_equals(util.cstr_str(arts[c + 1].module), mod_name);
+        if (last_of_module) {
+            if (hc.level == 0) { render_module_run(outcomes, hc.first, c, mod_name, hc.mod_w, hc.runner, hc.log_dir); }
+            hc.first = c + 1;
+        }
+        hc.cursor = c + 1;
     }
 }
 
 # render the closing human summary
+# ---
+# ctx:      the HumanCtx cell (unused)
+# outcomes: the run outcomes in test order
+# n:        number of outcomes
+# passed:   number of passing tests
+# failed:   number of failing tests
+# wall:     the run's wall time
 fun human_summary(ctx: ptr, outcomes: *Outcome, n: u32, passed: u32, failed: u32, wall: du.Duration) {
     render_summary(outcomes, n, passed, failed, wall);
 }
@@ -559,9 +597,11 @@ fun human_summary(ctx: ptr, outcomes: *Outcome, n: u32, passed: u32, failed: u32
 # build a JSON-stream renderer over caller-owned ctx storage
 # ---
 # jc:      the ctx cell the renderer borrows (must outlive the run)
+# a:       allocator for output-reference paths
 # log_dir: the capture-file directory, or nil when no tests will run
 # ret:     a Renderer bound to `jc`
-fun json_renderer(jc: *JsonCtx, log_dir: *u8) Renderer {
+fun json_renderer(jc: *JsonCtx, a: *A.Allocator, log_dir: *u8) Renderer {
+    jc.a       = a;
     jc.log_dir = log_dir;
     jc.n       = 0;
     fs.get_writer(?fs.stdout, ?jc.w);
@@ -573,27 +613,43 @@ fun json_renderer(jc: *JsonCtx, log_dir: *u8) Renderer {
     ret r;
 }
 
+# open a JSON event object and write its shared `schema` and `event` members
+# ---
+# w:     the writer to emit through
+# o:     the object state to open
+# event: the event discriminator token
+fun json_event_begin(w: *writer.Writer, o: *json.Object, event: *u8) {
+    json.object_begin(w, o);
+    json.field_i64(o, "schema", SCHEMA_VERSION);
+    json.field_str(o, "event", event);
+}
+
 # emit the `run_start` event
+# ---
+# ctx:  the JsonCtx cell
+# arts: the selected artifacts (unused)
+# n:    number of selected tests
 fun json_start(ctx: ptr, arts: *build.TestArtifact, n: u32) {
     val jc: *JsonCtx = ctx::*JsonCtx;
     jc.n = n;
     var o: json.Object;
-    json.object_begin(?jc.w, ?o);
-    json.field_i64(?o, "schema", SCHEMA_VERSION);
-    json.field_str(?o, "event", "run_start");
+    json_event_begin(?jc.w, ?o, "run_start");
     json.field_i64(?o, "tests", n::i64);
     json.object_end(?o);
 }
 
 # emit one `test` event for a finalized outcome
+# ---
+# ctx:      the JsonCtx cell
+# outcomes: the run outcomes, finalized in place
+# arts:     the selected artifacts, in collection order
+# idx:      the outcome to emit
 fun json_test(ctx: ptr, outcomes: *Outcome, arts: *build.TestArtifact, idx: u32) {
     val jc:  *JsonCtx            = ctx::*JsonCtx;
     val o0:  *Outcome            = ?outcomes[idx];
     val art: *build.TestArtifact = ?arts[idx];
     var o: json.Object;
-    json.object_begin(?jc.w, ?o);
-    json.field_i64(?o, "schema", SCHEMA_VERSION);
-    json.field_str(?o, "event", "test");
+    json_event_begin(?jc.w, ?o, "test");
     json.field_str(?o, "label", art.label);
     json.field_str(?o, "module", art.module);
     json.field_str(?o, "file", art.file);
@@ -603,11 +659,10 @@ fun json_test(ctx: ptr, outcomes: *Outcome, arts: *build.TestArtifact, idx: u32)
     json.field_i64(?o, "duration_ns", du.duration_nsec(o0.elapsed));
     json.field_i64(?o, "index", art.idx::i64);
     json.field_str(?o, "exe", art.exe);
-    # `output` references the on-disk capture file when the outcome kept one;
-    # a pass (unlinked) and a spawn failure (never created) have none.
-    var lp: [4096]u8;
-    if (has_capture(o0.kind) && log_path(?lp[0], 4096, jc.log_dir, art.idx)) {
-        json.field_str(?o, "output", ?lp[0]);
+    # `output` references the on-disk capture file when the outcome kept one; a
+    # pass (unlinked) and a spawn failure (never created) have none.
+    if (has_capture(o0.kind)) {
+        json.field_str_or_null(?o, "output", json_output_ref(jc, art.idx));
     }
     or {
         json.field_str_or_null(?o, "output", nil);
@@ -616,17 +671,42 @@ fun json_test(ctx: ptr, outcomes: *Outcome, arts: *build.TestArtifact, idx: u32)
 }
 
 # emit the `summary` event
+# ---
+# ctx:      the JsonCtx cell
+# outcomes: the run outcomes (unused)
+# n:        number of outcomes
+# passed:   number of passing tests
+# failed:   number of failing tests
+# wall:     the run's wall time
 fun json_summary(ctx: ptr, outcomes: *Outcome, n: u32, passed: u32, failed: u32, wall: du.Duration) {
     val jc: *JsonCtx = ctx::*JsonCtx;
     var o: json.Object;
-    json.object_begin(?jc.w, ?o);
-    json.field_i64(?o, "schema", SCHEMA_VERSION);
-    json.field_str(?o, "event", "summary");
+    json_event_begin(?jc.w, ?o, "summary");
     json.field_i64(?o, "passed", passed::i64);
     json.field_i64(?o, "failed", failed::i64);
     json.field_i64(?o, "total", n::i64);
     json.field_i64(?o, "duration_ns", du.duration_nsec(wall));
     json.object_end(?o);
+}
+
+# compose the `<log_dir>/<idx>.log` capture path into a freshly allocated buffer
+#
+# Allocating exactly to fit means the reference can never overflow a fixed
+# buffer; the result is owned by the run allocator. nil only on allocation
+# failure (the event then carries `output: null`).
+# ---
+# jc:  the JSON stream state (allocator + capture directory)
+# idx: the test's dispatch index
+# ret: the null-terminated path, or nil on allocation failure
+fun json_output_ref(jc: *JsonCtx, idx: u32) *u8 {
+    # the separator, up to ten index digits, `.log`, and the terminator fit in
+    # 32 bytes past the directory length.
+    val cap: usize = util.cstr_len(jc.log_dir) + 32;
+    val res: R.Result[*u8, str] = A.allocate[u8](jc.a, cap);
+    if (R.is_err[*u8, str](res)) { ret nil; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](res);
+    log_path(buf, cap, jc.log_dir, idx);
+    ret buf;
 }
 
 # emit one `case` event describing a collected test in `--list` mode
@@ -635,9 +715,7 @@ fun json_summary(ctx: ptr, outcomes: *Outcome, n: u32, passed: u32, failed: u32,
 # art: the collected test artifact
 fun emit_list_case(w: *writer.Writer, art: *build.TestArtifact) {
     var o: json.Object;
-    json.object_begin(w, ?o);
-    json.field_i64(?o, "schema", SCHEMA_VERSION);
-    json.field_str(?o, "event", "case");
+    json_event_begin(w, ?o, "case");
     json.field_str(?o, "label", art.label);
     json.field_str(?o, "module", art.module);
     json.field_str(?o, "file", art.file);
@@ -732,18 +810,21 @@ fun spawn_one(slots: *Slot, window: u32, art: *build.TestArtifact, idx: u32,
 
 # turn a reaped child's status into its final Outcome
 #
-# Closes the capture file, classifies the wait status, retains the captured
-# bytes where the readout needs them (always on failure, on pass under `-vv`),
-# and unlinks a passing test's file so only failures persist in `log/`.
+# Closes the capture file, classifies the wait status, and unlinks a passing
+# test's file so only failures persist in `log/`. When `want_bytes` is set the
+# readout wants the captured output inline, so it is retained (always on
+# failure, on pass under `-vv`); the JSON stream clears it and references the
+# on-disk file instead, so nothing is read into memory.
 # ---
-# a:        allocator retaining captured output
-# slot:     the reaped child's slot
-# st:       the wait status
-# outcomes: the outcomes array to finalize into
-# level:    verbosity (2 retains passing output)
-# log_dir:  the capture-file directory
+# a:          allocator retaining captured output
+# slot:       the reaped child's slot
+# st:         the wait status
+# outcomes:   the outcomes array to finalize into
+# level:      verbosity (2 retains passing output)
+# want_bytes: retain the captured output in memory for the readout
+# log_dir:    the capture-file directory
 fun finalize_slot(a: *A.Allocator, slot: *Slot, st: exec.ExitStatus,
-                  outcomes: *Outcome, level: u8, log_dir: *u8) {
+                  outcomes: *Outcome, level: u8, want_bytes: bool, log_dir: *u8) {
     var o: Outcome;
     o.art       = slot.art;
     o.code      = 0;
@@ -769,11 +850,11 @@ fun finalize_slot(a: *A.Allocator, slot: *Slot, st: exec.ExitStatus,
     var lp: [4096]u8;
     if (log_path(?lp[0], 4096, log_dir, slot.art.idx)) {
         if (o.kind == KIND_PASS) {
-            if (level >= 2) { retain_from_file(a, ?o, util.cstr_str(?lp[0])); }
+            if (want_bytes && level >= 2) { retain_from_file(a, ?o, util.cstr_str(?lp[0])); }
             fs.unlink(util.cstr_str(?lp[0]));
         }
         or {
-            retain_from_file(a, ?o, util.cstr_str(?lp[0]));
+            if (want_bytes) { retain_from_file(a, ?o, util.cstr_str(?lp[0])); }
         }
     }
 
