@@ -17,10 +17,25 @@ matched exactly: `--flag value` (a value follows in the next argument) or a bare
 
 An unrecognized flag is a hard error. Before it resolves positionals, each
 command rejects the first `-`/`--` token it does not accept — `error: unknown
-flag '<flag>' for '<command>'` — so a typo'd or removed flag never silently
-misparses as a project path or link input. Arguments after a `--` separator are
-program arguments, not flags (`mach run` forwards them to the executed binary),
-so a value that must begin with `-` is passed there.
+flag '<flag>' for '<command>'`, exit `1` — so a typo'd or removed flag never
+silently misparses as a project path or link input. `-h` / `--help` is accepted
+on every command and prints that command's help page.
+
+A `--` separator ends the flag region on every command: `--` itself and every
+token after it are never flag-rejected. What happens to the tokens after it
+depends on the command:
+
+- `run` forwards them to the executed binary as its `argv`
+  (`mach run <path> -- --flag`); `build` and `test` stop scanning at `--` (post-`--`
+  tokens are neither flags nor link inputs).
+- `doc`, `check`, and `init` take the token right after `--` as their positional,
+  so a `-`-leading path is reachable: `mach doc -- -weird-dir`,
+  `mach check -- -weird.mach`.
+
+Consequently a lone `-` or a negative-number token (e.g. `-1`) at a flag position
+is rejected as an unknown flag; where a command reads a positional after `--`
+(above), pass it there. No CLI positional legitimately begins with `-` today, so
+this only matters for oddly-named paths.
 
 ## Commands
 
