@@ -19,17 +19,23 @@
 # widths are computed from the collected tests before the run (clamped, so one
 # long name cannot blow out the table); the layout is fixed-width ASCII.
 #
-# child output is captured through `std.process.exec.capture`, which pipes the
-# child's stdout and drains it to EOF before waiting, so a chatty test never
-# deadlocks the runner. only failing tests retain their output (passing tests
-# stay quiet below `-vv`); the captured bytes surface under the expanded test.
+# tests run in parallel: a sliding window of `--jobs` children (defaulting to
+# the CPUs available to this process; 1 serializes) is kept in flight and
+# reaped with a blocking wait-any. each child's stdout and stderr are bound to
+# a per-test capture file under `log/` beside the dispatcher, so the kernel
+# does the buffering and a chatty test never blocks. a passing test's file is
+# unlinked on reap (retained first under `-vv`); a failing test's file stays
+# for inspection, and its first 64KB surface under the expanded failure along
+# with the exact rerun command. results always render in collection order, so
+# the readout is deterministic regardless of completion order.
 #
 # by default only `test` blocks declared in the current project's own modules are
 # collected; `--include-deps` widens collection to dependency modules too (#1556).
 # `--list` prints the collected tests without building or running them.
 # `--filter <substr>` selects the tests whose name contains the substring; it is
 # applied here at run time, so the built executable is identical regardless of
-# filter. `--runner <cmd>` launches every test as `<cmd> <exe> <idx>` instead of
+# filter. `--jobs <n>` overrides the parallel window width. `--runner <cmd>`
+# launches every test as `<cmd> <exe> <idx>` instead of
 # spawning the executable directly - the host-side launcher for foreign-target
 # artifacts (e.g. wine for a windows target, #1345). absent the flag, the
 # executable is spawned directly and a spawn failure reports exactly that.
@@ -55,6 +61,7 @@ use O:      std.types.option;
 use R:      std.types.result;
 use fmt:    std.format;
 use fs:     std.filesystem;
+use sys:    std.system.os;
 use writer: std.io.writer;
 use tm:     std.chrono.time;
 use du:     std.chrono.duration;
@@ -72,16 +79,18 @@ val KIND_SIGNAL: u8 = 2;
 val KIND_SPAWN:  u8 = 3;
 # a test that neither exited nor signaled (should not occur)
 val KIND_OTHER:  u8 = 4;
+# a test not yet finalized; the render cursor never crosses one
+val KIND_PENDING: u8 = 5;
 
-# capacity of the per-test stdout capture buffer; a child writing more is drained
-# past it (so it never blocks) and its retained output is marked truncated
+# most retained bytes per test from its capture file; a file holding more is
+# retained truncated (the file itself keeps the full output)
 val CAP_OUTPUT: usize = 65536;
 
 # the result of running one test
 #
-# `out` retains the captured child stdout for a failing test (and for a passing
-# one under `-vv`); it is owned by the run allocator and aliases nothing in the
-# reused capture buffer.
+# `out` retains the captured child output for a failing test (and for a
+# passing one under `-vv`), read back from the test's capture file; it is
+# owned by the run allocator.
 # ---
 # art:       the built test artifact (borrowed; owned by the run allocator)
 # kind:      a KIND_* outcome
@@ -116,6 +125,23 @@ pub fun run(argc: usize, argv: **u8) i64 {
     var level: u8 = 0;
     if (util.has_flag(argc, argv, "-v"))  { level = 1; }
     if (util.has_flag(argc, argv, "-vv")) { level = 2; }
+
+    # `--jobs <n>` bounds how many test children run at once; the default is
+    # the CPUs available to this process, and 1 serializes.
+    var jobs: u32 = 1;
+    val opt_jobs: O.Option[*u8] = util.get_value(argc, argv, "--jobs");
+    if (O.is_some[*u8](opt_jobs)) {
+        val jv: i64 = parse_count(O.unwrap[*u8](opt_jobs));
+        if (jv < 1) {
+            print.eprint("error: --jobs expects a positive integer\n");
+            ret 1;
+        }
+        jobs = jv::u32;
+    }
+    or {
+        val nc: i64 = sys.cpu_count();
+        if (nc > 1) { jobs = nc::u32; }
+    }
 
     # back the build with an arena over a page allocator, matching `mach build`.
     # the build's internal teardown frees through this allocator; the page
@@ -204,7 +230,7 @@ pub fun run(argc: usize, argv: **u8) i64 {
         ret 0;
     }
 
-    # one Outcome per selected test, plus a single reused stdout capture buffer.
+    # one Outcome per selected test.
     val res_out: R.Result[*Outcome, str] = A.allocate[Outcome](?a, sel_len::usize);
     if (R.is_err[*Outcome, str](res_out)) {
         arena.dnit(?ar);
@@ -213,13 +239,16 @@ pub fun run(argc: usize, argv: **u8) i64 {
     }
     val outcomes: *Outcome = R.unwrap_ok[*Outcome, str](res_out);
 
-    val res_buf: R.Result[*u8, str] = A.allocate[u8](?a, CAP_OUTPUT);
-    if (R.is_err[*u8, str](res_buf)) {
+    # per-test capture files live under `log/` beside the dispatcher. wiping
+    # this build's index range at run start leaves the directory holding only
+    # the failures of the run about to happen.
+    var log_dir: [4096]u8;
+    if (!capture_log_dir(selected[0].exe, ?log_dir[0], 4096)) {
         arena.dnit(?ar);
-        print.eprint("error: out of memory\n");
+        print.eprint("error: test log path too long\n");
         ret 2;
     }
-    val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
+    wipe_logs(?log_dir[0], tbr.len);
 
     # column widths come from the selection, so live lines align on the first
     # write with no second pass; clamping keeps one long name from blowing out
@@ -228,7 +257,7 @@ pub fun run(argc: usize, argv: **u8) i64 {
     val label_w: usize = label_col_width(selected, sel_len);
 
     val run_start: tm.Time = tm.monotonic();
-    execute_and_render(?a, selected, sel_len, runner, outcomes, buf, level, mod_w, label_w);
+    execute_and_render(?a, selected, sel_len, runner, outcomes, level, mod_w, label_w, jobs, ?log_dir[0]);
     val wall: du.Duration = tm.time_sub(tm.monotonic(), run_start);
 
     val failed: u32 = count_failed(outcomes, sel_len);
@@ -240,113 +269,313 @@ pub fun run(argc: usize, argv: **u8) i64 {
     ret 0;
 }
 
-# spawn every selected test in collection order, rendering the readout live as
-# results land
+# one in-flight test child
+# ---
+# pid:   the child's process id; 0 marks the slot free
+# art:   the artifact the child is running
+# idx:   index into the selection/outcomes arrays
+# start: monotonic spawn time
+# f:     the capture file, held open until the child is reaped
+rec Slot {
+    pid:   i64;
+    art:   *build.TestArtifact;
+    idx:   u32;
+    start: tm.Time;
+    f:     fs.File;
+}
+
+# run every selected test through a sliding window of child processes,
+# rendering the readout live in collection order as results finalize
 #
-# Each child is run with its stdout piped and drained to EOF (capture), so a
-# chatty test cannot deadlock the runner; stderr is inherited. A retained
-# test's captured bytes are copied out of the reused buffer into the run
-# allocator so they survive the next test overwriting the buffer (failures
-# always retain; passes retain under `-vv`). At the default level a module's
-# roll-up prints the moment its last test completes; under `-v` a module
-# header prints when its first test starts and each test line prints on
-# completion.
+# Up to `jobs` children are in flight at once, each with stdout and stderr
+# bound to its capture file; a blocking wait-any reaps whichever exits first.
+# The render cursor trails completion in collection order, so the readout is
+# deterministic regardless of completion order: at the default level a
+# module's roll-up prints the moment its last test finalizes, and under `-v`
+# the module header and each test line print as the cursor crosses them.
 # ---
 # a:        allocator retaining captured output
 # arts:     the selected test artifacts to run, in collection order
 # n:        number of artifacts in `arts`
 # runner:   resolved `--runner` launcher, or nil to exec the dispatcher directly
 # outcomes: caller-owned array (length n) filled in test order
-# buf:      the reused capture buffer (CAP_OUTPUT bytes)
 # level:    verbosity (0 roll-ups, 1 per-test lines, 2 also passing output)
 # mod_w:    module roll-up column width
 # label_w:  `-v` label column width
+# jobs:     window width (1 serializes)
+# log_dir:  the capture-file directory
 fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runner: *u8,
-                       outcomes: *Outcome, buf: *u8, level: u8, mod_w: usize, label_w: usize) {
-    # first index of the module run currently executing
-    var first: u32 = 0;
+                       outcomes: *Outcome, level: u8, mod_w: usize, label_w: usize,
+                       jobs: u32, log_dir: *u8) {
     var i: u32 = 0;
-    for (i < n) {
-        val art: *build.TestArtifact = ?arts[i];
-        val mod_name: str = util.cstr_str(art.module);
+    for (i < n) { outcomes[i].kind = KIND_PENDING; i = i + 1; }
 
-        if (level > 0 && i == first) { print.printf("{}\n", mod_name); }
+    var window: u32 = jobs;
+    if (window < 1) { window = 1; }
+    if (window > n) { window = n; }
 
-        # the test's dispatch index, rendered for the child's argv
-        var ibuf: [16]u8;
-        write_index(?ibuf[0], 16, art.idx);
-
-        # child argv: [exe, idx] directly, or [runner, exe, idx] under --runner.
-        # argv[0] doubles as the pathname the spawn receives, so a runner needs
-        # no PATH search.
-        var child_argv: [4]*u8;
-        if (runner != nil) {
-            child_argv[0] = runner;
-            child_argv[1] = art.exe;
-            child_argv[2] = ?ibuf[0];
-            child_argv[3] = nil;
+    val res_slots: R.Result[*Slot, str] = A.allocate[Slot](a, window::usize);
+    if (R.is_err[*Slot, str](res_slots)) {
+        print.eprint("error: out of memory\n");
+        i = 0;
+        for (i < n) {
+            outcomes[i].art       = ?arts[i];
+            outcomes[i].kind      = KIND_OTHER;
+            outcomes[i].code      = 0;
+            outcomes[i].elapsed   = 0;
+            outcomes[i].out       = nil;
+            outcomes[i].out_len   = 0;
+            outcomes[i].truncated = false;
+            i = i + 1;
         }
-        or {
-            child_argv[0] = art.exe;
-            child_argv[1] = ?ibuf[0];
-            child_argv[2] = nil;
-        }
+        ret;
+    }
+    val slots: *Slot = R.unwrap_ok[*Slot, str](res_slots);
+    i = 0;
+    for (i < window) { slots[i].pid = 0; i = i + 1; }
 
-        var o: Outcome;
-        o.art       = art;
-        o.code      = 0;
-        o.out       = nil;
-        o.out_len   = 0;
-        o.truncated = false;
+    var spawned:  u32 = 0;
+    var done:     u32 = 0;
+    var inflight: u32 = 0;
+    var cursor:   u32 = 0;
+    var first:    u32 = 0;
 
-        # each test child inherits the parent's environment unmodified.
-        val start: tm.Time = tm.monotonic();
-        val res: R.Result[exec.Capture, str] = exec.capture(child_argv[0], ?child_argv[0], env.environ(), buf, CAP_OUTPUT);
-        val finish: tm.Time = tm.monotonic();
-        o.elapsed = tm.time_sub(finish, start);
-
-        if (R.is_err[exec.Capture, str](res)) {
-            o.kind = KIND_SPAWN;
-        }
-        or {
-            val cap: exec.Capture    = R.unwrap_ok[exec.Capture, str](res);
-            val st:  exec.ExitStatus = cap.status;
-            if (exec.exited(st) && exec.code(st) == 0) {
-                o.kind = KIND_PASS;
-                # `-vv` surfaces passing output too, so it is worth retaining
-                if (level >= 2) { retain_output(a, ?o, buf, cap.len); }
-            }
-            or (exec.signaled(st)) {
-                # a crash reports the signal and the run continues to the next test.
-                o.kind = KIND_SIGNAL;
-                o.code = exec.signal(st);
-                retain_output(a, ?o, buf, cap.len);
-            }
-            or (exec.exited(st)) {
-                o.kind = KIND_EXIT;
-                o.code = exec.code(st);
-                retain_output(a, ?o, buf, cap.len);
+    for (done < n) {
+        # top the window back up
+        for (inflight < window && spawned < n) {
+            val idx: u32 = spawned;
+            spawned = spawned + 1;
+            if (spawn_one(slots, window, ?arts[idx], idx, runner, log_dir)) {
+                inflight = inflight + 1;
             }
             or {
-                o.kind = KIND_OTHER;
-                retain_output(a, ?o, buf, cap.len);
+                # the spawn itself failed, so the outcome is final immediately
+                outcomes[idx].art       = ?arts[idx];
+                outcomes[idx].kind      = KIND_SPAWN;
+                outcomes[idx].code      = 0;
+                outcomes[idx].elapsed   = 0;
+                outcomes[idx].out       = nil;
+                outcomes[idx].out_len   = 0;
+                outcomes[idx].truncated = false;
+                done = done + 1;
             }
         }
 
-        outcomes[i] = o;
-
-        if (level > 0) { print_verbose_test(?outcomes[i], label_w); }
-
-        # the module's run is complete when the next artifact starts a new
-        # module (or the selection ends); the roll-up prints right then.
-        val last_of_module: bool = i + 1 == n
-            || !str_equals(util.cstr_str(arts[i + 1].module), mod_name);
-        if (last_of_module) {
-            if (level == 0) { render_module_run(outcomes, first, i, mod_name, mod_w); }
-            first = i + 1;
+        if (inflight > 0) {
+            var st: exec.ExitStatus;
+            st.raw = 0;
+            val wr: R.Result[exec.Child, str] = exec.wait_any(?st);
+            if (R.is_err[exec.Child, str](wr)) {
+                # nothing reapable despite live children: report each rather
+                # than spinning forever
+                print.eprint("error: waiting for test children failed\n");
+                var sx: u32 = 0;
+                for (sx < window) {
+                    if (slots[sx].pid != 0) {
+                        fs.close(?slots[sx].f);
+                        outcomes[slots[sx].idx].art       = slots[sx].art;
+                        outcomes[slots[sx].idx].kind      = KIND_OTHER;
+                        outcomes[slots[sx].idx].code      = 0;
+                        outcomes[slots[sx].idx].elapsed   = 0;
+                        outcomes[slots[sx].idx].out       = nil;
+                        outcomes[slots[sx].idx].out_len   = 0;
+                        outcomes[slots[sx].idx].truncated = false;
+                        slots[sx].pid = 0;
+                        inflight = inflight - 1;
+                        done = done + 1;
+                    }
+                    sx = sx + 1;
+                }
+            }
+            or {
+                # a pid not in the window is a reparented grandchild; it is not
+                # a test result, so it does not account against the run.
+                val pid: i64 = R.unwrap_ok[exec.Child, str](wr).pid;
+                var sx: u32 = 0;
+                for (sx < window) {
+                    if (slots[sx].pid == pid) {
+                        finalize_slot(a, ?slots[sx], st, outcomes, level, log_dir);
+                        slots[sx].pid = 0;
+                        inflight = inflight - 1;
+                        done = done + 1;
+                        brk;
+                    }
+                    sx = sx + 1;
+                }
+            }
         }
-        i = i + 1;
+
+        # advance the render cursor across everything finalized so far
+        for (cursor < n && outcomes[cursor].kind != KIND_PENDING) {
+            val mod_name: str = util.cstr_str(arts[cursor].module);
+            if (level > 0 && cursor == first) { print.printf("{}\n", mod_name); }
+            if (level > 0) { print_verbose_test(?outcomes[cursor], label_w, runner, log_dir); }
+            val last_of_module: bool = cursor + 1 == n
+                || !str_equals(util.cstr_str(arts[cursor + 1].module), mod_name);
+            if (last_of_module) {
+                if (level == 0) { render_module_run(outcomes, first, cursor, mod_name, mod_w, runner, log_dir); }
+                first = cursor + 1;
+            }
+            cursor = cursor + 1;
+        }
     }
+}
+
+# spawn one test child into a free slot, its stdout and stderr bound to its
+# capture file
+#
+# A false return means the child never started (capture-file creation or the
+# spawn failed); the caller records the KIND_SPAWN outcome.
+# ---
+# slots:   the window's slot array
+# window:  number of slots
+# art:     the test to spawn
+# idx:     the test's index in the selection/outcomes arrays
+# runner:  resolved `--runner` launcher, or nil to exec the dispatcher directly
+# log_dir: the capture-file directory
+# ret:     true when the child is running and its slot is filled
+fun spawn_one(slots: *Slot, window: u32, art: *build.TestArtifact, idx: u32,
+              runner: *u8, log_dir: *u8) bool {
+    var s: u32 = 0;
+    for (s < window && slots[s].pid != 0) { s = s + 1; }
+    if (s == window) { ret false; }
+
+    var lp: [4096]u8;
+    if (!log_path(?lp[0], 4096, log_dir, art.idx)) { ret false; }
+    val res_f: R.Result[fs.File, str] = fs.create(util.cstr_str(?lp[0]), 420);
+    if (R.is_err[fs.File, str](res_f)) { ret false; }
+    var f: fs.File = R.unwrap_ok[fs.File, str](res_f);
+
+    # the test's dispatch index, rendered for the child's argv
+    var ibuf: [16]u8;
+    write_index(?ibuf[0], 16, art.idx);
+
+    # child argv: [exe, idx] directly, or [runner, exe, idx] under --runner.
+    # argv[0] doubles as the pathname the spawn receives, so a runner needs
+    # no PATH search. the child inherits the parent's environment unmodified.
+    var child_argv: [4]*u8;
+    if (runner != nil) {
+        child_argv[0] = runner;
+        child_argv[1] = art.exe;
+        child_argv[2] = ?ibuf[0];
+        child_argv[3] = nil;
+    }
+    or {
+        child_argv[0] = art.exe;
+        child_argv[1] = ?ibuf[0];
+        child_argv[2] = nil;
+    }
+
+    val start: tm.Time = tm.monotonic();
+    val res_c: R.Result[exec.Child, str] =
+        exec.spawn_redirected(util.cstr_str(child_argv[0]), ?child_argv[0], env.environ(), f.fd, f.fd);
+    if (R.is_err[exec.Child, str](res_c)) {
+        fs.close(?f);
+        fs.unlink(util.cstr_str(?lp[0]));
+        ret false;
+    }
+
+    slots[s].pid   = R.unwrap_ok[exec.Child, str](res_c).pid;
+    slots[s].art   = art;
+    slots[s].idx   = idx;
+    slots[s].start = start;
+    slots[s].f     = f;
+    ret true;
+}
+
+# turn a reaped child's status into its final Outcome
+#
+# Closes the capture file, classifies the wait status, retains the captured
+# bytes where the readout needs them (always on failure, on pass under `-vv`),
+# and unlinks a passing test's file so only failures persist in `log/`.
+# ---
+# a:        allocator retaining captured output
+# slot:     the reaped child's slot
+# st:       the wait status
+# outcomes: the outcomes array to finalize into
+# level:    verbosity (2 retains passing output)
+# log_dir:  the capture-file directory
+fun finalize_slot(a: *A.Allocator, slot: *Slot, st: exec.ExitStatus,
+                  outcomes: *Outcome, level: u8, log_dir: *u8) {
+    var o: Outcome;
+    o.art       = slot.art;
+    o.code      = 0;
+    o.out       = nil;
+    o.out_len   = 0;
+    o.truncated = false;
+    o.elapsed   = tm.time_sub(tm.monotonic(), slot.start);
+
+    fs.close(?slot.f);
+
+    if (exec.exited(st) && exec.code(st) == 0) { o.kind = KIND_PASS; }
+    or (exec.signaled(st)) {
+        # a crash reports the signal and the run continues.
+        o.kind = KIND_SIGNAL;
+        o.code = exec.signal(st);
+    }
+    or (exec.exited(st)) {
+        o.kind = KIND_EXIT;
+        o.code = exec.code(st);
+    }
+    or { o.kind = KIND_OTHER; }
+
+    var lp: [4096]u8;
+    if (log_path(?lp[0], 4096, log_dir, slot.art.idx)) {
+        if (o.kind == KIND_PASS) {
+            if (level >= 2) { retain_from_file(a, ?o, util.cstr_str(?lp[0])); }
+            fs.unlink(util.cstr_str(?lp[0]));
+        }
+        or {
+            retain_from_file(a, ?o, util.cstr_str(?lp[0]));
+        }
+    }
+
+    outcomes[slot.idx] = o;
+}
+
+# copy up to CAP_OUTPUT bytes of a test's capture file into `a`, marking the
+# outcome truncated when the file holds more
+#
+# Any filesystem or allocation error leaves the outcome without retained
+# output; the result still reports its location and exit status, and a failing
+# test's file stays on disk for direct inspection.
+# ---
+# a:    allocator owning the retained copy
+# o:    the outcome to attach the copy to
+# path: the capture-file path
+fun retain_from_file(a: *A.Allocator, o: *Outcome, path: str) {
+    val res_f: R.Result[fs.File, str] = fs.open(path);
+    if (R.is_err[fs.File, str](res_f)) { ret; }
+    var f: fs.File = R.unwrap_ok[fs.File, str](res_f);
+
+    val res_fi: R.Result[fs.FileInfo, str] = fs.info(?f);
+    if (R.is_err[fs.FileInfo, str](res_fi)) { fs.close(?f); ret; }
+    val size: usize = R.unwrap_ok[fs.FileInfo, str](res_fi).size;
+
+    var stored: usize = size;
+    if (stored > CAP_OUTPUT) {
+        stored      = CAP_OUTPUT;
+        o.truncated = true;
+    }
+    if (stored == 0) { fs.close(?f); ret; }
+
+    val res_buf: R.Result[*u8, str] = A.allocate[u8](a, stored);
+    if (R.is_err[*u8, str](res_buf)) { fs.close(?f); ret; }
+    val dst: *u8 = R.unwrap_ok[*u8, str](res_buf);
+
+    var got: usize = 0;
+    for (got < stored) {
+        val res_n: R.Result[usize, str] = fs.read(?f, (dst::usize + got)::*u8, stored - got);
+        if (R.is_err[usize, str](res_n)) { brk; }
+        val n: usize = R.unwrap_ok[usize, str](res_n);
+        if (n == 0) { brk; }
+        got = got + n;
+    }
+    fs.close(?f);
+
+    if (got == 0) { ret; }
+    o.out     = dst;
+    o.out_len = got;
 }
 
 # render one completed module run under the default readout: the roll-up line,
@@ -357,7 +586,10 @@ fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runne
 # last:     index of the module's last outcome (inclusive)
 # mod_name: the module's fully-qualified name
 # mod_w:    module column width
-fun render_module_run(outcomes: *Outcome, first: u32, last: u32, mod_name: str, mod_w: usize) {
+# runner:   resolved `--runner` launcher, or nil (for the rerun command)
+# log_dir:  the capture-file directory (for the full-output pointer)
+fun render_module_run(outcomes: *Outcome, first: u32, last: u32, mod_name: str, mod_w: usize,
+                      runner: *u8, log_dir: *u8) {
     var ok:      u32 = 0;
     var fail:    u32 = 0;
     var elapsed: du.Duration = 0;
@@ -373,41 +605,10 @@ fun render_module_run(outcomes: *Outcome, first: u32, last: u32, mod_name: str, 
     if (fail > 0) {
         j = first;
         for (j <= last) {
-            if (outcomes[j].kind != KIND_PASS) { print_fail_detail(?outcomes[j]); }
+            if (outcomes[j].kind != KIND_PASS) { print_fail_detail(?outcomes[j], runner, log_dir); }
             j = j + 1;
         }
     }
-}
-
-# copy a failing test's captured stdout out of the reused buffer into `a`
-#
-# Stores at most CAP_OUTPUT bytes, marking the outcome truncated when the child
-# wrote more. An allocation failure leaves the outcome without retained output;
-# the failure still reports its location and exit status.
-# ---
-# a:    allocator owning the retained copy
-# o:    the outcome to attach the copy to
-# buf:  the capture buffer holding the child's stdout
-# full: the full output length the capture reported (may exceed CAP_OUTPUT)
-fun retain_output(a: *A.Allocator, o: *Outcome, buf: *u8, full: usize) {
-    var stored: usize = full;
-    if (stored > CAP_OUTPUT) {
-        stored      = CAP_OUTPUT;
-        o.truncated = true;
-    }
-    if (stored == 0) { ret; }
-
-    val res: R.Result[*u8, str] = A.allocate[u8](a, stored);
-    if (R.is_err[*u8, str](res)) { ret; }
-    val dst: *u8 = R.unwrap_ok[*u8, str](res);
-
-    var i: usize = 0;
-    for (i < stored) {
-        dst[i] = buf[i];
-        i = i + 1;
-    }
-    o.out     = dst;
-    o.out_len = stored;
 }
 
 # the width of the module roll-up column: the longest selected module FQN,
@@ -492,15 +693,45 @@ fun print_rollup(mod_name: str, ok: u32, fail: u32, elapsed: du.Duration, mod_w:
     print.print("\n");
 }
 
-# write the expanded detail for one failing test under the default readout
+# write the expanded detail for one failing test under the default readout:
+# the FAIL line, the captured output, a full-output pointer when the retained
+# copy is truncated, and the exact rerun command
 # ---
-# o: the failing outcome
-fun print_fail_detail(o: *Outcome) {
+# o:       the failing outcome
+# runner:  resolved `--runner` launcher, or nil
+# log_dir: the capture-file directory
+fun print_fail_detail(o: *Outcome, runner: *u8, log_dir: *u8) {
     val label: str = util.cstr_str(o.art.label);
     print.printf("  FAIL  {}  {}:{}  ", label, util.cstr_str(o.art.file), o.art.line::i64);
     print_reason(o);
     print.print("\n");
     print_captured(o);
+    print_fail_pointers(o, runner, log_dir);
+}
+
+# write a failing test's trailing pointers: `full output:` when the retained
+# copy is truncated (the capture file holds everything), and the `rerun:`
+# command that reproduces exactly this test
+# ---
+# o:       the failing outcome
+# runner:  resolved `--runner` launcher, or nil
+# log_dir: the capture-file directory
+fun print_fail_pointers(o: *Outcome, runner: *u8, log_dir: *u8) {
+    if (o.truncated) {
+        var lp: [4096]u8;
+        if (log_path(?lp[0], 4096, log_dir, o.art.idx)) {
+            print.printf("    full output: {}\n", util.cstr_str(?lp[0]));
+        }
+    }
+    print.print("    rerun: ");
+    if (runner != nil) {
+        print.print(runner::str);
+        print.print(" ");
+    }
+    print.print(o.art.exe::str);
+    print.print(" ");
+    print.u64(o.art.idx::u64);
+    print.print("\n");
 }
 
 # write one test's line under the `-v` readout as it completes, expanding a
@@ -508,7 +739,9 @@ fun print_fail_detail(o: *Outcome) {
 # ---
 # o:       the outcome to list
 # label_w: label column width
-fun print_verbose_test(o: *Outcome, label_w: usize) {
+# runner:  resolved `--runner` launcher, or nil (for the rerun command)
+# log_dir: the capture-file directory (for the full-output pointer)
+fun print_verbose_test(o: *Outcome, label_w: usize, runner: *u8, log_dir: *u8) {
     val label: str = util.cstr_str(o.art.label);
     if (o.kind == KIND_PASS) {
         print.print("  ok    ");
@@ -525,6 +758,7 @@ fun print_verbose_test(o: *Outcome, label_w: usize) {
         print_reason(o);
         print.printf("  {}:{}\n", util.cstr_str(o.art.file), o.art.line::i64);
         print_captured(o);
+        print_fail_pointers(o, runner, log_dir);
     }
 }
 
@@ -659,4 +893,83 @@ fun write_index(buf: *u8, cap: usize, n: u32) {
     var k: usize = 0;
     for (k < t && k + 1 < cap) { buf[k] = tmp[t - 1 - k]; k = k + 1; }
     buf[k] = 0;
+}
+
+# parse a positive decimal flag value (the `--jobs` argument)
+# ---
+# s:   the null-terminated value text
+# ret: the parsed value, or -1 when empty, non-decimal, or absurdly large
+fun parse_count(s: *u8) i64 {
+    if (s == nil || s[0] == 0) { ret -1; }
+    var v: i64 = 0;
+    var i: usize = 0;
+    for (s[i] != 0) {
+        if (s[i] < '0' || s[i] > '9') { ret -1; }
+        v = v * 10 + (s[i] - '0')::i64;
+        if (v > 65536) { ret -1; }
+        i = i + 1;
+    }
+    ret v;
+}
+
+# derive the capture-file directory - `log/` beside the dispatcher - from the
+# dispatcher's executable path
+# ---
+# exe: the dispatcher executable path
+# buf: the destination buffer, receiving `<exe dir>/log` null-terminated
+# cap: the buffer capacity
+# ret: false when the result would not fit
+fun capture_log_dir(exe: *u8, buf: *u8, cap: usize) bool {
+    val el: usize = str_len(exe::str);
+    # the directory prefix ends at the last path separator, either flavor
+    var cut: usize = 0;
+    var i: usize = 0;
+    for (i < el) {
+        if (exe[i] == '/' || exe[i] == 92) { cut = i + 1; }
+        i = i + 1;
+    }
+    if (cut + 4 >= cap) { ret false; }
+    i = 0;
+    for (i < cut) { buf[i] = exe[i]; i = i + 1; }
+    buf[cut]     = 'l';
+    buf[cut + 1] = 'o';
+    buf[cut + 2] = 'g';
+    buf[cut + 3] = 0;
+    ret true;
+}
+
+# compose `<log_dir>/<idx>.log` into `buf`
+# ---
+# buf:     the destination buffer
+# cap:     the buffer capacity
+# log_dir: the capture-file directory
+# idx:     the test's dispatch index
+# ret:     false when the result would not fit
+fun log_path(buf: *u8, cap: usize, log_dir: *u8, idx: u32) bool {
+    var leaf: [24]u8;
+    write_index(?leaf[0], 16, idx);
+    var k: usize = str_len(util.cstr_str(?leaf[0]));
+    leaf[k]     = '.';
+    leaf[k + 1] = 'l';
+    leaf[k + 2] = 'o';
+    leaf[k + 3] = 'g';
+    leaf[k + 4] = 0;
+    ret util.join_into(buf, cap, log_dir, ?leaf[0]) > 0;
+}
+
+# remove every capture file this build could have written, so `log/` carries
+# only the run about to happen; the directory is created on the way
+# ---
+# log_dir: the capture-file directory
+# total:   the build's dispatch-index count (indices are 0..total-1)
+fun wipe_logs(log_dir: *u8, total: u32) {
+    var lp: [4096]u8;
+    var idx: u32 = 0;
+    for (idx < total) {
+        if (log_path(?lp[0], 4096, log_dir, idx)) {
+            if (idx == 0) { util.ensure_parents(?lp[0]); }
+            fs.unlink(util.cstr_str(?lp[0]));
+        }
+        idx = idx + 1;
+    }
 }
