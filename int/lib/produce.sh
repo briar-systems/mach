@@ -10,6 +10,8 @@
 #                 execution cannot observe (PE ASLR bit, macho PIE bit). dispatched
 #                 on the artifact's own magic, so it is independent of how the case
 #                 maps to a leg. no LLVM; reads little-endian fields (every runner is LE).
+#   relro       — like field, but walks the ELF program headers for a PT_GNU_RELRO
+#                 (the static-PIE RELRO region). ELF-only; used by the elf-relro guard.
 #   flat-loader — load an os=freestanding, of=raw flat image via a tiny C loader
 #                 (mmap + jump) and report the image's exit status.
 
@@ -83,6 +85,30 @@ produce_field() {
     esac
 }
 
+# produce_relro <runmode> <target> <binary>
+# emits the ELF RELRO fact: relro=1 when a PT_GNU_RELRO program header (p_type
+# 0x6474e552) is present, else relro=0. read host-side from the program headers
+# (e_phoff u64 @32, e_phentsize u16 @54, e_phnum u16 @56), never executing the binary,
+# so it works on every leg including qemu. ELF-only (RELRO is an ELF concept).
+produce_relro() {
+    bin=$3
+    magic=$(dd if="$bin" bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    if [ "$magic" != "7f454c46" ]; then
+        echo "int: relro: not an ELF binary (magic $magic)" >&2; return 2
+    fi
+    phoff=$(read_le_uint "$bin" 32 8)
+    phentsize=$(read_le_uint "$bin" 54 2)
+    phnum=$(read_le_uint "$bin" 56 2)
+    relro=0
+    i=0
+    while [ "$i" -lt "$phnum" ]; do
+        ptype=$(read_le_uint "$bin" $((phoff + i * phentsize)) 4)
+        if [ "$ptype" = "1685382482" ]; then relro=1; break; fi   # PT_GNU_RELRO = 0x6474e552
+        i=$((i + 1))
+    done
+    echo "relro=$relro"
+}
+
 # produce_flat_loader <runmode> <target> <binary>
 # loads the freestanding raw image through the C loader (built once, cached) and
 # reports the image's exit status as the observable. any stdout the image writes
@@ -109,6 +135,7 @@ produce() {
     case "$run" in
         exec)        produce_exec "$@" ;;
         field)       produce_field "$@" ;;
+        relro)       produce_relro "$@" ;;
         flat-loader) produce_flat_loader "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
