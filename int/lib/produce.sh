@@ -60,13 +60,26 @@ field_macho() {
     echo "PIE=$(( (flags & 0x200000) != 0 ))"
 }
 
-# field_elf <binary> — the ELF position-independence fact. e_type is a u16 at offset
-# 16; ET_DYN (3) is a position-independent (PIE) executable, ET_EXEC (2) a
-# fixed-address one.
+# field_elf <binary> — the ELF position-independence + RELRO facts. e_type is a u16 at
+# offset 16 (ET_DYN=3 is a PIE, ET_EXEC=2 a fixed-address one); relro is 1 when a
+# PT_GNU_RELRO program header (p_type 0x6474e552) is present, marking the read-only
+# region a static-PIE re-protects after self-relocation. e_phoff is a u64 at 32,
+# e_phentsize a u16 at 54, e_phnum a u16 at 56.
 field_elf() {
     bin=$1
     etype=$(read_le_uint "$bin" 16 2)
     echo "e_type=$etype"
+    phoff=$(read_le_uint "$bin" 32 8)
+    phentsize=$(read_le_uint "$bin" 54 2)
+    phnum=$(read_le_uint "$bin" 56 2)
+    relro=0
+    i=0
+    while [ "$i" -lt "$phnum" ]; do
+        ptype=$(read_le_uint "$bin" $((phoff + i * phentsize)) 4)
+        if [ "$ptype" = "1685382482" ]; then relro=1; break; fi   # PT_GNU_RELRO = 0x6474e552
+        i=$((i + 1))
+    done
+    echo "relro=$relro"
 }
 
 # produce_field <runmode> <target> <binary>
