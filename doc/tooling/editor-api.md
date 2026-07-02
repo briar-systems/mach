@@ -54,22 +54,35 @@ cached `Ast` / `ResolveResult`, so the next `parse` / `resolve` recomputes.
 ## Diagnostics — the first consumer slice
 
 `diagnostics` runs `tokenize → emit-lex-errors → parse` and returns the
-session `DiagList`. Each `diag.Diagnostic` carries `(severity, file_id, span,
-message, note)`. Map each `span` to a position with `source.position`:
+session `DiagList` of **syntactic** diagnostics only. Each `diag.Diagnostic`
+carries `(severity, loc, message, note, help, related[])`: `loc` is a
+`Location` (`file_id`, `span`) for the primary report, `note` and `help` are
+optional trailing lines, and `related` is a growable array (`related_len`
+entries) of secondary `Location`s each with an optional `label`. Map each
+`loc.span` to a position with `source.position`:
 
 ```mach
 val list: *diag.DiagList = unwrap_ok[...](editor.diagnostics(?es, fid));
 var i: usize = 0;
 for (i < list.len) {
     val d: *diag.Diagnostic = ?list.items[i];
-    val sf: *src.SourceFile = unwrap[...](src.get(?s.sources, d.file_id));
-    val pos: src.Position = src.position(sf, d.span.offset); // 1-based line/col
+    val sf: *src.SourceFile = unwrap[...](src.get(?s.sources, d.loc.file_id));
+    val pos: src.Position = src.position(sf, d.loc.span.offset); // 1-based line/col
     // d.severity, pos.line, pos.col, d.message -> LSP Diagnostic
     i = i + 1;
 }
 ```
 
-The `mach check <file>` CLI command is the in-tree consumer of this slice.
+`help` and `related` are populated by the **resolve** stage (a suggestion rides
+`help`, rendered `= help:`; a prior binding rides `related`, e.g. `previous
+definition here`), so an integrator wanting them drives `resolve` (or full
+`analyze`) and reads `es.s.diags` — the parse-only `diagnostics` slice never
+sets them. Map a `related` entry's `loc` to a position the same way, and surface
+its `label` as an LSP `relatedInformation` item.
+
+The `mach check <file>` CLI command is the in-tree consumer of the parse-only
+slice; `mach build` renders the resolve-stage diagnostics that carry `help` and
+`related`.
 
 ## Position lookup — offset → id
 
