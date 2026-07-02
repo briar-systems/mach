@@ -16,6 +16,31 @@ characters use their JSON escapes and every byte `>= 0x80` is emitted as a
 `\uXXXX` escape (UTF-8 decoded, astral code points as a surrogate pair), so the
 output is byte-for-byte identical on every platform. Numbers are integers.
 
+### ASCII escaping (considered alternative)
+
+The escaper is `ensure_ascii`: it never emits a raw byte `>= 0x80`. Verbatim
+UTF-8 passthrough would be equally deterministic and equally valid under RFC
+8259 (which mandates UTF-8), and would be smaller and more readable. The
+`ensure_ascii` form was chosen for two properties a machine stream benefits
+from: it makes no assumption about the consumer's byte-encoding handling, and it
+is robust to invalid UTF-8 in the underlying bytes — malformed sequences (a path
+on Linux is an arbitrary byte string) decode to the U+FFFD replacement escape
+rather than propagating raw or producing invalid JSON. The tradeoff is size and
+human readability, which do not matter for a machine stream.
+
+### Paths and ordering
+
+`file`, `exe`, and `output` are emitted exactly as the compiler references them
+— relative to the working directory the run was invoked from (the same form the
+human readout prints, e.g. `./src/...`), unless a path was configured as
+absolute. Resolve them against that cwd.
+
+`test` events arrive in **completion order** — each is emitted the moment its
+test process finalizes, so a slow test never delays results that finished before
+it. Consumers that want collection (declaration) order sort by `index`, which is
+the stable per-test dispatch index. `run_start` always precedes every `test`,
+and `summary` always follows every `test`.
+
 ## Versioning
 
 `schema` is `1`. It is bumped only on an **incompatible** change to the event
@@ -56,7 +81,7 @@ order as the human readout), regardless of completion order.
 | `kind`        | string        | outcome (see below) |
 | `code`        | int           | exit code (`kind` = `exit`) or signal number (`kind` = `signal`); `0` otherwise |
 | `duration_ns` | int           | wall time of the test process, in nanoseconds |
-| `index`       | int           | the test's dispatch index (`<exe> <index>` reruns exactly this test) |
+| `index`       | int           | the test's collection-order dispatch index (`<exe> <index>` reruns exactly this test; sort by it for declaration order) |
 | `exe`         | string        | the dispatcher executable path |
 | `output`      | string / null | path to the retained capture file, or `null` |
 
@@ -75,6 +100,12 @@ stderr. It is a path for a `test` whose capture file persists — every failure
 (`exit`, `signal`, `other`) — and `null` otherwise: a `pass` file is unlinked on
 completion, and a `spawn` failure never produced one. The file is the complete
 output (unlike the human readout's 64KB inline excerpt).
+
+The capture file is **single-run scoped**: the next `mach test` invocation wipes
+the `log/` directory beside the dispatcher — regardless of `--filter` — before
+it runs, so read a referenced file before starting another run. The path is
+composed to fit exactly, so `output` is never `null` for a failure on account of
+path length.
 
 ```json
 {"schema":1,"event":"test","label":"mach.cli.util.path_into:absolute_and_relative","module":"mach.cli.util","file":"./src/cli/util.mach","line":427,"kind":"pass","code":0,"duration_ns":489607,"index":12,"exe":"./out/linux-x86_64/debug/test/mach","output":null}
