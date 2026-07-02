@@ -100,6 +100,11 @@ secondary spans, and out-of-range integer literals now report their bounds.
   (`phdr_count <= 72`). Past that the image was silently unloadable; the writers now
   return a link error instead. Latent (real builds emit ~9 headers), owning the
   invariant before segment counts grow (#1814).
+- build: **`mach build --all-targets -o <path>` is now rejected** - `-o` names a
+  single artifact path, so combined with `--all-targets` every target linked to
+  that one path and overwrote the previous, leaving only the last target's binary
+  with no warning. The combination now errors (`-o cannot be combined with
+  --all-targets`) at parse; single-target `-o` is unchanged (#1831).
 
 ## [2.12.0] - 2026-07-01
 

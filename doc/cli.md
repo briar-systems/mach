@@ -66,7 +66,7 @@ A verbosity flag (`-v`/`-vv`) and `--quiet` together is a parse error.
 | `--bin <name>`   | artifact name    | narrow the build to one `[bin.<name>]` artifact |
 | `--lib <name>`   | artifact name    | narrow the build to one `[lib.<name>]` artifact (mutually exclusive with `--bin`) |
 | `-o <path>`      | path             | override the artifact path, rooted at the project root (build/run/test) |
-| `--all-targets`  | —                | build every declared `[target.*]`, not just the default |
+| `--all-targets`  | —                | build every declared `[target.*]`, not just the default (mutually exclusive with `-o`, which names one path) |
 | `--emit-asm`     | —                | emit per-module assembly text (`.s`); forces the selected profile's `emit_asm` on |
 | `--emit-ir`      | —                | emit per-module SSA IR text (`.ir`) — the final post-pipeline IR the object is built from, so it varies with `-O`; forces the selected profile's `emit_ir` on |
 | `--no-emit-asm`  | —                | force per-module assembly emission off, overriding the profile's `emit_asm` |
