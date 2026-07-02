@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- test: `mach test` runs tests **in parallel** - a sliding window of `--jobs`
+  child processes (default: the CPUs available to the process; `--jobs 1`
+  serializes), reaped with a blocking wait-any. Each child's stdout *and
+  stderr* are captured to a per-test file under `log/` beside the dispatcher;
+  a passing test's file is removed on reap, a failing test's stays (the
+  expanded failure shows the first 64KB, a `full output:` pointer when
+  truncated, and the exact `rerun: <exe> <idx>` command). Results render in
+  collection order regardless of completion order, so the readout is
+  deterministic (#1791).
 - test: the `mach test` readout is **live** - each module's roll-up prints the
   moment its last test completes, and failures expand as they happen. Column
   widths are computed from the collected tests (clamped) instead of hard-coded,

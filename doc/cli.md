@@ -227,23 +227,29 @@ passed.
 
 | Flag                | Value   | Effect |
 |---------------------|---------|--------|
+| `--jobs <n>`        | count   | run up to `<n>` test processes at once (default: the CPUs available; 1 serializes) |
 | `--filter <pattern>`| pattern | run only tests whose name contains `<pattern>` |
 | `--include-deps`    | —       | also collect tests declared in dependency modules |
 | `--list`            | —       | list the collected tests and exit |
 | `--runner <cmd>`    | command | launch every test as `<cmd> <exe> <idx>` instead of exec'ing the dispatcher directly |
 
 Plus the `build` and global flags (`-v` lists every test). The build produces a
-single dispatcher executable covering every collected test; the runner spawns it
-once per test as `<exe> <idx>`, so each test still runs in its own process.
-`--filter` selects at run time — the built executable is identical regardless of
-filter. `--runner` has the same semantics as on `mach run`: a single command
-name or path (no shell-style word splitting), resolved on `PATH`, for
-foreign-target tests the host cannot exec directly — e.g. `mach test . --target
-windows --runner wine` (the runner receives the executable path and the test
-index as its two arguments). Without it, a test executable the host cannot
-launch reports a per-test failure — `(exit 127)` when `execve` rejects the
-binary in the spawned child, `(spawn failed)` when the spawn itself fails — with
-no auto-detection.
+single dispatcher executable covering every collected test; the runner keeps up
+to `--jobs` children in flight, each spawned as `<exe> <idx>`, so every test
+still runs in its own process. Each child's stdout and stderr are captured to a
+per-test file under `log/` beside the dispatcher: a passing test's file is
+removed on the spot, a failing test's file stays for inspection (the expanded
+failure shows the first 64KB, a `full output:` pointer when that truncates, and
+the exact `rerun:` command). Results render in collection order regardless of
+completion order, so the readout is deterministic. `--filter` selects at run
+time — the built executable is identical regardless of filter. `--runner` has
+the same semantics as on `mach run`: a single command name or path (no
+shell-style word splitting), resolved on `PATH`, for foreign-target tests the
+host cannot exec directly — e.g. `mach test . --target windows --runner wine`
+(the runner receives the executable path and the test index as its two
+arguments). Without it, a test executable the host cannot launch reports a
+per-test failure — `(exit 127)` when `execve` rejects the binary in the spawned
+child, `(spawn failed)` when the spawn itself fails — with no auto-detection.
 
 Exit codes: `0` all passed, `1` any failed, `2` build/internal error.
 
