@@ -75,6 +75,13 @@ integer literals now report their bounds.
   overflowed a signed slot (e.g. `val mask: i64 = 0xFFFFFFFFFFFFFFFF;`) used to
   compile and silently wrap at runtime; it is now rejected, while `u64` slots
   keep their legitimate maximum (#1804).
+- link/elf: **the ELF exec writers refuse a program-header table that overflows
+  its reserved header page** - the PIE and dynamic writers extend the first
+  `PT_LOAD` down exactly one page to cover the ELF header + program headers, which
+  only maps segment 0 at its vaddr while the header block fits that page
+  (`phdr_count <= 72`). Past that the image was silently unloadable; the writers now
+  return a link error instead. Latent (real builds emit ~9 headers), owning the
+  invariant before segment counts grow (#1814).
 
 ## [2.12.0] - 2026-07-01
 
