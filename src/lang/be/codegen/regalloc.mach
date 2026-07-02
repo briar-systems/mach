@@ -112,6 +112,28 @@ rec BlockSpan {
     end:   i64;
 }
 
+# an allocation hint recording the source register a vreg's defining copy reads
+#
+# When a vreg is first defined by a plain register copy (`MOV v <- src`), the scan
+# prefers to color `v` onto `src`'s register so the copy collapses to `mov x, x`
+# and is dropped at rewrite. The two source shapes are mutually exclusive per
+# hint; a copy with an immediate or otherwise unhintable source leaves both fields
+# at their empty sentinels.
+# ---
+# src_vreg: source vreg id for a `MOV v <- v2` copy, else MIR_VREG_NIL
+# src_preg: source composite physical-register id for a `MOV v <- preg` copy, else -1
+# copy_pos: flat-stream position of the defining copy, or -1 when no hint. the
+#           merged-range model extends a phi destination's live range back over its
+#           whole defining block, so its range start no longer marks the copy; this
+#           exact position is what proves the source vreg dies precisely at the copy
+#           (its register may then transfer to the destination), independent of the
+#           extension
+rec CopyHint {
+    src_vreg: u32;
+    src_preg: i32;
+    copy_pos: i64;
+}
+
 # the per-function allocation scratch state
 #
 # Owns every working array for the duration of one function's allocation and
@@ -185,6 +207,11 @@ rec BlockSpan {
 #                       so vreg_has_slot is an O(1) read. spill slots added later name
 #                       only spilled vregs, which is_spilled rejects before consulting
 #                       this, so the flag stays correct after the scan
+# hints:                per-vreg allocation hint (the source register of the vreg's
+#                       first defining copy), sized f.vreg_count; the scan biases
+#                       coloring toward it so a coalesced copy collapses to a dropped
+#                       self-move. an empty hint (src_vreg == MIR_VREG_NIL and
+#                       src_preg < 0) is advisory-only and never affects correctness
 rec AllocCtx {
     alloc:                *A.Allocator;
     interner:             *intern.Interner;
@@ -221,6 +248,7 @@ rec AllocCtx {
     block_id_index_cap:   u32;
     block_spans:          *BlockSpan;
     vreg_slot_flag:       *bool;
+    hints:                *CopyHint;
 }
 
 # the allocating function's source name, or "<unknown>" when unresolved
@@ -363,6 +391,19 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
         reserve_reg(?ctx, tgt.arch.shift_count_reg);
     }
 
+    # per-vreg storage-slot flags are needed by the dead-def sweep (a slot-owning
+    # vreg is never swept) and later by the scan / rewrite; build them first, since
+    # they read only the frame and vreg count, not the instruction stream.
+    val vs: R.Result[bool, str] = build_vreg_slot_flags(?ctx);
+    if (R.is_err[bool, str](vs)) { ctx_dnit(?ctx); ret vs; }
+
+    # copy hygiene, step 1: delete register moves whose destination is never read,
+    # before any position-dependent structure (block order, flat stream, live
+    # ranges) is built, so every later pass sees the already-cleaned instruction
+    # lists with no staleness to reconcile.
+    val ds: R.Result[bool, str] = sweep_dead_movs(tgt, ?ctx);
+    if (R.is_err[bool, str](ds)) { ctx_dnit(?ctx); ret ds; }
+
     val bo: R.Result[bool, str] = build_order(?ctx);
     if (R.is_err[bool, str](bo)) { ctx_dnit(?ctx); ret bo; }
 
@@ -372,12 +413,9 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
     val fl: R.Result[bool, str] = flatten(?ctx);
     if (R.is_err[bool, str](fl)) { ctx_dnit(?ctx); ret fl; }
 
-    # precompute the per-block flat spans and per-vreg storage-slot flags the
-    # liveness and scan passes would otherwise rebuild by rescanning.
+    # precompute the per-block flat spans the liveness range-extension reads.
     val bs: R.Result[bool, str] = build_block_spans(?ctx);
     if (R.is_err[bool, str](bs)) { ctx_dnit(?ctx); ret bs; }
-    val vs: R.Result[bool, str] = build_vreg_slot_flags(?ctx);
-    if (R.is_err[bool, str](vs)) { ctx_dnit(?ctx); ret vs; }
 
     build_ranges(?ctx);
 
@@ -386,6 +424,10 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
 
     val mc: R.Result[bool, str] = mark_call_crossing(?ctx);
     if (R.is_err[bool, str](mc)) { ctx_dnit(?ctx); ret mc; }
+
+    # copy hygiene, step 2: record each vreg's copy-source hint so the scan can bias
+    # coloring toward it and collapse the copy to a self-move dropped at rewrite.
+    build_hints(tgt, ?ctx);
 
     val sc: R.Result[bool, str] = linear_scan(tgt, ?ctx);
     if (R.is_err[bool, str](sc)) { ctx_dnit(?ctx); ret sc; }
@@ -440,6 +482,7 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
     ctx.block_id_index_cap   = 0;
     ctx.block_spans          = nil;
     ctx.vreg_slot_flag       = nil;
+    ctx.hints                = nil;
 
     val ro: R.Result[*u32, str] = A.allocate[u32](m.alloc, f.block_count::usize);
     if (R.is_err[*u32, str](ro)) { ret R.err[bool, str](R.unwrap_err[*u32, str](ro)); }
@@ -521,6 +564,17 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
     val ra: R.Result[*u32, str] = A.allocate[u32](m.alloc, f.vreg_count::usize);
     if (R.is_err[*u32, str](ra)) { ctx_dnit(ctx); ret R.err[bool, str](R.unwrap_err[*u32, str](ra)); }
     ctx.active = R.unwrap_ok[*u32, str](ra);
+
+    val rh: R.Result[*CopyHint, str] = A.allocate[CopyHint](m.alloc, f.vreg_count::usize);
+    if (R.is_err[*CopyHint, str](rh)) { ctx_dnit(ctx); ret R.err[bool, str](R.unwrap_err[*CopyHint, str](rh)); }
+    ctx.hints = R.unwrap_ok[*CopyHint, str](rh);
+    var hi: u32 = 0;
+    for (hi < f.vreg_count) {
+        ctx.hints[hi].src_vreg = mir.MIR_VREG_NIL;
+        ctx.hints[hi].src_preg = -1;
+        ctx.hints[hi].copy_pos = -1;
+        hi = hi + 1;
+    }
 
     ret R.ok[bool, str](true);
 }
@@ -607,6 +661,10 @@ fun ctx_dnit(ctx: *AllocCtx) {
     if (ctx.vreg_slot_flag != nil && ctx.f.vreg_count > 0) {
         A.deallocate[bool](ctx.alloc, ctx.vreg_slot_flag, ctx.f.vreg_count::usize);
         ctx.vreg_slot_flag = nil;
+    }
+    if (ctx.hints != nil && ctx.f.vreg_count > 0) {
+        A.deallocate[CopyHint](ctx.alloc, ctx.hints, ctx.f.vreg_count::usize);
+        ctx.hints = nil;
     }
 }
 
@@ -1019,6 +1077,172 @@ fun build_ranges(ctx: *AllocCtx) {
     }
 }
 
+# true when a post-selection opcode is one of the active ISA's plain
+# register-move forms, via the ISA vtable's `is_reg_move` classifier. an ISA that
+# wires no classifier reports false, disabling both copy-hygiene passes for that
+# target rather than risking a wrong identification of a non-move opcode.
+fun isa_is_reg_move(tgt: *target.Target, opcode: u32) bool {
+    if (tgt.arch.is_reg_move == nil) { ret false; }
+    val f: isa.IsRegMoveFn = tgt.arch.is_reg_move::isa.IsRegMoveFn;
+    ret f(opcode);
+}
+
+# true when an instruction is a plain register-or-immediate copy - a
+# coalescable move whose destination register receives its source unchanged with no
+# side effect. the opcode is one of the ISA's move forms; the operands are
+# [dst-register, source-register/immediate] with no memory operand (so a store /
+# load routed through the same encoder opcode is rejected); and the source and
+# destination widths are equal, so no narrowing / sign- or zero-extension rides on
+# the move (a truncating or extending move carries width != src_width). an
+# inline-asm instruction is never a copy.
+fun instr_is_reg_copy(tgt: *target.Target, mi: *mir.MirInstr) bool {
+    if (mi.operand_count != 2)            { ret false; }
+    if (mi.asm_block != nil)              { ret false; }
+    if (mi.width != mi.src_width)         { ret false; }
+    if (!isa_is_reg_move(tgt, mi.opcode)) { ret false; }
+    val d: *mir.MirOperand = ?mi.operands[0];
+    val s: *mir.MirOperand = ?mi.operands[1];
+    if (d.kind != mir.MIR_OP_VREG && d.kind != mir.MIR_OP_PREG) { ret false; }
+    if (s.kind != mir.MIR_OP_VREG && s.kind != mir.MIR_OP_PREG && s.kind != mir.MIR_OP_IMM) { ret false; }
+    ret true;
+}
+
+# tally, per vreg, how many times it is READ across the whole function -
+# every operand occurrence that is a use rather than a definition. mirrors the
+# use classification `build_ranges` / `compute_use_def` apply: operand 0 of a
+# defining instruction is the written destination (not a read), a MEM base or
+# scaled-index vreg is always a read. a vreg with zero reads is never used and its
+# defining copies are dead.
+fun tally_reads(ctx: *AllocCtx, reads: *u32, nv: u32) {
+    val f: *mir.MirFunction = ctx.f;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            val has_def: bool = instr_defines(mi);
+            var k: u32 = 0;
+            for (k < mi.operand_count) {
+                val op: *mir.MirOperand = ?mi.operands[k];
+                if (op.kind == mir.MIR_OP_VREG) {
+                    val is_dst: bool = has_def && k == 0;
+                    if (!is_dst && op.vreg < nv) { reads[op.vreg] = reads[op.vreg] + 1; }
+                } or (op.kind == mir.MIR_OP_MEM && op.vreg != mir.MIR_VREG_NIL && op.vreg < nv) {
+                    reads[op.vreg] = reads[op.vreg] + 1;
+                }
+                if (op.kind == mir.MIR_OP_MEM && !op.index_is_preg && op.index != mir.MIR_VREG_NIL && op.index < nv) {
+                    reads[op.index] = reads[op.index] + 1;
+                }
+                k = k + 1;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+}
+
+# true when a register copy's destination vreg is never read, so the
+# copy is dead. a copy INTO a physical register (dst not a vreg) has an ABI effect
+# and is never dead; a slot-owning vreg is storage addressed through memory and is
+# not a plain value the sweep may drop.
+fun is_dead_mov(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr, reads: *u32, nv: u32) bool {
+    if (!instr_is_reg_copy(tgt, mi)) { ret false; }
+    val d: *mir.MirOperand = ?mi.operands[0];
+    if (d.kind != mir.MIR_OP_VREG) { ret false; }
+    if (d.vreg >= nv)              { ret false; }
+    if (vreg_has_slot(ctx, d.vreg)) { ret false; }
+    ret reads[d.vreg] == 0;
+}
+
+# delete every register move whose destination vreg is never read.
+#
+# The dead-def sweep of issue #1801. Runs before block ordering / flattening so no
+# later structure needs reconciling. Deleting `MOV v <- s` removes a use of `s`,
+# which can make an earlier copy into `s` dead in turn, so the pass iterates to a
+# fixpoint: each round retallies reads from scratch and compacts every block's
+# instruction list, dropping the dead moves. A block always ends in a terminator
+# (never a move), so it never empties. An ISA with no move classifier no-ops.
+fun sweep_dead_movs(tgt: *target.Target, ctx: *AllocCtx) R.Result[bool, str] {
+    val f: *mir.MirFunction = ctx.f;
+    val nv: u32 = f.vreg_count;
+    if (nv == 0)                     { ret R.ok[bool, str](true); }
+    if (tgt.arch.is_reg_move == nil) { ret R.ok[bool, str](true); }
+
+    val rr: R.Result[*u32, str] = A.allocate[u32](ctx.alloc, nv::usize);
+    if (R.is_err[*u32, str](rr)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rr)); }
+    val reads: *u32 = R.unwrap_ok[*u32, str](rr);
+
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var i: u32 = 0;
+        for (i < nv) { reads[i] = 0; i = i + 1; }
+        tally_reads(ctx, reads, nv);
+
+        var bi: u32 = 0;
+        for (bi < f.block_count) {
+            val blk: *mir.MirBlock = ?f.blocks[bi];
+            var write: u32 = 0;
+            var read:  u32 = 0;
+            for (read < blk.instr_count) {
+                val mi: *mir.MirInstr = ?blk.instrs[read];
+                if (is_dead_mov(tgt, ctx, mi, reads, nv)) {
+                    # the move never reaches encode; release its operand array.
+                    if (mi.operands != nil && mi.operand_count > 0) {
+                        A.deallocate[mir.MirOperand](ctx.alloc, mi.operands, mi.operand_count::usize);
+                    }
+                    changed = true;
+                } or {
+                    if (write != read) { blk.instrs[write] = blk.instrs[read]; }
+                    write = write + 1;
+                }
+                read = read + 1;
+            }
+            blk.instr_count = write;
+            bi = bi + 1;
+        }
+    }
+
+    A.deallocate[u32](ctx.alloc, reads, nv::usize);
+    ret R.ok[bool, str](true);
+}
+
+# record each vreg's copy-source allocation hint.
+#
+# For every vreg first defined by a plain register copy, remember the copy's source
+# (a physical register for `MOV v <- preg`, or a vreg for `MOV v <- v2`) and the
+# copy's flat position, so the scan can bias `v`'s color toward the source. Walks
+# the flat stream so the position is in hand and first-def-wins is first in scan
+# order: a vreg defined by copies on several paths (phi merges) can coalesce onto
+# only one source under the one-merged-range-per-vreg model, so the earliest
+# defining copy sets the hint. A self-copy or immediate source yields no register
+# hint. Runs after flatten / liveness so `flat_instr` and the ranges are available.
+fun build_hints(tgt: *target.Target, ctx: *AllocCtx) {
+    if (tgt.arch.is_reg_move == nil) { ret; }
+    val nv: u32 = ctx.f.vreg_count;
+    var pos: u32 = 0;
+    for (pos < ctx.flat_count) {
+        val mi: *mir.MirInstr = flat_instr(ctx, pos);
+        if (instr_is_reg_copy(tgt, mi)) {
+            val d: *mir.MirOperand = ?mi.operands[0];
+            if (d.kind == mir.MIR_OP_VREG && d.vreg < nv
+                && ctx.hints[d.vreg].src_vreg == mir.MIR_VREG_NIL
+                && ctx.hints[d.vreg].src_preg < 0) {
+                val s: *mir.MirOperand = ?mi.operands[1];
+                if (s.kind == mir.MIR_OP_VREG && s.vreg != d.vreg) {
+                    ctx.hints[d.vreg].src_vreg = s.vreg;
+                    ctx.hints[d.vreg].copy_pos = pos::i64;
+                } or (s.kind == mir.MIR_OP_PREG) {
+                    ctx.hints[d.vreg].src_preg = s.preg::i32;
+                    ctx.hints[d.vreg].copy_pos = pos::i64;
+                }
+            }
+        }
+        pos = pos + 1;
+    }
+}
+
 # solve per-block live-in/live-out by a backward dataflow
 # fixpoint over the RPO block order, then extend each vreg's range to span every
 # block in which it is live so values crossing a loop back edge are covered.
@@ -1095,7 +1319,18 @@ fun extend_liveness(ctx: *AllocCtx) R.Result[bool, str] {
         }
     }
 
-    # extend ranges to cover blocks where the vreg is live-in or live-out.
+    # extend ranges over the blocks a vreg spans, tightly. a live-IN value occupies
+    # its register from block entry, so its start extends back to the block's first
+    # position; a live-OUT value must hold its register through the terminator, so
+    # its end extends forward to the block's last position. the two are separate: a
+    # value live-in but not live-out dies at its last in-block use (already in
+    # end_pos from build_ranges) and its end is NOT pushed to the block end, and a
+    # value live-out but not live-in is born at its in-block def and its start is NOT
+    # pulled to the block start. dropping those phantom tails / heads removes the
+    # false interference they create with a precolored def elsewhere in the block
+    # (e.g. a return-register move the merged value is itself the source of), which a
+    # coalescing hint must not be blocked by. a loop-carried value is live-in AND
+    # live-out of its blocks, so both bounds still extend and the loop stays covered.
     var bi: u32 = 0;
     for (bi < nb) {
         val span: BlockSpan = ctx.block_spans[bi];
@@ -1103,11 +1338,9 @@ fun extend_liveness(ctx: *AllocCtx) R.Result[bool, str] {
         var v: u32 = 0;
         for (v < nv) {
             val idx: usize = base + v::usize;
-            if (live_in[idx] || live_out[idx]) {
-                val lr: *LiveRange = ?ctx.ranges[v];
-                if (span.start >= 0 && span.start < lr.start) { lr.start = span.start; }
-                if (span.end > lr.end_pos)                    { lr.end_pos = span.end; }
-            }
+            val lr: *LiveRange = ?ctx.ranges[v];
+            if (live_in[idx] && span.start >= 0 && span.start < lr.start) { lr.start = span.start; }
+            if (live_out[idx] && span.end > lr.end_pos)                   { lr.end_pos = span.end; }
             v = v + 1;
         }
         bi = bi + 1;
@@ -1362,10 +1595,18 @@ fun linear_scan(tgt: *target.Target, ctx: *AllocCtx) R.Result[bool, str] {
         ctx.cur_end   = lr.end_pos;
 
         var preg: i32 = -1;
-        if (lr.reg_class == REG_CLASS_GP) {
-            preg = pick_gp(ctx, lr.crosses_call);
-        } or {
-            preg = pick_fp(ctx, lr.crosses_call);
+        # prefer the copy-source register when a hint can be honored, so the
+        # defining copy collapses to a self-move dropped at rewrite; otherwise fall
+        # back to the normal class pick.
+        if (ctx.hints[v].src_vreg != mir.MIR_VREG_NIL || ctx.hints[v].src_preg >= 0) {
+            preg = pick_hint(ctx, v, lr);
+        }
+        if (preg < 0) {
+            if (lr.reg_class == REG_CLASS_GP) {
+                preg = pick_gp(ctx, lr.crosses_call);
+            } or {
+                preg = pick_fp(ctx, lr.crosses_call);
+            }
         }
 
         if (preg >= 0) {
@@ -1634,15 +1875,27 @@ fun vreg_has_slot(ctx: *AllocCtx, v: u32) bool {
     ret ctx.vreg_slot_flag[v];
 }
 
-# insertion-sort vreg ids in `order` by ascending range start,
-# the order linear scan walks them in.
+# true when range `a` sorts before range `b` in scan order -
+# ascending start, then ascending end to break ties. the end tie-break colors a
+# shorter range before a longer one that begins at the same position, so a copy
+# source (which dies at the copy) is colored before the copy destination whose
+# merged range the liveness pass extended back to the same start; the destination's
+# allocation hint then sees the source's assignment and can coalesce onto it.
+fun range_sorts_before(ctx: *AllocCtx, a: u32, b: u32) bool {
+    val sa: i64 = ctx.ranges[a].start;
+    val sb: i64 = ctx.ranges[b].start;
+    if (sa != sb) { ret sa < sb; }
+    ret ctx.ranges[a].end_pos < ctx.ranges[b].end_pos;
+}
+
+# insertion-sort vreg ids in `order` by ascending range start, then
+# ascending end, the order linear scan walks them in.
 fun sort_by_start(ctx: *AllocCtx, order: *u32, count: u32) {
     var i: u32 = 1;
     for (i < count) {
         val key: u32 = order[i];
-        val ks: i64 = ctx.ranges[key].start;
         var j: i64 = i::i64 - 1;
-        for (j >= 0 && ctx.ranges[order[j::u32]].start > ks) {
+        for (j >= 0 && range_sorts_before(ctx, key, order[j::u32])) {
             order[(j + 1)::u32] = order[j::u32];
             j = j - 1;
         }
@@ -1683,6 +1936,94 @@ fun free_assigned(ctx: *AllocCtx, v: u32) {
     } or {
         if (index < ctx.fp_count) { ctx.fp_busy[index] = false; }
     }
+}
+
+# try to color vreg `v` onto its copy-source register so the defining
+# copy collapses to a dropped self-move.
+#
+# The allocation-hint half of issue #1801. Returns the composite register id to
+# assign (with the bank's busy flag already claimed), or -1 when the hint cannot be
+# honored - the classic advisory linear-scan extension, so an unhonorable hint
+# never affects correctness. A hint is honored only when the register passes every
+# check the normal pick applies to `v`'s range (not reserved, not held by an
+# outgoing-argument or precolored-def window, not pinned for a different capture),
+# and either is free or is held solely by the copy's source vreg dying exactly at
+# this copy - in which case the register is transferred from source to destination,
+# since a source read at the same position it is overwritten provably never
+# coexists with the destination. A call-crossing range is never hinted onto a
+# caller-saved register: coalescing the copy there would only force a spill/reload
+# around the call, so the normal callee-saved-preferring pick is left to run.
+fun pick_hint(ctx: *AllocCtx, v: u32, lr: *LiveRange) i32 {
+    val h: *CopyHint = ?ctx.hints[v];
+
+    # resolve the hinted composite register id from the recorded copy source.
+    var rid: i32 = -1;
+    if (h.src_preg >= 0) {
+        rid = h.src_preg;
+    } or (h.src_vreg != mir.MIR_VREG_NIL) {
+        val s: u32 = h.src_vreg;
+        if (s < ctx.f.vreg_count && !is_spilled(ctx, s) && !vreg_has_slot(ctx, s)) {
+            val a: u32 = ctx.f.vregs[s].assigned;
+            if (a != mir.MIR_VREG_NIL) { rid = a::i32; }
+        }
+    }
+    if (rid < 0) { ret -1; }
+
+    val rclass: i32 = isa.regid_class(rid);
+    val idx: u32 = isa.regid_index(rid)::u32;
+
+    if (lr.reg_class == REG_CLASS_GP) {
+        if (rclass != isa.REG_CLASS_ID_GP) { ret -1; }
+        if (idx >= ctx.gp_count)           { ret -1; }
+        if (ctx.reserved[idx])             { ret -1; }
+        if (lr.crosses_call && !ctx.callee_saved[idx]) { ret -1; }
+        if (arg_reg_reserved(ctx, rid::u32)) { ret -1; }
+        if (def_reg_reserved(ctx, rid::u32)) { ret -1; }
+        # a pin blocks the register unless it ends exactly at this def - i.e. it is
+        # the pin protecting the incoming param register until this very capture.
+        if (ctx.pinned_end[idx] >= 0 && ctx.pinned_end[idx] != lr.start) { ret -1; }
+        if (!ctx.gp_busy[idx]) {
+            ctx.gp_busy[idx] = true;
+            ret rid;
+        }
+        # busy: honor only by transferring the register from the copy source when
+        # that source vreg dies exactly at the copy (its last use is the read this
+        # move performs), so source and destination provably never coexist even
+        # though the destination's extended range overlaps the source. remove_active
+        # drops the source from the active set while its busy flag stays set, so the
+        # register passes intact to the destination.
+        if (source_dies_at_copy(ctx, h)) {
+            remove_active(ctx, h.src_vreg);
+            ret rid;
+        }
+        ret -1;
+    } or {
+        if (rclass != isa.REG_CLASS_ID_XMM) { ret -1; }
+        if (idx >= ctx.fp_count)            { ret -1; }
+        if (lr.crosses_call && (ctx.fp_callee_saved == nil || !ctx.fp_callee_saved[idx])) { ret -1; }
+        if (arg_reg_reserved(ctx, rid::u32)) { ret -1; }
+        if (def_reg_reserved(ctx, rid::u32)) { ret -1; }
+        if (ctx.fp_pinned_end != nil && ctx.fp_pinned_end[idx] >= 0 && ctx.fp_pinned_end[idx] != lr.start) { ret -1; }
+        if (!ctx.fp_busy[idx]) {
+            ctx.fp_busy[idx] = true;
+            ret rid;
+        }
+        if (source_dies_at_copy(ctx, h)) {
+            remove_active(ctx, h.src_vreg);
+            ret rid;
+        }
+        ret -1;
+    }
+}
+
+# true when a copy hint's source is a vreg whose last use is the copy
+# itself - the register it currently holds may then be handed to the copy's
+# destination, since the source is read at the same instruction it dies at and can
+# never coexist with the destination the copy defines.
+fun source_dies_at_copy(ctx: *AllocCtx, h: *CopyHint) bool {
+    if (h.src_vreg == mir.MIR_VREG_NIL) { ret false; }
+    if (h.copy_pos < 0)                 { ret false; }
+    ret ctx.ranges[h.src_vreg].end_pos == h.copy_pos;
 }
 
 # choose a free general-purpose register, preferring caller-saved for a
@@ -2552,6 +2893,23 @@ fun rewrite_instr(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
             }
         }
         k = k + 1;
+    }
+
+    # drop a coalesced copy: a full-width register move whose operands rewrote to
+    # the same physical register is a no-op, so the hint that colored destination
+    # onto source has erased the copy. only when the destination was not spilled (a
+    # spilled destination still owes its store) and only at the full machine word,
+    # since a sub-word `mov` zero-extends and dropping it would skip that clear.
+    if (store_dst_vreg == mir.MIR_VREG_NIL
+        && mi.width >= ctx.spill_width
+        && instr_is_reg_copy(tgt, mi)
+        && ops[0].kind == mir.MIR_OP_PREG && ops[1].kind == mir.MIR_OP_PREG
+        && ops[0].preg == ops[1].preg) {
+        free_ops(ctx, ops, n);
+        if (mi.operands != nil && mi.operand_count > 0) {
+            A.deallocate[mir.MirOperand](ctx.alloc, mi.operands, mi.operand_count::usize);
+        }
+        ret R.ok[bool, str](true);
     }
 
     # the rewritten instruction itself. the operation width / source width are
