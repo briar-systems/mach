@@ -51,6 +51,11 @@ A verbosity flag (`-v`/`-vv`) and `--quiet` together is a parse error.
 | `--no-emit-ir`   | —                | force per-module IR emission off, overriding the profile's `emit_ir` |
 | `--verify-ir`    | —                | run the IR verifier after each optimisation pass |
 
+> Under `mach test`, the entry module's `--emit-ir` dump shows the neutralized
+> project `main` the test dispatcher substitutes for the real entry (the final IR
+> that build is made from), so it differs from the same module's `mach build`
+> dump. That divergence is expected.
+
 > `mach dep` and `mach init` do not use the shared config parser; they read only
 > their own flags listed below.
 
