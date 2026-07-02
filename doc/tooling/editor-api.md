@@ -55,7 +55,11 @@ cached `Ast` / `ResolveResult`, so the next `parse` / `resolve` recomputes.
 
 `diagnostics` runs `tokenize → emit-lex-errors → parse` and returns the
 session `DiagList`. Each `diag.Diagnostic` carries `(severity, file_id, span,
-message, note)`. Map each `span` to a position with `source.position`:
+message, note, help, related)`: `note` and `help` are optional secondary lines
+(a suggestion rides `help`, rendered `= help:`), and `related` is an optional
+secondary span (`file_id`, `span`, `label`) at an unrelated location, absent
+when `related.label` is nil. Map each `span` to a position with
+`source.position`:
 
 ```mach
 val list: *diag.DiagList = unwrap_ok[...](editor.diagnostics(?es, fid));
