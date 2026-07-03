@@ -53,12 +53,14 @@ entry = "hello_win.mach"   # overrides the artifact's entry for this target only
 libs  = ["user32.dll"]     # appended to the merged link overlay
 
 [profile.debug]            # a build variant
-opt = 0                    # 0 (no optimization) | 1 (standard) | 2 (aggressive)
+opt   = 0                  # 0 (no optimization) | 1 (standard) | 2 (aggressive)
+debug = true               # emit debug info for this profile (default false)
 
 [profile.release]
 opt      = 2
 emit_ir  = true            # emit per-module post-pipeline IR for this profile (default false)
 emit_asm = false           # emit per-module assembly for this profile (default false)
+debug    = false           # release-with-symbols: set true to keep debug info in a release profile
 
 [deps.mach-std]            # a dependency: exactly one of git|path, plus ref for git
 git = "https://github.com/briar-systems/mach-std"
@@ -145,11 +147,15 @@ toggles live here because they are variant concerns.
 | `opt`      | integer | — (debug) | Optimization level: `0` (no optimization beyond the always-on pipeline), `1` (standard), or `2` (aggressive). `1` and `2` currently select the same pass set; `2` is where future loop/vectorization work lands. Any other integer — or a non-integer — is a manifest error (`profile '<name>': opt must be 0, 1, or 2`). |
 | `emit_ir`  | bool    | `false` | Write per-module SSA IR dumps under the `ir` template for this profile — the final post-pipeline IR the object is built from, so it varies with `opt`. |
 | `emit_asm` | bool    | `false` | Write per-module assembly dumps under the `asm` template for this profile. |
+| `debug`    | bool    | `false` | Emit debug info (DWARF on ELF/Mach-O, CodeView on COFF) for this profile. Declare it once so a project ships symbols without passing a flag every build, or set it on a release profile for release-with-symbols. A non-boolean value is a manifest error (`profile '<name>': debug must be a boolean`). Gates emission only, never the optimizer. |
 
 A CLI `-O0` / `-O1` / `-O2` / `--release` flag overrides the selected profile's
 `opt` per invocation, and `--emit-ir` / `--emit-asm` / `--no-emit-ir` /
-`--no-emit-asm` override the emission toggles. Absent `--profile`/`--release`, the
-first declared profile is used; with no profile declared, a `debug` default (no
+`--no-emit-asm` override the emission toggles. A CLI `-g` forces `debug` on for one
+invocation regardless of the selected profile's key (precedence `-g` > profile >
+off); there is no flag to force it off over a `debug = true` profile — edit the
+manifest or select another profile. Absent `--profile`/`--release`, the first
+declared profile is used; with no profile declared, a `debug` default (no
 optimization, no emission) applies.
 
 ## `[deps.<alias>]`
