@@ -105,6 +105,50 @@ pub rec DbgVar {
     scope: u32;
 }
 
+# add the op's `arg` to the operand value
+pub val DBG_OP_PLUS_CONST:  u8 = 0;
+# subtract the op's `arg` from the operand value
+pub val DBG_OP_MINUS_CONST: u8 = 1;
+
+# one step of a debug-location expression, applied to an OP_DBG_VALUE operand to
+# recover the source variable's value after the instruction that defined the operand
+# was folded away (`%c = add %a, 4` deleted -> operand rebased to %a, expression
+# gains a +4 step). the op set is deliberately small and extensible: each -g location
+# emitter maps a step to its own encoding (a DWARF DW_OP_plus_uconst / minus, a
+# CodeView defrange adjust).
+# ---
+# op:  DBG_OP_* selector
+# arg: the step's u64 immediate (the folded constant's bit pattern)
+pub rec DbgOp {
+    op:  u8;
+    arg: u64;
+}
+
+# a DbgExprId of DBG_EXPR_IDENTITY names the empty expression: the OP_DBG_VALUE
+# operand is the variable's value verbatim, with no steps to apply. it owns no pool
+# slot, so a function that never salvages allocates no expression storage.
+pub val DBG_EXPR_IDENTITY: DbgExprId = 0;
+
+# an index identifying the debug-location expression an OP_DBG_VALUE applies to its
+# operand. DBG_EXPR_IDENTITY (0) is the empty expression and owns no slot; every
+# other id is 1-based into the owning function's `dbg_exprs` pool.
+pub def DbgExprId: u32;
+
+# a debug-location expression: the steps applied base-first to an OP_DBG_VALUE
+# operand to recover the source variable's value. this is the emitter-facing seam --
+# the -g location emitters (DWARF loclists, CodeView defranges) read one shared,
+# format-agnostic pool per function (Function.dbg_exprs) rather than each re-deriving
+# recovery math. an empty `ops` is the identity expression.
+# ---
+# ops:      the expression steps, applied in order (owned)
+# op_count: number of live steps
+# op_cap:   allocated capacity of `ops` (the true allocation size freed at teardown)
+pub rec DbgExpr {
+    ops:      *DbgOp;
+    op_count: u32;
+    op_cap:   u32;
+}
+
 # a basic block: an ordered instruction list ending in exactly one terminator,
 # plus its phi nodes and predecessor list.
 # ---
@@ -167,6 +211,13 @@ pub rec Block {
 #              void return or an unrecovered type
 # asm_blocks:  OP_ASM instruction id -> IrAsm payload map
 # dbg_vars:    OP_DBG_VALUE instruction id -> DbgVar source-variable identity map
+# dbg_exprs:   debug-location expression pool; a DbgExprId is 1-based into it
+#              (DBG_EXPR_IDENTITY owns no slot). the optimizer's dce salvage grows it,
+#              the -g location emitters consume it (#1696); owned
+# dbg_expr_len: number of live expressions in the pool
+# dbg_expr_cap: allocated capacity of `dbg_exprs`
+# dbg_expr_ids: OP_DBG_VALUE instruction id -> the DbgExprId it applies to its
+#              operand; an absent entry means DBG_EXPR_IDENTITY
 pub rec Function {
     name:        intern.StrId;
     sig:         type.IrTypeId;
@@ -191,6 +242,11 @@ pub rec Function {
 
     asm_blocks:  map.Map[id.InstructionId, IrAsm];
     dbg_vars:    map.Map[id.InstructionId, DbgVar];
+
+    dbg_exprs:    *DbgExpr;
+    dbg_expr_len: u32;
+    dbg_expr_cap: u32;
+    dbg_expr_ids: map.Map[id.InstructionId, DbgExprId];
 }
 
 # a module-level global data declaration.
@@ -271,6 +327,8 @@ val INITIAL_GLOBAL_CAP:      u32 = 8;   # globals array (allocated eagerly by in
 val INITIAL_INSTR_CAP:       u32 = 64;  # a function's instruction pool
 val INITIAL_BLOCK_LIST_CAP:  u32 = 4;   # block instr / phi / pred lists and the block array
 val INITIAL_PHI_OPERAND_CAP: u32 = 4;   # a phi's operand list
+val INITIAL_DBG_EXPR_CAP:    u32 = 4;   # a function's debug-location expression pool
+val INITIAL_DBG_OP_CAP:      u32 = 4;   # one debug-location expression's op list
 
 # construct an empty IR module with an initialized type table and no functions,
 # globals, or init function.
@@ -406,6 +464,21 @@ fun function_dnit(m: *Module, fn: *Function) {
     map.dnit[id.InstructionId, IrAsm](?fn.asm_blocks);
     # DbgVar owns no heap storage, so the map's own teardown suffices.
     map.dnit[id.InstructionId, DbgVar](?fn.dbg_vars);
+
+    # each pooled expression owns its ops array; free those, then the pool and the
+    # per-point id map (a DbgExprId owns no heap storage).
+    var e: u32 = 0;
+    for (e < fn.dbg_expr_len) {
+        val dex: *DbgExpr = ?fn.dbg_exprs[e];
+        if (dex.ops != nil && dex.op_cap > 0) {
+            A.deallocate[DbgOp](m.alloc, dex.ops, dex.op_cap::usize);
+        }
+        e = e + 1;
+    }
+    if (fn.dbg_exprs != nil && fn.dbg_expr_cap > 0) {
+        A.deallocate[DbgExpr](m.alloc, fn.dbg_exprs, fn.dbg_expr_cap::usize);
+    }
+    map.dnit[id.InstructionId, DbgExprId](?fn.dbg_expr_ids);
 }
 
 # free one block's owned instruction, phi, and predecessor arrays.
@@ -484,6 +557,10 @@ pub fun function_add(m: *Module, name: intern.StrId, sig: type.IrTypeId, flags: 
     f.ret_sem     = semtype.TYPE_NIL;
     f.asm_blocks  = map.init[id.InstructionId, IrAsm](m.alloc, map.hash_u32, map.eq_u32);
     f.dbg_vars    = map.init[id.InstructionId, DbgVar](m.alloc, map.hash_u32, map.eq_u32);
+    f.dbg_exprs    = nil;
+    f.dbg_expr_len = 0;
+    f.dbg_expr_cap = 0;
+    f.dbg_expr_ids = map.init[id.InstructionId, DbgExprId](m.alloc, map.hash_u32, map.eq_u32);
     m.functions[idx] = f;
     m.function_len   = m.function_len + 1;
     ret R.ok[u32, str](idx);
@@ -633,6 +710,108 @@ pub fun phi_append_incoming(m: *Module, phi: *instruction.Instruction, pred: id.
     phi.operands[phi.operand_count]     = R.unwrap_ok[value.Value, str](res_target);
     phi.operands[phi.operand_count + 1] = incoming;
     phi.operand_count = needed;
+    ret R.ok[bool, str](true);
+}
+
+# the DbgExprId the OP_DBG_VALUE `iid` applies to its operand, or DBG_EXPR_IDENTITY
+# when none is recorded. the single lookup the salvage path and the -g location
+# emitters share.
+# ---
+# fn:  the owning function
+# iid: an OP_DBG_VALUE instruction id
+# ret: the recorded DbgExprId, or DBG_EXPR_IDENTITY if absent
+pub fun dbg_expr_id(fn: *Function, iid: id.InstructionId) DbgExprId {
+    var key: id.InstructionId = iid;
+    val res: R.Result[*DbgExprId, str] = map.get[id.InstructionId, DbgExprId](?fn.dbg_expr_ids, ?key);
+    if (R.is_err[*DbgExprId, str](res)) { ret DBG_EXPR_IDENTITY; }
+    val p: *DbgExprId = R.unwrap_ok[*DbgExprId, str](res);
+    ret @p;
+}
+
+# a pointer to the pooled expression `eid` names, or none for DBG_EXPR_IDENTITY (the
+# empty expression owns no slot) or an out-of-range id. the accessor through which
+# the -g location emitters read an expression's recovery steps.
+# ---
+# fn:  the owning function
+# eid: the expression id to resolve
+# ret: some(*DbgExpr) for a live pooled expression, none for identity / out of range
+pub fun dbg_expr_get(fn: *Function, eid: DbgExprId) O.Option[*DbgExpr] {
+    if (eid == DBG_EXPR_IDENTITY) { ret O.none[*DbgExpr](); }
+    val idx: u32 = eid::u32 - 1;
+    if (idx >= fn.dbg_expr_len)   { ret O.none[*DbgExpr](); }
+    ret O.some[*DbgExpr](?fn.dbg_exprs[idx]);
+}
+
+# append a fresh, empty expression to `fn`'s pool and record it as the expression
+# OP_DBG_VALUE `iid` applies to its operand, returning its DbgExprId (>= 1). salvage
+# calls this the first time it rewrites a dbg-value's defining instruction; each
+# pooled expression has exactly one referencing OP_DBG_VALUE, so a later prepend into
+# it is unshared.
+# ---
+# m:   module owning the allocator
+# fn:  the function whose pool grows
+# iid: the OP_DBG_VALUE the new expression binds to
+# ret: the new DbgExprId, or an allocation error
+pub fun dbg_expr_new(m: *Module, fn: *Function, iid: id.InstructionId) R.Result[DbgExprId, str] {
+    if (fn.dbg_expr_len >= fn.dbg_expr_cap) {
+        var new_cap: u32 = fn.dbg_expr_cap * 2;
+        if (new_cap < INITIAL_DBG_EXPR_CAP) { new_cap = INITIAL_DBG_EXPR_CAP; }
+        val res_grow: R.Result[*DbgExpr, str] =
+            A.reallocate[DbgExpr](m.alloc, fn.dbg_exprs, fn.dbg_expr_cap::usize, new_cap::usize);
+        if (R.is_err[*DbgExpr, str](res_grow)) {
+            ret R.err[DbgExprId, str](R.unwrap_err[*DbgExpr, str](res_grow));
+        }
+        fn.dbg_exprs    = R.unwrap_ok[*DbgExpr, str](res_grow);
+        fn.dbg_expr_cap = new_cap;
+    }
+    val idx: u32 = fn.dbg_expr_len;
+    fn.dbg_exprs[idx].ops      = nil;
+    fn.dbg_exprs[idx].op_count = 0;
+    fn.dbg_exprs[idx].op_cap   = 0;
+    fn.dbg_expr_len = fn.dbg_expr_len + 1;
+
+    val eid: DbgExprId = (idx + 1)::DbgExprId;
+    val res_ins: R.Result[bool, str] = map.insert[id.InstructionId, DbgExprId](?fn.dbg_expr_ids, iid, eid);
+    if (R.is_err[bool, str](res_ins)) {
+        ret R.err[DbgExprId, str](R.unwrap_err[bool, str](res_ins));
+    }
+    ret R.ok[DbgExprId, str](eid);
+}
+
+# prepend a step to expression `eid` (base-first order), growing its op array as
+# needed. salvage prepends because a newly folded instruction sits closer to the
+# operand than the steps already recorded: the surviving base is mapped back to the
+# old operand before the earlier recovery runs.
+# ---
+# m:   module owning the allocator
+# fn:  the owning function
+# eid: the expression to extend (>= 1)
+# op:  the step to prepend
+# ret: ok(true), or an allocation error
+pub fun dbg_expr_prepend_op(m: *Module, fn: *Function, eid: DbgExprId, op: DbgOp) R.Result[bool, str] {
+    val opt: O.Option[*DbgExpr] = dbg_expr_get(fn, eid);
+    if (O.is_none[*DbgExpr](opt)) { ret R.err[bool, str]("dbg_expr_prepend_op: invalid expression id"); }
+    val dex: *DbgExpr = O.unwrap[*DbgExpr](opt);
+
+    if (dex.op_count >= dex.op_cap) {
+        var new_cap: u32 = dex.op_cap * 2;
+        if (new_cap < INITIAL_DBG_OP_CAP) { new_cap = INITIAL_DBG_OP_CAP; }
+        val res_grow: R.Result[*DbgOp, str] =
+            A.reallocate[DbgOp](m.alloc, dex.ops, dex.op_cap::usize, new_cap::usize);
+        if (R.is_err[*DbgOp, str](res_grow)) {
+            ret R.err[bool, str](R.unwrap_err[*DbgOp, str](res_grow));
+        }
+        dex.ops    = R.unwrap_ok[*DbgOp, str](res_grow);
+        dex.op_cap = new_cap;
+    }
+
+    var i: u32 = dex.op_count;
+    for (i > 0) {
+        dex.ops[i] = dex.ops[i - 1];
+        i = i - 1;
+    }
+    dex.ops[0]   = op;
+    dex.op_count = dex.op_count + 1;
     ret R.ok[bool, str](true);
 }
 
