@@ -20,6 +20,10 @@
 #                 for a cross-built target with no host runner (a freestanding
 #                 aarch64/riscv64 image on the x86_64 leg). the observable is a
 #                 constant, so the golden is the fact "it emitted".
+#
+# build-fails is a run-mode but not a producer: it asserts the compile is REJECTED
+# and takes the compiler's 'error:' diagnostic as the observable. it is handled in
+# run.sh (there is no artifact to run), noted here for discoverability.
 
 # the directory this file lives in (int/lib), used to find flat_loader.c. resolved
 # from the sourced path so it does not depend on run.sh's variables.
