@@ -1693,6 +1693,14 @@ rec PeLayout {
     have_pdata:  bool;
     have_reloc:  bool;
     sec_total:   u32;
+    # non-allocated debug sections (discardable), placed above the loaded sections;
+    # `debug_secs` is a caller-provided array of `debug_count` entries. a debug name
+    # longer than the 8-byte inline section-name field is emitted through the COFF
+    # string table at `strtab_off` (size `strtab_size`, 0 when every name fits inline).
+    debug_secs:  *PeSection;
+    debug_count: u32;
+    strtab_off:  usize;
+    strtab_size: usize;
 }
 
 # UnwindCode: one decoded x64 unwind operation - its prologue end offset, the
@@ -2110,7 +2118,8 @@ fun collect_function_unwind(segs: *of.LoadSegment, seg_count: u32, funcs: *of.Ex
 # in memory). returns the total file size.
 fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32,
                       dyn: *of.DynamicInfo, seg_secs: *PeSection,
-                      xdata_vsize: usize, pdata_vsize: usize) usize {
+                      xdata_vsize: usize, pdata_vsize: usize,
+                      debug: *of.Section, debug_count: u32, debug_secs: *PeSection) usize {
     lay.nimp      = func_import_count(dyn);
     lay.seg_secs  = seg_secs;
     lay.have_stub = lay.nimp > 0;
@@ -2118,15 +2127,20 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
     lay.have_xdata = xdata_vsize > 0;
     lay.have_pdata = pdata_vsize > 0;
     lay.have_reloc = dyn != nil && dyn.base_reloc_count > 0;
+    lay.debug_secs  = debug_secs;
+    lay.debug_count = debug_count;
+    lay.strtab_off  = 0;
+    lay.strtab_size = 0;
 
     # the synthesized section count: the linker segments, then the stub, idata, unwind,
-    # and base-relocation sections when present.
+    # and base-relocation sections when present, and one per non-allocated debug section.
     var nsec: u32 = seg_count;
     if (lay.have_stub)  { nsec = nsec + 1; }
     if (lay.have_idata) { nsec = nsec + 1; }
     if (lay.have_xdata) { nsec = nsec + 1; }
     if (lay.have_pdata) { nsec = nsec + 1; }
     if (lay.have_reloc) { nsec = nsec + 1; }
+    nsec = nsec + debug_count;
     lay.sec_total = nsec;
 
     # headers: DOS header + PE signature + COFF header + optional header + the
@@ -2266,6 +2280,32 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
         rva = rva + bin.align_up_u64(rsize::u64, PE_SECTION_ALIGN);
     }
 
+    # the non-allocated debug sections (read-only, discardable): each maps at an RVA
+    # above the loaded sections and carries file bytes the loader discards after
+    # load. a name longer than eight bytes is emitted through a trailing COFF string
+    # table (the section header names it "/<offset>").
+    var strtab_bytes: usize = 0;
+    var di: u32 = 0;
+    for (di < debug_count) {
+        rva = bin.align_up_u64(rva, PE_SECTION_ALIGN);
+        debug_secs[di].rva       = rva;
+        debug_secs[di].vsize     = debug[di].len::u64;
+        debug_secs[di].file_off  = file_off;
+        debug_secs[di].file_size = bin.align_up(debug[di].len::usize, PE_FILE_ALIGN::usize);
+        file_off = file_off + debug_secs[di].file_size;
+        rva = rva + bin.align_up_u64(debug[di].len::u64, PE_SECTION_ALIGN);
+        val nm: str = resolve(itn, debug[di].name);
+        if (name_in_strtab(nm)) { strtab_bytes = strtab_bytes + str_len(nm) + 1; }
+        di = di + 1;
+    }
+    # the COFF string table follows the section data (referenced by the header's
+    # PointerToSymbolTable, with zero symbols); only present when a name overflows.
+    if (strtab_bytes > 0) {
+        lay.strtab_off  = file_off;
+        lay.strtab_size = 4 + strtab_bytes;
+        file_off = file_off + lay.strtab_size;
+    }
+
     lay.image_size = bin.align_up_u64(rva, PE_SECTION_ALIGN);
     ret file_off;
 }
@@ -2346,15 +2386,26 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
         ret R.err[bool, str]("coff: PE emission is only implemented for x86-64");
     }
     if (seg_count == 0) { ret R.err[bool, str]("coff: no loadable segments"); }
-    # the of.ExecFn/DynExecFn debug-section channel (debug/debug_count) is accepted
-    # for seam conformance but not yet framed into the PE image; a `.debug_*` name
-    # exceeds the 8-byte inline section-name field and needs a COFF string table.
-    # tracked by #1887, gated on the Windows verification runner (#1698).
+    # the of.ExecFn/DynExecFn debug-section channel is framed into the PE image as
+    # non-loaded discardable sections below; native PE-loader / debugger verification
+    # is pending the Windows runner (#1698), and the structure round-trips in the
+    # of.coff parser unit test.
 
     var seg_secs: *PeSection = nil;
     val ssr: R.Result[*PeSection, str] = A.zallocate[PeSection](alloc, seg_count::usize);
     if (R.is_err[*PeSection, str](ssr)) { ret R.err[bool, str]("coff: segment layout alloc failed"); }
     seg_secs = R.unwrap_ok[*PeSection, str](ssr);
+
+    # per-debug-section layout (rva/file-offset); nil when there are no debug sections.
+    var debug_secs: *PeSection = nil;
+    if (debug_count > 0) {
+        val dsr: R.Result[*PeSection, str] = A.zallocate[PeSection](alloc, debug_count::usize);
+        if (R.is_err[*PeSection, str](dsr)) {
+            A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
+            ret R.err[bool, str]("coff: debug layout alloc failed");
+        }
+        debug_secs = R.unwrap_ok[*PeSection, str](dsr);
+    }
 
     var uw_all: *FunctionUnwind = nil;
     var uw_count: u32 = 0;
@@ -2363,6 +2414,7 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
     if (func_count > 0 && funcs != nil) {
         val ur: R.Result[*FunctionUnwind, str] = A.zallocate[FunctionUnwind](alloc, func_count::usize);
         if (R.is_err[*FunctionUnwind, str](ur)) {
+            if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
             A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
             ret R.err[bool, str]("coff: unwind table alloc failed");
         }
@@ -2384,10 +2436,12 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
     }
 
     var lay: PeLayout;
-    val total_size: usize = compute_pe_layout(itn, ?lay, segs, seg_count, dyn, seg_secs, xdata_vsize, pdata_vsize);
+    val total_size: usize = compute_pe_layout(itn, ?lay, segs, seg_count, dyn, seg_secs, xdata_vsize, pdata_vsize,
+                                              debug, debug_count, debug_secs);
 
     val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_size);
     if (R.is_err[*u8, str](res_buf)) {
+        if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
         A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
         if (uw_all != nil && func_count > 0) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
         ret R.err[bool, str]("coff: PE buffer alloc failed");
@@ -2403,6 +2457,26 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
         li = li + 1;
     }
 
+    # the debug section bytes and, when a name overflows the inline field, the COFF
+    # string table (4-byte length prefix, then each long name NUL-terminated).
+    var di: u32 = 0;
+    for (di < debug_count) {
+        if (debug[di].bytes != nil && debug[di].len > 0) {
+            memory.raw_copy((buf::usize + debug_secs[di].file_off)::ptr, debug[di].bytes::ptr, debug[di].len::usize);
+        }
+        di = di + 1;
+    }
+    if (lay.strtab_size > 0) {
+        var str_pos: usize = 4;
+        di = 0;
+        for (di < debug_count) {
+            val nm: str = resolve(itn, debug[di].name);
+            if (name_in_strtab(nm)) { str_pos = str_pos + bin.write_str(buf, lay.strtab_off + str_pos, nm); }
+            di = di + 1;
+        }
+        bin.write_u32_le(buf, lay.strtab_off, lay.strtab_size::u32);
+    }
+
     # synthesized sections: the import directory + IAT, then the import stubs that
     # jump through the IAT slots the import section owns.
     if (lay.have_idata)                   { write_pe_imports(itn, buf, ?lay, dyn); }
@@ -2415,6 +2489,7 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
     val fx_r: R.Result[bool, str] = patch_pe_fixups(buf, ?lay, dyn, fixups, fixup_count, segs, seg_count);
     if (R.is_err[bool, str](fx_r)) {
         A.deallocate[u8](alloc, buf, total_size);
+        if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
         A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
         if (uw_all != nil && func_count > 0) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
         ret R.err[bool, str](R.unwrap_err[bool, str](fx_r));
@@ -2423,8 +2498,9 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
     # the headers, then the section table. a position-independent image (Windows ASLR)
     # clears RELOCS_STRIPPED and sets DYNAMIC_BASE.
     val pie: bool = dyn != nil && dyn.pie;
-    write_pe_headers(buf, ?lay, segs, seg_count, entry, pie);
+    write_pe_headers(buf, ?lay, segs, seg_count, entry, pie, itn, debug, debug_count);
 
+    if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
     A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
     if (uw_all != nil && func_count > 0) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
 
@@ -2745,7 +2821,8 @@ fun write_pe_section_header(buf: *u8, pos: usize, name: str, sec: *PeSection, ch
 # 16 data directories), and the section table. the entry RVA is the program
 # entry vaddr relative to ImageBase. called last so the section RVAs/offsets the
 # layout fixed are known.
-fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32, entry: u64, pie: bool) {
+fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32, entry: u64, pie: bool,
+                     itn: *intern.Interner, debug: *of.Section, debug_count: u32) {
     # DOS header: 'MZ', e_lfanew (offset 0x3C) -> the PE signature. the rest of
     # the DOS stub is left zero - Windows reads only the magic and e_lfanew.
     buf[0] = 'M'; buf[1] = 'Z';
@@ -2760,7 +2837,9 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
     bin.write_u16_le(buf, ch, IMAGE_FILE_MACHINE_AMD64);
     bin.write_u16_le(buf, ch + 2, lay.sec_total::u16);
     bin.write_u32_le(buf, ch + 4, 0);
-    bin.write_u32_le(buf, ch + 8, 0);
+    # PointerToSymbolTable locates the trailing COFF string table (with zero symbols)
+    # that holds any long debug section name; 0 when every name fits inline.
+    bin.write_u32_le(buf, ch + 8, lay.strtab_off::u32);
     bin.write_u32_le(buf, ch + 12, 0);
     bin.write_u16_le(buf, ch + 16, OPTIONAL_HEADER_SIZE::u16);
     # a position-independent (ASLR) image carries base relocations, so RELOCS_STRIPPED is
@@ -2880,6 +2959,36 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
         write_pe_section_header(buf, pos, ".reloc", ?lay.reloc_sec,
             IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE);
         pos = pos + SECTION_HEADER_SIZE;
+    }
+
+    # the non-allocated debug sections: read-only, discardable initialized data. a
+    # name over eight bytes is written as "/<offset>" into the COFF string table,
+    # tracking the same accumulation order the string table was written in.
+    var str_pos: usize = 4;
+    var di: u32 = 0;
+    for (di < debug_count) {
+        val nm: str = resolve(itn, debug[di].name);
+        if (name_in_strtab(nm)) {
+            memory.raw_zero((buf::usize + pos)::ptr, 8);
+            buf[pos] = '/';
+            write_decimal(buf, pos + 1, 7, str_pos::u32);
+            str_pos = str_pos + str_len(nm) + 1;
+        }
+        or {
+            write_inline_name(buf, pos, nm);
+        }
+        bin.write_u32_le(buf, pos + 8, lay.debug_secs[di].vsize::u32);
+        bin.write_u32_le(buf, pos + 12, lay.debug_secs[di].rva::u32);
+        bin.write_u32_le(buf, pos + 16, lay.debug_secs[di].file_size::u32);
+        if (lay.debug_secs[di].file_size > 0) { bin.write_u32_le(buf, pos + 20, lay.debug_secs[di].file_off::u32); }
+        or                                    { bin.write_u32_le(buf, pos + 20, 0); }
+        bin.write_u32_le(buf, pos + 24, 0);
+        bin.write_u32_le(buf, pos + 28, 0);
+        bin.write_u16_le(buf, pos + 32, 0);
+        bin.write_u16_le(buf, pos + 34, 0);
+        bin.write_u32_le(buf, pos + 36, IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE);
+        pos = pos + SECTION_HEADER_SIZE;
+        di = di + 1;
     }
 }
 
@@ -4352,5 +4461,113 @@ test "mach.lang.target.of.coff.pe_iat_slot_rva:per_descriptor_range" {
     # must still resolve, so the same multiset laid in a different order holds too.
     counts[0] = 1; counts[1] = 2; counts[2] = 3; counts[3] = 6;
     if (!t_iat_slots_exact(?i, ?counts[0], 4)) { ret 1; }
+    ret 0;
+}
+
+# coff_emit_exec frames the linker's non-allocated debug sections as read-only
+# discardable PE sections above the loaded sections: a name that fits the 8-byte
+# field is written inline (`.debug$S`, the CodeView convention), and a longer name
+# (`.debug_info`) is written as "/<offset>" into a trailing COFF string table. the
+# section bytes round-trip. falsifies a writer that drops the channel, mis-flags a
+# section, or mishandles the long-name string table.
+fun ts_pe_debug_sections() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x90; k = k + 1; }
+    val base:  u64 = 0x140001000;
+    val entry: u64 = base;
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = base; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text_bytes[0];
+
+    var cv_bytes: [4]u8;
+    cv_bytes[0] = 0xDE; cv_bytes[1] = 0xAD; cv_bytes[2] = 0xBE; cv_bytes[3] = 0xEF;
+    var info_bytes: [3]u8;
+    info_bytes[0] = 0x11; info_bytes[1] = 0x22; info_bytes[2] = 0x33;
+
+    # ".debug$S" is exactly 8 bytes (inline); ".debug_info" is 11 (string table).
+    val nm_cv:   R.Result[intern.StrId, str] = intern.intern(?i, ".debug$S");
+    val nm_info: R.Result[intern.StrId, str] = intern.intern(?i, ".debug_info");
+    if (R.is_err[intern.StrId, str](nm_cv))   { ret 1; }
+    if (R.is_err[intern.StrId, str](nm_info)) { ret 1; }
+
+    var dbg: [2]of.Section;
+    dbg[0].name = R.unwrap_ok[intern.StrId, str](nm_cv);   dbg[0].kind = of.SK_DEBUG;
+    dbg[0].bytes = ?cv_bytes[0];   dbg[0].len = 4; dbg[0].align = 1;
+    dbg[1].name = R.unwrap_ok[intern.StrId, str](nm_info); dbg[1].kind = of.SK_DEBUG;
+    dbg[1].bytes = ?info_bytes[0]; dbg[1].len = 3; dbg[1].align = 1;
+
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "coff_dbg");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+
+    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1, 4096, entry,
+                                                 nil, 0, ?dbg[0], 2, filesystem.temp_path(?tf)::*u8, "coffdbg"::*u8);
+    if (R.is_err[bool, str](em)) { filesystem.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, filesystem.temp_path(?tf));
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_err[filesystem.Buffer, str](rb)) { ret 1; }
+    val buf: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rb);
+
+    val pe_off:   usize = bin.read_u32_le(buf.data, 0x3C)::usize;
+    val ch:       usize = pe_off + 4;
+    val nsec:     u32 = bin.read_u16_le(buf.data, ch + 2)::u32;
+    val opt_size: usize = bin.read_u16_le(buf.data, ch + 16)::usize;
+    val symtab:   usize = bin.read_u32_le(buf.data, ch + 8)::usize;   # -> string table
+    # one text section plus the two debug sections.
+    if (nsec != 3)   { ret 1; }
+    if (symtab == 0) { ret 1; }
+
+    # the string table holds the one long name ".debug_info" at offset 4.
+    val info_want: str = ".debug_info";
+    var j: usize = 0;
+    for (j < str_len(info_want)) { if (buf.data[symtab + 4 + j] != info_want[j]) { ret 1; } j = j + 1; }
+    if (buf.data[symtab + 4 + str_len(info_want)] != 0) { ret 1; }
+
+    val sec_table: usize = ch + 20 + opt_size;
+    var found_cv:   bool = false;
+    var found_info: bool = false;
+    var bad:        bool = false;
+    var s: u32 = 0;
+    for (s < nsec) {
+        val sh:    usize = sec_table + s::usize * SECTION_HEADER_SIZE;
+        val chars: u32 = bin.read_u32_le(buf.data, sh + 36);
+        if ((chars & IMAGE_SCN_MEM_DISCARDABLE) == 0) { s = s + 1; cnt; }
+        val vsize:  usize = bin.read_u32_le(buf.data, sh + 8)::usize;
+        val rawptr: usize = bin.read_u32_le(buf.data, sh + 20)::usize;
+
+        # ".debug$S": an inline 8-byte name; its bytes are 0xDEADBEEF.
+        if (buf.data[sh] == '.' && vsize == 4) {
+            found_cv = true;
+            if ((chars & IMAGE_SCN_MEM_READ) == 0) { bad = true; }
+            if (buf.data[rawptr] != 0xDE || buf.data[rawptr + 1] != 0xAD
+                || buf.data[rawptr + 2] != 0xBE || buf.data[rawptr + 3] != 0xEF) { bad = true; }
+        }
+        # ".debug_info": a "/offset" string-table name; its bytes are 0x112233.
+        if (buf.data[sh] == '/' && vsize == 3) {
+            found_info = true;
+            if (buf.data[rawptr] != 0x11 || buf.data[rawptr + 1] != 0x22 || buf.data[rawptr + 2] != 0x33) { bad = true; }
+        }
+        s = s + 1;
+    }
+
+    if (bad)         { ret 1; }
+    if (!found_cv)   { ret 1; }
+    if (!found_info) { ret 1; }
+    ret 0;
+}
+
+# coff_emit_exec carries non-allocated debug sections as discardable PE sections,
+# with long names resolved through the COFF string table.
+test "mach.lang.target.of.coff.coff_emit_exec:debug_sections_discardable" {
+    if (ts_pe_debug_sections() != 0) { ret 1; }
     ret 0;
 }
