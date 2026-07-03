@@ -70,6 +70,8 @@ pub rec EncoderOutput {
     symbol_count: u32;
     rows:         *LineRow;
     row_count:    u32;
+    varlocs:      *VarLoc;
+    varloc_count: u32;
 }
 
 # one retained PC<->source mapping: a `.text` byte offset and the source location of
@@ -94,6 +96,33 @@ pub rec LineRow {
     sec:         u32;
     loc:         source.SrcLoc;
 }
+
+# a source-variable location record: at `.text` offset `text_offset`, the variable
+# bound by OP_DBG_VALUE `iid` lives at the raw home `(kind, reg | off)`. The producer
+# joins `iid` to the IR variable identity and orders records by offset to build the
+# per-PC ranges of a `.debug_loclists` entry (#1705). `text_offset` / `sec` re-home
+# exactly like a LineRow (insert_text shift, site_placed re-home) so a range stays
+# correct across branch relaxation and `#[section]` excision.
+# ---
+# text_offset: `.text` byte offset where this binding becomes live
+# sec:         owning object-section index (re-homed from 0 by codegen)
+# iid:         source OP_DBG_VALUE instruction id (joins the IR dbg-var identity)
+# kind:        VARLOC_NONE / VARLOC_REG / VARLOC_FRAME
+# reg:         physical register id when kind == VARLOC_REG
+# off:         frame-base offset when kind == VARLOC_FRAME
+pub rec VarLoc {
+    text_offset: u32;
+    sec:         u32;
+    iid:         u32;
+    kind:        u8;
+    reg:         i32;
+    off:         i64;
+}
+
+# a variable-location record's home kind.
+pub val VARLOC_NONE:  u8 = 0;
+pub val VARLOC_REG:   u8 = 1;
+pub val VARLOC_FRAME: u8 = 2;
 
 # one relocation the encoder leaves for the object writer to resolve
 #
@@ -394,6 +423,9 @@ pub rec EncodeState {
     rows:        *LineRow;
     row_count:   u32;
     row_cap:     u32;
+    varlocs:     *VarLoc;
+    varloc_count: u32;
+    varloc_cap:  u32;
     interner:    *intern.Interner;
     abi:         *abi.AbiVTable;
     os:          *tos.OsVTable;
@@ -510,9 +542,11 @@ pub fun encode_driver(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirModul
     out.symbol_count = st.sym_count;
     out.rows         = st.rows;
     out.row_count    = st.row_count;
+    out.varlocs      = st.varlocs;
+    out.varloc_count = st.varloc_count;
 
-    # the text, symbol, relocation, and line-row arrays are transferred to the output;
-    # only the driver-internal fixup and block-offset arrays are released.
+    # the text, symbol, relocation, line-row, and varloc arrays are transferred to the
+    # output; only the driver-internal fixup and block-offset arrays are released.
     scratch_release(?st);
     ret R.ok[EncoderOutput, str](out);
 }
@@ -666,6 +700,75 @@ pub fun push_row(st: *EncodeState, text_offset: u32, loc: source.SrcLoc) R.Resul
     ret R.ok[bool, str](true);
 }
 
+# record a variable-location record for a MIR_DBG_VALUE marker at `text_offset`. The
+# marker's imm operands carry the bound value's vreg id (operand 0) and the source
+# OP_DBG_VALUE id (operand 1); the vreg's post-regalloc home (assigned register or
+# spill slot) becomes the raw home the producer maps to a DWARF location. A NIL vreg
+# or a vreg with neither home is an optimized-out binding (VARLOC_NONE), which the
+# producer renders as a gap. Called by each ISA encoder in place of emitting bytes.
+# ---
+# st:          the encode state
+# text_offset: `.text` offset where the binding becomes live
+# fn:          the MIR function owning the vreg (its vregs / frame give the home)
+# mi:          the MIR_DBG_VALUE marker
+# ret:         ok(true), or an allocation error
+pub fun push_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 2) { ret R.ok[bool, str](true); }
+    val vreg: u32 = mi.operands[0].imm::u32;
+    val iid:  u32 = mi.operands[1].imm::u32;
+
+    var kind: u8  = VARLOC_NONE;
+    var reg:  i32 = 0;
+    var off:  i64 = 0;
+    if (vreg != mir.MIR_VREG_NIL && vreg < fn.vreg_count) {
+        val vr: *mir.MirVReg = ?fn.vregs[vreg];
+        if (vr.assigned != mir.MIR_VREG_NIL) {
+            kind = VARLOC_REG;
+            reg  = vr.assigned::i32;
+        }
+        or (vr.spill_slot >= 0) {
+            var si: u32 = 0;
+            for (si < fn.frame.slot_count) {
+                if (fn.frame.slots[si].value == vreg) { kind = VARLOC_FRAME; off = fn.frame.slots[si].offset; }
+                si = si + 1;
+            }
+        }
+    }
+
+    if (st.varloc_count >= st.varloc_cap) {
+        val res_grow: R.Result[bool, str] = grow_varlocs(st);
+        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+    }
+    st.varlocs[st.varloc_count].text_offset = text_offset;
+    st.varlocs[st.varloc_count].sec         = 0;
+    st.varlocs[st.varloc_count].iid         = iid;
+    st.varlocs[st.varloc_count].kind        = kind;
+    st.varlocs[st.varloc_count].reg         = reg;
+    st.varlocs[st.varloc_count].off         = off;
+    st.varloc_count = st.varloc_count + 1;
+    ret R.ok[bool, str](true);
+}
+
+# grow the variable-location array, allocating it on first use.
+# ---
+# st:  the state whose varloc array is grown
+# ret: ok(true) once the array has room, or an allocation error
+fun grow_varlocs(st: *EncodeState) R.Result[bool, str] {
+    if (st.varlocs == nil) {
+        val res_alloc: R.Result[*VarLoc, str] = A.allocate[VarLoc](st.alloc, DRIVER_INIT_CAP::usize);
+        if (R.is_err[*VarLoc, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*VarLoc, str](res_alloc)); }
+        st.varlocs   = R.unwrap_ok[*VarLoc, str](res_alloc);
+        st.varloc_cap = DRIVER_INIT_CAP;
+        ret R.ok[bool, str](true);
+    }
+    val new_cap: u32 = st.varloc_cap * 2;
+    val res_realloc: R.Result[*VarLoc, str] = A.reallocate[VarLoc](st.alloc, st.varlocs, st.varloc_cap::usize, new_cap::usize);
+    if (R.is_err[*VarLoc, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*VarLoc, str](res_realloc)); }
+    st.varlocs   = R.unwrap_ok[*VarLoc, str](res_realloc);
+    st.varloc_cap = new_cap;
+    ret R.ok[bool, str](true);
+}
+
 # initialise an encode state with empty output arrays for one driver run
 # ---
 # st:    the state to populate in place
@@ -690,6 +793,9 @@ fun state_init(st: *EncodeState, alloc: *A.Allocator, m: *mir.MirModule, tgt: *t
     st.rows        = nil;
     st.row_count   = 0;
     st.row_cap     = 0;
+    st.varlocs     = nil;
+    st.varloc_count = 0;
+    st.varloc_cap  = 0;
     st.interner    = m.interner;
     st.abi         = tgt.abi;
     st.os          = tgt.os;
@@ -719,6 +825,12 @@ fun state_dnit(st: *EncodeState) {
     st.rows      = nil;
     st.row_count = 0;
     st.row_cap   = 0;
+    if (st.varlocs != nil && st.varloc_cap > 0) {
+        A.deallocate[VarLoc](st.alloc, st.varlocs, st.varloc_cap::usize);
+    }
+    st.varlocs      = nil;
+    st.varloc_count = 0;
+    st.varloc_cap   = 0;
     scratch_release(st);
 }
 
@@ -892,6 +1004,11 @@ pub fun insert_text(st: *EncodeState, pos: u32, nbytes: u32) R.Result[bool, str]
     for (wi < st.row_count) {
         if (st.rows[wi].text_offset >= pos) { st.rows[wi].text_offset = st.rows[wi].text_offset + nbytes; }
         wi = wi + 1;
+    }
+    var vli: u32 = 0;
+    for (vli < st.varloc_count) {
+        if (st.varlocs[vli].text_offset >= pos) { st.varlocs[vli].text_offset = st.varlocs[vli].text_offset + nbytes; }
+        vli = vli + 1;
     }
     ret R.ok[bool, str](true);
 }
