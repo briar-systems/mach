@@ -5,7 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.14.0] - 2026-07-03
+
+The incremental compilation back half and a hardening sweep. The full pipeline
+now runs through the query engine (lowering, codegen, and link cache per
+module), riscv64 becomes a self-hosting target with a byte-identical fixpoint
+after a critical phi-width miscompile fix, and the RELRO program completes:
+`.data.rel.ro` splits from read-only data, aarch64 images align to 64 KiB
+max-page-size, and the mach-std runtime treats re-protection failure as fatal.
+`mach check` is removed and `mach clean` added. Contains breaking CLI and
+test-collection changes - see Breaking. Built with mach 2.13.0.
 
 ### Breaking
 
