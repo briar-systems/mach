@@ -266,6 +266,7 @@ pub rec ModuleEntry {
     ir_module:         *ir.Module;
     object_image:      *of.ObjectImage;
     stable_id:         session.StableModuleId;
+    target_gated:      bool;
 }
 
 # load state for one module during DFS.
@@ -367,6 +368,11 @@ pub rec Project {
     opt_level:    pipeline.OptLevel;
     verify_ir:    bool;
     test_mode:    bool;
+
+    # set only while load_all_own_src loads orphan roots, so the load walk knows a
+    # top-level `$error` guard it reaches marks a target-gated orphan to exclude
+    # rather than the fatal build error a reachable module's guard stays (#1873).
+    loading_orphans: bool;
 }
 
 # seed capacities for the per-build growable arrays (module table, a module's pub
@@ -744,6 +750,19 @@ fun cmp_src_mod(a: *SrcMod, b: *SrcMod) i64 {
 # is enumerated, mapped to its FQN, sorted for determinism, and dfs_loaded; dfs_load
 # dedups by FQN, so the already-loaded entry closure re-loads as a no-op and only
 # the orphaned modules are added.
+# the number of modules excluded from this build as target-gated orphans (#1873).
+# `mach test` reports it as the per-run "skipped N target-gated modules" note so an
+# exclusion is never silent.
+pub fun count_target_gated(p: *Project) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        if ((?p.modules[i]).target_gated) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
 fun load_all_own_src(p: *Project) R.Result[bool, str] {
     val root_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.project_root);
     if (O.is_none[str](root_opt)) { ret R.err[bool, str]("project_root StrId not interned"); }
@@ -763,15 +782,21 @@ fun load_all_own_src(p: *Project) R.Result[bool, str] {
 
     sort.sort[SrcMod](mods.data, mods.len, cmp_src_mod);
 
+    # while these orphan roots load, a top-level `$error` guard reached on a live
+    # path flags its module target-gated (excluded from the test build) instead of
+    # firing as a fatal diagnostic (#1873).
+    p.loading_orphans = true;
     var i: usize = 0;
     for (i < mods.len) {
         val lr: R.Result[session.ModuleId, str] = dfs_load(p, mods.data[i].fqn);
         if (R.is_err[session.ModuleId, str](lr)) {
+            p.loading_orphans = false;
             vector.dnit[SrcMod](?mods);
             ret R.err[bool, str](R.unwrap_err[session.ModuleId, str](lr));
         }
         i = i + 1;
     }
+    p.loading_orphans = false;
     vector.dnit[SrcMod](?mods);
     ret R.ok[bool, str](true);
 }
@@ -1359,6 +1384,7 @@ fun init_project(p: *Project, s: *session.Session) {
     p.opt_level     = pipeline.OPT_DEBUG;
     p.verify_ir     = false;
     p.test_mode     = false;
+    p.loading_orphans = false;
 }
 
 # release every owned array a ProjectConfig holds (targets and their libs, deps,
@@ -2288,6 +2314,15 @@ fun dfs_load(p: *Project, fqn: intern.StrId) R.Result[session.ModuleId, str] {
 
     p.load_status[mid::u32] = LOAD_DONE;
 
+    # a target-gated orphan (its load-time `$error` guard fired under this target)
+    # is kept out of the topo set: resolve / sema / lower / codegen all walk topo,
+    # so the module is never touched and its guard never fires. it is excluded from
+    # test collection with a per-run note (#1873). nothing depends on an orphan, so
+    # leaving it out of topo is safe.
+    if ((?p.modules[mid::u32]).target_gated) {
+        ret R.ok[session.ModuleId, str](mid);
+    }
+
     val topo_r: R.Result[bool, str] = topo_push(p, mid);
     if (R.is_err[bool, str](topo_r)) { ret R.err[session.ModuleId, str](R.unwrap_err[bool, str](topo_r)); }
 
@@ -2358,6 +2393,7 @@ fun register_module_slot(p: *Project, fqn: intern.StrId) R.Result[session.Module
     m.sema_result       = nil;
     m.ir_module         = nil;
     m.object_image      = nil;
+    m.target_gated      = false;
     p.modules[p.module_len] = m;
     p.module_len = p.module_len + 1;
 
@@ -2934,7 +2970,47 @@ fun walk_one_decl_for_load(p: *Project, mid: session.ModuleId, did: id.DeclId) R
     if (d.kind == decl.DECL_KIND_VAL) {
         ret register_val_for_load(p, mid, d, did);
     }
+    if (d.kind == decl.DECL_KIND_COMPTIME_ATTR) {
+        ret walk_comptime_attr_for_load(p, mid, ?d.data.comptime_attr);
+    }
     ret R.ok[bool, str](true);
+}
+
+# a top-level comptime directive reached on a live path during an orphan's load walk.
+#
+# Only meaningful while load_all_own_src loads orphan roots: a reached `$error`
+# guard is the module's self-declaration that it is not compilable for the selected
+# target, so the module is flagged target-gated and later excluded from the test
+# build (#1873). The guard is not evaluated into a diagnostic here. A reachable
+# module (loading_orphans false) is left untouched, so sema keeps its live `$error`
+# a fatal build error.
+fun walk_comptime_attr_for_load(p: *Project, mid: session.ModuleId, ca: *decl.DeclComptimeAttr) R.Result[bool, str] {
+    if (!p.loading_orphans)       { ret R.ok[bool, str](true); }
+    if (ca.target == id.EXPR_NIL) { ret R.ok[bool, str](true); }
+
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    val src_opt: O.Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
+    if (O.is_none[*src.SourceFile](src_opt)) { ret R.err[bool, str]("module file_id not found in SourceMap"); }
+    val source: str = O.unwrap[*src.SourceFile](src_opt).text;
+
+    if (comptime.is_error_call(m.a, source, ca.target)) {
+        m.target_gated = true;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# propagate transitive target-gating across a load-time dependency edge.
+#
+# While loading orphan roots, a module that depends (`use` / `fwd`) on a
+# target-gated module is itself not compilable for the selected target — a
+# platform backend that imports its gated OS/ISA layer, say — so it is gated too
+# and excluded from the test build (#1873). Returns whether `mid` is now gated, so
+# the caller can skip work a to-be-excluded module does not need.
+fun propagate_target_gate(p: *Project, mid: session.ModuleId, dep_mid: session.ModuleId) bool {
+    if (!p.loading_orphans)                       { ret false; }
+    if (!(?p.modules[dep_mid::u32]).target_gated) { ret false; }
+    (?p.modules[mid::u32]).target_gated = true;
+    ret true;
 }
 
 # load-walk a `$if` chain: every some-target branch in union mode, else the first
@@ -3138,6 +3214,10 @@ fun walk_use_for_load(p: *Project, mid: session.ModuleId, du: *decl.DeclUse) R.R
     val record_r: R.Result[bool, str] = record_dep(p, mid, dep_mid);
     if (R.is_err[bool, str](record_r)) { ret record_r; }
 
+    # a gated dependency gates the importer too; it is excluded, so skip the pub
+    # const merge it no longer needs.
+    if (propagate_target_gate(p, mid, dep_mid)) { ret R.ok[bool, str](true); }
+
     if (du.alias.len > 0) {
         ret R.ok[bool, str](true);
     }
@@ -3172,7 +3252,12 @@ fun walk_fwd_for_load(p: *Project, mid: session.ModuleId, df: *decl.DeclFwd) R.R
     if (R.is_err[session.ModuleId, str](dep_r)) { ret R.err[bool, str](R.unwrap_err[session.ModuleId, str](dep_r)); }
     val dep_mid: session.ModuleId = R.unwrap_ok[session.ModuleId, str](dep_r);
 
-    ret record_dep(p, mid, dep_mid);
+    val record_r: R.Result[bool, str] = record_dep(p, mid, dep_mid);
+    if (R.is_err[bool, str](record_r)) { ret record_r; }
+
+    # forwarding a gated module's surface gates this module too (#1873).
+    propagate_target_gate(p, mid, dep_mid);
+    ret R.ok[bool, str](true);
 }
 
 # the resolution of a `use` path into the module to load plus
@@ -5217,6 +5302,145 @@ fun ut_build_multi(s: *session.Session, alloc: *A.Allocator, names: *str, texts:
     val pr: R.Result[Project, str] = build_project_union(s, root);
     filesystem.remove_all(alloc, root);
     ret pr;
+}
+
+# ut_build over build_project_test (the whole-source test loader), so the
+# target-gated-orphan exclusion (#1873) can be exercised. Scaffolds the src files,
+# builds the test Project, removes the temp tree, and returns it.
+fun ut_build_test(s: *session.Session, alloc: *A.Allocator, names: *str, texts: *str, n: u32) R.Result[Project, str] {
+    val root_r: R.Result[str, str] = ut_scaffold(alloc, names, texts, n);
+    if (R.is_err[str, str](root_r)) { ret R.err[Project, str](R.unwrap_err[str, str](root_r)); }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val rr: R.Result[bool, str] = setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { filesystem.remove_all(alloc, root); ret R.err[Project, str](R.unwrap_err[bool, str](rr)); }
+    var sel: manifest.Selection;
+    sel.target       = "";
+    sel.profile      = "";
+    sel.artifact     = "";
+    sel.want_lib     = false;
+    sel.has_artifact = false;
+    val pr: R.Result[Project, str] = build_project_test(s, root, ?sel);
+    filesystem.remove_all(alloc, root);
+    ret pr;
+}
+
+# the target_gated flag of module `fqn` in project `p` (false when absent).
+fun ut_gated(p: *Project, s: *session.Session, fqn: str) bool {
+    val mid: session.ModuleId = ut_mid(p, s, fqn);
+    if (mid == session.MODULE_NIL) { ret false; }
+    ret (?p.modules[mid::u32]).target_gated;
+}
+
+# whether module `fqn` is in project `p`'s topo set (its compiled / collected set).
+fun ut_in_topo(p: *Project, s: *session.Session, fqn: str) bool {
+    val mid: session.ModuleId = ut_mid(p, s, fqn);
+    if (mid == session.MODULE_NIL) { ret false; }
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        if (p.topo[i] == mid) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# #1873: an orphan module (no in-tree consumer) whose load-time comptime evaluation
+# reaches a `$error` is target-gated - loaded but kept out of the topo set and
+# counted for the skip note - so a `mach test` over a tree with other-target modules
+# does not fail on their guards. Sema over the remaining topo raises no error.
+test "mach.lang.driver:test_gated_orphan_excluded" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "gated.mach";
+    var texts: [2]str;
+    texts[0] = "fun main() i32 { ret 0; }\n";
+    texts[1] = "$error(\"gated: not for this target\");\n\ntest \"gt\" { ret 0; }\n";
+
+    val pr: R.Result[Project, str] = ut_build_test(?s, ?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[Project, str](pr)) { session.dnit(?s); ret 1; }
+    var p: Project = R.unwrap_ok[Project, str](pr);
+
+    var bad: i32 = 0;
+    if (!ut_has(?p, ?s, "uniontest.gated"))    { bad = 1; }  # loaded,
+    if (!ut_gated(?p, ?s, "uniontest.gated"))  { bad = 1; }  # flagged gated,
+    if (ut_in_topo(?p, ?s, "uniontest.gated")) { bad = 1; }  # but excluded from topo.
+    if (count_target_gated(?p) != 1)           { bad = 1; }
+    if (!ut_in_topo(?p, ?s, "uniontest.main")) { bad = 1; }  # the entry stays compiled.
+    val se: R.Result[bool, str] = run_sema_pass(?p);
+    if (R.is_err[bool, str](se))               { bad = 1; }
+    if (ut_count_errors(?p.s.diags) != 0)      { bad = 1; }  # the guard never fires.
+
+    dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# #1873 / #1863: an orphan module WITHOUT a target guard keeps its tests collected -
+# it loads into topo like any own-src module, preserving the whole-source collection
+# guarantee (the editor-subtree case).
+test "mach.lang.driver:test_ungated_orphan_collected" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "orphan.mach";
+    var texts: [2]str;
+    texts[0] = "fun main() i32 { ret 0; }\n";
+    texts[1] = "test \"ot\" { ret 0; }\n";
+
+    val pr: R.Result[Project, str] = ut_build_test(?s, ?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[Project, str](pr)) { session.dnit(?s); ret 1; }
+    var p: Project = R.unwrap_ok[Project, str](pr);
+
+    var bad: i32 = 0;
+    if (!ut_has(?p, ?s, "uniontest.orphan"))     { bad = 1; }
+    if (ut_gated(?p, ?s, "uniontest.orphan"))    { bad = 1; }  # not gated,
+    if (!ut_in_topo(?p, ?s, "uniontest.orphan")) { bad = 1; }  # collected.
+    if (count_target_gated(?p) != 0)             { bad = 1; }
+
+    dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# #1873: a `$error` in an ENTRY-REACHABLE module is never gated - it stays in topo
+# and its guard remains a fatal sema error, so the orphan-only exclusion never masks
+# a genuine error in reachable code.
+test "mach.lang.driver:test_reachable_error_still_fatal" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "bad.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.bad;\n\nfun main() i32 { ret 0; }\n";
+    texts[1] = "$error(\"reachable boom\");\n\npub fun f() i32 { ret 0; }\n";
+
+    val pr: R.Result[Project, str] = ut_build_test(?s, ?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[Project, str](pr)) { session.dnit(?s); ret 1; }
+    var p: Project = R.unwrap_ok[Project, str](pr);
+
+    var bad: i32 = 0;
+    if (ut_gated(?p, ?s, "uniontest.bad"))    { bad = 1; }  # reachable: not gated,
+    if (!ut_in_topo(?p, ?s, "uniontest.bad")) { bad = 1; }  # stays in topo,
+    if (count_target_gated(?p) != 0)          { bad = 1; }
+    val se: R.Result[bool, str] = run_sema_pass(?p);
+    if (R.is_err[bool, str](se))              { bad = 1; }
+    if (ut_count_errors(?p.s.diags) == 0)     { bad = 1; }  # its `$error` still fires.
+
+    dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
 }
 
 # whether the union Project loaded a module with the given FQN.
