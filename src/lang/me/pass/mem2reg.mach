@@ -29,6 +29,7 @@ use mach.lang.me.ir;
 use mach.lang.me.ir.builder;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.mutate;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.source;
@@ -995,19 +996,17 @@ fun place_phi(st: *State, bid: id.BlockId, alloca_id: id.InstructionId) R.Result
 
 # rename traversal context, threaded through the dominator-tree walk
 # ---
-# st:        promotion state
-# subst:     removed-load result id -> replacement SSA Value
-# has_sub:   which instruction ids have an entry in subst
-# cur:       per-alloca current SSA Value (stack top)
-# defined:   per-alloca whether cur holds a live value yet
-# instr_len: snapshot of the instruction pool length when rename began
+# st:      promotion state
+# rw:      shared rewrite map (removed-load result id -> replacement SSA Value);
+#          its length is the snapshot of the pool at rename start, so phis added
+#          during the walk fall outside it and are never substituted
+# cur:     per-alloca current SSA Value (stack top)
+# defined: per-alloca whether cur holds a live value yet
 rec RenameCtx {
-    st:        *State;
-    subst:     *value.Value;
-    has_sub:   *bool;
-    cur:       *value.Value;
-    defined:   *bool;
-    instr_len: u32;
+    st:      *State;
+    rw:      mutate.Rewrite;
+    cur:     *value.Value;
+    defined: *bool;
 }
 
 # the rename pass: a pre-order walk of the dominator tree maintaining one
@@ -1025,79 +1024,62 @@ fun rename(st: *State) R.Result[bool, str] {
     val ilen: u32 = st.fn.instr_len;
 
     var rc: RenameCtx;
-    rc.st        = st;
-    rc.subst     = nil;
-    rc.has_sub   = nil;
-    rc.cur       = nil;
-    rc.defined   = nil;
-    rc.instr_len = ilen;
+    rc.st      = st;
+    rc.cur     = nil;
+    rc.defined = nil;
 
     val res_init: R.Result[bool, str] = rename_ctx_init(?rc, na, ilen);
     if (R.is_err[bool, str](res_init)) { ret res_init; }
 
     val res_walk: R.Result[bool, str] = rename_walk(?rc);
     if (R.is_ok[bool, str](res_walk)) {
-        apply_substitutions(?rc);
+        mutate.rewrite_apply(st.fn, ?rc.rw);
         strip_promoted(st);
     }
 
-    rename_ctx_dnit(?rc, na, ilen);
+    rename_ctx_dnit(?rc, na);
     ret res_walk;
 }
 
-# allocate and clear the rename context's per-instruction and per-alloca tables
+# allocate and clear the rename context's rewrite map and per-alloca tables
 # ---
-# rc:   context whose subst / has_sub / cur / defined are filled
+# rc:   context whose rw / cur / defined are filled
 # na:   number of promotable allocas (sizes cur / defined)
-# ilen: instruction pool length (sizes subst / has_sub)
+# ilen: instruction pool length (sizes the rewrite map)
 # ret:  ok(true) on success, or an allocation error
 fun rename_ctx_init(rc: *RenameCtx, na: u32, ilen: u32) R.Result[bool, str] {
     val a: *A.Allocator = rc.st.alloc;
 
-    val res_subst: R.Result[*value.Value, str] = A.allocate[value.Value](a, ilen::usize);
-    if (R.is_err[*value.Value, str](res_subst)) { ret R.err[bool, str](R.unwrap_err[*value.Value, str](res_subst)); }
-    rc.subst = R.unwrap_ok[*value.Value, str](res_subst);
-
-    val res_has_sub: R.Result[*bool, str] = A.allocate[bool](a, ilen::usize);
-    if (R.is_err[*bool, str](res_has_sub)) {
-        A.deallocate[value.Value](a, rc.subst, ilen::usize);
-        ret R.err[bool, str](R.unwrap_err[*bool, str](res_has_sub));
-    }
-    rc.has_sub = R.unwrap_ok[*bool, str](res_has_sub);
+    val res_rw: R.Result[bool, str] = mutate.rewrite_init(?rc.rw, a, ilen);
+    if (R.is_err[bool, str](res_rw)) { ret res_rw; }
 
     val res_cur: R.Result[*value.Value, str] = A.allocate[value.Value](a, na::usize);
     if (R.is_err[*value.Value, str](res_cur)) {
-        A.deallocate[value.Value](a, rc.subst, ilen::usize);
-        A.deallocate[bool](a, rc.has_sub, ilen::usize);
+        mutate.rewrite_dnit(?rc.rw, a);
         ret R.err[bool, str](R.unwrap_err[*value.Value, str](res_cur));
     }
     rc.cur = R.unwrap_ok[*value.Value, str](res_cur);
 
     val res_defined: R.Result[*bool, str] = A.allocate[bool](a, na::usize);
     if (R.is_err[*bool, str](res_defined)) {
-        A.deallocate[value.Value](a, rc.subst, ilen::usize);
-        A.deallocate[bool](a, rc.has_sub, ilen::usize);
+        mutate.rewrite_dnit(?rc.rw, a);
         A.deallocate[value.Value](a, rc.cur, na::usize);
         ret R.err[bool, str](R.unwrap_err[*bool, str](res_defined));
     }
     rc.defined = R.unwrap_ok[*bool, str](res_defined);
 
-    var i: u32 = 0;
-    for (i < ilen) { rc.has_sub[i] = false; i = i + 1; }
     var ai: u32 = 0;
     for (ai < na) { rc.defined[ai] = false; ai = ai + 1; }
     ret R.ok[bool, str](true);
 }
 
-# free the rename context's tables by their allocation sizes
+# free the rename context's rewrite map and per-alloca tables
 # ---
-# rc:   context to tear down
-# na:   number of promotable allocas (the cur / defined size)
-# ilen: instruction pool length (the subst / has_sub size)
-fun rename_ctx_dnit(rc: *RenameCtx, na: u32, ilen: u32) {
+# rc: context to tear down
+# na: number of promotable allocas (the cur / defined size)
+fun rename_ctx_dnit(rc: *RenameCtx, na: u32) {
     val a: *A.Allocator = rc.st.alloc;
-    if (rc.subst != nil)   { A.deallocate[value.Value](a, rc.subst, ilen::usize); }
-    if (rc.has_sub != nil) { A.deallocate[bool](a, rc.has_sub, ilen::usize); }
+    mutate.rewrite_dnit(?rc.rw, a);
     if (rc.cur != nil)     { A.deallocate[value.Value](a, rc.cur, na::usize); }
     if (rc.defined != nil) { A.deallocate[bool](a, rc.defined, na::usize); }
 }
@@ -1340,13 +1322,12 @@ fun rename_enter_block(rc: *RenameCtx, bid: id.BlockId) R.Result[bool, str] {
                 val ptr: value.Value = inst.operands[0];
                 if (ptr.kind == value.VAL_INSTR) {
                     val ai: u32 = alloca_index(st, ptr.data.instr);
-                    if (ai != NONE_U32 && iid::u32 < rc.instr_len) {
+                    if (ai != NONE_U32 && iid::u32 < rc.rw.len) {
                         if (rc.defined[ai]) {
-                            rc.subst[iid::u32] = rc.cur[ai];
+                            mutate.replace_value(?rc.rw, iid, rc.cur[ai]);
                         } or {
-                            rc.subst[iid::u32] = value.const_null(inst.ty);
+                            mutate.replace_value(?rc.rw, iid, value.const_null(inst.ty));
                         }
-                        rc.has_sub[iid::u32] = true;
                     }
                 }
             } or (inst.kind == instruction.OP_STORE && inst.operand_count >= 2) {
@@ -1354,7 +1335,7 @@ fun rename_enter_block(rc: *RenameCtx, bid: id.BlockId) R.Result[bool, str] {
                 if (ptr.kind == value.VAL_INSTR) {
                     val ai: u32 = alloca_index(st, ptr.data.instr);
                     if (ai != NONE_U32) {
-                        rc.cur[ai]     = resolve_value(rc, inst.operands[0]);
+                        rc.cur[ai]     = mutate.rewrite_resolve(?rc.rw, inst.operands[0]);
                         rc.defined[ai] = true;
                     }
                 }
@@ -1432,56 +1413,6 @@ fun add_phi_incomings(rc: *RenameCtx, pred: id.BlockId, succ: id.BlockId) R.Resu
     ret R.ok[bool, str](true);
 }
 
-# resolve a Value through the substitution table: if it names a promoted load,
-# follow to the load's replacement (transitively)
-#
-# The use's own type is carried onto the replacement: a load's natural type
-# matches the stored value's, so this is a no-op for scalars, but an aggregate
-# rvalue retypes a pointer-valued load to the aggregate (an aggregate value IS
-# its storage pointer) -- dropping that type for the promoted pointer's would
-# turn a sized struct copy into an 8-byte store.
-# ---
-# rc:  rename context
-# v:   the Value to resolve
-# ret: the resolved Value (v unchanged when it is not a promoted load)
-fun resolve_value(rc: *RenameCtx, v: value.Value) value.Value {
-    var cur: value.Value = v;
-    for (cur.kind == value.VAL_INSTR) {
-        val iid: u32 = cur.data.instr::u32;
-        if (iid < rc.instr_len && rc.has_sub[iid]) {
-            cur = value.retype(rc.subst[iid], cur.ty);
-        } or {
-            ret cur;
-        }
-    }
-    ret cur;
-}
-
-# apply the substitution table to every operand of every surviving instruction
-# (including phi incomings), so references to promoted loads become their
-# resolved SSA Values
-# ---
-# rc: rename context with subst / has_sub filled
-fun apply_substitutions(rc: *RenameCtx) {
-    val st: *State = rc.st;
-    var i: u32 = 0;
-    for (i < st.fn.instr_len) {
-        val inst: *instruction.Instruction = ?st.fn.instrs[i];
-        var o: u32 = 0;
-        for (o < inst.operand_count) {
-            val op: value.Value = inst.operands[o];
-            if (op.kind == value.VAL_INSTR) {
-                val iid: u32 = op.data.instr::u32;
-                if (iid < rc.instr_len && rc.has_sub[iid]) {
-                    inst.operands[o] = resolve_value(rc, op);
-                }
-            }
-            o = o + 1;
-        }
-        i = i + 1;
-    }
-}
-
 # strip promoted instructions (the allocas, and every load/store on them) from
 # their block instruction lists
 #
@@ -1493,17 +1424,18 @@ fun strip_promoted(st: *State) {
     var b: u32 = 0;
     for (b < st.block_count) {
         val blk: *ir.Block = ?st.fn.blocks[b];
-        var w: u32 = 0;
+        # route every removal through the shared erase primitive (no private
+        # compaction); erase removes in place, so a promoted memop is erased
+        # without advancing the cursor.
         var r: u32 = 0;
         for (r < blk.instr_count) {
             val iid: id.InstructionId = blk.instructions[r];
-            if (is_promoted_memop(st, iid) == false) {
-                blk.instructions[w] = iid;
-                w = w + 1;
+            if (is_promoted_memop(st, iid)) {
+                mutate.erase_instruction(blk, iid);
+            } or {
+                r = r + 1;
             }
-            r = r + 1;
         }
-        blk.instr_count = w;
         b = b + 1;
     }
 }
