@@ -2562,6 +2562,10 @@ fun parse_module(p: *Project, mid: session.ModuleId, fqn: intern.StrId) R.Result
 # cross-build-stable key a reused result remaps through (#1582).
 fun ensure_query_pipeline(s: *session.Session) R.Result[bool, str] {
     query.set_ctx(?s.queries, s::ptr);
+    # bridge the session diagnostic sink to the engine so a reused phase replays
+    # the diagnostics it emitted when computed (#1586). refreshed every build like
+    # set_ctx; the session address is stable.
+    query.set_diag_hooks(?s.queries, diag_mark_hook, diag_capture_hook, diag_replay_hook, diag_free_hook);
     if (!query.is_registered(?s.queries, query.Q_PARSE)) {
         val rp: R.Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_PARSE, q_parse_compute, q_parse_finalize);
         if (R.is_err[bool, str](rp)) { ret rp; }
@@ -2595,6 +2599,45 @@ fun ensure_query_pipeline(s: *session.Session) R.Result[bool, str] {
         if (R.is_err[bool, str](rln)) { ret rln; }
     }
     ret R.ok[bool, str](true);
+}
+
+# the diagnostics-as-query-output hooks the query engine calls to capture the
+# diagnostics a derived compute emits onto the session sink and replay them on a
+# reused get (#1586). the engine is diagnostic-agnostic; these cast db.ctx back to
+# the session and bridge its `diags` sink. a captured snapshot is a heap
+# diagnostic.DiagList the query entry owns and the engine frees through
+# diag_free_hook.
+
+# read the session sink's current length, the mark a compute's diagnostics start at
+fun diag_mark_hook(ctx: ptr) u64 {
+    val s: *session.Session = ctx::*session.Session;
+    ret s.diags.len::u64;
+}
+
+# snapshot the diagnostics appended since `mark` into an owned DiagList handle, or
+# nil when the compute emitted none. an allocation failure yields nil - diagnostics
+# are advisory, so a failed capture degrades to no replay rather than aborting.
+fun diag_capture_hook(ctx: ptr, mark: u64, a: *A.Allocator) ptr {
+    val s: *session.Session = ctx::*session.Session;
+    if (s.diags.len <= mark::usize) { ret nil; }
+    val cr: R.Result[*diagnostic.DiagList, str] = diagnostic.clone_tail(?s.diags, mark::usize, a);
+    if (R.is_err[*diagnostic.DiagList, str](cr)) { ret nil; }
+    ret R.unwrap_ok[*diagnostic.DiagList, str](cr)::ptr;
+}
+
+# replay a captured snapshot into the live session sink on a reused get. the
+# advisory append failure is swallowed, as elsewhere in the diagnostic sink.
+fun diag_replay_hook(ctx: ptr, handle: ptr) {
+    val s: *session.Session = ctx::*session.Session;
+    val list: *diagnostic.DiagList = handle::*diagnostic.DiagList;
+    diagnostic.append_all(?s.diags, list);
+}
+
+# release a captured snapshot handle when its query entry is freed
+fun diag_free_hook(handle: ptr, a: *A.Allocator) {
+    val list: *diagnostic.DiagList = handle::*diagnostic.DiagList;
+    diagnostic.dnit(list);
+    A.deallocate[diagnostic.DiagList](a, list, 1::usize);
 }
 
 # the Q_PARSE derived compute - lex + parse one file into a heap
@@ -5729,6 +5772,114 @@ test "mach.lang.driver:incremental_qparse_ast_reuse_and_reparse" {
     if (ut_ast(?p3, ?s, "uniontest.a")    == a1)    { bad = 1; }   # edited: re-parsed
     dnit_project(?p3);
 
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?s);
+    ret bad;
+}
+
+# whether two optional owned strings are equal: both nil, or both present and
+# byte-equal. used by the diagnostic-replay comparison below.
+fun ut_opt_str_eq(a: str, b: str) bool {
+    if (a == nil && b == nil) { ret true; }
+    if (a == nil || b == nil) { ret false; }
+    ret str_equals(a, b);
+}
+
+# whether two diagnostic lists are structurally identical: same length and, per
+# entry, the same severity, primary location, message, note/help lines, and
+# secondary locations. the replay test asserts a warm-session rebuild reproduces
+# the cold build's diagnostics exactly (#1586).
+fun ut_diag_list_eq(x: *diagnostic.DiagList, y: *diagnostic.DiagList) bool {
+    if (x.len != y.len) { ret false; }
+    var i: usize = 0;
+    for (i < x.len) {
+        val dx: *diagnostic.Diagnostic = ?x.items[i];
+        val dy: *diagnostic.Diagnostic = ?y.items[i];
+        if (dx.severity != dy.severity)               { ret false; }
+        if (dx.loc.file_id != dy.loc.file_id)         { ret false; }
+        if (dx.loc.span.offset != dy.loc.span.offset) { ret false; }
+        if (dx.loc.span.len != dy.loc.span.len)       { ret false; }
+        if (!ut_opt_str_eq(dx.message, dy.message))   { ret false; }
+        if (!ut_opt_str_eq(dx.note, dy.note))         { ret false; }
+        if (!ut_opt_str_eq(dx.help, dy.help))         { ret false; }
+        if (dx.related_len != dy.related_len)         { ret false; }
+        var r: usize = 0;
+        for (r < dx.related_len) {
+            val rx: *diagnostic.Related = ?dx.related[r];
+            val ry: *diagnostic.Related = ?dy.related[r];
+            if (rx.loc.file_id != ry.loc.file_id)         { ret false; }
+            if (rx.loc.span.offset != ry.loc.span.offset) { ret false; }
+            if (rx.loc.span.len != ry.loc.span.len)       { ret false; }
+            if (!ut_opt_str_eq(rx.label, ry.label))       { ret false; }
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# driver incremental: a reused phase replays the diagnostics it emitted when
+# computed, so a warm-session rebuild surfaces the same diagnostics a cold compute
+# did (#1586). main.mach carries a duplicate module-scope definition, so name
+# resolution emits one error diagnostic (with a related "previous definition"
+# span). without the replay the reused Q_RESOLVE stays silent and the warm sink is
+# empty.
+test "mach.lang.driver:incremental_reused_phase_replays_diagnostics" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val rr: R.Result[bool, str] = setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { session.dnit(?s); ret 1; }
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = "fun dup() i32 { ret 1; }\nfun dup() i32 { ret 2; }\n\nfun main() i32 { ret 0; }\n";
+
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: cold. the resolve pass emits the diagnostic and the engine captures
+    # it onto the Q_RESOLVE entry.
+    val p1r: R.Result[Project, str] = build_project_union(?s, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+
+    # snapshot the cold diagnostics before the sink is reset; a non-empty snapshot
+    # proves the diagnostic was produced at all.
+    val cold_r: R.Result[*diagnostic.DiagList, str] = diagnostic.clone_tail(?s.diags, 0, ?alloc);
+    if (R.is_err[*diagnostic.DiagList, str](cold_r)) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val cold: *diagnostic.DiagList = R.unwrap_ok[*diagnostic.DiagList, str](cold_r);
+    if (cold.len == 0) { bad = 1; }
+    dnit_project(?p1);
+
+    # a warm-session consumer resets the sink between builds; do the same so the
+    # second build's sink reflects only its own (replayed) diagnostics.
+    diagnostic.dnit(?s.diags);
+    s.diags = diagnostic.init(?alloc);
+
+    # build 2: warm. nothing changed, so every phase is reused. the reused
+    # Q_RESOLVE must replay its captured diagnostic - identically to the cold build.
+    val p2r: R.Result[Project, str] = build_project_union(?s, root);
+    if (R.is_err[Project, str](p2r)) {
+        diagnostic.dnit(cold);
+        A.deallocate[diagnostic.DiagList](?alloc, cold, 1::usize);
+        filesystem.remove_all(?alloc, root);
+        session.dnit(?s);
+        ret 1;
+    }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    if (!ut_diag_list_eq(?s.diags, cold)) { bad = 1; }
+    dnit_project(?p2);
+
+    diagnostic.dnit(cold);
+    A.deallocate[diagnostic.DiagList](?alloc, cold, 1::usize);
     filesystem.remove_all(?alloc, root);
     session.dnit(?s);
     ret bad;
