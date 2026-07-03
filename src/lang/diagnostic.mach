@@ -16,6 +16,7 @@ use std.types.bool.true;
 use std.types.char.char;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 use std.types.string.str_len;
 
 use A: std.allocator;
@@ -332,6 +333,82 @@ pub fun suggestion_build(a: *A.Allocator, name: str) str {
     ret buf;
 }
 
+# deep-copy diagnostic `d` into `dst`, duplicating its owned message, optional
+# note/help lines, and every secondary location
+#
+# The shared body of clone_tail and append_all: a diagnostic owns heap strings, so
+# a copy must re-intern them into `dst`'s allocator. Only the primary emit can
+# fail meaningfully; the advisory attach helpers swallow their own allocation
+# failures, matching how a live pass records them.
+# ---
+# dst: diagnostic list receiving the copy
+# d:   diagnostic to copy
+# ret: true on success, or an allocation error from copying the primary record
+fun copy_into(dst: *DiagList, d: *Diagnostic) R.Result[bool, str] {
+    val res_emit: R.Result[bool, str] = emit(dst, d.severity, d.loc.file_id, d.loc.span, d.message);
+    if (R.is_err[bool, str](res_emit)) { ret res_emit; }
+
+    if (d.note != nil) { attach_note(dst, d.note); }
+    if (d.help != nil) { attach_help(dst, d.help); }
+
+    var r: usize = 0;
+    for (r < d.related_len) {
+        attach_related(dst, d.related[r].loc.file_id, d.related[r].loc.span, d.related[r].label);
+        r = r + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# snapshot the diagnostics recorded from index `from` onward into a fresh owned
+# list allocated with `a`
+#
+# The capture half of diagnostics-as-query-output (#1586): a derived query records
+# the sink length before it runs, then clones the tail it appended into a list the
+# query cache owns, so a later reused `get` can replay it. The returned list is
+# heap-owned; the caller frees it with dnit plus a single-element deallocate.
+# ---
+# src:  list to snapshot from
+# from: first index to copy (a length mark taken before the producing pass)
+# a:    allocator backing the returned list
+# ret:  the owned snapshot list, or an allocation error
+pub fun clone_tail(src: *DiagList, from: usize, a: *A.Allocator) R.Result[*DiagList, str] {
+    val res_alloc: R.Result[*DiagList, str] = A.allocate[DiagList](a, 1);
+    if (R.is_err[*DiagList, str](res_alloc)) { ret res_alloc; }
+    val list: *DiagList = R.unwrap_ok[*DiagList, str](res_alloc);
+    @list = init(a);
+
+    var i: usize = from;
+    for (i < src.len) {
+        val res_copy: R.Result[bool, str] = copy_into(list, ?src.items[i]);
+        if (R.is_err[bool, str](res_copy)) {
+            dnit(list);
+            A.deallocate[DiagList](a, list, 1);
+            ret R.err[*DiagList, str](R.unwrap_err[bool, str](res_copy));
+        }
+        i = i + 1;
+    }
+    ret R.ok[*DiagList, str](list);
+}
+
+# deep-copy every diagnostic in `src` onto the end of `dst`
+#
+# The replay half of diagnostics-as-query-output (#1586): a reused query replays
+# its cached snapshot into the live sink so a warm-session build surfaces the same
+# diagnostics a cold compute would. `src` is left intact for the next replay.
+# ---
+# dst: list receiving the copies
+# src: snapshot list to replay
+# ret: true on success, or an allocation error mid-copy
+pub fun append_all(dst: *DiagList, src: *DiagList) R.Result[bool, str] {
+    var i: usize = 0;
+    for (i < src.len) {
+        val res_copy: R.Result[bool, str] = copy_into(dst, ?src.items[i]);
+        if (R.is_err[bool, str](res_copy)) { ret res_copy; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
 # append a diagnostic of the given severity, growing the items array and copying
 # the message into the list's allocator
 # ---
@@ -510,4 +587,73 @@ test "mach.lang.diagnostic.suggestion_build:length" {
 
     str_free(?a, note);
     ret 0;
+}
+
+# clone_tail deep-copies the tail from a mark and append_all re-emits it, so a
+# captured snapshot round-trips a diagnostic's message, help line, and secondary
+# location intact (#1586)
+test "mach.lang.diagnostic.clone_tail:round_trips_via_append_all" {
+    var a: A.Allocator;
+    page.make(?a);
+    var src: DiagList = init(?a);
+
+    var sp: token.Span;
+    sp.offset = 4;
+    sp.len    = 2;
+
+    # a leading diagnostic that a mark past index 0 must exclude from the snapshot.
+    if (R.is_err[bool, str](warning(?src, 0::source.FileId, sp, "leading warning"))) { dnit(?src); ret 1; }
+    val mark: usize = src.len;
+
+    var esp: token.Span;
+    esp.offset = 10;
+    esp.len    = 3;
+    if (R.is_err[bool, str](error(?src, 5::source.FileId, esp, "the error"))) { dnit(?src); ret 1; }
+    attach_help(?src, "try this");
+    var rsp: token.Span;
+    rsp.offset = 20;
+    rsp.len    = 1;
+    attach_related(?src, 6::source.FileId, rsp, "previous here");
+
+    # snapshot from the mark: only the error and its attachments, not the warning.
+    val cr: R.Result[*DiagList, str] = clone_tail(?src, mark, ?a);
+    if (R.is_err[*DiagList, str](cr)) { dnit(?src); ret 1; }
+    val snap: *DiagList = R.unwrap_ok[*DiagList, str](cr);
+
+    # replay the snapshot into a fresh sink; the round-trip must reproduce it.
+    var dst: DiagList = init(?a);
+    if (R.is_err[bool, str](append_all(?dst, snap))) { dnit(?src); dnit(snap); A.deallocate[DiagList](?a, snap, 1); dnit(?dst); ret 1; }
+
+    # independence: free the source sink now, before reading the copies. deep copies
+    # must outlive it; a shallow alias would fault reading the strings below.
+    dnit(?src);
+
+    var bad: i32 = 0;
+    # snap holds exactly the error, with its owned message / help / label copied
+    # byte-for-byte from the (now freed) source.
+    if (snap.len != 1)                                                       { bad = 1; }
+    or (snap.items[0].severity != SEVERITY_ERROR)                           { bad = 1; }
+    or (snap.items[0].loc.file_id != 5::source.FileId)                      { bad = 1; }
+    or (snap.items[0].loc.span.offset != 10)                                { bad = 1; }
+    or (!str_equals(snap.items[0].message, "the error"))                    { bad = 1; }
+    or (snap.items[0].help == nil)                                          { bad = 1; }
+    or (!str_equals(snap.items[0].help, "try this"))                        { bad = 1; }
+    or (snap.items[0].related_len != 1)                                     { bad = 1; }
+    or (snap.items[0].related[0].loc.file_id != 6::source.FileId)           { bad = 1; }
+    or (snap.items[0].related[0].label == nil)                              { bad = 1; }
+    or (!str_equals(snap.items[0].related[0].label, "previous here"))       { bad = 1; }
+
+    # the replayed copy is likewise independent and content-correct.
+    if (dst.len != 1)                                                  { bad = 1; }
+    or (!str_equals(dst.items[0].message, "the error"))               { bad = 1; }
+    or (dst.items[0].help == nil)                                     { bad = 1; }
+    or (!str_equals(dst.items[0].help, "try this"))                   { bad = 1; }
+    or (dst.items[0].related_len != 1)                                { bad = 1; }
+    or (dst.items[0].related[0].label == nil)                         { bad = 1; }
+    or (!str_equals(dst.items[0].related[0].label, "previous here"))  { bad = 1; }
+
+    dnit(?dst);
+    dnit(snap);
+    A.deallocate[DiagList](?a, snap, 1);
+    ret bad;
 }
