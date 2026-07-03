@@ -22,6 +22,17 @@
 # golden is keyed by build-target (expect.<build-target>.txt). this lets, e.g., a
 # PE-ASLR or macho-PIE field case cross-build its format on the cheap linux leg and
 # `od` it there, per-PR, with no runner of the format's own OS.
+#
+# NATIVE vs QEMU FIDELITY. a target's run-mode (targets.conf) is `native` (execute on
+# the runner) or `qemu` (run the guest ELF under qemu-user). qemu-user does NOT fully
+# model kernel memory semantics - in particular it does not fault an `mprotect` (or
+# access) over address space the loader never mapped, and its guest page size need not
+# match a real kernel's. so RELRO / mprotect-class runtime behavior (e.g. the static-PIE
+# self-relocation re-protecting PT_GNU_RELRO) is only PROVEN by a `native` leg; a qemu
+# leg can pass while the same binary crashes on real hardware (briar-systems/mach#1885,
+# where a 64K-aligned aarch64 image faulted ENOMEM on a native 4K-page kernel that every
+# qemu-aarch64 leg had reported green). keep the aarch64 int leg `native` for this
+# reason - do not move it to qemu.
 set -eu
 
 usage() {
