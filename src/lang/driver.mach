@@ -50,6 +50,7 @@ use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.expr;
 use mach.lang.fe.ast.id;
 use mach.lang.fe.ast.module;
+use mach.lang.fe.ast.stmt;
 use mach.lang.fe.comptime;
 use mach.lang.fe.lexer;
 use mach.lang.fe.parser;
@@ -2599,6 +2600,10 @@ fun ensure_query_pipeline(s: *session.Session) R.Result[bool, str] {
         val rte: R.Result[bool, str] = query.register_derived(?s.queries, query.Q_TYPED_EXPORTS, q_typed_exports_compute);
         if (R.is_err[bool, str](rte)) { ret rte; }
     }
+    if (!query.is_registered(?s.queries, query.Q_LOWERED_SURFACE)) {
+        val rls: R.Result[bool, str] = query.register_derived(?s.queries, query.Q_LOWERED_SURFACE, q_lowered_surface_compute);
+        if (R.is_err[bool, str](rls)) { ret rls; }
+    }
     if (!query.is_registered(?s.queries, query.Q_LOWER)) {
         val rl: R.Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_LOWER, q_lower_compute, q_lower_finalize);
         if (R.is_err[bool, str](rl)) { ret rl; }
@@ -2872,6 +2877,16 @@ fun fp_u32(b: *FpBuf, v: u32) R.Result[bool, str] {
     b.buf[b.len + 2] = ((v >> 16) & 0xFF)::u8;
     b.buf[b.len + 3] = ((v >> 24) & 0xFF)::u8;
     b.len = b.len + 4;
+    ret R.ok[bool, str](true);
+}
+
+# append `len` raw bytes from `p`.
+fun fp_bytes(b: *FpBuf, p: *u8, len: u32) R.Result[bool, str] {
+    if (len == 0) { ret R.ok[bool, str](true); }
+    val r: R.Result[bool, str] = fp_reserve(b, len);
+    if (R.is_err[bool, str](r)) { ret r; }
+    memory.raw_copy((?b.buf[b.len])::ptr, p::ptr, len::usize);
+    b.len = b.len + len;
     ret R.ok[bool, str](true);
 }
 
@@ -4054,13 +4069,22 @@ pub fun run_lower_pass(p: *Project) R.Result[bool, str] {
 }
 
 # fetch module `mid`'s optimized IR through Q_LOWER - computed fresh when its own
-# typing or any dep-closure module's typing changed, reused otherwise - and borrow
-# it onto the ModuleEntry. the IR is owned by the query DB; m.ir_module only points
-# at it.
+# typing or any dep-closure module's LOWERED SURFACE changed, reused otherwise - and
+# borrow it onto the ModuleEntry. the IR is owned by the query DB; m.ir_module only
+# points at it.
 fun run_lower_one(p: *Project, mid: session.ModuleId) R.Result[bool, str] {
     val m: *ModuleEntry = ?p.modules[mid::u32];
 
     val t_item: ctime.Time = readout.item_begin(p.s.readout);
+
+    # refresh this module's lowered-surface fingerprint NOW, in topo order, so an
+    # importer later in the pass validates its Q_LOWER against a current fingerprint:
+    # the engine's validator reads a dep's STORED last_changed without recomputing it,
+    # so a dependent is only firewalled (impl-only edit: identical bytes) or invalidated
+    # (surface change: bytes differ) correctly when its deps' fingerprints are already
+    # current. mirror of run_sema_one's Q_TYPED_EXPORTS refresh (#1859).
+    val sf_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LOWERED_SURFACE, m.stable_id::u64);
+    if (R.is_err[*query.QueryEntry, str](sf_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](sf_r)); }
 
     val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LOWER, back_half_key(m.stable_id, p.test_mode));
     if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
@@ -4072,16 +4096,119 @@ fun run_lower_one(p: *Project, mid: session.ModuleId) R.Result[bool, str] {
     ret R.ok[bool, str](true);
 }
 
+# the Q_LOWERED_SURFACE derived compute - a deterministic byte fingerprint of the
+# module material that can monomorphize into an importer's IR (#1859). records a dep
+# on Q_RESOLVE(module), so any parse/resolve change refreshes it, then fingerprints
+# the module's whole source text MINUS the bodies of regular (non-generic,
+# non-comptime-param) functions: those bodies are emitted extern in importers and
+# never flow in, so an impl-only edit to one reproduces identical bytes and importers
+# reuse their lowered IR (the firewall). a generic-body, comptime-value, type-layout,
+# signature, or decorator edit changes these bytes and re-lowers importers. a plain
+# byte-valued derived kind (early-cutoff ON), keyed by StableModuleId.
+fun q_lowered_surface_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
+    val s: *session.Session = db.ctx::*session.Session;
+    if (s == nil) { ret R.err[query.QueryOutput, str]("Q_LOWERED_SURFACE: query db has no session context"); }
+    val pp: ptr = session.active_project(s);
+    if (pp == nil) { ret R.err[query.QueryOutput, str]("Q_LOWERED_SURFACE: no active project"); }
+    val p: *Project = pp::*Project;
+
+    val stable: session.StableModuleId = key::u32::session.StableModuleId;
+    val mid: session.ModuleId = session.module_id_for_stable(s, stable);
+    if (mid == session.MODULE_NIL) { ret R.err[query.QueryOutput, str]("Q_LOWERED_SURFACE: stable id not loaded this build"); }
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    val a: *ast.Ast = m.a;
+    if (a == nil) { ret R.err[query.QueryOutput, str]("Q_LOWERED_SURFACE: module has no parsed AST"); }
+
+    val rd: R.Result[bool, str] = query.record_dep(db, query.Q_LOWERED_SURFACE, key, query.Q_RESOLVE, key);
+    if (R.is_err[bool, str](rd)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rd)); }
+
+    val sf_o: O.Option[*src.SourceFile] = src.get(?s.sources, a.file_id);
+    if (O.is_none[*src.SourceFile](sf_o)) { ret R.err[query.QueryOutput, str]("Q_LOWERED_SURFACE: module source not loaded"); }
+    val text: str = O.unwrap[*src.SourceFile](sf_o).text;
+
+    var fb: FpBuf;
+    fb.alloc = alloc;
+    fb.buf   = nil;
+    fb.len   = 0;
+    fb.cap   = 0;
+
+    val wr: R.Result[bool, str] = fp_lowered_surface(?fb, a, text);
+    if (R.is_err[bool, str](wr)) {
+        if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](alloc, fb.buf, fb.cap::usize); }
+        ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](wr));
+    }
+
+    var out: query.QueryOutput;
+    out.bytes = fb.buf;
+    out.len   = fb.len;
+    ret R.ok[query.QueryOutput, str](out);
+}
+
+# append the module's lowered surface to `fb`: the whole source text minus the byte
+# ranges of regular (non-generic, non-comptime-param) function bodies. the module's
+# top-level decls are walked in source order; each such body span is skipped, so its
+# contents never enter the fingerprint. everything else - signatures, generic and
+# comptime-param bodies, comptime values, record/union layouts, decorators, use/fwd -
+# is included verbatim. body spans nest inside their decls and decls do not overlap,
+# so the skipped ranges are strictly increasing and non-overlapping.
+fun fp_lowered_surface(fb: *FpBuf, a: *ast.Ast, text: str) R.Result[bool, str] {
+    val base:  *u8    = text::*u8;
+    val total: usize  = str_len(text);
+
+    val m_opt: O.Option[*module.Module] = ast.get_module(a, a.root_module);
+    if (O.is_none[*module.Module](m_opt)) { ret fp_bytes(fb, base, total::u32); }
+    val mod_node: *module.Module = O.unwrap[*module.Module](m_opt);
+
+    var cursor: usize = 0;
+    var i: u32 = 0;
+    for (i < mod_node.decls_len) {
+        val did: id.DeclId = a.decl_ids[mod_node.decls_start + i];
+        val d_opt: O.Option[*decl.Decl] = ast.get_decl(a, did);
+        if (O.is_some[*decl.Decl](d_opt)) {
+            val bs_o: O.Option[token.Span] = regular_fn_body_span(a, O.unwrap[*decl.Decl](d_opt));
+            if (O.is_some[token.Span](bs_o)) {
+                val bs: token.Span = O.unwrap[token.Span](bs_o);
+                val w: R.Result[bool, str] = fp_bytes(fb, ?base[cursor], (bs.offset - cursor)::u32);
+                if (R.is_err[bool, str](w)) { ret w; }
+                cursor = bs.offset + bs.len;
+            }
+        }
+        i = i + 1;
+    }
+    ret fp_bytes(fb, ?base[cursor], (total - cursor)::u32);
+}
+
+# the source span of a regular function's body - the bytes to EXCLUDE from the lowered
+# surface - or none when `d` is not a body-carrying regular function. a function's body
+# flows into importers (and stays in the fingerprint) when the function is generic or
+# takes a comptime parameter; otherwise its body is emitted extern in importers and
+# excluded. non-function decls and body-less (extern/forward) functions yield none.
+fun regular_fn_body_span(a: *ast.Ast, d: *decl.Decl) O.Option[token.Span] {
+    if (d.kind != decl.DECL_KIND_FUN) { ret O.none[token.Span](); }
+    if (d.data.fun_.body == id.STMT_NIL) { ret O.none[token.Span](); }
+    if (d.data.fun_.generics_len > 0) { ret O.none[token.Span](); }
+    var pi: u32 = 0;
+    for (pi < d.data.fun_.params_len) {
+        if (a.typed_names[d.data.fun_.params_start + pi].comptime) { ret O.none[token.Span](); }
+        pi = pi + 1;
+    }
+    val st_o: O.Option[*stmt.Stmt] = ast.get_stmt(a, d.data.fun_.body);
+    if (O.is_none[*stmt.Stmt](st_o)) { ret O.none[token.Span](); }
+    ret O.some[token.Span](O.unwrap[*stmt.Stmt](st_o).span);
+}
+
 # the Q_LOWER derived compute - lower one module to optimized IR and return it as
 # an opaque owned handle. reaches the per-build module graph through the session's
 # active Project, and records the deps that make the entry incremental:
 #   - Q_SEMA(module):  a change to this module's typing re-lowers it;
 #   - Q_TARGET:        a build-config change re-lowers every module;
 #   - Q_LOWER_FLAGS:   the IR-verifier toggle re-lowers (re-runs the verifier);
-#   - Q_SEMA(dep) for every module in this module's TRANSITIVE import closure: a
-#     generic/comptime instance declared in another module is monomorphized into
-#     THIS module's IR, so a change to that module's typing (including a private
-#     generic body it exposes) must re-lower this module. the transitive closure -
+#   - Q_LOWERED_SURFACE(dep) for every module in this module's TRANSITIVE import
+#     closure: a generic/comptime instance declared in another module is monomorphized
+#     into THIS module's IR, so a change to the material that flows (its generic bodies,
+#     comptime values, type layouts, signatures) must re-lower this module - but an
+#     impl-only edit to a regular function body it also declares does NOT flow and is
+#     firewalled by the fingerprint's early-cutoff (#1859). the transitive closure -
 #     not the direct resolve closure - is required because there is no per-hop
 #     lowering firewall: an inlined instance can originate in a transitively-
 #     imported module the direct closure omits (#1618).
@@ -4117,10 +4244,17 @@ fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[
     val rvf: R.Result[bool, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_LOWER_FLAGS, 0);
     if (R.is_err[bool, str](rvf)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rvf)); }
 
-    # record a dep on Q_SEMA of every module whose typing can feed this module's
-    # lowered IR (its transitive import closure). those Q_SEMA entries are all
-    # computed and valid (run_sema_pass completed before the lower pass), so
-    # record_dep captures their final last_changed directly.
+    # record a dep on the LOWERED SURFACE fingerprint of every module whose material
+    # can feed this module's lowered IR (its transitive import closure). the surface -
+    # not the full Q_SEMA - is the firewall: an impl-only edit to a dep (a regular
+    # function body, which is emitted extern here and never flows in) reproduces an
+    # identical fingerprint and this module reuses its IR, while a generic-body or
+    # comptime-value edit advances the fingerprint and re-lowers this module (#1859).
+    # each surface entry is fetched first so record_dep captures its current revision
+    # (run_lower_one refreshed the earlier-topo deps, but a fresh recompute demands
+    # them directly). the transitive closure - not the direct closure - is required
+    # because there is no per-hop lowering firewall: an inlined instance can originate
+    # in a transitively-imported module the direct closure omits (#1618).
     val cl_r: R.Result[LowerClosure, str] = collect_lower_closure(p, m);
     if (R.is_err[LowerClosure, str](cl_r)) { ret R.err[query.QueryOutput, str](R.unwrap_err[LowerClosure, str](cl_r)); }
     var cl: LowerClosure = R.unwrap_ok[LowerClosure, str](cl_r);
@@ -4128,7 +4262,12 @@ fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[
     for (di < cl.count) {
         val dep_mid: session.ModuleId = cl.list[di];
         val dep_stable: session.StableModuleId = p.modules[dep_mid::u32].stable_id;
-        val rd: R.Result[bool, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_SEMA, dep_stable::u64);
+        val ge: R.Result[*query.QueryEntry, str] = query.get(db, query.Q_LOWERED_SURFACE, dep_stable::u64);
+        if (R.is_err[*query.QueryEntry, str](ge)) {
+            free_lower_closure(s.alloc, ?cl);
+            ret R.err[query.QueryOutput, str](R.unwrap_err[*query.QueryEntry, str](ge));
+        }
+        val rd: R.Result[bool, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_LOWERED_SURFACE, dep_stable::u64);
         if (R.is_err[bool, str](rd)) {
             free_lower_closure(s.alloc, ?cl);
             ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rd));
@@ -6529,6 +6668,15 @@ fun ut_lower_lc(s: *session.Session, stable: session.StableModuleId) query.Revis
     ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
 }
 
+# the last_changed revision of module `stable`'s Q_LOWERED_SURFACE entry - the
+# lowered-surface reuse probe (#1859).
+fun ut_surface_lc(s: *session.Session, stable: session.StableModuleId) query.Revision {
+    val e: R.Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_LOWERED_SURFACE, stable::u64);
+    if (R.is_err[*query.QueryEntry, str](e)) { ret 0xFFFFFFFFFFFFFFFF; }
+    ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
+}
+
+
 # the last_changed revision of module `stable`'s Q_CODEGEN entry on session
 # `s`, or a sentinel when absent. an owned-handle shard never early-cuts, so an
 # unchanged value means the module was NOT re-codegen'd - the codegen reuse probe (#1618).
@@ -7054,8 +7202,10 @@ test "mach.lang.driver:incremental_lower_isolated_edit_reuses_sibling" {
     var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
     if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
 
-    # main imports two independent leaves a and b. editing a re-lowers a and its
-    # importer main, but must not touch b (unrelated to a).
+    # main imports two independent leaves a and b. editing a's regular-function body
+    # re-lowers a itself, but the lowered-surface firewall reuses its importer main
+    # (fa is extern in main, so its body never flows in) and the unrelated sibling b
+    # (#1859).
     var names: [3]str;
     names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
     var texts: [3]str;
@@ -7098,9 +7248,10 @@ test "mach.lang.driver:incremental_lower_isolated_edit_reuses_sibling" {
     val lc_b_2:    query.Revision = ut_lower_lc(?sA, st_b);
     dnit_project(?p2);
 
-    # the edited module and its importer re-lowered; the unrelated sibling did NOT.
+    # the edited module re-lowered; its importer (firewalled) and the unrelated sibling
+    # did NOT - an impl-only body edit does not flow into either.
     if (lc_a_2 == lc_a_1)       { bad = 1; }
-    if (lc_main_2 == lc_main_1) { bad = 1; }
+    if (lc_main_2 != lc_main_1) { bad = 1; }
     if (lc_b_2 != lc_b_1)       { bad = 1; }
 
     filesystem.remove_all(?alloc, root);
@@ -7159,6 +7310,193 @@ test "mach.lang.driver:incremental_lower_entry_edit_reuses_dep" {
     # the edited entry re-lowered; its unedited dependency did NOT.
     if (lc_main_2 == lc_main_1) { bad = 1; }
     if (lc_leaf_2 != lc_leaf_1) { bad = 1; }
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: the lowered-surface firewall stops an impl-only edit to a
+# dependency from re-lowering its importers, while a surface-affecting edit still does.
+# leaf exports a regular `plain` and a generic `wrap`; main calls plain and instantiates
+# wrap. changing plain's body (a constant, so it perturbs neither the typed exports nor
+# the lowered surface) leaves leaf's surface fingerprint byte-identical, so main's
+# Q_LOWER and Q_CODEGEN are reused - plain is emitted extern in main and its body never
+# flows in. editing wrap's generic body advances the surface fingerprint, so main - into
+# which wrap's instance is monomorphized - re-lowers (#1859).
+test "mach.lang.driver:incremental_lower_surface_firewall" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.plain;\nuse uniontest.leaf.wrap;\nfun main() i32 { ret plain() + wrap[i32](2); }\n";
+    texts[1] = "pub fun plain() i32 { ret 1; }\npub fun wrap[T](x: T) T { ret x; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: warm the lower + codegen caches.
+    val p1r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val st_leaf: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.leaf");
+    val lo_main_1: query.Revision = ut_lower_lc(?sA, st_main);
+    val cg_main_1: query.Revision = ut_codegen_lc(?sA, st_main);
+    val lo_leaf_1: query.Revision = ut_lower_lc(?sA, st_leaf);
+    val sf_leaf_1: query.Revision = ut_surface_lc(?sA, st_leaf);
+    dnit_project(?p1);
+
+    val src_dir:   str = ut_cc3(?alloc, root, "/", "src");
+    val leaf_path: str = ut_cc3(?alloc, src_dir, "/", "leaf.mach");
+
+    # build 2: IMPL-ONLY edit - change plain's returned constant; wrap is untouched. the
+    # lowered surface is byte-identical (plain's body is excluded), so the firewall reuses
+    # main's Q_LOWER and Q_CODEGEN, while leaf itself re-lowers (its own source changed,
+    # and Q_LOWER is an owned handle that always advances on recompute).
+    val leaf_v2: str = "pub fun plain() i32 { ret 2; }\npub fun wrap[T](x: T) T { ret x; }\n";
+    if (R.is_err[bool, str](filesystem.write_file(leaf_path, leaf_v2, str_len(leaf_v2), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val p2r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    val lo_main_2: query.Revision = ut_lower_lc(?sA, st_main);
+    val cg_main_2: query.Revision = ut_codegen_lc(?sA, st_main);
+    val lo_leaf_2: query.Revision = ut_lower_lc(?sA, st_leaf);
+    val sf_leaf_2: query.Revision = ut_surface_lc(?sA, st_leaf);
+    dnit_project(?p2);
+    if (sf_leaf_2 != sf_leaf_1) { bad = 1; }   # firewall: leaf's surface fingerprint held
+    if (lo_leaf_2 == lo_leaf_1) { bad = 1; }   # leaf itself re-lowered
+    if (lo_main_2 != lo_main_1) { bad = 1; }   # importer's Q_LOWER reused
+    if (cg_main_2 != cg_main_1) { bad = 1; }   # and so its Q_CODEGEN reused
+
+    # build 3: SURFACE edit - rewrite wrap's generic body. its instance is monomorphized
+    # into main, so the surface fingerprint advances and main re-lowers.
+    val leaf_v3: str = "pub fun plain() i32 { ret 2; }\npub fun wrap[T](x: T) T { val y: T = x; ret y; }\n";
+    if (R.is_err[bool, str](filesystem.write_file(leaf_path, leaf_v3, str_len(leaf_v3), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val p3r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p3r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p3: Project = R.unwrap_ok[Project, str](p3r);
+    val lo_main_3: query.Revision = ut_lower_lc(?sA, st_main);
+    val sf_leaf_3: query.Revision = ut_surface_lc(?sA, st_leaf);
+    dnit_project(?p3);
+    if (sf_leaf_3 == sf_leaf_2) { bad = 1; }   # a generic body edit advances the surface
+    if (lo_main_3 == lo_main_2) { bad = 1; }   # and re-lowers the importer
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: editing a dependency's pub comptime value advances its lowered
+# surface - the value is constant-folded into importers - so the importer re-lowers
+# (the comptime-value arm of the surface firewall, #1859).
+test "mach.lang.driver:incremental_lower_surface_comptime_value_invalidates" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.N;\nfun main() i32 { ret N; }\n";
+    texts[1] = "pub val N: i32 = 5;\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val p1r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val st_leaf: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.leaf");
+    val lo_main_1: query.Revision = ut_lower_lc(?sA, st_main);
+    val sf_leaf_1: query.Revision = ut_surface_lc(?sA, st_leaf);
+    dnit_project(?p1);
+
+    val src_dir:   str = ut_cc3(?alloc, root, "/", "src");
+    val leaf_path: str = ut_cc3(?alloc, src_dir, "/", "leaf.mach");
+
+    val leaf_v2: str = "pub val N: i32 = 6;\n";
+    if (R.is_err[bool, str](filesystem.write_file(leaf_path, leaf_v2, str_len(leaf_v2), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val p2r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    val lo_main_2: query.Revision = ut_lower_lc(?sA, st_main);
+    val sf_leaf_2: query.Revision = ut_surface_lc(?sA, st_leaf);
+    dnit_project(?p2);
+    if (sf_leaf_2 == sf_leaf_1) { bad = 1; }   # the comptime value is in the surface
+    if (lo_main_2 == lo_main_1) { bad = 1; }   # so the importer that folds it re-lowers
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: an inline-body edit does NOT invalidate importers. mach does not
+# inline across module boundaries - a dependency's `#[inline]` function is emitted extern
+# in importers and the inline pass skips extern callees - so its body never flows in and
+# is excluded from the lowered surface, like any regular body. THIS PINS THAT BEHAVIOR:
+# when cross-module inlining is added, the surface (driver.fp_lowered_surface, keyed off
+# the extern-skip in me.pass.inline.should_inline) must be extended to include exported
+# bodies, at which point this test must flip to asserting invalidation (#1859).
+test "mach.lang.driver:incremental_lower_inline_body_pins_no_cross_module_inline" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.inl;\nfun main() i32 { ret inl(); }\n";
+    texts[1] = "#[inline]\npub fun inl() i32 { ret 3; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val p1r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val st_leaf: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.leaf");
+    val lo_main_1: query.Revision = ut_lower_lc(?sA, st_main);
+    val lo_leaf_1: query.Revision = ut_lower_lc(?sA, st_leaf);
+    val sf_leaf_1: query.Revision = ut_surface_lc(?sA, st_leaf);
+    dnit_project(?p1);
+
+    val src_dir:   str = ut_cc3(?alloc, root, "/", "src");
+    val leaf_path: str = ut_cc3(?alloc, src_dir, "/", "leaf.mach");
+
+    # change only the inline function's returned constant (renumber-neutral).
+    val leaf_v2: str = "#[inline]\npub fun inl() i32 { ret 4; }\n";
+    if (R.is_err[bool, str](filesystem.write_file(leaf_path, leaf_v2, str_len(leaf_v2), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val p2r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    val lo_main_2: query.Revision = ut_lower_lc(?sA, st_main);
+    val lo_leaf_2: query.Revision = ut_lower_lc(?sA, st_leaf);
+    val sf_leaf_2: query.Revision = ut_surface_lc(?sA, st_leaf);
+    dnit_project(?p2);
+    if (sf_leaf_2 != sf_leaf_1) { bad = 1; }   # inline body is excluded from the surface
+    if (lo_leaf_2 == lo_leaf_1) { bad = 1; }   # leaf itself re-lowered
+    if (lo_main_2 != lo_main_1) { bad = 1; }   # PIN: the importer is reused (no cross-module inline)
 
     filesystem.remove_all(?alloc, root);
     session.dnit(?sA);
