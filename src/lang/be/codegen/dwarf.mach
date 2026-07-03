@@ -254,6 +254,9 @@ val VLOC_FRAME: u8 = 2;
 # offset:   frame-base offset when loc_kind == VLOC_FRAME
 # net:      signed constant the salvage expression adds to the operand value (0 =
 #           identity); a non-zero net makes the location a computed DW_OP_stack_value
+# conflict: transient - true once two non-optimized-out bindings disagreed on a home,
+#           so the variable is not provably stationary and emits no DW_AT_location
+#           (deferred to the #1705 loclists tier); not part of the emitted DIE
 rec DwVar {
     name_off: u32;
     bt:       i32;
@@ -262,6 +265,21 @@ rec DwVar {
     reg:      i32;
     offset:   i64;
     net:      i64;
+    conflict: bool;
+}
+
+# whether the variable `v`'s recorded home equals the raw home `(kind, reg, off, net)`.
+# the single-location tier emits DW_AT_location only when every non-optimized-out
+# binding of a variable agrees under this predicate.
+# ---
+# v:                the variable with a recorded home
+# kind/reg/off/net: the candidate raw home
+# ret:              true when they name the same location
+fun home_eq(v: *DwVar, kind: u8, reg: i32, off: i64, net: i64) bool {
+    if (v.loc_kind != kind) { ret false; }
+    if (kind == VLOC_REG)   { ret v.reg == reg && v.net == net; }
+    if (kind == VLOC_FRAME) { ret v.offset == off && v.net == net; }
+    ret true;
 }
 
 # a DWARF base type gathered from a primitive semantic return type.
@@ -1401,25 +1419,43 @@ fun gather_vars(s: *session.Session, tgt: *target.Target, irfn: *ir.Function, mi
         val nm: str = resolve(?s.interner, dv.name);
         val name_off: u32 = str_off(strtab, nm);
 
-        # dedup: one single-location DIE per source name (keep the first birth).
-        var dup: bool = false;
-        var j: u32 = start;
-        for (j < @var_count) { if (vars[j].name_off == name_off) { dup = true; } j = j + 1; }
-        if (dup) { i = i + 1; cnt; }
-
+        # this binding's raw home.
         var kind: u8 = VLOC_NONE;
         var reg:  i32 = 0;
         var off:  i64 = 0;
         resolve_home(tgt, mfn, mdv.vreg, ?kind, ?reg, ?off);
+        val net: i64 = dbg_expr_net(irfn, mdv.iid::id.InstructionId);
 
-        vars[@var_count].name_off = name_off;
-        vars[@var_count].bt       = bt;
-        vars[@var_count].is_param = dv.is_param;
-        vars[@var_count].loc_kind = kind;
-        vars[@var_count].reg      = reg;
-        vars[@var_count].offset   = off;
-        vars[@var_count].net      = dbg_expr_net(irfn, mdv.iid::id.InstructionId);
-        @var_count = @var_count + 1;
+        # a variable may have several bindings (decl + reassignments). the
+        # single-location tier emits DW_AT_location only when every non-optimized-out
+        # binding agrees on one home; a disagreement marks the variable conflicted and
+        # drops its location (deferred to #1705's loclists). an optimized-out binding
+        # (VLOC_NONE) does not constrain a stationary home.
+        var found: i32 = -1;
+        var j: u32 = start;
+        for (j < @var_count) { if (vars[j].name_off == name_off) { found = j::i32; } j = j + 1; }
+
+        if (found < 0) {
+            if (@var_count >= var_cap) { i = i + 1; cnt; }
+            vars[@var_count].name_off = name_off;
+            vars[@var_count].bt       = bt;
+            vars[@var_count].is_param = dv.is_param;
+            vars[@var_count].loc_kind = kind;
+            vars[@var_count].reg      = reg;
+            vars[@var_count].offset   = off;
+            vars[@var_count].net      = net;
+            vars[@var_count].conflict = false;
+            @var_count = @var_count + 1;
+        } or {
+            val e: *DwVar = ?vars[found::u32];
+            if (!e.conflict && kind != VLOC_NONE) {
+                if (e.loc_kind == VLOC_NONE) {
+                    e.loc_kind = kind; e.reg = reg; e.offset = off; e.net = net;
+                } or (!home_eq(e, kind, reg, off, net)) {
+                    e.conflict = true; e.loc_kind = VLOC_NONE;
+                }
+            }
+        }
         i = i + 1;
     }
 }
@@ -1733,5 +1769,26 @@ test "mach.lang.be.codegen.dwarf.emit_var_location:reg_frame_salvage" {
     var e3: [4]u8; e3[0] = 0x03; e3[1] = 0x75; e3[2] = 0x04; e3[3] = 0x9F;
     if (!buf_eq(?d, ?e3[0], 4)) { code = 1; }
     enc.buf_dnit(?d);
+    ret code;
+}
+
+# home_eq is the agreement predicate the single-location tier uses: two bindings name
+# the same home only when kind and the kind-relevant fields (register or offset) plus
+# the salvage net all match. A mismatch is what drops a re-homed variable's location.
+test "mach.lang.be.codegen.dwarf.home_eq:agreement" {
+    var code: i32 = 0;
+    var v: DwVar; v.loc_kind = VLOC_REG; v.reg = 5; v.offset = 0; v.net = 0;
+    # same register + net: agrees.
+    if (!home_eq(?v, VLOC_REG, 5, 0, 0)) { code = 1; }
+    # different register: the re-home case, must disagree (-> no DW_AT_location).
+    if (home_eq(?v, VLOC_REG, 6, 0, 0))  { code = 1; }
+    # register vs frame: disagree.
+    if (home_eq(?v, VLOC_FRAME, 0, -8, 0)) { code = 1; }
+    # same register, different net: disagree.
+    if (home_eq(?v, VLOC_REG, 5, 0, 4))  { code = 1; }
+    # frame home agreement is by offset.
+    var f: DwVar; f.loc_kind = VLOC_FRAME; f.reg = 0; f.offset = -16; f.net = 0;
+    if (!home_eq(?f, VLOC_FRAME, 0, -16, 0)) { code = 1; }
+    if (home_eq(?f, VLOC_FRAME, 0, -24, 0))  { code = 1; }
     ret code;
 }
