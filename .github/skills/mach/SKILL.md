@@ -334,11 +334,6 @@ with a module docstring (summary, optional paragraphs separated by blank `#`
 lines) before any `use`/`fwd`/decorator. Decorators sit between the docstring
 and the declaration. Document every `pub` entity.
 
-Much existing code still carries the older `# name: summary.` form (leading
-identifier, trailing period) from before the convention tightened — when
-editing such a file, match its surrounding style; use the bare form in new
-files.
-
 ## Comptime channel
 
 `$` opens the compiler-owned comptime channel — read-only: it *selects and
