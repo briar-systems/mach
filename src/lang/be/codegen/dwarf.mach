@@ -187,6 +187,8 @@ fun resolve(itn: *intern.Interner, id: intern.StrId) str {
 # name:      interned function symbol name (the reloc target for its address)
 # offset:    byte offset of the function within `.text`
 # size:      byte length of the function body
+# weak:      true for a weak (monomorphized generic-instance) definition the linker
+#            deduplicates to a single winner across objects
 # disp:      readable source name for DW_AT_name, or STR_NIL to fall back to `name`
 # disp_off:  byte offset of the DW_AT_name string within `.debug_str`
 # external:  true when the symbol has global linkage (DW_AT_external)
@@ -198,6 +200,7 @@ rec DwFunc {
     name:      intern.StrId;
     offset:    u32;
     size:      u32;
+    weak:      bool;
     disp:      intern.StrId;
     disp_off:  u32;
     external:  bool;
@@ -821,6 +824,7 @@ fun gather_funcs(image: *of.ObjectImage, text_sec: u32, out: *DwFunc) {
             out[n].name     = sym.name;
             out[n].offset   = sym.offset;
             out[n].external = (sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0;
+            out[n].weak     = (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0;
             n = n + 1;
         }
         i = i + 1;
@@ -955,33 +959,57 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, ima
     var name: str = comp_dir;
     if (ft.count > 0) { name = file_path(s, ft.ids[0]); }
 
-    # low_pc is the lowest function, high_pc the span to the last function's end.
-    val high_pc: u64 = (funcs[nfuncs - 1].offset + funcs[nfuncs - 1].size - funcs[0].offset)::u64;
+    # subprograms cover only this module's own (non-weak) functions. a weak
+    # generic-instance copy is deduplicated by the linker to one winner, so a
+    # non-winning object's subprogram DIE would relocate outside its CU's contiguous
+    # range - an invalid parent/child range. their names return with COMDAT-style
+    # debug info in the multi-TU increment. the line table still covers every function.
+    val rs2: R.Result[*DwFunc, str] = A.allocate[DwFunc](s.alloc, nfuncs::usize);
+    if (R.is_err[*DwFunc, str](rs2)) { A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize); ret R.err[bool, str](R.unwrap_err[*DwFunc, str](rs2)); }
+    val subs: *DwFunc = R.unwrap_ok[*DwFunc, str](rs2);
+    var nsub: u32 = 0;
+    var si: u32 = 0;
+    for (si < nfuncs) {
+        if (!funcs[si].weak) { subs[nsub] = funcs[si]; nsub = nsub + 1; }
+        si = si + 1;
+    }
 
-    # gather base types + per-function subprogram metadata (name, decl file/line,
-    # return type), building the `.debug_str` table as names / type spellings resolve.
+    # the CU code range spans the subprogram functions (the ones this object keeps),
+    # so every emitted subprogram is contained; a module of only weak instances keeps
+    # the full-range fallback and emits no subprograms.
+    var cu_low_name: intern.StrId = funcs[0].name;
+    var high_pc: u64 = (funcs[nfuncs - 1].offset + funcs[nfuncs - 1].size - funcs[0].offset)::u64;
+    if (nsub > 0) {
+        cu_low_name = subs[0].name;
+        high_pc = (subs[nsub - 1].offset + subs[nsub - 1].size - subs[0].offset)::u64;
+    }
+
+    # gather base types + per-subprogram metadata (name, decl file/line, return type),
+    # building the `.debug_str` table as names / type spellings resolve.
     val rb: R.Result[*BaseType, str] = A.allocate[BaseType](s.alloc, MAX_BASE_TYPES::usize);
-    if (R.is_err[*BaseType, str](rb)) { A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize); ret R.err[bool, str](R.unwrap_err[*BaseType, str](rb)); }
+    if (R.is_err[*BaseType, str](rb)) { A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize); ret R.err[bool, str](R.unwrap_err[*BaseType, str](rb)); }
     val bts: *BaseType = R.unwrap_ok[*BaseType, str](rb);
     var strtab: StrTab;
     strtab.buf = enc.buf_init(s.alloc);
-    val nbt: u32 = gather_subprograms(s, irmod, funcs, nfuncs, rows, row_count, text_sec, ?ft, address_size, bts, ?strtab);
+    val nbt: u32 = gather_subprograms(s, irmod, subs, nsub, rows, row_count, text_sec, ?ft, address_size, bts, ?strtab);
 
     # per-function set_address field offsets, filled by build_line.
     val ra: R.Result[*u32, str] = A.allocate[u32](s.alloc, nfuncs::usize);
     if (R.is_err[*u32, str](ra)) {
-        enc.buf_dnit(?strtab.buf); A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+        enc.buf_dnit(?strtab.buf); A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+        A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
         ret R.err[bool, str](R.unwrap_err[*u32, str](ra));
     }
     val addr_off: *u32 = R.unwrap_ok[*u32, str](ra);
 
-    # the `.debug_info` reloc list: 2 CU + 2 per function (name strp, low_pc addr) +
+    # the `.debug_info` reloc list: 2 CU + 2 per subprogram (name strp, low_pc addr) +
     # 1 per base type (name strp).
-    val reloc_cap: u32 = 2 + 2 * nfuncs + nbt;
+    val reloc_cap: u32 = 2 + 2 * nsub + nbt;
     val rr2: R.Result[*InfoReloc, str] = A.allocate[InfoReloc](s.alloc, reloc_cap::usize);
     if (R.is_err[*InfoReloc, str](rr2)) {
         A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); enc.buf_dnit(?strtab.buf);
-        A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+        A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+        A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
         ret R.err[bool, str](R.unwrap_err[*InfoReloc, str](rr2));
     }
     val info_relocs: *InfoReloc = R.unwrap_ok[*InfoReloc, str](rr2);
@@ -996,9 +1024,9 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, ima
     var low_off:  u32 = 0;
     var stmt_off: u32 = 0;
     build_info(?b_info, address_size, producer, name, comp_dir, high_pc, frame_base_reg(tgt),
-               funcs, nfuncs, bts, nbt, info_relocs, ?info_reloc_count, ?low_off, ?stmt_off);
+               subs, nsub, bts, nbt, info_relocs, ?info_reloc_count, ?low_off, ?stmt_off);
 
-    val pr: R.Result[bool, str] = install(s, image, itn, funcs, nfuncs,
+    val pr: R.Result[bool, str] = install(s, image, itn, funcs, nfuncs, cu_low_name,
                                           ?b_abbrev, ?b_line, ?b_info, ?strtab.buf, addr_off, low_off, stmt_off,
                                           info_relocs, info_reloc_count);
 
@@ -1009,6 +1037,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, ima
     A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
     A.deallocate[u32](s.alloc, addr_off, nfuncs::usize);
     A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+    A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize);
     A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
     ret pr;
 }
@@ -1129,8 +1158,9 @@ fun first_row_loc(rows: *enc.LineRow, row_count: u32, text_sec: u32, start: u32,
 # s:        session, for interning names
 # image:    the object image
 # itn:      the session interner
-# funcs:    the sorted function ranges
+# funcs:    the sorted function ranges (every function, for the line table)
 # nfuncs:   number of functions
+# cu_low_name: symbol the CU DW_AT_low_pc relocates to (the lowest subprogram)
 # b_abbrev/b_line/b_info/b_str: the built section bytes
 # addr_off: per-function set_address field offsets in `.debug_line`
 # low_off:  low_pc field offset in `.debug_info`
@@ -1138,7 +1168,7 @@ fun first_row_loc(rows: *enc.LineRow, row_count: u32, text_sec: u32, start: u32,
 # info_relocs/info_reloc_count: the deferred `.debug_info` relocations
 # ret:      ok(true), or an allocation error
 fun install(s: *session.Session, image: *of.ObjectImage, itn: *intern.Interner,
-            funcs: *DwFunc, nfuncs: u32, b_abbrev: *enc.ByteBuf, b_line: *enc.ByteBuf,
+            funcs: *DwFunc, nfuncs: u32, cu_low_name: intern.StrId, b_abbrev: *enc.ByteBuf, b_line: *enc.ByteBuf,
             b_info: *enc.ByteBuf, b_str: *enc.ByteBuf, addr_off: *u32, low_off: u32, stmt_off: u32,
             info_relocs: *InfoReloc, info_reloc_count: u32) R.Result[bool, str] {
     val n_abbrev: R.Result[intern.StrId, str] = intern.intern(itn, ".debug_abbrev");
@@ -1176,8 +1206,9 @@ fun install(s: *session.Session, image: *of.ObjectImage, itn: *intern.Interner,
     val sar: R.Result[u32, str] = add_anchor(image, str_anchor, str_sec);
     if (R.is_err[u32, str](sar)) { ret R.err[bool, str](R.unwrap_err[u32, str](sar)); }
 
-    # .debug_info: low_pc -> first function (abs64), stmt_list -> .debug_line (abs32).
-    val r1: R.Result[bool, str] = add_reloc(image, info_sec, low_off, of.RK_ABS64, funcs[0].name);
+    # .debug_info: low_pc -> the CU's lowest subprogram function (abs64), stmt_list ->
+    # .debug_line (abs32).
+    val r1: R.Result[bool, str] = add_reloc(image, info_sec, low_off, of.RK_ABS64, cu_low_name);
     if (R.is_err[bool, str](r1)) { ret r1; }
     val r2: R.Result[bool, str] = add_reloc(image, info_sec, stmt_off, of.RK_ABS32, anchor);
     if (R.is_err[bool, str](r2)) { ret r2; }
