@@ -5,6 +5,75 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Breaking
+
+- cli: the `mach check` command is removed, including its `--format json`
+  surface added in v2.13.0 — a parse-only check reports success on code that
+  cannot build; use `mach build` (#1860).
+- test: `mach test` collects tests from the whole `[project].src` tree instead
+  of the entrypoint's import closure, so a `pub` module with no in-tree
+  consumer keeps its tests; projects with previously-orphaned modules may
+  collect more tests than before (#1863).
+
+### Added
+
+- driver: **the incremental back half** - `Q_LOWER`, `Q_CODEGEN`, and `Q_LINK`
+  are bound into the query engine. Lowering and codegen cache per module keyed
+  on stable module identity; the link records a complete fingerprint (per-module
+  images, content-hashed external inputs, output path, link-affecting flags,
+  target/profile) and reports whether a re-link is needed. Cold builds are
+  unchanged; warm sessions reuse every phase (#1618).
+- driver: a reused cached phase replays the diagnostics it produced when
+  computed, so warm-session rebuilds report the same errors and warnings as a
+  cold build (#1586).
+- driver: session source-overlay API - live (unsaved) buffer text shadows
+  on-disk content as the query engine's source input, keyed by path; the
+  byte-equality cutoff re-parses exactly the overlaid module (#1588).
+- driver: a lowered-surface fingerprint firewall for `Q_LOWER` - an
+  implementation-only edit to a dependency no longer re-lowers its importers;
+  only material that can monomorphize into an importer (generic and
+  comptime-template bodies, comptime values, type layouts, signatures)
+  invalidates (#1859).
+- link/elf: `.data.rel.ro` is a first-class section kind - reloc-bearing
+  read-only globals split from `.rodata`, which is now mapped read-only from
+  load under `--pie` instead of writable-then-reprotected; `PT_GNU_RELRO`
+  covers exactly the relocated constants (#1844).
+- link/elf: target-parameterized max page size - the writer's p_align, header
+  reservation, and file-offset congruence come from the OS vtable's per-arch
+  `page_size_for` (64 KiB on linux-aarch64, matching lld's max-page-size), so
+  aarch64 images load on 16K/64K-page kernels; 4K-page targets are
+  byte-identical (#1845).
+- cli: `mach clean` - removes the output directory trees declared by the
+  manifest's `out`/`obj`/`ir`/`asm` templates; idempotent, manifest-driven,
+  no flags (#1830).
+- infra: a riscv64 self-host smoke runs in CI - the cross-built riscv64
+  compiler executes under qemu to compile a multi-block case, locking in
+  self-host support (#1852; `self-host: true` int-case key).
+- cli: `mach init` derives each scaffolded target's abi from the OS's
+  self-declared native calling convention (`native_abi` on the OS vtable) and
+  skips OSes with no composable tuple on the host - a riscv64 host scaffolds
+  riscv64, not x86_64 (#1837).
+
+### Fixed
+
+- codegen: **critical** - out-of-SSA phi merge moves materialized immediate
+  sources at full register width, defeating riscv64's width-4 sign-extension
+  re-canonicalization; a negative i32 phi constant read positive in 64-bit
+  signed compares, which miscompiled the compiler's own register allocator on
+  riscv64. With the fix the riscv64-hosted compiler self-hosts with a
+  byte-identical fixpoint (#1851).
+- driver: test-mode `main`-neutralization no longer mutates query-owned IR in
+  place; the test variant is cached under its own query key, so cached IR is
+  immutable by construction (#1858).
+- cli: `mach info` reports `riscv64` instead of `unknown` for the host
+  architecture on riscv64 builds (#1853).
+
+### Removed
+
+- cli: the dead `pub fun build` wrapper in the build command (#1840).
+
 ## [2.13.0] - 2026-07-02
 
 A follow-up hardening, cleanup, and tooling sweep over the 2.12.0 overhaul.
