@@ -1371,6 +1371,149 @@ fun write_code_signature(buf: *u8, sig_off: usize, name: *u8, code_limit: usize,
     }
 }
 
+# the laid-out `__DWARF` segment for an executable's non-allocated debug sections:
+# a non-mapped `LC_SEGMENT_64` carrying one `S_ATTR_DEBUG` `section_64` per debug
+# section, with the section bytes placed in the file below the code signature so the
+# ad-hoc signature covers them. `present` is false (and no segment emitted) when
+# there are no debug sections, leaving the image byte-identical.
+# ---
+# present:  true when the image carries a __DWARF segment
+# seg_foff: file offset of the segment's byte region
+# seg_size: on-disk byte length of the segment (filesize)
+# end:      file offset just past the debug bytes (where the code signature follows)
+# sec_offs: per-section file offset (length debug_count)
+rec MachoDwarf {
+    present:  bool;
+    seg_foff: usize;
+    seg_size: usize;
+    end:      usize;
+    sec_offs: *usize;
+}
+
+# the load-command bytes a __DWARF segment adds: the segment command plus one
+# section_64 per debug section, or 0 when there are none.
+# ---
+# debug_count: number of debug sections
+# ret:         the added sizeofcmds bytes
+fun macho_dwarf_cmd_bytes(debug_count: u32) usize {
+    if (debug_count == 0) { ret 0; }
+    ret SEGMENT_CMD_64_SIZE + debug_count::usize * SECTION_64_SIZE;
+}
+
+# plan the __DWARF segment's file region starting at offset `base` (past the linker
+# segments, below the code signature). allocates the per-section offset array on
+# success; the caller frees it through `macho_dwarf_free`. an empty plan (no debug)
+# allocates nothing.
+# ---
+# alloc:       allocator backing the plan's offset array
+# debug:       the non-allocated debug sections
+# debug_count: number of debug sections
+# base:        file offset where the segment's bytes begin
+# ret:         the layout plan, or an allocation error
+fun macho_dwarf_plan(alloc: *A.Allocator, debug: *of.Section, debug_count: u32,
+                     base: usize) R.Result[MachoDwarf, str] {
+    var d: MachoDwarf;
+    d.present = false; d.seg_foff = 0; d.seg_size = 0; d.end = base; d.sec_offs = nil;
+    if (debug_count == 0) { ret R.ok[MachoDwarf, str](d); }
+
+    val ro: R.Result[*usize, str] = A.zallocate[usize](alloc, debug_count::usize);
+    if (R.is_err[*usize, str](ro)) { ret R.err[MachoDwarf, str](R.unwrap_err[*usize, str](ro)); }
+    d.sec_offs = R.unwrap_ok[*usize, str](ro);
+
+    val seg_foff: usize = bin.align_up(base, 8);
+    var cur: usize = seg_foff;
+    var di: u32 = 0;
+    for (di < debug_count) {
+        var a: u32 = debug[di].align;
+        if (a == 0) { a = 1; }
+        cur = bin.align_up(cur, a::usize);
+        d.sec_offs[di] = cur;
+        cur = cur + debug[di].len::usize;
+        di = di + 1;
+    }
+    d.present  = true;
+    d.seg_foff = seg_foff;
+    d.seg_size = cur - seg_foff;
+    d.end      = cur;
+    ret R.ok[MachoDwarf, str](d);
+}
+
+# write the __DWARF `LC_SEGMENT_64` + its `section_64` entries at load-command
+# cursor `lc`, returning the advanced cursor. a no-op (returns `lc`) when absent.
+# the segment is non-mapped (vmsize 0); each section is `S_ATTR_DEBUG` at address 0.
+# ---
+# buf:         the output buffer
+# itn:         interner resolving the debug section names
+# debug:       the non-allocated debug sections
+# debug_count: number of debug sections
+# lc:          load-command write cursor
+# d:           the layout plan from macho_dwarf_plan
+# vmaddr:      the segment's nominal virtual address (non-mapped)
+# ret:         the advanced load-command cursor
+fun macho_dwarf_write(buf: *u8, itn: *intern.Interner, debug: *of.Section, debug_count: u32,
+                      lc: usize, d: *MachoDwarf, vmaddr: u64) usize {
+    if (!d.present) { ret lc; }
+    val cmdsize: usize = SEGMENT_CMD_64_SIZE + debug_count::usize * SECTION_64_SIZE;
+    bin.write_u32_le(buf, lc, LC_SEGMENT_64);
+    bin.write_u32_le(buf, lc + 4, cmdsize::u32);
+    write_fixed16(buf, lc + 8, "__DWARF");
+    bin.write_u64_le(buf, lc + 24, vmaddr);
+    bin.write_u64_le(buf, lc + 32, 0);
+    bin.write_u64_le(buf, lc + 40, d.seg_foff::u64);
+    bin.write_u64_le(buf, lc + 48, d.seg_size::u64);
+    bin.write_u32_le(buf, lc + 56, VM_PROT_READ);
+    bin.write_u32_le(buf, lc + 60, VM_PROT_READ);
+    bin.write_u32_le(buf, lc + 64, debug_count);
+    bin.write_u32_le(buf, lc + 68, 0);
+
+    var sh: usize = lc + SEGMENT_CMD_64_SIZE;
+    var di: u32 = 0;
+    for (di < debug_count) {
+        write_fixed16(buf, sh, resolve(itn, debug[di].name));
+        write_fixed16(buf, sh + 16, "__DWARF");
+        bin.write_u64_le(buf, sh + 32, 0);
+        bin.write_u64_le(buf, sh + 40, debug[di].len::u64);
+        bin.write_u32_le(buf, sh + 48, d.sec_offs[di]::u32);
+        bin.write_u32_le(buf, sh + 52, align_log2(debug[di].align));
+        bin.write_u32_le(buf, sh + 56, 0);
+        bin.write_u32_le(buf, sh + 60, 0);
+        bin.write_u32_le(buf, sh + 64, S_ATTR_DEBUG);
+        bin.write_u32_le(buf, sh + 68, 0);
+        bin.write_u32_le(buf, sh + 72, 0);
+        bin.write_u32_le(buf, sh + 76, 0);
+        sh = sh + SECTION_64_SIZE;
+        di = di + 1;
+    }
+    ret lc + cmdsize;
+}
+
+# copy each debug section's bytes into its planned file offset. a no-op when absent.
+# ---
+# buf:         the output buffer
+# debug:       the non-allocated debug sections
+# debug_count: number of debug sections
+# d:           the layout plan from macho_dwarf_plan
+fun macho_dwarf_write_bytes(buf: *u8, debug: *of.Section, debug_count: u32, d: *MachoDwarf) {
+    if (!d.present) { ret; }
+    var di: u32 = 0;
+    for (di < debug_count) {
+        if (debug[di].bytes != nil && debug[di].len > 0) {
+            memory.raw_copy((buf::usize + d.sec_offs[di])::ptr, debug[di].bytes::ptr, debug[di].len::usize);
+        }
+        di = di + 1;
+    }
+}
+
+# release the offset array a `macho_dwarf_plan` allocated.
+# ---
+# alloc:       allocator the array was allocated from
+# d:           the plan whose array is released
+# debug_count: number of debug sections (the array's length)
+fun macho_dwarf_free(alloc: *A.Allocator, d: *MachoDwarf, debug_count: u32) {
+    if (d.sec_offs != nil) { A.deallocate[usize](alloc, d.sec_offs, debug_count::usize); }
+    d.sec_offs = nil;
+}
+
 # write a static MH_EXECUTE Mach-O, installed as the of.ExecFn
 #
 # Frames the linker's laid-out load segments with a leading __PAGEZERO (the
@@ -1405,22 +1548,26 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
               debug: *of.Section, debug_count: u32, path: *u8, name: *u8) R.Result[bool, str] {
     if (isa_vt == nil) { ret R.err[bool, str]("macho: nil exec isa"); }
     if (path == nil)   { ret R.err[bool, str]("macho: nil exec path"); }
-    # the of.ExecFn debug-section channel (debug/debug_count) is accepted for seam
-    # conformance but not yet framed into the Mach-O image: it needs a non-mapped
-    # __DWARF segment and the ad-hoc code-signature's code_limit extended to cover
-    # the debug bytes. tracked by #1887, gated on the macOS verification runner (#1698).
     val arch_id: u32 = isa_vt.id;
     val ct: R.Result[u32, str] = cpu_type_for(arch_id);
     if (R.is_err[u32, str](ct)) { ret R.err[bool, str](R.unwrap_err[u32, str](ct)); }
+
+    # non-allocated debug sections ride in a non-mapped __DWARF segment placed below
+    # the code signature (so the ad-hoc signature's code_limit covers them). the
+    # native codesign/dyld-load verification of this path is pending the macOS runner
+    # (#1698); the structure round-trips in the of.macho parser unit test.
+    val have_dwarf: bool = debug_count > 0;
 
     # __PAGEZERO spans the low region below __TEXT; it is present whenever the image
     # base is non-zero (darwin executables always carry one). its exact span depends
     # on hdr_span, computed once the load-command size is known below.
     var has_pagezero: bool = seg_count > 0 && segs[0].vaddr > 0;
     # the linker segments, a trailing __LINKEDIT (carrying the code signature),
-    # LC_UNIXTHREAD, LC_CODE_SIGNATURE, and __PAGEZERO when the base is non-zero.
+    # LC_UNIXTHREAD, LC_CODE_SIGNATURE, __PAGEZERO when the base is non-zero, and the
+    # __DWARF segment when debug sections are present.
     var ncmds: u32 = seg_count + 3;
     if (has_pagezero) { ncmds = ncmds + 1; }
+    if (have_dwarf)   { ncmds = ncmds + 1; }
 
     var thread_state: usize = X86_THREAD_STATE64_COUNT::usize * 4;
     if (arch_is_arm64(arch_id)) { thread_state = ARM_THREAD_STATE64_COUNT::usize * 4; }
@@ -1429,6 +1576,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
     var sizeofcmds: usize = seg_count::usize * SEGMENT_CMD_64_SIZE + thread_cmd_size
                           + SEGMENT_CMD_64_SIZE + LINKEDIT_DATA_CMD_SIZE;   # __LINKEDIT + LC_CODE_SIGNATURE
     if (has_pagezero) { sizeofcmds = sizeofcmds + SEGMENT_CMD_64_SIZE; }
+    sizeofcmds = sizeofcmds + macho_dwarf_cmd_bytes(debug_count);
     val header_end: usize = MACH_HEADER_64_SIZE + sizeofcmds;
 
     # the mach header + load commands map into __TEXT's first hdr_span bytes: the
@@ -1474,6 +1622,17 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
         li = li + 1;
     }
 
+    # the __DWARF segment's byte region follows the linker segments (below the code
+    # signature so the signature covers it). extends total_size when present.
+    var dw: MachoDwarf;
+    val dwp: R.Result[MachoDwarf, str] = macho_dwarf_plan(alloc, debug, debug_count, total_size);
+    if (R.is_err[MachoDwarf, str](dwp)) {
+        if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+        ret R.err[bool, str](R.unwrap_err[MachoDwarf, str](dwp));
+    }
+    dw = R.unwrap_ok[MachoDwarf, str](dwp);
+    total_size = dw.end;
+
     # __TEXT - the first segment, now carrying the header - is the executable segment
     # the code signature authorizes: it starts at file offset 0 and spans the header
     # plus the linker's text bytes.
@@ -1482,8 +1641,9 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
     if (seg_count > 0) { exec_limit = hdr_span::u64 + segs[0].filesz::u64; }
 
     # the ad-hoc code signature lives in a trailing __LINKEDIT segment and covers
-    # every byte before it, so it is laid out last and page-aligned. codeLimit is the
-    # signature's file offset; the bytes between the last segment and it hash as zero.
+    # every byte before it (including the __DWARF bytes), so it is laid out last and
+    # page-aligned. codeLimit is the signature's file offset; the bytes between the
+    # last content and it hash as zero.
     val ident_len:     usize = codesign_ident_len(name);
     val linkedit_off:  usize = bin.align_up(total_size, EXEC_PAGE_SIZE::usize);
     val code_limit:    usize = linkedit_off;
@@ -1494,6 +1654,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
 
     val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_size);
     if (R.is_err[*u8, str](res_buf)) {
+        macho_dwarf_free(alloc, ?dw, debug_count);
         if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
         ret R.err[bool, str]("macho: exec buffer alloc failed");
     }
@@ -1559,6 +1720,11 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
         li = li + 1;
     }
 
+    # the non-mapped __DWARF segment (debug sections) between the linker segments and
+    # __LINKEDIT; its bytes sit below the code signature and hash into it.
+    lc = macho_dwarf_write(buf, itn, debug, debug_count, lc, ?dw, 0);
+    macho_dwarf_write_bytes(buf, debug, debug_count, ?dw);
+
     # __LINKEDIT carries only the ad-hoc code signature.
     lc = write_segment_cmd(buf, lc, "__LINKEDIT", linkedit_va,
                            bin.align_up_u64(linkedit_size::u64, EXEC_PAGE_SIZE),
@@ -1589,6 +1755,7 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
     # all file bytes [0, code_limit) are now in place; hash them into the signature.
     write_code_signature(buf, code_limit, name, code_limit, exec_base, exec_limit);
 
+    macho_dwarf_free(alloc, ?dw, debug_count);
     if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
 
     val wr: R.Result[bool, str] = write_file(itn, alloc, path, buf, total_size, "macho: exec");
@@ -2288,6 +2455,15 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     var ncmds: u32 = seg_cmds + 6 + dyn.lib_count;   # dyld_info,symtab,dysymtab,dylinker,entry,code_signature
     if (pie) { ncmds = ncmds + 2; }                  # LC_BUILD_VERSION + LC_UUID
 
+    # a non-mapped __DWARF segment (debug sections) is placed below the code
+    # signature so the ad-hoc signature covers it; native codesign/dyld verification
+    # is pending the macOS runner (#1698).
+    val have_dwarf: bool = debug_count > 0;
+    if (have_dwarf) {
+        sizeofcmds = sizeofcmds + macho_dwarf_cmd_bytes(debug_count);
+        ncmds = ncmds + 1;
+    }
+
     var lay: MachoDynLayout;
     # a PIE image reserves exactly one page for the header so __TEXT maps at the OS
     # base (the linker reserved that page above the base when assigning vaddrs); a
@@ -2360,6 +2536,17 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
         lay.got_seg_index = pz + seg_count + 1;   # pagezero + linker segs + stubs
     }
 
+    # the non-mapped __DWARF segment's byte region, below __LINKEDIT (and thus below
+    # the code signature, which covers it). extends `file` when present.
+    var dw: MachoDwarf;
+    val dwp: R.Result[MachoDwarf, str] = macho_dwarf_plan(alloc, debug, debug_count, file);
+    if (R.is_err[MachoDwarf, str](dwp)) {
+        A.deallocate[usize](alloc, seg_offsets, seg_count::usize);
+        ret R.err[bool, str](R.unwrap_err[MachoDwarf, str](dwp));
+    }
+    dw = R.unwrap_ok[MachoDwarf, str](dwp);
+    file = dw.end;
+
     # __LINKEDIT: the rebase stream (PIE only), then the bind stream, then the nlist
     # array (8-aligned), then strings.
     file = bin.align_up(file, page);
@@ -2394,6 +2581,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
 
     val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_size);
     if (R.is_err[*u8, str](res_buf)) {
+        macho_dwarf_free(alloc, ?dw, debug_count);
         A.deallocate[usize](alloc, seg_offsets, seg_count::usize);
         ret R.err[bool, str]("macho: dyn-exec buffer alloc failed");
     }
@@ -2474,6 +2662,11 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
                          lay.got_off::u32, 0);
         lc = sec + SECTION_64_SIZE;
     }
+
+    # the non-mapped __DWARF segment (debug sections), before __LINKEDIT; its bytes
+    # sit below the code signature and hash into it.
+    lc = macho_dwarf_write(buf, itn, debug, debug_count, lc, ?dw, 0);
+    macho_dwarf_write_bytes(buf, debug, debug_count, ?dw);
 
     # __LINKEDIT.
     lc = write_segment_cmd(buf, lc, "__LINKEDIT", lay.linkedit_va,
@@ -2631,6 +2824,7 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     val fx_r: R.Result[bool, str] =
         patch_macho_fixups(buf, arch_id, ?lay, dyn, fixups, fixup_count, seg_offsets, segs, seg_count, nimp);
     A.deallocate[usize](alloc, seg_offsets, seg_count::usize);
+    macho_dwarf_free(alloc, ?dw, debug_count);
     if (R.is_err[bool, str](fx_r)) {
         A.deallocate[u8](alloc, buf, total_size);
         ret R.err[bool, str](R.unwrap_err[bool, str](fx_r));
@@ -3857,5 +4051,100 @@ test "mach.lang.target.of.macho:exec_vtable_and_rejections" {
 test "mach.lang.target.of.macho:dyn_exec" {
     if (ts_dyn_exec(isa.ARCH_X86_64) != 0)  { ret 1; }
     if (ts_dyn_exec(isa.ARCH_AARCH64) != 0) { ret 1; }
+    ret 0;
+}
+
+# emit_exec frames the linker's non-allocated debug sections into a non-mapped
+# __DWARF segment whose bytes sit below the code signature. the of.macho parser
+# re-reads the emitted executable and recovers each debug section as SK_DEBUG with
+# byte-equal payloads under its own name. falsifies a writer that drops the debug
+# channel, mis-tags the sections, or places them outside the segment.
+fun ts_exec_debug_roundtrip() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    var code: [8]u8;
+    var k: usize = 0;
+    for (k < 8) { code[k] = 0x90; k = k + 1; }
+    val base:  u64 = 0x100000000;
+    val entry: u64 = base;
+
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = base; segs[0].filesz = 8; segs[0].memsz = 8;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?code[0];
+
+    var info_bytes: [4]u8;
+    info_bytes[0] = 0xDE; info_bytes[1] = 0xAD; info_bytes[2] = 0xBE; info_bytes[3] = 0xEF;
+    var line_bytes: [3]u8;
+    line_bytes[0] = 0x11; line_bytes[1] = 0x22; line_bytes[2] = 0x33;
+
+    val nm_info: R.Result[intern.StrId, str] = intern.intern(?itn, "__debug_info");
+    val nm_line: R.Result[intern.StrId, str] = intern.intern(?itn, "__debug_line");
+    if (R.is_err[intern.StrId, str](nm_info)) { ret 1; }
+    if (R.is_err[intern.StrId, str](nm_line)) { ret 1; }
+    val id_info: intern.StrId = R.unwrap_ok[intern.StrId, str](nm_info);
+    val id_line: intern.StrId = R.unwrap_ok[intern.StrId, str](nm_line);
+
+    var dbg: [2]of.Section;
+    dbg[0].name = id_info; dbg[0].kind = of.SK_DEBUG; dbg[0].bytes = ?info_bytes[0]; dbg[0].len = 4; dbg[0].align = 1;
+    dbg[1].name = id_line; dbg[1].kind = of.SK_DEBUG; dbg[1].bytes = ?line_bytes[0]; dbg[1].len = 3; dbg[1].align = 1;
+
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "macho_dbg");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val tpath: str = filesystem.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 1, 4096, entry,
+                                            nil::*of.ExecFunction, 0, ?dbg[0], 2, tpath::*u8, "machodbg"::*u8);
+    if (R.is_err[bool, str](em)) { filesystem.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tpath);
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_err[filesystem.Buffer, str](rb)) { ret 1; }
+    val buf: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rb);
+
+    # re-read the emitted executable through the mach-o parser.
+    var img: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?itn, buf.data, buf.len, ?img);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+
+    var found_info: bool = false;
+    var found_line: bool = false;
+    var bad: bool = false;
+    var si: u32 = 0;
+    for (si < img.section_count) {
+        val sec: *of.Section = ?img.sections[si];
+        if (sec.kind == of.SK_DEBUG && sec.name == id_info) {
+            found_info = true;
+            if (sec.len != 4 || sec.bytes == nil) { bad = true; }
+            or {
+                if (sec.bytes[0] != 0xDE || sec.bytes[1] != 0xAD
+                    || sec.bytes[2] != 0xBE || sec.bytes[3] != 0xEF) { bad = true; }
+            }
+        }
+        if (sec.kind == of.SK_DEBUG && sec.name == id_line) {
+            found_line = true;
+            if (sec.len != 3 || sec.bytes == nil) { bad = true; }
+            or {
+                if (sec.bytes[0] != 0x11 || sec.bytes[1] != 0x22 || sec.bytes[2] != 0x33) { bad = true; }
+            }
+        }
+        si = si + 1;
+    }
+
+    if (bad)         { ret 1; }
+    if (!found_info) { ret 1; }
+    if (!found_line) { ret 1; }
+    ret 0;
+}
+
+# emit_exec carries non-allocated debug sections in a __DWARF segment the parser
+# recovers as byte-equal SK_DEBUG sections.
+test "mach.lang.target.of.macho.emit_exec:debug_dwarf_roundtrip" {
+    if (ts_exec_debug_roundtrip() != 0) { ret 1; }
     ret 0;
 }
