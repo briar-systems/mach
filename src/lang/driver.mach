@@ -36,7 +36,9 @@ use O: std.types.option;
 use R: std.types.result;
 use ctime: std.chrono.time;
 
+use mach.lang.be.codegen;
 use be_linker: mach.lang.be.linker;
+use mach.lang.be.obj;
 use mach.lang.diagnostic;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
@@ -60,6 +62,7 @@ use mach.lang.session;
 use src: mach.lang.source;
 use mach.lang.target;
 use mach.lang.target.isa;
+use mach.lang.target.of;
 use mach.lang.target.os;
 use mach.lang.type;
 
@@ -231,6 +234,11 @@ pub rec PubConst {
 #                 reused across rebuilds of an unchanged module; set by
 #                 run_lower_one, nil until then. NOT freed by dnit_project - the
 #                 query DB owns it (its finalizer frees it) (#1618)
+# object_image:   borrowed pointer to this module's codegen ObjectImage, owned by
+#                 the session query DB as the Q_CODEGEN handle (keyed by stable_id)
+#                 and reused across rebuilds of an unchanged module; set by
+#                 run_codegen_one, nil until then. NOT freed by dnit_project - the
+#                 query DB owns it (its finalizer frees it) (#1618)
 # stable_id:      this module's build-stable identity (session-assigned by FQN);
 #                 unlike the discovery-order ModuleId, it survives a graph reshape,
 #                 so cross-build resolve/sema reuse remaps through it (#1579)
@@ -249,6 +257,7 @@ pub rec ModuleEntry {
     resolved:          bool;
     sema_result:       *sema.SemaResult;
     ir_module:         *ir.Module;
+    object_image:      *of.ObjectImage;
     stable_id:         session.StableModuleId;
 }
 
@@ -2175,6 +2184,7 @@ fun register_module_slot(p: *Project, fqn: intern.StrId) R.Result[session.Module
     m.resolved          = false;
     m.sema_result       = nil;
     m.ir_module         = nil;
+    m.object_image      = nil;
     p.modules[p.module_len] = m;
     p.module_len = p.module_len + 1;
 
@@ -2403,6 +2413,10 @@ fun ensure_query_pipeline(s: *session.Session) R.Result[bool, str] {
     if (!query.is_registered(?s.queries, query.Q_LOWER)) {
         val rl: R.Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_LOWER, q_lower_compute, q_lower_finalize);
         if (R.is_err[bool, str](rl)) { ret rl; }
+    }
+    if (!query.is_registered(?s.queries, query.Q_CODEGEN)) {
+        val rcg: R.Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_CODEGEN, q_codegen_compute, q_codegen_finalize);
+        if (R.is_err[bool, str](rcg)) { ret rcg; }
     }
     ret R.ok[bool, str](true);
 }
@@ -3979,6 +3993,134 @@ fun free_lower_closure(alloc: *A.Allocator, cl: *LowerClosure) {
     cl.list  = nil;
     cl.count = 0;
     cl.cap   = 0;
+}
+
+# codegen every module to an ObjectImage in topo order through the Q_CODEGEN query.
+# the active Project is installed on the session for the pass so the compute can
+# reach the per-build module graph. run_lower_pass must have run first (each
+# module's optimized IR is borrowed onto its ModuleEntry). the CLI compile path
+# drives this after run_lower_pass; the per-module objects and the link read the
+# borrowed images.
+# ---
+# p:   the active project; its topo order and per-build module graph drive the pass
+# ret: true once every module is codegen'd, or the first error
+pub fun run_codegen_pass(p: *Project) R.Result[bool, str] {
+    session.set_active_project(p.s, p::ptr);
+
+    readout.phase_begin(p.s.readout, readout.PH_CODEGEN);
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId = p.topo[i];
+        val r: R.Result[bool, str] = run_codegen_one(p, mid);
+        if (R.is_err[bool, str](r)) {
+            session.set_active_project(p.s, nil);
+            ret r;
+        }
+        i = i + 1;
+    }
+    readout.phase_end(p.s.readout, readout.PH_CODEGEN, p.topo_len, "module", "modules");
+    session.set_active_project(p.s, nil);
+    ret R.ok[bool, str](true);
+}
+
+# fetch module `mid`'s ObjectImage through Q_CODEGEN - computed fresh when its
+# optimized IR changed, reused otherwise - and borrow it onto the ModuleEntry. the
+# image is owned by the query DB; m.object_image only points at it.
+fun run_codegen_one(p: *Project, mid: session.ModuleId) R.Result[bool, str] {
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+
+    val t_item: ctime.Time = readout.item_begin(p.s.readout);
+
+    val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_CODEGEN, m.stable_id::u64);
+    if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
+    val img: *of.ObjectImage = image_handle_decode(R.unwrap_ok[*query.QueryEntry, str](e_r));
+    if (img == nil) { ret R.err[bool, str]("Q_CODEGEN produced no result handle"); }
+
+    m.object_image = img;
+    readout.item(p.s.readout, readout.PH_CODEGEN, fqn_name(p, m.fqn), t_item);
+    ret R.ok[bool, str](true);
+}
+
+# the Q_CODEGEN derived compute - generate one module's object image from its
+# optimized IR and return it as an opaque owned handle. reaches the per-build module
+# graph through the session's active Project, and records the deps that make the
+# entry incremental:
+#   - Q_LOWER(module): a change to this module's optimized IR re-codegens it, so an
+#                      unchanged lowered module reuses its object (the per-module
+#                      hash-and-skip);
+#   - Q_TARGET:        a build-config change re-codegens every module.
+# emits no assembly side-channel (the `.s` debug artifact is rendered by the CLI
+# from the borrowed IR when requested).
+fun q_codegen_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
+    val s: *session.Session = db.ctx::*session.Session;
+    if (s == nil) { ret R.err[query.QueryOutput, str]("Q_CODEGEN: query db has no session context"); }
+    val pp: ptr = session.active_project(s);
+    if (pp == nil) { ret R.err[query.QueryOutput, str]("Q_CODEGEN: no active project for the codegen pass"); }
+    val p: *Project = pp::*Project;
+
+    val stable: session.StableModuleId = key::u32::session.StableModuleId;
+    val mid: session.ModuleId = session.module_id_for_stable(s, stable);
+    if (mid == session.MODULE_NIL) { ret R.err[query.QueryOutput, str]("Q_CODEGEN: stable id not loaded this build"); }
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    val irmod: *ir.Module = m.ir_module;
+    if (irmod == nil) { ret R.err[query.QueryOutput, str]("Q_CODEGEN: module has no lowered IR"); }
+
+    val rl: R.Result[bool, str] = query.record_dep(db, query.Q_CODEGEN, key, query.Q_LOWER, key);
+    if (R.is_err[bool, str](rl)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rl)); }
+    val rt: R.Result[bool, str] = query.record_dep(db, query.Q_CODEGEN, key, query.Q_TARGET, 0);
+    if (R.is_err[bool, str](rt)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rt)); }
+
+    val res_cg: R.Result[of.ObjectImage, str] = codegen.codegen_module(s, ?p.target, irmod, nil);
+    if (R.is_err[of.ObjectImage, str](res_cg)) { ret R.err[query.QueryOutput, str](R.unwrap_err[of.ObjectImage, str](res_cg)); }
+    var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](res_cg);
+
+    val br: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](alloc, 1::usize);
+    if (R.is_err[*of.ObjectImage, str](br)) {
+        obj.dnit(?img);
+        ret R.err[query.QueryOutput, str](R.unwrap_err[*of.ObjectImage, str](br));
+    }
+    val box: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](br);
+    box[0] = img;
+    ret image_handle_encode(alloc, box);
+}
+
+# release the ObjectImage a Q_CODEGEN handle owns, called by the engine before it
+# frees the handle buffer (on recompute, invalidate, dnit).
+fun q_codegen_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
+    if (value == nil || value_len::usize < $size_of(ptr)) { ret; }
+    val slot: *ptr = value::ptr::*ptr;
+    val r: *of.ObjectImage = slot[0]::*of.ObjectImage;
+    if (r == nil) { ret; }
+    obj.dnit(r);
+    A.deallocate[of.ObjectImage](alloc, r, 1::usize);
+}
+
+# wrap a heap ObjectImage pointer as a pointer-sized opaque handle buffer - the
+# Q_CODEGEN query value. like the other back-half handles, the artifact lives in
+# the byte-buffer DB as a handle, never serialized.
+fun image_handle_encode(alloc: *A.Allocator, r: *of.ObjectImage) R.Result[query.QueryOutput, str] {
+    val n: u32 = $size_of(ptr)::u32;
+    val rb: R.Result[*u8, str] = A.allocate[u8](alloc, n::usize);
+    if (R.is_err[*u8, str](rb)) {
+        obj.dnit(r);
+        A.deallocate[of.ObjectImage](alloc, r, 1::usize);
+        ret R.err[query.QueryOutput, str](R.unwrap_err[*u8, str](rb));
+    }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+    val slot: *ptr = buf::ptr::*ptr;
+    slot[0] = r::ptr;
+    var out: query.QueryOutput;
+    out.bytes = buf;
+    out.len   = n;
+    ret R.ok[query.QueryOutput, str](out);
+}
+
+# read the ObjectImage pointer back out of a Q_CODEGEN handle entry, or nil when
+# the entry carries no value.
+fun image_handle_decode(e: *query.QueryEntry) *of.ObjectImage {
+    if (e.value == nil || e.value_len::usize < $size_of(ptr)) { ret nil; }
+    val slot: *ptr = e.value::ptr::*ptr;
+    ret slot[0]::*of.ObjectImage;
 }
 
 # append the typed pub surface of module `mid` to the fingerprint.
@@ -5700,6 +5842,15 @@ fun ut_lower_lc(s: *session.Session, stable: session.StableModuleId) query.Revis
     ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
 }
 
+# the last_changed revision of module `stable`'s Q_CODEGEN entry on session
+# `s`, or a sentinel when absent. an owned-handle shard never early-cuts, so an
+# unchanged value means the module was NOT re-codegen'd - the codegen reuse probe (#1618).
+fun ut_codegen_lc(s: *session.Session, stable: session.StableModuleId) query.Revision {
+    val e: R.Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_CODEGEN, stable::u64);
+    if (R.is_err[*query.QueryEntry, str](e)) { ret 0xFFFFFFFFFFFFFFFF; }
+    ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
+}
+
 # whether two ModuleIds name the same module by FQN text
 # across two sessions. an anonymous nominal's origin is MODULE_NIL in both; the test
 # fixtures use only named records, so two MODULE_NIL origins (with a matched decl
@@ -6283,6 +6434,76 @@ test "mach.lang.driver:incremental_lower_entry_edit_reuses_dep" {
     # the edited entry re-lowered; its unedited dependency did NOT.
     if (lc_main_2 == lc_main_1) { bad = 1; }
     if (lc_leaf_2 != lc_leaf_1) { bad = 1; }
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: a no-change rebuild re-codegens no module (every Q_CODEGEN
+# reused), while editing a module re-codegens it and reuses an unrelated sibling -
+# the per-module codegen hash-and-skip chained off Q_LOWER (#1618).
+test "mach.lang.driver:incremental_codegen_reuse_and_recompute" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    texts[0] = "use uniontest.a.fa;\nuse uniontest.b.fb;\nfun main() i32 { ret fa() + fb(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 3);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val p1r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    if (R.is_err[bool, str](run_sema_pass(?p1)))    { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p1)))   { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_codegen_pass(?p1))) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val st_a:    session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.a");
+    val st_b:    session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.b");
+    val cg_main_1: query.Revision = ut_codegen_lc(?sA, st_main);
+    val cg_a_1:    query.Revision = ut_codegen_lc(?sA, st_a);
+    val cg_b_1:    query.Revision = ut_codegen_lc(?sA, st_b);
+    dnit_project(?p1);
+
+    # build 2: no edit. every module's Q_CODEGEN must be reused.
+    val p2r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    if (R.is_err[bool, str](run_sema_pass(?p2)))    { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p2)))   { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_codegen_pass(?p2))) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (ut_codegen_lc(?sA, st_main) != cg_main_1) { bad = 1; }
+    if (ut_codegen_lc(?sA, st_a)    != cg_a_1)    { bad = 1; }
+    if (ut_codegen_lc(?sA, st_b)    != cg_b_1)    { bad = 1; }
+    dnit_project(?p2);
+
+    # build 3: edit a's body. a re-codegens (its IR changed); b is reused.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val a_path:  str = ut_cc3(?alloc, src_dir, "/", "a.mach");
+    val a_v2:    str = "pub fun fa() i32 { val t: i32 = 1; ret t; }\n";
+    if (R.is_err[bool, str](filesystem.write_file(a_path, a_v2, str_len(a_v2), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+
+    val p3r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p3r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p3: Project = R.unwrap_ok[Project, str](p3r);
+    if (R.is_err[bool, str](run_sema_pass(?p3)))    { dnit_project(?p3); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p3)))   { dnit_project(?p3); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_codegen_pass(?p3))) { dnit_project(?p3); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (ut_codegen_lc(?sA, st_a) == cg_a_1) { bad = 1; }
+    if (ut_codegen_lc(?sA, st_b) != cg_b_1) { bad = 1; }
+    dnit_project(?p3);
 
     filesystem.remove_all(?alloc, root);
     session.dnit(?sA);

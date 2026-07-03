@@ -150,9 +150,10 @@ fun fqn_name(p: *driver.Project, fqn: intern.StrId) str {
 # Semantic analysis runs over the whole module graph first; only if no module
 # reported an error does the build proceed to lower + optimize + codegen each
 # module to an ObjectImage. This ordering keeps the lowering and codegen passes
-# off a semantically broken AST. `images` (caller-owned, sized to p.module_len)
-# is filled in topo order. On failure the partial images and IR modules are torn
-# down by the caller via `free_modules`.
+# off a semantically broken AST. The per-module IR and object images are owned by
+# the session query DB (the Q_LOWER / Q_CODEGEN handles); the `irs` / `images`
+# arrays the CLI fills are shallow VIEWS, filled in topo order and never separately
+# freed.
 # ---
 # p:           the project carrying the module graph and session
 # level:       optimization pipeline level
@@ -188,7 +189,7 @@ fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: b
     # readout's `lower` phase internally; the optimization pipeline runs inside the
     # query, so lower + optimize are one cached unit. the per-module IR arrays below
     # are shallow VIEWS onto the query-owned modules for the test / codegen passes,
-    # never separately freed (see free_modules).
+    # never separately freed (the query DB owns them).
     p.opt_level = level;
     p.verify_ir = verify_ir;
     val res_lower: R.Result[bool, str] = driver.run_lower_pass(p);
@@ -218,52 +219,74 @@ fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: b
         }
     }
 
-    readout.phase_begin(p.s.readout, readout.PH_CODEGEN);
+    # codegen every module to an ObjectImage through Q_CODEGEN - memoized per module
+    # (an unchanged lowered module reuses its object), computed fresh each CLI build.
+    # run_codegen_pass borrows each module's image onto its ModuleEntry (owned by the
+    # query DB) and records the readout's `codegen` phase internally.
+    val res_codegen: R.Result[bool, str] = driver.run_codegen_pass(p);
+    if (R.is_err[bool, str](res_codegen)) {
+        ret R.err[bool, str](R.unwrap_err[bool, str](res_codegen));
+    }
+
+    # collect the query-owned images into the CLI's image view array (shallow VIEWS,
+    # never separately freed) and render the optional per-module `.ir` / `.s` debug
+    # artifacts. the `.ir` artifact is rendered from the borrowed post-pipeline IR;
+    # the `.s` artifact is rendered by a separate codegen pass (assembly is a
+    # streaming side-channel not retained in the cached image), so the cached object
+    # path stays single-pass and only a `--emit-asm` build re-runs codegen.
     i = 0;
     for (i < p.topo_len) {
-        val mid: session.ModuleId   = p.topo[i];
+        val mid: session.ModuleId    = p.topo[i];
         val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
+        val img: *of.ObjectImage     = m.object_image;
+        images[mid::u32]      = @img;
+        image_ready[mid::u32] = true;
 
-        val t_item: ctime.Time = readout.item_begin(p.s.readout);
-
-        # textual SSA IR, rendered from the final post-pipeline module the object
-        # is built from (matching the `.s` artifact rendered during codegen below).
         if (ea.want_ir) {
-            val res_emit: R.Result[bool, str] = emit_ir(p, ea, m.fqn, ?irs[mid::u32]);
+            val res_emit: R.Result[bool, str] = emit_ir(p, ea, m.fqn, m.ir_module);
             if (R.is_err[bool, str](res_emit)) {
                 ret R.err[bool, str](R.unwrap_err[bool, str](res_emit));
             }
         }
-
-        # codegen, optionally rendering the resolved MIR to a `.s` artifact.
-        var asm_file: filesystem.File;
-        var asm_w:    writer.Writer;
-        var asm_out:  *writer.Writer = nil;
         if (ea.want_asm) {
-            val res_open: R.Result[bool, str] = open_asm(p, ea, m.fqn, ?asm_file, ?asm_w);
-            if (R.is_err[bool, str](res_open)) {
-                ret R.err[bool, str](R.unwrap_err[bool, str](res_open));
-            }
-            asm_out = ?asm_w;
-        }
-
-        val res_codegen: R.Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, ?irs[mid::u32], asm_out);
-        if (ea.want_asm) {
-            val res_close: R.Result[bool, str] = filesystem.close(?asm_file);
-            if (R.is_ok[of.ObjectImage, str](res_codegen) && R.is_err[bool, str](res_close)) {
-                ret R.err[bool, str](R.unwrap_err[bool, str](res_close));
+            val res_asm: R.Result[bool, str] = emit_asm(p, ea, m.fqn, m.ir_module);
+            if (R.is_err[bool, str](res_asm)) {
+                ret R.err[bool, str](R.unwrap_err[bool, str](res_asm));
             }
         }
-        if (R.is_err[of.ObjectImage, str](res_codegen)) {
-            ret R.err[bool, str](R.unwrap_err[of.ObjectImage, str](res_codegen));
-        }
-        images[mid::u32]      = R.unwrap_ok[of.ObjectImage, str](res_codegen);
-        image_ready[mid::u32] = true;
-
-        readout.item(p.s.readout, readout.PH_CODEGEN, fqn_name(p, m.fqn), t_item);
         i = i + 1;
     }
-    readout.phase_end(p.s.readout, readout.PH_CODEGEN, p.topo_len, "module", "modules");
+    ret R.ok[bool, str](true);
+}
+
+# render one module's assembly `.s` artifact from its post-pipeline IR
+#
+# Codegen's assembly text is a streaming side-channel not retained in the cached
+# ObjectImage, so the `.s` debug artifact is produced by a separate, deterministic
+# codegen pass over the same IR the cached object was built from; the throwaway
+# image is discarded. Only reached on a `--emit-asm` build.
+# ---
+# p:   the project (for its session, target, interner)
+# ea:  the emission settings (for `asm_base`)
+# fqn: the module's interned fully-qualified name
+# m:   the post-pipeline IR module to render
+# ret: ok(true) on success, or err with the failure message
+fun emit_asm(p: *driver.Project, ea: *EmitArtifacts, fqn: intern.StrId, m: *ir.Module) R.Result[bool, str] {
+    var asm_file: filesystem.File;
+    var asm_w:    writer.Writer;
+    val res_open: R.Result[bool, str] = open_asm(p, ea, fqn, ?asm_file, ?asm_w);
+    if (R.is_err[bool, str](res_open)) { ret res_open; }
+
+    val res_codegen: R.Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, m, ?asm_w);
+    val res_close:   R.Result[bool, str]           = filesystem.close(?asm_file);
+    if (R.is_err[of.ObjectImage, str](res_codegen)) {
+        ret R.err[bool, str](R.unwrap_err[of.ObjectImage, str](res_codegen));
+    }
+    var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](res_codegen);
+    obj.dnit(?img);
+    if (R.is_err[bool, str](res_close)) {
+        ret R.err[bool, str](R.unwrap_err[bool, str](res_close));
+    }
     ret R.ok[bool, str](true);
 }
 
@@ -313,23 +336,22 @@ fun open_asm(p: *driver.Project, ea: *EmitArtifacts, fqn: intern.StrId, file: *f
     ret open_artifact(ea.asm_base, O.unwrap[str](opt_fqn), "s", file, w);
 }
 
-# tear down the per-module object images
+# compile a single build unit selected from the CLI flags
 #
-# Neither the SemaResults nor the per-module IR are freed here - both are borrowed
-# from the session query DB (the Q_SEMA / Q_LOWER handles), which owns and frees
-# them (and reuses them across rebuilds), mirroring resolve results and parsed
-# ASTs. The `irs` array the CLI fills is a shallow VIEW onto the query-owned IR.
+# The shared body behind `run` that `cmd.run` reuses so it can build one
+# artifact and then exec it; `mach build` itself iterates the build matrix
+# (`run` below). The returned `output_path`, when non-nil, is owned by `a` - the
+# caller frees it (and tears `a` down) once done with it.
 # ---
-# p:           the project carrying the module count
-# images:      the ObjectImage array to tear down
-# image_ready: per-module flag marking which `images` entries are live
-fun free_modules(p: *driver.Project,
-                 images: *of.ObjectImage, image_ready: *bool) {
-    var i: u32 = 0;
-    for (i < p.module_len) {
-        if (image_ready[i]) { obj.dnit(?images[i]); }
-        i = i + 1;
-    }
+# a:        allocator owning the session and the returned artifact path;
+#           must outlive the returned BuildResult
+# argc:     argument count including argv[0]
+# argv:     the argument vector (argc null-terminated byte pointers)
+# marks:    consumption record parallel to argv, for positional/link scanning
+# emit_obj: when true, emit a relocatable object instead of an executable
+# ret:      a BuildResult carrying the exit code and artifact path
+pub fun build(a: *A.Allocator, argc: usize, argv: **u8, marks: *bool, emit_obj: bool) BuildResult {
+    ret build_unit(a, argc, argv, marks, emit_obj, false, nil, nil, false);
 }
 
 # build the single dispatcher executable covering every collected `test`
@@ -730,10 +752,11 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
         }
     }
 
-    # per-module SemaResults are owned by the session query DB (the Q_SEMA
-    # handles) and borrowed onto each ModuleEntry by run_sema_pass, so no
-    # per-build sema array is allocated here; only the IR and object-image arrays
-    # are.
+    # the SemaResults, the optimized IR, and the object images are all owned by the
+    # session query DB (the Q_SEMA / Q_LOWER / Q_CODEGEN handles) and borrowed onto
+    # each ModuleEntry by the driver passes. the IR and object-image arrays below are
+    # per-build shallow VIEWS the CLI fills from those borrows (for the test / link /
+    # emit paths); no artifact is owned here.
     val res_irs: R.Result[*ir.Module, str] = A.allocate[ir.Module](p.s.alloc, n);
     if (R.is_err[*ir.Module, str](res_irs)) {
         print.eprint("error: out of memory\n");
@@ -798,7 +821,9 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
         code = link_artifact(p, emit_obj, root, out_override, argc, argv, marks, images, out_path);
     }
 
-    free_modules(p, images, image_ready);
+    # the irs / images arrays are shallow VIEWS onto the query-owned IR and object
+    # images (freed by the query DB on session teardown), so only the view arrays
+    # themselves are released here, never their contents.
     A.deallocate[bool](p.s.alloc, image_ready, n);
     A.deallocate[of.ObjectImage](p.s.alloc, images, n);
     A.deallocate[bool](p.s.alloc, ir_ready, n);
