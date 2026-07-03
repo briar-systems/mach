@@ -193,6 +193,24 @@ pub def FinalizeFn: fun(*u8, u32, *A.Allocator);
 # metadata kind.
 pub def RevisionFn: fun(u64) Revision;
 
+# the diagnostics-as-query-output hooks (#1586). a derived compute emits
+# diagnostics as a side effect onto the owner's sink; a reused `get` must replay
+# them so a warm session surfaces the same diagnostics a cold compute would. the
+# engine stays diagnostic-agnostic - the owner installs these through
+# set_diag_hooks, and the engine calls them only around a top-level compute or
+# reuse. all four nil leaves the engine capturing nothing.
+#
+# mark reads the sink's current length before a compute; capture snapshots
+# everything appended since that mark into an owned opaque handle stored on the
+# entry (nil when nothing was appended or on allocation failure - diagnostics are
+# advisory, so a failed capture degrades to no replay rather than aborting the
+# build); replay re-emits a handle's diagnostics into the sink on a reused get;
+# free releases a handle. the ctx passed to mark/capture/replay is db.ctx.
+pub def DiagMarkFn:    fun(ptr) u64;
+pub def DiagCaptureFn: fun(ptr, u64, *A.Allocator) ptr;
+pub def DiagReplayFn:  fun(ptr, ptr);
+pub def DiagFreeFn:    fun(ptr, *A.Allocator);
+
 # bytes produced by a derived ComputeFn; ownership transfers into the cache entry
 # on a successful compute
 # ---
@@ -226,6 +244,9 @@ pub rec Dep {
 # deps:         queries read while computing value
 # dep_len:      number of entries in deps
 # dep_cap:      allocated slots in deps
+# diags:        owned opaque handle to the diagnostics this entry's compute emitted,
+#               replayed on a reused get and freed through the owner's DiagFreeFn;
+#               nil when the compute emitted none or no diag hooks are installed
 pub rec QueryEntry {
     key:          u64;
     value:        *u8;
@@ -234,6 +255,7 @@ pub rec QueryEntry {
     deps:         *Dep;
     dep_len:      u32;
     dep_cap:      u32;
+    diags:        ptr;
 }
 
 # per-kind storage; the kind equals the shard's index in QueryDb.storage
@@ -276,12 +298,26 @@ pub rec QueryShard {
 # ctx:      opaque context handle a derived ComputeFn casts back to reach the
 #           compiler's services (e.g. the Session); installed by set_ctx, nil
 #           until then
+# diag_mark:    diagnostics-as-query-output hook: reads the sink length before a
+#               compute (#1586); nil until set_diag_hooks, which disables capture
+# diag_capture: hook that snapshots a compute's emitted diagnostics; nil until set
+# diag_replay:  hook that replays a snapshot on a reused get; nil until set
+# diag_free:    hook that releases a captured snapshot handle; nil until set
+# compute_depth: number of derived computes currently on the stack. reuse replays
+#           an entry's cached diagnostics only at depth 0 (a top-level get), so a
+#           nested reuse reached from inside another compute does not double-emit
+#           diagnostics the driver already surfaced by driving that phase directly
 pub rec QueryDb {
-    a:        *A.Allocator;
-    revision: Revision;
-    storage:  *QueryShard;
-    kinds:    u32;
-    ctx:      ptr;
+    a:            *A.Allocator;
+    revision:     Revision;
+    storage:      *QueryShard;
+    kinds:        u32;
+    ctx:          ptr;
+    diag_mark:    DiagMarkFn;
+    diag_capture: DiagCaptureFn;
+    diag_replay:  DiagReplayFn;
+    diag_free:    DiagFreeFn;
+    compute_depth: u32;
 }
 
 # initial capacities for a shard's entries array and an entry's deps array
@@ -296,11 +332,16 @@ val INITIAL_DEP_CAP:   u32 = 4;
 # ret: a new empty QueryDb, or an allocation error
 pub fun init(a: *A.Allocator) R.Result[QueryDb, str] {
     var db: QueryDb;
-    db.a        = a;
-    db.revision = 0;
-    db.storage  = nil;
-    db.kinds    = 0;
-    db.ctx      = nil;
+    db.a             = a;
+    db.revision      = 0;
+    db.storage       = nil;
+    db.kinds         = 0;
+    db.ctx           = nil;
+    db.diag_mark     = nil::DiagMarkFn;
+    db.diag_capture  = nil::DiagCaptureFn;
+    db.diag_replay   = nil::DiagReplayFn;
+    db.diag_free     = nil::DiagFreeFn;
+    db.compute_depth = 0;
     ret R.ok[QueryDb, str](db);
 }
 
@@ -396,6 +437,25 @@ pub fun register_metadata(db: *QueryDb, kind: QueryKind, lookup: RevisionFn) R.R
 # ctx: opaque handle stored verbatim and never dereferenced by the engine
 pub fun set_ctx(db: *QueryDb, ctx: ptr) {
     db.ctx = ctx;
+}
+
+# install the diagnostics-as-query-output hooks the engine uses to capture the
+# diagnostics a derived compute emits and replay them on a reused get (#1586)
+#
+# The owner (which knows about its diagnostic sink) installs all four together;
+# passing nil for any disables capture/replay entirely. Idempotent across
+# rebuilds - the owner re-installs each build, as it does set_ctx.
+# ---
+# db:      the database
+# mark:    reads the sink's current length before a compute
+# capture: snapshots the diagnostics appended since a mark into an owned handle
+# replay:  re-emits a captured handle's diagnostics into the sink
+# free:    releases a captured handle
+pub fun set_diag_hooks(db: *QueryDb, mark: DiagMarkFn, capture: DiagCaptureFn, replay: DiagReplayFn, free: DiagFreeFn) {
+    db.diag_mark    = mark;
+    db.diag_capture = capture;
+    db.diag_replay  = replay;
+    db.diag_free    = free;
 }
 
 # whether shard `kind` has been claimed by a register_* call
@@ -524,7 +584,16 @@ pub fun get(db: *QueryDb, kind: QueryKind, key: u64) R.Result[*QueryEntry, str] 
 
     val existing: *QueryEntry = entry_find(sh, key);
     if (existing != nil) {
-        if (is_entry_valid(db, existing)) { ret R.ok[*QueryEntry, str](existing); }
+        if (is_entry_valid(db, existing)) {
+            # reuse: the compute did not run, so replay its cached diagnostics into
+            # the sink. only at depth 0 (a top-level get) - a nested reuse reached
+            # from inside another compute is one the driver drives directly at depth
+            # 0 too, so replaying here as well would double-emit (#1586).
+            if (db.compute_depth == 0 && existing.diags != nil && db.diag_replay != nil::DiagReplayFn) {
+                db.diag_replay(db.ctx, existing.diags);
+            }
+            ret R.ok[*QueryEntry, str](existing);
+        }
         ret recompute(db, sh, existing, key);
     }
 
@@ -709,6 +778,7 @@ fun entry_append(db: *QueryDb, sh: *QueryShard, key: u64) R.Result[*QueryEntry, 
     entry.deps         = nil;
     entry.dep_len      = 0;
     entry.dep_cap      = 0;
+    entry.diags        = nil;
     sh.len = sh.len + 1;
     ret R.ok[*QueryEntry, str](entry);
 }
@@ -742,11 +812,15 @@ fun entry_free(db: *QueryDb, sh: *QueryShard, entry: *QueryEntry) {
     if (entry.deps != nil && entry.dep_cap > 0) {
         A.deallocate[Dep](db.a, entry.deps, entry.dep_cap::usize);
     }
+    if (entry.diags != nil && db.diag_free != nil::DiagFreeFn) {
+        db.diag_free(entry.diags, db.a);
+    }
     entry.value     = nil;
     entry.value_len = 0;
     entry.deps      = nil;
     entry.dep_len   = 0;
     entry.dep_cap   = 0;
+    entry.diags     = nil;
 }
 
 # free every entry in a shard plus the entries array itself.
@@ -807,7 +881,15 @@ fun recompute(db: *QueryDb, sh: *QueryShard, entry: *QueryEntry, key: u64) R.Res
 
     entry.dep_len = 0;
 
+    # mark the sink before the compute so its emitted diagnostics can be captured;
+    # bump the depth so a nested reuse the compute reaches does not replay (#1586).
+    var diag_mark: u64 = 0;
+    if (db.diag_mark != nil::DiagMarkFn) { diag_mark = db.diag_mark(db.ctx); }
+
+    db.compute_depth = db.compute_depth + 1;
     val res_output: R.Result[QueryOutput, str] = sh.compute(db, key, db.a);
+    db.compute_depth = db.compute_depth - 1;
+
     if (R.is_err[QueryOutput, str](res_output)) {
         # a failed compute must not leave a poisoned entry behind: it now has zero
         # deps, which is_entry_valid reads as vacuously valid, so the next get would
@@ -817,6 +899,16 @@ fun recompute(db: *QueryDb, sh: *QueryShard, entry: *QueryEntry, key: u64) R.Res
         ret R.err[*QueryEntry, str](R.unwrap_err[QueryOutput, str](res_output));
     }
     val out: QueryOutput = R.unwrap_ok[QueryOutput, str](res_output);
+
+    # capture the diagnostics this compute emitted so a later reused get can replay
+    # them (#1586). done before the early-cutoff return so an entry whose bytes are
+    # unchanged still refreshes its cached diagnostics. a nil snapshot (nothing
+    # emitted, or an advisory allocation failure) leaves the entry with none.
+    if (db.diag_capture != nil::DiagCaptureFn) {
+        val snap: ptr = db.diag_capture(db.ctx, diag_mark, db.a);
+        if (entry.diags != nil && db.diag_free != nil::DiagFreeFn) { db.diag_free(entry.diags, db.a); }
+        entry.diags = snap;
+    }
 
     # owned-handle shards never early-cut: the handle differs every compute and
     # the artifact behind it propagates by input change, so skip the byte
@@ -1099,5 +1191,123 @@ test "mach.lang.query.register_derived_owned:finalizer_frees_artifacts" {
     # dnit finalizes every live handle; a balanced count proves no leak / double-free.
     dnit(?db);
     if (t_live != 0) { ret 1; }
+    ret 0;
+}
+
+# mock diagnostic sink for the capture/replay hook tests: a length counter a
+# compute "emits" into, that the hooks snapshot and replay. a scalar stands in for
+# the real DiagList so the engine test stays free of the diagnostic module.
+var t_diag_count: usize = 0;
+
+# reset the mock sink between phases of the test.
+fun t_diag_reset() { t_diag_count = 0; }
+
+# a captured run of emitted diagnostics: just how many, since order/content is the
+# driver test's concern; this engine test asserts replay and depth suppression.
+rec TDiagSnap { n: usize; }
+
+# mark hook: the mock sink's current length.
+fun t_diag_mark(ctx: ptr) u64 { ret t_diag_count::u64; }
+
+# capture hook: snapshot the count of diagnostics appended since `mark`, or nil
+# when none were.
+fun t_diag_capture(ctx: ptr, mark: u64, a: *A.Allocator) ptr {
+    if (t_diag_count <= mark::usize) { ret nil; }
+    val sr: R.Result[*TDiagSnap, str] = A.allocate[TDiagSnap](a, 1::usize);
+    if (R.is_err[*TDiagSnap, str](sr)) { ret nil; }
+    val snap: *TDiagSnap = R.unwrap_ok[*TDiagSnap, str](sr);
+    snap.n = t_diag_count - mark::usize;
+    ret snap::ptr;
+}
+
+# replay hook: re-append a snapshot's diagnostics onto the mock sink.
+fun t_diag_replay(ctx: ptr, handle: ptr) {
+    val snap: *TDiagSnap = handle::*TDiagSnap;
+    t_diag_count = t_diag_count + snap.n;
+}
+
+# free hook: release a snapshot handle.
+fun t_diag_free(handle: ptr, a: *A.Allocator) {
+    A.deallocate[TDiagSnap](a, handle::*TDiagSnap, 1::usize);
+}
+
+# an inner derived compute that "emits" one diagnostic and returns a fixed byte, so
+# its entry is reused on an unchanged input.
+fun t_inner_diag_compute(db: *QueryDb, key: u64, a: *A.Allocator) R.Result[QueryOutput, str] {
+    val rd: R.Result[bool, str] = record_dep(db, Q_TOKENIZE, key, Q_FILE_TEXT, key);
+    if (R.is_err[bool, str](rd)) { ret R.err[QueryOutput, str](R.unwrap_err[bool, str](rd)); }
+    t_diag_count = t_diag_count + 1;
+    val rb: R.Result[*u8, str] = A.allocate[u8](a, 1);
+    if (R.is_err[*u8, str](rb)) { ret R.err[QueryOutput, str](R.unwrap_err[*u8, str](rb)); }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+    buf[0] = 1;
+    var out: QueryOutput;
+    out.bytes = buf;
+    out.len   = 1;
+    ret R.ok[QueryOutput, str](out);
+}
+
+# an outer derived compute that "emits" one diagnostic then reads the inner query,
+# so the test can observe that the nested reuse it triggers does not replay.
+fun t_outer_diag_compute(db: *QueryDb, key: u64, a: *A.Allocator) R.Result[QueryOutput, str] {
+    val rd: R.Result[bool, str] = record_dep(db, Q_PARSE, key, Q_FILE_TEXT, key);
+    if (R.is_err[bool, str](rd)) { ret R.err[QueryOutput, str](R.unwrap_err[bool, str](rd)); }
+    t_diag_count = t_diag_count + 1;
+    val g: R.Result[*QueryEntry, str] = get(db, Q_TOKENIZE, key);
+    if (R.is_err[*QueryEntry, str](g)) { ret R.err[QueryOutput, str](R.unwrap_err[*QueryEntry, str](g)); }
+    val rb: R.Result[*u8, str] = A.allocate[u8](a, 1);
+    if (R.is_err[*u8, str](rb)) { ret R.err[QueryOutput, str](R.unwrap_err[*u8, str](rb)); }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+    buf[0] = 2;
+    var out: QueryOutput;
+    out.bytes = buf;
+    out.len   = 1;
+    ret R.ok[QueryOutput, str](out);
+}
+
+# a reused entry replays its captured diagnostics on a top-level get, and a nested
+# reuse reached from inside another compute is suppressed so it does not
+# double-emit what the driver drives directly (#1586).
+test "mach.lang.query.get:reused_entry_replays_diagnostics" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_db: R.Result[QueryDb, str] = init(?alloc);
+    if (R.is_err[QueryDb, str](res_db)) { ret 1; }
+    var db: QueryDb = R.unwrap_ok[QueryDb, str](res_db);
+
+    if (R.is_err[bool, str](register_input(?db, Q_FILE_TEXT)))                        { dnit(?db); ret 1; }
+    if (R.is_err[bool, str](register_derived(?db, Q_TOKENIZE, t_inner_diag_compute))) { dnit(?db); ret 1; }
+    if (R.is_err[bool, str](register_derived(?db, Q_PARSE, t_outer_diag_compute)))    { dnit(?db); ret 1; }
+    set_diag_hooks(?db, t_diag_mark, t_diag_capture, t_diag_replay, t_diag_free);
+    if (R.is_err[bool, str](set_input(?db, Q_FILE_TEXT, 1, "x"::*u8, 1)))             { dnit(?db); ret 1; }
+
+    # cold inner compute emits its diagnostic directly.
+    t_diag_reset();
+    if (R.is_err[*QueryEntry, str](get(?db, Q_TOKENIZE, 1))) { dnit(?db); ret 1; }
+    if (t_diag_count != 1)                                   { dnit(?db); ret 1; }
+
+    # reused inner replays its one diagnostic.
+    t_diag_reset();
+    if (R.is_err[*QueryEntry, str](get(?db, Q_TOKENIZE, 1))) { dnit(?db); ret 1; }
+    if (t_diag_count != 1)                                   { dnit(?db); ret 1; }
+
+    # cold outer compute emits its own diagnostic; the nested reused inner is
+    # suppressed at depth > 0, so exactly one lands - not two.
+    t_diag_reset();
+    if (R.is_err[*QueryEntry, str](get(?db, Q_PARSE, 1))) { dnit(?db); ret 1; }
+    if (t_diag_count != 1)                                { dnit(?db); ret 1; }
+
+    # reused outer replays exactly its own captured diagnostic.
+    t_diag_reset();
+    if (R.is_err[*QueryEntry, str](get(?db, Q_PARSE, 1))) { dnit(?db); ret 1; }
+    if (t_diag_count != 1)                                { dnit(?db); ret 1; }
+
+    # invalidate drops the snapshot; a re-get recomputes and re-emits directly.
+    if (R.is_err[bool, str](invalidate(?db, Q_PARSE, 1))) { dnit(?db); ret 1; }
+    t_diag_reset();
+    if (R.is_err[*QueryEntry, str](get(?db, Q_PARSE, 1))) { dnit(?db); ret 1; }
+    if (t_diag_count != 1)                                { dnit(?db); ret 1; }
+
+    dnit(?db);
     ret 0;
 }
