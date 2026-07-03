@@ -122,8 +122,8 @@ print.printlnf("built {} in {}ms", name, elapsed);
 ## Declarations
 
 Modifiers: `pub` (public surface; without it a declaration is file-private)
-and `ext` (C-ABI external, functions only). Both apply to `fun`, `rec`, `uni`,
-`def`, `val`, `var`.
+applies to `fun`, `rec`, `uni`, `def`, `val`, `var`; `ext` (C-ABI external)
+applies to functions only.
 
 ### `def` — type alias
 
