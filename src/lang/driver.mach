@@ -60,6 +60,7 @@ use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.me.ir;
 use mach.lang.me.lower;
+use mach.lang.me.lower.testrunner;
 use mach.lang.me.pipeline;
 use mach.lang.query;
 use mach.lang.readout;
@@ -331,6 +332,9 @@ rec TargetTuple {
 # opt_level:         the optimization pipeline level the back half lowers at, set
 #                    by the CLI before run_lower_pass (defaults to the debug pipeline)
 # verify_ir:         run the IR verifier after each optimization pass during lowering
+# test_mode:         lower the test variant (the module's `main` neutralized), set by
+#                    the CLI before run_lower_pass; folds into the back-half query key
+#                    so the test and normal variants cache independently (#1858)
 pub rec Project {
     s:            *session.Session;
     config:       ProjectConfig;
@@ -361,6 +365,7 @@ pub rec Project {
 
     opt_level:    pipeline.OptLevel;
     verify_ir:    bool;
+    test_mode:    bool;
 }
 
 # seed capacities for the per-build growable arrays (module table, a module's pub
@@ -1352,6 +1357,7 @@ fun init_project(p: *Project, s: *session.Session) {
     p.topo_cap      = 0;
     p.opt_level     = pipeline.OPT_DEBUG;
     p.verify_ir     = false;
+    p.test_mode     = false;
 }
 
 # release every owned array a ProjectConfig holds (targets and their libs, deps,
@@ -3932,6 +3938,24 @@ rec LowerClosure {
     cap:   u32;
 }
 
+# bit 32 of a packed back-half query key: set for the test-mode variant.
+val BACK_HALF_TEST_BIT: u64 = 0x100000000;
+
+# the packed Q_LOWER / Q_CODEGEN key for module `stable` under build mode
+# `test_mode`: the stable id in the low 32 bits, the test-mode flag in bit 32. A
+# test build (its `main` neutralized) and a normal build cache under distinct keys,
+# so the query-owned IR is never mutated in place to switch variants (#1858).
+fun back_half_key(stable: session.StableModuleId, test_mode: bool) u64 {
+    var k: u64 = stable::u64;
+    if (test_mode) { k = k | BACK_HALF_TEST_BIT; }
+    ret k;
+}
+
+# whether a packed back-half key names the test-mode (neutralized-main) variant.
+fun back_half_key_is_test(key: u64) bool {
+    ret (key & BACK_HALF_TEST_BIT) != 0;
+}
+
 # lower every module to optimized IR in topo order through the Q_LOWER query.
 # the active Project is installed on the session for the pass so the compute can
 # reach the per-build module graph; topo order matches the sema pass. every module's
@@ -3982,7 +4006,7 @@ fun run_lower_one(p: *Project, mid: session.ModuleId) R.Result[bool, str] {
 
     val t_item: ctime.Time = readout.item_begin(p.s.readout);
 
-    val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LOWER, m.stable_id::u64);
+    val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LOWER, back_half_key(m.stable_id, p.test_mode));
     if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
     val irm: *ir.Module = ir_handle_decode(R.unwrap_ok[*query.QueryEntry, str](e_r));
     if (irm == nil) { ret R.err[bool, str]("Q_LOWER produced no result handle"); }
@@ -4005,6 +4029,11 @@ fun run_lower_one(p: *Project, mid: session.ModuleId) R.Result[bool, str] {
 #     not the direct resolve closure - is required because there is no per-hop
 #     lowering firewall: an inlined instance can originate in a transitively-
 #     imported module the direct closure omits (#1618).
+# the key packs the module's stable id with the test-mode flag (back_half_key): the
+# test-mode variant neutralizes the module's `main` on its own freshly-lowered IR
+# before caching, so the two variants cache independently and query-owned IR is never
+# mutated in place (#1858). the deps below key on the stable id alone (test-mode does
+# not fan a module's typing).
 fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
     val s: *session.Session = db.ctx::*session.Session;
     if (s == nil) { ret R.err[query.QueryOutput, str]("Q_LOWER: query db has no session context"); }
@@ -4013,6 +4042,7 @@ fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[
     val p: *Project = pp::*Project;
 
     val stable: session.StableModuleId = key::u32::session.StableModuleId;
+    val test_mode: bool = back_half_key_is_test(key);
     val mid: session.ModuleId = session.module_id_for_stable(s, stable);
     if (mid == session.MODULE_NIL) { ret R.err[query.QueryOutput, str]("Q_LOWER: stable id not loaded this build"); }
     val m: *ModuleEntry = ?p.modules[mid::u32];
@@ -4021,7 +4051,7 @@ fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[
     val sr: *sema.SemaResult = m.sema_result;
     if (sr == nil) { ret R.err[query.QueryOutput, str]("Q_LOWER: module has no sema result"); }
 
-    val rsd: R.Result[bool, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_SEMA, key);
+    val rsd: R.Result[bool, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_SEMA, stable::u64);
     if (R.is_err[bool, str](rsd)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rsd)); }
     val rt: R.Result[bool, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_TARGET, 0);
     if (R.is_err[bool, str](rt)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rt)); }
@@ -4061,6 +4091,17 @@ fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[
     if (R.is_err[bool, str](res_opt)) {
         ir.dnit(?irmod);
         ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](res_opt));
+    }
+
+    # test variant: neutralize this module's `main` into a body-less extern (the
+    # runner supplies the program entry) on the fresh IR before it is cached, so the
+    # normal variant's Q_LOWER value stays untouched.
+    if (test_mode) {
+        val res_neu: R.Result[bool, str] = testrunner.neutralize_main(s, ?irmod);
+        if (R.is_err[bool, str](res_neu)) {
+            ir.dnit(?irmod);
+            ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](res_neu));
+        }
     }
 
     val br: R.Result[*ir.Module, str] = A.allocate[ir.Module](alloc, 1::usize);
@@ -4218,7 +4259,7 @@ fun run_codegen_one(p: *Project, mid: session.ModuleId) R.Result[bool, str] {
 
     val t_item: ctime.Time = readout.item_begin(p.s.readout);
 
-    val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_CODEGEN, m.stable_id::u64);
+    val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_CODEGEN, back_half_key(m.stable_id, p.test_mode));
     if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
     val img: *of.ObjectImage = image_handle_decode(R.unwrap_ok[*query.QueryEntry, str](e_r));
     if (img == nil) { ret R.err[bool, str]("Q_CODEGEN produced no result handle"); }
@@ -4236,8 +4277,10 @@ fun run_codegen_one(p: *Project, mid: session.ModuleId) R.Result[bool, str] {
 #                      unchanged lowered module reuses its object (the per-module
 #                      hash-and-skip);
 #   - Q_TARGET:        a build-config change re-codegens every module.
-# emits no assembly side-channel (the `.s` debug artifact is rendered by the CLI
-# from the borrowed IR when requested).
+# the key is the same packed (stable id, test-mode) key as Q_LOWER, so the Q_LOWER
+# dep names the matching variant and a test build codegens the neutralized IR while a
+# normal build codegens the untouched IR (#1858). emits no assembly side-channel (the
+# `.s` debug artifact is rendered by the CLI from the borrowed IR when requested).
 fun q_codegen_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
     val s: *session.Session = db.ctx::*session.Session;
     if (s == nil) { ret R.err[query.QueryOutput, str]("Q_CODEGEN: query db has no session context"); }
@@ -6252,6 +6295,35 @@ fun ut_codegen_lc(s: *session.Session, stable: session.StableModuleId) query.Rev
     ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
 }
 
+# the last_changed revision of the Q_LOWER entry under a raw packed back-half key
+# (back_half_key), or a sentinel when absent - the variant-keyed lower reuse probe
+# for the test-mode neutralization firewall (#1858).
+fun ut_lower_lc_key(s: *session.Session, key: u64) query.Revision {
+    val e: R.Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_LOWER, key);
+    if (R.is_err[*query.QueryEntry, str](e)) { ret 0xFFFFFFFFFFFFFFFF; }
+    ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
+}
+
+# inspect the `main` function in a module's borrowed optimized IR: 1 when it is
+# neutralized (a body-less extern), 0 when it retains its body, -1 when no `main`
+# function is present - the neutralization probe for the test-mode variant (#1858).
+fun ut_mod_main_neutralized(s: *session.Session, m: *ir.Module) i32 {
+    val mr: R.Result[intern.StrId, str] = intern.intern(?s.interner, "main");
+    if (R.is_err[intern.StrId, str](mr)) { ret -1; }
+    val main_id: intern.StrId = R.unwrap_ok[intern.StrId, str](mr);
+
+    var i: u32 = 0;
+    for (i < m.function_len) {
+        val fn: *ir.Function = ?m.functions[i];
+        if (fn.name == main_id) {
+            if ((fn.flags & ir.FN_FLAG_EXTERN) != 0 && fn.block_count == 0) { ret 1; }
+            ret 0;
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
 # the last_changed revision of the project's Q_LINK entry on session `s`, or a
 # sentinel when absent. Q_LINK's value folds its inputs' revisions, so an unchanged
 # value means no link input changed - the link reuse probe (#1618).
@@ -7180,6 +7252,77 @@ test "mach.lang.driver:incremental_lower_verify_ir_toggle_relowers" {
     if (R.is_err[bool, str](run_lower_pass(?p3))) { dnit_project(?p3); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
     if (ut_lower_lc(?sA, st_main) != lc2) { bad = 1; }
     dnit_project(?p3);
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: test-mode `main`-neutralization is a variant of Q_LOWER keyed
+# on (module, test-mode), not an in-place mutation of the cached IR. A warm session
+# that lowers the test variant (its `main` neutralized) then the normal variant of the
+# same module yields correct IR for both, and the test variant's cached value is never
+# rewritten by the normal build - query-owned IR is immutable by construction (#1858).
+test "mach.lang.driver:incremental_test_mode_neutralization_variant" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    # `#[symbol("main")]` gives the entry the literal `main` linkage name (the program
+    # entry a normal build emits and a test build must neutralize); without it the
+    # entry mangles like any other symbol and nothing needs neutralizing.
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.fa;\n#[symbol(\"main\")]\nfun main() i32 { ret fa(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: test mode. Q_LOWER computes the test variant, its `main` neutralized on
+    # the fresh IR before it is cached. the borrowed IR proves the produced variant is
+    # neutralized; lc_test1 pins its cached revision.
+    val p1r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    p1.test_mode = true;
+    if (R.is_err[bool, str](run_sema_pass(?p1)))  { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p1))) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val st_main:  session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val mid1: session.ModuleId = ut_mid(?p1, ?sA, "uniontest.main");
+    if (mid1 == session.MODULE_NIL) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (ut_mod_main_neutralized(?sA, p1.modules[mid1::u32].ir_module) != 1) { bad = 2; }
+    val key_test: u64 = back_half_key(st_main, true);
+    val key_norm: u64 = back_half_key(st_main, false);
+    val lc_test1: query.Revision = ut_lower_lc_key(?sA, key_test);
+    dnit_project(?p1);
+
+    # build 2: normal mode, same session, no edit. the normal variant lowers `main`
+    # with its body intact under a distinct key; the test variant, keyed separately,
+    # is not recomputed (its cached revision is unchanged) and so stays neutralized -
+    # both variants coexist and neither wrote through the other's handle.
+    val p2r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    p2.test_mode = false;
+    if (R.is_err[bool, str](run_sema_pass(?p2)))  { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p2))) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val mid2: session.ModuleId = ut_mid(?p2, ?sA, "uniontest.main");
+    if (mid2 == session.MODULE_NIL) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (ut_mod_main_neutralized(?sA, p2.modules[mid2::u32].ir_module) != 0) { bad = 3; }
+    # the test variant's cached entry is still present and un-recomputed by the normal
+    # build (owned-handle shards never early-cut, so an unchanged revision means it was
+    # not re-lowered - it holds the same neutralized module build 1 produced).
+    if (ut_lower_lc_key(?sA, key_test) != lc_test1) { bad = 4; }
+    # the normal variant is its own live cached entry under the distinct key.
+    if (ut_lower_lc_key(?sA, key_norm) == 0xFFFFFFFFFFFFFFFF) { bad = 5; }
+    dnit_project(?p2);
 
     filesystem.remove_all(?alloc, root);
     session.dnit(?sA);
