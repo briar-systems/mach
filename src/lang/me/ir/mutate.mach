@@ -15,6 +15,7 @@
 #     own predicate (dce's dead set, mem2reg's promoted memops).
 #   - cloning: `clone_instruction`, a faithful per-instruction copy.
 
+use std.collections.map;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -22,6 +23,7 @@ use std.types.size.usize;
 use std.types.string.str;
 
 use A: std.allocator;
+use O: std.types.option;
 use R: std.types.result;
 
 use mach.lang.me.ir;
@@ -217,10 +219,13 @@ pub def EraseTest: fun(ptr, id.InstructionId) bool;
 # Survivor order is preserved; a dropped instruction's pool entry remains as a
 # ghost, reclaimed at function teardown.
 # ---
+# m:    module owning the allocator (salvage grows the function's dbg-expression pool)
 # fn:   the function whose block lists are compacted
 # ctx:  opaque state threaded to `test`
 # test: the removal predicate
-pub fun erase_marked(fn: *ir.Function, ctx: ptr, test: EraseTest) {
+# ret:  ok(true) once every marked instruction is dropped and its dbg-values
+#       salvaged, or an allocation error raised while growing the pool
+pub fun erase_marked(m: *ir.Module, fn: *ir.Function, ctx: ptr, test: EraseTest) R.Result[bool, str] {
     var b: u32 = 0;
     for (b < fn.block_count) {
         val blk: *ir.Block = ?fn.blocks[b];
@@ -231,6 +236,10 @@ pub fun erase_marked(fn: *ir.Function, ctx: ptr, test: EraseTest) {
             if (test(ctx, blk.phis[r]) == false) {
                 blk.phis[w] = blk.phis[r];
                 w = w + 1;
+            }
+            or {
+                val res: R.Result[bool, str] = salvage_dbg_values(m, fn, ctx, test, blk.phis[r]);
+                if (R.is_err[bool, str](res)) { ret res; }
             }
             r = r + 1;
         }
@@ -243,12 +252,148 @@ pub fun erase_marked(fn: *ir.Function, ctx: ptr, test: EraseTest) {
                 blk.instructions[w] = blk.instructions[r];
                 w = w + 1;
             }
+            or {
+                val res: R.Result[bool, str] = salvage_dbg_values(m, fn, ctx, test, blk.instructions[r]);
+                if (R.is_err[bool, str](res)) { ret res; }
+            }
             r = r + 1;
         }
         blk.instr_count = w;
 
         b = b + 1;
     }
+    ret R.ok[bool, str](true);
+}
+
+# salvage every debug value bound to instruction `dropped`, which erase_marked is
+# about to remove, so its variable's location survives the erase
+#
+# When `dropped` is a recoverable pure op (an add/sub of a constant) whose base
+# itself survives this erase, each debug value naming it is rebased onto the base and
+# its pooled expression gains a step recovering the old operand -- the variable's
+# value stays computable. Otherwise (an unrecoverable op, or a base that is also
+# being erased) the debug value is marked optimized out: its operand becomes the
+# null idiom, so the debugger shows *optimized out* rather than a stale value.
+# Without `-g` a function holds no debug values and the length guard makes this a
+# no-op.
+# ---
+# m:       module owning the allocator
+# fn:      the function being compacted
+# ctx:     the erase predicate's context (to test whether the base also dies)
+# test:    the erase predicate
+# dropped: the instruction id being removed
+# ret:     ok(true), or an allocation error from growing the expression pool
+fun salvage_dbg_values(m: *ir.Module, fn: *ir.Function, ctx: ptr, test: EraseTest, dropped: id.InstructionId) R.Result[bool, str] {
+    if (map.length[id.InstructionId, ir.DbgVar](fn.dbg_vars) == 0) { ret R.ok[bool, str](true); }
+
+    var base:        value.Value;
+    var op:          ir.DbgOp;
+    var recoverable: bool = false;
+    salvage_decode(fn, dropped, ?base, ?op, ?recoverable);
+
+    # the recovered expression names the base, so the base must itself survive this
+    # erase; a base that is also dying leaves nothing to compute from.
+    var base_live: bool = false;
+    if (recoverable) {
+        if (base.kind != value.VAL_INSTR) { base_live = true; }
+        or { base_live = test(ctx, base.data.instr) == false; }
+    }
+
+    var i: u32 = 0;
+    for (i < fn.instr_len) {
+        val d: *instruction.Instruction = ?fn.instrs[i];
+        if (d.kind == instruction.OP_DBG_VALUE && d.operand_count == 1
+            && d.operands[0].kind == value.VAL_INSTR && d.operands[0].data.instr == dropped) {
+            if (recoverable && base_live) {
+                val res: R.Result[bool, str] = salvage_rebase(m, fn, i::id.InstructionId, d, base, op);
+                if (R.is_err[bool, str](res)) { ret res; }
+            }
+            or {
+                # unrecoverable: mark optimized out via the null operand idiom.
+                d.operands[0] = value.const_null(d.operands[0].ty);
+            }
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# rebase debug value `iid` (the instruction `d`) onto `base` and prepend `op` to its
+# pooled expression, so the variable's value is recovered from the surviving base
+# ---
+# m:    module owning the allocator
+# fn:   the owning function
+# iid:  the OP_DBG_VALUE instruction id
+# d:    the OP_DBG_VALUE instruction (its operand is rewritten to `base`)
+# base: the surviving value the expression is rebased onto
+# op:   the recovery step mapping `base` back to the old operand
+# ret:  ok(true), or an allocation error from growing the pool
+fun salvage_rebase(m: *ir.Module, fn: *ir.Function, iid: id.InstructionId, d: *instruction.Instruction, base: value.Value, op: ir.DbgOp) R.Result[bool, str] {
+    var eid: ir.DbgExprId = ir.dbg_expr_id(fn, iid);
+    if (eid == ir.DBG_EXPR_IDENTITY) {
+        val res_new: R.Result[ir.DbgExprId, str] = ir.dbg_expr_new(m, fn, iid);
+        if (R.is_err[ir.DbgExprId, str](res_new)) {
+            ret R.err[bool, str](R.unwrap_err[ir.DbgExprId, str](res_new));
+        }
+        eid = R.unwrap_ok[ir.DbgExprId, str](res_new);
+    }
+    val res_op: R.Result[bool, str] = ir.dbg_expr_prepend_op(m, fn, eid, op);
+    if (R.is_err[bool, str](res_op)) { ret res_op; }
+    d.operands[0] = base;
+    ret R.ok[bool, str](true);
+}
+
+# decode whether instruction `dropped` is a debug-recoverable `add` / `sub` of a
+# constant, yielding the surviving base value and the expression step that recovers
+# the original operand from it
+#
+# `add base, k` and `add k, base` recover as base + k (DBG_OP_PLUS_CONST); `sub
+# base, k` recovers as base - k (DBG_OP_MINUS_CONST). `sub k, base` is not a constant
+# offset of a single value, so it is left unrecoverable.
+# ---
+# fn:          the owning function
+# dropped:     the instruction id to decode
+# base:        receives the non-constant operand (the recovery base)
+# op:          receives the recovery step (kind + immediate)
+# recoverable: receives true when a recovery was decoded
+fun salvage_decode(fn: *ir.Function, dropped: id.InstructionId, base: *value.Value, op: *ir.DbgOp, recoverable: *bool) {
+    @recoverable = false;
+    val opt_x: O.Option[*instruction.Instruction] = ir.instruction_get(fn, dropped);
+    if (O.is_none[*instruction.Instruction](opt_x)) { ret; }
+    val x: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_x);
+
+    if (x.kind == instruction.OP_ADD && x.operand_count == 2) {
+        if (x.operands[1].kind == value.VAL_CONST_INT) {
+            @base = x.operands[0];
+            @op = dbg_op(ir.DBG_OP_PLUS_CONST, x.operands[1].data.int_lit);
+            @recoverable = true;
+            ret;
+        }
+        if (x.operands[0].kind == value.VAL_CONST_INT) {
+            @base = x.operands[1];
+            @op = dbg_op(ir.DBG_OP_PLUS_CONST, x.operands[0].data.int_lit);
+            @recoverable = true;
+            ret;
+        }
+    }
+    if (x.kind == instruction.OP_SUB && x.operand_count == 2 && x.operands[1].kind == value.VAL_CONST_INT) {
+        @base = x.operands[0];
+        @op = dbg_op(ir.DBG_OP_MINUS_CONST, x.operands[1].data.int_lit);
+        @recoverable = true;
+        ret;
+    }
+}
+
+# build a DbgOp from a selector and immediate
+# ---
+# kind: DBG_OP_* selector
+# arg:  the op's u64 immediate
+# ret:  the DbgOp
+fun dbg_op(kind: u8, arg: u64) ir.DbgOp {
+    var o: ir.DbgOp;
+    o.op  = kind;
+    o.arg = arg;
+    ret o;
 }
 
 # clone instruction `src` into `dst_fn`'s pool and return the new instruction's id
