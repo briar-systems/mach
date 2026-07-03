@@ -318,6 +318,15 @@ fun lower_block_phis(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block) R.Re
         ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](rs));
     }
     val srcs: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](rs);
+    # per-copy logical width, parallel to dsts / srcs: the phi result's byte width,
+    # so an immediate incoming value materializes at the constant's true width.
+    val rw: R.Result[*u8, str] = A.allocate[u8](ctx.alloc, np::usize);
+    if (R.is_err[*u8, str](rw)) {
+        A.deallocate[u32](ctx.alloc, dsts, np::usize);
+        A.deallocate[mir.MirOperand](ctx.alloc, srcs, np::usize);
+        ret R.err[bool, str](R.unwrap_err[*u8, str](rw));
+    }
+    val wids: *u8 = R.unwrap_ok[*u8, str](rw);
 
     var err_msg: str = nil;
     # iterate the distinct predecessor block ids of `S`. preds were copied from the
@@ -369,6 +378,7 @@ fun lower_block_phis(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block) R.Re
                 if (phi.operands[k].data.int_lit::u32 == pred_id) {
                     dsts[nc] = dst_vreg;
                     srcs[nc] = lctx.lower_value(ctx, phi.operands[k + 1]);
+                    wids[nc] = lctx.op_width_of(ctx, phi.ty);
                     nc = nc + 1;
                     found = true;
                 }
@@ -378,7 +388,7 @@ fun lower_block_phis(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block) R.Re
         }
 
         if (err_msg == nil && nc > 0) {
-            val r: R.Result[bool, str] = emit_edge_copies(ctx, pred_mb, dsts, srcs, nc);
+            val r: R.Result[bool, str] = emit_edge_copies(ctx, pred_mb, dsts, srcs, wids, nc);
             if (R.is_err[bool, str](r)) { err_msg = R.unwrap_err[bool, str](r); }
         }
         pi = pi + 1;
@@ -386,6 +396,7 @@ fun lower_block_phis(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block) R.Re
 
     A.deallocate[u32](ctx.alloc, dsts, np::usize);
     A.deallocate[mir.MirOperand](ctx.alloc, srcs, np::usize);
+    A.deallocate[u8](ctx.alloc, wids, np::usize);
     if (err_msg != nil) { ret R.err[bool, str](err_msg); }
     ret R.ok[bool, str](true);
 }
@@ -423,9 +434,10 @@ fun mir_block_by_id(f: *mir.MirFunction, block_id: u32) *mir.MirBlock {
 # pred_mb: the predecessor block the copies are spliced into
 # dsts:    the per-copy destination vregs (len `n`)
 # srcs:    the per-copy source operands (len `n`)
+# wids:    the per-copy value logical width in bytes (len `n`)
 # n:       the number of copies in the edge set
 # ret:     true on success, or an allocation / lowering error
-fun emit_edge_copies(ctx: *lctx.LowerCtx, pred_mb: *mir.MirBlock, dsts: *u32, srcs: *mir.MirOperand, n: u32) R.Result[bool, str] {
+fun emit_edge_copies(ctx: *lctx.LowerCtx, pred_mb: *mir.MirBlock, dsts: *u32, srcs: *mir.MirOperand, wids: *u8, n: u32) R.Result[bool, str] {
     val re: R.Result[*bool, str] = A.allocate[bool](ctx.alloc, n::usize);
     if (R.is_err[*bool, str](re)) { ret R.err[bool, str](R.unwrap_err[*bool, str](re)); }
     val done: *bool = R.unwrap_ok[*bool, str](re);
@@ -450,7 +462,7 @@ fun emit_edge_copies(ctx: *lctx.LowerCtx, pred_mb: *mir.MirBlock, dsts: *u32, sr
         for (j < n) {
             if (done[j] == false && !dst_is_pending_src(dsts, srcs, done, n, dsts[j])) {
                 val mv: R.Result[bool, str] = insert_mov_before_terminator(ctx, pred_mb,
-                    mir.op_vreg(dsts[j]), srcs[j]);
+                    mir.op_vreg(dsts[j]), srcs[j], wids[j]);
                 if (R.is_err[bool, str](mv)) { err_msg = R.unwrap_err[bool, str](mv); j = n; cnt; }
                 done[j] = true;
                 remaining = remaining - 1;
@@ -472,8 +484,10 @@ fun emit_edge_copies(ctx: *lctx.LowerCtx, pred_mb: *mir.MirBlock, dsts: *u32, sr
             val tr: R.Result[u32, str] = lctx.new_vreg(ctx, cls);
             if (R.is_err[u32, str](tr)) { err_msg = R.unwrap_err[u32, str](tr); cnt; }
             val tmp: u32 = R.unwrap_ok[u32, str](tr);
+            # the cycle-break save is a register-to-register copy of a live value,
+            # width-agnostic; carry the full register width.
             val sv: R.Result[bool, str] = insert_mov_before_terminator(ctx, pred_mb,
-                mir.op_vreg(tmp), mir.op_vreg(freed));
+                mir.op_vreg(tmp), mir.op_vreg(freed), ctx.tgt.model.gpr_width::u8);
             if (R.is_err[bool, str](sv)) { err_msg = R.unwrap_err[bool, str](sv); cnt; }
             var d: u32 = 0;
             for (d < n) {
@@ -512,6 +526,18 @@ fun dst_is_pending_src(dsts: *u32, srcs: *mir.MirOperand, done: *bool, n: u32, v
     ret false;
 }
 
+# the width to materialize an immediate phi-merge source into a GP register. a
+# 32-bit constant rides a width-4 move so the backend re-signs it to its register
+# convention (riscv64 lp64 holds an i32 sign-extended, re-signed from the width);
+# every other width keeps the full gpr-width move, since a sub-32 store leaves a
+# target's upper register bits unspecified (an x86 `mov al` does not clear them) and
+# a 64-bit value is already register-width. mirrors mir.abi.scalar_reg_move_width,
+# which clamps argument / return materialization the same way.
+fun imm_merge_width(ctx: *lctx.LowerCtx, wid: u8) u8 {
+    if (wid == 4) { ret 4; }
+    ret ctx.tgt.model.gpr_width::u8;
+}
+
 # splice a `mir.MIR_MOV (dst) <- (src)` just before a block's terminator
 #
 # A block that is a phi predecessor ends in a branch terminator (the last
@@ -522,8 +548,9 @@ fun dst_is_pending_src(dsts: *u32, srcs: *mir.MirOperand, done: *bool, n: u32, v
 # mb:  the block to splice into; must end in a terminator
 # dst: the move destination operand
 # src: the move source operand
+# wid: the value's logical width in bytes; consulted only for an immediate source
 # ret: true on success, or an allocation / lowering error
-fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand) R.Result[bool, str] {
+fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand, wid: u8) R.Result[bool, str] {
     if (mb.instr_count == 0) {
         ret R.err[bool, str]("mir.lower_ir: phi predecessor block has no terminator");
     }
@@ -538,19 +565,28 @@ fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mi
     ops[0] = dst;
     ops[1] = src;
     var mi: mir.MirInstr;
-    # a phi merge copy is normally a register-to-register / immediate move; the
-    # full-width move copies the value's low bits intact regardless of its logical
-    # width. but a global / function symbol incoming value is its ADDRESS as an
-    # rvalue: a mir.MIR_MOV of a symbol selects to `mov dst, [sym]` (loading the
-    # symbol's contents), so it is emitted as the address-computing mir.MIR_GEP
-    # (`lea dst, [sym]`) instead - the same LEA-materialization the store /
-    # call-arg / return symbol paths use.
+    # a global / function symbol incoming value is its ADDRESS as an rvalue: a
+    # mir.MIR_MOV of a symbol selects to `mov dst, [sym]` (loading the symbol's
+    # contents), so it is emitted as the address-computing mir.MIR_GEP (`lea dst,
+    # [sym]`) instead - the same LEA-materialization the store / call-arg / return
+    # symbol paths use.
     mi.opcode        = mir.MIR_MOV;
     if (src.kind == mir.MIR_OP_SYM) { mi.opcode = mir.MIR_GEP; }
     mi.operands      = ops;
     mi.operand_count = 2;
+    # a register / symbol source transfers a value already in its target-canonical
+    # register form, so a full-width bit copy is width-agnostic and correct. an
+    # immediate source is a MATERIALIZATION of a constant, materialized at
+    # `imm_merge_width`: a 32-bit constant rides a width-4 move so the backend
+    # re-signs it to its register convention (riscv64 lp64 holds an i32
+    # sign-extended), while every other width keeps the full-register move.
     mi.width         = ctx.tgt.model.gpr_width::u8;
     mi.src_width     = ctx.tgt.model.gpr_width::u8;
+    if (src.kind == mir.MIR_OP_IMM) {
+        val iw: u8 = imm_merge_width(ctx, wid);
+        mi.width     = iw;
+        mi.src_width = iw;
+    }
     # this splice bypasses lctx.push_instr, so enforce the asm_block invariant here:
     # struct locals are not zero-initialized, and regalloc.flatten reads a non-nil
     # asm_block as an inline-asm clobber barrier.

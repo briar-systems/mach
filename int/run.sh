@@ -118,6 +118,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     case_run=exec
     case_build_target=
     case_build_flags=
+    case_self_host=false
     if [ -f "$dir/case.conf" ]; then
         while IFS= read -r line || [ -n "$line" ]; do
             case "$line" in ''|\#*) continue ;; esac
@@ -132,6 +133,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
                 run)            case_run=$value ;;
                 build-target)   case_build_target=$value ;;
                 build-flags)    case_build_flags=$value ;;
+                self-host)      case_self_host=$value ;;
                 *) echo "run.sh: $case_id/case.conf: unknown key '$key'" >&2; exit 2 ;;
             esac
         done < "$dir/case.conf"
@@ -172,7 +174,29 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
         rm -rf "$dir/out/int"
         mkdir -p "$dir/out/int"
 
-        if ! (cd "$dir" && "$compiler" dep pull && "$compiler" build . --target "$build_target" --profile "$profile" $case_build_flags -o "$relbin") >"$tmp/build.log" 2>&1; then
+        # the compiler that builds the case. normally the from-source compiler
+        # itself; a self-host case first cross-builds that compiler to the leg
+        # target and drives it under the leg's run-mode, so the case is compiled by
+        # the target-hosted compiler (the riscv64 compiler under qemu-riscv64), not
+        # the host compiler. this executes the compiler's own emitted code on the
+        # target — the coverage running produced binaries can never reach.
+        buildcc=$compiler
+        if [ "$case_self_host" = true ]; then
+            if ! (cd "$here/.." && "$compiler" build . --target "$target" --profile "$profile" -o "$tmp/selfhostcc") >"$tmp/selfhost.log" 2>&1; then
+                echo "FAIL $label (self-host cross-build)"
+                sed 's/^/    /' "$tmp/selfhost.log" >&2
+                fails=$((fails + 1))
+                rm -rf "$tmp" "$dir/out/int"
+                continue
+            fi
+            if [ "$runmode" = qemu ]; then
+                buildcc="qemu-${target##*-} $tmp/selfhostcc"
+            else
+                buildcc=$tmp/selfhostcc
+            fi
+        fi
+
+        if ! (cd "$dir" && "$compiler" dep pull && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -o "$relbin") >"$tmp/build.log" 2>&1; then
             echo "FAIL $label (build)"
             sed 's/^/    /' "$tmp/build.log" >&2
             fails=$((fails + 1))

@@ -12,6 +12,9 @@
 
 use std.allocator.page;
 use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
+use std.crypto.hash.sha256;
 use std.data.toml;
 use std.filesystem;
 use std.memory;
@@ -24,6 +27,7 @@ use std.types.char.char;
 use std.types.size.usize;
 use std.types.string.StrView;
 use std.types.string.str;
+use std.types.string.str_compare;
 use std.types.string.str_empty;
 use std.types.string.str_ends_with;
 use std.types.string.str_equals;
@@ -35,14 +39,18 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 use ctime: std.chrono.time;
+use sysos: std.system.os;
 
+use mach.lang.be.codegen;
 use be_linker: mach.lang.be.linker;
+use mach.lang.be.obj;
 use mach.lang.diagnostic;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.expr;
 use mach.lang.fe.ast.id;
 use mach.lang.fe.ast.module;
+use mach.lang.fe.ast.stmt;
 use mach.lang.fe.comptime;
 use mach.lang.fe.lexer;
 use mach.lang.fe.parser;
@@ -51,12 +59,17 @@ use mach.lang.fe.sema;
 use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.manifest;
+use mach.lang.me.ir;
+use mach.lang.me.lower;
+use mach.lang.me.lower.testrunner;
+use mach.lang.me.pipeline;
 use mach.lang.query;
 use mach.lang.readout;
 use mach.lang.session;
 use src: mach.lang.source;
 use mach.lang.target;
 use mach.lang.target.isa;
+use mach.lang.target.of;
 use mach.lang.target.os;
 use mach.lang.type;
 
@@ -223,6 +236,16 @@ pub rec PubConst {
 #                 reused across rebuilds of an unchanged module; set by
 #                 run_sema_one, nil until then. NOT freed by dnit_project - the
 #                 query DB owns it (its finalizer frees it) (#1583)
+# ir_module:      borrowed pointer to this module's optimized IR, owned by the
+#                 session query DB as the Q_LOWER handle (keyed by stable_id) and
+#                 reused across rebuilds of an unchanged module; set by
+#                 run_lower_one, nil until then. NOT freed by dnit_project - the
+#                 query DB owns it (its finalizer frees it) (#1618)
+# object_image:   borrowed pointer to this module's codegen ObjectImage, owned by
+#                 the session query DB as the Q_CODEGEN handle (keyed by stable_id)
+#                 and reused across rebuilds of an unchanged module; set by
+#                 run_codegen_one, nil until then. NOT freed by dnit_project - the
+#                 query DB owns it (its finalizer frees it) (#1618)
 # stable_id:      this module's build-stable identity (session-assigned by FQN);
 #                 unlike the discovery-order ModuleId, it survives a graph reshape,
 #                 so cross-build resolve/sema reuse remaps through it (#1579)
@@ -240,7 +263,10 @@ pub rec ModuleEntry {
     resolve_result:    *resolve.ResolveResult;
     resolved:          bool;
     sema_result:       *sema.SemaResult;
+    ir_module:         *ir.Module;
+    object_image:      *of.ObjectImage;
     stable_id:         session.StableModuleId;
+    target_gated:      bool;
 }
 
 # load state for one module during DFS.
@@ -305,6 +331,12 @@ rec TargetTuple {
 # topo:              module ids in dep-order (topo[0] has no deps within the graph)
 # topo_len:          number of entries in topo
 # topo_cap:          allocated slots in topo
+# opt_level:         the optimization pipeline level the back half lowers at, set
+#                    by the CLI before run_lower_pass (defaults to the debug pipeline)
+# verify_ir:         run the IR verifier after each optimization pass during lowering
+# test_mode:         lower the test variant (the module's `main` neutralized), set by
+#                    the CLI before run_lower_pass; folds into the back-half query key
+#                    so the test and normal variants cache independently (#1858)
 pub rec Project {
     s:            *session.Session;
     config:       ProjectConfig;
@@ -332,6 +364,15 @@ pub rec Project {
     topo:         *session.ModuleId;
     topo_len:     u32;
     topo_cap:     u32;
+
+    opt_level:    pipeline.OptLevel;
+    verify_ir:    bool;
+    test_mode:    bool;
+
+    # set only while load_all_own_src loads orphan roots, so the load walk knows a
+    # top-level `$error` guard it reaches marks a target-gated orphan to exclude
+    # rather than the fatal build error a reachable module's guard stays (#1873).
+    loading_orphans: bool;
 }
 
 # seed capacities for the per-build growable arrays (module table, a module's pub
@@ -528,8 +569,9 @@ pub fun resolve_artifact_path(alloc: *A.Allocator, project_root: str, sel: *mani
 # build_project_impl: the shared build pipeline behind both build_project_sel
 # (single target) and build_project_union (all targets). `for_union` records every
 # manifest target's tuple and flips on the union load walk (see load_config /
-# walk_comptime_if_union).
-fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Selection, for_union: bool) R.Result[Project, str] {
+# walk_comptime_if_union). `all_own_src` additionally loads every own-source module
+# as a collection root (see load_all_own_src), for `mach test`.
+fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Selection, for_union: bool, all_own_src: bool) R.Result[Project, str] {
     var p: Project;
     init_project(?p, s);
 
@@ -587,6 +629,18 @@ fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Se
         }
         ei = ei + 1;
     }
+
+    # test builds root collection at the whole source tree, not the entrypoint's
+    # import closure, so a `pub` module with no in-tree `use` consumer still has
+    # its tests collected (#1863). dfs_load dedups by FQN, so this only adds the
+    # modules the entry/union walks missed.
+    if (all_own_src) {
+        val allsrc_r: R.Result[bool, str] = load_all_own_src(?p);
+        if (R.is_err[bool, str](allsrc_r)) {
+            dnit_project(?p);
+            ret R.err[Project, str](R.unwrap_err[bool, str](allsrc_r));
+        }
+    }
     readout.phase_end(p.s.readout, readout.PH_LOAD, p.topo_len, "module", "modules");
 
     # the module table is stable past the load pass; publish every module's
@@ -639,7 +693,14 @@ fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Se
 # repeatedly on one long-lived Session: sources dedup by path and dnit_project
 # resets the session's module registries (see dnit_project's reload contract).
 pub fun build_project_sel(s: *session.Session, project_root: str, sel: *manifest.Selection) R.Result[Project, str] {
-    ret build_project_impl(s, project_root, sel, false);
+    ret build_project_impl(s, project_root, sel, false, false);
+}
+
+# build the module graph for a `mach test` invocation: like build_project_sel, but
+# additionally loads every own-source module under `[project].src` as a collection
+# root, so tests in a module no entrypoint imports are still collected (#1863).
+pub fun build_project_test(s: *session.Session, project_root: str, sel: *manifest.Selection) R.Result[Project, str] {
+    ret build_project_impl(s, project_root, sel, false, true);
 }
 
 # build the union of EVERY manifest target's AND artifact's
@@ -661,7 +722,167 @@ pub fun build_project_union(s: *session.Session, project_root: str) R.Result[Pro
     sel.artifact     = "";
     sel.want_lib     = false;
     sel.has_artifact = false;
-    ret build_project_impl(s, project_root, ?sel, true);
+    ret build_project_impl(s, project_root, ?sel, true, false);
+}
+
+# one own-source module discovered by the whole-source test walk: its interned FQN
+# and the FQN text the deterministic load order sorts on.
+rec SrcMod {
+    text: str;
+    fqn:  intern.StrId;
+}
+
+# order two discovered modules by FQN text.
+#
+# The whole-source walk visits files in filesystem `readdir` order, which is not
+# stable across hosts; sorting by FQN before loading pins the module-id assignment
+# (hence collection order and per-test rerun indices) so a test build is
+# deterministic and self-host fixpoint-stable.
+fun cmp_src_mod(a: *SrcMod, b: *SrcMod) i64 {
+    ret str_compare(a.text, b.text);
+}
+
+# load every own-source module under `[project].src` as a test-collection root.
+#
+# `mach test` collects tests from the whole source tree, not the entrypoint's
+# import closure, so a `pub` module with no in-tree `use` consumer (an editor / LSP
+# surface, say) still has its tests collected. Every `.mach` file under the src dir
+# is enumerated, mapped to its FQN, sorted for determinism, and dfs_loaded; dfs_load
+# dedups by FQN, so the already-loaded entry closure re-loads as a no-op and only
+# the orphaned modules are added.
+# the number of modules excluded from this build as target-gated orphans (#1873).
+# `mach test` reports it as the per-run "skipped N target-gated modules" note so an
+# exclusion is never silent.
+pub fun count_target_gated(p: *Project) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        if ((?p.modules[i]).target_gated) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun load_all_own_src(p: *Project) R.Result[bool, str] {
+    val root_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.project_root);
+    if (O.is_none[str](root_opt)) { ret R.err[bool, str]("project_root StrId not interned"); }
+    val src_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.dir_src);
+    if (O.is_none[str](src_opt)) { ret R.err[bool, str]("dir_src StrId not interned"); }
+    val id_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.id);
+    if (O.is_none[str](id_opt)) { ret R.err[bool, str]("project id StrId not interned"); }
+
+    val src_abs_r: R.Result[str, str] = join_path(p.s.alloc, O.unwrap[str](root_opt), O.unwrap[str](src_opt));
+    if (R.is_err[str, str](src_abs_r)) { ret R.err[bool, str](R.unwrap_err[str, str](src_abs_r)); }
+    val src_abs: str = R.unwrap_ok[str, str](src_abs_r);
+
+    var mods: vector.Vector[SrcMod] = vector.init[SrcMod](p.s.alloc);
+    val walk_r: R.Result[bool, str] = collect_src_modules(p, src_abs, str_len(src_abs), O.unwrap[str](id_opt), ?mods);
+    str_free(p.s.alloc, src_abs);
+    if (R.is_err[bool, str](walk_r)) { vector.dnit[SrcMod](?mods); ret walk_r; }
+
+    sort.sort[SrcMod](mods.data, mods.len, cmp_src_mod);
+
+    # while these orphan roots load, a top-level `$error` guard reached on a live
+    # path flags its module target-gated (excluded from the test build) instead of
+    # firing as a fatal diagnostic (#1873).
+    p.loading_orphans = true;
+    var i: usize = 0;
+    for (i < mods.len) {
+        val lr: R.Result[session.ModuleId, str] = dfs_load(p, mods.data[i].fqn);
+        if (R.is_err[session.ModuleId, str](lr)) {
+            p.loading_orphans = false;
+            vector.dnit[SrcMod](?mods);
+            ret R.err[bool, str](R.unwrap_err[session.ModuleId, str](lr));
+        }
+        i = i + 1;
+    }
+    p.loading_orphans = false;
+    vector.dnit[SrcMod](?mods);
+    ret R.ok[bool, str](true);
+}
+
+# recursively append every `.mach` module under `dir_abs` to `out`.
+#
+# `src_prefix_len` is the byte length of the project src-dir path, so each file's
+# path relative to src (the FQN tail compose_module_fqn expands) is the c-string
+# just past `<src>/`. Symlinks are not followed (info_link is an lstat): a walk
+# that chased a link could escape the tree or loop.
+fun collect_src_modules(p: *Project, dir_abs: str, src_prefix_len: usize, id_text: str, out: *vector.Vector[SrcMod]) R.Result[bool, str] {
+    val fd_raw: i64 = sysos.open(sysos.AT_FDCWD, dir_abs, sysos.O_RDONLY | sysos.O_DIRECTORY, 0);
+    if (fd_raw < 0) { ret R.err[bool, str](sysos.message(fd_raw)); }
+    val fd: i32 = fd_raw::i32;
+
+    var dbuf: [8192]u8;
+    var result: R.Result[bool, str] = R.ok[bool, str](true);
+    var reading: bool = true;
+    for (reading) {
+        val n: i64 = sysos.read_dir(fd, (?dbuf[0])::*sysos.dirent64, 8192);
+        if (n < 0)  { result = R.err[bool, str](sysos.message(n)); reading = false; }
+        or (n == 0) { reading = false; }
+        or {
+            var pos: usize = 0;
+            for (reading && pos < n::usize) {
+                val ent:    *sysos.dirent64 = ((?dbuf[0])::usize + pos)::*sysos.dirent64;
+                val reclen: usize           = ent.d_reclen::usize;
+                if (reclen == 0) { reading = false; }
+                or {
+                    val name: *u8 = ?ent.d_name[0];
+                    if (!is_dot_name(name)) {
+                        val rr: R.Result[bool, str] = visit_src_entry(p, dir_abs, name::str, src_prefix_len, id_text, out);
+                        if (R.is_err[bool, str](rr)) { result = rr; reading = false; }
+                    }
+                    pos = pos + reclen;
+                }
+            }
+        }
+    }
+    sysos.close(fd);
+    ret result;
+}
+
+# handle one directory entry: recurse into a subdirectory, or append a `.mach`
+# file's module. non-`.mach` files, symlinks, and unstattable entries are skipped.
+fun visit_src_entry(p: *Project, dir_abs: str, name: str, src_prefix_len: usize, id_text: str, out: *vector.Vector[SrcMod]) R.Result[bool, str] {
+    val child_r: R.Result[str, str] = join_path(p.s.alloc, dir_abs, name);
+    if (R.is_err[str, str](child_r)) { ret R.err[bool, str](R.unwrap_err[str, str](child_r)); }
+    val child: str = R.unwrap_ok[str, str](child_r);
+
+    var result: R.Result[bool, str] = R.ok[bool, str](true);
+    val fi_r: R.Result[filesystem.FileInfo, str] = filesystem.info_link(child);
+    if (R.is_ok[filesystem.FileInfo, str](fi_r)) {
+        val fi: filesystem.FileInfo = R.unwrap_ok[filesystem.FileInfo, str](fi_r);
+        if (filesystem.info_is_dir(?fi)) {
+            result = collect_src_modules(p, child, src_prefix_len, id_text, out);
+        }
+        or (filesystem.info_is_file(?fi) && str_ends_with(name, ".mach")) {
+            # the FQN tail is child's path relative to the src dir: the c-string just
+            # past "<src>/". compose turns '/' into '.' and strips the '.mach' suffix.
+            val rel: str = (child::usize + src_prefix_len + 1)::str;
+            val fqn_r: R.Result[intern.StrId, str] = compose_module_fqn(p, id_text, rel);
+            if (R.is_err[intern.StrId, str](fqn_r)) { result = R.err[bool, str](R.unwrap_err[intern.StrId, str](fqn_r)); }
+            or {
+                val fqn: intern.StrId = R.unwrap_ok[intern.StrId, str](fqn_r);
+                val tx:  O.Option[str] = intern.lookup(?p.s.interner, fqn);
+                if (O.is_some[str](tx)) {
+                    var sm: SrcMod;
+                    sm.text = O.unwrap[str](tx);
+                    sm.fqn  = fqn;
+                    val pr: R.Result[usize, str] = vector.push[SrcMod](out, sm);
+                    if (R.is_err[usize, str](pr)) { result = R.err[bool, str](R.unwrap_err[usize, str](pr)); }
+                }
+            }
+        }
+    }
+    str_free(p.s.alloc, child);
+    ret result;
+}
+
+# whether a directory entry name is "." or ".." (the self / parent links a walk skips).
+fun is_dot_name(name: *u8) bool {
+    if (name[0] != '.') { ret false; }
+    if (name[1] == 0) { ret true; }
+    if (name[1] == '.' && name[2] == 0) { ret true; }
+    ret false;
 }
 
 # file a `warning:` on the session diagnostic sink for a union target this build
@@ -1160,6 +1381,10 @@ fun init_project(p: *Project, s: *session.Session) {
     p.topo          = nil;
     p.topo_len      = 0;
     p.topo_cap      = 0;
+    p.opt_level     = pipeline.OPT_DEBUG;
+    p.verify_ir     = false;
+    p.test_mode     = false;
+    p.loading_orphans = false;
 }
 
 # release every owned array a ProjectConfig holds (targets and their libs, deps,
@@ -2089,6 +2314,15 @@ fun dfs_load(p: *Project, fqn: intern.StrId) R.Result[session.ModuleId, str] {
 
     p.load_status[mid::u32] = LOAD_DONE;
 
+    # a target-gated orphan (its load-time `$error` guard fired under this target)
+    # is kept out of the topo set: resolve / sema / lower / codegen all walk topo,
+    # so the module is never touched and its guard never fires. it is excluded from
+    # test collection with a per-run note (#1873). nothing depends on an orphan, so
+    # leaving it out of topo is safe.
+    if ((?p.modules[mid::u32]).target_gated) {
+        ret R.ok[session.ModuleId, str](mid);
+    }
+
     val topo_r: R.Result[bool, str] = topo_push(p, mid);
     if (R.is_err[bool, str](topo_r)) { ret R.err[session.ModuleId, str](R.unwrap_err[bool, str](topo_r)); }
 
@@ -2157,6 +2391,9 @@ fun register_module_slot(p: *Project, fqn: intern.StrId) R.Result[session.Module
     m.resolve_result    = nil;
     m.resolved          = false;
     m.sema_result       = nil;
+    m.ir_module         = nil;
+    m.object_image      = nil;
+    m.target_gated      = false;
     p.modules[p.module_len] = m;
     p.module_len = p.module_len + 1;
 
@@ -2321,19 +2558,32 @@ fun parse_module(p: *Project, mid: session.ModuleId, fqn: intern.StrId) R.Result
     if (R.is_err[str, str](path_r)) { ret R.err[bool, str](R.unwrap_err[str, str](path_r)); }
     val file_path: str = R.unwrap_ok[str, str](path_r);
 
-    val text_r: R.Result[str, str] = filesystem.read_all(p.s.alloc, file_path);
-    if (R.is_err[str, str](text_r)) {
-        str_free(p.s.alloc, file_path);
-        ret R.err[bool, str](R.unwrap_err[str, str](text_r));
+    # an active overlay shadows the on-disk content: use the live unsaved buffer
+    # text as the source input instead of reading the file, so a long-lived session
+    # builds over unsaved edits (#1588). the overlay text is borrowed from the
+    # session (never freed here); a disk read is owned and freed below.
+    var text: str = nil;
+    var text_owned: bool = false;
+    val ov: O.Option[str] = session.overlay_get(p.s, file_path);
+    if (O.is_some[str](ov)) {
+        text = O.unwrap[str](ov);
     }
-    val text: str = R.unwrap_ok[str, str](text_r);
+    or {
+        val text_r: R.Result[str, str] = filesystem.read_all(p.s.alloc, file_path);
+        if (R.is_err[str, str](text_r)) {
+            str_free(p.s.alloc, file_path);
+            ret R.err[bool, str](R.unwrap_err[str, str](text_r));
+        }
+        text = R.unwrap_ok[str, str](text_r);
+        text_owned = true;
+    }
 
     # load_source mirrors the text into the Q_FILE_TEXT input; an unchanged file's
     # input keeps its last_changed (byte-equality cutoff), so the Q_PARSE entry
     # below stays valid and its AST is reused without re-parsing.
     val fid_r: R.Result[src.FileId, str] = session.load_source(p.s, file_path, text);
     str_free(p.s.alloc, file_path);
-    str_free(p.s.alloc, text);
+    if (text_owned) { str_free(p.s.alloc, text); }
     if (R.is_err[src.FileId, str](fid_r)) { ret R.err[bool, str](R.unwrap_err[src.FileId, str](fid_r)); }
     val file_id: src.FileId = R.unwrap_ok[src.FileId, str](fid_r);
 
@@ -2362,6 +2612,10 @@ fun parse_module(p: *Project, mid: session.ModuleId, fqn: intern.StrId) R.Result
 # cross-build-stable key a reused result remaps through (#1582).
 fun ensure_query_pipeline(s: *session.Session) R.Result[bool, str] {
     query.set_ctx(?s.queries, s::ptr);
+    # bridge the session diagnostic sink to the engine so a reused phase replays
+    # the diagnostics it emitted when computed (#1586). refreshed every build like
+    # set_ctx; the session address is stable.
+    query.set_diag_hooks(?s.queries, diag_mark_hook, diag_capture_hook, diag_replay_hook, diag_free_hook);
     if (!query.is_registered(?s.queries, query.Q_PARSE)) {
         val rp: R.Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_PARSE, q_parse_compute, q_parse_finalize);
         if (R.is_err[bool, str](rp)) { ret rp; }
@@ -2382,7 +2636,62 @@ fun ensure_query_pipeline(s: *session.Session) R.Result[bool, str] {
         val rte: R.Result[bool, str] = query.register_derived(?s.queries, query.Q_TYPED_EXPORTS, q_typed_exports_compute);
         if (R.is_err[bool, str](rte)) { ret rte; }
     }
+    if (!query.is_registered(?s.queries, query.Q_LOWERED_SURFACE)) {
+        val rls: R.Result[bool, str] = query.register_derived(?s.queries, query.Q_LOWERED_SURFACE, q_lowered_surface_compute);
+        if (R.is_err[bool, str](rls)) { ret rls; }
+    }
+    if (!query.is_registered(?s.queries, query.Q_LOWER)) {
+        val rl: R.Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_LOWER, q_lower_compute, q_lower_finalize);
+        if (R.is_err[bool, str](rl)) { ret rl; }
+    }
+    if (!query.is_registered(?s.queries, query.Q_CODEGEN)) {
+        val rcg: R.Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_CODEGEN, q_codegen_compute, q_codegen_finalize);
+        if (R.is_err[bool, str](rcg)) { ret rcg; }
+    }
+    if (!query.is_registered(?s.queries, query.Q_LINK)) {
+        val rln: R.Result[bool, str] = query.register_derived(?s.queries, query.Q_LINK, q_link_compute);
+        if (R.is_err[bool, str](rln)) { ret rln; }
+    }
     ret R.ok[bool, str](true);
+}
+
+# the diagnostics-as-query-output hooks the query engine calls to capture the
+# diagnostics a derived compute emits onto the session sink and replay them on a
+# reused get (#1586). the engine is diagnostic-agnostic; these cast db.ctx back to
+# the session and bridge its `diags` sink. a captured snapshot is a heap
+# diagnostic.DiagList the query entry owns and the engine frees through
+# diag_free_hook.
+
+# read the session sink's current length, the mark a compute's diagnostics start at
+fun diag_mark_hook(ctx: ptr) u64 {
+    val s: *session.Session = ctx::*session.Session;
+    ret s.diags.len::u64;
+}
+
+# snapshot the diagnostics appended since `mark` into an owned DiagList handle, or
+# nil when the compute emitted none. an allocation failure yields nil - diagnostics
+# are advisory, so a failed capture degrades to no replay rather than aborting.
+fun diag_capture_hook(ctx: ptr, mark: u64, a: *A.Allocator) ptr {
+    val s: *session.Session = ctx::*session.Session;
+    if (s.diags.len <= mark::usize) { ret nil; }
+    val cr: R.Result[*diagnostic.DiagList, str] = diagnostic.clone_tail(?s.diags, mark::usize, a);
+    if (R.is_err[*diagnostic.DiagList, str](cr)) { ret nil; }
+    ret R.unwrap_ok[*diagnostic.DiagList, str](cr)::ptr;
+}
+
+# replay a captured snapshot into the live session sink on a reused get. the
+# advisory append failure is swallowed, as elsewhere in the diagnostic sink.
+fun diag_replay_hook(ctx: ptr, handle: ptr) {
+    val s: *session.Session = ctx::*session.Session;
+    val list: *diagnostic.DiagList = handle::*diagnostic.DiagList;
+    diagnostic.append_all(?s.diags, list);
+}
+
+# release a captured snapshot handle when its query entry is freed
+fun diag_free_hook(handle: ptr, a: *A.Allocator) {
+    val list: *diagnostic.DiagList = handle::*diagnostic.DiagList;
+    diagnostic.dnit(list);
+    A.deallocate[diagnostic.DiagList](a, list, 1::usize);
 }
 
 # the Q_PARSE derived compute - lex + parse one file into a heap
@@ -2607,6 +2916,16 @@ fun fp_u32(b: *FpBuf, v: u32) R.Result[bool, str] {
     ret R.ok[bool, str](true);
 }
 
+# append `len` raw bytes from `p`.
+fun fp_bytes(b: *FpBuf, p: *u8, len: u32) R.Result[bool, str] {
+    if (len == 0) { ret R.ok[bool, str](true); }
+    val r: R.Result[bool, str] = fp_reserve(b, len);
+    if (R.is_err[bool, str](r)) { ret r; }
+    memory.raw_copy((?b.buf[b.len])::ptr, p::ptr, len::usize);
+    b.len = b.len + len;
+    ret R.ok[bool, str](true);
+}
+
 # walk the module's decls in source order,
 # recursively loading each active `use` target, evaluating `$if`
 # predicates against the running ComptimeCtx, and registering pub comptime
@@ -2651,7 +2970,47 @@ fun walk_one_decl_for_load(p: *Project, mid: session.ModuleId, did: id.DeclId) R
     if (d.kind == decl.DECL_KIND_VAL) {
         ret register_val_for_load(p, mid, d, did);
     }
+    if (d.kind == decl.DECL_KIND_COMPTIME_ATTR) {
+        ret walk_comptime_attr_for_load(p, mid, ?d.data.comptime_attr);
+    }
     ret R.ok[bool, str](true);
+}
+
+# a top-level comptime directive reached on a live path during an orphan's load walk.
+#
+# Only meaningful while load_all_own_src loads orphan roots: a reached `$error`
+# guard is the module's self-declaration that it is not compilable for the selected
+# target, so the module is flagged target-gated and later excluded from the test
+# build (#1873). The guard is not evaluated into a diagnostic here. A reachable
+# module (loading_orphans false) is left untouched, so sema keeps its live `$error`
+# a fatal build error.
+fun walk_comptime_attr_for_load(p: *Project, mid: session.ModuleId, ca: *decl.DeclComptimeAttr) R.Result[bool, str] {
+    if (!p.loading_orphans)       { ret R.ok[bool, str](true); }
+    if (ca.target == id.EXPR_NIL) { ret R.ok[bool, str](true); }
+
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    val src_opt: O.Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
+    if (O.is_none[*src.SourceFile](src_opt)) { ret R.err[bool, str]("module file_id not found in SourceMap"); }
+    val source: str = O.unwrap[*src.SourceFile](src_opt).text;
+
+    if (comptime.is_error_call(m.a, source, ca.target)) {
+        m.target_gated = true;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# propagate transitive target-gating across a load-time dependency edge.
+#
+# While loading orphan roots, a module that depends (`use` / `fwd`) on a
+# target-gated module is itself not compilable for the selected target — a
+# platform backend that imports its gated OS/ISA layer, say — so it is gated too
+# and excluded from the test build (#1873). Returns whether `mid` is now gated, so
+# the caller can skip work a to-be-excluded module does not need.
+fun propagate_target_gate(p: *Project, mid: session.ModuleId, dep_mid: session.ModuleId) bool {
+    if (!p.loading_orphans)                       { ret false; }
+    if (!(?p.modules[dep_mid::u32]).target_gated) { ret false; }
+    (?p.modules[mid::u32]).target_gated = true;
+    ret true;
 }
 
 # load-walk a `$if` chain: every some-target branch in union mode, else the first
@@ -2855,6 +3214,10 @@ fun walk_use_for_load(p: *Project, mid: session.ModuleId, du: *decl.DeclUse) R.R
     val record_r: R.Result[bool, str] = record_dep(p, mid, dep_mid);
     if (R.is_err[bool, str](record_r)) { ret record_r; }
 
+    # a gated dependency gates the importer too; it is excluded, so skip the pub
+    # const merge it no longer needs.
+    if (propagate_target_gate(p, mid, dep_mid)) { ret R.ok[bool, str](true); }
+
     if (du.alias.len > 0) {
         ret R.ok[bool, str](true);
     }
@@ -2889,7 +3252,12 @@ fun walk_fwd_for_load(p: *Project, mid: session.ModuleId, df: *decl.DeclFwd) R.R
     if (R.is_err[session.ModuleId, str](dep_r)) { ret R.err[bool, str](R.unwrap_err[session.ModuleId, str](dep_r)); }
     val dep_mid: session.ModuleId = R.unwrap_ok[session.ModuleId, str](dep_r);
 
-    ret record_dep(p, mid, dep_mid);
+    val record_r: R.Result[bool, str] = record_dep(p, mid, dep_mid);
+    if (R.is_err[bool, str](record_r)) { ret record_r; }
+
+    # forwarding a gated module's surface gates this module too (#1873).
+    propagate_target_gate(p, mid, dep_mid);
+    ret R.ok[bool, str](true);
 }
 
 # the resolution of a `use` path into the module to load plus
@@ -3715,6 +4083,770 @@ fun q_typed_exports_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R
     ret R.ok[query.QueryOutput, str](out);
 }
 
+# the transitive import closure a Q_LOWER compute records its Q_SEMA deps over.
+# ---
+# list:  owned array of the reachable dep ModuleIds (sized to module_len)
+# count: number of populated entries in list
+# cap:   allocated length of list (the free size)
+rec LowerClosure {
+    list:  *session.ModuleId;
+    count: u32;
+    cap:   u32;
+}
+
+# bit 32 of a packed back-half query key: set for the test-mode variant.
+val BACK_HALF_TEST_BIT: u64 = 0x100000000;
+
+# the packed Q_LOWER / Q_CODEGEN key for module `stable` under build mode
+# `test_mode`: the stable id in the low 32 bits, the test-mode flag in bit 32. A
+# test build (its `main` neutralized) and a normal build cache under distinct keys,
+# so the query-owned IR is never mutated in place to switch variants (#1858).
+fun back_half_key(stable: session.StableModuleId, test_mode: bool) u64 {
+    var k: u64 = stable::u64;
+    if (test_mode) { k = k | BACK_HALF_TEST_BIT; }
+    ret k;
+}
+
+# whether a packed back-half key names the test-mode (neutralized-main) variant.
+fun back_half_key_is_test(key: u64) bool {
+    ret (key & BACK_HALF_TEST_BIT) != 0;
+}
+
+# lower every module to optimized IR in topo order through the Q_LOWER query.
+# the active Project is installed on the session for the pass so the compute can
+# reach the per-build module graph; topo order matches the sema pass. every module's
+# SemaResult (its own and its dep closure's) is already borrowed onto its ModuleEntry
+# and published to the session by a completed run_sema_pass - the monomorphizer
+# reaches a generic template's declaring module through those session registries.
+# resolve and sema must both have run first; the CLI compile path drives this after
+# run_sema_pass (build_project itself stops at resolve, #1583).
+# ---
+# p:   the active project; its topo order and per-build module graph drive the pass
+# ret: true once every module is lowered, or the first error
+pub fun run_lower_pass(p: *Project) R.Result[bool, str] {
+    session.set_active_project(p.s, p::ptr);
+
+    # publish the lowering diagnostic flags (the IR-verifier toggle) so a change to
+    # them re-lowers; set_input's early-cutoff leaves the input untouched when they
+    # are unchanged, so an unedited module's Q_LOWER stays reused.
+    var vflag: u8 = 0;
+    if (p.verify_ir) { vflag = 1; }
+    val vf: R.Result[bool, str] = query.set_input(?p.s.queries, query.Q_LOWER_FLAGS, 0, ?vflag, 1);
+    if (R.is_err[bool, str](vf)) {
+        session.set_active_project(p.s, nil);
+        ret vf;
+    }
+
+    readout.phase_begin(p.s.readout, readout.PH_LOWER);
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId = p.topo[i];
+        val r: R.Result[bool, str] = run_lower_one(p, mid);
+        if (R.is_err[bool, str](r)) {
+            session.set_active_project(p.s, nil);
+            ret r;
+        }
+        i = i + 1;
+    }
+    readout.phase_end(p.s.readout, readout.PH_LOWER, p.topo_len, "module", "modules");
+    session.set_active_project(p.s, nil);
+    ret R.ok[bool, str](true);
+}
+
+# fetch module `mid`'s optimized IR through Q_LOWER - computed fresh when its own
+# typing or any dep-closure module's LOWERED SURFACE changed, reused otherwise - and
+# borrow it onto the ModuleEntry. the IR is owned by the query DB; m.ir_module only
+# points at it.
+fun run_lower_one(p: *Project, mid: session.ModuleId) R.Result[bool, str] {
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+
+    val t_item: ctime.Time = readout.item_begin(p.s.readout);
+
+    # refresh this module's lowered-surface fingerprint NOW, in topo order, so an
+    # importer later in the pass validates its Q_LOWER against a current fingerprint:
+    # the engine's validator reads a dep's STORED last_changed without recomputing it,
+    # so a dependent is only firewalled (impl-only edit: identical bytes) or invalidated
+    # (surface change: bytes differ) correctly when its deps' fingerprints are already
+    # current. mirror of run_sema_one's Q_TYPED_EXPORTS refresh (#1859).
+    val sf_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LOWERED_SURFACE, m.stable_id::u64);
+    if (R.is_err[*query.QueryEntry, str](sf_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](sf_r)); }
+
+    val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LOWER, back_half_key(m.stable_id, p.test_mode));
+    if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
+    val irm: *ir.Module = ir_handle_decode(R.unwrap_ok[*query.QueryEntry, str](e_r));
+    if (irm == nil) { ret R.err[bool, str]("Q_LOWER produced no result handle"); }
+
+    m.ir_module = irm;
+    readout.item(p.s.readout, readout.PH_LOWER, fqn_name(p, m.fqn), t_item);
+    ret R.ok[bool, str](true);
+}
+
+# the Q_LOWERED_SURFACE derived compute - a deterministic byte fingerprint of the
+# module material that can monomorphize into an importer's IR (#1859). records a dep
+# on Q_RESOLVE(module), so any parse/resolve change refreshes it, then fingerprints
+# the module's whole source text MINUS the bodies of regular (non-generic,
+# non-comptime-param) functions: those bodies are emitted extern in importers and
+# never flow in, so an impl-only edit to one reproduces identical bytes and importers
+# reuse their lowered IR (the firewall). a generic-body, comptime-value, type-layout,
+# signature, or decorator edit changes these bytes and re-lowers importers. a plain
+# byte-valued derived kind (early-cutoff ON), keyed by StableModuleId.
+fun q_lowered_surface_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
+    val s: *session.Session = db.ctx::*session.Session;
+    if (s == nil) { ret R.err[query.QueryOutput, str]("Q_LOWERED_SURFACE: query db has no session context"); }
+    val pp: ptr = session.active_project(s);
+    if (pp == nil) { ret R.err[query.QueryOutput, str]("Q_LOWERED_SURFACE: no active project"); }
+    val p: *Project = pp::*Project;
+
+    val stable: session.StableModuleId = key::u32::session.StableModuleId;
+    val mid: session.ModuleId = session.module_id_for_stable(s, stable);
+    if (mid == session.MODULE_NIL) { ret R.err[query.QueryOutput, str]("Q_LOWERED_SURFACE: stable id not loaded this build"); }
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    val a: *ast.Ast = m.a;
+    if (a == nil) { ret R.err[query.QueryOutput, str]("Q_LOWERED_SURFACE: module has no parsed AST"); }
+
+    val rd: R.Result[bool, str] = query.record_dep(db, query.Q_LOWERED_SURFACE, key, query.Q_RESOLVE, key);
+    if (R.is_err[bool, str](rd)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rd)); }
+
+    val sf_o: O.Option[*src.SourceFile] = src.get(?s.sources, a.file_id);
+    if (O.is_none[*src.SourceFile](sf_o)) { ret R.err[query.QueryOutput, str]("Q_LOWERED_SURFACE: module source not loaded"); }
+    val text: str = O.unwrap[*src.SourceFile](sf_o).text;
+
+    var fb: FpBuf;
+    fb.alloc = alloc;
+    fb.buf   = nil;
+    fb.len   = 0;
+    fb.cap   = 0;
+
+    val wr: R.Result[bool, str] = fp_lowered_surface(?fb, a, text);
+    if (R.is_err[bool, str](wr)) {
+        if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](alloc, fb.buf, fb.cap::usize); }
+        ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](wr));
+    }
+
+    var out: query.QueryOutput;
+    out.bytes = fb.buf;
+    out.len   = fb.len;
+    ret R.ok[query.QueryOutput, str](out);
+}
+
+# append the module's lowered surface to `fb`: the whole source text minus the byte
+# ranges of regular (non-generic, non-comptime-param) function bodies. the module's
+# top-level decls are walked in source order; each such body span is skipped, so its
+# contents never enter the fingerprint. everything else - signatures, generic and
+# comptime-param bodies, comptime values, record/union layouts, decorators, use/fwd -
+# is included verbatim. body spans nest inside their decls and decls do not overlap,
+# so the skipped ranges are strictly increasing and non-overlapping.
+fun fp_lowered_surface(fb: *FpBuf, a: *ast.Ast, text: str) R.Result[bool, str] {
+    val base:  *u8    = text::*u8;
+    val total: usize  = str_len(text);
+
+    val m_opt: O.Option[*module.Module] = ast.get_module(a, a.root_module);
+    if (O.is_none[*module.Module](m_opt)) { ret fp_bytes(fb, base, total::u32); }
+    val mod_node: *module.Module = O.unwrap[*module.Module](m_opt);
+
+    var cursor: usize = 0;
+    var i: u32 = 0;
+    for (i < mod_node.decls_len) {
+        val did: id.DeclId = a.decl_ids[mod_node.decls_start + i];
+        val d_opt: O.Option[*decl.Decl] = ast.get_decl(a, did);
+        if (O.is_some[*decl.Decl](d_opt)) {
+            val bs_o: O.Option[token.Span] = regular_fn_body_span(a, O.unwrap[*decl.Decl](d_opt));
+            if (O.is_some[token.Span](bs_o)) {
+                val bs: token.Span = O.unwrap[token.Span](bs_o);
+                val w: R.Result[bool, str] = fp_bytes(fb, ?base[cursor], (bs.offset - cursor)::u32);
+                if (R.is_err[bool, str](w)) { ret w; }
+                cursor = bs.offset + bs.len;
+            }
+        }
+        i = i + 1;
+    }
+    ret fp_bytes(fb, ?base[cursor], (total - cursor)::u32);
+}
+
+# the source span of a regular function's body - the bytes to EXCLUDE from the lowered
+# surface - or none when `d` is not a body-carrying regular function. a function's body
+# flows into importers (and stays in the fingerprint) when the function is generic or
+# takes a comptime parameter; otherwise its body is emitted extern in importers and
+# excluded. non-function decls and body-less (extern/forward) functions yield none.
+fun regular_fn_body_span(a: *ast.Ast, d: *decl.Decl) O.Option[token.Span] {
+    if (d.kind != decl.DECL_KIND_FUN) { ret O.none[token.Span](); }
+    if (d.data.fun_.body == id.STMT_NIL) { ret O.none[token.Span](); }
+    if (d.data.fun_.generics_len > 0) { ret O.none[token.Span](); }
+    var pi: u32 = 0;
+    for (pi < d.data.fun_.params_len) {
+        if (a.typed_names[d.data.fun_.params_start + pi].comptime) { ret O.none[token.Span](); }
+        pi = pi + 1;
+    }
+    val st_o: O.Option[*stmt.Stmt] = ast.get_stmt(a, d.data.fun_.body);
+    if (O.is_none[*stmt.Stmt](st_o)) { ret O.none[token.Span](); }
+    ret O.some[token.Span](O.unwrap[*stmt.Stmt](st_o).span);
+}
+
+# the Q_LOWER derived compute - lower one module to optimized IR and return it as
+# an opaque owned handle. reaches the per-build module graph through the session's
+# active Project, and records the deps that make the entry incremental:
+#   - Q_SEMA(module):  a change to this module's typing re-lowers it;
+#   - Q_TARGET:        a build-config change re-lowers every module;
+#   - Q_LOWER_FLAGS:   the IR-verifier toggle re-lowers (re-runs the verifier);
+#   - Q_LOWERED_SURFACE(dep) for every module in this module's TRANSITIVE import
+#     closure: a generic/comptime instance declared in another module is monomorphized
+#     into THIS module's IR, so a change to the material that flows (its generic bodies,
+#     comptime values, type layouts, signatures) must re-lower this module - but an
+#     impl-only edit to a regular function body it also declares does NOT flow and is
+#     firewalled by the fingerprint's early-cutoff (#1859). the transitive closure -
+#     not the direct resolve closure - is required because there is no per-hop
+#     lowering firewall: an inlined instance can originate in a transitively-
+#     imported module the direct closure omits (#1618).
+# the key packs the module's stable id with the test-mode flag (back_half_key): the
+# test-mode variant neutralizes the module's `main` on its own freshly-lowered IR
+# before caching, so the two variants cache independently and query-owned IR is never
+# mutated in place (#1858). the deps below key on the stable id alone (test-mode does
+# not fan a module's typing).
+fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
+    val s: *session.Session = db.ctx::*session.Session;
+    if (s == nil) { ret R.err[query.QueryOutput, str]("Q_LOWER: query db has no session context"); }
+    val pp: ptr = session.active_project(s);
+    if (pp == nil) { ret R.err[query.QueryOutput, str]("Q_LOWER: no active project for the lower pass"); }
+    val p: *Project = pp::*Project;
+
+    val stable: session.StableModuleId = key::u32::session.StableModuleId;
+    val test_mode: bool = back_half_key_is_test(key);
+    val mid: session.ModuleId = session.module_id_for_stable(s, stable);
+    if (mid == session.MODULE_NIL) { ret R.err[query.QueryOutput, str]("Q_LOWER: stable id not loaded this build"); }
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    val a: *ast.Ast = m.a;
+    if (a == nil) { ret R.err[query.QueryOutput, str]("Q_LOWER: module has no parsed AST"); }
+    val sr: *sema.SemaResult = m.sema_result;
+    if (sr == nil) { ret R.err[query.QueryOutput, str]("Q_LOWER: module has no sema result"); }
+
+    val rsd: R.Result[bool, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_SEMA, stable::u64);
+    if (R.is_err[bool, str](rsd)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rsd)); }
+    val rt: R.Result[bool, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_TARGET, 0);
+    if (R.is_err[bool, str](rt)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rt)); }
+    # the IR-verifier toggle changes what lowering DOES (whether it runs the verifier
+    # after each optimization pass), so a toggle must re-lower even when the typed
+    # inputs are unchanged.
+    val rvf: R.Result[bool, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_LOWER_FLAGS, 0);
+    if (R.is_err[bool, str](rvf)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rvf)); }
+
+    # record a dep on the LOWERED SURFACE fingerprint of every module whose material
+    # can feed this module's lowered IR (its transitive import closure). the surface -
+    # not the full Q_SEMA - is the firewall: an impl-only edit to a dep (a regular
+    # function body, which is emitted extern here and never flows in) reproduces an
+    # identical fingerprint and this module reuses its IR, while a generic-body or
+    # comptime-value edit advances the fingerprint and re-lowers this module (#1859).
+    # each surface entry is fetched first so record_dep captures its current revision
+    # (run_lower_one refreshed the earlier-topo deps, but a fresh recompute demands
+    # them directly). the transitive closure - not the direct closure - is required
+    # because there is no per-hop lowering firewall: an inlined instance can originate
+    # in a transitively-imported module the direct closure omits (#1618).
+    val cl_r: R.Result[LowerClosure, str] = collect_lower_closure(p, m);
+    if (R.is_err[LowerClosure, str](cl_r)) { ret R.err[query.QueryOutput, str](R.unwrap_err[LowerClosure, str](cl_r)); }
+    var cl: LowerClosure = R.unwrap_ok[LowerClosure, str](cl_r);
+    var di: u32 = 0;
+    for (di < cl.count) {
+        val dep_mid: session.ModuleId = cl.list[di];
+        val dep_stable: session.StableModuleId = p.modules[dep_mid::u32].stable_id;
+        val ge: R.Result[*query.QueryEntry, str] = query.get(db, query.Q_LOWERED_SURFACE, dep_stable::u64);
+        if (R.is_err[*query.QueryEntry, str](ge)) {
+            free_lower_closure(s.alloc, ?cl);
+            ret R.err[query.QueryOutput, str](R.unwrap_err[*query.QueryEntry, str](ge));
+        }
+        val rd: R.Result[bool, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_LOWERED_SURFACE, dep_stable::u64);
+        if (R.is_err[bool, str](rd)) {
+            free_lower_closure(s.alloc, ?cl);
+            ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rd));
+        }
+        di = di + 1;
+    }
+    free_lower_closure(s.alloc, ?cl);
+
+    val res_lower: R.Result[ir.Module, str] = lower.lower_module(s, ?p.target, a, m.fqn, mid, sr, m.resolve_result, ?m.ctx);
+    if (R.is_err[ir.Module, str](res_lower)) { ret R.err[query.QueryOutput, str](R.unwrap_err[ir.Module, str](res_lower)); }
+    var irmod: ir.Module = R.unwrap_ok[ir.Module, str](res_lower);
+
+    # optimize in place: the cached artifact is the post-pipeline IR the object is
+    # built from, so an unchanged optimized module reuses its codegen output.
+    val res_opt: R.Result[bool, str] = pipeline.run(?irmod, ?p.target, p.opt_level, p.verify_ir);
+    if (R.is_err[bool, str](res_opt)) {
+        ir.dnit(?irmod);
+        ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](res_opt));
+    }
+
+    # test variant: neutralize this module's `main` into a body-less extern (the
+    # runner supplies the program entry) on the fresh IR before it is cached, so the
+    # normal variant's Q_LOWER value stays untouched.
+    if (test_mode) {
+        val res_neu: R.Result[bool, str] = testrunner.neutralize_main(s, ?irmod);
+        if (R.is_err[bool, str](res_neu)) {
+            ir.dnit(?irmod);
+            ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](res_neu));
+        }
+    }
+
+    val br: R.Result[*ir.Module, str] = A.allocate[ir.Module](alloc, 1::usize);
+    if (R.is_err[*ir.Module, str](br)) {
+        ir.dnit(?irmod);
+        ret R.err[query.QueryOutput, str](R.unwrap_err[*ir.Module, str](br));
+    }
+    val box: *ir.Module = R.unwrap_ok[*ir.Module, str](br);
+    box[0] = irmod;
+    ret ir_handle_encode(alloc, box);
+}
+
+# release the optimized IR a Q_LOWER handle owns, called by the engine before it
+# frees the handle buffer (on recompute, invalidate, dnit).
+fun q_lower_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
+    if (value == nil || value_len::usize < $size_of(ptr)) { ret; }
+    val slot: *ptr = value::ptr::*ptr;
+    val r: *ir.Module = slot[0]::*ir.Module;
+    if (r == nil) { ret; }
+    ir.dnit(r);
+    A.deallocate[ir.Module](alloc, r, 1::usize);
+}
+
+# wrap a heap ir.Module pointer as a pointer-sized opaque handle buffer - the
+# Q_LOWER query value. like the front-half handles, the heavy IR graph lives in the
+# byte-buffer DB as a handle, never serialized.
+fun ir_handle_encode(alloc: *A.Allocator, r: *ir.Module) R.Result[query.QueryOutput, str] {
+    val n: u32 = $size_of(ptr)::u32;
+    val rb: R.Result[*u8, str] = A.allocate[u8](alloc, n::usize);
+    if (R.is_err[*u8, str](rb)) {
+        ir.dnit(r);
+        A.deallocate[ir.Module](alloc, r, 1::usize);
+        ret R.err[query.QueryOutput, str](R.unwrap_err[*u8, str](rb));
+    }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+    val slot: *ptr = buf::ptr::*ptr;
+    slot[0] = r::ptr;
+    var out: query.QueryOutput;
+    out.bytes = buf;
+    out.len   = n;
+    ret R.ok[query.QueryOutput, str](out);
+}
+
+# read the ir.Module pointer back out of a Q_LOWER handle entry, or nil when the
+# entry carries no value.
+fun ir_handle_decode(e: *query.QueryEntry) *ir.Module {
+    if (e.value == nil || e.value_len::usize < $size_of(ptr)) { ret nil; }
+    val slot: *ptr = e.value::ptr::*ptr;
+    ret slot[0]::*ir.Module;
+}
+
+# collect the transitive import closure of module `m` (every module reachable from
+# its direct deps, following deps to fixpoint) into a fresh owned list; the module
+# itself is excluded. bounded scratch (a visited mark array sized to module_len,
+# freed here) plus the returned list (also sized to module_len, owned by the session
+# allocator and freed by free_lower_closure).
+fun collect_lower_closure(p: *Project, m: *ModuleEntry) R.Result[LowerClosure, str] {
+    var cl: LowerClosure;
+    cl.list  = nil;
+    cl.count = 0;
+    cl.cap   = 0;
+    if (m.dep_count == 0 || p.module_len == 0) { ret R.ok[LowerClosure, str](cl); }
+
+    val vr: R.Result[*bool, str] = A.allocate[bool](p.s.alloc, p.module_len::usize);
+    if (R.is_err[*bool, str](vr)) { ret R.err[LowerClosure, str](R.unwrap_err[*bool, str](vr)); }
+    val visited: *bool = R.unwrap_ok[*bool, str](vr);
+    var vi: u32 = 0;
+    for (vi < p.module_len) { visited[vi] = false; vi = vi + 1; }
+
+    val lr: R.Result[*session.ModuleId, str] = A.allocate[session.ModuleId](p.s.alloc, p.module_len::usize);
+    if (R.is_err[*session.ModuleId, str](lr)) {
+        A.deallocate[bool](p.s.alloc, visited, p.module_len::usize);
+        ret R.err[LowerClosure, str](R.unwrap_err[*session.ModuleId, str](lr));
+    }
+    val list: *session.ModuleId = R.unwrap_ok[*session.ModuleId, str](lr);
+    var list_len: u32 = 0;
+
+    var i: u32 = 0;
+    for (i < m.dep_count) {
+        val d: session.ModuleId = m.deps[i];
+        if (d::u32 < p.module_len && !visited[d::u32]) {
+            visited[d::u32] = true;
+            list[list_len]  = d;
+            list_len = list_len + 1;
+        }
+        i = i + 1;
+    }
+
+    var head: u32 = 0;
+    for (head < list_len) {
+        val cur: session.ModuleId = list[head];
+        val cm:  *ModuleEntry = ?p.modules[cur::u32];
+        var j: u32 = 0;
+        for (j < cm.dep_count) {
+            val d: session.ModuleId = cm.deps[j];
+            if (d::u32 < p.module_len && !visited[d::u32]) {
+                visited[d::u32] = true;
+                list[list_len]  = d;
+                list_len = list_len + 1;
+            }
+            j = j + 1;
+        }
+        head = head + 1;
+    }
+
+    A.deallocate[bool](p.s.alloc, visited, p.module_len::usize);
+    cl.list  = list;
+    cl.count = list_len;
+    cl.cap   = p.module_len;
+    ret R.ok[LowerClosure, str](cl);
+}
+
+# release the list a LowerClosure owns (freed at its allocated capacity).
+fun free_lower_closure(alloc: *A.Allocator, cl: *LowerClosure) {
+    if (cl.list == nil || cl.cap == 0) { ret; }
+    A.deallocate[session.ModuleId](alloc, cl.list, cl.cap::usize);
+    cl.list  = nil;
+    cl.count = 0;
+    cl.cap   = 0;
+}
+
+# codegen every module to an ObjectImage in topo order through the Q_CODEGEN query.
+# the active Project is installed on the session for the pass so the compute can
+# reach the per-build module graph. run_lower_pass must have run first (each
+# module's optimized IR is borrowed onto its ModuleEntry). the CLI compile path
+# drives this after run_lower_pass; the per-module objects and the link read the
+# borrowed images.
+# ---
+# p:   the active project; its topo order and per-build module graph drive the pass
+# ret: true once every module is codegen'd, or the first error
+pub fun run_codegen_pass(p: *Project) R.Result[bool, str] {
+    session.set_active_project(p.s, p::ptr);
+
+    readout.phase_begin(p.s.readout, readout.PH_CODEGEN);
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId = p.topo[i];
+        val r: R.Result[bool, str] = run_codegen_one(p, mid);
+        if (R.is_err[bool, str](r)) {
+            session.set_active_project(p.s, nil);
+            ret r;
+        }
+        i = i + 1;
+    }
+    readout.phase_end(p.s.readout, readout.PH_CODEGEN, p.topo_len, "module", "modules");
+    session.set_active_project(p.s, nil);
+    ret R.ok[bool, str](true);
+}
+
+# fetch module `mid`'s ObjectImage through Q_CODEGEN - computed fresh when its
+# optimized IR changed, reused otherwise - and borrow it onto the ModuleEntry. the
+# image is owned by the query DB; m.object_image only points at it.
+fun run_codegen_one(p: *Project, mid: session.ModuleId) R.Result[bool, str] {
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+
+    val t_item: ctime.Time = readout.item_begin(p.s.readout);
+
+    val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_CODEGEN, back_half_key(m.stable_id, p.test_mode));
+    if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
+    val img: *of.ObjectImage = image_handle_decode(R.unwrap_ok[*query.QueryEntry, str](e_r));
+    if (img == nil) { ret R.err[bool, str]("Q_CODEGEN produced no result handle"); }
+
+    m.object_image = img;
+    readout.item(p.s.readout, readout.PH_CODEGEN, fqn_name(p, m.fqn), t_item);
+    ret R.ok[bool, str](true);
+}
+
+# the Q_CODEGEN derived compute - generate one module's object image from its
+# optimized IR and return it as an opaque owned handle. reaches the per-build module
+# graph through the session's active Project, and records the deps that make the
+# entry incremental:
+#   - Q_LOWER(module): a change to this module's optimized IR re-codegens it, so an
+#                      unchanged lowered module reuses its object (the per-module
+#                      hash-and-skip);
+#   - Q_TARGET:        a build-config change re-codegens every module.
+# the key is the same packed (stable id, test-mode) key as Q_LOWER, so the Q_LOWER
+# dep names the matching variant and a test build codegens the neutralized IR while a
+# normal build codegens the untouched IR (#1858). emits no assembly side-channel (the
+# `.s` debug artifact is rendered by the CLI from the borrowed IR when requested).
+fun q_codegen_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
+    val s: *session.Session = db.ctx::*session.Session;
+    if (s == nil) { ret R.err[query.QueryOutput, str]("Q_CODEGEN: query db has no session context"); }
+    val pp: ptr = session.active_project(s);
+    if (pp == nil) { ret R.err[query.QueryOutput, str]("Q_CODEGEN: no active project for the codegen pass"); }
+    val p: *Project = pp::*Project;
+
+    val stable: session.StableModuleId = key::u32::session.StableModuleId;
+    val mid: session.ModuleId = session.module_id_for_stable(s, stable);
+    if (mid == session.MODULE_NIL) { ret R.err[query.QueryOutput, str]("Q_CODEGEN: stable id not loaded this build"); }
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    val irmod: *ir.Module = m.ir_module;
+    if (irmod == nil) { ret R.err[query.QueryOutput, str]("Q_CODEGEN: module has no lowered IR"); }
+
+    val rl: R.Result[bool, str] = query.record_dep(db, query.Q_CODEGEN, key, query.Q_LOWER, key);
+    if (R.is_err[bool, str](rl)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rl)); }
+    val rt: R.Result[bool, str] = query.record_dep(db, query.Q_CODEGEN, key, query.Q_TARGET, 0);
+    if (R.is_err[bool, str](rt)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rt)); }
+
+    val res_cg: R.Result[of.ObjectImage, str] = codegen.codegen_module(s, ?p.target, irmod, nil);
+    if (R.is_err[of.ObjectImage, str](res_cg)) { ret R.err[query.QueryOutput, str](R.unwrap_err[of.ObjectImage, str](res_cg)); }
+    var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](res_cg);
+
+    val br: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](alloc, 1::usize);
+    if (R.is_err[*of.ObjectImage, str](br)) {
+        obj.dnit(?img);
+        ret R.err[query.QueryOutput, str](R.unwrap_err[*of.ObjectImage, str](br));
+    }
+    val box: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](br);
+    box[0] = img;
+    ret image_handle_encode(alloc, box);
+}
+
+# release the ObjectImage a Q_CODEGEN handle owns, called by the engine before it
+# frees the handle buffer (on recompute, invalidate, dnit).
+fun q_codegen_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
+    if (value == nil || value_len::usize < $size_of(ptr)) { ret; }
+    val slot: *ptr = value::ptr::*ptr;
+    val r: *of.ObjectImage = slot[0]::*of.ObjectImage;
+    if (r == nil) { ret; }
+    obj.dnit(r);
+    A.deallocate[of.ObjectImage](alloc, r, 1::usize);
+}
+
+# wrap a heap ObjectImage pointer as a pointer-sized opaque handle buffer - the
+# Q_CODEGEN query value. like the other back-half handles, the artifact lives in
+# the byte-buffer DB as a handle, never serialized.
+fun image_handle_encode(alloc: *A.Allocator, r: *of.ObjectImage) R.Result[query.QueryOutput, str] {
+    val n: u32 = $size_of(ptr)::u32;
+    val rb: R.Result[*u8, str] = A.allocate[u8](alloc, n::usize);
+    if (R.is_err[*u8, str](rb)) {
+        obj.dnit(r);
+        A.deallocate[of.ObjectImage](alloc, r, 1::usize);
+        ret R.err[query.QueryOutput, str](R.unwrap_err[*u8, str](rb));
+    }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+    val slot: *ptr = buf::ptr::*ptr;
+    slot[0] = r::ptr;
+    var out: query.QueryOutput;
+    out.bytes = buf;
+    out.len   = n;
+    ret R.ok[query.QueryOutput, str](out);
+}
+
+# read the ObjectImage pointer back out of a Q_CODEGEN handle entry, or nil when
+# the entry carries no value.
+fun image_handle_decode(e: *query.QueryEntry) *of.ObjectImage {
+    if (e.value == nil || e.value_len::usize < $size_of(ptr)) { ret nil; }
+    val slot: *ptr = e.value::ptr::*ptr;
+    ret slot[0]::*of.ObjectImage;
+}
+
+# serialize the link-only build configuration into the Q_LINK_CONFIG input, keyed
+# on unit (0) - set by the CLI before the link so Q_LINK invalidates on any change
+# to an input that does NOT flow through a module's Q_CODEGEN.
+#
+# Captures the output path and product name, the output kind, the pie flag, and the
+# external link inputs (object/archive paths plus dynamic-dependency sonames). The
+# ownership boundary: the CLI translates argv/manifest into these resolved inputs;
+# this records them into the query graph. set_input's byte-equality cutoff keeps the
+# link reused when the config is unchanged.
+# ---
+# p:            the active project (for its session query DB and pie flag)
+# out_path:     the resolved output artifact path (nil-safe)
+# product:      the product / signing-identity name (nil-safe)
+# out_kind:     the link output kind discriminator (exe / library / object)
+# ext_paths:    the external static link-input paths
+# ext_count:    number of external paths
+# sonames:      the dynamic-dependency soname ids
+# soname_count: number of sonames
+# ret:          true on success, or the first error
+pub fun set_link_config_input(p: *Project, out_path: *u8, product: *u8, out_kind: u32,
+                              ext_paths: **u8, ext_count: u32,
+                              sonames: *intern.StrId, soname_count: u32) R.Result[bool, str] {
+    var fb: FpBuf;
+    fb.alloc = p.s.alloc;
+    fb.buf   = nil;
+    fb.len   = 0;
+    fb.cap   = 0;
+
+    val w: R.Result[bool, str] = write_link_config(?fb, p, out_path, product, out_kind, ext_paths, ext_count, sonames, soname_count);
+    if (R.is_err[bool, str](w)) {
+        if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.s.alloc, fb.buf, fb.cap::usize); }
+        ret w;
+    }
+
+    val si: R.Result[bool, str] = query.set_input(?p.s.queries, query.Q_LINK_CONFIG, 0, fb.buf, fb.len);
+    if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.s.alloc, fb.buf, fb.cap::usize); }
+    ret si;
+}
+
+# append the link-only configuration bytes into `fb` in a stable order. every input
+# that can change the linked binary without changing a module's object appears here,
+# so a change to any of them advances Q_LINK_CONFIG and re-links.
+fun write_link_config(fb: *FpBuf, p: *Project, out_path: *u8, product: *u8, out_kind: u32,
+                      ext_paths: **u8, ext_count: u32,
+                      sonames: *intern.StrId, soname_count: u32) R.Result[bool, str] {
+    val a0: R.Result[bool, str] = fp_u32(fb, out_kind);            if (R.is_err[bool, str](a0)) { ret a0; }
+    var pie_axis: u32 = 0;
+    if (p.s.pie) { pie_axis = 1; }
+    val a1: R.Result[bool, str] = fp_u32(fb, pie_axis);            if (R.is_err[bool, str](a1)) { ret a1; }
+    val a2: R.Result[bool, str] = fp_cstr(fb, out_path);           if (R.is_err[bool, str](a2)) { ret a2; }
+    val a3: R.Result[bool, str] = fp_cstr(fb, product);            if (R.is_err[bool, str](a3)) { ret a3; }
+
+    # each static external input (a `.o` / `.a` baked into the output) is folded by
+    # PATH and by CONTENT: a same-path rebuild of a vendored archive changes the
+    # output binary, so its content must invalidate. mirrors the front half, which
+    # fingerprints a source file by its full text (Q_FILE_TEXT); the link folds a
+    # sha256 of the content instead of the raw bytes, since a static archive can be
+    # large. sonames below are DYNAMIC deps (DT_NEEDED, loaded at run time, not baked
+    # in), so they are fingerprinted by identity only - their content never changes
+    # this binary.
+    val a4: R.Result[bool, str] = fp_u32(fb, ext_count);           if (R.is_err[bool, str](a4)) { ret a4; }
+    var i: u32 = 0;
+    for (i < ext_count) {
+        val ap: R.Result[bool, str] = fp_cstr(fb, ext_paths[i]);          if (R.is_err[bool, str](ap)) { ret ap; }
+        val ah: R.Result[bool, str] = fp_file_content(fb, p.s.alloc, ext_paths[i]); if (R.is_err[bool, str](ah)) { ret ah; }
+        i = i + 1;
+    }
+    val a5: R.Result[bool, str] = fp_u32(fb, soname_count);        if (R.is_err[bool, str](a5)) { ret a5; }
+    var j: u32 = 0;
+    for (j < soname_count) {
+        val as: R.Result[bool, str] = fp_u32(fb, sonames[j]::u32); if (R.is_err[bool, str](as)) { ret as; }
+        j = j + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# append the sha256 content hash of the file at `path` to the fingerprint (a length
+# prefix plus the 32 digest bytes); a nil path contributes a zero length. reads the
+# whole file into `alloc` and frees it. a read failure is a hard error - the caller
+# resolved this path to an existing file, so a failure to read it must fail the
+# build rather than silently elide the input from the fingerprint.
+fun fp_file_content(fb: *FpBuf, alloc: *A.Allocator, path: *u8) R.Result[bool, str] {
+    if (path == nil) { ret fp_u32(fb, 0); }
+    val rr: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(alloc, path::str);
+    if (R.is_err[filesystem.Buffer, str](rr)) {
+        ret R.err[bool, str](R.unwrap_err[filesystem.Buffer, str](rr));
+    }
+    var buf: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rr);
+    var digest: [32]u8;
+    sha256.hash(buf.data, buf.len, ?digest[0]);
+    # read_all_sized over-allocates by one NUL byte.
+    A.deallocate[u8](alloc, buf.data, (buf.len + 1)::usize);
+
+    val rl: R.Result[bool, str] = fp_u32(fb, sha256.DIGEST_SIZE::u32);
+    if (R.is_err[bool, str](rl)) { ret rl; }
+    var i: u32 = 0;
+    for (i < sha256.DIGEST_SIZE::u32) {
+        val rb: R.Result[bool, str] = fp_u8(fb, digest[i]);
+        if (R.is_err[bool, str](rb)) { ret rb; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# compute the project's link fingerprint through Q_LINK and report whether the link
+# must re-run
+#
+# Records Q_LINK's dependency graph (Q_TARGET, Q_LINK_CONFIG, and every module's
+# Q_CODEGEN) and folds each dependency's revision into the entry's value, so
+# Q_LINK's last_changed advances iff a link input changed. The prior entry's
+# revision is peeked before the demand, so a fresh (cold-cache) or invalidated entry
+# reports "re-link needed" and an unchanged one reports "reuse". Q_CODEGEN must have
+# run first (the compute reads each module's object revision). set_link_config_input
+# must have set Q_LINK_CONFIG for this build.
+# ---
+# p:   the active project; its topo order drives the link set
+# ret: true when the link must re-run, false when the prior link is still valid, or
+#      the first error
+pub fun run_link_pass(p: *Project) R.Result[bool, str] {
+    session.set_active_project(p.s, p::ptr);
+
+    val prior: query.Revision = query.peek_revision(?p.s.queries, query.Q_LINK, 0);
+    val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LINK, 0);
+    session.set_active_project(p.s, nil);
+    if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
+    val now: query.Revision = R.unwrap_ok[*query.QueryEntry, str](e_r).last_changed;
+    ret R.ok[bool, str](now != prior);
+}
+
+# the Q_LINK derived compute - fold the revision of every link input into a
+# fingerprint whose change signals a needed re-link. reaches the per-build module
+# graph through the session's active Project, and records the deps that make the
+# entry incremental:
+#   - Q_TARGET:            a target/profile/pie change re-links (it also re-codegens
+#                          every module, so it is covered twice - deliberately);
+#   - Q_LINK_CONFIG:       a link-only change (output path, product, external inputs)
+#                          re-links even when every object is unchanged;
+#   - Q_CODEGEN(module) for every module in the link set: a changed object re-links.
+# the value is the ordered tuple of those revisions, so an unchanged set of inputs
+# reproduces identical bytes (early cutoff: the link is reused).
+fun q_link_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
+    val s: *session.Session = db.ctx::*session.Session;
+    if (s == nil) { ret R.err[query.QueryOutput, str]("Q_LINK: query db has no session context"); }
+    val pp: ptr = session.active_project(s);
+    if (pp == nil) { ret R.err[query.QueryOutput, str]("Q_LINK: no active project for the link pass"); }
+    val p: *Project = pp::*Project;
+
+    var fb: FpBuf;
+    fb.alloc = alloc;
+    fb.buf   = nil;
+    fb.len   = 0;
+    fb.cap   = 0;
+
+    # record_dep_rev records the dep AND returns the revision it captured, so each
+    # dependency is scanned once (not once to record, once to peek) - the link fold
+    # is the shipping cold-build path, so this halves its shard scans.
+    val rt: R.Result[query.Revision, str] = query.record_dep_rev(db, query.Q_LINK, key, query.Q_TARGET, 0);
+    if (R.is_err[query.Revision, str](rt)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[query.Revision, str](rt)); }
+    val wt: R.Result[bool, str] = fp_u64(?fb, R.unwrap_ok[query.Revision, str](rt));
+    if (R.is_err[bool, str](wt)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](wt)); }
+
+    val rc: R.Result[query.Revision, str] = query.record_dep_rev(db, query.Q_LINK, key, query.Q_LINK_CONFIG, 0);
+    if (R.is_err[query.Revision, str](rc)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[query.Revision, str](rc)); }
+    val wc: R.Result[bool, str] = fp_u64(?fb, R.unwrap_ok[query.Revision, str](rc));
+    if (R.is_err[bool, str](wc)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](wc)); }
+
+    val wn: R.Result[bool, str] = fp_u32(?fb, p.topo_len);
+    if (R.is_err[bool, str](wn)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](wn)); }
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val m: *ModuleEntry = ?p.modules[(p.topo[i])::u32];
+        val rd: R.Result[query.Revision, str] = query.record_dep_rev(db, query.Q_LINK, key, query.Q_CODEGEN, m.stable_id::u64);
+        if (R.is_err[query.Revision, str](rd)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[query.Revision, str](rd)); }
+        val wm: R.Result[bool, str] = fp_u64(?fb, R.unwrap_ok[query.Revision, str](rd));
+        if (R.is_err[bool, str](wm)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](wm)); }
+        i = i + 1;
+    }
+
+    var out: query.QueryOutput;
+    out.bytes = fb.buf;
+    out.len   = fb.len;
+    ret R.ok[query.QueryOutput, str](out);
+}
+
+# release a partially-built link fingerprint buffer and wrap the error.
+fun link_fp_fail(fb: *FpBuf, alloc: *A.Allocator, msg: str) R.Result[query.QueryOutput, str] {
+    if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](alloc, fb.buf, fb.cap::usize); }
+    ret R.err[query.QueryOutput, str](msg);
+}
+
+# append a u64 to the fingerprint as two u32 halves (the FpBuf primitives are u8 /
+# u32 only).
+fun fp_u64(b: *FpBuf, v: u64) R.Result[bool, str] {
+    val lo: R.Result[bool, str] = fp_u32(b, (v & 0xFFFFFFFF)::u32);
+    if (R.is_err[bool, str](lo)) { ret lo; }
+    ret fp_u32(b, (v >> 32)::u32);
+}
+
+# append a nil-terminated string to the fingerprint as a length prefix plus its
+# bytes; a nil pointer contributes a zero length.
+fun fp_cstr(b: *FpBuf, s: *u8) R.Result[bool, str] {
+    if (s == nil) { ret fp_u32(b, 0); }
+    val n: u32 = str_len(s::str)::u32;
+    val rl: R.Result[bool, str] = fp_u32(b, n);
+    if (R.is_err[bool, str](rl)) { ret rl; }
+    var i: u32 = 0;
+    for (i < n) {
+        val rb: R.Result[bool, str] = fp_u8(b, s[i]);
+        if (R.is_err[bool, str](rb)) { ret rb; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
 # append the typed pub surface of module `mid` to the fingerprint.
 # the pub symbols occupy indices [0, pub_count) of `rr` in source-deterministic order.
 # each contributes (kind, name); a LOCALLY-declared symbol (origin == mid) also
@@ -4170,6 +5302,145 @@ fun ut_build_multi(s: *session.Session, alloc: *A.Allocator, names: *str, texts:
     val pr: R.Result[Project, str] = build_project_union(s, root);
     filesystem.remove_all(alloc, root);
     ret pr;
+}
+
+# ut_build over build_project_test (the whole-source test loader), so the
+# target-gated-orphan exclusion (#1873) can be exercised. Scaffolds the src files,
+# builds the test Project, removes the temp tree, and returns it.
+fun ut_build_test(s: *session.Session, alloc: *A.Allocator, names: *str, texts: *str, n: u32) R.Result[Project, str] {
+    val root_r: R.Result[str, str] = ut_scaffold(alloc, names, texts, n);
+    if (R.is_err[str, str](root_r)) { ret R.err[Project, str](R.unwrap_err[str, str](root_r)); }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val rr: R.Result[bool, str] = setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { filesystem.remove_all(alloc, root); ret R.err[Project, str](R.unwrap_err[bool, str](rr)); }
+    var sel: manifest.Selection;
+    sel.target       = "";
+    sel.profile      = "";
+    sel.artifact     = "";
+    sel.want_lib     = false;
+    sel.has_artifact = false;
+    val pr: R.Result[Project, str] = build_project_test(s, root, ?sel);
+    filesystem.remove_all(alloc, root);
+    ret pr;
+}
+
+# the target_gated flag of module `fqn` in project `p` (false when absent).
+fun ut_gated(p: *Project, s: *session.Session, fqn: str) bool {
+    val mid: session.ModuleId = ut_mid(p, s, fqn);
+    if (mid == session.MODULE_NIL) { ret false; }
+    ret (?p.modules[mid::u32]).target_gated;
+}
+
+# whether module `fqn` is in project `p`'s topo set (its compiled / collected set).
+fun ut_in_topo(p: *Project, s: *session.Session, fqn: str) bool {
+    val mid: session.ModuleId = ut_mid(p, s, fqn);
+    if (mid == session.MODULE_NIL) { ret false; }
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        if (p.topo[i] == mid) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# #1873: an orphan module (no in-tree consumer) whose load-time comptime evaluation
+# reaches a `$error` is target-gated - loaded but kept out of the topo set and
+# counted for the skip note - so a `mach test` over a tree with other-target modules
+# does not fail on their guards. Sema over the remaining topo raises no error.
+test "mach.lang.driver:test_gated_orphan_excluded" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "gated.mach";
+    var texts: [2]str;
+    texts[0] = "fun main() i32 { ret 0; }\n";
+    texts[1] = "$error(\"gated: not for this target\");\n\ntest \"gt\" { ret 0; }\n";
+
+    val pr: R.Result[Project, str] = ut_build_test(?s, ?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[Project, str](pr)) { session.dnit(?s); ret 1; }
+    var p: Project = R.unwrap_ok[Project, str](pr);
+
+    var bad: i32 = 0;
+    if (!ut_has(?p, ?s, "uniontest.gated"))    { bad = 1; }  # loaded,
+    if (!ut_gated(?p, ?s, "uniontest.gated"))  { bad = 1; }  # flagged gated,
+    if (ut_in_topo(?p, ?s, "uniontest.gated")) { bad = 1; }  # but excluded from topo.
+    if (count_target_gated(?p) != 1)           { bad = 1; }
+    if (!ut_in_topo(?p, ?s, "uniontest.main")) { bad = 1; }  # the entry stays compiled.
+    val se: R.Result[bool, str] = run_sema_pass(?p);
+    if (R.is_err[bool, str](se))               { bad = 1; }
+    if (ut_count_errors(?p.s.diags) != 0)      { bad = 1; }  # the guard never fires.
+
+    dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# #1873 / #1863: an orphan module WITHOUT a target guard keeps its tests collected -
+# it loads into topo like any own-src module, preserving the whole-source collection
+# guarantee (the editor-subtree case).
+test "mach.lang.driver:test_ungated_orphan_collected" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "orphan.mach";
+    var texts: [2]str;
+    texts[0] = "fun main() i32 { ret 0; }\n";
+    texts[1] = "test \"ot\" { ret 0; }\n";
+
+    val pr: R.Result[Project, str] = ut_build_test(?s, ?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[Project, str](pr)) { session.dnit(?s); ret 1; }
+    var p: Project = R.unwrap_ok[Project, str](pr);
+
+    var bad: i32 = 0;
+    if (!ut_has(?p, ?s, "uniontest.orphan"))     { bad = 1; }
+    if (ut_gated(?p, ?s, "uniontest.orphan"))    { bad = 1; }  # not gated,
+    if (!ut_in_topo(?p, ?s, "uniontest.orphan")) { bad = 1; }  # collected.
+    if (count_target_gated(?p) != 0)             { bad = 1; }
+
+    dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# #1873: a `$error` in an ENTRY-REACHABLE module is never gated - it stays in topo
+# and its guard remains a fatal sema error, so the orphan-only exclusion never masks
+# a genuine error in reachable code.
+test "mach.lang.driver:test_reachable_error_still_fatal" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "bad.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.bad;\n\nfun main() i32 { ret 0; }\n";
+    texts[1] = "$error(\"reachable boom\");\n\npub fun f() i32 { ret 0; }\n";
+
+    val pr: R.Result[Project, str] = ut_build_test(?s, ?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[Project, str](pr)) { session.dnit(?s); ret 1; }
+    var p: Project = R.unwrap_ok[Project, str](pr);
+
+    var bad: i32 = 0;
+    if (ut_gated(?p, ?s, "uniontest.bad"))    { bad = 1; }  # reachable: not gated,
+    if (!ut_in_topo(?p, ?s, "uniontest.bad")) { bad = 1; }  # stays in topo,
+    if (count_target_gated(?p) != 0)          { bad = 1; }
+    val se: R.Result[bool, str] = run_sema_pass(?p);
+    if (R.is_err[bool, str](se))              { bad = 1; }
+    if (ut_count_errors(?p.s.diags) == 0)     { bad = 1; }  # its `$error` still fires.
+
+    dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
 }
 
 # whether the union Project loaded a module with the given FQN.
@@ -4882,6 +6153,193 @@ test "mach.lang.driver:incremental_qparse_ast_reuse_and_reparse" {
     ret bad;
 }
 
+# whether two optional owned strings are equal: both nil, or both present and
+# byte-equal. used by the diagnostic-replay comparison below.
+fun ut_opt_str_eq(a: str, b: str) bool {
+    if (a == nil && b == nil) { ret true; }
+    if (a == nil || b == nil) { ret false; }
+    ret str_equals(a, b);
+}
+
+# whether two diagnostic lists are structurally identical: same length and, per
+# entry, the same severity, primary location, message, note/help lines, and
+# secondary locations. the replay test asserts a warm-session rebuild reproduces
+# the cold build's diagnostics exactly (#1586).
+fun ut_diag_list_eq(x: *diagnostic.DiagList, y: *diagnostic.DiagList) bool {
+    if (x.len != y.len) { ret false; }
+    var i: usize = 0;
+    for (i < x.len) {
+        val dx: *diagnostic.Diagnostic = ?x.items[i];
+        val dy: *diagnostic.Diagnostic = ?y.items[i];
+        if (dx.severity != dy.severity)               { ret false; }
+        if (dx.loc.file_id != dy.loc.file_id)         { ret false; }
+        if (dx.loc.span.offset != dy.loc.span.offset) { ret false; }
+        if (dx.loc.span.len != dy.loc.span.len)       { ret false; }
+        if (!ut_opt_str_eq(dx.message, dy.message))   { ret false; }
+        if (!ut_opt_str_eq(dx.note, dy.note))         { ret false; }
+        if (!ut_opt_str_eq(dx.help, dy.help))         { ret false; }
+        if (dx.related_len != dy.related_len)         { ret false; }
+        var r: usize = 0;
+        for (r < dx.related_len) {
+            val rx: *diagnostic.Related = ?dx.related[r];
+            val ry: *diagnostic.Related = ?dy.related[r];
+            if (rx.loc.file_id != ry.loc.file_id)         { ret false; }
+            if (rx.loc.span.offset != ry.loc.span.offset) { ret false; }
+            if (rx.loc.span.len != ry.loc.span.len)       { ret false; }
+            if (!ut_opt_str_eq(rx.label, ry.label))       { ret false; }
+            r = r + 1;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# driver incremental: a reused phase replays the diagnostics it emitted when
+# computed, so a warm-session rebuild surfaces the same diagnostics a cold compute
+# did (#1586). main.mach carries a duplicate module-scope definition, so name
+# resolution emits one error diagnostic (with a related "previous definition"
+# span). without the replay the reused Q_RESOLVE stays silent and the warm sink is
+# empty.
+test "mach.lang.driver:incremental_reused_phase_replays_diagnostics" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val rr: R.Result[bool, str] = setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { session.dnit(?s); ret 1; }
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = "fun dup() i32 { ret 1; }\nfun dup() i32 { ret 2; }\n\nfun main() i32 { ret 0; }\n";
+
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: cold. the resolve pass emits the diagnostic and the engine captures
+    # it onto the Q_RESOLVE entry.
+    val p1r: R.Result[Project, str] = build_project_union(?s, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+
+    # snapshot the cold diagnostics before the sink is reset; a non-empty snapshot
+    # proves the diagnostic was produced at all.
+    val cold_r: R.Result[*diagnostic.DiagList, str] = diagnostic.clone_tail(?s.diags, 0, ?alloc);
+    if (R.is_err[*diagnostic.DiagList, str](cold_r)) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val cold: *diagnostic.DiagList = R.unwrap_ok[*diagnostic.DiagList, str](cold_r);
+    if (cold.len == 0) { bad = 1; }
+    dnit_project(?p1);
+
+    # a warm-session consumer resets the sink between builds; do the same so the
+    # second build's sink reflects only its own (replayed) diagnostics.
+    diagnostic.dnit(?s.diags);
+    s.diags = diagnostic.init(?alloc);
+
+    # build 2: warm. nothing changed, so every phase is reused. the reused
+    # Q_RESOLVE must replay its captured diagnostic - identically to the cold build.
+    val p2r: R.Result[Project, str] = build_project_union(?s, root);
+    if (R.is_err[Project, str](p2r)) {
+        diagnostic.dnit(cold);
+        A.deallocate[diagnostic.DiagList](?alloc, cold, 1::usize);
+        filesystem.remove_all(?alloc, root);
+        session.dnit(?s);
+        ret 1;
+    }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    if (!ut_diag_list_eq(?s.diags, cold)) { bad = 1; }
+    dnit_project(?p2);
+
+    diagnostic.dnit(cold);
+    A.deallocate[diagnostic.DiagList](?alloc, cold, 1::usize);
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?s);
+    ret bad;
+}
+
+# driver incremental: a source overlay re-parses exactly the overlaid module and
+# leaves its importer's parse reused; the same overlay bytes reuse it, and clearing
+# it re-reads disk (#1588). probes Q_PARSE AST-handle identity, the reuse signal the
+# qparse test uses.
+test "mach.lang.driver:incremental_overlay_reparses_exactly_overlaid_module" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val rr: R.Result[bool, str] = setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { session.dnit(?s); ret 1; }
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "a.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.a;\n\nfun main() i32 { ret 0; }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: cold, from disk. capture the two AST handles and a.mach's file id.
+    val p1r: R.Result[Project, str] = build_project_union(?s, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    val main1: *ast.Ast = ut_ast(?p1, ?s, "uniontest.main");
+    val a1:    *ast.Ast = ut_ast(?p1, ?s, "uniontest.a");
+    if (main1 == nil || a1 == nil) { bad = 1; }
+    val a_mid: session.ModuleId = ut_mid(?p1, ?s, "uniontest.a");
+    if (a_mid == session.MODULE_NIL) { filesystem.remove_all(?alloc, root); dnit_project(?p1); session.dnit(?s); ret 1; }
+    val a_fid: src.FileId = p1.modules[a_mid::u32].file_id;
+    dnit_project(?p1);
+
+    # the exact path the driver registered a.mach under: the overlay key must match
+    # the file_path parse_module computes, so read it back from the source map.
+    val sf_opt: O.Option[*src.SourceFile] = src.get(?s.sources, a_fid);
+    if (O.is_none[*src.SourceFile](sf_opt)) { filesystem.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val a_path: str = O.unwrap[*src.SourceFile](sf_opt).path;
+
+    # build 2: overlay a.mach with DIFFERENT text. only a re-parses; main is reused.
+    val ov_text: str = "pub fun fa() i32 { ret 2; }\n";
+    if (R.is_err[bool, str](session.set_overlay(?s, a_path, ov_text))) { filesystem.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val p2r: R.Result[Project, str] = build_project_union(?s, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    if (ut_ast(?p2, ?s, "uniontest.main") != main1) { bad = 1; }   # importer reused
+    if (ut_ast(?p2, ?s, "uniontest.a")    == a1)    { bad = 1; }   # overlaid module re-parsed
+    val a2: *ast.Ast = ut_ast(?p2, ?s, "uniontest.a");
+    dnit_project(?p2);
+
+    # build 3: set the SAME overlay bytes again. the byte cutoff reuses a's parse.
+    if (R.is_err[bool, str](session.set_overlay(?s, a_path, ov_text))) { filesystem.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val p3r: R.Result[Project, str] = build_project_union(?s, root);
+    if (R.is_err[Project, str](p3r)) { filesystem.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var p3: Project = R.unwrap_ok[Project, str](p3r);
+    if (ut_ast(?p3, ?s, "uniontest.main") != main1) { bad = 1; }
+    if (ut_ast(?p3, ?s, "uniontest.a")    != a2)    { bad = 1; }   # overlay unchanged: reused
+    dnit_project(?p3);
+
+    # build 4: clear the overlay. a re-reads disk (differs from the overlay), so it
+    # re-parses; main is still reused.
+    if (!session.clear_overlay(?s, a_path)) { bad = 1; }
+    val p4r: R.Result[Project, str] = build_project_union(?s, root);
+    if (R.is_err[Project, str](p4r)) { filesystem.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var p4: Project = R.unwrap_ok[Project, str](p4r);
+    if (ut_ast(?p4, ?s, "uniontest.main") != main1) { bad = 1; }
+    if (ut_ast(?p4, ?s, "uniontest.a")    == a2)    { bad = 1; }   # back to disk: re-parsed
+    dnit_project(?p4);
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?s);
+    ret bad;
+}
+
 # driver incremental: a module keeps its stable identity across a graph reshape (#1579)
 test "mach.lang.driver:incremental_stable_identity_across_reshape" {
     var alloc: A.Allocator;
@@ -5425,6 +6883,71 @@ fun ut_sema_lc(s: *session.Session, stable: session.StableModuleId) query.Revisi
     ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
 }
 
+# the last_changed revision of module `stable`'s Q_LOWER entry on session
+# `s`, or a sentinel when absent. an owned-handle shard never early-cuts, so an
+# unchanged value means the module was NOT re-lowered - the lowering reuse probe (#1618).
+fun ut_lower_lc(s: *session.Session, stable: session.StableModuleId) query.Revision {
+    val e: R.Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_LOWER, stable::u64);
+    if (R.is_err[*query.QueryEntry, str](e)) { ret 0xFFFFFFFFFFFFFFFF; }
+    ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
+}
+
+# the last_changed revision of module `stable`'s Q_LOWERED_SURFACE entry - the
+# lowered-surface reuse probe (#1859).
+fun ut_surface_lc(s: *session.Session, stable: session.StableModuleId) query.Revision {
+    val e: R.Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_LOWERED_SURFACE, stable::u64);
+    if (R.is_err[*query.QueryEntry, str](e)) { ret 0xFFFFFFFFFFFFFFFF; }
+    ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
+}
+
+
+# the last_changed revision of module `stable`'s Q_CODEGEN entry on session
+# `s`, or a sentinel when absent. an owned-handle shard never early-cuts, so an
+# unchanged value means the module was NOT re-codegen'd - the codegen reuse probe (#1618).
+fun ut_codegen_lc(s: *session.Session, stable: session.StableModuleId) query.Revision {
+    val e: R.Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_CODEGEN, stable::u64);
+    if (R.is_err[*query.QueryEntry, str](e)) { ret 0xFFFFFFFFFFFFFFFF; }
+    ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
+}
+
+# the last_changed revision of the Q_LOWER entry under a raw packed back-half key
+# (back_half_key), or a sentinel when absent - the variant-keyed lower reuse probe
+# for the test-mode neutralization firewall (#1858).
+fun ut_lower_lc_key(s: *session.Session, key: u64) query.Revision {
+    val e: R.Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_LOWER, key);
+    if (R.is_err[*query.QueryEntry, str](e)) { ret 0xFFFFFFFFFFFFFFFF; }
+    ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
+}
+
+# inspect the `main` function in a module's borrowed optimized IR: 1 when it is
+# neutralized (a body-less extern), 0 when it retains its body, -1 when no `main`
+# function is present - the neutralization probe for the test-mode variant (#1858).
+fun ut_mod_main_neutralized(s: *session.Session, m: *ir.Module) i32 {
+    val mr: R.Result[intern.StrId, str] = intern.intern(?s.interner, "main");
+    if (R.is_err[intern.StrId, str](mr)) { ret -1; }
+    val main_id: intern.StrId = R.unwrap_ok[intern.StrId, str](mr);
+
+    var i: u32 = 0;
+    for (i < m.function_len) {
+        val fn: *ir.Function = ?m.functions[i];
+        if (fn.name == main_id) {
+            if ((fn.flags & ir.FN_FLAG_EXTERN) != 0 && fn.block_count == 0) { ret 1; }
+            ret 0;
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# the last_changed revision of the project's Q_LINK entry on session `s`, or a
+# sentinel when absent. Q_LINK's value folds its inputs' revisions, so an unchanged
+# value means no link input changed - the link reuse probe (#1618).
+fun ut_link_lc(s: *session.Session) query.Revision {
+    val e: R.Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_LINK, 0);
+    if (R.is_err[*query.QueryEntry, str](e)) { ret 0xFFFFFFFFFFFFFFFF; }
+    ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
+}
+
 # whether two ModuleIds name the same module by FQN text
 # across two sessions. an anonymous nominal's origin is MODULE_NIL in both; the test
 # fixtures use only named records, so two MODULE_NIL origins (with a matched decl
@@ -5832,6 +7355,780 @@ test "mach.lang.driver:incremental_sema_reshape_renumber_recheck" {
     dnit_project(?pB);
     session.dnit(?sB);
     dnit_project(?pA2);
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: a no-change rebuild on a long-lived session re-lowers no
+# module - every Q_LOWER entry is reused, so lowering + optimize + codegen are all
+# skipped (#1618).
+test "mach.lang.driver:incremental_lower_reuse_no_change" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.fa;\nfun main() i32 { ret fa(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: sema then lower the whole graph.
+    val p1r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    if (R.is_err[bool, str](run_sema_pass(?p1)))  { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p1))) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val st_leaf: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.leaf");
+    val lc_main_1: query.Revision = ut_lower_lc(?sA, st_main);
+    val lc_leaf_1: query.Revision = ut_lower_lc(?sA, st_leaf);
+    dnit_project(?p1);
+
+    # build 2: no source edit, same long-lived session.
+    val p2r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    if (R.is_err[bool, str](run_sema_pass(?p2)))  { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p2))) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val lc_main_2: query.Revision = ut_lower_lc(?sA, st_main);
+    val lc_leaf_2: query.Revision = ut_lower_lc(?sA, st_leaf);
+    dnit_project(?p2);
+
+    # a no-change rebuild re-lowered NOTHING: both modules' Q_LOWER was reused.
+    if (lc_main_2 != lc_main_1) { bad = 1; }
+    if (lc_leaf_2 != lc_leaf_1) { bad = 1; }
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: editing one dependency's body re-lowers it and its importer
+# (the importer inlines nothing here, but has no per-hop lowering firewall so it
+# conservatively re-lowers), while an independent sibling module's Q_LOWER is
+# reused - a single-module edit rebuilds only the affected sub-graph (#1618).
+test "mach.lang.driver:incremental_lower_isolated_edit_reuses_sibling" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    # main imports two independent leaves a and b. editing a's regular-function body
+    # re-lowers a itself, but the lowered-surface firewall reuses its importer main
+    # (fa is extern in main, so its body never flows in) and the unrelated sibling b
+    # (#1859).
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    texts[0] = "use uniontest.a.fa;\nuse uniontest.b.fb;\nfun main() i32 { ret fa() + fb(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 3);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val p1r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    if (R.is_err[bool, str](run_sema_pass(?p1)))  { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p1))) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val st_a:    session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.a");
+    val st_b:    session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.b");
+    val lc_main_1: query.Revision = ut_lower_lc(?sA, st_main);
+    val lc_a_1:    query.Revision = ut_lower_lc(?sA, st_a);
+    val lc_b_1:    query.Revision = ut_lower_lc(?sA, st_b);
+    dnit_project(?p1);
+
+    # edit a's body only; b and the entry are untouched on disk.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val a_path:  str = ut_cc3(?alloc, src_dir, "/", "a.mach");
+    val a_v2:    str = "pub fun fa() i32 { val t: i32 = 1; ret t; }\n";
+    if (R.is_err[bool, str](filesystem.write_file(a_path, a_v2, str_len(a_v2), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+
+    val p2r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    if (R.is_err[bool, str](run_sema_pass(?p2)))  { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p2))) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val lc_main_2: query.Revision = ut_lower_lc(?sA, st_main);
+    val lc_a_2:    query.Revision = ut_lower_lc(?sA, st_a);
+    val lc_b_2:    query.Revision = ut_lower_lc(?sA, st_b);
+    dnit_project(?p2);
+
+    # the edited module re-lowered; its importer (firewalled) and the unrelated sibling
+    # did NOT - an impl-only body edit does not flow into either.
+    if (lc_a_2 == lc_a_1)       { bad = 1; }
+    if (lc_main_2 != lc_main_1) { bad = 1; }
+    if (lc_b_2 != lc_b_1)       { bad = 1; }
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: editing the entry module's own body re-lowers only the entry;
+# its unedited dependency's Q_LOWER is reused (editing an importer does not re-lower
+# its dependency) (#1618).
+test "mach.lang.driver:incremental_lower_entry_edit_reuses_dep" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.fa;\nfun main() i32 { ret fa(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val p1r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    if (R.is_err[bool, str](run_sema_pass(?p1)))  { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p1))) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val st_leaf: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.leaf");
+    val lc_main_1: query.Revision = ut_lower_lc(?sA, st_main);
+    val lc_leaf_1: query.Revision = ut_lower_lc(?sA, st_leaf);
+    dnit_project(?p1);
+
+    # edit the entry's body only (valid syntax); leaf is untouched on disk.
+    val src_dir:   str = ut_cc3(?alloc, root, "/", "src");
+    val main_path: str = ut_cc3(?alloc, src_dir, "/", "main.mach");
+    val main_v2:   str = "use uniontest.leaf.fa;\nfun main() i32 { val x: i32 = fa(); ret x; }\n";
+    if (R.is_err[bool, str](filesystem.write_file(main_path, main_v2, str_len(main_v2), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+
+    val p2r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    if (R.is_err[bool, str](run_sema_pass(?p2)))  { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p2))) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val lc_main_2: query.Revision = ut_lower_lc(?sA, st_main);
+    val lc_leaf_2: query.Revision = ut_lower_lc(?sA, st_leaf);
+    dnit_project(?p2);
+
+    # the edited entry re-lowered; its unedited dependency did NOT.
+    if (lc_main_2 == lc_main_1) { bad = 1; }
+    if (lc_leaf_2 != lc_leaf_1) { bad = 1; }
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: the lowered-surface firewall stops an impl-only edit to a
+# dependency from re-lowering its importers, while a surface-affecting edit still does.
+# leaf exports a regular `plain` and a generic `wrap`; main calls plain and instantiates
+# wrap. changing plain's body (a constant, so it perturbs neither the typed exports nor
+# the lowered surface) leaves leaf's surface fingerprint byte-identical, so main's
+# Q_LOWER and Q_CODEGEN are reused - plain is emitted extern in main and its body never
+# flows in. editing wrap's generic body advances the surface fingerprint, so main - into
+# which wrap's instance is monomorphized - re-lowers (#1859).
+test "mach.lang.driver:incremental_lower_surface_firewall" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.plain;\nuse uniontest.leaf.wrap;\nfun main() i32 { ret plain() + wrap[i32](2); }\n";
+    texts[1] = "pub fun plain() i32 { ret 1; }\npub fun wrap[T](x: T) T { ret x; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: warm the lower + codegen caches.
+    val p1r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val st_leaf: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.leaf");
+    val lo_main_1: query.Revision = ut_lower_lc(?sA, st_main);
+    val cg_main_1: query.Revision = ut_codegen_lc(?sA, st_main);
+    val lo_leaf_1: query.Revision = ut_lower_lc(?sA, st_leaf);
+    val sf_leaf_1: query.Revision = ut_surface_lc(?sA, st_leaf);
+    dnit_project(?p1);
+
+    val src_dir:   str = ut_cc3(?alloc, root, "/", "src");
+    val leaf_path: str = ut_cc3(?alloc, src_dir, "/", "leaf.mach");
+
+    # build 2: IMPL-ONLY edit - change plain's returned constant; wrap is untouched. the
+    # lowered surface is byte-identical (plain's body is excluded), so the firewall reuses
+    # main's Q_LOWER and Q_CODEGEN, while leaf itself re-lowers (its own source changed,
+    # and Q_LOWER is an owned handle that always advances on recompute).
+    val leaf_v2: str = "pub fun plain() i32 { ret 2; }\npub fun wrap[T](x: T) T { ret x; }\n";
+    if (R.is_err[bool, str](filesystem.write_file(leaf_path, leaf_v2, str_len(leaf_v2), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val p2r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    val lo_main_2: query.Revision = ut_lower_lc(?sA, st_main);
+    val cg_main_2: query.Revision = ut_codegen_lc(?sA, st_main);
+    val lo_leaf_2: query.Revision = ut_lower_lc(?sA, st_leaf);
+    val sf_leaf_2: query.Revision = ut_surface_lc(?sA, st_leaf);
+    dnit_project(?p2);
+    if (sf_leaf_2 != sf_leaf_1) { bad = 1; }   # firewall: leaf's surface fingerprint held
+    if (lo_leaf_2 == lo_leaf_1) { bad = 1; }   # leaf itself re-lowered
+    if (lo_main_2 != lo_main_1) { bad = 1; }   # importer's Q_LOWER reused
+    if (cg_main_2 != cg_main_1) { bad = 1; }   # and so its Q_CODEGEN reused
+
+    # build 3: SURFACE edit - rewrite wrap's generic body. its instance is monomorphized
+    # into main, so the surface fingerprint advances and main re-lowers.
+    val leaf_v3: str = "pub fun plain() i32 { ret 2; }\npub fun wrap[T](x: T) T { val y: T = x; ret y; }\n";
+    if (R.is_err[bool, str](filesystem.write_file(leaf_path, leaf_v3, str_len(leaf_v3), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val p3r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p3r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p3: Project = R.unwrap_ok[Project, str](p3r);
+    val lo_main_3: query.Revision = ut_lower_lc(?sA, st_main);
+    val sf_leaf_3: query.Revision = ut_surface_lc(?sA, st_leaf);
+    dnit_project(?p3);
+    if (sf_leaf_3 == sf_leaf_2) { bad = 1; }   # a generic body edit advances the surface
+    if (lo_main_3 == lo_main_2) { bad = 1; }   # and re-lowers the importer
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: editing a dependency's pub comptime value advances its lowered
+# surface - the value is constant-folded into importers - so the importer re-lowers
+# (the comptime-value arm of the surface firewall, #1859).
+test "mach.lang.driver:incremental_lower_surface_comptime_value_invalidates" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.N;\nfun main() i32 { ret N; }\n";
+    texts[1] = "pub val N: i32 = 5;\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val p1r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val st_leaf: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.leaf");
+    val lo_main_1: query.Revision = ut_lower_lc(?sA, st_main);
+    val sf_leaf_1: query.Revision = ut_surface_lc(?sA, st_leaf);
+    dnit_project(?p1);
+
+    val src_dir:   str = ut_cc3(?alloc, root, "/", "src");
+    val leaf_path: str = ut_cc3(?alloc, src_dir, "/", "leaf.mach");
+
+    val leaf_v2: str = "pub val N: i32 = 6;\n";
+    if (R.is_err[bool, str](filesystem.write_file(leaf_path, leaf_v2, str_len(leaf_v2), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val p2r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    val lo_main_2: query.Revision = ut_lower_lc(?sA, st_main);
+    val sf_leaf_2: query.Revision = ut_surface_lc(?sA, st_leaf);
+    dnit_project(?p2);
+    if (sf_leaf_2 == sf_leaf_1) { bad = 1; }   # the comptime value is in the surface
+    if (lo_main_2 == lo_main_1) { bad = 1; }   # so the importer that folds it re-lowers
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: an inline-body edit does NOT invalidate importers. mach does not
+# inline across module boundaries - a dependency's `#[inline]` function is emitted extern
+# in importers and the inline pass skips extern callees - so its body never flows in and
+# is excluded from the lowered surface, like any regular body. THIS PINS THAT BEHAVIOR:
+# when cross-module inlining is added, the surface (driver.fp_lowered_surface, keyed off
+# the extern-skip in me.pass.inline.should_inline) must be extended to include exported
+# bodies, at which point this test must flip to asserting invalidation (#1859).
+test "mach.lang.driver:incremental_lower_inline_body_pins_no_cross_module_inline" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.inl;\nfun main() i32 { ret inl(); }\n";
+    texts[1] = "#[inline]\npub fun inl() i32 { ret 3; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val p1r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val st_leaf: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.leaf");
+    val lo_main_1: query.Revision = ut_lower_lc(?sA, st_main);
+    val lo_leaf_1: query.Revision = ut_lower_lc(?sA, st_leaf);
+    val sf_leaf_1: query.Revision = ut_surface_lc(?sA, st_leaf);
+    dnit_project(?p1);
+
+    val src_dir:   str = ut_cc3(?alloc, root, "/", "src");
+    val leaf_path: str = ut_cc3(?alloc, src_dir, "/", "leaf.mach");
+
+    # change only the inline function's returned constant (renumber-neutral).
+    val leaf_v2: str = "#[inline]\npub fun inl() i32 { ret 4; }\n";
+    if (R.is_err[bool, str](filesystem.write_file(leaf_path, leaf_v2, str_len(leaf_v2), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val p2r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    val lo_main_2: query.Revision = ut_lower_lc(?sA, st_main);
+    val lo_leaf_2: query.Revision = ut_lower_lc(?sA, st_leaf);
+    val sf_leaf_2: query.Revision = ut_surface_lc(?sA, st_leaf);
+    dnit_project(?p2);
+    if (sf_leaf_2 != sf_leaf_1) { bad = 1; }   # inline body is excluded from the surface
+    if (lo_leaf_2 == lo_leaf_1) { bad = 1; }   # leaf itself re-lowered
+    if (lo_main_2 != lo_main_1) { bad = 1; }   # PIN: the importer is reused (no cross-module inline)
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: a no-change rebuild re-codegens no module (every Q_CODEGEN
+# reused), while editing a module re-codegens it and reuses an unrelated sibling -
+# the per-module codegen hash-and-skip chained off Q_LOWER (#1618).
+test "mach.lang.driver:incremental_codegen_reuse_and_recompute" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    texts[0] = "use uniontest.a.fa;\nuse uniontest.b.fb;\nfun main() i32 { ret fa() + fb(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 3);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val p1r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    if (R.is_err[bool, str](run_sema_pass(?p1)))    { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p1)))   { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_codegen_pass(?p1))) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val st_a:    session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.a");
+    val st_b:    session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.b");
+    val cg_main_1: query.Revision = ut_codegen_lc(?sA, st_main);
+    val cg_a_1:    query.Revision = ut_codegen_lc(?sA, st_a);
+    val cg_b_1:    query.Revision = ut_codegen_lc(?sA, st_b);
+    dnit_project(?p1);
+
+    # build 2: no edit. every module's Q_CODEGEN must be reused.
+    val p2r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    if (R.is_err[bool, str](run_sema_pass(?p2)))    { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p2)))   { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_codegen_pass(?p2))) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (ut_codegen_lc(?sA, st_main) != cg_main_1) { bad = 1; }
+    if (ut_codegen_lc(?sA, st_a)    != cg_a_1)    { bad = 1; }
+    if (ut_codegen_lc(?sA, st_b)    != cg_b_1)    { bad = 1; }
+    dnit_project(?p2);
+
+    # build 3: edit a's body. a re-codegens (its IR changed); b is reused.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val a_path:  str = ut_cc3(?alloc, src_dir, "/", "a.mach");
+    val a_v2:    str = "pub fun fa() i32 { val t: i32 = 1; ret t; }\n";
+    if (R.is_err[bool, str](filesystem.write_file(a_path, a_v2, str_len(a_v2), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+
+    val p3r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p3r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p3: Project = R.unwrap_ok[Project, str](p3r);
+    if (R.is_err[bool, str](run_sema_pass(?p3)))    { dnit_project(?p3); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p3)))   { dnit_project(?p3); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_codegen_pass(?p3))) { dnit_project(?p3); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (ut_codegen_lc(?sA, st_a) == cg_a_1) { bad = 1; }
+    if (ut_codegen_lc(?sA, st_b) != cg_b_1) { bad = 1; }
+    dnit_project(?p3);
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# build + sema + lower + codegen a scaffolded project on session `s`, returning the
+# Project (caller dnit_project's it). drives repeated back-half builds on one
+# long-lived session for the link incremental test.
+fun ut_back_half(s: *session.Session, root: str) R.Result[Project, str] {
+    val pr: R.Result[Project, str] = build_project_union(s, root);
+    if (R.is_err[Project, str](pr)) { ret pr; }
+    var p: Project = R.unwrap_ok[Project, str](pr);
+    val rs: R.Result[bool, str] = run_sema_pass(?p);
+    if (R.is_err[bool, str](rs)) { dnit_project(?p); ret R.err[Project, str](R.unwrap_err[bool, str](rs)); }
+    val rl: R.Result[bool, str] = run_lower_pass(?p);
+    if (R.is_err[bool, str](rl)) { dnit_project(?p); ret R.err[Project, str](R.unwrap_err[bool, str](rl)); }
+    val rc: R.Result[bool, str] = run_codegen_pass(?p);
+    if (R.is_err[bool, str](rc)) { dnit_project(?p); ret R.err[Project, str](R.unwrap_err[bool, str](rc)); }
+    ret R.ok[Project, str](p);
+}
+
+# driver incremental: Q_LINK reuses the link on a no-change rebuild, re-links when a
+# module's object changes, and re-links on a link-only config change (a different
+# output path) even when every object is reused - the fingerprint-completeness pin
+# (#1618).
+test "mach.lang.driver:incremental_link_reuse_and_fingerprint" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    texts[0] = "use uniontest.a.fa;\nuse uniontest.b.fb;\nfun main() i32 { ret fa() + fb(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 3);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: config C1. a cold-cache Q_LINK entry reports "re-link needed".
+    val p1r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    val st_a:    session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.a");
+    val st_b:    session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.b");
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    if (R.is_err[bool, str](set_link_config_input(?p1, "out/app"::*u8, "app"::*u8, 0, nil, 0, nil, 0))) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val r1: R.Result[bool, str] = run_link_pass(?p1);
+    if (R.is_err[bool, str](r1)) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (!R.unwrap_ok[bool, str](r1)) { bad = 1; }
+    val lk1: query.Revision = ut_link_lc(?sA);
+    dnit_project(?p1);
+
+    # build 2: no edit, config C1. every link input unchanged -> reuse.
+    val p2r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    if (R.is_err[bool, str](set_link_config_input(?p2, "out/app"::*u8, "app"::*u8, 0, nil, 0, nil, 0))) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val r2: R.Result[bool, str] = run_link_pass(?p2);
+    if (R.is_err[bool, str](r2)) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.unwrap_ok[bool, str](r2)) { bad = 1; }
+    val lk2: query.Revision = ut_link_lc(?sA);
+    if (lk2 != lk1) { bad = 1; }
+    dnit_project(?p2);
+
+    # build 3: edit a's body, config C1. a's object changed -> re-link.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val a_path:  str = ut_cc3(?alloc, src_dir, "/", "a.mach");
+    val a_v2:    str = "pub fun fa() i32 { val t: i32 = 1; ret t; }\n";
+    if (R.is_err[bool, str](filesystem.write_file(a_path, a_v2, str_len(a_v2), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+
+    val p3r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p3r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p3: Project = R.unwrap_ok[Project, str](p3r);
+    if (R.is_err[bool, str](set_link_config_input(?p3, "out/app"::*u8, "app"::*u8, 0, nil, 0, nil, 0))) { dnit_project(?p3); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val r3: R.Result[bool, str] = run_link_pass(?p3);
+    if (R.is_err[bool, str](r3)) { dnit_project(?p3); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (!R.unwrap_ok[bool, str](r3)) { bad = 1; }
+    val lk3: query.Revision = ut_link_lc(?sA);
+    if (lk3 == lk2) { bad = 1; }
+    dnit_project(?p3);
+
+    # build 4: no source edit, but a link-only config change (different output path)
+    # with every object reused -> re-link STILL fires. the fingerprint-completeness
+    # pin: a's Q_CODEGEN is unchanged, yet Q_LINK advances.
+    val p4r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p4r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p4: Project = R.unwrap_ok[Project, str](p4r);
+    val cg_a_before:    query.Revision = ut_codegen_lc(?sA, st_a);
+    val cg_b_before:    query.Revision = ut_codegen_lc(?sA, st_b);
+    val cg_main_before: query.Revision = ut_codegen_lc(?sA, st_main);
+    if (R.is_err[bool, str](set_link_config_input(?p4, "out/other"::*u8, "app"::*u8, 0, nil, 0, nil, 0))) { dnit_project(?p4); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val r4: R.Result[bool, str] = run_link_pass(?p4);
+    if (R.is_err[bool, str](r4)) { dnit_project(?p4); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    # every module's object is reused across a link-only config change; only Q_LINK advances.
+    if (!R.unwrap_ok[bool, str](r4))                    { bad = 1; }
+    if (ut_link_lc(?sA) == lk3)                         { bad = 1; }
+    if (ut_codegen_lc(?sA, st_a)    != cg_a_before)     { bad = 1; }
+    if (ut_codegen_lc(?sA, st_b)    != cg_b_before)     { bad = 1; }
+    if (ut_codegen_lc(?sA, st_main) != cg_main_before)  { bad = 1; }
+    dnit_project(?p4);
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: Q_LINK re-links when an external static input's CONTENT changes
+# at the same path (not just its path), when its path changes, and when a dynamic
+# dependency (soname) is added - the external-axis completeness of the link
+# fingerprint (#1618).
+test "mach.lang.driver:incremental_link_external_content_fingerprint" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    texts[0] = "use uniontest.a.fa;\nuse uniontest.b.fb;\nfun main() i32 { ret fa() + fb(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 3);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    # an external static link input (a vendored archive) on disk.
+    val ext1: str = ut_cc3(?alloc, root, "/", "libx.a");
+    if (R.is_err[bool, str](filesystem.write_file(ext1, "AAAA", 4, 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var ext_a: [1]*u8; ext_a[0] = ext1::*u8;
+
+    var bad: i32 = 0;
+
+    # build A: ext=[ext1] (content AAAA). cold -> re-link.
+    val pAr: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](pAr)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var pA: Project = R.unwrap_ok[Project, str](pAr);
+    if (R.is_err[bool, str](set_link_config_input(?pA, "out/app"::*u8, "app"::*u8, 0, ?ext_a[0], 1, nil, 0))) { dnit_project(?pA); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val rlA: R.Result[bool, str] = run_link_pass(?pA);
+    if (R.is_err[bool, str](rlA)) { dnit_project(?pA); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (!R.unwrap_ok[bool, str](rlA)) { bad = 1; }
+    val lkA: query.Revision = ut_link_lc(?sA);
+    dnit_project(?pA);
+
+    # build B: same ext, same content -> reuse.
+    val pBr: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](pBr)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var pB: Project = R.unwrap_ok[Project, str](pBr);
+    if (R.is_err[bool, str](set_link_config_input(?pB, "out/app"::*u8, "app"::*u8, 0, ?ext_a[0], 1, nil, 0))) { dnit_project(?pB); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val rlB: R.Result[bool, str] = run_link_pass(?pB);
+    if (R.is_err[bool, str](rlB)) { dnit_project(?pB); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.unwrap_ok[bool, str](rlB)) { bad = 1; }
+    if (ut_link_lc(?sA) != lkA)      { bad = 1; }
+    dnit_project(?pB);
+
+    # build C: SAME path, DIFFERENT content -> re-link (the content-hash pin for
+    # finding 1: a same-path archive rebuild must invalidate).
+    if (R.is_err[bool, str](filesystem.write_file(ext1, "BBBB", 4, 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val pCr: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](pCr)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var pC: Project = R.unwrap_ok[Project, str](pCr);
+    if (R.is_err[bool, str](set_link_config_input(?pC, "out/app"::*u8, "app"::*u8, 0, ?ext_a[0], 1, nil, 0))) { dnit_project(?pC); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val rlC: R.Result[bool, str] = run_link_pass(?pC);
+    if (R.is_err[bool, str](rlC)) { dnit_project(?pC); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (!R.unwrap_ok[bool, str](rlC)) { bad = 1; }
+    val lkC: query.Revision = ut_link_lc(?sA);
+    if (lkC == lkA)                   { bad = 1; }
+    dnit_project(?pC);
+
+    # build D: a DIFFERENT external path -> re-link.
+    val ext2: str = ut_cc3(?alloc, root, "/", "liby.a");
+    if (R.is_err[bool, str](filesystem.write_file(ext2, "CCCC", 4, 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var ext_b: [1]*u8; ext_b[0] = ext2::*u8;
+    val pDr: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](pDr)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var pD: Project = R.unwrap_ok[Project, str](pDr);
+    if (R.is_err[bool, str](set_link_config_input(?pD, "out/app"::*u8, "app"::*u8, 0, ?ext_b[0], 1, nil, 0))) { dnit_project(?pD); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val rlD: R.Result[bool, str] = run_link_pass(?pD);
+    if (R.is_err[bool, str](rlD)) { dnit_project(?pD); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (!R.unwrap_ok[bool, str](rlD)) { bad = 1; }
+    val lkD: query.Revision = ut_link_lc(?sA);
+    if (lkD == lkC)                   { bad = 1; }
+    dnit_project(?pD);
+
+    # build E: add a dynamic dependency (soname) -> re-link.
+    val sn_r: R.Result[intern.StrId, str] = intern.intern(?sA.interner, "libfoo");
+    if (R.is_err[intern.StrId, str](sn_r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var sn: [1]intern.StrId; sn[0] = R.unwrap_ok[intern.StrId, str](sn_r);
+    val pEr: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](pEr)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var pE: Project = R.unwrap_ok[Project, str](pEr);
+    if (R.is_err[bool, str](set_link_config_input(?pE, "out/app"::*u8, "app"::*u8, 0, ?ext_b[0], 1, ?sn[0], 1))) { dnit_project(?pE); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val rlE: R.Result[bool, str] = run_link_pass(?pE);
+    if (R.is_err[bool, str](rlE)) { dnit_project(?pE); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (!R.unwrap_ok[bool, str](rlE)) { bad = 1; }
+    if (ut_link_lc(?sA) == lkD)       { bad = 1; }
+    dnit_project(?pE);
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: toggling the IR verifier on a warm session re-lowers every
+# module (so the verifier actually runs), while leaving it unchanged reuses lowering
+# - Q_LOWER_FLAGS closes the "requested verification silently skipped" hole (#1618).
+test "mach.lang.driver:incremental_lower_verify_ir_toggle_relowers" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.fa;\nfun main() i32 { ret fa(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: verify off (the default).
+    val p1r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    p1.verify_ir = false;
+    if (R.is_err[bool, str](run_sema_pass(?p1)))  { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p1))) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val lc1: query.Revision = ut_lower_lc(?sA, st_main);
+    dnit_project(?p1);
+
+    # build 2: verify ON, no source edit -> re-lower (the verifier must run).
+    val p2r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    p2.verify_ir = true;
+    if (R.is_err[bool, str](run_sema_pass(?p2)))  { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p2))) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val lc2: query.Revision = ut_lower_lc(?sA, st_main);
+    dnit_project(?p2);
+    if (lc2 == lc1) { bad = 1; }
+
+    # build 3: verify ON again, no edit -> reuse (flags unchanged).
+    val p3r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p3r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p3: Project = R.unwrap_ok[Project, str](p3r);
+    p3.verify_ir = true;
+    if (R.is_err[bool, str](run_sema_pass(?p3)))  { dnit_project(?p3); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p3))) { dnit_project(?p3); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (ut_lower_lc(?sA, st_main) != lc2) { bad = 1; }
+    dnit_project(?p3);
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: test-mode `main`-neutralization is a variant of Q_LOWER keyed
+# on (module, test-mode), not an in-place mutation of the cached IR. A warm session
+# that lowers the test variant (its `main` neutralized) then the normal variant of the
+# same module yields correct IR for both, and the test variant's cached value is never
+# rewritten by the normal build - query-owned IR is immutable by construction (#1858).
+test "mach.lang.driver:incremental_test_mode_neutralization_variant" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    # `#[symbol("main")]` gives the entry the literal `main` linkage name (the program
+    # entry a normal build emits and a test build must neutralize); without it the
+    # entry mangles like any other symbol and nothing needs neutralizing.
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.fa;\n#[symbol(\"main\")]\nfun main() i32 { ret fa(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: test mode. Q_LOWER computes the test variant, its `main` neutralized on
+    # the fresh IR before it is cached. the borrowed IR proves the produced variant is
+    # neutralized; lc_test1 pins its cached revision.
+    val p1r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    p1.test_mode = true;
+    if (R.is_err[bool, str](run_sema_pass(?p1)))  { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p1))) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val st_main:  session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val mid1: session.ModuleId = ut_mid(?p1, ?sA, "uniontest.main");
+    if (mid1 == session.MODULE_NIL) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (ut_mod_main_neutralized(?sA, p1.modules[mid1::u32].ir_module) != 1) { bad = 2; }
+    val key_test: u64 = back_half_key(st_main, true);
+    val key_norm: u64 = back_half_key(st_main, false);
+    val lc_test1: query.Revision = ut_lower_lc_key(?sA, key_test);
+    dnit_project(?p1);
+
+    # build 2: normal mode, same session, no edit. the normal variant lowers `main`
+    # with its body intact under a distinct key; the test variant, keyed separately,
+    # is not recomputed (its cached revision is unchanged) and so stays neutralized -
+    # both variants coexist and neither wrote through the other's handle.
+    val p2r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    p2.test_mode = false;
+    if (R.is_err[bool, str](run_sema_pass(?p2)))  { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p2))) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val mid2: session.ModuleId = ut_mid(?p2, ?sA, "uniontest.main");
+    if (mid2 == session.MODULE_NIL) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (ut_mod_main_neutralized(?sA, p2.modules[mid2::u32].ir_module) != 0) { bad = 3; }
+    # the test variant's cached entry is still present and un-recomputed by the normal
+    # build (owned-handle shards never early-cut, so an unchanged revision means it was
+    # not re-lowered - it holds the same neutralized module build 1 produced).
+    if (ut_lower_lc_key(?sA, key_test) != lc_test1) { bad = 4; }
+    # the normal variant is its own live cached entry under the distinct key.
+    if (ut_lower_lc_key(?sA, key_norm) == 0xFFFFFFFFFFFFFFFF) { bad = 5; }
+    dnit_project(?p2);
+
     filesystem.remove_all(?alloc, root);
     session.dnit(?sA);
     ret bad;
