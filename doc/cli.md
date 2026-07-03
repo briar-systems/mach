@@ -40,6 +40,7 @@ argument forwarding.
 | `build` | compile the project to objects and (for a `[bin.*]`) a linked binary |
 | `run`   | execute the already-built binary (a post-`build` convenience, not a rebuild) |
 | `test`  | build the test binary and run the collected tests |
+| `clean` | remove the project's build output directory trees |
 | `dep`   | manage git-backed dependencies (clone, lock, vendor) under `<dep>` |
 | `init`  | scaffold a new project |
 | `doc`   | generate Markdown reference docs from source doc-comments |
@@ -282,6 +283,27 @@ per collected test instead. The schema is versioned and documented in
 integer. Build diagnostics stay on stderr, so the stdout stream is clean.
 
 Exit codes: `0` all passed, `1` any failed, `2` build/internal error.
+
+## `mach clean`
+
+```
+mach clean [path]
+```
+
+Removes the project's build output. The trees removed are the static directory
+prefixes of the manifest's `out`/`obj`/`ir`/`asm` templates — the leading path
+components before the first `{...}` placeholder — so the whole output tree is
+cleared regardless of target or profile. Because it is driven by the templates, a
+project that relocates its output (`out = "build/..."`) is cleaned at that root
+rather than a hardcoded `out/`. `[path]` selects the project (default: the working
+directory, walking up to the nearest `mach.toml`).
+
+Only the manifest is read: no module graph is loaded and nothing under the
+dependency dir is touched. Removal is idempotent (`mach clean` on an already-clean
+project prints `nothing to clean` and succeeds). The command takes no options.
+
+Exit codes: `0` on success, `1` on a missing project or unparseable manifest, `2`
+on an allocator or io failure.
 
 ## `mach dep`
 
