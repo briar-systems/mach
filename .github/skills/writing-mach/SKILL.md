@@ -313,6 +313,9 @@ val n: usize = unwrap_ok[usize, str](r);
 
 - `str` is `*char` (null-terminated); `std.types.string` provides `str_len`,
   comparison, and `StrView { data, len }` for length-aware slices.
+- No methods, no UFCS: everything is a free function taking an explicit
+  receiver (usually a pointer), reached through the module alias —
+  `vec.push[T](?v, x)`, not `v.push(x)`.
 - Naming: `snake_case` functions/bindings, `PascalCase` types,
   `SCREAMING_SNAKE` constants. Indent 4 spaces; align `:` columns in field
   blocks, import groups, and consecutive `val`/`var` runs when it aids
@@ -320,12 +323,13 @@ val n: usize = unwrap_ok[usize, str](r);
 
 ## Docstrings
 
-`#` comments immediately above a declaration: a lowercase summary line, then —
-only when there are elements to document — a `# ---` separator and one aligned
-component line per parameter/field/return:
+`#` comments immediately above a declaration: a bare lowercase summary line
+(no `name:` prefix, no trailing period), then — only when there are elements
+to document — a `# ---` separator and one aligned component line per
+parameter/field/return:
 
 ```mach
-# read the wall-clock time.
+# read the wall-clock time
 # ---
 # out: pointer to Timespec to populate
 # ret: 0 on success, negative errno on failure
@@ -337,6 +341,11 @@ variant name. Summary-only docstrings omit the separator. Every file opens
 with a module docstring (summary, optional paragraphs separated by blank `#`
 lines) before any `use`/`fwd`/decorator. Decorators sit between the docstring
 and the declaration. Document every `pub` entity.
+
+Much existing code still carries the older `# name: summary.` form (leading
+identifier, trailing period) from before the convention tightened — when
+editing such a file, match its surrounding style; use the bare form in new
+files.
 
 ## Comptime channel — brief
 

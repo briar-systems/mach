@@ -28,6 +28,7 @@ All reads, all comptime constants, closed tree:
 ```mach
 $mach.build.os / .arch / .abi / .mode   # live; compare against the tag tables
 $mach.build.pointer_width               # live; integer byte count (8 on 64-bit)
+$mach.build.pie                         # live; 1 when building position-independent
 $mach.build.<NAME>                      # live; manifest `defines` lookup (see below)
 $mach.version / .major / .minor / .patch    # live; compiler version
 $mach.compiler.name / .version              # live

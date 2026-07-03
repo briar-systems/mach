@@ -15,7 +15,8 @@ One inline-assembly form: an ISA-tagged block of raw instruction lines.
 ```mach
 asm x86_64 {
     # raw instructions, one per line, # for comments
-    mov rax, [{ptr}]
+    mov rcx, {ptr}
+    mov rax, [rcx]
     mov {result}, rax
 }
 ```
@@ -34,9 +35,20 @@ Locked rules:
 ## Operand substitution — `{name}`
 
 `{name}` substitutes a local in scope; the compiler resolves it to a register
-or memory operand from liveness and the instruction's operand class. Address
-it with the ISA's own syntax (`[{ptr}]` on x86_64, `[{ptr}]`/`ldr` on aarch64,
-`ld t0, ({ptr})` on riscv64).
+or memory operand from liveness and the instruction's operand class. In
+practice a `{name}` binds the local's **storage — typically a stack slot** —
+so to reach a pointee, stage the pointer through a scratch register first;
+never write a double indirection like `[{ptr}]`:
+
+```mach
+mov rcx, {ptr}          # x86_64: load the pointer value
+mov rax, [rcx]          # then address through the register
+                        # aarch64: ldr x12, {ptr}  /  ldr x9, [x12]
+```
+
+Branch targets inside a block are numeric local labels with direction
+suffixes (`1:` … `bnez a4, 1b`, `b.ne 2f`), the stdlib's convention across
+all three ISAs.
 
 ```mach
 pub fun add_via_asm(a: i64, b: i64) i64 {
@@ -64,16 +76,16 @@ never compile, so each block only needs to be valid for its own ISA:
 
 ```mach
 $if ($mach.build.arch == $mach.arch.x86_64) {
-    asm x86_64 { ud2 }
+    asm x86_64 { hlt }
 }
 $or ($mach.build.arch == $mach.arch.aarch64) {
     asm aarch64 { brk 0 }
 }
 $or ($mach.build.arch == $mach.arch.riscv64) {
-    asm riscv64 { unimp }
+    asm riscv64 { ebreak }
 }
 $or {
-    $error("unsupported arch");
+    $error("mymod.trap: unsupported architecture");
 }
 ```
 
@@ -97,8 +109,20 @@ distinct value and each instance compiles only its selected `asm` arm:
 pub fun load($order: u8, ptr: *i64) i64 {
     var result: i64 = 0;
     $if ($mach.build.arch == $mach.arch.aarch64) {
-        $if (order == RELAXED) { asm aarch64 { ldr {result}, [{ptr}] } }
-        $or (order == ACQUIRE) { asm aarch64 { ldar {result}, [{ptr}] } }
+        $if (order == RELAXED) {
+            asm aarch64 {
+                ldr x12, {ptr}
+                ldr x9, [x12]
+                str x9, {result}
+            }
+        }
+        $or (order == ACQUIRE) {
+            asm aarch64 {
+                ldr x12, {ptr}
+                ldar x9, [x12]
+                str x9, {result}
+            }
+        }
     }
     ret result;
 }
