@@ -106,8 +106,9 @@ reserved name — declaring `[target.native]` is an error.
 
 | Value     | Status |
 |-----------|--------|
-| `x86_64`  | supported — the only fully working ISA today |
-| `aarch64` | recognized; an ISA vtable exists, but codegen is not yet validated end-to-end |
+| `x86_64`  | supported — the primary ISA |
+| `aarch64` | supported — CI builds and runs linux-arm64 natively on every PR |
+| `riscv64` | supported — CI runs under qemu on every PR; self-hosting target (#1852) |
 
 ### Accepted `os` values
 

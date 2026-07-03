@@ -6,8 +6,8 @@ constants. The tags `$mach.{os,arch,abi,mode}.*` exist for path-value
 comparison against the resolved-build facts.
 
 > **Implementation status.** The resolved-build facts (`$mach.build.{os,arch,
-> abi,pointer_width,mode}`), the tag tables (`$mach.{os,arch,abi,mode}.*`), the
-> compiler version (`$mach.version` and `$mach.version.{major,minor,patch}`),
+> abi,pointer_width,mode,pie}`), the tag tables (`$mach.{os,arch,abi,mode}.*`),
+> the compiler version (`$mach.version` and `$mach.version.{major,minor,patch}`),
 > and `$mach.compiler.{name,version}` are live. The `$mach.build.{timestamp,
 > host}`, `$mach.build.git.*`, `$mach.project.*`, and `$mach.source.*` paths are
 > reserved stubs — reading one is a compile error ("not yet available"). Each
@@ -27,6 +27,7 @@ $mach.build.arch                # live; compared against $mach.arch.* tags
 $mach.build.abi                 # live; compared against $mach.abi.* tags
 $mach.build.pointer_width       # live; integer count of bytes
 $mach.build.mode                # live; compared against $mach.mode.* tags
+$mach.build.pie                 # live; 1 when building position-independent, else 0
 $mach.build.timestamp           # stub — not yet available
 $mach.build.host                # stub — not yet available
 $mach.build.git.commit          # stub — not yet available
@@ -85,9 +86,11 @@ $mach.os.windows
 $mach.os.freestanding           # no OS / bare metal
 $mach.arch.x86_64
 $mach.arch.aarch64
+$mach.arch.riscv64
 $mach.abi.sysv
 $mach.abi.win64
 $mach.abi.aapcs64
+$mach.abi.lp64
 $mach.mode.debug
 $mach.mode.release
 ```
