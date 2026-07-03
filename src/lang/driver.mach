@@ -2418,6 +2418,10 @@ fun ensure_query_pipeline(s: *session.Session) R.Result[bool, str] {
         val rcg: R.Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_CODEGEN, q_codegen_compute, q_codegen_finalize);
         if (R.is_err[bool, str](rcg)) { ret rcg; }
     }
+    if (!query.is_registered(?s.queries, query.Q_LINK)) {
+        val rln: R.Result[bool, str] = query.register_derived(?s.queries, query.Q_LINK, q_link_compute);
+        if (R.is_err[bool, str](rln)) { ret rln; }
+    }
     ret R.ok[bool, str](true);
 }
 
@@ -4121,6 +4125,180 @@ fun image_handle_decode(e: *query.QueryEntry) *of.ObjectImage {
     if (e.value == nil || e.value_len::usize < $size_of(ptr)) { ret nil; }
     val slot: *ptr = e.value::ptr::*ptr;
     ret slot[0]::*of.ObjectImage;
+}
+
+# serialize the link-only build configuration into the Q_LINK_CONFIG input, keyed
+# on unit (0) - set by the CLI before the link so Q_LINK invalidates on any change
+# to an input that does NOT flow through a module's Q_CODEGEN.
+#
+# Captures the output path and product name, the output kind, the pie flag, and the
+# external link inputs (object/archive paths plus dynamic-dependency sonames). The
+# ownership boundary: the CLI translates argv/manifest into these resolved inputs;
+# this records them into the query graph. set_input's byte-equality cutoff keeps the
+# link reused when the config is unchanged.
+# ---
+# p:            the active project (for its session query DB and pie flag)
+# out_path:     the resolved output artifact path (nil-safe)
+# product:      the product / signing-identity name (nil-safe)
+# out_kind:     the link output kind discriminator (exe / library / object)
+# ext_paths:    the external static link-input paths
+# ext_count:    number of external paths
+# sonames:      the dynamic-dependency soname ids
+# soname_count: number of sonames
+# ret:          true on success, or the first error
+pub fun set_link_config_input(p: *Project, out_path: *u8, product: *u8, out_kind: u32,
+                              ext_paths: **u8, ext_count: u32,
+                              sonames: *intern.StrId, soname_count: u32) R.Result[bool, str] {
+    var fb: FpBuf;
+    fb.alloc = p.s.alloc;
+    fb.buf   = nil;
+    fb.len   = 0;
+    fb.cap   = 0;
+
+    val w: R.Result[bool, str] = write_link_config(?fb, p, out_path, product, out_kind, ext_paths, ext_count, sonames, soname_count);
+    if (R.is_err[bool, str](w)) {
+        if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.s.alloc, fb.buf, fb.cap::usize); }
+        ret w;
+    }
+
+    val si: R.Result[bool, str] = query.set_input(?p.s.queries, query.Q_LINK_CONFIG, 0, fb.buf, fb.len);
+    if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.s.alloc, fb.buf, fb.cap::usize); }
+    ret si;
+}
+
+# append the link-only configuration bytes into `fb` in a stable order. every input
+# that can change the linked binary without changing a module's object appears here,
+# so a change to any of them advances Q_LINK_CONFIG and re-links.
+fun write_link_config(fb: *FpBuf, p: *Project, out_path: *u8, product: *u8, out_kind: u32,
+                      ext_paths: **u8, ext_count: u32,
+                      sonames: *intern.StrId, soname_count: u32) R.Result[bool, str] {
+    val a0: R.Result[bool, str] = fp_u32(fb, out_kind);            if (R.is_err[bool, str](a0)) { ret a0; }
+    var pie_axis: u32 = 0;
+    if (p.s.pie) { pie_axis = 1; }
+    val a1: R.Result[bool, str] = fp_u32(fb, pie_axis);            if (R.is_err[bool, str](a1)) { ret a1; }
+    val a2: R.Result[bool, str] = fp_cstr(fb, out_path);           if (R.is_err[bool, str](a2)) { ret a2; }
+    val a3: R.Result[bool, str] = fp_cstr(fb, product);            if (R.is_err[bool, str](a3)) { ret a3; }
+
+    val a4: R.Result[bool, str] = fp_u32(fb, ext_count);           if (R.is_err[bool, str](a4)) { ret a4; }
+    var i: u32 = 0;
+    for (i < ext_count) {
+        val ap: R.Result[bool, str] = fp_cstr(fb, ext_paths[i]);  if (R.is_err[bool, str](ap)) { ret ap; }
+        i = i + 1;
+    }
+    val a5: R.Result[bool, str] = fp_u32(fb, soname_count);        if (R.is_err[bool, str](a5)) { ret a5; }
+    var j: u32 = 0;
+    for (j < soname_count) {
+        val as: R.Result[bool, str] = fp_u32(fb, sonames[j]::u32); if (R.is_err[bool, str](as)) { ret as; }
+        j = j + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# compute the project's link fingerprint through Q_LINK and report whether the link
+# must re-run
+#
+# Records Q_LINK's dependency graph (Q_TARGET, Q_LINK_CONFIG, and every module's
+# Q_CODEGEN) and folds each dependency's revision into the entry's value, so
+# Q_LINK's last_changed advances iff a link input changed. The prior entry's
+# revision is peeked before the demand, so a fresh (cold-cache) or invalidated entry
+# reports "re-link needed" and an unchanged one reports "reuse". Q_CODEGEN must have
+# run first (the compute reads each module's object revision). set_link_config_input
+# must have set Q_LINK_CONFIG for this build.
+# ---
+# p:   the active project; its topo order drives the link set
+# ret: true when the link must re-run, false when the prior link is still valid, or
+#      the first error
+pub fun run_link_pass(p: *Project) R.Result[bool, str] {
+    session.set_active_project(p.s, p::ptr);
+
+    val prior: query.Revision = query.peek_revision(?p.s.queries, query.Q_LINK, 0);
+    val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LINK, 0);
+    session.set_active_project(p.s, nil);
+    if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
+    val now: query.Revision = R.unwrap_ok[*query.QueryEntry, str](e_r).last_changed;
+    ret R.ok[bool, str](now != prior);
+}
+
+# the Q_LINK derived compute - fold the revision of every link input into a
+# fingerprint whose change signals a needed re-link. reaches the per-build module
+# graph through the session's active Project, and records the deps that make the
+# entry incremental:
+#   - Q_TARGET:            a target/profile/pie change re-links (it also re-codegens
+#                          every module, so it is covered twice - deliberately);
+#   - Q_LINK_CONFIG:       a link-only change (output path, product, external inputs)
+#                          re-links even when every object is unchanged;
+#   - Q_CODEGEN(module) for every module in the link set: a changed object re-links.
+# the value is the ordered tuple of those revisions, so an unchanged set of inputs
+# reproduces identical bytes (early cutoff: the link is reused).
+fun q_link_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
+    val s: *session.Session = db.ctx::*session.Session;
+    if (s == nil) { ret R.err[query.QueryOutput, str]("Q_LINK: query db has no session context"); }
+    val pp: ptr = session.active_project(s);
+    if (pp == nil) { ret R.err[query.QueryOutput, str]("Q_LINK: no active project for the link pass"); }
+    val p: *Project = pp::*Project;
+
+    var fb: FpBuf;
+    fb.alloc = alloc;
+    fb.buf   = nil;
+    fb.len   = 0;
+    fb.cap   = 0;
+
+    val rt: R.Result[bool, str] = query.record_dep(db, query.Q_LINK, key, query.Q_TARGET, 0);
+    if (R.is_err[bool, str](rt)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](rt)); }
+    val wt: R.Result[bool, str] = fp_u64(?fb, query.peek_revision(db, query.Q_TARGET, 0));
+    if (R.is_err[bool, str](wt)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](wt)); }
+
+    val rc: R.Result[bool, str] = query.record_dep(db, query.Q_LINK, key, query.Q_LINK_CONFIG, 0);
+    if (R.is_err[bool, str](rc)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](rc)); }
+    val wc: R.Result[bool, str] = fp_u64(?fb, query.peek_revision(db, query.Q_LINK_CONFIG, 0));
+    if (R.is_err[bool, str](wc)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](wc)); }
+
+    val wn: R.Result[bool, str] = fp_u32(?fb, p.topo_len);
+    if (R.is_err[bool, str](wn)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](wn)); }
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val m: *ModuleEntry = ?p.modules[(p.topo[i])::u32];
+        val rd: R.Result[bool, str] = query.record_dep(db, query.Q_LINK, key, query.Q_CODEGEN, m.stable_id::u64);
+        if (R.is_err[bool, str](rd)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](rd)); }
+        val wm: R.Result[bool, str] = fp_u64(?fb, query.peek_revision(db, query.Q_CODEGEN, m.stable_id::u64));
+        if (R.is_err[bool, str](wm)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](wm)); }
+        i = i + 1;
+    }
+
+    var out: query.QueryOutput;
+    out.bytes = fb.buf;
+    out.len   = fb.len;
+    ret R.ok[query.QueryOutput, str](out);
+}
+
+# release a partially-built link fingerprint buffer and wrap the error.
+fun link_fp_fail(fb: *FpBuf, alloc: *A.Allocator, msg: str) R.Result[query.QueryOutput, str] {
+    if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](alloc, fb.buf, fb.cap::usize); }
+    ret R.err[query.QueryOutput, str](msg);
+}
+
+# append a u64 to the fingerprint as two u32 halves (the FpBuf primitives are u8 /
+# u32 only).
+fun fp_u64(b: *FpBuf, v: u64) R.Result[bool, str] {
+    val lo: R.Result[bool, str] = fp_u32(b, (v & 0xFFFFFFFF)::u32);
+    if (R.is_err[bool, str](lo)) { ret lo; }
+    ret fp_u32(b, (v >> 32)::u32);
+}
+
+# append a nil-terminated string to the fingerprint as a length prefix plus its
+# bytes; a nil pointer contributes a zero length.
+fun fp_cstr(b: *FpBuf, s: *u8) R.Result[bool, str] {
+    if (s == nil) { ret fp_u32(b, 0); }
+    val n: u32 = str_len(s::str)::u32;
+    val rl: R.Result[bool, str] = fp_u32(b, n);
+    if (R.is_err[bool, str](rl)) { ret rl; }
+    var i: u32 = 0;
+    for (i < n) {
+        val rb: R.Result[bool, str] = fp_u8(b, s[i]);
+        if (R.is_err[bool, str](rb)) { ret rb; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
 }
 
 # append the typed pub surface of module `mid` to the fingerprint.
@@ -5851,6 +6029,15 @@ fun ut_codegen_lc(s: *session.Session, stable: session.StableModuleId) query.Rev
     ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
 }
 
+# the last_changed revision of the project's Q_LINK entry on session `s`, or a
+# sentinel when absent. Q_LINK's value folds its inputs' revisions, so an unchanged
+# value means no link input changed - the link reuse probe (#1618).
+fun ut_link_lc(s: *session.Session) query.Revision {
+    val e: R.Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_LINK, 0);
+    if (R.is_err[*query.QueryEntry, str](e)) { ret 0xFFFFFFFFFFFFFFFF; }
+    ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
+}
+
 # whether two ModuleIds name the same module by FQN text
 # across two sessions. an anonymous nominal's origin is MODULE_NIL in both; the test
 # fixtures use only named records, so two MODULE_NIL origins (with a matched decl
@@ -6504,6 +6691,108 @@ test "mach.lang.driver:incremental_codegen_reuse_and_recompute" {
     if (ut_codegen_lc(?sA, st_a) == cg_a_1) { bad = 1; }
     if (ut_codegen_lc(?sA, st_b) != cg_b_1) { bad = 1; }
     dnit_project(?p3);
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# build + sema + lower + codegen a scaffolded project on session `s`, returning the
+# Project (caller dnit_project's it). drives repeated back-half builds on one
+# long-lived session for the link incremental test.
+fun ut_back_half(s: *session.Session, root: str) R.Result[Project, str] {
+    val pr: R.Result[Project, str] = build_project_union(s, root);
+    if (R.is_err[Project, str](pr)) { ret pr; }
+    var p: Project = R.unwrap_ok[Project, str](pr);
+    val rs: R.Result[bool, str] = run_sema_pass(?p);
+    if (R.is_err[bool, str](rs)) { dnit_project(?p); ret R.err[Project, str](R.unwrap_err[bool, str](rs)); }
+    val rl: R.Result[bool, str] = run_lower_pass(?p);
+    if (R.is_err[bool, str](rl)) { dnit_project(?p); ret R.err[Project, str](R.unwrap_err[bool, str](rl)); }
+    val rc: R.Result[bool, str] = run_codegen_pass(?p);
+    if (R.is_err[bool, str](rc)) { dnit_project(?p); ret R.err[Project, str](R.unwrap_err[bool, str](rc)); }
+    ret R.ok[Project, str](p);
+}
+
+# driver incremental: Q_LINK reuses the link on a no-change rebuild, re-links when a
+# module's object changes, and re-links on a link-only config change (a different
+# output path) even when every object is reused - the fingerprint-completeness pin
+# (#1618).
+test "mach.lang.driver:incremental_link_reuse_and_fingerprint" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    texts[0] = "use uniontest.a.fa;\nuse uniontest.b.fb;\nfun main() i32 { ret fa() + fb(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 3);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: config C1. a cold-cache Q_LINK entry reports "re-link needed".
+    val p1r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    val st_a: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.a");
+    if (R.is_err[bool, str](set_link_config_input(?p1, "out/app"::*u8, "app"::*u8, 0, nil, 0, nil, 0))) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val r1: R.Result[bool, str] = run_link_pass(?p1);
+    if (R.is_err[bool, str](r1)) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (!R.unwrap_ok[bool, str](r1)) { bad = 1; }
+    val lk1: query.Revision = ut_link_lc(?sA);
+    dnit_project(?p1);
+
+    # build 2: no edit, config C1. every link input unchanged -> reuse.
+    val p2r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    if (R.is_err[bool, str](set_link_config_input(?p2, "out/app"::*u8, "app"::*u8, 0, nil, 0, nil, 0))) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val r2: R.Result[bool, str] = run_link_pass(?p2);
+    if (R.is_err[bool, str](r2)) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.unwrap_ok[bool, str](r2)) { bad = 1; }
+    val lk2: query.Revision = ut_link_lc(?sA);
+    if (lk2 != lk1) { bad = 1; }
+    dnit_project(?p2);
+
+    # build 3: edit a's body, config C1. a's object changed -> re-link.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val a_path:  str = ut_cc3(?alloc, src_dir, "/", "a.mach");
+    val a_v2:    str = "pub fun fa() i32 { val t: i32 = 1; ret t; }\n";
+    if (R.is_err[bool, str](filesystem.write_file(a_path, a_v2, str_len(a_v2), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+
+    val p3r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p3r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p3: Project = R.unwrap_ok[Project, str](p3r);
+    if (R.is_err[bool, str](set_link_config_input(?p3, "out/app"::*u8, "app"::*u8, 0, nil, 0, nil, 0))) { dnit_project(?p3); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val r3: R.Result[bool, str] = run_link_pass(?p3);
+    if (R.is_err[bool, str](r3)) { dnit_project(?p3); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (!R.unwrap_ok[bool, str](r3)) { bad = 1; }
+    val lk3: query.Revision = ut_link_lc(?sA);
+    if (lk3 == lk2) { bad = 1; }
+    dnit_project(?p3);
+
+    # build 4: no source edit, but a link-only config change (different output path)
+    # with every object reused -> re-link STILL fires. the fingerprint-completeness
+    # pin: a's Q_CODEGEN is unchanged, yet Q_LINK advances.
+    val p4r: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](p4r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p4: Project = R.unwrap_ok[Project, str](p4r);
+    val cg_a_before: query.Revision = ut_codegen_lc(?sA, st_a);
+    if (R.is_err[bool, str](set_link_config_input(?p4, "out/other"::*u8, "app"::*u8, 0, nil, 0, nil, 0))) { dnit_project(?p4); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val r4: R.Result[bool, str] = run_link_pass(?p4);
+    if (R.is_err[bool, str](r4)) { dnit_project(?p4); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val cg_a_after: query.Revision = ut_codegen_lc(?sA, st_a);
+    if (!R.unwrap_ok[bool, str](r4))     { bad = 1; }
+    if (ut_link_lc(?sA) == lk3)          { bad = 1; }
+    if (cg_a_after != cg_a_before)       { bad = 1; }
+    dnit_project(?p4);
 
     filesystem.remove_all(?alloc, root);
     session.dnit(?sA);
