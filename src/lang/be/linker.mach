@@ -60,12 +60,14 @@ pub val LINK_RELOCATABLE: LinkMode = 1;
 # shared object / dynamic library
 pub val LINK_SHARED:      LinkMode = 2;
 
-# number of distinct merged output sections, one per `of.SK_*` kind. the merge
-# concatenates every input section of a kind into the kind's single output
-# section, in the canonical order TEXT, DATA, RODATA, RELRO, BSS, DEBUG (the
+# number of fixed, kind-keyed merged output sections - one per `of.SK_*` kind. the
+# merge concatenates every input section of an allocatable kind into that kind's
+# single output section, in the canonical order TEXT, DATA, RODATA, RELRO, BSS (the
 # `of.SK_*` numeric order; RELRO sits before BSS so a read-only-natured RELRO
-# segment is laid out with the constants, and DEBUG is non-allocated and excluded
-# from load segments).
+# segment is laid out with the constants). the `SK_DEBUG` kind slot stays unused:
+# non-allocated debug sections do not collapse by kind but are kept distinct by
+# NAME in name-keyed slots appended past this prefix (see `discover_debug_names`),
+# so `.debug_info`/`.debug_line`/... each survive as their own output section.
 val MERGED_KIND_COUNT: u32 = of.SK_COUNT;
 
 # placement of one input section within the merged image: which merged output
@@ -84,14 +86,22 @@ rec Placement {
 # accumulator describing one merged output section while it is being built: its
 # kind, the maximum alignment demanded by any contributing input section, the
 # running content length, and the assigned base virtual address.
+#
+# The first `MERGED_KIND_COUNT` accumulators are the fixed kind slots (index i
+# merges kind i) and carry `name = STR_NIL` - their output name derives from the
+# kind. Any accumulators past that prefix are name-keyed debug slots: non-allocated
+# `SK_DEBUG` sections kept distinct by name (`.debug_info`, `.debug_line`, ...) so
+# each survives the merge as its own output section rather than collapsing into one.
 # ---
 # kind:  the section kind this accumulator merges
+# name:  interned output name for a name-keyed debug slot, or STR_NIL for a kind slot
 # align: largest alignment any contributing section requires
 # len:   total content length accumulated so far
 # vaddr: base virtual address assigned to this merged section (0 if unassigned)
 # used:  true once at least one input section contributed
 rec MergedSection {
     kind:  of.SectionKind;
+    name:  intern.StrId;
     align: u32;
     len:   u32;
     vaddr: u64;
@@ -283,9 +293,29 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
         ret R.err[bool, str]("link: no input objects");
     }
 
-    # build the merged-section accumulators, one per kind, in canonical order.
-    var merged: [6]MergedSection;
-    init_merged(?merged[0]);
+    # discover the distinct debug-section names (first-encounter order) so the merge
+    # keeps non-allocated debug sections distinct by name instead of collapsing them
+    # into one kind-keyed section. with no debug input this yields 0 and the merge is
+    # the classic per-kind merge.
+    var debug_names: *intern.StrId = nil;
+    var debug_count: u32 = 0;
+    val dn_r: R.Result[bool, str] = discover_debug_names(alloc, modules, module_count, ?debug_names, ?debug_count);
+    if (R.is_err[bool, str](dn_r)) { ret R.err[bool, str](R.unwrap_err[bool, str](dn_r)); }
+
+    # the merged-section accumulators: the fixed kind slots in canonical order,
+    # followed by one name-keyed slot per distinct debug section name. `merged_to_out`
+    # is filled by build_merged_image to map a placement's merged index to its output
+    # section, and stays nil until then.
+    val merged_count: u32 = MERGED_KIND_COUNT + debug_count;
+    var merged: *MergedSection = nil;
+    val mrg_r: R.Result[*MergedSection, str] = A.zallocate[MergedSection](alloc, merged_count::usize);
+    if (R.is_err[*MergedSection, str](mrg_r)) {
+        if (debug_names != nil && debug_count > 0) { A.deallocate[intern.StrId](alloc, debug_names, debug_count::usize); }
+        ret R.err[bool, str](R.unwrap_err[*MergedSection, str](mrg_r));
+    }
+    merged = R.unwrap_ok[*MergedSection, str](mrg_r);
+    init_merged(merged, debug_names, debug_count);
+    var merged_to_out: *u32 = nil;
 
     # first pass over every input section: tally per-kind length and alignment,
     # and remember each input section's placement (merged index + offset). the
@@ -296,6 +326,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     if (sec_total > 0) {
         val pr: R.Result[*Placement, str] = A.zallocate[Placement](alloc, sec_total::usize);
         if (R.is_err[*Placement, str](pr)) {
+            free_scratch(alloc, nil, 0, nil, 0, merged, merged_count, debug_names, debug_count, merged_to_out);
             ret R.err[bool, str](R.unwrap_err[*Placement, str](pr));
         }
         placements = R.unwrap_ok[*Placement, str](pr);
@@ -305,15 +336,15 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     var sec_base: *u32 = nil;
     val br: R.Result[*u32, str] = A.zallocate[u32](alloc, module_count::usize);
     if (R.is_err[*u32, str](br)) {
-        free_placements(alloc, placements, sec_total);
+        free_scratch(alloc, placements, sec_total, nil, 0, merged, merged_count, debug_names, debug_count, merged_to_out);
         ret R.err[bool, str](R.unwrap_err[*u32, str](br));
     }
     sec_base = R.unwrap_ok[*u32, str](br);
 
     val acc_r: R.Result[bool, str] =
-        accumulate_sections(s, modules, module_count, ?merged[0], placements, sec_base);
+        accumulate_sections(s, modules, module_count, merged, debug_names, debug_count, placements, sec_base);
     if (R.is_err[bool, str](acc_r)) {
-        free_scratch(alloc, placements, sec_total, sec_base, module_count);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
         ret R.err[bool, str](R.unwrap_err[bool, str](acc_r));
     }
 
@@ -321,8 +352,8 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     # are placed in canonical order from the OS base, each kind page-aligned.
     val assign_vaddrs: bool = (mode == LINK_EXE);
     if (assign_vaddrs) {
-        assign_section_vaddrs(tgt, ?merged[0], pie);
-        finalize_placement_vaddrs(?merged[0], placements, sec_total);
+        assign_section_vaddrs(tgt, merged, pie);
+        finalize_placement_vaddrs(merged, placements, sec_total);
     }
 
     # collect the global symbol table: every defined symbol keyed by name, with
@@ -334,7 +365,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
         collect_symbols(s, modules, module_count, placements, sec_base, ?sym_locs, assign_vaddrs);
     if (R.is_err[bool, str](collect_r)) {
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
         ret R.err[bool, str](R.unwrap_err[bool, str](collect_r));
     }
 
@@ -344,17 +375,28 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     val img_r: R.Result[of.ObjectImage, str] = obj.init(alloc, ?s.interner, image_name(modules, module_count));
     if (R.is_err[of.ObjectImage, str](img_r)) {
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
         ret R.err[bool, str](R.unwrap_err[of.ObjectImage, str](img_r));
     }
     out_img = R.unwrap_ok[of.ObjectImage, str](img_r);
 
+    # the merged-index -> output-section map, filled by build_merged_image and read
+    # by relocation patching/carry to find the output section a placement landed in.
+    val mto_r: R.Result[*u32, str] = A.zallocate[u32](alloc, merged_count::usize);
+    if (R.is_err[*u32, str](mto_r)) {
+        obj.dnit(?out_img);
+        map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](mto_r));
+    }
+    merged_to_out = R.unwrap_ok[*u32, str](mto_r);
+
     val build_r: R.Result[bool, str] =
-        build_merged_image(s, ?out_img, modules, module_count, ?merged[0], placements, sec_base);
+        build_merged_image(s, ?out_img, modules, module_count, merged, merged_count, placements, sec_base, merged_to_out);
     if (R.is_err[bool, str](build_r)) {
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
         ret R.err[bool, str](R.unwrap_err[bool, str](build_r));
     }
 
@@ -378,33 +420,33 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
                 free_dynstate(alloc, ?dyn);
                 obj.dnit(?out_img);
                 map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-                free_scratch(alloc, placements, sec_total, sec_base, module_count);
+                free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
                 ret R.err[bool, str](R.unwrap_err[bool, str](dr));
             }
         }
 
         val patch_r: R.Result[bool, str] =
-            patch_relocations(s, ?out_img, modules, module_count, placements, sec_base, ?sym_locs, ?dyn, tgt.arch);
+            patch_relocations(s, ?out_img, modules, module_count, placements, sec_base, merged_to_out, ?sym_locs, ?dyn, tgt.arch);
         if (R.is_err[bool, str](patch_r)) {
             free_dynstate(alloc, ?dyn);
             obj.dnit(?out_img);
             map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-            free_scratch(alloc, placements, sec_total, sec_base, module_count);
+            free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
             ret R.err[bool, str](R.unwrap_err[bool, str](patch_r));
         }
 
         var emit_r: R.Result[bool, str] = R.ok[bool, str](true);
         if (dynamic) {
-            emit_r = emit_dynamic_executable(s, tgt, ?out_img, ?merged[0], ?sym_locs, ?dyn, out_path, name);
+            emit_r = emit_dynamic_executable(s, tgt, ?out_img, merged, ?sym_locs, ?dyn, out_path, name);
         }
         or {
-            emit_r = emit_executable(s, tgt, ?out_img, ?merged[0], ?sym_locs, out_path, name);
+            emit_r = emit_executable(s, tgt, ?out_img, merged, ?sym_locs, out_path, name);
         }
 
         free_dynstate(alloc, ?dyn);
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
 
         if (R.is_err[bool, str](emit_r)) {
             ret R.err[bool, str](R.unwrap_err[bool, str](emit_r));
@@ -415,11 +457,11 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     # library (relocatable): carry the input relocations forward unpatched and
     # write the single merged object through the format's object writer.
     val carry_r: R.Result[bool, str] =
-        carry_relocations(?out_img, modules, module_count, placements, sec_base);
+        carry_relocations(?out_img, modules, module_count, placements, sec_base, merged_to_out);
     if (R.is_err[bool, str](carry_r)) {
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
         ret R.err[bool, str](R.unwrap_err[bool, str](carry_r));
     }
 
@@ -427,7 +469,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
 
     obj.dnit(?out_img);
     map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-    free_scratch(alloc, placements, sec_total, sec_base, module_count);
+    free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
 
     if (R.is_err[bool, str](obj_r)) {
         ret R.err[bool, str](R.unwrap_err[bool, str](obj_r));
@@ -688,9 +730,19 @@ fun emit_executable(s: *session.Session, tgt: *target.Target, out_img: *of.Objec
     }
     val funcs: *of.ExecFunction = R.unwrap_ok[*of.ExecFunction, str](fr);
 
-    val emit_r: R.Result[bool, str] =
-        tgt.of.emit_exec(alloc, ?s.interner, tgt.arch, segs, seg_count, os_page_size(tgt), entry, funcs, func_count, nil::*of.Section, 0, out_path, name);
+    var dbg_count: u32 = 0;
+    val dr: R.Result[*of.Section, str] = collect_debug_sections(alloc, out_img, ?dbg_count);
+    if (R.is_err[*of.Section, str](dr)) {
+        if (funcs != nil && func_count > 0) { A.deallocate[of.ExecFunction](alloc, funcs, func_count::usize); }
+        A.deallocate[of.LoadSegment](alloc, segs, seg_count::usize);
+        ret R.err[bool, str](R.unwrap_err[*of.Section, str](dr));
+    }
+    val dbg: *of.Section = R.unwrap_ok[*of.Section, str](dr);
 
+    val emit_r: R.Result[bool, str] =
+        tgt.of.emit_exec(alloc, ?s.interner, tgt.arch, segs, seg_count, os_page_size(tgt), entry, funcs, func_count, dbg, dbg_count, out_path, name);
+
+    if (dbg != nil && dbg_count > 0) { A.deallocate[of.Section](alloc, dbg, dbg_count::usize); }
     if (funcs != nil && func_count > 0) {
         A.deallocate[of.ExecFunction](alloc, funcs, func_count::usize);
     }
@@ -748,10 +800,20 @@ fun emit_dynamic_executable(s: *session.Session, tgt: *target.Target, out_img: *
     }
     val funcs: *of.ExecFunction = R.unwrap_ok[*of.ExecFunction, str](fr);
 
+    var dbg_count: u32 = 0;
+    val dr: R.Result[*of.Section, str] = collect_debug_sections(alloc, out_img, ?dbg_count);
+    if (R.is_err[*of.Section, str](dr)) {
+        if (funcs != nil && func_count > 0) { A.deallocate[of.ExecFunction](alloc, funcs, func_count::usize); }
+        A.deallocate[of.LoadSegment](alloc, segs, seg_count::usize);
+        ret R.err[bool, str](R.unwrap_err[*of.Section, str](dr));
+    }
+    val dbg: *of.Section = R.unwrap_ok[*of.Section, str](dr);
+
     val emit_r: R.Result[bool, str] =
         tgt.of.emit_dyn_exec(alloc, ?s.interner, tgt.arch, segs, seg_count, os_page_size(tgt), entry,
-                             funcs, func_count, ?dyn.info, dyn.fixups, dyn.fixup_count, nil::*of.Section, 0, out_path, name);
+                             funcs, func_count, ?dyn.info, dyn.fixups, dyn.fixup_count, dbg, dbg_count, out_path, name);
 
+    if (dbg != nil && dbg_count > 0) { A.deallocate[of.Section](alloc, dbg, dbg_count::usize); }
     if (funcs != nil && func_count > 0) {
         A.deallocate[of.ExecFunction](alloc, funcs, func_count::usize);
     }
@@ -761,6 +823,44 @@ fun emit_dynamic_executable(s: *session.Session, tgt: *target.Target, out_img: *
         ret R.err[bool, str](R.unwrap_err[bool, str](emit_r));
     }
     ret R.ok[bool, str](true);
+}
+
+# collect the non-allocated debug sections of the merged image into a freshly
+# allocated compact array (shallow copies sharing the image's section bytes), in
+# image order, for the executable writers' debug channel. returns nil with a zero
+# count when the image has no debug sections. the caller frees the array (never the
+# bytes, which the image owns).
+# ---
+# alloc:   allocator backing the returned array
+# out_img: the merged image whose SK_DEBUG sections are collected
+# count:   out - number of debug sections collected
+# ret:     the debug-section array (freed by the caller), nil when count is 0, or an error string
+fun collect_debug_sections(alloc: *A.Allocator, out_img: *of.ObjectImage, count: *u32) R.Result[*of.Section, str] {
+    @count = 0;
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < out_img.section_count) {
+        if (out_img.sections[i].kind == of.SK_DEBUG) { n = n + 1; }
+        i = i + 1;
+    }
+    if (n == 0) { ret R.ok[*of.Section, str](nil); }
+
+    val ar: R.Result[*of.Section, str] = A.allocate[of.Section](alloc, n::usize);
+    if (R.is_err[*of.Section, str](ar)) { ret R.err[*of.Section, str](R.unwrap_err[*of.Section, str](ar)); }
+    val out: *of.Section = R.unwrap_ok[*of.Section, str](ar);
+
+    var w: u32 = 0;
+    i = 0;
+    for (i < out_img.section_count) {
+        if (out_img.sections[i].kind == of.SK_DEBUG) {
+            out[w] = out_img.sections[i];
+            w = w + 1;
+        }
+        i = i + 1;
+    }
+
+    @count = n;
+    ret R.ok[*of.Section, str](out);
 }
 
 # resolve the program entry point to the OS entry symbol's virtual
@@ -984,21 +1084,98 @@ fun merged_section_bytes(out_img: *of.ObjectImage, kind: of.SectionKind) *u8 {
     ret nil;
 }
 
-# reset the per-kind accumulator array to its canonical kinds and
-# empty state. index i holds kind i (SK_TEXT..SK_DEBUG); the numeric order is the
-# canonical layout order.
+# reset the merged accumulator array to its empty state: the fixed
+# kind slots (index i holds kind i, in canonical layout order) followed by one
+# name-keyed `SK_DEBUG` slot per distinct debug section name, in first-encounter
+# order. every slot starts unused with alignment 1.
 # ---
-# merged: the per-kind accumulator array to reset (MERGED_KIND_COUNT entries)
-fun init_merged(merged: *MergedSection) {
+# merged:      the accumulator array to reset (MERGED_KIND_COUNT + debug_count entries)
+# debug_names: the distinct debug section names for the trailing name-keyed slots
+# debug_count: number of name-keyed debug slots
+fun init_merged(merged: *MergedSection, debug_names: *intern.StrId, debug_count: u32) {
     var i: u32 = 0;
     for (i < MERGED_KIND_COUNT) {
         merged[i].kind  = i::u8;
+        merged[i].name  = intern.STR_NIL;
         merged[i].align = 1;
         merged[i].len   = 0;
         merged[i].vaddr = 0;
         merged[i].used  = false;
         i = i + 1;
     }
+    var d: u32 = 0;
+    for (d < debug_count) {
+        val slot: u32 = MERGED_KIND_COUNT + d;
+        merged[slot].kind  = of.SK_DEBUG;
+        merged[slot].name  = debug_names[d];
+        merged[slot].align = 1;
+        merged[slot].len   = 0;
+        merged[slot].vaddr = 0;
+        merged[slot].used  = false;
+        d = d + 1;
+    }
+}
+
+# collect the distinct `SK_DEBUG` section names across every input image into a
+# freshly allocated array, in first-encounter order (deterministic given the fixed
+# module/section iteration order). the name-keyed merge routes each debug input
+# section to the slot for its name; the count sizes the merged accumulator array.
+# with no debug input the array is nil and the count 0. the caller frees the array.
+# ---
+# alloc:        allocator backing the returned name array
+# modules:      the input image array
+# module_count: number of input images
+# out_names:    out - the distinct debug names (nil when count is 0), freed by caller
+# out_count:    out - number of distinct debug names
+# ret:          ok(true) on success, or an allocation error
+fun discover_debug_names(alloc: *A.Allocator, modules: *of.ObjectImage, module_count: u32,
+                         out_names: **intern.StrId, out_count: *u32) R.Result[bool, str] {
+    @out_names = nil;
+    @out_count = 0;
+    var names: *intern.StrId = nil;
+    var count: u32 = 0;
+    var cap:   u32 = 0;
+
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            val sec: *of.Section = ?modules[m].sections[sc];
+            if (sec.kind != of.SK_DEBUG) { sc = sc + 1; cnt; }
+
+            # a debug section name already seen shares its slot; names are interned
+            # into the one session interner, so StrId equality is name equality.
+            var seen: bool = false;
+            var j: u32 = 0;
+            for (j < count) {
+                if (names[j] == sec.name) { seen = true; }
+                j = j + 1;
+            }
+            if (seen) { sc = sc + 1; cnt; }
+
+            if (count == cap) {
+                var new_cap: u32 = cap * 2;
+                if (new_cap == 0) { new_cap = 4; }
+                val gr: R.Result[*intern.StrId, str] =
+                    A.reallocate[intern.StrId](alloc, names, cap::usize, new_cap::usize);
+                if (R.is_err[*intern.StrId, str](gr)) {
+                    if (names != nil && cap > 0) { A.deallocate[intern.StrId](alloc, names, cap::usize); }
+                    ret R.err[bool, str](R.unwrap_err[*intern.StrId, str](gr));
+                }
+                names = R.unwrap_ok[*intern.StrId, str](gr);
+                cap = new_cap;
+            }
+            names[count] = sec.name;
+            count = count + 1;
+
+            sc = sc + 1;
+        }
+        m = m + 1;
+    }
+
+    @out_names = names;
+    @out_count = count;
+    ret R.ok[bool, str](true);
 }
 
 # sum the section counts of every input image
@@ -1024,12 +1201,15 @@ fun total_sections(modules: *of.ObjectImage, module_count: u32) u32 {
 # s:            shared session, for diagnostics
 # modules:      the input image array
 # module_count: number of input images
-# merged:       the per-kind accumulators, updated in place
+# merged:       the merged accumulators (kind slots + debug name slots), updated in place
+# debug_names:  the distinct debug section names, indexing the name-keyed slots
+# debug_count:  number of name-keyed debug slots
 # placements:   out - per-input-section placement (merged index + offset)
 # sec_base:     out - per-module prefix offset into `placements`
 # ret:          ok(true) on success, or an error string
 fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
-                        merged: *MergedSection, placements: *Placement, sec_base: *u32) R.Result[bool, str] {
+                        merged: *MergedSection, debug_names: *intern.StrId, debug_count: u32,
+                        placements: *Placement, sec_base: *u32) R.Result[bool, str] {
     var flat: u32 = 0;
     var m: u32 = 0;
     for (m < module_count) {
@@ -1043,7 +1223,21 @@ fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_co
             if (sec.kind::u32 >= MERGED_KIND_COUNT) {
                 ret R.err[bool, str](named_message(s, "linker: input section in object '", modules[m].name, "' has an unknown section kind", "linker: input section has an unknown section kind"));
             }
-            val ki: u32 = sec.kind::u32;
+            # allocatable kinds collapse into their kind slot; a non-allocated debug
+            # section routes to the name-keyed slot for its section name so distinct
+            # debug sections never merge together.
+            var ki: u32 = sec.kind::u32;
+            if (sec.kind == of.SK_DEBUG) {
+                var found: bool = false;
+                var di: u32 = 0;
+                for (di < debug_count) {
+                    if (debug_names[di] == sec.name) { ki = MERGED_KIND_COUNT + di; found = true; }
+                    di = di + 1;
+                }
+                # discover_debug_names registered every debug name from these same
+                # inputs, so a miss is an internal invariant break, not an input error.
+                if (!found) { ret R.err[bool, str]("linker: debug section name not registered in the merge"); }
+            }
 
             var a: u32 = sec.align;
             if (a == 0)               { a = 1; }
@@ -1198,33 +1392,37 @@ fun collect_symbols(s: *session.Session, modules: *of.ObjectImage, module_count:
     ret R.ok[bool, str](true);
 }
 
-# allocate one output section per used kind and copy every
+# allocate one output section per used merged slot and copy every
 # contributing input section's bytes into its placed offset. records, on the
-# output image, the merged section's kind, alignment, length, and (for
-# executables) virtual address via the section name. BSS sections carry no
-# bytes.
+# output image, the merged section's name, kind, alignment, and length. the
+# allocatable kind slots produce `.text`/`.data`/... named by kind; each used
+# debug name slot produces its own `.debug_*` section. BSS carries no bytes.
+# `merged_to_out` (sized `merged_count`) is filled with each slot's output-section
+# index (0xFFFFFFFF for an empty slot) so relocation patching/carry can rebase.
 # ---
-# s:            shared session (allocator), for the merged section storage
-# out_img:      out - the merged image to populate with sections and symbols
-# modules:      the input image array
-# module_count: number of input images
-# merged:       the per-kind accumulators (carry each kind's length and alignment)
-# placements:   per-input-section placement (merged index + offset)
-# sec_base:     per-module prefix offset into `placements`
-# ret:          ok(true) on success, or an error string
+# s:             shared session (allocator), for the merged section storage
+# out_img:       out - the merged image to populate with sections and symbols
+# modules:       the input image array
+# module_count:  number of input images
+# merged:        the merged accumulators (carry each slot's name, length, alignment)
+# merged_count:  number of merged slots (kind slots + debug name slots)
+# placements:    per-input-section placement (merged index + offset)
+# sec_base:      per-module prefix offset into `placements`
+# merged_to_out: out - per-slot output-section index (0xFFFFFFFF when empty)
+# ret:           ok(true) on success, or an error string
 fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
                        modules: *of.ObjectImage, module_count: u32,
-                       merged: *MergedSection, placements: *Placement, sec_base: *u32) R.Result[bool, str] {
+                       merged: *MergedSection, merged_count: u32, placements: *Placement, sec_base: *u32,
+                       merged_to_out: *u32) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
 
-    # map each used kind to its output-section index so symbols/relocations can
-    # be rebased; -1 (0xFFFFFFFF) marks a kind with no content.
-    var kind_to_out: [6]u32;
+    # map each used merged slot to its output-section index so symbols/relocations
+    # can be rebased; -1 (0xFFFFFFFF) marks a slot with no content.
     var k: u32 = 0;
-    for (k < MERGED_KIND_COUNT) { kind_to_out[k] = 0xFFFFFFFF; k = k + 1; }
+    for (k < merged_count) { merged_to_out[k] = 0xFFFFFFFF; k = k + 1; }
 
     k = 0;
-    for (k < MERGED_KIND_COUNT) {
+    for (k < merged_count) {
         if (!merged[k].used || merged[k].len == 0) { k = k + 1; cnt; }
 
         var bytes: *u8 = nil;
@@ -1234,8 +1432,11 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
             bytes = R.unwrap_ok[*u8, str](zr);
         }
 
+        # a kind slot names itself by kind; a name-keyed debug slot carries its own
+        # interned section name.
         var sec: of.Section;
-        sec.name  = merged_section_name(s, merged[k].kind);
+        if (merged[k].name == intern.STR_NIL) { sec.name = merged_section_name(s, merged[k].kind); }
+        or                                    { sec.name = merged[k].name; }
         sec.kind  = merged[k].kind;
         sec.bytes = bytes;
         sec.len   = merged[k].len;
@@ -1246,7 +1447,7 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
             if (bytes != nil) { A.deallocate[u8](alloc, bytes, merged[k].len::usize); }
             ret R.err[bool, str](R.unwrap_err[u32, str](add_r));
         }
-        kind_to_out[k] = R.unwrap_ok[u32, str](add_r);
+        merged_to_out[k] = R.unwrap_ok[u32, str](add_r);
         k = k + 1;
     }
 
@@ -1261,7 +1462,7 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
 
             val flat: u32 = sec_base[m] + sc;
             val ki: u32 = placements[flat].merged_index;
-            val out_ix: u32 = kind_to_out[ki];
+            val out_ix: u32 = merged_to_out[ki];
             if (out_ix == 0xFFFFFFFF) { sc = sc + 1; cnt; }
 
             val dst: *u8 = out_img.sections[out_ix].bytes;
@@ -1288,7 +1489,7 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
 
             val flat: u32 = sec_base[m] + isym.section;
             val ki: u32 = placements[flat].merged_index;
-            val out_ix: u32 = kind_to_out[ki];
+            val out_ix: u32 = merged_to_out[ki];
             if (out_ix == 0xFFFFFFFF) { sy = sy + 1; cnt; }
 
             var osym: of.Symbol;
@@ -1327,15 +1528,16 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
 # out_img:      the merged image whose section bytes are patched in place
 # modules:      the input image array (source of the relocations)
 # module_count: number of input images
-# placements:   per-input-section placement (merged index + offset + vaddr)
-# sec_base:     per-module prefix offset into `placements`
-# sym_locs:     the global symbol table, for GLOBAL/extern target resolution
-# dyn:          dynamic-link state; out - collects import call-site fixups
-# arch:         active instruction-set vtable, owning the relocation packer
-# ret:          ok(true) on success, or an error string
+# placements:    per-input-section placement (merged index + offset + vaddr)
+# sec_base:      per-module prefix offset into `placements`
+# merged_to_out: per-merged-slot output-section index (from build_merged_image)
+# sym_locs:      the global symbol table, for GLOBAL/extern target resolution
+# dyn:           dynamic-link state; out - collects import call-site fixups
+# arch:          active instruction-set vtable, owning the relocation packer
+# ret:           ok(true) on success, or an error string
 fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
                      modules: *of.ObjectImage, module_count: u32,
-                     placements: *Placement, sec_base: *u32,
+                     placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                      sym_locs: *map.Map[intern.StrId, SymbolLoc],
                      dyn: *DynState, arch: *isa.IsaVTable) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
@@ -1356,7 +1558,7 @@ fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
         }
 
         val pr: R.Result[bool, str] = patch_module_relocations(s, out_img, modules, m,
-            placements, sec_base, sym_locs, dyn, ?local_map, arch);
+            placements, sec_base, merged_to_out, sym_locs, dyn, ?local_map, arch);
         map.dnit[intern.StrId, u64](?local_map);
         if (R.is_err[bool, str](pr)) { ret R.err[bool, str](R.unwrap_err[bool, str](pr)); }
 
@@ -1405,16 +1607,17 @@ fun build_local_index(modules: *of.ObjectImage, m: u32, placements: *Placement, 
 # out_img:      the merged image whose section bytes are patched in place
 # modules:      the input image array
 # m:            index of the module whose relocations are applied
-# placements:   per-input-section placement (merged index + offset + vaddr)
-# sec_base:     per-module prefix offset into `placements`
-# sym_locs:     the global symbol table, for GLOBAL/extern target resolution
-# dyn:          dynamic-link state; out - collects import call-site fixups
-# local_map:    module `m`'s LOCAL-name -> virtual-address index
-# arch:         active instruction-set vtable, owning the relocation packer
-# ret:          ok(true) on success, or an error string
+# placements:    per-input-section placement (merged index + offset + vaddr)
+# sec_base:      per-module prefix offset into `placements`
+# merged_to_out: per-merged-slot output-section index (from build_merged_image)
+# sym_locs:      the global symbol table, for GLOBAL/extern target resolution
+# dyn:           dynamic-link state; out - collects import call-site fixups
+# local_map:     module `m`'s LOCAL-name -> virtual-address index
+# arch:          active instruction-set vtable, owning the relocation packer
+# ret:           ok(true) on success, or an error string
 fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                              modules: *of.ObjectImage, m: u32,
-                             placements: *Placement, sec_base: *u32,
+                             placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                              sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState,
                              local_map: *map.Map[intern.StrId, u64], arch: *isa.IsaVTable) R.Result[bool, str] {
     var ri: u32 = 0;
@@ -1432,11 +1635,12 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         }
 
         # the patch site's location in the merged image. the placement's
-        # merged_index is a section *kind*; map it to the output-section index.
+        # merged_index selects a merged slot (kind or debug-name); map it to the
+        # output-section index the merge assigned.
         val flat: u32 = sec_base[m] + r.section;
         val pl: *Placement = ?placements[flat];
         val patch_va: u64 = pl.vaddr + r.offset::u64;
-        val out_ix: u32 = out_section_for_merged(out_img, pl.merged_index);
+        val out_ix: u32 = merged_to_out[pl.merged_index];
         # a relocation in a section with no merged output, or one whose patch site
         # lands in a (byteless) BSS section, cannot be applied - that is a contract
         # violation from a buggy parser/codegen, not a relocation to quietly skip.
@@ -1488,10 +1692,13 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
             ret R.err[bool, str](R.unwrap_err[bool, str](pr));
         }
 
-        # PIE: an in-image absolute 64-bit pointer (RK_ABS64) holds a link-time
-        # (bias-zero) address; record its location so the writer emits a load-time
-        # base relocation the loader slides. PC-relative kinds need no fixup.
-        if (dyn.info.pie && r.kind == of.RK_ABS64) {
+        # PIE: an in-image absolute 64-bit pointer (RK_ABS64) in a loadable section
+        # holds a link-time (bias-zero) address; record its location so the writer
+        # emits a load-time base relocation the loader slides. a non-allocated debug
+        # section is never mapped, so its absolute pointers are read at their
+        # link-time value and take no base relocation. PC-relative kinds need none.
+        if (dyn.info.pie && r.kind == of.RK_ABS64
+            && is_loadable_kind(out_img.sections[out_ix].kind)) {
             val brr: R.Result[bool, str] = dynstate_add_base_reloc(s, dyn,
                 segment_index_for(out_img, out_ix), patch_off, sym_va + r.addend::u64);
             if (R.is_err[bool, str](brr)) { ret R.err[bool, str](R.unwrap_err[bool, str](brr)); }
@@ -2274,14 +2481,15 @@ pub fun register_reloc_hooks(reg: *isa.IsaRegistry) R.Result[bool, str] {
 # output image rebased to the merged section indices, leaving the bytes
 # unpatched so a later link can resolve them.
 # ---
-# out_img:      out - the merged image the relocations are carried onto
-# modules:      the input image array (source of the relocations)
-# module_count: number of input images
-# placements:   per-input-section placement (merged index + offset)
-# sec_base:     per-module prefix offset into `placements`
-# ret:          ok(true) on success, or an error string
+# out_img:       out - the merged image the relocations are carried onto
+# modules:       the input image array (source of the relocations)
+# module_count:  number of input images
+# placements:    per-input-section placement (merged index + offset)
+# sec_base:      per-module prefix offset into `placements`
+# merged_to_out: per-merged-slot output-section index (from build_merged_image)
+# ret:           ok(true) on success, or an error string
 fun carry_relocations(out_img: *of.ObjectImage, modules: *of.ObjectImage, module_count: u32,
-                     placements: *Placement, sec_base: *u32) R.Result[bool, str] {
+                     placements: *Placement, sec_base: *u32, merged_to_out: *u32) R.Result[bool, str] {
     var m: u32 = 0;
     for (m < module_count) {
         var ri: u32 = 0;
@@ -2299,9 +2507,8 @@ fun carry_relocations(out_img: *of.ObjectImage, modules: *of.ObjectImage, module
             val flat: u32 = sec_base[m] + r.section;
             val pl: *Placement = ?placements[flat];
 
-            # find the output-section index for this kind by matching merged
-            # index against the already-added output sections.
-            val out_ix: u32 = out_section_for_merged(out_img, pl.merged_index);
+            # map the placement's merged slot to its output-section index.
+            val out_ix: u32 = merged_to_out[pl.merged_index];
             if (out_ix == 0xFFFFFFFF) {
                 ret R.err[bool, str]("linker: relocation targets a section with no merged output");
             }
@@ -2321,22 +2528,6 @@ fun carry_relocations(out_img: *of.ObjectImage, modules: *of.ObjectImage, module
         m = m + 1;
     }
     ret R.ok[bool, str](true);
-}
-
-# find the output image's section index whose kind
-# matches the merged kind index; the merge produced at most one section per
-# kind, so a kind-equality match is unambiguous.
-# ---
-# out_img:      the merged image to search
-# merged_index: the merged kind index to match against a section kind
-# ret:          the output-section index, or 0xFFFFFFFF when no kind matches
-fun out_section_for_merged(out_img: *of.ObjectImage, merged_index: u32) u32 {
-    var i: u32 = 0;
-    for (i < out_img.section_count) {
-        if (out_img.sections[i].kind::u32 == merged_index) { ret i; }
-        i = i + 1;
-    }
-    ret 0xFFFFFFFF;
 }
 
 # intern a name, returning STR_NIL on allocation failure so a
@@ -2675,19 +2866,38 @@ fun free_placements(alloc: *A.Allocator, placements: *Placement, sec_total: u32)
     }
 }
 
-# release the per-link scratch allocations (placements + per-module
-# base array).
+# release the per-link scratch allocations: the placements, the
+# per-module base array, the merged accumulators, the discovered debug names, and
+# the merged-slot -> output-section map. every argument is nil-safe so cleanup on
+# an early failure (before some arrays are allocated) is uniform.
 # ---
-# alloc:        allocator the arrays were allocated from
-# placements:   the placement array to release (may be nil)
-# sec_total:    length of the placement array
-# sec_base:     the per-module base array to release (may be nil)
-# module_count: length of the per-module base array
+# alloc:         allocator the arrays were allocated from
+# placements:    the placement array to release (may be nil)
+# sec_total:     length of the placement array
+# sec_base:      the per-module base array to release (may be nil)
+# module_count:  length of the per-module base array
+# merged:        the merged accumulator array to release (may be nil)
+# merged_count:  length of the merged accumulator array and the merged->output map
+# debug_names:   the discovered debug-name array to release (may be nil)
+# debug_count:   length of the debug-name array
+# merged_to_out: the merged-slot -> output-section map to release (may be nil)
 fun free_scratch(alloc: *A.Allocator, placements: *Placement, sec_total: u32,
-                sec_base: *u32, module_count: u32) {
+                sec_base: *u32, module_count: u32,
+                merged: *MergedSection, merged_count: u32,
+                debug_names: *intern.StrId, debug_count: u32,
+                merged_to_out: *u32) {
     free_placements(alloc, placements, sec_total);
     if (sec_base != nil && module_count > 0) {
         A.deallocate[u32](alloc, sec_base, module_count::usize);
+    }
+    if (merged != nil && merged_count > 0) {
+        A.deallocate[MergedSection](alloc, merged, merged_count::usize);
+    }
+    if (debug_names != nil && debug_count > 0) {
+        A.deallocate[intern.StrId](alloc, debug_names, debug_count::usize);
+    }
+    if (merged_to_out != nil && merged_count > 0) {
+        A.deallocate[u32](alloc, merged_to_out, merged_count::usize);
     }
 }
 
