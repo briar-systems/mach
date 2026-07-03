@@ -36,11 +36,14 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 
+use std.allocator.page;
+
 use A: std.allocator;
 use R: std.types.result;
 
 use mach.lang.be.codegen.mir;
 use mach.lang.intern;
+use source: mach.lang.source;
 use mach.lang.target.abi;
 use mach.lang.target.of;
 use tos:    mach.lang.target.os;
@@ -56,6 +59,8 @@ use target: mach.lang.target.resolved;
 # reloc_count:  number of relocations
 # symbols:      symbol marks, one per function entry (owned)
 # symbol_count: number of symbol marks
+# rows:         PC<->source line rows, ordered by ascending `text_offset` (owned)
+# row_count:    number of line rows
 pub rec EncoderOutput {
     text:         *u8;
     text_len:     u32;
@@ -63,6 +68,31 @@ pub rec EncoderOutput {
     reloc_count:  u32;
     symbols:      *SymbolMark;
     symbol_count: u32;
+    rows:         *LineRow;
+    row_count:    u32;
+}
+
+# one retained PC<->source mapping: a `.text` byte offset and the source location of
+# the instruction that begins there
+#
+# The encoder appends one per instruction with a valid source location, in
+# ascending `text_offset` order. `insert_text` (branch relaxation) keeps
+# `text_offset` correct while the text grows; codegen's `#[section(...)]` re-homing
+# (`pack_rows`) then assigns each row's final `sec` and rebases `text_offset` into
+# that section. Until re-homing every row is relative to the single encoder `.text`
+# blob and `sec` is 0. The source `loc` (file + byte offset) resolves to a 1-based
+# line/column via `source.position`; the #1699 `.debug_line` / CodeView producer
+# consumes it. The row never affects the emitted bytes.
+# ---
+# text_offset: byte offset of the instruction within its owning section (`.text`
+#              blob-relative until re-homing rebases it)
+# sec:         owning object-section index, assigned by codegen re-homing (0 while
+#              the row is still relative to the single encoder blob)
+# loc:         source location (file + byte offset) the instruction lowered from
+pub rec LineRow {
+    text_offset: u32;
+    sec:         u32;
+    loc:         source.SrcLoc;
 }
 
 # one relocation the encoder leaves for the object writer to resolve
@@ -361,6 +391,9 @@ pub rec EncodeState {
     blocks:      *BlockOffset;
     block_count: u32;
     block_cap:   u32;
+    rows:        *LineRow;
+    row_count:   u32;
+    row_cap:     u32;
     interner:    *intern.Interner;
     abi:         *abi.AbiVTable;
     os:          *tos.OsVTable;
@@ -475,9 +508,11 @@ pub fun encode_driver(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirModul
     out.reloc_count  = st.reloc_count;
     out.symbols      = st.syms;
     out.symbol_count = st.sym_count;
+    out.rows         = st.rows;
+    out.row_count    = st.row_count;
 
-    # the text, symbol, and relocation arrays are transferred to the output; only
-    # the driver-internal fixup and block-offset arrays are released.
+    # the text, symbol, relocation, and line-row arrays are transferred to the output;
+    # only the driver-internal fixup and block-offset arrays are released.
     scratch_release(?st);
     ret R.ok[EncoderOutput, str](out);
 }
@@ -605,6 +640,32 @@ pub fun push_block(st: *EncodeState, fn_text_base: u32, block_id: u32, offset: u
     ret R.ok[bool, str](true);
 }
 
+# append a PC<->source line row, growing the row array on demand
+#
+# Called by an ISA encoder for each instruction that carries a source location, at
+# the `.text` offset where its bytes begin. A location naming no file
+# (`source.loc_nil()`, a compiler-synthesized instruction) is dropped so its byte
+# range is attributed to the preceding row's line. The row survives into
+# `EncoderOutput` and is kept correct under `insert_text` relaxation and codegen
+# re-homing.
+# ---
+# st:          the encode state whose row array receives the entry
+# text_offset: byte offset of the instruction's first byte within `.text`
+# loc:         the instruction's source location
+# ret:         ok(true) on success (or a dropped nil location), or an allocation error
+pub fun push_row(st: *EncodeState, text_offset: u32, loc: source.SrcLoc) R.Result[bool, str] {
+    if (!source.loc_is_valid(loc)) { ret R.ok[bool, str](true); }
+    if (st.row_count >= st.row_cap) {
+        val res_grow: R.Result[bool, str] = grow_rows(st);
+        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+    }
+    st.rows[st.row_count].text_offset = text_offset;
+    st.rows[st.row_count].sec         = 0;
+    st.rows[st.row_count].loc         = loc;
+    st.row_count = st.row_count + 1;
+    ret R.ok[bool, str](true);
+}
+
 # initialise an encode state with empty output arrays for one driver run
 # ---
 # st:    the state to populate in place
@@ -626,6 +687,9 @@ fun state_init(st: *EncodeState, alloc: *A.Allocator, m: *mir.MirModule, tgt: *t
     st.blocks      = nil;
     st.block_count = 0;
     st.block_cap   = 0;
+    st.rows        = nil;
+    st.row_count   = 0;
+    st.row_cap     = 0;
     st.interner    = m.interner;
     st.abi         = tgt.abi;
     st.os          = tgt.os;
@@ -649,6 +713,12 @@ fun state_dnit(st: *EncodeState) {
     st.relocs      = nil;
     st.reloc_count = 0;
     st.reloc_cap   = 0;
+    if (st.rows != nil && st.row_cap > 0) {
+        A.deallocate[LineRow](st.alloc, st.rows, st.row_cap::usize);
+    }
+    st.rows      = nil;
+    st.row_count = 0;
+    st.row_cap   = 0;
     scratch_release(st);
 }
 
@@ -749,7 +819,7 @@ pub fun block_offset(st: *EncodeState, fn_base: u32, block_id: u32) R.Result[u32
 # Shifts the bytes in `[pos, len)` up by `nbytes` (growing the sink as needed),
 # zero-fills the opened gap, and advances by `nbytes` every recorded offset at or
 # past `pos`: block offsets, branch-fixup patch / next-ip / function-base fields,
-# symbol-mark offsets, and relocation offsets. This is the ISA-general mechanism a
+# symbol-mark offsets, relocation offsets, and line-row text offsets. This is the ISA-general mechanism a
 # branch-relaxation pass uses to grow an out-of-range branch into a longer
 # sequence while leaving the fixup, block, symbol, and relocation tables pointing
 # at the right instructions. An entry strictly before `pos` is untouched, so the
@@ -817,6 +887,11 @@ pub fun insert_text(st: *EncodeState, pos: u32, nbytes: u32) R.Result[bool, str]
     for (ri < st.reloc_count) {
         if (st.relocs[ri].offset >= pos) { st.relocs[ri].offset = st.relocs[ri].offset + nbytes; }
         ri = ri + 1;
+    }
+    var wi: u32 = 0;
+    for (wi < st.row_count) {
+        if (st.rows[wi].text_offset >= pos) { st.rows[wi].text_offset = st.rows[wi].text_offset + nbytes; }
+        wi = wi + 1;
     }
     ret R.ok[bool, str](true);
 }
@@ -899,4 +974,75 @@ fun grow_blocks(st: *EncodeState) R.Result[bool, str] {
     st.blocks    = R.unwrap_ok[*BlockOffset, str](res_realloc);
     st.block_cap = new_cap;
     ret R.ok[bool, str](true);
+}
+
+# grow the line-row array, allocating it on first use
+# ---
+# st:  the state whose row array is grown
+# ret: ok(true) once the array has room, or an allocation error
+fun grow_rows(st: *EncodeState) R.Result[bool, str] {
+    if (st.rows == nil) {
+        val res_alloc: R.Result[*LineRow, str] = A.allocate[LineRow](st.alloc, DRIVER_INIT_CAP::usize);
+        if (R.is_err[*LineRow, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*LineRow, str](res_alloc)); }
+        st.rows    = R.unwrap_ok[*LineRow, str](res_alloc);
+        st.row_cap = DRIVER_INIT_CAP;
+        ret R.ok[bool, str](true);
+    }
+    val new_cap: u32 = st.row_cap * 2;
+    val res_realloc: R.Result[*LineRow, str] = A.reallocate[LineRow](st.alloc, st.rows, st.row_cap::usize, new_cap::usize);
+    if (R.is_err[*LineRow, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*LineRow, str](res_realloc)); }
+    st.rows    = R.unwrap_ok[*LineRow, str](res_realloc);
+    st.row_cap = new_cap;
+    ret R.ok[bool, str](true);
+}
+
+# a minimal encode state for the row / insert_text unit tests: a text sink and an
+# empty set of mark / reloc / fixup / block / row arrays, no interner or vtables.
+fun t_row_state(alloc: *A.Allocator, st: *EncodeState) {
+    st.alloc = alloc;
+    st.buf = buf_init(alloc);
+    st.syms = nil;   st.sym_count = 0;   st.sym_cap = 0;
+    st.relocs = nil; st.reloc_count = 0; st.reloc_cap = 0;
+    st.fixups = nil; st.fixup_count = 0; st.fixup_cap = 0;
+    st.blocks = nil; st.block_count = 0; st.block_cap = 0;
+    st.rows = nil;   st.row_count = 0;   st.row_cap = 0;
+    st.interner = nil; st.abi = nil; st.os = nil;
+}
+
+# push_row drops a location naming no file, and insert_text (branch relaxation)
+# advances every line row at or past the gap while leaving earlier rows put - so a
+# row's text_offset keeps pointing at its instruction after the text grows.
+test "mach.lang.be.codegen.encode.insert_text:shifts_line_rows" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var st: EncodeState;
+    t_row_state(?alloc, ?st);
+
+    # a 12-byte placeholder .text so insert_text has bytes to slide.
+    var i: u32 = 0;
+    for (i < 12) { emit_byte(?st.buf, 0x90); i = i + 1; }
+
+    # three real rows at 0 / 4 / 8, plus a nil-location row that must be dropped.
+    val r0: R.Result[bool, str] = push_row(?st, 0, source.loc(0, 100)); if (R.is_err[bool, str](r0)) { ret 1; }
+    val r1: R.Result[bool, str] = push_row(?st, 4, source.loc(0, 200)); if (R.is_err[bool, str](r1)) { ret 1; }
+    val rn: R.Result[bool, str] = push_row(?st, 4, source.loc_nil());   if (R.is_err[bool, str](rn)) { ret 1; }
+    val r2: R.Result[bool, str] = push_row(?st, 8, source.loc(0, 300)); if (R.is_err[bool, str](r2)) { ret 1; }
+    if (st.row_count != 3) { buf_dnit(?st.buf); ret 1; }
+
+    # open a 4-byte gap at offset 4 (as a relaxed branch would).
+    val it: R.Result[bool, str] = insert_text(?st, 4, 4);
+    if (R.is_err[bool, str](it)) { buf_dnit(?st.buf); ret 1; }
+
+    var code: i32 = 0;
+    # the row before the gap is untouched; the rows at/after it advance by 4.
+    if (st.rows[0].text_offset != 0)  { code = 1; }
+    if (st.rows[1].text_offset != 8)  { code = 1; }
+    if (st.rows[2].text_offset != 12) { code = 1; }
+    # the source locations ride along unchanged.
+    if (st.rows[1].loc.offset != 200) { code = 1; }
+
+    buf_dnit(?st.buf);
+    if (st.rows != nil && st.row_cap > 0) { A.deallocate[LineRow](?alloc, st.rows, st.row_cap::usize); }
+    ret code;
 }
