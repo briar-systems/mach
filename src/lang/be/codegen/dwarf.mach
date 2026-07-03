@@ -1,0 +1,783 @@
+# the shared, format-agnostic DWARF 5 debug-info producer
+#
+# Builds three relocatable debug sections into the per-module `of.ObjectImage`
+# through the `be.obj` builder, alongside `pack_text`: `.debug_abbrev`,
+# a compile-unit-only `.debug_info`, and a DWARF 5 `.debug_line` program. It speaks
+# only the abstract object model - SK_DEBUG sections, anchor symbols, and `RK_*`
+# relocations - so the same bytes serve every container: the active `OfVTable`
+# writer maps the kinds and carries the sections, and no ELF/Mach-O knowledge lives
+# here. `be.codegen` calls `produce` when the build's `-g` switch is on and the
+# target's object format is DWARF-based.
+#
+# The line program is driven by the encoder's retained PC<->source rows (#1691),
+# resolved to file/line through `source.position`. Function ranges (low_pc/high_pc,
+# per-function `DW_LNE_set_address`) come from the `of.Symbol` marks the encoder
+# emitted. Strings are inline (`DW_FORM_string`) and addresses direct
+# (`DW_FORM_addr`) - no `.debug_str`/`.debug_addr` indirection - so exactly three
+# sections are produced.
+
+use std.system.panic.panic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use enc:     mach.lang.be.codegen.encode;
+use obj:     mach.lang.be.obj;
+use intern:  mach.lang.intern;
+use session: mach.lang.session;
+use source:  mach.lang.source;
+use target:  mach.lang.target.resolved;
+use of:      mach.lang.target.of;
+use bin:     mach.lang.target.of.bin;
+
+use std.allocator.page;
+
+# DWARF tag, attribute, and form constants (DWARF 5).
+val DW_TAG_compile_unit: u8 = 0x11;
+val DW_CHILDREN_no:      u8 = 0x00;
+
+val DW_AT_name:      u8 = 0x03;
+val DW_AT_stmt_list: u8 = 0x10;
+val DW_AT_low_pc:    u8 = 0x11;
+val DW_AT_high_pc:   u8 = 0x12;
+val DW_AT_language:  u8 = 0x13;
+val DW_AT_comp_dir:  u8 = 0x1b;
+val DW_AT_producer:  u8 = 0x25;
+
+val DW_FORM_addr:       u8 = 0x01;
+val DW_FORM_data2:      u8 = 0x05;
+val DW_FORM_data8:      u8 = 0x07;
+val DW_FORM_string:     u8 = 0x08;
+val DW_FORM_sec_offset: u8 = 0x17;
+
+# DWARF 5 unit header: unit_type for a full compile unit.
+val DW_UT_compile: u8 = 0x01;
+
+# source language: plain C, the most broadly-decodable value while the type system
+# has no dedicated DWARF language code.
+val DW_LANG_C: u16 = 0x0002;
+
+# the single abbreviation code the CU DIE references.
+val ABBREV_CU: u8 = 0x01;
+
+# DWARF 5 line-number program: standard opcodes, extended opcodes, and the tuned
+# special-opcode parameters this producer emits.
+val DW_LNS_copy:         u8 = 0x01;
+val DW_LNS_advance_pc:   u8 = 0x02;
+val DW_LNS_advance_line: u8 = 0x03;
+val DW_LNS_set_file:     u8 = 0x04;
+
+val DW_LNE_end_sequence: u8 = 0x01;
+val DW_LNE_set_address:  u8 = 0x02;
+
+# DWARF 5 line-header content-type and form codes for the directory / file tables.
+val DW_LNCT_path:            u8 = 0x1;
+val DW_LNCT_directory_index: u8 = 0x2;
+
+# line-program special-opcode tuning. line_base / line_range / opcode_base match the
+# common GNU choice so line deltas in [-5, 8] pack into one byte.
+val LINE_BASE:   i32 = -5;
+val LINE_RANGE:  i32 = 14;
+val OPCODE_BASE: u8  = 13;
+
+# append an unsigned LEB128 value to `b`.
+# ---
+# b: the byte buffer to append to
+# v: the value to encode
+fun uleb(b: *enc.ByteBuf, v: u64) {
+    var x: u64 = v;
+    var more: bool = true;
+    for (more) {
+        var byte: u8 = (x & 0x7F)::u8;
+        x = x >> 7;
+        if (x != 0) { byte = byte | 0x80; } or { more = false; }
+        enc.emit_byte(b, byte);
+    }
+}
+
+# append a signed LEB128 value to `b`.
+# ---
+# b: the byte buffer to append to
+# v: the value to encode
+fun sleb(b: *enc.ByteBuf, v: i64) {
+    var x: i64 = v;
+    var more: bool = true;
+    for (more) {
+        var byte: u8 = (x & 0x7F)::u8;
+        x = x >> 7;
+        val sign: bool = (byte & 0x40) != 0;
+        if ((x == 0 && !sign) || (x == -1 && sign)) { more = false; }
+        or { byte = byte | 0x80; }
+        enc.emit_byte(b, byte);
+    }
+}
+
+# append a NUL-terminated string (DW_FORM_string) to `b`.
+# ---
+# b: the byte buffer to append to
+# s: the string to append (its bytes then a 0)
+fun emit_cstr(b: *enc.ByteBuf, s: str) {
+    val n: usize = str_len(s);
+    var i: usize = 0;
+    for (i < n) { enc.emit_byte(b, s[i]); i = i + 1; }
+    enc.emit_byte(b, 0);
+}
+
+# resolve an interned StrId to its text, or "" when unavailable.
+# ---
+# itn: interner backing the id
+# id:  the id to resolve
+# ret: the text, or the empty string
+fun resolve(itn: *intern.Interner, id: intern.StrId) str {
+    if (id == intern.STR_NIL) { ret ""; }
+    val o: O.Option[str] = intern.lookup(itn, id);
+    if (O.is_some[str](o)) { ret O.unwrap[str](o); }
+    ret "";
+}
+
+# a function's `.text` range, gathered from the encoder's symbol marks.
+# ---
+# name:   interned function symbol name (the reloc target for its address)
+# offset: byte offset of the function within `.text`
+# size:   byte length of the function body
+rec DwFunc {
+    name:   intern.StrId;
+    offset: u32;
+    size:   u32;
+}
+
+# the largest number of distinct source files a compile unit's file table holds
+# before the producer bails; a single translation unit references few files.
+val MAX_FILES: u32 = 256;
+
+# a compile unit's source-file table, mapping the encoder rows' `source.FileId`s to
+# 0-based DWARF file indices in first-seen order.
+# ---
+# ids:   the distinct FileIds, in first-seen order (dwarf index = array index)
+# count: number of files
+rec FileTable {
+    ids:   [256]source.FileId;
+    count: u32;
+}
+
+# find or append `id` in the file table, returning its 0-based DWARF file index, or
+# -1 when the table is full.
+# ---
+# ft: the file table to search / grow
+# id: the FileId to intern into the table
+# ret: the 0-based dwarf file index, or -1 on overflow
+fun file_index(ft: *FileTable, id: source.FileId) i32 {
+    var i: u32 = 0;
+    for (i < ft.count) {
+        if (ft.ids[i] == id) { ret i::i32; }
+        i = i + 1;
+    }
+    if (ft.count >= MAX_FILES) { ret -1; }
+    ft.ids[ft.count] = id;
+    ft.count = ft.count + 1;
+    ret (ft.count - 1)::i32;
+}
+
+# copy a byte buffer's contents into a fresh image-owned, exactly-sized allocation
+# (the object builder frees a section's bytes by its length, so an over-allocated
+# ByteBuf cannot be handed over directly).
+# ---
+# alloc: allocator the image owns the result through
+# b:     the buffer to copy out
+# ret:   an exactly `b.len`-sized copy, or an allocation error
+fun copy_exact(alloc: *A.Allocator, b: *enc.ByteBuf) R.Result[*u8, str] {
+    if (b.len == 0) { ret R.ok[*u8, str](nil); }
+    val r: R.Result[*u8, str] = A.allocate[u8](alloc, b.len);
+    if (R.is_err[*u8, str](r)) { ret r; }
+    val out: *u8 = R.unwrap_ok[*u8, str](r);
+    var i: usize = 0;
+    for (i < b.len) { out[i] = b.data[i]; i = i + 1; }
+    ret R.ok[*u8, str](out);
+}
+
+# add a SK_DEBUG section holding `b`'s bytes to the image and return its index.
+# ---
+# image: the object image to append to
+# name:  interned section name (".debug_abbrev" etc.)
+# b:     the built section bytes (copied out exactly)
+# ret:   the new section index, or an allocation error
+fun add_debug_section(image: *of.ObjectImage, name: intern.StrId, b: *enc.ByteBuf) R.Result[u32, str] {
+    val rb: R.Result[*u8, str] = copy_exact(image.alloc, b);
+    if (R.is_err[*u8, str](rb)) { ret R.err[u32, str](R.unwrap_err[*u8, str](rb)); }
+    var sec: of.Section;
+    sec.name  = name;
+    sec.kind  = of.SK_DEBUG;
+    sec.bytes = R.unwrap_ok[*u8, str](rb);
+    sec.len   = b.len::u32;
+    sec.align = 1;
+    ret obj.add_section(image, sec);
+}
+
+# emit one abbreviation attribute spec pair (attribute code, form code).
+# ---
+# b:    the abbrev buffer
+# at:   the DW_AT_* attribute code
+# form: the DW_FORM_* form code
+fun emit_attr(b: *enc.ByteBuf, at: u8, form: u8) {
+    uleb(b, at::u64);
+    uleb(b, form::u64);
+}
+
+# build the `.debug_abbrev` table: one abbreviation for the compile-unit DIE, whose
+# attributes (producer/name/comp_dir inline strings, language, low_pc address,
+# high_pc offset, stmt_list section offset) match the DIE `build_info` emits. The
+# table is identical for every module, so a CU's `debug_abbrev_offset` of 0 is
+# correct even after the linker concatenates each object's `.debug_abbrev`.
+# ---
+# b: the buffer the abbrev bytes are appended to
+fun build_abbrev(b: *enc.ByteBuf) {
+    uleb(b, ABBREV_CU::u64);
+    uleb(b, DW_TAG_compile_unit::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_producer, DW_FORM_string);
+    emit_attr(b, DW_AT_name,     DW_FORM_string);
+    emit_attr(b, DW_AT_comp_dir, DW_FORM_string);
+    emit_attr(b, DW_AT_language, DW_FORM_data2);
+    emit_attr(b, DW_AT_low_pc,   DW_FORM_addr);
+    emit_attr(b, DW_AT_high_pc,  DW_FORM_data8);
+    emit_attr(b, DW_AT_stmt_list, DW_FORM_sec_offset);
+    uleb(b, 0); uleb(b, 0);   # end of this abbrev's attribute list
+    uleb(b, 0);               # null abbrev code terminates the table
+}
+
+# build the CU-only `.debug_info`: a DWARF 5 unit header plus one compile-unit DIE
+# carrying the producer / name / comp_dir strings, the source language, the code
+# range (low_pc as a relocated address, high_pc as an offset from it), and the
+# stmt_list section offset. Records the byte offsets of the low_pc and stmt_list
+# fields so `produce` can attach their relocations.
+# ---
+# b:            the buffer the info bytes are appended to
+# address_size: target pointer width in bytes
+# producer:     DW_AT_producer text
+# name:         DW_AT_name text (the CU's primary source path)
+# comp_dir:     DW_AT_comp_dir text
+# high_pc:      code span in bytes (high_pc - low_pc)
+# low_off:      out - byte offset of the 8-byte low_pc field
+# stmt_off:     out - byte offset of the 4-byte stmt_list field
+fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp_dir: str,
+               high_pc: u64, low_off: *u32, stmt_off: *u32) {
+    val len_pos: usize = b.len;
+    enc.emit_u32(b, 0);                 # unit_length (backpatched)
+    val body_start: usize = b.len;
+    enc.emit_u16(b, 5);                 # version
+    enc.emit_byte(b, DW_UT_compile);    # unit_type
+    enc.emit_byte(b, address_size);
+    enc.emit_u32(b, 0);                 # debug_abbrev_offset (identical abbrev, so 0)
+
+    uleb(b, ABBREV_CU::u64);            # the CU DIE's abbrev code
+    emit_cstr(b, producer);
+    emit_cstr(b, name);
+    emit_cstr(b, comp_dir);
+    enc.emit_u16(b, DW_LANG_C);
+    @low_off = b.len::u32;
+    enc.emit_u64(b, 0);                 # low_pc (relocated)
+    enc.emit_u64(b, high_pc);           # high_pc (offset from low_pc)
+    @stmt_off = b.len::u32;
+    enc.emit_u32(b, 0);                 # stmt_list (relocated to .debug_line)
+
+    # backpatch unit_length = bytes after the length field.
+    bin.write_u32_le(b.data, len_pos, (b.len - body_start)::u32);
+}
+
+# emit a DWARF 5 line-program row for `(addr_delta, line_delta)`, preferring a
+# single special opcode and falling back to advance_line / advance_pc / copy when
+# the combined advance does not pack into one byte.
+# ---
+# b:          the line-program buffer
+# addr_delta: operation-advance in bytes (min_instruction_length is 1)
+# line_delta: change in the line register since the last row
+fun emit_row(b: *enc.ByteBuf, addr_delta: u32, line_delta: i32) {
+    if (line_delta >= LINE_BASE && line_delta < LINE_BASE + LINE_RANGE) {
+        val op: i64 = (line_delta - LINE_BASE)::i64 + (LINE_RANGE::i64 * addr_delta::i64) + OPCODE_BASE::i64;
+        if (op <= 255) {
+            enc.emit_byte(b, op::u8);
+            ret;
+        }
+    }
+    if (line_delta != 0) { enc.emit_byte(b, DW_LNS_advance_line); sleb(b, line_delta::i64); }
+    if (addr_delta != 0) { enc.emit_byte(b, DW_LNS_advance_pc);   uleb(b, addr_delta::u64); }
+    enc.emit_byte(b, DW_LNS_copy);
+}
+
+# build the DWARF 5 `.debug_line` header and program. For each function, in
+# ascending `.text` order, it opens a sequence with `DW_LNE_set_address` (address
+# relocated to the function symbol), replays the encoder rows falling in the
+# function's byte range as line-program rows, advances to the function end, and
+# closes with `DW_LNE_end_sequence`. Records each set_address field offset so
+# `produce` can attach one `RK_ABS64` relocation per function.
+# ---
+# s:            session, for resolving source files and line numbers
+# funcs:        the module's functions, in ascending `.text` offset
+# nfuncs:       number of functions
+# rows:         the encoder's re-homed PC<->source rows
+# row_count:    number of rows
+# text_sec:     the `.text` section index (rows outside it are ignored)
+# address_size: target pointer width in bytes
+# comp_dir:     the compilation directory (line-header directory 0)
+# ft:           the built file table (line-header file entries)
+# b:            out - the line-program bytes
+# addr_off:     out - per-function byte offset of the set_address address field
+fun build_line(s: *session.Session, funcs: *DwFunc, nfuncs: u32, rows: *enc.LineRow, row_count: u32,
+               text_sec: u32, address_size: u8, comp_dir: str, ft: *FileTable,
+               b: *enc.ByteBuf, addr_off: *u32) {
+    val len_pos: usize = b.len;
+    enc.emit_u32(b, 0);              # unit_length (backpatched)
+    val ul_end: usize = b.len;
+    enc.emit_u16(b, 5);             # version
+    enc.emit_byte(b, address_size);
+    enc.emit_byte(b, 0);            # segment_selector_size
+    val hl_pos: usize = b.len;
+    enc.emit_u32(b, 0);            # header_length (backpatched)
+    val hdr_start: usize = b.len;
+
+    enc.emit_byte(b, 1);           # minimum_instruction_length
+    enc.emit_byte(b, 1);           # maximum_operations_per_instruction
+    enc.emit_byte(b, 1);           # default_is_stmt
+    enc.emit_byte(b, (LINE_BASE & 0xFF)::u8);   # line_base (signed)
+    enc.emit_byte(b, LINE_RANGE::u8);
+    enc.emit_byte(b, OPCODE_BASE);
+    # standard_opcode_lengths for opcodes 1..12.
+    enc.emit_byte(b, 0); enc.emit_byte(b, 1); enc.emit_byte(b, 1); enc.emit_byte(b, 1);
+    enc.emit_byte(b, 1); enc.emit_byte(b, 0); enc.emit_byte(b, 0); enc.emit_byte(b, 0);
+    enc.emit_byte(b, 1); enc.emit_byte(b, 0); enc.emit_byte(b, 0); enc.emit_byte(b, 1);
+
+    # directory table: one format field (path/string), one entry (comp_dir).
+    enc.emit_byte(b, 1);
+    uleb(b, DW_LNCT_path::u64); uleb(b, DW_FORM_string::u64);
+    uleb(b, 1);
+    emit_cstr(b, comp_dir);
+
+    # file table: two format fields (path/string, dir_index/udata), one entry per file.
+    enc.emit_byte(b, 2);
+    uleb(b, DW_LNCT_path::u64);            uleb(b, DW_FORM_string::u64);
+    uleb(b, DW_LNCT_directory_index::u64); uleb(b, 0x0F::u64);  # DW_FORM_udata
+    uleb(b, ft.count::u64);
+    var fi: u32 = 0;
+    for (fi < ft.count) {
+        emit_cstr(b, file_path(s, ft.ids[fi]));
+        uleb(b, 0);   # all files sit under directory 0 (comp_dir)
+        fi = fi + 1;
+    }
+
+    # header_length spans from just after the field to the first program opcode.
+    bin.write_u32_le(b.data, hl_pos, (b.len - hdr_start)::u32);
+
+    # the line-number program: one sequence per function.
+    var f: u32 = 0;
+    for (f < nfuncs) {
+        val fn: *DwFunc = ?funcs[f];
+        # DW_LNE_set_address (extended opcode): 0, uleb(len=1+addr), 0x02, address.
+        enc.emit_byte(b, 0);
+        uleb(b, (1 + address_size)::u64);
+        enc.emit_byte(b, DW_LNE_set_address);
+        addr_off[f] = b.len::u32;
+        emit_addr(b, address_size);
+
+        var cur_off:  u32 = fn.offset;
+        var cur_line: i32 = 1;
+        var cur_file: i64 = -1;
+
+        var r: u32 = 0;
+        for (r < row_count) {
+            val row: *enc.LineRow = ?rows[r];
+            if (row.sec == text_sec && row.text_offset >= fn.offset && row.text_offset < fn.offset + fn.size) {
+                val pl: PosLine = pos_of(s, row.loc, ft);
+                if (pl.file::i64 != cur_file) {
+                    enc.emit_byte(b, DW_LNS_set_file);
+                    uleb(b, pl.file::u64);
+                    cur_file = pl.file::i64;
+                }
+                val addr_delta: u32 = row.text_offset - cur_off;
+                emit_row(b, addr_delta, pl.line - cur_line);
+                cur_off  = row.text_offset;
+                cur_line = pl.line;
+            }
+            r = r + 1;
+        }
+
+        # advance to the function end and close the sequence.
+        val end_delta: u32 = (fn.offset + fn.size) - cur_off;
+        if (end_delta != 0) { enc.emit_byte(b, DW_LNS_advance_pc); uleb(b, end_delta::u64); }
+        enc.emit_byte(b, 0);
+        uleb(b, 1);
+        enc.emit_byte(b, DW_LNE_end_sequence);
+        f = f + 1;
+    }
+
+    bin.write_u32_le(b.data, len_pos, (b.len - ul_end)::u32);
+}
+
+# a resolved (dwarf file index, 1-based line) for a source location.
+# ---
+# file: 0-based dwarf file index
+# line: 1-based source line
+rec PosLine {
+    file: u32;
+    line: i32;
+}
+
+# resolve a source location to its dwarf file index and 1-based line, defaulting to
+# (0, 1) when the file or position cannot be recovered.
+# ---
+# s:   session, for the source map
+# loc: the source location to resolve
+# ft:  the file table (already populated with this loc's file)
+# ret: the (file index, line) pair
+fun pos_of(s: *session.Session, loc: source.SrcLoc, ft: *FileTable) PosLine {
+    var out: PosLine;
+    out.file = 0;
+    out.line = 1;
+    val fx: i32 = file_index(ft, loc.file);
+    if (fx >= 0) { out.file = fx::u32; }
+    val fo: O.Option[*source.SourceFile] = source.get(?s.sources, loc.file);
+    if (O.is_some[*source.SourceFile](fo)) {
+        val p: source.Position = source.position(O.unwrap[*source.SourceFile](fo), loc.offset);
+        out.line = p.line::i32;
+    }
+    ret out;
+}
+
+# the path of a source file, or "?" when it cannot be resolved.
+# ---
+# s:  session, for the source map
+# id: the FileId to resolve
+# ret: the file path, or "?"
+fun file_path(s: *session.Session, id: source.FileId) str {
+    val fo: O.Option[*source.SourceFile] = source.get(?s.sources, id);
+    if (O.is_some[*source.SourceFile](fo)) { ret O.unwrap[*source.SourceFile](fo).path; }
+    ret "?";
+}
+
+# emit `address_size` zero bytes for a relocated address field.
+# ---
+# b:            the buffer
+# address_size: number of address bytes (4 or 8)
+fun emit_addr(b: *enc.ByteBuf, address_size: u8) {
+    if (address_size == 8) { enc.emit_u64(b, 0); } or { enc.emit_u32(b, 0); }
+}
+
+# count the module's defined function symbols that live in `.text`.
+# ---
+# image:    the object image whose symbols are scanned
+# text_sec: the `.text` section index
+# ret:      the number of function symbols in `.text`
+fun count_funcs(image: *of.ObjectImage, text_sec: u32) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < image.symbol_count) {
+        val sym: *of.Symbol = ?image.symbols[i];
+        if ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0 && sym.section == text_sec) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# gather the module's `.text` functions into `out`, sorted by ascending offset.
+# ---
+# image:    the object image whose symbols are gathered
+# text_sec: the `.text` section index
+# out:      destination array, sized `count_funcs`
+fun gather_funcs(image: *of.ObjectImage, text_sec: u32, out: *DwFunc) {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < image.symbol_count) {
+        val sym: *of.Symbol = ?image.symbols[i];
+        if ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0 && sym.section == text_sec) {
+            out[n].name   = sym.name;
+            out[n].offset = sym.offset;
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    # insertion sort by offset (function counts per module are small).
+    var a: u32 = 1;
+    for (a < n) {
+        val key: DwFunc = out[a];
+        var b: i64 = a::i64 - 1;
+        for (b >= 0 && out[b::u32].offset > key.offset) {
+            out[(b + 1)::u32] = out[b::u32];
+            b = b - 1;
+        }
+        out[(b + 1)::u32] = key;
+        a = a + 1;
+    }
+}
+
+# intern "<base>#suffix", a per-module-unique local name for a debug-section anchor
+# (the linker keys relocations on the symbol name, so the anchor must not collide
+# across objects).
+# ---
+# itn:     the session interner
+# base:    the module name text
+# suffix:  the anchor discriminator (e.g. ".debug_line")
+# ret:     the interned unique name, or an intern/allocation error
+fun intern_anchor(itn: *intern.Interner, base: str, suffix: str) R.Result[intern.StrId, str] {
+    val lb: usize = str_len(base);
+    val ls: usize = str_len(suffix);
+    val rb: R.Result[*u8, str] = A.allocate[u8](itn.a, lb + ls + 1);
+    if (R.is_err[*u8, str](rb)) { ret R.err[intern.StrId, str](R.unwrap_err[*u8, str](rb)); }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+    var w: usize = 0;
+    var i: usize = 0;
+    for (i < lb) { buf[w] = base[i]; w = w + 1; i = i + 1; }
+    i = 0;
+    for (i < ls) { buf[w] = suffix[i]; w = w + 1; i = i + 1; }
+    buf[w] = 0;
+    val ri: R.Result[intern.StrId, str] = intern.intern(itn, buf::str);
+    A.deallocate[u8](itn.a, buf, lb + ls + 1);
+    ret ri;
+}
+
+# add one relocation to the image, propagating an allocation failure.
+# ---
+# image:  the object image
+# sec:    the section being patched
+# offset: patch-site offset within the section
+# kind:   abstract relocation kind
+# sym:    interned target symbol name
+# ret:    ok(true), or an allocation error
+fun add_reloc(image: *of.ObjectImage, sec: u32, offset: u32, kind: of.RelocKind, sym: intern.StrId) R.Result[bool, str] {
+    var rel: of.Relocation;
+    rel.section = sec;
+    rel.offset  = offset;
+    rel.kind    = kind;
+    rel.symbol  = sym;
+    rel.addend  = 0;
+    ret obj.add_relocation(image, rel);
+}
+
+# emit the module's DWARF 5 `.debug_abbrev` / `.debug_info` / `.debug_line` sections
+# into `image`, driven by the encoder's PC<->source rows and the `.text` function
+# symbols
+#
+# The format-agnostic producer the epic #1594 births: it writes only the abstract
+# object model, so the active container writer serializes the identical bytes for
+# ELF and Mach-O. A module with no `.text` function is a no-op. Frees every scratch
+# buffer and array before returning.
+# ---
+# s:        session (source map, debug producer / comp_dir strings)
+# tgt:      resolved target (address size)
+# image:    the per-module object image being built
+# rows:     the encoder's re-homed PC<->source rows
+# row_count: number of rows
+# text_sec: the `.text` section index
+# ret:      ok(true) on success, or an allocation error
+pub fun produce(s: *session.Session, tgt: *target.Target, image: *of.ObjectImage,
+                rows: *enc.LineRow, row_count: u32, text_sec: u32) R.Result[bool, str] {
+    val nfuncs: u32 = count_funcs(image, text_sec);
+    if (nfuncs == 0) { ret R.ok[bool, str](true); }
+
+    val address_size: u8 = tgt.arch.pointer_width::u8;
+    val itn: *intern.Interner = image.interner;
+    val producer: str = resolve(itn, s.debug_producer);
+    val comp_dir: str = resolve(itn, s.debug_comp_dir);
+
+    # gather + sort the functions.
+    val rf: R.Result[*DwFunc, str] = A.allocate[DwFunc](s.alloc, nfuncs::usize);
+    if (R.is_err[*DwFunc, str](rf)) { ret R.err[bool, str](R.unwrap_err[*DwFunc, str](rf)); }
+    val funcs: *DwFunc = R.unwrap_ok[*DwFunc, str](rf);
+    gather_funcs(image, text_sec, funcs);
+
+    # the encoder records no per-symbol size, so a function's extent is the gap to
+    # the next function (in `.text` order) and the last runs to the section end.
+    val text_len: u32 = image.sections[text_sec].len;
+    var fi0: u32 = 0;
+    for (fi0 < nfuncs) {
+        var end: u32 = text_len;
+        if (fi0 + 1 < nfuncs) { end = funcs[fi0 + 1].offset; }
+        funcs[fi0].size = end - funcs[fi0].offset;
+        fi0 = fi0 + 1;
+    }
+
+    # pre-populate the file table so the line header lists every file it references.
+    var ft: FileTable;
+    ft.count = 0;
+    var r: u32 = 0;
+    for (r < row_count) {
+        if (rows[r].sec == text_sec && source.loc_is_valid(rows[r].loc)) {
+            file_index(?ft, rows[r].loc.file);
+        }
+        r = r + 1;
+    }
+
+    var name: str = comp_dir;
+    if (ft.count > 0) { name = file_path(s, ft.ids[0]); }
+
+    # low_pc is the lowest function, high_pc the span to the last function's end.
+    val high_pc: u64 = (funcs[nfuncs - 1].offset + funcs[nfuncs - 1].size - funcs[0].offset)::u64;
+
+    # per-function set_address field offsets, filled by build_line.
+    val ra: R.Result[*u32, str] = A.allocate[u32](s.alloc, nfuncs::usize);
+    if (R.is_err[*u32, str](ra)) { A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize); ret R.err[bool, str](R.unwrap_err[*u32, str](ra)); }
+    val addr_off: *u32 = R.unwrap_ok[*u32, str](ra);
+
+    var b_abbrev: enc.ByteBuf = enc.buf_init(s.alloc);
+    var b_line:   enc.ByteBuf = enc.buf_init(s.alloc);
+    var b_info:   enc.ByteBuf = enc.buf_init(s.alloc);
+
+    build_abbrev(?b_abbrev);
+    build_line(s, funcs, nfuncs, rows, row_count, text_sec, address_size, comp_dir, ?ft, ?b_line, addr_off);
+    var low_off:  u32 = 0;
+    var stmt_off: u32 = 0;
+    build_info(?b_info, address_size, producer, name, comp_dir, high_pc, ?low_off, ?stmt_off);
+
+    val pr: R.Result[bool, str] = install(s, image, itn, funcs, nfuncs,
+                                          ?b_abbrev, ?b_line, ?b_info, addr_off, low_off, stmt_off);
+
+    enc.buf_dnit(?b_abbrev);
+    enc.buf_dnit(?b_line);
+    enc.buf_dnit(?b_info);
+    A.deallocate[u32](s.alloc, addr_off, nfuncs::usize);
+    A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+    ret pr;
+}
+
+# add the built sections, the per-module `.debug_line` anchor, and every relocation
+# to the image. split out so `produce` frees its scratch buffers on every path.
+# ---
+# s:        session, for interning names
+# image:    the object image
+# itn:      the session interner
+# funcs:    the sorted function ranges
+# nfuncs:   number of functions
+# b_abbrev/b_line/b_info: the built section bytes
+# addr_off: per-function set_address field offsets in `.debug_line`
+# low_off:  low_pc field offset in `.debug_info`
+# stmt_off: stmt_list field offset in `.debug_info`
+# ret:      ok(true), or an allocation error
+fun install(s: *session.Session, image: *of.ObjectImage, itn: *intern.Interner,
+            funcs: *DwFunc, nfuncs: u32, b_abbrev: *enc.ByteBuf, b_line: *enc.ByteBuf,
+            b_info: *enc.ByteBuf, addr_off: *u32, low_off: u32, stmt_off: u32) R.Result[bool, str] {
+    val n_abbrev: R.Result[intern.StrId, str] = intern.intern(itn, ".debug_abbrev");
+    if (R.is_err[intern.StrId, str](n_abbrev)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](n_abbrev)); }
+    val n_line: R.Result[intern.StrId, str] = intern.intern(itn, ".debug_line");
+    if (R.is_err[intern.StrId, str](n_line)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](n_line)); }
+    val n_info: R.Result[intern.StrId, str] = intern.intern(itn, ".debug_info");
+    if (R.is_err[intern.StrId, str](n_info)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](n_info)); }
+
+    val ra: R.Result[u32, str] = add_debug_section(image, R.unwrap_ok[intern.StrId, str](n_abbrev), b_abbrev);
+    if (R.is_err[u32, str](ra)) { ret R.err[bool, str](R.unwrap_err[u32, str](ra)); }
+    val rl: R.Result[u32, str] = add_debug_section(image, R.unwrap_ok[intern.StrId, str](n_line), b_line);
+    if (R.is_err[u32, str](rl)) { ret R.err[bool, str](R.unwrap_err[u32, str](rl)); }
+    val line_sec: u32 = R.unwrap_ok[u32, str](rl);
+    val ri: R.Result[u32, str] = add_debug_section(image, R.unwrap_ok[intern.StrId, str](n_info), b_info);
+    if (R.is_err[u32, str](ri)) { ret R.err[bool, str](R.unwrap_err[u32, str](ri)); }
+    val info_sec: u32 = R.unwrap_ok[u32, str](ri);
+
+    # a per-module-unique anchor at .debug_line offset 0 for the stmt_list reloc.
+    val anchor_r: R.Result[intern.StrId, str] = intern_anchor(itn, resolve(itn, image.name), ".debug_line");
+    if (R.is_err[intern.StrId, str](anchor_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](anchor_r)); }
+    val anchor: intern.StrId = R.unwrap_ok[intern.StrId, str](anchor_r);
+    var asym: of.Symbol;
+    asym.name    = anchor;
+    asym.section = line_sec;
+    asym.offset  = 0;
+    asym.size    = 0;
+    asym.flags   = of.SYM_OBJ_FLAG_GLOBAL;
+    val sr: R.Result[u32, str] = obj.add_symbol(image, asym);
+    if (R.is_err[u32, str](sr)) { ret R.err[bool, str](R.unwrap_err[u32, str](sr)); }
+
+    # .debug_info: low_pc -> first function (abs64), stmt_list -> .debug_line (abs32).
+    val r1: R.Result[bool, str] = add_reloc(image, info_sec, low_off, of.RK_ABS64, funcs[0].name);
+    if (R.is_err[bool, str](r1)) { ret r1; }
+    val r2: R.Result[bool, str] = add_reloc(image, info_sec, stmt_off, of.RK_ABS32, anchor);
+    if (R.is_err[bool, str](r2)) { ret r2; }
+
+    # .debug_line: one DW_LNE_set_address (abs64) per function.
+    var i: u32 = 0;
+    for (i < nfuncs) {
+        val rr: R.Result[bool, str] = add_reloc(image, line_sec, addr_off[i], of.RK_ABS64, funcs[i].name);
+        if (R.is_err[bool, str](rr)) { ret rr; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# check `b` holds exactly `expect[0..n]`; returns true on a match.
+fun buf_eq(b: *enc.ByteBuf, expect: *u8, n: usize) bool {
+    if (b.len != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (b.data[i] != expect[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# uleb / sleb encode to the canonical DWARF byte sequences.
+test "mach.lang.be.codegen.dwarf.uleb_sleb:canonical" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    uleb(?b, 0);   uleb(?b, 127); uleb(?b, 128); uleb(?b, 300);
+    # 0x00 | 0x7F | 0x80 0x01 | 0xAC 0x02
+    var e1: [6]u8; e1[0] = 0x00; e1[1] = 0x7F; e1[2] = 0x80; e1[3] = 0x01; e1[4] = 0xAC; e1[5] = 0x02;
+    if (!buf_eq(?b, ?e1[0], 6)) { code = 1; }
+    enc.buf_dnit(?b);
+
+    var c: enc.ByteBuf = enc.buf_init(?alloc);
+    sleb(?c, 0); sleb(?c, -1); sleb(?c, 2); sleb(?c, -128);
+    # 0x00 | 0x7F | 0x02 | 0x80 0x7F
+    var e2: [5]u8; e2[0] = 0x00; e2[1] = 0x7F; e2[2] = 0x02; e2[3] = 0x80; e2[4] = 0x7F;
+    if (!buf_eq(?c, ?e2[0], 5)) { code = 1; }
+    enc.buf_dnit(?c);
+    ret code;
+}
+
+# build_abbrev emits the exact one-abbrev compile-unit table, byte for byte.
+test "mach.lang.be.codegen.dwarf.build_abbrev:golden" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    build_abbrev(?b);
+    # code=1, tag=0x11, children=0, (producer,string)(name,string)(comp_dir,string)
+    # (language,data2)(low_pc,addr)(high_pc,data8)(stmt_list,sec_offset), (0,0), null.
+    var e: [20]u8;
+    e[0]=0x01; e[1]=0x11; e[2]=0x00;
+    e[3]=0x25; e[4]=0x08; e[5]=0x03; e[6]=0x08; e[7]=0x1B; e[8]=0x08;
+    e[9]=0x13; e[10]=0x05; e[11]=0x11; e[12]=0x01; e[13]=0x12; e[14]=0x07;
+    e[15]=0x10; e[16]=0x17; e[17]=0x00; e[18]=0x00; e[19]=0x00;
+    val ok: bool = buf_eq(?b, ?e[0], 20);
+    enc.buf_dnit(?b);
+    if (!ok) { ret 1; }
+    ret 0;
+}
+
+# emit_row packs a small line advance into a single special opcode and falls back to
+# advance_pc / copy when the combined advance overflows one byte.
+test "mach.lang.be.codegen.dwarf.emit_row:special_and_fallback" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    # (addr=1, line=0): opcode = (0 - LINE_BASE) + LINE_RANGE*1 + OPCODE_BASE = 5+14+13 = 32.
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_row(?b, 1, 0);
+    var e1: [1]u8; e1[0] = 32;
+    if (!buf_eq(?b, ?e1[0], 1)) { code = 1; }
+    enc.buf_dnit(?b);
+
+    # (addr=100, line=0): 5 + 14*100 + 13 = 1418 > 255, so advance_pc(100) + copy.
+    var c: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_row(?c, 100, 0);
+    var e2: [3]u8; e2[0] = DW_LNS_advance_pc; e2[1] = 100; e2[2] = DW_LNS_copy;
+    if (!buf_eq(?c, ?e2[0], 3)) { code = 1; }
+    enc.buf_dnit(?c);
+    ret code;
+}
