@@ -12,6 +12,8 @@
 
 use std.allocator.page;
 use std.collections.map;
+use std.collections.sort;
+use std.collections.vector;
 use std.crypto.hash.sha256;
 use std.data.toml;
 use std.filesystem;
@@ -25,6 +27,7 @@ use std.types.char.char;
 use std.types.size.usize;
 use std.types.string.StrView;
 use std.types.string.str;
+use std.types.string.str_compare;
 use std.types.string.str_empty;
 use std.types.string.str_ends_with;
 use std.types.string.str_equals;
@@ -36,6 +39,7 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 use ctime: std.chrono.time;
+use sysos: std.system.os;
 
 use mach.lang.be.codegen;
 use be_linker: mach.lang.be.linker;
@@ -553,8 +557,9 @@ pub fun resolve_artifact_path(alloc: *A.Allocator, project_root: str, sel: *mani
 # build_project_impl: the shared build pipeline behind both build_project_sel
 # (single target) and build_project_union (all targets). `for_union` records every
 # manifest target's tuple and flips on the union load walk (see load_config /
-# walk_comptime_if_union).
-fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Selection, for_union: bool) R.Result[Project, str] {
+# walk_comptime_if_union). `all_own_src` additionally loads every own-source module
+# as a collection root (see load_all_own_src), for `mach test`.
+fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Selection, for_union: bool, all_own_src: bool) R.Result[Project, str] {
     var p: Project;
     init_project(?p, s);
 
@@ -612,6 +617,18 @@ fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Se
         }
         ei = ei + 1;
     }
+
+    # test builds root collection at the whole source tree, not the entrypoint's
+    # import closure, so a `pub` module with no in-tree `use` consumer still has
+    # its tests collected (#1863). dfs_load dedups by FQN, so this only adds the
+    # modules the entry/union walks missed.
+    if (all_own_src) {
+        val allsrc_r: R.Result[bool, str] = load_all_own_src(?p);
+        if (R.is_err[bool, str](allsrc_r)) {
+            dnit_project(?p);
+            ret R.err[Project, str](R.unwrap_err[bool, str](allsrc_r));
+        }
+    }
     readout.phase_end(p.s.readout, readout.PH_LOAD, p.topo_len, "module", "modules");
 
     # the module table is stable past the load pass; publish every module's
@@ -664,7 +681,14 @@ fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Se
 # repeatedly on one long-lived Session: sources dedup by path and dnit_project
 # resets the session's module registries (see dnit_project's reload contract).
 pub fun build_project_sel(s: *session.Session, project_root: str, sel: *manifest.Selection) R.Result[Project, str] {
-    ret build_project_impl(s, project_root, sel, false);
+    ret build_project_impl(s, project_root, sel, false, false);
+}
+
+# build the module graph for a `mach test` invocation: like build_project_sel, but
+# additionally loads every own-source module under `[project].src` as a collection
+# root, so tests in a module no entrypoint imports are still collected (#1863).
+pub fun build_project_test(s: *session.Session, project_root: str, sel: *manifest.Selection) R.Result[Project, str] {
+    ret build_project_impl(s, project_root, sel, false, true);
 }
 
 # build the union of EVERY manifest target's AND artifact's
@@ -686,7 +710,148 @@ pub fun build_project_union(s: *session.Session, project_root: str) R.Result[Pro
     sel.artifact     = "";
     sel.want_lib     = false;
     sel.has_artifact = false;
-    ret build_project_impl(s, project_root, ?sel, true);
+    ret build_project_impl(s, project_root, ?sel, true, false);
+}
+
+# one own-source module discovered by the whole-source test walk: its interned FQN
+# and the FQN text the deterministic load order sorts on.
+rec SrcMod {
+    text: str;
+    fqn:  intern.StrId;
+}
+
+# order two discovered modules by FQN text.
+#
+# The whole-source walk visits files in filesystem `readdir` order, which is not
+# stable across hosts; sorting by FQN before loading pins the module-id assignment
+# (hence collection order and per-test rerun indices) so a test build is
+# deterministic and self-host fixpoint-stable.
+fun cmp_src_mod(a: *SrcMod, b: *SrcMod) i64 {
+    ret str_compare(a.text, b.text);
+}
+
+# load every own-source module under `[project].src` as a test-collection root.
+#
+# `mach test` collects tests from the whole source tree, not the entrypoint's
+# import closure, so a `pub` module with no in-tree `use` consumer (an editor / LSP
+# surface, say) still has its tests collected. Every `.mach` file under the src dir
+# is enumerated, mapped to its FQN, sorted for determinism, and dfs_loaded; dfs_load
+# dedups by FQN, so the already-loaded entry closure re-loads as a no-op and only
+# the orphaned modules are added.
+fun load_all_own_src(p: *Project) R.Result[bool, str] {
+    val root_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.project_root);
+    if (O.is_none[str](root_opt)) { ret R.err[bool, str]("project_root StrId not interned"); }
+    val src_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.dir_src);
+    if (O.is_none[str](src_opt)) { ret R.err[bool, str]("dir_src StrId not interned"); }
+    val id_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.id);
+    if (O.is_none[str](id_opt)) { ret R.err[bool, str]("project id StrId not interned"); }
+
+    val src_abs_r: R.Result[str, str] = join_path(p.s.alloc, O.unwrap[str](root_opt), O.unwrap[str](src_opt));
+    if (R.is_err[str, str](src_abs_r)) { ret R.err[bool, str](R.unwrap_err[str, str](src_abs_r)); }
+    val src_abs: str = R.unwrap_ok[str, str](src_abs_r);
+
+    var mods: vector.Vector[SrcMod] = vector.init[SrcMod](p.s.alloc);
+    val walk_r: R.Result[bool, str] = collect_src_modules(p, src_abs, str_len(src_abs), O.unwrap[str](id_opt), ?mods);
+    str_free(p.s.alloc, src_abs);
+    if (R.is_err[bool, str](walk_r)) { vector.dnit[SrcMod](?mods); ret walk_r; }
+
+    sort.sort[SrcMod](mods.data, mods.len, cmp_src_mod);
+
+    var i: usize = 0;
+    for (i < mods.len) {
+        val lr: R.Result[session.ModuleId, str] = dfs_load(p, mods.data[i].fqn);
+        if (R.is_err[session.ModuleId, str](lr)) {
+            vector.dnit[SrcMod](?mods);
+            ret R.err[bool, str](R.unwrap_err[session.ModuleId, str](lr));
+        }
+        i = i + 1;
+    }
+    vector.dnit[SrcMod](?mods);
+    ret R.ok[bool, str](true);
+}
+
+# recursively append every `.mach` module under `dir_abs` to `out`.
+#
+# `src_prefix_len` is the byte length of the project src-dir path, so each file's
+# path relative to src (the FQN tail compose_module_fqn expands) is the c-string
+# just past `<src>/`. Symlinks are not followed (info_link is an lstat): a walk
+# that chased a link could escape the tree or loop.
+fun collect_src_modules(p: *Project, dir_abs: str, src_prefix_len: usize, id_text: str, out: *vector.Vector[SrcMod]) R.Result[bool, str] {
+    val fd_raw: i64 = sysos.open(sysos.AT_FDCWD, dir_abs, sysos.O_RDONLY | sysos.O_DIRECTORY, 0);
+    if (fd_raw < 0) { ret R.err[bool, str](sysos.message(fd_raw)); }
+    val fd: i32 = fd_raw::i32;
+
+    var dbuf: [8192]u8;
+    var result: R.Result[bool, str] = R.ok[bool, str](true);
+    var reading: bool = true;
+    for (reading) {
+        val n: i64 = sysos.read_dir(fd, (?dbuf[0])::*sysos.dirent64, 8192);
+        if (n < 0)  { result = R.err[bool, str](sysos.message(n)); reading = false; }
+        or (n == 0) { reading = false; }
+        or {
+            var pos: usize = 0;
+            for (reading && pos < n::usize) {
+                val ent:    *sysos.dirent64 = ((?dbuf[0])::usize + pos)::*sysos.dirent64;
+                val reclen: usize           = ent.d_reclen::usize;
+                if (reclen == 0) { reading = false; }
+                or {
+                    val name: *u8 = ?ent.d_name[0];
+                    if (!is_dot_name(name)) {
+                        val rr: R.Result[bool, str] = visit_src_entry(p, dir_abs, name::str, src_prefix_len, id_text, out);
+                        if (R.is_err[bool, str](rr)) { result = rr; reading = false; }
+                    }
+                    pos = pos + reclen;
+                }
+            }
+        }
+    }
+    sysos.close(fd);
+    ret result;
+}
+
+# handle one directory entry: recurse into a subdirectory, or append a `.mach`
+# file's module. non-`.mach` files, symlinks, and unstattable entries are skipped.
+fun visit_src_entry(p: *Project, dir_abs: str, name: str, src_prefix_len: usize, id_text: str, out: *vector.Vector[SrcMod]) R.Result[bool, str] {
+    val child_r: R.Result[str, str] = join_path(p.s.alloc, dir_abs, name);
+    if (R.is_err[str, str](child_r)) { ret R.err[bool, str](R.unwrap_err[str, str](child_r)); }
+    val child: str = R.unwrap_ok[str, str](child_r);
+
+    var result: R.Result[bool, str] = R.ok[bool, str](true);
+    val fi_r: R.Result[filesystem.FileInfo, str] = filesystem.info_link(child);
+    if (R.is_ok[filesystem.FileInfo, str](fi_r)) {
+        val fi: filesystem.FileInfo = R.unwrap_ok[filesystem.FileInfo, str](fi_r);
+        if (filesystem.info_is_dir(?fi)) {
+            result = collect_src_modules(p, child, src_prefix_len, id_text, out);
+        }
+        or (filesystem.info_is_file(?fi) && str_ends_with(name, ".mach")) {
+            # the FQN tail is child's path relative to the src dir: the c-string just
+            # past "<src>/". compose turns '/' into '.' and strips the '.mach' suffix.
+            val rel: str = (child::usize + src_prefix_len + 1)::str;
+            val fqn_r: R.Result[intern.StrId, str] = compose_module_fqn(p, id_text, rel);
+            if (R.is_err[intern.StrId, str](fqn_r)) { result = R.err[bool, str](R.unwrap_err[intern.StrId, str](fqn_r)); }
+            or {
+                val fqn: intern.StrId = R.unwrap_ok[intern.StrId, str](fqn_r);
+                val tx:  O.Option[str] = intern.lookup(?p.s.interner, fqn);
+                if (O.is_some[str](tx)) {
+                    var sm: SrcMod;
+                    sm.text = O.unwrap[str](tx);
+                    sm.fqn  = fqn;
+                    val pr: R.Result[usize, str] = vector.push[SrcMod](out, sm);
+                    if (R.is_err[usize, str](pr)) { result = R.err[bool, str](R.unwrap_err[usize, str](pr)); }
+                }
+            }
+        }
+    }
+    str_free(p.s.alloc, child);
+    ret result;
+}
+
+# whether a directory entry name is "." or ".." (the self / parent links a walk skips).
+fun is_dot_name(name: *u8) bool {
+    if (name[0] != '.') { ret false; }
+    if (name[1] == 0) { ret true; }
+    if (name[1] == '.' && name[2] == 0) { ret true; }
+    ret false;
 }
 
 # file a `warning:` on the session diagnostic sink for a union target this build
