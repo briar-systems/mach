@@ -5,12 +5,16 @@
 # engine remaps against. Every phase takes a `*Session` and routes its service
 # interactions through it.
 
+use std.allocator.page;
 use std.collections.map;
+use std.text.string.str_dup;
+use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 use std.types.string.str_len;
 
 use A: std.allocator;
@@ -33,6 +37,20 @@ fwd module.ModuleId;
 fwd module.MODULE_NIL;
 fwd module.StableModuleId;
 fwd module.STABLE_MODULE_NIL;
+
+# an in-memory source overlay: unsaved buffer `text` shadowing the on-disk content
+# of the file at `path` as the query engine's source input (#1588)
+#
+# The driver's parse read consults the overlay before touching disk, so a
+# long-lived session (an LSP) can drive builds over live, unsaved edits. Both
+# strings are owned by the session.
+# ---
+# path: the on-disk path the overlay shadows (owned)
+# text: the live buffer text to use instead of the file's content (owned)
+pub rec Overlay {
+    path: str;
+    text: str;
+}
 
 # top-level driver state shared across every compilation phase
 #
@@ -128,10 +146,22 @@ pub rec Session {
     # instead of the default fixed-address one. opt-in; the linker ORs it with the
     # target's own PIE requirement. off leaves the default ET_EXEC output unchanged.
     pie: bool;
+
+    # in-memory source overlays keyed by path (#1588): live unsaved buffer text a
+    # long-lived session's parse read uses instead of the file on disk. a small
+    # owned array scanned by path - the open-buffer set is tiny - grown on demand
+    # and freed in dnit. deliberately NOT cleared by reset_module_registry: an
+    # overlay must outlive a build to shadow the file on the next one.
+    overlays:    *Overlay;
+    overlay_len: u32;
+    overlay_cap: u32;
 }
 
 # seed capacity of the module-AST registry, doubled on demand from there
 val MODULE_AST_SEED_CAP: u32 = 16;
+
+# seed capacity of the source-overlay array, doubled on demand from there
+val OVERLAY_SEED_CAP: u32 = 4;
 
 # construct an empty Session backed by the given allocator
 #
@@ -170,6 +200,9 @@ pub fun init(alloc: *A.Allocator) R.Result[Session, str] {
     s.opt_release      = false;
     s.readout          = nil;
     s.pie              = false;
+    s.overlays         = nil;
+    s.overlay_len      = 0;
+    s.overlay_cap      = 0;
 
     val opt_types: O.Option[str] = type.init(?s.types, alloc);
     if (O.is_some[str](opt_types)) {
@@ -249,6 +282,19 @@ fun register_catalog(db: *query.QueryDb) R.Result[bool, str] {
 # s: session to tear down; sub-structures are dnit'd in reverse construction order
 pub fun dnit(s: *Session) {
     if (s == nil) { ret; }
+
+    if (s.overlays != nil && s.overlay_cap > 0) {
+        var oi: u32 = 0;
+        for (oi < s.overlay_len) {
+            str_free(s.alloc, s.overlays[oi].path);
+            str_free(s.alloc, s.overlays[oi].text);
+            oi = oi + 1;
+        }
+        A.deallocate[Overlay](s.alloc, s.overlays, s.overlay_cap::usize);
+        s.overlays    = nil;
+        s.overlay_len = 0;
+        s.overlay_cap = 0;
+    }
 
     if (s.module_asts != nil && s.module_ast_cap > 0) {
         A.deallocate[*ast.Ast](s.alloc, s.module_asts, s.module_ast_cap::usize);
@@ -746,4 +792,159 @@ pub fun load_source(s: *Session, path: str, text: str) R.Result[source.FileId, s
         ret R.err[source.FileId, str](R.unwrap_err[bool, str](res_input));
     }
     ret R.ok[source.FileId, str](fid);
+}
+
+# set (or replace) the in-memory source overlay for `path`
+#
+# `text` shadows the on-disk content of the file at `path` as the query engine's
+# source input the next build reads: the driver's parse read consults the overlay
+# before touching disk. The LSP feeds live unsaved buffer text this way, keyed by
+# path to sidestep its URI-keyed editor FileIds. Both strings are copied into the
+# session; replacing an existing overlay frees its prior text. An unchanged overlay
+# reused across builds keeps the module's Q_PARSE valid (load_source's Q_FILE_TEXT
+# byte cutoff); a changed one re-parses exactly the overlaid module (#1588).
+# ---
+# s:    the session
+# path: the on-disk path to shadow
+# text: the live buffer text to use instead of the file's content
+# ret:  true on success, or an allocation error
+pub fun set_overlay(s: *Session, path: str, text: str) R.Result[bool, str] {
+    val dup_text_r: R.Result[str, str] = str_dup(s.alloc, text);
+    if (R.is_err[str, str](dup_text_r)) { ret R.err[bool, str](R.unwrap_err[str, str](dup_text_r)); }
+    val dup_text: str = R.unwrap_ok[str, str](dup_text_r);
+
+    # replace an existing overlay's text in place, keeping its path key.
+    var i: u32 = 0;
+    for (i < s.overlay_len) {
+        if (str_equals(s.overlays[i].path, path)) {
+            str_free(s.alloc, s.overlays[i].text);
+            s.overlays[i].text = dup_text;
+            ret R.ok[bool, str](true);
+        }
+        i = i + 1;
+    }
+
+    # append a new overlay, growing the array on demand.
+    val dup_path_r: R.Result[str, str] = str_dup(s.alloc, path);
+    if (R.is_err[str, str](dup_path_r)) {
+        str_free(s.alloc, dup_text);
+        ret R.err[bool, str](R.unwrap_err[str, str](dup_path_r));
+    }
+    val dup_path: str = R.unwrap_ok[str, str](dup_path_r);
+
+    val res_grow: R.Result[bool, str] = overlays_reserve(s, s.overlay_len + 1);
+    if (R.is_err[bool, str](res_grow)) {
+        str_free(s.alloc, dup_text);
+        str_free(s.alloc, dup_path);
+        ret res_grow;
+    }
+    s.overlays[s.overlay_len].path = dup_path;
+    s.overlays[s.overlay_len].text = dup_text;
+    s.overlay_len = s.overlay_len + 1;
+    ret R.ok[bool, str](true);
+}
+
+# drop the overlay for `path`, so the next build reads the on-disk content again
+# ---
+# s:    the session
+# path: the overlaid path to clear
+# ret:  true when an overlay was present and removed, false when none matched
+pub fun clear_overlay(s: *Session, path: str) bool {
+    var i: u32 = 0;
+    for (i < s.overlay_len) {
+        if (str_equals(s.overlays[i].path, path)) {
+            str_free(s.alloc, s.overlays[i].path);
+            str_free(s.alloc, s.overlays[i].text);
+            val last: u32 = s.overlay_len - 1;
+            if (i != last) { s.overlays[i] = s.overlays[last]; }
+            s.overlay_len = last;
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the overlay text registered for `path`, or none
+#
+# The returned text is borrowed from the session, valid until the overlay is
+# replaced or cleared. The driver's parse read uses it in place of the file.
+# ---
+# s:    the session
+# path: the path to look up
+# ret:  some(text) when an overlay is set for path, none otherwise
+pub fun overlay_get(s: *Session, path: str) O.Option[str] {
+    var i: u32 = 0;
+    for (i < s.overlay_len) {
+        if (str_equals(s.overlays[i].path, path)) {
+            ret O.some[str](s.overlays[i].text);
+        }
+        i = i + 1;
+    }
+    ret O.none[str]();
+}
+
+# grow the overlay array to at least `need` slots, doubling from the seed capacity.
+fun overlays_reserve(s: *Session, need: u32) R.Result[bool, str] {
+    if (need <= s.overlay_cap) { ret R.ok[bool, str](true); }
+
+    var new_cap: u32 = s.overlay_cap;
+    if (new_cap == 0) { new_cap = OVERLAY_SEED_CAP; }
+    for (new_cap < need) { new_cap = new_cap * 2; }
+
+    if (s.overlays == nil) {
+        val res_alloc: R.Result[*Overlay, str] = A.allocate[Overlay](s.alloc, new_cap::usize);
+        if (R.is_err[*Overlay, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*Overlay, str](res_alloc)); }
+        s.overlays = R.unwrap_ok[*Overlay, str](res_alloc);
+    }
+    or {
+        val res_realloc: R.Result[*Overlay, str] = A.reallocate[Overlay](s.alloc, s.overlays, s.overlay_cap::usize, new_cap::usize);
+        if (R.is_err[*Overlay, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*Overlay, str](res_realloc)); }
+        s.overlays = R.unwrap_ok[*Overlay, str](res_realloc);
+    }
+    s.overlay_cap = new_cap;
+    ret R.ok[bool, str](true);
+}
+
+# overlays set, read back, replace text in place, and clear exactly one entry;
+# an absent path reads as none and clears false (#1588)
+test "mach.lang.session.overlay:set_get_replace_clear" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[Session, str] = init(?alloc);
+    if (R.is_err[Session, str](sr)) { ret 1; }
+    var s: Session = R.unwrap_ok[Session, str](sr);
+
+    var bad: i32 = 0;
+
+    # absent overlay reads as none; clearing an absent path is false.
+    if (O.is_some[str](overlay_get(?s, "/x/a.mach"))) { bad = 1; }
+    if (clear_overlay(?s, "/x/a.mach"))               { bad = 1; }
+
+    # set two overlays; each reads back its own text.
+    if (R.is_err[bool, str](set_overlay(?s, "/x/a.mach", "AAA"))) { dnit(?s); ret 1; }
+    if (R.is_err[bool, str](set_overlay(?s, "/x/b.mach", "BBB"))) { dnit(?s); ret 1; }
+    if (s.overlay_len != 2) { bad = 1; }
+    val ga: O.Option[str] = overlay_get(?s, "/x/a.mach");
+    val gb: O.Option[str] = overlay_get(?s, "/x/b.mach");
+    if (O.is_none[str](ga) || !str_equals(O.unwrap[str](ga), "AAA")) { bad = 1; }
+    if (O.is_none[str](gb) || !str_equals(O.unwrap[str](gb), "BBB")) { bad = 1; }
+
+    # replacing an existing path swaps text in place, adding no new slot.
+    if (R.is_err[bool, str](set_overlay(?s, "/x/a.mach", "A2"))) { dnit(?s); ret 1; }
+    if (s.overlay_len != 2) { bad = 1; }
+    val ga2: O.Option[str] = overlay_get(?s, "/x/a.mach");
+    if (O.is_none[str](ga2) || !str_equals(O.unwrap[str](ga2), "A2")) { bad = 1; }
+
+    # clearing removes exactly one; the sibling survives.
+    if (!clear_overlay(?s, "/x/a.mach"))              { bad = 1; }
+    if (s.overlay_len != 1)                           { bad = 1; }
+    if (O.is_some[str](overlay_get(?s, "/x/a.mach"))) { bad = 1; }
+    val gb2: O.Option[str] = overlay_get(?s, "/x/b.mach");
+    if (O.is_none[str](gb2) || !str_equals(O.unwrap[str](gb2), "BBB")) { bad = 1; }
+
+    # dnit frees the remaining overlay's owned strings; a clean teardown is the
+    # observable (the page allocator faults a leak/double-free).
+    dnit(?s);
+    ret bad;
 }
