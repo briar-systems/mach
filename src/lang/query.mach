@@ -83,11 +83,31 @@ pub val Q_EXPORTS: QueryKind = 8;
 # because the session type interner is monotonic; a graph reshape that renumbers
 # a module's ModuleId-embedding type identities re-checks it via Q_MODULE_NUMBER.
 pub val Q_SEMA: QueryKind = 9;
-# derived: a module's optimized ir.Module, keyed on sess.ModuleId
+# derived (owned handle): a module's optimized ir.Module, keyed on
+# sess.StableModuleId so an unchanged module's lowered IR is reused across
+# rebuilds even when a graph reshape renumbers per-build ModuleIds. mangled
+# linkage names are FQN-derived, so a cached module stays valid across a reshape.
+#
+# Reads Q_SEMA(module), Q_TARGET, Q_LOWER_FLAGS, and Q_SEMA of every module in this
+# module's transitive import closure: a generic/comptime instance declared in
+# another module is monomorphized into THIS module's IR, so that module's typing
+# feeds this lowered output and a change there must re-lower this module (#1618).
 pub val Q_LOWER: QueryKind = 10;
-# derived: a module's of.ObjectImage, keyed on sess.ModuleId
+# derived (owned handle): a module's of.ObjectImage, keyed on sess.StableModuleId
+# so an unchanged module's codegen output is reused across rebuilds.
+#
+# Reads Q_LOWER(module) and Q_TARGET. an unchanged lowered IR reuses the cached
+# image (and its on-disk `.o`) instead of re-emitting - the per-module
+# hash-and-skip that also lets codegen run per module in parallel (#1618).
 pub val Q_CODEGEN: QueryKind = 11;
-# derived: the linked output for the project, keyed on unit
+# derived: the project's link fingerprint, keyed on unit (0).
+#
+# Reads Q_TARGET, Q_LINK_CONFIG, and Q_CODEGEN of every module in the product's
+# link set. its value folds each dependency's revision, so the entry's
+# last_changed advances iff a link input changed - an object (Q_CODEGEN), the
+# target/profile/pie (Q_TARGET), or a link-only input like the output path or an
+# external library (Q_LINK_CONFIG). run_link_pass compares this last_changed to
+# the prior build's to decide whether the link must re-run (#1618).
 pub val Q_LINK: QueryKind = 12;
 # derived: a byte fingerprint of a module's TYPED public surface (the resolved
 # types of its locally-declared pub symbols plus the field tables of pub
@@ -107,6 +127,27 @@ pub val Q_TYPED_EXPORTS: QueryKind = 13;
 # TypeIds went stale; set_input's early-cutoff leaves it untouched when the number
 # is unchanged, so a content-only edit keeps reuse valid (#1583).
 pub val Q_MODULE_NUMBER: QueryKind = 14;
+# input: the link-only build configuration, keyed on unit (0) and set each build
+# by the CLI before the link.
+#
+# Carries the link inputs that do NOT flow through a module's Q_CODEGEN - the
+# output path and product name, the output kind, the pie flag, and the external
+# link inputs. static external inputs (`.o` / `.a` baked into the output) are folded
+# by path AND by content hash, so a same-path rebuild of a vendored archive
+# invalidates; dynamic dependencies (sonames, loaded at run time) are folded by
+# identity. Q_LINK depends on it so a change to any of them re-links even when every
+# module's object is unchanged; set_input's early-cutoff keeps the link reused when
+# the config is byte-identical (#1618).
+pub val Q_LINK_CONFIG: QueryKind = 15;
+# input: the lowering diagnostic flags, keyed on unit (0) and set each build by the
+# driver before the lower pass.
+#
+# Carries the flags that change what lowering DOES without changing the IR it
+# produces - currently the IR-verifier toggle. Q_LOWER depends on it so a warm
+# session that cached a module with verification off re-lowers (and re-runs the
+# verifier) when a later build requests it on; set_input's early-cutoff keeps the
+# lowering reused when the flags are unchanged (#1618).
+pub val Q_LOWER_FLAGS: QueryKind = 16;
 
 # monotonic counter owned by the QueryDb, bumped on every set_input. cached
 # entries record the revision at which they were computed and the revision at
@@ -501,24 +542,54 @@ pub fun get(db: *QueryDb, kind: QueryKind, key: u64) R.Result[*QueryEntry, str] 
 # dep_key:    key that was read
 # ret:        true on success, or an allocation error from growing the dep list
 pub fun record_dep(db: *QueryDb, owner_kind: QueryKind, owner_key: u64, dep_kind: QueryKind, dep_key: u64) R.Result[bool, str] {
+    val r: R.Result[Revision, str] = record_dep_rev(db, owner_kind, owner_key, dep_kind, dep_key);
+    if (R.is_err[Revision, str](r)) { ret R.err[bool, str](R.unwrap_err[Revision, str](r)); }
+    ret R.ok[bool, str](true);
+}
+
+# record_dep, returning the dep's captured last_changed revision
+#
+# Same as record_dep, but hands back the revision it looked up for the dep, so a
+# ComputeFn that also folds that revision into its own value (Q_LINK) avoids a
+# second shard scan via peek_revision.
+# ---
+# ret: the dep's captured last_changed revision, or an allocation error
+pub fun record_dep_rev(db: *QueryDb, owner_kind: QueryKind, owner_key: u64, dep_kind: QueryKind, dep_key: u64) R.Result[Revision, str] {
     if (owner_kind::u32 >= db.kinds) {
-        ret R.err[bool, str]("record_dep: owner kind out of range");
+        ret R.err[Revision, str]("record_dep: owner kind out of range");
     }
     val sh: *QueryShard = ?db.storage[owner_kind::u32];
     val entry: *QueryEntry = entry_find(sh, owner_key);
     if (entry == nil) {
-        ret R.err[bool, str]("record_dep: owner entry not found");
+        ret R.err[Revision, str]("record_dep: owner entry not found");
     }
 
     val res_reserve: R.Result[bool, str] = deps_reserve(db, entry, 1);
-    if (R.is_err[bool, str](res_reserve)) { ret res_reserve; }
+    if (R.is_err[bool, str](res_reserve)) { ret R.err[Revision, str](R.unwrap_err[bool, str](res_reserve)); }
 
+    val rev: Revision = last_changed_get(db, dep_kind, dep_key);
     val dep: *Dep = ?entry.deps[entry.dep_len];
     dep.kind         = dep_kind;
     dep.key          = dep_key;
-    dep.last_changed = last_changed_get(db, dep_kind, dep_key);
+    dep.last_changed = rev;
     entry.dep_len = entry.dep_len + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok[Revision, str](rev);
+}
+
+# the stored last_changed revision for `(kind, key)` WITHOUT validating or
+# recomputing - a read-only peek at the cached state
+#
+# Returns 0 when the kind is out of range or has no stored entry. Lets a caller
+# capture an entry's revision before a `get` and compare afterward to learn whether
+# that get advanced it (the "did this input change since I last observed it" signal
+# run_link_pass uses). Metadata kinds resolve through their RevisionFn.
+# ---
+# db:   the database
+# kind: the queried kind
+# key:  the hashed key
+# ret:  the stored last_changed, or 0 when absent
+pub fun peek_revision(db: *QueryDb, kind: QueryKind, key: u64) Revision {
+    ret last_changed_get(db, kind, key);
 }
 
 # claim a shard for a kind, growing the shard array to cover that index when
