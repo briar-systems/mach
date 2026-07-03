@@ -1,0 +1,218 @@
+# `mach clean [path]` - remove the project's build output directory trees.
+#
+# Resolves the project root (the given path, or the working directory, walking up
+# to the nearest mach.toml) and removes the static directory prefix of each of the
+# manifest's `out`/`obj`/`ir`/`asm` path templates - the leading `/`-separated
+# components before the first `{...}` placeholder, so the whole output tree goes
+# regardless of target or profile. A project that relocates its output
+# (`out = "build/..."`) is cleaned at that root. Only the manifest is read: no
+# module graph is loaded and nothing under the dependency dir is touched. Removal
+# is idempotent, so cleaning an already-clean project is a no-op.
+#
+# Exit codes: 0 on success (including nothing to remove), 1 on a missing project or
+# an unparseable manifest, 2 on an allocator or io failure.
+
+use std.allocator.arena;
+use std.filesystem;
+use std.print;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A:    std.allocator;
+use O:    std.types.option;
+use R:    std.types.result;
+use toml: std.data.toml;
+
+use mach.cli.util;
+use mach.lang.intern;
+use mach.lang.manifest;
+
+# `mach clean` subcommand entry point
+#
+# Rejects any flag (the command takes none), resolves the project root from the
+# optional path positional, and removes each declared output tree. A missing
+# mach.toml is the standard no-project error.
+# ---
+# argc:  argument count including argv[0]
+# argv:  the argument vector (argc null-terminated byte pointers)
+# marks: consumption record parallel to argv, for the unknown-flag rejector
+# ret:   0 on success, 1 on a missing/unparseable project, 2 on an io failure
+pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
+    if (util.reject_unknown(argc, argv, marks, 2, "mach clean")) { ret 1; }
+
+    # the project root is the first positional, or the working directory; walk up
+    # to the nearest mach.toml. its absence is the standard no-project error.
+    val pix: usize = util.positional_index(argc, argv, marks, 2);
+    var start: *u8 = ".";
+    if (pix < argc) { start = argv[pix]; }
+
+    var root: [4096]u8;
+    if (!util.find_project_root(start, ?root[0], 4096)) {
+        print.eprint("error: no mach.toml found in the working directory or any parent\n");
+        ret 1;
+    }
+
+    var backing: A.Allocator;
+    var ar:      arena.Arena;
+    var a:       A.Allocator;
+    if (O.is_some[str](util.bootstrap_arena(?backing, ?ar, ?a))) {
+        print.eprintln("error: failed to initialise allocator");
+        ret 2;
+    }
+
+    val code: i64 = clean_project(?a, ?root[0]);
+    arena.dnit(?ar);
+    ret code;
+}
+
+# read the manifest at `root` and remove each distinct output-directory tree its
+# templates declare.
+#
+# The four templates are read for their static prefixes only; parsing the manifest
+# validates it as a real project. Every allocation is suballocated through the
+# caller's arena and reclaimed when it is torn down.
+# ---
+# a:    arena-backed allocator for the manifest read and parse
+# root: the resolved project root directory (null-terminated)
+# ret:  0 on success, 1 on an unparseable manifest, 2 on an io failure
+fun clean_project(a: *A.Allocator, root: *u8) i64 {
+    var toml_path: [4096]u8;
+    util.join_into(?toml_path[0], 4096, root, "mach.toml");
+
+    val text_r: R.Result[str, str] = filesystem.read_all(a, util.cstr_str(?toml_path[0]));
+    if (R.is_err[str, str](text_r)) {
+        print.eprint("error: cannot read '");
+        print.eprint(util.cstr_str(?toml_path[0]));
+        print.eprintln("'");
+        ret 2;
+    }
+
+    val tbl_r: R.Result[toml.Table, str] = toml.parse(a, R.unwrap_ok[str, str](text_r));
+    if (R.is_err[toml.Table, str](tbl_r)) {
+        print.eprint("error: mach.toml: ");
+        print.eprintln(R.unwrap_err[toml.Table, str](tbl_r));
+        ret 1;
+    }
+    var tbl: toml.Table = R.unwrap_ok[toml.Table, str](tbl_r);
+
+    var itn: intern.Interner = intern.init(a);
+    val man_r: R.Result[manifest.Manifest, str] = manifest.parse(a, ?itn, ?tbl);
+    if (R.is_err[manifest.Manifest, str](man_r)) {
+        print.eprint("error: mach.toml: ");
+        print.eprintln(R.unwrap_err[manifest.Manifest, str](man_r));
+        ret 1;
+    }
+    var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](man_r);
+
+    var removed: usize = 0;
+    var code:    i64   = 0;
+    code = clean_template(a, root, ?itn, m.out_tmpl, ?removed, code);
+    code = clean_template(a, root, ?itn, m.obj_tmpl, ?removed, code);
+    code = clean_template(a, root, ?itn, m.ir_tmpl,  ?removed, code);
+    code = clean_template(a, root, ?itn, m.asm_tmpl, ?removed, code);
+
+    if (removed == 0 && code == 0) { print.println("nothing to clean"); }
+
+    manifest.dnit(?m, a);
+    ret code;
+}
+
+# remove the static output-directory prefix of one template, reporting it.
+#
+# The tree is the template's leading static components joined under `root`; an
+# existence check before removal keeps a shared root (the default `out/`, named by
+# all four templates) reported once and makes the whole command idempotent. A
+# template with no static prefix (a leading placeholder) is skipped, so the project
+# root is never a removal target.
+# ---
+# a:       allocator for the removal's transient child paths
+# root:    the resolved project root directory (null-terminated)
+# itn:     interner the template id resolves against
+# tmpl_id: interned template whose static prefix is removed
+# removed: running count of trees actually removed, incremented on a removal
+# code:    the exit code so far, returned unless this removal fails
+# ret:     `code`, or 2 when the removal fails
+fun clean_template(a: *A.Allocator, root: *u8, itn: *intern.Interner, tmpl_id: intern.StrId, removed: *usize, code: i64) i64 {
+    val opt: O.Option[str] = intern.lookup(itn, tmpl_id);
+    if (O.is_none[str](opt)) { ret code; }
+    val tmpl: str = O.unwrap[str](opt);
+
+    val plen: usize = static_prefix_len(tmpl);
+    if (plen == 0 || plen + 1 > 4096) { ret code; }
+
+    # the '/'-separated static prefix, copied null-terminated for reporting and the
+    # join, then rooted at the project directory.
+    var rel: [4096]u8;
+    var k: usize = 0;
+    for (k < plen) { rel[k] = tmpl[k]; k = k + 1; }
+    rel[plen] = 0;
+
+    var abs: [4096]u8;
+    util.join_into(?abs[0], 4096, root, ?rel[0]);
+    val abs_str: str = util.cstr_str(?abs[0]);
+
+    if (!filesystem.exists(abs_str)) { ret code; }
+
+    val rr: R.Result[bool, str] = filesystem.remove_all(a, abs_str);
+    if (R.is_err[bool, str](rr)) {
+        print.eprint("error: cannot remove '");
+        print.eprint(util.cstr_str(?rel[0]));
+        print.eprint("': ");
+        print.eprintln(R.unwrap_err[bool, str](rr));
+        ret 2;
+    }
+
+    print.print("removed ");
+    print.println(util.cstr_str(?rel[0]));
+    @removed = @removed + 1;
+    ret code;
+}
+
+# the byte length of a path template's static directory prefix: the leading run of
+# complete `/`-separated components containing no `{...}` placeholder.
+#
+# `out/{target}/{profile}/bin/{name}{ext}` -> 3 (`out`); a template whose first
+# component holds a placeholder -> 0, so a value expanding into the project root is
+# never a removal target.
+# ---
+# tmpl: the path template text
+# ret:  the byte length of the static directory prefix, 0 when there is none
+fun static_prefix_len(tmpl: str) usize {
+    val n: usize = str_len(tmpl);
+    var end:       usize = 0;      # end offset of the last complete static component
+    var seg_start: usize = 0;
+    var seg_brace: bool  = false;
+    var i: usize = 0;
+    for (i <= n) {
+        if (i == n || tmpl[i] == '/') {
+            if (seg_brace)     { ret end; }   # first component holding a placeholder
+            if (i > seg_start) { end = i;  }   # a non-empty static component
+            seg_start = i + 1;
+            seg_brace = false;
+        }
+        or (tmpl[i] == '{') { seg_brace = true; }
+        i = i + 1;
+    }
+    ret end;
+}
+
+# the static prefix is the leading run of placeholder-free components: the whole
+# output root regardless of target/profile, empty when a placeholder leads (so the
+# project root is never removed).
+test "mach.cli.cmd.clean.static_prefix:template_shapes" {
+    var code: i32 = 0;
+    if (static_prefix_len("out/{target}/{profile}/bin/{name}{ext}") != 3) { code = 1; }  # "out"
+    if (static_prefix_len("out/{target}/{profile}/obj") != 3)             { code = 1; }  # "out"
+    if (static_prefix_len("build/{target}/obj") != 5)                     { code = 1; }  # "build"
+    if (static_prefix_len("bin/{name}{ext}") != 3)                        { code = 1; }  # "bin"
+    if (static_prefix_len("out/x/{target}") != 5)                         { code = 1; }  # "out/x"
+    if (static_prefix_len("cache") != 5)                                  { code = 1; }  # fully static dir
+    if (static_prefix_len("out/") != 3)                                   { code = 1; }  # trailing slash
+    if (static_prefix_len("{target}/obj") != 0)                           { code = 1; }  # leading placeholder
+    if (static_prefix_len("") != 0)                                       { code = 1; }  # empty
+    ret code;
+}

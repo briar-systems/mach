@@ -40,7 +40,7 @@ argument forwarding.
 | `build` | compile the project to objects and (for a `[bin.*]`) a linked binary |
 | `run`   | execute the already-built binary (a post-`build` convenience, not a rebuild) |
 | `test`  | build the test binary and run the collected tests |
-| `check` | report diagnostics for a single source file, without a project |
+| `clean` | remove the project's build output directory trees |
 | `dep`   | manage git-backed dependencies (clone, lock, vendor) under `<dep>` |
 | `init`  | scaffold a new project |
 | `doc`   | generate Markdown reference docs from source doc-comments |
@@ -284,34 +284,26 @@ integer. Build diagnostics stay on stderr, so the stdout stream is clean.
 
 Exit codes: `0` all passed, `1` any failed, `2` build/internal error.
 
-## `mach check`
+## `mach clean`
 
 ```
-mach check <file> [--format human|json]
+mach clean [path]
 ```
 
-Reports diagnostics for a single source file, feeding its text straight through
-the editor query surface — no `mach.toml`, module graph, or link step. It is the
-editor-facing diagnostics slice exposed as a CLI verb. It reports **parse-stage
-diagnostics only**: it does not run name resolution or sema, so a real run never
-carries the `= help:` suggestions or secondary (`related`) spans those stages
-produce — whether check should deepen to resolve is tracked in
-[#1839](https://github.com/briar-systems/mach/issues/1839).
+Removes the project's build output. The trees removed are the static directory
+prefixes of the manifest's `out`/`obj`/`ir`/`asm` templates — the leading path
+components before the first `{...}` placeholder — so the whole output tree is
+cleared regardless of target or profile. Because it is driven by the templates, a
+project that relocates its output (`out = "build/..."`) is cleaned at that root
+rather than a hardcoded `out/`. `[path]` selects the project (default: the working
+directory, walking up to the nearest `mach.toml`).
 
-| Flag              | Value            | Effect |
-|-------------------|------------------|--------|
-| `--format <mode>` | `human`\|`json`  | diagnostic format: framed source snippets on stderr (default `human`), or the machine-readable NDJSON stream on stdout |
+Only the manifest is read: no module graph is loaded and nothing under the
+dependency dir is touched. Removal is idempotent (`mach clean` on an already-clean
+project prints `nothing to clean` and succeeds). The command takes no options.
 
-`--format json` emits one JSON object per line on stdout — a `diagnostic` object
-per reported diagnostic (severity, message, primary location, and the `note`,
-`help`, and `related` fields, structurally `null` / empty today per the
-parse-only note above) and a closing `summary` — with no human frames
-interleaved. The schema is versioned and documented in
-[tooling/check-json.md](tooling/check-json.md); pin tooling to its `schema`
-integer. Usage and io errors stay on stderr, so the stdout stream is clean.
-
-Exit codes: `0` when the buffer has no error-severity diagnostics, `1` when it
-has any (or on a usage / io error), and `2` on an allocator bootstrap failure.
+Exit codes: `0` on success, `1` on a missing project or unparseable manifest, `2`
+on an allocator or io failure.
 
 ## `mach dep`
 
@@ -524,5 +516,4 @@ non-zero.
 - [manifest.md](manifest.md) — the `mach.toml` reference
 - [language/test.md](language/test.md) — the `test` declaration and `mach test`
 - [tooling/test-json.md](tooling/test-json.md) — the `mach test --format json` event schema
-- [tooling/check-json.md](tooling/check-json.md) — the `mach check --format json` diagnostic schema
 - [language/files.md](language/files.md) — project file layout

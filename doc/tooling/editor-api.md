@@ -80,9 +80,9 @@ definition here`), so an integrator wanting them drives `resolve` (or full
 sets them. Map a `related` entry's `loc` to a position the same way, and surface
 its `label` as an LSP `relatedInformation` item.
 
-The `mach check <file>` CLI command is the in-tree consumer of the parse-only
-slice; `mach build` renders the resolve-stage diagnostics that carry `help` and
-`related`.
+An editor integration consumes this parse-only slice directly through
+`diagnostics`; `mach build` renders the resolve-stage diagnostics that carry
+`help` and `related`.
 
 ## Position lookup — offset → id
 
