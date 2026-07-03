@@ -33,7 +33,10 @@ use R: std.types.result;
 
 use enc:     mach.lang.be.codegen.encode;
 use obj:     mach.lang.be.obj;
+use mir:     mach.lang.be.codegen.mir;
+use frame:   mach.lang.be.codegen.frame;
 use ir:      mach.lang.me.ir;
+use id:      mach.lang.me.ir.id;
 use intern:  mach.lang.intern;
 use session: mach.lang.session;
 use source:  mach.lang.source;
@@ -46,11 +49,13 @@ use bin:     mach.lang.target.of.bin;
 use std.allocator.page;
 
 # DWARF tag, attribute, and form constants (DWARF 5).
-val DW_TAG_compile_unit: u8 = 0x11;
-val DW_TAG_base_type:    u8 = 0x24;
-val DW_TAG_subprogram:   u8 = 0x2e;
-val DW_CHILDREN_no:      u8 = 0x00;
-val DW_CHILDREN_yes:     u8 = 0x01;
+val DW_TAG_compile_unit:     u8 = 0x11;
+val DW_TAG_base_type:        u8 = 0x24;
+val DW_TAG_subprogram:       u8 = 0x2e;
+val DW_TAG_formal_parameter: u8 = 0x05;
+val DW_TAG_variable:         u8 = 0x34;
+val DW_CHILDREN_no:          u8 = 0x00;
+val DW_CHILDREN_yes:         u8 = 0x01;
 
 val DW_AT_name:       u8 = 0x03;
 val DW_AT_byte_size:  u8 = 0x0b;
@@ -64,6 +69,7 @@ val DW_AT_encoding:   u8 = 0x3e;
 val DW_AT_external:   u8 = 0x3f;
 val DW_AT_frame_base: u8 = 0x40;
 val DW_AT_type:       u8 = 0x49;
+val DW_AT_location:   u8 = 0x02;
 val DW_AT_decl_file:  u8 = 0x3a;
 val DW_AT_decl_line:  u8 = 0x3b;
 
@@ -86,10 +92,20 @@ val DW_ATE_float:    u8 = 0x04;
 val DW_ATE_signed:   u8 = 0x05;
 val DW_ATE_unsigned: u8 = 0x07;
 
-# location-expression opcode: the frame-base register (DW_OP_reg0 + n for n < 32,
-# else DW_OP_regx + uleb(n)).
-val DW_OP_reg0: u8 = 0x50;
-val DW_OP_regx: u8 = 0x90;
+# location-expression opcodes. a register location is DW_OP_reg0 + n (n < 32) or
+# DW_OP_regx + uleb(n); a frame-relative slot is DW_OP_fbreg + sleb(offset); a
+# register-plus-offset value is DW_OP_breg0 + n + sleb(offset). DW_OP_deref /
+# DW_OP_plus_uconst / DW_OP_constu / DW_OP_minus / DW_OP_stack_value recover a
+# salvaged value (operand +/- constant) and mark the result a value, not a location.
+val DW_OP_reg0:        u8 = 0x50;
+val DW_OP_breg0:       u8 = 0x70;
+val DW_OP_regx:        u8 = 0x90;
+val DW_OP_fbreg:       u8 = 0x91;
+val DW_OP_deref:       u8 = 0x06;
+val DW_OP_plus_uconst: u8 = 0x23;
+val DW_OP_constu:      u8 = 0x10;
+val DW_OP_minus:       u8 = 0x1c;
+val DW_OP_stack_value: u8 = 0x9f;
 
 # DWARF 5 unit header: unit_type for a full compile unit.
 val DW_UT_compile: u8 = 0x01;
@@ -105,6 +121,12 @@ val ABBREV_CU:              u8 = 0x01;
 val ABBREV_BASE_TYPE:       u8 = 0x02;
 val ABBREV_SUBPROGRAM:      u8 = 0x03;
 val ABBREV_SUBPROGRAM_VOID: u8 = 0x04;
+# a variable / formal parameter, with or without a DW_AT_location (a located
+# variable vs one whose value was optimized out). all carry name + type.
+val ABBREV_VARIABLE:        u8 = 0x05;
+val ABBREV_VARIABLE_NOLOC:  u8 = 0x06;
+val ABBREV_PARAM:           u8 = 0x07;
+val ABBREV_PARAM_NOLOC:     u8 = 0x08;
 
 # DWARF 5 line-number program: standard opcodes, extended opcodes, and the tuned
 # special-opcode parameters this producer emits.
@@ -196,6 +218,8 @@ fun resolve(itn: *intern.Interner, id: intern.StrId) str {
 # decl_line: 1-based source line of the function's first row, or 0
 # ret_bt:    index into the base-type table for the return type, or -1 when the
 #            return is void or a non-primitive type (no DW_AT_type)
+# var_start: index of this function's first variable in the shared var array
+# var_count: number of variables this function contributes
 rec DwFunc {
     name:      intern.StrId;
     offset:    u32;
@@ -207,6 +231,55 @@ rec DwFunc {
     decl_file: u32;
     decl_line: u32;
     ret_bt:    i32;
+    var_start: u32;
+    var_count: u32;
+}
+
+# a variable's location kind. NONE = the value was optimized out (no DW_AT_location);
+# REG = live in a register (`reg` is its DWARF number); FRAME = a frame slot at
+# `offset` bytes from the frame base.
+val VLOC_NONE:  u8 = 0;
+val VLOC_REG:   u8 = 1;
+val VLOC_FRAME: u8 = 2;
+
+# a source variable's DWARF DIE data, joined from the IR dbg-var identity and the MIR
+# home. A DW_TAG_variable (or DW_TAG_formal_parameter) references its base type by
+# ref4 and carries a single-location DW_AT_location expression.
+# ---
+# name_off: DW_AT_name byte offset within `.debug_str`
+# bt:       base-type index for DW_AT_type
+# is_param: true for a formal parameter, false for a local
+# loc_kind: VLOC_NONE / VLOC_REG / VLOC_FRAME
+# reg:      DWARF register number when loc_kind == VLOC_REG
+# offset:   frame-base offset when loc_kind == VLOC_FRAME
+# net:      signed constant the salvage expression adds to the operand value (0 =
+#           identity); a non-zero net makes the location a computed DW_OP_stack_value
+# conflict: transient - true once two non-optimized-out bindings disagreed on a home,
+#           so the variable is not provably stationary and emits no DW_AT_location
+#           (deferred to the #1705 loclists tier); not part of the emitted DIE
+rec DwVar {
+    name_off: u32;
+    bt:       i32;
+    is_param: bool;
+    loc_kind: u8;
+    reg:      i32;
+    offset:   i64;
+    net:      i64;
+    conflict: bool;
+}
+
+# whether the variable `v`'s recorded home equals the raw home `(kind, reg, off, net)`.
+# the single-location tier emits DW_AT_location only when every non-optimized-out
+# binding of a variable agrees under this predicate.
+# ---
+# v:                the variable with a recorded home
+# kind/reg/off/net: the candidate raw home
+# ret:              true when they name the same location
+fun home_eq(v: *DwVar, kind: u8, reg: i32, off: i64, net: i64) bool {
+    if (v.loc_kind != kind) { ret false; }
+    if (kind == VLOC_REG)   { ret v.reg == reg && v.net == net; }
+    if (kind == VLOC_FRAME) { ret v.offset == off && v.net == net; }
+    ret true;
 }
 
 # a DWARF base type gathered from a primitive semantic return type.
@@ -493,11 +566,18 @@ fun build_abbrev(b: *enc.ByteBuf) {
     # subprogram without a return type (void or non-primitive return).
     build_subprogram_abbrev(b, ABBREV_SUBPROGRAM_VOID, false);
 
+    # variable / formal parameter, located and no-location shapes.
+    build_var_abbrev(b, ABBREV_VARIABLE,       DW_TAG_variable,         true);
+    build_var_abbrev(b, ABBREV_VARIABLE_NOLOC, DW_TAG_variable,         false);
+    build_var_abbrev(b, ABBREV_PARAM,          DW_TAG_formal_parameter, true);
+    build_var_abbrev(b, ABBREV_PARAM_NOLOC,    DW_TAG_formal_parameter, false);
+
     uleb(b, 0);   # null abbrev code terminates the table
 }
 
-# emit one subprogram abbreviation. Shared by the with-return and void shapes, which
-# differ only in the trailing DW_AT_type.
+# emit one subprogram abbreviation (now with children: its parameters and locals).
+# Shared by the with-return and void shapes, which differ only in the trailing
+# DW_AT_type.
 # ---
 # b:        the abbrev buffer
 # code:     the abbreviation code
@@ -505,7 +585,7 @@ fun build_abbrev(b: *enc.ByteBuf) {
 fun build_subprogram_abbrev(b: *enc.ByteBuf, code: u8, has_type: bool) {
     uleb(b, code::u64);
     uleb(b, DW_TAG_subprogram::u64);
-    enc.emit_byte(b, DW_CHILDREN_no);
+    enc.emit_byte(b, DW_CHILDREN_yes);
     emit_attr(b, DW_AT_name,       DW_FORM_strp);
     emit_attr(b, DW_AT_low_pc,     DW_FORM_addr);
     emit_attr(b, DW_AT_high_pc,    DW_FORM_data8);
@@ -514,6 +594,24 @@ fun build_subprogram_abbrev(b: *enc.ByteBuf, code: u8, has_type: bool) {
     emit_attr(b, DW_AT_decl_line,  DW_FORM_udata);
     emit_attr(b, DW_AT_frame_base, DW_FORM_exprloc);
     if (has_type) { emit_attr(b, DW_AT_type, DW_FORM_ref4); }
+    uleb(b, 0); uleb(b, 0);
+}
+
+# emit one variable / formal-parameter abbreviation: name (strp), type (ref4), and -
+# for the located shape - a location (exprloc). the no-location shape omits it (the
+# variable's value was optimized out).
+# ---
+# b:       the abbrev buffer
+# code:    the abbreviation code
+# tag:     DW_TAG_variable or DW_TAG_formal_parameter
+# has_loc: true to append DW_AT_location (DW_FORM_exprloc)
+fun build_var_abbrev(b: *enc.ByteBuf, code: u8, tag: u8, has_loc: bool) {
+    uleb(b, code::u64);
+    uleb(b, tag::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_name, DW_FORM_strp);
+    emit_attr(b, DW_AT_type, DW_FORM_ref4);
+    if (has_loc) { emit_attr(b, DW_AT_location, DW_FORM_exprloc); }
     uleb(b, 0); uleb(b, 0);
 }
 
@@ -538,7 +636,7 @@ fun build_subprogram_abbrev(b: *enc.ByteBuf, code: u8, has_type: bool) {
 # stmt_off:     out - byte offset of the CU 4-byte stmt_list field
 fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp_dir: str,
                high_pc: u64, fb_reg: i32, funcs: *DwFunc, nfuncs: u32, bts: *BaseType, nbt: u32,
-               relocs: *InfoReloc, reloc_count: *u32, low_off: *u32, stmt_off: *u32) {
+               vars: *DwVar, relocs: *InfoReloc, reloc_count: *u32, low_off: *u32, stmt_off: *u32) {
     val len_pos: usize = b.len;
     enc.emit_u32(b, 0);                 # unit_length (backpatched)
     val body_start: usize = b.len;
@@ -586,6 +684,14 @@ fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp
         uleb(b, fn.decl_line::u64);
         emit_frame_base(b, fb_reg);
         if (fn.ret_bt >= 0) { enc.emit_u32(b, bts[fn.ret_bt::u32].off); }   # DW_AT_type (ref4)
+
+        # the subprogram's variable / parameter children, then a null DIE.
+        var vi: u32 = 0;
+        for (vi < fn.var_count) {
+            emit_variable(b, ?vars[fn.var_start + vi], bts, relocs, reloc_count);
+            vi = vi + 1;
+        }
+        enc.emit_byte(b, 0);   # null DIE terminates this subprogram's children
         f = f + 1;
     }
 
@@ -593,6 +699,26 @@ fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp
 
     # backpatch unit_length = bytes after the length field.
     bin.write_u32_le(b.data, len_pos, (b.len - body_start)::u32);
+}
+
+# emit one variable / formal-parameter DIE: the located or no-location abbrev by kind,
+# then DW_AT_name (strp), DW_AT_type (ref4), and - when located - DW_AT_location.
+# ---
+# b:      the info buffer
+# v:      the variable to emit
+# bts:    the base-type table (DW_AT_type ref4 target)
+# relocs/reloc_count: the deferred `.debug_info` relocation list (for the name strp)
+fun emit_variable(b: *enc.ByteBuf, v: *DwVar, bts: *BaseType, relocs: *InfoReloc, reloc_count: *u32) {
+    val located: bool = v.loc_kind != VLOC_NONE;
+    if (v.is_param) {
+        if (located) { enc.emit_byte(b, ABBREV_PARAM); } or { enc.emit_byte(b, ABBREV_PARAM_NOLOC); }
+    } or {
+        if (located) { enc.emit_byte(b, ABBREV_VARIABLE); } or { enc.emit_byte(b, ABBREV_VARIABLE_NOLOC); }
+    }
+    push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, v.name_off::i64);
+    enc.emit_u32(b, 0);                    # DW_AT_name (strp, relocated to .debug_str)
+    enc.emit_u32(b, bts[v.bt::u32].off);   # DW_AT_type (ref4)
+    if (located) { emit_var_location(b, v); }
 }
 
 # emit a DW_AT_frame_base exprloc naming the frame-pointer register: a uleb length
@@ -612,6 +738,134 @@ fun emit_frame_base(b: *enc.ByteBuf, fb_reg: i32) {
         var i: usize = 0;
         for (i < tmp.len) { enc.emit_byte(b, tmp.data[i]); i = i + 1; }
         enc.buf_dnit(?tmp);
+    }
+}
+
+# find a MIR function by symbol name; linear, function counts per module are small.
+# ---
+# mirmod: the module whose functions are searched
+# name:   the interned function symbol name
+# ret:    the matching MIR function, or none
+fun find_mir_func(mirmod: *mir.MirModule, name: intern.StrId) O.Option[*mir.MirFunction] {
+    var i: u32 = 0;
+    for (i < mirmod.function_len) {
+        if (mirmod.functions[i].name == name) { ret O.some[*mir.MirFunction](?mirmod.functions[i]); }
+        i = i + 1;
+    }
+    ret O.none[*mir.MirFunction]();
+}
+
+# resolve a MIR vreg to a variable location: a register (VLOC_REG, `out_reg` a DWARF
+# number), a frame slot (VLOC_FRAME, `out_off` bytes from the frame base), or none
+# (VLOC_NONE) for MIR_VREG_NIL / an unmapped or DWARF-less register.
+# ---
+# tgt:      resolved target, for the ISA dwarf_reg hook
+# mfn:      the MIR function owning the vreg
+# vreg:     the vreg to resolve (post-regalloc / post-frame)
+# out_kind/out_reg/out_off: the resolved location
+fun resolve_home(tgt: *target.Target, mfn: *mir.MirFunction, vreg: u32,
+                 out_kind: *u8, out_reg: *i32, out_off: *i64) {
+    @out_kind = VLOC_NONE;
+    @out_reg  = 0;
+    @out_off  = 0;
+    if (vreg == mir.MIR_VREG_NIL || vreg >= mfn.vreg_count) { ret; }
+    val vr: *mir.MirVReg = ?mfn.vregs[vreg];
+    if (vr.assigned != mir.MIR_VREG_NIL) {
+        val f: isa.DwarfRegFn = tgt.arch.dwarf_reg::isa.DwarfRegFn;
+        val d: i32 = f(vr.assigned::i32);
+        if (d >= 0) { @out_kind = VLOC_REG; @out_reg = d; }
+        ret;
+    }
+    if (vr.spill_slot >= 0) {
+        val o: O.Option[i64] = frame.slot_offset(?mfn.frame, vreg);
+        if (O.is_some[i64](o)) { @out_kind = VLOC_FRAME; @out_off = O.unwrap[i64](o); }
+    }
+}
+
+# the net signed constant a salvage expression adds to the operand value (0 for the
+# identity expression), summed base-first over the +const / -const steps.
+# ---
+# irfn: the owning IR function (holds the dbg-expr pool)
+# iid:  the OP_DBG_VALUE instruction id
+# ret:  the net signed constant
+fun dbg_expr_net(irfn: *ir.Function, iid: id.InstructionId) i64 {
+    val eid: ir.DbgExprId = ir.dbg_expr_id(irfn, iid);
+    val o: O.Option[*ir.DbgExpr] = ir.dbg_expr_get(irfn, eid);
+    if (O.is_none[*ir.DbgExpr](o)) { ret 0; }
+    val dex: *ir.DbgExpr = O.unwrap[*ir.DbgExpr](o);
+    var net: i64 = 0;
+    var i: u32 = 0;
+    for (i < dex.op_count) {
+        if (dex.ops[i].op == ir.DBG_OP_PLUS_CONST)  { net = net + dex.ops[i].arg::i64; }
+        or (dex.ops[i].op == ir.DBG_OP_MINUS_CONST) { net = net - dex.ops[i].arg::i64; }
+        i = i + 1;
+    }
+    ret net;
+}
+
+# emit a variable's DW_AT_location exprloc (a uleb length prefix then the ops). A
+# register or frame slot with the identity expression is a plain location; a salvaged
+# value (net != 0) computes the value and marks it DW_OP_stack_value.
+# ---
+# b: the info buffer
+# v: the variable whose location is emitted (loc_kind != VLOC_NONE)
+fun emit_var_location(b: *enc.ByteBuf, v: *DwVar) {
+    var e: enc.ByteBuf = enc.buf_init(b.alloc);
+    if (v.loc_kind == VLOC_REG) {
+        if (v.net == 0) {
+            emit_reg_op(?e, DW_OP_reg0, DW_OP_regx, v.reg);
+        } or {
+            emit_reg_op(?e, DW_OP_breg0, 0, v.reg);
+            sleb(?e, v.net);
+            enc.emit_byte(?e, DW_OP_stack_value);
+        }
+    } or {   # VLOC_FRAME
+        enc.emit_byte(?e, DW_OP_fbreg);
+        sleb(?e, v.offset);
+        if (v.net != 0) {
+            enc.emit_byte(?e, DW_OP_deref);
+            emit_net_const(?e, v.net);
+            enc.emit_byte(?e, DW_OP_stack_value);
+        }
+    }
+    uleb(b, e.len::u64);
+    var i: usize = 0;
+    for (i < e.len) { enc.emit_byte(b, e.data[i]); i = i + 1; }
+    enc.buf_dnit(?e);
+}
+
+# emit DW_OP_reg<n> / DW_OP_breg<n>: `base0` + n as one byte for n < 32, else the
+# `opx` extended form + uleb(n). `opx` is 0 for DW_OP_breg (whose offset the caller
+# appends and which has no regx short form here, so n < 32 is required for breg).
+# ---
+# e:     the expression buffer
+# base0: DW_OP_reg0 or DW_OP_breg0
+# opx:   the extended opcode (DW_OP_regx), or 0 when none applies
+# n:     the DWARF register number
+fun emit_reg_op(e: *enc.ByteBuf, base0: u8, opx: u8, n: i32) {
+    if (n < 32) {
+        enc.emit_byte(e, (base0::i32 + n)::u8);
+    } or (opx != 0) {
+        enc.emit_byte(e, opx);
+        uleb(e, n::u64);
+    } or {
+        enc.emit_byte(e, (base0::i32 + 31)::u8);   # clamp; ISAs with a frame pointer register < 32
+    }
+}
+
+# append `net` to the value on the stack: DW_OP_plus_uconst for a positive net, else
+# DW_OP_constu(|net|) DW_OP_minus.
+# ---
+# e:   the expression buffer
+# net: the signed constant to add
+fun emit_net_const(e: *enc.ByteBuf, net: i64) {
+    if (net >= 0) {
+        enc.emit_byte(e, DW_OP_plus_uconst);
+        uleb(e, net::u64);
+    } or {
+        enc.emit_byte(e, DW_OP_constu);
+        uleb(e, (0 - net)::u64);
+        enc.emit_byte(e, DW_OP_minus);
     }
 }
 
@@ -918,8 +1172,8 @@ fun add_reloc_addend(image: *of.ObjectImage, sec: u32, offset: u32, kind: of.Rel
 # row_count: number of rows
 # text_sec: the `.text` section index
 # ret:      ok(true) on success, or an allocation error
-pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, image: *of.ObjectImage,
-                rows: *enc.LineRow, row_count: u32, text_sec: u32) R.Result[bool, str] {
+pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, mirmod: *mir.MirModule,
+                image: *of.ObjectImage, rows: *enc.LineRow, row_count: u32, text_sec: u32) R.Result[bool, str] {
     val nfuncs: u32 = count_funcs(image, text_sec);
     if (nfuncs == 0) { ret R.ok[bool, str](true); }
 
@@ -984,31 +1238,47 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, ima
         high_pc = (subs[nsub - 1].offset + subs[nsub - 1].size - subs[0].offset)::u64;
     }
 
-    # gather base types + per-subprogram metadata (name, decl file/line, return type),
-    # building the `.debug_str` table as names / type spellings resolve.
+    # variable capacity: an upper bound is the total MIR dbg-var count over the
+    # subprogram functions (dedup / skips only reduce it).
+    var var_cap: u32 = 0;
+    var vc: u32 = 0;
+    for (vc < nsub) {
+        val omf: O.Option[*mir.MirFunction] = find_mir_func(mirmod, subs[vc].name);
+        if (O.is_some[*mir.MirFunction](omf)) { var_cap = var_cap + O.unwrap[*mir.MirFunction](omf).dbg_var_count; }
+        vc = vc + 1;
+    }
+    if (var_cap == 0) { var_cap = 1; }
+    val rv: R.Result[*DwVar, str] = A.allocate[DwVar](s.alloc, var_cap::usize);
+    if (R.is_err[*DwVar, str](rv)) { A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize); ret R.err[bool, str](R.unwrap_err[*DwVar, str](rv)); }
+    val vars: *DwVar = R.unwrap_ok[*DwVar, str](rv);
+
+    # gather base types + per-subprogram metadata + variables, building the
+    # `.debug_str` table as names / type spellings resolve.
     val rb: R.Result[*BaseType, str] = A.allocate[BaseType](s.alloc, MAX_BASE_TYPES::usize);
-    if (R.is_err[*BaseType, str](rb)) { A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize); ret R.err[bool, str](R.unwrap_err[*BaseType, str](rb)); }
+    if (R.is_err[*BaseType, str](rb)) { A.deallocate[DwVar](s.alloc, vars, var_cap::usize); A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize); ret R.err[bool, str](R.unwrap_err[*BaseType, str](rb)); }
     val bts: *BaseType = R.unwrap_ok[*BaseType, str](rb);
     var strtab: StrTab;
     strtab.buf = enc.buf_init(s.alloc);
-    val nbt: u32 = gather_subprograms(s, irmod, subs, nsub, rows, row_count, text_sec, ?ft, address_size, bts, ?strtab);
+    var nbt: u32 = 0;
+    var var_count: u32 = 0;
+    gather_subprograms(s, tgt, irmod, mirmod, subs, nsub, rows, row_count, text_sec, ?ft, address_size, bts, ?nbt, ?strtab, vars, ?var_count, var_cap);
 
     # per-function set_address field offsets, filled by build_line.
     val ra: R.Result[*u32, str] = A.allocate[u32](s.alloc, nfuncs::usize);
     if (R.is_err[*u32, str](ra)) {
-        enc.buf_dnit(?strtab.buf); A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+        enc.buf_dnit(?strtab.buf); A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
         A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
         ret R.err[bool, str](R.unwrap_err[*u32, str](ra));
     }
     val addr_off: *u32 = R.unwrap_ok[*u32, str](ra);
 
     # the `.debug_info` reloc list: 2 CU + 2 per subprogram (name strp, low_pc addr) +
-    # 1 per base type (name strp).
-    val reloc_cap: u32 = 2 + 2 * nsub + nbt;
+    # 1 per base type (name strp) + 1 per variable (name strp).
+    val reloc_cap: u32 = 2 + 2 * nsub + nbt + var_count;
     val rr2: R.Result[*InfoReloc, str] = A.allocate[InfoReloc](s.alloc, reloc_cap::usize);
     if (R.is_err[*InfoReloc, str](rr2)) {
         A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); enc.buf_dnit(?strtab.buf);
-        A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+        A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
         A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
         ret R.err[bool, str](R.unwrap_err[*InfoReloc, str](rr2));
     }
@@ -1024,7 +1294,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, ima
     var low_off:  u32 = 0;
     var stmt_off: u32 = 0;
     build_info(?b_info, address_size, producer, name, comp_dir, high_pc, frame_base_reg(tgt),
-               subs, nsub, bts, nbt, info_relocs, ?info_reloc_count, ?low_off, ?stmt_off);
+               subs, nsub, bts, nbt, vars, info_relocs, ?info_reloc_count, ?low_off, ?stmt_off);
 
     val pr: R.Result[bool, str] = install(s, image, itn, funcs, nfuncs, cu_low_name,
                                           ?b_abbrev, ?b_line, ?b_info, ?strtab.buf, addr_off, low_off, stmt_off,
@@ -1037,6 +1307,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, ima
     A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
     A.deallocate[u32](s.alloc, addr_off, nfuncs::usize);
     A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+    A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
     A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize);
     A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
     ret pr;
@@ -1057,10 +1328,10 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, ima
 # bts:          out - the base-type array (cap MAX_BASE_TYPES)
 # strtab:       out - the `.debug_str` string table
 # ret:          the number of base types gathered
-fun gather_subprograms(s: *session.Session, irmod: *ir.Module, funcs: *DwFunc, nfuncs: u32,
-                       rows: *enc.LineRow, row_count: u32, text_sec: u32, ft: *FileTable,
-                       address_size: u8, bts: *BaseType, strtab: *StrTab) u32 {
-    var nbt: u32 = 0;
+fun gather_subprograms(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, mirmod: *mir.MirModule,
+                       funcs: *DwFunc, nfuncs: u32, rows: *enc.LineRow, row_count: u32, text_sec: u32,
+                       ft: *FileTable, address_size: u8, bts: *BaseType, nbt: *u32, strtab: *StrTab,
+                       vars: *DwVar, var_count: *u32, var_cap: u32) {
     var i: u32 = 0;
     for (i < nfuncs) {
         val fn: *DwFunc = ?funcs[i];
@@ -1068,12 +1339,15 @@ fun gather_subprograms(s: *session.Session, irmod: *ir.Module, funcs: *DwFunc, n
         fn.decl_line = 0;
         fn.disp      = intern.STR_NIL;
         fn.ret_bt    = -1;
+        fn.var_start = @var_count;
+        fn.var_count = 0;
 
-        # look up the IR function for its source name and semantic return type.
+        # look up the IR function for its source name, return type, and dbg vars.
         var ret_sem: semtype.TypeId = semtype.TYPE_NIL;
+        var irfn: *ir.Function = nil;
         val opt_idx: O.Option[u32] = ir.function_lookup(irmod, fn.name);
         if (O.is_some[u32](opt_idx)) {
-            val irfn: *ir.Function = ?irmod.functions[O.unwrap[u32](opt_idx)];
+            irfn = ?irmod.functions[O.unwrap[u32](opt_idx)];
             fn.disp = irfn.disp;
             ret_sem = irfn.ret_sem;
         }
@@ -1095,12 +1369,95 @@ fun gather_subprograms(s: *session.Session, irmod: *ir.Module, funcs: *DwFunc, n
         # return base type, deduplicated by spelling.
         val obt: O.Option[BaseType] = sem_base_type(s, ret_sem, address_size);
         if (O.is_some[BaseType](obt)) {
-            var bt: BaseType = O.unwrap[BaseType](obt);
-            fn.ret_bt = bt_intern(bts, ?nbt, strtab, bt);
+            fn.ret_bt = bt_intern(bts, nbt, strtab, O.unwrap[BaseType](obt));
+        }
+
+        # variables + parameters: join the MIR dbg-var table with the IR identity.
+        if (irfn != nil) {
+            gather_vars(s, tgt, irfn, mirmod, fn.name, address_size, bts, nbt, strtab, vars, var_count, var_cap);
+            fn.var_count = @var_count - fn.var_start;
         }
         i = i + 1;
     }
-    ret nbt;
+}
+
+# gather one function's DWARF variables: for each MIR dbg-var (iid -> vreg), join the
+# IR identity (name / semantic type / param flag), resolve the vreg to a location,
+# and append a DwVar. Deduplicates by source name (one single-location DIE per
+# variable, the first birth) and skips a variable whose type is not a primitive.
+# ---
+# s/tgt:        session + target
+# irfn:         the IR function (dbg-var / dbg-expr side tables)
+# mirmod:       the MIR module (variable homes)
+# name:         the function's symbol name (finds the MIR function)
+# address_size: pointer width, for a raw-pointer base type
+# bts/nbt:      the base-type table
+# vars/var_count/var_cap: the shared variable array
+fun gather_vars(s: *session.Session, tgt: *target.Target, irfn: *ir.Function, mirmod: *mir.MirModule,
+                name: intern.StrId, address_size: u8, bts: *BaseType, nbt: *u32, strtab: *StrTab,
+                vars: *DwVar, var_count: *u32, var_cap: u32) {
+    val omf: O.Option[*mir.MirFunction] = find_mir_func(mirmod, name);
+    if (O.is_none[*mir.MirFunction](omf)) { ret; }
+    val mfn: *mir.MirFunction = O.unwrap[*mir.MirFunction](omf);
+    val start: u32 = @var_count;
+
+    var i: u32 = 0;
+    for (i < mfn.dbg_var_count) {
+        if (@var_count >= var_cap) { ret; }
+        val mdv: *mir.MirDbgVar = ?mfn.dbg_vars[i];
+        val odv: O.Option[*ir.DbgVar] = ir.dbg_var_get(irfn, mdv.iid::id.InstructionId);
+        if (O.is_none[*ir.DbgVar](odv)) { i = i + 1; cnt; }
+        val dv: *ir.DbgVar = O.unwrap[*ir.DbgVar](odv);
+        if (dv.name == intern.STR_NIL) { i = i + 1; cnt; }
+
+        # only primitive-typed variables get a DIE in this increment.
+        val obt: O.Option[BaseType] = sem_base_type(s, dv.ty_sem, address_size);
+        if (O.is_none[BaseType](obt)) { i = i + 1; cnt; }
+        val bt: i32 = bt_intern(bts, nbt, strtab, O.unwrap[BaseType](obt));
+        if (bt < 0) { i = i + 1; cnt; }
+
+        val nm: str = resolve(?s.interner, dv.name);
+        val name_off: u32 = str_off(strtab, nm);
+
+        # this binding's raw home.
+        var kind: u8 = VLOC_NONE;
+        var reg:  i32 = 0;
+        var off:  i64 = 0;
+        resolve_home(tgt, mfn, mdv.vreg, ?kind, ?reg, ?off);
+        val net: i64 = dbg_expr_net(irfn, mdv.iid::id.InstructionId);
+
+        # a variable may have several bindings (decl + reassignments). the
+        # single-location tier emits DW_AT_location only when every non-optimized-out
+        # binding agrees on one home; a disagreement marks the variable conflicted and
+        # drops its location (deferred to #1705's loclists). an optimized-out binding
+        # (VLOC_NONE) does not constrain a stationary home.
+        var found: i32 = -1;
+        var j: u32 = start;
+        for (j < @var_count) { if (vars[j].name_off == name_off) { found = j::i32; } j = j + 1; }
+
+        if (found < 0) {
+            if (@var_count >= var_cap) { i = i + 1; cnt; }
+            vars[@var_count].name_off = name_off;
+            vars[@var_count].bt       = bt;
+            vars[@var_count].is_param = dv.is_param;
+            vars[@var_count].loc_kind = kind;
+            vars[@var_count].reg      = reg;
+            vars[@var_count].offset   = off;
+            vars[@var_count].net      = net;
+            vars[@var_count].conflict = false;
+            @var_count = @var_count + 1;
+        } or {
+            val e: *DwVar = ?vars[found::u32];
+            if (!e.conflict && kind != VLOC_NONE) {
+                if (e.loc_kind == VLOC_NONE) {
+                    e.loc_kind = kind; e.reg = reg; e.offset = off; e.net = net;
+                } or (!home_eq(e, kind, reg, off, net)) {
+                    e.conflict = true; e.loc_kind = VLOC_NONE;
+                }
+            }
+        }
+        i = i + 1;
+    }
 }
 
 # find or append a base type by spelling, returning its index. Resolves the type's
@@ -1286,25 +1643,30 @@ test "mach.lang.be.codegen.dwarf.uleb_sleb:canonical" {
     ret code;
 }
 
-# build_abbrev emits the exact four-abbrev table (compile-unit with children, base
-# type, and the with-type / void subprogram shapes), byte for byte.
+# build_abbrev emits the exact eight-abbrev table (compile-unit, base type, the two
+# subprogram shapes, and the located / no-location variable + parameter shapes), byte
+# for byte.
 test "mach.lang.be.codegen.dwarf.build_abbrev:golden" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var b: enc.ByteBuf = enc.buf_init(?alloc);
     build_abbrev(?b);
-    # CU(children=yes) | base_type | subprogram(+type) | subprogram(void) | null.
-    var e: [71]u8;
+    var e: [111]u8;
     e[0]=0x01; e[1]=0x11; e[2]=0x01; e[3]=0x25; e[4]=0x08; e[5]=0x03; e[6]=0x08; e[7]=0x1B;
     e[8]=0x08; e[9]=0x13; e[10]=0x05; e[11]=0x11; e[12]=0x01; e[13]=0x12; e[14]=0x07; e[15]=0x10;
     e[16]=0x17; e[17]=0x00; e[18]=0x00; e[19]=0x02; e[20]=0x24; e[21]=0x00; e[22]=0x03; e[23]=0x0E;
     e[24]=0x3E; e[25]=0x0B; e[26]=0x0B; e[27]=0x0B; e[28]=0x00; e[29]=0x00; e[30]=0x03; e[31]=0x2E;
-    e[32]=0x00; e[33]=0x03; e[34]=0x0E; e[35]=0x11; e[36]=0x01; e[37]=0x12; e[38]=0x07; e[39]=0x3F;
+    e[32]=0x01; e[33]=0x03; e[34]=0x0E; e[35]=0x11; e[36]=0x01; e[37]=0x12; e[38]=0x07; e[39]=0x3F;
     e[40]=0x0C; e[41]=0x3A; e[42]=0x0F; e[43]=0x3B; e[44]=0x0F; e[45]=0x40; e[46]=0x18; e[47]=0x49;
-    e[48]=0x13; e[49]=0x00; e[50]=0x00; e[51]=0x04; e[52]=0x2E; e[53]=0x00; e[54]=0x03; e[55]=0x0E;
+    e[48]=0x13; e[49]=0x00; e[50]=0x00; e[51]=0x04; e[52]=0x2E; e[53]=0x01; e[54]=0x03; e[55]=0x0E;
     e[56]=0x11; e[57]=0x01; e[58]=0x12; e[59]=0x07; e[60]=0x3F; e[61]=0x0C; e[62]=0x3A; e[63]=0x0F;
-    e[64]=0x3B; e[65]=0x0F; e[66]=0x40; e[67]=0x18; e[68]=0x00; e[69]=0x00; e[70]=0x00;
-    val ok: bool = buf_eq(?b, ?e[0], 71);
+    e[64]=0x3B; e[65]=0x0F; e[66]=0x40; e[67]=0x18; e[68]=0x00; e[69]=0x00; e[70]=0x05; e[71]=0x34;
+    e[72]=0x00; e[73]=0x03; e[74]=0x0E; e[75]=0x49; e[76]=0x13; e[77]=0x02; e[78]=0x18; e[79]=0x00;
+    e[80]=0x00; e[81]=0x06; e[82]=0x34; e[83]=0x00; e[84]=0x03; e[85]=0x0E; e[86]=0x49; e[87]=0x13;
+    e[88]=0x00; e[89]=0x00; e[90]=0x07; e[91]=0x05; e[92]=0x00; e[93]=0x03; e[94]=0x0E; e[95]=0x49;
+    e[96]=0x13; e[97]=0x02; e[98]=0x18; e[99]=0x00; e[100]=0x00; e[101]=0x08; e[102]=0x05; e[103]=0x00;
+    e[104]=0x03; e[105]=0x0E; e[106]=0x49; e[107]=0x13; e[108]=0x00; e[109]=0x00; e[110]=0x00;
+    val ok: bool = buf_eq(?b, ?e[0], 111);
     enc.buf_dnit(?b);
     if (!ok) { ret 1; }
     ret 0;
@@ -1374,5 +1736,59 @@ test "mach.lang.be.codegen.dwarf.emit_frame_base:reg_and_regx" {
     var e2: [3]u8; e2[0] = 0x02; e2[1] = 0x90; e2[2] = 0x28;
     if (!buf_eq(?c, ?e2[0], 3)) { code = 1; }
     enc.buf_dnit(?c);
+    ret code;
+}
+
+# emit_var_location encodes a register home, a frame slot, and a salvaged register
+# value (register + constant marked DW_OP_stack_value).
+test "mach.lang.be.codegen.dwarf.emit_var_location:reg_frame_salvage" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    # register 5 (RDI), identity: len 1, DW_OP_reg5 = 0x50 + 5 = 0x55.
+    var vr: DwVar; vr.loc_kind = VLOC_REG; vr.reg = 5; vr.offset = 0; vr.net = 0;
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_var_location(?b, ?vr);
+    var e1: [2]u8; e1[0] = 0x01; e1[1] = 0x55;
+    if (!buf_eq(?b, ?e1[0], 2)) { code = 1; }
+    enc.buf_dnit(?b);
+
+    # frame slot -8, identity: len 2, DW_OP_fbreg (0x91), sleb(-8) = 0x78.
+    var vf: DwVar; vf.loc_kind = VLOC_FRAME; vf.reg = 0; vf.offset = -8; vf.net = 0;
+    var c: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_var_location(?c, ?vf);
+    var e2: [3]u8; e2[0] = 0x02; e2[1] = 0x91; e2[2] = 0x78;
+    if (!buf_eq(?c, ?e2[0], 3)) { code = 1; }
+    enc.buf_dnit(?c);
+
+    # register 5 + 4 (salvaged): len 3, DW_OP_breg5 (0x75), sleb(4) = 0x04, stack_value (0x9F).
+    var vs: DwVar; vs.loc_kind = VLOC_REG; vs.reg = 5; vs.offset = 0; vs.net = 4;
+    var d: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_var_location(?d, ?vs);
+    var e3: [4]u8; e3[0] = 0x03; e3[1] = 0x75; e3[2] = 0x04; e3[3] = 0x9F;
+    if (!buf_eq(?d, ?e3[0], 4)) { code = 1; }
+    enc.buf_dnit(?d);
+    ret code;
+}
+
+# home_eq is the agreement predicate the single-location tier uses: two bindings name
+# the same home only when kind and the kind-relevant fields (register or offset) plus
+# the salvage net all match. A mismatch is what drops a re-homed variable's location.
+test "mach.lang.be.codegen.dwarf.home_eq:agreement" {
+    var code: i32 = 0;
+    var v: DwVar; v.loc_kind = VLOC_REG; v.reg = 5; v.offset = 0; v.net = 0;
+    # same register + net: agrees.
+    if (!home_eq(?v, VLOC_REG, 5, 0, 0)) { code = 1; }
+    # different register: the re-home case, must disagree (-> no DW_AT_location).
+    if (home_eq(?v, VLOC_REG, 6, 0, 0))  { code = 1; }
+    # register vs frame: disagree.
+    if (home_eq(?v, VLOC_FRAME, 0, -8, 0)) { code = 1; }
+    # same register, different net: disagree.
+    if (home_eq(?v, VLOC_REG, 5, 0, 4))  { code = 1; }
+    # frame home agreement is by offset.
+    var f: DwVar; f.loc_kind = VLOC_FRAME; f.reg = 0; f.offset = -16; f.net = 0;
+    if (!home_eq(?f, VLOC_FRAME, 0, -16, 0)) { code = 1; }
+    if (home_eq(?f, VLOC_FRAME, 0, -24, 0))  { code = 1; }
     ret code;
 }
