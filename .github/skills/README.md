@@ -9,15 +9,15 @@ for **writing Mach programs**, not for working on the compiler.
 
 | Skill | Purpose | Triggers when |
 |---|---|---|
-| [writing-mach](writing-mach/SKILL.md) | Core language: project/module structure, `use`/`fwd`, the shadow-module pattern, every declaration form, the type grammar, literals, operators, statements, expressions, docstrings, and the entrypoint / `std.print` idioms. | Writing, editing, or reviewing any `.mach` source. The default entry point. |
-| [mach-comptime](mach-comptime/SKILL.md) | The comptime channel (`$`): `$mach.*` reads, backtick codegen decorators, the closed intrinsic set, `$if`/`$or` control flow, and `$name: T` comptime parameters. | Code touches `$` — conditional compilation, target/build queries, decorators, intrinsics, or comptime params. |
-| [mach-lowlevel](mach-lowlevel/SKILL.md) | Inline assembly (`asm <isa> { ... }` with `{name}` substitution, multi-arch dispatch, inferred operands/clobbers) and when to write `asm` versus call the standard library. | Writing/reviewing inline `asm`, syscalls, or other target-specific code. |
+| [writing-mach](writing-mach/SKILL.md) | Core language: project/module structure, `use`/`fwd`, the shadow-module pattern, every declaration form (including `test`), variadic packs, the type grammar and the `^` secret qualifier, literals, operators and casts, statements, docstrings, and the entrypoint / `std.print` idioms. | Writing, editing, or reviewing any `.mach` source. The default entry point. |
+| [mach-comptime](mach-comptime/SKILL.md) | The comptime channel (`$`): `$mach.*`/`$project.*`/`$bin.*` reads, `#[...]` decorators, the closed intrinsic set (`$size_of`, `$type_of`, `$fields`, `$error`, …), `$if`/`$or` conditional compilation, `$each` unrolls, and `$name: T` comptime parameters. | Code touches `$` or `#[...]` — conditional compilation, target/build queries, decorators, intrinsics, packs, or comptime params. |
+| [mach-lowlevel](mach-lowlevel/SKILL.md) | Inline assembly (`asm <isa> { ... }` for x86_64/aarch64/riscv64 with `{name}` substitution and inferred operands/clobbers), multi-arch dispatch, module target guards, and when to write `asm` versus call the standard library. | Writing/reviewing inline `asm`, syscalls, or other target-specific code. |
 
-Scope is partitioned: core language lives in **writing-mach**, the `$` channel in
-**mach-comptime**, and `asm` in **mach-lowlevel**. writing-mach carries a
-one-paragraph summary of the `$` channel and defers the rest to mach-comptime;
-the low-level skill restates a few core gotchas as reminders and points back to
-writing-mach for the full rules.
+Scope is partitioned: core language lives in **writing-mach**, the `$` channel
+and decorators in **mach-comptime**, and `asm` in **mach-lowlevel**.
+writing-mach carries a one-paragraph summary of the `$` channel and defers the
+rest to mach-comptime; the low-level skill restates a few core gotchas as
+reminders and points back to the others for the full rules.
 
 ## Adopting these skills
 
@@ -36,5 +36,5 @@ language reference disagree, the reference wins and the skill is the bug.
 The skills are the fast path, not the contract. The complete, per-feature
 language reference — grammar, semantics, and implementation status — lives in
 the Mach repository under
-[`doc/language/`](https://github.com/briar-systems/mach/tree/dev/doc/language). Each
-skill points there for exhaustive detail.
+[`doc/language/`](https://github.com/briar-systems/mach/tree/dev/doc/language).
+Each skill points there for exhaustive detail.

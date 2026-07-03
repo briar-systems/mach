@@ -1,365 +1,355 @@
 ---
 name: writing-mach
-description: Use when writing, editing, or reviewing Mach (.mach) source files. Covers project/module structure, use/fwd imports and re-exports, the shadow-module pattern, all declaration forms (pub/ext, def, rec, uni, fun, ext fun, val/var), the type grammar (primitives, SIMD vectors, pointers, arrays, function types), literals, operators, statements (if/or, for, ret, brk/cnt, fin, blocks), expressions, docstring conventions, and the executable entrypoint and std.print output idioms.
+description: Use when writing, editing, or reviewing Mach (.mach) source files. Covers project/module structure, use/fwd imports and re-exports, the shadow-module pattern, all declaration forms (pub/ext, def, rec, uni, fun, ext fun, val/var, test), #[...] decorators, variadic packs, the type grammar (primitives, pointers, arrays, function types, the ^ secret qualifier), literals, operators and casts, statements (if/or, for, ret, brk/cnt, fin, blocks), docstring conventions, and the entrypoint / std.print idioms.
 ---
 
 # Writing Mach
 
-Mach is a low-level, explicitly-typed language. No type inference, no garbage
-collection, no hidden control flow. Files use the `.mach` extension. This skill
-is the fast path for authoring correct Mach; the language reference (see the
-Reference section) is the exhaustive source of truth.
+Mach is a low-level, explicitly-typed language: no type inference, no garbage
+collection, no hidden control flow. Files use `.mach`. This skill is the fast
+path for authoring correct Mach; `doc/language/` in the Mach repository is the
+authoritative reference and wins on any disagreement.
 
 ## Hard rules — get these right
 
 - **No type inference.** Every binding declares its type. `val x = 42;` is an
   error; write `val x: i64 = 42;`.
-- **No compiler-known type aliases.** `bool`, `usize`, `str`, etc. are *stdlib*
-  `def`s, not built-ins. The compiler ships only `ptr`, `va_list`, and the
-  numeric/SIMD family. Import the alias from stdlib before using it. `bool` is
-  `def bool: u8;`; `true`/`false` are stdlib `val`s (`1`/`0`). Comparison and
-  logical operators produce `u8`.
-- **Strings are `*u8`.** `"hello"` produces a `*u8` pointing at null-terminated
-  bytes. There is no fat-pointer string type — `std.types.string.str` is itself
-  `def str: *char;` (a null-terminated pointer, not length-aware). The
-  length-aware view is the stdlib record `std.types.string.StrView`
-  (`{ data: *char; len: usize; }`). Backtick `` ` `` has no role: the lexer
-  treats it as an unexpected character (a lex error) — never emit it.
-- **`fwd` is bare and always public.** No `pub fwd`. `ext fun` is the *only*
-  body-less function form — there are no forward declarations of regular
-  functions.
-- **No tagged unions, no `match`.** Discriminated values are a `rec` carrying a
-  discriminator plus a payload `uni`; consumers branch with `if`/`or`.
-- **`$or` has no condition for the else arm.** There is no `$or $if`. Comptime
-  control is `$if (C) {}` / `$or (C) {}` / `$or {}`.
+- **No compiler-known type aliases.** `bool`, `usize`, `str`, `char` are stdlib
+  `def`s, not built-ins. Import them before use (`use std.types.bool.bool;`).
+  `true`/`false` are stdlib `val`s (`1`/`0`); comparisons and logical operators
+  produce `u8`.
+- **Decorators are `#[...]` attributes** on the line(s) above a declaration:
+  `#[symbol("main")]`, `#[inline]`, `#[align(64)]`. The backtick form was
+  removed in v2.4.0 and is a migration error — never emit backticks.
+- **Variadics are comptime packs.** A trailing `va: ...` parameter, consumed by
+  `$each a in va`. There is no `va_list`/`va_start`/`va_arg` and the C-style
+  bare `...` parameter is a removed-syntax error.
+- **Strings are `*u8`, single-line.** `"hello"` is a pointer to null-terminated
+  bytes. No fat-pointer string type (`str` is `def str: *char;`); no multi-line
+  string literal — use `\n` escapes.
+- **No tagged unions, no `match`.** A discriminated value is a `rec` carrying a
+  discriminator plus a payload `uni`; consumers branch with `if`/`or`. This is
+  exactly how stdlib `Result[T, E]` is built.
+- **No compound assignment.** `+=` etc. do not exist; write `x = x + 1;`.
+- **`fwd` is bare and always public** (no `pub fwd`). `ext fun` is the only
+  body-less function form.
 
-## File and module structure
+## Project and module structure
 
-A project has a `mach.toml` at its root whose `[project] id` is the root of
-every module path. A file at `src/foo/bar.mach` in a project with `id = "myproj"`
-is the module `myproj.foo.bar`. Path separator is `.`. There is **no `this.`
-self-prefix** — always reference modules by full project-rooted path.
+A project has a `mach.toml` at its root; `[project] id` roots every module
+path. A file at `src/foo/bar.mach` in project `id = "myproj"` is the module
+`myproj.foo.bar`. There is no `this.` self-prefix — always use the full
+project-rooted path, including for sibling modules. A one-segment `use <id>;`
+resolves only when that project declares a `[project] module` surface file
+(e.g. a library `glfw` imported as `use glfw;`); `std` does not — always
+import full `std.*` paths.
 
-Entrypoints by convention: `lib.mach` (library, no executable), `main.mach`
-(executable). The dominant role is set by the target's `mode` / `entrypoint` in
-`mach.toml`.
+A file reads top-down: module docstring, `use`/`fwd` lines, declarations.
 
-A file begins with a module docstring (see Docstrings), then `use`/`fwd` lines,
-then declarations.
+### `use` — private import
 
-## Executable entrypoint
+```mach
+use std.types.size;             # binds module `size`; use as size.usize
+use sz: std.types.size;         # module under alias; use as sz.usize
+use std.types.size.usize;       # binds the symbol; use bare as usize
+```
 
-The standard library provides the platform `_start` symbol that calls your
-`main`. Pull it in with `use std.runtime;`, tag `main` with the `` `symbol` ``
-decorator so the linker finds it, and return an exit code:
+The resolver binds whatever the path ends at: a **module** (members reached
+qualified) or a **symbol** (used bare). Importing a module does not pull its
+members in unqualified. No splat, no `use foo.{a,b}` — one name per line. A
+module `use`s every dependency it directly names, even ones reachable through
+a re-export: the dependency graph is visible at the top of every file.
+
+### `fwd` — public re-export
+
+```mach
+fwd impl.Point;                 # re-export as Point
+fwd Pt: impl.Point;             # re-export as Pt
+fwd impl.helpers;               # a module path re-exports the whole module
+```
+
+Mirrors `use` grammar; always publishes.
+
+### Shadow-module pattern
+
+A surface file `foo.mach` co-exists with directory `foo/` holding split
+implementations. The surface `use`s each split and `fwd`s its public symbols;
+consumers `use myproj.foo;` and never name the splits. Topical splits forward
+everything unconditionally; multiplatform splits pick one impl per target:
+
+```mach
+$if ($mach.build.os == $mach.os.linux) {
+    use impl: myproj.os.linux;
+}
+$or ($mach.build.os == $mach.os.windows) {
+    use impl: myproj.os.windows;
+}
+$or {
+    $error("myproj.os: unsupported target");
+}
+
+fwd impl.page_size;
+```
+
+## Entrypoint and output
+
+The stdlib provides the platform `_start`, which calls whatever function
+exports the linker symbol `main`. `use std.runtime;` is required to link it in
+even though nothing references it by name:
 
 ```mach
 use std.runtime;
+use std.print;
 
-`symbol("main")`
+#[symbol("main")]
 fun main(argc: i64, argv: **u8) i64 {
+    print.println("hello, mach");
     ret 0;
 }
 ```
 
-`use std.runtime;` is what links the entrypoint into the binary.
-
-## Output — `std.print`
-
-There is no built-in `print`. Use the standard library, which returns a
-`Result` (output can fail):
-
-```mach
-use std.print;
-
-fun greet() {
-    print.println("hello, mach");
-}
-```
-
-`use std.print;` binds the leaf name `print` (the module), so members are
-reached qualified as `print.<member>` — `std` is not itself in scope, so
-`std.print.println(...)` would not resolve. The `print` module exposes
-`print` / `println` (stdout), `eprint` / `eprintln` (stderr), and formatting
-variants. Each returns `Result[usize, str]` — bytes written, or an error.
-
-## `use` — private import
+`use std.print;` binds the leaf module `print` (`std` itself is not in scope).
+It exposes `print`/`println` (stdout), `eprint`/`eprintln` (stderr), and the
+format family `printf`/`printlnf`/`eprintf`/`eprintlnf` — pack-variadic, with
+`{}` holes filled in argument order plus `{:x}`-style specs (`{:X}`, `{:c}`,
+`{:5}`, `{:<5}`, `{:08x}`; `{{`/`}}` for literal braces). All return
+`Result[usize, str]`.
 
 ```mach
-use std.types.size;        # binds module `size`; use as `size.usize`
-use sz: std.types.size;    # module under alias `sz`; use as `sz.usize`
-use std.types.size.usize;  # binds the symbol; use bare as `usize`
+print.printlnf("built {} in {}ms", name, elapsed);
 ```
-
-The resolver binds whatever the path ends at: a **module** (access members
-qualified, `module.member`) or a **symbol** (used bare). Importing a module
-does **not** pull its members in unqualified — to use `usize` bare, import the
-symbol, not the module. **No splat, no combined forms** (`use foo.*` and
-`use foo.{a,b}` do not exist). One name per line. A module must `use` every
-dependency it directly names — even ones reached through a re-export. The
-dependency graph is visible at the top of every file.
-
-## `fwd` — public re-export
-
-```mach
-fwd impl.Point;        # re-export as `Point`
-fwd Pt: impl.Point;    # re-export as `Pt`
-```
-
-Mirrors `use` grammar; always publishes; no `pub` modifier. One per line, no
-splat.
-
-## Shadow-module pattern
-
-A surface file `foo.mach` co-exists with a directory `foo/`. The surface owns
-the public face; the directory holds split implementations. The surface `use`s
-each split and `fwd`s its public symbols, flattening them into the `foo`
-namespace. Consumers `use myproj.foo;` and reach `foo.X` without naming splits.
-
-```mach
-use myproj.foo.data;
-use myproj.foo.ops;
-
-fwd data.Point;
-fwd ops.add;
-```
-
-- **Topical split** — forward all impls unconditionally.
-- **Multiplatform split** — pick one impl per target with `$if` on
-  `$mach.build.os` / `$mach.build.arch`, then `use` + `fwd` the chosen one.
 
 ## Declarations
 
-Modifiers: `pub` (public surface) and `ext` (C-ABI, functions only, no body).
-Without `pub`, a declaration is file-private. `pub` applies to `fun`, `rec`,
-`uni`, `def`, `val`, `var`, `ext fun`.
+Modifiers: `pub` (public surface; without it a declaration is file-private)
+and `ext` (C-ABI external, functions only). Both apply to `fun`, `rec`, `uni`,
+`def`, `val`, `var`.
 
 ### `def` — type alias
 
 ```mach
-pub def Age:    i64;
-pub def BinOp:  fun(i64, i64) i64;
-pub def Anon:   rec { x: i64; y: i64; };
-pub def Choice: uni { a: i64; b: f64; };
+pub def Age:   i64;
+pub def BinOp: fun(i64, i64) i64;
 ```
 
-Aliases name any type; alias and underlying type are interchangeable (no
-nominal distinction).
+Aliases name any type; alias and underlying type are interchangeable.
 
-### `rec` — record / `uni` — raw union
+### `rec` / `uni`
 
 ```mach
 pub rec Point { x: i64; y: i64; }
-pub rec Pair[T, U] { left: T; right: U; }   # generic
+pub rec Pair[T, U] { left: T; right: U; }      # generic
 
-pub uni Number { i: i64; f: f64; }
-pub uni Maybe[T] { some: T; none: u8; }     # generic
+pub uni Number { i: i64; f: f64; }              # fields overlap; size of largest
 ```
 
-A `rec` lays fields out with padding; a `uni` overlaps all fields in one slot
-(size of largest field). The compiler does not track which `uni` field is live.
-
-Discriminated value (the only sum-type idiom) — this is exactly how the stdlib
-`Result[T, E]` is built:
+The compiler does not track which `uni` field is live. The sum-type idiom
+(stdlib `Result[T, E]` verbatim):
 
 ```mach
-rec Result[T, E] {
+pub rec Result[T, E] {
     tag:   bool;
-    value: uni { ok: T; err: E; }
+    value: uni { ok: T; err: E; };
 }
 ```
 
-Read the discriminator, then access the matching payload field with `if`/`or`.
+Packed layout is not available; `#[align(N)]` raises a type's or global's
+alignment.
 
-### `fun` — function
-
-```mach
-fun NAME(args) RET { ... }        # with return type
-fun NAME(args) { ... }            # no return
-fun NAME[T](args) RET { ... }     # generic type params (no constraints)
-fun NAME($p: T, args) RET { ... } # comptime value param
-fun NAME(a, b, ...) RET { ... }   # variadic (trailing ...)
-```
+### `fun`
 
 ```mach
 pub fun add(a: i64, b: i64) i64 { ret a + b; }
-pub fun identity[T](value: T) T { ret value; }
+pub fun identity[T](value: T) T { ret value; }  # generic; call: identity[i64](42)
+pub fun load($order: u8, p: *i64) i64 { ... }   # comptime value param
+pub fun sum(va: ...) i64 {                      # variadic pack
+    var t: i64 = 0;
+    $each a in va { t = t + a; }
+    ret t;
+}
 ```
 
-- Generic type params in `[T]` brackets — **types only, no constraints**;
-  compiler monomorphizes per instantiation. Call sites supply types:
-  `identity[i64](42)`.
-- Comptime value params use `$name: T` *in the regular paren list*; the caller
-  passes a comptime-evaluable value (enforced at the call site, passed
-  positionally like a runtime arg). This form is **function parameters only** —
-  never record fields.
-- Variadic via trailing `...`; access through `va_list` / `va_start` /
-  `va_arg[T]` / `va_end` (C convention). The `va_list` builtin type and the
-  `va_*` intrinsics are compiler-seeded — typed in sema and lowered to
-  dedicated IR opcodes against the SysV register-save area. The limitation is
-  ABI completeness at the edges (e.g. passing/fetching large by-value
-  aggregates as variadic arguments); scalar and pointer varargs work.
+- Generic params `[T]` take types only, no constraints; monomorphized per
+  instantiation; call sites always supply the types explicitly.
+- `$name: T` params must receive a comptime-evaluable argument; the body
+  branches on them with `$if`, monomorphized per distinct value. Referenced
+  bare (`order`, not `$order`) inside the body. See the **mach-comptime**
+  skill for the full rules.
+- A pack (`va: ...`) must be the last parameter. `va.len` folds to the element
+  count; `g(va...)` forwards the whole pack to another pack-tailed function.
+  Pack functions are source-level only — no stable ABI symbol, so no `ext` and
+  no function pointer to one.
 
-### `ext fun` — external function
+### `ext fun`
 
 ```mach
-`symbol("write")`                          # optional linker-name override
+#[symbol("write")]
 pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ```
 
-Body-less, ends in `;`. C ABI is the contract; arg/return types must be C-
-representable. The only body-less function form.
+Body-less, ends in `;`, C ABI is the contract. Provide the definition at link
+time (`mach build . -l c`, manifest `libs`, or an explicit `.o`/`.a`/`.so`).
+On PE targets pin imports to their DLL with `#[library("ws2_32.dll")]`.
 
-### `val` / `var` — bindings
-
-```mach
-val pi: f64 = 3.14159;     # immutable, initializer required
-var counter: i64 = 0;      # mutable, explicit init
-var buf: [256]u8;          # mutable, default-initialized (zero)
-```
-
-Work at module top level (`pub val` / `pub var` export) and in function bodies.
-
-## Type grammar
-
-Primitives follow `<u|i|f><width>(x<count>)*`.
-
-- Scalars: `u8 u16 u32 u64`, `i8 i16 i32 i64`, `f32 f64`.
-- Untyped pointer: `ptr`. (`bool` is a stdlib `def` for `u8`, not a built-in.)
-- Variadic cursor: `va_list` — the compiler-seeded register-save struct used
-  with `va_start` / `va_arg[T]` / `va_end` (see Variadics under `fun`).
-- SIMD vectors: append `x<count>` — `f32x4`, `i32x8`, `u8x16`. **Planned, not
-  yet implemented**: vector type names do not resolve as types today. Higher
-  dims (`f32x4x4`) are grammatically legal. Atomic/volatile live outside the
-  type name (no bare-letter modifiers).
-
-Compound:
+### `val` / `var`
 
 ```mach
-*T              # pointer
-[N]T  [N][M]T   # array, nested
-fun(T1, T2) R   # function-pointer type
+val pi: f64 = 3.14159;          # immutable; initializer required
+var counter: i64 = 0;
+var buf: [256]u8;               # default-initialized to zero
 ```
 
+Work at module top level (`pub` exports) and in function bodies.
+
+### `test`
+
+Tests are declarations, inline next to the code they cover, in any module:
+
 ```mach
-var x: i64 = 9;
-var p: *i64 = ?x;     # address-of yields *i64
-val v: i64  = @p;     # dereference
-val a: [4]i64 = [4]i64{1, 2, 3, 4};
-def BinOp: fun(i64, i64) i64;
+test "point: add is commutative" {
+    if (add(1, 2) != add(2, 1)) { ret 1; }
+    ret 0;
+}
 ```
+
+The label is a required string literal; convention is `"topic: behavior"`.
+The body checks like an `i32` function: `ret 0` (or falling off the end)
+passes, any non-zero return fails. There are no assertion builtins — return
+early on a failed check. `mach test` collects every test in the project
+(dependencies excluded unless `--include-deps`), builds one executable per
+test, and reports per-module; `--filter <pattern>` narrows, `--list`
+enumerates.
+
+## Types
+
+Compiler-seeded primitives (the complete set): `u8 u16 u32 u64`,
+`i8 i16 i32 i64`, `f32 f64`, and the untyped pointer `ptr`. SIMD vector names
+(`f32x4` …) are a planned design and **do not resolve as types yet**.
+
+```mach
+*T                  # pointer          ?x address-of, @p dereference
+[N]T  [N][M]T       # array            val a: [4]i64 = [4]i64{1, 2, 3, 4};
+fun(T1, T2) R       # function pointer val op: BinOp = add;  op(2, 3)
+^T                  # secret-qualified (see below)
+```
+
+Pointers index like arrays: `p[i]` reads the i-th element (this is how `str`
+is walked). A `fun(...)` type may carry a trailing `...` for FFI only.
+
+### `^` — the secret qualifier
+
+`^T` marks data as secret for the constant-time discipline. Secrets may move
+and be stored but may never reach an observable position: a branch or loop
+condition, the left operand of `&&`/`||`, a memory index, or a `/`/`%`
+operand — each is a compile error. Public flows up to secret implicitly; the
+**only** downgrade is the explicit strip cast `x:^` (or `x:^T`). Any operation
+with a secret operand yields a secret result; `uni` variants must agree on
+secrecy; a secret-welded pointer (`*^T`) cannot be erased to `ptr`. See
+`doc/language/secrecy.md` before touching crypto code.
 
 ## Literals
 
 | Form | Example | Notes |
 |---|---|---|
-| Decimal / hex / bin / octal | `42` `0xDEAD` `0b1010` `0o755` | untyped |
-| Underscores / scientific | `1_000_000` `1.5e10` | untyped |
-| Typed suffix | `7i64` `255u8` `2.5f64` | typed by suffix |
-| Char | `'M'` | `u8` |
-| String | `"hi\n"` | `*u8`, null-terminated |
-| `nil` | `nil` | null-address literal; coerces to any pointer type |
+| Int (dec/hex/bin/oct) | `42` `0xDEAD` `0b1010` `0o755` `1_000_000` | untyped until context |
+| Typed suffix | `7i64` `255u8` `2.5f64` | use when context doesn't constrain |
+| Float | `1.5` `1.5e10` | `.` must be followed by a digit |
+| Char | `'M'` | `u8`; escapes `\n \t \r \\ \' \0 \xHH` |
+| String | `"hi\n"` | `*u8`, null-terminated, single-line; adds `\"` |
+| `nil` | `nil` | null address; coerces to any pointer **or function** type |
 
-Untyped numeric literals are *checked* against the surrounding declared type;
-they do not infer it. If context does not constrain the type, use a suffix
-(`42i64`). `nil` types as `*u8` with no context and coerces to any pointer;
-relate function pointers to `nil` via `==` / `!=`, not assignment. Char escapes:
-`\n \t \r \\ \' \0 \xHH`. String escapes: same plus `\"`. A string literal may
-span multiple lines — the lexer scans to the next unescaped `"`, so a raw
-newline inside the quotes is part of the literal.
+Untyped literals are *checked* against the declared type, never used to infer
+it. `nil` with no context types as `*u8`; `var cb: fun(u32) = nil;` is legal.
 
-## Operators
+## Operators and casts
 
-- Arithmetic: `+ - * / %` — int/float scalars (and lane-wise on planned SIMD
-  vectors).
-- Bitwise: `& | ^ ~ << >>` — integer scalars (and planned integer vectors).
-- Comparison: `== != < > <= >=` → `u8` (`1`/`0`). A pointer may be compared
-  against `nil`.
-- Logical: `&& || !` — short-circuiting; `u8` operands (`0` false, nonzero
-  true) → `u8`.
-- Unary: `-` negate, `~` bitwise NOT, `!` logical NOT.
-- Pointer: `?expr` address-of, `@ptr` dereference (also `@p = x;` to write).
-- Cast: `expr::Type` value conversion (width/sign/pointer, int↔float by value) and `expr:~Type` bit reinterpret (read the exact bits as an equal-size type).
+- Arithmetic `+ - * / %` (ints and floats; `%` truncated remainder, sign of
+  the dividend, floats included). Bitwise `& | ^ ~ << >>` (ints).
+- Comparison `== != < > <= >=` → `u8`. Mixed int signedness/width compares
+  **mathematical values** (a negative `i64` < any `u64`). Int vs float
+  comparison is a compile error — cast explicitly.
+- Logical `&& || !` — short-circuit, `u8` operands and result.
+- Pointer: `?expr` address-of, `@p` dereference (`@p = x;` writes through).
+- Casts (postfix): `expr::T` value conversion (resize, int↔float);
+  `expr:~T` bit reinterpret (same byte size required); `expr:^` strips the
+  secret qualifier (the only one that can).
+- Assignment `=` is an expression form used in statement position;
+  right-associative, lowest precedence.
 
-Precedence follows C-family conventions. There is no compound assignment
-(`+=`, `-=`, … do not exist).
+Precedence is C-family: `* / %` > `+ -` > `<< >>` > relational > equality >
+`&` > `^` > `|` > `&&` > `||` > `=`. Note bitwise binds looser than
+comparison, as in C — parenthesize `(a & b) != 0`.
 
 ## Statements
 
-End with `;` except when ending in a block `{...}`. There is no
-brace-less single-statement body.
+Statements end with `;` unless they end with a block. Bodies are always
+blocks — there is no brace-less form.
 
 ```mach
 if (cond) { ... } or (cond) { ... } or { ... }   # `or {}` is the catch-all
-for (cond) { ... }                                # single condition-loop; no for-each
-ret expr;  ret;                                   # value / void return
-brk;  cnt;                                         # break / continue enclosing for
-fin stmt;   fin { ... }                            # defer to scope exit, reverse order
-{ ... }                                            # bare block = new lexical scope
+for (cond) { ... }                               # condition loop
+for { ... }                                      # no condition: infinite loop
+ret expr;   ret;                                 # value / void return
+brk;   cnt;                                      # break / continue enclosing for
+fin { ... }                                      # run at scope exit, reverse order
+{ ... }                                          # bare block = new scope
 ```
 
-`fin` schedules cleanup that runs when the enclosing scope exits, in reverse
-declaration order. It takes a single statement or a block — no bare-expression
-form.
+`fin` requires a block — `fin stmt;` is rejected. There is no for-each; loop a
+counter or a pointer cursor. `$if`/`$or` (comptime) and `$each` (comptime
+unroll) also appear in statement position — see the **mach-comptime** skill.
 
-## Expressions
+## Stdlib idioms
+
+- `Result[T, E]` with `ok`/`err` constructors and `is_ok`/`is_err`/
+  `unwrap_ok`/`unwrap_err`; `Option[T]` with `some`/`none`/`is_some`/`unwrap`.
+  Generic arguments are always explicit at call sites:
 
 ```mach
-counter                              # name in scope
-core.add                             # module-qualified
-Point{ x: 1, y: 2 }                  # record literal
-[3]i64{10, 20, 30}                   # array literal
-Number{ i: 99 }                      # union literal
-Pair[i64, u8]{ left: 5, right: 6u8 } # generic literal: type args before body
-p.x   a[0]                           # field / index access
-add(2, 3)   identity[i64](42)        # call / generic call
+val r: Result[usize, str] = parse(s);
+if (is_err[usize, str](r)) { ret r; }
+val n: usize = unwrap_ok[usize, str](r);
 ```
 
-Vector literals (`f32x4{ ... }`) follow the same shape but depend on the SIMD
-vector types, which are not yet implemented.
+- `str` is `*char` (null-terminated); `std.types.string` provides `str_len`,
+  comparison, and `StrView { data, len }` for length-aware slices.
+- Naming: `snake_case` functions/bindings, `PascalCase` types,
+  `SCREAMING_SNAKE` constants. Indent 4 spaces; align `:` columns in field
+  blocks, import groups, and consecutive `val`/`var` runs when it aids
+  scanning.
 
 ## Docstrings
 
-`#` comments immediately above a declaration. Summary line, optional `# ---`
-separator, then one component line per exposed element. Prose is lowercase
-except proper nouns and type names.
+`#` comments immediately above a declaration: a lowercase summary line, then —
+only when there are elements to document — a `# ---` separator and one aligned
+component line per parameter/field/return:
 
 ```mach
-# realtime: read the wall-clock time.
+# read the wall-clock time.
 # ---
 # out: pointer to Timespec to populate
 # ret: 0 on success, negative errno on failure
 pub fun realtime(out: *Timespec) i64 { ... }
 ```
 
-Component identifiers: parameter name, `$name` (comptime param), `[T]` (generic
-param), `ret` (return), field name, variant name. Summary-only docstrings omit
-the separator and component block:
+Component identifiers: parameter name, `$name`, `[T]`, `ret`, field name,
+variant name. Summary-only docstrings omit the separator. Every file opens
+with a module docstring (summary, optional paragraphs separated by blank `#`
+lines) before any `use`/`fwd`/decorator. Decorators sit between the docstring
+and the declaration. Document every `pub` entity.
 
-```mach
-# spin_hint: yield the CPU to other threads.
-pub fun spin_hint() { ... }
-```
+## Comptime channel — brief
 
-A module file opens with a module docstring (full dotted path as `<name>`)
-before any `use`/`fwd`/attribute. Modules may add paragraphs separated by blank
-`#` lines; other declaration kinds do not extend past the component block.
-Backtick decorators follow the docstring, immediately above the decl.
-
-## Comptime channel (`$`) — brief
-
-`$mach.*` reads compiler-provided state; per-declaration backtick decorators
-`` `name(args)` `` attach codegen attributes to the following decl. Closed
-decorator set: `` `symbol` `` `` `library` `` `` `inline` `` `` `align` `` `` `section` ``. Comptime control:
-`$if (C) {} $or (C) {} $or {}` — only the taken branch compiles. Value
-intrinsics `$size_of(T) $align_of(T) $offset_of(T, f)` yield comptime unsigned
-integers; `$error("msg")` / `$assert(C, "msg")` are diagnostics. The full
-comptime/asm grammar is out of scope here — see the **mach-comptime** skill.
+`$` is the compiler-owned comptime channel: `$mach.*`/`$project.*`/`$bin.*`
+reads, the closed intrinsic set (`$size_of`, `$type_of`, `$fields`, `$error`,
+…), `$if`/`$or` conditional compilation, and `$each` unrolls. `#[...]`
+decorators (`symbol`, `library`, `inline`, `align`, `section`) are a separate
+closed set. Full rules: the **mach-comptime** skill. Inline `asm`: the
+**mach-lowlevel** skill.
 
 ## Reference
 
-The authoritative per-feature language reference lives in the Mach repository
-under
+The authoritative per-feature reference lives in the Mach repository under
 [`doc/language/`](https://github.com/briar-systems/mach/tree/dev/doc/language),
-including the EBNF in `grammar.md`. When a skill and the reference disagree, the
-reference wins.
+including the full EBNF in `grammar.md`. When this skill and the reference
+disagree, the reference wins.
