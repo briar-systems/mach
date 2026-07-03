@@ -10,14 +10,22 @@
 # stages; a post-pipeline verification failure is an internal compiler error
 # (a pass bug), surfaced as the returned err.
 
+use std.allocator.page;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.string.str;
 
+use A: std.allocator;
 use R: std.types.result;
 
+use mach.lang.intern;
 use mach.lang.me.ir;
+use mach.lang.me.ir.builder;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
 use mach.lang.me.ir.verify;
 use mach.lang.me.pass.algebraic;
 use mach.lang.me.pass.constfold;
@@ -25,6 +33,7 @@ use mach.lang.me.pass.cse;
 use mach.lang.me.pass.dce;
 use mach.lang.me.pass.inline;
 use mach.lang.me.pass.mem2reg;
+use mach.lang.source;
 use mach.lang.target;
 
 # optimisation level selecting the pipeline's stage sequence
@@ -190,4 +199,76 @@ fun run_verify(m: *ir.Module, full: bool, repr: bool) R.Result[bool, str] {
     val msg: str = verify.describe(report.violations[0].check);
     verify.dnit_report(?report);
     ret R.err[bool, str](msg);
+}
+
+# an instruction's source location survives the always-on pipeline: mem2reg
+# promotes an alloca (rewriting a use of the surviving add) and constfold folds a
+# constant into its other operand, yet the add keeps the loc it lowered with. This
+# is the debug-info invariant the shared Rewrite map exists to guarantee -- RAUW
+# rewrites operands, never the loc a surviving instruction carries.
+test "mach.lang.me.pipeline.loc:survives_mem2reg_constfold_dce" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val res_i64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](res_i64)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_i64);
+
+    val res_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](res_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val res_blk: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_blk)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_blk));
+
+    val p0: value.Value = value.param(0, i64t);
+
+    # a promotable local: alloca + store(p0) + load. mem2reg removes all three and
+    # rewrites the load's uses to p0.
+    val res_slot: R.Result[value.Value, str] = builder.emit_alloca(?bld, i64t, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](res_slot)) { ir.dnit(?m); ret 1; }
+    val slot: value.Value = R.unwrap_ok[value.Value, str](res_slot);
+    if (R.is_err[bool, str](builder.emit_store(?bld, p0, slot))) { ir.dnit(?m); ret 1; }
+    val res_load: R.Result[value.Value, str] = builder.emit_load(?bld, slot, i64t);
+    if (R.is_err[value.Value, str](res_load)) { ir.dnit(?m); ret 1; }
+    val x: value.Value = R.unwrap_ok[value.Value, str](res_load);
+
+    # a constant expression constfold collapses to 5, then propagates into the add.
+    val res_k: R.Result[value.Value, str] = builder.emit_add(?bld, value.const_int(2, i64t), value.const_int(3, i64t));
+    if (R.is_err[value.Value, str](res_k)) { ir.dnit(?m); ret 1; }
+    val k: value.Value = R.unwrap_ok[value.Value, str](res_k);
+
+    # the surviving instruction, stamped with a distinctive location.
+    builder.set_loc(?bld, source.loc(9, 500));
+    val res_s: R.Result[value.Value, str] = builder.emit_add(?bld, x, k);
+    if (R.is_err[value.Value, str](res_s)) { ir.dnit(?m); ret 1; }
+    val s: value.Value = R.unwrap_ok[value.Value, str](res_s);
+    val s_id: id.InstructionId = s.data.instr;
+
+    if (R.is_err[bool, str](builder.emit_ret(?bld, s))) { ir.dnit(?m); ret 1; }
+
+    if (R.is_err[bool, str](mem2reg.run(?m)))   { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](constfold.run(?m))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](dce.run(?m)))       { ir.dnit(?m); ret 1; }
+
+    # the add survived with its opcode and its exact source location.
+    val surviving: *instruction.Instruction = ?fn.instrs[s_id::u32];
+    if (surviving.kind != instruction.OP_ADD)   { ir.dnit(?m); ret 1; }
+    if (surviving.loc.file != 9)                { ir.dnit(?m); ret 1; }
+    if (surviving.loc.offset != 500)            { ir.dnit(?m); ret 1; }
+
+    # and the passes really ran: operand 0 was promoted to p0, operand 1 folded to 5.
+    if (surviving.operands[0].kind != value.VAL_PARAM)     { ir.dnit(?m); ret 1; }
+    if (surviving.operands[0].data.param_ix != 0)          { ir.dnit(?m); ret 1; }
+    if (surviving.operands[1].kind != value.VAL_CONST_INT) { ir.dnit(?m); ret 1; }
+    if (surviving.operands[1].data.int_lit != 5)           { ir.dnit(?m); ret 1; }
+
+    ir.dnit(?m);
+    ret 0;
 }

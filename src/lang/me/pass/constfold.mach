@@ -53,6 +53,7 @@ use mach.lang.me.ir;
 use mach.lang.me.ir.builder;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.mutate;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 
@@ -76,10 +77,10 @@ pub fun run(m: *ir.Module) R.Result[bool, str] {
 
 # folds one function to a local fixpoint, then propagates and simplifies branches.
 #
-# A per-instruction substitution table maps a folded instruction id to the
-# constant Value it produces; has_sub marks the live entries. Folding repeats
-# until no new instruction folds, then the substitutions are applied to every
-# operand and constant-condition branches are simplified.
+# The shared rewrite map records each folded instruction id -> the constant Value
+# it produces. Folding repeats until no new instruction folds, then the recorded
+# replacements are applied to every operand and constant-condition branches are
+# simplified.
 # ---
 # m:   module owning the function and the allocator
 # fn:  function to fold in place
@@ -88,93 +89,45 @@ fun fold_function(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
     val ilen: u32 = fn.instr_len;
     if (ilen == 0) { ret R.ok[bool, str](true); }
 
-    val res_subst: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, ilen::usize);
-    if (R.is_err[*value.Value, str](res_subst)) {
-        ret R.err[bool, str](R.unwrap_err[*value.Value, str](res_subst));
-    }
-    val subst: *value.Value = R.unwrap_ok[*value.Value, str](res_subst);
+    var rw: mutate.Rewrite;
+    val res_init: R.Result[bool, str] = mutate.rewrite_init(?rw, m.alloc, ilen);
+    if (R.is_err[bool, str](res_init)) { ret res_init; }
 
-    val res_has_sub: R.Result[*bool, str] = A.allocate[bool](m.alloc, ilen::usize);
-    if (R.is_err[*bool, str](res_has_sub)) {
-        A.deallocate[value.Value](m.alloc, subst, ilen::usize);
-        ret R.err[bool, str](R.unwrap_err[*bool, str](res_has_sub));
-    }
-    val has_sub: *bool = R.unwrap_ok[*bool, str](res_has_sub);
+    fold_to_fixpoint(m, fn, ?rw);
+    mutate.rewrite_apply(fn, ?rw);
+    val res_branches: R.Result[bool, str] = simplify_branches(m, fn, ?rw);
 
-    var i: u32 = 0;
-    for (i < ilen) {
-        has_sub[i] = false;
-        i = i + 1;
-    }
-
-    fold_to_fixpoint(m, fn, subst, has_sub, ilen);
-    apply_substitutions(fn, subst, has_sub, ilen);
-    val res_branches: R.Result[bool, str] = simplify_branches(m, fn, subst, has_sub, ilen);
-
-    A.deallocate[value.Value](m.alloc, subst, ilen::usize);
-    A.deallocate[bool](m.alloc, has_sub, ilen::usize);
+    mutate.rewrite_dnit(?rw, m.alloc);
     ret res_branches;
 }
 
 # sweeps the instruction pool, folding every instruction whose operands resolve
 # to constants, until a sweep folds nothing.
 #
-# Each fold records its result in subst/has_sub. Because operands are resolved
-# through the table, folding one instruction exposes any later op that consumed
-# it, so a chain like `(2 + 3) * 4` collapses across successive sweeps.
+# Each fold records its result in the rewrite map. Because operands are resolved
+# through the map, folding one instruction exposes any later op that consumed it,
+# so a chain like `(2 + 3) * 4` collapses across successive sweeps.
 # ---
-# m:       module owning the function
-# fn:      function whose instructions are folded
-# subst:   per-instruction substitution table, indexed by instruction id
-# has_sub: per-instruction flag marking a live substitution
-# ilen:    length of subst/has_sub and the instruction pool
-fun fold_to_fixpoint(m: *ir.Module, fn: *ir.Function,
-                     subst: *value.Value, has_sub: *bool, ilen: u32) {
+# m:  module owning the function
+# fn: function whose instructions are folded
+# rw: shared rewrite map each fold is recorded into
+fun fold_to_fixpoint(m: *ir.Module, fn: *ir.Function, rw: *mutate.Rewrite) {
     var changed: bool = true;
     for (changed) {
         changed = false;
         var i: u32 = 0;
-        for (i < ilen) {
-            if (has_sub[i] == false) {
+        for (i < rw.len) {
+            if (mutate.rewrite_has(rw, i) == false) {
                 val inst: *instruction.Instruction = ?fn.instrs[i];
                 var out: value.Value;
-                if (try_fold(m, inst, i, subst, has_sub, ilen, ?out)) {
-                    subst[i]   = out;
-                    has_sub[i] = true;
-                    changed    = true;
+                if (try_fold(m, inst, i, rw, ?out)) {
+                    mutate.replace_value(rw, i, out);
+                    changed = true;
                 }
             }
             i = i + 1;
         }
     }
-}
-
-# resolves an operand through the substitution table, following chains.
-#
-# A VAL_INSTR naming a folded instruction becomes that instruction's folded
-# value, followed again when that value itself names a folded instruction (so a
-# phi of a folded value collapses to the underlying constant in one resolve). The
-# operand's own carried type is preserved, so a fold feeding a differently-typed
-# slot keeps the slot's type. The hop count is bounded by ilen as a guard; the
-# table is acyclic in practice.
-# ---
-# v:       operand value to resolve
-# subst:   substitution table
-# has_sub: live-substitution flags
-# ilen:    table length and hop bound
-# ret:     the resolved value, carrying v's original type
-fun resolve(v: value.Value, subst: *value.Value, has_sub: *bool, ilen: u32) value.Value {
-    var cur:  value.Value = v;
-    var hops: u32         = 0;
-    for (cur.kind == value.VAL_INSTR && hops <= ilen) {
-        val iid: u32 = cur.data.instr::u32;
-        if (iid >= ilen || has_sub[iid] == false) {
-            ret value.retype(cur, v.ty);
-        }
-        cur  = subst[iid];
-        hops = hops + 1;
-    }
-    ret value.retype(cur, v.ty);
 }
 
 # attempts to fold one instruction to a constant value.
@@ -186,26 +139,24 @@ fun resolve(v: value.Value, subst: *value.Value, has_sub: *bool, ilen: u32) valu
 # m:       module owning the function
 # inst:    instruction to fold
 # self_id: inst's own id, used to ignore a phi's self-references
-# subst:   substitution table
-# has_sub: live-substitution flags
-# ilen:    table length
+# rw:      shared rewrite map operands are resolved through
 # out:     receives the folded value on success
 # ret:     true when a fold was produced
 fun try_fold(m: *ir.Module, inst: *instruction.Instruction, self_id: u32,
-             subst: *value.Value, has_sub: *bool, ilen: u32, out: *value.Value) bool {
+             rw: *mutate.Rewrite, out: *value.Value) bool {
     val k: instruction.InstrKind = inst.kind;
 
     # phi: collapse to the single value all its incomings resolve to.
     if (k == instruction.OP_PHI) {
-        ret fold_phi(inst, self_id, subst, has_sub, ilen, out);
+        ret fold_phi(inst, self_id, rw, out);
     }
 
     # binary ops [lhs, rhs]. the int and float arithmetic / comparison opcodes
     # overlap (one compare opcode rides both an int and a float compare), so the
     # int vs float path is chosen by the resolved operand kind, not the opcode.
     if ((is_int_binary(k) || is_float_binary(k)) && inst.operand_count == 2) {
-        val a: value.Value = resolve(inst.operands[0], subst, has_sub, ilen);
-        val b: value.Value = resolve(inst.operands[1], subst, has_sub, ilen);
+        val a: value.Value = mutate.rewrite_resolve(rw, inst.operands[0]);
+        val b: value.Value = mutate.rewrite_resolve(rw, inst.operands[1]);
         if (a.kind == value.VAL_CONST_INT && b.kind == value.VAL_CONST_INT && is_int_binary(k)) {
             ret fold_int_binary(m, k, a, b, inst.ty, out);
         }
@@ -217,7 +168,7 @@ fun try_fold(m: *ir.Module, inst: *instruction.Instruction, self_id: u32,
 
     # unary integer negation / not [operand].
     if ((k == instruction.OP_NEG || k == instruction.OP_NOT) && inst.operand_count == 1) {
-        val a: value.Value = resolve(inst.operands[0], subst, has_sub, ilen);
+        val a: value.Value = mutate.rewrite_resolve(rw, inst.operands[0]);
         if (a.kind == value.VAL_CONST_INT) {
             val bits: u32 = int_bits(m, inst.ty);
             if (bits == 0) { ret false; }
@@ -237,7 +188,7 @@ fun try_fold(m: *ir.Module, inst: *instruction.Instruction, self_id: u32,
 
     # integer width conversions [operand].
     if ((k == instruction.OP_TRUNC || k == instruction.OP_SEXT || k == instruction.OP_ZEXT) && inst.operand_count == 1) {
-        val a: value.Value = resolve(inst.operands[0], subst, has_sub, ilen);
+        val a: value.Value = mutate.rewrite_resolve(rw, inst.operands[0]);
         if (a.kind != value.VAL_CONST_INT) { ret false; }
         val src_bits: u32 = int_bits(m, a.ty);
         val dst_bits: u32 = int_bits(m, inst.ty);
@@ -264,18 +215,16 @@ fun try_fold(m: *ir.Module, inst: *instruction.Instruction, self_id: u32,
 # ---
 # inst:    the OP_PHI instruction
 # self_id: the phi's own id, whose self-referencing incomings are ignored
-# subst:   substitution table
-# has_sub: live-substitution flags
-# ilen:    table length
+# rw:      shared rewrite map incomings are resolved through
 # out:     receives the collapsed value on success
 # ret:     true when the phi collapsed to a single value
 fun fold_phi(inst: *instruction.Instruction, self_id: u32,
-             subst: *value.Value, has_sub: *bool, ilen: u32, out: *value.Value) bool {
+             rw: *mutate.Rewrite, out: *value.Value) bool {
     var have:   bool = false;
     var common: value.Value;
     var i: u32 = 1;                     # odd slots carry the incoming values
     for (i < inst.operand_count) {
-        val v: value.Value = resolve(inst.operands[i], subst, has_sub, ilen);
+        val v: value.Value = mutate.rewrite_resolve(rw, inst.operands[i]);
         val is_self: bool  = v.kind == value.VAL_INSTR && v.data.instr::u32 == self_id;
         if (is_self == false) {
             if (have == false) {
@@ -604,30 +553,6 @@ fun is_f64(m: *ir.Module, tid: type.IrTypeId) bool {
     ret t.data.bits == 64;
 }
 
-# rewrites every operand naming a folded instruction to its folded value,
-# following substitution chains so a fully resolved constant reaches each use.
-#
-# Operands that are not VAL_INSTR (constants, params, globals, branch-target
-# encodings) pass through unchanged, so branch targets riding as const_ints are
-# left intact.
-# ---
-# fn:      function whose operands are rewritten
-# subst:   substitution table
-# has_sub: live-substitution flags
-# ilen:    table length
-fun apply_substitutions(fn: *ir.Function, subst: *value.Value, has_sub: *bool, ilen: u32) {
-    var i: u32 = 0;
-    for (i < fn.instr_len) {
-        val inst: *instruction.Instruction = ?fn.instrs[i];
-        var ii: u32 = 0;
-        for (ii < inst.operand_count) {
-            inst.operands[ii] = resolve(inst.operands[ii], subst, has_sub, ilen);
-            ii = ii + 1;
-        }
-        i = i + 1;
-    }
-}
-
 # simplifies every OP_CBR whose condition folded to a constant into an OP_BR to
 # the statically-taken target.
 #
@@ -635,14 +560,11 @@ fun apply_substitutions(fn: *ir.Function, subst: *value.Value, has_sub: *bool, i
 # edge no longer exists are pruned, so the CFG stays consistent for dce's
 # reachability sweep and the verifier.
 # ---
-# m:       module owning the function
-# fn:      function to simplify in place
-# subst:   substitution table
-# has_sub: live-substitution flags
-# ilen:    table length
-# ret:     ok(true) on success, or the first allocation error from preds_rebuild
-fun simplify_branches(m: *ir.Module, fn: *ir.Function,
-                      subst: *value.Value, has_sub: *bool, ilen: u32) R.Result[bool, str] {
+# m:   module owning the function
+# fn:  function to simplify in place
+# rw:  shared rewrite map the folded condition is resolved through
+# ret: ok(true) on success, or the first allocation error from preds_rebuild
+fun simplify_branches(m: *ir.Module, fn: *ir.Function, rw: *mutate.Rewrite) R.Result[bool, str] {
     var rewrote: bool = false;
     var i: u32 = 0;
     for (i < fn.block_count) {
@@ -652,7 +574,7 @@ fun simplify_branches(m: *ir.Module, fn: *ir.Function,
             if (O.is_some[*instruction.Instruction](opt_term)) {
                 val term: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_term);
                 if (term.kind == instruction.OP_CBR && term.operand_count == 3) {
-                    val cond: value.Value = resolve(term.operands[0], subst, has_sub, ilen);
+                    val cond: value.Value = mutate.rewrite_resolve(rw, term.operands[0]);
                     if (cond.kind == value.VAL_CONST_INT) {
                         # operand 1 is the then-target, operand 2 the else-target.
                         var taken: value.Value = term.operands[2];
@@ -848,8 +770,10 @@ test "mach.lang.me.pass.constfold.try_fold:int_conversions" {
     if (R.is_err[type.IrTypeId, str](res_i64)) { ret 1; }
     val i64ty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
 
-    var dummy_subst: value.Value;
-    var dummy_has_sub: bool = false;
+    # an empty rewrite map: the folded operands are constants, so resolution is a
+    # no-op and try_fold exercises only the conversion folding.
+    var rw: mutate.Rewrite;
+    if (R.is_err[bool, str](mutate.rewrite_init(?rw, ?alloc, 1))) { ret 1; }
     var out: value.Value;
 
     # sext(0xFF:i8)->i64 = 0xFFFFFFFFFFFFFFFF (sign bit set in 8-bit)
@@ -862,9 +786,9 @@ test "mach.lang.me.pass.constfold.try_fold:int_conversions" {
     sext_inst.operand_cap   = 1;
     sext_inst.flags         = 0;
     sext_inst.aux_ty        = type.IRT_NIL;
-    if (try_fold(?m, ?sext_inst, 0, ?dummy_subst, ?dummy_has_sub, 0, ?out) == false) { ret 1; }
-    if (out.kind != value.VAL_CONST_INT)                                             { ret 1; }
-    if (out.data.int_lit != 0xFFFFFFFFFFFFFFFF)                                      { ret 1; }
+    if (try_fold(?m, ?sext_inst, 0, ?rw, ?out) == false) { ret 1; }
+    if (out.kind != value.VAL_CONST_INT)                 { ret 1; }
+    if (out.data.int_lit != 0xFFFFFFFFFFFFFFFF)          { ret 1; }
 
     # zext(0xFF:i8)->i64 = 0xFF (zero-extends, no sign fill)
     var zext_inst: instruction.Instruction;
@@ -875,8 +799,8 @@ test "mach.lang.me.pass.constfold.try_fold:int_conversions" {
     zext_inst.operand_cap   = 1;
     zext_inst.flags         = 0;
     zext_inst.aux_ty        = type.IRT_NIL;
-    if (try_fold(?m, ?zext_inst, 0, ?dummy_subst, ?dummy_has_sub, 0, ?out) == false) { ret 1; }
-    if (out.data.int_lit != 0xFF)                                                    { ret 1; }
+    if (try_fold(?m, ?zext_inst, 0, ?rw, ?out) == false) { ret 1; }
+    if (out.data.int_lit != 0xFF)                        { ret 1; }
 
     # trunc(0x1FF:i64)->i8 = 0xFF (low 8 bits)
     var trunc_op: value.Value = value.const_int(0x1FF, i64ty);
@@ -888,8 +812,10 @@ test "mach.lang.me.pass.constfold.try_fold:int_conversions" {
     trunc_inst.operand_cap   = 1;
     trunc_inst.flags         = 0;
     trunc_inst.aux_ty        = type.IRT_NIL;
-    if (try_fold(?m, ?trunc_inst, 0, ?dummy_subst, ?dummy_has_sub, 0, ?out) == false) { ret 1; }
-    if (out.data.int_lit != 0xFF)                                                     { ret 1; }
+    if (try_fold(?m, ?trunc_inst, 0, ?rw, ?out) == false) { ret 1; }
+    if (out.data.int_lit != 0xFF)                         { ret 1; }
+
+    mutate.rewrite_dnit(?rw, ?alloc);
     ret 0;
 }
 
@@ -966,8 +892,9 @@ test "mach.lang.me.pass.constfold.fold_phi:collapse_and_distinct" {
     if (R.is_err[type.IrTypeId, str](res_ty)) { ret 1; }
     val ty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_ty);
 
-    var subst: value.Value;        # never dereferenced: no VAL_INSTR incomings
-    var has_sub: bool = false;
+    # an empty rewrite map: the incomings are constants, never resolved through it.
+    var rw: mutate.Rewrite;
+    if (R.is_err[bool, str](mutate.rewrite_init(?rw, ?alloc, 1))) { ret 1; }
     var out: value.Value;
 
     # single incoming 7 -> collapses to 7.
@@ -976,8 +903,8 @@ test "mach.lang.me.pass.constfold.fold_phi:collapse_and_distinct" {
     var ops1: [2]value.Value;
     var phi1: instruction.Instruction;
     build_const_phi(?phi1, ?ops1[0], ?v1[0], 1, ty);
-    if (fold_phi(?phi1, 0xFFFFFFFF, ?subst, ?has_sub, 1, ?out) == false) { ret 1; }
-    if (out.kind != value.VAL_CONST_INT || out.data.int_lit != 7)        { ret 1; }
+    if (fold_phi(?phi1, 0xFFFFFFFF, ?rw, ?out) == false)         { ret 1; }
+    if (out.kind != value.VAL_CONST_INT || out.data.int_lit != 7) { ret 1; }
 
     # two identical incomings (9, 9) -> collapses to 9.
     var v2: [2]value.Value;
@@ -986,12 +913,14 @@ test "mach.lang.me.pass.constfold.fold_phi:collapse_and_distinct" {
     var ops2: [4]value.Value;
     var phi2: instruction.Instruction;
     build_const_phi(?phi2, ?ops2[0], ?v2[0], 2, ty);
-    if (fold_phi(?phi2, 0xFFFFFFFF, ?subst, ?has_sub, 1, ?out) == false) { ret 1; }
-    if (out.data.int_lit != 9)                                           { ret 1; }
+    if (fold_phi(?phi2, 0xFFFFFFFF, ?rw, ?out) == false) { ret 1; }
+    if (out.data.int_lit != 9)                           { ret 1; }
 
     # distinct incomings (9, 5) -> not folded.
     v2[1] = value.const_int(5, ty);
     build_const_phi(?phi2, ?ops2[0], ?v2[0], 2, ty);
-    if (fold_phi(?phi2, 0xFFFFFFFF, ?subst, ?has_sub, 1, ?out)) { ret 1; }
+    if (fold_phi(?phi2, 0xFFFFFFFF, ?rw, ?out)) { ret 1; }
+
+    mutate.rewrite_dnit(?rw, ?alloc);
     ret 0;
 }

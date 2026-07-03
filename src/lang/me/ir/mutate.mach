@@ -1,0 +1,278 @@
+# post-construction IR mutation primitives.
+#
+# `builder.mach` creates IR; this module transforms it after the fact. The two are
+# distinct lifecycle surfaces, so the shared mutation API the optimization passes
+# consume lives here rather than on the construction cursor.
+#
+# Three primitives, each the single place its kind of mutation happens so that
+# source-location (and, with debug info, OP_DBG_VALUE) maintenance is an invariant
+# of the primitive instead of a concern re-solved in every pass:
+#
+#   - value replacement (RAUW): a batched `Rewrite` map for the passes that record
+#     many substitutions then apply once (cse, algebraic, constfold, mem2reg), plus
+#     `replace_uses` for a single immediate replacement (inline).
+#   - erasure: `erase_instruction`, the one point an instruction leaves a block.
+#   - cloning: `clone_instruction`, a faithful per-instruction copy.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use R: std.types.result;
+
+use mach.lang.me.ir;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.value;
+
+# a batched value-replacement map (RAUW) over one function's instruction pool
+#
+# Records that an instruction's result is superseded by another Value, indexed by
+# instruction id, then rewrites every operand naming a replaced instruction to its
+# replacement in a single transitive pass. This is the one shared substitution
+# facility the value-optimization passes (cse, algebraic, constfold, mem2reg) build
+# on instead of each carrying a private copy.
+#
+# The map is acyclic: a replacement never (transitively) names the instruction it
+# replaces, so `rewrite_resolve` terminates; the hop bound is a guard only.
+# ---
+# vals: replacement Value per instruction id, meaningful where live[iid] is set
+# live: whether vals[iid] holds a recorded replacement
+# len:  number of instruction slots (the function's instr_len at init)
+pub rec Rewrite {
+    vals: *value.Value;
+    live: *bool;
+    len:  u32;
+}
+
+# allocate and clear a rewrite map sized to `len` instruction slots
+# ---
+# rw:  the map to initialize in place
+# a:   allocator backing both arrays
+# len: number of instruction slots (the function's instr_len)
+# ret: ok(true) on success, or an allocation error
+pub fun rewrite_init(rw: *Rewrite, a: *A.Allocator, len: u32) R.Result[bool, str] {
+    val res_vals: R.Result[*value.Value, str] = A.allocate[value.Value](a, len::usize);
+    if (R.is_err[*value.Value, str](res_vals)) {
+        ret R.err[bool, str](R.unwrap_err[*value.Value, str](res_vals));
+    }
+    val res_live: R.Result[*bool, str] = A.allocate[bool](a, len::usize);
+    if (R.is_err[*bool, str](res_live)) {
+        A.deallocate[value.Value](a, R.unwrap_ok[*value.Value, str](res_vals), len::usize);
+        ret R.err[bool, str](R.unwrap_err[*bool, str](res_live));
+    }
+
+    rw.vals = R.unwrap_ok[*value.Value, str](res_vals);
+    rw.live = R.unwrap_ok[*bool, str](res_live);
+    rw.len  = len;
+
+    var i: u32 = 0;
+    for (i < len) { rw.live[i] = false; i = i + 1; }
+    ret R.ok[bool, str](true);
+}
+
+# free a rewrite map's arrays and zero it
+# ---
+# rw: the map to tear down
+# a:  the allocator the arrays were taken from
+pub fun rewrite_dnit(rw: *Rewrite, a: *A.Allocator) {
+    if (rw.vals != nil && rw.len > 0) { A.deallocate[value.Value](a, rw.vals, rw.len::usize); }
+    if (rw.live != nil && rw.len > 0) { A.deallocate[bool](a, rw.live, rw.len::usize); }
+    rw.vals = nil;
+    rw.live = nil;
+    rw.len  = 0;
+}
+
+# record that instruction `iid`'s result is replaced by value `v` (RAUW)
+#
+# The replacement is not applied to operands until `rewrite_apply`; recording only
+# updates the map, so matching that resolves operands through the map (a pass
+# driving itself to a fixpoint) sees the replacement immediately.
+# ---
+# rw:  the map to record into
+# iid: the instruction whose result is superseded
+# v:   the value its uses resolve to
+pub fun replace_value(rw: *Rewrite, iid: id.InstructionId, v: value.Value) {
+    rw.vals[iid::u32] = v;
+    rw.live[iid::u32] = true;
+}
+
+# whether instruction `iid` has a recorded replacement
+# ---
+# rw:  the map to query
+# iid: the instruction id to test
+# ret: true when a replacement was recorded for iid
+pub fun rewrite_has(rw: *Rewrite, iid: id.InstructionId) bool {
+    val idx: u32 = iid::u32;
+    ret idx < rw.len && rw.live[idx];
+}
+
+# resolve a value through the map, following replacement chains transitively
+#
+# A VAL_INSTR naming a replaced instruction becomes its replacement, followed
+# again if that too was replaced, up to `len` hops (an acyclicity guard). A
+# non-instruction (or unreplaced) value passes through. The result always carries
+# the original value's type, so a replacement flowing into a differently-typed use
+# slot keeps that slot's type (the aggregate-pointer identity mem2reg relies on).
+# ---
+# rw: the map to resolve through
+# v:  the value to resolve
+# ret: the transitive replacement, retyped to v's type
+pub fun rewrite_resolve(rw: *Rewrite, v: value.Value) value.Value {
+    var cur:  value.Value = v;
+    var hops: u32         = 0;
+    for (cur.kind == value.VAL_INSTR && hops <= rw.len) {
+        val iid: u32 = cur.data.instr::u32;
+        if (iid >= rw.len || rw.live[iid] == false) { ret value.retype(cur, v.ty); }
+        cur  = rw.vals[iid];
+        hops = hops + 1;
+    }
+    ret value.retype(cur, v.ty);
+}
+
+# rewrite every operand naming a replaced instruction to its resolved replacement,
+# across every instruction in the function's pool
+#
+# Only VAL_INSTR operands with a live replacement are touched, resolved
+# transitively so a chain of replacements collapses fully. Block-target operands
+# ride in VAL_CONST_INT slots and so are never rewritten.
+# ---
+# fn: the function whose operands are rewritten in place
+# rw: the populated rewrite map to apply
+pub fun rewrite_apply(fn: *ir.Function, rw: *Rewrite) {
+    var i: u32 = 0;
+    for (i < fn.instr_len) {
+        val inst: *instruction.Instruction = ?fn.instrs[i];
+        var ii: u32 = 0;
+        for (ii < inst.operand_count) {
+            val op: value.Value = inst.operands[ii];
+            if (op.kind == value.VAL_INSTR) {
+                val iid: u32 = op.data.instr::u32;
+                if (iid < rw.len && rw.live[iid]) {
+                    inst.operands[ii] = rewrite_resolve(rw, op);
+                }
+            }
+            ii = ii + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# replace every operand of `fn` naming instruction `old_id` with `replacement`,
+# immediately (a single un-batched RAUW)
+#
+# The immediate counterpart to the `Rewrite` map: used where exactly one value is
+# replaced (inlining wires a call result to its return value) and a batched map
+# would be overkill. Block-target operands ride in VAL_CONST_INT slots, so the
+# VAL_INSTR guard already skips them.
+# ---
+# fn:          the function whose operands are rewritten in place
+# old_id:      the value-producing instruction id being replaced
+# replacement: the value to substitute in
+pub fun replace_uses(fn: *ir.Function, old_id: id.InstructionId, replacement: value.Value) {
+    var i: u32 = 0;
+    for (i < fn.instr_len) {
+        val inst: *instruction.Instruction = ?fn.instrs[i];
+        var ii: u32 = 0;
+        for (ii < inst.operand_count) {
+            val op: value.Value = inst.operands[ii];
+            if (op.kind == value.VAL_INSTR && op.data.instr == old_id) {
+                inst.operands[ii] = replacement;
+            }
+            ii = ii + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# erase instruction `iid` from block `blk` -- the one point an instruction leaves
+# a block's lists
+#
+# CONTRACT (load-bearing): every removal of an instruction from a block MUST route
+# through this primitive; no pass may compact a block's instruction or phi list
+# privately. Debug info depends on it -- this is where #1696 salvages the
+# dbg-values of a value about to disappear -- and there is no back-pointer from an
+# instruction to its owning block, so the invariant cannot be asserted
+# mechanically. It is held by convention; #1696's dbg-value tests will expose any
+# pass that bypasses it. The caller passes the block it is already walking rather
+# than have this rediscover it by scanning, keeping erasure O(list) and honoring
+# the IR's block-owns-membership model.
+#
+# The instruction is unlinked from `blk`'s phi and instruction lists; its pool
+# entry remains as a ghost, reclaimed at function teardown. The relative order of
+# the surviving entries is preserved.
+# ---
+# blk: the block to remove iid from (supplied by the walking caller)
+# iid: the instruction id to erase
+pub fun erase_instruction(blk: *ir.Block, iid: id.InstructionId) {
+    var w: u32 = 0;
+    var r: u32 = 0;
+    for (r < blk.instr_count) {
+        if (blk.instructions[r] != iid) {
+            blk.instructions[w] = blk.instructions[r];
+            w = w + 1;
+        }
+        r = r + 1;
+    }
+    blk.instr_count = w;
+
+    w = 0;
+    r = 0;
+    for (r < blk.phi_count) {
+        if (blk.phis[r] != iid) {
+            blk.phis[w] = blk.phis[r];
+            w = w + 1;
+        }
+        r = r + 1;
+    }
+    blk.phi_count = w;
+}
+
+# clone instruction `src` into `dst_fn`'s pool and return the new instruction's id
+#
+# Copies the opcode, result / auxiliary types, modifier flags, source location,
+# and a fresh copy of the operand array. Operand Values are copied verbatim; a
+# caller remapping ids across functions (inlining) rewrites them afterward. loc
+# and the flag word ride along, so a clone is a faithful copy the debug info
+# treats as the same source position.
+# ---
+# m:      module owning the allocator
+# dst_fn: the function whose pool receives the clone
+# src:    the instruction to clone (from any function)
+# ret:    the new instruction's id, or an allocation error
+pub fun clone_instruction(m: *ir.Module, dst_fn: *ir.Function, src: *instruction.Instruction) R.Result[id.InstructionId, str] {
+    var clone: instruction.Instruction;
+    clone.kind          = src.kind;
+    clone.ty            = src.ty;
+    clone.operand_count = src.operand_count;
+    clone.operand_cap   = src.operand_count;   # instruction_add normalizes cap to count
+    clone.flags         = src.flags;
+    clone.aux_ty        = src.aux_ty;
+    clone.loc           = src.loc;
+    clone.operands      = nil;
+    if (src.operand_count > 0) {
+        val res_ops: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, src.operand_count::usize);
+        if (R.is_err[*value.Value, str](res_ops)) {
+            ret R.err[id.InstructionId, str](R.unwrap_err[*value.Value, str](res_ops));
+        }
+        val ops: *value.Value = R.unwrap_ok[*value.Value, str](res_ops);
+        var i: u32 = 0;
+        for (i < src.operand_count) {
+            ops[i] = src.operands[i];
+            i = i + 1;
+        }
+        clone.operands = ops;
+    }
+
+    val res_id: R.Result[id.InstructionId, str] = ir.instruction_add(m, dst_fn, clone);
+    if (R.is_err[id.InstructionId, str](res_id)) {
+        if (clone.operands != nil) {
+            A.deallocate[value.Value](m.alloc, clone.operands, src.operand_count::usize);
+        }
+        ret res_id;
+    }
+    ret res_id;
+}
