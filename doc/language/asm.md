@@ -10,13 +10,14 @@ no `in` / `out` declarations, no clobber list.
 ```mach
 asm <isa> {
     # raw instructions, one per line, # for comments
-    mov rax, [{ptr}]
+    mov rcx, {ptr}
+    mov rax, [rcx]
     mov {result}, rax
 }
 ```
 
 - The ISA tag is mandatory. Bare `asm { ... }` does not exist.
-- The tag comes from a closed set: `x86_64`, `aarch64`, `riscv64`. Each has a working assembler that emits native bytes. `riscv64` is cross-compile-only: its assembler is complete (it emits `ecall` and the rest of the RV64 grammar), but mach-std has no riscv64 runtime yet, so the compiler cannot be built for it.
+- The tag comes from a closed set: `x86_64`, `aarch64`, `riscv64`. Each has a working assembler that emits native bytes; all three run in CI (riscv64 under qemu, including a self-host smoke — riscv64 is a self-hosting target with a byte-identical fixpoint, #1852).
 - Each line is an instruction in the ISA's native syntax.
 - `#` introduces a line comment: everything from `#` to the end of the line is ignored, whatever it contains (`;`, `{}`, `%`, and so on are all inert inside a comment).
 
@@ -24,7 +25,10 @@ asm <isa> {
 
 `{name}` substitutes a local in scope. The compiler resolves the reference
 to a memory or register operand based on liveness and the instruction's
-expected operand class.
+expected operand class. In practice a `{name}` binds the local's storage —
+typically a stack slot — so a pointer local's pointee is reached by staging
+the pointer through a scratch register first (`mov rcx, {ptr}` then
+`mov rax, [rcx]`), never by a direct `[{ptr}]` indirection.
 
 ```mach
 pub fun add_via_asm(a: i64, b: i64) i64 {
