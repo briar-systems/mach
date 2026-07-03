@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - test: `mach test` collects tests from the whole `[project].src` tree instead
   of the entrypoint's import closure, so a `pub` module with no in-tree
   consumer keeps its tests; projects with previously-orphaned modules may
-  collect more tests than before (#1863).
+  collect more tests than before. Target-gated modules (a top-level comptime
+  `$error` guard, or orphan modules depending on one) are excluded with a
+  visible `skipped N target-gated modules` note (#1863, #1873).
 
 ### Added
 
