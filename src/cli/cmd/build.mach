@@ -46,7 +46,6 @@ use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.me.ir;
 use mach.lang.me.ir.printer;
-use mach.lang.me.lower;
 use mach.lang.me.lower.context;
 use mach.lang.me.lower.testrunner;
 use mach.lang.me.pipeline;
@@ -182,47 +181,36 @@ fun compile_modules(p: *driver.Project, level: u8, test_mode: bool, verify_ir: b
     # do not lower or codegen a semantically broken module graph.
     if (diagnostic.has_errors(?p.s.diags)) { ret R.ok[bool, str](true); }
 
-    # lower every module to IR, then optimize, then - in test mode - neutralize
-    # the project `main` (the runner supplies the program entry) before any module
-    # is codegen'd. the `.ir` and `.s` debug artifacts are both rendered in the
-    # codegen pass, from the final post-pipeline IR the object is built from. the
-    # three passes are timed as distinct readout phases; splitting lower from
-    # optimize is purely structural and leaves the produced objects byte-identical.
-    readout.phase_begin(p.s.readout, readout.PH_LOWER);
+    # lower every module to optimized IR through Q_LOWER in topo order - memoized
+    # and incremental across rebuilds on a long-lived session, computed fresh each
+    # CLI build (fresh session, cold cache). run_lower_pass borrows each module's
+    # optimized IR onto its ModuleEntry (owned by the query DB) and records the
+    # readout's `lower` phase internally; the optimization pipeline runs inside the
+    # query, so lower + optimize are one cached unit. the per-module IR arrays below
+    # are shallow VIEWS onto the query-owned modules for the test / codegen passes,
+    # never separately freed (see free_modules).
+    p.opt_level = level;
+    p.verify_ir = verify_ir;
+    val res_lower: R.Result[bool, str] = driver.run_lower_pass(p);
+    if (R.is_err[bool, str](res_lower)) {
+        ret R.err[bool, str](R.unwrap_err[bool, str](res_lower));
+    }
+
     var i: u32 = 0;
     for (i < p.topo_len) {
-        val mid: session.ModuleId   = p.topo[i];
+        val mid: session.ModuleId    = p.topo[i];
         val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
-
-        val t_item: ctime.Time = readout.item_begin(p.s.readout);
-        val res_lower: R.Result[ir.Module, str] = lower.lower_module(p.s, ?p.target, m.a, m.fqn, mid, m.sema_result, m.resolve_result, ?m.ctx);
-        if (R.is_err[ir.Module, str](res_lower)) {
-            ret R.err[bool, str](R.unwrap_err[ir.Module, str](res_lower));
-        }
-        irs[mid::u32]      = R.unwrap_ok[ir.Module, str](res_lower);
+        val irm: *ir.Module          = m.ir_module;
+        irs[mid::u32]      = @irm;
         ir_ready[mid::u32] = true;
-
-        readout.item(p.s.readout, readout.PH_LOWER, fqn_name(p, m.fqn), t_item);
         i = i + 1;
     }
-    readout.phase_end(p.s.readout, readout.PH_LOWER, p.topo_len, "module", "modules");
 
-    readout.phase_begin(p.s.readout, readout.PH_OPTIMIZE);
-    i = 0;
-    for (i < p.topo_len) {
-        val mid: session.ModuleId   = p.topo[i];
-        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
-
-        val t_item: ctime.Time = readout.item_begin(p.s.readout);
-        val res_opt: R.Result[bool, str] = pipeline.run(?irs[mid::u32], ?p.target, level, verify_ir);
-        if (R.is_err[bool, str](res_opt)) {
-            ret R.err[bool, str](R.unwrap_err[bool, str](res_opt));
-        }
-        readout.item(p.s.readout, readout.PH_OPTIMIZE, fqn_name(p, m.fqn), t_item);
-        i = i + 1;
-    }
-    readout.phase_end(p.s.readout, readout.PH_OPTIMIZE, p.topo_len, "module", "modules");
-
+    # in test mode neutralize the project `main` (the runner supplies the program
+    # entry) before any module is codegen'd. this mutates the query-owned IR in
+    # place; safe on the CLI's single-shot session (the cache is torn down after
+    # this build), a latent hazard only for a hypothetical long-lived test-driving
+    # session, tracked as a follow-up (#1618).
     if (test_mode) {
         val res_neutralize: R.Result[bool, str] = testrunner.neutralize_project_main(p.s, irs, p.module_len);
         if (R.is_err[bool, str](res_neutralize)) {
@@ -325,24 +313,21 @@ fun open_asm(p: *driver.Project, ea: *EmitArtifacts, fqn: intern.StrId, file: *f
     ret open_artifact(ea.asm_base, O.unwrap[str](opt_fqn), "s", file, w);
 }
 
-# tear down the per-module IR and object images
+# tear down the per-module object images
 #
-# SemaResults are NOT freed here - they are borrowed from the session query DB
-# (the Q_SEMA handles), which owns and frees them (and reuses them across
-# rebuilds), mirroring resolve results and parsed ASTs.
+# Neither the SemaResults nor the per-module IR are freed here - both are borrowed
+# from the session query DB (the Q_SEMA / Q_LOWER handles), which owns and frees
+# them (and reuses them across rebuilds), mirroring resolve results and parsed
+# ASTs. The `irs` array the CLI fills is a shallow VIEW onto the query-owned IR.
 # ---
 # p:           the project carrying the module count
-# irs:         the IR-module array to tear down
-# ir_ready:    per-module flag marking which `irs` entries are live
 # images:      the ObjectImage array to tear down
 # image_ready: per-module flag marking which `images` entries are live
 fun free_modules(p: *driver.Project,
-                 irs: *ir.Module, ir_ready: *bool,
                  images: *of.ObjectImage, image_ready: *bool) {
     var i: u32 = 0;
     for (i < p.module_len) {
         if (image_ready[i]) { obj.dnit(?images[i]); }
-        if (ir_ready[i])    { ir.dnit(?irs[i]); }
         i = i + 1;
     }
 }
@@ -813,7 +798,7 @@ fun compile_and_link(p: *driver.Project, level: u8, emit_obj: bool, test_mode: b
         code = link_artifact(p, emit_obj, root, out_override, argc, argv, marks, images, out_path);
     }
 
-    free_modules(p, irs, ir_ready, images, image_ready);
+    free_modules(p, images, image_ready);
     A.deallocate[bool](p.s.alloc, image_ready, n);
     A.deallocate[of.ObjectImage](p.s.alloc, images, n);
     A.deallocate[bool](p.s.alloc, ir_ready, n);

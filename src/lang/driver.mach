@@ -51,6 +51,9 @@ use mach.lang.fe.sema;
 use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.manifest;
+use mach.lang.me.ir;
+use mach.lang.me.lower;
+use mach.lang.me.pipeline;
 use mach.lang.query;
 use mach.lang.readout;
 use mach.lang.session;
@@ -223,6 +226,11 @@ pub rec PubConst {
 #                 reused across rebuilds of an unchanged module; set by
 #                 run_sema_one, nil until then. NOT freed by dnit_project - the
 #                 query DB owns it (its finalizer frees it) (#1583)
+# ir_module:      borrowed pointer to this module's optimized IR, owned by the
+#                 session query DB as the Q_LOWER handle (keyed by stable_id) and
+#                 reused across rebuilds of an unchanged module; set by
+#                 run_lower_one, nil until then. NOT freed by dnit_project - the
+#                 query DB owns it (its finalizer frees it) (#1618)
 # stable_id:      this module's build-stable identity (session-assigned by FQN);
 #                 unlike the discovery-order ModuleId, it survives a graph reshape,
 #                 so cross-build resolve/sema reuse remaps through it (#1579)
@@ -240,6 +248,7 @@ pub rec ModuleEntry {
     resolve_result:    *resolve.ResolveResult;
     resolved:          bool;
     sema_result:       *sema.SemaResult;
+    ir_module:         *ir.Module;
     stable_id:         session.StableModuleId;
 }
 
@@ -305,6 +314,9 @@ rec TargetTuple {
 # topo:              module ids in dep-order (topo[0] has no deps within the graph)
 # topo_len:          number of entries in topo
 # topo_cap:          allocated slots in topo
+# opt_level:         the optimization pipeline level the back half lowers at, set
+#                    by the CLI before run_lower_pass (defaults to the debug pipeline)
+# verify_ir:         run the IR verifier after each optimization pass during lowering
 pub rec Project {
     s:            *session.Session;
     config:       ProjectConfig;
@@ -332,6 +344,9 @@ pub rec Project {
     topo:         *session.ModuleId;
     topo_len:     u32;
     topo_cap:     u32;
+
+    opt_level:    pipeline.OptLevel;
+    verify_ir:    bool;
 }
 
 # seed capacities for the per-build growable arrays (module table, a module's pub
@@ -1160,6 +1175,8 @@ fun init_project(p: *Project, s: *session.Session) {
     p.topo          = nil;
     p.topo_len      = 0;
     p.topo_cap      = 0;
+    p.opt_level     = pipeline.OPT_DEBUG;
+    p.verify_ir     = false;
 }
 
 # release every owned array a ProjectConfig holds (targets and their libs, deps,
@@ -2157,6 +2174,7 @@ fun register_module_slot(p: *Project, fqn: intern.StrId) R.Result[session.Module
     m.resolve_result    = nil;
     m.resolved          = false;
     m.sema_result       = nil;
+    m.ir_module         = nil;
     p.modules[p.module_len] = m;
     p.module_len = p.module_len + 1;
 
@@ -2381,6 +2399,10 @@ fun ensure_query_pipeline(s: *session.Session) R.Result[bool, str] {
     if (!query.is_registered(?s.queries, query.Q_TYPED_EXPORTS)) {
         val rte: R.Result[bool, str] = query.register_derived(?s.queries, query.Q_TYPED_EXPORTS, q_typed_exports_compute);
         if (R.is_err[bool, str](rte)) { ret rte; }
+    }
+    if (!query.is_registered(?s.queries, query.Q_LOWER)) {
+        val rl: R.Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_LOWER, q_lower_compute, q_lower_finalize);
+        if (R.is_err[bool, str](rl)) { ret rl; }
     }
     ret R.ok[bool, str](true);
 }
@@ -3713,6 +3735,250 @@ fun q_typed_exports_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R
     out.bytes = fb.buf;
     out.len   = fb.len;
     ret R.ok[query.QueryOutput, str](out);
+}
+
+# the transitive import closure a Q_LOWER compute records its Q_SEMA deps over.
+# ---
+# list:  owned array of the reachable dep ModuleIds (sized to module_len)
+# count: number of populated entries in list
+# cap:   allocated length of list (the free size)
+rec LowerClosure {
+    list:  *session.ModuleId;
+    count: u32;
+    cap:   u32;
+}
+
+# lower every module to optimized IR in topo order through the Q_LOWER query.
+# the active Project is installed on the session for the pass so the compute can
+# reach the per-build module graph; topo order matches the sema pass. every module's
+# SemaResult (its own and its dep closure's) is already borrowed onto its ModuleEntry
+# and published to the session by a completed run_sema_pass - the monomorphizer
+# reaches a generic template's declaring module through those session registries.
+# resolve and sema must both have run first; the CLI compile path drives this after
+# run_sema_pass (build_project itself stops at resolve, #1583).
+# ---
+# p:   the active project; its topo order and per-build module graph drive the pass
+# ret: true once every module is lowered, or the first error
+pub fun run_lower_pass(p: *Project) R.Result[bool, str] {
+    session.set_active_project(p.s, p::ptr);
+
+    readout.phase_begin(p.s.readout, readout.PH_LOWER);
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId = p.topo[i];
+        val r: R.Result[bool, str] = run_lower_one(p, mid);
+        if (R.is_err[bool, str](r)) {
+            session.set_active_project(p.s, nil);
+            ret r;
+        }
+        i = i + 1;
+    }
+    readout.phase_end(p.s.readout, readout.PH_LOWER, p.topo_len, "module", "modules");
+    session.set_active_project(p.s, nil);
+    ret R.ok[bool, str](true);
+}
+
+# fetch module `mid`'s optimized IR through Q_LOWER - computed fresh when its own
+# typing or any dep-closure module's typing changed, reused otherwise - and borrow
+# it onto the ModuleEntry. the IR is owned by the query DB; m.ir_module only points
+# at it.
+fun run_lower_one(p: *Project, mid: session.ModuleId) R.Result[bool, str] {
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+
+    val t_item: ctime.Time = readout.item_begin(p.s.readout);
+
+    val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LOWER, m.stable_id::u64);
+    if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
+    val irm: *ir.Module = ir_handle_decode(R.unwrap_ok[*query.QueryEntry, str](e_r));
+    if (irm == nil) { ret R.err[bool, str]("Q_LOWER produced no result handle"); }
+
+    m.ir_module = irm;
+    readout.item(p.s.readout, readout.PH_LOWER, fqn_name(p, m.fqn), t_item);
+    ret R.ok[bool, str](true);
+}
+
+# the Q_LOWER derived compute - lower one module to optimized IR and return it as
+# an opaque owned handle. reaches the per-build module graph through the session's
+# active Project, and records the deps that make the entry incremental:
+#   - Q_SEMA(module):  a change to this module's typing re-lowers it;
+#   - Q_TARGET:        a build-config change re-lowers every module;
+#   - Q_SEMA(dep) for every module in this module's TRANSITIVE import closure: a
+#     generic/comptime instance declared in another module is monomorphized into
+#     THIS module's IR, so a change to that module's typing (including a private
+#     generic body it exposes) must re-lower this module. the transitive closure -
+#     not the direct resolve closure - is required because there is no per-hop
+#     lowering firewall: an inlined instance can originate in a transitively-
+#     imported module the direct closure omits (#1618).
+fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
+    val s: *session.Session = db.ctx::*session.Session;
+    if (s == nil) { ret R.err[query.QueryOutput, str]("Q_LOWER: query db has no session context"); }
+    val pp: ptr = session.active_project(s);
+    if (pp == nil) { ret R.err[query.QueryOutput, str]("Q_LOWER: no active project for the lower pass"); }
+    val p: *Project = pp::*Project;
+
+    val stable: session.StableModuleId = key::u32::session.StableModuleId;
+    val mid: session.ModuleId = session.module_id_for_stable(s, stable);
+    if (mid == session.MODULE_NIL) { ret R.err[query.QueryOutput, str]("Q_LOWER: stable id not loaded this build"); }
+    val m: *ModuleEntry = ?p.modules[mid::u32];
+    val a: *ast.Ast = m.a;
+    if (a == nil) { ret R.err[query.QueryOutput, str]("Q_LOWER: module has no parsed AST"); }
+    val sr: *sema.SemaResult = m.sema_result;
+    if (sr == nil) { ret R.err[query.QueryOutput, str]("Q_LOWER: module has no sema result"); }
+
+    val rsd: R.Result[bool, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_SEMA, key);
+    if (R.is_err[bool, str](rsd)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rsd)); }
+    val rt: R.Result[bool, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_TARGET, 0);
+    if (R.is_err[bool, str](rt)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rt)); }
+
+    # record a dep on Q_SEMA of every module whose typing can feed this module's
+    # lowered IR (its transitive import closure). those Q_SEMA entries are all
+    # computed and valid (run_sema_pass completed before the lower pass), so
+    # record_dep captures their final last_changed directly.
+    val cl_r: R.Result[LowerClosure, str] = collect_lower_closure(p, m);
+    if (R.is_err[LowerClosure, str](cl_r)) { ret R.err[query.QueryOutput, str](R.unwrap_err[LowerClosure, str](cl_r)); }
+    var cl: LowerClosure = R.unwrap_ok[LowerClosure, str](cl_r);
+    var di: u32 = 0;
+    for (di < cl.count) {
+        val dep_mid: session.ModuleId = cl.list[di];
+        val dep_stable: session.StableModuleId = p.modules[dep_mid::u32].stable_id;
+        val rd: R.Result[bool, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_SEMA, dep_stable::u64);
+        if (R.is_err[bool, str](rd)) {
+            free_lower_closure(s.alloc, ?cl);
+            ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rd));
+        }
+        di = di + 1;
+    }
+    free_lower_closure(s.alloc, ?cl);
+
+    val res_lower: R.Result[ir.Module, str] = lower.lower_module(s, ?p.target, a, m.fqn, mid, sr, m.resolve_result, ?m.ctx);
+    if (R.is_err[ir.Module, str](res_lower)) { ret R.err[query.QueryOutput, str](R.unwrap_err[ir.Module, str](res_lower)); }
+    var irmod: ir.Module = R.unwrap_ok[ir.Module, str](res_lower);
+
+    # optimize in place: the cached artifact is the post-pipeline IR the object is
+    # built from, so an unchanged optimized module reuses its codegen output.
+    val res_opt: R.Result[bool, str] = pipeline.run(?irmod, ?p.target, p.opt_level, p.verify_ir);
+    if (R.is_err[bool, str](res_opt)) {
+        ir.dnit(?irmod);
+        ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](res_opt));
+    }
+
+    val br: R.Result[*ir.Module, str] = A.allocate[ir.Module](alloc, 1::usize);
+    if (R.is_err[*ir.Module, str](br)) {
+        ir.dnit(?irmod);
+        ret R.err[query.QueryOutput, str](R.unwrap_err[*ir.Module, str](br));
+    }
+    val box: *ir.Module = R.unwrap_ok[*ir.Module, str](br);
+    box[0] = irmod;
+    ret ir_handle_encode(alloc, box);
+}
+
+# release the optimized IR a Q_LOWER handle owns, called by the engine before it
+# frees the handle buffer (on recompute, invalidate, dnit).
+fun q_lower_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
+    if (value == nil || value_len::usize < $size_of(ptr)) { ret; }
+    val slot: *ptr = value::ptr::*ptr;
+    val r: *ir.Module = slot[0]::*ir.Module;
+    if (r == nil) { ret; }
+    ir.dnit(r);
+    A.deallocate[ir.Module](alloc, r, 1::usize);
+}
+
+# wrap a heap ir.Module pointer as a pointer-sized opaque handle buffer - the
+# Q_LOWER query value. like the front-half handles, the heavy IR graph lives in the
+# byte-buffer DB as a handle, never serialized.
+fun ir_handle_encode(alloc: *A.Allocator, r: *ir.Module) R.Result[query.QueryOutput, str] {
+    val n: u32 = $size_of(ptr)::u32;
+    val rb: R.Result[*u8, str] = A.allocate[u8](alloc, n::usize);
+    if (R.is_err[*u8, str](rb)) {
+        ir.dnit(r);
+        A.deallocate[ir.Module](alloc, r, 1::usize);
+        ret R.err[query.QueryOutput, str](R.unwrap_err[*u8, str](rb));
+    }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+    val slot: *ptr = buf::ptr::*ptr;
+    slot[0] = r::ptr;
+    var out: query.QueryOutput;
+    out.bytes = buf;
+    out.len   = n;
+    ret R.ok[query.QueryOutput, str](out);
+}
+
+# read the ir.Module pointer back out of a Q_LOWER handle entry, or nil when the
+# entry carries no value.
+fun ir_handle_decode(e: *query.QueryEntry) *ir.Module {
+    if (e.value == nil || e.value_len::usize < $size_of(ptr)) { ret nil; }
+    val slot: *ptr = e.value::ptr::*ptr;
+    ret slot[0]::*ir.Module;
+}
+
+# collect the transitive import closure of module `m` (every module reachable from
+# its direct deps, following deps to fixpoint) into a fresh owned list; the module
+# itself is excluded. bounded scratch (a visited mark array sized to module_len,
+# freed here) plus the returned list (also sized to module_len, owned by the session
+# allocator and freed by free_lower_closure).
+fun collect_lower_closure(p: *Project, m: *ModuleEntry) R.Result[LowerClosure, str] {
+    var cl: LowerClosure;
+    cl.list  = nil;
+    cl.count = 0;
+    cl.cap   = 0;
+    if (m.dep_count == 0 || p.module_len == 0) { ret R.ok[LowerClosure, str](cl); }
+
+    val vr: R.Result[*bool, str] = A.allocate[bool](p.s.alloc, p.module_len::usize);
+    if (R.is_err[*bool, str](vr)) { ret R.err[LowerClosure, str](R.unwrap_err[*bool, str](vr)); }
+    val visited: *bool = R.unwrap_ok[*bool, str](vr);
+    var vi: u32 = 0;
+    for (vi < p.module_len) { visited[vi] = false; vi = vi + 1; }
+
+    val lr: R.Result[*session.ModuleId, str] = A.allocate[session.ModuleId](p.s.alloc, p.module_len::usize);
+    if (R.is_err[*session.ModuleId, str](lr)) {
+        A.deallocate[bool](p.s.alloc, visited, p.module_len::usize);
+        ret R.err[LowerClosure, str](R.unwrap_err[*session.ModuleId, str](lr));
+    }
+    val list: *session.ModuleId = R.unwrap_ok[*session.ModuleId, str](lr);
+    var list_len: u32 = 0;
+
+    var i: u32 = 0;
+    for (i < m.dep_count) {
+        val d: session.ModuleId = m.deps[i];
+        if (d::u32 < p.module_len && !visited[d::u32]) {
+            visited[d::u32] = true;
+            list[list_len]  = d;
+            list_len = list_len + 1;
+        }
+        i = i + 1;
+    }
+
+    var head: u32 = 0;
+    for (head < list_len) {
+        val cur: session.ModuleId = list[head];
+        val cm:  *ModuleEntry = ?p.modules[cur::u32];
+        var j: u32 = 0;
+        for (j < cm.dep_count) {
+            val d: session.ModuleId = cm.deps[j];
+            if (d::u32 < p.module_len && !visited[d::u32]) {
+                visited[d::u32] = true;
+                list[list_len]  = d;
+                list_len = list_len + 1;
+            }
+            j = j + 1;
+        }
+        head = head + 1;
+    }
+
+    A.deallocate[bool](p.s.alloc, visited, p.module_len::usize);
+    cl.list  = list;
+    cl.count = list_len;
+    cl.cap   = p.module_len;
+    ret R.ok[LowerClosure, str](cl);
+}
+
+# release the list a LowerClosure owns (freed at its allocated capacity).
+fun free_lower_closure(alloc: *A.Allocator, cl: *LowerClosure) {
+    if (cl.list == nil || cl.cap == 0) { ret; }
+    A.deallocate[session.ModuleId](alloc, cl.list, cl.cap::usize);
+    cl.list  = nil;
+    cl.count = 0;
+    cl.cap   = 0;
 }
 
 # append the typed pub surface of module `mid` to the fingerprint.
@@ -5425,6 +5691,15 @@ fun ut_sema_lc(s: *session.Session, stable: session.StableModuleId) query.Revisi
     ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
 }
 
+# the last_changed revision of module `stable`'s Q_LOWER entry on session
+# `s`, or a sentinel when absent. an owned-handle shard never early-cuts, so an
+# unchanged value means the module was NOT re-lowered - the lowering reuse probe (#1618).
+fun ut_lower_lc(s: *session.Session, stable: session.StableModuleId) query.Revision {
+    val e: R.Result[*query.QueryEntry, str] = query.get(?s.queries, query.Q_LOWER, stable::u64);
+    if (R.is_err[*query.QueryEntry, str](e)) { ret 0xFFFFFFFFFFFFFFFF; }
+    ret R.unwrap_ok[*query.QueryEntry, str](e).last_changed;
+}
+
 # whether two ModuleIds name the same module by FQN text
 # across two sessions. an anonymous nominal's origin is MODULE_NIL in both; the test
 # fixtures use only named records, so two MODULE_NIL origins (with a matched decl
@@ -5832,6 +6107,183 @@ test "mach.lang.driver:incremental_sema_reshape_renumber_recheck" {
     dnit_project(?pB);
     session.dnit(?sB);
     dnit_project(?pA2);
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: a no-change rebuild on a long-lived session re-lowers no
+# module - every Q_LOWER entry is reused, so lowering + optimize + codegen are all
+# skipped (#1618).
+test "mach.lang.driver:incremental_lower_reuse_no_change" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.fa;\nfun main() i32 { ret fa(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: sema then lower the whole graph.
+    val p1r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    if (R.is_err[bool, str](run_sema_pass(?p1)))  { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p1))) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val st_leaf: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.leaf");
+    val lc_main_1: query.Revision = ut_lower_lc(?sA, st_main);
+    val lc_leaf_1: query.Revision = ut_lower_lc(?sA, st_leaf);
+    dnit_project(?p1);
+
+    # build 2: no source edit, same long-lived session.
+    val p2r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    if (R.is_err[bool, str](run_sema_pass(?p2)))  { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p2))) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val lc_main_2: query.Revision = ut_lower_lc(?sA, st_main);
+    val lc_leaf_2: query.Revision = ut_lower_lc(?sA, st_leaf);
+    dnit_project(?p2);
+
+    # a no-change rebuild re-lowered NOTHING: both modules' Q_LOWER was reused.
+    if (lc_main_2 != lc_main_1) { bad = 1; }
+    if (lc_leaf_2 != lc_leaf_1) { bad = 1; }
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: editing one dependency's body re-lowers it and its importer
+# (the importer inlines nothing here, but has no per-hop lowering firewall so it
+# conservatively re-lowers), while an independent sibling module's Q_LOWER is
+# reused - a single-module edit rebuilds only the affected sub-graph (#1618).
+test "mach.lang.driver:incremental_lower_isolated_edit_reuses_sibling" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    # main imports two independent leaves a and b. editing a re-lowers a and its
+    # importer main, but must not touch b (unrelated to a).
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    texts[0] = "use uniontest.a.fa;\nuse uniontest.b.fb;\nfun main() i32 { ret fa() + fb(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 3);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val p1r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    if (R.is_err[bool, str](run_sema_pass(?p1)))  { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p1))) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val st_a:    session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.a");
+    val st_b:    session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.b");
+    val lc_main_1: query.Revision = ut_lower_lc(?sA, st_main);
+    val lc_a_1:    query.Revision = ut_lower_lc(?sA, st_a);
+    val lc_b_1:    query.Revision = ut_lower_lc(?sA, st_b);
+    dnit_project(?p1);
+
+    # edit a's body only; b and the entry are untouched on disk.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val a_path:  str = ut_cc3(?alloc, src_dir, "/", "a.mach");
+    val a_v2:    str = "pub fun fa() i32 { val t: i32 = 1; ret t; }\n";
+    if (R.is_err[bool, str](filesystem.write_file(a_path, a_v2, str_len(a_v2), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+
+    val p2r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    if (R.is_err[bool, str](run_sema_pass(?p2)))  { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p2))) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val lc_main_2: query.Revision = ut_lower_lc(?sA, st_main);
+    val lc_a_2:    query.Revision = ut_lower_lc(?sA, st_a);
+    val lc_b_2:    query.Revision = ut_lower_lc(?sA, st_b);
+    dnit_project(?p2);
+
+    # the edited module and its importer re-lowered; the unrelated sibling did NOT.
+    if (lc_a_2 == lc_a_1)       { bad = 1; }
+    if (lc_main_2 == lc_main_1) { bad = 1; }
+    if (lc_b_2 != lc_b_1)       { bad = 1; }
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: editing the entry module's own body re-lowers only the entry;
+# its unedited dependency's Q_LOWER is reused (editing an importer does not re-lower
+# its dependency) (#1618).
+test "mach.lang.driver:incremental_lower_entry_edit_reuses_dep" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.fa;\nfun main() i32 { ret fa(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    val p1r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    if (R.is_err[bool, str](run_sema_pass(?p1)))  { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p1))) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val st_leaf: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.leaf");
+    val lc_main_1: query.Revision = ut_lower_lc(?sA, st_main);
+    val lc_leaf_1: query.Revision = ut_lower_lc(?sA, st_leaf);
+    dnit_project(?p1);
+
+    # edit the entry's body only (valid syntax); leaf is untouched on disk.
+    val src_dir:   str = ut_cc3(?alloc, root, "/", "src");
+    val main_path: str = ut_cc3(?alloc, src_dir, "/", "main.mach");
+    val main_v2:   str = "use uniontest.leaf.fa;\nfun main() i32 { val x: i32 = fa(); ret x; }\n";
+    if (R.is_err[bool, str](filesystem.write_file(main_path, main_v2, str_len(main_v2), 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+
+    val p2r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    if (R.is_err[bool, str](run_sema_pass(?p2)))  { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p2))) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val lc_main_2: query.Revision = ut_lower_lc(?sA, st_main);
+    val lc_leaf_2: query.Revision = ut_lower_lc(?sA, st_leaf);
+    dnit_project(?p2);
+
+    # the edited entry re-lowered; its unedited dependency did NOT.
+    if (lc_main_2 == lc_main_1) { bad = 1; }
+    if (lc_leaf_2 != lc_leaf_1) { bad = 1; }
+
     filesystem.remove_all(?alloc, root);
     session.dnit(?sA);
     ret bad;
