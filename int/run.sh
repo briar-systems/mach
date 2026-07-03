@@ -151,11 +151,11 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     build_target=${case_build_target:-$target}
 
     # the golden is shared across build-targets for runtime observables (exec and the
-    # relro-fault / rodata-fault write guards, whose output is target-independent) and
-    # per-build-target for structural producers (their fact is format-specific).
+    # relro-fault guard, whose output is target-independent) and per-build-target for
+    # structural producers (their fact is format-specific).
     case "$case_run" in
-        exec|relro-fault|rodata-fault) golden="$dir/expect.txt" ;;
-        *)                             golden="$dir/expect.$build_target.txt" ;;
+        exec|relro-fault) golden="$dir/expect.txt" ;;
+        *)                golden="$dir/expect.$build_target.txt" ;;
     esac
 
     for profile in $case_profiles; do

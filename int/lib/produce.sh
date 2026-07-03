@@ -42,11 +42,14 @@ produce_exec() {
     fi
 }
 
-# run_fault_status <runmode> <target> <binary>
-# runs the built binary with stdout/stderr discarded and prints "faulted" when it
-# died from a memory-protection fault (SIGSEGV -> exit 128+11=139, both natively and
-# under qemu-user), else "exit<code>". the shared body of the write-fault producers.
-run_fault_status() {
+# produce_relro_fault <runmode> <target> <binary>
+# runs the built binary (expected to write to a relocated constant's RELRO'd .rodata
+# storage) and reports whether that write faulted. after the --pie startup mprotects
+# the region read-only, the write must raise SIGSEGV, which surfaces as exit 128+11=139
+# both natively and under qemu-user; any other status means the region stayed writable.
+# the program's own stdout is discarded - the observable is purely the fault fact - so
+# this is a runtime (exec-like) producer sharing one target-independent golden.
+produce_relro_fault() {
     runmode=$1
     target=$2
     bin=$3
@@ -57,31 +60,10 @@ run_fault_status() {
     fi
     ec=$?
     if [ "$ec" -eq 139 ]; then
-        echo "faulted"
+        echo "relro_write=faulted"
     else
-        echo "exit$ec"
+        echo "relro_write=exit$ec"
     fi
-}
-
-# produce_relro_fault <runmode> <target> <binary>
-# runs the built binary (expected to write to a relocated constant's RELRO'd
-# .data.rel.ro storage) and reports whether that write faulted. after the --pie startup
-# mprotects the region read-only, the write must raise SIGSEGV; any other status means
-# the region stayed writable. the program's own stdout is discarded - the observable is
-# purely the fault fact - so this is a runtime (exec-like) producer sharing one
-# target-independent golden.
-produce_relro_fault() {
-    echo "relro_write=$(run_fault_status "$@")"
-}
-
-# produce_rodata_fault <runmode> <target> <binary>
-# runs the built binary (expected to write to a pure constant - a string literal's
-# bytes - in `.rodata`) and reports whether that write faulted. unlike the RELRO slot,
-# pure `.rodata` is mapped read-only from process start (never routed through the
-# writable RELRO region), so the write must raise SIGSEGV independently of the runtime
-# re-protection; the sibling pure-constant guard to produce_relro_fault.
-produce_rodata_fault() {
-    echo "rodata_write=$(run_fault_status "$@")"
 }
 
 # read_le_uint <file> <offset> <size>
@@ -197,13 +179,12 @@ produce() {
     run=$1
     shift
     case "$run" in
-        exec)         produce_exec "$@" ;;
-        relro-fault)  produce_relro_fault "$@" ;;
-        rodata-fault) produce_rodata_fault "$@" ;;
-        field)        produce_field "$@" ;;
-        relro)        produce_relro "$@" ;;
-        flat-loader)  produce_flat_loader "$@" ;;
-        built)        produce_built "$@" ;;
+        exec)        produce_exec "$@" ;;
+        relro-fault) produce_relro_fault "$@" ;;
+        field)       produce_field "$@" ;;
+        relro)       produce_relro "$@" ;;
+        flat-loader) produce_flat_loader "$@" ;;
+        built)       produce_built "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
 }
