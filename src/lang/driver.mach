@@ -12,6 +12,7 @@
 
 use std.allocator.page;
 use std.collections.map;
+use std.crypto.hash.sha256;
 use std.data.toml;
 use std.filesystem;
 use std.memory;
@@ -3780,6 +3781,17 @@ rec LowerClosure {
 pub fun run_lower_pass(p: *Project) R.Result[bool, str] {
     session.set_active_project(p.s, p::ptr);
 
+    # publish the lowering diagnostic flags (the IR-verifier toggle) so a change to
+    # them re-lowers; set_input's early-cutoff leaves the input untouched when they
+    # are unchanged, so an unedited module's Q_LOWER stays reused.
+    var vflag: u8 = 0;
+    if (p.verify_ir) { vflag = 1; }
+    val vf: R.Result[bool, str] = query.set_input(?p.s.queries, query.Q_LOWER_FLAGS, 0, ?vflag, 1);
+    if (R.is_err[bool, str](vf)) {
+        session.set_active_project(p.s, nil);
+        ret vf;
+    }
+
     readout.phase_begin(p.s.readout, readout.PH_LOWER);
     var i: u32 = 0;
     for (i < p.topo_len) {
@@ -3820,6 +3832,7 @@ fun run_lower_one(p: *Project, mid: session.ModuleId) R.Result[bool, str] {
 # active Project, and records the deps that make the entry incremental:
 #   - Q_SEMA(module):  a change to this module's typing re-lowers it;
 #   - Q_TARGET:        a build-config change re-lowers every module;
+#   - Q_LOWER_FLAGS:   the IR-verifier toggle re-lowers (re-runs the verifier);
 #   - Q_SEMA(dep) for every module in this module's TRANSITIVE import closure: a
 #     generic/comptime instance declared in another module is monomorphized into
 #     THIS module's IR, so a change to that module's typing (including a private
@@ -3847,6 +3860,11 @@ fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[
     if (R.is_err[bool, str](rsd)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rsd)); }
     val rt: R.Result[bool, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_TARGET, 0);
     if (R.is_err[bool, str](rt)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rt)); }
+    # the IR-verifier toggle changes what lowering DOES (whether it runs the verifier
+    # after each optimization pass), so a toggle must re-lower even when the typed
+    # inputs are unchanged.
+    val rvf: R.Result[bool, str] = query.record_dep(db, query.Q_LOWER, key, query.Q_LOWER_FLAGS, 0);
+    if (R.is_err[bool, str](rvf)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rvf)); }
 
     # record a dep on Q_SEMA of every module whose typing can feed this module's
     # lowered IR (its transitive import closure). those Q_SEMA entries are all
@@ -4179,10 +4197,19 @@ fun write_link_config(fb: *FpBuf, p: *Project, out_path: *u8, product: *u8, out_
     val a2: R.Result[bool, str] = fp_cstr(fb, out_path);           if (R.is_err[bool, str](a2)) { ret a2; }
     val a3: R.Result[bool, str] = fp_cstr(fb, product);            if (R.is_err[bool, str](a3)) { ret a3; }
 
+    # each static external input (a `.o` / `.a` baked into the output) is folded by
+    # PATH and by CONTENT: a same-path rebuild of a vendored archive changes the
+    # output binary, so its content must invalidate. mirrors the front half, which
+    # fingerprints a source file by its full text (Q_FILE_TEXT); the link folds a
+    # sha256 of the content instead of the raw bytes, since a static archive can be
+    # large. sonames below are DYNAMIC deps (DT_NEEDED, loaded at run time, not baked
+    # in), so they are fingerprinted by identity only - their content never changes
+    # this binary.
     val a4: R.Result[bool, str] = fp_u32(fb, ext_count);           if (R.is_err[bool, str](a4)) { ret a4; }
     var i: u32 = 0;
     for (i < ext_count) {
-        val ap: R.Result[bool, str] = fp_cstr(fb, ext_paths[i]);  if (R.is_err[bool, str](ap)) { ret ap; }
+        val ap: R.Result[bool, str] = fp_cstr(fb, ext_paths[i]);          if (R.is_err[bool, str](ap)) { ret ap; }
+        val ah: R.Result[bool, str] = fp_file_content(fb, p.s.alloc, ext_paths[i]); if (R.is_err[bool, str](ah)) { ret ah; }
         i = i + 1;
     }
     val a5: R.Result[bool, str] = fp_u32(fb, soname_count);        if (R.is_err[bool, str](a5)) { ret a5; }
@@ -4190,6 +4217,34 @@ fun write_link_config(fb: *FpBuf, p: *Project, out_path: *u8, product: *u8, out_
     for (j < soname_count) {
         val as: R.Result[bool, str] = fp_u32(fb, sonames[j]::u32); if (R.is_err[bool, str](as)) { ret as; }
         j = j + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# append the sha256 content hash of the file at `path` to the fingerprint (a length
+# prefix plus the 32 digest bytes); a nil path contributes a zero length. reads the
+# whole file into `alloc` and frees it. a read failure is a hard error - the caller
+# resolved this path to an existing file, so a failure to read it must fail the
+# build rather than silently elide the input from the fingerprint.
+fun fp_file_content(fb: *FpBuf, alloc: *A.Allocator, path: *u8) R.Result[bool, str] {
+    if (path == nil) { ret fp_u32(fb, 0); }
+    val rr: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(alloc, path::str);
+    if (R.is_err[filesystem.Buffer, str](rr)) {
+        ret R.err[bool, str](R.unwrap_err[filesystem.Buffer, str](rr));
+    }
+    var buf: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rr);
+    var digest: [32]u8;
+    sha256.hash(buf.data, buf.len, ?digest[0]);
+    # read_all_sized over-allocates by one NUL byte.
+    A.deallocate[u8](alloc, buf.data, (buf.len + 1)::usize);
+
+    val rl: R.Result[bool, str] = fp_u32(fb, sha256.DIGEST_SIZE::u32);
+    if (R.is_err[bool, str](rl)) { ret rl; }
+    var i: u32 = 0;
+    for (i < sha256.DIGEST_SIZE::u32) {
+        val rb: R.Result[bool, str] = fp_u8(fb, digest[i]);
+        if (R.is_err[bool, str](rb)) { ret rb; }
+        i = i + 1;
     }
     ret R.ok[bool, str](true);
 }
@@ -4243,14 +4298,17 @@ fun q_link_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[q
     fb.len   = 0;
     fb.cap   = 0;
 
-    val rt: R.Result[bool, str] = query.record_dep(db, query.Q_LINK, key, query.Q_TARGET, 0);
-    if (R.is_err[bool, str](rt)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](rt)); }
-    val wt: R.Result[bool, str] = fp_u64(?fb, query.peek_revision(db, query.Q_TARGET, 0));
+    # record_dep_rev records the dep AND returns the revision it captured, so each
+    # dependency is scanned once (not once to record, once to peek) - the link fold
+    # is the shipping cold-build path, so this halves its shard scans.
+    val rt: R.Result[query.Revision, str] = query.record_dep_rev(db, query.Q_LINK, key, query.Q_TARGET, 0);
+    if (R.is_err[query.Revision, str](rt)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[query.Revision, str](rt)); }
+    val wt: R.Result[bool, str] = fp_u64(?fb, R.unwrap_ok[query.Revision, str](rt));
     if (R.is_err[bool, str](wt)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](wt)); }
 
-    val rc: R.Result[bool, str] = query.record_dep(db, query.Q_LINK, key, query.Q_LINK_CONFIG, 0);
-    if (R.is_err[bool, str](rc)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](rc)); }
-    val wc: R.Result[bool, str] = fp_u64(?fb, query.peek_revision(db, query.Q_LINK_CONFIG, 0));
+    val rc: R.Result[query.Revision, str] = query.record_dep_rev(db, query.Q_LINK, key, query.Q_LINK_CONFIG, 0);
+    if (R.is_err[query.Revision, str](rc)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[query.Revision, str](rc)); }
+    val wc: R.Result[bool, str] = fp_u64(?fb, R.unwrap_ok[query.Revision, str](rc));
     if (R.is_err[bool, str](wc)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](wc)); }
 
     val wn: R.Result[bool, str] = fp_u32(?fb, p.topo_len);
@@ -4258,9 +4316,9 @@ fun q_link_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[q
     var i: u32 = 0;
     for (i < p.topo_len) {
         val m: *ModuleEntry = ?p.modules[(p.topo[i])::u32];
-        val rd: R.Result[bool, str] = query.record_dep(db, query.Q_LINK, key, query.Q_CODEGEN, m.stable_id::u64);
-        if (R.is_err[bool, str](rd)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](rd)); }
-        val wm: R.Result[bool, str] = fp_u64(?fb, query.peek_revision(db, query.Q_CODEGEN, m.stable_id::u64));
+        val rd: R.Result[query.Revision, str] = query.record_dep_rev(db, query.Q_LINK, key, query.Q_CODEGEN, m.stable_id::u64);
+        if (R.is_err[query.Revision, str](rd)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[query.Revision, str](rd)); }
+        val wm: R.Result[bool, str] = fp_u64(?fb, R.unwrap_ok[query.Revision, str](rd));
         if (R.is_err[bool, str](wm)) { ret link_fp_fail(?fb, alloc, R.unwrap_err[bool, str](wm)); }
         i = i + 1;
     }
@@ -6741,7 +6799,9 @@ test "mach.lang.driver:incremental_link_reuse_and_fingerprint" {
     val p1r: R.Result[Project, str] = ut_back_half(?sA, root);
     if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
     var p1: Project = R.unwrap_ok[Project, str](p1r);
-    val st_a: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.a");
+    val st_a:    session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.a");
+    val st_b:    session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.b");
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
     if (R.is_err[bool, str](set_link_config_input(?p1, "out/app"::*u8, "app"::*u8, 0, nil, 0, nil, 0))) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
     val r1: R.Result[bool, str] = run_link_pass(?p1);
     if (R.is_err[bool, str](r1)) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
@@ -6784,15 +6844,177 @@ test "mach.lang.driver:incremental_link_reuse_and_fingerprint" {
     val p4r: R.Result[Project, str] = ut_back_half(?sA, root);
     if (R.is_err[Project, str](p4r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
     var p4: Project = R.unwrap_ok[Project, str](p4r);
-    val cg_a_before: query.Revision = ut_codegen_lc(?sA, st_a);
+    val cg_a_before:    query.Revision = ut_codegen_lc(?sA, st_a);
+    val cg_b_before:    query.Revision = ut_codegen_lc(?sA, st_b);
+    val cg_main_before: query.Revision = ut_codegen_lc(?sA, st_main);
     if (R.is_err[bool, str](set_link_config_input(?p4, "out/other"::*u8, "app"::*u8, 0, nil, 0, nil, 0))) { dnit_project(?p4); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
     val r4: R.Result[bool, str] = run_link_pass(?p4);
     if (R.is_err[bool, str](r4)) { dnit_project(?p4); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
-    val cg_a_after: query.Revision = ut_codegen_lc(?sA, st_a);
-    if (!R.unwrap_ok[bool, str](r4))     { bad = 1; }
-    if (ut_link_lc(?sA) == lk3)          { bad = 1; }
-    if (cg_a_after != cg_a_before)       { bad = 1; }
+    # every module's object is reused across a link-only config change; only Q_LINK advances.
+    if (!R.unwrap_ok[bool, str](r4))                    { bad = 1; }
+    if (ut_link_lc(?sA) == lk3)                         { bad = 1; }
+    if (ut_codegen_lc(?sA, st_a)    != cg_a_before)     { bad = 1; }
+    if (ut_codegen_lc(?sA, st_b)    != cg_b_before)     { bad = 1; }
+    if (ut_codegen_lc(?sA, st_main) != cg_main_before)  { bad = 1; }
     dnit_project(?p4);
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: Q_LINK re-links when an external static input's CONTENT changes
+# at the same path (not just its path), when its path changes, and when a dynamic
+# dependency (soname) is added - the external-axis completeness of the link
+# fingerprint (#1618).
+test "mach.lang.driver:incremental_link_external_content_fingerprint" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    texts[0] = "use uniontest.a.fa;\nuse uniontest.b.fb;\nfun main() i32 { ret fa() + fb(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 3);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    # an external static link input (a vendored archive) on disk.
+    val ext1: str = ut_cc3(?alloc, root, "/", "libx.a");
+    if (R.is_err[bool, str](filesystem.write_file(ext1, "AAAA", 4, 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var ext_a: [1]*u8; ext_a[0] = ext1::*u8;
+
+    var bad: i32 = 0;
+
+    # build A: ext=[ext1] (content AAAA). cold -> re-link.
+    val pAr: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](pAr)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var pA: Project = R.unwrap_ok[Project, str](pAr);
+    if (R.is_err[bool, str](set_link_config_input(?pA, "out/app"::*u8, "app"::*u8, 0, ?ext_a[0], 1, nil, 0))) { dnit_project(?pA); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val rlA: R.Result[bool, str] = run_link_pass(?pA);
+    if (R.is_err[bool, str](rlA)) { dnit_project(?pA); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (!R.unwrap_ok[bool, str](rlA)) { bad = 1; }
+    val lkA: query.Revision = ut_link_lc(?sA);
+    dnit_project(?pA);
+
+    # build B: same ext, same content -> reuse.
+    val pBr: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](pBr)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var pB: Project = R.unwrap_ok[Project, str](pBr);
+    if (R.is_err[bool, str](set_link_config_input(?pB, "out/app"::*u8, "app"::*u8, 0, ?ext_a[0], 1, nil, 0))) { dnit_project(?pB); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val rlB: R.Result[bool, str] = run_link_pass(?pB);
+    if (R.is_err[bool, str](rlB)) { dnit_project(?pB); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.unwrap_ok[bool, str](rlB)) { bad = 1; }
+    if (ut_link_lc(?sA) != lkA)      { bad = 1; }
+    dnit_project(?pB);
+
+    # build C: SAME path, DIFFERENT content -> re-link (the content-hash pin for
+    # finding 1: a same-path archive rebuild must invalidate).
+    if (R.is_err[bool, str](filesystem.write_file(ext1, "BBBB", 4, 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val pCr: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](pCr)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var pC: Project = R.unwrap_ok[Project, str](pCr);
+    if (R.is_err[bool, str](set_link_config_input(?pC, "out/app"::*u8, "app"::*u8, 0, ?ext_a[0], 1, nil, 0))) { dnit_project(?pC); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val rlC: R.Result[bool, str] = run_link_pass(?pC);
+    if (R.is_err[bool, str](rlC)) { dnit_project(?pC); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (!R.unwrap_ok[bool, str](rlC)) { bad = 1; }
+    val lkC: query.Revision = ut_link_lc(?sA);
+    if (lkC == lkA)                   { bad = 1; }
+    dnit_project(?pC);
+
+    # build D: a DIFFERENT external path -> re-link.
+    val ext2: str = ut_cc3(?alloc, root, "/", "liby.a");
+    if (R.is_err[bool, str](filesystem.write_file(ext2, "CCCC", 4, 420))) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var ext_b: [1]*u8; ext_b[0] = ext2::*u8;
+    val pDr: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](pDr)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var pD: Project = R.unwrap_ok[Project, str](pDr);
+    if (R.is_err[bool, str](set_link_config_input(?pD, "out/app"::*u8, "app"::*u8, 0, ?ext_b[0], 1, nil, 0))) { dnit_project(?pD); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val rlD: R.Result[bool, str] = run_link_pass(?pD);
+    if (R.is_err[bool, str](rlD)) { dnit_project(?pD); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (!R.unwrap_ok[bool, str](rlD)) { bad = 1; }
+    val lkD: query.Revision = ut_link_lc(?sA);
+    if (lkD == lkC)                   { bad = 1; }
+    dnit_project(?pD);
+
+    # build E: add a dynamic dependency (soname) -> re-link.
+    val sn_r: R.Result[intern.StrId, str] = intern.intern(?sA.interner, "libfoo");
+    if (R.is_err[intern.StrId, str](sn_r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var sn: [1]intern.StrId; sn[0] = R.unwrap_ok[intern.StrId, str](sn_r);
+    val pEr: R.Result[Project, str] = ut_back_half(?sA, root);
+    if (R.is_err[Project, str](pEr)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var pE: Project = R.unwrap_ok[Project, str](pEr);
+    if (R.is_err[bool, str](set_link_config_input(?pE, "out/app"::*u8, "app"::*u8, 0, ?ext_b[0], 1, ?sn[0], 1))) { dnit_project(?pE); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val rlE: R.Result[bool, str] = run_link_pass(?pE);
+    if (R.is_err[bool, str](rlE)) { dnit_project(?pE); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (!R.unwrap_ok[bool, str](rlE)) { bad = 1; }
+    if (ut_link_lc(?sA) == lkD)       { bad = 1; }
+    dnit_project(?pE);
+
+    filesystem.remove_all(?alloc, root);
+    session.dnit(?sA);
+    ret bad;
+}
+
+# driver incremental: toggling the IR verifier on a warm session re-lowers every
+# module (so the verifier actually runs), while leaving it unchanged reuses lowering
+# - Q_LOWER_FLAGS closes the "requested verification silently skipped" hole (#1618).
+test "mach.lang.driver:incremental_lower_verify_ir_toggle_relowers" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var sA: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](setup_registry(?sA.registry))) { session.dnit(?sA); ret 1; }
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "leaf.mach";
+    var texts: [2]str;
+    texts[0] = "use uniontest.leaf.fa;\nfun main() i32 { ret fa(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[str, str](root_r)) { session.dnit(?sA); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    var bad: i32 = 0;
+
+    # build 1: verify off (the default).
+    val p1r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p1r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p1: Project = R.unwrap_ok[Project, str](p1r);
+    p1.verify_ir = false;
+    if (R.is_err[bool, str](run_sema_pass(?p1)))  { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p1))) { dnit_project(?p1); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val st_main: session.StableModuleId = ut_stable(?p1, ?sA, "uniontest.main");
+    val lc1: query.Revision = ut_lower_lc(?sA, st_main);
+    dnit_project(?p1);
+
+    # build 2: verify ON, no source edit -> re-lower (the verifier must run).
+    val p2r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p2r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p2: Project = R.unwrap_ok[Project, str](p2r);
+    p2.verify_ir = true;
+    if (R.is_err[bool, str](run_sema_pass(?p2)))  { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p2))) { dnit_project(?p2); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    val lc2: query.Revision = ut_lower_lc(?sA, st_main);
+    dnit_project(?p2);
+    if (lc2 == lc1) { bad = 1; }
+
+    # build 3: verify ON again, no edit -> reuse (flags unchanged).
+    val p3r: R.Result[Project, str] = build_project_union(?sA, root);
+    if (R.is_err[Project, str](p3r)) { filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    var p3: Project = R.unwrap_ok[Project, str](p3r);
+    p3.verify_ir = true;
+    if (R.is_err[bool, str](run_sema_pass(?p3)))  { dnit_project(?p3); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (R.is_err[bool, str](run_lower_pass(?p3))) { dnit_project(?p3); filesystem.remove_all(?alloc, root); session.dnit(?sA); ret 1; }
+    if (ut_lower_lc(?sA, st_main) != lc2) { bad = 1; }
+    dnit_project(?p3);
 
     filesystem.remove_all(?alloc, root);
     session.dnit(?sA);
