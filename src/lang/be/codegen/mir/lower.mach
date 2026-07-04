@@ -151,6 +151,9 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, interne
     ctx.interner       = interner;
     ctx.sret_vreg      = mir.MIR_VREG_NIL;
     ctx.cur_loc        = source.loc_nil();
+    ctx.pending        = nil;
+    ctx.pending_count  = 0;
+    ctx.pending_cap    = 0;
 
     val setup: R.Result[bool, str] = lctx.ctx_setup(?ctx, tgt, fn);
     if (R.is_err[bool, str](setup)) {
@@ -241,6 +244,16 @@ fun lower_block(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block, is_entry:
         val et: R.Result[bool, str] = lower_instr(ctx, fn, mb, blk.terminator);
         if (R.is_err[bool, str](et)) { ret et; }
     }
+
+    # flush any -g binding that had no following push_instr in this block (an
+    # OP_DBG_VALUE whose next instruction was the terminator on a path that bypasses
+    # push_instr) onto the block's last instruction, so a binding never leaks into the
+    # next block. cleared unconditionally so pending never crosses a block boundary.
+    if (ctx.pending_count > 0 && mb.instr_count > 0) {
+        val fl: R.Result[bool, str] = lctx.drain_pending_dbg(ctx, ?mb.instrs[mb.instr_count - 1]);
+        if (R.is_err[bool, str](fl)) { ret fl; }
+    }
+    ctx.pending_count = 0;
 
     ret R.ok[bool, str](true);
 }
@@ -592,9 +605,12 @@ fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mi
     # this splice bypasses lctx.push_instr, so enforce the asm_block invariant here:
     # struct locals are not zero-initialized, and regalloc.flatten reads a non-nil
     # asm_block as an inline-asm clobber barrier. the same non-zero-init reasoning
-    # applies to `loc` (FILE_NIL is not 0), so stamp the current lowering location.
-    mi.asm_block     = nil;
-    mi.loc           = ctx.cur_loc;
+    # applies to `loc` (FILE_NIL is not 0) and the dbg-binding list (the encoder reads
+    # it), so stamp the location and empty the binding list.
+    mi.asm_block         = nil;
+    mi.loc               = ctx.cur_loc;
+    mi.dbg_bindings      = nil;
+    mi.dbg_binding_count = 0;
 
     # grow by one, shift the terminator right, and drop the move into its place.
     val gr: R.Result[bool, str] = lctx.grow_instr(ctx, mb);
@@ -713,9 +729,11 @@ fun split_critical_edge(ctx: *lctx.LowerCtx, pred: *mir.MirBlock, succ_id: u32) 
     # struct locals are not zero-initialized, and regalloc.flatten reads a non-nil
     # asm_block as an inline-asm clobber barrier. this is a synthesized critical-edge
     # branch with no source instruction, so its loc is nil (the line table attributes
-    # it to the surrounding code).
-    br.asm_block     = nil;
-    br.loc           = source.loc_nil();
+    # it to the surrounding code) and it carries no dbg bindings.
+    br.asm_block         = nil;
+    br.loc               = source.loc_nil();
+    br.dbg_bindings      = nil;
+    br.dbg_binding_count = 0;
 
     val ri: R.Result[*mir.MirInstr, str] = A.allocate[mir.MirInstr](ctx.alloc, 1::usize);
     if (R.is_err[*mir.MirInstr, str](ri)) { A.deallocate[mir.MirOperand](ctx.alloc, bops, 1::usize); ret R.err[*mir.MirBlock, str](R.unwrap_err[*mir.MirInstr, str](ri)); }
@@ -782,31 +800,6 @@ fun replace_pred(mb: *mir.MirBlock, from: u32, to: u32) {
 #
 # OP_CALL expands into argument / call / result pseudos; OP_PHI is skipped here
 # (phis are eliminated out of SSA by `lower_phis` into predecessor-end copies,
-# append a MIR_DBG_VALUE marker binding source instruction `iid` to `vreg` (or
-# MIR_VREG_NIL). Both operands are imms so the marker carries no vreg use/def and is
-# inert to regalloc; the encoder emits no bytes and records the binding's live-start
-# PC for loclists.
-# ---
-# ctx:  the per-function lowering context
-# mb:   the destination MIR block
-# vreg: the bound value's vreg id, or MIR_VREG_NIL
-# iid:  the source OP_DBG_VALUE instruction id
-# ret:  true on success, or an allocation error
-fun emit_dbg_marker(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, vreg: u32, iid: u32) R.Result[bool, str] {
-    val ro: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-    if (R.is_err[*mir.MirOperand, str](ro)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](ro)); }
-    val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ro);
-    ops[0] = mir.op_imm(vreg::i64);
-    ops[1] = mir.op_imm(iid::i64);
-    var mi: mir.MirInstr;
-    mi.opcode        = mir.MIR_DBG_VALUE;
-    mi.operands      = ops;
-    mi.operand_count = 2;
-    mi.width         = ctx.tgt.model.gpr_width::u8;
-    mi.src_width     = ctx.tgt.model.gpr_width::u8;
-    ret lctx.push_instr(ctx, mb, mi);
-}
-
 # never as body instructions); the memory opcodes (alloca / load / store / gep)
 # have dedicated lowerings that form the stack slot and the `[base + disp]` memory
 # operands the slot model resolves; every other opcode maps 1:1 to its generic
@@ -839,19 +832,20 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     if (inst.kind == instr.OP_PHI) {
         ret R.ok[bool, str](true);
     }
-    # OP_DBG_VALUE is pure debug metadata (present only under -g); it lowers to no
-    # machine code, so builds with and without debug info emit identical text. Under
-    # -g it becomes a position-preserving MIR_DBG_VALUE marker whose imms carry the
-    # bound value's vreg id and the source instruction id (no vreg operand, so it is
-    # inert to regalloc); the encoder records a VarLoc at the marker's PC, and the
-    # producer builds per-PC loclists from those records.
+    # OP_DBG_VALUE is pure debug metadata (present only under -g); it lowers to NO
+    # machine code and emits no instruction, so the MIR stream is identical with and
+    # without -g. Instead it records a pending (iid, vreg) binding that the next lowered
+    # instruction carries in its dbg-binding list (attached at push_instr); the encoder
+    # records a VarLoc at that instruction's PC, and the producer builds per-PC loclists
+    # from those records. Riding a real instruction (never a standalone marker) keeps it
+    # inert to regalloc / frame by construction.
     if (inst.kind == instr.OP_DBG_VALUE) {
         var vreg: u32 = mir.MIR_VREG_NIL;
         if (inst.operand_count > 0) {
             val op: mir.MirOperand = lctx.lower_value(ctx, inst.operands[0]);
             if (op.kind == mir.MIR_OP_VREG) { vreg = op.vreg; }
         }
-        ret emit_dbg_marker(ctx, mb, vreg, iid::u32);
+        ret lctx.push_pending_dbg(ctx, iid::u32, vreg);
     }
     if (inst.kind == instr.OP_ALLOCA) {
         ret lower_alloca(ctx, mb, inst, iid);

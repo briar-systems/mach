@@ -216,16 +216,6 @@ pub val MIR_FCMP: MirOpcode = 0x1118;
 # width (4 for f32, 8 for f64) selects the f32 vs f64 sign-bit mask.
 pub val MIR_FNEG: MirOpcode = 0x111B;
 
-# a source-variable debug marker (`-g` only), position-preserving so the encoder can
-# record which PC a dbg-value binding becomes live at for `.debug_loclists` (#1705).
-# Operands are both MIR_OP_IMM - operand[0] holds the bound value's vreg id (or
-# MIR_VREG_NIL for a constant / optimized-out binding), operand[1] holds the source
-# OP_DBG_VALUE instruction id - so the marker carries NO vreg operand and is inert to
-# regalloc liveness (no use extends, no def), keeping codegen byte-identical. The
-# encoder emits zero bytes for it (like MIR_CALL_RES) and reads the imms to record a
-# VarLoc at the current text offset.
-pub val MIR_DBG_VALUE: MirOpcode = 0x111C;
-
 # a bit reinterpret (`:~`) is a plain MIR_BITCAST in every direction. a same-bank
 # reinterpret (GP<->GP or XMM<->XMM) is a register copy; a `:~` between a float and
 # an equal-size integer crosses the GP and XMM banks. both select to a plain MOV:
@@ -356,14 +346,37 @@ pub rec MirAsm {
 #                compiler-synthesized instruction with no source origin. the encoder
 #                retains it as a PC<->source row for debug line tables; it never
 #                affects the emitted bytes.
+# dbg_bindings:  `-g`-only source-variable bindings that become live at this
+#                instruction's PC (owned, ordered, nil when none). each entry names an
+#                OP_DBG_VALUE identity and the vreg holding its value; the encoder
+#                records a VarLoc at this instruction's start offset for each. pure
+#                debug metadata attached to a real instruction (never a standalone
+#                marker) so it rides through isel / regalloc / frame like `loc` and
+#                cannot perturb allocation - the instruction stream is identical with
+#                and without -g.
+# dbg_binding_count: number of dbg bindings (0 for the common no-binding case).
 pub rec MirInstr {
-    opcode:        MirOpcode;
-    operands:      *MirOperand;
-    operand_count: u32;
-    width:         u8;
-    src_width:     u8;
-    asm_block:     *MirAsm;
-    loc:           source.SrcLoc;
+    opcode:            MirOpcode;
+    operands:          *MirOperand;
+    operand_count:     u32;
+    width:             u8;
+    src_width:         u8;
+    asm_block:         *MirAsm;
+    loc:               source.SrcLoc;
+    dbg_bindings:      *MirDbgBinding;
+    dbg_binding_count: u32;
+}
+
+# one `-g` source-variable binding attached to a MirInstr: the OP_DBG_VALUE identity
+# `iid` (joining the IR dbg-var / dbg-expr side tables) and the MIR `vreg` holding the
+# variable's value (MIR_VREG_NIL for a constant / optimized-out binding). The variable
+# becomes live at the owning instruction's PC; the encoder emits a VarLoc there.
+# ---
+# iid:  the IR OP_DBG_VALUE instruction id
+# vreg: the operand's MIR vreg, or MIR_VREG_NIL for no register/frame home
+pub rec MirDbgBinding {
+    iid:  u32;
+    vreg: u32;
 }
 
 # a MIR basic block - an ordered instruction list plus predecessor ids, sharing the source IR `Block.id`
@@ -719,6 +732,33 @@ pub fun push_function(mm: *MirModule, mf: MirFunction) R.Result[bool, str] {
     ret R.ok[bool, str](true);
 }
 
+# append one `-g` source-variable binding (`iid` -> `vreg`) to a MirInstr's ordered
+# binding list, growing it by one. -g only; called at lowering to attach a pending
+# OP_DBG_VALUE binding to the instruction at whose PC the variable becomes live.
+# ---
+# a:    the allocator backing the list
+# mi:   the instruction to attach to
+# iid:  the IR OP_DBG_VALUE instruction id
+# vreg: the operand's MIR vreg, or MIR_VREG_NIL for no home
+# ret:  true on success, or an allocation error
+pub fun instr_attach_dbg(a: *A.Allocator, mi: *MirInstr, iid: u32, vreg: u32) R.Result[bool, str] {
+    val n: u32 = mi.dbg_binding_count;
+    if (mi.dbg_bindings == nil) {
+        val ra: R.Result[*MirDbgBinding, str] = A.allocate[MirDbgBinding](a, 1::usize);
+        if (R.is_err[*MirDbgBinding, str](ra)) { ret R.err[bool, str](R.unwrap_err[*MirDbgBinding, str](ra)); }
+        mi.dbg_bindings = R.unwrap_ok[*MirDbgBinding, str](ra);
+    }
+    or {
+        val rr: R.Result[*MirDbgBinding, str] = A.reallocate[MirDbgBinding](a, mi.dbg_bindings, n::usize, (n + 1)::usize);
+        if (R.is_err[*MirDbgBinding, str](rr)) { ret R.err[bool, str](R.unwrap_err[*MirDbgBinding, str](rr)); }
+        mi.dbg_bindings = R.unwrap_ok[*MirDbgBinding, str](rr);
+    }
+    mi.dbg_bindings[n].iid  = iid;
+    mi.dbg_bindings[n].vreg = vreg;
+    mi.dbg_binding_count = n + 1;
+    ret R.ok[bool, str](true);
+}
+
 # release every owned array in a MIR module, safe on a partially built module and on nil
 # ---
 # mm: the module to tear down; all owned storage is freed and fields zeroed
@@ -779,6 +819,9 @@ fun dnit_block(a: *A.Allocator, mb: *MirBlock) {
         val mi: *MirInstr = ?mb.instrs[i];
         if (mi.operands != nil && mi.operand_count > 0) {
             A.deallocate[MirOperand](a, mi.operands, mi.operand_count::usize);
+        }
+        if (mi.dbg_bindings != nil && mi.dbg_binding_count > 0) {
+            A.deallocate[MirDbgBinding](a, mi.dbg_bindings, mi.dbg_binding_count::usize);
         }
         if (mi.opcode == MIR_ASM && mi.asm_block != nil) {
             if (mi.asm_block.binds != nil && mi.asm_block.bind_count > 0) {
