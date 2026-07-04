@@ -250,6 +250,55 @@ verify_dwarf() {
         fi
     fi
 
+    # 8. composite type DIEs (#1919): a fixture with a record local emits a
+    #    DW_TAG_structure_type with DW_TAG_member children at their byte offsets, a
+    #    DW_TAG_array_type + DW_TAG_subrange_type for its array local, and a
+    #    DW_TAG_pointer_type resolving the record for its typed pointer. under the
+    #    primitive-only tier all of these are absent, so this is the falsifiable composite
+    #    check.
+    if grep -q '^rec ' "$src"; then
+        di=$("$dwarfdump" --debug-info "$g" 2>/dev/null)
+        for tag in DW_TAG_structure_type DW_TAG_member DW_TAG_array_type DW_TAG_subrange_type DW_TAG_pointer_type; do
+            if ! printf '%s\n' "$di" | grep -q "$tag"; then
+                echo "FAIL $label (no $tag DIE for aggregate/composite locals)"; rm -rf "$tmp"; return 1
+            fi
+        done
+        if ! printf '%s\n' "$di" | grep -q 'DW_AT_data_member_location'; then
+            echo "FAIL $label (struct member has no DW_AT_data_member_location)"; rm -rf "$tmp"; return 1
+        fi
+
+        # 8a. the array's element count and the pointer's pointee are VALUE-checked, not
+        #     just tag-checked: llvm-dwarfdump synthesizes a type's name from its DIE, so
+        #     a wrong DW_AT_count renders "i32[3]" not "i32[4]", and a pointer whose ref4
+        #     resolves to the wrong pointee renders e.g. "i32 *" not "Point *". both would
+        #     pass --verify (any in-CU ref4 / any count is structurally valid), so these
+        #     catch value drift the tag greps miss.
+        if ! printf '%s\n' "$di" | grep -q 'DW_AT_type.*"i32\[4\]"'; then
+            echo "FAIL $label (array local's DW_AT_count is not 4: no i32[4] type)"; rm -rf "$tmp"; return 1
+        fi
+        if ! printf '%s\n' "$di" | grep -q 'DW_AT_type.*"Point \*"'; then
+            echo "FAIL $label (typed pointer does not resolve to the Point record)"; rm -rf "$tmp"; return 1
+        fi
+
+        # 8b. by-reference aggregate locations never use a bare register address. An
+        #     aggregate's dbg-value is its storage POINTER; describing it whole-scope as
+        #     DW_OP_breg<reg>+0 (address in a reused register) is a wild pointer read that
+        #     --verify accepts. The producer instead emits DW_OP_fbreg+DW_OP_deref for a
+        #     frame home and OMITS a register home, so a DW_OP_breg location that is NOT a
+        #     computed value (no DW_OP_stack_value) is the regression, on any variable.
+        if printf '%s\n' "$di" | grep 'DW_OP_breg' | grep -qv 'DW_OP_stack_value'; then
+            echo "FAIL $label (a DW_OP_breg location is a bare register address, not a computed value — the aggregate wild-read regression)"; rm -rf "$tmp"; return 1
+        fi
+
+        # NOTE (member VALUES): these checks are structural — DIE shape, DW_AT_count and
+        # pointee names, and location-form. They do NOT read a member's runtime VALUE
+        # (`pt.count == 100`); that needs a debugger executing the target, and the ELF lane
+        # is a host-side DWARF inspector (llvm-dwarfdump / addr2line), tool-free of a
+        # runtime. The member-value read is the STAGED lldb source-breakpoint check (see the
+        # staged block below); until a runtime runner lands, a frame-homed aggregate's
+        # member values are proven only by the PR's manual gdb transcript, not by CI.
+    fi
+
     echo "PASS $label"
     rm -rf "$tmp"
     return 0
@@ -316,6 +365,36 @@ verify_no_foreign_file() {
     return 0
 }
 
+# verify_aggregate_release <fixture_dir> <build_target> — the release counterpart of the
+# composite checks. At -O2 an aggregate's storage pointer re-homes across its scope, so
+# its location becomes a `.debug_loclists` list (the debug build keeps a single stable
+# home and never exercises that path). This leg asserts --verify is clean and, crucially,
+# that no aggregate location is a bare DW_OP_breg register address (the wild-read
+# regression) even when homes move — the byref plumb-through in the per-range loclist
+# emit is otherwise unexercised by CI.
+verify_aggregate_release() {
+    dir=$1; bt=$2
+    label="${dir#"$here"/} [$bt release]"
+    tmp=$(mktemp -d)
+    g="$tmp/g"
+    if ! (cd "$dir" && "$compiler" dep pull && "$compiler" build . --target "$bt" --profile release -g -o "$g") >"$tmp/b.log" 2>&1; then
+        echo "FAIL $label (build release -g)"; sed 's/^/    /' "$tmp/b.log" >&2; rm -rf "$tmp"; return 1
+    fi
+    if ! "$dwarfdump" --verify "$g" >"$tmp/v.log" 2>&1; then
+        echo "FAIL $label (llvm-dwarfdump --verify)"; tail -30 "$tmp/v.log" | sed 's/^/    /' >&2; rm -rf "$tmp"; return 1
+    fi
+    di=$("$dwarfdump" --debug-info "$g" 2>/dev/null)
+    if ! printf '%s\n' "$di" | grep -q 'DW_TAG_structure_type'; then
+        echo "FAIL $label (no composite type DIE at release)"; rm -rf "$tmp"; return 1
+    fi
+    if printf '%s\n' "$di" | grep 'DW_OP_breg' | grep -qv 'DW_OP_stack_value'; then
+        echo "FAIL $label (a moving aggregate rendered a bare DW_OP_breg register address — the wild-read regression in the loclist path)"; rm -rf "$tmp"; return 1
+    fi
+    echo "PASS $label"
+    rm -rf "$tmp"
+    return 0
+}
+
 for dir in "$fixtures"/$filter; do
     [ -f "$dir/mach.toml" ] || continue
     # the inline fixtures are release-only (their callees inline away at -O0); they have
@@ -341,6 +420,16 @@ if [ -f "$fixtures/inline4/mach.toml" ]; then
     for bt in $elf_targets; do
         ran=$((ran + 1))
         verify_inline_release "$fixtures/inline4" "$bt" 4 "a b c d" || fails=$((fails + 1))
+    done
+fi
+
+# #1919 release leg: an aggregate re-homes at -O2, so its location becomes a loclist; this
+# exercises the byref plumb-through in the per-range loclist emit that the debug build
+# (single stable home) never reaches, and pins the no-bare-breg wild-read guard there.
+if [ -f "$fixtures/aggregate/mach.toml" ]; then
+    for bt in $elf_targets; do
+        ran=$((ran + 1))
+        verify_aggregate_release "$fixtures/aggregate" "$bt" || fails=$((fails + 1))
     done
 fi
 
