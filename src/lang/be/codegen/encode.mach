@@ -72,6 +72,8 @@ pub rec EncoderOutput {
     row_count:    u32;
     varlocs:      *VarLoc;
     varloc_count: u32;
+    inline_pcs:   *InlinePc;
+    inline_pc_count: u32;
 }
 
 # one retained PC<->source mapping: a `.text` byte offset and the source location of
@@ -95,6 +97,24 @@ pub rec LineRow {
     text_offset: u32;
     sec:         u32;
     loc:         source.SrcLoc;
+}
+
+# one inline-instance transition: at `text_offset` the active inline instance becomes
+# `inline_site` (0 = the function's own body, else a 1-based ir.Function inline-site id).
+# The encoder appends one only when the instance CHANGES between consecutive
+# instructions, in ascending `text_offset` order, so a record governs `[text_offset,
+# next_offset)`. insert_text keeps `text_offset` correct through branch relaxation, and
+# pack re-homes it exactly like a LineRow. The DWARF inlined_subroutine producer (#1707)
+# groups these into per-instance `.text` ranges; nothing else reads them and they never
+# affect the emitted bytes.
+# ---
+# text_offset: `.text` byte offset where this instance becomes active
+# sec:         owning section index after re-homing (0 until then)
+# inline_site: the 1-based inline instance now active, or 0 for the function body
+pub rec InlinePc {
+    text_offset: u32;
+    sec:         u32;
+    inline_site: u32;
 }
 
 # a source-variable location record: at `.text` offset `text_offset`, the variable
@@ -426,6 +446,10 @@ pub rec EncodeState {
     varlocs:     *VarLoc;
     varloc_count: u32;
     varloc_cap:  u32;
+    inline_pcs:  *InlinePc;
+    inline_pc_count: u32;
+    inline_pc_cap:   u32;
+    last_inline_site: u32;
     interner:    *intern.Interner;
     abi:         *abi.AbiVTable;
     os:          *tos.OsVTable;
@@ -542,6 +566,8 @@ pub fun encode_driver(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirModul
     out.symbol_count = st.sym_count;
     out.rows         = st.rows;
     out.row_count    = st.row_count;
+    out.inline_pcs   = st.inline_pcs;
+    out.inline_pc_count = st.inline_pc_count;
     out.varlocs      = st.varlocs;
     out.varloc_count = st.varloc_count;
 
@@ -814,6 +840,10 @@ fun state_init(st: *EncodeState, alloc: *A.Allocator, m: *mir.MirModule, tgt: *t
     st.varlocs     = nil;
     st.varloc_count = 0;
     st.varloc_cap  = 0;
+    st.inline_pcs  = nil;
+    st.inline_pc_count = 0;
+    st.inline_pc_cap   = 0;
+    st.last_inline_site = 0;
     st.interner    = m.interner;
     st.abi         = tgt.abi;
     st.os          = tgt.os;
@@ -849,6 +879,12 @@ fun state_dnit(st: *EncodeState) {
     st.varlocs      = nil;
     st.varloc_count = 0;
     st.varloc_cap   = 0;
+    if (st.inline_pcs != nil && st.inline_pc_cap > 0) {
+        A.deallocate[InlinePc](st.alloc, st.inline_pcs, st.inline_pc_cap::usize);
+    }
+    st.inline_pcs      = nil;
+    st.inline_pc_count = 0;
+    st.inline_pc_cap   = 0;
     scratch_release(st);
 }
 
@@ -1028,6 +1064,11 @@ pub fun insert_text(st: *EncodeState, pos: u32, nbytes: u32) R.Result[bool, str]
         if (st.varlocs[vli].text_offset >= pos) { st.varlocs[vli].text_offset = st.varlocs[vli].text_offset + nbytes; }
         vli = vli + 1;
     }
+    var ipi: u32 = 0;
+    for (ipi < st.inline_pc_count) {
+        if (st.inline_pcs[ipi].text_offset >= pos) { st.inline_pcs[ipi].text_offset = st.inline_pcs[ipi].text_offset + nbytes; }
+        ipi = ipi + 1;
+    }
     ret R.ok[bool, str](true);
 }
 
@@ -1131,6 +1172,49 @@ fun grow_rows(st: *EncodeState) R.Result[bool, str] {
     ret R.ok[bool, str](true);
 }
 
+# grow the inline-pc transition array, allocating it on first use
+# ---
+# st:  the state whose inline-pc array is grown
+# ret: ok(true) once the array has room, or an allocation error
+fun grow_inline_pcs(st: *EncodeState) R.Result[bool, str] {
+    if (st.inline_pcs == nil) {
+        val res_alloc: R.Result[*InlinePc, str] = A.allocate[InlinePc](st.alloc, DRIVER_INIT_CAP::usize);
+        if (R.is_err[*InlinePc, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*InlinePc, str](res_alloc)); }
+        st.inline_pcs    = R.unwrap_ok[*InlinePc, str](res_alloc);
+        st.inline_pc_cap = DRIVER_INIT_CAP;
+        ret R.ok[bool, str](true);
+    }
+    val new_cap: u32 = st.inline_pc_cap * 2;
+    val res_realloc: R.Result[*InlinePc, str] = A.reallocate[InlinePc](st.alloc, st.inline_pcs, st.inline_pc_cap::usize, new_cap::usize);
+    if (R.is_err[*InlinePc, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*InlinePc, str](res_realloc)); }
+    st.inline_pcs    = R.unwrap_ok[*InlinePc, str](res_realloc);
+    st.inline_pc_cap = new_cap;
+    ret R.ok[bool, str](true);
+}
+
+# record that at `text_offset` the active inline instance becomes `inline_site`. Only a
+# CHANGE from the previously active instance appends a record, so a run of instructions
+# in one instance forms a single range `[text_offset, next_offset)`. Called for every
+# instruction at its first byte; a no-op for the common body-to-body (0) run.
+# ---
+# st:          the encode state
+# text_offset: `.text` offset of the instruction being encoded
+# inline_site: the instruction's inline instance (0 = function body)
+# ret:         ok(true), or an allocation error
+pub fun push_inline_pc(st: *EncodeState, text_offset: u32, inline_site: u32) R.Result[bool, str] {
+    if (inline_site == st.last_inline_site) { ret R.ok[bool, str](true); }
+    if (st.inline_pc_count >= st.inline_pc_cap) {
+        val res_grow: R.Result[bool, str] = grow_inline_pcs(st);
+        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+    }
+    st.inline_pcs[st.inline_pc_count].text_offset = text_offset;
+    st.inline_pcs[st.inline_pc_count].sec         = 0;
+    st.inline_pcs[st.inline_pc_count].inline_site = inline_site;
+    st.inline_pc_count  = st.inline_pc_count + 1;
+    st.last_inline_site = inline_site;
+    ret R.ok[bool, str](true);
+}
+
 # a minimal encode state for the row / varloc / insert_text unit tests: a text sink and
 # an empty set of mark / reloc / fixup / block / row / varloc arrays, no interner or
 # vtables
@@ -1143,6 +1227,7 @@ fun t_row_state(alloc: *A.Allocator, st: *EncodeState) {
     st.blocks = nil; st.block_count = 0; st.block_cap = 0;
     st.rows = nil;   st.row_count = 0;   st.row_cap = 0;
     st.varlocs = nil; st.varloc_count = 0; st.varloc_cap = 0;
+    st.inline_pcs = nil; st.inline_pc_count = 0; st.inline_pc_cap = 0;
     st.interner = nil; st.abi = nil; st.os = nil;
 }
 
