@@ -250,6 +250,30 @@ verify_dwarf() {
         fi
     fi
 
+    # 8. composite type DIEs (#1919): a fixture with a record local emits a
+    #    DW_TAG_structure_type with DW_TAG_member children at their byte offsets, a
+    #    DW_TAG_array_type + DW_TAG_subrange_type for its array local, and a
+    #    DW_TAG_pointer_type resolving the record for its typed pointer. under the
+    #    primitive-only tier all of these are absent, so this is the falsifiable
+    #    composite check. the by-reference aggregate location (DW_OP_breg / fbreg+deref,
+    #    not DW_OP_reg) is what makes an aggregate's members readable, so it is asserted too.
+    if grep -q '^rec ' "$src"; then
+        di=$("$dwarfdump" --debug-info "$g" 2>/dev/null)
+        for tag in DW_TAG_structure_type DW_TAG_member DW_TAG_array_type DW_TAG_subrange_type DW_TAG_pointer_type; do
+            if ! printf '%s\n' "$di" | grep -q "$tag"; then
+                echo "FAIL $label (no $tag DIE for aggregate/composite locals)"; rm -rf "$tmp"; return 1
+            fi
+        done
+        if ! printf '%s\n' "$di" | grep -q 'DW_AT_data_member_location'; then
+            echo "FAIL $label (struct member has no DW_AT_data_member_location)"; rm -rf "$tmp"; return 1
+        fi
+        # a record local's location must address its storage (DW_OP_breg or fbreg+deref),
+        # never DW_OP_reg (which would misread the address as the aggregate's bytes).
+        if ! printf '%s\n' "$di" | grep -Eq 'DW_OP_breg|DW_OP_fbreg'; then
+            echo "FAIL $label (no by-reference aggregate location)"; rm -rf "$tmp"; return 1
+        fi
+    fi
+
     echo "PASS $label"
     rm -rf "$tmp"
     return 0
