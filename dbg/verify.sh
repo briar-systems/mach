@@ -123,6 +123,17 @@ var_loclist_ranges() {
         END { print cnt+0 }'
 }
 
+# var_computed <binary> <name> — "1" if the named local's DW_AT_location is a computed
+# value (DW_OP_const* ... DW_OP_stack_value), else "0". A constant-folded local (the
+# #1706 tier) renders this way instead of dropping its location.
+var_computed() {
+    "$dwarfdump" --debug-info "$1" 2>/dev/null | awk -v want="$2" '
+        /DW_TAG_/    { invar = ($0 ~ /DW_TAG_variable/); name="" }
+        /DW_AT_name/ && invar { if ($0 ~ "\\(\"" want "\"\\)") name=want }
+        name==want && /DW_AT_location/ && /DW_OP_const/ && /DW_OP_stack_value/ { print "1"; exit }
+        END { print "0" }' | head -1
+}
+
 # elf_seg_identical <a> <b> — true if every PT_LOAD segment of <a> has byte-identical
 # file content in <b>, after the ELF header's section-table bookkeeping (e_shoff,
 # e_shnum, e_shstrndx — expected to differ once -g adds named sections) is normalized.
@@ -224,6 +235,15 @@ verify_dwarf() {
         nr=$(var_loclist_ranges "$g" x)
         if [ "${nr:-0}" -lt 2 ]; then
             echo "FAIL $label ('x' has $nr loclist ranges; expected a multi-range location list)"; rm -rf "$tmp"; return 1
+        fi
+    fi
+
+    # 7. computed constant values (#1706): `konst`'s folded local `kc` renders as a
+    #    DW_OP_const* ... DW_OP_stack_value computed value. under the reg/frame tiers
+    #    alone it would have no location, so this is the falsifiable computed-value check.
+    if grep -q '^fun konst' "$src"; then
+        if [ "$(var_computed "$g" kc)" != "1" ]; then
+            echo "FAIL $label ('kc' has no DW_OP_const/stack_value computed location)"; rm -rf "$tmp"; return 1
         fi
     fi
 
