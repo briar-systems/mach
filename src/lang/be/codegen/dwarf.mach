@@ -34,11 +34,13 @@ use R: std.types.result;
 use enc:     mach.lang.be.codegen.encode;
 use obj:     mach.lang.be.obj;
 use ir:      mach.lang.me.ir;
+use ir_type: mach.lang.me.ir.type;
 use id:      mach.lang.me.ir.id;
 use intern:  mach.lang.intern;
 use session: mach.lang.session;
 use source:  mach.lang.source;
 use semtype: mach.lang.type;
+use generics: mach.lang.fe.sema.generics;
 use target:  mach.lang.target.resolved;
 use isa:     mach.lang.target.isa;
 use of:      mach.lang.target.of;
@@ -182,13 +184,17 @@ val ABBREV_INLINED_RANGES_KIDS: u8 = 0x0f;
 val ABBREV_SUBPROGRAM_LEAF:      u8 = 0x10;
 val ABBREV_SUBPROGRAM_VOID_LEAF: u8 = 0x11;
 # composite/aggregate type DIEs (#1919): a struct/union with member children, an array
-# with a subrange child, and a childless typed pointer
-val ABBREV_STRUCT:   u8 = 0x12;
-val ABBREV_UNION:    u8 = 0x13;
-val ABBREV_MEMBER:   u8 = 0x14;
-val ABBREV_ARRAY:    u8 = 0x15;
-val ABBREV_SUBRANGE: u8 = 0x16;
-val ABBREV_POINTER:  u8 = 0x17;
+# with a subrange child, and a childless typed pointer. The *_LEAF struct/union variants
+# are DW_CHILDREN_no, for a memberless aggregate (an empty record) so it never advertises
+# children it lacks (the #1949 discipline)
+val ABBREV_STRUCT:      u8 = 0x12;
+val ABBREV_UNION:       u8 = 0x13;
+val ABBREV_MEMBER:      u8 = 0x14;
+val ABBREV_ARRAY:       u8 = 0x15;
+val ABBREV_SUBRANGE:    u8 = 0x16;
+val ABBREV_POINTER:     u8 = 0x17;
+val ABBREV_STRUCT_LEAF: u8 = 0x18;
+val ABBREV_UNION_LEAF:  u8 = 0x19;
 
 # DWARF 5 line-number program: standard opcodes, extended opcodes, and the tuned
 # special-opcode parameters this producer emits
@@ -329,6 +335,10 @@ val VLOC_CONST: u8 = 4;
 #           in the shared LocRange array; each range carries its own home + expression
 # loclist_off: byte offset of this variable's `.debug_loclists` entry, set by
 #           build_loclists, patched into the DW_FORM_sec_offset field
+# byref:    true when the variable is a by-reference aggregate (struct / union / array):
+#           its OP_DBG_VALUE binds the storage POINTER (an aggregate value is its
+#           storage), so its home holds the aggregate's address, not its value, and the
+#           location reads through that address rather than naming it
 rec DwVar {
     name_off:    u32;
     ty:          i32;
@@ -340,6 +350,7 @@ rec DwVar {
     range_start: u32;
     range_count: u32;
     loclist_off: u32;
+    byref:       bool;
     # the inline instance this variable belongs to (0 = the function's own body, else a
     # 1-based inline-site id); the #1707 producer nests a non-zero one under its instance
     inline_site: u32;
@@ -463,6 +474,19 @@ rec TypeMember {
     name_off: u32;
     type_ix:  u32;
     offset:   u32;
+}
+
+# a deferred DW_FORM_ref4 patch within the type-DIE block: at `.debug_info` byte offset
+# `pos` write the CU-relative offset of type `target`. Type DIEs cross-reference each
+# other (a member / element / pointee), and a self-referential aggregate makes some of
+# those references forward, so their targets' offsets are only known after the whole
+# block is emitted
+# ---
+# pos:    absolute `.debug_info` byte offset of the 4-byte ref4 field
+# target: the referenced type's index in the TypeCtx table
+rec TypeFixup {
+    pos:    u32;
+    target: u32;
 }
 
 # the compile unit's growable type table: the distinct type DIEs it emits plus the
@@ -739,6 +763,99 @@ fun sem_base_type(s: *session.Session, tid: semtype.TypeId, address_size: u8) O.
     ret O.some[TypeDie](bt);
 }
 
+# bridge a semantic type to its IR type, the single layout authority for aggregate DIEs
+# (member byte offsets / struct sizes). Mirrors the front end's `lower_type` structural
+# mapping; because the IR type interners deduplicate, this lands on the exact type
+# lowering already produced (a lookup in practice - every reachable type was lowered)
+# rather than a new one, so DWARF member offsets come from the same layout that emitted
+# the code. IR pointers are opaque, so this never recurses through one (it terminates)
+# ---
+# s:     session (semantic type universe, align overrides, allocator)
+# irmod: the IR module whose type universe is consulted
+# sem:   the semantic TypeId to bridge
+# ret:   the corresponding IrTypeId, or an allocation error
+fun sem_to_ir(s: *session.Session, irmod: *ir.Module, sem: semtype.TypeId) R.Result[ir_type.IrTypeId, str] {
+    if (sem == semtype.TYPE_NIL) { ret ir_type.intern_void(?irmod.types); }
+    val to: O.Option[*semtype.Type] = semtype.get(?s.types, sem);
+    if (O.is_none[*semtype.Type](to)) { ret ir_type.intern_void(?irmod.types); }
+    val t: *semtype.Type = O.unwrap[*semtype.Type](to);
+    val k: semtype.TypeKind = t.kind;
+
+    # secrecy has no runtime representation: `^T` bridges to exactly `T`'s shape.
+    if (k == semtype.TYPE_SECRET) { ret sem_to_ir(s, irmod, t.data.secret.base); }
+
+    val d: semtype.PrimDesc = semtype.prim_desc(k);
+    if (d.class == semtype.PRIM_CLASS_INT)   { ret ir_type.intern_int(?irmod.types, d.bits); }
+    if (d.class == semtype.PRIM_CLASS_FLOAT) { ret ir_type.intern_float(?irmod.types, d.bits); }
+    if (d.class == semtype.PRIM_CLASS_PTR)   { ret ir_type.intern_ptr(?irmod.types); }
+    if (k == semtype.TYPE_POINTER)           { ret ir_type.intern_ptr(?irmod.types); }
+
+    if (k == semtype.TYPE_ARRAY) {
+        val rb: R.Result[ir_type.IrTypeId, str] = sem_to_ir(s, irmod, t.data.array.base);
+        if (R.is_err[ir_type.IrTypeId, str](rb)) { ret rb; }
+        ret ir_type.intern_array(?irmod.types, R.unwrap_ok[ir_type.IrTypeId, str](rb), t.data.array.count);
+    }
+
+    if (k == semtype.TYPE_REC || k == semtype.TYPE_UNI || k == semtype.TYPE_INSTANCE) {
+        ret sem_to_ir_nominal(s, irmod, sem, k == semtype.TYPE_UNI);
+    }
+
+    # function / generic-param / error types bridge to an opaque pointer-width slot, as
+    # `lower_type` does, so a variable of such a type still sizes correctly.
+    ret ir_type.intern_ptr(?irmod.types);
+}
+
+# bridge a nominal (rec / uni) or generic instance to an IR struct / union of its lowered
+# field types, read from the session-global field store - the same source `lower_nominal`
+# uses, so the interned layout matches
+# ---
+# s:        session
+# irmod:    the IR module
+# tid:      the nominal / instance semantic TypeId
+# is_union: bridge to an IR union rather than a struct
+# ret:      the IrTypeId, or an allocation error
+fun sem_to_ir_nominal(s: *session.Session, irmod: *ir.Module, tid: semtype.TypeId, is_union: bool) R.Result[ir_type.IrTypeId, str] {
+    # materialize a generic instance's substituted field table before reading it, exactly
+    # as lower_type does; a no-op for a non-instance or an already-built table.
+    generics.ensure_fields(s, tid);
+
+    var nom_align: u32 = 0;
+    val ta: O.Option[u32] = session.type_align(s, tid::u32);
+    if (O.is_some[u32](ta)) { nom_align = O.unwrap[u32](ta); }
+
+    val fields_len: u32 = semtype.field_count(?s.types, tid);
+    if (fields_len == 0) {
+        if (is_union) { ret ir_type.intern_union(?irmod.types, nil, 0, nom_align); }
+        ret ir_type.intern_struct(?irmod.types, nil, 0, nom_align);
+    }
+
+    val rbuf: R.Result[*ir_type.IrTypeId, str] = A.allocate[ir_type.IrTypeId](s.alloc, fields_len::usize);
+    if (R.is_err[*ir_type.IrTypeId, str](rbuf)) { ret R.err[ir_type.IrTypeId, str](R.unwrap_err[*ir_type.IrTypeId, str](rbuf)); }
+    val buf: *ir_type.IrTypeId = R.unwrap_ok[*ir_type.IrTypeId, str](rbuf);
+
+    var i: u32 = 0;
+    for (i < fields_len) {
+        val fe: O.Option[*semtype.FieldEntry] = semtype.field_at(?s.types, tid, i);
+        if (O.is_none[*semtype.FieldEntry](fe)) {
+            A.deallocate[ir_type.IrTypeId](s.alloc, buf, fields_len::usize);
+            ret R.err[ir_type.IrTypeId, str]("dwarf.sem_to_ir: corrupt field table");
+        }
+        val rf: R.Result[ir_type.IrTypeId, str] = sem_to_ir(s, irmod, O.unwrap[*semtype.FieldEntry](fe).ty);
+        if (R.is_err[ir_type.IrTypeId, str](rf)) {
+            A.deallocate[ir_type.IrTypeId](s.alloc, buf, fields_len::usize);
+            ret rf;
+        }
+        buf[i] = R.unwrap_ok[ir_type.IrTypeId, str](rf);
+        i = i + 1;
+    }
+
+    var res: R.Result[ir_type.IrTypeId, str];
+    if (is_union) { res = ir_type.intern_union(?irmod.types, buf, fields_len, nom_align); }
+    or            { res = ir_type.intern_struct(?irmod.types, buf, fields_len, nom_align); }
+    A.deallocate[ir_type.IrTypeId](s.alloc, buf, fields_len::usize);
+    ret res;
+}
+
 # the frame-base DWARF register number for the target, read through the ISA's
 # `dwarf_reg` hook (#1693) mapping the physical frame pointer to its DWARF number.
 # DWARF-based targets always wire the hook, so this is defined for every arch that
@@ -947,6 +1064,22 @@ fun build_abbrev(b: *enc.ByteBuf) {
     emit_attr(b, DW_AT_byte_size, DW_FORM_udata);
     uleb(b, 0); uleb(b, 0);
 
+    # the DW_CHILDREN_no struct / union variants for a memberless aggregate (an empty
+    # record), so it never advertises children it lacks (#1949).
+    uleb(b, ABBREV_STRUCT_LEAF::u64);
+    uleb(b, DW_TAG_structure_type::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_name,      DW_FORM_strp);
+    emit_attr(b, DW_AT_byte_size, DW_FORM_udata);
+    uleb(b, 0); uleb(b, 0);
+
+    uleb(b, ABBREV_UNION_LEAF::u64);
+    uleb(b, DW_TAG_union_type::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_name,      DW_FORM_strp);
+    emit_attr(b, DW_AT_byte_size, DW_FORM_udata);
+    uleb(b, 0); uleb(b, 0);
+
     uleb(b, 0);   # null abbrev code terminates the table
 }
 
@@ -1132,32 +1265,107 @@ fun emit_inlines(b: *enc.ByteBuf, f: u32, parent_site: u32, inlines: *DwInline, 
 }
 
 # emit the compile unit's type DIEs in table order, recording each type's `.debug_info`
-# offset (`off`, CU-relative) for the ref4 references that follow. This increment emits
-# only DW_TAG_base_type scalars; composite kinds are added by the aggregate tier
+# offset (`off`, CU-relative) for the ref4 references that follow. Scalars emit a
+# DW_TAG_base_type; a pointer / array / record / union emits its composite tag with its
+# children (members / subrange). Cross-type ref4s are written as placeholders and their
+# `pos`/`target` recorded in `fixups`; `resolve_type_fixups` patches them once every
+# type's offset is known (handling the forward references self-referential aggregates
+# introduce)
 # ---
 # b:       the info buffer
 # tc:      the type table (each entry's `off` filled in place)
 # len_pos: buffer offset of the CU unit_length field (ref4 offsets are relative to it)
 # relocs/reloc_count: the deferred `.debug_info` relocation list (for name strps)
-fun emit_type_dies(b: *enc.ByteBuf, tc: *TypeCtx, len_pos: usize, relocs: *InfoReloc, reloc_count: *u32) {
+# fixups/nfix: out - the deferred ref4 patch list and its running count
+fun emit_type_dies(b: *enc.ByteBuf, tc: *TypeCtx, len_pos: usize, relocs: *InfoReloc, reloc_count: *u32,
+                   fixups: *TypeFixup, nfix: *u32) {
     var t: u32 = 0;
     for (t < tc.ntypes) {
         val td: *TypeDie = ?tc.types[t];
         td.off = (b.len - len_pos)::u32;
-        enc.emit_byte(b, ABBREV_BASE_TYPE);
-        push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, td.name_off::i64);
-        enc.emit_u32(b, 0);                     # DW_AT_name (strp, relocated to .debug_str)
-        enc.emit_byte(b, td.encoding);
-        enc.emit_byte(b, td.byte_size::u8);
+        if (td.kind == TK_BASE) {
+            enc.emit_byte(b, ABBREV_BASE_TYPE);
+            push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, td.name_off::i64);
+            enc.emit_u32(b, 0);                 # DW_AT_name (strp)
+            enc.emit_byte(b, td.encoding);
+            enc.emit_byte(b, td.byte_size::u8);
+        }
+        or (td.kind == TK_POINTER) {
+            enc.emit_byte(b, ABBREV_POINTER);
+            push_type_fixup(fixups, nfix, b.len::u32, td.elem::u32);
+            enc.emit_u32(b, 0);                 # DW_AT_type (ref4, patched)
+            uleb(b, td.byte_size::u64);         # DW_AT_byte_size
+        }
+        or (td.kind == TK_ARRAY) {
+            enc.emit_byte(b, ABBREV_ARRAY);
+            push_type_fixup(fixups, nfix, b.len::u32, td.elem::u32);
+            enc.emit_u32(b, 0);                 # DW_AT_type (ref4, patched)
+            enc.emit_byte(b, ABBREV_SUBRANGE);  # the single subrange child gives the count
+            uleb(b, td.count::u64);             # DW_AT_count
+            enc.emit_byte(b, 0);                # null DIE terminates the array's children
+        }
+        or {
+            # a memberless aggregate uses the DW_CHILDREN_no leaf abbrev (and no
+            # terminator), so it never advertises children it lacks (#1949).
+            val kids: bool = td.memb_count > 0;
+            if (td.kind == TK_UNION) {
+                if (kids) { enc.emit_byte(b, ABBREV_UNION); } or { enc.emit_byte(b, ABBREV_UNION_LEAF); }
+            } or {
+                if (kids) { enc.emit_byte(b, ABBREV_STRUCT); } or { enc.emit_byte(b, ABBREV_STRUCT_LEAF); }
+            }
+            push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, td.name_off::i64);
+            enc.emit_u32(b, 0);                 # DW_AT_name (strp)
+            uleb(b, td.byte_size::u64);         # DW_AT_byte_size
+            var m: u32 = td.memb_start;
+            val mend: u32 = td.memb_start + td.memb_count;
+            for (m < mend) {
+                val mb: *TypeMember = ?tc.membs[m];
+                enc.emit_byte(b, ABBREV_MEMBER);
+                push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, mb.name_off::i64);
+                enc.emit_u32(b, 0);             # DW_AT_name (strp)
+                push_type_fixup(fixups, nfix, b.len::u32, mb.type_ix);
+                enc.emit_u32(b, 0);             # DW_AT_type (ref4, patched)
+                uleb(b, mb.offset::u64);        # DW_AT_data_member_location
+                m = m + 1;
+            }
+            if (kids) { enc.emit_byte(b, 0); }  # null DIE terminates the members (only when present)
+        }
         t = t + 1;
+    }
+    resolve_type_fixups(b, tc, fixups, nfix);
+}
+
+# record a deferred ref4 patch: at buffer offset `pos`, the CU-relative offset of type
+# `target` is written once the whole type block is emitted
+# ---
+# fixups/nfix: the patch list and its running count (grown by the caller's cap)
+# pos:         absolute `.debug_info` offset of the ref4 field
+# target:      the referenced type's index
+fun push_type_fixup(fixups: *TypeFixup, nfix: *u32, pos: u32, target: u32) {
+    fixups[@nfix].pos    = pos;
+    fixups[@nfix].target = target;
+    @nfix = @nfix + 1;
+}
+
+# patch every recorded type ref4 with its target's now-known CU-relative offset
+# ---
+# b:           the info buffer (patched in place)
+# tc:          the type table (target offsets)
+# fixups/nfix: the recorded patches
+fun resolve_type_fixups(b: *enc.ByteBuf, tc: *TypeCtx, fixups: *TypeFixup, nfix: *u32) {
+    var i: u32 = 0;
+    for (i < @nfix) {
+        bin.write_u32_le(b.data, fixups[i].pos::usize, tc.types[fixups[i].target].off);
+        i = i + 1;
     }
 }
 
 # build the `.debug_info` compile unit: the DWARF 5 unit header, the CU DIE
-# (producer / name / comp_dir strings, language, code range, stmt_list), then a
-# `DW_TAG_base_type` DIE per gathered primitive and a `DW_TAG_subprogram` DIE per
-# function, closed by a null DIE. Records the CU low_pc / stmt_list field offsets and
-# appends an `InfoReloc` for every strp (name) and addr (low_pc) field
+# (producer / name / comp_dir strings, language, code range, stmt_list), then a type DIE
+# per gathered type (base scalars + composite records / unions / arrays / pointers) and a
+# `DW_TAG_subprogram` DIE per function, closed by a null DIE. Records the CU low_pc /
+# stmt_list field offsets and appends an `InfoReloc` for every strp (name) and addr
+# (low_pc) field
 # ---
 # b:            the buffer the info bytes are appended to
 # address_size: target pointer width in bytes
@@ -1172,11 +1380,12 @@ fun emit_type_dies(b: *enc.ByteBuf, tc: *TypeCtx, len_pos: usize, relocs: *InfoR
 # reloc_count:  out - number of InfoRelocs appended
 # low_off:      out - byte offset of the CU 8-byte low_pc field
 # stmt_off:     out - byte offset of the CU 4-byte stmt_list field
+# fixups:       scratch - the type-DIE ref4 patch list (cap >= type count + member count)
 fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp_dir: str,
                high_pc: u64, fb_reg: i32, funcs: *DwFunc, nfuncs: u32, tc: *TypeCtx,
                vars: *DwVar, relocs: *InfoReloc, reloc_count: *u32, low_off: *u32, stmt_off: *u32,
                s: *session.Session, irmod: *ir.Module, strtab: *StrTab,
-               inlines: *DwInline, ninl: u32, iranges: *DwInlineRange) {
+               inlines: *DwInline, ninl: u32, iranges: *DwInlineRange, fixups: *TypeFixup) {
     val len_pos: usize = b.len;
     enc.emit_u32(b, 0);                 # unit_length (backpatched)
     val body_start: usize = b.len;
@@ -1197,7 +1406,8 @@ fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp
     enc.emit_u32(b, 0);                 # stmt_list (relocated to .debug_line)
 
     # type DIEs first, so the subprograms below reference them by ref4.
-    emit_type_dies(b, tc, len_pos, relocs, reloc_count);
+    var nfix: u32 = 0;
+    emit_type_dies(b, tc, len_pos, relocs, reloc_count, fixups, ?nfix);
 
     # abstract-instance subprograms for the inlined callees, before the concrete
     # subprograms so each inlined_subroutine references its origin backward. One per
@@ -1370,17 +1580,35 @@ fun dbg_expr_net(irfn: *ir.Function, iid: id.InstructionId) i64 {
     ret net;
 }
 
+# whether type index `ty` names a by-reference aggregate DIE (struct / union / array).
+# such a value is manipulated through its storage address, so a variable of this type
+# homes an address rather than a value (see DwVar.byref)
+# ---
+# tc: the type table
+# ty: a type index, or -1
+# ret: true for a composite aggregate kind
+fun type_is_aggregate(tc: *TypeCtx, ty: i32) bool {
+    if (ty < 0) { ret false; }
+    val k: u8 = tc.types[ty::u32].kind;
+    ret k == TK_STRUCT || k == TK_UNION || k == TK_ARRAY;
+}
+
 # append the DWARF expression ops for a home to `e`. A register or frame slot with the
 # identity expression (net == 0) is a plain location; a salvaged value (net != 0)
 # computes the value and marks it DW_OP_stack_value; a constant home is the computed
-# value `off + net` pushed directly and marked DW_OP_stack_value
+# value `off + net` pushed directly and marked DW_OP_stack_value. When `byref`, the home
+# holds a pointer to the aggregate's storage (not its value): the location yields that
+# address - a register home is the address itself (DW_OP_breg reg 0), a spilled home
+# loads the pointer from its slot (DW_OP_fbreg off, DW_OP_deref) - so the consumer reads
+# the aggregate's bytes from it rather than misreading the pointer as the value
 # ---
-# e:    the expression buffer
-# kind: VLOC_REG / VLOC_FRAME / VLOC_CONST
-# reg:  DWARF register number when kind == VLOC_REG
-# off:  frame-base offset when kind == VLOC_FRAME; the constant value when VLOC_CONST
-# net:  the salvage net constant (0 = identity)
-fun build_loc_ops(e: *enc.ByteBuf, kind: u8, reg: i32, off: i64, net: i64) {
+# e:     the expression buffer
+# kind:  VLOC_REG / VLOC_FRAME / VLOC_CONST
+# reg:   DWARF register number when kind == VLOC_REG
+# off:   frame-base offset when kind == VLOC_FRAME; the constant value when VLOC_CONST
+# net:   the salvage net constant (0 = identity)
+# byref: true for a by-reference aggregate whose home addresses its storage
+fun build_loc_ops(e: *enc.ByteBuf, kind: u8, reg: i32, off: i64, net: i64, byref: bool) {
     if (kind == VLOC_CONST) {
         # the variable IS the compile-time constant `off + net`; push it and mark the
         # result a value, not a location. the DIE's DW_AT_type sizes / signs it, so the
@@ -1388,6 +1616,19 @@ fun build_loc_ops(e: *enc.ByteBuf, kind: u8, reg: i32, off: i64, net: i64) {
         enc.emit_byte(e, DW_OP_consts);
         sleb(e, off + net);
         enc.emit_byte(e, DW_OP_stack_value);
+        ret;
+    }
+    if (byref) {
+        # the home addresses the aggregate's storage; leave the address on the stack (no
+        # DW_OP_stack_value) so the consumer dereferences it for the aggregate's bytes.
+        if (kind == VLOC_REG) {
+            emit_reg_op(e, DW_OP_breg0, 0, reg);
+            sleb(e, 0);
+        } or {   # VLOC_FRAME: the slot holds the storage pointer, so load it.
+            enc.emit_byte(e, DW_OP_fbreg);
+            sleb(e, off);
+            enc.emit_byte(e, DW_OP_deref);
+        }
         ret;
     }
     if (kind == VLOC_REG) {
@@ -1415,9 +1656,10 @@ fun build_loc_ops(e: *enc.ByteBuf, kind: u8, reg: i32, off: i64, net: i64) {
 # ---
 # b:    the destination buffer
 # kind/reg/off/net: the home the expression describes
-fun emit_counted_loc(b: *enc.ByteBuf, kind: u8, reg: i32, off: i64, net: i64) {
+# byref: true for a by-reference aggregate whose home addresses its storage
+fun emit_counted_loc(b: *enc.ByteBuf, kind: u8, reg: i32, off: i64, net: i64, byref: bool) {
     var e: enc.ByteBuf = enc.buf_init(b.alloc);
-    build_loc_ops(?e, kind, reg, off, net);
+    build_loc_ops(?e, kind, reg, off, net, byref);
     uleb(b, e.len::u64);
     var i: usize = 0;
     for (i < e.len) { enc.emit_byte(b, e.data[i]); i = i + 1; }
@@ -1429,7 +1671,7 @@ fun emit_counted_loc(b: *enc.ByteBuf, kind: u8, reg: i32, off: i64, net: i64) {
 # b: the info buffer
 # v: the variable whose location is emitted (loc_kind is VLOC_REG or VLOC_FRAME)
 fun emit_var_location(b: *enc.ByteBuf, v: *DwVar) {
-    emit_counted_loc(b, v.loc_kind, v.reg, v.offset, v.net);
+    emit_counted_loc(b, v.loc_kind, v.reg, v.offset, v.net, v.byref);
 }
 
 # build the DWARF 5 `.debug_loclists` section: the unit header (offset_entry_count 0,
@@ -1485,7 +1727,7 @@ fun build_loclists(b: *enc.ByteBuf, funcs: *DwFunc, nfuncs: u32, vars: *DwVar, r
                     enc.emit_byte(b, DW_LLE_offset_pair);
                     uleb(b, (rg.start - fn.offset)::u64);
                     uleb(b, (rg.end - fn.offset)::u64);
-                    emit_counted_loc(b, rg.kind, rg.reg, rg.off, rg.net);
+                    emit_counted_loc(b, rg.kind, rg.reg, rg.off, rg.net, v.byref);
                 }
                 r = r + 1;
             }
@@ -2099,6 +2341,22 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     val rng_relocs: *RngReloc = R.unwrap_ok[*RngReloc, str](rrr);
     var rng_reloc_count: u32 = 0;
 
+    # the type-DIE ref4 patch list: one per pointer / array element and one per member
+    # (bounded by the type count + member count), plus a guard slot for an empty table.
+    val fixup_cap: u32 = tc.ntypes + tc.nmemb + 1;
+    val rfx: R.Result[*TypeFixup, str] = A.allocate[TypeFixup](s.alloc, fixup_cap::usize);
+    if (R.is_err[*TypeFixup, str](rfx)) {
+        A.deallocate[RngReloc](s.alloc, rng_relocs, rng_reloc_cap::usize);
+        A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize); A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
+        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
+        A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); type_ctx_dnit(?tc);
+        A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
+        A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+        ret R.err[bool, str](R.unwrap_err[*TypeFixup, str](rfx));
+    }
+    val type_fixups: *TypeFixup = R.unwrap_ok[*TypeFixup, str](rfx);
+
     build_abbrev(?b_abbrev);
     build_line(s, funcs, nfuncs, rows, row_count, text_sec, address_size, comp_dir, ?ft, ?b_line, addr_off);
     # loclists / rnglists before info: they stamp each variable's `loclist_off` and each
@@ -2113,7 +2371,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     var stmt_off: u32 = 0;
     build_info(?b_info, address_size, producer, name, comp_dir, high_pc, frame_base_reg(tgt),
                subs, nsub, ?tc, vars, info_relocs, ?info_reloc_count, ?low_off, ?stmt_off,
-               s, irmod, ?strtab, inlines, ninl, iranges);
+               s, irmod, ?strtab, inlines, ninl, iranges, type_fixups);
 
     val pr: R.Result[bool, str] = install(s, image, itn, funcs, nfuncs, cu_low_name,
                                           ?b_abbrev, ?b_line, ?b_info, ?strtab.buf, ?b_loclists, has_loclists,
@@ -2126,6 +2384,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     enc.buf_dnit(?b_loclists);
     enc.buf_dnit(?b_rnglists);
     enc.buf_dnit(?strtab.buf);
+    A.deallocate[TypeFixup](s.alloc, type_fixups, fixup_cap::usize);
     A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize);
     A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
     A.deallocate[RngReloc](s.alloc, rng_relocs, rng_reloc_cap::usize);
@@ -2387,6 +2646,7 @@ fun gather_vars(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, irf
             vars[@var_count].range_count = 0;
             vars[@var_count].loclist_off = 0;
             vars[@var_count].inline_site = vsite;
+            vars[@var_count].byref       = type_is_aggregate(tc, ty);
             @var_count = @var_count + 1;
         }
         i = i + 1;
@@ -2538,23 +2798,209 @@ fun base_intern(tc: *TypeCtx, strtab: *StrTab, bt: TypeDie) i32 {
     ret (tc.ntypes - 1)::i32;
 }
 
-# intern a semantic type into the compile unit's type table, returning its type index,
-# or -1 when the type carries no DIE (void / unresolved). This increment resolves
-# primitive scalars only; the aggregate tier extends it to composites
+# find an already-interned composite type by semantic TypeId, or -1. Composites (unlike
+# base types, which dedup by spelling) are keyed by their semantic identity, so a nominal
+# and a distinct type with the same layout stay separate DIEs
 # ---
-# s:            session (semantic type universe, interner)
+# tc:  the type table
+# sem: the semantic TypeId to look for
+# ret: the type's index, or -1 when absent
+fun comp_find(tc: *TypeCtx, sem: semtype.TypeId) i32 {
+    var i: u32 = 0;
+    for (i < tc.ntypes) {
+        if (tc.types[i].kind != TK_BASE && tc.types[i].sem == sem) { ret i::i32; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# append a composite TypeDie of `kind` keyed by `sem`, with zeroed structural links, and
+# return its index (or -1 on allocation failure). Registering the entry before recursing
+# into its children makes self-referential aggregates (a struct reached again through one
+# of its `*T` members) terminate on the second visit
+# ---
+# tc:   the type table
+# kind: the composite TK_* kind
+# sem:  the semantic identity (dedup key)
+# ret:  the new type's index, or -1
+fun comp_reserve(tc: *TypeCtx, kind: u8, sem: semtype.TypeId) i32 {
+    if (!type_reserve(tc)) { ret -1; }
+    val ix: u32 = tc.ntypes;
+    tc.types[ix].kind       = kind;
+    tc.types[ix].sem        = sem;
+    tc.types[ix].off        = 0;
+    tc.types[ix].name       = "";
+    tc.types[ix].name_off   = 0;
+    tc.types[ix].encoding   = 0;
+    tc.types[ix].byte_size  = 0;
+    tc.types[ix].elem       = -1;
+    tc.types[ix].count      = 0;
+    tc.types[ix].memb_start = 0;
+    tc.types[ix].memb_count = 0;
+    tc.ntypes = tc.ntypes + 1;
+    ret ix::i32;
+}
+
+# the source spelling of a nominal record / union for DW_AT_name, or "" for an anonymous
+# composite (a generic instance or an unnamed shape) that carries no nominal name
+# ---
+# s:   session (interner)
+# t:   the semantic Type
+# ret: the name, or ""
+fun comp_name(s: *session.Session, t: *semtype.Type) str {
+    if (t.kind == semtype.TYPE_REC || t.kind == semtype.TYPE_UNI) { ret resolve(?s.interner, t.data.nominal.name); }
+    ret "";
+}
+
+# intern a semantic type into the compile unit's type table, returning its type index, or
+# -1 when the type carries no DIE (void / unresolved). Primitive scalars become base type
+# DIEs; typed pointers, arrays, records, and unions become composite DIEs whose member
+# layout is read from the IR type (the single layout authority, via `sem_to_ir`) and whose
+# names come from the semantic type. Idempotent - a repeat resolves to the same index
+# ---
+# s:            session (semantic type universe, interner, allocator)
 # tgt:          resolved target (member layout via the IR type table)
 # irmod:        the IR module (IR type universe for composite layout)
 # tc:           the type table
 # strtab:       the `.debug_str` string table
 # sem:          the semantic TypeId to intern
-# address_size: target pointer width, for a raw `ptr` byte size
+# address_size: target pointer width, for a raw / typed pointer byte size
 # ret:          the type's index in `tc`, or -1
 fun type_intern(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, tc: *TypeCtx,
                 strtab: *StrTab, sem: semtype.TypeId, address_size: u8) i32 {
+    if (sem == semtype.TYPE_NIL || sem == semtype.TYPE_ERROR) { ret -1; }
+    val to: O.Option[*semtype.Type] = semtype.get(?s.types, sem);
+    if (O.is_none[*semtype.Type](to)) { ret -1; }
+    val t: *semtype.Type = O.unwrap[*semtype.Type](to);
+    val kind: semtype.TypeKind = t.kind;
+
+    # secrecy is representation-transparent: `^T` interns as exactly `T`.
+    if (kind == semtype.TYPE_SECRET) { ret type_intern(s, tgt, irmod, tc, strtab, t.data.secret.base, address_size); }
+
+    # primitive scalars (incl. the raw opaque `ptr`) become base type DIEs.
     val obt: O.Option[TypeDie] = sem_base_type(s, sem, address_size);
-    if (O.is_none[TypeDie](obt)) { ret -1; }
-    ret base_intern(tc, strtab, O.unwrap[TypeDie](obt));
+    if (O.is_some[TypeDie](obt)) { ret base_intern(tc, strtab, O.unwrap[TypeDie](obt)); }
+
+    # composites dedup by semantic identity.
+    val found: i32 = comp_find(tc, sem);
+    if (found >= 0) { ret found; }
+
+    if (kind == semtype.TYPE_POINTER) {
+        # a typed pointer resolves its pointee; an unresolvable pointee (void-like) degrades
+        # to the raw opaque `ptr` base type rather than a pointer to nothing.
+        val pe: i32 = type_intern(s, tgt, irmod, tc, strtab, t.data.pointer.base, address_size);
+        if (pe < 0) { ret base_intern(tc, strtab, ptr_base_type(address_size)); }
+        val ix: i32 = comp_reserve(tc, TK_POINTER, sem);
+        if (ix < 0) { ret -1; }
+        tc.types[ix::u32].elem      = pe;
+        tc.types[ix::u32].byte_size = address_size::u32;
+        ret ix;
+    }
+
+    if (kind == semtype.TYPE_ARRAY) {
+        val el: i32 = type_intern(s, tgt, irmod, tc, strtab, t.data.array.base, address_size);
+        if (el < 0) { ret -1; }
+        val ix: i32 = comp_reserve(tc, TK_ARRAY, sem);
+        if (ix < 0) { ret -1; }
+        tc.types[ix::u32].elem  = el;
+        tc.types[ix::u32].count = t.data.array.count;
+        ret ix;
+    }
+
+    if (kind == semtype.TYPE_REC || kind == semtype.TYPE_UNI || kind == semtype.TYPE_INSTANCE) {
+        ret struct_intern(s, tgt, irmod, tc, strtab, sem, t, address_size);
+    }
+
+    # a first-class function value (and any residual generic-param / pack) lowers to a
+    # pointer-width slot, exactly as lower_type does; represent it as the raw address
+    # type so a member of that type still carries a DIE rather than being dropped.
+    ret base_intern(tc, strtab, ptr_base_type(address_size));
+}
+
+# intern a record / union / generic-instance as a TK_STRUCT / TK_UNION DIE with a
+# DW_TAG_member child per field. Member offsets and the aggregate size come from the IR
+# type (`sem_to_ir`, the layout authority); member names and types come from the semantic
+# field table. The entry is registered before its fields recurse, so a self-referential
+# aggregate terminates
+# ---
+# s/tgt/irmod:  session / target / IR module
+# tc:           the type table
+# strtab:       the `.debug_str` string table
+# sem:          the aggregate's semantic TypeId
+# t:            its resolved semantic Type
+# address_size: target pointer width
+# ret:          the type's index, or -1
+fun struct_intern(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, tc: *TypeCtx,
+                  strtab: *StrTab, sem: semtype.TypeId, t: *semtype.Type, address_size: u8) i32 {
+    # the IR type is the single layout authority; without it we cannot place members.
+    val rir: R.Result[ir_type.IrTypeId, str] = sem_to_ir(s, irmod, sem);
+    if (R.is_err[ir_type.IrTypeId, str](rir)) { ret -1; }
+    val ir_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rir);
+
+    var is_union: bool = false;
+    if (t.kind == semtype.TYPE_UNI) { is_union = true; }
+    var tk: u8 = TK_STRUCT;
+    if (is_union) { tk = TK_UNION; }
+
+    val ix: i32 = comp_reserve(tc, tk, sem);
+    if (ix < 0) { ret -1; }
+    tc.types[ix::u32].name_off  = str_off(strtab, comp_name(s, t));
+    tc.types[ix::u32].byte_size = ir_type.byte_size(?irmod.types, ir_ty, tgt);
+
+    val nfields: u32 = semtype.field_count(?s.types, sem);
+
+    # pass 1: intern every field type first, so all descendant types and their members
+    # are appended before this aggregate's own contiguous member run.
+    var i: u32 = 0;
+    for (i < nfields) {
+        val fe: O.Option[*semtype.FieldEntry] = semtype.field_at(?s.types, sem, i);
+        if (O.is_some[*semtype.FieldEntry](fe)) { type_intern(s, tgt, irmod, tc, strtab, O.unwrap[*semtype.FieldEntry](fe).ty, address_size); }
+        i = i + 1;
+    }
+
+    # pass 2: append this aggregate's members contiguously (the field re-intern is a cheap
+    # dedup hit). A member whose type is unresolvable is skipped rather than mistyped.
+    val memb_start: u32 = tc.nmemb;
+    var count: u32 = 0;
+    var j: u32 = 0;
+    for (j < nfields) {
+        val fe: O.Option[*semtype.FieldEntry] = semtype.field_at(?s.types, sem, j);
+        if (O.is_none[*semtype.FieldEntry](fe)) { j = j + 1; cnt; }
+        val f: *semtype.FieldEntry = O.unwrap[*semtype.FieldEntry](fe);
+        val fty: i32 = type_intern(s, tgt, irmod, tc, strtab, f.ty, address_size);
+        if (fty < 0) { j = j + 1; cnt; }
+        if (!memb_reserve(tc)) { j = j + 1; cnt; }
+        tc.membs[tc.nmemb].name_off = str_off(strtab, resolve(?s.interner, f.name));
+        tc.membs[tc.nmemb].type_ix  = fty::u32;
+        tc.membs[tc.nmemb].offset   = ir_type.byte_offset(?irmod.types, ir_ty, j, tgt);
+        tc.nmemb = tc.nmemb + 1;
+        count = count + 1;
+        j = j + 1;
+    }
+    tc.types[ix::u32].memb_start = memb_start;
+    tc.types[ix::u32].memb_count = count;
+    ret ix;
+}
+
+# a DWARF base type for the target's raw address (`ptr`): the fallback DIE for a pointer
+# whose pointee carries no type
+# ---
+# address_size: target pointer width in bytes
+# ret:          a TK_BASE `ptr` type DIE
+fun ptr_base_type(address_size: u8) TypeDie {
+    var bt: TypeDie;
+    bt.kind       = TK_BASE;
+    bt.name       = "ptr";
+    bt.sem        = semtype.TYPE_NIL;
+    bt.off        = 0;
+    bt.name_off   = 0;
+    bt.encoding   = DW_ATE_address;
+    bt.byte_size  = address_size::u32;
+    bt.elem       = -1;
+    bt.count      = 0;
+    bt.memb_start = 0;
+    bt.memb_count = 0;
+    ret bt;
 }
 
 # the source location of a function's first row in `.text` order (the lowest-offset
@@ -2790,7 +3236,7 @@ test "mach.lang.be.codegen.dwarf.build_abbrev:golden" {
     page.make(?alloc);
     var b: enc.ByteBuf = enc.buf_init(?alloc);
     build_abbrev(?b);
-    var e: [290]u8;
+    var e: [308]u8;
     e[0]=0x01; e[1]=0x11; e[2]=0x01; e[3]=0x25; e[4]=0x08; e[5]=0x03; e[6]=0x08; e[7]=0x1B;
     e[8]=0x08; e[9]=0x13; e[10]=0x05; e[11]=0x11; e[12]=0x01; e[13]=0x12; e[14]=0x07; e[15]=0x10;
     e[16]=0x17; e[17]=0x00; e[18]=0x00; e[19]=0x02; e[20]=0x24; e[21]=0x00; e[22]=0x03; e[23]=0x0E;
@@ -2848,11 +3294,66 @@ test "mach.lang.be.codegen.dwarf.build_abbrev:golden" {
     e[273]=0x16; e[274]=0x21; e[275]=0x00; e[276]=0x37; e[277]=0x0F; e[278]=0x00; e[279]=0x00;
     # ABBREV_POINTER (0x17): DW_TAG_pointer_type, no children, pointee type ref4, byte_size udata.
     e[280]=0x17; e[281]=0x0F; e[282]=0x00; e[283]=0x49; e[284]=0x13; e[285]=0x0B; e[286]=0x0F; e[287]=0x00; e[288]=0x00;
-    e[289]=0x00;   # null abbrev code terminates the table
-    val ok: bool = buf_eq(?b, ?e[0], 290);
+    # ABBREV_STRUCT_LEAF (0x18): DW_TAG_structure_type, no children, name strp, byte_size udata.
+    e[289]=0x18; e[290]=0x13; e[291]=0x00; e[292]=0x03; e[293]=0x0E; e[294]=0x0B; e[295]=0x0F; e[296]=0x00; e[297]=0x00;
+    # ABBREV_UNION_LEAF (0x19): DW_TAG_union_type, no children, name strp, byte_size udata.
+    e[298]=0x19; e[299]=0x17; e[300]=0x00; e[301]=0x03; e[302]=0x0E; e[303]=0x0B; e[304]=0x0F; e[305]=0x00; e[306]=0x00;
+    e[307]=0x00;   # null abbrev code terminates the table
+    val ok: bool = buf_eq(?b, ?e[0], 308);
     enc.buf_dnit(?b);
     if (!ok) { ret 1; }
     ret 0;
+}
+
+# emit_type_dies lays out a base type, a two-member struct, a pointer to that struct, an
+# array of the base, and a memberless struct; every cross-type DW_FORM_ref4 (each member,
+# the pointer's pointee, the array's element) is a fixup patched to its target's recorded
+# CU offset, and a memberless struct uses the DW_CHILDREN_no leaf abbrev
+test "mach.lang.be.codegen.dwarf.emit_type_dies:composite_refs" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    # types: [0] base i32, [1] struct S{i32,i32}, [2] *S, [3] [4]i32, [4] empty struct.
+    var td: [5]TypeDie;
+    td[0].kind=TK_BASE;    td[0].off=0; td[0].sem=semtype.TYPE_NIL; td[0].name="i32"; td[0].name_off=1; td[0].encoding=DW_ATE_signed; td[0].byte_size=4; td[0].elem=-1; td[0].count=0; td[0].memb_start=0; td[0].memb_count=0;
+    td[1].kind=TK_STRUCT;  td[1].off=0; td[1].sem=100; td[1].name=""; td[1].name_off=5; td[1].encoding=0; td[1].byte_size=8; td[1].elem=-1; td[1].count=0; td[1].memb_start=0; td[1].memb_count=2;
+    td[2].kind=TK_POINTER; td[2].off=0; td[2].sem=101; td[2].name=""; td[2].name_off=0; td[2].encoding=0; td[2].byte_size=8; td[2].elem=1; td[2].count=0; td[2].memb_start=0; td[2].memb_count=0;
+    td[3].kind=TK_ARRAY;   td[3].off=0; td[3].sem=102; td[3].name=""; td[3].name_off=0; td[3].encoding=0; td[3].byte_size=16; td[3].elem=0; td[3].count=4; td[3].memb_start=0; td[3].memb_count=0;
+    td[4].kind=TK_STRUCT;  td[4].off=0; td[4].sem=103; td[4].name=""; td[4].name_off=9; td[4].encoding=0; td[4].byte_size=0; td[4].elem=-1; td[4].count=0; td[4].memb_start=2; td[4].memb_count=0;
+
+    var mb: [2]TypeMember;
+    mb[0].name_off=20; mb[0].type_ix=0; mb[0].offset=0;
+    mb[1].name_off=24; mb[1].type_ix=0; mb[1].offset=4;
+
+    var tc: TypeCtx;
+    tc.alloc=?alloc; tc.types=?td[0]; tc.ntypes=5; tc.type_cap=5; tc.membs=?mb[0]; tc.nmemb=2; tc.memb_cap=2;
+
+    var relocs: [16]InfoReloc;
+    var rc: u32 = 0;
+    var fixups: [8]TypeFixup;
+    var nfix: u32 = 0;
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_type_dies(?b, ?tc, 0, ?relocs[0], ?rc, ?fixups[0], ?nfix);
+
+    # four ref4 fixups: two members -> base, the pointer -> struct, the array -> base.
+    if (nfix != 4) { code = 1; }
+    var i: u32 = 0;
+    for (i < nfix) {
+        val v: u32 = bin.read_u32_le(b.data, fixups[i].pos::usize);
+        if (v != td[fixups[i].target].off) { code = 1; }
+        i = i + 1;
+    }
+    # offsets were recorded in emit order: the base opens the block at 0, later types after it.
+    if (td[1].off == 0 || td[2].off <= td[1].off || td[4].off <= td[3].off) { code = 1; }
+    # the populated struct opens with ABBREV_STRUCT; the memberless one with the leaf abbrev.
+    if (b.data[td[1].off::usize] != ABBREV_STRUCT)      { code = 1; }
+    if (b.data[td[4].off::usize] != ABBREV_STRUCT_LEAF) { code = 1; }
+    # the pointer references the struct, the array references the base.
+    if (td[2].elem != 1 || td[3].elem != 0) { code = 1; }
+
+    enc.buf_dnit(?b);
+    ret code;
 }
 
 # emit_row packs a small line advance into a single special opcode and falls back to
@@ -2930,7 +3431,7 @@ test "mach.lang.be.codegen.dwarf.emit_var_location:reg_frame_salvage" {
     var code: i32 = 0;
 
     # register 5 (RDI), identity: len 1, DW_OP_reg5 = 0x50 + 5 = 0x55.
-    var vr: DwVar; vr.loc_kind = VLOC_REG; vr.reg = 5; vr.offset = 0; vr.net = 0;
+    var vr: DwVar; vr.loc_kind = VLOC_REG; vr.reg = 5; vr.offset = 0; vr.net = 0; vr.byref = false;
     var b: enc.ByteBuf = enc.buf_init(?alloc);
     emit_var_location(?b, ?vr);
     var e1: [2]u8; e1[0] = 0x01; e1[1] = 0x55;
@@ -2938,7 +3439,7 @@ test "mach.lang.be.codegen.dwarf.emit_var_location:reg_frame_salvage" {
     enc.buf_dnit(?b);
 
     # frame slot -8, identity: len 2, DW_OP_fbreg (0x91), sleb(-8) = 0x78.
-    var vf: DwVar; vf.loc_kind = VLOC_FRAME; vf.reg = 0; vf.offset = -8; vf.net = 0;
+    var vf: DwVar; vf.loc_kind = VLOC_FRAME; vf.reg = 0; vf.offset = -8; vf.net = 0; vf.byref = false;
     var c: enc.ByteBuf = enc.buf_init(?alloc);
     emit_var_location(?c, ?vf);
     var e2: [3]u8; e2[0] = 0x02; e2[1] = 0x91; e2[2] = 0x78;
@@ -2946,7 +3447,7 @@ test "mach.lang.be.codegen.dwarf.emit_var_location:reg_frame_salvage" {
     enc.buf_dnit(?c);
 
     # register 5 + 4 (salvaged): len 3, DW_OP_breg5 (0x75), sleb(4) = 0x04, stack_value (0x9F).
-    var vs: DwVar; vs.loc_kind = VLOC_REG; vs.reg = 5; vs.offset = 0; vs.net = 4;
+    var vs: DwVar; vs.loc_kind = VLOC_REG; vs.reg = 5; vs.offset = 0; vs.net = 4; vs.byref = false;
     var d: enc.ByteBuf = enc.buf_init(?alloc);
     emit_var_location(?d, ?vs);
     var e3: [4]u8; e3[0] = 0x03; e3[1] = 0x75; e3[2] = 0x04; e3[3] = 0x9F;
@@ -2954,12 +3455,30 @@ test "mach.lang.be.codegen.dwarf.emit_var_location:reg_frame_salvage" {
     enc.buf_dnit(?d);
 
     # constant 40 + net 2 = 42: len 3, DW_OP_consts (0x11), sleb(42) = 0x2A, stack_value (0x9F).
-    var vk: DwVar; vk.loc_kind = VLOC_CONST; vk.reg = 0; vk.offset = 40; vk.net = 2;
+    var vk: DwVar; vk.loc_kind = VLOC_CONST; vk.reg = 0; vk.offset = 40; vk.net = 2; vk.byref = false;
     var g: enc.ByteBuf = enc.buf_init(?alloc);
     emit_var_location(?g, ?vk);
     var e4: [4]u8; e4[0] = 0x03; e4[1] = 0x11; e4[2] = 0x2A; e4[3] = 0x9F;
     if (!buf_eq(?g, ?e4[0], 4)) { code = 1; }
     enc.buf_dnit(?g);
+
+    # a by-reference aggregate homed in register 5: len 3, DW_OP_breg5 (0x75), sleb(0) =
+    # 0x00, DW_OP_deref-less (the address is the location, no stack_value).
+    var va: DwVar; va.loc_kind = VLOC_REG; va.reg = 5; va.offset = 0; va.net = 0; va.byref = true;
+    var h: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_var_location(?h, ?va);
+    var e5: [3]u8; e5[0] = 0x02; e5[1] = 0x75; e5[2] = 0x00;
+    if (!buf_eq(?h, ?e5[0], 3)) { code = 1; }
+    enc.buf_dnit(?h);
+
+    # a by-reference aggregate spilled to frame slot -8: len 3, DW_OP_fbreg (0x91),
+    # sleb(-8) = 0x78, DW_OP_deref (0x06) to load the storage pointer.
+    var vm: DwVar; vm.loc_kind = VLOC_FRAME; vm.reg = 0; vm.offset = -8; vm.net = 0; vm.byref = true;
+    var k: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_var_location(?k, ?vm);
+    var e6: [4]u8; e6[0] = 0x03; e6[1] = 0x91; e6[2] = 0x78; e6[3] = 0x06;
+    if (!buf_eq(?k, ?e6[0], 4)) { code = 1; }
+    enc.buf_dnit(?k);
     ret code;
 }
 
@@ -3036,7 +3555,7 @@ test "mach.lang.be.codegen.dwarf.build_loclists:ranges" {
     var funcs: [1]DwFunc;
     funcs[0].name = intern.STR_NIL; funcs[0].offset = 0; funcs[0].var_start = 0; funcs[0].var_count = 1;
     var vars: [1]DwVar;
-    vars[0].loc_kind = VLOC_LOCLIST; vars[0].range_start = 0; vars[0].range_count = 2; vars[0].loclist_off = 0;
+    vars[0].loc_kind = VLOC_LOCLIST; vars[0].range_start = 0; vars[0].range_count = 2; vars[0].loclist_off = 0; vars[0].byref = false;
     var ranges: [2]LocRange;
     ranges[0].start=0; ranges[0].end=4; ranges[0].kind=VLOC_REG; ranges[0].reg=5; ranges[0].off=0; ranges[0].net=0;
     ranges[1].start=4; ranges[1].end=8; ranges[1].kind=VLOC_REG; ranges[1].reg=6; ranges[1].off=0; ranges[1].net=0;
