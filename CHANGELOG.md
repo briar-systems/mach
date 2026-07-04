@@ -5,6 +5,93 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.15.0] - 2026-07-04
+
+The debug-info release. `-g` produces full DWARF 5 on every ELF target
+(x86_64, aarch64, riscv64): breakpoints by file:line, stepping, named and
+typed frames, live parameter/local values with PC-ranged locations, inlined
+frames with call sites, and composite types - structs, unions, arrays, and
+typed pointers print their members in gdb. Debug info is strictly additive:
+`-g` adds only `.debug_*` sections and never changes machine code, enforced
+byte-for-byte in CI at both debug and release profiles. Also fixes a critical
+comptime field-gate defect and the dep resolver's misleading unresolved-ref
+error. Built with mach 2.14.1.
+
+### Added
+
+- debuginfo: **full DWARF 5 for ELF targets** under `-g` (or per-profile
+  `debug = true`), format-agnostic producer behind the `DebugInfo` vtable
+  seam. Source locations ride IR and MIR instructions from lowering through
+  encoding; the encoder emits a PC/line row table with branch-relaxation
+  re-homing (#1689, #1691, #1692, #1693, #1697).
+- debuginfo: `.debug_line` line tables and compile-unit scaffolding;
+  `DW_TAG_subprogram` and base-type DIEs with `.debug_str` interning
+  (#1699, #1703).
+- debuginfo: variable and parameter locations - `dbg.value`-style bindings
+  survive the optimizer (RAUW, DCE, salvage; debug-only uses never keep a
+  value alive), render as single-location expressions under the
+  agree-or-omit stationary-home rule, PC-ranged `.debug_loclists` for
+  re-bound variables, and computed constants (`DW_OP_stack_value`) for
+  folded locals. A variable never shows a home it does not hold; unknown
+  renders as absent, never garbage (#1695, #1696, #1704, #1705, #1706).
+- debuginfo: inlined frames - `DW_TAG_inlined_subroutine` with abstract
+  instances, `call_file`/`call_line`, exact multi-extent `.debug_rnglists`,
+  nested instances under their parents, and inlined locals scoped to their
+  instance. Backed by an inline-site identity channel threaded IR→MIR→encoder
+  (#1707, #1924).
+- debuginfo: composite types - struct/union/array/member/pointer DIEs with
+  member offsets taken from the same IR layout codegen used; generic
+  instances materialize concrete field tables; aggregate variables locate
+  by reference (frame-homed print members; register-homed conservatively
+  omit) (#1919).
+- debuginfo: a dedicated CI lane (`dbg/`) verifying every PR on all three
+  ELF ISAs at debug **and** release profiles: `llvm-dwarfdump --verify`,
+  addr2line spot checks, byte-additivity of loadable segments, and
+  falsifiable per-feature assertions (#1698).
+- link: debug sections carry through all three object writers (ELF, Mach-O
+  `__DWARF`, COFF `DISCARDABLE`) and merge into executables (#1694).
+- link: unattributed dynamic imports are a hard error on two-level-namespace
+  formats instead of a silent mis-link (#1800).
+- driver: `mach init` scaffolds the target's native ABI via the OS vtable
+  (#1837).
+
+### Fixed
+
+- codegen: `-g` no longer changes machine code - the compiler's own build
+  is byte-identical with and without `-g` at both debug and release. Four
+  independent causes fixed: the inliner's size gate counted debug-value
+  instructions, mem2reg treated a debug-value alloca reference as an
+  address escape, param homing counted a debug value as a real parameter
+  use, and DWARF metadata perturbed layout via stream-resident markers
+  (replaced by attached per-instruction records). Enforced by falsifiable
+  CI byte-identity assertions at release (#1944, #1956, #1932).
+- codegen: a zeroed source location could alias the entry module's first
+  byte, misattributing a `.debug_line` row to an unrelated module -
+  `FILE_NIL` is now 0 so zeroed memory is invalid by construction, and the
+  x64 NEG/NOT expander stamps loc/inline-site on its expansion pieces
+  (#1902).
+- codegen: subprogram DIEs with no children use `DW_CHILDREN_no` leaf
+  abbrevs - 60 dwarfdump warnings to zero (#1949).
+- sema: a comptime `$if` gate reading a `$each` field descriptor
+  (`f.name`/`f.type`/`f.offset`) defers to the unroll where the loop
+  variable is bound, and sema installs the field resolvers, so only the
+  live arm is type-checked - fixes bogus "no such field" errors and
+  rejected `f.name` string comparisons in `$fields` loops (#1923).
+- driver: an unresolvable git dependency ref now reports
+  `fatal: invalid reference` instead of git's misleading pathspec error;
+  slashed branch refs were already handled (#1890).
+- ir: dbg-value salvage in batch erasure gates on debug-value presence
+  instead of variable metadata, so a metadata-free debug value can never
+  skip salvage and dangle past its dropped definition (#1958).
+
+### Changed
+
+- ir: `Function` construction is a single `function_new` constructor - new
+  fields initialize in exactly one place (three `-g`-only segfaults this
+  release traced to the old three-site pattern) (#1906).
+- ir: batch instruction erasure (`erase_marked`) is the single free path
+  with dbg-value salvage built in (#1690, #1895).
+
 ## [2.14.1] - 2026-07-04
 
 Hotfix for two defects in 2.14.0.
