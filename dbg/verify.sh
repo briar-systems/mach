@@ -252,13 +252,55 @@ verify_dwarf() {
     return 0
 }
 
+# verify_inline_release <fixture_dir> <build_target> — the inline pass fires only at
+# release, so this leg builds one -g release binary and asserts the DWARF inlined_
+# subroutine tier: llvm-dwarfdump --verify is clean and the expected inlined callees
+# appear as DW_TAG_inlined_subroutine DIEs. Byte-for-byte -g additivity is NOT checked at
+# release (a separate, pre-existing codegen-determinism issue tracked outside this lane).
+verify_inline_release() {
+    dir=$1; bt=$2
+    label="${dir#"$here"/} [$bt release]"
+    tmp=$(mktemp -d)
+    g="$tmp/g"
+    if ! (cd "$dir" && "$compiler" dep pull && "$compiler" build . --target "$bt" --profile release -g -o "$g") >"$tmp/b.log" 2>&1; then
+        echo "FAIL $label (build release -g)"; sed 's/^/    /' "$tmp/b.log" >&2; rm -rf "$tmp"; return 1
+    fi
+    if ! "$dwarfdump" --verify "$g" >"$tmp/v.log" 2>&1; then
+        echo "FAIL $label (llvm-dwarfdump --verify)"; tail -30 "$tmp/v.log" | sed 's/^/    /' >&2; rm -rf "$tmp"; return 1
+    fi
+    n=$("$dwarfdump" --debug-info "$g" 2>/dev/null | grep -c DW_TAG_inlined_subroutine)
+    if [ "$n" -lt 2 ]; then
+        echo "FAIL $label (expected >=2 inlined_subroutine DIEs, found $n)"; rm -rf "$tmp"; return 1
+    fi
+    for callee in leaf mid; do
+        if ! "$dwarfdump" --debug-info "$g" 2>/dev/null | grep -q "DW_AT_abstract_origin.*\"$callee\""; then
+            echo "FAIL $label (no inlined_subroutine referencing $callee)"; rm -rf "$tmp"; return 1
+        fi
+    done
+    echo "PASS $label ($n inlined_subroutine DIEs)"
+    rm -rf "$tmp"
+    return 0
+}
+
 for dir in "$fixtures"/$filter; do
     [ -f "$dir/mach.toml" ] || continue
+    # the inline fixture is release-only (its callees inline away at -O0); it has its own
+    # release leg below and does not fit the debug fixture's structural checks.
+    [ "$(basename "$dir")" = "inline" ] && continue
     for bt in $elf_targets; do
         ran=$((ran + 1))
         verify_dwarf "$dir" "$bt" || fails=$((fails + 1))
     done
 done
+
+# release leg: exercise the release-only inline pass so the inlined_subroutine tier
+# (#1707) is actually verified in CI (debug builds never inline).
+if [ -f "$fixtures/inline/mach.toml" ]; then
+    for bt in $elf_targets; do
+        ran=$((ran + 1))
+        verify_inline_release "$fixtures/inline" "$bt" || fails=$((fails + 1))
+    done
+fi
 
 # STAGED — expansion points wired but not yet live, each pending its producer. these
 # consume the same fixtures; a tier issue turns one on by adding its checks here and
