@@ -204,9 +204,15 @@ test "point: add is commutative" {
 }
 ```
 
-The label is a required string literal; convention is `"topic: behavior"`.
-The body checks like an `i32` function: `ret 0` (or falling off the end)
-passes, any non-zero return fails. There are no assertion builtins — return
+The label is a required string literal. Its internal format is a convention,
+not an enforced standard: choose whatever names the test clearly and stays
+consistent within a project. The compiler uses a fully-qualified
+`module.path.symbol:behavior` form (e.g.
+`"mach.cli.cmd.doc.write_doc:summary_only"`) that pins each test to the exact
+unit it exercises and groups cleanly under `--filter`; the libraries favor a
+shorter `"topic: behavior"` (e.g. `"abs: i64 min saturates"`). Either reads
+well. The body checks like an `i32` function: `ret 0` (or falling off the end)
+passes, any non-zero return fails. There are no assertion builtins; return
 early on a failed check. `mach test` collects every test in the project
 (dependencies excluded unless `--include-deps`), builds one executable per
 test, and reports per-module; `--filter <pattern>` narrows, `--list`
