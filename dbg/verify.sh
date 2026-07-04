@@ -134,6 +134,25 @@ var_computed() {
         END { print "0" }' | head -1
 }
 
+# var_home_class <binary> <name> — the DWARF opcode class of the named local's inline
+# single-location DW_AT_location: "fbreg" / "breg" / "reg", or "" for a loclist or no
+# location. A by-reference aggregate (#1919) MUST be "breg" (address in a register) or
+# "fbreg" (address via the frame, dereferenced) because its home holds the storage
+# pointer; a regression to "reg" (value-in-register) would misread that pointer as the
+# aggregate's bytes and — critically — llvm-dwarfdump --verify still accepts it, so this
+# is the falsifiable pin that value-encoding an aggregate can't slip past CI.
+var_home_class() {
+    "$dwarfdump" --debug-info "$1" 2>/dev/null | awk -v want="$2" '
+        /DW_TAG_/    { invar = ($0 ~ /DW_TAG_variable/); name="" }
+        /DW_AT_name/ && invar { if ($0 ~ "\\(\"" want "\"\\)") name=want }
+        name==want && /DW_AT_location/ {
+            if ($0 ~ /DW_OP_fbreg/) { print "fbreg"; exit }
+            if ($0 ~ /DW_OP_breg/)  { print "breg";  exit }
+            if ($0 ~ /DW_OP_reg/)   { print "reg";   exit }
+            print ""; exit
+        }' | head -1
+}
+
 # elf_seg_identical <a> <b> — true if every PT_LOAD segment of <a> has byte-identical
 # file content in <b>, after the ELF header's section-table bookkeeping (e_shoff,
 # e_shnum, e_shstrndx — expected to differ once -g adds named sections) is normalized.
@@ -267,10 +286,17 @@ verify_dwarf() {
         if ! printf '%s\n' "$di" | grep -q 'DW_AT_data_member_location'; then
             echo "FAIL $label (struct member has no DW_AT_data_member_location)"; rm -rf "$tmp"; return 1
         fi
-        # a record local's location must address its storage (DW_OP_breg or fbreg+deref),
-        # never DW_OP_reg (which would misread the address as the aggregate's bytes).
-        if ! printf '%s\n' "$di" | grep -Eq 'DW_OP_breg|DW_OP_fbreg'; then
-            echo "FAIL $label (no by-reference aggregate location)"; rm -rf "$tmp"; return 1
+        # the record local's OWN location must address its storage (DW_OP_breg, or
+        # DW_OP_fbreg+deref when spilled), never DW_OP_reg — its dbg-value binds the
+        # storage pointer, so value-in-register would misread that pointer as the
+        # aggregate's bytes. scoped to the `pt` record local (not a whole-dump grep, which
+        # every scalar frame slot's DW_OP_fbreg would satisfy) so a regression to value
+        # encoding is actually caught; llvm-dwarfdump --verify accepts either form.
+        if grep -q 'var pt:' "$src"; then
+            cls=$(var_home_class "$g" pt)
+            if [ "$cls" != "breg" ] && [ "$cls" != "fbreg" ]; then
+                echo "FAIL $label (record local 'pt' location class is '${cls:-none}', expected by-reference DW_OP_breg/fbreg, not DW_OP_reg)"; rm -rf "$tmp"; return 1
+            fi
         fi
     fi
 
