@@ -278,8 +278,8 @@ fun resolve(itn: *intern.Interner, id: intern.StrId) str {
 # external:  true when the symbol has global linkage (DW_AT_external)
 # decl_file: 0-based DWARF file index of the function's first row, or 0
 # decl_line: 1-based source line of the function's first row, or 0
-# ret_bt:    index into the base-type table for the return type, or -1 when the
-#            return is void or a non-primitive type (no DW_AT_type)
+# ret_ty:    index into the type table for the return type, or -1 when the return is
+#            void or an unresolved type (no DW_AT_type)
 # var_start: index of this function's first variable in the shared var array
 # var_count: number of variables this function contributes
 rec DwFunc {
@@ -292,7 +292,7 @@ rec DwFunc {
     external:  bool;
     decl_file: u32;
     decl_line: u32;
-    ret_bt:    i32;
+    ret_ty:    i32;
     var_start: u32;
     var_count: u32;
 }
@@ -313,12 +313,12 @@ val VLOC_CONST: u8 = 4;
 
 # a source variable's DWARF DIE data, joined from the IR dbg-var identity and the
 # per-PC variable-location records. A DW_TAG_variable (or DW_TAG_formal_parameter)
-# references its base type by ref4 and carries a DW_AT_location that is either an
-# inline single-location exprloc (VLOC_REG / VLOC_FRAME) or a DW_FORM_sec_offset into
+# references its type by ref4 and carries a DW_AT_location that is either an inline
+# single-location exprloc (VLOC_REG / VLOC_FRAME) or a DW_FORM_sec_offset into
 # `.debug_loclists` (VLOC_LOCLIST)
 # ---
 # name_off: DW_AT_name byte offset within `.debug_str`
-# bt:       base-type index for DW_AT_type
+# ty:       type index (into the TypeCtx table) for DW_AT_type
 # is_param: true for a formal parameter, false for a local
 # loc_kind: VLOC_NONE / VLOC_REG / VLOC_FRAME / VLOC_LOCLIST
 # reg:      DWARF register number when loc_kind == VLOC_REG
@@ -331,7 +331,7 @@ val VLOC_CONST: u8 = 4;
 #           build_loclists, patched into the DW_FORM_sec_offset field
 rec DwVar {
     name_off:    u32;
-    bt:          i32;
+    ty:          i32;
     is_param:    bool;
     loc_kind:    u8;
     reg:         i32;
@@ -416,24 +416,139 @@ fun home_eq(k1: u8, r1: i32, o1: i64, n1: i64, k2: u8, r2: i32, o2: i64, n2: i64
     ret true;
 }
 
-# a DWARF base type gathered from a primitive semantic return type
+# a type DIE's shape kind. TK_BASE is a scalar (DW_TAG_base_type); the rest are
+# composites: TK_STRUCT / TK_UNION carry members, TK_ARRAY an element + count,
+# TK_POINTER a pointee. Every kind records its emitted DIE offset for ref4
+val TK_BASE:    u8 = 0;
+val TK_STRUCT:  u8 = 1;
+val TK_UNION:   u8 = 2;
+val TK_ARRAY:   u8 = 3;
+val TK_POINTER: u8 = 4;
+
+# one type DIE in the compile unit's type table. A scalar base type (TK_BASE) carries
+# `encoding` / `byte_size` and is deduplicated by source spelling; a composite carries
+# its structural links (element / pointee `elem`, array `count`, or the `[memb_start,
+# memb_start + memb_count)` member slice) and is deduplicated by semantic TypeId
 # ---
-# name:      the type's source spelling (e.g. "i32", "u64", "f64", "ptr")
-# encoding:  DW_ATE_* scalar encoding
-# byte_size: width in bytes
-# off:       byte offset of the emitted DIE within `.debug_info`, for DW_FORM_ref4
-# str_off:   byte offset of `name` within `.debug_str`, for DW_FORM_strp
-rec BaseType {
-    name:      str;
-    encoding:  u8;
-    byte_size: u8;
-    off:       u32;
-    str_off:   u32;
+# kind:       TK_* shape discriminator
+# off:        byte offset of the emitted DIE within `.debug_info`, for DW_FORM_ref4
+# sem:        semantic TypeId (composite dedup key; TYPE_NIL for a base type)
+# name:       source spelling (base dedup key; "" for an anonymous composite shape)
+# name_off:   byte offset of `name` within `.debug_str` (base + struct / union), else 0
+# encoding:   DW_ATE_* scalar encoding (TK_BASE)
+# byte_size:  width in bytes (base scalar width, or a composite's total size)
+# elem:       element (TK_ARRAY) or pointee (TK_POINTER) type index, else -1
+# count:      element count (TK_ARRAY)
+# memb_start/memb_count: the type's member slice in the shared TypeMember array
+rec TypeDie {
+    kind:       u8;
+    off:        u32;
+    sem:        semtype.TypeId;
+    name:       str;
+    name_off:   u32;
+    encoding:   u8;
+    byte_size:  u32;
+    elem:       i32;
+    count:      u32;
+    memb_start: u32;
+    memb_count: u32;
 }
 
-# the largest number of distinct primitive return types a compile unit emits base
-# types for; the primitive universe (u8..f64, ptr) is small
-val MAX_BASE_TYPES: u32 = 16;
+# one member of a TK_STRUCT / TK_UNION type DIE, emitted as a DW_TAG_member child
+# ---
+# name_off: byte offset of the member name within `.debug_str`
+# type_ix:  the member's type index in the TypeDie table (DW_AT_type ref4)
+# offset:   byte offset of the member within its aggregate (DW_AT_data_member_location)
+rec TypeMember {
+    name_off: u32;
+    type_ix:  u32;
+    offset:   u32;
+}
+
+# the compile unit's growable type table: the distinct type DIEs it emits plus the
+# members of its aggregates. Base types dedup by spelling, composites by semantic
+# TypeId; both grow on demand so a large module never silently drops a type
+# ---
+# alloc:                 the allocator the arrays are owned through
+# types/ntypes/type_cap: the TypeDie array, its live count, and its capacity
+# membs/nmemb/memb_cap:  the TypeMember array, its live count, and its capacity
+rec TypeCtx {
+    alloc:    *A.Allocator;
+    types:    *TypeDie;
+    ntypes:   u32;
+    type_cap: u32;
+    membs:    *TypeMember;
+    nmemb:    u32;
+    memb_cap: u32;
+}
+
+# an initial, empty type context; the arrays allocate lazily on first insert
+# ---
+# alloc: the allocator its arrays are owned through
+# ret:   a zeroed context
+fun type_ctx_init(alloc: *A.Allocator) TypeCtx {
+    var tc: TypeCtx;
+    tc.alloc    = alloc;
+    tc.types    = nil;
+    tc.ntypes   = 0;
+    tc.type_cap = 0;
+    tc.membs    = nil;
+    tc.nmemb    = 0;
+    tc.memb_cap = 0;
+    ret tc;
+}
+
+# free a type context's arrays
+# ---
+# tc: the context to release
+fun type_ctx_dnit(tc: *TypeCtx) {
+    if (tc.types != nil) { A.deallocate[TypeDie](tc.alloc, tc.types, tc.type_cap::usize); tc.types = nil; }
+    if (tc.membs != nil) { A.deallocate[TypeMember](tc.alloc, tc.membs, tc.memb_cap::usize); tc.membs = nil; }
+}
+
+# ensure room for one more TypeDie, doubling capacity as needed. Returns false only on
+# an allocation failure (the caller degrades that type to no DIE rather than aborting)
+# ---
+# tc:  the context to grow
+# ret: true when a slot is available
+fun type_reserve(tc: *TypeCtx) bool {
+    if (tc.ntypes < tc.type_cap) { ret true; }
+    if (tc.type_cap == 0) {
+        val ra: R.Result[*TypeDie, str] = A.allocate[TypeDie](tc.alloc, 8::usize);
+        if (R.is_err[*TypeDie, str](ra)) { ret false; }
+        tc.types    = R.unwrap_ok[*TypeDie, str](ra);
+        tc.type_cap = 8;
+        ret true;
+    }
+    val new_cap: u32 = tc.type_cap * 2;
+    val rr: R.Result[*TypeDie, str] = A.reallocate[TypeDie](tc.alloc, tc.types, tc.type_cap::usize, new_cap::usize);
+    if (R.is_err[*TypeDie, str](rr)) { ret false; }
+    tc.types    = R.unwrap_ok[*TypeDie, str](rr);
+    tc.type_cap = new_cap;
+    ret true;
+}
+
+# ensure room for one more TypeMember, doubling capacity as needed. Returns false only
+# on an allocation failure
+# ---
+# tc:  the context to grow
+# ret: true when a slot is available
+fun memb_reserve(tc: *TypeCtx) bool {
+    if (tc.nmemb < tc.memb_cap) { ret true; }
+    if (tc.memb_cap == 0) {
+        val ra: R.Result[*TypeMember, str] = A.allocate[TypeMember](tc.alloc, 16::usize);
+        if (R.is_err[*TypeMember, str](ra)) { ret false; }
+        tc.membs    = R.unwrap_ok[*TypeMember, str](ra);
+        tc.memb_cap = 16;
+        ret true;
+    }
+    val new_cap: u32 = tc.memb_cap * 2;
+    val rr: R.Result[*TypeMember, str] = A.reallocate[TypeMember](tc.alloc, tc.membs, tc.memb_cap::usize, new_cap::usize);
+    if (R.is_err[*TypeMember, str](rr)) { ret false; }
+    tc.membs    = R.unwrap_ok[*TypeMember, str](rr);
+    tc.memb_cap = new_cap;
+    ret true;
+}
 
 # a compile-unit `.debug_str` string table: accumulates NUL-terminated strings,
 # deduplicated by content, and hands out each string's byte offset for DW_FORM_strp
@@ -584,37 +699,44 @@ fun prim_name(kind: semtype.TypeKind) str {
     ret "";
 }
 
-# resolve a semantic return type to its DWARF base type (name / encoding / byte_size),
-# or none when the type is void, unresolved, or not a primitive scalar. Non-primitive
-# returns (typed pointers, records) carry no DW_AT_type in this increment
+# resolve a semantic type to its DWARF base type DIE (a TK_BASE TypeDie: name /
+# encoding / byte_size), or none when the type is void, unresolved, or not a primitive
+# scalar. A raw `ptr` is a base type; a typed pointer / record / array is a composite
+# handled by `type_intern`
 # ---
 # s:            session, for the semantic type universe
-# tid:          the semantic return TypeId
+# tid:          the semantic TypeId
 # address_size: target pointer width, used for the raw `ptr` byte size
-# ret:          the base type (off/str_off unset), or none
-fun sem_base_type(s: *session.Session, tid: semtype.TypeId, address_size: u8) O.Option[BaseType] {
-    if (tid == semtype.TYPE_NIL || tid == semtype.TYPE_ERROR) { ret O.none[BaseType](); }
+# ret:          the base type DIE (off / name_off unset), or none
+fun sem_base_type(s: *session.Session, tid: semtype.TypeId, address_size: u8) O.Option[TypeDie] {
+    if (tid == semtype.TYPE_NIL || tid == semtype.TYPE_ERROR) { ret O.none[TypeDie](); }
     val to: O.Option[*semtype.Type] = semtype.get(?s.types, tid);
-    if (O.is_none[*semtype.Type](to)) { ret O.none[BaseType](); }
+    if (O.is_none[*semtype.Type](to)) { ret O.none[TypeDie](); }
     val kind: semtype.TypeKind = O.unwrap[*semtype.Type](to).kind;
     val d: semtype.PrimDesc = semtype.prim_desc(kind);
-    if (d.class == semtype.PRIM_CLASS_NONE) { ret O.none[BaseType](); }
+    if (d.class == semtype.PRIM_CLASS_NONE) { ret O.none[TypeDie](); }
 
-    var bt: BaseType;
-    bt.name    = prim_name(kind);
-    bt.off     = 0;
-    bt.str_off = 0;
+    var bt: TypeDie;
+    bt.kind       = TK_BASE;
+    bt.name       = prim_name(kind);
+    bt.sem        = semtype.TYPE_NIL;
+    bt.off        = 0;
+    bt.name_off   = 0;
+    bt.elem       = -1;
+    bt.count      = 0;
+    bt.memb_start = 0;
+    bt.memb_count = 0;
     if (d.class == semtype.PRIM_CLASS_FLOAT) {
         bt.encoding  = DW_ATE_float;
-        bt.byte_size = (d.bits / 8)::u8;
+        bt.byte_size = (d.bits / 8)::u32;
     } or (d.class == semtype.PRIM_CLASS_PTR) {
         bt.encoding  = DW_ATE_address;
-        bt.byte_size = address_size;
+        bt.byte_size = address_size::u32;
     } or {
         if (d.signed) { bt.encoding = DW_ATE_signed; } or { bt.encoding = DW_ATE_unsigned; }
-        bt.byte_size = (d.bits / 8)::u8;
+        bt.byte_size = (d.bits / 8)::u32;
     }
-    ret O.some[BaseType](bt);
+    ret O.some[TypeDie](bt);
 }
 
 # the frame-base DWARF register number for the target, read through the ISA's
@@ -966,7 +1088,7 @@ fun subprogram_has_children(f: u32, fn: *DwFunc, vars: *DwVar, inlines: *DwInlin
 
 fun emit_inlines(b: *enc.ByteBuf, f: u32, parent_site: u32, inlines: *DwInline, ninl: u32,
                  iranges: *DwInlineRange, relocs: *InfoReloc, reloc_count: *u32, fn: *DwFunc, address_size: u8,
-                 vars: *DwVar, bts: *BaseType) {
+                 vars: *DwVar, tc: *TypeCtx) {
     var xi: u32 = 0;
     for (xi < ninl) {
         if (inlines[xi].func_idx != f || inlines[xi].parent != parent_site) { xi = xi + 1; cnt; }
@@ -999,13 +1121,35 @@ fun emit_inlines(b: *enc.ByteBuf, f: u32, parent_site: u32, inlines: *DwInline, 
             # this instance's inlined locals, then its nested inlines, then the terminator.
             var vv: u32 = 0;
             for (vv < fn.var_count) {
-                if (vars[fn.var_start + vv].inline_site == di.site_id) { emit_variable(b, ?vars[fn.var_start + vv], bts, relocs, reloc_count); }
+                if (vars[fn.var_start + vv].inline_site == di.site_id) { emit_variable(b, ?vars[fn.var_start + vv], tc, relocs, reloc_count); }
                 vv = vv + 1;
             }
-            emit_inlines(b, f, di.site_id, inlines, ninl, iranges, relocs, reloc_count, fn, address_size, vars, bts);
+            emit_inlines(b, f, di.site_id, inlines, ninl, iranges, relocs, reloc_count, fn, address_size, vars, tc);
             enc.emit_byte(b, 0);   # null DIE terminates this instance's children
         }
         xi = xi + 1;
+    }
+}
+
+# emit the compile unit's type DIEs in table order, recording each type's `.debug_info`
+# offset (`off`, CU-relative) for the ref4 references that follow. This increment emits
+# only DW_TAG_base_type scalars; composite kinds are added by the aggregate tier
+# ---
+# b:       the info buffer
+# tc:      the type table (each entry's `off` filled in place)
+# len_pos: buffer offset of the CU unit_length field (ref4 offsets are relative to it)
+# relocs/reloc_count: the deferred `.debug_info` relocation list (for name strps)
+fun emit_type_dies(b: *enc.ByteBuf, tc: *TypeCtx, len_pos: usize, relocs: *InfoReloc, reloc_count: *u32) {
+    var t: u32 = 0;
+    for (t < tc.ntypes) {
+        val td: *TypeDie = ?tc.types[t];
+        td.off = (b.len - len_pos)::u32;
+        enc.emit_byte(b, ABBREV_BASE_TYPE);
+        push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, td.name_off::i64);
+        enc.emit_u32(b, 0);                     # DW_AT_name (strp, relocated to .debug_str)
+        enc.emit_byte(b, td.encoding);
+        enc.emit_byte(b, td.byte_size::u8);
+        t = t + 1;
     }
 }
 
@@ -1023,13 +1167,13 @@ fun emit_inlines(b: *enc.ByteBuf, f: u32, parent_site: u32, inlines: *DwInline, 
 # high_pc:      code span in bytes (high_pc - low_pc)
 # fb_reg:       frame-base DWARF register number
 # funcs/nfuncs: the module's functions (with resolved decl / return metadata)
-# bts/nbt:      the gathered base types (with resolved DIE / string offsets)
+# tc:           the gathered type table (with resolved DIE / string offsets)
 # relocs:       out - the InfoReloc list
 # reloc_count:  out - number of InfoRelocs appended
 # low_off:      out - byte offset of the CU 8-byte low_pc field
 # stmt_off:     out - byte offset of the CU 4-byte stmt_list field
 fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp_dir: str,
-               high_pc: u64, fb_reg: i32, funcs: *DwFunc, nfuncs: u32, bts: *BaseType, nbt: u32,
+               high_pc: u64, fb_reg: i32, funcs: *DwFunc, nfuncs: u32, tc: *TypeCtx,
                vars: *DwVar, relocs: *InfoReloc, reloc_count: *u32, low_off: *u32, stmt_off: *u32,
                s: *session.Session, irmod: *ir.Module, strtab: *StrTab,
                inlines: *DwInline, ninl: u32, iranges: *DwInlineRange) {
@@ -1052,17 +1196,8 @@ fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp
     @stmt_off = b.len::u32;
     enc.emit_u32(b, 0);                 # stmt_list (relocated to .debug_line)
 
-    # base-type DIEs first, so the subprograms below reference them by ref4.
-    var t: u32 = 0;
-    for (t < nbt) {
-        bts[t].off = (b.len - len_pos)::u32;
-        enc.emit_byte(b, ABBREV_BASE_TYPE);
-        push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, bts[t].str_off::i64);
-        enc.emit_u32(b, 0);             # DW_AT_name (strp, relocated to .debug_str)
-        enc.emit_byte(b, bts[t].encoding);
-        enc.emit_byte(b, bts[t].byte_size);
-        t = t + 1;
-    }
+    # type DIEs first, so the subprograms below reference them by ref4.
+    emit_type_dies(b, tc, len_pos, relocs, reloc_count);
 
     # abstract-instance subprograms for the inlined callees, before the concrete
     # subprograms so each inlined_subroutine references its origin backward. One per
@@ -1101,7 +1236,7 @@ fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp
         # a subprogram with no children uses the DW_CHILDREN_no leaf abbrev (and emits no
         # terminator), so it never advertises children it lacks (#1949).
         val has_kids: bool = subprogram_has_children(f, fn, vars, inlines, ninl);
-        if (fn.ret_bt >= 0) {
+        if (fn.ret_ty >= 0) {
             if (has_kids) { enc.emit_byte(b, ABBREV_SUBPROGRAM); } or { enc.emit_byte(b, ABBREV_SUBPROGRAM_LEAF); }
         } or {
             if (has_kids) { enc.emit_byte(b, ABBREV_SUBPROGRAM_VOID); } or { enc.emit_byte(b, ABBREV_SUBPROGRAM_VOID_LEAF); }
@@ -1115,7 +1250,7 @@ fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp
         uleb(b, fn.decl_file::u64);
         uleb(b, fn.decl_line::u64);
         emit_frame_base(b, fb_reg);
-        if (fn.ret_bt >= 0) { enc.emit_u32(b, bts[fn.ret_bt::u32].off); }   # DW_AT_type (ref4)
+        if (fn.ret_ty >= 0) { enc.emit_u32(b, tc.types[fn.ret_ty::u32].off); }   # DW_AT_type (ref4)
 
         # the subprogram's own variable / parameter children: instance-0 vars, plus any
         # var whose inline instance was dropped (no materialized inlined_subroutine to
@@ -1123,13 +1258,13 @@ fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp
         var vi: u32 = 0;
         for (vi < fn.var_count) {
             val dvr: *DwVar = ?vars[fn.var_start + vi];
-            if (dvr.inline_site == 0 || !inline_present(inlines, ninl, f, dvr.inline_site)) { emit_variable(b, dvr, bts, relocs, reloc_count); }
+            if (dvr.inline_site == 0 || !inline_present(inlines, ninl, f, dvr.inline_site)) { emit_variable(b, dvr, tc, relocs, reloc_count); }
             vi = vi + 1;
         }
 
         # its inlined_subroutine children, as a tree by inline-instance parent (top-level
         # instances directly under the subprogram, nested instances under their parent).
-        emit_inlines(b, f, 0, inlines, ninl, iranges, relocs, reloc_count, fn, address_size, vars, bts);
+        emit_inlines(b, f, 0, inlines, ninl, iranges, relocs, reloc_count, fn, address_size, vars, tc);
 
         if (has_kids) { enc.emit_byte(b, 0); }   # null DIE terminates the children (only when present)
         f = f + 1;
@@ -1146,14 +1281,14 @@ fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp
 # ---
 # b:      the info buffer
 # v:      the variable to emit
-# bts:    the base-type table (DW_AT_type ref4 target)
+# tc:     the type table (DW_AT_type ref4 target)
 # relocs/reloc_count: the deferred `.debug_info` relocation list (for the name strp)
-fun emit_variable(b: *enc.ByteBuf, v: *DwVar, bts: *BaseType, relocs: *InfoReloc, reloc_count: *u32) {
+fun emit_variable(b: *enc.ByteBuf, v: *DwVar, tc: *TypeCtx, relocs: *InfoReloc, reloc_count: *u32) {
     if (v.loc_kind == VLOC_LOCLIST) {
         if (v.is_param) { enc.emit_byte(b, ABBREV_PARAM_LOCLIST); } or { enc.emit_byte(b, ABBREV_VARIABLE_LOCLIST); }
         push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, v.name_off::i64);
-        enc.emit_u32(b, 0);                    # DW_AT_name (strp, relocated to .debug_str)
-        enc.emit_u32(b, bts[v.bt::u32].off);   # DW_AT_type (ref4)
+        enc.emit_u32(b, 0);                          # DW_AT_name (strp, relocated to .debug_str)
+        enc.emit_u32(b, tc.types[v.ty::u32].off);    # DW_AT_type (ref4)
         # DW_AT_location (sec_offset), relocated to the `.debug_loclists` entry.
         push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_LOCLIST, intern.STR_NIL, v.loclist_off::i64);
         enc.emit_u32(b, 0);
@@ -1166,8 +1301,8 @@ fun emit_variable(b: *enc.ByteBuf, v: *DwVar, bts: *BaseType, relocs: *InfoReloc
         if (located) { enc.emit_byte(b, ABBREV_VARIABLE); } or { enc.emit_byte(b, ABBREV_VARIABLE_NOLOC); }
     }
     push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, v.name_off::i64);
-    enc.emit_u32(b, 0);                    # DW_AT_name (strp, relocated to .debug_str)
-    enc.emit_u32(b, bts[v.bt::u32].off);   # DW_AT_type (ref4)
+    enc.emit_u32(b, 0);                          # DW_AT_name (strp, relocated to .debug_str)
+    enc.emit_u32(b, tc.types[v.ty::u32].off);    # DW_AT_type (ref4)
     if (located) { emit_var_location(b, v); }
 }
 
@@ -1838,18 +1973,15 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     }
     val ranges: *LocRange = R.unwrap_ok[*LocRange, str](rgr);
 
-    # gather base types + per-subprogram metadata + variables (+ their loclist ranges),
+    # gather types + per-subprogram metadata + variables (+ their loclist ranges),
     # building the `.debug_str` table as names / type spellings resolve.
-    val rb: R.Result[*BaseType, str] = A.allocate[BaseType](s.alloc, MAX_BASE_TYPES::usize);
-    if (R.is_err[*BaseType, str](rb)) { A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize); A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize); ret R.err[bool, str](R.unwrap_err[*BaseType, str](rb)); }
-    val bts: *BaseType = R.unwrap_ok[*BaseType, str](rb);
+    var tc: TypeCtx = type_ctx_init(s.alloc);
     var strtab: StrTab;
     strtab.buf = enc.buf_init(s.alloc);
-    var nbt: u32 = 0;
     var var_count: u32 = 0;
     var range_count: u32 = 0;
     gather_subprograms(s, tgt, irmod, subs, nsub, rows, row_count, varlocs, varloc_count, text_sec, ?ft, address_size,
-                       bts, ?nbt, ?strtab, vars, ?var_count, var_cap, ranges, ?range_count, range_cap);
+                       ?tc, ?strtab, vars, ?var_count, var_cap, ranges, ?range_count, range_cap);
 
     # a module emits a `.debug_loclists` section only when some variable's home moves.
     var has_loclists: bool = false;
@@ -1859,7 +1991,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     # per-function set_address field offsets, filled by build_line.
     val ra: R.Result[*u32, str] = A.allocate[u32](s.alloc, nfuncs::usize);
     if (R.is_err[*u32, str](ra)) {
-        enc.buf_dnit(?strtab.buf); A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+        enc.buf_dnit(?strtab.buf); type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
         A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
         ret R.err[bool, str](R.unwrap_err[*u32, str](ra));
@@ -1867,14 +1999,15 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     val addr_off: *u32 = R.unwrap_ok[*u32, str](ra);
 
     # the `.debug_info` reloc list: 2 CU + 2 per subprogram (name strp, low_pc addr) +
-    # 1 per base type (name strp) + up to 2 per variable (name strp, loclist sec_offset).
-    # + 2 per inlined instance (abstract-instance name strp, inlined_subroutine low_pc
-    # sym); bounded by the transition count, an upper bound on the instance count.
-    val reloc_cap: u32 = 2 + 2 * nsub + nbt + 2 * var_count + 2 * inline_pc_count;
+    # 1 per named type DIE (base + struct / union name strp) + 1 per aggregate member
+    # (name strp) + up to 2 per variable (name strp, loclist sec_offset) + 2 per inlined
+    # instance (abstract-instance name strp, inlined_subroutine low_pc sym); bounded by
+    # the transition count, an upper bound on the instance count.
+    val reloc_cap: u32 = 2 + 2 * nsub + tc.ntypes + tc.nmemb + 2 * var_count + 2 * inline_pc_count;
     val rr2: R.Result[*InfoReloc, str] = A.allocate[InfoReloc](s.alloc, reloc_cap::usize);
     if (R.is_err[*InfoReloc, str](rr2)) {
         A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); enc.buf_dnit(?strtab.buf);
-        A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+        type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
         A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
         ret R.err[bool, str](R.unwrap_err[*InfoReloc, str](rr2));
@@ -1888,7 +2021,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     if (R.is_err[*LocReloc, str](rlr)) {
         A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
         A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); enc.buf_dnit(?strtab.buf);
-        A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+        type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
         A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
         ret R.err[bool, str](R.unwrap_err[*LocReloc, str](rlr));
@@ -1917,7 +2050,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     if (R.is_err[*DwInline, str](rinl)) {
         enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
         A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
-        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
         A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
         ret R.err[bool, str](R.unwrap_err[*DwInline, str](rinl));
@@ -1928,7 +2061,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
         A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
         enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
         A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
-        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
         A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
         ret R.err[bool, str](R.unwrap_err[*DwInlineRange, str](rirng));
@@ -1941,7 +2074,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
         A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize); A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
         enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
         A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
-        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
         A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
         ret rgi;
@@ -1958,7 +2091,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
         A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize); A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
         enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
         A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
-        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); type_ctx_dnit(?tc);
         A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
         A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
         ret R.err[bool, str](R.unwrap_err[*RngReloc, str](rrr));
@@ -1979,7 +2112,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     var low_off:  u32 = 0;
     var stmt_off: u32 = 0;
     build_info(?b_info, address_size, producer, name, comp_dir, high_pc, frame_base_reg(tgt),
-               subs, nsub, bts, nbt, vars, info_relocs, ?info_reloc_count, ?low_off, ?stmt_off,
+               subs, nsub, ?tc, vars, info_relocs, ?info_reloc_count, ?low_off, ?stmt_off,
                s, irmod, ?strtab, inlines, ninl, iranges);
 
     val pr: R.Result[bool, str] = install(s, image, itn, funcs, nfuncs, cu_low_name,
@@ -1999,7 +2132,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize);
     A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
     A.deallocate[u32](s.alloc, addr_off, nfuncs::usize);
-    A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+    type_ctx_dnit(?tc);
     A.deallocate[LocRange](s.alloc, ranges, range_cap::usize);
     A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
     A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize);
@@ -2007,10 +2140,9 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     ret pr;
 }
 
-# resolve each function's subprogram metadata and gather the distinct base types its
-# return types reference. Fills `funcs[*].disp`, `disp_off`, `decl_file`, `decl_line`,
-# `ret_bt`, and each `bts[*]` (name / encoding / byte_size / str_off). Returns the
-# number of base types
+# resolve each function's subprogram metadata and gather the distinct types its return
+# types reference. Fills `funcs[*].disp`, `disp_off`, `decl_file`, `decl_line`, `ret_ty`,
+# and the type table (`tc`) with the referenced DIEs / string offsets
 # ---
 # s:            session (IR lookup, type universe, source map)
 # irmod:        the IR module supplying disp / ret_sem
@@ -2020,14 +2152,14 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
 # text_sec:     the `.text` section index
 # ft:           the file table (for decl_file resolution)
 # address_size: target pointer width, for a raw-pointer return's byte size
-# bts:          out - the base-type array (cap MAX_BASE_TYPES)
+# tc:           out - the type table
 # strtab:       out - the `.debug_str` string table
 # vars/var_count/var_cap: out - the shared variable array
 # ranges/range_count/range_cap: out - the shared loclist-range array
 fun gather_subprograms(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
                        funcs: *DwFunc, nfuncs: u32, rows: *enc.LineRow, row_count: u32,
                        varlocs: *enc.VarLoc, varloc_count: u32, text_sec: u32,
-                       ft: *FileTable, address_size: u8, bts: *BaseType, nbt: *u32, strtab: *StrTab,
+                       ft: *FileTable, address_size: u8, tc: *TypeCtx, strtab: *StrTab,
                        vars: *DwVar, var_count: *u32, var_cap: u32,
                        ranges: *LocRange, range_count: *u32, range_cap: u32) {
     var i: u32 = 0;
@@ -2036,7 +2168,7 @@ fun gather_subprograms(s: *session.Session, tgt: *target.Target, irmod: *ir.Modu
         fn.decl_file = 0;
         fn.decl_line = 0;
         fn.disp      = intern.STR_NIL;
-        fn.ret_bt    = -1;
+        fn.ret_ty    = -1;
         fn.var_start = @var_count;
         fn.var_count = 0;
 
@@ -2064,17 +2196,14 @@ fun gather_subprograms(s: *session.Session, tgt: *target.Target, irmod: *ir.Modu
             fn.decl_line = pl.line::u32;
         }
 
-        # return base type, deduplicated by spelling.
-        val obt: O.Option[BaseType] = sem_base_type(s, ret_sem, address_size);
-        if (O.is_some[BaseType](obt)) {
-            fn.ret_bt = bt_intern(bts, nbt, strtab, O.unwrap[BaseType](obt));
-        }
+        # return type: any resolvable type (a composite un-defers #1907's aggregates).
+        fn.ret_ty = type_intern(s, tgt, irmod, tc, strtab, ret_sem, address_size);
 
         # variables + parameters: join the encoder's variable-location records for this
         # function's `.text` range with the IR dbg-var identity.
         if (irfn != nil) {
-            gather_vars(s, tgt, irfn, fn.offset, fn.offset + fn.size, varlocs, varloc_count, text_sec,
-                        address_size, bts, nbt, strtab, vars, var_count, var_cap, ranges, range_count, range_cap);
+            gather_vars(s, tgt, irmod, irfn, fn.offset, fn.offset + fn.size, varlocs, varloc_count, text_sec,
+                        address_size, tc, strtab, vars, var_count, var_cap, ranges, range_count, range_cap);
             fn.var_count = @var_count - fn.var_start;
         }
         i = i + 1;
@@ -2208,22 +2337,23 @@ fun gather_inlines(s: *session.Session, irmod: *ir.Module, funcs: *DwFunc, nfunc
 # dbg-var identity (name / semantic type / param flag); named, primitive-typed
 # variables get a DwVar. Each variable's bindings become PC-ordered LocRanges; a
 # variable whose real homes all agree keeps a single inline exprloc, one whose homes
-# disagree becomes a VLOC_LOCLIST with per-PC ranges. Only primitives get a DIE this
-# increment
+# disagree becomes a VLOC_LOCLIST with per-PC ranges. A variable's type is interned
+# through `type_intern`, so aggregates and typed pointers carry their composite DIE
 # ---
-# s/tgt:        session + target (the ISA dwarf_reg hook)
+# s/tgt:        session + target (the ISA dwarf_reg hook, member layout)
+# irmod:        the IR module (IR type universe for composite layout)
 # irfn:         the IR function (dbg-var / dbg-expr side tables)
 # lo/hi:        the function's `.text` byte range
 # varlocs/varloc_count: the encoder's variable-location records
 # text_sec:     the `.text` section index (records in other sections are skipped)
 # address_size: pointer width, for a raw-pointer base type
-# bts/nbt:      the base-type table
+# tc:           the type table
 # strtab:       the `.debug_str` string table
 # vars/var_count/var_cap:       the shared variable array
 # ranges/range_count/range_cap: the shared loclist-range array
-fun gather_vars(s: *session.Session, tgt: *target.Target, irfn: *ir.Function, lo: u32, hi: u32,
+fun gather_vars(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, irfn: *ir.Function, lo: u32, hi: u32,
                 varlocs: *enc.VarLoc, varloc_count: u32, text_sec: u32, address_size: u8,
-                bts: *BaseType, nbt: *u32, strtab: *StrTab, vars: *DwVar, var_count: *u32, var_cap: u32,
+                tc: *TypeCtx, strtab: *StrTab, vars: *DwVar, var_count: *u32, var_cap: u32,
                 ranges: *LocRange, range_count: *u32, range_cap: u32) {
     val fn_var_start: u32 = @var_count;
 
@@ -2232,7 +2362,7 @@ fun gather_vars(s: *session.Session, tgt: *target.Target, irfn: *ir.Function, lo
     for (i < varloc_count) {
         val vl: *enc.VarLoc = ?varlocs[i];
         if (vl.sec != text_sec || vl.text_offset < lo || vl.text_offset >= hi) { i = i + 1; cnt; }
-        val obt: O.Option[u32] = varloc_ident(s, irfn, vl, address_size, bts, nbt, strtab);
+        val obt: O.Option[u32] = varloc_ident(s, tgt, irmod, irfn, vl, address_size, tc, strtab);
         if (O.is_none[u32](obt)) { i = i + 1; cnt; }
         val name_off: u32 = O.unwrap[u32](obt);
         # the inline instance this variable lives in (0 = the caller's own body); a caller
@@ -2245,9 +2375,9 @@ fun gather_vars(s: *session.Session, tgt: *target.Target, irfn: *ir.Function, lo
         for (j < @var_count) { if (vars[j].name_off == name_off && vars[j].inline_site == vsite) { found = true; } j = j + 1; }
         if (!found && @var_count < var_cap) {
             val dv: *ir.DbgVar = O.unwrap[*ir.DbgVar](ir.dbg_var_get(irfn, vl.iid::id.InstructionId));
-            val bt: i32 = bt_intern(bts, nbt, strtab, O.unwrap[BaseType](sem_base_type(s, dv.ty_sem, address_size)));
+            val ty: i32 = type_intern(s, tgt, irmod, tc, strtab, dv.ty_sem, address_size);
             vars[@var_count].name_off    = name_off;
-            vars[@var_count].bt          = bt;
+            vars[@var_count].ty          = ty;
             vars[@var_count].is_param    = dv.is_param;
             vars[@var_count].loc_kind    = VLOC_NONE;
             vars[@var_count].reg         = 0;
@@ -2273,7 +2403,7 @@ fun gather_vars(s: *session.Session, tgt: *target.Target, irfn: *ir.Function, lo
             val vl: *enc.VarLoc = ?varlocs[k];
             if (vl.sec != text_sec || vl.text_offset < lo || vl.text_offset >= hi) { k = k + 1; cnt; }
             if (@range_count >= range_cap) { k = k + 1; cnt; }
-            val oid: O.Option[u32] = varloc_ident(s, irfn, vl, address_size, bts, nbt, strtab);
+            val oid: O.Option[u32] = varloc_ident(s, tgt, irmod, irfn, vl, address_size, tc, strtab);
             if (O.is_none[u32](oid)) { k = k + 1; cnt; }
             if (O.unwrap[u32](oid) != v.name_off) { k = k + 1; cnt; }
 
@@ -2310,26 +2440,26 @@ fun gather_vars(s: *session.Session, tgt: *target.Target, irfn: *ir.Function, lo
 }
 
 # join a variable-location record to its IR dbg-var identity and return the variable's
-# `.debug_str` name offset, or none when the binding has no named, primitive-typed
-# source variable (so it contributes no DIE). Interns the name and base type as a side
-# effect (idempotent - a repeat resolves to the same offsets)
+# `.debug_str` name offset, or none when the binding has no named, DIE-carrying source
+# variable (so it contributes no DIE). Interns the name and type as a side effect
+# (idempotent - a repeat resolves to the same offsets)
 # ---
 # s:            session (interner, type universe)
+# tgt:          resolved target (member layout via the IR type table)
+# irmod:        the IR module (IR type universe for composite layout)
 # irfn:         the IR function holding the dbg-var side table
 # vl:           the variable-location record (its `iid` joins the identity)
 # address_size: pointer width, for a raw-pointer base type
-# bts/nbt:      the base-type table
+# tc:           the type table
 # strtab:       the `.debug_str` string table
 # ret:          the variable's name offset, or none
-fun varloc_ident(s: *session.Session, irfn: *ir.Function, vl: *enc.VarLoc, address_size: u8,
-                 bts: *BaseType, nbt: *u32, strtab: *StrTab) O.Option[u32] {
+fun varloc_ident(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, irfn: *ir.Function,
+                 vl: *enc.VarLoc, address_size: u8, tc: *TypeCtx, strtab: *StrTab) O.Option[u32] {
     val odv: O.Option[*ir.DbgVar] = ir.dbg_var_get(irfn, vl.iid::id.InstructionId);
     if (O.is_none[*ir.DbgVar](odv)) { ret O.none[u32](); }
     val dv: *ir.DbgVar = O.unwrap[*ir.DbgVar](odv);
     if (dv.name == intern.STR_NIL) { ret O.none[u32](); }
-    val obt: O.Option[BaseType] = sem_base_type(s, dv.ty_sem, address_size);
-    if (O.is_none[BaseType](obt)) { ret O.none[u32](); }
-    if (bt_intern(bts, nbt, strtab, O.unwrap[BaseType](obt)) < 0) { ret O.none[u32](); }
+    if (type_intern(s, tgt, irmod, tc, strtab, dv.ty_sem, address_size) < 0) { ret O.none[u32](); }
     ret O.some[u32](str_off(strtab, resolve(?s.interner, dv.name)));
 }
 
@@ -2386,27 +2516,45 @@ fun classify_var(v: *DwVar, ranges: *LocRange) {
     v.range_count = 0;
 }
 
-# find or append a base type by spelling, returning its index. Resolves the type's
+# find or append a base type by spelling, returning its type index. Resolves the type's
 # name string offset on first insertion
 # ---
-# bts:    the base-type array (cap MAX_BASE_TYPES)
-# nbt:    in/out - current count
+# tc:     the type context (base types dedup against its TK_BASE entries)
 # strtab: the string table, for the name's `.debug_str` offset
-# bt:     the base type to intern (name / encoding / byte_size set)
-# ret:    the base type's index, or -1 when the table is full
-fun bt_intern(bts: *BaseType, nbt: *u32, strtab: *StrTab, bt: BaseType) i32 {
+# bt:     the base type DIE to intern (kind TK_BASE, name / encoding / byte_size set)
+# ret:    the base type's index, or -1 on allocation failure
+fun base_intern(tc: *TypeCtx, strtab: *StrTab, bt: TypeDie) i32 {
     var i: u32 = 0;
-    for (i < @nbt) {
-        if (str_equals(bts[i].name, bt.name)) { ret i::i32; }
+    for (i < tc.ntypes) {
+        if (tc.types[i].kind == TK_BASE && str_equals(tc.types[i].name, bt.name)) { ret i::i32; }
         i = i + 1;
     }
-    if (@nbt >= MAX_BASE_TYPES) { ret -1; }
-    var e: BaseType = bt;
-    e.str_off = str_off(strtab, bt.name);
-    e.off     = 0;
-    bts[@nbt] = e;
-    @nbt = @nbt + 1;
-    ret (@nbt - 1)::i32;
+    if (!type_reserve(tc)) { ret -1; }
+    var e: TypeDie = bt;
+    e.name_off = str_off(strtab, bt.name);
+    e.off      = 0;
+    tc.types[tc.ntypes] = e;
+    tc.ntypes = tc.ntypes + 1;
+    ret (tc.ntypes - 1)::i32;
+}
+
+# intern a semantic type into the compile unit's type table, returning its type index,
+# or -1 when the type carries no DIE (void / unresolved). This increment resolves
+# primitive scalars only; the aggregate tier extends it to composites
+# ---
+# s:            session (semantic type universe, interner)
+# tgt:          resolved target (member layout via the IR type table)
+# irmod:        the IR module (IR type universe for composite layout)
+# tc:           the type table
+# strtab:       the `.debug_str` string table
+# sem:          the semantic TypeId to intern
+# address_size: target pointer width, for a raw `ptr` byte size
+# ret:          the type's index in `tc`, or -1
+fun type_intern(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, tc: *TypeCtx,
+                strtab: *StrTab, sem: semtype.TypeId, address_size: u8) i32 {
+    val obt: O.Option[TypeDie] = sem_base_type(s, sem, address_size);
+    if (O.is_none[TypeDie](obt)) { ret -1; }
+    ret base_intern(tc, strtab, O.unwrap[TypeDie](obt));
 }
 
 # the source location of a function's first row in `.text` order (the lowest-offset
