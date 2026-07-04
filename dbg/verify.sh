@@ -109,6 +109,20 @@ distinct_lines() {
         /^0x/{a=strtonum($1); if(a>=lo && a<hi) seen[$2]=1} END{print length(seen)}'
 }
 
+# var_loclist_ranges <binary> <name> — the number of PC ranges in the named local's
+# DW_AT_location location list, or 0 when it has an inline (single-location) exprloc or
+# no location. A variable that re-homes across its scope (the #1705 tier) reports its
+# range count; the single-location tier reports 0.
+var_loclist_ranges() {
+    "$dwarfdump" --debug-info "$1" 2>/dev/null | awk -v want="$2" '
+        /DW_TAG_/    { invar = ($0 ~ /DW_TAG_variable/); name=""; loc=0 }
+        /DW_AT_name/ && invar { if ($0 ~ "\\(\"" want "\"\\)") name=want }
+        name==want && /DW_AT_location/ { loc=1; next }
+        name==want && loc && /\[0x/    { cnt++ }
+        name==want && loc && !/\[0x/   { loc=0 }
+        END { print cnt+0 }'
+}
+
 # elf_seg_identical <a> <b> — true if every PT_LOAD segment of <a> has byte-identical
 # file content in <b>, after the ELF header's section-table bookkeeping (e_shoff,
 # e_shnum, e_shstrndx — expected to differ once -g adds named sections) is normalized.
@@ -197,6 +211,20 @@ verify_dwarf() {
     #    section-table bookkeeping). a codegen change under -g fails here.
     if ! elf_seg_identical "$g" "$nog"; then
         echo "FAIL $label (-g perturbed a loadable segment vs the no-g build)"; rm -rf "$tmp"; return 1
+    fi
+
+    # 6. PC-ranged variable locations (#1705): `pick`'s re-homed local `x` gets a
+    #    `.debug_loclists` entry with multiple ranges. under the single-location tier
+    #    alone it would have no location at all, so this is the falsifiable loclists
+    #    check. only asserted where the fixture has such a variable.
+    if grep -q '^fun pick' "$src"; then
+        if ! readelf -SW "$g" 2>/dev/null | grep -q '\.debug_loclists'; then
+            echo "FAIL $label (no .debug_loclists section for a re-homed local)"; rm -rf "$tmp"; return 1
+        fi
+        nr=$(var_loclist_ranges "$g" x)
+        if [ "${nr:-0}" -lt 2 ]; then
+            echo "FAIL $label ('x' has $nr loclist ranges; expected a multi-range location list)"; rm -rf "$tmp"; return 1
+        fi
     fi
 
     echo "PASS $label"
