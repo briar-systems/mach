@@ -219,10 +219,10 @@ verify_dwarf() {
 
     # 5. additive-only: -g must not perturb the loaded program. every PT_LOAD segment
     #    is byte-identical between the -g and no-g builds (modulo the ELF header's
-    #    section-table bookkeeping). a codegen change under -g fails here. NOTE: this
-    #    runs at the debug profile only; the release counterpart is deferred to #1944
-    #    (release -g still perturbs .text on clean dev), so verify_inline_release does
-    #    not yet assert it.
+    #    section-table bookkeeping). a codegen change under -g fails here. this fixture
+    #    builds at the debug profile; the release counterpart (where the inline / late
+    #    sweep passes fire) is asserted the same way in verify_inline_release below,
+    #    restored by #1944.
     if ! elf_seg_identical "$g" "$nog"; then
         echo "FAIL $label (-g perturbed a loadable segment vs the no-g build)"; rm -rf "$tmp"; return 1
     fi
@@ -256,21 +256,26 @@ verify_dwarf() {
 }
 
 # verify_inline_release <fixture_dir> <build_target> <min_dies> <callees> — the inline
-# pass fires only at release, so this leg builds one -g release binary and asserts the
-# DWARF inlined_subroutine tier: llvm-dwarfdump --verify is clean, at least <min_dies>
-# DW_TAG_inlined_subroutine DIEs are present, and each name in <callees> (space-
-# separated) appears as an inlined instance (its DW_AT_abstract_origin resolves to it) —
-# the pin that every level of a nested inline chain survived. Byte-for-byte -g additivity
-# is NOT asserted here yet: release -g still perturbs .text on clean dev (a pre-existing
-# -g-sensitive inlining decision, tracked in #1944 — see step 5's note). turn the
-# elf_seg_identical assertion on at release once #1944 lands.
+# pass fires only at release, so this leg builds a -g and a no-g release binary and
+# asserts two things: the DWARF inlined_subroutine tier (llvm-dwarfdump --verify clean,
+# at least <min_dies> DW_TAG_inlined_subroutine DIEs, and each name in <callees> (space-
+# separated) present as an inlined instance whose DW_AT_abstract_origin resolves to it —
+# the pin that every level of a nested inline chain survived), and byte-for-byte -g
+# additivity at release: every PT_LOAD segment is identical between the two builds, the
+# release counterpart of step 5. This is the guard #1944 restored (the release-only
+# passes must be blind to debug metadata); the compiler's own object-format/ABI writers
+# still carry a separate backend -g-sensitivity tracked in #1956, which these fixtures
+# do not exercise.
 verify_inline_release() {
     dir=$1; bt=$2; min=$3; callees=$4
     label="${dir#"$here"/} [$bt release]"
     tmp=$(mktemp -d)
-    g="$tmp/g"
+    g="$tmp/g"; nog="$tmp/nog"
     if ! (cd "$dir" && "$compiler" dep pull && "$compiler" build . --target "$bt" --profile release -g -o "$g") >"$tmp/b.log" 2>&1; then
         echo "FAIL $label (build release -g)"; sed 's/^/    /' "$tmp/b.log" >&2; rm -rf "$tmp"; return 1
+    fi
+    if ! (cd "$dir" && "$compiler" build . --target "$bt" --profile release -o "$nog") >"$tmp/b2.log" 2>&1; then
+        echo "FAIL $label (build release no-g)"; sed 's/^/    /' "$tmp/b2.log" >&2; rm -rf "$tmp"; return 1
     fi
     if ! "$dwarfdump" --verify "$g" >"$tmp/v.log" 2>&1; then
         echo "FAIL $label (llvm-dwarfdump --verify)"; tail -30 "$tmp/v.log" | sed 's/^/    /' >&2; rm -rf "$tmp"; return 1
@@ -284,7 +289,36 @@ verify_inline_release() {
             echo "FAIL $label (no inlined_subroutine referencing $callee)"; rm -rf "$tmp"; return 1
         fi
     done
-    echo "PASS $label ($n inlined_subroutine DIEs)"
+    # additive-only at release: the release-only inline / mem2reg / late-sweep passes must
+    # not perturb one byte of the loaded program under -g.
+    if ! elf_seg_identical "$g" "$nog"; then
+        echo "FAIL $label (-g perturbed a loadable segment vs the no-g release build)"; rm -rf "$tmp"; return 1
+    fi
+    echo "PASS $label ($n inlined_subroutine DIEs, -g additive)"
+    rm -rf "$tmp"
+    return 0
+}
+
+# verify_release_additive <fixture_dir> <build_target> — assert byte-for-byte -g
+# additivity at the release profile: the -g and no-g release builds share every PT_LOAD
+# segment. this is the falsifiable guard for the release-only passes (a fixture whose
+# local promotes to SSA only after inlining, so a -g-blind escape/salvage bug keeps it in
+# memory under -g and drops it without — #1944).
+verify_release_additive() {
+    dir=$1; bt=$2
+    label="${dir#"$here"/} [$bt release additive]"
+    tmp=$(mktemp -d)
+    g="$tmp/g"; nog="$tmp/nog"
+    if ! (cd "$dir" && "$compiler" dep pull && "$compiler" build . --target "$bt" --profile release -g -o "$g") >"$tmp/b.log" 2>&1; then
+        echo "FAIL $label (build release -g)"; sed 's/^/    /' "$tmp/b.log" >&2; rm -rf "$tmp"; return 1
+    fi
+    if ! (cd "$dir" && "$compiler" build . --target "$bt" --profile release -o "$nog") >"$tmp/b2.log" 2>&1; then
+        echo "FAIL $label (build release no-g)"; sed 's/^/    /' "$tmp/b2.log" >&2; rm -rf "$tmp"; return 1
+    fi
+    if ! elf_seg_identical "$g" "$nog"; then
+        echo "FAIL $label (-g perturbed a loadable segment vs the no-g release build)"; rm -rf "$tmp"; return 1
+    fi
+    echo "PASS $label"
     rm -rf "$tmp"
     return 0
 }
@@ -293,7 +327,7 @@ for dir in "$fixtures"/$filter; do
     [ -f "$dir/mach.toml" ] || continue
     # the inline fixtures are release-only (their callees inline away at -O0); they have
     # their own release legs below and do not fit the debug fixture's structural checks.
-    case "$(basename "$dir")" in inline|inline4) continue;; esac
+    case "$(basename "$dir")" in inline|inline4|promote) continue;; esac
     for bt in $elf_targets; do
         ran=$((ran + 1))
         verify_dwarf "$dir" "$bt" || fails=$((fails + 1))
@@ -314,6 +348,15 @@ if [ -f "$fixtures/inline4/mach.toml" ]; then
     for bt in $elf_targets; do
         ran=$((ran + 1))
         verify_inline_release "$fixtures/inline4" "$bt" 4 "a b c d" || fails=$((fails + 1))
+    done
+fi
+# promote is the release -g additivity guard: its local escapes into an inlinable
+# helper, so it promotes only after the inline pass runs — a release-only pass that is
+# not blind to the local's debug value keeps it in memory under -g and drops it without.
+if [ -f "$fixtures/promote/mach.toml" ]; then
+    for bt in $elf_targets; do
+        ran=$((ran + 1))
+        verify_release_additive "$fixtures/promote" "$bt" || fails=$((fails + 1))
     done
 fi
 
