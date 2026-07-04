@@ -37,6 +37,7 @@ use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.source;
 use mach.lang.target;
+use semtype: mach.lang.type;
 
 # instruction-count ceiling below which a callee is small enough to inline
 # unconditionally. fixed for the rewrite; future cost models read it off the
@@ -214,18 +215,27 @@ fun callee_has_asm(callee: *ir.Function) bool {
     ret false;
 }
 
-# count the instructions that live in the callee's blocks
+# count the instructions that live in the callee's blocks, EXCLUDING OP_DBG_VALUE
 #
-# Pool entries orphaned by earlier passes are not counted.
+# OP_DBG_VALUE births are emitted only under -g, so counting them would let the size
+# threshold in should_inline decide differently with and without -g and emit different
+# machine code -- a -g additivity violation. The count must be -g-invariant, so debug
+# values are skipped. Pool entries orphaned by earlier passes are not counted.
 # ---
 # callee: the callee function
-# ret:    total live phi, body, and terminator instructions
+# ret:    total live phi, non-debug body, and terminator instructions
 fun callee_instr_count(callee: *ir.Function) u32 {
     var total: u32 = 0;
     var i: u32 = 0;
     for (i < callee.block_count) {
         val blk: *ir.Block = ?callee.blocks[i];
-        total = total + blk.phi_count + blk.instr_count;
+        total = total + blk.phi_count;
+        var k: u32 = 0;
+        for (k < blk.instr_count) {
+            val oi: O.Option[*instruction.Instruction] = ir.instruction_get(callee, blk.instructions[k]);
+            if (O.is_some[*instruction.Instruction](oi) && O.unwrap[*instruction.Instruction](oi).kind != instruction.OP_DBG_VALUE) { total = total + 1; }
+            k = k + 1;
+        }
         if (blk.terminator != id.INSTR_NIL) { total = total + 1; }
         i = i + 1;
     }
@@ -567,6 +577,10 @@ fun stamp_inline_metadata(m: *ir.Module, cx: *InlineCtx, call_loc: source.SrcLoc
         }
         val rs: R.Result[bool, str] = ir.instr_inline_site_set(caller, cloned_iid, caller_site);
         if (R.is_err[bool, str](rs)) { if (site_map != nil) { A.deallocate[u32](m.alloc, site_map, (nsite + 1)::usize); } ret rs; }
+        # copy the callee's dbg-var / dbg-expr identity onto the cloned OP_DBG_VALUE so the
+        # inlined local keeps its name/type; the #1707 producer nests it under its instance.
+        val rc: R.Result[bool, str] = ir.clone_dbg_metadata(m, callee, caller, i::id.InstructionId, cloned_iid);
+        if (R.is_err[bool, str](rc)) { if (site_map != nil) { A.deallocate[u32](m.alloc, site_map, (nsite + 1)::usize); } ret rc; }
         i = i + 1;
     }
     if (site_map != nil) { A.deallocate[u32](m.alloc, site_map, (nsite + 1)::usize); }
@@ -1138,5 +1152,85 @@ test "mach.lang.me.pass.inline.mark_recursive:direct_self_call" {
     A.deallocate[bool](m.alloc, recursive, 1::usize);
     ir.dnit(?m);
     if (is_recursive == false) { ret 1; }
+    ret 0;
+}
+
+# callee_instr_count must be -g-invariant: OP_DBG_VALUE births exist only under -g,
+# so counting them would let the size gate in should_inline decide differently with
+# and without -g and emit different machine code. This builds two callees with the
+# identical real body -- one clean, one carrying enough OP_DBG_VALUE births to cross
+# INLINE_INSTR_THRESHOLD if they were counted -- and proves the count (hence the
+# inline decision) is the same for both, at the size boundary where it matters.
+test "mach.lang.me.pass.inline.callee_instr_count:dbg_value_blind" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val res_i64: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64)) { ir.dnit(?m); ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
+
+    # nadd real adds keep the clean count just below the threshold; kdbg debug
+    # values are enough to push a dbg-value-counting implementation over it.
+    val nadd: u32 = 19;
+    val kdbg: u32 = 6;
+
+    var bld: builder.Builder = builder.init(?m);
+
+    # clean callee: nadd adds + a terminator, no debug values.
+    val res_c: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_c)) { ir.dnit(?m); ret 1; }
+    val fn_clean: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](res_c)];
+    builder.set_function(?bld, fn_clean);
+    val res_cb: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_cb)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_cb));
+    var ca: value.Value = value.const_int(1, i64t);
+    var i: u32 = 0;
+    for (i < nadd) {
+        val r: R.Result[value.Value, str] = builder.emit_add(?bld, ca, value.const_int(1, i64t));
+        if (R.is_err[value.Value, str](r)) { ir.dnit(?m); ret 1; }
+        ca = R.unwrap_ok[value.Value, str](r);
+        i = i + 1;
+    }
+    if (R.is_err[bool, str](builder.emit_ret_void(?bld))) { ir.dnit(?m); ret 1; }
+
+    # laden callee: the same nadd adds, then kdbg debug values, then a terminator.
+    val res_l: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_l)) { ir.dnit(?m); ret 1; }
+    val fn_laden: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](res_l)];
+    builder.set_function(?bld, fn_laden);
+    val res_lb: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_lb)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_lb));
+    var la: value.Value = value.const_int(1, i64t);
+    var track: value.Value = la;
+    var j: u32 = 0;
+    for (j < nadd) {
+        val r: R.Result[value.Value, str] = builder.emit_add(?bld, la, value.const_int(1, i64t));
+        if (R.is_err[value.Value, str](r)) { ir.dnit(?m); ret 1; }
+        la = R.unwrap_ok[value.Value, str](r);
+        track = la;
+        j = j + 1;
+    }
+    var d: u32 = 0;
+    for (d < kdbg) {
+        if (R.is_err[bool, str](builder.emit_dbg_value(?bld, track, intern.STR_NIL, i64t, semtype.TYPE_NIL, false, 0))) { ir.dnit(?m); ret 1; }
+        d = d + 1;
+    }
+    if (R.is_err[bool, str](builder.emit_ret_void(?bld))) { ir.dnit(?m); ret 1; }
+
+    val clean: u32 = callee_instr_count(fn_clean);
+    val laden: u32 = callee_instr_count(fn_laden);
+    ir.dnit(?m);
+
+    # the fix: debug values do not change the count, so the decision is unchanged
+    if (clean != laden)                        { ret 1; }
+    # the clean body is under the threshold -- it inlines
+    if (!(clean < INLINE_INSTR_THRESHOLD))     { ret 1; }
+    # counting the debug values would have crossed the threshold and refused to inline
+    if (clean + kdbg < INLINE_INSTR_THRESHOLD) { ret 1; }
     ret 0;
 }
