@@ -154,6 +154,13 @@ val ABBREV_PARAM_NOLOC:     u8 = 0x08;
 val ABBREV_VARIABLE_LOCLIST: u8 = 0x09;
 val ABBREV_PARAM_LOCLIST:    u8 = 0x0a;
 
+# inlining tier: an abstract-instance subprogram (name + DW_AT_inline, no code range) the
+# inlined_subroutine DIEs reference, and the two inlined_subroutine shapes -- a single
+# contiguous extent (low_pc/high_pc) or a range list (DW_AT_ranges into `.debug_rnglists`)
+val ABBREV_SUBPROGRAM_ABSTRACT: u8 = 0x0b;
+val ABBREV_INLINED:             u8 = 0x0c;
+val ABBREV_INLINED_RANGES:      u8 = 0x0d;
+
 # DWARF 5 line-number program: standard opcodes, extended opcodes, and the tuned
 # special-opcode parameters this producer emits
 val DW_LNS_copy:         u8 = 0x01;
@@ -698,7 +705,45 @@ fun build_abbrev(b: *enc.ByteBuf) {
     build_var_loclist_abbrev(b, ABBREV_VARIABLE_LOCLIST, DW_TAG_variable);
     build_var_loclist_abbrev(b, ABBREV_PARAM_LOCLIST,    DW_TAG_formal_parameter);
 
+    # abstract-instance subprogram: name (strp) + DW_AT_inline (data1), no code range and
+    # (this tier) no children; the dbg-clone increment gives it abstract locals + children.
+    uleb(b, ABBREV_SUBPROGRAM_ABSTRACT::u64);
+    uleb(b, DW_TAG_subprogram::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_name,   DW_FORM_strp);
+    emit_attr(b, DW_AT_inline, DW_FORM_data1);
+    uleb(b, 0); uleb(b, 0);
+
+    # inlined_subroutine, contiguous-extent and range-list shapes.
+    build_inlined_abbrev(b, ABBREV_INLINED,        false);
+    build_inlined_abbrev(b, ABBREV_INLINED_RANGES, true);
+
     uleb(b, 0);   # null abbrev code terminates the table
+}
+
+# emit one DW_TAG_inlined_subroutine abbreviation. `ranges` selects DW_AT_ranges
+# (sec_offset into `.debug_rnglists`) for a non-contiguous instance, else an inline
+# DW_AT_low_pc / DW_AT_high_pc pair. No children this tier (flat, no inlined locals); the
+# dbg-clone / nesting increment adds a children-bearing shape.
+# ---
+# b:      the abbrev buffer
+# code:   the abbreviation code
+# ranges: true for the DW_AT_ranges shape, false for the low_pc/high_pc shape
+fun build_inlined_abbrev(b: *enc.ByteBuf, code: u8, ranges: bool) {
+    uleb(b, code::u64);
+    uleb(b, DW_TAG_inlined_subroutine::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_abstract_origin, DW_FORM_ref4);
+    if (ranges) {
+        emit_attr(b, DW_AT_ranges,  DW_FORM_sec_offset);
+    }
+    or {
+        emit_attr(b, DW_AT_low_pc,  DW_FORM_addr);
+        emit_attr(b, DW_AT_high_pc, DW_FORM_data8);
+    }
+    emit_attr(b, DW_AT_call_file, DW_FORM_udata);
+    emit_attr(b, DW_AT_call_line, DW_FORM_udata);
+    uleb(b, 0); uleb(b, 0);
 }
 
 # emit one subprogram abbreviation (now with children: its parameters and locals).
@@ -779,7 +824,9 @@ fun build_var_loclist_abbrev(b: *enc.ByteBuf, code: u8, tag: u8) {
 # stmt_off:     out - byte offset of the CU 4-byte stmt_list field
 fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp_dir: str,
                high_pc: u64, fb_reg: i32, funcs: *DwFunc, nfuncs: u32, bts: *BaseType, nbt: u32,
-               vars: *DwVar, relocs: *InfoReloc, reloc_count: *u32, low_off: *u32, stmt_off: *u32) {
+               vars: *DwVar, relocs: *InfoReloc, reloc_count: *u32, low_off: *u32, stmt_off: *u32,
+               s: *session.Session, irmod: *ir.Module, strtab: *StrTab,
+               inlines: *DwInline, ninl: u32, iranges: *DwInlineRange) {
     val len_pos: usize = b.len;
     enc.emit_u32(b, 0);                 # unit_length (backpatched)
     val body_start: usize = b.len;
@@ -811,6 +858,28 @@ fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp
         t = t + 1;
     }
 
+    # abstract-instance subprograms for the inlined callees, before the concrete
+    # subprograms so each inlined_subroutine references its origin backward. One per
+    # instance (no dedup yet); DW_AT_name is the callee's source spelling.
+    var ai: u32 = 0;
+    for (ai < ninl) {
+        # only the instances the subprogram loop emits (single-extent, top-level) get an
+        # abstract instance this tier; the rest are held for the rnglists / nesting commits.
+        if (inlines[ai].range_count != 1 || inlines[ai].parent != 0) { ai = ai + 1; cnt; }
+        var cnm: str = resolve(?s.interner, inlines[ai].callee);
+        val oi: O.Option[u32] = ir.function_lookup(irmod, inlines[ai].callee);
+        if (O.is_some[u32](oi)) {
+            val cf: *ir.Function = ?irmod.functions[O.unwrap[u32](oi)];
+            if (cf.disp != intern.STR_NIL) { cnm = resolve(?s.interner, cf.disp); }
+        }
+        inlines[ai].origin_off = (b.len - len_pos)::u32;
+        enc.emit_byte(b, ABBREV_SUBPROGRAM_ABSTRACT);
+        push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, str_off(strtab, cnm)::i64);
+        enc.emit_u32(b, 0);                # DW_AT_name (strp)
+        enc.emit_byte(b, DW_INL_inlined);  # DW_AT_inline (no children this tier)
+        ai = ai + 1;
+    }
+
     # one subprogram DIE per function.
     var f: u32 = 0;
     for (f < nfuncs) {
@@ -828,12 +897,33 @@ fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp
         emit_frame_base(b, fb_reg);
         if (fn.ret_bt >= 0) { enc.emit_u32(b, bts[fn.ret_bt::u32].off); }   # DW_AT_type (ref4)
 
-        # the subprogram's variable / parameter children, then a null DIE.
+        # the subprogram's variable / parameter children.
         var vi: u32 = 0;
         for (vi < fn.var_count) {
             emit_variable(b, ?vars[fn.var_start + vi], bts, relocs, reloc_count);
             vi = vi + 1;
         }
+
+        # its inlined_subroutine children. This tier emits the single-extent, top-level
+        # instances only -- exact low_pc/high_pc, non-overlapping. Multi-extent instances
+        # (exact DW_AT_ranges into `.debug_rnglists`) and nested instances (parent != 0,
+        # emitted under their parent's DIE) ship in the following commits; emitting them
+        # flat with a span approximation would overlap sibling ranges, so they are held.
+        var xi: u32 = 0;
+        for (xi < ninl) {
+            if (inlines[xi].func_idx != f || inlines[xi].range_count != 1 || inlines[xi].parent != 0) { xi = xi + 1; cnt; }
+            val di: *DwInline = ?inlines[xi];
+            val rg: *DwInlineRange = ?iranges[di.range_start];
+            enc.emit_byte(b, ABBREV_INLINED);
+            enc.emit_u32(b, di.origin_off);   # DW_AT_abstract_origin (ref4, backward)
+            push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS64, IRLT_SYM, fn.name, (rg.start - fn.offset)::i64);
+            emit_addr(b, address_size);        # DW_AT_low_pc (enclosing fn + range start)
+            enc.emit_u64(b, (rg.end - rg.start)::u64);   # DW_AT_high_pc
+            uleb(b, di.call_file::u64);
+            uleb(b, di.call_line::u64);
+            xi = xi + 1;
+        }
+
         enc.emit_byte(b, 0);   # null DIE terminates this subprogram's children
         f = f + 1;
     }
@@ -1521,7 +1611,9 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
 
     # the `.debug_info` reloc list: 2 CU + 2 per subprogram (name strp, low_pc addr) +
     # 1 per base type (name strp) + up to 2 per variable (name strp, loclist sec_offset).
-    val reloc_cap: u32 = 2 + 2 * nsub + nbt + 2 * var_count;
+    # + 2 per inlined instance (abstract-instance name strp, inlined_subroutine low_pc
+    # sym); bounded by the transition count, an upper bound on the instance count.
+    val reloc_cap: u32 = 2 + 2 * nsub + nbt + 2 * var_count + 2 * inline_pc_count;
     val rr2: R.Result[*InfoReloc, str] = A.allocate[InfoReloc](s.alloc, reloc_cap::usize);
     if (R.is_err[*InfoReloc, str](rr2)) {
         A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); enc.buf_dnit(?strtab.buf);
@@ -1593,7 +1685,8 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     var low_off:  u32 = 0;
     var stmt_off: u32 = 0;
     build_info(?b_info, address_size, producer, name, comp_dir, high_pc, frame_base_reg(tgt),
-               subs, nsub, bts, nbt, vars, info_relocs, ?info_reloc_count, ?low_off, ?stmt_off);
+               subs, nsub, bts, nbt, vars, info_relocs, ?info_reloc_count, ?low_off, ?stmt_off,
+               s, irmod, ?strtab, inlines, ninl, iranges);
 
     val pr: R.Result[bool, str] = install(s, image, itn, funcs, nfuncs, cu_low_name,
                                           ?b_abbrev, ?b_line, ?b_info, ?strtab.buf, ?b_loclists, has_loclists,
@@ -2161,15 +2254,16 @@ test "mach.lang.be.codegen.dwarf.uleb_sleb:canonical" {
     ret code;
 }
 
-# build_abbrev emits the exact ten-abbrev table (compile-unit, base type, the two
-# subprogram shapes, the located / no-location variable + parameter shapes, and the two
-# loclist variable + parameter shapes), byte for byte
+# build_abbrev emits the exact thirteen-abbrev table (compile-unit, base type, the two
+# subprogram shapes, the located / no-location variable + parameter shapes, the two
+# loclist variable + parameter shapes, the abstract-instance subprogram, and the two
+# inlined_subroutine shapes), byte for byte
 test "mach.lang.be.codegen.dwarf.build_abbrev:golden" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var b: enc.ByteBuf = enc.buf_init(?alloc);
     build_abbrev(?b);
-    var e: [133]u8;
+    var e: [170]u8;
     e[0]=0x01; e[1]=0x11; e[2]=0x01; e[3]=0x25; e[4]=0x08; e[5]=0x03; e[6]=0x08; e[7]=0x1B;
     e[8]=0x08; e[9]=0x13; e[10]=0x05; e[11]=0x11; e[12]=0x01; e[13]=0x12; e[14]=0x07; e[15]=0x10;
     e[16]=0x17; e[17]=0x00; e[18]=0x00; e[19]=0x02; e[20]=0x24; e[21]=0x00; e[22]=0x03; e[23]=0x0E;
@@ -2190,8 +2284,19 @@ test "mach.lang.be.codegen.dwarf.build_abbrev:golden" {
     # ABBREV_PARAM_LOCLIST (0x0A): DW_TAG_formal_parameter, name strp, type ref4, location sec_offset.
     e[121]=0x0A; e[122]=0x05; e[123]=0x00; e[124]=0x03; e[125]=0x0E; e[126]=0x49; e[127]=0x13;
     e[128]=0x02; e[129]=0x17; e[130]=0x00; e[131]=0x00;
-    e[132]=0x00;   # null abbrev code terminates the table
-    val ok: bool = buf_eq(?b, ?e[0], 133);
+    # ABBREV_SUBPROGRAM_ABSTRACT (0x0B): DW_TAG_subprogram, no children, name strp, DW_AT_inline data1.
+    e[132]=0x0B; e[133]=0x2E; e[134]=0x00; e[135]=0x03; e[136]=0x0E; e[137]=0x20; e[138]=0x0B;
+    e[139]=0x00; e[140]=0x00;
+    # ABBREV_INLINED (0x0C): DW_TAG_inlined_subroutine, no children, abstract_origin ref4,
+    # low_pc addr, high_pc data8, call_file udata, call_line udata.
+    e[141]=0x0C; e[142]=0x1D; e[143]=0x00; e[144]=0x31; e[145]=0x13; e[146]=0x11; e[147]=0x01;
+    e[148]=0x12; e[149]=0x07; e[150]=0x58; e[151]=0x0F; e[152]=0x59; e[153]=0x0F; e[154]=0x00; e[155]=0x00;
+    # ABBREV_INLINED_RANGES (0x0D): DW_TAG_inlined_subroutine, no children, abstract_origin ref4,
+    # ranges sec_offset, call_file udata, call_line udata.
+    e[156]=0x0D; e[157]=0x1D; e[158]=0x00; e[159]=0x31; e[160]=0x13; e[161]=0x55; e[162]=0x17;
+    e[163]=0x58; e[164]=0x0F; e[165]=0x59; e[166]=0x0F; e[167]=0x00; e[168]=0x00;
+    e[169]=0x00;   # null abbrev code terminates the table
+    val ok: bool = buf_eq(?b, ?e[0], 170);
     enc.buf_dnit(?b);
     if (!ok) { ret 1; }
     ret 0;
