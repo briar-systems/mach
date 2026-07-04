@@ -255,8 +255,10 @@ verify_dwarf() {
 # verify_inline_release <fixture_dir> <build_target> — the inline pass fires only at
 # release, so this leg builds one -g release binary and asserts the DWARF inlined_
 # subroutine tier: llvm-dwarfdump --verify is clean and the expected inlined callees
-# appear as DW_TAG_inlined_subroutine DIEs. Byte-for-byte -g additivity is NOT checked at
-# release (a separate, pre-existing codegen-determinism issue tracked outside this lane).
+# appear as DW_TAG_inlined_subroutine DIEs. Byte-for-byte -g additivity is NOT asserted
+# here yet: release -g still perturbs .text on clean dev (a pre-existing -g-sensitive
+# inlining decision, tracked in #1946). turn the elf_seg_identical assertion on at release
+# once #1946 lands.
 verify_inline_release() {
     dir=$1; bt=$2
     label="${dir#"$here"/} [$bt release]"
