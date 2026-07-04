@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.14.1] - 2026-07-04
+
+Hotfix for two defects in 2.14.0.
+
+### Fixed
+
+- codegen: **critical** - a module-global aggregate passed by value lowered to
+  its bare pointer-typed storage address, so the call ABI classified it as a
+  scalar and passed the address instead of copying the record's bytes - garbage
+  values in the callee, debug and release. Global aggregate rvalues now retype
+  to the aggregate IR type, identical to locals (#1925).
+- link/elf: `PT_GNU_RELRO` declares the actual `.data.rel.ro` extent instead of
+  the image max-page-rounded size, so the header matches what the runtime maps
+  and re-protects (#1885 follow-through; the startup-crash half shipped via
+  mach-std).
+
 ## [2.14.0] - 2026-07-03
 
 The incremental compilation back half and a hardening sweep. The full pipeline
