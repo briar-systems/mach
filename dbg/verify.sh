@@ -289,6 +289,33 @@ verify_inline_release() {
     return 0
 }
 
+# verify_no_foreign_file <fixture_dir> <build_target> — regression for #1902 (loc
+# provenance leak). A std dependency object's .debug_line must never list the entry
+# module (main.mach) as a source file: a synthesized instruction left with a zeroed
+# {0,0} location used to read as file 0 (the first-registered = entry module) and emit
+# a stray row misattributing a std address to main.mach:1. With FILE_NIL == 0 a zeroed
+# loc is loc_nil and drops. Scans every std object under the fixture's obj tree.
+verify_no_foreign_file() {
+    dir=$1; bt=$2
+    label="${dir#"$here"/} [$bt no-foreign-file]"
+    tmp=$(mktemp -d)
+    if ! (cd "$dir" && "$compiler" dep pull && "$compiler" build . --target "$bt" --profile debug -g -o "$tmp/g") >"$tmp/b.log" 2>&1; then
+        echo "FAIL $label (build)"; sed 's/^/    /' "$tmp/b.log" >&2; rm -rf "$tmp"; return 1
+    fi
+    objdir="$dir/out/$bt/debug/obj"
+    bad=0
+    for o in $(find "$objdir" -path '*std*' -name '*.o' 2>/dev/null); do
+        if "$dwarfdump" --debug-line "$o" 2>/dev/null | grep -q 'main\.mach'; then
+            echo "FAIL $label (${o#"$objdir"/} attributes a .debug_line row to the entry module main.mach)" >&2
+            bad=$((bad + 1))
+        fi
+    done
+    rm -rf "$tmp"
+    if [ "$bad" -ne 0 ]; then return 1; fi
+    echo "PASS $label"
+    return 0
+}
+
 for dir in "$fixtures"/$filter; do
     [ -f "$dir/mach.toml" ] || continue
     # the inline fixtures are release-only (their callees inline away at -O0); they have
@@ -314,6 +341,16 @@ if [ -f "$fixtures/inline4/mach.toml" ]; then
     for bt in $elf_targets; do
         ran=$((ran + 1))
         verify_inline_release "$fixtures/inline4" "$bt" 4 "a b c d" || fails=$((fails + 1))
+    done
+fi
+
+# #1902 regression: no std dependency object may attribute a .debug_line row to the
+# entry module. The multi fixture is a [bin] main.mach pulling std, so its std objects
+# are the exact surface the loc-provenance leak corrupted.
+if [ -f "$fixtures/multi/mach.toml" ]; then
+    for bt in $elf_targets; do
+        ran=$((ran + 1))
+        verify_no_foreign_file "$fixtures/multi" "$bt" || fails=$((fails + 1))
     done
 fi
 
