@@ -849,6 +849,19 @@ fun build_var_loclist_abbrev(b: *enc.ByteBuf, code: u8, tag: u8) {
 # relocs/reloc_count: the InfoReloc list (abstract_origin/low_pc/ranges patch sites)
 # fn:           the enclosing DwFunc (symbol name + `.text` offset)
 # address_size: target pointer width
+# whether function `f` has a materialized inline instance with the given 1-based site id
+# (an instance with no surviving `.text` is dropped by gather_inlines, so a variable
+# tagged with it has no inlined_subroutine to nest under and must fall back to the
+# subprogram scope rather than vanish).
+fun inline_present(inlines: *DwInline, ninl: u32, f: u32, site: u32) bool {
+    var i: u32 = 0;
+    for (i < ninl) {
+        if (inlines[i].func_idx == f && inlines[i].site_id == site) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 fun emit_inlines(b: *enc.ByteBuf, f: u32, parent_site: u32, inlines: *DwInline, ninl: u32,
                  iranges: *DwInlineRange, relocs: *InfoReloc, reloc_count: *u32, fn: *DwFunc, address_size: u8,
                  vars: *DwVar, bts: *BaseType) {
@@ -954,6 +967,17 @@ fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp
     # instance (no dedup yet); DW_AT_name is the callee's source spelling.
     var ai: u32 = 0;
     for (ai < ninl) {
+        # dedup by callee: one abstract instance per distinct callee, shared by every
+        # inlined_subroutine of it (a reused abstract_origin, per DWARF's single abstract
+        # instance model).
+        var dup: bool = false;
+        var pj: u32 = 0;
+        for (pj < ai) {
+            if (inlines[pj].callee == inlines[ai].callee) { inlines[ai].origin_off = inlines[pj].origin_off; dup = true; brk; }
+            pj = pj + 1;
+        }
+        if (dup) { ai = ai + 1; cnt; }
+
         var cnm: str = resolve(?s.interner, inlines[ai].callee);
         val oi: O.Option[u32] = ir.function_lookup(irmod, inlines[ai].callee);
         if (O.is_some[u32](oi)) {
@@ -985,11 +1009,13 @@ fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp
         emit_frame_base(b, fb_reg);
         if (fn.ret_bt >= 0) { enc.emit_u32(b, bts[fn.ret_bt::u32].off); }   # DW_AT_type (ref4)
 
-        # the subprogram's own variable / parameter children (inline instance 0); an
-        # inlined local (instance != 0) is emitted under its inlined_subroutine instead.
+        # the subprogram's own variable / parameter children: instance-0 vars, plus any
+        # var whose inline instance was dropped (no materialized inlined_subroutine to
+        # nest under) so it keeps a scope rather than vanishing.
         var vi: u32 = 0;
         for (vi < fn.var_count) {
-            if (vars[fn.var_start + vi].inline_site == 0) { emit_variable(b, ?vars[fn.var_start + vi], bts, relocs, reloc_count); }
+            val dvr: *DwVar = ?vars[fn.var_start + vi];
+            if (dvr.inline_site == 0 || !inline_present(inlines, ninl, f, dvr.inline_site)) { emit_variable(b, dvr, bts, relocs, reloc_count); }
             vi = vi + 1;
         }
 
@@ -1256,7 +1282,9 @@ fun build_rnglists(b: *enc.ByteBuf, funcs: *DwFunc, nfuncs: u32, inlines: *DwInl
     var i: u32 = 0;
     for (i < ninl) {
         val di: *DwInline = ?inlines[i];
-        if (di.parent != 0 || di.range_count <= 1) { i = i + 1; cnt; }
+        # every multi-extent instance needs a list, nested or not; emit_inlines picks the
+        # DW_AT_ranges shape purely on range_count, so a skipped nested one would dangle.
+        if (di.range_count <= 1) { i = i + 1; cnt; }
         val fn: *DwFunc = ?funcs[di.func_idx];
         di.rnglist_off = b.len::u32;
         enc.emit_byte(b, DW_RLE_base_address);
@@ -1767,10 +1795,16 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     var b_rnglists: enc.ByteBuf = enc.buf_init(s.alloc);
 
     # inlined-subroutine instances: gathered before build_line so their call-site files
-    # are registered in the file table the line header emits. capacity is bounded by the
-    # transition count (each starts at most one instance-range).
-    var inl_cap: u32 = inline_pc_count;
+    # are registered in the file table the line header emits. Instances are bounded by the
+    # total inline-site count; ranges by inline_pc_count * max nesting depth (a descendant
+    # extent rolls into every ancestor). gather_inlines errors loudly if either is exceeded.
+    var tot_sites: u32 = 0;
+    var max_depth: u32 = 1;
+    inline_caps(irmod, subs, nsub, ?tot_sites, ?max_depth);
+    var inl_cap: u32 = tot_sites;
     if (inl_cap == 0) { inl_cap = 1; }
+    var ir_cap: u32 = inline_pc_count * max_depth;
+    if (ir_cap == 0) { ir_cap = 1; }
     val rinl: R.Result[*DwInline, str] = A.allocate[DwInline](s.alloc, inl_cap::usize);
     if (R.is_err[*DwInline, str](rinl)) {
         enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
@@ -1781,7 +1815,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
         ret R.err[bool, str](R.unwrap_err[*DwInline, str](rinl));
     }
     val inlines: *DwInline = R.unwrap_ok[*DwInline, str](rinl);
-    val rirng: R.Result[*DwInlineRange, str] = A.allocate[DwInlineRange](s.alloc, inl_cap::usize);
+    val rirng: R.Result[*DwInlineRange, str] = A.allocate[DwInlineRange](s.alloc, ir_cap::usize);
     if (R.is_err[*DwInlineRange, str](rirng)) {
         A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
         enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
@@ -1794,17 +1828,26 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     val iranges: *DwInlineRange = R.unwrap_ok[*DwInlineRange, str](rirng);
     var ninl: u32 = 0;
     var nir:  u32 = 0;
-    gather_inlines(s, irmod, subs, nsub, inline_pcs, inline_pc_count, text_sec, ?ft, inlines, ?ninl, inl_cap, iranges, ?nir, inl_cap);
+    val rgi: R.Result[bool, str] = gather_inlines(s, irmod, subs, nsub, inline_pcs, inline_pc_count, text_sec, ?ft, inlines, ?ninl, inl_cap, iranges, ?nir, ir_cap);
+    if (R.is_err[bool, str](rgi)) {
+        A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize); A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
+        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
+        A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+        A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
+        A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+        ret rgi;
+    }
 
-    # a `.debug_rnglists` section only when some top-level instance is multi-extent.
+    # a `.debug_rnglists` section only when some instance (nested or not) is multi-extent.
     var has_rnglists: bool = false;
     var hr: u32 = 0;
-    for (hr < ninl) { if (inlines[hr].parent == 0 && inlines[hr].range_count > 1) { has_rnglists = true; } hr = hr + 1; }
+    for (hr < ninl) { if (inlines[hr].range_count > 1) { has_rnglists = true; } hr = hr + 1; }
     # one DW_RLE_base_address reloc per multi-extent instance (bounded by the count).
     val rng_reloc_cap: u32 = inl_cap + 1;
     val rrr: R.Result[*RngReloc, str] = A.allocate[RngReloc](s.alloc, rng_reloc_cap::usize);
     if (R.is_err[*RngReloc, str](rrr)) {
-        A.deallocate[DwInlineRange](s.alloc, iranges, inl_cap::usize); A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
+        A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize); A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
         enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
         A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
         A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
@@ -1842,7 +1885,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     enc.buf_dnit(?b_loclists);
     enc.buf_dnit(?b_rnglists);
     enc.buf_dnit(?strtab.buf);
-    A.deallocate[DwInlineRange](s.alloc, iranges, inl_cap::usize);
+    A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize);
     A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
     A.deallocate[RngReloc](s.alloc, rng_relocs, rng_reloc_cap::usize);
     A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize);
@@ -1958,10 +2001,34 @@ fun inline_ancestor_or_self(irfn: *ir.Function, k: u32, s: u32) bool {
     ret false;
 }
 
+# upper bounds for the inline arrays: the total inline-site count across the subprograms
+# (an exact bound on instances) and the deepest parent chain (ranges roll a descendant's
+# extent into every ancestor, so they are bounded by inline_pc_count * max_depth).
+fun inline_caps(irmod: *ir.Module, funcs: *DwFunc, nfuncs: u32, total: *u32, max_depth: *u32) {
+    @total = 0;
+    @max_depth = 1;
+    var i: u32 = 0;
+    for (i < nfuncs) {
+        val oi: O.Option[u32] = ir.function_lookup(irmod, funcs[i].name);
+        if (O.is_none[u32](oi)) { i = i + 1; cnt; }
+        val irfn: *ir.Function = ?irmod.functions[O.unwrap[u32](oi)];
+        @total = @total + irfn.inline_site_len;
+        var k: u32 = 1;
+        for (k <= irfn.inline_site_len) {
+            var d: u32 = 0;
+            var cur: u32 = k;
+            for (cur != 0) { d = d + 1; val ps: *ir.InlineSite = ?irfn.inline_sites[cur - 1]; cur = ps.parent; }
+            if (d > @max_depth) { @max_depth = d; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+}
+
 fun gather_inlines(s: *session.Session, irmod: *ir.Module, funcs: *DwFunc, nfuncs: u32,
                    inline_pcs: *enc.InlinePc, inline_pc_count: u32, text_sec: u32, ft: *FileTable,
                    out: *DwInline, ninl: *u32, inl_cap: u32,
-                   iranges: *DwInlineRange, nir: *u32, ir_cap: u32) {
+                   iranges: *DwInlineRange, nir: *u32, ir_cap: u32) R.Result[bool, str] {
     var i: u32 = 0;
     for (i < nfuncs) {
         val opt_idx: O.Option[u32] = ir.function_lookup(irmod, funcs[i].name);
@@ -1973,7 +2040,7 @@ fun gather_inlines(s: *session.Session, irmod: *ir.Module, funcs: *DwFunc, nfunc
 
         var k: u32 = 1;
         for (k <= irfn.inline_site_len) {
-            if (@ninl >= inl_cap) { brk; }
+            if (@ninl >= inl_cap) { ret R.err[bool, str]("dwarf.gather_inlines: inline-instance capacity exceeded"); }
             val site: *ir.InlineSite = ?irfn.inline_sites[k - 1];
             val di: *DwInline = ?out[@ninl];
             di.func_idx    = i;
@@ -1984,22 +2051,33 @@ fun gather_inlines(s: *session.Session, irmod: *ir.Module, funcs: *DwFunc, nfunc
             di.range_start = @nir;
             di.range_count = 0;
             di.rnglist_off = 0;
-            di.call_file   = 0;
-            di.call_line   = 0;
             if (source.loc_is_valid(site.call_loc)) {
                 file_index(ft, site.call_loc.file);
                 val pl: PosLine = pos_of(s, site.call_loc, ft);
                 di.call_file = pl.file;
                 di.call_line = pl.line::u32;
             }
+            or {
+                # no call-site location: attribute to the enclosing function's file rather
+                # than file index 0, which is out of range when the file table is empty.
+                di.call_file = funcs[i].decl_file;
+                di.call_line = funcs[i].decl_line;
+            }
 
             var j: u32 = 0;
             for (j < inline_pc_count) {
                 val o: u32 = inline_pcs[j].text_offset;
                 if (inline_pcs[j].sec == text_sec && o >= lo && o < hi && inline_ancestor_or_self(irfn, k, inline_pcs[j].inline_site)) {
+                    # the segment ends at the next same-section transition (skipping any
+                    # other-section records), clamped to the function end. Two records at
+                    # the same offset (a zero-byte site change) make seg_end == o, a
+                    # zero-length segment that is dropped rather than over-extended to hi.
                     var seg_end: u32 = hi;
-                    if (j + 1 < inline_pc_count && inline_pcs[j + 1].sec == text_sec && inline_pcs[j + 1].text_offset < hi && inline_pcs[j + 1].text_offset > o) { seg_end = inline_pcs[j + 1].text_offset; }
-                    if (@nir < ir_cap) {
+                    var jn: u32 = j + 1;
+                    for (jn < inline_pc_count && inline_pcs[jn].sec != text_sec) { jn = jn + 1; }
+                    if (jn < inline_pc_count && inline_pcs[jn].text_offset < hi) { seg_end = inline_pcs[jn].text_offset; }
+                    if (o < seg_end) {
+                        if (@nir >= ir_cap) { ret R.err[bool, str]("dwarf.gather_inlines: inline-range capacity exceeded"); }
                         iranges[@nir].start = o;
                         iranges[@nir].end   = seg_end;
                         @nir = @nir + 1;
@@ -2014,6 +2092,7 @@ fun gather_inlines(s: *session.Session, irmod: *ir.Module, funcs: *DwFunc, nfunc
         }
         i = i + 1;
     }
+    ret R.ok[bool, str](true);
 }
 
 # gather one function's DWARF variables from the encoder's variable-location records.
@@ -2048,10 +2127,14 @@ fun gather_vars(s: *session.Session, tgt: *target.Target, irfn: *ir.Function, lo
         val obt: O.Option[u32] = varloc_ident(s, irfn, vl, address_size, bts, nbt, strtab);
         if (O.is_none[u32](obt)) { i = i + 1; cnt; }
         val name_off: u32 = O.unwrap[u32](obt);
+        # the inline instance this variable lives in (0 = the caller's own body); a caller
+        # local and an identically-named inlined local are DISTINCT scopes, so the dedup
+        # key is (name_off, inline_site), not name alone.
+        val vsite: u32 = ir.instr_inline_site_of(irfn, vl.iid::id.InstructionId);
 
         var found: bool = false;
         var j: u32 = fn_var_start;
-        for (j < @var_count) { if (vars[j].name_off == name_off) { found = true; } j = j + 1; }
+        for (j < @var_count) { if (vars[j].name_off == name_off && vars[j].inline_site == vsite) { found = true; } j = j + 1; }
         if (!found && @var_count < var_cap) {
             val dv: *ir.DbgVar = O.unwrap[*ir.DbgVar](ir.dbg_var_get(irfn, vl.iid::id.InstructionId));
             val bt: i32 = bt_intern(bts, nbt, strtab, O.unwrap[BaseType](sem_base_type(s, dv.ty_sem, address_size)));
@@ -2065,9 +2148,7 @@ fun gather_vars(s: *session.Session, tgt: *target.Target, irfn: *ir.Function, lo
             vars[@var_count].range_start = 0;
             vars[@var_count].range_count = 0;
             vars[@var_count].loclist_off = 0;
-            # the inline instance this variable lives in (0 = the caller's own body); the
-            # #1707 producer nests a non-zero one under its inlined_subroutine.
-            vars[@var_count].inline_site = ir.instr_inline_site_of(irfn, vl.iid::id.InstructionId);
+            vars[@var_count].inline_site = vsite;
             @var_count = @var_count + 1;
         }
         i = i + 1;
