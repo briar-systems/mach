@@ -219,7 +219,10 @@ verify_dwarf() {
 
     # 5. additive-only: -g must not perturb the loaded program. every PT_LOAD segment
     #    is byte-identical between the -g and no-g builds (modulo the ELF header's
-    #    section-table bookkeeping). a codegen change under -g fails here.
+    #    section-table bookkeeping). a codegen change under -g fails here. NOTE: this
+    #    runs at the debug profile only; the release counterpart is deferred to #1944
+    #    (release -g still perturbs .text on clean dev), so verify_inline_release does
+    #    not yet assert it.
     if ! elf_seg_identical "$g" "$nog"; then
         echo "FAIL $label (-g perturbed a loadable segment vs the no-g build)"; rm -rf "$tmp"; return 1
     fi
@@ -252,15 +255,17 @@ verify_dwarf() {
     return 0
 }
 
-# verify_inline_release <fixture_dir> <build_target> — the inline pass fires only at
-# release, so this leg builds one -g release binary and asserts the DWARF inlined_
-# subroutine tier: llvm-dwarfdump --verify is clean and the expected inlined callees
-# appear as DW_TAG_inlined_subroutine DIEs. Byte-for-byte -g additivity is NOT asserted
-# here yet: release -g still perturbs .text on clean dev (a pre-existing -g-sensitive
-# inlining decision, tracked in #1944). turn the elf_seg_identical assertion on at release
-# once #1944 lands.
+# verify_inline_release <fixture_dir> <build_target> <min_dies> <callees> — the inline
+# pass fires only at release, so this leg builds one -g release binary and asserts the
+# DWARF inlined_subroutine tier: llvm-dwarfdump --verify is clean, at least <min_dies>
+# DW_TAG_inlined_subroutine DIEs are present, and each name in <callees> (space-
+# separated) appears as an inlined instance (its DW_AT_abstract_origin resolves to it) —
+# the pin that every level of a nested inline chain survived. Byte-for-byte -g additivity
+# is NOT asserted here yet: release -g still perturbs .text on clean dev (a pre-existing
+# -g-sensitive inlining decision, tracked in #1944 — see step 5's note). turn the
+# elf_seg_identical assertion on at release once #1944 lands.
 verify_inline_release() {
-    dir=$1; bt=$2
+    dir=$1; bt=$2; min=$3; callees=$4
     label="${dir#"$here"/} [$bt release]"
     tmp=$(mktemp -d)
     g="$tmp/g"
@@ -271,10 +276,10 @@ verify_inline_release() {
         echo "FAIL $label (llvm-dwarfdump --verify)"; tail -30 "$tmp/v.log" | sed 's/^/    /' >&2; rm -rf "$tmp"; return 1
     fi
     n=$("$dwarfdump" --debug-info "$g" 2>/dev/null | grep -c DW_TAG_inlined_subroutine)
-    if [ "$n" -lt 2 ]; then
-        echo "FAIL $label (expected >=2 inlined_subroutine DIEs, found $n)"; rm -rf "$tmp"; return 1
+    if [ "$n" -lt "$min" ]; then
+        echo "FAIL $label (expected >=$min inlined_subroutine DIEs, found $n)"; rm -rf "$tmp"; return 1
     fi
-    for callee in leaf mid; do
+    for callee in $callees; do
         if ! "$dwarfdump" --debug-info "$g" 2>/dev/null | grep -q "DW_AT_abstract_origin.*\"$callee\""; then
             echo "FAIL $label (no inlined_subroutine referencing $callee)"; rm -rf "$tmp"; return 1
         fi
@@ -286,21 +291,29 @@ verify_inline_release() {
 
 for dir in "$fixtures"/$filter; do
     [ -f "$dir/mach.toml" ] || continue
-    # the inline fixture is release-only (its callees inline away at -O0); it has its own
-    # release leg below and does not fit the debug fixture's structural checks.
-    [ "$(basename "$dir")" = "inline" ] && continue
+    # the inline fixtures are release-only (their callees inline away at -O0); they have
+    # their own release legs below and do not fit the debug fixture's structural checks.
+    case "$(basename "$dir")" in inline|inline4) continue;; esac
     for bt in $elf_targets; do
         ran=$((ran + 1))
         verify_dwarf "$dir" "$bt" || fails=$((fails + 1))
     done
 done
 
-# release leg: exercise the release-only inline pass so the inlined_subroutine tier
-# (#1707) is actually verified in CI (debug builds never inline).
+# release legs: exercise the release-only inline pass so the inlined_subroutine tier
+# (#1707) is actually verified in CI (debug builds never inline). inline is a 2-level
+# chain (leaf under mid); inline4 is a 4-level chain (a>b>c>d) that pins nested-instance
+# rollup recovery — every level must survive as its own inlined instance.
 if [ -f "$fixtures/inline/mach.toml" ]; then
     for bt in $elf_targets; do
         ran=$((ran + 1))
-        verify_inline_release "$fixtures/inline" "$bt" || fails=$((fails + 1))
+        verify_inline_release "$fixtures/inline" "$bt" 2 "leaf mid" || fails=$((fails + 1))
+    done
+fi
+if [ -f "$fixtures/inline4/mach.toml" ]; then
+    for bt in $elf_targets; do
+        ran=$((ran + 1))
+        verify_inline_release "$fixtures/inline4" "$bt" 4 "a b c d" || fails=$((fails + 1))
     done
 fi
 
