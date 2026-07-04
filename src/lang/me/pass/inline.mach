@@ -1,4 +1,4 @@
-# mach.lang.me.pass.inline: function inliner.
+# mach.lang.me.pass.inline: function inliner
 #
 # Replaces a direct call whose callee passes the inlining heuristic with a clone
 # of the callee body, rewriting parameters to the call's actual arguments and
@@ -32,19 +32,22 @@ use mach.lang.me.ir;
 use mach.lang.me.ir.builder;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.mutate;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
+use mach.lang.source;
 use mach.lang.target;
+use semtype: mach.lang.type;
 
 # instruction-count ceiling below which a callee is small enough to inline
 # unconditionally. fixed for the rewrite; future cost models read it off the
-# target.
+# target
 val INLINE_INSTR_THRESHOLD: u32 = 25;
 
 # global ceiling on inlines per pass invocation. with the call-graph recursion
 # guard below, inlining only contracts the graph along a DAG and terminates on
 # its own; the budget is kept solely as an ICE-grade backstop against an
-# unforeseen runaway, not as the termination mechanism.
+# unforeseen runaway, not as the termination mechanism
 val INLINE_BUDGET: u32 = 1024;
 
 # inline eligible call sites across the module until none remain or the budget is
@@ -212,18 +215,27 @@ fun callee_has_asm(callee: *ir.Function) bool {
     ret false;
 }
 
-# count the instructions that live in the callee's blocks
+# count the instructions that live in the callee's blocks, EXCLUDING OP_DBG_VALUE
 #
-# Pool entries orphaned by earlier passes are not counted.
+# OP_DBG_VALUE births are emitted only under -g, so counting them would let the size
+# threshold in should_inline decide differently with and without -g and emit different
+# machine code -- a -g additivity violation. The count must be -g-invariant, so debug
+# values are skipped. Pool entries orphaned by earlier passes are not counted.
 # ---
 # callee: the callee function
-# ret:    total live phi, body, and terminator instructions
+# ret:    total live phi, non-debug body, and terminator instructions
 fun callee_instr_count(callee: *ir.Function) u32 {
     var total: u32 = 0;
     var i: u32 = 0;
     for (i < callee.block_count) {
         val blk: *ir.Block = ?callee.blocks[i];
-        total = total + blk.phi_count + blk.instr_count;
+        total = total + blk.phi_count;
+        var k: u32 = 0;
+        for (k < blk.instr_count) {
+            val oi: O.Option[*instruction.Instruction] = ir.instruction_get(callee, blk.instructions[k]);
+            if (O.is_some[*instruction.Instruction](oi) && O.unwrap[*instruction.Instruction](oi).kind != instruction.OP_DBG_VALUE) { total = total + 1; }
+            k = k + 1;
+        }
         if (blk.terminator != id.INSTR_NIL) { total = total + 1; }
         i = i + 1;
     }
@@ -450,6 +462,12 @@ fun do_inline(
     val call: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_call);
     val ret_type: type.IrTypeId = call.ty;
 
+    # snapshot the -g inline-site anchors before run_inline unlinks the call: the call
+    # site's own source location (DW_AT_call_file/line for this expansion) and the
+    # inline instance the call itself sat in (for nesting, 0 at the top level).
+    val call_loc: source.SrcLoc = call.loc;
+    val parent_site: u32 = ir.instr_inline_site_of(caller, call_id);
+
     # snapshot the actual arguments (operands [1..]) before any mutation.
     val arg_count: u32 = call.operand_count - 1;
     var args: *value.Value = nil;
@@ -480,6 +498,15 @@ fun do_inline(
 
     val res_run: R.Result[bool, str] = run_inline(?cx, call_bi, call_ii, call_id);
 
+    # stamp -g inline-site metadata onto the clones while cx.instr_map is still live: an
+    # InlineSite for this expansion (plus remapped nested instances) and each cloned
+    # instruction's owning instance. pure identity metadata; consumed only by the DWARF
+    # inlined_subroutine producer (#1707), so a build never changes because of it.
+    var res_meta: R.Result[bool, str] = R.ok[bool, str](true);
+    if (!R.is_err[bool, str](res_run)) {
+        res_meta = stamp_inline_metadata(m, ?cx, call_loc, parent_site);
+    }
+
     if (cx.block_map != nil) {
         A.deallocate[u32](m.alloc, cx.block_map, callee.block_count::usize);
     }
@@ -490,14 +517,74 @@ fun do_inline(
         A.deallocate[value.Value](m.alloc, args, arg_count::usize);
     }
 
+    if (R.is_err[bool, str](res_run)) { ret res_run; }
+    if (R.is_err[bool, str](res_meta)) { ret res_meta; }
+
     # maintain the live call-count table: the inlined call no longer exists (it
     # was a live call to callee_ix, so the count is at least 1), and the cloned
     # callee body's own live calls now live in the caller.
-    if (!R.is_err[bool, str](res_run)) {
-        counts[callee_ix] = counts[callee_ix] - 1;
-        add_fn_call_counts(m, callee, counts);
-    }
+    counts[callee_ix] = counts[callee_ix] - 1;
+    add_fn_call_counts(m, callee, counts);
     ret res_run;
+}
+
+# stamp the -g inline-site side tables for one completed expansion (cx.instr_map maps
+# each callee instruction index to its clone in the caller). Records an InlineSite for
+# this expansion, remaps the callee's own nested instances beneath it, and tags every
+# cloned instruction with its owning instance. -g identity metadata only; never affects
+# emitted code. The DWARF inlined_subroutine producer (#1707) also clones the callee's
+# dbg-vars/dbg-exprs, but that ships there with the nesting that attributes them.
+# ---
+# m:           the module
+# cx:          the inline context (caller / callee / instr_map populated)
+# call_loc:    the call-site source location for this expansion
+# parent_site: the enclosing inline instance (0 at top level)
+# ret:         ok(true), or an allocation error
+fun stamp_inline_metadata(m: *ir.Module, cx: *InlineCtx, call_loc: source.SrcLoc, parent_site: u32) R.Result[bool, str] {
+    val caller: *ir.Function = cx.caller;
+    val callee: *ir.Function = cx.callee;
+
+    val rtop: R.Result[u32, str] = ir.inline_site_add(m, caller, callee.name, call_loc, parent_site);
+    if (R.is_err[u32, str](rtop)) { ret R.err[bool, str](R.unwrap_err[u32, str](rtop)); }
+    val top: u32 = R.unwrap_ok[u32, str](rtop);
+
+    # remap the callee's own inline instances into the caller, parented under `top` (a
+    # callee instance k's parent is always an earlier instance, so site_map[parent] is
+    # already filled). site_map[0] = top names the callee's own body.
+    var site_map: *u32 = nil;
+    val nsite: u32 = callee.inline_site_len;
+    if (nsite > 0) {
+        val rsm: R.Result[*u32, str] = A.allocate[u32](m.alloc, (nsite + 1)::usize);
+        if (R.is_err[*u32, str](rsm)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rsm)); }
+        site_map = R.unwrap_ok[*u32, str](rsm);
+        site_map[0] = top;
+        var k: u32 = 1;
+        for (k <= nsite) {
+            val cs: *ir.InlineSite = ?callee.inline_sites[k - 1];
+            val rp: R.Result[u32, str] = ir.inline_site_add(m, caller, cs.callee, cs.call_loc, site_map[cs.parent]);
+            if (R.is_err[u32, str](rp)) { A.deallocate[u32](m.alloc, site_map, (nsite + 1)::usize); ret R.err[bool, str](R.unwrap_err[u32, str](rp)); }
+            site_map[k] = R.unwrap_ok[u32, str](rp);
+            k = k + 1;
+        }
+    }
+
+    var i: u32 = 0;
+    for (i < callee.instr_len) {
+        val cloned_iid: id.InstructionId = cx.instr_map[i]::id.InstructionId;
+        var caller_site: u32 = top;
+        if (nsite > 0) {
+            caller_site = site_map[ir.instr_inline_site_of(callee, i::id.InstructionId)];
+        }
+        val rs: R.Result[bool, str] = ir.instr_inline_site_set(caller, cloned_iid, caller_site);
+        if (R.is_err[bool, str](rs)) { if (site_map != nil) { A.deallocate[u32](m.alloc, site_map, (nsite + 1)::usize); } ret rs; }
+        # copy the callee's dbg-var / dbg-expr identity onto the cloned OP_DBG_VALUE so the
+        # inlined local keeps its name/type; the #1707 producer nests it under its instance.
+        val rc: R.Result[bool, str] = ir.clone_dbg_metadata(m, callee, caller, i::id.InstructionId, cloned_iid);
+        if (R.is_err[bool, str](rc)) { if (site_map != nil) { A.deallocate[u32](m.alloc, site_map, (nsite + 1)::usize); } ret rc; }
+        i = i + 1;
+    }
+    if (site_map != nil) { A.deallocate[u32](m.alloc, site_map, (nsite + 1)::usize); }
+    ret R.ok[bool, str](true);
 }
 
 # the inline body proper, operating on the prepared context
@@ -591,31 +678,10 @@ fun clone_instructions(cx: *InlineCtx) R.Result[bool, str] {
     var i: u32 = 0;
     for (i < callee.instr_len) {
         val src: *instruction.Instruction = ?callee.instrs[i];
-        var clone: instruction.Instruction;
-        clone.kind          = src.kind;
-        clone.ty            = src.ty;
-        clone.operand_count = src.operand_count;
-        clone.flags         = src.flags;
-        clone.aux_ty        = src.aux_ty;        # preserve GEP source pointee type
-        clone.operands      = nil;
-        if (src.operand_count > 0) {
-            val res_ops: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, src.operand_count::usize);
-            if (R.is_err[*value.Value, str](res_ops)) {
-                ret R.err[bool, str](R.unwrap_err[*value.Value, str](res_ops));
-            }
-            val ops: *value.Value = R.unwrap_ok[*value.Value, str](res_ops);
-            var ii: u32 = 0;
-            for (ii < src.operand_count) {
-                ops[ii] = src.operands[ii];
-                ii = ii + 1;
-            }
-            clone.operands = ops;
-        }
-        val res_id: R.Result[id.InstructionId, str] = ir.instruction_add(m, cx.caller, clone);
+        # operands are cloned verbatim here and remapped later by
+        # remap_clone_operands; loc and flags ride along via the primitive.
+        val res_id: R.Result[id.InstructionId, str] = mutate.clone_instruction(m, cx.caller, src);
         if (R.is_err[id.InstructionId, str](res_id)) {
-            if (clone.operands != nil) {
-                A.deallocate[value.Value](m.alloc, clone.operands, src.operand_count::usize);
-            }
             ret R.err[bool, str](R.unwrap_err[id.InstructionId, str](res_id));
         }
         cx.instr_map[i] = R.unwrap_ok[id.InstructionId, str](res_id)::u32;
@@ -852,6 +918,7 @@ fun emit_br(cx: *InlineCtx, target_blk: id.BlockId) R.Result[id.InstructionId, s
     br.operand_count = 1;
     br.flags         = 0;
     br.aux_ty        = type.IRT_NIL;
+    br.loc           = source.loc_nil();     # synthesized control-flow edge, no source origin
     val res_id: R.Result[id.InstructionId, str] = ir.instruction_add(m, cx.caller, br);
     if (R.is_err[id.InstructionId, str](res_id)) {
         A.deallocate[value.Value](m.alloc, ops, 1::usize);
@@ -894,6 +961,7 @@ fun finish_returns(cx: *InlineCtx, call_id: id.InstructionId) R.Result[bool, str
         phi.operand_count = 0;
         phi.flags         = 0;
         phi.aux_ty        = type.IRT_NIL;
+        phi.loc           = source.loc_nil();    # synthesized result join, no source origin
         val res_phi: R.Result[id.InstructionId, str] = ir.instruction_add(m, caller, phi);
         if (R.is_err[id.InstructionId, str](res_phi)) {
             ret R.err[bool, str](R.unwrap_err[id.InstructionId, str](res_phi));
@@ -933,13 +1001,13 @@ fun finish_returns(cx: *InlineCtx, call_id: id.InstructionId) R.Result[bool, str
 
     # wire the call's result to the single return value or the result phi.
     if (returns_value && value_rets == 1 && have_single) {
-        replace_value_uses(caller, call_id, single_val);
+        mutate.replace_uses(caller, call_id, single_val);
     } or (returns_value && value_rets >= 2) {
         val cont: *ir.Block = ?caller.blocks[cx.cont_blk::u32];
         val res_append_phi: R.Result[bool, str] = ir.block_append_phi(m, cont, phi_id);
         if (R.is_err[bool, str](res_append_phi)) { ret res_append_phi; }
         val replacement: value.Value = value.instr(phi_id, cx.ret_type);
-        replace_value_uses(caller, call_id, replacement);
+        mutate.replace_uses(caller, call_id, replacement);
     }
 
     # the original call is already unlinked: it sat at call_ii, and
@@ -1027,32 +1095,6 @@ fun phi_append(cx: *InlineCtx, phi_id: id.InstructionId, pred: id.BlockId, v: va
     ret ir.phi_append_incoming(cx.m, O.unwrap[*instruction.Instruction](opt_phi), pred, v);
 }
 
-# replace every VAL_INSTR operand naming `old_id` with `replacement`
-#
-# Walks all of the caller's instructions. Block-target operands are left
-# untouched (they never name a value result).
-# ---
-# caller:      function whose operands to rewrite
-# old_id:      the value-producing instruction id being replaced
-# replacement: the Value to substitute in
-fun replace_value_uses(caller: *ir.Function, old_id: id.InstructionId, replacement: value.Value) {
-    var i: u32 = 0;
-    for (i < caller.instr_len) {
-        val inst: *instruction.Instruction = ?caller.instrs[i];
-        var ii: u32 = 0;
-        for (ii < inst.operand_count) {
-            if (operand_is_block(inst.kind, ii) == false) {
-                val op: value.Value = inst.operands[ii];
-                if (op.kind == value.VAL_INSTR && op.data.instr == old_id) {
-                    inst.operands[ii] = replacement;
-                }
-            }
-            ii = ii + 1;
-        }
-        i = i + 1;
-    }
-}
-
 # the module's interned void IrTypeId
 #
 # The result type every terminator carries, matching the builder's terminator
@@ -1110,5 +1152,85 @@ test "mach.lang.me.pass.inline.mark_recursive:direct_self_call" {
     A.deallocate[bool](m.alloc, recursive, 1::usize);
     ir.dnit(?m);
     if (is_recursive == false) { ret 1; }
+    ret 0;
+}
+
+# callee_instr_count must be -g-invariant: OP_DBG_VALUE births exist only under -g,
+# so counting them would let the size gate in should_inline decide differently with
+# and without -g and emit different machine code. This builds two callees with the
+# identical real body -- one clean, one carrying enough OP_DBG_VALUE births to cross
+# INLINE_INSTR_THRESHOLD if they were counted -- and proves the count (hence the
+# inline decision) is the same for both, at the size boundary where it matters.
+test "mach.lang.me.pass.inline.callee_instr_count:dbg_value_blind" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val res_i64: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64)) { ir.dnit(?m); ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
+
+    # nadd real adds keep the clean count just below the threshold; kdbg debug
+    # values are enough to push a dbg-value-counting implementation over it.
+    val nadd: u32 = 19;
+    val kdbg: u32 = 6;
+
+    var bld: builder.Builder = builder.init(?m);
+
+    # clean callee: nadd adds + a terminator, no debug values.
+    val res_c: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_c)) { ir.dnit(?m); ret 1; }
+    val fn_clean: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](res_c)];
+    builder.set_function(?bld, fn_clean);
+    val res_cb: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_cb)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_cb));
+    var ca: value.Value = value.const_int(1, i64t);
+    var i: u32 = 0;
+    for (i < nadd) {
+        val r: R.Result[value.Value, str] = builder.emit_add(?bld, ca, value.const_int(1, i64t));
+        if (R.is_err[value.Value, str](r)) { ir.dnit(?m); ret 1; }
+        ca = R.unwrap_ok[value.Value, str](r);
+        i = i + 1;
+    }
+    if (R.is_err[bool, str](builder.emit_ret_void(?bld))) { ir.dnit(?m); ret 1; }
+
+    # laden callee: the same nadd adds, then kdbg debug values, then a terminator.
+    val res_l: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_l)) { ir.dnit(?m); ret 1; }
+    val fn_laden: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](res_l)];
+    builder.set_function(?bld, fn_laden);
+    val res_lb: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_lb)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_lb));
+    var la: value.Value = value.const_int(1, i64t);
+    var track: value.Value = la;
+    var j: u32 = 0;
+    for (j < nadd) {
+        val r: R.Result[value.Value, str] = builder.emit_add(?bld, la, value.const_int(1, i64t));
+        if (R.is_err[value.Value, str](r)) { ir.dnit(?m); ret 1; }
+        la = R.unwrap_ok[value.Value, str](r);
+        track = la;
+        j = j + 1;
+    }
+    var d: u32 = 0;
+    for (d < kdbg) {
+        if (R.is_err[bool, str](builder.emit_dbg_value(?bld, track, intern.STR_NIL, i64t, semtype.TYPE_NIL, false, 0))) { ir.dnit(?m); ret 1; }
+        d = d + 1;
+    }
+    if (R.is_err[bool, str](builder.emit_ret_void(?bld))) { ir.dnit(?m); ret 1; }
+
+    val clean: u32 = callee_instr_count(fn_clean);
+    val laden: u32 = callee_instr_count(fn_laden);
+    ir.dnit(?m);
+
+    # the fix: debug values do not change the count, so the decision is unchanged
+    if (clean != laden)                        { ret 1; }
+    # the clean body is under the threshold -- it inlines
+    if (!(clean < INLINE_INSTR_THRESHOLD))     { ret 1; }
+    # counting the debug values would have crossed the threshold and refused to inline
+    if (clean + kdbg < INLINE_INSTR_THRESHOLD) { ret 1; }
     ret 0;
 }

@@ -1,4 +1,4 @@
-# the shared lowering context and emit primitives for IR-to-MIR translation.
+# the shared lowering context and emit primitives for IR-to-MIR translation
 #
 # `LowerCtx` is the per-function lowering state threaded through every pass of
 # the IR-to-MIR translation (`mir.lower`) and the ABI call/param/ret lowering
@@ -31,6 +31,7 @@ use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
 use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
+use mach.lang.source;
 use mach.lang.target.isa;
 use target:  mach.lang.target.resolved;
 
@@ -81,6 +82,26 @@ pub rec LowerCtx {
     # argument register in `lower_params`; mir.MIR_VREG_NIL otherwise. `lower_ret`
     # copies the returned aggregate into this storage and returns it in RAX.
     sret_vreg: u32;
+
+    # source location of the IR instruction currently being lowered, stamped onto
+    # every MirInstr `push_instr` appends so lowered machine instructions carry a
+    # PC<->source mapping for debug line tables. set per IR instruction by the
+    # lowering loop; source.loc_nil() outside one (params / prologue setup).
+    cur_loc: source.SrcLoc;
+
+    # inline instance (1-based, 0 = function body) of the IR instruction currently
+    # being lowered, stamped onto every MirInstr `push_instr` appends so the encoder
+    # can group an inlined expansion's PC ranges. set per IR instruction by the
+    # lowering loop alongside cur_loc; 0 outside one.
+    cur_inline_site: u32;
+
+    # `-g`-only source-variable bindings awaiting attachment: an OP_DBG_VALUE records
+    # its (iid, vreg) here, and the next `push_instr` attaches the whole list (in order)
+    # to the instruction at whose PC the variables become live, then clears it. any
+    # remaining at block end flush onto the block's last instruction. empty without -g.
+    pending:       *mir.MirDbgBinding;
+    pending_count: u32;
+    pending_cap:   u32;
 }
 
 # allocate the per-definition vreg maps and assign a vreg to every parameter and
@@ -159,6 +180,59 @@ pub fun ctx_dnit(ctx: *LowerCtx) {
         A.deallocate[u32](ctx.alloc, ctx.slot_key_vregs, ctx.instr_count::usize);
         ctx.slot_key_vregs = nil;
     }
+    if (ctx.pending != nil && ctx.pending_cap > 0) {
+        A.deallocate[mir.MirDbgBinding](ctx.alloc, ctx.pending, ctx.pending_cap::usize);
+        ctx.pending = nil;
+    }
+}
+
+# record one `-g` source-variable binding to attach to the next lowered instruction.
+# Grows the pending buffer on demand. Called by OP_DBG_VALUE lowering instead of
+# emitting any instruction, so the binding rides a real instruction and never perturbs
+# codegen
+# ---
+# ctx:  the lowering context
+# iid:  the IR OP_DBG_VALUE instruction id
+# vreg: the operand's MIR vreg, or mir.MIR_VREG_NIL for no home
+# ret:  true on success, or an allocation error
+pub fun push_pending_dbg(ctx: *LowerCtx, iid: u32, vreg: u32) R.Result[bool, str] {
+    if (ctx.pending_count >= ctx.pending_cap) {
+        var new_cap: u32 = ctx.pending_cap * 2;
+        if (new_cap < 4) { new_cap = 4; }
+        if (ctx.pending == nil) {
+            val ra: R.Result[*mir.MirDbgBinding, str] = A.allocate[mir.MirDbgBinding](ctx.alloc, new_cap::usize);
+            if (R.is_err[*mir.MirDbgBinding, str](ra)) { ret R.err[bool, str](R.unwrap_err[*mir.MirDbgBinding, str](ra)); }
+            ctx.pending = R.unwrap_ok[*mir.MirDbgBinding, str](ra);
+        }
+        or {
+            val rr: R.Result[*mir.MirDbgBinding, str] = A.reallocate[mir.MirDbgBinding](ctx.alloc, ctx.pending, ctx.pending_cap::usize, new_cap::usize);
+            if (R.is_err[*mir.MirDbgBinding, str](rr)) { ret R.err[bool, str](R.unwrap_err[*mir.MirDbgBinding, str](rr)); }
+            ctx.pending = R.unwrap_ok[*mir.MirDbgBinding, str](rr);
+        }
+        ctx.pending_cap = new_cap;
+    }
+    ctx.pending[ctx.pending_count].iid  = iid;
+    ctx.pending[ctx.pending_count].vreg = vreg;
+    ctx.pending_count = ctx.pending_count + 1;
+    ret R.ok[bool, str](true);
+}
+
+# attach every pending `-g` binding (in order) to `mi`, then clear the pending buffer.
+# A no-op without -g / when no binding is pending. Called from `push_instr` (the next
+# instruction after the OP_DBG_VALUE) and from the block-end flush
+# ---
+# ctx: the lowering context
+# mi:  the instruction the pending bindings become live at
+# ret: true on success, or an allocation error
+pub fun drain_pending_dbg(ctx: *LowerCtx, mi: *mir.MirInstr) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < ctx.pending_count) {
+        val ra: R.Result[bool, str] = mir.instr_attach_dbg(ctx.alloc, mi, ctx.pending[i].iid, ctx.pending[i].vreg);
+        if (R.is_err[bool, str](ra)) { ret ra; }
+        i = i + 1;
+    }
+    ctx.pending_count = 0;
+    ret R.ok[bool, str](true);
 }
 
 # append a fresh virtual register in the given register class and return its id
@@ -427,6 +501,21 @@ pub fun mem_operand_of(ctx: *LowerCtx, v: value.Value) mir.MirOperand {
 pub fun push_instr(ctx: *LowerCtx, mb: *mir.MirBlock, mi: mir.MirInstr) R.Result[bool, str] {
     var ni: mir.MirInstr = mi;
     if (ni.opcode != mir.MIR_ASM) { ni.asm_block = nil; }
+    # stamp the source location of the IR instruction being lowered, at the single
+    # append chokepoint, so every MirInstr carries its real source line. (a residual
+    # unstamped loc is zeroed to {FILE_NIL=0, 0} == loc_nil == no row, harmless, but
+    # the real loc is what the line table wants.)
+    ni.loc = ctx.cur_loc;
+    # the inline instance rides beside loc, stamped at the same chokepoint for the same
+    # non-zero-init reason, so every lowered instruction carries its inlined-from origin.
+    ni.inline_site = ctx.cur_inline_site;
+    # the dbg-binding list defaults empty here for the same reason (callers build
+    # instructions field-by-field and never set it); any pending -g binding then
+    # attaches to this instruction, the next one after its OP_DBG_VALUE.
+    ni.dbg_bindings      = nil;
+    ni.dbg_binding_count = 0;
+    val res_drain: R.Result[bool, str] = drain_pending_dbg(ctx, ?ni);
+    if (R.is_err[bool, str](res_drain)) { ret res_drain; }
     val res_grow: R.Result[bool, str] = grow_instr(ctx, mb);
     if (R.is_err[bool, str](res_grow)) { ret res_grow; }
     mb.instrs[mb.instr_count] = ni;
@@ -1083,7 +1172,7 @@ fun inst3(ctx: *LowerCtx, mb: *mir.MirBlock, opcode: mir.MirOpcode, op0: mir.Mir
     ret push_instr(ctx, mb, mi);
 }
 
-# size=0 treated as 8; 1..8 all round up to 8; 9 rounds to 16.
+# size=0 treated as 8; 1..8 all round up to 8; 9 rounds to 16
 test "mach.lang.be.codegen.mir.context.stack_slot_bytes" {
     if (stack_slot_bytes(0) != 8)  { ret 1; }
     if (stack_slot_bytes(1) != 8)  { ret 1; }
@@ -1092,7 +1181,7 @@ test "mach.lang.be.codegen.mir.context.stack_slot_bytes" {
     ret 0;
 }
 
-# sub-4 widths raise to 4; 4 and 8 pass through.
+# sub-4 widths raise to 4; 4 and 8 pass through
 test "mach.lang.be.codegen.mir.context.clamp_alu_width" {
     if (clamp_alu_width(1) != 4) { ret 1; }
     if (clamp_alu_width(2) != 4) { ret 1; }
@@ -1104,7 +1193,7 @@ test "mach.lang.be.codegen.mir.context.clamp_alu_width" {
 
 # the float bank is found by RC_FLOAT kind, not a width threshold: a 64-bit float
 # bank (rv64d's f-registers) resolves just like the 128-bit XMM / V bank (x64 /
-# arm64 shape).
+# arm64 shape)
 test "mach.lang.be.codegen.mir.context.fp_class_index" {
     var classes: [2]isa.RegClass;
     classes[0].kind = isa.RC_GENERAL;

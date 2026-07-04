@@ -36,11 +36,14 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 
+use std.allocator.page;
+
 use A: std.allocator;
 use R: std.types.result;
 
 use mach.lang.be.codegen.mir;
 use mach.lang.intern;
+use source: mach.lang.source;
 use mach.lang.target.abi;
 use mach.lang.target.of;
 use tos:    mach.lang.target.os;
@@ -56,6 +59,8 @@ use target: mach.lang.target.resolved;
 # reloc_count:  number of relocations
 # symbols:      symbol marks, one per function entry (owned)
 # symbol_count: number of symbol marks
+# rows:         PC<->source line rows, ordered by ascending `text_offset` (owned)
+# row_count:    number of line rows
 pub rec EncoderOutput {
     text:         *u8;
     text_len:     u32;
@@ -63,7 +68,81 @@ pub rec EncoderOutput {
     reloc_count:  u32;
     symbols:      *SymbolMark;
     symbol_count: u32;
+    rows:         *LineRow;
+    row_count:    u32;
+    varlocs:      *VarLoc;
+    varloc_count: u32;
+    inline_pcs:   *InlinePc;
+    inline_pc_count: u32;
 }
+
+# one retained PC<->source mapping: a `.text` byte offset and the source location of
+# the instruction that begins there
+#
+# The encoder appends one per instruction with a valid source location, in
+# ascending `text_offset` order. `insert_text` (branch relaxation) keeps
+# `text_offset` correct while the text grows; codegen's `#[section(...)]` re-homing
+# (`pack_rows`) then assigns each row's final `sec` and rebases `text_offset` into
+# that section. Until re-homing every row is relative to the single encoder `.text`
+# blob and `sec` is 0. The source `loc` (file + byte offset) resolves to a 1-based
+# line/column via `source.position`; the #1699 `.debug_line` / CodeView producer
+# consumes it. The row never affects the emitted bytes.
+# ---
+# text_offset: byte offset of the instruction within its owning section (`.text`
+#              blob-relative until re-homing rebases it)
+# sec:         owning object-section index, assigned by codegen re-homing (0 while
+#              the row is still relative to the single encoder blob)
+# loc:         source location (file + byte offset) the instruction lowered from
+pub rec LineRow {
+    text_offset: u32;
+    sec:         u32;
+    loc:         source.SrcLoc;
+}
+
+# one inline-instance transition: at `text_offset` the active inline instance becomes
+# `inline_site` (0 = the function's own body, else a 1-based ir.Function inline-site id).
+# The encoder appends one only when the instance CHANGES between consecutive
+# instructions, in ascending `text_offset` order, so a record governs `[text_offset,
+# next_offset)`. insert_text keeps `text_offset` correct through branch relaxation, and
+# pack re-homes it exactly like a LineRow. The DWARF inlined_subroutine producer (#1707)
+# groups these into per-instance `.text` ranges; nothing else reads them and they never
+# affect the emitted bytes.
+# ---
+# text_offset: `.text` byte offset where this instance becomes active
+# sec:         owning section index after re-homing (0 until then)
+# inline_site: the 1-based inline instance now active, or 0 for the function body
+pub rec InlinePc {
+    text_offset: u32;
+    sec:         u32;
+    inline_site: u32;
+}
+
+# a source-variable location record: at `.text` offset `text_offset`, the variable
+# bound by OP_DBG_VALUE `iid` lives at the raw home `(kind, reg | off)`. The producer
+# joins `iid` to the IR variable identity and orders records by offset to build the
+# per-PC ranges of a `.debug_loclists` entry (#1705). `text_offset` / `sec` re-home
+# exactly like a LineRow (insert_text shift, site_placed re-home) so a range stays
+# correct across branch relaxation and `#[section]` excision
+# ---
+# text_offset: `.text` byte offset where this binding becomes live
+# sec:         owning object-section index (re-homed from 0 by codegen)
+# iid:         source OP_DBG_VALUE instruction id (joins the IR dbg-var identity)
+# kind:        VARLOC_NONE / VARLOC_REG / VARLOC_FRAME
+# reg:         physical register id when kind == VARLOC_REG
+# off:         frame-base offset when kind == VARLOC_FRAME
+pub rec VarLoc {
+    text_offset: u32;
+    sec:         u32;
+    iid:         u32;
+    kind:        u8;
+    reg:         i32;
+    off:         i64;
+}
+
+# a variable-location record's home kind
+pub val VARLOC_NONE:  u8 = 0;
+pub val VARLOC_REG:   u8 = 1;
+pub val VARLOC_FRAME: u8 = 2;
 
 # one relocation the encoder leaves for the object writer to resolve
 #
@@ -361,6 +440,16 @@ pub rec EncodeState {
     blocks:      *BlockOffset;
     block_count: u32;
     block_cap:   u32;
+    rows:        *LineRow;
+    row_count:   u32;
+    row_cap:     u32;
+    varlocs:     *VarLoc;
+    varloc_count: u32;
+    varloc_cap:  u32;
+    inline_pcs:  *InlinePc;
+    inline_pc_count: u32;
+    inline_pc_cap:   u32;
+    last_inline_site: u32;
     interner:    *intern.Interner;
     abi:         *abi.AbiVTable;
     os:          *tos.OsVTable;
@@ -448,6 +537,10 @@ pub fun encode_driver(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirModul
 
     var fi: u32 = 0;
     for (fi < m.function_len) {
+        # each function starts in its own body (inline instance 0); reset the transition
+        # tracker so a function whose last instruction was inlined does not suppress the
+        # next function's opening transition (inline-site ids are per-function).
+        st.last_inline_site = 0;
         val res_encode: R.Result[bool, str] = hooks.encode_function(?st, ?m.functions[fi]);
         if (R.is_err[bool, str](res_encode)) {
             state_dnit(?st);
@@ -475,9 +568,15 @@ pub fun encode_driver(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirModul
     out.reloc_count  = st.reloc_count;
     out.symbols      = st.syms;
     out.symbol_count = st.sym_count;
+    out.rows         = st.rows;
+    out.row_count    = st.row_count;
+    out.inline_pcs   = st.inline_pcs;
+    out.inline_pc_count = st.inline_pc_count;
+    out.varlocs      = st.varlocs;
+    out.varloc_count = st.varloc_count;
 
-    # the text, symbol, and relocation arrays are transferred to the output; only
-    # the driver-internal fixup and block-offset arrays are released.
+    # the text, symbol, relocation, line-row, and varloc arrays are transferred to the
+    # output; only the driver-internal fixup and block-offset arrays are released.
     scratch_release(?st);
     ret R.ok[EncoderOutput, str](out);
 }
@@ -605,6 +704,119 @@ pub fun push_block(st: *EncodeState, fn_text_base: u32, block_id: u32, offset: u
     ret R.ok[bool, str](true);
 }
 
+# append a PC<->source line row, growing the row array on demand
+#
+# Called by an ISA encoder for each instruction that carries a source location, at
+# the `.text` offset where its bytes begin. A location naming no file
+# (`source.loc_nil()`, a compiler-synthesized instruction) is dropped so its byte
+# range is attributed to the preceding row's line. The row survives into
+# `EncoderOutput` and is kept correct under `insert_text` relaxation and codegen
+# re-homing.
+# ---
+# st:          the encode state whose row array receives the entry
+# text_offset: byte offset of the instruction's first byte within `.text`
+# loc:         the instruction's source location
+# ret:         ok(true) on success (or a dropped nil location), or an allocation error
+pub fun push_row(st: *EncodeState, text_offset: u32, loc: source.SrcLoc) R.Result[bool, str] {
+    if (!source.loc_is_valid(loc)) { ret R.ok[bool, str](true); }
+    if (st.row_count >= st.row_cap) {
+        val res_grow: R.Result[bool, str] = grow_rows(st);
+        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+    }
+    st.rows[st.row_count].text_offset = text_offset;
+    st.rows[st.row_count].sec         = 0;
+    st.rows[st.row_count].loc         = loc;
+    st.row_count = st.row_count + 1;
+    ret R.ok[bool, str](true);
+}
+
+# record a variable-location record for a source-variable binding `(iid, vreg)` that
+# becomes live at `text_offset`. The vreg's post-regalloc home (assigned register or
+# spill slot) becomes the raw home the producer maps to a DWARF location. A NIL vreg or
+# a vreg with neither home is an optimized-out binding (VARLOC_NONE), which the producer
+# renders as a gap
+# ---
+# st:          the encode state
+# text_offset: `.text` offset where the binding becomes live
+# fn:          the MIR function owning the vreg (its vregs / frame give the home)
+# vreg:        the bound value's vreg, or mir.MIR_VREG_NIL for no home
+# iid:         the source OP_DBG_VALUE instruction id
+# ret:         ok(true), or an allocation error
+pub fun push_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, vreg: u32, iid: u32) R.Result[bool, str] {
+    var kind: u8  = VARLOC_NONE;
+    var reg:  i32 = 0;
+    var off:  i64 = 0;
+    if (vreg != mir.MIR_VREG_NIL && vreg < fn.vreg_count) {
+        val vr: *mir.MirVReg = ?fn.vregs[vreg];
+        if (vr.assigned != mir.MIR_VREG_NIL) {
+            kind = VARLOC_REG;
+            reg  = vr.assigned::i32;
+        }
+        or (vr.spill_slot >= 0) {
+            var si: u32 = 0;
+            for (si < fn.frame.slot_count) {
+                if (fn.frame.slots[si].value == vreg) { kind = VARLOC_FRAME; off = fn.frame.slots[si].offset; }
+                si = si + 1;
+            }
+        }
+    }
+
+    if (st.varloc_count >= st.varloc_cap) {
+        val res_grow: R.Result[bool, str] = grow_varlocs(st);
+        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+    }
+    st.varlocs[st.varloc_count].text_offset = text_offset;
+    st.varlocs[st.varloc_count].sec         = 0;
+    st.varlocs[st.varloc_count].iid         = iid;
+    st.varlocs[st.varloc_count].kind        = kind;
+    st.varlocs[st.varloc_count].reg         = reg;
+    st.varlocs[st.varloc_count].off         = off;
+    st.varloc_count = st.varloc_count + 1;
+    ret R.ok[bool, str](true);
+}
+
+# record a VarLoc for every `-g` source-variable binding attached to `mi`, at the
+# instruction's current `.text` start offset (`st.buf.len`). Called by each ISA encoder
+# at the top of `encode_mir_instr`, before the instruction's bytes are emitted, so the
+# binding's PC is the instruction's start - the same position a standalone marker would
+# have produced. A no-op for the common instruction with no bindings
+# ---
+# st: the encode state
+# fn: the MIR function owning the vregs
+# mi: the instruction whose attached bindings are recorded
+# ret: ok(true), or an allocation error
+pub fun emit_var_bindings(st: *EncodeState, fn: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.dbg_binding_count == 0) { ret R.ok[bool, str](true); }
+    val at: u32 = st.buf.len::u32;
+    var i: u32 = 0;
+    for (i < mi.dbg_binding_count) {
+        val r: R.Result[bool, str] = push_varloc(st, at, fn, mi.dbg_bindings[i].vreg, mi.dbg_bindings[i].iid);
+        if (R.is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# grow the variable-location array, allocating it on first use
+# ---
+# st:  the state whose varloc array is grown
+# ret: ok(true) once the array has room, or an allocation error
+fun grow_varlocs(st: *EncodeState) R.Result[bool, str] {
+    if (st.varlocs == nil) {
+        val res_alloc: R.Result[*VarLoc, str] = A.allocate[VarLoc](st.alloc, DRIVER_INIT_CAP::usize);
+        if (R.is_err[*VarLoc, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*VarLoc, str](res_alloc)); }
+        st.varlocs   = R.unwrap_ok[*VarLoc, str](res_alloc);
+        st.varloc_cap = DRIVER_INIT_CAP;
+        ret R.ok[bool, str](true);
+    }
+    val new_cap: u32 = st.varloc_cap * 2;
+    val res_realloc: R.Result[*VarLoc, str] = A.reallocate[VarLoc](st.alloc, st.varlocs, st.varloc_cap::usize, new_cap::usize);
+    if (R.is_err[*VarLoc, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*VarLoc, str](res_realloc)); }
+    st.varlocs   = R.unwrap_ok[*VarLoc, str](res_realloc);
+    st.varloc_cap = new_cap;
+    ret R.ok[bool, str](true);
+}
+
 # initialise an encode state with empty output arrays for one driver run
 # ---
 # st:    the state to populate in place
@@ -626,6 +838,16 @@ fun state_init(st: *EncodeState, alloc: *A.Allocator, m: *mir.MirModule, tgt: *t
     st.blocks      = nil;
     st.block_count = 0;
     st.block_cap   = 0;
+    st.rows        = nil;
+    st.row_count   = 0;
+    st.row_cap     = 0;
+    st.varlocs     = nil;
+    st.varloc_count = 0;
+    st.varloc_cap  = 0;
+    st.inline_pcs  = nil;
+    st.inline_pc_count = 0;
+    st.inline_pc_cap   = 0;
+    st.last_inline_site = 0;
     st.interner    = m.interner;
     st.abi         = tgt.abi;
     st.os          = tgt.os;
@@ -649,6 +871,24 @@ fun state_dnit(st: *EncodeState) {
     st.relocs      = nil;
     st.reloc_count = 0;
     st.reloc_cap   = 0;
+    if (st.rows != nil && st.row_cap > 0) {
+        A.deallocate[LineRow](st.alloc, st.rows, st.row_cap::usize);
+    }
+    st.rows      = nil;
+    st.row_count = 0;
+    st.row_cap   = 0;
+    if (st.varlocs != nil && st.varloc_cap > 0) {
+        A.deallocate[VarLoc](st.alloc, st.varlocs, st.varloc_cap::usize);
+    }
+    st.varlocs      = nil;
+    st.varloc_count = 0;
+    st.varloc_cap   = 0;
+    if (st.inline_pcs != nil && st.inline_pc_cap > 0) {
+        A.deallocate[InlinePc](st.alloc, st.inline_pcs, st.inline_pc_cap::usize);
+    }
+    st.inline_pcs      = nil;
+    st.inline_pc_count = 0;
+    st.inline_pc_cap   = 0;
     scratch_release(st);
 }
 
@@ -749,7 +989,7 @@ pub fun block_offset(st: *EncodeState, fn_base: u32, block_id: u32) R.Result[u32
 # Shifts the bytes in `[pos, len)` up by `nbytes` (growing the sink as needed),
 # zero-fills the opened gap, and advances by `nbytes` every recorded offset at or
 # past `pos`: block offsets, branch-fixup patch / next-ip / function-base fields,
-# symbol-mark offsets, and relocation offsets. This is the ISA-general mechanism a
+# symbol-mark offsets, relocation offsets, and line-row text offsets. This is the ISA-general mechanism a
 # branch-relaxation pass uses to grow an out-of-range branch into a longer
 # sequence while leaving the fixup, block, symbol, and relocation tables pointing
 # at the right instructions. An entry strictly before `pos` is untouched, so the
@@ -817,6 +1057,21 @@ pub fun insert_text(st: *EncodeState, pos: u32, nbytes: u32) R.Result[bool, str]
     for (ri < st.reloc_count) {
         if (st.relocs[ri].offset >= pos) { st.relocs[ri].offset = st.relocs[ri].offset + nbytes; }
         ri = ri + 1;
+    }
+    var wi: u32 = 0;
+    for (wi < st.row_count) {
+        if (st.rows[wi].text_offset >= pos) { st.rows[wi].text_offset = st.rows[wi].text_offset + nbytes; }
+        wi = wi + 1;
+    }
+    var vli: u32 = 0;
+    for (vli < st.varloc_count) {
+        if (st.varlocs[vli].text_offset >= pos) { st.varlocs[vli].text_offset = st.varlocs[vli].text_offset + nbytes; }
+        vli = vli + 1;
+    }
+    var ipi: u32 = 0;
+    for (ipi < st.inline_pc_count) {
+        if (st.inline_pcs[ipi].text_offset >= pos) { st.inline_pcs[ipi].text_offset = st.inline_pcs[ipi].text_offset + nbytes; }
+        ipi = ipi + 1;
     }
     ret R.ok[bool, str](true);
 }
@@ -899,4 +1154,162 @@ fun grow_blocks(st: *EncodeState) R.Result[bool, str] {
     st.blocks    = R.unwrap_ok[*BlockOffset, str](res_realloc);
     st.block_cap = new_cap;
     ret R.ok[bool, str](true);
+}
+
+# grow the line-row array, allocating it on first use
+# ---
+# st:  the state whose row array is grown
+# ret: ok(true) once the array has room, or an allocation error
+fun grow_rows(st: *EncodeState) R.Result[bool, str] {
+    if (st.rows == nil) {
+        val res_alloc: R.Result[*LineRow, str] = A.allocate[LineRow](st.alloc, DRIVER_INIT_CAP::usize);
+        if (R.is_err[*LineRow, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*LineRow, str](res_alloc)); }
+        st.rows    = R.unwrap_ok[*LineRow, str](res_alloc);
+        st.row_cap = DRIVER_INIT_CAP;
+        ret R.ok[bool, str](true);
+    }
+    val new_cap: u32 = st.row_cap * 2;
+    val res_realloc: R.Result[*LineRow, str] = A.reallocate[LineRow](st.alloc, st.rows, st.row_cap::usize, new_cap::usize);
+    if (R.is_err[*LineRow, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*LineRow, str](res_realloc)); }
+    st.rows    = R.unwrap_ok[*LineRow, str](res_realloc);
+    st.row_cap = new_cap;
+    ret R.ok[bool, str](true);
+}
+
+# grow the inline-pc transition array, allocating it on first use
+# ---
+# st:  the state whose inline-pc array is grown
+# ret: ok(true) once the array has room, or an allocation error
+fun grow_inline_pcs(st: *EncodeState) R.Result[bool, str] {
+    if (st.inline_pcs == nil) {
+        val res_alloc: R.Result[*InlinePc, str] = A.allocate[InlinePc](st.alloc, DRIVER_INIT_CAP::usize);
+        if (R.is_err[*InlinePc, str](res_alloc)) { ret R.err[bool, str](R.unwrap_err[*InlinePc, str](res_alloc)); }
+        st.inline_pcs    = R.unwrap_ok[*InlinePc, str](res_alloc);
+        st.inline_pc_cap = DRIVER_INIT_CAP;
+        ret R.ok[bool, str](true);
+    }
+    val new_cap: u32 = st.inline_pc_cap * 2;
+    val res_realloc: R.Result[*InlinePc, str] = A.reallocate[InlinePc](st.alloc, st.inline_pcs, st.inline_pc_cap::usize, new_cap::usize);
+    if (R.is_err[*InlinePc, str](res_realloc)) { ret R.err[bool, str](R.unwrap_err[*InlinePc, str](res_realloc)); }
+    st.inline_pcs    = R.unwrap_ok[*InlinePc, str](res_realloc);
+    st.inline_pc_cap = new_cap;
+    ret R.ok[bool, str](true);
+}
+
+# record that at `text_offset` the active inline instance becomes `inline_site`. Only a
+# CHANGE from the previously active instance appends a record, so a run of instructions
+# in one instance forms a single range `[text_offset, next_offset)`. Called for every
+# instruction at its first byte; a no-op for the common body-to-body (0) run.
+# ---
+# st:          the encode state
+# text_offset: `.text` offset of the instruction being encoded
+# inline_site: the instruction's inline instance (0 = function body)
+# ret:         ok(true), or an allocation error
+pub fun push_inline_pc(st: *EncodeState, text_offset: u32, inline_site: u32) R.Result[bool, str] {
+    if (inline_site == st.last_inline_site) { ret R.ok[bool, str](true); }
+    if (st.inline_pc_count >= st.inline_pc_cap) {
+        val res_grow: R.Result[bool, str] = grow_inline_pcs(st);
+        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+    }
+    st.inline_pcs[st.inline_pc_count].text_offset = text_offset;
+    st.inline_pcs[st.inline_pc_count].sec         = 0;
+    st.inline_pcs[st.inline_pc_count].inline_site = inline_site;
+    st.inline_pc_count  = st.inline_pc_count + 1;
+    st.last_inline_site = inline_site;
+    ret R.ok[bool, str](true);
+}
+
+# a minimal encode state for the row / varloc / insert_text unit tests: a text sink and
+# an empty set of mark / reloc / fixup / block / row / varloc arrays, no interner or
+# vtables
+fun t_row_state(alloc: *A.Allocator, st: *EncodeState) {
+    st.alloc = alloc;
+    st.buf = buf_init(alloc);
+    st.syms = nil;   st.sym_count = 0;   st.sym_cap = 0;
+    st.relocs = nil; st.reloc_count = 0; st.reloc_cap = 0;
+    st.fixups = nil; st.fixup_count = 0; st.fixup_cap = 0;
+    st.blocks = nil; st.block_count = 0; st.block_cap = 0;
+    st.rows = nil;   st.row_count = 0;   st.row_cap = 0;
+    st.varlocs = nil; st.varloc_count = 0; st.varloc_cap = 0;
+    st.inline_pcs = nil; st.inline_pc_count = 0; st.inline_pc_cap = 0;
+    st.interner = nil; st.abi = nil; st.os = nil;
+}
+
+# push_row drops a location naming no file, and insert_text (branch relaxation)
+# advances every line row at or past the gap while leaving earlier rows put - so a
+# row's text_offset keeps pointing at its instruction after the text grows
+test "mach.lang.be.codegen.encode.insert_text:shifts_line_rows" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var st: EncodeState;
+    t_row_state(?alloc, ?st);
+
+    # a 12-byte placeholder .text so insert_text has bytes to slide.
+    var i: u32 = 0;
+    for (i < 12) { emit_byte(?st.buf, 0x90); i = i + 1; }
+
+    # three real rows at 0 / 4 / 8, plus a nil-location row that must be dropped.
+    val r0: R.Result[bool, str] = push_row(?st, 0, source.loc(1, 100)); if (R.is_err[bool, str](r0)) { ret 1; }
+    val r1: R.Result[bool, str] = push_row(?st, 4, source.loc(1, 200)); if (R.is_err[bool, str](r1)) { ret 1; }
+    val rn: R.Result[bool, str] = push_row(?st, 4, source.loc_nil());   if (R.is_err[bool, str](rn)) { ret 1; }
+    val r2: R.Result[bool, str] = push_row(?st, 8, source.loc(1, 300)); if (R.is_err[bool, str](r2)) { ret 1; }
+    if (st.row_count != 3) { buf_dnit(?st.buf); ret 1; }
+
+    # open a 4-byte gap at offset 4 (as a relaxed branch would).
+    val it: R.Result[bool, str] = insert_text(?st, 4, 4);
+    if (R.is_err[bool, str](it)) { buf_dnit(?st.buf); ret 1; }
+
+    var code: i32 = 0;
+    # the row before the gap is untouched; the rows at/after it advance by 4.
+    if (st.rows[0].text_offset != 0)  { code = 1; }
+    if (st.rows[1].text_offset != 8)  { code = 1; }
+    if (st.rows[2].text_offset != 12) { code = 1; }
+    # the source locations ride along unchanged.
+    if (st.rows[1].loc.offset != 200) { code = 1; }
+
+    buf_dnit(?st.buf);
+    if (st.rows != nil && st.row_cap > 0) { A.deallocate[LineRow](?alloc, st.rows, st.row_cap::usize); }
+    ret code;
+}
+
+# push_varloc resolves a source-variable binding's vreg to its post-regalloc home: an
+# assigned register (VARLOC_REG), a spill slot (VARLOC_FRAME), or - for a vreg with
+# neither, a value referenced only by debug and left dead by regalloc - VARLOC_NONE (an
+# optimized-out binding), never a stale register id or a panic
+test "mach.lang.be.codegen.encode.push_varloc:reg_frame_dead" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    var st: EncodeState;
+    t_row_state(?alloc, ?st);
+
+    # vreg 0 -> physical register 7; vreg 1 -> spill slot at frame offset -16;
+    # vreg 2 -> no home (dead).
+    var vregs: [3]mir.MirVReg;
+    vregs[0].id = 0; vregs[0].class = 0; vregs[0].spill_slot = -1; vregs[0].assigned = 7;
+    vregs[1].id = 1; vregs[1].class = 0; vregs[1].spill_slot = 0;  vregs[1].assigned = mir.MIR_VREG_NIL;
+    vregs[2].id = 2; vregs[2].class = 0; vregs[2].spill_slot = -1; vregs[2].assigned = mir.MIR_VREG_NIL;
+
+    var slots: [1]mir.MirSlot;
+    slots[0].value = 1; slots[0].kind = mir.SLOT_SPILL; slots[0].offset = -16; slots[0].size = 8; slots[0].align = 8;
+
+    var fn: mir.MirFunction;
+    fn.vregs = ?vregs[0]; fn.vreg_count = 3;
+    fn.frame.slots = ?slots[0]; fn.frame.slot_count = 1; fn.frame.slot_cap = 1;
+    fn.frame.size = 0; fn.frame.align = 0; fn.frame.outgoing_size = 0;
+
+    val ra: R.Result[bool, str] = push_varloc(?st, 0, ?fn, 0, 100); if (R.is_err[bool, str](ra)) { code = 1; }
+    val rb: R.Result[bool, str] = push_varloc(?st, 4, ?fn, 1, 101); if (R.is_err[bool, str](rb)) { code = 1; }
+    val rc: R.Result[bool, str] = push_varloc(?st, 8, ?fn, 2, 102); if (R.is_err[bool, str](rc)) { code = 1; }
+
+    if (st.varloc_count != 3) { code = 1; }
+    if (st.varlocs[0].kind != VARLOC_REG || st.varlocs[0].reg != 7 || st.varlocs[0].iid != 100) { code = 1; }
+    if (st.varlocs[1].kind != VARLOC_FRAME || st.varlocs[1].off != -16 || st.varlocs[1].iid != 101) { code = 1; }
+    if (st.varlocs[2].kind != VARLOC_NONE || st.varlocs[2].iid != 102) { code = 1; }
+
+    if (st.varlocs != nil && st.varloc_cap > 0) { A.deallocate[VarLoc](?alloc, st.varlocs, st.varloc_cap::usize); }
+    buf_dnit(?st.buf);
+    ret code;
 }

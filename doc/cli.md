@@ -98,6 +98,7 @@ and nothing is linked.
 | `-O0`          | —              | force the debug pipeline (overrides `--release`) |
 | `-O1`          | —              | select the release pipeline |
 | `-O2`          | —              | select the release pipeline |
+| `-g`           | —              | emit debug info for this build, forcing the selected profile's `debug` on (precedence `-g` > profile > off) |
 | `--emit <kind>`| `obj`\|`exe`   | `obj` stops at the relocatable objects; `exe` (default) links a binary |
 | `--pie`        | —              | emit a position-independent (ET_DYN) executable for ASLR instead of the default fixed-address one; opt-in (see below) |
 | `-L <dir>`     | dir            | add a search directory for `-l`-resolved inputs; repeatable |

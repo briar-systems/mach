@@ -22,6 +22,17 @@
 # golden is keyed by build-target (expect.<build-target>.txt). this lets, e.g., a
 # PE-ASLR or macho-PIE field case cross-build its format on the cheap linux leg and
 # `od` it there, per-PR, with no runner of the format's own OS.
+#
+# NATIVE vs QEMU FIDELITY. a target's run-mode (targets.conf) is `native` (execute on
+# the runner) or `qemu` (run the guest ELF under qemu-user). qemu-user does NOT fully
+# model kernel memory semantics - in particular it does not fault an `mprotect` (or
+# access) over address space the loader never mapped, and its guest page size need not
+# match a real kernel's. so RELRO / mprotect-class runtime behavior (e.g. the static-PIE
+# self-relocation re-protecting PT_GNU_RELRO) is only PROVEN by a `native` leg; a qemu
+# leg can pass while the same binary crashes on real hardware (briar-systems/mach#1885,
+# where a 64K-aligned aarch64 image faulted ENOMEM on a native 4K-page kernel that every
+# qemu-aarch64 leg had reported green). keep the aarch64 int leg `native` for this
+# reason - do not move it to qemu.
 set -eu
 
 usage() {
@@ -196,25 +207,52 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
             fi
         fi
 
-        if ! (cd "$dir" && "$compiler" dep pull && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -o "$relbin") >"$tmp/build.log" 2>&1; then
-            echo "FAIL $label (build)"
-            sed 's/^/    /' "$tmp/build.log" >&2
-            fails=$((fails + 1))
-            rm -rf "$tmp" "$dir/out/int"
-            continue
+        if (cd "$dir" && "$compiler" dep pull && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -o "$relbin") >"$tmp/build.log" 2>&1; then
+            build_ok=1
+        else
+            build_ok=0
         fi
 
-        if produce "$case_run" "$runmode" "$target" "$bin" >"$tmp/out.txt" 2>"$tmp/err.txt"; then
-            prc=0
+        # a build-fails case asserts the compile is rejected and takes the compiler's
+        # 'error:' diagnostic as its observable (deterministic: no paths, just the
+        # message text). every other mode requires a clean build and runs a producer
+        # on the artifact.
+        if [ "$case_run" = build-fails ]; then
+            if [ "$build_ok" -eq 1 ]; then
+                echo "FAIL $label (build succeeded; expected a link error)"
+                fails=$((fails + 1))
+                rm -rf "$tmp" "$dir/out/int"
+                continue
+            fi
+            grep '^error:' "$tmp/build.log" >"$tmp/out.txt" || true
+            if [ ! -s "$tmp/out.txt" ]; then
+                echo "FAIL $label (build failed without an 'error:' diagnostic)"
+                sed 's/^/    /' "$tmp/build.log" >&2
+                fails=$((fails + 1))
+                rm -rf "$tmp" "$dir/out/int"
+                continue
+            fi
         else
-            prc=$?
-        fi
-        if [ "$prc" -ne 0 ]; then
-            echo "FAIL $label (producer exit $prc)"
-            sed 's/^/    /' "$tmp/err.txt" >&2
-            fails=$((fails + 1))
-            rm -rf "$tmp" "$dir/out/int"
-            continue
+            if [ "$build_ok" -eq 0 ]; then
+                echo "FAIL $label (build)"
+                sed 's/^/    /' "$tmp/build.log" >&2
+                fails=$((fails + 1))
+                rm -rf "$tmp" "$dir/out/int"
+                continue
+            fi
+
+            if produce "$case_run" "$runmode" "$target" "$bin" >"$tmp/out.txt" 2>"$tmp/err.txt"; then
+                prc=0
+            else
+                prc=$?
+            fi
+            if [ "$prc" -ne 0 ]; then
+                echo "FAIL $label (producer exit $prc)"
+                sed 's/^/    /' "$tmp/err.txt" >&2
+                fails=$((fails + 1))
+                rm -rf "$tmp" "$dir/out/int"
+                continue
+            fi
         fi
 
         if [ "$bless" -eq 1 ]; then

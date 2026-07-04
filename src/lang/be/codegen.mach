@@ -18,11 +18,13 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
 
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
+use dwarf: mach.lang.be.codegen.dwarf;
 use mach.lang.be.codegen.encode;
 use mach.lang.be.codegen.frame;
 use mach.lang.be.codegen.isel;
@@ -36,6 +38,7 @@ use mach.lang.me.ir;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.session;
+use source: mach.lang.source;
 use mach.lang.target;
 use mach.lang.target.of;
 
@@ -138,7 +141,7 @@ pub fun codegen_module(s: *session.Session, tgt: *target.Target,
     }
     val enc: encode.EncoderOutput = R.unwrap_ok[encode.EncoderOutput, str](res_encode);
 
-    ret pack_image(s, tgt, irmod, ?enc);
+    ret pack_image(s, tgt, irmod, ?mir_module, ?enc);
 }
 
 # build the object image from the encoder output and the module's globals
@@ -155,7 +158,7 @@ pub fun codegen_module(s: *session.Session, tgt: *target.Target,
 # enc:   encoder output for the module's `.text`
 # ret:   the populated object image, or an error string
 fun pack_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
-               enc: *encode.EncoderOutput) R.Result[of.ObjectImage, str] {
+               mirmod: *mir.MirModule, enc: *encode.EncoderOutput) R.Result[of.ObjectImage, str] {
     val res_image: R.Result[of.ObjectImage, str] = obj.init(s.alloc, ?s.interner, irmod.name);
     if (R.is_err[of.ObjectImage, str](res_image)) {
         ret R.err[of.ObjectImage, str](R.unwrap_err[of.ObjectImage, str](res_image));
@@ -196,6 +199,10 @@ fun pack_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     }
 
     val res_relocs: R.Result[bool, str] = pack_relocs(?image, enc, text_sec, placements, placement_count);
+    # re-home the retained PC<->source rows the same way symbols are, while the
+    # placements are still live, so the #1699 line producer reads final section
+    # offsets. infallible (in-place offset math), so no error to thread.
+    pack_rows(enc, placements, placement_count, text_sec);
     if (placements != nil) { A.deallocate[SectionPlacement](s.alloc, placements, enc.symbol_count::usize); }
     if (R.is_err[bool, str](res_relocs)) {
         obj.dnit(?image);
@@ -224,7 +231,29 @@ fun pack_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
         ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_data_externs));
     }
 
+    # when `-g` is on and the target uses DWARF (elf / mach-o), the shared producer
+    # writes the .debug_abbrev/.debug_info/.debug_line/.debug_loclists sections from the
+    # encoder's re-homed PC<->source rows, per-PC variable-location records, and the
+    # packed function symbols. off without `-g`, so non-debug output is unchanged.
+    if (s.debug && format_uses_dwarf(tgt)) {
+        val res_dwarf: R.Result[bool, str] = dwarf.produce(s, tgt, irmod, ?image, enc.rows, enc.row_count, enc.varlocs, enc.varloc_count, enc.inline_pcs, enc.inline_pc_count, text_sec);
+        if (R.is_err[bool, str](res_dwarf)) {
+            obj.dnit(?image);
+            ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_dwarf));
+        }
+    }
+
     ret R.ok[of.ObjectImage, str](image);
+}
+
+# whether the target's object format carries DWARF debug info (ELF and Mach-O; COFF
+# uses CodeView, a separate producer)
+# ---
+# tgt: the resolved target
+# ret: true when the format is DWARF-based
+fun format_uses_dwarf(tgt: *target.Target) bool {
+    if (tgt.of == nil) { ret false; }
+    ret str_equals(tgt.of.name, "elf") || str_equals(tgt.of.name, "macho");
 }
 
 # assemble the `.text` section from the non-sectioned functions
@@ -388,6 +417,49 @@ fun pack_relocs(image: *of.ObjectImage, enc: *encode.EncoderOutput,
         i = i + 1;
     }
     ret R.ok[bool, str](true);
+}
+
+# re-home every retained PC<->source line row into its final section and offset,
+# the line-table analogue of pack_symbols / pack_relocs
+#
+# Each row's encoder-blob `text_offset` resolves through `site_placed` exactly as a
+# symbol mark does: a row inside a `#[section("...")]` function moves to that
+# function's named section at its section-relative offset, and a `.text`-resident
+# row keeps `.text` and shifts down by the excised ranges below it. With no
+# sectioned function the rows keep `.text` (section index `text_sec`) and their
+# offsets are unchanged, matching the byte-for-byte default path. Rebases the rows
+# in place; the #1699 line-table producer reads the final `(sec, text_offset, loc)`.
+# ---
+# enc:             encoder output whose rows are re-homed in place
+# placements:      the sectioned-function ranges, in increasing text offset
+# placement_count: number of placements
+# text_sec:        index of the `.text` section a non-sectioned row stays in
+fun pack_rows(enc: *encode.EncoderOutput, placements: *SectionPlacement, placement_count: u32, text_sec: u32) {
+    var i: u32 = 0;
+    for (i < enc.row_count) {
+        val site: PlacedSite = site_placed(placements, placement_count, text_sec, enc.rows[i].text_offset);
+        enc.rows[i].sec         = site.sec;
+        enc.rows[i].text_offset = site.off;
+        i = i + 1;
+    }
+    # variable-location records re-home identically (the #1705 loclist producer reads
+    # the final (sec, text_offset) to bound each range).
+    var v: u32 = 0;
+    for (v < enc.varloc_count) {
+        val vsite: PlacedSite = site_placed(placements, placement_count, text_sec, enc.varlocs[v].text_offset);
+        enc.varlocs[v].sec         = vsite.sec;
+        enc.varlocs[v].text_offset = vsite.off;
+        v = v + 1;
+    }
+    # inline-instance transitions re-home identically (the #1707 inlined_subroutine
+    # producer reads the final (sec, text_offset) to bound each instance range).
+    var ip: u32 = 0;
+    for (ip < enc.inline_pc_count) {
+        val ipsite: PlacedSite = site_placed(placements, placement_count, text_sec, enc.inline_pcs[ip].text_offset);
+        enc.inline_pcs[ip].sec         = ipsite.sec;
+        enc.inline_pcs[ip].text_offset = ipsite.off;
+        ip = ip + 1;
+    }
 }
 
 # materialise every module global into the image
@@ -976,4 +1048,34 @@ fun is_f32_type(types: *type.IrTypeTable, id: type.IrTypeId) bool {
     if (O.is_none[*type.IrType](opt_type)) { ret false; }
     val t: *type.IrType = O.unwrap[*type.IrType](opt_type);
     ret t.kind == type.IRT_FLOAT && t.data.bits == 32;
+}
+
+# pack_rows re-homes each retained PC<->source row into its final section and offset
+# under `#[section(...)]` excision: a row inside the sectioned range moves to that
+# section at its section-relative offset, and a `.text` row after the excised range
+# shifts down by its length - the same site_placed mapping symbols use, so a row's
+# final offset matches the final `.text`
+test "mach.lang.be.codegen.pack_rows:rehomes_sectioned_and_text" {
+    var rows: [3]encode.LineRow;
+    rows[0].text_offset = 0;  rows[0].sec = 0; rows[0].loc = source.loc(1, 100);
+    rows[1].text_offset = 10; rows[1].sec = 0; rows[1].loc = source.loc(1, 200);
+    rows[2].text_offset = 20; rows[2].sec = 0; rows[2].loc = source.loc(1, 300);
+
+    var enc: encode.EncoderOutput;
+    enc.rows      = ?rows[0];
+    enc.row_count = 3;
+
+    # one sectioned function occupying the encoder blob range [8, 16), homed to section 5.
+    var pls: [1]SectionPlacement;
+    pls[0].text_start = 8; pls[0].text_end = 16; pls[0].sec = 5;
+
+    pack_rows(?enc, ?pls[0], 1, 1);
+
+    # blob 0: `.text`, nothing excised below -> section 1, offset unchanged.
+    if (enc.rows[0].sec != 1 || enc.rows[0].text_offset != 0)  { ret 1; }
+    # blob 10: inside [8, 16) -> section 5 at offset 10 - 8 = 2.
+    if (enc.rows[1].sec != 5 || enc.rows[1].text_offset != 2)  { ret 1; }
+    # blob 20: `.text` after the 8-byte excised range -> section 1 at offset 20 - 8 = 12.
+    if (enc.rows[2].sec != 1 || enc.rows[2].text_offset != 12) { ret 1; }
+    ret 0;
 }

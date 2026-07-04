@@ -45,11 +45,12 @@ val first: i64 = a[0];           # array index
 ```mach
 add(2, 3)
 identity[i64](42)               # generic call: type args in [ ]
-sum(3, 10i64, 20i64, 30i64)     # variadic (call site parses; see fun.md)
+sum(3, 10i64, 20i64, 30i64)     # variadic pack call (see variadics.md)
 ```
 
-Variadic call sites parse, but the callee-side `va_list` machinery is not
-yet implemented — see [fun.md](fun.md).
+A call to a pack-tailed function is monomorphized per distinct trailing
+type-list; `g(va...)` forwards a whole pack — see
+[variadics.md](variadics.md).
 
 For comptime parameters, the value is passed positionally like a runtime
 argument — the function signature determines whether it must be comptime:

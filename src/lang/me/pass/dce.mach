@@ -1,4 +1,4 @@
-# dead code elimination over the SSA IR.
+# dead code elimination over the SSA IR
 #
 # Two cooperating sweeps run on each non-extern function:
 #
@@ -27,13 +27,17 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
+use map: std.collections.map;
+
 use mach.lang.intern;
 use mach.lang.me.ir;
 use mach.lang.me.ir.builder;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.mutate;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
+use semtype: mach.lang.type;
 
 # sentinel for a removed block in the reachability compaction remap
 val BLOCK_GONE: u32 = 0xFFFFFFFF;
@@ -56,6 +60,29 @@ pub fun run(m: *ir.Module) R.Result[bool, str] {
         i = i + 1;
     }
     ret R.ok[bool, str](true);
+}
+
+# the erase context threaded to `dce_marked`: the per-instruction dead-flag array
+# and its length
+# ---
+# dead: per-instruction dead flags, indexed by InstructionId
+# ilen: length of `dead` and the in-range bound
+rec DceMarks {
+    dead: *bool;
+    ilen: u32;
+}
+
+# the erase predicate `erase_marked` drives: whether dce flagged `iid` dead
+#
+# An id at or beyond the dead map's range is conservatively kept.
+# ---
+# ctx: a *DceMarks (the dead-flag array and its length)
+# iid: the instruction id to test
+# ret: true when iid is flagged dead
+fun dce_marked(ctx: ptr, iid: id.InstructionId) bool {
+    val c: *DceMarks = ctx::*DceMarks;
+    if (iid::u32 >= c.ilen) { ret false; }
+    ret c.dead[iid::u32];
 }
 
 # value DCE for one function
@@ -157,19 +184,18 @@ fun value_dce(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
         }
     }
 
-    # drop the dead instructions from each block's instruction and phi lists.
-    i = 0;
-    for (i < fn.block_count) {
-        val blk: *ir.Block = ?fn.blocks[i];
-        blk.instr_count = compact_ids(blk.instructions, blk.instr_count, dead, ilen);
-        blk.phi_count   = compact_ids(blk.phis, blk.phi_count, dead, ilen);
-        i = i + 1;
-    }
+    # drop the dead instructions from every block's lists through the shared batch
+    # removal helper (the single free path; no private compaction).
+    var marks: DceMarks;
+    marks.dead = dead;
+    marks.ilen = ilen;
+    val marks_ptr: *DceMarks = ?marks;
+    val res_erase: R.Result[bool, str] = mutate.erase_marked(m, fn, marks_ptr::ptr, dce_marked);
 
     A.deallocate[u32](m.alloc, use_count, ilen::usize);
     A.deallocate[bool](m.alloc, dead, ilen::usize);
     A.deallocate[id.InstructionId](m.alloc, work, ilen::usize);
-    ret R.ok[bool, str](true);
+    ret res_erase;
 }
 
 # whether `inst` may be deleted once its result is unused
@@ -275,15 +301,20 @@ fun seed_if_dead(fn: *ir.Function, iid: id.InstructionId, use_count: *u32, dead:
 #
 # OP_BR's sole operand is a block; OP_CBR operand 0 is the condition value and
 # operands 1 and 2 are blocks; OP_PHI alternates [block, value, ...], so odd
-# slots are values.
+# slots are values. OP_DBG_VALUE's operand is a debug use, not a real one: it must
+# never keep an otherwise-dead value alive, or a `-g` build would drop fewer
+# instructions than a plain build and emit different code. When such a value is in
+# fact dropped, erase_marked salvages the debug value (rebasing it onto a surviving
+# value plus an expression, or marking it optimized out).
 # ---
 # inst: the instruction
 # o:    the operand slot
-# ret:  true when slot `o` is a value use
+# ret:  true when slot `o` is a value use that keeps its definition live
 fun operand_is_value_use(inst: *instruction.Instruction, o: u32) bool {
-    if (inst.kind == instruction.OP_BR)  { ret false; }
-    if (inst.kind == instruction.OP_CBR) { ret o == 0; }
-    if (inst.kind == instruction.OP_PHI) { ret (o % 2) == 1; }
+    if (inst.kind == instruction.OP_BR)        { ret false; }
+    if (inst.kind == instruction.OP_CBR)       { ret o == 0; }
+    if (inst.kind == instruction.OP_PHI)       { ret (o % 2) == 1; }
+    if (inst.kind == instruction.OP_DBG_VALUE) { ret false; }
     ret true;
 }
 
@@ -304,31 +335,6 @@ fun operand_instr_use(inst: *instruction.Instruction, o: u32, ilen: u32) O.Optio
     val def_id: u32 = op.data.instr::u32;
     if (def_id >= ilen) { ret O.none[u32](); }
     ret O.some[u32](def_id);
-}
-
-# compact an InstructionId list in place, dropping ids flagged dead
-#
-# An id outside the dead map's range is conservatively kept.
-# ---
-# ids:  the list to compact in place
-# len:  the list's current length
-# dead: per-instruction dead flags
-# ilen: the dead map's length (the in-range bound)
-# ret:  the compacted length
-fun compact_ids(ids: *id.InstructionId, len: u32, dead: *bool, ilen: u32) u32 {
-    var w: u32 = 0;
-    var r: u32 = 0;
-    for (r < len) {
-        val iid: id.InstructionId = ids[r];
-        var drop: bool = false;
-        if (iid::u32 < ilen) { drop = dead[iid::u32]; }
-        if (drop == false) {
-            ids[w] = iid;
-            w = w + 1;
-        }
-        r = r + 1;
-    }
-    ret w;
 }
 
 # reachability DCE for one function
@@ -569,7 +575,7 @@ fun prune_phis(fn: *ir.Function, blk: *ir.Block, remap: *u32) {
 }
 
 # an unused phi must be removed: a phi is not `is_pure`, so DCE must recognize it
-# as removable-when-unused rather than keeping it like a side-effecting op.
+# as removable-when-unused rather than keeping it like a side-effecting op
 test "mach.lang.me.pass.dce.run:unused_phi_removed" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -621,7 +627,7 @@ test "mach.lang.me.pass.dce.run:unused_phi_removed" {
 }
 
 # reachability DCE removes an unreachable block and prunes the phi incoming that
-# came from it.
+# came from it
 test "mach.lang.me.pass.dce.run:dead_block_and_phi_pruned" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -679,5 +685,66 @@ test "mach.lang.me.pass.dce.run:dead_block_and_phi_pruned" {
     val phi_id: id.InstructionId = fn.blocks[1].phis[0];
     val phi_inst: *instruction.Instruction = ?fn.instrs[phi_id];
     if (phi_inst.operand_count != 2) { ret 1; }
+    ret 0;
+}
+
+# a -g additivity regression (#1944): a dropped value's debug value must be salvaged
+# even when the function carries no DbgVar metadata for it -- the state the inliner
+# leaves after cloning a callee's OP_DBG_VALUE instructions but before its dbg-clone
+# attaches their metadata. erase_marked gates salvage on OP_DBG_VALUE presence, not on
+# dbg_vars length; keying it on the map length (the reverted behaviour) skips salvage
+# here and leaves the debug value dangling at the removed instruction.
+test "mach.lang.me.pass.dce.run:salvages_metadata_free_dbg_value" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    val res_module: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_module)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_module);
+
+    val res_i64: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64)) { ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
+
+    val res_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](res_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_entry));
+
+    val p0: value.Value = value.param(0, i64t);
+    val p1: value.Value = value.param(1, i64t);
+
+    # x = add(p0, p1) -- referenced only by the debug value, so DCE drops it.
+    val res_x: R.Result[value.Value, str] = builder.emit_add(?bld, p0, p1);
+    if (R.is_err[value.Value, str](res_x)) { ret 1; }
+    val x: value.Value = R.unwrap_ok[value.Value, str](res_x);
+
+    if (R.is_err[bool, str](builder.emit_dbg_value(?bld, x, intern.STR_NIL, i64t, semtype.TYPE_NIL, false, 0))) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?bld, p0))) { ret 1; }
+
+    # simulate an inlined debug-value clone: the OP_DBG_VALUE binds x but carries no
+    # DbgVar metadata (empty dbg_vars).
+    map.clear[id.InstructionId, ir.DbgVar](?fn.dbg_vars);
+
+    if (R.is_err[bool, str](run(?m))) { ret 1; }
+
+    # x is dropped; its debug value survives (not removable) and must be salvaged to the
+    # optimized-out null idiom, never left dangling at the removed instruction.
+    var found: bool = false;
+    var i: u32 = 0;
+    for (i < fn.instr_len) {
+        val ins: *instruction.Instruction = ?fn.instrs[i];
+        if (ins.kind == instruction.OP_DBG_VALUE) {
+            found = true;
+            if (ins.operands[0].kind != value.VAL_CONST_NULL) { ret 1; }
+        }
+        i = i + 1;
+    }
+    if (found == false) { ret 1; }
     ret 0;
 }

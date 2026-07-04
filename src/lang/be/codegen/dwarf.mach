@@ -1,0 +1,3677 @@
+# the shared, format-agnostic DWARF 5 debug-info producer
+#
+# Builds relocatable debug sections into the per-module `of.ObjectImage` through the
+# `be.obj` builder, alongside `pack_text`: `.debug_abbrev`, a `.debug_info` compile
+# unit with a `DW_TAG_subprogram` per function and a `DW_TAG_base_type` per primitive
+# return type, a `.debug_str` string table, and a DWARF 5 `.debug_line` program. It
+# speaks only the abstract object model - SK_DEBUG sections, anchor symbols, and
+# `RK_*` relocations - so the same bytes serve every container: the active `OfVTable`
+# writer maps the kinds and carries the sections, and no ELF/Mach-O knowledge lives
+# here. `be.codegen` calls `produce` when the build's `-g` switch is on and the
+# target's object format is DWARF-based.
+#
+# The line program is driven by the encoder's retained PC<->source rows (#1691),
+# resolved to file/line through `source.position`. Function ranges (low_pc/high_pc,
+# per-function `DW_LNE_set_address`) come from the `of.Symbol` marks the encoder
+# emitted; each subprogram's readable name and return type come from the `ir.Module`
+# (`Function.disp` / `Function.ret_sem`, #1703). Names are deduplicated through
+# `.debug_str` (`DW_FORM_strp`); addresses stay direct (`DW_FORM_addr`) with no
+# `.debug_addr`/`.debug_str_offsets` indirection.
+
+use std.system.panic.panic;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use enc:     mach.lang.be.codegen.encode;
+use obj:     mach.lang.be.obj;
+use ir:      mach.lang.me.ir;
+use ir_type: mach.lang.me.ir.type;
+use id:      mach.lang.me.ir.id;
+use intern:  mach.lang.intern;
+use session: mach.lang.session;
+use source:  mach.lang.source;
+use semtype: mach.lang.type;
+use generics: mach.lang.fe.sema.generics;
+use target:  mach.lang.target.resolved;
+use isa:     mach.lang.target.isa;
+use of:      mach.lang.target.of;
+use bin:     mach.lang.target.of.bin;
+
+use std.allocator.page;
+
+# DWARF tag, attribute, and form constants (DWARF 5)
+val DW_TAG_compile_unit:     u8 = 0x11;
+val DW_TAG_base_type:        u8 = 0x24;
+val DW_TAG_subprogram:       u8 = 0x2e;
+val DW_TAG_formal_parameter: u8 = 0x05;
+val DW_TAG_variable:         u8 = 0x34;
+val DW_TAG_inlined_subroutine: u8 = 0x1d;
+# composite / aggregate type DIEs (#1919): struct / union / array with member and
+# subrange children, and a typed pointer to a pointee DIE
+val DW_TAG_array_type:       u8 = 0x01;
+val DW_TAG_pointer_type:     u8 = 0x0f;
+val DW_TAG_member:           u8 = 0x0d;
+val DW_TAG_structure_type:   u8 = 0x13;
+val DW_TAG_union_type:       u8 = 0x17;
+val DW_TAG_subrange_type:    u8 = 0x21;
+val DW_CHILDREN_no:          u8 = 0x00;
+val DW_CHILDREN_yes:         u8 = 0x01;
+
+val DW_AT_name:       u8 = 0x03;
+val DW_AT_byte_size:  u8 = 0x0b;
+val DW_AT_stmt_list:  u8 = 0x10;
+val DW_AT_low_pc:     u8 = 0x11;
+val DW_AT_high_pc:    u8 = 0x12;
+val DW_AT_language:   u8 = 0x13;
+val DW_AT_comp_dir:   u8 = 0x1b;
+val DW_AT_producer:   u8 = 0x25;
+val DW_AT_encoding:   u8 = 0x3e;
+val DW_AT_external:   u8 = 0x3f;
+val DW_AT_frame_base: u8 = 0x40;
+val DW_AT_type:       u8 = 0x49;
+val DW_AT_location:   u8 = 0x02;
+val DW_AT_decl_file:  u8 = 0x3a;
+val DW_AT_decl_line:  u8 = 0x3b;
+val DW_AT_ranges:          u8 = 0x55;
+val DW_AT_abstract_origin: u8 = 0x31;
+val DW_AT_inline:          u8 = 0x20;
+val DW_AT_call_file:       u8 = 0x58;
+val DW_AT_call_line:       u8 = 0x59;
+# composite-type attributes (#1919): a member's byte offset within its enclosing
+# struct/union, and an array subrange's element count
+val DW_AT_data_member_location: u8 = 0x38;
+val DW_AT_count:                u8 = 0x37;
+
+# DW_AT_inline value: this subprogram is an abstract instance that was inlined (never
+# out-of-line here); its concrete expansions are DW_TAG_inlined_subroutine DIEs that
+# reference it by DW_AT_abstract_origin.
+val DW_INL_inlined:   u8 = 0x01;
+
+val DW_FORM_addr:       u8 = 0x01;
+val DW_FORM_data2:      u8 = 0x05;
+val DW_FORM_data8:      u8 = 0x07;
+val DW_FORM_string:     u8 = 0x08;
+val DW_FORM_data1:      u8 = 0x0b;
+val DW_FORM_flag:       u8 = 0x0c;
+val DW_FORM_ref4:       u8 = 0x13;
+val DW_FORM_udata:      u8 = 0x0f;
+val DW_FORM_strp:       u8 = 0x0e;
+val DW_FORM_exprloc:    u8 = 0x18;
+val DW_FORM_sec_offset: u8 = 0x17;
+
+# DWARF base-type encodings (DW_ATE_*)
+val DW_ATE_address:  u8 = 0x01;
+val DW_ATE_boolean:  u8 = 0x02;
+val DW_ATE_float:    u8 = 0x04;
+val DW_ATE_signed:   u8 = 0x05;
+val DW_ATE_unsigned: u8 = 0x07;
+
+# location-expression opcodes. a register location is DW_OP_reg0 + n (n < 32) or
+# DW_OP_regx + uleb(n); a frame-relative slot is DW_OP_fbreg + sleb(offset); a
+# register-plus-offset value is DW_OP_breg0 + n + sleb(offset). DW_OP_deref /
+# DW_OP_plus_uconst / DW_OP_constu / DW_OP_minus / DW_OP_stack_value recover a
+# salvaged value (operand +/- constant) and mark the result a value, not a location.
+# DWARF 5 location-list entry codes for `.debug_loclists`
+val DW_LLE_end_of_list:  u8 = 0x00;
+val DW_LLE_base_address: u8 = 0x06;
+val DW_LLE_offset_pair:  u8 = 0x04;
+
+# DWARF 5 range-list entry codes for `.debug_rnglists`; an inlined instance's
+# DW_AT_ranges names a list of DW_RLE_base_address (its enclosing function's low_pc)
+# then DW_RLE_offset_pair per contiguous `.text` extent, closed by DW_RLE_end_of_list
+val DW_RLE_end_of_list:  u8 = 0x00;
+val DW_RLE_base_address: u8 = 0x05;
+val DW_RLE_offset_pair:  u8 = 0x04;
+
+val DW_OP_reg0:        u8 = 0x50;
+val DW_OP_breg0:       u8 = 0x70;
+val DW_OP_regx:        u8 = 0x90;
+val DW_OP_fbreg:       u8 = 0x91;
+val DW_OP_deref:       u8 = 0x06;
+val DW_OP_plus_uconst: u8 = 0x23;
+val DW_OP_constu:      u8 = 0x10;
+val DW_OP_consts:      u8 = 0x11;
+val DW_OP_minus:       u8 = 0x1c;
+val DW_OP_stack_value: u8 = 0x9f;
+
+# DWARF 5 unit header: unit_type for a full compile unit
+val DW_UT_compile: u8 = 0x01;
+
+# source language: plain C, the most broadly-decodable value while the type system
+# has no dedicated DWARF language code
+val DW_LANG_C: u16 = 0x0002;
+
+# abbreviation codes: the CU DIE and its two child DIE shapes. A subprogram with a
+# primitive return type carries DW_AT_type; one without (void or a non-primitive
+# return, deferred to a later increment) uses the type-less shape
+val ABBREV_CU:              u8 = 0x01;
+val ABBREV_BASE_TYPE:       u8 = 0x02;
+val ABBREV_SUBPROGRAM:      u8 = 0x03;
+val ABBREV_SUBPROGRAM_VOID: u8 = 0x04;
+# a variable / formal parameter, with or without a DW_AT_location (a located
+# variable vs one whose value was optimized out). all carry name + type
+val ABBREV_VARIABLE:        u8 = 0x05;
+val ABBREV_VARIABLE_NOLOC:  u8 = 0x06;
+val ABBREV_PARAM:           u8 = 0x07;
+val ABBREV_PARAM_NOLOC:     u8 = 0x08;
+# a variable / parameter whose home changes across its range: DW_AT_location is a
+# DW_FORM_sec_offset into `.debug_loclists` (#1705) rather than an inline exprloc
+val ABBREV_VARIABLE_LOCLIST: u8 = 0x09;
+val ABBREV_PARAM_LOCLIST:    u8 = 0x0a;
+
+# inlining tier: an abstract-instance subprogram (name + DW_AT_inline, no code range) the
+# inlined_subroutine DIEs reference, and the two inlined_subroutine shapes -- a single
+# contiguous extent (low_pc/high_pc) or a range list (DW_AT_ranges into `.debug_rnglists`)
+val ABBREV_SUBPROGRAM_ABSTRACT: u8 = 0x0b;
+val ABBREV_INLINED:             u8 = 0x0c;
+val ABBREV_INLINED_RANGES:      u8 = 0x0d;
+# children-bearing shapes, used when an instance has nested inlines / (later) inlined locals
+val ABBREV_INLINED_KIDS:        u8 = 0x0e;
+val ABBREV_INLINED_RANGES_KIDS: u8 = 0x0f;
+# childless concrete subprograms: DW_CHILDREN_no variants of ABBREV_SUBPROGRAM /
+# ABBREV_SUBPROGRAM_VOID, selected when a subprogram emits no parameters, locals, or
+# inlined instances. advertising DW_CHILDREN_yes with no children trips llvm-dwarfdump
+# --verify (#1949)
+val ABBREV_SUBPROGRAM_LEAF:      u8 = 0x10;
+val ABBREV_SUBPROGRAM_VOID_LEAF: u8 = 0x11;
+# composite/aggregate type DIEs (#1919): a struct/union with member children, an array
+# with a subrange child, and a childless typed pointer. The *_LEAF struct/union variants
+# are DW_CHILDREN_no, for a memberless aggregate (an empty record) so it never advertises
+# children it lacks (the #1949 discipline)
+val ABBREV_STRUCT:      u8 = 0x12;
+val ABBREV_UNION:       u8 = 0x13;
+val ABBREV_MEMBER:      u8 = 0x14;
+val ABBREV_ARRAY:       u8 = 0x15;
+val ABBREV_SUBRANGE:    u8 = 0x16;
+val ABBREV_POINTER:     u8 = 0x17;
+val ABBREV_STRUCT_LEAF: u8 = 0x18;
+val ABBREV_UNION_LEAF:  u8 = 0x19;
+
+# DWARF 5 line-number program: standard opcodes, extended opcodes, and the tuned
+# special-opcode parameters this producer emits
+val DW_LNS_copy:         u8 = 0x01;
+val DW_LNS_advance_pc:   u8 = 0x02;
+val DW_LNS_advance_line: u8 = 0x03;
+val DW_LNS_set_file:     u8 = 0x04;
+
+val DW_LNE_end_sequence: u8 = 0x01;
+val DW_LNE_set_address:  u8 = 0x02;
+
+# DWARF 5 line-header content-type and form codes for the directory / file tables
+val DW_LNCT_path:            u8 = 0x1;
+val DW_LNCT_directory_index: u8 = 0x2;
+
+# line-program special-opcode tuning. line_base / line_range / opcode_base match the
+# common GNU choice so line deltas in [-5, 8] pack into one byte
+val LINE_BASE:   i32 = -5;
+val LINE_RANGE:  i32 = 14;
+val OPCODE_BASE: u8  = 13;
+
+# append an unsigned LEB128 value to `b`
+# ---
+# b: the byte buffer to append to
+# v: the value to encode
+fun uleb(b: *enc.ByteBuf, v: u64) {
+    var x: u64 = v;
+    var more: bool = true;
+    for (more) {
+        var byte: u8 = (x & 0x7F)::u8;
+        x = x >> 7;
+        if (x != 0) { byte = byte | 0x80; } or { more = false; }
+        enc.emit_byte(b, byte);
+    }
+}
+
+# append a signed LEB128 value to `b`
+# ---
+# b: the byte buffer to append to
+# v: the value to encode
+fun sleb(b: *enc.ByteBuf, v: i64) {
+    var x: i64 = v;
+    var more: bool = true;
+    for (more) {
+        var byte: u8 = (x & 0x7F)::u8;
+        x = x >> 7;
+        val sign: bool = (byte & 0x40) != 0;
+        if ((x == 0 && !sign) || (x == -1 && sign)) { more = false; }
+        or { byte = byte | 0x80; }
+        enc.emit_byte(b, byte);
+    }
+}
+
+# append a NUL-terminated string (DW_FORM_string) to `b`
+# ---
+# b: the byte buffer to append to
+# s: the string to append (its bytes then a 0)
+fun emit_cstr(b: *enc.ByteBuf, s: str) {
+    val n: usize = str_len(s);
+    var i: usize = 0;
+    for (i < n) { enc.emit_byte(b, s[i]); i = i + 1; }
+    enc.emit_byte(b, 0);
+}
+
+# resolve an interned StrId to its text, or "" when unavailable
+# ---
+# itn: interner backing the id
+# id:  the id to resolve
+# ret: the text, or the empty string
+fun resolve(itn: *intern.Interner, id: intern.StrId) str {
+    if (id == intern.STR_NIL) { ret ""; }
+    val o: O.Option[str] = intern.lookup(itn, id);
+    if (O.is_some[str](o)) { ret O.unwrap[str](o); }
+    ret "";
+}
+
+# a function's `.text` range and subprogram metadata, gathered from the encoder's
+# symbol marks and the IR module
+# ---
+# name:      interned function symbol name (the reloc target for its address)
+# offset:    byte offset of the function within `.text`
+# size:      byte length of the function body
+# weak:      true for a weak (monomorphized generic-instance) definition the linker
+#            deduplicates to a single winner across objects
+# disp:      readable source name for DW_AT_name, or STR_NIL to fall back to `name`
+# disp_off:  byte offset of the DW_AT_name string within `.debug_str`
+# external:  true when the symbol has global linkage (DW_AT_external)
+# decl_file: 0-based DWARF file index of the function's first row, or 0
+# decl_line: 1-based source line of the function's first row, or 0
+# ret_ty:    index into the type table for the return type, or -1 when the return is
+#            void or an unresolved type (no DW_AT_type)
+# var_start: index of this function's first variable in the shared var array
+# var_count: number of variables this function contributes
+rec DwFunc {
+    name:      intern.StrId;
+    offset:    u32;
+    size:      u32;
+    weak:      bool;
+    disp:      intern.StrId;
+    disp_off:  u32;
+    external:  bool;
+    decl_file: u32;
+    decl_line: u32;
+    ret_ty:    i32;
+    var_start: u32;
+    var_count: u32;
+}
+
+# a variable that lives in one place for its whole scope uses VLOC_REG / VLOC_FRAME /
+# VLOC_CONST / VLOC_NONE (an inline exprloc or no location); one that moves uses
+# VLOC_LOCLIST, and `loclist_off` names its entry in `.debug_loclists`
+val VLOC_LOCLIST: u8 = 3;
+
+# a variable's location kind. NONE = the value was optimized out (no DW_AT_location);
+# REG = live in a register (`reg` is its DWARF number); FRAME = a frame slot at
+# `offset` bytes from the frame base; CONST = a computed value (the variable IS a
+# compile-time constant, held in `offset`), emitted as DW_OP_const + DW_OP_stack_value
+val VLOC_NONE:  u8 = 0;
+val VLOC_REG:   u8 = 1;
+val VLOC_FRAME: u8 = 2;
+val VLOC_CONST: u8 = 4;
+
+# a source variable's DWARF DIE data, joined from the IR dbg-var identity and the
+# per-PC variable-location records. A DW_TAG_variable (or DW_TAG_formal_parameter)
+# references its type by ref4 and carries a DW_AT_location that is either an inline
+# single-location exprloc (VLOC_REG / VLOC_FRAME) or a DW_FORM_sec_offset into
+# `.debug_loclists` (VLOC_LOCLIST)
+# ---
+# name_off: DW_AT_name byte offset within `.debug_str`
+# ty:       type index (into the TypeCtx table) for DW_AT_type
+# is_param: true for a formal parameter, false for a local
+# loc_kind: VLOC_NONE / VLOC_REG / VLOC_FRAME / VLOC_LOCLIST
+# reg:      DWARF register number when loc_kind == VLOC_REG
+# offset:   frame-base offset when loc_kind == VLOC_FRAME
+# net:      signed constant the single-location salvage expression adds to the operand
+#           value (0 = identity); a non-zero net makes it a computed DW_OP_stack_value
+# range_start/range_count: when loc_kind == VLOC_LOCLIST, the variable's per-PC ranges
+#           in the shared LocRange array; each range carries its own home + expression
+# loclist_off: byte offset of this variable's `.debug_loclists` entry, set by
+#           build_loclists, patched into the DW_FORM_sec_offset field
+# byref:    true when the variable is a by-reference aggregate (struct / union / array):
+#           its OP_DBG_VALUE binds the storage POINTER (an aggregate value is its
+#           storage), so its home holds the aggregate's address, not its value, and the
+#           location reads through that address rather than naming it
+rec DwVar {
+    name_off:    u32;
+    ty:          i32;
+    is_param:    bool;
+    loc_kind:    u8;
+    reg:         i32;
+    offset:      i64;
+    net:         i64;
+    range_start: u32;
+    range_count: u32;
+    loclist_off: u32;
+    byref:       bool;
+    # the inline instance this variable belongs to (0 = the function's own body, else a
+    # 1-based inline-site id); the #1707 producer nests a non-zero one under its instance
+    inline_site: u32;
+}
+
+# one PC-range of a VLOC_LOCLIST variable: over `[start, end)` (absolute `.text` byte
+# offsets), the variable lives at the home `(kind, reg | off)` with salvage `net`. A
+# VLOC_NONE range is an optimized-out gap the loclist omits. Ranges derive from the
+# encoder's ordered variable-location records: binding i governs `[start_i, start_{i+1}
+# | fn_end)`. This is linear-order reasoning - see build_loclists on the range-fidelity
+# caveat it inherits from #1904
+# ---
+# start/end: absolute `.text` byte range this home governs
+# kind:      VLOC_NONE / VLOC_REG / VLOC_FRAME
+# reg:       DWARF register number when kind == VLOC_REG
+# off:       frame-base offset when kind == VLOC_FRAME
+# net:       salvage net constant (0 = identity)
+rec LocRange {
+    start: u32;
+    end:   u32;
+    kind:  u8;
+    reg:   i32;
+    off:   i64;
+    net:   i64;
+}
+
+# one inlined-subroutine instance, emitted as a DW_TAG_inlined_subroutine nested under
+# its enclosing subprogram (or parent instance). Its `.text` extents come from the
+# encoder's InlinePc transitions; a single contiguous extent uses DW_AT_low_pc /
+# DW_AT_high_pc, multiple extents use DW_AT_ranges into `.debug_rnglists`.
+# ---
+# func_idx:    index of the enclosing DwFunc (subprogram) in the subs array
+# callee:      inlined callee's symbol name (DW_AT_abstract_origin target)
+# origin_off:  `.debug_info` offset of the callee's abstract-instance subprogram DIE
+# call_file:   1-based DWARF file index of the call site (DW_AT_call_file)
+# call_line:   1-based source line of the call site (DW_AT_call_line)
+# parent:      enclosing instance's 1-based site id within the same function (0 = directly
+#              under the subprogram), for nested inlines
+# site_id:     this instance's 1-based ir inline-site id (matches InlinePc.inline_site)
+# range_start/range_count: this instance's extents in the shared DwInlineRange array
+# rnglist_off: byte offset of this instance's `.debug_rnglists` list (multi-extent only)
+rec DwInline {
+    func_idx:    u32;
+    callee:      intern.StrId;
+    origin_off:  u32;
+    call_file:   u32;
+    call_line:   u32;
+    parent:      u32;
+    site_id:     u32;
+    range_start: u32;
+    range_count: u32;
+    rnglist_off: u32;
+}
+
+# one contiguous `.text` extent `[start, end)` of an inlined instance (absolute byte
+# offsets, like LocRange)
+rec DwInlineRange {
+    start: u32;
+    end:   u32;
+}
+
+# whether two non-optimized-out homes name the same location. the single-location
+# tier keeps an inline exprloc only when every one of a variable's real bindings agrees
+# under this predicate; a disagreement makes the variable a VLOC_LOCLIST
+# ---
+# k1/r1/o1/n1: the first home (kind, reg, off, net)
+# k2/r2/o2/n2: the second home
+# ret:         true when they name the same location
+fun home_eq(k1: u8, r1: i32, o1: i64, n1: i64, k2: u8, r2: i32, o2: i64, n2: i64) bool {
+    if (k1 != k2) { ret false; }
+    if (k1 == VLOC_REG)   { ret r1 == r2 && n1 == n2; }
+    if (k1 == VLOC_FRAME) { ret o1 == o2 && n1 == n2; }
+    if (k1 == VLOC_CONST) { ret o1 + n1 == o2 + n2; }
+    ret true;
+}
+
+# a type DIE's shape kind. TK_BASE is a scalar (DW_TAG_base_type); the rest are
+# composites: TK_STRUCT / TK_UNION carry members, TK_ARRAY an element + count,
+# TK_POINTER a pointee. Every kind records its emitted DIE offset for ref4
+val TK_BASE:    u8 = 0;
+val TK_STRUCT:  u8 = 1;
+val TK_UNION:   u8 = 2;
+val TK_ARRAY:   u8 = 3;
+val TK_POINTER: u8 = 4;
+
+# one type DIE in the compile unit's type table. A scalar base type (TK_BASE) carries
+# `encoding` / `byte_size` and is deduplicated by source spelling; a composite carries
+# its structural links (element / pointee `elem`, array `count`, or the `[memb_start,
+# memb_start + memb_count)` member slice) and is deduplicated by semantic TypeId
+# ---
+# kind:       TK_* shape discriminator
+# off:        byte offset of the emitted DIE within `.debug_info`, for DW_FORM_ref4
+# sem:        semantic TypeId (composite dedup key; TYPE_NIL for a base type)
+# name:       source spelling (base dedup key; "" for an anonymous composite shape)
+# name_off:   byte offset of `name` within `.debug_str` (base + struct / union), else 0
+# encoding:   DW_ATE_* scalar encoding (TK_BASE)
+# byte_size:  width in bytes (base scalar width, or a composite's total size)
+# elem:       element (TK_ARRAY) or pointee (TK_POINTER) type index, else -1
+# count:      element count (TK_ARRAY)
+# memb_start/memb_count: the type's member slice in the shared TypeMember array
+rec TypeDie {
+    kind:       u8;
+    off:        u32;
+    sem:        semtype.TypeId;
+    name:       str;
+    name_off:   u32;
+    encoding:   u8;
+    byte_size:  u32;
+    elem:       i32;
+    count:      u32;
+    memb_start: u32;
+    memb_count: u32;
+}
+
+# one member of a TK_STRUCT / TK_UNION type DIE, emitted as a DW_TAG_member child
+# ---
+# name_off: byte offset of the member name within `.debug_str`
+# type_ix:  the member's type index in the TypeDie table (DW_AT_type ref4)
+# offset:   byte offset of the member within its aggregate (DW_AT_data_member_location)
+rec TypeMember {
+    name_off: u32;
+    type_ix:  u32;
+    offset:   u32;
+}
+
+# a deferred DW_FORM_ref4 patch within the type-DIE block: at `.debug_info` byte offset
+# `pos` write the CU-relative offset of type `target`. Type DIEs cross-reference each
+# other (a member / element / pointee), and a self-referential aggregate makes some of
+# those references forward, so their targets' offsets are only known after the whole
+# block is emitted
+# ---
+# pos:    absolute `.debug_info` byte offset of the 4-byte ref4 field
+# target: the referenced type's index in the TypeCtx table
+rec TypeFixup {
+    pos:    u32;
+    target: u32;
+}
+
+# the compile unit's growable type table: the distinct type DIEs it emits plus the
+# members of its aggregates. Base types dedup by spelling, composites by semantic
+# TypeId; both grow on demand so a large module never silently drops a type
+# ---
+# alloc:                 the allocator the arrays are owned through
+# types/ntypes/type_cap: the TypeDie array, its live count, and its capacity
+# membs/nmemb/memb_cap:  the TypeMember array, its live count, and its capacity
+rec TypeCtx {
+    alloc:    *A.Allocator;
+    types:    *TypeDie;
+    ntypes:   u32;
+    type_cap: u32;
+    membs:    *TypeMember;
+    nmemb:    u32;
+    memb_cap: u32;
+}
+
+# an initial, empty type context; the arrays allocate lazily on first insert
+# ---
+# alloc: the allocator its arrays are owned through
+# ret:   a zeroed context
+fun type_ctx_init(alloc: *A.Allocator) TypeCtx {
+    var tc: TypeCtx;
+    tc.alloc    = alloc;
+    tc.types    = nil;
+    tc.ntypes   = 0;
+    tc.type_cap = 0;
+    tc.membs    = nil;
+    tc.nmemb    = 0;
+    tc.memb_cap = 0;
+    ret tc;
+}
+
+# free a type context's arrays
+# ---
+# tc: the context to release
+fun type_ctx_dnit(tc: *TypeCtx) {
+    if (tc.types != nil) { A.deallocate[TypeDie](tc.alloc, tc.types, tc.type_cap::usize); tc.types = nil; }
+    if (tc.membs != nil) { A.deallocate[TypeMember](tc.alloc, tc.membs, tc.memb_cap::usize); tc.membs = nil; }
+}
+
+# ensure room for one more TypeDie, doubling capacity as needed. Returns false only on
+# an allocation failure (the caller degrades that type to no DIE rather than aborting)
+# ---
+# tc:  the context to grow
+# ret: true when a slot is available
+fun type_reserve(tc: *TypeCtx) bool {
+    if (tc.ntypes < tc.type_cap) { ret true; }
+    if (tc.type_cap == 0) {
+        val ra: R.Result[*TypeDie, str] = A.allocate[TypeDie](tc.alloc, 8::usize);
+        if (R.is_err[*TypeDie, str](ra)) { ret false; }
+        tc.types    = R.unwrap_ok[*TypeDie, str](ra);
+        tc.type_cap = 8;
+        ret true;
+    }
+    val new_cap: u32 = tc.type_cap * 2;
+    val rr: R.Result[*TypeDie, str] = A.reallocate[TypeDie](tc.alloc, tc.types, tc.type_cap::usize, new_cap::usize);
+    if (R.is_err[*TypeDie, str](rr)) { ret false; }
+    tc.types    = R.unwrap_ok[*TypeDie, str](rr);
+    tc.type_cap = new_cap;
+    ret true;
+}
+
+# ensure room for one more TypeMember, doubling capacity as needed. Returns false only
+# on an allocation failure
+# ---
+# tc:  the context to grow
+# ret: true when a slot is available
+fun memb_reserve(tc: *TypeCtx) bool {
+    if (tc.nmemb < tc.memb_cap) { ret true; }
+    if (tc.memb_cap == 0) {
+        val ra: R.Result[*TypeMember, str] = A.allocate[TypeMember](tc.alloc, 16::usize);
+        if (R.is_err[*TypeMember, str](ra)) { ret false; }
+        tc.membs    = R.unwrap_ok[*TypeMember, str](ra);
+        tc.memb_cap = 16;
+        ret true;
+    }
+    val new_cap: u32 = tc.memb_cap * 2;
+    val rr: R.Result[*TypeMember, str] = A.reallocate[TypeMember](tc.alloc, tc.membs, tc.memb_cap::usize, new_cap::usize);
+    if (R.is_err[*TypeMember, str](rr)) { ret false; }
+    tc.membs    = R.unwrap_ok[*TypeMember, str](rr);
+    tc.memb_cap = new_cap;
+    ret true;
+}
+
+# a compile-unit `.debug_str` string table: accumulates NUL-terminated strings,
+# deduplicated by content, and hands out each string's byte offset for DW_FORM_strp
+# ---
+# buf: the accumulated string bytes (owned by the caller's buffer)
+rec StrTab {
+    buf: enc.ByteBuf;
+}
+
+# find or append `s` in the string table, returning its byte offset. Deduplicates by
+# content so a repeated name is stored once
+# ---
+# st: the string table
+# s:  the string to intern
+# ret: the string's byte offset within `.debug_str`
+fun str_off(st: *StrTab, s: str) u32 {
+    # scan existing NUL-terminated entries for an exact match.
+    var i: usize = 0;
+    for (i < st.buf.len) {
+        val start: usize = i;
+        for (i < st.buf.len && st.buf.data[i] != 0) { i = i + 1; }
+        if (bytes_eq_str(?st.buf, start, i, s)) { ret start::u32; }
+        i = i + 1;   # skip the NUL
+    }
+    val off: u32 = st.buf.len::u32;
+    emit_cstr(?st.buf, s);
+    ret off;
+}
+
+# true when `b[start..end)` equals the bytes of `s` (both exclusive of any NUL)
+# ---
+# b:     the byte buffer
+# start: inclusive start offset in `b`
+# end:   exclusive end offset in `b`
+# s:     the string to compare against
+fun bytes_eq_str(b: *enc.ByteBuf, start: usize, end: usize, s: str) bool {
+    val n: usize = str_len(s);
+    if (end - start != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (b.data[start + i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the target of a `.debug_info` relocation recorded while the DIEs are emitted
+# ---
+# IRLT_SYM: the reloc targets the carried symbol name (a function's low_pc)
+# IRLT_STR: the reloc targets the module's `.debug_str` anchor, `addend` bytes in
+# IRLT_LOCLIST: the reloc targets the module's `.debug_loclists` anchor, `addend`
+#           bytes in (a variable's DW_FORM_sec_offset location-list pointer)
+val IRLT_SYM:     u8 = 0;
+val IRLT_STR:     u8 = 1;
+val IRLT_LOCLIST: u8 = 2;
+# IRLT_RNGLIST: the reloc targets the module's `.debug_rnglists` anchor, `addend`
+#           bytes in (an inlined_subroutine's DW_AT_ranges DW_FORM_sec_offset pointer)
+val IRLT_RNGLIST: u8 = 3;
+
+# one deferred `.debug_info` relocation. `build_info` records the patch sites as it
+# writes strp / addr fields whose targets are section anchors or function symbols;
+# `install` resolves and attaches them once the anchor symbol exists
+# ---
+# off:    patch-site byte offset within `.debug_info`
+# kind:   abstract relocation kind (RK_ABS32 for strp, RK_ABS64 for addr)
+# target: IRLT_SYM (use `sym`) or IRLT_STR (the `.debug_str` anchor)
+# sym:    target symbol name when `target` is IRLT_SYM
+# addend: byte offset added to the target (a string's offset for IRLT_STR)
+rec InfoReloc {
+    off:    u32;
+    kind:   of.RelocKind;
+    target: u8;
+    sym:    intern.StrId;
+    addend: i64;
+}
+
+# append a relocation record to the growing list
+# ---
+# list:   the InfoReloc array
+# count:  in/out - current length, incremented
+# off/kind/target/sym/addend: the record fields
+fun push_info_reloc(list: *InfoReloc, count: *u32, off: u32, kind: of.RelocKind,
+                    target: u8, sym: intern.StrId, addend: i64) {
+    list[@count].off    = off;
+    list[@count].kind   = kind;
+    list[@count].target = target;
+    list[@count].sym    = sym;
+    list[@count].addend = addend;
+    @count = @count + 1;
+}
+
+# one deferred `.debug_loclists` relocation: a DW_LLE_base_address address field is
+# relocated to its variable's owning function symbol (RK_ABS64, no addend), so the
+# following DW_LLE_offset_pair ranges are relative to the function's low_pc
+# ---
+# off: patch-site byte offset within `.debug_loclists`
+# sym: target function symbol name
+rec LocReloc {
+    off: u32;
+    sym: intern.StrId;
+}
+
+# append a `.debug_loclists` base-address relocation to the growing list
+# ---
+# list:  the LocReloc array
+# count: in/out - current length, incremented
+# off:   patch-site offset within `.debug_loclists`
+# sym:   target function symbol name
+fun push_loc_reloc(list: *LocReloc, count: *u32, off: u32, sym: intern.StrId) {
+    list[@count].off = off;
+    list[@count].sym = sym;
+    @count = @count + 1;
+}
+
+# one `.debug_rnglists` base-address relocation: a DW_RLE_base_address address field
+# resolves to the enclosing function symbol, so an instance's offset-pair ranges are
+# relative to that function's low_pc (identical shape to LocReloc).
+# ---
+# off: patch-site byte offset within `.debug_rnglists`
+# sym: enclosing function symbol name
+rec RngReloc {
+    off: u32;
+    sym: intern.StrId;
+}
+
+# append a `.debug_rnglists` base-address relocation to the growing list
+fun push_rng_reloc(list: *RngReloc, count: *u32, off: u32, sym: intern.StrId) {
+    list[@count].off = off;
+    list[@count].sym = sym;
+    @count = @count + 1;
+}
+
+# the source spelling of a primitive semantic TypeKind, or "" for a non-primitive
+# ---
+# kind: the semantic TypeKind
+fun prim_name(kind: semtype.TypeKind) str {
+    if (kind == semtype.TYPE_U8)  { ret "u8"; }
+    or (kind == semtype.TYPE_U16) { ret "u16"; }
+    or (kind == semtype.TYPE_U32) { ret "u32"; }
+    or (kind == semtype.TYPE_U64) { ret "u64"; }
+    or (kind == semtype.TYPE_I8)  { ret "i8"; }
+    or (kind == semtype.TYPE_I16) { ret "i16"; }
+    or (kind == semtype.TYPE_I32) { ret "i32"; }
+    or (kind == semtype.TYPE_I64) { ret "i64"; }
+    or (kind == semtype.TYPE_F32) { ret "f32"; }
+    or (kind == semtype.TYPE_F64) { ret "f64"; }
+    or (kind == semtype.TYPE_PTR) { ret "ptr"; }
+    ret "";
+}
+
+# resolve a semantic type to its DWARF base type DIE (a TK_BASE TypeDie: name /
+# encoding / byte_size), or none when the type is void, unresolved, or not a primitive
+# scalar. A raw `ptr` is a base type; a typed pointer / record / array is a composite
+# handled by `type_intern`
+# ---
+# s:            session, for the semantic type universe
+# tid:          the semantic TypeId
+# address_size: target pointer width, used for the raw `ptr` byte size
+# ret:          the base type DIE (off / name_off unset), or none
+fun sem_base_type(s: *session.Session, tid: semtype.TypeId, address_size: u8) O.Option[TypeDie] {
+    if (tid == semtype.TYPE_NIL || tid == semtype.TYPE_ERROR) { ret O.none[TypeDie](); }
+    val to: O.Option[*semtype.Type] = semtype.get(?s.types, tid);
+    if (O.is_none[*semtype.Type](to)) { ret O.none[TypeDie](); }
+    val kind: semtype.TypeKind = O.unwrap[*semtype.Type](to).kind;
+    val d: semtype.PrimDesc = semtype.prim_desc(kind);
+    if (d.class == semtype.PRIM_CLASS_NONE) { ret O.none[TypeDie](); }
+
+    var bt: TypeDie;
+    bt.kind       = TK_BASE;
+    bt.name       = prim_name(kind);
+    bt.sem        = semtype.TYPE_NIL;
+    bt.off        = 0;
+    bt.name_off   = 0;
+    bt.elem       = -1;
+    bt.count      = 0;
+    bt.memb_start = 0;
+    bt.memb_count = 0;
+    if (d.class == semtype.PRIM_CLASS_FLOAT) {
+        bt.encoding  = DW_ATE_float;
+        bt.byte_size = (d.bits / 8)::u32;
+    } or (d.class == semtype.PRIM_CLASS_PTR) {
+        bt.encoding  = DW_ATE_address;
+        bt.byte_size = address_size::u32;
+    } or {
+        if (d.signed) { bt.encoding = DW_ATE_signed; } or { bt.encoding = DW_ATE_unsigned; }
+        bt.byte_size = (d.bits / 8)::u32;
+    }
+    ret O.some[TypeDie](bt);
+}
+
+# bridge a semantic type to its IR type, the single layout authority for aggregate DIEs
+# (member byte offsets / struct sizes). Mirrors the front end's `lower_type` structural
+# mapping; because the IR type interners deduplicate, this lands on the exact type
+# lowering already produced (a lookup in practice - every reachable type was lowered)
+# rather than a new one, so DWARF member offsets come from the same layout that emitted
+# the code. IR pointers are opaque, so this never recurses through one (it terminates)
+# ---
+# s:     session (semantic type universe, align overrides, allocator)
+# irmod: the IR module whose type universe is consulted
+# sem:   the semantic TypeId to bridge
+# ret:   the corresponding IrTypeId, or an allocation error
+fun sem_to_ir(s: *session.Session, irmod: *ir.Module, sem: semtype.TypeId) R.Result[ir_type.IrTypeId, str] {
+    if (sem == semtype.TYPE_NIL) { ret ir_type.intern_void(?irmod.types); }
+    val to: O.Option[*semtype.Type] = semtype.get(?s.types, sem);
+    if (O.is_none[*semtype.Type](to)) { ret ir_type.intern_void(?irmod.types); }
+    val t: *semtype.Type = O.unwrap[*semtype.Type](to);
+    val k: semtype.TypeKind = t.kind;
+
+    # secrecy has no runtime representation: `^T` bridges to exactly `T`'s shape.
+    if (k == semtype.TYPE_SECRET) { ret sem_to_ir(s, irmod, t.data.secret.base); }
+
+    val d: semtype.PrimDesc = semtype.prim_desc(k);
+    if (d.class == semtype.PRIM_CLASS_INT)   { ret ir_type.intern_int(?irmod.types, d.bits); }
+    if (d.class == semtype.PRIM_CLASS_FLOAT) { ret ir_type.intern_float(?irmod.types, d.bits); }
+    if (d.class == semtype.PRIM_CLASS_PTR)   { ret ir_type.intern_ptr(?irmod.types); }
+    if (k == semtype.TYPE_POINTER)           { ret ir_type.intern_ptr(?irmod.types); }
+
+    if (k == semtype.TYPE_ARRAY) {
+        # capture element + count before recursing: bridging the element can materialize a
+        # generic instance's field table (ensure_fields), reallocating s.types and dangling
+        # `t` - so a post-recursion `t.data.array.count` would read freed memory.
+        val ebase: semtype.TypeId = t.data.array.base;
+        val ecount: u32 = t.data.array.count;
+        val rb: R.Result[ir_type.IrTypeId, str] = sem_to_ir(s, irmod, ebase);
+        if (R.is_err[ir_type.IrTypeId, str](rb)) { ret rb; }
+        ret ir_type.intern_array(?irmod.types, R.unwrap_ok[ir_type.IrTypeId, str](rb), ecount);
+    }
+
+    if (k == semtype.TYPE_REC || k == semtype.TYPE_UNI || k == semtype.TYPE_INSTANCE) {
+        ret sem_to_ir_nominal(s, irmod, sem, k == semtype.TYPE_UNI);
+    }
+
+    # function / generic-param / error types bridge to an opaque pointer-width slot, as
+    # `lower_type` does, so a variable of such a type still sizes correctly.
+    ret ir_type.intern_ptr(?irmod.types);
+}
+
+# bridge a nominal (rec / uni) or generic instance to an IR struct / union of its lowered
+# field types, read from the session-global field store - the same source `lower_nominal`
+# uses, so the interned layout matches
+# ---
+# s:        session
+# irmod:    the IR module
+# tid:      the nominal / instance semantic TypeId
+# is_union: bridge to an IR union rather than a struct
+# ret:      the IrTypeId, or an allocation error
+fun sem_to_ir_nominal(s: *session.Session, irmod: *ir.Module, tid: semtype.TypeId, is_union: bool) R.Result[ir_type.IrTypeId, str] {
+    # materialize a generic instance's substituted field table before reading it, exactly
+    # as lower_type does; a no-op for a non-instance or an already-built table.
+    generics.ensure_fields(s, tid);
+
+    var nom_align: u32 = 0;
+    val ta: O.Option[u32] = session.type_align(s, tid::u32);
+    if (O.is_some[u32](ta)) { nom_align = O.unwrap[u32](ta); }
+
+    val fields_len: u32 = semtype.field_count(?s.types, tid);
+    if (fields_len == 0) {
+        if (is_union) { ret ir_type.intern_union(?irmod.types, nil, 0, nom_align); }
+        ret ir_type.intern_struct(?irmod.types, nil, 0, nom_align);
+    }
+
+    val rbuf: R.Result[*ir_type.IrTypeId, str] = A.allocate[ir_type.IrTypeId](s.alloc, fields_len::usize);
+    if (R.is_err[*ir_type.IrTypeId, str](rbuf)) { ret R.err[ir_type.IrTypeId, str](R.unwrap_err[*ir_type.IrTypeId, str](rbuf)); }
+    val buf: *ir_type.IrTypeId = R.unwrap_ok[*ir_type.IrTypeId, str](rbuf);
+
+    var i: u32 = 0;
+    for (i < fields_len) {
+        val fe: O.Option[*semtype.FieldEntry] = semtype.field_at(?s.types, tid, i);
+        if (O.is_none[*semtype.FieldEntry](fe)) {
+            A.deallocate[ir_type.IrTypeId](s.alloc, buf, fields_len::usize);
+            ret R.err[ir_type.IrTypeId, str]("dwarf.sem_to_ir: corrupt field table");
+        }
+        val rf: R.Result[ir_type.IrTypeId, str] = sem_to_ir(s, irmod, O.unwrap[*semtype.FieldEntry](fe).ty);
+        if (R.is_err[ir_type.IrTypeId, str](rf)) {
+            A.deallocate[ir_type.IrTypeId](s.alloc, buf, fields_len::usize);
+            ret rf;
+        }
+        buf[i] = R.unwrap_ok[ir_type.IrTypeId, str](rf);
+        i = i + 1;
+    }
+
+    var res: R.Result[ir_type.IrTypeId, str];
+    if (is_union) { res = ir_type.intern_union(?irmod.types, buf, fields_len, nom_align); }
+    or            { res = ir_type.intern_struct(?irmod.types, buf, fields_len, nom_align); }
+    A.deallocate[ir_type.IrTypeId](s.alloc, buf, fields_len::usize);
+    ret res;
+}
+
+# the frame-base DWARF register number for the target, read through the ISA's
+# `dwarf_reg` hook (#1693) mapping the physical frame pointer to its DWARF number.
+# DWARF-based targets always wire the hook, so this is defined for every arch that
+# reaches the producer
+#
+# A subprogram's DW_AT_frame_base is `DW_OP_reg<this>`, so `-g` debug info relies on
+# a retained frame pointer (the epic pins one instead of emitting CFI). The back end
+# always emits the rbp/x29/s0 prologue today; a future frame-pointer-omission
+# optimization must stay disabled under `session.debug` or DW_AT_fbreg locations and
+# `DW_AT_frame_base` would point at a clobbered register.
+# ---
+# tgt: the resolved target
+# ret: the frame pointer's DWARF register number
+fun frame_base_reg(tgt: *target.Target) i32 {
+    val f: isa.DwarfRegFn = tgt.arch.dwarf_reg::isa.DwarfRegFn;
+    ret f(tgt.arch.frame_ptr_reg);
+}
+
+# the largest number of distinct source files a compile unit's file table holds
+# before the producer bails; a single translation unit references few files
+val MAX_FILES: u32 = 256;
+
+# a compile unit's source-file table, mapping the encoder rows' `source.FileId`s to
+# 0-based DWARF file indices in first-seen order
+# ---
+# ids:   the distinct FileIds, in first-seen order (dwarf index = array index)
+# count: number of files
+rec FileTable {
+    ids:   [256]source.FileId;
+    count: u32;
+}
+
+# find or append `id` in the file table, returning its 0-based DWARF file index, or
+# -1 when the table is full
+# ---
+# ft: the file table to search / grow
+# id: the FileId to intern into the table
+# ret: the 0-based dwarf file index, or -1 on overflow
+fun file_index(ft: *FileTable, id: source.FileId) i32 {
+    var i: u32 = 0;
+    for (i < ft.count) {
+        if (ft.ids[i] == id) { ret i::i32; }
+        i = i + 1;
+    }
+    if (ft.count >= MAX_FILES) { ret -1; }
+    ft.ids[ft.count] = id;
+    ft.count = ft.count + 1;
+    ret (ft.count - 1)::i32;
+}
+
+# copy a byte buffer's contents into a fresh image-owned, exactly-sized allocation
+# (the object builder frees a section's bytes by its length, so an over-allocated
+# ByteBuf cannot be handed over directly)
+# ---
+# alloc: allocator the image owns the result through
+# b:     the buffer to copy out
+# ret:   an exactly `b.len`-sized copy, or an allocation error
+fun copy_exact(alloc: *A.Allocator, b: *enc.ByteBuf) R.Result[*u8, str] {
+    if (b.len == 0) { ret R.ok[*u8, str](nil); }
+    val r: R.Result[*u8, str] = A.allocate[u8](alloc, b.len);
+    if (R.is_err[*u8, str](r)) { ret r; }
+    val out: *u8 = R.unwrap_ok[*u8, str](r);
+    var i: usize = 0;
+    for (i < b.len) { out[i] = b.data[i]; i = i + 1; }
+    ret R.ok[*u8, str](out);
+}
+
+# add a SK_DEBUG section holding `b`'s bytes to the image and return its index
+# ---
+# image: the object image to append to
+# name:  interned section name (".debug_abbrev" etc.)
+# b:     the built section bytes (copied out exactly)
+# ret:   the new section index, or an allocation error
+fun add_debug_section(image: *of.ObjectImage, name: intern.StrId, b: *enc.ByteBuf) R.Result[u32, str] {
+    val rb: R.Result[*u8, str] = copy_exact(image.alloc, b);
+    if (R.is_err[*u8, str](rb)) { ret R.err[u32, str](R.unwrap_err[*u8, str](rb)); }
+    var sec: of.Section;
+    sec.name  = name;
+    sec.kind  = of.SK_DEBUG;
+    sec.bytes = R.unwrap_ok[*u8, str](rb);
+    sec.len   = b.len::u32;
+    sec.align = 1;
+    ret obj.add_section(image, sec);
+}
+
+# emit one abbreviation attribute spec pair (attribute code, form code)
+# ---
+# b:    the abbrev buffer
+# at:   the DW_AT_* attribute code
+# form: the DW_FORM_* form code
+fun emit_attr(b: *enc.ByteBuf, at: u8, form: u8) {
+    uleb(b, at::u64);
+    uleb(b, form::u64);
+}
+
+# build the `.debug_abbrev` table: the compile-unit DIE (now with children), a base
+# type, and the subprogram shapes (with / without a return type, each in a
+# children-bearing and a childless-leaf form), matching the DIEs `build_info` emits.
+# The table is identical for every module, so a CU's
+# `debug_abbrev_offset` of 0 is correct even after the linker concatenates each
+# object's `.debug_abbrev`
+# ---
+# b: the buffer the abbrev bytes are appended to
+fun build_abbrev(b: *enc.ByteBuf) {
+    # compile unit (has children).
+    uleb(b, ABBREV_CU::u64);
+    uleb(b, DW_TAG_compile_unit::u64);
+    enc.emit_byte(b, DW_CHILDREN_yes);
+    emit_attr(b, DW_AT_producer, DW_FORM_string);
+    emit_attr(b, DW_AT_name,     DW_FORM_string);
+    emit_attr(b, DW_AT_comp_dir, DW_FORM_string);
+    emit_attr(b, DW_AT_language, DW_FORM_data2);
+    emit_attr(b, DW_AT_low_pc,   DW_FORM_addr);
+    emit_attr(b, DW_AT_high_pc,  DW_FORM_data8);
+    emit_attr(b, DW_AT_stmt_list, DW_FORM_sec_offset);
+    uleb(b, 0); uleb(b, 0);
+
+    # base type: name (strp), encoding, byte_size.
+    uleb(b, ABBREV_BASE_TYPE::u64);
+    uleb(b, DW_TAG_base_type::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_name,      DW_FORM_strp);
+    emit_attr(b, DW_AT_encoding,  DW_FORM_data1);
+    emit_attr(b, DW_AT_byte_size, DW_FORM_data1);
+    uleb(b, 0); uleb(b, 0);
+
+    # subprogram with a return type.
+    build_subprogram_abbrev(b, ABBREV_SUBPROGRAM, true, true);
+    # subprogram without a return type (void or non-primitive return).
+    build_subprogram_abbrev(b, ABBREV_SUBPROGRAM_VOID, false, true);
+
+    # variable / formal parameter, located and no-location shapes.
+    build_var_abbrev(b, ABBREV_VARIABLE,       DW_TAG_variable,         true);
+    build_var_abbrev(b, ABBREV_VARIABLE_NOLOC, DW_TAG_variable,         false);
+    build_var_abbrev(b, ABBREV_PARAM,          DW_TAG_formal_parameter, true);
+    build_var_abbrev(b, ABBREV_PARAM_NOLOC,    DW_TAG_formal_parameter, false);
+
+    # variable / formal parameter whose home moves: DW_AT_location is a sec_offset
+    # location-list pointer into `.debug_loclists`.
+    build_var_loclist_abbrev(b, ABBREV_VARIABLE_LOCLIST, DW_TAG_variable);
+    build_var_loclist_abbrev(b, ABBREV_PARAM_LOCLIST,    DW_TAG_formal_parameter);
+
+    # abstract-instance subprogram: name (strp) + DW_AT_inline (data1), no code range and
+    # (this tier) no children; the dbg-clone increment gives it abstract locals + children.
+    uleb(b, ABBREV_SUBPROGRAM_ABSTRACT::u64);
+    uleb(b, DW_TAG_subprogram::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_name,   DW_FORM_strp);
+    emit_attr(b, DW_AT_inline, DW_FORM_data1);
+    uleb(b, 0); uleb(b, 0);
+
+    # inlined_subroutine, contiguous / range-list shapes, each in a leaf and a
+    # children-bearing form (children = nested inlines and, later, inlined locals).
+    build_inlined_abbrev(b, ABBREV_INLINED,             false, false);
+    build_inlined_abbrev(b, ABBREV_INLINED_RANGES,      true,  false);
+    build_inlined_abbrev(b, ABBREV_INLINED_KIDS,        false, true);
+    build_inlined_abbrev(b, ABBREV_INLINED_RANGES_KIDS, true,  true);
+
+    # childless concrete subprograms: DW_CHILDREN_no variants of the two above, for a
+    # subprogram that emits no parameters, locals, or inlined instances (#1949).
+    build_subprogram_abbrev(b, ABBREV_SUBPROGRAM_LEAF,      true,  false);
+    build_subprogram_abbrev(b, ABBREV_SUBPROGRAM_VOID_LEAF, false, false);
+
+    # composite type DIEs (#1919). struct / union carry a name + byte size and hold
+    # DW_TAG_member children; a member names its type (ref4) and byte offset. an array
+    # names its element type and holds a DW_TAG_subrange child carrying the element count.
+    # a typed pointer names its pointee (ref4) and pointer width.
+    uleb(b, ABBREV_STRUCT::u64);
+    uleb(b, DW_TAG_structure_type::u64);
+    enc.emit_byte(b, DW_CHILDREN_yes);
+    emit_attr(b, DW_AT_name,      DW_FORM_strp);
+    emit_attr(b, DW_AT_byte_size, DW_FORM_udata);
+    uleb(b, 0); uleb(b, 0);
+
+    uleb(b, ABBREV_UNION::u64);
+    uleb(b, DW_TAG_union_type::u64);
+    enc.emit_byte(b, DW_CHILDREN_yes);
+    emit_attr(b, DW_AT_name,      DW_FORM_strp);
+    emit_attr(b, DW_AT_byte_size, DW_FORM_udata);
+    uleb(b, 0); uleb(b, 0);
+
+    uleb(b, ABBREV_MEMBER::u64);
+    uleb(b, DW_TAG_member::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_name,                 DW_FORM_strp);
+    emit_attr(b, DW_AT_type,                 DW_FORM_ref4);
+    emit_attr(b, DW_AT_data_member_location, DW_FORM_udata);
+    uleb(b, 0); uleb(b, 0);
+
+    uleb(b, ABBREV_ARRAY::u64);
+    uleb(b, DW_TAG_array_type::u64);
+    enc.emit_byte(b, DW_CHILDREN_yes);
+    emit_attr(b, DW_AT_type, DW_FORM_ref4);
+    uleb(b, 0); uleb(b, 0);
+
+    uleb(b, ABBREV_SUBRANGE::u64);
+    uleb(b, DW_TAG_subrange_type::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_count, DW_FORM_udata);
+    uleb(b, 0); uleb(b, 0);
+
+    uleb(b, ABBREV_POINTER::u64);
+    uleb(b, DW_TAG_pointer_type::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_type,      DW_FORM_ref4);
+    emit_attr(b, DW_AT_byte_size, DW_FORM_udata);
+    uleb(b, 0); uleb(b, 0);
+
+    # the DW_CHILDREN_no struct / union variants for a memberless aggregate (an empty
+    # record), so it never advertises children it lacks (#1949).
+    uleb(b, ABBREV_STRUCT_LEAF::u64);
+    uleb(b, DW_TAG_structure_type::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_name,      DW_FORM_strp);
+    emit_attr(b, DW_AT_byte_size, DW_FORM_udata);
+    uleb(b, 0); uleb(b, 0);
+
+    uleb(b, ABBREV_UNION_LEAF::u64);
+    uleb(b, DW_TAG_union_type::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_name,      DW_FORM_strp);
+    emit_attr(b, DW_AT_byte_size, DW_FORM_udata);
+    uleb(b, 0); uleb(b, 0);
+
+    uleb(b, 0);   # null abbrev code terminates the table
+}
+
+# emit one DW_TAG_inlined_subroutine abbreviation. `ranges` selects DW_AT_ranges
+# (sec_offset into `.debug_rnglists`) for a non-contiguous instance, else an inline
+# DW_AT_low_pc / DW_AT_high_pc pair. `kids` selects DW_CHILDREN_yes (nested inlines /
+# inlined locals) over a leaf shape.
+# ---
+# b:      the abbrev buffer
+# code:   the abbreviation code
+# ranges: true for the DW_AT_ranges shape, false for the low_pc/high_pc shape
+# kids:   true for DW_CHILDREN_yes
+fun build_inlined_abbrev(b: *enc.ByteBuf, code: u8, ranges: bool, kids: bool) {
+    uleb(b, code::u64);
+    uleb(b, DW_TAG_inlined_subroutine::u64);
+    if (kids) { enc.emit_byte(b, DW_CHILDREN_yes); }
+    or        { enc.emit_byte(b, DW_CHILDREN_no); }
+    emit_attr(b, DW_AT_abstract_origin, DW_FORM_ref4);
+    if (ranges) {
+        emit_attr(b, DW_AT_ranges,  DW_FORM_sec_offset);
+    }
+    or {
+        emit_attr(b, DW_AT_low_pc,  DW_FORM_addr);
+        emit_attr(b, DW_AT_high_pc, DW_FORM_data8);
+    }
+    emit_attr(b, DW_AT_call_file, DW_FORM_udata);
+    emit_attr(b, DW_AT_call_line, DW_FORM_udata);
+    uleb(b, 0); uleb(b, 0);
+}
+
+# emit one subprogram abbreviation. Shared by the with-return and void shapes (which
+# differ only in the trailing DW_AT_type) and by their childless-leaf variants (which
+# differ only in the DW_CHILDREN flag)
+# ---
+# b:        the abbrev buffer
+# code:     the abbreviation code
+# has_type: true to append DW_AT_type (DW_FORM_ref4)
+# kids:     true for DW_CHILDREN_yes (params/locals/inlines), false for a childless leaf
+fun build_subprogram_abbrev(b: *enc.ByteBuf, code: u8, has_type: bool, kids: bool) {
+    uleb(b, code::u64);
+    uleb(b, DW_TAG_subprogram::u64);
+    if (kids) { enc.emit_byte(b, DW_CHILDREN_yes); } or { enc.emit_byte(b, DW_CHILDREN_no); }
+    emit_attr(b, DW_AT_name,       DW_FORM_strp);
+    emit_attr(b, DW_AT_low_pc,     DW_FORM_addr);
+    emit_attr(b, DW_AT_high_pc,    DW_FORM_data8);
+    emit_attr(b, DW_AT_external,   DW_FORM_flag);
+    emit_attr(b, DW_AT_decl_file,  DW_FORM_udata);
+    emit_attr(b, DW_AT_decl_line,  DW_FORM_udata);
+    emit_attr(b, DW_AT_frame_base, DW_FORM_exprloc);
+    if (has_type) { emit_attr(b, DW_AT_type, DW_FORM_ref4); }
+    uleb(b, 0); uleb(b, 0);
+}
+
+# emit one variable / formal-parameter abbreviation: name (strp), type (ref4), and -
+# for the located shape - a location (exprloc). the no-location shape omits it (the
+# variable's value was optimized out)
+# ---
+# b:       the abbrev buffer
+# code:    the abbreviation code
+# tag:     DW_TAG_variable or DW_TAG_formal_parameter
+# has_loc: true to append DW_AT_location (DW_FORM_exprloc)
+fun build_var_abbrev(b: *enc.ByteBuf, code: u8, tag: u8, has_loc: bool) {
+    uleb(b, code::u64);
+    uleb(b, tag::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_name, DW_FORM_strp);
+    emit_attr(b, DW_AT_type, DW_FORM_ref4);
+    if (has_loc) { emit_attr(b, DW_AT_location, DW_FORM_exprloc); }
+    uleb(b, 0); uleb(b, 0);
+}
+
+# emit one variable / formal-parameter abbreviation whose DW_AT_location is a
+# DW_FORM_sec_offset pointer into `.debug_loclists` (the variable's home moves across
+# its scope, so the location is a per-PC list rather than one expression)
+# ---
+# b:    the abbrev buffer
+# code: the abbreviation code
+# tag:  DW_TAG_variable or DW_TAG_formal_parameter
+fun build_var_loclist_abbrev(b: *enc.ByteBuf, code: u8, tag: u8) {
+    uleb(b, code::u64);
+    uleb(b, tag::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_name, DW_FORM_strp);
+    emit_attr(b, DW_AT_type, DW_FORM_ref4);
+    emit_attr(b, DW_AT_location, DW_FORM_sec_offset);
+    uleb(b, 0); uleb(b, 0);
+}
+
+# emit the DW_TAG_inlined_subroutine DIEs of function `f` whose inline-instance parent is
+# `parent_site` (0 = directly under the subprogram), recursing so a nested instance nests
+# under its parent's DIE. A single-extent instance carries low_pc/high_pc; a multi-extent
+# one carries DW_AT_ranges. An instance with nested children uses a children-bearing
+# abbrev and a closing null DIE.
+# ---
+# b:            the info buffer
+# f:            the enclosing subprogram index (into the DwInline.func_idx space)
+# parent_site:  the parent inline-instance id whose children to emit (0 = subprogram)
+# inlines/ninl: the gathered instances
+# iranges:      the shared extent array
+# relocs/reloc_count: the InfoReloc list (abstract_origin/low_pc/ranges patch sites)
+# fn:           the enclosing DwFunc (symbol name + `.text` offset)
+# address_size: target pointer width
+# whether function `f` has a materialized inline instance with the given 1-based site id
+# (an instance with no surviving `.text` is dropped by gather_inlines, so a variable
+# tagged with it has no inlined_subroutine to nest under and must fall back to the
+# subprogram scope rather than vanish).
+fun inline_present(inlines: *DwInline, ninl: u32, f: u32, site: u32) bool {
+    var i: u32 = 0;
+    for (i < ninl) {
+        if (inlines[i].func_idx == f && inlines[i].site_id == site) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether the subprogram for function `f` will emit any child DIE: a variable/parameter
+# that survives the inline-scope filter, or a top-level inlined_subroutine instance.
+# mirrors build_info's child-emission conditions so the DW_CHILDREN flag matches reality
+# (a childless DIE marked DW_CHILDREN_yes trips llvm-dwarfdump --verify, #1949)
+# ---
+# f:            the subprogram's function index (DwInline.func_idx space)
+# fn:           its DwFunc (var_start / var_count)
+# vars:         the gathered variable table
+# inlines/ninl: the gathered inline instances
+fun subprogram_has_children(f: u32, fn: *DwFunc, vars: *DwVar, inlines: *DwInline, ninl: u32) bool {
+    var vi: u32 = 0;
+    for (vi < fn.var_count) {
+        val dvr: *DwVar = ?vars[fn.var_start + vi];
+        if (dvr.inline_site == 0 || !inline_present(inlines, ninl, f, dvr.inline_site)) { ret true; }
+        vi = vi + 1;
+    }
+    var xi: u32 = 0;
+    for (xi < ninl) {
+        if (inlines[xi].func_idx == f && inlines[xi].parent == 0) { ret true; }
+        xi = xi + 1;
+    }
+    ret false;
+}
+
+fun emit_inlines(b: *enc.ByteBuf, f: u32, parent_site: u32, inlines: *DwInline, ninl: u32,
+                 iranges: *DwInlineRange, relocs: *InfoReloc, reloc_count: *u32, fn: *DwFunc, address_size: u8,
+                 vars: *DwVar, tc: *TypeCtx) {
+    var xi: u32 = 0;
+    for (xi < ninl) {
+        if (inlines[xi].func_idx != f || inlines[xi].parent != parent_site) { xi = xi + 1; cnt; }
+        val di: *DwInline = ?inlines[xi];
+        # children = nested inlines and/or inlined locals living in this instance.
+        var kids: bool = false;
+        var ck: u32 = 0;
+        for (ck < ninl) { if (inlines[ck].func_idx == f && inlines[ck].parent == di.site_id) { kids = true; } ck = ck + 1; }
+        var cv: u32 = 0;
+        for (cv < fn.var_count) { if (vars[fn.var_start + cv].inline_site == di.site_id) { kids = true; } cv = cv + 1; }
+
+        if (di.range_count == 1) {
+            if (kids) { enc.emit_byte(b, ABBREV_INLINED_KIDS); } or { enc.emit_byte(b, ABBREV_INLINED); }
+            enc.emit_u32(b, di.origin_off);   # DW_AT_abstract_origin (ref4, backward)
+            val rg: *DwInlineRange = ?iranges[di.range_start];
+            push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS64, IRLT_SYM, fn.name, (rg.start - fn.offset)::i64);
+            emit_addr(b, address_size);        # DW_AT_low_pc (enclosing fn + range start)
+            enc.emit_u64(b, (rg.end - rg.start)::u64);   # DW_AT_high_pc
+        }
+        or {
+            if (kids) { enc.emit_byte(b, ABBREV_INLINED_RANGES_KIDS); } or { enc.emit_byte(b, ABBREV_INLINED_RANGES); }
+            enc.emit_u32(b, di.origin_off);   # DW_AT_abstract_origin (ref4, backward)
+            push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_RNGLIST, intern.STR_NIL, di.rnglist_off::i64);
+            enc.emit_u32(b, 0);                # DW_AT_ranges (sec_offset into .debug_rnglists)
+        }
+        uleb(b, di.call_file::u64);
+        uleb(b, di.call_line::u64);
+
+        if (kids) {
+            # this instance's inlined locals, then its nested inlines, then the terminator.
+            var vv: u32 = 0;
+            for (vv < fn.var_count) {
+                if (vars[fn.var_start + vv].inline_site == di.site_id) { emit_variable(b, ?vars[fn.var_start + vv], tc, relocs, reloc_count); }
+                vv = vv + 1;
+            }
+            emit_inlines(b, f, di.site_id, inlines, ninl, iranges, relocs, reloc_count, fn, address_size, vars, tc);
+            enc.emit_byte(b, 0);   # null DIE terminates this instance's children
+        }
+        xi = xi + 1;
+    }
+}
+
+# emit the compile unit's type DIEs in table order, recording each type's `.debug_info`
+# offset (`off`, CU-relative) for the ref4 references that follow. Scalars emit a
+# DW_TAG_base_type; a pointer / array / record / union emits its composite tag with its
+# children (members / subrange). Cross-type ref4s are written as placeholders and their
+# `pos`/`target` recorded in `fixups`; `resolve_type_fixups` patches them once every
+# type's offset is known (handling the forward references self-referential aggregates
+# introduce)
+# ---
+# b:       the info buffer
+# tc:      the type table (each entry's `off` filled in place)
+# len_pos: buffer offset of the CU unit_length field (ref4 offsets are relative to it)
+# relocs/reloc_count: the deferred `.debug_info` relocation list (for name strps)
+# fixups/nfix: out - the deferred ref4 patch list and its running count
+fun emit_type_dies(b: *enc.ByteBuf, tc: *TypeCtx, len_pos: usize, relocs: *InfoReloc, reloc_count: *u32,
+                   fixups: *TypeFixup, nfix: *u32) {
+    var t: u32 = 0;
+    for (t < tc.ntypes) {
+        val td: *TypeDie = ?tc.types[t];
+        td.off = (b.len - len_pos)::u32;
+        if (td.kind == TK_BASE) {
+            enc.emit_byte(b, ABBREV_BASE_TYPE);
+            push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, td.name_off::i64);
+            enc.emit_u32(b, 0);                 # DW_AT_name (strp)
+            enc.emit_byte(b, td.encoding);
+            enc.emit_byte(b, td.byte_size::u8);
+        }
+        or (td.kind == TK_POINTER) {
+            enc.emit_byte(b, ABBREV_POINTER);
+            push_type_fixup(fixups, nfix, b.len::u32, td.elem::u32);
+            enc.emit_u32(b, 0);                 # DW_AT_type (ref4, patched)
+            uleb(b, td.byte_size::u64);         # DW_AT_byte_size
+        }
+        or (td.kind == TK_ARRAY) {
+            enc.emit_byte(b, ABBREV_ARRAY);
+            push_type_fixup(fixups, nfix, b.len::u32, td.elem::u32);
+            enc.emit_u32(b, 0);                 # DW_AT_type (ref4, patched)
+            enc.emit_byte(b, ABBREV_SUBRANGE);  # the single subrange child gives the count
+            uleb(b, td.count::u64);             # DW_AT_count
+            enc.emit_byte(b, 0);                # null DIE terminates the array's children
+        }
+        or {
+            # a memberless aggregate uses the DW_CHILDREN_no leaf abbrev (and no
+            # terminator), so it never advertises children it lacks (#1949).
+            val kids: bool = td.memb_count > 0;
+            if (td.kind == TK_UNION) {
+                if (kids) { enc.emit_byte(b, ABBREV_UNION); } or { enc.emit_byte(b, ABBREV_UNION_LEAF); }
+            } or {
+                if (kids) { enc.emit_byte(b, ABBREV_STRUCT); } or { enc.emit_byte(b, ABBREV_STRUCT_LEAF); }
+            }
+            push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, td.name_off::i64);
+            enc.emit_u32(b, 0);                 # DW_AT_name (strp)
+            uleb(b, td.byte_size::u64);         # DW_AT_byte_size
+            var m: u32 = td.memb_start;
+            val mend: u32 = td.memb_start + td.memb_count;
+            for (m < mend) {
+                val mb: *TypeMember = ?tc.membs[m];
+                enc.emit_byte(b, ABBREV_MEMBER);
+                push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, mb.name_off::i64);
+                enc.emit_u32(b, 0);             # DW_AT_name (strp)
+                push_type_fixup(fixups, nfix, b.len::u32, mb.type_ix);
+                enc.emit_u32(b, 0);             # DW_AT_type (ref4, patched)
+                uleb(b, mb.offset::u64);        # DW_AT_data_member_location
+                m = m + 1;
+            }
+            if (kids) { enc.emit_byte(b, 0); }  # null DIE terminates the members (only when present)
+        }
+        t = t + 1;
+    }
+    resolve_type_fixups(b, tc, fixups, nfix);
+}
+
+# record a deferred ref4 patch: at buffer offset `pos`, the CU-relative offset of type
+# `target` is written once the whole type block is emitted
+# ---
+# fixups/nfix: the patch list and its running count (grown by the caller's cap)
+# pos:         absolute `.debug_info` offset of the ref4 field
+# target:      the referenced type's index
+fun push_type_fixup(fixups: *TypeFixup, nfix: *u32, pos: u32, target: u32) {
+    fixups[@nfix].pos    = pos;
+    fixups[@nfix].target = target;
+    @nfix = @nfix + 1;
+}
+
+# patch every recorded type ref4 with its target's now-known CU-relative offset
+# ---
+# b:           the info buffer (patched in place)
+# tc:          the type table (target offsets)
+# fixups/nfix: the recorded patches
+fun resolve_type_fixups(b: *enc.ByteBuf, tc: *TypeCtx, fixups: *TypeFixup, nfix: *u32) {
+    var i: u32 = 0;
+    for (i < @nfix) {
+        bin.write_u32_le(b.data, fixups[i].pos::usize, tc.types[fixups[i].target].off);
+        i = i + 1;
+    }
+}
+
+# build the `.debug_info` compile unit: the DWARF 5 unit header, the CU DIE
+# (producer / name / comp_dir strings, language, code range, stmt_list), then a type DIE
+# per gathered type (base scalars + composite records / unions / arrays / pointers) and a
+# `DW_TAG_subprogram` DIE per function, closed by a null DIE. Records the CU low_pc /
+# stmt_list field offsets and appends an `InfoReloc` for every strp (name) and addr
+# (low_pc) field
+# ---
+# b:            the buffer the info bytes are appended to
+# address_size: target pointer width in bytes
+# producer:     DW_AT_producer text
+# name:         DW_AT_name text (the CU's primary source path)
+# comp_dir:     DW_AT_comp_dir text
+# high_pc:      code span in bytes (high_pc - low_pc)
+# fb_reg:       frame-base DWARF register number
+# funcs/nfuncs: the module's functions (with resolved decl / return metadata)
+# tc:           the gathered type table (with resolved DIE / string offsets)
+# relocs:       out - the InfoReloc list
+# reloc_count:  out - number of InfoRelocs appended
+# low_off:      out - byte offset of the CU 8-byte low_pc field
+# stmt_off:     out - byte offset of the CU 4-byte stmt_list field
+# fixups:       scratch - the type-DIE ref4 patch list (cap >= type count + member count)
+fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp_dir: str,
+               high_pc: u64, fb_reg: i32, funcs: *DwFunc, nfuncs: u32, tc: *TypeCtx,
+               vars: *DwVar, relocs: *InfoReloc, reloc_count: *u32, low_off: *u32, stmt_off: *u32,
+               s: *session.Session, irmod: *ir.Module, strtab: *StrTab,
+               inlines: *DwInline, ninl: u32, iranges: *DwInlineRange, fixups: *TypeFixup) {
+    val len_pos: usize = b.len;
+    enc.emit_u32(b, 0);                 # unit_length (backpatched)
+    val body_start: usize = b.len;
+    enc.emit_u16(b, 5);                 # version
+    enc.emit_byte(b, DW_UT_compile);    # unit_type
+    enc.emit_byte(b, address_size);
+    enc.emit_u32(b, 0);                 # debug_abbrev_offset (identical abbrev, so 0)
+
+    uleb(b, ABBREV_CU::u64);            # the CU DIE's abbrev code
+    emit_cstr(b, producer);
+    emit_cstr(b, name);
+    emit_cstr(b, comp_dir);
+    enc.emit_u16(b, DW_LANG_C);
+    @low_off = b.len::u32;
+    enc.emit_u64(b, 0);                 # low_pc (relocated)
+    enc.emit_u64(b, high_pc);           # high_pc (offset from low_pc)
+    @stmt_off = b.len::u32;
+    enc.emit_u32(b, 0);                 # stmt_list (relocated to .debug_line)
+
+    # type DIEs first, so the subprograms below reference them by ref4.
+    var nfix: u32 = 0;
+    emit_type_dies(b, tc, len_pos, relocs, reloc_count, fixups, ?nfix);
+
+    # abstract-instance subprograms for the inlined callees, before the concrete
+    # subprograms so each inlined_subroutine references its origin backward. One per
+    # instance (no dedup yet); DW_AT_name is the callee's source spelling.
+    var ai: u32 = 0;
+    for (ai < ninl) {
+        # dedup by callee: one abstract instance per distinct callee, shared by every
+        # inlined_subroutine of it (a reused abstract_origin, per DWARF's single abstract
+        # instance model).
+        var dup: bool = false;
+        var pj: u32 = 0;
+        for (pj < ai) {
+            if (inlines[pj].callee == inlines[ai].callee) { inlines[ai].origin_off = inlines[pj].origin_off; dup = true; brk; }
+            pj = pj + 1;
+        }
+        if (dup) { ai = ai + 1; cnt; }
+
+        var cnm: str = resolve(?s.interner, inlines[ai].callee);
+        val oi: O.Option[u32] = ir.function_lookup(irmod, inlines[ai].callee);
+        if (O.is_some[u32](oi)) {
+            val cf: *ir.Function = ?irmod.functions[O.unwrap[u32](oi)];
+            if (cf.disp != intern.STR_NIL) { cnm = resolve(?s.interner, cf.disp); }
+        }
+        inlines[ai].origin_off = (b.len - len_pos)::u32;
+        enc.emit_byte(b, ABBREV_SUBPROGRAM_ABSTRACT);
+        push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, str_off(strtab, cnm)::i64);
+        enc.emit_u32(b, 0);                # DW_AT_name (strp)
+        enc.emit_byte(b, DW_INL_inlined);  # DW_AT_inline (no children this tier)
+        ai = ai + 1;
+    }
+
+    # one subprogram DIE per function.
+    var f: u32 = 0;
+    for (f < nfuncs) {
+        val fn: *DwFunc = ?funcs[f];
+        # a subprogram with no children uses the DW_CHILDREN_no leaf abbrev (and emits no
+        # terminator), so it never advertises children it lacks (#1949).
+        val has_kids: bool = subprogram_has_children(f, fn, vars, inlines, ninl);
+        if (fn.ret_ty >= 0) {
+            if (has_kids) { enc.emit_byte(b, ABBREV_SUBPROGRAM); } or { enc.emit_byte(b, ABBREV_SUBPROGRAM_LEAF); }
+        } or {
+            if (has_kids) { enc.emit_byte(b, ABBREV_SUBPROGRAM_VOID); } or { enc.emit_byte(b, ABBREV_SUBPROGRAM_VOID_LEAF); }
+        }
+        push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, fn.disp_off::i64);
+        enc.emit_u32(b, 0);             # DW_AT_name (strp, relocated to .debug_str)
+        push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS64, IRLT_SYM, fn.name, 0);
+        emit_addr(b, address_size);     # DW_AT_low_pc (relocated to the function)
+        enc.emit_u64(b, fn.size::u64);  # DW_AT_high_pc (offset from low_pc)
+        if (fn.external) { enc.emit_byte(b, 1); } or { enc.emit_byte(b, 0); }
+        uleb(b, fn.decl_file::u64);
+        uleb(b, fn.decl_line::u64);
+        emit_frame_base(b, fb_reg);
+        if (fn.ret_ty >= 0) { enc.emit_u32(b, tc.types[fn.ret_ty::u32].off); }   # DW_AT_type (ref4)
+
+        # the subprogram's own variable / parameter children: instance-0 vars, plus any
+        # var whose inline instance was dropped (no materialized inlined_subroutine to
+        # nest under) so it keeps a scope rather than vanishing.
+        var vi: u32 = 0;
+        for (vi < fn.var_count) {
+            val dvr: *DwVar = ?vars[fn.var_start + vi];
+            if (dvr.inline_site == 0 || !inline_present(inlines, ninl, f, dvr.inline_site)) { emit_variable(b, dvr, tc, relocs, reloc_count); }
+            vi = vi + 1;
+        }
+
+        # its inlined_subroutine children, as a tree by inline-instance parent (top-level
+        # instances directly under the subprogram, nested instances under their parent).
+        emit_inlines(b, f, 0, inlines, ninl, iranges, relocs, reloc_count, fn, address_size, vars, tc);
+
+        if (has_kids) { enc.emit_byte(b, 0); }   # null DIE terminates the children (only when present)
+        f = f + 1;
+    }
+
+    enc.emit_byte(b, 0);   # null DIE terminates the CU's children
+
+    # backpatch unit_length = bytes after the length field.
+    bin.write_u32_le(b.data, len_pos, (b.len - body_start)::u32);
+}
+
+# emit one variable / formal-parameter DIE: the located or no-location abbrev by kind,
+# then DW_AT_name (strp), DW_AT_type (ref4), and - when located - DW_AT_location
+# ---
+# b:      the info buffer
+# v:      the variable to emit
+# tc:     the type table (DW_AT_type ref4 target)
+# relocs/reloc_count: the deferred `.debug_info` relocation list (for the name strp)
+fun emit_variable(b: *enc.ByteBuf, v: *DwVar, tc: *TypeCtx, relocs: *InfoReloc, reloc_count: *u32) {
+    if (v.loc_kind == VLOC_LOCLIST) {
+        if (v.is_param) { enc.emit_byte(b, ABBREV_PARAM_LOCLIST); } or { enc.emit_byte(b, ABBREV_VARIABLE_LOCLIST); }
+        push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, v.name_off::i64);
+        enc.emit_u32(b, 0);                          # DW_AT_name (strp, relocated to .debug_str)
+        enc.emit_u32(b, tc.types[v.ty::u32].off);    # DW_AT_type (ref4)
+        # DW_AT_location (sec_offset), relocated to the `.debug_loclists` entry.
+        push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_LOCLIST, intern.STR_NIL, v.loclist_off::i64);
+        enc.emit_u32(b, 0);
+        ret;
+    }
+    val located: bool = v.loc_kind != VLOC_NONE;
+    if (v.is_param) {
+        if (located) { enc.emit_byte(b, ABBREV_PARAM); } or { enc.emit_byte(b, ABBREV_PARAM_NOLOC); }
+    } or {
+        if (located) { enc.emit_byte(b, ABBREV_VARIABLE); } or { enc.emit_byte(b, ABBREV_VARIABLE_NOLOC); }
+    }
+    push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, v.name_off::i64);
+    enc.emit_u32(b, 0);                          # DW_AT_name (strp, relocated to .debug_str)
+    enc.emit_u32(b, tc.types[v.ty::u32].off);    # DW_AT_type (ref4)
+    if (located) { emit_var_location(b, v); }
+}
+
+# emit a DW_AT_frame_base exprloc naming the frame-pointer register: a uleb length
+# prefix then DW_OP_reg<n> (single byte for n < 32, else DW_OP_regx + uleb(n))
+# ---
+# b:      the info buffer
+# fb_reg: the frame-pointer DWARF register number
+fun emit_frame_base(b: *enc.ByteBuf, fb_reg: i32) {
+    if (fb_reg < 32) {
+        enc.emit_byte(b, 1);
+        enc.emit_byte(b, (DW_OP_reg0::i32 + fb_reg)::u8);
+    } or {
+        var tmp: enc.ByteBuf = enc.buf_init(b.alloc);
+        enc.emit_byte(?tmp, DW_OP_regx);
+        uleb(?tmp, fb_reg::u64);
+        uleb(b, tmp.len::u64);
+        var i: usize = 0;
+        for (i < tmp.len) { enc.emit_byte(b, tmp.data[i]); i = i + 1; }
+        enc.buf_dnit(?tmp);
+    }
+}
+
+# map an encoder VarLoc's raw home to a DWARF variable location: a register (VLOC_REG,
+# `out_reg` the DWARF number via the ISA hook), a frame slot (VLOC_FRAME, `out_off`
+# bytes from the frame base), or none (VLOC_NONE) for an optimized-out binding or a
+# physical register with no DWARF number. The encoder captured the post-regalloc home
+# at the marker's PC; the producer only remaps the physical register id to DWARF
+# ---
+# tgt:      resolved target, for the ISA dwarf_reg hook
+# vl:       the variable-location record
+# out_kind/out_reg/out_off: the resolved DWARF location
+fun varloc_home(tgt: *target.Target, vl: *enc.VarLoc, out_kind: *u8, out_reg: *i32, out_off: *i64) {
+    @out_kind = VLOC_NONE;
+    @out_reg  = 0;
+    @out_off  = 0;
+    if (vl.kind == enc.VARLOC_REG) {
+        val f: isa.DwarfRegFn = tgt.arch.dwarf_reg::isa.DwarfRegFn;
+        val d: i32 = f(vl.reg);
+        if (d >= 0) { @out_kind = VLOC_REG; @out_reg = d; }
+    } or (vl.kind == enc.VARLOC_FRAME) {
+        @out_kind = VLOC_FRAME;
+        @out_off  = vl.off;
+    }
+}
+
+# the net signed constant a salvage expression adds to the operand value (0 for the
+# identity expression), summed base-first over the +const / -const steps
+# ---
+# irfn: the owning IR function (holds the dbg-expr pool)
+# iid:  the OP_DBG_VALUE instruction id
+# ret:  the net signed constant
+fun dbg_expr_net(irfn: *ir.Function, iid: id.InstructionId) i64 {
+    val eid: ir.DbgExprId = ir.dbg_expr_id(irfn, iid);
+    val o: O.Option[*ir.DbgExpr] = ir.dbg_expr_get(irfn, eid);
+    if (O.is_none[*ir.DbgExpr](o)) { ret 0; }
+    val dex: *ir.DbgExpr = O.unwrap[*ir.DbgExpr](o);
+    var net: i64 = 0;
+    var i: u32 = 0;
+    for (i < dex.op_count) {
+        if (dex.ops[i].op == ir.DBG_OP_PLUS_CONST)  { net = net + dex.ops[i].arg::i64; }
+        or (dex.ops[i].op == ir.DBG_OP_MINUS_CONST) { net = net - dex.ops[i].arg::i64; }
+        i = i + 1;
+    }
+    ret net;
+}
+
+# whether type index `ty` names a by-reference aggregate DIE (struct / union / array).
+# such a value is manipulated through its storage address, so a variable of this type
+# homes an address rather than a value (see DwVar.byref)
+# ---
+# tc: the type table
+# ty: a type index, or -1
+# ret: true for a composite aggregate kind
+fun type_is_aggregate(tc: *TypeCtx, ty: i32) bool {
+    if (ty < 0) { ret false; }
+    val k: u8 = tc.types[ty::u32].kind;
+    ret k == TK_STRUCT || k == TK_UNION || k == TK_ARRAY;
+}
+
+# append the DWARF expression ops for a home to `e`. A register or frame slot with the
+# identity expression (net == 0) is a plain location; a salvaged value (net != 0)
+# computes the value and marks it DW_OP_stack_value; a constant home is the computed
+# value `off + net` pushed directly and marked DW_OP_stack_value. When `byref`, the home
+# is a frame slot holding a pointer to the aggregate's storage (register homes never
+# reach here - classify_var / build_loclists filter them out, since a reused register
+# cannot describe the address whole-scope): the location loads that pointer, adds any
+# salvage offset, and leaves the address on the stack (no DW_OP_stack_value) so the
+# consumer reads the aggregate's bytes from it
+# ---
+# e:     the expression buffer
+# kind:  VLOC_REG / VLOC_FRAME / VLOC_CONST
+# reg:   DWARF register number when kind == VLOC_REG
+# off:   frame-base offset when kind == VLOC_FRAME; the constant value when VLOC_CONST
+# net:   the salvage net constant (0 = identity)
+# byref: true for a by-reference aggregate located from a frame slot holding its address
+fun build_loc_ops(e: *enc.ByteBuf, kind: u8, reg: i32, off: i64, net: i64, byref: bool) {
+    if (kind == VLOC_CONST) {
+        # the variable IS the compile-time constant `off + net`; push it and mark the
+        # result a value, not a location. the DIE's DW_AT_type sizes / signs it, so the
+        # full i64 is emitted and the consumer truncates to the variable's byte size.
+        enc.emit_byte(e, DW_OP_consts);
+        sleb(e, off + net);
+        enc.emit_byte(e, DW_OP_stack_value);
+        ret;
+    }
+    if (byref) {
+        # a frame slot holds the storage pointer: load it, add any salvage offset (an
+        # aggregate address recovered as base + k), and leave the address on the stack.
+        enc.emit_byte(e, DW_OP_fbreg);
+        sleb(e, off);
+        enc.emit_byte(e, DW_OP_deref);
+        if (net != 0) { emit_net_const(e, net); }
+        ret;
+    }
+    if (kind == VLOC_REG) {
+        if (net == 0) {
+            emit_reg_op(e, DW_OP_reg0, DW_OP_regx, reg);
+        } or {
+            emit_reg_op(e, DW_OP_breg0, 0, reg);
+            sleb(e, net);
+            enc.emit_byte(e, DW_OP_stack_value);
+        }
+    } or {   # VLOC_FRAME
+        enc.emit_byte(e, DW_OP_fbreg);
+        sleb(e, off);
+        if (net != 0) {
+            enc.emit_byte(e, DW_OP_deref);
+            emit_net_const(e, net);
+            enc.emit_byte(e, DW_OP_stack_value);
+        }
+    }
+}
+
+# emit a counted location description: a uleb byte-length prefix then the home's
+# expression ops. Shared by the single-location DW_AT_location exprloc and each
+# `.debug_loclists` range's counted location description (identical byte shape)
+# ---
+# b:    the destination buffer
+# kind/reg/off/net: the home the expression describes
+# byref: true for a by-reference aggregate whose home addresses its storage
+fun emit_counted_loc(b: *enc.ByteBuf, kind: u8, reg: i32, off: i64, net: i64, byref: bool) {
+    var e: enc.ByteBuf = enc.buf_init(b.alloc);
+    build_loc_ops(?e, kind, reg, off, net, byref);
+    uleb(b, e.len::u64);
+    var i: usize = 0;
+    for (i < e.len) { enc.emit_byte(b, e.data[i]); i = i + 1; }
+    enc.buf_dnit(?e);
+}
+
+# emit a variable's single-location DW_AT_location exprloc from its stationary home
+# ---
+# b: the info buffer
+# v: the variable whose location is emitted (loc_kind is VLOC_REG or VLOC_FRAME)
+fun emit_var_location(b: *enc.ByteBuf, v: *DwVar) {
+    emit_counted_loc(b, v.loc_kind, v.reg, v.offset, v.net, v.byref);
+}
+
+# build the DWARF 5 `.debug_loclists` section: the unit header (offset_entry_count 0,
+# so DW_AT_location fields are direct DW_FORM_sec_offset pointers), then one location
+# list per VLOC_LOCLIST variable, walked in the same subprogram-then-declaration order
+# `build_info` emits the DIEs. Each list is a DW_LLE_base_address (its address
+# relocated to the owning function's low_pc, recorded in `loc_relocs`) followed by a
+# DW_LLE_offset_pair per real-home range - each carrying the range's own counted
+# location expression - and a closing DW_LLE_end_of_list. An optimized-out range
+# (VLOC_NONE) is omitted, leaving a gap the consumer reports as unavailable. Each
+# variable's list byte offset is recorded in `loclist_off` for its DW_FORM_sec_offset
+#
+# Range fidelity: a binding governs `[binding_pc, next_binding_pc | fn_end)`, which is
+# linear source-order reasoning. Under control flow, a taken branch can enter a range
+# where a different binding actually governs, and merge points carry no births until
+# #1904 lands; so ranges are accurate for straight-line and dominating flow and
+# conservative past unbirthed merges - never presented as flow-exact. This inherits the
+# #1904 merge-point caveat.
+# ---
+# b:            the loclists buffer (appended to)
+# funcs/nfuncs: the subprogram functions whose variables own the lists
+# vars:         the shared variable array
+# ranges:       the shared range array
+# address_size: target pointer width (base-address field size)
+# loc_relocs:   out - the base-address relocation list
+# loc_reloc_count: out - number of base-address relocations
+fun build_loclists(b: *enc.ByteBuf, funcs: *DwFunc, nfuncs: u32, vars: *DwVar, ranges: *LocRange,
+                   address_size: u8, loc_relocs: *LocReloc, loc_reloc_count: *u32) {
+    val len_pos: usize = b.len;
+    enc.emit_u32(b, 0);              # unit_length (backpatched)
+    val body: usize = b.len;
+    enc.emit_u16(b, 5);             # version
+    enc.emit_byte(b, address_size);
+    enc.emit_byte(b, 0);            # segment_selector_size
+    enc.emit_u32(b, 0);            # offset_entry_count (0 = direct sec_offset)
+
+    var f: u32 = 0;
+    for (f < nfuncs) {
+        val fn: *DwFunc = ?funcs[f];
+        var vi: u32 = 0;
+        for (vi < fn.var_count) {
+            val v: *DwVar = ?vars[fn.var_start + vi];
+            if (v.loc_kind != VLOC_LOCLIST) { vi = vi + 1; cnt; }
+            v.loclist_off = b.len::u32;
+            enc.emit_byte(b, DW_LLE_base_address);
+            push_loc_reloc(loc_relocs, loc_reloc_count, b.len::u32, fn.name);
+            emit_addr(b, address_size);   # base address = fn low_pc (relocated)
+            var r: u32 = v.range_start;
+            val rend: u32 = v.range_start + v.range_count;
+            for (r < rend) {
+                val rg: *LocRange = ?ranges[r];
+                # a non-real home (optimized out, or a byref aggregate's transient register)
+                # is left as a gap the consumer reports as unavailable, never a stale address.
+                if (range_real_home(v, rg)) {
+                    enc.emit_byte(b, DW_LLE_offset_pair);
+                    uleb(b, (rg.start - fn.offset)::u64);
+                    uleb(b, (rg.end - fn.offset)::u64);
+                    emit_counted_loc(b, rg.kind, rg.reg, rg.off, rg.net, v.byref);
+                }
+                r = r + 1;
+            }
+            enc.emit_byte(b, DW_LLE_end_of_list);
+            vi = vi + 1;
+        }
+        f = f + 1;
+    }
+
+    bin.write_u32_le(b.data, len_pos, (b.len - body)::u32);
+}
+
+# build the DWARF 5 `.debug_rnglists` section: the unit header (offset_entry_count 0,
+# direct sec_offset) then one range list per multi-extent inlined instance. Each list is
+# a DW_RLE_base_address (the enclosing function's low_pc, relocated) then a
+# DW_RLE_offset_pair per contiguous extent, closed by DW_RLE_end_of_list; `rnglist_off`
+# is stamped so build_info patches the instance's DW_AT_ranges sec_offset. Single-extent
+# and nested instances are handled elsewhere. Range accuracy inherits the #1904 caveat.
+# ---
+# b:            the buffer the rnglists bytes are appended to
+# funcs/nfuncs: the subprograms (for the enclosing function symbol + low_pc)
+# inlines/ninl: the gathered instances (rnglist_off filled in place)
+# iranges:      the shared extent array
+# address_size: target pointer width
+# rng_relocs:   out - the base-address relocation list
+# rng_reloc_count: out - number of RngRelocs appended
+fun build_rnglists(b: *enc.ByteBuf, funcs: *DwFunc, nfuncs: u32, inlines: *DwInline, ninl: u32,
+                   iranges: *DwInlineRange, address_size: u8, rng_relocs: *RngReloc, rng_reloc_count: *u32) {
+    val len_pos: usize = b.len;
+    enc.emit_u32(b, 0);             # unit_length (backpatched)
+    val body: usize = b.len;
+    enc.emit_u16(b, 5);            # version
+    enc.emit_byte(b, address_size);
+    enc.emit_byte(b, 0);           # segment_selector_size
+    enc.emit_u32(b, 0);            # offset_entry_count (0 = direct sec_offset)
+
+    var i: u32 = 0;
+    for (i < ninl) {
+        val di: *DwInline = ?inlines[i];
+        # every multi-extent instance needs a list, nested or not; emit_inlines picks the
+        # DW_AT_ranges shape purely on range_count, so a skipped nested one would dangle.
+        if (di.range_count <= 1) { i = i + 1; cnt; }
+        val fn: *DwFunc = ?funcs[di.func_idx];
+        di.rnglist_off = b.len::u32;
+        enc.emit_byte(b, DW_RLE_base_address);
+        push_rng_reloc(rng_relocs, rng_reloc_count, b.len::u32, fn.name);
+        emit_addr(b, address_size);   # base address = fn low_pc (relocated)
+        var r: u32 = di.range_start;
+        val rend: u32 = di.range_start + di.range_count;
+        for (r < rend) {
+            val rg: *DwInlineRange = ?iranges[r];
+            enc.emit_byte(b, DW_RLE_offset_pair);
+            uleb(b, (rg.start - fn.offset)::u64);
+            uleb(b, (rg.end - fn.offset)::u64);
+            r = r + 1;
+        }
+        enc.emit_byte(b, DW_RLE_end_of_list);
+        i = i + 1;
+    }
+    bin.write_u32_le(b.data, len_pos, (b.len - body)::u32);
+}
+
+# emit DW_OP_reg<n> / DW_OP_breg<n>: `base0` + n as one byte for n < 32, else the
+# `opx` extended form + uleb(n). `opx` is 0 for DW_OP_breg (whose offset the caller
+# appends and which has no regx short form here, so n < 32 is required for breg)
+# ---
+# e:     the expression buffer
+# base0: DW_OP_reg0 or DW_OP_breg0
+# opx:   the extended opcode (DW_OP_regx), or 0 when none applies
+# n:     the DWARF register number
+fun emit_reg_op(e: *enc.ByteBuf, base0: u8, opx: u8, n: i32) {
+    if (n < 32) {
+        enc.emit_byte(e, (base0::i32 + n)::u8);
+    } or (opx != 0) {
+        enc.emit_byte(e, opx);
+        uleb(e, n::u64);
+    } or {
+        enc.emit_byte(e, (base0::i32 + 31)::u8);   # clamp; ISAs with a frame pointer register < 32
+    }
+}
+
+# append `net` to the value on the stack: DW_OP_plus_uconst for a positive net, else
+# DW_OP_constu(|net|) DW_OP_minus
+# ---
+# e:   the expression buffer
+# net: the signed constant to add
+fun emit_net_const(e: *enc.ByteBuf, net: i64) {
+    if (net >= 0) {
+        enc.emit_byte(e, DW_OP_plus_uconst);
+        uleb(e, net::u64);
+    } or {
+        enc.emit_byte(e, DW_OP_constu);
+        uleb(e, (0 - net)::u64);
+        enc.emit_byte(e, DW_OP_minus);
+    }
+}
+
+# emit a DWARF 5 line-program row for `(addr_delta, line_delta)`, preferring a
+# single special opcode and falling back to advance_line / advance_pc / copy when
+# the combined advance does not pack into one byte
+# ---
+# b:          the line-program buffer
+# addr_delta: operation-advance in bytes (min_instruction_length is 1)
+# line_delta: change in the line register since the last row
+fun emit_row(b: *enc.ByteBuf, addr_delta: u32, line_delta: i32) {
+    if (line_delta >= LINE_BASE && line_delta < LINE_BASE + LINE_RANGE) {
+        val op: i64 = (line_delta - LINE_BASE)::i64 + (LINE_RANGE::i64 * addr_delta::i64) + OPCODE_BASE::i64;
+        if (op <= 255) {
+            enc.emit_byte(b, op::u8);
+            ret;
+        }
+    }
+    if (line_delta != 0) { enc.emit_byte(b, DW_LNS_advance_line); sleb(b, line_delta::i64); }
+    if (addr_delta != 0) { enc.emit_byte(b, DW_LNS_advance_pc);   uleb(b, addr_delta::u64); }
+    enc.emit_byte(b, DW_LNS_copy);
+}
+
+# build the DWARF 5 `.debug_line` header and program. For each function, in
+# ascending `.text` order, it opens a sequence with `DW_LNE_set_address` (address
+# relocated to the function symbol), replays the encoder rows falling in the
+# function's byte range as line-program rows, advances to the function end, and
+# closes with `DW_LNE_end_sequence`. Records each set_address field offset so
+# `produce` can attach one `RK_ABS64` relocation per function
+# ---
+# s:            session, for resolving source files and line numbers
+# funcs:        the module's functions, in ascending `.text` offset
+# nfuncs:       number of functions
+# rows:         the encoder's re-homed PC<->source rows
+# row_count:    number of rows
+# text_sec:     the `.text` section index (rows outside it are ignored)
+# address_size: target pointer width in bytes
+# comp_dir:     the compilation directory (line-header directory 0)
+# ft:           the built file table (line-header file entries)
+# b:            out - the line-program bytes
+# addr_off:     out - per-function byte offset of the set_address address field
+fun build_line(s: *session.Session, funcs: *DwFunc, nfuncs: u32, rows: *enc.LineRow, row_count: u32,
+               text_sec: u32, address_size: u8, comp_dir: str, ft: *FileTable,
+               b: *enc.ByteBuf, addr_off: *u32) {
+    val len_pos: usize = b.len;
+    enc.emit_u32(b, 0);              # unit_length (backpatched)
+    val ul_end: usize = b.len;
+    enc.emit_u16(b, 5);             # version
+    enc.emit_byte(b, address_size);
+    enc.emit_byte(b, 0);            # segment_selector_size
+    val hl_pos: usize = b.len;
+    enc.emit_u32(b, 0);            # header_length (backpatched)
+    val hdr_start: usize = b.len;
+
+    enc.emit_byte(b, 1);           # minimum_instruction_length
+    enc.emit_byte(b, 1);           # maximum_operations_per_instruction
+    enc.emit_byte(b, 1);           # default_is_stmt
+    enc.emit_byte(b, (LINE_BASE & 0xFF)::u8);   # line_base (signed)
+    enc.emit_byte(b, LINE_RANGE::u8);
+    enc.emit_byte(b, OPCODE_BASE);
+    # standard_opcode_lengths for opcodes 1..12.
+    enc.emit_byte(b, 0); enc.emit_byte(b, 1); enc.emit_byte(b, 1); enc.emit_byte(b, 1);
+    enc.emit_byte(b, 1); enc.emit_byte(b, 0); enc.emit_byte(b, 0); enc.emit_byte(b, 0);
+    enc.emit_byte(b, 1); enc.emit_byte(b, 0); enc.emit_byte(b, 0); enc.emit_byte(b, 1);
+
+    # directory table: one format field (path/string), one entry (comp_dir).
+    enc.emit_byte(b, 1);
+    uleb(b, DW_LNCT_path::u64); uleb(b, DW_FORM_string::u64);
+    uleb(b, 1);
+    emit_cstr(b, comp_dir);
+
+    # file table: two format fields (path/string, dir_index/udata), one entry per file.
+    enc.emit_byte(b, 2);
+    uleb(b, DW_LNCT_path::u64);            uleb(b, DW_FORM_string::u64);
+    uleb(b, DW_LNCT_directory_index::u64); uleb(b, 0x0F::u64);  # DW_FORM_udata
+    uleb(b, ft.count::u64);
+    var fi: u32 = 0;
+    for (fi < ft.count) {
+        emit_cstr(b, file_path(s, ft.ids[fi]));
+        uleb(b, 0);   # all files sit under directory 0 (comp_dir)
+        fi = fi + 1;
+    }
+
+    # header_length spans from just after the field to the first program opcode.
+    bin.write_u32_le(b.data, hl_pos, (b.len - hdr_start)::u32);
+
+    # the line-number program: one sequence per function.
+    var f: u32 = 0;
+    for (f < nfuncs) {
+        val fn: *DwFunc = ?funcs[f];
+        # DW_LNE_set_address (extended opcode): 0, uleb(len=1+addr), 0x02, address.
+        enc.emit_byte(b, 0);
+        uleb(b, (1 + address_size)::u64);
+        enc.emit_byte(b, DW_LNE_set_address);
+        addr_off[f] = b.len::u32;
+        emit_addr(b, address_size);
+
+        var cur_off:  u32 = fn.offset;
+        var cur_line: i32 = 1;
+        var cur_file: i64 = -1;
+
+        var r: u32 = 0;
+        for (r < row_count) {
+            val row: *enc.LineRow = ?rows[r];
+            if (row.sec == text_sec && row.text_offset >= fn.offset && row.text_offset < fn.offset + fn.size) {
+                val pl: PosLine = pos_of(s, row.loc, ft);
+                if (pl.file::i64 != cur_file) {
+                    enc.emit_byte(b, DW_LNS_set_file);
+                    uleb(b, pl.file::u64);
+                    cur_file = pl.file::i64;
+                }
+                val addr_delta: u32 = row.text_offset - cur_off;
+                emit_row(b, addr_delta, pl.line - cur_line);
+                cur_off  = row.text_offset;
+                cur_line = pl.line;
+            }
+            r = r + 1;
+        }
+
+        # advance to the function end and close the sequence.
+        val end_delta: u32 = (fn.offset + fn.size) - cur_off;
+        if (end_delta != 0) { enc.emit_byte(b, DW_LNS_advance_pc); uleb(b, end_delta::u64); }
+        enc.emit_byte(b, 0);
+        uleb(b, 1);
+        enc.emit_byte(b, DW_LNE_end_sequence);
+        f = f + 1;
+    }
+
+    bin.write_u32_le(b.data, len_pos, (b.len - ul_end)::u32);
+}
+
+# a resolved (dwarf file index, 1-based line) for a source location
+# ---
+# file: 0-based dwarf file index
+# line: 1-based source line
+rec PosLine {
+    file: u32;
+    line: i32;
+}
+
+# resolve a source location to its dwarf file index and 1-based line, defaulting to
+# (0, 1) when the file or position cannot be recovered
+# ---
+# s:   session, for the source map
+# loc: the source location to resolve
+# ft:  the file table (already populated with this loc's file)
+# ret: the (file index, line) pair
+fun pos_of(s: *session.Session, loc: source.SrcLoc, ft: *FileTable) PosLine {
+    var out: PosLine;
+    out.file = 0;
+    out.line = 1;
+    val fx: i32 = file_index(ft, loc.file);
+    if (fx >= 0) { out.file = fx::u32; }
+    val fo: O.Option[*source.SourceFile] = source.get(?s.sources, loc.file);
+    if (O.is_some[*source.SourceFile](fo)) {
+        val p: source.Position = source.position(O.unwrap[*source.SourceFile](fo), loc.offset);
+        out.line = p.line::i32;
+    }
+    ret out;
+}
+
+# the path of a source file, or "?" when it cannot be resolved
+# ---
+# s:  session, for the source map
+# id: the FileId to resolve
+# ret: the file path, or "?"
+fun file_path(s: *session.Session, id: source.FileId) str {
+    val fo: O.Option[*source.SourceFile] = source.get(?s.sources, id);
+    if (O.is_some[*source.SourceFile](fo)) { ret O.unwrap[*source.SourceFile](fo).path; }
+    ret "?";
+}
+
+# emit `address_size` zero bytes for a relocated address field
+# ---
+# b:            the buffer
+# address_size: number of address bytes (4 or 8)
+fun emit_addr(b: *enc.ByteBuf, address_size: u8) {
+    if (address_size == 8) { enc.emit_u64(b, 0); } or { enc.emit_u32(b, 0); }
+}
+
+# count the module's defined function symbols that live in `.text`
+# ---
+# image:    the object image whose symbols are scanned
+# text_sec: the `.text` section index
+# ret:      the number of function symbols in `.text`
+fun count_funcs(image: *of.ObjectImage, text_sec: u32) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < image.symbol_count) {
+        val sym: *of.Symbol = ?image.symbols[i];
+        if ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0 && sym.section == text_sec) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# gather the module's `.text` functions into `out`, sorted by ascending offset
+# ---
+# image:    the object image whose symbols are gathered
+# text_sec: the `.text` section index
+# out:      destination array, sized `count_funcs`
+fun gather_funcs(image: *of.ObjectImage, text_sec: u32, out: *DwFunc) {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < image.symbol_count) {
+        val sym: *of.Symbol = ?image.symbols[i];
+        if ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0 && sym.section == text_sec) {
+            out[n].name     = sym.name;
+            out[n].offset   = sym.offset;
+            out[n].external = (sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0;
+            out[n].weak     = (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0;
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    # insertion sort by offset (function counts per module are small).
+    var a: u32 = 1;
+    for (a < n) {
+        val key: DwFunc = out[a];
+        var b: i64 = a::i64 - 1;
+        for (b >= 0 && out[b::u32].offset > key.offset) {
+            out[(b + 1)::u32] = out[b::u32];
+            b = b - 1;
+        }
+        out[(b + 1)::u32] = key;
+        a = a + 1;
+    }
+}
+
+# intern "<base>#suffix", a per-module-unique local name for a debug-section anchor
+# (the linker keys relocations on the symbol name, so the anchor must not collide
+# across objects)
+# ---
+# itn:     the session interner
+# base:    the module name text
+# suffix:  the anchor discriminator (e.g. ".debug_line")
+# ret:     the interned unique name, or an intern/allocation error
+fun intern_anchor(itn: *intern.Interner, base: str, suffix: str) R.Result[intern.StrId, str] {
+    val lb: usize = str_len(base);
+    val ls: usize = str_len(suffix);
+    val rb: R.Result[*u8, str] = A.allocate[u8](itn.a, lb + ls + 1);
+    if (R.is_err[*u8, str](rb)) { ret R.err[intern.StrId, str](R.unwrap_err[*u8, str](rb)); }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+    var w: usize = 0;
+    var i: usize = 0;
+    for (i < lb) { buf[w] = base[i]; w = w + 1; i = i + 1; }
+    i = 0;
+    for (i < ls) { buf[w] = suffix[i]; w = w + 1; i = i + 1; }
+    buf[w] = 0;
+    val ri: R.Result[intern.StrId, str] = intern.intern(itn, buf::str);
+    A.deallocate[u8](itn.a, buf, lb + ls + 1);
+    ret ri;
+}
+
+# add one relocation to the image, propagating an allocation failure
+# ---
+# image:  the object image
+# sec:    the section being patched
+# offset: patch-site offset within the section
+# kind:   abstract relocation kind
+# sym:    interned target symbol name
+# ret:    ok(true), or an allocation error
+fun add_reloc(image: *of.ObjectImage, sec: u32, offset: u32, kind: of.RelocKind, sym: intern.StrId) R.Result[bool, str] {
+    ret add_reloc_addend(image, sec, offset, kind, sym, 0);
+}
+
+# add one relocation with an explicit addend (a `.debug_str` strp targets the section
+# anchor plus the string's byte offset)
+# ---
+# image:  the object image
+# sec:    the section being patched
+# offset: patch-site offset within the section
+# kind:   abstract relocation kind
+# sym:    interned target symbol name
+# addend: value added to the resolved target
+# ret:    ok(true), or an allocation error
+fun add_reloc_addend(image: *of.ObjectImage, sec: u32, offset: u32, kind: of.RelocKind,
+                     sym: intern.StrId, addend: i64) R.Result[bool, str] {
+    var rel: of.Relocation;
+    rel.section = sec;
+    rel.offset  = offset;
+    rel.kind    = kind;
+    rel.symbol  = sym;
+    rel.addend  = addend;
+    ret obj.add_relocation(image, rel);
+}
+
+# emit the module's DWARF 5 `.debug_abbrev` / `.debug_info` / `.debug_line` sections
+# into `image`, driven by the encoder's PC<->source rows and the `.text` function
+# symbols
+#
+# The format-agnostic producer the epic #1594 births: it writes only the abstract
+# object model, so the active container writer serializes the identical bytes for
+# ELF and Mach-O. A module with no `.text` function is a no-op. Frees every scratch
+# buffer and array before returning.
+# ---
+# s:        session (source map, debug producer / comp_dir strings, type universe)
+# tgt:      resolved target (address size, frame-pointer register)
+# irmod:    IR module supplying each function's source name and semantic return type
+# image:    the per-module object image being built
+# rows:     the encoder's re-homed PC<->source rows
+# row_count: number of rows
+# varlocs:  the encoder's re-homed per-PC variable-location records
+# varloc_count: number of variable-location records
+# text_sec: the `.text` section index
+# ret:      ok(true) on success, or an allocation error
+pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
+                image: *of.ObjectImage, rows: *enc.LineRow, row_count: u32,
+                varlocs: *enc.VarLoc, varloc_count: u32,
+                inline_pcs: *enc.InlinePc, inline_pc_count: u32, text_sec: u32) R.Result[bool, str] {
+    val nfuncs: u32 = count_funcs(image, text_sec);
+    if (nfuncs == 0) { ret R.ok[bool, str](true); }
+
+    val address_size: u8 = tgt.arch.pointer_width::u8;
+    val itn: *intern.Interner = image.interner;
+    val producer: str = resolve(itn, s.debug_producer);
+    val comp_dir: str = resolve(itn, s.debug_comp_dir);
+
+    # gather + sort the functions.
+    val rf: R.Result[*DwFunc, str] = A.allocate[DwFunc](s.alloc, nfuncs::usize);
+    if (R.is_err[*DwFunc, str](rf)) { ret R.err[bool, str](R.unwrap_err[*DwFunc, str](rf)); }
+    val funcs: *DwFunc = R.unwrap_ok[*DwFunc, str](rf);
+    gather_funcs(image, text_sec, funcs);
+
+    # the encoder records no per-symbol size, so a function's extent is the gap to
+    # the next function (in `.text` order) and the last runs to the section end.
+    val text_len: u32 = image.sections[text_sec].len;
+    var fi0: u32 = 0;
+    for (fi0 < nfuncs) {
+        var end: u32 = text_len;
+        if (fi0 + 1 < nfuncs) { end = funcs[fi0 + 1].offset; }
+        funcs[fi0].size = end - funcs[fi0].offset;
+        fi0 = fi0 + 1;
+    }
+
+    # pre-populate the file table so the line header lists every file it references.
+    var ft: FileTable;
+    ft.count = 0;
+    var r: u32 = 0;
+    for (r < row_count) {
+        if (rows[r].sec == text_sec && source.loc_is_valid(rows[r].loc)) {
+            file_index(?ft, rows[r].loc.file);
+        }
+        r = r + 1;
+    }
+
+    var name: str = comp_dir;
+    if (ft.count > 0) { name = file_path(s, ft.ids[0]); }
+
+    # subprograms cover only this module's own (non-weak) functions. a weak
+    # generic-instance copy is deduplicated by the linker to one winner, so a
+    # non-winning object's subprogram DIE would relocate outside its CU's contiguous
+    # range - an invalid parent/child range. their names return with COMDAT-style
+    # debug info in the multi-TU increment. the line table still covers every function.
+    val rs2: R.Result[*DwFunc, str] = A.allocate[DwFunc](s.alloc, nfuncs::usize);
+    if (R.is_err[*DwFunc, str](rs2)) { A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize); ret R.err[bool, str](R.unwrap_err[*DwFunc, str](rs2)); }
+    val subs: *DwFunc = R.unwrap_ok[*DwFunc, str](rs2);
+    var nsub: u32 = 0;
+    var si: u32 = 0;
+    for (si < nfuncs) {
+        if (!funcs[si].weak) { subs[nsub] = funcs[si]; nsub = nsub + 1; }
+        si = si + 1;
+    }
+
+    # the CU code range spans the subprogram functions (the ones this object keeps),
+    # so every emitted subprogram is contained; a module of only weak instances keeps
+    # the full-range fallback and emits no subprograms.
+    var cu_low_name: intern.StrId = funcs[0].name;
+    var high_pc: u64 = (funcs[nfuncs - 1].offset + funcs[nfuncs - 1].size - funcs[0].offset)::u64;
+    if (nsub > 0) {
+        cu_low_name = subs[0].name;
+        high_pc = (subs[nsub - 1].offset + subs[nsub - 1].size - subs[0].offset)::u64;
+    }
+
+    # variable capacity: an upper bound is the total variable-location record count
+    # (each record contributes at most one variable-binding; dedup only reduces it).
+    var var_cap: u32 = varloc_count;
+    if (var_cap == 0) { var_cap = 1; }
+    val rv: R.Result[*DwVar, str] = A.allocate[DwVar](s.alloc, var_cap::usize);
+    if (R.is_err[*DwVar, str](rv)) { A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize); ret R.err[bool, str](R.unwrap_err[*DwVar, str](rv)); }
+    val vars: *DwVar = R.unwrap_ok[*DwVar, str](rv);
+
+    # loclist-range capacity: at most one range per variable-location record.
+    val range_cap: u32 = var_cap;
+    val rgr: R.Result[*LocRange, str] = A.allocate[LocRange](s.alloc, range_cap::usize);
+    if (R.is_err[*LocRange, str](rgr)) {
+        A.deallocate[DwVar](s.alloc, vars, var_cap::usize); A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+        ret R.err[bool, str](R.unwrap_err[*LocRange, str](rgr));
+    }
+    val ranges: *LocRange = R.unwrap_ok[*LocRange, str](rgr);
+
+    # gather types + per-subprogram metadata + variables (+ their loclist ranges),
+    # building the `.debug_str` table as names / type spellings resolve.
+    var tc: TypeCtx = type_ctx_init(s.alloc);
+    var strtab: StrTab;
+    strtab.buf = enc.buf_init(s.alloc);
+    var var_count: u32 = 0;
+    var range_count: u32 = 0;
+    gather_subprograms(s, tgt, irmod, subs, nsub, rows, row_count, varlocs, varloc_count, text_sec, ?ft, address_size,
+                       ?tc, ?strtab, vars, ?var_count, var_cap, ranges, ?range_count, range_cap);
+
+    # a module emits a `.debug_loclists` section only when some variable's home moves.
+    var has_loclists: bool = false;
+    var lv: u32 = 0;
+    for (lv < var_count) { if (vars[lv].loc_kind == VLOC_LOCLIST) { has_loclists = true; } lv = lv + 1; }
+
+    # per-function set_address field offsets, filled by build_line.
+    val ra: R.Result[*u32, str] = A.allocate[u32](s.alloc, nfuncs::usize);
+    if (R.is_err[*u32, str](ra)) {
+        enc.buf_dnit(?strtab.buf); type_ctx_dnit(?tc);
+        A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
+        A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](ra));
+    }
+    val addr_off: *u32 = R.unwrap_ok[*u32, str](ra);
+
+    # the `.debug_info` reloc list: 2 CU + 2 per subprogram (name strp, low_pc addr) +
+    # 1 per named type DIE (base + struct / union name strp) + 1 per aggregate member
+    # (name strp) + up to 2 per variable (name strp, loclist sec_offset) + 2 per inlined
+    # instance (abstract-instance name strp, inlined_subroutine low_pc sym); bounded by
+    # the transition count, an upper bound on the instance count.
+    val reloc_cap: u32 = 2 + 2 * nsub + tc.ntypes + tc.nmemb + 2 * var_count + 2 * inline_pc_count;
+    val rr2: R.Result[*InfoReloc, str] = A.allocate[InfoReloc](s.alloc, reloc_cap::usize);
+    if (R.is_err[*InfoReloc, str](rr2)) {
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); enc.buf_dnit(?strtab.buf);
+        type_ctx_dnit(?tc);
+        A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
+        A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+        ret R.err[bool, str](R.unwrap_err[*InfoReloc, str](rr2));
+    }
+    val info_relocs: *InfoReloc = R.unwrap_ok[*InfoReloc, str](rr2);
+    var info_reloc_count: u32 = 0;
+
+    # the `.debug_loclists` base-address reloc list: one per loclist variable.
+    val loc_reloc_cap: u32 = var_count + 1;
+    val rlr: R.Result[*LocReloc, str] = A.allocate[LocReloc](s.alloc, loc_reloc_cap::usize);
+    if (R.is_err[*LocReloc, str](rlr)) {
+        A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); enc.buf_dnit(?strtab.buf);
+        type_ctx_dnit(?tc);
+        A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
+        A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+        ret R.err[bool, str](R.unwrap_err[*LocReloc, str](rlr));
+    }
+    val loc_relocs: *LocReloc = R.unwrap_ok[*LocReloc, str](rlr);
+    var loc_reloc_count: u32 = 0;
+
+    var b_abbrev:   enc.ByteBuf = enc.buf_init(s.alloc);
+    var b_line:     enc.ByteBuf = enc.buf_init(s.alloc);
+    var b_info:     enc.ByteBuf = enc.buf_init(s.alloc);
+    var b_loclists: enc.ByteBuf = enc.buf_init(s.alloc);
+    var b_rnglists: enc.ByteBuf = enc.buf_init(s.alloc);
+
+    # inlined-subroutine instances: gathered before build_line so their call-site files
+    # are registered in the file table the line header emits. Instances are bounded by the
+    # total inline-site count; ranges by inline_pc_count * max nesting depth (a descendant
+    # extent rolls into every ancestor). gather_inlines errors loudly if either is exceeded.
+    var tot_sites: u32 = 0;
+    var max_depth: u32 = 1;
+    inline_caps(irmod, subs, nsub, ?tot_sites, ?max_depth);
+    var inl_cap: u32 = tot_sites;
+    if (inl_cap == 0) { inl_cap = 1; }
+    var ir_cap: u32 = inline_pc_count * max_depth;
+    if (ir_cap == 0) { ir_cap = 1; }
+    val rinl: R.Result[*DwInline, str] = A.allocate[DwInline](s.alloc, inl_cap::usize);
+    if (R.is_err[*DwInline, str](rinl)) {
+        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
+        A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); type_ctx_dnit(?tc);
+        A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
+        A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+        ret R.err[bool, str](R.unwrap_err[*DwInline, str](rinl));
+    }
+    val inlines: *DwInline = R.unwrap_ok[*DwInline, str](rinl);
+    val rirng: R.Result[*DwInlineRange, str] = A.allocate[DwInlineRange](s.alloc, ir_cap::usize);
+    if (R.is_err[*DwInlineRange, str](rirng)) {
+        A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
+        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
+        A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); type_ctx_dnit(?tc);
+        A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
+        A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+        ret R.err[bool, str](R.unwrap_err[*DwInlineRange, str](rirng));
+    }
+    val iranges: *DwInlineRange = R.unwrap_ok[*DwInlineRange, str](rirng);
+    var ninl: u32 = 0;
+    var nir:  u32 = 0;
+    val rgi: R.Result[bool, str] = gather_inlines(s, irmod, subs, nsub, inline_pcs, inline_pc_count, text_sec, ?ft, inlines, ?ninl, inl_cap, iranges, ?nir, ir_cap);
+    if (R.is_err[bool, str](rgi)) {
+        A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize); A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
+        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
+        A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); type_ctx_dnit(?tc);
+        A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
+        A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+        ret rgi;
+    }
+
+    # a `.debug_rnglists` section only when some instance (nested or not) is multi-extent.
+    var has_rnglists: bool = false;
+    var hr: u32 = 0;
+    for (hr < ninl) { if (inlines[hr].range_count > 1) { has_rnglists = true; } hr = hr + 1; }
+    # one DW_RLE_base_address reloc per multi-extent instance (bounded by the count).
+    val rng_reloc_cap: u32 = inl_cap + 1;
+    val rrr: R.Result[*RngReloc, str] = A.allocate[RngReloc](s.alloc, rng_reloc_cap::usize);
+    if (R.is_err[*RngReloc, str](rrr)) {
+        A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize); A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
+        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
+        A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); type_ctx_dnit(?tc);
+        A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
+        A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+        ret R.err[bool, str](R.unwrap_err[*RngReloc, str](rrr));
+    }
+    val rng_relocs: *RngReloc = R.unwrap_ok[*RngReloc, str](rrr);
+    var rng_reloc_count: u32 = 0;
+
+    # the type-DIE ref4 patch list: one per pointer / array element and one per member
+    # (bounded by the type count + member count), plus a guard slot for an empty table.
+    val fixup_cap: u32 = tc.ntypes + tc.nmemb + 1;
+    val rfx: R.Result[*TypeFixup, str] = A.allocate[TypeFixup](s.alloc, fixup_cap::usize);
+    if (R.is_err[*TypeFixup, str](rfx)) {
+        A.deallocate[RngReloc](s.alloc, rng_relocs, rng_reloc_cap::usize);
+        A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize); A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
+        enc.buf_dnit(?b_rnglists); enc.buf_dnit(?b_loclists); enc.buf_dnit(?b_info); enc.buf_dnit(?b_line); enc.buf_dnit(?b_abbrev); enc.buf_dnit(?strtab.buf);
+        A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize); A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); type_ctx_dnit(?tc);
+        A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
+        A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+        ret R.err[bool, str](R.unwrap_err[*TypeFixup, str](rfx));
+    }
+    val type_fixups: *TypeFixup = R.unwrap_ok[*TypeFixup, str](rfx);
+
+    build_abbrev(?b_abbrev);
+    build_line(s, funcs, nfuncs, rows, row_count, text_sec, address_size, comp_dir, ?ft, ?b_line, addr_off);
+    # loclists / rnglists before info: they stamp each variable's `loclist_off` and each
+    # instance's `rnglist_off`, which build_info patches into the sec_offset fields.
+    if (has_loclists) {
+        build_loclists(?b_loclists, subs, nsub, vars, ranges, address_size, loc_relocs, ?loc_reloc_count);
+    }
+    if (has_rnglists) {
+        build_rnglists(?b_rnglists, subs, nsub, inlines, ninl, iranges, address_size, rng_relocs, ?rng_reloc_count);
+    }
+    var low_off:  u32 = 0;
+    var stmt_off: u32 = 0;
+    build_info(?b_info, address_size, producer, name, comp_dir, high_pc, frame_base_reg(tgt),
+               subs, nsub, ?tc, vars, info_relocs, ?info_reloc_count, ?low_off, ?stmt_off,
+               s, irmod, ?strtab, inlines, ninl, iranges, type_fixups);
+
+    val pr: R.Result[bool, str] = install(s, image, itn, funcs, nfuncs, cu_low_name,
+                                          ?b_abbrev, ?b_line, ?b_info, ?strtab.buf, ?b_loclists, has_loclists,
+                                          ?b_rnglists, has_rnglists, addr_off, low_off, stmt_off, info_relocs, info_reloc_count,
+                                          loc_relocs, loc_reloc_count, rng_relocs, rng_reloc_count);
+
+    enc.buf_dnit(?b_abbrev);
+    enc.buf_dnit(?b_line);
+    enc.buf_dnit(?b_info);
+    enc.buf_dnit(?b_loclists);
+    enc.buf_dnit(?b_rnglists);
+    enc.buf_dnit(?strtab.buf);
+    A.deallocate[TypeFixup](s.alloc, type_fixups, fixup_cap::usize);
+    A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize);
+    A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
+    A.deallocate[RngReloc](s.alloc, rng_relocs, rng_reloc_cap::usize);
+    A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize);
+    A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
+    A.deallocate[u32](s.alloc, addr_off, nfuncs::usize);
+    type_ctx_dnit(?tc);
+    A.deallocate[LocRange](s.alloc, ranges, range_cap::usize);
+    A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
+    A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize);
+    A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+    ret pr;
+}
+
+# resolve each function's subprogram metadata and gather the distinct types its return
+# types reference. Fills `funcs[*].disp`, `disp_off`, `decl_file`, `decl_line`, `ret_ty`,
+# and the type table (`tc`) with the referenced DIEs / string offsets
+# ---
+# s:            session (IR lookup, type universe, source map)
+# irmod:        the IR module supplying disp / ret_sem
+# funcs/nfuncs: the sorted functions (metadata filled in place)
+# rows/row_count: the encoder rows, scanned for each function's first-row location
+# varlocs/varloc_count: the encoder's re-homed variable-location records
+# text_sec:     the `.text` section index
+# ft:           the file table (for decl_file resolution)
+# address_size: target pointer width, for a raw-pointer return's byte size
+# tc:           out - the type table
+# strtab:       out - the `.debug_str` string table
+# vars/var_count/var_cap: out - the shared variable array
+# ranges/range_count/range_cap: out - the shared loclist-range array
+fun gather_subprograms(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
+                       funcs: *DwFunc, nfuncs: u32, rows: *enc.LineRow, row_count: u32,
+                       varlocs: *enc.VarLoc, varloc_count: u32, text_sec: u32,
+                       ft: *FileTable, address_size: u8, tc: *TypeCtx, strtab: *StrTab,
+                       vars: *DwVar, var_count: *u32, var_cap: u32,
+                       ranges: *LocRange, range_count: *u32, range_cap: u32) {
+    var i: u32 = 0;
+    for (i < nfuncs) {
+        val fn: *DwFunc = ?funcs[i];
+        fn.decl_file = 0;
+        fn.decl_line = 0;
+        fn.disp      = intern.STR_NIL;
+        fn.ret_ty    = -1;
+        fn.var_start = @var_count;
+        fn.var_count = 0;
+
+        # look up the IR function for its source name, return type, and dbg vars.
+        var ret_sem: semtype.TypeId = semtype.TYPE_NIL;
+        var irfn: *ir.Function = nil;
+        val opt_idx: O.Option[u32] = ir.function_lookup(irmod, fn.name);
+        if (O.is_some[u32](opt_idx)) {
+            irfn = ?irmod.functions[O.unwrap[u32](opt_idx)];
+            fn.disp = irfn.disp;
+            ret_sem = irfn.ret_sem;
+        }
+
+        # DW_AT_name: the source spelling, or the mangled linkage name when a
+        # synthesized function has none.
+        var nm: str = resolve(?s.interner, fn.disp);
+        if (fn.disp == intern.STR_NIL) { nm = resolve(?s.interner, fn.name); }
+        fn.disp_off = str_off(strtab, nm);
+
+        # decl_file / decl_line: the function's first row in `.text` order.
+        val first: O.Option[source.SrcLoc] = first_row_loc(rows, row_count, text_sec, fn.offset, fn.offset + fn.size);
+        if (O.is_some[source.SrcLoc](first)) {
+            val pl: PosLine = pos_of(s, O.unwrap[source.SrcLoc](first), ft);
+            fn.decl_file = pl.file;
+            fn.decl_line = pl.line::u32;
+        }
+
+        # return type: any resolvable type (a composite un-defers #1907's aggregates).
+        fn.ret_ty = type_intern(s, tgt, irmod, tc, strtab, ret_sem, address_size);
+
+        # variables + parameters: join the encoder's variable-location records for this
+        # function's `.text` range with the IR dbg-var identity.
+        if (irfn != nil) {
+            gather_vars(s, tgt, irmod, irfn, fn.offset, fn.offset + fn.size, varlocs, varloc_count, text_sec,
+                        address_size, tc, strtab, vars, var_count, var_cap, ranges, range_count, range_cap);
+            fn.var_count = @var_count - fn.var_start;
+        }
+        i = i + 1;
+    }
+}
+
+# gather each function's inlined-subroutine instances from the encoder's InlinePc
+# transitions joined with the IR inline-site pool. Every ir inline-site that has emitted
+# `.text` becomes a DwInline whose extents are the transition segments tagged with that
+# site (record j at o_j governs `[o_j, next_within_fn)`); the site's call location gives
+# DW_AT_call_file / DW_AT_call_line. Instances with no surviving `.text` (fully folded
+# away) are dropped. The linear-order range reasoning inherits the #1904 fidelity caveat.
+# ---
+# s:        session (interner + file positions)
+# irmod:    the IR module (inline-site pools)
+# funcs:    the subprogram DwFuncs (offset / size / name)
+# nfuncs:   number of subprograms
+# inline_pcs/inline_pc_count: the encoder's inline-instance transitions
+# ft:       the file table (call-site files are indexed in)
+# out:      the DwInline array to fill; ninl is its running count (in/out), inl_cap its cap
+# iranges:  the shared DwInlineRange array; nir its running count (in/out), ir_cap its cap
+# whether inline instance `k` is `s` itself or an ancestor of `s`, walking `s`'s parent
+# chain in `irfn`'s inline-site pool. Used so a parent instance's PC ranges cover its
+# whole subtree (a nested child's ranges must be contained in its parent's).
+fun inline_ancestor_or_self(irfn: *ir.Function, k: u32, s: u32) bool {
+    var cur: u32 = s;
+    for (cur != 0) {
+        if (cur == k) { ret true; }
+        val ps: *ir.InlineSite = ?irfn.inline_sites[cur - 1];
+        cur = ps.parent;
+    }
+    ret false;
+}
+
+# upper bounds for the inline arrays: the total inline-site count across the subprograms
+# (an exact bound on instances) and the deepest parent chain (ranges roll a descendant's
+# extent into every ancestor, so they are bounded by inline_pc_count * max_depth).
+fun inline_caps(irmod: *ir.Module, funcs: *DwFunc, nfuncs: u32, total: *u32, max_depth: *u32) {
+    @total = 0;
+    @max_depth = 1;
+    var i: u32 = 0;
+    for (i < nfuncs) {
+        val oi: O.Option[u32] = ir.function_lookup(irmod, funcs[i].name);
+        if (O.is_none[u32](oi)) { i = i + 1; cnt; }
+        val irfn: *ir.Function = ?irmod.functions[O.unwrap[u32](oi)];
+        @total = @total + irfn.inline_site_len;
+        var k: u32 = 1;
+        for (k <= irfn.inline_site_len) {
+            var d: u32 = 0;
+            var cur: u32 = k;
+            for (cur != 0) { d = d + 1; val ps: *ir.InlineSite = ?irfn.inline_sites[cur - 1]; cur = ps.parent; }
+            if (d > @max_depth) { @max_depth = d; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fun gather_inlines(s: *session.Session, irmod: *ir.Module, funcs: *DwFunc, nfuncs: u32,
+                   inline_pcs: *enc.InlinePc, inline_pc_count: u32, text_sec: u32, ft: *FileTable,
+                   out: *DwInline, ninl: *u32, inl_cap: u32,
+                   iranges: *DwInlineRange, nir: *u32, ir_cap: u32) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < nfuncs) {
+        val opt_idx: O.Option[u32] = ir.function_lookup(irmod, funcs[i].name);
+        if (O.is_none[u32](opt_idx)) { i = i + 1; cnt; }
+        val irfn: *ir.Function = ?irmod.functions[O.unwrap[u32](opt_idx)];
+        if (irfn.inline_site_len == 0) { i = i + 1; cnt; }
+        val lo: u32 = funcs[i].offset;
+        val hi: u32 = funcs[i].offset + funcs[i].size;
+
+        var k: u32 = 1;
+        for (k <= irfn.inline_site_len) {
+            if (@ninl >= inl_cap) { ret R.err[bool, str]("dwarf.gather_inlines: inline-instance capacity exceeded"); }
+            val site: *ir.InlineSite = ?irfn.inline_sites[k - 1];
+            val di: *DwInline = ?out[@ninl];
+            di.func_idx    = i;
+            di.callee      = site.callee;
+            di.origin_off  = 0;
+            di.parent      = site.parent;
+            di.site_id     = k;
+            di.range_start = @nir;
+            di.range_count = 0;
+            di.rnglist_off = 0;
+            if (source.loc_is_valid(site.call_loc)) {
+                file_index(ft, site.call_loc.file);
+                val pl: PosLine = pos_of(s, site.call_loc, ft);
+                di.call_file = pl.file;
+                di.call_line = pl.line::u32;
+            }
+            or {
+                # no call-site location: attribute to the enclosing function's file rather
+                # than file index 0, which is out of range when the file table is empty.
+                di.call_file = funcs[i].decl_file;
+                di.call_line = funcs[i].decl_line;
+            }
+
+            var j: u32 = 0;
+            for (j < inline_pc_count) {
+                val o: u32 = inline_pcs[j].text_offset;
+                if (inline_pcs[j].sec == text_sec && o >= lo && o < hi && inline_ancestor_or_self(irfn, k, inline_pcs[j].inline_site)) {
+                    # the segment ends at the next same-section transition (skipping any
+                    # other-section records), clamped to the function end. Two records at
+                    # the same offset (a zero-byte site change) make seg_end == o, a
+                    # zero-length segment that is dropped rather than over-extended to hi.
+                    var seg_end: u32 = hi;
+                    var jn: u32 = j + 1;
+                    for (jn < inline_pc_count && inline_pcs[jn].sec != text_sec) { jn = jn + 1; }
+                    if (jn < inline_pc_count && inline_pcs[jn].text_offset < hi) { seg_end = inline_pcs[jn].text_offset; }
+                    if (o < seg_end) {
+                        if (@nir >= ir_cap) { ret R.err[bool, str]("dwarf.gather_inlines: inline-range capacity exceeded"); }
+                        iranges[@nir].start = o;
+                        iranges[@nir].end   = seg_end;
+                        @nir = @nir + 1;
+                        di.range_count = di.range_count + 1;
+                    }
+                }
+                j = j + 1;
+            }
+
+            if (di.range_count > 0) { @ninl = @ninl + 1; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# gather one function's DWARF variables from the encoder's variable-location records.
+# Every record whose PC falls in `[lo, hi)` joins its OP_DBG_VALUE `iid` to the IR
+# dbg-var identity (name / semantic type / param flag); named, primitive-typed
+# variables get a DwVar. Each variable's bindings become PC-ordered LocRanges; a
+# variable whose real homes all agree keeps a single inline exprloc, one whose homes
+# disagree becomes a VLOC_LOCLIST with per-PC ranges. A variable's type is interned
+# through `type_intern`, so aggregates and typed pointers carry their composite DIE
+# ---
+# s/tgt:        session + target (the ISA dwarf_reg hook, member layout)
+# irmod:        the IR module (IR type universe for composite layout)
+# irfn:         the IR function (dbg-var / dbg-expr side tables)
+# lo/hi:        the function's `.text` byte range
+# varlocs/varloc_count: the encoder's variable-location records
+# text_sec:     the `.text` section index (records in other sections are skipped)
+# address_size: pointer width, for a raw-pointer base type
+# tc:           the type table
+# strtab:       the `.debug_str` string table
+# vars/var_count/var_cap:       the shared variable array
+# ranges/range_count/range_cap: the shared loclist-range array
+fun gather_vars(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, irfn: *ir.Function, lo: u32, hi: u32,
+                varlocs: *enc.VarLoc, varloc_count: u32, text_sec: u32, address_size: u8,
+                tc: *TypeCtx, strtab: *StrTab, vars: *DwVar, var_count: *u32, var_cap: u32,
+                ranges: *LocRange, range_count: *u32, range_cap: u32) {
+    val fn_var_start: u32 = @var_count;
+
+    # phase A: discover this function's distinct source variables (deduped by name).
+    var i: u32 = 0;
+    for (i < varloc_count) {
+        val vl: *enc.VarLoc = ?varlocs[i];
+        if (vl.sec != text_sec || vl.text_offset < lo || vl.text_offset >= hi) { i = i + 1; cnt; }
+        val obt: O.Option[u32] = varloc_ident(s, tgt, irmod, irfn, vl, address_size, tc, strtab);
+        if (O.is_none[u32](obt)) { i = i + 1; cnt; }
+        val name_off: u32 = O.unwrap[u32](obt);
+        # the inline instance this variable lives in (0 = the caller's own body); a caller
+        # local and an identically-named inlined local are DISTINCT scopes, so the dedup
+        # key is (name_off, inline_site), not name alone.
+        val vsite: u32 = ir.instr_inline_site_of(irfn, vl.iid::id.InstructionId);
+
+        var found: bool = false;
+        var j: u32 = fn_var_start;
+        for (j < @var_count) { if (vars[j].name_off == name_off && vars[j].inline_site == vsite) { found = true; } j = j + 1; }
+        if (!found && @var_count < var_cap) {
+            val dv: *ir.DbgVar = O.unwrap[*ir.DbgVar](ir.dbg_var_get(irfn, vl.iid::id.InstructionId));
+            val ty: i32 = type_intern(s, tgt, irmod, tc, strtab, dv.ty_sem, address_size);
+            vars[@var_count].name_off    = name_off;
+            vars[@var_count].ty          = ty;
+            vars[@var_count].is_param    = dv.is_param;
+            vars[@var_count].loc_kind    = VLOC_NONE;
+            vars[@var_count].reg         = 0;
+            vars[@var_count].offset      = 0;
+            vars[@var_count].net         = 0;
+            vars[@var_count].range_start = 0;
+            vars[@var_count].range_count = 0;
+            vars[@var_count].loclist_off = 0;
+            vars[@var_count].inline_site = vsite;
+            vars[@var_count].byref       = type_is_aggregate(tc, ty);
+            @var_count = @var_count + 1;
+        }
+        i = i + 1;
+    }
+
+    # phase B: per variable, collect its bindings as contiguous PC-ordered ranges, then
+    # classify the location tier.
+    var vi: u32 = fn_var_start;
+    for (vi < @var_count) {
+        val v: *DwVar = ?vars[vi];
+        v.range_start = @range_count;
+        var k: u32 = 0;
+        for (k < varloc_count) {
+            val vl: *enc.VarLoc = ?varlocs[k];
+            if (vl.sec != text_sec || vl.text_offset < lo || vl.text_offset >= hi) { k = k + 1; cnt; }
+            if (@range_count >= range_cap) { k = k + 1; cnt; }
+            val oid: O.Option[u32] = varloc_ident(s, tgt, irmod, irfn, vl, address_size, tc, strtab);
+            if (O.is_none[u32](oid)) { k = k + 1; cnt; }
+            if (O.unwrap[u32](oid) != v.name_off) { k = k + 1; cnt; }
+
+            var kind: u8 = VLOC_NONE;
+            var reg:  i32 = 0;
+            var off:  i64 = 0;
+            varloc_home(tgt, vl, ?kind, ?reg, ?off);
+            # a binding with no register/frame home may still be a compile-time constant
+            # (a folded local): render it as a computed DW_OP_const value rather than
+            # dropping the location. the constant lives in `off` for VLOC_CONST.
+            if (kind == VLOC_NONE) {
+                val oc: O.Option[i64] = ir.dbg_value_const(irfn, vl.iid::id.InstructionId);
+                if (O.is_some[i64](oc)) { kind = VLOC_CONST; off = O.unwrap[i64](oc); }
+            }
+            ranges[@range_count].start = vl.text_offset;
+            ranges[@range_count].end   = hi;
+            ranges[@range_count].kind  = kind;
+            ranges[@range_count].reg   = reg;
+            ranges[@range_count].off   = off;
+            ranges[@range_count].net   = dbg_expr_net(irfn, vl.iid::id.InstructionId);
+            @range_count = @range_count + 1;
+            k = k + 1;
+        }
+        v.range_count = @range_count - v.range_start;
+
+        # order by PC; a binding governs until the next binding's start, the last to hi.
+        sort_ranges(ranges, v.range_start, @range_count);
+        var r: u32 = v.range_start;
+        for (r + 1 < @range_count) { ranges[r].end = ranges[r + 1].start; r = r + 1; }
+
+        classify_var(v, ranges);
+        vi = vi + 1;
+    }
+}
+
+# join a variable-location record to its IR dbg-var identity and return the variable's
+# `.debug_str` name offset, or none when the binding has no named, DIE-carrying source
+# variable (so it contributes no DIE). Interns the name and type as a side effect
+# (idempotent - a repeat resolves to the same offsets)
+# ---
+# s:            session (interner, type universe)
+# tgt:          resolved target (member layout via the IR type table)
+# irmod:        the IR module (IR type universe for composite layout)
+# irfn:         the IR function holding the dbg-var side table
+# vl:           the variable-location record (its `iid` joins the identity)
+# address_size: pointer width, for a raw-pointer base type
+# tc:           the type table
+# strtab:       the `.debug_str` string table
+# ret:          the variable's name offset, or none
+fun varloc_ident(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, irfn: *ir.Function,
+                 vl: *enc.VarLoc, address_size: u8, tc: *TypeCtx, strtab: *StrTab) O.Option[u32] {
+    val odv: O.Option[*ir.DbgVar] = ir.dbg_var_get(irfn, vl.iid::id.InstructionId);
+    if (O.is_none[*ir.DbgVar](odv)) { ret O.none[u32](); }
+    val dv: *ir.DbgVar = O.unwrap[*ir.DbgVar](odv);
+    if (dv.name == intern.STR_NIL) { ret O.none[u32](); }
+    if (type_intern(s, tgt, irmod, tc, strtab, dv.ty_sem, address_size) < 0) { ret O.none[u32](); }
+    ret O.some[u32](str_off(strtab, resolve(?s.interner, dv.name)));
+}
+
+# insertion-sort a variable's LocRange slice `[start, end)` by ascending PC start
+# (binding counts per variable are tiny)
+# ---
+# ranges: the shared range array
+# start:  inclusive slice start
+# end:    exclusive slice end
+fun sort_ranges(ranges: *LocRange, start: u32, end: u32) {
+    var a: u32 = start + 1;
+    for (a < end) {
+        val key: LocRange = ranges[a];
+        var b: i64 = a::i64 - 1;
+        for (b >= start::i64 && ranges[b::u32].start > key.start) {
+            ranges[(b + 1)::u32] = ranges[b::u32];
+            b = b - 1;
+        }
+        ranges[(b + 1)::u32] = key;
+        a = a + 1;
+    }
+}
+
+# whether a range is a real, describable home for variable `v`. An optimized-out binding
+# (VLOC_NONE) never is. For a by-reference aggregate a REGISTER home never is either: the
+# register holds the storage address only transiently and is reused, so describing the
+# aggregate from it whole-scope would dereference a stale value (a wild read) - such a
+# variable is located only from a frame slot (scope-stable) or omitted
+# ---
+# v:  the variable the range belongs to
+# rg: the range to test
+# ret: true when the range names a home the producer can faithfully describe
+fun range_real_home(v: *DwVar, rg: *LocRange) bool {
+    if (rg.kind == VLOC_NONE) { ret false; }
+    if (v.byref && rg.kind == VLOC_REG) { ret false; }
+    ret true;
+}
+
+# classify a variable's location tier from its gathered ranges: VLOC_NONE when no
+# binding has a real home (every binding optimized out, or - for a byref aggregate -
+# only register homes, which it cannot describe); a single inline exprloc (VLOC_REG /
+# VLOC_FRAME, `range_count` cleared) when every real binding agrees on one home;
+# VLOC_LOCLIST (ranges kept) when two real homes disagree. A non-real binding never
+# constrains a stationary home - it only introduces a loclist gap
+# ---
+# v:      the variable to classify (loc_kind / home / range_count set in place)
+# ranges: the shared range array (this variable's slice is `[range_start, +range_count)`)
+fun classify_var(v: *DwVar, ranges: *LocRange) {
+    var first: i32 = -1;
+    var multi: bool = false;
+    var r: u32 = v.range_start;
+    val end: u32 = v.range_start + v.range_count;
+    for (r < end) {
+        if (range_real_home(v, ?ranges[r])) {
+            if (first < 0) {
+                first = r::i32;
+            } or (!home_eq(ranges[first::u32].kind, ranges[first::u32].reg, ranges[first::u32].off, ranges[first::u32].net,
+                           ranges[r].kind, ranges[r].reg, ranges[r].off, ranges[r].net)) {
+                multi = true;
+            }
+        }
+        r = r + 1;
+    }
+    if (first < 0) { v.loc_kind = VLOC_NONE; v.range_count = 0; ret; }
+    if (multi)     { v.loc_kind = VLOC_LOCLIST; ret; }
+    v.loc_kind    = ranges[first::u32].kind;
+    v.reg         = ranges[first::u32].reg;
+    v.offset      = ranges[first::u32].off;
+    v.net         = ranges[first::u32].net;
+    v.range_count = 0;
+}
+
+# find or append a base type by spelling, returning its type index. Resolves the type's
+# name string offset on first insertion
+# ---
+# tc:     the type context (base types dedup against its TK_BASE entries)
+# strtab: the string table, for the name's `.debug_str` offset
+# bt:     the base type DIE to intern (kind TK_BASE, name / encoding / byte_size set)
+# ret:    the base type's index, or -1 on allocation failure
+fun base_intern(tc: *TypeCtx, strtab: *StrTab, bt: TypeDie) i32 {
+    var i: u32 = 0;
+    for (i < tc.ntypes) {
+        if (tc.types[i].kind == TK_BASE && str_equals(tc.types[i].name, bt.name)) { ret i::i32; }
+        i = i + 1;
+    }
+    if (!type_reserve(tc)) { ret -1; }
+    var e: TypeDie = bt;
+    e.name_off = str_off(strtab, bt.name);
+    e.off      = 0;
+    tc.types[tc.ntypes] = e;
+    tc.ntypes = tc.ntypes + 1;
+    ret (tc.ntypes - 1)::i32;
+}
+
+# find an already-interned composite type by semantic TypeId, or -1. Composites (unlike
+# base types, which dedup by spelling) are keyed by their semantic identity, so a nominal
+# and a distinct type with the same layout stay separate DIEs
+# ---
+# tc:  the type table
+# sem: the semantic TypeId to look for
+# ret: the type's index, or -1 when absent
+fun comp_find(tc: *TypeCtx, sem: semtype.TypeId) i32 {
+    var i: u32 = 0;
+    for (i < tc.ntypes) {
+        if (tc.types[i].kind != TK_BASE && tc.types[i].sem == sem) { ret i::i32; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# append a composite TypeDie of `kind` keyed by `sem`, with zeroed structural links, and
+# return its index (or -1 on allocation failure). Registering the entry before recursing
+# into its children makes self-referential aggregates (a struct reached again through one
+# of its `*T` members) terminate on the second visit
+# ---
+# tc:   the type table
+# kind: the composite TK_* kind
+# sem:  the semantic identity (dedup key)
+# ret:  the new type's index, or -1
+fun comp_reserve(tc: *TypeCtx, kind: u8, sem: semtype.TypeId) i32 {
+    if (!type_reserve(tc)) { ret -1; }
+    val ix: u32 = tc.ntypes;
+    tc.types[ix].kind       = kind;
+    tc.types[ix].sem        = sem;
+    tc.types[ix].off        = 0;
+    tc.types[ix].name       = "";
+    tc.types[ix].name_off   = 0;
+    tc.types[ix].encoding   = 0;
+    tc.types[ix].byte_size  = 0;
+    tc.types[ix].elem       = -1;
+    tc.types[ix].count      = 0;
+    tc.types[ix].memb_start = 0;
+    tc.types[ix].memb_count = 0;
+    tc.ntypes = tc.ntypes + 1;
+    ret ix::i32;
+}
+
+# the source spelling of a nominal record / union for DW_AT_name, or "" for an anonymous
+# composite (a generic instance or an unnamed shape) that carries no nominal name
+# ---
+# s:   session (interner)
+# t:   the semantic Type
+# ret: the name, or ""
+fun comp_name(s: *session.Session, t: *semtype.Type) str {
+    if (t.kind == semtype.TYPE_REC || t.kind == semtype.TYPE_UNI) { ret resolve(?s.interner, t.data.nominal.name); }
+    ret "";
+}
+
+# intern a semantic type into the compile unit's type table, returning its type index, or
+# -1 when the type carries no DIE (void / unresolved). Primitive scalars become base type
+# DIEs; typed pointers, arrays, records, and unions become composite DIEs whose member
+# layout is read from the IR type (the single layout authority, via `sem_to_ir`) and whose
+# names come from the semantic type. Idempotent - a repeat resolves to the same index
+# ---
+# s:            session (semantic type universe, interner, allocator)
+# tgt:          resolved target (member layout via the IR type table)
+# irmod:        the IR module (IR type universe for composite layout)
+# tc:           the type table
+# strtab:       the `.debug_str` string table
+# sem:          the semantic TypeId to intern
+# address_size: target pointer width, for a raw / typed pointer byte size
+# ret:          the type's index in `tc`, or -1
+fun type_intern(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, tc: *TypeCtx,
+                strtab: *StrTab, sem: semtype.TypeId, address_size: u8) i32 {
+    if (sem == semtype.TYPE_NIL || sem == semtype.TYPE_ERROR) { ret -1; }
+    val to: O.Option[*semtype.Type] = semtype.get(?s.types, sem);
+    if (O.is_none[*semtype.Type](to)) { ret -1; }
+    val t: *semtype.Type = O.unwrap[*semtype.Type](to);
+    val kind: semtype.TypeKind = t.kind;
+
+    # secrecy is representation-transparent: `^T` interns as exactly `T`.
+    if (kind == semtype.TYPE_SECRET) { ret type_intern(s, tgt, irmod, tc, strtab, t.data.secret.base, address_size); }
+
+    # primitive scalars (incl. the raw opaque `ptr`) become base type DIEs.
+    val obt: O.Option[TypeDie] = sem_base_type(s, sem, address_size);
+    if (O.is_some[TypeDie](obt)) { ret base_intern(tc, strtab, O.unwrap[TypeDie](obt)); }
+
+    # composites dedup by semantic identity.
+    val found: i32 = comp_find(tc, sem);
+    if (found >= 0) { ret found; }
+
+    if (kind == semtype.TYPE_POINTER) {
+        # capture the pointee TypeId before recursing: interning it can grow s.types and
+        # dangle `t`.
+        val ptee: semtype.TypeId = t.data.pointer.base;
+        val pe: i32 = type_intern(s, tgt, irmod, tc, strtab, ptee, address_size);
+        # the pointee recursion may have interned THIS exact pointer already (a cycle, e.g.
+        # rec Node { next: *Node } reached via a `*Node` local), so re-dedup rather than
+        # emit a second identical DIE.
+        val f2: i32 = comp_find(tc, sem);
+        if (f2 >= 0) { ret f2; }
+        # a typed pointer resolves its pointee; an unresolvable pointee (void-like) degrades
+        # to the raw opaque `ptr` base type rather than a pointer to nothing.
+        if (pe < 0) { ret base_intern(tc, strtab, ptr_base_type(address_size)); }
+        val ix: i32 = comp_reserve(tc, TK_POINTER, sem);
+        if (ix < 0) { ret -1; }
+        tc.types[ix::u32].elem      = pe;
+        tc.types[ix::u32].byte_size = address_size::u32;
+        ret ix;
+    }
+
+    if (kind == semtype.TYPE_ARRAY) {
+        # capture element type + count before recursing: interning the element can grow
+        # s.types and dangle `t` (a stale `t.data.array.count` would be a garbage length).
+        val ebase: semtype.TypeId = t.data.array.base;
+        val ecount: u32 = t.data.array.count;
+        val el: i32 = type_intern(s, tgt, irmod, tc, strtab, ebase, address_size);
+        if (el < 0) { ret -1; }
+        val f2: i32 = comp_find(tc, sem);   # element recursion may have interned this array (cycle)
+        if (f2 >= 0) { ret f2; }
+        val ix: i32 = comp_reserve(tc, TK_ARRAY, sem);
+        if (ix < 0) { ret -1; }
+        tc.types[ix::u32].elem  = el;
+        tc.types[ix::u32].count = ecount;
+        ret ix;
+    }
+
+    if (kind == semtype.TYPE_REC || kind == semtype.TYPE_UNI || kind == semtype.TYPE_INSTANCE) {
+        ret struct_intern(s, tgt, irmod, tc, strtab, sem, address_size);
+    }
+
+    # an unresolved type here (an unsubstituted generic parameter / pack, or a first-class
+    # function value) has no faithful composite DIE: omit it rather than misattribute it to
+    # a raw `ptr` - conservative omission beats a wrong DW_AT_type that aliases every
+    # instantiation to one address-typed DIE.
+    ret -1;
+}
+
+# intern a record / union / generic-instance as a TK_STRUCT / TK_UNION DIE with a
+# DW_TAG_member child per field. Member offsets and the aggregate size come from the IR
+# type (`sem_to_ir`, the layout authority); member names and types come from the semantic
+# field table. The entry is registered before its fields recurse, so a self-referential
+# aggregate terminates
+# ---
+# s/tgt/irmod:  session / target / IR module
+# tc:           the type table
+# strtab:       the `.debug_str` string table
+# sem:          the aggregate's semantic TypeId
+# address_size: target pointer width
+# ret:          the type's index, or -1
+fun struct_intern(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, tc: *TypeCtx,
+                  strtab: *StrTab, sem: semtype.TypeId, address_size: u8) i32 {
+    # the IR type is the single layout authority; without it we cannot place members.
+    # sem_to_ir can materialize a generic instance's field table (ensure_fields), growing
+    # s.types and reallocating it - so every borrow into s.types must be taken AFTER it.
+    val rir: R.Result[ir_type.IrTypeId, str] = sem_to_ir(s, irmod, sem);
+    if (R.is_err[ir_type.IrTypeId, str](rir)) { ret -1; }
+    val ir_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rir);
+
+    # re-fetch the semantic type now that interning has settled; a pointer taken before
+    # sem_to_ir would dangle.
+    val to: O.Option[*semtype.Type] = semtype.get(?s.types, sem);
+    if (O.is_none[*semtype.Type](to)) { ret -1; }
+    val t: *semtype.Type = O.unwrap[*semtype.Type](to);
+
+    var tk: u8 = TK_STRUCT;
+    if (t.kind == semtype.TYPE_UNI) { tk = TK_UNION; }
+    # resolve the name string before any further interning (comp_name reads `t`).
+    val name_off: u32 = str_off(strtab, comp_name(s, t));
+    val bsize: u32 = ir_type.byte_size(?irmod.types, ir_ty, tgt);
+
+    val ix: i32 = comp_reserve(tc, tk, sem);
+    if (ix < 0) { ret -1; }
+    tc.types[ix::u32].name_off  = name_off;
+    tc.types[ix::u32].byte_size = bsize;
+
+    val nfields: u32 = semtype.field_count(?s.types, sem);
+
+    # pass 1: intern every field type first, so all descendant types and their members
+    # are appended before this aggregate's own contiguous member run.
+    var i: u32 = 0;
+    for (i < nfields) {
+        val fe: O.Option[*semtype.FieldEntry] = semtype.field_at(?s.types, sem, i);
+        if (O.is_some[*semtype.FieldEntry](fe)) {
+            val fty_sem: semtype.TypeId = O.unwrap[*semtype.FieldEntry](fe).ty;   # capture before recursion (fe may dangle)
+            type_intern(s, tgt, irmod, tc, strtab, fty_sem, address_size);
+        }
+        i = i + 1;
+    }
+
+    # pass 2: append this aggregate's members contiguously (the field re-intern is a cheap
+    # dedup hit). A member whose type is unresolvable is skipped rather than mistyped.
+    val memb_start: u32 = tc.nmemb;
+    var count: u32 = 0;
+    var j: u32 = 0;
+    for (j < nfields) {
+        val fe: O.Option[*semtype.FieldEntry] = semtype.field_at(?s.types, sem, j);
+        if (O.is_none[*semtype.FieldEntry](fe)) { j = j + 1; cnt; }
+        # capture the field's type + name before type_intern: interning can grow s.types
+        # and dangle `fe`.
+        val f_ty:   semtype.TypeId = O.unwrap[*semtype.FieldEntry](fe).ty;
+        val f_name: intern.StrId   = O.unwrap[*semtype.FieldEntry](fe).name;
+        val fty: i32 = type_intern(s, tgt, irmod, tc, strtab, f_ty, address_size);
+        if (fty < 0) { j = j + 1; cnt; }
+        if (!memb_reserve(tc)) { j = j + 1; cnt; }
+        tc.membs[tc.nmemb].name_off = str_off(strtab, resolve(?s.interner, f_name));
+        tc.membs[tc.nmemb].type_ix  = fty::u32;
+        tc.membs[tc.nmemb].offset   = ir_type.byte_offset(?irmod.types, ir_ty, j, tgt);
+        tc.nmemb = tc.nmemb + 1;
+        count = count + 1;
+        j = j + 1;
+    }
+    tc.types[ix::u32].memb_start = memb_start;
+    tc.types[ix::u32].memb_count = count;
+    ret ix;
+}
+
+# a DWARF base type for the target's raw address (`ptr`): the fallback DIE for a pointer
+# whose pointee carries no type
+# ---
+# address_size: target pointer width in bytes
+# ret:          a TK_BASE `ptr` type DIE
+fun ptr_base_type(address_size: u8) TypeDie {
+    var bt: TypeDie;
+    bt.kind       = TK_BASE;
+    bt.name       = "ptr";
+    bt.sem        = semtype.TYPE_NIL;
+    bt.off        = 0;
+    bt.name_off   = 0;
+    bt.encoding   = DW_ATE_address;
+    bt.byte_size  = address_size::u32;
+    bt.elem       = -1;
+    bt.count      = 0;
+    bt.memb_start = 0;
+    bt.memb_count = 0;
+    ret bt;
+}
+
+# the source location of a function's first row in `.text` order (the lowest-offset
+# row within `[start, end)`), or none when the function has no rows
+# ---
+# rows/row_count: the encoder rows
+# text_sec:  the `.text` section index
+# start/end: the function's byte range
+# ret:       the first row's location, or none
+fun first_row_loc(rows: *enc.LineRow, row_count: u32, text_sec: u32, start: u32, end: u32) O.Option[source.SrcLoc] {
+    var found: bool = false;
+    var best_off: u32 = 0;
+    var best_loc: source.SrcLoc;
+    var r: u32 = 0;
+    for (r < row_count) {
+        val row: *enc.LineRow = ?rows[r];
+        if (row.sec == text_sec && row.text_offset >= start && row.text_offset < end && source.loc_is_valid(row.loc)) {
+            if (!found || row.text_offset < best_off) {
+                found = true; best_off = row.text_offset; best_loc = row.loc;
+            }
+        }
+        r = r + 1;
+    }
+    if (found) { ret O.some[source.SrcLoc](best_loc); }
+    ret O.none[source.SrcLoc]();
+}
+
+# add the built sections, the per-module `.debug_line` / `.debug_str` anchors, and
+# every relocation to the image. split out so `produce` frees its scratch buffers on
+# every path
+# ---
+# s:        session, for interning names
+# image:    the object image
+# itn:      the session interner
+# funcs:    the sorted function ranges (every function, for the line table)
+# nfuncs:   number of functions
+# cu_low_name: symbol the CU DW_AT_low_pc relocates to (the lowest subprogram)
+# b_abbrev/b_line/b_info/b_str: the built section bytes
+# b_loclists: the built `.debug_loclists` bytes (empty when has_loclists is false)
+# has_loclists: true when some variable's home moves (install the loclists section)
+# addr_off: per-function set_address field offsets in `.debug_line`
+# low_off:  low_pc field offset in `.debug_info`
+# stmt_off: stmt_list field offset in `.debug_info`
+# info_relocs/info_reloc_count: the deferred `.debug_info` relocations
+# loc_relocs/loc_reloc_count:   the deferred `.debug_loclists` base-address relocations
+# ret:      ok(true), or an allocation error
+fun install(s: *session.Session, image: *of.ObjectImage, itn: *intern.Interner,
+            funcs: *DwFunc, nfuncs: u32, cu_low_name: intern.StrId, b_abbrev: *enc.ByteBuf, b_line: *enc.ByteBuf,
+            b_info: *enc.ByteBuf, b_str: *enc.ByteBuf, b_loclists: *enc.ByteBuf, has_loclists: bool,
+            b_rnglists: *enc.ByteBuf, has_rnglists: bool,
+            addr_off: *u32, low_off: u32, stmt_off: u32,
+            info_relocs: *InfoReloc, info_reloc_count: u32,
+            loc_relocs: *LocReloc, loc_reloc_count: u32,
+            rng_relocs: *RngReloc, rng_reloc_count: u32) R.Result[bool, str] {
+    val n_abbrev: R.Result[intern.StrId, str] = intern.intern(itn, ".debug_abbrev");
+    if (R.is_err[intern.StrId, str](n_abbrev)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](n_abbrev)); }
+    val n_line: R.Result[intern.StrId, str] = intern.intern(itn, ".debug_line");
+    if (R.is_err[intern.StrId, str](n_line)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](n_line)); }
+    val n_info: R.Result[intern.StrId, str] = intern.intern(itn, ".debug_info");
+    if (R.is_err[intern.StrId, str](n_info)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](n_info)); }
+    val n_str: R.Result[intern.StrId, str] = intern.intern(itn, ".debug_str");
+    if (R.is_err[intern.StrId, str](n_str)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](n_str)); }
+
+    val ra: R.Result[u32, str] = add_debug_section(image, R.unwrap_ok[intern.StrId, str](n_abbrev), b_abbrev);
+    if (R.is_err[u32, str](ra)) { ret R.err[bool, str](R.unwrap_err[u32, str](ra)); }
+    val rl: R.Result[u32, str] = add_debug_section(image, R.unwrap_ok[intern.StrId, str](n_line), b_line);
+    if (R.is_err[u32, str](rl)) { ret R.err[bool, str](R.unwrap_err[u32, str](rl)); }
+    val line_sec: u32 = R.unwrap_ok[u32, str](rl);
+    val ri: R.Result[u32, str] = add_debug_section(image, R.unwrap_ok[intern.StrId, str](n_info), b_info);
+    if (R.is_err[u32, str](ri)) { ret R.err[bool, str](R.unwrap_err[u32, str](ri)); }
+    val info_sec: u32 = R.unwrap_ok[u32, str](ri);
+    val rs: R.Result[u32, str] = add_debug_section(image, R.unwrap_ok[intern.StrId, str](n_str), b_str);
+    if (R.is_err[u32, str](rs)) { ret R.err[bool, str](R.unwrap_err[u32, str](rs)); }
+    val str_sec: u32 = R.unwrap_ok[u32, str](rs);
+
+    # a per-module-unique anchor at .debug_line offset 0 for the stmt_list reloc.
+    val anchor_r: R.Result[intern.StrId, str] = intern_anchor(itn, resolve(itn, image.name), ".debug_line");
+    if (R.is_err[intern.StrId, str](anchor_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](anchor_r)); }
+    val anchor: intern.StrId = R.unwrap_ok[intern.StrId, str](anchor_r);
+    val sr: R.Result[u32, str] = add_anchor(image, anchor, line_sec);
+    if (R.is_err[u32, str](sr)) { ret R.err[bool, str](R.unwrap_err[u32, str](sr)); }
+
+    # a per-module-unique anchor at .debug_str offset 0 for the strp relocs.
+    val sanchor_r: R.Result[intern.StrId, str] = intern_anchor(itn, resolve(itn, image.name), ".debug_str");
+    if (R.is_err[intern.StrId, str](sanchor_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sanchor_r)); }
+    val str_anchor: intern.StrId = R.unwrap_ok[intern.StrId, str](sanchor_r);
+    val sar: R.Result[u32, str] = add_anchor(image, str_anchor, str_sec);
+    if (R.is_err[u32, str](sar)) { ret R.err[bool, str](R.unwrap_err[u32, str](sar)); }
+
+    # `.debug_loclists` + its anchor, only when some variable uses a location list. the
+    # anchor at offset 0 lets the DW_FORM_sec_offset location pointers (abs32 + addend)
+    # resolve into this module's contribution after the linker concatenates the section.
+    var loclists_sec: u32 = 0;
+    var loclists_anchor: intern.StrId = intern.STR_NIL;
+    if (has_loclists) {
+        val n_ll: R.Result[intern.StrId, str] = intern.intern(itn, ".debug_loclists");
+        if (R.is_err[intern.StrId, str](n_ll)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](n_ll)); }
+        val rll: R.Result[u32, str] = add_debug_section(image, R.unwrap_ok[intern.StrId, str](n_ll), b_loclists);
+        if (R.is_err[u32, str](rll)) { ret R.err[bool, str](R.unwrap_err[u32, str](rll)); }
+        loclists_sec = R.unwrap_ok[u32, str](rll);
+        val llanchor_r: R.Result[intern.StrId, str] = intern_anchor(itn, resolve(itn, image.name), ".debug_loclists");
+        if (R.is_err[intern.StrId, str](llanchor_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](llanchor_r)); }
+        loclists_anchor = R.unwrap_ok[intern.StrId, str](llanchor_r);
+        val llar: R.Result[u32, str] = add_anchor(image, loclists_anchor, loclists_sec);
+        if (R.is_err[u32, str](llar)) { ret R.err[bool, str](R.unwrap_err[u32, str](llar)); }
+    }
+
+    # `.debug_rnglists` + its anchor, only when some inlined instance is multi-extent;
+    # the anchor at offset 0 lets each inlined_subroutine's DW_AT_ranges sec_offset (abs32
+    # + addend) resolve into this module's contribution after the linker concatenates it.
+    var rnglists_sec: u32 = 0;
+    var rnglists_anchor: intern.StrId = intern.STR_NIL;
+    if (has_rnglists) {
+        val n_rl: R.Result[intern.StrId, str] = intern.intern(itn, ".debug_rnglists");
+        if (R.is_err[intern.StrId, str](n_rl)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](n_rl)); }
+        val rrl: R.Result[u32, str] = add_debug_section(image, R.unwrap_ok[intern.StrId, str](n_rl), b_rnglists);
+        if (R.is_err[u32, str](rrl)) { ret R.err[bool, str](R.unwrap_err[u32, str](rrl)); }
+        rnglists_sec = R.unwrap_ok[u32, str](rrl);
+        val rlanchor_r: R.Result[intern.StrId, str] = intern_anchor(itn, resolve(itn, image.name), ".debug_rnglists");
+        if (R.is_err[intern.StrId, str](rlanchor_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](rlanchor_r)); }
+        rnglists_anchor = R.unwrap_ok[intern.StrId, str](rlanchor_r);
+        val rlar: R.Result[u32, str] = add_anchor(image, rnglists_anchor, rnglists_sec);
+        if (R.is_err[u32, str](rlar)) { ret R.err[bool, str](R.unwrap_err[u32, str](rlar)); }
+    }
+
+    # .debug_info: low_pc -> the CU's lowest subprogram function (abs64), stmt_list ->
+    # .debug_line (abs32).
+    val r1: R.Result[bool, str] = add_reloc(image, info_sec, low_off, of.RK_ABS64, cu_low_name);
+    if (R.is_err[bool, str](r1)) { ret r1; }
+    val r2: R.Result[bool, str] = add_reloc(image, info_sec, stmt_off, of.RK_ABS32, anchor);
+    if (R.is_err[bool, str](r2)) { ret r2; }
+
+    # .debug_info: the deferred subprogram / base-type strp (to .debug_str), low_pc (to
+    # the function symbol), and variable location-list pointer (to .debug_loclists)
+    # relocations.
+    var k: u32 = 0;
+    for (k < info_reloc_count) {
+        val ir2: *InfoReloc = ?info_relocs[k];
+        var sym: intern.StrId = ir2.sym;
+        if (ir2.target == IRLT_STR)     { sym = str_anchor; }
+        or (ir2.target == IRLT_LOCLIST) { sym = loclists_anchor; }
+        or (ir2.target == IRLT_RNGLIST) { sym = rnglists_anchor; }
+        val rk: R.Result[bool, str] = add_reloc_addend(image, info_sec, ir2.off, ir2.kind, sym, ir2.addend);
+        if (R.is_err[bool, str](rk)) { ret rk; }
+        k = k + 1;
+    }
+
+    # .debug_loclists: each DW_LLE_base_address -> its variable's function symbol (abs64).
+    var li: u32 = 0;
+    for (li < loc_reloc_count) {
+        val lr: *LocReloc = ?loc_relocs[li];
+        val rlrx: R.Result[bool, str] = add_reloc(image, loclists_sec, lr.off, of.RK_ABS64, lr.sym);
+        if (R.is_err[bool, str](rlrx)) { ret rlrx; }
+        li = li + 1;
+    }
+
+    # .debug_rnglists: each DW_RLE_base_address -> its instance's enclosing function (abs64).
+    var ri3: u32 = 0;
+    for (ri3 < rng_reloc_count) {
+        val rr3: *RngReloc = ?rng_relocs[ri3];
+        val rrx: R.Result[bool, str] = add_reloc(image, rnglists_sec, rr3.off, of.RK_ABS64, rr3.sym);
+        if (R.is_err[bool, str](rrx)) { ret rrx; }
+        ri3 = ri3 + 1;
+    }
+
+    # .debug_line: one DW_LNE_set_address (abs64) per function.
+    var i: u32 = 0;
+    for (i < nfuncs) {
+        val rr: R.Result[bool, str] = add_reloc(image, line_sec, addr_off[i], of.RK_ABS64, funcs[i].name);
+        if (R.is_err[bool, str](rr)) { ret rr; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# add a per-module-unique GLOBAL anchor symbol at offset 0 of a debug section (the
+# linker keys relocations on the symbol name, so relocs into a concatenated debug
+# section resolve to this module's contribution)
+# ---
+# image: the object image
+# name:  the interned anchor name
+# sec:   the section the anchor sits at offset 0 of
+# ret:   the new symbol index, or an allocation error
+fun add_anchor(image: *of.ObjectImage, name: intern.StrId, sec: u32) R.Result[u32, str] {
+    var asym: of.Symbol;
+    asym.name    = name;
+    asym.section = sec;
+    asym.offset  = 0;
+    asym.size    = 0;
+    asym.flags   = of.SYM_OBJ_FLAG_GLOBAL;
+    ret obj.add_symbol(image, asym);
+}
+
+# check `b` holds exactly `expect[0..n]`; returns true on a match
+fun buf_eq(b: *enc.ByteBuf, expect: *u8, n: usize) bool {
+    if (b.len != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (b.data[i] != expect[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# uleb / sleb encode to the canonical DWARF byte sequences
+test "mach.lang.be.codegen.dwarf.uleb_sleb:canonical" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    uleb(?b, 0);   uleb(?b, 127); uleb(?b, 128); uleb(?b, 300);
+    # 0x00 | 0x7F | 0x80 0x01 | 0xAC 0x02
+    var e1: [6]u8; e1[0] = 0x00; e1[1] = 0x7F; e1[2] = 0x80; e1[3] = 0x01; e1[4] = 0xAC; e1[5] = 0x02;
+    if (!buf_eq(?b, ?e1[0], 6)) { code = 1; }
+    enc.buf_dnit(?b);
+
+    var c: enc.ByteBuf = enc.buf_init(?alloc);
+    sleb(?c, 0); sleb(?c, -1); sleb(?c, 2); sleb(?c, -128);
+    # 0x00 | 0x7F | 0x02 | 0x80 0x7F
+    var e2: [5]u8; e2[0] = 0x00; e2[1] = 0x7F; e2[2] = 0x02; e2[3] = 0x80; e2[4] = 0x7F;
+    if (!buf_eq(?c, ?e2[0], 5)) { code = 1; }
+    enc.buf_dnit(?c);
+    ret code;
+}
+
+# build_abbrev emits the exact abbrev table byte for byte: compile-unit, base type, the
+# subprogram shapes (with/without return, children/leaf), the variable + parameter shapes
+# (located / no-location / loclist), the abstract-instance and inlined_subroutine shapes,
+# and the composite type shapes (struct / union / member / array / subrange / pointer)
+test "mach.lang.be.codegen.dwarf.build_abbrev:golden" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    build_abbrev(?b);
+    var e: [308]u8;
+    e[0]=0x01; e[1]=0x11; e[2]=0x01; e[3]=0x25; e[4]=0x08; e[5]=0x03; e[6]=0x08; e[7]=0x1B;
+    e[8]=0x08; e[9]=0x13; e[10]=0x05; e[11]=0x11; e[12]=0x01; e[13]=0x12; e[14]=0x07; e[15]=0x10;
+    e[16]=0x17; e[17]=0x00; e[18]=0x00; e[19]=0x02; e[20]=0x24; e[21]=0x00; e[22]=0x03; e[23]=0x0E;
+    e[24]=0x3E; e[25]=0x0B; e[26]=0x0B; e[27]=0x0B; e[28]=0x00; e[29]=0x00; e[30]=0x03; e[31]=0x2E;
+    e[32]=0x01; e[33]=0x03; e[34]=0x0E; e[35]=0x11; e[36]=0x01; e[37]=0x12; e[38]=0x07; e[39]=0x3F;
+    e[40]=0x0C; e[41]=0x3A; e[42]=0x0F; e[43]=0x3B; e[44]=0x0F; e[45]=0x40; e[46]=0x18; e[47]=0x49;
+    e[48]=0x13; e[49]=0x00; e[50]=0x00; e[51]=0x04; e[52]=0x2E; e[53]=0x01; e[54]=0x03; e[55]=0x0E;
+    e[56]=0x11; e[57]=0x01; e[58]=0x12; e[59]=0x07; e[60]=0x3F; e[61]=0x0C; e[62]=0x3A; e[63]=0x0F;
+    e[64]=0x3B; e[65]=0x0F; e[66]=0x40; e[67]=0x18; e[68]=0x00; e[69]=0x00; e[70]=0x05; e[71]=0x34;
+    e[72]=0x00; e[73]=0x03; e[74]=0x0E; e[75]=0x49; e[76]=0x13; e[77]=0x02; e[78]=0x18; e[79]=0x00;
+    e[80]=0x00; e[81]=0x06; e[82]=0x34; e[83]=0x00; e[84]=0x03; e[85]=0x0E; e[86]=0x49; e[87]=0x13;
+    e[88]=0x00; e[89]=0x00; e[90]=0x07; e[91]=0x05; e[92]=0x00; e[93]=0x03; e[94]=0x0E; e[95]=0x49;
+    e[96]=0x13; e[97]=0x02; e[98]=0x18; e[99]=0x00; e[100]=0x00; e[101]=0x08; e[102]=0x05; e[103]=0x00;
+    e[104]=0x03; e[105]=0x0E; e[106]=0x49; e[107]=0x13; e[108]=0x00; e[109]=0x00;
+    # ABBREV_VARIABLE_LOCLIST (0x09): DW_TAG_variable, name strp, type ref4, location sec_offset.
+    e[110]=0x09; e[111]=0x34; e[112]=0x00; e[113]=0x03; e[114]=0x0E; e[115]=0x49; e[116]=0x13;
+    e[117]=0x02; e[118]=0x17; e[119]=0x00; e[120]=0x00;
+    # ABBREV_PARAM_LOCLIST (0x0A): DW_TAG_formal_parameter, name strp, type ref4, location sec_offset.
+    e[121]=0x0A; e[122]=0x05; e[123]=0x00; e[124]=0x03; e[125]=0x0E; e[126]=0x49; e[127]=0x13;
+    e[128]=0x02; e[129]=0x17; e[130]=0x00; e[131]=0x00;
+    # ABBREV_SUBPROGRAM_ABSTRACT (0x0B): DW_TAG_subprogram, no children, name strp, DW_AT_inline data1.
+    e[132]=0x0B; e[133]=0x2E; e[134]=0x00; e[135]=0x03; e[136]=0x0E; e[137]=0x20; e[138]=0x0B;
+    e[139]=0x00; e[140]=0x00;
+    # ABBREV_INLINED (0x0C): DW_TAG_inlined_subroutine, no children, abstract_origin ref4,
+    # low_pc addr, high_pc data8, call_file udata, call_line udata.
+    e[141]=0x0C; e[142]=0x1D; e[143]=0x00; e[144]=0x31; e[145]=0x13; e[146]=0x11; e[147]=0x01;
+    e[148]=0x12; e[149]=0x07; e[150]=0x58; e[151]=0x0F; e[152]=0x59; e[153]=0x0F; e[154]=0x00; e[155]=0x00;
+    # ABBREV_INLINED_RANGES (0x0D): DW_TAG_inlined_subroutine, no children, abstract_origin ref4,
+    # ranges sec_offset, call_file udata, call_line udata.
+    e[156]=0x0D; e[157]=0x1D; e[158]=0x00; e[159]=0x31; e[160]=0x13; e[161]=0x55; e[162]=0x17;
+    e[163]=0x58; e[164]=0x0F; e[165]=0x59; e[166]=0x0F; e[167]=0x00; e[168]=0x00;
+    # ABBREV_INLINED_KIDS (0x0E): as 0x0C but DW_CHILDREN_yes.
+    e[169]=0x0E; e[170]=0x1D; e[171]=0x01; e[172]=0x31; e[173]=0x13; e[174]=0x11; e[175]=0x01;
+    e[176]=0x12; e[177]=0x07; e[178]=0x58; e[179]=0x0F; e[180]=0x59; e[181]=0x0F; e[182]=0x00; e[183]=0x00;
+    # ABBREV_INLINED_RANGES_KIDS (0x0F): as 0x0D but DW_CHILDREN_yes.
+    e[184]=0x0F; e[185]=0x1D; e[186]=0x01; e[187]=0x31; e[188]=0x13; e[189]=0x55; e[190]=0x17;
+    e[191]=0x58; e[192]=0x0F; e[193]=0x59; e[194]=0x0F; e[195]=0x00; e[196]=0x00;
+    # ABBREV_SUBPROGRAM_LEAF (0x10): as 0x03 (with-type subprogram) but DW_CHILDREN_no.
+    e[197]=0x10; e[198]=0x2E; e[199]=0x00; e[200]=0x03; e[201]=0x0E; e[202]=0x11; e[203]=0x01;
+    e[204]=0x12; e[205]=0x07; e[206]=0x3F; e[207]=0x0C; e[208]=0x3A; e[209]=0x0F; e[210]=0x3B;
+    e[211]=0x0F; e[212]=0x40; e[213]=0x18; e[214]=0x49; e[215]=0x13; e[216]=0x00; e[217]=0x00;
+    # ABBREV_SUBPROGRAM_VOID_LEAF (0x11): as 0x04 (void subprogram) but DW_CHILDREN_no.
+    e[218]=0x11; e[219]=0x2E; e[220]=0x00; e[221]=0x03; e[222]=0x0E; e[223]=0x11; e[224]=0x01;
+    e[225]=0x12; e[226]=0x07; e[227]=0x3F; e[228]=0x0C; e[229]=0x3A; e[230]=0x0F; e[231]=0x3B;
+    e[232]=0x0F; e[233]=0x40; e[234]=0x18; e[235]=0x00; e[236]=0x00;
+    # ABBREV_STRUCT (0x12): DW_TAG_structure_type, children, name strp, byte_size udata.
+    e[237]=0x12; e[238]=0x13; e[239]=0x01; e[240]=0x03; e[241]=0x0E; e[242]=0x0B; e[243]=0x0F; e[244]=0x00; e[245]=0x00;
+    # ABBREV_UNION (0x13): DW_TAG_union_type, children, name strp, byte_size udata.
+    e[246]=0x13; e[247]=0x17; e[248]=0x01; e[249]=0x03; e[250]=0x0E; e[251]=0x0B; e[252]=0x0F; e[253]=0x00; e[254]=0x00;
+    # ABBREV_MEMBER (0x14): DW_TAG_member, no children, name strp, type ref4, data_member_location udata.
+    e[255]=0x14; e[256]=0x0D; e[257]=0x00; e[258]=0x03; e[259]=0x0E; e[260]=0x49; e[261]=0x13; e[262]=0x38; e[263]=0x0F; e[264]=0x00; e[265]=0x00;
+    # ABBREV_ARRAY (0x15): DW_TAG_array_type, children, element type ref4.
+    e[266]=0x15; e[267]=0x01; e[268]=0x01; e[269]=0x49; e[270]=0x13; e[271]=0x00; e[272]=0x00;
+    # ABBREV_SUBRANGE (0x16): DW_TAG_subrange_type, no children, count udata.
+    e[273]=0x16; e[274]=0x21; e[275]=0x00; e[276]=0x37; e[277]=0x0F; e[278]=0x00; e[279]=0x00;
+    # ABBREV_POINTER (0x17): DW_TAG_pointer_type, no children, pointee type ref4, byte_size udata.
+    e[280]=0x17; e[281]=0x0F; e[282]=0x00; e[283]=0x49; e[284]=0x13; e[285]=0x0B; e[286]=0x0F; e[287]=0x00; e[288]=0x00;
+    # ABBREV_STRUCT_LEAF (0x18): DW_TAG_structure_type, no children, name strp, byte_size udata.
+    e[289]=0x18; e[290]=0x13; e[291]=0x00; e[292]=0x03; e[293]=0x0E; e[294]=0x0B; e[295]=0x0F; e[296]=0x00; e[297]=0x00;
+    # ABBREV_UNION_LEAF (0x19): DW_TAG_union_type, no children, name strp, byte_size udata.
+    e[298]=0x19; e[299]=0x17; e[300]=0x00; e[301]=0x03; e[302]=0x0E; e[303]=0x0B; e[304]=0x0F; e[305]=0x00; e[306]=0x00;
+    e[307]=0x00;   # null abbrev code terminates the table
+    val ok: bool = buf_eq(?b, ?e[0], 308);
+    enc.buf_dnit(?b);
+    if (!ok) { ret 1; }
+    ret 0;
+}
+
+# emit_type_dies lays out a base type, a two-member struct, a pointer to that struct, an
+# array of the base, and a memberless struct; every cross-type DW_FORM_ref4 (each member,
+# the pointer's pointee, the array's element) is a fixup patched to its target's recorded
+# CU offset, and a memberless struct uses the DW_CHILDREN_no leaf abbrev
+test "mach.lang.be.codegen.dwarf.emit_type_dies:composite_refs" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    # types: [0] base i32, [1] struct S{i32,i32}, [2] *S, [3] [4]i32, [4] empty struct.
+    var td: [5]TypeDie;
+    td[0].kind=TK_BASE;    td[0].off=0; td[0].sem=semtype.TYPE_NIL; td[0].name="i32"; td[0].name_off=1; td[0].encoding=DW_ATE_signed; td[0].byte_size=4; td[0].elem=-1; td[0].count=0; td[0].memb_start=0; td[0].memb_count=0;
+    td[1].kind=TK_STRUCT;  td[1].off=0; td[1].sem=100; td[1].name=""; td[1].name_off=5; td[1].encoding=0; td[1].byte_size=8; td[1].elem=-1; td[1].count=0; td[1].memb_start=0; td[1].memb_count=2;
+    td[2].kind=TK_POINTER; td[2].off=0; td[2].sem=101; td[2].name=""; td[2].name_off=0; td[2].encoding=0; td[2].byte_size=8; td[2].elem=1; td[2].count=0; td[2].memb_start=0; td[2].memb_count=0;
+    td[3].kind=TK_ARRAY;   td[3].off=0; td[3].sem=102; td[3].name=""; td[3].name_off=0; td[3].encoding=0; td[3].byte_size=16; td[3].elem=0; td[3].count=4; td[3].memb_start=0; td[3].memb_count=0;
+    td[4].kind=TK_STRUCT;  td[4].off=0; td[4].sem=103; td[4].name=""; td[4].name_off=9; td[4].encoding=0; td[4].byte_size=0; td[4].elem=-1; td[4].count=0; td[4].memb_start=2; td[4].memb_count=0;
+
+    var mb: [2]TypeMember;
+    mb[0].name_off=20; mb[0].type_ix=0; mb[0].offset=0;
+    mb[1].name_off=24; mb[1].type_ix=0; mb[1].offset=4;
+
+    var tc: TypeCtx;
+    tc.alloc=?alloc; tc.types=?td[0]; tc.ntypes=5; tc.type_cap=5; tc.membs=?mb[0]; tc.nmemb=2; tc.memb_cap=2;
+
+    var relocs: [16]InfoReloc;
+    var rc: u32 = 0;
+    var fixups: [8]TypeFixup;
+    var nfix: u32 = 0;
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_type_dies(?b, ?tc, 0, ?relocs[0], ?rc, ?fixups[0], ?nfix);
+
+    # four ref4 fixups: two members -> base, the pointer -> struct, the array -> base.
+    if (nfix != 4) { code = 1; }
+    var i: u32 = 0;
+    for (i < nfix) {
+        val v: u32 = bin.read_u32_le(b.data, fixups[i].pos::usize);
+        if (v != td[fixups[i].target].off) { code = 1; }
+        i = i + 1;
+    }
+    # offsets were recorded in emit order: the base opens the block at 0, later types after it.
+    if (td[1].off == 0 || td[2].off <= td[1].off || td[4].off <= td[3].off) { code = 1; }
+    # the populated struct opens with ABBREV_STRUCT; the memberless one with the leaf abbrev.
+    if (b.data[td[1].off::usize] != ABBREV_STRUCT)      { code = 1; }
+    if (b.data[td[4].off::usize] != ABBREV_STRUCT_LEAF) { code = 1; }
+    # the pointer references the struct, the array references the base.
+    if (td[2].elem != 1 || td[3].elem != 0) { code = 1; }
+
+    enc.buf_dnit(?b);
+    ret code;
+}
+
+# emit_row packs a small line advance into a single special opcode and falls back to
+# advance_pc / copy when the combined advance overflows one byte
+test "mach.lang.be.codegen.dwarf.emit_row:special_and_fallback" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    # (addr=1, line=0): opcode = (0 - LINE_BASE) + LINE_RANGE*1 + OPCODE_BASE = 5+14+13 = 32.
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_row(?b, 1, 0);
+    var e1: [1]u8; e1[0] = 32;
+    if (!buf_eq(?b, ?e1[0], 1)) { code = 1; }
+    enc.buf_dnit(?b);
+
+    # (addr=100, line=0): 5 + 14*100 + 13 = 1418 > 255, so advance_pc(100) + copy.
+    var c: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_row(?c, 100, 0);
+    var e2: [3]u8; e2[0] = DW_LNS_advance_pc; e2[1] = 100; e2[2] = DW_LNS_copy;
+    if (!buf_eq(?c, ?e2[0], 3)) { code = 1; }
+    enc.buf_dnit(?c);
+    ret code;
+}
+
+# str_off appends a new string and returns its offset, and deduplicates a repeat to
+# the same offset while a distinct string gets a fresh one
+test "mach.lang.be.codegen.dwarf.str_off:dedup" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+    var st: StrTab;
+    st.buf = enc.buf_init(?alloc);
+
+    val a0: u32 = str_off(?st, "i32");   # 0
+    val b0: u32 = str_off(?st, "u32");   # 4 (after "i32\0")
+    val a1: u32 = str_off(?st, "i32");   # 0 again (deduped)
+    if (a0 != 0) { code = 1; }
+    if (b0 != 4) { code = 1; }
+    if (a1 != a0) { code = 1; }
+    if (st.buf.len != 8::usize) { code = 1; }   # "i32\0u32\0"
+
+    enc.buf_dnit(?st.buf);
+    ret code;
+}
+
+# emit_frame_base packs a small register into a one-byte DW_OP_reg<n> exprloc and
+# falls back to DW_OP_regx + uleb for a register the single-byte form cannot hold
+test "mach.lang.be.codegen.dwarf.emit_frame_base:reg_and_regx" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    # rbp (DWARF 6): length 1, DW_OP_reg6 = 0x50 + 6 = 0x56.
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_frame_base(?b, 6);
+    var e1: [2]u8; e1[0] = 0x01; e1[1] = 0x56;
+    if (!buf_eq(?b, ?e1[0], 2)) { code = 1; }
+    enc.buf_dnit(?b);
+
+    # reg 40 (>= 32): length 2, DW_OP_regx (0x90) + uleb(40) = 0x28.
+    var c: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_frame_base(?c, 40);
+    var e2: [3]u8; e2[0] = 0x02; e2[1] = 0x90; e2[2] = 0x28;
+    if (!buf_eq(?c, ?e2[0], 3)) { code = 1; }
+    enc.buf_dnit(?c);
+    ret code;
+}
+
+# emit_var_location encodes a register home, a frame slot, and a salvaged register
+# value (register + constant marked DW_OP_stack_value)
+test "mach.lang.be.codegen.dwarf.emit_var_location:reg_frame_salvage" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    # register 5 (RDI), identity: len 1, DW_OP_reg5 = 0x50 + 5 = 0x55.
+    var vr: DwVar; vr.loc_kind = VLOC_REG; vr.reg = 5; vr.offset = 0; vr.net = 0; vr.byref = false;
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_var_location(?b, ?vr);
+    var e1: [2]u8; e1[0] = 0x01; e1[1] = 0x55;
+    if (!buf_eq(?b, ?e1[0], 2)) { code = 1; }
+    enc.buf_dnit(?b);
+
+    # frame slot -8, identity: len 2, DW_OP_fbreg (0x91), sleb(-8) = 0x78.
+    var vf: DwVar; vf.loc_kind = VLOC_FRAME; vf.reg = 0; vf.offset = -8; vf.net = 0; vf.byref = false;
+    var c: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_var_location(?c, ?vf);
+    var e2: [3]u8; e2[0] = 0x02; e2[1] = 0x91; e2[2] = 0x78;
+    if (!buf_eq(?c, ?e2[0], 3)) { code = 1; }
+    enc.buf_dnit(?c);
+
+    # register 5 + 4 (salvaged): len 3, DW_OP_breg5 (0x75), sleb(4) = 0x04, stack_value (0x9F).
+    var vs: DwVar; vs.loc_kind = VLOC_REG; vs.reg = 5; vs.offset = 0; vs.net = 4; vs.byref = false;
+    var d: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_var_location(?d, ?vs);
+    var e3: [4]u8; e3[0] = 0x03; e3[1] = 0x75; e3[2] = 0x04; e3[3] = 0x9F;
+    if (!buf_eq(?d, ?e3[0], 4)) { code = 1; }
+    enc.buf_dnit(?d);
+
+    # constant 40 + net 2 = 42: len 3, DW_OP_consts (0x11), sleb(42) = 0x2A, stack_value (0x9F).
+    var vk: DwVar; vk.loc_kind = VLOC_CONST; vk.reg = 0; vk.offset = 40; vk.net = 2; vk.byref = false;
+    var g: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_var_location(?g, ?vk);
+    var e4: [4]u8; e4[0] = 0x03; e4[1] = 0x11; e4[2] = 0x2A; e4[3] = 0x9F;
+    if (!buf_eq(?g, ?e4[0], 4)) { code = 1; }
+    enc.buf_dnit(?g);
+
+    # a by-reference aggregate at frame slot -8: len 3, DW_OP_fbreg (0x91), sleb(-8) =
+    # 0x78, DW_OP_deref (0x06) to load the storage pointer (address, no stack_value).
+    # register-homed byref never reaches build_loc_ops (classify_var / build_loclists omit
+    # it), so only the frame form is exercised.
+    var vm: DwVar; vm.loc_kind = VLOC_FRAME; vm.reg = 0; vm.offset = -8; vm.net = 0; vm.byref = true;
+    var k: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_var_location(?k, ?vm);
+    var e6: [4]u8; e6[0] = 0x03; e6[1] = 0x91; e6[2] = 0x78; e6[3] = 0x06;
+    if (!buf_eq(?k, ?e6[0], 4)) { code = 1; }
+    enc.buf_dnit(?k);
+
+    # a by-reference aggregate at frame slot -8 salvaged onto base + 16: len 5, DW_OP_fbreg
+    # (0x91), sleb(-8) = 0x78, DW_OP_deref (0x06), DW_OP_plus_uconst (0x23), uleb(16) = 0x10.
+    var vn: DwVar; vn.loc_kind = VLOC_FRAME; vn.reg = 0; vn.offset = -8; vn.net = 16; vn.byref = true;
+    var m: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_var_location(?m, ?vn);
+    var e7: [6]u8; e7[0] = 0x05; e7[1] = 0x91; e7[2] = 0x78; e7[3] = 0x06; e7[4] = 0x23; e7[5] = 0x10;
+    if (!buf_eq(?m, ?e7[0], 6)) { code = 1; }
+    enc.buf_dnit(?m);
+    ret code;
+}
+
+# home_eq is the agreement predicate the classifier uses: two bindings name the same
+# home only when kind and the kind-relevant fields (register or offset) plus the
+# salvage net all match. A mismatch is what promotes a re-homed variable to a loclist
+test "mach.lang.be.codegen.dwarf.home_eq:agreement" {
+    var code: i32 = 0;
+    # same register + net: agrees.
+    if (!home_eq(VLOC_REG, 5, 0, 0, VLOC_REG, 5, 0, 0)) { code = 1; }
+    # different register: the re-home case, must disagree (-> a loclist).
+    if (home_eq(VLOC_REG, 5, 0, 0, VLOC_REG, 6, 0, 0))  { code = 1; }
+    # register vs frame: disagree.
+    if (home_eq(VLOC_REG, 5, 0, 0, VLOC_FRAME, 0, -8, 0)) { code = 1; }
+    # same register, different net: disagree.
+    if (home_eq(VLOC_REG, 5, 0, 0, VLOC_REG, 5, 0, 4))  { code = 1; }
+    # frame home agreement is by offset.
+    if (!home_eq(VLOC_FRAME, 0, -16, 0, VLOC_FRAME, 0, -16, 0)) { code = 1; }
+    if (home_eq(VLOC_FRAME, 0, -16, 0, VLOC_FRAME, 0, -24, 0))  { code = 1; }
+    # constant home agreement is by the computed value (off + net).
+    if (!home_eq(VLOC_CONST, 0, 42, 0, VLOC_CONST, 0, 40, 2)) { code = 1; }
+    if (home_eq(VLOC_CONST, 0, 42, 0, VLOC_CONST, 0, 7, 0))   { code = 1; }
+    if (home_eq(VLOC_CONST, 0, 42, 0, VLOC_REG, 5, 0, 0))     { code = 1; }
+    ret code;
+}
+
+# classify_var picks the location tier from a variable's ranges: agreeing real homes
+# collapse to one inline exprloc (range_count cleared), disagreeing homes stay a
+# loclist, all-optimized-out becomes no location, and an optimized-out tail does not
+# perturb an otherwise stationary home
+test "mach.lang.be.codegen.dwarf.classify_var:tiers" {
+    var code: i32 = 0;
+    var ranges: [8]LocRange;
+
+    # two agreeing register homes -> a single inline exprloc.
+    ranges[0].start=0; ranges[0].end=4; ranges[0].kind=VLOC_REG; ranges[0].reg=5; ranges[0].off=0; ranges[0].net=0;
+    ranges[1].start=4; ranges[1].end=8; ranges[1].kind=VLOC_REG; ranges[1].reg=5; ranges[1].off=0; ranges[1].net=0;
+    var v1: DwVar; v1.range_start=0; v1.range_count=2;
+    classify_var(?v1, ?ranges[0]);
+    if (v1.loc_kind != VLOC_REG || v1.reg != 5 || v1.range_count != 0) { code = 1; }
+
+    # two disagreeing homes -> a loclist (ranges kept).
+    ranges[2].start=0; ranges[2].end=4; ranges[2].kind=VLOC_REG; ranges[2].reg=5; ranges[2].off=0; ranges[2].net=0;
+    ranges[3].start=4; ranges[3].end=8; ranges[3].kind=VLOC_REG; ranges[3].reg=6; ranges[3].off=0; ranges[3].net=0;
+    var v2: DwVar; v2.range_start=2; v2.range_count=2;
+    classify_var(?v2, ?ranges[0]);
+    if (v2.loc_kind != VLOC_LOCLIST || v2.range_count != 2) { code = 1; }
+
+    # every binding optimized out -> no location.
+    ranges[4].start=0; ranges[4].end=4; ranges[4].kind=VLOC_NONE; ranges[4].reg=0; ranges[4].off=0; ranges[4].net=0;
+    ranges[5].start=4; ranges[5].end=8; ranges[5].kind=VLOC_NONE; ranges[5].reg=0; ranges[5].off=0; ranges[5].net=0;
+    var v3: DwVar; v3.range_start=4; v3.range_count=2;
+    classify_var(?v3, ?ranges[0]);
+    if (v3.loc_kind != VLOC_NONE || v3.range_count != 0) { code = 1; }
+
+    # a real frame home + an optimized-out tail -> stationary (NONE does not constrain).
+    ranges[6].start=0; ranges[6].end=4; ranges[6].kind=VLOC_FRAME; ranges[6].reg=0; ranges[6].off=-8; ranges[6].net=0;
+    ranges[7].start=4; ranges[7].end=8; ranges[7].kind=VLOC_NONE;  ranges[7].reg=0; ranges[7].off=0;  ranges[7].net=0;
+    var v4: DwVar; v4.range_start=6; v4.range_count=2;
+    classify_var(?v4, ?ranges[0]);
+    if (v4.loc_kind != VLOC_FRAME || v4.offset != -8 || v4.range_count != 0) { code = 1; }
+    ret code;
+}
+
+# build_loclists emits the DWARF 5 header and, for one loclist variable with two
+# register ranges, a base-address entry (with a recorded relocation), an offset_pair
+# per range carrying its counted location expression, and an end_of_list - byte for
+# byte, with the variable's entry offset stamped for its DW_FORM_sec_offset
+test "mach.lang.be.codegen.dwarf.build_loclists:ranges" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    var funcs: [1]DwFunc;
+    funcs[0].name = intern.STR_NIL; funcs[0].offset = 0; funcs[0].var_start = 0; funcs[0].var_count = 1;
+    var vars: [1]DwVar;
+    vars[0].loc_kind = VLOC_LOCLIST; vars[0].range_start = 0; vars[0].range_count = 2; vars[0].loclist_off = 0; vars[0].byref = false;
+    var ranges: [2]LocRange;
+    ranges[0].start=0; ranges[0].end=4; ranges[0].kind=VLOC_REG; ranges[0].reg=5; ranges[0].off=0; ranges[0].net=0;
+    ranges[1].start=4; ranges[1].end=8; ranges[1].kind=VLOC_REG; ranges[1].reg=6; ranges[1].off=0; ranges[1].net=0;
+
+    var relocs: [4]LocReloc;
+    var nrel: u32 = 0;
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    build_loclists(?b, ?funcs[0], 1, ?vars[0], ?ranges[0], 8, ?relocs[0], ?nrel);
+
+    var e: [32]u8;
+    e[0]=0x1C; e[1]=0x00; e[2]=0x00; e[3]=0x00;                      # unit_length = 28
+    e[4]=0x05; e[5]=0x00;                                            # version 5
+    e[6]=0x08; e[7]=0x00;                                            # address_size, segment_selector_size
+    e[8]=0x00; e[9]=0x00; e[10]=0x00; e[11]=0x00;                    # offset_entry_count 0
+    e[12]=0x06;                                                      # DW_LLE_base_address
+    e[13]=0x00; e[14]=0x00; e[15]=0x00; e[16]=0x00; e[17]=0x00; e[18]=0x00; e[19]=0x00; e[20]=0x00;
+    e[21]=0x04; e[22]=0x00; e[23]=0x04; e[24]=0x01; e[25]=0x55;      # offset_pair [0,4) reg5
+    e[26]=0x04; e[27]=0x04; e[28]=0x08; e[29]=0x01; e[30]=0x56;      # offset_pair [4,8) reg6
+    e[31]=0x00;                                                      # DW_LLE_end_of_list
+    val ok: bool = buf_eq(?b, ?e[0], 32);
+    enc.buf_dnit(?b);
+    if (!ok) { code = 1; }
+    if (nrel != 1) { code = 1; }
+    if (relocs[0].off != 13) { code = 1; }        # the base-address address field
+    if (vars[0].loclist_off != 12) { code = 1; }  # the entry begins at DW_LLE_base_address
+    ret code;
+}
+
+# build_rnglists emits the DWARF 5 header and, for one multi-extent inlined instance
+# with two extents, a DW_RLE_base_address (with a recorded relocation), a
+# DW_RLE_offset_pair per extent (function-relative), and a DW_RLE_end_of_list - byte for
+# byte, with the instance's rnglist_off stamped for its DW_AT_ranges sec_offset
+test "mach.lang.be.codegen.dwarf.build_rnglists:ranges" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    var funcs: [1]DwFunc;
+    funcs[0].name = intern.STR_NIL; funcs[0].offset = 0;
+    var inls: [1]DwInline;
+    inls[0].func_idx = 0; inls[0].parent = 0; inls[0].range_start = 0; inls[0].range_count = 2; inls[0].rnglist_off = 0;
+    var irng: [2]DwInlineRange;
+    irng[0].start = 0; irng[0].end = 4;
+    irng[1].start = 8; irng[1].end = 12;
+
+    var relocs: [4]RngReloc;
+    var nrel: u32 = 0;
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    build_rnglists(?b, ?funcs[0], 1, ?inls[0], 1, ?irng[0], 8, ?relocs[0], ?nrel);
+
+    var e: [28]u8;
+    e[0]=0x18; e[1]=0x00; e[2]=0x00; e[3]=0x00;                      # unit_length = 24
+    e[4]=0x05; e[5]=0x00;                                            # version 5
+    e[6]=0x08; e[7]=0x00;                                            # address_size, segment_selector_size
+    e[8]=0x00; e[9]=0x00; e[10]=0x00; e[11]=0x00;                    # offset_entry_count 0
+    e[12]=0x05;                                                      # DW_RLE_base_address
+    e[13]=0x00; e[14]=0x00; e[15]=0x00; e[16]=0x00; e[17]=0x00; e[18]=0x00; e[19]=0x00; e[20]=0x00;
+    e[21]=0x04; e[22]=0x00; e[23]=0x04;                             # offset_pair [0,4)
+    e[24]=0x04; e[25]=0x08; e[26]=0x0C;                             # offset_pair [8,12)
+    e[27]=0x00;                                                      # DW_RLE_end_of_list
+    val ok: bool = buf_eq(?b, ?e[0], 28);
+    enc.buf_dnit(?b);
+    if (!ok) { code = 1; }
+    if (nrel != 1) { code = 1; }
+    if (relocs[0].off != 13) { code = 1; }       # the base-address address field
+    if (inls[0].rnglist_off != 12) { code = 1; } # the list begins at DW_RLE_base_address
+    ret code;
+}
