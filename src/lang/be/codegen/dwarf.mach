@@ -33,8 +33,6 @@ use R: std.types.result;
 
 use enc:     mach.lang.be.codegen.encode;
 use obj:     mach.lang.be.obj;
-use mir:     mach.lang.be.codegen.mir;
-use frame:   mach.lang.be.codegen.frame;
 use ir:      mach.lang.me.ir;
 use id:      mach.lang.me.ir.id;
 use intern:  mach.lang.intern;
@@ -96,7 +94,12 @@ val DW_ATE_unsigned: u8 = 0x07;
 # DW_OP_regx + uleb(n); a frame-relative slot is DW_OP_fbreg + sleb(offset); a
 # register-plus-offset value is DW_OP_breg0 + n + sleb(offset). DW_OP_deref /
 # DW_OP_plus_uconst / DW_OP_constu / DW_OP_minus / DW_OP_stack_value recover a
-# salvaged value (operand +/- constant) and mark the result a value, not a location
+# salvaged value (operand +/- constant) and mark the result a value, not a location.
+# DWARF 5 location-list entry codes for `.debug_loclists`
+val DW_LLE_end_of_list:  u8 = 0x00;
+val DW_LLE_base_address: u8 = 0x06;
+val DW_LLE_offset_pair:  u8 = 0x04;
+
 val DW_OP_reg0:        u8 = 0x50;
 val DW_OP_breg0:       u8 = 0x70;
 val DW_OP_regx:        u8 = 0x90;
@@ -127,6 +130,10 @@ val ABBREV_VARIABLE:        u8 = 0x05;
 val ABBREV_VARIABLE_NOLOC:  u8 = 0x06;
 val ABBREV_PARAM:           u8 = 0x07;
 val ABBREV_PARAM_NOLOC:     u8 = 0x08;
+# a variable / parameter whose home changes across its range: DW_AT_location is a
+# DW_FORM_sec_offset into `.debug_loclists` (#1705) rather than an inline exprloc
+val ABBREV_VARIABLE_LOCLIST: u8 = 0x09;
+val ABBREV_PARAM_LOCLIST:    u8 = 0x0a;
 
 # DWARF 5 line-number program: standard opcodes, extended opcodes, and the tuned
 # special-opcode parameters this producer emits
@@ -235,6 +242,11 @@ rec DwFunc {
     var_count: u32;
 }
 
+# a variable that lives in one place for its whole scope uses VLOC_REG / VLOC_FRAME /
+# VLOC_NONE (an inline exprloc or no location); one that moves uses VLOC_LOCLIST, and
+# `loclist_off` names its entry in `.debug_loclists`
+val VLOC_LOCLIST: u8 = 3;
+
 # a variable's location kind. NONE = the value was optimized out (no DW_AT_location);
 # REG = live in a register (`reg` is its DWARF number); FRAME = a frame slot at
 # `offset` bytes from the frame base
@@ -242,43 +254,69 @@ val VLOC_NONE:  u8 = 0;
 val VLOC_REG:   u8 = 1;
 val VLOC_FRAME: u8 = 2;
 
-# a source variable's DWARF DIE data, joined from the IR dbg-var identity and the MIR
-# home. A DW_TAG_variable (or DW_TAG_formal_parameter) references its base type by
-# ref4 and carries a single-location DW_AT_location expression
+# a source variable's DWARF DIE data, joined from the IR dbg-var identity and the
+# per-PC variable-location records. A DW_TAG_variable (or DW_TAG_formal_parameter)
+# references its base type by ref4 and carries a DW_AT_location that is either an
+# inline single-location exprloc (VLOC_REG / VLOC_FRAME) or a DW_FORM_sec_offset into
+# `.debug_loclists` (VLOC_LOCLIST)
 # ---
 # name_off: DW_AT_name byte offset within `.debug_str`
 # bt:       base-type index for DW_AT_type
 # is_param: true for a formal parameter, false for a local
-# loc_kind: VLOC_NONE / VLOC_REG / VLOC_FRAME
+# loc_kind: VLOC_NONE / VLOC_REG / VLOC_FRAME / VLOC_LOCLIST
 # reg:      DWARF register number when loc_kind == VLOC_REG
 # offset:   frame-base offset when loc_kind == VLOC_FRAME
-# net:      signed constant the salvage expression adds to the operand value (0 =
-#           identity); a non-zero net makes the location a computed DW_OP_stack_value
-# conflict: transient - true once two non-optimized-out bindings disagreed on a home,
-#           so the variable is not provably stationary and emits no DW_AT_location
-#           (deferred to the #1705 loclists tier); not part of the emitted DIE
+# net:      signed constant the single-location salvage expression adds to the operand
+#           value (0 = identity); a non-zero net makes it a computed DW_OP_stack_value
+# range_start/range_count: when loc_kind == VLOC_LOCLIST, the variable's per-PC ranges
+#           in the shared LocRange array; each range carries its own home + expression
+# loclist_off: byte offset of this variable's `.debug_loclists` entry, set by
+#           build_loclists, patched into the DW_FORM_sec_offset field
 rec DwVar {
-    name_off: u32;
-    bt:       i32;
-    is_param: bool;
-    loc_kind: u8;
-    reg:      i32;
-    offset:   i64;
-    net:      i64;
-    conflict: bool;
+    name_off:    u32;
+    bt:          i32;
+    is_param:    bool;
+    loc_kind:    u8;
+    reg:         i32;
+    offset:      i64;
+    net:         i64;
+    range_start: u32;
+    range_count: u32;
+    loclist_off: u32;
 }
 
-# whether the variable `v`'s recorded home equals the raw home `(kind, reg, off, net)`.
-# the single-location tier emits DW_AT_location only when every non-optimized-out
-# binding of a variable agrees under this predicate
+# one PC-range of a VLOC_LOCLIST variable: over `[start, end)` (absolute `.text` byte
+# offsets), the variable lives at the home `(kind, reg | off)` with salvage `net`. A
+# VLOC_NONE range is an optimized-out gap the loclist omits. Ranges derive from the
+# encoder's ordered variable-location records: binding i governs `[start_i, start_{i+1}
+# | fn_end)`. This is linear-order reasoning - see build_loclists on the range-fidelity
+# caveat it inherits from #1904
 # ---
-# v:                the variable with a recorded home
-# kind/reg/off/net: the candidate raw home
-# ret:              true when they name the same location
-fun home_eq(v: *DwVar, kind: u8, reg: i32, off: i64, net: i64) bool {
-    if (v.loc_kind != kind) { ret false; }
-    if (kind == VLOC_REG)   { ret v.reg == reg && v.net == net; }
-    if (kind == VLOC_FRAME) { ret v.offset == off && v.net == net; }
+# start/end: absolute `.text` byte range this home governs
+# kind:      VLOC_NONE / VLOC_REG / VLOC_FRAME
+# reg:       DWARF register number when kind == VLOC_REG
+# off:       frame-base offset when kind == VLOC_FRAME
+# net:       salvage net constant (0 = identity)
+rec LocRange {
+    start: u32;
+    end:   u32;
+    kind:  u8;
+    reg:   i32;
+    off:   i64;
+    net:   i64;
+}
+
+# whether two non-optimized-out homes name the same location. the single-location
+# tier keeps an inline exprloc only when every one of a variable's real bindings agrees
+# under this predicate; a disagreement makes the variable a VLOC_LOCLIST
+# ---
+# k1/r1/o1/n1: the first home (kind, reg, off, net)
+# k2/r2/o2/n2: the second home
+# ret:         true when they name the same location
+fun home_eq(k1: u8, r1: i32, o1: i64, n1: i64, k2: u8, r2: i32, o2: i64, n2: i64) bool {
+    if (k1 != k2) { ret false; }
+    if (k1 == VLOC_REG)   { ret r1 == r2 && n1 == n2; }
+    if (k1 == VLOC_FRAME) { ret o1 == o2 && n1 == n2; }
     ret true;
 }
 
@@ -350,8 +388,11 @@ fun bytes_eq_str(b: *enc.ByteBuf, start: usize, end: usize, s: str) bool {
 # ---
 # IRLT_SYM: the reloc targets the carried symbol name (a function's low_pc)
 # IRLT_STR: the reloc targets the module's `.debug_str` anchor, `addend` bytes in
-val IRLT_SYM: u8 = 0;
-val IRLT_STR: u8 = 1;
+# IRLT_LOCLIST: the reloc targets the module's `.debug_loclists` anchor, `addend`
+#           bytes in (a variable's DW_FORM_sec_offset location-list pointer)
+val IRLT_SYM:     u8 = 0;
+val IRLT_STR:     u8 = 1;
+val IRLT_LOCLIST: u8 = 2;
 
 # one deferred `.debug_info` relocation. `build_info` records the patch sites as it
 # writes strp / addr fields whose targets are section anchors or function symbols;
@@ -382,6 +423,29 @@ fun push_info_reloc(list: *InfoReloc, count: *u32, off: u32, kind: of.RelocKind,
     list[@count].target = target;
     list[@count].sym    = sym;
     list[@count].addend = addend;
+    @count = @count + 1;
+}
+
+# one deferred `.debug_loclists` relocation: a DW_LLE_base_address address field is
+# relocated to its variable's owning function symbol (RK_ABS64, no addend), so the
+# following DW_LLE_offset_pair ranges are relative to the function's low_pc
+# ---
+# off: patch-site byte offset within `.debug_loclists`
+# sym: target function symbol name
+rec LocReloc {
+    off: u32;
+    sym: intern.StrId;
+}
+
+# append a `.debug_loclists` base-address relocation to the growing list
+# ---
+# list:  the LocReloc array
+# count: in/out - current length, incremented
+# off:   patch-site offset within `.debug_loclists`
+# sym:   target function symbol name
+fun push_loc_reloc(list: *LocReloc, count: *u32, off: u32, sym: intern.StrId) {
+    list[@count].off = off;
+    list[@count].sym = sym;
     @count = @count + 1;
 }
 
@@ -572,6 +636,11 @@ fun build_abbrev(b: *enc.ByteBuf) {
     build_var_abbrev(b, ABBREV_PARAM,          DW_TAG_formal_parameter, true);
     build_var_abbrev(b, ABBREV_PARAM_NOLOC,    DW_TAG_formal_parameter, false);
 
+    # variable / formal parameter whose home moves: DW_AT_location is a sec_offset
+    # location-list pointer into `.debug_loclists`.
+    build_var_loclist_abbrev(b, ABBREV_VARIABLE_LOCLIST, DW_TAG_variable);
+    build_var_loclist_abbrev(b, ABBREV_PARAM_LOCLIST,    DW_TAG_formal_parameter);
+
     uleb(b, 0);   # null abbrev code terminates the table
 }
 
@@ -612,6 +681,23 @@ fun build_var_abbrev(b: *enc.ByteBuf, code: u8, tag: u8, has_loc: bool) {
     emit_attr(b, DW_AT_name, DW_FORM_strp);
     emit_attr(b, DW_AT_type, DW_FORM_ref4);
     if (has_loc) { emit_attr(b, DW_AT_location, DW_FORM_exprloc); }
+    uleb(b, 0); uleb(b, 0);
+}
+
+# emit one variable / formal-parameter abbreviation whose DW_AT_location is a
+# DW_FORM_sec_offset pointer into `.debug_loclists` (the variable's home moves across
+# its scope, so the location is a per-PC list rather than one expression)
+# ---
+# b:    the abbrev buffer
+# code: the abbreviation code
+# tag:  DW_TAG_variable or DW_TAG_formal_parameter
+fun build_var_loclist_abbrev(b: *enc.ByteBuf, code: u8, tag: u8) {
+    uleb(b, code::u64);
+    uleb(b, tag::u64);
+    enc.emit_byte(b, DW_CHILDREN_no);
+    emit_attr(b, DW_AT_name, DW_FORM_strp);
+    emit_attr(b, DW_AT_type, DW_FORM_ref4);
+    emit_attr(b, DW_AT_location, DW_FORM_sec_offset);
     uleb(b, 0); uleb(b, 0);
 }
 
@@ -709,6 +795,16 @@ fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp
 # bts:    the base-type table (DW_AT_type ref4 target)
 # relocs/reloc_count: the deferred `.debug_info` relocation list (for the name strp)
 fun emit_variable(b: *enc.ByteBuf, v: *DwVar, bts: *BaseType, relocs: *InfoReloc, reloc_count: *u32) {
+    if (v.loc_kind == VLOC_LOCLIST) {
+        if (v.is_param) { enc.emit_byte(b, ABBREV_PARAM_LOCLIST); } or { enc.emit_byte(b, ABBREV_VARIABLE_LOCLIST); }
+        push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_STR, intern.STR_NIL, v.name_off::i64);
+        enc.emit_u32(b, 0);                    # DW_AT_name (strp, relocated to .debug_str)
+        enc.emit_u32(b, bts[v.bt::u32].off);   # DW_AT_type (ref4)
+        # DW_AT_location (sec_offset), relocated to the `.debug_loclists` entry.
+        push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_LOCLIST, intern.STR_NIL, v.loclist_off::i64);
+        enc.emit_u32(b, 0);
+        ret;
+    }
     val located: bool = v.loc_kind != VLOC_NONE;
     if (v.is_param) {
         if (located) { enc.emit_byte(b, ABBREV_PARAM); } or { enc.emit_byte(b, ABBREV_PARAM_NOLOC); }
@@ -741,44 +837,26 @@ fun emit_frame_base(b: *enc.ByteBuf, fb_reg: i32) {
     }
 }
 
-# find a MIR function by symbol name; linear, function counts per module are small
-# ---
-# mirmod: the module whose functions are searched
-# name:   the interned function symbol name
-# ret:    the matching MIR function, or none
-fun find_mir_func(mirmod: *mir.MirModule, name: intern.StrId) O.Option[*mir.MirFunction] {
-    var i: u32 = 0;
-    for (i < mirmod.function_len) {
-        if (mirmod.functions[i].name == name) { ret O.some[*mir.MirFunction](?mirmod.functions[i]); }
-        i = i + 1;
-    }
-    ret O.none[*mir.MirFunction]();
-}
-
-# resolve a MIR vreg to a variable location: a register (VLOC_REG, `out_reg` a DWARF
-# number), a frame slot (VLOC_FRAME, `out_off` bytes from the frame base), or none
-# (VLOC_NONE) for MIR_VREG_NIL / an unmapped or DWARF-less register
+# map an encoder VarLoc's raw home to a DWARF variable location: a register (VLOC_REG,
+# `out_reg` the DWARF number via the ISA hook), a frame slot (VLOC_FRAME, `out_off`
+# bytes from the frame base), or none (VLOC_NONE) for an optimized-out binding or a
+# physical register with no DWARF number. The encoder captured the post-regalloc home
+# at the marker's PC; the producer only remaps the physical register id to DWARF
 # ---
 # tgt:      resolved target, for the ISA dwarf_reg hook
-# mfn:      the MIR function owning the vreg
-# vreg:     the vreg to resolve (post-regalloc / post-frame)
-# out_kind/out_reg/out_off: the resolved location
-fun resolve_home(tgt: *target.Target, mfn: *mir.MirFunction, vreg: u32,
-                 out_kind: *u8, out_reg: *i32, out_off: *i64) {
+# vl:       the variable-location record
+# out_kind/out_reg/out_off: the resolved DWARF location
+fun varloc_home(tgt: *target.Target, vl: *enc.VarLoc, out_kind: *u8, out_reg: *i32, out_off: *i64) {
     @out_kind = VLOC_NONE;
     @out_reg  = 0;
     @out_off  = 0;
-    if (vreg == mir.MIR_VREG_NIL || vreg >= mfn.vreg_count) { ret; }
-    val vr: *mir.MirVReg = ?mfn.vregs[vreg];
-    if (vr.assigned != mir.MIR_VREG_NIL) {
+    if (vl.kind == enc.VARLOC_REG) {
         val f: isa.DwarfRegFn = tgt.arch.dwarf_reg::isa.DwarfRegFn;
-        val d: i32 = f(vr.assigned::i32);
+        val d: i32 = f(vl.reg);
         if (d >= 0) { @out_kind = VLOC_REG; @out_reg = d; }
-        ret;
-    }
-    if (vr.spill_slot >= 0) {
-        val o: O.Option[i64] = frame.slot_offset(?mfn.frame, vreg);
-        if (O.is_some[i64](o)) { @out_kind = VLOC_FRAME; @out_off = O.unwrap[i64](o); }
+    } or (vl.kind == enc.VARLOC_FRAME) {
+        @out_kind = VLOC_FRAME;
+        @out_off  = vl.off;
     }
 }
 
@@ -803,35 +881,122 @@ fun dbg_expr_net(irfn: *ir.Function, iid: id.InstructionId) i64 {
     ret net;
 }
 
-# emit a variable's DW_AT_location exprloc (a uleb length prefix then the ops). A
-# register or frame slot with the identity expression is a plain location; a salvaged
-# value (net != 0) computes the value and marks it DW_OP_stack_value
+# append the DWARF expression ops for a home to `e`. A register or frame slot with the
+# identity expression (net == 0) is a plain location; a salvaged value (net != 0)
+# computes the value and marks it DW_OP_stack_value
 # ---
-# b: the info buffer
-# v: the variable whose location is emitted (loc_kind != VLOC_NONE)
-fun emit_var_location(b: *enc.ByteBuf, v: *DwVar) {
-    var e: enc.ByteBuf = enc.buf_init(b.alloc);
-    if (v.loc_kind == VLOC_REG) {
-        if (v.net == 0) {
-            emit_reg_op(?e, DW_OP_reg0, DW_OP_regx, v.reg);
+# e:    the expression buffer
+# kind: VLOC_REG or VLOC_FRAME
+# reg:  DWARF register number when kind == VLOC_REG
+# off:  frame-base offset when kind == VLOC_FRAME
+# net:  the salvage net constant (0 = identity)
+fun build_loc_ops(e: *enc.ByteBuf, kind: u8, reg: i32, off: i64, net: i64) {
+    if (kind == VLOC_REG) {
+        if (net == 0) {
+            emit_reg_op(e, DW_OP_reg0, DW_OP_regx, reg);
         } or {
-            emit_reg_op(?e, DW_OP_breg0, 0, v.reg);
-            sleb(?e, v.net);
-            enc.emit_byte(?e, DW_OP_stack_value);
+            emit_reg_op(e, DW_OP_breg0, 0, reg);
+            sleb(e, net);
+            enc.emit_byte(e, DW_OP_stack_value);
         }
     } or {   # VLOC_FRAME
-        enc.emit_byte(?e, DW_OP_fbreg);
-        sleb(?e, v.offset);
-        if (v.net != 0) {
-            enc.emit_byte(?e, DW_OP_deref);
-            emit_net_const(?e, v.net);
-            enc.emit_byte(?e, DW_OP_stack_value);
+        enc.emit_byte(e, DW_OP_fbreg);
+        sleb(e, off);
+        if (net != 0) {
+            enc.emit_byte(e, DW_OP_deref);
+            emit_net_const(e, net);
+            enc.emit_byte(e, DW_OP_stack_value);
         }
     }
+}
+
+# emit a counted location description: a uleb byte-length prefix then the home's
+# expression ops. Shared by the single-location DW_AT_location exprloc and each
+# `.debug_loclists` range's counted location description (identical byte shape)
+# ---
+# b:    the destination buffer
+# kind/reg/off/net: the home the expression describes
+fun emit_counted_loc(b: *enc.ByteBuf, kind: u8, reg: i32, off: i64, net: i64) {
+    var e: enc.ByteBuf = enc.buf_init(b.alloc);
+    build_loc_ops(?e, kind, reg, off, net);
     uleb(b, e.len::u64);
     var i: usize = 0;
     for (i < e.len) { enc.emit_byte(b, e.data[i]); i = i + 1; }
     enc.buf_dnit(?e);
+}
+
+# emit a variable's single-location DW_AT_location exprloc from its stationary home
+# ---
+# b: the info buffer
+# v: the variable whose location is emitted (loc_kind is VLOC_REG or VLOC_FRAME)
+fun emit_var_location(b: *enc.ByteBuf, v: *DwVar) {
+    emit_counted_loc(b, v.loc_kind, v.reg, v.offset, v.net);
+}
+
+# build the DWARF 5 `.debug_loclists` section: the unit header (offset_entry_count 0,
+# so DW_AT_location fields are direct DW_FORM_sec_offset pointers), then one location
+# list per VLOC_LOCLIST variable, walked in the same subprogram-then-declaration order
+# `build_info` emits the DIEs. Each list is a DW_LLE_base_address (its address
+# relocated to the owning function's low_pc, recorded in `loc_relocs`) followed by a
+# DW_LLE_offset_pair per real-home range - each carrying the range's own counted
+# location expression - and a closing DW_LLE_end_of_list. An optimized-out range
+# (VLOC_NONE) is omitted, leaving a gap the consumer reports as unavailable. Each
+# variable's list byte offset is recorded in `loclist_off` for its DW_FORM_sec_offset
+#
+# Range fidelity: a binding governs `[binding_pc, next_binding_pc | fn_end)`, which is
+# linear source-order reasoning. Under control flow, a taken branch can enter a range
+# where a different binding actually governs, and merge points carry no births until
+# #1904 lands; so ranges are accurate for straight-line and dominating flow and
+# conservative past unbirthed merges - never presented as flow-exact. This inherits the
+# #1904 merge-point caveat.
+# ---
+# b:            the loclists buffer (appended to)
+# funcs/nfuncs: the subprogram functions whose variables own the lists
+# vars:         the shared variable array
+# ranges:       the shared range array
+# address_size: target pointer width (base-address field size)
+# loc_relocs:   out - the base-address relocation list
+# loc_reloc_count: out - number of base-address relocations
+fun build_loclists(b: *enc.ByteBuf, funcs: *DwFunc, nfuncs: u32, vars: *DwVar, ranges: *LocRange,
+                   address_size: u8, loc_relocs: *LocReloc, loc_reloc_count: *u32) {
+    val len_pos: usize = b.len;
+    enc.emit_u32(b, 0);              # unit_length (backpatched)
+    val body: usize = b.len;
+    enc.emit_u16(b, 5);             # version
+    enc.emit_byte(b, address_size);
+    enc.emit_byte(b, 0);            # segment_selector_size
+    enc.emit_u32(b, 0);            # offset_entry_count (0 = direct sec_offset)
+
+    var f: u32 = 0;
+    for (f < nfuncs) {
+        val fn: *DwFunc = ?funcs[f];
+        var vi: u32 = 0;
+        for (vi < fn.var_count) {
+            val v: *DwVar = ?vars[fn.var_start + vi];
+            if (v.loc_kind != VLOC_LOCLIST) { vi = vi + 1; cnt; }
+            v.loclist_off = b.len::u32;
+            enc.emit_byte(b, DW_LLE_base_address);
+            push_loc_reloc(loc_relocs, loc_reloc_count, b.len::u32, fn.name);
+            emit_addr(b, address_size);   # base address = fn low_pc (relocated)
+            var r: u32 = v.range_start;
+            val rend: u32 = v.range_start + v.range_count;
+            for (r < rend) {
+                val rg: *LocRange = ?ranges[r];
+                if (rg.kind != VLOC_NONE) {
+                    enc.emit_byte(b, DW_LLE_offset_pair);
+                    uleb(b, (rg.start - fn.offset)::u64);
+                    uleb(b, (rg.end - fn.offset)::u64);
+                    emit_counted_loc(b, rg.kind, rg.reg, rg.off, rg.net);
+                }
+                r = r + 1;
+            }
+            enc.emit_byte(b, DW_LLE_end_of_list);
+            vi = vi + 1;
+        }
+        f = f + 1;
+    }
+
+    bin.write_u32_le(b.data, len_pos, (b.len - body)::u32);
 }
 
 # emit DW_OP_reg<n> / DW_OP_breg<n>: `base0` + n as one byte for n < 32, else the
@@ -1170,10 +1335,13 @@ fun add_reloc_addend(image: *of.ObjectImage, sec: u32, offset: u32, kind: of.Rel
 # image:    the per-module object image being built
 # rows:     the encoder's re-homed PC<->source rows
 # row_count: number of rows
+# varlocs:  the encoder's re-homed per-PC variable-location records
+# varloc_count: number of variable-location records
 # text_sec: the `.text` section index
 # ret:      ok(true) on success, or an allocation error
-pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, mirmod: *mir.MirModule,
-                image: *of.ObjectImage, rows: *enc.LineRow, row_count: u32, text_sec: u32) R.Result[bool, str] {
+pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
+                image: *of.ObjectImage, rows: *enc.LineRow, row_count: u32,
+                varlocs: *enc.VarLoc, varloc_count: u32, text_sec: u32) R.Result[bool, str] {
     val nfuncs: u32 = count_funcs(image, text_sec);
     if (nfuncs == 0) { ret R.ok[bool, str](true); }
 
@@ -1238,75 +1406,111 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, mir
         high_pc = (subs[nsub - 1].offset + subs[nsub - 1].size - subs[0].offset)::u64;
     }
 
-    # variable capacity: an upper bound is the total MIR dbg-var count over the
-    # subprogram functions (dedup / skips only reduce it).
-    var var_cap: u32 = 0;
-    var vc: u32 = 0;
-    for (vc < nsub) {
-        val omf: O.Option[*mir.MirFunction] = find_mir_func(mirmod, subs[vc].name);
-        if (O.is_some[*mir.MirFunction](omf)) { var_cap = var_cap + O.unwrap[*mir.MirFunction](omf).dbg_var_count; }
-        vc = vc + 1;
-    }
+    # variable capacity: an upper bound is the total variable-location record count
+    # (each record contributes at most one variable-binding; dedup only reduces it).
+    var var_cap: u32 = varloc_count;
     if (var_cap == 0) { var_cap = 1; }
     val rv: R.Result[*DwVar, str] = A.allocate[DwVar](s.alloc, var_cap::usize);
     if (R.is_err[*DwVar, str](rv)) { A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize); ret R.err[bool, str](R.unwrap_err[*DwVar, str](rv)); }
     val vars: *DwVar = R.unwrap_ok[*DwVar, str](rv);
 
-    # gather base types + per-subprogram metadata + variables, building the
-    # `.debug_str` table as names / type spellings resolve.
+    # loclist-range capacity: at most one range per variable-location record.
+    val range_cap: u32 = var_cap;
+    val rgr: R.Result[*LocRange, str] = A.allocate[LocRange](s.alloc, range_cap::usize);
+    if (R.is_err[*LocRange, str](rgr)) {
+        A.deallocate[DwVar](s.alloc, vars, var_cap::usize); A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+        ret R.err[bool, str](R.unwrap_err[*LocRange, str](rgr));
+    }
+    val ranges: *LocRange = R.unwrap_ok[*LocRange, str](rgr);
+
+    # gather base types + per-subprogram metadata + variables (+ their loclist ranges),
+    # building the `.debug_str` table as names / type spellings resolve.
     val rb: R.Result[*BaseType, str] = A.allocate[BaseType](s.alloc, MAX_BASE_TYPES::usize);
-    if (R.is_err[*BaseType, str](rb)) { A.deallocate[DwVar](s.alloc, vars, var_cap::usize); A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize); ret R.err[bool, str](R.unwrap_err[*BaseType, str](rb)); }
+    if (R.is_err[*BaseType, str](rb)) { A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize); A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize); ret R.err[bool, str](R.unwrap_err[*BaseType, str](rb)); }
     val bts: *BaseType = R.unwrap_ok[*BaseType, str](rb);
     var strtab: StrTab;
     strtab.buf = enc.buf_init(s.alloc);
     var nbt: u32 = 0;
     var var_count: u32 = 0;
-    gather_subprograms(s, tgt, irmod, mirmod, subs, nsub, rows, row_count, text_sec, ?ft, address_size, bts, ?nbt, ?strtab, vars, ?var_count, var_cap);
+    var range_count: u32 = 0;
+    gather_subprograms(s, tgt, irmod, subs, nsub, rows, row_count, varlocs, varloc_count, text_sec, ?ft, address_size,
+                       bts, ?nbt, ?strtab, vars, ?var_count, var_cap, ranges, ?range_count, range_cap);
+
+    # a module emits a `.debug_loclists` section only when some variable's home moves.
+    var has_loclists: bool = false;
+    var lv: u32 = 0;
+    for (lv < var_count) { if (vars[lv].loc_kind == VLOC_LOCLIST) { has_loclists = true; } lv = lv + 1; }
 
     # per-function set_address field offsets, filled by build_line.
     val ra: R.Result[*u32, str] = A.allocate[u32](s.alloc, nfuncs::usize);
     if (R.is_err[*u32, str](ra)) {
-        enc.buf_dnit(?strtab.buf); A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
+        enc.buf_dnit(?strtab.buf); A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+        A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
         A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
         ret R.err[bool, str](R.unwrap_err[*u32, str](ra));
     }
     val addr_off: *u32 = R.unwrap_ok[*u32, str](ra);
 
     # the `.debug_info` reloc list: 2 CU + 2 per subprogram (name strp, low_pc addr) +
-    # 1 per base type (name strp) + 1 per variable (name strp).
-    val reloc_cap: u32 = 2 + 2 * nsub + nbt + var_count;
+    # 1 per base type (name strp) + up to 2 per variable (name strp, loclist sec_offset).
+    val reloc_cap: u32 = 2 + 2 * nsub + nbt + 2 * var_count;
     val rr2: R.Result[*InfoReloc, str] = A.allocate[InfoReloc](s.alloc, reloc_cap::usize);
     if (R.is_err[*InfoReloc, str](rr2)) {
         A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); enc.buf_dnit(?strtab.buf);
-        A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
+        A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+        A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
         A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
         ret R.err[bool, str](R.unwrap_err[*InfoReloc, str](rr2));
     }
     val info_relocs: *InfoReloc = R.unwrap_ok[*InfoReloc, str](rr2);
     var info_reloc_count: u32 = 0;
 
-    var b_abbrev: enc.ByteBuf = enc.buf_init(s.alloc);
-    var b_line:   enc.ByteBuf = enc.buf_init(s.alloc);
-    var b_info:   enc.ByteBuf = enc.buf_init(s.alloc);
+    # the `.debug_loclists` base-address reloc list: one per loclist variable.
+    val loc_reloc_cap: u32 = var_count + 1;
+    val rlr: R.Result[*LocReloc, str] = A.allocate[LocReloc](s.alloc, loc_reloc_cap::usize);
+    if (R.is_err[*LocReloc, str](rlr)) {
+        A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
+        A.deallocate[u32](s.alloc, addr_off, nfuncs::usize); enc.buf_dnit(?strtab.buf);
+        A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+        A.deallocate[LocRange](s.alloc, ranges, range_cap::usize); A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
+        A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize); A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
+        ret R.err[bool, str](R.unwrap_err[*LocReloc, str](rlr));
+    }
+    val loc_relocs: *LocReloc = R.unwrap_ok[*LocReloc, str](rlr);
+    var loc_reloc_count: u32 = 0;
+
+    var b_abbrev:   enc.ByteBuf = enc.buf_init(s.alloc);
+    var b_line:     enc.ByteBuf = enc.buf_init(s.alloc);
+    var b_info:     enc.ByteBuf = enc.buf_init(s.alloc);
+    var b_loclists: enc.ByteBuf = enc.buf_init(s.alloc);
 
     build_abbrev(?b_abbrev);
     build_line(s, funcs, nfuncs, rows, row_count, text_sec, address_size, comp_dir, ?ft, ?b_line, addr_off);
+    # loclists before info: build_loclists stamps each loclist variable's `loclist_off`,
+    # which build_info patches into the variable's DW_FORM_sec_offset field.
+    if (has_loclists) {
+        build_loclists(?b_loclists, subs, nsub, vars, ranges, address_size, loc_relocs, ?loc_reloc_count);
+    }
     var low_off:  u32 = 0;
     var stmt_off: u32 = 0;
     build_info(?b_info, address_size, producer, name, comp_dir, high_pc, frame_base_reg(tgt),
                subs, nsub, bts, nbt, vars, info_relocs, ?info_reloc_count, ?low_off, ?stmt_off);
 
     val pr: R.Result[bool, str] = install(s, image, itn, funcs, nfuncs, cu_low_name,
-                                          ?b_abbrev, ?b_line, ?b_info, ?strtab.buf, addr_off, low_off, stmt_off,
-                                          info_relocs, info_reloc_count);
+                                          ?b_abbrev, ?b_line, ?b_info, ?strtab.buf, ?b_loclists, has_loclists,
+                                          addr_off, low_off, stmt_off, info_relocs, info_reloc_count,
+                                          loc_relocs, loc_reloc_count);
 
     enc.buf_dnit(?b_abbrev);
     enc.buf_dnit(?b_line);
     enc.buf_dnit(?b_info);
+    enc.buf_dnit(?b_loclists);
     enc.buf_dnit(?strtab.buf);
+    A.deallocate[LocReloc](s.alloc, loc_relocs, loc_reloc_cap::usize);
     A.deallocate[InfoReloc](s.alloc, info_relocs, reloc_cap::usize);
     A.deallocate[u32](s.alloc, addr_off, nfuncs::usize);
     A.deallocate[BaseType](s.alloc, bts, MAX_BASE_TYPES::usize);
+    A.deallocate[LocRange](s.alloc, ranges, range_cap::usize);
     A.deallocate[DwVar](s.alloc, vars, var_cap::usize);
     A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize);
     A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
@@ -1322,16 +1526,20 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, mir
 # irmod:        the IR module supplying disp / ret_sem
 # funcs/nfuncs: the sorted functions (metadata filled in place)
 # rows/row_count: the encoder rows, scanned for each function's first-row location
+# varlocs/varloc_count: the encoder's re-homed variable-location records
 # text_sec:     the `.text` section index
 # ft:           the file table (for decl_file resolution)
 # address_size: target pointer width, for a raw-pointer return's byte size
 # bts:          out - the base-type array (cap MAX_BASE_TYPES)
 # strtab:       out - the `.debug_str` string table
-# ret:          the number of base types gathered
-fun gather_subprograms(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, mirmod: *mir.MirModule,
-                       funcs: *DwFunc, nfuncs: u32, rows: *enc.LineRow, row_count: u32, text_sec: u32,
+# vars/var_count/var_cap: out - the shared variable array
+# ranges/range_count/range_cap: out - the shared loclist-range array
+fun gather_subprograms(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
+                       funcs: *DwFunc, nfuncs: u32, rows: *enc.LineRow, row_count: u32,
+                       varlocs: *enc.VarLoc, varloc_count: u32, text_sec: u32,
                        ft: *FileTable, address_size: u8, bts: *BaseType, nbt: *u32, strtab: *StrTab,
-                       vars: *DwVar, var_count: *u32, var_cap: u32) {
+                       vars: *DwVar, var_count: *u32, var_cap: u32,
+                       ranges: *LocRange, range_count: *u32, range_cap: u32) {
     var i: u32 = 0;
     for (i < nfuncs) {
         val fn: *DwFunc = ?funcs[i];
@@ -1372,92 +1580,186 @@ fun gather_subprograms(s: *session.Session, tgt: *target.Target, irmod: *ir.Modu
             fn.ret_bt = bt_intern(bts, nbt, strtab, O.unwrap[BaseType](obt));
         }
 
-        # variables + parameters: join the MIR dbg-var table with the IR identity.
+        # variables + parameters: join the encoder's variable-location records for this
+        # function's `.text` range with the IR dbg-var identity.
         if (irfn != nil) {
-            gather_vars(s, tgt, irfn, mirmod, fn.name, address_size, bts, nbt, strtab, vars, var_count, var_cap);
+            gather_vars(s, tgt, irfn, fn.offset, fn.offset + fn.size, varlocs, varloc_count, text_sec,
+                        address_size, bts, nbt, strtab, vars, var_count, var_cap, ranges, range_count, range_cap);
             fn.var_count = @var_count - fn.var_start;
         }
         i = i + 1;
     }
 }
 
-# gather one function's DWARF variables: for each MIR dbg-var (iid -> vreg), join the
-# IR identity (name / semantic type / param flag), resolve the vreg to a location,
-# and append a DwVar. Deduplicates by source name (one single-location DIE per
-# variable, the first birth) and skips a variable whose type is not a primitive
+# gather one function's DWARF variables from the encoder's variable-location records.
+# Every record whose PC falls in `[lo, hi)` joins its OP_DBG_VALUE `iid` to the IR
+# dbg-var identity (name / semantic type / param flag); named, primitive-typed
+# variables get a DwVar. Each variable's bindings become PC-ordered LocRanges; a
+# variable whose real homes all agree keeps a single inline exprloc, one whose homes
+# disagree becomes a VLOC_LOCLIST with per-PC ranges. Only primitives get a DIE this
+# increment
 # ---
-# s/tgt:        session + target
+# s/tgt:        session + target (the ISA dwarf_reg hook)
 # irfn:         the IR function (dbg-var / dbg-expr side tables)
-# mirmod:       the MIR module (variable homes)
-# name:         the function's symbol name (finds the MIR function)
+# lo/hi:        the function's `.text` byte range
+# varlocs/varloc_count: the encoder's variable-location records
+# text_sec:     the `.text` section index (records in other sections are skipped)
 # address_size: pointer width, for a raw-pointer base type
 # bts/nbt:      the base-type table
-# vars/var_count/var_cap: the shared variable array
-fun gather_vars(s: *session.Session, tgt: *target.Target, irfn: *ir.Function, mirmod: *mir.MirModule,
-                name: intern.StrId, address_size: u8, bts: *BaseType, nbt: *u32, strtab: *StrTab,
-                vars: *DwVar, var_count: *u32, var_cap: u32) {
-    val omf: O.Option[*mir.MirFunction] = find_mir_func(mirmod, name);
-    if (O.is_none[*mir.MirFunction](omf)) { ret; }
-    val mfn: *mir.MirFunction = O.unwrap[*mir.MirFunction](omf);
-    val start: u32 = @var_count;
+# strtab:       the `.debug_str` string table
+# vars/var_count/var_cap:       the shared variable array
+# ranges/range_count/range_cap: the shared loclist-range array
+fun gather_vars(s: *session.Session, tgt: *target.Target, irfn: *ir.Function, lo: u32, hi: u32,
+                varlocs: *enc.VarLoc, varloc_count: u32, text_sec: u32, address_size: u8,
+                bts: *BaseType, nbt: *u32, strtab: *StrTab, vars: *DwVar, var_count: *u32, var_cap: u32,
+                ranges: *LocRange, range_count: *u32, range_cap: u32) {
+    val fn_var_start: u32 = @var_count;
 
+    # phase A: discover this function's distinct source variables (deduped by name).
     var i: u32 = 0;
-    for (i < mfn.dbg_var_count) {
-        if (@var_count >= var_cap) { ret; }
-        val mdv: *mir.MirDbgVar = ?mfn.dbg_vars[i];
-        val odv: O.Option[*ir.DbgVar] = ir.dbg_var_get(irfn, mdv.iid::id.InstructionId);
-        if (O.is_none[*ir.DbgVar](odv)) { i = i + 1; cnt; }
-        val dv: *ir.DbgVar = O.unwrap[*ir.DbgVar](odv);
-        if (dv.name == intern.STR_NIL) { i = i + 1; cnt; }
+    for (i < varloc_count) {
+        val vl: *enc.VarLoc = ?varlocs[i];
+        if (vl.sec != text_sec || vl.text_offset < lo || vl.text_offset >= hi) { i = i + 1; cnt; }
+        val obt: O.Option[u32] = varloc_ident(s, irfn, vl, address_size, bts, nbt, strtab);
+        if (O.is_none[u32](obt)) { i = i + 1; cnt; }
+        val name_off: u32 = O.unwrap[u32](obt);
 
-        # only primitive-typed variables get a DIE in this increment.
-        val obt: O.Option[BaseType] = sem_base_type(s, dv.ty_sem, address_size);
-        if (O.is_none[BaseType](obt)) { i = i + 1; cnt; }
-        val bt: i32 = bt_intern(bts, nbt, strtab, O.unwrap[BaseType](obt));
-        if (bt < 0) { i = i + 1; cnt; }
-
-        val nm: str = resolve(?s.interner, dv.name);
-        val name_off: u32 = str_off(strtab, nm);
-
-        # this binding's raw home.
-        var kind: u8 = VLOC_NONE;
-        var reg:  i32 = 0;
-        var off:  i64 = 0;
-        resolve_home(tgt, mfn, mdv.vreg, ?kind, ?reg, ?off);
-        val net: i64 = dbg_expr_net(irfn, mdv.iid::id.InstructionId);
-
-        # a variable may have several bindings (decl + reassignments). the
-        # single-location tier emits DW_AT_location only when every non-optimized-out
-        # binding agrees on one home; a disagreement marks the variable conflicted and
-        # drops its location (deferred to #1705's loclists). an optimized-out binding
-        # (VLOC_NONE) does not constrain a stationary home.
-        var found: i32 = -1;
-        var j: u32 = start;
-        for (j < @var_count) { if (vars[j].name_off == name_off) { found = j::i32; } j = j + 1; }
-
-        if (found < 0) {
-            if (@var_count >= var_cap) { i = i + 1; cnt; }
-            vars[@var_count].name_off = name_off;
-            vars[@var_count].bt       = bt;
-            vars[@var_count].is_param = dv.is_param;
-            vars[@var_count].loc_kind = kind;
-            vars[@var_count].reg      = reg;
-            vars[@var_count].offset   = off;
-            vars[@var_count].net      = net;
-            vars[@var_count].conflict = false;
+        var found: bool = false;
+        var j: u32 = fn_var_start;
+        for (j < @var_count) { if (vars[j].name_off == name_off) { found = true; } j = j + 1; }
+        if (!found && @var_count < var_cap) {
+            val dv: *ir.DbgVar = O.unwrap[*ir.DbgVar](ir.dbg_var_get(irfn, vl.iid::id.InstructionId));
+            val bt: i32 = bt_intern(bts, nbt, strtab, O.unwrap[BaseType](sem_base_type(s, dv.ty_sem, address_size)));
+            vars[@var_count].name_off    = name_off;
+            vars[@var_count].bt          = bt;
+            vars[@var_count].is_param    = dv.is_param;
+            vars[@var_count].loc_kind    = VLOC_NONE;
+            vars[@var_count].reg         = 0;
+            vars[@var_count].offset      = 0;
+            vars[@var_count].net         = 0;
+            vars[@var_count].range_start = 0;
+            vars[@var_count].range_count = 0;
+            vars[@var_count].loclist_off = 0;
             @var_count = @var_count + 1;
-        } or {
-            val e: *DwVar = ?vars[found::u32];
-            if (!e.conflict && kind != VLOC_NONE) {
-                if (e.loc_kind == VLOC_NONE) {
-                    e.loc_kind = kind; e.reg = reg; e.offset = off; e.net = net;
-                } or (!home_eq(e, kind, reg, off, net)) {
-                    e.conflict = true; e.loc_kind = VLOC_NONE;
-                }
-            }
         }
         i = i + 1;
     }
+
+    # phase B: per variable, collect its bindings as contiguous PC-ordered ranges, then
+    # classify the location tier.
+    var vi: u32 = fn_var_start;
+    for (vi < @var_count) {
+        val v: *DwVar = ?vars[vi];
+        v.range_start = @range_count;
+        var k: u32 = 0;
+        for (k < varloc_count) {
+            val vl: *enc.VarLoc = ?varlocs[k];
+            if (vl.sec != text_sec || vl.text_offset < lo || vl.text_offset >= hi) { k = k + 1; cnt; }
+            if (@range_count >= range_cap) { k = k + 1; cnt; }
+            val oid: O.Option[u32] = varloc_ident(s, irfn, vl, address_size, bts, nbt, strtab);
+            if (O.is_none[u32](oid)) { k = k + 1; cnt; }
+            if (O.unwrap[u32](oid) != v.name_off) { k = k + 1; cnt; }
+
+            var kind: u8 = VLOC_NONE;
+            var reg:  i32 = 0;
+            var off:  i64 = 0;
+            varloc_home(tgt, vl, ?kind, ?reg, ?off);
+            ranges[@range_count].start = vl.text_offset;
+            ranges[@range_count].end   = hi;
+            ranges[@range_count].kind  = kind;
+            ranges[@range_count].reg   = reg;
+            ranges[@range_count].off   = off;
+            ranges[@range_count].net   = dbg_expr_net(irfn, vl.iid::id.InstructionId);
+            @range_count = @range_count + 1;
+            k = k + 1;
+        }
+        v.range_count = @range_count - v.range_start;
+
+        # order by PC; a binding governs until the next binding's start, the last to hi.
+        sort_ranges(ranges, v.range_start, @range_count);
+        var r: u32 = v.range_start;
+        for (r + 1 < @range_count) { ranges[r].end = ranges[r + 1].start; r = r + 1; }
+
+        classify_var(v, ranges);
+        vi = vi + 1;
+    }
+}
+
+# join a variable-location record to its IR dbg-var identity and return the variable's
+# `.debug_str` name offset, or none when the binding has no named, primitive-typed
+# source variable (so it contributes no DIE). Interns the name and base type as a side
+# effect (idempotent - a repeat resolves to the same offsets)
+# ---
+# s:            session (interner, type universe)
+# irfn:         the IR function holding the dbg-var side table
+# vl:           the variable-location record (its `iid` joins the identity)
+# address_size: pointer width, for a raw-pointer base type
+# bts/nbt:      the base-type table
+# strtab:       the `.debug_str` string table
+# ret:          the variable's name offset, or none
+fun varloc_ident(s: *session.Session, irfn: *ir.Function, vl: *enc.VarLoc, address_size: u8,
+                 bts: *BaseType, nbt: *u32, strtab: *StrTab) O.Option[u32] {
+    val odv: O.Option[*ir.DbgVar] = ir.dbg_var_get(irfn, vl.iid::id.InstructionId);
+    if (O.is_none[*ir.DbgVar](odv)) { ret O.none[u32](); }
+    val dv: *ir.DbgVar = O.unwrap[*ir.DbgVar](odv);
+    if (dv.name == intern.STR_NIL) { ret O.none[u32](); }
+    val obt: O.Option[BaseType] = sem_base_type(s, dv.ty_sem, address_size);
+    if (O.is_none[BaseType](obt)) { ret O.none[u32](); }
+    if (bt_intern(bts, nbt, strtab, O.unwrap[BaseType](obt)) < 0) { ret O.none[u32](); }
+    ret O.some[u32](str_off(strtab, resolve(?s.interner, dv.name)));
+}
+
+# insertion-sort a variable's LocRange slice `[start, end)` by ascending PC start
+# (binding counts per variable are tiny)
+# ---
+# ranges: the shared range array
+# start:  inclusive slice start
+# end:    exclusive slice end
+fun sort_ranges(ranges: *LocRange, start: u32, end: u32) {
+    var a: u32 = start + 1;
+    for (a < end) {
+        val key: LocRange = ranges[a];
+        var b: i64 = a::i64 - 1;
+        for (b >= start::i64 && ranges[b::u32].start > key.start) {
+            ranges[(b + 1)::u32] = ranges[b::u32];
+            b = b - 1;
+        }
+        ranges[(b + 1)::u32] = key;
+        a = a + 1;
+    }
+}
+
+# classify a variable's location tier from its gathered ranges: VLOC_NONE when no
+# binding has a real home (every binding optimized out); a single inline exprloc
+# (VLOC_REG / VLOC_FRAME, `range_count` cleared) when every real binding agrees on one
+# home; VLOC_LOCLIST (ranges kept) when two real homes disagree. An optimized-out
+# binding never constrains a stationary home - it only introduces a loclist gap
+# ---
+# v:      the variable to classify (loc_kind / home / range_count set in place)
+# ranges: the shared range array (this variable's slice is `[range_start, +range_count)`)
+fun classify_var(v: *DwVar, ranges: *LocRange) {
+    var first: i32 = -1;
+    var multi: bool = false;
+    var r: u32 = v.range_start;
+    val end: u32 = v.range_start + v.range_count;
+    for (r < end) {
+        if (ranges[r].kind != VLOC_NONE) {
+            if (first < 0) {
+                first = r::i32;
+            } or (!home_eq(ranges[first::u32].kind, ranges[first::u32].reg, ranges[first::u32].off, ranges[first::u32].net,
+                           ranges[r].kind, ranges[r].reg, ranges[r].off, ranges[r].net)) {
+                multi = true;
+            }
+        }
+        r = r + 1;
+    }
+    if (first < 0) { v.loc_kind = VLOC_NONE; v.range_count = 0; ret; }
+    if (multi)     { v.loc_kind = VLOC_LOCLIST; ret; }
+    v.loc_kind    = ranges[first::u32].kind;
+    v.reg         = ranges[first::u32].reg;
+    v.offset      = ranges[first::u32].off;
+    v.net         = ranges[first::u32].net;
+    v.range_count = 0;
 }
 
 # find or append a base type by spelling, returning its index. Resolves the type's
@@ -1519,15 +1821,20 @@ fun first_row_loc(rows: *enc.LineRow, row_count: u32, text_sec: u32, start: u32,
 # nfuncs:   number of functions
 # cu_low_name: symbol the CU DW_AT_low_pc relocates to (the lowest subprogram)
 # b_abbrev/b_line/b_info/b_str: the built section bytes
+# b_loclists: the built `.debug_loclists` bytes (empty when has_loclists is false)
+# has_loclists: true when some variable's home moves (install the loclists section)
 # addr_off: per-function set_address field offsets in `.debug_line`
 # low_off:  low_pc field offset in `.debug_info`
 # stmt_off: stmt_list field offset in `.debug_info`
 # info_relocs/info_reloc_count: the deferred `.debug_info` relocations
+# loc_relocs/loc_reloc_count:   the deferred `.debug_loclists` base-address relocations
 # ret:      ok(true), or an allocation error
 fun install(s: *session.Session, image: *of.ObjectImage, itn: *intern.Interner,
             funcs: *DwFunc, nfuncs: u32, cu_low_name: intern.StrId, b_abbrev: *enc.ByteBuf, b_line: *enc.ByteBuf,
-            b_info: *enc.ByteBuf, b_str: *enc.ByteBuf, addr_off: *u32, low_off: u32, stmt_off: u32,
-            info_relocs: *InfoReloc, info_reloc_count: u32) R.Result[bool, str] {
+            b_info: *enc.ByteBuf, b_str: *enc.ByteBuf, b_loclists: *enc.ByteBuf, has_loclists: bool,
+            addr_off: *u32, low_off: u32, stmt_off: u32,
+            info_relocs: *InfoReloc, info_reloc_count: u32,
+            loc_relocs: *LocReloc, loc_reloc_count: u32) R.Result[bool, str] {
     val n_abbrev: R.Result[intern.StrId, str] = intern.intern(itn, ".debug_abbrev");
     if (R.is_err[intern.StrId, str](n_abbrev)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](n_abbrev)); }
     val n_line: R.Result[intern.StrId, str] = intern.intern(itn, ".debug_line");
@@ -1563,6 +1870,24 @@ fun install(s: *session.Session, image: *of.ObjectImage, itn: *intern.Interner,
     val sar: R.Result[u32, str] = add_anchor(image, str_anchor, str_sec);
     if (R.is_err[u32, str](sar)) { ret R.err[bool, str](R.unwrap_err[u32, str](sar)); }
 
+    # `.debug_loclists` + its anchor, only when some variable uses a location list. the
+    # anchor at offset 0 lets the DW_FORM_sec_offset location pointers (abs32 + addend)
+    # resolve into this module's contribution after the linker concatenates the section.
+    var loclists_sec: u32 = 0;
+    var loclists_anchor: intern.StrId = intern.STR_NIL;
+    if (has_loclists) {
+        val n_ll: R.Result[intern.StrId, str] = intern.intern(itn, ".debug_loclists");
+        if (R.is_err[intern.StrId, str](n_ll)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](n_ll)); }
+        val rll: R.Result[u32, str] = add_debug_section(image, R.unwrap_ok[intern.StrId, str](n_ll), b_loclists);
+        if (R.is_err[u32, str](rll)) { ret R.err[bool, str](R.unwrap_err[u32, str](rll)); }
+        loclists_sec = R.unwrap_ok[u32, str](rll);
+        val llanchor_r: R.Result[intern.StrId, str] = intern_anchor(itn, resolve(itn, image.name), ".debug_loclists");
+        if (R.is_err[intern.StrId, str](llanchor_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](llanchor_r)); }
+        loclists_anchor = R.unwrap_ok[intern.StrId, str](llanchor_r);
+        val llar: R.Result[u32, str] = add_anchor(image, loclists_anchor, loclists_sec);
+        if (R.is_err[u32, str](llar)) { ret R.err[bool, str](R.unwrap_err[u32, str](llar)); }
+    }
+
     # .debug_info: low_pc -> the CU's lowest subprogram function (abs64), stmt_list ->
     # .debug_line (abs32).
     val r1: R.Result[bool, str] = add_reloc(image, info_sec, low_off, of.RK_ABS64, cu_low_name);
@@ -1570,16 +1895,27 @@ fun install(s: *session.Session, image: *of.ObjectImage, itn: *intern.Interner,
     val r2: R.Result[bool, str] = add_reloc(image, info_sec, stmt_off, of.RK_ABS32, anchor);
     if (R.is_err[bool, str](r2)) { ret r2; }
 
-    # .debug_info: the deferred subprogram / base-type strp (to .debug_str) and low_pc
-    # (to the function symbol) relocations.
+    # .debug_info: the deferred subprogram / base-type strp (to .debug_str), low_pc (to
+    # the function symbol), and variable location-list pointer (to .debug_loclists)
+    # relocations.
     var k: u32 = 0;
     for (k < info_reloc_count) {
         val ir2: *InfoReloc = ?info_relocs[k];
         var sym: intern.StrId = ir2.sym;
-        if (ir2.target == IRLT_STR) { sym = str_anchor; }
+        if (ir2.target == IRLT_STR)     { sym = str_anchor; }
+        or (ir2.target == IRLT_LOCLIST) { sym = loclists_anchor; }
         val rk: R.Result[bool, str] = add_reloc_addend(image, info_sec, ir2.off, ir2.kind, sym, ir2.addend);
         if (R.is_err[bool, str](rk)) { ret rk; }
         k = k + 1;
+    }
+
+    # .debug_loclists: each DW_LLE_base_address -> its variable's function symbol (abs64).
+    var li: u32 = 0;
+    for (li < loc_reloc_count) {
+        val lr: *LocReloc = ?loc_relocs[li];
+        val rlrx: R.Result[bool, str] = add_reloc(image, loclists_sec, lr.off, of.RK_ABS64, lr.sym);
+        if (R.is_err[bool, str](rlrx)) { ret rlrx; }
+        li = li + 1;
     }
 
     # .debug_line: one DW_LNE_set_address (abs64) per function.
@@ -1643,15 +1979,15 @@ test "mach.lang.be.codegen.dwarf.uleb_sleb:canonical" {
     ret code;
 }
 
-# build_abbrev emits the exact eight-abbrev table (compile-unit, base type, the two
-# subprogram shapes, and the located / no-location variable + parameter shapes), byte
-# for byte
+# build_abbrev emits the exact ten-abbrev table (compile-unit, base type, the two
+# subprogram shapes, the located / no-location variable + parameter shapes, and the two
+# loclist variable + parameter shapes), byte for byte
 test "mach.lang.be.codegen.dwarf.build_abbrev:golden" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var b: enc.ByteBuf = enc.buf_init(?alloc);
     build_abbrev(?b);
-    var e: [111]u8;
+    var e: [133]u8;
     e[0]=0x01; e[1]=0x11; e[2]=0x01; e[3]=0x25; e[4]=0x08; e[5]=0x03; e[6]=0x08; e[7]=0x1B;
     e[8]=0x08; e[9]=0x13; e[10]=0x05; e[11]=0x11; e[12]=0x01; e[13]=0x12; e[14]=0x07; e[15]=0x10;
     e[16]=0x17; e[17]=0x00; e[18]=0x00; e[19]=0x02; e[20]=0x24; e[21]=0x00; e[22]=0x03; e[23]=0x0E;
@@ -1665,8 +2001,15 @@ test "mach.lang.be.codegen.dwarf.build_abbrev:golden" {
     e[80]=0x00; e[81]=0x06; e[82]=0x34; e[83]=0x00; e[84]=0x03; e[85]=0x0E; e[86]=0x49; e[87]=0x13;
     e[88]=0x00; e[89]=0x00; e[90]=0x07; e[91]=0x05; e[92]=0x00; e[93]=0x03; e[94]=0x0E; e[95]=0x49;
     e[96]=0x13; e[97]=0x02; e[98]=0x18; e[99]=0x00; e[100]=0x00; e[101]=0x08; e[102]=0x05; e[103]=0x00;
-    e[104]=0x03; e[105]=0x0E; e[106]=0x49; e[107]=0x13; e[108]=0x00; e[109]=0x00; e[110]=0x00;
-    val ok: bool = buf_eq(?b, ?e[0], 111);
+    e[104]=0x03; e[105]=0x0E; e[106]=0x49; e[107]=0x13; e[108]=0x00; e[109]=0x00;
+    # ABBREV_VARIABLE_LOCLIST (0x09): DW_TAG_variable, name strp, type ref4, location sec_offset.
+    e[110]=0x09; e[111]=0x34; e[112]=0x00; e[113]=0x03; e[114]=0x0E; e[115]=0x49; e[116]=0x13;
+    e[117]=0x02; e[118]=0x17; e[119]=0x00; e[120]=0x00;
+    # ABBREV_PARAM_LOCLIST (0x0A): DW_TAG_formal_parameter, name strp, type ref4, location sec_offset.
+    e[121]=0x0A; e[122]=0x05; e[123]=0x00; e[124]=0x03; e[125]=0x0E; e[126]=0x49; e[127]=0x13;
+    e[128]=0x02; e[129]=0x17; e[130]=0x00; e[131]=0x00;
+    e[132]=0x00;   # null abbrev code terminates the table
+    val ok: bool = buf_eq(?b, ?e[0], 133);
     enc.buf_dnit(?b);
     if (!ok) { ret 1; }
     ret 0;
@@ -1772,23 +2115,100 @@ test "mach.lang.be.codegen.dwarf.emit_var_location:reg_frame_salvage" {
     ret code;
 }
 
-# home_eq is the agreement predicate the single-location tier uses: two bindings name
-# the same home only when kind and the kind-relevant fields (register or offset) plus
-# the salvage net all match. A mismatch is what drops a re-homed variable's location
+# home_eq is the agreement predicate the classifier uses: two bindings name the same
+# home only when kind and the kind-relevant fields (register or offset) plus the
+# salvage net all match. A mismatch is what promotes a re-homed variable to a loclist
 test "mach.lang.be.codegen.dwarf.home_eq:agreement" {
     var code: i32 = 0;
-    var v: DwVar; v.loc_kind = VLOC_REG; v.reg = 5; v.offset = 0; v.net = 0;
     # same register + net: agrees.
-    if (!home_eq(?v, VLOC_REG, 5, 0, 0)) { code = 1; }
-    # different register: the re-home case, must disagree (-> no DW_AT_location).
-    if (home_eq(?v, VLOC_REG, 6, 0, 0))  { code = 1; }
+    if (!home_eq(VLOC_REG, 5, 0, 0, VLOC_REG, 5, 0, 0)) { code = 1; }
+    # different register: the re-home case, must disagree (-> a loclist).
+    if (home_eq(VLOC_REG, 5, 0, 0, VLOC_REG, 6, 0, 0))  { code = 1; }
     # register vs frame: disagree.
-    if (home_eq(?v, VLOC_FRAME, 0, -8, 0)) { code = 1; }
+    if (home_eq(VLOC_REG, 5, 0, 0, VLOC_FRAME, 0, -8, 0)) { code = 1; }
     # same register, different net: disagree.
-    if (home_eq(?v, VLOC_REG, 5, 0, 4))  { code = 1; }
+    if (home_eq(VLOC_REG, 5, 0, 0, VLOC_REG, 5, 0, 4))  { code = 1; }
     # frame home agreement is by offset.
-    var f: DwVar; f.loc_kind = VLOC_FRAME; f.reg = 0; f.offset = -16; f.net = 0;
-    if (!home_eq(?f, VLOC_FRAME, 0, -16, 0)) { code = 1; }
-    if (home_eq(?f, VLOC_FRAME, 0, -24, 0))  { code = 1; }
+    if (!home_eq(VLOC_FRAME, 0, -16, 0, VLOC_FRAME, 0, -16, 0)) { code = 1; }
+    if (home_eq(VLOC_FRAME, 0, -16, 0, VLOC_FRAME, 0, -24, 0))  { code = 1; }
+    ret code;
+}
+
+# classify_var picks the location tier from a variable's ranges: agreeing real homes
+# collapse to one inline exprloc (range_count cleared), disagreeing homes stay a
+# loclist, all-optimized-out becomes no location, and an optimized-out tail does not
+# perturb an otherwise stationary home
+test "mach.lang.be.codegen.dwarf.classify_var:tiers" {
+    var code: i32 = 0;
+    var ranges: [8]LocRange;
+
+    # two agreeing register homes -> a single inline exprloc.
+    ranges[0].start=0; ranges[0].end=4; ranges[0].kind=VLOC_REG; ranges[0].reg=5; ranges[0].off=0; ranges[0].net=0;
+    ranges[1].start=4; ranges[1].end=8; ranges[1].kind=VLOC_REG; ranges[1].reg=5; ranges[1].off=0; ranges[1].net=0;
+    var v1: DwVar; v1.range_start=0; v1.range_count=2;
+    classify_var(?v1, ?ranges[0]);
+    if (v1.loc_kind != VLOC_REG || v1.reg != 5 || v1.range_count != 0) { code = 1; }
+
+    # two disagreeing homes -> a loclist (ranges kept).
+    ranges[2].start=0; ranges[2].end=4; ranges[2].kind=VLOC_REG; ranges[2].reg=5; ranges[2].off=0; ranges[2].net=0;
+    ranges[3].start=4; ranges[3].end=8; ranges[3].kind=VLOC_REG; ranges[3].reg=6; ranges[3].off=0; ranges[3].net=0;
+    var v2: DwVar; v2.range_start=2; v2.range_count=2;
+    classify_var(?v2, ?ranges[0]);
+    if (v2.loc_kind != VLOC_LOCLIST || v2.range_count != 2) { code = 1; }
+
+    # every binding optimized out -> no location.
+    ranges[4].start=0; ranges[4].end=4; ranges[4].kind=VLOC_NONE; ranges[4].reg=0; ranges[4].off=0; ranges[4].net=0;
+    ranges[5].start=4; ranges[5].end=8; ranges[5].kind=VLOC_NONE; ranges[5].reg=0; ranges[5].off=0; ranges[5].net=0;
+    var v3: DwVar; v3.range_start=4; v3.range_count=2;
+    classify_var(?v3, ?ranges[0]);
+    if (v3.loc_kind != VLOC_NONE || v3.range_count != 0) { code = 1; }
+
+    # a real frame home + an optimized-out tail -> stationary (NONE does not constrain).
+    ranges[6].start=0; ranges[6].end=4; ranges[6].kind=VLOC_FRAME; ranges[6].reg=0; ranges[6].off=-8; ranges[6].net=0;
+    ranges[7].start=4; ranges[7].end=8; ranges[7].kind=VLOC_NONE;  ranges[7].reg=0; ranges[7].off=0;  ranges[7].net=0;
+    var v4: DwVar; v4.range_start=6; v4.range_count=2;
+    classify_var(?v4, ?ranges[0]);
+    if (v4.loc_kind != VLOC_FRAME || v4.offset != -8 || v4.range_count != 0) { code = 1; }
+    ret code;
+}
+
+# build_loclists emits the DWARF 5 header and, for one loclist variable with two
+# register ranges, a base-address entry (with a recorded relocation), an offset_pair
+# per range carrying its counted location expression, and an end_of_list - byte for
+# byte, with the variable's entry offset stamped for its DW_FORM_sec_offset
+test "mach.lang.be.codegen.dwarf.build_loclists:ranges" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    var funcs: [1]DwFunc;
+    funcs[0].name = intern.STR_NIL; funcs[0].offset = 0; funcs[0].var_start = 0; funcs[0].var_count = 1;
+    var vars: [1]DwVar;
+    vars[0].loc_kind = VLOC_LOCLIST; vars[0].range_start = 0; vars[0].range_count = 2; vars[0].loclist_off = 0;
+    var ranges: [2]LocRange;
+    ranges[0].start=0; ranges[0].end=4; ranges[0].kind=VLOC_REG; ranges[0].reg=5; ranges[0].off=0; ranges[0].net=0;
+    ranges[1].start=4; ranges[1].end=8; ranges[1].kind=VLOC_REG; ranges[1].reg=6; ranges[1].off=0; ranges[1].net=0;
+
+    var relocs: [4]LocReloc;
+    var nrel: u32 = 0;
+    var b: enc.ByteBuf = enc.buf_init(?alloc);
+    build_loclists(?b, ?funcs[0], 1, ?vars[0], ?ranges[0], 8, ?relocs[0], ?nrel);
+
+    var e: [32]u8;
+    e[0]=0x1C; e[1]=0x00; e[2]=0x00; e[3]=0x00;                      # unit_length = 28
+    e[4]=0x05; e[5]=0x00;                                            # version 5
+    e[6]=0x08; e[7]=0x00;                                            # address_size, segment_selector_size
+    e[8]=0x00; e[9]=0x00; e[10]=0x00; e[11]=0x00;                    # offset_entry_count 0
+    e[12]=0x06;                                                      # DW_LLE_base_address
+    e[13]=0x00; e[14]=0x00; e[15]=0x00; e[16]=0x00; e[17]=0x00; e[18]=0x00; e[19]=0x00; e[20]=0x00;
+    e[21]=0x04; e[22]=0x00; e[23]=0x04; e[24]=0x01; e[25]=0x55;      # offset_pair [0,4) reg5
+    e[26]=0x04; e[27]=0x04; e[28]=0x08; e[29]=0x01; e[30]=0x56;      # offset_pair [4,8) reg6
+    e[31]=0x00;                                                      # DW_LLE_end_of_list
+    val ok: bool = buf_eq(?b, ?e[0], 32);
+    enc.buf_dnit(?b);
+    if (!ok) { code = 1; }
+    if (nrel != 1) { code = 1; }
+    if (relocs[0].off != 13) { code = 1; }        # the base-address address field
+    if (vars[0].loclist_off != 12) { code = 1; }  # the entry begins at DW_LLE_base_address
     ret code;
 }

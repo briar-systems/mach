@@ -123,9 +123,6 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, interne
     mf.frame.outgoing_size = 0;
     mf.callee_mask         = 0;
     mf.callee_mask_fp      = 0;
-    mf.dbg_vars            = nil;
-    mf.dbg_var_count       = 0;
-    mf.dbg_var_cap         = 0;
 
     # extern / body-less functions lower to an empty mir.MirFunction shell.
     if ((fn.flags & ir.FN_FLAG_EXTERN) != 0 || fn.block_count == 0) {
@@ -154,6 +151,9 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, interne
     ctx.interner       = interner;
     ctx.sret_vreg      = mir.MIR_VREG_NIL;
     ctx.cur_loc        = source.loc_nil();
+    ctx.pending        = nil;
+    ctx.pending_count  = 0;
+    ctx.pending_cap    = 0;
 
     val setup: R.Result[bool, str] = lctx.ctx_setup(?ctx, tgt, fn);
     if (R.is_err[bool, str](setup)) {
@@ -244,6 +244,16 @@ fun lower_block(ctx: *lctx.LowerCtx, fn: *ir.Function, blk: *ir.Block, is_entry:
         val et: R.Result[bool, str] = lower_instr(ctx, fn, mb, blk.terminator);
         if (R.is_err[bool, str](et)) { ret et; }
     }
+
+    # flush any -g binding that had no following push_instr in this block (an
+    # OP_DBG_VALUE whose next instruction was the terminator on a path that bypasses
+    # push_instr) onto the block's last instruction, so a binding never leaks into the
+    # next block. cleared unconditionally so pending never crosses a block boundary.
+    if (ctx.pending_count > 0 && mb.instr_count > 0) {
+        val fl: R.Result[bool, str] = lctx.drain_pending_dbg(ctx, ?mb.instrs[mb.instr_count - 1]);
+        if (R.is_err[bool, str](fl)) { ret fl; }
+    }
+    ctx.pending_count = 0;
 
     ret R.ok[bool, str](true);
 }
@@ -595,9 +605,12 @@ fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mi
     # this splice bypasses lctx.push_instr, so enforce the asm_block invariant here:
     # struct locals are not zero-initialized, and regalloc.flatten reads a non-nil
     # asm_block as an inline-asm clobber barrier. the same non-zero-init reasoning
-    # applies to `loc` (FILE_NIL is not 0), so stamp the current lowering location.
-    mi.asm_block     = nil;
-    mi.loc           = ctx.cur_loc;
+    # applies to `loc` (FILE_NIL is not 0) and the dbg-binding list (the encoder reads
+    # it), so stamp the location and empty the binding list.
+    mi.asm_block         = nil;
+    mi.loc               = ctx.cur_loc;
+    mi.dbg_bindings      = nil;
+    mi.dbg_binding_count = 0;
 
     # grow by one, shift the terminator right, and drop the move into its place.
     val gr: R.Result[bool, str] = lctx.grow_instr(ctx, mb);
@@ -716,9 +729,11 @@ fun split_critical_edge(ctx: *lctx.LowerCtx, pred: *mir.MirBlock, succ_id: u32) 
     # struct locals are not zero-initialized, and regalloc.flatten reads a non-nil
     # asm_block as an inline-asm clobber barrier. this is a synthesized critical-edge
     # branch with no source instruction, so its loc is nil (the line table attributes
-    # it to the surrounding code).
-    br.asm_block     = nil;
-    br.loc           = source.loc_nil();
+    # it to the surrounding code) and it carries no dbg bindings.
+    br.asm_block         = nil;
+    br.loc               = source.loc_nil();
+    br.dbg_bindings      = nil;
+    br.dbg_binding_count = 0;
 
     val ri: R.Result[*mir.MirInstr, str] = A.allocate[mir.MirInstr](ctx.alloc, 1::usize);
     if (R.is_err[*mir.MirInstr, str](ri)) { A.deallocate[mir.MirOperand](ctx.alloc, bops, 1::usize); ret R.err[*mir.MirBlock, str](R.unwrap_err[*mir.MirInstr, str](ri)); }
@@ -817,18 +832,20 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     if (inst.kind == instr.OP_PHI) {
         ret R.ok[bool, str](true);
     }
-    # OP_DBG_VALUE is pure debug metadata (present only under -g); it lowers to no
-    # machine code, so builds with and without debug info emit identical text. Under
-    # -g it records the source variable's home - the vreg its operand lowered to,
-    # whose regalloc/frame assignment the DWARF variable emitter later reads - or
-    # MIR_VREG_NIL when the operand is a constant or optimized-out value.
+    # OP_DBG_VALUE is pure debug metadata (present only under -g); it lowers to NO
+    # machine code and emits no instruction, so the MIR stream is identical with and
+    # without -g. Instead it records a pending (iid, vreg) binding that the next lowered
+    # instruction carries in its dbg-binding list (attached at push_instr); the encoder
+    # records a VarLoc at that instruction's PC, and the producer builds per-PC loclists
+    # from those records. Riding a real instruction (never a standalone marker) keeps it
+    # inert to regalloc / frame by construction.
     if (inst.kind == instr.OP_DBG_VALUE) {
         var vreg: u32 = mir.MIR_VREG_NIL;
         if (inst.operand_count > 0) {
             val op: mir.MirOperand = lctx.lower_value(ctx, inst.operands[0]);
             if (op.kind == mir.MIR_OP_VREG) { vreg = op.vreg; }
         }
-        ret mir.dbg_var_add(ctx.alloc, ctx.f, iid::u32, vreg);
+        ret lctx.push_pending_dbg(ctx, iid::u32, vreg);
     }
     if (inst.kind == instr.OP_ALLOCA) {
         ret lower_alloca(ctx, mb, inst, iid);
