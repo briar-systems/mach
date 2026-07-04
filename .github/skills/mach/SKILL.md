@@ -10,7 +10,7 @@ collection, no hidden control flow. Files use `.mach`. This skill is the fast
 path for authoring correct Mach; `doc/language/` in the Mach repository is the
 authoritative reference and wins on any disagreement.
 
-## Hard rules — get these right
+## Hard rules - get these right
 
 - **No type inference.** Every binding declares its type. `val x = 42;` is an
   error; write `val x: i64 = 42;`.
@@ -20,13 +20,13 @@ authoritative reference and wins on any disagreement.
   produce `u8`.
 - **Decorators are `#[...]` attributes** on the line(s) above a declaration:
   `#[symbol("main")]`, `#[inline]`, `#[align(64)]`. The backtick form was
-  removed in v2.4.0 and is a migration error — never emit backticks.
+  removed in v2.4.0 and is a migration error - never emit backticks.
 - **Variadics are comptime packs.** A trailing `va: ...` parameter, consumed by
   `$each a in va`. There is no `va_list`/`va_start`/`va_arg` and the C-style
   bare `...` parameter is a removed-syntax error.
 - **Strings are `*u8`, single-line.** `"hello"` is a pointer to null-terminated
   bytes. No fat-pointer string type (`str` is `def str: *char;`); no multi-line
-  string literal — use `\n` escapes.
+  string literal - use `\n` escapes.
 - **No tagged unions, no `match`.** A discriminated value is a `rec` carrying a
   discriminator plus a payload `uni`; consumers branch with `if`/`or`. This is
   exactly how stdlib `Result[T, E]` is built.
@@ -38,15 +38,15 @@ authoritative reference and wins on any disagreement.
 
 A project has a `mach.toml` at its root; `[project] id` roots every module
 path. A file at `src/foo/bar.mach` in project `id = "myproj"` is the module
-`myproj.foo.bar`. There is no `this.` self-prefix — always use the full
+`myproj.foo.bar`. There is no `this.` self-prefix - always use the full
 project-rooted path, including for sibling modules. A one-segment `use <id>;`
 resolves only when that project declares a `[project] module` surface file
-(e.g. a library `glfw` imported as `use glfw;`); `std` does not — always
+(e.g. a library `glfw` imported as `use glfw;`); `std` does not - always
 import full `std.*` paths.
 
 A file reads top-down: module docstring, `use`/`fwd` lines, declarations.
 
-### `use` — private import
+### `use` - private import
 
 ```mach
 use std.types.size;             # binds module `size`; use as size.usize
@@ -56,11 +56,11 @@ use std.types.size.usize;       # binds the symbol; use bare as usize
 
 The resolver binds whatever the path ends at: a **module** (members reached
 qualified) or a **symbol** (used bare). Importing a module does not pull its
-members in unqualified. No splat, no `use foo.{a,b}` — one name per line. A
+members in unqualified. No splat, no `use foo.{a,b}` - one name per line. A
 module `use`s every dependency it directly names, even ones reachable through
 a re-export: the dependency graph is visible at the top of every file.
 
-### `fwd` — public re-export
+### `fwd` - public re-export
 
 ```mach
 fwd impl.Point;                 # re-export as Point
@@ -110,7 +110,7 @@ fun main(argc: i64, argv: **u8) i64 {
 
 `use std.print;` binds the leaf module `print` (`std` itself is not in scope).
 It exposes `print`/`println` (stdout), `eprint`/`eprintln` (stderr), and the
-format family `printf`/`printlnf`/`eprintf`/`eprintlnf` — pack-variadic, with
+format family `printf`/`printlnf`/`eprintf`/`eprintlnf` - pack-variadic, with
 `{}` holes filled in argument order plus `{:x}`-style specs (`{:X}`, `{:c}`,
 `{:5}`, `{:<5}`, `{:08x}`; `{{`/`}}` for literal braces). All return
 `Result[usize, str]`.
@@ -125,7 +125,7 @@ Modifiers: `pub` (public surface; without it a declaration is file-private)
 applies to `fun`, `rec`, `uni`, `def`, `val`, `var`; `ext` (C-ABI external)
 applies to functions only.
 
-### `def` — type alias
+### `def` - type alias
 
 ```mach
 pub def Age:   i64;
@@ -234,12 +234,12 @@ fun(T1, T2) R       # function pointer val op: BinOp = add;  op(2, 3)
 Pointers index like arrays: `p[i]` reads the i-th element (this is how `str`
 is walked). A `fun(...)` type may carry a trailing `...` for FFI only.
 
-### `^` — the secret qualifier
+### `^` - the secret qualifier
 
 `^T` marks data as secret for the constant-time discipline. Secrets may move
 and be stored but may never reach an observable position: a branch or loop
 condition, the left operand of `&&`/`||`, a memory index, or a `/`/`%`
-operand — each is a compile error. Public flows up to secret implicitly; the
+operand - each is a compile error. Public flows up to secret implicitly; the
 **only** downgrade is the explicit strip cast `x:^` (or `x:^T`). Any operation
 with a secret operand yields a secret result; `uni` variants must agree on
 secrecy; a secret-welded pointer (`*^T`) cannot be erased to `ptr`. See
@@ -265,8 +265,8 @@ it. `nil` with no context types as `*u8`; `var cb: fun(u32) = nil;` is legal.
   the dividend, floats included). Bitwise `& | ^ ~ << >>` (ints).
 - Comparison `== != < > <= >=` → `u8`. Mixed int signedness/width compares
   **mathematical values** (a negative `i64` < any `u64`). Int vs float
-  comparison is a compile error — cast explicitly.
-- Logical `&& || !` — short-circuit, `u8` operands and result.
+  comparison is a compile error - cast explicitly.
+- Logical `&& || !` - short-circuit, `u8` operands and result.
 - Pointer: `?expr` address-of, `@p` dereference (`@p = x;` writes through).
 - Casts (postfix): `expr::T` value conversion (resize, int↔float);
   `expr:~T` bit reinterpret (same byte size required); `expr:^` strips the
@@ -276,12 +276,12 @@ it. `nil` with no context types as `*u8`; `var cb: fun(u32) = nil;` is legal.
 
 Precedence is C-family: `* / %` > `+ -` > `<< >>` > relational > equality >
 `&` > `^` > `|` > `&&` > `||` > `=`. Note bitwise binds looser than
-comparison, as in C — parenthesize `(a & b) != 0`.
+comparison, as in C - parenthesize `(a & b) != 0`.
 
 ## Statements
 
 Statements end with `;` unless they end with a block. Bodies are always
-blocks — there is no brace-less form.
+blocks - there is no brace-less form.
 
 ```mach
 if (cond) { ... } or (cond) { ... } or { ... }   # `or {}` is the catch-all
@@ -293,9 +293,9 @@ fin { ... }                                      # run at scope exit, reverse or
 { ... }                                          # bare block = new scope
 ```
 
-`fin` requires a block — `fin stmt;` is rejected. There is no for-each; loop a
+`fin` requires a block - `fin stmt;` is rejected. There is no for-each; loop a
 counter or a pointer cursor. `$if`/`$or` (comptime) and `$each` (comptime
-unroll) also appear in statement position — see Comptime below.
+unroll) also appear in statement position - see Comptime below.
 
 ## Stdlib idioms
 
@@ -312,7 +312,7 @@ val n: usize = unwrap_ok[usize, str](r);
 - `str` is `*char` (null-terminated); `std.types.string` provides `str_len`,
   comparison, and `StrView { data, len }` for length-aware slices.
 - No methods, no UFCS: everything is a free function taking an explicit
-  receiver (usually a pointer), reached through the module alias —
+  receiver (usually a pointer), reached through the module alias -
   `vec.push[T](?v, x)`, not `v.push(x)`.
 - Naming: `snake_case` functions/bindings, `PascalCase` types,
   `SCREAMING_SNAKE` constants. Indent 4 spaces; align `:` columns in field
@@ -322,8 +322,8 @@ val n: usize = unwrap_ok[usize, str](r);
 ## Docstrings
 
 `#` comments immediately above a declaration: a bare lowercase summary line
-(no `name:` prefix, no trailing period), then — only when there are elements
-to document — a `# ---` separator and one aligned component line per
+(no `name:` prefix, no trailing period), then - only when there are elements
+to document - a `# ---` separator and one aligned component line per
 parameter/field/return:
 
 ```mach
@@ -342,24 +342,24 @@ and the declaration. Document every `pub` entity.
 
 ## Comptime channel
 
-`$` opens the compiler-owned comptime channel — read-only: it *selects and
+`$` opens the compiler-owned comptime channel - read-only: it *selects and
 expands*, never executes or mutates. The parser disambiguates by shape:
 
 | Shape | Meaning |
 |---|---|
 | `$mach.*` / `$project.*` / `$bin.*` | read a compiler-owned tree (roots are reserved) |
-| `$sym(args)` | comptime call — the closed intrinsic set |
+| `$sym(args)` | comptime call - the closed intrinsic set |
 | `$if` / `$or` | comptime control flow |
 | `$each x in SEQ { }` | comptime unroll over `$fields(T)` or a variadic pack |
 
 A bare `$ident` (`$mode`, `$foo`) is none of these and is rejected: comptime
 *parameters* are referenced without `$`; comptime *paths* are rooted. The
-`$sym.attr = value;` setters were removed in v2.0.0 — codegen directives are
+`$sym.attr = value;` setters were removed in v2.0.0 - codegen directives are
 `#[...]` decorators. Not in the channel: no `$<Type>.*` reflection, no
 comptime function definitions, no comptime loops beyond `$each` over
 fields/packs.
 
-### `$mach.*` — compiler and build state
+### `$mach.*` - compiler and build state
 
 All reads, all comptime constants, closed tree:
 
@@ -378,10 +378,10 @@ $mach.mode.debug  .release
 ```
 
 `$mach.build.{timestamp,host,git.*}`, `$mach.project.*`, and `$mach.source.*`
-are reserved stubs — reading one is a compile error. The tag tables are closed;
+are reserved stubs - reading one is a compile error. The tag tables are closed;
 an unrecognized tag is a compile error, never a silent fold.
 
-Tag comparison is path-value — plain `==`, no `.id` suffix, no unwrap:
+Tag comparison is path-value - plain `==`, no `.id` suffix, no unwrap:
 
 ```mach
 $if ($mach.build.os == $mach.os.linux) { ... }
@@ -392,7 +392,7 @@ A `$mach.build.<NAME>` that names none of the reserved facts resolves to the
 manifest's per-target comptime `defines` (`defines = ["TRACING", "DEPTH=4"]`
 in a `[target.*]` stanza); an undeclared name is a loud error.
 
-A `$mach.*` read can fold into a runtime binding — the binding still declares
+A `$mach.*` read can fold into a runtime binding - the binding still declares
 its type:
 
 ```mach
@@ -400,7 +400,7 @@ pub val IS_LINUX: u8  = $mach.build.os == $mach.os.linux;
 pub val COMPILER: *u8 = $mach.compiler.name;
 ```
 
-### `$project.*` / `$bin.*` — manifest state
+### `$project.*` / `$bin.*` - manifest state
 
 ```mach
 $project.id / .version / .name / .description   # [project] metadata
@@ -410,10 +410,10 @@ $bin.name                                       # the artifact being built
 ```
 
 `$project.target.*` carries the manifest's string spellings (`"linux"`,
-`"x86_64"`) — distinct from `$mach.build.*`'s numeric tags. A field the
+`"x86_64"`) - distinct from `$mach.build.*`'s numeric tags. A field the
 manifest does not declare is reported unavailable, not folded to `""`.
 
-### Decorators — `#[...]`
+### Decorators - `#[...]`
 
 Codegen directives on the line(s) above a declaration (after the docstring).
 One clause each, stackable on one line or several; they attach only to the
@@ -436,18 +436,18 @@ pub var cache_line: u8 = 0;
 ```
 
 `align` takes any comptime expression (`#[align($align_of(T))]`). A `library`
-pin must name a DLL in the target's `libs` set — pinning to an absent library
+pin must name a DLL in the target's `libs` set - pinning to an absent library
 is a link error; on ELF the pin is validated but has no binary effect. Beware:
-a line comment starting `#[` with no space parses as a decorator — write
+a line comment starting `#[` with no space parses as a decorator - write
 `# [...]` in prose comments.
 
-### Intrinsics — `$name(args)`
+### Intrinsics - `$name(args)`
 
 Closed compiler-shipped set. New ones require a compiler change; runtime
-instruction emitters (`trap`, `fence`, `pause`) are **not** intrinsics — they
+instruction emitters (`trap`, `fence`, `pause`) are **not** intrinsics - they
 are stdlib functions with per-arch `asm` bodies.
 
-**Layout values** — comptime unsigned integers; the binding declares the
+**Layout values** - comptime unsigned integers; the binding declares the
 storage type (`pub val POINT_SIZE: i64 = $size_of(Point);`):
 
 ```mach
@@ -457,7 +457,7 @@ $size_of(T)   $align_of(T)   $offset_of(T, field)
 **`$type_of(expr)`** produces a comptime type value, comparable with
 `==`/`!=` against a type name inside `$if`. Dead arms are **pruned before
 type-checking**, so each arm can use the value at its own concrete type with
-no cast — the idiom for per-element dispatch inside `$each` bodies (stdlib
+no cast - the idiom for per-element dispatch inside `$each` bodies (stdlib
 `vformat` is built exactly this way):
 
 ```mach
@@ -469,7 +469,7 @@ $or { $error("no writer for this argument type"); }
 **`$fields(T)`** yields a comptime sequence of field descriptors for a
 `rec`/`uni`, consumed by `$each`. Each descriptor `f` carries `f.name`
 (`*u8`), `f.type` (type value), `f.offset` (integer); `v.[f]` projects the
-concrete field off an instance — an lvalue, re-typed per iteration:
+concrete field off an instance - an lvalue, re-typed per iteration:
 
 ```mach
 fun sum_fields(p: Pair) i64 {
@@ -479,42 +479,42 @@ fun sum_fields(p: Pair) i64 {
 }
 ```
 
-**`$each`** is statement-scope only. The body is spliced once per element —
+**`$each`** is statement-scope only. The body is spliced once per element -
 not a runtime loop. Two sequence forms: `$each f in $fields(T)` and
 `$each a in va` (packs). Enclosing runtime variables thread across the
 unrolled copies; nesting is allowed.
 
-**Diagnostics.** `$error("msg")` fails the build when **reached** —
+**Diagnostics.** `$error("msg")` fails the build when **reached** -
 unconditional position or a selected `$if`/`$or` arm. A `$error` in a
 discarded arm never fires, making it the natural exhaustiveness fallback for
 target and type dispatch. Valid at declaration and statement scope.
-**`$assert` parses but is not yet evaluated** — write
+**`$assert` parses but is not yet evaluated** - write
 `$if (!cond) { $error("msg"); }` instead.
 
-### `$if` / `$or` — conditional compilation
+### `$if` / `$or` - conditional compilation
 
 ```mach
 $if (cond) { ... }
 $or (cond) { ... }
-$or { ... }             # comptime else — no condition; there is no `$or $if`
+$or { ... }             # comptime else - no condition; there is no `$or $if`
 ```
 
 Only the taken branch compiles: discarded branches are not resolved,
-type-checked, or emitted — names inside them are never looked up. This is
+type-checked, or emitted - names inside them are never looked up. This is
 what makes per-arch `asm` and per-OS `use` safe. Valid at declaration scope
 (selecting `use`/`fwd`/declarations) and statement scope. `$if` selects at
-compile time and discards the rest; runtime `if` emits a branch — never use
+compile time and discards the rest; runtime `if` emits a branch - never use
 `$if` to fake reflection over code that must exist at runtime.
 
 Conditions must be comptime: `$mach.*`/`$project.*` reads, comptime constants
 (`pub val`), comptime parameters, `$type_of` comparisons. Comptime comparison
-follows the runtime rules — mathematical values, mixed signedness fine;
+follows the runtime rules - mathematical values, mixed signedness fine;
 overflow in comptime arithmetic is a compile error, not a wrap.
 
-### Comptime function parameters — `$name: T`
+### Comptime function parameters - `$name: T`
 
 A `$`-marked parameter in the regular list must receive a comptime-evaluable
-argument (literal, `pub val` constant — including imported ones — or another
+argument (literal, `pub val` constant - including imported ones - or another
 comptime parameter). The compiler **monomorphizes the body per distinct
 value**; each instance compiles only the arms its value selects. Referenced
 bare inside the body:
@@ -537,17 +537,17 @@ Rules that bite:
   instance. Each arm must be independently valid.
 - No storage: `?mode` is rejected; the parameter is stripped from the lowered
   signature and ABI.
-- A comptime-parameter function is a template, not a value — it cannot be
+- A comptime-parameter function is a template, not a value - it cannot be
   assigned, passed, or compared, only called.
 - Not yet combinable with generic type params (`fun f[T]($m: u8, ...)` is a
   clear diagnostic).
-- Function parameters only — never record fields.
+- Function parameters only - never record fields.
 
 ### Variadic packs
 
 `va: ...` (trailing parameter) collects call-site arguments into a comptime
 sequence; monomorphized per distinct type-list. `$each a in va` consumes it
-(heterogeneous packs work — dispatch with `$type_of` per element), `va.len`
+(heterogeneous packs work - dispatch with `$type_of` per element), `va.len`
 folds to the count, `g(va...)` forwards the whole pack (sole trailing argument
 only; no partial forward). No runtime `va_list` exists. Pack functions have no
 stable ABI symbol: not `ext`, not addressable. See `doc/language/variadics.md`.
@@ -568,7 +568,7 @@ asm x86_64 {
 Locked rules:
 
 - The ISA tag is **mandatory**; bare `asm { }` is rejected. The tag set is
-  closed: `x86_64`, `aarch64`, `riscv64` — each with a working native
+  closed: `x86_64`, `aarch64`, `riscv64` - each with a working native
   assembler, all three exercised in CI (riscv64 under qemu; riscv64 is a
   self-hosting target with a byte-identical fixpoint).
 - The body is **raw text**, not tokens: unquoted lines in the ISA's native
@@ -576,11 +576,11 @@ Locked rules:
   body is not a string.
 - `#` starts a line comment; everything after it on the line is inert.
 
-### Operand substitution — `{name}`
+### Operand substitution - `{name}`
 
 `{name}` substitutes a local in scope; the compiler resolves it to a register
 or memory operand from liveness and the instruction's operand class. In
-practice a `{name}` binds the local's **storage — typically a stack slot** —
+practice a `{name}` binds the local's **storage - typically a stack slot** -
 so to reach a pointee, stage the pointer through a scratch register first;
 never write a double indirection like `[{ptr}]`:
 
@@ -620,7 +620,7 @@ $or {
 ```
 
 A platform-specific module guards itself at the top so misuse fails loudly at
-compile time — the stdlib pattern:
+compile time - the stdlib pattern:
 
 ```mach
 $if ($mach.build.arch != $mach.arch.x86_64) {
@@ -629,20 +629,20 @@ $if ($mach.build.arch != $mach.arch.x86_64) {
 ```
 
 Variant dispatch (memory orderings and similar) is one function with a
-`$name: T` comptime parameter whose `$if` arms select per-variant `asm` — one
+`$name: T` comptime parameter whose `$if` arms select per-variant `asm` - one
 monomorphized instance per distinct value (see Comptime function parameters).
 
 ### `asm` vs stdlib
 
 Write `asm` only for truly target-specific operations with no stdlib wrapper:
 raw syscalls, special-register reads, stack-frame surgery. For anything that
-maps to a named function — atomics, fences, `trap()`, bit ops (popcount, clz,
-bswap), syscall wrappers — **call the stdlib**: those functions already
+maps to a named function - atomics, fences, `trap()`, bit ops (popcount, clz,
+bswap), syscall wrappers - **call the stdlib**: those functions already
 contain the arch-dispatched `asm`, and reimplementing them inline duplicates
 the dispatch. Rule of thumb: if the operation is a fixed instruction sequence
 per arch, there is (or should be) a stdlib wrapper.
 
-### Secrecy — `asm` is a trusted-base crossing
+### Secrecy - `asm` is a trusted-base crossing
 
 The `^` secret qualifier's flow rules stop at an `asm` boundary: the type
 system cannot check instruction streams, so an `asm` block can observe or
@@ -654,7 +654,7 @@ instructions) is entirely on you.
 
 The authoritative per-feature reference lives in the Mach repository under
 [`doc/language/`](https://github.com/briar-systems/mach/tree/dev/doc/language)
-— including the full EBNF in `grammar.md`, `variadics.md`, `secrecy.md`,
+- including the full EBNF in `grammar.md`, `variadics.md`, `secrecy.md`,
 `decorators.md`, the `comptime-*.md` set, `asm.md`, and `policy.md` (the
 compiler-vs-stdlib boundary). When this skill and the reference disagree, the
 reference wins.
