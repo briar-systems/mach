@@ -1597,17 +1597,18 @@ fun type_is_aggregate(tc: *TypeCtx, ty: i32) bool {
 # identity expression (net == 0) is a plain location; a salvaged value (net != 0)
 # computes the value and marks it DW_OP_stack_value; a constant home is the computed
 # value `off + net` pushed directly and marked DW_OP_stack_value. When `byref`, the home
-# holds a pointer to the aggregate's storage (not its value): the location yields that
-# address - a register home is the address itself (DW_OP_breg reg 0), a spilled home
-# loads the pointer from its slot (DW_OP_fbreg off, DW_OP_deref) - so the consumer reads
-# the aggregate's bytes from it rather than misreading the pointer as the value
+# is a frame slot holding a pointer to the aggregate's storage (register homes never
+# reach here - classify_var / build_loclists filter them out, since a reused register
+# cannot describe the address whole-scope): the location loads that pointer, adds any
+# salvage offset, and leaves the address on the stack (no DW_OP_stack_value) so the
+# consumer reads the aggregate's bytes from it
 # ---
 # e:     the expression buffer
 # kind:  VLOC_REG / VLOC_FRAME / VLOC_CONST
 # reg:   DWARF register number when kind == VLOC_REG
 # off:   frame-base offset when kind == VLOC_FRAME; the constant value when VLOC_CONST
 # net:   the salvage net constant (0 = identity)
-# byref: true for a by-reference aggregate whose home addresses its storage
+# byref: true for a by-reference aggregate located from a frame slot holding its address
 fun build_loc_ops(e: *enc.ByteBuf, kind: u8, reg: i32, off: i64, net: i64, byref: bool) {
     if (kind == VLOC_CONST) {
         # the variable IS the compile-time constant `off + net`; push it and mark the
@@ -1619,16 +1620,12 @@ fun build_loc_ops(e: *enc.ByteBuf, kind: u8, reg: i32, off: i64, net: i64, byref
         ret;
     }
     if (byref) {
-        # the home addresses the aggregate's storage; leave the address on the stack (no
-        # DW_OP_stack_value) so the consumer dereferences it for the aggregate's bytes.
-        if (kind == VLOC_REG) {
-            emit_reg_op(e, DW_OP_breg0, 0, reg);
-            sleb(e, 0);
-        } or {   # VLOC_FRAME: the slot holds the storage pointer, so load it.
-            enc.emit_byte(e, DW_OP_fbreg);
-            sleb(e, off);
-            enc.emit_byte(e, DW_OP_deref);
-        }
+        # a frame slot holds the storage pointer: load it, add any salvage offset (an
+        # aggregate address recovered as base + k), and leave the address on the stack.
+        enc.emit_byte(e, DW_OP_fbreg);
+        sleb(e, off);
+        enc.emit_byte(e, DW_OP_deref);
+        if (net != 0) { emit_net_const(e, net); }
         ret;
     }
     if (kind == VLOC_REG) {
@@ -1723,7 +1720,9 @@ fun build_loclists(b: *enc.ByteBuf, funcs: *DwFunc, nfuncs: u32, vars: *DwVar, r
             val rend: u32 = v.range_start + v.range_count;
             for (r < rend) {
                 val rg: *LocRange = ?ranges[r];
-                if (rg.kind != VLOC_NONE) {
+                # a non-real home (optimized out, or a byref aggregate's transient register)
+                # is left as a gap the consumer reports as unavailable, never a stale address.
+                if (range_real_home(v, rg)) {
                     enc.emit_byte(b, DW_LLE_offset_pair);
                     uleb(b, (rg.start - fn.offset)::u64);
                     uleb(b, (rg.end - fn.offset)::u64);
@@ -2743,11 +2742,27 @@ fun sort_ranges(ranges: *LocRange, start: u32, end: u32) {
     }
 }
 
+# whether a range is a real, describable home for variable `v`. An optimized-out binding
+# (VLOC_NONE) never is. For a by-reference aggregate a REGISTER home never is either: the
+# register holds the storage address only transiently and is reused, so describing the
+# aggregate from it whole-scope would dereference a stale value (a wild read) - such a
+# variable is located only from a frame slot (scope-stable) or omitted
+# ---
+# v:  the variable the range belongs to
+# rg: the range to test
+# ret: true when the range names a home the producer can faithfully describe
+fun range_real_home(v: *DwVar, rg: *LocRange) bool {
+    if (rg.kind == VLOC_NONE) { ret false; }
+    if (v.byref && rg.kind == VLOC_REG) { ret false; }
+    ret true;
+}
+
 # classify a variable's location tier from its gathered ranges: VLOC_NONE when no
-# binding has a real home (every binding optimized out); a single inline exprloc
-# (VLOC_REG / VLOC_FRAME, `range_count` cleared) when every real binding agrees on one
-# home; VLOC_LOCLIST (ranges kept) when two real homes disagree. An optimized-out
-# binding never constrains a stationary home - it only introduces a loclist gap
+# binding has a real home (every binding optimized out, or - for a byref aggregate -
+# only register homes, which it cannot describe); a single inline exprloc (VLOC_REG /
+# VLOC_FRAME, `range_count` cleared) when every real binding agrees on one home;
+# VLOC_LOCLIST (ranges kept) when two real homes disagree. A non-real binding never
+# constrains a stationary home - it only introduces a loclist gap
 # ---
 # v:      the variable to classify (loc_kind / home / range_count set in place)
 # ranges: the shared range array (this variable's slice is `[range_start, +range_count)`)
@@ -2757,7 +2772,7 @@ fun classify_var(v: *DwVar, ranges: *LocRange) {
     var r: u32 = v.range_start;
     val end: u32 = v.range_start + v.range_count;
     for (r < end) {
-        if (ranges[r].kind != VLOC_NONE) {
+        if (range_real_home(v, ?ranges[r])) {
             if (first < 0) {
                 first = r::i32;
             } or (!home_eq(ranges[first::u32].kind, ranges[first::u32].reg, ranges[first::u32].off, ranges[first::u32].net,
@@ -2886,9 +2901,17 @@ fun type_intern(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, tc:
     if (found >= 0) { ret found; }
 
     if (kind == semtype.TYPE_POINTER) {
+        # capture the pointee TypeId before recursing: interning it can grow s.types and
+        # dangle `t`.
+        val ptee: semtype.TypeId = t.data.pointer.base;
+        val pe: i32 = type_intern(s, tgt, irmod, tc, strtab, ptee, address_size);
+        # the pointee recursion may have interned THIS exact pointer already (a cycle, e.g.
+        # rec Node { next: *Node } reached via a `*Node` local), so re-dedup rather than
+        # emit a second identical DIE.
+        val f2: i32 = comp_find(tc, sem);
+        if (f2 >= 0) { ret f2; }
         # a typed pointer resolves its pointee; an unresolvable pointee (void-like) degrades
         # to the raw opaque `ptr` base type rather than a pointer to nothing.
-        val pe: i32 = type_intern(s, tgt, irmod, tc, strtab, t.data.pointer.base, address_size);
         if (pe < 0) { ret base_intern(tc, strtab, ptr_base_type(address_size)); }
         val ix: i32 = comp_reserve(tc, TK_POINTER, sem);
         if (ix < 0) { ret -1; }
@@ -2898,23 +2921,30 @@ fun type_intern(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, tc:
     }
 
     if (kind == semtype.TYPE_ARRAY) {
-        val el: i32 = type_intern(s, tgt, irmod, tc, strtab, t.data.array.base, address_size);
+        # capture element type + count before recursing: interning the element can grow
+        # s.types and dangle `t` (a stale `t.data.array.count` would be a garbage length).
+        val ebase: semtype.TypeId = t.data.array.base;
+        val ecount: u32 = t.data.array.count;
+        val el: i32 = type_intern(s, tgt, irmod, tc, strtab, ebase, address_size);
         if (el < 0) { ret -1; }
+        val f2: i32 = comp_find(tc, sem);   # element recursion may have interned this array (cycle)
+        if (f2 >= 0) { ret f2; }
         val ix: i32 = comp_reserve(tc, TK_ARRAY, sem);
         if (ix < 0) { ret -1; }
         tc.types[ix::u32].elem  = el;
-        tc.types[ix::u32].count = t.data.array.count;
+        tc.types[ix::u32].count = ecount;
         ret ix;
     }
 
     if (kind == semtype.TYPE_REC || kind == semtype.TYPE_UNI || kind == semtype.TYPE_INSTANCE) {
-        ret struct_intern(s, tgt, irmod, tc, strtab, sem, t, address_size);
+        ret struct_intern(s, tgt, irmod, tc, strtab, sem, address_size);
     }
 
-    # a first-class function value (and any residual generic-param / pack) lowers to a
-    # pointer-width slot, exactly as lower_type does; represent it as the raw address
-    # type so a member of that type still carries a DIE rather than being dropped.
-    ret base_intern(tc, strtab, ptr_base_type(address_size));
+    # an unresolved type here (an unsubstituted generic parameter / pack, or a first-class
+    # function value) has no faithful composite DIE: omit it rather than misattribute it to
+    # a raw `ptr` - conservative omission beats a wrong DW_AT_type that aliases every
+    # instantiation to one address-typed DIE.
+    ret -1;
 }
 
 # intern a record / union / generic-instance as a TK_STRUCT / TK_UNION DIE with a
@@ -2927,25 +2957,33 @@ fun type_intern(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, tc:
 # tc:           the type table
 # strtab:       the `.debug_str` string table
 # sem:          the aggregate's semantic TypeId
-# t:            its resolved semantic Type
 # address_size: target pointer width
 # ret:          the type's index, or -1
 fun struct_intern(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, tc: *TypeCtx,
-                  strtab: *StrTab, sem: semtype.TypeId, t: *semtype.Type, address_size: u8) i32 {
+                  strtab: *StrTab, sem: semtype.TypeId, address_size: u8) i32 {
     # the IR type is the single layout authority; without it we cannot place members.
+    # sem_to_ir can materialize a generic instance's field table (ensure_fields), growing
+    # s.types and reallocating it - so every borrow into s.types must be taken AFTER it.
     val rir: R.Result[ir_type.IrTypeId, str] = sem_to_ir(s, irmod, sem);
     if (R.is_err[ir_type.IrTypeId, str](rir)) { ret -1; }
     val ir_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rir);
 
-    var is_union: bool = false;
-    if (t.kind == semtype.TYPE_UNI) { is_union = true; }
+    # re-fetch the semantic type now that interning has settled; a pointer taken before
+    # sem_to_ir would dangle.
+    val to: O.Option[*semtype.Type] = semtype.get(?s.types, sem);
+    if (O.is_none[*semtype.Type](to)) { ret -1; }
+    val t: *semtype.Type = O.unwrap[*semtype.Type](to);
+
     var tk: u8 = TK_STRUCT;
-    if (is_union) { tk = TK_UNION; }
+    if (t.kind == semtype.TYPE_UNI) { tk = TK_UNION; }
+    # resolve the name string before any further interning (comp_name reads `t`).
+    val name_off: u32 = str_off(strtab, comp_name(s, t));
+    val bsize: u32 = ir_type.byte_size(?irmod.types, ir_ty, tgt);
 
     val ix: i32 = comp_reserve(tc, tk, sem);
     if (ix < 0) { ret -1; }
-    tc.types[ix::u32].name_off  = str_off(strtab, comp_name(s, t));
-    tc.types[ix::u32].byte_size = ir_type.byte_size(?irmod.types, ir_ty, tgt);
+    tc.types[ix::u32].name_off  = name_off;
+    tc.types[ix::u32].byte_size = bsize;
 
     val nfields: u32 = semtype.field_count(?s.types, sem);
 
@@ -2954,7 +2992,10 @@ fun struct_intern(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, t
     var i: u32 = 0;
     for (i < nfields) {
         val fe: O.Option[*semtype.FieldEntry] = semtype.field_at(?s.types, sem, i);
-        if (O.is_some[*semtype.FieldEntry](fe)) { type_intern(s, tgt, irmod, tc, strtab, O.unwrap[*semtype.FieldEntry](fe).ty, address_size); }
+        if (O.is_some[*semtype.FieldEntry](fe)) {
+            val fty_sem: semtype.TypeId = O.unwrap[*semtype.FieldEntry](fe).ty;   # capture before recursion (fe may dangle)
+            type_intern(s, tgt, irmod, tc, strtab, fty_sem, address_size);
+        }
         i = i + 1;
     }
 
@@ -2966,11 +3007,14 @@ fun struct_intern(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, t
     for (j < nfields) {
         val fe: O.Option[*semtype.FieldEntry] = semtype.field_at(?s.types, sem, j);
         if (O.is_none[*semtype.FieldEntry](fe)) { j = j + 1; cnt; }
-        val f: *semtype.FieldEntry = O.unwrap[*semtype.FieldEntry](fe);
-        val fty: i32 = type_intern(s, tgt, irmod, tc, strtab, f.ty, address_size);
+        # capture the field's type + name before type_intern: interning can grow s.types
+        # and dangle `fe`.
+        val f_ty:   semtype.TypeId = O.unwrap[*semtype.FieldEntry](fe).ty;
+        val f_name: intern.StrId   = O.unwrap[*semtype.FieldEntry](fe).name;
+        val fty: i32 = type_intern(s, tgt, irmod, tc, strtab, f_ty, address_size);
         if (fty < 0) { j = j + 1; cnt; }
         if (!memb_reserve(tc)) { j = j + 1; cnt; }
-        tc.membs[tc.nmemb].name_off = str_off(strtab, resolve(?s.interner, f.name));
+        tc.membs[tc.nmemb].name_off = str_off(strtab, resolve(?s.interner, f_name));
         tc.membs[tc.nmemb].type_ix  = fty::u32;
         tc.membs[tc.nmemb].offset   = ir_type.byte_offset(?irmod.types, ir_ty, j, tgt);
         tc.nmemb = tc.nmemb + 1;
@@ -3462,23 +3506,25 @@ test "mach.lang.be.codegen.dwarf.emit_var_location:reg_frame_salvage" {
     if (!buf_eq(?g, ?e4[0], 4)) { code = 1; }
     enc.buf_dnit(?g);
 
-    # a by-reference aggregate homed in register 5: len 3, DW_OP_breg5 (0x75), sleb(0) =
-    # 0x00, DW_OP_deref-less (the address is the location, no stack_value).
-    var va: DwVar; va.loc_kind = VLOC_REG; va.reg = 5; va.offset = 0; va.net = 0; va.byref = true;
-    var h: enc.ByteBuf = enc.buf_init(?alloc);
-    emit_var_location(?h, ?va);
-    var e5: [3]u8; e5[0] = 0x02; e5[1] = 0x75; e5[2] = 0x00;
-    if (!buf_eq(?h, ?e5[0], 3)) { code = 1; }
-    enc.buf_dnit(?h);
-
-    # a by-reference aggregate spilled to frame slot -8: len 3, DW_OP_fbreg (0x91),
-    # sleb(-8) = 0x78, DW_OP_deref (0x06) to load the storage pointer.
+    # a by-reference aggregate at frame slot -8: len 3, DW_OP_fbreg (0x91), sleb(-8) =
+    # 0x78, DW_OP_deref (0x06) to load the storage pointer (address, no stack_value).
+    # register-homed byref never reaches build_loc_ops (classify_var / build_loclists omit
+    # it), so only the frame form is exercised.
     var vm: DwVar; vm.loc_kind = VLOC_FRAME; vm.reg = 0; vm.offset = -8; vm.net = 0; vm.byref = true;
     var k: enc.ByteBuf = enc.buf_init(?alloc);
     emit_var_location(?k, ?vm);
     var e6: [4]u8; e6[0] = 0x03; e6[1] = 0x91; e6[2] = 0x78; e6[3] = 0x06;
     if (!buf_eq(?k, ?e6[0], 4)) { code = 1; }
     enc.buf_dnit(?k);
+
+    # a by-reference aggregate at frame slot -8 salvaged onto base + 16: len 5, DW_OP_fbreg
+    # (0x91), sleb(-8) = 0x78, DW_OP_deref (0x06), DW_OP_plus_uconst (0x23), uleb(16) = 0x10.
+    var vn: DwVar; vn.loc_kind = VLOC_FRAME; vn.reg = 0; vn.offset = -8; vn.net = 16; vn.byref = true;
+    var m: enc.ByteBuf = enc.buf_init(?alloc);
+    emit_var_location(?m, ?vn);
+    var e7: [6]u8; e7[0] = 0x05; e7[1] = 0x91; e7[2] = 0x78; e7[3] = 0x06; e7[4] = 0x23; e7[5] = 0x10;
+    if (!buf_eq(?m, ?e7[0], 6)) { code = 1; }
+    enc.buf_dnit(?m);
     ret code;
 }
 
