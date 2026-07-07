@@ -1557,7 +1557,10 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
     p.config.description  = m.description;
     # the artifact name feeds `$bin.name`; STR_NIL when the selection bound none.
     if (bu.artifact != nil) { p.config.bin_name = bu.artifact.name; }
-    p.config.module       = bu.entry;
+    p.config.module       = intern.STR_NIL;
+    if (m.artifact_count > 0) {
+        p.config.module = m.artifacts[0].entry;
+    }
     p.config.dir_src      = m.src;
     val res_dep_id: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, "dep");
     if (R.is_ok[intern.StrId, str](res_dep_id)) {
@@ -1764,6 +1767,17 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
     val dr: R.Result[bool, str] = resolve_deps(p, ?m, project_root);
     if (R.is_err[bool, str](dr)) { manifest.dnit(?m, p.s.alloc); ret dr; }
 
+    val isa_opt: O.Option[str] = intern.lookup(?p.s.interner, bu.target.isa);
+    val os_opt: O.Option[str] = intern.lookup(?p.s.interner, bu.target.os);
+    val abi_opt: O.Option[str] = intern.lookup(?p.s.interner, bu.target.abi);
+    if (O.is_none[str](isa_opt) || O.is_none[str](os_opt) || O.is_none[str](abi_opt)) {
+        manifest.dnit(?m, p.s.alloc);
+        ret R.err[bool, str]("internal: selected target tuple not interned");
+    }
+    val cr2: R.Result[bool, str] = resolve_cascade_libs(p, project_root,
+        O.unwrap[str](isa_opt), O.unwrap[str](os_opt), O.unwrap[str](abi_opt), bu.libs, bu.lib_count);
+    if (R.is_err[bool, str](cr2)) { manifest.dnit(?m, p.s.alloc); ret cr2; }
+
     # multi-target tooling build (#1391): record every manifest target's tuple so
     # the union load walk can follow each target's `$if` branches. multi-artifact
     # tooling build (#1505): record every artifact's entry FQN so the union loads
@@ -1857,31 +1871,143 @@ fun dcopy(buf: *u8, k: usize, s: str) usize {
     ret k + n;
 }
 
-# resolve each `[deps.*]` into a DepEntry by vendor layout, reading
-# the dependency's own mach.toml for its id and source dir
+fun intern_unwrap(itn: *intern.Interner, text: str) intern.StrId {
+    val res: R.Result[intern.StrId, str] = intern.intern(itn, text);
+    ret R.unwrap_ok[intern.StrId, str](res);
+}
+
+fun intern_opt_unwrap(itn: *intern.Interner, text: str) intern.StrId {
+    if (str_empty(text)) { ret intern.STR_NIL; }
+    ret intern_unwrap(itn, text);
+}
+
+fun resolve_deps_recursive(p: *Project, current_root: str, dep_names: *manifest.DepDef, dep_name_count: u32,
+                           deps: *DepEntry, dep_count_ptr: *u32, max_deps: usize, dir_dep: str) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < dep_name_count) {
+        val alias_opt: O.Option[str] = intern.lookup(?p.s.interner, dep_names[i].name);
+        if (O.is_none[str](alias_opt)) { ret R.err[bool, str]("dep alias StrId not interned"); }
+        val alias: str = O.unwrap[str](alias_opt);
+
+        val rd: R.Result[DepEntry, str] = resolve_dep(p.s, alias, current_root, dir_dep);
+        if (R.is_err[DepEntry, str](rd)) { ret R.err[bool, str](R.unwrap_err[DepEntry, str](rd)); }
+        val entry: DepEntry = R.unwrap_ok[DepEntry, str](rd);
+
+        var exists: bool = false;
+        var j: u32 = 0;
+        for (j < dep_count_ptr[0]) {
+            if (deps[j].project_id == entry.project_id) {
+                exists = true;
+            }
+            j = j + 1;
+        }
+
+        if (!exists) {
+            if (dep_count_ptr[0] >= max_deps::u32) {
+                ret R.err[bool, str]("exceeded maximum dependency limit of 128");
+            }
+            val idx: u32 = dep_count_ptr[0];
+            deps[idx] = entry;
+            dep_count_ptr[0] = dep_count_ptr[0] + 1;
+
+            val dep_root_opt: O.Option[str] = intern.lookup(?p.s.interner, entry.vendor_root);
+            if (O.is_some[str](dep_root_opt)) {
+                val dep_root: str = O.unwrap[str](dep_root_opt);
+                
+                val toml_path_r: R.Result[str, str] = join_path(p.s.alloc, dep_root, "mach.toml");
+                if (R.is_ok[str, str](toml_path_r)) {
+                    val toml_path: str = R.unwrap_ok[str, str](toml_path_r);
+                    val tr: R.Result[toml.Table, str] = parse_toml_file(p.s.alloc, toml_path);
+                    str_free(p.s.alloc, toml_path);
+                    if (R.is_ok[toml.Table, str](tr)) {
+                        var t: toml.Table = R.unwrap_ok[toml.Table, str](tr);
+                        val dep_tab: *toml.Table = toml.get_table(?t, "dep");
+                        if (dep_tab != nil) {
+                            val sub_dep_count: usize = toml.table_len(dep_tab);
+                            if (sub_dep_count > 0) {
+                                val res_sub_defs: R.Result[*manifest.DepDef, str] = A.allocate[manifest.DepDef](p.s.alloc, sub_dep_count);
+                                if (R.is_ok[*manifest.DepDef, str](res_sub_defs)) {
+                                    val sub_defs: *manifest.DepDef = R.unwrap_ok[*manifest.DepDef, str](res_sub_defs);
+                                    var k: usize = 0;
+                                    for (k < sub_dep_count) {
+                                        val sub_alias: str = toml.table_key(dep_tab, k);
+                                        val sub_v: *toml.Value = toml.table_value(dep_tab, k);
+                                        var sub_d: manifest.DepDef;
+                                        sub_d.name = intern_unwrap(?p.s.interner, sub_alias);
+                                        sub_d.git = intern.STR_NIL;
+                                        sub_d.path = intern.STR_NIL;
+                                        sub_d.ref = intern.STR_NIL;
+                                        if (sub_v != nil && sub_v.tag == toml.TYPE_TABLE) {
+                                            val sub_sub: *toml.Table = ?sub_v.data.table;
+                                            sub_d.git = intern_opt_unwrap(?p.s.interner, toml.get_str(sub_sub, "git"));
+                                            sub_d.path = intern_opt_unwrap(?p.s.interner, toml.get_str(sub_sub, "path"));
+                                            sub_d.ref = intern_opt_unwrap(?p.s.interner, toml.get_str(sub_sub, "ref"));
+                                        }
+                                        sub_defs[k] = sub_d;
+                                        k = k + 1;
+                                    }
+                                    
+                                    val res_rec: R.Result[bool, str] = resolve_deps_recursive(p, dep_root, sub_defs, sub_dep_count::u32, deps, dep_count_ptr, max_deps, dir_dep);
+                                    A.deallocate[manifest.DepDef](p.s.alloc, sub_defs, sub_dep_count);
+                                    if (R.is_err[bool, str](res_rec)) { ret res_rec; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
 fun resolve_deps(p: *Project, m: *manifest.Manifest, project_root: str) R.Result[bool, str] {
     if (m.dep_count == 0) {
         p.config.deps      = nil;
         p.config.dep_count = 0;
         ret R.ok[bool, str](true);
     }
-    val r: R.Result[*DepEntry, str] = A.allocate[DepEntry](p.s.alloc, m.dep_count::usize);
+    
+    val max_deps: usize = 128;
+    val r: R.Result[*DepEntry, str] = A.allocate[DepEntry](p.s.alloc, max_deps);
     if (R.is_err[*DepEntry, str](r)) { ret R.err[bool, str](R.unwrap_err[*DepEntry, str](r)); }
-    p.config.deps      = R.unwrap_ok[*DepEntry, str](r);
-    p.config.dep_count = m.dep_count;
+    val deps: *DepEntry = R.unwrap_ok[*DepEntry, str](r);
+    var dep_count: u32 = 0;
 
     val dir_dep_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.dir_dep);
-    if (O.is_none[str](dir_dep_opt)) { ret R.err[bool, str]("dep dir StrId not interned"); }
+    if (O.is_none[str](dir_dep_opt)) {
+        A.deallocate[DepEntry](p.s.alloc, deps, max_deps);
+        ret R.err[bool, str]("dep dir StrId not interned");
+    }
     val dir_dep: str = O.unwrap[str](dir_dep_opt);
 
-    var i: u32 = 0;
-    for (i < m.dep_count) {
-        val alias_opt: O.Option[str] = intern.lookup(?p.s.interner, m.deps[i].name);
-        if (O.is_none[str](alias_opt)) { ret R.err[bool, str]("dep alias StrId not interned"); }
-        val rd: R.Result[DepEntry, str] = resolve_dep(p.s, O.unwrap[str](alias_opt), project_root, dir_dep);
-        if (R.is_err[DepEntry, str](rd)) { ret R.err[bool, str](R.unwrap_err[DepEntry, str](rd)); }
-        p.config.deps[i] = R.unwrap_ok[DepEntry, str](rd);
-        i = i + 1;
+    val res_rec: R.Result[bool, str] = resolve_deps_recursive(p, project_root, m.deps, m.dep_count, deps, ?dep_count, max_deps, dir_dep);
+    if (R.is_err[bool, str](res_rec)) {
+        A.deallocate[DepEntry](p.s.alloc, deps, max_deps);
+        ret res_rec;
+    }
+
+    if (dep_count == 0) {
+        A.deallocate[DepEntry](p.s.alloc, deps, max_deps);
+        p.config.deps      = nil;
+        p.config.dep_count = 0;
+    }
+    or {
+        val r_shrink: R.Result[*DepEntry, str] = A.allocate[DepEntry](p.s.alloc, dep_count::usize);
+        if (R.is_err[*DepEntry, str](r_shrink)) {
+            A.deallocate[DepEntry](p.s.alloc, deps, max_deps);
+            ret R.err[bool, str](R.unwrap_err[*DepEntry, str](r_shrink));
+        }
+        val shrunk: *DepEntry = R.unwrap_ok[*DepEntry, str](r_shrink);
+        var idx: u32 = 0;
+        for (idx < dep_count) {
+            shrunk[idx] = deps[idx];
+            idx = idx + 1;
+        }
+        A.deallocate[DepEntry](p.s.alloc, deps, max_deps);
+        p.config.deps      = shrunk;
+        p.config.dep_count = dep_count;
     }
     ret R.ok[bool, str](true);
 }
@@ -2023,12 +2149,38 @@ fun resolve_cascade_libs(p: *Project, project_root: str, isa: str, os: str, abi:
                 if (l.source == R.unwrap_ok[intern.StrId, str](intern.intern(?p.s.interner, "local"))) {
                     val p_opt: O.Option[str] = intern.lookup(?p.s.interner, l.path);
                     if (O.is_some[str](p_opt)) {
-                        val full_p_r: R.Result[str, str] = join_path(p.s.alloc, dep_vr, O.unwrap[str](p_opt));
+                        val raw_path: str = O.unwrap[str](p_opt);
+                        var expanded_path: str;
+                        if (str_len(raw_path) >= 13 && str_equals(step_seg_dup(p.s.alloc, raw_path, 0, 13), "{project.out}")) {
+                            val out_tmpl_opt: O.Option[str] = intern.lookup(?p.s.interner, mfd.out_tmpl);
+                            val out_tmpl: str = O.unwrap[str](out_tmpl_opt);
+                            val tn_opt: O.Option[str] = intern.lookup(?p.s.interner, p.target_entry.name);
+                            val target_name: str = O.unwrap[str](tn_opt);
+                            val pn_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.profile);
+                            val profile_name: str = O.unwrap[str](pn_opt);
+                            val dep_out_r: R.Result[str, str] = manifest.expand(p.s.alloc, out_tmpl, target_name, profile_name, "", "");
+                            val dep_out: str = R.unwrap_ok[str, str](dep_out_r);
+                            val suffix: str = step_seg_dup(p.s.alloc, raw_path, 13, str_len(raw_path));
+                            val full_p_r: R.Result[str, str] = join_path(p.s.alloc, dep_out, suffix);
+                            expanded_path = R.unwrap_ok[str, str](full_p_r);
+                            str_free(p.s.alloc, dep_out);
+                            str_free(p.s.alloc, suffix);
+                        }
+                        or {
+                            val tn_opt: O.Option[str] = intern.lookup(?p.s.interner, p.target_entry.name);
+                            val target_name: str = O.unwrap[str](tn_opt);
+                            val pn_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.profile);
+                            val profile_name: str = O.unwrap[str](pn_opt);
+                            val expanded_path_r: R.Result[str, str] = manifest.expand(p.s.alloc, raw_path, target_name, profile_name, "", "");
+                            expanded_path = R.unwrap_ok[str, str](expanded_path_r);
+                        }
+                        val full_p_r: R.Result[str, str] = join_path(p.s.alloc, dep_vr, expanded_path);
                         if (R.is_ok[str, str](full_p_r)) {
                             val full_p: str = R.unwrap_ok[str, str](full_p_r);
                             lib_id = R.unwrap_ok[intern.StrId, str](intern.intern(?p.s.interner, full_p));
                             str_free(p.s.alloc, full_p);
                         }
+                        str_free(p.s.alloc, expanded_path);
                     }
                 }
                 or {
@@ -2087,9 +2239,12 @@ fun cascade_dfs(base: *toml.Table, aliases: *str, visited: *bool, order: *u32, o
     @order_len = @order_len + 1;
 }
 
-# whether dep manifest `t` lists `alias` under its own `[deps.*]`
+# whether dep manifest `t` lists `alias` under its own `[deps.*]` or `[dep.*]`
 fun dep_declares(t: *toml.Table, alias: str) bool {
-    val deps_tab: *toml.Table = toml.get_table(t, "deps");
+    var deps_tab: *toml.Table = toml.get_table(t, "dep");
+    if (deps_tab == nil) {
+        deps_tab = toml.get_table(t, "deps");
+    }
     if (deps_tab == nil) { ret false; }
     val m: usize = toml.table_len(deps_tab);
     var k: usize = 0;
@@ -2170,15 +2325,25 @@ fun resolve_dep(s: *session.Session, alias: str, project_root: str, dir_dep: str
     entry.project_dir_src = R.unwrap_ok[intern.StrId, str](rds);
 
     # V2 dependency entry resolution:
-    # First, try to get the first [lib.<name>].entry.
+    # First, try to get the first [artifact.<name>].entry.
+    # If not found, try [lib.<name>].entry.
     # If not found, try [bin.<name>].entry.
     # Otherwise, default to "lib.mach".
     var dep_entry_file: str = "";
-    val libs_tab: *toml.Table = toml.get_table(?t, "lib");
-    if (libs_tab != nil && toml.table_len(libs_tab) > 0) {
-        val first_lib_val: *toml.Value = toml.table_value(libs_tab, 0);
-        if (first_lib_val != nil && first_lib_val.tag == toml.TYPE_TABLE) {
-            dep_entry_file = toml.get_str(?first_lib_val.data.table, "entry");
+    val arts_tab: *toml.Table = toml.get_table(?t, "artifact");
+    if (arts_tab != nil && toml.table_len(arts_tab) > 0) {
+        val first_art_val: *toml.Value = toml.table_value(arts_tab, 0);
+        if (first_art_val != nil && first_art_val.tag == toml.TYPE_TABLE) {
+            dep_entry_file = toml.get_str(?first_art_val.data.table, "entry");
+        }
+    }
+    if (str_empty(dep_entry_file)) {
+        val libs_tab: *toml.Table = toml.get_table(?t, "lib");
+        if (libs_tab != nil && toml.table_len(libs_tab) > 0) {
+            val first_lib_val: *toml.Value = toml.table_value(libs_tab, 0);
+            if (first_lib_val != nil && first_lib_val.tag == toml.TYPE_TABLE) {
+                dep_entry_file = toml.get_str(?first_lib_val.data.table, "entry");
+            }
         }
     }
     if (str_empty(dep_entry_file)) {
@@ -8551,6 +8716,72 @@ fun step_seg_dup(alloc: *A.Allocator, tmpl: str, start: usize, end: usize) str {
     ret buf::str;
 }
 
+fun expand_step_vars(alloc: *A.Allocator, cmd: str, target_name: str, profile_name: str, target_isa: str, target_os: str, target_abi: str, project_out: str) str {
+    val n: usize = str_len(cmd);
+    var new_len: usize = 0;
+    var i: usize = 0;
+    for (i < n) {
+        if (cmd[i] == '{') {
+            var ii: usize = i + 1;
+            for (ii < n && cmd[ii] != '}') { ii = ii + 1; }
+            if (ii < n) {
+                val name: str = step_seg_dup(alloc, cmd, i + 1, ii);
+                var val_len: usize = 0;
+                if (str_equals(name, "project.out")) { val_len = str_len(project_out); }
+                or (str_equals(name, "target.name") || str_equals(name, "target")) { val_len = str_len(target_name); }
+                or (str_equals(name, "target.isa"))  { val_len = str_len(target_isa); }
+                or (str_equals(name, "target.os"))   { val_len = str_len(target_os); }
+                or (str_equals(name, "target.abi"))  { val_len = str_len(target_abi); }
+                or (str_equals(name, "profile.name") || str_equals(name, "profile")) { val_len = str_len(profile_name); }
+                new_len = new_len + val_len;
+                i = ii + 1;
+                str_free(alloc, name);
+                cnt;
+            }
+        }
+        new_len = new_len + 1;
+        i = i + 1;
+    }
+
+    val res_buf: R.Result[*u8, str] = A.allocate[u8](alloc, new_len + 1);
+    if (R.is_err[*u8, str](res_buf)) { ret ""; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
+    var w: usize = 0;
+    i = 0;
+    for (i < n) {
+        if (cmd[i] == '{') {
+            var ii: usize = i + 1;
+            for (ii < n && cmd[ii] != '}') { ii = ii + 1; }
+            if (ii < n) {
+                val name: str = step_seg_dup(alloc, cmd, i + 1, ii);
+                var var_val: str = "";
+                if (str_equals(name, "project.out")) { var_val = project_out; }
+                or (str_equals(name, "target.name") || str_equals(name, "target")) { var_val = target_name; }
+                or (str_equals(name, "target.isa"))  { var_val = target_isa; }
+                or (str_equals(name, "target.os"))   { var_val = target_os; }
+                or (str_equals(name, "target.abi"))  { var_val = target_abi; }
+                or (str_equals(name, "profile.name") || str_equals(name, "profile")) { var_val = profile_name; }
+                
+                val vl: usize = str_len(var_val);
+                var iii: usize = 0;
+                for (iii < vl) {
+                    buf[w] = var_val[iii];
+                    w = w + 1;
+                    iii = iii + 1;
+                }
+                i = ii + 1;
+                str_free(alloc, name);
+                cnt;
+            }
+        }
+        buf[w] = cmd[i];
+        w = w + 1;
+        i = i + 1;
+    }
+    buf[w] = 0;
+    ret buf::str;
+}
+
 fun expand_env_vars(alloc: *A.Allocator, cmd: str, target_isa: str, target_os: str, target_abi: str, profile_name: str, out_dir: str) str {
     val n: usize = str_len(cmd);
     var new_len: usize = 0;
@@ -8691,21 +8922,30 @@ fun step_cc5(alloc: *A.Allocator, a: str, b: str, c: str, d: str, e: str) str {
 }
 
 fun run_one_step(a: *A.Allocator, p: *Project, step: *manifest.StepDef, project_root: str) R.Result[bool, str] {
-    val cmd_s: str = O.unwrap[str](intern.lookup(?p.s.interner, step.cmd));
-    
+    val isa_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.isa_name));
+    val os_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.os_name));
+    val abi_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.abi_name));
+    val profile_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.profile));
+    val project_out_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_out));
+    val target_name_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.name));
+
     # Check if out-of-date across all in/out combinations
     var out_of_date: bool = false;
     var ini: u32 = 0;
     for (ini < step.in_count && !out_of_date) {
-        val in_s: str = O.unwrap[str](intern.lookup(?p.s.interner, step.in[ini]));
+        val raw_in: str = O.unwrap[str](intern.lookup(?p.s.interner, step.in[ini]));
+        val in_s: str = expand_step_vars(a, raw_in, target_name_s, profile_s, isa_s, os_s, abi_s, project_out_s);
         var outi: u32 = 0;
         for (outi < step.out_count && !out_of_date) {
-            val out_s: str = O.unwrap[str](intern.lookup(?p.s.interner, step.out[outi]));
+            val raw_out: str = O.unwrap[str](intern.lookup(?p.s.interner, step.out[outi]));
+            val out_s: str = expand_step_vars(a, raw_out, target_name_s, profile_s, isa_s, os_s, abi_s, project_out_s);
             if (step_out_of_date(a, project_root, in_s, out_s)) {
                 out_of_date = true;
             }
+            str_free(a, out_s);
             outi = outi + 1;
         }
+        str_free(a, in_s);
         ini = ini + 1;
     }
     
@@ -8713,13 +8953,10 @@ fun run_one_step(a: *A.Allocator, p: *Project, step: *manifest.StepDef, project_
         ret R.ok[bool, str](true);
     }
     
-    val isa_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.isa_name));
-    val os_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.os_name));
-    val abi_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.abi_name));
-    val profile_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.profile));
-    val project_out_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_out));
-    
+    val raw_cmd: str = O.unwrap[str](intern.lookup(?p.s.interner, step.cmd));
+    val cmd_s: str = expand_step_vars(a, raw_cmd, target_name_s, profile_s, isa_s, os_s, abi_s, project_out_s);
     val expanded_cmd: str = expand_env_vars(a, cmd_s, isa_s, os_s, abi_s, profile_s, project_out_s);
+    str_free(a, cmd_s);
     
     val step_name: str = O.unwrap[str](intern.lookup(?p.s.interner, step.name));
     val msg: str = step_cc5(a, "step ", step_name, ": ", expanded_cmd, "\n");
