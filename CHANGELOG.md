@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.1] - 2026-07-06
+
+Updates the compiler project's self manifest (`mach.toml`) to the new V2 manifest format (`[artifact.mach]`).
+
+### Changed
+- manifest: Migrated self-manifest layout to comply with the V2 manifest spec.
+
 ## [3.0.0] - 2026-07-06
 
 A major paradigm break and structural overhaul to v2 manifests. Overhauls parser, driver, and CLI commands to comply with the v2 spec: replaces `[bin.X]` and `[lib.X]` with `[artifact.X]`, adds `[link.X]` with target filtering, adds custom `[step.X]` support, removes `[project].module` and `[os.X]`, and replaces release/debug flags with the profile-selection parameter. This release retains the old-format `mach.toml` for bootstrapping.
