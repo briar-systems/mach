@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Re-implements the `[step.X]` build-step engine as demand-driven with content-based caching (#1970). A step runs only when demanded — by a selected, target-matching `local` link entry whose path matches the step's `out`, an artifact's `need`, or another step's `need` — never automatically; cycles are an error. A dependency's export steps now execute (from the dep checkout, homing `{project.out}` into the consumer out tree), so vendored-C dependencies that previously failed to link now build. Step paths and `cmd` use the closed template set `{project.out}`/`{target.name}`/`{profile.name}`; an unknown `{a.b}` is a hard error.
+
+### Added
+- steps: `in` globbing (`*`, `**`) with sorted, stable expansion; an empty match is an error.
+
+### Changed
+- steps: Demand-driven execution — a step runs only when a link entry, artifact, or another step demands it; platform-filtered steps never run on a non-matching cell.
+- steps: Content-fingerprint caching (a persisted per-step stamp over the inputs' content and the expanded `cmd`) replaces mtime staleness — a warm rebuild skips unchanged steps, a `cmd` or source edit re-runs them.
+
+### Fixed
+- driver: A dependency's `[step.X]` outputs are produced (in the consumer out tree) before the link, instead of failing with "cannot find link input".
+
 ## [3.0.2] - 2026-07-07
 
 Fixes transitive dependency resolution to resolve flat relative to the current root directory instead of nesting them.
