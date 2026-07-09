@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.0] - 2026-07-09
+
+The release that makes the V2 build system work as designed. The `[step.X]`
+engine is now demand-driven: a step runs only when a build needs it — a
+selected, target-matching `local` link entry whose path matches the step's
+`out`, an artifact's `need`, or another step's `need` — never automatically,
+and a dependency's export steps run through a consumer so vendored-C libraries
+finally build and link. Each step is cached by the content of its inputs and
+its expanded command, so warm rebuilds skip unchanged work. `mach test` links
+the union of every artifact's entries; link filters accept string and array
+forms with `[]` meaning none and `""` a parse error; a duplicate dependency id
+is a hard error that names the requirer chain. Project paths resolve by four
+explicit rules with the path argument now **required** — a directory or a
+config file, with no current-directory walk. The manifest parser matches the
+RFC (optional `name`/`description`, `{project.out}`), and a pre-V2 `mach.lock`
+is read transparently with its pin preserved. Built with mach 3.0.2.
+
+### Added
+- steps: **Demand-driven `[step.X]` engine** — steps run only when a link
+  entry, artifact, or another step demands them (never automatically; cycles
+  are an error), cached by a per-step content fingerprint (sorted inputs +
+  content hashes + expanded `cmd`) so warm rebuilds skip unchanged steps.
+  Dependency export steps execute from the dep checkout and home
+  `{project.out}` into the consumer out tree. `in` accepts `*`/`**` globs
+  (sorted, empty match errors); paths/`cmd` use the closed template set
+  `{project.out}`/`{target.name}`/`{profile.name}` (#1970).
+- manifest: `mach test` links the **union** of every artifact's referenced
+  entries plus exported dependency entries, filtered to the native target
+  (#1969).
+- linking: **string-form link filters** — `os`/`isa`/`abi` accept a string or
+  an array of strings — with up-front validation of every `local` link path
+  (#1969, #1983).
+- driver: a **duplicate dependency id** anywhere in the closure is a hard error
+  naming the requirer chain (#1968, #1986).
+
+### Changed
+- driver: **project path resolution is four explicit rules and the path
+  argument is required** — a directory or a config file, with no
+  current-directory walk (behavior change from 3.0.x; `mach clean`'s path is
+  likewise required) (#1974, #1985, #1992, #1993).
+- manifest: link **filter presence semantics** — an explicit `[]` matches
+  nothing and an empty `""` is a parse error — with cell-aware `local`-link
+  validation (#1988, #1990).
+- manifest: `[project].name` and `[project].description` are **optional**, and
+  `{project.out}` resolves per the RFC (#1983).
+- deps: a pre-V2 `mach.lock` `[deps.X]` section is read transparently as
+  `[dep.X]` with its pin preserved; the repo lock re-pinned to a
+  V2-compatible mach-std (#1975).
+
+### Fixed
+- driver: a dependency's `[step.X]` outputs are produced in the consumer out
+  tree before the link, instead of failing with "cannot find link input"
+  (#1970).
+- doc: `mach doc` creates its output directories recursively (#1987, #1991).
+- ci: the integration and debug-info fixtures were migrated to the V2 manifest
+  schema, restoring a green matrix (#1976).
+
 ## [3.0.2] - 2026-07-07
 
 Fixes transitive dependency resolution to resolve flat relative to the current root directory instead of nesting them.
