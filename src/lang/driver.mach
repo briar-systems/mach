@@ -597,7 +597,7 @@ fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Se
         ret R.err[Project, str](R.unwrap_err[bool, str](q_r));
     }
 
-    val cfg_r: R.Result[bool, str] = load_project_config(?p, project_root, sel, for_union);
+    val cfg_r: R.Result[bool, str] = load_project_config(?p, project_root, sel, for_union, all_own_src);
     if (R.is_err[bool, str](cfg_r)) {
         dnit_project(?p);
         ret R.err[Project, str](R.unwrap_err[bool, str](cfg_r));
@@ -1468,7 +1468,7 @@ fun deallocate_config(c: *ProjectConfig, alloc: *A.Allocator) {
 
 # read and parse `<project_root>/mach.toml`, then synthesize the ProjectConfig
 # through load_config
-fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection, for_union: bool) R.Result[bool, str] {
+fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection, for_union: bool, is_test: bool) R.Result[bool, str] {
     val abs_root_r: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, project_root);
     if (R.is_err[intern.StrId, str](abs_root_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](abs_root_r)); }
     p.config.project_root = R.unwrap_ok[intern.StrId, str](abs_root_r);
@@ -1482,7 +1482,7 @@ fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection
     if (R.is_err[toml.Table, str](toml_r)) { ret R.err[bool, str](R.unwrap_err[toml.Table, str](toml_r)); }
     var t: toml.Table = R.unwrap_ok[toml.Table, str](toml_r);
 
-    ret load_config(p, project_root, ?t, sel, for_union);
+    ret load_config(p, project_root, ?t, sel, for_union, is_test);
 }
 
 # parse the manifest, resolve the build selection into one build
@@ -1490,7 +1490,7 @@ fun load_project_config(p: *Project, project_root: str, sel: *manifest.Selection
 # single target entry plus the unit's concrete, template-expanded output paths.
 # collisions are checked before anything is built. a `native` selection that
 # finds no host match emits an unmissable warning here
-fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.Selection, for_union: bool) R.Result[bool, str] {
+fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.Selection, for_union: bool, is_test: bool) R.Result[bool, str] {
     val mr: R.Result[manifest.Manifest, str] = manifest.parse(p.s.alloc, ?p.s.interner, t);
     if (R.is_err[manifest.Manifest, str](mr)) { ret R.err[bool, str](R.unwrap_err[manifest.Manifest, str](mr)); }
     var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](mr);
@@ -1506,7 +1506,10 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
     eff_sel.artifact     = sel.artifact;
     eff_sel.want_lib     = sel.want_lib;
     eff_sel.has_artifact = sel.has_artifact;
-    if (for_union && !eff_sel.has_artifact && m.artifact_count > 1) {
+    # `mach test` (is_test) links the whole source tree, not one artifact, so like a
+    # union build it takes the first declared artifact as the primary ctx rather than
+    # raising the multi-artifact ambiguity `build_project_sel` would.
+    if ((for_union || is_test) && !eff_sel.has_artifact && m.artifact_count > 1) {
         val an_opt: O.Option[str] = intern.lookup(?p.s.interner, m.artifacts[0].name);
         if (O.is_none[str](an_opt)) { manifest.dnit(?m, p.s.alloc); ret R.err[bool, str]("internal: union primary artifact name not interned"); }
         eff_sel.artifact     = O.unwrap[str](an_opt);
@@ -1584,16 +1587,33 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
     val tn_s: str = O.unwrap[str](intern.lookup(?p.s.interner, bu.target.name));
     val pn_s: str = O.unwrap[str](intern.lookup(?p.s.interner, bu.profile_name));
     val out_tmpl_s: str = O.unwrap[str](intern.lookup(?p.s.interner, m.out_tmpl));
-    val res_project_out_str: R.Result[str, str] = manifest.expand(p.s.alloc, out_tmpl_s, tn_s, pn_s, "", "");
+    val res_project_out_str: R.Result[str, str] = manifest.expand(p.s.alloc, out_tmpl_s, "", tn_s, pn_s, "", "");
     if (R.is_ok[str, str](res_project_out_str)) {
         val project_out_str: str = R.unwrap_ok[str, str](res_project_out_str);
         val res_po_id: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, project_out_str);
         if (R.is_ok[intern.StrId, str](res_po_id)) {
             p.config.project_out = R.unwrap_ok[intern.StrId, str](res_po_id);
         }
+        # up-front local link path validation (#1969): a `local` entry's path must
+        # match a step's `out` (demanding it) or exist on disk; anything else errors
+        # here naming the entry, instead of flowing to the linker to fail at link time.
+        val vr: R.Result[bool, str] = validate_local_links(p, project_root, ?m, project_out_str, tn_s, pn_s);
+        if (R.is_err[bool, str](vr)) { str_free(p.s.alloc, project_out_str); manifest.dnit(?m, p.s.alloc); ret R.err[bool, str](R.unwrap_err[bool, str](vr)); }
+
+        # `mach test` links the union of every artifact's referenced entries (native
+        # target), not just the primary's, plus the exported dep entries the cascade
+        # pass adds below (#1964). replaces the single-artifact libs synthesized above.
+        if (is_test) {
+            var test_items: *intern.StrId = nil;
+            var test_count: u32 = 0;
+            val tlr: R.Result[bool, str] = manifest.resolve_test_libs(p.s.alloc, ?p.s.interner, ?m, bu.target, project_out_str, tn_s, pn_s, ?test_items, ?test_count);
+            if (R.is_err[bool, str](tlr)) { str_free(p.s.alloc, project_out_str); manifest.dnit(?m, p.s.alloc); ret R.err[bool, str](R.unwrap_err[bool, str](tlr)); }
+            p.config.targets[0].libs      = test_items;
+            p.config.targets[0].lib_count = test_count;
+        }
         str_free(p.s.alloc, project_out_str);
     }
-    
+
     # Copy links to ProjectConfig
     p.config.links      = nil;
     p.config.link_count = 0;
@@ -1774,8 +1794,12 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
         manifest.dnit(?m, p.s.alloc);
         ret R.err[bool, str]("internal: selected target tuple not interned");
     }
+    # dedup exported dep entries against the effective own link surface: the union
+    # for a test build, the single artifact's libs otherwise (both held by the
+    # synthesized target entry).
     val cr2: R.Result[bool, str] = resolve_cascade_libs(p, project_root,
-        O.unwrap[str](isa_opt), O.unwrap[str](os_opt), O.unwrap[str](abi_opt), bu.libs, bu.lib_count);
+        O.unwrap[str](isa_opt), O.unwrap[str](os_opt), O.unwrap[str](abi_opt),
+        p.target_entry.libs, p.target_entry.lib_count);
     if (R.is_err[bool, str](cr2)) { manifest.dnit(?m, p.s.alloc); ret cr2; }
 
     # multi-target tooling build (#1391): record every manifest target's tuple so
@@ -1869,6 +1893,70 @@ fun dcopy(buf: *u8, k: usize, s: str) usize {
     var j: usize = 0;
     for (j < n) { buf[k + j] = s[j]; j = j + 1; }
     ret k + n;
+}
+
+# build the up-front local-path validation error for a link entry that names
+# neither a step output nor an existing file
+fun local_link_error(alloc: *A.Allocator, name: str, path: str) str {
+    val a: str = "mach.toml: [link.";
+    val b: str = "] path '";
+    val c: str = "' matches no step output and does not exist on disk";
+    val total: usize = str_len(a) + str_len(name) + str_len(b) + str_len(path) + str_len(c);
+    val r: R.Result[*u8, str] = A.allocate[u8](alloc, total + 1);
+    if (R.is_err[*u8, str](r)) { ret "mach.toml: a local link path matches no step output and does not exist on disk"; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](r);
+    var k: usize = 0;
+    k = dcopy(buf, k, a);
+    k = dcopy(buf, k, name);
+    k = dcopy(buf, k, b);
+    k = dcopy(buf, k, path);
+    k = dcopy(buf, k, c);
+    buf[total] = 0;
+    ret buf::str;
+}
+
+# validate every `local` [link.X] path up-front (#1969): it must match a declared
+# step's `out` (which will produce it) or already exist on disk, else an error names
+# the entry here rather than failing at link time. paths expand against the build
+# cell; the disk check resolves relative to the project root.
+fun validate_local_links(p: *Project, project_root: str, m: *manifest.Manifest, proj_out: str, tn: str, pn: str) R.Result[bool, str] {
+    val local_r: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, "local");
+    if (R.is_err[intern.StrId, str](local_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](local_r)); }
+    val local_id: intern.StrId = R.unwrap_ok[intern.StrId, str](local_r);
+
+    var li: u32 = 0;
+    for (li < m.link_count) {
+        val l: *manifest.LinkDef = ?m.links[li];
+        if (l.source == local_id) {
+            val path_opt: O.Option[str] = intern.lookup(?p.s.interner, l.path);
+            val name_opt: O.Option[str] = intern.lookup(?p.s.interner, l.name);
+            if (O.is_none[str](path_opt) || O.is_none[str](name_opt)) { ret R.err[bool, str]("internal: link entry metadata not interned"); }
+            val raw_path: str = O.unwrap[str](path_opt);
+            val ename:    str = O.unwrap[str](name_opt);
+
+            val exp_r: R.Result[str, str] = manifest.expand(p.s.alloc, raw_path, proj_out, tn, pn, "", "");
+            if (R.is_err[str, str](exp_r)) { ret R.err[bool, str](R.unwrap_err[str, str](exp_r)); }
+            val exp: str = R.unwrap_ok[str, str](exp_r);
+
+            var ok_: bool = manifest.local_path_demanded_by_step(p.s.alloc, ?p.s.interner, m, exp, proj_out, tn, pn);
+            if (!ok_) {
+                val abs_r: R.Result[str, str] = join_path(p.s.alloc, project_root, exp);
+                if (R.is_ok[str, str](abs_r)) {
+                    val abs: str = R.unwrap_ok[str, str](abs_r);
+                    ok_ = filesystem.exists(abs);
+                    str_free(p.s.alloc, abs);
+                }
+            }
+            if (!ok_) {
+                val msg: str = local_link_error(p.s.alloc, ename, exp);
+                str_free(p.s.alloc, exp);
+                ret R.err[bool, str](msg);
+            }
+            str_free(p.s.alloc, exp);
+        }
+        li = li + 1;
+    }
+    ret R.ok[bool, str](true);
 }
 
 fun intern_unwrap(itn: *intern.Interner, text: str) intern.StrId {
@@ -2158,7 +2246,7 @@ fun resolve_cascade_libs(p: *Project, project_root: str, isa: str, os: str, abi:
                             val target_name: str = O.unwrap[str](tn_opt);
                             val pn_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.profile);
                             val profile_name: str = O.unwrap[str](pn_opt);
-                            val dep_out_r: R.Result[str, str] = manifest.expand(p.s.alloc, out_tmpl, target_name, profile_name, "", "");
+                            val dep_out_r: R.Result[str, str] = manifest.expand(p.s.alloc, out_tmpl, "", target_name, profile_name, "", "");
                             val dep_out: str = R.unwrap_ok[str, str](dep_out_r);
                             val suffix: str = step_seg_dup(p.s.alloc, raw_path, 13, str_len(raw_path));
                             val full_p_r: R.Result[str, str] = join_path(p.s.alloc, dep_out, suffix);
@@ -2171,7 +2259,7 @@ fun resolve_cascade_libs(p: *Project, project_root: str, isa: str, os: str, abi:
                             val target_name: str = O.unwrap[str](tn_opt);
                             val pn_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.profile);
                             val profile_name: str = O.unwrap[str](pn_opt);
-                            val expanded_path_r: R.Result[str, str] = manifest.expand(p.s.alloc, raw_path, target_name, profile_name, "", "");
+                            val expanded_path_r: R.Result[str, str] = manifest.expand(p.s.alloc, raw_path, "", target_name, profile_name, "", "");
                             expanded_path = R.unwrap_ok[str, str](expanded_path_r);
                         }
                         val full_p_r: R.Result[str, str] = join_path(p.s.alloc, dep_vr, expanded_path);
