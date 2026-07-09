@@ -6078,6 +6078,45 @@ test "mach.lang.driver:wildcard_match" {
     ret bad;
 }
 
+# the step content fingerprint is deterministic over identical inputs+cmd and
+# invalidates on a cmd edit (#1970) - the persisted-stamp behaviour asserted e2e
+test "mach.lang.driver:step_fingerprint" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var code: i32 = 0;
+
+    val res_temp: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "mach_test_fp");
+    if (R.is_err[filesystem.TempFile, str](res_temp)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](res_temp);
+    val path: str = filesystem.temp_path(?tf);
+    if (R.is_err[bool, str](filesystem.write_file(path, "hello"::*u8, 5, 0o644))) { filesystem.temp_close_and_remove(?tf); ret 1; }
+
+    var ins: vector.Vector[str] = vector.init[str](?alloc);
+    if (R.is_err[usize, str](vector.push[str](?ins, path))) { filesystem.temp_close_and_remove(?tf); ret 1; }
+
+    var d1: [32]u8;
+    var d2: [32]u8;
+    var d3: [32]u8;
+    val r1: R.Result[bool, str] = step_fingerprint(?alloc, "", ?ins, "cc -c x", ?d1[0]);
+    val r2: R.Result[bool, str] = step_fingerprint(?alloc, "", ?ins, "cc -c x", ?d2[0]);
+    val r3: R.Result[bool, str] = step_fingerprint(?alloc, "", ?ins, "cc -c y", ?d3[0]);
+    filesystem.temp_close_and_remove(?tf);
+    vector.dnit[str](?ins);
+    if (R.is_err[bool, str](r1) || R.is_err[bool, str](r2) || R.is_err[bool, str](r3)) { ret 1; }
+
+    var eq12: bool = true;
+    var eq13: bool = true;
+    var i: usize = 0;
+    for (i < 32) {
+        if (d1[i] != d2[i]) { eq12 = false; }
+        if (d1[i] != d3[i]) { eq13 = false; }
+        i = i + 1;
+    }
+    if (!eq12) { code = 1; }
+    if (eq13)  { code = 1; }
+    ret code;
+}
+
 # #1873: an orphan module (no in-tree consumer) whose load-time comptime evaluation
 # reaches a `$error` is target-gated - loaded but kept out of the topo set and
 # counted for the skip note - so a `mach test` over a tree with other-target modules
@@ -9138,47 +9177,6 @@ test "mach.lang.driver:secret_join_coerce_strip_clean" {
     ret 0;
 }
 
-# --- custom step execution helpers ---
-
-fun step_out_of_date(alloc: *A.Allocator, project_root: str, step_in: str, step_out: str) bool {
-    val abs_in_r: R.Result[str, str] = join_path(alloc, project_root, step_in);
-    val abs_out_r: R.Result[str, str] = join_path(alloc, project_root, step_out);
-    if (R.is_err[str, str](abs_in_r) || R.is_err[str, str](abs_out_r)) { ret true; }
-    val abs_in: str = R.unwrap_ok[str, str](abs_in_r);
-    val abs_out: str = R.unwrap_ok[str, str](abs_out_r);
-    
-    val exists_out: bool = filesystem.exists(abs_out);
-    val exists_in: bool = filesystem.exists(abs_in);
-    
-    var out_of_date: bool = false;
-    if (!exists_out) {
-        out_of_date = true;
-    }
-    or (!exists_in) {
-        out_of_date = false;
-    }
-    or {
-        var info_in: filesystem.FileInfo;
-        var info_out: filesystem.FileInfo;
-        val res_in: R.Result[filesystem.FileInfo, str] = filesystem.info_path(abs_in);
-        val res_out: R.Result[filesystem.FileInfo, str] = filesystem.info_path(abs_out);
-        if (R.is_err[filesystem.FileInfo, str](res_in) || R.is_err[filesystem.FileInfo, str](res_out)) {
-            out_of_date = true;
-        }
-        or {
-            info_in = R.unwrap_ok[filesystem.FileInfo, str](res_in);
-            info_out = R.unwrap_ok[filesystem.FileInfo, str](res_out);
-            if (info_in.modified > info_out.modified) {
-                out_of_date = true;
-            }
-        }
-    }
-    
-    str_free(alloc, abs_in);
-    str_free(alloc, abs_out);
-    ret out_of_date;
-}
-
 fun step_cc5(alloc: *A.Allocator, a: str, b: str, c: str, d: str, e: str) str {
     val la: usize = str_len(a);
     val lb: usize = str_len(b);
@@ -9407,59 +9405,173 @@ fun step_free_inputs(alloc: *A.Allocator, ins: *vector.Vector[str]) {
     vector.dnit[str](ins);
 }
 
+# free a fingerprint accumulation buffer
+fun fp_free(fb: *FpBuf) {
+    if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](fb.alloc, fb.buf, fb.cap::usize); }
+}
+
+# the sha256 content fingerprint of a step: the sorted input paths, each input's
+# content hash, and the expanded cmd - reusing the Q_LINK_CONFIG fingerprint helpers.
+# being content-based, a touch that changes no bytes does not invalidate while a cmd
+# or source edit does. this is the SINGLE place the composition lives.
+#
+# The digest is persisted per step in a stamp file rather than a query kind because
+# the query DB is in-memory per process today, so a fresh build would hold no prior
+# revision to compare against; folding step caching into the persisted query store is
+# deferred to the incremental epic (#1164). `digest` receives 32 bytes.
+fun step_fingerprint(a: *A.Allocator, project_root: str, ins: *vector.Vector[str], cmd_expanded: str, digest: *u8) R.Result[bool, str] {
+    var fb: FpBuf;
+    fb.alloc = a;
+    fb.buf   = nil;
+    fb.len   = 0;
+    fb.cap   = 0;
+    var i: usize = 0;
+    for (i < ins.len) {
+        val wp: R.Result[bool, str] = fp_cstr(?fb, ins.data[i]::*u8);
+        if (R.is_err[bool, str](wp)) { fp_free(?fb); ret wp; }
+        val abs_r: R.Result[str, str] = join_path(a, project_root, ins.data[i]);
+        if (R.is_err[str, str](abs_r)) { fp_free(?fb); ret R.err[bool, str](R.unwrap_err[str, str](abs_r)); }
+        val abs: str = R.unwrap_ok[str, str](abs_r);
+        val wc: R.Result[bool, str] = fp_file_content(?fb, a, abs::*u8);
+        str_free(a, abs);
+        if (R.is_err[bool, str](wc)) { fp_free(?fb); ret wc; }
+        i = i + 1;
+    }
+    val wcmd: R.Result[bool, str] = fp_cstr(?fb, cmd_expanded::*u8);
+    if (R.is_err[bool, str](wcmd)) { fp_free(?fb); ret wcmd; }
+    sha256.hash(fb.buf, fb.len::usize, digest);
+    fp_free(?fb);
+    ret R.ok[bool, str](true);
+}
+
+# lowercase hex of `len` digest bytes, as a fresh owned string
+fun digest_hex(a: *A.Allocator, digest: *u8, len: usize) str {
+    val hexchars: *u8 = "0123456789abcdef";
+    val rb: R.Result[*u8, str] = A.allocate[u8](a, len * 2 + 1);
+    if (R.is_err[*u8, str](rb)) { ret ""; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+    var i: usize = 0;
+    for (i < len) {
+        val b: u8 = digest[i];
+        buf[i * 2]     = hexchars[(b >> 4)::usize];
+        buf[i * 2 + 1] = hexchars[(b & 0x0f::u8)::usize];
+        i = i + 1;
+    }
+    buf[len * 2] = 0;
+    ret buf::str;
+}
+
+# the stamp path `<root_out>/.steps/<owner>.<step>.stamp`; per-cell (the fingerprint
+# expands per cell) and owner-id-keyed so same-named steps in two deps never collide
+fun step_stamp_path(a: *A.Allocator, root_out: str, owner_id: str, step_name: str) str {
+    val fname: str = step_cc5(a, owner_id, ".", step_name, ".stamp", "");
+    val dir_r: R.Result[str, str] = join_path(a, root_out, ".steps");
+    if (R.is_err[str, str](dir_r)) { str_free(a, fname); ret ""; }
+    val dir: str = R.unwrap_ok[str, str](dir_r);
+    val path_r: R.Result[str, str] = join_path(a, dir, fname);
+    str_free(a, dir);
+    str_free(a, fname);
+    if (R.is_err[str, str](path_r)) { ret ""; }
+    ret R.unwrap_ok[str, str](path_r);
+}
+
+# whether the stamp at `path` exists and holds exactly `hex`
+fun stamp_matches(a: *A.Allocator, path: str, hex: str) bool {
+    val rr: R.Result[str, str] = filesystem.read_all(a, path);
+    if (R.is_err[str, str](rr)) { ret false; }
+    val prior: str = R.unwrap_ok[str, str](rr);
+    val eq: bool = str_equals(prior, hex);
+    str_free(a, prior);
+    ret eq;
+}
+
+# whether every declared output of `step` exists on disk (checked from `project_root`)
+fun step_outputs_exist(a: *A.Allocator, p: *Project, step: *manifest.StepDef, project_root: str, home_out: str) bool {
+    val profile_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.profile));
+    val target_name_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.name));
+    var oi: u32 = 0;
+    for (oi < step.out_count) {
+        val out_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](intern.lookup(?p.s.interner, step.out[oi])), home_out, target_name_s, profile_s, "", "");
+        if (R.is_err[str, str](out_r)) { ret false; }
+        val out_s: str = R.unwrap_ok[str, str](out_r);
+        val abs_r: R.Result[str, str] = join_path(a, project_root, out_s);
+        str_free(a, out_s);
+        if (R.is_err[str, str](abs_r)) { ret false; }
+        val abs: str = R.unwrap_ok[str, str](abs_r);
+        val ex: bool = filesystem.exists(abs);
+        str_free(a, abs);
+        if (!ex) { ret false; }
+        oi = oi + 1;
+    }
+    ret true;
+}
+
+# write `hex` to the stamp, creating the `.steps` directory. best effort - a write
+# failure only costs the next build a re-run, never correctness (#1970).
+fun write_stamp(a: *A.Allocator, root_out: str, path: str, hex: str) {
+    val dir_r: R.Result[str, str] = join_path(a, root_out, ".steps");
+    if (R.is_err[str, str](dir_r)) { ret; }
+    val dir: str = R.unwrap_ok[str, str](dir_r);
+    filesystem.create_dir_all(a, dir, 0o755);
+    str_free(a, dir);
+    filesystem.write_file(path, hex::*u8, str_len(hex), 0o644);
+}
+
 # run one step from `project_root` (its shell CWD), homing `{project.out}` to
 # `home_out`. root steps home to the root out and run from the root; a dependency's
 # steps run from the dep checkout and home to a path that climbs back to the root out
 # (#1970), so `vendor/*` inputs resolve while outputs land in the consumer tree.
-fun run_one_step(a: *A.Allocator, p: *Project, step: *manifest.StepDef, project_root: str, home_out: str) R.Result[bool, str] {
+# `owner_id` is the project id owning the step, keying its stamp file.
+fun run_one_step(a: *A.Allocator, p: *Project, step: *manifest.StepDef, project_root: str, home_out: str, owner_id: str) R.Result[bool, str] {
     val profile_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.profile));
     val project_out_s: str = home_out;
     val target_name_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.name));
+    val step_name: str = O.unwrap[str](intern.lookup(?p.s.interner, step.name));
 
     # `in`/`out`/`cmd` home through the closed template set ({project.out},
     # {target.name}, {profile.name}); an unknown `{a.b}` is a hard error and shell
     # `$VAR` is left to the shell. `in` globs expand sorted against project_root (empty
-    # match errors). skip when every output is up to date against every input (mtime;
-    # #1970 C4 swaps this for a content fingerprint) - a step with no input or output
-    # cannot be dated, so it always runs.
+    # match errors).
     var ins: vector.Vector[str] = vector.init[str](a);
     val cir: R.Result[bool, str] = collect_step_inputs(a, p, step, project_root, home_out, ?ins);
     if (R.is_err[bool, str](cir)) { step_free_inputs(a, ?ins); ret R.err[bool, str](R.unwrap_err[bool, str](cir)); }
 
-    var out_of_date: bool = (ins.len == 0 || step.out_count == 0);
-    var oi: u32 = 0;
-    for (oi < step.out_count && !out_of_date) {
-        val out_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](intern.lookup(?p.s.interner, step.out[oi])), project_out_s, target_name_s, profile_s, "", "");
-        if (R.is_err[str, str](out_r)) { step_free_inputs(a, ?ins); ret R.err[bool, str](R.unwrap_err[str, str](out_r)); }
-        val out_s: str = R.unwrap_ok[str, str](out_r);
-        var ii: usize = 0;
-        for (ii < ins.len && !out_of_date) {
-            if (step_out_of_date(a, project_root, ins.data[ii], out_s)) { out_of_date = true; }
-            ii = ii + 1;
-        }
-        str_free(a, out_s);
-        oi = oi + 1;
-    }
-    step_free_inputs(a, ?ins);
-
-    if (!out_of_date) { ret R.ok[bool, str](true); }
-
     val cmd_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](intern.lookup(?p.s.interner, step.cmd)), project_out_s, target_name_s, profile_s, "", "");
-    if (R.is_err[str, str](cmd_r)) { ret R.err[bool, str](R.unwrap_err[str, str](cmd_r)); }
+    if (R.is_err[str, str](cmd_r)) { step_free_inputs(a, ?ins); ret R.err[bool, str](R.unwrap_err[str, str](cmd_r)); }
     val expanded_cmd: str = R.unwrap_ok[str, str](cmd_r);
 
-    val step_name: str = O.unwrap[str](intern.lookup(?p.s.interner, step.name));
+    # content-fingerprint cache: skip iff the stamp matches AND every output exists.
+    # fail toward running - any error, mismatch, or missing output re-runs (#1970).
+    val root_out: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_out));
+    var digest: [32]u8;
+    val fpr: R.Result[bool, str] = step_fingerprint(a, project_root, ?ins, expanded_cmd, ?digest[0]);
+    step_free_inputs(a, ?ins);
+
+    var hex:        str  = "";
+    var stamp_path: str  = "";
+    val stampable:  bool = R.is_ok[bool, str](fpr) && step.out_count > 0;
+    if (stampable) {
+        hex        = digest_hex(a, ?digest[0], 32::usize);
+        stamp_path = step_stamp_path(a, root_out, owner_id, step_name);
+        if (step_outputs_exist(a, p, step, project_root, home_out) && stamp_matches(a, stamp_path, hex)) {
+            str_free(a, hex);
+            str_free(a, stamp_path);
+            str_free(a, expanded_cmd);
+            ret R.ok[bool, str](true);
+        }
+    }
+
     val msg: str = step_cc5(a, "step ", step_name, ": ", expanded_cmd, "\n");
     print.print(msg);
     str_free(a, msg);
-    
+
     var shell_name: *u8 = "/bin/sh";
     var shell_flag: *u8 = "-c";
     $if ($mach.build.os == $mach.os.windows) {
         shell_name = "cmd.exe";
         shell_flag = "/c";
     }
-    
+
     var full_cmd: str;
     $if ($mach.build.os == $mach.os.windows) {
         full_cmd = step_cc5(a, "cd /d \"", project_root, "\" && ", expanded_cmd, "");
@@ -9467,9 +9579,10 @@ fun run_one_step(a: *A.Allocator, p: *Project, step: *manifest.StepDef, project_
     $or {
         full_cmd = step_cc5(a, "cd '", project_root, "' && ", expanded_cmd, "");
     }
-    
+
     val res_argv: R.Result[**u8, str] = A.allocate[*u8](a, 4);
     if (R.is_err[**u8, str](res_argv)) {
+        if (stampable) { str_free(a, hex); str_free(a, stamp_path); }
         str_free(a, expanded_cmd);
         str_free(a, full_cmd);
         ret R.err[bool, str]("out of memory");
@@ -9479,21 +9592,28 @@ fun run_one_step(a: *A.Allocator, p: *Project, step: *manifest.StepDef, project_
     argv[1] = shell_flag;
     argv[2] = full_cmd::*u8;
     argv[3] = nil;
-    
+
     val res_run: R.Result[exec.ExitStatus, str] = exec.run(shell_name::str, argv, sysos.environ());
-    
+
     A.deallocate[*u8](a, argv, 4);
     str_free(a, expanded_cmd);
     str_free(a, full_cmd);
-    
+
     if (R.is_err[exec.ExitStatus, str](res_run)) {
+        if (stampable) { str_free(a, hex); str_free(a, stamp_path); }
         ret R.err[bool, str]("failed to execute build step");
     }
     val status: exec.ExitStatus = R.unwrap_ok[exec.ExitStatus, str](res_run);
     if (!exec.exited(status) || exec.code(status) != 0) {
+        if (stampable) { str_free(a, hex); str_free(a, stamp_path); }
         ret R.err[bool, str]("build step exited non-zero");
     }
-    
+
+    if (stampable) {
+        write_stamp(a, root_out, stamp_path, hex);
+        str_free(a, hex);
+        str_free(a, stamp_path);
+    }
     ret R.ok[bool, str](true);
 }
 
@@ -9503,10 +9623,11 @@ fun run_one_step(a: *A.Allocator, p: *Project, step: *manifest.StepDef, project_
 fun execute_steps(a: *A.Allocator, p: *Project, project_root: str) R.Result[bool, str] {
     if (p.config.step_order_count == 0) { ret R.ok[bool, str](true); }
     val root_out: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_out));
+    val owner_id: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.id));
     var i: u32 = 0;
     for (i < p.config.step_order_count) {
         val idx: u32 = p.config.step_order[i];
-        val res: R.Result[bool, str] = run_one_step(a, p, ?p.config.steps[idx], project_root, root_out);
+        val res: R.Result[bool, str] = run_one_step(a, p, ?p.config.steps[idx], project_root, root_out, owner_id);
         if (R.is_err[bool, str](res)) { ret res; }
         i = i + 1;
     }
@@ -9599,9 +9720,10 @@ fun execute_dep_steps(p: *Project, isa: str, os: str, abi: str) R.Result[bool, s
             val hr: R.Result[str, str] = dep_out_home(p.s.alloc, dep_vr, root_out);
             if (R.is_err[str, str](hr)) { A.deallocate[u32](p.s.alloc, dep_order, dep_count::usize); manifest.dnit(?mfd, p.s.alloc); ret R.err[bool, str](R.unwrap_err[str, str](hr)); }
             val dep_home: str = R.unwrap_ok[str, str](hr);
+            val dep_owner: str = O.unwrap[str](intern.lookup(?p.s.interner, mfd.id));
             var si: u32 = 0;
             for (si < dep_count) {
-                val rs: R.Result[bool, str] = run_one_step(p.s.alloc, p, ?mfd.steps[dep_order[si]], dep_vr, dep_home);
+                val rs: R.Result[bool, str] = run_one_step(p.s.alloc, p, ?mfd.steps[dep_order[si]], dep_vr, dep_home, dep_owner);
                 if (R.is_err[bool, str](rs)) { str_free(p.s.alloc, dep_home); A.deallocate[u32](p.s.alloc, dep_order, dep_count::usize); manifest.dnit(?mfd, p.s.alloc); ret rs; }
                 si = si + 1;
             }
