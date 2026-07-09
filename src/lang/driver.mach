@@ -217,6 +217,9 @@ pub rec ProjectConfig {
     project_out:  intern.StrId;
     steps:        *manifest.StepDef;
     step_count:   u32;
+    # indices into `steps` for the demanded steps, in needs-first run order (#1970)
+    step_order:       *u32;
+    step_order_count: u32;
     links:        *manifest.LinkDef;
     link_count:   u32;
 }
@@ -1452,6 +1455,9 @@ fun deallocate_config(c: *ProjectConfig, alloc: *A.Allocator) {
         }
         A.deallocate[manifest.StepDef](alloc, c.steps, c.step_count::usize);
     }
+    if (c.step_order != nil && c.step_order_count > 0) {
+        A.deallocate[u32](alloc, c.step_order, c.step_order_count::usize);
+    }
     c.targets      = nil;
     c.target_count = 0;
     c.deps         = nil;
@@ -1464,6 +1470,8 @@ fun deallocate_config(c: *ProjectConfig, alloc: *A.Allocator) {
     c.link_count = 0;
     c.steps = nil;
     c.step_count = 0;
+    c.step_order = nil;
+    c.step_order_count = 0;
 }
 
 # read and parse the manifest at `manifest_path`, then synthesize the ProjectConfig
@@ -1579,7 +1587,9 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
     p.config.define_count  = bu.define_count;
     p.target_entry        = ?p.config.targets[0];
     p.config.profile      = bu.profile_name;
-    
+    p.config.step_order       = nil;
+    p.config.step_order_count = 0;
+
     val tn_s: str = O.unwrap[str](intern.lookup(?p.s.interner, bu.target.name));
     val pn_s: str = O.unwrap[str](intern.lookup(?p.s.interner, bu.profile_name));
     val out_tmpl_s: str = O.unwrap[str](intern.lookup(?p.s.interner, m.out_tmpl));
@@ -1607,6 +1617,11 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
             p.config.targets[0].libs      = test_items;
             p.config.targets[0].lib_count = test_count;
         }
+
+        # compute which steps this build demands, in run order (#1970). indices are
+        # into m.steps, which p.config.steps mirrors 1:1 when copied below.
+        val spr: R.Result[bool, str] = compute_step_plan(p, ?m, ?bu, is_test, for_union, project_out_str, tn_s, pn_s);
+        if (R.is_err[bool, str](spr)) { str_free(p.s.alloc, project_out_str); manifest.dnit(?m, p.s.alloc); ret R.err[bool, str](R.unwrap_err[bool, str](spr)); }
         str_free(p.s.alloc, project_out_str);
     }
 
@@ -1909,6 +1924,52 @@ fun local_link_error(alloc: *A.Allocator, name: str, path: str) str {
     k = dcopy(buf, k, c);
     buf[total] = 0;
     ret buf::str;
+}
+
+# compute the demanded step plan for the current build cell and store it in
+# p.config.step_order (#1970). demand is driven by the selected artifact for a plain
+# build, or by every declared artifact for a test/union link (which links them all).
+# ---
+# p:        the active project, receiving the plan
+# m:        the parsed root manifest
+# bu:       the resolved build unit (its artifact / target drive demand)
+# is_test:  a `mach test` link (union of all artifacts)
+# for_union: a multi-artifact union build
+# proj_out: the expanded project out the entry paths and step outs home against
+# tn:       the target name for template expansion
+# pn:       the profile name for template expansion
+fun compute_step_plan(p: *Project, m: *manifest.Manifest, bu: *manifest.BuildUnit,
+                      is_test: bool, for_union: bool, proj_out: str, tn: str, pn: str) R.Result[bool, str] {
+    p.config.step_order       = nil;
+    p.config.step_order_count = 0;
+    if (m.step_count == 0) { ret R.ok[bool, str](true); }
+
+    var names:  *intern.StrId = nil;
+    var ncount: u32           = 0;
+    var owned:  bool          = false;
+    if ((is_test || for_union) && m.artifact_count > 0) {
+        val ar: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](p.s.alloc, m.artifact_count::usize);
+        if (R.is_err[*intern.StrId, str](ar)) { ret R.err[bool, str](R.unwrap_err[*intern.StrId, str](ar)); }
+        names = R.unwrap_ok[*intern.StrId, str](ar);
+        owned = true;
+        var i: u32 = 0;
+        for (i < m.artifact_count) { names[i] = m.artifacts[i].name; i = i + 1; }
+        ncount = m.artifact_count;
+    }
+    or {
+        if (bu.artifact == nil) { ret R.ok[bool, str](true); }
+        names  = ?bu.artifact.name;
+        ncount = 1;
+    }
+
+    var order: *u32 = nil;
+    var count: u32  = 0;
+    val r: R.Result[bool, str] = manifest.plan_steps(p.s.alloc, ?p.s.interner, m, names, ncount, bu.target, proj_out, tn, pn, ?order, ?count);
+    if (owned) { A.deallocate[intern.StrId](p.s.alloc, names, m.artifact_count::usize); }
+    if (R.is_err[bool, str](r)) { ret r; }
+    p.config.step_order       = order;
+    p.config.step_order_count = count;
+    ret R.ok[bool, str](true);
 }
 
 # validate every `local` [link.X] path up-front (#1969): it must match a declared
@@ -9122,186 +9183,6 @@ fun step_seg_dup(alloc: *A.Allocator, tmpl: str, start: usize, end: usize) str {
     ret buf::str;
 }
 
-fun expand_step_vars(alloc: *A.Allocator, cmd: str, target_name: str, profile_name: str, target_isa: str, target_os: str, target_abi: str, project_out: str) str {
-    val n: usize = str_len(cmd);
-    var new_len: usize = 0;
-    var i: usize = 0;
-    for (i < n) {
-        if (cmd[i] == '{') {
-            var ii: usize = i + 1;
-            for (ii < n && cmd[ii] != '}') { ii = ii + 1; }
-            if (ii < n) {
-                val name: str = step_seg_dup(alloc, cmd, i + 1, ii);
-                var val_len: usize = 0;
-                if (str_equals(name, "project.out")) { val_len = str_len(project_out); }
-                or (str_equals(name, "target.name") || str_equals(name, "target")) { val_len = str_len(target_name); }
-                or (str_equals(name, "target.isa"))  { val_len = str_len(target_isa); }
-                or (str_equals(name, "target.os"))   { val_len = str_len(target_os); }
-                or (str_equals(name, "target.abi"))  { val_len = str_len(target_abi); }
-                or (str_equals(name, "profile.name") || str_equals(name, "profile")) { val_len = str_len(profile_name); }
-                new_len = new_len + val_len;
-                i = ii + 1;
-                str_free(alloc, name);
-                cnt;
-            }
-        }
-        new_len = new_len + 1;
-        i = i + 1;
-    }
-
-    val res_buf: R.Result[*u8, str] = A.allocate[u8](alloc, new_len + 1);
-    if (R.is_err[*u8, str](res_buf)) { ret ""; }
-    val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
-    var w: usize = 0;
-    i = 0;
-    for (i < n) {
-        if (cmd[i] == '{') {
-            var ii: usize = i + 1;
-            for (ii < n && cmd[ii] != '}') { ii = ii + 1; }
-            if (ii < n) {
-                val name: str = step_seg_dup(alloc, cmd, i + 1, ii);
-                var var_val: str = "";
-                if (str_equals(name, "project.out")) { var_val = project_out; }
-                or (str_equals(name, "target.name") || str_equals(name, "target")) { var_val = target_name; }
-                or (str_equals(name, "target.isa"))  { var_val = target_isa; }
-                or (str_equals(name, "target.os"))   { var_val = target_os; }
-                or (str_equals(name, "target.abi"))  { var_val = target_abi; }
-                or (str_equals(name, "profile.name") || str_equals(name, "profile")) { var_val = profile_name; }
-                
-                val vl: usize = str_len(var_val);
-                var iii: usize = 0;
-                for (iii < vl) {
-                    buf[w] = var_val[iii];
-                    w = w + 1;
-                    iii = iii + 1;
-                }
-                i = ii + 1;
-                str_free(alloc, name);
-                cnt;
-            }
-        }
-        buf[w] = cmd[i];
-        w = w + 1;
-        i = i + 1;
-    }
-    buf[w] = 0;
-    ret buf::str;
-}
-
-fun expand_env_vars(alloc: *A.Allocator, cmd: str, target_isa: str, target_os: str, target_abi: str, profile_name: str, out_dir: str) str {
-    val n: usize = str_len(cmd);
-    var new_len: usize = 0;
-    var i: usize = 0;
-    for (i < n) {
-        if (cmd[i] == '$') {
-            var var_len: usize = 0;
-            var var_name: str = "";
-            var var_value: str = "";
-            
-            if (i + 1 < n && cmd[i + 1] == '{') {
-                var ii: usize = i + 2;
-                for (ii < n && cmd[ii] != '}') { ii = ii + 1; }
-                if (ii < n) {
-                    val name: str = step_seg_dup(alloc, cmd, i + 2, ii);
-                    var_name = name;
-                    var_len = ii - i + 1;
-                }
-            }
-            or {
-                var ii: usize = i + 1;
-                for (ii < n && ((cmd[ii] >= 'A' && cmd[ii] <= 'Z') || (cmd[ii] >= 'a' && cmd[ii] <= 'z') || (cmd[ii] >= '0' && cmd[ii] <= '9') || cmd[ii] == '_')) {
-                    ii = ii + 1;
-                }
-                if (ii > i + 1) {
-                    val name: str = step_seg_dup(alloc, cmd, i + 1, ii);
-                    var_name = name;
-                    var_len = ii - i;
-                }
-            }
-            
-            if (str_len(var_name) > 0) {
-                if (str_equals(var_name, "MACH_TARGET_ISA"))      { var_value = target_isa; }
-                or (str_equals(var_name, "MACH_TARGET_OS"))       { var_value = target_os; }
-                or (str_equals(var_name, "MACH_TARGET_ABI"))      { var_value = target_abi; }
-                or (str_equals(var_name, "MACH_PROFILE"))         { var_value = profile_name; }
-                or (str_equals(var_name, "MACH_OUT"))             { var_value = out_dir; }
-                
-                if (str_len(var_value) > 0 || str_equals(var_name, "MACH_TARGET_ISA") || str_equals(var_name, "MACH_TARGET_OS") || str_equals(var_name, "MACH_TARGET_ABI") || str_equals(var_name, "MACH_PROFILE") || str_equals(var_name, "MACH_OUT")) {
-                    new_len = new_len + str_len(var_value);
-                    i = i + var_len;
-                    if (str_len(var_name) > 0) { str_free(alloc, var_name); }
-                    cnt;
-                }
-            }
-            if (str_len(var_name) > 0) { str_free(alloc, var_name); }
-        }
-        new_len = new_len + 1;
-        i = i + 1;
-    }
-    
-    val res_buf: R.Result[*u8, str] = A.allocate[u8](alloc, new_len + 1);
-    if (R.is_err[*u8, str](res_buf)) { ret cmd; }
-    val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
-    
-    var w: usize = 0;
-    i = 0;
-    for (i < n) {
-        if (cmd[i] == '$') {
-            var var_len: usize = 0;
-            var var_name: str = "";
-            var var_value: str = "";
-            
-            if (i + 1 < n && cmd[i + 1] == '{') {
-                var ii: usize = i + 2;
-                for (ii < n && cmd[ii] != '}') { ii = ii + 1; }
-                if (ii < n) {
-                    val name: str = step_seg_dup(alloc, cmd, i + 2, ii);
-                    var_name = name;
-                    var_len = ii - i + 1;
-                }
-            }
-            or {
-                var ii: usize = i + 1;
-                for (ii < n && ((cmd[ii] >= 'A' && cmd[ii] <= 'Z') || (cmd[ii] >= 'a' && cmd[ii] <= 'z') || (cmd[ii] >= '0' && cmd[ii] <= '9') || cmd[ii] == '_')) {
-                    ii = ii + 1;
-                }
-                if (ii > i + 1) {
-                    val name: str = step_seg_dup(alloc, cmd, i + 1, ii);
-                    var_name = name;
-                    var_len = ii - i;
-                }
-            }
-            
-            if (str_len(var_name) > 0) {
-                if (str_equals(var_name, "MACH_TARGET_ISA"))      { var_value = target_isa; }
-                or (str_equals(var_name, "MACH_TARGET_OS"))       { var_value = target_os; }
-                or (str_equals(var_name, "MACH_TARGET_ABI"))      { var_value = target_abi; }
-                or (str_equals(var_name, "MACH_PROFILE"))         { var_value = profile_name; }
-                or (str_equals(var_name, "MACH_OUT"))             { var_value = out_dir; }
-                
-                if (str_len(var_value) > 0 || str_equals(var_name, "MACH_TARGET_ISA") || str_equals(var_name, "MACH_TARGET_OS") || str_equals(var_name, "MACH_TARGET_ABI") || str_equals(var_name, "MACH_PROFILE") || str_equals(var_name, "MACH_OUT")) {
-                    val vl: usize = str_len(var_value);
-                    var vi: usize = 0;
-                    for (vi < vl) {
-                        buf[w] = var_value[vi];
-                        w = w + 1;
-                        vi = vi + 1;
-                    }
-                    i = i + var_len;
-                    if (str_len(var_name) > 0) { str_free(alloc, var_name); }
-                    cnt;
-                }
-            }
-            if (str_len(var_name) > 0) { str_free(alloc, var_name); }
-        }
-        buf[w] = cmd[i];
-        w = w + 1;
-        i = i + 1;
-    }
-    buf[w] = 0;
-    ret buf::str;
-}
-
 fun step_cc5(alloc: *A.Allocator, a: str, b: str, c: str, d: str, e: str) str {
     val la: usize = str_len(a);
     val lb: usize = str_len(b);
@@ -9328,42 +9209,40 @@ fun step_cc5(alloc: *A.Allocator, a: str, b: str, c: str, d: str, e: str) str {
 }
 
 fun run_one_step(a: *A.Allocator, p: *Project, step: *manifest.StepDef, project_root: str) R.Result[bool, str] {
-    val isa_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.isa_name));
-    val os_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.os_name));
-    val abi_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.abi_name));
     val profile_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.profile));
     val project_out_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_out));
     val target_name_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.name));
 
-    # Check if out-of-date across all in/out combinations
-    var out_of_date: bool = false;
+    # `in`/`out`/`cmd` home through the closed template set ({project.out},
+    # {target.name}, {profile.name}); an unknown `{a.b}` is a hard error. shell `$VAR`
+    # is left to the shell. skip when every output is up to date against every input
+    # (mtime; #1970 C4 swaps this for a content fingerprint) - a step with no declared
+    # input or output cannot be dated, so it always runs.
+    var out_of_date: bool = (step.in_count == 0 || step.out_count == 0);
     var ini: u32 = 0;
     for (ini < step.in_count && !out_of_date) {
-        val raw_in: str = O.unwrap[str](intern.lookup(?p.s.interner, step.in[ini]));
-        val in_s: str = expand_step_vars(a, raw_in, target_name_s, profile_s, isa_s, os_s, abi_s, project_out_s);
+        val in_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](intern.lookup(?p.s.interner, step.in[ini])), project_out_s, target_name_s, profile_s, "", "");
+        if (R.is_err[str, str](in_r)) { ret R.err[bool, str](R.unwrap_err[str, str](in_r)); }
+        val in_s: str = R.unwrap_ok[str, str](in_r);
         var outi: u32 = 0;
         for (outi < step.out_count && !out_of_date) {
-            val raw_out: str = O.unwrap[str](intern.lookup(?p.s.interner, step.out[outi]));
-            val out_s: str = expand_step_vars(a, raw_out, target_name_s, profile_s, isa_s, os_s, abi_s, project_out_s);
-            if (step_out_of_date(a, project_root, in_s, out_s)) {
-                out_of_date = true;
-            }
+            val out_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](intern.lookup(?p.s.interner, step.out[outi])), project_out_s, target_name_s, profile_s, "", "");
+            if (R.is_err[str, str](out_r)) { str_free(a, in_s); ret R.err[bool, str](R.unwrap_err[str, str](out_r)); }
+            val out_s: str = R.unwrap_ok[str, str](out_r);
+            if (step_out_of_date(a, project_root, in_s, out_s)) { out_of_date = true; }
             str_free(a, out_s);
             outi = outi + 1;
         }
         str_free(a, in_s);
         ini = ini + 1;
     }
-    
-    if (!out_of_date) {
-        ret R.ok[bool, str](true);
-    }
-    
-    val raw_cmd: str = O.unwrap[str](intern.lookup(?p.s.interner, step.cmd));
-    val cmd_s: str = expand_step_vars(a, raw_cmd, target_name_s, profile_s, isa_s, os_s, abi_s, project_out_s);
-    val expanded_cmd: str = expand_env_vars(a, cmd_s, isa_s, os_s, abi_s, profile_s, project_out_s);
-    str_free(a, cmd_s);
-    
+
+    if (!out_of_date) { ret R.ok[bool, str](true); }
+
+    val cmd_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](intern.lookup(?p.s.interner, step.cmd)), project_out_s, target_name_s, profile_s, "", "");
+    if (R.is_err[str, str](cmd_r)) { ret R.err[bool, str](R.unwrap_err[str, str](cmd_r)); }
+    val expanded_cmd: str = R.unwrap_ok[str, str](cmd_r);
+
     val step_name: str = O.unwrap[str](intern.lookup(?p.s.interner, step.name));
     val msg: str = step_cc5(a, "step ", step_name, ": ", expanded_cmd, "\n");
     print.print(msg);
@@ -9413,59 +9292,17 @@ fun run_one_step(a: *A.Allocator, p: *Project, step: *manifest.StepDef, project_
     ret R.ok[bool, str](true);
 }
 
-fun find_step_by_name(p: *Project, name: intern.StrId) i64 {
-    var i: u32 = 0;
-    for (i < p.config.step_count) {
-        if (p.config.steps[i].name == name) { ret i::i64; }
-        i = i + 1;
-    }
-    ret -1;
-}
-
-fun run_step_dfs(a: *A.Allocator, p: *Project, project_root: str, visited: *u8, idx: u32) R.Result[bool, str] {
-    if (visited[idx] == 2) { ret R.ok[bool, str](true); }
-    if (visited[idx] == 1) { ret R.err[bool, str]("mach.toml: cyclic dependency detected in build steps"); }
-    
-    visited[idx] = 1;
-    
-    val step: *manifest.StepDef = ?p.config.steps[idx];
-    var need_i: u32 = 0;
-    for (need_i < step.need_count) {
-        val dep_idx: i64 = find_step_by_name(p, step.need[need_i]);
-        if (dep_idx < 0) {
-            ret R.err[bool, str]("mach.toml: step refers to unknown dependency");
-        }
-        val res_dep: R.Result[bool, str] = run_step_dfs(a, p, project_root, visited, dep_idx::u32);
-        if (R.is_err[bool, str](res_dep)) { ret res_dep; }
-        need_i = need_i + 1;
-    }
-    
-    val res_exec: R.Result[bool, str] = run_one_step(a, p, step, project_root);
-    if (R.is_err[bool, str](res_exec)) { ret res_exec; }
-    
-    visited[idx] = 2;
-    ret R.ok[bool, str](true);
-}
-
+# run the demanded steps in the planned needs-first order (#1970). the plan
+# (manifest.plan_steps, computed at config time) already resolved demand, ordering,
+# and cycle detection; undemanded steps never run.
 fun execute_steps(a: *A.Allocator, p: *Project, project_root: str) R.Result[bool, str] {
-    if (p.config.step_count == 0) { ret R.ok[bool, str](true); }
-    
-    val res_visited: R.Result[*u8, str] = A.allocate[u8](a, p.config.step_count::usize);
-    if (R.is_err[*u8, str](res_visited)) { ret R.err[bool, str]("out of memory"); }
-    val visited: *u8 = R.unwrap_ok[*u8, str](res_visited);
     var i: u32 = 0;
-    for (i < p.config.step_count) { visited[i] = 0; i = i + 1; }
-    
-    i = 0;
-    for (i < p.config.step_count) {
-        val res_run: R.Result[bool, str] = run_step_dfs(a, p, project_root, visited, i);
-        if (R.is_err[bool, str](res_run)) {
-            A.deallocate[u8](a, visited, p.config.step_count::usize);
-            ret res_run;
-        }
+    for (i < p.config.step_order_count) {
+        val idx: u32 = p.config.step_order[i];
+        val res: R.Result[bool, str] = run_one_step(a, p, ?p.config.steps[idx], project_root);
+        if (R.is_err[bool, str](res)) { ret res; }
         i = i + 1;
     }
-    A.deallocate[u8](a, visited, p.config.step_count::usize);
     ret R.ok[bool, str](true);
 }
 

@@ -1309,6 +1309,140 @@ pub fun local_path_demanded_by_step(alloc: *A.Allocator, itn: *intern.Interner, 
     ret step_producing_out(alloc, itn, m, expanded_path, proj_out, tn, pn) >= 0;
 }
 
+# the artifact declared as `name`, or nil
+fun find_artifact_by_name(m: *Manifest, name: intern.StrId) *ArtifactDef {
+    var i: u32 = 0;
+    for (i < m.artifact_count) {
+        if (m.artifacts[i].name == name) { ret ?m.artifacts[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the link entry declared as `name`, or nil
+fun find_link_by_name(m: *Manifest, name: intern.StrId) *LinkDef {
+    var i: u32 = 0;
+    for (i < m.link_count) {
+        if (m.links[i].name == name) { ret ?m.links[i]; }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# the index of the step declared as `name`, or -1
+fun find_step_index(m: *Manifest, name: intern.StrId) i64 {
+    var i: u32 = 0;
+    for (i < m.step_count) {
+        if (m.steps[i].name == name) { ret i::i64; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# post-order visit emitting each of `idx`'s `need` steps before `idx` itself, so the
+# resulting order runs dependencies first. `state` is per-step (0 unvisited, 1
+# in-progress, 2 emitted); re-entering an in-progress step is a `need` cycle.
+fun plan_visit(m: *Manifest, idx: u32, state: *u8, order: *u32, order_len: *u32) R.Result[bool, str] {
+    if (state[idx] == 2) { ret R.ok[bool, str](true); }
+    if (state[idx] == 1) { ret R.err[bool, str]("mach.toml: cyclic dependency detected in build steps"); }
+    state[idx] = 1;
+    val s: *StepDef = ?m.steps[idx];
+    var ni: u32 = 0;
+    for (ni < s.need_count) {
+        val nidx: i64 = find_step_index(m, s.need[ni]);
+        if (nidx < 0) { ret R.err[bool, str]("mach.toml: a step 'need' refers to an unknown step"); }
+        val vr: R.Result[bool, str] = plan_visit(m, nidx::u32, state, order, order_len);
+        if (R.is_err[bool, str](vr)) { ret vr; }
+        ni = ni + 1;
+    }
+    state[idx] = 2;
+    order[@order_len] = idx;
+    @order_len = @order_len + 1;
+    ret R.ok[bool, str](true);
+}
+
+# compute the steps `art_names` demand, in topological (needs-first) order (#1970)
+#
+# A step is demanded when a selected, target-matching `local` link entry referenced
+# by one of the artifacts expands to the step's `out`, or an artifact names it in
+# `need`; demand then closes transitively over each step's own `need`. A step that
+# nothing demands never runs. Steps carry no filters - conditions live on the link
+# entries. A `need` cycle or an unknown `need` target is a hard error.
+# ---
+# art_names: the artifact names driving demand (the selected one for a build, all
+#            of them for the test union)
+# art_count: number of entries in `art_names`
+# t:         the resolved build cell, for link-entry filtering
+# proj_out:  the expanded project out the entry paths and step outs home against
+# tn:        the target name for template expansion
+# pn:        the profile name for template expansion
+# out_order: receives the owned ordered step-index array (nil when none)
+# out_count: receives the step count (0 when none)
+pub fun plan_steps(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
+                   art_names: *intern.StrId, art_count: u32, t: *TargetDef,
+                   proj_out: str, tn: str, pn: str,
+                   out_order: **u32, out_count: *u32) R.Result[bool, str] {
+    @out_order = nil;
+    @out_count = 0;
+    if (m.step_count == 0) { ret R.ok[bool, str](true); }
+
+    val sr: R.Result[*u8, str] = A.allocate[u8](alloc, m.step_count::usize);
+    if (R.is_err[*u8, str](sr)) { ret R.err[bool, str](R.unwrap_err[*u8, str](sr)); }
+    val state: *u8 = R.unwrap_ok[*u8, str](sr);
+    var i: u32 = 0;
+    for (i < m.step_count) { state[i] = 0; i = i + 1; }
+
+    val or_: R.Result[*u32, str] = A.allocate[u32](alloc, m.step_count::usize);
+    if (R.is_err[*u32, str](or_)) { A.deallocate[u8](alloc, state, m.step_count::usize); ret R.err[bool, str](R.unwrap_err[*u32, str](or_)); }
+    val order: *u32 = R.unwrap_ok[*u32, str](or_);
+    var order_len: u32 = 0;
+
+    val local_id: intern.StrId = intern_unwrap(itn, "local");
+    var ai: u32 = 0;
+    for (ai < art_count) {
+        val a: *ArtifactDef = find_artifact_by_name(m, art_names[ai]);
+        if (a != nil) {
+            var li: u32 = 0;
+            for (li < a.link_count) {
+                val l: *LinkDef = find_link_by_name(m, a.link[li]);
+                if (l != nil && l.source == local_id && link_matches_target(itn, l, t)) {
+                    val exp_r: R.Result[str, str] = expand(alloc, idstr(itn, l.path), proj_out, tn, pn, "", "");
+                    if (R.is_ok[str, str](exp_r)) {
+                        val exp: str = R.unwrap_ok[str, str](exp_r);
+                        val sidx: i64 = step_producing_out(alloc, itn, m, exp, proj_out, tn, pn);
+                        str_free(alloc, exp);
+                        if (sidx >= 0) {
+                            val vr: R.Result[bool, str] = plan_visit(m, sidx::u32, state, order, ?order_len);
+                            if (R.is_err[bool, str](vr)) { plan_free(alloc, state, order, m.step_count); ret vr; }
+                        }
+                    }
+                }
+                li = li + 1;
+            }
+            var ni: u32 = 0;
+            for (ni < a.need_count) {
+                val nidx: i64 = find_step_index(m, a.need[ni]);
+                if (nidx < 0) { plan_free(alloc, state, order, m.step_count); ret R.err[bool, str]("mach.toml: an artifact 'need' refers to an unknown step"); }
+                val vr: R.Result[bool, str] = plan_visit(m, nidx::u32, state, order, ?order_len);
+                if (R.is_err[bool, str](vr)) { plan_free(alloc, state, order, m.step_count); ret vr; }
+                ni = ni + 1;
+            }
+        }
+        ai = ai + 1;
+    }
+
+    A.deallocate[u8](alloc, state, m.step_count::usize);
+    if (order_len == 0) { A.deallocate[u32](alloc, order, m.step_count::usize); ret R.ok[bool, str](true); }
+    @out_order = order;
+    @out_count = order_len;
+    ret R.ok[bool, str](true);
+}
+
+fun plan_free(alloc: *A.Allocator, state: *u8, order: *u32, n: u32) {
+    A.deallocate[u8](alloc, state, n::usize);
+    A.deallocate[u32](alloc, order, n::usize);
+}
+
 pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest, sel: Selection) R.Result[BuildUnit, str] {
     val res_target: R.Result[ResolvedTarget, str] = resolve_target(alloc, itn, m, sel.target);
     if (R.is_err[ResolvedTarget, str](res_target)) { ret R.err[BuildUnit, str](R.unwrap_err[ResolvedTarget, str](res_target)); }
@@ -2059,6 +2193,77 @@ test "mach.lang.manifest.local_path_demanded_by_step" {
         # the shared predicate reports which step produces the path (the sole shim, index 0) and -1 for a miss
         if (step_producing_out(?alloc, ?itn, ?m, "out/linux/obj/shim.o", "out/linux", "linux", "debug") != 0)  { code = 1; }
         if (step_producing_out(?alloc, ?itn, ?m, "out/linux/obj/nope.o", "out/linux", "linux", "debug") != -1) { code = 1; }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+# demand: app links a wildcard local (obj->compile) and a windows-only local
+# (win->winc, filtered out on linux), and needs gen; gen needs dep. so the linux
+# plan is {compile, gen, dep} - winc excluded, dep ordered before gen (#1970)
+test "mach.lang.manifest.plan_steps" {
+    var backing: A.Allocator; var ar: arena.Arena; var alloc: A.Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[link.obj]\nsource=\"local\"\npath=\"{project.out}/o/a.o\"\nos=\"*\"\n[link.win]\nsource=\"local\"\npath=\"{project.out}/o/w.o\"\nos=\"windows\"\n[artifact.app]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[\"obj\",\"win\"]\nneed=[\"gen\"]\n[step.compile]\ncmd=\"cc\"\nin=[\"a.c\"]\nout=[\"{project.out}/o/a.o\"]\n[step.winc]\ncmd=\"cc\"\nin=[\"w.c\"]\nout=[\"{project.out}/o/w.o\"]\n[step.gen]\ncmd=\"g\"\nin=[\"g.in\"]\nout=[\"{project.out}/g.h\"]\nneed=[\"dep\"]\n[step.dep]\ncmd=\"d\"\nin=[\"d.in\"]\nout=[\"{project.out}/d.o\"]\n";
+    val rm: R.Result[Manifest, str] = tparse(?alloc, ?itn, src);
+    if (R.is_err[Manifest, str](rm)) { code = 1; }
+    or {
+        var m: Manifest = R.unwrap_ok[Manifest, str](rm);
+        val tl: *TargetDef = find_target_by_name(?itn, ?m, "linux");
+        if (tl == nil) { code = 1; }
+        or {
+            var names: [1]intern.StrId;
+            names[0] = intern_unwrap(?itn, "app");
+            var order: *u32 = nil;
+            var count: u32 = 0;
+            val r: R.Result[bool, str] = plan_steps(?alloc, ?itn, ?m, ?names[0], 1, tl, "out/linux", "linux", "debug", ?order, ?count);
+            if (R.is_err[bool, str](r)) { code = 1; }
+            or {
+                var has_compile: bool = false; var has_gen: bool = false; var has_dep: bool = false; var has_winc: bool = false;
+                var gen_pos: i64 = -1; var dep_pos: i64 = -1;
+                var k: u32 = 0;
+                for (k < count) {
+                    val nm: str = idstr(?itn, m.steps[order[k]].name);
+                    if (str_equals(nm, "compile")) { has_compile = true; }
+                    if (str_equals(nm, "gen"))     { has_gen = true;  gen_pos = k::i64; }
+                    if (str_equals(nm, "dep"))     { has_dep = true;  dep_pos = k::i64; }
+                    if (str_equals(nm, "winc"))    { has_winc = true; }
+                    k = k + 1;
+                }
+                if (count != 3)                              { code = 1; }
+                if (!has_compile || !has_gen || !has_dep)    { code = 1; }
+                if (has_winc)                                { code = 1; }
+                if (dep_pos < 0 || gen_pos < 0 || dep_pos > gen_pos) { code = 1; }
+            }
+        }
+    }
+    arena.dnit(?ar);
+    ret code;
+}
+
+# demand: a `need` cycle (a->b->a, reached from an artifact need) is a hard error
+test "mach.lang.manifest.plan_steps:cycle" {
+    var backing: A.Allocator; var ar: arena.Arena; var alloc: A.Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nneed=[\"a\"]\n[step.a]\ncmd=\"x\"\nin=[\"i\"]\nout=[\"{project.out}/a.o\"]\nneed=[\"b\"]\n[step.b]\ncmd=\"y\"\nin=[\"i\"]\nout=[\"{project.out}/b.o\"]\nneed=[\"a\"]\n";
+    val rm: R.Result[Manifest, str] = tparse(?alloc, ?itn, src);
+    if (R.is_err[Manifest, str](rm)) { code = 1; }
+    or {
+        var m: Manifest = R.unwrap_ok[Manifest, str](rm);
+        val tl: *TargetDef = find_target_by_name(?itn, ?m, "linux");
+        if (tl == nil) { code = 1; }
+        or {
+            var names: [1]intern.StrId;
+            names[0] = intern_unwrap(?itn, "app");
+            var order: *u32 = nil;
+            var count: u32 = 0;
+            val r: R.Result[bool, str] = plan_steps(?alloc, ?itn, ?m, ?names[0], 1, tl, "out/linux", "linux", "debug", ?order, ?count);
+            if (R.is_ok[bool, str](r) || !str_equals(R.unwrap_err[bool, str](r), "mach.toml: cyclic dependency detected in build steps")) { code = 1; }
+        }
     }
     arena.dnit(?ar);
     ret code;
