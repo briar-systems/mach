@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.0] - 2026-07-10
+
+The shared-objects and debugging-experience release. `kind = "shared"` artifacts
+now link into real position-independent ELF shared objects — exporting
+`.dynsym`/`.hash`, with a `DT_SONAME` taken from the output basename — `dlopen`-able
+and consumable by another project through a `local` `[link.X]` entry. A release
+image is program-headers-only; a `-g` image carries a full descriptive section
+table, and `-g` stays byte-additive over the release image. And debugging under
+optimization is materially better: local variables survive phi merges,
+register-passed by-value aggregate parameters get honest frame locations, a
+breakpoint on a function lands after its parameters are homed, anonymous and
+generic-instance aggregates no longer emit empty type names, and `.debug_abbrev` is
+deduplicated across modules — 44,968 bytes down to 345 on the compiler itself. Built
+with mach 3.2.0.
+
+### Added
+- backend: **`kind = "shared"` artifacts link real ELF shared objects** —
+  position-independent, exporting `.dynsym`/`.hash` with a `DT_SONAME` from the
+  output basename, `dlopen`-able and consumable through a `local` `[link.X]` entry.
+  A release image is program-headers-only; a `-g` image carries a full descriptive
+  section table, and `-g` remains byte-additive over the release image (#1980,
+  #2004).
+
+### Fixed
+- debuginfo: **local variables survive phi merges** in optimized `-g` builds,
+  instead of losing their locations where control flow joins (#1904, #2005).
+- debuginfo: **register-passed by-value aggregate parameters** get honest frame
+  locations rather than register locations left stale after homing (#1954, #2006).
+- debuginfo: **`break <fn>` lands after parameter homing** — a `prologue_end` row
+  plus a `low_pc` anchor row put the breakpoint past the prologue (#2007, #2008).
+- debuginfo: **anonymous and generic-instance aggregates omit `DW_AT_name`**
+  instead of emitting an empty string (#1955, #2003).
+- debuginfo: **`.debug_abbrev` is deduplicated across modules** — 44,968 → 345
+  bytes on the compiler itself (#1708, #2009).
+
 ## [3.2.0] - 2026-07-10
 
 The strictness release. A declared manifest table is now **total** — every field
