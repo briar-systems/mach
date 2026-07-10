@@ -745,6 +745,79 @@ fun emit_global_store(st: *encode.EncodeState, symop: *mir.MirOperand, val_op: *
     ret encode.push_reloc(st, arm64_reloc_offset(pos), ldst_lo12_kind(w), symop.sym, symop.sym_off);
 }
 
+# emit `adrp Xd, :got:sym` with a zero page-delta placeholder and record the
+# RK_GOT_PAGE21 relocation at the instruction-word start. the GOT analogue of
+# emit_adrp_reloc: the page-high half of a GOT-slot address. the addend is always
+# zero - the slot holds the symbol's own base and any symbol addend is applied to
+# the loaded address afterward, since a GOT reloc cannot carry it. the caller pairs
+# it with the `ldr :got_lo12:` low half that dereferences the slot
+fun emit_adrp_got_reloc(st: *encode.EncodeState, rd: u32, sym: intern.StrId) R.Result[bool, str] {
+    val pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_adrp(rd));
+    ret encode.push_reloc(st, arm64_reloc_offset(pos), of.RK_GOT_PAGE21, sym, 0);
+}
+
+# a preemptible / imported symbol's address loaded GOT-indirect -
+# `adrp Xd, :got:sym` (RK_GOT_PAGE21) ; `ldr Xd, [Xd, :got_lo12:sym]` (RK_GOT_LO12).
+# the LDR dereferences the GOT slot, so Xd holds the symbol's runtime absolute
+# address, which the dynamic loader bound through an R_AARCH64_GLOB_DAT. a nonzero
+# addend rides a trailing `add Xd, Xd, #off` (the slot addresses the symbol base
+# only). this is the imported-data analogue of the absolute emit_global_addr
+fun emit_global_addr_got(st: *encode.EncodeState, rd: u32, symop: *mir.MirOperand) R.Result[bool, str] {
+    if (symop.sym == intern.STR_NIL) {
+        ret R.err[bool, str]("encode: GOT address-of has no resolved symbol name");
+    }
+    val ar: R.Result[bool, str] = emit_adrp_got_reloc(st, rd, symop.sym);
+    if (R.is_err[bool, str](ar)) { ret ar; }
+    val pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_ldst(ldst_base_scaled(8, true), rd, rd, 0));
+    val pr: R.Result[bool, str] = encode.push_reloc(st, arm64_reloc_offset(pos), of.RK_GOT_LO12, symop.sym, 0);
+    if (R.is_err[bool, str](pr)) { ret pr; }
+    if (symop.sym_off != 0) { emit_add_imm(st, rd, rd, symop.sym_off::i64); }
+    ret R.ok[bool, str](true);
+}
+
+# a GOT-indirect load - the imported-data analogue of emit_global_load. the
+# symbol's address is loaded from its GOT slot into the destination register, then
+# dereferenced in place at the access width. the destination doubles as the address
+# scratch (the GOT sequence and the value load chain through Rt), so no reserved
+# scratch is spent
+fun emit_global_load_got(st: *encode.EncodeState, rt: u32, symop: *mir.MirOperand, width: u8) R.Result[bool, str] {
+    var w: u8 = width;
+    if (w == 0) { w = 8; }
+    val ar: R.Result[bool, str] = emit_global_addr_got(st, rt, symop);
+    if (R.is_err[bool, str](ar)) { ret ar; }
+    emit_mem_access(st, rt, rt, 0, w, true);
+    ret R.ok[bool, str](true);
+}
+
+# a GOT-indirect store - the imported-data analogue of emit_global_store. the
+# stored value resolves first (the zero register for an immediate 0, IP1 for a
+# non-zero immediate, the value's own register otherwise) so materializing the
+# symbol's address into IP0 never clobbers it; then the address is loaded from the
+# GOT slot into IP0 and the value stored through it
+fun emit_global_store_got(st: *encode.EncodeState, symop: *mir.MirOperand, val_op: *mir.MirOperand, width: u8) R.Result[bool, str] {
+    var w: u8 = width;
+    if (w == 0) { w = 8; }
+
+    var rt: u32 = ZR;
+    if (val_op.kind == mir.MIR_OP_IMM) {
+        if (val_op.imm != 0) {
+            emit_movewide_seq(st, SCRATCH1, val_op.imm::u64, is64(width));
+            rt = SCRATCH1;
+        }
+    } or {
+        val rr: R.Result[i32, str] = req_gpr(val_op);
+        if (R.is_err[i32, str](rr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rr)); }
+        rt = R.unwrap_ok[i32, str](rr)::u32;
+    }
+
+    val ar: R.Result[bool, str] = emit_global_addr_got(st, SCRATCH0, symop);
+    if (R.is_err[bool, str](ar)) { ret ar; }
+    emit_mem_access(st, rt, SCRATCH0, 0, w, false);
+    ret R.ok[bool, str](true);
+}
+
 # a direct or indirect call. a MIR_OP_SYM callee emits `bl sym` with a
 # zero imm26 placeholder and records RK_PLT32 at the instruction-word start (the
 # linker maps it to CALL26; addend is the symbol's own constant only - no x86 -4
@@ -947,6 +1020,7 @@ fun encode_mov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) 
 # destination is a folded-global store: `adrp IP0, sym` + `str Xt, [IP0, :lo12:sym]`
 fun emit_store_mem(st: *encode.EncodeState, f: *mir.MirFunction, dst_mem: *mir.MirOperand, val_op: *mir.MirOperand, width: u8) R.Result[bool, str] {
     if (dst_mem.kind == mir.MIR_OP_SYM) {
+        if (dst_mem.sym_got) { ret emit_global_store_got(st, dst_mem, val_op, width); }
         ret emit_global_store(st, dst_mem, val_op, width);
     }
     val mr: R.Result[A64Mem, str] = resolve_mem(f, dst_mem);
@@ -1027,6 +1101,7 @@ fun encode_load(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
     val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
 
     if (src.kind == mir.MIR_OP_SYM) {
+        if (src.sym_got) { ret emit_global_load_got(st, rd, src, mi.src_width); }
         ret emit_global_load(st, rd, src, mi.src_width);
     }
     val mr: R.Result[A64Mem, str] = resolve_mem(f, src);
@@ -1057,6 +1132,7 @@ fun encode_addr(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
 
     val memop: *mir.MirOperand = ?mi.operands[1];
     if (memop.kind == mir.MIR_OP_SYM) {
+        if (memop.sym_got) { ret emit_global_addr_got(st, rd, memop); }
         ret emit_global_addr(st, rd, memop);
     }
     val mr: R.Result[A64Mem, str] = resolve_mem(f, memop);
@@ -4914,6 +4990,81 @@ test "mach.lang.target.isa.arm64.encode:call_global_emitters_record_relocs_plus_
     or {
         if (st.relocs[6].kind != of.RK_LDST32_LO12) { bad = 1; }
         if (st.relocs[6].offset != 28)              { bad = 1; }
+    }
+
+    encode.buf_dnit(?st.buf);
+    if (st.relocs != nil && st.reloc_cap > 0) {
+        A.deallocate[encode.PendingReloc](?alloc, st.relocs, st.reloc_cap::usize);
+    }
+    ret bad;
+}
+
+# the GOT-indirect emitters (a preemptible / imported symbol) drive the adrp+ldr
+# GOT sequence and record RK_GOT_PAGE21 / RK_GOT_LO12 at the instruction-word
+# starts, both addend zero (the slot holds the symbol base). the load derefs the
+# GOT-loaded address in place; the store resolves its value first then addresses
+# through IP0. the reloc fields are zero placeholders pre-link.
+# GOT emitters record GOT relocs + base words
+test "mach.lang.target.isa.arm64.encode:got_indirect_emitters_record_relocs_plus_base_words" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+    st.alloc       = ?alloc;
+    st.relocs      = nil;
+    st.reloc_count = 0;
+    st.reloc_cap   = 0;
+
+    val sym: intern.StrId = 7::intern.StrId;
+
+    # GOT address-of: adrp x0,:got:sym ; ldr x0,[x0,:got_lo12:sym] ->
+    # 0x90000000 ; 0xf9400000, RK_GOT_PAGE21 @0, RK_GOT_LO12 @4, both addend 0.
+    var ao: mir.MirOperand = mir.op_sym(sym, 0);
+    ao.sym_got = true;
+    emit_global_addr_got(?st, 0, ?ao);
+    if (read_word(?st.buf, 0) != 0x90000000) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0xF9400000) { bad = 1; }
+    if (st.reloc_count != 2)                 { bad = 1; }
+    or {
+        if (st.relocs[0].kind != of.RK_GOT_PAGE21) { bad = 1; }
+        if (st.relocs[0].offset != 0)              { bad = 1; }
+        if (st.relocs[0].addend != 0)              { bad = 1; }
+        if (st.relocs[1].kind != of.RK_GOT_LO12)   { bad = 1; }
+        if (st.relocs[1].offset != 4)              { bad = 1; }
+        if (st.relocs[1].addend != 0)              { bad = 1; }
+    }
+
+    # GOT load: adrp x0 ; ldr x0,[x0] (GOT) ; ldr x0,[x0] (deref) ->
+    # 0x90000000 ; 0xf9400000 ; 0xf9400000, RK_GOT_PAGE21 @8, RK_GOT_LO12 @12; the
+    # deref carries no reloc.
+    var lo: mir.MirOperand = mir.op_sym(sym, 0);
+    lo.sym_got = true;
+    emit_global_load_got(?st, 0, ?lo, 8);
+    if (read_word(?st.buf, 8)  != 0x90000000) { bad = 1; }
+    if (read_word(?st.buf, 12) != 0xF9400000) { bad = 1; }
+    if (read_word(?st.buf, 16) != 0xF9400000) { bad = 1; }
+    if (st.reloc_count != 4)                  { bad = 1; }
+    or {
+        if (st.relocs[2].kind != of.RK_GOT_PAGE21) { bad = 1; }
+        if (st.relocs[3].kind != of.RK_GOT_LO12)   { bad = 1; }
+        if (st.relocs[3].offset != 12)             { bad = 1; }
+    }
+
+    # GOT store: value x1 already in a register ; adrp x16 ; ldr x16,[x16] (GOT) ;
+    # str w1,[x16] -> 0x90000010 ; 0xf9400210 ; 0xb9000201, RK_GOT_PAGE21 @20,
+    # RK_GOT_LO12 @24; the store carries no reloc.
+    var so: mir.MirOperand = mir.op_sym(sym, 0);
+    so.sym_got = true;
+    var sv: mir.MirOperand = mir.op_preg(1);
+    emit_global_store_got(?st, ?so, ?sv, 4);
+    if (read_word(?st.buf, 20) != 0x90000010) { bad = 1; }
+    if (read_word(?st.buf, 24) != 0xF9400210) { bad = 1; }
+    if (read_word(?st.buf, 28) != 0xB9000201) { bad = 1; }
+    if (st.reloc_count != 6)                  { bad = 1; }
+    or {
+        if (st.relocs[4].kind != of.RK_GOT_PAGE21) { bad = 1; }
+        if (st.relocs[5].kind != of.RK_GOT_LO12)   { bad = 1; }
+        if (st.relocs[5].offset != 24)             { bad = 1; }
     }
 
     encode.buf_dnit(?st.buf);
