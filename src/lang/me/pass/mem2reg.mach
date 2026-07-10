@@ -158,6 +158,12 @@ fun promote_function(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
     val res_rename: R.Result[bool, str] = rename(?st);
     if (R.is_err[bool, str](res_rename)) { state_dnit(?st); ret res_rename; }
 
+    # #1904: with phis final and promoted memory stripped, birth a dbg-value at each
+    # merge-block phi that resolves a -g-linked local, so its binding is the phi across
+    # the merge. a no-op without -g (no alloca links) and for machine code (never lowers).
+    val res_births: R.Result[bool, str] = emit_phi_dbg_births(?st);
+    if (R.is_err[bool, str](res_births)) { state_dnit(?st); ret res_births; }
+
     state_dnit(?st);
     ret R.ok[bool, str](true);
 }
@@ -977,11 +983,10 @@ fun place_phi(st: *State, bid: id.BlockId, alloca_id: id.InstructionId) R.Result
         ret R.err[bool, str]("mem2reg: phi placed for a non-promotable alloca");
     }
 
-    # deferred (#1904): under -g, a promoted local's variable value at and after this
-    # merge is the phi result, so a dbg-value birth belongs here binding that variable
-    # to the phi. it is not emitted yet -- mem2reg has no alloca-to-source-variable
-    # link to name the variable -- so past a merge a binding may reflect the
-    # last-processed branch until #1904 lands.
+    # under -g, a promoted local's variable value at and after this merge is the phi
+    # result; the dbg-value birth binding that variable to the phi is emitted by
+    # emit_phi_dbg_births after rename, once the alloca's source-variable link (#1904)
+    # names the variable and the phi's result value is final.
     var phi: instruction.Instruction;
     phi.kind          = instruction.OP_PHI;
     phi.ty            = st.alloca_ty[ai];
@@ -1005,6 +1010,76 @@ fun place_phi(st: *State, bid: id.BlockId, alloca_id: id.InstructionId) R.Result
 
     val blk: *ir.Block = ?st.fn.blocks[bid::u32];
     ret ir.block_append_phi(st.m, blk, phi_id);
+}
+
+# birth a dbg-value at every merge-block phi that resolves a `-g`-linked promoted
+# alloca (#1904), so a source variable's binding at and after a control-flow merge is
+# the phi result rather than the last-processed predecessor's value
+#
+# Runs after rename (phi results final) and strip (block bodies compacted): for each
+# mem2reg phi whose alloca carries a source-variable link, an OP_DBG_VALUE binding
+# that variable to the phi result is prepended to the merge block's body -- position
+# 0, right after the phis, so the loclist opens the range at the block entry. The
+# alloca link is populated only under `-g`, so a non-debug build has no links, births
+# nothing, and stays byte-identical; OP_DBG_VALUE never lowers regardless.
+fun emit_phi_dbg_births(st: *State) R.Result[bool, str] {
+    val res_void: R.Result[type.IrTypeId, str] = type.intern_void(?st.m.types);
+    if (R.is_err[type.IrTypeId, str](res_void)) { ret R.err[bool, str](R.unwrap_err[type.IrTypeId, str](res_void)); }
+    val void_ty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_void);
+
+    var bi: u32 = 0;
+    for (bi < st.block_count) {
+        val blk: *ir.Block = ?st.fn.blocks[bi];
+        # phi ids are read from phis[]; births are prepended to instructions[], so the
+        # phi list this scans is never perturbed. snapshot the count all the same.
+        val pc: u32 = blk.phi_count;
+        var pi: u32 = 0;
+        for (pi < pc) {
+            val phi_id: id.InstructionId = blk.phis[pi];
+            pi = pi + 1;
+
+            if (phi_id::u32 >= st.phi_alloca_cap) { cnt; }
+            val alloca_id: id.InstructionId = st.phi_alloca[phi_id::u32];
+            if (alloca_id == id.INSTR_NIL) { cnt; }
+
+            val opt_dv: O.Option[*ir.DbgVar] = ir.alloca_dbg_var_get(st.fn, alloca_id);
+            if (O.is_none[*ir.DbgVar](opt_dv)) { cnt; }
+            var dv: ir.DbgVar = @O.unwrap[*ir.DbgVar](opt_dv);
+
+            val opt_phi: O.Option[*instruction.Instruction] = ir.instruction_get(st.fn, phi_id);
+            if (O.is_none[*instruction.Instruction](opt_phi)) { cnt; }
+            val phi_ty: type.IrTypeId = O.unwrap[*instruction.Instruction](opt_phi).ty;
+
+            # OP_DBG_VALUE operand is the phi result value; the instruction owns its
+            # 1-slot operand array (instruction_add copies the record, keeps the ptr).
+            val res_ops: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 1::usize);
+            if (R.is_err[*value.Value, str](res_ops)) { ret R.err[bool, str](R.unwrap_err[*value.Value, str](res_ops)); }
+            val ops: *value.Value = R.unwrap_ok[*value.Value, str](res_ops);
+            ops[0] = value.instr(phi_id, phi_ty);
+
+            var inst: instruction.Instruction;
+            inst.kind          = instruction.OP_DBG_VALUE;
+            inst.ty            = void_ty;
+            inst.operands      = ops;
+            inst.operand_count = 1;
+            inst.operand_cap   = 1;
+            inst.flags         = 0;
+            inst.aux_ty        = type.IRT_NIL;
+            inst.loc           = source.loc_nil();
+
+            val res_id: R.Result[id.InstructionId, str] = ir.instruction_add(st.m, st.fn, inst);
+            if (R.is_err[id.InstructionId, str](res_id)) { ret R.err[bool, str](R.unwrap_err[id.InstructionId, str](res_id)); }
+            val dbg_id: id.InstructionId = R.unwrap_ok[id.InstructionId, str](res_id);
+
+            val res_rec: R.Result[bool, str] = map.insert[id.InstructionId, ir.DbgVar](?st.fn.dbg_vars, dbg_id, dv);
+            if (R.is_err[bool, str](res_rec)) { ret R.err[bool, str](R.unwrap_err[bool, str](res_rec)); }
+
+            val res_pre: R.Result[bool, str] = ir.block_prepend_instr(st.m, ?st.fn.blocks[bi], dbg_id);
+            if (R.is_err[bool, str](res_pre)) { ret R.err[bool, str](R.unwrap_err[bool, str](res_pre)); }
+        }
+        bi = bi + 1;
+    }
+    ret R.ok[bool, str](true);
 }
 
 # rename traversal context, threaded through the dominator-tree walk
@@ -1632,5 +1707,96 @@ test "mach.lang.me.pass.mem2reg.run:dbg_value_is_not_an_escape" {
     # the block.
     if (R.is_err[bool, str](run(?m)))          { ret 1; }
     if (live_alloca_count(fn, entry_blk) != 0) { ret 1; }
+    ret 0;
+}
+
+# #1904: a local written on both arms of a diamond and read after the merge promotes to
+# a phi at the merge; when the alloca carries a source-variable link, mem2reg births an
+# OP_DBG_VALUE at the merge binding that variable to the phi result. this pins the birth
+# (present, at the merge block, operand = the phi, identity copied from the link).
+test "mach.lang.me.pass.mem2reg.run:phi_dbg_birth" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_module: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_module)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_module);
+
+    val res_i64: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64)) { ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
+
+    val res_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](res_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val rb0: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    val rb1: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    val rb2: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    val rb3: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rb0) || R.is_err[id.BlockId, str](rb1) || R.is_err[id.BlockId, str](rb2) || R.is_err[id.BlockId, str](rb3)) { ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](rb0);
+    val bb1:   id.BlockId = R.unwrap_ok[id.BlockId, str](rb1);
+    val bb2:   id.BlockId = R.unwrap_ok[id.BlockId, str](rb2);
+    val merge: id.BlockId = R.unwrap_ok[id.BlockId, str](rb3);
+
+    # entry: x = alloca; cbr 1, bb1, bb2   (a diamond over the promoted local x)
+    builder.set_block(?bld, entry);
+    val res_alloca: R.Result[value.Value, str] = builder.emit_alloca(?bld, i64t, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](res_alloca)) { ret 1; }
+    val x: value.Value = R.unwrap_ok[value.Value, str](res_alloca);
+    # a -g alloca -> source-variable link (name is a distinguishable non-nil StrId)
+    var dv: ir.DbgVar;
+    dv.name     = 7::intern.StrId;
+    dv.ty       = i64t;
+    dv.ty_sem   = semtype.TYPE_NIL;
+    dv.is_param = false;
+    dv.scope    = 0;
+    if (R.is_err[bool, str](ir.record_alloca_dbg_var(fn, x.data.instr, dv))) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, value.const_int(1, i64t), bb1, bb2))) { ret 1; }
+
+    # bb1: store 10 -> x; br merge
+    builder.set_block(?bld, bb1);
+    if (R.is_err[bool, str](builder.emit_store(?bld, value.const_int(10, i64t), x))) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_br(?bld, merge))) { ret 1; }
+
+    # bb2: store 20 -> x; br merge
+    builder.set_block(?bld, bb2);
+    if (R.is_err[bool, str](builder.emit_store(?bld, value.const_int(20, i64t), x))) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_br(?bld, merge))) { ret 1; }
+
+    # merge: v = load x; ret v
+    builder.set_block(?bld, merge);
+    val res_load: R.Result[value.Value, str] = builder.emit_load(?bld, x, i64t);
+    if (R.is_err[value.Value, str](res_load)) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?bld, R.unwrap_ok[value.Value, str](res_load)))) { ret 1; }
+
+    if (R.is_err[bool, str](run(?m))) { ret 1; }
+
+    # the merge got a phi for x
+    val mblk: *ir.Block = ?fn.blocks[merge::u32];
+    if (mblk.phi_count < 1) { ret 1; }
+    val phi_id: id.InstructionId = mblk.phis[0];
+
+    # a birth binding x to that phi sits in the merge body, and carries the linked identity
+    var found: bool = false;
+    var i: u32 = 0;
+    for (i < mblk.instr_count) {
+        val iid: id.InstructionId = mblk.instructions[i];
+        val oi: O.Option[*instruction.Instruction] = ir.instruction_get(fn, iid);
+        if (O.is_some[*instruction.Instruction](oi)) {
+            val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](oi);
+            if (inst.kind == instruction.OP_DBG_VALUE && inst.operand_count >= 1) {
+                val op: value.Value = inst.operands[0];
+                if (op.kind == value.VAL_INSTR && op.data.instr == phi_id) {
+                    val odv: O.Option[*ir.DbgVar] = ir.dbg_var_get(fn, iid);
+                    if (O.is_some[*ir.DbgVar](odv) && O.unwrap[*ir.DbgVar](odv).name == 7::intern.StrId) { found = true; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if (!found) { ret 1; }
     ret 0;
 }
