@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.2.0] - 2026-07-10
+
+The strictness release. A declared manifest table is now **total** — every field
+is spelled or it is a parse error — so there are no silent defaults to memorize:
+`[project]` is exactly `id`/`version`/`src`/`out`, a filter axis takes a canonical
+`os`/`isa`/`abi` value or `"*"` (a typo like `"windoze"` is rejected rather than
+silently never matching), `[]` says "none" out loud, and the path template set
+closes to `{project.out}`/`{target.name}`/`{profile.name}`. Totality is enforced on
+the manifest being **built**; a **dependency's** manifest parses permissively, read
+only for its export surface, so historical commit pins keep resolving and a project
+never waits on its dependencies to migrate. `static` artifacts now emit a real `ar`
+archive with a symbol index at their declared `out`. The manifest and CLI
+documentation are rewritten against the landed schema, and the pre-flag-day CLI
+leftovers — `--release`, `--no-emit-ir`/`--no-emit-asm`, and the `[project].dep`
+read — are gone. The thirteen first-party repositories were swept to the strict
+shape in lockstep, so no in-house consumer breaks. Built with mach 3.1.0.
+
+> **Breaking:** a root manifest that relied on lenient parsing must now be total —
+> every field of every declared table spelled, canonical filter values, and only
+> the closed template set. Dependency manifests are unaffected (they parse
+> permissively for their export surface). Every first-party repository was
+> converted by the ecosystem sweep (#1971, #1979).
+
+### Added
+- manifest: **`static` artifacts emit a real `ar` archive** with a symbol index at
+  the declared `out`, the deliverable a consumer links as a `.a` (`shared` remains
+  phase 2) (#1980, #1997).
+
+### Changed
+- manifest: **no-defaults totality on the root manifest** (the #1964 flag-day) — a
+  declared table spells every field or it is a parse error; `[project]` is trimmed
+  to `id`/`version`/`src`/`out`; filter axes take a canonical value or `"*"`; the
+  template set closes to `{project.out}`/`{target.name}`/`{profile.name}`; and
+  `emit_ir`/`emit_asm` become CLI-only (#1971, #1996).
+- manifest: a **dependency's manifest parses permissively** — read only for its
+  export surface (project id, `export = true` link entries, and the steps they
+  demand) — so a dependency's own migration state never gates a consumer and
+  historical commit pins keep resolving. Unknown keys are still rejected on both
+  paths (#1971, #1996).
+- doc: **`doc/manifest.md` and `doc/cli.md` rewritten** against the landed strict
+  schema, and the `mach help` text corrected (#1977, #1998).
+- ecosystem: the **thirteen first-party repositories** were migrated to the strict
+  manifest shape in lockstep with the flag-day, so no in-house consumer breaks
+  (#1979).
+
+### Removed
+- cli: **`--release`** (rejected with a `--profile release` hint), **`--no-emit-ir`
+  / `--no-emit-asm`** (emission is CLI-only via `--emit-ir`/`--emit-asm`), and the
+  **`[project].dep` read** (the store is the hardcoded `dep/` convention) — the
+  pre-flag-day leftovers. `-O0`/`-O1`/`-O2` remain as per-invocation opt overrides
+  (#1999, #2000).
+
 ## [3.1.0] - 2026-07-09
 
 The release that makes the V2 build system work as designed. The `[step.X]`
