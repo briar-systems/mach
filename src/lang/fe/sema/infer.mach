@@ -616,6 +616,13 @@ fun infer_binary(sc: *context.SemaContext, eid: id.ExprId, b: *expr.ExprBinary, 
     val lhs_secret:    bool = type.is_secret(?sc.s.types, lt);
     val either_secret: bool = lhs_secret || type.is_secret(?sc.s.types, rt);
 
+    # vector operands follow the lane-wise op table (#1965), a separate ladder
+    # from the scalar rules below: exact same-shape match, no scalar<->vector
+    # mixing, and no literal unification into a vector.
+    if (type.is_vector(?sc.s.types, lt) || type.is_vector(?sc.s.types, rt)) {
+        ret infer_vector_binary(sc, b.op, lt, rt, either_secret, span);
+    }
+
     # GATE: `/` and `%` are variable-latency on every target (the leakage model
     # always observes them), so a secret operand is a compile error here. the
     # float-default and integer-multiply gates are target-CT-capability dependent
@@ -688,6 +695,90 @@ fun infer_binary(sc: *context.SemaContext, eid: id.ExprId, b: *expr.ExprBinary, 
     # arithmetic: ADD, SUB, MUL, DIV, MOD
     if (!operands_ok || !is_numeric(sc, lt)) { type_mismatch(sc, span, lt, rt); ret type.TYPE_ERROR; }
     ret join_secret(sc, lt, either_secret);
+}
+
+# the lane-wise binary operator table for vector operands (#1965)
+#
+# Operands must be the same vector shape (exact TypeId match, no implicit casts,
+# no scalar<->vector mixing). The honest table of what is 1:1 on the SSE2/NEON
+# baselines: float lanes `+ - * /`; integer lanes `+ -` at all widths and `*` on
+# 16-bit lanes only; bitwise `& | ^ << >>` on integer lanes; comparisons yield
+# the same-shape unsigned mask vector. There is no vector `%` and no integer
+# vector `/`. Result secrecy is the join of the operands'.
+# ---
+# sc:            sema context
+# op:            the binary operator
+# lt:            the left operand type
+# rt:            the right operand type
+# either_secret: whether either operand was secret
+# span:          the operator span for diagnostics
+# ret:           the result TypeId, or TYPE_ERROR
+fun infer_vector_binary(sc: *context.SemaContext, op: expr.BinOp, lt: type.TypeId, rt: type.TypeId, either_secret: bool, span: token.Span) type.TypeId {
+    val lbase: type.TypeId = type.strip_secret(?sc.s.types, lt);
+    val rbase: type.TypeId = type.strip_secret(?sc.s.types, rt);
+
+    # both operands must be vectors of exactly the same shape.
+    if (!type.is_vector(?sc.s.types, lt) || !type.is_vector(?sc.s.types, rt) || lbase != rbase) {
+        type_mismatch(sc, span, lt, rt);
+        ret type.TYPE_ERROR;
+    }
+
+    val d: type.PrimDesc = type.prim_desc(type.vector_element(?sc.s.types, lbase));
+    val float_lane: bool = d.class == type.PRIM_CLASS_FLOAT;
+    val int_lane:   bool = d.class == type.PRIM_CLASS_INT;
+
+    # comparisons -> same-shape unsigned mask vector (all-ones / all-zeros lanes).
+    if (op == expr.BIN_EQ || op == expr.BIN_NEQ || op == expr.BIN_LT
+        || op == expr.BIN_LEQ || op == expr.BIN_GT || op == expr.BIN_GEQ) {
+        val mr: R.Result[type.TypeId, str] = type.vector_mask(?sc.s.types, lbase);
+        if (R.is_err[type.TypeId, str](mr)) { ret type.TYPE_ERROR; }
+        ret join_secret(sc, R.unwrap_ok[type.TypeId, str](mr), either_secret);
+    }
+
+    # bitwise and shifts require integer lanes.
+    if (op == expr.BIN_BIT_AND || op == expr.BIN_BIT_OR || op == expr.BIN_BIT_XOR
+        || op == expr.BIN_SHL || op == expr.BIN_SHR) {
+        if (!int_lane) {
+            context.report(sc, span, "type mismatch: bitwise vector operands must have integer lanes");
+            ret type.TYPE_ERROR;
+        }
+        ret join_secret(sc, lbase, either_secret);
+    }
+
+    # no vector `%` on any lane type.
+    if (op == expr.BIN_MOD) {
+        context.report(sc, span, "vector `%` is not supported");
+        ret type.TYPE_ERROR;
+    }
+
+    # `/` is float-lane only; integer vector division is not supported.
+    if (op == expr.BIN_DIV) {
+        if (!float_lane) {
+            context.report(sc, span, "integer vector `/` is not supported");
+            ret type.TYPE_ERROR;
+        }
+        ret join_secret(sc, lbase, either_secret);
+    }
+
+    # `*` is float lanes, or 16-bit integer lanes only (pmulld is out of baseline).
+    if (op == expr.BIN_MUL) {
+        if (float_lane || (int_lane && d.bits == 16)) {
+            ret join_secret(sc, lbase, either_secret);
+        }
+        context.report(sc, span, "vector `*` on this lane width is not supported (integer multiply is 16-bit lanes only)");
+        ret type.TYPE_ERROR;
+    }
+
+    # `+` / `-` on float or integer lanes at any width.
+    if (op == expr.BIN_ADD || op == expr.BIN_SUB) {
+        if (float_lane || int_lane) { ret join_secret(sc, lbase, either_secret); }
+        type_mismatch(sc, span, lt, rt);
+        ret type.TYPE_ERROR;
+    }
+
+    # `&&` / `||` and anything else are not lane-wise vector operators.
+    context.report(sc, span, "operator not supported on vector operands");
+    ret type.TYPE_ERROR;
 }
 
 # apply the secrecy JOIN to a binary/unary result base type (#1645)
@@ -846,6 +937,15 @@ fun infer_unary(sc: *context.SemaContext, u: *expr.ExprUnary, span: token.Span) 
         ret join_secret(sc, prim_or_error(sc, type.TYPE_U8), ot_secret);
     }
     if (u.op == expr.UN_BIT_NOT) {
+        # `~v` on an integer-lane vector yields the operand vector type (#1965).
+        if (type.is_vector(?sc.s.types, ot)) {
+            val base: type.TypeId = type.strip_secret(?sc.s.types, ot);
+            if (type.prim_desc(type.vector_element(?sc.s.types, base)).class != type.PRIM_CLASS_INT) {
+                context.report(sc, span, "type mismatch: unary ~ requires integer lanes");
+                ret type.TYPE_ERROR;
+            }
+            ret join_secret(sc, base, ot_secret);
+        }
         if (!is_integer(sc, ot)) { context.report(sc, span, "type mismatch: unary ~ requires an integer operand"); ret type.TYPE_ERROR; }
         ret join_secret(sc, ot, ot_secret);
     }
@@ -1404,9 +1504,52 @@ fun infer_index(sc: *context.SemaContext, ix: *expr.ExprIndex, span: token.Span)
     val it: type.TypeId = infer_expr(sc, ix.index);
     if (ot == type.TYPE_ERROR || it == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
 
+    # lane access `v[i]` on a vector: the index must be a comptime constant in
+    # bounds, and the result is the lane scalar (#1965). a dynamic index is a
+    # defined error, deferred by design (a memory round-trip breaks 1:1 on SSE2).
+    if (type.is_vector(?sc.s.types, ot)) {
+        ret infer_vector_lane(sc, ix, ot, span);
+    }
+
     val r: O.Option[type.TypeId] = check.check_index(sc, ot, it, span);
     if (O.is_none[type.TypeId](r)) { ret type.TYPE_ERROR; }
     ret O.unwrap[type.TypeId](r);
+}
+
+# lane access on a vector: demand a comptime-constant, in-bounds index and yield
+# the lane scalar, joining any secrecy on the vector onto the result (#1965)
+# ---
+# sc:   sema context
+# ix:   the index payload
+# ot:   the (possibly secret) vector object type
+# span: the index span for diagnostics
+# ret:  the lane scalar TypeId, or TYPE_ERROR
+fun infer_vector_lane(sc: *context.SemaContext, ix: *expr.ExprIndex, ot: type.TypeId, span: token.Span) type.TypeId {
+    val base:      type.TypeId = type.strip_secret(?sc.s.types, ot);
+    val lanes:     u32         = type.vector_lanes(?sc.s.types, base);
+    val lane_kind: type.TypeKind = type.vector_element(?sc.s.types, base);
+    val lane_ty:   type.TypeId = prim_or_error(sc, lane_kind);
+
+    val cr: R.Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, ix.index, ?sc.s.interner);
+    if (R.is_err[comptime.CTValue, str](cr)) {
+        context.report(sc, span, "dynamic lane index not supported: a vector lane index must be a comptime constant");
+        ret type.TYPE_ERROR;
+    }
+    val cv: comptime.CTValue = R.unwrap_ok[comptime.CTValue, str](cr);
+    if (cv.kind != comptime.CT_KIND_INT) {
+        context.report(sc, span, "dynamic lane index not supported: a vector lane index must be a comptime constant");
+        ret type.TYPE_ERROR;
+    }
+    if (comptime.ct_is_negative(cv)) {
+        context.report(sc, span, "vector lane index out of bounds: index must be non-negative");
+        ret type.TYPE_ERROR;
+    }
+    if (cv.data.i:~u64 >= lanes::u64) {
+        context.report(sc, span, "vector lane index out of bounds for the lane count");
+        ret type.TYPE_ERROR;
+    }
+
+    ret join_secret(sc, lane_ty, type.is_secret(?sc.s.types, ot));
 }
 
 # MEMBER: a member access is either a qualified module reference `alias.symbol`
