@@ -78,8 +78,7 @@ git = "https://github.com/briar-systems/mach-std"
 ref = "branch/main"
 ```
 
-`[link.X]` and `[step.X]` are shown under [Link requirements](#linkx--link-requirements)
-and [Build steps](#stepx--build-steps).
+`[link.X]` and `[step.X]` each have their own section below.
 
 ## `[project]`
 
