@@ -68,7 +68,7 @@ debug = true                           # emit debug info for this profile
 [artifact.demo]                        # a produced artifact
 kind    = "bin"                        # "bin" | "static" | "shared"
 entry   = "main.mach"                  # entry source, relative to src
-out     = "{project.out}/bin/demo"     # this artifact's output path
+out     = "bin/demo"                   # output path, relative to the project out
 targets = ["*"]                        # which declared targets build it ("*" = all)
 link    = []                           # [link.X] names this artifact links
 need    = []                           # [step.X] names this artifact demands directly
@@ -169,7 +169,7 @@ reads the selected artifact's name.
 |-----------|----------|---------|
 | `kind`    | yes | `"bin"`, `"static"`, or `"shared"` (see below). |
 | `entry`   | yes | Entry source, relative to the project `src` dir (e.g. `main.mach` for `src/main.mach`). The entry module's FQN is `<id>.<entry without .mach>`, `/` turned into `.`. |
-| `out`     | yes | This artifact's output path, a template (see [Path templates](#path-templates)). An executable extension, where wanted, is written literally into this path. |
+| `out`     | yes | This artifact's output path, **relative to the expanded project `out`** and rooted there automatically — write `bin/demo`, not `{project.out}/bin/demo`. An executable extension, where wanted, is written literally here. |
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
 | `link`    | yes | Array of `[link.X]` names this artifact links (see below). `[]` for none. |
 | `need`    | yes | Array of `[step.X]` names this artifact demands directly, for step outputs that are not themselves link inputs. `[]` for none. |
@@ -289,12 +289,18 @@ entries demand. Nothing else in a dependency's manifest applies to consumers.
 
 ## Path templates
 
-Output paths and `cmd`s come only from the declared templates, expanded over a
-closed, final set of three variables:
+Paths and `cmd`s expand over a closed, final set of three variables:
 
-- `{project.out}` — the root project's expanded `[project].out`.
+- `{project.out}` — the **root** project's expanded `[project].out`, in every
+  manifest of the closure.
 - `{target.name}` — the resolved target name (never the literal `native`).
 - `{profile.name}` — the selected profile name.
+
+An artifact's `out` is relative to the expanded project `out` and is rooted there
+automatically — write `bin/demo`, not `{project.out}/bin/demo`. Step `out` lists
+and local link `path`s are **not** auto-rooted: they name `{project.out}`
+explicitly, which is what homes a dependency's build products into the *consumer's*
+output tree rather than the dependency's checkout.
 
 There are no `{name}`/`{ext}` or bare `{target}`/`{profile}` aliases. An
 unresolvable `{...}` reference, or an unterminated `{`, is a strict-parse error.
@@ -387,7 +393,7 @@ export = false
 [artifact.demo]
 kind    = "bin"
 entry   = "main.mach"
-out     = "{project.out}/bin/demo"
+out     = "bin/demo"
 targets = ["linux", "windows"]
 link    = ["shim", "shim-x11", "shim-win32", "gl"]
 need    = []
@@ -436,28 +442,38 @@ applies to both.
 
 ## Worked example: a C-binding dependency's export
 
-`mach-glfw` exports only its `system`/`framework` link entries — a consumer that
-imports its modules inherits every `export = true` entry that matches the build:
+`mach-glfw` exports its `system`/`framework` link entries — a consumer that imports
+its modules inherits every `export = true` entry that matches the build: linux and
+darwin pull the `glfw` system library, a windows build pulls `glfw3.dll`, and the
+darwin frameworks apply only on darwin.
 
 ```toml
 [project]
 id      = "glfw"
-version = "0.2.1"
+version = "0.3.0"
 src     = "src"
 out     = "out/{target.name}/{profile.name}"
 
 [link.glfw]
 source = "system"
 name   = "glfw"
-os     = "*"
+os     = ["linux", "darwin"]
 isa    = "*"
 abi    = "*"
 export = true
 
-[link.cocoa]
+[link.glfw-win]
+source = "system"
+name   = "glfw3.dll"
+os     = ["windows"]
+isa    = "*"
+abi    = "*"
+export = true
+
+[link.Cocoa]
 source = "framework"
 name   = "Cocoa"
-os     = "darwin"
+os     = ["darwin"]
 isa    = "*"
 abi    = "*"
 export = true
