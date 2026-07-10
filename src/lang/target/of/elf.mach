@@ -4872,6 +4872,149 @@ test "mach.lang.target.of.elf.emit_pie_exec:static_pie_layout" {
     ret 0;
 }
 
+# emit_shared writes an ET_DYN shared object that exports its defined globals: an
+# ET_DYN header with no entry and no PT_INTERP, a trailing RW PT_GNU_STACK (so a
+# loader accepts it), a .dynamic naming the object via DT_SONAME (the output
+# basename) and locating the .dynsym/.dynstr/.hash, and a .dynsym whose entries are
+# GLOBAL/defined (st_shndx != UNDEF) at the exports' link-time vaddrs. this is the
+# #1980 phase-2 export contract asserted on the emitted bytes.
+test "mach.lang.target.of.elf.emit_shared:exports_and_soname" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id            = isa.ARCH_X86_64;
+    isa_vt.elf_machine   = 62;       # EM_X86_64
+    isa_vt.pointer_width = 8;
+
+    # one executable load segment holding two exported functions.
+    var text: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text[k] = 0x90; k = k + 1; }
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = 0x401000; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text[0];
+
+    val add_r: R.Result[intern.StrId, str] = intern.intern(?i, "add_fn");
+    val mul_r: R.Result[intern.StrId, str] = intern.intern(?i, "mul_fn");
+    if (R.is_err[intern.StrId, str](add_r) || R.is_err[intern.StrId, str](mul_r)) { ret 1; }
+    var exports: [2]of.ExportSym;
+    exports[0].name = R.unwrap_ok[intern.StrId, str](add_r); exports[0].vaddr = 0x401000; exports[0].is_func = true;
+    exports[1].name = R.unwrap_ok[intern.StrId, str](mul_r); exports[1].vaddr = 0x401008; exports[1].is_func = true;
+
+    # a self-contained shared object: position-independent, no base relocations.
+    var dyn: of.DynamicInfo;
+    dyn.libs = nil;            dyn.lib_count = 0;
+    dyn.imports = nil;         dyn.import_count = 0;
+    dyn.interp = intern.STR_NIL;
+    dyn.base_relocs = nil;     dyn.base_reloc_count = 0;
+    dyn.pie = true;
+
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "elf_shared");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val tpath: str = filesystem.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_shared(?alloc, ?i, ?isa_vt, ?segs[0], 1, 4096, ?exports[0], 2, ?dyn, nil::*of.Section, 0, tpath::*u8);
+    if (R.is_err[bool, str](em)) { filesystem.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tpath);
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_err[filesystem.Buffer, str](rb)) { ret 1; }
+    val buf: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rb);
+
+    var bad: bool = false;
+
+    # ET_DYN, no entry point.
+    if (bin.read_u16_le(buf.data, 16) != ET_DYN) { bad = true; }
+    if (bin.read_u64_le(buf.data, 24) != 0)      { bad = true; }
+
+    # walk the program headers: PT_DYNAMIC present, PT_INTERP absent, PT_GNU_STACK
+    # present and RW (not executable).
+    val e_phoff: usize = bin.read_u64_le(buf.data, 32)::usize;
+    val e_phnum: usize = bin.read_u16_le(buf.data, 56)::usize;
+    var dyn_foff: usize = 0;
+    var have_interp: bool = false;
+    var gnu_stack_flags: u32 = 0;
+    var have_gnu_stack: bool = false;
+    var ph: usize = 0;
+    for (ph < e_phnum) {
+        val po: usize = e_phoff + ph * PHDR_SIZE;
+        val pt: u32 = bin.read_u32_le(buf.data, po);
+        if (pt == PT_DYNAMIC)   { dyn_foff = bin.read_u64_le(buf.data, po + 8)::usize; }
+        if (pt == PT_INTERP)    { have_interp = true; }
+        if (pt == PT_GNU_STACK) { have_gnu_stack = true; gnu_stack_flags = bin.read_u32_le(buf.data, po + 4); }
+        ph = ph + 1;
+    }
+    if (have_interp)     { bad = true; }
+    if (dyn_foff == 0)   { bad = true; }
+    if (!have_gnu_stack) { bad = true; }
+    if (gnu_stack_flags != (PF_R | PF_W)) { bad = true; }
+
+    # .dynamic: DT_SONAME + the table-locating tags.
+    var soname_off: u64 = 0xFFFFFFFFFFFFFFFF;
+    var strtab_va:  u64 = 0;
+    var symtab_va:  u64 = 0;
+    var have_hash:  bool = false;
+    var syment:     u64 = 0;
+    var d: usize = dyn_foff;
+    var seen: u32 = 0;
+    for (seen < 32) {
+        val tag: u64 = bin.read_u64_le(buf.data, d);
+        val v:   u64 = bin.read_u64_le(buf.data, d + 8);
+        if (tag == DT_SONAME) { soname_off = v; }
+        if (tag == DT_STRTAB) { strtab_va = v; }
+        if (tag == DT_SYMTAB) { symtab_va = v; }
+        if (tag == DT_HASH)   { have_hash = true; }
+        if (tag == DT_SYMENT) { syment = v; }
+        if (tag == DT_NULL) { seen = 32; } or { d = d + DYN_SIZE; seen = seen + 1; }
+    }
+    if (soname_off == 0xFFFFFFFFFFFFFFFF) { bad = true; }
+    if (strtab_va == 0) { bad = true; }
+    if (symtab_va == 0) { bad = true; }
+    if (!have_hash)     { bad = true; }
+    if (syment != 24)   { bad = true; }
+
+    # map the .dynstr / .dynsym vaddrs to file offsets through the containing PT_LOAD.
+    var strtab_off: usize = 0;
+    var symtab_off: usize = 0;
+    ph = 0;
+    for (ph < e_phnum) {
+        val po: usize = e_phoff + ph * PHDR_SIZE;
+        if (bin.read_u32_le(buf.data, po) == PT_LOAD) {
+            val pf:  u64 = bin.read_u64_le(buf.data, po + 8);
+            val pv:  u64 = bin.read_u64_le(buf.data, po + 16);
+            val psz: u64 = bin.read_u64_le(buf.data, po + 32);
+            if (strtab_va >= pv && strtab_va < pv + psz) { strtab_off = (pf + (strtab_va - pv))::usize; }
+            if (symtab_va >= pv && symtab_va < pv + psz) { symtab_off = (pf + (symtab_va - pv))::usize; }
+        }
+        ph = ph + 1;
+    }
+    if (strtab_off == 0 || symtab_off == 0) { bad = true; }
+    or {
+        # DT_SONAME resolves to the output basename in .dynstr.
+        val sn: str = ((buf.data::usize + strtab_off + soname_off::usize)::*u8)::str;
+        if (!str_equals(sn, so_basename(tpath::*u8))) { bad = true; }
+
+        # .dynsym[1] and [2]: GLOBAL/FUNC, defined (st_shndx != UNDEF), at the export vaddrs.
+        val s1: usize = symtab_off + SYM_SIZE;
+        val s2: usize = symtab_off + 2 * SYM_SIZE;
+        if (buf.data[s1 + 4] != ((STB_GLOBAL << 4) | STT_FUNC)) { bad = true; }
+        if (bin.read_u16_le(buf.data, s1 + 6) == 0)             { bad = true; }
+        if (bin.read_u64_le(buf.data, s1 + 8) != 0x401000)      { bad = true; }
+        if (bin.read_u64_le(buf.data, s2 + 8) != 0x401008)      { bad = true; }
+
+        # the first export's name resolves to "add_fn".
+        val n1_off: u64 = bin.read_u32_le(buf.data, s1)::u64;
+        val n1: str = ((buf.data::usize + strtab_off + n1_off::usize)::*u8)::str;
+        if (!str_equals(n1, "add_fn")) { bad = true; }
+    }
+
+    if (bad) { ret 1; }
+    ret 0;
+}
+
 # emit_pie_exec covers exactly the read-only-natured segment that carries a base
 # relocation (`.data.rel.ro`, holding relocated constants) with a PT_GNU_RELRO, forcing
 # it R+W at load so the self-reloc can slide its slots, and leaves pure `.rodata` (a
@@ -5362,6 +5505,94 @@ test "mach.lang.target.of.elf.emit_pie_exec:debug_sections_trailing_nonloaded" {
             if (sh_off >= pf && sh_off < pf + psz) { bad = true; }
         }
         ph = ph + 1;
+    }
+
+    if (bad) { ret 1; }
+    ret 0;
+}
+
+# emit_shared appends debug sections to a trailing section-header table that lies
+# outside every PT_LOAD, so building a shared object with `-g` never changes its
+# loadable image - the #1980-phase-2 slice of the standing -g byte-additivity rule.
+# falsifies a shared writer that maps debug into a load segment.
+test "mach.lang.target.of.elf.emit_shared:debug_additive_nonloaded" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id            = isa.ARCH_X86_64;
+    isa_vt.elf_machine   = 62;
+    isa_vt.pointer_width = 8;
+
+    var text: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text[k] = 0x90; k = k + 1; }
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = 0x401000; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text[0];
+
+    val add_r: R.Result[intern.StrId, str] = intern.intern(?i, "add_fn");
+    if (R.is_err[intern.StrId, str](add_r)) { ret 1; }
+    var exports: [1]of.ExportSym;
+    exports[0].name = R.unwrap_ok[intern.StrId, str](add_r); exports[0].vaddr = 0x401000; exports[0].is_func = true;
+
+    var dyn: of.DynamicInfo;
+    dyn.libs = nil;          dyn.lib_count = 0;
+    dyn.imports = nil;       dyn.import_count = 0;
+    dyn.interp = intern.STR_NIL;
+    dyn.base_relocs = nil;   dyn.base_reloc_count = 0;
+    dyn.pie = true;
+
+    var info_bytes: [4]u8;
+    info_bytes[0] = 0xDE; info_bytes[1] = 0xAD; info_bytes[2] = 0xBE; info_bytes[3] = 0xEF;
+    val nm_info: R.Result[intern.StrId, str] = intern.intern(?i, ".debug_info");
+    if (R.is_err[intern.StrId, str](nm_info)) { ret 1; }
+    var dbg: [1]of.Section;
+    dbg[0].name = R.unwrap_ok[intern.StrId, str](nm_info); dbg[0].kind = of.SK_DEBUG;
+    dbg[0].bytes = ?info_bytes[0]; dbg[0].len = 4; dbg[0].align = 1;
+
+    # emit the same shared object (one output path, so one soname) twice: once with
+    # the debug section, once without. read_all_sized copies the bytes out, so the
+    # first image stays valid after the second emit overwrites the file.
+    val tf_r: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "elf_shared_add");
+    if (R.is_err[filesystem.TempFile, str](tf_r)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](tf_r);
+    val tp: str = filesystem.temp_path(?tf);
+
+    val e1: R.Result[bool, str] = emit_shared(?alloc, ?i, ?isa_vt, ?segs[0], 1, 4096, ?exports[0], 1, ?dyn, ?dbg[0], 1, tp::*u8);
+    if (R.is_err[bool, str](e1)) { filesystem.temp_close_and_remove(?tf); ret 1; }
+    val rb1: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tp);
+    if (R.is_err[filesystem.Buffer, str](rb1)) { filesystem.temp_close_and_remove(?tf); ret 1; }
+    val b1: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rb1);
+
+    val e2: R.Result[bool, str] = emit_shared(?alloc, ?i, ?isa_vt, ?segs[0], 1, 4096, ?exports[0], 1, ?dyn, nil::*of.Section, 0, tp::*u8);
+    if (R.is_err[bool, str](e2)) { filesystem.temp_close_and_remove(?tf); ret 1; }
+    val rb2: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, tp);
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_err[filesystem.Buffer, str](rb2)) { ret 1; }
+    val b2: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rb2);
+
+    var bad: bool = false;
+
+    # the no-debug object carries no section-header table; the debug object does.
+    if (bin.read_u64_le(b2.data, 40) != 0) { bad = true; }
+    if (bin.read_u64_le(b1.data, 40) == 0) { bad = true; }
+
+    # the loadable image is byte-identical: the no-debug file is a prefix of the
+    # debug file (which only appends the trailing debug SHT), and every byte outside
+    # the section-table header fields matches.
+    if (b1.len < b2.len) { bad = true; }
+    or {
+        var j: usize = 0;
+        for (j < b2.len) {
+            # e_shoff (40..48) and e_shnum/e_shstrndx (60..64) legitimately differ; every
+            # other header and loadable byte must be identical.
+            if (j >= 40 && j < 48) { j = j + 1; cnt; }
+            if (j >= 60 && j < 64) { j = j + 1; cnt; }
+            if (b1.data[j] != b2.data[j]) { bad = true; j = b2.len; cnt; }
+            j = j + 1;
+        }
     }
 
     if (bad) { ret 1; }
