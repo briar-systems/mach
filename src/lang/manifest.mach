@@ -25,6 +25,7 @@ use mach.lang.intern;
 use tgt: mach.lang.target;
 use mach.lang.target.isa;
 use mach.lang.target.os;
+use mach.lang.target.abi;
 
 pub def MOpt: u8;
 
@@ -308,7 +309,18 @@ fun parse_str_array(alloc: *A.Allocator, itn: *intern.Interner, arr: *toml.Array
 # and `["linux"]` filter identically. an absent axis (present false) matches any;
 # an explicit empty array (present, count 0) matches nothing. an empty-string value
 # is not a canonical value and is a strict error, as is a non-string, non-array.
-fun parse_filter_axis(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml.Table, key: str, label: str) R.Result[StrArr, str] {
+# whether `value` is a canonical spelling for filter axis `key` (os/isa/abi), or
+# the explicit-any token "*". non-canonical spellings are strict errors (#1971) so
+# a typo like os = "windoze" never silently matches nothing.
+fun canonical_axis_value(key: str, value: str) bool {
+    if (str_equals(value, "*")) { ret true; }
+    if (str_equals(key, "os"))  { ret os.os_id_for(value) != os.OS_UNKNOWN; }
+    if (str_equals(key, "isa")) { ret isa.arch_id_for(value) != isa.ARCH_UNKNOWN; }
+    if (str_equals(key, "abi")) { ret abi.abi_id_for(value) != abi.ABI_UNKNOWN; }
+    ret false;
+}
+
+fun parse_filter_axis(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml.Table, key: str, label: str, strict: bool) R.Result[StrArr, str] {
     var out: StrArr;
     out.items   = nil;
     out.count   = 0;
@@ -331,23 +343,35 @@ fun parse_filter_axis(alloc: *A.Allocator, itn: *intern.Interner, sub: *toml.Tab
         }
         out.items[0] = R.unwrap_ok[intern.StrId, str](res_elem);
         out.count = 1;
-        ret R.ok[StrArr, str](out);
     }
-
-    if (v.tag == toml.TYPE_ARRAY) {
+    or (v.tag == toml.TYPE_ARRAY) {
         val res_arr: R.Result[StrArr, str] = parse_str_array(alloc, itn, ?v.data.array,
             cc5(alloc, "mach.toml: ", label, ".", key, " must be a string or array of strings"));
         if (R.is_err[StrArr, str](res_arr)) { ret res_arr; }
-        var arr_v: StrArr = R.unwrap_ok[StrArr, str](res_arr);
-        arr_v.present = true;
-        ret R.ok[StrArr, str](arr_v);
+        val arr_v: StrArr = R.unwrap_ok[StrArr, str](res_arr);
+        out.items = arr_v.items;
+        out.count = arr_v.count;
+    }
+    or {
+        ret R.err[StrArr, str](cc5(alloc, "mach.toml: ", label, ".", key, " must be a string or array of strings"));
     }
 
-    ret R.err[StrArr, str](cc5(alloc, "mach.toml: ", label, ".", key, " must be a string or array of strings"));
+    if (strict) {
+        var vi: u32 = 0;
+        for (vi < out.count) {
+            val vs: str = idstr(itn, out.items[vi]);
+            if (!canonical_axis_value(key, vs)) {
+                ret R.err[StrArr, str](cc(alloc, cc5(alloc, "mach.toml: ", label, ".", key, cc3(alloc, " has non-canonical value '", vs, "'")), "; use a canonical value or \"*\""));
+            }
+            vi = vi + 1;
+        }
+    }
+    ret R.ok[StrArr, str](out);
 }
 
-fun parse_opt_level(alloc: *A.Allocator, name: str, sub: *toml.Table) R.Result[MOpt, str] {
+fun parse_opt_level(alloc: *A.Allocator, name: str, sub: *toml.Table, strict: bool) R.Result[MOpt, str] {
     val v: *toml.Value = toml.get(sub, "opt");
+    if (v == nil && strict)         { ret R.err[MOpt, str](cc3(alloc, "mach.toml: [profile.", name, "] is missing required key 'opt'")); }
     if (v == nil)                   { ret R.ok[MOpt, str](MOPT_DEFAULT); }
     if (v.tag != toml.TYPE_INTEGER) { ret R.err[MOpt, str](opt_err(alloc, name, v)); }
     val n: i64 = v.data.integer;
@@ -374,8 +398,9 @@ fun opt_value_text(alloc: *A.Allocator, v: *toml.Value) str {
     ret "a value";
 }
 
-fun parse_debug_flag(alloc: *A.Allocator, name: str, sub: *toml.Table) R.Result[bool, str] {
+fun parse_debug_flag(alloc: *A.Allocator, name: str, sub: *toml.Table, strict: bool) R.Result[bool, str] {
     val v: *toml.Value = toml.get(sub, "debug");
+    if (v == nil && strict)      { ret R.err[bool, str](cc3(alloc, "mach.toml: [profile.", name, "] is missing required key 'debug'")); }
     if (v == nil)                { ret R.ok[bool, str](false); }
     if (v.tag != toml.TYPE_BOOL) { ret R.err[bool, str](debug_err(alloc, name, v)); }
     ret R.ok[bool, str](v.data.boolean);
@@ -413,10 +438,14 @@ fun unknown_key_msg(alloc: *A.Allocator, key: str, label: str) str {
     ret cc(alloc, cc3(alloc, "mach.toml: unknown key '", key, "' in "), label);
 }
 
-fun key_known(kind: TableKind, k: str) bool {
+fun key_known(kind: TableKind, k: str, strict: bool) bool {
     if (kind == TK_PROJECT) {
-        ret str_equals(k, "id") || str_equals(k, "name") || str_equals(k, "description")
-            || str_equals(k, "version") || str_equals(k, "src") || str_equals(k, "out");
+        if (str_equals(k, "id") || str_equals(k, "version") || str_equals(k, "src") || str_equals(k, "out")) { ret true; }
+        # a dependency's manifest is parsed permissively (#1971): the consumer reads
+        # only its export surface, so pre-flag-day metadata like name/description is
+        # tolerated rather than rejected. the root manifest is strict.
+        if (!strict && (str_equals(k, "name") || str_equals(k, "description"))) { ret true; }
+        ret false;
     }
     if (kind == TK_TARGET) {
         ret str_equals(k, "isa") || str_equals(k, "os") || str_equals(k, "abi") || str_equals(k, "of");
@@ -441,12 +470,12 @@ fun key_known(kind: TableKind, k: str) bool {
     ret false;
 }
 
-fun check_keys(alloc: *A.Allocator, tab: *toml.Table, label: str, kind: TableKind) R.Result[bool, str] {
+fun check_keys(alloc: *A.Allocator, tab: *toml.Table, label: str, kind: TableKind, strict: bool) R.Result[bool, str] {
     val n: usize = toml.table_len(tab);
     var i: usize = 0;
     for (i < n) {
         val k: str = toml.table_key(tab, i);
-        if (!key_known(kind, k)) { ret R.err[bool, str](unknown_key_msg(alloc, k, label)); }
+        if (!key_known(kind, k, strict)) { ret R.err[bool, str](unknown_key_msg(alloc, k, label)); }
         i = i + 1;
     }
     ret R.ok[bool, str](true);
@@ -469,7 +498,12 @@ fun first_nonempty(a: str, b: str) str {
     ret a;
 }
 
-pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table) R.Result[Manifest, str] {
+# parse a manifest. `strict` enforces #1964 no-defaults totality (every declared-
+# table field spelled, [project] trimmed to id/version/src/out, canonical filter
+# axes) and is used for the root manifest being built. a dependency's manifest is
+# parsed with strict=false: the consumer reads only its export surface, so the
+# dep's own migration state must not gate the consumer's build (#1971).
+pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, strict: bool) R.Result[Manifest, str] {
     var m: Manifest;
     m.targets        = nil;
     m.target_count   = 0;
@@ -486,17 +520,13 @@ pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table) R.Resu
 
     val proj: *toml.Table = toml.get_table(t, "project");
     if (proj == nil) { ret R.err[Manifest, str]("mach.toml: missing [project] table"); }
-    val res_project_keys: R.Result[bool, str] = check_keys(alloc, proj, "[project]", TK_PROJECT);
+    val res_project_keys: R.Result[bool, str] = check_keys(alloc, proj, "[project]", TK_PROJECT, strict);
     if (R.is_err[bool, str](res_project_keys)) { ret R.err[Manifest, str](R.unwrap_err[bool, str](res_project_keys)); }
 
     val id_str: str = toml.get_str(proj, "id");
     if (str_empty(id_str)) { ret R.err[Manifest, str]("mach.toml: [project] is missing required key 'id'"); }
     val ver_str: str = toml.get_str(proj, "version");
     if (str_empty(ver_str)) { ret R.err[Manifest, str]("mach.toml: [project] is missing required key 'version'"); }
-    # name/description are metadata the #1964 shape does not define; accepted when
-    # present, absent otherwise (STR_NIL). strict totality is #1971's flag-day.
-    val name_str: str = toml.get_str(proj, "name");
-    val desc_str: str = toml.get_str(proj, "description");
     val src_str: str = toml.get_str(proj, "src");
     if (str_empty(src_str)) { ret R.err[Manifest, str]("mach.toml: [project] is missing required key 'src'"); }
     val out_str: str = toml.get_str(proj, "out");
@@ -512,34 +542,35 @@ pub fun parse(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table) R.Resu
     if (!is_valid_id(id_str)) { ret R.err[Manifest, str]("mach.toml: [project].id must be an identifier (letters, digits, '_', '-')"); }
     m.id = intern_unwrap(itn, id_str);
     m.version = intern_unwrap(itn, ver_str);
-    m.name = intern_opt_unwrap(itn, name_str);
-    m.description = intern_opt_unwrap(itn, desc_str);
+    # name/description are not #1964 fields; [project] is id/version/src/out only.
+    m.name = intern.STR_NIL;
+    m.description = intern.STR_NIL;
     m.src = intern_unwrap(itn, src_str);
     m.out_tmpl = intern_unwrap(itn, out_str);
     m.default_target = intern_unwrap(itn, "native");
 
-    val res_targets: R.Result[bool, str] = parse_targets(alloc, itn, t, ?m);
+    val res_targets: R.Result[bool, str] = parse_targets(alloc, itn, t, ?m, strict);
     if (R.is_err[bool, str](res_targets)) { dnit(?m, alloc); ret R.err[Manifest, str](R.unwrap_err[bool, str](res_targets)); }
 
-    val res_artifacts: R.Result[bool, str] = parse_artifacts(alloc, itn, t, ?m);
+    val res_artifacts: R.Result[bool, str] = parse_artifacts(alloc, itn, t, ?m, strict);
     if (R.is_err[bool, str](res_artifacts)) { dnit(?m, alloc); ret R.err[Manifest, str](R.unwrap_err[bool, str](res_artifacts)); }
 
-    val res_profiles: R.Result[bool, str] = parse_profiles(alloc, itn, t, ?m);
+    val res_profiles: R.Result[bool, str] = parse_profiles(alloc, itn, t, ?m, strict);
     if (R.is_err[bool, str](res_profiles)) { dnit(?m, alloc); ret R.err[Manifest, str](R.unwrap_err[bool, str](res_profiles)); }
 
-    val res_deps: R.Result[bool, str] = parse_deps(alloc, itn, t, ?m);
+    val res_deps: R.Result[bool, str] = parse_deps(alloc, itn, t, ?m, strict);
     if (R.is_err[bool, str](res_deps)) { dnit(?m, alloc); ret R.err[Manifest, str](R.unwrap_err[bool, str](res_deps)); }
 
-    val res_links: R.Result[bool, str] = parse_links(alloc, itn, t, ?m);
+    val res_links: R.Result[bool, str] = parse_links(alloc, itn, t, ?m, strict);
     if (R.is_err[bool, str](res_links)) { dnit(?m, alloc); ret R.err[Manifest, str](R.unwrap_err[bool, str](res_links)); }
 
-    val res_steps: R.Result[bool, str] = parse_steps(alloc, itn, t, ?m);
+    val res_steps: R.Result[bool, str] = parse_steps(alloc, itn, t, ?m, strict);
     if (R.is_err[bool, str](res_steps)) { dnit(?m, alloc); ret R.err[Manifest, str](R.unwrap_err[bool, str](res_steps)); }
 
     ret R.ok[Manifest, str](m);
 }
 
-fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) R.Result[bool, str] {
+fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, strict: bool) R.Result[bool, str] {
     val tab: *toml.Table = toml.get_table(t, "target");
     if (tab == nil) { ret R.ok[bool, str](true); }
     val n: usize = toml.table_len(tab);
@@ -562,7 +593,7 @@ fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m:
         }
         val sub: *toml.Table = ?v.data.table;
         val label: str = cc3(alloc, "[target.", name, "]");
-        val res_keys: R.Result[bool, str] = check_keys(alloc, sub, label, TK_TARGET);
+        val res_keys: R.Result[bool, str] = check_keys(alloc, sub, label, TK_TARGET, strict);
         if (R.is_err[bool, str](res_keys)) { ret res_keys; }
 
         var d: TargetDef;
@@ -585,7 +616,7 @@ fun parse_targets(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m:
     ret R.ok[bool, str](true);
 }
 
-fun parse_artifacts(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) R.Result[bool, str] {
+fun parse_artifacts(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, strict: bool) R.Result[bool, str] {
     val arts: *toml.Table = toml.get_table(t, "artifact");
     if (arts == nil) { ret R.ok[bool, str](true); }
     val n: usize = toml.table_len(arts);
@@ -598,7 +629,7 @@ fun parse_artifacts(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, 
 
     var i: usize = 0;
     for (i < n) {
-        val res_artifact: R.Result[ArtifactDef, str] = parse_one_artifact(alloc, itn, arts, i);
+        val res_artifact: R.Result[ArtifactDef, str] = parse_one_artifact(alloc, itn, arts, i, strict);
         if (R.is_err[ArtifactDef, str](res_artifact)) { ret R.err[bool, str](R.unwrap_err[ArtifactDef, str](res_artifact)); }
         m.artifacts[i] = R.unwrap_ok[ArtifactDef, str](res_artifact);
         i = i + 1;
@@ -606,7 +637,7 @@ fun parse_artifacts(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, 
     ret R.ok[bool, str](true);
 }
 
-fun parse_one_artifact(alloc: *A.Allocator, itn: *intern.Interner, tab: *toml.Table, k: usize) R.Result[ArtifactDef, str] {
+fun parse_one_artifact(alloc: *A.Allocator, itn: *intern.Interner, tab: *toml.Table, k: usize, strict: bool) R.Result[ArtifactDef, str] {
     val name: str = toml.table_key(tab, k);
     val v: *toml.Value = toml.table_value(tab, k);
     val label: str = cc3(alloc, "[artifact.", name, "]");
@@ -615,7 +646,7 @@ fun parse_one_artifact(alloc: *A.Allocator, itn: *intern.Interner, tab: *toml.Ta
     }
     val sub: *toml.Table = ?v.data.table;
 
-    val res_keys: R.Result[bool, str] = check_keys(alloc, sub, label, TK_ARTIFACT);
+    val res_keys: R.Result[bool, str] = check_keys(alloc, sub, label, TK_ARTIFACT, strict);
     if (R.is_err[bool, str](res_keys)) { ret R.err[ArtifactDef, str](R.unwrap_err[bool, str](res_keys)); }
 
     var a: ArtifactDef;
@@ -658,6 +689,9 @@ fun parse_one_artifact(alloc: *A.Allocator, itn: *intern.Interner, tab: *toml.Ta
     a.target_count = targets_val.count;
 
     val link_arr: *toml.Array = toml.get_array(sub, "link");
+    if (link_arr == nil && strict) {
+        ret R.err[ArtifactDef, str](cc3(alloc, "mach.toml: ", label, " is missing required key 'link' (use [] for none)"));
+    }
     if (link_arr != nil) {
         val res_link: R.Result[StrArr, str] = parse_str_array(alloc, itn, link_arr,
             cc3(alloc, "mach.toml: ", label, ".link must be an array of strings"));
@@ -668,6 +702,9 @@ fun parse_one_artifact(alloc: *A.Allocator, itn: *intern.Interner, tab: *toml.Ta
     }
 
     val need_arr: *toml.Array = toml.get_array(sub, "need");
+    if (need_arr == nil && strict) {
+        ret R.err[ArtifactDef, str](cc3(alloc, "mach.toml: ", label, " is missing required key 'need' (use [] for none)"));
+    }
     if (need_arr != nil) {
         val res_need: R.Result[StrArr, str] = parse_str_array(alloc, itn, need_arr,
             cc3(alloc, "mach.toml: ", label, ".need must be an array of strings"));
@@ -680,7 +717,7 @@ fun parse_one_artifact(alloc: *A.Allocator, itn: *intern.Interner, tab: *toml.Ta
     ret R.ok[ArtifactDef, str](a);
 }
 
-fun parse_profiles(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) R.Result[bool, str] {
+fun parse_profiles(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, strict: bool) R.Result[bool, str] {
     val tab: *toml.Table = toml.get_table(t, "profile");
     if (tab == nil) { ret R.ok[bool, str](true); }
     val n: usize = toml.table_len(tab);
@@ -700,17 +737,17 @@ fun parse_profiles(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m
             ret R.err[bool, str](cc3(alloc, "mach.toml: ", label, " must be a table"));
         }
         val sub: *toml.Table = ?v.data.table;
-        val res_keys: R.Result[bool, str] = check_keys(alloc, sub, label, TK_PROFILE);
+        val res_keys: R.Result[bool, str] = check_keys(alloc, sub, label, TK_PROFILE, strict);
         if (R.is_err[bool, str](res_keys)) { ret res_keys; }
 
         var pf: ProfileDef;
         pf.name = intern_unwrap(itn, name);
-        val res_opt: R.Result[MOpt, str] = parse_opt_level(alloc, name, sub);
+        val res_opt: R.Result[MOpt, str] = parse_opt_level(alloc, name, sub, strict);
         if (R.is_err[MOpt, str](res_opt)) { ret R.err[bool, str](R.unwrap_err[MOpt, str](res_opt)); }
         pf.opt      = R.unwrap_ok[MOpt, str](res_opt);
         pf.emit_ir  = bool_or(toml.get_bool(sub, "emit_ir"), false);
         pf.emit_asm = bool_or(toml.get_bool(sub, "emit_asm"), false);
-        val res_debug: R.Result[bool, str] = parse_debug_flag(alloc, name, sub);
+        val res_debug: R.Result[bool, str] = parse_debug_flag(alloc, name, sub, strict);
         if (R.is_err[bool, str](res_debug)) { ret R.err[bool, str](R.unwrap_err[bool, str](res_debug)); }
         pf.debug    = R.unwrap_ok[bool, str](res_debug);
 
@@ -720,7 +757,7 @@ fun parse_profiles(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m
     ret R.ok[bool, str](true);
 }
 
-fun parse_deps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) R.Result[bool, str] {
+fun parse_deps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, strict: bool) R.Result[bool, str] {
     val tab: *toml.Table = toml.get_table(t, "dep");
     if (tab == nil) { ret R.ok[bool, str](true); }
     val n: usize = toml.table_len(tab);
@@ -744,7 +781,7 @@ fun parse_deps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *M
         if (toml.get(sub, "version") != nil) {
             ret R.err[bool, str](cc3(alloc, "mach.toml: ", label, ".version is reserved for the registry era"));
         }
-        val res_keys: R.Result[bool, str] = check_keys(alloc, sub, label, TK_DEP);
+        val res_keys: R.Result[bool, str] = check_keys(alloc, sub, label, TK_DEP, strict);
         if (R.is_err[bool, str](res_keys)) { ret res_keys; }
 
         var d: DepDef;
@@ -756,9 +793,16 @@ fun parse_deps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *M
         if (has_git == has_path) {
             ret R.err[bool, str](cc3(alloc, "mach.toml: ", label, " needs exactly one source key: 'git' or 'path'"));
         }
+        val ref_s: str = toml.get_str(sub, "ref");
+        if (has_git && str_empty(ref_s) && strict) {
+            ret R.err[bool, str](cc3(alloc, "mach.toml: ", label, " is missing required key 'ref' for git source"));
+        }
+        if (has_path && !str_empty(ref_s) && strict) {
+            ret R.err[bool, str](cc3(alloc, "mach.toml: ", label, ".ref is not allowed for path sources"));
+        }
         d.git  = intern_opt_unwrap(itn, git_s);
         d.path = intern_opt_unwrap(itn, path_s);
-        d.ref  = intern_opt_unwrap(itn, toml.get_str(sub, "ref"));
+        d.ref  = intern_opt_unwrap(itn, ref_s);
 
         m.deps[i] = d;
         i = i + 1;
@@ -766,7 +810,7 @@ fun parse_deps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *M
     ret R.ok[bool, str](true);
 }
 
-fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) R.Result[bool, str] {
+fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, strict: bool) R.Result[bool, str] {
     val tab: *toml.Table = toml.get_table(t, "link");
     if (tab == nil) { ret R.ok[bool, str](true); }
     val n: usize = toml.table_len(tab);
@@ -787,7 +831,7 @@ fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *
         }
         val sub: *toml.Table = ?v.data.table;
 
-        val res_keys: R.Result[bool, str] = check_keys(alloc, sub, label, TK_LINK);
+        val res_keys: R.Result[bool, str] = check_keys(alloc, sub, label, TK_LINK, strict);
         if (R.is_err[bool, str](res_keys)) { ret res_keys; }
 
         var d: LinkDef;
@@ -826,28 +870,35 @@ fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *
             d.path = intern.STR_NIL;
         }
 
-        val res_os: R.Result[StrArr, str] = parse_filter_axis(alloc, itn, sub, "os", label);
+        val res_os: R.Result[StrArr, str] = parse_filter_axis(alloc, itn, sub, "os", label, strict);
         if (R.is_err[StrArr, str](res_os)) { ret R.err[bool, str](R.unwrap_err[StrArr, str](res_os)); }
         val os_v: StrArr = R.unwrap_ok[StrArr, str](res_os);
+        if (!os_v.present && strict) { ret R.err[bool, str](cc3(alloc, "mach.toml: ", label, " is missing required key 'os' (use \"*\" for any)")); }
         d.os = os_v.items;
         d.os_count = os_v.count;
         d.os_present = os_v.present;
 
-        val res_isa: R.Result[StrArr, str] = parse_filter_axis(alloc, itn, sub, "isa", label);
+        val res_isa: R.Result[StrArr, str] = parse_filter_axis(alloc, itn, sub, "isa", label, strict);
         if (R.is_err[StrArr, str](res_isa)) { ret R.err[bool, str](R.unwrap_err[StrArr, str](res_isa)); }
         val isa_v: StrArr = R.unwrap_ok[StrArr, str](res_isa);
+        if (!isa_v.present && strict) { ret R.err[bool, str](cc3(alloc, "mach.toml: ", label, " is missing required key 'isa' (use \"*\" for any)")); }
         d.isa = isa_v.items;
         d.isa_count = isa_v.count;
         d.isa_present = isa_v.present;
 
-        val res_abi: R.Result[StrArr, str] = parse_filter_axis(alloc, itn, sub, "abi", label);
+        val res_abi: R.Result[StrArr, str] = parse_filter_axis(alloc, itn, sub, "abi", label, strict);
         if (R.is_err[StrArr, str](res_abi)) { ret R.err[bool, str](R.unwrap_err[StrArr, str](res_abi)); }
         val abi_v: StrArr = R.unwrap_ok[StrArr, str](res_abi);
+        if (!abi_v.present && strict) { ret R.err[bool, str](cc3(alloc, "mach.toml: ", label, " is missing required key 'abi' (use \"*\" for any)")); }
         d.abi = abi_v.items;
         d.abi_count = abi_v.count;
         d.abi_present = abi_v.present;
 
-        d.export = bool_or(toml.get_bool(sub, "export"), false);
+        val export_v: *toml.Value = toml.get(sub, "export");
+        if (export_v == nil && strict) { ret R.err[bool, str](cc3(alloc, "mach.toml: ", label, " is missing required key 'export'")); }
+        if (export_v == nil) { d.export = false; }
+        or (export_v.tag != toml.TYPE_BOOL) { ret R.err[bool, str](cc3(alloc, "mach.toml: ", label, ".export must be a boolean")); }
+        or { d.export = export_v.data.boolean; }
 
         m.links[i] = d;
         i = i + 1;
@@ -855,7 +906,7 @@ fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *
     ret R.ok[bool, str](true);
 }
 
-fun parse_steps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest) R.Result[bool, str] {
+fun parse_steps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *Manifest, strict: bool) R.Result[bool, str] {
     val tab: *toml.Table = toml.get_table(t, "step");
     if (tab == nil) { ret R.ok[bool, str](true); }
     val n: usize = toml.table_len(tab);
@@ -876,10 +927,12 @@ fun parse_steps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *
         }
         val sub: *toml.Table = ?v.data.table;
 
-        val res_keys: R.Result[bool, str] = check_keys(alloc, sub, label, TK_STEP);
+        val res_keys: R.Result[bool, str] = check_keys(alloc, sub, label, TK_STEP, strict);
         if (R.is_err[bool, str](res_keys)) { ret res_keys; }
 
         var d: StepDef;
+        d.need       = nil;
+        d.need_count = 0;
         # the step name keys its stamp file, so it must be a plain identifier - a
         # '/' would break the stamp path and a '.' would collide owner.step keys (#1989).
         if (!is_valid_id(name)) { ret R.err[bool, str](cc3(alloc, "mach.toml: ", label, " name must be an identifier (letters, digits, '_', '-')")); }
@@ -926,6 +979,9 @@ fun parse_steps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *
         }
 
         val need_arr: *toml.Array = toml.get_array(sub, "need");
+        if (need_arr == nil && strict) {
+            ret R.err[bool, str](cc3(alloc, "mach.toml: ", label, " is missing required key 'need' (use [] for none)"));
+        }
         if (need_arr != nil) {
             val res_need: R.Result[StrArr, str] = parse_str_array(alloc, itn, need_arr,
                 cc3(alloc, "mach.toml: ", label, ".need must be an array of strings"));
@@ -933,10 +989,6 @@ fun parse_steps(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *
             val need_val: StrArr = R.unwrap_ok[StrArr, str](res_need);
             d.need = need_val.items;
             d.need_count = need_val.count;
-        }
-        or {
-            d.need = nil;
-            d.need_count = 0;
         }
 
         m.steps[i] = d;
@@ -1030,23 +1082,24 @@ fun seg_dup(alloc: *A.Allocator, tmpl: str, start: usize, end: usize) str {
     ret buf::str;
 }
 
+# the #1964 template variable set is closed and final: {project.out}, {target.name},
+# {profile.name}. no {name}/{ext} or bare {target}/{profile} aliases -- an executable
+# extension is written literally into the artifact's out, per the RFC.
 fun tmpl_value(alloc: *A.Allocator, tmpl: str, start: usize, end: usize, project_out: str,
-               target_name: str, profile_name: str, art_name: str, ext: str) R.Result[str, str] {
+               target_name: str, profile_name: str) R.Result[str, str] {
     if (seg_eq(tmpl, start, end, "project.out")) {
         # available everywhere except while expanding [project].out itself, where it
         # would be self-referential (project_out is passed empty there).
         if (str_empty(project_out)) { ret R.err[str, str]("mach.toml: '{project.out}' is not available in [project].out"); }
         ret R.ok[str, str](project_out);
     }
-    if (seg_eq(tmpl, start, end, "target.name") || seg_eq(tmpl, start, end, "target"))  { ret R.ok[str, str](target_name); }
-    if (seg_eq(tmpl, start, end, "profile.name") || seg_eq(tmpl, start, end, "profile")) { ret R.ok[str, str](profile_name); }
-    if (seg_eq(tmpl, start, end, "name"))    { ret R.ok[str, str](art_name); }
-    if (seg_eq(tmpl, start, end, "ext"))     { ret R.ok[str, str](ext); }
+    if (seg_eq(tmpl, start, end, "target.name"))  { ret R.ok[str, str](target_name); }
+    if (seg_eq(tmpl, start, end, "profile.name")) { ret R.ok[str, str](profile_name); }
     ret R.err[str, str](cc3(alloc, "mach.toml: unknown template variable '{", seg_dup(alloc, tmpl, start, end), "}'"));
 }
 
 pub fun expand(alloc: *A.Allocator, tmpl: str, project_out: str,
-               target_name: str, profile_name: str, art_name: str, ext: str) R.Result[str, str] {
+               target_name: str, profile_name: str) R.Result[str, str] {
     val n: usize = str_len(tmpl);
     var total: usize = 0;
     var i: usize = 0;
@@ -1055,7 +1108,7 @@ pub fun expand(alloc: *A.Allocator, tmpl: str, project_out: str,
             var ii: usize = i + 1;
             for (ii < n && tmpl[ii] != '}') { ii = ii + 1; }
             if (ii >= n) { ret R.err[str, str]("mach.toml: unterminated '{' in a path template"); }
-            val res_value: R.Result[str, str] = tmpl_value(alloc, tmpl, i + 1, ii, project_out, target_name, profile_name, art_name, ext);
+            val res_value: R.Result[str, str] = tmpl_value(alloc, tmpl, i + 1, ii, project_out, target_name, profile_name);
             if (R.is_err[str, str](res_value)) { ret R.err[str, str](R.unwrap_err[str, str](res_value)); }
             total = total + str_len(R.unwrap_ok[str, str](res_value));
             i = ii + 1;
@@ -1076,7 +1129,7 @@ pub fun expand(alloc: *A.Allocator, tmpl: str, project_out: str,
         if (tmpl[i] == '{') {
             var ii: usize = i + 1;
             for (ii < n && tmpl[ii] != '}') { ii = ii + 1; }
-            val res_value: R.Result[str, str] = tmpl_value(alloc, tmpl, i + 1, ii, project_out, target_name, profile_name, art_name, ext);
+            val res_value: R.Result[str, str] = tmpl_value(alloc, tmpl, i + 1, ii, project_out, target_name, profile_name);
             val value: str = R.unwrap_ok[str, str](res_value);
             val vl: usize = str_len(value);
             var iii: usize = 0;
@@ -1280,7 +1333,7 @@ fun join_path_canonical(alloc: *A.Allocator, a: str, b: str) str {
 fun link_token(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef, proj_out: str, tn: str, pn: str) R.Result[intern.StrId, str] {
     if (l.source == intern_unwrap(itn, "local")) {
         val raw_path: str = idstr(itn, l.path);
-        val expanded_r: R.Result[str, str] = expand(alloc, raw_path, proj_out, tn, pn, "", "");
+        val expanded_r: R.Result[str, str] = expand(alloc, raw_path, proj_out, tn, pn);
         if (R.is_err[str, str](expanded_r)) { ret R.err[intern.StrId, str](R.unwrap_err[str, str](expanded_r)); }
         val expanded: str = R.unwrap_ok[str, str](expanded_r);
         val res_int: R.Result[intern.StrId, str] = intern.intern(itn, expanded);
@@ -1304,7 +1357,7 @@ pub fun step_producing_out(alloc: *A.Allocator, itn: *intern.Interner, m: *Manif
         var oi: u32 = 0;
         for (oi < s.out_count) {
             val raw_out: str = idstr(itn, s.out[oi]);
-            val exp_r: R.Result[str, str] = expand(alloc, raw_out, proj_out, tn, pn, "", "");
+            val exp_r: R.Result[str, str] = expand(alloc, raw_out, proj_out, tn, pn);
             if (R.is_ok[str, str](exp_r)) {
                 val exp: str = R.unwrap_ok[str, str](exp_r);
                 val eq: bool = str_equals(exp, expanded_path);
@@ -1422,7 +1475,7 @@ pub fun plan_steps(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifest,
             for (li < a.link_count) {
                 val l: *LinkDef = find_link_by_name(m, a.link[li]);
                 if (l != nil && l.source == local_id && link_matches_target(itn, l, t)) {
-                    val exp_r: R.Result[str, str] = expand(alloc, idstr(itn, l.path), proj_out, tn, pn, "", "");
+                    val exp_r: R.Result[str, str] = expand(alloc, idstr(itn, l.path), proj_out, tn, pn);
                     if (R.is_ok[str, str](exp_r)) {
                         val exp: str = R.unwrap_ok[str, str](exp_r);
                         val sidx: i64 = step_producing_out(alloc, itn, m, exp, proj_out, tn, pn);
@@ -1497,7 +1550,7 @@ pub fun plan_export_steps(alloc: *A.Allocator, itn: *intern.Interner, m: *Manife
     for (li < m.link_count) {
         val l: *LinkDef = ?m.links[li];
         if (l.export && l.source == local_id && link_matches_target(itn, l, t)) {
-            val exp_r: R.Result[str, str] = expand(alloc, idstr(itn, l.path), proj_out, tn, pn, "", "");
+            val exp_r: R.Result[str, str] = expand(alloc, idstr(itn, l.path), proj_out, tn, pn);
             if (R.is_ok[str, str](exp_r)) {
                 val exp: str = R.unwrap_ok[str, str](exp_r);
                 val sidx: i64 = step_producing_out(alloc, itn, m, exp, proj_out, tn, pn);
@@ -1570,20 +1623,11 @@ pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, m: *Manif
     if (R.is_err[str, str](res_target_name)) { ret R.err[BuildUnit, str](R.unwrap_err[str, str](res_target_name)); }
     val res_profile_name: R.Result[str, str] = must_lookup(itn, rp.name);
     if (R.is_err[str, str](res_profile_name)) { ret R.err[BuildUnit, str](R.unwrap_err[str, str](res_profile_name)); }
-    val res_art_name: R.Result[str, str] = must_lookup(itn, a.name);
-    if (R.is_err[str, str](res_art_name)) { ret R.err[BuildUnit, str](R.unwrap_err[str, str](res_art_name)); }
     val tn: str = R.unwrap_ok[str, str](res_target_name);
     val pn: str = R.unwrap_ok[str, str](res_profile_name);
-    val an: str = R.unwrap_ok[str, str](res_art_name);
-
-    val res_os_name: R.Result[str, str] = must_lookup(itn, rt.target.os);
-    if (R.is_err[str, str](res_os_name)) { ret R.err[BuildUnit, str](R.unwrap_err[str, str](res_os_name)); }
-    val os_name: str = R.unwrap_ok[str, str](res_os_name);
-    var ex: str = "";
-    if (str_equals(os_name, "windows")) { ex = ".exe"; }
 
     # Expand project out
-    val res_project_out: R.Result[str, str] = expand(alloc, R.unwrap_ok[str, str](must_lookup(itn, m.out_tmpl)), "", tn, pn, "", "");
+    val res_project_out: R.Result[str, str] = expand(alloc, R.unwrap_ok[str, str](must_lookup(itn, m.out_tmpl)), "", tn, pn);
     if (R.is_err[str, str](res_project_out)) { ret R.err[BuildUnit, str](R.unwrap_err[str, str](res_project_out)); }
     val proj_out: str = R.unwrap_ok[str, str](res_project_out);
 
@@ -1645,7 +1689,7 @@ pub fun resolve_build_unit(alloc: *A.Allocator, itn: *intern.Interner, m: *Manif
 
     # Resolve artifact relative path
     val art_out_tmpl: intern.StrId = a.out;
-    val res_art_out: R.Result[str, str] = expand(alloc, R.unwrap_ok[str, str](must_lookup(itn, art_out_tmpl)), proj_out, tn, pn, an, ex);
+    val res_art_out: R.Result[str, str] = expand(alloc, R.unwrap_ok[str, str](must_lookup(itn, art_out_tmpl)), proj_out, tn, pn);
     if (R.is_err[str, str](res_art_out)) { ret R.err[BuildUnit, str](R.unwrap_err[str, str](res_art_out)); }
     val art_out_rel: str = R.unwrap_ok[str, str](res_art_out);
 
@@ -1763,28 +1807,20 @@ pub fun check_collisions(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifes
     if (R.is_err[str, str](res_target_name)) { ret R.err[bool, str](R.unwrap_err[str, str](res_target_name)); }
     val tn: str = R.unwrap_ok[str, str](res_target_name);
 
-    val res_os_name: R.Result[str, str] = must_lookup(itn, t.os);
-    if (R.is_err[str, str](res_os_name)) { ret R.err[bool, str](R.unwrap_err[str, str](res_os_name)); }
-    val os_name: str = R.unwrap_ok[str, str](res_os_name);
-    var ex: str = "";
-    if (str_equals(os_name, "windows")) { ex = ".exe"; }
-
     val res_paths: R.Result[*str, str] = A.allocate[str](alloc, m.artifact_count::usize);
     if (R.is_err[*str, str](res_paths)) { ret R.err[bool, str](R.unwrap_err[*str, str](res_paths)); }
     val paths: *str = R.unwrap_ok[*str, str](res_paths);
 
     # Expand project out
-    val res_project_out: R.Result[str, str] = expand(alloc, R.unwrap_ok[str, str](must_lookup(itn, m.out_tmpl)), "", tn, profile_name, "", "");
+    val res_project_out: R.Result[str, str] = expand(alloc, R.unwrap_ok[str, str](must_lookup(itn, m.out_tmpl)), "", tn, profile_name);
     if (R.is_err[str, str](res_project_out)) { ret R.err[bool, str](R.unwrap_err[str, str](res_project_out)); }
     val proj_out: str = R.unwrap_ok[str, str](res_project_out);
 
     var i: u32 = 0;
     for (i < m.artifact_count) {
         val a: *ArtifactDef = ?m.artifacts[i];
-        val res_art_name: R.Result[str, str] = must_lookup(itn, a.name);
-        if (R.is_err[str, str](res_art_name)) { ret R.err[bool, str](R.unwrap_err[str, str](res_art_name)); }
         val art_out_tmpl: intern.StrId = a.out;
-        val res_art_out: R.Result[str, str] = expand(alloc, R.unwrap_ok[str, str](must_lookup(itn, art_out_tmpl)), proj_out, tn, profile_name, R.unwrap_ok[str, str](res_art_name), ex);
+        val res_art_out: R.Result[str, str] = expand(alloc, R.unwrap_ok[str, str](must_lookup(itn, art_out_tmpl)), proj_out, tn, profile_name);
         if (R.is_err[str, str](res_art_out)) { ret R.err[bool, str](R.unwrap_err[str, str](res_art_out)); }
         val art_out_rel: str = R.unwrap_ok[str, str](res_art_out);
         paths[i] = join_path_canonical(alloc, proj_out, art_out_rel);
@@ -1819,7 +1855,7 @@ pub fun check_collisions(alloc: *A.Allocator, itn: *intern.Interner, m: *Manifes
 # --- test helper / scaffolding ---
 
 fun demo_src() str {
-    ret "[project]\nid = \"demo\"\nname = \"demo\"\ndescription = \"demo\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\n\n[artifact.ls]\nkind = \"bin\"\nentry = \"bin/ls.mach\"\nout = \"bin/ls\"\ntargets = [\"*\"]\n\n[artifact.cat]\nkind = \"bin\"\nentry = \"bin/cat.mach\"\nout = \"bin/cat\"\ntargets = [\"*\"]\n\n[profile.debug]\nopt = 0\n\n[profile.release]\nopt = 2\n\n[dep.mach-std]\ngit = \"https://github.com/briar-systems/mach-std\"\nref = \"v0.4.0\"\n";
+    ret "[project]\nid = \"demo\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[target.windows]\nisa = \"x86_64\"\nos = \"windows\"\nabi = \"win64\"\n\n[artifact.ls]\nkind = \"bin\"\nentry = \"bin/ls.mach\"\nout = \"bin/ls\"\ntargets = [\"*\"]\nlink = []\nneed = []\n\n[artifact.cat]\nkind = \"bin\"\nentry = \"bin/cat.mach\"\nout = \"bin/cat\"\ntargets = [\"*\"]\nlink = []\nneed = []\n\n[profile.debug]\nopt = 0\ndebug = false\n\n[profile.release]\nopt = 2\ndebug = false\n\n[dep.mach-std]\ngit = \"https://github.com/briar-systems/mach-std\"\nref = \"v0.4.0\"\n";
 }
 
 fun host_target_stanza(alloc: *A.Allocator, name: str) str {
@@ -1872,7 +1908,17 @@ fun tparse(alloc: *A.Allocator, itn: *intern.Interner, src: str) R.Result[Manife
     val tbl_r: R.Result[toml.Table, str] = toml.parse(alloc, src);
     if (R.is_err[toml.Table, str](tbl_r)) { ret R.err[Manifest, str](R.unwrap_err[toml.Table, str](tbl_r)); }
     var tbl: toml.Table = R.unwrap_ok[toml.Table, str](tbl_r);
-    ret parse(alloc, itn, ?tbl);
+    ret parse(alloc, itn, ?tbl, true);
+}
+
+# parse a manifest permissively, as a dependency's manifest is parsed: used to
+# exercise the runtime filter/resolve semantics on entries with absent axes, which
+# the strict root parser forbids.
+fun tparse_lenient(alloc: *A.Allocator, itn: *intern.Interner, src: str) R.Result[Manifest, str] {
+    val tbl_r: R.Result[toml.Table, str] = toml.parse(alloc, src);
+    if (R.is_err[toml.Table, str](tbl_r)) { ret R.err[Manifest, str](R.unwrap_err[toml.Table, str](tbl_r)); }
+    var tbl: toml.Table = R.unwrap_ok[toml.Table, str](tbl_r);
+    ret parse(alloc, itn, ?tbl, false);
 }
 
 test "mach.lang.manifest.is_valid_id" {
@@ -1927,30 +1973,23 @@ test "mach.lang.manifest.parse:missing_required_keys" {
     ret code;
 }
 
-test "mach.lang.manifest.parse:name_description_optional" {
+test "mach.lang.manifest.parse:name_description_rejected" {
     var backing: A.Allocator; var ar: arena.Arena; var alloc: A.Allocator; var itn: intern.Interner;
     if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
     var code: i32 = 0;
 
-    # the #1964 shape omits name/description; a manifest without them parses, with
-    # both fields interned to STR_NIL. id/version/src/out stay required.
-    val a: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
-    if (R.is_err[Manifest, str](a)) { code = 1; }
-    or {
-        var m: Manifest = R.unwrap_ok[Manifest, str](a);
-        if (m.name != intern.STR_NIL)        { code = 1; }
-        if (m.description != intern.STR_NIL) { code = 1; }
-        if (!str_equals(idstr(?itn, m.id), "x")) { code = 1; }
-    }
+    # the #1964 shape trims [project] to id/version/src/out; name/description are
+    # unknown keys in the strict root parse (#1971 flag-day).
+    val a: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nname=\"App\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
+    if (R.is_ok[Manifest, str](a) || !str_equals(R.unwrap_err[Manifest, str](a), "mach.toml: unknown key 'name' in [project]")) { code = 1; }
 
-    # present name/description are still accepted and recorded verbatim
-    val b: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nname=\"App\"\ndescription=\"d\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
-    if (R.is_err[Manifest, str](b)) { code = 1; }
-    or {
-        var m: Manifest = R.unwrap_ok[Manifest, str](b);
-        if (!str_equals(idstr(?itn, m.name), "App")) { code = 1; }
-        if (!str_equals(idstr(?itn, m.description), "d")) { code = 1; }
-    }
+    val b: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\ndescription=\"d\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
+    if (R.is_ok[Manifest, str](b) || !str_equals(R.unwrap_err[Manifest, str](b), "mach.toml: unknown key 'description' in [project]")) { code = 1; }
+
+    # a dependency's manifest is parsed permissively, so pre-flag-day name/description
+    # are tolerated there.
+    val d: R.Result[Manifest, str] = tparse_lenient(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nname=\"App\"\ndescription=\"d\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
+    if (R.is_err[Manifest, str](d)) { code = 1; }
     arena.dnit(?ar);
     ret code;
 }
@@ -1960,10 +1999,10 @@ test "mach.lang.manifest.parse:unknown_keys" {
     if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
     var code: i32 = 0;
 
-    val a: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nname=\"x\"\ndescription=\"x\"\nsrc=\"src\"\nout=\"out\"\nbogus=\"y\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
+    val a: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\nbogus=\"y\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
     if (R.is_ok[Manifest, str](a) || !str_equals(R.unwrap_err[Manifest, str](a), "mach.toml: unknown key 'bogus' in [project]")) { code = 1; }
 
-    val b: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nname=\"x\"\ndescription=\"x\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\nwat=\"z\"\n");
+    val b: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\nwat=\"z\"\n");
     if (R.is_ok[Manifest, str](b) || !str_equals(R.unwrap_err[Manifest, str](b), "mach.toml: unknown key 'wat' in [target.l]")) { code = 1; }
     arena.dnit(?ar);
     ret code;
@@ -1974,7 +2013,7 @@ test "mach.lang.manifest.parse:reserved_target_native" {
     if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
     var code: i32 = 0;
 
-    val a: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nname=\"x\"\ndescription=\"x\"\nsrc=\"src\"\nout=\"out\"\n[target.native]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
+    val a: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.native]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
     if (R.is_ok[Manifest, str](a) || !str_equals(R.unwrap_err[Manifest, str](a), "mach.toml: [target.native] is reserved; 'native' resolves to a declared target")) { code = 1; }
     arena.dnit(?ar);
     ret code;
@@ -1985,10 +2024,10 @@ test "mach.lang.manifest.parse:dep_conflict" {
     if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
     var code: i32 = 0;
 
-    val a: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nname=\"x\"\ndescription=\"x\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[dep.std]\nversion=\"1.0\"\n");
+    val a: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[dep.std]\nversion=\"1.0\"\n");
     if (R.is_ok[Manifest, str](a) || !str_equals(R.unwrap_err[Manifest, str](a), "mach.toml: [dep.std].version is reserved for the registry era")) { code = 1; }
 
-    val b: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nname=\"x\"\ndescription=\"x\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[dep.std]\ngit=\"u\"\npath=\"p\"\n");
+    val b: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[dep.std]\ngit=\"u\"\npath=\"p\"\n");
     if (R.is_ok[Manifest, str](b) || !str_equals(R.unwrap_err[Manifest, str](b), "mach.toml: [dep.std] needs exactly one source key: 'git' or 'path'")) { code = 1; }
     arena.dnit(?ar);
     ret code;
@@ -1999,7 +2038,7 @@ test "mach.lang.manifest.parse:backslash_rejected" {
     if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
     var code: i32 = 0;
 
-    val a: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nname=\"x\"\ndescription=\"x\"\nsrc=\"a\\\\b\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
+    val a: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"a\\\\b\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n");
     if (R.is_ok[Manifest, str](a) || !str_equals(R.unwrap_err[Manifest, str](a), "mach.toml: [project].src contains a '\\\\'; manifest paths use '/'")) { code = 1; }
     arena.dnit(?ar);
     ret code;
@@ -2010,7 +2049,7 @@ test "mach.lang.manifest.resolve_build_unit:native_resolution" {
     if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
     var code: i32 = 0;
 
-    var src: str = "[project]\nid = \"x\"\nversion = \"1\"\nname=\"x\"\ndescription=\"x\"\nsrc=\"src\"\nout=\"out\"\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"*\"]\n";
+    var src: str = "[project]\nid = \"x\"\nversion = \"1\"\nsrc=\"src\"\nout=\"out\"\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
     val st:  str = host_target_stanza(?alloc, "foreign");
     src = cc(?alloc, src, st);
 
@@ -2041,7 +2080,7 @@ test "mach.lang.manifest.resolve_build_unit:default_profile" {
     var code: i32 = 0;
 
     # only [profile.debug] declared -> the empty profile selector resolves 'debug'
-    var s1: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{profile.name}\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\n[profile.debug]\nopt=0\n";
+    var s1: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{profile.name}\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink = []\nneed = []\n[profile.debug]\nopt=0\ndebug = false\n";
     s1 = cc(?alloc, s1, host_target_stanza(?alloc, "h"));
     val r1: R.Result[Manifest, str] = tparse(?alloc, ?itn, s1);
     if (R.is_err[Manifest, str](r1)) { code = 1; }
@@ -2053,7 +2092,7 @@ test "mach.lang.manifest.resolve_build_unit:default_profile" {
     }
 
     # no [profile] section at all -> the conventional 'debug' default, still clean
-    var s2: str = "[project]\nid=\"y\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{profile.name}\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\n";
+    var s2: str = "[project]\nid=\"y\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{profile.name}\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink = []\nneed = []\n";
     s2 = cc(?alloc, s2, host_target_stanza(?alloc, "h"));
     val r2: R.Result[Manifest, str] = tparse(?alloc, ?itn, s2);
     if (R.is_err[Manifest, str](r2)) { code = 1; }
@@ -2072,7 +2111,7 @@ test "mach.lang.manifest.resolve_build_unit:native_resolution_multi_match" {
     if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
     var code: i32 = 0;
 
-    var src: str = "[project]\nid = \"x\"\nversion = \"1\"\nname=\"x\"\ndescription=\"x\"\nsrc=\"src\"\nout=\"out\"\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"*\"]\n";
+    var src: str = "[project]\nid = \"x\"\nversion = \"1\"\nsrc=\"src\"\nout=\"out\"\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
     src = cc(?alloc, src, host_target_stanza(?alloc, "alpha"));
     src = cc(?alloc, src, host_target_stanza(?alloc, "beta"));
 
@@ -2092,7 +2131,7 @@ test "mach.lang.manifest.resolve_build_unit:native_resolution_exact" {
     if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
     var code: i32 = 0;
 
-    var src: str = "[project]\nid = \"x\"\nversion = \"1\"\nname=\"x\"\ndescription=\"x\"\nsrc=\"src\"\nout=\"out\"\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"*\"]\n";
+    var src: str = "[project]\nid = \"x\"\nversion = \"1\"\nsrc=\"src\"\nout=\"out\"\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n";
     src = cc(?alloc, src, "[target.foreign]\nisa = \"nonesuch\"\nos = \"nonesuch\"\nabi = \"x\"\n");
     src = cc(?alloc, src, host_target_stanza(?alloc, "host"));
 
@@ -2117,7 +2156,7 @@ test "mach.lang.manifest.resolve_build_unit:collision_detection" {
     if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
     var code: i32 = 0;
 
-    val res_manifest: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nname=\"x\"\ndescription=\"x\"\nversion=\"0.1.0\"\nsrc=\"src\"\nout=\"bin/app\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.a]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"app\"\ntargets = [\"*\"]\n[artifact.b]\nkind=\"bin\"\nentry=\"b.mach\"\nout=\"app\"\ntargets = [\"*\"]\n");
+    val res_manifest: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"0.1.0\"\nsrc=\"src\"\nout=\"bin/app\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.a]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[artifact.b]\nkind=\"bin\"\nentry=\"b.mach\"\nout=\"app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n");
     if (R.is_err[Manifest, str](res_manifest)) { code = 1; }
     or {
         var m: Manifest = R.unwrap_ok[Manifest, str](res_manifest);
@@ -2125,7 +2164,7 @@ test "mach.lang.manifest.resolve_build_unit:collision_detection" {
         if (R.is_ok[bool, str](cr) || !str_equals(R.unwrap_err[bool, str](cr), "mach.toml: artifacts 'a' and 'b' collide on output path 'bin/app/app'")) { code = 1; }
     }
 
-    val res_clean: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nname=\"x\"\ndescription=\"x\"\nversion=\"0.1.0\"\nsrc=\"src\"\nout=\"out/{target.name}/{profile.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app1\"\ntargets = [\"*\"]\n[artifact.tool]\nkind=\"bin\"\nentry=\"tool.mach\"\nout=\"bin/app2\"\ntargets = [\"*\"]\n");
+    val res_clean: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"0.1.0\"\nsrc=\"src\"\nout=\"out/{target.name}/{profile.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app1\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[artifact.tool]\nkind=\"bin\"\nentry=\"tool.mach\"\nout=\"bin/app2\"\ntargets = [\"*\"]\nlink = []\nneed = []\n");
     if (R.is_err[Manifest, str](res_clean)) { code = 1; }
     or {
         var m: Manifest = R.unwrap_ok[Manifest, str](res_clean);
@@ -2141,10 +2180,10 @@ test "mach.lang.manifest.resolve_build_unit:profile_debug_strict" {
     if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
     var code: i32 = 0;
 
-    val a: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nname=\"x\"\ndescription=\"x\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets = [\"*\"]\n[profile.debug]\nopt = 9\n");
+    val a: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\nopt = 9\ndebug = false\n");
     if (R.is_ok[Manifest, str](a) || !str_contains(R.unwrap_err[Manifest, str](a), "opt must be 0, 1, or 2")) { code = 1; }
 
-    val b: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nname=\"x\"\ndescription=\"x\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets = [\"*\"]\n[profile.debug]\ndebug = 9\n");
+    val b: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.l]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[profile.debug]\nopt = 0\ndebug = 9\n");
     if (R.is_ok[Manifest, str](b) || !str_contains(R.unwrap_err[Manifest, str](b), "debug must be a boolean")) { code = 1; }
     arena.dnit(?ar);
     ret code;
@@ -2176,7 +2215,7 @@ test "mach.lang.manifest.resolve_build_unit:links" {
     if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
     var code: i32 = 0;
 
-    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nname=\"x\"\ndescription=\"x\"\nsrc=\"src\"\nout=\"out\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[link.sys]\nsource=\"system\"\nname=\"c\"\nos=[\"linux\"]\n[link.local_lib]\nsource=\"local\"\npath=\"lib/mylib.a\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets = [\"*\"]\nlink = [\"sys\", \"local_lib\"]\n";
+    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[link.sys]\nsource=\"system\"\nname=\"c\"\nos=[\"linux\"]\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n[link.local_lib]\nsource=\"local\"\npath=\"lib/mylib.a\"\nos=[\"*\"]\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets = [\"*\"]\nlink = [\"sys\", \"local_lib\"]\nneed = []\n";
     val res_manifest: R.Result[Manifest, str] = tparse(?alloc, ?itn, src);
     if (R.is_err[Manifest, str](res_manifest)) { code = 1; }
     or {
@@ -2215,7 +2254,7 @@ test "mach.lang.manifest.parse:link_filter_string_form" {
     # exercise the string form on the other two axes. this pins the #1969 fix: a
     # string filter is no longer silently ignored (degraded to match-any).
     val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[target.arm]\nisa=\"aarch64\"\nos=\"linux\"\nabi=\"aapcs64\"\n[link.os_str]\nsource=\"system\"\nname=\"a\"\nos=\"linux\"\n[link.os_arr]\nsource=\"system\"\nname=\"b\"\nos=[\"linux\"]\n[link.os_star]\nsource=\"system\"\nname=\"c\"\nos=\"*\"\n[link.os_absent]\nsource=\"system\"\nname=\"d\"\n[link.isa_str]\nsource=\"system\"\nname=\"e\"\nisa=\"x86_64\"\n[link.abi_str]\nsource=\"system\"\nname=\"f\"\nabi=\"sysv64\"\n";
-    val res_manifest: R.Result[Manifest, str] = tparse(?alloc, ?itn, src);
+    val res_manifest: R.Result[Manifest, str] = tparse_lenient(?alloc, ?itn, src);
     if (R.is_err[Manifest, str](res_manifest)) { code = 1; }
     or {
         var m: Manifest = R.unwrap_ok[Manifest, str](res_manifest);
@@ -2252,15 +2291,15 @@ test "mach.lang.manifest.expand:project_out" {
     var code: i32 = 0;
 
     # {project.out} substitutes the expanded project out
-    val r1: R.Result[str, str] = expand(?alloc, "{project.out}/obj/x.o", "out/linux/release", "linux", "release", "", "");
+    val r1: R.Result[str, str] = expand(?alloc, "{project.out}/obj/x.o", "out/linux/release", "linux", "release");
     if (R.is_err[str, str](r1) || !str_equals(R.unwrap_ok[str, str](r1), "out/linux/release/obj/x.o")) { code = 1; }
 
     # referencing it while expanding [project].out itself (project_out empty) is an error
-    val r2: R.Result[str, str] = expand(?alloc, "{project.out}/x", "", "linux", "release", "", "");
+    val r2: R.Result[str, str] = expand(?alloc, "{project.out}/x", "", "linux", "release");
     if (R.is_ok[str, str](r2) || !str_contains(R.unwrap_err[str, str](r2), "not available in [project].out")) { code = 1; }
 
     # an unknown variable is still a strict error
-    val r3: R.Result[str, str] = expand(?alloc, "{bogus}", "o", "t", "p", "", "");
+    val r3: R.Result[str, str] = expand(?alloc, "{bogus}", "o", "t", "p");
     if (R.is_ok[str, str](r3) || !str_contains(R.unwrap_err[str, str](r3), "unknown template variable")) { code = 1; }
     arena.dnit(?ar);
     ret code;
@@ -2272,7 +2311,7 @@ test "mach.lang.manifest.resolve_build_unit:local_project_out" {
     var code: i32 = 0;
 
     # a local link path using {project.out} resolves to the expanded project out
-    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[link.obj]\nsource=\"local\"\npath=\"{project.out}/obj/shim.o\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets = [\"*\"]\nlink = [\"obj\"]\n";
+    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[link.obj]\nsource=\"local\"\npath=\"{project.out}/obj/shim.o\"\nos=[\"*\"]\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets = [\"*\"]\nlink = [\"obj\"]\nneed = []\n";
     val res_manifest: R.Result[Manifest, str] = tparse(?alloc, ?itn, src);
     if (R.is_err[Manifest, str](res_manifest)) { code = 1; }
     or {
@@ -2294,7 +2333,7 @@ test "mach.lang.manifest.local_path_demanded_by_step" {
     if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
     var code: i32 = 0;
 
-    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[step.shim]\ncmd=\"cc -c shim.c\"\nin=[\"shim.c\"]\nout=[\"{project.out}/obj/shim.o\"]\n";
+    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[step.shim]\ncmd=\"cc -c shim.c\"\nin=[\"shim.c\"]\nout=[\"{project.out}/obj/shim.o\"]\nneed=[]\n";
     val res_manifest: R.Result[Manifest, str] = tparse(?alloc, ?itn, src);
     if (R.is_err[Manifest, str](res_manifest)) { code = 1; }
     or {
@@ -2319,7 +2358,7 @@ test "mach.lang.manifest.plan_steps" {
     var code: i32 = 0;
 
     val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[link.obj]\nsource=\"local\"\npath=\"{project.out}/o/a.o\"\nos=\"*\"\n[link.win]\nsource=\"local\"\npath=\"{project.out}/o/w.o\"\nos=\"windows\"\n[artifact.app]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[\"obj\",\"win\"]\nneed=[\"gen\"]\n[step.compile]\ncmd=\"cc\"\nin=[\"a.c\"]\nout=[\"{project.out}/o/a.o\"]\n[step.winc]\ncmd=\"cc\"\nin=[\"w.c\"]\nout=[\"{project.out}/o/w.o\"]\n[step.gen]\ncmd=\"g\"\nin=[\"g.in\"]\nout=[\"{project.out}/g.h\"]\nneed=[\"dep\"]\n[step.dep]\ncmd=\"d\"\nin=[\"d.in\"]\nout=[\"{project.out}/d.o\"]\n";
-    val rm: R.Result[Manifest, str] = tparse(?alloc, ?itn, src);
+    val rm: R.Result[Manifest, str] = tparse_lenient(?alloc, ?itn, src);
     if (R.is_err[Manifest, str](rm)) { code = 1; }
     or {
         var m: Manifest = R.unwrap_ok[Manifest, str](rm);
@@ -2361,7 +2400,7 @@ test "mach.lang.manifest.plan_steps:cycle" {
     if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
     var code: i32 = 0;
 
-    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nneed=[\"a\"]\n[step.a]\ncmd=\"x\"\nin=[\"i\"]\nout=[\"{project.out}/a.o\"]\nneed=[\"b\"]\n[step.b]\ncmd=\"y\"\nin=[\"i\"]\nout=[\"{project.out}/b.o\"]\nneed=[\"a\"]\n";
+    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[]\nneed=[\"a\"]\n[step.a]\ncmd=\"x\"\nin=[\"i\"]\nout=[\"{project.out}/a.o\"]\nneed=[\"b\"]\n[step.b]\ncmd=\"y\"\nin=[\"i\"]\nout=[\"{project.out}/b.o\"]\nneed=[\"a\"]\n";
     val rm: R.Result[Manifest, str] = tparse(?alloc, ?itn, src);
     if (R.is_err[Manifest, str](rm)) { code = 1; }
     or {
@@ -2390,7 +2429,7 @@ test "mach.lang.manifest.plan_export_steps" {
     var code: i32 = 0;
 
     val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[link.exp]\nsource=\"local\"\npath=\"{project.out}/o/m.o\"\nos=\"*\"\nexport=true\n[link.noexp]\nsource=\"local\"\npath=\"{project.out}/o/n.o\"\nos=\"*\"\nexport=false\n[link.win]\nsource=\"local\"\npath=\"{project.out}/o/w.o\"\nos=\"windows\"\nexport=true\n[step.mk]\ncmd=\"cc\"\nin=[\"m.c\"]\nout=[\"{project.out}/o/m.o\"]\n[step.no]\ncmd=\"cc\"\nin=[\"n.c\"]\nout=[\"{project.out}/o/n.o\"]\n[step.winmk]\ncmd=\"cc\"\nin=[\"w.c\"]\nout=[\"{project.out}/o/w.o\"]\n";
-    val rm: R.Result[Manifest, str] = tparse(?alloc, ?itn, src);
+    val rm: R.Result[Manifest, str] = tparse_lenient(?alloc, ?itn, src);
     if (R.is_err[Manifest, str](rm)) { code = 1; }
     or {
         var m: Manifest = R.unwrap_ok[Manifest, str](rm);
@@ -2428,8 +2467,85 @@ test "mach.lang.manifest.parse:id_and_out_validation" {
     val ok_id: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"a-b_2\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n");
     if (R.is_err[Manifest, str](ok_id)) { code = 1; }
     # a '*' in a step out is rejected (outputs are concrete)
-    val bad_out: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[step.s]\ncmd=\"cc\"\nin=[\"a.c\"]\nout=[\"{project.out}/*.o\"]\n");
+    val bad_out: R.Result[Manifest, str] = tparse(?alloc, ?itn, "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[step.s]\ncmd=\"cc\"\nin=[\"a.c\"]\nout=[\"{project.out}/*.o\"]\nneed=[]\n");
     if (R.is_ok[Manifest, str](bad_out)) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+# #1971 no-defaults totality: an absent field of a declared table is a strict-parse
+# error in the root manifest, one per declared table kind.
+test "mach.lang.manifest.parse:strict_totality" {
+    var backing: A.Allocator; var ar: arena.Arena; var alloc: A.Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val head: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n";
+
+    # profile spells opt + debug
+    val p_opt: R.Result[Manifest, str] = tparse(?alloc, ?itn, cc(?alloc, head, "[profile.p]\ndebug=false\n"));
+    if (R.is_ok[Manifest, str](p_opt) || !str_contains(R.unwrap_err[Manifest, str](p_opt), "[profile.p] is missing required key 'opt'")) { code = 1; }
+    val p_dbg: R.Result[Manifest, str] = tparse(?alloc, ?itn, cc(?alloc, head, "[profile.p]\nopt=0\n"));
+    if (R.is_ok[Manifest, str](p_dbg) || !str_contains(R.unwrap_err[Manifest, str](p_dbg), "[profile.p] is missing required key 'debug'")) { code = 1; }
+
+    # artifact spells link + need
+    val a_link: R.Result[Manifest, str] = tparse(?alloc, ?itn, cc(?alloc, head, "[artifact.a]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/a\"\ntargets=[\"*\"]\n"));
+    if (R.is_ok[Manifest, str](a_link) || !str_contains(R.unwrap_err[Manifest, str](a_link), "missing required key 'link'")) { code = 1; }
+    val a_need: R.Result[Manifest, str] = tparse(?alloc, ?itn, cc(?alloc, head, "[artifact.a]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/a\"\ntargets=[\"*\"]\nlink=[]\n"));
+    if (R.is_ok[Manifest, str](a_need) || !str_contains(R.unwrap_err[Manifest, str](a_need), "missing required key 'need'")) { code = 1; }
+
+    # link spells os / isa / abi / export
+    val l_os: R.Result[Manifest, str] = tparse(?alloc, ?itn, cc(?alloc, head, "[link.l]\nsource=\"system\"\nname=\"c\"\n"));
+    if (R.is_ok[Manifest, str](l_os) || !str_contains(R.unwrap_err[Manifest, str](l_os), "missing required key 'os'")) { code = 1; }
+    val l_isa: R.Result[Manifest, str] = tparse(?alloc, ?itn, cc(?alloc, head, "[link.l]\nsource=\"system\"\nname=\"c\"\nos=\"*\"\n"));
+    if (R.is_ok[Manifest, str](l_isa) || !str_contains(R.unwrap_err[Manifest, str](l_isa), "missing required key 'isa'")) { code = 1; }
+    val l_abi: R.Result[Manifest, str] = tparse(?alloc, ?itn, cc(?alloc, head, "[link.l]\nsource=\"system\"\nname=\"c\"\nos=\"*\"\nisa=[\"*\"]\n"));
+    if (R.is_ok[Manifest, str](l_abi) || !str_contains(R.unwrap_err[Manifest, str](l_abi), "missing required key 'abi'")) { code = 1; }
+    val l_exp: R.Result[Manifest, str] = tparse(?alloc, ?itn, cc(?alloc, head, "[link.l]\nsource=\"system\"\nname=\"c\"\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\n"));
+    if (R.is_ok[Manifest, str](l_exp) || !str_contains(R.unwrap_err[Manifest, str](l_exp), "missing required key 'export'")) { code = 1; }
+
+    # step spells need; a git dep spells ref
+    val s_need: R.Result[Manifest, str] = tparse(?alloc, ?itn, cc(?alloc, head, "[step.s]\ncmd=\"c\"\nin=[\"i\"]\nout=[\"o\"]\n"));
+    if (R.is_ok[Manifest, str](s_need) || !str_contains(R.unwrap_err[Manifest, str](s_need), "missing required key 'need'")) { code = 1; }
+    val d_ref: R.Result[Manifest, str] = tparse(?alloc, ?itn, cc(?alloc, head, "[dep.d]\ngit=\"u\"\n"));
+    if (R.is_ok[Manifest, str](d_ref) || !str_contains(R.unwrap_err[Manifest, str](d_ref), "missing required key 'ref' for git source")) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+# #1971: filter axes take canonical os/isa/abi values or "*"; "*" (any) is legal and
+# a non-canonical spelling is rejected rather than silently never-matching.
+test "mach.lang.manifest.parse:canonical_and_star" {
+    var backing: A.Allocator; var ar: arena.Arena; var alloc: A.Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val head: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n";
+
+    # a non-canonical os is a strict error
+    val bad: R.Result[Manifest, str] = tparse(?alloc, ?itn, cc(?alloc, head, "[link.l]\nsource=\"system\"\nname=\"c\"\nos=\"windoze\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n"));
+    if (R.is_ok[Manifest, str](bad) || !str_contains(R.unwrap_err[Manifest, str](bad), "non-canonical value 'windoze'")) { code = 1; }
+
+    # "*" on every axis and targets = ["*"] are the explicit-any token and legal
+    val ok: R.Result[Manifest, str] = tparse(?alloc, ?itn, cc(?alloc, head, "[artifact.a]\nkind=\"bin\"\nentry=\"m.mach\"\nout=\"bin/a\"\ntargets=[\"*\"]\nlink=[\"c\"]\nneed=[]\n[link.c]\nsource=\"system\"\nname=\"c\"\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n"));
+    if (R.is_err[Manifest, str](ok)) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+# #1971: the template variable set is closed to {project.out}/{target.name}/
+# {profile.name}; the dropped {name}/{ext} aliases are now unknown (no silent empty).
+test "mach.lang.manifest.expand:closed_set" {
+    var backing: A.Allocator; var ar: arena.Arena; var alloc: A.Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val ext: R.Result[str, str] = expand(?alloc, "bin/app{ext}", "out", "linux", "release");
+    if (R.is_ok[str, str](ext) || !str_contains(R.unwrap_err[str, str](ext), "unknown template variable")) { code = 1; }
+    val nm: R.Result[str, str] = expand(?alloc, "test/{name}", "out", "linux", "release");
+    if (R.is_ok[str, str](nm) || !str_contains(R.unwrap_err[str, str](nm), "unknown template variable")) { code = 1; }
+    # the closed set still resolves
+    val good: R.Result[str, str] = expand(?alloc, "{project.out}/{target.name}/{profile.name}", "o", "linux", "release");
+    if (R.is_err[str, str](good) || !str_equals(R.unwrap_ok[str, str](good), "o/linux/release")) { code = 1; }
     arena.dnit(?ar);
     ret code;
 }
@@ -2442,7 +2558,7 @@ test "mach.lang.manifest.resolve_test_libs:union" {
     # `mach test` links the union of every artifact's referenced entries, filtered
     # to the native target and deduplicated: app->{a,shared}, tool->{b,shared,c};
     # c filters out (windows-only) and shared dedups, so the union is {a,b,shared}.
-    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[link.a]\nsource=\"system\"\nname=\"liba\"\nos=\"*\"\n[link.b]\nsource=\"system\"\nname=\"libb\"\nos=\"linux\"\n[link.c]\nsource=\"system\"\nname=\"libc\"\nos=\"windows\"\n[link.shared]\nsource=\"system\"\nname=\"libshared\"\nos=\"*\"\n[artifact.app]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[\"a\",\"shared\"]\n[artifact.tool]\nkind=\"bin\"\nentry=\"t.mach\"\nout=\"bin/tool\"\ntargets=[\"*\"]\nlink=[\"b\",\"shared\",\"c\"]\n";
+    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out/{target.name}\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[link.a]\nsource=\"system\"\nname=\"liba\"\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n[link.b]\nsource=\"system\"\nname=\"libb\"\nos=\"linux\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n[link.c]\nsource=\"system\"\nname=\"libc\"\nos=\"windows\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n[link.shared]\nsource=\"system\"\nname=\"libshared\"\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n[artifact.app]\nkind=\"bin\"\nentry=\"a.mach\"\nout=\"bin/app\"\ntargets=[\"*\"]\nlink=[\"a\",\"shared\"]\nneed=[]\n[artifact.tool]\nkind=\"bin\"\nentry=\"t.mach\"\nout=\"bin/tool\"\ntargets=[\"*\"]\nlink=[\"b\",\"shared\",\"c\"]\nneed=[]\n";
     val res_manifest: R.Result[Manifest, str] = tparse(?alloc, ?itn, src);
     if (R.is_err[Manifest, str](res_manifest)) { code = 1; }
     or {
@@ -2500,7 +2616,7 @@ test "mach.lang.manifest.parse:link_filter_empty_array_matches_nothing" {
     # explicit os = [] says "none" (#1964) and matches NO cell, distinct from an
     # absent axis which matches any until strict totality (#1971).
     val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[target.arm]\nisa=\"aarch64\"\nos=\"linux\"\nabi=\"aapcs64\"\n[link.none]\nsource=\"system\"\nname=\"a\"\nos=[]\n[link.absent]\nsource=\"system\"\nname=\"b\"\n";
-    val res_manifest: R.Result[Manifest, str] = tparse(?alloc, ?itn, src);
+    val res_manifest: R.Result[Manifest, str] = tparse_lenient(?alloc, ?itn, src);
     if (R.is_err[Manifest, str](res_manifest)) { code = 1; }
     or {
         var m: Manifest = R.unwrap_ok[Manifest, str](res_manifest);
@@ -2527,7 +2643,7 @@ test "mach.lang.manifest.resolve_build_unit:artifact_target_filter" {
     if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
     var code: i32 = 0;
 
-    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nname=\"x\"\ndescription=\"x\"\nsrc=\"src\"\nout=\"out\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets = [\"linux\"]\n";
+    val src: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n[target.linux]\nisa=\"x86_64\"\nos=\"linux\"\nabi=\"sysv64\"\n[target.windows]\nisa=\"x86_64\"\nos=\"windows\"\nabi=\"win64\"\n[artifact.app]\nkind=\"bin\"\nentry=\"main.mach\"\nout=\"bin/app\"\ntargets = [\"linux\"]\nlink = []\nneed = []\n";
     val res_manifest: R.Result[Manifest, str] = tparse(?alloc, ?itn, src);
     if (R.is_err[Manifest, str](res_manifest)) { code = 1; }
     or {
