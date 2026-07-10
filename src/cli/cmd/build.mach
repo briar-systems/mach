@@ -54,6 +54,7 @@ use mach.lang.session;
 use mach.lang.source;
 use mach.lang.target;
 use mach.lang.target.of;
+use mach.lang.target.of.ar;
 
 # the outcome of a single `build` invocation
 # ---
@@ -1526,6 +1527,115 @@ fun subst_name(tmpl: str, name: str, out: *u8, cap: usize) usize {
 # images:       the per-module object images to write
 # out_path:     receives the owned produced-artifact path on success
 # ret:          0 on success, 1 on a user error, 2 on an internal error
+# free the per-member read buffers and symbol-name arrays, then the member array
+fun free_members(alloc: *A.Allocator, members: *ar.ArMember, cap: u32) {
+    var i: u32 = 0;
+    for (i < cap) {
+        if (members[i].data != nil) { A.deallocate[u8](alloc, members[i].data, (members[i].len + 1)::usize); }
+        if (members[i].sym_names != nil && members[i].sym_count > 0) { A.deallocate[str](alloc, members[i].sym_names, members[i].sym_count::usize); }
+        i = i + 1;
+    }
+    A.deallocate[ar.ArMember](alloc, members, cap::usize);
+}
+
+# fill `member.sym_names` with the object image's defined global symbol names (for the
+# archive symbol index): a symbol is global (`SYM_OBJ_FLAG_GLOBAL`) and defined here
+# (`section != SECTION_EXTERNAL`). names resolve against the image's own interner.
+fun collect_defined_globals(p: *driver.Project, img: *of.ObjectImage, member: *ar.ArMember) bool {
+    member.sym_names = nil;
+    member.sym_count = 0;
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < img.symbol_count) {
+        if ((img.symbols[i].flags & of.SYM_OBJ_FLAG_GLOBAL) != 0 && img.symbols[i].section != of.SECTION_EXTERNAL) { n = n + 1; }
+        i = i + 1;
+    }
+    if (n == 0) { ret true; }
+    val res: R.Result[*str, str] = A.allocate[str](p.s.alloc, n::usize);
+    if (R.is_err[*str, str](res)) { ret false; }
+    val names: *str = R.unwrap_ok[*str, str](res);
+    var w: u32 = 0;
+    i = 0;
+    for (i < img.symbol_count) {
+        if ((img.symbols[i].flags & of.SYM_OBJ_FLAG_GLOBAL) != 0 && img.symbols[i].section != of.SECTION_EXTERNAL) {
+            val nm: O.Option[str] = intern.lookup(img.interner, img.symbols[i].name);
+            if (O.is_some[str](nm)) { names[w] = O.unwrap[str](nm); w = w + 1; }
+        }
+        i = i + 1;
+    }
+    member.sym_names = names;
+    member.sym_count = w;
+    ret true;
+}
+
+# archive the artifact's per-module objects into a static `ar` library at its declared
+# `out` (#1980 phase 1). members are the freshly written `.o` files, each contributing
+# its defined global symbols to the archive symbol index. Sets `*out_path` to the
+# archive path on success. `paths` must still be live (the objects are read here).
+# ---
+# p:            the project carrying the module graph and session
+# images:       the per-module codegen images, indexed by module id
+# paths:        the written per-module object paths, indexed by topo position
+# root:         the resolved project root directory
+# out_override: the `-o` artifact path, or nil to use the resolved path
+# out_path:     receives the owned archive path on success
+# ret:          0 on success, 1 on a user error, 2 on an internal error
+fun emit_static_archive(p: *driver.Project, images: *of.ObjectImage, paths: **u8, root: *u8, out_override: *u8, out_path: **u8) i64 {
+    val len: u32 = p.topo_len;
+
+    var archive: [4096]u8;
+    if (out_override != nil) {
+        util.path_into(?archive[0], 4096, root, out_override);
+    }
+    or {
+        val opt_bin: O.Option[str] = intern.lookup(?p.s.interner, p.config.bin_out);
+        if (O.is_none[str](opt_bin) || str_empty(O.unwrap[str](opt_bin))) {
+            print.eprint("error: selected artifact has no output path; set the `out` template in mach.toml\n");
+            ret 1;
+        }
+        join_into_str(?archive[0], 4096, root, O.unwrap[str](opt_bin));
+    }
+    if (!util.ensure_parents(?archive[0])) {
+        print.eprint("error: failed to create library directory\n");
+        ret 2;
+    }
+
+    val res_mem: R.Result[*ar.ArMember, str] = A.allocate[ar.ArMember](p.s.alloc, len::usize);
+    if (R.is_err[*ar.ArMember, str](res_mem)) { print.eprint("error: out of memory\n"); ret 2; }
+    val members: *ar.ArMember = R.unwrap_ok[*ar.ArMember, str](res_mem);
+    var i: u32 = 0;
+    for (i < len) { members[i].name = ""; members[i].data = nil; members[i].len = 0; members[i].sym_names = nil; members[i].sym_count = 0; i = i + 1; }
+
+    i = 0;
+    for (i < len) {
+        val mid: session.ModuleId    = p.topo[i];
+        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
+        val fqn_opt: O.Option[str]   = intern.lookup(?p.s.interner, m.fqn);
+        if (O.is_none[str](fqn_opt)) { free_members(p.s.alloc, members, len); print.eprint("error: module FQN not interned\n"); ret 2; }
+        members[i].name = O.unwrap[str](fqn_opt);
+
+        val rr: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(p.s.alloc, paths[i]::str);
+        if (R.is_err[filesystem.Buffer, str](rr)) { free_members(p.s.alloc, members, len); print.eprint("error: cannot read object for archive\n"); ret 2; }
+        val b: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rr);
+        members[i].data = b.data;
+        members[i].len  = b.len;
+
+        if (!collect_defined_globals(p, ?images[mid::u32], ?members[i])) { free_members(p.s.alloc, members, len); print.eprint("error: out of memory\n"); ret 2; }
+        i = i + 1;
+    }
+
+    val wr: R.Result[bool, str] = ar.write_archive(p.s.alloc, members, len, util.cstr_str(?archive[0]));
+    free_members(p.s.alloc, members, len);
+    if (R.is_err[bool, str](wr)) {
+        print.eprint("error: ");
+        print.eprint(R.unwrap_err[bool, str](wr));
+        print.eprint("\n");
+        ret 2;
+    }
+    @out_path = dup_cstr(p.s.alloc, ?archive[0]);
+    ret 0;
+}
+
 fun link_artifact(p: *driver.Project, emit_obj: bool, root: *u8,
                   out_override: *u8,
                   argc: usize, argv: **u8, marks: *bool,
@@ -1556,9 +1666,18 @@ fun link_artifact(p: *driver.Project, emit_obj: bool, root: *u8,
     if (obj_code != 0) { ret obj_code; }
     var len: u32 = p.topo_len;
 
-    # library mode (or `--emit obj`): the per-module objects are the deliverable;
-    # do not link an executable.
+    # library mode (or `--emit obj`): the per-module objects are the deliverable; do
+    # not link an executable. a `kind = "static"` artifact additionally archives those
+    # objects into a real `ar` library at its declared `out` (#1980). `--emit obj` and
+    # (phase 2) `kind = "shared"` keep the loose-objects deliverable unchanged.
     if (te.mode == driver.MODE_LIBRARY || emit_obj) {
+        if (te.mode == driver.MODE_LIBRARY && !emit_obj && te.lib_kind == manifest.LIBKIND_STATIC) {
+            val arc_code: i64 = emit_static_archive(p, images, paths, root, out_override, out_path);
+            free_paths(p.s.alloc, paths, len, len);
+            if (arc_code != 0) { ret arc_code; }
+            readout.phase_end(p.s.readout, readout.PH_LINK, 1, "archive", "archives");
+            ret 0;
+        }
         free_paths(p.s.alloc, paths, len, len);
         @out_path = dup_cstr(p.s.alloc, ?obj_base[0]);
         readout.phase_end(p.s.readout, readout.PH_LINK, len, "object", "objects");
