@@ -241,6 +241,11 @@ pub rec Block {
 # dbg_expr_cap: allocated capacity of `dbg_exprs`
 # dbg_expr_ids: OP_DBG_VALUE instruction id -> the DbgExprId it applies to its
 #              operand; an absent entry means DBG_EXPR_IDENTITY
+# alloca_dbg_vars: OP_ALLOCA instruction id -> the DbgVar the promoted slot stands
+#              for (name/ty/scope). populated only under `-g`, at the local's decl
+#              lowering, so mem2reg can name the variable when it births a dbg-value
+#              at the phi it inserts for the promoted alloca (#1904). the identity is
+#              the same one the local's OP_DBG_VALUE births carry.
 pub rec Function {
     name:        intern.StrId;
     sig:         type.IrTypeId;
@@ -270,6 +275,7 @@ pub rec Function {
     dbg_expr_len: u32;
     dbg_expr_cap: u32;
     dbg_expr_ids: map.Map[id.InstructionId, DbgExprId];
+    alloca_dbg_vars: map.Map[id.InstructionId, DbgVar];
 
     # inlined-subroutine instances created by the inline pass (owned); empty when the
     # function contains no inlined code. `instr_inline_site` maps a cloned instruction
@@ -496,6 +502,7 @@ fun function_dnit(m: *Module, fn: *Function) {
     map.dnit[id.InstructionId, IrAsm](?fn.asm_blocks);
     # DbgVar owns no heap storage, so the map's own teardown suffices.
     map.dnit[id.InstructionId, DbgVar](?fn.dbg_vars);
+    map.dnit[id.InstructionId, DbgVar](?fn.alloca_dbg_vars);
 
     # each pooled expression owns its ops array; free those, then the pool and the
     # per-point id map (a DbgExprId owns no heap storage).
@@ -590,6 +597,7 @@ pub fun function_new(alloc: *A.Allocator, name: intern.StrId, sig: type.IrTypeId
     f.dbg_expr_len = 0;
     f.dbg_expr_cap = 0;
     f.dbg_expr_ids = map.init[id.InstructionId, DbgExprId](alloc, map.hash_u32, map.eq_u32);
+    f.alloca_dbg_vars = map.init[id.InstructionId, DbgVar](alloc, map.hash_u32, map.eq_u32);
     f.inline_sites      = nil;
     f.inline_site_len   = 0;
     f.inline_site_cap   = 0;
@@ -781,6 +789,31 @@ pub fun phi_append_incoming(m: *Module, phi: *instruction.Instruction, pred: id.
 pub fun dbg_var_get(fn: *Function, iid: id.InstructionId) O.Option[*DbgVar] {
     var key: id.InstructionId = iid;
     val res: R.Result[*DbgVar, str] = map.get[id.InstructionId, DbgVar](?fn.dbg_vars, ?key);
+    if (R.is_err[*DbgVar, str](res)) { ret O.none[*DbgVar](); }
+    ret O.some[*DbgVar](R.unwrap_ok[*DbgVar, str](res));
+}
+
+# link a promoted-alloca instruction id to the source variable it stands for, so
+# mem2reg can name that variable when it births a dbg-value at an inserted phi
+# (#1904). recorded only under `-g`, at the local's decl lowering
+# ---
+# fn:        the owning function
+# alloca_id: the OP_ALLOCA instruction id of the local's slot
+# dv:        the source-variable identity (the same one the local's births carry)
+# ret:       ok(true) once recorded, or an allocation error
+pub fun record_alloca_dbg_var(fn: *Function, alloca_id: id.InstructionId, dv: DbgVar) R.Result[bool, str] {
+    ret map.insert[id.InstructionId, DbgVar](?fn.alloca_dbg_vars, alloca_id, dv);
+}
+
+# the source-variable identity a promoted alloca stands for, or none when the alloca
+# has no `-g` link. read by mem2reg's phi-birth path (#1904)
+# ---
+# fn:        the owning function
+# alloca_id: an OP_ALLOCA instruction id
+# ret:       some(*DbgVar) when linked, else none
+pub fun alloca_dbg_var_get(fn: *Function, alloca_id: id.InstructionId) O.Option[*DbgVar] {
+    var key: id.InstructionId = alloca_id;
+    val res: R.Result[*DbgVar, str] = map.get[id.InstructionId, DbgVar](?fn.alloca_dbg_vars, ?key);
     if (R.is_err[*DbgVar, str](res)) { ret O.none[*DbgVar](); }
     ret O.some[*DbgVar](R.unwrap_ok[*DbgVar, str](res));
 }
@@ -1060,6 +1093,36 @@ pub fun block_append_instr(m: *Module, blk: *Block, i: id.InstructionId) R.Resul
         blk.instr_cap    = new_cap;
     }
     blk.instructions[blk.instr_count] = i;
+    blk.instr_count = blk.instr_count + 1;
+    ret R.ok[bool, str](true);
+}
+
+# prepend an InstructionId to the front of a block's body (position 0, conceptually
+# right after the phis), shifting the existing entries right. mem2reg uses this to
+# place a phi-merge dbg-value birth at the merge block entry (#1904)
+# ---
+# m:   module owning the allocator
+# blk: block whose body receives the instruction id at its front
+# i:   the instruction id to prepend
+# ret: ok(true) on success, or an allocation error
+pub fun block_prepend_instr(m: *Module, blk: *Block, i: id.InstructionId) R.Result[bool, str] {
+    if (blk.instr_count >= blk.instr_cap) {
+        var new_cap: u32 = blk.instr_cap * 2;
+        if (new_cap < INITIAL_BLOCK_LIST_CAP) { new_cap = INITIAL_BLOCK_LIST_CAP; }
+        val res_grow: R.Result[*id.InstructionId, str] =
+            A.reallocate[id.InstructionId](m.alloc, blk.instructions, blk.instr_cap::usize, new_cap::usize);
+        if (R.is_err[*id.InstructionId, str](res_grow)) {
+            ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](res_grow));
+        }
+        blk.instructions = R.unwrap_ok[*id.InstructionId, str](res_grow);
+        blk.instr_cap    = new_cap;
+    }
+    var j: u32 = blk.instr_count;
+    for (j > 0) {
+        blk.instructions[j] = blk.instructions[j - 1];
+        j = j - 1;
+    }
+    blk.instructions[0] = i;
     blk.instr_count = blk.instr_count + 1;
     ret R.ok[bool, str](true);
 }
