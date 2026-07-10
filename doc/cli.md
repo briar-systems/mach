@@ -41,7 +41,7 @@ argument forwarding.
 | `run`   | execute the already-built binary (a post-`build` convenience, not a rebuild) |
 | `test`  | build the test binary and run the collected tests |
 | `clean` | remove the project's build output directory trees |
-| `dep`   | manage git-backed dependencies (clone, lock, vendor) under `<dep>` |
+| `dep`   | manage git-backed dependencies (clone, lock, vendor) under `dep` |
 | `init`  | scaffold a new project |
 | `doc`   | generate Markdown reference docs from source doc-comments |
 | `info`  | print compiler version, build host, and registered target capabilities |
@@ -91,8 +91,8 @@ resolved artifact path (its `out` template); for a `static`/`shared` library (or
 with `--emit obj`) the objects are the deliverable and nothing is linked.
 
 The optimisation pipeline comes from the selected profile's `opt` (`--profile
-<name>`, or the first declared profile); there are no `-O`/`--release`
-pipeline-selection flags.
+<name>`, or the first declared profile) — the profile is how a build picks its
+optimisation level.
 
 | Flag           | Value          | Effect |
 |----------------|----------------|--------|
@@ -307,10 +307,10 @@ on an allocator or io failure.
 mach dep <action> [args]
 ```
 
-Manages the project's dependency tree under `<dep>`. Dispatches on `argv[2]`.
+Manages the project's dependency tree under `dep`. Dispatches on `argv[2]`.
 A dependency has exactly one source form: a **git** URL plus a ref, which mach
-acquires into `<dep>/<name>/` with plain git operations, or a **path** to another
-project tree, never fetched but materialised at `<dep>/<name>/` as a relative
+acquires into `dep/<name>/` with plain git operations, or a **path** to another
+project tree, never fetched but materialised at `dep/<name>/` as a relative
 symlink so the build resolves it by the same vendor layout.
 
 | Action   | Args | Effect |
@@ -334,7 +334,7 @@ invoked with an allowlisted environment (`PATH`, `HOME`, and the common
 git/ssh/proxy/CA variables). Git's absence is a clean error naming the operation
 that needed it.
 
-For each git dependency, `pull` clones the `git` URL into `<dep>/<name>/` when
+For each git dependency, `pull` clones the `git` URL into `dep/<name>/` when
 absent, then checks out the resolved commit as a **detached HEAD**
 (`git checkout --detach`). A ref resolves as: `branch/<n>` (the remote-tracking
 branch tip), `tag/<n>`, `commit/<n>` or a 7–40 char hex SHA (the literal commit),
@@ -344,7 +344,7 @@ plain git operations, so a checkout the user also commits as a **submodule**
 composes naturally — a moved checkout surfaces as gitlink drift in the parent
 repo's `git status`. mach never invokes `git submodule`.
 
-A **non-empty** directory present under `<dep>/<name>/` without a `.git` entry,
+A **non-empty** directory present under `dep/<name>/` without a `.git` entry,
 while the manifest declares it a git dep, is a hard error: declare it a `path`
 dependency if those are vendored files. (`.git` as a file — a submodule gitlink —
 counts as a checkout.) An **empty** directory has nothing to vendor and is treated
@@ -352,7 +352,7 @@ as absent — `pull` clones into it — so a plain `git clone` (without
 `--recurse-submodules`), which leaves a submodule dep dir empty, is repaired by a
 plain `mach dep pull` (#1329).
 
-For each **path** dependency, `pull` materialises the source at `<dep>/<name>/` as
+For each **path** dependency, `pull` materialises the source at `dep/<name>/` as
 a relative symlink, so the build resolves its modules by the same vendor layout as
 a git dep. The `path` is resolved relative to the requiring manifest's directory;
 the link is relative, so a tree that moves as a whole (a monorepo, a committed
@@ -366,7 +366,7 @@ by a real directory (a stale git checkout, foreign vendored files) is a hard err
 ### Transitive resolution
 
 Transitive deps resolve into the **flat dep tree**: every git dep, direct or
-transitive, lives at `<dep>/<name>/`, so a dependency's own
+transitive, lives at `dep/<name>/`, so a dependency's own
 `[target.*].libs` cascade into the consumer's build (see `manifest.md`). The same
 name required from two different sources or refs is a hard error naming both
 requirers; there is no version resolution (reserved for the registry era).

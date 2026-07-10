@@ -167,12 +167,19 @@ reads the selected artifact's name.
 
 | Key       | Required | Meaning |
 |-----------|----------|---------|
-| `kind`    | yes | `"bin"` (an executable), `"static"` (a static library — the per-module objects are the deliverable), or `"shared"` (a shared library). |
+| `kind`    | yes | `"bin"`, `"static"`, or `"shared"` (see below). |
 | `entry`   | yes | Entry source, relative to the project `src` dir (e.g. `main.mach` for `src/main.mach`). The entry module's FQN is `<id>.<entry without .mach>`, `/` turned into `.`. |
 | `out`     | yes | This artifact's output path, a template (see [Path templates](#path-templates)). An executable extension, where wanted, is written literally into this path. |
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
 | `link`    | yes | Array of `[link.X]` names this artifact links (see below). `[]` for none. |
 | `need`    | yes | Array of `[step.X]` names this artifact demands directly, for step outputs that are not themselves link inputs. `[]` for none. |
+
+- **`bin`** links an executable at the resolved `out` path.
+- **`static`** materialises a real `ar` archive at the resolved `out` path — the
+  per-module objects with an archive symbol index, the deliverable a consumer links
+  as a `.a` (#1997).
+- **`shared`** is reserved for a shared-library deliverable; its emission is phase 2
+  (#1980).
 
 Per-target extension or per-target entry is not a per-cell exception table — it is a
 second artifact stanza, so the condition stays visible like everything else.
