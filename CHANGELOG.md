@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.3.1] - 2026-07-10
+
+The seed-gate patch for the SIMD program. The manifest parser now accepts and
+validates the `simd` profile key (`"scalarize"` | `"require"`) without requiring
+it — the staging step that lets the next compiler parse a swept manifest tree
+before the required-everywhere flip lands with the SIMD gate. Alongside it,
+`.debug_str` is string-merge deduplicated across modules, and the aarch64
+shared-object path is verified end to end and carries its GOT relocation
+foundation. Built with mach 3.3.0.
+
+### Added
+- manifest: **the `simd` profile key parses** — accepted and value-validated
+  (`"scalarize"` | `"require"`) on a declared `[profile.X]`, not yet required;
+  the required-everywhere flip ships with the SIMD gate (#1965, #2013, #2027).
+- link: **aarch64 GOT relocation foundation** — `RK_GOT_PAGE21`/`RK_GOT_LO12`
+  mapped to `R_AARCH64_ADR_GOT_PAGE`/`R_AARCH64_LD64_GOT_LO12_NC`, with a
+  unit-tested GOT-indirect encode primitive, dormant pending the imported-data
+  ruling (RFC #2026); aarch64 `kind = "shared"` output verified end to end —
+  PIC-clean internal references, `R_AARCH64_RELATIVE` dynamic relocations, and
+  the release/`-g` byte rules (#1980, #2022, #2023).
+
+### Fixed
+- debuginfo: **`.debug_str` is string-merge deduplicated across modules** —
+  406,117 → 166,072 bytes on the compiler itself, with a per-site
+  content-equality guard that turns a wrong remap into a loud link error
+  (#1708, #2025).
+
 ## [3.3.0] - 2026-07-10
 
 The shared-objects and debugging-experience release. `kind = "shared"` artifacts
