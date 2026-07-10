@@ -2185,13 +2185,22 @@ fun so_basename(path: *u8) str {
 # and a PT_GNU_RELRO over any reloc-bearing read-only segment. Unlike an executable
 # it has no entry point and publishes an EXPORT table instead of imports: a
 # `.dynsym` of GLOBAL/defined entries (`st_value` the symbol's link-time vaddr,
-# `st_shndx` a defined marker) reachable through a single-bucket SysV `.hash`, and
-# a `.dynamic` naming the object with `DT_SONAME` (the output basename) so a
-# consumer resolves its imports against these symbols at load. The exported
-# symbols carry no allocated section-header index - like every mach image this
-# file is program-headers-only, and the dynamic loader resolves an export by its
-# `.dynsym` value, never by a section header - so `st_shndx` is a non-special
-# "defined" marker (1) that makes the loader add the load bias to `st_value`.
+# `st_shndx` the containing load segment's section index) reachable through a
+# single-bucket SysV `.hash`, and a `.dynamic` naming the object with `DT_SONAME`
+# (the output basename) so a consumer resolves its imports against these symbols at
+# load.
+#
+# Section-header contract. A RELEASE object is program-headers-only (no section
+# table) - the load truth is the program headers, and the dynamic loader resolves
+# an export by its `.dynsym` value, never by a section header. A `-g` object already
+# appends a trailing, non-loaded section table for its debug sections; this writer
+# extends that table into a full DESCRIPTIVE one - a header per load segment (its
+# `.text`/`.data`/`.rodata`), the dynamic sections, and the debug sections - so
+# tooling that reads sections resolves each export to its real section (`objdump -T`
+# shows a function as `.text` / type `T`). Only headers + names are added; no
+# loadable byte moves, so `-g` stays byte-additive. `st_shndx` names the export's
+# load segment either way: the loader ignores it (bar `SHN_UNDEF`), and it is a
+# valid index once the `-g` table exists.
 #
 # P2a scope is self-contained shared objects: exports and base relocations, no
 # dynamic imports of other libraries (those need the PLT/GOT machinery `emit_dyn_exec`
@@ -2316,31 +2325,53 @@ fun emit_shared(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTa
     val struct_total: usize = dyn_off + dyn_size;
     val ro_size: usize = struct_total - ro_off;
 
-    # the allocated dynamic sections, named/located in the trailing section-header
-    # table so `nm -D` / `objdump -T` (which read sections when a table is present)
-    # see the exports instead of an empty result. their bodies already live in the RO
-    # load segment; only headers + names are added, and only on a -g build (the table
-    # exists solely to carry the debug sections). `link` is the aux section's SHT
-    # index of its cross-referenced section: aux[0..3] land at SHT indices 1..4, so
-    # .dynsym/.dynamic link .dynstr (2) and .hash links .dynsym (1). the release .so
-    # has no debug sections, so no table and no aux headers - it stays byte-identical.
-    var aux: [4]ShtAlloc;
-    aux[0].name = ".dynsym";  aux[0].sh_type = SHT_DYNSYM;  aux[0].flags = SHF_ALLOC;
-    aux[0].addr = dynsym_va;  aux[0].off = dynsym_off;  aux[0].size = dynsym_size;  aux[0].link = 2; aux[0].info = 1; aux[0].entsize = SYM_SIZE;
-    aux[1].name = ".dynstr";  aux[1].sh_type = SHT_STRTAB;  aux[1].flags = SHF_ALLOC;
-    aux[1].addr = dynstr_va;  aux[1].off = dynstr_off;  aux[1].size = dynstr_size;  aux[1].link = 0; aux[1].info = 0; aux[1].entsize = 0;
-    aux[2].name = ".hash";    aux[2].sh_type = SHT_HASH;    aux[2].flags = SHF_ALLOC;
-    aux[2].addr = hash_va;    aux[2].off = hash_off;    aux[2].size = hash_size;    aux[2].link = 1; aux[2].info = 0; aux[2].entsize = 4;
-    aux[3].name = ".dynamic"; aux[3].sh_type = SHT_DYNAMIC; aux[3].flags = SHF_ALLOC;
-    aux[3].addr = dyn_va;     aux[3].off = dyn_off;     aux[3].size = dyn_size;     aux[3].link = 2; aux[3].info = 0; aux[3].entsize = DYN_SIZE;
+    # every already-emitted allocated section, named/located in the trailing
+    # section-header table so tooling that reads sections resolves an export to its
+    # real code/data section (a function export shows as .text / type T) and finds
+    # the dynamic tables. the bodies already live in the load segments / RO block;
+    # only headers + names are added, and only on a -g build (the table exists to
+    # carry the debug sections). order: one PROGBITS per load segment at SHT indices
+    # 1..seg_count - matching each export's st_shndx below - then the dynamic
+    # sections. cross-references (.dynsym/.dynamic -> .dynstr, .hash -> .dynsym) are
+    # resolved against this order. the release .so has no debug sections, so no table
+    # and no aux headers, and stays byte-identical.
+    val aux_count: u32 = seg_count + 4;
+    var aux: *ShtAlloc = nil;
+    val axr: R.Result[*ShtAlloc, str] = A.zallocate[ShtAlloc](alloc, aux_count::usize);
+    if (R.is_err[*ShtAlloc, str](axr)) {
+        if (exp_str != nil)     { A.deallocate[usize](alloc, exp_str, nexp::usize); }
+        if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
+        ret R.err[bool, str]("elf: shared aux-section table alloc failed");
+    }
+    aux = R.unwrap_ok[*ShtAlloc, str](axr);
+    li = 0;
+    for (li < seg_count) {
+        aux[li].name = seg_section_name(segs[li].flags);
+        aux[li].sh_type = SHT_PROGBITS; aux[li].flags = seg_section_flags(segs[li].flags);
+        aux[li].addr = segs[li].vaddr;  aux[li].off = seg_offsets[li]; aux[li].size = segs[li].filesz;
+        aux[li].link = 0; aux[li].info = 0; aux[li].entsize = 0;
+        li = li + 1;
+    }
+    # the dynamic sections follow: .dynsym at SHT index seg_count+1, .dynstr at
+    # seg_count+2, .hash at seg_count+3, .dynamic at seg_count+4.
+    val i_dynsym: u32 = seg_count + 1;
+    val i_dynstr: u32 = seg_count + 2;
+    aux[seg_count].name = ".dynsym";      aux[seg_count].sh_type = SHT_DYNSYM;      aux[seg_count].flags = SHF_ALLOC;
+    aux[seg_count].addr = dynsym_va;      aux[seg_count].off = dynsym_off;      aux[seg_count].size = dynsym_size;  aux[seg_count].link = i_dynstr; aux[seg_count].info = 1; aux[seg_count].entsize = SYM_SIZE;
+    aux[seg_count + 1].name = ".dynstr";  aux[seg_count + 1].sh_type = SHT_STRTAB;  aux[seg_count + 1].flags = SHF_ALLOC;
+    aux[seg_count + 1].addr = dynstr_va;  aux[seg_count + 1].off = dynstr_off;  aux[seg_count + 1].size = dynstr_size;  aux[seg_count + 1].link = 0; aux[seg_count + 1].info = 0; aux[seg_count + 1].entsize = 0;
+    aux[seg_count + 2].name = ".hash";    aux[seg_count + 2].sh_type = SHT_HASH;    aux[seg_count + 2].flags = SHF_ALLOC;
+    aux[seg_count + 2].addr = hash_va;    aux[seg_count + 2].off = hash_off;    aux[seg_count + 2].size = hash_size;    aux[seg_count + 2].link = i_dynsym; aux[seg_count + 2].info = 0; aux[seg_count + 2].entsize = 4;
+    aux[seg_count + 3].name = ".dynamic"; aux[seg_count + 3].sh_type = SHT_DYNAMIC; aux[seg_count + 3].flags = SHF_ALLOC;
+    aux[seg_count + 3].addr = dyn_va;     aux[seg_count + 3].off = dyn_off;     aux[seg_count + 3].size = dyn_size;     aux[seg_count + 3].link = i_dynstr; aux[seg_count + 3].info = 0; aux[seg_count + 3].entsize = DYN_SIZE;
 
     # a section-header table trails the whole image, outside every PT_LOAD, when the
     # object carries debug sections (a -g build); it names the debug sections and the
-    # allocated dynamic sections above. absent (and the image byte-identical) with no
-    # debug input.
+    # allocated sections above. absent (and the image byte-identical) with no debug input.
     var dsht: DebugSht;
-    val dp: R.Result[DebugSht, str] = debug_sht_plan(alloc, itn, debug, debug_count, ?aux[0], 4, struct_total);
+    val dp: R.Result[DebugSht, str] = debug_sht_plan(alloc, itn, debug, debug_count, aux, aux_count, struct_total);
     if (R.is_err[DebugSht, str](dp)) {
+        A.deallocate[ShtAlloc](alloc, aux, aux_count::usize);
         if (exp_str != nil)     { A.deallocate[usize](alloc, exp_str, nexp::usize); }
         if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
         ret R.err[bool, str](R.unwrap_err[DebugSht, str](dp));
@@ -2350,7 +2381,8 @@ fun emit_shared(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTa
 
     val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_size);
     if (R.is_err[*u8, str](res_buf)) {
-        debug_sht_free(alloc, ?dsht, debug_count, 4);
+        debug_sht_free(alloc, ?dsht, debug_count, aux_count);
+        A.deallocate[ShtAlloc](alloc, aux, aux_count::usize);
         if (exp_str != nil)     { A.deallocate[usize](alloc, exp_str, nexp::usize); }
         if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
         ret R.err[bool, str]("elf: shared buffer alloc failed");
@@ -2358,7 +2390,7 @@ fun emit_shared(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTa
     var buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
 
     # ELF header: ET_DYN, no entry point. e_shoff/e_shnum/e_shstrndx name the trailing
-    # debug table when present, else 0 (a bare runtime image).
+    # section table on a -g build, else 0 (a program-headers-only release image).
     buf[0] = 0x7F; buf[1] = 0x45; buf[2] = 0x4C; buf[3] = 0x46;
     buf[4] = elf_class_for(tgt_isa); buf[5] = ELFDATA2LSB; buf[6] = EV_CURRENT; buf[7] = ELFOSABI_NONE;
     bin.write_u16_le(buf, 16, ET_DYN);
@@ -2402,18 +2434,29 @@ fun emit_shared(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTa
     }
 
     # .dynsym: index 0 is the reserved null entry (already zeroed). each export is a
-    # GLOBAL/defined symbol: st_value the link-time vaddr the loader biases, st_shndx a
-    # non-special "defined" marker (this file has no allocated section table; the loader
-    # resolves the export by value, never by section header).
+    # GLOBAL/defined symbol: st_value the link-time vaddr the loader biases, st_shndx
+    # the SHT index of its containing load segment (segment i is SHT section i + 1).
+    # the loader tests st_shndx only against SHN_UNDEF, so this value works whether or
+    # not a section table is present (a release .so has none); when the table IS
+    # present (-g), it resolves a function export to its .text section (objdump: T).
+    # every defined export lies in a load segment, so the scan always matches; the 1
+    # initializer is a defined marker for the degenerate no-segment case.
     var sym_off: usize = dynsym_off + SYM_SIZE;
     e = 0;
     for (e < nexp) {
         var st_type: u8 = STT_OBJECT;
         if (exports[e].is_func) { st_type = STT_FUNC; }
+        var shndx: u16 = 1;
+        var sgi: u32 = 0;
+        for (sgi < seg_count) {
+            val sv: u64 = segs[sgi].vaddr;
+            if (exports[e].vaddr >= sv && exports[e].vaddr < sv + segs[sgi].memsz::u64) { shndx = (sgi + 1)::u16; }
+            sgi = sgi + 1;
+        }
         bin.write_u32_le(buf, sym_off, exp_str[e]::u32);
         buf[sym_off + 4] = (STB_GLOBAL << 4) | (st_type & 0xF);
         buf[sym_off + 5] = 0;
-        bin.write_u16_le(buf, sym_off + 6, 1);
+        bin.write_u16_le(buf, sym_off + 6, shndx);
         bin.write_u64_le(buf, sym_off + 8, exports[e].vaddr);
         bin.write_u64_le(buf, sym_off + 16, 0);
         sym_off = sym_off + SYM_SIZE;
@@ -2473,9 +2516,10 @@ fun emit_shared(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaVTa
     write_pie_phdrs(buf, phdr_offset, phdr_count, segs, seg_offsets, seg_count,
                     ro_off, ro_va, ro_size, dyn_off, dyn_va, dyn_size, dyn, page_size, true);
 
-    debug_sht_write(buf, itn, debug, debug_count, ?aux[0], 4, ?dsht);
-    debug_sht_free(alloc, ?dsht, debug_count, 4);
+    debug_sht_write(buf, itn, debug, debug_count, aux, aux_count, ?dsht);
+    debug_sht_free(alloc, ?dsht, debug_count, aux_count);
 
+    A.deallocate[ShtAlloc](alloc, aux, aux_count::usize);
     if (exp_str != nil)     { A.deallocate[usize](alloc, exp_str, nexp::usize); }
     if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
 
@@ -5791,6 +5835,21 @@ test "mach.lang.target.of.elf.emit_shared:dynamic_sections_in_sht" {
         or {
             val lho: usize = e_shoff + link::usize * SHDR_SIZE;
             if (bin.read_u32_le(buf.data, lho + 4) != SHT_STRTAB) { bad = true; }
+        }
+
+        # the first export (a function) resolves through its st_shndx to a section
+        # that is PROGBITS + SHF_ALLOC + SHF_EXECINSTR - the .text it lives in, the
+        # byte-level statement of `objdump -T` showing it as type T.
+        val dynsym_off: usize = bin.read_u64_le(buf.data, dynsym_hdr + 24)::usize;
+        val shndx: u32 = bin.read_u16_le(buf.data, dynsym_off + SYM_SIZE + 6)::u32;
+        if (shndx == 0 || shndx >= e_shnum) { bad = true; }
+        or {
+            val tho: usize = e_shoff + shndx::usize * SHDR_SIZE;
+            val tty: u32 = bin.read_u32_le(buf.data, tho + 4);
+            val tfl: u64 = bin.read_u64_le(buf.data, tho + 8);
+            if (tty != SHT_PROGBITS)             { bad = true; }
+            if ((tfl & SHF_ALLOC) == 0)          { bad = true; }
+            if ((tfl & SHF_EXECINSTR) == 0)      { bad = true; }
         }
     }
 
