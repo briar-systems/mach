@@ -42,6 +42,7 @@ use O: std.types.option;
 use R: std.types.result;
 
 use mach.lang.be.obj;
+use enc: mach.lang.be.codegen.encode;
 use mach.lang.intern;
 use mach.lang.session;
 use mach.lang.target;
@@ -142,6 +143,25 @@ rec DynState {
     fixup_cap:   u32;
     base_reloc_cap: u32;
     active:      bool;
+}
+
+# the deduped `.debug_str` string table and the map from an interned string to its
+# byte offset within it, built once per link before section accumulation. every
+# module's `.debug_str` holds the same names redundantly (10k unique of ~38k on a
+# self-host `-g` build), so one physical copy per distinct string collapses the
+# section by ~60%. a strp relocation's target string interns to a `StrId` whose
+# offset here is the value written at the patch site, so identical strings across
+# modules resolve to the one copy (#1708). owns `buf` + `offs`; freed after link
+# ---
+# buf:    the deduped `.debug_str` bytes (one NUL-terminated copy per distinct string)
+# offs:   interned-string -> byte offset within `buf`
+# name:   the interned ".debug_str" section name, keying the merged slot
+# active: true when dedup is in effect (a patching-mode link carrying `.debug_str`)
+rec StrMerge {
+    buf:    enc.ByteBuf;
+    offs:   map.Map[intern.StrId, u32];
+    name:   intern.StrId;
+    active: bool;
 }
 
 # read the input object files from disk and combine them into the
@@ -307,6 +327,19 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     val dn_r: R.Result[bool, str] = discover_debug_names(alloc, modules, module_count, ?debug_names, ?debug_count);
     if (R.is_err[bool, str](dn_r)) { ret R.err[bool, str](R.unwrap_err[bool, str](dn_r)); }
 
+    # build the deduped .debug_str table before section accumulation: the merged
+    # .debug_str content is this buffer and its length sizes the merged slot. only the
+    # in-place-patched modes (executable, shared object) dedup; a relocatable output
+    # gets an inactive StrMerge and keeps the classic concatenation (#1708).
+    val patching: bool = (mode == LINK_EXE) || shared;
+    var strm: StrMerge;
+    val sm_r: R.Result[StrMerge, str] = build_str_merge(s, modules, module_count, patching);
+    if (R.is_err[StrMerge, str](sm_r)) {
+        if (debug_names != nil && debug_count > 0) { A.deallocate[intern.StrId](alloc, debug_names, debug_count::usize); }
+        ret R.err[bool, str](R.unwrap_err[StrMerge, str](sm_r));
+    }
+    strm = R.unwrap_ok[StrMerge, str](sm_r);
+
     # the merged-section accumulators: the fixed kind slots in canonical order,
     # followed by one name-keyed slot per distinct debug section name. `merged_to_out`
     # is filled by build_merged_image to map a placement's merged index to its output
@@ -316,6 +349,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     val mrg_r: R.Result[*MergedSection, str] = A.zallocate[MergedSection](alloc, merged_count::usize);
     if (R.is_err[*MergedSection, str](mrg_r)) {
         if (debug_names != nil && debug_count > 0) { A.deallocate[intern.StrId](alloc, debug_names, debug_count::usize); }
+        free_str_merge(?strm);
         ret R.err[bool, str](R.unwrap_err[*MergedSection, str](mrg_r));
     }
     merged = R.unwrap_ok[*MergedSection, str](mrg_r);
@@ -331,7 +365,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     if (sec_total > 0) {
         val pr: R.Result[*Placement, str] = A.zallocate[Placement](alloc, sec_total::usize);
         if (R.is_err[*Placement, str](pr)) {
-            free_scratch(alloc, nil, 0, nil, 0, merged, merged_count, debug_names, debug_count, merged_to_out);
+            free_scratch(alloc, nil, 0, nil, 0, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
             ret R.err[bool, str](R.unwrap_err[*Placement, str](pr));
         }
         placements = R.unwrap_ok[*Placement, str](pr);
@@ -341,15 +375,15 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     var sec_base: *u32 = nil;
     val br: R.Result[*u32, str] = A.zallocate[u32](alloc, module_count::usize);
     if (R.is_err[*u32, str](br)) {
-        free_scratch(alloc, placements, sec_total, nil, 0, merged, merged_count, debug_names, debug_count, merged_to_out);
+        free_scratch(alloc, placements, sec_total, nil, 0, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
         ret R.err[bool, str](R.unwrap_err[*u32, str](br));
     }
     sec_base = R.unwrap_ok[*u32, str](br);
 
     val acc_r: R.Result[bool, str] =
-        accumulate_sections(s, modules, module_count, merged, debug_names, debug_count, placements, sec_base);
+        accumulate_sections(s, modules, module_count, merged, debug_names, debug_count, placements, sec_base, ?strm);
     if (R.is_err[bool, str](acc_r)) {
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
         ret R.err[bool, str](R.unwrap_err[bool, str](acc_r));
     }
 
@@ -372,7 +406,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
         collect_symbols(s, modules, module_count, placements, sec_base, ?sym_locs, assign_vaddrs);
     if (R.is_err[bool, str](collect_r)) {
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
         ret R.err[bool, str](R.unwrap_err[bool, str](collect_r));
     }
 
@@ -382,7 +416,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     val img_r: R.Result[of.ObjectImage, str] = obj.init(alloc, ?s.interner, image_name(modules, module_count));
     if (R.is_err[of.ObjectImage, str](img_r)) {
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
         ret R.err[bool, str](R.unwrap_err[of.ObjectImage, str](img_r));
     }
     out_img = R.unwrap_ok[of.ObjectImage, str](img_r);
@@ -393,17 +427,17 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     if (R.is_err[*u32, str](mto_r)) {
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
         ret R.err[bool, str](R.unwrap_err[*u32, str](mto_r));
     }
     merged_to_out = R.unwrap_ok[*u32, str](mto_r);
 
     val build_r: R.Result[bool, str] =
-        build_merged_image(s, ?out_img, modules, module_count, merged, merged_count, placements, sec_base, merged_to_out);
+        build_merged_image(s, ?out_img, modules, module_count, merged, merged_count, placements, sec_base, merged_to_out, ?strm);
     if (R.is_err[bool, str](build_r)) {
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
         ret R.err[bool, str](R.unwrap_err[bool, str](build_r));
     }
 
@@ -429,18 +463,18 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
                 free_dynstate(alloc, ?dyn);
                 obj.dnit(?out_img);
                 map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-                free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
+                free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
                 ret R.err[bool, str](R.unwrap_err[bool, str](dr));
             }
         }
 
         val patch_r: R.Result[bool, str] =
-            patch_relocations(s, ?out_img, modules, module_count, placements, sec_base, merged_to_out, ?sym_locs, ?dyn, tgt.arch);
+            patch_relocations(s, ?out_img, modules, module_count, placements, sec_base, merged_to_out, ?sym_locs, ?dyn, ?strm, tgt.arch);
         if (R.is_err[bool, str](patch_r)) {
             free_dynstate(alloc, ?dyn);
             obj.dnit(?out_img);
             map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-            free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
+            free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
             ret R.err[bool, str](R.unwrap_err[bool, str](patch_r));
         }
 
@@ -458,7 +492,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
         free_dynstate(alloc, ?dyn);
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
 
         if (R.is_err[bool, str](emit_r)) {
             ret R.err[bool, str](R.unwrap_err[bool, str](emit_r));
@@ -473,7 +507,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     if (R.is_err[bool, str](carry_r)) {
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
         ret R.err[bool, str](R.unwrap_err[bool, str](carry_r));
     }
 
@@ -481,7 +515,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
 
     obj.dnit(?out_img);
     map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-    free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out);
+    free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
 
     if (R.is_err[bool, str](obj_r)) {
         ret R.err[bool, str](R.unwrap_err[bool, str](obj_r));
@@ -1367,6 +1401,107 @@ fun discover_debug_names(alloc: *A.Allocator, modules: *of.ObjectImage, module_c
     ret R.ok[bool, str](true);
 }
 
+# build the deduped `.debug_str` table: walk every module's `.debug_str`, intern each
+# NUL-terminated string, and append one physical copy per distinct content to a growing
+# buffer, recording each string's offset. identical content across modules interns to
+# the same `StrId`, so it is stored exactly once and every strp resolves to that offset
+# during patching
+#
+# only the in-place-patched link modes (executable, shared object) dedup: a relocatable
+# output carries its strp relocations forward against the concatenated section, so it
+# must keep `.debug_str` un-deduped. an inactive `StrMerge` (no `.debug_str` input, or a
+# relocatable link) leaves the classic per-module concatenation in place.
+# ---
+# s:            shared session (allocator, interner)
+# modules:      the input image array
+# module_count: number of input images
+# patching:     true for a link mode that patches strp sites in place (exe / shared)
+# ret:          the owned StrMerge (freed after link), or an allocation error
+fun build_str_merge(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+                    patching: bool) R.Result[StrMerge, str] {
+    val alloc: *A.Allocator = s.alloc;
+    var sm: StrMerge;
+    sm.buf    = enc.buf_init(alloc);
+    sm.offs   = map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+    sm.name   = intern.STR_NIL;
+    sm.active = false;
+    if (!patching) { ret R.ok[StrMerge, str](sm); }
+
+    val nr: R.Result[intern.StrId, str] = intern.intern(?s.interner, ".debug_str");
+    if (R.is_err[intern.StrId, str](nr)) { free_str_merge(?sm); ret R.err[StrMerge, str](R.unwrap_err[intern.StrId, str](nr)); }
+    sm.name = R.unwrap_ok[intern.StrId, str](nr);
+
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            val sec: *of.Section = ?modules[m].sections[sc];
+            if (sec.kind != of.SK_DEBUG || sec.name != sm.name || sec.bytes == nil) { sc = sc + 1; cnt; }
+            sm.active = true;
+
+            # the section is a run of NUL-terminated strings; intern each, appending a
+            # single copy (bytes + NUL) to the deduped buffer on first sight.
+            var o: u32 = 0;
+            for (o < sec.len) {
+                val sr: R.Result[intern.StrId, str] = intern.intern(?s.interner, (?sec.bytes[o])::str);
+                if (R.is_err[intern.StrId, str](sr)) { free_str_merge(?sm); ret R.err[StrMerge, str](R.unwrap_err[intern.StrId, str](sr)); }
+                val sid: intern.StrId = R.unwrap_ok[intern.StrId, str](sr);
+                val slen: u32 = str_len((?sec.bytes[o])::str)::u32;
+
+                if (R.is_err[*u32, str](map.get[intern.StrId, u32](?sm.offs, ?sid))) {
+                    val off: u32 = sm.buf.len::u32;
+                    var i: u32 = 0;
+                    for (i <= slen) { enc.emit_byte(?sm.buf, sec.bytes[o + i]); i = i + 1; }
+                    val ins: R.Result[bool, str] = map.insert[intern.StrId, u32](?sm.offs, sid, off);
+                    if (R.is_err[bool, str](ins)) { free_str_merge(?sm); ret R.err[StrMerge, str](R.unwrap_err[bool, str](ins)); }
+                }
+                o = o + slen + 1;
+            }
+            sc = sc + 1;
+        }
+        m = m + 1;
+    }
+    ret R.ok[StrMerge, str](sm);
+}
+
+# release a StrMerge's deduped buffer and offset map; nil-safe, and safe on the
+# inactive (empty) value built for a relocatable link or a debug-free link
+# ---
+# sm: the StrMerge to release
+fun free_str_merge(sm: *StrMerge) {
+    if (sm == nil) { ret; }
+    map.dnit[intern.StrId, u32](?sm.offs);
+    enc.buf_dnit(?sm.buf);
+}
+
+# whether the NUL-terminated string at `src[src_off..]` byte-equals the one at
+# `ded[ded_off..]`, both bounded by their buffer lengths. the load-bearing guard on the
+# `.debug_str` dedup remap (#1708): a wrong-but-valid strp offset is invisible to
+# `llvm-dwarfdump --verify`, so a content divergence here is turned into a loud linker
+# error instead of silently corrupt debug info
+# ---
+# src:     the module's own `.debug_str` bytes
+# src_len: length of `src`
+# src_off: the strp addend (string start within the module's `.debug_str`)
+# ded:     the deduped `.debug_str` bytes
+# ded_len: length of `ded`
+# ded_off: the remapped offset the strp is about to be written with
+# ret:     true when the two strings are byte-identical through their shared NUL
+fun debug_str_content_eq(src: *u8, src_len: u32, src_off: u32,
+                         ded: *u8, ded_len: u32, ded_off: u32) bool {
+    var i: u32 = 0;
+    for (true) {
+        if (src_off::u64 + i::u64 >= src_len::u64) { ret false; }
+        if (ded_off::u64 + i::u64 >= ded_len::u64) { ret false; }
+        val sc: u8 = src[(src_off + i)::usize];
+        val dc: u8 = ded[(ded_off + i)::usize];
+        if (sc != dc) { ret false; }
+        if (sc == 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 # sum the section counts of every input image
 # ---
 # modules:      the input image array
@@ -1398,7 +1533,7 @@ fun total_sections(modules: *of.ObjectImage, module_count: u32) u32 {
 # ret:          ok(true) on success, or an error string
 fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
                         merged: *MergedSection, debug_names: *intern.StrId, debug_count: u32,
-                        placements: *Placement, sec_base: *u32) R.Result[bool, str] {
+                        placements: *Placement, sec_base: *u32, strm: *StrMerge) R.Result[bool, str] {
     # .debug_abbrev is byte-identical across every module (a deterministic, complete
     # build_abbrev) and every CU references it at offset 0, so only the first copy is
     # ever read. dedup it: a later object's table shares the first at offset 0 and adds
@@ -1425,6 +1560,7 @@ fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_co
             # debug sections never merge together.
             var ki: u32 = sec.kind::u32;
             var dedup: bool = false;
+            var str_slot: bool = false;
             if (sec.kind == of.SK_DEBUG) {
                 var found: bool = false;
                 var di: u32 = 0;
@@ -1437,9 +1573,25 @@ fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_co
                 if (!found) { ret R.err[bool, str]("linker: debug section name not registered in the merge"); }
                 # a later .debug_abbrev copy shares the first at offset 0 (#1708).
                 if (sec.name == abbrev_name && merged[ki].used) { dedup = true; }
+                # .debug_str is string-merge deduped: its merged content is the pre-built
+                # deduped buffer, so no module contributes bytes here (#1708).
+                if (strm.active && sec.name == strm.name) { str_slot = true; }
             }
 
-            if (dedup) {
+            if (str_slot) {
+                # the deduped .debug_str is build_str_merge's buffer; every module's copy
+                # adds no bytes and its placement offset is unused - strp sites resolve to
+                # deduped offsets during patching, not through this placement.
+                var a: u32 = sec.align;
+                if (a == 0)               { a = 1; }
+                if (a > merged[ki].align) { merged[ki].align = a; }
+                merged[ki].len  = strm.buf.len::u32;
+                merged[ki].used = true;
+                placements[flat].merged_index = ki;
+                placements[flat].offset       = 0;
+                placements[flat].vaddr        = 0;
+            }
+            or (dedup) {
                 # share the surviving first copy: offset 0, no bytes added. the copy pass
                 # rewrites offset 0 with this identical table (harmless); every CU already
                 # references offset 0, so nothing points into a dropped copy.
@@ -1623,7 +1775,7 @@ fun collect_symbols(s: *session.Session, modules: *of.ObjectImage, module_count:
 fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
                        modules: *of.ObjectImage, module_count: u32,
                        merged: *MergedSection, merged_count: u32, placements: *Placement, sec_base: *u32,
-                       merged_to_out: *u32) R.Result[bool, str] {
+                       merged_to_out: *u32, strm: *StrMerge) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
 
     # map each used merged slot to its output-section index so symbols/relocations
@@ -1640,6 +1792,13 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
             val zr: R.Result[*u8, str] = A.zallocate[u8](alloc, merged[k].len::usize);
             if (R.is_err[*u8, str](zr)) { ret R.err[bool, str](R.unwrap_err[*u8, str](zr)); }
             bytes = R.unwrap_ok[*u8, str](zr);
+
+            # the deduped .debug_str content is the pre-built buffer, written once here;
+            # the per-module byte-copy loop below skips every .debug_str source (#1708).
+            if (strm.active && merged[k].kind == of.SK_DEBUG && merged[k].name == strm.name
+                && strm.buf.len > 0) {
+                memory.copy[u8](bytes, strm.buf.data, strm.buf.len);
+            }
         }
 
         # a kind slot names itself by kind; a name-keyed debug slot carries its own
@@ -1669,6 +1828,8 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
         for (sc < modules[m].section_count) {
             val src: *of.Section = ?modules[m].sections[sc];
             if (src.kind == of.SK_BSS || src.bytes == nil || src.len == 0) { sc = sc + 1; cnt; }
+            # the deduped .debug_str was written once above; skip every per-module copy.
+            if (strm.active && src.kind == of.SK_DEBUG && src.name == strm.name) { sc = sc + 1; cnt; }
 
             val flat: u32 = sec_base[m] + sc;
             val ki: u32 = placements[flat].merged_index;
@@ -1743,13 +1904,14 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
 # merged_to_out: per-merged-slot output-section index (from build_merged_image)
 # sym_locs:      the global symbol table, for GLOBAL/extern target resolution
 # dyn:           dynamic-link state; out - collects import call-site fixups
+# strm:          the deduped .debug_str table, for strp remap (inactive to skip)
 # arch:          active instruction-set vtable, owning the relocation packer
 # ret:           ok(true) on success, or an error string
 fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
                      modules: *of.ObjectImage, module_count: u32,
                      placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                      sym_locs: *map.Map[intern.StrId, SymbolLoc],
-                     dyn: *DynState, arch: *isa.IsaVTable) R.Result[bool, str] {
+                     dyn: *DynState, strm: *StrMerge, arch: *isa.IsaVTable) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
 
     var m: u32 = 0;
@@ -1768,7 +1930,7 @@ fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
         }
 
         val pr: R.Result[bool, str] = patch_module_relocations(s, out_img, modules, m,
-            placements, sec_base, merged_to_out, sym_locs, dyn, ?local_map, arch);
+            placements, sec_base, merged_to_out, sym_locs, dyn, ?local_map, strm, arch);
         map.dnit[intern.StrId, u64](?local_map);
         if (R.is_err[bool, str](pr)) { ret R.err[bool, str](R.unwrap_err[bool, str](pr)); }
 
@@ -1823,13 +1985,35 @@ fun build_local_index(modules: *of.ObjectImage, m: u32, placements: *Placement, 
 # sym_locs:      the global symbol table, for GLOBAL/extern target resolution
 # dyn:           dynamic-link state; out - collects import call-site fixups
 # local_map:     module `m`'s LOCAL-name -> virtual-address index
+# strm:          the deduped .debug_str table, for strp remap (inactive to skip)
 # arch:          active instruction-set vtable, owning the relocation packer
 # ret:           ok(true) on success, or an error string
 fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                              modules: *of.ObjectImage, m: u32,
                              placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                              sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState,
-                             local_map: *map.Map[intern.StrId, u64], arch: *isa.IsaVTable) R.Result[bool, str] {
+                             local_map: *map.Map[intern.StrId, u64], strm: *StrMerge,
+                             arch: *isa.IsaVTable) R.Result[bool, str] {
+    # locate module m's .debug_str section and its anchor symbol once: a strp
+    # relocation is exactly one whose target is that anchor. resolving it remaps the
+    # string to its deduped offset rather than the concatenated placement (#1708).
+    var str_sec: u32 = 0xFFFFFFFF;
+    var str_anchor: intern.StrId = intern.STR_NIL;
+    if (strm.active) {
+        var scx: u32 = 0;
+        for (scx < modules[m].section_count) {
+            if (modules[m].sections[scx].kind == of.SK_DEBUG && modules[m].sections[scx].name == strm.name) { str_sec = scx; }
+            scx = scx + 1;
+        }
+        if (str_sec != 0xFFFFFFFF) {
+            var syx: u32 = 0;
+            for (syx < modules[m].symbol_count) {
+                if (modules[m].symbols[syx].section == str_sec) { str_anchor = modules[m].symbols[syx].name; }
+                syx = syx + 1;
+            }
+        }
+    }
+
     var ri: u32 = 0;
     for (ri < modules[m].reloc_count) {
         val r: *of.Relocation = ?modules[m].relocations[ri];
@@ -1862,6 +2046,15 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
             ret R.err[bool, str]("linker: relocation patch site lands in a BSS section");
         }
         val patch_off: u32 = pl.offset + r.offset;
+
+        # a strp into .debug_str: remap it to the string's deduped offset instead of
+        # resolving the anchor's placement. skips the normal apply_one below (#1708).
+        if (strm.active && str_anchor != intern.STR_NIL && r.symbol == str_anchor) {
+            val sp: R.Result[bool, str] = resolve_strp(s, modules, m, str_sec, r, strm,
+                dst, patch_off, out_img.sections[out_ix].len, patch_va, arch);
+            if (R.is_err[bool, str](sp)) { ret R.err[bool, str](R.unwrap_err[bool, str](sp)); }
+            ri = ri + 1; cnt;
+        }
 
         # locate the target symbol's final virtual address. a LOCAL target is
         # private to module `m`; resolve it through `m`'s local index. GLOBAL targets
@@ -1917,6 +2110,55 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         ri = ri + 1;
     }
     ret R.ok[bool, str](true);
+}
+
+# resolve one `.debug_str` strp relocation to its deduped offset and write it at the
+# patch site. the addend is the string's byte offset within module `m`'s own
+# `.debug_str`; interning the string there yields the `StrId` whose deduped-buffer
+# offset is the strp value. a per-site content-equality guard (#1708) asserts the
+# deduped bytes match before writing - `llvm-dwarfdump --verify` cannot catch a
+# wrong-but-valid strp offset, so any divergence is turned into a loud linker error
+# rather than silently corrupt debug info
+# ---
+# s:         shared session (interner), for diagnostics
+# modules:   the input image array
+# m:         index of the module owning the relocation
+# str_sec:   index of module `m`'s `.debug_str` section
+# r:         the strp relocation (addend is the string offset within `.debug_str`)
+# strm:      the deduped `.debug_str` table (buffer + offset map)
+# dst:       the merged output-section bytes to patch
+# patch_off: byte offset of the patch site within `dst`
+# sec_len:   length of the output section `dst` backs, for the bounds check
+# patch_va:  the patch site's own virtual address (unused for a strp, passed through)
+# arch:      active instruction-set vtable, owning the relocation packer
+# ret:       ok(true) once the deduped offset is written, or an error string
+fun resolve_strp(s: *session.Session, modules: *of.ObjectImage, m: u32, str_sec: u32,
+                 r: *of.Relocation, strm: *StrMerge, dst: *u8, patch_off: u32, sec_len: u32,
+                 patch_va: u64, arch: *isa.IsaVTable) R.Result[bool, str] {
+    val ssec: *of.Section = ?modules[m].sections[str_sec];
+    if (ssec.bytes == nil || r.addend < 0 || r.addend::u64 >= ssec.len::u64) {
+        ret R.err[bool, str]("linker: .debug_str strp addend out of range");
+    }
+    val src_off: u32 = r.addend::u32;
+
+    val sid_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, (?ssec.bytes[src_off])::str);
+    if (R.is_err[intern.StrId, str](sid_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sid_r)); }
+    val sid: intern.StrId = R.unwrap_ok[intern.StrId, str](sid_r);
+
+    val og: R.Result[*u32, str] = map.get[intern.StrId, u32](?strm.offs, ?sid);
+    if (R.is_err[*u32, str](og)) {
+        ret R.err[bool, str]("linker: .debug_str strp target absent from the deduped table");
+    }
+    val ded_off: u32 = @R.unwrap_ok[*u32, str](og);
+
+    # the load-bearing guard: the deduped bytes must equal the module's own string.
+    if (!debug_str_content_eq(ssec.bytes, ssec.len, src_off, strm.buf.data, strm.buf.len::u32, ded_off)) {
+        ret R.err[bool, str]("linker: .debug_str dedup remapped a strp to divergent content");
+    }
+
+    # write the deduped offset as the strp value: RK_ABS32 into a non-loadable section,
+    # so `sym_va` is the debug-section-relative offset itself and the addend is zero.
+    ret apply_one(s, r.kind, dst, patch_off, sec_len, ded_off::u64, 0, patch_va, r.symbol, arch);
 }
 
 # reset a DynState to the empty (static-link) state. its plan and
@@ -3148,11 +3390,12 @@ fun free_placements(alloc: *A.Allocator, placements: *Placement, sec_total: u32)
 # debug_names:   the discovered debug-name array to release (may be nil)
 # debug_count:   length of the debug-name array
 # merged_to_out: the merged-slot -> output-section map to release (may be nil)
+# strm:          the deduped .debug_str table to release (may be nil)
 fun free_scratch(alloc: *A.Allocator, placements: *Placement, sec_total: u32,
                 sec_base: *u32, module_count: u32,
                 merged: *MergedSection, merged_count: u32,
                 debug_names: *intern.StrId, debug_count: u32,
-                merged_to_out: *u32) {
+                merged_to_out: *u32, strm: *StrMerge) {
     free_placements(alloc, placements, sec_total);
     if (sec_base != nil && module_count > 0) {
         A.deallocate[u32](alloc, sec_base, module_count::usize);
@@ -3166,6 +3409,7 @@ fun free_scratch(alloc: *A.Allocator, placements: *Placement, sec_total: u32,
     if (merged_to_out != nil && merged_count > 0) {
         A.deallocate[u32](alloc, merged_to_out, merged_count::usize);
     }
+    free_str_merge(strm);
 }
 
 # tear down every parsed input image and release the image array.
