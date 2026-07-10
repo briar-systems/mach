@@ -37,11 +37,11 @@ argument forwarding.
 
 | Command | Summary |
 |---------|---------|
-| `build` | compile the project to objects and (for a `[bin.*]`) a linked binary |
+| `build` | compile the project to objects and (for a `bin` artifact) a linked binary |
 | `run`   | execute the already-built binary (a post-`build` convenience, not a rebuild) |
 | `test`  | build the test binary and run the collected tests |
 | `clean` | remove the project's build output directory trees |
-| `dep`   | manage git-backed dependencies (clone, lock, vendor) under `<dep>` |
+| `dep`   | manage git-backed dependencies (clone, lock, vendor) under `dep` |
 | `init`  | scaffold a new project |
 | `doc`   | generate Markdown reference docs from source doc-comments |
 | `info`  | print compiler version, build host, and registered target capabilities |
@@ -57,16 +57,14 @@ A verbosity flag (`-v`/`-vv`) and `--quiet` together is a parse error.
 | `-v`             | —                | `mach build`: per-phase roll-up (load/resolve/sema/lower/optimize/codegen/link) with item counts + timing, then a `built … N modules … in …` summary, on stderr |
 | `-vv`            | —                | `-v` plus a per-module/file line under each phase with its duration and a `(slow)` marker on the slowest |
 | `--quiet`, `-q`  | —                | suppress non-error output |
-| `--target <name>`| target name      | select a declared target; absent, defers to `[project].target` |
-| `--profile <name>`| profile name    | select a `[profile.<name>]` build variant; absent, the first declared profile |
-| `--bin <name>`   | artifact name    | narrow the build to one `[bin.<name>]` artifact |
-| `--lib <name>`   | artifact name    | narrow the build to one `[lib.<name>]` artifact (mutually exclusive with `--bin`) |
+| `--target <name>`| target name      | select a declared target; absent, resolves the host-matching declared target (`native`) |
+| `--profile <name>`| profile name    | select a `[profile.<name>]` build variant, whose `opt` sets the optimisation pipeline; absent, the first declared profile |
+| `--bin <name>`   | artifact name    | narrow the build to one `bin` `[artifact.<name>]` |
+| `--lib <name>`   | artifact name    | narrow the build to one `static`/`shared` `[artifact.<name>]` (mutually exclusive with `--bin`) |
 | `-o <path>`      | path             | override the artifact path, rooted at the project root (build/run/test) |
 | `--all-targets`  | —                | build every declared `[target.*]`, not just the default (mutually exclusive with `-o`, which names one path) |
-| `--emit-asm`     | —                | emit per-module assembly text (`.s`); forces the selected profile's `emit_asm` on |
-| `--emit-ir`      | —                | emit per-module SSA IR text (`.ir`) — the final post-pipeline IR the object is built from, so it varies with `-O`; forces the selected profile's `emit_ir` on |
-| `--no-emit-asm`  | —                | force per-module assembly emission off, overriding the profile's `emit_asm` |
-| `--no-emit-ir`   | —                | force per-module IR emission off, overriding the profile's `emit_ir` |
+| `--emit-asm`     | —                | emit per-module assembly text (`.s`) — emission is opt-in, controlled only by this flag |
+| `--emit-ir`      | —                | emit per-module SSA IR text (`.ir`), the final post-pipeline IR the object is built from (so it varies with the profile's `opt`) — emission is opt-in, controlled only by this flag |
 | `--verify-ir`    | —                | run the IR verifier after each optimisation pass |
 
 > Under `mach test`, the entry module's `--emit-ir` dump shows the neutralized
@@ -83,21 +81,21 @@ A verbosity flag (`-v`/`-vv`) and `--quiet` together is a parse error.
 mach build <path> [options]
 ```
 
-Compiles the project rooted at `<path>` (e.g. `mach build .`). With no
-`--bin`/`--lib`, it builds every declared
-artifact for the default target and profile. Every reachable module is driven
-through sema → lower → optimise → codegen to one relocatable object, written
-under the manifest's resolved `obj` template at `<obj>/<fqn-as-path>.o`. For a
-`[bin.*]` the objects are linked into the resolved artifact path (the `out`
-template); for a `[lib.*]` (or with `--emit obj`) the objects are the deliverable
-and nothing is linked.
+Compiles the project named by `<path>` — a project directory (whose `mach.toml`
+is read) or a manifest file directly (e.g. `mach build .` or `mach build ci.toml`).
+With no `--bin`/`--lib`, it builds every declared artifact for the selected target
+and profile. Every reachable module is driven through sema → lower → optimise →
+codegen to one relocatable object, written under the resolved object tree at
+`<out>/obj/<fqn-as-path>.o`. For a `bin` artifact the objects are linked into the
+resolved artifact path (its `out` template); for a `static`/`shared` library (or
+with `--emit obj`) the objects are the deliverable and nothing is linked.
+
+The optimisation pipeline comes from the selected profile's `opt` (`--profile
+<name>`, or the first declared profile) — the profile is how a build picks its
+optimisation level.
 
 | Flag           | Value          | Effect |
 |----------------|----------------|--------|
-| `--release`    | —              | select the release optimisation pipeline |
-| `-O0`          | —              | force the debug pipeline (overrides `--release`) |
-| `-O1`          | —              | select the release pipeline |
-| `-O2`          | —              | select the release pipeline |
 | `-g`           | —              | emit debug info for this build, forcing the selected profile's `debug` on (precedence `-g` > profile > off) |
 | `--emit <kind>`| `obj`\|`exe`   | `obj` stops at the relocatable objects; `exe` (default) links a binary |
 | `--pie`        | —              | emit a position-independent (ET_DYN) executable for ASLR instead of the default fixed-address one; opt-in (see below) |
@@ -105,10 +103,7 @@ and nothing is linked.
 | `-l <name>`    | name           | link a named object, archive, or shared library, resolved through the `-L` dirs (see below); repeatable |
 | *(positional)* | input path     | a bare argument that contains `/`, ends in `.o` / `.a`, or names a `.so` is linked verbatim |
 
-Plus the global flags above. The `-O<n>` flags override `--release` when both
-are present; absent any optimisation flag the build uses the debug pipeline
-(the bootstrap-stable default). `-O1` and `-O2` currently select the same
-release pipeline.
+Plus the global flags above.
 
 `--pie` is an opt-in: without it, a linux executable links fixed-address
 (`ET_EXEC`) exactly as before — a normal build is byte-identical. With it, the
@@ -122,9 +117,9 @@ dependency is rejected.
 `ext fun` declarations are forward references whose definitions are supplied at
 link time by external precompiled code — a loose `.o` object, a static `.a`
 archive, or a shared `.so` library. Those inputs come from the command line and
-from the manifest's merged `libs` overlay (`[target.*]`, `[bin.*]`/`[lib.*]`, and
-per-cell, see [manifest.md](manifest.md)); both sets are linked. An input that
-resolves to no
+from the manifest's matching `[link.X]` entries — an artifact's referenced entries
+plus exported dependency entries whose `os`/`isa`/`abi` filters match the build
+(see [manifest.md](manifest.md)); both sets are linked. An input that resolves to no
 existing file is a hard error, so a typo never silently drops a dependency.
 
 - **Explicit input path** — a bare (non-flag) argument that contains a `/`, ends
@@ -179,17 +174,17 @@ mach run <path> [options] [-- args...]
 ```
 
 Executes the binary `mach build` already produced for `<path>` — a post-build
-convenience, **not** a rebuild. The same selection flags (`--target`,
-`--profile`/`--release`, `--bin`) that narrow a build resolve which artifact to
-run; its path is read from the manifest's `out` template and the existing file
-is exec'd. When the artifact does not exist yet, `mach run` errors and points at
-`mach build` rather than building it.
+convenience, **not** a rebuild. The same selection flags (`--target`, `--profile`,
+`--bin`) that narrow a build resolve which artifact to run; its path is read from
+the artifact's `out` template and the existing file is exec'd. When the artifact
+does not exist yet, `mach run` errors and points at `mach build` rather than
+building it.
 Arguments after a `--` separator are forwarded to the child as its `argv`. The
 child's exit code becomes this command's exit code.
 
 `--emit` is rejected — running a relocatable object is not meaningful. The
-`build` selection and global flags apply; build-only flags (`-O*`, `--emit-*`)
-are accepted but have no effect, since nothing is built.
+`build` selection and global flags apply; build-only flags (`--emit-*`) are
+accepted but have no effect, since nothing is built.
 
 | Flag             | Value   | Effect |
 |------------------|---------|--------|
@@ -288,16 +283,16 @@ Exit codes: `0` all passed, `1` any failed, `2` build/internal error.
 ## `mach clean`
 
 ```
-mach clean [path]
+mach clean <path>
 ```
 
-Removes the project's build output. The trees removed are the static directory
-prefixes of the manifest's `out`/`obj`/`ir`/`asm` templates — the leading path
-components before the first `{...}` placeholder — so the whole output tree is
-cleared regardless of target or profile. Because it is driven by the templates, a
-project that relocates its output (`out = "build/..."`) is cleaned at that root
-rather than a hardcoded `out/`. `[path]` selects the project (default: the working
-directory, walking up to the nearest `mach.toml`).
+Removes the project's build output. The tree removed is the static directory
+prefix of the manifest's `out` template — the leading path components before the
+first `{...}` placeholder — so the whole output tree is cleared regardless of
+target or profile. Because it is driven by the template, a project that relocates
+its output (`out = "build/..."`) is cleaned at that root rather than a hardcoded
+`out/`. `<path>` names the project (a directory or a manifest file), like every
+project-rooted command.
 
 Only the manifest is read: no module graph is loaded and nothing under the
 dependency dir is touched. Removal is idempotent (`mach clean` on an already-clean
@@ -312,19 +307,19 @@ on an allocator or io failure.
 mach dep <action> [args]
 ```
 
-Manages the project's dependency tree under `<dep>`. Dispatches on `argv[2]`.
+Manages the project's dependency tree under `dep`. Dispatches on `argv[2]`.
 A dependency has exactly one source form: a **git** URL plus a ref, which mach
-acquires into `<dep>/<name>/` with plain git operations, or a **path** to another
-project tree, never fetched but materialised at `<dep>/<name>/` as a relative
+acquires into `dep/<name>/` with plain git operations, or a **path** to another
+project tree, never fetched but materialised at `dep/<name>/` as a relative
 symlink so the build resolves it by the same vendor layout.
 
 | Action   | Args | Effect |
 |----------|------|--------|
 | `pull`   | — | realise the manifest: clone missing git deps (transitively), link path deps, re-resolve a changed ref, repair checkout-vs-lock drift, write `mach.lock`. Idempotent; the command routine use needs. |
 | `update` | `<name> \| --all` | the only lock-advancer: re-resolve branch refs to current remote tips. Tag/commit refs are an immutable no-op. Never edits the manifest. |
-| `add`    | `<name> --git <url> [--ref <ref>] \| --path <dir>` | append a `[deps.<name>]` `git`/`path` stanza to the manifest, then `pull`. |
-| `remove` | `<name> [--purge]` | drop the entry from `mach.toml` and `mach.lock`; `--purge` also deletes `<dep>/<name>/`. |
-| `list`   | — | print each `[deps.<name>]` entry with its source form, ref, locked commit, and state (`synced`/`missing`/`drifted`/`path`). |
+| `add`    | `<name> --git <url> [--ref <ref>] \| --path <dir>` | append a `[dep.<name>]` `git`/`path` stanza to the manifest, then `pull`. |
+| `remove` | `<name> [--purge]` | drop the entry from `mach.toml` and `mach.lock`; `--purge` also deletes `dep/<name>/`. |
+| `list`   | — | print each `[dep.<name>]` entry with its source form, ref, locked commit, and state (`synced`/`missing`/`drifted`/`path`). |
 
 `sync` is the pre-`pull` name, kept one cycle as a hidden alias that prints a
 deprecation note and runs `pull`.
@@ -339,7 +334,7 @@ invoked with an allowlisted environment (`PATH`, `HOME`, and the common
 git/ssh/proxy/CA variables). Git's absence is a clean error naming the operation
 that needed it.
 
-For each git dependency, `pull` clones the `git` URL into `<dep>/<name>/` when
+For each git dependency, `pull` clones the `git` URL into `dep/<name>/` when
 absent, then checks out the resolved commit as a **detached HEAD**
 (`git checkout --detach`). A ref resolves as: `branch/<n>` (the remote-tracking
 branch tip), `tag/<n>`, `commit/<n>` or a 7–40 char hex SHA (the literal commit),
@@ -349,7 +344,7 @@ plain git operations, so a checkout the user also commits as a **submodule**
 composes naturally — a moved checkout surfaces as gitlink drift in the parent
 repo's `git status`. mach never invokes `git submodule`.
 
-A **non-empty** directory present under `<dep>/<name>/` without a `.git` entry,
+A **non-empty** directory present under `dep/<name>/` without a `.git` entry,
 while the manifest declares it a git dep, is a hard error: declare it a `path`
 dependency if those are vendored files. (`.git` as a file — a submodule gitlink —
 counts as a checkout.) An **empty** directory has nothing to vendor and is treated
@@ -357,7 +352,7 @@ as absent — `pull` clones into it — so a plain `git clone` (without
 `--recurse-submodules`), which leaves a submodule dep dir empty, is repaired by a
 plain `mach dep pull` (#1329).
 
-For each **path** dependency, `pull` materialises the source at `<dep>/<name>/` as
+For each **path** dependency, `pull` materialises the source at `dep/<name>/` as
 a relative symlink, so the build resolves its modules by the same vendor layout as
 a git dep. The `path` is resolved relative to the requiring manifest's directory;
 the link is relative, so a tree that moves as a whole (a monorepo, a committed
@@ -371,7 +366,7 @@ by a real directory (a stale git checkout, foreign vendored files) is a hard err
 ### Transitive resolution
 
 Transitive deps resolve into the **flat dep tree**: every git dep, direct or
-transitive, lives at `<dep>/<name>/`, so a dependency's own
+transitive, lives at `dep/<name>/`, so a dependency's own
 `[target.*].libs` cascade into the consumer's build (see `manifest.md`). The same
 name required from two different sources or refs is a hard error naming both
 requirers; there is no version resolution (reserved for the registry era).
@@ -383,13 +378,12 @@ The manifest is intent; the lock is the record of resolving it. After a `pull`,
 and resolved `commit` (path deps have no lock entry):
 
 ```toml
-# generated by `mach dep pull`; do not edit by hand.
-version = 1
+# this file is automatically generated; do not edit by hand.
 
-[deps.mach-std]
+[dep.mach-std]
 url = "https://github.com/briar-systems/mach-std"
-ref = "branch/dev"
-commit = "6b78ae1e8c3c9cc45e4ab4b916fd191d61e76aff"
+ref = "branch/main"
+commit = "9c6eb77880de143090ef48645ba7353ec786d758"
 ```
 
 `pull` honours the lock except where the manifest ref was edited — there it
@@ -400,7 +394,7 @@ to their current tips. The lock writer is idempotent: an up-to-date lock is left
 untouched. Commit `mach.lock` to pin builds.
 
 `mach dep` reads `mach.toml` from the current directory directly (it does not walk
-up to find a project root); each `[deps.<name>]` declares exactly one of
+up to find a project root); each `[dep.<name>]` declares exactly one of
 `git`/`path`, with `ref` for git (see `manifest.md`). Exit codes: `0` ok, `1` user
 error, `2` internal error.
 
@@ -412,8 +406,8 @@ mach init [dir] [options]
 
 Scaffolds a new project in `[dir]` (default: the current directory). Writes a
 complete `mach.toml` with a `[project]` block, `[target.*]` platforms for
-`linux`/`windows`/`darwin` (on the host ISA), one `[bin.*]`/`[lib.*]` artifact,
-`[profile.debug]`/`[profile.release]` variants, a `[deps.mach-std]` dependency, a
+`linux`/`windows`/`darwin` (on the host ISA), one `[artifact.<id>]`,
+`[profile.debug]`/`[profile.release]` variants, a `[dep.mach-std]` dependency, a
 starter source file, and `dep/mach-std/` cloned from the declared ref (through
 the same path as `mach dep pull`). Refuses to overwrite an existing `mach.toml`,
 `src/main.mach`, or `src/lib.mach` unless `--force`; every collision is checked
@@ -423,7 +417,7 @@ before any file is written, so a refused init leaves nothing behind.
 |----------------|-------|--------|
 | `--name <name>`| name  | project id (default: the directory base name) |
 | `--force`      | —     | scaffold even when `mach.toml`, `src/main.mach`, or `src/lib.mach` already exists |
-| `--lib`        | —     | library layout: write `src/lib.mach` instead of `src/main.mach`, and scaffold a `[lib.<id>]` artifact (`kind = "static"`) instead of `[bin.<id>]` |
+| `--lib`        | —     | library layout: write `src/lib.mach` instead of `src/main.mach`, and scaffold a `static` `[artifact.<id>]` instead of a `bin` one |
 
 The first non-flag argument after `init` is the target directory.
 

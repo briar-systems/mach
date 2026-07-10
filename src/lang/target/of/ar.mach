@@ -18,12 +18,19 @@
 # archiver inserts (the `/` symbol directory and the `//` long-name table), since
 # those are not objects.
 
+use std.allocator.page;
+use std.filesystem;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 use std.types.string.str_starts_with;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
 
 # the `!<arch>\n` magic that opens every `ar` file
 val MAGIC:       str   = "!<arch>\n";
@@ -234,4 +241,266 @@ fun parse_size(buf: *u8, at: usize, ok: *bool) usize {
 
     @ok = digits > 0;
     ret size;
+}
+
+# --- writer ---
+
+# one member to place into an archive: its file name, object bytes, and the names of
+# the global symbols it defines (for the `/` symbol index the linker consults)
+# ---
+# name:      the member file name (unique within the archive)
+# data:      the member's object bytes
+# len:       byte length of `data`
+# sym_names: the names of the defined global symbols this member exports
+# sym_count: number of entries in `sym_names`
+pub rec ArMember {
+    name:      str;
+    data:      *u8;
+    len:       usize;
+    sym_names: *str;
+    sym_count: u32;
+}
+
+# the even-padded on-disk length of a member body (members pad to a 2-byte boundary)
+fun even(x: usize) usize {
+    if ((x & 1) == 1) { ret x + 1; }
+    ret x;
+}
+
+# whether `name` fits the 16-byte inline name field (the name plus its `/` terminator)
+fun inline_name(name: str) bool {
+    ret str_len(name) + 1 <= 16;
+}
+
+# the number of decimal digits in `v` (at least 1)
+fun dec_digits(v: usize) usize {
+    var n: usize = 1;
+    var t: usize = v;
+    for (t >= 10) { t = t / 10; n = n + 1; }
+    ret n;
+}
+
+# write `v` as left-justified decimal ASCII at `buf[off..]`, returning the digit count
+fun put_dec(buf: *u8, off: usize, v: usize) usize {
+    val d: usize = dec_digits(v);
+    var i: usize = d;
+    var t: usize = v;
+    for (i > 0) {
+        i = i - 1;
+        buf[off + i] = ('0'::usize + (t % 10))::u8;
+        t = t / 10;
+    }
+    ret d;
+}
+
+# write the 4-byte big-endian `v` at `buf[off..]` (the `ar` symbol-index offset width)
+fun put_be32(buf: *u8, off: usize, v: u32) {
+    buf[off]     = ((v >> 24) & 0xFF)::u8;
+    buf[off + 1] = ((v >> 16) & 0xFF)::u8;
+    buf[off + 2] = ((v >> 8)  & 0xFF)::u8;
+    buf[off + 3] = (v & 0xFF)::u8;
+}
+
+# write a 60-byte member header at `buf[off..]` with mtime/uid/gid 0, mode 644, the
+# decimal `size`, and the `\x60\n` magic. the 16-byte name field is left as spaces for
+# the caller to fill (inline `name/` or `/<longtable-offset>`).
+fun put_header(buf: *u8, off: usize, size: usize) {
+    var i: usize = 0;
+    for (i < HEADER_LEN) { buf[off + i] = ' '; i = i + 1; }
+    buf[off + 16] = '0';
+    buf[off + 28] = '0';
+    buf[off + 34] = '0';
+    buf[off + 40] = '6'; buf[off + 41] = '4'; buf[off + 42] = '4';
+    put_dec(buf, off + SIZE_OFFSET, size);
+    buf[off + HEADER_LEN - 2] = 0x60;
+    buf[off + HEADER_LEN - 1] = 0x0A;
+}
+
+# write the GNU `ar` archive of `members` to `out_path`: the `!<arch>\n` magic, a `/`
+# symbol index mapping every member's defined globals to its header offset, a `//`
+# long-name table for names past 15 bytes, then each member header + object bytes
+# (padded to an even boundary). external-tool-free - mirrors the format the reader
+# above frames. used for ELF/Mach-O `.a` and the COFF `.lib` ar variant.
+# ---
+# alloc:    allocator for the archive buffer and scratch arrays
+# members:  the objects to archive, in link order
+# count:    number of members
+# out_path: the archive path to write
+# ret:      ok(true) on success, or the first allocation / write error
+pub fun write_archive(alloc: *A.Allocator, members: *ArMember, count: u32, out_path: str) R.Result[bool, str] {
+    var total_syms: usize = 0;
+    var strtab_len: usize = 0;
+    var long_len:   usize = 0;
+    var i: u32 = 0;
+    for (i < count) {
+        total_syms = total_syms + members[i].sym_count::usize;
+        var s: u32 = 0;
+        for (s < members[i].sym_count) { strtab_len = strtab_len + str_len(members[i].sym_names[s]) + 1; s = s + 1; }
+        if (!inline_name(members[i].name)) { long_len = long_len + str_len(members[i].name) + 2; }
+        i = i + 1;
+    }
+    val armap_content: usize = 4 + total_syms * 4 + strtab_len;
+    val has_long: bool = long_len > 0;
+
+    val res_lo: R.Result[*usize, str] = A.allocate[usize](alloc, count::usize);
+    if (R.is_err[*usize, str](res_lo)) { ret R.err[bool, str](R.unwrap_err[*usize, str](res_lo)); }
+    val long_off: *usize = R.unwrap_ok[*usize, str](res_lo);
+    val res_ho: R.Result[*usize, str] = A.allocate[usize](alloc, count::usize);
+    if (R.is_err[*usize, str](res_ho)) { A.deallocate[usize](alloc, long_off, count::usize); ret R.err[bool, str](R.unwrap_err[*usize, str](res_ho)); }
+    val hdr_off: *usize = R.unwrap_ok[*usize, str](res_ho);
+
+    var lo_run: usize = 0;
+    i = 0;
+    for (i < count) {
+        long_off[i] = lo_run;
+        if (!inline_name(members[i].name)) { lo_run = lo_run + str_len(members[i].name) + 2; }
+        i = i + 1;
+    }
+
+    var pos: usize = MAGIC_LEN + HEADER_LEN + even(armap_content);
+    if (has_long) { pos = pos + HEADER_LEN + even(long_len); }
+    i = 0;
+    for (i < count) {
+        hdr_off[i] = pos;
+        pos = pos + HEADER_LEN + even(members[i].len);
+        i = i + 1;
+    }
+    val total: usize = pos;
+
+    val res_buf: R.Result[*u8, str] = A.allocate[u8](alloc, total);
+    if (R.is_err[*u8, str](res_buf)) {
+        A.deallocate[usize](alloc, long_off, count::usize);
+        A.deallocate[usize](alloc, hdr_off, count::usize);
+        ret R.err[bool, str](R.unwrap_err[*u8, str](res_buf));
+    }
+    val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
+
+    var k: usize = 0;
+    for (k < MAGIC_LEN) { buf[k] = MAGIC[k]; k = k + 1; }
+    var off: usize = MAGIC_LEN;
+
+    put_header(buf, off, armap_content);
+    buf[off] = '/';
+    off = off + HEADER_LEN;
+    put_be32(buf, off, total_syms::u32);
+    var so: usize = off + 4;
+    var st: usize = off + 4 + total_syms * 4;
+    i = 0;
+    for (i < count) {
+        var s: u32 = 0;
+        for (s < members[i].sym_count) {
+            put_be32(buf, so, hdr_off[i]::u32);
+            so = so + 4;
+            val nm: str = members[i].sym_names[s];
+            val nl: usize = str_len(nm);
+            var j: usize = 0;
+            for (j < nl) { buf[st] = nm[j]; st = st + 1; j = j + 1; }
+            buf[st] = 0; st = st + 1;
+            s = s + 1;
+        }
+        i = i + 1;
+    }
+    off = off + armap_content;
+    if ((armap_content & 1) == 1) { buf[off] = 0x0A; off = off + 1; }
+
+    if (has_long) {
+        put_header(buf, off, long_len);
+        buf[off] = '/'; buf[off + 1] = '/';
+        off = off + HEADER_LEN;
+        i = 0;
+        for (i < count) {
+            if (!inline_name(members[i].name)) {
+                val nm: str = members[i].name;
+                val nl: usize = str_len(nm);
+                var j: usize = 0;
+                for (j < nl) { buf[off] = nm[j]; off = off + 1; j = j + 1; }
+                buf[off] = '/'; off = off + 1;
+                buf[off] = 0x0A; off = off + 1;
+            }
+            i = i + 1;
+        }
+        if ((long_len & 1) == 1) { buf[off] = 0x0A; off = off + 1; }
+    }
+
+    i = 0;
+    for (i < count) {
+        put_header(buf, off, members[i].len);
+        if (inline_name(members[i].name)) {
+            val nm: str = members[i].name;
+            val nl: usize = str_len(nm);
+            var j: usize = 0;
+            for (j < nl) { buf[off + j] = nm[j]; j = j + 1; }
+            buf[off + nl] = '/';
+        }
+        or {
+            buf[off] = '/';
+            put_dec(buf, off + 1, long_off[i]);
+        }
+        off = off + HEADER_LEN;
+        var b: usize = 0;
+        for (b < members[i].len) { buf[off] = members[i].data[b]; off = off + 1; b = b + 1; }
+        if ((members[i].len & 1) == 1) { buf[off] = 0x0A; off = off + 1; }
+        i = i + 1;
+    }
+
+    val wr: R.Result[bool, str] = filesystem.write_file(out_path, buf, total, 0o644);
+    A.deallocate[u8](alloc, buf, total);
+    A.deallocate[usize](alloc, long_off, count::usize);
+    A.deallocate[usize](alloc, hdr_off, count::usize);
+    ret wr;
+}
+
+# a written archive round-trips through the reader: valid magic, the `/` symbol index
+# and `//` long-name table are skipped as specials, and exactly the two object members
+# are yielded with their bytes intact - including a member whose name needs the
+# long-name table (#1980)
+test "mach.lang.target.of.ar.write_roundtrip" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var code: i32 = 0;
+
+    var d1: [4]u8; d1[0] = 1::u8; d1[1] = 2::u8; d1[2] = 3::u8; d1[3] = 4::u8;
+    var d2: [3]u8; d2[0] = 9::u8; d2[1] = 8::u8; d2[2] = 7::u8;
+    var s1: [2]str; s1[0] = "foo"; s1[1] = "bar";
+    var s2: [1]str; s2[0] = "aVeryLongExportedSymbolName";
+    var members: [2]ArMember;
+    members[0].name = "short.o";
+    members[0].data = ?d1[0]; members[0].len = 4; members[0].sym_names = ?s1[0]; members[0].sym_count = 2;
+    members[1].name = "a.long.member.name.needing.the.table.o";
+    members[1].data = ?d2[0]; members[1].len = 3; members[1].sym_names = ?s2[0]; members[1].sym_count = 1;
+
+    val res_temp: R.Result[filesystem.TempFile, str] = filesystem.temp_create(?alloc, "mach_test_ar");
+    if (R.is_err[filesystem.TempFile, str](res_temp)) { ret 1; }
+    var tf: filesystem.TempFile = R.unwrap_ok[filesystem.TempFile, str](res_temp);
+    val path: str = filesystem.temp_path(?tf);
+    if (R.is_err[bool, str](write_archive(?alloc, ?members[0], 2, path))) { filesystem.temp_close_and_remove(?tf); ret 1; }
+
+    val rr: R.Result[filesystem.Buffer, str] = filesystem.read_all_sized(?alloc, path);
+    filesystem.temp_close_and_remove(?tf);
+    if (R.is_err[filesystem.Buffer, str](rr)) { ret 1; }
+    val b: filesystem.Buffer = R.unwrap_ok[filesystem.Buffer, str](rr);
+
+    if (!is_archive(b.data, b.len)) { ret 1; }
+
+    var pos: usize = first_member();
+    var objs: u32 = 0;
+    var m0_ok: bool = false;
+    var m1_ok: bool = false;
+    var walking: bool = true;
+    for (walking) {
+        val step: Step = next_member(b.data, b.len, pos);
+        if (!step.ok) { code = 1; walking = false; }
+        or (step.done) { walking = false; }
+        or {
+            if (!is_special(b.data, pos)) {
+                objs = objs + 1;
+                if (step.member.len == 4 && step.member.data[0] == 1::u8 && step.member.data[3] == 4::u8) { m0_ok = true; }
+                if (step.member.len == 3 && step.member.data[0] == 9::u8 && step.member.data[2] == 7::u8) { m1_ok = true; }
+            }
+            pos = step.next;
+        }
+    }
+    if (objs != 2) { code = 1; }
+    if (!m0_ok || !m1_ok) { code = 1; }
+    ret code;
 }
