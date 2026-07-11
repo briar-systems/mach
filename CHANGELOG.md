@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.1] - 2026-07-11
+
+The vector correctness patch. The `#2038` runtime suite's first run caught a
+shipped v3.4.0 miscompile: a by-value 128-bit vector argument or return whose
+value was not already register-resident was captured with a machine-word move,
+silently truncating lanes 2-3. Fixed at the shared capture path (a 16-byte
+`CLASS_FP` value now moves full-width on both SysV and AAPCS64); scalar codegen
+is byte-identical. Debug info for vectors also lands. Built with mach 3.4.0.
+
+**Known limitation:** win64 never classified vector arguments/returns (a
+distinct, pre-existing gap first exercised by this patch's regression test) —
+vector-by-value calls on x86_64-windows are mis-passed until #2055 lands; the
+MS x64 convention (args by reference, returns in XMM0) is specified there.
+
+### Added
+- debuginfo: vector types emit `DW_TAG_array_type` + `DW_AT_GNU_vector` DIEs —
+  gdb prints vector locals lane-by-lane on `-g` builds (#2018).
+
+### Fixed
+- codegen: **by-value vector argument/return capture is full-width** — the
+  caller's return capture and the callee's parameter capture no longer truncate
+  a non-coalesced vector register copy to 64 bits (#2053).
+- debuginfo: a struct's vector member gets its true 16-byte layout in DWARF
+  member offsets (the DWARF type bridge modeled vectors at pointer width;
+  runtime layout was always correct) (#2051).
+
 ## [3.4.0] - 2026-07-11
 
 The SIMD release. Ten 128-bit vector types (`f32x4 f64x2 i8x16 i16x8 i32x4
