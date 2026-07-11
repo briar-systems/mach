@@ -1,0 +1,712 @@
+# target-conditional vector scalarization pass (#2016)
+#
+# On a SIMD-incapable target (`MachineModel.has_v128 == false`, rv64gc the shipping
+# instance) there is no vector register file and no packed instruction for any
+# lane-wise operator, so every `IRT_VECTOR` value and operator must be lowered to a
+# defined per-lane scalar form before the back end selects instructions. This pass
+# runs as a middle-end IR legalization stage, after the always-on mem2reg / constfold
+# / dce sequence and before codegen, so that by the time MIR selection runs there are
+# no `IRT_VECTOR`-typed values left: the per-target isel guard in mir/lower.mach then
+# never fires on rv64 (it stays a loud backstop) and the existing scalar back end
+# selects the result unchanged.
+#
+# The governing rule is the epic's: scalarize OPERATORS, never algorithms. Each
+# lane-wise operator becomes a fixed, bounded per-lane unroll -- N independent scalar
+# computations, one per lane, never reordered, fused, or reassociated across lanes --
+# so the result is lane-exact-identical to the packed hardware backends, including
+# the compare -> all-ones / all-zeros mask encoding and every IEEE-754 edge case
+# (NaN, signed zero, rounding), which per-lane scalar ops reproduce for free.
+#
+# Representation: every vector value becomes a pointer to a 16-byte stack slot (an
+# `[lanes]elem` array), exactly as an aggregate flows by address. A lane is a scalar
+# load / store at its offset; an operator reads its operand lanes, computes per lane,
+# and writes its result lanes. Vector-typed function signatures are left intact: a
+# vector parameter / return is the ABI's memory (by-reference) class on rv64, so the
+# callee receives / returns it by address, and this pass makes every body use of that
+# value a pointer to match.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.me.ir;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.source;
+use mach.lang.target;
+
+# per-function rewrite state, threaded through the expansion helpers
+# ---
+# m:       the module being legalized
+# fn:      the function being legalized
+# pval:    replacement pointer Value per original instruction id (a vector result's
+#          16-byte slot address, a retyped phi / call result, meaningful where set)
+# pval_set: whether pval[iid] holds a replacement
+# n:       original instruction count (pval / pval_set are sized to it; ids >= n are
+#          freshly emitted scalar instructions that never produce a vector value)
+# is_vp:   whether parameter p is vector-typed (a body use becomes a pointer)
+# pcount:  parameter count (bounds is_vp)
+# void_ty: interned void type for stores
+# ptr_ty:  interned pointer type for slots / lane addresses
+# idx_ty:  interned integer type for gep lane indices (target pointer width)
+rec Ctx {
+    m:        *ir.Module;
+    fn:       *ir.Function;
+    pval:     *value.Value;
+    pval_set: *bool;
+    n:        u32;
+    is_vp:    *bool;
+    pcount:   u32;
+    void_ty:  ir_type.IrTypeId;
+    ptr_ty:   ir_type.IrTypeId;
+    idx_ty:   ir_type.IrTypeId;
+}
+
+# a vector type's element type, lane count, and element bit width
+# ---
+# elem:  scalar element IrTypeId
+# lanes: number of lanes
+# bits:  element bit width (a lane mask's width)
+rec VInfo {
+    elem:  ir_type.IrTypeId;
+    lanes: u32;
+    bits:  u32;
+}
+
+# whether a binary opcode is a lane-wise vector arithmetic / bitwise operator
+#
+# The full arithmetic / bitwise binary family: whenever the result is vector-typed
+# the operator expands per lane. Illegal-on-vectors opcodes (integer `/` `%`) never
+# reach here from sema, but a per-lane expansion of them is still well-defined, so
+# the classifier stays total rather than partial.
+fun is_binary_op(k: instruction.InstrKind) bool {
+    ret k == instruction.OP_ADD || k == instruction.OP_SUB || k == instruction.OP_MUL
+        || k == instruction.OP_DIV_S || k == instruction.OP_DIV_U
+        || k == instruction.OP_REM_S || k == instruction.OP_REM_U
+        || k == instruction.OP_AND || k == instruction.OP_OR || k == instruction.OP_XOR
+        || k == instruction.OP_SHL || k == instruction.OP_SHR_S || k == instruction.OP_SHR_U;
+}
+
+# whether a unary opcode is a lane-wise vector operator (bitwise not, negate)
+fun is_unary_op(k: instruction.InstrKind) bool {
+    ret k == instruction.OP_NOT || k == instruction.OP_NEG;
+}
+
+# whether an opcode is a lane-wise vector comparison (result is the same-shape mask)
+fun is_compare_op(k: instruction.InstrKind) bool {
+    ret k == instruction.OP_CMP_EQ || k == instruction.OP_CMP_NE
+        || k == instruction.OP_CMP_LT_S || k == instruction.OP_CMP_LT_U
+        || k == instruction.OP_CMP_LE_S || k == instruction.OP_CMP_LE_U;
+}
+
+# whether an instruction produces a vector result that needs a backing stack slot
+#
+# Arithmetic / unary / comparison operators and a whole-vector load each define a
+# fresh vector value; a phi / call result is a vector too but is handled by
+# retyping in place, and a store / ret consume a vector without producing one.
+fun produces_vector(m: *ir.Module, inst: *instruction.Instruction) bool {
+    if (!ir_type.is_vector(?m.types, inst.ty)) { ret false; }
+    ret is_binary_op(inst.kind) || is_unary_op(inst.kind) || is_compare_op(inst.kind)
+        || inst.kind == instruction.OP_LOAD;
+}
+
+# read a vector type's element / lane / bit-width descriptor
+# ---
+# m:   the module (its type table)
+# vty: a vector IrTypeId
+# out: filled with the descriptor on success
+# ret: ok(true), or an err if `vty` is not a resolvable vector
+fun vec_info(m: *ir.Module, vty: ir_type.IrTypeId, out: *VInfo) R.Result[bool, str] {
+    val opt_v: O.Option[*ir_type.IrType] = ir_type.get(?m.types, vty);
+    if (O.is_none[*ir_type.IrType](opt_v)) { ret R.err[bool, str]("scalarize: operand is not a resolvable IR type"); }
+    val vt: *ir_type.IrType = O.unwrap[*ir_type.IrType](opt_v);
+    if (vt.kind != ir_type.IRT_VECTOR) { ret R.err[bool, str]("scalarize: expected an IR vector type"); }
+    out.elem  = vt.data.vector_.element;
+    out.lanes = vt.data.vector_.lanes;
+
+    val opt_e: O.Option[*ir_type.IrType] = ir_type.get(?m.types, vt.data.vector_.element);
+    if (O.is_none[*ir_type.IrType](opt_e)) { ret R.err[bool, str]("scalarize: vector element type not resolvable"); }
+    out.bits = O.unwrap[*ir_type.IrType](opt_e).data.bits;
+    ret R.ok[bool, str](true);
+}
+
+# create a fresh instruction in the function's pool with owned operands
+#
+# The pool-level primitive underlying every emit: it never links the instruction into
+# a block, so the caller controls placement. Stamps `loc` for debug-line fidelity.
+# ---
+# ret: the new instruction id, or an allocation error
+fun new_instr(m: *ir.Module, fn: *ir.Function, kind: instruction.InstrKind, ty: ir_type.IrTypeId,
+              aux: ir_type.IrTypeId, ops: *value.Value, opn: u32, loc: source.SrcLoc) R.Result[id.InstructionId, str] {
+    var owned: *value.Value = nil;
+    if (opn > 0) {
+        val ro: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, opn::usize);
+        if (R.is_err[*value.Value, str](ro)) { ret R.err[id.InstructionId, str](R.unwrap_err[*value.Value, str](ro)); }
+        owned = R.unwrap_ok[*value.Value, str](ro);
+        var i: u32 = 0;
+        for (i < opn) { owned[i] = ops[i]; i = i + 1; }
+    }
+    var ins: instruction.Instruction;
+    ins.kind          = kind;
+    ins.ty            = ty;
+    ins.operands      = owned;
+    ins.operand_count = opn;
+    ins.operand_cap   = opn;
+    ins.flags         = 0;
+    ins.aux_ty        = aux;
+    ins.loc           = loc;
+    ret ir.instruction_add(m, fn, ins);
+}
+
+# create an instruction and append it to `blk`'s body, returning its result Value
+fun push(c: *Ctx, blk: *ir.Block, kind: instruction.InstrKind, ty: ir_type.IrTypeId,
+         aux: ir_type.IrTypeId, ops: *value.Value, opn: u32, loc: source.SrcLoc) R.Result[value.Value, str] {
+    val ri: R.Result[id.InstructionId, str] = new_instr(c.m, c.fn, kind, ty, aux, ops, opn, loc);
+    if (R.is_err[id.InstructionId, str](ri)) { ret R.err[value.Value, str](R.unwrap_err[id.InstructionId, str](ri)); }
+    val iid: id.InstructionId = R.unwrap_ok[id.InstructionId, str](ri);
+    val rl: R.Result[bool, str] = ir.block_append_instr(c.m, blk, iid);
+    if (R.is_err[bool, str](rl)) { ret R.err[value.Value, str](R.unwrap_err[bool, str](rl)); }
+    ret R.ok[value.Value, str](value.instr(iid, ty));
+}
+
+# the pointer to lane `k` of the `[lanes]elem` slot at `base` (a `gep [0, k]`)
+fun lane_ptr(c: *Ctx, blk: *ir.Block, base: value.Value, arr_ty: ir_type.IrTypeId, k: u32, loc: source.SrcLoc) R.Result[value.Value, str] {
+    var ops: [3]value.Value;
+    ops[0] = base;
+    ops[1] = value.const_int(0, c.idx_ty);
+    ops[2] = value.const_int(k::u64, c.idx_ty);
+    ret push(c, blk, instruction.OP_GEP, c.ptr_ty, arr_ty, ?ops[0], 3, loc);
+}
+
+# a scalar load of `elem_ty` from `ptr`
+fun emit_load(c: *Ctx, blk: *ir.Block, ptr: value.Value, elem_ty: ir_type.IrTypeId, loc: source.SrcLoc) R.Result[value.Value, str] {
+    var ops: [1]value.Value;
+    ops[0] = ptr;
+    ret push(c, blk, instruction.OP_LOAD, elem_ty, ir_type.IRT_NIL, ?ops[0], 1, loc);
+}
+
+# a scalar store of `v` to `ptr`
+fun emit_store(c: *Ctx, blk: *ir.Block, v: value.Value, ptr: value.Value, loc: source.SrcLoc) R.Result[bool, str] {
+    var ops: [2]value.Value;
+    ops[0] = v;
+    ops[1] = ptr;
+    val r: R.Result[value.Value, str] = push(c, blk, instruction.OP_STORE, c.void_ty, ir_type.IRT_NIL, ?ops[0], 2, loc);
+    if (R.is_err[value.Value, str](r)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r)); }
+    ret R.ok[bool, str](true);
+}
+
+# a scalar binary op `kind ty a, b`
+fun emit_binop(c: *Ctx, blk: *ir.Block, kind: instruction.InstrKind, ty: ir_type.IrTypeId, a: value.Value, b: value.Value, loc: source.SrcLoc) R.Result[value.Value, str] {
+    var ops: [2]value.Value;
+    ops[0] = a;
+    ops[1] = b;
+    ret push(c, blk, kind, ty, ir_type.IRT_NIL, ?ops[0], 2, loc);
+}
+
+# a scalar unary op `kind ty a`
+fun emit_unop(c: *Ctx, blk: *ir.Block, kind: instruction.InstrKind, ty: ir_type.IrTypeId, a: value.Value, loc: source.SrcLoc) R.Result[value.Value, str] {
+    var ops: [1]value.Value;
+    ops[0] = a;
+    ret push(c, blk, kind, ty, ir_type.IRT_NIL, ?ops[0], 1, loc);
+}
+
+# resolve a value to its scalarized replacement
+#
+# A vector-typed instruction result resolves to its slot pointer; a vector parameter
+# resolves to the same-index pointer parameter (byref on rv64, so the register holds
+# the address); everything else passes through unchanged.
+fun resolve(c: *Ctx, v: value.Value) value.Value {
+    if (v.kind == value.VAL_INSTR) {
+        val iid: u32 = v.data.instr::u32;
+        if (iid < c.n && c.pval_set[iid]) { ret c.pval[iid]; }
+        ret v;
+    }
+    if (v.kind == value.VAL_PARAM) {
+        val p: u32 = v.data.param_ix;
+        if (p < c.pcount && c.is_vp[p]) { ret value.param(p, c.ptr_ty); }
+        ret v;
+    }
+    ret v;
+}
+
+# rewrite every operand of `inst` through `resolve`, in place
+#
+# Used for the kept instructions, the phi value operands, and the terminator: a
+# vector value naming a scalarized producer becomes its slot pointer. Block-target
+# operands ride in VAL_CONST_INT slots and pass through untouched.
+fun rewrite_ops(c: *Ctx, inst: *instruction.Instruction) {
+    var i: u32 = 0;
+    for (i < inst.operand_count) {
+        inst.operands[i] = resolve(c, inst.operands[i]);
+        i = i + 1;
+    }
+}
+
+# expand a lane-wise arithmetic / bitwise binary vector operator into N scalar ops
+#
+# reads lane k of each operand slot, applies the scalar op, stores lane k of the
+# result slot -- N independent computations, no cross-lane interaction.
+fun expand_binary(c: *Ctx, blk: *ir.Block, kind: instruction.InstrKind, dst: value.Value, a: value.Value, b: value.Value, vi: VInfo, loc: source.SrcLoc) R.Result[bool, str] {
+    val ra: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?c.m.types, vi.elem, vi.lanes);
+    if (R.is_err[ir_type.IrTypeId, str](ra)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ra)); }
+    val arr: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ra);
+
+    var k: u32 = 0;
+    for (k < vi.lanes) {
+        val pa: R.Result[value.Value, str] = lane_ptr(c, blk, a, arr, k, loc);
+        if (R.is_err[value.Value, str](pa)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](pa)); }
+        val va: R.Result[value.Value, str] = emit_load(c, blk, R.unwrap_ok[value.Value, str](pa), vi.elem, loc);
+        if (R.is_err[value.Value, str](va)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](va)); }
+
+        val pb: R.Result[value.Value, str] = lane_ptr(c, blk, b, arr, k, loc);
+        if (R.is_err[value.Value, str](pb)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](pb)); }
+        val vb: R.Result[value.Value, str] = emit_load(c, blk, R.unwrap_ok[value.Value, str](pb), vi.elem, loc);
+        if (R.is_err[value.Value, str](vb)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](vb)); }
+
+        val vr: R.Result[value.Value, str] = emit_binop(c, blk, kind, vi.elem, R.unwrap_ok[value.Value, str](va), R.unwrap_ok[value.Value, str](vb), loc);
+        if (R.is_err[value.Value, str](vr)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](vr)); }
+
+        val pr: R.Result[value.Value, str] = lane_ptr(c, blk, dst, arr, k, loc);
+        if (R.is_err[value.Value, str](pr)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](pr)); }
+        val rs: R.Result[bool, str] = emit_store(c, blk, R.unwrap_ok[value.Value, str](vr), R.unwrap_ok[value.Value, str](pr), loc);
+        if (R.is_err[bool, str](rs)) { ret rs; }
+        k = k + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# expand a lane-wise unary vector operator (bitwise not, negate) into N scalar ops
+fun expand_unary(c: *Ctx, blk: *ir.Block, kind: instruction.InstrKind, dst: value.Value, a: value.Value, vi: VInfo, loc: source.SrcLoc) R.Result[bool, str] {
+    val ra: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?c.m.types, vi.elem, vi.lanes);
+    if (R.is_err[ir_type.IrTypeId, str](ra)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ra)); }
+    val arr: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ra);
+
+    var k: u32 = 0;
+    for (k < vi.lanes) {
+        val pa: R.Result[value.Value, str] = lane_ptr(c, blk, a, arr, k, loc);
+        if (R.is_err[value.Value, str](pa)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](pa)); }
+        val va: R.Result[value.Value, str] = emit_load(c, blk, R.unwrap_ok[value.Value, str](pa), vi.elem, loc);
+        if (R.is_err[value.Value, str](va)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](va)); }
+
+        val vr: R.Result[value.Value, str] = emit_unop(c, blk, kind, vi.elem, R.unwrap_ok[value.Value, str](va), loc);
+        if (R.is_err[value.Value, str](vr)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](vr)); }
+
+        val pr: R.Result[value.Value, str] = lane_ptr(c, blk, dst, arr, k, loc);
+        if (R.is_err[value.Value, str](pr)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](pr)); }
+        val rs: R.Result[bool, str] = emit_store(c, blk, R.unwrap_ok[value.Value, str](vr), R.unwrap_ok[value.Value, str](pr), loc);
+        if (R.is_err[bool, str](rs)) { ret rs; }
+        k = k + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# expand a lane-wise vector comparison into N scalar compares each writing a full-width
+# mask lane (all-ones for true, all-zeros for false)
+#
+# The operand element carries the compared values (`op`); the result mask element is a
+# same-width integer. Per lane: a scalar compare yields a 0/1 boolean, widened to the
+# mask width and negated (`0 - z`) so a true lane is all-ones in two's complement --
+# lane-for-lane identical to CMPPS / FCMEQ, including the NaN outcome the scalar
+# ordered / unordered compare reproduces.
+fun expand_compare(c: *Ctx, blk: *ir.Block, kind: instruction.InstrKind, dst: value.Value, a: value.Value, b: value.Value,
+                   op: VInfo, mask: VInfo, i8_ty: ir_type.IrTypeId, loc: source.SrcLoc) R.Result[bool, str] {
+    val rao: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?c.m.types, op.elem, op.lanes);
+    if (R.is_err[ir_type.IrTypeId, str](rao)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rao)); }
+    val arr_op: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rao);
+    val ram: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?c.m.types, mask.elem, mask.lanes);
+    if (R.is_err[ir_type.IrTypeId, str](ram)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ram)); }
+    val arr_mask: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ram);
+
+    var k: u32 = 0;
+    for (k < op.lanes) {
+        val pa: R.Result[value.Value, str] = lane_ptr(c, blk, a, arr_op, k, loc);
+        if (R.is_err[value.Value, str](pa)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](pa)); }
+        val va: R.Result[value.Value, str] = emit_load(c, blk, R.unwrap_ok[value.Value, str](pa), op.elem, loc);
+        if (R.is_err[value.Value, str](va)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](va)); }
+
+        val pb: R.Result[value.Value, str] = lane_ptr(c, blk, b, arr_op, k, loc);
+        if (R.is_err[value.Value, str](pb)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](pb)); }
+        val vb: R.Result[value.Value, str] = emit_load(c, blk, R.unwrap_ok[value.Value, str](pb), op.elem, loc);
+        if (R.is_err[value.Value, str](vb)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](vb)); }
+
+        # a scalar compare of the two lanes yields an 8-bit 0/1 boolean.
+        val cmp: R.Result[value.Value, str] = emit_binop(c, blk, kind, i8_ty, R.unwrap_ok[value.Value, str](va), R.unwrap_ok[value.Value, str](vb), loc);
+        if (R.is_err[value.Value, str](cmp)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](cmp)); }
+        var wide: value.Value = R.unwrap_ok[value.Value, str](cmp);
+
+        # widen the boolean to the mask lane width (identity when the mask is 8-bit).
+        if (mask.bits != 8) {
+            val z: R.Result[value.Value, str] = emit_unop(c, blk, instruction.OP_ZEXT, mask.elem, wide, loc);
+            if (R.is_err[value.Value, str](z)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](z)); }
+            wide = R.unwrap_ok[value.Value, str](z);
+        }
+
+        # negate: 0 - {0,1} is {0, all-ones} in two's complement at the mask width.
+        val neg: R.Result[value.Value, str] = emit_binop(c, blk, instruction.OP_SUB, mask.elem, value.const_int(0, mask.elem), wide, loc);
+        if (R.is_err[value.Value, str](neg)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](neg)); }
+
+        val pr: R.Result[value.Value, str] = lane_ptr(c, blk, dst, arr_mask, k, loc);
+        if (R.is_err[value.Value, str](pr)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](pr)); }
+        val rs: R.Result[bool, str] = emit_store(c, blk, R.unwrap_ok[value.Value, str](neg), R.unwrap_ok[value.Value, str](pr), loc);
+        if (R.is_err[bool, str](rs)) { ret rs; }
+        k = k + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# copy the 16 bytes of a vector from `src` to `dst`, lane by lane (a whole-vector
+# load's snapshot, or a whole-vector store)
+fun copy_vector(c: *Ctx, blk: *ir.Block, dst: value.Value, src: value.Value, vi: VInfo, loc: source.SrcLoc) R.Result[bool, str] {
+    val ra: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?c.m.types, vi.elem, vi.lanes);
+    if (R.is_err[ir_type.IrTypeId, str](ra)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ra)); }
+    val arr: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ra);
+
+    var k: u32 = 0;
+    for (k < vi.lanes) {
+        val ps: R.Result[value.Value, str] = lane_ptr(c, blk, src, arr, k, loc);
+        if (R.is_err[value.Value, str](ps)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](ps)); }
+        val v: R.Result[value.Value, str] = emit_load(c, blk, R.unwrap_ok[value.Value, str](ps), vi.elem, loc);
+        if (R.is_err[value.Value, str](v)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](v)); }
+
+        val pd: R.Result[value.Value, str] = lane_ptr(c, blk, dst, arr, k, loc);
+        if (R.is_err[value.Value, str](pd)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](pd)); }
+        val rs: R.Result[bool, str] = emit_store(c, blk, R.unwrap_ok[value.Value, str](v), R.unwrap_ok[value.Value, str](pd), loc);
+        if (R.is_err[bool, str](rs)) { ret rs; }
+        k = k + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# create a fresh `[lanes]elem` stack slot for `vty` in the entry block's alloca set,
+# returning its pointer Value
+#
+# The slot is emitted into `entry`'s body front later (it must dominate every use);
+# here it is only created in the pool and its id recorded in `slots`.
+fun make_slot(c: *Ctx, vty: ir_type.IrTypeId, slots: *id.InstructionId, slot_len: *u32) R.Result[value.Value, str] {
+    var vi: VInfo;
+    val vr: R.Result[bool, str] = vec_info(c.m, vty, ?vi);
+    if (R.is_err[bool, str](vr)) { ret R.err[value.Value, str](R.unwrap_err[bool, str](vr)); }
+    val ra: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?c.m.types, vi.elem, vi.lanes);
+    if (R.is_err[ir_type.IrTypeId, str](ra)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](ra)); }
+    val arr: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ra);
+
+    var ops: [1]value.Value;
+    ops[0] = value.const_int(1, c.idx_ty);
+    val ri: R.Result[id.InstructionId, str] = new_instr(c.m, c.fn, instruction.OP_ALLOCA, c.ptr_ty, arr, ?ops[0], 1, source.loc(source.FILE_NIL, 0));
+    if (R.is_err[id.InstructionId, str](ri)) { ret R.err[value.Value, str](R.unwrap_err[id.InstructionId, str](ri)); }
+    val iid: id.InstructionId = R.unwrap_ok[id.InstructionId, str](ri);
+    slots[@slot_len] = iid;
+    @slot_len = @slot_len + 1;
+    ret R.ok[value.Value, str](value.instr(iid, c.ptr_ty));
+}
+
+# retype an alloca / gep whose aggregate type is a vector to the equivalent
+# `[lanes]elem` array, so the back end strides and sizes it as ordinary array memory
+# and no `IRT_VECTOR` is referenced after the pass
+fun retype_aux(c: *Ctx, inst: *instruction.Instruction) R.Result[bool, str] {
+    if (inst.aux_ty == ir_type.IRT_NIL) { ret R.ok[bool, str](true); }
+    if (!ir_type.is_vector(?c.m.types, inst.aux_ty)) { ret R.ok[bool, str](true); }
+    var vi: VInfo;
+    val vr: R.Result[bool, str] = vec_info(c.m, inst.aux_ty, ?vi);
+    if (R.is_err[bool, str](vr)) { ret vr; }
+    val ra: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?c.m.types, vi.elem, vi.lanes);
+    if (R.is_err[ir_type.IrTypeId, str](ra)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ra)); }
+    inst.aux_ty = R.unwrap_ok[ir_type.IrTypeId, str](ra);
+    ret R.ok[bool, str](true);
+}
+
+# legalize one function, returning the number of vector OPERATORS scalarized
+#
+# The operator tally counts arithmetic / unary / comparison expansions only; the
+# supporting loads, stores, and moves are not operators.
+fun scalarize_function(c: *Ctx, i8_ty: ir_type.IrTypeId) R.Result[u32, str] {
+    val fn: *ir.Function = c.fn;
+
+    # slot ids created in the pre-pass, prepended to the entry block in the fill pass.
+    var slots:    *id.InstructionId = nil;
+    var slot_len: u32 = 0;
+    if (c.n > 0) {
+        val rs: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](c.m.alloc, c.n::usize);
+        if (R.is_err[*id.InstructionId, str](rs)) { ret R.err[u32, str](R.unwrap_err[*id.InstructionId, str](rs)); }
+        slots = R.unwrap_ok[*id.InstructionId, str](rs);
+    }
+
+    # pre-pass: give every vector-producing instruction its pointer representation,
+    # and retype vector allocas / geps to array form. iterate the pool by id so a
+    # phi's incoming producers are mapped before the fill pass reads them.
+    var iid: u32 = 0;
+    for (iid < c.n) {
+        val inst: *instruction.Instruction = ?fn.instrs[iid];
+        if (inst.kind == instruction.OP_ALLOCA || inst.kind == instruction.OP_GEP) {
+            val rr: R.Result[bool, str] = retype_aux(c, inst);
+            if (R.is_err[bool, str](rr)) { slots_free(c, slots); ret R.err[u32, str](R.unwrap_err[bool, str](rr)); }
+        } or (produces_vector(c.m, inst)) {
+            val vty: ir_type.IrTypeId = inst.ty;
+            val ms: R.Result[value.Value, str] = make_slot(c, vty, slots, ?slot_len);
+            if (R.is_err[value.Value, str](ms)) { slots_free(c, slots); ret R.err[u32, str](R.unwrap_err[value.Value, str](ms)); }
+            c.pval[iid]     = R.unwrap_ok[value.Value, str](ms);
+            c.pval_set[iid] = true;
+        } or (inst.kind == instruction.OP_PHI && ir_type.is_vector(?c.m.types, inst.ty)) {
+            inst.ty         = c.ptr_ty;
+            c.pval[iid]     = value.instr(iid::id.InstructionId, c.ptr_ty);
+            c.pval_set[iid] = true;
+        } or (inst.kind == instruction.OP_CALL && ir_type.is_vector(?c.m.types, inst.ty)) {
+            inst.ty         = c.ptr_ty;
+            c.pval[iid]     = value.instr(iid::id.InstructionId, c.ptr_ty);
+            c.pval_set[iid] = true;
+        }
+        iid = iid + 1;
+    }
+
+    # fill pass: rewrite each block's body, expanding operators and copying loads /
+    # stores; rewrite phi value operands and the terminator in place.
+    var count: u32 = 0;
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[bi];
+        val rf: R.Result[u32, str] = fill_block(c, blk, bi == 0, slots, slot_len, i8_ty, count);
+        if (R.is_err[u32, str](rf)) { slots_free(c, slots); ret rf; }
+        count = R.unwrap_ok[u32, str](rf);
+        bi = bi + 1;
+    }
+
+    slots_free(c, slots);
+    ret R.ok[u32, str](count);
+}
+
+# free the pre-pass slot-id scratch array
+fun slots_free(c: *Ctx, slots: *id.InstructionId) {
+    if (slots != nil && c.n > 0) {
+        A.deallocate[id.InstructionId](c.m.alloc, slots, c.n::usize);
+    }
+}
+
+# rebuild one block's body, expanding vector operators; returns the running operator tally
+fun fill_block(c: *Ctx, blk: *ir.Block, is_entry: bool, slots: *id.InstructionId, slot_len: u32, i8_ty: ir_type.IrTypeId, count_in: u32) R.Result[u32, str] {
+    val fn: *ir.Function = c.fn;
+    var count: u32 = count_in;
+
+    # snapshot the old body ids: the fill re-appends into a cleared body, and emits
+    # fresh instructions between them, so the original order is preserved.
+    val old_len: u32 = blk.instr_count;
+    var old: *id.InstructionId = nil;
+    if (old_len > 0) {
+        val ro: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](c.m.alloc, old_len::usize);
+        if (R.is_err[*id.InstructionId, str](ro)) { ret R.err[u32, str](R.unwrap_err[*id.InstructionId, str](ro)); }
+        old = R.unwrap_ok[*id.InstructionId, str](ro);
+        var i: u32 = 0;
+        for (i < old_len) { old[i] = blk.instructions[i]; i = i + 1; }
+    }
+    blk.instr_count = 0;
+
+    # the entry block's alloca slots dominate every use, so they lead the body.
+    if (is_entry) {
+        var s: u32 = 0;
+        for (s < slot_len) {
+            val ra: R.Result[bool, str] = ir.block_append_instr(c.m, blk, slots[s]);
+            if (R.is_err[bool, str](ra)) { body_free(c, old, old_len); ret R.err[u32, str](R.unwrap_err[bool, str](ra)); }
+            s = s + 1;
+        }
+    }
+
+    var oi: u32 = 0;
+    for (oi < old_len) {
+        val cur: id.InstructionId = old[oi];
+        val rr: R.Result[u32, str] = fill_one(c, blk, cur, i8_ty, count);
+        if (R.is_err[u32, str](rr)) { body_free(c, old, old_len); ret rr; }
+        count = R.unwrap_ok[u32, str](rr);
+        oi = oi + 1;
+    }
+
+    body_free(c, old, old_len);
+
+    # phis carry value operands from predecessors; retype vector incomings to pointers.
+    var p: u32 = 0;
+    for (p < blk.phi_count) {
+        rewrite_ops(c, ?fn.instrs[blk.phis[p]::u32]);
+        p = p + 1;
+    }
+    # the terminator (a vector `ret`) consumes a vector value by address.
+    if (blk.terminator != id.INSTR_NIL) {
+        rewrite_ops(c, ?fn.instrs[blk.terminator::u32]);
+    }
+    ret R.ok[u32, str](count);
+}
+
+# free the snapshot body-id array
+fun body_free(c: *Ctx, old: *id.InstructionId, old_len: u32) {
+    if (old != nil && old_len > 0) {
+        A.deallocate[id.InstructionId](c.m.alloc, old, old_len::usize);
+    }
+}
+
+# process one original body instruction: expand a vector operator, copy a vector
+# load / store, or keep and operand-rewrite anything else
+fun fill_one(c: *Ctx, blk: *ir.Block, cur: id.InstructionId, i8_ty: ir_type.IrTypeId, count_in: u32) R.Result[u32, str] {
+    val fn: *ir.Function = c.fn;
+    var count: u32 = count_in;
+
+    # copy out everything read from the instruction: emitting fresh instructions can
+    # reallocate the pool and invalidate this pointer.
+    val ip: *instruction.Instruction = ?fn.instrs[cur::u32];
+    val kind: instruction.InstrKind = ip.kind;
+    val ty:   ir_type.IrTypeId = ip.ty;
+    val loc:  source.SrcLoc = ip.loc;
+    val is_vec_ty: bool = ir_type.is_vector(?c.m.types, ty);
+
+    # a vector arithmetic / unary / comparison operator, or a whole-vector load.
+    if (is_vec_ty && (is_binary_op(kind) || is_unary_op(kind) || is_compare_op(kind) || kind == instruction.OP_LOAD)) {
+        val dst: value.Value = c.pval[cur::u32];
+        if (is_compare_op(kind)) {
+            val op0: value.Value = resolve(c, ip.operands[0]);
+            val op1: value.Value = resolve(c, ip.operands[1]);
+            val op0ty: ir_type.IrTypeId = ip.operands[0].ty;
+            var opi: VInfo;
+            val re: R.Result[bool, str] = vec_info(c.m, op0ty, ?opi);
+            if (R.is_err[bool, str](re)) { ret R.err[u32, str](R.unwrap_err[bool, str](re)); }
+            var mi: VInfo;
+            val rm: R.Result[bool, str] = vec_info(c.m, ty, ?mi);
+            if (R.is_err[bool, str](rm)) { ret R.err[u32, str](R.unwrap_err[bool, str](rm)); }
+            val rx: R.Result[bool, str] = expand_compare(c, blk, kind, dst, op0, op1, opi, mi, i8_ty, loc);
+            if (R.is_err[bool, str](rx)) { ret R.err[u32, str](R.unwrap_err[bool, str](rx)); }
+            ret R.ok[u32, str](count + 1);
+        }
+        var vi: VInfo;
+        val rv: R.Result[bool, str] = vec_info(c.m, ty, ?vi);
+        if (R.is_err[bool, str](rv)) { ret R.err[u32, str](R.unwrap_err[bool, str](rv)); }
+        if (kind == instruction.OP_LOAD) {
+            val src: value.Value = resolve(c, ip.operands[0]);
+            val rc: R.Result[bool, str] = copy_vector(c, blk, dst, src, vi, loc);
+            if (R.is_err[bool, str](rc)) { ret R.err[u32, str](R.unwrap_err[bool, str](rc)); }
+            ret R.ok[u32, str](count);
+        }
+        if (is_unary_op(kind)) {
+            val a: value.Value = resolve(c, ip.operands[0]);
+            val ru: R.Result[bool, str] = expand_unary(c, blk, kind, dst, a, vi, loc);
+            if (R.is_err[bool, str](ru)) { ret R.err[u32, str](R.unwrap_err[bool, str](ru)); }
+            ret R.ok[u32, str](count + 1);
+        }
+        val a: value.Value = resolve(c, ip.operands[0]);
+        val b: value.Value = resolve(c, ip.operands[1]);
+        val rb: R.Result[bool, str] = expand_binary(c, blk, kind, dst, a, b, vi, loc);
+        if (R.is_err[bool, str](rb)) { ret R.err[u32, str](R.unwrap_err[bool, str](rb)); }
+        ret R.ok[u32, str](count + 1);
+    }
+
+    # a whole-vector store: copy the source slot's 16 bytes to the destination.
+    if (kind == instruction.OP_STORE && ir_type.is_vector(?c.m.types, ip.operands[0].ty)) {
+        val srcv: value.Value = resolve(c, ip.operands[0]);
+        val dstp: value.Value = resolve(c, ip.operands[1]);
+        val vty:  ir_type.IrTypeId = ip.operands[0].ty;
+        var vi: VInfo;
+        val rv: R.Result[bool, str] = vec_info(c.m, vty, ?vi);
+        if (R.is_err[bool, str](rv)) { ret R.err[u32, str](R.unwrap_err[bool, str](rv)); }
+        val rc: R.Result[bool, str] = copy_vector(c, blk, dstp, srcv, vi, loc);
+        if (R.is_err[bool, str](rc)) { ret R.err[u32, str](R.unwrap_err[bool, str](rc)); }
+        ret R.ok[u32, str](count);
+    }
+
+    # everything else is kept: rewrite its operands to the pointer representation and
+    # re-link it into the rebuilt body in its original position.
+    rewrite_ops(c, ?fn.instrs[cur::u32]);
+    val rl: R.Result[bool, str] = ir.block_append_instr(c.m, blk, cur);
+    if (R.is_err[bool, str](rl)) { ret R.err[u32, str](R.unwrap_err[bool, str](rl)); }
+    ret R.ok[u32, str](count);
+}
+
+# scalarize every lane-wise vector value and operator in `m` for a SIMD-incapable
+# target; a no-op on a capable target (`has_v128 == true`)
+#
+# Records the number of vector operators scalarized (summed across the module's
+# functions) on `m.vector_ops_scalarized`, which the build path reads to surface the
+# one-shot scalarization note. This is the shared detection seam the profile lever
+# (#2017) turns into a `require`-mode error.
+# ---
+# m:   the module to legalize in place
+# tgt: the target, consulted for the SIMD capability fact
+# ret: ok(true) on success, or an allocation / internal error
+pub fun run(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
+    if (tgt.model.has_v128) { ret R.ok[bool, str](true); }
+
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rp)); }
+    val ptr_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+
+    val rv: R.Result[ir_type.IrTypeId, str] = ir_type.intern_void(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rv)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rv)); }
+    val void_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rv);
+
+    # gep lane indices are machine-word integers; the pointer width matches the target.
+    val ri: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, tgt.arch.pointer_width * 8);
+    if (R.is_err[ir_type.IrTypeId, str](ri)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ri)); }
+    val idx_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ri);
+
+    val r8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
+    if (R.is_err[ir_type.IrTypeId, str](r8)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](r8)); }
+    val i8_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r8);
+
+    var total: u32 = 0;
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        if ((fn.flags & ir.FN_FLAG_EXTERN) == 0 && fn.instr_len > 0) {
+            var c: Ctx;
+            c.m       = m;
+            c.fn      = fn;
+            c.n       = fn.instr_len;
+            c.pcount  = fn.param_count;
+            c.void_ty = void_ty;
+            c.ptr_ty  = ptr_ty;
+            c.idx_ty  = idx_ty;
+
+            val rpv: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, c.n::usize);
+            if (R.is_err[*value.Value, str](rpv)) { ret R.err[bool, str](R.unwrap_err[*value.Value, str](rpv)); }
+            c.pval = R.unwrap_ok[*value.Value, str](rpv);
+            val rps: R.Result[*bool, str] = A.allocate[bool](m.alloc, c.n::usize);
+            if (R.is_err[*bool, str](rps)) { A.deallocate[value.Value](m.alloc, c.pval, c.n::usize); ret R.err[bool, str](R.unwrap_err[*bool, str](rps)); }
+            c.pval_set = R.unwrap_ok[*bool, str](rps);
+
+            var iid: u32 = 0;
+            for (iid < c.n) { c.pval_set[iid] = false; iid = iid + 1; }
+
+            c.is_vp = nil;
+            if (c.pcount > 0) {
+                val rvp: R.Result[*bool, str] = A.allocate[bool](m.alloc, c.pcount::usize);
+                if (R.is_err[*bool, str](rvp)) { ctx_free(m, ?c); ret R.err[bool, str](R.unwrap_err[*bool, str](rvp)); }
+                c.is_vp = R.unwrap_ok[*bool, str](rvp);
+                var p: u32 = 0;
+                for (p < c.pcount) {
+                    c.is_vp[p] = ir_type.is_vector(?m.types, fn.params[p].ty);
+                    p = p + 1;
+                }
+            }
+
+            val rf: R.Result[u32, str] = scalarize_function(?c, i8_ty);
+            ctx_free(m, ?c);
+            if (R.is_err[u32, str](rf)) { ret R.err[bool, str](R.unwrap_err[u32, str](rf)); }
+            total = total + R.unwrap_ok[u32, str](rf);
+        }
+        fi = fi + 1;
+    }
+
+    m.vector_ops_scalarized = total;
+    ret R.ok[bool, str](true);
+}
+
+# free a Ctx's owned scratch arrays
+fun ctx_free(m: *ir.Module, c: *Ctx) {
+    if (c.pval != nil && c.n > 0)     { A.deallocate[value.Value](m.alloc, c.pval, c.n::usize); }
+    if (c.pval_set != nil && c.n > 0) { A.deallocate[bool](m.alloc, c.pval_set, c.n::usize); }
+    if (c.is_vp != nil && c.pcount > 0) { A.deallocate[bool](m.alloc, c.is_vp, c.pcount::usize); }
+    c.pval = nil;
+    c.pval_set = nil;
+    c.is_vp = nil;
+}
