@@ -34,6 +34,29 @@ At module top level:
 
 Inside functions, they are local to the enclosing block.
 
+## `ext` — foreign data imports
+
+`ext val` / `ext var` declares a binding whose storage lives in another object,
+imported by name — the data analogue of [`ext fun`](ext-fun.md). It is a
+forward reference the linker resolves, so it is **storage-less** and carries no
+initializer:
+
+```mach
+ext var errno: i32;                        # imported mutable datum
+#[symbol("environ")] ext var env: **u8;    # renamed import
+#[library("libfoo.so")] ext val foo_flags: u32;  # library-pinned import
+```
+
+- No initializer. `ext val x: T = ...;` is an error — the definition, and its
+  value, live in the providing object (mirrors `ext fun`'s absent body).
+- The `symbol` and `library` decorators and the static/dynamic linking inputs
+  work exactly as for [`ext fun`](ext-fun.md).
+- On a dynamic target the reference is emitted GOT-indirect so the loader binds
+  it to the runtime definition (ELF: an `R_*_GLOB_DAT` GOT slot); an ordinary
+  cross-module reference to a `val`/`var` defined elsewhere in the same artifact
+  stays directly addressed. Executed dynamic-import resolution is proven on the
+  native ELF legs.
+
 ## No inference
 
 Every binding declares its type. An untyped numeric literal is checked

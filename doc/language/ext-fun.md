@@ -144,5 +144,6 @@ is currently implemented for the ELF (Linux) target; the PE (Windows) and Mach-O
 ## See also
 
 - [fun.md](fun.md) — regular function declarations
+- [val-var.md](val-var.md) — `ext val` / `ext var`, the data analogue (foreign data imports)
 - [visibility.md](visibility.md) — `pub` and `ext` modifiers
 - [decorators.md](decorators.md) — `symbol`, `library`, and other codegen decorators
