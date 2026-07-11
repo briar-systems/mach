@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.3] - 2026-07-11
+
+The inliner correctness patch, fixing a long-lived silent miscompile the repo
+owner hit in the field (mach-mqtt's `brokerd`). Built with mach 3.4.2.
+
+### Fixed
+- codegen: **the inliner preserves an operand's use-site type when substituting
+  a callee parameter with the caller's actual argument.** A by-value aggregate
+  argument is an address the frontend retypes to the aggregate; clobbering that
+  stamp made the surviving call classify its ABI from a bare pointer, so an
+  inlined call site passed the aggregate as a pointer while the callee read a
+  by-value stack parameter — a wrong-address read that could crash or, worse,
+  silently return foreign memory. Affected every release since 1.0.0 at
+  `opt >= 1` for generic calls passing by-value aggregates through an inlined
+  clone (#2035). A `--verify-ir` structural check and an opt-independent
+  inliner unit test now guard the invariant. Follow-ups: #2063 (instance
+  callees carry real signatures), #2064, #2065.
+
 ## [3.4.2] - 2026-07-11
 
 The win64 vector patch: closes the known limitation documented in 3.4.1. Built
