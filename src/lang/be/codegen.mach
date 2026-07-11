@@ -12,13 +12,16 @@
 # here is shared across architectures. This module is the compute body of
 # `Q_CODEGEN`: one `ir.Module` produces exactly one `of.ObjectImage`.
 
+use std.allocator.page;
 use std.io.writer;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_contains;
 use std.types.string.str_equals;
+use std.types.string.str_len;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -34,12 +37,17 @@ use mach.lang.be.codegen.regalloc;
 use mach.lang.be.obj;
 use mach.lang.float;
 use mach.lang.intern;
+use mach.lang.manifest;
 use mach.lang.me.ir;
+use builder: mach.lang.me.ir.builder;
+use mach.lang.me.ir.id;
+use instruction: mach.lang.me.ir.instruction;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.session;
 use source: mach.lang.source;
 use mach.lang.target;
+use resolved: mach.lang.target.resolved;
 use mach.lang.target.of;
 
 # a function moved out of `.text` by a `#[section("...")]` decorator
@@ -65,6 +73,121 @@ rec SectionPlacement {
 rec PlacedSite {
     sec: u32;
     off: u32;
+}
+
+# concatenate two strings into a fresh session-allocated buffer, degrading to `b`
+# on allocation failure (the message is best-effort, never load-bearing storage)
+fun cat(alloc: *A.Allocator, a: str, b: str) str {
+    val la: usize = str_len(a);
+    val lb: usize = str_len(b);
+    val res_buf: R.Result[*u8, str] = A.allocate[u8](alloc, la + lb + 1);
+    if (R.is_err[*u8, str](res_buf)) { ret b; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
+    var w: usize = 0;
+    var i: usize = 0;
+    for (i < la) { buf[w] = a[i]; w = w + 1; i = i + 1; }
+    i = 0;
+    for (i < lb) { buf[w] = b[i]; w = w + 1; i = i + 1; }
+    buf[w] = 0;
+    ret buf::str;
+}
+
+# true when type id `ty` resolves to an IRT_VECTOR in the module's type table
+fun ty_is_vector(m: *ir.Module, ty: type.IrTypeId) bool {
+    val ot: O.Option[*type.IrType] = type.get(?m.types, ty);
+    if (!O.is_some[*type.IrType](ot)) { ret false; }
+    ret O.unwrap[*type.IrType](ot).kind == type.IRT_VECTOR;
+}
+
+# true when a 128-bit vector value flows through the instruction (result or operand),
+# i.e. it would scalarize on a target with no SIMD unit
+fun instr_touches_vector(m: *ir.Module, ins: *instruction.Instruction) bool {
+    if (ty_is_vector(m, ins.ty)) { ret true; }
+    var i: u32 = 0;
+    for (i < ins.operand_count) {
+        if (ty_is_vector(m, ins.operands[i].ty)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a friendly category name for a lane-wise vector operation, for the require error
+fun vector_op_name(k: instruction.InstrKind) str {
+    if (k == instruction.OP_ADD)       { ret "add"; }
+    if (k == instruction.OP_SUB)       { ret "subtract"; }
+    if (k == instruction.OP_NEG)       { ret "negate"; }
+    if (k == instruction.OP_MUL)       { ret "multiply"; }
+    if (k == instruction.OP_DIV_S)     { ret "divide"; }
+    if (k == instruction.OP_DIV_U)     { ret "divide"; }
+    if (k == instruction.OP_AND)       { ret "and"; }
+    if (k == instruction.OP_OR)        { ret "or"; }
+    if (k == instruction.OP_XOR)       { ret "xor"; }
+    if (k == instruction.OP_NOT)       { ret "complement"; }
+    if (k == instruction.OP_CMP_EQ)    { ret "compare"; }
+    if (k == instruction.OP_CMP_NE)    { ret "compare"; }
+    if (k == instruction.OP_CMP_LT_S)  { ret "compare"; }
+    if (k == instruction.OP_CMP_LT_U)  { ret "compare"; }
+    if (k == instruction.OP_CMP_LE_S)  { ret "compare"; }
+    if (k == instruction.OP_CMP_LE_U)  { ret "compare"; }
+    ret "value";
+}
+
+# assemble the precise `require`-mode error naming the offending operation, the
+# containing function, and the incapable target arch, plus the actionable fix
+fun require_error_msg(s: *session.Session, tgt: *target.Target, fn: *ir.Function, ins: *instruction.Instruction) str {
+    val op: str = vector_op_name(ins.kind);
+    var fname: str = "<anonymous>";
+    val on: O.Option[str] = intern.lookup(?s.interner, fn.name);
+    if (O.is_some[str](on)) { fname = O.unwrap[str](on); }
+
+    var msg: str = cat(s.alloc, "codegen: simd = \"require\": vector ", op);
+    msg = cat(s.alloc, msg, " in '");
+    msg = cat(s.alloc, msg, fname);
+    msg = cat(s.alloc, msg, "' would scalarize on ");
+    msg = cat(s.alloc, msg, tgt.arch.name);
+    msg = cat(s.alloc, msg, " (target has no 128-bit SIMD); set simd = \"scalarize\" to build with the scalar expansion");
+    ret msg;
+}
+
+# #2017: enforce the resolved `require` SIMD posture over the target capability fact.
+#
+# On an incapable target (`MachineModel.has_v128 == false`) every lane-wise vector
+# operator scalarizes; `simd = "require"` is the consumer's request to reject that,
+# so any surviving `IRT_VECTOR`-typed instruction is a precise build error naming the
+# operation and its containing function rather than a silent scalarization. Inert on
+# capable targets and under `simd = "scalarize"` (the default posture, where #2016's
+# scalarization pass lowers vector ops before codegen so none reach here). Rides the
+# same vector-op detection the isel guard uses; #2016's cross-module scalarization
+# tally refines the enumeration when it lands. Reports the first offending op, so the
+# build aborts once with an actionable message.
+# ---
+# s:     the session carrying the resolved `simd` posture
+# tgt:   the resolved target carrying the `has_v128` capability fact
+# irmod: the module about to be lowered
+# ret:   ok(true) when the build may proceed, or the require error string
+fun require_simd_check(s: *session.Session, tgt: *target.Target, irmod: *ir.Module) R.Result[bool, str] {
+    if (s.simd != manifest.SIMD_REQUIRE) { ret R.ok[bool, str](true); }
+    if (tgt.model.has_v128)              { ret R.ok[bool, str](true); }
+
+    var fi: u32 = 0;
+    for (fi < irmod.function_len) {
+        val fn: *ir.Function = ?irmod.functions[fi];
+        var bi: u32 = 0;
+        for (bi < fn.block_count) {
+            val blk: *ir.Block = ?fn.blocks[bi];
+            var ix: u32 = 0;
+            for (ix < blk.instr_count) {
+                val ins: *instruction.Instruction = ?fn.instrs[blk.instructions[ix]];
+                if (instr_touches_vector(irmod, ins)) {
+                    ret R.err[bool, str](require_error_msg(s, tgt, fn, ins));
+                }
+                ix = ix + 1;
+            }
+            bi = bi + 1;
+        }
+        fi = fi + 1;
+    }
+    ret R.ok[bool, str](true);
 }
 
 # generate an object image for one optimised IR module
@@ -106,6 +229,11 @@ pub fun codegen_module(s: *session.Session, tgt: *target.Target,
     if (s == nil)     { ret R.err[of.ObjectImage, str]("codegen: nil session"); }
     if (tgt == nil)   { ret R.err[of.ObjectImage, str]("codegen: nil target"); }
     if (irmod == nil) { ret R.err[of.ObjectImage, str]("codegen: nil ir module"); }
+
+    # #2017: enforce the resolved `require` posture before lowering. On an incapable
+    # target a vector op would scalarize; `require` rejects that with a precise error.
+    val res_req: R.Result[bool, str] = require_simd_check(s, tgt, irmod);
+    if (R.is_err[bool, str](res_req)) { ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_req)); }
 
     val res_lower: R.Result[mir.MirModule, str] = lower.lower_ir(tgt, irmod, ?s.interner);
     if (R.is_err[mir.MirModule, str](res_lower)) {
@@ -1078,4 +1206,94 @@ test "mach.lang.be.codegen.pack_rows:rehomes_sectioned_and_text" {
     # blob 20: `.text` after the 8-byte excised range -> section 1 at offset 20 - 8 = 12.
     if (enc.rows[2].sec != 1 || enc.rows[2].text_offset != 12) { ret 1; }
     ret 0;
+}
+
+# #2017: the require posture resolved over the target capability fact. On an
+# incapable target (riscv64, has_v128 false) a vector op is a precise, actionable
+# build error naming the operation, the containing function, and the arch; on a
+# capable target (x86_64) require is inert; under scalarize nothing errors; and a
+# vectorless module is always clean regardless of posture or target.
+test "mach.lang.be.codegen.require_simd_check:posture_over_capability" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val trr: R.Result[resolved.Target, str] = target.select(?reg, "riscv64", "linux", "lp64");
+    if (R.is_err[resolved.Target, str](trr)) { ret 1; }
+    var rv: resolved.Target = R.unwrap_ok[resolved.Target, str](trr);
+    val txr: R.Result[resolved.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[resolved.Target, str](txr)) { ret 1; }
+    var x64: resolved.Target = R.unwrap_ok[resolved.Target, str](txr);
+
+    val res_s: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](res_s)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_s);
+
+    # a module with one function 'kernel' whose body holds a vector add
+    val fname_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, "kernel");
+    if (R.is_err[intern.StrId, str](fname_r)) { session.dnit(?s); ret 1; }
+    val fname: intern.StrId = R.unwrap_ok[intern.StrId, str](fname_r);
+
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { session.dnit(?s); ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+    val ef: R.Result[type.IrTypeId, str] = type.intern_float(?m.types, 32);
+    if (R.is_err[type.IrTypeId, str](ef)) { code = 1; }
+    val vf: R.Result[type.IrTypeId, str] = type.intern_vector(?m.types, R.unwrap_ok[type.IrTypeId, str](ef), 4);
+    if (R.is_err[type.IrTypeId, str](vf)) { code = 1; }
+    val vecty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](vf);
+    val res_fn: R.Result[u32, str] = ir.function_add(?m, fname, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { code = 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](res_fn)];
+    var b: builder.Builder = builder.init(?m);
+    builder.set_function(?b, fn);
+    val rb: R.Result[id.BlockId, str] = builder.new_block(?b);
+    if (R.is_err[id.BlockId, str](rb)) { code = 1; }
+    builder.set_block(?b, R.unwrap_ok[id.BlockId, str](rb));
+    if (R.is_err[value.Value, str](builder.emit_add(?b, value.const_int(0, vecty), value.const_int(0, vecty)))) { code = 1; }
+
+    # require + incapable + vector -> a precise error naming op, function, and arch
+    s.simd = manifest.SIMD_REQUIRE;
+    val e1: R.Result[bool, str] = require_simd_check(?s, ?rv, ?m);
+    if (R.is_ok[bool, str](e1)) { code = 1; }
+    or {
+        val msg: str = R.unwrap_err[bool, str](e1);
+        if (!str_contains(msg, "simd = \"require\"")) { code = 1; }
+        if (!str_contains(msg, "kernel"))            { code = 1; }
+        if (!str_contains(msg, "riscv64"))           { code = 1; }
+        if (!str_contains(msg, "would scalarize"))   { code = 1; }
+    }
+
+    # require + capable -> inert
+    if (R.is_err[bool, str](require_simd_check(?s, ?x64, ?m))) { code = 1; }
+
+    # scalarize + incapable -> the pass will scalarize; no require error here
+    s.simd = manifest.SIMD_SCALARIZE;
+    if (R.is_err[bool, str](require_simd_check(?s, ?rv, ?m))) { code = 1; }
+
+    # require + incapable + no vector -> clean (the walk finds nothing to reject)
+    val res_m2: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m2)) { code = 1; }
+    var m2: ir.Module = R.unwrap_ok[ir.Module, str](res_m2);
+    val i32r: R.Result[type.IrTypeId, str] = type.intern_int(?m2.types, 32);
+    if (R.is_err[type.IrTypeId, str](i32r)) { code = 1; }
+    val i32t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](i32r);
+    val rf2: R.Result[u32, str] = ir.function_add(?m2, fname, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf2)) { code = 1; }
+    val fn2: *ir.Function = ?m2.functions[R.unwrap_ok[u32, str](rf2)];
+    var b2: builder.Builder = builder.init(?m2);
+    builder.set_function(?b2, fn2);
+    val rb2: R.Result[id.BlockId, str] = builder.new_block(?b2);
+    if (R.is_err[id.BlockId, str](rb2)) { code = 1; }
+    builder.set_block(?b2, R.unwrap_ok[id.BlockId, str](rb2));
+    if (R.is_err[value.Value, str](builder.emit_add(?b2, value.const_int(0, i32t), value.const_int(1, i32t)))) { code = 1; }
+    s.simd = manifest.SIMD_REQUIRE;
+    if (R.is_err[bool, str](require_simd_check(?s, ?rv, ?m2))) { code = 1; }
+
+    ir.dnit(?m2);
+    ir.dnit(?m);
+    session.dnit(?s);
+    ret code;
 }
