@@ -2564,6 +2564,18 @@ fun jump_slot_for(arch_id: u32) u32 {
     ret R_X86_64_JUMP_SLOT;
 }
 
+# the ELF machine GLOB_DAT (GOT-slot bind) relocation type for an ISA (#2026)
+#
+# Defaults to the x86-64 type for an unrecognized ISA.
+# ---
+# arch_id: the target ISA id
+# ret:     the ELF R_*_GLOB_DAT relocation type
+fun glob_dat_for(arch_id: u32) u32 {
+    if (arch_id == isa.ARCH_AARCH64) { ret R_AARCH64_GLOB_DAT; }
+    if (arch_id == isa.ARCH_RISCV64) { ret R_RISCV_GLOB_DAT; }
+    ret R_X86_64_GLOB_DAT;
+}
+
 # the ELF machine RELATIVE (load-bias) relocation type for an ISA
 #
 # Defaults to the x86-64 type for an unrecognized ISA.
@@ -2654,9 +2666,11 @@ rec DynLayout {
     dynstr_off: usize;   dynstr_va: u64;    dynstr_size: usize;
     hash_off: usize;     hash_va: u64;      hash_size: usize;
     relaplt_off: usize;  relaplt_va: u64;   relaplt_size: usize;
+    reladyn_off: usize;  reladyn_va: u64;   reladyn_size: usize;
     plt_off: usize;      plt_va: u64;       plt_size: usize;
     rw_off: usize;       rw_va: u64;        rw_size: usize;
     gotplt_off: usize;   gotplt_va: u64;    gotplt_size: usize;
+    datagot_off: usize;  datagot_va: u64;   datagot_size: usize;
     dynamic_off: usize;  dynamic_va: u64;   dynamic_size: usize;
 }
 
@@ -2673,6 +2687,39 @@ fun func_import_count(dyn: *of.DynamicInfo) u32 {
     var i: u32 = 0;
     for (i < dyn.import_count) {
         if (dyn.imports[i].is_func) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# count the data imports in a dynamic plan
+#
+# Each data import (an `ext val`/`ext var`, #2026) gets a GOT slot bound at load
+# by an `R_*_GLOB_DAT` relocation and a `.dynsym`/`.dynstr` entry, but no PLT stub.
+# ---
+# dyn: the dynamic-link plan to scan
+# ret: the number of data imports
+fun data_import_count(dyn: *of.DynamicInfo) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < dyn.import_count) {
+        if (!dyn.imports[i].is_func) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the data-import ordinal (0-based, in plan order) of raw import index `raw`, i.e.
+# the count of data imports preceding it - selects its GOT slot and dynsym entry
+# ---
+# dyn: the dynamic-link plan
+# raw: the raw index into `dyn.imports` (a data import)
+# ret: the data-import ordinal
+fun data_import_ordinal(dyn: *of.DynamicInfo, raw: u32) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < raw && i < dyn.import_count) {
+        if (!dyn.imports[i].is_func) { n = n + 1; }
         i = i + 1;
     }
     ret n;
@@ -2893,10 +2940,14 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, tgt_isa: *isa.IsaV
         lib_str = R.unwrap_ok[*usize, str](rl);
     }
 
-    # write the synthesized structures, then patch the import call sites.
+    # write the synthesized structures, then patch the import call sites and the
+    # GOT-indirect data-import access sites.
     write_dyn_structures(itn, buf, ?lay, dyn, nimp, tgt_isa.id, imp_str, lib_str);
-    val fx_r: R.Result[bool, str] =
+    var fx_r: R.Result[bool, str] =
         patch_plt_fixups(buf, ?lay, dyn, fixups, fixup_count, seg_offsets, segs, seg_count, nimp, tgt_isa.id);
+    if (R.is_ok[bool, str](fx_r)) {
+        fx_r = patch_got_fixups(buf, ?lay, dyn, seg_offsets, segs, seg_count, tgt_isa.id);
+    }
 
     if (imp_str != nil) { A.deallocate[usize](alloc, imp_str, dyn.import_count::usize); }
     if (lib_str != nil) { A.deallocate[usize](alloc, lib_str, dyn.lib_count::usize); }
@@ -2952,6 +3003,11 @@ fun compute_dyn_layout(itn: *intern.Interner, lay: *DynLayout, dyn: *of.DynamicI
                        arch_id: u32, struct_file: usize, struct_va: u64, page_size: u64) {
     val page_sz: usize = page_size::usize;
 
+    # data imports (#2026): each takes a .dynsym/.dynstr entry, a GOT slot, and a
+    # `.rela.dyn` GLOB_DAT relocation. ndata == 0 leaves the layout byte-identical
+    # to the function-only image.
+    val ndata: u32 = data_import_count(dyn);
+
     # read-only metadata segment.
     lay.ro_off = struct_file;
     lay.ro_va  = struct_va;
@@ -2966,16 +3022,19 @@ fun compute_dyn_layout(itn: *intern.Interner, lay: *DynLayout, dyn: *of.DynamicI
     off = off + lay.interp_size;
     va  = va  + lay.interp_size::u64;
 
-    # .dynsym: index 0 reserved-null, then one entry per function import.
+    # .dynsym: index 0 reserved-null, then one entry per function import, then one
+    # per data import (#2026). function imports keep their leading indices so the
+    # JUMP_SLOT relocations are unchanged.
     off = bin.align_up(off, 8);
     va  = bin.align_up_u64(va, 8);
     lay.dynsym_off = off;
     lay.dynsym_va  = va;
-    val dynsym_size: usize = (nimp + 1)::usize * SYM_SIZE;
+    val dynsym_size: usize = (nimp + ndata + 1)::usize * SYM_SIZE;
     off = off + dynsym_size;
     va  = va  + dynsym_size::u64;
 
-    # .dynstr: leading NUL, the interp path, each import name, each soname.
+    # .dynstr: leading NUL, the interp path, each import name (function then data),
+    # each soname.
     lay.dynstr_off = off;
     lay.dynstr_va  = va;
     var dynstr_size: usize = 1;
@@ -2983,6 +3042,11 @@ fun compute_dyn_layout(itn: *intern.Interner, lay: *DynLayout, dyn: *of.DynamicI
     var i: u32 = 0;
     for (i < dyn.import_count) {
         if (dyn.imports[i].is_func) { dynstr_size = dynstr_size + dynstr_name_len(itn, dyn.imports[i].symbol); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < dyn.import_count) {
+        if (!dyn.imports[i].is_func) { dynstr_size = dynstr_size + dynstr_name_len(itn, dyn.imports[i].symbol); }
         i = i + 1;
     }
     i = 0;
@@ -2997,7 +3061,7 @@ fun compute_dyn_layout(itn: *intern.Interner, lay: *DynLayout, dyn: *of.DynamicI
     va  = bin.align_up_u64(va, 8);
     lay.hash_off = off;
     lay.hash_va  = va;
-    val nchain: usize = (nimp + 1)::usize;
+    val nchain: usize = (nimp + ndata + 1)::usize;
     lay.hash_size = 8 + 4 + nchain * 4;
     off = off + lay.hash_size;
     va  = va  + lay.hash_size::u64;
@@ -3010,6 +3074,16 @@ fun compute_dyn_layout(itn: *intern.Interner, lay: *DynLayout, dyn: *of.DynamicI
     lay.relaplt_size = nimp::usize * RELA_SIZE;
     off = off + lay.relaplt_size;
     va  = va  + lay.relaplt_size::u64;
+
+    # .rela.dyn: one GLOB_DAT relocation per data import (#2026), binding its GOT
+    # slot at load. empty (and absent from .dynamic) with no data imports.
+    off = bin.align_up(off, 8);
+    va  = bin.align_up_u64(va, 8);
+    lay.reladyn_off  = off;
+    lay.reladyn_va   = va;
+    lay.reladyn_size = ndata::usize * RELA_SIZE;
+    off = off + lay.reladyn_size;
+    va  = va  + lay.reladyn_size::u64;
 
     lay.ro_size = off - lay.ro_off;
 
@@ -3035,14 +3109,24 @@ fun compute_dyn_layout(itn: *intern.Interner, lay: *DynLayout, dyn: *of.DynamicI
     off = off + lay.gotplt_size;
     va  = va  + lay.gotplt_size::u64;
 
+    # the data-import GOT (#2026): one slot per data import, loader-filled through
+    # its `.rela.dyn` GLOB_DAT. sits in the same read+write segment as .got.plt.
+    lay.datagot_off  = off;
+    lay.datagot_va   = va;
+    lay.datagot_size = ndata::usize * GOT_ENTRY_SIZE;
+    off = off + lay.datagot_size;
+    va  = va  + lay.datagot_size::u64;
+
     off = bin.align_up(off, 8);
     va  = bin.align_up_u64(va, 8);
     lay.dynamic_off = off;
     lay.dynamic_va  = va;
     # DT_NEEDED per lib + HASH,STRTAB,SYMTAB,STRSZ,SYMENT + (PLT tags when imports)
-    # + (FLAGS,BIND_NOW on the eager arches) + DT_NULL.
+    # + (RELA,RELASZ,RELAENT when data imports) + (FLAGS,BIND_NOW on the eager
+    # arches) + DT_NULL.
     var dyn_entries: u32 = dyn.lib_count + 6;
     if (nimp > 0)              { dyn_entries = dyn_entries + 4; }
+    if (ndata > 0)             { dyn_entries = dyn_entries + 3; }
     if (dyn_bind_now(arch_id)) { dyn_entries = dyn_entries + 2; }
     lay.dynamic_size = dyn_entries::usize * DYN_SIZE;
     off = off + lay.dynamic_size;
@@ -3083,8 +3167,15 @@ fun write_dyn_structures(itn: *intern.Interner, buf: *u8, lay: *DynLayout, dyn: 
         if (dyn.imports[i].is_func) {
             imp_str[i] = str_pos;
             str_pos = str_pos + bin.write_str(buf, lay.dynstr_off + str_pos, resolve(itn, dyn.imports[i].symbol));
-        } or {
-            imp_str[i] = 0;
+        }
+        i = i + 1;
+    }
+    # data-import names follow the function names, matching the .dynsym order (#2026).
+    i = 0;
+    for (i < dyn.import_count) {
+        if (!dyn.imports[i].is_func) {
+            imp_str[i] = str_pos;
+            str_pos = str_pos + bin.write_str(buf, lay.dynstr_off + str_pos, resolve(itn, dyn.imports[i].symbol));
         }
         i = i + 1;
     }
@@ -3112,14 +3203,30 @@ fun write_dyn_structures(itn: *intern.Interner, buf: *u8, lay: *DynLayout, dyn: 
         }
         i = i + 1;
     }
+    # data-import entries follow the function entries, marked STT_OBJECT (#2026);
+    # SHN_UNDEF (st_shndx 0) makes each an import the GLOB_DAT reloc binds.
+    i = 0;
+    for (i < dyn.import_count) {
+        if (!dyn.imports[i].is_func) {
+            bin.write_u32_le(buf, sym_off, imp_str[i]::u32);
+            buf[sym_off + 4] = (STB_GLOBAL << 4) | (STT_OBJECT & 0xF);
+            buf[sym_off + 5] = 0;
+            bin.write_u16_le(buf, sym_off + 6, 0);
+            bin.write_u64_le(buf, sym_off + 8, 0);
+            bin.write_u64_le(buf, sym_off + 16, 0);
+            sym_off = sym_off + SYM_SIZE;
+        }
+        i = i + 1;
+    }
 
     # .hash: a single-bucket SysV table - bucket[0] points at dynsym index 1 and
     # the chain links 1->2->...->n->0. with one bucket the loader walks the whole
     # chain, which is correct (if not fast) for the small import sets here.
-    val nchain: u32 = nimp + 1;
+    val ndata_h: u32 = data_import_count(dyn);
+    val nchain: u32 = nimp + ndata_h + 1;
     bin.write_u32_le(buf, lay.hash_off, 1);
     bin.write_u32_le(buf, lay.hash_off + 4, nchain);
-    if (nimp > 0) { bin.write_u32_le(buf, lay.hash_off + 8, 1); } or { bin.write_u32_le(buf, lay.hash_off + 8, 0); }
+    if (nimp + ndata_h > 0) { bin.write_u32_le(buf, lay.hash_off + 8, 1); } or { bin.write_u32_le(buf, lay.hash_off + 8, 0); }
     var c: u32 = 0;
     for (c < nchain) {
         var next: u32 = c + 1;
@@ -3171,8 +3278,34 @@ fun write_dyn_structures(itn: *intern.Interner, buf: *u8, lay: *DynLayout, dyn: 
         }
     }
 
+    # .rela.dyn: one GLOB_DAT per data import (#2026), binding its GOT slot to the
+    # imported datum's runtime address at load. the slot itself stays zero
+    # (loader-filled). a data import's dynsym index follows the function entries:
+    # 1 + nimp + (data ordinal). the GOT.PLT slots are function-only, so the data
+    # GOT is a distinct region and its slots need no PLT stub.
+    if (ndata_h > 0) {
+        var rd_off:  usize = lay.reladyn_off;
+        var d_sym:   u32   = nimp + 1;
+        var d_ord:   u32   = 0;
+        i = 0;
+        for (i < dyn.import_count) {
+            if (!dyn.imports[i].is_func) {
+                val slot_va: u64 = lay.datagot_va + d_ord::u64 * GOT_ENTRY_SIZE::u64;
+                bin.write_u64_le(buf, rd_off, slot_va);
+                val rd_info: u64 = (d_sym::u64 << 32) | glob_dat_for(arch_id)::u64;
+                bin.write_u64_le(buf, rd_off + 8, rd_info);
+                bin.write_u64_le(buf, rd_off + 16, 0);
+                rd_off = rd_off + RELA_SIZE;
+                d_ord = d_ord + 1;
+                d_sym = d_sym + 1;
+            }
+            i = i + 1;
+        }
+    }
+
     # .dynamic: the table the loader walks. DT_NEEDED per dependency, then the
-    # table pointers, then the PLT tags (when there are imports), then DT_NULL.
+    # table pointers, then the PLT tags (when there are imports), then the .rela.dyn
+    # tags (when there are data imports), then DT_NULL.
     var dpos: usize = lay.dynamic_off;
     i = 0;
     for (i < dyn.lib_count) {
@@ -3189,6 +3322,13 @@ fun write_dyn_structures(itn: *intern.Interner, buf: *u8, lay: *DynLayout, dyn: 
         dpos = write_dyn_entry(buf, dpos, DT_PLTRELSZ, lay.relaplt_size::u64);
         dpos = write_dyn_entry(buf, dpos, DT_PLTREL,   DT_RELA_TAG);
         dpos = write_dyn_entry(buf, dpos, DT_JMPREL,   lay.relaplt_va);
+    }
+    # the .rela.dyn GLOB_DAT table for data imports (#2026); processed eagerly at
+    # load (data relocations are never lazy).
+    if (ndata_h > 0) {
+        dpos = write_dyn_entry(buf, dpos, DT_RELA,    lay.reladyn_va);
+        dpos = write_dyn_entry(buf, dpos, DT_RELASZ,  lay.reladyn_size::u64);
+        dpos = write_dyn_entry(buf, dpos, DT_RELAENT, RELA_SIZE::u64);
     }
     # the eager arches have no lazy-resolution trampoline, so the loader must bind
     # every JUMP_SLOT at load: DT_FLAGS(DF_BIND_NOW) for modern loaders, plus the
@@ -3448,6 +3588,58 @@ fun patch_plt_fixups(buf: *u8, lay: *DynLayout, dyn: *of.DynamicInfo,
         val file_off: usize = seg_offsets[fx.seg_index] + fx.seg_offset::usize;
         val pr: R.Result[bool, str] = patch_call_site(buf, file_off, arch_id, stub_va, fx.addend, fx.patch_vaddr);
         if (R.is_err[bool, str](pr)) { ret R.err[bool, str](R.unwrap_err[bool, str](pr)); }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# resolve each GOT-indirect data-import access site to its GOT slot (#2026)
+#
+# An `ext val`/`ext var` read lowered to `adrp :got:` + `ldr :got_lo12:` with a
+# distinct relocation per instruction, deferred by the linker as a `GotFixup`
+# because the slot's address is part of this writer's layout. Each fixup's
+# instruction word is patched to reach the data GOT slot the loader binds through
+# GLOB_DAT: the page-high half on the `adrp`, the scaled-lo12 half on the `ldr`.
+# Only aarch64 emits these paired kinds today; an unexpected kind fails loudly
+# rather than mispatch. Mirrors `patch_plt_fixups`.
+# ---
+# buf:         the output buffer
+# lay:         the resolved dynamic-structure layout (.got data-slot base)
+# dyn:         the dynamic-link plan carrying the GOT fixups
+# seg_offsets: per-segment file offset of the copied segment bytes
+# segs:        the linker's loadable segments (for the bounds check)
+# seg_count:   number of segments
+# arch_id:     the target ISA id
+# ret:         ok(true) once patched, or an error string
+fun patch_got_fixups(buf: *u8, lay: *DynLayout, dyn: *of.DynamicInfo,
+                     seg_offsets: *usize, segs: *of.LoadSegment, seg_count: u32,
+                     arch_id: u32) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < dyn.got_fixup_count) {
+        val fx: *of.GotFixup = ?dyn.got_fixups[i];
+        if (fx.seg_index >= seg_count) {
+            ret R.err[bool, str]("elf: data-import GOT fixup references an out-of-range segment");
+        }
+        # the data-import ordinal selects the GOT slot the loader binds via GLOB_DAT.
+        val ord: u32 = data_import_ordinal(dyn, fx.import_index);
+        val slot_va: u64 = lay.datagot_va + ord::u64 * GOT_ENTRY_SIZE::u64;
+
+        # each fixup patches a single 4-byte instruction word within the segment.
+        val seg_filesz: usize = segs[fx.seg_index].filesz;
+        if (fx.seg_offset::usize + 4 > seg_filesz) {
+            ret R.err[bool, str]("elf: data-import GOT fixup offset out of range");
+        }
+        val file_off: usize = seg_offsets[fx.seg_index] + fx.seg_offset::usize;
+        # the emitted instruction carries the opcode + registers with a zero
+        # immediate (the reloc addend is 0); packing OR-s the slot displacement in.
+        val cur: u32 = bin.read_u32_le(buf, file_off);
+        if (fx.kind == of.RK_GOT_PAGE21) {
+            bin.write_u32_le(buf, file_off, arm64_adrp_word(cur, fx.patch_vaddr, slot_va));
+        } or (fx.kind == of.RK_GOT_LO12) {
+            bin.write_u32_le(buf, file_off, arm64_ldr64_lo12_word(cur, slot_va));
+        } or {
+            ret R.err[bool, str]("elf: unsupported data-import GOT relocation kind");
+        }
         i = i + 1;
     }
     ret R.ok[bool, str](true);
