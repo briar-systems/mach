@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.2] - 2026-07-11
+
+The win64 vector patch: closes the known limitation documented in 3.4.1. Built
+with mach 3.4.1.
+
+### Fixed
+- codegen: **win64 classifies 128-bit vectors** — arguments ride XMM registers
+  (stack by value on exhaustion) and returns ride XMM0, instead of being
+  mis-passed in a single 8-byte GP register. This is mach's internal convention,
+  consistent across all four ABIs; it deliberately deviates from the Microsoft
+  x64 `__m128` by-reference argument convention, so C interop with vector-typed
+  `ext` functions on windows awaits the conformance ruling (#2058). The by-value
+  round-trip regression test now runs on every target (#2055).
+
 ## [3.4.1] - 2026-07-11
 
 The vector correctness patch. The `#2038` runtime suite's first run caught a
