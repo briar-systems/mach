@@ -761,7 +761,14 @@ fun remap_clone_operands(cx: *InlineCtx) {
                 if (op.kind == value.VAL_PARAM) {
                     val param_ix: u32 = op.data.param_ix;
                     if (param_ix < cx.arg_count) {
-                        clone.operands[ii] = cx.args[param_ix];
+                        # preserve the use-site type: the callee body's operand ty is its
+                        # ABI contract (a by-value aggregate arg is the actual's address
+                        # retyped to the aggregate). replacing it wholesale with the
+                        # actual's ty (e.g. a bare ptr) mis-classifies the call (#2035);
+                        # the VAL_INSTR arm below already preserves ty for the same reason.
+                        var sub: value.Value = cx.args[param_ix];
+                        sub.ty = op.ty;
+                        clone.operands[ii] = sub;
                     }
                 } or (op.kind == value.VAL_INSTR) {
                     val callee_iid: u32 = op.data.instr::u32;
@@ -1233,4 +1240,101 @@ test "mach.lang.me.pass.inline.callee_instr_count:dbg_value_blind" {
     # counting the debug values would have crossed the threshold and refused to inline
     if (clean + kdbg < INLINE_INSTR_THRESHOLD) { ret 1; }
     ret 0;
+}
+
+# #2035: when the inliner substitutes a callee's VAL_PARAM operand with the
+# caller's actual argument, it must preserve the operand's use-site type. a
+# by-value aggregate argument is the actual's address retyped to the aggregate;
+# a call with no signature classifies its ABI from that per-operand type, so
+# clobbering it with the actual's bare pointer type mis-sizes the argument.
+# builds `caller` calling `f(ptr-actual)`, where `f`'s body passes its parameter
+# (stamped as a 24-byte aggregate) to an extern `sink`; after inlining `f`, the
+# surviving `sink` call's argument operand must still carry the aggregate type,
+# not the actual's pointer type.
+test "mach.lang.me.pass.inline.run:preserves_aggregate_param_operand_type" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val rv: R.Result[type.IrTypeId, str] = type.intern_void(?m.types);
+    if (R.is_err[type.IrTypeId, str](rv)) { ir.dnit(?m); ret 1; }
+    val voidty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](rv);
+    val ri: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ri);
+    val rp: R.Result[type.IrTypeId, str] = type.intern_ptr(?m.types);
+    if (R.is_err[type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](rp);
+    var fields: [3]type.IrTypeId;
+    fields[0] = i64t; fields[1] = i64t; fields[2] = i64t;
+    val ra: R.Result[type.IrTypeId, str] = type.intern_struct(?m.types, ?fields[0], 3, 8);
+    if (R.is_err[type.IrTypeId, str](ra)) { ir.dnit(?m); ret 1; }
+    val aggt: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ra);
+
+    # signatures: sink(agg), f(agg), caller(ptr) -- all returning void.
+    val rsig_a: R.Result[type.IrTypeId, str] = type.intern_fn(?m.types, voidty, ?aggt, 1);
+    if (R.is_err[type.IrTypeId, str](rsig_a)) { ir.dnit(?m); ret 1; }
+    val sig_agg: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](rsig_a);
+    var pptr: type.IrTypeId = ptrt;
+    val rsig_p: R.Result[type.IrTypeId, str] = type.intern_fn(?m.types, voidty, ?pptr, 1);
+    if (R.is_err[type.IrTypeId, str](rsig_p)) { ir.dnit(?m); ret 1; }
+    val sig_ptr: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](rsig_p);
+
+    # function 0: extern sink (no body, never inlined).
+    val r_sink: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, sig_agg, ir.FN_FLAG_EXTERN);
+    if (R.is_err[u32, str](r_sink)) { ir.dnit(?m); ret 1; }
+    val sink_ix: u32 = R.unwrap_ok[u32, str](r_sink);
+
+    var bld: builder.Builder = builder.init(?m);
+
+    # function 1: f(p) { sink(p); ret; } -- p stamped as the aggregate at the use.
+    val r_f: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, sig_agg, 0);
+    if (R.is_err[u32, str](r_f)) { ir.dnit(?m); ret 1; }
+    val f_ix: u32 = R.unwrap_ok[u32, str](r_f);
+    builder.set_function(?bld, ?m.functions[f_ix]);
+    val rfb: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rfb)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](rfb));
+    var f_arg: value.Value = value.param(0, aggt);
+    val rfc: R.Result[value.Value, str] = builder.emit_call(?bld, value.fn(sink_ix, sig_agg), ?f_arg, 1, voidty);
+    if (R.is_err[value.Value, str](rfc)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?bld))) { ir.dnit(?m); ret 1; }
+
+    # function 2: caller(q) { f(q); ret; } -- q is a bare pointer, the mis-typed actual.
+    val r_c: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, sig_ptr, 0);
+    if (R.is_err[u32, str](r_c)) { ir.dnit(?m); ret 1; }
+    val caller_ix: u32 = R.unwrap_ok[u32, str](r_c);
+    builder.set_function(?bld, ?m.functions[caller_ix]);
+    val rcb: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rcb)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](rcb));
+    var c_arg: value.Value = value.param(0, ptrt);
+    val rcc: R.Result[value.Value, str] = builder.emit_call(?bld, value.fn(f_ix, sig_agg), ?c_arg, 1, voidty);
+    if (R.is_err[value.Value, str](rcc)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?bld))) { ir.dnit(?m); ret 1; }
+
+    val r_run: R.Result[bool, str] = run(?m, nil);
+    if (R.is_err[bool, str](r_run)) { ir.dnit(?m); ret 1; }
+
+    # after inlining f into caller, the surviving sink call's argument operand must
+    # still be the aggregate type. a clobbered stamp would leave it the pointer type.
+    val caller_fn: *ir.Function = ?m.functions[caller_ix];
+    var bad: i32 = 1;
+    var i: u32 = 0;
+    for (i < caller_fn.instr_len) {
+        val oi: O.Option[*instruction.Instruction] = ir.instruction_get(caller_fn, i::id.InstructionId);
+        if (O.is_some[*instruction.Instruction](oi)) {
+            val ins: *instruction.Instruction = O.unwrap[*instruction.Instruction](oi);
+            if (ins.kind == instruction.OP_CALL && ins.operand_count >= 2 &&
+                ins.operands[1].kind == value.VAL_PARAM) {
+                if (ins.operands[1].ty == aggt) { bad = 0; }
+                or { bad = 2; }
+            }
+        }
+        i = i + 1;
+    }
+    ir.dnit(?m);
+    ret bad;
 }
