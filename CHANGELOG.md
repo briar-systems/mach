@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.4] - 2026-07-11
+
+The vector compare/merge patch — two more shipped miscompiles caught by the
+new runtime suite's first CI runs, plus the suite itself landing as permanent
+coverage. Built with mach 3.4.3.
+
+### Added
+- test: the colocated runtime vector per-op suite — 36 self-checking blocks
+  (every table operator on every shape with discriminating lane values, ABI
+  round-trips, spill pressure) executing natively on the x86_64 and aarch64
+  legs (#2038).
+
+### Fixed
+- codegen: **aarch64 float vector ordering compares** (`< <= > >=`) selected
+  the unsigned integer byte compare instead of the float ordered compare —
+  silent wrong masks on every float ordering since v3.4.0 (#2069).
+- codegen: **a by-value vector returned through a control-flow merge carries
+  all 16 bytes** — the phi-elimination copy was hard-coded to GP register
+  width, truncating vector merges to the low 64 bits (#2070).
+
 ## [3.4.3] - 2026-07-11
 
 The inliner correctness patch, fixing a long-lived silent miscompile the repo
