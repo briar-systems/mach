@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.5.1] - 2026-07-11
+
+The emergency inliner-correctness patch: one silent miscompile, one fix,
+nothing else. Built with mach 3.5.0.
+
+### Fixed
+- codegen: **the value-substitution primitive preserves the use-site operand
+  type stamp.** When the inliner wired a call result to its return value,
+  `replace_uses` substituted the value wholesale, clobbering the use-site
+  stamp — so a deref-copy of an inlined callee's returned pointer
+  (`var x: Rec = @small_same_module_fn();`) degraded from a record copy to an
+  8-byte pointer-bits store: silent wrong values at `opt >= 1`, present in
+  every release of the #2035 vintage through 3.5.0. The primitive now retypes
+  per use slot, matching the batched-rewrite invariant, with every other
+  wholesale substitution site audited clean; in-vitro tests pin both inliner
+  return arms and a release-profile end-to-end regression case pins the
+  observable defect (#2092, #2093).
+
 ## [3.5.0] - 2026-07-11
 
 The data-imports and correctness release. `ext val` / `ext var` land as the
