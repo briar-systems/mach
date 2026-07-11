@@ -1496,6 +1496,110 @@ fun encode_fp_arith(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIn
     ret R.ok[bool, str](true);
 }
 
+# the NEON arrangement size field [23:22] for a lane descriptor (#2015): float
+# lanes 0=.4s / 1=.2d, integer lanes 0=.16b / 1=.8h / 2=.4s / 3=.2d
+fun neon_size(vl: u8) u32 {
+    val eb: u8 = mir.vec_lane_elem_bytes(vl);
+    if (mir.vec_lane_kind(vl) == mir.VEC_LANE_FLOAT) {
+        if (eb == 8) { ret 1; }
+        ret 0;
+    }
+    if (eb == 2) { ret 1; }
+    if (eb == 4) { ret 2; }
+    if (eb == 8) { ret 3; }
+    ret 0;
+}
+
+# the NEON three-register-same base word for a selected vector opcode, picking the
+# float vs integer form from the lane kind (#2015). the ops that have no float form
+# (the unsigned integer orderings CMHI/CMHS) are integer-only by construction, and
+# VEC_DIV is float-only (sema rejects integer vector division)
+fun neon_base(opcode: u32, is_float: bool) u32 {
+    if (opcode == arm64.VEC_ADD::u32)  { if (is_float) { ret VFADD; } ret VADD; }
+    if (opcode == arm64.VEC_SUB::u32)  { if (is_float) { ret VFSUB; } ret VSUB; }
+    if (opcode == arm64.VEC_MUL::u32)  { if (is_float) { ret VFMUL; } ret VMUL; }
+    if (opcode == arm64.VEC_DIV::u32)  { ret VFDIV; }
+    if (opcode == arm64.VEC_AND::u32)  { ret VAND; }
+    if (opcode == arm64.VEC_ORR::u32)  { ret VORR; }
+    if (opcode == arm64.VEC_EOR::u32)  { ret VEOR; }
+    if (opcode == arm64.VEC_CMEQ::u32) { if (is_float) { ret VFCMEQ; } ret VCMEQ; }
+    if (opcode == arm64.VEC_CMGT::u32) { if (is_float) { ret VFCMGT; } ret VCMGT_S; }
+    if (opcode == arm64.VEC_CMGE::u32) { if (is_float) { ret VFCMGE; } ret VCMGE_S; }
+    if (opcode == arm64.VEC_CMHI::u32) { ret VCMHI_U; }
+    if (opcode == arm64.VEC_CMHS::u32) { ret VCMHS_U; }
+    ret 0;
+}
+
+# materialize a selected NEON vector data op `[dst, lhs(, rhs)]` (#2015)
+#
+# The arrangement (size) and the float-vs-integer form come from `mi.vec_lane`. A
+# spilled operand loads into an FP scratch; a spilled destination computes into the
+# FP scratch and stores back through the 128-bit Q form. NOT is a two-register form;
+# `!=` (VEC_CMNE) emits its equality word followed by a NOT complement of the mask,
+# since NEON has no not-equal compare.
+fun encode_neon(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
+    val vl: u8 = mi.vec_lane;
+    val is_float: bool = mir.vec_lane_kind(vl) == mir.VEC_LANE_FLOAT;
+    val size: u32 = neon_size(vl);
+    val op: u32 = mi.opcode;
+
+    # NOT: `NOT Vd.16b, Vn.16b`, a single two-register-misc word.
+    if (op == arm64.VEC_NOT::u32) {
+        if (mi.operand_count < 2) { ret R.err[bool, str]("encode: vector NOT missing operands"); }
+        val rnr: R.Result[i32, str] = resolve_fp_source(st, f, ?mi.operands[1], FP_SCRATCH0, 16);
+        if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
+        val rn: u32 = R.unwrap_ok[i32, str](rnr)::u32;
+        val ndst: *mir.MirOperand = ?mi.operands[0];
+        if (ndst.kind == mir.MIR_OP_MEM) {
+            emit_word(st, pack_neon_2misc(VNOT, FP_SCRATCH0, rn));
+            ret emit_fp_slot_store(st, f, ndst, FP_SCRATCH0, 16);
+        }
+        val rdr: R.Result[i32, str] = req_vec(ndst);
+        if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
+        emit_word(st, pack_neon_2misc(VNOT, R.unwrap_ok[i32, str](rdr)::u32, rn));
+        ret R.ok[bool, str](true);
+    }
+
+    # every other vector op is three-register-same `[dst, lhs, rhs]`.
+    if (mi.operand_count < 3) { ret R.err[bool, str]("encode: vector op missing operands"); }
+    val rnr: R.Result[i32, str] = resolve_fp_source(st, f, ?mi.operands[1], FP_SCRATCH0, 16);
+    if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
+    val rn: u32 = R.unwrap_ok[i32, str](rnr)::u32;
+    val rmr: R.Result[i32, str] = resolve_fp_source(st, f, ?mi.operands[2], FP_SCRATCH1, 16);
+    if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
+    val rm: u32 = R.unwrap_ok[i32, str](rmr)::u32;
+
+    val dst: *mir.MirOperand = ?mi.operands[0];
+    var rd: u32 = FP_SCRATCH0;
+    var to_slot: bool = false;
+    if (dst.kind == mir.MIR_OP_MEM) {
+        to_slot = true;
+    }
+    or {
+        val rdr: R.Result[i32, str] = req_vec(dst);
+        if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
+        rd = R.unwrap_ok[i32, str](rdr)::u32;
+    }
+
+    if (op == arm64.VEC_CMNE::u32) {
+        var eqbase: u32 = VCMEQ;
+        if (is_float) { eqbase = VFCMEQ; }
+        emit_word(st, pack_neon_3same(eqbase, size, rd, rn, rm));
+        emit_word(st, pack_neon_2misc(VNOT, rd, rd));
+    }
+    or {
+        # the logical ops (AND/ORR/EOR) are byte-agnostic - the size field is part of
+        # their opcode, not an arrangement - so they always encode at size 0 (.16b),
+        # regardless of the lane width the descriptor carries.
+        var eff_size: u32 = size;
+        if (op == arm64.VEC_AND::u32 || op == arm64.VEC_ORR::u32 || op == arm64.VEC_EOR::u32) { eff_size = 0; }
+        emit_word(st, pack_neon_3same(neon_base(op, is_float), eff_size, rd, rn, rm));
+    }
+
+    if (to_slot) { ret emit_fp_slot_store(st, f, dst, rd, 16); }
+    ret R.ok[bool, str](true);
+}
+
 # materialize a surviving float negation `[dst, src]` into `fneg
 # Sd|Dd, Sn|Dn` (an IEEE-754 sign-bit flip). the source resolves to a vector
 # register (a spilled source loaded into V31); a spilled destination computes into
@@ -2208,6 +2312,8 @@ fun encode_mir_instr(st: *encode.EncodeState, f: *mir.MirFunction, fn_base: u32,
     }
 
     # concrete A64 opcodes.
+    # NEON vector data ops (arithmetic / logical / compare) selected off vec_lane.
+    if (op >= arm64.VEC_ADD::u16 && op <= arm64.VEC_CMHS::u16) { ret encode_neon(st, f, mi); }
     if (op == arm64.ADD::u16)  { ret encode_addsub(st, mi, false); }
     if (op == arm64.SUB::u16)  { ret encode_addsub(st, mi, true); }
     if (op == arm64.MUL::u16)  { ret encode_alu3(st, mi, MUL_X, MUL_W); }
@@ -5741,5 +5847,73 @@ test "mach.lang.target.isa.arm64.encode:neon_vector_base_words" {
     if (pack_ldur(LDUR_Q_FP, 0, 0, 0x1F8::u32) != 0x3CDF8000) { bad = 1; }  # ldur q0,[x0,#-8]
     if (pack_ldst_reg(LDR_Q_REG, 0, 0, 1) != 0x3CE16800) { bad = 1; }        # ldr q0,[x0,x1]
 
+    ret bad;
+}
+
+# the NEON vector op selection (isel -> encode_neon) drives byte-exact words off
+# mi.vec_lane: the float-vs-integer form from the lane kind, the arrangement from
+# the element width, logical ops byte-agnostic (size 0), and the `!=` compare as an
+# equality word plus a NOT complement. dst v0, lhs v1, rhs v2. asserted vs llvm-mc.
+test "mach.lang.target.isa.arm64.encode:neon_vector_op_selection" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+    var f: mir.MirFunction;
+    var ops: [3]mir.MirOperand;
+    var mi: mir.MirInstr;
+    mi.operands = ?ops[0]; mi.operand_count = 3;
+    ops[0] = tvec(0); ops[1] = tvec(1); ops[2] = tvec(2);
+
+    # VEC_ADD: f32x4 -> FADD.4s ; i8x16 -> ADD.16b ; i32x4 -> ADD.4s.
+    mi.opcode = arm64.VEC_ADD::u32; mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_FLOAT, 4); st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x4E22D420) { bad = 1; }
+    mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 1); st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x4E228420) { bad = 1; }
+    mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 4); st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x4EA28420) { bad = 1; }
+
+    # VEC_SUB f64x2 -> FSUB.2d ; VEC_MUL i16x8 -> MUL.8h ; VEC_DIV f32x4 -> FDIV.4s.
+    mi.opcode = arm64.VEC_SUB::u32; mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_FLOAT, 8); st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x4EE2D420) { bad = 1; }
+    mi.opcode = arm64.VEC_MUL::u32; mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 2); st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x4E629C20) { bad = 1; }
+    mi.opcode = arm64.VEC_DIV::u32; mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_FLOAT, 4); st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x6E22FC20) { bad = 1; }
+
+    # logical: byte-agnostic (size 0 even at a wider lane). VEC_AND/ORR/EOR at i32x4.
+    mi.opcode = arm64.VEC_AND::u32; mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 4); st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x4E221C20) { bad = 1; }
+    mi.opcode = arm64.VEC_ORR::u32; st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x4EA21C20) { bad = 1; }
+    mi.opcode = arm64.VEC_EOR::u32; st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x6E221C20) { bad = 1; }
+
+    # compares: CMEQ (float/int), signed CMGT, unsigned CMHI/CMHS, float FCMGT.
+    mi.opcode = arm64.VEC_CMEQ::u32; mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 4); st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x6EA28C20) { bad = 1; }
+    mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_FLOAT, 4); st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x4E22E420) { bad = 1; }
+    mi.opcode = arm64.VEC_CMGT::u32; mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 4); st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x4EA23420) { bad = 1; }
+    mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_FLOAT, 4); st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x6EA2E420) { bad = 1; }
+    mi.opcode = arm64.VEC_CMHI::u32; mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 4); st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x6EA23420) { bad = 1; }
+    mi.opcode = arm64.VEC_CMHS::u32; mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 1); st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x6E223C20) { bad = 1; }
+
+    # VEC_CMNE i8x16 -> CMEQ.16b then NOT.16b (two words).
+    mi.opcode = arm64.VEC_CMNE::u32; mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 1); st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi);
+    if (read_word(?st.buf, 0) != 0x6E228C20) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x6E205800) { bad = 1; }
+
+    # VEC_NOT: two-operand `NOT v0.16b, v1.16b`.
+    ops[0] = tvec(0); ops[1] = tvec(1);
+    mi.opcode = arm64.VEC_NOT::u32; mi.operand_count = 2; mi.vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 1); st.buf.len = 0;
+    encode_neon(?st, ?f, ?mi); if (read_word(?st.buf, 0) != 0x6E205820) { bad = 1; }
+
+    encode.buf_dnit(?st.buf);
     ret bad;
 }
