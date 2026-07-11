@@ -36,6 +36,7 @@ use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.me.ir;
 use mach.lang.me.ir.builder;
+use mach.lang.me.ir.instruction;
 use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.me.lower.context;
@@ -83,6 +84,7 @@ pub fun lower_rvalue(ctx: *context.LowerContext, eid: id.ExprId) R.Result[value.
     if (k == expr.EXPR_KIND_COMPTIME_IDENT) { ret lower_comptime_path(ctx, eid); }
     if (k == expr.EXPR_KIND_ARRAY_LIT)      { ret lower_array_lit(ctx, eid, e); }
     if (k == expr.EXPR_KIND_STRUCT_LIT)     { ret lower_struct_lit(ctx, eid, e); }
+    if (k == expr.EXPR_KIND_VECTOR_LIT)     { ret lower_vector_lit(ctx, eid, e); }
 
     ret R.err[value.Value, str]("lower: unsupported expression kind in rvalue position");
 }
@@ -974,9 +976,28 @@ fun lower_index_lvalue(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr
     }
 
     # `[N]T[ix]` addresses element ix through the aggregate walk on the array type.
-    val res_arr_ir: R.Result[ir_type.IrTypeId, str] = context.lower_type(ctx, obj_ty);
-    if (R.is_err[ir_type.IrTypeId, str](res_arr_ir)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](res_arr_ir)); }
-    val arr_ir: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_arr_ir);
+    val res_obj_ir: R.Result[ir_type.IrTypeId, str] = context.lower_type(ctx, obj_ty);
+    if (R.is_err[ir_type.IrTypeId, str](res_obj_ir)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](res_obj_ir)); }
+    var arr_ir: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_obj_ir);
+
+    # a vector lane `v[i]` addresses the vector's 16-byte storage through an
+    # array-of-lanes shape (`[lanes]elem`, the same layout): a vector is
+    # register-class, not an aggregate, so a gep INTO the IRT_VECTOR type hits the
+    # MIR lowering's non-aggregate guard and hard-errors on both capable backends
+    # (x86_64 and aarch64). the array shape composes identically everywhere (#1965).
+    if (type.is_vector(?ctx.s.types, obj_ty)) {
+        val opt_v: O.Option[*ir_type.IrType] = ir_type.get(?ctx.m.types, arr_ir);
+        if (O.is_some[*ir_type.IrType](opt_v)) {
+            val vt: *ir_type.IrType = O.unwrap[*ir_type.IrType](opt_v);
+            if (vt.kind == ir_type.IRT_VECTOR) {
+                val elem:  ir_type.IrTypeId = vt.data.vector_.element;
+                val lanes: u32              = vt.data.vector_.lanes;
+                val res_arr: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?ctx.m.types, elem, lanes);
+                if (R.is_err[ir_type.IrTypeId, str](res_arr)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](res_arr)); }
+                arr_ir = R.unwrap_ok[ir_type.IrTypeId, str](res_arr);
+            }
+        }
+    }
 
     val res_xty: R.Result[ir_type.IrTypeId, str] = index_type(ctx);
     if (R.is_err[ir_type.IrTypeId, str](res_xty)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](res_xty)); }
@@ -1831,6 +1852,12 @@ fun lower_binary(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R.Re
     val rty:    type.TypeId = context.expr_type_of(ctx, e.data.binary.rhs);
     val signed: bool        = is_signed_type(ctx, lty);
 
+    # a lane-wise vector op rides the shared opcodes carrying a vector type; a
+    # vector comparison diverges to the same-shape unsigned mask result (#1965).
+    if (type.is_vector(?ctx.s.types, lty)) {
+        ret lower_vector_binary(ctx, op, lhs, rhs, lty);
+    }
+
     # comparisons compare mathematical values across any integer signedness /
     # width mix and across float widths. lower_cmp owns the value-correct
     # widening and the irreducible i64/u64 sign-test sequence; the back end's
@@ -1866,6 +1893,104 @@ fun lower_binary(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R.Re
     }
 
     ret R.err[value.Value, str]("lower: unsupported binary operator");
+}
+
+# lower a lane-wise vector binary op (#1965)
+#
+# Arithmetic and bitwise ops ride the shared opcodes, carrying the operand vector
+# type through as their result (sema restricts the legal lane/op combinations).
+# Comparisons yield the same-shape unsigned mask. The resulting vector-typed IR is
+# caught by the target-generic MIR guard until a backend wires real selection.
+# ---
+# ctx: per-module lowering context
+# op:  the binary operator
+# lhs: the lowered left operand (vector-typed)
+# rhs: the lowered right operand (vector-typed)
+# lty: the left operand's semantic (vector) type
+# ret: the lowered result Value, or an error
+fun lower_vector_binary(ctx: *context.LowerContext, op: expr.BinOp, lhs: value.Value, rhs: value.Value, lty: type.TypeId) R.Result[value.Value, str] {
+    if (is_compare_binop(op)) { ret lower_vector_compare(ctx, op, lhs, rhs, vector_lane_signed(ctx, lty)); }
+
+    if (op == expr.BIN_ADD)     { ret builder.emit_add(?ctx.builder, lhs, rhs); }
+    if (op == expr.BIN_SUB)     { ret builder.emit_sub(?ctx.builder, lhs, rhs); }
+    if (op == expr.BIN_MUL)     { ret builder.emit_mul(?ctx.builder, lhs, rhs); }
+    # sema admits only float-lane vector `/`; float `/` emits as OP_DIV_U.
+    if (op == expr.BIN_DIV)     { ret builder.emit_div_u(?ctx.builder, lhs, rhs); }
+    if (op == expr.BIN_BIT_AND) { ret builder.emit_and(?ctx.builder, lhs, rhs); }
+    if (op == expr.BIN_BIT_OR)  { ret builder.emit_or(?ctx.builder, lhs, rhs); }
+    if (op == expr.BIN_BIT_XOR) { ret builder.emit_xor(?ctx.builder, lhs, rhs); }
+
+    # vector `<<` / `>>` are rejected in sema (#2030), so no shift reaches lowering.
+    ret R.err[value.Value, str]("lower: unsupported vector binary operator");
+}
+
+# lower a lane-wise vector comparison to the same-shape unsigned mask (#1965)
+#
+# `>` / `>=` reuse `<` / `<=` with the operands swapped, matching emit_cmp_int.
+# The exact opcode is a placeholder the backend re-selects; the load-bearing part
+# is the mask result type, which flows to the MIR guard.
+# ---
+# ctx:    per-module lowering context
+# op:     the comparison operator
+# lhs:    the lowered left operand
+# rhs:    the lowered right operand
+# signed: whether the lanes are signed integers
+# ret:    the mask-typed result Value, or an error
+fun lower_vector_compare(ctx: *context.LowerContext, op: expr.BinOp, lhs: value.Value, rhs: value.Value, signed: bool) R.Result[value.Value, str] {
+    val res_mask: R.Result[ir_type.IrTypeId, str] = vector_mask_ir(ctx, lhs.ty);
+    if (R.is_err[ir_type.IrTypeId, str](res_mask)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](res_mask)); }
+    val mask: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_mask);
+
+    if (op == expr.BIN_EQ)  { ret builder.emit_vcompare(?ctx.builder, instruction.OP_CMP_EQ, lhs, rhs, mask); }
+    if (op == expr.BIN_NEQ) { ret builder.emit_vcompare(?ctx.builder, instruction.OP_CMP_NE, lhs, rhs, mask); }
+    if (op == expr.BIN_LT)  { ret builder.emit_vcompare(?ctx.builder, vec_cmp_lt(signed), lhs, rhs, mask); }
+    if (op == expr.BIN_LEQ) { ret builder.emit_vcompare(?ctx.builder, vec_cmp_le(signed), lhs, rhs, mask); }
+    if (op == expr.BIN_GT)  { ret builder.emit_vcompare(?ctx.builder, vec_cmp_lt(signed), rhs, lhs, mask); }
+    if (op == expr.BIN_GEQ) { ret builder.emit_vcompare(?ctx.builder, vec_cmp_le(signed), rhs, lhs, mask); }
+    ret R.err[value.Value, str]("lower: unsupported vector comparison operator");
+}
+
+# the OP_CMP_LT opcode for the given lane signedness
+fun vec_cmp_lt(signed: bool) instruction.InstrKind {
+    if (signed) { ret instruction.OP_CMP_LT_S; }
+    ret instruction.OP_CMP_LT_U;
+}
+
+# the OP_CMP_LE opcode for the given lane signedness
+fun vec_cmp_le(signed: bool) instruction.InstrKind {
+    if (signed) { ret instruction.OP_CMP_LE_S; }
+    ret instruction.OP_CMP_LE_U;
+}
+
+# whether a vector semantic type's lanes are signed integers
+fun vector_lane_signed(ctx: *context.LowerContext, lty: type.TypeId) bool {
+    val base: type.TypeId = type.strip_secret(?ctx.s.types, lty);
+    ret type.prim_desc(type.vector_element(?ctx.s.types, base)).signed;
+}
+
+# the same-lane-count unsigned mask IR type for a vector compare result
+#
+# The mask element is a signedness-free IRT_INT of the operand's lane width, so a
+# float-lane operand's mask (e.g. f32x4 -> the u32x4-shaped vector) is a distinct
+# IR type from the operand while an integer-lane operand's mask matches it.
+# ---
+# ctx:    per-module lowering context
+# vec_ir: the operand's IR vector type
+# ret:    the mask IR vector type, or an error
+fun vector_mask_ir(ctx: *context.LowerContext, vec_ir: ir_type.IrTypeId) R.Result[ir_type.IrTypeId, str] {
+    val opt_v: O.Option[*ir_type.IrType] = ir_type.get(?ctx.m.types, vec_ir);
+    if (O.is_none[*ir_type.IrType](opt_v)) { ret R.err[ir_type.IrTypeId, str]("lower: vector compare operand is not an IR vector"); }
+    val vt: *ir_type.IrType = O.unwrap[*ir_type.IrType](opt_v);
+    if (vt.kind != ir_type.IRT_VECTOR) { ret R.err[ir_type.IrTypeId, str]("lower: vector compare operand is not an IR vector"); }
+
+    val opt_e: O.Option[*ir_type.IrType] = ir_type.get(?ctx.m.types, vt.data.vector_.element);
+    if (O.is_none[*ir_type.IrType](opt_e)) { ret R.err[ir_type.IrTypeId, str]("lower: vector element type not resolvable"); }
+    val lane_bits: u32 = O.unwrap[*ir_type.IrType](opt_e).data.bits;
+    val lanes:     u32 = vt.data.vector_.lanes;
+
+    val res_elem: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?ctx.m.types, lane_bits);
+    if (R.is_err[ir_type.IrTypeId, str](res_elem)) { ret res_elem; }
+    ret ir_type.intern_vector(?ctx.m.types, R.unwrap_ok[ir_type.IrTypeId, str](res_elem), lanes);
 }
 
 # lower a floating-point remainder `lhs % rhs` to the truncated (C `fmod`) form
@@ -2484,6 +2609,69 @@ fun lower_array_lit(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R
     # the literal's value IS its storage; retype the slot to the array type so the
     # back end treats it as an aggregate, not a scalar pointer.
     ret R.ok[value.Value, str](value.retype(slot, arr_ir));
+}
+
+# lower a full-arity vector literal `f32x4{a, b, c, d}` (#1965)
+#
+# A vector is register-class, so it cannot be addressed lane-wise like an
+# aggregate; the lanes are assembled through array-shaped backing storage (same
+# 16-byte layout) and loaded back as the vector value. The resulting IRT_VECTOR
+# value flows to the target-generic isel guard until a backend wires real
+# construction.
+# ---
+# ctx: per-module lowering context
+# eid: the vector-literal expression (supplies the vector type)
+# e:   the resolved vector-literal node
+# ret: the assembled IRT_VECTOR value, or an error
+fun lower_vector_lit(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R.Result[value.Value, str] {
+    val vec_ty: type.TypeId = context.expr_type_of(ctx, eid);
+    val res_vec_ir: R.Result[ir_type.IrTypeId, str] = context.lower_type(ctx, vec_ty);
+    if (R.is_err[ir_type.IrTypeId, str](res_vec_ir)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](res_vec_ir)); }
+    val vec_ir: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_vec_ir);
+
+    # the lane element IR type and lane count, read off the IRT_VECTOR.
+    val opt_vt: O.Option[*ir_type.IrType] = ir_type.get(?ctx.m.types, vec_ir);
+    if (O.is_none[*ir_type.IrType](opt_vt)) { ret R.err[value.Value, str]("lower: vector literal type is not an IR vector"); }
+    val vt: *ir_type.IrType = O.unwrap[*ir_type.IrType](opt_vt);
+    if (vt.kind != ir_type.IRT_VECTOR) { ret R.err[value.Value, str]("lower: vector literal type is not an IR vector"); }
+    val elem_ir: ir_type.IrTypeId = vt.data.vector_.element;
+    val lanes:   u32              = vt.data.vector_.lanes;
+
+    # array-shaped backing storage; a `[lanes]elem` alloca has the vector's layout.
+    val res_arr_ir: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?ctx.m.types, elem_ir, lanes);
+    if (R.is_err[ir_type.IrTypeId, str](res_arr_ir)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](res_arr_ir)); }
+    val arr_ir: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_arr_ir);
+
+    val res_xty: R.Result[ir_type.IrTypeId, str] = index_type(ctx);
+    if (R.is_err[ir_type.IrTypeId, str](res_xty)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](res_xty)); }
+    val xty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_xty);
+
+    val res_slot: R.Result[value.Value, str] = builder.emit_alloca(?ctx.builder, arr_ir, value.const_int(1, xty));
+    if (R.is_err[value.Value, str](res_slot)) { ret res_slot; }
+    val slot: value.Value = R.unwrap_ok[value.Value, str](res_slot);
+
+    var i: u32 = 0;
+    for (i < e.data.vector_lit.elems_len) {
+        val pool_ix: u32 = e.data.vector_lit.elems_start + i;
+        if (pool_ix::usize >= ctx.a.expr_id_len) {
+            ret R.err[value.Value, str]("lower: vector literal element index out of range");
+        }
+        val elem_eid: id.ExprId = ctx.a.expr_ids[pool_ix];
+        val res_elem: R.Result[value.Value, str] = lower_rvalue(ctx, elem_eid);
+        if (R.is_err[value.Value, str](res_elem)) { ret res_elem; }
+
+        var idx: [2]value.Value;
+        idx[0] = value.const_int(0, xty);
+        idx[1] = value.const_int(i::u64, xty);
+        val res_gep: R.Result[value.Value, str] = builder.emit_gep(?ctx.builder, slot, arr_ir, ?idx[0], 2);
+        if (R.is_err[value.Value, str](res_gep)) { ret res_gep; }
+        val res_store: R.Result[bool, str] = builder.emit_store(?ctx.builder, R.unwrap_ok[value.Value, str](res_elem), R.unwrap_ok[value.Value, str](res_gep));
+        if (R.is_err[bool, str](res_store)) { ret R.err[value.Value, str](R.unwrap_err[bool, str](res_store)); }
+        i = i + 1;
+    }
+
+    # load the assembled lanes back as the vector value.
+    ret builder.emit_load(?ctx.builder, slot, vec_ir);
 }
 
 # lower a struct literal into an alloca plus a per-field store through a gep

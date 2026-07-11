@@ -74,6 +74,16 @@ pub val TYPE_PACK: TypeKind = 18;
 # to the same machine shape as `T`; it constrains only sema's flow typing
 pub val TYPE_SECRET: TypeKind = 19;
 
+# a 128-bit SIMD vector type `<u|i|f><width>x<count>` (#1965). the portable
+# vector model: all ten seeded shapes are legal on every target, with a payload
+# carrying the lane scalar kind and lane count. lowers to a 16-byte register-class
+# value; whether a lane-wise op is one instruction or a scalar expansion is a
+# backend concern
+pub val TYPE_VECTOR: TypeKind = 20;
+
+# number of seeded vector types (the ten 128-bit shapes)
+pub val VEC_COUNT: u32 = 10;
+
 # scalar class of a primitive TypeKind, the discriminator of PrimDesc
 pub def PrimClass: u8;
 
@@ -148,6 +158,59 @@ pub rec TypeSecret {
     base: TypeId;
 }
 
+# 128-bit SIMD vector type payload (#1965)
+#
+# Two vectors are identical iff (element, lanes) match. `element` is one of the
+# ten scalar prim kinds; `lanes` is 2, 4, 8, or 16 so that element*lanes is 128.
+# ---
+# element: lane scalar TypeKind (u8..i64, f32, f64)
+# lanes:   lane count
+pub rec TypeVector {
+    element: TypeKind;
+    lanes:   u32;
+}
+
+# the spelling, lane scalar, and lane count of one seeded vector type
+#
+# The single source of truth for the ten shapes, shared by the interner's init
+# seeding and the resolver's name registry, keyed by ordinal.
+# ---
+# name:    source spelling, e.g. "f32x4"
+# element: lane scalar TypeKind
+# lanes:   lane count
+pub rec VecShape {
+    name:    str;
+    element: TypeKind;
+    lanes:   u32;
+}
+
+# the seeded vector shape at ordinal `index`
+#
+# The ten shapes in a fixed order shared between the type interner (which
+# pre-interns them at init) and the resolver (which interns their spellings).
+# ---
+# index: ordinal in [0, VEC_COUNT)
+# ret:   the shape descriptor; a zero-lane VecShape when index is out of range
+pub fun vec_shape(index: u32) VecShape {
+    var s: VecShape;
+    s.name    = nil;
+    s.element = TYPE_U8;
+    s.lanes   = 0;
+
+    if      (index == 0) { s.name = "f32x4"; s.element = TYPE_F32; s.lanes = 4;  }
+    or (index == 1) { s.name = "f64x2"; s.element = TYPE_F64; s.lanes = 2;  }
+    or (index == 2) { s.name = "i8x16"; s.element = TYPE_I8;  s.lanes = 16; }
+    or (index == 3) { s.name = "i16x8"; s.element = TYPE_I16; s.lanes = 8;  }
+    or (index == 4) { s.name = "i32x4"; s.element = TYPE_I32; s.lanes = 4;  }
+    or (index == 5) { s.name = "i64x2"; s.element = TYPE_I64; s.lanes = 2;  }
+    or (index == 6) { s.name = "u8x16"; s.element = TYPE_U8;  s.lanes = 16; }
+    or (index == 7) { s.name = "u16x8"; s.element = TYPE_U16; s.lanes = 8;  }
+    or (index == 8) { s.name = "u32x4"; s.element = TYPE_U32; s.lanes = 4;  }
+    or (index == 9) { s.name = "u64x2"; s.element = TYPE_U64; s.lanes = 2;  }
+
+    ret s;
+}
+
 # fixed-size array type payload
 # ---
 # base:  element TypeId
@@ -218,6 +281,7 @@ pub rec Type {
         pointer:       TypePointer;
         secret:        TypeSecret;
         array:         TypeArray;
+        vector:        TypeVector;
         fn:            TypeFun;
         nominal:       TypeNominal;
         generic_param: TypeGenericParam;
@@ -308,6 +372,10 @@ pub rec TypeInterner {
     instances_cap: u32;
 
     prims: [PRIM_COUNT]TypeId;
+
+    # pre-interned TypeIds for the ten seeded vector shapes, indexed by the
+    # ordinal `vec_shape` uses, so a seeded shape has a stable id from init.
+    vecs: [VEC_COUNT]TypeId;
 
     field_tables:    *FieldTable;
     field_table_len: u32;
@@ -407,6 +475,20 @@ pub fun init(ti: *TypeInterner, a: *A.Allocator) O.Option[str] {
         }
 
         i = i + 1;
+    }
+
+    # seed the ten vector shapes so each has a stable TypeId the resolver reads
+    # back through `vec`. intern_vector dedups, so seeding never doubles a shape.
+    var vi: u32 = 0;
+    for (vi < VEC_COUNT) {
+        val sh: VecShape = vec_shape(vi);
+        val res_vec: R.Result[TypeId, str] = intern_vector(ti, sh.element, sh.lanes);
+        if (R.is_err[TypeId, str](res_vec)) {
+            dnit(ti);
+            ret O.some[str](R.unwrap_err[TypeId, str](res_vec));
+        }
+        ti.vecs[vi] = R.unwrap_ok[TypeId, str](res_vec);
+        vi = vi + 1;
     }
 
     ret O.none[str]();
@@ -565,6 +647,80 @@ pub fun is_secret(ti: *TypeInterner, tid: TypeId) bool {
     ret O.unwrap[*Type](opt_type).kind == TYPE_SECRET;
 }
 
+# whether `tid` is a 128-bit vector type (#1965)
+#
+# A secret `^T` is classified by its inner type, so a secret vector still reports
+# as a vector for layout and lane classification.
+# ---
+# ti:  the interner
+# tid: the TypeId to classify
+# ret: true when `tid` (or its inner type under `^`) is a vector
+pub fun is_vector(ti: *TypeInterner, tid: TypeId) bool {
+    val opt_type: O.Option[*Type] = get(ti, strip_secret(ti, tid));
+    if (O.is_none[*Type](opt_type)) { ret false; }
+    ret O.unwrap[*Type](opt_type).kind == TYPE_VECTOR;
+}
+
+# the lane scalar TypeKind of a vector type, or TYPE_VECTOR itself when `tid` is
+# not a vector (callers gate on is_vector first)
+# ---
+# ti:  the interner
+# tid: a vector TypeId (secret-stripped internally)
+# ret: the lane scalar kind, or TYPE_VECTOR when `tid` is not a vector
+pub fun vector_element(ti: *TypeInterner, tid: TypeId) TypeKind {
+    val opt_type: O.Option[*Type] = get(ti, strip_secret(ti, tid));
+    if (O.is_none[*Type](opt_type)) { ret TYPE_VECTOR; }
+    val t: *Type = O.unwrap[*Type](opt_type);
+    if (t.kind != TYPE_VECTOR) { ret TYPE_VECTOR; }
+    ret t.data.vector.element;
+}
+
+# the lane count of a vector type, or 0 when `tid` is not a vector
+# ---
+# ti:  the interner
+# tid: a vector TypeId (secret-stripped internally)
+# ret: the lane count, or 0 when `tid` is not a vector
+pub fun vector_lanes(ti: *TypeInterner, tid: TypeId) u32 {
+    val opt_type: O.Option[*Type] = get(ti, strip_secret(ti, tid));
+    if (O.is_none[*Type](opt_type)) { ret 0; }
+    val t: *Type = O.unwrap[*Type](opt_type);
+    if (t.kind != TYPE_VECTOR) { ret 0; }
+    ret t.data.vector.lanes;
+}
+
+# the TypeId of the seeded vector shape at ordinal `index`
+# ---
+# ti:    the interner
+# index: ordinal in [0, VEC_COUNT)
+# ret:   some(TypeId) for a seeded shape, none when index is out of range
+pub fun vec(ti: *TypeInterner, index: u32) O.Option[TypeId] {
+    if (index >= VEC_COUNT) { ret O.none[TypeId](); }
+    ret O.some[TypeId](ti.vecs[index]);
+}
+
+# the same-shape unsigned mask vector for a vector comparison result (#1965)
+#
+# A comparison lanes-wise yields all-ones / all-zeros masks in an unsigned vector
+# of the same lane width and count (`f32x4`/`i32x4` -> `u32x4`, `i8x16` ->
+# `u8x16`, and so on).
+# ---
+# ti:  the interner
+# tid: the operand vector TypeId
+# ret: the mask vector TypeId, or an allocation error
+pub fun vector_mask(ti: *TypeInterner, tid: TypeId) R.Result[TypeId, str] {
+    val element: TypeKind = vector_element(ti, tid);
+    val lanes:   u32      = vector_lanes(ti, tid);
+    val bits:    u32      = prim_desc(element).bits;
+
+    var mask_elem: TypeKind = TYPE_U8;
+    if      (bits == 8)  { mask_elem = TYPE_U8;  }
+    or (bits == 16) { mask_elem = TYPE_U16; }
+    or (bits == 32) { mask_elem = TYPE_U32; }
+    or (bits == 64) { mask_elem = TYPE_U64; }
+
+    ret intern_vector(ti, mask_elem, lanes);
+}
+
 # peel one secret qualifier from `tid`, returning the inner type
 #
 # A non-secret type is returned unchanged. `^^T` never forms (intern_secret
@@ -682,6 +838,23 @@ pub fun intern_array(ti: *TypeInterner, base: TypeId, count: u32) R.Result[TypeI
     t.kind             = TYPE_ARRAY;
     t.data.array.base  = base;
     t.data.array.count = count;
+    ret intern_dedup(ti, t);
+}
+
+# intern a 128-bit vector type (#1965)
+#
+# Returns an existing TypeId when the same (element, lanes) shape has been
+# interned before.
+# ---
+# ti:      the interner
+# element: lane scalar TypeKind
+# lanes:   lane count
+# ret:     TypeId for the vector shape, or an allocation error
+pub fun intern_vector(ti: *TypeInterner, element: TypeKind, lanes: u32) R.Result[TypeId, str] {
+    var t: Type;
+    t.kind                = TYPE_VECTOR;
+    t.data.vector.element = element;
+    t.data.vector.lanes   = lanes;
     ret intern_dedup(ti, t);
 }
 
@@ -1309,6 +1482,10 @@ fun hash_type(p: ptr) u64 {
         h = fnv1a.step_u32(h, t.data.array.base::u32);
         h = fnv1a.step_u32(h, t.data.array.count);
     }
+    or (t.kind == TYPE_VECTOR) {
+        h = fnv1a.step_u8(h, t.data.vector.element::u8);
+        h = fnv1a.step_u32(h, t.data.vector.lanes);
+    }
     or (t.kind == TYPE_REC || t.kind == TYPE_UNI) {
         h = fnv1a.step_u32(h, t.data.nominal.origin::u32);
         h = fnv1a.step_u32(h, t.data.nominal.decl::u32);
@@ -1340,6 +1517,10 @@ fun eq_type(pa: ptr, pb: ptr) bool {
     if (a.kind == TYPE_ARRAY) {
         ret a.data.array.base == b.data.array.base
             && a.data.array.count == b.data.array.count;
+    }
+    if (a.kind == TYPE_VECTOR) {
+        ret a.data.vector.element == b.data.vector.element
+            && a.data.vector.lanes == b.data.vector.lanes;
     }
     if (a.kind == TYPE_REC || a.kind == TYPE_UNI) {
         ret a.data.nominal.origin == b.data.nominal.origin
@@ -1423,6 +1604,78 @@ test "mach.lang.type.intern_instance:dedup_by_origin_decl_args" {
     val r4: R.Result[TypeId, str] = intern_instance(?ti, 1::module.ModuleId, 0::id.DeclId, ?a2[0], 2);
     if (R.is_err[TypeId, str](r4))                                    { dnit(?ti); ret 1; }
     if (R.unwrap_ok[TypeId, str](r1) == R.unwrap_ok[TypeId, str](r4)) { dnit(?ti); ret 1; }
+
+    dnit(?ti);
+    ret 0;
+}
+
+# the ten seeded vector shapes are retrievable through `vec`, intern_vector
+# dedups equal shapes to one TypeId, and distinct shapes stay distinct
+test "mach.lang.type.intern_vector:seeded_and_dedup" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, ?alloc))) { ret 1; }
+
+    # every seeded ordinal resolves to a real vector carrying the shape's payload
+    var vi: u32 = 0;
+    for (vi < VEC_COUNT) {
+        val sh:  VecShape          = vec_shape(vi);
+        val opt: O.Option[TypeId]  = vec(?ti, vi);
+        if (O.is_none[TypeId](opt))                             { dnit(?ti); ret 1; }
+        val tid: TypeId = O.unwrap[TypeId](opt);
+        if (!is_vector(?ti, tid))                               { dnit(?ti); ret 1; }
+        if (vector_element(?ti, tid) != sh.element)             { dnit(?ti); ret 1; }
+        if (vector_lanes(?ti, tid) != sh.lanes)                 { dnit(?ti); ret 1; }
+        vi = vi + 1;
+    }
+
+    # re-interning f32x4 returns the seeded id (dedup by shape)
+    val f0: TypeId = O.unwrap[TypeId](vec(?ti, 0));
+    val r_f: R.Result[TypeId, str] = intern_vector(?ti, TYPE_F32, 4);
+    if (R.is_err[TypeId, str](r_f))                     { dnit(?ti); ret 1; }
+    if (R.unwrap_ok[TypeId, str](r_f) != f0)            { dnit(?ti); ret 1; }
+
+    # a different element at the same lane count is a different type
+    val r_i: R.Result[TypeId, str] = intern_vector(?ti, TYPE_I32, 4);
+    if (R.is_err[TypeId, str](r_i))                     { dnit(?ti); ret 1; }
+    if (R.unwrap_ok[TypeId, str](r_i) == f0)            { dnit(?ti); ret 1; }
+
+    # out-of-range ordinal yields none, and a scalar is not a vector
+    if (O.is_some[TypeId](vec(?ti, VEC_COUNT)))         { dnit(?ti); ret 1; }
+    if (is_vector(?ti, O.unwrap[TypeId](prim(?ti, TYPE_U8)))) { dnit(?ti); ret 1; }
+
+    dnit(?ti);
+    ret 0;
+}
+
+# vector_mask maps each shape to the same-lane-count unsigned mask vector
+test "mach.lang.type.vector_mask:same_shape_unsigned" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var ti: TypeInterner;
+    if (O.is_some[str](init(?ti, ?alloc))) { ret 1; }
+
+    # f32x4 -> u32x4
+    val f32x4: TypeId = O.unwrap[TypeId](vec(?ti, 0));
+    val u32x4: TypeId = O.unwrap[TypeId](vec(?ti, 8));
+    val m0: R.Result[TypeId, str] = vector_mask(?ti, f32x4);
+    if (R.is_err[TypeId, str](m0))          { dnit(?ti); ret 1; }
+    if (R.unwrap_ok[TypeId, str](m0) != u32x4) { dnit(?ti); ret 1; }
+
+    # i8x16 -> u8x16
+    val i8x16: TypeId = O.unwrap[TypeId](vec(?ti, 2));
+    val u8x16: TypeId = O.unwrap[TypeId](vec(?ti, 6));
+    val m1: R.Result[TypeId, str] = vector_mask(?ti, i8x16);
+    if (R.is_err[TypeId, str](m1))          { dnit(?ti); ret 1; }
+    if (R.unwrap_ok[TypeId, str](m1) != u8x16) { dnit(?ti); ret 1; }
+
+    # i64x2 -> u64x2
+    val i64x2: TypeId = O.unwrap[TypeId](vec(?ti, 5));
+    val u64x2: TypeId = O.unwrap[TypeId](vec(?ti, 9));
+    val m2: R.Result[TypeId, str] = vector_mask(?ti, i64x2);
+    if (R.is_err[TypeId, str](m2))          { dnit(?ti); ret 1; }
+    if (R.unwrap_ok[TypeId, str](m2) != u64x2) { dnit(?ti); ret 1; }
 
     dnit(?ti);
     ret 0;

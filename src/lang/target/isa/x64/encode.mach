@@ -491,6 +491,28 @@ fun encode_fp_mov(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     val start: usize = buf.len;
     val dst: *isa.Operand = ?mi.dst;
     val src1: *isa.Operand = ?mi.src1;
+
+    # a 128-bit vector move: MOVAPS between XMM registers (a copy or spill of a value in
+    # a 16-aligned slot), MOVUPS to / from memory since a pointer-to-vector load / store
+    # may not be statically 16-aligned (#2014). a vector never crosses to the GP bank.
+    if (mi.size == 16) {
+        if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_REG) {
+            emit_movaps_rr(dst.reg, src1.reg, buf);
+            ret (buf.len - start)::i32;
+        }
+        if (dst.kind == isa.OPK_REG && src1.kind == isa.OPK_MEM) {
+            emit_movups_load(dst.reg, @src1, buf);
+            ret (buf.len - start)::i32;
+        }
+        if (dst.kind == isa.OPK_MEM && src1.kind == isa.OPK_REG) {
+            emit_movups_store(@dst, src1.reg, buf);
+            ret (buf.len - start)::i32;
+        }
+        emit_movups_load(FLOAT_SCRATCH0, @src1, buf);
+        emit_movups_store(@dst, FLOAT_SCRATCH0, buf);
+        ret (buf.len - start)::i32;
+    }
+
     var w: u8 = mi.size;
     if (w != 4 && w != 8) { w = 8; }
 
@@ -529,7 +551,12 @@ fun encode_mov(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     val size: u8 = mi.size;
     val flags: u16 = mi.flags;
 
-    if (reg_is_xmm(dst) || reg_is_xmm(src1)) {
+    # a 128-bit vector move (size 16) routes to the SSE move even when neither operand is
+    # an XMM register: a vector value spilled on BOTH sides (its result slot and its source
+    # slot) is a memory-to-memory move that the GP path would copy at the 8-byte word width,
+    # corrupting the high two lanes; the SSE path stages it through the XMM scratch with a
+    # 16-byte MOVUPS (#2014).
+    if (reg_is_xmm(dst) || reg_is_xmm(src1) || size == 16) {
         ret encode_fp_mov(mi, buf);
     }
 
@@ -1678,8 +1705,9 @@ fun encode_cvt(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
 #
 # dispatches on the x86-64 opcode to the matching encoder. pseudo-opcodes
 # (parallel copies) emit nothing. when both operands are memory the instruction
-# is first split into a load into the R11 scratch register and a recursive
-# re-encode against that register. on an unrecognized opcode it reports the
+# is first split into a load into the reserved scratch register (R11 for scalar
+# widths, the XMM scratch at width 16) and a recursive re-encode against that
+# register. on an unrecognized opcode it reports the
 # offending value to stderr and panics, since reaching here means the back end
 # emitted an instruction the encoder does not model.
 # ---
@@ -1697,7 +1725,12 @@ pub fun encode_inst(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
         opcode != x64.NOP && opcode != x64.RET && opcode != x64.SYSCALL &&
         opcode != x64.UD2 && opcode != x64.PAUSE && opcode != x64.CDQ &&
         opcode != x64.CQO && opcode != x64.MFENCE) {
-        val scratch: i32 = x64.R11;
+        # encoder staging must be non-allocatable per bank: at size 16 the GP R11
+        # id re-encodes as its XMM-bank shadow (XMM11), a live allocatable register
+        # (#2034), so a 16-byte (vector) mem-mem move stages through the reserved
+        # XMM scratch instead. scalar widths keep R11 (reserved from GP allocation).
+        var scratch: i32 = x64.R11;
+        if (mi.size == 16) { scratch = FLOAT_SCRATCH0; }
         var ld: isa.Inst;
         ld.opcode    = x64.MOV;
         ld.dst       = isa.make_reg(scratch, mi.size);
@@ -2589,6 +2622,15 @@ fun encode_mir_instr(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi
     }
     if (mi.opcode == mir.MIR_PHI) {
         ret R.err[bool, str](enc_named_message(st, "internal compiler error: phi survived register allocation in '", enc_fn_name(st, f), "'", "internal compiler error: phi survived register allocation"));
+    }
+
+    # a vector-typed ALU / compare / not (vec_lane set, and the opcode a selected packed
+    # candidate) materializes its packed SSE2 byte sequence here. this precedes the scalar
+    # compare / divide dispatch so a vector op sharing their MIR_SEL_* opcode is not encoded
+    # as its scalar integer form; a vector load / store / move keeps its concrete move
+    # opcode (not a candidate) and falls through to the width-16 SSE move below (#2014).
+    if (mir.vec_lane_is_vector(mi.vec_lane) && is_selected_vector_alu(mi.opcode)) {
+        ret encode_vector_op(f, mi, ?st.buf);
     }
 
     # the comparison family survives selection as a single `[dst, lhs, rhs]`
@@ -3522,6 +3564,495 @@ fun encode_float_cmp(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) 
     encode_inst(?movzx, buf);
 
     ret R.ok[bool, str](true);
+}
+
+# whether a packed SSE2 opcode takes no mandatory prefix (the ps float forms, the ps
+# compare, and MOVUPS); everything else - pd float and all integer packed ops - takes 66
+fun packed_prefix66(op: u16) bool {
+    if (op == x64.ADDPS || op == x64.SUBPS || op == x64.MULPS || op == x64.DIVPS) { ret false; }
+    if (op == x64.CMPPS || op == x64.MOVUPS) { ret false; }
+    ret true;
+}
+
+# the secondary (0F-map) opcode byte for a packed SSE2 opcode
+fun packed_opbyte(op: u16) u8 {
+    if (op == x64.ADDPS || op == x64.ADDPD) { ret 0x58; }
+    if (op == x64.SUBPS || op == x64.SUBPD) { ret 0x5C; }
+    if (op == x64.MULPS || op == x64.MULPD) { ret 0x59; }
+    if (op == x64.DIVPS || op == x64.DIVPD) { ret 0x5E; }
+    if (op == x64.PADDB)  { ret 0xFC; }
+    if (op == x64.PADDW)  { ret 0xFD; }
+    if (op == x64.PADDD)  { ret 0xFE; }
+    if (op == x64.PADDQ)  { ret 0xD4; }
+    if (op == x64.PSUBB)  { ret 0xF8; }
+    if (op == x64.PSUBW)  { ret 0xF9; }
+    if (op == x64.PSUBD)  { ret 0xFA; }
+    if (op == x64.PSUBQ)  { ret 0xFB; }
+    if (op == x64.PSUBUSB) { ret 0xD8; }
+    if (op == x64.PSUBUSW) { ret 0xD9; }
+    if (op == x64.PMULLW) { ret 0xD5; }
+    if (op == x64.PAND)   { ret 0xDB; }
+    if (op == x64.POR)    { ret 0xEB; }
+    if (op == x64.PXOR)   { ret 0xEF; }
+    if (op == x64.CMPPS || op == x64.CMPPD) { ret 0xC2; }
+    if (op == x64.PCMPEQB) { ret 0x74; }
+    if (op == x64.PCMPEQW) { ret 0x75; }
+    if (op == x64.PCMPEQD) { ret 0x76; }
+    if (op == x64.PCMPGTB) { ret 0x64; }
+    if (op == x64.PCMPGTW) { ret 0x65; }
+    if (op == x64.PCMPGTD) { ret 0x66; }
+    if (op == x64.PSHUFD) { ret 0x70; }
+    if (op == x64.PSLLD)  { ret 0x72; }
+    panic("encode: unknown packed SSE2 opcode\n");
+    ret 0;
+}
+
+# a 16-byte XMM register operand for the packed helpers
+fun vec_reg(xmm: i32) isa.Operand {
+    ret isa.make_reg(xmm, 16);
+}
+
+# emit a two-operand packed op `<op> dst_xmm, src` where `src` is an XMM register or a
+# 16-byte-aligned memory operand: `[66] [REX] 0F <byte> /r`. all packed vector operands
+# are register- or 16-aligned-slot-resident, so the aligned memory form is safe
+fun emit_packed_op(op: u16, dst_xmm: i32, src: isa.Operand, buf: *enc.ByteBuf) {
+    if (packed_prefix66(op)) { enc.emit_byte(buf, 0x66); }
+    if (src.kind == isa.OPK_REG) {
+        emit_rex_if_needed(buf, 0, dst_xmm, src.reg);
+        enc.emit_byte(buf, 0x0F);
+        enc.emit_byte(buf, packed_opbyte(op));
+        enc.emit_byte(buf, encode_modrm(3, reg_bits(dst_xmm), reg_bits(src.reg)));
+        ret;
+    }
+    if (src.kind == isa.OPK_MEM) {
+        emit_rex_mem(buf, 0, dst_xmm, ?src);
+        enc.emit_byte(buf, 0x0F);
+        enc.emit_byte(buf, packed_opbyte(op));
+        encode_mem_operand(buf, dst_xmm, ?src);
+        ret;
+    }
+    panic("encode: packed vector op source is not a register or aligned frame slot\n");
+}
+
+# emit a packed reg-reg op with an imm8 (`[66] [REX] 0F <byte> /r ib`): CMPPS/PD and PSHUFD
+fun emit_packed_rri(op: u16, dst_xmm: i32, src_xmm: i32, imm: u8, buf: *enc.ByteBuf) {
+    if (packed_prefix66(op)) { enc.emit_byte(buf, 0x66); }
+    emit_rex_if_needed(buf, 0, dst_xmm, src_xmm);
+    enc.emit_byte(buf, 0x0F);
+    enc.emit_byte(buf, packed_opbyte(op));
+    enc.emit_byte(buf, encode_modrm(3, reg_bits(dst_xmm), reg_bits(src_xmm)));
+    enc.emit_byte(buf, imm);
+}
+
+# emit a packed shift-by-imm8 `<op> xmm, imm8` (group form `66 [REX] 0F <byte> /6 ib`);
+# the shifted register is the r/m operand, /6 the opcode extension in the reg field
+fun emit_packed_shift_imm(op: u16, xmm: i32, imm: u8, buf: *enc.ByteBuf) {
+    enc.emit_byte(buf, 0x66);
+    if (needs_rex(xmm)) { enc.emit_byte(buf, encode_rex(0, 0, xmm)); }
+    enc.emit_byte(buf, 0x0F);
+    enc.emit_byte(buf, packed_opbyte(op));
+    enc.emit_byte(buf, encode_modrm(3, 6, reg_bits(xmm)));
+    enc.emit_byte(buf, imm);
+}
+
+# emit a register-register MOVAPS (`0F 28 /r`) copying one 128-bit XMM to another
+fun emit_movaps_rr(dst_xmm: i32, src_xmm: i32, buf: *enc.ByteBuf) {
+    emit_rex_if_needed(buf, 0, dst_xmm, src_xmm);
+    enc.emit_byte(buf, 0x0F);
+    enc.emit_byte(buf, 0x28);
+    enc.emit_byte(buf, encode_modrm(3, reg_bits(dst_xmm), reg_bits(src_xmm)));
+}
+
+# emit an unaligned 128-bit load `MOVUPS xmm, [mem]` (`0F 10 /r`)
+fun emit_movups_load(xmm: i32, mem: isa.Operand, buf: *enc.ByteBuf) {
+    emit_rex_mem(buf, 0, xmm, ?mem);
+    enc.emit_byte(buf, 0x0F);
+    enc.emit_byte(buf, 0x10);
+    encode_mem_operand(buf, xmm, ?mem);
+}
+
+# emit an unaligned 128-bit store `MOVUPS [mem], xmm` (`0F 11 /r`)
+fun emit_movups_store(mem: isa.Operand, xmm: i32, buf: *enc.ByteBuf) {
+    emit_rex_mem(buf, 0, xmm, ?mem);
+    enc.emit_byte(buf, 0x0F);
+    enc.emit_byte(buf, 0x11);
+    encode_mem_operand(buf, xmm, ?mem);
+}
+
+# load a 16-byte vector operand into the XMM scratch `xmm` via MOVAPS (from an XMM
+# register or a 16-byte-aligned frame slot). vector operands are always register- or
+# 16-aligned-spill-slot-resident, so MOVAPS is safe; an immediate never occurs
+fun emit_vec_load(op: isa.Operand, xmm: i32, buf: *enc.ByteBuf) R.Result[bool, str] {
+    if (op.kind == isa.OPK_REG) { emit_movaps_rr(xmm, op.reg, buf); ret R.ok[bool, str](true); }
+    if (op.kind == isa.OPK_MEM) {
+        var ld: isa.Inst;
+        zero_inst(?ld);
+        ld.opcode = x64.MOVAPS;
+        ld.dst    = isa.make_reg(xmm, 16);
+        ld.src1   = op;
+        ld.size   = 16;
+        encode_inst(?ld, buf);
+        ret R.ok[bool, str](true);
+    }
+    ret R.err[bool, str]("encode: vector operand is not a register or aligned frame slot");
+}
+
+# store the XMM scratch `xmm` to a 16-byte vector destination via MOVAPS (an XMM
+# register or a 16-byte-aligned frame slot)
+fun emit_vec_store(dst: isa.Operand, xmm: i32, buf: *enc.ByteBuf) R.Result[bool, str] {
+    if (dst.kind == isa.OPK_REG) { emit_movaps_rr(dst.reg, xmm, buf); ret R.ok[bool, str](true); }
+    if (dst.kind == isa.OPK_MEM) {
+        var st: isa.Inst;
+        zero_inst(?st);
+        st.opcode = x64.MOVAPS;
+        st.dst    = dst;
+        st.src1   = isa.make_reg(xmm, 16);
+        st.size   = 16;
+        encode_inst(?st, buf);
+        ret R.ok[bool, str](true);
+    }
+    ret R.err[bool, str]("encode: vector destination is not a register or aligned frame slot");
+}
+
+# set every bit of `xmm` (`PCMPEQD xmm, xmm`) - the all-ones mask for a bitwise NOT
+fun emit_vec_all_ones(xmm: i32, buf: *enc.ByteBuf) {
+    emit_packed_op(x64.PCMPEQD, xmm, vec_reg(xmm), buf);
+}
+
+# clear `xmm` (`PXOR xmm, xmm`)
+fun emit_vec_zero(xmm: i32, buf: *enc.ByteBuf) {
+    emit_packed_op(x64.PXOR, xmm, vec_reg(xmm), buf);
+}
+
+# whether a post-isel opcode is a vector-ALU candidate the packed encoders own: the
+# high-space MIR_SEL_* arithmetic / bitwise / shift / compare forms (a scalar op carries
+# vec_lane=NONE, so the encode-site vec_lane guard keeps this to real vector ops), plus
+# the surviving MIR_NOT (a scalar NOT expands, so a surviving MIR_NOT is always vector).
+# a vector load / store / move keeps a concrete move opcode and is NOT a candidate (#2014)
+fun is_selected_vector_alu(o: mir.MirOpcode) bool {
+    if (o == mir.MIR_NOT) { ret true; }
+    if (o == mir.MIR_SEL_ADD || o == mir.MIR_SEL_SUB || o == mir.MIR_SEL_MUL) { ret true; }
+    if (o == mir.MIR_SEL_DIV_S || o == mir.MIR_SEL_DIV_U ||
+        o == mir.MIR_SEL_REM_S || o == mir.MIR_SEL_REM_U) { ret true; }
+    if (o == mir.MIR_SEL_AND || o == mir.MIR_SEL_OR || o == mir.MIR_SEL_XOR) { ret true; }
+    if (o == mir.MIR_SEL_SHL || o == mir.MIR_SEL_SHR_S || o == mir.MIR_SEL_SHR_U) { ret true; }
+    if (o == mir.MIR_SEL_CMP_EQ || o == mir.MIR_SEL_CMP_NE ||
+        o == mir.MIR_SEL_CMP_LT_S || o == mir.MIR_SEL_CMP_LT_U ||
+        o == mir.MIR_SEL_CMP_LE_S || o == mir.MIR_SEL_CMP_LE_U) { ret true; }
+    ret false;
+}
+
+# dispatch a vector-typed selected op to its packed SSE2 encoder by opcode: the MIR_SEL_*
+# arithmetic / bitwise family, the surviving MIR_NOT (unary `~`), and the MIR_SEL_* compare
+# family. a vector shift / remainder (rejected at sema #2030, so unreachable) is the defined
+# loud backstop rather than a silent integer fall-through (#2014)
+fun encode_vector_op(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) R.Result[bool, str] {
+    val o: mir.MirOpcode = mi.opcode;
+    if (o == mir.MIR_NOT) { ret encode_vector_not(f, mi, buf); }
+    if (o == mir.MIR_SEL_CMP_EQ || o == mir.MIR_SEL_CMP_NE ||
+        o == mir.MIR_SEL_CMP_LT_S || o == mir.MIR_SEL_CMP_LT_U ||
+        o == mir.MIR_SEL_CMP_LE_S || o == mir.MIR_SEL_CMP_LE_U) { ret encode_vector_compare(f, mi, buf); }
+    if (o == mir.MIR_SEL_ADD || o == mir.MIR_SEL_SUB || o == mir.MIR_SEL_MUL ||
+        o == mir.MIR_SEL_DIV_S || o == mir.MIR_SEL_DIV_U ||
+        o == mir.MIR_SEL_AND || o == mir.MIR_SEL_OR || o == mir.MIR_SEL_XOR) { ret encode_vector_arith(f, mi, buf); }
+    ret R.err[bool, str]("encode: unsupported vector operation on x86_64 (no packed SSE2 selection)");
+}
+
+# the concrete packed arithmetic / bitwise opcode for a vector-typed selected MIR op at a
+# vec_lane descriptor (element kind + byte width), or 0xFFFF for a combination sema does
+# not admit (an unresolvable pair is a lowering bug)
+fun packed_arith_opcode(op: mir.MirOpcode, vec_lane: u8) u16 {
+    val is_float: bool = mir.vec_lane_kind(vec_lane) == mir.VEC_LANE_FLOAT;
+    val eb:       u8   = mir.vec_lane_elem_bytes(vec_lane);
+    if (op == mir.MIR_SEL_AND) { ret x64.PAND; }
+    if (op == mir.MIR_SEL_OR)  { ret x64.POR; }
+    if (op == mir.MIR_SEL_XOR) { ret x64.PXOR; }
+    if (op == mir.MIR_SEL_ADD) {
+        if (is_float) { if (eb == 4) { ret x64.ADDPS; } ret x64.ADDPD; }
+        if (eb == 1) { ret x64.PADDB; }
+        if (eb == 2) { ret x64.PADDW; }
+        if (eb == 4) { ret x64.PADDD; }
+        ret x64.PADDQ;
+    }
+    if (op == mir.MIR_SEL_SUB) {
+        if (is_float) { if (eb == 4) { ret x64.SUBPS; } ret x64.SUBPD; }
+        if (eb == 1) { ret x64.PSUBB; }
+        if (eb == 2) { ret x64.PSUBW; }
+        if (eb == 4) { ret x64.PSUBD; }
+        ret x64.PSUBQ;
+    }
+    if (op == mir.MIR_SEL_MUL) {
+        if (is_float) { if (eb == 4) { ret x64.MULPS; } ret x64.MULPD; }
+        if (eb == 2) { ret x64.PMULLW; }
+    }
+    if (op == mir.MIR_SEL_DIV_U || op == mir.MIR_SEL_DIV_S) {
+        if (is_float) { if (eb == 4) { ret x64.DIVPS; } ret x64.DIVPD; }
+    }
+    ret 0xFFFF;
+}
+
+# materialize a vector-typed packed arithmetic / bitwise op `[dst, lhs, rhs]` into its
+# SSE2 byte sequence: load `lhs` -> FLOAT_SCRATCH0, then the packed op reads `rhs`
+# directly (register or aligned slot), and the result stores back from FLOAT_SCRATCH0.
+# mirrors `encode_float_arith`; the lane shape rides on `mi.vec_lane`
+fun encode_vector_arith(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) R.Result[bool, str] {
+    if (mi.operand_count < 3) { ret R.err[bool, str]("encode: packed vector op missing operands"); }
+    val rd: R.Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[0], 16);
+    if (R.is_err[isa.Operand, str](rd)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](rd)); }
+    val rl: R.Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[1], 16);
+    if (R.is_err[isa.Operand, str](rl)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](rl)); }
+    val rr: R.Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[2], 16);
+    if (R.is_err[isa.Operand, str](rr)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](rr)); }
+    val dst: isa.Operand = R.unwrap_ok[isa.Operand, str](rd);
+    val lhs: isa.Operand = R.unwrap_ok[isa.Operand, str](rl);
+    val rhs: isa.Operand = R.unwrap_ok[isa.Operand, str](rr);
+
+    val opc: u16 = packed_arith_opcode(mi.opcode, mi.vec_lane);
+    if (opc == 0xFFFF) { ret R.err[bool, str]("encode: unsupported packed vector op / lane combination"); }
+
+    val ll: R.Result[bool, str] = emit_vec_load(lhs, FLOAT_SCRATCH0, buf);
+    if (R.is_err[bool, str](ll)) { ret ll; }
+    emit_packed_op(opc, FLOAT_SCRATCH0, rhs, buf);
+    ret emit_vec_store(dst, FLOAT_SCRATCH0, buf);
+}
+
+# materialize a vector-typed bitwise complement `MIR_NOT [dst, src]` (unary `~`): load
+# `src` -> FLOAT_SCRATCH0, XOR against an all-ones mask in FLOAT_SCRATCH1, store back
+fun encode_vector_not(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) R.Result[bool, str] {
+    if (mi.operand_count < 2) { ret R.err[bool, str]("encode: packed vector not missing operands"); }
+    val rd: R.Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[0], 16);
+    if (R.is_err[isa.Operand, str](rd)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](rd)); }
+    val rs: R.Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[1], 16);
+    if (R.is_err[isa.Operand, str](rs)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](rs)); }
+    val dst: isa.Operand = R.unwrap_ok[isa.Operand, str](rd);
+    val src: isa.Operand = R.unwrap_ok[isa.Operand, str](rs);
+
+    val ll: R.Result[bool, str] = emit_vec_load(src, FLOAT_SCRATCH0, buf);
+    if (R.is_err[bool, str](ll)) { ret ll; }
+    emit_vec_all_ones(FLOAT_SCRATCH1, buf);
+    emit_packed_op(x64.PXOR, FLOAT_SCRATCH0, vec_reg(FLOAT_SCRATCH1), buf);
+    ret emit_vec_store(dst, FLOAT_SCRATCH0, buf);
+}
+
+# the PCMPEQ{B,W,D} opcode for an integer lane byte width
+fun pcmpeq_op(w: u8) u16 {
+    if (w == 1) { ret x64.PCMPEQB; }
+    if (w == 2) { ret x64.PCMPEQW; }
+    ret x64.PCMPEQD;
+}
+
+# the PCMPGT{B,W,D} opcode for an integer lane byte width
+fun pcmpgt_op(w: u8) u16 {
+    if (w == 1) { ret x64.PCMPGTB; }
+    if (w == 2) { ret x64.PCMPGTW; }
+    ret x64.PCMPGTD;
+}
+
+# leave the integer-lane equality mask (`lhs == rhs`) in FLOAT_SCRATCH0. 8/16/32-bit
+# lanes use one PCMPEQ; 64-bit lanes compose PCMPEQD + PSHUFD(0xB1) + PAND (PCMPEQQ is
+# SSE4.1, out of baseline) so each 64-bit lane is all-ones only when both halves match
+fun emit_vcmp_eq_s0(lhs: isa.Operand, rhs: isa.Operand, w: u8, buf: *enc.ByteBuf) R.Result[bool, str] {
+    val ll: R.Result[bool, str] = emit_vec_load(lhs, FLOAT_SCRATCH0, buf);
+    if (R.is_err[bool, str](ll)) { ret ll; }
+    if (w == 8) {
+        emit_packed_op(x64.PCMPEQD, FLOAT_SCRATCH0, rhs, buf);
+        emit_packed_rri(x64.PSHUFD, FLOAT_SCRATCH1, FLOAT_SCRATCH0, 0xB1, buf);
+        emit_packed_op(x64.PAND, FLOAT_SCRATCH0, vec_reg(FLOAT_SCRATCH1), buf);
+        ret R.ok[bool, str](true);
+    }
+    emit_packed_op(pcmpeq_op(w), FLOAT_SCRATCH0, rhs, buf);
+    ret R.ok[bool, str](true);
+}
+
+# the SETcc opcode realizing a 64-bit-lane ordering compare (LT/LE, signed/unsigned)
+fun i64_ordering_setcc(op: mir.MirOpcode) u16 {
+    if (op == mir.MIR_SEL_CMP_LT_S) { ret x64.SETL; }
+    if (op == mir.MIR_SEL_CMP_LE_S) { ret x64.SETLE; }
+    if (op == mir.MIR_SEL_CMP_LT_U) { ret x64.SETB; }
+    ret x64.SETBE;
+}
+
+# materialize a 64-bit-lane ordering compare as a fixed, branch-free per-lane scalar
+# sequence: spill both operands into the call-free 128-byte red zone, compare each
+# 64-bit lane in GP registers (CMP + SETcc), broadcast the 0/-1 mask back, and reload
+# the assembled result. PCMPGTQ is SSE4.2 and the packed 32-bit-half compose is
+# register-hungry, so this two-lane unrolled form is the defined baseline
+fun encode_vcmp_i64_ordering(dst: isa.Operand, lhs: isa.Operand, rhs: isa.Operand, op: mir.MirOpcode, buf: *enc.ByteBuf) R.Result[bool, str] {
+    val setcc: u16 = i64_ordering_setcc(op);
+    val lhs_slot: isa.Operand = isa.make_mem(x64.RSP, -16, -1, 0, 16);
+    val rhs_slot: isa.Operand = isa.make_mem(x64.RSP, -32, -1, 0, 16);
+    val res_slot: isa.Operand = isa.make_mem(x64.RSP, -48, -1, 0, 16);
+
+    val l0: R.Result[bool, str] = emit_vec_load(lhs, FLOAT_SCRATCH0, buf);
+    if (R.is_err[bool, str](l0)) { ret l0; }
+    val l1: R.Result[bool, str] = emit_vec_load(rhs, FLOAT_SCRATCH1, buf);
+    if (R.is_err[bool, str](l1)) { ret l1; }
+    emit_movups_store(lhs_slot, FLOAT_SCRATCH0, buf);
+    emit_movups_store(rhs_slot, FLOAT_SCRATCH1, buf);
+
+    var lane: i32 = 0;
+    for (lane < 2) {
+        val off: i32 = lane * 8;
+        # MOV R10, [rsp-16+off]  ;  MOV R11, [rsp-32+off]
+        emit_gp_inst(x64.MOV, isa.make_reg(x64.R10, 8), isa.make_mem(x64.RSP, -16 + off, -1, 0, 8), 8, x64.FLAG_REX_W, buf);
+        emit_gp_inst(x64.MOV, isa.make_reg(x64.R11, 8), isa.make_mem(x64.RSP, -32 + off, -1, 0, 8), 8, x64.FLAG_REX_W, buf);
+        # CMP R10, R11  (flags for lhs - rhs)
+        emit_gp_inst(x64.CMP, isa.make_reg(x64.R10, 8), isa.make_reg(x64.R11, 8), 8, x64.FLAG_REX_W, buf);
+        # SETcc R10b
+        var setb: isa.Inst;
+        zero_inst(?setb);
+        setb.opcode   = setcc;
+        setb.dst      = isa.make_reg(x64.R10, 1);
+        setb.dst.size = 1;
+        setb.size     = 1;
+        encode_inst(?setb, buf);
+        # MOVZX R10, R10b  (0/1)  then NEG R10  (0/-1)
+        var mz: isa.Inst;
+        zero_inst(?mz);
+        mz.opcode    = x64.MOVZX;
+        mz.dst       = isa.make_reg(x64.R10, 8);
+        mz.dst.size  = DEFAULT_OPERAND_SIZE;
+        mz.src1      = isa.make_reg(x64.R10, 1);
+        mz.src1.size = 1;
+        mz.size      = DEFAULT_OPERAND_SIZE;
+        mz.flags     = x64.FLAG_REX_W;
+        encode_inst(?mz, buf);
+        emit_gp_inst(x64.NEG, isa.make_reg(x64.R10, 8), isa.make_reg(x64.R10, 8), 8, x64.FLAG_REX_W, buf);
+        # MOV [rsp-48+off], R10
+        emit_gp_inst(x64.MOV, isa.make_mem(x64.RSP, -48 + off, -1, 0, 8), isa.make_reg(x64.R10, 8), 8, x64.FLAG_REX_W, buf);
+        lane = lane + 1;
+    }
+
+    emit_movups_load(FLOAT_SCRATCH0, res_slot, buf);
+    ret emit_vec_store(dst, FLOAT_SCRATCH0, buf);
+}
+
+# build a simple GP instruction `<opcode> dst, src` at `size` bytes and emit it
+fun emit_gp_inst(opcode: u16, dst: isa.Operand, src: isa.Operand, size: u8, flags: u16, buf: *enc.ByteBuf) {
+    var mi: isa.Inst;
+    zero_inst(?mi);
+    mi.opcode = opcode;
+    mi.dst    = dst;
+    mi.src1   = src;
+    mi.size   = size;
+    mi.flags  = flags;
+    encode_inst(?mi, buf);
+}
+
+# materialize a vector-typed compare `MIR_CMP_* [dst, lhs, rhs]` into the same-shape
+# mask. float lanes use CMPPS/PD (imm8 predicate); integer lanes use the PCMPEQ / PCMPGT
+# family plus the fixed defined sequences where SSE2 has no single form (integer !=,
+# <= / >=, unsigned orderings, and all 64-bit-lane orderings). the lane shape rides on
+# `mi.vec_lane` (the OPERAND's shape); signedness comes from the compare opcode
+fun encode_vector_compare(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) R.Result[bool, str] {
+    if (mi.operand_count < 3) { ret R.err[bool, str]("encode: packed compare missing operands"); }
+    val rd: R.Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[0], 16);
+    if (R.is_err[isa.Operand, str](rd)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](rd)); }
+    val rl: R.Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[1], 16);
+    if (R.is_err[isa.Operand, str](rl)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](rl)); }
+    val rr: R.Result[isa.Operand, str] = mir_to_operand(f, ?mi.operands[2], 16);
+    if (R.is_err[isa.Operand, str](rr)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](rr)); }
+    val dst: isa.Operand = R.unwrap_ok[isa.Operand, str](rd);
+    val lhs: isa.Operand = R.unwrap_ok[isa.Operand, str](rl);
+    val rhs: isa.Operand = R.unwrap_ok[isa.Operand, str](rr);
+    val op:   mir.MirOpcode = mi.opcode;
+    val w:    u8 = mir.vec_lane_elem_bytes(mi.vec_lane);
+
+    # float lanes: CMPPS/PD with an imm8 predicate (EQ 0, LT 1, LE 2, NEQ 4).
+    if (mir.vec_lane_kind(mi.vec_lane) == mir.VEC_LANE_FLOAT) {
+        var cmpop: u16 = x64.CMPPD;
+        if (w == 4) { cmpop = x64.CMPPS; }
+        var imm: u8 = 0;
+        if (op == mir.MIR_SEL_CMP_NE) { imm = 4; }
+        or (op == mir.MIR_SEL_CMP_LT_S || op == mir.MIR_SEL_CMP_LT_U) { imm = 1; }
+        or (op == mir.MIR_SEL_CMP_LE_S || op == mir.MIR_SEL_CMP_LE_U) { imm = 2; }
+        val fl: R.Result[bool, str] = emit_vec_load(lhs, FLOAT_SCRATCH0, buf);
+        if (R.is_err[bool, str](fl)) { ret fl; }
+        val fr: R.Result[bool, str] = emit_vec_load(rhs, FLOAT_SCRATCH1, buf);
+        if (R.is_err[bool, str](fr)) { ret fr; }
+        emit_packed_rri(cmpop, FLOAT_SCRATCH0, FLOAT_SCRATCH1, imm, buf);
+        ret emit_vec_store(dst, FLOAT_SCRATCH0, buf);
+    }
+
+    if (op == mir.MIR_SEL_CMP_EQ) {
+        val re: R.Result[bool, str] = emit_vcmp_eq_s0(lhs, rhs, w, buf);
+        if (R.is_err[bool, str](re)) { ret re; }
+        ret emit_vec_store(dst, FLOAT_SCRATCH0, buf);
+    }
+    if (op == mir.MIR_SEL_CMP_NE) {
+        val re: R.Result[bool, str] = emit_vcmp_eq_s0(lhs, rhs, w, buf);
+        if (R.is_err[bool, str](re)) { ret re; }
+        emit_vec_all_ones(FLOAT_SCRATCH1, buf);
+        emit_packed_op(x64.PXOR, FLOAT_SCRATCH0, vec_reg(FLOAT_SCRATCH1), buf);
+        ret emit_vec_store(dst, FLOAT_SCRATCH0, buf);
+    }
+
+    # 64-bit-lane orderings: fixed per-lane scalar sequence.
+    if (w == 8) { ret encode_vcmp_i64_ordering(dst, lhs, rhs, op, buf); }
+
+    if (op == mir.MIR_SEL_CMP_LT_S) {
+        # lhs < rhs (signed) = rhs > lhs = PCMPGT(rhs, lhs).
+        val ld: R.Result[bool, str] = emit_vec_load(rhs, FLOAT_SCRATCH0, buf);
+        if (R.is_err[bool, str](ld)) { ret ld; }
+        emit_packed_op(pcmpgt_op(w), FLOAT_SCRATCH0, lhs, buf);
+        ret emit_vec_store(dst, FLOAT_SCRATCH0, buf);
+    }
+    if (op == mir.MIR_SEL_CMP_LE_S) {
+        # lhs <= rhs (signed) = !(lhs > rhs).
+        val ld: R.Result[bool, str] = emit_vec_load(lhs, FLOAT_SCRATCH0, buf);
+        if (R.is_err[bool, str](ld)) { ret ld; }
+        emit_packed_op(pcmpgt_op(w), FLOAT_SCRATCH0, rhs, buf);
+        emit_vec_all_ones(FLOAT_SCRATCH1, buf);
+        emit_packed_op(x64.PXOR, FLOAT_SCRATCH0, vec_reg(FLOAT_SCRATCH1), buf);
+        ret emit_vec_store(dst, FLOAT_SCRATCH0, buf);
+    }
+    if (op == mir.MIR_SEL_CMP_LT_U) {
+        if (w == 4) {
+            # dword sign-bias then signed PCMPGTD: lhs <u rhs = biased_rhs >s biased_lhs.
+            emit_vec_all_ones(FLOAT_SCRATCH1, buf);
+            emit_packed_shift_imm(x64.PSLLD, FLOAT_SCRATCH1, 31, buf);
+            val ld: R.Result[bool, str] = emit_vec_load(lhs, FLOAT_SCRATCH0, buf);
+            if (R.is_err[bool, str](ld)) { ret ld; }
+            emit_packed_op(x64.PXOR, FLOAT_SCRATCH0, vec_reg(FLOAT_SCRATCH1), buf);
+            emit_packed_op(x64.PXOR, FLOAT_SCRATCH1, rhs, buf);
+            emit_packed_op(x64.PCMPGTD, FLOAT_SCRATCH1, vec_reg(FLOAT_SCRATCH0), buf);
+            ret emit_vec_store(dst, FLOAT_SCRATCH1, buf);
+        }
+        # byte/word: lhs <u rhs = subus(rhs, lhs) != 0.
+        val ld: R.Result[bool, str] = emit_vec_load(rhs, FLOAT_SCRATCH0, buf);
+        if (R.is_err[bool, str](ld)) { ret ld; }
+        var subus: u16 = x64.PSUBUSW;
+        if (w == 1) { subus = x64.PSUBUSB; }
+        emit_packed_op(subus, FLOAT_SCRATCH0, lhs, buf);
+        emit_vec_zero(FLOAT_SCRATCH1, buf);
+        emit_packed_op(pcmpeq_op(w), FLOAT_SCRATCH0, vec_reg(FLOAT_SCRATCH1), buf);
+        emit_vec_all_ones(FLOAT_SCRATCH1, buf);
+        emit_packed_op(x64.PXOR, FLOAT_SCRATCH0, vec_reg(FLOAT_SCRATCH1), buf);
+        ret emit_vec_store(dst, FLOAT_SCRATCH0, buf);
+    }
+    # MIR_CMP_LE_U
+    if (w == 4) {
+        # dword: lhs <=u rhs = !(lhs >u rhs) = !(biased_lhs >s biased_rhs).
+        emit_vec_all_ones(FLOAT_SCRATCH1, buf);
+        emit_packed_shift_imm(x64.PSLLD, FLOAT_SCRATCH1, 31, buf);
+        val ld: R.Result[bool, str] = emit_vec_load(lhs, FLOAT_SCRATCH0, buf);
+        if (R.is_err[bool, str](ld)) { ret ld; }
+        emit_packed_op(x64.PXOR, FLOAT_SCRATCH0, vec_reg(FLOAT_SCRATCH1), buf);
+        emit_packed_op(x64.PXOR, FLOAT_SCRATCH1, rhs, buf);
+        emit_packed_op(x64.PCMPGTD, FLOAT_SCRATCH0, vec_reg(FLOAT_SCRATCH1), buf);
+        emit_vec_all_ones(FLOAT_SCRATCH1, buf);
+        emit_packed_op(x64.PXOR, FLOAT_SCRATCH0, vec_reg(FLOAT_SCRATCH1), buf);
+        ret emit_vec_store(dst, FLOAT_SCRATCH0, buf);
+    }
+    # byte/word: lhs <=u rhs = subus(lhs, rhs) == 0.
+    val ld: R.Result[bool, str] = emit_vec_load(lhs, FLOAT_SCRATCH0, buf);
+    if (R.is_err[bool, str](ld)) { ret ld; }
+    var subus2: u16 = x64.PSUBUSW;
+    if (w == 1) { subus2 = x64.PSUBUSB; }
+    emit_packed_op(subus2, FLOAT_SCRATCH0, rhs, buf);
+    emit_vec_zero(FLOAT_SCRATCH1, buf);
+    emit_packed_op(pcmpeq_op(w), FLOAT_SCRATCH0, vec_reg(FLOAT_SCRATCH1), buf);
+    ret emit_vec_store(dst, FLOAT_SCRATCH0, buf);
 }
 
 # true when a post-isel opcode is a surviving generic integer
@@ -5725,5 +6256,52 @@ test "mach.lang.target.isa.x64.encode.x86_reloc_offset:legalized_disp32" {
     or (x86_reloc_offset(nil, ?small, small_sz) != 3) { bad = 1; }
 
     enc.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# FLOAT_SCRATCH0 (XMM14) must encode with ModRM reg field 6 + REX.R in the packed move
+# helpers; a mis-encode would stage a vector memory-to-memory spill through a live XMM
+# register instead of the reserved scratch (#2014 regression guard)
+test "mach.lang.target.isa.x64.encode.vec:scratch_reg_encoding" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: enc.ByteBuf = enc.buf_init(?alloc);
+    val mem: isa.Operand = isa.make_mem(x64.RAX, 0, -1, 0, 16);
+    emit_movups_load(FLOAT_SCRATCH0, mem, ?buf);
+    var bad: i32 = 0;
+    if (buf.len < 4)          { bad = 1; }
+    or (buf.data[0] != 0x44)  { bad = 1; }
+    or (buf.data[1] != 0x0F)  { bad = 1; }
+    or (buf.data[2] != 0x10)  { bad = 1; }
+    or (buf.data[3] != 0x30)  { bad = 1; }
+    enc.buf_dnit(?buf);
+    ret bad;
+}
+
+# a 16-byte mem-mem MOV routed through the full encode_inst split must stage
+# through XMM14 (44 0F 10 30), not the GP R11 whose id aliases live XMM11
+# (44 0F 10 18) at size 16 (#2034). exercises the dispatch, not the callee.
+test "mach.lang.target.isa.x64.encode.vec:mem_mem_16_stages_xmm14" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: enc.ByteBuf = enc.buf_init(?alloc);
+    var inst: isa.Inst;
+    inst.opcode   = x64.MOV;
+    inst.size     = 16;
+    inst.dst      = isa.make_mem(x64.RBP, -384, -1, 0, 16);
+    inst.src1     = isa.make_mem(x64.RAX, 0, -1, 0, 16);
+    inst.src2.kind = 0;
+    inst.flags    = 0;
+    inst.clobbers = 0;
+    inst.src_line = 0;
+    inst.src_file = nil;
+    encode_inst(?inst, ?buf);
+    var bad: i32 = 0;
+    if (buf.len < 4)          { bad = 1; }
+    or (buf.data[0] != 0x44)  { bad = 1; }
+    or (buf.data[1] != 0x0F)  { bad = 1; }
+    or (buf.data[2] != 0x10)  { bad = 1; }
+    or (buf.data[3] != 0x30)  { bad = 1; }
+    enc.buf_dnit(?buf);
     ret bad;
 }

@@ -181,6 +181,9 @@ pub rec DepEntry {
 # emit_asm:     selected profile's ASM-emission default
 # debug:        selected profile's debug-info default (`[profile.*] debug`); the
 #               driver ORs it with the CLI `-g` flag into the session's resolved bit
+# simd:         selected profile's SIMD strictness lever (`[profile.*] simd`); the
+#               consumer's posture over the target capability fact, resolved onto the
+#               session and read at the build's scalarize/require gate (#2017)
 # defines:      merged comptime defines for the selected unit (artifact < target
 #               < cell), each `NAME` or `NAME=VALUE`; bound into every module's
 #               comptime ctx during load (#1191); nil when none
@@ -212,6 +215,7 @@ pub rec ProjectConfig {
     emit_ir:      bool;
     emit_asm:     bool;
     debug:        bool;
+    simd:         manifest.SimdMode;
     defines:      *intern.StrId;
     define_count: u32;
     cascade_libs:      *intern.StrId;
@@ -1396,6 +1400,7 @@ fun init_project(p: *Project, s: *session.Session) {
     p.config.emit_ir      = false;
     p.config.emit_asm     = false;
     p.config.debug        = false;
+    p.config.simd         = manifest.SIMD_SCALARIZE;
     p.config.defines       = nil;
     p.config.define_count  = 0;
     p.config.cascade_libs      = nil;
@@ -1601,6 +1606,7 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
     p.config.emit_ir      = bu.emit_ir;
     p.config.emit_asm     = bu.emit_asm;
     p.config.debug        = bu.debug;
+    p.config.simd         = bu.simd;
     p.config.defines       = bu.defines;
     p.config.define_count  = bu.define_count;
     p.target_entry        = ?p.config.targets[0];
@@ -5036,7 +5042,7 @@ fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[
 
     # optimize in place: the cached artifact is the post-pipeline IR the object is
     # built from, so an unchanged optimized module reuses its codegen output.
-    val res_opt: R.Result[bool, str] = pipeline.run(?irmod, ?p.target, p.opt_level, p.verify_ir);
+    val res_opt: R.Result[bool, str] = pipeline.run(?irmod, ?p.target, p.opt_level, p.verify_ir, p.s.simd == manifest.SIMD_REQUIRE, ?p.s.interner);
     if (R.is_err[bool, str](res_opt)) {
         ir.dnit(?irmod);
         ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](res_opt));
@@ -5999,7 +6005,7 @@ fun ut_lib_manifest(alloc: *A.Allocator, id: str) str {
 
 # a bin root manifest declaring the single path dep [dep.<alias>] at `path`.
 fun ut_dep_root_one(alloc: *A.Allocator, alias: str, path: str) str {
-    val head: str = "[project]\nid = \"app\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[profile.debug]\nopt = 0\ndebug = false\n\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n\n[dep.";
+    val head: str = "[project]\nid = \"app\"\nversion = \"0.0.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n\n[target.linux]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n\n[artifact.app]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/app\"\ntargets = [\"*\"]\nlink = []\nneed = []\n\n[dep.";
     val mid: str = ut_cc3(alloc, head, alias, "]\npath = \"");
     ret ut_cc3(alloc, mid, path, "\"\n");
 }
@@ -6327,6 +6333,461 @@ fun ut_count_errors(d: *diagnostic.DiagList) u32 {
         i = i + 1;
     }
     ret c;
+}
+
+# whether any error-severity diagnostic's message contains `needle`
+fun ut_diag_has(d: *diagnostic.DiagList, needle: str) bool {
+    var i: usize = 0;
+    for (i < d.len) {
+        if (d.items[i].severity == diagnostic.SEVERITY_ERROR
+            && ut_str_contains(d.items[i].message, needle)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# build a one-file project from `src` (as main.mach), run resolve + sema, and
+# return the project so a test can inspect p.s.diags. the caller tears down the
+# project and session
+fun ut_vec_sema(s: *session.Session, alloc: *A.Allocator, src: str) R.Result[Project, str] {
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = src;
+    val pr: R.Result[Project, str] = ut_build(s, alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[Project, str](pr)) { ret pr; }
+    var p: Project = R.unwrap_ok[Project, str](pr);
+    val se: R.Result[bool, str] = run_sema_pass(?p);
+    if (R.is_err[bool, str](se)) { dnit_project(?p); ret R.err[Project, str](R.unwrap_err[bool, str](se)); }
+    ret R.ok[Project, str](p);
+}
+
+# 0 when compiling `src` through sema leaves an error diagnostic containing
+# `needle`, 1 otherwise. a self-contained session per call, torn down here
+fun ut_vec_diag(src: str, needle: str) i32 {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    val pr: R.Result[Project, str] = ut_vec_sema(?s, ?alloc, src);
+    if (R.is_err[Project, str](pr)) { session.dnit(?s); ret 1; }
+    var p: Project = R.unwrap_ok[Project, str](pr);
+    val hit: bool = ut_diag_has(?p.s.diags, needle);
+    dnit_project(?p);
+    session.dnit(?s);
+    if (hit) { ret 0; }
+    ret 1;
+}
+
+# 0 when compiling `src` through sema + lower + codegen reaches a DEFINED
+# outcome -- either a clean compile, or a codegen error containing `needle` (the
+# per-target isel guard). 1 on any other result: a codegen error carrying a
+# different message, or a failure before codegen. this is the durable never-ICE
+# invariant a vector op reaching selection must satisfy -- it holds on every arch
+# and at every stage of the backend guard-lift, so it stays a permanent selection
+# ICE canary rather than dissolving once a backend wires selection (#2013 slice 7)
+fun ut_vec_codegen_defined(src: str, needle: str) i32 {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = src;
+    val pr: R.Result[Project, str] = ut_build(?s, ?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[Project, str](pr)) { session.dnit(?s); ret 1; }
+    var p: Project = R.unwrap_ok[Project, str](pr);
+
+    var code: i32 = 1;
+    val se: R.Result[bool, str] = run_sema_pass(?p);
+    if (R.is_ok[bool, str](se)) {
+        val le: R.Result[bool, str] = run_lower_pass(?p);
+        if (R.is_ok[bool, str](le)) {
+            val ce: R.Result[bool, str] = run_codegen_pass(?p);
+            if (R.is_ok[bool, str](ce)) { code = 0; }
+            or (ut_str_contains(R.unwrap_err[bool, str](ce), needle)) { code = 0; }
+        }
+    }
+    dnit_project(?p);
+    session.dnit(?s);
+    ret code;
+}
+
+# a vector op reaching instruction selection always resolves to DEFINED behavior
+# -- never an ICE, never a silent miscompile. driving real vector ops (a pointer
+# lane-wise add and a full-arity literal) through the HOST backend on each CI
+# runner, the outcome is either a clean compile or the defined per-target guard
+# error. that invariant holds at every stage of the backend guard-lift -- before
+# a backend wires selection it is the guard error, after it is a clean compile --
+# so this stays a permanent selection ICE canary rather than a test that dissolves
+# the moment an arch lands its backend (#2013 slice 7)
+test "mach.lang.driver:vector_isel_defined" {
+    var bad: i32 = 0;
+    # a lane-wise add through pointers (no literal): the add lowers to a vector op.
+    if (ut_vec_codegen_defined("fun addv(a: *f32x4, b: *f32x4, out: *f32x4) { @out = @a + @b; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { addv(argv:~*f32x4, argv:~*f32x4, argv:~*f32x4); ret 0; }\n",
+        "128-bit vectors not yet supported") != 0) { bad = 1; }
+    # a full-arity literal: it lowers to an IRT_VECTOR value driven through selection.
+    if (ut_vec_codegen_defined("fun mk(out: *f32x4) { @out = f32x4{1.0, 2.0, 3.0, 4.0}; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { mk(argv:~*f32x4); ret 0; }\n",
+        "128-bit vectors not yet supported") != 0) { bad = 1; }
+    ret bad;
+}
+
+# scaffold one-file `src`, select `target_name` from the fixture manifest, and run
+# resolve + sema + lower so each module's `ir_module` carries its post-lower IR (a
+# capable target keeps vector ops; an incapable one has them scalarized, since
+# pipeline.run's scalarize stage is part of Q_LOWER). the session is the caller's
+# to tear down; the temp tree is removed once the graph is in memory
+fun ut_vec_lower(s: *session.Session, alloc: *A.Allocator, src: str, target_name: str) R.Result[Project, str] {
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = src;
+    val root_r: R.Result[str, str] = ut_scaffold(alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { ret R.err[Project, str](R.unwrap_err[str, str](root_r)); }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val rr: R.Result[bool, str] = setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { filesystem.remove_all(alloc, root); ret R.err[Project, str](R.unwrap_err[bool, str](rr)); }
+    val mf: str = ut_cc3(alloc, root, "/", "mach.toml");
+    val pr: R.Result[Project, str] = build_project(s, root, mf, target_name);
+    filesystem.remove_all(alloc, root);
+    if (R.is_err[Project, str](pr)) { ret pr; }
+    var p: Project = R.unwrap_ok[Project, str](pr);
+    val se: R.Result[bool, str] = run_sema_pass(?p);
+    if (R.is_err[bool, str](se)) { dnit_project(?p); ret R.err[Project, str](R.unwrap_err[bool, str](se)); }
+    val le: R.Result[bool, str] = run_lower_pass(?p);
+    if (R.is_err[bool, str](le)) { dnit_project(?p); ret R.err[Project, str](R.unwrap_err[bool, str](le)); }
+    ret R.ok[Project, str](p);
+}
+
+# tally the gep instructions across `p`'s lowered modules: `@total` counts every
+# gep, `@into_vec` counts those whose base aggregate type (`aux_ty`) is a vector.
+# #2013 lowered a lane `v[i]` to a gep INTO the register-class IRT_VECTOR type --
+# rejected by aarch64, tolerated by x86_64 only through a numeric-offset accident;
+# the fix routes lane access through an array-of-lanes shape so `@into_vec` is 0
+fun ut_count_geps_into_vector(p: *Project, total: *u32, into_vec: *u32) {
+    @total    = 0;
+    @into_vec = 0;
+    var ti: u32 = 0;
+    for (ti < p.topo_len) {
+        val m: *ir.Module = p.modules[p.topo[ti]::u32].ir_module;
+        if (m != nil) {
+            var fi: u32 = 0;
+            for (fi < m.function_len) {
+                val fn: *ir.Function = ?m.functions[fi];
+                var bi: u32 = 0;
+                for (bi < fn.block_count) {
+                    val blk: *ir.Block = ?fn.blocks[bi];
+                    var ix: u32 = 0;
+                    for (ix < blk.instr_count) {
+                        val ins: *instruction.Instruction = ?fn.instrs[blk.instructions[ix]];
+                        if (ins.kind == instruction.OP_GEP) {
+                            @total = @total + 1;
+                            if (ir_type.is_vector(?m.types, ins.aux_ty)) { @into_vec = @into_vec + 1; }
+                        }
+                        ix = ix + 1;
+                    }
+                    bi = bi + 1;
+                }
+                fi = fi + 1;
+            }
+        }
+        ti = ti + 1;
+    }
+}
+
+# true when `p`'s lowered modules hold a vector `==` compare whose two operands
+# read back as vectors with the given lane kind and element width. a compare
+# records its OPERAND shape, not its unsigned-mask result shape - the substrate a
+# capable backend reads to pick the compare's lane width. only present on a
+# capable target, where the vector compare survives lowering
+fun ut_has_vec_compare_operands(p: *Project, want_float: bool, want_bytes: u8) bool {
+    var ti: u32 = 0;
+    for (ti < p.topo_len) {
+        val m: *ir.Module = p.modules[p.topo[ti]::u32].ir_module;
+        if (m != nil) {
+            var fi: u32 = 0;
+            for (fi < m.function_len) {
+                val fn: *ir.Function = ?m.functions[fi];
+                var bi: u32 = 0;
+                for (bi < fn.block_count) {
+                    val blk: *ir.Block = ?fn.blocks[bi];
+                    var ix: u32 = 0;
+                    for (ix < blk.instr_count) {
+                        val ins: *instruction.Instruction = ?fn.instrs[blk.instructions[ix]];
+                        if (ins.kind == instruction.OP_CMP_EQ && ins.operand_count >= 2) {
+                            var f0: bool = false;
+                            var b0: u8   = 0;
+                            var f1: bool = false;
+                            var b1: u8   = 0;
+                            if (ir_type.vector_lane(?m.types, ins.operands[0].ty, ?f0, ?b0)
+                                && ir_type.vector_lane(?m.types, ins.operands[1].ty, ?f1, ?b1)
+                                && f0 == want_float && b0 == want_bytes
+                                && f1 == want_float && b1 == want_bytes) { ret true; }
+                        }
+                        ix = ix + 1;
+                    }
+                    bi = bi + 1;
+                }
+                fi = fi + 1;
+            }
+        }
+        ti = ti + 1;
+    }
+    ret false;
+}
+
+# a vector lane `v[i]` read and write lower to a slot round-trip -- a gep through
+# the vector's array-of-lanes storage, never a gep INTO the register-class
+# IRT_VECTOR type -- identically on all three targets' pipelines. x86_64/aarch64
+# keep the vector and riscv64 scalarizes it, yet the lane geps are array-shaped on
+# every one; the regression guard for the #2013 substrate bug aarch64 rejected and
+# x86_64 only tolerated through a numeric-offset accident (#1965)
+test "mach.lang.driver:vector_lane_access_round_trip" {
+    val src: str = "fun lane_rw(p: *i32x4, out: *i32) {\n    @out = (@p)[2];\n    (@p)[0] = 7;\n}\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { lane_rw(argv:~*i32x4, argv:~*i32); ret 0; }\n";
+    var targets: [3]str;
+    targets[0] = "linux";
+    targets[1] = "linux-arm64";
+    targets[2] = "linux-riscv64";
+    var bad: i32 = 0;
+    var t: u32 = 0;
+    for (t < 3) {
+        var alloc: A.Allocator;
+        if (O.is_some[str](page.make(?alloc))) { ret 1; }
+        val sr: R.Result[session.Session, str] = session.init(?alloc);
+        if (R.is_err[session.Session, str](sr)) { ret 1; }
+        var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+        val pr: R.Result[Project, str] = ut_vec_lower(?s, ?alloc, src, targets[t]);
+        if (R.is_err[Project, str](pr)) { session.dnit(?s); ret 1; }
+        var p: Project = R.unwrap_ok[Project, str](pr);
+        var total:    u32 = 0;
+        var into_vec: u32 = 0;
+        ut_count_geps_into_vector(?p, ?total, ?into_vec);
+        # the lane access must materialize as a gep (base is a pointer param, so it
+        # survives optimization) and none may index into a vector.
+        if (total == 0)     { bad = 1; }
+        if (into_vec != 0)  { bad = 1; }
+        dnit_project(?p);
+        session.dnit(?s);
+        t = t + 1;
+    }
+    ret bad;
+}
+
+# a vector `==` compare records its OPERAND lane shape (float, 4-byte for f32x4),
+# not its unsigned-mask result shape, on both capable targets' pipelines
+# (x86_64/aarch64), where the vector compare survives lowering. guards the failure
+# mode where the operand shape is lost so a backend collapses every lane width to
+# bytes (riscv64 scalarizes the compare away, so it is excluded) (#1965)
+test "mach.lang.driver:vector_compare_operand_shape" {
+    val src: str = "fun vcmp(a: *f32x4, b: *f32x4, out: *u32x4) { @out = @a == @b; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { vcmp(argv:~*f32x4, argv:~*f32x4, argv:~*u32x4); ret 0; }\n";
+    var targets: [2]str;
+    targets[0] = "linux";
+    targets[1] = "linux-arm64";
+    var bad: i32 = 0;
+    var t: u32 = 0;
+    for (t < 2) {
+        var alloc: A.Allocator;
+        if (O.is_some[str](page.make(?alloc))) { ret 1; }
+        val sr: R.Result[session.Session, str] = session.init(?alloc);
+        if (R.is_err[session.Session, str](sr)) { ret 1; }
+        var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+        val pr: R.Result[Project, str] = ut_vec_lower(?s, ?alloc, src, targets[t]);
+        if (R.is_err[Project, str](pr)) { session.dnit(?s); ret 1; }
+        var p: Project = R.unwrap_ok[Project, str](pr);
+        if (!ut_has_vec_compare_operands(?p, true, 4)) { bad = 1; }
+        dnit_project(?p);
+        session.dnit(?s);
+        t = t + 1;
+    }
+    ret bad;
+}
+
+# 0 iff `p`'s lowered modules default-initialize a vector local the aggregate way:
+# at least one memzero is present and none memzeroes a vector type (its storage is
+# the `[lanes]elem` array), no gep indexes into a vector, and no VAL_CONST_INT
+# carries a vector type -- the scalar `zero_const` bug an uninitialized vector
+# local used to hit (#2043). 1 otherwise
+fun ut_vector_local_wellformed(p: *Project) i32 {
+    var seen_memzero: bool = false;
+    var bad:          bool = false;
+    var ti: u32 = 0;
+    for (ti < p.topo_len) {
+        val m: *ir.Module = p.modules[p.topo[ti]::u32].ir_module;
+        if (m != nil) {
+            var fi: u32 = 0;
+            for (fi < m.function_len) {
+                val fn: *ir.Function = ?m.functions[fi];
+                var bi: u32 = 0;
+                for (bi < fn.block_count) {
+                    val blk: *ir.Block = ?fn.blocks[bi];
+                    var ix: u32 = 0;
+                    for (ix < blk.instr_count) {
+                        val ins: *instruction.Instruction = ?fn.instrs[blk.instructions[ix]];
+                        if (ins.kind == instruction.OP_MEMZERO) {
+                            seen_memzero = true;
+                            if (ir_type.is_vector(?m.types, ins.aux_ty)) { bad = true; }
+                        }
+                        if (ins.kind == instruction.OP_GEP && ir_type.is_vector(?m.types, ins.aux_ty)) { bad = true; }
+                        var oi: u32 = 0;
+                        for (oi < ins.operand_count) {
+                            if (ins.operands[oi].kind == value.VAL_CONST_INT
+                                && ir_type.is_vector(?m.types, ins.operands[oi].ty)) { bad = true; }
+                            oi = oi + 1;
+                        }
+                        ix = ix + 1;
+                    }
+                    bi = bi + 1;
+                }
+                fi = fi + 1;
+            }
+        }
+        ti = ti + 1;
+    }
+    if (bad)          { ret 1; }
+    if (!seen_memzero) { ret 1; }
+    ret 0;
+}
+
+# an uninitialized vector local default-initializes to all-zero lanes through the
+# aggregate memzero over its array-shaped storage, on all three targets' pipelines
+# -- never the scalar zero_const that produced a vector-typed constant the verifier
+# rejected (#2043). the program reads a lane no write touched, so the memzero must
+# stay live; it holds no vector operator, so it lowers clean on every target
+test "mach.lang.driver:vector_local_default_init" {
+    val src: str = "fun f(o: *i32) { var v: i32x4; @o = v[2]; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { f(argv:~*i32); ret 0; }\n";
+    var targets: [3]str;
+    targets[0] = "linux";
+    targets[1] = "linux-arm64";
+    targets[2] = "linux-riscv64";
+    var bad: i32 = 0;
+    var t: u32 = 0;
+    for (t < 3) {
+        var alloc: A.Allocator;
+        if (O.is_some[str](page.make(?alloc))) { ret 1; }
+        val sr: R.Result[session.Session, str] = session.init(?alloc);
+        if (R.is_err[session.Session, str](sr)) { ret 1; }
+        var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+        val pr: R.Result[Project, str] = ut_vec_lower(?s, ?alloc, src, targets[t]);
+        # lowering must succeed at all -- the pre-fix path failed the IR verifier.
+        if (R.is_err[Project, str](pr)) { session.dnit(?s); ret 1; }
+        var p: Project = R.unwrap_ok[Project, str](pr);
+        if (ut_vector_local_wellformed(?p) != 0) { bad = 1; }
+        dnit_project(?p);
+        session.dnit(?s);
+        t = t + 1;
+    }
+    ret bad;
+}
+
+# a vector `==` compare records its i32x4 operand shape (non-float, 4-byte) when
+# the operands arrive through STORAGE and PARAM paths, not just literal temporaries
+# -- a mutable local `var a=...; a==b` and a by-value param `fun eqv(a,b){ret a==b}`
+# -- on both capable targets (x86_64/aarch64), where the compare survives lowering.
+# these are the shapes a backend's lane-width selection depends on (#1965/#2043)
+test "mach.lang.driver:vector_compare_operands_via_storage" {
+    var srcs: [2]str;
+    srcs[0] = "fun mlcmp(out: *u32x4) { var a: i32x4 = i32x4{1, 2, 3, 4}; var b: i32x4 = i32x4{1, 2, 3, 4}; @out = a == b; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { mlcmp(argv:~*u32x4); ret 0; }\n";
+    srcs[1] = "fun eqv(a: i32x4, b: i32x4) u32x4 { ret a == b; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { val a: i32x4 = i32x4{1, 2, 3, 4}; val b: i32x4 = i32x4{1, 2, 3, 4}; val m: u32x4 = eqv(a, b); ret 0; }\n";
+    var targets: [2]str;
+    targets[0] = "linux";
+    targets[1] = "linux-arm64";
+    var bad: i32 = 0;
+    var si: u32 = 0;
+    for (si < 2) {
+        var t: u32 = 0;
+        for (t < 2) {
+            var alloc: A.Allocator;
+            if (O.is_some[str](page.make(?alloc))) { ret 1; }
+            val sr: R.Result[session.Session, str] = session.init(?alloc);
+            if (R.is_err[session.Session, str](sr)) { ret 1; }
+            var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+            val pr: R.Result[Project, str] = ut_vec_lower(?s, ?alloc, srcs[si], targets[t]);
+            if (R.is_err[Project, str](pr)) { session.dnit(?s); ret 1; }
+            var p: Project = R.unwrap_ok[Project, str](pr);
+            if (!ut_has_vec_compare_operands(?p, false, 4)) { bad = 1; }
+            dnit_project(?p);
+            session.dnit(?s);
+            t = t + 1;
+        }
+        si = si + 1;
+    }
+    ret bad;
+}
+
+# a well-typed program exercising the full vector surface -- spellings in type
+# position, a full-arity literal, lane-wise arithmetic / bitwise / compare to
+# mask, 16-bit integer multiply, unary ~, and a comptime-constant lane read --
+# passes sema with no errors (#2013)
+test "mach.lang.driver:vector_surface_typechecks" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val src: str = "fun main() i32 {\n    val a: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0};\n    val b: f32x4 = f32x4{5.0, 6.0, 7.0, 8.0};\n    val c: f32x4 = a + b;\n    val d: f32x4 = a * b;\n    val m: u32x4 = a == b;\n    val x: f32 = a[0];\n    var iv: i16x8 = i16x8{1, 2, 3, 4, 5, 6, 7, 8};\n    val iw: i16x8 = iv & iv;\n    val ip: i16x8 = iv * iv;\n    val iq: i16x8 = ~iv;\n    val im: u16x8 = iv == iv;\n    ret 0;\n}\n";
+    val pr: R.Result[Project, str] = ut_vec_sema(?s, ?alloc, src);
+    if (R.is_err[Project, str](pr)) { session.dnit(?s); ret 1; }
+    var p: Project = R.unwrap_ok[Project, str](pr);
+
+    var bad: i32 = 0;
+    if (ut_count_errors(?p.s.diags) != 0) { bad = 1; }
+
+    dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# every vector negative diagnostic from the acceptance list lands as a specific
+# error, never an ICE or a silent accept (#2013)
+test "mach.lang.driver:vector_negative_diagnostics" {
+    var bad: i32 = 0;
+
+    # wrong-arity literal
+    if (ut_vec_diag("fun main() i32 { val v: f32x4 = f32x4{1.0, 2.0, 3.0}; ret 0; }\n",
+        "too few elements") != 0) { bad = 1; }
+    if (ut_vec_diag("fun main() i32 { val v: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0, 5.0}; ret 0; }\n",
+        "too many elements") != 0) { bad = 1; }
+    # non-comptime lane index (dynamic)
+    if (ut_vec_diag("fun main(argc: i64, argv: **u8) i32 { val a: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0}; val x: f32 = a[argc]; ret 0; }\n",
+        "dynamic lane index not supported") != 0) { bad = 1; }
+    # out-of-bounds constant lane index
+    if (ut_vec_diag("fun main() i32 { val a: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0}; val x: f32 = a[4]; ret 0; }\n",
+        "vector lane index out of bounds") != 0) { bad = 1; }
+    # vector %
+    if (ut_vec_diag("fun main() i32 { val a: i32x4 = i32x4{1, 2, 3, 4}; val b: i32x4 = i32x4{1, 2, 3, 4}; val c: i32x4 = a % b; ret 0; }\n",
+        "vector `%` is not supported") != 0) { bad = 1; }
+    # integer vector /
+    if (ut_vec_diag("fun main() i32 { val a: i32x4 = i32x4{1, 2, 3, 4}; val b: i32x4 = i32x4{1, 2, 3, 4}; val c: i32x4 = a / b; ret 0; }\n",
+        "integer vector `/` is not supported") != 0) { bad = 1; }
+    # scalar <-> vector mixing
+    if (ut_vec_diag("fun main() i32 { val a: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0}; val s: f32 = 1.0; val c: f32x4 = a + s; ret 0; }\n",
+        "mismatch") != 0) { bad = 1; }
+    # a vector (mask) used where a scalar truth value is required
+    if (ut_vec_diag("fun main() i32 { val a: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0}; val b: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0}; if (a == b) { ret 1; } ret 0; }\n",
+        "vector is not a truth value") != 0) { bad = 1; }
+    # a positional-brace literal on a non-vector type (record) is a specific error.
+    if (ut_vec_diag("rec Point { x: i64; y: i64; }\nfun main() i32 { val p: Point = Point{1, 2}; ret 0; }\n",
+        "positional-brace literal requires a vector type") != 0) { bad = 1; }
+    # a negative constant lane index.
+    if (ut_vec_diag("fun main() i32 { val a: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0}; val x: f32 = a[-1]; ret 0; }\n",
+        "index must be non-negative") != 0) { bad = 1; }
+    # scalar<->vector mixing in the reversed operand order (scalar on the left).
+    if (ut_vec_diag("fun main() i32 { val a: f32x4 = f32x4{1.0, 2.0, 3.0, 4.0}; val s: f32 = 1.0; val c: f32x4 = s + a; ret 0; }\n",
+        "mismatch") != 0) { bad = 1; }
+    # vector `<<` / `>>` are out of the increment-1 table (#2030), across shapes.
+    if (ut_vec_diag("fun main() i32 { val a: i32x4 = i32x4{1, 2, 3, 4}; val b: i32x4 = i32x4{1, 1, 1, 1}; val c: i32x4 = a << b; ret 0; }\n",
+        "vector shift") != 0) { bad = 1; }
+    if (ut_vec_diag("fun main() i32 { val a: u16x8 = u16x8{1, 2, 3, 4, 5, 6, 7, 8}; val b: u16x8 = u16x8{1, 1, 1, 1, 1, 1, 1, 1}; val c: u16x8 = a >> b; ret 0; }\n",
+        "not in the increment-1 operator table") != 0) { bad = 1; }
+    if (ut_vec_diag("fun main() i32 { val a: i8x16 = i8x16{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; val b: i8x16 = i8x16{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}; val c: i8x16 = a << b; ret 0; }\n",
+        "vector shift") != 0) { bad = 1; }
+
+    ret bad;
 }
 
 # a two-char decimal string ("00".."99") for n < 100, owned by `alloc`.

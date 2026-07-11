@@ -48,6 +48,7 @@ use instr:   mach.lang.me.ir.instruction;
 use ir_type: mach.lang.me.ir.type;
 use value:   mach.lang.me.ir.value;
 use source:  mach.lang.source;
+use isa:     mach.lang.target.isa;
 use target:  mach.lang.target.resolved;
 
 # lower an IR module to a parallel MIR module, one MIR function per IR function
@@ -152,6 +153,7 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, interne
     ctx.sret_vreg      = mir.MIR_VREG_NIL;
     ctx.cur_loc        = source.loc_nil();
     ctx.cur_inline_site = 0;
+    ctx.cur_vec_lane   = mir.VEC_LANE_NONE;
     ctx.pending        = nil;
     ctx.pending_count  = 0;
     ctx.pending_cap    = 0;
@@ -613,6 +615,10 @@ fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mi
     mi.inline_site       = ctx.cur_inline_site;
     mi.dbg_bindings      = nil;
     mi.dbg_binding_count = 0;
+    # a phi-elimination move is a full-width register copy, lane-agnostic even for a
+    # vector phi, so it carries no lane descriptor (and struct locals are not
+    # zero-initialized, so it is set explicitly like the other push_instr invariants).
+    mi.vec_lane          = mir.VEC_LANE_NONE;
 
     # grow by one, shift the terminator right, and drop the move into its place.
     val gr: R.Result[bool, str] = lctx.grow_instr(ctx, mb);
@@ -829,6 +835,33 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     # and its inline instance, so lowered instructions carry which inlined expansion
     # they came from (0 for the function's own body).
     ctx.cur_inline_site = ir.instr_inline_site_of(fn, iid);
+    # and its 128-bit vector lane shape, so a backend selector reads the element kind
+    # + width off each lowered MirInstr. VEC_LANE_NONE for every non-vector op, so
+    # this is inert until a backend lifts its vector guard below.
+    ctx.cur_vec_lane = lctx.compute_vec_lane(ctx, inst);
+
+    # a 128-bit vector reaching MIR lowering needs backend selection (#1965): a
+    # target whose backend wires it (aarch64 NEON, x86_64 SSE2, rv64 scalarization)
+    # lets it through to real lowering; a target without selection yet gets a defined
+    # per-target compile error, never an ICE or the silent 8-byte GP clamp
+    # `op_width_of` would otherwise apply. phis are eliminated and dbg-values emit no
+    # code, so neither is the erroring site.
+    if (inst.kind != instr.OP_PHI && inst.kind != instr.OP_DBG_VALUE
+        && instr_touches_vector(ctx, inst)) {
+        if (!arch_selects_vectors(ctx.tgt.arch.id)) {
+            ret R.err[bool, str](vector_unsupported(ctx));
+        }
+        # x86_64: a lane-wise compute op (arithmetic / bitwise / unary not / compare-to-
+        # mask) rides the generic MIR opcodes carrying `vec_lane` directly, bypassing the
+        # scalar-specific float / divide / shift routing below (a vector float divide must
+        # not reach the integer `lower_div`); the x64 isel / encoder select the packed
+        # SSE2 form. load / store / move / call / ret / gep / alloca fall through to the
+        # shared handlers carrying the 16-byte width the vreg's `vector` flag set. aarch64
+        # (NEON) selects in its isa isel and falls through here for every vector op.
+        if (ctx.tgt.arch.id == isa.ARCH_X86_64 && is_vector_compute(inst.kind)) {
+            ret lower_generic(ctx, mb, inst, iid);
+        }
+    }
 
     if (inst.kind == instr.OP_CALL) {
         ret mabi.lower_call(ctx, mb, inst, iid);
@@ -924,6 +957,64 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     }
 
     ret lower_generic(ctx, mb, inst, iid);
+}
+
+# whether an instruction's result or any operand is a 128-bit vector (#1965)
+# ---
+# ctx:  the lowering context
+# inst: the instruction to inspect
+# ret:  true when a vector-typed value flows through the instruction
+fun instr_touches_vector(ctx: *lctx.LowerCtx, inst: *instr.Instruction) bool {
+    if (lctx.value_is_vector(ctx, inst.ty)) { ret true; }
+    var i: u32 = 0;
+    for (i < inst.operand_count) {
+        if (lctx.value_is_vector(ctx, inst.operands[i].ty)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether the target arch's backend selects 128-bit vector ops to real machine
+# code, so a vector-typed instruction lowers rather than hitting the defined
+# "not yet supported" guard. each backend child flips its arch true as it wires
+# selection: aarch64 (NEON) and x86_64 (#2014 SSE2). riscv64 needs no arm - its
+# scalarization pass rewrites vector ops before MIR lowering, so none reaches here.
+fun arch_selects_vectors(arch_id: u32) bool {
+    if (arch_id == isa.ARCH_AARCH64) { ret true; }
+    if (arch_id == isa.ARCH_X86_64) { ret true; }
+    ret false;
+}
+
+# the defined per-target "vectors not yet supported" error, naming the arch
+#
+# Interns the assembled message so it outlives the scratch buffer; degrades to a
+# static target-neutral message on an allocation failure.
+# ---
+# ctx: the lowering context (supplies the target arch name and interner)
+# ret: the owned error message
+fun vector_unsupported(ctx: *lctx.LowerCtx) str {
+    val prefix:   str = "codegen: 128-bit vectors not yet supported on ";
+    val fallback: str = "codegen: 128-bit vectors not yet supported on this target";
+    val arch:     str = ctx.tgt.arch.name;
+    if (arch == nil) { ret fallback; }
+
+    val total: usize = str_len(prefix) + str_len(arch);
+    val r: R.Result[*u8, str] = A.allocate[u8](ctx.alloc, total + 1);
+    if (R.is_err[*u8, str](r)) { ret fallback; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](r);
+    var k: usize = 0;
+    var j: usize = 0;
+    for (j < str_len(prefix)) { buf[k] = prefix[j]; k = k + 1; j = j + 1; }
+    j = 0;
+    for (j < str_len(arch)) { buf[k] = arch[j]; k = k + 1; j = j + 1; }
+    buf[total] = 0;
+
+    val ir_id: R.Result[intern.StrId, str] = intern.intern(ctx.interner, buf::str);
+    A.deallocate[u8](ctx.alloc, buf, total + 1);
+    if (R.is_err[intern.StrId, str](ir_id)) { ret fallback; }
+    val rn: O.Option[str] = intern.lookup(ctx.interner, R.unwrap_ok[intern.StrId, str](ir_id));
+    if (O.is_some[str](rn)) { ret O.unwrap[str](rn); }
+    ret fallback;
 }
 
 # lower an IR OP_CBR into a `mir.MIR_CBR [cond, then, else]`
@@ -1550,6 +1641,25 @@ fun is_compare_kind(k: instr.InstrKind) bool {
     ret k == instr.OP_CMP_EQ || k == instr.OP_CMP_NE ||
         k == instr.OP_CMP_LT_S || k == instr.OP_CMP_LT_U ||
         k == instr.OP_CMP_LE_S || k == instr.OP_CMP_LE_U;
+}
+
+# true for a lane-wise vector compute op that the x86_64 arm routes generically
+# rather than one of the memory / call / return ops that keep their dedicated handler.
+# a vector value flows to the generic lowering as its shared opcode carrying `vec_lane`;
+# the x64 isel / encoder select the packed SSE2 form from that descriptor (#2014). shifts
+# are rejected at sema (#2030) so none reach here, but routing them generically keeps the
+# isel loud backstop the single place a stray vector shift errors.
+# ---
+# k:   the IR instruction opcode
+# ret: true for a lane-wise compute op
+fun is_vector_compute(k: instr.InstrKind) bool {
+    if (k == instr.OP_ADD || k == instr.OP_SUB || k == instr.OP_MUL) { ret true; }
+    if (k == instr.OP_DIV_S || k == instr.OP_DIV_U ||
+        k == instr.OP_REM_S || k == instr.OP_REM_U) { ret true; }
+    if (k == instr.OP_AND || k == instr.OP_OR || k == instr.OP_XOR || k == instr.OP_NOT) { ret true; }
+    if (k == instr.OP_SHL || k == instr.OP_SHR_S || k == instr.OP_SHR_U) { ret true; }
+    if (is_compare_kind(k)) { ret true; }
+    ret false;
 }
 
 # true for the width-changing integer conversions (TRUNC / SEXT / ZEXT)

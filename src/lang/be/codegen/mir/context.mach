@@ -19,6 +19,8 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 
+use std.allocator.page;
+
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
@@ -95,6 +97,13 @@ pub rec LowerCtx {
     # lowering loop alongside cur_loc; 0 outside one.
     cur_inline_site: u32;
 
+    # the 128-bit vector lane descriptor of the IR instruction currently being
+    # lowered (#1965), stamped onto every MirInstr `push_instr` appends so a backend
+    # selector can read the lane element kind + width a vector op needs. set per IR
+    # instruction by the lowering loop alongside cur_loc; VEC_LANE_NONE (0) outside
+    # one and for every non-vector instruction, so non-vector code is unaffected.
+    cur_vec_lane: u8;
+
     # `-g`-only source-variable bindings awaiting attachment: an OP_DBG_VALUE records
     # its (iid, vreg) here, and the next `push_instr` attaches the whole list (in order)
     # to the instruction at whose PC the variables become live, then clears it. any
@@ -139,7 +148,7 @@ pub fun ctx_setup(ctx: *LowerCtx, tgt: *target.Target, fn: *ir.Function) R.Resul
     var i: u32 = 0;
     for (i < ctx.param_count) {
         val reg_class: u32 = reg_class_of(ctx, tgt, fn.params[i].ty);
-        val res_vreg: R.Result[u32, str] = new_vreg(ctx, reg_class);
+        val res_vreg: R.Result[u32, str] = new_vreg_vec(ctx, reg_class, value_is_vector(ctx, fn.params[i].ty));
         if (R.is_err[u32, str](res_vreg)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_vreg)); }
         ctx.param_vregs[i] = R.unwrap_ok[u32, str](res_vreg);
         i = i + 1;
@@ -154,7 +163,7 @@ pub fun ctx_setup(ctx: *LowerCtx, tgt: *target.Target, fn: *ir.Function) R.Resul
             # now carries the IR pointer type (its element type rides on aux_ty),
             # so it classifies general-purpose without a special case.
             val reg_class: u32 = reg_class_of(ctx, tgt, inst.ty);
-            val res_vreg: R.Result[u32, str] = new_vreg(ctx, reg_class);
+            val res_vreg: R.Result[u32, str] = new_vreg_vec(ctx, reg_class, value_is_vector(ctx, inst.ty));
             if (R.is_err[u32, str](res_vreg)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_vreg)); }
             ctx.instr_vregs[i] = R.unwrap_ok[u32, str](res_vreg);
         }
@@ -256,8 +265,23 @@ pub fun new_vreg(ctx: *LowerCtx, reg_class: u32) R.Result[u32, str] {
     f.vregs[vid].class      = reg_class;
     f.vregs[vid].spill_slot = -1;
     f.vregs[vid].assigned   = mir.MIR_VREG_NIL;
+    f.vregs[vid].vector     = false;
     f.vreg_count = f.vreg_count + 1;
     ret R.ok[u32, str](vid);
+}
+
+# append a fresh vreg that holds a 128-bit vector when `vector` is set, so regalloc
+# 16-byte-aligns its spill slot for MOVAPS reloads (#2014)
+# ---
+# ctx:       the lowering context
+# reg_class: register-class index into target.arch.reg_classes
+# vector:    whether the vreg holds a 128-bit SIMD vector
+# ret:       the new vreg id, or an allocation error
+pub fun new_vreg_vec(ctx: *LowerCtx, reg_class: u32, vector: bool) R.Result[u32, str] {
+    val r: R.Result[u32, str] = new_vreg(ctx, reg_class);
+    if (R.is_err[u32, str](r)) { ret r; }
+    ctx.f.vregs[R.unwrap_ok[u32, str](r)].vector = vector;
+    ret r;
 }
 
 # the result vreg mapped to an instruction id, or mir.MIR_VREG_NIL when the id is
@@ -304,6 +328,56 @@ pub fun value_is_float(ctx: *LowerCtx, ty: ir_type.IrTypeId) bool {
 # ret: true for an aggregate
 pub fun value_is_aggregate(ctx: *LowerCtx, ty: ir_type.IrTypeId) bool {
     ret ir_type.is_aggregate(ctx.types, ty);
+}
+
+# whether an IR value type is a 128-bit vector (#1965)
+#
+# The neutral classifier the psABI classify driver and the target-generic MIR
+# guard both consult; each backend owns only its own vector-class ABI branch.
+# ---
+# ctx: the lowering context
+# ty:  the IR value type to classify
+# ret: true for an IRT_VECTOR
+pub fun value_is_vector(ctx: *LowerCtx, ty: ir_type.IrTypeId) bool {
+    ret ir_type.is_vector(ctx.types, ty);
+}
+
+# the vec_lane MIR descriptor for an IR value type (#1965)
+#
+# VEC_LANE_NONE for a non-vector; otherwise the lane element kind (float vs
+# integer) and byte-width packed for the backend selectors. Signedness is not part
+# of the shape - it rides the consuming opcode.
+# ---
+# ctx: the lowering context
+# ty:  the IR value type
+# ret: the packed vec_lane descriptor
+pub fun vec_lane_for_type(ctx: *LowerCtx, ty: ir_type.IrTypeId) u8 {
+    var is_float:   bool = false;
+    var elem_bytes: u8   = 0;
+    if (!ir_type.vector_lane(ctx.types, ty, ?is_float, ?elem_bytes)) { ret mir.VEC_LANE_NONE; }
+    var kind: u8 = mir.VEC_LANE_INT;
+    if (is_float) { kind = mir.VEC_LANE_FLOAT; }
+    ret mir.vec_lane_make(kind, elem_bytes);
+}
+
+# the vec_lane descriptor for a whole IR instruction (#1965)
+#
+# The lane shape of its first vector-typed operand - a comparison's operand carries
+# the element kind/width its unsigned-mask result does not - falling back to a
+# vector result (a load or literal has no vector operand). VEC_LANE_NONE when
+# nothing vector-typed flows through, which is every non-vector instruction.
+# ---
+# ctx:  the lowering context
+# inst: the IR instruction being lowered
+# ret:  the packed vec_lane descriptor to stamp on its MIR instructions
+pub fun compute_vec_lane(ctx: *LowerCtx, inst: *instruction.Instruction) u8 {
+    var i: u32 = 0;
+    for (i < inst.operand_count) {
+        val d: u8 = vec_lane_for_type(ctx, inst.operands[i].ty);
+        if (mir.vec_lane_is_vector(d)) { ret d; }
+        i = i + 1;
+    }
+    ret vec_lane_for_type(ctx, inst.ty);
 }
 
 # the lowered function's IR return type, read from its function type (IRT_FN)
@@ -354,6 +428,9 @@ pub fun op_width_of(ctx: *LowerCtx, ty: ir_type.IrTypeId) u8 {
     if (sz == 1) { ret 1; }
     if (sz == 2) { ret 2; }
     if (sz == 4) { ret 4; }
+    # a 128-bit vector rides its full 16-byte width in a vector register, rather
+    # than clamping to the GP word width (#1965).
+    if (sz == 16 && value_is_vector(ctx, ty)) { ret 16; }
     ret ctx.tgt.model.gpr_width::u8;
 }
 
@@ -517,6 +594,10 @@ pub fun push_instr(ctx: *LowerCtx, mb: *mir.MirBlock, mi: mir.MirInstr) R.Result
     # the inline instance rides beside loc, stamped at the same chokepoint for the same
     # non-zero-init reason, so every lowered instruction carries its inlined-from origin.
     ni.inline_site = ctx.cur_inline_site;
+    # the vector lane descriptor rides beside loc for the same non-zero-init reason,
+    # so every lowered instruction carries the lane shape of the IR op it came from
+    # (VEC_LANE_NONE for non-vector code, leaving those instructions unaffected).
+    ni.vec_lane = ctx.cur_vec_lane;
     # the dbg-binding list defaults empty here for the same reason (callers build
     # instructions field-by-field and never set it); any pending -g binding then
     # attaches to this instruction, the next one after its OP_DBG_VALUE.
@@ -1011,7 +1092,8 @@ fun reg_class_of(ctx: *LowerCtx, tgt: *target.Target, ty: ir_type.IrTypeId) u32 
     val opt_type: O.Option[*ir_type.IrType] = ir_type.get(ctx.types, ty);
     if (O.is_some[*ir_type.IrType](opt_type)) {
         val t: *ir_type.IrType = O.unwrap[*ir_type.IrType](opt_type);
-        if (t.kind == ir_type.IRT_FLOAT) {
+        # a 128-bit vector shares the float/vector bank (#1965).
+        if (t.kind == ir_type.IRT_FLOAT || t.kind == ir_type.IRT_VECTOR) {
             ret fp_class_index(tgt);
         }
     }
@@ -1219,5 +1301,52 @@ test "mach.lang.be.codegen.mir.context.fp_class_index" {
     classes[1].bit_width = 128;
     if (fp_class_index(?tgt) != 1) { ret 1; }
 
+    ret 0;
+}
+
+# shared vector scaffolding (#1965): a 128-bit vector routes to the FP/vector bank
+# (like a float) and preserves its 16-byte operand width, while value_is_vector
+# distinguishes it from a scalar; a GP scalar keeps its own bank and width
+test "mach.lang.be.codegen.mir.context.vector_scaffolding" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var types: ir_type.IrTypeTable;
+    if (O.is_some[str](ir_type.init(?types, ?alloc))) { ret 1; }
+
+    var classes: [2]isa.RegClass;
+    classes[0].kind = isa.RC_GENERAL;
+    classes[1].kind = isa.RC_FLOAT;
+    classes[1].bit_width = 128;
+    var tgt: target.Target;
+    tgt.model.reg_classes   = ?classes[0];
+    tgt.model.reg_class_len = 2;
+    tgt.model.gpr_width     = 8;
+
+    var ctx: LowerCtx;
+    ctx.types = ?types;
+    ctx.tgt   = ?tgt;
+
+    # f32x4 IR vector and an i32 scalar.
+    val ef: R.Result[ir_type.IrTypeId, str] = ir_type.intern_float(?types, 32);
+    if (R.is_err[ir_type.IrTypeId, str](ef)) { ir_type.dnit(?types); ret 1; }
+    val vr: R.Result[ir_type.IrTypeId, str] = ir_type.intern_vector(?types, R.unwrap_ok[ir_type.IrTypeId, str](ef), 4);
+    if (R.is_err[ir_type.IrTypeId, str](vr)) { ir_type.dnit(?types); ret 1; }
+    val vecty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](vr);
+
+    val ir: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?types, 32);
+    if (R.is_err[ir_type.IrTypeId, str](ir)) { ir_type.dnit(?types); ret 1; }
+    val i32ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ir);
+
+    # a vector routes to the FP bank at its full 16-byte width; value_is_vector true.
+    if (reg_class_of(?ctx, ?tgt, vecty) != fp_class_index(?tgt)) { ir_type.dnit(?types); ret 1; }
+    if (op_width_of(?ctx, vecty) != 16)                          { ir_type.dnit(?types); ret 1; }
+    if (!value_is_vector(?ctx, vecty))                           { ir_type.dnit(?types); ret 1; }
+
+    # a GP scalar keeps the general bank, its own 4-byte width, and is not a vector.
+    if (reg_class_of(?ctx, ?tgt, i32ty) != gp_class_index(?tgt)) { ir_type.dnit(?types); ret 1; }
+    if (op_width_of(?ctx, i32ty) != 4)                           { ir_type.dnit(?types); ret 1; }
+    if (value_is_vector(?ctx, i32ty))                           { ir_type.dnit(?types); ret 1; }
+
+    ir_type.dnit(?types);
     ret 0;
 }

@@ -553,6 +553,7 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
     val ret_size:  u64  = type.byte_size(ctx.types, ret_type, ctx.tgt)::u64;
     val ret_float: bool = context.value_is_float(ctx, ret_type);
     val ret_aggr:  bool = context.value_is_aggregate(ctx, ret_type);
+    val ret_vec:   bool = context.value_is_vector(ctx, ret_type);
     val ret_eb:    u8   = aggregate_sse_mask(ctx, ret_type);
     var ret_hm:    u8   = 0;
     var ret_he:    u8   = 0;
@@ -562,7 +563,7 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
     val wants_agg: bool = ctx.tgt.abi.consumes_agg_layout;
     var ret_agg: abi.AggLayout = abi.agg_none();
     if (wants_agg) { ret_agg = agg_layout(ctx, ret_type, ret_aggr); }
-    out.ret_slot = classify_ret(ret_size, 0, ret_float, ret_eb, ret_aggr, ret_hm, ret_he, ret_agg);
+    out.ret_slot = classify_ret(ret_size, 0, ret_float, ret_eb, ret_aggr, ret_vec, ret_hm, ret_he, ret_agg);
 
     var gp_used:   i32 = 0;
     var fp_used:   i32 = 0;
@@ -618,7 +619,8 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
         hfa_info(ctx, pty, ?phm, ?phe);
         var pagg: abi.AggLayout = abi.agg_none();
         if (wants_agg) { pagg = agg_layout(ctx, pty, pag); }
-        var slot: abi.ParamSlot = classify_arg(i::i32, psz, pal, pfl, peb, pag, gp_used, fp_used, phm, phe, pagg);
+        val pvec: bool = context.value_is_vector(ctx, pty);
+        var slot: abi.ParamSlot = classify_arg(i::i32, psz, pal, pfl, peb, pag, pvec, gp_used, fp_used, phm, phe, pagg);
 
         # record the real outgoing stack offset on the slot (the ABI classifier
         # returns a sizing-only slot with offset 0); the param / call lowering
@@ -672,6 +674,30 @@ pub fun sig_layout_free(ctx: *context.LowerCtx, layout: *abi.SigLayout) {
     }
 }
 
+# the declared return type for a call: the callee signature's return type only when
+# it is a vector, otherwise the call instruction's own result type
+#
+# On a scalarized target a vector-returning call's `inst.ty` is a plain pointer (the
+# 16-byte result lives in memory), so the true vector return type must come from the
+# callee's IRT_FN to classify the sret correctly. Every non-vector call keeps
+# `fallback` (`inst.ty`) verbatim, so this is exactly inert on a capable target -- the
+# classification, and the emitted code, are byte-identical to before.
+# ---
+# ctx:      the active lowering context
+# sig:      the call's `aux_ty` (the callee IRT_FN, or an untyped pointer)
+# fallback: the call instruction's own result type
+# ret:      the return type to classify the call from
+fun call_ret_type(ctx: *context.LowerCtx, sig: type.IrTypeId, fallback: type.IrTypeId) type.IrTypeId {
+    val opt: O.Option[*type.IrType] = type.get(ctx.types, sig);
+    if (O.is_some[*type.IrType](opt)) {
+        val st: *type.IrType = O.unwrap[*type.IrType](opt);
+        if (st.kind == type.IRT_FN && context.value_is_vector(ctx, st.data.fn.ret_type)) {
+            ret st.data.fn.ret_type;
+        }
+    }
+    ret fallback;
+}
+
 # expand an OP_CALL into argument pre-coloring plus the call and result pseudos
 #
 # Classifies the callee's return value and each argument through the ABI vtable,
@@ -719,7 +745,13 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     # function pointer yields zero fixed params, so every argument falls back to
     # per-operand classification below.
     val sig: type.IrTypeId = inst.aux_ty;
-    val ret_type: type.IrTypeId = inst.ty;
+    # the declared return type comes from the callee signature when one is known,
+    # not `inst.ty`: on a scalarized target a vector-returning call's result type is
+    # rewritten to a plain pointer (its 16-byte result lives in memory), yet the
+    # return still classifies from the true vector type in the callee's IRT_FN. for a
+    # direct call the two agree; an indirect call through an untyped pointer has no
+    # IRT_FN and falls back to `inst.ty`.
+    val ret_type: type.IrTypeId = call_ret_type(ctx, sig, inst.ty);
     var layout: abi.SigLayout;
     val cls: R.Result[bool, str] = classify_signature(ctx, sig, ret_type, ?layout);
     if (R.is_err[bool, str](cls)) { ret cls; }
@@ -729,6 +761,9 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     # the call's result type sizes the caller-owned aggregate result storage.
     val ret_size:  u64 = type.byte_size(ctx.types, ret_type, ctx.tgt)::u64;
     val ret_aggr:  bool = context.value_is_aggregate(ctx, ret_type);
+    # a vector return is the memory (sret) class on a scalarized target: it arrives by
+    # address exactly like an aggregate, so it needs caller-owned result storage.
+    val ret_mem:   bool = ret_aggr || (context.value_is_vector(ctx, ret_type) && rslot.class == abi.CLASS_SRET);
 
     # the running register / stack cursors resume from the fixed-parameter walk so
     # a variadic call's tail arguments continue against the same counters.
@@ -742,7 +777,7 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     # move (>16B) passes it and the two-register form (9-16B) stores each half into
     # it; downstream consumers then read the aggregate result by this pointer.
     val res_dst: u32 = context.instr_vreg(ctx, iid);
-    if (ret_aggr && res_dst != mir.MIR_VREG_NIL) {
+    if (ret_mem && res_dst != mir.MIR_VREG_NIL) {
         val ra: R.Result[bool, str] = context.alloc_result_storage(ctx, mb, res_dst, ret_size, context.ret_align(ctx, ret_type));
         if (R.is_err[bool, str](ra)) {
             sig_layout_free(ctx, ?layout);
@@ -789,13 +824,14 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         } or {
             val aal: u64  = type.byte_align(ctx.types, av.ty, ctx.tgt)::u64;
             val afl: bool = context.value_is_float(ctx, av.ty);
+            val avec: bool = context.value_is_vector(ctx, av.ty);
             # a variadic tail aggregate is classified as integer eightbytes (mask 0),
             # never as an HFA (members 0), and with no flattened-aggregate descriptor
             # (agg_none): the va_arg read path walks the GP register-save / overflow
             # areas, so the caller and callee stay consistent. SSE-eightbyte, HFA
             # V-register, and lp64d fa-register passing are for fixed parameters and
             # returns (the C-FFI boundary), not the varargs tail.
-            slot = classify_arg(pidx::i32, asz, aal, afl, 0, aag, gp_used, fp_used, 0, 0, abi.agg_none());
+            slot = classify_arg(pidx::i32, asz, aal, afl, 0, aag, avec, gp_used, fp_used, 0, 0, abi.agg_none());
             # round a stack-passed tail argument up to its slot alignment before
             # placing it (identity on x86; honors a 16-aligned AAPCS64 by-value arg).
             # a register-plus-stack split's tail stack chunk is eight-byte-granular.
@@ -1124,9 +1160,13 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
 # size: the scalar's byte size
 # ret:  the SSE move width in bytes (4 or 8), or a loud error on an unexpected size
 fun fp_move_width(size: u64) R.Result[u8, str] {
-    if (size == 4) { ret R.ok[u8, str](4); }
-    if (size == 8) { ret R.ok[u8, str](8); }
-    ret R.err[u8, str]("mir.abi.fp_move_width: CLASS_FP scalar of unsupported size (expected 4 or 8 bytes)");
+    if (size == 4)  { ret R.ok[u8, str](4); }
+    if (size == 8)  { ret R.ok[u8, str](8); }
+    # a 128-bit vector rides the vector register whole (#1965): a one-member
+    # short-vector aggregate / SSE-class piece moves at the full 16-byte width, which
+    # each backend's FP move encoder realizes (a NEON Q move, an SSE MOVAPS).
+    if (size == 16) { ret R.ok[u8, str](16); }
+    ret R.err[u8, str]("mir.abi.fp_move_width: CLASS_FP scalar of unsupported size (expected 4, 8, or 16 bytes)");
 }
 
 # the move width for materializing a scalar GP value into its argument / return

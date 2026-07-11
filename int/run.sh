@@ -163,12 +163,13 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     # the mach target to compile: the build-target if set, else the leg itself.
     build_target=${case_build_target:-$target}
 
-    # the golden is shared across build-targets for runtime observables (exec and the
-    # relro-fault guard, whose output is target-independent) and per-build-target for
-    # structural producers (their fact is format-specific).
+    # the golden is shared across build-targets for target-independent observables (exec
+    # and the relro-fault guard, whose output is target-independent; debuginfo, whose
+    # two facts — validator-clean and additive — hold identically on every ELF ISA) and
+    # per-build-target for structural producers (their fact is format-specific).
     case "$case_run" in
-        exec|relro-fault) golden="$dir/expect.txt" ;;
-        *)                golden="$dir/expect.$build_target.txt" ;;
+        exec|relro-fault|debuginfo) golden="$dir/expect.txt" ;;
+        *)                          golden="$dir/expect.$build_target.txt" ;;
     esac
 
     for profile in $case_profiles; do
@@ -241,7 +242,23 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
                 continue
             fi
 
-            if produce "$case_run" "$runmode" "$target" "$bin" >"$tmp/out.txt" 2>"$tmp/err.txt"; then
+            # the debuginfo producer inspects the artifact built with and without `-g`:
+            # the default build above is the no-`-g` one; build the `-g` twin here (same
+            # compiler / target / profile / flags, plus `-g`) and hand its path to the
+            # producer as an extra argument. every other producer inspects only `$bin`.
+            gbin=
+            if [ "$case_run" = debuginfo ]; then
+                gbin="$dir/out/int/prog-g$exe"
+                if ! (cd "$dir" && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -g -o "out/int/prog-g$exe") >"$tmp/build-g.log" 2>&1; then
+                    echo "FAIL $label (build -g)"
+                    sed 's/^/    /' "$tmp/build-g.log" >&2
+                    fails=$((fails + 1))
+                    rm -rf "$tmp" "$dir/out/int"
+                    continue
+                fi
+            fi
+
+            if produce "$case_run" "$runmode" "$target" "$bin" "$gbin" >"$tmp/out.txt" 2>"$tmp/err.txt"; then
                 prc=0
             else
                 prc=$?

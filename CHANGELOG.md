@@ -5,6 +5,61 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.4.0] - 2026-07-11
+
+The SIMD release. Ten 128-bit vector types (`f32x4 f64x2 i8x16 i16x8 i32x4
+i64x2 u8x16 u16x8 u32x4 u64x2`) land as first-class primitives on the
+portable-vector model: semantic types legal on **every** target, with lane-wise
+operators, full-arity literals, comptime-bounds-checked lane access, and
+comparisons that produce hardware-shaped unsigned mask vectors. x86_64 lowers
+one instruction per operator on SSE2 and aarch64 on NEON; riscv64 builds the
+same programs through a defined unrolled scalar expansion of each operator,
+reported with a build-time note. What an incapable target does is the new
+`[profile.X] simd` lever — `"scalarize"` (build with the expansion) or
+`"require"` (hard error naming the offending operator). Built with mach 3.3.1.
+
+**Manifest schema change:** `simd` is a **required** key on every declared
+`[profile.X]` (`"scalarize" | "require"`), per the schema-evolution rule —
+additions enter as required-everywhere fields with a coordinated sweep, never
+optional-with-default. Every briar-systems repo was swept ahead of this release;
+a third-party manifest declaring a profile must add the key (the 3.3.1 seed
+already accepts it).
+
+### Added
+- language: **the ten seeded 128-bit vector types** — spelling
+  `<u|i|f><width>x<count>`, single-`x` only; 16-byte size/align;
+  arrays-of-vectors and pointers-to-vectors ordinary; full-arity literals;
+  comptime-constant bounds-checked lane read/write; uninitialized locals
+  default to all-zero lanes; no scalar↔vector casts; the honest lane-wise
+  operator table (float `+ - * /`; integer `+ -`, `*` on 16-bit lanes;
+  bitwise `& | ^ ~`; all six comparisons → same-shape unsigned mask; no
+  vector `%`, integer `/`, or shifts) (#1965, #2013, #2030, #2043).
+- codegen: **SSE2 (x86_64) and NEON (aarch64) vector backends** — one
+  instruction per table operator, fixed defined sequences where the baseline
+  lacks one; SysV SSE-class and AAPCS64 short-vector ABIs; 16-byte-aligned
+  vector spills (#2014, #2015).
+- codegen: **riscv64 defined unrolled scalarization** — lane-exact-identical
+  results with no vector unit, memory-class ABI, and the one-shot build-time
+  scalarization note (#2016).
+- driver: **the `[profile.X] simd` lever** — `"scalarize"` | `"require"`,
+  enforced at a single middle-end gate off the shared detection; the lever is
+  always the consumer's (a dependency's value is inert — no ecosystem fork)
+  (#2017).
+- doc: language and manifest documentation for all of the above
+  (types/operators/policy/manifest) (#2020).
+
+### Changed
+- test infra: the standalone `dbg/` debug-info harness folded into the int
+  framework as the `debuginfo` binary-inspection case kind (dwarfdump
+  `--verify` + `-g` byte-additivity, multi-TU, all three ELF ISAs); the
+  whole-compiler `-g` additivity capstone now runs inline at release cut
+  (#2039).
+
+### Fixed
+- codegen: the x86_64 encoder's memory-to-memory staging register is chosen
+  bank-correctly for 16-byte moves (a hardwired GP scratch aliased a live XMM
+  register under vector spill pressure) (#2034).
+
 ## [3.3.1] - 2026-07-10
 
 The seed-gate patch for the SIMD program. The manifest parser now accepts and
