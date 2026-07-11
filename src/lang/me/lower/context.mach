@@ -18,6 +18,7 @@ use O: std.types.option;
 use R: std.types.result;
 
 use mach.lang.fe.ast;
+use adecl: mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.id;
 use mach.lang.fe.comptime;
 use mach.lang.fe.resolve;
@@ -1138,6 +1139,178 @@ pub fun decl_ret_sem(lc: *LowerContext, did: id.DeclId) type.TypeId {
         ret_type = generics.substitute(lc.s, ret_type, lc.subst, lc.subst_len);
     }
     ret ret_type;
+}
+
+# the IR return type of a function decl
+#
+# Lowers the return type of its semantic TYPE_FUN signature (through the active
+# substitution env), defaulting to void. Shared by the concrete/instance body
+# lowerings and the pack-instance reference signature helper.
+# ---
+# lc:  the context
+# did: the function's DeclId
+# ret: the IR return type, or an error
+pub fun function_return_ir(lc: *LowerContext, did: id.DeclId) R.Result[ir_type.IrTypeId, str] {
+    val sem: type.TypeId = decl_type_of(lc, did);
+    val opt_type: O.Option[*type.Type] = type.get(?lc.s.types, sem);
+    if (O.is_none[*type.Type](opt_type)) { ret ir_type.intern_void(?lc.m.types); }
+    val t: *type.Type = O.unwrap[*type.Type](opt_type);
+    if (t.kind != type.TYPE_FUN) { ret ir_type.intern_void(?lc.m.types); }
+    ret lower_type(lc, t.data.fn.ret_type);
+}
+
+# intern the IR function type of a pack instance
+#
+# The signature is the leading fixed parameter IR types followed by the N expanded
+# element IR types, returning `ret_ir`. The expanded elements take the place of
+# the single TYPE_PACK parameter, so the instance's ABI matches the collected call
+# rather than the opaque pack. Shared by the pack-instance definition and its
+# reference signature helper, so a call and the drained body classify identically.
+# ---
+# lc:          the context (its substitution env, if any, is applied by lower_type)
+# d:           the resolved template Decl
+# fixed_count: number of leading fixed parameters
+# types:       the concrete pack element type-list
+# type_len:    number of pack element types
+# ret_ir:      the function's IR return type
+# ret:         the interned IR function type, or an error
+pub fun pack_instance_sig(lc: *LowerContext, d: *adecl.Decl, fixed_count: u32,
+                          types: *type.TypeId, type_len: u32, ret_ir: ir_type.IrTypeId) R.Result[ir_type.IrTypeId, str] {
+    val total: u32 = fixed_count + type_len;
+    if (total == 0) {
+        ret ir_type.intern_fn(?lc.m.types, ret_ir, nil, 0);
+    }
+
+    val res_buf: R.Result[*ir_type.IrTypeId, str] = A.allocate[ir_type.IrTypeId](lc.s.alloc, total::usize);
+    if (R.is_err[*ir_type.IrTypeId, str](res_buf)) { ret R.err[ir_type.IrTypeId, str](R.unwrap_err[*ir_type.IrTypeId, str](res_buf)); }
+    val buf: *ir_type.IrTypeId = R.unwrap_ok[*ir_type.IrTypeId, str](res_buf);
+
+    # buf[0 .. fixed_count) are the leading fixed parameter IR types; the rest are
+    # the expanded pack element IR types, replacing the single TYPE_PACK parameter.
+    var i: u32 = 0;
+    for (i < total) {
+        var elem_sem: type.TypeId = type.TYPE_NIL;
+        if (i < fixed_count) {
+            val pool_ix: u32 = d.data.fun_.params_start + i;
+            if (pool_ix::usize < lc.a.typed_name_len) {
+                elem_sem = type_resolved_of(lc, lc.a.typed_names[pool_ix].ty);
+            }
+        }
+        or {
+            elem_sem = types[i - fixed_count];
+        }
+        val res_elem: R.Result[ir_type.IrTypeId, str] = lower_type(lc, elem_sem);
+        if (R.is_err[ir_type.IrTypeId, str](res_elem)) {
+            A.deallocate[ir_type.IrTypeId](lc.s.alloc, buf, total::usize);
+            ret res_elem;
+        }
+        buf[i] = R.unwrap_ok[ir_type.IrTypeId, str](res_elem);
+        i = i + 1;
+    }
+
+    val res_fn: R.Result[ir_type.IrTypeId, str] = ir_type.intern_fn(?lc.m.types, ret_ir, buf, total);
+    A.deallocate[ir_type.IrTypeId](lc.s.alloc, buf, total::usize);
+    ret res_fn;
+}
+
+# the true IRT_FN signature of a generic or comptime-value instance at a reference
+# site in the referencing module
+#
+# A monomorphized-instance callee reference must carry the same signature the
+# drained definition emits, so a direct call classifies its ABI from the declared
+# parameter types rather than from per-operand stamps (the fragile contract behind
+# #2035). The signature depends on the callee's own type-parameter binding, absent
+# in the referencing context -- a naive caller-side `lower_type` erases a nested
+# generic param to pointer width. So bind the origin module's typing and the
+# concrete substitution env (as the instance drain does) and lower the template's
+# declared function type through the identical path, then restore the caller's
+# state. `lower_type` / `decl_type_of` read only the swapped fields, so nothing
+# else needs binding. `args`/`arg_len` are the concrete type-arguments for a
+# generic instance, or nil/0 for a value instance (whose signature carries no type
+# args, and whose comptime bindings never reach the signature -- lower_type folds
+# no comptime).
+# ---
+# lc:      the referencing context
+# decl_id: DeclId of the template function in `origin`'s AST
+# origin:  ModuleId declaring the template
+# args:    concrete type-argument sequence, or nil
+# arg_len: number of type arguments
+# ret:     the interned IRT_FN, or an error
+pub fun instance_ref_sig(lc: *LowerContext, decl_id: id.DeclId, origin: session.ModuleId,
+                         args: *type.TypeId, arg_len: u32) R.Result[ir_type.IrTypeId, str] {
+    val oa: *ast.Ast = session.module_ast(lc.s, origin);
+    if (oa == nil) { ret R.err[ir_type.IrTypeId, str]("lower: instance-reference origin AST not registered"); }
+    val osema: *sema.SemaResult = (session.module_sema_ptr(lc.s, origin))::*sema.SemaResult;
+    if (osema == nil) { ret R.err[ir_type.IrTypeId, str]("lower: instance-reference origin typing not registered"); }
+
+    val home_a:         *ast.Ast          = lc.a;
+    val home_sema:      *sema.SemaResult   = lc.sema_result;
+    val home_subst:     *type.TypeId       = lc.subst;
+    val home_subst_len: u32                = lc.subst_len;
+    lc.a           = oa;
+    lc.sema_result = osema;
+    lc.subst       = args;
+    lc.subst_len   = arg_len;
+
+    val res_sig: R.Result[ir_type.IrTypeId, str] = lower_type(lc, decl_type_of(lc, decl_id));
+
+    lc.a           = home_a;
+    lc.sema_result = home_sema;
+    lc.subst       = home_subst;
+    lc.subst_len   = home_subst_len;
+    ret res_sig;
+}
+
+# the true IRT_FN signature of a comptime variadic-pack instance at a reference
+# site in the referencing module
+#
+# The pack expands to `type_len` concrete element parameters after the leading
+# fixed ones, so the signature is built by `pack_instance_sig` (not the whole
+# declared function type), exactly as the drained definition builds it. Binds the
+# origin module's typing so the return and fixed-parameter types resolve against
+# the declaring module, then restores the caller's state.
+# ---
+# lc:       the referencing context
+# decl_id:  DeclId of the pack-tailed template in `origin`'s AST
+# origin:   ModuleId declaring the template
+# types:    the concrete pack element type-list (by pack ordinal)
+# type_len: number of pack element types
+# ret:      the interned IRT_FN, or an error
+pub fun pack_instance_ref_sig(lc: *LowerContext, decl_id: id.DeclId, origin: session.ModuleId,
+                              types: *type.TypeId, type_len: u32) R.Result[ir_type.IrTypeId, str] {
+    val oa: *ast.Ast = session.module_ast(lc.s, origin);
+    if (oa == nil) { ret R.err[ir_type.IrTypeId, str]("lower: pack-instance-reference origin AST not registered"); }
+    val osema: *sema.SemaResult = (session.module_sema_ptr(lc.s, origin))::*sema.SemaResult;
+    if (osema == nil) { ret R.err[ir_type.IrTypeId, str]("lower: pack-instance-reference origin typing not registered"); }
+    val opt_d: O.Option[*adecl.Decl] = ast.get_decl(oa, decl_id);
+    if (O.is_none[*adecl.Decl](opt_d)) { ret R.err[ir_type.IrTypeId, str]("lower: pack-instance-reference origin declaration not found"); }
+    val d: *adecl.Decl = O.unwrap[*adecl.Decl](opt_d);
+    if (d.kind != adecl.DECL_KIND_FUN) { ret R.err[ir_type.IrTypeId, str]("lower: pack-instance-reference origin declaration is not a function"); }
+
+    val home_a:         *ast.Ast          = lc.a;
+    val home_sema:      *sema.SemaResult   = lc.sema_result;
+    val home_subst:     *type.TypeId       = lc.subst;
+    val home_subst_len: u32                = lc.subst_len;
+    lc.a           = oa;
+    lc.sema_result = osema;
+    lc.subst       = nil;
+    lc.subst_len   = 0;
+
+    var res_sig: R.Result[ir_type.IrTypeId, str] = R.err[ir_type.IrTypeId, str]("");
+    val res_ret_ir: R.Result[ir_type.IrTypeId, str] = function_return_ir(lc, decl_id);
+    if (R.is_err[ir_type.IrTypeId, str](res_ret_ir)) {
+        res_sig = R.err[ir_type.IrTypeId, str](R.unwrap_err[ir_type.IrTypeId, str](res_ret_ir));
+    }
+    or {
+        val fixed_count: u32 = d.data.fun_.params_len - 1;
+        res_sig = pack_instance_sig(lc, d, fixed_count, types, type_len, R.unwrap_ok[ir_type.IrTypeId, str](res_ret_ir));
+    }
+
+    lc.a           = home_a;
+    lc.sema_result = home_sema;
+    lc.subst       = home_subst;
+    lc.subst_len   = home_subst_len;
+    ret res_sig;
 }
 
 # return the resolved SymbolId for an expression reference, or SYMBOL_NIL
