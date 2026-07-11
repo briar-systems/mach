@@ -15,6 +15,7 @@
 #     own predicate (dce's dead set, mem2reg's promoted memops).
 #   - cloning: `clone_instruction`, a faithful per-instruction copy.
 
+use std.allocator.page;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -25,10 +26,13 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
+use mach.lang.intern;
 use mach.lang.me.ir;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
+use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
+use mach.lang.source;
 
 # a batched value-replacement map (RAUW) over one function's instruction pool
 #
@@ -170,10 +174,17 @@ pub fun rewrite_apply(fn: *ir.Function, rw: *Rewrite) {
 # replaced (inlining wires a call result to its return value) and a batched map
 # would be overkill. Block-target operands ride in VAL_CONST_INT slots, so the
 # VAL_INSTR guard already skips them.
+#
+# Each rewritten slot keeps its own type, mirroring `rewrite_resolve`: the use-site
+# stamp is the slot's semantic contract (a by-address aggregate is a ptr-producing
+# value stamped with the aggregate type), so substituting which value fills the slot
+# must not change what the slot means. Clobbering the stamp with the replacement's
+# def type turned an inlined callee's deref-copied return into an 8-byte pointer
+# store (#2092).
 # ---
 # fn:          the function whose operands are rewritten in place
 # old_id:      the value-producing instruction id being replaced
-# replacement: the value to substitute in
+# replacement: the value to substitute in, retyped per use slot
 pub fun replace_uses(fn: *ir.Function, old_id: id.InstructionId, replacement: value.Value) {
     var i: u32 = 0;
     for (i < fn.instr_len) {
@@ -182,7 +193,7 @@ pub fun replace_uses(fn: *ir.Function, old_id: id.InstructionId, replacement: va
         for (ii < inst.operand_count) {
             val op: value.Value = inst.operands[ii];
             if (op.kind == value.VAL_INSTR && op.data.instr == old_id) {
-                inst.operands[ii] = replacement;
+                inst.operands[ii] = value.retype(replacement, op.ty);
             }
             ii = ii + 1;
         }
@@ -464,4 +475,106 @@ pub fun clone_instruction(m: *ir.Module, dst_fn: *ir.Function, src: *instruction
         ret res_id;
     }
     ret res_id;
+}
+
+# build a pool instruction with the given operands (copied into an owned array)
+# and add it to fn, returning its id (test helper; replace_uses walks the raw pool,
+# so no block wiring is needed)
+# ---
+# m:    module owning the allocator
+# fn:   function whose pool receives the instruction
+# kind: opcode
+# ty:   result type
+# ops:  operand values to copy (nil when n == 0)
+# n:    operand count
+# ret:  the new InstructionId, or an allocation error
+fun test_instr(m: *ir.Module, fn: *ir.Function, kind: instruction.InstrKind, ty: ir_type.IrTypeId, ops: *value.Value, n: u32) R.Result[id.InstructionId, str] {
+    var owned: *value.Value = nil;
+    if (n > 0) {
+        val res_ops: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, n::usize);
+        if (R.is_err[*value.Value, str](res_ops)) { ret R.err[id.InstructionId, str](R.unwrap_err[*value.Value, str](res_ops)); }
+        owned = R.unwrap_ok[*value.Value, str](res_ops);
+        var i: u32 = 0;
+        for (i < n) { owned[i] = ops[i]; i = i + 1; }
+    }
+    var inst: instruction.Instruction;
+    inst.kind          = kind;
+    inst.ty            = ty;
+    inst.operands      = owned;
+    inst.operand_count = n;
+    inst.operand_cap   = n;
+    inst.flags         = 0;
+    inst.aux_ty        = ir_type.IRT_NIL;
+    inst.loc           = source.loc_nil();
+    ret ir.instruction_add(m, fn, inst);
+}
+
+# #2092: replace_uses must preserve each rewritten slot's use-site type stamp. a
+# ptr-producing value used with an aggregate stamp is a by-address aggregate (the
+# store below means "copy the record"); substituting which value fills the slot must
+# not change what the slot means. builds `store %v:{agg} -> %slot` in the raw pool
+# and replaces %v with a bare-ptr param: the store's value operand must become the
+# param while still carrying the aggregate type, not the replacement's ptr type, and
+# the untouched pointer slot must keep its own stamp.
+test "mach.lang.me.ir.mutate.replace_uses:preserves_use_site_type" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val ri: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ri);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val rv: R.Result[ir_type.IrTypeId, str] = ir_type.intern_void(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rv)) { ir.dnit(?m); ret 1; }
+    val voidt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rv);
+    var fields: [3]ir_type.IrTypeId;
+    fields[0] = i64t; fields[1] = i64t; fields[2] = i64t;
+    val ra: R.Result[ir_type.IrTypeId, str] = ir_type.intern_struct(?m.types, ?fields[0], 3, 8);
+    if (R.is_err[ir_type.IrTypeId, str](ra)) { ir.dnit(?m); ret 1; }
+    val aggt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ra);
+
+    val r_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](r_fn)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](r_fn)];
+
+    # %v and %slot: two ptr-producing allocas; the store's value operand is %v
+    # stamped with the aggregate type (the deref-copy idiom).
+    var count: [1]value.Value;
+    count[0] = value.const_int(1, i64t);
+    val r_v: R.Result[id.InstructionId, str] = test_instr(?m, fn, instruction.OP_ALLOCA, ptrt, ?count[0], 1);
+    if (R.is_err[id.InstructionId, str](r_v)) { ir.dnit(?m); ret 1; }
+    val v_id: id.InstructionId = R.unwrap_ok[id.InstructionId, str](r_v);
+    val r_slot: R.Result[id.InstructionId, str] = test_instr(?m, fn, instruction.OP_ALLOCA, ptrt, ?count[0], 1);
+    if (R.is_err[id.InstructionId, str](r_slot)) { ir.dnit(?m); ret 1; }
+    val slot_id: id.InstructionId = R.unwrap_ok[id.InstructionId, str](r_slot);
+
+    var store_ops: [2]value.Value;
+    store_ops[0] = value.instr(v_id, aggt);
+    store_ops[1] = value.instr(slot_id, ptrt);
+    val r_store: R.Result[id.InstructionId, str] = test_instr(?m, fn, instruction.OP_STORE, voidt, ?store_ops[0], 2);
+    if (R.is_err[id.InstructionId, str](r_store)) { ir.dnit(?m); ret 1; }
+    val store_id: id.InstructionId = R.unwrap_ok[id.InstructionId, str](r_store);
+
+    replace_uses(fn, v_id, value.param(0, ptrt));
+
+    val oi: O.Option[*instruction.Instruction] = ir.instruction_get(fn, store_id);
+    if (O.is_none[*instruction.Instruction](oi)) { ir.dnit(?m); ret 1; }
+    val ins: *instruction.Instruction = O.unwrap[*instruction.Instruction](oi);
+
+    var bad: i32 = 0;
+    if (ins.operands[0].kind != value.VAL_PARAM)  { bad = 3; }   # substitution happened
+    or (ins.operands[0].data.param_ix != 0)       { bad = 4; }
+    or (ins.operands[0].ty != aggt)               { bad = 2; }   # use-site stamp kept
+    if (bad == 0) {
+        if (ins.operands[1].kind != value.VAL_INSTR)  { bad = 5; }   # other slot untouched
+        or (ins.operands[1].data.instr != slot_id)    { bad = 6; }
+        or (ins.operands[1].ty != ptrt)               { bad = 7; }
+    }
+    ir.dnit(?m);
+    ret bad;
 }
