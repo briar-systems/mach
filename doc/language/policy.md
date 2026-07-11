@@ -11,10 +11,16 @@ Things that need to feel like the language:
   records, unions, generics.
 - **Control flow.** `if` / `or`, `for`, `ret`, `brk`, `cnt`, `fin`,
   blocks.
-- **SIMD operators on primitive vector types.** Binary arithmetic
-  (`+ - * / %`), bitwise (`& | ^ ~ << >>`), comparison, lane indexing,
-  vector literals. The compiler emits one CPU instruction per operator
-  per supported ISA.
+- **SIMD operators on primitive vector types.** Lane-wise arithmetic,
+  bitwise, comparison-to-mask, lane indexing, and full-arity vector
+  literals over the seeded 128-bit vector types (the honest per-operator
+  table is in [operators.md](operators.md)). On a target with the hardware
+  (SSE2 on x86_64, NEON on aarch64) the compiler emits one instruction per
+  operator; on a target without it the compiler emits a **defined unrolled
+  scalar expansion** of the same operator — scalarize operators, never
+  algorithms — and reports the scalarization at build time. What to do on
+  an incapable target is the `simd` profile lever (see
+  [manifest.md](../manifest.md)), not a compiler default.
 - **`asm` parsing, encoding, and operand allocation** for each supported
   ISA.
 - **The comptime channel** — `$mach.*` reads, the closed intrinsic set,
