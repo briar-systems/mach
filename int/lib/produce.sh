@@ -20,6 +20,11 @@
 #                 for a cross-built target with no host runner (a freestanding
 #                 aarch64/riscv64 image on the x86_64 leg). the observable is a
 #                 constant, so the golden is the fact "it emitted".
+#   debuginfo   — build the case with and without `-g` (run.sh builds both) and
+#                 assert over the artifacts: llvm-dwarfdump --verify accepts the `-g`
+#                 image and `-g` is loadable-byte additive (PT_LOAD segments identical).
+#                 the one producer that needs external validators (llvm-dwarfdump,
+#                 readelf); it runs only on the ELF debug-info legs, which install them.
 #
 # build-fails is a run-mode but not a producer: it asserts the compile is REJECTED
 # and takes the compiler's 'error:' diagnostic as the observable. it is handled in
@@ -177,8 +182,82 @@ produce_built() {
     fi
 }
 
-# produce <run> <runmode> <target> <binary>
-# dispatches to the producer named by <run>, forwarding the remaining arguments.
+# resolve_dwarfdump — print an llvm-dwarfdump on PATH, preferring the unversioned
+# name and falling back to the highest-versioned one (ubuntu ships llvm-dwarfdump-NN).
+# empty output (return 1) when none is installed.
+resolve_dwarfdump() {
+    if command -v llvm-dwarfdump >/dev/null 2>&1; then echo llvm-dwarfdump; return 0; fi
+    newest=$(compgen -c 'llvm-dwarfdump-' 2>/dev/null | sort -t- -k3 -n | tail -1)
+    [ -n "$newest" ] && { echo "$newest"; return 0; }
+    return 1
+}
+
+# _norm_shdr_fields <in> <out> — copy <in> to <out> zeroing the ELF header's
+# section-table bookkeeping (e_shoff @40 8B, e_shnum @60 2B, e_shstrndx @62 2B), which
+# legitimately differs once `-g` adds named debug sections. everything else — every
+# loadable byte — must stay identical.
+_norm_shdr_fields() {
+    cp "$1" "$2"
+    printf '\0\0\0\0\0\0\0\0' | dd of="$2" bs=1 seek=40 count=8 conv=notrunc status=none
+    printf '\0\0'             | dd of="$2" bs=1 seek=60 count=2 conv=notrunc status=none
+    printf '\0\0'             | dd of="$2" bs=1 seek=62 count=2 conv=notrunc status=none
+}
+
+# elf_seg_identical <g> <nog> — 0 when every PT_LOAD segment of the `-g` image has
+# byte-identical file content in the no-`-g` image (after normalizing the header
+# section-table fields), else 1. the additive-only guard: `-g` must not perturb one
+# byte of the loaded program. PT_LOAD file extents come from `readelf -lW` (offset,
+# filesz); a p_filesz of 0 (a pure .bss LOAD) carries no file bytes to compare.
+elf_seg_identical() {
+    an=$(mktemp); bn=$(mktemp)
+    _norm_shdr_fields "$1" "$an"; _norm_shdr_fields "$2" "$bn"
+    rc=0
+    while read -r off fsz; do
+        [ "$fsz" -eq 0 ] && continue
+        if ! cmp -s \
+            <(dd if="$an" bs=1M iflag=skip_bytes,count_bytes skip="$off" count="$fsz" status=none) \
+            <(dd if="$bn" bs=1M iflag=skip_bytes,count_bytes skip="$off" count="$fsz" status=none); then
+            rc=1; break
+        fi
+    done < <(readelf -lW "$1" 2>/dev/null | awk '/LOAD/{print strtonum($2), strtonum($5)}')
+    rm -f "$an" "$bn"
+    return $rc
+}
+
+# produce_debuginfo <runmode> <target> <nog_binary> <g_binary>
+# the binary-inspection producer for the debuginfo case kind (#2039): asserts, purely
+# host-side over the artifacts run.sh built with and without `-g`, that (1) the
+# standard structural validator accepts the whole `-g` image and (2) `-g` is loadable-
+# byte additive. the two facts are ISA-independent, so the golden is one shared
+# expect.txt. requires llvm-dwarfdump and readelf on the leg (the ELF debug-info legs
+# install them); a missing validator is a hard error, never a silent skip.
+produce_debuginfo() {
+    nog=$3
+    g=$4
+    dd_tool=$(resolve_dwarfdump) || {
+        echo "int: debuginfo: llvm-dwarfdump not found (install the 'llvm' package)" >&2; return 2
+    }
+    command -v readelf >/dev/null 2>&1 || {
+        echo "int: debuginfo: readelf not found (install 'binutils')" >&2; return 2
+    }
+
+    if "$dd_tool" --verify "$g" >/dev/null 2>&1; then
+        echo "dwarfdump_verify=clean"
+    else
+        echo "dwarfdump_verify=errors"
+    fi
+
+    if elf_seg_identical "$g" "$nog"; then
+        echo "g_additive=yes"
+    else
+        echo "g_additive=no"
+    fi
+}
+
+# produce <run> <runmode> <target> <binary> [<g_binary>]
+# dispatches to the producer named by <run>, forwarding the remaining arguments. the
+# debuginfo producer takes an extra `-g` artifact path run.sh built alongside the
+# default (no-`-g`) one; every other producer inspects the single default artifact.
 produce() {
     run=$1
     shift
@@ -189,6 +268,7 @@ produce() {
         relro)       produce_relro "$@" ;;
         flat-loader) produce_flat_loader "$@" ;;
         built)       produce_built "$@" ;;
+        debuginfo)   produce_debuginfo "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
 }
