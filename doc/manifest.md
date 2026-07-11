@@ -64,6 +64,7 @@ abi = "sysv64"
 [profile.debug]                        # a build variant
 opt   = 0                              # 0 (debug pipeline) | 1 | 2 (release pipeline)
 debug = true                           # emit debug info for this profile
+simd  = "scalarize"                    # SIMD lever: "scalarize" | "require"
 
 [artifact.demo]                        # a produced artifact
 kind    = "bin"                        # "bin" | "static" | "shared"
@@ -148,10 +149,18 @@ live here because they are variant concerns.
 |---------|---------|---------|
 | `opt`   | integer | Optimization level: `0` selects the debug pipeline (the always-on passes only), `1` and `2` select the release pipeline. `1` and `2` currently share a pass set; `2` is where future loop/vectorization work lands. Any other integer — or a non-integer — is a manifest error. |
 | `debug` | bool    | Emit debug info (DWARF on ELF/Mach-O, CodeView on COFF) for this profile. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
+| `simd`  | string  | SIMD scalarization lever. `"scalarize"` builds for a target without hardware SIMD by emitting a defined unrolled scalar expansion of each vector operator, with a build-time note (the "skipped N target-gated modules" style). `"require"` makes a build for an incapable target a hard error naming the offending operator. Any other string is a manifest error. |
 
-Both keys are required in a declared profile. Emission of the human-readable IR and
-assembly side-artifacts is **not** a profile concern — it is controlled only by the
-`--emit-ir` / `--emit-asm` CLI flags (see [cli.md](cli.md)).
+All three keys (`opt`, `debug`, `simd`) are required in a declared profile.
+Emission of the human-readable IR and assembly side-artifacts is **not** a profile
+concern — it is controlled only by the `--emit-ir` / `--emit-asm` CLI flags (see
+[cli.md](cli.md)).
+
+The `simd` lever is always the **consumer's**. Consistent with the root-vs-dependency
+strictness above, a dependency's `[profile.*]` is parsed permissively and never read
+to build the consumer, so a library's `simd` value is inert — the effective lever
+comes from the consumer's resolved profile. Libraries set nothing SIMD-specific and
+inherit the consumer's choice; there is no ecosystem fork and no dual API.
 
 The CLI selects and overrides at invocation time: `--profile <name>` picks the
 profile; `-g` forces `debug` on for one build regardless of the profile's key
@@ -428,10 +437,12 @@ abi = "win64"
 [profile.debug]
 opt   = 0
 debug = true
+simd  = "scalarize"
 
 [profile.release]
 opt   = 2
 debug = false
+simd  = "scalarize"
 ```
 
 The `gl` and `shim-x11` entries carry `os = "linux"`, so on a windows build cell
@@ -531,10 +542,12 @@ abi = "win64"
 [profile.debug]
 opt   = 0
 debug = false
+simd  = "scalarize"
 
 [profile.release]
 opt   = 2
 debug = false
+simd  = "scalarize"
 
 [artifact.mach]
 kind    = "bin"
