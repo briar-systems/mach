@@ -937,7 +937,7 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     # the result vreg.
     val dst: u32 = context.instr_vreg(ctx, iid);
     if (dst != mir.MIR_VREG_NIL && rslot.class != abi.CLASS_SRET) {
-        val rr: R.Result[bool, str] = emit_ret_slot_to_vreg(ctx, mb, rslot, dst, ret_aggr);
+        val rr: R.Result[bool, str] = emit_ret_slot_to_vreg(ctx, mb, rslot, dst, ret_aggr, ret_size);
         if (R.is_err[bool, str](rr)) { ret rr; }
     }
     if (dst != mir.MIR_VREG_NIL) {
@@ -1169,6 +1169,18 @@ fun fp_move_width(size: u64) R.Result[u8, str] {
     ret R.err[u8, str]("mir.abi.fp_move_width: CLASS_FP scalar of unsupported size (expected 4, 8, or 16 bytes)");
 }
 
+# capture a value passed / returned in `slot`'s canonical register into `dst` vreg.
+# a 128-bit vector (a CLASS_FP slot of 16 bytes) copies at its full 16-byte width so the
+# reg-reg move is a MOVAPS / NEON Q move, not a 64-bit MOVSD that drops lanes 2-3 when
+# the vreg does not coalesce onto the incoming register (#2053). every scalar -- GP or
+# float -- keeps the machine-word move it always used, so its codegen is byte-identical.
+fun capture_slot_reg(ctx: *context.LowerCtx, mb: *mir.MirBlock, dst: u32, slot: abi.ParamSlot, size: u64) R.Result[bool, str] {
+    if (slot.class == abi.CLASS_FP && size == 16) {
+        ret context.emit_fmov(ctx, mb, mir.op_vreg(dst), mir.op_preg(slot.reg::u32), 16);
+    }
+    ret context.emit_mov(ctx, mb, mir.op_vreg(dst), mir.op_preg(slot.reg::u32));
+}
+
 # the move width for materializing a scalar GP value into its argument / return
 # register. a 32-bit value rides a width-4 move so a backend can re-extend it to the
 # register width by its own convention -- RV64 lp64 holds a 32-bit register
@@ -1214,7 +1226,7 @@ fun record_outgoing_size(ctx: *context.LowerCtx, bytes: i64) {
 # dst:     the result vreg, or the result-storage pointer for an aggregate
 # is_aggr: whether the return is an aggregate flowing by address
 # ret:     ok(true) on success, or a loud error
-fun emit_ret_slot_to_vreg(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, dst: u32, is_aggr: bool) R.Result[bool, str] {
+fun emit_ret_slot_to_vreg(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, dst: u32, is_aggr: bool, size: u64) R.Result[bool, str] {
     if (is_aggr) {
         var plan: PiecePlan;
         plan.store      = true;
@@ -1225,7 +1237,7 @@ fun emit_ret_slot_to_vreg(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.P
         plan.stack_ok   = false;
         ret materialize_pieces(ctx, mb, slot, plan);
     }
-    ret context.emit_mov(ctx, mb, mir.op_vreg(dst), mir.op_preg(slot.reg::u32));
+    ret capture_slot_reg(ctx, mb, dst, slot, size);
 }
 
 # emit the entry-block ABI pre-coloring for incoming parameters
@@ -1369,7 +1381,7 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSl
         plan.stack_ok   = true;
         ret materialize_pieces(ctx, mb, slot, plan);
     }
-    ret context.emit_mov(ctx, mb, mir.op_vreg(pv), mir.op_preg(slot.reg::u32));
+    ret capture_slot_reg(ctx, mb, pv, slot, size);
 }
 
 # report whether IR parameter `param_ix` is read anywhere in the function body
@@ -1611,4 +1623,43 @@ test "mach.lang.be.codegen.mir.abi.param_has_use:dbg_value_is_not_a_use" {
 
     ir.dnit(?m);
     ret 0;
+}
+
+# #2053 colocated runtime regression: a by-value 128-bit vector passed or returned
+# must carry all four lanes, never truncate to the low 64 bits. lane values are
+# discriminating -- lanes 2-3 are nonzero with cross-byte content, so a low-half
+# truncation (the shipped bug) is detected. these helpers are referenced only by the
+# test block below, so `mach build` emits none of them into the compiler.
+fun rt_passthru(a: i32x4) i32x4 { ret a; }
+fun rt_litret() i32x4 { ret i32x4{266, 10, 70000, 40000}; }
+fun rt_localret(seed: i32) i32x4 { var v: i32x4 = i32x4{seed, 10, 70000, 40000}; ret v; }
+fun rt_add_one(a: i32x4) i32x4 { var one: i32x4 = i32x4{1, 1, 1, 1}; ret a + one; }
+fun rt_mixed(tag: i64, a: i32x4, k: i64) i32x4 { var b: i32x4 = i32x4{tag::i32, k::i32, 70000, 40000}; ret a + b; }
+fun rt_lane_ok(v: i32x4, l0: i32, l1: i32, l2: i32, l3: i32) bool {
+    ret v[0] == l0 && v[1] == l1 && v[2] == l2 && v[3] == l3;
+}
+
+test "mach.lang.be.codegen.mir.abi:vector_by_value_roundtrip" {
+    # win64's vector-by-value ABI is a separate, never-implemented gap (#2055): win64
+    # is the only classifier without an `is_vector` branch, so a 128-bit vector is
+    # mis-passed as CLASS_GP. skip the by-value exercise on windows until #2055 lands;
+    # the SysV/NEON capture-width fix (#2053) this guards is unaffected by it.
+    $if ($mach.build.os == $mach.os.windows) {
+        ret 0;
+    } $or {
+        val src: i32x4 = i32x4{266, 10, 70000, 40000};
+        # ret-of-arg (passthru): the arg is loaded from a slot into the arg register.
+        if (!rt_lane_ok(rt_passthru(src), 266, 10, 70000, 40000)) { ret 1; }
+        # ret-of-literal: a slot-materialized literal captured into the return register.
+        if (!rt_lane_ok(rt_litret(), 266, 10, 70000, 40000)) { ret 1; }
+        # ret-of-local.
+        if (!rt_lane_ok(rt_localret(266), 266, 10, 70000, 40000)) { ret 1; }
+        # ret-of-call-result: a returned vector captured, then passed and returned again.
+        if (!rt_lane_ok(rt_passthru(rt_litret()), 266, 10, 70000, 40000)) { ret 1; }
+        # op-result return (register-resident -- the path tier-1 already proved).
+        if (!rt_lane_ok(rt_add_one(src), 267, 11, 70001, 40001)) { ret 1; }
+        # mixed scalar + vector signature round-trip.
+        if (!rt_lane_ok(rt_mixed(5, src, 9), 271, 19, 140000, 80000)) { ret 1; }
+        ret 0;
+    }
 }
