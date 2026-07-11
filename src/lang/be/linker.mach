@@ -142,6 +142,7 @@ rec DynState {
     fixup_count: u32;
     fixup_cap:   u32;
     base_reloc_cap: u32;
+    got_fixup_cap:  u32;
     active:      bool;
 }
 
@@ -2072,10 +2073,11 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
             }
             or {
                 # not defined anywhere: a dynamic import, or a hard error. a
-                # pc-relative call to a FUNCTION import is deferred to the writer
-                # (only function imports get a PLT stub); any other unresolved
-                # reference - including a call kind against a data import (deferred)
-                # - is rejected as undefined.
+                # pc-relative call to a FUNCTION import is deferred to the writer as
+                # a PLT fixup; a GOT-indirect access to a DATA import is deferred as
+                # a GOT fixup (the writer builds its GOT slot + GLOB_DAT). any other
+                # unresolved reference - a call against a data import, an absolute
+                # reference to any import - is rejected as undefined.
                 val imp: R.Result[u32, str] = dynstate_import_index(dyn, r.symbol);
                 if (R.is_ok[u32, str](imp) && is_call_kind(r.kind)
                     && dynstate_import_is_func(dyn, R.unwrap_ok[u32, str](imp))) {
@@ -2083,6 +2085,14 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                         segment_index_for(out_img, out_ix), patch_off,
                         R.unwrap_ok[u32, str](imp), patch_va, r.addend);
                     if (R.is_err[bool, str](rec_r)) { ret R.err[bool, str](R.unwrap_err[bool, str](rec_r)); }
+                    ri = ri + 1; cnt;
+                }
+                if (R.is_ok[u32, str](imp) && is_got_kind(r.kind)
+                    && !dynstate_import_is_func(dyn, R.unwrap_ok[u32, str](imp))) {
+                    val rec_g: R.Result[bool, str] = dynstate_add_got_fixup(s, dyn,
+                        segment_index_for(out_img, out_ix), patch_off,
+                        R.unwrap_ok[u32, str](imp), patch_va, r.kind);
+                    if (R.is_err[bool, str](rec_g)) { ret R.err[bool, str](R.unwrap_err[bool, str](rec_g)); }
                     ri = ri + 1; cnt;
                 }
                 ret R.err[bool, str](undef_message(s, r.symbol));
@@ -2174,10 +2184,13 @@ fun init_dynstate(dyn: *DynState) {
     dyn.info.base_relocs      = nil;
     dyn.info.base_reloc_count = 0;
     dyn.info.pie              = false;
+    dyn.info.got_fixups       = nil;
+    dyn.info.got_fixup_count  = 0;
     dyn.fixups            = nil;
     dyn.fixup_count       = 0;
     dyn.fixup_cap         = 0;
     dyn.base_reloc_cap    = 0;
+    dyn.got_fixup_cap     = 0;
     dyn.active            = false;
 }
 
@@ -2198,6 +2211,9 @@ fun free_dynstate(alloc: *A.Allocator, dyn: *DynState) {
     }
     if (dyn.info.base_relocs != nil && dyn.base_reloc_cap > 0) {
         A.deallocate[of.BaseReloc](alloc, dyn.info.base_relocs, dyn.base_reloc_cap::usize);
+    }
+    if (dyn.info.got_fixups != nil && dyn.got_fixup_cap > 0) {
+        A.deallocate[of.GotFixup](alloc, dyn.info.got_fixups, dyn.got_fixup_cap::usize);
     }
     if (dyn.active) {
         map.dnit[intern.StrId, u32](?dyn.import_map);
@@ -2433,6 +2449,16 @@ fun is_call_kind(kind: of.RelocKind) bool {
     ret kind == of.RK_PC32 || kind == of.RK_PLT32;
 }
 
+# whether an abstract relocation kind is a GOT-indirect address load - the shape
+# an imported-data reference lowers to (#2026). a GOT-kind reloc against a data
+# import is resolved to the import's GOT slot by the writer, not patched here
+# ---
+# kind: the abstract relocation kind to test
+# ret:  true for a GOT-indirect kind (aarch64 page21/lo12 pair, x86_64 GOTPCREL)
+fun is_got_kind(kind: of.RelocKind) bool {
+    ret kind == of.RK_GOT_PAGE21 || kind == of.RK_GOT_LO12 || kind == of.RK_GOTPCREL;
+}
+
 # the load-segment index a merged output section maps to in the
 # writer's segment array. the writer builds one segment per loadable used section
 # in output order, so the index is the count of loadable sections before `out_ix`
@@ -2480,6 +2506,40 @@ fun dynstate_add_fixup(s: *session.Session, dyn: *DynState, seg_index: u32, seg_
     dyn.fixups[ix].patch_vaddr  = patch_vaddr;
     dyn.fixups[ix].addend       = addend;
     dyn.fixup_count = ix + 1;
+    ret R.ok[bool, str](true);
+}
+
+# append one GOT-indirect data-import access site, growing the array
+# geometrically. the writer resolves each to its import's GOT slot and emits the
+# slot's GLOB_DAT dynamic relocation (#2026)
+# ---
+# s:            shared session (allocator), backing the fixup array
+# dyn:          out - the dynamic-link state whose GOT-fixup array grows
+# seg_index:    load-segment index of the patched instruction
+# seg_offset:   byte offset of the patched instruction within its segment
+# import_index: plan import index (a data import) this access binds to
+# patch_vaddr:  the patched instruction's virtual address
+# kind:         the GOT relocation kind (page-high vs scaled-lo12 half)
+# ret:          ok(true) once recorded, or an allocation error
+fun dynstate_add_got_fixup(s: *session.Session, dyn: *DynState, seg_index: u32, seg_offset: u32,
+                           import_index: u32, patch_vaddr: u64, kind: of.RelocKind) R.Result[bool, str] {
+    val alloc: *A.Allocator = s.alloc;
+    if (dyn.info.got_fixup_count == dyn.got_fixup_cap) {
+        var new_cap: u32 = dyn.got_fixup_cap * 2;
+        if (new_cap == 0) { new_cap = 4; }
+        val gr: R.Result[*of.GotFixup, str] =
+            A.reallocate[of.GotFixup](alloc, dyn.info.got_fixups, dyn.got_fixup_cap::usize, new_cap::usize);
+        if (R.is_err[*of.GotFixup, str](gr)) { ret R.err[bool, str](R.unwrap_err[*of.GotFixup, str](gr)); }
+        dyn.info.got_fixups = R.unwrap_ok[*of.GotFixup, str](gr);
+        dyn.got_fixup_cap = new_cap;
+    }
+    val ix: u32 = dyn.info.got_fixup_count;
+    dyn.info.got_fixups[ix].seg_index    = seg_index;
+    dyn.info.got_fixups[ix].seg_offset   = seg_offset;
+    dyn.info.got_fixups[ix].import_index = import_index;
+    dyn.info.got_fixups[ix].patch_vaddr  = patch_vaddr;
+    dyn.info.got_fixups[ix].kind         = kind;
+    dyn.info.got_fixup_count = ix + 1;
     ret R.ok[bool, str](true);
 }
 

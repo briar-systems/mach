@@ -82,6 +82,16 @@ pub val VC_DANGLING_ID:     VerifyCheck = 12;
 # const-int block id). opt-in alongside the other `repr` checks
 pub val VC_TYPE_AGREE:      VerifyCheck = 13;
 
+# a direct call's fixed argument operand type disagrees with the callee's declared
+# parameter type: an aggregate parameter received a non-aggregate (pointer/scalar)
+# operand - the #2035 class, a by-value aggregate arg mis-typed to a pointer - or a
+# scalar parameter received an incompatible operand. only checked when the call
+# carries a real IRT_FN signature (every direct call, since generic instances now
+# do too); an indirect / untyped-pointer call and the variadic tail are not
+# checked. always on - the durable tripwire that keeps the #2035 defect class from
+# shipping
+pub val VC_CALL_ARG_TYPE:   VerifyCheck = 14;
+
 # one invariant failure, located as precisely as the failing check allows
 # ---
 # function: index into Module.functions
@@ -192,6 +202,7 @@ pub fun describe(check: VerifyCheck) str {
     if (check == VC_TYPE_RESOLVE)    { ret "type resolution: operand or aux type does not resolve"; }
     if (check == VC_DANGLING_ID)     { ret "dangling id: a block list names an out-of-range instruction id"; }
     if (check == VC_TYPE_AGREE)      { ret "type agreement: operand types violate the opcode's typing contract"; }
+    if (check == VC_CALL_ARG_TYPE)   { ret "call argument typing: a call argument's type disagrees with the callee's declared parameter"; }
     ret "unknown verification check";
 }
 
@@ -526,6 +537,12 @@ fun check_one_instr(m: *ir.Module, fn: *ir.Function, iid: id.InstructionId, fi: 
         val res_agree: R.Result[bool, str] = check_type_agree(m, ins, fi, bid, iid, r);
         if (R.is_err[bool, str](res_agree)) { ret res_agree; }
     }
+    # always on: a direct call's fixed argument types must agree with the callee's
+    # declared IRT_FN signature. now that generic instances carry real signatures,
+    # this makes the #2035 defect class (a by-value aggregate arg mis-typed to a
+    # pointer) structurally impossible to ship.
+    val res_call: R.Result[bool, str] = check_call_arg_types(m, ins, fi, bid, iid, r);
+    if (R.is_err[bool, str](res_call)) { ret res_call; }
     ret R.ok[bool, str](true);
 }
 
@@ -626,6 +643,75 @@ fun check_type_agree(m: *ir.Module, ins: *instruction.Instruction, fi: u32, bid:
         if (ins.operands[2].kind != value.VAL_CONST_INT)         { ret push(r, fi, bid, iid, VC_TYPE_AGREE); }
     }
     ret R.ok[bool, str](true);
+}
+
+# VC_CALL_ARG_TYPE: a direct call classifies its ABI from the callee's declared
+# IRT_FN signature (`aux_ty`), so each fixed argument's operand type must agree with
+# the declared parameter type. checked only when `aux_ty` is a real IRT_FN - every
+# direct call to a named function or (now) a monomorphized instance; an indirect
+# call through an untyped function pointer carries no declared parameter types and
+# is skipped, as is the variadic tail past the declared parameter count (its
+# per-operand classification is the intended path). the first operand is the callee,
+# so argument i is operand i+1
+# ---
+# m:   the enclosing module (type-table oracle)
+# ins: the call instruction to check
+# fi:  index of the enclosing function into Module.functions
+# bid: the block holding ins (located on a violation)
+# iid: the instruction id (located on a violation)
+# r:   the report to record into
+# ret: true on completion, or an allocation error
+fun check_call_arg_types(m: *ir.Module, ins: *instruction.Instruction, fi: u32, bid: id.BlockId, iid: id.InstructionId, r: *VerifyReport) R.Result[bool, str] {
+    if (ins.kind != instruction.OP_CALL) { ret R.ok[bool, str](true); }
+    if (ins.operand_count == 0)          { ret R.ok[bool, str](true); }
+
+    val ot: O.Option[*type.IrType] = type.get(?m.types, ins.aux_ty);
+    if (!O.is_some[*type.IrType](ot))    { ret R.ok[bool, str](true); }
+    val sig: *type.IrType = O.unwrap[*type.IrType](ot);
+    if (sig.kind != type.IRT_FN)         { ret R.ok[bool, str](true); }
+
+    val pc: u32 = sig.data.fn.param_count;
+    var i: u32 = 0;
+    for (i < pc) {
+        val argix: u32 = i + 1;
+        # fewer operands than declared params is a wrong-arity call (VC_OPERAND_TYPE);
+        # stop rather than read past the operand list.
+        if (argix >= ins.operand_count) { ret R.ok[bool, str](true); }
+        if (!call_arg_type_ok(m, sig.data.fn.params[i], ins.operands[argix].ty)) {
+            val rr: R.Result[bool, str] = push(r, fi, bid, iid, VC_CALL_ARG_TYPE);
+            if (R.is_err[bool, str](rr)) { ret rr; }
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# whether a call argument operand type `q` agrees with the declared parameter type
+# `p`. an aggregate parameter takes its value by address, so it must receive an
+# aggregate operand (also by address) - a pointer or scalar operand there is the
+# #2035 mis-typing. two distinct aggregate ids are accepted: the verifier has no
+# target, so it cannot compare their ABI classification, but both flowing by
+# address is the load-bearing invariant. a non-aggregate pointer parameter
+# accepts any address form (ptr / fnptr / aggregate-by-address / nil), the same
+# leniency the binary-agree check grants; every other parameter needs an exact
+# match. an IRT_NIL sentinel on either side carries no information to check against
+# ---
+# m:   the enclosing module (type-table oracle)
+# p:   the declared parameter type
+# q:   the argument operand type
+# ret: true when the argument type agrees with the parameter type
+fun call_arg_type_ok(m: *ir.Module, p: type.IrTypeId, q: type.IrTypeId) bool {
+    if (p == q)                                 { ret true; }
+    if (p == type.IRT_NIL || q == type.IRT_NIL) { ret true; }
+    # a vector parameter's passing model is target-dependent: register-class on a
+    # capable target (the `p == q` vector match above) or memory-class under
+    # scalarization (#2016), where the argument is retyped to flow by address. the
+    # verifier is target-less, so accept the union - a by-address argument (pointerish
+    # or aggregate-by-address) against a vector parameter is the scalarized form (#2086).
+    if (type.is_vector(?m.types, p))            { ret is_pointerish(m, q) || type.is_aggregate(?m.types, q); }
+    if (type.is_aggregate(?m.types, p))         { ret type.is_aggregate(?m.types, q); }
+    if (is_pointerish(m, p) && is_pointerish(m, q)) { ret true; }
+    ret false;
 }
 
 # true for the binary and comparison opcodes whose two operands must share a
@@ -1972,5 +2058,108 @@ test "mach.lang.me.ir.verify.check_type_agree:vector_ops_and_mask_compare" {
     if (R.is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
 
     if (t_total(?env, true, false) != 0) { ret 1; }
+    ret 0;
+}
+
+# always on (no repr gate): a direct call whose fixed aggregate argument is
+# mis-typed to a plain pointer - the #2035 stamp-destroying clobber - is rejected,
+# while the well-typed aggregate argument passes. this is the durable tripwire that
+# keeps the #2035 defect class from shipping once generic instances carry real
+# signatures
+test "mach.lang.me.ir.verify.check_call_arg_types:aggregate_arg_pointer_mistype" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    if (b0 != 0) { ret 1; }
+    builder.set_block(?env.bld, b0);
+
+    # a 32-byte aggregate parameter type and a plain pointer type.
+    val agr: R.Result[type.IrTypeId, str] = type.intern_array(?env.m.types, env.i64ty, 4);
+    if (R.is_err[type.IrTypeId, str](agr)) { ret 1; }
+    val aggty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](agr);
+    val pr: R.Result[type.IrTypeId, str] = type.intern_ptr(?env.m.types);
+    if (R.is_err[type.IrTypeId, str](pr)) { ret 1; }
+    val ptrty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](pr);
+
+    # a callee `fn(aggty) -> i64`, referenced as an extern declaration.
+    var pbuf: type.IrTypeId = aggty;
+    val sr: R.Result[type.IrTypeId, str] = type.intern_fn(?env.m.types, env.i64ty, ?pbuf, 1);
+    if (R.is_err[type.IrTypeId, str](sr)) { ret 1; }
+    val calleesig: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](sr);
+    val cfr: R.Result[u32, str] = ir.function_add(?env.m, intern.STR_NIL, calleesig, ir.FN_FLAG_EXTERN);
+    if (R.is_err[u32, str](cfr)) { ret 1; }
+    val cidx: u32 = R.unwrap_ok[u32, str](cfr);
+
+    # well-typed: the aggregate argument carries the aggregate type by address.
+    var abuf: value.Value = value.param(0, aggty);
+    val callr: R.Result[value.Value, str] = builder.emit_call(?env.bld, value.fn(cidx, calleesig), ?abuf, 1, env.i64ty);
+    if (R.is_err[value.Value, str](callr)) { ret 1; }
+    val callv: value.Value = R.unwrap_ok[value.Value, str](callr);
+    if (R.is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+
+    # always on (repr=false): the well-typed call records no violation.
+    if (t_count(?env, false, false, VC_CALL_ARG_TYPE) != 0) { ret 1; }
+
+    # clobber the argument operand's type to a plain pointer (the #2035 mis-typing).
+    val cid: id.InstructionId = callv.data.instr;
+    env.m.functions[0].instrs[cid].operands[1].ty = ptrty;
+
+    # the always-on check now fires, without repr.
+    if (t_count(?env, false, false, VC_CALL_ARG_TYPE) < 1) { ret 1; }
+    ret 0;
+}
+
+# always on (no repr gate): a vector parameter's passing model is target-dependent -
+# register-class on a capable target (the argument stays vector-typed) and memory-class
+# under scalarization (#2016), where the pass retypes the argument to a plain pointer.
+# the target-less verifier must accept both, so a `ptr` (or aggregate-by-address)
+# argument to a vector-typed callee parameter records no violation - the #2086 false
+# positive that hard-gated every rv64 vector call. a bare scalar argument is still
+# rejected, so the relaxation stays by-address only and the #2035 discipline holds
+test "mach.lang.me.ir.verify.check_call_arg_types:vector_param_accepts_by_address_arg" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+    val b0: id.BlockId = t_block(?env);
+    if (b0 != 0) { ret 1; }
+    builder.set_block(?env.bld, b0);
+
+    # an i32x4 vector parameter type and a plain pointer type.
+    val ei: R.Result[type.IrTypeId, str] = type.intern_int(?env.m.types, 32);
+    if (R.is_err[type.IrTypeId, str](ei)) { ret 1; }
+    val vr: R.Result[type.IrTypeId, str] = type.intern_vector(?env.m.types, R.unwrap_ok[type.IrTypeId, str](ei), 4);
+    if (R.is_err[type.IrTypeId, str](vr)) { ret 1; }
+    val vecty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](vr);
+    val pr: R.Result[type.IrTypeId, str] = type.intern_ptr(?env.m.types);
+    if (R.is_err[type.IrTypeId, str](pr)) { ret 1; }
+    val ptrty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](pr);
+
+    # a callee `fn(i32x4) -> i64`, referenced as an extern declaration.
+    var pbuf: type.IrTypeId = vecty;
+    val sr: R.Result[type.IrTypeId, str] = type.intern_fn(?env.m.types, env.i64ty, ?pbuf, 1);
+    if (R.is_err[type.IrTypeId, str](sr)) { ret 1; }
+    val calleesig: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](sr);
+    val cfr: R.Result[u32, str] = ir.function_add(?env.m, intern.STR_NIL, calleesig, ir.FN_FLAG_EXTERN);
+    if (R.is_err[u32, str](cfr)) { ret 1; }
+    val cidx: u32 = R.unwrap_ok[u32, str](cfr);
+
+    # well-typed on a capable target: the argument carries the vector type (p == q).
+    var abuf: value.Value = value.param(0, vecty);
+    val callr: R.Result[value.Value, str] = builder.emit_call(?env.bld, value.fn(cidx, calleesig), ?abuf, 1, env.i64ty);
+    if (R.is_err[value.Value, str](callr)) { ret 1; }
+    val callv: value.Value = R.unwrap_ok[value.Value, str](callr);
+    if (R.is_err[bool, str](builder.emit_ret_void(?env.bld))) { ret 1; }
+    val cid: id.InstructionId = callv.data.instr;
+
+    # capable target: the vector argument matches the vector parameter, no violation.
+    if (t_count(?env, false, false, VC_CALL_ARG_TYPE) != 0) { ret 1; }
+
+    # scalarized (rv64): the argument is retyped to a plain pointer - still accepted.
+    env.m.functions[0].instrs[cid].operands[1].ty = ptrty;
+    if (t_count(?env, false, false, VC_CALL_ARG_TYPE) != 0) { ret 1; }
+
+    # a bare scalar is not a by-address form, so the check still fires against a vector
+    # parameter - the relaxation is bounded.
+    env.m.functions[0].instrs[cid].operands[1].ty = env.i64ty;
+    if (t_count(?env, false, false, VC_CALL_ARG_TYPE) < 1) { ret 1; }
     ret 0;
 }

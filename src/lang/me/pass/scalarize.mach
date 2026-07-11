@@ -400,6 +400,20 @@ fun expand_compare(c: *Ctx, blk: *ir.Block, kind: instruction.InstrKind, dst: va
     if (R.is_err[ir_type.IrTypeId, str](ram)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ram)); }
     val arr_mask: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ram);
 
+    # a signed ordering compare of a sub-word lane must sign-extend both operands to a
+    # register-canonical width before the scalar compare: rv64's sub-word integer loads
+    # zero-extend (lbu / lhu), so a negative i8 / i16 lane would otherwise be read as its
+    # large unsigned bit pattern and `-1 < 0` would evaluate false (#2077). i32 / i64
+    # lanes load sign-canonical (lw / ld), and equality / unsigned relations read the
+    # zero-extended lane correctly, so neither needs the extension.
+    val need_sext: bool = (kind == instruction.OP_CMP_LT_S || kind == instruction.OP_CMP_LE_S) && op.bits < 32;
+    var ext_ty: ir_type.IrTypeId = ir_type.IRT_NIL;
+    if (need_sext) {
+        val rx: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?c.m.types, 32);
+        if (R.is_err[ir_type.IrTypeId, str](rx)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rx)); }
+        ext_ty = R.unwrap_ok[ir_type.IrTypeId, str](rx);
+    }
+
     var k: u32 = 0;
     for (k < op.lanes) {
         val pa: R.Result[value.Value, str] = lane_ptr(c, blk, a, arr_op, k, loc);
@@ -412,8 +426,21 @@ fun expand_compare(c: *Ctx, blk: *ir.Block, kind: instruction.InstrKind, dst: va
         val vb: R.Result[value.Value, str] = emit_load(c, blk, R.unwrap_ok[value.Value, str](pb), op.elem, loc);
         if (R.is_err[value.Value, str](vb)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](vb)); }
 
+        var la: value.Value = R.unwrap_ok[value.Value, str](va);
+        var lb: value.Value = R.unwrap_ok[value.Value, str](vb);
+        # sign-extend the narrow signed operands (see need_sext above) so the scalar
+        # compare reads them at register width in two's complement.
+        if (need_sext) {
+            val sa: R.Result[value.Value, str] = emit_unop(c, blk, instruction.OP_SEXT, ext_ty, la, loc);
+            if (R.is_err[value.Value, str](sa)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](sa)); }
+            la = R.unwrap_ok[value.Value, str](sa);
+            val sb: R.Result[value.Value, str] = emit_unop(c, blk, instruction.OP_SEXT, ext_ty, lb, loc);
+            if (R.is_err[value.Value, str](sb)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](sb)); }
+            lb = R.unwrap_ok[value.Value, str](sb);
+        }
+
         # a scalar compare of the two lanes yields an 8-bit 0/1 boolean.
-        val cmp: R.Result[value.Value, str] = emit_binop(c, blk, kind, i8_ty, R.unwrap_ok[value.Value, str](va), R.unwrap_ok[value.Value, str](vb), loc);
+        val cmp: R.Result[value.Value, str] = emit_binop(c, blk, kind, i8_ty, la, lb, loc);
         if (R.is_err[value.Value, str](cmp)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](cmp)); }
         var wide: value.Value = R.unwrap_ok[value.Value, str](cmp);
 
@@ -827,5 +854,82 @@ test "mach.lang.me.pass.scalarize.detect:counts_only_vector_operators" {
     if (site.op != instruction.OP_ADD)       { ir.dnit(?m); ret 1; }
 
     ir.dnit(?m);
+    ret 0;
+}
+
+# build a one-function module holding a single lane-wise vector compare of `kind`
+# over `elem_bits`-wide, `lanes`-lane integer vectors, scalarize it for `tgt`, and
+# return the number of OP_SEXT instructions the expansion emitted
+#
+# The pass emits OP_SEXT only to sign-extend a narrow signed ordering compare's
+# operands (#2077), so the count discriminates the fixed signed sub-word path (two
+# extends per lane) from equality / unsigned / register-width lanes (none). Returns
+# a large sentinel on any construction error so a failed setup never reads as a pass.
+fun sext_count(tgt: *target.Target, kind: instruction.InstrKind, elem_bits: u32, lanes: u32) u32 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 0xFFFFFFFF; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val res_e: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, elem_bits);
+    if (R.is_err[ir_type.IrTypeId, str](res_e)) { ir.dnit(?m); ret 0xFFFFFFFF; }
+    val elem: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_e);
+    val res_v: R.Result[ir_type.IrTypeId, str] = ir_type.intern_vector(?m.types, elem, lanes);
+    if (R.is_err[ir_type.IrTypeId, str](res_v)) { ir.dnit(?m); ret 0xFFFFFFFF; }
+    val vec: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_v);
+
+    val res_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { ir.dnit(?m); ret 0xFFFFFFFF; }
+    val fidx: u32 = R.unwrap_ok[u32, str](res_fn);
+    val fn: *ir.Function = ?m.functions[fidx];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val res_blk: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_blk)) { ir.dnit(?m); ret 0xFFFFFFFF; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](res_blk));
+
+    # two vector operands and a same-shape mask result; the operand element width is
+    # what selects the sign-extension, so the mask type reuses the operand vector.
+    val pv0: value.Value = value.param(0, vec);
+    val pv1: value.Value = value.param(1, vec);
+    if (R.is_err[value.Value, str](builder.emit_vcompare(?bld, kind, pv0, pv1, vec))) { ir.dnit(?m); ret 0xFFFFFFFF; }
+
+    if (R.is_err[bool, str](run(?m, tgt))) { ir.dnit(?m); ret 0xFFFFFFFF; }
+
+    val fnc: *ir.Function = ?m.functions[fidx];
+    var count: u32 = 0;
+    var i: u32 = 0;
+    for (i < fnc.instr_len) {
+        if (fnc.instrs[i].kind == instruction.OP_SEXT) { count = count + 1; }
+        i = i + 1;
+    }
+    ir.dnit(?m);
+    ret count;
+}
+
+# a signed sub-word ordering compare sign-extends both operands per lane so rv64's
+# 64-bit `slt` reads a negative i8 / i16 lane correctly; equality, unsigned relations,
+# and register-width lanes read the loaded lane directly (#2077). the OP_SEXT count is
+# the discriminator: the sign-straddling case (`-1 < 0`) is correct only with these,
+# and the small values the bug tolerates would not exercise the difference
+test "mach.lang.me.pass.scalarize.expand_compare:sign_extends_narrow_signed_lanes" {
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val rt: R.Result[target.Target, str] = target.select_of(?reg, "riscv64", "linux", "lp64", "");
+    if (R.is_err[target.Target, str](rt)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](rt);
+
+    # signed narrow ordering compares sign-extend both operands per lane: 8 i16 lanes
+    # -> 16 sexts, 16 i8 lanes -> 32.
+    if (sext_count(?tgt, instruction.OP_CMP_LT_S, 16, 8) != 16)  { ret 1; }
+    if (sext_count(?tgt, instruction.OP_CMP_LE_S, 8, 16) != 32)  { ret 1; }
+
+    # equality, unsigned relations, and register-width (i32) signed lanes emit none.
+    if (sext_count(?tgt, instruction.OP_CMP_EQ, 16, 8) != 0)     { ret 1; }
+    if (sext_count(?tgt, instruction.OP_CMP_LT_U, 16, 8) != 0)   { ret 1; }
+    if (sext_count(?tgt, instruction.OP_CMP_LT_S, 32, 4) != 0)   { ret 1; }
+
     ret 0;
 }

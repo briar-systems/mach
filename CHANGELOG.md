@@ -5,6 +5,53 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.5.0] - 2026-07-11
+
+The data-imports and correctness release. `ext val` / `ext var` land as the
+data analogue of `ext fun` — imported data resolves through the GOT on dynamic
+targets — and the defect trail exposed by the vector library build-out is
+closed: two aarch64 SIMD criticals, the riscv64 scalarized compare, and the
+generic-instance signature gap behind the 1.0.0-era inliner miscompile's ABI
+fragility. Built with mach 3.4.4.
+
+### Added
+- language: **`ext val` / `ext var` foreign data imports** — storage-less
+  declarations mirroring `ext fun` (no initializer; the `symbol` and `library`
+  decorators work as for functions). On a dynamic target the reference is
+  GOT-indirect (ELF `R_*_GLOB_DAT`, eager-bound); a same-artifact cross-module
+  reference keeps direct addressing. Data imports in a shared object are
+  exec-only for now (loud error); the executed-`dlopen` bind is tracked at
+  #1885. Seed note: `ext var` parses under the 3.4.4 seed, in-tree `ext val`
+  needs this release as seed (#2026, #2079).
+- codegen: **the always-on call-argument typing verifier** — every direct
+  call's fixed arguments are checked against the callee's declared signature
+  at build time, making the #2035 mis-typing class structurally unshippable;
+  vector parameters accept the scalarized by-address form (#2063, #2080,
+  #2086, #2088).
+- diag: the emitted-IR printer renders extern-decl signatures and per-operand
+  types (#2065, #2078).
+- test: the riscv64 vectors int case — the first end-to-end rv64 vector
+  build + runtime coverage (qemu leg); it caught #2077 and #2086 before it
+  merged (#2075, #2076).
+
+### Fixed
+- codegen: **generic, comptime-value, and pack instance callee references
+  carry their true signature** instead of a bare pointer, so a direct call
+  classifies its ABI from the declared parameter types rather than per-operand
+  stamps — the structural fix behind the #2035 miscompile class (#2063, #2080).
+- codegen: **aarch64 same-bank vector bit-reinterpret (`:~`) materializes the
+  register copy** — it previously selected a GP move that never wrote the
+  vector destination: garbage lanes or SIGSEGV on every float/signed
+  select-via-mask since v3.4.0 (#2082, #2083).
+- codegen: **an aarch64 128-bit vector live across a call keeps its upper
+  lanes** — AAPCS64 callee-saves only the low 64 bits of V8-V15, so the
+  allocator now spills a vector around a call instead of parking it there;
+  modeled as a per-ABI fact, win64's full-width XMM6-15 preservation untouched
+  (#2085, #2089).
+- codegen: **riscv64 scalarized signed i8/i16 vector ordering compares
+  sign-extend their lanes** before the register-width compare — `-1 < 0` no
+  longer evaluates false under scalarization (#2077, #2084).
+
 ## [3.4.4] - 2026-07-11
 
 The vector compare/merge patch — two more shipped miscompiles caught by the
