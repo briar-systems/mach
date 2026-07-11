@@ -35,6 +35,7 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
+use mach.lang.intern;
 use mach.lang.me.ir;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
@@ -81,23 +82,33 @@ rec VInfo {
     bits:  u32;
 }
 
-# whether a binary opcode is a lane-wise vector arithmetic / bitwise operator
+# whether a binary opcode is a lane-wise vector arithmetic / bitwise operator in the
+# increment-1 table
 #
-# The full arithmetic / bitwise binary family: whenever the result is vector-typed
-# the operator expands per lane. Illegal-on-vectors opcodes (integer `/` `%`) never
-# reach here from sema, but a per-lane expansion of them is still well-defined, so
-# the classifier stays total rather than partial.
+# The legal set (#1965, narrowed by #2030): float `+ - * /` (float `/` lowers to
+# OP_DIV_U), integer `+ -` at all widths, integer `*` on 16-bit lanes, and bitwise
+# `& | ^`. Integer `/` `%` and shifts are NOT in the table -- `is_disallowed_op`
+# rejects them loudly rather than silently expanding a form the language does not
+# admit.
 fun is_binary_op(k: instruction.InstrKind) bool {
     ret k == instruction.OP_ADD || k == instruction.OP_SUB || k == instruction.OP_MUL
-        || k == instruction.OP_DIV_S || k == instruction.OP_DIV_U
-        || k == instruction.OP_REM_S || k == instruction.OP_REM_U
-        || k == instruction.OP_AND || k == instruction.OP_OR || k == instruction.OP_XOR
-        || k == instruction.OP_SHL || k == instruction.OP_SHR_S || k == instruction.OP_SHR_U;
+        || k == instruction.OP_DIV_U
+        || k == instruction.OP_AND || k == instruction.OP_OR || k == instruction.OP_XOR;
 }
 
-# whether a unary opcode is a lane-wise vector operator (bitwise not, negate)
+# whether a unary opcode is a lane-wise vector operator (bitwise not)
 fun is_unary_op(k: instruction.InstrKind) bool {
-    ret k == instruction.OP_NOT || k == instruction.OP_NEG;
+    ret k == instruction.OP_NOT;
+}
+
+# whether an opcode is a vector operator OUTSIDE the increment-1 table: a shift
+# (per-lane variable shift is AVX2/NEON-only, deferred by #2030), integer `/` `%`,
+# or negate. A vector value carrying one is a defined loud error, never a silent
+# expansion of a form sema is meant to reject.
+fun is_disallowed_op(k: instruction.InstrKind) bool {
+    ret k == instruction.OP_SHL || k == instruction.OP_SHR_S || k == instruction.OP_SHR_U
+        || k == instruction.OP_DIV_S || k == instruction.OP_REM_S || k == instruction.OP_REM_U
+        || k == instruction.OP_NEG;
 }
 
 # whether an opcode is a lane-wise vector comparison (result is the same-shape mask)
@@ -105,6 +116,16 @@ fun is_compare_op(k: instruction.InstrKind) bool {
     ret k == instruction.OP_CMP_EQ || k == instruction.OP_CMP_NE
         || k == instruction.OP_CMP_LT_S || k == instruction.OP_CMP_LT_U
         || k == instruction.OP_CMP_LE_S || k == instruction.OP_CMP_LE_U;
+}
+
+# whether an instruction is a lane-wise vector OPERATOR (the unit the note counts and
+# the require lever names)
+#
+# Exactly the arithmetic / unary / comparison operators the pass expands per lane;
+# loads, stores, phis, and calls carry vectors but are not operators.
+fun is_operator(m: *ir.Module, inst: *instruction.Instruction) bool {
+    if (!ir_type.is_vector(?m.types, inst.ty)) { ret false; }
+    ret is_binary_op(inst.kind) || is_unary_op(inst.kind) || is_compare_op(inst.kind);
 }
 
 # whether an instruction produces a vector result that needs a backing stack slot
@@ -116,6 +137,58 @@ fun produces_vector(m: *ir.Module, inst: *instruction.Instruction) bool {
     if (!ir_type.is_vector(?m.types, inst.ty)) { ret false; }
     ret is_binary_op(inst.kind) || is_unary_op(inst.kind) || is_compare_op(inst.kind)
         || inst.kind == instruction.OP_LOAD;
+}
+
+# a single would-scalarize site: the operator's opcode and its containing function
+#
+# The shared detection currency between this child's build-time note and the profile
+# lever's (#2017) `require`-mode error, so both name the same operators by
+# construction rather than re-deriving them from two independent walks.
+pub rec ScalarizeSite {
+    fn_name: intern.StrId;
+    op:      instruction.InstrKind;
+}
+
+# count the lane-wise vector operators in `m` that would scalarize on a SIMD-incapable
+# target, filling `first` with the earliest one in program order
+#
+# Read-only: it inspects the IR without transforming it, so the profile lever can
+# call it under `require` (where the pass must not run) and this child calls it to set
+# the note count -- both over the identical operator set. Walks block-listed
+# instructions (the ones the pass would expand); phis / calls / loads / stores carry
+# vectors but are not operators and are not counted.
+# ---
+# m:     the module to inspect
+# first: filled with the first operator's { containing function name, opcode } when
+#        the returned count is > 0; left unset when the count is 0
+# ret:   the number of would-scalarize vector operators in the module
+pub fun detect(m: *ir.Module, first: *ScalarizeSite) u32 {
+    var count: u32 = 0;
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        if ((fn.flags & ir.FN_FLAG_EXTERN) == 0) {
+            var bi: u32 = 0;
+            for (bi < fn.block_count) {
+                val blk: *ir.Block = ?fn.blocks[bi];
+                var ii: u32 = 0;
+                for (ii < blk.instr_count) {
+                    val inst: *instruction.Instruction = ?fn.instrs[blk.instructions[ii]::u32];
+                    if (is_operator(m, inst)) {
+                        if (count == 0) {
+                            first.fn_name = fn.name;
+                            first.op      = inst.kind;
+                        }
+                        count = count + 1;
+                    }
+                    ii = ii + 1;
+                }
+                bi = bi + 1;
+            }
+        }
+        fi = fi + 1;
+    }
+    ret count;
 }
 
 # read a vector type's element / lane / bit-width descriptor
@@ -423,11 +496,8 @@ fun retype_aux(c: *Ctx, inst: *instruction.Instruction) R.Result[bool, str] {
     ret R.ok[bool, str](true);
 }
 
-# legalize one function, returning the number of vector OPERATORS scalarized
-#
-# The operator tally counts arithmetic / unary / comparison expansions only; the
-# supporting loads, stores, and moves are not operators.
-fun scalarize_function(c: *Ctx, i8_ty: ir_type.IrTypeId) R.Result[u32, str] {
+# legalize one function: no IRT_VECTOR value or operand survives afterward
+fun scalarize_function(c: *Ctx, i8_ty: ir_type.IrTypeId) R.Result[bool, str] {
     val fn: *ir.Function = c.fn;
 
     # slot ids created in the pre-pass, prepended to the entry block in the fill pass.
@@ -435,7 +505,7 @@ fun scalarize_function(c: *Ctx, i8_ty: ir_type.IrTypeId) R.Result[u32, str] {
     var slot_len: u32 = 0;
     if (c.n > 0) {
         val rs: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](c.m.alloc, c.n::usize);
-        if (R.is_err[*id.InstructionId, str](rs)) { ret R.err[u32, str](R.unwrap_err[*id.InstructionId, str](rs)); }
+        if (R.is_err[*id.InstructionId, str](rs)) { ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](rs)); }
         slots = R.unwrap_ok[*id.InstructionId, str](rs);
     }
 
@@ -445,13 +515,19 @@ fun scalarize_function(c: *Ctx, i8_ty: ir_type.IrTypeId) R.Result[u32, str] {
     var iid: u32 = 0;
     for (iid < c.n) {
         val inst: *instruction.Instruction = ?fn.instrs[iid];
+        # a vector operator outside the increment-1 table (a shift, integer `/` `%`,
+        # negate) is a defined loud error, never a silent expansion (#2030).
+        if (ir_type.is_vector(?c.m.types, inst.ty) && is_disallowed_op(inst.kind)) {
+            slots_free(c, slots);
+            ret R.err[bool, str]("scalarize: vector operator is not in the increment-1 table (shift / integer div-rem / negate)");
+        }
         if (inst.kind == instruction.OP_ALLOCA || inst.kind == instruction.OP_GEP) {
             val rr: R.Result[bool, str] = retype_aux(c, inst);
-            if (R.is_err[bool, str](rr)) { slots_free(c, slots); ret R.err[u32, str](R.unwrap_err[bool, str](rr)); }
+            if (R.is_err[bool, str](rr)) { slots_free(c, slots); ret rr; }
         } or (produces_vector(c.m, inst)) {
             val vty: ir_type.IrTypeId = inst.ty;
             val ms: R.Result[value.Value, str] = make_slot(c, vty, slots, ?slot_len);
-            if (R.is_err[value.Value, str](ms)) { slots_free(c, slots); ret R.err[u32, str](R.unwrap_err[value.Value, str](ms)); }
+            if (R.is_err[value.Value, str](ms)) { slots_free(c, slots); ret R.err[bool, str](R.unwrap_err[value.Value, str](ms)); }
             c.pval[iid]     = R.unwrap_ok[value.Value, str](ms);
             c.pval_set[iid] = true;
         } or (inst.kind == instruction.OP_PHI && ir_type.is_vector(?c.m.types, inst.ty)) {
@@ -468,18 +544,16 @@ fun scalarize_function(c: *Ctx, i8_ty: ir_type.IrTypeId) R.Result[u32, str] {
 
     # fill pass: rewrite each block's body, expanding operators and copying loads /
     # stores; rewrite phi value operands and the terminator in place.
-    var count: u32 = 0;
     var bi: u32 = 0;
     for (bi < fn.block_count) {
         val blk: *ir.Block = ?fn.blocks[bi];
-        val rf: R.Result[u32, str] = fill_block(c, blk, bi == 0, slots, slot_len, i8_ty, count);
-        if (R.is_err[u32, str](rf)) { slots_free(c, slots); ret rf; }
-        count = R.unwrap_ok[u32, str](rf);
+        val rf: R.Result[bool, str] = fill_block(c, blk, bi == 0, slots, slot_len, i8_ty);
+        if (R.is_err[bool, str](rf)) { slots_free(c, slots); ret rf; }
         bi = bi + 1;
     }
 
     slots_free(c, slots);
-    ret R.ok[u32, str](count);
+    ret R.ok[bool, str](true);
 }
 
 # free the pre-pass slot-id scratch array
@@ -489,10 +563,9 @@ fun slots_free(c: *Ctx, slots: *id.InstructionId) {
     }
 }
 
-# rebuild one block's body, expanding vector operators; returns the running operator tally
-fun fill_block(c: *Ctx, blk: *ir.Block, is_entry: bool, slots: *id.InstructionId, slot_len: u32, i8_ty: ir_type.IrTypeId, count_in: u32) R.Result[u32, str] {
+# rebuild one block's body, expanding vector operators into per-lane scalar sequences
+fun fill_block(c: *Ctx, blk: *ir.Block, is_entry: bool, slots: *id.InstructionId, slot_len: u32, i8_ty: ir_type.IrTypeId) R.Result[bool, str] {
     val fn: *ir.Function = c.fn;
-    var count: u32 = count_in;
 
     # snapshot the old body ids: the fill re-appends into a cleared body, and emits
     # fresh instructions between them, so the original order is preserved.
@@ -500,7 +573,7 @@ fun fill_block(c: *Ctx, blk: *ir.Block, is_entry: bool, slots: *id.InstructionId
     var old: *id.InstructionId = nil;
     if (old_len > 0) {
         val ro: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](c.m.alloc, old_len::usize);
-        if (R.is_err[*id.InstructionId, str](ro)) { ret R.err[u32, str](R.unwrap_err[*id.InstructionId, str](ro)); }
+        if (R.is_err[*id.InstructionId, str](ro)) { ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](ro)); }
         old = R.unwrap_ok[*id.InstructionId, str](ro);
         var i: u32 = 0;
         for (i < old_len) { old[i] = blk.instructions[i]; i = i + 1; }
@@ -512,7 +585,7 @@ fun fill_block(c: *Ctx, blk: *ir.Block, is_entry: bool, slots: *id.InstructionId
         var s: u32 = 0;
         for (s < slot_len) {
             val ra: R.Result[bool, str] = ir.block_append_instr(c.m, blk, slots[s]);
-            if (R.is_err[bool, str](ra)) { body_free(c, old, old_len); ret R.err[u32, str](R.unwrap_err[bool, str](ra)); }
+            if (R.is_err[bool, str](ra)) { body_free(c, old, old_len); ret ra; }
             s = s + 1;
         }
     }
@@ -520,9 +593,8 @@ fun fill_block(c: *Ctx, blk: *ir.Block, is_entry: bool, slots: *id.InstructionId
     var oi: u32 = 0;
     for (oi < old_len) {
         val cur: id.InstructionId = old[oi];
-        val rr: R.Result[u32, str] = fill_one(c, blk, cur, i8_ty, count);
-        if (R.is_err[u32, str](rr)) { body_free(c, old, old_len); ret rr; }
-        count = R.unwrap_ok[u32, str](rr);
+        val rr: R.Result[bool, str] = fill_one(c, blk, cur, i8_ty);
+        if (R.is_err[bool, str](rr)) { body_free(c, old, old_len); ret rr; }
         oi = oi + 1;
     }
 
@@ -538,7 +610,7 @@ fun fill_block(c: *Ctx, blk: *ir.Block, is_entry: bool, slots: *id.InstructionId
     if (blk.terminator != id.INSTR_NIL) {
         rewrite_ops(c, ?fn.instrs[blk.terminator::u32]);
     }
-    ret R.ok[u32, str](count);
+    ret R.ok[bool, str](true);
 }
 
 # free the snapshot body-id array
@@ -550,9 +622,8 @@ fun body_free(c: *Ctx, old: *id.InstructionId, old_len: u32) {
 
 # process one original body instruction: expand a vector operator, copy a vector
 # load / store, or keep and operand-rewrite anything else
-fun fill_one(c: *Ctx, blk: *ir.Block, cur: id.InstructionId, i8_ty: ir_type.IrTypeId, count_in: u32) R.Result[u32, str] {
+fun fill_one(c: *Ctx, blk: *ir.Block, cur: id.InstructionId, i8_ty: ir_type.IrTypeId) R.Result[bool, str] {
     val fn: *ir.Function = c.fn;
-    var count: u32 = count_in;
 
     # copy out everything read from the instruction: emitting fresh instructions can
     # reallocate the pool and invalidate this pointer.
@@ -571,34 +642,26 @@ fun fill_one(c: *Ctx, blk: *ir.Block, cur: id.InstructionId, i8_ty: ir_type.IrTy
             val op0ty: ir_type.IrTypeId = ip.operands[0].ty;
             var opi: VInfo;
             val re: R.Result[bool, str] = vec_info(c.m, op0ty, ?opi);
-            if (R.is_err[bool, str](re)) { ret R.err[u32, str](R.unwrap_err[bool, str](re)); }
+            if (R.is_err[bool, str](re)) { ret re; }
             var mi: VInfo;
             val rm: R.Result[bool, str] = vec_info(c.m, ty, ?mi);
-            if (R.is_err[bool, str](rm)) { ret R.err[u32, str](R.unwrap_err[bool, str](rm)); }
-            val rx: R.Result[bool, str] = expand_compare(c, blk, kind, dst, op0, op1, opi, mi, i8_ty, loc);
-            if (R.is_err[bool, str](rx)) { ret R.err[u32, str](R.unwrap_err[bool, str](rx)); }
-            ret R.ok[u32, str](count + 1);
+            if (R.is_err[bool, str](rm)) { ret rm; }
+            ret expand_compare(c, blk, kind, dst, op0, op1, opi, mi, i8_ty, loc);
         }
         var vi: VInfo;
         val rv: R.Result[bool, str] = vec_info(c.m, ty, ?vi);
-        if (R.is_err[bool, str](rv)) { ret R.err[u32, str](R.unwrap_err[bool, str](rv)); }
+        if (R.is_err[bool, str](rv)) { ret rv; }
         if (kind == instruction.OP_LOAD) {
             val src: value.Value = resolve(c, ip.operands[0]);
-            val rc: R.Result[bool, str] = copy_vector(c, blk, dst, src, vi, loc);
-            if (R.is_err[bool, str](rc)) { ret R.err[u32, str](R.unwrap_err[bool, str](rc)); }
-            ret R.ok[u32, str](count);
+            ret copy_vector(c, blk, dst, src, vi, loc);
         }
         if (is_unary_op(kind)) {
             val a: value.Value = resolve(c, ip.operands[0]);
-            val ru: R.Result[bool, str] = expand_unary(c, blk, kind, dst, a, vi, loc);
-            if (R.is_err[bool, str](ru)) { ret R.err[u32, str](R.unwrap_err[bool, str](ru)); }
-            ret R.ok[u32, str](count + 1);
+            ret expand_unary(c, blk, kind, dst, a, vi, loc);
         }
         val a: value.Value = resolve(c, ip.operands[0]);
         val b: value.Value = resolve(c, ip.operands[1]);
-        val rb: R.Result[bool, str] = expand_binary(c, blk, kind, dst, a, b, vi, loc);
-        if (R.is_err[bool, str](rb)) { ret R.err[u32, str](R.unwrap_err[bool, str](rb)); }
-        ret R.ok[u32, str](count + 1);
+        ret expand_binary(c, blk, kind, dst, a, b, vi, loc);
     }
 
     # a whole-vector store: copy the source slot's 16 bytes to the destination.
@@ -608,33 +671,35 @@ fun fill_one(c: *Ctx, blk: *ir.Block, cur: id.InstructionId, i8_ty: ir_type.IrTy
         val vty:  ir_type.IrTypeId = ip.operands[0].ty;
         var vi: VInfo;
         val rv: R.Result[bool, str] = vec_info(c.m, vty, ?vi);
-        if (R.is_err[bool, str](rv)) { ret R.err[u32, str](R.unwrap_err[bool, str](rv)); }
-        val rc: R.Result[bool, str] = copy_vector(c, blk, dstp, srcv, vi, loc);
-        if (R.is_err[bool, str](rc)) { ret R.err[u32, str](R.unwrap_err[bool, str](rc)); }
-        ret R.ok[u32, str](count);
+        if (R.is_err[bool, str](rv)) { ret rv; }
+        ret copy_vector(c, blk, dstp, srcv, vi, loc);
     }
 
     # everything else is kept: rewrite its operands to the pointer representation and
     # re-link it into the rebuilt body in its original position.
     rewrite_ops(c, ?fn.instrs[cur::u32]);
-    val rl: R.Result[bool, str] = ir.block_append_instr(c.m, blk, cur);
-    if (R.is_err[bool, str](rl)) { ret R.err[u32, str](R.unwrap_err[bool, str](rl)); }
-    ret R.ok[u32, str](count);
+    ret ir.block_append_instr(c.m, blk, cur);
 }
 
 # scalarize every lane-wise vector value and operator in `m` for a SIMD-incapable
 # target; a no-op on a capable target (`has_v128 == true`)
 #
-# Records the number of vector operators scalarized (summed across the module's
-# functions) on `m.vector_ops_scalarized`, which the build path reads to surface the
-# one-shot scalarization note. This is the shared detection seam the profile lever
-# (#2017) turns into a `require`-mode error.
+# Records the number of vector operators scalarized on `m.vector_ops_scalarized` from
+# the shared `detect` walk (the same operator set the pass expands), which the build
+# path reads to surface the one-shot scalarization note. `detect` is the shared seam
+# the profile lever (#2017) turns into a `require`-mode error, so the note and that
+# error name the identical operators by construction.
 # ---
 # m:   the module to legalize in place
 # tgt: the target, consulted for the SIMD capability fact
 # ret: ok(true) on success, or an allocation / internal error
 pub fun run(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
     if (tgt.model.has_v128) { ret R.ok[bool, str](true); }
+
+    # record the operator count for the note from the same read-only walk the require
+    # lever consumes, before any expansion mutates the IR.
+    var first: ScalarizeSite;
+    m.vector_ops_scalarized = detect(m, ?first);
 
     val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
     if (R.is_err[ir_type.IrTypeId, str](rp)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rp)); }
@@ -653,7 +718,6 @@ pub fun run(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
     if (R.is_err[ir_type.IrTypeId, str](r8)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](r8)); }
     val i8_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r8);
 
-    var total: u32 = 0;
     var fi: u32 = 0;
     for (fi < m.function_len) {
         val fn: *ir.Function = ?m.functions[fi];
@@ -694,15 +758,13 @@ pub fun run(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
                 }
             }
 
-            val rf: R.Result[u32, str] = scalarize_function(?c, i8_ty);
+            val rf: R.Result[bool, str] = scalarize_function(?c, i8_ty);
             ctx_free(m, ?c);
-            if (R.is_err[u32, str](rf)) { ret R.err[bool, str](R.unwrap_err[u32, str](rf)); }
-            total = total + R.unwrap_ok[u32, str](rf);
+            if (R.is_err[bool, str](rf)) { ret rf; }
         }
         fi = fi + 1;
     }
 
-    m.vector_ops_scalarized = total;
     ret R.ok[bool, str](true);
 }
 
