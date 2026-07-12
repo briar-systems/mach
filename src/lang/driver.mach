@@ -10,6 +10,7 @@
 # environment when it later runs through resolve. The public entry is
 # build_project, which returns a fully populated Project or an error string.
 
+use std.allocator.arena;
 use std.allocator.page;
 use std.collections.map;
 use std.collections.sort;
@@ -40,6 +41,8 @@ use O: std.types.option;
 use R: std.types.result;
 use ctime: std.chrono.time;
 use sysos: std.system.os;
+use atomic: std.sync.atomic;
+use thread: std.sync.thread;
 use std.process.exec;
 use std.print;
 
@@ -289,6 +292,11 @@ pub rec ModuleEntry {
     sema_result:       *sema.SemaResult;
     ir_module:         *ir.Module;
     object_image:      *of.ObjectImage;
+    # a parallel-codegen prelude's finished image, already re-homed onto the
+    # session allocator and remapped into the session interner, waiting for
+    # Q_CODEGEN to adopt it as its value (nil on the serial path). session-owned,
+    # freed by the Q_CODEGEN handle's finalize once adopted.
+    staged_image:      *of.ObjectImage;
     stable_id:         session.StableModuleId;
     target_gated:      bool;
 }
@@ -392,6 +400,10 @@ pub rec Project {
     opt_level:    pipeline.OptLevel;
     verify_ir:    bool;
     test_mode:    bool;
+
+    # requested codegen worker count for the parallel back half (`--jobs`); 0 means
+    # auto (os.cpu_count). 1 forces the serial-equivalent single-worker path.
+    jobs:         u32;
 
     # set only while load_all_own_src loads orphan roots, so the load walk knows a
     # top-level `$error` guard it reaches marks a target-gated orphan to exclude
@@ -1434,6 +1446,7 @@ fun init_project(p: *Project, s: *session.Session) {
     p.opt_level     = pipeline.OPT_DEBUG;
     p.verify_ir     = false;
     p.test_mode     = false;
+    p.jobs          = 0;
     p.loading_orphans = false;
 }
 
@@ -1567,14 +1580,16 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
     }
     val bu: manifest.BuildUnit = R.unwrap_ok[manifest.BuildUnit, str](ur);
 
+    # the closed template-variable set for this build cell (#1964): the target tuple
+    # and profile every {target.*}/{profile.name} path and cmd expands against.
+    var cell_v: manifest.TmplVars = manifest.tmpl_vars_of(?p.s.interner, bu.target,
+        O.unwrap[str](intern.lookup(?p.s.interner, bu.profile_name)));
+
     # honest collision guard over every artifact for the selected target/profile.
-    val pn_opt: O.Option[str] = intern.lookup(?p.s.interner, bu.profile_name);
-    if (O.is_some[str](pn_opt)) {
-        val cr: R.Result[bool, str] = manifest.check_collisions(p.s.alloc, ?p.s.interner, ?m, bu.target, O.unwrap[str](pn_opt));
-        if (R.is_err[bool, str](cr)) {
-            manifest.dnit(?m, p.s.alloc);
-            ret R.err[bool, str](R.unwrap_err[bool, str](cr));
-        }
+    val cr: R.Result[bool, str] = manifest.check_collisions(p.s.alloc, ?p.s.interner, ?m, ?cell_v);
+    if (R.is_err[bool, str](cr)) {
+        manifest.dnit(?m, p.s.alloc);
+        ret R.err[bool, str](R.unwrap_err[bool, str](cr));
     }
 
     if (bu.warned) { emit_native_warning(p, bu.target_name); }
@@ -1631,10 +1646,8 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
     p.config.step_order       = nil;
     p.config.step_order_count = 0;
 
-    val tn_s: str = O.unwrap[str](intern.lookup(?p.s.interner, bu.target.name));
-    val pn_s: str = O.unwrap[str](intern.lookup(?p.s.interner, bu.profile_name));
     val out_tmpl_s: str = O.unwrap[str](intern.lookup(?p.s.interner, m.out_tmpl));
-    val res_project_out_str: R.Result[str, str] = manifest.expand(p.s.alloc, out_tmpl_s, "", tn_s, pn_s);
+    val res_project_out_str: R.Result[str, str] = manifest.expand(p.s.alloc, out_tmpl_s, "", ?cell_v);
     if (R.is_ok[str, str](res_project_out_str)) {
         val project_out_str: str = R.unwrap_ok[str, str](res_project_out_str);
         val res_po_id: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, project_out_str);
@@ -1644,7 +1657,7 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
         # up-front local link path validation (#1969): a `local` entry's path must
         # match a step's `out` (demanding it) or exist on disk; anything else errors
         # here naming the entry, instead of flowing to the linker to fail at link time.
-        val vr: R.Result[bool, str] = validate_local_links(p, project_root, ?m, bu.target, project_out_str, tn_s, pn_s);
+        val vr: R.Result[bool, str] = validate_local_links(p, project_root, ?m, bu.target, project_out_str, ?cell_v);
         if (R.is_err[bool, str](vr)) { str_free(p.s.alloc, project_out_str); manifest.dnit(?m, p.s.alloc); ret R.err[bool, str](R.unwrap_err[bool, str](vr)); }
 
         # `mach test` links the union of every artifact's referenced entries (native
@@ -1653,7 +1666,7 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
         if (is_test) {
             var test_items: *intern.StrId = nil;
             var test_count: u32 = 0;
-            val tlr: R.Result[bool, str] = manifest.resolve_test_libs(p.s.alloc, ?p.s.interner, ?m, bu.target, project_out_str, tn_s, pn_s, ?test_items, ?test_count);
+            val tlr: R.Result[bool, str] = manifest.resolve_test_libs(p.s.alloc, ?p.s.interner, ?m, bu.target, project_out_str, ?cell_v, ?test_items, ?test_count);
             if (R.is_err[bool, str](tlr)) { str_free(p.s.alloc, project_out_str); manifest.dnit(?m, p.s.alloc); ret R.err[bool, str](R.unwrap_err[bool, str](tlr)); }
             p.config.targets[0].libs      = test_items;
             p.config.targets[0].lib_count = test_count;
@@ -1661,7 +1674,7 @@ fun load_config(p: *Project, project_root: str, t: *toml.Table, sel: *manifest.S
 
         # compute which steps this build demands, in run order (#1970). indices are
         # into m.steps, which p.config.steps mirrors 1:1 when copied below.
-        val spr: R.Result[bool, str] = compute_step_plan(p, ?m, ?bu, is_test, for_union, project_out_str, tn_s, pn_s);
+        val spr: R.Result[bool, str] = compute_step_plan(p, ?m, ?bu, is_test, for_union, project_out_str, ?cell_v);
         if (R.is_err[bool, str](spr)) { str_free(p.s.alloc, project_out_str); manifest.dnit(?m, p.s.alloc); ret R.err[bool, str](R.unwrap_err[bool, str](spr)); }
         str_free(p.s.alloc, project_out_str);
     }
@@ -1977,10 +1990,9 @@ fun local_link_error(alloc: *A.Allocator, name: str, path: str) str {
 # is_test:  a `mach test` link (union of all artifacts)
 # for_union: a multi-artifact union build
 # proj_out: the expanded project out the entry paths and step outs home against
-# tn:       the target name for template expansion
-# pn:       the profile name for template expansion
+# v:        the target/profile template variables for path expansion
 fun compute_step_plan(p: *Project, m: *manifest.Manifest, bu: *manifest.BuildUnit,
-                      is_test: bool, for_union: bool, proj_out: str, tn: str, pn: str) R.Result[bool, str] {
+                      is_test: bool, for_union: bool, proj_out: str, v: *manifest.TmplVars) R.Result[bool, str] {
     p.config.step_order       = nil;
     p.config.step_order_count = 0;
     if (m.step_count == 0) { ret R.ok[bool, str](true); }
@@ -2005,7 +2017,7 @@ fun compute_step_plan(p: *Project, m: *manifest.Manifest, bu: *manifest.BuildUni
 
     var order: *u32 = nil;
     var count: u32  = 0;
-    val r: R.Result[bool, str] = manifest.plan_steps(p.s.alloc, ?p.s.interner, m, names, ncount, bu.target, proj_out, tn, pn, ?order, ?count);
+    val r: R.Result[bool, str] = manifest.plan_steps(p.s.alloc, ?p.s.interner, m, names, ncount, bu.target, proj_out, v, ?order, ?count);
     if (owned) { A.deallocate[intern.StrId](p.s.alloc, names, m.artifact_count::usize); }
     if (R.is_err[bool, str](r)) { ret r; }
     p.config.step_order       = order;
@@ -2017,7 +2029,7 @@ fun compute_step_plan(p: *Project, m: *manifest.Manifest, bu: *manifest.BuildUni
 # step's `out` (which will produce it) or already exist on disk, else an error names
 # the entry here rather than failing at link time. paths expand against the build
 # cell; the disk check resolves relative to the project root.
-fun validate_local_links(p: *Project, project_root: str, m: *manifest.Manifest, t: *manifest.TargetDef, proj_out: str, tn: str, pn: str) R.Result[bool, str] {
+fun validate_local_links(p: *Project, project_root: str, m: *manifest.Manifest, t: *manifest.TargetDef, proj_out: str, v: *manifest.TmplVars) R.Result[bool, str] {
     val local_r: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, "local");
     if (R.is_err[intern.StrId, str](local_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](local_r)); }
     val local_id: intern.StrId = R.unwrap_ok[intern.StrId, str](local_r);
@@ -2035,11 +2047,11 @@ fun validate_local_links(p: *Project, project_root: str, m: *manifest.Manifest, 
             val raw_path: str = O.unwrap[str](path_opt);
             val ename:    str = O.unwrap[str](name_opt);
 
-            val exp_r: R.Result[str, str] = manifest.expand(p.s.alloc, raw_path, proj_out, tn, pn);
+            val exp_r: R.Result[str, str] = manifest.expand(p.s.alloc, raw_path, proj_out, v);
             if (R.is_err[str, str](exp_r)) { ret R.err[bool, str](R.unwrap_err[str, str](exp_r)); }
             val exp: str = R.unwrap_ok[str, str](exp_r);
 
-            var ok_: bool = manifest.local_path_demanded_by_step(p.s.alloc, ?p.s.interner, m, exp, proj_out, tn, pn);
+            var ok_: bool = manifest.local_path_demanded_by_step(p.s.alloc, ?p.s.interner, m, exp, proj_out, v);
             if (!ok_) {
                 val abs_r: R.Result[str, str] = join_path(p.s.alloc, project_root, exp);
                 if (R.is_ok[str, str](abs_r)) {
@@ -2449,9 +2461,8 @@ fun resolve_cascade_libs(p: *Project, project_root: str, isa: str, os: str, abi:
                     val p_opt: O.Option[str] = intern.lookup(?p.s.interner, l.path);
                     if (O.is_some[str](p_opt)) {
                         val root_out: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_out));
-                        val tn2: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.name));
-                        val pn2: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.profile));
-                        val exp_r: R.Result[str, str] = manifest.expand(p.s.alloc, O.unwrap[str](p_opt), root_out, tn2, pn2);
+                        var cv: manifest.TmplVars = cell_tmpl_vars(p);
+                        val exp_r: R.Result[str, str] = manifest.expand(p.s.alloc, O.unwrap[str](p_opt), root_out, ?cv);
                         if (R.is_ok[str, str](exp_r)) {
                             val exp: str = R.unwrap_ok[str, str](exp_r);
                             lib_id = R.unwrap_ok[intern.StrId, str](intern.intern(?p.s.interner, exp));
@@ -3085,6 +3096,7 @@ fun register_module_slot(p: *Project, fqn: intern.StrId) R.Result[session.Module
     m.sema_result       = nil;
     m.ir_module         = nil;
     m.object_image      = nil;
+    m.staged_image      = nil;
     m.target_gated      = false;
     p.modules[p.module_len] = m;
     p.module_len = p.module_len + 1;
@@ -5195,6 +5207,337 @@ fun free_lower_closure(alloc: *A.Allocator, cl: *LowerClosure) {
     cl.cap   = 0;
 }
 
+# per-worker parallel-codegen state: a private bump arena and a child interner over
+# the frozen session interner, plus the session view codegen_module reads
+# ---
+# backing: page allocator backing this worker's arena
+# ar:      bump arena owning all of this worker's codegen scratch and raw images
+# alloc:   allocator interface over `ar`
+# sess:    session view - a copy of the real session with alloc and interner
+#          (a child over the session interner) overridden; every other field is a
+#          frozen read shared with the real session
+# active:  the worker was initialised and needs teardown
+rec PcgWorker {
+    backing: A.Allocator;
+    ar:      arena.Arena;
+    alloc:   A.Allocator;
+    sess:    session.Session;
+    active:  bool;
+}
+
+# one module's parallel-codegen result, indexed by topo position
+# ---
+# image:  raw image in the producing worker's arena (child-interner names), or nil
+# worker: producing worker index - selects the remap at collection
+# err:    nil on success, else the module's codegen error message
+rec PcgSlot {
+    image:  *of.ObjectImage;
+    worker: u32;
+    err:    str;
+}
+
+# the running parallel-codegen job the bare thread entry reads through a global
+# ---
+# p:          the active project
+# next:       atomic cursor - the next topo index a worker claims
+# worker_seq: atomic dispenser - hands each running thread its worker index
+# stop:       atomic flag - set non-zero by the first worker to error
+# nworkers:   number of worker slots (>= threads that actually run)
+# workers:    the per-worker state array
+# slots:      the per-module result array, indexed by topo position
+# base_len:   session-interner id count snapshotted before any child - the boundary
+#             below which a name needs no remap
+rec ParallelCodegen {
+    p:          *Project;
+    next:       i64;
+    worker_seq: i64;
+    stop:       i64;
+    nworkers:   u32;
+    workers:    *PcgWorker;
+    slots:      *PcgSlot;
+    base_len:   usize;
+}
+
+# the in-flight parallel-codegen job, read by the bare thread entry point
+# (std.sync.thread hands the entry no argument, so the job is reached through this
+# global). set for the span of run_codegen_parallel and nil otherwise.
+var g_pcg: *ParallelCodegen = nil;
+
+# initialise one worker: a fresh page-backed arena and a session view whose
+# allocator and interner are worker-private
+#
+# The interner is a child over the session interner - it resolves the frozen IR
+# ids every image inherits and captures any new codegen strings locally, so the
+# worker interns without touching the shared interner. The session copy shares
+# every other (frozen) field with the real session by value.
+# ---
+# w: the worker slot to initialise
+# p: the active project (its session is the parent of the worker view)
+# ret: none on success, or the first allocation error
+fun pcg_worker_init(w: *PcgWorker, p: *Project) O.Option[str] {
+    w.active = false;
+    if (O.is_some[str](page.make(?w.backing)))          { ret O.some[str]("parallel codegen: worker backing alloc failed"); }
+    if (O.is_some[str](arena.init(?w.ar, ?w.backing, 0))) { ret O.some[str]("parallel codegen: worker arena init failed"); }
+    if (O.is_some[str](arena.make(?w.alloc, ?w.ar)))     { arena.dnit(?w.ar); ret O.some[str]("parallel codegen: worker arena bind failed"); }
+
+    w.sess          = @p.s;
+    w.sess.alloc    = ?w.alloc;
+    w.sess.interner = intern.make_child(?p.s.interner, ?w.alloc);
+    w.active        = true;
+    ret O.none[str]();
+}
+
+# tear one worker down, releasing its arena (which owns its child interner storage
+# and every raw image it built)
+fun pcg_worker_teardown(w: *PcgWorker) {
+    if (!w.active) { ret; }
+    arena.dnit(?w.ar);
+    w.active = false;
+}
+
+# the worker thread body: claim a worker index, then drain modules from the shared
+# cursor, codegen each into this worker's arena, and record it in its slot
+#
+# Bare (std.sync.thread hands no argument); reaches the job through g_pcg. Every
+# read of the project (topo, modules, target) and of the frozen session is
+# read-only and shared; every write (the MIR scratch, the image, interned strings)
+# lands in this worker's private arena and child interner. The first error sets the
+# stop flag so peers wind down.
+fun pcg_worker_main() {
+    val pc: *ParallelCodegen = g_pcg;
+    if (pc == nil) { ret; }
+    val wid_raw: i64 = atomic.fetch_add(?pc.worker_seq, 1::i64);
+    if (wid_raw < 0 || wid_raw >= pc.nworkers::i64) { ret; }
+    val wid: u32 = wid_raw::u32;
+    val w: *PcgWorker = ?pc.workers[wid::usize];
+
+    for (true) {
+        if (atomic.load(?pc.stop) != 0) { ret; }
+        val idx_raw: i64 = atomic.fetch_add(?pc.next, 1::i64);
+        if (idx_raw >= pc.p.topo_len::i64) { ret; }
+        val idx: u32 = idx_raw::u32;
+
+        val mid:  session.ModuleId = pc.p.topo[idx];
+        val m:    *ModuleEntry     = ?pc.p.modules[mid::u32];
+        val slot: *PcgSlot         = ?pc.slots[idx::usize];
+        slot.worker = wid;
+
+        val r: R.Result[of.ObjectImage, str] = codegen.codegen_module(?w.sess, ?pc.p.target, m.ir_module, nil);
+        if (R.is_err[of.ObjectImage, str](r)) {
+            slot.err   = R.unwrap_err[of.ObjectImage, str](r);
+            slot.image = nil;
+            atomic.store(?pc.stop, 1::i64);
+            ret;
+        }
+        var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](r);
+        val br: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](?w.alloc, 1::usize);
+        if (R.is_err[*of.ObjectImage, str](br)) {
+            slot.err   = "parallel codegen: worker image box allocation failed";
+            slot.image = nil;
+            atomic.store(?pc.stop, 1::i64);
+            ret;
+        }
+        val box: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](br);
+        box[0]     = img;
+        slot.image = box;
+        slot.err   = nil;
+    }
+}
+
+# codegen every module across a worker pool and stage each finished image on its
+# ModuleEntry for Q_CODEGEN to adopt
+#
+# Each worker owns a private arena and a child interner over the session interner,
+# so lowering-to-object runs with no shared mutable state (the session interner and
+# allocator are read-only for the span). Modules are handed out by an atomic cursor,
+# so the object tree is independent of worker count and scheduling. Collection is
+# serial in TOPO order: each worker's new interner strings are folded back into the
+# session interner (reintern_child) and each raw image is re-homed onto the session
+# allocator with its names remapped (obj.rehome_remap), so the staged images are
+# byte-identical to a serial build and the link that follows keys on one interner.
+# Assumes a cold cache (every module is (re)built) - the CLI's contract; a warm
+# session must use the serial incremental path.
+# ---
+# p:   the active project (jobs resolved, no DWARF - see pcg_enabled)
+# ret: true once every module is staged, or the first worker's codegen error
+fun run_codegen_parallel(p: *Project) R.Result[bool, str] {
+    val topo_len: u32 = p.topo_len;
+    if (topo_len == 0) { ret R.ok[bool, str](true); }
+
+    var nworkers: u32 = p.jobs;
+    if (nworkers == 0)        { nworkers = 1; }
+    if (nworkers > topo_len)  { nworkers = topo_len; }
+
+    val rslots: R.Result[*PcgSlot, str] = A.allocate[PcgSlot](p.s.alloc, topo_len::usize);
+    if (R.is_err[*PcgSlot, str](rslots)) { ret R.err[bool, str](R.unwrap_err[*PcgSlot, str](rslots)); }
+    val slots: *PcgSlot = R.unwrap_ok[*PcgSlot, str](rslots);
+    var si: u32 = 0;
+    for (si < topo_len) { slots[si].image = nil; slots[si].worker = 0; slots[si].err = nil; si = si + 1; }
+
+    val rworkers: R.Result[*PcgWorker, str] = A.allocate[PcgWorker](p.s.alloc, nworkers::usize);
+    if (R.is_err[*PcgWorker, str](rworkers)) {
+        A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+        ret R.err[bool, str](R.unwrap_err[*PcgWorker, str](rworkers));
+    }
+    val workers: *PcgWorker = R.unwrap_ok[*PcgWorker, str](rworkers);
+
+    var wi: u32 = 0;
+    for (wi < nworkers) {
+        val io: O.Option[str] = pcg_worker_init(?workers[wi], p);
+        if (O.is_some[str](io)) {
+            var wj: u32 = 0;
+            for (wj < wi) { pcg_worker_teardown(?workers[wj]); wj = wj + 1; }
+            A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
+            A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+            ret R.err[bool, str](O.unwrap[str](io));
+        }
+        wi = wi + 1;
+    }
+
+    var ctx: ParallelCodegen;
+    ctx.p          = p;
+    ctx.next       = 0;
+    ctx.worker_seq = 0;
+    ctx.stop       = 0;
+    ctx.nworkers   = nworkers;
+    ctx.workers    = workers;
+    ctx.slots      = slots;
+    ctx.base_len   = intern.count(?p.s.interner);
+    g_pcg = ?ctx;
+
+    # spawn nworkers-1 helper threads; the calling thread is the last worker, so a
+    # single-worker (jobs 1) run drives the whole pool on this thread with no spawn.
+    var threads: *thread.Thread = nil;
+    val extra: u32 = nworkers - 1;
+    if (extra > 0) {
+        val rt: R.Result[*thread.Thread, str] = A.allocate[thread.Thread](p.s.alloc, extra::usize);
+        if (R.is_err[*thread.Thread, str](rt)) {
+            g_pcg = nil;
+            var wk: u32 = 0;
+            for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
+            A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
+            A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+            ret R.err[bool, str](R.unwrap_err[*thread.Thread, str](rt));
+        }
+        threads = R.unwrap_ok[*thread.Thread, str](rt);
+        var k: u32 = 0;
+        for (k < extra) { thread.spawn(pcg_worker_main, ?threads[k]); k = k + 1; }
+    }
+
+    pcg_worker_main();
+
+    if (extra > 0) {
+        var k: u32 = 0;
+        for (k < extra) {
+            if (threads[k].tid >= 0) { thread.join(?threads[k]); }
+            k = k + 1;
+        }
+        A.deallocate[thread.Thread](p.s.alloc, threads, extra::usize);
+    }
+    g_pcg = nil;
+
+    # first error in topo order wins - deterministic regardless of which worker hit it.
+    var ei: u32 = 0;
+    for (ei < topo_len) {
+        if (slots[ei].err != nil) {
+            val msg: str = slots[ei].err;
+            var wk: u32 = 0;
+            for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
+            A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
+            A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+            ret R.err[bool, str](msg);
+        }
+        ei = ei + 1;
+    }
+
+    val cr: R.Result[bool, str] = pcg_collect(p, ?ctx);
+
+    var wk: u32 = 0;
+    for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
+    A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
+    A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+    ret cr;
+}
+
+# fold every worker's new interner strings back into the session interner and
+# re-home each raw image onto the session allocator, remapped, staged on its module
+#
+# Serial and in topo order: worker remaps are computed once each, then every image
+# is deep-copied onto the session allocator with its names rewritten into the
+# session interner's id space. On any allocation failure the images staged so far
+# are left on their modules for the normal teardown to reclaim.
+# ---
+# p:   the active project
+# ctx: the finished job (its workers hold the raw images and child interners)
+# ret: true once every image is staged, or the first allocation error
+fun pcg_collect(p: *Project, ctx: *ParallelCodegen) R.Result[bool, str] {
+    val nworkers: u32 = ctx.nworkers;
+
+    val rmaps: R.Result[**intern.StrId, str] = A.allocate[*intern.StrId](p.s.alloc, nworkers::usize);
+    if (R.is_err[**intern.StrId, str](rmaps)) { ret R.err[bool, str](R.unwrap_err[**intern.StrId, str](rmaps)); }
+    val remaps: **intern.StrId = R.unwrap_ok[**intern.StrId, str](rmaps);
+
+    var wi: u32 = 0;
+    for (wi < nworkers) {
+        val rr: R.Result[*intern.StrId, str] = intern.reintern_child(?workers_at(ctx, wi).sess.interner, p.s.alloc);
+        if (R.is_err[*intern.StrId, str](rr)) {
+            pcg_free_remaps(p, ctx, remaps, wi);
+            A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+            ret R.err[bool, str](R.unwrap_err[*intern.StrId, str](rr));
+        }
+        remaps[wi] = R.unwrap_ok[*intern.StrId, str](rr);
+        wi = wi + 1;
+    }
+
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val slot: *PcgSlot = ?ctx.slots[i::usize];
+        val w:    *PcgWorker = ?ctx.workers[slot.worker::usize];
+        val rehomed: R.Result[of.ObjectImage, str] =
+            obj.rehome_remap(p.s.alloc, ?p.s.interner, slot.image, ctx.base_len, remaps[slot.worker]);
+        if (R.is_err[of.ObjectImage, str](rehomed)) {
+            pcg_free_remaps(p, ctx, remaps, nworkers);
+            A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+            ret R.err[bool, str](R.unwrap_err[of.ObjectImage, str](rehomed));
+        }
+        val rbox: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](p.s.alloc, 1::usize);
+        if (R.is_err[*of.ObjectImage, str](rbox)) {
+            var tmp: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](rehomed);
+            obj.dnit(?tmp);
+            pcg_free_remaps(p, ctx, remaps, nworkers);
+            A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+            ret R.err[bool, str](R.unwrap_err[*of.ObjectImage, str](rbox));
+        }
+        val box: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](rbox);
+        box[0] = R.unwrap_ok[of.ObjectImage, str](rehomed);
+
+        val mid: session.ModuleId = p.topo[i];
+        p.modules[mid::u32].staged_image = box;
+        i = i + 1;
+    }
+
+    pcg_free_remaps(p, ctx, remaps, nworkers);
+    A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+    ret R.ok[bool, str](true);
+}
+
+# the worker at index `wi` (a bounds-clear accessor for the collection phase)
+fun workers_at(ctx: *ParallelCodegen, wi: u32) *PcgWorker {
+    ret ?ctx.workers[wi::usize];
+}
+
+# free the first `n` worker remap arrays (each sized to its child's new-string count)
+fun pcg_free_remaps(p: *Project, ctx: *ParallelCodegen, remaps: **intern.StrId, n: u32) {
+    var wi: u32 = 0;
+    for (wi < n) {
+        if (remaps[wi] != nil) {
+            val len: usize = intern.count(?workers_at(ctx, wi).sess.interner);
+            if (len > 0) { A.deallocate[intern.StrId](p.s.alloc, remaps[wi], len); }
+        }
+        wi = wi + 1;
+    }
+}
+
 # codegen every module to an ObjectImage in topo order through the Q_CODEGEN query.
 # the active Project is installed on the session for the pass so the compute can
 # reach the per-build module graph. run_lower_pass must have run first (each
@@ -5208,6 +5551,24 @@ pub fun run_codegen_pass(p: *Project) R.Result[bool, str] {
     session.set_active_project(p.s, p::ptr);
 
     readout.phase_begin(p.s.readout, readout.PH_CODEGEN);
+
+    # when the caller opts into parallelism (jobs >= 1, CLI builds) and the build
+    # emits no DWARF, codegen every module across a worker pool up front and stage
+    # each finished image on its ModuleEntry; the serial query.get loop below then
+    # adopts the staged images (Q_CODEGEN stays the value's system of record). a
+    # `-g` build keeps the serial path: its DWARF interns IR types into each
+    # module's type table through the shared session allocator, which the worker
+    # arenas do not isolate (#1826 parallel-lowering/-g follow-up). the serial path
+    # also drives every non-CLI caller (jobs == 0) and the driver tests, keeping the
+    # in-engine codegen compute exercised.
+    if (pcg_enabled(p)) {
+        val rp: R.Result[bool, str] = run_codegen_parallel(p);
+        if (R.is_err[bool, str](rp)) {
+            session.set_active_project(p.s, nil);
+            ret rp;
+        }
+    }
+
     var i: u32 = 0;
     for (i < p.topo_len) {
         val mid: session.ModuleId = p.topo[i];
@@ -5221,6 +5582,13 @@ pub fun run_codegen_pass(p: *Project) R.Result[bool, str] {
     readout.phase_end(p.s.readout, readout.PH_CODEGEN, p.topo_len, "module", "modules");
     session.set_active_project(p.s, nil);
     ret R.ok[bool, str](true);
+}
+
+# whether the parallel-codegen prelude should run for this build: the caller asked
+# for at least one worker, the build emits no DWARF (the worker arenas do not
+# isolate the `-g` type-table writes), and there is at least one module
+fun pcg_enabled(p: *Project) bool {
+    ret p.jobs >= 1 && !p.s.debug && p.topo_len > 0;
 }
 
 # fetch module `mid`'s ObjectImage through Q_CODEGEN - computed fresh when its
@@ -5271,6 +5639,17 @@ fun q_codegen_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Resul
     if (R.is_err[bool, str](rl)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rl)); }
     val rt: R.Result[bool, str] = query.record_dep(db, query.Q_CODEGEN, key, query.Q_TARGET, 0);
     if (R.is_err[bool, str](rt)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rt)); }
+
+    # the parallel-codegen prelude may already have built this module's image (across
+    # a worker pool) and staged it, re-homed onto the session allocator and remapped
+    # into the session interner. adopt it as this query's value instead of
+    # recomputing; the same codegen_module produced it, so it is byte-identical to the
+    # serial compute below. cleared once taken so a later demand recomputes.
+    val staged: *of.ObjectImage = m.staged_image;
+    if (staged != nil) {
+        m.staged_image = nil;
+        ret image_handle_encode(alloc, staged);
+    }
 
     val res_cg: R.Result[of.ObjectImage, str] = codegen.codegen_module(s, ?p.target, irmod, nil);
     if (R.is_err[of.ObjectImage, str](res_cg)) { ret R.err[query.QueryOutput, str](R.unwrap_err[of.ObjectImage, str](res_cg)); }
@@ -6803,6 +7182,62 @@ test "mach.lang.driver:vector_negative_diagnostics" {
         "not in the increment-1 operator table") != 0) { bad = 1; }
     if (ut_vec_diag("fun main() i32 { val a: i8x16 = i8x16{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; val b: i8x16 = i8x16{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1}; val c: i8x16 = a << b; ret 0; }\n",
         "vector shift") != 0) { bad = 1; }
+
+    ret bad;
+}
+
+# build a two-module project (main.mach + a.mach) from source, run resolve + sema,
+# and return the project so a test can inspect p.s.diags. the caller tears down the
+# project and session
+fun ut_sema2(s: *session.Session, alloc: *A.Allocator, main_src: str, a_src: str) R.Result[Project, str] {
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "a.mach";
+    var texts: [2]str;
+    texts[0] = main_src; texts[1] = a_src;
+    val pr: R.Result[Project, str] = ut_build(s, alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[Project, str](pr)) { ret pr; }
+    var p: Project = R.unwrap_ok[Project, str](pr);
+    val se: R.Result[bool, str] = run_sema_pass(?p);
+    if (R.is_err[bool, str](se)) { dnit_project(?p); ret R.err[Project, str](R.unwrap_err[bool, str](se)); }
+    ret R.ok[Project, str](p);
+}
+
+# an imported `pub val` integer constant folds in a type position (an array length)
+# exactly as a local `val` does, so `[a.CAP]u8` compiles and sizes to the constant's
+# value; an imported `var` - not a comptime constant - is still rejected (#2081)
+test "mach.lang.driver:imported_pub_val_array_length" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var bad: i32 = 0;
+
+    # positive: main uses a.CAP (a pub val = 16) as an array length. the 16-element
+    # `[16]u8` literal type-checks against the declared `[a.CAP]u8` only when the fold
+    # yields exactly 16, so a clean sema pass proves both that it folded and to what.
+    val sp: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sp)) { ret 1; }
+    var sPos: session.Session = R.unwrap_ok[session.Session, str](sp);
+    val ppr: R.Result[Project, str] = ut_sema2(?sPos, ?alloc,
+        "use a: uniontest.a;\nfun main() i32 {\n    var buf: [a.CAP]u8 = [16]u8{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};\n    ret buf[15]::i32;\n}\n",
+        "pub val CAP: u64 = 16;\n");
+    if (R.is_err[Project, str](ppr)) { session.dnit(?sPos); ret 1; }
+    var pPos: Project = R.unwrap_ok[Project, str](ppr);
+    if (ut_count_errors(?pPos.s.diags) != 0) { bad = 1; }
+    dnit_project(?pPos);
+    session.dnit(?sPos);
+
+    # negative: an imported `var` is not a comptime constant, so the same array-length
+    # position is still rejected with the existing diagnostic.
+    val sn: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sn)) { ret 1; }
+    var sNeg: session.Session = R.unwrap_ok[session.Session, str](sn);
+    val npr: R.Result[Project, str] = ut_sema2(?sNeg, ?alloc,
+        "use a: uniontest.a;\nfun main() i32 {\n    var buf: [a.CAP]u8;\n    ret 0;\n}\n",
+        "pub var CAP: u64 = 16;\n");
+    if (R.is_err[Project, str](npr)) { session.dnit(?sNeg); ret 1; }
+    var pNeg: Project = R.unwrap_ok[Project, str](npr);
+    if (!ut_diag_has(?pNeg.s.diags, "array length is not a comptime constant")) { bad = 1; }
+    dnit_project(?pNeg);
+    session.dnit(?sNeg);
 
     ret bad;
 }
@@ -9933,16 +10368,27 @@ fun glob_expand_pattern(alloc: *A.Allocator, project_root: str, pattern: str, ou
     ret gr;
 }
 
+# the closed template-variable set for the active build cell (#1964): the target
+# tuple (name/isa/os/abi) and profile a step path or cmd expands against.
+fun cell_tmpl_vars(p: *Project) manifest.TmplVars {
+    var v: manifest.TmplVars;
+    v.target  = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.name));
+    v.isa     = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.isa_name));
+    v.os      = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.os_name));
+    v.abi     = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.abi_name));
+    v.profile = O.unwrap[str](intern.lookup(?p.s.interner, p.config.profile));
+    ret v;
+}
+
 # expand a step's `in` list into concrete input files (templates then globs), sorted
 # for a stable order (#1970). a `*`/`**` pattern expands against `project_root` and an
 # empty match is a hard error; a plain path is taken literally. `out` receives owned
 # path strings the caller frees.
 fun collect_step_inputs(alloc: *A.Allocator, p: *Project, step: *manifest.StepDef, project_root: str, home_out: str, out: *vector.Vector[str]) R.Result[bool, str] {
-    val profile_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.profile));
-    val target_name_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.name));
+    var v: manifest.TmplVars = cell_tmpl_vars(p);
     var i: u32 = 0;
     for (i < step.in_count) {
-        val exp_r: R.Result[str, str] = manifest.expand(alloc, O.unwrap[str](intern.lookup(?p.s.interner, step.in[i])), home_out, target_name_s, profile_s);
+        val exp_r: R.Result[str, str] = manifest.expand(alloc, O.unwrap[str](intern.lookup(?p.s.interner, step.in[i])), home_out, ?v);
         if (R.is_err[str, str](exp_r)) { ret R.err[bool, str](R.unwrap_err[str, str](exp_r)); }
         val exp: str = R.unwrap_ok[str, str](exp_r);
         if (!has_glob(exp)) {
@@ -10066,11 +10512,10 @@ fun stamp_matches(a: *A.Allocator, path: str, hex: str) bool {
 
 # whether every declared output of `step` exists on disk (checked from `project_root`)
 fun step_outputs_exist(a: *A.Allocator, p: *Project, step: *manifest.StepDef, project_root: str, home_out: str) bool {
-    val profile_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.profile));
-    val target_name_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.name));
+    var v: manifest.TmplVars = cell_tmpl_vars(p);
     var oi: u32 = 0;
     for (oi < step.out_count) {
-        val out_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](intern.lookup(?p.s.interner, step.out[oi])), home_out, target_name_s, profile_s);
+        val out_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](intern.lookup(?p.s.interner, step.out[oi])), home_out, ?v);
         if (R.is_err[str, str](out_r)) { ret false; }
         val out_s: str = R.unwrap_ok[str, str](out_r);
         val abs_r: R.Result[str, str] = join_path(a, project_root, out_s);
@@ -10112,11 +10557,10 @@ fun parent_dir(a: *A.Allocator, path: str) str {
 fun step_make_output_dirs(a: *A.Allocator, p: *Project, step: *manifest.StepDef) R.Result[bool, str] {
     val root_out: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_out));
     val root_project: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_root));
-    val profile_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.profile));
-    val target_name_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.name));
+    var v: manifest.TmplVars = cell_tmpl_vars(p);
     var oi: u32 = 0;
     for (oi < step.out_count) {
-        val out_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](intern.lookup(?p.s.interner, step.out[oi])), root_out, target_name_s, profile_s);
+        val out_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](intern.lookup(?p.s.interner, step.out[oi])), root_out, ?v);
         if (R.is_err[str, str](out_r)) { ret R.err[bool, str](R.unwrap_err[str, str](out_r)); }
         val out_s: str = R.unwrap_ok[str, str](out_r);
         val rel_dir: str = parent_dir(a, out_s);
@@ -10136,26 +10580,54 @@ fun step_make_output_dirs(a: *A.Allocator, p: *Project, step: *manifest.StepDef)
     ret R.ok[bool, str](true);
 }
 
+# the step process environment: the inherited environment plus three appended
+# "MACH_TARGET_*=..." cstrings (#1964). the three strings are owned by the caller; only
+# the returned array is allocated here (freed by step_env_free). nil on allocation
+# failure.
+fun step_env(a: *A.Allocator, isa_env: str, os_env: str, abi_env: str) **u8 {
+    val base: **u8 = sysos.environ();
+    var n: usize = 0;
+    for (base[n] != nil) { n = n + 1; }
+    val rb: R.Result[**u8, str] = A.allocate[*u8](a, n + 4);
+    if (R.is_err[**u8, str](rb)) { ret nil; }
+    val env: **u8 = R.unwrap_ok[**u8, str](rb);
+    var i: usize = 0;
+    for (i < n) { env[i] = base[i]; i = i + 1; }
+    env[n]     = isa_env::*u8;
+    env[n + 1] = os_env::*u8;
+    env[n + 2] = abi_env::*u8;
+    env[n + 3] = nil;
+    ret env;
+}
+
+# free the array step_env allocated (not the inherited entries, which the runtime owns,
+# nor the three appended cstrings, which the caller frees)
+fun step_env_free(a: *A.Allocator, env: **u8) {
+    var n: usize = 0;
+    for (env[n] != nil) { n = n + 1; }
+    A.deallocate[*u8](a, env, (n + 1)::usize);
+}
+
 # run one step from `project_root` (its shell CWD), homing `{project.out}` to
 # `home_out`. root steps home to the root out and run from the root; a dependency's
 # steps run from the dep checkout and home to a path that climbs back to the root out
 # (#1970), so `vendor/*` inputs resolve while outputs land in the consumer tree.
-# `owner_id` is the project id owning the step, keying its stamp file.
+# `owner_id` is the project id owning the step, keying its stamp file. the step process
+# inherits MACH_TARGET_ISA/OS/ABI for the active cell (#1964).
 fun run_one_step(a: *A.Allocator, p: *Project, step: *manifest.StepDef, project_root: str, home_out: str, owner_id: str) R.Result[bool, str] {
-    val profile_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.profile));
     val project_out_s: str = home_out;
-    val target_name_s: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.name));
+    var v: manifest.TmplVars = cell_tmpl_vars(p);
     val step_name: str = O.unwrap[str](intern.lookup(?p.s.interner, step.name));
 
     # `in`/`out`/`cmd` home through the closed template set ({project.out},
-    # {target.name}, {profile.name}); an unknown `{a.b}` is a hard error and shell
-    # `$VAR` is left to the shell. `in` globs expand sorted against project_root (empty
-    # match errors).
+    # {target.name}, {target.isa}, {target.os}, {target.abi}, {profile.name}); an
+    # unknown `{a.b}` is a hard error and shell `$VAR` is left to the shell. `in` globs
+    # expand sorted against project_root (empty match errors).
     var ins: vector.Vector[str] = vector.init[str](a);
     val cir: R.Result[bool, str] = collect_step_inputs(a, p, step, project_root, home_out, ?ins);
     if (R.is_err[bool, str](cir)) { step_free_inputs(a, ?ins); ret R.err[bool, str](R.unwrap_err[bool, str](cir)); }
 
-    val cmd_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](intern.lookup(?p.s.interner, step.cmd)), project_out_s, target_name_s, profile_s);
+    val cmd_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](intern.lookup(?p.s.interner, step.cmd)), project_out_s, ?v);
     if (R.is_err[str, str](cmd_r)) { step_free_inputs(a, ?ins); ret R.err[bool, str](R.unwrap_err[str, str](cmd_r)); }
     val expanded_cmd: str = R.unwrap_ok[str, str](cmd_r);
 
@@ -10221,8 +10693,26 @@ fun run_one_step(a: *A.Allocator, p: *Project, step: *manifest.StepDef, project_
     argv[2] = full_cmd::*u8;
     argv[3] = nil;
 
-    val res_run: R.Result[exec.ExitStatus, str] = exec.run(shell_name::str, argv, sysos.environ());
+    # inject the active target tuple so a step's cmd/script can branch on it (#1964).
+    val isa_env: str = step_cc5(a, "MACH_TARGET_ISA=", v.isa, "", "", "");
+    val os_env:  str = step_cc5(a, "MACH_TARGET_OS=",  v.os,  "", "", "");
+    val abi_env: str = step_cc5(a, "MACH_TARGET_ABI=", v.abi, "", "", "");
+    val env: **u8 = step_env(a, isa_env, os_env, abi_env);
+    if (env == nil) {
+        str_free(a, isa_env); str_free(a, os_env); str_free(a, abi_env);
+        A.deallocate[*u8](a, argv, 4);
+        if (stampable) { str_free(a, hex); str_free(a, stamp_path); }
+        str_free(a, expanded_cmd);
+        str_free(a, full_cmd);
+        ret R.err[bool, str]("out of memory");
+    }
 
+    val res_run: R.Result[exec.ExitStatus, str] = exec.run(shell_name::str, argv, env);
+
+    step_env_free(a, env);
+    str_free(a, isa_env);
+    str_free(a, os_env);
+    str_free(a, abi_env);
     A.deallocate[*u8](a, argv, 4);
     str_free(a, expanded_cmd);
     str_free(a, full_cmd);
@@ -10330,8 +10820,7 @@ fun execute_dep_steps(p: *Project, isa: str, os: str, abi: str) R.Result[bool, s
 
     val root_out: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_out));
     val root_project: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_root));
-    val tn: str = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.name));
-    val pn: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.profile));
+    var cv: manifest.TmplVars = cell_tmpl_vars(p);
 
     var i: u32 = 0;
     for (i < n) {
@@ -10354,7 +10843,7 @@ fun execute_dep_steps(p: *Project, isa: str, os: str, abi: str) R.Result[bool, s
 
         var dep_order: *u32 = nil;
         var dep_count: u32  = 0;
-        val dpr: R.Result[bool, str] = manifest.plan_export_steps(p.s.alloc, ?p.s.interner, ?mfd, ?tgt, root_out, tn, pn, ?dep_order, ?dep_count);
+        val dpr: R.Result[bool, str] = manifest.plan_export_steps(p.s.alloc, ?p.s.interner, ?mfd, ?tgt, root_out, ?cv, ?dep_order, ?dep_count);
         if (R.is_err[bool, str](dpr)) { manifest.dnit(?mfd, p.s.alloc); ret dpr; }
 
         if (dep_count > 0) {

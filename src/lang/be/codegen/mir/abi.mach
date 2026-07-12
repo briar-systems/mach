@@ -494,13 +494,28 @@ fun round_up_i64(value: i64, align: u64) i64 {
 # <=8-aligned, so this is always eight and the round-up is identity; AAPCS64 honors
 # a 16-byte-aligned by-value argument.
 # ---
-# class: the slot's classification (CLASS_STACK or CLASS_STACK_BYREF)
+# class: the slot's classification (CLASS_STACK, CLASS_STACK_BYREF, or CLASS_VEC_STACK_BYREF)
 # align: the value's natural alignment in bytes
 # ret:   the slot's stack alignment in bytes
 fun stack_arg_align(class: abi.ParamClass, align: u64) u64 {
-    if (class == abi.CLASS_STACK_BYREF) { ret 8; }
-    if (align < 8)                      { ret 8; }
+    # both by-reference stack spills carry only an 8-byte pointer, so they round to 8
+    # regardless of the referent's alignment (CLASS_VEC_STACK_BYREF's referent is the
+    # spilled vector temp, aligned at its own frame slot, not this outgoing pointer slot).
+    if (class == abi.CLASS_STACK_BYREF)     { ret 8; }
+    if (class == abi.CLASS_VEC_STACK_BYREF) { ret 8; }
+    if (align < 8)                          { ret 8; }
     ret align;
+}
+
+# whether a placement occupies an outgoing stack slot the signature walk assigns and
+# advances a stack offset for (a by-value stack argument or either by-reference stack
+# spill). the register and register-plus-stack-split placements are handled off the
+# register-cursor path instead
+# ---
+# class: the slot's classification
+# ret:   true when the slot is a pure stack placement
+fun is_stack_slot_class(class: abi.ParamClass) bool {
+    ret class == abi.CLASS_STACK || class == abi.CLASS_STACK_BYREF || class == abi.CLASS_VEC_STACK_BYREF;
 }
 
 # classify a whole function ABI in one left-to-right walk into a `SigLayout`
@@ -533,10 +548,15 @@ fun stack_arg_align(class: abi.ParamClass, align: u64) u64 {
 # ctx:      the active lowering context (supplies the IR type oracle and target)
 # sig:      the function signature (an IRT_FN id; non-IRT_FN yields zero fixed params)
 # ret_type: the declared return type to classify the return / sret reservation from
+# is_ext:   true when classifying a call to a declared `ext` (foreign C) function, so
+#           each argument follows the foreign convention at the boundary (win64
+#           marshals a 128-bit vector by reference, #2058); false for an internal call
+#           and for a callee's own parameter / return classification (a compiled mach
+#           function is never itself `ext`)
 # out:      receives the assembled SigLayout (`params` is owned - free it with
 #           `sig_layout_free`)
 # ret:      ok(true) on success, or a loud error from the ABI vtable surface
-pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type: type.IrTypeId,
+pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type: type.IrTypeId, is_ext: bool,
                            out: *abi.SigLayout) R.Result[bool, str] {
     val rok: R.Result[bool, str] = require_abi(ctx.tgt);
     if (R.is_err[bool, str](rok)) { ret rok; }
@@ -620,7 +640,7 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
         var pagg: abi.AggLayout = abi.agg_none();
         if (wants_agg) { pagg = agg_layout(ctx, pty, pag); }
         val pvec: bool = context.value_is_vector(ctx, pty);
-        var slot: abi.ParamSlot = classify_arg(i::i32, psz, pal, pfl, peb, pag, pvec, gp_used, fp_used, phm, phe, pagg);
+        var slot: abi.ParamSlot = classify_arg(i::i32, psz, pal, pfl, peb, pag, pvec, is_ext, gp_used, fp_used, phm, phe, pagg);
 
         # record the real outgoing stack offset on the slot (the ABI classifier
         # returns a sizing-only slot with offset 0); the param / call lowering
@@ -631,7 +651,7 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
         # GP/SSE aggregate consumes one of each). a by-value stack slot is first
         # rounded up to the value's alignment (identity on x86, where every stack
         # argument is <=8-aligned; honors a 16-aligned AAPCS64 by-value argument).
-        if (slot.class == abi.CLASS_STACK || slot.class == abi.CLASS_STACK_BYREF) {
+        if (is_stack_slot_class(slot.class)) {
             stack_off   = round_up_i64(stack_off, stack_arg_align(slot.class, pal));
             slot.offset = stack_off;
             stack_off   = stack_off + context.stack_slot_bytes(slot.size);
@@ -698,6 +718,27 @@ fun call_ret_type(ctx: *context.LowerCtx, sig: type.IrTypeId, fallback: type.IrT
     ret fallback;
 }
 
+# report whether an OP_CALL targets a declared `ext` (foreign C) function
+#
+# The classification signal for boundary marshalling (#2058) is the callee's is_import
+# fact -- true only for a declared `ext fun`, the strict subset of extern that excludes
+# a same-artifact cross-module reference (a generic instance drained in another object).
+# Only a DIRECT call (operand 0 a VAL_FN naming a module function) can be ext; an
+# indirect call through a function pointer carries no callee identity in today's IR, so
+# it is never marshalled -- the recorded #2058 boundary (function-pointer types would
+# carry the rule).
+# ---
+# ctx:  the active lowering context (supplies the source IR module)
+# inst: the OP_CALL instruction (operand 0 is the callee)
+# ret:  true when the callee is a declared `ext` function
+fun call_targets_ext(ctx: *context.LowerCtx, inst: *instruction.Instruction) bool {
+    if (inst.operand_count == 0)                   { ret false; }
+    val callee: value.Value = inst.operands[0];
+    if (callee.kind != value.VAL_FN)               { ret false; }
+    if (callee.data.fn_ix >= ctx.m.function_len)   { ret false; }
+    ret ctx.m.functions[callee.data.fn_ix].is_import;
+}
+
 # expand an OP_CALL into argument pre-coloring plus the call and result pseudos
 #
 # Classifies the callee's return value and each argument through the ABI vtable,
@@ -741,9 +782,13 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     # fixed argument read their placement from this single layout so the call and
     # the callee's `lower_params` can never disagree - in particular a by-value
     # aggregate argument is classified from its DECLARED parameter type, not from
-    # the 8-byte pointer its operand carries. an indirect call through an untyped
-    # function pointer yields zero fixed params, so every argument falls back to
-    # per-operand classification below.
+    # the 8-byte pointer its operand carries. every call with a declared signature
+    # takes this path - a direct call to a named function or monomorphized instance,
+    # and an indirect call through a TYPED function pointer (its callee carries the
+    # IRT_FN). only a signature-less position yields zero fixed params and defers to
+    # per-operand classification below: the variadic tail, or a callee with no
+    # IRT_FN type (an erased / untyped function pointer). this is never a fallback
+    # for a direct call whose signature merely went uncomputed.
     val sig: type.IrTypeId = inst.aux_ty;
     # the declared return type comes from the callee signature when one is known,
     # not `inst.ty`: on a scalarized target a vector-returning call's result type is
@@ -752,8 +797,11 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     # direct call the two agree; an indirect call through an untyped pointer has no
     # IRT_FN and falls back to `inst.ty`.
     val ret_type: type.IrTypeId = call_ret_type(ctx, sig, inst.ty);
+    # a call to a declared `ext` function marshals its arguments to the foreign
+    # convention at the boundary (#2058); an internal call keeps mach's convention.
+    val is_ext: bool = call_targets_ext(ctx, inst);
     var layout: abi.SigLayout;
-    val cls: R.Result[bool, str] = classify_signature(ctx, sig, ret_type, ?layout);
+    val cls: R.Result[bool, str] = classify_signature(ctx, sig, ret_type, is_ext, ?layout);
     if (R.is_err[bool, str](cls)) { ret cls; }
 
     val rslot: abi.ParamSlot = layout.ret_slot;
@@ -830,12 +878,14 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
             # (agg_none): the va_arg read path walks the GP register-save / overflow
             # areas, so the caller and callee stay consistent. SSE-eightbyte, HFA
             # V-register, and lp64d fa-register passing are for fixed parameters and
-            # returns (the C-FFI boundary), not the varargs tail.
-            slot = classify_arg(pidx::i32, asz, aal, afl, 0, aag, avec, gp_used, fp_used, 0, 0, abi.agg_none());
+            # returns (the C-FFI boundary), not the varargs tail. is_ext still applies:
+            # MS passes an __m128 vararg by reference too, so a tail vector at an ext
+            # boundary marshals exactly like a fixed one (#2058).
+            slot = classify_arg(pidx::i32, asz, aal, afl, 0, aag, avec, is_ext, gp_used, fp_used, 0, 0, abi.agg_none());
             # round a stack-passed tail argument up to its slot alignment before
             # placing it (identity on x86; honors a 16-aligned AAPCS64 by-value arg).
             # a register-plus-stack split's tail stack chunk is eight-byte-granular.
-            if (slot.class == abi.CLASS_STACK || slot.class == abi.CLASS_STACK_BYREF) {
+            if (is_stack_slot_class(slot.class)) {
                 stack_off = round_up_i64(stack_off, stack_arg_align(slot.class, aal));
             } or (slot_has_stack_piece(?slot)) {
                 stack_off = round_up_i64(stack_off, 8);
@@ -883,7 +933,7 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         # cursors were already consumed by `classify_signature`. a register slot
         # advances each assigned register's bank; a stack slot advances the offset.
         if (pidx >= layout.param_count) {
-            if (slot.class == abi.CLASS_STACK || slot.class == abi.CLASS_STACK_BYREF) {
+            if (is_stack_slot_class(slot.class)) {
                 stack_off = stack_off + context.stack_slot_bytes(slot.size);
             } or {
                 advance_arg_cursors(?slot, ?gp_used, ?fp_used);
@@ -1088,6 +1138,22 @@ fun materialize_pieces(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.Para
 # ret:       ok(true) on success, or a loud error
 fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, argop: mir.MirOperand,
                   stack_off: i64, is_aggr: bool, size: u64) R.Result[bool, str] {
+    # a register-resident value marshalled by reference (a 128-bit vector at a win64 `ext`
+    # boundary, #2058): unlike an aggregate or a scalarized rv64 vector -- already
+    # memory-resident, its argop a storage pointer -- the value is in a register, so the
+    # address does not yet exist. store it to a 16-byte-aligned temp and pass the temp's
+    # ADDRESS: into the slot's GP register (CLASS_VEC_BYREF) or, once the register slots
+    # are exhausted, spilled as an 8-byte pointer (CLASS_VEC_STACK_BYREF).
+    if (slot.class == abi.CLASS_VEC_BYREF || slot.class == abi.CLASS_VEC_STACK_BYREF) {
+        var addr: u32 = mir.MIR_VREG_NIL;
+        val sr: R.Result[bool, str] = spill_vector_to_temp(ctx, mb, argop, size, ?addr);
+        if (R.is_err[bool, str](sr)) { ret sr; }
+        if (slot.class == abi.CLASS_VEC_STACK_BYREF) {
+            val sp: u32 = ctx.tgt.arch.stack_ptr_reg::u32;
+            ret context.emit_store_to(ctx, mb, mir.op_mem_preg(sp, stack_off), mir.op_vreg(addr));
+        }
+        ret context.emit_mov(ctx, mb, mir.op_preg(slot.reg::u32), mir.op_vreg(addr));
+    }
     if (slot.class == abi.CLASS_STACK_BYREF) {
         # win64 by-reference overflow: store the hidden aggregate pointer into the
         # outgoing stack slot, not a by-value copy of the aggregate bytes.
@@ -1149,6 +1215,35 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
     # backend re-extends it to the register width by its own convention (RV64 lp64
     # sign-extends a 32-bit register).
     ret context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), argop, scalar_reg_move_width(ctx, size));
+}
+
+# store a register-resident vector to a fresh 16-byte-aligned frame temporary and
+# return the temporary's address in a vreg
+#
+# The win64 ext-boundary marshal (#2058) needs a 128-bit vector's ADDRESS, but the
+# vector is a value in a vector register. This allocates an aligned frame slot (its
+# alignment the vector's own size, so a 16-byte __m128 lands on a 16-byte boundary),
+# stores the whole vector into it at full width (a MOVAPS-class store, the same form
+# `materialize_pieces` uses for an FP chunk), and LEAs the slot address into `out_addr`.
+# ---
+# ctx:      the active lowering context
+# mb:       the MIR block the store / address materialization are appended to
+# val_op:   the vector value operand (a vector-register vreg)
+# size:     the vector's byte size (its temp alignment and store width)
+# out_addr: receives the vreg holding the temporary's address
+# ret:      ok(true) on success, or a loud error
+fun spill_vector_to_temp(ctx: *context.LowerCtx, mb: *mir.MirBlock, val_op: mir.MirOperand, size: u64, out_addr: *u32) R.Result[bool, str] {
+    val res_key: R.Result[u32, str] = context.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](res_key)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_key)); }
+    val sk: u32 = R.unwrap_ok[u32, str](res_key);
+
+    val sr: R.Result[bool, str] = context.add_spill_slot_aligned(ctx, sk, size, size::u32);
+    if (R.is_err[bool, str](sr)) { ret sr; }
+
+    val st: R.Result[bool, str] = context.emit_store_to_w(ctx, mb, mir.op_mem_slot(sk, 0), val_op, size::u8);
+    if (R.is_err[bool, str](st)) { ret st; }
+
+    ret context.emit_lea_slot(ctx, mb, mir.op_mem_slot(sk, 0), out_addr);
 }
 
 # the SSE move width (4 for f32, 8 for f64) for a CLASS_FP scalar of `size` bytes
@@ -1260,7 +1355,9 @@ pub fun lower_params(ctx: *context.LowerCtx, mb: *mir.MirBlock) R.Result[bool, s
     # carry their real `[rbp + 16 + offset]` stack offsets.
     val ret_type: type.IrTypeId = context.fn_return_type(ctx);
     var layout: abi.SigLayout;
-    val cls: R.Result[bool, str] = classify_signature(ctx, ctx.fn.sig, ret_type, ?layout);
+    # a compiled mach function is never itself `ext`, so its own parameters always use
+    # mach's internal convention (is_ext false); only calls TO an ext function marshal.
+    val cls: R.Result[bool, str] = classify_signature(ctx, ctx.fn.sig, ret_type, false, ?layout);
     if (R.is_err[bool, str](cls)) { ret cls; }
 
     # an sret return: the caller passes the hidden result-storage pointer in the
@@ -1476,7 +1573,9 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
     val rsz:  u64  = type.byte_size(ctx.types, rt, ctx.tgt)::u64;
     val rag:  bool = context.value_is_aggregate(ctx, rt);
     var layout: abi.SigLayout;
-    val cls: R.Result[bool, str] = classify_signature(ctx, ctx.fn.sig, rt, ?layout);
+    # the return classifies from the function's own signature (is_ext false); a vector
+    # return conforms to MS under both conventions (XMM0), so it is never marshalled.
+    val cls: R.Result[bool, str] = classify_signature(ctx, ctx.fn.sig, rt, false, ?layout);
     if (R.is_err[bool, str](cls)) { ret cls; }
     val slot: abi.ParamSlot = layout.ret_slot;
     sig_layout_free(ctx, ?layout);

@@ -77,6 +77,24 @@ not bound to a single dependency, so `library` has no effect on the emitted
 binary — the value is still validated against the link's dependencies, but every
 dependency is searched at load time regardless.
 
+## Vector arguments and the C ABI
+
+A 128-bit vector (`f32x4`, `i32x4`, …) crossing an `ext` boundary follows the
+target's **C** vector convention, not Mach's internal one, so the call is
+bit-compatible with a C `__m128` parameter:
+
+- **x86_64-windows (Microsoft x64):** the caller passes each vector argument **by
+  reference** — it stores the vector to a 16-byte-aligned temporary and passes that
+  temporary's address in the parameter's integer register (RCX/RDX/R8/R9) or, once
+  those are exhausted, on the stack. A variadic vector argument is passed the same
+  way. Vector **returns** ride XMM0, which both conventions already agree on.
+- **Every other target** (System V, AAPCS64, RISC-V lp64d): the C convention already
+  matches Mach's internal one, so nothing special happens at the boundary.
+
+Only a *direct* call to a declared `ext fun` marshals — an ordinary Mach→Mach call
+always keeps the internal convention (a vector in a vector register). A call through
+a function *pointer* does not yet carry the `ext` fact, so it is not covered.
+
 ## Linking external objects
 
 An `ext fun` is only a forward reference — its definition must be supplied at
