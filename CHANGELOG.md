@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.6.0] - 2026-07-12
+
+The build-speed and interop release. Parallel codegen takes the compiler
+self-build from 25.2s to 11.7s on 16 cores with byte-identical output, win64
+C interop for vectors conforms at `ext` boundaries, and the inliner finally
+sees generic-instance bodies. Built with mach 3.5.1.
+
+### Added
+- driver: **parallel per-module codegen** — codegen runs across a worker pool
+  (`--jobs <n>`, default host CPUs), with output byte-identical to the serial
+  build at every core count (proven through the self-host fixpoint): codegen
+  17.7s → 3.3s, whole release self-build 2.15x on 16 cores. `-g` builds keep
+  the serial codegen path for now (#2101); parallel lowering is the next phase
+  (#2100) (#1826, #2099).
+- abi: **win64 vector arguments marshal to the Microsoft x64 convention at
+  `ext` boundaries** — a call to a declared `ext` function passes each 128-bit
+  vector by reference (a 16-byte-aligned caller temp), varargs included;
+  returns already conformed (XMM0). Internal calls keep mach's XMM convention
+  everywhere, byte-identical on every target. A call through a function
+  pointer carries no `ext` fact yet and does not marshal (#2058, #2087).
+- manifest: **step template variables `{target.isa}` / `{target.os}` /
+  `{target.abi}`** join the closed expansion set, and every step process
+  receives `MACH_TARGET_ISA` / `MACH_TARGET_OS` / `MACH_TARGET_ABI` in its
+  environment — closes RFC #1964 (#2098).
+
+### Fixed
+- sema: **an imported `pub val` constant folds in type positions** —
+  `var buf: [a.CAP]u8;` with a cross-module constant compiles exactly like its
+  local equivalent; an imported `var` is still rejected (#2081, #2097).
+- me: **generic-instance and forward-referenced function bodies are visible to
+  the inliner** — materialising a definition reuses its forward extern entry
+  in place instead of orphaning every captured call against a bodiless twin,
+  so eligible instance calls inline (#2064, #2096).
+
 ## [3.5.1] - 2026-07-11
 
 The emergency inliner-correctness patch: one silent miscompile, one fix,
