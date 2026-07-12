@@ -10,6 +10,7 @@
 # environment when it later runs through resolve. The public entry is
 # build_project, which returns a fully populated Project or an error string.
 
+use std.allocator.arena;
 use std.allocator.page;
 use std.collections.map;
 use std.collections.sort;
@@ -40,6 +41,8 @@ use O: std.types.option;
 use R: std.types.result;
 use ctime: std.chrono.time;
 use sysos: std.system.os;
+use atomic: std.sync.atomic;
+use thread: std.sync.thread;
 use std.process.exec;
 use std.print;
 
@@ -289,6 +292,11 @@ pub rec ModuleEntry {
     sema_result:       *sema.SemaResult;
     ir_module:         *ir.Module;
     object_image:      *of.ObjectImage;
+    # a parallel-codegen prelude's finished image, already re-homed onto the
+    # session allocator and remapped into the session interner, waiting for
+    # Q_CODEGEN to adopt it as its value (nil on the serial path). session-owned,
+    # freed by the Q_CODEGEN handle's finalize once adopted.
+    staged_image:      *of.ObjectImage;
     stable_id:         session.StableModuleId;
     target_gated:      bool;
 }
@@ -392,6 +400,10 @@ pub rec Project {
     opt_level:    pipeline.OptLevel;
     verify_ir:    bool;
     test_mode:    bool;
+
+    # requested codegen worker count for the parallel back half (`--jobs`); 0 means
+    # auto (os.cpu_count). 1 forces the serial-equivalent single-worker path.
+    jobs:         u32;
 
     # set only while load_all_own_src loads orphan roots, so the load walk knows a
     # top-level `$error` guard it reaches marks a target-gated orphan to exclude
@@ -1434,6 +1446,7 @@ fun init_project(p: *Project, s: *session.Session) {
     p.opt_level     = pipeline.OPT_DEBUG;
     p.verify_ir     = false;
     p.test_mode     = false;
+    p.jobs          = 0;
     p.loading_orphans = false;
 }
 
@@ -3085,6 +3098,7 @@ fun register_module_slot(p: *Project, fqn: intern.StrId) R.Result[session.Module
     m.sema_result       = nil;
     m.ir_module         = nil;
     m.object_image      = nil;
+    m.staged_image      = nil;
     m.target_gated      = false;
     p.modules[p.module_len] = m;
     p.module_len = p.module_len + 1;
@@ -5195,6 +5209,337 @@ fun free_lower_closure(alloc: *A.Allocator, cl: *LowerClosure) {
     cl.cap   = 0;
 }
 
+# per-worker parallel-codegen state: a private bump arena and a child interner over
+# the frozen session interner, plus the session view codegen_module reads
+# ---
+# backing: page allocator backing this worker's arena
+# ar:      bump arena owning all of this worker's codegen scratch and raw images
+# alloc:   allocator interface over `ar`
+# sess:    session view - a copy of the real session with alloc and interner
+#          (a child over the session interner) overridden; every other field is a
+#          frozen read shared with the real session
+# active:  the worker was initialised and needs teardown
+rec PcgWorker {
+    backing: A.Allocator;
+    ar:      arena.Arena;
+    alloc:   A.Allocator;
+    sess:    session.Session;
+    active:  bool;
+}
+
+# one module's parallel-codegen result, indexed by topo position
+# ---
+# image:  raw image in the producing worker's arena (child-interner names), or nil
+# worker: producing worker index - selects the remap at collection
+# err:    nil on success, else the module's codegen error message
+rec PcgSlot {
+    image:  *of.ObjectImage;
+    worker: u32;
+    err:    str;
+}
+
+# the running parallel-codegen job the bare thread entry reads through a global
+# ---
+# p:          the active project
+# next:       atomic cursor - the next topo index a worker claims
+# worker_seq: atomic dispenser - hands each running thread its worker index
+# stop:       atomic flag - set non-zero by the first worker to error
+# nworkers:   number of worker slots (>= threads that actually run)
+# workers:    the per-worker state array
+# slots:      the per-module result array, indexed by topo position
+# base_len:   session-interner id count snapshotted before any child - the boundary
+#             below which a name needs no remap
+rec ParallelCodegen {
+    p:          *Project;
+    next:       i64;
+    worker_seq: i64;
+    stop:       i64;
+    nworkers:   u32;
+    workers:    *PcgWorker;
+    slots:      *PcgSlot;
+    base_len:   usize;
+}
+
+# the in-flight parallel-codegen job, read by the bare thread entry point
+# (std.sync.thread hands the entry no argument, so the job is reached through this
+# global). set for the span of run_codegen_parallel and nil otherwise.
+var g_pcg: *ParallelCodegen = nil;
+
+# initialise one worker: a fresh page-backed arena and a session view whose
+# allocator and interner are worker-private
+#
+# The interner is a child over the session interner - it resolves the frozen IR
+# ids every image inherits and captures any new codegen strings locally, so the
+# worker interns without touching the shared interner. The session copy shares
+# every other (frozen) field with the real session by value.
+# ---
+# w: the worker slot to initialise
+# p: the active project (its session is the parent of the worker view)
+# ret: none on success, or the first allocation error
+fun pcg_worker_init(w: *PcgWorker, p: *Project) O.Option[str] {
+    w.active = false;
+    if (O.is_some[str](page.make(?w.backing)))          { ret O.some[str]("parallel codegen: worker backing alloc failed"); }
+    if (O.is_some[str](arena.init(?w.ar, ?w.backing, 0))) { ret O.some[str]("parallel codegen: worker arena init failed"); }
+    if (O.is_some[str](arena.make(?w.alloc, ?w.ar)))     { arena.dnit(?w.ar); ret O.some[str]("parallel codegen: worker arena bind failed"); }
+
+    w.sess          = @p.s;
+    w.sess.alloc    = ?w.alloc;
+    w.sess.interner = intern.make_child(?p.s.interner, ?w.alloc);
+    w.active        = true;
+    ret O.none[str]();
+}
+
+# tear one worker down, releasing its arena (which owns its child interner storage
+# and every raw image it built)
+fun pcg_worker_teardown(w: *PcgWorker) {
+    if (!w.active) { ret; }
+    arena.dnit(?w.ar);
+    w.active = false;
+}
+
+# the worker thread body: claim a worker index, then drain modules from the shared
+# cursor, codegen each into this worker's arena, and record it in its slot
+#
+# Bare (std.sync.thread hands no argument); reaches the job through g_pcg. Every
+# read of the project (topo, modules, target) and of the frozen session is
+# read-only and shared; every write (the MIR scratch, the image, interned strings)
+# lands in this worker's private arena and child interner. The first error sets the
+# stop flag so peers wind down.
+fun pcg_worker_main() {
+    val pc: *ParallelCodegen = g_pcg;
+    if (pc == nil) { ret; }
+    val wid_raw: i64 = atomic.fetch_add(?pc.worker_seq, 1::i64);
+    if (wid_raw < 0 || wid_raw >= pc.nworkers::i64) { ret; }
+    val wid: u32 = wid_raw::u32;
+    val w: *PcgWorker = ?pc.workers[wid::usize];
+
+    for (true) {
+        if (atomic.load(?pc.stop) != 0) { ret; }
+        val idx_raw: i64 = atomic.fetch_add(?pc.next, 1::i64);
+        if (idx_raw >= pc.p.topo_len::i64) { ret; }
+        val idx: u32 = idx_raw::u32;
+
+        val mid:  session.ModuleId = pc.p.topo[idx];
+        val m:    *ModuleEntry     = ?pc.p.modules[mid::u32];
+        val slot: *PcgSlot         = ?pc.slots[idx::usize];
+        slot.worker = wid;
+
+        val r: R.Result[of.ObjectImage, str] = codegen.codegen_module(?w.sess, ?pc.p.target, m.ir_module, nil);
+        if (R.is_err[of.ObjectImage, str](r)) {
+            slot.err   = R.unwrap_err[of.ObjectImage, str](r);
+            slot.image = nil;
+            atomic.store(?pc.stop, 1::i64);
+            ret;
+        }
+        var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](r);
+        val br: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](?w.alloc, 1::usize);
+        if (R.is_err[*of.ObjectImage, str](br)) {
+            slot.err   = "parallel codegen: worker image box allocation failed";
+            slot.image = nil;
+            atomic.store(?pc.stop, 1::i64);
+            ret;
+        }
+        val box: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](br);
+        box[0]     = img;
+        slot.image = box;
+        slot.err   = nil;
+    }
+}
+
+# codegen every module across a worker pool and stage each finished image on its
+# ModuleEntry for Q_CODEGEN to adopt
+#
+# Each worker owns a private arena and a child interner over the session interner,
+# so lowering-to-object runs with no shared mutable state (the session interner and
+# allocator are read-only for the span). Modules are handed out by an atomic cursor,
+# so the object tree is independent of worker count and scheduling. Collection is
+# serial in TOPO order: each worker's new interner strings are folded back into the
+# session interner (reintern_child) and each raw image is re-homed onto the session
+# allocator with its names remapped (obj.rehome_remap), so the staged images are
+# byte-identical to a serial build and the link that follows keys on one interner.
+# Assumes a cold cache (every module is (re)built) - the CLI's contract; a warm
+# session must use the serial incremental path.
+# ---
+# p:   the active project (jobs resolved, no DWARF - see pcg_enabled)
+# ret: true once every module is staged, or the first worker's codegen error
+fun run_codegen_parallel(p: *Project) R.Result[bool, str] {
+    val topo_len: u32 = p.topo_len;
+    if (topo_len == 0) { ret R.ok[bool, str](true); }
+
+    var nworkers: u32 = p.jobs;
+    if (nworkers == 0)        { nworkers = 1; }
+    if (nworkers > topo_len)  { nworkers = topo_len; }
+
+    val rslots: R.Result[*PcgSlot, str] = A.allocate[PcgSlot](p.s.alloc, topo_len::usize);
+    if (R.is_err[*PcgSlot, str](rslots)) { ret R.err[bool, str](R.unwrap_err[*PcgSlot, str](rslots)); }
+    val slots: *PcgSlot = R.unwrap_ok[*PcgSlot, str](rslots);
+    var si: u32 = 0;
+    for (si < topo_len) { slots[si].image = nil; slots[si].worker = 0; slots[si].err = nil; si = si + 1; }
+
+    val rworkers: R.Result[*PcgWorker, str] = A.allocate[PcgWorker](p.s.alloc, nworkers::usize);
+    if (R.is_err[*PcgWorker, str](rworkers)) {
+        A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+        ret R.err[bool, str](R.unwrap_err[*PcgWorker, str](rworkers));
+    }
+    val workers: *PcgWorker = R.unwrap_ok[*PcgWorker, str](rworkers);
+
+    var wi: u32 = 0;
+    for (wi < nworkers) {
+        val io: O.Option[str] = pcg_worker_init(?workers[wi], p);
+        if (O.is_some[str](io)) {
+            var wj: u32 = 0;
+            for (wj < wi) { pcg_worker_teardown(?workers[wj]); wj = wj + 1; }
+            A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
+            A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+            ret R.err[bool, str](O.unwrap[str](io));
+        }
+        wi = wi + 1;
+    }
+
+    var ctx: ParallelCodegen;
+    ctx.p          = p;
+    ctx.next       = 0;
+    ctx.worker_seq = 0;
+    ctx.stop       = 0;
+    ctx.nworkers   = nworkers;
+    ctx.workers    = workers;
+    ctx.slots      = slots;
+    ctx.base_len   = intern.count(?p.s.interner);
+    g_pcg = ?ctx;
+
+    # spawn nworkers-1 helper threads; the calling thread is the last worker, so a
+    # single-worker (jobs 1) run drives the whole pool on this thread with no spawn.
+    var threads: *thread.Thread = nil;
+    val extra: u32 = nworkers - 1;
+    if (extra > 0) {
+        val rt: R.Result[*thread.Thread, str] = A.allocate[thread.Thread](p.s.alloc, extra::usize);
+        if (R.is_err[*thread.Thread, str](rt)) {
+            g_pcg = nil;
+            var wk: u32 = 0;
+            for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
+            A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
+            A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+            ret R.err[bool, str](R.unwrap_err[*thread.Thread, str](rt));
+        }
+        threads = R.unwrap_ok[*thread.Thread, str](rt);
+        var k: u32 = 0;
+        for (k < extra) { thread.spawn(pcg_worker_main, ?threads[k]); k = k + 1; }
+    }
+
+    pcg_worker_main();
+
+    if (extra > 0) {
+        var k: u32 = 0;
+        for (k < extra) {
+            if (threads[k].tid >= 0) { thread.join(?threads[k]); }
+            k = k + 1;
+        }
+        A.deallocate[thread.Thread](p.s.alloc, threads, extra::usize);
+    }
+    g_pcg = nil;
+
+    # first error in topo order wins - deterministic regardless of which worker hit it.
+    var ei: u32 = 0;
+    for (ei < topo_len) {
+        if (slots[ei].err != nil) {
+            val msg: str = slots[ei].err;
+            var wk: u32 = 0;
+            for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
+            A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
+            A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+            ret R.err[bool, str](msg);
+        }
+        ei = ei + 1;
+    }
+
+    val cr: R.Result[bool, str] = pcg_collect(p, ?ctx);
+
+    var wk: u32 = 0;
+    for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
+    A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
+    A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+    ret cr;
+}
+
+# fold every worker's new interner strings back into the session interner and
+# re-home each raw image onto the session allocator, remapped, staged on its module
+#
+# Serial and in topo order: worker remaps are computed once each, then every image
+# is deep-copied onto the session allocator with its names rewritten into the
+# session interner's id space. On any allocation failure the images staged so far
+# are left on their modules for the normal teardown to reclaim.
+# ---
+# p:   the active project
+# ctx: the finished job (its workers hold the raw images and child interners)
+# ret: true once every image is staged, or the first allocation error
+fun pcg_collect(p: *Project, ctx: *ParallelCodegen) R.Result[bool, str] {
+    val nworkers: u32 = ctx.nworkers;
+
+    val rmaps: R.Result[**intern.StrId, str] = A.allocate[*intern.StrId](p.s.alloc, nworkers::usize);
+    if (R.is_err[**intern.StrId, str](rmaps)) { ret R.err[bool, str](R.unwrap_err[**intern.StrId, str](rmaps)); }
+    val remaps: **intern.StrId = R.unwrap_ok[**intern.StrId, str](rmaps);
+
+    var wi: u32 = 0;
+    for (wi < nworkers) {
+        val rr: R.Result[*intern.StrId, str] = intern.reintern_child(?workers_at(ctx, wi).sess.interner, p.s.alloc);
+        if (R.is_err[*intern.StrId, str](rr)) {
+            pcg_free_remaps(p, ctx, remaps, wi);
+            A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+            ret R.err[bool, str](R.unwrap_err[*intern.StrId, str](rr));
+        }
+        remaps[wi] = R.unwrap_ok[*intern.StrId, str](rr);
+        wi = wi + 1;
+    }
+
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val slot: *PcgSlot = ?ctx.slots[i::usize];
+        val w:    *PcgWorker = ?ctx.workers[slot.worker::usize];
+        val rehomed: R.Result[of.ObjectImage, str] =
+            obj.rehome_remap(p.s.alloc, ?p.s.interner, slot.image, ctx.base_len, remaps[slot.worker]);
+        if (R.is_err[of.ObjectImage, str](rehomed)) {
+            pcg_free_remaps(p, ctx, remaps, nworkers);
+            A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+            ret R.err[bool, str](R.unwrap_err[of.ObjectImage, str](rehomed));
+        }
+        val rbox: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](p.s.alloc, 1::usize);
+        if (R.is_err[*of.ObjectImage, str](rbox)) {
+            var tmp: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](rehomed);
+            obj.dnit(?tmp);
+            pcg_free_remaps(p, ctx, remaps, nworkers);
+            A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+            ret R.err[bool, str](R.unwrap_err[*of.ObjectImage, str](rbox));
+        }
+        val box: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](rbox);
+        box[0] = R.unwrap_ok[of.ObjectImage, str](rehomed);
+
+        val mid: session.ModuleId = p.topo[i];
+        p.modules[mid::u32].staged_image = box;
+        i = i + 1;
+    }
+
+    pcg_free_remaps(p, ctx, remaps, nworkers);
+    A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+    ret R.ok[bool, str](true);
+}
+
+# the worker at index `wi` (a bounds-clear accessor for the collection phase)
+fun workers_at(ctx: *ParallelCodegen, wi: u32) *PcgWorker {
+    ret ?ctx.workers[wi::usize];
+}
+
+# free the first `n` worker remap arrays (each sized to its child's new-string count)
+fun pcg_free_remaps(p: *Project, ctx: *ParallelCodegen, remaps: **intern.StrId, n: u32) {
+    var wi: u32 = 0;
+    for (wi < n) {
+        if (remaps[wi] != nil) {
+            val len: usize = intern.count(?workers_at(ctx, wi).sess.interner);
+            if (len > 0) { A.deallocate[intern.StrId](p.s.alloc, remaps[wi], len); }
+        }
+        wi = wi + 1;
+    }
+}
+
 # codegen every module to an ObjectImage in topo order through the Q_CODEGEN query.
 # the active Project is installed on the session for the pass so the compute can
 # reach the per-build module graph. run_lower_pass must have run first (each
@@ -5208,6 +5553,24 @@ pub fun run_codegen_pass(p: *Project) R.Result[bool, str] {
     session.set_active_project(p.s, p::ptr);
 
     readout.phase_begin(p.s.readout, readout.PH_CODEGEN);
+
+    # when the caller opts into parallelism (jobs >= 1, CLI builds) and the build
+    # emits no DWARF, codegen every module across a worker pool up front and stage
+    # each finished image on its ModuleEntry; the serial query.get loop below then
+    # adopts the staged images (Q_CODEGEN stays the value's system of record). a
+    # `-g` build keeps the serial path: its DWARF interns IR types into each
+    # module's type table through the shared session allocator, which the worker
+    # arenas do not isolate (#1826 parallel-lowering/-g follow-up). the serial path
+    # also drives every non-CLI caller (jobs == 0) and the driver tests, keeping the
+    # in-engine codegen compute exercised.
+    if (pcg_enabled(p)) {
+        val rp: R.Result[bool, str] = run_codegen_parallel(p);
+        if (R.is_err[bool, str](rp)) {
+            session.set_active_project(p.s, nil);
+            ret rp;
+        }
+    }
+
     var i: u32 = 0;
     for (i < p.topo_len) {
         val mid: session.ModuleId = p.topo[i];
@@ -5221,6 +5584,13 @@ pub fun run_codegen_pass(p: *Project) R.Result[bool, str] {
     readout.phase_end(p.s.readout, readout.PH_CODEGEN, p.topo_len, "module", "modules");
     session.set_active_project(p.s, nil);
     ret R.ok[bool, str](true);
+}
+
+# whether the parallel-codegen prelude should run for this build: the caller asked
+# for at least one worker, the build emits no DWARF (the worker arenas do not
+# isolate the `-g` type-table writes), and there is at least one module
+fun pcg_enabled(p: *Project) bool {
+    ret p.jobs >= 1 && !p.s.debug && p.topo_len > 0;
 }
 
 # fetch module `mid`'s ObjectImage through Q_CODEGEN - computed fresh when its
@@ -5271,6 +5641,17 @@ fun q_codegen_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Resul
     if (R.is_err[bool, str](rl)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rl)); }
     val rt: R.Result[bool, str] = query.record_dep(db, query.Q_CODEGEN, key, query.Q_TARGET, 0);
     if (R.is_err[bool, str](rt)) { ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](rt)); }
+
+    # the parallel-codegen prelude may already have built this module's image (across
+    # a worker pool) and staged it, re-homed onto the session allocator and remapped
+    # into the session interner. adopt it as this query's value instead of
+    # recomputing; the same codegen_module produced it, so it is byte-identical to the
+    # serial compute below. cleared once taken so a later demand recomputes.
+    val staged: *of.ObjectImage = m.staged_image;
+    if (staged != nil) {
+        m.staged_image = nil;
+        ret image_handle_encode(alloc, staged);
+    }
 
     val res_cg: R.Result[of.ObjectImage, str] = codegen.codegen_module(s, ?p.target, irmod, nil);
     if (R.is_err[of.ObjectImage, str](res_cg)) { ret R.err[query.QueryOutput, str](R.unwrap_err[of.ObjectImage, str](res_cg)); }
