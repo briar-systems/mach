@@ -5,12 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.6.0] - 2026-07-12
+## [3.6.1] - 2026-07-12
 
 The build-speed and interop release. Parallel codegen takes the compiler
 self-build from 25.2s to 11.7s on 16 cores with byte-identical output, win64
-C interop for vectors conforms at `ext` boundaries, and the inliner finally
-sees generic-instance bodies. Built with mach 3.5.1.
+C interop for vectors conforms at `ext` boundaries, the inliner finally sees
+generic-instance bodies, and macOS support consolidates on Apple Silicon.
+Built with mach 3.5.1.
+
+(v3.6.0 was tagged but never published: its CD run caught the parallel
+compiler's worker threads crashing under Rosetta 2 on the x86_64-darwin lane,
+which led to the platform ruling below — the full ledger is #2104. This
+release supersedes the tag; the payload is otherwise identical.)
+
+### Removed
+- **the x86_64-darwin release artifact.** Intel Mac hardware is EOL and its CI
+  substrate is gone: Rosetta 2 cannot host mach's raw `bsdthread_create`
+  worker threads (the kernel entry bypasses Rosetta's per-thread
+  translation-context init — proven by core backtrace), and native Intel
+  runners no longer allocate. The `x86_64-darwin` target triple remains a
+  buildable, unvalidated cross-target; `aarch64-darwin` is the supported macOS
+  platform, now validated on macos-15 (#2104, #2105). The darwin thread entry
+  additionally gained the x86_64 stack-alignment trampoline in mach-std
+  (briar-systems/mach-std#377), a standalone ABI hardening found during the
+  investigation.
 
 ### Added
 - driver: **parallel per-module codegen** — codegen runs across a worker pool
