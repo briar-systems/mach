@@ -88,7 +88,7 @@ ref = "branch/main"
 | `id`      | string | Root segment of every module path the project exposes: a file at `<src>/foo/bar.mach` is reachable as `<id>.foo.bar`. Must be a plain identifier — letters, digits, `_`, `-` — since it names the dependency store and keys step stamp files. Read by `$project.id`. |
 | `version` | string | Project version. Read by `$project.version`; the source of truth a Go-style `tag/<version>` acquisition checks. |
 | `src`     | string | Source root, project-root-relative. Module paths resolve under it. |
-| `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step paths, and `cmd`s. Expanded over `{target.name}`/`{profile.name}` (see [Path templates](#path-templates)). |
+| `out`     | string | The output-path template root, referenced as `{project.out}` by artifact `out`, step paths, and `cmd`s. Expanded over `{target.name}`/`{target.isa}`/`{target.os}`/`{target.abi}`/`{profile.name}` (see [Path templates](#path-templates)). |
 
 `[project]` is exactly these four keys; `name`, `description`, and any other key
 are unknown-key errors in a root manifest.
@@ -261,6 +261,13 @@ outputs still exist is skipped; change an input or the command and it re-runs.
 consumer's output tree — exactly as a dependency's compiled modules do — and the
 dependency's own checkout is never written to.
 
+**Target environment.** Every step process additionally inherits the active
+build cell's target tuple as `MACH_TARGET_ISA`, `MACH_TARGET_OS`, and
+`MACH_TARGET_ABI`, so a `cmd` or the script it invokes can branch on the target
+without threading it through the template — e.g. `cc --target=$MACH_TARGET_ISA-…`.
+The same three values are available in the `cmd` template as the `{target.*}` keys
+(see [Path templates](#path-templates)).
+
 ## `[dep.<alias>]`
 
 Each `<alias>` names a dependency materialised under `dep/<alias>/`. The build
@@ -297,12 +304,18 @@ entries demand. Nothing else in a dependency's manifest applies to consumers.
 
 ## Path templates
 
-Paths and `cmd`s expand over a closed, final set of three variables:
+Paths and `cmd`s expand over a closed, final set of six variables:
 
 - `{project.out}` — the **root** project's expanded `[project].out`, in every
   manifest of the closure.
 - `{target.name}` — the resolved target name (never the literal `native`).
+- `{target.isa}` — the resolved target's `isa` (e.g. `x86_64`).
+- `{target.os}` — the resolved target's `os` (e.g. `linux`).
+- `{target.abi}` — the resolved target's `abi` (e.g. `sysv64`).
 - `{profile.name}` — the selected profile name.
+
+The three `{target.*}` tuple keys are also exported to every step process as
+`MACH_TARGET_ISA`/`MACH_TARGET_OS`/`MACH_TARGET_ABI` (see [build steps](#stepname--build-steps)).
 
 An artifact's `out` is relative to the expanded project `out` and is rooted there
 automatically — write `bin/demo`, not `{project.out}/bin/demo`. Step `out` lists
