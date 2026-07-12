@@ -28,18 +28,29 @@ pub val STR_NIL: StrId = 0xFFFFFFFF;
 #
 # Assigns each unique string a stable u32 id and collapses repeated inserts of
 # the same bytes onto a single id and a single owned copy.
+#
+# An interner is either a ROOT (`base == nil`) that owns its whole id universe,
+# or a CHILD (`base != nil`, built by `make_child`) that layers a private write
+# scratch over a frozen root: ids `[0, base_len)` resolve into the base, ids
+# `>= base_len` into the child's own `strings`. A child never writes the base, so
+# many children can read one frozen base concurrently (the parallel back half),
+# and `reintern_child` folds a child's new strings back into the base afterward.
 # ---
-# a:       allocator backing owned copies, the index array, and the dedup map
-# strings: array of owned strings indexed by StrId
-# len:     number of strings stored
-# cap:     allocated slots in strings
-# dedup:   text -> StrId map keyed by content for O(1) interning
+# a:        allocator backing owned copies, the index array, and the dedup map
+# strings:  array of owned strings indexed by StrId (offset by base_len for a child)
+# len:      number of strings stored in THIS interner's own array
+# cap:      allocated slots in strings
+# dedup:    text -> StrId map keyed by content for O(1) interning
+# base:     frozen parent whose ids [0, base_len) this interner extends, or nil for a root
+# base_len: id boundary - the base's len snapshotted at make_child; 0 for a root
 pub rec Interner {
     a:       *A.Allocator;
     strings: *str;
     len:     usize;
     cap:     usize;
     dedup:   map.Map[str, StrId];
+    base:     *Interner;
+    base_len: usize;
 }
 
 # initial capacity of the strings array on first intern
@@ -53,11 +64,37 @@ val INITIAL_CAP: usize = 32;
 # ret: a new empty interner
 pub fun init(a: *A.Allocator) Interner {
     var itn: Interner;
-    itn.a       = a;
-    itn.strings = nil;
-    itn.len     = 0;
-    itn.cap     = 0;
-    itn.dedup   = map.init[str, StrId](a, map.hash_str, map.eq_str);
+    itn.a        = a;
+    itn.strings  = nil;
+    itn.len      = 0;
+    itn.cap      = 0;
+    itn.dedup    = map.init[str, StrId](a, map.hash_str, map.eq_str);
+    itn.base     = nil;
+    itn.base_len = 0;
+    ret itn;
+}
+
+# construct a child interner extending a frozen `base` with a private write scratch
+#
+# Ids `[0, base_len)` resolve into `base`; ids the child assigns start at
+# `base_len`. The child copies nothing and must not outlive `base`, and `base`
+# must stay frozen (no interning) for the child's lifetime - which is the parallel
+# codegen contract: all lowering (the only base writer) is done before any child
+# is made. `reintern_child` maps the child's new ids back into the base once the
+# parallel region ends.
+# ---
+# base: the frozen parent interner to extend (must be a root)
+# a:    allocator backing the child's own owned copies, index array, and dedup map
+# ret:  a new empty child interner over base
+pub fun make_child(base: *Interner, a: *A.Allocator) Interner {
+    var itn: Interner;
+    itn.a        = a;
+    itn.strings  = nil;
+    itn.len      = 0;
+    itn.cap      = 0;
+    itn.dedup    = map.init[str, StrId](a, map.hash_str, map.eq_str);
+    itn.base     = base;
+    itn.base_len = base.len;
     ret itn;
 }
 
@@ -92,6 +129,12 @@ pub fun dnit(itn: *Interner) {
 # id:  a StrId returned by a prior intern / intern_span / intern_bytes
 # ret: some(text) when id is in range, none otherwise
 pub fun lookup(itn: *Interner, id: StrId) O.Option[str] {
+    if (itn.base != nil) {
+        if (id::usize < itn.base_len) { ret lookup(itn.base, id); }
+        val local: usize = id::usize - itn.base_len;
+        if (local >= itn.len) { ret O.none[str](); }
+        ret O.some[str](itn.strings[local]);
+    }
     if (id::usize >= itn.len) { ret O.none[str](); }
     ret O.some[str](itn.strings[id]);
 }
@@ -105,6 +148,16 @@ pub fun lookup(itn: *Interner, id: StrId) O.Option[str] {
 # text: null-terminated text to intern
 # ret:  the StrId for text (existing or new), or an allocation error
 pub fun intern(itn: *Interner, text: str) R.Result[StrId, str] {
+    # a child dedups against the frozen base first (a read-only map lookup, safe
+    # from many workers at once), reusing a base id when the string already exists
+    # there; only genuinely new strings land in the child's own scratch.
+    if (itn.base != nil) {
+        val res_base: R.Result[*StrId, str] = map.get[str, StrId](?itn.base.dedup, ?text);
+        if (R.is_ok[*StrId, str](res_base)) {
+            ret R.ok[StrId, str](@R.unwrap_ok[*StrId, str](res_base));
+        }
+    }
+
     val res_existing: R.Result[*StrId, str] = map.get[str, StrId](?itn.dedup, ?text);
     if (R.is_ok[*StrId, str](res_existing)) {
         ret R.ok[StrId, str](@R.unwrap_ok[*StrId, str](res_existing));
@@ -159,6 +212,14 @@ fun intern_range(itn: *Interner, source: str, offset: usize, len: usize) R.Resul
     }
     val owned: str = R.unwrap_ok[str, str](res_dup);
 
+    if (itn.base != nil) {
+        val res_base: R.Result[*StrId, str] = map.get[str, StrId](?itn.base.dedup, ?owned);
+        if (R.is_ok[*StrId, str](res_base)) {
+            string.str_free(itn.a, owned);
+            ret R.ok[StrId, str](@R.unwrap_ok[*StrId, str](res_base));
+        }
+    }
+
     val res_existing: R.Result[*StrId, str] = map.get[str, StrId](?itn.dedup, ?owned);
     if (R.is_ok[*StrId, str](res_existing)) {
         string.str_free(itn.a, owned);
@@ -198,7 +259,9 @@ fun store_and_index(itn: *Interner, owned: str) R.Result[StrId, str] {
         itn.cap     = new_cap;
     }
 
-    val new_id: StrId = itn.len::u32;
+    # a child's ids continue past the base's frozen universe; a root has base_len 0,
+    # so its ids are just its own array index.
+    val new_id: StrId = (itn.base_len + itn.len)::u32;
     itn.strings[itn.len] = owned;
     itn.len = itn.len + 1;
 
@@ -211,6 +274,59 @@ fun store_and_index(itn: *Interner, owned: str) R.Result[StrId, str] {
     }
 
     ret R.ok[StrId, str](new_id);
+}
+
+# the id boundary of a child interner - ids below it live in the frozen base
+# ---
+# itn: a child interner (base != nil); a root returns 0
+# ret: base_len, the first id this interner assigns to its own strings
+pub fun child_base_len(itn: *Interner) usize {
+    ret itn.base_len;
+}
+
+# the number of strings stored in THIS interner's own array
+#
+# For a root that is the whole id universe; for a child it is the count of new
+# strings it added past base_len - the length of a reintern_child remap.
+# ---
+# itn: the interner
+# ret: itn's own stored string count
+pub fun count(itn: *Interner) usize {
+    ret itn.len;
+}
+
+# fold a child's new strings back into its base and return the id remap
+#
+# Interns each string the child assigned (ids `[base_len, base_len + len)`) into
+# the base, which grows to cover them, and returns an owned array `remap[len]`
+# where `remap[i]` is the base id for the child's local string `i` - the string
+# whose child id is `base_len + i`. A field id `< base_len` needs no remap (it is
+# already a base id); a field id `>= base_len` maps to `remap[id - base_len]`.
+# Called serially after the parallel region joins, so interning the base is safe.
+# ---
+# child: the child interner to fold in (base must be non-nil)
+# alloc: allocator for the returned remap array (caller frees, length = child len)
+# ret:   the owned remap array, or an allocation error; nil array when the child
+#        added nothing
+pub fun reintern_child(child: *Interner, alloc: *A.Allocator) R.Result[*StrId, str] {
+    if (child.base == nil) { ret R.err[*StrId, str]("reintern_child: not a child interner"); }
+    if (child.len == 0)    { ret R.ok[*StrId, str](nil); }
+
+    val res_map: R.Result[*StrId, str] = A.allocate[StrId](alloc, child.len);
+    if (R.is_err[*StrId, str](res_map)) { ret res_map; }
+    val remap: *StrId = R.unwrap_ok[*StrId, str](res_map);
+
+    var i: usize = 0;
+    for (i < child.len) {
+        val res_id: R.Result[StrId, str] = intern(child.base, child.strings[i]);
+        if (R.is_err[StrId, str](res_id)) {
+            A.deallocate[StrId](alloc, remap, child.len);
+            ret R.err[*StrId, str](R.unwrap_err[StrId, str](res_id));
+        }
+        remap[i] = R.unwrap_ok[StrId, str](res_id);
+        i = i + 1;
+    }
+    ret R.ok[*StrId, str](remap);
 }
 
 # interning the same text twice yields the same id; distinct text yields a
@@ -265,6 +381,63 @@ test "mach.lang.intern.intern_span:dedups_against_intern" {
     if (R.unwrap_ok[StrId, str](res_bytes) != hello_id) { dnit(?itn); ret 1; }
 
     dnit(?itn);
+    ret 0;
+}
+
+# a child resolves base ids, dedups new strings against the base, assigns fresh
+# ids past the base boundary, and reintern_child folds those back into the base
+test "mach.lang.intern.make_child:layers_and_reinterns" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var base: Interner = init(?alloc);
+
+    val res_a: R.Result[StrId, str] = intern(?base, "alpha");
+    val res_b: R.Result[StrId, str] = intern(?base, "beta");
+    if (R.is_err[StrId, str](res_a)) { dnit(?base); ret 1; }
+    if (R.is_err[StrId, str](res_b)) { dnit(?base); ret 1; }
+    val alpha_id: StrId = R.unwrap_ok[StrId, str](res_a);
+
+    var child: Interner = make_child(?base, ?alloc);
+    if (child_base_len(?child) != 2) { dnit(?child); dnit(?base); ret 1; }
+
+    # a base id resolves through the child, and re-interning a base string in the
+    # child returns the SAME base id (dedup against the frozen base).
+    val opt_a: O.Option[str] = lookup(?child, alpha_id);
+    if (O.is_none[str](opt_a)) { dnit(?child); dnit(?base); ret 1; }
+    val res_a2: R.Result[StrId, str] = intern(?child, "alpha");
+    if (R.is_err[StrId, str](res_a2))                { dnit(?child); dnit(?base); ret 1; }
+    if (R.unwrap_ok[StrId, str](res_a2) != alpha_id) { dnit(?child); dnit(?base); ret 1; }
+
+    # a new string lands in the child's scratch at an id past base_len, resolvable
+    # in the child but absent from the base.
+    val res_g: R.Result[StrId, str] = intern(?child, "gamma");
+    if (R.is_err[StrId, str](res_g)) { dnit(?child); dnit(?base); ret 1; }
+    val gamma_id: StrId = R.unwrap_ok[StrId, str](res_g);
+    if (gamma_id::usize != 2) { dnit(?child); dnit(?base); ret 1; }
+    if (O.is_none[str](lookup(?child, gamma_id)))  { dnit(?child); dnit(?base); ret 1; }
+    if (O.is_some[str](lookup(?base, gamma_id)))   { dnit(?child); dnit(?base); ret 1; }
+    # interning gamma again in the child dedups to the same local id.
+    val res_g2: R.Result[StrId, str] = intern(?child, "gamma");
+    if (R.is_err[StrId, str](res_g2))                { dnit(?child); dnit(?base); ret 1; }
+    if (R.unwrap_ok[StrId, str](res_g2) != gamma_id) { dnit(?child); dnit(?base); ret 1; }
+
+    # folding the child back into the base yields a remap whose local-0 entry names
+    # gamma's new base id, which now resolves in the base.
+    val res_rm: R.Result[*StrId, str] = reintern_child(?child, ?alloc);
+    if (R.is_err[*StrId, str](res_rm)) { dnit(?child); dnit(?base); ret 1; }
+    val remap: *StrId = R.unwrap_ok[*StrId, str](res_rm);
+    if (remap == nil) { dnit(?child); dnit(?base); ret 1; }
+    val gamma_base: StrId = remap[gamma_id::usize - child_base_len(?child)];
+    if (O.is_none[str](lookup(?base, gamma_base))) { A.deallocate[StrId](?alloc, remap, child.len); dnit(?child); dnit(?base); ret 1; }
+    # re-interning gamma directly into the base now resolves to the same id the
+    # remap handed back, proving the fold landed the string in the base universe.
+    val res_gb2: R.Result[StrId, str] = intern(?base, "gamma");
+    if (R.is_err[StrId, str](res_gb2))                 { A.deallocate[StrId](?alloc, remap, child.len); dnit(?child); dnit(?base); ret 1; }
+    if (R.unwrap_ok[StrId, str](res_gb2) != gamma_base) { A.deallocate[StrId](?alloc, remap, child.len); dnit(?child); dnit(?base); ret 1; }
+
+    A.deallocate[StrId](?alloc, remap, child.len);
+    dnit(?child);
+    dnit(?base);
     ret 0;
 }
 
