@@ -81,8 +81,8 @@ A verbosity flag (`-v`/`-vv`) and `--quiet` together is a parse error.
 mach build <path> [options]
 ```
 
-Compiles the project named by `<path>` — a project directory (whose `mach.toml`
-is read) or a manifest file directly (e.g. `mach build .` or `mach build ci.toml`).
+Compiles the project named by `<path>` — a project directory containing a
+`mach.toml` (e.g. `mach build .`).
 With no `--bin`/`--lib`, it builds every declared artifact for the selected target
 and profile. Every reachable module is driven through sema → lower → optimise →
 codegen to one relocatable object, written under the resolved object tree at
