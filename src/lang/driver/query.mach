@@ -1,0 +1,205 @@
+# leaf query primitives shared across the driver's load and pass submodules
+#
+# The lowest layer of the driver's query wiring: the FpBuf fingerprint byte
+# buffer and its append primitives, the session diagnostic capture/replay hooks
+# the query DB drives on a reused compute, and the ResolveResult handle codec
+# shared by the exports (load) and resolve (passes) computes. These sit at the
+# bottom of the driver DAG and depend on no other driver submodule.
+
+use std.collections.vector;
+use std.crypto.hash.sha256;
+use fs: std.filesystem;
+use std.collections.vector.Vector;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use R: std.types.result;
+
+use mach.lang.diagnostic;
+use mach.lang.fe.resolve;
+use mach.lang.query;
+use mach.lang.session;
+
+# read the session sink's current length, the mark a compute's diagnostics start at
+pub fun diag_mark_hook(ctx: ptr) u64 {
+    val s: *session.Session = ctx::*session.Session;
+    ret s.diags.len::u64;
+}
+
+# snapshot the diagnostics appended since `mark` into an owned DiagList handle, or
+# nil when the compute emitted none. an allocation failure yields nil - diagnostics
+# are advisory, so a failed capture degrades to no replay rather than aborting
+pub fun diag_capture_hook(ctx: ptr, mark: u64, a: *A.Allocator) ptr {
+    val s: *session.Session = ctx::*session.Session;
+    if (s.diags.len <= mark::usize) { ret nil; }
+    val cr: R.Result[*diagnostic.DiagList, str] = diagnostic.clone_tail(?s.diags, mark::usize, a);
+    if (R.is_err[*diagnostic.DiagList, str](cr)) { ret nil; }
+    ret R.unwrap_ok[*diagnostic.DiagList, str](cr)::ptr;
+}
+
+# replay a captured snapshot into the live session sink on a reused get. the
+# advisory append failure is swallowed, as elsewhere in the diagnostic sink
+pub fun diag_replay_hook(ctx: ptr, handle: ptr) {
+    val s: *session.Session = ctx::*session.Session;
+    val list: *diagnostic.DiagList = handle::*diagnostic.DiagList;
+    diagnostic.append_all(?s.diags, list);
+}
+
+# release a captured snapshot handle when its query entry is freed
+pub fun diag_free_hook(handle: ptr, a: *A.Allocator) {
+    val list: *diagnostic.DiagList = handle::*diagnostic.DiagList;
+    diagnostic.dnit(list);
+    A.deallocate[diagnostic.DiagList](a, list, 1::usize);
+}
+
+# a growable byte buffer the export fingerprint is appended into
+# ---
+# alloc: backing allocator
+# buf:   owned byte buffer (transfers to the QueryOutput on success)
+# len:   bytes written so far
+# cap:   allocated capacity
+pub rec FpBuf {
+    alloc: *A.Allocator;
+    buf:   *u8;
+    len:   u32;
+    cap:   u32;
+}
+
+# ensure the buffer has room for `extra` more bytes
+fun fp_reserve(b: *FpBuf, extra: u32) R.Result[bool, str] {
+    if (b.len + extra <= b.cap) { ret R.ok[bool, str](true); }
+    var new_cap: u32 = b.cap;
+    if (new_cap == 0) { new_cap = 64; }
+    for (b.len + extra > new_cap) { new_cap = new_cap * 2; }
+    if (b.buf == nil) {
+        val r: R.Result[*u8, str] = A.allocate[u8](b.alloc, new_cap::usize);
+        if (R.is_err[*u8, str](r)) { ret R.err[bool, str](R.unwrap_err[*u8, str](r)); }
+        b.buf = R.unwrap_ok[*u8, str](r);
+    } or {
+        val r: R.Result[*u8, str] = A.reallocate[u8](b.alloc, b.buf, b.cap::usize, new_cap::usize);
+        if (R.is_err[*u8, str](r)) { ret R.err[bool, str](R.unwrap_err[*u8, str](r)); }
+        b.buf = R.unwrap_ok[*u8, str](r);
+    }
+    b.cap = new_cap;
+    ret R.ok[bool, str](true);
+}
+
+# append one byte
+pub fun fp_u8(b: *FpBuf, v: u8) R.Result[bool, str] {
+    val r: R.Result[bool, str] = fp_reserve(b, 1);
+    if (R.is_err[bool, str](r)) { ret r; }
+    b.buf[b.len] = v;
+    b.len = b.len + 1;
+    ret R.ok[bool, str](true);
+}
+
+# append a u32 in little-endian, so a length prefix is unambiguous
+pub fun fp_u32(b: *FpBuf, v: u32) R.Result[bool, str] {
+    val r: R.Result[bool, str] = fp_reserve(b, 4);
+    if (R.is_err[bool, str](r)) { ret r; }
+    b.buf[b.len]     = (v & 0xFF)::u8;
+    b.buf[b.len + 1] = ((v >> 8) & 0xFF)::u8;
+    b.buf[b.len + 2] = ((v >> 16) & 0xFF)::u8;
+    b.buf[b.len + 3] = ((v >> 24) & 0xFF)::u8;
+    b.len = b.len + 4;
+    ret R.ok[bool, str](true);
+}
+
+# append `len` raw bytes from `p`
+pub fun fp_bytes(b: *FpBuf, p: *u8, len: u32) R.Result[bool, str] {
+    if (len == 0) { ret R.ok[bool, str](true); }
+    val r: R.Result[bool, str] = fp_reserve(b, len);
+    if (R.is_err[bool, str](r)) { ret r; }
+    memory.raw_copy((?b.buf[b.len])::ptr, p::ptr, len::usize);
+    b.len = b.len + len;
+    ret R.ok[bool, str](true);
+}
+
+# wrap a heap ResolveResult pointer as a pointer-sized opaque
+# handle buffer - the Q_RESOLVE query value. like the Q_PARSE AST handle, the heavy
+# pointer-graph artifact lives in the byte-buffer DB as a handle, never serialized
+pub fun resolve_handle_encode(alloc: *A.Allocator, r: *resolve.ResolveResult) R.Result[query.QueryOutput, str] {
+    val n: u32 = $size_of(ptr)::u32;
+    val rb: R.Result[*u8, str] = A.allocate[u8](alloc, n::usize);
+    if (R.is_err[*u8, str](rb)) {
+        resolve.dnit_result(r);
+        A.deallocate[resolve.ResolveResult](alloc, r, 1::usize);
+        ret R.err[query.QueryOutput, str](R.unwrap_err[*u8, str](rb));
+    }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+    val slot: *ptr = buf::ptr::*ptr;
+    slot[0] = r::ptr;
+    var out: query.QueryOutput;
+    out.bytes = buf;
+    out.len   = n;
+    ret R.ok[query.QueryOutput, str](out);
+}
+
+# read the ResolveResult pointer back out of a Q_RESOLVE
+# handle entry, or nil when the entry carries no value
+pub fun resolve_handle_decode(e: *query.QueryEntry) *resolve.ResolveResult {
+    if (e.value == nil || e.value_len::usize < $size_of(ptr)) { ret nil; }
+    val slot: *ptr = e.value::ptr::*ptr;
+    ret slot[0]::*resolve.ResolveResult;
+}
+
+# append the sha256 content hash of the file at `path` to the fingerprint (a length
+# prefix plus the 32 digest bytes); a nil path contributes a zero length. reads the
+# whole file into `alloc` and frees it. a read failure is a hard error - the caller
+# resolved this path to an existing file, so a failure to read it must fail the
+# build rather than silently elide the input from the fingerprint
+pub fun fp_file_content(fb: *FpBuf, alloc: *A.Allocator, path: *u8) R.Result[bool, str] {
+    if (path == nil) { ret fp_u32(fb, 0); }
+    val rr: R.Result[Vector[u8], str] = fs.read_bytes(alloc, path::str);
+    if (R.is_err[Vector[u8], str](rr)) {
+        ret R.err[bool, str](R.unwrap_err[Vector[u8], str](rr));
+    }
+    var buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rr);
+    var digest: [32]u8;
+    sha256.hash(buf.data, buf.len, ?digest[0]);
+    vector.dnit[u8](?buf);
+
+    val rl: R.Result[bool, str] = fp_u32(fb, sha256.DIGEST_SIZE::u32);
+    if (R.is_err[bool, str](rl)) { ret rl; }
+    var i: u32 = 0;
+    for (i < sha256.DIGEST_SIZE::u32) {
+        val rb: R.Result[bool, str] = fp_u8(fb, digest[i]);
+        if (R.is_err[bool, str](rb)) { ret rb; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# append a u64 to the fingerprint as two u32 halves (the FpBuf primitives are u8 /
+# u32 only)
+pub fun fp_u64(b: *FpBuf, v: u64) R.Result[bool, str] {
+    val lo: R.Result[bool, str] = fp_u32(b, (v & 0xFFFFFFFF)::u32);
+    if (R.is_err[bool, str](lo)) { ret lo; }
+    ret fp_u32(b, (v >> 32)::u32);
+}
+
+# append a nil-terminated string to the fingerprint as a length prefix plus its
+# bytes; a nil pointer contributes a zero length
+pub fun fp_cstr(b: *FpBuf, s: *u8) R.Result[bool, str] {
+    if (s == nil) { ret fp_u32(b, 0); }
+    val n: u32 = str_len(s::str)::u32;
+    val rl: R.Result[bool, str] = fp_u32(b, n);
+    if (R.is_err[bool, str](rl)) { ret rl; }
+    var i: u32 = 0;
+    for (i < n) {
+        val rb: R.Result[bool, str] = fp_u8(b, s[i]);
+        if (R.is_err[bool, str](rb)) { ret rb; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# free a fingerprint accumulation buffer
+pub fun fp_free(fb: *FpBuf) {
+    if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](fb.alloc, fb.buf, fb.cap::usize); }
+}
