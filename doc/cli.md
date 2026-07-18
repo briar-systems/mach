@@ -94,13 +94,20 @@ The optimisation pipeline comes from the selected profile's `opt` (`--profile
 <name>`, or the first declared profile) — the profile is how a build picks its
 optimisation level.
 
+`--explain` resolves the full build plan — the (target, artifact) matrix and each
+unit's inputs — prints it, and exits without compiling or linking.
+
 | Flag           | Value          | Effect |
 |----------------|----------------|--------|
+| `-O0`          | —              | force the debug pipeline for this build, overriding the selected profile's `opt` |
+| `-O1` / `-O2`  | —              | select the release pipeline, overriding the selected profile's `opt` |
 | `-g`           | —              | emit debug info for this build, forcing the selected profile's `debug` on (precedence `-g` > profile > off) |
 | `--emit <kind>`| `obj`\|`exe`   | `obj` stops at the relocatable objects; `exe` (default) links a binary |
+| `--jobs <n>`   | count          | codegen worker threads (default: host CPUs; `1` serialises) |
 | `--pie`        | —              | emit a position-independent (ET_DYN) executable for ASLR instead of the default fixed-address one; opt-in (see below) |
 | `-L <dir>`     | dir            | add a search directory for `-l`-resolved inputs; repeatable |
 | `-l <name>`    | name           | link a named object, archive, or shared library, resolved through the `-L` dirs (see below); repeatable |
+| `--explain`    | —              | print the resolved build plan and exit without building |
 | *(positional)* | input path     | a bare argument that contains `/`, ends in `.o` / `.a`, or names a `.so` is linked verbatim |
 
 Plus the global flags above.
@@ -246,14 +253,16 @@ passed.
 
 | Flag                | Value   | Effect |
 |---------------------|---------|--------|
-| `--jobs <n>`        | count   | run up to `<n>` test processes at once (default: the CPUs available; 1 serializes) |
+| `--jobs <n>`        | count   | run up to `<n>` test processes at once **and** size the build's codegen workers (default: the CPUs available; 1 serializes) |
 | `--filter <pattern>`| pattern | run only tests whose name contains `<pattern>` |
 | `--include-deps`    | —       | also collect tests declared in dependency modules |
 | `--list`            | —       | list the collected tests and exit |
 | `--format <mode>`   | `human`\|`json` | output format: the live readout (default `human`), or the machine-readable JSON event stream |
 | `--runner <cmd>`    | command | launch every test as `<cmd> <exe> <idx>` instead of exec'ing the dispatcher directly |
 
-Plus the `build` and global flags (`-v` lists every test). The build produces a
+Plus the `build` and global flags (`-v` lists every test). `--emit` is accepted
+for compatibility with `mach build` but has no effect — a test build always links
+executables. The build produces a
 single dispatcher executable covering every collected test; the runner keeps up
 to `--jobs` children in flight, each spawned as `<exe> <idx>`, so every test
 still runs in its own process. Each child's stdout and stderr are captured to a
@@ -315,7 +324,7 @@ symlink so the build resolves it by the same vendor layout.
 
 | Action   | Args | Effect |
 |----------|------|--------|
-| `pull`   | — | realise the manifest: clone missing git deps (transitively), link path deps, re-resolve a changed ref, repair checkout-vs-lock drift, write `mach.lock`. Idempotent; the command routine use needs. |
+| `pull`   | — | realise the manifest: clone missing git deps (transitively), link path deps, re-resolve a changed ref, repair checkout-vs-lock drift, write `mach.lock`. Idempotent; safe to re-run. |
 | `update` | `<name> \| --all` | the only lock-advancer: re-resolve branch refs to current remote tips. Tag/commit refs are an immutable no-op. Never edits the manifest. |
 | `add`    | `<name> --git <url> [--ref <ref>] \| --path <dir>` | append a `[dep.<name>]` `git`/`path` stanza to the manifest, then `pull`. |
 | `remove` | `<name> [--purge]` | drop the entry from `mach.toml` and `mach.lock`; `--purge` also deletes `dep/<name>/`. |
