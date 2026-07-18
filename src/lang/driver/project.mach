@@ -1,0 +1,617 @@
+# the driver's project data model: build config, target, and module-graph records
+#
+# The shared value types the whole driver subtree is built around - the build
+# mode / optimization level tags, the manifest-derived TargetEntry / DepEntry /
+# ProjectConfig, the per-module PubConst / ModuleEntry, and the top-level Project
+# that carries the entire loaded module graph - plus the Project lifecycle
+# (init_project / dnit_project / deallocate_config) and the small interning,
+# span, and readout utilities shared across the load, config, deps, and pass
+# submodules.
+
+use std.collections.map;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_empty;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.fe.ast;
+use mach.lang.fe.comptime;
+use mach.lang.fe.resolve;
+use mach.lang.fe.sema;
+use mach.lang.fe.token;
+use mach.lang.intern;
+use mach.lang.manifest;
+use mach.lang.me.ir;
+use mach.lang.me.pipeline;
+use mach.lang.session;
+use src: mach.lang.source;
+use mach.lang.target;
+use mach.lang.target.isa;
+use mach.lang.target.of;
+use mach.lang.target.os;
+
+# the kind of artifact a target build produces
+pub def BuildMode: u8;
+
+# link the per-module objects into a static executable
+pub val MODE_EXECUTABLE: BuildMode = 0;
+
+# leave the per-module objects as the deliverable (no link)
+pub val MODE_LIBRARY:    BuildMode = 1;
+
+# a target's declared optimization level. kept back-end-agnostic so
+# the driver carries the manifest's intent without depending on the pipeline; the
+# CLI maps it to a concrete pipeline level, and an explicit `-O*` flag overrides it
+pub def TargetOpt: u8;
+
+# no `opt` key declared - the build's own default (debug)
+pub val TARGET_OPT_DEFAULT: TargetOpt = 0;
+
+# `opt = "O0"` / `"debug"` - the debug optimization pipeline
+pub val TARGET_OPT_DEBUG:   TargetOpt = 1;
+
+# `opt = "O1"` / `"O2"` / `"release"` - the release pipeline
+pub val TARGET_OPT_RELEASE: TargetOpt = 2;
+
+# the selected target a build resolves to - synthesized by the
+# manifest reader from the chosen `[target.<name>]` stanza and build unit
+# ---
+# name:       interned target selector (e.g. "linux")
+# os_name:    interned os name (e.g. "linux"); read by `$project.target.os`
+# isa_name:   interned isa name (e.g. "x86_64"); read by `$project.target.arch`
+# abi_name:   interned abi name (e.g. "sysv64"); read by `$project.target.abi`
+# of_name:    interned object-format override, "" to derive from the os default
+# entrypoint: interned entry-source path, relative to the project src dir (e.g. "main.mach")
+# mode:       whether the build links an executable or stops at the objects
+# opt:        resolved optimization level from the selected profile; TARGET_OPT_DEFAULT
+#             when none. the CLI maps it to a pipeline level, with an explicit
+#             `-O*` flag taking precedence
+# libs:       interned project-level link inputs (the merged target+artifact+cell
+#             link overlay) - each entry is either an explicit `.o` object / `.a`
+#             archive path (relative to the project root, or absolute) or a bare
+#             `-l`-style name resolved against the link search dirs; nil when none
+# lib_count:  number of entries in `libs`
+# lib_kind:   for a library build (mode == MODE_LIBRARY), whether the artifact is
+#             static or shared; meaningless for an executable (#1980)
+pub rec TargetEntry {
+    name:       intern.StrId;
+    os_name:    intern.StrId;
+    isa_name:   intern.StrId;
+    abi_name:   intern.StrId;
+    of_name:    intern.StrId;
+    entrypoint: intern.StrId;
+    mode:       BuildMode;
+    opt:        TargetOpt;
+    libs:       *intern.StrId;
+    lib_count:  u32;
+    lib_kind:   manifest.LibKind;
+}
+
+# one entry under `[deps.<alias>]` in mach.toml plus the dep's
+# own resolved project metadata (read from the dep's mach.toml)
+# ---
+# alias:           interned alias as written in `[deps.<alias>]`
+# project_id:      interned `[project].id` from the dep's own mach.toml
+# project_dir_src: interned `[project].src` from the dep's own mach.toml
+# project_module:  interned `[project].module` from the dep's own mach.toml - the
+#                  src-relative module a bare project-id import resolves to;
+#                  STR_NIL when the dep declares none
+# vendor_root:     interned absolute filesystem path to the dep root
+pub rec DepEntry {
+    alias:           intern.StrId;
+    project_id:      intern.StrId;
+    project_dir_src: intern.StrId;
+    project_module:  intern.StrId;
+    vendor_root:     intern.StrId;
+}
+
+# parsed mach.toml plus the resolved dep metadata
+# ---
+# id:           interned `[project].id`; read by `$project.id`
+# version:      interned `[project].version`; read by `$project.version`
+# name:         interned `[project].name` metadata; read by `$project.name`.
+#               STR_NIL when the manifest omits it
+# description:  interned `[project].description` metadata; read by
+#               `$project.description`. STR_NIL when the manifest omits it
+# bin_name:     interned name of the selected artifact; read by `$bin.name`
+# module:       interned `[project].module` - the src-relative module a bare
+#               project-id import of this project resolves to; STR_NIL when none
+# dir_src:      interned `[project].src` (default "src")
+# dir_dep:      interned `[project].dep` (default "dep")
+# project_root: interned absolute filesystem path of the project root
+# targets:      one synthesized TargetEntry - the selected target
+# target_count: number of entries in targets (always 1)
+# deps:         flat array of DepEntry records
+# dep_count:    number of entries in deps
+# bin_out:      interned resolved artifact path (root-relative)
+# obj_root:     interned resolved intermediate-object dir (root-relative)
+# ir_root:      interned resolved IR-dump dir (root-relative)
+# asm_root:     interned resolved ASM-dump dir (root-relative)
+# test_root:    interned per-test executable path template (root-relative) with a
+#               literal `{name}` placeholder `mach test` fills per test
+# emit_ir:      selected profile's IR-emission default
+# emit_asm:     selected profile's ASM-emission default
+# debug:        selected profile's debug-info default (`[profile.*] debug`); the
+#               driver ORs it with the CLI `-g` flag into the session's resolved bit
+# simd:         selected profile's SIMD strictness lever (`[profile.*] simd`); the
+#               consumer's posture over the target capability fact, resolved onto the
+#               session and read at the build's scalarize/require gate (#2017)
+# defines:      merged comptime defines for the selected unit (artifact < target
+#               < cell), each `NAME` or `NAME=VALUE`; bound into every module's
+#               comptime ctx during load (#1191); nil when none
+# define_count: number of entries in defines
+# cascade_libs:      transitive dependency link inputs whose declared target tuple
+#                    (isa, os, abi) matches the selected target's, in topological
+#                    dep then declaration order, deduplicated by name and excluding
+#                    the consumer's own libs (#1218); nil when none
+# cascade_lib_count: number of entries in cascade_libs
+pub rec ProjectConfig {
+    id:           intern.StrId;
+    version:      intern.StrId;
+    name:         intern.StrId;
+    description:  intern.StrId;
+    bin_name:     intern.StrId;
+    module:       intern.StrId;
+    dir_src:      intern.StrId;
+    dir_dep:      intern.StrId;
+    project_root: intern.StrId;
+    targets:      *TargetEntry;
+    target_count: u32;
+    deps:         *DepEntry;
+    dep_count:    u32;
+    bin_out:      intern.StrId;
+    obj_root:     intern.StrId;
+    ir_root:      intern.StrId;
+    asm_root:     intern.StrId;
+    test_root:    intern.StrId;
+    emit_ir:      bool;
+    emit_asm:     bool;
+    debug:        bool;
+    simd:         manifest.SimdMode;
+    defines:      *intern.StrId;
+    define_count: u32;
+    cascade_libs:      *intern.StrId;
+    cascade_lib_count: u32;
+    profile:      intern.StrId;
+    project_out:  intern.StrId;
+    steps:        *manifest.StepDef;
+    step_count:   u32;
+    # indices into `steps` for the demanded steps, in needs-first run order (#1970)
+    step_order:       *u32;
+    step_order_count: u32;
+    links:        *manifest.LinkDef;
+    link_count:   u32;
+}
+
+# one comptime constant exported by a module to its importers
+# ---
+# name:  interned identifier of the exported pub comptime val
+# value: pre-evaluated comptime value
+pub rec PubConst {
+    name:  intern.StrId;
+    value: comptime.CTValue;
+}
+
+# one loaded module
+# ---
+# fqn:            interned fully-qualified module path (e.g. "std.types.bool")
+# file_id:        FileId of the module's source in session.sources
+# a:              borrowed parsed AST, owned by the session query DB as the Q_PARSE handle (keyed by file_id); nil until parse_module sets it. NOT freed by dnit_project - the query DB owns it (and its finalizer frees it) and reuses it across rebuilds of an unchanged file (#1580)
+# ctx:            comptime context populated during DFS load: target params,
+#                 imports' pub consts, and this-module's pub comptime vals
+# pub_consts:     snapshot of comptime vals declared `pub` in this module
+# deps:           ModuleIds this module directly depends on (active uses only)
+# resolve_result: borrowed pointer to this module's ResolveResult, owned by the
+#                 session query DB as the Q_RESOLVE handle (keyed by stable_id) and
+#                 reused across rebuilds of an unchanged module; set by
+#                 run_resolve_one, nil until then. NOT freed by dnit_project - the
+#                 query DB owns it (its finalizer frees it) (#1582)
+# resolved:       true once resolve has run
+# sema_result:    borrowed pointer to this module's SemaResult, owned by the
+#                 session query DB as the Q_SEMA handle (keyed by stable_id) and
+#                 reused across rebuilds of an unchanged module; set by
+#                 run_sema_one, nil until then. NOT freed by dnit_project - the
+#                 query DB owns it (its finalizer frees it) (#1583)
+# ir_module:      borrowed pointer to this module's optimized IR, owned by the
+#                 session query DB as the Q_LOWER handle (keyed by stable_id) and
+#                 reused across rebuilds of an unchanged module; set by
+#                 run_lower_one, nil until then. NOT freed by dnit_project - the
+#                 query DB owns it (its finalizer frees it) (#1618)
+# object_image:   borrowed pointer to this module's codegen ObjectImage, owned by
+#                 the session query DB as the Q_CODEGEN handle (keyed by stable_id)
+#                 and reused across rebuilds of an unchanged module; set by
+#                 run_codegen_one, nil until then. NOT freed by dnit_project - the
+#                 query DB owns it (its finalizer frees it) (#1618)
+# stable_id:      this module's build-stable identity (session-assigned by FQN);
+#                 unlike the discovery-order ModuleId, it survives a graph reshape,
+#                 so cross-build resolve/sema reuse remaps through it (#1579)
+pub rec ModuleEntry {
+    fqn:               intern.StrId;
+    file_id:           src.FileId;
+    a:                 *ast.Ast;
+    ctx:               comptime.ComptimeCtx;
+    pub_consts:        *PubConst;
+    pub_const_count:   u32;
+    pub_const_cap:     u32;
+    deps:              *session.ModuleId;
+    dep_count:         u32;
+    dep_cap:           u32;
+    resolve_result:    *resolve.ResolveResult;
+    resolved:          bool;
+    sema_result:       *sema.SemaResult;
+    ir_module:         *ir.Module;
+    object_image:      *of.ObjectImage;
+    # a parallel-codegen prelude's finished image, already re-homed onto the
+    # session allocator and remapped into the session interner, waiting for
+    # Q_CODEGEN to adopt it as its value (nil on the serial path). session-owned,
+    # freed by the Q_CODEGEN handle's finalize once adopted.
+    staged_image:      *of.ObjectImage;
+    stable_id:         session.StableModuleId;
+    target_gated:      bool;
+}
+
+# load state for one module during DFS
+pub def LoadStatus: u8;
+
+# not yet visited
+pub val LOAD_NEW:     LoadStatus = 0;
+
+# currently in flight on the DFS stack; revisiting signals a cycle
+pub val LOAD_LOADING: LoadStatus = 1;
+
+# fully loaded and pushed to the topo order
+pub val LOAD_DONE:    LoadStatus = 2;
+
+# a manifest target's comptime-relevant axes - what a `$if` can fork on
+# (`$mach.build.{os,arch}`, `$project.target.{os,arch,abi}`)
+#
+# The #1391 union build precomputes one per manifest target and evaluates each
+# load-walk `$if` branch under every tuple, so a branch taken by any target is
+# followed (see comptime_branch_active_load). Inert on a single-target build.
+# ---
+# os_id:         canonical os id of the target
+# arch_id:       canonical arch id of the target
+# pointer_width: the arch's pointer width in bytes
+# os_name:       interned os name; drives the `$project.target.os` string tag
+# isa_name:      interned isa name; drives `$project.target.arch`
+# abi_name:      interned abi name; drives `$project.target.abi`
+pub rec TargetTuple {
+    os_id:         u32;
+    arch_id:       u32;
+    pointer_width: u32;
+    os_name:       intern.StrId;
+    isa_name:      intern.StrId;
+    abi_name:      intern.StrId;
+}
+
+# the public Project value: the build's entire module graph
+#
+# A union build (#1391/#1505) unions every manifest target's AND artifact's
+# import closure into one deduplicated Project for multi-target tooling. The load
+# walk then takes a `$if` branch active under ANY union_tuples entry (not just the
+# selected target) and loads every union_entries artifact entry, so a module
+# reachable only from a non-default target or a non-primary artifact is still
+# present (visible to workspace-wide rename). Such modules still resolve under the
+# selected (default) target's ctx - "default target's branches win". An ordinary
+# single-target build leaves the union fields false/empty.
+# ---
+# s:                 shared session (allocator, sources, diags, interner)
+# config:            parsed project config, including dep metadata
+# target_entry:      pointer into config.targets selecting this build's target
+# target:            composed target (isa/abi/os/of vtables); pointer width is read through target.arch
+# union:             whether this is a multi-target / multi-artifact union build
+# union_tuples:      one TargetTuple per manifest target, evaluated by the union load walk
+# union_tuple_count: number of entries in union_tuples
+# union_entries:     entry-module FQN of every declared artifact the union loads
+# union_entry_count: number of entries in union_entries
+# compiler_name:     interned compiler name, fed to every module's comptime ctx
+# compiler_ver:      interned compiler version, fed to every module's comptime ctx
+# modules:           flat array of ModuleEntry, indexed by ModuleId
+# module_len:        number of modules loaded
+# module_cap:        allocated slots in modules
+# by_fqn:            module FQN to ModuleId index
+# load_status:       per-module DFS load state; cleared when build_project completes
+# load_cap:          allocated slots in load_status
+# topo:              module ids in dep-order (topo[0] has no deps within the graph)
+# topo_len:          number of entries in topo
+# topo_cap:          allocated slots in topo
+# opt_level:         the optimization pipeline level the back half lowers at, set
+#                    by the CLI before run_lower_pass (defaults to the debug pipeline)
+# verify_ir:         run the IR verifier after each optimization pass during lowering
+# test_mode:         lower the test variant (the module's `main` neutralized), set by
+#                    the CLI before run_lower_pass; folds into the back-half query key
+#                    so the test and normal variants cache independently (#1858)
+pub rec Project {
+    s:            *session.Session;
+    config:       ProjectConfig;
+    target_entry: *TargetEntry;
+    target:       target.Target;
+
+    union:              bool;
+    union_tuples:       *TargetTuple;
+    union_tuple_count:  u32;
+
+    union_entries:      *intern.StrId;
+    union_entry_count:  u32;
+
+    compiler_name:  intern.StrId;
+    compiler_ver:   intern.StrId;
+
+    modules:      *ModuleEntry;
+    module_len:   u32;
+    module_cap:   u32;
+    by_fqn:       map.Map[intern.StrId, session.ModuleId];
+
+    load_status:  *LoadStatus;
+    load_cap:     u32;
+
+    topo:         *session.ModuleId;
+    topo_len:     u32;
+    topo_cap:     u32;
+
+    opt_level:    pipeline.OptLevel;
+    verify_ir:    bool;
+    test_mode:    bool;
+
+    # requested codegen worker count for the parallel back half (`--jobs`); 0 means
+    # auto (os.cpu_count). 1 forces the serial-equivalent single-worker path.
+    jobs:         u32;
+
+    # set only while load_all_own_src loads orphan roots, so the load walk knows a
+    # top-level `$error` guard it reaches marks a target-gated orphan to exclude
+    # rather than the fatal build error a reachable module's guard stays (#1873).
+    loading_orphans: bool;
+}
+
+# true when the bytes of `span` in `source` equal the bytes of `s`
+pub fun span_eq_str(source: str, span: token.Span, s: str) bool {
+    val n: usize = str_len(s);
+    if (span.len != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (source[span.offset + i] != s[i]::u8) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# release every owned array on the project, then clear the session's
+# per-build module registries so the session is reusable for the next build
+#
+# reload contract: a long-lived consumer (an LSP reloading on save) keeps ONE
+# Session and, per reload, calls build_project_sel / build_project_union, drives
+# the build, then dnit_project. sources dedup by path (source.load) so re-reading
+# the same closure reuses FileIds instead of growing the SourceMap, and this call's
+# reset_module_registry drops the borrowed AST/sema/resolve/comptime references the
+# freed Project leaves behind - so memory stays bounded and the session stays clean
+# across rebuilds. parsed ASTs ARE reused across builds: each `ModuleEntry.a` is
+# borrowed from the session query DB (the Q_PARSE handle), which this teardown
+# leaves intact, so an unchanged module's AST survives to the next build (#1580).
+# resolve results are likewise borrowed from the query DB (the Q_RESOLVE handle)
+# and reused across rebuilds of an unchanged closure; this teardown leaves them
+# intact too (#1582).
+# ---
+# p: project to tear down; nil is a no-op
+pub fun dnit_project(p: *Project) {
+    if (p == nil) { ret; }
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        val m: *ModuleEntry = ?p.modules[i];
+        # m.resolve_result / m.sema_result are BORROWED from the session query DB
+        # (the Q_RESOLVE / Q_SEMA handles), which own and free them (and reuse them
+        # across rebuilds). do NOT free them here.
+        comptime.dnit(?m.ctx);
+        # m.a is BORROWED from the session query DB (the Q_PARSE handle), which owns
+        # and frees it (and reuses it across rebuilds). do NOT free it here.
+        if (m.pub_consts != nil && m.pub_const_cap > 0) {
+            A.deallocate[PubConst](p.s.alloc, m.pub_consts, m.pub_const_cap::usize);
+        }
+        if (m.deps != nil && m.dep_cap > 0) {
+            A.deallocate[session.ModuleId](p.s.alloc, m.deps, m.dep_cap::usize);
+        }
+        i = i + 1;
+    }
+    if (p.modules != nil && p.module_cap > 0) {
+        A.deallocate[ModuleEntry](p.s.alloc, p.modules, p.module_cap::usize);
+    }
+    if (p.load_status != nil && p.load_cap > 0) {
+        A.deallocate[LoadStatus](p.s.alloc, p.load_status, p.load_cap::usize);
+    }
+    if (p.topo != nil && p.topo_cap > 0) {
+        A.deallocate[session.ModuleId](p.s.alloc, p.topo, p.topo_cap::usize);
+    }
+    if (p.union_tuples != nil && p.union_tuple_count > 0) {
+        A.deallocate[TargetTuple](p.s.alloc, p.union_tuples, p.union_tuple_count::usize);
+    }
+    if (p.union_entries != nil && p.union_entry_count > 0) {
+        A.deallocate[intern.StrId](p.s.alloc, p.union_entries, p.union_entry_count::usize);
+    }
+    map.dnit[intern.StrId, session.ModuleId](?p.by_fqn);
+    deallocate_config(?p.config, p.s.alloc);
+
+    # the freed Project leaves the session's module registries pointing at freed
+    # AST/sema/resolve/comptime storage; clear them so the session is reusable.
+    session.reset_module_registry(p.s);
+}
+
+# zero a Project in place: nil every owned array and handle, clear the target and
+# config, and open the empty by-fqn map
+pub fun init_project(p: *Project, s: *session.Session) {
+    p.s             = s;
+    p.target_entry  = nil;
+    p.union              = false;
+    p.union_tuples       = nil;
+    p.union_tuple_count  = 0;
+    p.union_entries      = nil;
+    p.union_entry_count  = 0;
+    p.target.os_id   = os.OS_UNKNOWN;
+    p.target.arch_id = isa.ARCH_UNKNOWN;
+    p.target.abi_id  = 0;
+    p.target.of_id   = 0;
+    p.target.os      = nil;
+    p.target.arch    = nil;
+    p.target.abi     = nil;
+    p.target.of      = nil;
+    p.compiler_name = intern.STR_NIL;
+    p.compiler_ver  = intern.STR_NIL;
+    p.config.id           = intern.STR_NIL;
+    p.config.version      = intern.STR_NIL;
+    p.config.name         = intern.STR_NIL;
+    p.config.description  = intern.STR_NIL;
+    p.config.bin_name     = intern.STR_NIL;
+    p.config.module       = intern.STR_NIL;
+    p.config.targets      = nil;
+    p.config.target_count = 0;
+    p.config.deps         = nil;
+    p.config.dep_count    = 0;
+    p.config.bin_out      = intern.STR_NIL;
+    p.config.obj_root     = intern.STR_NIL;
+    p.config.ir_root      = intern.STR_NIL;
+    p.config.asm_root     = intern.STR_NIL;
+    p.config.test_root    = intern.STR_NIL;
+    p.config.emit_ir      = false;
+    p.config.emit_asm     = false;
+    p.config.debug        = false;
+    p.config.simd         = manifest.SIMD_SCALARIZE;
+    p.config.defines       = nil;
+    p.config.define_count  = 0;
+    p.config.cascade_libs      = nil;
+    p.config.cascade_lib_count = 0;
+    p.modules       = nil;
+    p.module_len    = 0;
+    p.module_cap    = 0;
+    p.by_fqn        = map.init[intern.StrId, session.ModuleId](s.alloc, map.hash_u32, map.eq_u32);
+    p.load_status   = nil;
+    p.load_cap      = 0;
+    p.topo          = nil;
+    p.topo_len      = 0;
+    p.topo_cap      = 0;
+    p.opt_level     = pipeline.OPT_DEBUG;
+    p.verify_ir     = false;
+    p.test_mode     = false;
+    p.jobs          = 0;
+    p.loading_orphans = false;
+}
+
+# release every owned array a ProjectConfig holds (targets and their libs, deps,
+# defines, cascade libs) and reset it to empty
+fun deallocate_config(c: *ProjectConfig, alloc: *A.Allocator) {
+    if (c.targets != nil && c.target_count > 0) {
+        var i: u32 = 0;
+        for (i < c.target_count) {
+            val te: *TargetEntry = ?c.targets[i];
+            if (te.libs != nil && te.lib_count > 0) {
+                A.deallocate[intern.StrId](alloc, te.libs, te.lib_count::usize);
+            }
+            i = i + 1;
+        }
+        A.deallocate[TargetEntry](alloc, c.targets, c.target_count::usize);
+    }
+    if (c.deps != nil && c.dep_count > 0) {
+        A.deallocate[DepEntry](alloc, c.deps, c.dep_count::usize);
+    }
+    if (c.defines != nil && c.define_count > 0) {
+        A.deallocate[intern.StrId](alloc, c.defines, c.define_count::usize);
+    }
+    if (c.cascade_libs != nil && c.cascade_lib_count > 0) {
+        A.deallocate[intern.StrId](alloc, c.cascade_libs, c.cascade_lib_count::usize);
+    }
+    if (c.links != nil && c.link_count > 0) {
+        var li: u32 = 0;
+        for (li < c.link_count) {
+            val l: *manifest.LinkDef = ?c.links[li];
+            if (l.os != nil && l.os_count > 0) {
+                A.deallocate[intern.StrId](alloc, l.os, l.os_count::usize);
+            }
+            if (l.isa != nil && l.isa_count > 0) {
+                A.deallocate[intern.StrId](alloc, l.isa, l.isa_count::usize);
+            }
+            if (l.abi != nil && l.abi_count > 0) {
+                A.deallocate[intern.StrId](alloc, l.abi, l.abi_count::usize);
+            }
+            li = li + 1;
+        }
+        A.deallocate[manifest.LinkDef](alloc, c.links, c.link_count::usize);
+    }
+    if (c.steps != nil && c.step_count > 0) {
+        var si: u32 = 0;
+        for (si < c.step_count) {
+            val s: *manifest.StepDef = ?c.steps[si];
+            if (s.in != nil && s.in_count > 0) {
+                A.deallocate[intern.StrId](alloc, s.in, s.in_count::usize);
+            }
+            if (s.out != nil && s.out_count > 0) {
+                A.deallocate[intern.StrId](alloc, s.out, s.out_count::usize);
+            }
+            if (s.need != nil && s.need_count > 0) {
+                A.deallocate[intern.StrId](alloc, s.need, s.need_count::usize);
+            }
+            si = si + 1;
+        }
+        A.deallocate[manifest.StepDef](alloc, c.steps, c.step_count::usize);
+    }
+    if (c.step_order != nil && c.step_order_count > 0) {
+        A.deallocate[u32](alloc, c.step_order, c.step_order_count::usize);
+    }
+    c.targets      = nil;
+    c.target_count = 0;
+    c.deps         = nil;
+    c.dep_count    = 0;
+    c.defines       = nil;
+    c.define_count  = 0;
+    c.cascade_libs      = nil;
+    c.cascade_lib_count = 0;
+    c.links = nil;
+    c.link_count = 0;
+    c.steps = nil;
+    c.step_count = 0;
+    c.step_order = nil;
+    c.step_order_count = 0;
+}
+
+# map a manifest profile opt level to the driver's TargetOpt
+pub fun map_opt(o: manifest.MOpt) TargetOpt {
+    if (o == manifest.MOPT_RELEASE) { ret TARGET_OPT_RELEASE; }
+    if (o == manifest.MOPT_DEBUG)   { ret TARGET_OPT_DEBUG; }
+    ret TARGET_OPT_DEFAULT;
+}
+
+# append `s`'s bytes into `buf` at offset `k`, returning the new offset
+pub fun dcopy(buf: *u8, k: usize, s: str) usize {
+    val n: usize = str_len(s);
+    var j: usize = 0;
+    for (j < n) { buf[k + j] = s[j]; j = j + 1; }
+    ret k + n;
+}
+
+# intern `text`, unwrapping the result; callers use it where interning cannot fail
+pub fun intern_unwrap(itn: *intern.Interner, text: str) intern.StrId {
+    val res: R.Result[intern.StrId, str] = intern.intern(itn, text);
+    ret R.unwrap_ok[intern.StrId, str](res);
+}
+
+# intern `text`, mapping the empty string to STR_NIL
+pub fun intern_opt_unwrap(itn: *intern.Interner, text: str) intern.StrId {
+    if (str_empty(text)) { ret intern.STR_NIL; }
+    ret intern_unwrap(itn, text);
+}
+
+# resolve an interned module FQN to its display string for the readout
+#
+# Falls back to "<?>" for an un-interned id so a readout item always has a name.
+# ---
+# p:   the project (for its session interner)
+# fqn: the module's interned fully-qualified name
+# ret: the FQN string, or "<?>"
+pub fun fqn_name(p: *Project, fqn: intern.StrId) str {
+    val o: O.Option[str] = intern.lookup(?p.s.interner, fqn);
+    if (O.is_some[str](o)) { ret O.unwrap[str](o); }
+    ret "<?>";
+}
