@@ -1,14 +1,14 @@
 # the query-backed compiler passes: resolve, sema, lower, codegen, and link
 #
 # Drives each module through the incremental query pipeline in topological order
-# - resolve, sema, lower (with its parallel-codegen worker pool), codegen, and
-# the whole-program link - encoding each heavy artifact as an opaque handle the
-# query DB owns and reuses across rebuilds, and writing the link and build
-# configuration surfaces the back end consumes. Sits above the load walk and the
-# leaf query primitives; the facade's ensure_query_pipeline registers these
-# computes and build_project_impl sequences the passes.
+# - resolve, sema, lower, codegen, and the whole-program link - encoding each
+# heavy artifact as an opaque handle the query DB owns and reuses across
+# rebuilds, and writing the build configuration surface the back end consumes.
+# Sits above the load walk and the leaf query primitives; each pass registers
+# its own computes at entry, and the build engine (or build_project_impl for
+# the legacy flows) sequences the passes. The parallel-codegen worker pool is
+# an engine property; the serial Q_CODEGEN loop here adopts its staged images.
 
-use std.allocator.arena;
 use std.allocator.page;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -16,6 +16,8 @@ use std.types.bool.true;
 use std.types.char.char;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_join;
 use std.types.string.str_len;
 use std.types.view.view;
 use std.types.view.view_eq_str;
@@ -24,17 +26,17 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 use ctime: std.chrono.time;
-use atomic: std.sync.atomic;
-use thread: std.sync.thread;
 
 use mach.lang.be.codegen;
 use mach.lang.be.obj;
+use mach.lang.build.outcome;
+use request: mach.lang.build.request;
+use mach.lang.diagnostic;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.id;
 use mach.lang.fe.ast.module;
 use mach.lang.fe.ast.stmt;
-use mach.lang.fe.comptime;
 use mach.lang.fe.resolve;
 use mach.lang.fe.sema;
 use mach.lang.fe.token;
@@ -62,9 +64,22 @@ use mach.lang.driver.load;
 # already resolved (and their Q_RESOLVE/Q_EXPORTS entries valid) before it runs, so
 # the firewall gets the compute issues never recurse into an unresolved dep
 pub fun run_resolve_pass(p: *project.Project) R.Result[bool, str] {
+    # this pass owns its query binding: Q_RESOLVE (an opaque owned handle) and
+    # Q_EXPORTS (a plain fingerprint, the firewall), both keyed by
+    # StableModuleId - the cross-build-stable key a reused result remaps
+    # through (#1582). registered once per session.
+    if (!query.is_registered(?p.s.queries, query.Q_RESOLVE)) {
+        val rr: R.Result[bool, str] = query.register_derived_owned(?p.s.queries, query.Q_RESOLVE, q_resolve_compute, q_resolve_finalize);
+        if (R.is_err[bool, str](rr)) { ret rr; }
+    }
+    if (!query.is_registered(?p.s.queries, query.Q_EXPORTS)) {
+        val re: R.Result[bool, str] = query.register_derived(?p.s.queries, query.Q_EXPORTS, load.q_exports_compute);
+        if (R.is_err[bool, str](re)) { ret re; }
+    }
+
     session.set_active_project(p.s, p::ptr);
 
-    readout.phase_begin(p.s.readout, readout.PH_RESOLVE);
+    readout.phase_begin(p.events, readout.PH_RESOLVE);
     var i: u32 = 0;
     for (i < p.topo_len) {
         val mid: session.ModuleId = p.topo[i];
@@ -75,7 +90,7 @@ pub fun run_resolve_pass(p: *project.Project) R.Result[bool, str] {
         }
         i = i + 1;
     }
-    readout.phase_end(p.s.readout, readout.PH_RESOLVE, p.topo_len, "module", "modules");
+    readout.phase_end(p.events, readout.PH_RESOLVE, p.topo_len, "module", "modules");
     session.set_active_project(p.s, nil);
     ret R.ok[bool, str](true);
 }
@@ -87,7 +102,7 @@ pub fun run_resolve_pass(p: *project.Project) R.Result[bool, str] {
 fun run_resolve_one(p: *project.Project, mid: session.ModuleId) R.Result[bool, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
 
-    val t_item: ctime.Time = readout.item_begin(p.s.readout);
+    val t_item: ctime.Time = readout.item_begin(p.events);
 
     val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_RESOLVE, m.stable_id::u64);
     if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
@@ -112,7 +127,7 @@ fun run_resolve_one(p: *project.Project, mid: session.ModuleId) R.Result[bool, s
 
     m.resolve_result = rr;
     m.resolved       = true;
-    readout.item(p.s.readout, readout.PH_RESOLVE, project.fqn_name(p, m.fqn), t_item);
+    readout.item(p.events, readout.PH_RESOLVE, project.fqn_name(p, m.fqn), t_item);
     ret R.ok[bool, str](true);
 }
 
@@ -236,7 +251,19 @@ fun build_resolve_deps_owned(p: *project.Project, m: *project.ModuleEntry) R.Res
 # ---
 # p:   the active project; its topo order and per-build module graph drive the pass
 # ret: true once every module is type-checked, or the first error
-pub fun run_sema_pass(p: *project.Project) R.Result[bool, str] {
+pub fun run_sema_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
+    # this pass owns its query binding: Q_SEMA (an opaque owned handle) and
+    # Q_TYPED_EXPORTS (a plain fingerprint, the typed firewall), keyed by
+    # StableModuleId. registered once per session.
+    if (!query.is_registered(?p.s.queries, query.Q_SEMA)) {
+        val rsm: R.Result[bool, str] = query.register_derived_owned(?p.s.queries, query.Q_SEMA, q_sema_compute, q_sema_finalize);
+        if (R.is_err[bool, str](rsm)) { ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](rsm))); }
+    }
+    if (!query.is_registered(?p.s.queries, query.Q_TYPED_EXPORTS)) {
+        val rte: R.Result[bool, str] = query.register_derived(?p.s.queries, query.Q_TYPED_EXPORTS, q_typed_exports_compute);
+        if (R.is_err[bool, str](rte)) { ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](rte))); }
+    }
+
     session.set_active_project(p.s, p::ptr);
 
     # open a fresh field-table epoch for this build: a record keeps its TypeId across
@@ -246,20 +273,20 @@ pub fun run_sema_pass(p: *project.Project) R.Result[bool, str] {
     # from the pre-epoch build-once behaviour.
     type.field_epoch_bump(?p.s.types);
 
-    readout.phase_begin(p.s.readout, readout.PH_SEMA);
+    readout.phase_begin(p.events, readout.PH_SEMA);
     var i: u32 = 0;
     for (i < p.topo_len) {
         val mid: session.ModuleId = p.topo[i];
         val r: R.Result[bool, str] = run_sema_one(p, mid);
         if (R.is_err[bool, str](r)) {
             session.set_active_project(p.s, nil);
-            ret r;
+            ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](r)));
         }
         i = i + 1;
     }
-    readout.phase_end(p.s.readout, readout.PH_SEMA, p.topo_len, "module", "modules");
+    readout.phase_end(p.events, readout.PH_SEMA, p.topo_len, "module", "modules");
     session.set_active_project(p.s, nil);
-    ret R.ok[bool, str](true);
+    ret R.ok[bool, outcome.Fail](true);
 }
 
 # fetch module `mid`'s SemaResult through Q_SEMA - computed fresh
@@ -271,7 +298,7 @@ pub fun run_sema_pass(p: *project.Project) R.Result[bool, str] {
 fun run_sema_one(p: *project.Project, mid: session.ModuleId) R.Result[bool, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
 
-    val t_item: ctime.Time = readout.item_begin(p.s.readout);
+    val t_item: ctime.Time = readout.item_begin(p.events);
 
     val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_SEMA, m.stable_id::u64);
     if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
@@ -298,7 +325,7 @@ fun run_sema_one(p: *project.Project, mid: session.ModuleId) R.Result[bool, str]
     if (R.is_err[bool, str](rr2)) { ret R.err[bool, str](R.unwrap_err[bool, str](rr2)); }
     val rc: R.Result[bool, str] = session.register_module_comptime(p.s, mid, (?m.ctx)::ptr);
     if (R.is_err[bool, str](rc)) { ret R.err[bool, str](R.unwrap_err[bool, str](rc)); }
-    readout.item(p.s.readout, readout.PH_SEMA, project.fqn_name(p, m.fqn), t_item);
+    readout.item(p.events, readout.PH_SEMA, project.fqn_name(p, m.fqn), t_item);
     ret R.ok[bool, str](true);
 }
 
@@ -562,6 +589,77 @@ fun back_half_key_is_test(key: u64) bool {
     ret (key & BACK_HALF_TEST_BIT) != 0;
 }
 
+# whether this build lowers the test variant (the module's `main` neutralized) -
+# the request's goal, folded into the back-half query keys so the test and
+# normal variants cache independently (#1858)
+fun test_build(p: *project.Project) bool {
+    ret request.test_goal(p.req.goal);
+}
+
+# the build's codegen debug metadata, derived from the settled request
+#
+# Off (`emit` false, ids STR_NIL) when the request carries no debug intent, so a
+# non-debug build perturbs neither the interner nor the output. On, interns the
+# DW_AT_producer string ("<name> <version>") from the session-interned compiler
+# identity and records the project root as DW_AT_comp_dir. Interning is
+# memoized, so per-module derivation resolves to stable ids.
+# ---
+# p:   the active project (its request, compiler identity, and project root)
+# ret: the populated DebugInfo, or an intern error
+pub fun debug_info_of(p: *project.Project) R.Result[codegen.DebugInfo, str] {
+    var d: codegen.DebugInfo = codegen.no_debug();
+    if (!p.req.debug) { ret R.ok[codegen.DebugInfo, str](d); }
+
+    val rp: R.Result[intern.StrId, str] = intern_producer(?p.s.interner, p.s.alloc, p.compiler_name, p.compiler_ver);
+    if (R.is_err[intern.StrId, str](rp)) { ret R.err[codegen.DebugInfo, str](R.unwrap_err[intern.StrId, str](rp)); }
+    d.emit     = true;
+    d.producer = R.unwrap_ok[intern.StrId, str](rp);
+    d.comp_dir = p.config.project_root;
+    ret R.ok[codegen.DebugInfo, str](d);
+}
+
+# intern the DW_AT_producer string "<name> <version>" from the interned compiler
+# identity. both ids are session-interned by the driver, so a lookup miss is a
+# compiler bug rather than a runtime condition and is reported, not masked
+# ---
+# itn:     the interner the ids belong to and the result is interned into
+# alloc:   allocator backing the transient concatenation buffer
+# name_id: interned compiler name (e.g. "mach")
+# ver_id:  interned compiler version (e.g. "2.14.0")
+# ret:     the interned "<name> <version>" id, or an intern/allocation error
+fun intern_producer(itn: *intern.Interner, alloc: *A.Allocator, name_id: intern.StrId, ver_id: intern.StrId) R.Result[intern.StrId, str] {
+    val no: O.Option[str] = intern.lookup(itn, name_id);
+    val vo: O.Option[str] = intern.lookup(itn, ver_id);
+    if (O.is_none[str](no) || O.is_none[str](vo)) {
+        ret R.err[intern.StrId, str]("debug: compiler identity not interned");
+    }
+    val jr: R.Result[str, str] = str_join(alloc, O.unwrap[str](no), " ", O.unwrap[str](vo));
+    if (R.is_err[str, str](jr)) { ret R.err[intern.StrId, str](R.unwrap_err[str, str](jr)); }
+    val joined: str = R.unwrap_ok[str, str](jr);
+    val ri: R.Result[intern.StrId, str] = intern.intern(itn, joined);
+    A.deallocate[u8](alloc, joined::*u8, str_len(joined) + 1);
+    ret ri;
+}
+
+# intern_producer builds "<name> <version>" - the DW_AT_producer string the driver
+# plumbs to the debug producer - from the interned compiler identity
+test "mach.lang.driver.passes.intern_producer:name_version" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+
+    val rn: R.Result[intern.StrId, str] = intern.intern(?itn, "mach");
+    val rv: R.Result[intern.StrId, str] = intern.intern(?itn, "2.14.0");
+    if (R.is_err[intern.StrId, str](rn) || R.is_err[intern.StrId, str](rv)) { ret 1; }
+
+    val rp: R.Result[intern.StrId, str] = intern_producer(?itn, ?alloc,
+        R.unwrap_ok[intern.StrId, str](rn), R.unwrap_ok[intern.StrId, str](rv));
+    if (R.is_err[intern.StrId, str](rp)) { ret 1; }
+    val got: O.Option[str] = intern.lookup(?itn, R.unwrap_ok[intern.StrId, str](rp));
+    if (O.is_none[str](got) || !str_equals(O.unwrap[str](got), "mach 2.14.0")) { ret 1; }
+    ret 0;
+}
+
 # lower every module to optimized IR in topo order through the Q_LOWER query.
 # the active Project is installed on the session for the pass so the compute can
 # reach the per-build module graph; topo order matches the sema pass. every module's
@@ -573,34 +671,63 @@ fun back_half_key_is_test(key: u64) bool {
 # ---
 # p:   the active project; its topo order and per-build module graph drive the pass
 # ret: true once every module is lowered, or the first error
-pub fun run_lower_pass(p: *project.Project) R.Result[bool, str] {
+pub fun run_lower_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
+    # this pass owns its query binding: Q_LOWER (an opaque owned handle keyed by
+    # the packed back-half key) and Q_LOWERED_SURFACE (a plain fingerprint, the
+    # monomorphization firewall, keyed by StableModuleId). once per session.
+    if (!query.is_registered(?p.s.queries, query.Q_LOWERED_SURFACE)) {
+        val rls: R.Result[bool, str] = query.register_derived(?p.s.queries, query.Q_LOWERED_SURFACE, q_lowered_surface_compute);
+        if (R.is_err[bool, str](rls)) { ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](rls))); }
+    }
+    if (!query.is_registered(?p.s.queries, query.Q_LOWER)) {
+        val rl: R.Result[bool, str] = query.register_derived_owned(?p.s.queries, query.Q_LOWER, q_lower_compute, q_lower_finalize);
+        if (R.is_err[bool, str](rl)) { ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](rl))); }
+    }
+
     session.set_active_project(p.s, p::ptr);
 
     # publish the lowering diagnostic flags (the IR-verifier toggle) so a change to
     # them re-lowers; set_input's early-cutoff leaves the input untouched when they
     # are unchanged, so an unedited module's Q_LOWER stays reused.
     var vflag: u8 = 0;
-    if (p.verify_ir) { vflag = 1; }
+    if (p.req.verify_ir) { vflag = 1; }
     val vf: R.Result[bool, str] = query.set_input(?p.s.queries, query.Q_LOWER_FLAGS, 0, ?vflag, 1);
     if (R.is_err[bool, str](vf)) {
         session.set_active_project(p.s, nil);
-        ret vf;
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](vf)));
     }
 
-    readout.phase_begin(p.s.readout, readout.PH_LOWER);
+    readout.phase_begin(p.events, readout.PH_LOWER);
     var i: u32 = 0;
     for (i < p.topo_len) {
         val mid: session.ModuleId = p.topo[i];
         val r: R.Result[bool, str] = run_lower_one(p, mid);
         if (R.is_err[bool, str](r)) {
             session.set_active_project(p.s, nil);
-            ret r;
+            ret R.err[bool, outcome.Fail](lower_fail(p, R.unwrap_err[bool, str](r)));
         }
         i = i + 1;
     }
-    readout.phase_end(p.s.readout, readout.PH_LOWER, p.topo_len, "module", "modules");
+    readout.phase_end(p.events, readout.PH_LOWER, p.topo_len, "module", "modules");
     session.set_active_project(p.s, nil);
-    ret R.ok[bool, str](true);
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# wrap a lowering-pass error into a Fail, marking it reported when a located
+# diagnostic was already filed on the session sink
+#
+# A lowering routine that reaches an ill-formed construct files a located
+# diagnostic and returns an error; the sink then carries that diagnostic, so the
+# failure is `reported` and the render step prints nothing further (the flush is
+# the user-facing message). A raw failure with no diagnostic (an internal fault,
+# an allocation error) carries its message through instead.
+# ---
+# p:    the active project, for its diagnostic sink
+# emsg: the raw error string the lowering routine returned
+# ret:  a reported Fail when the sink carries an error, else an unreported user Fail
+fun lower_fail(p: *project.Project, emsg: str) outcome.Fail {
+    if (diagnostic.has_errors(?p.s.diags)) { ret outcome.reported(); }
+    ret outcome.user(emsg);
 }
 
 # fetch module `mid`'s optimized IR through Q_LOWER - computed fresh when its own
@@ -610,7 +737,7 @@ pub fun run_lower_pass(p: *project.Project) R.Result[bool, str] {
 fun run_lower_one(p: *project.Project, mid: session.ModuleId) R.Result[bool, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
 
-    val t_item: ctime.Time = readout.item_begin(p.s.readout);
+    val t_item: ctime.Time = readout.item_begin(p.events);
 
     # refresh this module's lowered-surface fingerprint NOW, in topo order, so an
     # importer later in the pass validates its Q_LOWER against a current fingerprint:
@@ -621,13 +748,13 @@ fun run_lower_one(p: *project.Project, mid: session.ModuleId) R.Result[bool, str
     val sf_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LOWERED_SURFACE, m.stable_id::u64);
     if (R.is_err[*query.QueryEntry, str](sf_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](sf_r)); }
 
-    val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LOWER, back_half_key(m.stable_id, p.test_mode));
+    val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LOWER, back_half_key(m.stable_id, test_build(p)));
     if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
     val irm: *ir.Module = ir_handle_decode(R.unwrap_ok[*query.QueryEntry, str](e_r));
     if (irm == nil) { ret R.err[bool, str]("Q_LOWER produced no result handle"); }
 
     m.ir_module = irm;
-    readout.item(p.s.readout, readout.PH_LOWER, project.fqn_name(p, m.fqn), t_item);
+    readout.item(p.events, readout.PH_LOWER, project.fqn_name(p, m.fqn), t_item);
     ret R.ok[bool, str](true);
 }
 
@@ -811,13 +938,13 @@ pub fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Res
     }
     free_lower_closure(s.alloc, ?cl);
 
-    val res_lower: R.Result[ir.Module, str] = lower.lower_module(s, ?p.target, a, m.fqn, mid, sr, m.resolve_result, ?m.ctx);
+    val res_lower: R.Result[ir.Module, str] = lower.lower_module(s, ?p.target, a, m.fqn, mid, sr, m.resolve_result, ?m.ctx, p.req.debug);
     if (R.is_err[ir.Module, str](res_lower)) { ret R.err[query.QueryOutput, str](R.unwrap_err[ir.Module, str](res_lower)); }
     var irmod: ir.Module = R.unwrap_ok[ir.Module, str](res_lower);
 
     # optimize in place: the cached artifact is the post-pipeline IR the object is
     # built from, so an unchanged optimized module reuses its codegen output.
-    val res_opt: R.Result[bool, str] = pipeline.run(?irmod, ?p.target, p.opt_level, p.verify_ir, p.s.simd == manifest.SIMD_REQUIRE, ?p.s.interner);
+    val res_opt: R.Result[bool, str] = pipeline.run(?irmod, ?p.target, p.req.opt, p.req.verify_ir, p.req.simd == manifest.SIMD_REQUIRE, ?p.s.interner);
     if (R.is_err[bool, str](res_opt)) {
         ir.dnit(?irmod);
         ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](res_opt));
@@ -953,337 +1080,6 @@ fun free_lower_closure(alloc: *A.Allocator, cl: *LowerClosure) {
     cl.cap   = 0;
 }
 
-# per-worker parallel-codegen state: a private bump arena and a child interner over
-# the frozen session interner, plus the session view codegen_module reads
-# ---
-# backing: page allocator backing this worker's arena
-# ar:      bump arena owning all of this worker's codegen scratch and raw images
-# alloc:   allocator interface over `ar`
-# sess:    session view - a copy of the real session with alloc and interner
-#          (a child over the session interner) overridden; every other field is a
-#          frozen read shared with the real session
-# active:  the worker was initialised and needs teardown
-rec PcgWorker {
-    backing: A.Allocator;
-    ar:      arena.Arena;
-    alloc:   A.Allocator;
-    sess:    session.Session;
-    active:  bool;
-}
-
-# one module's parallel-codegen result, indexed by topo position
-# ---
-# image:  raw image in the producing worker's arena (child-interner names), or nil
-# worker: producing worker index - selects the remap at collection
-# err:    nil on success, else the module's codegen error message
-rec PcgSlot {
-    image:  *of.ObjectImage;
-    worker: u32;
-    err:    str;
-}
-
-# the running parallel-codegen job the bare thread entry reads through a global
-# ---
-# p:          the active project
-# next:       atomic cursor - the next topo index a worker claims
-# worker_seq: atomic dispenser - hands each running thread its worker index
-# stop:       atomic flag - set non-zero by the first worker to error
-# nworkers:   number of worker slots (>= threads that actually run)
-# workers:    the per-worker state array
-# slots:      the per-module result array, indexed by topo position
-# base_len:   session-interner id count snapshotted before any child - the boundary
-#             below which a name needs no remap
-rec ParallelCodegen {
-    p:          *project.Project;
-    next:       i64;
-    worker_seq: i64;
-    stop:       i64;
-    nworkers:   u32;
-    workers:    *PcgWorker;
-    slots:      *PcgSlot;
-    base_len:   usize;
-}
-
-# the in-flight parallel-codegen job, read by the bare thread entry point
-# (std.sync.thread hands the entry no argument, so the job is reached through this
-# global). set for the span of run_codegen_parallel and nil otherwise.
-var g_pcg: *ParallelCodegen = nil;
-
-# initialise one worker: a fresh page-backed arena and a session view whose
-# allocator and interner are worker-private
-#
-# The interner is a child over the session interner - it resolves the frozen IR
-# ids every image inherits and captures any new codegen strings locally, so the
-# worker interns without touching the shared interner. The session copy shares
-# every other (frozen) field with the real session by value.
-# ---
-# w: the worker slot to initialise
-# p: the active project (its session is the parent of the worker view)
-# ret: none on success, or the first allocation error
-fun pcg_worker_init(w: *PcgWorker, p: *project.Project) O.Option[str] {
-    w.active = false;
-    if (O.is_some[str](page.make(?w.backing)))          { ret O.some[str]("parallel codegen: worker backing alloc failed"); }
-    if (O.is_some[str](arena.init(?w.ar, ?w.backing, 0))) { ret O.some[str]("parallel codegen: worker arena init failed"); }
-    if (O.is_some[str](arena.make(?w.alloc, ?w.ar)))     { arena.dnit(?w.ar); ret O.some[str]("parallel codegen: worker arena bind failed"); }
-
-    w.sess          = @p.s;
-    w.sess.alloc    = ?w.alloc;
-    w.sess.interner = intern.make_child(?p.s.interner, ?w.alloc);
-    w.active        = true;
-    ret O.none[str]();
-}
-
-# tear one worker down, releasing its arena (which owns its child interner storage
-# and every raw image it built)
-fun pcg_worker_teardown(w: *PcgWorker) {
-    if (!w.active) { ret; }
-    arena.dnit(?w.ar);
-    w.active = false;
-}
-
-# the worker thread body: claim a worker index, then drain modules from the shared
-# cursor, codegen each into this worker's arena, and record it in its slot
-#
-# Bare (std.sync.thread hands no argument); reaches the job through g_pcg. Every
-# read of the project (topo, modules, target) and of the frozen session is
-# read-only and shared; every write (the MIR scratch, the image, interned strings)
-# lands in this worker's private arena and child interner. The first error sets the
-# stop flag so peers wind down.
-fun pcg_worker_main() {
-    val pc: *ParallelCodegen = g_pcg;
-    if (pc == nil) { ret; }
-    val wid_raw: i64 = atomic.fetch_add(?pc.worker_seq, 1::i64);
-    if (wid_raw < 0 || wid_raw >= pc.nworkers::i64) { ret; }
-    val wid: u32 = wid_raw::u32;
-    val w: *PcgWorker = ?pc.workers[wid::usize];
-
-    for (true) {
-        if (atomic.load(?pc.stop) != 0) { ret; }
-        val idx_raw: i64 = atomic.fetch_add(?pc.next, 1::i64);
-        if (idx_raw >= pc.p.topo_len::i64) { ret; }
-        val idx: u32 = idx_raw::u32;
-
-        val mid:  session.ModuleId = pc.p.topo[idx];
-        val m:    *project.ModuleEntry     = ?pc.p.modules[mid::u32];
-        val slot: *PcgSlot         = ?pc.slots[idx::usize];
-        slot.worker = wid;
-
-        val r: R.Result[of.ObjectImage, str] = codegen.codegen_module(?w.sess, ?pc.p.target, m.ir_module, nil);
-        if (R.is_err[of.ObjectImage, str](r)) {
-            slot.err   = R.unwrap_err[of.ObjectImage, str](r);
-            slot.image = nil;
-            atomic.store(?pc.stop, 1::i64);
-            ret;
-        }
-        var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](r);
-        val br: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](?w.alloc, 1::usize);
-        if (R.is_err[*of.ObjectImage, str](br)) {
-            slot.err   = "parallel codegen: worker image box allocation failed";
-            slot.image = nil;
-            atomic.store(?pc.stop, 1::i64);
-            ret;
-        }
-        val box: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](br);
-        box[0]     = img;
-        slot.image = box;
-        slot.err   = nil;
-    }
-}
-
-# codegen every module across a worker pool and stage each finished image on its
-# ModuleEntry for Q_CODEGEN to adopt
-#
-# Each worker owns a private arena and a child interner over the session interner,
-# so lowering-to-object runs with no shared mutable state (the session interner and
-# allocator are read-only for the span). Modules are handed out by an atomic cursor,
-# so the object tree is independent of worker count and scheduling. Collection is
-# serial in TOPO order: each worker's new interner strings are folded back into the
-# session interner (reintern_child) and each raw image is re-homed onto the session
-# allocator with its names remapped (obj.rehome_remap), so the staged images are
-# byte-identical to a serial build and the link that follows keys on one interner.
-# Assumes a cold cache (every module is (re)built) - the CLI's contract; a warm
-# session must use the serial incremental path.
-# ---
-# p:   the active project (jobs resolved, no DWARF - see pcg_enabled)
-# ret: true once every module is staged, or the first worker's codegen error
-fun run_codegen_parallel(p: *project.Project) R.Result[bool, str] {
-    val topo_len: u32 = p.topo_len;
-    if (topo_len == 0) { ret R.ok[bool, str](true); }
-
-    var nworkers: u32 = p.jobs;
-    if (nworkers == 0)        { nworkers = 1; }
-    if (nworkers > topo_len)  { nworkers = topo_len; }
-
-    val rslots: R.Result[*PcgSlot, str] = A.allocate[PcgSlot](p.s.alloc, topo_len::usize);
-    if (R.is_err[*PcgSlot, str](rslots)) { ret R.err[bool, str](R.unwrap_err[*PcgSlot, str](rslots)); }
-    val slots: *PcgSlot = R.unwrap_ok[*PcgSlot, str](rslots);
-    var si: u32 = 0;
-    for (si < topo_len) { slots[si].image = nil; slots[si].worker = 0; slots[si].err = nil; si = si + 1; }
-
-    val rworkers: R.Result[*PcgWorker, str] = A.allocate[PcgWorker](p.s.alloc, nworkers::usize);
-    if (R.is_err[*PcgWorker, str](rworkers)) {
-        A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
-        ret R.err[bool, str](R.unwrap_err[*PcgWorker, str](rworkers));
-    }
-    val workers: *PcgWorker = R.unwrap_ok[*PcgWorker, str](rworkers);
-
-    var wi: u32 = 0;
-    for (wi < nworkers) {
-        val io: O.Option[str] = pcg_worker_init(?workers[wi], p);
-        if (O.is_some[str](io)) {
-            var wj: u32 = 0;
-            for (wj < wi) { pcg_worker_teardown(?workers[wj]); wj = wj + 1; }
-            A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
-            A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
-            ret R.err[bool, str](O.unwrap[str](io));
-        }
-        wi = wi + 1;
-    }
-
-    var ctx: ParallelCodegen;
-    ctx.p          = p;
-    ctx.next       = 0;
-    ctx.worker_seq = 0;
-    ctx.stop       = 0;
-    ctx.nworkers   = nworkers;
-    ctx.workers    = workers;
-    ctx.slots      = slots;
-    ctx.base_len   = intern.count(?p.s.interner);
-    g_pcg = ?ctx;
-
-    # spawn nworkers-1 helper threads; the calling thread is the last worker, so a
-    # single-worker (jobs 1) run drives the whole pool on this thread with no spawn.
-    var threads: *thread.Thread = nil;
-    val extra: u32 = nworkers - 1;
-    if (extra > 0) {
-        val rt: R.Result[*thread.Thread, str] = A.allocate[thread.Thread](p.s.alloc, extra::usize);
-        if (R.is_err[*thread.Thread, str](rt)) {
-            g_pcg = nil;
-            var wk: u32 = 0;
-            for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
-            A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
-            A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
-            ret R.err[bool, str](R.unwrap_err[*thread.Thread, str](rt));
-        }
-        threads = R.unwrap_ok[*thread.Thread, str](rt);
-        var k: u32 = 0;
-        for (k < extra) { thread.spawn(pcg_worker_main, ?threads[k]); k = k + 1; }
-    }
-
-    pcg_worker_main();
-
-    if (extra > 0) {
-        var k: u32 = 0;
-        for (k < extra) {
-            if (threads[k].tid >= 0) { thread.join(?threads[k]); }
-            k = k + 1;
-        }
-        A.deallocate[thread.Thread](p.s.alloc, threads, extra::usize);
-    }
-    g_pcg = nil;
-
-    # first error in topo order wins - deterministic regardless of which worker hit it.
-    var ei: u32 = 0;
-    for (ei < topo_len) {
-        if (slots[ei].err != nil) {
-            val msg: str = slots[ei].err;
-            var wk: u32 = 0;
-            for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
-            A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
-            A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
-            ret R.err[bool, str](msg);
-        }
-        ei = ei + 1;
-    }
-
-    val cr: R.Result[bool, str] = pcg_collect(p, ?ctx);
-
-    var wk: u32 = 0;
-    for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
-    A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
-    A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
-    ret cr;
-}
-
-# fold every worker's new interner strings back into the session interner and
-# re-home each raw image onto the session allocator, remapped, staged on its module
-#
-# Serial and in topo order: worker remaps are computed once each, then every image
-# is deep-copied onto the session allocator with its names rewritten into the
-# session interner's id space. On any allocation failure the images staged so far
-# are left on their modules for the normal teardown to reclaim.
-# ---
-# p:   the active project
-# ctx: the finished job (its workers hold the raw images and child interners)
-# ret: true once every image is staged, or the first allocation error
-fun pcg_collect(p: *project.Project, ctx: *ParallelCodegen) R.Result[bool, str] {
-    val nworkers: u32 = ctx.nworkers;
-
-    val rmaps: R.Result[**intern.StrId, str] = A.allocate[*intern.StrId](p.s.alloc, nworkers::usize);
-    if (R.is_err[**intern.StrId, str](rmaps)) { ret R.err[bool, str](R.unwrap_err[**intern.StrId, str](rmaps)); }
-    val remaps: **intern.StrId = R.unwrap_ok[**intern.StrId, str](rmaps);
-
-    var wi: u32 = 0;
-    for (wi < nworkers) {
-        val rr: R.Result[*intern.StrId, str] = intern.reintern_child(?workers_at(ctx, wi).sess.interner, p.s.alloc);
-        if (R.is_err[*intern.StrId, str](rr)) {
-            pcg_free_remaps(p, ctx, remaps, wi);
-            A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
-            ret R.err[bool, str](R.unwrap_err[*intern.StrId, str](rr));
-        }
-        remaps[wi] = R.unwrap_ok[*intern.StrId, str](rr);
-        wi = wi + 1;
-    }
-
-    var i: u32 = 0;
-    for (i < p.topo_len) {
-        val slot: *PcgSlot = ?ctx.slots[i::usize];
-        val w:    *PcgWorker = ?ctx.workers[slot.worker::usize];
-        val rehomed: R.Result[of.ObjectImage, str] =
-            obj.rehome_remap(p.s.alloc, ?p.s.interner, slot.image, ctx.base_len, remaps[slot.worker]);
-        if (R.is_err[of.ObjectImage, str](rehomed)) {
-            pcg_free_remaps(p, ctx, remaps, nworkers);
-            A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
-            ret R.err[bool, str](R.unwrap_err[of.ObjectImage, str](rehomed));
-        }
-        val rbox: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](p.s.alloc, 1::usize);
-        if (R.is_err[*of.ObjectImage, str](rbox)) {
-            var tmp: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](rehomed);
-            obj.dnit(?tmp);
-            pcg_free_remaps(p, ctx, remaps, nworkers);
-            A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
-            ret R.err[bool, str](R.unwrap_err[*of.ObjectImage, str](rbox));
-        }
-        val box: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](rbox);
-        box[0] = R.unwrap_ok[of.ObjectImage, str](rehomed);
-
-        val mid: session.ModuleId = p.topo[i];
-        p.modules[mid::u32].staged_image = box;
-        i = i + 1;
-    }
-
-    pcg_free_remaps(p, ctx, remaps, nworkers);
-    A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
-    ret R.ok[bool, str](true);
-}
-
-# the worker at index `wi` (a bounds-clear accessor for the collection phase)
-fun workers_at(ctx: *ParallelCodegen, wi: u32) *PcgWorker {
-    ret ?ctx.workers[wi::usize];
-}
-
-# free the first `n` worker remap arrays (each sized to its child's new-string count)
-fun pcg_free_remaps(p: *project.Project, ctx: *ParallelCodegen, remaps: **intern.StrId, n: u32) {
-    var wi: u32 = 0;
-    for (wi < n) {
-        if (remaps[wi] != nil) {
-            val len: usize = intern.count(?workers_at(ctx, wi).sess.interner);
-            if (len > 0) { A.deallocate[intern.StrId](p.s.alloc, remaps[wi], len); }
-        }
-        wi = wi + 1;
-    }
-}
-
 # codegen every module to an ObjectImage in topo order through the Q_CODEGEN query.
 # the active Project is installed on the session for the pass so the compute can
 # reach the per-build module graph. run_lower_pass must have run first (each
@@ -1293,27 +1089,20 @@ fun pcg_free_remaps(p: *project.Project, ctx: *ParallelCodegen, remaps: **intern
 # ---
 # p:   the active project; its topo order and per-build module graph drive the pass
 # ret: true once every module is codegen'd, or the first error
-pub fun run_codegen_pass(p: *project.Project) R.Result[bool, str] {
+pub fun run_codegen_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
+    # this pass owns its query binding: Q_CODEGEN (an opaque owned handle keyed
+    # by the packed back-half key). registered once per session. the engine's
+    # parallel-codegen pool, when it ran, staged each module's image on its
+    # ModuleEntry; the serial loop below adopts the staged images through the
+    # compute (Q_CODEGEN stays the value's system of record).
+    if (!query.is_registered(?p.s.queries, query.Q_CODEGEN)) {
+        val rcg: R.Result[bool, str] = query.register_derived_owned(?p.s.queries, query.Q_CODEGEN, q_codegen_compute, q_codegen_finalize);
+        if (R.is_err[bool, str](rcg)) { ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](rcg))); }
+    }
+
     session.set_active_project(p.s, p::ptr);
 
-    readout.phase_begin(p.s.readout, readout.PH_CODEGEN);
-
-    # when the caller opts into parallelism (jobs >= 1, CLI builds) and the build
-    # emits no DWARF, codegen every module across a worker pool up front and stage
-    # each finished image on its ModuleEntry; the serial query.get loop below then
-    # adopts the staged images (Q_CODEGEN stays the value's system of record). a
-    # `-g` build keeps the serial path: its DWARF interns IR types into each
-    # module's type table through the shared session allocator, which the worker
-    # arenas do not isolate (#1826 parallel-lowering/-g follow-up). the serial path
-    # also drives every non-CLI caller (jobs == 0) and the driver tests, keeping the
-    # in-engine codegen compute exercised.
-    if (pcg_enabled(p)) {
-        val rp: R.Result[bool, str] = run_codegen_parallel(p);
-        if (R.is_err[bool, str](rp)) {
-            session.set_active_project(p.s, nil);
-            ret rp;
-        }
-    }
+    readout.phase_begin(p.events, readout.PH_CODEGEN);
 
     var i: u32 = 0;
     for (i < p.topo_len) {
@@ -1321,20 +1110,13 @@ pub fun run_codegen_pass(p: *project.Project) R.Result[bool, str] {
         val r: R.Result[bool, str] = run_codegen_one(p, mid);
         if (R.is_err[bool, str](r)) {
             session.set_active_project(p.s, nil);
-            ret r;
+            ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](r)));
         }
         i = i + 1;
     }
-    readout.phase_end(p.s.readout, readout.PH_CODEGEN, p.topo_len, "module", "modules");
+    readout.phase_end(p.events, readout.PH_CODEGEN, p.topo_len, "module", "modules");
     session.set_active_project(p.s, nil);
-    ret R.ok[bool, str](true);
-}
-
-# whether the parallel-codegen prelude should run for this build: the caller asked
-# for at least one worker, the build emits no DWARF (the worker arenas do not
-# isolate the `-g` type-table writes), and there is at least one module
-fun pcg_enabled(p: *project.Project) bool {
-    ret p.jobs >= 1 && !p.s.debug && p.topo_len > 0;
+    ret R.ok[bool, outcome.Fail](true);
 }
 
 # fetch module `mid`'s ObjectImage through Q_CODEGEN - computed fresh when its
@@ -1343,15 +1125,15 @@ fun pcg_enabled(p: *project.Project) bool {
 fun run_codegen_one(p: *project.Project, mid: session.ModuleId) R.Result[bool, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
 
-    val t_item: ctime.Time = readout.item_begin(p.s.readout);
+    val t_item: ctime.Time = readout.item_begin(p.events);
 
-    val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_CODEGEN, back_half_key(m.stable_id, p.test_mode));
+    val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_CODEGEN, back_half_key(m.stable_id, test_build(p)));
     if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
     val img: *of.ObjectImage = image_handle_decode(R.unwrap_ok[*query.QueryEntry, str](e_r));
     if (img == nil) { ret R.err[bool, str]("Q_CODEGEN produced no result handle"); }
 
     m.object_image = img;
-    readout.item(p.s.readout, readout.PH_CODEGEN, project.fqn_name(p, m.fqn), t_item);
+    readout.item(p.events, readout.PH_CODEGEN, project.fqn_name(p, m.fqn), t_item);
     ret R.ok[bool, str](true);
 }
 
@@ -1397,7 +1179,10 @@ pub fun q_codegen_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.R
         ret image_handle_encode(alloc, staged);
     }
 
-    val res_cg: R.Result[of.ObjectImage, str] = codegen.codegen_module(s, ?p.target, irmod, nil);
+    val dbg_r: R.Result[codegen.DebugInfo, str] = debug_info_of(p);
+    if (R.is_err[codegen.DebugInfo, str](dbg_r)) { ret R.err[query.QueryOutput, str](R.unwrap_err[codegen.DebugInfo, str](dbg_r)); }
+
+    val res_cg: R.Result[of.ObjectImage, str] = codegen.codegen_module(s, ?p.target, irmod, nil, R.unwrap_ok[codegen.DebugInfo, str](dbg_r));
     if (R.is_err[of.ObjectImage, str](res_cg)) { ret R.err[query.QueryOutput, str](R.unwrap_err[of.ObjectImage, str](res_cg)); }
     var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](res_cg);
 
@@ -1450,82 +1235,6 @@ fun image_handle_decode(e: *query.QueryEntry) *of.ObjectImage {
     ret slot[0]::*of.ObjectImage;
 }
 
-# serialize the link-only build configuration into the Q_LINK_CONFIG input, keyed
-# on unit (0) - set by the CLI before the link so Q_LINK invalidates on any change
-# to an input that does NOT flow through a module's Q_CODEGEN
-#
-# Captures the output path and product name, the output kind, the pie flag, and the
-# external link inputs (object/archive paths plus dynamic-dependency sonames). The
-# ownership boundary: the CLI translates argv/manifest into these resolved inputs;
-# this records them into the query graph. set_input's byte-equality cutoff keeps the
-# link reused when the config is unchanged.
-# ---
-# p:            the active project (for its session query DB and pie flag)
-# out_path:     the resolved output artifact path (nil-safe)
-# product:      the product / signing-identity name (nil-safe)
-# out_kind:     the link output kind discriminator (exe / library / object)
-# ext_paths:    the external static link-input paths
-# ext_count:    number of external paths
-# sonames:      the dynamic-dependency soname ids
-# soname_count: number of sonames
-# ret:          true on success, or the first error
-pub fun set_link_config_input(p: *project.Project, out_path: *u8, product: *u8, out_kind: u32,
-                              ext_paths: **u8, ext_count: u32,
-                              sonames: *intern.StrId, soname_count: u32) R.Result[bool, str] {
-    var fb: dq.FpBuf;
-    fb.alloc = p.s.alloc;
-    fb.buf   = nil;
-    fb.len   = 0;
-    fb.cap   = 0;
-
-    val w: R.Result[bool, str] = write_link_config(?fb, p, out_path, product, out_kind, ext_paths, ext_count, sonames, soname_count);
-    if (R.is_err[bool, str](w)) {
-        if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.s.alloc, fb.buf, fb.cap::usize); }
-        ret w;
-    }
-
-    val si: R.Result[bool, str] = query.set_input(?p.s.queries, query.Q_LINK_CONFIG, 0, fb.buf, fb.len);
-    if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.s.alloc, fb.buf, fb.cap::usize); }
-    ret si;
-}
-
-# append the link-only configuration bytes into `fb` in a stable order. every input
-# that can change the linked binary without changing a module's object appears here,
-# so a change to any of them advances Q_LINK_CONFIG and re-links
-fun write_link_config(fb: *dq.FpBuf, p: *project.Project, out_path: *u8, product: *u8, out_kind: u32,
-                      ext_paths: **u8, ext_count: u32,
-                      sonames: *intern.StrId, soname_count: u32) R.Result[bool, str] {
-    val a0: R.Result[bool, str] = dq.fp_u32(fb, out_kind);            if (R.is_err[bool, str](a0)) { ret a0; }
-    var pie_axis: u32 = 0;
-    if (p.s.pie) { pie_axis = 1; }
-    val a1: R.Result[bool, str] = dq.fp_u32(fb, pie_axis);            if (R.is_err[bool, str](a1)) { ret a1; }
-    val a2: R.Result[bool, str] = dq.fp_cstr(fb, out_path);           if (R.is_err[bool, str](a2)) { ret a2; }
-    val a3: R.Result[bool, str] = dq.fp_cstr(fb, product);            if (R.is_err[bool, str](a3)) { ret a3; }
-
-    # each static external input (a `.o` / `.a` baked into the output) is folded by
-    # PATH and by CONTENT: a same-path rebuild of a vendored archive changes the
-    # output binary, so its content must invalidate. mirrors the front half, which
-    # fingerprints a source file by its full text (Q_FILE_TEXT); the link folds a
-    # sha256 of the content instead of the raw bytes, since a static archive can be
-    # large. sonames below are DYNAMIC deps (DT_NEEDED, loaded at run time, not baked
-    # in), so they are fingerprinted by identity only - their content never changes
-    # this binary.
-    val a4: R.Result[bool, str] = dq.fp_u32(fb, ext_count);           if (R.is_err[bool, str](a4)) { ret a4; }
-    var i: u32 = 0;
-    for (i < ext_count) {
-        val ap: R.Result[bool, str] = dq.fp_cstr(fb, ext_paths[i]);          if (R.is_err[bool, str](ap)) { ret ap; }
-        val ah: R.Result[bool, str] = dq.fp_file_content(fb, p.s.alloc, ext_paths[i]); if (R.is_err[bool, str](ah)) { ret ah; }
-        i = i + 1;
-    }
-    val a5: R.Result[bool, str] = dq.fp_u32(fb, soname_count);        if (R.is_err[bool, str](a5)) { ret a5; }
-    var j: u32 = 0;
-    for (j < soname_count) {
-        val as: R.Result[bool, str] = dq.fp_u32(fb, sonames[j]::u32); if (R.is_err[bool, str](as)) { ret as; }
-        j = j + 1;
-    }
-    ret R.ok[bool, str](true);
-}
-
 # compute the project's link fingerprint through Q_LINK and report whether the link
 # must re-run
 #
@@ -1540,15 +1249,22 @@ fun write_link_config(fb: *dq.FpBuf, p: *project.Project, out_path: *u8, product
 # p:   the active project; its topo order drives the link set
 # ret: true when the link must re-run, false when the prior link is still valid, or
 #      the first error
-pub fun run_link_pass(p: *project.Project) R.Result[bool, str] {
+pub fun run_link_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
+    # this pass owns its query binding: Q_LINK, the whole-program link
+    # fingerprint (a plain derived kind, early cutoff on). once per session.
+    if (!query.is_registered(?p.s.queries, query.Q_LINK)) {
+        val rln: R.Result[bool, str] = query.register_derived(?p.s.queries, query.Q_LINK, q_link_compute);
+        if (R.is_err[bool, str](rln)) { ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](rln))); }
+    }
+
     session.set_active_project(p.s, p::ptr);
 
     val prior: query.Revision = query.peek_revision(?p.s.queries, query.Q_LINK, 0);
     val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LINK, 0);
     session.set_active_project(p.s, nil);
-    if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
+    if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[*query.QueryEntry, str](e_r))); }
     val now: query.Revision = R.unwrap_ok[*query.QueryEntry, str](e_r).last_changed;
-    ret R.ok[bool, str](now != prior);
+    ret R.ok[bool, outcome.Fail](now != prior);
 }
 
 # the Q_LINK derived compute - fold the revision of every link input into a
@@ -1676,20 +1392,13 @@ fun fp_type_fields(fb: *dq.FpBuf, s: *session.Session, ty: type.TypeId) R.Result
 # (so Q_RESOLVE stays valid) and advances it on any real change (so every module
 # re-resolves). the value is build-wide, so it is keyed under 0 (#1582)
 pub fun set_build_config_input(p: *project.Project) R.Result[bool, str] {
-    var build_mode_id: u32 = comptime.MODE_DEBUG;
-    if (p.s.opt_explicit) {
-        if (p.s.opt_release) { build_mode_id = comptime.MODE_RELEASE; }
-    } or (p.target_entry.opt == project.TARGET_OPT_RELEASE) {
-        build_mode_id = comptime.MODE_RELEASE;
-    }
-
     var fb: dq.FpBuf;
     fb.alloc = p.s.alloc;
     fb.buf   = nil;
     fb.len   = 0;
     fb.cap   = 0;
 
-    val w: R.Result[bool, str] = write_build_config(?fb, p, build_mode_id);
+    val w: R.Result[bool, str] = write_build_config(?fb, p);
     if (R.is_err[bool, str](w)) {
         if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.s.alloc, fb.buf, fb.cap::usize); }
         ret w;
@@ -1700,23 +1409,23 @@ pub fun set_build_config_input(p: *project.Project) R.Result[bool, str] {
     ret si;
 }
 
-# append the comptime-relevant build axes into `fb`. every value
-# an importer-independent `$if` can read is captured, so a change to any of them
-# advances Q_TARGET and re-resolves the graph
-fun write_build_config(fb: *dq.FpBuf, p: *project.Project, build_mode_id: u32) R.Result[bool, str] {
+# append the build-level cache key into `fb`: the request identity plus the
+# unit facts the request cannot know. the settled request's 32-byte hash
+# (request.request_hash) folds every request-owned decision - mode, pie,
+# debug-info intent, selection, emissions, link inputs - so any change that
+# alters what the build would do advances Q_TARGET and re-resolves the graph;
+# the composed target ids, entry names, project identity, and defines the unit
+# contributes stay explicit
+fun write_build_config(fb: *dq.FpBuf, p: *project.Project) R.Result[bool, str] {
+    var digest: [32]u8;
+    val hr: R.Result[bool, str] = request.request_hash(p.s.alloc, ?p.req, ?digest[0]);
+    if (R.is_err[bool, str](hr)) { ret hr; }
+    val ah: R.Result[bool, str] = dq.fp_bytes(fb, ?digest[0], request.HASH_SIZE::u32);
+    if (R.is_err[bool, str](ah)) { ret ah; }
+
     val a0: R.Result[bool, str] = dq.fp_u32(fb, p.target.os_id);        if (R.is_err[bool, str](a0)) { ret a0; }
     val a1: R.Result[bool, str] = dq.fp_u32(fb, p.target.arch_id);      if (R.is_err[bool, str](a1)) { ret a1; }
     val a2: R.Result[bool, str] = dq.fp_u32(fb, p.target.abi_id);       if (R.is_err[bool, str](a2)) { ret a2; }
-    val a3: R.Result[bool, str] = dq.fp_u32(fb, build_mode_id);         if (R.is_err[bool, str](a3)) { ret a3; }
-    var pie_axis: u32 = 0;
-    if (p.s.pie) { pie_axis = 1; }
-    val a3p: R.Result[bool, str] = dq.fp_u32(fb, pie_axis);             if (R.is_err[bool, str](a3p)) { ret a3p; }
-    # debug-info intent forks compilation state like pie: Q_TARGET re-codegens every
-    # module (adding/removing debug sections) and re-links, so a `-g`/`debug` toggle
-    # never serves a no-debug object for a debug request or vice versa.
-    var dbg_axis: u32 = 0;
-    if (p.s.debug) { dbg_axis = 1; }
-    val a3d: R.Result[bool, str] = dq.fp_u32(fb, dbg_axis);             if (R.is_err[bool, str](a3d)) { ret a3d; }
     val a4: R.Result[bool, str] = dq.fp_u32(fb, p.target.arch.pointer_width); if (R.is_err[bool, str](a4)) { ret a4; }
     val a5: R.Result[bool, str] = dq.fp_u32(fb, p.target_entry.os_name::u32);  if (R.is_err[bool, str](a5)) { ret a5; }
     val a6: R.Result[bool, str] = dq.fp_u32(fb, p.target_entry.isa_name::u32); if (R.is_err[bool, str](a6)) { ret a6; }

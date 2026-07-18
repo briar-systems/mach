@@ -1,0 +1,1110 @@
+# the build executor: phase dispatch over the resolved plan
+#
+# `execute` walks each plan unit's ordered phase vector and dispatches on
+# PhaseKind - the phases vector drives execution rather than describing it.
+# Each unit runs in its own arena-backed session, torn down before the next
+# matrix cell; results land on the caller's outcome allocator. The engine owns
+# the build-level query wiring (the Q_LINK_CONFIG input; the passes bind their
+# own computes and Q_TARGET carries the request hash), the parallel-codegen
+# worker pool sized by the request's `jobs`, and the progress events the
+# readout renders. The engine itself never prints: narration flows through the
+# `readout.Progress` sink and render-worthy moments (unit banners, failures,
+# diagnostics flushes, the scalarization note) through the `outcome.Render`
+# seam, so rendering stays with the CLI.
+
+use std.allocator.arena;
+use std.allocator.page;
+use fs: std.filesystem;
+use std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_copy;
+use std.types.string.str_join;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+use ctime: std.chrono.time;
+use atomic: std.sync.atomic;
+use thread: std.sync.thread;
+
+use btest: mach.lang.build.testing;
+use emit: mach.lang.build.emit;
+use outcome: mach.lang.build.outcome;
+use plan: mach.lang.build.plan;
+use request: mach.lang.build.request;
+use dq: mach.lang.driver.query;
+use mach.lang.be.codegen;
+use mach.lang.be.linker;
+use mach.lang.be.obj;
+use mach.lang.diagnostic;
+use mach.lang.driver;
+use mach.lang.intern;
+use mach.lang.manifest;
+use mach.lang.me.ir;
+use mach.lang.query;
+use mach.lang.readout;
+use mach.lang.session;
+use mach.lang.target.of;
+
+# one unit's execution state, threaded across the phase dispatch
+#
+# The view arrays are shallow VIEWS onto the query-owned IR and object images
+# (the session query DB owns and frees the artifacts); everything here lives on
+# the unit arena and is reclaimed wholesale when the cell tears down.
+# ---
+# irs:          per-module IR views, filled in topo order after PH_LOWER
+# ir_ready:     per-module flag set once `irs[mid]` holds a built module
+# images:       per-module object-image views, filled after PH_CODEGEN
+# image_ready:  per-module flag set once `images[mid]` holds a built image
+# obj_paths:    written per-module object paths (topo order), grown by the
+#               external link inputs on the executable path; owned strings
+# obj_len:      number of populated `obj_paths` entries
+# sonames:      the dynamic-dependency soname list the link consumed
+# soname_len:   number of sonames
+# out_path:     the produced artifact path, or nil until a phase sets it
+# scope:        the test collection state (tests goals only)
+# link_started: the link narration span is open (its begin fired)
+# t_link:       the link item's start instant (paired with `link_started`)
+rec UnitState {
+    irs:          *ir.Module;
+    ir_ready:     *bool;
+    images:       *of.ObjectImage;
+    image_ready:  *bool;
+
+    obj_paths:    **u8;
+    obj_len:      u32;
+    sonames:      *intern.StrId;
+    soname_len:   u32;
+
+    out_path:     *u8;
+    scope:        btest.TestScope;
+
+    link_started: bool;
+    t_link:       ctime.Time;
+}
+
+# execute the resolved plan: every unit, one after another, each in its own
+# arena-backed session
+#
+# A unit failure is rendered through `rd` the moment it lands (the failure
+# event, then the unit session's diagnostics flush) and recorded on the
+# outcome; later units still run, matching the matrix contract. The returned
+# outcome carries the exit derivation (`ok`/`internal` - the first failure
+# decides the class), the produced artifacts, and - for test goals - the
+# collected test artifacts, all on `oa`.
+# ---
+# bp:      the resolved plan; its request drives every unit derivation
+# backing: allocator the per-unit arenas draw from
+# oa:      the outcome allocator - everything the caller keeps lands here
+# ev:      the progress-event sink (`-v` narration), or nil for silence
+# rd:      the render seam (banners, notes, failures, diagnostics), or nil
+# ret:     the executed outcome; err only for an invocation-level fault that
+#          produced no outcome
+pub fun execute(bp: *plan.BuildPlan, backing: *A.Allocator, oa: *A.Allocator,
+                ev: *readout.Progress, rd: *outcome.Render) R.Result[outcome.BuildOutcome, outcome.Fail] {
+    var bo: outcome.BuildOutcome;
+    bo.ok            = true;
+    bo.internal      = false;
+    bo.artifacts     = vector.init[outcome.Artifact](oa);
+    bo.tests         = vector.init[outcome.TestArtifact](oa);
+    bo.tests_skipped = 0;
+
+    var i: usize = 0;
+    for (i < bp.units.len) {
+        val unit: *plan.BuildUnit = ?bp.units.data[i];
+        outcome.render_unit(rd, unit.sel_artifact, unit.sel_target, unit.has_artifact);
+
+        val ur: R.Result[bool, outcome.Fail] = execute_unit(bp, unit, backing, oa, ev, rd, ?bo);
+        if (R.is_err[bool, outcome.Fail](ur)) {
+            # the failure was already rendered where it landed; fold the exit
+            # derivation - the first failing unit decides the class.
+            val f: outcome.Fail = R.unwrap_err[bool, outcome.Fail](ur);
+            if (bo.ok) { bo.internal = f.internal; }
+            bo.ok = false;
+        }
+        i = i + 1;
+    }
+    ret R.ok[outcome.BuildOutcome, outcome.Fail](bo);
+}
+
+# concatenate `va` into one owned message string on `al`, for a Fail's message
+#
+# The parts are short and the allocation effectively cannot fail; should it, the
+# allocator's own error is surfaced so an error still reaches the user under
+# memory pressure.
+fun join_msg(al: *A.Allocator, va: ...) str {
+    val r: R.Result[str, str] = str_join(al, va...);
+    if (R.is_err[str, str](r)) { ret R.unwrap_err[str, str](r); }
+    ret R.unwrap_ok[str, str](r);
+}
+
+# render a failure through the seam and return it as the unit's error
+fun unit_fail(rd: *outcome.Render, f: outcome.Fail) R.Result[bool, outcome.Fail] {
+    var fv: outcome.Fail = f;
+    outcome.render_fail(rd, ?fv);
+    ret R.err[bool, outcome.Fail](fv);
+}
+
+# execute one plan unit: fresh session over a fresh arena, the cell's derived
+# request, then the unit's phase vector dispatched in order
+#
+# Any failure is rendered here - the failure event first, then the unit
+# session's diagnostics flush when the session is live - so the error text
+# interleaves with the narration exactly where it happened. The returned Fail
+# is already rendered; the caller only folds it into the outcome.
+# ---
+# bp:      the plan (for the invocation request)
+# unit:    the cell to execute
+# backing: allocator the unit arena draws from
+# oa:      the outcome allocator
+# ev:      the progress-event sink, or nil
+# rd:      the render seam, or nil
+# bo:      the outcome under construction (artifacts, tests)
+# ret:     ok(true), or the rendered failure
+fun execute_unit(bp: *plan.BuildPlan, unit: *plan.BuildUnit, backing: *A.Allocator,
+                 oa: *A.Allocator, ev: *readout.Progress, rd: *outcome.Render,
+                 bo: *outcome.BuildOutcome) R.Result[bool, outcome.Fail] {
+    # the unit arena: every session-side allocation of this cell lands here and
+    # is reclaimed in one teardown before the next cell.
+    var u_ar: arena.Arena;
+    if (O.is_some[str](arena.init(?u_ar, backing, 0))) {
+        ret unit_fail(rd, outcome.internal("failed to initialise allocator"));
+    }
+    var u_alloc: A.Allocator;
+    if (O.is_some[str](arena.make(?u_alloc, ?u_ar))) {
+        arena.dnit(?u_ar);
+        ret unit_fail(rd, outcome.internal("failed to initialise allocator"));
+    }
+
+    val res_session: R.Result[session.Session, str] = session.init(?u_alloc);
+    if (R.is_err[session.Session, str](res_session)) {
+        val f: outcome.Fail = outcome.internal(join_msg(?u_alloc, "failed to initialise compiler session: ", R.unwrap_err[session.Session, str](res_session)));
+        arena.dnit(?u_ar);
+        ret unit_fail(rd, f);
+    }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
+
+    val res_register: R.Result[bool, str] = driver.setup_registry(?s.registry);
+    if (R.is_err[bool, str](res_register)) {
+        val f: outcome.Fail = outcome.internal(R.unwrap_err[bool, str](res_register));
+        session.dnit(?s);
+        arena.dnit(?u_ar);
+        ret unit_fail(rd, f);
+    }
+
+    # the ONE manifest load of this unit: the driver builds the project from
+    # the same parsed value; nothing downstream re-parses it.
+    val res_manifest: R.Result[manifest.Manifest, str] = driver.load_manifest(?s, bp.request.project_root);
+    if (R.is_err[manifest.Manifest, str](res_manifest)) {
+        val f: outcome.Fail = outcome.user(R.unwrap_err[manifest.Manifest, str](res_manifest));
+        session.dnit(?s);
+        arena.dnit(?u_ar);
+        ret unit_fail(rd, f);
+    }
+    var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](res_manifest);
+
+    # the cell's request: the invocation request with the cell's selection
+    # swapped in - request-lifetime data, boxed on the unit arena because the
+    # project borrows it for the unit's whole span.
+    val res_rq: R.Result[*request.BuildRequest, str] = A.allocate[request.BuildRequest](?u_alloc, 1::usize);
+    if (R.is_err[*request.BuildRequest, str](res_rq)) {
+        session.dnit(?s);
+        arena.dnit(?u_ar);
+        ret unit_fail(rd, outcome.internal("out of memory"));
+    }
+    val reqp: *request.BuildRequest = R.unwrap_ok[*request.BuildRequest, str](res_rq);
+    @reqp = request.for_cell(bp.request, unit.sel_target, unit.sel_artifact, unit.want_lib);
+
+    val begin_r: R.Result[driver.Project, outcome.Fail] = driver.begin_build(?s, ?m, reqp, ev);
+    if (R.is_err[driver.Project, outcome.Fail](begin_r)) {
+        val f: outcome.Fail = R.unwrap_err[driver.Project, outcome.Fail](begin_r);
+        session.dnit(?s);
+        arena.dnit(?u_ar);
+        ret unit_fail(rd, f);
+    }
+    var p: driver.Project = R.unwrap_ok[driver.Project, outcome.Fail](begin_r);
+
+    var st: UnitState;
+    st.irs          = nil;
+    st.ir_ready     = nil;
+    st.images       = nil;
+    st.image_ready  = nil;
+    st.obj_paths    = nil;
+    st.obj_len      = 0;
+    st.sonames      = nil;
+    st.soname_len   = 0;
+    st.out_path     = nil;
+    st.scope.have    = false;
+    st.scope.sel     = nil;
+    st.scope.sel_len = 0;
+    st.scope.skipped = 0;
+    st.link_started = false;
+
+    # the unit's execution IS its phase vector: dispatch each phase in order,
+    # stopping at the first failure.
+    var result: R.Result[bool, outcome.Fail] = R.ok[bool, outcome.Fail](true);
+    var pi: usize = 0;
+    for (pi < unit.phases.len) {
+        result = run_phase(unit.phases.data[pi], ?p, unit, ?st, bo, oa, ev, rd);
+        if (R.is_err[bool, outcome.Fail](result)) { brk; }
+        pi = pi + 1;
+    }
+
+    # a test-list goal compiles only; the collection is the goal's outcome,
+    # assembled once the phases are done.
+    if (R.is_ok[bool, outcome.Fail](result) && p.req.goal == request.GOAL_TEST_LIST) {
+        result = list_tests(?p, ?st, bo, oa);
+    }
+
+    if (R.is_ok[bool, outcome.Fail](result)) {
+        result = record_artifact(?p, unit, ?st, bo);
+    }
+
+    if (R.is_err[bool, outcome.Fail](result)) {
+        var f: outcome.Fail = R.unwrap_err[bool, outcome.Fail](result);
+        outcome.render_fail(rd, ?f);
+    }
+    or (ev != nil) {
+        emit_unit_summary(?p, ?st, ev);
+    }
+
+    # rendering the unit's located diagnostics needs the live session, so the
+    # flush event fires before teardown; the unit arena then reclaims the
+    # cell's memory wholesale (the RFC's unit-arena teardown between cells).
+    outcome.render_diags(rd, (?s)::ptr);
+    btest.free_scope(?p, ?st.scope);
+    driver.dnit_project(?p);
+    session.dnit(?s);
+    arena.dnit(?u_ar);
+
+    if (R.is_err[bool, outcome.Fail](result)) {
+        ret R.err[bool, outcome.Fail](R.unwrap_err[bool, outcome.Fail](result));
+    }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# dispatch one phase of the unit's vector
+fun run_phase(ph: plan.PhaseKind, p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
+              bo: *outcome.BuildOutcome, oa: *A.Allocator,
+              ev: *readout.Progress, rd: *outcome.Render) R.Result[bool, outcome.Fail] {
+    if (ph == plan.PH_STEPS)     { ret driver.run_steps_phase(p); }
+    if (ph == plan.PH_DEP_STEPS) { ret driver.run_dep_steps_phase(p); }
+    if (ph == plan.PH_LOAD)      { ret load_phase(p); }
+    if (ph == plan.PH_SEMA)      { ret sema_phase(p, st); }
+    if (ph == plan.PH_LOWER)     { ret lower_phase(p, st, rd); }
+    if (ph == plan.PH_CODEGEN)   { ret codegen_phase(p, st); }
+    if (ph == plan.PH_EMIT)      { ret emit_phase(p, unit, st, bo, ev); }
+    if (ph == plan.PH_LINK)      { ret link_phase(p, unit, st, bo, oa, ev); }
+    ret R.err[bool, outcome.Fail](outcome.internal("unknown build phase"));
+}
+
+# PH_LOAD: the driver's load-and-resolve walk over the module graph
+fun load_phase(p: *driver.Project) R.Result[bool, outcome.Fail] {
+    val lr: R.Result[bool, outcome.Fail] = driver.run_load_phase(p);
+    if (R.is_err[bool, outcome.Fail](lr)) { ret lr; }
+    if (p.module_len == 0) {
+        ret R.err[bool, outcome.Fail](outcome.user("project graph is empty; the entrypoint loaded no modules"));
+    }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# allocate the per-module view arrays once the module count is known
+#
+# The SemaResults, the optimized IR, and the object images are all owned by the
+# session query DB (the Q_SEMA / Q_LOWER / Q_CODEGEN handles) and borrowed onto
+# each ModuleEntry by the driver passes; the arrays here are shallow VIEWS the
+# engine fills from those borrows for the test / link / emit paths. They live
+# on the unit arena and die with it.
+fun ensure_views(p: *driver.Project, st: *UnitState) R.Result[bool, outcome.Fail] {
+    if (st.irs != nil) { ret R.ok[bool, outcome.Fail](true); }
+    val n: usize = p.module_len::usize;
+
+    val res_irs: R.Result[*ir.Module, str] = A.allocate[ir.Module](p.s.alloc, n);
+    if (R.is_err[*ir.Module, str](res_irs)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    st.irs = R.unwrap_ok[*ir.Module, str](res_irs);
+
+    val res_ir_ready: R.Result[*bool, str] = A.allocate[bool](p.s.alloc, n);
+    if (R.is_err[*bool, str](res_ir_ready)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    st.ir_ready = R.unwrap_ok[*bool, str](res_ir_ready);
+
+    val res_images: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](p.s.alloc, n);
+    if (R.is_err[*of.ObjectImage, str](res_images)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    st.images = R.unwrap_ok[*of.ObjectImage, str](res_images);
+
+    val res_image_ready: R.Result[*bool, str] = A.allocate[bool](p.s.alloc, n);
+    if (R.is_err[*bool, str](res_image_ready)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    st.image_ready = R.unwrap_ok[*bool, str](res_image_ready);
+
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        st.ir_ready[i]    = false;
+        st.image_ready[i] = false;
+        # a target-gated orphan is not lowered (it is kept out of topo), so its IR
+        # view slot is never filled; an empty function list keeps test collection,
+        # which scans every module id, from reading an uninitialized slot (#1873).
+        st.irs[i].function_len = 0;
+        i = i + 1;
+    }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# PH_SEMA: type-check the module graph; a graph with reported errors stops the
+# unit here so lowering and codegen never run off a broken AST
+fun sema_phase(p: *driver.Project, st: *UnitState) R.Result[bool, outcome.Fail] {
+    val vr: R.Result[bool, outcome.Fail] = ensure_views(p, st);
+    if (R.is_err[bool, outcome.Fail](vr)) { ret vr; }
+
+    val res_sema: R.Result[bool, outcome.Fail] = driver.run_sema_pass(p);
+    if (R.is_err[bool, outcome.Fail](res_sema)) { ret res_sema; }
+
+    # sema filed located diagnostics; the flush is the user-facing message.
+    if (diagnostic.has_errors(?p.s.diags)) {
+        ret R.err[bool, outcome.Fail](outcome.reported());
+    }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# PH_LOWER: lower + optimize every module, fill the IR views, and surface the
+# one-shot scalarization note (#2016)
+fun lower_phase(p: *driver.Project, st: *UnitState, rd: *outcome.Render) R.Result[bool, outcome.Fail] {
+    val res_lower: R.Result[bool, outcome.Fail] = driver.run_lower_pass(p);
+    if (R.is_err[bool, outcome.Fail](res_lower)) { ret res_lower; }
+
+    # the one-shot note under the default `simd = "scalarize"` posture: on a
+    # SIMD-incapable target the middle-end expanded vector operators to
+    # per-lane scalar sequences; the render seam owns the wording.
+    var total: u32 = 0;
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId    = p.topo[i];
+        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
+        total = total + m.ir_module.vector_ops_scalarized;
+        i = i + 1;
+    }
+    if (total > 0) { outcome.render_note(rd, total); }
+
+    i = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId    = p.topo[i];
+        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
+        val irm: *ir.Module          = m.ir_module;
+        st.irs[mid::u32]      = @irm;
+        st.ir_ready[mid::u32] = true;
+        i = i + 1;
+    }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# PH_CODEGEN: the parallel pool (an executor property, sized by the request's
+# `jobs`) stages images up front; the serial pass adopts them through
+# Q_CODEGEN and the views collect the borrows
+fun codegen_phase(p: *driver.Project, st: *UnitState) R.Result[bool, outcome.Fail] {
+    # when the request asks for workers (jobs >= 1, CLI builds) and the build
+    # emits no DWARF, codegen every module across the pool up front and stage
+    # each finished image on its ModuleEntry; run_codegen_pass then adopts the
+    # staged images (Q_CODEGEN stays the value's system of record). a `-g`
+    # build keeps the serial path: its DWARF interns IR types into each
+    # module's type table through the shared session allocator, which the
+    # worker arenas do not isolate (#1826 parallel-lowering/-g follow-up).
+    if (pcg_enabled(p)) {
+        val rp: R.Result[bool, str] = run_codegen_parallel(p);
+        if (R.is_err[bool, str](rp)) {
+            ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](rp)));
+        }
+    }
+
+    val res_codegen: R.Result[bool, outcome.Fail] = driver.run_codegen_pass(p);
+    if (R.is_err[bool, outcome.Fail](res_codegen)) { ret res_codegen; }
+
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId    = p.topo[i];
+        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
+        val img: *of.ObjectImage     = m.object_image;
+        st.images[mid::u32]      = @img;
+        st.image_ready[mid::u32] = true;
+        i = i + 1;
+    }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# open the link narration span (idempotent): the readout folds the emit + link
+# tail under its single `link` phase, so the span begins at the first of the
+# two phases and closes when the artifact lands
+fun begin_link_narration(st: *UnitState, ev: *readout.Progress) {
+    if (st.link_started) { ret; }
+    st.link_started = true;
+    readout.phase_begin(ev, readout.PH_LINK);
+    st.t_link = readout.item_begin(ev);
+}
+
+# PH_EMIT: materialize the on-disk per-module artifacts - the `.ir` / `.s`
+# debug dumps and the object tree - per the unit's goal
+fun emit_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
+               bo: *outcome.BuildOutcome, ev: *readout.Progress) R.Result[bool, outcome.Fail] {
+    val goal: request.BuildGoal = p.req.goal;
+    val flat: bool = p.target.of != nil && p.target.of.produces_image;
+
+    if (goal == request.GOAL_EXECUTE || goal == request.GOAL_OBJECTS) {
+        begin_link_narration(st, ev);
+    }
+
+    # the per-module `.ir` / `.s` debug artifacts, from the same post-pipeline
+    # IR the objects are built from; the dirs are plan facts.
+    if (p.req.emit_ir || p.req.emit_asm) {
+        var i: u32 = 0;
+        for (i < p.topo_len) {
+            val mid: session.ModuleId    = p.topo[i];
+            val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
+            if (p.req.emit_ir) {
+                val res_ir: R.Result[bool, str] = emit.emit_ir(p, unit.ir_dir::*u8, m.fqn, m.ir_module);
+                if (R.is_err[bool, str](res_ir)) {
+                    ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](res_ir)));
+                }
+            }
+            if (p.req.emit_asm) {
+                val res_asm: R.Result[bool, str] = emit.emit_asm(p, unit.asm_dir::*u8, m.fqn, m.ir_module);
+                if (R.is_err[bool, str](res_asm)) {
+                    ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](res_asm)));
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    # a flat-image format has no relocatable `.o` container: it cannot emit
+    # per-module objects (the executable link goes straight from the images).
+    if (goal == request.GOAL_OBJECTS && flat) {
+        ret R.err[bool, outcome.Fail](outcome.user("a flat-image object format produces only executables; library and '--emit obj' outputs are unsupported"));
+    }
+
+    if (goal == request.GOAL_TESTS) {
+        # the collection decides whether anything materializes: a build with no
+        # tests errors, a scope that selected nothing builds nothing.
+        val cr: R.Result[bool, outcome.Fail] = btest.collect_scope(p, st.irs, ?st.scope);
+        if (R.is_err[bool, outcome.Fail](cr)) { ret cr; }
+        bo.tests_skipped = st.scope.skipped;
+        if (st.scope.sel_len == 0) { ret R.ok[bool, outcome.Fail](true); }
+    }
+
+    val objects: bool = (goal == request.GOAL_EXECUTE && !flat)
+        || goal == request.GOAL_OBJECTS
+        || goal == request.GOAL_TESTS;
+    if (objects) {
+        val oc: R.Result[bool, outcome.Fail] = emit.write_objects(p, st.images, unit.obj_dir::*u8, ?st.obj_paths);
+        if (R.is_err[bool, outcome.Fail](oc)) { ret oc; }
+        st.obj_len = p.topo_len;
+    }
+
+    # an objects goal delivers the object tree itself; the narration closes
+    # here since the unit has no link phase.
+    if (goal == request.GOAL_OBJECTS) {
+        st.out_path = unit.out_path::*u8;
+        readout.phase_end(ev, readout.PH_LINK, p.topo_len, "object", "objects");
+        st.link_started = false;
+    }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# PH_LINK: produce the goal's linked artifact - the executable, the test
+# dispatcher, a static archive, a shared object, or the loose-object delivery
+fun link_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
+               bo: *outcome.BuildOutcome, oa: *A.Allocator, ev: *readout.Progress) R.Result[bool, outcome.Fail] {
+    val goal: request.BuildGoal = p.req.goal;
+
+    if (goal == request.GOAL_TESTS) {
+        # a scope that selected nothing builds nothing and runs nothing.
+        if (st.scope.sel_len == 0) { ret R.ok[bool, outcome.Fail](true); }
+        val lr: R.Result[bool, outcome.Fail] = btest.link_dispatcher(p, unit, ?st.scope, st.obj_paths);
+        if (R.is_err[bool, outcome.Fail](lr)) { ret lr; }
+        val rr: R.Result[bool, outcome.Fail] = btest.record_tests(p, ?st.scope, unit.out_path::*u8, ?bo.tests, oa);
+        if (R.is_err[bool, outcome.Fail](rr)) { ret rr; }
+        st.out_path = unit.out_path::*u8;
+        ret R.ok[bool, outcome.Fail](true);
+    }
+
+    val te: *driver.TargetEntry = p.target_entry;
+    if (te == nil) { ret R.err[bool, outcome.Fail](outcome.internal("no target selected")); }
+
+    # a flat-image object format links the in-memory codegen images straight
+    # into the executable - no `.o` round-trip, and no library form.
+    if (p.target.of != nil && p.target.of.produces_image) {
+        if (te.mode == driver.MODE_LIBRARY) {
+            ret R.err[bool, outcome.Fail](outcome.user("a flat-image object format produces only executables; library and '--emit obj' outputs are unsupported"));
+        }
+        ret link_flat(p, unit, st, ev);
+    }
+
+    # library mode: the per-module objects are the deliverable. a `kind =
+    # "static"` artifact additionally archives them into a real `ar` library,
+    # and a `kind = "shared"` artifact links them into a real ELF shared
+    # object, each at its declared `out` (#1980).
+    if (te.mode == driver.MODE_LIBRARY) {
+        if (te.lib_kind == manifest.LIBKIND_STATIC) {
+            val arc_r: R.Result[bool, outcome.Fail] = emit.emit_static_archive(p, unit, st.images, st.obj_paths, ?st.out_path);
+            if (R.is_err[bool, outcome.Fail](arc_r)) { ret arc_r; }
+            readout.phase_end(ev, readout.PH_LINK, 1, "archive", "archives");
+            ret R.ok[bool, outcome.Fail](true);
+        }
+        if (te.lib_kind == manifest.LIBKIND_SHARED) {
+            val so_r: R.Result[bool, outcome.Fail] = emit.emit_shared_library(p, unit, st.obj_paths, st.obj_len, ?st.out_path);
+            if (R.is_err[bool, outcome.Fail](so_r)) { ret so_r; }
+            readout.phase_end(ev, readout.PH_LINK, 1, "library", "libraries");
+            ret R.ok[bool, outcome.Fail](true);
+        }
+        st.out_path = unit.obj_dir::*u8;
+        readout.phase_end(ev, readout.PH_LINK, st.obj_len, "object", "objects");
+        ret R.ok[bool, outcome.Fail](true);
+    }
+
+    # append every external link input - the manifest's merged link overlay plus
+    # the unit's plan-resolved `-L`/`-l`/explicit-object facts - to the object
+    # set, then consult Q_LINK and link (or reuse the prior artifact).
+    val ext_r: R.Result[bool, outcome.Fail] = emit.append_external_inputs(p, unit, ?st.obj_paths, ?st.obj_len, ?st.sonames, ?st.soname_len);
+    if (R.is_err[bool, outcome.Fail](ext_r)) { ret ext_r; }
+
+    val artifact: str = unit.out_path;
+    if (O.is_some[str](emit.ensure_parents(p.s.alloc, artifact))) {
+        ret R.err[bool, outcome.Fail](outcome.internal("failed to create binary directory"));
+    }
+
+    # record the link inputs into Q_LINK_CONFIG and consult Q_LINK: when no link
+    # input changed and the prior artifact is present, reuse it instead of
+    # re-linking. the external link inputs are obj_paths[topo_len..obj_len)
+    # (obj_paths[0..topo_len) are the per-module objects Q_CODEGEN already
+    # tracks). a cold-cache CLI build always re-links (Q_LINK is a fresh entry).
+    val ext_from:  u32 = p.topo_len;
+    val ext_count: u32 = st.obj_len - p.topo_len;
+    val cfg_r: R.Result[bool, outcome.Fail] = set_link_config_input(p, artifact::*u8, emit.artifact_product_name(p), linker.LINK_EXE::u32,
+                                                                    ?st.obj_paths[ext_from], ext_count, st.sonames, st.soname_len);
+    if (R.is_err[bool, outcome.Fail](cfg_r)) { ret cfg_r; }
+    val relink_r: R.Result[bool, outcome.Fail] = driver.run_link_pass(p);
+    if (R.is_err[bool, outcome.Fail](relink_r)) { ret relink_r; }
+    if (!R.unwrap_ok[bool, outcome.Fail](relink_r) && fs.is_file(artifact)) {
+        st.out_path = artifact::*u8;
+        readout.item(ev, readout.PH_LINK, artifact, st.t_link);
+        readout.phase_end(ev, readout.PH_LINK, 1, "binary", "binaries");
+        ret R.ok[bool, outcome.Fail](true);
+    }
+
+    val res_link: R.Result[bool, outcome.Fail] = emit.link_executable(p, st.obj_paths, st.obj_len, st.sonames, st.soname_len, artifact::*u8);
+    if (R.is_err[bool, outcome.Fail](res_link)) { ret res_link; }
+
+    st.out_path = artifact::*u8;
+    readout.item(ev, readout.PH_LINK, artifact, st.t_link);
+    readout.phase_end(ev, readout.PH_LINK, 1, "binary", "binaries");
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# the flat-image executable link: config, Q_LINK consult, then the direct
+# image link when a re-link is needed
+fun link_flat(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState, ev: *readout.Progress) R.Result[bool, outcome.Fail] {
+    begin_link_narration(st, ev);
+
+    val artifact: str = unit.out_path;
+    if (O.is_some[str](emit.ensure_parents(p.s.alloc, artifact))) {
+        ret R.err[bool, outcome.Fail](outcome.internal("failed to create binary directory"));
+    }
+
+    # a flat image has no external link inputs, so the config is the output
+    # path / product / pie. reuse the prior artifact when no link input
+    # changed (a cold build always re-links).
+    val cfg_r: R.Result[bool, outcome.Fail] = set_link_config_input(p, artifact::*u8, emit.artifact_product_name(p), linker.LINK_EXE::u32, nil, 0, nil, 0);
+    if (R.is_err[bool, outcome.Fail](cfg_r)) { ret cfg_r; }
+    val relink_r: R.Result[bool, outcome.Fail] = driver.run_link_pass(p);
+    if (R.is_err[bool, outcome.Fail](relink_r)) { ret relink_r; }
+    if (!R.unwrap_ok[bool, outcome.Fail](relink_r) && fs.is_file(artifact)) {
+        st.out_path = artifact::*u8;
+        readout.item(ev, readout.PH_LINK, artifact, st.t_link);
+        readout.phase_end(ev, readout.PH_LINK, 1, "binary", "binaries");
+        ret R.ok[bool, outcome.Fail](true);
+    }
+
+    val res_link: R.Result[bool, outcome.Fail] = emit.link_flat_images(p, st.images, artifact::*u8);
+    if (R.is_err[bool, outcome.Fail](res_link)) { ret res_link; }
+
+    st.out_path = artifact::*u8;
+    readout.item(ev, readout.PH_LINK, artifact, st.t_link);
+    readout.phase_end(ev, readout.PH_LINK, 1, "binary", "binaries");
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# the test-list assembly: collect and record the in-scope tests with no
+# executable (each artifact's `exe` stays nil)
+fun list_tests(p: *driver.Project, st: *UnitState, bo: *outcome.BuildOutcome, oa: *A.Allocator) R.Result[bool, outcome.Fail] {
+    val cr: R.Result[bool, outcome.Fail] = btest.collect_scope(p, st.irs, ?st.scope);
+    if (R.is_err[bool, outcome.Fail](cr)) { ret cr; }
+    bo.tests_skipped = st.scope.skipped;
+    ret btest.record_tests(p, ?st.scope, nil, ?bo.tests, oa);
+}
+
+# record the unit's produced artifact on the outcome, its kind derived from
+# the goal and the target's build mode
+fun record_artifact(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState, bo: *outcome.BuildOutcome) R.Result[bool, outcome.Fail] {
+    if (st.out_path == nil) { ret R.ok[bool, outcome.Fail](true); }
+
+    var a: outcome.Artifact;
+    a.kind = outcome.ART_BINARY;
+    if (p.req.goal == request.GOAL_OBJECTS) { a.kind = outcome.ART_OBJECTS; }
+    or (p.req.goal == request.GOAL_TESTS)   { a.kind = outcome.ART_TESTS; }
+    or (p.target_entry != nil && p.target_entry.mode == driver.MODE_LIBRARY) {
+        a.kind = outcome.ART_OBJECTS;
+        if (p.target_entry.lib_kind == manifest.LIBKIND_STATIC) { a.kind = outcome.ART_ARCHIVE; }
+        if (p.target_entry.lib_kind == manifest.LIBKIND_SHARED) { a.kind = outcome.ART_SHARED; }
+    }
+
+    # the path is duplicated onto the outcome allocator - the unit arena that
+    # owns the original is torn down before the caller reads the outcome.
+    val dup_r: R.Result[str, str] = str_copy(bo.artifacts.a, st.out_path);
+    if (R.is_err[str, str](dup_r)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    a.path = R.unwrap_ok[str, str](dup_r);
+
+    val push_r: R.Result[usize, str] = vector.push[outcome.Artifact](?bo.artifacts, a);
+    if (R.is_err[usize, str](push_r)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# render the readout's closing recap for a finished unit
+#
+# Reports the module count and total time, plus the linked binary's size when
+# the build produced one (an executable). A library / object-only build has no
+# single binary, so the size segment is omitted.
+fun emit_unit_summary(p: *driver.Project, st: *UnitState, ev: *readout.Progress) {
+    var out_str: str = "<output>";
+    if (st.out_path != nil) { out_str = st.out_path::str; }
+
+    val te: *driver.TargetEntry = p.target_entry;
+    val emit_obj: bool = p.req.goal == request.GOAL_OBJECTS;
+    val is_lib: bool = emit_obj || (te != nil && te.mode == driver.MODE_LIBRARY);
+
+    if (!is_lib && st.out_path != nil) {
+        val fi_r: R.Result[fs.Metadata, str] = fs.metadata(st.out_path::str);
+        if (R.is_ok[fs.Metadata, str](fi_r)) {
+            val fi: fs.Metadata = R.unwrap_ok[fs.Metadata, str](fi_r);
+            var unit_s: str = "B";
+            val mag: i64 = readout.size_split(fi.size, ?unit_s);
+            readout.summary(ev, out_str, p.module_len, mag, unit_s, true);
+            ret;
+        }
+    }
+    readout.summary(ev, out_str, p.module_len, 0, "B", false);
+}
+
+# whether the parallel-codegen prelude should run for this build: the request
+# asked for at least one worker, the build emits no DWARF (the worker arenas do
+# not isolate the `-g` type-table writes), and there is at least one module
+fun pcg_enabled(p: *driver.Project) bool {
+    ret p.req.jobs >= 1 && !p.req.debug && p.topo_len > 0;
+}
+
+# serialize the link-only build configuration into the Q_LINK_CONFIG input, keyed
+# on unit (0) - set by the engine before the link so Q_LINK invalidates on any change
+# to an input that does NOT flow through a module's Q_CODEGEN
+#
+# Captures the output path and product name, the output kind, the pie flag, and the
+# external link inputs (object/archive paths plus dynamic-dependency sonames). The
+# ownership boundary: the CLI translates argv/manifest into these resolved inputs;
+# this records them into the query graph. set_input's byte-equality cutoff keeps the
+# link reused when the config is unchanged.
+# ---
+# p:            the active project (for its session query DB and pie flag)
+# out_path:     the resolved output artifact path (nil-safe)
+# product:      the product / signing-identity name (nil-safe)
+# out_kind:     the link output kind discriminator (exe / library / object)
+# ext_paths:    the external static link-input paths
+# ext_count:    number of external paths
+# sonames:      the dynamic-dependency soname ids
+# soname_count: number of sonames
+# ret:          true on success, or the first error
+pub fun set_link_config_input(p: *driver.Project, out_path: *u8, product: *u8, out_kind: u32,
+                              ext_paths: **u8, ext_count: u32,
+                              sonames: *intern.StrId, soname_count: u32) R.Result[bool, outcome.Fail] {
+    var fb: dq.FpBuf;
+    fb.alloc = p.s.alloc;
+    fb.buf   = nil;
+    fb.len   = 0;
+    fb.cap   = 0;
+
+    val w: R.Result[bool, str] = write_link_config(?fb, p, out_path, product, out_kind, ext_paths, ext_count, sonames, soname_count);
+    if (R.is_err[bool, str](w)) {
+        if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.s.alloc, fb.buf, fb.cap::usize); }
+        ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](w)));
+    }
+
+    val si: R.Result[bool, str] = query.set_input(?p.s.queries, query.Q_LINK_CONFIG, 0, fb.buf, fb.len);
+    if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.s.alloc, fb.buf, fb.cap::usize); }
+    if (R.is_err[bool, str](si)) { ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](si))); }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# append the link-only configuration bytes into `fb` in a stable order. every input
+# that can change the linked binary without changing a module's object appears here,
+# so a change to any of them advances Q_LINK_CONFIG and re-links
+fun write_link_config(fb: *dq.FpBuf, p: *driver.Project, out_path: *u8, product: *u8, out_kind: u32,
+                      ext_paths: **u8, ext_count: u32,
+                      sonames: *intern.StrId, soname_count: u32) R.Result[bool, str] {
+    val a0: R.Result[bool, str] = dq.fp_u32(fb, out_kind);            if (R.is_err[bool, str](a0)) { ret a0; }
+    var pie_axis: u32 = 0;
+    if (p.req.pie) { pie_axis = 1; }
+    val a1: R.Result[bool, str] = dq.fp_u32(fb, pie_axis);            if (R.is_err[bool, str](a1)) { ret a1; }
+    val a2: R.Result[bool, str] = dq.fp_cstr(fb, out_path);           if (R.is_err[bool, str](a2)) { ret a2; }
+    val a3: R.Result[bool, str] = dq.fp_cstr(fb, product);            if (R.is_err[bool, str](a3)) { ret a3; }
+
+    # each static external input (a `.o` / `.a` baked into the output) is folded by
+    # PATH and by CONTENT: a same-path rebuild of a vendored archive changes the
+    # output binary, so its content must invalidate. mirrors the front half, which
+    # fingerprints a source file by its full text (Q_FILE_TEXT); the link folds a
+    # sha256 of the content instead of the raw bytes, since a static archive can be
+    # large. sonames below are DYNAMIC deps (DT_NEEDED, loaded at run time, not baked
+    # in), so they are fingerprinted by identity only - their content never changes
+    # this binary.
+    val a4: R.Result[bool, str] = dq.fp_u32(fb, ext_count);           if (R.is_err[bool, str](a4)) { ret a4; }
+    var i: u32 = 0;
+    for (i < ext_count) {
+        val ap: R.Result[bool, str] = dq.fp_cstr(fb, ext_paths[i]);          if (R.is_err[bool, str](ap)) { ret ap; }
+        val ah: R.Result[bool, str] = dq.fp_file_content(fb, p.s.alloc, ext_paths[i]); if (R.is_err[bool, str](ah)) { ret ah; }
+        i = i + 1;
+    }
+    val a5: R.Result[bool, str] = dq.fp_u32(fb, soname_count);        if (R.is_err[bool, str](a5)) { ret a5; }
+    var j: u32 = 0;
+    for (j < soname_count) {
+        val as: R.Result[bool, str] = dq.fp_u32(fb, sonames[j]::u32); if (R.is_err[bool, str](as)) { ret as; }
+        j = j + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# per-worker parallel-codegen state: a private bump arena and a child interner over
+# the frozen session interner, plus the session view codegen_module reads
+# ---
+# backing: page allocator backing this worker's arena
+# ar:      bump arena owning all of this worker's codegen scratch and raw images
+# alloc:   allocator interface over `ar`
+# sess:    session view - a copy of the real session with alloc and interner
+#          (a child over the session interner) overridden; every other field is a
+#          frozen read shared with the real session
+# active:  the worker was initialised and needs teardown
+rec PcgWorker {
+    backing: A.Allocator;
+    ar:      arena.Arena;
+    alloc:   A.Allocator;
+    sess:    session.Session;
+    active:  bool;
+}
+
+# one module's parallel-codegen result, indexed by topo position
+# ---
+# image:  raw image in the producing worker's arena (child-interner names), or nil
+# worker: producing worker index - selects the remap at collection
+# err:    nil on success, else the module's codegen error message
+rec PcgSlot {
+    image:  *of.ObjectImage;
+    worker: u32;
+    err:    str;
+}
+
+# the running parallel-codegen job the bare thread entry reads through a global
+# ---
+# p:          the active project
+# next:       atomic cursor - the next topo index a worker claims
+# worker_seq: atomic dispenser - hands each running thread its worker index
+# stop:       atomic flag - set non-zero by the first worker to error
+# nworkers:   number of worker slots (>= threads that actually run)
+# workers:    the per-worker state array
+# slots:      the per-module result array, indexed by topo position
+# base_len:   session-interner id count snapshotted before any child - the boundary
+#             below which a name needs no remap
+rec ParallelCodegen {
+    p:          *driver.Project;
+    next:       i64;
+    worker_seq: i64;
+    stop:       i64;
+    nworkers:   u32;
+    workers:    *PcgWorker;
+    slots:      *PcgSlot;
+    base_len:   usize;
+}
+
+# the in-flight parallel-codegen job, read by the bare thread entry point
+# (std.sync.thread hands the entry no argument, so the job is reached through this
+# global). set for the span of run_codegen_parallel and nil otherwise.
+var g_pcg: *ParallelCodegen = nil;
+
+# initialise one worker: a fresh page-backed arena and a session view whose
+# allocator and interner are worker-private
+#
+# The interner is a child over the session interner - it resolves the frozen IR
+# ids every image inherits and captures any new codegen strings locally, so the
+# worker interns without touching the shared interner. The session copy shares
+# every other (frozen) field with the real session by value.
+# ---
+# w: the worker slot to initialise
+# p: the active project (its session is the parent of the worker view)
+# ret: none on success, or the first allocation error
+fun pcg_worker_init(w: *PcgWorker, p: *driver.Project) O.Option[str] {
+    w.active = false;
+    if (O.is_some[str](page.make(?w.backing)))          { ret O.some[str]("parallel codegen: worker backing alloc failed"); }
+    if (O.is_some[str](arena.init(?w.ar, ?w.backing, 0))) { ret O.some[str]("parallel codegen: worker arena init failed"); }
+    if (O.is_some[str](arena.make(?w.alloc, ?w.ar)))     { arena.dnit(?w.ar); ret O.some[str]("parallel codegen: worker arena bind failed"); }
+
+    w.sess          = @p.s;
+    w.sess.alloc    = ?w.alloc;
+    w.sess.interner = intern.make_child(?p.s.interner, ?w.alloc);
+    w.active        = true;
+    ret O.none[str]();
+}
+
+# tear one worker down, releasing its arena (which owns its child interner storage
+# and every raw image it built)
+fun pcg_worker_teardown(w: *PcgWorker) {
+    if (!w.active) { ret; }
+    arena.dnit(?w.ar);
+    w.active = false;
+}
+
+# the worker thread body: claim a worker index, then drain modules from the shared
+# cursor, codegen each into this worker's arena, and record it in its slot
+#
+# Bare (std.sync.thread hands no argument); reaches the job through g_pcg. Every
+# read of the project (topo, modules, target) and of the frozen session is
+# read-only and shared; every write (the MIR scratch, the image, interned strings)
+# lands in this worker's private arena and child interner. The first error sets the
+# stop flag so peers wind down.
+fun pcg_worker_main() {
+    val pc: *ParallelCodegen = g_pcg;
+    if (pc == nil) { ret; }
+    val wid_raw: i64 = atomic.fetch_add(?pc.worker_seq, 1::i64);
+    if (wid_raw < 0 || wid_raw >= pc.nworkers::i64) { ret; }
+    val wid: u32 = wid_raw::u32;
+    val w: *PcgWorker = ?pc.workers[wid::usize];
+
+    for (true) {
+        if (atomic.load(?pc.stop) != 0) { ret; }
+        val idx_raw: i64 = atomic.fetch_add(?pc.next, 1::i64);
+        if (idx_raw >= pc.p.topo_len::i64) { ret; }
+        val idx: u32 = idx_raw::u32;
+
+        val mid:  session.ModuleId = pc.p.topo[idx];
+        val m:    *driver.ModuleEntry     = ?pc.p.modules[mid::u32];
+        val slot: *PcgSlot         = ?pc.slots[idx::usize];
+        slot.worker = wid;
+
+        val r: R.Result[of.ObjectImage, str] = codegen.codegen_module(?w.sess, ?pc.p.target, m.ir_module, nil, codegen.no_debug());
+        if (R.is_err[of.ObjectImage, str](r)) {
+            slot.err   = R.unwrap_err[of.ObjectImage, str](r);
+            slot.image = nil;
+            atomic.store(?pc.stop, 1::i64);
+            ret;
+        }
+        var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](r);
+        val br: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](?w.alloc, 1::usize);
+        if (R.is_err[*of.ObjectImage, str](br)) {
+            slot.err   = "parallel codegen: worker image box allocation failed";
+            slot.image = nil;
+            atomic.store(?pc.stop, 1::i64);
+            ret;
+        }
+        val box: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](br);
+        box[0]     = img;
+        slot.image = box;
+        slot.err   = nil;
+    }
+}
+
+# codegen every module across a worker pool and stage each finished image on its
+# ModuleEntry for Q_CODEGEN to adopt
+#
+# Each worker owns a private arena and a child interner over the session interner,
+# so lowering-to-object runs with no shared mutable state (the session interner and
+# allocator are read-only for the span). Modules are handed out by an atomic cursor,
+# so the object tree is independent of worker count and scheduling. Collection is
+# serial in TOPO order: each worker's new interner strings are folded back into the
+# session interner (reintern_child) and each raw image is re-homed onto the session
+# allocator with its names remapped (obj.rehome_remap), so the staged images are
+# byte-identical to a serial build and the link that follows keys on one interner.
+# Assumes a cold cache (every module is (re)built) - the CLI's contract; a warm
+# session must use the serial incremental path.
+# ---
+# p:   the active project (jobs resolved, no DWARF - see pcg_enabled)
+# ret: true once every module is staged, or the first worker's codegen error
+fun run_codegen_parallel(p: *driver.Project) R.Result[bool, str] {
+    val topo_len: u32 = p.topo_len;
+    if (topo_len == 0) { ret R.ok[bool, str](true); }
+
+    var nworkers: u32 = p.req.jobs;
+    if (nworkers == 0)        { nworkers = 1; }
+    if (nworkers > topo_len)  { nworkers = topo_len; }
+
+    val rslots: R.Result[*PcgSlot, str] = A.allocate[PcgSlot](p.s.alloc, topo_len::usize);
+    if (R.is_err[*PcgSlot, str](rslots)) { ret R.err[bool, str](R.unwrap_err[*PcgSlot, str](rslots)); }
+    val slots: *PcgSlot = R.unwrap_ok[*PcgSlot, str](rslots);
+    var si: u32 = 0;
+    for (si < topo_len) { slots[si].image = nil; slots[si].worker = 0; slots[si].err = nil; si = si + 1; }
+
+    val rworkers: R.Result[*PcgWorker, str] = A.allocate[PcgWorker](p.s.alloc, nworkers::usize);
+    if (R.is_err[*PcgWorker, str](rworkers)) {
+        A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+        ret R.err[bool, str](R.unwrap_err[*PcgWorker, str](rworkers));
+    }
+    val workers: *PcgWorker = R.unwrap_ok[*PcgWorker, str](rworkers);
+
+    var wi: u32 = 0;
+    for (wi < nworkers) {
+        val io: O.Option[str] = pcg_worker_init(?workers[wi], p);
+        if (O.is_some[str](io)) {
+            var wj: u32 = 0;
+            for (wj < wi) { pcg_worker_teardown(?workers[wj]); wj = wj + 1; }
+            A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
+            A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+            ret R.err[bool, str](O.unwrap[str](io));
+        }
+        wi = wi + 1;
+    }
+
+    var ctx: ParallelCodegen;
+    ctx.p          = p;
+    ctx.next       = 0;
+    ctx.worker_seq = 0;
+    ctx.stop       = 0;
+    ctx.nworkers   = nworkers;
+    ctx.workers    = workers;
+    ctx.slots      = slots;
+    ctx.base_len   = intern.count(?p.s.interner);
+    g_pcg = ?ctx;
+
+    # spawn nworkers-1 helper threads; the calling thread is the last worker, so a
+    # single-worker (jobs 1) run drives the whole pool on this thread with no spawn.
+    var threads: *thread.Thread = nil;
+    val extra: u32 = nworkers - 1;
+    if (extra > 0) {
+        val rt: R.Result[*thread.Thread, str] = A.allocate[thread.Thread](p.s.alloc, extra::usize);
+        if (R.is_err[*thread.Thread, str](rt)) {
+            g_pcg = nil;
+            var wk: u32 = 0;
+            for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
+            A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
+            A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+            ret R.err[bool, str](R.unwrap_err[*thread.Thread, str](rt));
+        }
+        threads = R.unwrap_ok[*thread.Thread, str](rt);
+        var k: u32 = 0;
+        for (k < extra) { thread.spawn(pcg_worker_main, ?threads[k]); k = k + 1; }
+    }
+
+    pcg_worker_main();
+
+    if (extra > 0) {
+        var k: u32 = 0;
+        for (k < extra) {
+            if (threads[k].tid >= 0) { thread.join(?threads[k]); }
+            k = k + 1;
+        }
+        A.deallocate[thread.Thread](p.s.alloc, threads, extra::usize);
+    }
+    g_pcg = nil;
+
+    # first error in topo order wins - deterministic regardless of which worker hit it.
+    var ei: u32 = 0;
+    for (ei < topo_len) {
+        if (slots[ei].err != nil) {
+            val msg: str = slots[ei].err;
+            var wk: u32 = 0;
+            for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
+            A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
+            A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+            ret R.err[bool, str](msg);
+        }
+        ei = ei + 1;
+    }
+
+    val cr: R.Result[bool, str] = pcg_collect(p, ?ctx);
+
+    var wk: u32 = 0;
+    for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
+    A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
+    A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+    ret cr;
+}
+
+# fold every worker's new interner strings back into the session interner and
+# re-home each raw image onto the session allocator, remapped, staged on its module
+#
+# Serial and in topo order: worker remaps are computed once each, then every image
+# is deep-copied onto the session allocator with its names rewritten into the
+# session interner's id space. On any allocation failure the images staged so far
+# are left on their modules for the normal teardown to reclaim.
+# ---
+# p:   the active project
+# ctx: the finished job (its workers hold the raw images and child interners)
+# ret: true once every image is staged, or the first allocation error
+fun pcg_collect(p: *driver.Project, ctx: *ParallelCodegen) R.Result[bool, str] {
+    val nworkers: u32 = ctx.nworkers;
+
+    val rmaps: R.Result[**intern.StrId, str] = A.allocate[*intern.StrId](p.s.alloc, nworkers::usize);
+    if (R.is_err[**intern.StrId, str](rmaps)) { ret R.err[bool, str](R.unwrap_err[**intern.StrId, str](rmaps)); }
+    val remaps: **intern.StrId = R.unwrap_ok[**intern.StrId, str](rmaps);
+
+    var wi: u32 = 0;
+    for (wi < nworkers) {
+        val rr: R.Result[*intern.StrId, str] = intern.reintern_child(?workers_at(ctx, wi).sess.interner, p.s.alloc);
+        if (R.is_err[*intern.StrId, str](rr)) {
+            pcg_free_remaps(p, ctx, remaps, wi);
+            A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+            ret R.err[bool, str](R.unwrap_err[*intern.StrId, str](rr));
+        }
+        remaps[wi] = R.unwrap_ok[*intern.StrId, str](rr);
+        wi = wi + 1;
+    }
+
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val slot: *PcgSlot = ?ctx.slots[i::usize];
+        val w:    *PcgWorker = ?ctx.workers[slot.worker::usize];
+        val rehomed: R.Result[of.ObjectImage, str] =
+            obj.rehome_remap(p.s.alloc, ?p.s.interner, slot.image, ctx.base_len, remaps[slot.worker]);
+        if (R.is_err[of.ObjectImage, str](rehomed)) {
+            pcg_free_remaps(p, ctx, remaps, nworkers);
+            A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+            ret R.err[bool, str](R.unwrap_err[of.ObjectImage, str](rehomed));
+        }
+        val rbox: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](p.s.alloc, 1::usize);
+        if (R.is_err[*of.ObjectImage, str](rbox)) {
+            var tmp: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](rehomed);
+            obj.dnit(?tmp);
+            pcg_free_remaps(p, ctx, remaps, nworkers);
+            A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+            ret R.err[bool, str](R.unwrap_err[*of.ObjectImage, str](rbox));
+        }
+        val box: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](rbox);
+        box[0] = R.unwrap_ok[of.ObjectImage, str](rehomed);
+
+        val mid: session.ModuleId = p.topo[i];
+        p.modules[mid::u32].staged_image = box;
+        i = i + 1;
+    }
+
+    pcg_free_remaps(p, ctx, remaps, nworkers);
+    A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+    ret R.ok[bool, str](true);
+}
+
+# the worker at index `wi` (a bounds-clear accessor for the collection phase)
+fun workers_at(ctx: *ParallelCodegen, wi: u32) *PcgWorker {
+    ret ?ctx.workers[wi::usize];
+}
+
+# free the first `n` worker remap arrays (each sized to its child's new-string count)
+fun pcg_free_remaps(p: *driver.Project, ctx: *ParallelCodegen, remaps: **intern.StrId, n: u32) {
+    var wi: u32 = 0;
+    for (wi < n) {
+        if (remaps[wi] != nil) {
+            val len: usize = intern.count(?workers_at(ctx, wi).sess.interner);
+            if (len > 0) { A.deallocate[intern.StrId](p.s.alloc, remaps[wi], len); }
+        }
+        wi = wi + 1;
+    }
+}

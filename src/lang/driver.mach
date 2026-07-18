@@ -8,29 +8,36 @@
 # target params plus already-loaded imports' pub comptime constants plus this
 # module's earlier pub comptime vals - so each module sees the same constant
 # environment when it later runs through resolve. The public entry is
-# build_project, which returns a fully populated Project or an error string.
+# build_project, which returns a fully populated Project or an outcome.Fail.
 #
 # This file is the facade over the `driver.*` submodules: it re-exports the
-# external API (below), owns the build_project entry points and their shared
-# build_project_impl orchestration, the registry bring-up, and the
-# ensure_query_pipeline registration that binds computes from both the load and
-# pass submodules (kept here to keep those two off each other's import path).
-# The data model, load walk, dependency resolution, query primitives, union
-# loading, passes, and manifest/config live in the split submodules; the test
-# suite is the orphan `driver.tests` module.
+# external API (below), owns the build_project entry points, their shared
+# build_project_impl orchestration, the phase entries the build engine
+# dispatches (begin_build / run_steps_phase / run_dep_steps_phase /
+# run_load_phase), and the registry bring-up. Each pass registers its own query
+# computes at entry; only Q_PARSE binds here, before the load walk. The data
+# model, load walk, dependency resolution, query primitives, union loading,
+# passes, and manifest/config live in the split submodules; the test suite is
+# the orphan `driver.tests` module.
 
 use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.string.str;
+use std.types.string.str_empty;
 
 use O: std.types.option;
 use R: std.types.result;
 
+use std.data.toml;
+
 use be_linker: mach.lang.be.linker;
+use mach.lang.build.outcome;
+use request: mach.lang.build.request;
 use mach.lang.intern;
 use mach.lang.manifest;
+use mach.lang.me.pipeline;
 use mach.lang.query;
 use mach.lang.readout;
 use mach.lang.session;
@@ -38,6 +45,7 @@ use mach.lang.target;
 
 use mach.lang.driver.project;
 use dq: mach.lang.driver.query;
+use ddep: mach.lang.driver.deps;
 use mach.lang.driver.load;
 use mach.lang.driver.union;
 use mach.lang.driver.passes;
@@ -63,14 +71,11 @@ fwd passes.run_sema_pass;
 fwd passes.run_lower_pass;
 fwd passes.run_codegen_pass;
 fwd passes.run_link_pass;
-fwd passes.set_link_config_input;
 fwd passes.module_in_current_project;
+fwd passes.debug_info_of;
 
-# the config-layer matrix enumeration and artifact-path resolution, re-exported
-# so tooling consumers keep spelling them as `driver.X`
-fwd dcfg.Matrix;
-fwd dcfg.MatrixUnit;
-fwd dcfg.enumerate_matrix;
+# the config-layer artifact-path resolution, re-exported so tooling consumers
+# keep spelling it as `driver.X`
 fwd dcfg.resolve_artifact_path;
 
 # the single registry bring-up point - it installs the target
@@ -94,7 +99,7 @@ pub fun setup_registry(reg: *target.TargetRegistry) R.Result[bool, str] {
 # project_root: filesystem path to the project root
 # target_name:  selector that must match a declared target
 # ret:          fully populated Project, or an error message
-pub fun build_project(s: *session.Session, project_root: str, target_name: str) R.Result[project.Project, str] {
+pub fun build_project(s: *session.Session, project_root: str, target_name: str) R.Result[project.Project, outcome.Fail] {
     var sel: manifest.Selection;
     sel.target       = target_name;
     sel.profile      = "";
@@ -102,7 +107,7 @@ pub fun build_project(s: *session.Session, project_root: str, target_name: str) 
     sel.want_lib     = false;
     sel.has_artifact = false;
     # the doc/tooling entry: load the graph but never run steps (no shell in a doc pass).
-    ret build_project_impl(s, project_root, ?sel, false, false, false);
+    ret build_project_impl(s, project_root, ?sel, nil, nil, false, false, false);
 }
 
 # build_project_impl: the shared build pipeline behind both build_project_sel
@@ -110,79 +115,170 @@ pub fun build_project(s: *session.Session, project_root: str, target_name: str) 
 # root manifest (`<project_root>/mach.toml`). `for_union` records every
 # manifest target's tuple and flips on the union load walk (see load_config /
 # walk_comptime_if_union). `all_own_src` additionally loads every own-source module
-# as a collection root (see load_all_own_src), for `mach test`.
-fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Selection, for_union: bool, all_own_src: bool, run_steps: bool) R.Result[project.Project, str] {
-    var p: project.Project;
-    project.init_project(?p, s);
-
-    # bind the query db's compute context and register Q_PARSE (once per session)
-    # before any module loads, so parse_module can route through the engine.
-    val q_r: R.Result[bool, str] = ensure_query_pipeline(s);
-    if (R.is_err[bool, str](q_r)) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, str](R.unwrap_err[bool, str](q_r));
-    }
-
-    # the project's manifest is always the conventional <root>/mach.toml
-    val mp_r: R.Result[str, str] = load.join_path(s.alloc, project_root, "mach.toml");
-    if (R.is_err[str, str](mp_r)) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, str](R.unwrap_err[str, str](mp_r));
-    }
-    val manifest_path: str = R.unwrap_ok[str, str](mp_r);
-
-    val cfg_r: R.Result[bool, str] = dcfg.load_project_config(?p, project_root, manifest_path, sel, for_union, all_own_src);
-    str_free(s.alloc, manifest_path);
-    if (R.is_err[bool, str](cfg_r)) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, str](R.unwrap_err[bool, str](cfg_r));
-    }
-
-    # the manifest reader already selected and synthesized the target entry.
-    val te: *project.TargetEntry = p.target_entry;
-    if (te == nil) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, str]("internal: manifest selected no target");
-    }
+# as a collection root (see load_all_own_src), for `mach test`. the same phase
+# entries the build engine dispatches individually run here in sequence, so a
+# non-engine flow and an engine unit execute identical pieces.
+fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Selection, m: *manifest.Manifest, req: *request.BuildRequest, for_union: bool, all_own_src: bool, run_steps: bool) R.Result[project.Project, outcome.Fail] {
+    val begin_r: R.Result[project.Project, outcome.Fail] = begin_build_impl(s, project_root, sel, m, req, nil, for_union, all_own_src);
+    if (R.is_err[project.Project, outcome.Fail](begin_r)) { ret begin_r; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](begin_r);
 
     # run the demanded build steps only for build/test flows - never for a doc or
     # workspace-union load, which must not execute shell (#1989 review). the root
     # project's steps run first, then each dependency's export-demanded steps, all
     # before the objects they produce are linked (#1970).
     if (run_steps) {
-        val res_steps: R.Result[bool, str] = dcfg.execute_steps(p.s.alloc, ?p, project_root);
-        if (R.is_err[bool, str](res_steps)) {
+        val res_steps: R.Result[bool, outcome.Fail] = run_steps_phase(?p);
+        if (R.is_err[bool, outcome.Fail](res_steps)) {
             project.dnit_project(?p);
-            ret R.err[project.Project, str](R.unwrap_err[bool, str](res_steps));
+            ret R.err[project.Project, outcome.Fail](R.unwrap_err[bool, outcome.Fail](res_steps));
         }
-        val isa_s: str = O.unwrap[str](intern.lookup(?p.s.interner, te.isa_name));
-        val os_s:  str = O.unwrap[str](intern.lookup(?p.s.interner, te.os_name));
-        val abi_s: str = O.unwrap[str](intern.lookup(?p.s.interner, te.abi_name));
-        val res_dep_steps: R.Result[bool, str] = dcfg.execute_dep_steps(?p, isa_s, os_s, abi_s);
-        if (R.is_err[bool, str](res_dep_steps)) {
+        val res_dep_steps: R.Result[bool, outcome.Fail] = run_dep_steps_phase(?p);
+        if (R.is_err[bool, outcome.Fail](res_dep_steps)) {
             project.dnit_project(?p);
-            ret R.err[project.Project, str](R.unwrap_err[bool, str](res_dep_steps));
+            ret R.err[project.Project, outcome.Fail](R.unwrap_err[bool, outcome.Fail](res_dep_steps));
         }
     }
 
-    val fp_r: R.Result[bool, str] = dcfg.select_target(?p, te);
+    val load_r: R.Result[bool, outcome.Fail] = run_load_phase(?p);
+    if (R.is_err[bool, outcome.Fail](load_r)) {
+        project.dnit_project(?p);
+        ret R.err[project.Project, outcome.Fail](R.unwrap_err[bool, outcome.Fail](load_r));
+    }
+
+    ret R.ok[project.Project, outcome.Fail](p);
+}
+
+# open one build: initialize the Project, bind the query pipeline, synthesize
+# the config from the manifest, and install the settled request and event sink
+#
+# The engine's per-unit entry: the phase entries below (`run_steps_phase`,
+# `run_dep_steps_phase`, `run_load_phase`) then execute the unit's planned
+# phase list over the returned Project. `m` and `req` are required here - a
+# legacy flow without them goes through build_project / build_project_sel.
+# ---
+# s:   shared session
+# m:   the parsed root manifest the request was composed against
+# req: the settled request; its selection narrows the manifest
+# ev:  the invocation's progress-event sink, or nil for silence
+# ret: the opened Project (config loaded, nothing built), or the failure
+pub fun begin_build(s: *session.Session, m: *manifest.Manifest, req: *request.BuildRequest, ev: *readout.Progress) R.Result[project.Project, outcome.Fail] {
+    var sel: manifest.Selection;
+    sel.target       = req.target;
+    sel.profile      = req.profile;
+    sel.artifact     = req.artifact;
+    sel.want_lib     = req.want_lib;
+    sel.has_artifact = !str_empty(req.artifact);
+    ret begin_build_impl(s, req.project_root, ?sel, m, req, ev, false, request.test_goal(req.goal));
+}
+
+# the shared open: init + query binding + config synthesis + target entry
+fun begin_build_impl(s: *session.Session, project_root: str, sel: *manifest.Selection, m: *manifest.Manifest, req: *request.BuildRequest, ev: *readout.Progress, for_union: bool, all_own_src: bool) R.Result[project.Project, outcome.Fail] {
+    var p: project.Project;
+    project.init_project(?p, s);
+    if (req != nil) { p.req = @req; }
+    p.events      = ev;
+    p.all_own_src = all_own_src;
+
+    # bind the query db's compute context and register Q_PARSE (once per session)
+    # before any module loads, so parse_module can route through the engine.
+    val q_r: R.Result[bool, str] = bind_queries(s);
+    if (R.is_err[bool, str](q_r)) {
+        project.dnit_project(?p);
+        ret R.err[project.Project, outcome.Fail](outcome.user(R.unwrap_err[bool, str](q_r)));
+    }
+
+    # a handed-forward manifest (the CLI's once-loaded parse) feeds the config
+    # synthesis directly; a legacy entry reads the conventional <root>/mach.toml.
+    var cfg_r: R.Result[bool, str];
+    if (m != nil) {
+        cfg_r = dcfg.load_config_manifest(?p, project_root, m, sel, for_union, all_own_src);
+    }
+    or {
+        val mp_r: R.Result[str, str] = load.join_path(s.alloc, project_root, manifest.MANIFEST_FILE);
+        if (R.is_err[str, str](mp_r)) {
+            project.dnit_project(?p);
+            ret R.err[project.Project, outcome.Fail](outcome.user(R.unwrap_err[str, str](mp_r)));
+        }
+        val manifest_path: str = R.unwrap_ok[str, str](mp_r);
+        cfg_r = dcfg.load_project_config(?p, project_root, manifest_path, sel, for_union, all_own_src);
+        str_free(s.alloc, manifest_path);
+    }
+    if (R.is_err[bool, str](cfg_r)) {
+        project.dnit_project(?p);
+        ret R.err[project.Project, outcome.Fail](outcome.user(R.unwrap_err[bool, str](cfg_r)));
+    }
+
+    # the manifest reader already selected and synthesized the target entry.
+    val te: *project.TargetEntry = p.target_entry;
+    if (te == nil) {
+        project.dnit_project(?p);
+        ret R.err[project.Project, outcome.Fail](outcome.user("internal: manifest selected no target"));
+    }
+
+    # a legacy entry (doc, union, driver tests) builds without a composed
+    # request: install the internal default, settled against the selected
+    # target's profile opt so `$mach.build.mode` folds exactly as before.
+    # jobs stays 0 - the serial-incremental posture tooling relies on.
+    if (req == nil) {
+        p.req.project_root = project_root;
+        if (te.opt == project.TARGET_OPT_RELEASE) { p.req.opt = pipeline.OPT_RELEASE; }
+    }
+
+    ret R.ok[project.Project, outcome.Fail](p);
+}
+
+# the PH_STEPS phase: run the root project's demanded user-defined build steps
+# ---
+# p:   the opened project
+# ret: ok(true), or the first step failure
+pub fun run_steps_phase(p: *project.Project) R.Result[bool, outcome.Fail] {
+    val res_steps: R.Result[bool, str] = dcfg.execute_steps(p.s.alloc, p, p.req.project_root);
+    if (R.is_err[bool, str](res_steps)) {
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](res_steps)));
+    }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# the PH_DEP_STEPS phase: run each dependency's export-demanded steps
+# ---
+# p:   the opened project
+# ret: ok(true), or the first step failure
+pub fun run_dep_steps_phase(p: *project.Project) R.Result[bool, outcome.Fail] {
+    val te: *project.TargetEntry = p.target_entry;
+    val isa_s: str = O.unwrap[str](intern.lookup(?p.s.interner, te.isa_name));
+    val os_s:  str = O.unwrap[str](intern.lookup(?p.s.interner, te.os_name));
+    val abi_s: str = O.unwrap[str](intern.lookup(?p.s.interner, te.abi_name));
+    val res_dep_steps: R.Result[bool, str] = dcfg.execute_dep_steps(p, isa_s, os_s, abi_s);
+    if (R.is_err[bool, str](res_dep_steps)) {
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](res_dep_steps)));
+    }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# the PH_LOAD phase: select the target, DFS-load the module graph, publish the
+# ASTs, mirror the build config into Q_TARGET, and resolve every module
+# ---
+# p:   the opened project
+# ret: ok(true), or the first load/resolve failure
+pub fun run_load_phase(p: *project.Project) R.Result[bool, outcome.Fail] {
+    val te: *project.TargetEntry = p.target_entry;
+
+    val fp_r: R.Result[bool, str] = dcfg.select_target(p, te);
     if (R.is_err[bool, str](fp_r)) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, str](R.unwrap_err[bool, str](fp_r));
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](fp_r)));
     }
 
-    val entry_path_r: R.Result[intern.StrId, str] = load.entry_module_fqn(?p, te);
+    val entry_path_r: R.Result[intern.StrId, str] = load.entry_module_fqn(p, te);
     if (R.is_err[intern.StrId, str](entry_path_r)) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, str](R.unwrap_err[intern.StrId, str](entry_path_r));
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[intern.StrId, str](entry_path_r)));
     }
     val entry_fqn: intern.StrId = R.unwrap_ok[intern.StrId, str](entry_path_r);
 
-    readout.phase_begin(p.s.readout, readout.PH_LOAD);
-    val load_r: R.Result[session.ModuleId, str] = load.dfs_load(?p, entry_fqn);
+    readout.phase_begin(p.events, readout.PH_LOAD);
+    val load_r: R.Result[session.ModuleId, str] = load.dfs_load(p, entry_fqn);
     if (R.is_err[session.ModuleId, str](load_r)) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, str](R.unwrap_err[session.ModuleId, str](load_r));
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[session.ModuleId, str](load_r)));
     }
 
     # union build (#1505): load every other declared artifact's entry into the same
@@ -191,10 +287,9 @@ fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Se
     # (also present in union_entries) re-loads as a no-op, as do shared modules.
     var ei: u32 = 0;
     for (ei < p.union_entry_count) {
-        val ear: R.Result[session.ModuleId, str] = load.dfs_load(?p, p.union_entries[ei]);
+        val ear: R.Result[session.ModuleId, str] = load.dfs_load(p, p.union_entries[ei]);
         if (R.is_err[session.ModuleId, str](ear)) {
-            project.dnit_project(?p);
-            ret R.err[project.Project, str](R.unwrap_err[session.ModuleId, str](ear));
+            ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[session.ModuleId, str](ear)));
         }
         ei = ei + 1;
     }
@@ -203,57 +298,75 @@ fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Se
     # import closure, so a `pub` module with no in-tree `use` consumer still has
     # its tests collected (#1863). dfs_load dedups by FQN, so this only adds the
     # modules the entry/union walks missed.
-    if (all_own_src) {
-        val allsrc_r: R.Result[bool, str] = union.load_all_own_src(?p);
+    if (p.all_own_src) {
+        val allsrc_r: R.Result[bool, str] = union.load_all_own_src(p);
         if (R.is_err[bool, str](allsrc_r)) {
-            project.dnit_project(?p);
-            ret R.err[project.Project, str](R.unwrap_err[bool, str](allsrc_r));
+            ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](allsrc_r)));
         }
     }
-    readout.phase_end(p.s.readout, readout.PH_LOAD, p.topo_len, "module", "modules");
+    readout.phase_end(p.events, readout.PH_LOAD, p.topo_len, "module", "modules");
 
     # the module table is stable past the load pass; publish every module's
     # AST to the session registry so later phases can reach cross-module
     # declarations (imported record fields, generics from transitive deps).
-    val reg_r: R.Result[bool, str] = load.register_module_asts(?p);
+    val reg_r: R.Result[bool, str] = load.register_module_asts(p);
     if (R.is_err[bool, str](reg_r)) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, str](R.unwrap_err[bool, str](reg_r));
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](reg_r)));
     }
 
     # mirror the build configuration (target tuple + manifest defines) into the
     # Q_TARGET input. resolve forks on it through `$if`, so Q_RESOLVE records a dep
     # on it: a config change advances Q_TARGET's last_changed and re-resolves every
     # module, while an identical reconfigure early-cuts and keeps reuse valid (#1582).
-    val cfg_in_r: R.Result[bool, str] = passes.set_build_config_input(?p);
+    val cfg_in_r: R.Result[bool, str] = passes.set_build_config_input(p);
     if (R.is_err[bool, str](cfg_in_r)) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, str](R.unwrap_err[bool, str](cfg_in_r));
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](cfg_in_r)));
     }
 
-    val resolve_r: R.Result[bool, str] = passes.run_resolve_pass(?p);
+    val resolve_r: R.Result[bool, str] = passes.run_resolve_pass(p);
     if (R.is_err[bool, str](resolve_r)) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, str](R.unwrap_err[bool, str](resolve_r));
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](resolve_r)));
     }
 
     # record every `#[symbol("...")]` link-name override so the back-end
     # mangler keeps the named entry / runtime symbols literal.
-    val exp_r: R.Result[bool, str] = union.register_export_names(?p);
+    val exp_r: R.Result[bool, str] = union.register_export_names(p);
     if (R.is_err[bool, str](exp_r)) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, str](R.unwrap_err[bool, str](exp_r));
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](exp_r)));
     }
 
     # project `#[library(...)]` attributions onto link-name keys now that every
     # import's final link name (`#[symbol]` override or bare `ext` name) is settled.
-    val imp_r: R.Result[bool, str] = union.register_import_libraries(?p);
+    val imp_r: R.Result[bool, str] = union.register_import_libraries(p);
     if (R.is_err[bool, str](imp_r)) {
-        project.dnit_project(?p);
-        ret R.err[project.Project, str](R.unwrap_err[bool, str](imp_r));
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](imp_r)));
     }
 
-    ret R.ok[project.Project, str](p);
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# load and parse the project's root manifest (`<root>/mach.toml`) into the
+# session interner - the ONE manifest load of a build flow
+#
+# The command layer calls this before composing the request; the parsed value is
+# then handed forward through compose and build_project_req, so nothing
+# downstream re-parses it. The manifest's owned arrays live on the session
+# allocator; a caller on an arena reclaims them wholesale at teardown.
+# ---
+# s:            shared session (allocator + interner the manifest interns into)
+# project_root: filesystem path to the project root
+# ret:          the parsed manifest, or a read/parse error message
+pub fun load_manifest(s: *session.Session, project_root: str) R.Result[manifest.Manifest, str] {
+    val mp_r: R.Result[str, str] = load.join_path(s.alloc, project_root, manifest.MANIFEST_FILE);
+    if (R.is_err[str, str](mp_r)) { ret R.err[manifest.Manifest, str](R.unwrap_err[str, str](mp_r)); }
+    val manifest_path: str = R.unwrap_ok[str, str](mp_r);
+
+    val toml_r: R.Result[toml.Table, str] = ddep.parse_toml_file(s.alloc, manifest_path);
+    str_free(s.alloc, manifest_path);
+    if (R.is_err[toml.Table, str](toml_r)) { ret R.err[manifest.Manifest, str](R.unwrap_err[toml.Table, str](toml_r)); }
+    var t: toml.Table = R.unwrap_ok[toml.Table, str](toml_r);
+
+    ret manifest.parse(s.alloc, ?s.interner, ?t, true);
 }
 
 # build the module graph for one build selection (target,
@@ -261,15 +374,15 @@ fun build_project_impl(s: *session.Session, project_root: str, sel: *manifest.Se
 # project's single target entry and concrete output paths. Safe to call
 # repeatedly on one long-lived Session: sources dedup by path and dnit_project
 # resets the session's module registries (see dnit_project's reload contract)
-pub fun build_project_sel(s: *session.Session, project_root: str, sel: *manifest.Selection) R.Result[project.Project, str] {
-    ret build_project_impl(s, project_root, sel, false, false, true);
+pub fun build_project_sel(s: *session.Session, project_root: str, sel: *manifest.Selection) R.Result[project.Project, outcome.Fail] {
+    ret build_project_impl(s, project_root, sel, nil, nil, false, false, true);
 }
 
 # build the module graph for a `mach test` invocation: like build_project_sel, but
 # additionally loads every own-source module under `[project].src` as a collection
 # root, so tests in a module no entrypoint imports are still collected (#1863)
-pub fun build_project_test(s: *session.Session, project_root: str, sel: *manifest.Selection) R.Result[project.Project, str] {
-    ret build_project_impl(s, project_root, sel, false, true, true);
+pub fun build_project_test(s: *session.Session, project_root: str, sel: *manifest.Selection) R.Result[project.Project, outcome.Fail] {
+    ret build_project_impl(s, project_root, sel, nil, nil, false, true, true);
 }
 
 # build the union of EVERY manifest target's AND artifact's
@@ -284,25 +397,23 @@ pub fun build_project_test(s: *session.Session, project_root: str, sel: *manifes
 # too. A module that does not fully resolve under the default ctx records per-module
 # diagnostics and the Project stays usable; the union build is not aborted. For
 # ordinary single-target builds use build_project_sel
-pub fun build_project_union(s: *session.Session, project_root: str) R.Result[project.Project, str] {
+pub fun build_project_union(s: *session.Session, project_root: str) R.Result[project.Project, outcome.Fail] {
     var sel: manifest.Selection;
     sel.target       = "";
     sel.profile      = "";
     sel.artifact     = "";
     sel.want_lib     = false;
     sel.has_artifact = false;
-    ret build_project_impl(s, project_root, ?sel, true, false, false);
+    ret build_project_impl(s, project_root, ?sel, nil, nil, true, false, false);
 }
 
-# bind the query db's compute context to the session and
-# register the driver-owned derived kinds the build routes through. set_ctx is
-# refreshed every build (the session address is stable); each kind is registered
-# exactly once per session (registered() guards the idempotent re-call). Q_PARSE
-# and Q_RESOLVE carry opaque heap handles (owned); Q_EXPORTS is a plain byte
-# fingerprint with output early-cutoff - the firewall - so it is a plain derived
-# kind. Q_PARSE is keyed by FileId; Q_RESOLVE and Q_EXPORTS by StableModuleId, the
-# cross-build-stable key a reused result remaps through (#1582)
-fun ensure_query_pipeline(s: *session.Session) R.Result[bool, str] {
+# bind the query db's compute context to the session and register the
+# front-half kind the load walk itself demands (Q_PARSE, an opaque owned handle
+# keyed by FileId). set_ctx is refreshed every build (the session address is
+# stable); the registration is once per session. every later derived kind is
+# registered by the pass that binds its compute (run_resolve_pass and the
+# back-half passes), so each phase owns its own query binding
+fun bind_queries(s: *session.Session) R.Result[bool, str] {
     query.set_ctx(?s.queries, s::ptr);
     # bridge the session diagnostic sink to the engine so a reused phase replays
     # the diagnostics it emitted when computed (#1586). refreshed every build like
@@ -311,38 +422,6 @@ fun ensure_query_pipeline(s: *session.Session) R.Result[bool, str] {
     if (!query.is_registered(?s.queries, query.Q_PARSE)) {
         val rp: R.Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_PARSE, load.q_parse_compute, load.q_parse_finalize);
         if (R.is_err[bool, str](rp)) { ret rp; }
-    }
-    if (!query.is_registered(?s.queries, query.Q_RESOLVE)) {
-        val rr: R.Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_RESOLVE, passes.q_resolve_compute, passes.q_resolve_finalize);
-        if (R.is_err[bool, str](rr)) { ret rr; }
-    }
-    if (!query.is_registered(?s.queries, query.Q_EXPORTS)) {
-        val re: R.Result[bool, str] = query.register_derived(?s.queries, query.Q_EXPORTS, load.q_exports_compute);
-        if (R.is_err[bool, str](re)) { ret re; }
-    }
-    if (!query.is_registered(?s.queries, query.Q_SEMA)) {
-        val rsm: R.Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_SEMA, passes.q_sema_compute, passes.q_sema_finalize);
-        if (R.is_err[bool, str](rsm)) { ret rsm; }
-    }
-    if (!query.is_registered(?s.queries, query.Q_TYPED_EXPORTS)) {
-        val rte: R.Result[bool, str] = query.register_derived(?s.queries, query.Q_TYPED_EXPORTS, passes.q_typed_exports_compute);
-        if (R.is_err[bool, str](rte)) { ret rte; }
-    }
-    if (!query.is_registered(?s.queries, query.Q_LOWERED_SURFACE)) {
-        val rls: R.Result[bool, str] = query.register_derived(?s.queries, query.Q_LOWERED_SURFACE, passes.q_lowered_surface_compute);
-        if (R.is_err[bool, str](rls)) { ret rls; }
-    }
-    if (!query.is_registered(?s.queries, query.Q_LOWER)) {
-        val rl: R.Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_LOWER, passes.q_lower_compute, passes.q_lower_finalize);
-        if (R.is_err[bool, str](rl)) { ret rl; }
-    }
-    if (!query.is_registered(?s.queries, query.Q_CODEGEN)) {
-        val rcg: R.Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_CODEGEN, passes.q_codegen_compute, passes.q_codegen_finalize);
-        if (R.is_err[bool, str](rcg)) { ret rcg; }
-    }
-    if (!query.is_registered(?s.queries, query.Q_LINK)) {
-        val rln: R.Result[bool, str] = query.register_derived(?s.queries, query.Q_LINK, passes.q_link_compute);
-        if (R.is_err[bool, str](rln)) { ret rln; }
     }
     ret R.ok[bool, str](true);
 }

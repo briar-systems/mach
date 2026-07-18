@@ -76,8 +76,14 @@ use du:     std.chrono.duration;
 
 use mach.cli.cmd.build;
 use mach.cli.util;
-use cfg:  mach.cli.config;
+use args: mach.cli.args;
+use cli_diag: mach.cli.diagnostic;
 use json: std.data.json;
+use engine: mach.lang.build.engine;
+use bplan: mach.lang.build.plan;
+use outcome: mach.lang.build.outcome;
+use request: mach.lang.build.request;
+use mach.lang.session;
 
 # a test that passed
 val KIND_PASS:   u8 = 0;
@@ -114,7 +120,7 @@ val CAP_OUTPUT: usize = 65536;
 # out_len:   bytes stored in `out`
 # truncated: the child wrote more than the capture buffer held
 rec Outcome {
-    art:       *build.TestArtifact;
+    art:       *outcome.TestArtifact;
     kind:      u8;
     code:      i32;
     elapsed:   du.Duration;
@@ -137,25 +143,31 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     # exclusion; `mach test` also accepts every build flag plus its own. mark them
     # all, then reject any unrecognized flag before the build runs, so an unknown
     # flag never slips through the shared build body.
-    val res_cfg: R.Result[cfg.Config, str] = cfg.parse(argc, argv, marks);
-    if (R.is_err[cfg.Config, str](res_cfg)) {
+    val res_cfg: R.Result[args.CliArgs, str] = args.parse(argc, argv);
+    if (R.is_err[args.CliArgs, str](res_cfg)) {
         print.eprint("error: ");
-        print.eprint(R.unwrap_err[cfg.Config, str](res_cfg));
+        print.eprint(R.unwrap_err[args.CliArgs, str](res_cfg));
         print.eprint("\n");
         ret 1;
     }
-    val config: cfg.Config = R.unwrap_ok[cfg.Config, str](res_cfg);
+    var config: args.CliArgs = R.unwrap_ok[args.CliArgs, str](res_cfg);
 
-    # marking each flag both registers it for the rejector and reads its value, so
-    # there is no second unmarked read to drift. `--include-deps` is marked here for
-    # the rejector and read again in the build layer where it scopes collection.
-    build.mark_build_flags(marks, argc, argv);
-    val list:       bool          = util.flag_mark(marks, argc, argv, "--list");
-    util.flag_mark(marks, argc, argv, "--include-deps");
-    val opt_format: O.Option[*u8] = util.flag_mark_value(marks, argc, argv, "--format");
-    val opt_jobs:   O.Option[*u8] = util.flag_mark_value(marks, argc, argv, "--jobs");
-    val opt_filter: O.Option[*u8] = util.flag_mark_value(marks, argc, argv, "--filter");
-    val opt_runner: O.Option[*u8] = util.flag_mark_value(marks, argc, argv, "--runner");
+    # mark the flags `mach test` accepts from their tables - the cross-cutting set
+    # (`parse` read their values), the `-O` override, the build-flow inputs, and
+    # test's own - then read their values and reject any unrecognized flag before
+    # the build runs. `--include-deps` is captured into the request (via
+    # collect_build) where it scopes collection.
+    args.mark_cross(marks, argc, argv);
+    args.mark_flags(marks, argc, argv, ?args.OPT[0], args.OPT_N);
+    args.mark_flags(marks, argc, argv, ?args.EMIT[0], args.EMIT_N);
+    args.mark_flags(marks, argc, argv, ?args.JOBS[0], args.JOBS_N);
+    args.mark_flags(marks, argc, argv, ?args.LINKIN[0], args.LINKIN_N);
+    args.mark_flags(marks, argc, argv, ?args.TEST_OWN[0], args.TEST_OWN_N);
+    val list:       bool          = util.flag_exists(argc, argv, "--list");
+    val opt_format: O.Option[*u8] = util.flag_value(argc, argv, "--format");
+    val opt_jobs:   O.Option[*u8] = util.flag_value(argc, argv, "--jobs");
+    val opt_filter: O.Option[*u8] = util.flag_value(argc, argv, "--filter");
+    val opt_runner: O.Option[*u8] = util.flag_value(argc, argv, "--runner");
     if (util.flag_reject_unknown(argc, argv, marks, 2, "mach test")) { ret 1; }
 
     # verbosity comes from the shared config (`-v`/`-vv`; `--verbose` was dropped in
@@ -214,15 +226,72 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         ret 2;
     }
 
-    val tbr: build.TestBuildResult = build.build_tests(?a, argc, argv, marks, list);
-    if (tbr.code != 0) {
+    # resolve the project root from the required positional path
+    # (`mach test <path>`); see util.resolve_project_root for the rules.
+    val pix: usize = util.arg_index_positional(argc, argv, marks, 2);
+    var root_arg: *u8 = nil;
+    if (pix < argc) { root_arg = argv[pix]; }
+
+    val root_r: R.Result[str, str] = util.resolve_project_root(?a, root_arg);
+    if (R.is_err[str, str](root_r)) {
+        print.eprint("error: ");
+        print.eprint(R.unwrap_err[str, str](root_r));
+        print.eprint("\n");
         arena.dnit(?ar);
-        ret tbr.code;
+        ret 1;
     }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    # capture the build-flow values (`-O`, `--jobs`, `-L` dirs, link tokens,
+    # `--include-deps`) now that the full flag set is marked; past this point
+    # argv is dead to the build flow - the build reads its composed request.
+    val col_r: R.Result[bool, str] = args.collect_build(?a, ?config, argc, argv, marks);
+    if (R.is_err[bool, str](col_r)) {
+        print.eprint("error: ");
+        print.eprint(R.unwrap_err[bool, str](col_r));
+        print.eprint("\n");
+        arena.dnit(?ar);
+        ret 2;
+    }
+
+    # the test flow's build: compose -> plan -> execute, exactly as `mach build`
+    # runs its units; the goal selects the dispatcher build or the collection
+    # pass, and the outcome carries the test artifacts on this command's arena.
+    var goal: request.BuildGoal = request.GOAL_TESTS;
+    if (list) { goal = request.GOAL_TEST_LIST; }
+
+    var ps: session.Session;
+    val plan_r: R.Result[bplan.BuildPlan, outcome.Fail] = build.plan_invocation(?a, root, ?config, goal, ?ps);
+    if (R.is_err[bplan.BuildPlan, outcome.Fail](plan_r)) {
+        var pf: outcome.Fail = R.unwrap_err[bplan.BuildPlan, outcome.Fail](plan_r);
+        val pc: i64 = cli_diag.render_fail(?pf);
+        arena.dnit(?ar);
+        ret pc;
+    }
+    val bp: bplan.BuildPlan = R.unwrap_ok[bplan.BuildPlan, outcome.Fail](plan_r);
+
+    var rctx: cli_diag.RenderCtx;
+    var rd: outcome.Render = cli_diag.render_sink(?rctx, bp.units.len);
+    val ex_r: R.Result[outcome.BuildOutcome, outcome.Fail] = engine.execute(?bp, ?backing, ?a, nil, ?rd);
+    session.dnit(?ps);
+    if (R.is_err[outcome.BuildOutcome, outcome.Fail](ex_r)) {
+        var xf: outcome.Fail = R.unwrap_err[outcome.BuildOutcome, outcome.Fail](ex_r);
+        val xc: i64 = cli_diag.render_fail(?xf);
+        arena.dnit(?ar);
+        ret xc;
+    }
+    var bo: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](ex_r);
+    if (!bo.ok) {
+        val bc: i64 = cli_diag.outcome_code(?bo);
+        arena.dnit(?ar);
+        ret bc;
+    }
+    val built_tests: *outcome.TestArtifact = bo.tests.data;
+    val built_len:   u32                   = bo.tests.len::u32;
 
     # surface any target-gated own-src modules excluded from collection, so the
     # whole-source test set never drops a module silently (#1873).
-    if (tbr.skipped > 0) { report_skipped(tbr.skipped); }
+    if (bo.tests_skipped > 0) { report_skipped(bo.tests_skipped); }
 
     # `--filter <substr>` (read above) selects at run time: the dispatcher embeds
     # every in-scope test, this command runs (or lists) only the matching ones.
@@ -235,11 +304,11 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         var lw: writer.Writer;
         if (json_out) { lw = fs.writer(fs.STDOUT); }
         var i: u32 = 0;
-        for (i < tbr.len) {
-            if (filter_matches(?tbr.tests[i], filter)) {
-                if (json_out) { emit_list_case(?lw, ?tbr.tests[i]); }
+        for (i < built_len) {
+            if (filter_matches(?built_tests[i], filter)) {
+                if (json_out) { emit_list_case(?lw, ?built_tests[i]); }
                 or {
-                    artifact_report(?tbr.tests[i]);
+                    artifact_report(?built_tests[i]);
                     print.print("\n");
                 }
             }
@@ -250,20 +319,20 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     }
 
     # the selected artifacts, in collection order (module runs stay adjacent).
-    var selected: *build.TestArtifact = nil;
+    var selected: *outcome.TestArtifact = nil;
     var sel_len:  u32 = 0;
-    if (tbr.len > 0) {
-        val res_sel: R.Result[*build.TestArtifact, str] = A.allocate[build.TestArtifact](?a, tbr.len::usize);
-        if (R.is_err[*build.TestArtifact, str](res_sel)) {
+    if (built_len > 0) {
+        val res_sel: R.Result[*outcome.TestArtifact, str] = A.allocate[outcome.TestArtifact](?a, built_len::usize);
+        if (R.is_err[*outcome.TestArtifact, str](res_sel)) {
             arena.dnit(?ar);
             print.eprint("error: out of memory\n");
             ret 2;
         }
-        selected = R.unwrap_ok[*build.TestArtifact, str](res_sel);
+        selected = R.unwrap_ok[*outcome.TestArtifact, str](res_sel);
         var i: u32 = 0;
-        for (i < tbr.len) {
-            if (filter_matches(?tbr.tests[i], filter)) {
-                selected[sel_len] = tbr.tests[i];
+        for (i < built_len) {
+            if (filter_matches(?built_tests[i], filter)) {
+                selected[sel_len] = built_tests[i];
                 sel_len = sel_len + 1;
             }
             i = i + 1;
@@ -321,7 +390,7 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
         ret 2;
     }
     val log_dir: str = R.unwrap_ok[str, str](ld_r);
-    wipe_logs(?a, log_dir, tbr.len);
+    wipe_logs(?a, log_dir, built_len);
 
     # the human readout and the JSON stream are sibling renderers over the same
     # per-test event stream; only one is live per run. the human renderer needs
@@ -361,7 +430,7 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
 # f:     the capture file, held open until the child is reaped
 rec Slot {
     pid:   i64;
-    art:   *build.TestArtifact;
+    art:   *outcome.TestArtifact;
     idx:   u32;
     start: tm.Time;
     f:     fs.File;
@@ -388,7 +457,7 @@ rec Slot {
 # want_bytes: retain each failing test's captured output in memory (the human
 #             readout inlines it; the JSON stream references the file instead)
 # r:          the renderer notified as each outcome finalizes
-fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runner: *u8,
+fun execute_and_render(a: *A.Allocator, arts: *outcome.TestArtifact, n: u32, runner: *u8,
                        outcomes: *Outcome, level: u8, jobs: u32, log_dir: *u8,
                        want_bytes: bool, r: *Renderer) {
     var i: u32 = 0;
@@ -505,8 +574,8 @@ fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runne
 # fn_summary: run end (outcomes, count, passed, failed, wall time)
 rec Renderer {
     ctx:        ptr;
-    fn_start:   fun(ptr, *build.TestArtifact, u32);
-    fn_test:    fun(ptr, *Outcome, *build.TestArtifact, u32);
+    fn_start:   fun(ptr, *outcome.TestArtifact, u32);
+    fn_test:    fun(ptr, *Outcome, *outcome.TestArtifact, u32);
     fn_summary: fun(ptr, *Outcome, u32, u32, u32, du.Duration);
 }
 
@@ -582,7 +651,7 @@ fun human_renderer(a: *A.Allocator, hc: *HumanCtx, level: u8, mod_w: usize, labe
 # ctx:  the HumanCtx cell
 # arts: the selected artifacts (unused; the cursor reads them per-test)
 # n:    number of selected tests
-fun human_start(ctx: ptr, arts: *build.TestArtifact, n: u32) {
+fun human_start(ctx: ptr, arts: *outcome.TestArtifact, n: u32) {
     val hc: *HumanCtx = ctx::*HumanCtx;
     hc.n      = n;
     hc.cursor = 0;
@@ -601,7 +670,7 @@ fun human_start(ctx: ptr, arts: *build.TestArtifact, n: u32) {
 # outcomes: the run outcomes, finalized in place
 # arts:     the selected artifacts, in collection order
 # idx:      the outcome that just finalized (drives the cursor forward)
-fun human_test(ctx: ptr, outcomes: *Outcome, arts: *build.TestArtifact, idx: u32) {
+fun human_test(ctx: ptr, outcomes: *Outcome, arts: *outcome.TestArtifact, idx: u32) {
     val hc: *HumanCtx = ctx::*HumanCtx;
     for (hc.cursor < hc.n && outcomes[hc.cursor].kind != KIND_PENDING) {
         val c: u32 = hc.cursor;
@@ -665,7 +734,7 @@ fun json_event_begin(w: *writer.Writer, o: *json.Object, event: *u8) {
 # ctx:  the JsonCtx cell
 # arts: the selected artifacts (unused)
 # n:    number of selected tests
-fun json_start(ctx: ptr, arts: *build.TestArtifact, n: u32) {
+fun json_start(ctx: ptr, arts: *outcome.TestArtifact, n: u32) {
     val jc: *JsonCtx = ctx::*JsonCtx;
     jc.n = n;
     var o: json.Object;
@@ -680,10 +749,10 @@ fun json_start(ctx: ptr, arts: *build.TestArtifact, n: u32) {
 # outcomes: the run outcomes, finalized in place
 # arts:     the selected artifacts, in collection order
 # idx:      the outcome to emit
-fun json_test(ctx: ptr, outcomes: *Outcome, arts: *build.TestArtifact, idx: u32) {
+fun json_test(ctx: ptr, outcomes: *Outcome, arts: *outcome.TestArtifact, idx: u32) {
     val jc:  *JsonCtx            = ctx::*JsonCtx;
     val o0:  *Outcome            = ?outcomes[idx];
-    val art: *build.TestArtifact = ?arts[idx];
+    val art: *outcome.TestArtifact = ?arts[idx];
     var o: json.Object;
     json_event_begin(?jc.w, ?o, "test");
     json.field_str(?o, "label", art.label);
@@ -744,7 +813,7 @@ fun json_output_ref(jc: *JsonCtx, idx: u32) *u8 {
 # ---
 # w:   the stdout writer to emit through
 # art: the collected test artifact
-fun emit_list_case(w: *writer.Writer, art: *build.TestArtifact) {
+fun emit_list_case(w: *writer.Writer, art: *outcome.TestArtifact) {
     var o: json.Object;
     json_event_begin(w, ?o, "case");
     json.field_str(?o, "label", art.label);
@@ -790,7 +859,7 @@ fun has_capture(kind: u8) bool {
 # runner:  resolved `--runner` launcher, or nil to exec the dispatcher directly
 # log_dir: the capture-file directory
 # ret:     true when the child is running and its slot is filled
-fun spawn_one(a: *A.Allocator, slots: *Slot, window: u32, art: *build.TestArtifact, idx: u32,
+fun spawn_one(a: *A.Allocator, slots: *Slot, window: u32, art: *outcome.TestArtifact, idx: u32,
               runner: *u8, log_dir: *u8) bool {
     var s: u32 = 0;
     for (s < window && slots[s].pid != 0) { s = s + 1; }
@@ -978,7 +1047,7 @@ fun render_module_run(a: *A.Allocator, outcomes: *Outcome, first: u32, last: u32
 # arts: the selected test artifacts
 # n:    number of artifacts
 # ret:  the column width in bytes
-fun module_col_width(arts: *build.TestArtifact, n: u32) usize {
+fun module_col_width(arts: *outcome.TestArtifact, n: u32) usize {
     var w: usize = 0;
     var i: u32 = 0;
     for (i < n) {
@@ -997,7 +1066,7 @@ fun module_col_width(arts: *build.TestArtifact, n: u32) usize {
 # arts: the selected test artifacts
 # n:    number of artifacts
 # ret:  the column width in bytes
-fun label_col_width(arts: *build.TestArtifact, n: u32) usize {
+fun label_col_width(arts: *outcome.TestArtifact, n: u32) usize {
     var w: usize = 0;
     var i: u32 = 0;
     for (i < n) {
@@ -1220,7 +1289,7 @@ fun count_failed(outcomes: *Outcome, len: u32) u32 {
 # newline (the `--list` line shape)
 # ---
 # art: the test artifact to describe
-fun artifact_report(art: *build.TestArtifact) {
+fun artifact_report(art: *outcome.TestArtifact) {
     print.print(art.label::str);
     print.print(" ");
     print.print(art.file::str);
@@ -1234,7 +1303,7 @@ fun artifact_report(art: *build.TestArtifact) {
 # art:    the artifact to check
 # filter: the filter substring, or nil to select everything
 # ret:    true when selected
-fun filter_matches(art: *build.TestArtifact, filter: *u8) bool {
+fun filter_matches(art: *outcome.TestArtifact, filter: *u8) bool {
     if (filter == nil) { ret true; }
     ret str_contains(art.label, filter);
 }

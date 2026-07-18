@@ -1,0 +1,540 @@
+# the composed intent for one build invocation: `BuildRequest`, its composition,
+# and its serialized identity
+#
+# A request carries decisions, not ingredients: `compose` owns all precedence
+# (manifest default < profile < invoker), so every field is the settled answer
+# and no field records how it was decided. Per-unit facts - an expanded output
+# template, a link token resolved against a target's library directories - stay
+# plan-side and are never stored here. The CLI composes a request per build
+# unit; a matrix cell derivation or an embedding consumer (LSP, tooling)
+# constructs one through the same helper or directly. Immutable once composed.
+#
+# The compose seam: composition consumes the parsed `manifest.Manifest` plus
+# the interner it was interned into - not the driver's ProjectConfig, which is
+# a per-unit synthesis produced DURING project build and so cannot exist before
+# the request that drives it. The manifest is loaded once by the command layer
+# and handed forward: compose reads it here, the driver builds the project from
+# the same parsed value, and nothing downstream re-parses it.
+
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.crypto.hash.sha256;
+use std.encoding.binary;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_empty;
+use std.types.string.str_ends_with;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.path;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+use sys: std.system.os;
+
+use outcome: mach.lang.build.outcome;
+use mach.lang.intern;
+use mach.lang.manifest;
+use mach.lang.me.pipeline;
+
+# the parsed command line shared across subcommands - the raw invoker choices
+# `compose` settles into a BuildRequest
+#
+# The record lives here so composition never reaches above the lang layer; the
+# parser that fills it from argv stays in the CLI's args module (the one module
+# that reads argv), which re-exports this type under its old spelling.
+# ---
+# verbosity:   readout detail level: 0 plain, 1 (`-v`), 2 (`-vv`)
+# quiet:       --quiet / -q was passed; suppress non-error output
+# verify_ir:   --verify-ir was passed; run the IR verifier after each optimization pass
+# target:      selected target name (nil when --target was not given)
+# output:      -o override for the linked binary path, rooted at the project
+#              root (nil = use the target's `binary` from mach.toml)
+# emit_asm:    --emit-asm was passed; emit per-module human-readable assembly
+#              text (`.s`) alongside each object, for debugging / transparency
+# emit_ir:     --emit-ir was passed; emit per-module human-readable SSA IR text
+#              (`.ir`) alongside each object - the final post-pipeline IR the
+#              object is built from, so it varies with the optimization level
+# profile:     --profile <name> selected build profile (nil when not given)
+# bin:         --bin <name> narrows a build to one `[bin.*]` artifact (nil
+#              when not given)
+# lib:         --lib <name> narrows a build to one `[lib.*]` artifact (nil
+#              when not given)
+# all_targets: --all-targets was passed; build every declared target rather
+#              than the manifest default
+# pie:         --pie was passed; emit a position-independent (ET_DYN) executable
+# g:           -g was passed; force debug-info emission on for this invocation
+# opt_set:     an explicit `-O0`/`-O1`/`-O2` was passed (a per-invocation
+#              override that wins over the profile's `opt`)
+# opt_release: the explicit level names the release pipeline (`-O1`/`-O2`)
+# jobs:        raw `--jobs` value (nil when not given); compose validates it
+# include_deps: --include-deps was passed; widen test collection to dependency
+#              modules
+# link_tokens: link-input tokens (`-l` values and bare object/archive path
+#              positionals) in invocation order
+# lib_dirs:    `-L` link search directories in invocation order
+pub rec CliArgs {
+    verbosity:   u8;
+    quiet:       bool;
+    verify_ir:   bool;
+    target:      *u8;
+    output:      *u8;
+    emit_asm:    bool;
+    emit_ir:     bool;
+    profile:     *u8;
+    bin:         *u8;
+    lib:         *u8;
+    all_targets: bool;
+    pie:         bool;
+    g:           bool;
+    opt_set:      bool;
+    opt_release:  bool;
+    jobs:         *u8;
+    include_deps: bool;
+    link_tokens:  Vector[*u8];
+    lib_dirs:     Vector[*u8];
+}
+
+# whether a link-input token denotes an explicit file path rather than a bare
+# `-l`-style library name
+#
+# A token is treated as a path when it contains a '/' (any directory component)
+# or ends in `.o` (a loose object) or `.a` (a static archive).
+# ---
+# tok: the token to classify
+# ret: true when `tok` is an explicit object/archive path
+pub fun is_object_path(tok: *u8) bool {
+    if (tok == nil || str_empty(tok::str)) { ret false; }
+    if (path.has_separator(tok::str))      { ret true; }
+    ret str_ends_with(tok::str, ".o") || str_ends_with(tok::str, ".a");
+}
+
+# what the build produces
+pub def BuildGoal: u8;
+
+# link the selected artifact
+pub val GOAL_EXECUTE:   BuildGoal = 0;
+
+# per-module objects only
+pub val GOAL_OBJECTS:   BuildGoal = 1;
+
+# test dispatcher + artifact list
+pub val GOAL_TESTS:     BuildGoal = 2;
+
+# collect tests, build nothing
+pub val GOAL_TEST_LIST: BuildGoal = 3;
+
+# one link input as the invoker spelled it; the planner resolves it
+# ---
+# text: the token verbatim (`-l` value, or a bare object/archive path)
+pub rec LinkToken {
+    text: str;
+}
+
+# the complete intent for one build invocation
+#
+# Composed by the CLI, a matrix cell derivation, or an embedding consumer
+# (LSP, tooling). Every field is a settled decision. Immutable once composed;
+# owned by the request arena.
+# ---
+# project_root: resolved absolute project root directory
+# target:       selected target name; empty selects the manifest default
+# profile:      selected profile name; empty selects the manifest default
+# artifact:     selected artifact name; empty selects the manifest default
+# want_lib:     the named artifact is a `[lib.*]` (disambiguates a name)
+# all_targets:  build every declared target rather than the manifest default
+# goal:         what the build produces
+# opt:          settled optimization pipeline level (explicit `-O*` wins, else
+#               the profile's `opt`, else the debug pipeline)
+# debug:        emit debug info (`-g` wins, else the profile's `debug`)
+# pie:          emit a position-independent executable (`--pie`)
+# simd:         the profile's resolved SIMD strictness posture
+# verify_ir:    run the IR verifier after each optimization pass
+# jobs:         concrete codegen worker count; compose settles >= 1 (explicit
+#               `--jobs`, else the host CPU count). 0 is the serial-incremental
+#               posture the driver-internal default requests carry (tooling,
+#               doc, and union builds never fan out)
+# emit_ir:      emit per-module `.ir` SSA text (flag or profile default)
+# emit_asm:     emit per-module `.s` assembly text (flag or profile default)
+# out:          requested artifact path (`-o`); empty selects the manifest template
+# link_tokens:  link inputs in invocation order (`-l` values and bare
+#               object/archive path positionals)
+# lib_dirs:     `-L` link search directories in invocation order
+# include_deps: widen test collection to dependency modules
+# verbosity:    readout detail level: 0 plain, 1 (`-v`), 2 (`-vv`)
+# quiet:        suppress non-error output
+pub rec BuildRequest {
+    project_root: str;
+
+    target:       str;
+    profile:      str;
+    artifact:     str;
+    want_lib:     bool;
+    all_targets:  bool;
+
+    goal:         BuildGoal;
+
+    opt:          u8;
+    debug:        bool;
+    pie:          bool;
+    simd:         manifest.SimdMode;
+    verify_ir:    bool;
+    jobs:         u32;
+
+    emit_ir:      bool;
+    emit_asm:     bool;
+    out:          str;
+
+    link_tokens:  Vector[LinkToken];
+    lib_dirs:     Vector[str];
+
+    include_deps: bool;
+
+    verbosity:    u8;
+    quiet:        bool;
+}
+
+# a zeroed request: manifest-default selection, execute goal, debug pipeline,
+# no emissions, empty link inputs, serial (jobs 0)
+#
+# The driver-internal baseline for tooling entries (doc, union, driver tests)
+# that build without a CLI invocation; `compose` starts from it too. The vector
+# fields are zeroed, not initialized - a default request is read, never grown.
+# ---
+# ret: the zeroed request
+pub fun defaults() BuildRequest {
+    var r: BuildRequest;
+    r.project_root = "";
+    r.target       = "";
+    r.profile      = "";
+    r.artifact     = "";
+    r.want_lib     = false;
+    r.all_targets  = false;
+    r.goal         = GOAL_EXECUTE;
+    r.opt          = pipeline.OPT_DEBUG;
+    r.debug        = false;
+    r.pie          = false;
+    r.simd         = manifest.SIMD_SCALARIZE;
+    r.verify_ir    = false;
+    r.jobs         = 0;
+    r.emit_ir      = false;
+    r.emit_asm     = false;
+    r.out          = "";
+    r.link_tokens.a    = nil;
+    r.link_tokens.data = nil;
+    r.link_tokens.len  = 0;
+    r.link_tokens.cap  = 0;
+    r.lib_dirs.a    = nil;
+    r.lib_dirs.data = nil;
+    r.lib_dirs.len  = 0;
+    r.lib_dirs.cap  = 0;
+    r.include_deps = false;
+    r.verbosity    = 0;
+    r.quiet        = false;
+    ret r;
+}
+
+# whether a goal is a test build (dispatcher or collection)
+# ---
+# g:   the goal to classify
+# ret: true for GOAL_TESTS and GOAL_TEST_LIST
+pub fun test_goal(g: BuildGoal) bool {
+    ret g == GOAL_TESTS || g == GOAL_TEST_LIST;
+}
+
+# whether the request settled on the release pipeline
+# ---
+# r:   the request
+# ret: true when `opt` names the release pipeline
+pub fun release(r: *BuildRequest) bool {
+    ret r.opt == pipeline.OPT_RELEASE;
+}
+
+# compose the settled request for one build invocation
+#
+# Applies ALL precedence: an explicit `-O*` wins over the profile's `opt`,
+# `-g` over the profile's `debug`, an explicit `--jobs` over the host CPU
+# count; emissions are the flag OR the profile default. The selection is
+# validated against the manifest through the same `resolve_build_unit` the
+# driver runs, so selection errors surface here with identical text and
+# precedence; for a test goal with no named artifact, a multi-artifact
+# manifest settles on the first declared artifact (the whole-source test
+# build links them all).
+# ---
+# a:    allocator backing the request's link-input vectors and the transient
+#       unit resolution
+# itn:  the interner the manifest was parsed into
+# m:    the parsed root manifest, loaded once and handed forward
+# cli:  the parsed command line
+# root: resolved absolute project root directory
+# goal: what the build produces
+# sel:  the invocation's selection (from the flags, or one enumerated matrix cell)
+# ret:  the settled request, or the failure to render
+pub fun compose(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
+                cli: *CliArgs, root: str, goal: BuildGoal,
+                sel: *manifest.Selection) R.Result[BuildRequest, outcome.Fail] {
+    var r: BuildRequest = defaults();
+    r.project_root = root;
+    r.all_targets  = cli.all_targets;
+    r.goal         = goal;
+
+    # a whole-source test build of a multi-artifact manifest is not the
+    # ambiguity a plain build raises: it settles on the first declared
+    # artifact as the primary, mirroring the driver's own test-load rule.
+    var esel: manifest.Selection = @sel;
+    if (test_goal(goal) && !esel.has_artifact && m.artifact_count > 1) {
+        val an_opt: O.Option[str] = intern.lookup(itn, m.artifacts[0].name);
+        if (O.is_none[str](an_opt)) {
+            ret R.err[BuildRequest, outcome.Fail](outcome.internal("primary artifact name not interned"));
+        }
+        esel.artifact     = O.unwrap[str](an_opt);
+        esel.want_lib     = m.artifacts[0].is_lib;
+        esel.has_artifact = true;
+    }
+    r.target   = esel.target;
+    r.profile  = esel.profile;
+    r.artifact = esel.artifact;
+    r.want_lib = esel.want_lib;
+
+    # the selection and profile resolution: the same resolver the driver runs
+    # over the same manifest, so an invalid selection fails here first with
+    # the exact message the build would have produced.
+    val ur: R.Result[manifest.BuildUnit, str] = manifest.resolve_build_unit(a, itn, m, esel);
+    if (R.is_err[manifest.BuildUnit, str](ur)) {
+        ret R.err[BuildRequest, outcome.Fail](outcome.user(R.unwrap_err[manifest.BuildUnit, str](ur)));
+    }
+    val bu: manifest.BuildUnit = R.unwrap_ok[manifest.BuildUnit, str](ur);
+
+    # optimization: an explicit CLI `-O*` is a per-invocation override that wins
+    # outright; absent one the profile's `opt` decides, else the debug pipeline
+    # (what the bootstrap uses, kept fixpoint-stable).
+    if (cli.opt_set) {
+        if (cli.opt_release) { r.opt = pipeline.OPT_RELEASE; }
+    }
+    or (bu.opt == manifest.MOPT_RELEASE) {
+        r.opt = pipeline.OPT_RELEASE;
+    }
+
+    r.debug     = cli.g || bu.debug;
+    r.pie       = cli.pie;
+    r.simd      = bu.simd;
+    r.verify_ir = cli.verify_ir;
+
+    # worker count: an explicit `--jobs` wins (a positive integer); absent it
+    # the host CPU count, and 1 when that cannot be determined. always >= 1;
+    # the driver clamps it down to the module count.
+    if (cli.jobs != nil) {
+        val jv: i64 = parse_jobs(cli.jobs);
+        if (jv < 1) {
+            ret R.err[BuildRequest, outcome.Fail](outcome.user("--jobs expects a positive integer"));
+        }
+        r.jobs = jv::u32;
+    }
+    or {
+        r.jobs = 1;
+        val nc: i64 = sys.cpu_count();
+        if (nc > 1) { r.jobs = nc::u32; }
+    }
+
+    r.emit_ir  = cli.emit_ir  || bu.emit_ir;
+    r.emit_asm = cli.emit_asm || bu.emit_asm;
+    if (cli.output != nil) { r.out = cli.output::str; }
+
+    r.link_tokens = vector.init[LinkToken](a);
+    var ti: usize = 0;
+    for (ti < cli.link_tokens.len) {
+        var t: LinkToken;
+        t.text = cli.link_tokens.data[ti]::str;
+        val pr: R.Result[usize, str] = vector.push[LinkToken](?r.link_tokens, t);
+        if (R.is_err[usize, str](pr)) {
+            ret R.err[BuildRequest, outcome.Fail](outcome.internal("out of memory"));
+        }
+        ti = ti + 1;
+    }
+    r.lib_dirs = vector.init[str](a);
+    var di: usize = 0;
+    for (di < cli.lib_dirs.len) {
+        val dr: R.Result[usize, str] = vector.push[str](?r.lib_dirs, cli.lib_dirs.data[di]::str);
+        if (R.is_err[usize, str](dr)) {
+            ret R.err[BuildRequest, outcome.Fail](outcome.internal("out of memory"));
+        }
+        di = di + 1;
+    }
+
+    r.include_deps = cli.include_deps;
+    r.verbosity    = cli.verbosity;
+    r.quiet        = cli.quiet;
+    ret R.ok[BuildRequest, outcome.Fail](r);
+}
+
+# derive one matrix cell's request from the invocation request
+#
+# A cell differs from the invocation only in its selection: the (target,
+# artifact) pair the planner enumerated. Every other settled decision - the
+# profile and everything it decided, the codegen levels, the link inputs -
+# applies to every cell unchanged, so the derivation is a copy with the
+# selection swapped. The vectors are shared with the base request (the cell
+# never grows them).
+# ---
+# base:     the invocation's composed request
+# target:   the cell's target selector (empty selects the manifest default)
+# artifact: the cell's artifact selector
+# want_lib: the artifact selector names a `[lib.*]`
+# ret:      the cell's request
+pub fun for_cell(base: *BuildRequest, target: str, artifact: str, want_lib: bool) BuildRequest {
+    var r: BuildRequest = @base;
+    r.target   = target;
+    r.artifact = artifact;
+    r.want_lib = want_lib;
+    ret r;
+}
+
+# parse a positive decimal `--jobs` value, or -1 when empty, non-decimal, or absurd
+fun parse_jobs(s: *u8) i64 {
+    if (s == nil || s[0] == 0) { ret -1; }
+    var v: i64 = 0;
+    var i: usize = 0;
+    for (s[i] != 0) {
+        if (s[i] < '0' || s[i] > '9') { ret -1; }
+        v = v * 10 + (s[i] - '0')::i64;
+        if (v > 65536) { ret -1; }
+        i = i + 1;
+    }
+    ret v;
+}
+
+# the sha256 digest size of a request identity, in bytes
+pub val HASH_SIZE: usize = 32;
+
+# hash the request's settled fields into a 32-byte identity
+#
+# Serializes every field that alters what the build would do (little-endian
+# via std.encoding.binary, strings length-prefixed) and hashes the bytes with
+# sha256. Because fields are settled values, the key reflects effective
+# configuration: any change from either the manifest or the command line that
+# changes the build changes the key. The presentation fields (`verbosity`,
+# `quiet`) are excluded - they change the readout, never the artifacts. The
+# digest lands now; wiring it as the query cache key is the engine stage's job.
+# ---
+# a:      allocator for the transient serialization buffer
+# r:      the request to hash
+# digest: receives the 32-byte digest (HASH_SIZE bytes)
+# ret:    ok(true), or a serialization allocation error
+pub fun request_hash(a: *A.Allocator, r: *BuildRequest, digest: *u8) R.Result[bool, str] {
+    var e: binary.Encoder = binary.encoder(a, binary.LITTLE);
+
+    var ok: bool = true;
+    ok = ok && hs(?e, r.project_root);
+    ok = ok && hs(?e, r.target);
+    ok = ok && hs(?e, r.profile);
+    ok = ok && hs(?e, r.artifact);
+    ok = ok && hb(?e, r.want_lib);
+    ok = ok && hb(?e, r.all_targets);
+    ok = ok && R.is_ok[usize, str](binary.write_u8(?e, r.goal));
+    ok = ok && R.is_ok[usize, str](binary.write_u8(?e, r.opt));
+    ok = ok && hb(?e, r.debug);
+    ok = ok && hb(?e, r.pie);
+    ok = ok && R.is_ok[usize, str](binary.write_u8(?e, r.simd));
+    ok = ok && hb(?e, r.verify_ir);
+    ok = ok && R.is_ok[usize, str](binary.write_u32(?e, r.jobs));
+    ok = ok && hb(?e, r.emit_ir);
+    ok = ok && hb(?e, r.emit_asm);
+    ok = ok && hs(?e, r.out);
+    ok = ok && R.is_ok[usize, str](binary.write_u32(?e, r.link_tokens.len::u32));
+    var ti: usize = 0;
+    for (ti < r.link_tokens.len) {
+        ok = ok && hs(?e, r.link_tokens.data[ti].text);
+        ti = ti + 1;
+    }
+    ok = ok && R.is_ok[usize, str](binary.write_u32(?e, r.lib_dirs.len::u32));
+    var di: usize = 0;
+    for (di < r.lib_dirs.len) {
+        ok = ok && hs(?e, r.lib_dirs.data[di]);
+        di = di + 1;
+    }
+    ok = ok && hb(?e, r.include_deps);
+
+    if (!ok) {
+        binary.encoder_dnit(?e);
+        ret R.err[bool, str]("out of memory");
+    }
+    sha256.hash(e.data, e.len, digest);
+    binary.encoder_dnit(?e);
+    ret R.ok[bool, str](true);
+}
+
+# append a length-prefixed string to the identity serialization
+fun hs(e: *binary.Encoder, s: str) bool {
+    val n: usize = str_len(s);
+    if (R.is_err[usize, str](binary.write_u32(e, n::u32))) { ret false; }
+    ret R.is_ok[usize, str](binary.write_bytes(e, s::*u8, n));
+}
+
+# append a bool to the identity serialization
+fun hb(e: *binary.Encoder, v: bool) bool {
+    var b: u8 = 0;
+    if (v) { b = 1; }
+    ret R.is_ok[usize, str](binary.write_u8(e, b));
+}
+
+# a cell derivation swaps exactly the selection; every other settled decision
+# and the shared link-input vectors carry over unchanged
+test "mach.lang.build.request.for_cell:swaps_selection_only" {
+    var base: BuildRequest = defaults();
+    base.project_root = "/r";
+    base.target       = "";
+    base.artifact     = "";
+    base.opt          = pipeline.OPT_RELEASE;
+    base.debug        = true;
+    base.jobs         = 7;
+
+    val c: BuildRequest = for_cell(?base, "tb", "libb", true);
+    if (!str_equals(c.target, "tb"))       { ret 1; }
+    if (!str_equals(c.artifact, "libb"))   { ret 1; }
+    if (!c.want_lib)                       { ret 1; }
+    if (c.opt != pipeline.OPT_RELEASE)     { ret 1; }
+    if (!c.debug)                          { ret 1; }
+    if (c.jobs != 7)                       { ret 1; }
+    if (!str_equals(c.project_root, "/r")) { ret 1; }
+    ret 0;
+}
+
+# two identical requests hash identically; a settled-field change (opt) diverges
+# and a presentation-field change (verbosity) does not, exactly as documented
+test "mach.lang.build.request.request_hash:settled_fields_key_the_identity" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+
+    var ra: BuildRequest = defaults();
+    ra.project_root = "/tmp/p";
+    ra.opt          = pipeline.OPT_DEBUG;
+    var rb: BuildRequest = ra;
+
+    var da: [32]u8;
+    var db: [32]u8;
+    if (R.is_err[bool, str](request_hash(?alloc, ?ra, ?da[0]))) { ret 1; }
+    if (R.is_err[bool, str](request_hash(?alloc, ?rb, ?db[0]))) { ret 1; }
+    var i: usize = 0;
+    for (i < 32) { if (da[i] != db[i]) { ret 1; } i = i + 1; }
+
+    # a settled decision changes the identity.
+    rb.opt = pipeline.OPT_RELEASE;
+    if (R.is_err[bool, str](request_hash(?alloc, ?rb, ?db[0]))) { ret 1; }
+    var same: bool = true;
+    i = 0;
+    for (i < 32) { if (da[i] != db[i]) { same = false; } i = i + 1; }
+    if (same) { ret 1; }
+
+    # a presentation field does not.
+    rb.opt       = pipeline.OPT_DEBUG;
+    rb.verbosity = 2;
+    if (R.is_err[bool, str](request_hash(?alloc, ?rb, ?db[0]))) { ret 1; }
+    i = 0;
+    for (i < 32) { if (da[i] != db[i]) { ret 1; } i = i + 1; }
+    ret 0;
+}

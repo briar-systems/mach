@@ -1,0 +1,463 @@
+# dispatcher synthesis and TestArtifact collection for the test goals
+#
+# A test build produces one executable: the project's transitive code plus a
+# synthesized dispatcher `main` that runs the test selected by a decimal index
+# argument and exits with its `i32` result. This module owns the test half of
+# the engine's PH_EMIT / PH_LINK dispatch: collecting the in-scope `test`
+# declarations off the lowered IR, synthesizing / optimizing / codegen'ing the
+# dispatcher entry, linking it with the shared per-module object set, and
+# recording each test's reporting artifact. Only tests declared in the current
+# project's own modules are in scope by default; the request's `include_deps`
+# widens the scope to dependency tests (#1556). `--filter` is a run-time
+# selection in the runner, so the built executable is identical regardless of
+# filter.
+
+use std.allocator.arena;
+use std.allocator.page;
+use fs: std.filesystem;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_copy;
+use std.types.string.str_len;
+use std.types.path;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use emit: mach.lang.build.emit;
+use outcome: mach.lang.build.outcome;
+use plan: mach.lang.build.plan;
+use mach.lang.be.codegen;
+use mach.lang.be.linker;
+use mach.lang.be.obj;
+use mach.lang.driver;
+use mach.lang.intern;
+use mach.lang.manifest;
+use mach.lang.me.ir;
+use mach.lang.me.lower.testrunner;
+use mach.lang.me.pipeline;
+use mach.lang.session;
+use mach.lang.source;
+use mach.lang.target.of;
+
+# one test build's collection state, threaded from the emit phase into the
+# link phase and the artifact recording
+# ---
+# col:     the raw collection off the lowered IR (owned until `free_scope`)
+# have:    `col` is live and needs `testrunner.free`
+# sel:     the in-scope selection; a test's dispatch index is its position
+#          here, stable for the built executable's lifetime
+# sel_len: number of tests in `sel`
+# skipped: target-gated own-src modules excluded from collection (#1873)
+pub rec TestScope {
+    col:     testrunner.Collected;
+    have:    bool;
+    sel:     *testrunner.Test;
+    sel_len: u32;
+    skipped: u32;
+}
+
+# collect every `test` declaration off the lowered IR and scope the selection
+#
+# Fills `sc` with the raw collection and the in-scope selection (the current
+# project's own modules, widened to dependencies by the request's
+# `include_deps`). A build with no tests at all is a user error; a scope that
+# selected nothing is not (the caller builds and runs nothing).
+# ---
+# p:   the project carrying the module graph, session, and settled request
+# irs: the per-module IR views (module-id-indexed; gated slots are empty)
+# sc:  receives the collection state; on ok the caller owns it via `free_scope`
+# ret: ok(true) on success, or the failure as a Fail
+pub fun collect_scope(p: *driver.Project, irs: *ir.Module, sc: *TestScope) R.Result[bool, outcome.Fail] {
+    sc.have    = false;
+    sc.sel     = nil;
+    sc.sel_len = 0;
+    sc.skipped = driver.count_target_gated(p);
+
+    val res_collect: R.Result[testrunner.Collected, str] = testrunner.collect(p.s, irs, p.module_len);
+    if (R.is_err[testrunner.Collected, str](res_collect)) {
+        ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[testrunner.Collected, str](res_collect)));
+    }
+    sc.col  = R.unwrap_ok[testrunner.Collected, str](res_collect);
+    sc.have = true;
+    if (sc.col.count == 0) {
+        free_scope(p, sc);
+        ret R.err[bool, outcome.Fail](outcome.user("no 'test' declarations found (add 'test \"name\" { ... }' blocks)"));
+    }
+
+    # `--include-deps`: by default a test run is scoped to the current project's
+    # own modules; the request widens the scope to tests declared in dependency
+    # modules (#1556).
+    val include_deps: bool = p.req.include_deps;
+
+    val res_sel: R.Result[*testrunner.Test, str] = A.allocate[testrunner.Test](p.s.alloc, sc.col.count::usize);
+    if (R.is_err[*testrunner.Test, str](res_sel)) {
+        free_scope(p, sc);
+        ret R.err[bool, outcome.Fail](outcome.internal("out of memory"));
+    }
+    sc.sel = R.unwrap_ok[*testrunner.Test, str](res_sel);
+    var i: u32 = 0;
+    for (i < sc.col.count) {
+        if (test_selected(p, ?sc.col.tests[i], include_deps)) {
+            sc.sel[sc.sel_len] = sc.col.tests[i];
+            sc.sel_len = sc.sel_len + 1;
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# release a collection state (the raw collection and the selection array)
+# ---
+# p:  the project (for its session allocator)
+# sc: the state to release; safe on a never-filled state
+pub fun free_scope(p: *driver.Project, sc: *TestScope) {
+    if (sc.sel != nil && sc.have && sc.col.count > 0) {
+        A.deallocate[testrunner.Test](p.s.alloc, sc.sel, sc.col.count::usize);
+    }
+    sc.sel     = nil;
+    sc.sel_len = 0;
+    if (sc.have) {
+        testrunner.free(p.s, ?sc.col);
+        sc.have = false;
+    }
+}
+
+# record each in-scope test's reporting artifact into `tests`
+#
+# Duplicates every string onto `oa` so the artifacts outlive the unit session's
+# teardown. `exe` is nil in `--list` mode.
+# ---
+# p:     the project (for its interner and source map)
+# sc:    the collection state
+# exe:   the dispatcher executable path, or nil in `--list` mode
+# tests: the outcome vector to append each artifact to
+# oa:    allocator backing the duplicated strings (the outcome arena)
+# ret:   ok(true) on success, or the failure as a Fail
+pub fun record_tests(p: *driver.Project, sc: *TestScope, exe: *u8,
+                     tests: *Vector[outcome.TestArtifact], oa: *A.Allocator) R.Result[bool, outcome.Fail] {
+    var k: u32 = 0;
+    for (k < sc.sel_len) {
+        val rc: R.Result[bool, outcome.Fail] = record_test(p, ?sc.sel[k], exe, k, tests, oa);
+        if (R.is_err[bool, outcome.Fail](rc)) { ret rc; }
+        k = k + 1;
+    }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# whether a collected test is in scope for this run
+#
+# A test is in scope when its declaring module is part of the current project;
+# `include_deps` opts dependency tests in (#1556). Label filtering (`--filter`)
+# happens at run time in the runner, never here.
+# ---
+# p:            the project (for its module table)
+# t:            the test to check
+# include_deps: also select tests declared in dependency modules
+# ret:          true when the test is in scope
+fun test_selected(p: *driver.Project, t: *testrunner.Test, include_deps: bool) bool {
+    if (include_deps) { ret true; }
+    ret test_in_project(p, t);
+}
+
+# whether a collected test was declared in a current-project module rather than a
+# dependency. `t.mod_idx` is the declaring module's id
+# ---
+# p:   the project (for its module table)
+# t:   the test to locate
+# ret: true when the declaring module is part of the current project
+fun test_in_project(p: *driver.Project, t: *testrunner.Test) bool {
+    if (t.mod_idx >= p.module_len) { ret false; }
+    val m: *driver.ModuleEntry = ?p.modules[t.mod_idx];
+    ret driver.module_in_current_project(p, m.fqn);
+}
+
+# assemble the external inputs and link the dispatcher executable over the
+# already-written per-module object set
+#
+# The engine's PH_LINK dispatch for a tests goal, after the emit phase wrote
+# the shared objects. The external link inputs (libc, manifest/CLI libs)
+# resolve once; the dispatcher's compile/link allocations (the synthesized
+# entry IR, its codegen object image, the parsed link inputs, the merged
+# output image, and the format unwind tables) route through a scratch arena
+# torn down as soon as the executable is linked, so the transients never
+# outlive the build. A fresh page allocator backs the arena so teardown
+# actually returns the chunks to the OS.
+# ---
+# p:          the project carrying the module graph, session, and settled request
+# unit:       the resolved plan cell (its `out_path` is the executable path)
+# sc:         the collection state (the dispatch selection)
+# obj_paths:  the written per-module object paths, in topo order (borrowed)
+# ret:        ok(true) on success, or the failure as a Fail
+pub fun link_dispatcher(p: *driver.Project, unit: *plan.BuildUnit, sc: *TestScope,
+                        obj_paths: **u8) R.Result[bool, outcome.Fail] {
+    val te: *driver.TargetEntry = p.target_entry;
+    if (te == nil) {
+        ret R.err[bool, outcome.Fail](outcome.internal("no target selected"));
+    }
+
+    # the shared object set: the per-module paths (borrowed) copied into a
+    # growable array the external inputs append to.
+    val len0: u32 = p.topo_len;
+    val res_sh: R.Result[**u8, str] = A.allocate[*u8](p.s.alloc, len0::usize);
+    if (R.is_err[**u8, str](res_sh)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    var shared: **u8 = R.unwrap_ok[**u8, str](res_sh);
+    var i: u32 = 0;
+    for (i < len0) { shared[i] = obj_paths[i]; i = i + 1; }
+    var shared_len: u32 = len0;
+
+    # the external link inputs (libc, manifest/CLI libs), resolved once and shared.
+    var sonames:    *intern.StrId = nil;
+    var soname_len: u32           = 0;
+    val ec: R.Result[bool, outcome.Fail] = emit.append_external_inputs(p, unit, ?shared, ?shared_len, ?sonames, ?soname_len);
+    if (R.is_err[bool, outcome.Fail](ec)) {
+        free_shared(p, shared, shared_len, len0);
+        emit.free_sonames(p.s.alloc, sonames, soname_len);
+        ret ec;
+    }
+
+    var scratch_backing: A.Allocator;
+    if (O.is_some[str](page.make(?scratch_backing))) {
+        free_shared(p, shared, shared_len, len0);
+        emit.free_sonames(p.s.alloc, sonames, soname_len);
+        ret R.err[bool, outcome.Fail](outcome.internal("failed to initialise test allocator"));
+    }
+    var scratch_ar: arena.Arena;
+    if (O.is_some[str](arena.init(?scratch_ar, ?scratch_backing, 0))) {
+        free_shared(p, shared, shared_len, len0);
+        emit.free_sonames(p.s.alloc, sonames, soname_len);
+        ret R.err[bool, outcome.Fail](outcome.internal("failed to initialise test allocator"));
+    }
+    var scratch_alloc: A.Allocator;
+    if (O.is_some[str](arena.make(?scratch_alloc, ?scratch_ar))) {
+        arena.dnit(?scratch_ar);
+        free_shared(p, shared, shared_len, len0);
+        emit.free_sonames(p.s.alloc, sonames, soname_len);
+        ret R.err[bool, outcome.Fail](outcome.internal("failed to initialise test allocator"));
+    }
+
+    # the persistent build allocator, swapped back once the dispatcher is built
+    # so the shared inputs and the collected list never touch the scratch arena.
+    val persistent: *A.Allocator = p.s.alloc;
+
+    p.s.alloc = ?scratch_alloc;
+    val result: R.Result[bool, outcome.Fail] = build_dispatch_executable(p, unit, unit.obj_dir::*u8,
+                                              sc.sel, sc.sel_len, shared, shared_len,
+                                              sonames, soname_len);
+    p.s.alloc = persistent;
+    arena.dnit(?scratch_ar);
+
+    free_shared(p, shared, shared_len, len0);
+    emit.free_sonames(p.s.alloc, sonames, soname_len);
+    ret result;
+}
+
+# release the grown shared-path array: the appended external-input tails are
+# owned here (freed at exact size); the first `borrowed` entries are the
+# engine's object paths and are left alone
+fun free_shared(p: *driver.Project, shared: **u8, shared_len: u32, borrowed: u32) {
+    if (shared == nil) { ret; }
+    var i: u32 = borrowed;
+    for (i < shared_len) {
+        if (shared[i] != nil) {
+            A.deallocate[u8](p.s.alloc, shared[i], (str_len(shared[i]::str) + 1)::usize);
+        }
+        i = i + 1;
+    }
+    A.deallocate[*u8](p.s.alloc, shared, shared_len::usize);
+}
+
+# synthesize, codegen, and link the dispatcher executable
+#
+# The entry module is the index dispatcher over `sel`; its object is written to
+# `<obj_base>/__mach_test_dispatch.o` and linked with the shared object set into
+# the unit's resolved `tests` path (its `{name}` was expanded at plan time to
+# the product name, falling back to the project id for artifact-less builds).
+# The transient compile/link allocations come from the session allocator, which
+# the caller points at a scratch arena it tears down afterward; the unit's
+# strings live on the plan allocator and survive that teardown.
+# ---
+# p:          the project carrying the module graph, session, and settled request
+# unit:       the resolved plan cell (its `out_path` is the executable path)
+# obj_base:   the resolved per-module object tree root
+# sel:        the in-scope tests, dispatch index = array position
+# sel_len:    number of tests in `sel`
+# shared:     the shared per-module object path set
+# shared_len: number of shared object paths
+# sonames:    the shared dynamic-dependency soname list
+# soname_len: number of sonames
+# ret:        ok(true) on success, or the failure as a Fail
+fun build_dispatch_executable(p: *driver.Project, unit: *plan.BuildUnit, obj_base: *u8,
+                              sel: *testrunner.Test, sel_len: u32,
+                              shared: **u8, shared_len: u32,
+                              sonames: *intern.StrId, soname_len: u32) R.Result[bool, outcome.Fail] {
+    val res_synth: R.Result[ir.Module, str] = testrunner.synthesize_dispatcher(p.s, sel, sel_len);
+    if (R.is_err[ir.Module, str](res_synth)) {
+        ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[ir.Module, str](res_synth)));
+    }
+    var entry_ir: ir.Module = R.unwrap_ok[ir.Module, str](res_synth);
+
+    val res_opt: R.Result[bool, str] = pipeline.run(?entry_ir, ?p.target, p.req.opt, p.req.verify_ir, p.req.simd == manifest.SIMD_REQUIRE, ?p.s.interner);
+    if (R.is_err[bool, str](res_opt)) {
+        ir.dnit(?entry_ir);
+        ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](res_opt)));
+    }
+
+    val dbg_r: R.Result[codegen.DebugInfo, str] = driver.debug_info_of(p);
+    if (R.is_err[codegen.DebugInfo, str](dbg_r)) {
+        ir.dnit(?entry_ir);
+        ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[codegen.DebugInfo, str](dbg_r)));
+    }
+
+    val res_codegen: R.Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, ?entry_ir, nil, R.unwrap_ok[codegen.DebugInfo, str](dbg_r));
+    if (R.is_err[of.ObjectImage, str](res_codegen)) {
+        ir.dnit(?entry_ir);
+        ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[of.ObjectImage, str](res_codegen)));
+    }
+    var entry_img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](res_codegen);
+
+    # write the dispatcher object alongside the per-module objects.
+    val ep_r: R.Result[str, str] = path.join(p.s.alloc, obj_base::str, "__mach_test_dispatch.o");
+    if (R.is_err[str, str](ep_r)) {
+        obj.dnit(?entry_img);
+        ir.dnit(?entry_ir);
+        ret R.err[bool, outcome.Fail](outcome.internal("failed to create test object directory"));
+    }
+    val entry_path: str = R.unwrap_ok[str, str](ep_r);
+    if (O.is_some[str](emit.ensure_parents(p.s.alloc, entry_path))) {
+        obj.dnit(?entry_img);
+        ir.dnit(?entry_ir);
+        ret R.err[bool, outcome.Fail](outcome.internal("failed to create test object directory"));
+    }
+    val res_emit: R.Result[bool, str] = obj.emit(?entry_img, ?p.target, entry_path);
+    obj.dnit(?entry_img);
+    ir.dnit(?entry_ir);
+    if (R.is_err[bool, str](res_emit)) {
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](res_emit)));
+    }
+
+    # the executable path is the unit's resolved `tests` fact.
+    if (O.is_some[str](emit.ensure_parents(p.s.alloc, unit.out_path))) {
+        ret R.err[bool, outcome.Fail](outcome.internal("failed to resolve the test executable path; check the `tests` template in mach.toml"));
+    }
+
+    ret link_one_test(p, shared, shared_len, sonames, soname_len, entry_path, unit.out_path::*u8);
+}
+
+# link the shared object set plus the dispatcher entry object into the test
+# executable at `exe_path`
+#
+# The shared paths are reused across tests, so the combined array borrows their
+# string pointers and only the array wrapper is freed.
+# ---
+# p:          the project carrying the session and target
+# shared:     the shared per-module object path set
+# shared_len: number of shared object paths
+# sonames:    the shared dynamic-dependency soname list
+# soname_len: number of sonames
+# entry_path: the test's entry-object path
+# exe_path:   the executable path to link into
+# ret:        ok(true) on success, or the failure as a Fail
+fun link_one_test(p: *driver.Project, shared: **u8, shared_len: u32,
+                  sonames: *intern.StrId, soname_len: u32,
+                  entry_path: *u8, exe_path: *u8) R.Result[bool, outcome.Fail] {
+    val total: u32 = shared_len + 1;
+    val res_paths: R.Result[**u8, str] = A.allocate[*u8](p.s.alloc, total::usize);
+    if (R.is_err[**u8, str](res_paths)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    val paths: **u8 = R.unwrap_ok[**u8, str](res_paths);
+
+    var i: u32 = 0;
+    for (i < shared_len) { paths[i] = shared[i]; i = i + 1; }
+    paths[shared_len] = entry_path;
+
+    val res_link: R.Result[bool, str] =
+        linker.link(p.s, ?p.target, paths, total, sonames, soname_len, exe_path, emit.artifact_product_name(p), linker.LINK_EXE, p.req.pie);
+    A.deallocate[*u8](p.s.alloc, paths, total::usize);
+    if (R.is_err[bool, str](res_link)) {
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](res_link)));
+    }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# append a test's reporting artifact to `tests`
+#
+# Duplicates every string into `a` so it outlives the session teardown and the
+# dispatcher build's scratch teardown. `exe` is nil in `--list` mode.
+# ---
+# p:     the project (for its interner and source map)
+# t:     the test to record
+# exe:   the dispatcher executable path, or nil in `--list` mode
+# idx:   the test's dispatch index
+# tests: the vector to append the artifact to
+# a:     allocator backing the duplicated strings
+# ret:   ok(true) on success, or the failure as a Fail
+fun record_test(p: *driver.Project, t: *testrunner.Test, exe: *u8, idx: u32,
+                tests: *Vector[outcome.TestArtifact], a: *A.Allocator) R.Result[bool, outcome.Fail] {
+    var artifact: outcome.TestArtifact;
+    artifact.line = t.line;
+    artifact.idx  = idx;
+
+    val mod_r: R.Result[str, str] = str_copy(a, test_module_fqn(p, t.mod_idx));
+    if (R.is_err[str, str](mod_r)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    artifact.module = R.unwrap_ok[str, str](mod_r);
+
+    val opt_label: O.Option[str] = intern.lookup(?p.s.interner, t.label);
+    var label_src: *u8 = "<test>";
+    if (O.is_some[str](opt_label)) { label_src = O.unwrap[str](opt_label)::*u8; }
+    val label_r: R.Result[str, str] = str_copy(a, label_src);
+    if (R.is_err[str, str](label_r)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    artifact.label = R.unwrap_ok[str, str](label_r);
+
+    val file_r: R.Result[str, str] = str_copy(a, test_source_path(p, t.mod_idx));
+    if (R.is_err[str, str](file_r)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    artifact.file = R.unwrap_ok[str, str](file_r);
+
+    artifact.exe = nil;
+    if (exe != nil) {
+        val exe_r: R.Result[str, str] = str_copy(a, exe);
+        if (R.is_err[str, str](exe_r)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+        artifact.exe = R.unwrap_ok[str, str](exe_r);
+    }
+
+    val push_r: R.Result[usize, str] = vector.push[outcome.TestArtifact](tests, artifact);
+    if (R.is_err[usize, str](push_r)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# the fully-qualified name of the module a test was declared in
+#
+# Borrowed from the session interner (the caller duplicates). "<unknown>" when
+# the index is out of range or the FQN is not interned.
+# ---
+# p:       the project (for its interner and module table)
+# mod_idx: the declaring module's index
+# ret:     the borrowed module FQN, or "<unknown>"
+fun test_module_fqn(p: *driver.Project, mod_idx: u32) *u8 {
+    if (mod_idx >= p.module_len) { ret "<unknown>"; }
+    val m: *driver.ModuleEntry = ?p.modules[mod_idx];
+    val opt_fqn: O.Option[str] = intern.lookup(?p.s.interner, m.fqn);
+    if (O.is_none[str](opt_fqn)) { ret "<unknown>"; }
+    ret O.unwrap[str](opt_fqn)::*u8;
+}
+
+# the source file path of the module a test was declared in
+#
+# Borrowed from the session source map (the caller duplicates). "<unknown>" when
+# the module's file is not registered.
+# ---
+# p:       the project (for its source map)
+# mod_idx: the declaring module's index
+# ret:     the borrowed source path, or "<unknown>"
+fun test_source_path(p: *driver.Project, mod_idx: u32) *u8 {
+    if (mod_idx >= p.module_len) { ret "<unknown>"; }
+    val m: *driver.ModuleEntry = ?p.modules[mod_idx];
+    val opt_file: O.Option[*source.SourceFile] = source.get(?p.s.sources, m.file_id);
+    if (O.is_none[*source.SourceFile](opt_file)) { ret "<unknown>"; }
+    ret O.unwrap[*source.SourceFile](opt_file).path::*u8;
+}
