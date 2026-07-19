@@ -72,6 +72,11 @@ the scope exits.
 # at scope exit, in reverse order: counter * 2 runs first, then counter - 1
 ```
 
+When the scope exits through `ret expr;`, the return expression is fully
+evaluated first, then the pending `fin` blocks run, then the function returns
+the already-evaluated value — a fin's side effects are never observable in the
+returned value.
+
 `fin` requires a block body (`fin { ... }`). The bare single-statement form
 (`fin stmt;`) is rejected.
 
