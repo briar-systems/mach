@@ -22,9 +22,11 @@
 # and tears down before returning, so a warm session does not grow per rebuild.
 # The cold `execute` reduces to today's exact contract: a fresh session per
 # unit over one arena, both channels initially identical, everything torn down
-# together between cells. A warm call always takes the serial incremental
-# codegen path - the parallel prelude assumes a cold cache (it stages images a
-# warm-valid Q_CODEGEN would never adopt), so only the cold entry enables it.
+# together between cells. Warm and cold share one adaptive codegen path: the
+# parallel prelude fans out only the modules whose Q_CODEGEN would not
+# revalidate, so a warm-valid module is served by the cache and never touched
+# by a worker - a cold cache is the degenerate case where every module is
+# stale.
 
 use std.allocator.arena;
 use std.allocator.page;
@@ -85,9 +87,6 @@ use mach.lang.target.of;
 # scope:        the test collection state (tests goals only)
 # link_started: the link narration span is open (its begin fired)
 # t_link:       the link item's start instant (paired with `link_started`)
-# parallel:     the parallel-codegen prelude is permitted - set only by the cold
-#               entry; a warm session keeps the serial incremental path (see
-#               run_codegen_parallel's cold-cache contract)
 rec UnitState {
     irs:          *ir.Module;
     ir_ready:     *bool;
@@ -104,7 +103,6 @@ rec UnitState {
 
     link_started: bool;
     t_link:       ctime.Time;
-    parallel:     bool;
 }
 
 # execute the resolved plan: every unit, one after another, each in its own
@@ -208,7 +206,7 @@ fun execute_unit_cold(bp: *plan.BuildPlan, unit_index: usize, backing: *A.Alloca
     }
     var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
 
-    val r: R.Result[outcome.BuildOutcome, outcome.Fail] = execute_warm_impl(bp, unit_index, ?s, oa, ev, rd, true);
+    val r: R.Result[outcome.BuildOutcome, outcome.Fail] = execute_warm(bp, unit_index, ?s, oa, ev, rd);
 
     session.dnit(?s);
     arena.dnit(?u_ar);
@@ -243,75 +241,23 @@ fun join_msg(al: *A.Allocator, va: ...) str {
 # engine's view state - land on a page-backed per-call arena installed as the
 # session's build channel and torn down before return; query-owned artifacts
 # stay on the session allocator. The diagnostic sink is reset at entry (a
-# fresh session's is already empty), the unit QueryCtx is uninstalled at exit,
-# and the codegen path is always the serial incremental one. Failures render
-# through `rd` where they land and fold into the returned outcome
+# fresh session's is already empty) and the unit QueryCtx is uninstalled at
+# exit. The codegen path adapts per module: when the request asks for workers
+# (`jobs`) the parallel prelude builds only the modules whose Q_CODEGEN would
+# not revalidate, and warm-valid modules are served by the cache. Failures
+# render through `rd` where they land and fold into the returned outcome
 # (`ok`/`internal`), mirroring `execute`.
 # ---
-# bp:   the resolved plan
-# unit: index of the plan unit to execute
-# s:    the caller-owned session the unit runs in
-# oa:   the outcome allocator - everything the caller keeps lands here
-# ev:   the progress-event sink (`-v` narration), or nil for silence
-# rd:   the render seam (banners, notes, failures, diagnostics), or nil
-# ret:  the executed unit's outcome; err only for an invocation-level fault
-#       that produced no outcome (a bad unit index)
-pub fun execute_warm(bp: *plan.BuildPlan, unit: usize, s: *session.Session, oa: *A.Allocator,
+# bp:         the resolved plan
+# unit_index: index of the plan unit to execute
+# s:          the caller-owned session the unit runs in
+# oa:         the outcome allocator - everything the caller keeps lands here
+# ev:         the progress-event sink (`-v` narration), or nil for silence
+# rd:         the render seam (banners, notes, failures, diagnostics), or nil
+# ret:        the executed unit's outcome; err only for an invocation-level
+#             fault that produced no outcome (a bad unit index)
+pub fun execute_warm(bp: *plan.BuildPlan, unit_index: usize, s: *session.Session, oa: *A.Allocator,
                      ev: *readout.Progress, rd: *outcome.Render) R.Result[outcome.BuildOutcome, outcome.Fail] {
-    ret execute_warm_impl(bp, unit, s, oa, ev, rd, false);
-}
-
-# execute every unit of `bp` inside a caller-owned session
-#
-# The warm counterpart to `execute`'s unit loop: one persistent session runs
-# every planned unit in order, folding per-unit outcomes exactly as the cold
-# loop does (the first failing unit decides the exit class; later units still
-# run). Units share the session's cache, so a matrix plan whose cells differ
-# in config invalidates and recomputes per cell - warm reuse pays off across
-# calls whose plans agree, the single-unit editor build being the intended
-# consumer.
-# ---
-# bp:  the resolved plan
-# s:   the caller-owned session every unit runs in
-# oa:  the outcome allocator - everything the caller keeps lands here
-# ev:  the progress-event sink (`-v` narration), or nil for silence
-# rd:  the render seam (banners, notes, failures, diagnostics), or nil
-# ret: the executed outcome; err only for an invocation-level fault that
-#      produced no outcome
-pub fun execute_warm_all(bp: *plan.BuildPlan, s: *session.Session, oa: *A.Allocator,
-                         ev: *readout.Progress, rd: *outcome.Render) R.Result[outcome.BuildOutcome, outcome.Fail] {
-    var bo: outcome.BuildOutcome;
-    bo.ok            = true;
-    bo.internal      = false;
-    bo.artifacts     = vector.init[outcome.Artifact](oa);
-    bo.tests         = vector.init[outcome.TestArtifact](oa);
-    bo.tests_skipped = 0;
-
-    var i: usize = 0;
-    for (i < bp.units.len) {
-        val unit: *plan.BuildUnit = ?bp.units.data[i];
-        outcome.render_unit(rd, unit.sel_artifact, unit.sel_target, unit.has_artifact);
-
-        val ur: R.Result[outcome.BuildOutcome, outcome.Fail] = execute_warm_impl(bp, i, s, oa, ev, rd, false);
-        if (R.is_err[outcome.BuildOutcome, outcome.Fail](ur)) {
-            val f: outcome.Fail = R.unwrap_err[outcome.BuildOutcome, outcome.Fail](ur);
-            if (bo.ok) { bo.internal = f.internal; }
-            bo.ok = false;
-        }
-        or {
-            var ubo: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](ur);
-            merge_outcome(?bo, ?ubo, bp.request.goal);
-        }
-        i = i + 1;
-    }
-    ret R.ok[outcome.BuildOutcome, outcome.Fail](bo);
-}
-
-# the shared unit execution behind `execute_warm` (serial) and the cold
-# per-unit wrapper (`parallel` permits the cold-cache parallel-codegen prelude)
-fun execute_warm_impl(bp: *plan.BuildPlan, unit_index: usize, s: *session.Session, oa: *A.Allocator,
-                      ev: *readout.Progress, rd: *outcome.Render, parallel: bool)
-                      R.Result[outcome.BuildOutcome, outcome.Fail] {
     if (unit_index >= bp.units.len) {
         ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal("build unit index out of range"));
     }
@@ -422,7 +368,6 @@ fun execute_warm_impl(bp: *plan.BuildPlan, unit_index: usize, s: *session.Sessio
     st.scope.sel_len = 0;
     st.scope.skipped = 0;
     st.link_started = false;
-    st.parallel     = parallel;
 
     # the unit's execution IS its phase vector: dispatch each phase in order,
     # stopping at the first failure.
@@ -457,6 +402,7 @@ fun execute_warm_impl(bp: *plan.BuildPlan, unit_index: usize, s: *session.Sessio
     # cell's transients wholesale while the warm cache stays.
     outcome.render_diags(rd, s::ptr);
     btest.free_scope(?p, ?st.scope);
+    pcg_sweep_staged(?p);
     driver.dnit_project(?p);
     query.set_ctx(?s.queries, nil);
 
@@ -466,6 +412,69 @@ fun execute_warm_impl(bp: *plan.BuildPlan, unit_index: usize, s: *session.Sessio
         bo.internal = f.internal;
     }
     ret R.ok[outcome.BuildOutcome, outcome.Fail](bo);
+}
+
+# execute every unit of `bp` inside a caller-owned session
+#
+# The warm counterpart to `execute`'s unit loop: one persistent session runs
+# every planned unit in order, folding per-unit outcomes exactly as the cold
+# loop does (the first failing unit decides the exit class; later units still
+# run). Units share the session's cache, so a matrix plan whose cells differ
+# in config invalidates and recomputes per cell - warm reuse pays off across
+# calls whose plans agree, the single-unit editor build being the intended
+# consumer.
+# ---
+# bp:  the resolved plan
+# s:   the caller-owned session every unit runs in
+# oa:  the outcome allocator - everything the caller keeps lands here
+# ev:  the progress-event sink (`-v` narration), or nil for silence
+# rd:  the render seam (banners, notes, failures, diagnostics), or nil
+# ret: the executed outcome; err only for an invocation-level fault that
+#      produced no outcome
+pub fun execute_warm_all(bp: *plan.BuildPlan, s: *session.Session, oa: *A.Allocator,
+                         ev: *readout.Progress, rd: *outcome.Render) R.Result[outcome.BuildOutcome, outcome.Fail] {
+    var bo: outcome.BuildOutcome;
+    bo.ok            = true;
+    bo.internal      = false;
+    bo.artifacts     = vector.init[outcome.Artifact](oa);
+    bo.tests         = vector.init[outcome.TestArtifact](oa);
+    bo.tests_skipped = 0;
+
+    var i: usize = 0;
+    for (i < bp.units.len) {
+        val unit: *plan.BuildUnit = ?bp.units.data[i];
+        outcome.render_unit(rd, unit.sel_artifact, unit.sel_target, unit.has_artifact);
+
+        val ur: R.Result[outcome.BuildOutcome, outcome.Fail] = execute_warm(bp, i, s, oa, ev, rd);
+        if (R.is_err[outcome.BuildOutcome, outcome.Fail](ur)) {
+            val f: outcome.Fail = R.unwrap_err[outcome.BuildOutcome, outcome.Fail](ur);
+            if (bo.ok) { bo.internal = f.internal; }
+            bo.ok = false;
+        }
+        or {
+            var ubo: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](ur);
+            merge_outcome(?bo, ?ubo, bp.request.goal);
+        }
+        i = i + 1;
+    }
+    ret R.ok[outcome.BuildOutcome, outcome.Fail](bo);
+}
+
+# reclaim any staged image the parallel prelude built but no Q_CODEGEN compute
+# adopted - a pass failure between staging and adoption leaves them behind, and
+# they are session-owned, so on a warm session they would outlive the call.
+# a no-op after a successful codegen pass (every staged image was adopted)
+fun pcg_sweep_staged(p: *driver.Project) {
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        val m: *driver.ModuleEntry = ?p.modules[i];
+        if (m.staged_image != nil) {
+            obj.dnit(m.staged_image);
+            A.deallocate[of.ObjectImage](p.s.alloc, m.staged_image, 1::usize);
+            m.staged_image = nil;
+        }
+        i = i + 1;
+    }
 }
 
 # render a unit-scoped failure through the seam and fold it into the outcome
@@ -593,16 +602,16 @@ fun lower_phase(p: *driver.Project, st: *UnitState, rd: *outcome.Render) R.Resul
 # `jobs`) stages images up front; the serial pass adopts them through
 # Q_CODEGEN and the views collect the borrows
 fun codegen_phase(p: *driver.Project, st: *UnitState) R.Result[bool, outcome.Fail] {
-    # when the request asks for workers (jobs >= 1, CLI builds) and the build
-    # emits no DWARF, codegen every module across the pool up front and stage
-    # each finished image on its ModuleEntry; run_codegen_pass then adopts the
-    # staged images (Q_CODEGEN stays the value's system of record). a `-g`
-    # build keeps the serial path: its DWARF interns IR types into each
-    # module's type table through the shared session allocator, which the
-    # worker arenas do not isolate (#1826 parallel-lowering/-g follow-up).
-    # a warm call never runs the prelude (st.parallel is false): it assumes a
-    # cold cache, staging images a warm-valid Q_CODEGEN would never adopt.
-    if (st.parallel && pcg_enabled(p)) {
+    # when the request asks for workers (jobs >= 1) and the build emits no
+    # DWARF, codegen the stale modules across the pool up front and stage each
+    # finished image on its ModuleEntry; run_codegen_pass then adopts the
+    # staged images (Q_CODEGEN stays the value's system of record). warm-valid
+    # modules never reach the pool - the cache serves them through the pass's
+    # revalidation. a `-g` build keeps the serial path: its DWARF interns IR
+    # types into each module's type table through the shared session
+    # allocator, which the worker arenas do not isolate (#1826
+    # parallel-lowering/-g follow-up).
+    if (pcg_enabled(p)) {
         val rp: R.Result[bool, str] = run_codegen_parallel(p);
         if (R.is_err[bool, str](rp)) {
             ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](rp)));
@@ -994,7 +1003,7 @@ rec PcgWorker {
     active:  bool;
 }
 
-# one module's parallel-codegen result, indexed by topo position
+# one module's parallel-codegen result, indexed by stale position
 # ---
 # image:  raw image in the producing worker's arena (child-interner names), or nil
 # worker: producing worker index - selects the remap at collection
@@ -1008,12 +1017,15 @@ rec PcgSlot {
 # the running parallel-codegen job the bare thread entry reads through a global
 # ---
 # p:          the active project
-# next:       atomic cursor - the next topo index a worker claims
+# next:       atomic cursor - the next stale-list index a worker claims
 # worker_seq: atomic dispenser - hands each running thread its worker index
 # stop:       atomic flag - set non-zero by the first worker to error
 # nworkers:   number of worker slots (>= threads that actually run)
 # workers:    the per-worker state array
-# slots:      the per-module result array, indexed by topo position
+# slots:      the per-module result array, indexed by stale position
+# stale:      topo positions of the modules the pool builds, in topo order -
+#             the modules whose Q_CODEGEN would not revalidate
+# stale_len:  number of stale entries
 # base_len:   session-interner id count snapshotted before any child - the boundary
 #             below which a name needs no remap
 rec ParallelCodegen {
@@ -1024,6 +1036,8 @@ rec ParallelCodegen {
     nworkers:   u32;
     workers:    *PcgWorker;
     slots:      *PcgSlot;
+    stale:      *u32;
+    stale_len:  u32;
     base_len:   usize;
 }
 
@@ -1064,8 +1078,8 @@ fun pcg_worker_teardown(w: *PcgWorker) {
     w.active = false;
 }
 
-# the worker thread body: claim a worker index, then drain modules from the shared
-# cursor, codegen each into this worker's arena, and record it in its slot
+# the worker thread body: claim a worker index, then drain stale modules from the
+# shared cursor, codegen each into this worker's arena, and record it in its slot
 #
 # Bare (std.sync.thread hands no argument); reaches the job through g_pcg. Every
 # read of the project (topo, modules, target) and of the frozen session is
@@ -1083,10 +1097,10 @@ fun pcg_worker_main() {
     for (true) {
         if (atomic.load(?pc.stop) != 0) { ret; }
         val idx_raw: i64 = atomic.fetch_add(?pc.next, 1::i64);
-        if (idx_raw >= pc.p.topo_len::i64) { ret; }
+        if (idx_raw >= pc.stale_len::i64) { ret; }
         val idx: u32 = idx_raw::u32;
 
-        val mid:  session.ModuleId = pc.p.topo[idx];
+        val mid:  session.ModuleId = pc.p.topo[pc.stale[idx::usize]];
         val m:    *driver.ModuleEntry     = ?pc.p.modules[mid::u32];
         val slot: *PcgSlot         = ?pc.slots[idx::usize];
         slot.worker = wid;
@@ -1113,8 +1127,15 @@ fun pcg_worker_main() {
     }
 }
 
-# codegen every module across a worker pool and stage each finished image on its
-# ModuleEntry for Q_CODEGEN to adopt
+# codegen every stale module across a worker pool and stage each finished image
+# on its ModuleEntry for Q_CODEGEN to adopt
+#
+# The warm split first: a module whose Q_CODEGEN would revalidate is served by
+# the cache (the pass reuses its entry, so a staged image would never be
+# adopted) and never reaches the pool; only the stale remainder fans out. A
+# cold cache is the degenerate case where every module is stale. Zero or one
+# stale module skips the pool - the serial pass computes it directly with none
+# of the staging overhead.
 #
 # Each worker owns a private arena and a child interner over the session interner,
 # so lowering-to-object runs with no shared mutable state (the session interner and
@@ -1124,29 +1145,50 @@ fun pcg_worker_main() {
 # session interner (reintern_child) and each raw image is re-homed onto the session
 # allocator with its names remapped (obj.rehome_remap), so the staged images are
 # byte-identical to a serial build and the link that follows keys on one interner.
-# Assumes a cold cache (every module is (re)built) - the CLI's contract; a warm
-# session must use the serial incremental path.
+# Pool bookkeeping is per-call (the build channel); the staged images alone are
+# session-owned, so a warm session does not grow per rebuild.
 # ---
 # p:   the active project (jobs resolved, no DWARF - see pcg_enabled)
-# ret: true once every module is staged, or the first worker's codegen error
+# ret: true once every stale module is staged, or the first worker's codegen error
 fun run_codegen_parallel(p: *driver.Project) R.Result[bool, str] {
     val topo_len: u32 = p.topo_len;
     if (topo_len == 0) { ret R.ok[bool, str](true); }
 
+    val rstale: R.Result[*u32, str] = A.allocate[u32](p.alloc, topo_len::usize);
+    if (R.is_err[*u32, str](rstale)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rstale)); }
+    val stale: *u32 = R.unwrap_ok[*u32, str](rstale);
+    var stale_len: u32 = 0;
+    var ti: u32 = 0;
+    for (ti < topo_len) {
+        if (!driver.codegen_reusable(p, p.topo[ti])) {
+            stale[stale_len] = ti;
+            stale_len = stale_len + 1;
+        }
+        ti = ti + 1;
+    }
+    if (stale_len <= 1) {
+        A.deallocate[u32](p.alloc, stale, topo_len::usize);
+        ret R.ok[bool, str](true);
+    }
+
     val qc: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
     var nworkers: u32 = qc.req.jobs;
-    if (nworkers == 0)        { nworkers = 1; }
-    if (nworkers > topo_len)  { nworkers = topo_len; }
+    if (nworkers == 0)         { nworkers = 1; }
+    if (nworkers > stale_len)  { nworkers = stale_len; }
 
-    val rslots: R.Result[*PcgSlot, str] = A.allocate[PcgSlot](p.s.alloc, topo_len::usize);
-    if (R.is_err[*PcgSlot, str](rslots)) { ret R.err[bool, str](R.unwrap_err[*PcgSlot, str](rslots)); }
+    val rslots: R.Result[*PcgSlot, str] = A.allocate[PcgSlot](p.alloc, stale_len::usize);
+    if (R.is_err[*PcgSlot, str](rslots)) {
+        A.deallocate[u32](p.alloc, stale, topo_len::usize);
+        ret R.err[bool, str](R.unwrap_err[*PcgSlot, str](rslots));
+    }
     val slots: *PcgSlot = R.unwrap_ok[*PcgSlot, str](rslots);
     var si: u32 = 0;
-    for (si < topo_len) { slots[si].image = nil; slots[si].worker = 0; slots[si].err = nil; si = si + 1; }
+    for (si < stale_len) { slots[si].image = nil; slots[si].worker = 0; slots[si].err = nil; si = si + 1; }
 
-    val rworkers: R.Result[*PcgWorker, str] = A.allocate[PcgWorker](p.s.alloc, nworkers::usize);
+    val rworkers: R.Result[*PcgWorker, str] = A.allocate[PcgWorker](p.alloc, nworkers::usize);
     if (R.is_err[*PcgWorker, str](rworkers)) {
-        A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+        A.deallocate[PcgSlot](p.alloc, slots, stale_len::usize);
+        A.deallocate[u32](p.alloc, stale, topo_len::usize);
         ret R.err[bool, str](R.unwrap_err[*PcgWorker, str](rworkers));
     }
     val workers: *PcgWorker = R.unwrap_ok[*PcgWorker, str](rworkers);
@@ -1157,8 +1199,9 @@ fun run_codegen_parallel(p: *driver.Project) R.Result[bool, str] {
         if (O.is_some[str](io)) {
             var wj: u32 = 0;
             for (wj < wi) { pcg_worker_teardown(?workers[wj]); wj = wj + 1; }
-            A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
-            A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+            A.deallocate[PcgWorker](p.alloc, workers, nworkers::usize);
+            A.deallocate[PcgSlot](p.alloc, slots, stale_len::usize);
+            A.deallocate[u32](p.alloc, stale, topo_len::usize);
             ret R.err[bool, str](O.unwrap[str](io));
         }
         wi = wi + 1;
@@ -1172,6 +1215,8 @@ fun run_codegen_parallel(p: *driver.Project) R.Result[bool, str] {
     ctx.nworkers   = nworkers;
     ctx.workers    = workers;
     ctx.slots      = slots;
+    ctx.stale      = stale;
+    ctx.stale_len  = stale_len;
     ctx.base_len   = intern.count(?p.s.interner);
     g_pcg = ?ctx;
 
@@ -1180,13 +1225,14 @@ fun run_codegen_parallel(p: *driver.Project) R.Result[bool, str] {
     var threads: *thread.Thread = nil;
     val extra: u32 = nworkers - 1;
     if (extra > 0) {
-        val rt: R.Result[*thread.Thread, str] = A.allocate[thread.Thread](p.s.alloc, extra::usize);
+        val rt: R.Result[*thread.Thread, str] = A.allocate[thread.Thread](p.alloc, extra::usize);
         if (R.is_err[*thread.Thread, str](rt)) {
             g_pcg = nil;
             var wk: u32 = 0;
             for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
-            A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
-            A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+            A.deallocate[PcgWorker](p.alloc, workers, nworkers::usize);
+            A.deallocate[PcgSlot](p.alloc, slots, stale_len::usize);
+            A.deallocate[u32](p.alloc, stale, topo_len::usize);
             ret R.err[bool, str](R.unwrap_err[*thread.Thread, str](rt));
         }
         threads = R.unwrap_ok[*thread.Thread, str](rt);
@@ -1202,19 +1248,20 @@ fun run_codegen_parallel(p: *driver.Project) R.Result[bool, str] {
             if (threads[k].tid >= 0) { thread.join(?threads[k]); }
             k = k + 1;
         }
-        A.deallocate[thread.Thread](p.s.alloc, threads, extra::usize);
+        A.deallocate[thread.Thread](p.alloc, threads, extra::usize);
     }
     g_pcg = nil;
 
     # first error in topo order wins - deterministic regardless of which worker hit it.
     var ei: u32 = 0;
-    for (ei < topo_len) {
+    for (ei < stale_len) {
         if (slots[ei].err != nil) {
             val msg: str = slots[ei].err;
             var wk: u32 = 0;
             for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
-            A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
-            A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+            A.deallocate[PcgWorker](p.alloc, workers, nworkers::usize);
+            A.deallocate[PcgSlot](p.alloc, slots, stale_len::usize);
+            A.deallocate[u32](p.alloc, stale, topo_len::usize);
             ret R.err[bool, str](msg);
         }
         ei = ei + 1;
@@ -1224,35 +1271,37 @@ fun run_codegen_parallel(p: *driver.Project) R.Result[bool, str] {
 
     var wk: u32 = 0;
     for (wk < nworkers) { pcg_worker_teardown(?workers[wk]); wk = wk + 1; }
-    A.deallocate[PcgWorker](p.s.alloc, workers, nworkers::usize);
-    A.deallocate[PcgSlot](p.s.alloc, slots, topo_len::usize);
+    A.deallocate[PcgWorker](p.alloc, workers, nworkers::usize);
+    A.deallocate[PcgSlot](p.alloc, slots, stale_len::usize);
+    A.deallocate[u32](p.alloc, stale, topo_len::usize);
     ret cr;
 }
 
 # fold every worker's new interner strings back into the session interner and
 # re-home each raw image onto the session allocator, remapped, staged on its module
 #
-# Serial and in topo order: worker remaps are computed once each, then every image
-# is deep-copied onto the session allocator with its names rewritten into the
-# session interner's id space. On any allocation failure the images staged so far
-# are left on their modules for the normal teardown to reclaim.
+# Serial and in topo order over the stale list: worker remaps are computed once
+# each, then every image is deep-copied onto the session allocator with its names
+# rewritten into the session interner's id space. On any allocation failure the
+# images staged so far are left on their modules for the engine's staged-image
+# sweep to reclaim at unit teardown.
 # ---
 # p:   the active project
 # ctx: the finished job (its workers hold the raw images and child interners)
-# ret: true once every image is staged, or the first allocation error
+# ret: true once every stale module's image is staged, or the first allocation error
 fun pcg_collect(p: *driver.Project, ctx: *ParallelCodegen) R.Result[bool, str] {
     val nworkers: u32 = ctx.nworkers;
 
-    val rmaps: R.Result[**intern.StrId, str] = A.allocate[*intern.StrId](p.s.alloc, nworkers::usize);
+    val rmaps: R.Result[**intern.StrId, str] = A.allocate[*intern.StrId](p.alloc, nworkers::usize);
     if (R.is_err[**intern.StrId, str](rmaps)) { ret R.err[bool, str](R.unwrap_err[**intern.StrId, str](rmaps)); }
     val remaps: **intern.StrId = R.unwrap_ok[**intern.StrId, str](rmaps);
 
     var wi: u32 = 0;
     for (wi < nworkers) {
-        val rr: R.Result[*intern.StrId, str] = intern.reintern_child(?workers_at(ctx, wi).sess.interner, p.s.alloc);
+        val rr: R.Result[*intern.StrId, str] = intern.reintern_child(?workers_at(ctx, wi).sess.interner, p.alloc);
         if (R.is_err[*intern.StrId, str](rr)) {
             pcg_free_remaps(p, ctx, remaps, wi);
-            A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+            A.deallocate[*intern.StrId](p.alloc, remaps, nworkers::usize);
             ret R.err[bool, str](R.unwrap_err[*intern.StrId, str](rr));
         }
         remaps[wi] = R.unwrap_ok[*intern.StrId, str](rr);
@@ -1260,14 +1309,13 @@ fun pcg_collect(p: *driver.Project, ctx: *ParallelCodegen) R.Result[bool, str] {
     }
 
     var i: u32 = 0;
-    for (i < p.topo_len) {
+    for (i < ctx.stale_len) {
         val slot: *PcgSlot = ?ctx.slots[i::usize];
-        val w:    *PcgWorker = ?ctx.workers[slot.worker::usize];
         val rehomed: R.Result[of.ObjectImage, str] =
             obj.rehome_remap(p.s.alloc, ?p.s.interner, slot.image, ctx.base_len, remaps[slot.worker]);
         if (R.is_err[of.ObjectImage, str](rehomed)) {
             pcg_free_remaps(p, ctx, remaps, nworkers);
-            A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+            A.deallocate[*intern.StrId](p.alloc, remaps, nworkers::usize);
             ret R.err[bool, str](R.unwrap_err[of.ObjectImage, str](rehomed));
         }
         val rbox: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](p.s.alloc, 1::usize);
@@ -1275,19 +1323,19 @@ fun pcg_collect(p: *driver.Project, ctx: *ParallelCodegen) R.Result[bool, str] {
             var tmp: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](rehomed);
             obj.dnit(?tmp);
             pcg_free_remaps(p, ctx, remaps, nworkers);
-            A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+            A.deallocate[*intern.StrId](p.alloc, remaps, nworkers::usize);
             ret R.err[bool, str](R.unwrap_err[*of.ObjectImage, str](rbox));
         }
         val box: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](rbox);
         box[0] = R.unwrap_ok[of.ObjectImage, str](rehomed);
 
-        val mid: session.ModuleId = p.topo[i];
+        val mid: session.ModuleId = p.topo[ctx.stale[i::usize]];
         p.modules[mid::u32].staged_image = box;
         i = i + 1;
     }
 
     pcg_free_remaps(p, ctx, remaps, nworkers);
-    A.deallocate[*intern.StrId](p.s.alloc, remaps, nworkers::usize);
+    A.deallocate[*intern.StrId](p.alloc, remaps, nworkers::usize);
     ret R.ok[bool, str](true);
 }
 
@@ -1302,7 +1350,7 @@ fun pcg_free_remaps(p: *driver.Project, ctx: *ParallelCodegen, remaps: **intern.
     for (wi < n) {
         if (remaps[wi] != nil) {
             val len: usize = intern.count(?workers_at(ctx, wi).sess.interner);
-            if (len > 0) { A.deallocate[intern.StrId](p.s.alloc, remaps[wi], len); }
+            if (len > 0) { A.deallocate[intern.StrId](p.alloc, remaps[wi], len); }
         }
         wi = wi + 1;
     }

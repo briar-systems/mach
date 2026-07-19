@@ -87,9 +87,11 @@ outside an engine call — is pointed at the per-call arena for the span of one 
 execution; the Project captures it at init, so the graph and every build-span
 transient die with the call while artifact internals (which computes build through
 `s.alloc` / the query DB's allocator) survive. The caller decides when the session —
-and therefore the cache — dies. A warm call always takes the serial incremental
-codegen path: the parallel prelude assumes a cold cache, so only the cold `execute`
-enables it.
+and therefore the cache — dies. Codegen adapts per module on every call: the parallel
+prelude probes each module's `Q_CODEGEN` (`peek_valid` — exactly `get`'s reuse test,
+read-only) and fans out only the stale remainder, staging results for the pass's
+adoption; a warm-valid module is served by the cache and never touched by a worker,
+and a cold cache degenerates to the full fan-out.
 
 ---
 

@@ -4097,6 +4097,102 @@ test "mach.lang.build.engine.execute_warm:unchanged_rebuild_reuses_and_stays_bou
     ret bad;
 }
 
+# warm engine under the parallel pool: with workers requested, a warm rebuild
+# after editing two module bodies fans out exactly the edited modules - their
+# staged images are adopted through Q_CODEGEN (revisions advance and the link
+# re-runs) while the untouched modules revalidate (revisions hold) and the
+# shard populations stay bounded
+test "mach.lang.build.engine.execute_warm:parallel_pool_rebuilds_only_stale_modules" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](driver.setup_registry(?s.registry))) { session.dnit(?s); ret 1; }
+
+    var names: [4]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach"; names[3] = "c.mach";
+    var texts: [4]str;
+    texts[0] = "use uniontest.a.fa;\nuse uniontest.b.fb;\nuse uniontest.c.fc;\n#[symbol(\"_start\")]\nfun start() i32 { ret fa() + fb() + fc(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+    texts[3] = "pub fun fc() i32 { ret 3; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 4);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    val mr: R.Result[manifest.Manifest, str] = driver.load_manifest(?s, root);
+    if (R.is_err[manifest.Manifest, str](mr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](mr);
+    var rq: request.BuildRequest = request.defaults();
+    rq.project_root = root;
+    rq.jobs         = 2;
+    val pr: R.Result[bplan.BuildPlan, outcome.Fail] = bplan.plan(?alloc, ?s.interner, ?s.registry, ?m, ?rq);
+    if (R.is_err[bplan.BuildPlan, outcome.Fail](pr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var bp: bplan.BuildPlan = R.unwrap_ok[bplan.BuildPlan, outcome.Fail](pr);
+
+    var bad: i32 = 0;
+
+    # build 1: cold cache, so every module is stale and the pool builds all four.
+    val r1: R.Result[outcome.BuildOutcome, outcome.Fail] = bengine.execute_warm(?bp, 0, ?s, ?alloc, nil, nil);
+    if (R.is_err[outcome.BuildOutcome, outcome.Fail](r1)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val bo1: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](r1);
+    if (!bo1.ok)                { bad = 1; }
+    if (bo1.artifacts.len != 1) { bad = 1; }
+    or (!fs.is_file(bo1.artifacts.data[0].path)) { bad = 1; }
+
+    val st_main: session.StableModuleId = ut_stable_of(?s, "uniontest.main");
+    val st_a:    session.StableModuleId = ut_stable_of(?s, "uniontest.a");
+    val st_b:    session.StableModuleId = ut_stable_of(?s, "uniontest.b");
+    val st_c:    session.StableModuleId = ut_stable_of(?s, "uniontest.c");
+    if (st_main == session.STABLE_MODULE_NIL || st_a == session.STABLE_MODULE_NIL
+        || st_b == session.STABLE_MODULE_NIL || st_c == session.STABLE_MODULE_NIL) { bad = 1; }
+
+    val cg_m_1: query.Revision = query.peek_revision(?s.queries, query.Q_CODEGEN, st_main::u64);
+    val cg_a_1: query.Revision = query.peek_revision(?s.queries, query.Q_CODEGEN, st_a::u64);
+    val cg_b_1: query.Revision = query.peek_revision(?s.queries, query.Q_CODEGEN, st_b::u64);
+    val cg_c_1: query.Revision = query.peek_revision(?s.queries, query.Q_CODEGEN, st_c::u64);
+    val lk_1:   query.Revision = query.peek_revision(?s.queries, query.Q_LINK, 0);
+    if (cg_m_1 == 0 || cg_a_1 == 0 || cg_b_1 == 0 || cg_c_1 == 0 || lk_1 == 0) { bad = 1; }
+    val n_cg_1: u32 = ut_shard_len(?s, query.Q_CODEGEN);
+
+    # build 2: nothing changed - the pool sees zero stale modules and every
+    # entry revalidates.
+    val r2: R.Result[outcome.BuildOutcome, outcome.Fail] = bengine.execute_warm(?bp, 0, ?s, ?alloc, nil, nil);
+    if (R.is_err[outcome.BuildOutcome, outcome.Fail](r2)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    if (!R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](r2).ok) { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_CODEGEN, st_a::u64) != cg_a_1) { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_CODEGEN, st_c::u64) != cg_c_1) { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_LINK, 0)            != lk_1)   { bad = 1; }
+
+    # build 3: edit the bodies of a and c - two stale modules, so the pool
+    # engages. exactly a and c re-codegen; main and b are cache-served.
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val a_path:  str = ut_cc3(?alloc, src_dir, "/", "a.mach");
+    val c_path:  str = ut_cc3(?alloc, src_dir, "/", "c.mach");
+    val a_v2: str = "pub fun fa() i32 { val t: i32 = 1; ret t; }\n";
+    val c_v2: str = "pub fun fc() i32 { val t: i32 = 3; ret t; }\n";
+    if (O.is_some[str](fs.write_bytes(a_path, a_v2, str_len(a_v2), 420))) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    if (O.is_some[str](fs.write_bytes(c_path, c_v2, str_len(c_v2), 420))) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+
+    val r3: R.Result[outcome.BuildOutcome, outcome.Fail] = bengine.execute_warm(?bp, 0, ?s, ?alloc, nil, nil);
+    if (R.is_err[outcome.BuildOutcome, outcome.Fail](r3)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val bo3: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](r3);
+    if (!bo3.ok) { bad = 1; }
+    if (bo3.artifacts.len != 1) { bad = 1; }
+    or (!fs.is_file(bo3.artifacts.data[0].path)) { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_CODEGEN, st_a::u64)    == cg_a_1) { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_CODEGEN, st_c::u64)    == cg_c_1) { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_CODEGEN, st_main::u64) != cg_m_1) { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_CODEGEN, st_b::u64)    != cg_b_1) { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_LINK, 0)               == lk_1)   { bad = 1; }
+    if (ut_shard_len(?s, query.Q_CODEGEN) != n_cg_1) { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    session.dnit(?s);
+    ret bad;
+}
+
 # warm replacement of a Q_CODEGEN image must not free borrowed storage: a
 # string-literal global's section bytes are interner-owned (the VAL_CONST_BYTES
 # borrows them), so a replaced image's obj.dnit freeing them as image-owned
