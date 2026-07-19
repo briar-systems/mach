@@ -24,9 +24,11 @@ use std.text.string.str_free;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_empty;
 
+use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
@@ -34,6 +36,7 @@ use std.data.toml;
 
 use be_linker: mach.lang.be.linker;
 use mach.lang.build.outcome;
+use mach.lang.build.qctx;
 use mach.lang.build.request;
 use mach.lang.intern;
 use mach.lang.manifest;
@@ -177,7 +180,6 @@ pub fun begin_build(s: *session.Session, m: *manifest.Manifest, req: *request.Bu
 fun begin_build_impl(s: *session.Session, project_root: str, sel: *manifest.Selection, m: *manifest.Manifest, req: *request.BuildRequest, ev: *readout.Progress, for_union: bool, all_own_src: bool) R.Result[project.Project, outcome.Fail] {
     var p: project.Project;
     project.init_project(?p, s);
-    if (req != nil) { p.req = @req; }
     p.events      = ev;
     p.all_own_src = all_own_src;
 
@@ -217,16 +219,55 @@ fun begin_build_impl(s: *session.Session, project_root: str, sel: *manifest.Sele
         ret R.err[project.Project, outcome.Fail](outcome.user("internal: manifest selected no target"));
     }
 
-    # a legacy entry (doc, union, driver tests) builds without a composed
-    # request: install the internal default, settled against the selected
-    # target's profile opt so `$mach.build.mode` folds exactly as before.
-    # jobs stays 0 - the serial-incremental posture tooling relies on.
+    # a legacy entry (doc, union, driver tests) builds without a composed request:
+    # install the internal default through a session-owned QueryCtx, settled against
+    # the selected target's profile opt so `$mach.build.mode` folds exactly as before.
+    # jobs stays 0 - the serial-incremental posture tooling relies on. an engine unit
+    # arrives with its composed request and installs its own QueryCtx.
     if (req == nil) {
-        p.req.project_root = project_root;
-        if (te.opt == project.TARGET_OPT_RELEASE) { p.req.opt = pipeline.OPT_RELEASE; }
+        val dc_r: R.Result[bool, str] = install_default_ctx(s, project_root, te.opt == project.TARGET_OPT_RELEASE);
+        if (R.is_err[bool, str](dc_r)) {
+            project.dnit_project(?p);
+            ret R.err[project.Project, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](dc_r)));
+        }
     }
 
     ret R.ok[project.Project, outcome.Fail](p);
+}
+
+# install the driver's internal default request through a session-owned QueryCtx
+# for a legacy build (doc, union, driver tests) that carries no composed request
+#
+# The QueryCtx and its request live on the session allocator for the build's span;
+# both are reused across rebuilds of a long-lived session, so repeated legacy builds
+# allocate them once. The pass drivers point the ctx at the active project each pass;
+# `jobs` stays 0 (the serial tooling posture). An engine unit never reaches here - it
+# installs its own arena-local QueryCtx over its composed request.
+# ---
+# s:            the build session (owns the QueryCtx + request storage)
+# project_root: the request's project root
+# opt_release:  true when the selected target's profile opt is release
+# ret:          ok(true), or an allocation error
+fun install_default_ctx(s: *session.Session, project_root: str, opt_release: bool) R.Result[bool, str] {
+    var qc: *qctx.QueryCtx = s.queries.ctx::*qctx.QueryCtx;
+    if (qc == nil) {
+        val qc_r: R.Result[*qctx.QueryCtx, str] = A.allocate[qctx.QueryCtx](s.alloc, 1::usize);
+        if (R.is_err[*qctx.QueryCtx, str](qc_r)) { ret R.err[bool, str]("out of memory installing query context"); }
+        qc     = R.unwrap_ok[*qctx.QueryCtx, str](qc_r);
+        qc.req = nil;
+        query.set_ctx(?s.queries, qc::ptr);
+    }
+    if (qc.req == nil) {
+        val rq_r: R.Result[*request.BuildRequest, str] = A.allocate[request.BuildRequest](s.alloc, 1::usize);
+        if (R.is_err[*request.BuildRequest, str](rq_r)) { ret R.err[bool, str]("out of memory installing default request"); }
+        qc.req = R.unwrap_ok[*request.BuildRequest, str](rq_r);
+    }
+    @qc.req = request.defaults();
+    qc.req.project_root = project_root;
+    if (opt_release) { qc.req.opt = pipeline.OPT_RELEASE; }
+    qc.s = s;
+    qc.p = nil;
+    ret R.ok[bool, str](true);
 }
 
 # the PH_STEPS phase: run the root project's demanded user-defined build steps
@@ -234,7 +275,8 @@ fun begin_build_impl(s: *session.Session, project_root: str, sel: *manifest.Sele
 # p:   the opened project
 # ret: ok(true), or the first step failure
 pub fun run_steps_phase(p: *project.Project) R.Result[bool, outcome.Fail] {
-    val res_steps: R.Result[bool, str] = dcfg.execute_steps(p.s.alloc, p, p.req.project_root);
+    val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
+    val res_steps: R.Result[bool, str] = dcfg.execute_steps(p.s.alloc, p, ctx.req.project_root);
     if (R.is_err[bool, str](res_steps)) {
         ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](res_steps)));
     }
@@ -408,17 +450,18 @@ pub fun build_project_union(s: *session.Session, project_root: str) R.Result[pro
     ret build_project_impl(s, project_root, ?sel, nil, nil, true, false, false);
 }
 
-# bind the query db's compute context to the session and register the
-# front-half kind the load walk itself demands (Q_PARSE, an opaque owned handle
-# keyed by FileId). set_ctx is refreshed every build (the session address is
-# stable); the registration is once per session. every later derived kind is
-# registered by the pass that binds its compute (run_resolve_pass and the
-# back-half passes), so each phase owns its own query binding
+# bind the query db's diagnostic hooks and register the front-half kind the load
+# walk itself demands (Q_PARSE, an opaque owned handle keyed by FileId). the
+# per-unit QueryCtx (db.ctx) is installed by the driving entry, not here - the
+# engine per unit, the legacy entries through install_default_ctx. the diag hooks
+# are refreshed every build (the session address is stable); the registration is
+# once per session. every later derived kind is registered by the pass that binds
+# its compute (run_resolve_pass and the back-half passes), so each phase owns its
+# own query binding
 fun bind_queries(s: *session.Session) R.Result[bool, str] {
-    query.set_ctx(?s.queries, s::ptr);
     # bridge the session diagnostic sink to the engine so a reused phase replays
-    # the diagnostics it emitted when computed (#1586). refreshed every build like
-    # set_ctx; the session address is stable.
+    # the diagnostics it emitted when computed (#1586). refreshed every build; the
+    # session address is stable.
     query.set_diag_hooks(?s.queries, dq.diag_mark_hook, dq.diag_capture_hook, dq.diag_replay_hook, dq.diag_free_hook);
     if (!query.is_registered(?s.queries, query.Q_PARSE)) {
         val rp: R.Result[bool, str] = query.register_derived_owned(?s.queries, query.Q_PARSE, load.q_parse_compute, load.q_parse_finalize);
@@ -430,7 +473,7 @@ fun bind_queries(s: *session.Session) R.Result[bool, str] {
 # the diagnostics-as-query-output hooks the query engine calls to capture the
 # diagnostics a derived compute emits onto the session sink and replay them on a
 # reused get (#1586). the engine is diagnostic-agnostic; these cast db.ctx back to
-# the session and bridge its `diags` sink. a captured snapshot is a heap
+# the QueryCtx and bridge its session's `diags` sink. a captured snapshot is a heap
 # diagnostic.DiagList the query entry owns and the engine frees through
 # diag_free_hook.
 
