@@ -154,3 +154,29 @@ This stage ships last and only with measurements from a real warm consumer.
 Gates throughout: full suite, int leg, self-build fixpoint and timing; stage 2 must
 show zero behavioral delta for cold builds; stage 3 adds the first warm-session
 regression tests. The mach-lsp pin sees only additive API until it advances.
+
+---
+
+## Constraint: `fin` runs before a ret-position call
+
+A longstanding compiler bug (present in the seed, not introduced by this work): with
+an active `fin`, a call in `ret f(...)` position evaluates **after** the `fin` block
+runs. Minimal repro (verified against seed 3.6.1):
+
+```mach
+var g: i64 = 5;
+fun read_g() i64 { ret g; }
+fun probe() i64 {
+    fin { g = 0; }
+    ret read_g();   # returns 0 - the fin ran first; binding read_g() to a
+                    # local before the ret returns 5, the correct semantics
+}
+```
+
+Consequence for this design: any scope holding a teardown `fin` (the warm engine's
+per-call arena, the editor build's build-span arena) must **bind** a call's result to
+a local and `ret` the local - a `ret <call>(...)` would run the callee over state the
+fin already tore down (e.g. rendering a failure message composed on the freed arena).
+The engine and editor sites carry `bind before ret` comments marking the constraint.
+Fixing the compiler's fin/ret ordering is a separate scheduled program; until it
+lands, treat ret-position calls under an active `fin` as a defect in review.
