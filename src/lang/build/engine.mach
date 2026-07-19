@@ -11,6 +11,20 @@
 # `readout.Progress` sink and render-worthy moments (unit banners, failures,
 # diagnostics flushes, the scalarization note) through the `outcome.Render`
 # seam, so rendering stays with the CLI.
+#
+# `execute_warm` is the same unit execution over a caller-owned session that
+# survives the call, so unchanged modules revalidate through the query cache
+# instead of recomputing. Allocation-channel policy: the session allocator
+# (`s.alloc`, also the query DB's) holds everything that must outlive the call -
+# the services and every query-owned artifact - while the Project graph and all
+# build-span transients allocate through the session's per-build channel
+# (`s.build_alloc`), which the warm entry points at a page-backed per-call arena
+# and tears down before returning, so a warm session does not grow per rebuild.
+# The cold `execute` reduces to today's exact contract: a fresh session per
+# unit over one arena, both channels initially identical, everything torn down
+# together between cells. A warm call always takes the serial incremental
+# codegen path - the parallel prelude assumes a cold cache (it stages images a
+# warm-valid Q_CODEGEN would never adopt), so only the cold entry enables it.
 
 use std.allocator.arena;
 use std.allocator.page;
@@ -49,6 +63,7 @@ use mach.lang.me.ir;
 use mach.lang.query;
 use mach.lang.readout;
 use mach.lang.session;
+use mach.lang.target.isa;
 use mach.lang.target.of;
 
 # one unit's execution state, threaded across the phase dispatch
@@ -70,6 +85,9 @@ use mach.lang.target.of;
 # scope:        the test collection state (tests goals only)
 # link_started: the link narration span is open (its begin fired)
 # t_link:       the link item's start instant (paired with `link_started`)
+# parallel:     the parallel-codegen prelude is permitted - set only by the cold
+#               entry; a warm session keeps the serial incremental path (see
+#               run_codegen_parallel's cold-cache contract)
 rec UnitState {
     irs:          *ir.Module;
     ir_ready:     *bool;
@@ -86,6 +104,7 @@ rec UnitState {
 
     link_started: bool;
     t_link:       ctime.Time;
+    parallel:     bool;
 }
 
 # execute the resolved plan: every unit, one after another, each in its own
@@ -119,17 +138,88 @@ pub fun execute(bp: *plan.BuildPlan, backing: *A.Allocator, oa: *A.Allocator,
         val unit: *plan.BuildUnit = ?bp.units.data[i];
         outcome.render_unit(rd, unit.sel_artifact, unit.sel_target, unit.has_artifact);
 
-        val ur: R.Result[bool, outcome.Fail] = execute_unit(bp, unit, backing, oa, ev, rd, ?bo);
-        if (R.is_err[bool, outcome.Fail](ur)) {
+        val ur: R.Result[outcome.BuildOutcome, outcome.Fail] = execute_unit_cold(bp, i, backing, oa, ev, rd);
+        if (R.is_err[outcome.BuildOutcome, outcome.Fail](ur)) {
             # the failure was already rendered where it landed; fold the exit
             # derivation - the first failing unit decides the class.
-            val f: outcome.Fail = R.unwrap_err[bool, outcome.Fail](ur);
+            val f: outcome.Fail = R.unwrap_err[outcome.BuildOutcome, outcome.Fail](ur);
             if (bo.ok) { bo.internal = f.internal; }
             bo.ok = false;
+        }
+        or {
+            var ubo: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](ur);
+            merge_outcome(?bo, ?ubo, bp.request.goal);
         }
         i = i + 1;
     }
     ret R.ok[outcome.BuildOutcome, outcome.Fail](bo);
+}
+
+# fold one unit's outcome into the invocation aggregate
+#
+# Failure classing matches the historical single-outcome fold: the first failing
+# unit decides `internal`. Artifacts and tests append in unit order; the skip
+# count is an assignment on test goals only, which plan exactly one unit. The
+# unit outcome's vectors are consumed (their backing freed) by the merge.
+fun merge_outcome(agg: *outcome.BuildOutcome, ubo: *outcome.BuildOutcome, goal: request.BuildGoal) {
+    if (!ubo.ok) {
+        if (agg.ok) { agg.internal = ubo.internal; }
+        agg.ok = false;
+    }
+    var i: usize = 0;
+    for (i < ubo.artifacts.len) {
+        val pr: R.Result[usize, str] = vector.push[outcome.Artifact](?agg.artifacts, ubo.artifacts.data[i]);
+        if (R.is_err[usize, str](pr)) { agg.ok = false; agg.internal = true; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < ubo.tests.len) {
+        val pr: R.Result[usize, str] = vector.push[outcome.TestArtifact](?agg.tests, ubo.tests.data[i]);
+        if (R.is_err[usize, str](pr)) { agg.ok = false; agg.internal = true; }
+        i = i + 1;
+    }
+    if (request.test_goal(goal)) { agg.tests_skipped = ubo.tests_skipped; }
+    vector.dnit[outcome.Artifact](?ubo.artifacts);
+    vector.dnit[outcome.TestArtifact](?ubo.tests);
+}
+
+# the cold per-unit run: a fresh arena-backed session for one cell, the warm
+# entry over it, then the whole cell torn down - today's per-unit contract
+# expressed over the warm path (both session channels start on the unit arena)
+fun execute_unit_cold(bp: *plan.BuildPlan, unit_index: usize, backing: *A.Allocator,
+                      oa: *A.Allocator, ev: *readout.Progress, rd: *outcome.Render)
+                      R.Result[outcome.BuildOutcome, outcome.Fail] {
+    var u_ar: arena.Arena;
+    if (O.is_some[str](arena.init(?u_ar, backing, 0))) {
+        ret cold_fail(rd, outcome.internal("failed to initialise allocator"));
+    }
+    var u_alloc: A.Allocator;
+    if (O.is_some[str](arena.make(?u_alloc, ?u_ar))) {
+        arena.dnit(?u_ar);
+        ret cold_fail(rd, outcome.internal("failed to initialise allocator"));
+    }
+
+    val res_session: R.Result[session.Session, str] = session.init(?u_alloc);
+    if (R.is_err[session.Session, str](res_session)) {
+        val f: outcome.Fail = outcome.internal(join_msg(?u_alloc, "failed to initialise compiler session: ", R.unwrap_err[session.Session, str](res_session)));
+        val r: R.Result[outcome.BuildOutcome, outcome.Fail] = cold_fail(rd, f);
+        arena.dnit(?u_ar);
+        ret r;
+    }
+    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
+
+    val r: R.Result[outcome.BuildOutcome, outcome.Fail] = execute_warm_impl(bp, unit_index, ?s, oa, ev, rd, true);
+
+    session.dnit(?s);
+    arena.dnit(?u_ar);
+    ret r;
+}
+
+# render an invocation-level cold failure through the seam and return it
+fun cold_fail(rd: *outcome.Render, f: outcome.Fail) R.Result[outcome.BuildOutcome, outcome.Fail] {
+    var fv: outcome.Fail = f;
+    outcome.render_fail(rd, ?fv);
+    ret R.err[outcome.BuildOutcome, outcome.Fail](fv);
 }
 
 # concatenate `va` into one owned message string on `al`, for a Fail's message
@@ -143,98 +233,124 @@ fun join_msg(al: *A.Allocator, va: ...) str {
     ret R.unwrap_ok[str, str](r);
 }
 
-# render a failure through the seam and return it as the unit's error
-fun unit_fail(rd: *outcome.Render, f: outcome.Fail) R.Result[bool, outcome.Fail] {
-    var fv: outcome.Fail = f;
-    outcome.render_fail(rd, ?fv);
-    ret R.err[bool, outcome.Fail](fv);
+# execute one unit of `bp` inside a caller-owned session
+#
+# The warm counterpart to `execute`: the caller's session (and its query
+# database) persists across calls, so unchanged modules revalidate instead of
+# recomputing. The caller owns session lifetime; the engine installs the unit's
+# QueryCtx, runs the unit's phases, and leaves the cache warm. Per-call
+# transients - the manifest parse, the Project graph, the cell request, the
+# engine's view state - land on a page-backed per-call arena installed as the
+# session's build channel and torn down before return; query-owned artifacts
+# stay on the session allocator. The diagnostic sink is reset at entry (a
+# fresh session's is already empty), the unit QueryCtx is uninstalled at exit,
+# and the codegen path is always the serial incremental one. Failures render
+# through `rd` where they land and fold into the returned outcome
+# (`ok`/`internal`), mirroring `execute`.
+# ---
+# bp:   the resolved plan
+# unit: index of the plan unit to execute
+# s:    the caller-owned session the unit runs in
+# oa:   the outcome allocator - everything the caller keeps lands here
+# ev:   the progress-event sink (`-v` narration), or nil for silence
+# rd:   the render seam (banners, notes, failures, diagnostics), or nil
+# ret:  the executed unit's outcome; err only for an invocation-level fault
+#       that produced no outcome (a bad unit index)
+pub fun execute_warm(bp: *plan.BuildPlan, unit: usize, s: *session.Session, oa: *A.Allocator,
+                     ev: *readout.Progress, rd: *outcome.Render) R.Result[outcome.BuildOutcome, outcome.Fail] {
+    ret execute_warm_impl(bp, unit, s, oa, ev, rd, false);
 }
 
-# execute one plan unit: fresh session over a fresh arena, the cell's derived
-# request, then the unit's phase vector dispatched in order
-#
-# Any failure is rendered here - the failure event first, then the unit
-# session's diagnostics flush when the session is live - so the error text
-# interleaves with the narration exactly where it happened. The returned Fail
-# is already rendered; the caller only folds it into the outcome.
-# ---
-# bp:      the plan (for the invocation request)
-# unit:    the cell to execute
-# backing: allocator the unit arena draws from
-# oa:      the outcome allocator
-# ev:      the progress-event sink, or nil
-# rd:      the render seam, or nil
-# bo:      the outcome under construction (artifacts, tests)
-# ret:     ok(true), or the rendered failure
-fun execute_unit(bp: *plan.BuildPlan, unit: *plan.BuildUnit, backing: *A.Allocator,
-                 oa: *A.Allocator, ev: *readout.Progress, rd: *outcome.Render,
-                 bo: *outcome.BuildOutcome) R.Result[bool, outcome.Fail] {
-    # the unit arena: every session-side allocation of this cell lands here and
-    # is reclaimed in one teardown before the next cell.
-    var u_ar: arena.Arena;
-    if (O.is_some[str](arena.init(?u_ar, backing, 0))) {
-        ret unit_fail(rd, outcome.internal("failed to initialise allocator"));
+# the shared unit execution behind `execute_warm` (serial) and the cold
+# per-unit wrapper (`parallel` permits the cold-cache parallel-codegen prelude)
+fun execute_warm_impl(bp: *plan.BuildPlan, unit_index: usize, s: *session.Session, oa: *A.Allocator,
+                      ev: *readout.Progress, rd: *outcome.Render, parallel: bool)
+                      R.Result[outcome.BuildOutcome, outcome.Fail] {
+    if (unit_index >= bp.units.len) {
+        ret R.err[outcome.BuildOutcome, outcome.Fail](outcome.internal("build unit index out of range"));
     }
-    var u_alloc: A.Allocator;
-    if (O.is_some[str](arena.make(?u_alloc, ?u_ar))) {
-        arena.dnit(?u_ar);
-        ret unit_fail(rd, outcome.internal("failed to initialise allocator"));
+    val unit: *plan.BuildUnit = ?bp.units.data[unit_index];
+
+    var bo: outcome.BuildOutcome;
+    bo.ok            = true;
+    bo.internal      = false;
+    bo.artifacts     = vector.init[outcome.Artifact](oa);
+    bo.tests         = vector.init[outcome.TestArtifact](oa);
+    bo.tests_skipped = 0;
+
+    # a warm session still carries the previous call's rendered diagnostics;
+    # reset the sink so this call flushes only its own. a no-op on a fresh
+    # (cold) session, whose sink is empty.
+    diagnostic.dnit(?s.diags);
+    s.diags = diagnostic.init(s.alloc);
+
+    # the per-call arena: every build-span transient of this call lands here
+    # and is reclaimed in one teardown before return, while the session (and
+    # its query-owned artifacts) survives. a private page backing, so teardown
+    # returns the chunks to the OS regardless of what backs the session.
+    var call_backing: A.Allocator;
+    if (O.is_some[str](page.make(?call_backing))) {
+        ret warm_fail(rd, ?bo, outcome.internal("failed to initialise allocator"));
+    }
+    var call_ar: arena.Arena;
+    if (O.is_some[str](arena.init(?call_ar, ?call_backing, 0))) {
+        ret warm_fail(rd, ?bo, outcome.internal("failed to initialise allocator"));
+    }
+    var call_alloc: A.Allocator;
+    if (O.is_some[str](arena.make(?call_alloc, ?call_ar))) {
+        arena.dnit(?call_ar);
+        ret warm_fail(rd, ?bo, outcome.internal("failed to initialise allocator"));
     }
 
-    val res_session: R.Result[session.Session, str] = session.init(?u_alloc);
-    if (R.is_err[session.Session, str](res_session)) {
-        val f: outcome.Fail = outcome.internal(join_msg(?u_alloc, "failed to initialise compiler session: ", R.unwrap_err[session.Session, str](res_session)));
-        arena.dnit(?u_ar);
-        ret unit_fail(rd, f);
+    # install the per-call build channel; the prior channel (the session
+    # allocator outside an engine call) is restored on every exit path.
+    val prior_build: *A.Allocator = s.build_alloc;
+    s.build_alloc = ?call_alloc;
+    fin {
+        s.build_alloc = prior_build;
+        arena.dnit(?call_ar);
     }
-    var s: session.Session = R.unwrap_ok[session.Session, str](res_session);
 
-    val res_register: R.Result[bool, str] = driver.setup_registry(?s.registry);
-    if (R.is_err[bool, str](res_register)) {
-        val f: outcome.Fail = outcome.internal(R.unwrap_err[bool, str](res_register));
-        session.dnit(?s);
-        arena.dnit(?u_ar);
-        ret unit_fail(rd, f);
+    # registry bring-up once per session: a fresh cold session registers here;
+    # a warm caller's already-populated registry is left alone.
+    if (isa.registered_count(?s.registry.isa) == 0) {
+        val res_register: R.Result[bool, str] = driver.setup_registry(?s.registry);
+        if (R.is_err[bool, str](res_register)) {
+            ret warm_fail(rd, ?bo, outcome.internal(R.unwrap_err[bool, str](res_register)));
+        }
     }
 
     # the ONE manifest load of this unit: the driver builds the project from
-    # the same parsed value; nothing downstream re-parses it.
-    val res_manifest: R.Result[manifest.Manifest, str] = driver.load_manifest(?s, bp.request.project_root);
+    # the same parsed value; nothing downstream re-parses it. its storage is
+    # per-call (the build channel).
+    val res_manifest: R.Result[manifest.Manifest, str] = driver.load_manifest(s, bp.request.project_root);
     if (R.is_err[manifest.Manifest, str](res_manifest)) {
-        val f: outcome.Fail = outcome.user(R.unwrap_err[manifest.Manifest, str](res_manifest));
-        session.dnit(?s);
-        arena.dnit(?u_ar);
-        ret unit_fail(rd, f);
+        ret warm_fail(rd, ?bo, outcome.user(R.unwrap_err[manifest.Manifest, str](res_manifest)));
     }
     var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](res_manifest);
 
     # the cell's request: the invocation request with the cell's selection
-    # swapped in - request-lifetime data, boxed on the unit arena because the
-    # project borrows it for the unit's whole span.
-    val res_rq: R.Result[*request.BuildRequest, str] = A.allocate[request.BuildRequest](?u_alloc, 1::usize);
+    # swapped in - request-lifetime data, boxed on the per-call arena because
+    # the project borrows it for the unit's whole span.
+    val res_rq: R.Result[*request.BuildRequest, str] = A.allocate[request.BuildRequest](s.build_alloc, 1::usize);
     if (R.is_err[*request.BuildRequest, str](res_rq)) {
-        session.dnit(?s);
-        arena.dnit(?u_ar);
-        ret unit_fail(rd, outcome.internal("out of memory"));
+        ret warm_fail(rd, ?bo, outcome.internal("out of memory"));
     }
     val reqp: *request.BuildRequest = R.unwrap_ok[*request.BuildRequest, str](res_rq);
     @reqp = request.for_cell(bp.request, unit.sel_target, unit.sel_artifact, unit.want_lib);
 
-    val begin_r: R.Result[driver.Project, outcome.Fail] = driver.begin_build(?s, ?m, reqp, ev);
+    val begin_r: R.Result[driver.Project, outcome.Fail] = driver.begin_build(s, ?m, reqp, ev);
     if (R.is_err[driver.Project, outcome.Fail](begin_r)) {
-        val f: outcome.Fail = R.unwrap_err[driver.Project, outcome.Fail](begin_r);
-        session.dnit(?s);
-        arena.dnit(?u_ar);
-        ret unit_fail(rd, f);
+        ret warm_fail(rd, ?bo, R.unwrap_err[driver.Project, outcome.Fail](begin_r));
     }
     var p: driver.Project = R.unwrap_ok[driver.Project, outcome.Fail](begin_r);
 
     # the unit's QueryCtx: the view every compute and pass driver reaches through
-    # db.ctx. the session and cell request are stable for the unit's whole span (both
-    # arena-local alongside the session); the pass drivers point `p` at the active
-    # project each pass.
+    # db.ctx. stack-local to this call, so it is uninstalled before return - a
+    # later legacy build on the same session installs its own; the pass drivers
+    # point `p` at the active project each pass.
     var qc: qctx.QueryCtx;
-    qc.s   = ?s;
+    qc.s   = s;
     qc.p   = ?p;
     qc.req = reqp;
     query.set_ctx(?s.queries, (?qc)::ptr);
@@ -254,13 +370,14 @@ fun execute_unit(bp: *plan.BuildPlan, unit: *plan.BuildUnit, backing: *A.Allocat
     st.scope.sel_len = 0;
     st.scope.skipped = 0;
     st.link_started = false;
+    st.parallel     = parallel;
 
     # the unit's execution IS its phase vector: dispatch each phase in order,
     # stopping at the first failure.
     var result: R.Result[bool, outcome.Fail] = R.ok[bool, outcome.Fail](true);
     var pi: usize = 0;
     for (pi < unit.phases.len) {
-        result = run_phase(unit.phases.data[pi], ?p, unit, ?st, bo, oa, ev, rd);
+        result = run_phase(unit.phases.data[pi], ?p, unit, ?st, ?bo, oa, ev, rd);
         if (R.is_err[bool, outcome.Fail](result)) { brk; }
         pi = pi + 1;
     }
@@ -268,11 +385,11 @@ fun execute_unit(bp: *plan.BuildPlan, unit: *plan.BuildUnit, backing: *A.Allocat
     # a test-list goal compiles only; the collection is the goal's outcome,
     # assembled once the phases are done.
     if (R.is_ok[bool, outcome.Fail](result) && reqp.goal == request.GOAL_TEST_LIST) {
-        result = list_tests(?p, ?st, bo, oa);
+        result = list_tests(?p, ?st, ?bo, oa);
     }
 
     if (R.is_ok[bool, outcome.Fail](result)) {
-        result = record_artifact(?p, unit, ?st, bo);
+        result = record_artifact(?p, unit, ?st, ?bo);
     }
 
     if (R.is_err[bool, outcome.Fail](result)) {
@@ -284,18 +401,28 @@ fun execute_unit(bp: *plan.BuildPlan, unit: *plan.BuildUnit, backing: *A.Allocat
     }
 
     # rendering the unit's located diagnostics needs the live session, so the
-    # flush event fires before teardown; the unit arena then reclaims the
-    # cell's memory wholesale (the RFC's unit-arena teardown between cells).
-    outcome.render_diags(rd, (?s)::ptr);
+    # flush event fires before teardown; the per-call arena then reclaims the
+    # cell's transients wholesale while the warm cache stays.
+    outcome.render_diags(rd, s::ptr);
     btest.free_scope(?p, ?st.scope);
     driver.dnit_project(?p);
-    session.dnit(?s);
-    arena.dnit(?u_ar);
+    query.set_ctx(?s.queries, nil);
 
     if (R.is_err[bool, outcome.Fail](result)) {
-        ret R.err[bool, outcome.Fail](R.unwrap_err[bool, outcome.Fail](result));
+        val f: outcome.Fail = R.unwrap_err[bool, outcome.Fail](result);
+        bo.ok       = false;
+        bo.internal = f.internal;
     }
-    ret R.ok[bool, outcome.Fail](true);
+    ret R.ok[outcome.BuildOutcome, outcome.Fail](bo);
+}
+
+# render a unit-scoped failure through the seam and fold it into the outcome
+fun warm_fail(rd: *outcome.Render, bo: *outcome.BuildOutcome, f: outcome.Fail) R.Result[outcome.BuildOutcome, outcome.Fail] {
+    var fv: outcome.Fail = f;
+    outcome.render_fail(rd, ?fv);
+    bo.ok       = false;
+    bo.internal = fv.internal;
+    ret R.ok[outcome.BuildOutcome, outcome.Fail](@bo);
 }
 
 # dispatch one phase of the unit's vector
@@ -334,19 +461,19 @@ fun ensure_views(p: *driver.Project, st: *UnitState) R.Result[bool, outcome.Fail
     if (st.irs != nil) { ret R.ok[bool, outcome.Fail](true); }
     val n: usize = p.module_len::usize;
 
-    val res_irs: R.Result[*ir.Module, str] = A.allocate[ir.Module](p.s.alloc, n);
+    val res_irs: R.Result[*ir.Module, str] = A.allocate[ir.Module](p.alloc, n);
     if (R.is_err[*ir.Module, str](res_irs)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
     st.irs = R.unwrap_ok[*ir.Module, str](res_irs);
 
-    val res_ir_ready: R.Result[*bool, str] = A.allocate[bool](p.s.alloc, n);
+    val res_ir_ready: R.Result[*bool, str] = A.allocate[bool](p.alloc, n);
     if (R.is_err[*bool, str](res_ir_ready)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
     st.ir_ready = R.unwrap_ok[*bool, str](res_ir_ready);
 
-    val res_images: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](p.s.alloc, n);
+    val res_images: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](p.alloc, n);
     if (R.is_err[*of.ObjectImage, str](res_images)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
     st.images = R.unwrap_ok[*of.ObjectImage, str](res_images);
 
-    val res_image_ready: R.Result[*bool, str] = A.allocate[bool](p.s.alloc, n);
+    val res_image_ready: R.Result[*bool, str] = A.allocate[bool](p.alloc, n);
     if (R.is_err[*bool, str](res_image_ready)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
     st.image_ready = R.unwrap_ok[*bool, str](res_image_ready);
 
@@ -421,7 +548,9 @@ fun codegen_phase(p: *driver.Project, st: *UnitState) R.Result[bool, outcome.Fai
     # build keeps the serial path: its DWARF interns IR types into each
     # module's type table through the shared session allocator, which the
     # worker arenas do not isolate (#1826 parallel-lowering/-g follow-up).
-    if (pcg_enabled(p)) {
+    # a warm call never runs the prelude (st.parallel is false): it assumes a
+    # cold cache, staging images a warm-valid Q_CODEGEN would never adopt.
+    if (st.parallel && pcg_enabled(p)) {
         val rp: R.Result[bool, str] = run_codegen_parallel(p);
         if (R.is_err[bool, str](rp)) {
             ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](rp)));
@@ -581,7 +710,7 @@ fun link_phase(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState,
     if (R.is_err[bool, outcome.Fail](ext_r)) { ret ext_r; }
 
     val artifact: str = unit.out_path;
-    if (O.is_some[str](emit.ensure_parents(p.s.alloc, artifact))) {
+    if (O.is_some[str](emit.ensure_parents(p.alloc, artifact))) {
         ret R.err[bool, outcome.Fail](outcome.internal("failed to create binary directory"));
     }
 
@@ -619,7 +748,7 @@ fun link_flat(p: *driver.Project, unit: *plan.BuildUnit, st: *UnitState, ev: *re
     begin_link_narration(st, ev);
 
     val artifact: str = unit.out_path;
-    if (O.is_some[str](emit.ensure_parents(p.s.alloc, artifact))) {
+    if (O.is_some[str](emit.ensure_parents(p.alloc, artifact))) {
         ret R.err[bool, outcome.Fail](outcome.internal("failed to create binary directory"));
     }
 
@@ -740,19 +869,19 @@ pub fun set_link_config_input(p: *driver.Project, out_path: *u8, product: *u8, o
                               ext_paths: **u8, ext_count: u32,
                               sonames: *intern.StrId, soname_count: u32) R.Result[bool, outcome.Fail] {
     var fb: dq.FpBuf;
-    fb.alloc = p.s.alloc;
+    fb.alloc = p.alloc;
     fb.buf   = nil;
     fb.len   = 0;
     fb.cap   = 0;
 
     val w: R.Result[bool, str] = write_link_config(?fb, p, out_path, product, out_kind, ext_paths, ext_count, sonames, soname_count);
     if (R.is_err[bool, str](w)) {
-        if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.s.alloc, fb.buf, fb.cap::usize); }
+        if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.alloc, fb.buf, fb.cap::usize); }
         ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](w)));
     }
 
     val si: R.Result[bool, str] = query.set_input(?p.s.queries, query.Q_LINK_CONFIG, 0, fb.buf, fb.len);
-    if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.s.alloc, fb.buf, fb.cap::usize); }
+    if (fb.buf != nil && fb.cap > 0) { A.deallocate[u8](p.alloc, fb.buf, fb.cap::usize); }
     if (R.is_err[bool, str](si)) { ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](si))); }
     ret R.ok[bool, outcome.Fail](true);
 }
@@ -783,7 +912,7 @@ fun write_link_config(fb: *dq.FpBuf, p: *driver.Project, out_path: *u8, product:
     var i: u32 = 0;
     for (i < ext_count) {
         val ap: R.Result[bool, str] = dq.fp_cstr(fb, ext_paths[i]);          if (R.is_err[bool, str](ap)) { ret ap; }
-        val ah: R.Result[bool, str] = dq.fp_file_content(fb, p.s.alloc, ext_paths[i]); if (R.is_err[bool, str](ah)) { ret ah; }
+        val ah: R.Result[bool, str] = dq.fp_file_content(fb, p.alloc, ext_paths[i]); if (R.is_err[bool, str](ah)) { ret ah; }
         i = i + 1;
     }
     val a5: R.Result[bool, str] = dq.fp_u32(fb, soname_count);        if (R.is_err[bool, str](a5)) { ret a5; }

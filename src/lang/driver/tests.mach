@@ -52,6 +52,7 @@ use ddep: mach.lang.driver.deps;
 use mach.lang.driver.union;
 use mach.lang.driver.passes;
 use bengine: mach.lang.build.engine;
+use bplan: mach.lang.build.plan;
 use dcfg: mach.lang.driver.config;
 use mach.lang.driver;
 
@@ -3967,5 +3968,131 @@ test "mach.lang.driver:secret_uni_field_secrecy" {
     if (!ut_sema_rejects("uni U { a: ^u32; b: u32; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
     if (!ut_sema_clean("uni U { a: ^u32; b: ^u32; }\nfun main() i32 { ret 0; }\n"))  { bad = 1; }
     if (!ut_sema_clean("uni U { a: u32; b: u32; }\nfun main() i32 { ret 0; }\n"))    { bad = 1; }
+    ret bad;
+}
+
+# the entry count of the session's shard for `kind` - the query-population probe
+# the warm-engine boundedness assertions read (a warm rebuild replaces entries in
+# place; it must never append)
+fun ut_shard_len(s: *session.Session, kind: query.QueryKind) u32 {
+    if (kind::u32 >= s.queries.kinds) { ret 0; }
+    ret s.queries.storage[kind::u32].len;
+}
+
+# the stable id already assigned to `fqn` on session `s`, without a live project
+# (the warm-engine test reads it after the per-call Project is torn down)
+fun ut_stable_of(s: *session.Session, fqn: str) session.StableModuleId {
+    val idr: R.Result[intern.StrId, str] = intern.intern(?s.interner, fqn);
+    if (R.is_err[intern.StrId, str](idr)) { ret session.STABLE_MODULE_NIL; }
+    ret session.stable_module_id_lookup(s, R.unwrap_ok[intern.StrId, str](idr));
+}
+
+# warm engine: two `execute_warm` calls on one session with unchanged inputs -
+# the second call revalidates instead of recomputing (per-module Q_SEMA /
+# Q_LOWER / Q_CODEGEN and the Q_LINK fingerprint keep their last_changed), and
+# the session stays bounded (interner, SourceMap, and query-shard entry counts
+# do not grow). a third call after an edit recomputes exactly the edited
+# module's back half and re-links, proving the observables are live
+test "mach.lang.build.engine.execute_warm:unchanged_rebuild_reuses_and_stays_bounded" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](driver.setup_registry(?s.registry))) { session.dnit(?s); ret 1; }
+
+    var names: [3]str;
+    names[0] = "main.mach"; names[1] = "a.mach"; names[2] = "b.mach";
+    var texts: [3]str;
+    # the scaffold vendors no std, so the fixture provides its own `_start` -
+    # the link resolves the entry symbol without the runtime library.
+    texts[0] = "use uniontest.a.fa;\nuse uniontest.b.fb;\n#[symbol(\"_start\")]\nfun start() i32 { ret fa() + fb(); }\n";
+    texts[1] = "pub fun fa() i32 { ret 1; }\n";
+    texts[2] = "pub fun fb() i32 { ret 2; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 3);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    # one plan for all three calls: default target (native), execute goal, serial.
+    val mr: R.Result[manifest.Manifest, str] = driver.load_manifest(?s, root);
+    if (R.is_err[manifest.Manifest, str](mr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](mr);
+    var rq: request.BuildRequest = request.defaults();
+    rq.project_root = root;
+    val pr: R.Result[bplan.BuildPlan, outcome.Fail] = bplan.plan(?alloc, ?s.interner, ?s.registry, ?m, ?rq);
+    if (R.is_err[bplan.BuildPlan, outcome.Fail](pr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var bp: bplan.BuildPlan = R.unwrap_ok[bplan.BuildPlan, outcome.Fail](pr);
+
+    var bad: i32 = 0;
+
+    # call 1: cold cache. the unit builds and links end to end.
+    val r1: R.Result[outcome.BuildOutcome, outcome.Fail] = bengine.execute_warm(?bp, 0, ?s, ?alloc, nil, nil);
+    if (R.is_err[outcome.BuildOutcome, outcome.Fail](r1)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val bo1: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](r1);
+    if (!bo1.ok)                 { bad = 1; }
+    if (bo1.artifacts.len != 1)  { bad = 1; }
+    or (!fs.is_file(bo1.artifacts.data[0].path)) { bad = 1; }
+
+    val st_main: session.StableModuleId = ut_stable_of(?s, "uniontest.main");
+    val st_a:    session.StableModuleId = ut_stable_of(?s, "uniontest.a");
+    val st_b:    session.StableModuleId = ut_stable_of(?s, "uniontest.b");
+    if (st_main == session.STABLE_MODULE_NIL || st_a == session.STABLE_MODULE_NIL || st_b == session.STABLE_MODULE_NIL) { bad = 1; }
+
+    # the call-1 cache state: per-module back-half revisions, the link
+    # fingerprint, and the session growth axes.
+    val sema_a_1: query.Revision = query.peek_revision(?s.queries, query.Q_SEMA,    st_a::u64);
+    val low_a_1:  query.Revision = query.peek_revision(?s.queries, query.Q_LOWER,   st_a::u64);
+    val cg_m_1:   query.Revision = query.peek_revision(?s.queries, query.Q_CODEGEN, st_main::u64);
+    val cg_a_1:   query.Revision = query.peek_revision(?s.queries, query.Q_CODEGEN, st_a::u64);
+    val cg_b_1:   query.Revision = query.peek_revision(?s.queries, query.Q_CODEGEN, st_b::u64);
+    val lk_1:     query.Revision = query.peek_revision(?s.queries, query.Q_LINK, 0);
+    if (sema_a_1 == 0 || low_a_1 == 0 || cg_m_1 == 0 || cg_a_1 == 0 || cg_b_1 == 0 || lk_1 == 0) { bad = 1; }
+    val interned_1: usize = intern.count(?s.interner);
+    val sources_1:  usize = s.sources.len;
+    val n_parse_1:  u32   = ut_shard_len(?s, query.Q_PARSE);
+    val n_sema_1:   u32   = ut_shard_len(?s, query.Q_SEMA);
+    val n_low_1:    u32   = ut_shard_len(?s, query.Q_LOWER);
+    val n_cg_1:     u32   = ut_shard_len(?s, query.Q_CODEGEN);
+
+    # call 2: nothing changed. every entry revalidates - no last_changed moves -
+    # and no session axis grows.
+    val r2: R.Result[outcome.BuildOutcome, outcome.Fail] = bengine.execute_warm(?bp, 0, ?s, ?alloc, nil, nil);
+    if (R.is_err[outcome.BuildOutcome, outcome.Fail](r2)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    if (!R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](r2).ok) { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_SEMA,    st_a::u64)    != sema_a_1) { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_LOWER,   st_a::u64)    != low_a_1)  { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_CODEGEN, st_main::u64) != cg_m_1)   { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_CODEGEN, st_a::u64)    != cg_a_1)   { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_CODEGEN, st_b::u64)    != cg_b_1)   { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_LINK, 0)               != lk_1)     { bad = 1; }
+    if (intern.count(?s.interner)          != interned_1) { bad = 1; }
+    if (s.sources.len                      != sources_1)  { bad = 1; }
+    if (ut_shard_len(?s, query.Q_PARSE)    != n_parse_1)  { bad = 1; }
+    if (ut_shard_len(?s, query.Q_SEMA)     != n_sema_1)   { bad = 1; }
+    if (ut_shard_len(?s, query.Q_LOWER)    != n_low_1)    { bad = 1; }
+    if (ut_shard_len(?s, query.Q_CODEGEN)  != n_cg_1)     { bad = 1; }
+
+    # call 3: edit a.mach's body. a's back half recomputes and the link re-runs;
+    # b's codegen is reused, and the shard populations still do not grow
+    # (entries replace in place).
+    val src_dir: str = ut_cc3(?alloc, root, "/", "src");
+    val a_path:  str = ut_cc3(?alloc, src_dir, "/", "a.mach");
+    val a_v2:    str = "pub fun fa() i32 { val t: i32 = 1; ret t; }\n";
+    if (O.is_some[str](fs.write_bytes(a_path, a_v2, str_len(a_v2), 420))) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+
+    val r3: R.Result[outcome.BuildOutcome, outcome.Fail] = bengine.execute_warm(?bp, 0, ?s, ?alloc, nil, nil);
+    if (R.is_err[outcome.BuildOutcome, outcome.Fail](r3)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    if (!R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](r3).ok) { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_CODEGEN, st_a::u64) == cg_a_1) { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_CODEGEN, st_b::u64) != cg_b_1) { bad = 1; }
+    if (query.peek_revision(?s.queries, query.Q_LINK, 0)            == lk_1)   { bad = 1; }
+    if (s.sources.len                     != sources_1) { bad = 1; }
+    if (ut_shard_len(?s, query.Q_PARSE)   != n_parse_1) { bad = 1; }
+    if (ut_shard_len(?s, query.Q_SEMA)    != n_sema_1)  { bad = 1; }
+    if (ut_shard_len(?s, query.Q_LOWER)   != n_low_1)   { bad = 1; }
+    if (ut_shard_len(?s, query.Q_CODEGEN) != n_cg_1)    { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    session.dnit(?s);
     ret bad;
 }

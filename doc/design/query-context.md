@@ -78,9 +78,18 @@ reimplemented over the warm entry plus session setup/teardown. Cold CLI builds b
 identically; the warm path is new capability, not changed behavior.
 
 Warm-session memory policy: the session allocator holds query-owned artifacts for the
-session's lifetime; per-unit transients still live in a per-call arena the engine opens
-over the caller's backing allocator. The caller decides when the session — and
-therefore the cache — dies.
+session's lifetime; per-unit transients still live in a per-call arena, which the
+engine opens over a private page backing (not the caller's allocator — the signature
+carries none, and a caller-provided arena would never return the per-call chunks) and
+tears down before returning. The channel split is carried by the session: `s.alloc`
+stays the persistent channel, and a second `s.build_alloc` — identical to `s.alloc`
+outside an engine call — is pointed at the per-call arena for the span of one unit
+execution; the Project captures it at init, so the graph and every build-span
+transient die with the call while artifact internals (which computes build through
+`s.alloc` / the query DB's allocator) survive. The caller decides when the session —
+and therefore the cache — dies. A warm call always takes the serial incremental
+codegen path: the parallel prelude assumes a cold cache, so only the cold `execute`
+enables it.
 
 ---
 
