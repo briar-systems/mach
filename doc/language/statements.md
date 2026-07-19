@@ -58,7 +58,7 @@ loop that also uses bare `cnt;` for control flow.
 
 ## `fin` — deferred block
 
-`fin` schedules a block to execute when the enclosing scope exits, in reverse
+`fin` schedules a block to execute when its enclosing block exits, in reverse
 order of declaration. Useful for cleanup that should happen regardless of how
 the scope exits.
 
@@ -69,13 +69,31 @@ the scope exits.
 
     # ... code ...
 }
-# at scope exit, in reverse order: counter * 2 runs first, then counter - 1
+# at block exit, in reverse order: counter * 2 runs first, then counter - 1
 ```
 
-When the scope exits through `ret expr;`, the return expression is fully
-evaluated first, then the pending `fin` blocks run, then the function returns
-the already-evaluated value — a fin's side effects are never observable in the
-returned value.
+`fin` is block-scoped: it belongs to the block that declares it and covers
+only the statements after its declaration. A function body is a block, so the
+classic pattern — a `fin` at the top of a function running at every return —
+is the block rule applied to the outermost scope.
+
+- A **normal block exit** replays the block's fins, then execution continues
+  after the block.
+- A **loop body** is a block: its fins replay at the end of every iteration,
+  with that iteration's values.
+- **`brk` / `cnt`** replay the fins of every scope being exited — everything
+  down through the targeted loop's body, innermost first — before branching.
+  The loop body's fins replay under `cnt` too: the iteration is ending.
+- **`ret expr;`** fully evaluates the return expression first, then replays
+  the fins of every open scope (innermost first), then returns the
+  already-evaluated value — a fin's side effects are never observable in the
+  returned value. A bare `ret` likewise, minus the expression.
+
+A `fin` declared inside another fin's body belongs to that body's block and
+replays when the body finishes. Control flow cannot cross a `fin` boundary
+outward: a `ret` inside a fin body is a compile error, as is a `brk` / `cnt`
+whose target loop encloses the fin. A loop fully inside the fin body uses
+`brk` / `cnt` normally.
 
 `fin` requires a block body (`fin { ... }`). The bare single-statement form
 (`fin stmt;`) is rejected.

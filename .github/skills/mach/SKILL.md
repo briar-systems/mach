@@ -289,7 +289,7 @@ for (cond) { ... }                               # condition loop
 for { ... }                                      # no condition: infinite loop
 ret expr;   ret;                                 # value / void return
 brk;   cnt;                                      # break / continue enclosing for
-fin { ... }                                      # run at scope exit, reverse order
+fin { ... }                                      # run at enclosing block's exit, reverse order
 { ... }                                          # bare block = new scope
 ```
 

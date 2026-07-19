@@ -7,9 +7,14 @@
 # After a statement that produces a terminator (a `ret`, an exhaustive `if`/`or`
 # chain, an infinite `for`), the builder cursor is left on a fresh, unreachable
 # block so the caller's next statement lands somewhere valid; `dce` drops the
-# dead block later. The `fin` stack records deferred bodies that are replayed
-# (lowered inline) before every reachable terminator that closes the enclosing
-# scope.
+# dead block later.
+#
+# `fin` is block-scoped: each block marks the fin stack on entry and replays its
+# own registrations (in reverse) on normal exit, so a loop body replays per
+# iteration. An early exit replays without popping -- `ret` replays every open
+# scope, `brk` / `cnt` replay down to the targeted loop's frame depth -- and the
+# emission lands only on the exiting CFG path; the bookkeeping pop happens once,
+# in the owning block's exit, so sibling paths keep their pending fins.
 
 use std.collections.map;
 use std.types.bool.bool;
@@ -132,12 +137,32 @@ fun lower_expr_stmt(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, st
 }
 
 # lower a block statement by lowering its statement list
+#
+# A block is a fin scope: a `fin` declared inside registers here and lives only
+# while the block is open. A normal (non-terminated) exit replays the block's
+# own fins in reverse registration order; a terminated exit (`ret` / `brk` /
+# `cnt` inside) already replayed them on the exiting path, so only the
+# bookkeeping is dropped.
 # ---
 # ctx: the context
 # s:   the block statement
 # ret: true on success, or an error
 fun lower_block(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, str] {
-    ret lower_stmt_list(ctx, s.data.block.stmts_start, s.data.block.stmts_len);
+    val mark: u32 = context.fin_count(ctx);
+    val res_body: R.Result[bool, str] = lower_stmt_list(ctx, s.data.block.stmts_start, s.data.block.stmts_len);
+    if (R.is_err[bool, str](res_body)) {
+        context.pop_fins_to(ctx, mark);
+        ret res_body;
+    }
+    if (!context.block_terminated(ctx)) {
+        val res_fins: R.Result[bool, str] = replay_fins_from(ctx, mark);
+        if (R.is_err[bool, str](res_fins)) {
+            context.pop_fins_to(ctx, mark);
+            ret res_fins;
+        }
+    }
+    context.pop_fins_to(ctx, mark);
+    ret R.ok[bool, str](true);
 }
 
 # lower an `if`/`or` chain into a cbr diamond
@@ -276,9 +301,9 @@ fun lower_for(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, str] {
 
 # lower a return
 #
-# Lowers the return expression first, then replays the pending fin bodies
-# (innermost first), then emits the `ret` terminator: the returned value is
-# fully evaluated before any fin teardown runs, so fin side effects are never
+# Lowers the return expression first, then replays every open scope's fin
+# bodies (innermost first), then emits the `ret` terminator: the returned value
+# is fully evaluated before any fin teardown runs, so fin side effects are never
 # observable in the value. A bare `ret` in a value-returning function returns
 # a typed zero of the function's IR return type so the IR stays well-typed.
 # ---
@@ -293,13 +318,13 @@ fun lower_ret(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, str] {
         }
         val v: value.Value = R.unwrap_ok[value.Value, str](res_value);
 
-        val res_fins: R.Result[bool, str] = run_fins(ctx);
+        val res_fins: R.Result[bool, str] = replay_fins_from(ctx, 0);
         if (R.is_err[bool, str](res_fins)) { ret res_fins; }
         if (context.block_terminated(ctx)) { ret R.ok[bool, str](true); }
         ret builder.emit_ret(?ctx.builder, v);
     }
 
-    val res_fins: R.Result[bool, str] = run_fins(ctx);
+    val res_fins: R.Result[bool, str] = replay_fins_from(ctx, 0);
     if (R.is_err[bool, str](res_fins)) { ret res_fins; }
     if (context.block_terminated(ctx)) { ret R.ok[bool, str](true); }
 
@@ -310,30 +335,49 @@ fun lower_ret(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, str] {
     ret builder.emit_ret(?ctx.builder, zero_const(ctx, ctx.ret_type));
 }
 
-# lower a `brk` as a branch to the current loop's exit block
+# lower a `brk`: replay the fins of every scope being exited (down through the
+# loop body, innermost first), then branch to the loop's exit block
 # ---
 # ctx: the context
 # ret: true on success, or an error when outside a loop
 fun lower_brk(ctx: *context.LowerContext) R.Result[bool, str] {
     val lf: *context.LoopFrame = context.current_loop(ctx);
     if (lf == nil) { ret R.err[bool, str]("lower: brk outside a loop"); }
-    ret builder.emit_br(?ctx.builder, lf.exit);
+
+    # copy the frame's fields before replaying: a fin body holding its own loop
+    # can grow (reallocate) the loop stack under the frame pointer
+    val exit:  ir.BlockId = lf.exit;
+    val floor: u32        = lf.fin_depth;
+    val res_fins: R.Result[bool, str] = replay_fins_from(ctx, floor);
+    if (R.is_err[bool, str](res_fins)) { ret res_fins; }
+    if (context.block_terminated(ctx)) { ret R.ok[bool, str](true); }
+    ret builder.emit_br(?ctx.builder, exit);
 }
 
-# lower a `cnt` as a branch to the current loop's header block
+# lower a `cnt`: replay the fins of every scope the ending iteration exits (the
+# loop body's included, innermost first), then branch to the loop's header block
 # ---
 # ctx: the context
 # ret: true on success, or an error when outside a loop
 fun lower_cnt(ctx: *context.LowerContext) R.Result[bool, str] {
     val lf: *context.LoopFrame = context.current_loop(ctx);
     if (lf == nil) { ret R.err[bool, str]("lower: cnt outside a loop"); }
-    ret builder.emit_br(?ctx.builder, lf.header);
+
+    # copy the frame's fields before replaying: a fin body holding its own loop
+    # can grow (reallocate) the loop stack under the frame pointer
+    val header: ir.BlockId = lf.header;
+    val floor:  u32        = lf.fin_depth;
+    val res_fins: R.Result[bool, str] = replay_fins_from(ctx, floor);
+    if (R.is_err[bool, str](res_fins)) { ret res_fins; }
+    if (context.block_terminated(ctx)) { ret R.ok[bool, str](true); }
+    ret builder.emit_br(?ctx.builder, header);
 }
 
-# record a deferred `fin` body on the fin stack
+# record a deferred `fin` body on the enclosing block's fin scope
 #
-# The body is replayed before every reachable terminator that closes the
-# enclosing function scope (currently at each `ret` and at fall-through exit).
+# The body is replayed on every path that exits the block: its normal exit, an
+# iteration's end when the block is a loop body, and any `ret` / `brk` / `cnt`
+# that leaves it early.
 # ---
 # ctx: the context
 # s:   the `fin` statement
@@ -342,19 +386,20 @@ fun lower_fin(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, str] {
     ret context.push_fin(ctx, s.data.fin_.body);
 }
 
-# replay every pending fin body in reverse registration order (innermost first)
+# replay the pending fin bodies above stack index `floor`, in reverse
+# registration order (innermost first), without popping them
 #
-# Called before each `ret` terminator (after the return expression has been
-# evaluated) and at function fall-through. Exposed for the decl lowerer's
-# default-return path.
+# Emission lands on the current CFG path only; the pop is the owning block's,
+# so a conditional early exit never disturbs the pending fins of the paths that
+# stay. Replay stops once a body terminates the path (a fin body cannot `ret`,
+# but an infinite loop can end it).
 # ---
-# ctx: the context
-# ret: true on success, or an error
-pub fun run_fins(ctx: *context.LowerContext) R.Result[bool, str] {
-    val n: u32 = context.fin_count(ctx);
-    if (n == 0) { ret R.ok[bool, str](true); }
-    var i: u32 = n;
-    for (i > 0) {
+# ctx:   the context
+# floor: fin-stack index to replay down to (exclusive)
+# ret:   true on success, or an error
+fun replay_fins_from(ctx: *context.LowerContext, floor: u32) R.Result[bool, str] {
+    var i: u32 = context.fin_count(ctx);
+    for (i > floor) {
         i = i - 1;
         if (context.block_terminated(ctx)) { ret R.ok[bool, str](true); }
         val body: id.StmtId = context.fin_at(ctx, i);
