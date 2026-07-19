@@ -104,11 +104,20 @@ the engine:
 pub fun build(es: *EditorSession, req: *request.BuildRequest) R.Result[BuildOutcome, Fail]
 ```
 
-- the editor composes requests directly (it is an embedding consumer; no argv, no
-  manifest re-parse when it already holds one);
-- `open`/`update` already feed `Q_FILE_TEXT` through `session.load_source`, so an
-  edited buffer invalidates exactly the entries that read it — diagnostics for a
-  whole-project check come from the same replay machinery the CLI uses (#1586);
+- the editor composes requests directly (it is an embedding consumer; no argv). The
+  editor holds no manifest, so `build` loads it per call — one parse, on a per-call
+  arena installed as the session's build channel, torn down with the plan before
+  returning — and runs every planned unit through `execute_warm_all` (the engine's
+  warm counterpart to `execute`'s unit loop). The build is silent: no sinks;
+  diagnostics land on the session DiagList, outcome artifacts on the editor's
+  allocator;
+- `open`/`update` feed `Q_FILE_TEXT` through `session.load_source`, so an edited
+  buffer invalidates exactly the entries that read it — but the load walk keys
+  sources by module path and reads overlay-then-disk (#1588), so that alone does
+  not put a buffer's text into a build. `open`/`update` therefore also mirror the
+  buffer into the session's source overlay under the buffer's key: a buffer
+  registered under its module's on-disk path builds with its unsaved text, while a
+  non-path key (an LSP URI) never matches a module and is inert to builds;
 - repeated builds with an unchanged request and one edited file recompute only that
   file's parse and whatever its exports firewall lets through — the incremental
   behavior the query catalog documents, finally exercised by a consumer that holds
