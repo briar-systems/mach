@@ -27,9 +27,21 @@
 # module's teardown still frees everything exactly once. A block with no
 # expanding rule is retagged in place and never reallocates.
 #
-# The engine owns no opcode, register, or ABI knowledge; those live entirely in
-# the packs (`target/isa/<arch>/rules.mach`). The shared regalloc / frame /
-# encode phases consume the selected output unchanged.
+# Ahead of per-instruction selection, `select` runs the one cross-instruction
+# rewrite the engine owns: COMPARE-AND-BRANCH FUSION (`combine_cbr`). A pack
+# opts in as data - `fused_cbr_ccs` lists the generic scalar comparison opcodes
+# it fuses - and for each declared condition a `MIR_CMP_* ; MIR_CBR` pair on the
+# exact safe shape collapses into one `mir.MIR_SEL_CBR_*` terminator carrying
+# `[lhs, rhs, then_block, else_block]` and the compare width, which the pack's
+# table then selects like any other instruction (a RULE_PASS survivor the
+# encoder materializes). The fusion never reads `-g` debug state to decide, so
+# selection is identical with and without -g; a fused-away compare's binding
+# list migrates onto the fused terminator.
+#
+# The engine owns no opcode, register, or ABI knowledge beyond the generic
+# `mir.*` opcode model; everything target-specific lives in the packs
+# (`target/isa/<arch>/rules.mach`). The shared regalloc / frame / encode phases
+# consume the selected output unchanged.
 
 use std.system.os;
 use std.types.bool.bool;
@@ -152,29 +164,37 @@ pub rec Rule {
 # and the post-selection opcodes `is_reg_move` classifies as plain register
 # copies. A pack that wants regalloc's copy-hygiene passes to see its selected
 # move forms lists them in `copy_opcodes`, including the generic `mir.MIR_MOV`
-# regalloc splices after selection.
+# regalloc splices after selection. A pack that wants compare-and-branch fusion
+# lists the generic scalar comparison opcodes it fuses in `fused_cbr_ccs`; its
+# table must then admit the corresponding `mir.MIR_SEL_CBR_*` survivors.
 # ---
-# name:              the pack's diagnostic label (the ISA name)
-# rules:             ordered rule table; scan order is match priority
-# rule_count:        number of rules
-# copy_opcodes:      post-selection opcodes that are plain register copies
-# copy_opcode_count: number of copy opcodes
+# name:               the pack's diagnostic label (the ISA name)
+# rules:              ordered rule table; scan order is match priority
+# rule_count:         number of rules
+# copy_opcodes:       post-selection opcodes that are plain register copies
+# copy_opcode_count:  number of copy opcodes
+# fused_cbr_ccs:      generic comparison opcodes (`mir.MIR_CMP_*`) the pack
+#                     fuses with a consuming conditional branch (nil for none)
+# fused_cbr_cc_count: number of fused comparison opcodes
 pub rec RulePack {
-    name:              str;
-    rules:             *Rule;
-    rule_count:        u32;
-    copy_opcodes:      *u32;
-    copy_opcode_count: u32;
+    name:               str;
+    rules:              *Rule;
+    rule_count:         u32;
+    copy_opcodes:       *u32;
+    copy_opcode_count:  u32;
+    fused_cbr_ccs:      *u32;
+    fused_cbr_cc_count: u32;
 }
 
 # select concrete instructions for one MIR function by interpreting a pack
 #
-# Walks every block: the first rule admitting each instruction (opcode + gate +
-# guard, in table order) decides it, and an instruction no rule admits fails
-# loudly as an internal compiler error naming the numeric opcode. A block is
-# rebuilt only when a matched rule expands; otherwise it is retagged in place.
-# This is the one selector behind every ISA vtable's `select` slot - each pack
-# exposes a thin wrapper binding its `RulePack` to this function.
+# Runs the pack-declared compare-and-branch fusion first, then walks every
+# block: the first rule admitting each instruction (opcode + gate + guard, in
+# table order) decides it, and an instruction no rule admits fails loudly as an
+# internal compiler error naming the numeric opcode. A block is rebuilt only
+# when a matched rule expands; otherwise it is retagged in place. This is the
+# one selector behind every ISA vtable's `select` slot - each pack exposes a
+# thin wrapper binding its `RulePack` to this function.
 # ---
 # pack: the target's rule pack
 # a:    backing allocator for rebuilt blocks' instruction storage
@@ -186,6 +206,11 @@ pub fun select(pack: *RulePack, a: *A.Allocator, tgt: *target.Target, f: *mir.Mi
     if (a == nil)    { ret R.err[bool, str]("rules: nil allocator"); }
     if (tgt == nil)  { ret R.err[bool, str]("rules: nil target"); }
     if (f == nil)    { ret R.err[bool, str]("rules: nil mir function"); }
+
+    if (pack.fused_cbr_cc_count > 0) {
+        val res_combine: R.Result[bool, str] = combine_cbr(pack, a, f);
+        if (R.is_err[bool, str](res_combine)) { ret res_combine; }
+    }
 
     var bi: u32 = 0;
     for (bi < f.block_count) {
@@ -304,6 +329,281 @@ fun gate_admits(gate: RuleGate, mi: *mir.MirInstr) bool {
     if (gate == GATE_ANY)    { ret true; }
     if (gate == GATE_SCALAR) { ret mi.vec_lane == 0; }
     ret mi.vec_lane != 0;
+}
+
+# whether the pack declares a generic comparison opcode compare-and-branch
+# fusable (a membership scan over `fused_cbr_ccs`)
+fun pack_fuses_cc(pack: *RulePack, op: u32) bool {
+    var i: u32 = 0;
+    for (i < pack.fused_cbr_cc_count) {
+        if (pack.fused_cbr_ccs[i] == op) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# tally every operand reference of each vreg across the whole function - value
+# operands, MEM base vregs, and MEM scaled-index vregs alike, defs and uses both.
+# the fusion's single-consumer test reads this: a compare result with exactly two
+# references (its def and the consuming branch) dies with the fused-away compare
+# ---
+# f:      the MIR function to tally
+# counts: per-vreg reference counts, `nv` wide, zeroed by the caller
+# nv:     number of vregs
+fun count_vreg_refs(f: *mir.MirFunction, counts: *u32, nv: u32) {
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val b: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < b.instr_count) {
+            val mi: *mir.MirInstr = ?b.instrs[ii];
+            var k: u32 = 0;
+            for (k < mi.operand_count) {
+                val op: *mir.MirOperand = ?mi.operands[k];
+                if (op.kind == mir.MIR_OP_VREG && op.vreg < nv) {
+                    counts[op.vreg] = counts[op.vreg] + 1;
+                }
+                if (op.kind == mir.MIR_OP_MEM) {
+                    if (op.vreg != mir.MIR_VREG_NIL && op.vreg < nv) {
+                        counts[op.vreg] = counts[op.vreg] + 1;
+                    }
+                    if (!op.index_is_preg && op.index != mir.MIR_VREG_NIL && op.index < nv) {
+                        counts[op.index] = counts[op.index] + 1;
+                    }
+                }
+                k = k + 1;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+}
+
+# whether an instruction writes vreg `v`, by the same operand-shape
+# classification the register allocator applies: a block-operand-bearing branch
+# and the value-less call / marker pseudos define nothing; otherwise a VREG in
+# operand 0 is the written destination
+fun defines_vreg(mi: *mir.MirInstr, v: u32) bool {
+    if (mi.operand_count == 0)         { ret false; }
+    if (mi.opcode == mir.MIR_CALL)     { ret false; }
+    if (mi.opcode == mir.MIR_CALL_RES) { ret false; }
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        if (mi.operands[k].kind == mir.MIR_OP_BLOCK) { ret false; }
+        k = k + 1;
+    }
+    ret mi.operands[0].kind == mir.MIR_OP_VREG && mi.operands[0].vreg == v;
+}
+
+# fuse each pack-declared `MIR_CMP_* ; MIR_CBR` pair into one MIR_SEL_CBR_*
+# terminator
+#
+# Runs on the generic opcodes ahead of per-instruction selection. A branch fuses
+# only on the exact safe shape: a scalar `MIR_CBR [cond, then, else]` whose
+# condition vreg has exactly two references in the whole function (the def and
+# this use), whose defining instruction is a scalar three-operand comparison the
+# pack declares fusable, sitting EARLIER IN THE SAME BLOCK, with register /
+# immediate compare operands, and with neither compare operand vreg redefined
+# between the compare and the branch. Anything else - a call-produced or
+# phi-merged condition, a multiply-consumed compare result, a vector lane, a
+# cross-block def - declines and selects exactly as before.
+#
+# The rewrite mutates the branch in place: opcode `mir.fused_cbr_opcode`,
+# operands `[lhs, rhs, then, else]` (a fresh array; the old one is released),
+# and the COMPARE's width / src_width, while keeping the branch's own loc and
+# inline_site. The compare is deleted and its block compacted; its `-g` binding
+# list migrates onto the fused terminator (ahead of the branch's own bindings,
+# matching its earlier PC), mirroring the ExpansionBuilder first-piece
+# convention, so no binding is lost or duplicated. The fusion never READS
+# binding state to decide anything - a -g and a non--g build select
+# identically.
+# ---
+# pack: the target's rule pack (supplies the fused condition set)
+# a:    backing allocator for the rewritten operand / binding arrays
+# f:    the MIR function to fuse; mutated in place
+# ret:  ok(true) on success, or an allocation error
+fun combine_cbr(pack: *RulePack, a: *A.Allocator, f: *mir.MirFunction) R.Result[bool, str] {
+    val nv: u32 = f.vreg_count;
+    if (nv == 0) { ret R.ok[bool, str](true); }
+
+    val res_counts: R.Result[*u32, str] = A.zallocate[u32](a, nv::usize);
+    if (R.is_err[*u32, str](res_counts)) {
+        ret R.err[bool, str](R.unwrap_err[*u32, str](res_counts));
+    }
+    val counts: *u32 = R.unwrap_ok[*u32, str](res_counts);
+    count_vreg_refs(f, counts, nv);
+
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val b: *mir.MirBlock = ?f.blocks[bi];
+        var j: u32 = 0;
+        for (j < b.instr_count) {
+            val br: *mir.MirInstr = ?b.instrs[j];
+            val ci: u32 = fusable_cmp_index(pack, b, br, counts, nv, j);
+            if (ci == FUSE_NONE) { j = j + 1; cnt; }
+
+            val res_fuse: R.Result[bool, str] = fuse_pair(a, b, ci, j);
+            if (R.is_err[bool, str](res_fuse)) {
+                A.deallocate[u32](a, counts, nv::usize);
+                ret res_fuse;
+            }
+            # the compare's deletion shifted the fused branch to index j - 1;
+            # j now names the instruction that followed the branch.
+        }
+        bi = bi + 1;
+    }
+
+    A.deallocate[u32](a, counts, nv::usize);
+    ret R.ok[bool, str](true);
+}
+
+# sentinel "no fusable compare" returned by `fusable_cmp_index`
+val FUSE_NONE: u32 = 0xFFFFFFFF;
+
+# the in-block index of the comparison a conditional branch may fuse with, or
+# FUSE_NONE when the branch does not sit on the safe shape (see `combine_cbr`)
+# ---
+# pack:   the target's rule pack (supplies the fused condition set)
+# b:      the block owning the branch
+# br:     the candidate branch instruction (`b.instrs[j]`)
+# counts: whole-function per-vreg reference counts
+# nv:     number of vregs
+# j:      the branch's index within the block
+# ret:    the compare's index within the block, or FUSE_NONE
+fun fusable_cmp_index(pack: *RulePack, b: *mir.MirBlock, br: *mir.MirInstr,
+                      counts: *u32, nv: u32, j: u32) u32 {
+    if (br.opcode != mir.MIR_CBR)                 { ret FUSE_NONE; }
+    if (br.vec_lane != 0)                         { ret FUSE_NONE; }
+    if (br.operand_count != 3)                    { ret FUSE_NONE; }
+    if (br.operands[0].kind != mir.MIR_OP_VREG)   { ret FUSE_NONE; }
+    val v: u32 = br.operands[0].vreg;
+    if (v >= nv)                                  { ret FUSE_NONE; }
+    # the condition must die with the fused-away compare: exactly the def and
+    # this use, nothing else in the whole function.
+    if (counts[v] != 2)                           { ret FUSE_NONE; }
+
+    # the def is the condition's only other reference; find it in this block.
+    var k: u32 = j;
+    var found: bool = false;
+    for (k > 0 && !found) {
+        k = k - 1;
+        if (defines_vreg(?b.instrs[k], v)) { found = true; }
+    }
+    if (!found) { ret FUSE_NONE; }  # defined in another block
+
+    val cmp: *mir.MirInstr = ?b.instrs[k];
+    if (!mir.is_cmp_opcode(cmp.opcode))     { ret FUSE_NONE; }
+    if (!pack_fuses_cc(pack, cmp.opcode))   { ret FUSE_NONE; }
+    if (cmp.vec_lane != 0)                  { ret FUSE_NONE; }
+    if (cmp.operand_count != 3)             { ret FUSE_NONE; }
+
+    val lhs: *mir.MirOperand = ?cmp.operands[1];
+    val rhs: *mir.MirOperand = ?cmp.operands[2];
+    if (lhs.kind != mir.MIR_OP_VREG && lhs.kind != mir.MIR_OP_IMM) { ret FUSE_NONE; }
+    if (rhs.kind != mir.MIR_OP_VREG && rhs.kind != mir.MIR_OP_IMM) { ret FUSE_NONE; }
+
+    # the fused compare reads its operands at the BRANCH's position, so neither
+    # operand vreg may be redefined between the compare and the branch (a phi
+    # merge copy spliced ahead of the terminator, say).
+    var m: u32 = k + 1;
+    for (m < j) {
+        if (lhs.kind == mir.MIR_OP_VREG && defines_vreg(?b.instrs[m], lhs.vreg)) { ret FUSE_NONE; }
+        if (rhs.kind == mir.MIR_OP_VREG && defines_vreg(?b.instrs[m], rhs.vreg)) { ret FUSE_NONE; }
+        m = m + 1;
+    }
+    ret k;
+}
+
+# rewrite one admitted compare/branch pair: the branch at `j` becomes the fused
+# terminator and the compare at `ci` is deleted, compacting the block in place
+# ---
+# a:   backing allocator for the fused operand / merged binding arrays
+# b:   the block owning both instructions
+# ci:  the compare's index within the block (ci < j)
+# j:   the branch's index within the block
+# ret: ok(true) on success, or an allocation error
+fun fuse_pair(a: *A.Allocator, b: *mir.MirBlock, ci: u32, j: u32) R.Result[bool, str] {
+    val cmp: *mir.MirInstr = ?b.instrs[ci];
+    val br:  *mir.MirInstr = ?b.instrs[j];
+
+    val res_ops: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](a, 4::usize);
+    if (R.is_err[*mir.MirOperand, str](res_ops)) {
+        ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](res_ops));
+    }
+    val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](res_ops);
+    ops[0] = cmp.operands[1];
+    ops[1] = cmp.operands[2];
+    ops[2] = br.operands[1];
+    ops[3] = br.operands[2];
+
+    val res_dbg: R.Result[bool, str] = merge_dbg_bindings(a, cmp, br);
+    if (R.is_err[bool, str](res_dbg)) {
+        A.deallocate[mir.MirOperand](a, ops, 4::usize);
+        ret res_dbg;
+    }
+
+    # the branch becomes the fused terminator: the compare's relation and width,
+    # its own loc / inline_site / successor edges.
+    A.deallocate[mir.MirOperand](a, br.operands, br.operand_count::usize);
+    br.opcode        = mir.fused_cbr_opcode(cmp.opcode);
+    br.operands      = ops;
+    br.operand_count = 4;
+    br.width         = cmp.width;
+    br.src_width     = cmp.src_width;
+
+    # delete the compare and compact the block in place.
+    A.deallocate[mir.MirOperand](a, cmp.operands, cmp.operand_count::usize);
+    var m: u32 = ci;
+    for (m + 1 < b.instr_count) {
+        b.instrs[m] = b.instrs[m + 1];
+        m = m + 1;
+    }
+    b.instr_count = b.instr_count - 1;
+    ret R.ok[bool, str](true);
+}
+
+# migrate a fused-away compare's `-g` binding list onto the fused terminator,
+# ahead of the branch's own bindings (the compare's PC preceded the branch's).
+# pure metadata movement - never a fusion decision input - so a -g and a non--g
+# build select identically
+# ---
+# a:   backing allocator for a merged binding array
+# cmp: the compare being deleted; its binding list is transferred and nilled
+# br:  the branch becoming the fused terminator; receives the merged list
+# ret: ok(true) on success, or an allocation error
+fun merge_dbg_bindings(a: *A.Allocator, cmp: *mir.MirInstr, br: *mir.MirInstr) R.Result[bool, str] {
+    if (cmp.dbg_binding_count == 0) { ret R.ok[bool, str](true); }
+
+    if (br.dbg_binding_count == 0) {
+        br.dbg_bindings      = cmp.dbg_bindings;
+        br.dbg_binding_count = cmp.dbg_binding_count;
+    }
+    or {
+        val total: u32 = cmp.dbg_binding_count + br.dbg_binding_count;
+        val res_merged: R.Result[*mir.MirDbgBinding, str] = A.allocate[mir.MirDbgBinding](a, total::usize);
+        if (R.is_err[*mir.MirDbgBinding, str](res_merged)) {
+            ret R.err[bool, str](R.unwrap_err[*mir.MirDbgBinding, str](res_merged));
+        }
+        val merged: *mir.MirDbgBinding = R.unwrap_ok[*mir.MirDbgBinding, str](res_merged);
+        var i: u32 = 0;
+        for (i < cmp.dbg_binding_count) {
+            merged[i] = cmp.dbg_bindings[i];
+            i = i + 1;
+        }
+        i = 0;
+        for (i < br.dbg_binding_count) {
+            merged[cmp.dbg_binding_count + i] = br.dbg_bindings[i];
+            i = i + 1;
+        }
+        A.deallocate[mir.MirDbgBinding](a, cmp.dbg_bindings, cmp.dbg_binding_count::usize);
+        A.deallocate[mir.MirDbgBinding](a, br.dbg_bindings, br.dbg_binding_count::usize);
+        br.dbg_bindings      = merged;
+        br.dbg_binding_count = total;
+    }
+
+    cmp.dbg_bindings      = nil;
+    cmp.dbg_binding_count = 0;
+    ret R.ok[bool, str](true);
 }
 
 # select instructions for one block
@@ -532,6 +832,8 @@ test "mach.lang.be.codegen.rules.select:retag_pass_priority" {
     pack.name       = "test";
     pack.rules      = ?rules_table[0];
     pack.rule_count = 4;
+    pack.fused_cbr_ccs      = nil;
+    pack.fused_cbr_cc_count = 0;
 
     var blk: mir.MirBlock;
     var f:   mir.MirFunction;
@@ -585,6 +887,8 @@ test "mach.lang.be.codegen.rules.select:guard_routing" {
     pack.name       = "test";
     pack.rules      = ?rules_table[0];
     pack.rule_count = 2;
+    pack.fused_cbr_ccs      = nil;
+    pack.fused_cbr_cc_count = 0;
 
     var blk: mir.MirBlock;
     var f:   mir.MirFunction;
@@ -632,6 +936,8 @@ test "mach.lang.be.codegen.rules.select:gate_routing" {
     pack.name       = "test";
     pack.rules      = ?rules_table[0];
     pack.rule_count = 2;
+    pack.fused_cbr_ccs      = nil;
+    pack.fused_cbr_cc_count = 0;
 
     var blk: mir.MirBlock;
     var f:   mir.MirFunction;
@@ -667,6 +973,8 @@ test "mach.lang.be.codegen.rules.select:unmatched_opcode_fails" {
     pack.name       = "test";
     pack.rules      = ?rules_table[0];
     pack.rule_count = 1;
+    pack.fused_cbr_ccs      = nil;
+    pack.fused_cbr_cc_count = 0;
 
     var blk: mir.MirBlock;
     var f:   mir.MirFunction;
@@ -739,6 +1047,8 @@ test "mach.lang.be.codegen.rules.select:expansion_identity_carriage" {
     pack.name       = "test";
     pack.rules      = ?rules_table[0];
     pack.rule_count = 2;
+    pack.fused_cbr_ccs      = nil;
+    pack.fused_cbr_cc_count = 0;
 
     var blk: mir.MirBlock;
     var f:   mir.MirFunction;
@@ -811,6 +1121,8 @@ test "mach.lang.be.codegen.rules.select:expansion_length_mismatch_fails" {
     pack.name       = "test";
     pack.rules      = ?rules_table[0];
     pack.rule_count = 1;
+    pack.fused_cbr_ccs      = nil;
+    pack.fused_cbr_cc_count = 0;
 
     var blk: mir.MirBlock;
     var f:   mir.MirFunction;
@@ -818,6 +1130,218 @@ test "mach.lang.be.codegen.rules.select:expansion_length_mismatch_fails" {
 
     val r: R.Result[bool, str] = select(?pack, ?backing, ?tgt, ?f);
     if (!R.is_err[bool, str](r)) { ret 1; }
+    ret 0;
+}
+
+# build one heap-backed instruction: `opcode` with a fresh copy of `operands`,
+# for the combine tests whose operand arrays the fusion releases
+fun t_heap_instr(a: *A.Allocator, mi: *mir.MirInstr, opcode: u32, operands: *mir.MirOperand, operand_count: u32) bool {
+    val ro: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](a, operand_count::usize);
+    if (R.is_err[*mir.MirOperand, str](ro)) { ret false; }
+    val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ro);
+    var i: u32 = 0;
+    for (i < operand_count) {
+        ops[i] = operands[i];
+        i = i + 1;
+    }
+    mi.opcode        = opcode;
+    mi.operands      = ops;
+    mi.operand_count = operand_count;
+    ret true;
+}
+
+# a declared `MIR_CMP_* ; MIR_CBR` pair on the safe shape fuses through the full
+# select path: the branch becomes the MIR_SEL_CBR_* terminator carrying
+# [lhs, rhs, then, else] and the COMPARE's width, keeps its own loc, and receives
+# the compare's -g bindings ahead of its own; the compare is deleted and the
+# block compacts in place
+test "mach.lang.be.codegen.rules.combine_cbr:fuses_safe_shape" {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+    var tgt: target.Target;
+
+    val res_instrs: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](?backing, 2::usize);
+    if (R.is_err[*mir.MirInstr, str](res_instrs)) { ret 1; }
+    val instrs: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](res_instrs);
+
+    # cmp.lt_s v2 <- v0, v1 at width 4, carrying one -g binding.
+    var cmp_ops: [3]mir.MirOperand;
+    cmp_ops[0] = mir.op_vreg(2);
+    cmp_ops[1] = mir.op_vreg(0);
+    cmp_ops[2] = mir.op_vreg(1);
+    if (!t_heap_instr(?backing, ?instrs[0], mir.MIR_CMP_LT_S, ?cmp_ops[0], 3)) { ret 1; }
+    instrs[0].width     = 4;
+    instrs[0].src_width = 4;
+    instrs[0].loc       = source.loc(3, 40);
+    val res_cb: R.Result[*mir.MirDbgBinding, str] = A.allocate[mir.MirDbgBinding](?backing, 1::usize);
+    if (R.is_err[*mir.MirDbgBinding, str](res_cb)) { ret 1; }
+    instrs[0].dbg_bindings = R.unwrap_ok[*mir.MirDbgBinding, str](res_cb);
+    instrs[0].dbg_bindings[0].iid  = 7;
+    instrs[0].dbg_bindings[0].vreg = 0;
+    instrs[0].dbg_binding_count = 1;
+
+    # cbr v2, .5, .9 at the bool width, carrying its own -g binding.
+    var br_ops: [3]mir.MirOperand;
+    br_ops[0] = mir.op_vreg(2);
+    br_ops[1] = mir.op_block(5);
+    br_ops[2] = mir.op_block(9);
+    if (!t_heap_instr(?backing, ?instrs[1], mir.MIR_CBR, ?br_ops[0], 3)) { ret 1; }
+    instrs[1].width     = 1;
+    instrs[1].src_width = 1;
+    instrs[1].loc       = source.loc(3, 77);
+    val res_bb: R.Result[*mir.MirDbgBinding, str] = A.allocate[mir.MirDbgBinding](?backing, 1::usize);
+    if (R.is_err[*mir.MirDbgBinding, str](res_bb)) { ret 1; }
+    instrs[1].dbg_bindings = R.unwrap_ok[*mir.MirDbgBinding, str](res_bb);
+    instrs[1].dbg_bindings[0].iid  = 9;
+    instrs[1].dbg_bindings[0].vreg = 1;
+    instrs[1].dbg_binding_count = 1;
+
+    # the pack fuses LT_S and its table admits the fused survivor.
+    var ccs: [1]u32;
+    ccs[0] = mir.MIR_CMP_LT_S;
+    var rules_table: [1]Rule;
+    rules_table[0].op     = mir.MIR_SEL_CBR_LT_S;
+    rules_table[0].gate   = GATE_SCALAR;
+    rules_table[0].guard  = nil;
+    rules_table[0].kind   = RULE_PASS;
+    rules_table[0].expand = nil;
+
+    var pack: RulePack;
+    pack.name       = "test";
+    pack.rules      = ?rules_table[0];
+    pack.rule_count = 1;
+    pack.fused_cbr_ccs      = ?ccs[0];
+    pack.fused_cbr_cc_count = 1;
+
+    var blk: mir.MirBlock;
+    var f:   mir.MirFunction;
+    t_function(?blk, instrs, 2, ?f);
+    f.vreg_count = 3;
+
+    val r: R.Result[bool, str] = select(?pack, ?backing, ?tgt, ?f);
+    if (R.is_err[bool, str](r)) { ret 1; }
+
+    # the pair collapsed to one fused terminator, compacted in place.
+    if (blk.instr_count != 1) { ret 1; }
+    val fused: *mir.MirInstr = ?blk.instrs[0];
+    if (fused.opcode != mir.MIR_SEL_CBR_LT_S) { ret 1; }
+    if (fused.operand_count != 4)             { ret 1; }
+    if (fused.operands[0].kind != mir.MIR_OP_VREG || fused.operands[0].vreg != 0) { ret 1; }
+    if (fused.operands[1].kind != mir.MIR_OP_VREG || fused.operands[1].vreg != 1) { ret 1; }
+    if (fused.operands[2].kind != mir.MIR_OP_BLOCK || fused.operands[2].imm != 5) { ret 1; }
+    if (fused.operands[3].kind != mir.MIR_OP_BLOCK || fused.operands[3].imm != 9) { ret 1; }
+
+    # the COMPARE's width rides the terminator; the BRANCH's loc survives.
+    if (fused.width != 4)       { ret 1; }
+    if (fused.src_width != 4)   { ret 1; }
+    if (fused.loc.offset != 77) { ret 1; }
+
+    # the compare's binding migrated ahead of the branch's own.
+    if (fused.dbg_binding_count != 2)     { ret 1; }
+    if (fused.dbg_bindings[0].iid != 7)   { ret 1; }
+    if (fused.dbg_bindings[1].iid != 9)   { ret 1; }
+    ret 0;
+}
+
+# every unsafe shape declines: a multiply-consumed condition, a cross-block def,
+# a compare operand redefined between the pair, a vector lane, and an undeclared
+# condition all leave the block untouched
+test "mach.lang.be.codegen.rules.combine_cbr:declines_unsafe_shapes" {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+
+    var ccs: [6]u32;
+    ccs[0] = mir.MIR_CMP_EQ;
+    ccs[1] = mir.MIR_CMP_NE;
+    ccs[2] = mir.MIR_CMP_LT_S;
+    ccs[3] = mir.MIR_CMP_LT_U;
+    ccs[4] = mir.MIR_CMP_LE_S;
+    ccs[5] = mir.MIR_CMP_LE_U;
+    var pack: RulePack;
+    pack.name               = "test";
+    pack.fused_cbr_ccs      = ?ccs[0];
+    pack.fused_cbr_cc_count = 6;
+
+    # shared operand storage; declines free nothing, so stack arrays suffice.
+    var cmp_ops: [3]mir.MirOperand;
+    cmp_ops[0] = mir.op_vreg(2);
+    cmp_ops[1] = mir.op_vreg(0);
+    cmp_ops[2] = mir.op_vreg(1);
+    var use_ops: [2]mir.MirOperand;
+    use_ops[0] = mir.op_vreg(3);
+    use_ops[1] = mir.op_vreg(2);
+    var redef_ops: [2]mir.MirOperand;
+    redef_ops[0] = mir.op_vreg(0);
+    redef_ops[1] = mir.op_imm(4);
+    var br_ops: [3]mir.MirOperand;
+    br_ops[0] = mir.op_vreg(2);
+    br_ops[1] = mir.op_block(5);
+    br_ops[2] = mir.op_block(9);
+
+    var instrs: [3]mir.MirInstr;
+    var blk: mir.MirBlock;
+    var f:   mir.MirFunction;
+
+    # a second consumer of the condition (v2 referenced three times): declined.
+    var zi: u32 = 0;
+    for (zi < 3) {
+        instrs[zi].vec_lane          = 0;
+        instrs[zi].dbg_bindings      = nil;
+        instrs[zi].dbg_binding_count = 0;
+        zi = zi + 1;
+    }
+    instrs[0].opcode = mir.MIR_CMP_EQ;  instrs[0].operands = ?cmp_ops[0]; instrs[0].operand_count = 3;
+    instrs[1].opcode = mir.MIR_MOV;     instrs[1].operands = ?use_ops[0]; instrs[1].operand_count = 2;
+    instrs[2].opcode = mir.MIR_CBR;     instrs[2].operands = ?br_ops[0];  instrs[2].operand_count = 3;
+    t_function(?blk, ?instrs[0], 3, ?f);
+    f.vreg_count = 4;
+    if (R.is_err[bool, str](combine_cbr(?pack, ?backing, ?f))) { ret 1; }
+    if (blk.instr_count != 3)             { ret 1; }
+    if (instrs[2].opcode != mir.MIR_CBR)  { ret 1; }
+
+    # a compare operand redefined between the pair (mov v0 <- 4): declined.
+    instrs[1].operands      = ?redef_ops[0];
+    instrs[1].operand_count = 2;
+    if (R.is_err[bool, str](combine_cbr(?pack, ?backing, ?f))) { ret 2; }
+    if (blk.instr_count != 3)             { ret 2; }
+    if (instrs[2].opcode != mir.MIR_CBR)  { ret 2; }
+
+    # a cross-block def: the branch's block holds no def of the condition.
+    var blocks: [2]mir.MirBlock;
+    blocks[0].id          = 0;
+    blocks[0].instrs      = ?instrs[0];
+    blocks[0].instr_count = 1;
+    blocks[0].instr_cap   = 1;
+    blocks[1].id          = 1;
+    blocks[1].instrs      = ?instrs[2];
+    blocks[1].instr_count = 1;
+    blocks[1].instr_cap   = 1;
+    f.blocks      = ?blocks[0];
+    f.block_count = 2;
+    if (R.is_err[bool, str](combine_cbr(?pack, ?backing, ?f))) { ret 3; }
+    if (blocks[0].instr_count != 1)       { ret 3; }
+    if (instrs[2].opcode != mir.MIR_CBR)  { ret 3; }
+
+    # a vector-typed compare: declined (fusion is scalar-only).
+    instrs[0].opcode = mir.MIR_CMP_EQ;
+    instrs[1].opcode = mir.MIR_CBR;
+    instrs[1].operands      = ?br_ops[0];
+    instrs[1].operand_count = 3;
+    instrs[1].vec_lane      = 0;
+    instrs[0].vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 4);
+    t_function(?blk, ?instrs[0], 2, ?f);
+    f.vreg_count = 4;
+    if (R.is_err[bool, str](combine_cbr(?pack, ?backing, ?f))) { ret 4; }
+    if (blk.instr_count != 2)             { ret 4; }
+    if (instrs[1].opcode != mir.MIR_CBR)  { ret 4; }
+    instrs[0].vec_lane = 0;
+
+    # a condition code the pack does not declare: declined.
+    pack.fused_cbr_cc_count = 1;
+    ccs[0] = mir.MIR_CMP_NE;
+    if (R.is_err[bool, str](combine_cbr(?pack, ?backing, ?f))) { ret 5; }
+    if (blk.instr_count != 2)             { ret 5; }
+    if (instrs[1].opcode != mir.MIR_CBR)  { ret 5; }
     ret 0;
 }
 
