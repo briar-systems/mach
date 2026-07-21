@@ -937,13 +937,57 @@ fun is_mir_compare(op: mir.MirOpcode) bool {
         op == mir.MIR_SEL_CMP_LE_S || op == mir.MIR_SEL_CMP_LE_U;
 }
 
+# re-narrow a sub-word compare operand into `scratch`, honoring the shared
+# ALU_MIN_WIDTH contract: a register holds a 1 / 2-byte value in its low bits
+# with the higher bits UNSPECIFIED (loads zero-extend, but a truncation leaves
+# residue above bit 31), and every consumer that needs the narrow value must
+# re-narrow it. the slt / branch primitives compare full XLEN registers, so a
+# sub-word operand is first extended - sign-extended for a signed relation,
+# zero-extended for an unsigned relation and for equality (any consistent
+# extension preserves it) - making the full-register compare exact at the
+# operand width. a 4 / 8-byte operand is already canonical under lp64 (lw /
+# addiw sign-extend the 32-bit convention, which sltu reads monotonically) and
+# passes through untouched
+# ---
+# st:      encoder driver state
+# reg:     the resolved operand register
+# scratch: the scratch the extended value is written into (the operand's own
+#          materialization scratch, so an immediate extends in place)
+# width:   the compare width riding `mi.width`
+# signed:  true for a signed relation (sign-extend), false to zero-extend
+# ret:     the register the compare should read (`reg`, or `scratch` when narrowed)
+fun narrow_cmp_source(st: *encode.EncodeState, reg: u32, scratch: u32, width: u8, signed: bool) u32 {
+    if (width >= 4) { ret reg; }
+    val sh: u32 = 64 - (width::u32 * 8);
+    if (signed) {
+        emit_word(st, pack_i(OP_IMM, F3_SLL, scratch, reg, sh));                # slli scratch, reg, sh
+        emit_word(st, pack_i(OP_IMM, F3_SRL, scratch, scratch, sh | 0x400));    # srai scratch, scratch, sh
+        ret scratch;
+    }
+    if (width == 1) {
+        emit_word(st, pack_i(OP_IMM, F3_AND, scratch, reg, 0xFF));              # andi scratch, reg, 0xff
+        ret scratch;
+    }
+    emit_word(st, pack_i(OP_IMM, F3_SLL, scratch, reg, sh));                    # slli scratch, reg, sh
+    emit_word(st, pack_i(OP_IMM, F3_SRL, scratch, scratch, sh));                # srli scratch, scratch, sh
+    ret scratch;
+}
+
+# whether a surviving comparison / fused compare-branch opcode is a SIGNED
+# relation, selecting the sign- versus zero-extension of `narrow_cmp_source`
+fun cmp_is_signed(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_SEL_CMP_LT_S || op == mir.MIR_SEL_CMP_LE_S ||
+        op == mir.MIR_SEL_CBR_LT_S || op == mir.MIR_SEL_CBR_LE_S;
+}
+
 # materialize a surviving comparison `[dst, lhs, rhs]` into a 0/1 result. RISC-V has
 # no flags register, so each relation synthesizes its boolean from the set-less-than
 # primitives: equal / not-equal through `xor` then `seqz`/`snez` (the `sltiu rd,t,1`
 # / `sltu rd,x0,t` idioms), the less-than relations directly with `slt`/`sltu`, and
 # the less-or-equal relations as the negation of the swapped strict relation. the
-# `xor` is bit-for-bit so it needs no width branch; the orderings ride the operands
-# isel sign- or zero-extended to the operation width
+# primitives compare full XLEN registers, so a sub-word operand is first re-narrowed
+# through `narrow_cmp_source`; a 4 / 8-byte operand rides the lp64 register
+# convention directly
 fun encode_compare(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 3) { ret R.err[bool, str]("encode: compare missing operands"); }
 
@@ -953,11 +997,14 @@ fun encode_compare(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, st
 
     val rnr: R.Result[i32, str] = resolve_source(st, ?mi.operands[1], SCRATCH2, mi.width);
     if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
-    val lhs: u32 = R.unwrap_ok[i32, str](rnr)::u32;
+    var lhs: u32 = R.unwrap_ok[i32, str](rnr)::u32;
 
     val rmr: R.Result[i32, str] = resolve_source(st, ?mi.operands[2], SCRATCH, mi.width);
     if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
-    val rhs: u32 = R.unwrap_ok[i32, str](rmr)::u32;
+    var rhs: u32 = R.unwrap_ok[i32, str](rmr)::u32;
+
+    lhs = narrow_cmp_source(st, lhs, SCRATCH2, mi.width, cmp_is_signed(mi.opcode));
+    rhs = narrow_cmp_source(st, rhs, SCRATCH, mi.width, cmp_is_signed(mi.opcode));
 
     val op: mir.MirOpcode = mi.opcode;
     if (op == mir.MIR_SEL_CMP_EQ) {
@@ -1055,9 +1102,10 @@ fun fused_cbr_funct3(op: mir.MirOpcode, swap: *bool) u32 {
 # materialized as the NATIVE RV64 fused conditional branch: `bcc lhs, rhs, then ;
 # j else` (the LE relations as the swapped GE). the operands resolve exactly as
 # `encode_compare`'s - a physical register directly, an immediate materialized
-# into the scratch re-signed to the lp64 register convention - and the branch
-# compares the full XLEN registers exactly as the slt-idiom boolean did, so the
-# fused relation is identical to the split pair at every width. each branch
+# into the scratch re-signed to the lp64 register convention, a sub-word operand
+# re-narrowed through `narrow_cmp_source` - and the branch then compares full
+# XLEN registers exactly as the slt-idiom boolean did, so the fused relation is
+# identical to the split pair at every width. each branch
 # records a fixup against its target block; `relax_function_riscv64` widens an
 # over-range B-type into the inverted-guard + jal (funct3 ^ 1 inverts every
 # beq/bne, blt/bge, bltu/bgeu pair) and pass 2 scatters the displacement
@@ -1078,11 +1126,14 @@ fun encode_fused_cbr(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R
 
     val rnr: R.Result[i32, str] = resolve_source(st, ?mi.operands[0], SCRATCH2, mi.width);
     if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
-    val lhs: u32 = R.unwrap_ok[i32, str](rnr)::u32;
+    var lhs: u32 = R.unwrap_ok[i32, str](rnr)::u32;
 
     val rmr: R.Result[i32, str] = resolve_source(st, ?mi.operands[1], SCRATCH, mi.width);
     if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
-    val rhs: u32 = R.unwrap_ok[i32, str](rmr)::u32;
+    var rhs: u32 = R.unwrap_ok[i32, str](rmr)::u32;
+
+    lhs = narrow_cmp_source(st, lhs, SCRATCH2, mi.width, cmp_is_signed(mi.opcode));
+    rhs = narrow_cmp_source(st, rhs, SCRATCH, mi.width, cmp_is_signed(mi.opcode));
 
     var swap: bool = false;
     val funct3: u32 = fused_cbr_funct3(mi.opcode, ?swap);
@@ -3834,6 +3885,27 @@ test "mach.lang.target.isa.riscv64.encode:integer_compare_sequences" {
     if (read_word(?st.buf, 0) != 0x00B62533) { bad = 1; }
     if (read_word(?st.buf, 4) != 0x00154513) { bad = 1; }
 
+    # a SUB-WORD signed compare re-narrows both operands (ALU_MIN_WIDTH consumer
+    # contract) before the full-register slt: lt_s at width 1 is
+    # slli t1,a1,56 ; srai t1,t1,56 ; slli t0,a2,56 ; srai t0,t0,56 ; slt a0,t1,t0
+    st.buf.len = 0;
+    mi.opcode = mir.MIR_SEL_CMP_LT_S; mi.width = 1;
+    encode_compare(?st, ?mi);
+    if (read_word(?st.buf, 0)  != 0x03859313) { bad = 1; }
+    if (read_word(?st.buf, 4)  != 0x43835313) { bad = 1; }
+    if (read_word(?st.buf, 8)  != 0x03861293) { bad = 1; }
+    if (read_word(?st.buf, 12) != 0x4382D293) { bad = 1; }
+    if (read_word(?st.buf, 16) != 0x00532533) { bad = 1; }
+
+    # its unsigned byte twin zero-extends with the single andi form:
+    # andi t1,a1,255 ; andi t0,a2,255 ; sltu a0,t1,t0
+    st.buf.len = 0;
+    mi.opcode = mir.MIR_SEL_CMP_LT_U;
+    encode_compare(?st, ?mi);
+    if (read_word(?st.buf, 0) != 0x0FF5F313) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x0FF67293) { bad = 1; }
+    if (read_word(?st.buf, 8) != 0x00533533) { bad = 1; }
+
     encode.buf_dnit(?st.buf);
     ret bad;
 }
@@ -3895,6 +3967,19 @@ test "mach.lang.target.isa.riscv64.encode:fused_cbr_sequences" {
     if (st.fixups[10].target_block != 3)               { bad = 1; }
     if (st.fixups[11].patch_pos != 4)                  { bad = 1; }
     if (st.fixups[11].target_block != 4)               { bad = 1; }
+
+    # a SUB-WORD fused compare re-narrows both operands before the full-register
+    # branch: lt_u at width 2 is slli t1,a1,48 ; srli t1,t1,48 ; slli t0,a2,48 ;
+    # srli t0,t0,48 ; bltu t1,t0,0 - and the branch fixup sits at the bltu word.
+    st.buf.len = 0;
+    mi.opcode = mir.MIR_SEL_CBR_LT_U; mi.width = 2;
+    encode_fused_cbr(?st, 0, ?mi);
+    if (read_word(?st.buf, 0)  != 0x03059313) { bad = 1; }
+    if (read_word(?st.buf, 4)  != 0x03035313) { bad = 1; }
+    if (read_word(?st.buf, 8)  != 0x03061293) { bad = 1; }
+    if (read_word(?st.buf, 12) != 0x0302D293) { bad = 1; }
+    if (read_word(?st.buf, 16) != 0x00536063) { bad = 1; }
+    if (st.fixups[12].patch_pos != 16)         { bad = 1; }
 
     encode.buf_dnit(?st.buf);
     ret bad;
