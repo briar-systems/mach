@@ -628,35 +628,61 @@ fun merge_dbg_bindings(a: *A.Allocator, cmp: *mir.MirInstr, br: *mir.MirInstr) R
 
 # select instructions for one block
 #
-# The first pass matches every instruction (failing loudly on one no rule
-# admits) and sums the replacement piece counts; the second applies the rules.
-# When no matched rule expands, the block is retagged in place. Otherwise a
-# fresh, exactly-sized instruction array is zero-allocated (so every untouched
-# field of an emitted piece - `asm_block` above all - is deterministically nil),
-# each 1:1 instruction is moved into it transferring operand ownership, each
-# expanding instruction's pieces are emitted through the builder and its operand
-# array released, and the old array is released and swapped out - so the
-# module's teardown still frees everything exactly once.
+# Every instruction is matched ONCE, in the first pass, and the decisions are
+# cached: the apply pass reuses the cached `*Rule` pointers rather than
+# re-matching over instructions the pass itself is mutating. A `GuardFn` may
+# inspect the whole function, so a re-match after mutation could diverge from
+# the counted decision and corrupt the exactly-sized rebuild; caching makes the
+# two passes agree by construction (and halves the table-dispatch cost). The
+# first pass also fails loudly on an unmodeled opcode and sums the replacement
+# piece counts. When no matched rule expands, the block is retagged in place.
+# Otherwise a fresh, exactly-sized instruction array is zero-allocated (so
+# every untouched field of an emitted piece - `asm_block` above all - is
+# deterministically nil), each 1:1 instruction is moved into it transferring
+# operand ownership, each expanding instruction's pieces are emitted through
+# the builder and its operand array released, and the old array is released
+# and swapped out - so the module's teardown still frees everything exactly
+# once.
 # ---
 # pack: the target's rule pack
-# a:    backing allocator for the rebuilt instruction array
+# a:    backing allocator for the rule cache and the rebuilt instruction array
 # f:    the MIR function owning the block
 # b:    the block to select instructions for; mutated in place
 # ret:  ok(true) on success, an ICE on an unmodeled opcode, or an allocation
 #       error
 fun select_block(pack: *RulePack, a: *A.Allocator, f: *mir.MirFunction, b: *mir.MirBlock) R.Result[bool, str] {
+    val n: u32 = b.instr_count;
+    if (n == 0) { ret R.ok[bool, str](true); }
+
+    # the decision cache lives on the stack for the common block, so a
+    # retag-only selection still allocates nothing; only a block past the
+    # stack window takes a heap cache (freed on every exit below).
+    var stack_cache: [RULE_CACHE_STACK]*Rule;
+    var rules_for: **Rule = ?stack_cache[0];
+    var cache_on_heap: bool = false;
+    if (n > RULE_CACHE_STACK) {
+        val res_cache: R.Result[**Rule, str] = A.allocate[*Rule](a, n::usize);
+        if (R.is_err[**Rule, str](res_cache)) {
+            ret R.err[bool, str](R.unwrap_err[**Rule, str](res_cache));
+        }
+        rules_for = R.unwrap_ok[**Rule, str](res_cache);
+        cache_on_heap = true;
+    }
+
     var total:        u32  = 0;
     var needs_expand: bool = false;
     var i:            u32  = 0;
-    for (i < b.instr_count) {
+    for (i < n) {
         val mi:   *mir.MirInstr = ?b.instrs[i];
         val rule: *Rule         = find_rule(pack, f, mi);
         if (rule == nil) {
             write_opcode_ice(mi.opcode);
+            free_rule_cache(a, rules_for, n, cache_on_heap);
             ret R.err[bool, str]("internal compiler error: unhandled MIR opcode in instruction selection");
         }
         if (rule.kind == RULE_EXPAND) {
             if (rule.expand == nil || rule.expansion_length == 0) {
+                free_rule_cache(a, rules_for, n, cache_on_heap);
                 ret R.err[bool, str]("rules: malformed expansion rule");
             }
             needs_expand = true;
@@ -665,31 +691,32 @@ fun select_block(pack: *RulePack, a: *A.Allocator, f: *mir.MirFunction, b: *mir.
         or {
             total = total + 1;
         }
+        rules_for[i] = rule;
         i = i + 1;
     }
 
     if (!needs_expand) {
         i = 0;
-        for (i < b.instr_count) {
-            val mi:   *mir.MirInstr = ?b.instrs[i];
-            val rule: *Rule         = find_rule(pack, f, mi);
-            if (rule.kind == RULE_RETAG) { mi.opcode = rule.to; }
+        for (i < n) {
+            if (rules_for[i].kind == RULE_RETAG) { b.instrs[i].opcode = rules_for[i].to; }
             i = i + 1;
         }
+        free_rule_cache(a, rules_for, n, cache_on_heap);
         ret R.ok[bool, str](true);
     }
 
     val res_alloc: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](a, total::usize);
     if (R.is_err[*mir.MirInstr, str](res_alloc)) {
+        free_rule_cache(a, rules_for, n, cache_on_heap);
         ret R.err[bool, str](R.unwrap_err[*mir.MirInstr, str](res_alloc));
     }
     val dst: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](res_alloc);
 
     var w: u32 = 0;
     i = 0;
-    for (i < b.instr_count) {
+    for (i < n) {
         val mi:   *mir.MirInstr = ?b.instrs[i];
-        val rule: *Rule         = find_rule(pack, f, mi);
+        val rule: *Rule         = rules_for[i];
         if (rule.kind == RULE_EXPAND) {
             var builder: ExpansionBuilder;
             builder.allocator = a;
@@ -699,8 +726,12 @@ fun select_block(pack: *RulePack, a: *A.Allocator, f: *mir.MirFunction, b: *mir.
             builder.cursor    = w;
             builder.emitted   = 0;
             val res_expand: R.Result[bool, str] = rule.expand(?builder);
-            if (R.is_err[bool, str](res_expand)) { ret res_expand; }
+            if (R.is_err[bool, str](res_expand)) {
+                free_rule_cache(a, rules_for, n, cache_on_heap);
+                ret res_expand;
+            }
             if (builder.emitted != rule.expansion_length) {
+                free_rule_cache(a, rules_for, n, cache_on_heap);
                 ret R.err[bool, str]("rules: expansion emitted a piece count different from its rule's declared length");
             }
             w = builder.cursor;
@@ -721,7 +752,17 @@ fun select_block(pack: *RulePack, a: *A.Allocator, f: *mir.MirFunction, b: *mir.
     b.instr_count = total;
     b.instr_cap   = total;
 
+    free_rule_cache(a, rules_for, n, cache_on_heap);
     ret R.ok[bool, str](true);
+}
+
+# the stack window of select_block's per-instruction rule-decision cache; a
+# block with more instructions takes a heap cache instead
+val RULE_CACHE_STACK: u32 = 128;
+
+# release a heap-allocated rule-decision cache; a stack cache is a no-op
+fun free_rule_cache(a: *A.Allocator, cache: **Rule, n: u32, on_heap: bool) {
+    if (on_heap) { A.deallocate[*Rule](a, cache, n::usize); }
 }
 
 # release a replaced instruction's operand array once its expansion is emitted
