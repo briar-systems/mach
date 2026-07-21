@@ -24,7 +24,11 @@
 #   - the conditional branch (`MIR_CBR -> MIR_SEL_CBR`): the encoder lowers it to
 #     `CBNZ cond, then ; B else`, keeping both block targets and the condition on
 #     one terminator so the allocator reads the condition as a use and resolves
-#     both successor edges for liveness.
+#     both successor edges for liveness. the pack declares all six comparison
+#     conditions in `fused_cbr_ccs`, so the engine's compare-and-branch fusion
+#     collapses a single-consumer `CMP ; CBR` pair into one `mir.MIR_SEL_CBR_*`
+#     terminator ahead of selection; those survivors pass through and the encoder
+#     materializes `SUBS XZR ; B.cc then ; B else` directly.
 #   - the division / remainder family (`MIR_DIV_*`/`MIR_REM_*` -> `MIR_SEL_DIV_*`/
 #     `MIR_SEL_REM_*`): a clean three-address `[dst, dividend, divisor]` op (A64
 #     wires no fixed division register) the encoder lowers to `SDIV`/`UDIV` (+
@@ -87,16 +91,21 @@ use target: mach.lang.target.resolved;
 # ret: ok(true) on success, or an error naming the failure
 pub def SelectFn: fun(*A.Allocator, *target.Target, *mir.MirFunction) R.Result[bool, str];
 
-# the pack's rule table: 73 rules - 20 NEON vector rules ahead of the 53 scalar
-# rules covering every generic opcode that can reach aarch64 selection. filled once
-# by `built_pack`; the coverage test pins the count so the storage length and the
-# appended table can never drift apart
-var rules_storage: [73]rules.Rule;
+# the pack's rule table: 79 rules - 20 NEON vector rules ahead of the 53 scalar
+# rules covering every generic opcode that can reach aarch64 selection, plus the
+# six fused compare-and-branch survivors. filled once by `built_pack`; the
+# coverage test pins the count so the storage length and the appended table can
+# never drift apart
+var rules_storage: [79]rules.Rule;
 
 # the post-selection plain register-copy opcodes: the concrete GP move (`orr xd,
 # xzr, xn`), the concrete float move (`fmov`), and the generic `mir.MIR_MOV` the
 # reload / store moves regalloc splices after selection keep
 var copy_opcodes_storage: [3]u32;
+
+# the comparison opcodes the engine's compare-and-branch fusion combines with a
+# consuming conditional branch on aarch64: all six scalar conditions
+var fused_ccs_storage: [6]u32;
 
 # the pack handed to the shared engine, built once on first use
 var pack_storage: rules.RulePack;
@@ -390,6 +399,19 @@ fun built_pack() *rules.RulePack {
     # encoder materializes the `CBNZ cond, then ; B else` byte sequence.
     append_retag(mir.MIR_CBR, mir.MIR_SEL_CBR);
 
+    # the fused compare-and-branch terminators the engine's combine produces for
+    # the conditions declared in `fused_cbr_ccs` pass through as `[lhs, rhs,
+    # then_block, else_block]` survivors; the encoder materializes `SUBS XZR,
+    # lhs, rhs ; B.cc then ; B else`, dropping the CSET boolean and the CBNZ of
+    # the split pair. scalar-gated: the combine never fuses a vector lane, so a
+    # vector instruction can never take these arms.
+    append(mir.MIR_SEL_CBR_EQ,   rules.GATE_SCALAR, nil, rules.RULE_PASS, 0, nil, 0);
+    append(mir.MIR_SEL_CBR_NE,   rules.GATE_SCALAR, nil, rules.RULE_PASS, 0, nil, 0);
+    append(mir.MIR_SEL_CBR_LT_S, rules.GATE_SCALAR, nil, rules.RULE_PASS, 0, nil, 0);
+    append(mir.MIR_SEL_CBR_LT_U, rules.GATE_SCALAR, nil, rules.RULE_PASS, 0, nil, 0);
+    append(mir.MIR_SEL_CBR_LE_S, rules.GATE_SCALAR, nil, rules.RULE_PASS, 0, nil, 0);
+    append(mir.MIR_SEL_CBR_LE_U, rules.GATE_SCALAR, nil, rules.RULE_PASS, 0, nil, 0);
+
     # memory ops pass through unchanged (their generic opcode values are above the
     # concrete A64 opcode space, so the encoder dispatches them without a sentinel
     # rewrite). ALLOCA / GEP select to A64 address arithmetic (ADD / SUB), and LOAD /
@@ -459,11 +481,20 @@ fun built_pack() *rules.RulePack {
     copy_opcodes_storage[1] = arm64.FMOV::u32;
     copy_opcodes_storage[2] = mir.MIR_MOV;
 
-    pack_storage.name              = "aarch64";
-    pack_storage.rules             = ?rules_storage[0];
-    pack_storage.rule_count        = rule_cursor;
-    pack_storage.copy_opcodes      = ?copy_opcodes_storage[0];
-    pack_storage.copy_opcode_count = 3;
+    fused_ccs_storage[0] = mir.MIR_CMP_EQ;
+    fused_ccs_storage[1] = mir.MIR_CMP_NE;
+    fused_ccs_storage[2] = mir.MIR_CMP_LT_S;
+    fused_ccs_storage[3] = mir.MIR_CMP_LT_U;
+    fused_ccs_storage[4] = mir.MIR_CMP_LE_S;
+    fused_ccs_storage[5] = mir.MIR_CMP_LE_U;
+
+    pack_storage.name               = "aarch64";
+    pack_storage.rules              = ?rules_storage[0];
+    pack_storage.rule_count         = rule_cursor;
+    pack_storage.copy_opcodes       = ?copy_opcodes_storage[0];
+    pack_storage.copy_opcode_count  = 3;
+    pack_storage.fused_cbr_ccs      = ?fused_ccs_storage[0];
+    pack_storage.fused_cbr_cc_count = 6;
     pack_built = true;
 
     ret ?pack_storage;
@@ -537,6 +568,7 @@ test "mach.lang.target.isa.arm64.rules:opcode_rewrites" {
     var f: mir.MirFunction;
     f.blocks      = ?blk;
     f.block_count = 1;
+    f.vreg_count  = 0;
 
     val r: R.Result[bool, str] = select(?alloc, ?tgt, ?f);
     if (R.is_err[bool, str](r)) { ret 1; }
@@ -630,7 +662,7 @@ test "mach.lang.target.isa.arm64.rules:bitcast_bank_selects_fmov" {
 # so an appended rule and the storage size can never drift apart
 test "mach.lang.target.isa.arm64.rules:generic_opcode_coverage" {
     val pack: *rules.RulePack = built_pack();
-    if (pack.rule_count != 73) { ret 1; }
+    if (pack.rule_count != 79) { ret 1; }
 
     # every generic opcode `mir.lower_ir` can hand selection: the IR-mirroring block
     # 0..43 minus the three eliminated below, plus the lowering pseudos.
@@ -746,6 +778,24 @@ test "mach.lang.target.isa.arm64.rules:generic_opcode_coverage" {
         if (rules.find_rule(pack, ?f, ?probe) == nil) { ret 1; }
         i = i + 1;
     }
+
+    # the six fused compare-and-branch survivors the engine's combine produces
+    # for this pack's declared conditions must terminate in a rule too.
+    var fused: [6]u32;
+    fused[0] = mir.MIR_SEL_CBR_EQ;
+    fused[1] = mir.MIR_SEL_CBR_NE;
+    fused[2] = mir.MIR_SEL_CBR_LT_S;
+    fused[3] = mir.MIR_SEL_CBR_LT_U;
+    fused[4] = mir.MIR_SEL_CBR_LE_S;
+    fused[5] = mir.MIR_SEL_CBR_LE_U;
+    i = 0;
+    for (i < 6) {
+        probe.opcode   = fused[i];
+        probe.vec_lane = mir.VEC_LANE_NONE;
+        if (rules.find_rule(pack, ?f, ?probe) == nil) { ret 1; }
+        i = i + 1;
+    }
+    if (pack.fused_cbr_cc_count != 6) { ret 1; }
     ret 0;
 }
 
@@ -800,6 +850,7 @@ test "mach.lang.target.isa.arm64.rules:vector_compare_swaps_operands" {
     var f: mir.MirFunction;
     f.blocks      = ?blk;
     f.block_count = 1;
+    f.vreg_count  = 0;
 
     val r: R.Result[bool, str] = select(?backing, ?tgt, ?f);
     if (R.is_err[bool, str](r)) { ret 1; }
@@ -877,6 +928,7 @@ fun sel_vec_cmp(opcode: u32, lane: u8) u32 {
     var f: mir.MirFunction;
     f.blocks      = ?blk;
     f.block_count = 1;
+    f.vreg_count  = 0;
 
     val r: R.Result[bool, str] = select(?backing, ?tgt, ?f);
     if (R.is_err[bool, str](r)) { ret 0; }
@@ -941,6 +993,7 @@ fun vec_op_select_fails(opcode: u32, lane: u8) bool {
     var f: mir.MirFunction;
     f.blocks      = ?blk;
     f.block_count = 1;
+    f.vreg_count  = 0;
 
     ret R.is_err[bool, str](select(?backing, ?tgt, ?f));
 }

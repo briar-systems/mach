@@ -2001,6 +2001,74 @@ fun encode_cbr(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R.Resul
     ret encode.push_fixup(st, b_pos, b_next, else_block, fn_base);
 }
 
+# the A64 condition a fused compare-and-branch terminator branches on. only the
+# EQ / NE / LT / LE forms exist in the fused opcode space (the lowerer
+# canonicalizes GT/GE by swapping operands); signedness selects the signed
+# (LT/LE) versus unsigned (CC/LS) condition, mirroring cmp_cond
+fun fused_cbr_cond(op: mir.MirOpcode) u32 {
+    if (op == mir.MIR_SEL_CBR_EQ)   { ret CC_EQ; }
+    if (op == mir.MIR_SEL_CBR_NE)   { ret CC_NE; }
+    if (op == mir.MIR_SEL_CBR_LT_S) { ret CC_LT; }
+    if (op == mir.MIR_SEL_CBR_LT_U) { ret CC_CC; }
+    if (op == mir.MIR_SEL_CBR_LE_S) { ret CC_LE; }
+    ret CC_LS;
+}
+
+# materialize a fused compare-and-branch terminator
+# `MIR_SEL_CBR_* [lhs, rhs, then_block, else_block]` into `SUBS XZR, lhs, rhs`
+# (the flag-setting compare at the width riding `mi.width`) ; `B.cc then_block`
+# (the condition read straight off the flags) ; `B else_block` (the fall-through
+# edge, always emitted). the compare piece mirrors `encode_compare` exactly - an
+# immediate lhs (a constant landing on the left after lowering swaps `a > b`
+# into `b < a`) is materialized into SCRATCH1, distinct from the rhs's SCRATCH0,
+# and an immediate rhs in 0..4095 folds into the SUBS immediate form - so the
+# fused compare sets the identical flags the split SUBS ; CSET pair produced at
+# every width. each branch records a fixup against its target block; pass 2
+# inserts the imm19 / imm26 displacement once both block offsets are known
+# ---
+# st:      encoder driver state (byte sink + branch-fixup table)
+# fn_base: `.text` offset of the enclosing function, scoping the block fixups
+# mi:      the fused terminator `[lhs, rhs, then_block, else_block]`
+# ret:     ok(true) on success, or an error on a malformed terminator
+fun encode_fused_cbr(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 4) {
+        ret R.err[bool, str]("encode: fused compare-branch missing operands");
+    }
+    if (mi.operands[2].kind != mir.MIR_OP_BLOCK || mi.operands[3].kind != mir.MIR_OP_BLOCK) {
+        ret R.err[bool, str]("encode: fused compare-branch target is not a block");
+    }
+    val then_block: u32 = mi.operands[2].imm::u32;
+    val else_block: u32 = mi.operands[3].imm::u32;
+    val use64: bool = is64(mi.width);
+
+    val rnr: R.Result[i32, str] = resolve_source(st, ?mi.operands[0], SCRATCH1, use64);
+    if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
+    val rn: u32 = R.unwrap_ok[i32, str](rnr)::u32;
+
+    val rhs: *mir.MirOperand = ?mi.operands[1];
+    if (rhs.kind == mir.MIR_OP_IMM && rhs.imm >= 0 && rhs.imm <= 4095) {
+        emit_word(st, pack_cmp_imm(sel(use64, SUBS_IMM_X, SUBS_IMM_W), rn, rhs.imm::u32));
+    } or {
+        val rmr: R.Result[i32, str] = resolve_source(st, rhs, SCRATCH0, use64);
+        if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
+        val rm: u32 = R.unwrap_ok[i32, str](rmr)::u32;
+        emit_word(st, pack_cmp_reg(sel(use64, SUBS_REG_X, SUBS_REG_W), rn, rm));
+    }
+
+    # B.cc then_block (a zero imm19 placeholder; pass 2 inserts the displacement).
+    val bcc_pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_bcond(0, fused_cbr_cond(mi.opcode)));
+    val bcc_next: u32 = st.buf.len::u32;
+    val f1: R.Result[bool, str] = encode.push_fixup(st, bcc_pos, bcc_next, then_block, fn_base);
+    if (R.is_err[bool, str](f1)) { ret f1; }
+
+    # B else_block (the unconditional fall-through edge).
+    val b_pos: u32 = st.buf.len::u32;
+    emit_word(st, B_BASE);
+    val b_next: u32 = st.buf.len::u32;
+    ret encode.push_fixup(st, b_pos, b_next, else_block, fn_base);
+}
+
 # true when a post-isel opcode is a surviving division / remainder
 # sentinel (MIR_SEL_DIV_*/MIR_SEL_REM_*) - the encoder materializes the SDIV/UDIV
 # (+ MSUB for a remainder) and the defined division-by-zero / signed-overflow traps
@@ -2291,6 +2359,11 @@ fun encode_mir_instr(st: *encode.EncodeState, f: *mir.MirFunction, fn_base: u32,
     # multi-instruction byte sequences.
     if (is_mir_compare(mi.opcode))    { ret encode_compare(st, mi); }
     if (mi.opcode == mir.MIR_SEL_CBR) { ret encode_cbr(st, fn_base, mi); }
+
+    # a fused compare-and-branch terminator `[lhs, rhs, then_block, else_block]`
+    # materializes as SUBS XZR ; B.cc then ; B else - the flags feed the
+    # conditional branch directly, with no CSET boolean or CBNZ in between.
+    if (mir.is_fused_cbr(mi.opcode)) { ret encode_fused_cbr(st, fn_base, mi); }
 
     # the surviving division / remainder sentinel expands into its SDIV/UDIV (+ MSUB)
     # byte sequence with the defined division-by-zero / signed-overflow traps.
