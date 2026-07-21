@@ -103,7 +103,10 @@ pub def GuardFn: fun(*mir.MirFunction, *mir.MirInstr) bool;
 # `source` and emits each replacement piece with `emit`. Packs never construct a
 # `mir.MirInstr` directly - `emit` is the single construction path, and it
 # copies every identity field from `source` (see `emit`), so a piece can never
-# silently drop one.
+# silently drop one. `limit` is the rule's declared `expansion_length`: `emit`
+# refuses the piece past it BEFORE writing anything, so a callback that drifts
+# over its declaration fails loudly instead of corrupting the exactly-sized
+# rebuild.
 # ---
 # allocator: backing allocator for each emitted piece's operand array
 # function:  the MIR function under selection (context for operand queries)
@@ -111,6 +114,7 @@ pub def GuardFn: fun(*mir.MirFunction, *mir.MirInstr) bool;
 # dst:       the rebuilt instruction array pieces are written into
 # cursor:    next write index into `dst`; advanced by each `emit`
 # emitted:   pieces emitted so far by this expansion
+# limit:     the rule's declared piece count; `emit` rejects the piece past it
 pub rec ExpansionBuilder {
     allocator: *A.Allocator;
     function:  *mir.MirFunction;
@@ -118,6 +122,7 @@ pub rec ExpansionBuilder {
     dst:       *mir.MirInstr;
     cursor:    u32;
     emitted:   u32;
+    limit:     u32;
 }
 
 # the expansion callback a RULE_EXPAND rule carries
@@ -286,6 +291,13 @@ pub fun find_rule(pack: *RulePack, f: *mir.MirFunction, mi: *mir.MirInstr) *Rule
 # operand_count: number of operands
 # ret:           the emitted piece for explicit overrides, or an allocation error
 pub fun emit(builder: *ExpansionBuilder, opcode: u32, operands: *mir.MirOperand, operand_count: u32) R.Result[*mir.MirInstr, str] {
+    # refuse a piece past the rule's declared length BEFORE writing: the rebuilt
+    # array reserved exactly `limit` slots for this expansion, so an over-emitting
+    # callback must fail loudly here, not corrupt the neighboring instruction.
+    if (builder.emitted >= builder.limit) {
+        ret R.err[*mir.MirInstr, str]("rules: expansion emitted more pieces than its rule's declared length");
+    }
+
     var ops: *mir.MirOperand = nil;
     if (operand_count > 0) {
         val res_ops: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](builder.allocator, operand_count::usize);
@@ -725,12 +737,16 @@ fun select_block(pack: *RulePack, a: *A.Allocator, f: *mir.MirFunction, b: *mir.
             builder.dst       = dst;
             builder.cursor    = w;
             builder.emitted   = 0;
+            builder.limit     = rule.expansion_length;
             val res_expand: R.Result[bool, str] = rule.expand(?builder);
             if (R.is_err[bool, str](res_expand)) {
+                free_partial_rebuild(a, b, rules_for, i, builder.emitted, dst, total);
                 free_rule_cache(a, rules_for, n, cache_on_heap);
                 ret res_expand;
             }
+            # emit bounds over-emission, so a count mismatch here is under-emission.
             if (builder.emitted != rule.expansion_length) {
+                free_partial_rebuild(a, b, rules_for, i, builder.emitted, dst, total);
                 free_rule_cache(a, rules_for, n, cache_on_heap);
                 ret R.err[bool, str]("rules: expansion emitted a piece count different from its rule's declared length");
             }
@@ -759,6 +775,47 @@ fun select_block(pack: *RulePack, a: *A.Allocator, f: *mir.MirFunction, b: *mir.
 # the stack window of select_block's per-instruction rule-decision cache; a
 # block with more instructions takes a heap cache instead
 val RULE_CACHE_STACK: u32 = 128;
+
+# release the partial rebuild a failed expansion pass leaves behind, honoring
+# the module's exactly-once ownership: every piece operand array written into
+# `dst` so far is a fresh copy an expansion allocated and is freed here - a
+# moved 1:1 instruction's array is still owned by its source in `b.instrs`
+# (the move only copied the record), and a piece's `-g` binding list is still
+# owned by its source instruction - then the rebuilt array itself is released.
+# the block keeps its original instruction list, so teardown frees the sources
+# (including the already-nil'd operand fields of fully expanded ones) exactly
+# once.
+# ---
+# a:               allocator the rebuild's storage came from
+# b:               the block whose rebuild failed (its instrs drive the walk)
+# rules_for:       the per-instruction rule-decision cache
+# failed_i:        index of the instruction whose expansion failed
+# failed_emitted:  pieces the failing expansion emitted before the error
+# dst:             the partially written rebuilt array
+# total:           `dst`'s allocated length
+fun free_partial_rebuild(a: *A.Allocator, b: *mir.MirBlock, rules_for: **Rule,
+                         failed_i: u32, failed_emitted: u32, dst: *mir.MirInstr, total: u32) {
+    var c: u32 = 0;
+    var k: u32 = 0;
+    for (k <= failed_i) {
+        var pieces: u32 = 1;
+        if (rules_for[k].kind == RULE_EXPAND) {
+            pieces = rules_for[k].expansion_length;
+            if (k == failed_i) { pieces = failed_emitted; }
+            var p: u32 = 0;
+            for (p < pieces) {
+                val piece: *mir.MirInstr = ?dst[c + p];
+                if (piece.operands != nil && piece.operand_count > 0) {
+                    A.deallocate[mir.MirOperand](a, piece.operands, piece.operand_count::usize);
+                }
+                p = p + 1;
+            }
+        }
+        c = c + pieces;
+        k = k + 1;
+    }
+    A.deallocate[mir.MirInstr](a, dst, total::usize);
+}
 
 # release a heap-allocated rule-decision cache; a stack cache is a no-op
 fun free_rule_cache(a: *A.Allocator, cache: **Rule, n: u32, on_heap: bool) {
@@ -1191,6 +1248,53 @@ test "mach.lang.be.codegen.rules.select:expansion_length_mismatch_fails" {
 
     val r: R.Result[bool, str] = select(?pack, ?backing, ?tgt, ?f);
     if (!R.is_err[bool, str](r)) { ret 1; }
+    ret 0;
+}
+
+# an expansion that tries to emit MORE pieces than its rule declares is refused
+# by `emit` BEFORE anything is written - the piece past the declared length
+# would land in the neighboring instruction's reserved slot
+test "mach.lang.be.codegen.rules.select:expansion_over_emission_fails" {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+    var tgt: target.Target;
+
+    val res_instrs: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](?backing, 1::usize);
+    if (R.is_err[*mir.MirInstr, str](res_instrs)) { ret 1; }
+    val instrs: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](res_instrs);
+    val res_ops: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](?backing, 2::usize);
+    if (R.is_err[*mir.MirOperand, str](res_ops)) { ret 1; }
+    val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](res_ops);
+    ops[0] = mir.op_preg(10);
+    ops[1] = mir.op_preg(11);
+    instrs[0].opcode        = 9;
+    instrs[0].operands      = ops;
+    instrs[0].operand_count = 2;
+
+    # the two-piece expander against a one-piece declaration: its second emit
+    # must be rejected and its propagated error must fail the selection.
+    var rules_table: [1]Rule;
+    rules_table[0].op               = 9;
+    rules_table[0].kind             = RULE_EXPAND;
+    rules_table[0].expand           = t_expand_two_pieces;
+    rules_table[0].expansion_length = 1;
+
+    var pack: RulePack;
+    pack.name       = "test";
+    pack.rules      = ?rules_table[0];
+    pack.rule_count = 1;
+    pack.fused_cbr_ccs      = nil;
+    pack.fused_cbr_cc_count = 0;
+
+    var blk: mir.MirBlock;
+    var f:   mir.MirFunction;
+    t_function(?blk, instrs, 1, ?f);
+
+    val r: R.Result[bool, str] = select(?pack, ?backing, ?tgt, ?f);
+    if (!R.is_err[bool, str](r)) { ret 1; }
+    # the block was left as the engine found it (the rebuild was discarded).
+    if (blk.instrs != instrs)  { ret 1; }
+    if (blk.instr_count != 1)  { ret 1; }
     ret 0;
 }
 
