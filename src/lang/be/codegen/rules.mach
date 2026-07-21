@@ -1,0 +1,843 @@
+# the shared, target-blind rule engine for instruction selection
+#
+# Instruction selection rewrites the generic MIR opcodes `mir.lower_ir` produced
+# into the concrete forms a target's encoder consumes. A target expresses its
+# selection as data - a `RulePack` of `Rule` entries - and this module is the one
+# selector that interprets every pack: per block, per instruction, the FIRST rule
+# whose opcode, gate, and guard all admit the instruction decides it. Table order
+# is priority, so a guarded rule precedes its unguarded fallback for the same
+# opcode. An instruction no rule admits is an internal compiler error naming the
+# numeric opcode on stderr - selection is total and default-deny, so a new
+# generic opcode can never silently leak through a pack that does not model it.
+#
+# A rule resolves one of three ways:
+#   - RULE_RETAG: rewrite the opcode to `to` in place, the sole mutation. This
+#     covers both a concrete rewrite (a generic op to the target's encoder
+#     opcode) and a survivor lift (a generic op to its high `mir.MIR_SEL_*`
+#     sentinel, from which the encoder materializes a byte sequence).
+#   - RULE_PASS: leave the instruction untouched; the encoder dispatches it
+#     from the surviving generic opcode.
+#   - RULE_EXPAND: replace the instruction with the short fixed sequence the
+#     rule's `expand` callback emits through the engine's `ExpansionBuilder`.
+#
+# A block's instruction list is rebuilt only when some matched rule in it is
+# RULE_EXPAND: the first pass sums each instruction's piece count, the second
+# writes a fresh exactly-sized array, transferring operand ownership for the 1:1
+# instructions and releasing the replaced instructions' operand arrays, so the
+# module's teardown still frees everything exactly once. A block with no
+# expanding rule is retagged in place and never reallocates.
+#
+# The engine owns no opcode, register, or ABI knowledge; those live entirely in
+# the packs (`target/isa/<arch>/rules.mach`). The shared regalloc / frame /
+# encode phases consume the selected output unchanged.
+
+use std.system.os;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use std.allocator.page;
+
+use mach.lang.be.codegen.mir;
+use mach.lang.source;
+use target: mach.lang.target.resolved;
+
+# how a matched rule resolves its instruction (one of RULE_*)
+pub def RuleKind: u8;
+
+# rewrite the opcode to the rule's `to` in place; operands and every identity
+# field survive untouched. covers concrete rewrites and `mir.MIR_SEL_*` survivor
+# lifts alike
+pub val RULE_RETAG:  RuleKind = 0;
+# leave the instruction untouched; the encoder dispatches the surviving opcode
+pub val RULE_PASS:   RuleKind = 1;
+# replace the instruction with the fixed sequence the rule's `expand` callback
+# emits through the engine's `ExpansionBuilder`
+pub val RULE_EXPAND: RuleKind = 2;
+
+# which instructions a rule's vector gate admits (one of GATE_*), tested against
+# `mir.MirInstr.vec_lane` before the guard runs
+pub def RuleGate: u8;
+
+# admit every instruction regardless of its lane descriptor
+pub val GATE_ANY:    RuleGate = 0;
+# admit only a scalar instruction (`vec_lane == 0`)
+pub val GATE_SCALAR: RuleGate = 1;
+# admit only a vector-typed instruction (`vec_lane != 0`)
+pub val GATE_VECTOR: RuleGate = 2;
+
+# the predicate a guarded rule attaches
+#
+# Runs after the opcode and gate admit the instruction; true admits the rule,
+# false falls through to the next table entry. A guard must be a PURE predicate
+# over the function and instruction (operand banks, widths, operand kinds) - the
+# engine may evaluate it more than once per instruction and instructions are
+# only mutated after their own rule is chosen.
+# ---
+# f:  the MIR function owning the instruction (vreg classes for bank tests)
+# mi: the instruction under selection
+pub def GuardFn: fun(*mir.MirFunction, *mir.MirInstr) bool;
+
+# the write cursor a RULE_EXPAND callback emits its replacement sequence through
+#
+# Constructed by the engine for each expanding instruction and handed to the
+# rule's `expand`; the callback reads the instruction being replaced from
+# `source` and emits each replacement piece with `emit`. Packs never construct a
+# `mir.MirInstr` directly - `emit` is the single construction path, and it
+# copies every identity field from `source` (see `emit`), so a piece can never
+# silently drop one.
+# ---
+# allocator: backing allocator for each emitted piece's operand array
+# function:  the MIR function under selection (context for operand queries)
+# source:    the instruction being replaced; read-only during the callback
+# dst:       the rebuilt instruction array pieces are written into
+# cursor:    next write index into `dst`; advanced by each `emit`
+# emitted:   pieces emitted so far by this expansion
+pub rec ExpansionBuilder {
+    allocator: *A.Allocator;
+    function:  *mir.MirFunction;
+    source:    *mir.MirInstr;
+    dst:       *mir.MirInstr;
+    cursor:    u32;
+    emitted:   u32;
+}
+
+# the expansion callback a RULE_EXPAND rule carries
+#
+# Must emit exactly the rule's `expansion_length` pieces through `emit` on the
+# builder it receives; the engine verifies the count and fails loudly on a
+# mismatch. The callback must not free or retain `builder.source` - the engine
+# releases the replaced instruction's operand array itself once the callback
+# returns.
+# ---
+# builder: the engine's write cursor for this expansion
+pub def ExpandFn: fun(*ExpansionBuilder) R.Result[bool, str];
+
+# one selection rule: the decision for a generic MIR opcode under a gate and an
+# optional guard
+#
+# A pack's table is scanned top to bottom and the first admitting rule wins, so
+# order encodes priority: a guarded rule for an opcode precedes its unguarded
+# fallback. Fields beyond the matched kind are inert (`to` for RULE_PASS /
+# RULE_EXPAND, `expand` and `expansion_length` for RULE_RETAG / RULE_PASS).
+# ---
+# op:               the generic MIR opcode this rule matches
+# gate:             vector gate tested against the instruction's `vec_lane`
+#                   (one of GATE_*)
+# guard:            predicate run after the gate admits, or nil for an
+#                   unconditional rule
+# kind:             how the rule resolves the instruction (one of RULE_*)
+# to:               replacement opcode for RULE_RETAG
+# expand:           replacement-sequence callback for RULE_EXPAND, else nil
+# expansion_length: exact piece count a RULE_EXPAND emits (>= 1), else 0
+pub rec Rule {
+    op:               u32;
+    gate:             RuleGate;
+    guard:            GuardFn;
+    kind:             RuleKind;
+    to:               u32;
+    expand:           ExpandFn;
+    expansion_length: u32;
+}
+
+# one target's complete contribution to instruction selection
+#
+# Pure data plus named functions: the ordered rule table `select` interprets,
+# and the post-selection opcodes `is_reg_move` classifies as plain register
+# copies. A pack that wants regalloc's copy-hygiene passes to see its selected
+# move forms lists them in `copy_opcodes`, including the generic `mir.MIR_MOV`
+# regalloc splices after selection.
+# ---
+# name:              the pack's diagnostic label (the ISA name)
+# rules:             ordered rule table; scan order is match priority
+# rule_count:        number of rules
+# copy_opcodes:      post-selection opcodes that are plain register copies
+# copy_opcode_count: number of copy opcodes
+pub rec RulePack {
+    name:              str;
+    rules:             *Rule;
+    rule_count:        u32;
+    copy_opcodes:      *u32;
+    copy_opcode_count: u32;
+}
+
+# select concrete instructions for one MIR function by interpreting a pack
+#
+# Walks every block: the first rule admitting each instruction (opcode + gate +
+# guard, in table order) decides it, and an instruction no rule admits fails
+# loudly as an internal compiler error naming the numeric opcode. A block is
+# rebuilt only when a matched rule expands; otherwise it is retagged in place.
+# This is the one selector behind every ISA vtable's `select` slot - each pack
+# exposes a thin wrapper binding its `RulePack` to this function.
+# ---
+# pack: the target's rule pack
+# a:    backing allocator for rebuilt blocks' instruction storage
+# tgt:  resolved compilation target
+# f:    the MIR function to select instructions for; mutated in place
+# ret:  ok(true) on success, or an error naming the failure
+pub fun select(pack: *RulePack, a: *A.Allocator, tgt: *target.Target, f: *mir.MirFunction) R.Result[bool, str] {
+    if (pack == nil) { ret R.err[bool, str]("rules: nil rule pack"); }
+    if (a == nil)    { ret R.err[bool, str]("rules: nil allocator"); }
+    if (tgt == nil)  { ret R.err[bool, str]("rules: nil target"); }
+    if (f == nil)    { ret R.err[bool, str]("rules: nil mir function"); }
+
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val res_block: R.Result[bool, str] = select_block(pack, a, f, ?f.blocks[bi]);
+        if (R.is_err[bool, str](res_block)) { ret res_block; }
+        bi = bi + 1;
+    }
+
+    ret R.ok[bool, str](true);
+}
+
+# classify a post-selection opcode as one of the pack's plain register-move forms
+#
+# A membership scan over the pack's `copy_opcodes`. The shared copy-hygiene
+# passes further gate on operand shape and equal source/destination width, so a
+# move mis-listed here can only forgo an optimization, never miscompile. Each
+# pack exposes a thin wrapper binding its `RulePack` to this function behind the
+# ISA vtable's `is_reg_move` slot.
+# ---
+# pack:   the target's rule pack
+# opcode: the concrete post-selection opcode to classify
+# ret:    true when the opcode is one of the pack's plain register-move forms
+pub fun is_reg_move(pack: *RulePack, opcode: u32) bool {
+    var i: u32 = 0;
+    for (i < pack.copy_opcode_count) {
+        if (pack.copy_opcodes[i] == opcode) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the first rule in the pack's table admitting an instruction, or nil
+#
+# A rule admits when its `op` equals the instruction's opcode, its gate admits
+# the instruction's `vec_lane`, and its guard (when present) returns true.
+# Exposed so a pack's coverage tests can prove every reachable opcode terminates
+# in a rule.
+# ---
+# pack: the target's rule pack
+# f:    the MIR function owning the instruction
+# mi:   the instruction to match
+# ret:  the first admitting rule, or nil when the table does not model the opcode
+pub fun find_rule(pack: *RulePack, f: *mir.MirFunction, mi: *mir.MirInstr) *Rule {
+    var i: u32 = 0;
+    for (i < pack.rule_count) {
+        val r: *Rule = ?pack.rules[i];
+        if (r.op == mi.opcode && gate_admits(r.gate, mi) &&
+            (r.guard == nil || r.guard(f, mi))) {
+            ret r;
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+# emit one replacement piece of an expansion, carrying the source's identity
+#
+# The single instruction-construction path for every pack: the piece receives
+# the callback's `opcode` and a freshly allocated copy of `operands`, and EVERY
+# identity field is copied from the instruction being replaced - `width`,
+# `src_width`, `vec_lane`, `loc`, and `inline_site` - so a piece can never
+# silently drop one to a zeroed buffer. `asm_block` stays nil (only a MIR_ASM
+# carries one, and MIR_ASM never expands), and the source's `-g` binding list
+# moves onto the FIRST piece only, at whose PC the bindings become live, so it
+# is neither lost nor duplicated when the source is discarded. A caller that
+# needs a piece to differ from the source (a narrower width, say) overrides the
+# field explicitly on the returned piece - a deliberate act, never an omission.
+# ---
+# builder:       the expansion's write cursor
+# opcode:        the piece's opcode
+# operands:      operand values copied into the piece (borrowed; may be nil
+#                when `operand_count` is 0)
+# operand_count: number of operands
+# ret:           the emitted piece for explicit overrides, or an allocation error
+pub fun emit(builder: *ExpansionBuilder, opcode: u32, operands: *mir.MirOperand, operand_count: u32) R.Result[*mir.MirInstr, str] {
+    var ops: *mir.MirOperand = nil;
+    if (operand_count > 0) {
+        val res_ops: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](builder.allocator, operand_count::usize);
+        if (R.is_err[*mir.MirOperand, str](res_ops)) {
+            ret R.err[*mir.MirInstr, str](R.unwrap_err[*mir.MirOperand, str](res_ops));
+        }
+        ops = R.unwrap_ok[*mir.MirOperand, str](res_ops);
+        var i: u32 = 0;
+        for (i < operand_count) {
+            ops[i] = operands[i];
+            i = i + 1;
+        }
+    }
+
+    val piece:  *mir.MirInstr = ?builder.dst[builder.cursor];
+    val source: *mir.MirInstr = builder.source;
+    piece.opcode        = opcode;
+    piece.operands      = ops;
+    piece.operand_count = operand_count;
+    piece.width         = source.width;
+    piece.src_width     = source.src_width;
+    piece.vec_lane      = source.vec_lane;
+    piece.loc           = source.loc;
+    piece.inline_site   = source.inline_site;
+    if (builder.emitted == 0) {
+        piece.dbg_bindings      = source.dbg_bindings;
+        piece.dbg_binding_count = source.dbg_binding_count;
+    }
+
+    builder.cursor  = builder.cursor + 1;
+    builder.emitted = builder.emitted + 1;
+    ret R.ok[*mir.MirInstr, str](piece);
+}
+
+# whether a rule's gate admits an instruction's lane descriptor
+# ---
+# gate: the rule's gate (one of GATE_*)
+# mi:   the instruction under selection
+# ret:  true when the gate admits the instruction
+fun gate_admits(gate: RuleGate, mi: *mir.MirInstr) bool {
+    if (gate == GATE_ANY)    { ret true; }
+    if (gate == GATE_SCALAR) { ret mi.vec_lane == 0; }
+    ret mi.vec_lane != 0;
+}
+
+# select instructions for one block
+#
+# The first pass matches every instruction (failing loudly on one no rule
+# admits) and sums the replacement piece counts; the second applies the rules.
+# When no matched rule expands, the block is retagged in place. Otherwise a
+# fresh, exactly-sized instruction array is zero-allocated (so every untouched
+# field of an emitted piece - `asm_block` above all - is deterministically nil),
+# each 1:1 instruction is moved into it transferring operand ownership, each
+# expanding instruction's pieces are emitted through the builder and its operand
+# array released, and the old array is released and swapped out - so the
+# module's teardown still frees everything exactly once.
+# ---
+# pack: the target's rule pack
+# a:    backing allocator for the rebuilt instruction array
+# f:    the MIR function owning the block
+# b:    the block to select instructions for; mutated in place
+# ret:  ok(true) on success, an ICE on an unmodeled opcode, or an allocation
+#       error
+fun select_block(pack: *RulePack, a: *A.Allocator, f: *mir.MirFunction, b: *mir.MirBlock) R.Result[bool, str] {
+    var total:        u32  = 0;
+    var needs_expand: bool = false;
+    var i:            u32  = 0;
+    for (i < b.instr_count) {
+        val mi:   *mir.MirInstr = ?b.instrs[i];
+        val rule: *Rule         = find_rule(pack, f, mi);
+        if (rule == nil) {
+            write_opcode_ice(mi.opcode);
+            ret R.err[bool, str]("internal compiler error: unhandled MIR opcode in instruction selection");
+        }
+        if (rule.kind == RULE_EXPAND) {
+            if (rule.expand == nil || rule.expansion_length == 0) {
+                ret R.err[bool, str]("rules: malformed expansion rule");
+            }
+            needs_expand = true;
+            total = total + rule.expansion_length;
+        }
+        or {
+            total = total + 1;
+        }
+        i = i + 1;
+    }
+
+    if (!needs_expand) {
+        i = 0;
+        for (i < b.instr_count) {
+            val mi:   *mir.MirInstr = ?b.instrs[i];
+            val rule: *Rule         = find_rule(pack, f, mi);
+            if (rule.kind == RULE_RETAG) { mi.opcode = rule.to; }
+            i = i + 1;
+        }
+        ret R.ok[bool, str](true);
+    }
+
+    val res_alloc: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](a, total::usize);
+    if (R.is_err[*mir.MirInstr, str](res_alloc)) {
+        ret R.err[bool, str](R.unwrap_err[*mir.MirInstr, str](res_alloc));
+    }
+    val dst: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](res_alloc);
+
+    var w: u32 = 0;
+    i = 0;
+    for (i < b.instr_count) {
+        val mi:   *mir.MirInstr = ?b.instrs[i];
+        val rule: *Rule         = find_rule(pack, f, mi);
+        if (rule.kind == RULE_EXPAND) {
+            var builder: ExpansionBuilder;
+            builder.allocator = a;
+            builder.function  = f;
+            builder.source    = mi;
+            builder.dst       = dst;
+            builder.cursor    = w;
+            builder.emitted   = 0;
+            val res_expand: R.Result[bool, str] = rule.expand(?builder);
+            if (R.is_err[bool, str](res_expand)) { ret res_expand; }
+            if (builder.emitted != rule.expansion_length) {
+                ret R.err[bool, str]("rules: expansion emitted a piece count different from its rule's declared length");
+            }
+            w = builder.cursor;
+            free_source_operands(a, mi);
+        }
+        or {
+            if (rule.kind == RULE_RETAG) { mi.opcode = rule.to; }
+            dst[w] = @mi;
+            w = w + 1;
+        }
+        i = i + 1;
+    }
+
+    if (b.instrs != nil && b.instr_cap > 0) {
+        A.deallocate[mir.MirInstr](a, b.instrs, b.instr_cap::usize);
+    }
+    b.instrs      = dst;
+    b.instr_count = total;
+    b.instr_cap   = total;
+
+    ret R.ok[bool, str](true);
+}
+
+# release a replaced instruction's operand array once its expansion is emitted
+#
+# The pieces carry freshly allocated copies, so the source array would otherwise
+# leak when the old instruction list is discarded.
+# ---
+# a:  allocator the operand array was allocated from
+# mi: the replaced instruction; its operand array is freed and nilled
+fun free_source_operands(a: *A.Allocator, mi: *mir.MirInstr) {
+    if (mi.operands != nil && mi.operand_count > 0) {
+        A.deallocate[mir.MirOperand](a, mi.operands, mi.operand_count::usize);
+    }
+    mi.operands      = nil;
+    mi.operand_count = 0;
+}
+
+# write "internal compiler error: unhandled MIR opcode <N>\n" to stderr ahead of
+# an ICE return, so the numeric opcode survives in crash logs
+# ---
+# opcode: the unmodeled MIR opcode to report
+fun write_opcode_ice(opcode: u32) {
+    os.write(os.STDERR_FD, "internal compiler error: unhandled MIR opcode ", 46);
+
+    var digits: [16]u8;
+    var len:    usize = 0;
+    if (opcode == 0) {
+        digits[0] = '0';
+        len       = 1;
+    }
+    or {
+        # emit decimal digits least-significant first, then reverse them in place
+        var v: u32 = opcode;
+        for (v > 0) {
+            digits[len] = (v % 10)::u8 + '0';
+            v   = v / 10;
+            len = len + 1;
+        }
+        var i: usize = 0;
+        for (i < len / 2) {
+            val swap: u8 = digits[i];
+            digits[i] = digits[len - 1 - i];
+            digits[len - 1 - i] = swap;
+            i = i + 1;
+        }
+    }
+
+    os.write(os.STDERR_FD, ?digits[0], len);
+    os.write(os.STDERR_FD, "\n", 1);
+}
+
+# test-only guard admitting an instruction whose operand 0 is physical register 10
+fun t_operand_zero_is_preg_ten(f: *mir.MirFunction, mi: *mir.MirInstr) bool {
+    ret mi.operands[0].kind == mir.MIR_OP_PREG && mi.operands[0].preg == 10;
+}
+
+# test-only expander emitting two pieces (opcodes 900 and 901) that both copy the
+# source's `[dst, src]` operands
+fun t_expand_two_pieces(builder: *ExpansionBuilder) R.Result[bool, str] {
+    var ops: [2]mir.MirOperand;
+    ops[0] = builder.source.operands[0];
+    ops[1] = builder.source.operands[1];
+
+    val res_first: R.Result[*mir.MirInstr, str] = emit(builder, 900, ?ops[0], 2);
+    if (R.is_err[*mir.MirInstr, str](res_first)) {
+        ret R.err[bool, str](R.unwrap_err[*mir.MirInstr, str](res_first));
+    }
+    val res_second: R.Result[*mir.MirInstr, str] = emit(builder, 901, ?ops[0], 2);
+    if (R.is_err[*mir.MirInstr, str](res_second)) {
+        ret R.err[bool, str](R.unwrap_err[*mir.MirInstr, str](res_second));
+    }
+    ret R.ok[bool, str](true);
+}
+
+# test-only expander that emits one piece while its rule declares two, driving
+# the engine's piece-count verification
+fun t_expand_short_pieces(builder: *ExpansionBuilder) R.Result[bool, str] {
+    var ops: [2]mir.MirOperand;
+    ops[0] = builder.source.operands[0];
+    ops[1] = builder.source.operands[1];
+
+    val res_first: R.Result[*mir.MirInstr, str] = emit(builder, 900, ?ops[0], 2);
+    if (R.is_err[*mir.MirInstr, str](res_first)) {
+        ret R.err[bool, str](R.unwrap_err[*mir.MirInstr, str](res_first));
+    }
+    ret R.ok[bool, str](true);
+}
+
+# test-only single-block function scaffold over caller-owned instruction storage
+fun t_function(blk: *mir.MirBlock, instrs: *mir.MirInstr, instr_count: u32, f: *mir.MirFunction) {
+    blk.id          = 0;
+    blk.instrs      = instrs;
+    blk.instr_count = instr_count;
+    blk.instr_cap   = instr_count;
+    f.blocks        = blk;
+    f.block_count   = 1;
+}
+
+# a retag rewrites only the opcode in place, a pass leaves the instruction
+# untouched, and table order decides between two admitting rules (first match
+# wins); nothing in the no-expansion path reallocates the block
+test "mach.lang.be.codegen.rules.select:retag_pass_priority" {
+    var alloc: A.Allocator;
+    var tgt:   target.Target;
+
+    var instrs: [3]mir.MirInstr;
+    var ops:    [3][2]mir.MirOperand;
+    var i:      u32 = 0;
+    for (i < 3) {
+        ops[i][0] = mir.op_preg(10);
+        ops[i][1] = mir.op_preg(11);
+        instrs[i].operands      = ?ops[i][0];
+        instrs[i].operand_count = 2;
+        instrs[i].width         = 8;
+        i = i + 1;
+    }
+    instrs[0].opcode = 1;   # retagged to 101 by rule 0
+    instrs[1].opcode = 2;   # passes through
+    instrs[2].opcode = 1;   # rule 0 shadows the later rule 3 for the same opcode
+
+    var rules_table: [4]Rule;
+    rules_table[0].op = 1; rules_table[0].kind = RULE_RETAG; rules_table[0].to = 101;
+    rules_table[1].op = 2; rules_table[1].kind = RULE_PASS;
+    rules_table[2].op = 3; rules_table[2].kind = RULE_RETAG; rules_table[2].to = 103;
+    rules_table[3].op = 1; rules_table[3].kind = RULE_RETAG; rules_table[3].to = 999;
+
+    var pack: RulePack;
+    pack.name       = "test";
+    pack.rules      = ?rules_table[0];
+    pack.rule_count = 4;
+
+    var blk: mir.MirBlock;
+    var f:   mir.MirFunction;
+    t_function(?blk, ?instrs[0], 3, ?f);
+
+    val r: R.Result[bool, str] = select(?pack, ?alloc, ?tgt, ?f);
+    if (R.is_err[bool, str](r)) { ret 1; }
+
+    if (instrs[0].opcode != 101) { ret 1; }
+    if (instrs[1].opcode != 2)   { ret 1; }
+    if (instrs[2].opcode != 101) { ret 1; }
+    # a retag mutates nothing but the opcode.
+    if (instrs[0].operand_count != 2)          { ret 1; }
+    if (instrs[0].operands[0].preg != 10)      { ret 1; }
+    if (blk.instr_count != 3)                  { ret 1; }
+    if (blk.instrs != ?instrs[0])              { ret 1; }
+    ret 0;
+}
+
+# a guarded rule admits only the instructions its predicate accepts and the
+# unguarded fallback later in the table catches the rest
+test "mach.lang.be.codegen.rules.select:guard_routing" {
+    var alloc: A.Allocator;
+    var tgt:   target.Target;
+
+    var instrs: [2]mir.MirInstr;
+    var ops:    [2][2]mir.MirOperand;
+    ops[0][0] = mir.op_preg(10);
+    ops[0][1] = mir.op_preg(11);
+    ops[1][0] = mir.op_preg(12);
+    ops[1][1] = mir.op_preg(11);
+    var i: u32 = 0;
+    for (i < 2) {
+        instrs[i].opcode        = 7;
+        instrs[i].operands      = ?ops[i][0];
+        instrs[i].operand_count = 2;
+        instrs[i].width         = 8;
+        i = i + 1;
+    }
+
+    var rules_table: [2]Rule;
+    rules_table[0].op    = 7;
+    rules_table[0].guard = t_operand_zero_is_preg_ten;
+    rules_table[0].kind  = RULE_RETAG;
+    rules_table[0].to    = 700;
+    rules_table[1].op    = 7;
+    rules_table[1].kind  = RULE_RETAG;
+    rules_table[1].to    = 701;
+
+    var pack: RulePack;
+    pack.name       = "test";
+    pack.rules      = ?rules_table[0];
+    pack.rule_count = 2;
+
+    var blk: mir.MirBlock;
+    var f:   mir.MirFunction;
+    t_function(?blk, ?instrs[0], 2, ?f);
+
+    val r: R.Result[bool, str] = select(?pack, ?alloc, ?tgt, ?f);
+    if (R.is_err[bool, str](r)) { ret 1; }
+
+    if (instrs[0].opcode != 700) { ret 1; }  # guard admitted (operand 0 is preg 10)
+    if (instrs[1].opcode != 701) { ret 1; }  # guard declined; fallback caught it
+    ret 0;
+}
+
+# the scalar and vector gates route the same opcode by the instruction's lane
+# descriptor, and GATE_ANY admits both shapes
+test "mach.lang.be.codegen.rules.select:gate_routing" {
+    var alloc: A.Allocator;
+    var tgt:   target.Target;
+
+    var instrs: [2]mir.MirInstr;
+    var ops:    [2][2]mir.MirOperand;
+    var i:      u32 = 0;
+    for (i < 2) {
+        ops[i][0] = mir.op_preg(10);
+        ops[i][1] = mir.op_preg(11);
+        instrs[i].opcode        = 5;
+        instrs[i].operands      = ?ops[i][0];
+        instrs[i].operand_count = 2;
+        instrs[i].width         = 8;
+        i = i + 1;
+    }
+    instrs[1].vec_lane = mir.vec_lane_make(mir.VEC_LANE_FLOAT, 4);
+
+    var rules_table: [2]Rule;
+    rules_table[0].op   = 5;
+    rules_table[0].gate = GATE_VECTOR;
+    rules_table[0].kind = RULE_RETAG;
+    rules_table[0].to   = 502;
+    rules_table[1].op   = 5;
+    rules_table[1].gate = GATE_SCALAR;
+    rules_table[1].kind = RULE_RETAG;
+    rules_table[1].to   = 501;
+
+    var pack: RulePack;
+    pack.name       = "test";
+    pack.rules      = ?rules_table[0];
+    pack.rule_count = 2;
+
+    var blk: mir.MirBlock;
+    var f:   mir.MirFunction;
+    t_function(?blk, ?instrs[0], 2, ?f);
+
+    val r: R.Result[bool, str] = select(?pack, ?alloc, ?tgt, ?f);
+    if (R.is_err[bool, str](r)) { ret 1; }
+
+    if (instrs[0].opcode != 501) { ret 1; }  # scalar instruction took the scalar gate
+    if (instrs[1].opcode != 502) { ret 1; }  # vector instruction took the vector gate
+    ret 0;
+}
+
+# an instruction no rule admits is a loud selection failure, not a silent pass:
+# the engine is total and default-deny
+test "mach.lang.be.codegen.rules.select:unmatched_opcode_fails" {
+    var alloc: A.Allocator;
+    var tgt:   target.Target;
+
+    var instrs: [1]mir.MirInstr;
+    var ops:    [2]mir.MirOperand;
+    ops[0] = mir.op_preg(10);
+    ops[1] = mir.op_preg(11);
+    instrs[0].opcode        = 40;
+    instrs[0].operands      = ?ops[0];
+    instrs[0].operand_count = 2;
+
+    var rules_table: [1]Rule;
+    rules_table[0].op   = 1;
+    rules_table[0].kind = RULE_PASS;
+
+    var pack: RulePack;
+    pack.name       = "test";
+    pack.rules      = ?rules_table[0];
+    pack.rule_count = 1;
+
+    var blk: mir.MirBlock;
+    var f:   mir.MirFunction;
+    t_function(?blk, ?instrs[0], 1, ?f);
+
+    val r: R.Result[bool, str] = select(?pack, ?alloc, ?tgt, ?f);
+    if (!R.is_err[bool, str](r)) { ret 1; }
+    ret 0;
+}
+
+# an expansion rebuilds the block exactly once at the exact final size, and every
+# emitted piece carries the source's full identity - width, src_width, vec_lane,
+# loc, and inline_site - with the -g binding list on the first piece only; the
+# surrounding 1:1 instructions move over with their operands intact
+test "mach.lang.be.codegen.rules.select:expansion_identity_carriage" {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+    var tgt: target.Target;
+
+    # block storage the engine will release must come from the allocator.
+    val res_instrs: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](?backing, 3::usize);
+    if (R.is_err[*mir.MirInstr, str](res_instrs)) { ret 1; }
+    val instrs: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](res_instrs);
+    val res_exp_ops: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](?backing, 2::usize);
+    if (R.is_err[*mir.MirOperand, str](res_exp_ops)) { ret 1; }
+    val exp_ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](res_exp_ops);
+    exp_ops[0] = mir.op_preg(10);
+    exp_ops[1] = mir.op_preg(11);
+
+    var edge_ops: [2][2]mir.MirOperand;
+    edge_ops[0][0] = mir.op_preg(12);
+    edge_ops[0][1] = mir.op_preg(13);
+    edge_ops[1][0] = mir.op_preg(14);
+    edge_ops[1][1] = mir.op_preg(15);
+
+    var bindings: [1]mir.MirDbgBinding;
+    bindings[0].iid  = 7;
+    bindings[0].vreg = 3;
+
+    # 1:1 neighbor, the expanding instruction, 1:1 neighbor.
+    instrs[0].opcode        = 1;
+    instrs[0].operands      = ?edge_ops[0][0];
+    instrs[0].operand_count = 2;
+    instrs[0].width         = 8;
+    instrs[1].opcode            = 9;
+    instrs[1].operands          = exp_ops;
+    instrs[1].operand_count     = 2;
+    instrs[1].width             = 4;
+    instrs[1].src_width         = 2;
+    instrs[1].vec_lane          = mir.vec_lane_make(mir.VEC_LANE_INT, 4);
+    instrs[1].loc               = source.loc(3, 77);
+    instrs[1].inline_site       = 5;
+    instrs[1].dbg_bindings      = ?bindings[0];
+    instrs[1].dbg_binding_count = 1;
+    instrs[2].opcode        = 1;
+    instrs[2].operands      = ?edge_ops[1][0];
+    instrs[2].operand_count = 2;
+    instrs[2].width         = 8;
+
+    var rules_table: [2]Rule;
+    rules_table[0].op   = 1;
+    rules_table[0].kind = RULE_RETAG;
+    rules_table[0].to   = 101;
+    rules_table[1].op               = 9;
+    rules_table[1].kind             = RULE_EXPAND;
+    rules_table[1].expand           = t_expand_two_pieces;
+    rules_table[1].expansion_length = 2;
+
+    var pack: RulePack;
+    pack.name       = "test";
+    pack.rules      = ?rules_table[0];
+    pack.rule_count = 2;
+
+    var blk: mir.MirBlock;
+    var f:   mir.MirFunction;
+    t_function(?blk, instrs, 3, ?f);
+
+    val r: R.Result[bool, str] = select(?pack, ?backing, ?tgt, ?f);
+    if (R.is_err[bool, str](r)) { ret 1; }
+
+    # 3 instructions became 4 in a fresh exactly-sized array.
+    if (blk.instr_count != 4) { ret 1; }
+    if (blk.instr_cap != 4)   { ret 1; }
+
+    # the 1:1 neighbors retagged and moved with their operand arrays.
+    if (blk.instrs[0].opcode != 101)               { ret 1; }
+    if (blk.instrs[0].operands != ?edge_ops[0][0]) { ret 1; }
+    if (blk.instrs[3].opcode != 101)               { ret 1; }
+    if (blk.instrs[3].operands != ?edge_ops[1][0]) { ret 1; }
+
+    # both pieces carry the source's identity fields.
+    var p: u32 = 1;
+    for (p < 3) {
+        if (blk.instrs[p].width != 4)         { ret 1; }
+        if (blk.instrs[p].src_width != 2)     { ret 1; }
+        if (blk.instrs[p].vec_lane != mir.vec_lane_make(mir.VEC_LANE_INT, 4)) { ret 1; }
+        if (blk.instrs[p].loc.file != 3)      { ret 1; }
+        if (blk.instrs[p].loc.offset != 77)   { ret 1; }
+        if (blk.instrs[p].inline_site != 5)   { ret 1; }
+        if (blk.instrs[p].asm_block != nil)   { ret 1; }
+        if (blk.instrs[p].operand_count != 2) { ret 1; }
+        if (blk.instrs[p].operands[0].preg != 10) { ret 1; }
+        p = p + 1;
+    }
+    if (blk.instrs[1].opcode != 900) { ret 1; }
+    if (blk.instrs[2].opcode != 901) { ret 1; }
+
+    # the -g bindings moved onto the first piece only.
+    if (blk.instrs[1].dbg_bindings != ?bindings[0]) { ret 1; }
+    if (blk.instrs[1].dbg_binding_count != 1)       { ret 1; }
+    if (blk.instrs[2].dbg_bindings != nil)          { ret 1; }
+    if (blk.instrs[2].dbg_binding_count != 0)       { ret 1; }
+    ret 0;
+}
+
+# an expansion that emits fewer pieces than its rule declares is a loud failure -
+# the exact-size rebuild cannot tolerate a drifting count
+test "mach.lang.be.codegen.rules.select:expansion_length_mismatch_fails" {
+    var backing: A.Allocator;
+    if (O.is_some[str](page.make(?backing))) { ret 1; }
+    var tgt: target.Target;
+
+    val res_instrs: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](?backing, 1::usize);
+    if (R.is_err[*mir.MirInstr, str](res_instrs)) { ret 1; }
+    val instrs: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](res_instrs);
+    val res_ops: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](?backing, 2::usize);
+    if (R.is_err[*mir.MirOperand, str](res_ops)) { ret 1; }
+    val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](res_ops);
+    ops[0] = mir.op_preg(10);
+    ops[1] = mir.op_preg(11);
+    instrs[0].opcode        = 9;
+    instrs[0].operands      = ops;
+    instrs[0].operand_count = 2;
+
+    var rules_table: [1]Rule;
+    rules_table[0].op               = 9;
+    rules_table[0].kind             = RULE_EXPAND;
+    rules_table[0].expand           = t_expand_short_pieces;
+    rules_table[0].expansion_length = 2;
+
+    var pack: RulePack;
+    pack.name       = "test";
+    pack.rules      = ?rules_table[0];
+    pack.rule_count = 1;
+
+    var blk: mir.MirBlock;
+    var f:   mir.MirFunction;
+    t_function(?blk, instrs, 1, ?f);
+
+    val r: R.Result[bool, str] = select(?pack, ?backing, ?tgt, ?f);
+    if (!R.is_err[bool, str](r)) { ret 1; }
+    ret 0;
+}
+
+# the copy classifier is a pure membership scan over the pack's copy_opcodes -
+# listed opcodes are admitted, everything else is rejected
+test "mach.lang.be.codegen.rules.is_reg_move:membership" {
+    var copies: [3]u32;
+    copies[0] = 13;
+    copies[1] = 16;
+    copies[2] = 0x1000;
+
+    var pack: RulePack;
+    pack.name              = "test";
+    pack.copy_opcodes      = ?copies[0];
+    pack.copy_opcode_count = 3;
+
+    if (!is_reg_move(?pack, 13))     { ret 1; }
+    if (!is_reg_move(?pack, 16))     { ret 1; }
+    if (!is_reg_move(?pack, 0x1000)) { ret 1; }
+    if (is_reg_move(?pack, 2))       { ret 1; }
+    if (is_reg_move(?pack, 0x1100))  { ret 1; }
+    ret 0;
+}
