@@ -1,0 +1,310 @@
+# MOS 6502 machine-code encoder
+#
+# Turns a fully-resolved (post-isel, post-regalloc, post-frame) MIR function into
+# 6502 bytes through the shared two-pass driver (`be.codegen.encode.encode_driver`):
+# it supplies the per-function encode hook and the per-branch patch hook and owns
+# all opcode / addressing-mode / byte knowledge. The concrete opcode bytes are laid
+# out as a regular ADDRESSING-MODE x OPERATION matrix (immediate / zero-page /
+# absolute forms of each operation), the shape a second retro target would reuse.
+#
+# THE ACCUMULATOR MODEL. Every MIR value lives in a zero-page imaginary register
+# (`mos6502.zp_addr` maps a register id to its zero-page byte). Because the 6502 has
+# no register-to-register ALU, a byte operation `d = a op b` is materialized as
+# `LDA a ; <op> b ; STA d` through the accumulator - a three-instruction sequence,
+# the honest cost of an 8-bit machine. Addition and subtraction additionally clear
+# / set carry first (`CLC` / `SEC`), since the legalizer's byte lanes each start a
+# fresh single-byte add / subtract.
+#
+# SCOPE. This encoder realizes the straight-line register-arithmetic core - moves,
+# the byte ALU (add / sub / and / or / xor / not), returns, and direct calls -
+# byte-exact against the published 6502 opcode matrix. The frontiers documented in
+# the backend's scorecard (conditional branches, memory access through the software
+# frame, and the 16-bit-pointer forms) reach the encoder as passed-through generic
+# opcodes and are rejected with a loud, specific diagnostic rather than mis-encoded.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.string.str;
+
+use std.allocator.page;
+
+use A: std.allocator;
+use R: std.types.result;
+
+use enc: mach.lang.be.codegen.encode;
+use mach.lang.be.codegen.mir;
+use mach.lang.intern;
+use mach.lang.target.isa;
+use mach.lang.target.isa.mos6502;
+use mach.lang.target.of;
+use target: mach.lang.target.resolved;
+
+# the published 6502 opcode bytes, grouped by operation with one constant per
+# addressing mode this encoder emits (immediate / zero-page / absolute). the names
+# match the standard mnemonics so a byte pin reads against the reference matrix
+val OP_LDA_IMM: u8 = 0xA9;  val OP_LDA_ZP: u8 = 0xA5;  val OP_LDA_ABS: u8 = 0xAD;
+val OP_STA_ZP:  u8 = 0x85;  val OP_STA_ABS: u8 = 0x8D;
+val OP_ADC_IMM: u8 = 0x69;  val OP_ADC_ZP: u8 = 0x65;
+val OP_SBC_IMM: u8 = 0xE9;  val OP_SBC_ZP: u8 = 0xE5;
+val OP_AND_IMM: u8 = 0x29;  val OP_AND_ZP: u8 = 0x25;
+val OP_ORA_IMM: u8 = 0x09;  val OP_ORA_ZP: u8 = 0x05;
+val OP_EOR_IMM: u8 = 0x49;  val OP_EOR_ZP: u8 = 0x45;
+val OP_CLC:     u8 = 0x18;  val OP_SEC:    u8 = 0x38;
+val OP_JMP_ABS: u8 = 0x4C;  val OP_JSR_ABS: u8 = 0x20;
+val OP_RTS:     u8 = 0x60;  val OP_BRK:     u8 = 0x00;  val OP_NOP: u8 = 0xEA;
+
+# encode one fully-resolved MIR module into `.text` bytes, symbol marks, and
+# relocations
+#
+# The 6502 implementation behind the ISA vtable's `encode` slot; binds the 6502
+# encode / patch hooks to the shared two-pass driver.
+# ---
+# alloc: backing allocator for the encoder's output arrays
+# tgt:   resolved compilation target (must be mos6502)
+# m:     the fully-resolved MIR module
+# ret:   the populated EncoderOutput, or an error naming the failure
+pub fun encode_mos6502(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirModule) R.Result[enc.EncoderOutput, str] {
+    var hooks: enc.EncodeHooks;
+    hooks.encode_function = encode_function;
+    hooks.patch_branch    = patch_branch;
+    ret enc.encode_driver(alloc, tgt, m, ?hooks);
+}
+
+# emit one function's 6502 bytes into the shared encode state (driver pass 1)
+#
+# Records the function's entry symbol mark, then walks its blocks in layout order -
+# registering each block's `.text` offset for pass-2 branch resolution - and encodes
+# every instruction. The 6502 has no register-save prologue: values live in
+# zero-page and the software frame pointer is managed by the caller, so a leaf
+# function is pure body plus its terminating RTS.
+# ---
+# st: the shared encode state (text sink + mark / reloc / fixup / block arrays)
+# f:  the function to encode
+# ret: ok(true) on success, or an error naming an unencodable instruction
+fun encode_function(st: *enc.EncodeState, f: *mir.MirFunction) R.Result[bool, str] {
+    val fn_base: u32 = st.buf.len::u32;
+
+    val res_sym: R.Result[bool, str] = enc.push_symbol(st, f.name, fn_base, 0);
+    if (R.is_err[bool, str](res_sym)) { ret res_sym; }
+
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val b: *mir.MirBlock = ?f.blocks[bi];
+        val res_blk: R.Result[bool, str] = enc.push_block(st, fn_base, b.id, st.buf.len::u32);
+        if (R.is_err[bool, str](res_blk)) { ret res_blk; }
+
+        var ii: u32 = 0;
+        for (ii < b.instr_count) {
+            val res_i: R.Result[bool, str] = encode_instr(st, f, ?b.instrs[ii], fn_base);
+            if (R.is_err[bool, str](res_i)) { ret res_i; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# encode one resolved MIR instruction
+# ---
+# st:      the shared encode state
+# f:       the owning function (for operand resolution)
+# mi:      the instruction to encode
+# fn_base: the owning function's first-block text offset (for branch fixups)
+# ret:     ok(true) on success, or an error naming an unencodable instruction
+fun encode_instr(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr, fn_base: u32) R.Result[bool, str] {
+    val op: mir.MirOpcode = mi.opcode;
+
+    if (op == mos6502.MOV::u32) { ret encode_mov(st, mi); }
+    if (op == mos6502.RTS::u32) { enc.emit_byte(?st.buf, OP_RTS); ret R.ok[bool, str](true); }
+    if (op == mos6502.BRK::u32) { enc.emit_byte(?st.buf, OP_BRK); ret R.ok[bool, str](true); }
+    if (op == mos6502.NOP::u32) { enc.emit_byte(?st.buf, OP_NOP); ret R.ok[bool, str](true); }
+
+    if (op == mir.MIR_ADD || op == mir.MIR_SUB ||
+        op == mir.MIR_AND || op == mir.MIR_OR || op == mir.MIR_XOR) {
+        ret encode_alu(st, mi, op);
+    }
+    if (op == mir.MIR_NOT) { ret encode_not(st, mi); }
+    if (op == mir.MIR_CALL) { ret encode_call(st, mi); }
+
+    ret R.err[bool, str](unencodable_message(op));
+}
+
+# encode a byte move `dst <- src` as `LDA src ; STA dst`
+#
+# The source is an immediate (`LDA #imm`) or a zero-page value register (`LDA zp`);
+# the destination is always a zero-page value register (`STA zp`).
+fun encode_mov(st: *enc.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count != 2) { ret R.err[bool, str]("mos6502: malformed move"); }
+    val dst: *mir.MirOperand = ?mi.operands[0];
+    val src: *mir.MirOperand = ?mi.operands[1];
+    if (dst.kind != mir.MIR_OP_PREG) { ret R.err[bool, str](unencodable_message(mos6502.MOV::u32)); }
+
+    val res_ld: R.Result[bool, str] = emit_load_a(st, src);
+    if (R.is_err[bool, str](res_ld)) { ret res_ld; }
+    emit_zp1(st, OP_STA_ZP, mos6502.zp_addr(dst.preg::i32));
+    ret R.ok[bool, str](true);
+}
+
+# encode a byte ALU op `dst = a op b` as `LDA a ; [CLC|SEC ;] <op> b ; STA dst`
+#
+# Addition clears carry first and subtraction sets it, since each legalized byte
+# lane begins a fresh single-byte add / subtract. The right operand rides an
+# immediate or a zero-page value register.
+fun encode_alu(st: *enc.EncodeState, mi: *mir.MirInstr, op: mir.MirOpcode) R.Result[bool, str] {
+    if (mi.operand_count != 3) { ret R.err[bool, str]("mos6502: malformed binary op"); }
+    val dst: *mir.MirOperand = ?mi.operands[0];
+    val a:   *mir.MirOperand = ?mi.operands[1];
+    val b:   *mir.MirOperand = ?mi.operands[2];
+    if (dst.kind != mir.MIR_OP_PREG) { ret R.err[bool, str](unencodable_message(op)); }
+
+    val res_ld: R.Result[bool, str] = emit_load_a(st, a);
+    if (R.is_err[bool, str](res_ld)) { ret res_ld; }
+
+    if (op == mir.MIR_ADD) { enc.emit_byte(?st.buf, OP_CLC); }
+    if (op == mir.MIR_SUB) { enc.emit_byte(?st.buf, OP_SEC); }
+
+    var imm_op: u8 = 0;
+    var zp_op:  u8 = 0;
+    if (op == mir.MIR_ADD) { imm_op = OP_ADC_IMM; zp_op = OP_ADC_ZP; }
+    or (op == mir.MIR_SUB) { imm_op = OP_SBC_IMM; zp_op = OP_SBC_ZP; }
+    or (op == mir.MIR_AND) { imm_op = OP_AND_IMM; zp_op = OP_AND_ZP; }
+    or (op == mir.MIR_OR)  { imm_op = OP_ORA_IMM; zp_op = OP_ORA_ZP; }
+    or                     { imm_op = OP_EOR_IMM; zp_op = OP_EOR_ZP; }
+
+    val res_op: R.Result[bool, str] = emit_operand(st, b, imm_op, zp_op, op);
+    if (R.is_err[bool, str](res_op)) { ret res_op; }
+    emit_zp1(st, OP_STA_ZP, mos6502.zp_addr(dst.preg::i32));
+    ret R.ok[bool, str](true);
+}
+
+# encode a byte complement `dst = ~a` as `LDA a ; EOR #$FF ; STA dst`
+fun encode_not(st: *enc.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count != 2) { ret R.err[bool, str]("mos6502: malformed not"); }
+    val dst: *mir.MirOperand = ?mi.operands[0];
+    if (dst.kind != mir.MIR_OP_PREG) { ret R.err[bool, str](unencodable_message(mir.MIR_NOT)); }
+    val res_ld: R.Result[bool, str] = emit_load_a(st, ?mi.operands[1]);
+    if (R.is_err[bool, str](res_ld)) { ret res_ld; }
+    emit_imm1(st, OP_EOR_IMM, 0xFF);
+    emit_zp1(st, OP_STA_ZP, mos6502.zp_addr(dst.preg::i32));
+    ret R.ok[bool, str](true);
+}
+
+# encode a direct call as `JSR callee` (absolute), recording a relocation against
+# the callee symbol for the 16-bit address field
+fun encode_call(st: *enc.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count == 0) { ret R.err[bool, str]("mos6502: malformed call"); }
+    val callee: *mir.MirOperand = ?mi.operands[0];
+    if (callee.kind != mir.MIR_OP_SYM) {
+        ret R.err[bool, str]("mos6502: indirect call is not yet encoded on this target");
+    }
+    enc.emit_byte(?st.buf, OP_JSR_ABS);
+    val site: u32 = st.buf.len::u32;
+    val res_rel: R.Result[bool, str] = enc.push_reloc(st, site, of.RK_ABS64, callee.sym, callee.sym_off);
+    if (R.is_err[bool, str](res_rel)) { ret res_rel; }
+    # 16-bit absolute address placeholder patched by the linker via the relocation.
+    enc.emit_byte(?st.buf, 0);
+    enc.emit_byte(?st.buf, 0);
+    ret R.ok[bool, str](true);
+}
+
+# load the accumulator from an immediate or a zero-page value register
+fun emit_load_a(st: *enc.EncodeState, src: *mir.MirOperand) R.Result[bool, str] {
+    if (src.kind == mir.MIR_OP_IMM)  { emit_imm1(st, OP_LDA_IMM, (src.imm & 0xFF)::u8); ret R.ok[bool, str](true); }
+    if (src.kind == mir.MIR_OP_PREG) { emit_zp1(st, OP_LDA_ZP, mos6502.zp_addr(src.preg::i32)); ret R.ok[bool, str](true); }
+    ret R.err[bool, str]("mos6502: unsupported source operand for accumulator load");
+}
+
+# emit an operation's right operand as an immediate or zero-page form
+fun emit_operand(st: *enc.EncodeState, b: *mir.MirOperand, imm_op: u8, zp_op: u8, op: mir.MirOpcode) R.Result[bool, str] {
+    if (b.kind == mir.MIR_OP_IMM)  { emit_imm1(st, imm_op, (b.imm & 0xFF)::u8); ret R.ok[bool, str](true); }
+    if (b.kind == mir.MIR_OP_PREG) { emit_zp1(st, zp_op, mos6502.zp_addr(b.preg::i32)); ret R.ok[bool, str](true); }
+    ret R.err[bool, str](unencodable_message(op));
+}
+
+# emit a two-byte immediate-mode instruction (opcode + 8-bit immediate)
+fun emit_imm1(st: *enc.EncodeState, opcode: u8, value: u8) {
+    enc.emit_byte(?st.buf, opcode);
+    enc.emit_byte(?st.buf, value);
+}
+
+# emit a two-byte zero-page instruction (opcode + 8-bit zero-page address)
+fun emit_zp1(st: *enc.EncodeState, opcode: u8, addr: i32) {
+    enc.emit_byte(?st.buf, opcode);
+    enc.emit_byte(?st.buf, (addr & 0xFF)::u8);
+}
+
+# write one resolved branch displacement into the text (driver pass 2)
+#
+# No branch form is emitted yet (conditional branches are a documented frontier),
+# so no fixup is ever recorded and this is never called; it exists to satisfy the
+# driver's hook contract.
+fun patch_branch(st: *enc.EncodeState, fx: *enc.BranchFixup, target_off: u32) R.Result[bool, str] {
+    ret R.err[bool, str]("mos6502: branch relaxation is not yet implemented");
+}
+
+# the diagnostic for a generic opcode this encoder does not yet realize
+# ---
+# op:  the unencodable opcode
+# ret: the diagnostic string
+fun unencodable_message(op: mir.MirOpcode) str {
+    if (op == mir.MIR_MUL)   { ret "mos6502: the 6502 has no hardware multiply; use a constant-multiplier strength reduction or a runtime routine"; }
+    if (op == mir.MIR_DIV_S || op == mir.MIR_DIV_U ||
+        op == mir.MIR_REM_S || op == mir.MIR_REM_U) {
+        ret "mos6502: the 6502 has no hardware divide / remainder";
+    }
+    if (op == mir.MIR_FADD || op == mir.MIR_FSUB || op == mir.MIR_FMUL || op == mir.MIR_FDIV) {
+        ret "mos6502: floating-point is unsupported on this target";
+    }
+    if (op == mir.MIR_LOAD || op == mir.MIR_STORE || op == mir.MIR_GEP || op == mir.MIR_ALLOCA) {
+        ret "mos6502: memory access encoding is not yet implemented on this target";
+    }
+    if (op == mir.MIR_CBR || op == mir.MIR_BR ||
+        op == mir.MIR_CMP_EQ || op == mir.MIR_CMP_NE ||
+        op == mir.MIR_CMP_LT_S || op == mir.MIR_CMP_LT_U ||
+        op == mir.MIR_CMP_LE_S || op == mir.MIR_CMP_LE_U) {
+        ret "mos6502: compare / branch encoding is not yet implemented on this target";
+    }
+    ret "mos6502: instruction encoding is not yet implemented on this target";
+}
+
+# the byte encodings match the published 6502 opcode matrix: LDA #imm (A9),
+# STA zp (85), the ADC/SBC/AND/ORA/EOR immediate and zero-page forms, CLC/SEC, and
+# the implied RTS / BRK / NOP. this byte-pins the emitter helpers against the
+# reference without needing the full pipeline
+test "mach.lang.target.isa.mos6502.encode:byte_pins" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var st: enc.EncodeState;
+    st.buf = enc.buf_init(?alloc);
+
+    # LDA #$2A -> A9 2A
+    emit_imm1(?st, OP_LDA_IMM, 0x2A);
+    if (st.buf.data[0] != 0xA9 || st.buf.data[1] != 0x2A) { ret 1; }
+
+    # STA $18 -> 85 18  (value register id 8 maps to zero-page $18)
+    emit_zp1(?st, OP_STA_ZP, mos6502.zp_addr(8));
+    if (st.buf.data[2] != 0x85 || st.buf.data[3] != 0x18) { ret 1; }
+
+    # CLC ; ADC $19 -> 18 65 19
+    enc.emit_byte(?st.buf, OP_CLC);
+    emit_zp1(?st, OP_ADC_ZP, mos6502.zp_addr(9));
+    if (st.buf.data[4] != 0x18 || st.buf.data[5] != 0x65 || st.buf.data[6] != 0x19) { ret 1; }
+
+    # SEC ; SBC #$01 -> 38 E9 01
+    enc.emit_byte(?st.buf, OP_SEC);
+    emit_imm1(?st, OP_SBC_IMM, 0x01);
+    if (st.buf.data[7] != 0x38 || st.buf.data[8] != 0xE9 || st.buf.data[9] != 0x01) { ret 1; }
+
+    # EOR #$FF -> 49 FF  (the complement idiom)
+    emit_imm1(?st, OP_EOR_IMM, 0xFF);
+    if (st.buf.data[10] != 0x49 || st.buf.data[11] != 0xFF) { ret 1; }
+
+    # RTS -> 60
+    enc.emit_byte(?st.buf, OP_RTS);
+    if (st.buf.data[12] != 0x60) { ret 1; }
+
+    enc.buf_dnit(?st.buf);
+    ret 0;
+}
