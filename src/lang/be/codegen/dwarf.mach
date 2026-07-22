@@ -31,20 +31,20 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
-use enc:     mach.lang.be.codegen.encode;
-use obj:     mach.lang.be.obj;
-use ir:      mach.lang.me.ir;
+use enc: mach.lang.be.codegen.encode;
+use mach.lang.be.obj;
+use mach.lang.me.ir;
 use ir_type: mach.lang.me.ir.type;
-use id:      mach.lang.me.ir.id;
-use intern:  mach.lang.intern;
-use session: mach.lang.session;
-use source:  mach.lang.source;
+use mach.lang.me.ir.id;
+use mach.lang.intern;
+use mach.lang.session;
+use mach.lang.source;
 use semtype: mach.lang.type;
-use generics: mach.lang.fe.sema.generics;
-use target:  mach.lang.target.resolved;
-use isa:     mach.lang.target.isa;
-use of:      mach.lang.target.of;
-use bin:     mach.lang.target.of.bin;
+use mach.lang.fe.sema.generics;
+use target: mach.lang.target.resolved;
+use mach.lang.target.isa;
+use mach.lang.target.of;
+use mach.lang.target.of.bin;
 
 use std.allocator.page;
 
@@ -148,6 +148,18 @@ val DW_OP_constu:      u8 = 0x10;
 val DW_OP_consts:      u8 = 0x11;
 val DW_OP_minus:       u8 = 0x1c;
 val DW_OP_stack_value: u8 = 0x9f;
+# the fused-condition computed-value expression's alphabet (#1705 follow-on):
+# width normalization (shift pair / mask / wrap-bias) and the signed relational
+# operators DWARF defines on the generic type
+val DW_OP_const1u:     u8 = 0x08;
+val DW_OP_and:         u8 = 0x1a;
+val DW_OP_plus:        u8 = 0x22;
+val DW_OP_shl:         u8 = 0x24;
+val DW_OP_shra:        u8 = 0x26;
+val DW_OP_eq:          u8 = 0x29;
+val DW_OP_le:          u8 = 0x2c;
+val DW_OP_lt:          u8 = 0x2d;
+val DW_OP_ne:          u8 = 0x2e;
 
 # DWARF 5 unit header: unit_type for a full compile unit
 val DW_UT_compile: u8 = 0x01;
@@ -342,6 +354,11 @@ val VLOC_NONE:  u8 = 0;
 val VLOC_REG:   u8 = 1;
 val VLOC_FRAME: u8 = 2;
 val VLOC_CONST: u8 = 4;
+# the fused-condition computed value: the range's variable IS the relation
+# `cc(lhs, rhs)` evaluated over two operand sub-homes, emitted as a composed
+# DW_OP expression (never a stationary single-location - classify_var forces
+# the loclist tier so the range stays bounded to the fused terminator's bytes)
+val VLOC_CMP:   u8 = 5;
 
 # a source variable's DWARF DIE data, joined from the IR dbg-var identity and the
 # per-PC variable-location records. A DW_TAG_variable (or DW_TAG_formal_parameter)
@@ -394,10 +411,17 @@ rec DwVar {
 # caveat it inherits from #1904
 # ---
 # start/end: absolute `.text` byte range this home governs
-# kind:      VLOC_NONE / VLOC_REG / VLOC_FRAME
-# reg:       DWARF register number when kind == VLOC_REG
-# off:       frame-base offset when kind == VLOC_FRAME
-# net:       salvage net constant (0 = identity)
+# kind:      VLOC_NONE / VLOC_REG / VLOC_FRAME / VLOC_CMP
+# reg:       DWARF register number when kind == VLOC_REG; the lhs operand's
+#            DWARF register for a VLOC_CMP with kind1 VLOC_REG
+# off:       frame-base offset when kind == VLOC_FRAME; the lhs operand's frame
+#            offset or constant bits for a VLOC_CMP
+# net:       salvage net constant (0 = identity; a VLOC_CMP carries none)
+# kind1/kind2: VLOC_CMP operand sub-homes (VLOC_REG / VLOC_FRAME / VLOC_CONST)
+# reg2/off2:   the rhs operand's payload, mirroring reg / off
+# cmp_rel:     the relation (encoder CMPREL_*) for a VLOC_CMP
+# cmp_signed:  true for a signed relation
+# cmp_width:   compare width in bytes (0 reads as the machine word)
 rec LocRange {
     start:   u32;
     end:     u32;
@@ -406,6 +430,13 @@ rec LocRange {
     off:     i64;
     net:     i64;
     storage: bool;
+    kind1:      u8;
+    kind2:      u8;
+    reg2:       i32;
+    off2:       i64;
+    cmp_rel:    u8;
+    cmp_signed: bool;
+    cmp_width:  u8;
 }
 
 # one inlined-subroutine instance, emitted as a DW_TAG_inlined_subroutine nested under
@@ -452,6 +483,9 @@ rec DwInlineRange {
 # ret:         true when they name the same location
 fun home_eq(k1: u8, r1: i32, o1: i64, n1: i64, k2: u8, r2: i32, o2: i64, n2: i64) bool {
     if (k1 != k2) { ret false; }
+    # a computed compare is never "the same home" as anything - it must stay a
+    # distinct bounded loclist range, never collapse into a stationary location.
+    if (k1 == VLOC_CMP || k2 == VLOC_CMP) { ret false; }
     if (k1 == VLOC_REG)   { ret r1 == r2 && n1 == n2; }
     if (k1 == VLOC_FRAME) { ret o1 == o2 && n1 == n2; }
     if (k1 == VLOC_CONST) { ret o1 + n1 == o2 + n2; }
@@ -926,7 +960,7 @@ fun sem_to_ir_nominal(s: *session.Session, irmod: *ir.Module, tid: semtype.TypeI
 # A subprogram's DW_AT_frame_base is `DW_OP_reg<this>`, so `-g` debug info relies on
 # a retained frame pointer (the epic pins one instead of emitting CFI). The back end
 # always emits the rbp/x29/s0 prologue today; a future frame-pointer-omission
-# optimization must stay disabled under `session.debug` or DW_AT_fbreg locations and
+# optimization must stay disabled under a debug build or DW_AT_fbreg locations and
 # `DW_AT_frame_base` would point at a clobbered register.
 # ---
 # tgt: the resolved target
@@ -1798,6 +1832,149 @@ fun emit_counted_loc(b: *enc.ByteBuf, kind: u8, reg: i32, off: i64, net: i64, by
     enc.buf_dnit(?e);
 }
 
+# the DWARF relational opcode for a digested relation (encoder CMPREL_*). the
+# operators are SIGNED over the generic type; `build_cmp_operand`'s width
+# normalization makes the signed comparison exact for every covered relation
+fun cmp_rel_op(rel: u8) u8 {
+    if (rel == enc.CMPREL_EQ) { ret DW_OP_eq; }
+    if (rel == enc.CMPREL_NE) { ret DW_OP_ne; }
+    if (rel == enc.CMPREL_LT) { ret DW_OP_lt; }
+    ret DW_OP_le;
+}
+
+# host-interpret a constant compare operand at the compare width, into the same
+# normalized space the register fragments compute in: a sub-word constant
+# arrives width-masked, so a signed relation re-signs its low bytes and an
+# unsigned relation (and equality) masks to them; a machine-word unsigned
+# ordering applies the +2^63 wrap-bias (as an XOR of the top bit - identical
+# modulo 2^64) so the signed DWARF comparison reads unsigned order
+# ---
+# bits:   the operand's raw immediate bits
+# width:  the compare width (0 reads as the machine word)
+# signed: true for a signed relation
+# bias:   true when the machine-word wrap-bias applies (unsigned ordering at w8)
+# ret:    the exact value the expression pushes
+fun cmp_const_value(bits: i64, width: u8, signed: bool, bias: bool) i64 {
+    if (width == 1) {
+        var v: i64 = bits & 0xFF;
+        if (signed && (v & 0x80) != 0) { v = v - 0x100; }
+        ret v;
+    }
+    if (width == 2) {
+        var v: i64 = bits & 0xFFFF;
+        if (signed && (v & 0x8000) != 0) { v = v - 0x10000; }
+        ret v;
+    }
+    if (width == 4) {
+        var v: i64 = bits & 0xFFFFFFFF;
+        if (signed && (v & 0x80000000) != 0) { v = v - 0x100000000; }
+        ret v;
+    }
+    if (bias) {
+        val minv: i64 = -9223372036854775807 - 1;
+        ret bits ^ minv;
+    }
+    ret bits;
+}
+
+# append one normalized operand fragment of a computed-compare expression. a
+# constant pushes its host-interpreted value directly; a register or frame home
+# pushes the raw 64-bit value (DW_OP_breg + 0, or DW_OP_fbreg + DW_OP_deref for
+# a spill slot holding the machine word) and then normalizes it AT THE COMPARE
+# WIDTH - register conventions differ per arch and width (a 32-bit x86-64 write
+# zero-extends where riscv64 sign-extends; sub-word high bits are unspecified),
+# so the expression must not trust the high bits any more than the fused
+# encoders do:
+#   - sub-word / word signed: shift left then arithmetic right (exact sext)
+#   - sub-word / word unsigned and equality: mask (values < 2^63, so the signed
+#     relational op reads unsigned order exactly)
+#   - machine-word signed / equality: the raw value is already exact
+#   - machine-word unsigned ordering: +2^63 wrap-bias on both operands (modulo
+#     2^64, so (a + 2^63) < (b + 2^63) signed == a < b unsigned)
+# ---
+# e:      the expression buffer
+# kind:   the operand sub-home (VLOC_REG / VLOC_FRAME / VLOC_CONST)
+# reg:    the DWARF register number for VLOC_REG
+# off:    the frame offset for VLOC_FRAME; the raw constant bits for VLOC_CONST
+# width:  the compare width (0 reads as the machine word)
+# signed: true for a signed relation
+# bias:   true when the machine-word wrap-bias applies
+fun build_cmp_operand(e: *enc.ByteBuf, kind: u8, reg: i32, off: i64, width: u8, signed: bool, bias: bool) {
+    if (kind == VLOC_CONST) {
+        enc.emit_byte(e, DW_OP_consts);
+        sleb(e, cmp_const_value(off, width, signed, bias));
+        ret;
+    }
+    if (kind == VLOC_REG) {
+        emit_reg_op(e, DW_OP_breg0, 0, reg);
+        sleb(e, 0);
+    }
+    or {   # VLOC_FRAME: the spill slot holds the machine-word value
+        enc.emit_byte(e, DW_OP_fbreg);
+        sleb(e, off);
+        enc.emit_byte(e, DW_OP_deref);
+    }
+    if (width == 1 || width == 2 || width == 4) {
+        val sh: u8 = 64 - (width * 8);
+        if (signed) {
+            enc.emit_byte(e, DW_OP_const1u);
+            enc.emit_byte(e, sh);
+            enc.emit_byte(e, DW_OP_shl);
+            enc.emit_byte(e, DW_OP_const1u);
+            enc.emit_byte(e, sh);
+            enc.emit_byte(e, DW_OP_shra);
+        }
+        or {
+            var mask: u64 = 0xFF;
+            if (width == 2) { mask = 0xFFFF; }
+            if (width == 4) { mask = 0xFFFFFFFF; }
+            enc.emit_byte(e, DW_OP_constu);
+            uleb(e, mask);
+            enc.emit_byte(e, DW_OP_and);
+        }
+        ret;
+    }
+    if (bias) {
+        enc.emit_byte(e, DW_OP_constu);
+        uleb(e, 9223372036854775808);
+        enc.emit_byte(e, DW_OP_plus);
+    }
+}
+
+# append the full computed-compare expression for a VLOC_CMP range: both
+# normalized operand fragments, the signed relational operator, and
+# DW_OP_stack_value (the result is the relation's 0/1 value, not a location)
+# ---
+# e:  the expression buffer
+# rg: the VLOC_CMP range carrying the digested relation and both sub-homes
+fun build_cmp_ops(e: *enc.ByteBuf, rg: *LocRange) {
+    var w: u8 = rg.cmp_width;
+    if (w == 0) { w = 8; }
+    # equality needs no bias at the machine word (raw 64-bit equality is exact);
+    # only an unsigned ORDERING there does.
+    val bias: bool = w == 8 && !rg.cmp_signed &&
+                     (rg.cmp_rel == enc.CMPREL_LT || rg.cmp_rel == enc.CMPREL_LE);
+    build_cmp_operand(e, rg.kind1, rg.reg, rg.off, w, rg.cmp_signed, bias);
+    build_cmp_operand(e, rg.kind2, rg.reg2, rg.off2, w, rg.cmp_signed, bias);
+    enc.emit_byte(e, cmp_rel_op(rg.cmp_rel));
+    enc.emit_byte(e, DW_OP_stack_value);
+}
+
+# emit a VLOC_CMP range's counted location description: a uleb byte-length
+# prefix then the computed-compare expression, the two-home analogue of
+# emit_counted_loc
+# ---
+# b:  the destination buffer
+# rg: the VLOC_CMP range
+fun emit_counted_cmp_loc(b: *enc.ByteBuf, rg: *LocRange) {
+    var e: enc.ByteBuf = enc.buf_init(b.alloc);
+    build_cmp_ops(?e, rg);
+    uleb(b, e.len::u64);
+    var i: usize = 0;
+    for (i < e.len) { enc.emit_byte(b, e.data[i]); i = i + 1; }
+    enc.buf_dnit(?e);
+}
+
 # emit a variable's single-location DW_AT_location exprloc from its stationary home
 # ---
 # b: the info buffer
@@ -1861,7 +2038,8 @@ fun build_loclists(b: *enc.ByteBuf, funcs: *DwFunc, nfuncs: u32, vars: *DwVar, r
                     enc.emit_byte(b, DW_LLE_offset_pair);
                     uleb(b, (rg.start - fn.offset)::u64);
                     uleb(b, (rg.end - fn.offset)::u64);
-                    emit_counted_loc(b, rg.kind, rg.reg, rg.off, rg.net, v.byref, rg.storage);
+                    if (rg.kind == VLOC_CMP) { emit_counted_cmp_loc(b, rg); }
+                    or                       { emit_counted_loc(b, rg.kind, rg.reg, rg.off, rg.net, v.byref, rg.storage); }
                 }
                 r = r + 1;
             }
@@ -2259,6 +2437,19 @@ fun add_reloc_addend(image: *of.ObjectImage, sec: u32, offset: u32, kind: of.Rel
     ret obj.add_relocation(image, rel);
 }
 
+# the concrete signature the erased `of.DebugVTable.produce` pointer is cast back to
+#
+# The debug-info analogue of the linker's `ApplyRelocFn`: the vtable stores the
+# producer type-erased (`*u8`) because its signature names the session, the resolved
+# target, the IR module, and the encoder's output - every one of which imports the
+# target layer the vtable lives in - so a typed field there would invert the
+# dependency. `be.codegen` casts `tgt.debug.produce` back to this before calling it.
+pub def ProduceFn: fun(*session.Session, *target.Target, *ir.Module,
+                       *of.ObjectImage, *enc.LineRow, u32,
+                       *enc.VarLoc, u32,
+                       *enc.InlinePc, u32,
+                       intern.StrId, intern.StrId, u32) R.Result[bool, str];
+
 # emit the module's DWARF 5 `.debug_abbrev` / `.debug_info` / `.debug_line` sections
 # into `image`, driven by the encoder's PC<->source rows and the `.text` function
 # symbols
@@ -2268,7 +2459,7 @@ fun add_reloc_addend(image: *of.ObjectImage, sec: u32, offset: u32, kind: of.Rel
 # ELF and Mach-O. A module with no `.text` function is a no-op. Frees every scratch
 # buffer and array before returning.
 # ---
-# s:        session (source map, debug producer / comp_dir strings, type universe)
+# s:        session (source map, type universe)
 # tgt:      resolved target (address size, frame-pointer register)
 # irmod:    IR module supplying each function's source name and semantic return type
 # image:    the per-module object image being built
@@ -2276,19 +2467,22 @@ fun add_reloc_addend(image: *of.ObjectImage, sec: u32, offset: u32, kind: of.Rel
 # row_count: number of rows
 # varlocs:  the encoder's re-homed per-PC variable-location records
 # varloc_count: number of variable-location records
+# producer_id: interned DW_AT_producer string
+# comp_dir_id: interned DW_AT_comp_dir (the project root)
 # text_sec: the `.text` section index
 # ret:      ok(true) on success, or an allocation error
 pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
                 image: *of.ObjectImage, rows: *enc.LineRow, row_count: u32,
                 varlocs: *enc.VarLoc, varloc_count: u32,
-                inline_pcs: *enc.InlinePc, inline_pc_count: u32, text_sec: u32) R.Result[bool, str] {
+                inline_pcs: *enc.InlinePc, inline_pc_count: u32,
+                producer_id: intern.StrId, comp_dir_id: intern.StrId, text_sec: u32) R.Result[bool, str] {
     val nfuncs: u32 = count_funcs(image, text_sec);
     if (nfuncs == 0) { ret R.ok[bool, str](true); }
 
     val address_size: u8 = tgt.arch.pointer_width::u8;
     val itn: *intern.Interner = image.interner;
-    val producer: str = resolve(itn, s.debug_producer);
-    val comp_dir: str = resolve(itn, s.debug_comp_dir);
+    val producer: str = resolve(itn, producer_id);
+    val comp_dir: str = resolve(itn, comp_dir_id);
 
     # gather + sort the functions.
     val rf: R.Result[*DwFunc, str] = A.allocate[DwFunc](s.alloc, nfuncs::usize);
@@ -2545,6 +2739,41 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     A.deallocate[DwFunc](s.alloc, subs, nfuncs::usize);
     A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize);
     ret pr;
+}
+
+# the DWARF debug-model vtable, wired into a target registry's debug dimension
+#
+# The debug analogue of a per-arch `IsaVTable`: its identity (id / name) is fixed
+# and its `produce` hook points at this module's `produce`, erased. `select_of`
+# resolves it onto a target whose object format declares `default_debug = "dwarf"`.
+var dwarf_debug_vtable: of.DebugVTable;
+
+# install the DWARF producer into a target registry's debug dimension
+#
+# The debug-dimension counterpart of `be.linker.register_reloc_hooks`: the target
+# layer owns the `DebugRegistry` slot but cannot name this be-layer producer, so
+# the wiring lands here. Sets the DWARF vtable's identity and its erased `produce`
+# hook, then registers it under "dwarf" - the name elf / mach-o's `default_debug`
+# resolves against. Idempotent: `debug_register` keeps the first write-once entry.
+# Must run at startup (from `driver.setup_registry`) before any `select`.
+# ---
+# reg: the debug registry to install the DWARF producer into
+# ret: ok(true) once registered
+pub fun register_debug_hooks(reg: *of.DebugRegistry) R.Result[bool, str] {
+    # the target layer registered the model's identity (register_all); wire the
+    # producer onto that entry, mirroring how register_reloc_hooks mutates the
+    # registered ISA vtables. a registry composed without the identities (a
+    # be-layer test's scratch registry) still gets the full vtable registered.
+    val opt_dw: O.Option[*of.DebugVTable] = of.debug_lookup(reg, "dwarf");
+    if (O.is_some[*of.DebugVTable](opt_dw)) {
+        O.unwrap[*of.DebugVTable](opt_dw).produce = produce::*u8;
+        ret R.ok[bool, str](true);
+    }
+    dwarf_debug_vtable.id      = of.DBG_DWARF;
+    dwarf_debug_vtable.name    = "dwarf";
+    dwarf_debug_vtable.produce = produce::*u8;
+    of.debug_register(reg, ?dwarf_debug_vtable);
+    ret R.ok[bool, str](true);
 }
 
 # resolve each function's subprogram metadata and gather the distinct types its return
@@ -2820,6 +3049,10 @@ fun gather_vars(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, irf
             var reg:  i32 = 0;
             var off:  i64 = 0;
             var storage: bool = false;
+            var end: u32 = hi;
+            var kind1: u8 = VLOC_NONE; var kind2: u8 = VLOC_NONE;
+            var reg2: i32 = 0; var off2: i64 = 0;
+            var cmp_rel: u8 = 0; var cmp_signed: bool = false; var cmp_width: u8 = 0;
             varloc_home(tgt, vl, ?kind, ?reg, ?off, ?storage);
             # a binding with no register/frame home may still be a compile-time constant
             # (a folded local): render it as a computed DW_OP_const value rather than
@@ -2828,26 +3061,90 @@ fun gather_vars(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, irf
                 val oc: O.Option[i64] = ir.dbg_value_const(irfn, vl.iid::id.InstructionId);
                 if (O.is_some[i64](oc)) { kind = VLOC_CONST; off = O.unwrap[i64](oc); }
             }
+            # a fused-condition computed value: map both operand sub-homes (a
+            # register through the ISA's DWARF numbering; a spill slot to its
+            # frame offset; an immediate to a constant) and bound the range to
+            # the fused terminator's byte extent the encoder recorded. an
+            # operand register with no DWARF number degrades the range to an
+            # optimized-out gap rather than a half-computable expression.
+            if (vl.kind == enc.VARLOC_CMP) {
+                kind1 = cmp_sub_home(tgt, vl.sub_lhs, vl.reg, vl.off, ?reg, ?off);
+                kind2 = cmp_sub_home(tgt, vl.sub_rhs, vl.reg2, vl.off2, ?reg2, ?off2);
+                if (kind1 == VLOC_NONE || kind2 == VLOC_NONE) {
+                    kind = VLOC_NONE;
+                }
+                or {
+                    kind       = VLOC_CMP;
+                    cmp_rel    = vl.cmp_rel;
+                    cmp_signed = vl.cmp_signed;
+                    cmp_width  = vl.cmp_width;
+                    if (vl.end_offset != 0) { end = vl.end_offset; }
+                }
+            }
             ranges[@range_count].start   = vl.text_offset;
-            ranges[@range_count].end     = hi;
+            ranges[@range_count].end     = end;
             ranges[@range_count].kind    = kind;
             ranges[@range_count].reg     = reg;
             ranges[@range_count].off     = off;
             ranges[@range_count].net     = dbg_expr_net(irfn, vl.iid::id.InstructionId);
             ranges[@range_count].storage = storage;
+            ranges[@range_count].kind1      = kind1;
+            ranges[@range_count].kind2      = kind2;
+            ranges[@range_count].reg2       = reg2;
+            ranges[@range_count].off2       = off2;
+            ranges[@range_count].cmp_rel    = cmp_rel;
+            ranges[@range_count].cmp_signed = cmp_signed;
+            ranges[@range_count].cmp_width  = cmp_width;
             @range_count = @range_count + 1;
             k = k + 1;
         }
         v.range_count = @range_count - v.range_start;
 
-        # order by PC; a binding governs until the next binding's start, the last to hi.
+        # order by PC; a binding governs until the next binding's start, the last
+        # to hi - except a VLOC_CMP range, whose end is already bounded to its
+        # fused terminator's bytes (always at or before the next binding).
         sort_ranges(ranges, v.range_start, @range_count);
         var r: u32 = v.range_start;
-        for (r + 1 < @range_count) { ranges[r].end = ranges[r + 1].start; r = r + 1; }
+        for (r + 1 < @range_count) {
+            if (ranges[r].kind != VLOC_CMP) { ranges[r].end = ranges[r + 1].start; }
+            r = r + 1;
+        }
 
         classify_var(v, ranges);
         vi = vi + 1;
     }
+}
+
+# map one fused-compare operand sub-home from the encoder's raw record to the
+# producer's VLOC space: a register through the ISA's DWARF numbering (no
+# number -> VLOC_NONE, degrading the whole range), a spill slot to its
+# frame-base offset, an immediate to a VLOC_CONST carrying its raw bits
+# ---
+# tgt:     resolved target, for the ISA dwarf_reg hook
+# sub:     the encoder sub-home kind (enc.VARLOC_REG / VARLOC_FRAME / VARLOC_IMM)
+# raw_reg: the encoder's physical register id
+# raw_off: the encoder's frame offset or immediate bits
+# out_reg/out_off: the mapped payload
+# ret:     the mapped sub-home kind, or VLOC_NONE when unmappable
+fun cmp_sub_home(tgt: *target.Target, sub: u8, raw_reg: i32, raw_off: i64, out_reg: *i32, out_off: *i64) u8 {
+    @out_reg = 0;
+    @out_off = 0;
+    if (sub == enc.VARLOC_REG) {
+        val f: isa.DwarfRegFn = tgt.arch.dwarf_reg::isa.DwarfRegFn;
+        val d: i32 = f(raw_reg);
+        if (d < 0) { ret VLOC_NONE; }
+        @out_reg = d;
+        ret VLOC_REG;
+    }
+    if (sub == enc.VARLOC_FRAME) {
+        @out_off = raw_off;
+        ret VLOC_FRAME;
+    }
+    if (sub == enc.VARLOC_IMM) {
+        @out_off = raw_off;
+        ret VLOC_CONST;
+    }
+    ret VLOC_NONE;
 }
 
 # join a variable-location record to its IR dbg-var identity and return the variable's
@@ -2936,6 +3233,10 @@ fun classify_var(v: *DwVar, ranges: *LocRange) {
     }
     if (first < 0) { v.loc_kind = VLOC_NONE; v.range_count = 0; ret; }
     if (multi)     { v.loc_kind = VLOC_LOCLIST; ret; }
+    # a single computed-compare binding still takes the loclist tier: its range
+    # is bounded to the fused terminator's bytes, which a whole-scope
+    # single-location DW_AT_location cannot express.
+    if (ranges[first::u32].kind == VLOC_CMP) { v.loc_kind = VLOC_LOCLIST; ret; }
     v.loc_kind    = ranges[first::u32].kind;
     v.reg         = ranges[first::u32].reg;
     v.offset      = ranges[first::u32].off;
@@ -3431,6 +3732,138 @@ fun buf_eq(b: *enc.ByteBuf, expect: *u8, n: usize) bool {
 }
 
 # uleb / sleb encode to the canonical DWARF byte sequences
+# helper for the computed-compare expression pins: a VLOC_CMP range over the
+# given sub-homes and digest
+fun t_cmp_range(k1: u8, reg: i32, off: i64, k2: u8, reg2: i32, off2: i64,
+                rel: u8, signed: bool, width: u8) LocRange {
+    var rg: LocRange;
+    rg.start = 0; rg.end = 0;
+    rg.kind = VLOC_CMP; rg.net = 0; rg.storage = false;
+    rg.kind1 = k1; rg.reg  = reg;  rg.off  = off;
+    rg.kind2 = k2; rg.reg2 = reg2; rg.off2 = off2;
+    rg.cmp_rel = rel; rg.cmp_signed = signed; rg.cmp_width = width;
+    ret rg;
+}
+
+# compare `e`'s bytes against `want[0..n)`; 0 on match
+fun t_cmp_bytes(e: *enc.ByteBuf, want: *u8, n: usize) i32 {
+    if (e.len != n) { ret 1; }
+    var i: usize = 0;
+    for (i < n) {
+        if (e.data[i] != want[i]) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the computed-compare expressions are byte-exact per normalization variant:
+# signed sub-word operands sign-extend with the shl/shra pair, unsigned and
+# equality sub-word operands mask, machine-word signed / equality compare raw,
+# and the machine-word unsigned ordering wrap-biases both operands; a constant
+# operand pushes its host-interpreted value and a spilled operand loads through
+# DW_OP_fbreg + DW_OP_deref. every relation maps to its signed DWARF operator
+# and every expression ends in DW_OP_stack_value
+test "mach.lang.be.codegen.dwarf.build_cmp_ops:expression_pins" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    # signed i32 lt over two registers (DWARF 5 and 6):
+    # breg5 0 ; sext32 ; breg6 0 ; sext32 ; lt ; stack_value
+    var e: enc.ByteBuf = enc.buf_init(?alloc);
+    var rg: LocRange = t_cmp_range(VLOC_REG, 5, 0, VLOC_REG, 6, 0, enc.CMPREL_LT, true, 4);
+    build_cmp_ops(?e, ?rg);
+    var w1: [18]u8;
+    w1[0]=0x75; w1[1]=0x00; w1[2]=0x08; w1[3]=0x20; w1[4]=0x24; w1[5]=0x08; w1[6]=0x20; w1[7]=0x26;
+    w1[8]=0x76; w1[9]=0x00; w1[10]=0x08; w1[11]=0x20; w1[12]=0x24; w1[13]=0x08; w1[14]=0x20; w1[15]=0x26;
+    w1[16]=0x2D; w1[17]=0x9F;
+    if (t_cmp_bytes(?e, ?w1[0], 18) != 0) { code = 1; }
+    enc.buf_dnit(?e);
+
+    # unsigned u16 le of a register against constant 40000:
+    # breg5 0 ; constu 0xffff ; and ; consts 40000 ; le ; stack_value
+    e = enc.buf_init(?alloc);
+    rg = t_cmp_range(VLOC_REG, 5, 0, VLOC_CONST, 0, 40000, enc.CMPREL_LE, false, 2);
+    build_cmp_ops(?e, ?rg);
+    var w2: [13]u8;
+    w2[0]=0x75; w2[1]=0x00; w2[2]=0x10; w2[3]=0xFF; w2[4]=0xFF; w2[5]=0x03; w2[6]=0x1A;
+    w2[7]=0x11; w2[8]=0xC0; w2[9]=0xB8; w2[10]=0x02; w2[11]=0x2C; w2[12]=0x9F;
+    if (t_cmp_bytes(?e, ?w2[0], 13) != 0) { code = 2; }
+    enc.buf_dnit(?e);
+
+    # machine-word equality over two registers: raw values, no normalization.
+    e = enc.buf_init(?alloc);
+    rg = t_cmp_range(VLOC_REG, 0, 0, VLOC_REG, 1, 0, enc.CMPREL_EQ, false, 8);
+    build_cmp_ops(?e, ?rg);
+    var w3: [6]u8;
+    w3[0]=0x70; w3[1]=0x00; w3[2]=0x71; w3[3]=0x00; w3[4]=0x29; w3[5]=0x9F;
+    if (t_cmp_bytes(?e, ?w3[0], 6) != 0) { code = 3; }
+    enc.buf_dnit(?e);
+
+    # machine-word UNSIGNED lt over two registers: both operands wrap-biased by
+    # +2^63 (uleb 0x80 x9, 0x01) so the signed operator reads unsigned order.
+    e = enc.buf_init(?alloc);
+    rg = t_cmp_range(VLOC_REG, 0, 0, VLOC_REG, 1, 0, enc.CMPREL_LT, false, 8);
+    build_cmp_ops(?e, ?rg);
+    var w4: [28]u8;
+    w4[0]=0x70; w4[1]=0x00; w4[2]=0x10;
+    w4[3]=0x80; w4[4]=0x80; w4[5]=0x80; w4[6]=0x80; w4[7]=0x80; w4[8]=0x80; w4[9]=0x80; w4[10]=0x80; w4[11]=0x80; w4[12]=0x01;
+    w4[13]=0x22;
+    w4[14]=0x71; w4[15]=0x00; w4[16]=0x10;
+    w4[17]=0x80; w4[18]=0x80; w4[19]=0x80; w4[20]=0x80; w4[21]=0x80; w4[22]=0x80; w4[23]=0x80; w4[24]=0x80; w4[25]=0x80; w4[26]=0x01;
+    w4[27]=0x22;
+    if (e.len != 30) { code = 4; }
+    or {
+        if (t_cmp_bytes_prefix(?e, ?w4[0], 28) != 0) { code = 4; }
+        if ((e.data[28] != 0x2D || e.data[29] != 0x9F) && code == 0) { code = 4; }
+    }
+    enc.buf_dnit(?e);
+
+    # u8 inequality of a spilled operand (frame slot -16, loaded via fbreg+deref)
+    # against constant raw bits 255: both sides mask to the byte.
+    e = enc.buf_init(?alloc);
+    rg = t_cmp_range(VLOC_FRAME, 0, -16, VLOC_CONST, 0, 255, enc.CMPREL_NE, false, 1);
+    build_cmp_ops(?e, ?rg);
+    var w5: [12]u8;
+    w5[0]=0x91; w5[1]=0x70; w5[2]=0x06; w5[3]=0x10; w5[4]=0xFF; w5[5]=0x01; w5[6]=0x1A;
+    w5[7]=0x11; w5[8]=0xFF; w5[9]=0x01; w5[10]=0x2E; w5[11]=0x9F;
+    if (t_cmp_bytes(?e, ?w5[0], 12) != 0) { code = 5; }
+    enc.buf_dnit(?e);
+
+    # a signed sub-word CONSTANT is host re-signed: i8 raw bits 200 pushes -56.
+    # breg3 0 ; sext8 ; consts -56 ; lt ; stack_value
+    e = enc.buf_init(?alloc);
+    rg = t_cmp_range(VLOC_REG, 3, 0, VLOC_CONST, 0, 200, enc.CMPREL_LT, true, 1);
+    build_cmp_ops(?e, ?rg);
+    var w6: [12]u8;
+    w6[0]=0x73; w6[1]=0x00; w6[2]=0x08; w6[3]=0x38; w6[4]=0x24; w6[5]=0x08; w6[6]=0x38; w6[7]=0x26;
+    w6[8]=0x11; w6[9]=0x48; w6[10]=0x2D; w6[11]=0x9F;
+    if (t_cmp_bytes(?e, ?w6[0], 12) != 0) { code = 6; }
+    enc.buf_dnit(?e);
+
+    # the counted wrapper prefixes the expression with its uleb byte length.
+    e = enc.buf_init(?alloc);
+    rg = t_cmp_range(VLOC_REG, 0, 0, VLOC_REG, 1, 0, enc.CMPREL_EQ, false, 8);
+    emit_counted_cmp_loc(?e, ?rg);
+    var w7: [7]u8;
+    w7[0]=0x06; w7[1]=0x70; w7[2]=0x00; w7[3]=0x71; w7[4]=0x00; w7[5]=0x29; w7[6]=0x9F;
+    if (t_cmp_bytes(?e, ?w7[0], 7) != 0) { code = 7; }
+    enc.buf_dnit(?e);
+
+    ret code;
+}
+
+# prefix comparison twin of t_cmp_bytes (the buffer may be longer than `n`)
+fun t_cmp_bytes_prefix(e: *enc.ByteBuf, want: *u8, n: usize) i32 {
+    if (e.len < n) { ret 1; }
+    var i: usize = 0;
+    for (i < n) {
+        if (e.data[i] != want[i]) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
 test "mach.lang.be.codegen.dwarf.uleb_sleb:canonical" {
     var alloc: A.Allocator;
     page.make(?alloc);

@@ -18,16 +18,17 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.str_equals;
+use std.memory;
 
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
-use dwarf: mach.lang.be.codegen.dwarf;
+use mach.lang.be.codegen.dwarf;
 use mach.lang.be.codegen.encode;
 use mach.lang.be.codegen.frame;
 use mach.lang.be.codegen.isel;
+use mach.lang.be.codegen.legalize;
 use mach.lang.be.codegen.mir;
 use mach.lang.be.codegen.mir.lower;
 use mach.lang.be.codegen.regalloc;
@@ -38,7 +39,7 @@ use mach.lang.me.ir;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.session;
-use source: mach.lang.source;
+use mach.lang.source;
 use mach.lang.target;
 use mach.lang.target.of;
 
@@ -65,6 +66,34 @@ rec SectionPlacement {
 rec PlacedSite {
     sec: u32;
     off: u32;
+}
+
+# the build's settled debug-info decision plus the DWARF compilation-unit
+# metadata, handed to codegen by its driver
+#
+# `emit` gates the debug producer; when off, `producer` and `comp_dir` are
+# STR_NIL and non-debug output is unchanged. `producer` is the interned
+# DW_AT_producer string ("<name> <version>"); `comp_dir` the interned
+# DW_AT_comp_dir (the project root).
+# ---
+# emit:     produce the DWARF debug sections
+# producer: interned DW_AT_producer string; STR_NIL when emit is off
+# comp_dir: interned DW_AT_comp_dir; STR_NIL when emit is off
+pub rec DebugInfo {
+    emit:     bool;
+    producer: intern.StrId;
+    comp_dir: intern.StrId;
+}
+
+# a DebugInfo carrying no debug intent, for callers that never emit debug info
+# ---
+# ret: the empty (off) DebugInfo
+pub fun no_debug() DebugInfo {
+    var d: DebugInfo;
+    d.emit     = false;
+    d.producer = intern.STR_NIL;
+    d.comp_dir = intern.STR_NIL;
+    ret d;
 }
 
 # generate an object image for one optimised IR module
@@ -100,9 +129,24 @@ rec PlacedSite {
 # tgt:     resolved compilation target
 # irmod:   optimised SSA IR module to generate code for
 # asm_out: optional writer for the per-module assembly text (nil = none)
+# dbg:     the build's settled debug-info decision plus the DWARF CU metadata
 # ret:     the populated object image, or an error string from any pipeline stage
+# the concrete signature the erased `isa.IsaVTable.emit_module` pointer is cast
+# back to: the whole-module SPIR-V back half. consumes post-lower MIR and writes
+# the finished module bytes through the out-params, bypassing isel / regalloc /
+# frame / encode. the allocator and interner ride the MIR module, so the emitter
+# (composed under `mach.lang.target`) needs no session.
+# ---
+# arg 0: the resolved target
+# arg 1: the IR module (signatures + linkage)
+# arg 2: the post-lower MIR module (also supplies the allocator + interner)
+# arg 3: receives the owned little-endian module image
+# arg 4: receives the image byte length
+# ret:   true on success, or a precise error string
+pub def EmitModuleFn: fun(*target.Target, *ir.Module, *mir.MirModule, **u8, *u32) R.Result[bool, str];
+
 pub fun codegen_module(s: *session.Session, tgt: *target.Target,
-                       irmod: *ir.Module, asm_out: *writer.Writer) R.Result[of.ObjectImage, str] {
+                       irmod: *ir.Module, asm_out: *writer.Writer, dbg: DebugInfo) R.Result[of.ObjectImage, str] {
     if (s == nil)     { ret R.err[of.ObjectImage, str]("codegen: nil session"); }
     if (tgt == nil)   { ret R.err[of.ObjectImage, str]("codegen: nil target"); }
     if (irmod == nil) { ret R.err[of.ObjectImage, str]("codegen: nil ir module"); }
@@ -112,6 +156,19 @@ pub fun codegen_module(s: *session.Session, tgt: *target.Target,
         ret R.err[of.ObjectImage, str](R.unwrap_err[mir.MirModule, str](res_lower));
     }
     var mir_module: mir.MirModule = R.unwrap_ok[mir.MirModule, str](res_lower);
+
+    # spine fork: a target that declares a whole-module emitter (spir-v) bypasses
+    # the machine back half entirely - no isel / regalloc / frame / encode. the
+    # machine path below is byte-identical when emit_module is nil (every register
+    # machine ISA leaves it nil).
+    if (tgt.arch.emit_module != nil) {
+        ret emit_spirv_image(s, tgt, irmod, ?mir_module);
+    }
+
+    val res_legalize: R.Result[bool, str] = legalize.run(tgt, ?mir_module);
+    if (R.is_err[bool, str](res_legalize)) {
+        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_legalize));
+    }
 
     val res_isel: R.Result[bool, str] = isel.run(tgt, ?mir_module);
     if (R.is_err[bool, str](res_isel)) {
@@ -141,7 +198,51 @@ pub fun codegen_module(s: *session.Session, tgt: *target.Target,
     }
     val enc: encode.EncoderOutput = R.unwrap_ok[encode.EncoderOutput, str](res_encode);
 
-    ret pack_image(s, tgt, irmod, ?mir_module, ?enc);
+    ret pack_image(s, tgt, irmod, ?mir_module, ?enc, dbg);
+}
+
+
+# wrap a whole-module emitter's output as a single-section object image
+#
+# The SPIR-V spine produces the finished module bytes rather than encoded machine
+# text; this dispatches the erased emitter and packs the bytes into a one-section
+# (".spirv") object image the of.spv writer emits verbatim. No symbols or
+# relocations - a SPIR-V module is self-contained. The bytes are session-allocated
+# and adopted by the image (obj.dnit frees them).
+# ---
+# s:      the shared session
+# tgt:    the resolved target (carries the emit_module hook)
+# irmod:  the IR module (names the image)
+# mirmod: the post-lower MIR module the emitter consumes
+# ret:    the populated object image, or an error string
+fun emit_spirv_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
+                     mirmod: *mir.MirModule) R.Result[of.ObjectImage, str] {
+    var bytes: *u8 = nil;
+    var len:   u32 = 0;
+    val r: R.Result[bool, str] = tgt.arch.emit_module::EmitModuleFn(tgt, irmod, mirmod, ?bytes, ?len);
+    if (R.is_err[bool, str](r)) { ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](r)); }
+
+    val res_image: R.Result[of.ObjectImage, str] = obj.init(s.alloc, ?s.interner, irmod.name);
+    if (R.is_err[of.ObjectImage, str](res_image)) { ret res_image; }
+    var image: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](res_image);
+
+    val res_name: R.Result[intern.StrId, str] = intern.intern(?s.interner, ".spirv");
+    if (R.is_err[intern.StrId, str](res_name)) {
+        obj.dnit(?image);
+        ret R.err[of.ObjectImage, str](R.unwrap_err[intern.StrId, str](res_name));
+    }
+    var sec: of.Section;
+    sec.name  = R.unwrap_ok[intern.StrId, str](res_name);
+    sec.kind  = of.SK_TEXT;
+    sec.bytes = bytes;
+    sec.len   = len;
+    sec.align = 4;
+    val res_sec: R.Result[u32, str] = obj.add_section(?image, sec);
+    if (R.is_err[u32, str](res_sec)) {
+        obj.dnit(?image);
+        ret R.err[of.ObjectImage, str](R.unwrap_err[u32, str](res_sec));
+    }
+    ret R.ok[of.ObjectImage, str](image);
 }
 
 # build the object image from the encoder output and the module's globals
@@ -156,9 +257,10 @@ pub fun codegen_module(s: *session.Session, tgt: *target.Target,
 # tgt:   resolved target; supplies type sizes for bss global layout
 # irmod: IR module whose globals are packed alongside the encoded text
 # enc:   encoder output for the module's `.text`
+# dbg:   the build's settled debug-info decision plus the DWARF CU metadata
 # ret:   the populated object image, or an error string
 fun pack_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
-               mirmod: *mir.MirModule, enc: *encode.EncoderOutput) R.Result[of.ObjectImage, str] {
+               mirmod: *mir.MirModule, enc: *encode.EncoderOutput, dbg: DebugInfo) R.Result[of.ObjectImage, str] {
     val res_image: R.Result[of.ObjectImage, str] = obj.init(s.alloc, ?s.interner, irmod.name);
     if (R.is_err[of.ObjectImage, str](res_image)) {
         ret R.err[of.ObjectImage, str](R.unwrap_err[of.ObjectImage, str](res_image));
@@ -231,12 +333,22 @@ fun pack_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
         ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_data_externs));
     }
 
-    # when `-g` is on and the target uses DWARF (elf / mach-o), the shared producer
-    # writes the .debug_abbrev/.debug_info/.debug_line/.debug_loclists sections from the
-    # encoder's re-homed PC<->source rows, per-PC variable-location records, and the
-    # packed function symbols. off without `-g`, so non-debug output is unchanged.
-    if (s.debug && format_uses_dwarf(tgt)) {
-        val res_dwarf: R.Result[bool, str] = dwarf.produce(s, tgt, irmod, ?image, enc.rows, enc.row_count, enc.varlocs, enc.varloc_count, enc.inline_pcs, enc.inline_pc_count, text_sec);
+    # when `-g` is on and the target resolved a debug-info producer (elf / mach-o ->
+    # DWARF; nil for coff / raw), dispatch through its vtable: the producer writes the
+    # .debug_abbrev/.debug_info/.debug_line/.debug_loclists sections from the encoder's
+    # re-homed PC<->source rows, per-PC variable-location records, and the packed
+    # function symbols. off without `-g` or a nil `debug`, so non-debug output and a
+    # non-DWARF target are unchanged. the erased `produce` is cast back to its
+    # `dwarf.ProduceFn` signature, exactly as the linker casts `apply_reloc`. the
+    # vtable registers with `produce` nil until the be-layer registrar wires it
+    # (`dwarf.register_debug_hooks`), so a wiring failure is rejected loudly here
+    # - like isel.run's nil-select path - rather than dispatched into a segfault.
+    if (dbg.emit && tgt.debug != nil) {
+        if (tgt.debug.produce == nil) {
+            obj.dnit(?image);
+            ret R.err[of.ObjectImage, str]("codegen: debug producer registered no produce hook");
+        }
+        val res_dwarf: R.Result[bool, str] = tgt.debug.produce::dwarf.ProduceFn(s, tgt, irmod, ?image, enc.rows, enc.row_count, enc.varlocs, enc.varloc_count, enc.inline_pcs, enc.inline_pc_count, dbg.producer, dbg.comp_dir, text_sec);
         if (R.is_err[bool, str](res_dwarf)) {
             obj.dnit(?image);
             ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_dwarf));
@@ -244,16 +356,6 @@ fun pack_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     }
 
     ret R.ok[of.ObjectImage, str](image);
-}
-
-# whether the target's object format carries DWARF debug info (ELF and Mach-O; COFF
-# uses CodeView, a separate producer)
-# ---
-# tgt: the resolved target
-# ret: true when the format is DWARF-based
-fun format_uses_dwarf(tgt: *target.Target) bool {
-    if (tgt.of == nil) { ret false; }
-    ret str_equals(tgt.of.name, "elf") || str_equals(tgt.of.name, "macho");
 }
 
 # assemble the `.text` section from the non-sectioned functions
@@ -446,9 +548,15 @@ fun pack_rows(enc: *encode.EncoderOutput, placements: *SectionPlacement, placeme
     # the final (sec, text_offset) to bound each range).
     var v: u32 = 0;
     for (v < enc.varloc_count) {
-        val vsite: PlacedSite = site_placed(placements, placement_count, text_sec, enc.varlocs[v].text_offset);
+        val old_start: u32 = enc.varlocs[v].text_offset;
+        val vsite: PlacedSite = site_placed(placements, placement_count, text_sec, old_start);
         enc.varlocs[v].sec         = vsite.sec;
         enc.varlocs[v].text_offset = vsite.off;
+        # a bounded compare range lies within one instruction, so it moves
+        # wholesale with its start; re-home the end by the same displacement.
+        if (enc.varlocs[v].end_offset != 0) {
+            enc.varlocs[v].end_offset = vsite.off + (enc.varlocs[v].end_offset - old_start);
+        }
         v = v + 1;
     }
     # inline-instance transitions re-home identically (the #1707 inlined_subroutine
@@ -475,6 +583,26 @@ fun pack_rows(enc: *encode.EncoderOutput, placements: *SectionPlacement, placeme
 # image: object image being built
 # irmod: IR module whose globals are packed
 # ret:   true on success, or an error string
+# copy a borrowed initializer byte image into an image-owned buffer
+#
+# The image owns every section buffer (obj.dnit frees them by `len`), so a
+# borrowed source must be copied before it becomes a section's `bytes`. A nil
+# or empty source passes through unchanged: obj.dnit never frees a nil/empty
+# buffer, and the bss/data routing keys on the pointer, which is preserved.
+# ---
+# image: the image whose allocator owns the copy
+# src:   the borrowed bytes, or nil
+# len:   number of bytes
+# ret:   the owned copy (or the original nil/empty pointer), or an allocation error
+fun section_bytes_copy(image: *of.ObjectImage, src: *u8, len: u32) R.Result[*u8, str] {
+    if (src == nil || len == 0) { ret R.ok[*u8, str](src); }
+    val res_buf: R.Result[*u8, str] = A.allocate[u8](image.alloc, len::usize);
+    if (R.is_err[*u8, str](res_buf)) { ret res_buf; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
+    memory.raw_copy(buf::ptr, src::ptr, len::usize);
+    ret R.ok[*u8, str](buf);
+}
+
 fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImage,
                  irmod: *ir.Module) R.Result[bool, str] {
     var i: u32 = 0;
@@ -497,10 +625,18 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
             cnt;
         }
 
+        # both constant-initializer byte images arrive BORROWED - a
+        # VAL_CONST_BYTES points at interner-owned literal bytes and a
+        # VAL_CONST_AGG blob is owned by the IR module (ir.dnit frees it) - while
+        # the image owns every section buffer it carries (obj.dnit frees them).
+        # copy at this boundary: a warm session finalizing a replaced Q_CODEGEN
+        # image must never free interner storage or double-free the module's blob.
         var bytes: *u8 = nil;
         var len:   u32 = 0;
         if (g.init.kind == value.VAL_CONST_BYTES) {
-            bytes = g.init.data.bytes.ptr;
+            val res_copy: R.Result[*u8, str] = section_bytes_copy(image, g.init.data.bytes.ptr, g.init.data.bytes.len);
+            if (R.is_err[*u8, str](res_copy)) { ret R.err[bool, str](R.unwrap_err[*u8, str](res_copy)); }
+            bytes = R.unwrap_ok[*u8, str](res_copy);
             len   = g.init.data.bytes.len;
         }
         or (g.init.kind == value.VAL_CONST_AGG) {
@@ -508,7 +644,9 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
             # relocation side-table for its pointer leaves. the blob lands in
             # .data/.rodata like any byte image; the relocations are attached to
             # the new section below.
-            bytes = g.init.data.agg.bytes;
+            val res_copy: R.Result[*u8, str] = section_bytes_copy(image, g.init.data.agg.bytes, g.init.data.agg.len);
+            if (R.is_err[*u8, str](res_copy)) { ret R.err[bool, str](R.unwrap_err[*u8, str](res_copy)); }
+            bytes = R.unwrap_ok[*u8, str](res_copy);
             len   = g.init.data.agg.len;
         }
         or (g.init.kind == value.VAL_CONST_INT || g.init.kind == value.VAL_CONST_FLOAT) {
@@ -531,7 +669,8 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
             # size would silently drop a real value, and that alone is a loud error.
             val gsz: u32 = type.byte_size(?irmod.types, g.ty, tgt);
             if (gsz > 0 && gsz <= 8) {
-                val res_bytes: R.Result[*u8, str] = A.allocate[u8](s.alloc, gsz::usize);
+                # image-owned like every section buffer (obj.dnit frees by len).
+                val res_bytes: R.Result[*u8, str] = A.allocate[u8](image.alloc, gsz::usize);
                 if (R.is_err[*u8, str](res_bytes)) { ret R.err[bool, str](R.unwrap_err[*u8, str](res_bytes)); }
                 bytes = R.unwrap_ok[*u8, str](res_bytes);
                 # a comptime float is always an f64 bit pattern; a 32-bit float
@@ -827,8 +966,7 @@ fun func_section_add(s: *session.Session, image: *of.ObjectImage, sname: intern.
     if (R.is_err[*u8, str](res_buf)) { ret R.err[u32, str](R.unwrap_err[*u8, str](res_buf)); }
     val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
 
-    var i: u32 = 0;
-    for (i < len) { buf[i] = enc.text[start + i]; i = i + 1; }
+    memory.raw_copy(buf::ptr, (enc.text::usize + start::usize)::ptr, len::usize);
 
     var sec: of.Section;
     sec.name  = sname;

@@ -1,0 +1,1270 @@
+# the resolved build plan: units x phases x artifacts, fully concrete
+#
+# The planner is the resolution stage of the build pipeline. It consumes the
+# once-parsed manifest and the settled request and produces a `BuildPlan` - one
+# `BuildUnit` per (target, artifact) cell, expanded under `--all-targets`, with
+# every name resolved to the thing it names. Selection names resolve through
+# the same `manifest.resolve_build_unit` the driver and compose share (one
+# rule, one home); output templates expand to final absolute paths; link
+# tokens resolve against the unit's composed target to `LinkInput` facts - an
+# absolute object/archive path, or the soname a shared library is loaded by -
+# discovered by the exact filesystem probing the link performs. A link input
+# that does not exist fails the plan with the same error text the link would
+# have produced: same visible behavior, earlier and honest.
+#
+# The plan is inspectable data. `mach build --explain` renders it through
+# `explain`, and the execution paths consume unit facts instead of
+# re-resolving anything: the plan and the build cannot disagree. Each unit's
+# `phases` vector is its ordered execution list, accurate to what execution
+# does; the engine stage will dispatch on it.
+
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.data.toml;
+use fs: std.filesystem;
+use std.memory;
+use std.print;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.char.char;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_copy;
+use std.types.string.str_empty;
+use std.types.string.str_ends_with;
+use std.types.string.str_equals;
+use std.types.string.str_join;
+use std.types.string.str_len;
+use std.types.string.str_replace;
+use std.types.path;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.target.of.bin;
+use mach.lang.build.outcome;
+use mach.lang.build.request;
+use mach.lang.driver.project;
+use mach.lang.intern;
+use mach.lang.manifest;
+use mach.lang.me.pipeline;
+use mach.lang.target;
+use mach.lang.target.of;
+
+# a phase in a unit's ordered execution list
+pub def PhaseKind: u8;
+
+# user-defined steps of dependencies
+pub val PH_DEP_STEPS: PhaseKind = 0;
+
+# module-graph load + resolve
+pub val PH_LOAD:      PhaseKind = 1;
+
+# user-defined project steps
+pub val PH_STEPS:     PhaseKind = 2;
+
+# semantic analysis over the module graph
+pub val PH_SEMA:      PhaseKind = 3;
+
+# lowering + the optimization pipeline
+pub val PH_LOWER:     PhaseKind = 4;
+
+# per-module code generation
+pub val PH_CODEGEN:   PhaseKind = 5;
+
+# object tree / ir / asm materialization
+pub val PH_EMIT:      PhaseKind = 6;
+
+# executable, archive, shared object, or dispatcher per goal
+pub val PH_LINK:      PhaseKind = 7;
+
+# one fully resolved link input's kind
+pub def LinkInputKind: u8;
+
+# object or archive path on disk
+pub val LINK_STATIC:  LinkInputKind = 0;
+
+# soname recorded for the loader
+pub val LINK_DYNAMIC: LinkInputKind = 1;
+
+# one fully resolved link input
+# ---
+# kind: static (an on-disk object/archive) or dynamic (a loader dependency)
+# text: absolute path (STATIC) or soname (DYNAMIC), owned by the plan allocator
+pub rec LinkInput {
+    kind: LinkInputKind;
+    text: str;
+}
+
+# one build unit: a (target, profile, artifact) cell, everything concrete
+#
+# Strings are owned by the plan allocator; `target_entry` is a synthesized
+# driver target entry whose interned names live in the planning interner. The
+# `sel_*` fields carry the cell's selection as the executor re-composes its
+# per-unit request from them - they are the matrix cell's identity, where the
+# rest of the record is its resolution.
+# ---
+# target_entry: the synthesized target entry for this cell
+# profile:      resolved profile name
+# opt_level:    settled optimization pipeline level
+# goal:         what this unit produces
+# out_path:     final artifact path, templates expanded; the object tree root
+#               for an objects goal, empty for a test-list goal
+# obj_dir:      per-module object tree root
+# ir_dir:       per-module `.ir` dump dir; empty when ir emission is off
+# asm_dir:      per-module `.s` dump dir; empty when asm emission is off
+# link_inputs:  the request's link tokens resolved to facts, invocation order
+# phases:       ordered, goal- and manifest-derived execution list
+# sel_target:   the cell's target selector (empty selects the manifest default)
+# sel_artifact: the cell's artifact selector
+# want_lib:     the selected artifact is a `[lib.*]` (disambiguates a name)
+# has_artifact: an artifact is named
+pub rec BuildUnit {
+    target_entry: *project.TargetEntry;
+    profile:      str;
+    opt_level:    u8;
+    goal:         request.BuildGoal;
+    out_path:     str;
+    obj_dir:      str;
+    ir_dir:       str;
+    asm_dir:      str;
+    link_inputs:  Vector[LinkInput];
+    phases:       Vector[PhaseKind];
+
+    sel_target:   str;
+    sel_artifact: str;
+    want_lib:     bool;
+    has_artifact: bool;
+}
+
+# the settled request the planner consumes, re-exported for the RFC spelling
+pub def BuildRequest: request.BuildRequest;
+
+# the resolved plan for one request
+# ---
+# request: provenance - the settled request the plan was resolved from
+# units:   one normally; one per (target, artifact) cell under all_targets
+pub rec BuildPlan {
+    request: *BuildRequest;
+    units:   Vector[BuildUnit];
+}
+
+# resolve the settled request into a concrete build plan
+#
+# Expands the matrix - every declared artifact unless one is named, crossed
+# with every declared target under `all_targets` (a named `--target` pins the
+# axis) - and resolves each cell: selection through the shared manifest
+# resolver, the composed target through the registry, output templates to
+# final paths, link tokens to facts, and the ordered phase list. A test goal
+# plans exactly one unit for the request's settled selection (a test build
+# links the whole source tree; the matrix never applies). Any resolution
+# failure fails the plan with the message the build would have produced.
+# ---
+# a:   allocator owning the plan's units, strings, and vectors
+# itn: the interner the manifest was parsed into
+# reg: the populated target registry (isa/os/abi/of vtables installed)
+# m:   the parsed root manifest the request was composed against
+# req: the settled request; `project_root` roots every expanded path
+# ret: the resolved plan, or the failure to render
+pub fun plan(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry,
+             m: *manifest.Manifest, req: *request.BuildRequest) R.Result[BuildPlan, outcome.Fail] {
+    var bp: BuildPlan;
+    bp.request = req;
+    bp.units   = vector.init[BuildUnit](a);
+
+    # a test goal is a single unit: the whole-source test build never expands
+    # the matrix, mirroring the test flow's single build.
+    if (request.test_goal(req.goal)) {
+        val ur: R.Result[BuildUnit, outcome.Fail] = plan_unit(a, itn, reg, m, req,
+            req.target, req.artifact, req.want_lib, !str_empty(req.artifact));
+        if (R.is_err[BuildUnit, outcome.Fail](ur)) {
+            ret R.err[BuildPlan, outcome.Fail](R.unwrap_err[BuildUnit, outcome.Fail](ur));
+        }
+        val pr: R.Result[usize, str] = vector.push[BuildUnit](?bp.units, R.unwrap_ok[BuildUnit, outcome.Fail](ur));
+        if (R.is_err[usize, str](pr)) { ret oom_plan(); }
+        ret R.ok[BuildPlan, outcome.Fail](bp);
+    }
+
+    # the target axis: a named filter, every declared target, or the default.
+    val expand_targets: bool = req.all_targets && str_empty(req.target);
+    var tn: u32 = 1;
+    if (expand_targets) { tn = m.target_count; }
+    if (tn == 0) {
+        ret R.err[BuildPlan, outcome.Fail](outcome.user("mach.toml: --all-targets but no [target.*] declared"));
+    }
+
+    # the artifact axis: a named bin/lib, or every declared artifact.
+    val expand_artifacts: bool = str_empty(req.artifact);
+    var an: u32 = 1;
+    if (expand_artifacts) { an = m.artifact_count; }
+    if (an == 0) {
+        ret R.err[BuildPlan, outcome.Fail](outcome.user("mach.toml: no [artifact.*] artifacts declared"));
+    }
+
+    var ti: u32 = 0;
+    for (ti < tn) {
+        var tname: str = req.target;
+        if (expand_targets) {
+            val to: O.Option[str] = intern.lookup(itn, m.targets[ti].name);
+            if (O.is_none[str](to)) {
+                ret R.err[BuildPlan, outcome.Fail](outcome.user("internal: target name not interned"));
+            }
+            tname = O.unwrap[str](to);
+        }
+        var ai: u32 = 0;
+        for (ai < an) {
+            var aname:    str  = req.artifact;
+            var want_lib: bool = req.want_lib;
+            if (expand_artifacts) {
+                val ao: O.Option[str] = intern.lookup(itn, m.artifacts[ai].name);
+                if (O.is_none[str](ao)) {
+                    ret R.err[BuildPlan, outcome.Fail](outcome.user("internal: artifact name not interned"));
+                }
+                aname    = O.unwrap[str](ao);
+                want_lib = m.artifacts[ai].is_lib;
+            }
+            val ur: R.Result[BuildUnit, outcome.Fail] = plan_unit(a, itn, reg, m, req, tname, aname, want_lib, true);
+            if (R.is_err[BuildUnit, outcome.Fail](ur)) {
+                ret R.err[BuildPlan, outcome.Fail](R.unwrap_err[BuildUnit, outcome.Fail](ur));
+            }
+            val pr: R.Result[usize, str] = vector.push[BuildUnit](?bp.units, R.unwrap_ok[BuildUnit, outcome.Fail](ur));
+            if (R.is_err[usize, str](pr)) { ret oom_plan(); }
+            ai = ai + 1;
+        }
+        ti = ti + 1;
+    }
+    ret R.ok[BuildPlan, outcome.Fail](bp);
+}
+
+# the shared out-of-memory plan failure
+fun oom_plan() R.Result[BuildPlan, outcome.Fail] {
+    ret R.err[BuildPlan, outcome.Fail](outcome.internal("out of memory"));
+}
+
+# resolve one (target, artifact) cell into its concrete unit
+#
+# Runs the shared selection resolver, composes the cell's target (replicating
+# the driver's unknown-name precedence and messages), synthesizes the driver
+# target entry, expands the output paths per goal, resolves the request's link
+# tokens, and derives the phase list.
+# ---
+# tname:        the cell's target selector (empty selects the manifest default)
+# aname:        the cell's artifact selector
+# want_lib:     the artifact selector names a `[lib.*]`
+# has_artifact: an artifact is named
+# ret:          the resolved unit, or the failure to render
+fun plan_unit(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry,
+              m: *manifest.Manifest, req: *request.BuildRequest,
+              tname: str, aname: str, want_lib: bool, has_artifact: bool) R.Result[BuildUnit, outcome.Fail] {
+    var sel: manifest.Selection;
+    sel.target       = tname;
+    sel.profile      = req.profile;
+    sel.artifact     = aname;
+    sel.want_lib     = want_lib;
+    sel.has_artifact = has_artifact;
+
+    val ur: R.Result[manifest.BuildUnit, str] = manifest.resolve_build_unit(a, itn, m, sel);
+    if (R.is_err[manifest.BuildUnit, str](ur)) {
+        ret R.err[BuildUnit, outcome.Fail](outcome.user(R.unwrap_err[manifest.BuildUnit, str](ur)));
+    }
+    val bu: manifest.BuildUnit = R.unwrap_ok[manifest.BuildUnit, str](ur);
+
+    # compose the cell's target: resolve the interned selection names, then let
+    # select_of compose the vtables. select_of is the single owner of the
+    # unregistered-name check - it rejects an unknown os / isa / abi / of naming the
+    # value and listing the live registry - so no closed-tag pre-validation duplicates
+    # it here.
+    val os_opt: O.Option[str] = intern.lookup(itn, bu.target.os);
+    if (O.is_none[str](os_opt)) { ret R.err[BuildUnit, outcome.Fail](outcome.user("target os name not interned")); }
+    val os_s: str = O.unwrap[str](os_opt);
+    val isa_opt: O.Option[str] = intern.lookup(itn, bu.target.isa);
+    if (O.is_none[str](isa_opt)) { ret R.err[BuildUnit, outcome.Fail](outcome.user("target isa name not interned")); }
+    val isa_s: str = O.unwrap[str](isa_opt);
+    val abi_opt: O.Option[str] = intern.lookup(itn, bu.target.abi);
+    if (O.is_none[str](abi_opt)) { ret R.err[BuildUnit, outcome.Fail](outcome.user("target abi name not interned")); }
+    val abi_s: str = O.unwrap[str](abi_opt);
+    var of_s: str = "";
+    val of_opt: O.Option[str] = intern.lookup(itn, bu.target.of);
+    if (O.is_some[str](of_opt)) { of_s = O.unwrap[str](of_opt); }
+
+    val tr: R.Result[target.Target, str] = target.select_of(reg, isa_s, os_s, abi_s, of_s);
+    if (R.is_err[target.Target, str](tr)) {
+        ret R.err[BuildUnit, outcome.Fail](outcome.user(R.unwrap_err[target.Target, str](tr)));
+    }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+
+    var u: BuildUnit;
+    u.goal         = req.goal;
+    u.opt_level    = req.opt;
+    u.sel_target   = tname;
+    u.sel_artifact = aname;
+    u.want_lib     = want_lib;
+    u.has_artifact = has_artifact;
+
+    val pn_opt: O.Option[str] = intern.lookup(itn, bu.profile_name);
+    if (O.is_none[str](pn_opt)) { ret R.err[BuildUnit, outcome.Fail](outcome.user("internal: profile name not interned")); }
+    u.profile = O.unwrap[str](pn_opt);
+
+    # the synthesized target entry, mirroring the driver's own synthesis so the
+    # engine stage can consume it directly.
+    val ter: R.Result[*project.TargetEntry, str] = A.allocate[project.TargetEntry](a, 1::usize);
+    if (R.is_err[*project.TargetEntry, str](ter)) { ret oom_unit(); }
+    val te: *project.TargetEntry = R.unwrap_ok[*project.TargetEntry, str](ter);
+    te.name       = bu.target_name;
+    te.os_name    = bu.target.os;
+    te.isa_name   = bu.target.isa;
+    te.abi_name   = bu.target.abi;
+    te.of_name    = bu.target.of;
+    te.entrypoint = bu.entry;
+    te.mode       = project.MODE_EXECUTABLE;
+    if (bu.is_lib) { te.mode = project.MODE_LIBRARY; }
+    te.lib_kind   = bu.kind;
+    te.opt        = project.map_opt(bu.opt);
+    te.libs       = bu.libs;
+    te.lib_count  = bu.lib_count;
+    u.target_entry = te;
+
+    val root: str = req.project_root;
+
+    # the output directories: `<root>/<resolved template>`, expanded once here.
+    val ob_r: R.Result[str, outcome.Fail] = join_template(a, itn, root, bu.obj_root, "project obj output dir: ");
+    if (R.is_err[str, outcome.Fail](ob_r)) { ret R.err[BuildUnit, outcome.Fail](R.unwrap_err[str, outcome.Fail](ob_r)); }
+    u.obj_dir = R.unwrap_ok[str, outcome.Fail](ob_r);
+
+    u.ir_dir = "";
+    if (req.emit_ir) {
+        val ib_r: R.Result[str, outcome.Fail] = join_template(a, itn, root, bu.ir_root, "project ir output dir: ");
+        if (R.is_err[str, outcome.Fail](ib_r)) { ret R.err[BuildUnit, outcome.Fail](R.unwrap_err[str, outcome.Fail](ib_r)); }
+        u.ir_dir = R.unwrap_ok[str, outcome.Fail](ib_r);
+    }
+    u.asm_dir = "";
+    if (req.emit_asm) {
+        val ab_r: R.Result[str, outcome.Fail] = join_template(a, itn, root, bu.asm_root, "project asm output dir: ");
+        if (R.is_err[str, outcome.Fail](ab_r)) { ret R.err[BuildUnit, outcome.Fail](R.unwrap_err[str, outcome.Fail](ab_r)); }
+        u.asm_dir = R.unwrap_ok[str, outcome.Fail](ab_r);
+    }
+
+    val op_r: R.Result[str, outcome.Fail] = unit_out_path(a, itn, m, req, ?bu, u.obj_dir);
+    if (R.is_err[str, outcome.Fail](op_r)) { ret R.err[BuildUnit, outcome.Fail](R.unwrap_err[str, outcome.Fail](op_r)); }
+    u.out_path = R.unwrap_ok[str, outcome.Fail](op_r);
+
+    # the request's link tokens, resolved to facts in invocation order with the
+    # exact probing (and error text) the link performs.
+    u.link_inputs = vector.init[LinkInput](a);
+    var ti: usize = 0;
+    for (ti < req.link_tokens.len) {
+        val lr: R.Result[LinkInput, outcome.Fail] = resolve_token(a, ?tgt, ?req.lib_dirs, root, req.link_tokens.data[ti].text::*u8);
+        if (R.is_err[LinkInput, outcome.Fail](lr)) {
+            ret R.err[BuildUnit, outcome.Fail](R.unwrap_err[LinkInput, outcome.Fail](lr));
+        }
+        val pr: R.Result[usize, str] = vector.push[LinkInput](?u.link_inputs, R.unwrap_ok[LinkInput, outcome.Fail](lr));
+        if (R.is_err[usize, str](pr)) { ret oom_unit(); }
+        ti = ti + 1;
+    }
+
+    val ph_r: R.Result[bool, outcome.Fail] = derive_phases(a, itn, m, req, ?bu, ?tgt, ?u);
+    if (R.is_err[bool, outcome.Fail](ph_r)) {
+        ret R.err[BuildUnit, outcome.Fail](R.unwrap_err[bool, outcome.Fail](ph_r));
+    }
+    ret R.ok[BuildUnit, outcome.Fail](u);
+}
+
+# the shared out-of-memory unit failure
+fun oom_unit() R.Result[BuildUnit, outcome.Fail] {
+    ret R.err[BuildUnit, outcome.Fail](outcome.internal("out of memory"));
+}
+
+# `<root>/<resolved template>` for a manifest output-dir template, owned
+# ---
+# dir_id: the interned template
+# what:   the error prefix naming the directory being resolved
+fun join_template(a: *A.Allocator, itn: *intern.Interner, root: str, dir_id: intern.StrId, what: str) R.Result[str, outcome.Fail] {
+    val opt_tmpl: O.Option[str] = intern.lookup(itn, dir_id);
+    if (O.is_none[str](opt_tmpl)) {
+        ret R.err[str, outcome.Fail](outcome.internal(join_msg(a, what, "template not interned", "")));
+    }
+    val jr: R.Result[str, str] = path.join(a, root, O.unwrap[str](opt_tmpl));
+    if (R.is_err[str, str](jr)) {
+        ret R.err[str, outcome.Fail](outcome.internal(join_msg(a, what, R.unwrap_err[str, str](jr), "")));
+    }
+    ret R.ok[str, outcome.Fail](R.unwrap_ok[str, str](jr));
+}
+
+# the unit's final artifact path per goal
+#
+# An executable goal applies the `-o` precedence (absolute verbatim, relative
+# rooted at the project root, else the manifest's resolved artifact template);
+# an objects goal delivers the object tree root; a tests goal expands the
+# `tests` template with the artifact's product name (falling back to the
+# project id); a test-list goal builds nothing and carries no path.
+fun unit_out_path(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
+                  req: *request.BuildRequest, bu: *manifest.BuildUnit, obj_dir: str) R.Result[str, outcome.Fail] {
+    if (req.goal == request.GOAL_OBJECTS)   { ret R.ok[str, outcome.Fail](obj_dir); }
+    if (req.goal == request.GOAL_TEST_LIST) { ret R.ok[str, outcome.Fail](""); }
+
+    if (req.goal == request.GOAL_TESTS) {
+        # the dispatcher's `{name}`: the artifact's product name, else the
+        # project id, else the "tests" fallback - the run-path's exact rule.
+        var name: str = "";
+        if (bu.artifact != nil) {
+            val an_opt: O.Option[str] = intern.lookup(itn, bu.artifact.name);
+            if (O.is_some[str](an_opt)) { name = O.unwrap[str](an_opt); }
+        }
+        if (str_empty(name)) {
+            val id_opt: O.Option[str] = intern.lookup(itn, m.id);
+            if (O.is_some[str](id_opt)) { name = O.unwrap[str](id_opt); }
+        }
+        if (str_empty(name)) { name = "tests"; }
+
+        val tmpl_opt: O.Option[str] = intern.lookup(itn, bu.test_root);
+        if (O.is_none[str](tmpl_opt)) { ret test_exe_fail(); }
+        val rel_r: R.Result[str, str] = str_replace(a, O.unwrap[str](tmpl_opt), "{name}", name);
+        if (R.is_err[str, str](rel_r)) { ret test_exe_fail(); }
+        val full_r: R.Result[str, str] = path.join(a, req.project_root, R.unwrap_ok[str, str](rel_r));
+        if (R.is_err[str, str](full_r)) { ret test_exe_fail(); }
+        ret R.ok[str, outcome.Fail](R.unwrap_ok[str, str](full_r));
+    }
+
+    if (!str_empty(req.out)) {
+        val op_r: R.Result[str, str] = path.resolve(a, req.project_root, req.out);
+        if (R.is_err[str, str](op_r)) { ret R.err[str, outcome.Fail](outcome.internal("out of memory")); }
+        ret R.ok[str, outcome.Fail](R.unwrap_ok[str, str](op_r));
+    }
+    val bin_opt: O.Option[str] = intern.lookup(itn, bu.bin_path);
+    if (O.is_none[str](bin_opt) || str_empty(O.unwrap[str](bin_opt))) {
+        ret R.err[str, outcome.Fail](outcome.user("selected artifact has no output path; set the `out` template in mach.toml"));
+    }
+    val op_r: R.Result[str, str] = path.join(a, req.project_root, O.unwrap[str](bin_opt));
+    if (R.is_err[str, str](op_r)) { ret R.err[str, outcome.Fail](outcome.internal("out of memory")); }
+    ret R.ok[str, outcome.Fail](R.unwrap_ok[str, str](op_r));
+}
+
+# the test-executable resolution failure, with the run-path's exact message
+fun test_exe_fail() R.Result[str, outcome.Fail] {
+    ret R.err[str, outcome.Fail](outcome.internal("failed to resolve the test executable path; check the `tests` template in mach.toml"));
+}
+
+# derive the unit's ordered phase list - accurate to what execution does
+#
+# Dependency steps run before project steps, both before the module-graph
+# load: a project step may consume a dep-step artifact, so the deps produce
+# theirs first. sema, lower, and codegen run for every goal (a test-list build
+# still compiles). PH_DEP_STEPS appears when the project has dependencies (the
+# export-step scan runs over each dep's manifest); PH_STEPS appears only when
+# the cell's demanded step plan is non-empty (the same demand computation the
+# driver runs, so a step-plan error - a cycle, an unknown need - fails here
+# with the driver's message). PH_EMIT appears when the unit
+# materializes on-disk per-module artifacts: the object tree (a non-flat-image
+# target with an execute, objects, or tests goal) or `.ir`/`.s` dumps.
+# PH_LINK appears for the goals that link: an executable/archive/shared
+# artifact, or the test dispatcher.
+fun derive_phases(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
+                  req: *request.BuildRequest, bu: *manifest.BuildUnit,
+                  tgt: *target.Target, u: *BuildUnit) R.Result[bool, outcome.Fail] {
+    u.phases = vector.init[PhaseKind](a);
+
+    val sd_r: R.Result[bool, outcome.Fail] = steps_demanded(a, itn, m, req, bu);
+    if (R.is_err[bool, outcome.Fail](sd_r)) { ret sd_r; }
+    if (m.dep_count > 0) {
+        val r1: R.Result[bool, outcome.Fail] = push_phase(u, PH_DEP_STEPS);
+        if (R.is_err[bool, outcome.Fail](r1)) { ret r1; }
+    }
+    if (R.unwrap_ok[bool, outcome.Fail](sd_r)) {
+        val r2: R.Result[bool, outcome.Fail] = push_phase(u, PH_STEPS);
+        if (R.is_err[bool, outcome.Fail](r2)) { ret r2; }
+    }
+
+    val r3: R.Result[bool, outcome.Fail] = push_phase(u, PH_LOAD);
+    if (R.is_err[bool, outcome.Fail](r3)) { ret r3; }
+    val r4: R.Result[bool, outcome.Fail] = push_phase(u, PH_SEMA);
+    if (R.is_err[bool, outcome.Fail](r4)) { ret r4; }
+    val r5: R.Result[bool, outcome.Fail] = push_phase(u, PH_LOWER);
+    if (R.is_err[bool, outcome.Fail](r5)) { ret r5; }
+    val r6: R.Result[bool, outcome.Fail] = push_phase(u, PH_CODEGEN);
+    if (R.is_err[bool, outcome.Fail](r6)) { ret r6; }
+
+    # a flat-image format has no relocatable object container: the images link
+    # directly and no object tree is written.
+    val flat: bool = tgt.of != nil && tgt.of.produces_image;
+    var objects: bool = false;
+    if (req.goal == request.GOAL_EXECUTE && !flat) { objects = true; }
+    if (req.goal == request.GOAL_OBJECTS)          { objects = true; }
+    if (req.goal == request.GOAL_TESTS)            { objects = true; }
+    if (objects || req.emit_ir || req.emit_asm) {
+        val r7: R.Result[bool, outcome.Fail] = push_phase(u, PH_EMIT);
+        if (R.is_err[bool, outcome.Fail](r7)) { ret r7; }
+    }
+    if (req.goal == request.GOAL_EXECUTE || req.goal == request.GOAL_TESTS) {
+        val r8: R.Result[bool, outcome.Fail] = push_phase(u, PH_LINK);
+        if (R.is_err[bool, outcome.Fail](r8)) { ret r8; }
+    }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# append one phase to the unit's list
+fun push_phase(u: *BuildUnit, k: PhaseKind) R.Result[bool, outcome.Fail] {
+    val pr: R.Result[usize, str] = vector.push[PhaseKind](?u.phases, k);
+    if (R.is_err[usize, str](pr)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# whether the cell's demanded root-step plan is non-empty
+#
+# The same demand computation the driver's config synthesis runs: demand is
+# driven by the selected artifact for a plain build, or by every declared
+# artifact for a test goal (which links them all). A failed project-out
+# expansion skips step planning, mirroring the driver.
+fun steps_demanded(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest,
+                   req: *request.BuildRequest, bu: *manifest.BuildUnit) R.Result[bool, outcome.Fail] {
+    if (m.step_count == 0) { ret R.ok[bool, outcome.Fail](false); }
+
+    val pn_opt: O.Option[str] = intern.lookup(itn, bu.profile_name);
+    if (O.is_none[str](pn_opt)) { ret R.ok[bool, outcome.Fail](false); }
+    var v: manifest.TmplVars = manifest.tmpl_vars_of(itn, bu.target, O.unwrap[str](pn_opt));
+
+    val ot_opt: O.Option[str] = intern.lookup(itn, m.out_tmpl);
+    if (O.is_none[str](ot_opt)) { ret R.ok[bool, outcome.Fail](false); }
+    val po_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](ot_opt), "", ?v);
+    if (R.is_err[str, str](po_r)) { ret R.ok[bool, outcome.Fail](false); }
+    val proj_out: str = R.unwrap_ok[str, str](po_r);
+
+    var names:  *intern.StrId = nil;
+    var ncount: u32           = 0;
+    var owned:  bool          = false;
+    if (request.test_goal(req.goal) && m.artifact_count > 0) {
+        val ar: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](a, m.artifact_count::usize);
+        if (R.is_err[*intern.StrId, str](ar)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+        names = R.unwrap_ok[*intern.StrId, str](ar);
+        owned = true;
+        var i: u32 = 0;
+        for (i < m.artifact_count) { names[i] = m.artifacts[i].name; i = i + 1; }
+        ncount = m.artifact_count;
+    }
+    or {
+        if (bu.artifact == nil) { ret R.ok[bool, outcome.Fail](false); }
+        names  = ?bu.artifact.name;
+        ncount = 1;
+    }
+
+    var order: *u32 = nil;
+    var count: u32  = 0;
+    val r: R.Result[bool, str] = manifest.plan_steps(a, itn, m, names, ncount, bu.target, proj_out, ?v, ?order, ?count);
+    if (owned) { A.deallocate[intern.StrId](a, names, m.artifact_count::usize); }
+    if (R.is_err[bool, str](r)) {
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](r)));
+    }
+    # plan_steps hands back the full step_count-sized order array; only the
+    # demand answer is needed here.
+    if (order != nil && count > 0) { A.deallocate[u32](a, order, m.step_count::usize); }
+    ret R.ok[bool, outcome.Fail](count > 0);
+}
+
+# resolve one link-input token to its fact
+#
+# The single home of link-token resolution, shared by the planner (the
+# request's tokens, at plan time) and the link path (the manifest's merged
+# overlay and the cascading dep libs, discovered during the build). A
+# `.dll`/`.dylib` is a loader dependency named by string alone, recorded by
+# basename with no on-disk probe and gated to its object format. Anything
+# else probes the filesystem: an explicit `.o`/`.a` path verbatim (then
+# retried against the project root), a bare name through the `-L` dirs and
+# working directory as `lib<name>.o`/`<name>.o`/`lib<name>.a`/`<name>.a`, a
+# shared object by reading its DT_SONAME, and a bare name lastly as
+# `lib<name>.so` through the `-L` dirs and the target OS's library
+# directories. An input that resolves to no existing file is a hard error so
+# a typo never silently drops a dependency.
+# ---
+# a:    allocator owning the returned fact's text
+# tgt:  the unit's composed target (object-format gating, os library dirs)
+# dirs: the `-L` search directories in invocation order
+# root: the project root explicit relative paths retry against
+# tok:  the link-input token to resolve
+# ret:  the resolved fact, or the failure to render
+pub fun resolve_token(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
+                      root: str, tok: *u8) R.Result[LinkInput, outcome.Fail] {
+    # a Windows `.dll` is a PE import-directory dependency named by string alone -
+    # the loader resolves it by name from the system path at run time, so it is
+    # recorded verbatim (by basename) with no on-disk probe, unlike an ELF `.so`.
+    if (is_dll_path(tok)) {
+        # only the format that declares `.dll` as its shared-library input extension
+        # (PE/COFF) consumes a `.dll`; every other target rejects it by that fact.
+        if (!str_equals(tgt.of.shared_input_ext, ".dll")) {
+            ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "'", tok::str, "' is a Windows DLL; .dll inputs require a PE/COFF target")));
+        }
+        ret dyn_copy(a, dll_basename(tok));
+    }
+
+    # a Darwin `.dylib` is a Mach-O LC_LOAD_DYLIB dependency named by its install
+    # name, resolved by dyld at run time; recorded by basename with no on-disk
+    # probe (a system dylib is absent on a cross host).
+    if (is_dylib_path(tok)) {
+        # likewise only the format declaring `.dylib` as its shared-library input
+        # extension (Mach-O) consumes a `.dylib`.
+        if (!str_equals(tgt.of.shared_input_ext, ".dylib")) {
+            ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "'", tok::str, "' is a Mach-O dylib; .dylib inputs require a Mach-O target")));
+        }
+        ret dyn_copy(a, dll_basename(tok));
+    }
+
+    var buf: [4096]u8;
+    var found: bool = resolve_input_into(tok, dirs, ?buf[0], 4096);
+
+    # a relative explicit path that misses the working directory is retried rooted
+    # at the project root, so manifest `libs` paths are project-relative.
+    if (!found && (request.is_object_path(tok) || is_shared_path(tok)) && tok[0] != '/') {
+        val cand_r: R.Result[str, str] = path.join(a, root, tok::str);
+        if (R.is_ok[str, str](cand_r)) {
+            val cand: str = R.unwrap_ok[str, str](cand_r);
+            if (fs.is_file(cand) && str_len(cand) + 1 <= 4096) {
+                memory.raw_copy((?buf[0])::ptr, cand::ptr, str_len(cand) + 1);
+                found = true;
+            }
+        }
+    }
+
+    # a resolved input that is a shared object (an explicit `.so` path, or a
+    # search that landed on one) is a dynamic dependency: record its DT_SONAME
+    # (or basename) instead of adding it as a static object.
+    if (found && is_shared_path(?buf[0])) {
+        var sname: [4096]u8;
+        if (read_so_soname(a, ?buf[0], ?sname[0], 4096)) {
+            ret dyn_copy(a, ?sname[0]);
+        }
+        ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "'", (?buf[0])::str, "' is not a loadable ELF shared object (an ld script or unsupported '.so')")));
+    }
+
+    # an explicit `.so` token taken verbatim (it has no '/' so `is_object_path`
+    # skipped it) - resolve it as a file and record its soname.
+    if (!found && is_shared_path(tok)) {
+        if (fs.is_file(tok)) {
+            var sname: [4096]u8;
+            if (read_so_soname(a, tok, ?sname[0], 4096)) {
+                ret dyn_copy(a, ?sname[0]);
+            }
+            ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "'", tok::str, "' is not a loadable ELF shared object (an ld script or unsupported '.so')")));
+        }
+    }
+
+    # a bare `-l` name with no static `.o`/`.a` falls back to a shared
+    # `lib<name>.so` in the `-L` dirs and the system library directories;
+    # `resolve_shared_into` writes the library's own soname.
+    if (!found && !request.is_object_path(tok) && !is_shared_path(tok)) {
+        var sname: [4096]u8;
+        if (resolve_shared_into(a, tgt, dirs, tok, ?sname[0], 4096)) {
+            ret dyn_copy(a, ?sname[0]);
+        }
+    }
+
+    if (!found) {
+        ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "cannot find link input '", tok::str, "'")));
+    }
+
+    val dup_r: R.Result[str, str] = str_copy(a, ?buf[0]);
+    if (R.is_err[str, str](dup_r)) { ret R.err[LinkInput, outcome.Fail](outcome.internal("out of memory")); }
+    var li: LinkInput;
+    li.kind = LINK_STATIC;
+    li.text = R.unwrap_ok[str, str](dup_r);
+    ret R.ok[LinkInput, outcome.Fail](li);
+}
+
+# a DYNAMIC fact carrying an owned copy of `name`
+fun dyn_copy(a: *A.Allocator, name: *u8) R.Result[LinkInput, outcome.Fail] {
+    val dup_r: R.Result[str, str] = str_copy(a, name);
+    if (R.is_err[str, str](dup_r)) { ret R.err[LinkInput, outcome.Fail](outcome.internal("out of memory")); }
+    var li: LinkInput;
+    li.kind = LINK_DYNAMIC;
+    li.text = R.unwrap_ok[str, str](dup_r);
+    ret R.ok[LinkInput, outcome.Fail](li);
+}
+
+# concatenate `va` into one owned message string on `al`, for a Fail's message
+#
+# The parts are short and the allocation effectively cannot fail; should it,
+# the allocator's own error is surfaced so an error still reaches the user
+# under memory pressure.
+fun join_msg(al: *A.Allocator, va: ...) str {
+    val r: R.Result[str, str] = str_join(al, va...);
+    if (R.is_err[str, str](r)) { ret R.unwrap_err[str, str](r); }
+    ret R.unwrap_ok[str, str](r);
+}
+
+# resolve one link-input token to an existing input file, writing the
+# absolute-or-relative path into `buf`
+#
+# An explicit object/archive path (`is_object_path`, i.e. a `.o` or `.a`) is
+# taken verbatim. A bare `-l`-style name is searched in each `-L <dir>` as
+# `<dir>/lib<name>.o`, `<dir>/<name>.o`, `<dir>/lib<name>.a`, `<dir>/<name>.a`,
+# then the same four candidates relative to the working directory. `.so` shared
+# libraries are not handled here - only loose `.o` objects and static `.a`
+# archives.
+fun resolve_input_into(tok: *u8, dirs: *Vector[str], buf: *u8, cap: usize) bool {
+    if (tok == nil || str_empty(tok::str)) { ret false; }
+
+    if (request.is_object_path(tok)) {
+        val n: usize = str_len(tok::str);
+        if (n + 1 > cap) { ret false; }
+        var i: usize = 0;
+        for (i < n) { buf[i] = tok[i]; i = i + 1; }
+        buf[n] = 0;
+        ret fs.is_file(buf);
+    }
+
+    # bare name: search each `-L` dir, then the working directory, for the
+    # `lib<name>.o` and `<name>.o` candidates in turn.
+    var i: usize = 0;
+    for (i < dirs.len) {
+        if (try_named_object(dirs.data[i]::*u8, tok, buf, cap)) { ret true; }
+        i = i + 1;
+    }
+    if (try_named_object(nil, tok, buf, cap)) { ret true; }
+    ret false;
+}
+
+# probe the `lib<name>` / `<name>` candidates with a `.o` then `.a` extension,
+# writing the first existing hit into `buf`
+#
+# A nil `dir` probes them relative to the working directory; a non-nil `dir`
+# roots them under it. Loose objects are preferred over archives so resolution
+# is unchanged for an `-l` name that has a loose `.o`.
+fun try_named_object(dir: *u8, name: *u8, buf: *u8, cap: usize) bool {
+    if (write_named_candidate(dir, "lib", name, "o", buf, cap) && fs.is_file(buf)) { ret true; }
+    if (write_named_candidate(dir, "", name, "o", buf, cap) && fs.is_file(buf))    { ret true; }
+    if (write_named_candidate(dir, "lib", name, "a", buf, cap) && fs.is_file(buf)) { ret true; }
+    if (write_named_candidate(dir, "", name, "a", buf, cap) && fs.is_file(buf))    { ret true; }
+    ret false;
+}
+
+# compose `<dir>/<prefix><name>.<ext>` (or `<prefix><name>.<ext>` when `dir` is
+# nil) into `buf`, null-terminated; false if it would not fit
+fun write_named_candidate(dir: *u8, prefix: *u8, name: *u8, ext: *u8, buf: *u8, cap: usize) bool {
+    # dir is nil for a working-directory probe; str_len returns 0 for nil.
+    val dl: usize = str_len(dir);
+    val pl: usize = str_len(prefix::str);
+    val nl: usize = str_len(name::str);
+    val el: usize = str_len(ext::str);
+    var need: usize = dl;
+    if (dl > 0) { need = need + 1; }
+    need = need + pl + nl + 1 + el + 1;
+    if (need > cap) { ret false; }
+
+    var k: usize = 0;
+    var i: usize = 0;
+    if (dir != nil) {
+        for (i < dl) { buf[k] = dir[i]; k = k + 1; i = i + 1; }
+        if (k > 0 && buf[k - 1] != '/') { buf[k] = '/'; k = k + 1; }
+    }
+    i = 0;
+    for (i < pl) { buf[k] = prefix[i]; k = k + 1; i = i + 1; }
+    i = 0;
+    for (i < nl) { buf[k] = name[i]; k = k + 1; i = i + 1; }
+    buf[k] = '.'; k = k + 1;
+    i = 0;
+    for (i < el) { buf[k] = ext[i]; k = k + 1; i = i + 1; }
+    buf[k] = 0;
+    ret true;
+}
+
+# read a shared object's DT_SONAME and write it (null-terminated) into `out`
+#
+# Accepts only a real ELF64 shared object (magic + ET_DYN): it writes the
+# object's DT_SONAME (tag 14, parsed from the SHT_DYNAMIC section and its
+# linked string table) when present, else the path's basename, and returns
+# true. Returns false for anything that is NOT a loadable ELF shared object -
+# a non-ELF file (e.g. a GNU ld linker script like `libc.so` on some distros)
+# or a non-ET_DYN object - so a caller never records a DT_NEEDED for something
+# the loader cannot map. The DT_SONAME is the canonical dependency name, so a
+# versioned `libc.so.6` is recorded even when the probe matched a `libc.so`
+# link.
+fun read_so_soname(a: *A.Allocator, so_path: *u8, out: *u8, cap: usize) bool {
+    val res_read: R.Result[Vector[u8], str] = fs.read_bytes(a, so_path);
+    if (R.is_err[Vector[u8], str](res_read)) { ret false; }
+    var b: Vector[u8] = R.unwrap_ok[Vector[u8], str](res_read);
+    var ok: bool = false;
+    # ELF64 magic and e_type == ET_DYN (3) - a loadable shared object.
+    if (b.len >= 64 && b.data[0] == 0x7F && b.data[1] == 0x45 && b.data[2] == 0x4C
+        && b.data[3] == 0x46 && bin.read_u16_le(b.data, 16) == 3) {
+        if (!extract_soname(b.data, b.len, out, cap)) {
+            # a loadable shared object with no DT_SONAME: the basename is the
+            # canonical dependency name.
+            val base: str   = path.filename(so_path::str);
+            val bl:   usize = str_len(base);
+            if (bl + 1 <= cap) { memory.raw_copy(out::ptr, base::ptr, bl + 1); }
+        }
+        ok = true;
+    }
+    vector.dnit[u8](?b);
+    ret ok;
+}
+
+# locate the DT_SONAME string in a parsed ELF64 image and copy it into `out`
+#
+# Returns false when there is no dynamic section or DT_SONAME, so the caller
+# substitutes the file's basename.
+fun extract_soname(buf: *u8, len: usize, out: *u8, cap: usize) bool {
+    val e_shoff:     usize = bin.read_u64_le(buf, 40)::usize;
+    val e_shentsize: usize = bin.read_u16_le(buf, 58)::usize;
+    val e_shnum:     usize = bin.read_u16_le(buf, 60)::usize;
+    if (e_shoff == 0 || e_shnum == 0) { ret false; }
+
+    # find SHT_DYNAMIC (type 6); its sh_link names the dynamic string table.
+    var dyn_off:    usize = 0;
+    var dyn_size:   usize = 0;
+    var dynstr_off: usize = 0;
+    var sh: usize = 0;
+    for (sh < e_shnum) {
+        val so: usize = e_shoff + sh * e_shentsize;
+        if (so + 64 > len) { ret false; }
+        if (bin.read_u32_le(buf, so + 4) == 6) {
+            dyn_off  = bin.read_u64_le(buf, so + 24)::usize;
+            dyn_size = bin.read_u64_le(buf, so + 32)::usize;
+            val link: usize = bin.read_u32_le(buf, so + 40)::usize;
+            if (link < e_shnum) {
+                val lo: usize = e_shoff + link * e_shentsize;
+                if (lo + 64 <= len) { dynstr_off = bin.read_u64_le(buf, lo + 24)::usize; }
+            }
+        }
+        sh = sh + 1;
+    }
+    if (dyn_off == 0 || dynstr_off == 0) { ret false; }
+
+    # walk the Elf64_Dyn array for DT_SONAME (tag 14).
+    var d: usize = 0;
+    for (d + 16 <= dyn_size) {
+        val eo: usize = dyn_off + d;
+        if (eo + 16 > len) { ret false; }
+        val tag: u64 = bin.read_u64_le(buf, eo);
+        if (tag == 0) { ret false; }
+        if (tag == 14) {
+            val str_at: usize = dynstr_off + bin.read_u64_le(buf, eo + 8)::usize;
+            var k: usize = 0;
+            for (str_at + k < len && buf[str_at + k] != 0 && k + 1 < cap) {
+                out[k] = buf[str_at + k];
+                k = k + 1;
+            }
+            out[k] = 0;
+            ret k > 0;
+        }
+        d = d + 16;
+    }
+    ret false;
+}
+
+# whether a path/token names a shared library: it contains a `.so` segment
+# followed by end-of-string or a `.<version>` suffix
+fun is_shared_path(tok: *u8) bool {
+    if (tok == nil) { ret false; }
+    ret str_ends_with(tok::str, ".so") || str_contains(tok::str, ".so.");
+}
+
+# whether a token names a Windows dynamic-link library - it ends in a `.dll`
+# extension (case-insensitive)
+fun is_dll_path(tok: *u8) bool {
+    if (tok == nil) { ret false; }
+    val n: usize = str_len(tok::str);
+    if (n < 4) { ret false; }
+    val d:  u8 = tok[n - 4];
+    val l1: u8 = tok[n - 3] | 0x20;
+    val l2: u8 = tok[n - 2] | 0x20;
+    val l3: u8 = tok[n - 1] | 0x20;
+    ret d == '.' && l1 == 'd' && l2 == 'l' && l3 == 'l';
+}
+
+# whether a link-input token names a Mach-O `.dylib` shared library
+# (case-insensitive)
+fun is_dylib_path(tok: *u8) bool {
+    if (tok == nil) { ret false; }
+    val n: usize = str_len(tok::str);
+    if (n < 6) { ret false; }
+    val d:  u8 = tok[n - 6];
+    val l1: u8 = tok[n - 5] | 0x20;
+    val l2: u8 = tok[n - 4] | 0x20;
+    val l3: u8 = tok[n - 3] | 0x20;
+    val l4: u8 = tok[n - 2] | 0x20;
+    val l5: u8 = tok[n - 1] | 0x20;
+    ret d == '.' && l1 == 'd' && l2 == 'y' && l3 == 'l' && l4 == 'i' && l5 == 'b';
+}
+
+# the final path component of a DLL path, stripping both POSIX `/` and Windows
+# `\` separators; a borrowed pointer into `path`
+fun dll_basename(path: *u8) *u8 {
+    val n: usize = str_len(path::str);
+    var last: usize = 0;
+    var i: usize = 0;
+    for (i < n) {
+        if (path[i] == '/' || path[i] == '\\') { last = i + 1; }
+        i = i + 1;
+    }
+    ret (path::usize + last)::*u8;
+}
+
+# resolve a bare `-l` name to a shared library `lib<name>.so` (or a
+# `.so.<version>`)
+#
+# Searches each `-L <dir>`, then the target OS's ordered library directories
+# (per-OS, so a cross-OS link probes the right directories rather than the
+# host's). Writes the soname to record for DT_NEEDED (the library's own
+# DT_SONAME) into `buf`. A non-ELF match (a GNU ld linker script at
+# `lib<name>.so`) is skipped so a versioned `lib<name>.so.N` is preferred.
+fun resolve_shared_into(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
+                        name: *u8, buf: *u8, cap: usize) bool {
+    var i: usize = 0;
+    for (i < dirs.len) {
+        if (try_shared_in_dir(a, dirs.data[i]::*u8, name, buf, cap)) { ret true; }
+        i = i + 1;
+    }
+    if (tgt.os != nil) {
+        var li: u32 = 0;
+        for (li < tgt.os.libdir_len) {
+            val ld: str = tgt.os.libdirs[li];
+            if (!str_empty(ld) && try_shared_in_dir(a, ld::*u8, name, buf, cap)) { ret true; }
+            li = li + 1;
+        }
+    }
+    ret false;
+}
+
+# probe `<dir>/lib<name>.so` then the common SONAME-bearing `lib<name>.so.<N>`
+# files for `N` in 6..0, accepting the first that is a real ELF shared object
+fun try_shared_in_dir(a: *A.Allocator, dir: *u8, name: *u8, buf: *u8, cap: usize) bool {
+    var cand: [4096]u8;
+    if (write_named_candidate(dir, "lib", name, "so", ?cand[0], 4096) && accept_shared(a, ?cand[0], buf, cap)) { ret true; }
+    var v: i64 = 6;
+    for (v >= 0) {
+        if (write_named_versioned(dir, name, v::u32, ?cand[0], 4096) && accept_shared(a, ?cand[0], buf, cap)) { ret true; }
+        v = v - 1;
+    }
+    ret false;
+}
+
+# accept `cand` as a shared dependency if it is an existing real ELF shared
+# object, writing its DT_SONAME (or, lacking one, its basename) into `buf`
+fun accept_shared(a: *A.Allocator, cand: *u8, buf: *u8, cap: usize) bool {
+    if (!fs.is_file(cand)) { ret false; }
+    if (read_so_soname(a, cand, buf, cap)) { ret true; }
+    ret false;
+}
+
+# compose `<dir>/lib<name>.so.<v>` into `buf`, null-terminated; false if it
+# would not fit or `v` exceeds one digit
+fun write_named_versioned(dir: *u8, name: *u8, v: u32, buf: *u8, cap: usize) bool {
+    if (v > 9)                                                    { ret false; }
+    if (!write_named_candidate(dir, "lib", name, "so", buf, cap)) { ret false; }
+    val n: usize = str_len(buf::str);
+    if (n + 3 > cap) { ret false; }
+    buf[n]     = '.';
+    buf[n + 1] = ('0'::u32 + v)::u8;
+    buf[n + 2] = 0;
+    ret true;
+}
+
+# render the plan to stdout for `mach build --explain`
+#
+# Everything printed is read off the BuildPlan value (and the interner its
+# target entries were resolved into), so the rendering cannot disagree with
+# what execution consumes.
+# ---
+# p:   the plan to render
+# itn: the interner the plan's target entries name into
+pub fun explain(p: *BuildPlan, itn: *intern.Interner) {
+    print.printf("plan: {}\n", p.request.project_root);
+    print.printf("units: {}\n", p.units.len::i64);
+
+    var i: usize = 0;
+    for (i < p.units.len) {
+        val u: *BuildUnit = ?p.units.data[i];
+        print.print("\n");
+        print.printf("unit {}: {} ({})  target {}  profile {}\n",
+            (i + 1)::i64, unit_artifact_label(u), unit_kind_label(u),
+            entry_name(itn, u.target_entry.name), u.profile);
+        print.printf("  goal    {}\n", goal_name(u.goal));
+        print.printf("  tuple   {}-{}-{}\n",
+            entry_name(itn, u.target_entry.isa_name),
+            entry_name(itn, u.target_entry.os_name),
+            entry_name(itn, u.target_entry.abi_name));
+        print.printf("  opt     {}\n", opt_name(u.opt_level));
+        if (!str_empty(u.out_path)) { print.printf("  out     {}\n", u.out_path); }
+        print.printf("  obj     {}\n", u.obj_dir);
+        if (!str_empty(u.ir_dir))  { print.printf("  ir      {}\n", u.ir_dir); }
+        if (!str_empty(u.asm_dir)) { print.printf("  asm     {}\n", u.asm_dir); }
+
+        var li: usize = 0;
+        for (li < u.link_inputs.len) {
+            val inp: *LinkInput = ?u.link_inputs.data[li];
+            if (inp.kind == LINK_STATIC) { print.printf("  link    static  {}\n", inp.text); }
+            or                           { print.printf("  link    dynamic {}\n", inp.text); }
+            li = li + 1;
+        }
+
+        print.print("  phases  ");
+        var pi: usize = 0;
+        for (pi < u.phases.len) {
+            if (pi > 0) { print.print(" -> "); }
+            print.print(phase_name(u.phases.data[pi]));
+            pi = pi + 1;
+        }
+        print.print("\n");
+        i = i + 1;
+    }
+}
+
+# the unit's artifact label for the explain rendering
+fun unit_artifact_label(u: *BuildUnit) str {
+    if (u.has_artifact) { ret u.sel_artifact; }
+    ret "(default)";
+}
+
+# the unit's artifact-kind label for the explain rendering
+fun unit_kind_label(u: *BuildUnit) str {
+    if (u.target_entry.mode == project.MODE_LIBRARY) {
+        if (u.target_entry.lib_kind == manifest.LIBKIND_SHARED) { ret "lib shared"; }
+        ret "lib static";
+    }
+    ret "bin";
+}
+
+# an interned target-entry name for the explain rendering, or "(default)" when unset
+fun entry_name(itn: *intern.Interner, id: intern.StrId) str {
+    val o: O.Option[str] = intern.lookup(itn, id);
+    if (O.is_some[str](o)) { ret O.unwrap[str](o); }
+    ret "(default)";
+}
+
+# the display name of a goal
+fun goal_name(g: request.BuildGoal) str {
+    if (g == request.GOAL_OBJECTS)   { ret "objects"; }
+    if (g == request.GOAL_TESTS)     { ret "tests"; }
+    if (g == request.GOAL_TEST_LIST) { ret "test list"; }
+    ret "executable";
+}
+
+# the display name of the settled optimization level
+fun opt_name(level: u8) str {
+    if (level == pipeline.OPT_RELEASE) { ret "release"; }
+    ret "debug";
+}
+
+# the display name of a phase
+fun phase_name(k: PhaseKind) str {
+    if (k == PH_DEP_STEPS) { ret "dep steps"; }
+    if (k == PH_LOAD)      { ret "load"; }
+    if (k == PH_STEPS)     { ret "steps"; }
+    if (k == PH_SEMA)      { ret "sema"; }
+    if (k == PH_LOWER)     { ret "lower"; }
+    if (k == PH_CODEGEN)   { ret "codegen"; }
+    if (k == PH_EMIT)      { ret "emit"; }
+    ret "link";
+}
+
+# parse a manifest source string into `out_m`
+fun ut_manifest_src(a: *A.Allocator, itn: *intern.Interner, src: str, out_m: *manifest.Manifest) bool {
+    val tr: R.Result[toml.Table, str] = toml.parse(a, src);
+    if (R.is_err[toml.Table, str](tr)) { ret false; }
+    var t: toml.Table = R.unwrap_ok[toml.Table, str](tr);
+    val mr: R.Result[manifest.Manifest, str] = manifest.parse(a, itn, ?t, true);
+    if (R.is_err[manifest.Manifest, str](mr)) { ret false; }
+    @out_m = R.unwrap_ok[manifest.Manifest, str](mr);
+    ret true;
+}
+
+# parse the two-target, two-artifact test manifest into `out_m`
+fun ut_manifest(a: *A.Allocator, itn: *intern.Interner, out_m: *manifest.Manifest) bool {
+    ret ut_manifest_src(a, itn, "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[target.tb]\nisa = \"aarch64\"\nos = \"linux\"\nabi = \"aapcs64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[artifact.appa]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/appa\"\ntargets = [\"*\"]\nlink = []\nneed = []\n[artifact.libb]\nkind = \"static\"\nentry = \"lib.mach\"\nout = \"lib/libb.a\"\ntargets = [\"*\"]\nlink = []\nneed = []\n", out_m);
+}
+
+# the shared test scaffold: page allocator, interner, populated registry, manifest
+fun ut_scaffold(alloc: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry, m: *manifest.Manifest) bool {
+    if (O.is_some[str](page.make(alloc)))              { ret false; }
+    @itn = intern.init(alloc);
+    @reg = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(reg))) { ret false; }
+    if (!ut_manifest(alloc, itn, m))                   { ret false; }
+    ret true;
+}
+
+# a test scaffold over a caller-supplied manifest source, for fixtures the shared
+# manifest does not express (a step-declaring, dependency-carrying project)
+fun ut_scaffold_src(alloc: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistry, m: *manifest.Manifest, src: str) bool {
+    if (O.is_some[str](page.make(alloc)))              { ret false; }
+    @itn = intern.init(alloc);
+    @reg = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(reg))) { ret false; }
+    if (!ut_manifest_src(alloc, itn, src, m))          { ret false; }
+    ret true;
+}
+
+# byte-compare two paths treating '/' and '\' as equal, so a `/`-written
+# expectation matches the host-separator path the planner emits (join uses
+# the build host's separator - '\' on windows). length-implicit via the
+# shared terminator check.
+fun ut_path_eq(a: str, b: str) bool {
+    if (a == nil) { ret str_empty(b); }
+    if (b == nil) { ret str_empty(a); }
+    if (a == b)   { ret true; }
+
+    var i: usize = 0;
+    for (a[i] != 0 && b[i] != 0) {
+        var ca: char = a[i];
+        var cb: char = b[i];
+        if (ca == 92) { ca = 47; }
+        if (cb == 92) { cb = 47; }
+        if (ca != cb) { ret false; }
+        i = i + 1;
+    }
+
+    ret a[i] == b[i];
+}
+
+# all_targets expands targets-outer, artifacts-inner in declaration order, and
+# every unit carries the cell's expanded paths and synthesized target entry
+test "mach.lang.build.plan.plan:matrix_expands_targets_outer_artifacts_inner" {
+    var alloc: A.Allocator;
+    var itn:   intern.Interner;
+    var reg:   target.TargetRegistry;
+    var m:     manifest.Manifest;
+    if (!ut_scaffold(?alloc, ?itn, ?reg, ?m)) { ret 1; }
+
+    var rq: request.BuildRequest = request.defaults();
+    rq.project_root = "/r";
+    rq.all_targets  = true;
+
+    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, ?rq);
+    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
+    val bp: BuildPlan = R.unwrap_ok[BuildPlan, outcome.Fail](pr);
+
+    if (bp.units.len != 4)                                        { ret 1; }
+    if (!str_equals(bp.units.data[0].sel_target, "ta"))           { ret 1; }
+    if (!str_equals(bp.units.data[0].sel_artifact, "appa"))       { ret 1; }
+    if (!str_equals(bp.units.data[1].sel_target, "ta"))           { ret 1; }
+    if (!str_equals(bp.units.data[1].sel_artifact, "libb"))       { ret 1; }
+    if (!str_equals(bp.units.data[2].sel_target, "tb"))           { ret 1; }
+    if (!str_equals(bp.units.data[2].sel_artifact, "appa"))       { ret 1; }
+    if (!str_equals(bp.units.data[3].sel_artifact, "libb"))       { ret 1; }
+
+    if (!ut_path_eq(bp.units.data[0].out_path, "/r/out/ta/debug/bin/appa"))   { ret 1; }
+    if (!ut_path_eq(bp.units.data[0].obj_dir, "/r/out/ta/debug/obj"))         { ret 1; }
+    if (!ut_path_eq(bp.units.data[1].out_path, "/r/out/ta/debug/lib/libb.a")) { ret 1; }
+    if (!ut_path_eq(bp.units.data[2].out_path, "/r/out/tb/debug/bin/appa"))   { ret 1; }
+
+    if (bp.units.data[0].target_entry.mode != project.MODE_EXECUTABLE) { ret 1; }
+    if (bp.units.data[1].target_entry.mode != project.MODE_LIBRARY)    { ret 1; }
+    if (bp.units.data[1].target_entry.lib_kind != manifest.LIBKIND_STATIC) { ret 1; }
+    ret 0;
+}
+
+# the phase list follows the goal: an execute goal emits and links, an objects
+# goal stops at emit, a test-list goal compiles only, a tests goal links the
+# dispatcher at the resolved `tests` template path
+test "mach.lang.build.plan.plan:phases_follow_goal" {
+    var alloc: A.Allocator;
+    var itn:   intern.Interner;
+    var reg:   target.TargetRegistry;
+    var m:     manifest.Manifest;
+    if (!ut_scaffold(?alloc, ?itn, ?reg, ?m)) { ret 1; }
+
+    var rq: request.BuildRequest = request.defaults();
+    rq.project_root = "/r";
+    rq.target       = "ta";
+    rq.artifact     = "appa";
+
+    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, ?rq);
+    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
+    val u0: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](pr).units.data[0];
+    if (u0.phases.len != 6)                 { ret 1; }
+    if (u0.phases.data[0] != PH_LOAD)       { ret 1; }
+    if (u0.phases.data[1] != PH_SEMA)       { ret 1; }
+    if (u0.phases.data[2] != PH_LOWER)      { ret 1; }
+    if (u0.phases.data[3] != PH_CODEGEN)    { ret 1; }
+    if (u0.phases.data[4] != PH_EMIT)       { ret 1; }
+    if (u0.phases.data[5] != PH_LINK)       { ret 1; }
+
+    rq.goal = request.GOAL_OBJECTS;
+    val po: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, ?rq);
+    if (R.is_err[BuildPlan, outcome.Fail](po)) { ret 1; }
+    val uo: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](po).units.data[0];
+    if (uo.phases.len != 5)                       { ret 1; }
+    if (uo.phases.data[4] != PH_EMIT)             { ret 1; }
+    if (!str_equals(uo.out_path, uo.obj_dir))     { ret 1; }
+
+    rq.goal = request.GOAL_TEST_LIST;
+    val pl: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, ?rq);
+    if (R.is_err[BuildPlan, outcome.Fail](pl)) { ret 1; }
+    val ul: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](pl).units.data[0];
+    if (ul.phases.len != 4)               { ret 1; }
+    if (ul.phases.data[3] != PH_CODEGEN)  { ret 1; }
+    if (!str_empty(ul.out_path))          { ret 1; }
+
+    rq.goal = request.GOAL_TESTS;
+    val pt: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, ?rq);
+    if (R.is_err[BuildPlan, outcome.Fail](pt)) { ret 1; }
+    val bt: BuildPlan = R.unwrap_ok[BuildPlan, outcome.Fail](pt);
+    if (bt.units.len != 1) { ret 1; }
+    val ut: *BuildUnit = ?bt.units.data[0];
+    if (!ut_path_eq(ut.out_path, "/r/out/ta/debug/test/appa"))   { ret 1; }
+    if (ut.phases.data[ut.phases.len - 1] != PH_LINK)            { ret 1; }
+    ret 0;
+}
+
+# a project carrying both a demanded step and a dependency derives its phase
+# list dependency-steps-first: a project step may consume a dep-step artifact,
+# so PH_DEP_STEPS leads PH_STEPS, both ahead of the module-graph load
+test "mach.lang.build.plan.plan:dep_steps_precede_project_steps" {
+    var alloc: A.Allocator;
+    var itn:   intern.Interner;
+    var reg:   target.TargetRegistry;
+    var m:     manifest.Manifest;
+    if (!ut_scaffold_src(?alloc, ?itn, ?reg, ?m, "[project]\nid = \"p\"\nversion = \"0.1.0\"\nsrc = \"src\"\nout = \"out/{target.name}/{profile.name}\"\n[target.ta]\nisa = \"x86_64\"\nos = \"linux\"\nabi = \"sysv64\"\n[profile.debug]\nopt = 0\ndebug = false\nsimd = \"scalarize\"\n[step.s]\ncmd = \"true\"\nin = []\nout = [\"gen/x\"]\nneed = []\n[dep.d]\npath = \"./vendor/d\"\n[artifact.appa]\nkind = \"bin\"\nentry = \"main.mach\"\nout = \"bin/appa\"\ntargets = [\"*\"]\nlink = []\nneed = [\"s\"]\n")) { ret 1; }
+
+    var rq: request.BuildRequest = request.defaults();
+    rq.project_root = "/r";
+    rq.target       = "ta";
+    rq.artifact     = "appa";
+
+    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, ?rq);
+    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
+    val u0: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](pr).units.data[0];
+
+    if (u0.phases.len < 3)                  { ret 1; }
+    if (u0.phases.data[0] != PH_DEP_STEPS)  { ret 1; }
+    if (u0.phases.data[1] != PH_STEPS)      { ret 1; }
+    if (u0.phases.data[2] != PH_LOAD)       { ret 1; }
+    ret 0;
+}
+
+# `-o` applies the executable-goal precedence (relative rooted at the project
+# root, absolute verbatim) and the ir/asm dump dirs appear only when emission
+# is on
+test "mach.lang.build.plan.plan:out_override_and_emission_dirs" {
+    var alloc: A.Allocator;
+    var itn:   intern.Interner;
+    var reg:   target.TargetRegistry;
+    var m:     manifest.Manifest;
+    if (!ut_scaffold(?alloc, ?itn, ?reg, ?m)) { ret 1; }
+
+    var rq: request.BuildRequest = request.defaults();
+    rq.project_root = "/r";
+    rq.target       = "ta";
+    rq.artifact     = "appa";
+    rq.out          = "bin/custom";
+
+    val pr: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, ?rq);
+    if (R.is_err[BuildPlan, outcome.Fail](pr)) { ret 1; }
+    val u0: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](pr).units.data[0];
+    if (!ut_path_eq(u0.out_path, "/r/bin/custom")) { ret 1; }
+    if (!str_empty(u0.ir_dir))                     { ret 1; }
+    if (!str_empty(u0.asm_dir))                    { ret 1; }
+
+    rq.out     = "/abs/custom";
+    rq.emit_ir = true;
+    rq.emit_asm = true;
+    val pa: R.Result[BuildPlan, outcome.Fail] = plan(?alloc, ?itn, ?reg, ?m, ?rq);
+    if (R.is_err[BuildPlan, outcome.Fail](pa)) { ret 1; }
+    val ua: *BuildUnit = ?R.unwrap_ok[BuildPlan, outcome.Fail](pa).units.data[0];
+    if (!ut_path_eq(ua.out_path, "/abs/custom"))          { ret 1; }
+    if (!ut_path_eq(ua.ir_dir, "/r/out/ta/debug/ir"))     { ret 1; }
+    if (!ut_path_eq(ua.asm_dir, "/r/out/ta/debug/asm"))   { ret 1; }
+    ret 0;
+}

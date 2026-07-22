@@ -24,10 +24,8 @@ use R: std.types.result;
 use mach.lang.diagnostic;
 use mach.lang.fe.ast;
 use mach.lang.intern;
-use mach.lang.manifest;
 use mach.lang.module;
 use mach.lang.query;
-use mach.lang.readout;
 use mach.lang.source;
 use mach.lang.target;
 use mach.lang.type;
@@ -59,7 +57,15 @@ pub rec Overlay {
 # Owns the allocator-backed services every phase reads or writes plus the
 # per-build module registries the incremental engine remaps against.
 # ---
-# alloc:            allocator used for all owned storage on the session
+# alloc:            the persistent channel: allocator for session-lifetime storage -
+#                    the services below, the session registries, and the query-owned
+#                    artifact internals every compute builds through it
+# build_alloc:      the per-build channel: allocator for build-span transients (the
+#                    Project graph, manifest parses, engine unit state). identical to
+#                    `alloc` at init - the one-channel legacy/cold posture; the build
+#                    engine points it at a per-call scratch arena for the span of one
+#                    warm unit execution and restores it before returning, so an
+#                    allocation and its free must pair within one build span
 # sources:          registry of loaded source files
 # diags:            diagnostic sink shared by every phase
 # interner:         shared string interner used by sema and downstream phases
@@ -85,7 +91,8 @@ pub rec Overlay {
 # registry:         owned target registry (isa/os/abi/of vtables), zeroed at init and
 #                    populated by the owner's target.register_all call
 pub rec Session {
-    alloc:    *A.Allocator;
+    alloc:       *A.Allocator;
+    build_alloc: *A.Allocator;
     sources:  source.SourceMap;
     diags:    diagnostic.DiagList;
     interner: intern.Interner;
@@ -125,44 +132,7 @@ pub rec Session {
     # table a reused ResolveResult is remapped through (resolve.remap_result).
     stable_to_mid: map.Map[module.StableModuleId, module.ModuleId];
 
-    # opaque handle to the *driver.Project of the running build, installed for
-    # the span of the resolve pass so the Q_RESOLVE compute can reach the
-    # per-build module graph. nil outside a resolve pass; never dereferenced here.
-    active_project: ptr;
-
     registry: target.TargetRegistry;
-
-    # CLI optimization intent, set before the build so the comptime ctx can
-    # resolve `$mach.build.mode`. opt_explicit marks an explicit `-O*`
-    # flag (it wins over the manifest); opt_release is its release-vs-debug sense.
-    opt_explicit: bool;
-    opt_release:  bool;
-
-    # the build-progress readout (`mach build -v`/`-vv`), attached before the
-    # build so the front-end load/resolve/sema phases record into the same
-    # accumulator the back-end closes. nil leaves the build silent.
-    readout: *readout.Readout;
-
-    # CLI `--pie` intent: emit a position-independent (ET_DYN) executable for ASLR
-    # instead of the default fixed-address one. opt-in; the linker ORs it with the
-    # target's own PIE requirement. off leaves the default ET_EXEC output unchanged.
-    pie: bool;
-
-    # resolved debug-info intent for this build (`-g` or a profile's `debug = true`,
-    # precedence `-g` > profile > off). the single switch that gates debug-section
-    # emission; like `pie` it forks compilation state, so the target fingerprint keys
-    # on it. `debug_producer` (DW_AT_producer) and `debug_comp_dir` (DW_AT_comp_dir)
-    # are the compilation-unit metadata the driver plumbs to the debug producer; both
-    # STR_NIL when debug is off.
-    debug:          bool;
-    debug_producer: intern.StrId;
-    debug_comp_dir: intern.StrId;
-
-    # resolved SIMD strictness posture for this build (`[profile.*] simd`, the
-    # consumer's setting): SIMD_SCALARIZE tolerates scalarization on an incapable
-    # target, SIMD_REQUIRE rejects it. read at the build's scalarize/require gate over
-    # the target capability fact (`MachineModel.has_v128`). SIMD_SCALARIZE by default.
-    simd:           manifest.SimdMode;
 
     # in-memory source overlays keyed by path (#1588): live unsaved buffer text a
     # long-lived session's parse read uses instead of the file on disk. a small
@@ -194,6 +164,7 @@ val OVERLAY_SEED_CAP: u32 = 4;
 pub fun init(alloc: *A.Allocator) R.Result[Session, str] {
     var s: Session;
     s.alloc            = alloc;
+    s.build_alloc      = alloc;
     s.sources          = source.init(alloc);
     s.diags            = diagnostic.init(alloc);
     s.interner         = intern.init(alloc);
@@ -211,16 +182,7 @@ pub fun init(alloc: *A.Allocator) R.Result[Session, str] {
     s.stable_ids       = map.init[intern.StrId, module.StableModuleId](alloc, map.hash_u32, map.eq_u32);
     s.stable_id_next   = 0;
     s.stable_to_mid    = map.init[module.StableModuleId, module.ModuleId](alloc, map.hash_u32, map.eq_u32);
-    s.active_project   = nil;
     s.registry         = target.registry_init();
-    s.opt_explicit     = false;
-    s.opt_release      = false;
-    s.readout          = nil;
-    s.pie              = false;
-    s.debug            = false;
-    s.debug_producer   = intern.STR_NIL;
-    s.debug_comp_dir   = intern.STR_NIL;
-    s.simd             = manifest.SIMD_SCALARIZE;
     s.overlays         = nil;
     s.overlay_len      = 0;
     s.overlay_cap      = 0;
@@ -382,8 +344,6 @@ pub fun reset_module_registry(s: *Session) {
     # each build; clear it so a reshape's new numbering never collides with a
     # stale entry.
     map.clear[module.StableModuleId, module.ModuleId](?s.stable_to_mid);
-
-    s.active_project = nil;
 }
 
 # record `a` as the AST of module `mid`, growing the registry to cover `mid` and
@@ -555,29 +515,6 @@ pub fun module_id_for_stable(s: *Session, stable: module.StableModuleId) module.
         ret @R.unwrap_ok[*module.ModuleId, str](res_get);
     }
     ret module.MODULE_NIL;
-}
-
-# install (or clear, with nil) the opaque handle to the build's *driver.Project
-# for the span of the resolve pass
-#
-# Lets the Q_RESOLVE compute reach the per-build module graph. Stored verbatim and
-# never dereferenced here.
-# ---
-# s: the session
-# p: the active Project as `ptr`, or nil to clear
-pub fun set_active_project(s: *Session, p: ptr) {
-    s.active_project = p;
-}
-
-# the opaque *driver.Project handle installed for the running resolve pass, or nil
-# outside one
-#
-# The caller casts it back to *driver.Project.
-# ---
-# s:   the session
-# ret: the active Project `ptr`, or nil
-pub fun active_project(s: *Session) ptr {
-    ret s.active_project;
 }
 
 # record a literal link-name override for decl `did` in module `mid`

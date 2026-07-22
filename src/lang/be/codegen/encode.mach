@@ -43,10 +43,10 @@ use R: std.types.result;
 
 use mach.lang.be.codegen.mir;
 use mach.lang.intern;
-use source: mach.lang.source;
+use mach.lang.source;
 use mach.lang.target.abi;
 use mach.lang.target.of;
-use tos:    mach.lang.target.os;
+use tos: mach.lang.target.os;
 use target: mach.lang.target.resolved;
 
 # the per-module result an ISA's encoder produces: the encoded `.text` bytes plus
@@ -120,20 +120,42 @@ pub rec InlinePc {
 # a source-variable location record: at `.text` offset `text_offset`, the variable
 # bound by OP_DBG_VALUE `iid` lives at the raw home `(kind, reg | off)`. The producer
 # joins `iid` to the IR variable identity and orders records by offset to build the
-# per-PC ranges of a `.debug_loclists` entry (#1705). `text_offset` / `sec` re-home
-# exactly like a LineRow (insert_text shift, site_placed re-home) so a range stays
-# correct across branch relaxation and `#[section]` excision
+# per-PC ranges of a `.debug_loclists` entry (#1705). `text_offset` / `sec` (and a
+# nonzero `end_offset`) re-home exactly like a LineRow (insert_text shift,
+# site_placed re-home) so a range stays correct across branch relaxation and
+# `#[section]` excision.
+#
+# A VARLOC_CMP record is the fused-condition COMPUTED VALUE: the variable is the
+# relation `cc(lhs, rhs)` evaluated over the two operand homes, observable only
+# while the fused compare-and-branch executes - `end_offset` bounds the range to
+# that instruction's byte extent (a plain record's range instead runs to the
+# variable's next binding, the linear rule, and carries `end_offset` 0). the
+# operand homes ride `(sub_lhs, reg, off)` / `(sub_rhs, reg2, off2)`, each one
+# of VARLOC_REG (register id), VARLOC_FRAME (spill-slot offset holding the
+# machine-word value), or VARLOC_IMM (the constant's raw bits in off / off2);
+# `cmp_rel` + `cmp_signed` + `cmp_width` digest the relation so the producer
+# needs no MIR opcode knowledge.
 # ---
 # text_offset: `.text` byte offset where this binding becomes live
 # sec:         owning object-section index (re-homed from 0 by codegen)
 # iid:         source OP_DBG_VALUE instruction id (joins the IR dbg-var identity)
-# kind:        VARLOC_NONE / VARLOC_REG / VARLOC_FRAME
-# reg:         physical register id when kind == VARLOC_REG
-# off:         frame-base offset when kind == VARLOC_FRAME
+# kind:        VARLOC_NONE / VARLOC_REG / VARLOC_FRAME / VARLOC_CMP
+# reg:         physical register id when kind == VARLOC_REG; the lhs operand's
+#              register for a VARLOC_CMP with sub_lhs VARLOC_REG
+# off:         frame-base offset when kind == VARLOC_FRAME; the lhs operand's
+#              frame offset or immediate bits for a VARLOC_CMP
 # off_storage: true when a VARLOC_FRAME slot holds the value's storage directly (a
 #              register-passed aggregate reconstructed into a slot it owns, #1954), so an
 #              aggregate location addresses the slot without the byref pointer deref; false
 #              for a regalloc spill, whose slot holds the value (a pointer, for an aggregate)
+# end_offset:  explicit exclusive range end for a VARLOC_CMP (0 = linear rule)
+# sub_lhs:     lhs operand home kind for a VARLOC_CMP (REG / FRAME / IMM)
+# sub_rhs:     rhs operand home kind for a VARLOC_CMP (REG / FRAME / IMM)
+# reg2:        rhs operand register for a VARLOC_CMP with sub_rhs VARLOC_REG
+# off2:        rhs operand frame offset or immediate bits for a VARLOC_CMP
+# cmp_rel:     the relation (one of CMPREL_*) for a VARLOC_CMP
+# cmp_signed:  true for a signed relation (selects the width interpretation)
+# cmp_width:   the compare width in bytes (0 reads as the machine word)
 pub rec VarLoc {
     text_offset: u32;
     sec:         u32;
@@ -142,12 +164,32 @@ pub rec VarLoc {
     reg:         i32;
     off:         i64;
     off_storage: bool;
+    end_offset:  u32;
+    sub_lhs:     u8;
+    sub_rhs:     u8;
+    reg2:        i32;
+    off2:        i64;
+    cmp_rel:     u8;
+    cmp_signed:  bool;
+    cmp_width:   u8;
 }
 
-# a variable-location record's home kind
+# a variable-location record's home kind. VARLOC_CMP is the fused-condition
+# computed value (see VarLoc); VARLOC_IMM appears only as a VARLOC_CMP operand
+# sub-home, never as a record's own kind
 pub val VARLOC_NONE:  u8 = 0;
 pub val VARLOC_REG:   u8 = 1;
 pub val VARLOC_FRAME: u8 = 2;
+pub val VARLOC_CMP:   u8 = 3;
+pub val VARLOC_IMM:   u8 = 4;
+
+# the digested relation a VARLOC_CMP compares with (`cmp_signed` carries the
+# signedness separately; only EQ / NE / LT / LE exist - lowering canonicalizes
+# GT / GE by swapping operands)
+pub val CMPREL_EQ: u8 = 0;
+pub val CMPREL_NE: u8 = 1;
+pub val CMPREL_LT: u8 = 2;
+pub val CMPREL_LE: u8 = 3;
 
 # one relocation the encoder leaves for the object writer to resolve
 #
@@ -791,8 +833,131 @@ pub fun push_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, vr
     st.varlocs[st.varloc_count].reg         = reg;
     st.varlocs[st.varloc_count].off         = off;
     st.varlocs[st.varloc_count].off_storage = storage;
+    varloc_clear_cmp(?st.varlocs[st.varloc_count]);
     st.varloc_count = st.varloc_count + 1;
     ret R.ok[bool, str](true);
+}
+
+# zero a record's compare payload (a plain binding carries none; the fields are
+# read only under kind VARLOC_CMP but must not be garbage)
+fun varloc_clear_cmp(vl: *VarLoc) {
+    vl.end_offset = 0;
+    vl.sub_lhs    = VARLOC_NONE;
+    vl.sub_rhs    = VARLOC_NONE;
+    vl.reg2       = 0;
+    vl.off2       = 0;
+    vl.cmp_rel    = 0;
+    vl.cmp_signed = false;
+    vl.cmp_width  = 0;
+}
+
+# resolve one fused-compare operand to its VARLOC sub-home: an immediate is its
+# raw bits (VARLOC_IMM), a register-assigned vreg its register, a spilled vreg
+# its frame slot (holding the machine-word value), and anything else - a vreg
+# with no home - VARLOC_NONE, which degrades the whole record
+# ---
+# fn:      the MIR function owning the vreg table and frame
+# is_imm:  true when the operand is an immediate
+# vreg:    the operand vreg (when not an immediate)
+# imm:     the immediate's raw bits (when is_imm)
+# out_kind/out_reg/out_off: the resolved sub-home
+fun cmp_operand_home(fn: *mir.MirFunction, is_imm: bool, vreg: u32, imm: i64,
+                     out_kind: *u8, out_reg: *i32, out_off: *i64) {
+    @out_kind = VARLOC_NONE;
+    @out_reg  = 0;
+    @out_off  = 0;
+    if (is_imm) {
+        @out_kind = VARLOC_IMM;
+        @out_off  = imm;
+        ret;
+    }
+    if (vreg >= fn.vreg_count) { ret; }
+    val vr: *mir.MirVReg = ?fn.vregs[vreg];
+    if (vr.assigned != mir.MIR_VREG_NIL) {
+        @out_kind = VARLOC_REG;
+        @out_reg  = vr.assigned::i32;
+        ret;
+    }
+    if (vr.spill_slot >= 0) {
+        var si: u32 = 0;
+        for (si < fn.frame.slot_count) {
+            if (fn.frame.slots[si].value == vreg) {
+                @out_kind = VARLOC_FRAME;
+                @out_off  = fn.frame.slots[si].offset;
+            }
+            si = si + 1;
+        }
+    }
+}
+
+# record a fused-condition computed-value location for a compare binding (see
+# VarLoc's VARLOC_CMP contract). both operand homes must resolve - a homeless
+# operand degrades the record to a plain optimized-out binding, keeping the gap
+# semantics rather than describing a half-computable value. the range stays open
+# (`end_offset` 0) until the fused terminator's encoder closes it at the
+# instruction's byte end via `close_cmp_varlocs`
+# ---
+# st:          the encode state
+# text_offset: `.text` offset where the fused terminator begins
+# fn:          the MIR function owning the operand vregs
+# bind:        the compare binding (cmp_op nonzero)
+# ret:         ok(true), or an allocation error
+pub fun push_cmp_varloc(st: *EncodeState, text_offset: u32, fn: *mir.MirFunction, bind: *mir.MirDbgBinding) R.Result[bool, str] {
+    var lk: u8 = VARLOC_NONE; var lr: i32 = 0; var lo: i64 = 0;
+    var rk: u8 = VARLOC_NONE; var rr: i32 = 0; var ro: i64 = 0;
+    cmp_operand_home(fn, bind.lhs_is_imm, bind.vreg, bind.imm, ?lk, ?lr, ?lo);
+    cmp_operand_home(fn, bind.rhs_is_imm, bind.vreg2, bind.imm2, ?rk, ?rr, ?ro);
+    if (lk == VARLOC_NONE || rk == VARLOC_NONE) {
+        ret push_varloc(st, text_offset, fn, mir.MIR_VREG_NIL, bind.iid);
+    }
+
+    var rel: u8 = CMPREL_EQ;
+    if (bind.cmp_op == mir.MIR_SEL_CBR_NE)                                            { rel = CMPREL_NE; }
+    or (bind.cmp_op == mir.MIR_SEL_CBR_LT_S || bind.cmp_op == mir.MIR_SEL_CBR_LT_U)   { rel = CMPREL_LT; }
+    or (bind.cmp_op == mir.MIR_SEL_CBR_LE_S || bind.cmp_op == mir.MIR_SEL_CBR_LE_U)   { rel = CMPREL_LE; }
+
+    if (st.varloc_count >= st.varloc_cap) {
+        val res_grow: R.Result[bool, str] = grow_varlocs(st);
+        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+    }
+    val vl: *VarLoc = ?st.varlocs[st.varloc_count];
+    vl.text_offset = text_offset;
+    vl.sec         = 0;
+    vl.iid         = bind.iid;
+    vl.kind        = VARLOC_CMP;
+    vl.reg         = lr;
+    vl.off         = lo;
+    vl.off_storage = false;
+    vl.end_offset  = 0;
+    vl.sub_lhs     = lk;
+    vl.sub_rhs     = rk;
+    vl.reg2        = rr;
+    vl.off2        = ro;
+    vl.cmp_rel     = rel;
+    vl.cmp_signed  = mir.is_signed_cmp(bind.cmp_op);
+    vl.cmp_width   = bind.cmp_width;
+    st.varloc_count = st.varloc_count + 1;
+    ret R.ok[bool, str](true);
+}
+
+# close every still-open VARLOC_CMP record the fused terminator at
+# `instr_start` pushed, bounding its range to the instruction's byte extent
+# `[instr_start, instr_end)` - the only PCs where the computed relation is
+# observable. called by each arch's fused-terminator encoder once the branch's
+# last byte is emitted; records of other instructions are never touched (the
+# backward walk stops at the first record of an earlier offset)
+# ---
+# st:          the encode state
+# instr_start: the fused terminator's first byte offset (its records' offset)
+# instr_end:   the offset one past the terminator's last byte
+pub fun close_cmp_varlocs(st: *EncodeState, instr_start: u32, instr_end: u32) {
+    var i: u32 = st.varloc_count;
+    for (i > 0) {
+        i = i - 1;
+        val vl: *VarLoc = ?st.varlocs[i];
+        if (vl.text_offset != instr_start) { ret; }
+        if (vl.kind == VARLOC_CMP && vl.end_offset == 0) { vl.end_offset = instr_end; }
+    }
 }
 
 # record a VarLoc for every `-g` source-variable binding attached to `mi`, at the
@@ -810,7 +975,12 @@ pub fun emit_var_bindings(st: *EncodeState, fn: *mir.MirFunction, mi: *mir.MirIn
     val at: u32 = st.buf.len::u32;
     var i: u32 = 0;
     for (i < mi.dbg_binding_count) {
-        val r: R.Result[bool, str] = push_varloc(st, at, fn, mi.dbg_bindings[i].vreg, mi.dbg_bindings[i].iid);
+        val bind: *mir.MirDbgBinding = ?mi.dbg_bindings[i];
+        # a fused-condition compare binding records the computed relation; a
+        # plain binding the vreg's post-regalloc home.
+        var r: R.Result[bool, str] = R.ok[bool, str](true);
+        if (bind.cmp_op != 0) { r = push_cmp_varloc(st, at, fn, bind); }
+        or                    { r = push_varloc(st, at, fn, bind.vreg, bind.iid); }
         if (R.is_err[bool, str](r)) { ret r; }
         i = i + 1;
     }
@@ -1086,6 +1256,10 @@ pub fun insert_text(st: *EncodeState, pos: u32, nbytes: u32) R.Result[bool, str]
     var vli: u32 = 0;
     for (vli < st.varloc_count) {
         if (st.varlocs[vli].text_offset >= pos) { st.varlocs[vli].text_offset = st.varlocs[vli].text_offset + nbytes; }
+        # a bounded compare range's end shifts with the text like its start.
+        if (st.varlocs[vli].end_offset != 0 && st.varlocs[vli].end_offset >= pos) {
+            st.varlocs[vli].end_offset = st.varlocs[vli].end_offset + nbytes;
+        }
         vli = vli + 1;
     }
     var ipi: u32 = 0;
@@ -1328,6 +1502,86 @@ test "mach.lang.be.codegen.encode.push_varloc:reg_frame_dead" {
     if (st.varlocs[0].kind != VARLOC_REG || st.varlocs[0].reg != 7 || st.varlocs[0].iid != 100) { code = 1; }
     if (st.varlocs[1].kind != VARLOC_FRAME || st.varlocs[1].off != -16 || st.varlocs[1].iid != 101) { code = 1; }
     if (st.varlocs[2].kind != VARLOC_NONE || st.varlocs[2].iid != 102) { code = 1; }
+
+    if (st.varlocs != nil && st.varloc_cap > 0) { A.deallocate[VarLoc](?alloc, st.varlocs, st.varloc_cap::usize); }
+    buf_dnit(?st.buf);
+    ret code;
+}
+
+# a fused-condition compare binding records the computed relation over both
+# operand homes (register / spill slot / immediate), digested for the producer
+# (relation + signedness + width), and close_cmp_varlocs bounds each such record
+# to the fused terminator's byte extent while a plain record at the same offset
+# keeps its linear-rule 0. a compare binding with a homeless operand degrades to
+# a plain optimized-out record
+test "mach.lang.be.codegen.encode.push_cmp_varloc:homes_digest_and_close" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var code: i32 = 0;
+
+    var st: EncodeState;
+    t_row_state(?alloc, ?st);
+
+    # vreg 0 -> register 7; vreg 1 -> spill slot at -16; vreg 2 -> no home.
+    var vregs: [3]mir.MirVReg;
+    vregs[0].id = 0; vregs[0].class = 0; vregs[0].spill_slot = -1; vregs[0].assigned = 7;
+    vregs[1].id = 1; vregs[1].class = 0; vregs[1].spill_slot = 0;  vregs[1].assigned = mir.MIR_VREG_NIL;
+    vregs[2].id = 2; vregs[2].class = 0; vregs[2].spill_slot = -1; vregs[2].assigned = mir.MIR_VREG_NIL;
+
+    var slots: [1]mir.MirSlot;
+    slots[0].value = 1; slots[0].kind = mir.SLOT_SPILL; slots[0].offset = -16; slots[0].size = 8; slots[0].align = 8;
+
+    var fn: mir.MirFunction;
+    fn.vregs = ?vregs[0]; fn.vreg_count = 3;
+    fn.frame.slots = ?slots[0]; fn.frame.slot_count = 1; fn.frame.slot_cap = 1;
+    fn.frame.size = 0; fn.frame.align = 0; fn.frame.outgoing_size = 0;
+
+    # unsigned i16 less-than of (reg vreg 0) against (imm 40000), bound at PC 12.
+    var bind: mir.MirDbgBinding;
+    bind.iid = 100; bind.cmp_op = mir.MIR_SEL_CBR_LT_U; bind.cmp_width = 2;
+    bind.lhs_is_imm = false; bind.vreg = 0; bind.imm = 0;
+    bind.rhs_is_imm = true;  bind.vreg2 = mir.MIR_VREG_NIL; bind.imm2 = 40000;
+    val ra: R.Result[bool, str] = push_cmp_varloc(?st, 12, ?fn, ?bind);
+    if (R.is_err[bool, str](ra)) { code = 1; }
+
+    # signed le of (spilled vreg 1) against (reg vreg 0), same terminator.
+    bind.iid = 101; bind.cmp_op = mir.MIR_SEL_CBR_LE_S; bind.cmp_width = 8;
+    bind.lhs_is_imm = false; bind.vreg = 1;
+    bind.rhs_is_imm = false; bind.vreg2 = 0;
+    val rb: R.Result[bool, str] = push_cmp_varloc(?st, 12, ?fn, ?bind);
+    if (R.is_err[bool, str](rb)) { code = 1; }
+
+    # a plain binding at the same offset stays open under the linear rule.
+    val rp: R.Result[bool, str] = push_varloc(?st, 12, ?fn, 0, 102);
+    if (R.is_err[bool, str](rp)) { code = 1; }
+
+    # a compare whose operand has no home degrades to a plain optimized-out gap.
+    bind.iid = 103; bind.cmp_op = mir.MIR_SEL_CBR_EQ; bind.cmp_width = 4;
+    bind.lhs_is_imm = false; bind.vreg = 2;
+    bind.rhs_is_imm = true;  bind.imm2 = 0;
+    val rd: R.Result[bool, str] = push_cmp_varloc(?st, 12, ?fn, ?bind);
+    if (R.is_err[bool, str](rd)) { code = 1; }
+
+    close_cmp_varlocs(?st, 12, 20);
+
+    if (st.varloc_count != 4) { code = 1; }
+    val a: *VarLoc = ?st.varlocs[0];
+    if (a.kind != VARLOC_CMP)                     { code = 1; }
+    if (a.sub_lhs != VARLOC_REG || a.reg != 7)    { code = 1; }
+    if (a.sub_rhs != VARLOC_IMM || a.off2 != 40000) { code = 1; }
+    if (a.cmp_rel != CMPREL_LT || a.cmp_signed)   { code = 1; }
+    if (a.cmp_width != 2)                         { code = 1; }
+    if (a.end_offset != 20)                       { code = 1; }
+    val b: *VarLoc = ?st.varlocs[1];
+    if (b.kind != VARLOC_CMP)                       { code = 1; }
+    if (b.sub_lhs != VARLOC_FRAME || b.off != -16)  { code = 1; }
+    if (b.sub_rhs != VARLOC_REG || b.reg2 != 7)     { code = 1; }
+    if (b.cmp_rel != CMPREL_LE || !b.cmp_signed)    { code = 1; }
+    if (b.end_offset != 20)                         { code = 1; }
+    val c: *VarLoc = ?st.varlocs[2];
+    if (c.kind != VARLOC_REG || c.end_offset != 0)  { code = 1; }
+    val d: *VarLoc = ?st.varlocs[3];
+    if (d.kind != VARLOC_NONE || d.iid != 103)      { code = 1; }
 
     if (st.varlocs != nil && st.varloc_cap > 0) { A.deallocate[VarLoc](?alloc, st.varlocs, st.varloc_cap::usize); }
     buf_dnit(?st.buf);

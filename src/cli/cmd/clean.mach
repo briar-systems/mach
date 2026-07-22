@@ -13,7 +13,8 @@
 # an unparseable manifest, 2 on an allocator or io failure.
 
 use std.allocator.arena;
-use std.filesystem;
+use std.allocator.page;
+use fs: std.filesystem;
 use std.print;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -21,11 +22,13 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.string.str_copy_slice;
+use std.types.path;
 
-use A:    std.allocator;
-use O:    std.types.option;
-use R:    std.types.result;
-use toml: std.data.toml;
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+use std.data.toml;
 
 use mach.cli.util;
 use mach.lang.intern;
@@ -42,53 +45,68 @@ use mach.lang.manifest;
 # marks: consumption record parallel to argv, for the unknown-flag rejector
 # ret:   0 on success, 1 on a missing/unparseable project, 2 on an io failure
 pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
-    if (util.reject_unknown(argc, argv, marks, 2, "mach clean")) { ret 1; }
+    if (util.flag_reject_unknown(argc, argv, marks, 2, "mach clean")) { ret 1; }
 
     var backing: A.Allocator;
-    var ar:      arena.Arena;
-    var a:       A.Allocator;
-    if (O.is_some[str](util.bootstrap_arena(?backing, ?ar, ?a))) {
+    if (O.is_some[str](page.make(?backing))) {
+        print.eprintln("error: failed to initialise allocator");
+        ret 2;
+    }
+    var ar: arena.Arena;
+    if (O.is_some[str](arena.init(?ar, ?backing, 0))) {
+        print.eprintln("error: failed to initialise allocator");
+        ret 2;
+    }
+    var a: A.Allocator;
+    if (O.is_some[str](arena.make(?a, ?ar))) {
+        arena.dnit(?ar);
         print.eprintln("error: failed to initialise allocator");
         ret 2;
     }
 
-    # resolve the (project_root, manifest) pair from the required positional path;
-    # see util.resolve_project for the rules.
-    val pix: usize = util.positional_index(argc, argv, marks, 2);
+    # resolve the project root from the required positional path;
+    # see util.resolve_project_root for the rules.
+    val pix: usize = util.arg_index_positional(argc, argv, marks, 2);
     var arg: *u8 = nil;
     if (pix < argc) { arg = argv[pix]; }
-    var root:     [4096]u8;
-    var manifest_path: [4096]u8;
-    val rr: R.Result[bool, str] = util.resolve_project(?a, arg, ?root[0], 4096, ?manifest_path[0], 4096);
-    if (R.is_err[bool, str](rr)) {
+
+    val root_r: R.Result[str, str] = util.resolve_project_root(?a, arg);
+    if (R.is_err[str, str](root_r)) {
         print.eprint("error: ");
-        print.eprint(R.unwrap_err[bool, str](rr));
+        print.eprint(R.unwrap_err[str, str](root_r));
         print.eprint("\n");
         arena.dnit(?ar);
         ret 1;
     }
 
-    val code: i64 = clean_project(?a, ?root[0], ?manifest_path[0]);
+    val code: i64 = clean_project(?a, R.unwrap_ok[str, str](root_r));
     arena.dnit(?ar);
     ret code;
 }
 
-# read the manifest at `manifest` and remove each distinct output-directory tree
-# its templates declare, rooted under `root`
+# read the project's root manifest and remove each distinct output-directory
+# tree its templates declare, rooted under `root`
 #
 # The four templates are read for their static prefixes only; parsing the manifest
 # validates it as a real project. Every allocation is suballocated through the
 # caller's arena and reclaimed when it is torn down.
 # ---
-# a:             arena-backed allocator for the manifest read and parse
-# root:          the resolved project root directory (null-terminated)
-# manifest_path: the resolved manifest path (null-terminated)
-# ret:           0 on success, 1 on an unparseable manifest, 2 on an io failure
-fun clean_project(a: *A.Allocator, root: *u8, manifest_path: *u8) i64 {
-    val text_r: R.Result[str, str] = filesystem.read_all(a, util.cstr_str(manifest_path));
+# a:    arena-backed allocator for the manifest read and parse
+# root: the resolved project root directory (null-terminated)
+# ret:  0 on success, 1 on an unparseable manifest, 2 on an io failure
+fun clean_project(a: *A.Allocator, root: *u8) i64 {
+    val mp_r: R.Result[str, str] = path.join(a, root, util.PROJECT_CONFIG_NAME);
+    if (R.is_err[str, str](mp_r)) {
+        print.eprint("error: ");
+        print.eprintln(R.unwrap_err[str, str](mp_r));
+        ret 2;
+    }
+    val manifest_path: str = R.unwrap_ok[str, str](mp_r);
+
+    val text_r: R.Result[str, str] = fs.read_string(a, manifest_path);
     if (R.is_err[str, str](text_r)) {
         print.eprint("error: cannot read '");
-        print.eprint(util.cstr_str(manifest_path));
+        print.eprint(manifest_path);
         print.eprintln("'");
         ret 2;
     }
@@ -141,32 +159,31 @@ fun clean_template(a: *A.Allocator, root: *u8, itn: *intern.Interner, tmpl_id: i
     val tmpl: str = O.unwrap[str](opt);
 
     val plen: usize = static_prefix_len(tmpl);
-    if (plen == 0 || plen + 1 > 4096) { ret code; }
+    if (plen == 0) { ret code; }
 
-    # the '/'-separated static prefix, copied null-terminated for reporting and the
-    # join, then rooted at the project directory.
-    var rel: [4096]u8;
-    var k: usize = 0;
-    for (k < plen) { rel[k] = tmpl[k]; k = k + 1; }
-    rel[plen] = 0;
+    # the '/'-separated static prefix, copied for reporting and the join, then
+    # rooted at the project directory.
+    val rel_r: R.Result[str, str] = str_copy_slice(a, tmpl, 0, plen);
+    if (R.is_err[str, str](rel_r)) { ret code; }
+    val rel: str = R.unwrap_ok[str, str](rel_r);
 
-    var abs: [4096]u8;
-    util.join_into(?abs[0], 4096, root, ?rel[0]);
-    val abs_str: str = util.cstr_str(?abs[0]);
+    val abs_r: R.Result[str, str] = path.join(a, root::str, rel);
+    if (R.is_err[str, str](abs_r)) { ret code; }
+    val abs_str: str = R.unwrap_ok[str, str](abs_r);
 
-    if (!filesystem.exists(abs_str)) { ret code; }
+    if (!fs.exists(abs_str)) { ret code; }
 
-    val rr: R.Result[bool, str] = filesystem.remove_all(a, abs_str);
-    if (R.is_err[bool, str](rr)) {
+    val rr: O.Option[str] = fs.remove_all(a, abs_str);
+    if (O.is_some[str](rr)) {
         print.eprint("error: cannot remove '");
-        print.eprint(util.cstr_str(?rel[0]));
+        print.eprint(rel);
         print.eprint("': ");
-        print.eprintln(R.unwrap_err[bool, str](rr));
+        print.eprintln(O.unwrap[str](rr));
         ret 2;
     }
 
     print.print("removed ");
-    print.println(util.cstr_str(?rel[0]));
+    print.println(rel);
     @removed = @removed + 1;
     ret code;
 }

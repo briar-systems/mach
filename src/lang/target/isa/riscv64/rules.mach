@@ -1,0 +1,474 @@
+# RISC-V (RV64) instruction-selection rule pack
+#
+# The riscv64 contribution to the shared rule engine (`be.codegen.rules`): a
+# data table describing how every generic MIR opcode selects on RV64, plus the
+# thin wrappers the ISA vtable's `select` / `is_reg_move` slots bind. The shared
+# engine interprets the table per instruction - first admitting rule wins - and
+# fails loudly on any opcode the table does not model, so selection stays total.
+#
+# RISC-V is three-address (`rd, rs1, rs2`) like AArch64, so the integer binary
+# ops retag in place to a concrete three-address opcode rather than surviving as
+# a two-address sentinel: register allocation keys an instruction's def/use
+# shape on its operands (operand 0 a pure def), not its opcode, so a concrete
+# three-address form is read correctly. Every retag is 1:1 - the operand list
+# already matches the machine form and only the opcode changes - and no rule
+# expands, so a block's instruction list is never rebuilt.
+#
+# A handful of generic opcodes survive selection with a high selection-output
+# sentinel (`mir.MIR_SEL_*`) so the encoder can materialize a short byte
+# sequence from them without confusing the generic opcode with a concrete RV64
+# opcode of the same low value:
+#   - the comparison family (`MIR_CMP_* -> MIR_SEL_CMP_*`): RISC-V has no
+#     condition-flags register, so the encoder synthesizes the 0/1 boolean from
+#     the set-less-than primitives (`slt`/`sltu` + the `seqz`/`snez` idioms),
+#     keeping operand 0 a clean boolean def the register allocator reads
+#     correctly.
+#   - the conditional branch (`MIR_CBR -> MIR_SEL_CBR`): the encoder lowers it
+#     to `bne cond, x0, then ; j else`, keeping both block targets and the
+#     condition on one terminator so the allocator reads the condition as a use
+#     and resolves both successor edges for liveness. the pack declares all six
+#     comparison conditions in `fused_cbr_ccs`, so the engine's compare-and-
+#     branch fusion collapses a single-consumer `CMP ; CBR` pair into one
+#     `mir.MIR_SEL_CBR_*` terminator ahead of selection; those survivors pass
+#     through and the encoder materializes the native fused conditional
+#     branches (`beq/bne/blt/bltu/bge/bgeu`) directly.
+#   - the division / remainder family (`MIR_DIV_*`/`MIR_REM_*` ->
+#     `MIR_SEL_DIV_*`/`MIR_SEL_REM_*`): a clean three-address `[dst, dividend,
+#     divisor]` op (RV64 wires no fixed division register) the encoder lowers to
+#     the M-extension `div`/`divu`/`rem`/`remu` (word forms at 32-bit width),
+#     whose RISC-V-defined divide-by-zero / overflow results need no guard
+#     sequence.
+#
+# The memory opcodes, the call / phi pseudos, the scalar float arithmetic /
+# comparison / negate family, the integer and float conversions, and inline asm
+# all pass through unchanged: their generic opcode values sit above the concrete
+# RV64 opcode space, so the encoder dispatches them directly and the register
+# allocator reads operand 0 as a clean def (or the memory destination for a
+# store). The float-bank guard routes a float register copy and a `:~`
+# reinterpret touching the float bank to the concrete FMV, whose encoder picks
+# the `fmv` form from operand register class; a same-bank GP<->GP reinterpret
+# stays generic, a plain register copy the integer conversion encoder handles.
+#
+# WIDTH-HONESTY: the rule table carries no XLEN assumption - the same table
+# drives an RV32 (ilp32) sibling unchanged. The W-vs-full ALU form, the load /
+# store width, the constant-materialization length, and the slot-width
+# thresholds are all the encoder's choice off the operation's OPERAND SIZE,
+# never decided here.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.string.str;
+
+use A: std.allocator;
+use R: std.types.result;
+
+use mach.lang.be.codegen.mir;
+use mach.lang.be.codegen.rules;
+use mach.lang.target.isa;
+use mach.lang.target.isa.riscv64;
+use target: mach.lang.target.resolved;
+
+# the concrete signature the erased `isa.IsaVTable.select` pointer is cast back
+# to, matching the shared `be.codegen.isel.SelectFn`
+#
+# The vtable stores `select` type-erased (`*u8`); the shared dispatcher casts it
+# back to this type before calling it.
+# ---
+# a:   backing allocator (threaded for the shared SelectFn contract; no RV64
+#      rule expands, so selection rewrites in place and never reallocates)
+# tgt: resolved compilation target (must be RISC-V)
+# f:   the MIR function to select instructions for; mutated in place
+# ret: ok(true) on success, or an error naming the failure
+pub def SelectFn: fun(*A.Allocator, *target.Target, *mir.MirFunction) R.Result[bool, str];
+
+# the pack's rule table: 59 rules covering every generic opcode that can reach
+# RV64 selection plus the six fused compare-and-branch survivors. filled once by
+# `built_pack`; the coverage test pins the count so the storage length and the
+# appended table can never drift apart
+var rules_storage: [59]rules.Rule;
+
+# the post-selection plain register-copy opcodes: the concrete GP move (`mv`),
+# the concrete float move (`fmv`), and the generic `mir.MIR_MOV` the reload /
+# store moves regalloc splices after selection keep
+var copy_opcodes_storage: [3]u32;
+
+# the comparison opcodes the engine's compare-and-branch fusion combines with a
+# consuming conditional branch on RV64: all six scalar conditions
+var fused_ccs_storage: [6]u32;
+
+# the pack handed to the shared engine, built once on first use
+var pack_storage: rules.RulePack;
+var pack_built:   bool;
+
+# select concrete RV64 instructions for one MIR function
+#
+# The RV64 implementation behind the ISA vtable's `select` slot, reached only
+# through `tgt.arch.select` by the shared `be.codegen.isel.run` dispatcher: a
+# one-line binding of the RV64 rule pack to the shared engine.
+# ---
+# a:   backing allocator (unused in practice; no RV64 rule expands)
+# tgt: resolved compilation target (must be RISC-V)
+# f:   the MIR function to select instructions for; mutated in place
+# ret: ok(true) on success, or an error naming the failure
+pub fun select(a: *A.Allocator, tgt: *target.Target, f: *mir.MirFunction) R.Result[bool, str] {
+    ret rules.select(built_pack(), a, tgt, f);
+}
+
+# classify a post-selection opcode as an RV64 plain register move
+#
+# A `mir.MIR_MOV` selects to `riscv64.MOV` (GP, `mv`) or `riscv64.FMV` (float),
+# and the reload / store moves regalloc splices after selection stay generic
+# `mir.MIR_MOV`; all three are plain full-width copies. The shared copy-hygiene
+# passes further gate on operand shape and equal source/destination width. This
+# is the RV64 implementation behind the ISA vtable's `is_reg_move` slot.
+# ---
+# opcode: the concrete post-selection opcode to classify
+# ret:    true when the opcode is a plain register-move form
+pub fun is_reg_move(opcode: u32) bool {
+    ret rules.is_reg_move(built_pack(), opcode);
+}
+
+# the RV64 rule pack, built once on first use
+#
+# Table order mirrors the opcode families; only the two guarded rules (the
+# float-bank MOV and BITCAST) depend on order, each preceding its unguarded
+# fallback.
+# ---
+# ret: the process-lifetime RV64 pack
+fun built_pack() *rules.RulePack {
+    if (pack_built) { ret ?pack_storage; }
+
+    var tb: rules.TableBuilder = rules.table(?rules_storage[0]);
+
+    # the three-address integer binary ALU ops retag to a concrete RV64 three-
+    # address opcode: operand 0 stays a pure def and the encoder packs one
+    # `op rd, rs1, rs2` word (folding an immediate right operand into the `addi` /
+    # `andi` / shift-immediate form or materializing it through a scratch).
+    rules.append_retag(?tb, mir.MIR_ADD, riscv64.ADD::u32);
+    rules.append_retag(?tb, mir.MIR_SUB, riscv64.SUB::u32);
+    rules.append_retag(?tb, mir.MIR_MUL, riscv64.MUL::u32);
+    rules.append_retag(?tb, mir.MIR_AND, riscv64.AND::u32);
+    rules.append_retag(?tb, mir.MIR_OR,  riscv64.OR::u32);
+    rules.append_retag(?tb, mir.MIR_XOR, riscv64.XOR::u32);
+
+    # the shifts retag to a single RV64 shift opcode (no x86-64 CL constraint):
+    # the encoder selects the register variant (sll/srl/sra) or the immediate
+    # variant (slli/srli/srai, masking the shift amount) from operand 2's kind,
+    # and the RV64 word form (sllw/srlw/sraw) at 32-bit operand width.
+    rules.append_retag(?tb, mir.MIR_SHL,   riscv64.SLL::u32);
+    rules.append_retag(?tb, mir.MIR_SHR_U, riscv64.SRL::u32);
+    rules.append_retag(?tb, mir.MIR_SHR_S, riscv64.SRA::u32);
+
+    # division / remainder survive selection as a three-address `[dst, dividend,
+    # divisor]` instruction (operand 0 a pure def), lifted to a high SELECTION-
+    # OUTPUT sentinel so the encoder never confuses the generic opcode with a
+    # concrete RV64 opcode of the same low value (MIR_REM_U = 6 = riscv64.OR).
+    # the encoder materializes the M-extension div / divu / rem / remu (word
+    # forms at 32-bit width); RISC-V defines the divide-by-zero and signed-
+    # overflow results, so no guard sequence is needed.
+    rules.append_retag(?tb, mir.MIR_DIV_S, mir.MIR_SEL_DIV_S);
+    rules.append_retag(?tb, mir.MIR_DIV_U, mir.MIR_SEL_DIV_U);
+    rules.append_retag(?tb, mir.MIR_REM_S, mir.MIR_SEL_REM_S);
+    rules.append_retag(?tb, mir.MIR_REM_U, mir.MIR_SEL_REM_U);
+
+    # negate and complement are single RV64 instructions (no x86-64 multi-
+    # instruction expansion): NEG is `sub rd, x0, rs` (the `neg` alias) and NOT
+    # is `xori rd, rs, -1` (the `not` alias). the encoder supplies the missing
+    # operand from the surviving `[dst, src]`.
+    rules.append_retag(?tb, mir.MIR_NEG, riscv64.NEG::u32);
+    rules.append_retag(?tb, mir.MIR_NOT, riscv64.NOT::u32);
+
+    # the register-to-register / ABI pre-coloring move selects to a plain MOV
+    # (`mv rd, rs` for a register source, an `li` materialization for an
+    # immediate). a FLOAT move - either operand a float vreg or a float-class
+    # pre-color - selects to FMV instead, whose encoder emits the `fmv` family
+    # and dispatches the spilled frame-slot forms by register class, so a float
+    # copy never mis-encodes as a GP move of the aliasing register index. the
+    # spill reload / store moves regalloc inserts after selection keep the
+    # generic MIR_MOV (the encoder routes a float spill to the FP path by
+    # operand class).
+    rules.append_guarded_retag(?tb, mir.MIR_MOV, rules.guard_fp_bank_move, riscv64.FMV::u32);
+    rules.append_retag(?tb, mir.MIR_MOV, riscv64.MOV::u32);
+
+    # control flow. an unconditional branch selects to JMP (`j`); a return to
+    # RET; an unreachable terminator to an `ebreak` trap.
+    rules.append_retag(?tb, mir.MIR_BR,          riscv64.JMP::u32);
+    rules.append_retag(?tb, mir.MIR_RET,         riscv64.RET::u32);
+    rules.append_retag(?tb, mir.MIR_UNREACHABLE, riscv64.EBREAK::u32);
+
+    # the comparison family survives selection as a single `[dst, lhs, rhs]`
+    # instruction lifted to a high SELECTION-OUTPUT sentinel so the encoder
+    # never confuses it with a concrete RV64 opcode of the same low value; the
+    # encoder materializes the set-less-than byte sequence, reading the relation
+    # (and its signedness) from the opcode.
+    rules.append_retag(?tb, mir.MIR_CMP_EQ,   mir.MIR_SEL_CMP_EQ);
+    rules.append_retag(?tb, mir.MIR_CMP_NE,   mir.MIR_SEL_CMP_NE);
+    rules.append_retag(?tb, mir.MIR_CMP_LT_S, mir.MIR_SEL_CMP_LT_S);
+    rules.append_retag(?tb, mir.MIR_CMP_LT_U, mir.MIR_SEL_CMP_LT_U);
+    rules.append_retag(?tb, mir.MIR_CMP_LE_S, mir.MIR_SEL_CMP_LE_S);
+    rules.append_retag(?tb, mir.MIR_CMP_LE_U, mir.MIR_SEL_CMP_LE_U);
+
+    # the conditional branch survives selection as a single
+    # `[cond, then_block, else_block]` instruction (high sentinel): the
+    # allocator reads `cond` as a use and both block operands as the two
+    # successor edges; the encoder materializes the `bne cond, x0, then ; j
+    # else` byte sequence.
+    rules.append_retag(?tb, mir.MIR_CBR, mir.MIR_SEL_CBR);
+
+    # the fused compare-and-branch terminators the engine's combine produces
+    # for the conditions declared in `fused_cbr_ccs` pass through as `[lhs,
+    # rhs, then_block, else_block]` survivors; the encoder materializes the
+    # NATIVE fused conditional branches (`beq/bne/blt/bltu/bge/bgeu then ; j
+    # else`, the LE relations as the swapped GE), dropping the slt-idiom
+    # boolean and its `bne x0` of the split pair. scalar-gated: the combine
+    # never fuses a vector lane, so a vector instruction can never take these
+    # arms.
+    rules.append_gated_pass(?tb, mir.MIR_SEL_CBR_EQ,   rules.GATE_SCALAR);
+    rules.append_gated_pass(?tb, mir.MIR_SEL_CBR_NE,   rules.GATE_SCALAR);
+    rules.append_gated_pass(?tb, mir.MIR_SEL_CBR_LT_S, rules.GATE_SCALAR);
+    rules.append_gated_pass(?tb, mir.MIR_SEL_CBR_LT_U, rules.GATE_SCALAR);
+    rules.append_gated_pass(?tb, mir.MIR_SEL_CBR_LE_S, rules.GATE_SCALAR);
+    rules.append_gated_pass(?tb, mir.MIR_SEL_CBR_LE_U, rules.GATE_SCALAR);
+
+    # memory ops pass through unchanged (their generic opcode values are above
+    # the concrete RV64 opcode space, so the encoder dispatches them without a
+    # sentinel lift). ALLOCA / GEP select to RV64 address arithmetic (addi /
+    # add), and LOAD / STORE to the width-driven loads / stores; operand 0 stays
+    # a clean def (or the memory destination for a store), so the register
+    # allocator reads the def/use shape correctly. a frame-slot MEM base
+    # survives to the encoder, which resolves it to `[s0 + slot.offset]`.
+    rules.append_pass(?tb, mir.MIR_ALLOCA);
+    rules.append_pass(?tb, mir.MIR_LOAD);
+    rules.append_pass(?tb, mir.MIR_STORE);
+    rules.append_pass(?tb, mir.MIR_GEP);
+
+    # call / phi pseudo-opcodes pass through unchanged. MIR_CALL is the caller-
+    # saved clobber barrier the shared register allocator keys on; the argument,
+    # result, and phi pseudos are resolved (or skipped) downstream.
+    rules.append_pass(?tb, mir.MIR_CALL);
+    rules.append_pass(?tb, mir.MIR_ARG);
+    rules.append_pass(?tb, mir.MIR_CALL_RES);
+    rules.append_pass(?tb, mir.MIR_PHI);
+
+    # the scalar float arithmetic / comparison / negate ops pass through keeping
+    # their dedicated high-sentinel MIR opcode, like the integer compare /
+    # divide families: each is a clean `[dst, lhs, rhs]` (or `[dst, src]`) the
+    # register allocator reads by operand shape, and the encoder materializes
+    # the RV64D scalar-FP byte sequence (fadd/fsub/fmul/fdiv single words;
+    # feq/flt/fle for the comparison; fsgnjn for the negate) from the surviving
+    # opcode, sizing the S-vs-D form by the instruction's width.
+    rules.append_pass(?tb, mir.MIR_FADD);
+    rules.append_pass(?tb, mir.MIR_FSUB);
+    rules.append_pass(?tb, mir.MIR_FMUL);
+    rules.append_pass(?tb, mir.MIR_FDIV);
+    rules.append_pass(?tb, mir.MIR_FCMP);
+    rules.append_pass(?tb, mir.MIR_FNEG);
+
+    # a bit reinterpret touching the float bank selects to FMV, whose encoder
+    # picks the form from operand register class: a cross-bank reinterpret
+    # (`f64 :~ i64` / `i32 :~ f32`) transfers the raw bits between a GP and an
+    # F/D register (fmv.d.x / fmv.x.d); a same-bank float-to-float reinterpret
+    # is a float register copy (fmv.d / fmv.s). the latter arises from the
+    # native variadic `arg::f64` over a float pack element (#1762) - left as
+    # MIR_BITCAST it would encode as a GP move of the aliasing register index,
+    # never writing the float destination. a same-bank GP<->GP reinterpret stays
+    # MIR_BITCAST, a plain register copy the integer conversion encoder handles.
+    rules.append_guarded_retag(?tb, mir.MIR_BITCAST, rules.guard_fp_bank_move, riscv64.FMV::u32);
+    rules.append_pass(?tb, mir.MIR_BITCAST);
+
+    # the integer width conversions and the float conversions pass through
+    # unchanged: their generic opcode values sit above the concrete RV64 opcode
+    # space, so the encoder dispatches each directly (sext.w / the shift-pair
+    # sign / zero extensions for the integer forms; fcvt.s.d / fcvt.d.s /
+    # fcvt.*.* / fmv for the float forms) and the allocator reads operand 0 as a
+    # clean def.
+    rules.append_pass(?tb, mir.MIR_TRUNC);
+    rules.append_pass(?tb, mir.MIR_SEXT);
+    rules.append_pass(?tb, mir.MIR_ZEXT);
+    rules.append_pass(?tb, mir.MIR_FP_TRUNC);
+    rules.append_pass(?tb, mir.MIR_FP_EXT);
+    rules.append_pass(?tb, mir.MIR_FP_TO_SI);
+    rules.append_pass(?tb, mir.MIR_FP_TO_UI);
+    rules.append_pass(?tb, mir.MIR_SI_TO_FP);
+    rules.append_pass(?tb, mir.MIR_UI_TO_FP);
+
+    # inline assembly passes through unchanged: the encoder parses the asm body
+    # and emits RV64 words directly. MIR_ASM carries no operands to rewrite; its
+    # `asm_block` payload is the inline-asm clobber barrier the register
+    # allocator keys on.
+    rules.append_pass(?tb, mir.MIR_ASM);
+
+    copy_opcodes_storage[0] = riscv64.MOV::u32;
+    copy_opcodes_storage[1] = riscv64.FMV::u32;
+    copy_opcodes_storage[2] = mir.MIR_MOV;
+
+    fused_ccs_storage[0] = mir.MIR_CMP_EQ;
+    fused_ccs_storage[1] = mir.MIR_CMP_NE;
+    fused_ccs_storage[2] = mir.MIR_CMP_LT_S;
+    fused_ccs_storage[3] = mir.MIR_CMP_LT_U;
+    fused_ccs_storage[4] = mir.MIR_CMP_LE_S;
+    fused_ccs_storage[5] = mir.MIR_CMP_LE_U;
+
+    pack_storage.name               = "riscv64";
+    pack_storage.rules              = ?rules_storage[0];
+    pack_storage.rule_count         = tb.cursor;
+    pack_storage.copy_opcodes       = ?copy_opcodes_storage[0];
+    pack_storage.copy_opcode_count  = 3;
+    pack_storage.fused_cbr_ccs      = ?fused_ccs_storage[0];
+    pack_storage.fused_cbr_cc_count = 6;
+    pack_built = true;
+
+    ret ?pack_storage;
+}
+
+# a float-bank physical register operand for register index `idx` (the composite
+# float id the allocator hands the float pre-coloring), so a test can drive the
+# float-vs-GP move classification without a vreg table
+fun fp_preg(idx: i32) mir.MirOperand {
+    ret mir.op_preg(isa.regid_make(isa.REG_CLASS_ID_XMM, idx)::u32);
+}
+
+# selection rewrites each generic MIR opcode in place into the concrete RV64
+# opcode (or the surviving sentinel / pass-through), keying the float-vs-GP move
+# on the operand register class. all-physical-register operands keep the test
+# free of a vreg table; the engine only nil-checks its target and allocator, so
+# a zeroed pair suffices
+test "mach.lang.target.isa.riscv64.rules:opcode_rewrites" {
+    var bad: i32 = 0;
+    var alloc: A.Allocator;
+    var tgt:   target.Target;
+
+    var instrs: [14]mir.MirInstr;
+    var ops:    [14][3]mir.MirOperand;
+    var i:      u32 = 0;
+    for (i < 14) {
+        ops[i][0] = mir.op_preg(10);
+        ops[i][1] = mir.op_preg(11);
+        ops[i][2] = mir.op_preg(12);
+        instrs[i].operands      = ?ops[i][0];
+        instrs[i].operand_count = 3;
+        instrs[i].width         = 8;
+        i = i + 1;
+    }
+
+    # the three-address integer ops, shifts, divide, and negate / not.
+    instrs[0].opcode  = mir.MIR_ADD;
+    instrs[1].opcode  = mir.MIR_SHL;
+    instrs[2].opcode  = mir.MIR_DIV_S;
+    instrs[3].opcode  = mir.MIR_NEG;
+    # the surviving compare / conditional-branch / float-arith pass-throughs.
+    instrs[4].opcode  = mir.MIR_CMP_EQ;
+    instrs[5].opcode  = mir.MIR_CBR;
+    instrs[6].opcode  = mir.MIR_FADD;
+    # a GP move and a float move - the float one keys FMV off the operand class.
+    instrs[7].opcode  = mir.MIR_MOV;
+    instrs[8].opcode  = mir.MIR_MOV;
+    ops[8][0] = fp_preg(10); ops[8][1] = fp_preg(11);
+    # a bitcast touching the float bank selects FMV - cross-bank (instrs[9]) and
+    # same-bank float-to-float (instrs[13], the #1762 case); a same-bank GP<->GP
+    # bitcast (instrs[10]) stays MIR_BITCAST.
+    instrs[9].opcode  = mir.MIR_BITCAST;
+    ops[9][0] = fp_preg(10); ops[9][1] = mir.op_preg(11);
+    instrs[10].opcode = mir.MIR_BITCAST;
+    instrs[13].opcode = mir.MIR_BITCAST;
+    ops[13][0] = fp_preg(10); ops[13][1] = fp_preg(11);
+    # control flow.
+    instrs[11].opcode = mir.MIR_BR;
+    instrs[12].opcode = mir.MIR_RET;
+
+    var blk: mir.MirBlock;
+    blk.id          = 0;
+    blk.instrs      = ?instrs[0];
+    blk.instr_count = 14;
+
+    var f: mir.MirFunction;
+    f.blocks      = ?blk;
+    f.block_count = 1;
+    f.vreg_count  = 0;
+
+    val r: R.Result[bool, str] = select(?alloc, ?tgt, ?f);
+    if (R.is_err[bool, str](r)) { ret 1; }
+
+    if (instrs[0].opcode  != riscv64.ADD::u32)    { bad = 1; }
+    if (instrs[1].opcode  != riscv64.SLL::u32)    { bad = 1; }
+    if (instrs[2].opcode  != mir.MIR_SEL_DIV_S)   { bad = 1; }
+    if (instrs[3].opcode  != riscv64.NEG::u32)    { bad = 1; }
+    if (instrs[4].opcode  != mir.MIR_SEL_CMP_EQ)  { bad = 1; }
+    if (instrs[5].opcode  != mir.MIR_SEL_CBR)     { bad = 1; }
+    if (instrs[6].opcode  != mir.MIR_FADD)        { bad = 1; }  # float arith survives
+    if (instrs[7].opcode  != riscv64.MOV::u32)    { bad = 1; }  # GP move
+    if (instrs[8].opcode  != riscv64.FMV::u32)    { bad = 1; }  # float move
+    if (instrs[9].opcode  != riscv64.FMV::u32)    { bad = 1; }  # cross-bank bitcast
+    if (instrs[10].opcode != mir.MIR_BITCAST)     { bad = 1; }  # same-bank GP bitcast survives
+    if (instrs[11].opcode != riscv64.JMP::u32)    { bad = 1; }
+    if (instrs[12].opcode != riscv64.RET::u32)    { bad = 1; }
+    if (instrs[13].opcode != riscv64.FMV::u32)    { bad = 1; }  # same-bank float bitcast (#1762)
+
+    ret bad;
+}
+
+# the copy-hygiene move classifier admits both concrete move forms (GP and
+# float) and the generic MIR_MOV regalloc splices, and rejects a non-move opcode
+test "mach.lang.target.isa.riscv64.rules:is_reg_move" {
+    if (!is_reg_move(riscv64.MOV::u32)) { ret 1; }
+    if (!is_reg_move(riscv64.FMV::u32)) { ret 1; }
+    if (!is_reg_move(mir.MIR_MOV))      { ret 1; }
+    if (is_reg_move(riscv64.ADD::u32))  { ret 1; }
+    ret 0;
+}
+
+# every generic opcode that can reach selection terminates in a rule, and the
+# three ops eliminated before selection ever runs stay default-deny: the table
+# cannot silently lose an opcode. also pins the table at its exact storage
+# length, so an appended rule and the storage size can never drift apart
+test "mach.lang.target.isa.riscv64.rules:generic_opcode_coverage" {
+    val pack: *rules.RulePack = built_pack();
+    if (pack.rule_count != 59) { ret 1; }
+
+    # the shared selection alphabet (a property of mir.lower_ir, one table for
+    # every pack's coverage test): reachable opcodes must terminate in a rule.
+    var reachable: [mir.SELECTION_REACHABLE_COUNT]u32;
+    mir.selection_reachable(?reachable[0]);
+
+    # the opcodes eliminated before selection stay default-deny.
+    var eliminated: [mir.SELECTION_ELIMINATED_COUNT]u32;
+    mir.selection_eliminated(?eliminated[0]);
+
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(10);
+    ops[1] = mir.op_preg(11);
+    ops[2] = mir.op_preg(12);
+    var probe: mir.MirInstr;
+    probe.operands      = ?ops[0];
+    probe.operand_count = 3;
+    probe.width         = 8;
+    probe.vec_lane      = mir.VEC_LANE_NONE;
+
+    var f: mir.MirFunction;
+
+    # the fused survivors the engine's combine produces must be admitted.
+    var fused: [mir.SELECTION_FUSED_COUNT]u32;
+    mir.selection_fused(?fused[0]);
+
+    var i: u32 = 0;
+    for (i < mir.SELECTION_REACHABLE_COUNT) {
+        probe.opcode = reachable[i];
+        if (rules.find_rule(pack, ?f, ?probe) == nil) { ret 1; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < mir.SELECTION_ELIMINATED_COUNT) {
+        probe.opcode = eliminated[i];
+        if (rules.find_rule(pack, ?f, ?probe) != nil) { ret 1; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < mir.SELECTION_FUSED_COUNT) {
+        probe.opcode = fused[i];
+        if (rules.find_rule(pack, ?f, ?probe) == nil) { ret 1; }
+        i = i + 1;
+    }
+    if (pack.fused_cbr_cc_count != 6) { ret 1; }
+    ret 0;
+}

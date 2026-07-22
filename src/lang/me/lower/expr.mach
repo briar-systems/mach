@@ -14,10 +14,13 @@ use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
-use std.types.string.StrView;
+use std.types.view.View;
 use std.types.string.str;
 use std.types.string.str_len;
-use std.types.string.view;
+use std.types.string.str_copy_slice;
+use std.types.string.str_join;
+use std.text.string.str_free;
+use std.types.view.view;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -192,7 +195,7 @@ pub fun lower_lit_str(ctx: *context.LowerContext, e: *expr.Expr) R.Result[value.
 
     # the literal's inner content view, with the surrounding quotes stripped.
     val txt: str = context.module_source(ctx);
-    var inner: StrView = view(nil, 0);
+    var inner: View = view(nil, 0);
     if (e.span.len >= 2::usize) {
         inner = view(?txt[e.span.offset + 1::usize], e.span.len - 2::usize);
     }
@@ -223,7 +226,7 @@ pub fun lower_lit_str(ctx: *context.LowerContext, e: *expr.Expr) R.Result[value.
 # ctx:   per-module lowering context
 # inner: the literal's content view, quotes already stripped
 # ret:   the interned StrId of the decoded content, or an error
-fun intern_str_lit(ctx: *context.LowerContext, inner: StrView) R.Result[intern.StrId, str] {
+fun intern_str_lit(ctx: *context.LowerContext, inner: View) R.Result[intern.StrId, str] {
     if (inner.len == 0 || !lit_has_escape(inner)) {
         ret intern.intern_bytes(?ctx.s.interner, inner.data::str, inner.len);
     }
@@ -262,7 +265,7 @@ fun intern_str_lit(ctx: *context.LowerContext, inner: StrView) R.Result[intern.S
 # ---
 # s:   the string view to scan
 # ret: true when `s` holds at least one backslash
-fun lit_has_escape(s: StrView) bool {
+fun lit_has_escape(s: View) bool {
     var i: usize = 0;
     for (i < s.len) {
         if (s.data[i] == '\\') { ret true; }
@@ -354,6 +357,14 @@ fun lower_ident_rvalue(ctx: *context.LowerContext, eid: id.ExprId) R.Result[valu
         ret load_pack_elem(ctx, eid, O.unwrap[u32](opt_ord));
     }
 
+    # a `$each x in ARR` constant-array loop variable: its rvalue is the element's
+    # constant, lowered by re-processing the element's initializer expression - a
+    # scalar element folds to a constant, a record element materializes its literal.
+    val opt_elem: O.Option[id.ExprId] = const_elem_expr(ctx, sid);
+    if (O.is_some[id.ExprId](opt_elem)) {
+        ret lower_rvalue(ctx, O.unwrap[id.ExprId](opt_elem));
+    }
+
     val opt_local: O.Option[value.Value] = context.lookup_local(ctx, sid);
     if (O.is_some[value.Value](opt_local)) {
         val slot: value.Value = O.unwrap[value.Value](opt_local);
@@ -388,6 +399,61 @@ fun pack_elem_ordinal(ctx: *context.LowerContext, sid: resolve.SymbolId) O.Optio
     val cval: comptime.CTValue = O.unwrap[*comptime.NamedConst](opt_nc).value;
     if (cval.kind != comptime.CT_KIND_PACK_ELEM) { ret O.none[u32](); }
     ret O.some[u32](cval.data.pelem.index);
+}
+
+# the element initializer ExprId of a `$each x in ARR` constant-array loop variable
+#
+# The loop variable is a comptime-flagged SYM_VAL with no declaration, bound by
+# the unroll to a CT_KIND_CONST_ELEM descriptor whose `.elem` is the ExprId of
+# this iteration's element initializer (in this module's ast).
+# ---
+# ctx: per-module lowering context
+# sid: the symbol to inspect
+# ret: some(element ExprId) for a constant-array loop variable, none otherwise
+fun const_elem_expr(ctx: *context.LowerContext, sid: resolve.SymbolId) O.Option[id.ExprId] {
+    val opt_sym: O.Option[*resolve.Symbol] = context.symbol_of(ctx, sid);
+    if (O.is_none[*resolve.Symbol](opt_sym)) { ret O.none[id.ExprId](); }
+    val sym: *resolve.Symbol = O.unwrap[*resolve.Symbol](opt_sym);
+    if (sym.kind != resolve.SYM_VAL || (sym.flags & resolve.SYM_FLAG_COMPTIME) == 0) { ret O.none[id.ExprId](); }
+    if (sym.decl != id.DECL_NIL)                                                     { ret O.none[id.ExprId](); }
+    val opt_nc: O.Option[*comptime.NamedConst] = comptime.lookup(ctx.ctx, sym.name);
+    if (O.is_none[*comptime.NamedConst](opt_nc)) { ret O.none[id.ExprId](); }
+    val cval: comptime.CTValue = O.unwrap[*comptime.NamedConst](opt_nc).value;
+    if (cval.kind != comptime.CT_KIND_CONST_ELEM) { ret O.none[id.ExprId](); }
+    ret O.some[id.ExprId](cval.data.celem.elem::id.ExprId);
+}
+
+# the initializer ExprId of a struct-literal element's field, matched by name
+#
+# Used to lower `x.field` where `x` is a constant-array loop variable bound to a
+# record element: the field's initializer is lowered in place of the projection.
+# ---
+# ctx:         per-module lowering context
+# elem_eid:    the element's struct-literal initializer expression
+# member_span: the projected field's name span
+# ret:         the field initializer ExprId, or EXPR_NIL when unmatched / not a struct literal
+fun const_elem_field_expr(ctx: *context.LowerContext, elem_eid: id.ExprId, member_span: token.Span) id.ExprId {
+    val el_opt: O.Option[*expr.Expr] = ast.get_expr(ctx.a, elem_eid);
+    if (O.is_none[*expr.Expr](el_opt)) { ret id.EXPR_NIL; }
+    val el: *expr.Expr = O.unwrap[*expr.Expr](el_opt);
+    if (el.kind != expr.EXPR_KIND_STRUCT_LIT) { ret id.EXPR_NIL; }
+
+    val src: str = context.module_source(ctx);
+    val mname_r: R.Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, src, member_span);
+    if (R.is_err[intern.StrId, str](mname_r)) { ret id.EXPR_NIL; }
+    val mname: intern.StrId = R.unwrap_ok[intern.StrId, str](mname_r);
+
+    var i: u32 = 0;
+    for (i < el.data.struct_lit.fields_len) {
+        val pool_ix: usize = (el.data.struct_lit.fields_start + i)::usize;
+        if (pool_ix >= ctx.a.field_init_len) { ret id.EXPR_NIL; }
+        val fi: *expr.FieldInit = ?ctx.a.field_inits[pool_ix];
+        val fname_r: R.Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, src, fi.name);
+        if (R.is_err[intern.StrId, str](fname_r)) { ret id.EXPR_NIL; }
+        if (R.unwrap_ok[intern.StrId, str](fname_r) == mname) { ret fi.value; }
+        i = i + 1;
+    }
+    ret id.EXPR_NIL;
 }
 
 # the rvalue of a pack element at a given ordinal
@@ -752,11 +818,45 @@ fun lower_ident_lvalue(ctx: *context.LowerContext, eid: id.ExprId) R.Result[valu
         ret R.ok[value.Value, str](ctx.pack_slots[ord]);
     }
 
+    # a `$each x in ARR` constant-array loop variable folds to a constant and has no
+    # storage, so it is not addressable; guard the lower path so no fabricated
+    # extern global is emitted for it.
+    val opt_celem: O.Option[id.ExprId] = const_elem_expr(ctx, sid);
+    if (O.is_some[id.ExprId](opt_celem)) {
+        ret R.err[value.Value, str]("lower: cannot take the address of a `$each` constant array element");
+    }
+
     val opt_local: O.Option[value.Value] = context.lookup_local(ctx, sid);
     if (O.is_some[value.Value](opt_local)) {
         ret R.ok[value.Value, str](O.unwrap[value.Value](opt_local));
     }
     ret symbol_lvalue(ctx, eid, sid);
+}
+
+# lower `x.field` where `x` is a `$each x in ARR` constant-array loop variable
+# bound to a record element
+#
+# None when the object is not such a loop variable, the element is not a struct
+# literal, or names no matching field - so the member dispatch falls through to
+# ordinary field access. Otherwise the matching field initializer is lowered in
+# place of the projection: a scalar field folds to a constant, a function-pointer
+# field yields a function reference, a record field materializes its literal.
+# ---
+# ctx: per-module lowering context
+# e:   the member expression
+# ret: some(lowered field initializer) for a constant-element projection, none otherwise
+fun try_lower_const_elem_member(ctx: *context.LowerContext, e: *expr.Expr) O.Option[R.Result[value.Value, str]] {
+    val obj_opt: O.Option[*expr.Expr] = ast.get_expr(ctx.a, e.data.member.object);
+    if (O.is_none[*expr.Expr](obj_opt))                             { ret O.none[R.Result[value.Value, str]](); }
+    if (O.unwrap[*expr.Expr](obj_opt).kind != expr.EXPR_KIND_IDENT) { ret O.none[R.Result[value.Value, str]](); }
+
+    val osid: resolve.SymbolId = context.expr_symbol_of(ctx, e.data.member.object);
+    val opt_elem: O.Option[id.ExprId] = const_elem_expr(ctx, osid);
+    if (O.is_none[id.ExprId](opt_elem))                             { ret O.none[R.Result[value.Value, str]](); }
+
+    val field_eid: id.ExprId = const_elem_field_expr(ctx, O.unwrap[id.ExprId](opt_elem), e.data.member.name);
+    if (field_eid == id.EXPR_NIL)                                   { ret O.none[R.Result[value.Value, str]](); }
+    ret O.some[R.Result[value.Value, str]](lower_rvalue(ctx, field_eid));
 }
 
 # fold a `$each` field-descriptor member (`f.offset`, #1473) to a constant
@@ -833,6 +933,13 @@ fun try_lower_pack_len(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr
 # e:   the resolved member node
 # ret: the member's rvalue, or an error
 fun lower_member_rvalue(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R.Result[value.Value, str] {
+    # `x.field` where `x` is a `$each x in ARR` constant-array loop variable bound
+    # to a record element: lower the matching field initializer in place, so the
+    # projection reads the element's constant field without materializing the whole
+    # record.
+    val opt_celem: O.Option[R.Result[value.Value, str]] = try_lower_const_elem_member(ctx, e);
+    if (O.is_some[R.Result[value.Value, str]](opt_celem)) { ret O.unwrap[R.Result[value.Value, str]](opt_celem); }
+
     # `va.len` on a comptime variadic pack (#1475): folds to the instance's element
     # count, a compile-time constant fixed by the call site. sema already validated
     # that `.len` is the pack's only member, so a pack receiver here is `.len`.
@@ -1608,7 +1715,7 @@ fun lower_value_callee(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr
                 diagnostic.error(?ctx.s.diags, ctx.a.file_id, arg_span, "comptime argument is not a compile-time constant");
                 A.deallocate[comptime.CTValue](ctx.s.alloc, vals, ct_len::usize);
                 A.deallocate[intern.StrId](ctx.s.alloc, names, ct_len::usize);
-                ret R.err[value.Value, str](context.REPORTED);
+                ret R.err[value.Value, str]("");
             }
             vals[dst] = O.unwrap[comptime.CTValue](opt_fv);
 
@@ -1716,18 +1823,20 @@ fun expr_span_of(ctx: *context.LowerContext, eid: id.ExprId) token.Span {
     ret s;
 }
 
-# file a located error at an expression's span and return the REPORTED sentinel
+# file a located error at an expression's span and return an empty-message error
 #
 # Lets lowering surface a single file:line:col diagnostic instead of a span-less
-# propagated string.
+# propagated string. The diagnostic on the sink is the user-facing message, so
+# the orchestration layer renders this failure as reported and prints nothing
+# further; the error string is empty.
 # ---
 # ctx:     per-module lowering context
 # eid:     the expression to locate the error at
 # message: the diagnostic text
-# ret:     always an error carrying the REPORTED sentinel
+# ret:     always an error with an empty message (the diagnostic is the message)
 fun report_expr(ctx: *context.LowerContext, eid: id.ExprId, message: str) R.Result[value.Value, str] {
     diagnostic.error(?ctx.s.diags, ctx.a.file_id, expr_span_of(ctx, eid), message);
-    ret R.err[value.Value, str](context.REPORTED);
+    ret R.err[value.Value, str]("");
 }
 
 # resolve a generic call to its monomorphized instance
@@ -2424,7 +2533,7 @@ fun lower_assign(ctx: *context.LowerContext, e: *expr.Expr) R.Result[value.Value
     # debug birth on reassignment: rebind a simple named variable to its new value,
     # under -g only. field / index / deref lvalues are memory writes, not variable
     # rebinds, so they carry no debug value.
-    if (ctx.s.debug) {
+    if (ctx.debug) {
         val opt_lhs: O.Option[*expr.Expr] = ast.get_expr(ctx.a, e.data.binary.lhs);
         if (O.is_some[*expr.Expr](opt_lhs)) {
             val lhs_e: *expr.Expr = O.unwrap[*expr.Expr](opt_lhs);
@@ -3124,25 +3233,21 @@ pub fun field_index_in_type(ctx: *context.LowerContext, rec_ty: type.TypeId, nam
 
     # name the missing field from its source text; the span already underlines it,
     # and lowering has no semantic type renderer to also name the receiver type.
-    val prefix: str   = "no field '";
-    val suffix: str   = "' on the receiver type";
-    val total:  usize = str_len(prefix) + name.len + str_len(suffix);
-    val res_buf: R.Result[*u8, str] = A.allocate[u8](ctx.s.alloc, total + 1);
-    if (R.is_err[*u8, str](res_buf)) {
+    val res_name: R.Result[str, str] = str_copy_slice(ctx.s.alloc, src_text, name.offset, name.len);
+    if (R.is_err[str, str](res_name)) {
         diagnostic.error(?ctx.s.diags, ctx.a.file_id, name, "no such field on the receiver type");
         ret 0;
     }
-    val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
-    var pos: usize = 0;
-    var j:   usize = 0;
-    for (j < str_len(prefix)) { buf[pos] = prefix[j];                pos = pos + 1; j = j + 1; }
-    j = 0;
-    for (j < name.len)        { buf[pos] = src_text[name.offset + j]; pos = pos + 1; j = j + 1; }
-    j = 0;
-    for (j < str_len(suffix)) { buf[pos] = suffix[j];                pos = pos + 1; j = j + 1; }
-    buf[total] = 0;
-    diagnostic.error(?ctx.s.diags, ctx.a.file_id, name, buf::str);
-    A.deallocate[u8](ctx.s.alloc, buf, total + 1);
+    val fname: str = R.unwrap_ok[str, str](res_name);
+    val res_msg: R.Result[str, str] = str_join(ctx.s.alloc, "no field '", fname, "' on the receiver type");
+    str_free(ctx.s.alloc, fname);
+    if (R.is_err[str, str](res_msg)) {
+        diagnostic.error(?ctx.s.diags, ctx.a.file_id, name, "no such field on the receiver type");
+        ret 0;
+    }
+    val msg: str = R.unwrap_ok[str, str](res_msg);
+    diagnostic.error(?ctx.s.diags, ctx.a.file_id, name, msg);
+    str_free(ctx.s.alloc, msg);
     ret 0;
 }
 

@@ -600,7 +600,7 @@ for-stmt ::= "for" [ "(" expr ")" ] block      (* no condition => infinite loop 
 ret-stmt ::= "ret" [ expr ] ";"
 brk-stmt ::= "brk" ";"
 cnt-stmt ::= "cnt" ";"
-fin-stmt ::= "fin" block                         (* defer: runs block at scope exit *)
+fin-stmt ::= "fin" block                         (* defer: runs block at enclosing-block exit *)
 
 local-decl-stmt ::= bind-decl                    (* a "val"/"var" used as a statement *)
 
@@ -615,16 +615,18 @@ comptime-each-stmt ::= "$" "each" IDENT "in" expr stmt-branch-body
 ```
 
 `$each` is a compile-time unroll: the body is duplicated once per element of
-the sequence, which must be `$fields(T)` or a variadic pack identifier. `in`
-is a contextual keyword.
+the sequence, which must be `$fields(T)`, a variadic pack identifier, or a
+comptime-constant array `val` (see
+[comptime-intrinsics.md](comptime-intrinsics.md)). `in` is a contextual keyword.
 
 Notes:
 - `if` / `or`: the `or` chain models both `else if` (`or (cond) { ... }`)
   and `else` (`or { ... }`). Arms are parsed greedily; an `or` with a
   condition continues the chain, an `or` without one terminates it. Each
   arm body is a block.
-- `fin { ... }` registers a block to run when the enclosing scope exits —
-  Mach's defer. The body must be a block; the bare `fin stmt;` form is rejected.
+- `fin { ... }` registers a block to run when the enclosing block exits —
+  Mach's defer, block-scoped (see [statements.md](statements.md) for the exit
+  rules). The body must be a block; the bare `fin stmt;` form is rejected.
 - `comptime-if-stmt` is the statement-scope `$if`/`$or` chain (the
   declaration-scope variant is under [Comptime](#comptime-declarations-and-directives)).
   A `$` only begins this form when the next token is the keyword `if`;

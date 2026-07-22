@@ -1,0 +1,710 @@
+# artifact materialization: the per-module object tree, the `.ir` / `.s` debug
+# artifacts, and executable / archive / shared-object emission
+#
+# The emission half of the build engine. Every function here consumes resolved
+# facts - a plan unit's expanded directories, the request's settled decisions
+# off the project - and materializes bytes on disk; none of them resolves a
+# name, consults the query graph, or prints. The engine's PH_EMIT and PH_LINK
+# dispatch drives these; the dispatcher-synthesis flow in `build.testing`
+# shares the object writer and the external-link-input assembly.
+
+use fs: std.filesystem;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.io.writer;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_copy;
+use std.types.string.str_join;
+use std.types.string.str_len;
+use std.types.string.str_replace;
+use std.types.path;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.build.outcome;
+use mach.lang.build.plan;
+use mach.lang.build.qctx;
+use mach.lang.be.codegen;
+use mach.lang.be.linker;
+use mach.lang.be.obj;
+use mach.lang.driver;
+use mach.lang.intern;
+use mach.lang.me.ir;
+use mach.lang.me.ir.printer;
+use mach.lang.session;
+use mach.lang.target.of;
+use mach.lang.target.of.ar;
+
+# the directory creation mode for artifact parents
+val DIR_MODE: i32 = 0o0755;
+
+# create every missing parent directory of the file at `p`
+# ---
+# a:   allocator for the transient parent path
+# p:   file path whose parent chain is materialized
+# ret: none on success, or an error message
+pub fun ensure_parents(a: *A.Allocator, p: str) O.Option[str] {
+    val pr: R.Result[str, str] = path.parent(a, p);
+    if (R.is_err[str, str](pr)) { ret O.some[str](R.unwrap_err[str, str](pr)); }
+    ret fs.create_dir_all(a, R.unwrap_ok[str, str](pr), DIR_MODE);
+}
+
+# render one module's assembly `.s` artifact from its post-pipeline IR
+#
+# Codegen's assembly text is a streaming side-channel not retained in the cached
+# ObjectImage, so the `.s` debug artifact is produced by a separate, deterministic
+# codegen pass over the same IR the cached object was built from; the throwaway
+# image is discarded. Only reached on a `--emit-asm` build.
+# ---
+# p:        the project (for its session, target, interner)
+# asm_base: the resolved per-module `.s` output directory
+# fqn:      the module's interned fully-qualified name
+# m:        the post-pipeline IR module to render
+# ret:      ok(true) on success, or err with the failure message
+pub fun emit_asm(p: *driver.Project, asm_base: *u8, fqn: intern.StrId, m: *ir.Module) R.Result[bool, str] {
+    var asm_file: fs.File;
+    var asm_w:    writer.Writer;
+    val res_open: R.Result[bool, str] = open_asm(p, asm_base, fqn, ?asm_file, ?asm_w);
+    if (R.is_err[bool, str](res_open)) { ret res_open; }
+
+    val dbg_r: R.Result[codegen.DebugInfo, str] = driver.debug_info_of(p);
+    if (R.is_err[codegen.DebugInfo, str](dbg_r)) {
+        fs.close(asm_file);
+        ret R.err[bool, str](R.unwrap_err[codegen.DebugInfo, str](dbg_r));
+    }
+
+    val res_codegen: R.Result[of.ObjectImage, str] = codegen.codegen_module(p.s, ?p.target, m, ?asm_w, R.unwrap_ok[codegen.DebugInfo, str](dbg_r));
+    val res_close: O.Option[str] = fs.close(asm_file);
+    if (R.is_err[of.ObjectImage, str](res_codegen)) {
+        ret R.err[bool, str](R.unwrap_err[of.ObjectImage, str](res_codegen));
+    }
+    var img: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](res_codegen);
+    obj.dnit(?img);
+    if (O.is_some[str](res_close)) {
+        ret R.err[bool, str](O.unwrap[str](res_close));
+    }
+    ret R.ok[bool, str](true);
+}
+
+# render one module's textual SSA IR to its `.ir` artifact
+#
+# Called after the lower pass, so `m` is the final post-pipeline IR the object
+# is built from - the same module codegen consumes for the `.s` artifact.
+# ---
+# p:       the project (for its interner)
+# ir_base: the resolved per-module `.ir` output directory
+# fqn:     the module's interned fully-qualified name
+# m:       the IR module to render
+# ret:     ok(true) on success, or err with the failure message
+pub fun emit_ir(p: *driver.Project, ir_base: *u8, fqn: intern.StrId, m: *ir.Module) R.Result[bool, str] {
+    val opt_fqn: O.Option[str] = intern.lookup(?p.s.interner, fqn);
+    if (O.is_none[str](opt_fqn)) { ret R.err[bool, str]("module FQN not interned"); }
+
+    var file: fs.File;
+    var w:    writer.Writer;
+    val res_open: R.Result[bool, str] = open_artifact(p.alloc, ir_base, O.unwrap[str](opt_fqn), "ir", ?file, ?w);
+    if (R.is_err[bool, str](res_open)) {
+        ret R.err[bool, str](R.unwrap_err[bool, str](res_open));
+    }
+
+    val res_print: R.Result[bool, str] = printer.print_module(?w, m, ?p.s.interner);
+    val res_close: O.Option[str] = fs.close(file);
+    if (R.is_err[bool, str](res_print)) {
+        ret R.err[bool, str](R.unwrap_err[bool, str](res_print));
+    }
+    if (O.is_some[str](res_close)) {
+        ret R.err[bool, str](O.unwrap[str](res_close));
+    }
+    ret R.ok[bool, str](true);
+}
+
+# open one module's `.s` assembly artifact and wire `w` to stream into it
+# ---
+# p:        the project (for its interner)
+# asm_base: the resolved per-module `.s` output directory
+# fqn:      the module's interned fully-qualified name
+# file:     receives the created file; the caller closes it
+# w:        receives a writer streaming into `file`
+# ret:      ok(true) on success, or err with the failure message
+fun open_asm(p: *driver.Project, asm_base: *u8, fqn: intern.StrId, file: *fs.File, w: *writer.Writer) R.Result[bool, str] {
+    val opt_fqn: O.Option[str] = intern.lookup(?p.s.interner, fqn);
+    if (O.is_none[str](opt_fqn)) { ret R.err[bool, str]("module FQN not interned"); }
+    ret open_artifact(p.alloc, asm_base, O.unwrap[str](opt_fqn), "s", file, w);
+}
+
+# the selected artifact's product name (the `[bin.<name>]`), resolved to a
+# borrowed null-terminated string, or "" when unset
+#
+# This is the writer's stable signing identity (the Mach-O code-signing
+# identifier), deliberately independent of the `-o` output path so a rename-based
+# self-host fixpoint (a -> b -> c) produces byte-identical signed images.
+# ---
+# p:   the project carrying the session and selected artifact config
+# ret: the borrowed product name, or "" when no artifact name is set
+pub fun artifact_product_name(p: *driver.Project) *u8 {
+    val nm: O.Option[str] = intern.lookup(?p.s.interner, p.config.bin_name);
+    if (O.is_some[str](nm)) { ret O.unwrap[str](nm)::*u8; }
+    ret ""::*u8;
+}
+
+# free the per-member symbol-name arrays, then the member array; the member data
+# buffers are borrowed from the parallel read-vector array (see free_read_bufs)
+fun free_members(alloc: *A.Allocator, members: *ar.ArMember, cap: u32) {
+    var i: u32 = 0;
+    for (i < cap) {
+        if (members[i].sym_names != nil && members[i].sym_count > 0) { A.deallocate[str](alloc, members[i].sym_names, members[i].sym_count::usize); }
+        i = i + 1;
+    }
+    A.deallocate[ar.ArMember](alloc, members, cap::usize);
+}
+
+# tear down the per-member read vectors at their true capacities, then the array
+fun free_read_bufs(alloc: *A.Allocator, bufs: *Vector[u8], cap: u32) {
+    var i: u32 = 0;
+    for (i < cap) { vector.dnit[u8](?bufs[i]); i = i + 1; }
+    A.deallocate[Vector[u8]](alloc, bufs, cap::usize);
+}
+
+# fill `member.sym_names` with the object image's defined global symbol names (for the
+# archive symbol index): a symbol is global (`SYM_OBJ_FLAG_GLOBAL`) and defined here
+# (`section != SECTION_EXTERNAL`). names resolve against the image's own interner.
+fun collect_defined_globals(p: *driver.Project, img: *of.ObjectImage, member: *ar.ArMember) bool {
+    member.sym_names = nil;
+    member.sym_count = 0;
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < img.symbol_count) {
+        if ((img.symbols[i].flags & of.SYM_OBJ_FLAG_GLOBAL) != 0 && img.symbols[i].section != of.SECTION_EXTERNAL) { n = n + 1; }
+        i = i + 1;
+    }
+    if (n == 0) { ret true; }
+    val res: R.Result[*str, str] = A.allocate[str](p.alloc, n::usize);
+    if (R.is_err[*str, str](res)) { ret false; }
+    val names: *str = R.unwrap_ok[*str, str](res);
+    var w: u32 = 0;
+    i = 0;
+    for (i < img.symbol_count) {
+        if ((img.symbols[i].flags & of.SYM_OBJ_FLAG_GLOBAL) != 0 && img.symbols[i].section != of.SECTION_EXTERNAL) {
+            val nm: O.Option[str] = intern.lookup(img.interner, img.symbols[i].name);
+            if (O.is_some[str](nm)) { names[w] = O.unwrap[str](nm); w = w + 1; }
+        }
+        i = i + 1;
+    }
+    member.sym_names = names;
+    member.sym_count = w;
+    ret true;
+}
+
+# archive the artifact's per-module objects into a static `ar` library at its declared
+# `out` (#1980 phase 1). members are the freshly written `.o` files, each contributing
+# its defined global symbols to the archive symbol index. Sets `*out_path` to the
+# archive path on success. `paths` must still be live (the objects are read here).
+# ---
+# p:        the project carrying the module graph and session
+# unit:     the resolved plan cell (its `out_path` is the archive path)
+# images:   the per-module codegen images, indexed by module id
+# paths:    the written per-module object paths, indexed by topo position
+# out_path: receives the owned archive path on success
+# ret:      ok(true) on success, or the failure as a Fail
+pub fun emit_static_archive(p: *driver.Project, unit: *plan.BuildUnit, images: *of.ObjectImage, paths: **u8, out_path: **u8) R.Result[bool, outcome.Fail] {
+    val len: u32 = p.topo_len;
+
+    val archive: str = unit.out_path;
+    if (O.is_some[str](ensure_parents(p.alloc, archive))) {
+        ret R.err[bool, outcome.Fail](outcome.internal("failed to create library directory"));
+    }
+
+    val res_mem: R.Result[*ar.ArMember, str] = A.allocate[ar.ArMember](p.alloc, len::usize);
+    if (R.is_err[*ar.ArMember, str](res_mem)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    val members: *ar.ArMember = R.unwrap_ok[*ar.ArMember, str](res_mem);
+
+    # the member data is borrowed from these read vectors, torn down at their
+    # true capacities after the archive is written (read_bytes grows in chunks,
+    # so a `len + 1`-sized free would lie to the allocator).
+    val res_bufs: R.Result[*Vector[u8], str] = A.allocate[Vector[u8]](p.alloc, len::usize);
+    if (R.is_err[*Vector[u8], str](res_bufs)) { free_members(p.alloc, members, len); ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    val bufs: *Vector[u8] = R.unwrap_ok[*Vector[u8], str](res_bufs);
+
+    var i: u32 = 0;
+    for (i < len) {
+        members[i].name = ""; members[i].data = nil; members[i].len = 0; members[i].sym_names = nil; members[i].sym_count = 0;
+        bufs[i] = vector.init[u8](p.alloc);
+        i = i + 1;
+    }
+
+    i = 0;
+    for (i < len) {
+        val mid: session.ModuleId    = p.topo[i];
+        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
+        val fqn_opt: O.Option[str]   = intern.lookup(?p.s.interner, m.fqn);
+        if (O.is_none[str](fqn_opt)) { free_read_bufs(p.alloc, bufs, len); free_members(p.alloc, members, len); ret R.err[bool, outcome.Fail](outcome.internal("module FQN not interned")); }
+        members[i].name = O.unwrap[str](fqn_opt);
+
+        val rr: R.Result[Vector[u8], str] = fs.read_bytes(p.alloc, paths[i]::str);
+        if (R.is_err[Vector[u8], str](rr)) { free_read_bufs(p.alloc, bufs, len); free_members(p.alloc, members, len); ret R.err[bool, outcome.Fail](outcome.internal("cannot read object for archive")); }
+        bufs[i] = R.unwrap_ok[Vector[u8], str](rr);
+        members[i].data = bufs[i].data;
+        members[i].len  = bufs[i].len;
+
+        if (!collect_defined_globals(p, ?images[mid::u32], ?members[i])) { free_read_bufs(p.alloc, bufs, len); free_members(p.alloc, members, len); ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+        i = i + 1;
+    }
+
+    val wr: R.Result[bool, str] = ar.write_archive(p.alloc, members, len, archive);
+    free_read_bufs(p.alloc, bufs, len);
+    free_members(p.alloc, members, len);
+    if (R.is_err[bool, str](wr)) {
+        ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](wr)));
+    }
+    @out_path = archive;
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# link the artifact's per-module objects into a real ELF shared object at its
+# declared `out` (#1980 phase 2). the object is a position-independent ET_DYN that
+# exports its defined globals and names itself by its basename (DT_SONAME), so a
+# consumer records the matching DT_NEEDED. a P2a shared object is self-contained -
+# only the project's own objects are linked; dynamic dependencies of a shared
+# object are a later phase. Sets `*out_path` to the library path on success.
+# ---
+# p:        the project carrying the target and session
+# unit:     the resolved plan cell (its `out_path` is the library path)
+# paths:    the written per-module object paths
+# len:      the per-module object count
+# out_path: receives the owned library path on success
+# ret:      ok(true) on success, or the failure as a Fail
+pub fun emit_shared_library(p: *driver.Project, unit: *plan.BuildUnit, paths: **u8, len: u32, out_path: **u8) R.Result[bool, outcome.Fail] {
+    val solib: str = unit.out_path;
+    if (O.is_some[str](ensure_parents(p.alloc, solib))) {
+        ret R.err[bool, outcome.Fail](outcome.internal("failed to create library directory"));
+    }
+
+    val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
+    val res_link: R.Result[bool, str] =
+        linker.link(p.s, ?p.target, paths, len, nil::*intern.StrId, 0, solib, artifact_product_name(p), linker.LINK_SHARED, ctx.req.pie);
+    if (R.is_err[bool, str](res_link)) {
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](res_link)));
+    }
+    @out_path = solib;
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# link the object set into the executable at `exe_path`
+#
+# The final emission step of the executable path: the caller assembled the
+# on-disk object paths and the dynamic-dependency sonames, and consulted the
+# link query; this call only drives the linker.
+# ---
+# p:          the project carrying the session, target, and settled request
+# paths:      the object/archive paths to link, in link order
+# len:        number of paths
+# sonames:    the dynamic-dependency soname list
+# soname_len: number of sonames
+# exe_path:   the executable path to link into
+# ret:        ok(true) on success, or the failure as a Fail
+pub fun link_executable(p: *driver.Project, paths: **u8, len: u32,
+                        sonames: *intern.StrId, soname_len: u32, exe_path: *u8) R.Result[bool, outcome.Fail] {
+    val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
+    val res_link: R.Result[bool, str] =
+        linker.link(p.s, ?p.target, paths, len, sonames, soname_len, exe_path, artifact_product_name(p), linker.LINK_EXE, ctx.req.pie);
+    if (R.is_err[bool, str](res_link)) {
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](res_link)));
+    }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# link the in-memory codegen images straight into a flat executable image,
+# bypassing the per-module `.o` emit/parse round-trip
+#
+# The emission step for a flat-image object format (`produces_image`): the
+# codegen images are handed to the linker directly (`linker.link_images`), so
+# no relocatable `.o` is written or re-parsed. The images are gathered into a
+# contiguous topo-ordered array so the link order matches the on-disk path;
+# the wrapper array is freed afterward, never the images (the caller owns
+# them).
+# ---
+# p:        the project carrying the module graph and session
+# images:   the per-module codegen images, indexed by module id
+# exe_path: the executable path to link into
+# ret:      ok(true) on success, or the failure as a Fail
+pub fun link_flat_images(p: *driver.Project, images: *of.ObjectImage, exe_path: *u8) R.Result[bool, outcome.Fail] {
+    # gather the topo-ordered images into a contiguous array. each `of.ObjectImage`
+    # is a shallow value carrying borrowed array pointers, so copying it shares the
+    # underlying storage; only this wrapper array is freed, never the images.
+    val len: u32 = p.topo_len;
+    val res_ord: R.Result[*of.ObjectImage, str] = A.allocate[of.ObjectImage](p.alloc, len::usize);
+    if (R.is_err[*of.ObjectImage, str](res_ord)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    val ordered: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](res_ord);
+    var i: u32 = 0;
+    for (i < len) {
+        ordered[i] = images[(p.topo[i])::u32];
+        i = i + 1;
+    }
+
+    val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
+    val res_link: R.Result[bool, str] =
+        linker.link_images(p.s, ?p.target, ordered, len, nil::*intern.StrId, 0, exe_path, artifact_product_name(p), linker.LINK_EXE, ctx.req.pie);
+    A.deallocate[of.ObjectImage](p.alloc, ordered, len::usize);
+    if (R.is_err[bool, str](res_link)) {
+        ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](res_link)));
+    }
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# number of external link inputs
+#
+# The selected target's manifest libs, the cascading transitive dep libs, and
+# the unit's plan-resolved link facts (`-l` values and bare object-file path
+# positionals, resolved at plan time in invocation order).
+# ---
+# p:    the project carrying the target entry and config
+# unit: the resolved plan cell carrying the request's link facts
+# ret:  the external link-input count
+fun count_external_tokens(p: *driver.Project, unit: *plan.BuildUnit) u32 {
+    var n: u32 = 0;
+    val te: *driver.TargetEntry = p.target_entry;
+    if (te != nil) { n = n + te.lib_count; }
+    # cascading transitive dep libs; 0 when no dep contributes any.
+    n = n + p.config.cascade_lib_count;
+    n = n + unit.link_inputs.len::u32;
+    ret n;
+}
+
+# assemble every external link input, STATIC and DYNAMIC
+#
+# The manifest's merged link overlay and the cascading transitive dep libs are
+# discovered during the build (a step may have just produced them), so they
+# resolve here through the planner-owned `plan.resolve_token` - the single home
+# of link-input resolution; the request's own tokens are already facts on the
+# unit and are appended without re-probing. A STATIC input (a loose `.o` or
+# static `.a`) is appended to `*paths`; a DYNAMIC one (a shared library) has
+# its soname interned and appended to `*sonames`. `*paths` is pre-grown by the
+# input count (the worst case where every input is an object) and then shrunk
+# to the true object count `*len`, so the array is dense (no nil holes) and
+# `free_paths(.., len, len)` frees it correctly. An input that resolves to no
+# existing file is a hard error so a typo never silently drops a dependency.
+# ---
+# p:          the project carrying the target entry, config, session, and request
+# unit:       the resolved plan cell carrying the request's link facts
+# paths:      the static object-path array to grow and fill
+# len:        the static object-path count, updated to the true count
+# sonames:    the dynamic-dependency soname array to grow and fill
+# soname_len: the soname count
+# ret:        ok(true) on success, or the failure as a Fail
+pub fun append_external_inputs(p: *driver.Project, unit: *plan.BuildUnit,
+                               paths: ***u8, len: *u32,
+                               sonames: **intern.StrId, soname_len: *u32) R.Result[bool, outcome.Fail] {
+    @sonames    = nil;
+    @soname_len = 0;
+    val extra: u32 = count_external_tokens(p, unit);
+    if (extra == 0) { ret R.ok[bool, outcome.Fail](true); }
+
+    val base:  u32 = @len;
+    val grown: u32 = base + extra;
+    val res_grow: R.Result[**u8, str] = A.reallocate[*u8](p.alloc, @paths, base::usize, grown::usize);
+    if (R.is_err[**u8, str](res_grow)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    @paths = R.unwrap_ok[**u8, str](res_grow);
+
+    var z: u32 = base;
+    for (z < grown) { (@paths)[z] = nil; z = z + 1; }
+    @len = grown;
+
+    var written: u32 = base;
+
+    # the consumer's own manifest libs first, then the cascading transitive dep
+    # libs, then the unit's plan-resolved facts (already in invocation order) -
+    # a stable order keeps the link deterministic across runs.
+    val te: *driver.TargetEntry = p.target_entry;
+    if (te != nil) {
+        var i: u32 = 0;
+        for (i < te.lib_count) {
+            val opt_lib: O.Option[str] = intern.lookup(?p.s.interner, te.libs[i]);
+            if (O.is_none[str](opt_lib)) { ret uninterned_lib_fail(); }
+            val rc: R.Result[bool, outcome.Fail] = resolve_and_store_input(p, O.unwrap[str](opt_lib)::*u8,
+                                                    @paths, ?written, sonames, soname_len);
+            if (R.is_err[bool, outcome.Fail](rc)) { shrink_paths(p, paths, len, written, grown); ret rc; }
+            i = i + 1;
+        }
+    }
+
+    var i: u32 = 0;
+    for (i < p.config.cascade_lib_count) {
+        val opt_lib: O.Option[str] = intern.lookup(?p.s.interner, p.config.cascade_libs[i]);
+        if (O.is_none[str](opt_lib)) { ret uninterned_lib_fail(); }
+        val rc: R.Result[bool, outcome.Fail] = resolve_and_store_input(p, O.unwrap[str](opt_lib)::*u8,
+                                                @paths, ?written, sonames, soname_len);
+        if (R.is_err[bool, outcome.Fail](rc)) { shrink_paths(p, paths, len, written, grown); ret rc; }
+        i = i + 1;
+    }
+
+    var ti: usize = 0;
+    for (ti < unit.link_inputs.len) {
+        val rc: R.Result[bool, outcome.Fail] = store_fact(p, ?unit.link_inputs.data[ti],
+                                                @paths, ?written, sonames, soname_len);
+        if (R.is_err[bool, outcome.Fail](rc)) { shrink_paths(p, paths, len, written, grown); ret rc; }
+        ti = ti + 1;
+    }
+
+    shrink_paths(p, paths, len, written, grown);
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# store one plan-resolved link fact into the right bucket
+#
+# A STATIC fact's path is duplicated onto the build allocator (the plan owns
+# its copy; `free_paths` frees these at their exact size); a DYNAMIC fact's
+# soname is interned.
+# ---
+# p:          the project (for its build allocator and interner)
+# li:         the plan-resolved fact
+# paths:      the static object-path array to append into
+# written:    the next free index in `paths`, advanced on a static input
+# sonames:    the dynamic-dependency soname array to grow
+# soname_len: the soname count
+# ret:        ok(true) on success, or the failure as a Fail
+fun store_fact(p: *driver.Project, li: *plan.LinkInput, paths: **u8, written: *u32,
+               sonames: **intern.StrId, soname_len: *u32) R.Result[bool, outcome.Fail] {
+    if (li.kind == plan.LINK_DYNAMIC) {
+        ret append_soname(p, li.text::*u8, sonames, soname_len);
+    }
+    val dup_r: R.Result[str, str] = str_copy(p.alloc, li.text::*u8);
+    if (R.is_err[str, str](dup_r)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    paths[@written] = R.unwrap_ok[str, str](dup_r);
+    @written = @written + 1;
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# the internal bail for a manifest lib name that failed to intern-lookup
+#
+# a manifest lib name is always interned by config load, so this guards a
+# compiler invariant rather than a user condition; if it ever fires, the
+# message names the broken invariant instead of exiting silently
+# ---
+# ret: an internal Fail deriving exit code 2
+fun uninterned_lib_fail() R.Result[bool, outcome.Fail] {
+    ret R.err[bool, outcome.Fail](outcome.internal("manifest lib name not interned (compiler bug)"));
+}
+
+# shrink the over-grown object-path array to its true object count and set `*len`
+# to it, so the array is dense and frees at its size
+#
+# A shrink failure leaves the array at its grown size, which `free_paths` still
+# frees correctly (the unfilled tail slots are nil).
+# ---
+# p:       the project (for its build allocator)
+# paths:   the over-grown object-path array
+# len:     receives the true object count
+# written: the true object count
+# grown:   the over-grown array length
+fun shrink_paths(p: *driver.Project, paths: ***u8, len: *u32, written: u32, grown: u32) {
+    if (written < grown) {
+        val res_shrink: R.Result[**u8, str] = A.reallocate[*u8](p.alloc, @paths, grown::usize, written::usize);
+        if (R.is_ok[**u8, str](res_shrink)) {
+            @paths = R.unwrap_ok[**u8, str](res_shrink);
+            @len   = written;
+            ret;
+        }
+    }
+    @len = grown;
+}
+
+# intern a shared library's soname and append it to the dynamic dependency list,
+# growing it one slot at a time
+# ---
+# p:          the project (for its interner and build allocator)
+# name:       the soname to intern
+# sonames:    the dynamic-dependency soname array to grow
+# soname_len: the soname count
+# ret:        ok(true) on success, or the failure as a Fail
+fun append_soname(p: *driver.Project, name: *u8, sonames: **intern.StrId, soname_len: *u32) R.Result[bool, outcome.Fail] {
+    val res_intern: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, name);
+    if (R.is_err[intern.StrId, str](res_intern)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    val id: intern.StrId = R.unwrap_ok[intern.StrId, str](res_intern);
+
+    val old: u32 = @soname_len;
+    val res_grow: R.Result[*intern.StrId, str] =
+        A.reallocate[intern.StrId](p.alloc, @sonames, old::usize, (old + 1)::usize);
+    if (R.is_err[*intern.StrId, str](res_grow)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    @sonames = R.unwrap_ok[*intern.StrId, str](res_grow);
+    (@sonames)[old] = id;
+    @soname_len = old + 1;
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# release the dynamic-dependency soname array
+# ---
+# a:          allocator backing the array
+# sonames:    the soname array, or nil
+# soname_len: the soname count
+pub fun free_sonames(a: *A.Allocator, sonames: *intern.StrId, soname_len: u32) {
+    if (sonames != nil && soname_len > 0) {
+        A.deallocate[intern.StrId](a, sonames, soname_len::usize);
+    }
+}
+
+# resolve one build-time link input and route it to the right bucket
+#
+# The manifest overlay and cascade libs resolve here, at link time (a build
+# step may have just produced them), through the planner-owned
+# `plan.resolve_token` - the same probing order and error text as the plan's
+# own tokens. A STATIC result is stored into `paths[*written]`; a DYNAMIC one
+# has its soname interned into `*sonames`.
+# ---
+# p:          the project carrying the target, session, and settled request
+# tok:        the link-input token to resolve
+# paths:      the static object-path array to append into
+# written:    the next free index in `paths`, advanced on a static input
+# sonames:    the dynamic-dependency soname array to grow
+# soname_len: the soname count
+# ret:        ok(true) on success, or the failure as a Fail
+fun resolve_and_store_input(p: *driver.Project, tok: *u8, paths: **u8, written: *u32,
+                            sonames: **intern.StrId, soname_len: *u32) R.Result[bool, outcome.Fail] {
+    val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
+    val lr: R.Result[plan.LinkInput, outcome.Fail] = plan.resolve_token(p.alloc, ?p.target, ?ctx.req.lib_dirs, ctx.req.project_root, tok);
+    if (R.is_err[plan.LinkInput, outcome.Fail](lr)) {
+        ret R.err[bool, outcome.Fail](R.unwrap_err[plan.LinkInput, outcome.Fail](lr));
+    }
+    val li: plan.LinkInput = R.unwrap_ok[plan.LinkInput, outcome.Fail](lr);
+    if (li.kind == plan.LINK_DYNAMIC) {
+        ret append_soname(p, li.text::*u8, sonames, soname_len);
+    }
+    # the STATIC text is already an exact-size copy on the build allocator.
+    paths[@written] = li.text::*u8;
+    @written = @written + 1;
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# write each per-module image to a relocatable object whose path mirrors the
+# module FQN under `obj_base`, collecting the owned path strings
+#
+# FQN `a.b.c` -> `<obj_base>/a/b/c.o`, creating parent directories. The owned
+# path strings - one per topo entry, in topo order - are collected into a fresh
+# `**u8` array stored through `paths_out`. On failure any paths produced so far
+# are released.
+# ---
+# p:         the project carrying the module graph and session
+# images:    the per-module object images to write
+# obj_base:  the per-module object tree root
+# paths_out: receives the fresh owned object-path array on success
+# ret:       ok(true) on success, or the failure as a Fail
+pub fun write_objects(p: *driver.Project, images: *of.ObjectImage,
+                      obj_base: *u8, paths_out: ***u8) R.Result[bool, outcome.Fail] {
+    val len: u32 = p.topo_len;
+    val res_paths: R.Result[**u8, str] = A.allocate[*u8](p.alloc, len::usize);
+    if (R.is_err[**u8, str](res_paths)) { ret R.err[bool, outcome.Fail](outcome.internal("out of memory")); }
+    val paths: **u8 = R.unwrap_ok[**u8, str](res_paths);
+
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId   = p.topo[i];
+        val m:   *driver.ModuleEntry = ?p.modules[mid::u32];
+
+        val opt_fqn: O.Option[str] = intern.lookup(?p.s.interner, m.fqn);
+        if (O.is_none[str](opt_fqn)) {
+            free_paths(p.alloc, paths, i, len);
+            ret R.err[bool, outcome.Fail](outcome.internal("module FQN not interned"));
+        }
+
+        val op_r: R.Result[str, str] = mirror_fqn(p.alloc, obj_base, O.unwrap[str](opt_fqn), "o");
+        if (R.is_err[str, str](op_r)) {
+            free_paths(p.alloc, paths, i, len);
+            ret R.err[bool, outcome.Fail](outcome.internal("out of memory"));
+        }
+        val opath: str = R.unwrap_ok[str, str](op_r);
+
+        if (O.is_some[str](ensure_parents(p.alloc, opath))) {
+            free_paths(p.alloc, paths, i, len);
+            ret R.err[bool, outcome.Fail](outcome.internal("failed to create object directory"));
+        }
+
+        val res_emit: R.Result[bool, str] = obj.emit(?images[mid::u32], ?p.target, opath);
+        if (R.is_err[bool, str](res_emit)) {
+            free_paths(p.alloc, paths, i, len);
+            ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](res_emit)));
+        }
+
+        paths[i] = opath;
+        i = i + 1;
+    }
+
+    @paths_out = paths;
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# the module's mirrored artifact path: `<base>/<rel>.<suffix>`, where `<rel>` is
+# the FQN with every '.' replaced by '/' (`a.b.c` + `o` -> `<base>/a/b/c.o`)
+#
+# The intermediate strings are transient allocations on `a`; the returned path
+# is an exact-size allocation, so freeing it at `str_len + 1` is correct.
+# ---
+# a:      allocator for the result
+# base:   the base directory
+# fqn:    the module fully-qualified name
+# suffix: the file extension (without the dot)
+# ret:    the owned path, or an allocation error
+fun mirror_fqn(a: *A.Allocator, base: *u8, fqn: str, suffix: str) R.Result[str, str] {
+    val rel_r: R.Result[str, str] = str_replace(a, fqn, ".", "/");
+    if (R.is_err[str, str](rel_r)) { ret rel_r; }
+    val leaf_r: R.Result[str, str] = str_join(a, R.unwrap_ok[str, str](rel_r), ".", suffix);
+    if (R.is_err[str, str](leaf_r)) { ret leaf_r; }
+    ret path.join(a, base::str, R.unwrap_ok[str, str](leaf_r));
+}
+
+# create `<base>/<rel>.<suffix>` (making any parent directories) and wire `w` to
+# stream into it through the returned `file`
+#
+# The FQN is mapped to `<rel>` exactly as the object tree is. The caller owns
+# `file` and must close it once writing is done - the Writer borrows the File and
+# must not outlive it.
+# ---
+# base:   the base directory
+# fqn:    the module fully-qualified name
+# suffix: the file extension (without the dot)
+# file:   receives the created file; the caller closes it
+# w:      receives a writer streaming into `file`
+# ret:    ok(true) on success, or err with the failure message
+fun open_artifact(a: *A.Allocator, base: *u8, fqn: str, suffix: str,
+                  file: *fs.File, w: *writer.Writer) R.Result[bool, str] {
+    val p_r: R.Result[str, str] = mirror_fqn(a, base, fqn, suffix);
+    if (R.is_err[str, str](p_r)) {
+        ret R.err[bool, str](R.unwrap_err[str, str](p_r));
+    }
+    val apath: str = R.unwrap_ok[str, str](p_r);
+    if (O.is_some[str](ensure_parents(a, apath))) {
+        ret R.err[bool, str]("failed to create artifact directory");
+    }
+
+    val res_create: R.Result[fs.File, str] = fs.create(apath, 0o644);
+    if (R.is_err[fs.File, str](res_create)) {
+        ret R.err[bool, str](R.unwrap_err[fs.File, str](res_create));
+    }
+    @file = R.unwrap_ok[fs.File, str](res_create);
+    @w = fs.writer(@file);
+    ret R.ok[bool, str](true);
+}
+
+# release the first `n` owned path strings of a path array and the `cap`-long
+# array itself
+#
+# `n` may be less than `cap` when unwinding a partially-filled array; the array
+# is always freed at its full capacity.
+# ---
+# a:     allocator backing the array and its strings
+# paths: the path array (its first n entries are populated)
+# n:     number of populated path strings to free
+# cap:   full allocated length of the array
+pub fun free_paths(a: *A.Allocator, paths: **u8, n: u32, cap: u32) {
+    if (paths == nil) { ret; }
+    var i: u32 = 0;
+    for (i < n) {
+        if (paths[i] != nil) { A.deallocate[u8](a, paths[i], (str_len(paths[i]::str) + 1)::usize); }
+        i = i + 1;
+    }
+    if (cap > 0) { A.deallocate[*u8](a, paths, cap::usize); }
+}

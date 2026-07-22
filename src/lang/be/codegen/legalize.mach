@@ -1,0 +1,1021 @@
+# width legalization: rewrite wider-than-native MIR into native-width sequences
+#
+# A shared backend pass that runs between MIR lowering (`mir.lower_ir`) and
+# instruction selection (`isel.run`). It reads one declared machine fact - the
+# target's `MachineModel.max_alu_width` (the widest integer operation the ISA
+# computes in one native step, in bytes) - and rewrites every scalar MIR
+# instruction wider than it into a sequence of native-width instructions, so
+# selection and the encoder never see an operation the ISA cannot realize
+# directly. It is the wide-integer analogue of the middle end's `scalarize` pass
+# (which legalizes vectors before codegen): scalarize splits a 128-bit vector
+# into lane scalars, this splits a wide scalar into native-width byte lanes.
+#
+# THE INERTNESS CONTRACT. Every 64-bit target declares `max_alu_width = 8`, and
+# the language's widest scalar is 64-bit (pointers included), so on x86-64 /
+# aarch64 / riscv64 no scalar instruction is ever wider than the native ALU. The
+# pass proves this per function with a single pre-scan (`function_needs_legalize`)
+# and, when nothing exceeds the native width, RETURNS HAVING TOUCHED NOTHING - no
+# allocation, no vreg added, no block rebuilt. The output is therefore byte-
+# identical to a build without this pass on every wide-native target; only a
+# target that declares a narrow ALU (the 8-bit mos6502 declares 1) drives the
+# rewrite. A 128-bit vector instruction (`vec_lane != 0`) is never legalized here:
+# it is the vector path's responsibility and was already legalized (or rejected)
+# in the middle end.
+#
+# THE MODEL. A wide value is one vreg; the pass splits it into
+# `width / max_alu_width` native-width LANE vregs (lane 0 the least significant),
+# assigned once up front for the whole function so a value defined in one block
+# and used in another agrees on its lanes. Each wide instruction then expands into
+# per-lane native-width instructions: bitwise ops lane-wise, add / sub as an
+# explicit CARRY CHAIN (the carry is a computed value, not a hardware flag - this
+# IR models no flag register, so a byte carry must be materialized with an
+# unsigned compare and threaded as an ordinary vreg), widen / narrow / copy as
+# byte moves, and loads / stores as per-lane accesses at successive displacements.
+#
+# THE ALGORITHM-VS-TEMPLATE SPLIT (documented for the design record). The bitwise
+# and copy expansions are naturally rule-shaped (one native op per lane). The
+# arithmetic carry chain is an ALGORITHM, not a template: it computes each lane's
+# carry-out with a compare and feeds it into the next lane, which no fixed
+# per-lane opcode substitution can express. Both live here rather than being
+# forced into the selection rule engine, because they are width-driven and
+# target-blind - the same expansion serves any ISA that declares a narrow ALU.
+#
+# UNSUPPORTED WIDE OPERATIONS fail loudly and specifically (never silently), the
+# same discipline the vector path uses for an unimplemented lane op: a wide
+# multiply by a non-constant, any wide divide / remainder, a variable-count wide
+# shift, a wide floating-point op, and a wide memory access through a runtime
+# pointer value (which needs the target's paired-pointer register class) are
+# rejected with a diagnostic naming the operation and width.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.allocator.page;
+
+use A: std.allocator;
+use R: std.types.result;
+
+use mach.lang.be.codegen.mir;
+use mach.lang.target.isa;
+use target: mach.lang.target.resolved;
+
+# per-function legalization plan: the lane assignment for every wide vreg
+#
+# `lane_base[v]` is the first of a wide vreg `v`'s contiguous native-width lane
+# vregs (lane `i` is `lane_base[v] + i`), or `LANE_NONE` when `v` is not wide.
+# `lane_count[v]` is `v`'s lane count (`width / max_alu_width`), 0 when not wide.
+# Both arrays are sized to the function's ORIGINAL vreg count; the lane vregs
+# appended during planning are never themselves wide, so they need no entry.
+# ---
+# lane_base:  first lane vreg id per original vreg (LANE_NONE when not wide)
+# lane_count: lane count per original vreg (0 when not wide)
+# orig_count: the function's vreg count before lane vregs were appended
+# lane_width: the native ALU width in bytes (one lane's byte width)
+rec LanePlan {
+    lane_base:  *u32;
+    lane_count: *u8;
+    orig_count: u32;
+    lane_width: u8;
+}
+
+# sentinel "vreg is not wide" in a LanePlan's `lane_base`
+val LANE_NONE: u32 = 0xFFFFFFFF;
+
+# legalize every function of a MIR module to the target's native ALU width
+#
+# The shared entry point the codegen driver calls between `lower_ir` and
+# `isel.run`. Reads `tgt.model.max_alu_width` and, per function, rewrites any
+# scalar instruction wider than it into native-width sequences. Provably inert on
+# a target whose native ALU already covers every scalar (the wide-native targets):
+# the per-function pre-scan finds nothing to legalize and the function is returned
+# untouched.
+# ---
+# tgt: resolved compilation target (supplies `model.max_alu_width`)
+# m:   the MIR module to legalize in place
+# ret: ok(true) on success, or an error naming the first unsupported wide op
+pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
+    if (tgt == nil) { ret R.err[bool, str]("legalize: nil target"); }
+    if (m == nil)   { ret R.err[bool, str]("legalize: nil mir module"); }
+
+    val maw: u32 = tgt.model.max_alu_width;
+    # a target that declares no native ALU width (0) legalizes nothing: treat it as
+    # already-native so the pass stays a strict no-op rather than dividing by zero.
+    if (maw == 0) { ret R.ok[bool, str](true); }
+
+    var i: u32 = 0;
+    for (i < m.function_len) {
+        val res_fn: R.Result[bool, str] = legalize_function(m.alloc, maw::u8, ?m.functions[i]);
+        if (R.is_err[bool, str](res_fn)) { ret res_fn; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# whether any scalar instruction of the function is wider than the native ALU
+#
+# The inertness gate: an instruction needs legalization when its operation width
+# or its source width exceeds `maw` and it is not a 128-bit vector op (which the
+# vector path owns). When this returns false the function is returned untouched -
+# no allocation, no mutation - so a wide-native target's output is byte-identical.
+# ---
+# f:   the MIR function to scan
+# maw: native ALU width in bytes
+# ret: true when some scalar instruction exceeds the native width
+fun function_needs_legalize(f: *mir.MirFunction, maw: u8) bool {
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val b: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < b.instr_count) {
+            if (instr_is_wide(f, ?b.instrs[ii], maw)) { ret true; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+# whether one SCALAR instruction operates wider than the native ALU
+#
+# A 128-bit vector instruction is never legalized here - it is the vector path's
+# concern (scalarized or selected in the middle end / vector isel). vec_lane is
+# the usual vector marker, but the phi/merge move splice in `mir.lower` carries a
+# 16-byte width WITHOUT stamping vec_lane, so the vreg table's `vector` flag is
+# the authoritative signal a value rides the vector bank; both are honored.
+# ---
+# f:   the MIR function (for vreg classes / the vector flag)
+# mi:  the instruction to test
+# maw: native ALU width in bytes
+# ret: true when the instruction is a scalar op exceeding the native width
+fun instr_is_wide(f: *mir.MirFunction, mi: *mir.MirInstr, maw: u8) bool {
+    if (instr_is_vector(f, mi)) { ret false; }
+    ret mi.width > maw || mi.src_width > maw;
+}
+
+# whether an instruction rides the 128-bit vector bank (via its lane descriptor or
+# any vector-flagged vreg operand)
+# ---
+# f:  the MIR function owning the vreg table
+# mi: the instruction to test
+# ret: true when the instruction is a vector op
+fun instr_is_vector(f: *mir.MirFunction, mi: *mir.MirInstr) bool {
+    if (mi.vec_lane != mir.VEC_LANE_NONE) { ret true; }
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        val op: *mir.MirOperand = ?mi.operands[k];
+        if (op.kind == mir.MIR_OP_VREG && op.vreg < f.vreg_count && f.vregs[op.vreg].vector) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# legalize one function to the native ALU width
+#
+# Returns immediately (inert) when the function has no wide scalar instruction.
+# Otherwise assigns lane vregs for every wide vreg, then rebuilds every block with
+# each wide instruction replaced by its native-width expansion.
+# ---
+# alloc: backing allocator for lane vregs and rebuilt blocks
+# maw:   native ALU width in bytes
+# f:     the MIR function to legalize in place
+# ret:   ok(true) on success, or an error naming an unsupported wide op
+fun legalize_function(alloc: *A.Allocator, maw: u8, f: *mir.MirFunction) R.Result[bool, str] {
+    if (!function_needs_legalize(f, maw)) { ret R.ok[bool, str](true); }
+
+    var plan: LanePlan;
+    val res_plan: R.Result[bool, str] = plan_lanes(alloc, maw, f, ?plan);
+    if (R.is_err[bool, str](res_plan)) { ret res_plan; }
+
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val res_b: R.Result[bool, str] = legalize_block(alloc, ?plan, f, ?f.blocks[bi]);
+        if (R.is_err[bool, str](res_b)) { free_plan(alloc, ?plan); ret res_b; }
+        bi = bi + 1;
+    }
+
+    free_plan(alloc, ?plan);
+    ret R.ok[bool, str](true);
+}
+
+# assign native-width lane vregs for every wide vreg of the function
+#
+# A vreg is wide when the instruction defining it (operand 0 a VREG destination)
+# operates at a width greater than the native ALU. Each such vreg gets
+# `width / maw` fresh contiguous lane vregs of its own register class. The plan
+# arrays are sized to the pre-expansion vreg count.
+# ---
+# alloc: backing allocator for the plan arrays and the lane vregs
+# maw:   native ALU width in bytes
+# f:     the MIR function
+# out:   receives the populated LanePlan
+# ret:   ok(true) on success, or an allocation error
+fun plan_lanes(alloc: *A.Allocator, maw: u8, f: *mir.MirFunction, out: *LanePlan) R.Result[bool, str] {
+    val n: u32 = f.vreg_count;
+    val res_base: R.Result[*u32, str] = A.allocate[u32](alloc, n::usize);
+    if (R.is_err[*u32, str](res_base)) { ret R.err[bool, str](R.unwrap_err[*u32, str](res_base)); }
+    val res_cnt: R.Result[*u8, str] = A.allocate[u8](alloc, n::usize);
+    if (R.is_err[*u8, str](res_cnt)) {
+        A.deallocate[u32](alloc, R.unwrap_ok[*u32, str](res_base), n::usize);
+        ret R.err[bool, str](R.unwrap_err[*u8, str](res_cnt));
+    }
+    out.lane_base  = R.unwrap_ok[*u32, str](res_base);
+    out.lane_count = R.unwrap_ok[*u8, str](res_cnt);
+    out.orig_count = n;
+    out.lane_width = maw;
+
+    var v: u32 = 0;
+    for (v < n) {
+        out.lane_base[v]  = LANE_NONE;
+        out.lane_count[v] = 0;
+        v = v + 1;
+    }
+
+    # find each wide vreg by its defining instruction's width, then allocate its
+    # lanes. one forward walk suffices: a vreg is defined once (MIR is not strict
+    # SSA post-lowering, but every value vreg has a single defining width).
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val b: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < b.instr_count) {
+            val mi: *mir.MirInstr = ?b.instrs[ii];
+            if (!instr_is_vector(f, mi) && mir.instr_defines_shape(mi) &&
+                mi.width > maw && mi.operand_count > 0 &&
+                mi.operands[0].kind == mir.MIR_OP_VREG) {
+                val dv: u32 = mi.operands[0].vreg;
+                if (dv < n && out.lane_base[dv] == LANE_NONE) {
+                    val nlanes: u32 = (mi.width / maw)::u32;
+                    val res_l: R.Result[u32, str] = alloc_lanes(alloc, f, dv, nlanes);
+                    if (R.is_err[u32, str](res_l)) {
+                        free_plan(alloc, out);
+                        ret R.err[bool, str](R.unwrap_err[u32, str](res_l));
+                    }
+                    out.lane_base[dv]  = R.unwrap_ok[u32, str](res_l);
+                    out.lane_count[dv] = nlanes::u8;
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# append `nlanes` fresh contiguous lane vregs sharing the wide vreg's class
+# ---
+# alloc:  backing allocator for the vreg table growth
+# f:      the MIR function whose vreg table grows
+# wide:   the wide vreg whose class the lanes inherit
+# nlanes: number of lane vregs to append
+# ret:    the first lane vreg id, or an allocation error
+fun alloc_lanes(alloc: *A.Allocator, f: *mir.MirFunction, wide: u32, nlanes: u32) R.Result[u32, str] {
+    val cls: u32 = f.vregs[wide].class;
+    var base: u32 = mir.MIR_VREG_NIL;
+    var i: u32 = 0;
+    for (i < nlanes) {
+        val res_v: R.Result[u32, str] = new_vreg(alloc, f, cls);
+        if (R.is_err[u32, str](res_v)) { ret res_v; }
+        val vid: u32 = R.unwrap_ok[u32, str](res_v);
+        if (i == 0) { base = vid; }
+        i = i + 1;
+    }
+    ret R.ok[u32, str](base);
+}
+
+# append a fresh virtual register in the given class and return its id
+#
+# The post-lowering analogue of `mir.context.new_vreg` (which needs a lowering
+# context); legalization has only the function and an allocator. Grows the vreg
+# table on demand.
+# ---
+# alloc: backing allocator for the vreg table
+# f:     the MIR function whose vreg table grows
+# cls:   register-class index the new vreg belongs to
+# ret:   the new vreg id, or an allocation error
+fun new_vreg(alloc: *A.Allocator, f: *mir.MirFunction, cls: u32) R.Result[u32, str] {
+    if (f.vreg_count >= f.vreg_cap) {
+        var new_cap: u32 = f.vreg_cap * 2;
+        if (new_cap == 0) { new_cap = mir.INITIAL_VREG_CAP; }
+        val res_v: R.Result[*mir.MirVReg, str] = A.reallocate[mir.MirVReg](alloc, f.vregs, f.vreg_cap::usize, new_cap::usize);
+        if (R.is_err[*mir.MirVReg, str](res_v)) { ret R.err[u32, str](R.unwrap_err[*mir.MirVReg, str](res_v)); }
+        f.vregs    = R.unwrap_ok[*mir.MirVReg, str](res_v);
+        f.vreg_cap = new_cap;
+    }
+    val vid: u32 = f.vreg_count;
+    f.vregs[vid].id         = vid;
+    f.vregs[vid].class      = cls;
+    f.vregs[vid].spill_slot = -1;
+    f.vregs[vid].assigned   = mir.MIR_VREG_NIL;
+    f.vregs[vid].vector     = false;
+    f.vreg_count = f.vreg_count + 1;
+    ret R.ok[u32, str](vid);
+}
+
+# release a lane plan's arrays
+# ---
+# alloc: allocator the plan arrays came from
+# plan:  the plan to free
+fun free_plan(alloc: *A.Allocator, plan: *LanePlan) {
+    if (plan.lane_base != nil)  { A.deallocate[u32](alloc, plan.lane_base, plan.orig_count::usize); plan.lane_base = nil; }
+    if (plan.lane_count != nil) { A.deallocate[u8](alloc, plan.lane_count, plan.orig_count::usize); plan.lane_count = nil; }
+}
+
+# rebuild one block with every wide instruction replaced by its native-width
+# expansion
+#
+# Two passes mirroring the rules engine's expand path: pass 1 sums the output
+# instruction count (and fails loudly on an unsupported wide op before mutating
+# anything), pass 2 writes a fresh exactly-sized array, moving each native
+# instruction 1:1 (transferring operand ownership) and emitting each wide
+# instruction's lane sequence. The old instruction array is released and swapped
+# out, so module teardown still frees everything exactly once.
+# ---
+# alloc: backing allocator for the rebuilt array and lane temporaries
+# plan:  the function's lane assignment
+# f:     the MIR function (for appending carry / temp vregs)
+# b:     the block to rebuild in place
+# ret:   ok(true) on success, or an error naming an unsupported wide op
+fun legalize_block(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, b: *mir.MirBlock) R.Result[bool, str] {
+    val n: u32 = b.instr_count;
+    if (n == 0) { ret R.ok[bool, str](true); }
+
+    var total:        u32  = 0;
+    var needs_expand: bool = false;
+    var i: u32 = 0;
+    for (i < n) {
+        val mi: *mir.MirInstr = ?b.instrs[i];
+        if (instr_is_wide(f, mi, plan.lane_width)) {
+            val res_c: R.Result[u32, str] = expansion_count(plan, mi);
+            if (R.is_err[u32, str](res_c)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_c)); }
+            total = total + R.unwrap_ok[u32, str](res_c);
+            needs_expand = true;
+        }
+        or { total = total + 1; }
+        i = i + 1;
+    }
+
+    if (!needs_expand) { ret R.ok[bool, str](true); }
+
+    val res_dst: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](alloc, total::usize);
+    if (R.is_err[*mir.MirInstr, str](res_dst)) { ret R.err[bool, str](R.unwrap_err[*mir.MirInstr, str](res_dst)); }
+    val dst: *mir.MirInstr = R.unwrap_ok[*mir.MirInstr, str](res_dst);
+
+    var w: u32 = 0;
+    i = 0;
+    for (i < n) {
+        val mi: *mir.MirInstr = ?b.instrs[i];
+        if (instr_is_wide(f, mi, plan.lane_width)) {
+            val res_e: R.Result[bool, str] = expand_instr(alloc, plan, f, mi, dst, ?w);
+            if (R.is_err[bool, str](res_e)) {
+                # the pieces already written into dst own fresh operand copies; free
+                # them and the array, leaving b.instrs intact for module teardown.
+                free_pieces(alloc, dst, w);
+                A.deallocate[mir.MirInstr](alloc, dst, total::usize);
+                ret res_e;
+            }
+            free_source_operands(alloc, mi);
+        }
+        or {
+            dst[w] = @mi;
+            w = w + 1;
+        }
+        i = i + 1;
+    }
+
+    if (b.instrs != nil && b.instr_cap > 0) {
+        A.deallocate[mir.MirInstr](alloc, b.instrs, b.instr_cap::usize);
+    }
+    b.instrs      = dst;
+    b.instr_count = total;
+    b.instr_cap   = total;
+    ret R.ok[bool, str](true);
+}
+
+# free the operand arrays of the first `count` pieces written into a rebuild that
+# then failed, honoring exactly-once ownership (a moved 1:1 instruction's array is
+# still owned by its source)
+# ---
+# alloc: allocator the piece operand arrays came from
+# dst:   the partially written rebuild
+# count: number of pieces written before the failure
+fun free_pieces(alloc: *A.Allocator, dst: *mir.MirInstr, count: u32) {
+    var i: u32 = 0;
+    for (i < count) {
+        if (dst[i].operands != nil && dst[i].operand_count > 0) {
+            A.deallocate[mir.MirOperand](alloc, dst[i].operands, dst[i].operand_count::usize);
+        }
+        i = i + 1;
+    }
+}
+
+# release a wide source instruction's operand array once its expansion is emitted
+# (the pieces carry fresh copies), mirroring the rules engine's cleanup
+# ---
+# alloc: allocator the operand array came from
+# mi:    the replaced wide instruction; its operand array is freed and nilled
+fun free_source_operands(alloc: *A.Allocator, mi: *mir.MirInstr) {
+    if (mi.operands != nil && mi.operand_count > 0) {
+        A.deallocate[mir.MirOperand](alloc, mi.operands, mi.operand_count::usize);
+    }
+    mi.operands      = nil;
+    mi.operand_count = 0;
+    # a legalized wide value has no single register home, so any -g binding on it
+    # is dropped; the only target driving legalization (mos6502 / freestanding)
+    # emits no debug info, and inert targets never reach this path.
+    if (mi.dbg_bindings != nil && mi.dbg_binding_count > 0) {
+        A.deallocate[mir.MirDbgBinding](alloc, mi.dbg_bindings, mi.dbg_binding_count::usize);
+    }
+    mi.dbg_bindings      = nil;
+    mi.dbg_binding_count = 0;
+}
+
+# the number of native-width instructions a wide instruction expands into
+#
+# Must agree exactly with what `expand_instr` emits; both read the destination's
+# lane count so they cannot drift. Fails loudly for a wide op this pass does not
+# yet legalize, before any block is rebuilt.
+# ---
+# plan: the function's lane assignment
+# mi:   the wide instruction
+# ret:  the exact piece count, or an error naming the unsupported wide op
+fun expansion_count(plan: *LanePlan, mi: *mir.MirInstr) R.Result[u32, str] {
+    val op: mir.MirOpcode = mi.opcode;
+    val nl: u32 = wide_lane_count(plan, mi);
+
+    if (op == mir.MIR_AND || op == mir.MIR_OR || op == mir.MIR_XOR || op == mir.MIR_NOT) {
+        ret R.ok[u32, str](nl);
+    }
+    if (op == mir.MIR_MOV) {
+        ret R.ok[u32, str](nl);
+    }
+    if (op == mir.MIR_ADD || op == mir.MIR_SUB || op == mir.MIR_NEG) {
+        # carry / borrow chain: 2 for the low lane, 5 per middle lane, 2 for the
+        # top lane (its carry-out is discarded) = 4 + 5*(nl - 2) for nl >= 2.
+        ret R.ok[u32, str](4 + 5 * (nl - 2));
+    }
+    if (op == mir.MIR_ZEXT) {
+        # one move per destination lane (low lanes copy the source, high lanes zero).
+        ret R.ok[u32, str](dst_lane_count(plan, mi));
+    }
+    if (op == mir.MIR_TRUNC) {
+        # one move per (narrower) destination lane, copying the low source lanes.
+        ret R.ok[u32, str](dst_lane_count(plan, mi));
+    }
+    ret R.err[u32, str](unsupported_message(op, mi.width));
+}
+
+# the lane count of a wide instruction's destination (or its widest operand),
+# derived from the operation width and the native lane width
+# ---
+# plan: the function's lane assignment
+# mi:   the wide instruction
+# ret:  the number of native-width lanes the operation spans
+fun wide_lane_count(plan: *LanePlan, mi: *mir.MirInstr) u32 {
+    var wbytes: u8 = mi.width;
+    if (mi.src_width > wbytes) { wbytes = mi.src_width; }
+    ret (wbytes / plan.lane_width)::u32;
+}
+
+# expand one wide instruction into its native-width lane sequence in `dst`
+#
+# Dispatches on the generic opcode. Each arm emits exactly the count
+# `expansion_count` reported. Advances `*cursor` past the emitted pieces.
+# ---
+# alloc:  backing allocator for piece operand arrays and lane temporaries
+# plan:   the function's lane assignment
+# f:      the MIR function (for appending carry / temp vregs)
+# mi:     the wide instruction to expand
+# dst:    the rebuilt instruction array
+# cursor: next write index into `dst`; advanced past the emitted pieces
+# ret:    ok(true) on success, or an error naming an unsupported wide op
+fun expand_instr(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
+                 dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
+    val op: mir.MirOpcode = mi.opcode;
+
+    if (op == mir.MIR_AND || op == mir.MIR_OR || op == mir.MIR_XOR) {
+        ret expand_bitwise(alloc, plan, mi, dst, cursor);
+    }
+    if (op == mir.MIR_NOT) {
+        ret expand_not(alloc, plan, mi, dst, cursor);
+    }
+    if (op == mir.MIR_MOV) {
+        ret expand_mov(alloc, plan, mi, dst, cursor);
+    }
+    if (op == mir.MIR_ADD || op == mir.MIR_SUB) {
+        ret expand_addsub(alloc, plan, f, mi, dst, cursor, op == mir.MIR_SUB);
+    }
+    if (op == mir.MIR_NEG) {
+        ret expand_neg(alloc, plan, f, mi, dst, cursor);
+    }
+    if (op == mir.MIR_ZEXT) {
+        ret expand_zext(alloc, plan, mi, dst, cursor);
+    }
+    if (op == mir.MIR_TRUNC) {
+        ret expand_trunc(alloc, plan, mi, dst, cursor);
+    }
+    ret R.err[bool, str](unsupported_message(op, mi.width));
+}
+
+# emit one native-width piece into `dst[*cursor]`, copying the source's location
+# metadata and advancing the cursor
+# ---
+# alloc:  allocator for the piece's operand array
+# dst:    the rebuilt array
+# cursor: next write index; advanced by one
+# src:    the wide instruction being replaced (source of loc / inline_site)
+# opcode: the piece's opcode
+# ops:    operand values copied into a fresh array (nil when count is 0)
+# nops:   operand count
+# width:  the piece's operation width (the native lane width)
+# ret:    ok(true) on success, or an allocation error
+fun emit_piece(alloc: *A.Allocator, dst: *mir.MirInstr, cursor: *u32, src: *mir.MirInstr,
+               opcode: mir.MirOpcode, ops: *mir.MirOperand, nops: u32, width: u8) R.Result[bool, str] {
+    var arr: *mir.MirOperand = nil;
+    if (nops > 0) {
+        val res_a: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](alloc, nops::usize);
+        if (R.is_err[*mir.MirOperand, str](res_a)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](res_a)); }
+        arr = R.unwrap_ok[*mir.MirOperand, str](res_a);
+        var j: u32 = 0;
+        for (j < nops) { arr[j] = ops[j]; j = j + 1; }
+    }
+    val ci: u32 = @cursor;
+    val p: *mir.MirInstr = ?dst[ci];
+    p.opcode        = opcode;
+    p.operands      = arr;
+    p.operand_count = nops;
+    p.width         = width;
+    p.src_width     = width;
+    p.asm_block     = nil;
+    p.loc           = src.loc;
+    p.inline_site   = src.inline_site;
+    p.vec_lane      = mir.VEC_LANE_NONE;
+    p.dbg_bindings      = nil;
+    p.dbg_binding_count = 0;
+    @cursor = ci + 1;
+    ret R.ok[bool, str](true);
+}
+
+# the native-width operand for lane `i` of a wide operation's operand
+#
+# A wide VREG operand yields its `i`-th lane vreg; an immediate yields its `i`-th
+# native-width byte group. Only these two kinds reach a wide integer ALU op after
+# lowering; a caller validates that before expanding.
+# ---
+# plan: the function's lane assignment
+# op:   the wide operand
+# i:    the lane index
+# ret:  the native-width operand for that lane
+fun lane_operand(plan: *LanePlan, op: *mir.MirOperand, i: u32) mir.MirOperand {
+    if (op.kind == mir.MIR_OP_VREG && op.vreg < plan.orig_count && plan.lane_base[op.vreg] != LANE_NONE) {
+        ret mir.op_vreg(plan.lane_base[op.vreg] + i);
+    }
+    if (op.kind == mir.MIR_OP_IMM) {
+        ret mir.op_imm(imm_lane(op.imm, i, plan.lane_width));
+    }
+    # a native-width vreg (lane count 1) rides lane 0 directly; a caller only asks
+    # for lane 0 in that case.
+    ret @op;
+}
+
+# the `i`-th native-width byte group of an immediate, zero-filled above the value
+# ---
+# imm: the full immediate value
+# i:   the lane index
+# w:   the native lane width in bytes
+# ret: the immediate's bits for that lane, in [0, 2^(8*w))
+fun imm_lane(imm: i64, i: u32, w: u8) i64 {
+    val shift: i64 = (i * w::u32)::i64 * 8;
+    val mask:  i64 = (1::i64 << (w::i64 * 8)) - 1;
+    ret (imm >> shift) & mask;
+}
+
+# whether every value operand of a wide ALU instruction is a wide vreg or an
+# immediate (the only shapes a lane expansion handles)
+# ---
+# plan:  the function's lane assignment
+# mi:    the wide instruction
+# start: first operand index to check (1 to skip the destination)
+# ret:   true when operands [start, operand_count) are all wide-vreg or immediate
+fun operands_are_lane_ready(plan: *LanePlan, mi: *mir.MirInstr, start: u32) bool {
+    var k: u32 = start;
+    for (k < mi.operand_count) {
+        val op: *mir.MirOperand = ?mi.operands[k];
+        val is_wide_vreg: bool = op.kind == mir.MIR_OP_VREG && op.vreg < plan.orig_count &&
+                                 plan.lane_base[op.vreg] != LANE_NONE;
+        if (!is_wide_vreg && op.kind != mir.MIR_OP_IMM) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# expand a wide lane-independent bitwise binary op (AND / OR / XOR) into one
+# native op per lane
+fun expand_bitwise(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
+                   dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
+    if (mi.operand_count != 3 || !operands_are_lane_ready(plan, mi, 1)) {
+        ret R.err[bool, str](unsupported_message(mi.opcode, mi.width));
+    }
+    val nl: u32 = wide_lane_count(plan, mi);
+    val lw: u8  = plan.lane_width;
+    var i: u32 = 0;
+    for (i < nl) {
+        var ops: [3]mir.MirOperand;
+        ops[0] = lane_operand(plan, ?mi.operands[0], i);
+        ops[1] = lane_operand(plan, ?mi.operands[1], i);
+        ops[2] = lane_operand(plan, ?mi.operands[2], i);
+        val r: R.Result[bool, str] = emit_piece(alloc, dst, cursor, mi, mi.opcode, ?ops[0], 3, lw);
+        if (R.is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# expand a wide bitwise complement into one native NOT per lane
+fun expand_not(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
+               dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
+    if (mi.operand_count != 2 || !operands_are_lane_ready(plan, mi, 1)) {
+        ret R.err[bool, str](unsupported_message(mi.opcode, mi.width));
+    }
+    val nl: u32 = wide_lane_count(plan, mi);
+    val lw: u8  = plan.lane_width;
+    var i: u32 = 0;
+    for (i < nl) {
+        var ops: [2]mir.MirOperand;
+        ops[0] = lane_operand(plan, ?mi.operands[0], i);
+        ops[1] = lane_operand(plan, ?mi.operands[1], i);
+        val r: R.Result[bool, str] = emit_piece(alloc, dst, cursor, mi, mir.MIR_NOT, ?ops[0], 2, lw);
+        if (R.is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# expand a wide register / immediate copy into one native move per lane
+fun expand_mov(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
+               dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
+    # a wide MOV with a precolored physical-register operand is an ABI register
+    # placement of a wide value, which needs the target's paired-register class;
+    # the mos6502 ABI passes wide values in memory, so this should not arise.
+    if (mi.operand_count != 2 || !operands_are_lane_ready(plan, mi, 1) ||
+        mi.operands[0].kind != mir.MIR_OP_VREG || plan.lane_base[mi.operands[0].vreg] == LANE_NONE) {
+        ret R.err[bool, str](unsupported_message(mi.opcode, mi.width));
+    }
+    val nl: u32 = wide_lane_count(plan, mi);
+    val lw: u8  = plan.lane_width;
+    var i: u32 = 0;
+    for (i < nl) {
+        var ops: [2]mir.MirOperand;
+        ops[0] = lane_operand(plan, ?mi.operands[0], i);
+        ops[1] = lane_operand(plan, ?mi.operands[1], i);
+        val r: R.Result[bool, str] = emit_piece(alloc, dst, cursor, mi, mir.MIR_MOV, ?ops[0], 2, lw);
+        if (R.is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# expand a wide add or subtract into an explicit native-width carry / borrow chain
+#
+# Each lane computes its native sum / difference and the carry / borrow out of it
+# as an ordinary value (an unsigned compare), threading that into the next lane -
+# this IR has no hardware carry flag, so the carry is materialized. The low lane
+# needs no carry-in and the top lane's carry-out is discarded (wrapping
+# arithmetic), so the shape is: low lane 2 pieces, each middle lane 5, top lane 2.
+# ---
+# is_sub: true for subtraction (borrow chain), false for addition (carry chain)
+fun expand_addsub(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
+                  dst: *mir.MirInstr, cursor: *u32, is_sub: bool) R.Result[bool, str] {
+    if (mi.operand_count != 3 || !operands_are_lane_ready(plan, mi, 1) ||
+        mi.operands[0].kind != mir.MIR_OP_VREG || plan.lane_base[mi.operands[0].vreg] == LANE_NONE) {
+        ret R.err[bool, str](unsupported_message(mi.opcode, mi.width));
+    }
+    val nl: u32 = wide_lane_count(plan, mi);
+    val lw: u8  = plan.lane_width;
+    val cmp:  mir.MirOpcode = mir.MIR_CMP_LT_U;
+    var op0:  mir.MirOpcode = mir.MIR_ADD;
+    if (is_sub) { op0 = mir.MIR_SUB; }
+
+    var carry: u32 = mir.MIR_VREG_NIL;  # the carry / borrow vreg out of the last lane
+    var i: u32 = 0;
+    for (i < nl) {
+        val d: mir.MirOperand = lane_operand(plan, ?mi.operands[0], i);
+        val a: mir.MirOperand = lane_operand(plan, ?mi.operands[1], i);
+        val b: mir.MirOperand = lane_operand(plan, ?mi.operands[2], i);
+        val is_low: bool = i == 0;
+        val is_top: bool = i == nl - 1;
+
+        if (is_low) {
+            # d = a (+/-) b ; carry = is_sub ? (a <u b) : (d <u a)
+            val r1: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, op0, d, a, b, lw);
+            if (R.is_err[bool, str](r1)) { ret r1; }
+            val res_c: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](res_c)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_c)); }
+            carry = R.unwrap_ok[u32, str](res_c);
+            val cop: mir.MirOperand = mir.op_vreg(carry);
+            var rc: R.Result[bool, str];
+            if (is_sub) { rc = emit_bin(alloc, dst, cursor, mi, cmp, cop, a, b, lw); }
+            or          { rc = emit_bin(alloc, dst, cursor, mi, cmp, cop, d, a, lw); }
+            if (R.is_err[bool, str](rc)) { ret rc; }
+        }
+        or (is_top) {
+            # t = a (+/-) b ; d = t (+/-) carry   (carry-out discarded)
+            val res_t: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](res_t)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_t)); }
+            val t: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](res_t));
+            val r1: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, op0, t, a, b, lw);
+            if (R.is_err[bool, str](r1)) { ret r1; }
+            val r2: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, op0, d, t, mir.op_vreg(carry), lw);
+            if (R.is_err[bool, str](r2)) { ret r2; }
+        }
+        or {
+            # middle lane: t = a (+/-) b ; ct = overflow(t) ; d = t (+/-) carry ;
+            #              cd = overflow(d) ; carry = ct | cd
+            val res_t: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](res_t)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_t)); }
+            val t: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](res_t));
+            val cin: mir.MirOperand = mir.op_vreg(carry);
+
+            val r1: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, op0, t, a, b, lw);
+            if (R.is_err[bool, str](r1)) { ret r1; }
+
+            val res_ct: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](res_ct)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_ct)); }
+            val ct: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](res_ct));
+            var rct: R.Result[bool, str];
+            if (is_sub) { rct = emit_bin(alloc, dst, cursor, mi, cmp, ct, a, b, lw); }
+            or          { rct = emit_bin(alloc, dst, cursor, mi, cmp, ct, t, a, lw); }
+            if (R.is_err[bool, str](rct)) { ret rct; }
+
+            val r3: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, op0, d, t, cin, lw);
+            if (R.is_err[bool, str](r3)) { ret r3; }
+
+            val res_cd: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](res_cd)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_cd)); }
+            val cd: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](res_cd));
+            var rcd: R.Result[bool, str];
+            if (is_sub) { rcd = emit_bin(alloc, dst, cursor, mi, cmp, cd, t, cin, lw); }
+            or          { rcd = emit_bin(alloc, dst, cursor, mi, cmp, cd, d, t, lw); }
+            if (R.is_err[bool, str](rcd)) { ret rcd; }
+
+            val res_co: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](res_co)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_co)); }
+            val co: u32 = R.unwrap_ok[u32, str](res_co);
+            val r5: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_OR, mir.op_vreg(co), ct, cd, lw);
+            if (R.is_err[bool, str](r5)) { ret r5; }
+            carry = co;
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# expand a wide negate as `0 - value` through the subtract carry chain
+fun expand_neg(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
+               dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
+    if (mi.operand_count != 2 || !operands_are_lane_ready(plan, mi, 1) ||
+        mi.operands[0].kind != mir.MIR_OP_VREG || plan.lane_base[mi.operands[0].vreg] == LANE_NONE) {
+        ret R.err[bool, str](unsupported_message(mi.opcode, mi.width));
+    }
+    # synthesize a three-operand subtract `dst = 0 - src` and drive the borrow chain.
+    var sub: mir.MirInstr = @mi;
+    var ops: [3]mir.MirOperand;
+    ops[0] = mi.operands[0];
+    ops[1] = mir.op_imm(0);
+    ops[2] = mi.operands[1];
+    sub.operands      = ?ops[0];
+    sub.operand_count = 3;
+    ret expand_addsub(alloc, plan, f, ?sub, dst, cursor, true);
+}
+
+# the destination lane count of a width-changing op (its operation width in native
+# lanes, at least one)
+fun dst_lane_count(plan: *LanePlan, mi: *mir.MirInstr) u32 {
+    var n: u32 = (mi.width / plan.lane_width)::u32;
+    if (n == 0) { n = 1; }
+    ret n;
+}
+
+# the source lane count of a width-changing op (its source width in native lanes,
+# at least one)
+fun src_lane_count(plan: *LanePlan, mi: *mir.MirInstr) u32 {
+    var n: u32 = (mi.src_width / plan.lane_width)::u32;
+    if (n == 0) { n = 1; }
+    ret n;
+}
+
+# expand a zero-extension into per-lane moves: the low lanes copy the source, the
+# high lanes are zeroed
+fun expand_zext(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
+                dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
+    if (mi.operand_count != 2 ||
+        mi.operands[0].kind != mir.MIR_OP_VREG || plan.lane_base[mi.operands[0].vreg] == LANE_NONE) {
+        ret R.err[bool, str](unsupported_message(mi.opcode, mi.width));
+    }
+    val dl: u32 = dst_lane_count(plan, mi);
+    val sl: u32 = src_lane_count(plan, mi);
+    val lw: u8  = plan.lane_width;
+    var i: u32 = 0;
+    for (i < dl) {
+        var ops: [2]mir.MirOperand;
+        ops[0] = lane_operand(plan, ?mi.operands[0], i);
+        if (i < sl) { ops[1] = lane_operand(plan, ?mi.operands[1], i); }
+        or          { ops[1] = mir.op_imm(0); }
+        val r: R.Result[bool, str] = emit_piece(alloc, dst, cursor, mi, mir.MIR_MOV, ?ops[0], 2, lw);
+        if (R.is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# expand a truncation into per-lane moves of the low destination lanes; the high
+# source lanes are dropped
+fun expand_trunc(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
+                 dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
+    if (mi.operand_count != 2) {
+        ret R.err[bool, str](unsupported_message(mi.opcode, mi.width));
+    }
+    val dl: u32 = dst_lane_count(plan, mi);
+    val lw: u8  = plan.lane_width;
+    var i: u32 = 0;
+    for (i < dl) {
+        var ops: [2]mir.MirOperand;
+        ops[0] = lane_operand(plan, ?mi.operands[0], i);
+        ops[1] = lane_operand(plan, ?mi.operands[1], i);
+        val r: R.Result[bool, str] = emit_piece(alloc, dst, cursor, mi, mir.MIR_MOV, ?ops[0], 2, lw);
+        if (R.is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# emit one native three-operand (or two-operand) binary piece `d = a op b`
+fun emit_bin(alloc: *A.Allocator, dst: *mir.MirInstr, cursor: *u32, src: *mir.MirInstr,
+             opcode: mir.MirOpcode, d: mir.MirOperand, a: mir.MirOperand, b: mir.MirOperand, w: u8) R.Result[bool, str] {
+    var ops: [3]mir.MirOperand;
+    ops[0] = d;
+    ops[1] = a;
+    ops[2] = b;
+    ret emit_piece(alloc, dst, cursor, src, opcode, ?ops[0], 3, w);
+}
+
+# the diagnostic for a wide operation this pass does not legalize
+#
+# Names the numeric opcode and width so the failure is specific, mirroring the
+# vector path's loud unsupported-lane-op discipline. A static message (no
+# allocator) keeps the pass allocation-free on its error paths.
+# ---
+# op:    the unsupported wide opcode
+# width: the operation width in bytes
+# ret:   the diagnostic string
+fun unsupported_message(op: mir.MirOpcode, width: u8) str {
+    if (op == mir.MIR_MUL)     { ret "legalize: wide multiply by a non-constant is unsupported on this target"; }
+    if (op == mir.MIR_DIV_S || op == mir.MIR_DIV_U) { ret "legalize: wide divide is unsupported on this target"; }
+    if (op == mir.MIR_REM_S || op == mir.MIR_REM_U) { ret "legalize: wide remainder is unsupported on this target"; }
+    if (op == mir.MIR_SHL || op == mir.MIR_SHR_S || op == mir.MIR_SHR_U) {
+        ret "legalize: wide shift is not yet legalized on this target";
+    }
+    if (op == mir.MIR_LOAD || op == mir.MIR_STORE) {
+        ret "legalize: wide memory access is not yet legalized on this target";
+    }
+    ret "legalize: operation wider than the target ALU is unsupported";
+}
+
+# test-only: heap vreg table of `n` general-purpose vregs
+fun t_vregs(alloc: *A.Allocator, f: *mir.MirFunction, n: u32) {
+    val r: R.Result[*mir.MirVReg, str] = A.allocate[mir.MirVReg](alloc, n::usize);
+    f.vregs     = R.unwrap_ok[*mir.MirVReg, str](r);
+    f.vreg_count = n;
+    f.vreg_cap   = n;
+    var i: u32 = 0;
+    for (i < n) {
+        f.vregs[i].id         = i;
+        f.vregs[i].class      = mir.REG_CLASS_GP;
+        f.vregs[i].spill_slot = -1;
+        f.vregs[i].assigned   = mir.MIR_VREG_NIL;
+        f.vregs[i].vector     = false;
+        i = i + 1;
+    }
+}
+
+# test-only: heap block of `n` instructions, each with a fresh heap operand array
+fun t_block(alloc: *A.Allocator, b: *mir.MirBlock, n: u32) {
+    val r: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](alloc, n::usize);
+    b.instrs      = R.unwrap_ok[*mir.MirInstr, str](r);
+    b.instr_count = n;
+    b.instr_cap   = n;
+    b.id          = 0;
+}
+
+# test-only: write instruction `ix` of a block with a heap-copied operand array
+fun t_instr(alloc: *A.Allocator, b: *mir.MirBlock, ix: u32, opcode: mir.MirOpcode,
+            ops: *mir.MirOperand, nops: u32, width: u8) {
+    val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](alloc, nops::usize);
+    val arr: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
+    var j: u32 = 0;
+    for (j < nops) { arr[j] = ops[j]; j = j + 1; }
+    b.instrs[ix].opcode        = opcode;
+    b.instrs[ix].operands      = arr;
+    b.instrs[ix].operand_count = nops;
+    b.instrs[ix].width         = width;
+    b.instrs[ix].src_width     = width;
+    b.instrs[ix].vec_lane      = mir.VEC_LANE_NONE;
+}
+
+# a function whose every scalar op fits the native ALU (width <= max_alu_width) is
+# returned untouched: no vreg added, the block array pointer and count unchanged.
+# this is the byte-identical inertness path every wide-native target takes
+test "mach.lang.be.codegen.legalize:inert_on_native_width" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 3);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 1);
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_vreg(0); ops[1] = mir.op_vreg(1); ops[2] = mir.op_vreg(2);
+    t_instr(?alloc, ?b, 0, mir.MIR_ADD, ?ops[0], 3, 8);  # width 8 == native
+    f.blocks = ?b; f.block_count = 1;
+
+    val before_ptr:   *mir.MirInstr = b.instrs;
+    val before_count: u32           = b.instr_count;
+    val before_vregs: u32           = f.vreg_count;
+
+    val r: R.Result[bool, str] = legalize_function(?alloc, 8, ?f);
+    if (R.is_err[bool, str](r))         { ret 1; }
+    if (b.instrs != before_ptr)         { ret 1; }  # not reallocated
+    if (b.instr_count != before_count)  { ret 1; }  # not rewritten
+    if (f.vreg_count != before_vregs)   { ret 1; }  # no lane vregs added
+    ret 0;
+}
+
+# a width-2 add on an 8-bit ALU (max_alu_width 1) expands into the two-lane carry
+# chain: low lane `add ; cmp` then top lane `add ; add`, four native-width pieces
+# whose destinations are the destination vreg's two fresh byte lanes
+test "mach.lang.be.codegen.legalize:expands_wide_add_carry_chain" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    # v0 = v1 + v2, all i16; v1 / v2 are defined by wide immediate moves so the
+    # planner marks them wide (a real lowered function defines every value vreg).
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 3);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 3);
+    var m1: [2]mir.MirOperand;
+    m1[0] = mir.op_vreg(1); m1[1] = mir.op_imm(0x0102);
+    t_instr(?alloc, ?b, 0, mir.MIR_MOV, ?m1[0], 2, 2);
+    var m2: [2]mir.MirOperand;
+    m2[0] = mir.op_vreg(2); m2[1] = mir.op_imm(0x0304);
+    t_instr(?alloc, ?b, 1, mir.MIR_MOV, ?m2[0], 2, 2);
+    var ad: [3]mir.MirOperand;
+    ad[0] = mir.op_vreg(0); ad[1] = mir.op_vreg(1); ad[2] = mir.op_vreg(2);
+    t_instr(?alloc, ?b, 2, mir.MIR_ADD, ?ad[0], 3, 2);
+    f.blocks = ?b; f.block_count = 1;
+
+    val r: R.Result[bool, str] = legalize_function(?alloc, 1, ?f);
+    if (R.is_err[bool, str](r)) { ret 1; }
+
+    # lanes are assigned in definition order (v1 -> v3,v4; v2 -> v5,v6; v0 -> v7,v8),
+    # two per wide vreg = 6 fresh lane vregs, plus the two-lane add chain's carry and
+    # top-lane temp = 3 + 6 + 2 = 11.
+    if (f.vreg_count != 11) { ret 1; }
+
+    # two moves (2 lanes each) + the four-piece add chain = 8 instructions.
+    if (b.instr_count != 8) { ret 1; }
+
+    # the add chain occupies pieces 4..7. piece 4: add low lane -> v0 lane 0 (v7);
+    # piece 5: cmp producing the carry; piece 6/7: top lane add + carry-in add,
+    # the last writing v0 lane 1 (v8).
+    if (b.instrs[4].opcode != mir.MIR_ADD)      { ret 1; }
+    if (b.instrs[4].width != 1)                 { ret 1; }
+    if (b.instrs[4].operands[0].vreg != 7)      { ret 1; }  # v0 lane 0
+    if (b.instrs[5].opcode != mir.MIR_CMP_LT_U) { ret 1; }
+    if (b.instrs[6].opcode != mir.MIR_ADD)      { ret 1; }
+    if (b.instrs[7].opcode != mir.MIR_ADD)      { ret 1; }
+    if (b.instrs[7].operands[0].vreg != 8)      { ret 1; }  # v0 lane 1
+    ret 0;
+}
+
+# a wide operation the pass does not legalize (a divide) fails loudly with a
+# diagnostic naming the operation, never silently miscompiling
+test "mach.lang.be.codegen.legalize:rejects_unsupported_wide_op" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 3);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 1);
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_vreg(0); ops[1] = mir.op_vreg(1); ops[2] = mir.op_vreg(2);
+    t_instr(?alloc, ?b, 0, mir.MIR_DIV_U, ?ops[0], 3, 2);  # wide divide, unsupported
+    f.blocks = ?b; f.block_count = 1;
+
+    val r: R.Result[bool, str] = legalize_function(?alloc, 1, ?f);
+    if (!R.is_err[bool, str](r)) { ret 1; }
+    ret 0;
+}
