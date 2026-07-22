@@ -1,0 +1,248 @@
+# MOS 6502 instruction-selection rule pack
+#
+# The 6502 contribution to the shared rule engine (`be.codegen.rules`). By the time
+# selection runs, `be.codegen.legalize` has rewritten every wider-than-8-bit scalar
+# into native byte operations, so this pack only ever sees 1-byte ops - and because
+# the 6502 is an accumulator machine (no register-to-register arithmetic), almost
+# every operation survives selection as its generic opcode and the encoder
+# materializes the load-A / operate / store-A byte sequence. The pack is therefore
+# small and boring: it retags the moves and control-flow terminators to concrete
+# 6502 opcodes and passes everything else through. That smallness is the 8-bit
+# target succeeding - the width legalization did the hard work upstream.
+#
+# The encoder (`mos6502.encode`) is the total authority on what the 6502 can
+# realize: an operation the hardware lacks (a byte multiply, any divide, a
+# floating-point op) reaches the encoder as a passed-through generic opcode and is
+# rejected there with a loud, specific diagnostic, mirroring how the legalizer
+# rejects the wide forms of the same operations.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.string.str;
+
+use A: std.allocator;
+use R: std.types.result;
+
+use mach.lang.be.codegen.mir;
+use mach.lang.be.codegen.rules;
+use mach.lang.target.isa.mos6502;
+use target: mach.lang.target.resolved;
+
+# the concrete signature the erased `isa.IsaVTable.select` pointer is cast back to,
+# matching the shared `be.codegen.isel.SelectFn`
+# ---
+# a:   backing allocator (threaded for the shared SelectFn contract)
+# tgt: resolved compilation target (must be mos6502)
+# f:   the MIR function to select instructions for; mutated in place
+# ret: ok(true) on success, or an error naming the failure
+pub def SelectFn: fun(*A.Allocator, *target.Target, *mir.MirFunction) R.Result[bool, str];
+
+# the pack's rule table: one rule per reachable generic opcode plus the six fused
+# compare-and-branch survivors. the coverage test pins the count so the storage
+# length and the appended table cannot drift apart
+var rules_storage: [51]rules.Rule;
+
+# the post-selection plain register-copy opcodes: the concrete 6502 move and the
+# generic `mir.MIR_MOV` the reload / store moves regalloc splices after selection
+var copy_opcodes_storage: [2]u32;
+
+# the comparison opcodes the engine's compare-and-branch fusion combines with a
+# consuming conditional branch: all six scalar conditions, so a `CMP ; CBR` pair
+# collapses to one native compare-and-branch the encoder materializes directly
+var fused_ccs_storage: [6]u32;
+
+# the pack handed to the shared engine, built once on first use
+var pack_storage: rules.RulePack;
+var pack_built:   bool;
+
+# select concrete 6502 instructions for one MIR function
+#
+# The 6502 implementation behind the ISA vtable's `select` slot; a one-line binding
+# of the pack to the shared engine.
+# ---
+# a:   backing allocator (unused in practice; no 6502 rule expands)
+# tgt: resolved compilation target (must be mos6502)
+# f:   the MIR function to select instructions for; mutated in place
+# ret: ok(true) on success, or an error naming the failure
+pub fun select(a: *A.Allocator, tgt: *target.Target, f: *mir.MirFunction) R.Result[bool, str] {
+    ret rules.select(built_pack(), a, tgt, f);
+}
+
+# classify a post-selection opcode as a 6502 plain register move
+# ---
+# opcode: the concrete post-selection opcode to classify
+# ret:    true when the opcode is a plain register-move form
+pub fun is_reg_move(opcode: u32) bool {
+    ret rules.is_reg_move(built_pack(), opcode);
+}
+
+# the 6502 rule pack, built once on first use
+#
+# Retags the moves and control-flow terminators to concrete 6502 opcodes; passes
+# every other reachable generic opcode through for the encoder to materialize (or
+# to reject when the hardware cannot realize it).
+# ---
+# ret: the process-lifetime 6502 pack
+fun built_pack() *rules.RulePack {
+    if (pack_built) { ret ?pack_storage; }
+
+    var tb: rules.TableBuilder = rules.table(?rules_storage[0]);
+
+    # moves and control flow retag to concrete 6502 opcodes.
+    rules.append_retag(?tb, mir.MIR_MOV,         mos6502.MOV::u32);
+    rules.append_retag(?tb, mir.MIR_BR,          mos6502.JMP::u32);
+    rules.append_retag(?tb, mir.MIR_RET,         mos6502.RTS::u32);
+    rules.append_retag(?tb, mir.MIR_UNREACHABLE, mos6502.BRK::u32);
+
+    # the integer ALU / logic ops pass through: the encoder materializes each as a
+    # load-A / operate / store-A byte sequence. the hardware-absent forms (multiply,
+    # divide, remainder) also pass through and are rejected at encode time.
+    rules.append_pass(?tb, mir.MIR_ADD);
+    rules.append_pass(?tb, mir.MIR_SUB);
+    rules.append_pass(?tb, mir.MIR_MUL);
+    rules.append_pass(?tb, mir.MIR_DIV_S);
+    rules.append_pass(?tb, mir.MIR_DIV_U);
+    rules.append_pass(?tb, mir.MIR_REM_S);
+    rules.append_pass(?tb, mir.MIR_REM_U);
+    rules.append_pass(?tb, mir.MIR_NEG);
+    rules.append_pass(?tb, mir.MIR_AND);
+    rules.append_pass(?tb, mir.MIR_OR);
+    rules.append_pass(?tb, mir.MIR_XOR);
+    rules.append_pass(?tb, mir.MIR_SHL);
+    rules.append_pass(?tb, mir.MIR_SHR_S);
+    rules.append_pass(?tb, mir.MIR_SHR_U);
+    rules.append_pass(?tb, mir.MIR_NOT);
+
+    # the comparisons and the conditional branch pass through; the encoder
+    # materializes the CMP + Bxx byte sequence. the pack declares all six conditions
+    # fusable, so a single-consumer `CMP ; CBR` pair collapses ahead of selection
+    # into a `MIR_SEL_CBR_*` survivor (below); a compare whose boolean is consumed
+    # elsewhere stays a plain compare the encoder lowers to a 0/1 result.
+    rules.append_pass(?tb, mir.MIR_CMP_EQ);
+    rules.append_pass(?tb, mir.MIR_CMP_NE);
+    rules.append_pass(?tb, mir.MIR_CMP_LT_S);
+    rules.append_pass(?tb, mir.MIR_CMP_LT_U);
+    rules.append_pass(?tb, mir.MIR_CMP_LE_S);
+    rules.append_pass(?tb, mir.MIR_CMP_LE_U);
+    rules.append_pass(?tb, mir.MIR_CBR);
+
+    # the fused compare-and-branch survivors the engine's combine produces; the
+    # encoder materializes the native `LDA ; CMP ; B!cc ; JMP then ; JMP else`
+    # sequence. scalar-gated: the combine never fuses a vector lane.
+    rules.append_gated_pass(?tb, mir.MIR_SEL_CBR_EQ,   rules.GATE_SCALAR);
+    rules.append_gated_pass(?tb, mir.MIR_SEL_CBR_NE,   rules.GATE_SCALAR);
+    rules.append_gated_pass(?tb, mir.MIR_SEL_CBR_LT_S, rules.GATE_SCALAR);
+    rules.append_gated_pass(?tb, mir.MIR_SEL_CBR_LT_U, rules.GATE_SCALAR);
+    rules.append_gated_pass(?tb, mir.MIR_SEL_CBR_LE_S, rules.GATE_SCALAR);
+    rules.append_gated_pass(?tb, mir.MIR_SEL_CBR_LE_U, rules.GATE_SCALAR);
+
+    # the width conversions pass through: after legalization these are byte moves or
+    # zero / sign fills the encoder emits (or rejects for the float forms).
+    rules.append_pass(?tb, mir.MIR_TRUNC);
+    rules.append_pass(?tb, mir.MIR_SEXT);
+    rules.append_pass(?tb, mir.MIR_ZEXT);
+    rules.append_pass(?tb, mir.MIR_FP_TRUNC);
+    rules.append_pass(?tb, mir.MIR_FP_EXT);
+    rules.append_pass(?tb, mir.MIR_FP_TO_SI);
+    rules.append_pass(?tb, mir.MIR_FP_TO_UI);
+    rules.append_pass(?tb, mir.MIR_SI_TO_FP);
+    rules.append_pass(?tb, mir.MIR_UI_TO_FP);
+    rules.append_pass(?tb, mir.MIR_BITCAST);
+
+    # memory and address ops pass through to the encoder's zero-page / absolute /
+    # frame-relative addressing.
+    rules.append_pass(?tb, mir.MIR_ALLOCA);
+    rules.append_pass(?tb, mir.MIR_LOAD);
+    rules.append_pass(?tb, mir.MIR_STORE);
+    rules.append_pass(?tb, mir.MIR_GEP);
+
+    # call / phi pseudos pass through; MIR_CALL is the caller-saved clobber barrier
+    # the shared allocator keys on.
+    rules.append_pass(?tb, mir.MIR_CALL);
+    rules.append_pass(?tb, mir.MIR_ARG);
+    rules.append_pass(?tb, mir.MIR_CALL_RES);
+    rules.append_pass(?tb, mir.MIR_PHI);
+
+    # inline assembly passes through; the encoder emits the body bytes directly.
+    rules.append_pass(?tb, mir.MIR_ASM);
+
+    copy_opcodes_storage[0] = mos6502.MOV::u32;
+    copy_opcodes_storage[1] = mir.MIR_MOV;
+
+    fused_ccs_storage[0] = mir.MIR_CMP_EQ;
+    fused_ccs_storage[1] = mir.MIR_CMP_NE;
+    fused_ccs_storage[2] = mir.MIR_CMP_LT_S;
+    fused_ccs_storage[3] = mir.MIR_CMP_LT_U;
+    fused_ccs_storage[4] = mir.MIR_CMP_LE_S;
+    fused_ccs_storage[5] = mir.MIR_CMP_LE_U;
+
+    pack_storage.name               = "mos6502";
+    pack_storage.rules              = ?rules_storage[0];
+    pack_storage.rule_count         = tb.cursor;
+    pack_storage.copy_opcodes       = ?copy_opcodes_storage[0];
+    pack_storage.copy_opcode_count  = 2;
+    pack_storage.fused_cbr_ccs      = ?fused_ccs_storage[0];
+    pack_storage.fused_cbr_cc_count = 6;
+    pack_built = true;
+
+    ret ?pack_storage;
+}
+
+# every generic opcode that can reach selection terminates in a rule, and the pack
+# pins its exact storage length so an appended rule and the storage size cannot
+# drift apart
+test "mach.lang.target.isa.mos6502.rules:generic_opcode_coverage" {
+    val pack: *rules.RulePack = built_pack();
+    if (pack.rule_count != 51)        { ret 1; }
+    if (pack.fused_cbr_cc_count != 6) { ret 1; }
+
+    var reachable: [mir.SELECTION_REACHABLE_COUNT]u32;
+    mir.selection_reachable(?reachable[0]);
+    var eliminated: [mir.SELECTION_ELIMINATED_COUNT]u32;
+    mir.selection_eliminated(?eliminated[0]);
+    var fused: [mir.SELECTION_FUSED_COUNT]u32;
+    mir.selection_fused(?fused[0]);
+
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(11);
+    ops[1] = mir.op_preg(12);
+    ops[2] = mir.op_preg(13);
+    var probe: mir.MirInstr;
+    probe.operands      = ?ops[0];
+    probe.operand_count = 3;
+    probe.width         = 1;
+    probe.vec_lane      = mir.VEC_LANE_NONE;
+
+    var f: mir.MirFunction;
+
+    var i: u32 = 0;
+    for (i < mir.SELECTION_REACHABLE_COUNT) {
+        probe.opcode = reachable[i];
+        if (rules.find_rule(pack, ?f, ?probe) == nil) { ret 1; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < mir.SELECTION_ELIMINATED_COUNT) {
+        probe.opcode = eliminated[i];
+        if (rules.find_rule(pack, ?f, ?probe) != nil) { ret 1; }
+        i = i + 1;
+    }
+    # the fused survivors the combine produces must be admitted.
+    i = 0;
+    for (i < mir.SELECTION_FUSED_COUNT) {
+        probe.opcode = fused[i];
+        if (rules.find_rule(pack, ?f, ?probe) == nil) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# the copy-hygiene classifier admits the concrete 6502 move and the generic
+# MIR_MOV regalloc splices, and rejects a non-move opcode
+test "mach.lang.target.isa.mos6502.rules:is_reg_move" {
+    if (!is_reg_move(mos6502.MOV::u32)) { ret 1; }
+    if (!is_reg_move(mir.MIR_MOV))      { ret 1; }
+    if (is_reg_move(mos6502.JMP::u32))  { ret 1; }
+    ret 0;
+}

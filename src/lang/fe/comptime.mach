@@ -33,17 +33,18 @@ use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
-use std.types.string.StrView;
+use std.types.view.View;
 use std.types.string.str_len;
-use std.types.string.view;
-use std.types.string.view_eq_str;
-use std.types.string.view_contains_char;
+use std.types.view.view;
+use std.types.view.view_eq_str;
+use std.types.view.view_contains_char;
 
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
 use mach.lang.fe.ast;
+use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.expr;
 use mach.lang.fe.ast.id;
 use mach.lang.fe.token;
@@ -102,6 +103,24 @@ pub rec PackElemRef {
     ty:    u32;
 }
 
+# a comptime CONSTANT-ARRAY-ELEMENT descriptor: one element of a
+# comptime-constant array `val`, bound to the `$each x in ARR` loop variable. the
+# payload `data.celem` carries the ExprId of the element's initializer expression
+# (in the current module's ast) and the element's concrete sema type. a bare `x`
+# folds by re-evaluating the element expression; a record element's `x.field`
+# folds by re-evaluating the matching field initializer
+pub val CT_KIND_CONST_ELEM: CTKind = 7;
+
+# the payload of a CT_KIND_CONST_ELEM value - the element initializer's ExprId in
+# the current module's ast and the element's concrete sema TypeId
+# ---
+# elem: ExprId of the element's initializer expression
+# ty:   the element's concrete sema TypeId
+pub rec ConstElemRef {
+    elem: u32;
+    ty:   u32;
+}
+
 # the single teaching diagnostic for a standalone bare
 # `$ident` (#1249). the comptime channel's shapes are a closed set; a lone
 # `$ident` is none of them - a comptime parameter is referenced without `$`, and
@@ -131,6 +150,7 @@ pub rec CTValue {
         t: u32;
         fld: FieldRef;
         pelem: PackElemRef;
+        celem: ConstElemRef;
     };
 }
 
@@ -640,7 +660,19 @@ pub fun eval(
     if (k == expr.EXPR_KIND_BINARY) { ret eval_binary(c, a, source, ?node.data.binary, interner); }
     if (k == expr.EXPR_KIND_UNARY)  { ret eval_unary(c, a, source, ?node.data.unary, interner); }
 
-    if (k == expr.EXPR_KIND_IDENT) { ret eval_ident(c, source, node.span, interner); }
+    if (k == expr.EXPR_KIND_IDENT) {
+        val r_id: R.Result[CTValue, str] = eval_ident(c, source, node.span, interner);
+        if (R.is_err[CTValue, str](r_id)) { ret r_id; }
+        val v_id: CTValue = R.unwrap_ok[CTValue, str](r_id);
+        # a `$each x in ARR` loop variable binds to a CONST_ELEM descriptor; fold a
+        # bare `x` by re-evaluating the element's initializer. a scalar element
+        # yields its constant; a record element (a struct literal) is not a comptime
+        # scalar and surfaces the struct-literal rejection, exactly as intended.
+        if (v_id.kind == CT_KIND_CONST_ELEM) {
+            ret eval(c, a, source, v_id.data.celem.elem::id.ExprId, interner);
+        }
+        ret r_id;
+    }
 
     # a standalone bare `$ident` is not one of the closed comptime channel shapes
     # (#1249): comptime parameters are referenced without `$`, and comptime paths
@@ -655,6 +687,13 @@ pub fun eval(
     # resolved through the installed member resolver.
     if (k == expr.EXPR_KIND_MEMBER) {
         if (is_comptime_path(a, e)) { ret eval_path(c, a, source, e, interner); }
+        # `x.field` where `x` is a `$each x in ARR` loop variable bound to a record
+        # element: fold to the matching field initializer's value. checked before the
+        # field-descriptor path since a constant-element object is a plain identifier
+        # (not a CT_KIND_FIELD), so the two never collide.
+        val cel: O.Option[R.Result[CTValue, str]] =
+            eval_const_elem_member(c, a, source, node.data.member.object, node.data.member.name, interner);
+        if (O.is_some[R.Result[CTValue, str]](cel)) { ret O.unwrap[R.Result[CTValue, str]](cel); }
         # a `.name` / `.type` / `.offset` projection off a comptime field
         # descriptor (#1473): fires only when the object evaluates to a
         # CT_KIND_FIELD, so a member of any other value falls through to the
@@ -678,7 +717,7 @@ pub fun eval(
 
 # returns a length-counted view into source covering `span`. the returned view
 # shares source's storage; do not free it independently
-fun span_text(source: str, span: token.Span) StrView {
+fun span_text(source: str, span: token.Span) View {
     ret view(?source[span.offset], span.len);
 }
 
@@ -692,7 +731,7 @@ fun span_text(source: str, span: token.Span) StrView {
 # span:   span of the integer-literal token
 # ret:    a CT_KIND_INT value, or an error describing the malformed literal
 pub fun eval_lit_int(source: str, span: token.Span) R.Result[CTValue, str] {
-    val text: StrView = span_text(source, span);
+    val text: View = span_text(source, span);
     if (text.len == 0) { ret R.err[CTValue, str]("empty integer literal"); }
 
     var i:     usize = 0;
@@ -875,7 +914,7 @@ fun decimal_to_f64(mant: *bignum.Big, exp10: i64, trunc: bool) u64 {
 # span:   span of the float-literal token
 # ret:    a CT_KIND_FLOAT value, or an error describing the malformed literal
 pub fun eval_lit_float(source: str, span: token.Span) R.Result[CTValue, str] {
-    val text: StrView = span_text(source, span);
+    val text: View = span_text(source, span);
     if (text.len == 0) { ret R.err[CTValue, str]("empty float literal"); }
 
     # exact significand and its decimal exponent: value-so-far = mant * 10^dexp.
@@ -972,13 +1011,13 @@ pub fun eval_lit_float(source: str, span: token.Span) R.Result[CTValue, str] {
 # span:   span of the character-literal token
 # ret:    a CT_KIND_INT value holding the byte, or an error for a malformed literal
 pub fun eval_lit_char(source: str, span: token.Span) R.Result[CTValue, str] {
-    val text: StrView = span_text(source, span);
+    val text: View = span_text(source, span);
     if (text.len < 3) { ret R.err[CTValue, str]("malformed character literal"); }
     if (text.data[0] != '\'' || text.data[text.len - 1] != '\'') {
         ret R.err[CTValue, str]("character literal not delimited by single quotes");
     }
 
-    val inner: StrView = view(?text.data[1], text.len - 2);
+    val inner: View = view(?text.data[1], text.len - 2);
 
     val r: R.Result[u8, str] = decode_char(inner);
     if (R.is_err[u8, str](r)) {
@@ -994,7 +1033,7 @@ pub fun eval_lit_char(source: str, span: token.Span) R.Result[CTValue, str] {
 # parses a double-quoted string literal; decodes escape sequences and interns
 # the resulting bytes. the returned StrId is a handle into `interner`
 fun eval_lit_str(source: str, span: token.Span, interner: *intern.Interner) R.Result[CTValue, str] {
-    val text: StrView = span_text(source, span);
+    val text: View = span_text(source, span);
     if (text.len < 2) { ret R.err[CTValue, str]("malformed string literal"); }
 
     val open: u8 = text.data[0];
@@ -1005,7 +1044,7 @@ fun eval_lit_str(source: str, span: token.Span, interner: *intern.Interner) R.Re
         ret R.err[CTValue, str]("string literal missing closing delimiter");
     }
 
-    val inner: StrView = view(?text.data[1], text.len - 2);
+    val inner: View = view(?text.data[1], text.len - 2);
 
     val s_r: R.Result[intern.StrId, str] = intern_decoded(interner, inner);
     if (R.is_err[intern.StrId, str](s_r)) {
@@ -1019,7 +1058,7 @@ fun eval_lit_str(source: str, span: token.Span, interner: *intern.Interner) R.Re
 }
 
 # decodes escape sequences in `inner` and interns the result via `interner`
-fun intern_decoded(interner: *intern.Interner, inner: StrView) R.Result[intern.StrId, str] {
+fun intern_decoded(interner: *intern.Interner, inner: View) R.Result[intern.StrId, str] {
     val has_escape: bool = view_contains_char(inner, '\\');
     if (!has_escape) {
         ret intern.intern_bytes(interner, inner.data::str, inner.len);
@@ -1062,7 +1101,7 @@ fun intern_decoded(interner: *intern.Interner, inner: StrView) R.Result[intern.S
 }
 
 # decodes a single character (or escape sequence) from a string view
-fun decode_char(inner: StrView) R.Result[u8, str] {
+fun decode_char(inner: View) R.Result[u8, str] {
     if (inner.len == 0) { ret R.err[u8, str]("empty character literal; must contain exactly one character or escape"); }
     if (inner.data[0] != '\\') {
         if (inner.len != 1) { ret R.err[u8, str]("character literal must contain exactly one character"); }
@@ -1209,15 +1248,16 @@ fun eval_logical(
     ret bool_value(rhs.data.b);
 }
 
-# whether `eid` is a `$type_of(arg)` intrinsic call, recognized
-# structurally by a `$`-rooted COMPTIME_IDENT callee spelled `type_of`. arity is
-# validated by sema, not here
+# whether `eid` is a `$name(...)` intrinsic call, recognized structurally by a
+# `$`-rooted COMPTIME_IDENT callee spelled `name`. shared by the per-intrinsic
+# `is_*_call` predicates; arity is validated by sema, not here
 # ---
 # a:      the ast that owns `eid`
 # source: source text (for the callee span)
 # eid:    expression id to test
-# ret:    true when `eid` is a `$type_of(...)` call
-pub fun is_type_of_call(a: *ast.Ast, source: str, eid: id.ExprId) bool {
+# name:   the intrinsic name the callee must spell
+# ret:    true when `eid` is a `$name(...)` call
+fun is_comptime_call(a: *ast.Ast, source: str, eid: id.ExprId, name: str) bool {
     if (eid == id.EXPR_NIL) { ret false; }
     val n_opt: O.Option[*expr.Expr] = ast.get_expr(a, eid);
     if (O.is_none[*expr.Expr](n_opt)) { ret false; }
@@ -1229,7 +1269,36 @@ pub fun is_type_of_call(a: *ast.Ast, source: str, eid: id.ExprId) bool {
     if (ce.kind != expr.EXPR_KIND_COMPTIME_IDENT) { ret false; }
     val ns: token.Span = comptime_ident_name(ce.span);
     if (ns.len == 0) { ret false; }
-    ret view_eq_str(span_text(source, ns), "type_of");
+    ret view_eq_str(span_text(source, ns), name);
+}
+
+# the single value-argument expression of a comptime intrinsic call, or EXPR_NIL
+# when `eid` is not a call or carries no argument. shared by `type_of_arg` and
+# `fields_type_arg`
+# ---
+# a:   the ast that owns `eid`
+# eid: a comptime intrinsic call expression id
+# ret: the first argument expression id, or EXPR_NIL
+fun first_call_arg(a: *ast.Ast, eid: id.ExprId) id.ExprId {
+    if (eid == id.EXPR_NIL) { ret id.EXPR_NIL; }
+    val n_opt: O.Option[*expr.Expr] = ast.get_expr(a, eid);
+    if (O.is_none[*expr.Expr](n_opt)) { ret id.EXPR_NIL; }
+    val node: *expr.Expr = O.unwrap[*expr.Expr](n_opt);
+    if (node.kind != expr.EXPR_KIND_CALL) { ret id.EXPR_NIL; }
+    if (node.data.call.args_len < 1)      { ret id.EXPR_NIL; }
+    ret a.expr_ids[node.data.call.args_start];
+}
+
+# whether `eid` is a `$type_of(arg)` intrinsic call, recognized
+# structurally by a `$`-rooted COMPTIME_IDENT callee spelled `type_of`. arity is
+# validated by sema, not here
+# ---
+# a:      the ast that owns `eid`
+# source: source text (for the callee span)
+# eid:    expression id to test
+# ret:    true when `eid` is a `$type_of(...)` call
+pub fun is_type_of_call(a: *ast.Ast, source: str, eid: id.ExprId) bool {
+    ret is_comptime_call(a, source, eid, "type_of");
 }
 
 # the single value-argument expression of a `$type_of(arg)` call, or
@@ -1239,13 +1308,7 @@ pub fun is_type_of_call(a: *ast.Ast, source: str, eid: id.ExprId) bool {
 # eid: a `$type_of(...)` call expression id
 # ret: the argument expression id, or EXPR_NIL
 pub fun type_of_arg(a: *ast.Ast, eid: id.ExprId) id.ExprId {
-    if (eid == id.EXPR_NIL) { ret id.EXPR_NIL; }
-    val n_opt: O.Option[*expr.Expr] = ast.get_expr(a, eid);
-    if (O.is_none[*expr.Expr](n_opt)) { ret id.EXPR_NIL; }
-    val node: *expr.Expr = O.unwrap[*expr.Expr](n_opt);
-    if (node.kind != expr.EXPR_KIND_CALL) { ret id.EXPR_NIL; }
-    if (node.data.call.args_len < 1)      { ret id.EXPR_NIL; }
-    ret a.expr_ids[node.data.call.args_start];
+    ret first_call_arg(a, eid);
 }
 
 # whether `eid` is a `$fields(T)` intrinsic call (#1473),
@@ -1256,18 +1319,7 @@ pub fun type_of_arg(a: *ast.Ast, eid: id.ExprId) id.ExprId {
 # eid:    expression id to test
 # ret:    true when `eid` is a `$fields(...)` call
 pub fun is_fields_call(a: *ast.Ast, source: str, eid: id.ExprId) bool {
-    if (eid == id.EXPR_NIL) { ret false; }
-    val n_opt: O.Option[*expr.Expr] = ast.get_expr(a, eid);
-    if (O.is_none[*expr.Expr](n_opt)) { ret false; }
-    val node: *expr.Expr = O.unwrap[*expr.Expr](n_opt);
-    if (node.kind != expr.EXPR_KIND_CALL) { ret false; }
-    val ce_opt: O.Option[*expr.Expr] = ast.get_expr(a, node.data.call.callee);
-    if (O.is_none[*expr.Expr](ce_opt)) { ret false; }
-    val ce: *expr.Expr = O.unwrap[*expr.Expr](ce_opt);
-    if (ce.kind != expr.EXPR_KIND_COMPTIME_IDENT) { ret false; }
-    val ns: token.Span = comptime_ident_name(ce.span);
-    if (ns.len == 0) { ret false; }
-    ret view_eq_str(span_text(source, ns), "fields");
+    ret is_comptime_call(a, source, eid, "fields");
 }
 
 # the single type-naming argument of a `$fields(T)` call, or
@@ -1277,13 +1329,44 @@ pub fun is_fields_call(a: *ast.Ast, source: str, eid: id.ExprId) bool {
 # eid: a `$fields(...)` call expression id
 # ret: the type-argument expression id, or EXPR_NIL
 pub fun fields_type_arg(a: *ast.Ast, eid: id.ExprId) id.ExprId {
-    if (eid == id.EXPR_NIL) { ret id.EXPR_NIL; }
-    val n_opt: O.Option[*expr.Expr] = ast.get_expr(a, eid);
-    if (O.is_none[*expr.Expr](n_opt)) { ret id.EXPR_NIL; }
-    val node: *expr.Expr = O.unwrap[*expr.Expr](n_opt);
-    if (node.kind != expr.EXPR_KIND_CALL) { ret id.EXPR_NIL; }
-    if (node.data.call.args_len < 1)      { ret id.EXPR_NIL; }
-    ret a.expr_ids[node.data.call.args_start];
+    ret first_call_arg(a, eid);
+}
+
+# the element-expression slice of a binding declaration's array-literal
+# initializer, used to unroll `$each x in ARR` over a constant array `val`
+# ---
+# elems_start: index into ast.expr_ids of the first element expression
+# elems_len:   number of element expressions
+pub rec ArrayLitInfo {
+    elems_start: u32;
+    elems_len:   u32;
+}
+
+# extracts the element slice of a binding declaration's array-literal initializer
+#
+# Consumed by the `$each x in ARR` constant-array unroll to walk the array's
+# elements. Returns none when the decl is not a binding or its initializer is not
+# a literal array (the caller reports the eligibility diagnostic).
+# ---
+# a:       the ast owning `decl_id`
+# decl_id: the binding declaration to inspect
+# ret:     some(info) for an array-literal-initialized binding; none otherwise
+pub fun decl_array_lit(a: *ast.Ast, decl_id: id.DeclId) O.Option[ArrayLitInfo] {
+    if (decl_id == id.DECL_NIL) { ret O.none[ArrayLitInfo](); }
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(a, decl_id);
+    if (O.is_none[*decl.Decl](d_opt)) { ret O.none[ArrayLitInfo](); }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+    if (d.kind != decl.DECL_KIND_VAL && d.kind != decl.DECL_KIND_VAR) { ret O.none[ArrayLitInfo](); }
+    val init: id.ExprId = d.data.bind.init;
+    if (init == id.EXPR_NIL) { ret O.none[ArrayLitInfo](); }
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(a, init);
+    if (O.is_none[*expr.Expr](e_opt)) { ret O.none[ArrayLitInfo](); }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
+    if (e.kind != expr.EXPR_KIND_ARRAY_LIT) { ret O.none[ArrayLitInfo](); }
+    var info: ArrayLitInfo;
+    info.elems_start = e.data.array_lit.elems_start;
+    info.elems_len   = e.data.array_lit.elems_len;
+    ret O.some[ArrayLitInfo](info);
 }
 
 # whether `eid` is a `$error(args)` compile-time directive call
@@ -1295,18 +1378,7 @@ pub fun fields_type_arg(a: *ast.Ast, eid: id.ExprId) id.ExprId {
 # eid:    expression id to test
 # ret:    true when `eid` is a `$error(...)` call
 pub fun is_error_call(a: *ast.Ast, source: str, eid: id.ExprId) bool {
-    if (eid == id.EXPR_NIL) { ret false; }
-    val n_opt: O.Option[*expr.Expr] = ast.get_expr(a, eid);
-    if (O.is_none[*expr.Expr](n_opt)) { ret false; }
-    val node: *expr.Expr = O.unwrap[*expr.Expr](n_opt);
-    if (node.kind != expr.EXPR_KIND_CALL) { ret false; }
-    val ce_opt: O.Option[*expr.Expr] = ast.get_expr(a, node.data.call.callee);
-    if (O.is_none[*expr.Expr](ce_opt)) { ret false; }
-    val ce: *expr.Expr = O.unwrap[*expr.Expr](ce_opt);
-    if (ce.kind != expr.EXPR_KIND_COMPTIME_IDENT) { ret false; }
-    val ns: token.Span = comptime_ident_name(ce.span);
-    if (ns.len == 0) { ret false; }
-    ret view_eq_str(span_text(source, ns), "error");
+    ret is_comptime_call(a, source, eid, "error");
 }
 
 # the folded message of a `$error("msg")` directive call (#1511).
@@ -1407,7 +1479,7 @@ pub fun is_field_descriptor_member(a: *ast.Ast, source: str, eid: id.ExprId) boo
     if (O.is_none[*expr.Expr](n_opt)) { ret false; }
     val node: *expr.Expr = O.unwrap[*expr.Expr](n_opt);
     if (node.kind != expr.EXPR_KIND_MEMBER) { ret false; }
-    val m: StrView = span_text(source, node.data.member.name);
+    val m: View = span_text(source, node.data.member.name);
     ret view_eq_str(m, "name") || view_eq_str(m, "type") || view_eq_str(m, "offset");
 }
 
@@ -1706,7 +1778,7 @@ fun eval_ident(
     span:     token.Span,
     interner: *intern.Interner
 ) R.Result[CTValue, str] {
-    val text: StrView = span_text(source, span);
+    val text: View = span_text(source, span);
     if (view_eq_str(text, "true"))  { ret bool_value(true); }
     if (view_eq_str(text, "false")) { ret bool_value(false); }
 
@@ -1756,7 +1828,7 @@ fun eval_field_member(
     val obj: CTValue = R.unwrap_ok[CTValue, str](obj_r);
     if (obj.kind != CT_KIND_FIELD) { ret O.none[R.Result[CTValue, str]](); }
 
-    val mtext: StrView = span_text(source, member_span);
+    val mtext: View = span_text(source, member_span);
     var sel: u8 = FIELD_SEL_NAME;
     if      (view_eq_str(mtext, "name"))   { sel = FIELD_SEL_NAME; }
     or      (view_eq_str(mtext, "type"))   { sel = FIELD_SEL_TYPE; }
@@ -1770,6 +1842,56 @@ fun eval_field_member(
     val o: O.Option[CTValue] = R.unwrap_ok[O.Option[CTValue], str](r);
     if (O.is_none[CTValue](o)) { ret O.some[R.Result[CTValue, str]](R.err[CTValue, str](COMPTIME_FIELD_UNAVAILABLE_MSG)); }
     ret O.some[R.Result[CTValue, str]](R.ok[CTValue, str](O.unwrap[CTValue](o)));
+}
+
+# folds `x.field` where `x` is a `$each x in ARR` loop variable bound to a record
+# element. returns none when `object` is not such a loop variable, or the element
+# is not a struct literal, or names no matching field - so the MEMBER dispatch
+# falls through to the field-descriptor / module-member paths, leaving an ordinary
+# member access untouched. some(...) carries the folded field value, or the error
+# from evaluating a non-constant field initializer
+fun eval_const_elem_member(
+    c:           *ComptimeCtx,
+    a:           *ast.Ast,
+    source:      str,
+    object_eid:  id.ExprId,
+    member_span: token.Span,
+    interner:    *intern.Interner
+) O.Option[R.Result[CTValue, str]] {
+    val obj_opt: O.Option[*expr.Expr] = ast.get_expr(a, object_eid);
+    if (O.is_none[*expr.Expr](obj_opt))                                       { ret O.none[R.Result[CTValue, str]](); }
+    val obj: *expr.Expr = O.unwrap[*expr.Expr](obj_opt);
+    if (obj.kind != expr.EXPR_KIND_IDENT)                                     { ret O.none[R.Result[CTValue, str]](); }
+
+    val obj_r: R.Result[CTValue, str] = eval_ident(c, source, obj.span, interner);
+    if (R.is_err[CTValue, str](obj_r))                                        { ret O.none[R.Result[CTValue, str]](); }
+    val ov: CTValue = R.unwrap_ok[CTValue, str](obj_r);
+    if (ov.kind != CT_KIND_CONST_ELEM)                                        { ret O.none[R.Result[CTValue, str]](); }
+
+    # a record element is a struct literal; a scalar element has no fields to
+    # project, so `x.field` on one falls through (sema rejects it as a type error).
+    val el_opt: O.Option[*expr.Expr] = ast.get_expr(a, ov.data.celem.elem::id.ExprId);
+    if (O.is_none[*expr.Expr](el_opt))                                        { ret O.none[R.Result[CTValue, str]](); }
+    val el: *expr.Expr = O.unwrap[*expr.Expr](el_opt);
+    if (el.kind != expr.EXPR_KIND_STRUCT_LIT)                                 { ret O.none[R.Result[CTValue, str]](); }
+
+    val mname_r: R.Result[intern.StrId, str] = intern.intern_span(interner, source, member_span);
+    if (R.is_err[intern.StrId, str](mname_r)) { ret O.some[R.Result[CTValue, str]](R.err[CTValue, str](R.unwrap_err[intern.StrId, str](mname_r))); }
+    val mname: intern.StrId = R.unwrap_ok[intern.StrId, str](mname_r);
+
+    var i: u32 = 0;
+    for (i < el.data.struct_lit.fields_len) {
+        val pool_ix: usize = (el.data.struct_lit.fields_start + i)::usize;
+        if (pool_ix >= a.field_init_len)                                      { ret O.none[R.Result[CTValue, str]](); }
+        val fi: *expr.FieldInit = ?a.field_inits[pool_ix];
+        val fname_r: R.Result[intern.StrId, str] = intern.intern_span(interner, source, fi.name);
+        if (R.is_err[intern.StrId, str](fname_r)) { ret O.some[R.Result[CTValue, str]](R.err[CTValue, str](R.unwrap_err[intern.StrId, str](fname_r))); }
+        if (R.unwrap_ok[intern.StrId, str](fname_r) == mname) {
+            ret O.some[R.Result[CTValue, str]](eval(c, a, source, fi.value, interner));
+        }
+        i = i + 1;
+    }
+    ret O.none[R.Result[CTValue, str]]();
 }
 
 # reports whether `e` is a comptime path expression: a bare COMPTIME_IDENT
@@ -1844,7 +1966,7 @@ fun eval_path(
 # `$project.target.*` (the legacy top-level target root was removed in v2.0.0)
 fun resolve_comptime_path(c: *ComptimeCtx, source: str, stack: *token.Span, depth: u32, interner: *intern.Interner) R.Result[CTValue, str] {
     if (depth == 0) { ret R.err[CTValue, str]("empty comptime path"); }
-    val root: StrView = span_text(source, stack[depth - 1]);
+    val root: View = span_text(source, stack[depth - 1]);
     if (view_eq_str(root, "mach"))    { ret resolve_mach_path(c, source, stack, depth, interner); }
     if (view_eq_str(root, "project")) { ret resolve_project_path(c, source, stack, depth, interner); }
     if (view_eq_str(root, "bin"))     { ret resolve_bin_path(c, source, stack, depth); }
@@ -1942,8 +2064,8 @@ pub fun comptime_ident_name(full: token.Span) token.Span {
 #     int compare. the canonical spelling for active-build facts. `mode` is the
 #     active optimization pipeline (debug/release).
 #   $mach.os.{linux,darwin,windows,freestanding} - os tag values.
-#   $mach.arch.{x86_64,aarch64} - arch tag values.
-#   $mach.abi.{sysv,win64,aapcs64} - abi tag values, same numeric space as
+#   $mach.arch.{x86_64,aarch64,riscv64} - arch tag values.
+#   $mach.abi.{sysv,win64,aapcs64,lp64} - abi tag values, same numeric space as
 #     $mach.build.abi.
 #   $mach.project.{name,version,root} - legacy project metadata stubs ($project.*
 #     is the canonical top-level root).
@@ -1977,14 +2099,14 @@ fun resolve_mach_path(c: *ComptimeCtx, source: str, stack: *token.Span, depth: u
     # silent fold to OS_UNKNOWN (a typo'd tag must not quietly compare against a
     # real target).
     if (depth == 3 && seg_is(source, stack, 1, "os")) {
-        val name: StrView = span_text(source, stack[0]);
+        val name: View = span_text(source, stack[0]);
         val r: R.Result[u32, str] = os_tag_for(name);
         if (R.is_err[u32, str](r)) { ret R.err[CTValue, str](R.unwrap_err[u32, str](r)); }
         ret int_value(R.unwrap_ok[u32, str](r)::i64);
     }
     # $mach.arch.<name> - arch tag value; unrecognized names error likewise.
     if (depth == 3 && seg_is(source, stack, 1, "arch")) {
-        val name: StrView = span_text(source, stack[0]);
+        val name: View = span_text(source, stack[0]);
         val r: R.Result[u32, str] = arch_tag_for(name);
         if (R.is_err[u32, str](r)) { ret R.err[CTValue, str](R.unwrap_err[u32, str](r)); }
         ret int_value(R.unwrap_ok[u32, str](r)::i64);
@@ -1993,7 +2115,7 @@ fun resolve_mach_path(c: *ComptimeCtx, source: str, stack: *token.Span, depth: u
     # $mach.build.abi so `$mach.build.abi == $mach.abi.sysv` is an int compare;
     # unrecognized names error likewise.
     if (depth == 3 && seg_is(source, stack, 1, "abi")) {
-        val name: StrView = span_text(source, stack[0]);
+        val name: View = span_text(source, stack[0]);
         val r: R.Result[u32, str] = abi_tag_for(name);
         if (R.is_err[u32, str](r)) { ret R.err[CTValue, str](R.unwrap_err[u32, str](r)); }
         ret int_value(R.unwrap_ok[u32, str](r)::i64);
@@ -2001,7 +2123,7 @@ fun resolve_mach_path(c: *ComptimeCtx, source: str, stack: *token.Span, depth: u
     # $mach.mode.<name> - mode tag value (debug/release), same numeric space as
     # $mach.build.mode; unrecognized names error likewise.
     if (depth == 3 && seg_is(source, stack, 1, "mode")) {
-        val name: StrView = span_text(source, stack[0]);
+        val name: View = span_text(source, stack[0]);
         val r: R.Result[u32, str] = mode_tag_for(name);
         if (R.is_err[u32, str](r)) { ret R.err[CTValue, str](R.unwrap_err[u32, str](r)); }
         ret int_value(R.unwrap_ok[u32, str](r)::i64);
@@ -2083,14 +2205,14 @@ fun resolve_mach_path(c: *ComptimeCtx, source: str, stack: *token.Span, depth: u
 # compares the segment at `idx` (0 = leaf, depth - 1 = root) against `expected`
 fun seg_is(source: str, stack: *token.Span, idx: u32, expected: str) bool {
     val span: token.Span = stack[idx];
-    val text: StrView = span_text(source, span);
+    val text: View = span_text(source, span);
     ret view_eq_str(text, expected);
 }
 
 # maps an `$mach.os.<name>` tag to its numeric os id (os.OS_*). the tag list is
 # closed: `freestanding` has its own id distinct from the unknown sentinel, and
 # an unrecognized name is an error rather than a fold to OS_UNKNOWN
-fun os_tag_for(name: StrView) R.Result[u32, str] {
+fun os_tag_for(name: View) R.Result[u32, str] {
     if (view_eq_str(name, "linux"))        { ret R.ok[u32, str](os.OS_LINUX); }
     if (view_eq_str(name, "darwin"))       { ret R.ok[u32, str](os.OS_DARWIN); }
     if (view_eq_str(name, "windows"))      { ret R.ok[u32, str](os.OS_WINDOWS); }
@@ -2100,7 +2222,7 @@ fun os_tag_for(name: StrView) R.Result[u32, str] {
 
 # maps an `$mach.arch.<name>` tag to its numeric arch id (isa.ARCH_*). closed
 # list; an unrecognized name is an error rather than a fold to ARCH_UNKNOWN
-fun arch_tag_for(name: StrView) R.Result[u32, str] {
+fun arch_tag_for(name: View) R.Result[u32, str] {
     if (view_eq_str(name, "x86_64"))  { ret R.ok[u32, str](isa.ARCH_X86_64); }
     if (view_eq_str(name, "aarch64")) { ret R.ok[u32, str](isa.ARCH_AARCH64); }
     if (view_eq_str(name, "riscv64")) { ret R.ok[u32, str](isa.ARCH_RISCV64); }
@@ -2111,7 +2233,7 @@ fun arch_tag_for(name: StrView) R.Result[u32, str] {
 # are the canonical convention names (matching each AbiVTable's name), distinct
 # from the manifest tuple's declared abi spelling read by `$project.target.abi`. closed
 # list; an unrecognized name is an error rather than a fold to ABI_UNKNOWN
-fun abi_tag_for(name: StrView) R.Result[u32, str] {
+fun abi_tag_for(name: View) R.Result[u32, str] {
     if (view_eq_str(name, "sysv"))    { ret R.ok[u32, str](abi.ABI_SYSV); }
     if (view_eq_str(name, "win64"))   { ret R.ok[u32, str](abi.ABI_WIN64); }
     if (view_eq_str(name, "aapcs64")) { ret R.ok[u32, str](abi.ABI_AAPCS64); }
@@ -2128,7 +2250,7 @@ pub val MODE_RELEASE: u32 = 1;
 
 # maps an `$mach.mode.<name>` tag to its mode id; the active build's value reads
 # from `$mach.build.mode`. closed list; an unrecognized name is an error
-fun mode_tag_for(name: StrView) R.Result[u32, str] {
+fun mode_tag_for(name: View) R.Result[u32, str] {
     if (view_eq_str(name, "debug"))   { ret R.ok[u32, str](MODE_DEBUG); }
     if (view_eq_str(name, "release")) { ret R.ok[u32, str](MODE_RELEASE); }
     ret R.err[u32, str]("unknown `$mach.mode.*` tag");
@@ -2266,6 +2388,23 @@ pub fun pack_elem_value(index: u32, ty: u32) CTValue {
     ret v;
 }
 
+# a comptime CONSTANT-ARRAY-ELEMENT descriptor naming one element of a
+# comptime-constant array `val`
+#
+# Bound to the `$each x in ARR` loop variable; sema reads `.ty` to type the loop
+# variable, the evaluator re-evaluates `.elem` to fold `x` and `x.field`.
+# ---
+# elem: ExprId of the element's initializer expression in the current module's ast
+# ty:   the element's concrete sema TypeId
+# ret:  a CT_KIND_CONST_ELEM value
+pub fun const_elem_value(elem: u32, ty: u32) CTValue {
+    var v: CTValue;
+    v.kind             = CT_KIND_CONST_ELEM;
+    v.data.celem.elem = elem;
+    v.data.celem.ty   = ty;
+    ret v;
+}
+
 # a comptime string value over an interned StrId
 #
 # Used by the field resolver to build a `f.name` projection (#1473).
@@ -2345,8 +2484,8 @@ test "mach.lang.fe.comptime.eval_lit_int:hex_overflow_rejected" {
     ret 0;
 }
 
-# helper: a full-length StrView over a literal, for the tag-name lookups.
-fun t_view(s: str) StrView {
+# helper: a full-length View over a literal, for the tag-name lookups.
+fun t_view(s: str) View {
     ret view(?s[0], str_len(s));
 }
 

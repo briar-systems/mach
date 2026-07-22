@@ -1,0 +1,370 @@
+# SPIR-V type and constant deduplication
+#
+# SPIR-V requires every scalar / pointer / function type and every constant to be
+# a single, structurally-unique definition in the module's types-and-constants
+# section. This module owns a `TypeTable` that memoizes each request against the
+# builder: the first time a type or constant is asked for it allocates an id,
+# emits the defining instruction into the builder's `types_consts` section, and
+# caches the id; every later request for the same shape returns the cached id. The
+# emitter reasons in MIR widths and op signedness and asks here for the concrete
+# SPIR-V ids.
+#
+# SPIR-V integer types are sign-less: signedness rides the operation (OpSDiv vs
+# OpUDiv), so a width maps to exactly one `OpTypeInt <bits> 0` and the emitter
+# never mints a signed / unsigned pair.
+
+use std.allocator.page;
+use std.collections.vector;
+use std.collections.vector.Vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.target.isa.spirv;
+
+# a memoized scalar / pointer type. `tag` selects which cache role the entry
+# fills; `a` / `b` carry the shape (int/float bits, or pointer storage class /
+# pointee id); `id` is the allocated SPIR-V type id
+# ---
+# tag: one of TAG_*
+# a:   int/float bit width, or pointer storage class
+# b:   pointer pointee type id (0 for scalars)
+# id:  the allocated SPIR-V type id
+rec ScalarKey {
+    tag: u8;
+    a:   u32;
+    b:   u32;
+    id:  u32;
+}
+
+# a memoized constant: its result type id, the two value words (the high word is 0
+# for values <= 32 bits), and the allocated id
+# ---
+# type_id: the constant's SPIR-V type id
+# lo:      low 32 value bits
+# hi:      high 32 value bits (0 for <= 32-bit constants)
+# id:      the allocated SPIR-V constant id
+rec ConstKey {
+    type_id: u32;
+    lo:      u32;
+    hi:      u32;
+    id:      u32;
+}
+
+# a memoized function type: its return type id and the borrowed-then-copied param
+# type id list
+# ---
+# ret_id:      return type id
+# params:      owned copy of the param type ids
+# param_count: number of params
+# id:          the allocated SPIR-V function type id
+rec FnKey {
+    ret_id:      u32;
+    params:      *u32;
+    param_count: u32;
+    id:          u32;
+}
+
+# tags distinguishing the scalar-cache roles
+val TAG_INT:   u8 = 0;  # OpTypeInt (signedness 0), `a` = bit width
+val TAG_FLOAT: u8 = 1;  # OpTypeFloat, `a` = bit width
+val TAG_BOOL:  u8 = 2;  # OpTypeBool
+val TAG_VOID:  u8 = 3;  # OpTypeVoid
+val TAG_PTR:   u8 = 4;  # OpTypePointer, `a` = storage class, `b` = pointee id
+
+# the per-module type / constant memoization table
+#
+# Threads the builder so a cache miss can allocate an id and emit the defining
+# instruction. Every cache is a linear vector - a compiled function names only a
+# handful of distinct types and constants, so a scan is cheaper than a hash.
+# ---
+# b:       the module builder the ids are allocated from and instructions emitted into
+# scalars: memoized scalar / pointer types
+# consts:  memoized constants
+# fns:     memoized function types
+pub rec TypeTable {
+    b:       *spirv.Builder;
+    scalars: Vector[ScalarKey];
+    consts:  Vector[ConstKey];
+    fns:     Vector[FnKey];
+}
+
+# construct an empty type table over a builder
+# ---
+# b:   the module builder to allocate ids from and emit into
+# ret: an initialized TypeTable
+pub fun types_init(b: *spirv.Builder) TypeTable {
+    var tt: TypeTable;
+    tt.b       = b;
+    tt.scalars = vector.init[ScalarKey](b.alloc);
+    tt.consts  = vector.init[ConstKey](b.alloc);
+    tt.fns     = vector.init[FnKey](b.alloc);
+    ret tt;
+}
+
+# release every cache the type table owns, including each function type's param copy
+# ---
+# tt: the table to tear down
+pub fun types_dnit(tt: *TypeTable) {
+    var i: usize = 0;
+    for (i < tt.fns.len) {
+        val fk: *FnKey = ?tt.fns.data[i];
+        if (fk.params != nil && fk.param_count > 0) {
+            A.deallocate[u32](tt.b.alloc, fk.params, fk.param_count::usize);
+        }
+        i = i + 1;
+    }
+    vector.dnit[ScalarKey](?tt.scalars);
+    vector.dnit[ConstKey](?tt.consts);
+    vector.dnit[FnKey](?tt.fns);
+}
+
+# find a cached scalar / pointer id by shape, or 0 when absent
+# ---
+# tt:  the table to search
+# tag: the cache role
+# a:   the shape's first key
+# b:   the shape's second key (pointer pointee, else 0)
+# ret: the cached id, or 0
+fun scalar_find(tt: *TypeTable, tag: u8, a: u32, b: u32) u32 {
+    var i: usize = 0;
+    for (i < tt.scalars.len) {
+        val k: *ScalarKey = ?tt.scalars.data[i];
+        if (k.tag == tag && k.a == a && k.b == b) { ret k.id; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# cache a freshly emitted scalar / pointer id under its shape
+# ---
+# tt:  the table
+# tag: the cache role
+# a:   the shape's first key
+# b:   the shape's second key
+# id:  the allocated id
+fun scalar_put(tt: *TypeTable, tag: u8, a: u32, b: u32, id: u32) {
+    var k: ScalarKey;
+    k.tag = tag; k.a = a; k.b = b; k.id = id;
+    vector.push[ScalarKey](?tt.scalars, k);
+}
+
+# the id of the sign-less integer type of `bits` width, emitting it on first use
+# ---
+# tt:   the table
+# bits: the integer width in bits (8, 16, 32, 64)
+# ret:  the OpTypeInt id
+pub fun type_int(tt: *TypeTable, bits: u32) u32 {
+    val hit: u32 = scalar_find(tt, TAG_INT, bits, 0);
+    if (hit != 0) { ret hit; }
+    if (bits == 8)  { tt.b.caps_needed = tt.b.caps_needed | spirv.NEED_INT8; }
+    if (bits == 16) { tt.b.caps_needed = tt.b.caps_needed | spirv.NEED_INT16; }
+    if (bits == 64) { tt.b.caps_needed = tt.b.caps_needed | spirv.NEED_INT64; }
+    val id: u32 = spirv.alloc_id(tt.b);
+    var ops: [3]u32;
+    ops[0] = id; ops[1] = bits; ops[2] = 0;  # signedness 0: sign-less
+    spirv.inst(tt.b, ?tt.b.types_consts, spirv.OP_TYPE_INT, ?ops[0], 3);
+    scalar_put(tt, TAG_INT, bits, 0, id);
+    ret id;
+}
+
+# the id of the floating-point type of `bits` width, emitting it on first use
+# ---
+# tt:   the table
+# bits: the float width in bits (32, 64)
+# ret:  the OpTypeFloat id
+pub fun type_float(tt: *TypeTable, bits: u32) u32 {
+    val hit: u32 = scalar_find(tt, TAG_FLOAT, bits, 0);
+    if (hit != 0) { ret hit; }
+    if (bits == 16) { tt.b.caps_needed = tt.b.caps_needed | spirv.NEED_FLOAT16; }
+    if (bits == 64) { tt.b.caps_needed = tt.b.caps_needed | spirv.NEED_FLOAT64; }
+    val id: u32 = spirv.alloc_id(tt.b);
+    var ops: [2]u32;
+    ops[0] = id; ops[1] = bits;
+    spirv.inst(tt.b, ?tt.b.types_consts, spirv.OP_TYPE_FLOAT, ?ops[0], 2);
+    scalar_put(tt, TAG_FLOAT, bits, 0, id);
+    ret id;
+}
+
+# the id of the boolean type, emitting it on first use
+# ---
+# tt:  the table
+# ret: the OpTypeBool id
+pub fun type_bool(tt: *TypeTable) u32 {
+    val hit: u32 = scalar_find(tt, TAG_BOOL, 0, 0);
+    if (hit != 0) { ret hit; }
+    val id: u32 = spirv.alloc_id(tt.b);
+    var ops: [1]u32;
+    ops[0] = id;
+    spirv.inst(tt.b, ?tt.b.types_consts, spirv.OP_TYPE_BOOL, ?ops[0], 1);
+    scalar_put(tt, TAG_BOOL, 0, 0, id);
+    ret id;
+}
+
+# the id of the void type, emitting it on first use
+# ---
+# tt:  the table
+# ret: the OpTypeVoid id
+pub fun type_void(tt: *TypeTable) u32 {
+    val hit: u32 = scalar_find(tt, TAG_VOID, 0, 0);
+    if (hit != 0) { ret hit; }
+    val id: u32 = spirv.alloc_id(tt.b);
+    var ops: [1]u32;
+    ops[0] = id;
+    spirv.inst(tt.b, ?tt.b.types_consts, spirv.OP_TYPE_VOID, ?ops[0], 1);
+    scalar_put(tt, TAG_VOID, 0, 0, id);
+    ret id;
+}
+
+# the id of the pointer type `storage`-class to `pointee`, emitting it on first use
+# ---
+# tt:      the table
+# storage: the SPIR-V storage class (spirv.STORAGE_*)
+# pointee: the pointed-to type id
+# ret:     the OpTypePointer id
+pub fun type_ptr(tt: *TypeTable, storage: u32, pointee: u32) u32 {
+    val hit: u32 = scalar_find(tt, TAG_PTR, storage, pointee);
+    if (hit != 0) { ret hit; }
+    val id: u32 = spirv.alloc_id(tt.b);
+    var ops: [3]u32;
+    ops[0] = id; ops[1] = storage; ops[2] = pointee;
+    spirv.inst(tt.b, ?tt.b.types_consts, spirv.OP_TYPE_POINTER, ?ops[0], 3);
+    scalar_put(tt, TAG_PTR, storage, pointee, id);
+    ret id;
+}
+
+# the id of the function type `ret_id (params...)`, emitting it on first use
+#
+# Deduplicates by return id plus an exact param-id-sequence match, so two
+# signatures with the same shape share one OpTypeFunction.
+# ---
+# tt:     the table
+# ret_id: the return type id
+# params: the param type ids, or nil when n is 0
+# n:      number of params
+# ret:    the OpTypeFunction id, or 0 on an allocation error
+pub fun type_fn(tt: *TypeTable, ret_id: u32, params: *u32, n: u32) u32 {
+    var i: usize = 0;
+    for (i < tt.fns.len) {
+        val k: *FnKey = ?tt.fns.data[i];
+        if (k.ret_id == ret_id && k.param_count == n && params_equal(k.params, params, n)) {
+            ret k.id;
+        }
+        i = i + 1;
+    }
+
+    val id: u32 = spirv.alloc_id(tt.b);
+    # OpTypeFunction operands: result id, return type, then each param type.
+    var ops: [16]u32;
+    if (n + 2 > 16) { ret 0; }  # milestone caps a signature at 14 params
+    ops[0] = id; ops[1] = ret_id;
+    var pi: u32 = 0;
+    for (pi < n) { ops[2 + pi] = params[pi]; pi = pi + 1; }
+    spirv.inst(tt.b, ?tt.b.types_consts, spirv.OP_TYPE_FUNCTION, ?ops[0], n + 2);
+
+    # cache an owned copy of the param ids for future structural comparison.
+    var copy: *u32 = nil;
+    if (n > 0) {
+        val rc: R.Result[*u32, str] = A.allocate[u32](tt.b.alloc, n::usize);
+        if (R.is_err[*u32, str](rc)) { tt.b.err = true; ret id; }
+        copy = R.unwrap_ok[*u32, str](rc);
+        var ci: u32 = 0;
+        for (ci < n) { copy[ci] = params[ci]; ci = ci + 1; }
+    }
+    var fk: FnKey;
+    fk.ret_id = ret_id; fk.params = copy; fk.param_count = n; fk.id = id;
+    vector.push[FnKey](?tt.fns, fk);
+    ret id;
+}
+
+# whether two param-id sequences of length `n` are element-wise equal
+# ---
+# a: first sequence (may be nil when n is 0)
+# b: second sequence (may be nil when n is 0)
+# n: length
+# ret: true when equal
+fun params_equal(a: *u32, b: *u32, n: u32) bool {
+    var i: u32 = 0;
+    for (i < n) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the id of the integer constant `value` at `bits` width, emitting it on first use
+#
+# The value's low (and, for 64-bit, high) word is the OpConstant literal; the
+# comparison key folds the two words with the type so structurally-equal constants
+# share one id.
+# ---
+# tt:    the table
+# bits:  the integer width in bits (8, 16, 32, 64)
+# value: the constant value (its two's-complement bit pattern for negatives)
+# ret:   the OpConstant id
+pub fun const_int(tt: *TypeTable, bits: u32, value: i64) u32 {
+    val type_id: u32 = type_int(tt, bits);
+    val bitsv: u64 = value::u64;
+    val lo: u32 = (bitsv & 0xFFFFFFFF)::u32;
+    var hi: u32 = 0;
+    val wide: bool = bits > 32;
+    if (wide) { hi = ((bitsv >> 32) & 0xFFFFFFFF)::u32; }
+
+    var i: usize = 0;
+    for (i < tt.consts.len) {
+        val k: *ConstKey = ?tt.consts.data[i];
+        if (k.type_id == type_id && k.lo == lo && k.hi == hi) { ret k.id; }
+        i = i + 1;
+    }
+
+    val id: u32 = spirv.alloc_id(tt.b);
+    if (wide) {
+        var ops: [4]u32;
+        ops[0] = type_id; ops[1] = id; ops[2] = lo; ops[3] = hi;
+        spirv.inst(tt.b, ?tt.b.types_consts, spirv.OP_CONSTANT, ?ops[0], 4);
+    }
+    or {
+        var ops: [3]u32;
+        ops[0] = type_id; ops[1] = id; ops[2] = lo;
+        spirv.inst(tt.b, ?tt.b.types_consts, spirv.OP_CONSTANT, ?ops[0], 3);
+    }
+
+    var k: ConstKey;
+    k.type_id = type_id; k.lo = lo; k.hi = hi; k.id = id;
+    vector.push[ConstKey](?tt.consts, k);
+    ret id;
+}
+
+test "mach.lang.target.isa.spirv.types:dedup" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var b: spirv.Builder = spirv.builder_init(?alloc);
+    var tt: TypeTable = types_init(?b);
+
+    # a repeated width returns the same id and emits one OpTypeInt.
+    val i32a: u32 = type_int(?tt, 32);
+    val i32b: u32 = type_int(?tt, 32);
+    if (i32a != i32b) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+    if (tt.scalars.len != 1) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+
+    # a different width mints a new id.
+    val i64a: u32 = type_int(?tt, 64);
+    if (i64a == i32a) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+
+    # constants dedup by (type, value).
+    val c1: u32 = const_int(?tt, 32, 7);
+    val c2: u32 = const_int(?tt, 32, 7);
+    val c3: u32 = const_int(?tt, 32, 8);
+    if (c1 != c2) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+    if (c1 == c3) { types_dnit(?tt); spirv.builder_dnit(?b); ret 1; }
+
+    types_dnit(?tt);
+    spirv.builder_dnit(?b);
+    ret 0;
+}

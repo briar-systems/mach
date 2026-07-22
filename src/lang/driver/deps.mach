@@ -1,0 +1,661 @@
+# dependency resolution: the manifest dep closure, cascade link inputs, and steps
+#
+# Resolves the project's declared `[dep.*]` entries and their transitive closure
+# into the ProjectConfig's DepEntry array (naming any project-id collision with
+# its conflicting sources, refs, and requirer chains), collects the transitive
+# link inputs whose declared target tuple matches the selected target, and
+# parses each dep's own mach.toml. Sits above the load walk it borrows path and
+# diagnostic helpers from, below the config layer that drives it.
+
+use std.data.toml;
+use fs: std.filesystem;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.intern;
+use mach.lang.manifest;
+use mach.lang.session;
+
+use mach.lang.driver.project;
+use mach.lang.driver.load;
+
+# whether `<root>/<src_dir>/<module_rel>` is an existing file
+fun module_file_present(alloc: *A.Allocator, root: str, src_dir: str, module_rel: str) bool {
+    val a: R.Result[str, str] = load.join_path(alloc, root, src_dir);
+    if (R.is_err[str, str](a)) { ret false; }
+    val mid: str = R.unwrap_ok[str, str](a);
+    val b: R.Result[str, str] = load.join_path(alloc, mid, module_rel);
+    str_free(alloc, mid);
+    if (R.is_err[str, str](b)) { ret false; }
+    val full: str = R.unwrap_ok[str, str](b);
+    val ok_: bool = fs.is_file(full);
+    str_free(alloc, full);
+    ret ok_;
+}
+
+# the provenance of one registered dep, tracked parallel to the resolved DepEntry array
+# so a project-id collision in the closure can name the conflicting sources, refs, and
+# requirer chains rather than silently deduping the loser (#1968).
+# ---
+# source: interned source label ("git <url>" / "path <path>") the requirer declared
+# ref:    interned declared ref, STR_NIL when omitted
+# chain:  interned requirer chain ("<root> -> a -> b") ending at this dep's alias
+rec DepProvenance {
+    source: intern.StrId;
+    ref:    intern.StrId;
+    chain:  intern.StrId;
+}
+
+# a re-encountered project id unifies with its prior registration only when both the
+# declared source and ref match exactly; any difference is a hard conflict. the model
+# is exact-ref with no version reconciliation (#1964), so the two legitimate diamonds
+# (same git url+ref, same path) unify and everything else is reported.
+pub fun dep_id_conflicts(existing_source: intern.StrId, existing_ref: intern.StrId,
+                     new_source: intern.StrId, new_ref: intern.StrId) bool {
+    if (existing_source == new_source && existing_ref == new_ref) { ret false; }
+    ret true;
+}
+
+# the text of an interned id, or `default` when the id is STR_NIL or unrecorded.
+fun id_text_or(s: *session.Session, id: intern.StrId, default: str) str {
+    if (id == intern.STR_NIL) { ret default; }
+    val o: O.Option[str] = intern.lookup(?s.interner, id);
+    if (O.is_some[str](o)) { ret O.unwrap[str](o); }
+    ret default;
+}
+
+# a dep's declared source as an interned identity+display label: "git <url>" for a git
+# source, "path <path>" for a path source, else "<unknown source>". identity is a StrId
+# compare, so the scheme prefix keeps a git url and an identical path string distinct.
+fun dep_source_label(s: *session.Session, d: *manifest.DepDef) intern.StrId {
+    if (d.git != intern.STR_NIL) {
+        val u: O.Option[str] = intern.lookup(?s.interner, d.git);
+        if (O.is_some[str](u)) { ret project.intern_unwrap(?s.interner, load.diag_join3(s, "git ", O.unwrap[str](u), "", "git")); }
+    }
+    if (d.path != intern.STR_NIL) {
+        val pth: O.Option[str] = intern.lookup(?s.interner, d.path);
+        if (O.is_some[str](pth)) { ret project.intern_unwrap(?s.interner, load.diag_join3(s, "path ", O.unwrap[str](pth), "", "path")); }
+    }
+    ret project.intern_unwrap(?s.interner, "<unknown source>");
+}
+
+# one "<chain> pins <source>[ @ <ref>]" line of a conflict diagnostic.
+fun dep_conflict_edge(s: *session.Session, chain: str, source: str, ref: str) str {
+    val base: str = load.diag_join3(s, chain, " pins ", source, chain);
+    if (str_empty(ref)) { ret base; }
+    ret load.diag_join3(s, base, " @ ", ref, base);
+}
+
+# render the dependency-conflict diagnostic for one project id reached two incompatible
+# ways: names both full requirer chains and the source/ref each pins, so the fix (fork
+# or upstream) is actionable from the message alone (#1968).
+fun dep_conflict_msg(s: *session.Session, project_id: str,
+                     chain_a: str, source_a: str, ref_a: str,
+                     chain_b: str, source_b: str, ref_b: str) str {
+    val head: str = load.diag_join3(s, "dependency conflict: project id '", project_id,
+        "' is required from two incompatible sources:", "dependency conflict: incompatible sources for one project id");
+    val la: str = dep_conflict_edge(s, chain_a, source_a, ref_a);
+    val lb: str = dep_conflict_edge(s, chain_b, source_b, ref_b);
+    val p1: str = load.diag_join3(s, head, "\n    ", la, head);
+    val p2: str = load.diag_join3(s, p1, "\n    ", lb, p1);
+    ret load.diag_join3(s, p2, "\n    ",
+        "fork or upstream to reconcile; one project id must resolve to a single source and ref (no version remapping)", p2);
+}
+
+fun resolve_deps_recursive(p: *project.Project, current_root: str, dep_names: *manifest.DepDef, dep_name_count: u32,
+                           deps: *project.DepEntry, prov: *DepProvenance, dep_count_ptr: *u32, max_deps: usize,
+                           dir_dep: str, requirer_chain: str) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < dep_name_count) {
+        val alias_opt: O.Option[str] = intern.lookup(?p.s.interner, dep_names[i].name);
+        if (O.is_none[str](alias_opt)) { ret R.err[bool, str]("dep alias StrId not interned"); }
+        val alias: str = O.unwrap[str](alias_opt);
+
+        val rd: R.Result[project.DepEntry, str] = resolve_dep(p.s, alias, current_root, dir_dep);
+        if (R.is_err[project.DepEntry, str](rd)) { ret R.err[bool, str](R.unwrap_err[project.DepEntry, str](rd)); }
+        val entry: project.DepEntry = R.unwrap_ok[project.DepEntry, str](rd);
+
+        # this dep's declared provenance: its source label, its ref, and the requirer
+        # chain reaching it, so a project-id collision names who required what from where.
+        val src_id: intern.StrId = dep_source_label(p.s, ?dep_names[i]);
+        val ref_id: intern.StrId = dep_names[i].ref;
+        val chain_here: str = load.diag_join3(p.s, requirer_chain, " -> ", alias, alias);
+
+        var exists: bool = false;
+        var j: u32 = 0;
+        for (j < dep_count_ptr[0]) {
+            if (deps[j].project_id == entry.project_id) {
+                if (dep_id_conflicts(prov[j].source, prov[j].ref, src_id, ref_id)) {
+                    val pid: str = id_text_or(p.s, entry.project_id, "?");
+                    ret R.err[bool, str](dep_conflict_msg(p.s, pid,
+                        id_text_or(p.s, prov[j].chain, requirer_chain),
+                        id_text_or(p.s, prov[j].source, "<unknown source>"),
+                        id_text_or(p.s, prov[j].ref, ""),
+                        chain_here,
+                        id_text_or(p.s, src_id, "<unknown source>"),
+                        id_text_or(p.s, ref_id, "")));
+                }
+                exists = true;
+            }
+            j = j + 1;
+        }
+
+        if (!exists) {
+            if (dep_count_ptr[0] >= max_deps::u32) {
+                ret R.err[bool, str]("exceeded maximum dependency limit of 128");
+            }
+            val idx: u32 = dep_count_ptr[0];
+            deps[idx] = entry;
+            prov[idx].source = src_id;
+            prov[idx].ref    = ref_id;
+            prov[idx].chain  = project.intern_unwrap(?p.s.interner, chain_here);
+            dep_count_ptr[0] = dep_count_ptr[0] + 1;
+
+            val dep_root_opt: O.Option[str] = intern.lookup(?p.s.interner, entry.vendor_root);
+            if (O.is_some[str](dep_root_opt)) {
+                val dep_root: str = O.unwrap[str](dep_root_opt);
+                
+                val toml_path_r: R.Result[str, str] = load.join_path(p.alloc, dep_root, manifest.MANIFEST_FILE);
+                if (R.is_ok[str, str](toml_path_r)) {
+                    val toml_path: str = R.unwrap_ok[str, str](toml_path_r);
+                    val tr: R.Result[toml.Table, str] = parse_toml_file(p.alloc, toml_path);
+                    str_free(p.alloc, toml_path);
+                    if (R.is_ok[toml.Table, str](tr)) {
+                        var t: toml.Table = R.unwrap_ok[toml.Table, str](tr);
+                        val dep_tab: *toml.Table = toml.get_table(?t, "dep");
+                        if (dep_tab != nil) {
+                            val sub_dep_count: usize = toml.table_len(dep_tab);
+                            if (sub_dep_count > 0) {
+                                val res_sub_defs: R.Result[*manifest.DepDef, str] = A.allocate[manifest.DepDef](p.alloc, sub_dep_count);
+                                if (R.is_ok[*manifest.DepDef, str](res_sub_defs)) {
+                                    val sub_defs: *manifest.DepDef = R.unwrap_ok[*manifest.DepDef, str](res_sub_defs);
+                                    var k: usize = 0;
+                                    for (k < sub_dep_count) {
+                                        val sub_alias: str = toml.table_key(dep_tab, k);
+                                        val sub_v: *toml.Value = toml.table_value(dep_tab, k);
+                                        var sub_d: manifest.DepDef;
+                                        sub_d.name = project.intern_unwrap(?p.s.interner, sub_alias);
+                                        sub_d.git = intern.STR_NIL;
+                                        sub_d.path = intern.STR_NIL;
+                                        sub_d.ref = intern.STR_NIL;
+                                        if (sub_v != nil && sub_v.tag == toml.TYPE_TABLE) {
+                                            val sub_sub: *toml.Table = ?sub_v.data.table;
+                                            sub_d.git = project.intern_opt_unwrap(?p.s.interner, toml.get_str(sub_sub, "git"));
+                                            sub_d.path = project.intern_opt_unwrap(?p.s.interner, toml.get_str(sub_sub, "path"));
+                                            sub_d.ref = project.intern_opt_unwrap(?p.s.interner, toml.get_str(sub_sub, "ref"));
+                                        }
+                                        sub_defs[k] = sub_d;
+                                        k = k + 1;
+                                    }
+                                    
+                                    val res_rec: R.Result[bool, str] = resolve_deps_recursive(p, current_root, sub_defs, sub_dep_count::u32, deps, prov, dep_count_ptr, max_deps, dir_dep, chain_here);
+                                    A.deallocate[manifest.DepDef](p.alloc, sub_defs, sub_dep_count);
+                                    if (R.is_err[bool, str](res_rec)) { ret res_rec; }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# resolve the project's declared deps and their transitive closure into the
+# ProjectConfig's DepEntry array; a no-dep manifest clears the array
+pub fun resolve_deps(p: *project.Project, m: *manifest.Manifest, project_root: str) R.Result[bool, str] {
+    if (m.dep_count == 0) {
+        p.config.deps      = nil;
+        p.config.dep_count = 0;
+        ret R.ok[bool, str](true);
+    }
+    
+    val max_deps: usize = 128;
+    val r: R.Result[*project.DepEntry, str] = A.allocate[project.DepEntry](p.alloc, max_deps);
+    if (R.is_err[*project.DepEntry, str](r)) { ret R.err[bool, str](R.unwrap_err[*project.DepEntry, str](r)); }
+    val deps: *project.DepEntry = R.unwrap_ok[*project.DepEntry, str](r);
+    var dep_count: u32 = 0;
+
+    # provenance runs parallel to `deps`; it is walk-local (only read to diagnose a
+    # collision) and freed as soon as the closure walk returns.
+    val pr: R.Result[*DepProvenance, str] = A.allocate[DepProvenance](p.alloc, max_deps);
+    if (R.is_err[*DepProvenance, str](pr)) {
+        A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
+        ret R.err[bool, str](R.unwrap_err[*DepProvenance, str](pr));
+    }
+    val prov: *DepProvenance = R.unwrap_ok[*DepProvenance, str](pr);
+
+    val dir_dep_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.dir_dep);
+    if (O.is_none[str](dir_dep_opt)) {
+        A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
+        A.deallocate[DepProvenance](p.alloc, prov, max_deps);
+        ret R.err[bool, str]("dep dir StrId not interned");
+    }
+    val dir_dep: str = O.unwrap[str](dir_dep_opt);
+
+    # the requirer chain roots at the project id (or "root" when unrecorded).
+    var root_name: str = "root";
+    val rn_o: O.Option[str] = intern.lookup(?p.s.interner, m.id);
+    if (O.is_some[str](rn_o) && !str_empty(O.unwrap[str](rn_o))) { root_name = O.unwrap[str](rn_o); }
+
+    val res_rec: R.Result[bool, str] = resolve_deps_recursive(p, project_root, m.deps, m.dep_count, deps, prov, ?dep_count, max_deps, dir_dep, root_name);
+    A.deallocate[DepProvenance](p.alloc, prov, max_deps);
+    if (R.is_err[bool, str](res_rec)) {
+        A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
+        ret res_rec;
+    }
+
+    if (dep_count == 0) {
+        A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
+        p.config.deps      = nil;
+        p.config.dep_count = 0;
+    }
+    or {
+        val r_shrink: R.Result[*project.DepEntry, str] = A.allocate[project.DepEntry](p.alloc, dep_count::usize);
+        if (R.is_err[*project.DepEntry, str](r_shrink)) {
+            A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
+            ret R.err[bool, str](R.unwrap_err[*project.DepEntry, str](r_shrink));
+        }
+        val shrunk: *project.DepEntry = R.unwrap_ok[*project.DepEntry, str](r_shrink);
+        var idx: u32 = 0;
+        for (idx < dep_count) {
+            shrunk[idx] = deps[idx];
+            idx = idx + 1;
+        }
+        A.deallocate[project.DepEntry](p.alloc, deps, max_deps);
+        p.config.deps      = shrunk;
+        p.config.dep_count = dep_count;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# free resolve_cascade_libs's per-dep scratch: dnit each parsed manifest, then
+# release the manifest/table/alias/order/visited arrays (all sized to `n`)
+fun free_cascade_scratch(alloc: *A.Allocator, manifests: *manifest.Manifest, tables: *toml.Table, aliases: *str, order: *u32, visited: *bool, n: u32) {
+    var i: u32 = 0;
+    for (i < n) { manifest.dnit(?manifests[i], alloc); i = i + 1; }
+    A.deallocate[manifest.Manifest](alloc, manifests, n::usize);
+    A.deallocate[toml.Table](alloc, tables, n::usize);
+    A.deallocate[str](alloc, aliases, n::usize);
+    A.deallocate[u32](alloc, order, n::usize);
+    A.deallocate[bool](alloc, visited, n::usize);
+}
+
+# gather the transitive dependencies' matched link libs into
+# `p.config.cascade_libs` (#1218, #1326). a dependency declares its own
+# `[os.<name>].libs` (matched on the os component) and `[target.*].libs` (matched
+# on the full (isa, os, abi) tuple), and a consumer inherits every such lib for the
+# build it is producing - so a platform link requirement (e.g. `kernel32.dll`)
+# lives once in the providing dependency's manifest. order is topological (a dep's
+# own deps first); within each dep the matching os overlays precede the matching
+# target libs. libs are deduplicated by name and the consumer's own `own_libs` are
+# excluded, so a shared requirement is never linked twice. an empty result leaves
+# the cascade nil/0, so a build with no inheriting deps is unaffected
+pub fun resolve_cascade_libs(p: *project.Project, project_root: str, isa: str, os: str, abi: str,
+                         own_libs: *intern.StrId, own_count: u32) R.Result[bool, str] {
+    p.config.cascade_libs      = nil;
+    p.config.cascade_lib_count = 0;
+    val n: u32 = p.config.dep_count;
+    if (n == 0) { ret R.ok[bool, str](true); }
+
+    val tr: R.Result[*toml.Table, str] = A.allocate[toml.Table](p.alloc, n::usize);
+    if (R.is_err[*toml.Table, str](tr)) { ret R.err[bool, str](R.unwrap_err[*toml.Table, str](tr)); }
+    val tables: *toml.Table = R.unwrap_ok[*toml.Table, str](tr);
+
+    val ar: R.Result[*str, str] = A.allocate[str](p.alloc, n::usize);
+    if (R.is_err[*str, str](ar)) { ret R.err[bool, str](R.unwrap_err[*str, str](ar)); }
+    val aliases: *str = R.unwrap_ok[*str, str](ar);
+
+    val mr: R.Result[*manifest.Manifest, str] = A.allocate[manifest.Manifest](p.alloc, n::usize);
+    if (R.is_err[*manifest.Manifest, str](mr)) { ret R.err[bool, str](R.unwrap_err[*manifest.Manifest, str](mr)); }
+    val manifests: *manifest.Manifest = R.unwrap_ok[*manifest.Manifest, str](mr);
+
+    var i: u32 = 0;
+    for (i < n) {
+        val vr_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.deps[i].vendor_root);
+        val al_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.deps[i].alias);
+        if (O.is_none[str](vr_opt) || O.is_none[str](al_opt)) { ret R.err[bool, str]("internal: dep metadata not interned"); }
+        aliases[i] = O.unwrap[str](al_opt);
+        val tp_r: R.Result[str, str] = load.join_path(p.alloc, O.unwrap[str](vr_opt), manifest.MANIFEST_FILE);
+        if (R.is_err[str, str](tp_r)) { ret R.err[bool, str](R.unwrap_err[str, str](tp_r)); }
+        val tp: str = R.unwrap_ok[str, str](tp_r);
+        val pr: R.Result[toml.Table, str] = parse_toml_file(p.alloc, tp);
+        str_free(p.alloc, tp);
+        if (R.is_err[toml.Table, str](pr)) { ret R.err[bool, str](R.unwrap_err[toml.Table, str](pr)); }
+        tables[i] = R.unwrap_ok[toml.Table, str](pr);
+
+        # a dependency's manifest: as_root false, parsed permissively for its export
+        # surface only (#1971) -- the dep's totality is enforced on its own root builds.
+        val mf_r: R.Result[manifest.Manifest, str] = manifest.parse(p.alloc, ?p.s.interner, ?tables[i], false);
+        if (R.is_err[manifest.Manifest, str](mf_r)) { ret R.err[bool, str](R.unwrap_err[manifest.Manifest, str](mf_r)); }
+        manifests[i] = R.unwrap_ok[manifest.Manifest, str](mf_r);
+
+        i = i + 1;
+    }
+
+    val ov: R.Result[*u32, str] = A.allocate[u32](p.alloc, n::usize);
+    if (R.is_err[*u32, str](ov)) { ret R.err[bool, str](R.unwrap_err[*u32, str](ov)); }
+    val order: *u32 = R.unwrap_ok[*u32, str](ov);
+    val vv: R.Result[*bool, str] = A.allocate[bool](p.alloc, n::usize);
+    if (R.is_err[*bool, str](vv)) { ret R.err[bool, str](R.unwrap_err[*bool, str](vv)); }
+    val visited: *bool = R.unwrap_ok[*bool, str](vv);
+    i = 0;
+    for (i < n) { visited[i] = false; i = i + 1; }
+    var order_len: u32 = 0;
+    i = 0;
+    for (i < n) { cascade_dfs(?tables[0], aliases, visited, order, ?order_len, n, i); i = i + 1; }
+
+    # Setup target filters
+    var tgt: manifest.TargetDef;
+    val res_tgt_isa: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, isa);
+    if (R.is_err[intern.StrId, str](res_tgt_isa)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](res_tgt_isa)); }
+    tgt.isa = R.unwrap_ok[intern.StrId, str](res_tgt_isa);
+
+    val res_tgt_os: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, os);
+    if (R.is_err[intern.StrId, str](res_tgt_os)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](res_tgt_os)); }
+    tgt.os = R.unwrap_ok[intern.StrId, str](res_tgt_os);
+
+    val res_tgt_abi: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, abi);
+    if (R.is_err[intern.StrId, str](res_tgt_abi)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](res_tgt_abi)); }
+    tgt.abi = R.unwrap_ok[intern.StrId, str](res_tgt_abi);
+
+    # Calculate max possible matching libs to allocate buffer
+    var max: u32 = 0;
+    i = 0;
+    for (i < n) {
+        val mfd: *manifest.Manifest = ?manifests[i];
+        max = max + mfd.link_count;
+        i = i + 1;
+    }
+
+    if (max == 0) {
+        free_cascade_scratch(p.alloc, manifests, tables, aliases, order, visited, n);
+        ret R.ok[bool, str](true);
+    }
+
+    val br: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](p.alloc, max::usize);
+    if (R.is_err[*intern.StrId, str](br)) {
+        free_cascade_scratch(p.alloc, manifests, tables, aliases, order, visited, n);
+        ret R.err[bool, str](R.unwrap_err[*intern.StrId, str](br));
+    }
+    val buf: *intern.StrId = R.unwrap_ok[*intern.StrId, str](br);
+    var w: u32 = 0;
+
+    var oi: u32 = 0;
+    for (oi < order_len) {
+        val di: u32 = order[oi];
+        val mfd: *manifest.Manifest = ?manifests[di];
+        val vr_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.deps[di].vendor_root);
+        if (O.is_none[str](vr_opt)) {
+            free_cascade_scratch(p.alloc, manifests, tables, aliases, order, visited, n);
+            A.deallocate[intern.StrId](p.alloc, buf, max::usize);
+            ret R.err[bool, str]("internal: dep metadata not interned");
+        }
+        val dep_vr: str = O.unwrap[str](vr_opt);
+
+        var li: u32 = 0;
+        for (li < mfd.link_count) {
+            val l: *manifest.LinkDef = ?mfd.links[li];
+            if (l.export && manifest.link_matches_target(?p.s.interner, l, ?tgt)) {
+                # a `local` entry's path homes against the ROOT project out (#1970): the
+                # exported object lands in the consumer out tree, where the demanding dep
+                # step (run beforehand by execute_dep_steps) writes it. system/framework
+                # entries contribute their lib name.
+                var lib_id: intern.StrId = intern.STR_NIL;
+                if (l.source == R.unwrap_ok[intern.StrId, str](intern.intern(?p.s.interner, "local"))) {
+                    val p_opt: O.Option[str] = intern.lookup(?p.s.interner, l.path);
+                    if (O.is_some[str](p_opt)) {
+                        val root_out: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_out));
+                        var cv: manifest.TmplVars = cell_tmpl_vars(p);
+                        val exp_r: R.Result[str, str] = manifest.expand(p.alloc, O.unwrap[str](p_opt), root_out, ?cv);
+                        if (R.is_ok[str, str](exp_r)) {
+                            val exp: str = R.unwrap_ok[str, str](exp_r);
+                            lib_id = R.unwrap_ok[intern.StrId, str](intern.intern(?p.s.interner, exp));
+                            str_free(p.alloc, exp);
+                        }
+                    }
+                }
+                or {
+                    lib_id = l.lib_name;
+                }
+
+                if (lib_id != intern.STR_NIL && !strid_in(buf, w, lib_id) && !strid_in(own_libs, own_count, lib_id)) {
+                    buf[w] = lib_id;
+                    w = w + 1;
+                }
+            }
+            li = li + 1;
+        }
+        oi = oi + 1;
+    }
+
+    free_cascade_scratch(p.alloc, manifests, tables, aliases, order, visited, n);
+
+    if (w == 0) {
+        A.deallocate[intern.StrId](p.alloc, buf, max::usize);
+        ret R.ok[bool, str](true);
+    }
+    if (w < max) {
+        val sr: R.Result[*intern.StrId, str] = A.reallocate[intern.StrId](p.alloc, buf, max::usize, w::usize);
+        if (R.is_ok[*intern.StrId, str](sr)) {
+            p.config.cascade_libs      = R.unwrap_ok[*intern.StrId, str](sr);
+            p.config.cascade_lib_count = w;
+            ret R.ok[bool, str](true);
+        }
+    }
+    p.config.cascade_libs      = buf;
+    p.config.cascade_lib_count = w;
+    ret R.ok[bool, str](true);
+}
+
+# post-order DFS visiting a dep's own declared deps before the dep
+# itself, so the emitted order is topological (dependencies first) with siblings
+# kept in declaration order. `base` points at the dep manifest table array
+fun cascade_dfs(base: *toml.Table, aliases: *str, visited: *bool, order: *u32, order_len: *u32, n: u32, i: u32) {
+    if (visited[i]) { ret; }
+    visited[i] = true;
+    var j: u32 = 0;
+    for (j < n) {
+        if (j != i && dep_declares(?base[i], aliases[j])) {
+            cascade_dfs(base, aliases, visited, order, order_len, n, j);
+        }
+        j = j + 1;
+    }
+    order[@order_len] = i;
+    @order_len = @order_len + 1;
+}
+
+# whether dep manifest `t` lists `alias` under its own `[deps.*]` or `[dep.*]`
+fun dep_declares(t: *toml.Table, alias: str) bool {
+    var deps_tab: *toml.Table = toml.get_table(t, "dep");
+    if (deps_tab == nil) {
+        deps_tab = toml.get_table(t, "deps");
+    }
+    if (deps_tab == nil) { ret false; }
+    val m: usize = toml.table_len(deps_tab);
+    var k: usize = 0;
+    for (k < m) {
+        if (str_equals(toml.table_key(deps_tab, k), alias)) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# whether `id` already appears in the first `count` entries of `arr`
+fun strid_in(arr: *intern.StrId, count: u32, id: intern.StrId) bool {
+    if (arr == nil) { ret false; }
+    var k: u32 = 0;
+    for (k < count) {
+        if (arr[k] == id) { ret true; }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# load a dep's own mach.toml to recover its [project].id and source
+# dir. vendor layout follows doc/dependencies.md:
+# <project_root>/<dir_dep>/<alias>/
+fun resolve_dep(s: *session.Session, alias: str, project_root: str, dir_dep: str) R.Result[project.DepEntry, str] {
+    val dep_dir_r: R.Result[str, str] = build_dep_root(s.build_alloc, project_root, dir_dep, alias);
+    if (R.is_err[str, str](dep_dir_r)) { ret R.err[project.DepEntry, str](R.unwrap_err[str, str](dep_dir_r)); }
+    val dep_dir: str = R.unwrap_ok[str, str](dep_dir_r);
+
+    val toml_path_r: R.Result[str, str] = load.join_path(s.build_alloc, dep_dir, manifest.MANIFEST_FILE);
+    if (R.is_err[str, str](toml_path_r)) {
+        str_free(s.build_alloc, dep_dir);
+        ret R.err[project.DepEntry, str](R.unwrap_err[str, str](toml_path_r));
+    }
+    val toml_path: str = R.unwrap_ok[str, str](toml_path_r);
+
+    val tr: R.Result[toml.Table, str] = parse_toml_file(s.build_alloc, toml_path);
+    str_free(s.build_alloc, toml_path);
+    if (R.is_err[toml.Table, str](tr)) {
+        str_free(s.build_alloc, dep_dir);
+        ret R.err[project.DepEntry, str](R.unwrap_err[toml.Table, str](tr));
+    }
+    var t: toml.Table = R.unwrap_ok[toml.Table, str](tr);
+
+    val id_str: str = toml.get_str(?t, "project.id");
+    if (str_empty(id_str)) {
+        val msg: str = load.diag_join3(s, "dep '", alias, "' mach.toml is missing [project].id", "dep mach.toml is missing [project].id");
+        str_free(s.build_alloc, dep_dir);
+        ret R.err[project.DepEntry, str](msg);
+    }
+
+    var entry: project.DepEntry;
+
+    val ra: R.Result[intern.StrId, str] = intern.intern(?s.interner, alias);
+    if (R.is_err[intern.StrId, str](ra)) {
+        str_free(s.build_alloc, dep_dir);
+        ret R.err[project.DepEntry, str](R.unwrap_err[intern.StrId, str](ra));
+    }
+    entry.alias = R.unwrap_ok[intern.StrId, str](ra);
+
+    val rp: R.Result[intern.StrId, str] = intern.intern(?s.interner, id_str);
+    if (R.is_err[intern.StrId, str](rp)) {
+        str_free(s.build_alloc, dep_dir);
+        ret R.err[project.DepEntry, str](R.unwrap_err[intern.StrId, str](rp));
+    }
+    entry.project_id = R.unwrap_ok[intern.StrId, str](rp);
+
+    # the dep's source dir: `[project].src`, defaulting to "src". resolution is
+    # purely by vendor layout otherwise.
+    val rds: R.Result[intern.StrId, str] = intern_or(?s.interner, toml.get_str(?t, "project.src"), "src");
+    if (R.is_err[intern.StrId, str](rds)) {
+        str_free(s.build_alloc, dep_dir);
+        ret R.err[project.DepEntry, str](R.unwrap_err[intern.StrId, str](rds));
+    }
+    entry.project_dir_src = R.unwrap_ok[intern.StrId, str](rds);
+
+    # V2 dependency entry resolution:
+    # First, try to get the first [artifact.<name>].entry.
+    # If not found, try [lib.<name>].entry.
+    # If not found, try [bin.<name>].entry.
+    # Otherwise, default to "lib.mach".
+    var dep_entry_file: str = "";
+    val arts_tab: *toml.Table = toml.get_table(?t, "artifact");
+    if (arts_tab != nil && toml.table_len(arts_tab) > 0) {
+        val first_art_val: *toml.Value = toml.table_value(arts_tab, 0);
+        if (first_art_val != nil && first_art_val.tag == toml.TYPE_TABLE) {
+            dep_entry_file = toml.get_str(?first_art_val.data.table, "entry");
+        }
+    }
+    if (str_empty(dep_entry_file)) {
+        val libs_tab: *toml.Table = toml.get_table(?t, "lib");
+        if (libs_tab != nil && toml.table_len(libs_tab) > 0) {
+            val first_lib_val: *toml.Value = toml.table_value(libs_tab, 0);
+            if (first_lib_val != nil && first_lib_val.tag == toml.TYPE_TABLE) {
+                dep_entry_file = toml.get_str(?first_lib_val.data.table, "entry");
+            }
+        }
+    }
+    if (str_empty(dep_entry_file)) {
+        val bins_tab: *toml.Table = toml.get_table(?t, "bin");
+        if (bins_tab != nil && toml.table_len(bins_tab) > 0) {
+            val first_bin_val: *toml.Value = toml.table_value(bins_tab, 0);
+            if (first_bin_val != nil && first_bin_val.tag == toml.TYPE_TABLE) {
+                dep_entry_file = toml.get_str(?first_bin_val.data.table, "entry");
+            }
+        }
+    }
+    if (str_empty(dep_entry_file)) {
+        dep_entry_file = "lib.mach";
+    }
+
+    entry.project_module = intern.STR_NIL;
+    val dep_src_text: str = O.unwrap[str](intern.lookup(?s.interner, entry.project_dir_src));
+    if (!str_empty(dep_entry_file)) {
+        if (!module_file_present(s.build_alloc, dep_dir, dep_src_text, dep_entry_file)) {
+            val msg: str = load.diag_join_named(s, "dep '", entry.alias, "' mach.toml: default entry names no file", "dep mach.toml: default entry names no file");
+            str_free(s.build_alloc, dep_dir);
+            ret R.err[project.DepEntry, str](msg);
+        }
+        val rmd: R.Result[intern.StrId, str] = intern.intern(?s.interner, dep_entry_file);
+        if (R.is_err[intern.StrId, str](rmd)) {
+            str_free(s.build_alloc, dep_dir);
+            ret R.err[project.DepEntry, str](R.unwrap_err[intern.StrId, str](rmd));
+        }
+        entry.project_module = R.unwrap_ok[intern.StrId, str](rmd);
+    }
+
+    val rvr: R.Result[intern.StrId, str] = intern.intern(?s.interner, dep_dir);
+    if (R.is_err[intern.StrId, str](rvr)) {
+        str_free(s.build_alloc, dep_dir);
+        ret R.err[project.DepEntry, str](R.unwrap_err[intern.StrId, str](rvr));
+    }
+    entry.vendor_root = R.unwrap_ok[intern.StrId, str](rvr);
+
+    str_free(s.build_alloc, dep_dir);
+    ret R.ok[project.DepEntry, str](entry);
+}
+
+# compose a dependency's vendor root path `<project_root>/<dir_dep>/<alias>`
+fun build_dep_root(alloc: *A.Allocator, project_root: str, dir_dep: str, alias: str) R.Result[str, str] {
+    val a: R.Result[str, str] = load.join_path(alloc, project_root, dir_dep);
+    if (R.is_err[str, str](a)) { ret a; }
+    val mid: str = R.unwrap_ok[str, str](a);
+    val b: R.Result[str, str] = load.join_path(alloc, mid, alias);
+    str_free(alloc, mid);
+    ret b;
+}
+
+# read `path` and parse its contents into a TOML Table, freeing the file text
+pub fun parse_toml_file(alloc: *A.Allocator, path: str) R.Result[toml.Table, str] {
+    val rb: R.Result[str, str] = fs.read_string(alloc, path);
+    if (R.is_err[str, str](rb)) { ret R.err[toml.Table, str](R.unwrap_err[str, str](rb)); }
+    val src_text: str = R.unwrap_ok[str, str](rb);
+    val rt: R.Result[toml.Table, str] = toml.parse(alloc, src_text);
+    str_free(alloc, src_text);
+    ret rt;
+}
+
+# intern `text`, falling back to `default` when `text` is empty
+fun intern_or(i: *intern.Interner, text: str, default: str) R.Result[intern.StrId, str] {
+    var t: str = text;
+    if (str_empty(t)) { t = default; }
+    ret intern.intern(i, t);
+}
+
+# the closed template-variable set for the active build cell (#1964): the target
+# tuple (name/isa/os/abi) and profile a step path or cmd expands against.
+pub fun cell_tmpl_vars(p: *project.Project) manifest.TmplVars {
+    var v: manifest.TmplVars;
+    v.target  = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.name));
+    v.isa     = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.isa_name));
+    v.os      = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.os_name));
+    v.abi     = O.unwrap[str](intern.lookup(?p.s.interner, p.target_entry.abi_name));
+    v.profile = O.unwrap[str](intern.lookup(?p.s.interner, p.config.profile));
+    ret v;
+}

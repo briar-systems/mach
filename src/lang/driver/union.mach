@@ -1,0 +1,574 @@
+# multi-target / multi-artifact union loading and export/import-library registration
+#
+# The union build (#1391/#1505) unions every manifest target's and artifact's
+# import closure into one deduplicated Project for workspace-wide tooling: it
+# precomputes one TargetTuple per target, loads every declared artifact entry
+# and every own-source module under `[project].src`, and skips a target the
+# compiler cannot cover. It also registers the project's `#[export]` directives
+# and `ext` import libraries onto the session. Sits above the load walk it
+# drives, below the facade orchestration that invokes it.
+
+use std.collections.sort;
+use std.collections.vector;
+use std.format;
+use fs: std.filesystem;
+use std.collections.vector.Vector;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_ends_with;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+use sysos: std.system.os;
+
+use mach.lang.diagnostic;
+use mach.lang.fe.ast;
+use mach.lang.fe.ast.decl;
+use mach.lang.fe.ast.expr;
+use mach.lang.fe.ast.id;
+use mach.lang.fe.ast.module;
+use mach.lang.fe.token;
+use mach.lang.intern;
+use mach.lang.manifest;
+use mach.lang.session;
+use src: mach.lang.source;
+use mach.lang.target;
+use mach.lang.target.isa;
+use mach.lang.target.os;
+
+use mach.lang.driver.project;
+use mach.lang.driver.load;
+
+# one own-source module discovered by the whole-source test walk: its interned FQN
+# and the FQN text the deterministic load order sorts on
+rec SrcMod {
+    text: str;
+    fqn:  intern.StrId;
+}
+
+# order two discovered modules by FQN text
+#
+# The whole-source walk visits files in filesystem `readdir` order, which is not
+# stable across hosts; sorting by FQN before loading pins the module-id assignment
+# (hence collection order and per-test rerun indices) so a test build is
+# deterministic and self-host fixpoint-stable.
+fun cmp_src_mod(a: *SrcMod, b: *SrcMod) i64 {
+    ret str_compare(a.text, b.text);
+}
+
+# load every own-source module under `[project].src` as a test-collection root
+#
+# `mach test` collects tests from the whole source tree, not the entrypoint's
+# import closure, so a `pub` module with no in-tree `use` consumer (an editor / LSP
+# surface, say) still has its tests collected. Every `.mach` file under the src dir
+# is enumerated, mapped to its FQN, sorted for determinism, and dfs_loaded; dfs_load
+# dedups by FQN, so the already-loaded entry closure re-loads as a no-op and only
+# the orphaned modules are added.
+# the number of modules excluded from this build as target-gated orphans (#1873).
+# `mach test` reports it as the per-run "skipped N target-gated modules" note so an
+# exclusion is never silent.
+pub fun count_target_gated(p: *project.Project) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        if ((?p.modules[i]).target_gated) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# load every own-source module under `[project].src` as a collection, so `mach
+# test` and union tooling see modules no artifact entry imports (#1788)
+pub fun load_all_own_src(p: *project.Project) R.Result[bool, str] {
+    val root_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.project_root);
+    if (O.is_none[str](root_opt)) { ret R.err[bool, str]("project_root StrId not interned"); }
+    val src_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.dir_src);
+    if (O.is_none[str](src_opt)) { ret R.err[bool, str]("dir_src StrId not interned"); }
+    val id_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.id);
+    if (O.is_none[str](id_opt)) { ret R.err[bool, str]("project id StrId not interned"); }
+
+    val src_abs_r: R.Result[str, str] = load.join_path(p.alloc, O.unwrap[str](root_opt), O.unwrap[str](src_opt));
+    if (R.is_err[str, str](src_abs_r)) { ret R.err[bool, str](R.unwrap_err[str, str](src_abs_r)); }
+    val src_abs: str = R.unwrap_ok[str, str](src_abs_r);
+
+    var mods: vector.Vector[SrcMod] = vector.init[SrcMod](p.alloc);
+    val walk_r: R.Result[bool, str] = collect_src_modules(p, src_abs, str_len(src_abs), O.unwrap[str](id_opt), ?mods);
+    str_free(p.alloc, src_abs);
+    if (R.is_err[bool, str](walk_r)) { vector.dnit[SrcMod](?mods); ret walk_r; }
+
+    sort.sort[SrcMod](mods.data, mods.len, cmp_src_mod);
+
+    # while these orphan roots load, a top-level `$error` guard reached on a live
+    # path flags its module target-gated (excluded from the test build) instead of
+    # firing as a fatal diagnostic (#1873).
+    p.loading_orphans = true;
+    var i: usize = 0;
+    for (i < mods.len) {
+        val lr: R.Result[session.ModuleId, str] = load.dfs_load(p, mods.data[i].fqn);
+        if (R.is_err[session.ModuleId, str](lr)) {
+            p.loading_orphans = false;
+            vector.dnit[SrcMod](?mods);
+            ret R.err[bool, str](R.unwrap_err[session.ModuleId, str](lr));
+        }
+        i = i + 1;
+    }
+    p.loading_orphans = false;
+    vector.dnit[SrcMod](?mods);
+    ret R.ok[bool, str](true);
+}
+
+# recursively append every `.mach` module under `dir_abs` to `out`
+#
+# `src_prefix_len` is the byte length of the project src-dir path, so each file's
+# path relative to src (the FQN tail compose_module_fqn expands) is the c-string
+# just past `<src>/`. Symlinks are not followed (info_link is an lstat): a walk
+# that chased a link could escape the tree or loop.
+fun collect_src_modules(p: *project.Project, dir_abs: str, src_prefix_len: usize, id_text: str, out: *vector.Vector[SrcMod]) R.Result[bool, str] {
+    val fd_raw: i64 = sysos.open(sysos.AT_FDCWD, dir_abs, sysos.O_RDONLY | sysos.O_DIRECTORY, 0);
+    if (fd_raw < 0) { ret R.err[bool, str](sysos.message(fd_raw)); }
+    val fd: i32 = fd_raw::i32;
+
+    var dbuf: [8192]u8;
+    var result: R.Result[bool, str] = R.ok[bool, str](true);
+    var reading: bool = true;
+    for (reading) {
+        val n: i64 = sysos.read_dir(fd, (?dbuf[0])::*sysos.dirent64, 8192);
+        if (n < 0)  { result = R.err[bool, str](sysos.message(n)); reading = false; }
+        or (n == 0) { reading = false; }
+        or {
+            var pos: usize = 0;
+            for (reading && pos < n::usize) {
+                val ent:    *sysos.dirent64 = ((?dbuf[0])::usize + pos)::*sysos.dirent64;
+                val reclen: usize           = ent.d_reclen::usize;
+                if (reclen == 0) { reading = false; }
+                or {
+                    val name: *u8 = ?ent.d_name[0];
+                    if (!is_dot_name(name)) {
+                        val rr: R.Result[bool, str] = visit_src_entry(p, dir_abs, name::str, src_prefix_len, id_text, out);
+                        if (R.is_err[bool, str](rr)) { result = rr; reading = false; }
+                    }
+                    pos = pos + reclen;
+                }
+            }
+        }
+    }
+    sysos.close(fd);
+    ret result;
+}
+
+# handle one directory entry: recurse into a subdirectory, or append a `.mach`
+# file's module. non-`.mach` files, symlinks, and unstattable entries are skipped
+fun visit_src_entry(p: *project.Project, dir_abs: str, name: str, src_prefix_len: usize, id_text: str, out: *vector.Vector[SrcMod]) R.Result[bool, str] {
+    val child_r: R.Result[str, str] = load.join_path(p.alloc, dir_abs, name);
+    if (R.is_err[str, str](child_r)) { ret R.err[bool, str](R.unwrap_err[str, str](child_r)); }
+    val child: str = R.unwrap_ok[str, str](child_r);
+
+    var result: R.Result[bool, str] = R.ok[bool, str](true);
+    val fi_r: R.Result[fs.Metadata, str] = fs.metadata_link(child);
+    if (R.is_ok[fs.Metadata, str](fi_r)) {
+        val fi: fs.Metadata = R.unwrap_ok[fs.Metadata, str](fi_r);
+        if (fs.meta_is_dir(?fi)) {
+            result = collect_src_modules(p, child, src_prefix_len, id_text, out);
+        }
+        or (fs.meta_is_file(?fi) && str_ends_with(name, ".mach")) {
+            # the FQN tail is child's path relative to the src dir: the c-string just
+            # past "<src>/". compose turns '/' into '.' and strips the '.mach' suffix.
+            val rel: str = (child::usize + src_prefix_len + 1)::str;
+            val fqn_r: R.Result[intern.StrId, str] = load.compose_module_fqn(p, id_text, rel);
+            if (R.is_err[intern.StrId, str](fqn_r)) { result = R.err[bool, str](R.unwrap_err[intern.StrId, str](fqn_r)); }
+            or {
+                val fqn: intern.StrId = R.unwrap_ok[intern.StrId, str](fqn_r);
+                val tx:  O.Option[str] = intern.lookup(?p.s.interner, fqn);
+                if (O.is_some[str](tx)) {
+                    var sm: SrcMod;
+                    sm.text = O.unwrap[str](tx);
+                    sm.fqn  = fqn;
+                    val pr: R.Result[usize, str] = vector.push[SrcMod](out, sm);
+                    if (R.is_err[usize, str](pr)) { result = R.err[bool, str](R.unwrap_err[usize, str](pr)); }
+                }
+            }
+        }
+    }
+    str_free(p.alloc, child);
+    ret result;
+}
+
+# whether a directory entry name is "." or ".." (the self / parent links a walk skips)
+fun is_dot_name(name: *u8) bool {
+    if (name[0] != '.') { ret false; }
+    if (name[1] == 0) { ret true; }
+    if (name[1] == '.' && name[2] == 0) { ret true; }
+    ret false;
+}
+
+# file a `warning:` on the session diagnostic sink for a union target this build
+# cannot compose, naming the `<os>-<isa>` tuple and the reason
+#
+# The union path is maximally permissive by design (LSP / rename): one uncoverable
+# declared target must not abort loading the rest. Filing it (rather than a raw
+# stderr write) gives it a `warning:` label and orders it with the structured
+# diagnostics; like the native warning it carries no source span.
+# ---
+# p:        the project whose session sink and allocator back the message
+# os_name:  the target's os name
+# isa_name: the target's isa name
+# why:      the select_of error explaining the missing capability
+fun warn_union_target_skipped(p: *project.Project, os_name: str, isa_name: str, why: str) {
+    val res_msg: R.Result[str, str] = format.sprint(p.alloc, "target '{}-{}' is not supported by this build; skipped in multi-target analysis: {}", os_name, isa_name, why);
+    if (R.is_err[str, str](res_msg)) { ret; }
+    val buf: str = R.unwrap_ok[str, str](res_msg);
+
+    var span: token.Span;
+    span.offset = 0;
+    span.len    = 0;
+    diagnostic.warning(?p.s.diags, 0xFFFFFFFF::src.FileId, span, buf);
+
+    str_free(p.alloc, buf);
+}
+
+# record one TargetTuple per declared manifest target and
+# turn on union mode (#1391). The union load walk evaluates each `$if` branch
+# under every tuple, so a branch some target takes is followed. A manifest with no
+# `[target.*]` leaves the Project single-target (union stays off)
+pub fun populate_union_tuples(p: *project.Project, m: *manifest.Manifest) R.Result[bool, str] {
+    val n: u32 = m.target_count;
+    if (n == 0) { ret R.ok[bool, str](true); }
+    val tr: R.Result[*project.TargetTuple, str] = A.allocate[project.TargetTuple](p.alloc, n::usize);
+    if (R.is_err[*project.TargetTuple, str](tr)) { ret R.err[bool, str](R.unwrap_err[*project.TargetTuple, str](tr)); }
+    val tuples: *project.TargetTuple = R.unwrap_ok[*project.TargetTuple, str](tr);
+    var k:    u32 = 0;
+    var fill: u32 = 0;
+    for (k < n) {
+        val td: *manifest.TargetDef = ?m.targets[k];
+        val os_opt:  O.Option[str] = intern.lookup(?p.s.interner, td.os);
+        val isa_opt: O.Option[str] = intern.lookup(?p.s.interner, td.isa);
+        val abi_opt: O.Option[str] = intern.lookup(?p.s.interner, td.abi);
+        if (O.is_none[str](os_opt) || O.is_none[str](isa_opt) || O.is_none[str](abi_opt)) {
+            A.deallocate[project.TargetTuple](p.alloc, tuples, n::usize);
+            ret R.err[bool, str]("internal: union target tuple name not interned");
+        }
+        val os_name:  str = O.unwrap[str](os_opt);
+        val isa_name: str = O.unwrap[str](isa_opt);
+        val abi_name: str = O.unwrap[str](abi_opt);
+        val os_id:   u32 = os.os_id_for(os_name);
+        val arch_id: u32 = isa.arch_id_for(isa_name);
+        # the object-format override is optional; an unset/empty name defers to the
+        # os default inside select_of.
+        var of_name: str = "";
+        val of_opt: O.Option[str] = intern.lookup(?p.s.interner, td.of);
+        if (O.is_some[str](of_opt)) { of_name = O.unwrap[str](of_opt); }
+        val sr: R.Result[target.Target, str] = target.select_of(?p.s.registry, isa_name, os_name, abi_name, of_name);
+        if (R.is_err[target.Target, str](sr)) {
+            # the union is maximally permissive (LSP / rename load every declared
+            # target's branches, #1391/#1505): a declared target this build cannot
+            # compose is skipped with a warning, not aborted, so the remaining
+            # targets still load. `mach build <tuple>` stays strict via select_target.
+            warn_union_target_skipped(p, os_name, isa_name, R.unwrap_err[target.Target, str](sr));
+        } or {
+            tuples[fill].os_id         = os_id;
+            tuples[fill].arch_id       = arch_id;
+            tuples[fill].pointer_width = R.unwrap_ok[target.Target, str](sr).arch.pointer_width;
+            tuples[fill].os_name       = td.os;
+            tuples[fill].isa_name      = td.isa;
+            tuples[fill].abi_name      = td.abi;
+            fill = fill + 1;
+        }
+        k = k + 1;
+    }
+    p.union_tuples      = tuples;
+    p.union_tuple_count = fill;
+    p.union             = true;
+    ret R.ok[bool, str](true);
+}
+
+# record the entry-module FQN of every declared artifact -
+# each artifact's base `entry` plus any per-cell `[*.target.*]` entry override -
+# deduped by FQN, so the union load walk covers the whole (target x artifact)
+# matrix (#1505). Requires `p.config.id` set (the FQN head). A manifest with no
+# artifacts is a no-op. Idempotent re-loads (the primary entry is among these) are
+# absorbed by `dfs_load`'s FQN dedup
+pub fun populate_union_entries(p: *project.Project, m: *manifest.Manifest) R.Result[bool, str] {
+    if (m.artifact_count == 0) { ret R.ok[bool, str](true); }
+
+    # upper bound: one base entry per artifact.
+    var cap: u32 = m.artifact_count;
+
+    val er: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](p.alloc, cap::usize);
+    if (R.is_err[*intern.StrId, str](er)) { ret R.err[bool, str](R.unwrap_err[*intern.StrId, str](er)); }
+    val entries: *intern.StrId = R.unwrap_ok[*intern.StrId, str](er);
+
+    val id_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.id);
+    if (O.is_none[str](id_opt)) {
+        A.deallocate[intern.StrId](p.alloc, entries, cap::usize);
+        ret R.err[bool, str]("internal: union project id not interned");
+    }
+    val id_text: str = O.unwrap[str](id_opt);
+
+    var w: u32 = 0;
+    var k: u32 = 0;
+    for (k < m.artifact_count) {
+        val a: *manifest.ArtifactDef = ?m.artifacts[k];
+        val br: R.Result[u32, str] = add_union_entry(p, entries, w, cap, id_text, a.entry);
+        if (R.is_err[u32, str](br)) { A.deallocate[intern.StrId](p.alloc, entries, cap::usize); ret R.err[bool, str](R.unwrap_err[u32, str](br)); }
+        w = R.unwrap_ok[u32, str](br);
+        k = k + 1;
+    }
+
+    # shrink to the deduped count so the freed size matches the allocation exactly
+    # (the page allocator's deallocate munmaps the recorded byte span).
+    if (w < cap) {
+        val sr: R.Result[*intern.StrId, str] = A.reallocate[intern.StrId](p.alloc, entries, cap::usize, w::usize);
+        if (R.is_err[*intern.StrId, str](sr)) {
+            A.deallocate[intern.StrId](p.alloc, entries, cap::usize);
+            ret R.err[bool, str](R.unwrap_err[*intern.StrId, str](sr));
+        }
+        p.union_entries = R.unwrap_ok[*intern.StrId, str](sr);
+    }
+    or {
+        p.union_entries = entries;
+    }
+    p.union_entry_count = w;
+    ret R.ok[bool, str](true);
+}
+
+# compose the FQN of `entry_id` (an artifact/cell entry-source
+# path) under project id `id_text` and append it to `entries[0, w)` if not already
+# present, returning the new count. dedups by FQN StrId so shared entries are
+# recorded once
+fun add_union_entry(p: *project.Project, entries: *intern.StrId, w: u32, cap: u32, id_text: str, entry_id: intern.StrId) R.Result[u32, str] {
+    val ep_opt: O.Option[str] = intern.lookup(?p.s.interner, entry_id);
+    if (O.is_none[str](ep_opt)) { ret R.err[u32, str]("internal: union artifact entry not interned"); }
+    val fqn_r: R.Result[intern.StrId, str] = load.compose_module_fqn(p, id_text, O.unwrap[str](ep_opt));
+    if (R.is_err[intern.StrId, str](fqn_r)) { ret R.err[u32, str](R.unwrap_err[intern.StrId, str](fqn_r)); }
+    val fqn: intern.StrId = R.unwrap_ok[intern.StrId, str](fqn_r);
+
+    var i: u32 = 0;
+    for (i < w) {
+        if (entries[i] == fqn) { ret R.ok[u32, str](w); }
+        i = i + 1;
+    }
+    if (w >= cap) { ret R.err[u32, str]("internal: union entry count exceeded capacity"); }
+    entries[w] = fqn;
+    ret R.ok[u32, str](w + 1);
+}
+
+# scan every module for `#[symbol("...")]` decorators
+# and `ext fun` defaults and record each as a literal link-name override keyed by
+# (ModuleId, DeclId) on the session. the decorated decl keeps the literal string
+# verbatim as its emitted symbol name. this is the sole mechanism keeping the
+# program entry (`main`), the OS entry (`_start`), and the runtime symbols
+# (`_rt_*`) literal so the inline-asm relocations against those exact names
+# resolve at link
+pub fun register_export_names(p: *project.Project) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        val r: R.Result[bool, str] = register_module_export_names(p, i::session.ModuleId);
+        if (R.is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# scan one loaded module's decls and register its `ext fun` / `#[symbol]` /
+# `#[library]` link-name overrides on the session
+fun register_module_export_names(p: *project.Project, mid: session.ModuleId) R.Result[bool, str] {
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    val m_opt: O.Option[*module.Module] = ast.get_module(m.a, m.a.root_module);
+    if (O.is_none[*module.Module](m_opt)) { ret R.ok[bool, str](true); }
+    val mod_node: *module.Module = O.unwrap[*module.Module](m_opt);
+
+    val src_opt: O.Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
+    if (O.is_none[*src.SourceFile](src_opt)) { ret R.ok[bool, str](true); }
+    val source: str = O.unwrap[*src.SourceFile](src_opt).text;
+
+    ret scan_export_directives(p, mid, source, mod_node.decls_start, mod_node.decls_len);
+}
+
+# project the per-decl `#[library(...)]` attributions
+# (keyed by decl) onto the session's link-name-keyed `import_libraries` map. run
+# after every `#[symbol]`/`#[library]` decorator and `ext fun` default is recorded,
+# so each import's final link name is settled. for every `ext` decl pinned to a
+# library, the binding `<final link name> -> <library>` lets the back-end linker
+# route the import to a specific PE import descriptor rather than the first one
+pub fun register_import_libraries(p: *project.Project) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        val m: *project.ModuleEntry = ?p.modules[i];
+        val m_opt: O.Option[*module.Module] = ast.get_module(m.a, m.a.root_module);
+        if (O.is_some[*module.Module](m_opt)) {
+            val mod_node: *module.Module = O.unwrap[*module.Module](m_opt);
+            val r: R.Result[bool, str] = bind_import_libraries(p, i::session.ModuleId, mod_node.decls_start, mod_node.decls_len);
+            if (R.is_err[bool, str](r)) { ret r; }
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# walk a decl list (recursing into comptime-if branch
+# bodies, where target-selected `ext` bindings live) and, for each `ext fun`
+# pinned by a `#[library(...)]` decorator, record `<final link name> -> <library>`
+# on the session. the final link name is the decl's `export_name` (the `#[symbol]`
+# value when present, else the bare identifier), so the key matches the object
+# symbol the linker later sees
+fun bind_import_libraries(p: *project.Project, mid: session.ModuleId, start: u32, len: u32) R.Result[bool, str] {
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    var i: u32 = 0;
+    for (i < len) {
+        val did: id.DeclId = m.a.decl_ids[start + i];
+        val d_opt: O.Option[*decl.Decl] = ast.get_decl(m.a, did);
+        if (O.is_some[*decl.Decl](d_opt)) {
+            val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+            if ((d.kind == decl.DECL_KIND_FUN
+                 || d.kind == decl.DECL_KIND_VAL || d.kind == decl.DECL_KIND_VAR)
+                && (d.flags & decl.DECL_FLAG_EXT) != 0) {
+                val lib_opt: O.Option[intern.StrId] = session.export_library(p.s, mid, did::u32);
+                if (O.is_some[intern.StrId](lib_opt)) {
+                    val name_opt: O.Option[intern.StrId] = session.export_name(p.s, mid, did::u32);
+                    if (O.is_some[intern.StrId](name_opt)) {
+                        val r: R.Result[bool, str] = session.register_import_library(p.s,
+                            O.unwrap[intern.StrId](name_opt), O.unwrap[intern.StrId](lib_opt));
+                        if (R.is_err[bool, str](r)) { ret r; }
+                    }
+                }
+            }
+            or (d.kind == decl.DECL_KIND_COMPTIME_IF) {
+                val ci: *decl.DeclComptimeIf = ?d.data.comptime_if;
+                var bi: u32 = 0;
+                for (bi < ci.branches_len) {
+                    val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
+                    val rb: R.Result[bool, str] = bind_import_libraries(p, mid, br.body_start, br.body_len);
+                    if (R.is_err[bool, str](rb)) { ret rb; }
+                    bi = bi + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# walk a decl list (recursing into comptime-if branch
+# bodies, where target-selected runtime directives live) and register each
+# link-name exemption against its decl: every `ext fun` foreign symbol
+# (`DECL_FLAG_EXT`) under its bare source name, plus any `#[symbol]`/`#[library]`
+# decorator override. recording these here gives lowering
+# one source of truth, consulted identically at a definition and at every
+# reference so the mangled / literal choice always agrees
+fun scan_export_directives(p: *project.Project, mid: session.ModuleId, source: str, start: u32, len: u32) R.Result[bool, str] {
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    var i: u32 = 0;
+    for (i < len) {
+        val did: id.DeclId = m.a.decl_ids[start + i];
+        val d_opt: O.Option[*decl.Decl] = ast.get_decl(m.a, did);
+        if (O.is_some[*decl.Decl](d_opt)) {
+            val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+            if (d.kind == decl.DECL_KIND_FUN && (d.flags & decl.DECL_FLAG_EXT) != 0) {
+                val r: R.Result[bool, str] = register_ext_fun(p, mid, source, d, did);
+                if (R.is_err[bool, str](r)) { ret r; }
+            }
+            or ((d.kind == decl.DECL_KIND_VAL || d.kind == decl.DECL_KIND_VAR)
+                && (d.flags & decl.DECL_FLAG_EXT) != 0) {
+                val r: R.Result[bool, str] = register_ext_global(p, mid, source, d, did);
+                if (R.is_err[bool, str](r)) { ret r; }
+            }
+            or (d.kind == decl.DECL_KIND_COMPTIME_IF) {
+                val ci: *decl.DeclComptimeIf = ?d.data.comptime_if;
+                var bi: u32 = 0;
+                for (bi < ci.branches_len) {
+                    val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
+                    val rb: R.Result[bool, str] = scan_export_directives(p, mid, source, br.body_start, br.body_len);
+                    if (R.is_err[bool, str](rb)) { ret rb; }
+                    bi = bi + 1;
+                }
+            }
+
+            # leading decorators attach directly to this decl, so a
+            # `#[symbol]` / `#[library]` decorator overrides the bare `ext` default
+            # registered above. run after the kind dispatch so the explicit name
+            # wins (the registries overwrite on a repeated key).
+            if (d.decorators_len > 0::u32) {
+                val rd: R.Result[bool, str] = register_decl_decorators(p, mid, source, d, did);
+                if (R.is_err[bool, str](rd)) { ret rd; }
+            }
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# apply decl `d`'s leading decorators the
+# link-name machinery owns - `#[symbol("name")]` records the literal link name
+# and `#[library("lib")]` pins an `ext` import's library - into the session
+# registries, so a definition and its references resolve the name identically.
+# each takes a single string-literal argument. directives without a link-name
+# effect (section / inline / align) are left for the sema validation pass; a
+# malformed argument is likewise skipped here and diagnosed there
+fun register_decl_decorators(p: *project.Project, mid: session.ModuleId, source: str, d: *decl.Decl, did: id.DeclId) R.Result[bool, str] {
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    var k: u32 = 0;
+    for (k < d.decorators_len) {
+        val dec: *decl.Decorator = ?m.a.decorators[d.decorators_start + k];
+        val is_symbol:  bool = project.span_eq_str(source, dec.name, "symbol");
+        val is_library: bool = project.span_eq_str(source, dec.name, "library");
+
+        if ((is_symbol || is_library) && dec.args_len == 1::u32) {
+            val eid: id.ExprId = m.a.expr_ids[dec.args_start];
+            val ve_opt: O.Option[*expr.Expr] = ast.get_expr(m.a, eid);
+            if (O.is_some[*expr.Expr](ve_opt)) {
+                val ve: *expr.Expr = O.unwrap[*expr.Expr](ve_opt);
+                if (ve.kind == expr.EXPR_KIND_LIT_STR && ve.span.len >= 2::usize) {
+                    # the string literal's inner content, quotes stripped.
+                    var inner: token.Span = ve.span;
+                    inner.offset = inner.offset + 1::usize;
+                    inner.len    = inner.len - 2::usize;
+
+                    val name_r: R.Result[intern.StrId, str] = intern.intern_span(?p.s.interner, source, inner);
+                    if (R.is_err[intern.StrId, str](name_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](name_r)); }
+                    val sid: intern.StrId = R.unwrap_ok[intern.StrId, str](name_r);
+
+                    if (is_library) {
+                        val rl: R.Result[bool, str] = session.register_export_library(p.s, mid, did::u32, sid);
+                        if (R.is_err[bool, str](rl)) { ret rl; }
+                    } or {
+                        val rn: R.Result[bool, str] = session.register_export_name(p.s, mid, did::u32, sid);
+                        if (R.is_err[bool, str](rn)) { ret rn; }
+                    }
+                }
+            }
+        }
+        k = k + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# record an `ext fun` foreign symbol's literal link name (its
+# bare source identifier) as the decl's export override, so it is never mangled.
+# the linker binds it to the imported C / syscall symbol of that name. the bare
+# name is only the default: a `#[symbol("...")]` decorator on the same decl is
+# an explicit override that must win, so registration is skipped when one is
+# already recorded. a decorator scanned later still overwrites the default
+# through register_export_name
+fun register_ext_fun(p: *project.Project, mid: session.ModuleId, source: str, d: *decl.Decl, did: id.DeclId) R.Result[bool, str] {
+    if (O.is_some[intern.StrId](session.export_name(p.s, mid, did::u32))) { ret R.ok[bool, str](true); }
+    val name_r: R.Result[intern.StrId, str] = intern.intern_span(?p.s.interner, source, d.data.fun_.name);
+    if (R.is_err[intern.StrId, str](name_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](name_r)); }
+    ret session.register_export_name(p.s, mid, did::u32, R.unwrap_ok[intern.StrId, str](name_r));
+}
+
+# register an `ext val`/`ext var` foreign data import's bare source name as its
+# link-name exemption, so a definition and every reference resolve to the literal
+# (unmangled) symbol - the data analogue of `register_ext_fun` (#2026)
+fun register_ext_global(p: *project.Project, mid: session.ModuleId, source: str, d: *decl.Decl, did: id.DeclId) R.Result[bool, str] {
+    if (O.is_some[intern.StrId](session.export_name(p.s, mid, did::u32))) { ret R.ok[bool, str](true); }
+    val name_r: R.Result[intern.StrId, str] = intern.intern_span(?p.s.interner, source, d.data.bind.name);
+    if (R.is_err[intern.StrId, str](name_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](name_r)); }
+    ret session.register_export_name(p.s, mid, did::u32, R.unwrap_ok[intern.StrId, str](name_r));
+}

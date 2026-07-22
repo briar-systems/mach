@@ -50,6 +50,7 @@
 # `doc/tooling/test-json.md`; `std.data.json` owns the ASCII-safe encoding.
 
 use std.allocator.arena;
+use std.allocator.page;
 use std.print;
 use std.process.env;
 use std.process.exec;
@@ -58,24 +59,31 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.path;
 use std.types.string.str_contains;
 use std.types.string.str_equals;
 use std.types.string.str_len;
 
-use A:      std.allocator;
-use O:      std.types.option;
-use R:      std.types.result;
-use fmt:    std.format;
-use fs:     std.filesystem;
-use sys:    std.system.os;
-use writer: std.io.writer;
-use tm:     std.chrono.time;
-use du:     std.chrono.duration;
+use A:   std.allocator;
+use O:   std.types.option;
+use R:   std.types.result;
+use fmt: std.format;
+use fs:  std.filesystem;
+use sys: std.system.os;
+use std.io.writer;
+use tm:  std.chrono.time;
+use du:  std.chrono.duration;
 
 use mach.cli.cmd.build;
 use mach.cli.util;
-use cfg:  mach.cli.config;
-use json: std.data.json;
+use mach.cli.args;
+use cli_diag: mach.cli.diagnostic;
+use std.data.json;
+use mach.lang.build.engine;
+use mach.lang.build.plan;
+use mach.lang.build.outcome;
+use mach.lang.build.request;
+use mach.lang.session;
 
 # a test that passed
 val KIND_PASS:   u8 = 0;
@@ -112,7 +120,7 @@ val CAP_OUTPUT: usize = 65536;
 # out_len:   bytes stored in `out`
 # truncated: the child wrote more than the capture buffer held
 rec Outcome {
-    art:       *build.TestArtifact;
+    art:       *outcome.TestArtifact;
     kind:      u8;
     code:      i32;
     elapsed:   du.Duration;
@@ -135,26 +143,32 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     # exclusion; `mach test` also accepts every build flag plus its own. mark them
     # all, then reject any unrecognized flag before the build runs, so an unknown
     # flag never slips through the shared build body.
-    val res_cfg: R.Result[cfg.Config, str] = cfg.parse(argc, argv, marks);
-    if (R.is_err[cfg.Config, str](res_cfg)) {
+    val res_cfg: R.Result[args.CliArgs, str] = args.parse(argc, argv);
+    if (R.is_err[args.CliArgs, str](res_cfg)) {
         print.eprint("error: ");
-        print.eprint(R.unwrap_err[cfg.Config, str](res_cfg));
+        print.eprint(R.unwrap_err[args.CliArgs, str](res_cfg));
         print.eprint("\n");
         ret 1;
     }
-    val config: cfg.Config = R.unwrap_ok[cfg.Config, str](res_cfg);
+    var config: args.CliArgs = R.unwrap_ok[args.CliArgs, str](res_cfg);
 
-    # marking each flag both registers it for the rejector and reads its value, so
-    # there is no second unmarked read to drift. `--include-deps` is marked here for
-    # the rejector and read again in the build layer where it scopes collection.
-    build.mark_build_flags(marks, argc, argv);
-    val list:       bool          = util.mark_flag(marks, argc, argv, "--list");
-    util.mark_flag(marks, argc, argv, "--include-deps");
-    val opt_format: O.Option[*u8] = util.mark_value(marks, argc, argv, "--format");
-    val opt_jobs:   O.Option[*u8] = util.mark_value(marks, argc, argv, "--jobs");
-    val opt_filter: O.Option[*u8] = util.mark_value(marks, argc, argv, "--filter");
-    val opt_runner: O.Option[*u8] = util.mark_value(marks, argc, argv, "--runner");
-    if (util.reject_unknown(argc, argv, marks, 2, "mach test")) { ret 1; }
+    # mark the flags `mach test` accepts from their tables - the cross-cutting set
+    # (`parse` read their values), the `-O` override, the build-flow inputs, and
+    # test's own - then read their values and reject any unrecognized flag before
+    # the build runs. `--include-deps` is captured into the request (via
+    # collect_build) where it scopes collection.
+    args.mark_cross(marks, argc, argv);
+    args.mark_flags(marks, argc, argv, ?args.OPT[0], args.OPT_N);
+    args.mark_flags(marks, argc, argv, ?args.EMIT[0], args.EMIT_N);
+    args.mark_flags(marks, argc, argv, ?args.JOBS[0], args.JOBS_N);
+    args.mark_flags(marks, argc, argv, ?args.LINKIN[0], args.LINKIN_N);
+    args.mark_flags(marks, argc, argv, ?args.TEST_OWN[0], args.TEST_OWN_N);
+    val list:       bool          = util.flag_exists(argc, argv, "--list");
+    val opt_format: O.Option[*u8] = util.flag_value(argc, argv, "--format");
+    val opt_jobs:   O.Option[*u8] = util.flag_value(argc, argv, "--jobs");
+    val opt_filter: O.Option[*u8] = util.flag_value(argc, argv, "--filter");
+    val opt_runner: O.Option[*u8] = util.flag_value(argc, argv, "--runner");
+    if (util.flag_reject_unknown(argc, argv, marks, 2, "mach test")) { ret 1; }
 
     # verbosity comes from the shared config (`-v`/`-vv`; `--verbose` was dropped in
     # #1775): `-v` lists every test as it completes, `-vv` also prints passing output.
@@ -196,22 +210,88 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     # executable path lives in before we exec it. the arena defers all reclamation
     # to a single `arena.dnit`, keeping every artifact path mapped until we are done.
     var backing: A.Allocator;
-    var ar:      arena.Arena;
-    var a:       A.Allocator;
-    if (O.is_some[str](util.bootstrap_arena(?backing, ?ar, ?a))) {
+    if (O.is_some[str](page.make(?backing))) {
+        print.eprint("error: failed to initialise allocator\n");
+        ret 2;
+    }
+    var ar: arena.Arena;
+    if (O.is_some[str](arena.init(?ar, ?backing, 0))) {
+        print.eprint("error: failed to initialise allocator\n");
+        ret 2;
+    }
+    var a: A.Allocator;
+    if (O.is_some[str](arena.make(?a, ?ar))) {
+        arena.dnit(?ar);
         print.eprint("error: failed to initialise allocator\n");
         ret 2;
     }
 
-    val tbr: build.TestBuildResult = build.build_tests(?a, argc, argv, marks, list);
-    if (tbr.code != 0) {
+    # resolve the project root from the required positional path
+    # (`mach test <path>`); see util.resolve_project_root for the rules.
+    val pix: usize = util.arg_index_positional(argc, argv, marks, 2);
+    var root_arg: *u8 = nil;
+    if (pix < argc) { root_arg = argv[pix]; }
+
+    val root_r: R.Result[str, str] = util.resolve_project_root(?a, root_arg);
+    if (R.is_err[str, str](root_r)) {
+        print.eprint("error: ");
+        print.eprint(R.unwrap_err[str, str](root_r));
+        print.eprint("\n");
         arena.dnit(?ar);
-        ret tbr.code;
+        ret 1;
     }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    # capture the build-flow values (`-O`, `--jobs`, `-L` dirs, link tokens,
+    # `--include-deps`) now that the full flag set is marked; past this point
+    # argv is dead to the build flow - the build reads its composed request.
+    val col_r: R.Result[bool, str] = args.collect_build(?a, ?config, argc, argv, marks);
+    if (R.is_err[bool, str](col_r)) {
+        print.eprint("error: ");
+        print.eprint(R.unwrap_err[bool, str](col_r));
+        print.eprint("\n");
+        arena.dnit(?ar);
+        ret 2;
+    }
+
+    # the test flow's build: compose -> plan -> execute, exactly as `mach build`
+    # runs its units; the goal selects the dispatcher build or the collection
+    # pass, and the outcome carries the test artifacts on this command's arena.
+    var goal: request.BuildGoal = request.GOAL_TESTS;
+    if (list) { goal = request.GOAL_TEST_LIST; }
+
+    var ps: session.Session;
+    val plan_r: R.Result[plan.BuildPlan, outcome.Fail] = build.plan_invocation(?a, root, ?config, goal, ?ps);
+    if (R.is_err[plan.BuildPlan, outcome.Fail](plan_r)) {
+        var pf: outcome.Fail = R.unwrap_err[plan.BuildPlan, outcome.Fail](plan_r);
+        val pc: i64 = cli_diag.render_fail(?pf);
+        arena.dnit(?ar);
+        ret pc;
+    }
+    val bp: plan.BuildPlan = R.unwrap_ok[plan.BuildPlan, outcome.Fail](plan_r);
+
+    var rctx: cli_diag.RenderCtx;
+    var rd: outcome.Render = cli_diag.render_sink(?rctx, bp.units.len);
+    val ex_r: R.Result[outcome.BuildOutcome, outcome.Fail] = engine.execute(?bp, ?backing, ?a, nil, ?rd);
+    session.dnit(?ps);
+    if (R.is_err[outcome.BuildOutcome, outcome.Fail](ex_r)) {
+        var xf: outcome.Fail = R.unwrap_err[outcome.BuildOutcome, outcome.Fail](ex_r);
+        val xc: i64 = cli_diag.render_fail(?xf);
+        arena.dnit(?ar);
+        ret xc;
+    }
+    var bo: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](ex_r);
+    if (!bo.ok) {
+        val bc: i64 = cli_diag.outcome_code(?bo);
+        arena.dnit(?ar);
+        ret bc;
+    }
+    val built_tests: *outcome.TestArtifact = bo.tests.data;
+    val built_len:   u32                   = bo.tests.len::u32;
 
     # surface any target-gated own-src modules excluded from collection, so the
     # whole-source test set never drops a module silently (#1873).
-    if (tbr.skipped > 0) { report_skipped(tbr.skipped); }
+    if (bo.tests_skipped > 0) { report_skipped(bo.tests_skipped); }
 
     # `--filter <substr>` (read above) selects at run time: the dispatcher embeds
     # every in-scope test, this command runs (or lists) only the matching ones.
@@ -222,13 +302,13 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     # object per test under `--format json`, else `label file:line`.
     if (list) {
         var lw: writer.Writer;
-        if (json_out) { fs.get_writer(?fs.stdout, ?lw); }
+        if (json_out) { lw = fs.writer(fs.STDOUT); }
         var i: u32 = 0;
-        for (i < tbr.len) {
-            if (filter_matches(?tbr.tests[i], filter)) {
-                if (json_out) { emit_list_case(?lw, ?tbr.tests[i]); }
+        for (i < built_len) {
+            if (filter_matches(?built_tests[i], filter)) {
+                if (json_out) { emit_list_case(?lw, ?built_tests[i]); }
                 or {
-                    artifact_report(?tbr.tests[i]);
+                    artifact_report(?built_tests[i]);
                     print.print("\n");
                 }
             }
@@ -239,20 +319,20 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     }
 
     # the selected artifacts, in collection order (module runs stay adjacent).
-    var selected: *build.TestArtifact = nil;
+    var selected: *outcome.TestArtifact = nil;
     var sel_len:  u32 = 0;
-    if (tbr.len > 0) {
-        val res_sel: R.Result[*build.TestArtifact, str] = A.allocate[build.TestArtifact](?a, tbr.len::usize);
-        if (R.is_err[*build.TestArtifact, str](res_sel)) {
+    if (built_len > 0) {
+        val res_sel: R.Result[*outcome.TestArtifact, str] = A.allocate[outcome.TestArtifact](?a, built_len::usize);
+        if (R.is_err[*outcome.TestArtifact, str](res_sel)) {
             arena.dnit(?ar);
             print.eprint("error: out of memory\n");
             ret 2;
         }
-        selected = R.unwrap_ok[*build.TestArtifact, str](res_sel);
+        selected = R.unwrap_ok[*outcome.TestArtifact, str](res_sel);
         var i: u32 = 0;
-        for (i < tbr.len) {
-            if (filter_matches(?tbr.tests[i], filter)) {
-                selected[sel_len] = tbr.tests[i];
+        for (i < built_len) {
+            if (filter_matches(?built_tests[i], filter)) {
+                selected[sel_len] = built_tests[i];
                 sel_len = sel_len + 1;
             }
             i = i + 1;
@@ -303,13 +383,14 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     # per-test capture files live under `log/` beside the dispatcher. wiping
     # this build's index range at run start leaves the directory holding only
     # the failures of the run about to happen.
-    var log_dir: [4096]u8;
-    if (!capture_log_dir(selected[0].exe, ?log_dir[0], 4096)) {
+    val ld_r: R.Result[str, str] = capture_log_dir(?a, selected[0].exe);
+    if (R.is_err[str, str](ld_r)) {
         arena.dnit(?ar);
-        print.eprint("error: test log path too long\n");
+        print.eprint("error: could not derive the test log directory\n");
         ret 2;
     }
-    wipe_logs(?log_dir[0], tbr.len);
+    val log_dir: str = R.unwrap_ok[str, str](ld_r);
+    wipe_logs(?a, log_dir, built_len);
 
     # the human readout and the JSON stream are sibling renderers over the same
     # per-test event stream; only one is live per run. the human renderer needs
@@ -319,16 +400,16 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
     var hc: HumanCtx;
     var jc: JsonCtx;
     var r:  Renderer;
-    if (json_out) { r = json_renderer(?jc, ?a, ?log_dir[0]); }
+    if (json_out) { r = json_renderer(?jc, ?a, log_dir); }
     or {
         val mod_w:   usize = module_col_width(selected, sel_len);
         val label_w: usize = label_col_width(selected, sel_len);
-        r = human_renderer(?hc, level, mod_w, label_w, runner, ?log_dir[0]);
+        r = human_renderer(?a, ?hc, level, mod_w, label_w, runner, log_dir);
     }
 
     val run_start: tm.Time = tm.monotonic();
     r.fn_start(r.ctx, selected, sel_len);
-    execute_and_render(?a, selected, sel_len, runner, outcomes, level, jobs, ?log_dir[0], !json_out, ?r);
+    execute_and_render(?a, selected, sel_len, runner, outcomes, level, jobs, log_dir, !json_out, ?r);
     val wall: du.Duration = tm.time_sub(tm.monotonic(), run_start);
 
     val failed: u32 = count_failed(outcomes, sel_len);
@@ -349,7 +430,7 @@ pub fun run(argc: usize, argv: **u8, marks: *bool) i64 {
 # f:     the capture file, held open until the child is reaped
 rec Slot {
     pid:   i64;
-    art:   *build.TestArtifact;
+    art:   *outcome.TestArtifact;
     idx:   u32;
     start: tm.Time;
     f:     fs.File;
@@ -376,7 +457,7 @@ rec Slot {
 # want_bytes: retain each failing test's captured output in memory (the human
 #             readout inlines it; the JSON stream references the file instead)
 # r:          the renderer notified as each outcome finalizes
-fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runner: *u8,
+fun execute_and_render(a: *A.Allocator, arts: *outcome.TestArtifact, n: u32, runner: *u8,
                        outcomes: *Outcome, level: u8, jobs: u32, log_dir: *u8,
                        want_bytes: bool, r: *Renderer) {
     var i: u32 = 0;
@@ -417,7 +498,7 @@ fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runne
         for (inflight < window && spawned < n) {
             val idx: u32 = spawned;
             spawned = spawned + 1;
-            if (spawn_one(slots, window, ?arts[idx], idx, runner, log_dir)) {
+            if (spawn_one(a, slots, window, ?arts[idx], idx, runner, log_dir)) {
                 inflight = inflight + 1;
             }
             or {
@@ -435,10 +516,8 @@ fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runne
         }
 
         if (inflight > 0) {
-            var st: exec.ExitStatus;
-            st.raw = 0;
-            val wr: R.Result[exec.Child, str] = exec.wait_any(?st);
-            if (R.is_err[exec.Child, str](wr)) {
+            val wr: R.Result[exec.Reaped, str] = exec.wait_any();
+            if (R.is_err[exec.Reaped, str](wr)) {
                 # nothing reapable despite live children: report each rather
                 # than spinning forever
                 print.eprint("error: waiting for test children failed\n");
@@ -446,7 +525,7 @@ fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runne
                 for (sx < window) {
                     if (slots[sx].pid != 0) {
                         val eidx: u32 = slots[sx].idx;
-                        fs.close(?slots[sx].f);
+                        fs.close(slots[sx].f);
                         outcomes[eidx].art       = slots[sx].art;
                         outcomes[eidx].kind      = KIND_OTHER;
                         outcomes[eidx].code      = 0;
@@ -465,12 +544,13 @@ fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runne
             or {
                 # a pid not in the window is a reparented grandchild; it is not
                 # a test result, so it does not account against the run.
-                val pid: i64 = R.unwrap_ok[exec.Child, str](wr).pid;
+                val reaped: exec.Reaped = R.unwrap_ok[exec.Reaped, str](wr);
+                val pid: i64 = reaped.child.pid;
                 var sx: u32 = 0;
                 for (sx < window) {
                     if (slots[sx].pid == pid) {
                         val fidx: u32 = slots[sx].idx;
-                        finalize_slot(a, ?slots[sx], st, outcomes, level, want_bytes, log_dir);
+                        finalize_slot(a, ?slots[sx], reaped.status, outcomes, level, want_bytes, log_dir);
                         slots[sx].pid = 0;
                         inflight = inflight - 1;
                         done = done + 1;
@@ -494,8 +574,8 @@ fun execute_and_render(a: *A.Allocator, arts: *build.TestArtifact, n: u32, runne
 # fn_summary: run end (outcomes, count, passed, failed, wall time)
 rec Renderer {
     ctx:        ptr;
-    fn_start:   fun(ptr, *build.TestArtifact, u32);
-    fn_test:    fun(ptr, *Outcome, *build.TestArtifact, u32);
+    fn_start:   fun(ptr, *outcome.TestArtifact, u32);
+    fn_test:    fun(ptr, *Outcome, *outcome.TestArtifact, u32);
     fn_summary: fun(ptr, *Outcome, u32, u32, u32, du.Duration);
 }
 
@@ -514,6 +594,7 @@ rec Renderer {
 # cursor:  index of the next outcome to render in collection order
 # first:   index of the current module's first outcome
 rec HumanCtx {
+    a:       *A.Allocator;
     level:   u8;
     mod_w:   usize;
     label_w: usize;
@@ -546,8 +627,9 @@ rec JsonCtx {
 # runner:  resolved `--runner` launcher, or nil
 # log_dir: the capture-file directory
 # ret:     a Renderer bound to `hc`
-fun human_renderer(hc: *HumanCtx, level: u8, mod_w: usize, label_w: usize,
+fun human_renderer(a: *A.Allocator, hc: *HumanCtx, level: u8, mod_w: usize, label_w: usize,
                    runner: *u8, log_dir: *u8) Renderer {
+    hc.a       = a;
     hc.level   = level;
     hc.mod_w   = mod_w;
     hc.label_w = label_w;
@@ -569,7 +651,7 @@ fun human_renderer(hc: *HumanCtx, level: u8, mod_w: usize, label_w: usize,
 # ctx:  the HumanCtx cell
 # arts: the selected artifacts (unused; the cursor reads them per-test)
 # n:    number of selected tests
-fun human_start(ctx: ptr, arts: *build.TestArtifact, n: u32) {
+fun human_start(ctx: ptr, arts: *outcome.TestArtifact, n: u32) {
     val hc: *HumanCtx = ctx::*HumanCtx;
     hc.n      = n;
     hc.cursor = 0;
@@ -588,17 +670,17 @@ fun human_start(ctx: ptr, arts: *build.TestArtifact, n: u32) {
 # outcomes: the run outcomes, finalized in place
 # arts:     the selected artifacts, in collection order
 # idx:      the outcome that just finalized (drives the cursor forward)
-fun human_test(ctx: ptr, outcomes: *Outcome, arts: *build.TestArtifact, idx: u32) {
+fun human_test(ctx: ptr, outcomes: *Outcome, arts: *outcome.TestArtifact, idx: u32) {
     val hc: *HumanCtx = ctx::*HumanCtx;
     for (hc.cursor < hc.n && outcomes[hc.cursor].kind != KIND_PENDING) {
         val c: u32 = hc.cursor;
-        val mod_name: str = util.cstr_str(arts[c].module);
+        val mod_name: str = arts[c].module;
         if (hc.level > 0 && c == hc.first) { print.printf("{}\n", mod_name); }
-        if (hc.level > 0) { print_verbose_test(?outcomes[c], hc.label_w, hc.runner, hc.log_dir); }
+        if (hc.level > 0) { print_verbose_test(hc.a, ?outcomes[c], hc.label_w, hc.runner, hc.log_dir); }
         val last_of_module: bool = c + 1 == hc.n
-            || !str_equals(util.cstr_str(arts[c + 1].module), mod_name);
+            || !str_equals(arts[c + 1].module, mod_name);
         if (last_of_module) {
-            if (hc.level == 0) { render_module_run(outcomes, hc.first, c, mod_name, hc.mod_w, hc.runner, hc.log_dir); }
+            if (hc.level == 0) { render_module_run(hc.a, outcomes, hc.first, c, mod_name, hc.mod_w, hc.runner, hc.log_dir); }
             hc.first = c + 1;
         }
         hc.cursor = c + 1;
@@ -627,7 +709,7 @@ fun json_renderer(jc: *JsonCtx, a: *A.Allocator, log_dir: *u8) Renderer {
     jc.a       = a;
     jc.log_dir = log_dir;
     jc.n       = 0;
-    fs.get_writer(?fs.stdout, ?jc.w);
+    jc.w = fs.writer(fs.STDOUT);
     var r: Renderer;
     r.ctx        = jc::ptr;
     r.fn_start   = json_start;
@@ -652,7 +734,7 @@ fun json_event_begin(w: *writer.Writer, o: *json.Object, event: *u8) {
 # ctx:  the JsonCtx cell
 # arts: the selected artifacts (unused)
 # n:    number of selected tests
-fun json_start(ctx: ptr, arts: *build.TestArtifact, n: u32) {
+fun json_start(ctx: ptr, arts: *outcome.TestArtifact, n: u32) {
     val jc: *JsonCtx = ctx::*JsonCtx;
     jc.n = n;
     var o: json.Object;
@@ -667,10 +749,10 @@ fun json_start(ctx: ptr, arts: *build.TestArtifact, n: u32) {
 # outcomes: the run outcomes, finalized in place
 # arts:     the selected artifacts, in collection order
 # idx:      the outcome to emit
-fun json_test(ctx: ptr, outcomes: *Outcome, arts: *build.TestArtifact, idx: u32) {
+fun json_test(ctx: ptr, outcomes: *Outcome, arts: *outcome.TestArtifact, idx: u32) {
     val jc:  *JsonCtx            = ctx::*JsonCtx;
     val o0:  *Outcome            = ?outcomes[idx];
-    val art: *build.TestArtifact = ?arts[idx];
+    val art: *outcome.TestArtifact = ?arts[idx];
     var o: json.Object;
     json_event_begin(?jc.w, ?o, "test");
     json.field_str(?o, "label", art.label);
@@ -722,21 +804,16 @@ fun json_summary(ctx: ptr, outcomes: *Outcome, n: u32, passed: u32, failed: u32,
 # idx: the test's dispatch index
 # ret: the null-terminated path, or nil on allocation failure
 fun json_output_ref(jc: *JsonCtx, idx: u32) *u8 {
-    # the separator, up to ten index digits, `.log`, and the terminator fit in
-    # 32 bytes past the directory length.
-    val cap: usize = util.cstr_len(jc.log_dir) + 32;
-    val res: R.Result[*u8, str] = A.allocate[u8](jc.a, cap);
-    if (R.is_err[*u8, str](res)) { ret nil; }
-    val buf: *u8 = R.unwrap_ok[*u8, str](res);
-    log_path(buf, cap, jc.log_dir, idx);
-    ret buf;
+    val r: R.Result[str, str] = log_path(jc.a, jc.log_dir, idx);
+    if (R.is_err[str, str](r)) { ret nil; }
+    ret R.unwrap_ok[str, str](r);
 }
 
 # emit one `case` event describing a collected test in `--list` mode
 # ---
 # w:   the stdout writer to emit through
 # art: the collected test artifact
-fun emit_list_case(w: *writer.Writer, art: *build.TestArtifact) {
+fun emit_list_case(w: *writer.Writer, art: *outcome.TestArtifact) {
     var o: json.Object;
     json_event_begin(w, ?o, "case");
     json.field_str(?o, "label", art.label);
@@ -782,15 +859,16 @@ fun has_capture(kind: u8) bool {
 # runner:  resolved `--runner` launcher, or nil to exec the dispatcher directly
 # log_dir: the capture-file directory
 # ret:     true when the child is running and its slot is filled
-fun spawn_one(slots: *Slot, window: u32, art: *build.TestArtifact, idx: u32,
+fun spawn_one(a: *A.Allocator, slots: *Slot, window: u32, art: *outcome.TestArtifact, idx: u32,
               runner: *u8, log_dir: *u8) bool {
     var s: u32 = 0;
     for (s < window && slots[s].pid != 0) { s = s + 1; }
     if (s == window) { ret false; }
 
-    var lp: [4096]u8;
-    if (!log_path(?lp[0], 4096, log_dir, art.idx)) { ret false; }
-    val res_f: R.Result[fs.File, str] = fs.create(util.cstr_str(?lp[0]), 420);
+    val lp_r: R.Result[str, str] = log_path(a, log_dir, art.idx);
+    if (R.is_err[str, str](lp_r)) { ret false; }
+    val lp: str = R.unwrap_ok[str, str](lp_r);
+    val res_f: R.Result[fs.File, str] = fs.create(lp, 420);
     if (R.is_err[fs.File, str](res_f)) { ret false; }
     var f: fs.File = R.unwrap_ok[fs.File, str](res_f);
 
@@ -816,10 +894,10 @@ fun spawn_one(slots: *Slot, window: u32, art: *build.TestArtifact, idx: u32,
 
     val start: tm.Time = tm.monotonic();
     val res_c: R.Result[exec.Child, str] =
-        exec.spawn_redirected(util.cstr_str(child_argv[0]), ?child_argv[0], env.environ(), f.fd, f.fd);
+        exec.spawn_redirected(child_argv[0], ?child_argv[0], env.environ(), f, f);
     if (R.is_err[exec.Child, str](res_c)) {
-        fs.close(?f);
-        fs.unlink(util.cstr_str(?lp[0]));
+        fs.close(f);
+        fs.remove_file(?lp[0]);
         ret false;
     }
 
@@ -856,7 +934,7 @@ fun finalize_slot(a: *A.Allocator, slot: *Slot, st: exec.ExitStatus,
     o.truncated = false;
     o.elapsed   = tm.time_sub(tm.monotonic(), slot.start);
 
-    fs.close(?slot.f);
+    fs.close(slot.f);
 
     if (exec.exited(st) && exec.code(st) == 0) { o.kind = KIND_PASS; }
     or (exec.signaled(st)) {
@@ -870,14 +948,15 @@ fun finalize_slot(a: *A.Allocator, slot: *Slot, st: exec.ExitStatus,
     }
     or { o.kind = KIND_OTHER; }
 
-    var lp: [4096]u8;
-    if (log_path(?lp[0], 4096, log_dir, slot.art.idx)) {
+    val lp_r: R.Result[str, str] = log_path(a, log_dir, slot.art.idx);
+    if (R.is_ok[str, str](lp_r)) {
+        val lp: str = R.unwrap_ok[str, str](lp_r);
         if (o.kind == KIND_PASS) {
-            if (want_bytes && level >= 2) { retain_from_file(a, ?o, util.cstr_str(?lp[0])); }
-            fs.unlink(util.cstr_str(?lp[0]));
+            if (want_bytes && level >= 2) { retain_from_file(a, ?o, lp); }
+            fs.remove_file(lp);
         }
         or {
-            if (want_bytes) { retain_from_file(a, ?o, util.cstr_str(?lp[0])); }
+            if (want_bytes) { retain_from_file(a, ?o, lp); }
         }
     }
 
@@ -899,30 +978,30 @@ fun retain_from_file(a: *A.Allocator, o: *Outcome, path: str) {
     if (R.is_err[fs.File, str](res_f)) { ret; }
     var f: fs.File = R.unwrap_ok[fs.File, str](res_f);
 
-    val res_fi: R.Result[fs.FileInfo, str] = fs.info(?f);
-    if (R.is_err[fs.FileInfo, str](res_fi)) { fs.close(?f); ret; }
-    val size: usize = R.unwrap_ok[fs.FileInfo, str](res_fi).size;
+    val res_fi: R.Result[fs.Metadata, str] = fs.stat_of(f);
+    if (R.is_err[fs.Metadata, str](res_fi)) { fs.close(f); ret; }
+    val size: usize = R.unwrap_ok[fs.Metadata, str](res_fi).size;
 
     var stored: usize = size;
     if (stored > CAP_OUTPUT) {
         stored      = CAP_OUTPUT;
         o.truncated = true;
     }
-    if (stored == 0) { fs.close(?f); ret; }
+    if (stored == 0) { fs.close(f); ret; }
 
     val res_buf: R.Result[*u8, str] = A.allocate[u8](a, stored);
-    if (R.is_err[*u8, str](res_buf)) { fs.close(?f); ret; }
+    if (R.is_err[*u8, str](res_buf)) { fs.close(f); ret; }
     val dst: *u8 = R.unwrap_ok[*u8, str](res_buf);
 
     var got: usize = 0;
     for (got < stored) {
-        val res_n: R.Result[usize, str] = fs.read(?f, (dst::usize + got)::*u8, stored - got);
+        val res_n: R.Result[usize, str] = fs.read(f, (dst::usize + got)::*u8, stored - got);
         if (R.is_err[usize, str](res_n)) { brk; }
         val n: usize = R.unwrap_ok[usize, str](res_n);
         if (n == 0) { brk; }
         got = got + n;
     }
-    fs.close(?f);
+    fs.close(f);
 
     if (got == 0) { ret; }
     o.out     = dst;
@@ -939,7 +1018,7 @@ fun retain_from_file(a: *A.Allocator, o: *Outcome, path: str) {
 # mod_w:    module column width
 # runner:   resolved `--runner` launcher, or nil (for the rerun command)
 # log_dir:  the capture-file directory (for the full-output pointer)
-fun render_module_run(outcomes: *Outcome, first: u32, last: u32, mod_name: str, mod_w: usize,
+fun render_module_run(a: *A.Allocator, outcomes: *Outcome, first: u32, last: u32, mod_name: str, mod_w: usize,
                       runner: *u8, log_dir: *u8) {
     var ok:      u32 = 0;
     var fail:    u32 = 0;
@@ -956,7 +1035,7 @@ fun render_module_run(outcomes: *Outcome, first: u32, last: u32, mod_name: str, 
     if (fail > 0) {
         j = first;
         for (j <= last) {
-            if (outcomes[j].kind != KIND_PASS) { print_fail_detail(?outcomes[j], runner, log_dir); }
+            if (outcomes[j].kind != KIND_PASS) { print_fail_detail(a, ?outcomes[j], runner, log_dir); }
             j = j + 1;
         }
     }
@@ -968,11 +1047,11 @@ fun render_module_run(outcomes: *Outcome, first: u32, last: u32, mod_name: str, 
 # arts: the selected test artifacts
 # n:    number of artifacts
 # ret:  the column width in bytes
-fun module_col_width(arts: *build.TestArtifact, n: u32) usize {
+fun module_col_width(arts: *outcome.TestArtifact, n: u32) usize {
     var w: usize = 0;
     var i: u32 = 0;
     for (i < n) {
-        val l: usize = str_len(util.cstr_str(arts[i].module));
+        val l: usize = str_len(arts[i].module);
         if (l > w) { w = l; }
         i = i + 1;
     }
@@ -987,11 +1066,11 @@ fun module_col_width(arts: *build.TestArtifact, n: u32) usize {
 # arts: the selected test artifacts
 # n:    number of artifacts
 # ret:  the column width in bytes
-fun label_col_width(arts: *build.TestArtifact, n: u32) usize {
+fun label_col_width(arts: *outcome.TestArtifact, n: u32) usize {
     var w: usize = 0;
     var i: u32 = 0;
     for (i < n) {
-        val l: usize = str_len(util.cstr_str(arts[i].label));
+        val l: usize = str_len(arts[i].label);
         if (l > w) { w = l; }
         i = i + 1;
     }
@@ -1051,13 +1130,13 @@ fun print_rollup(mod_name: str, ok: u32, fail: u32, elapsed: du.Duration, mod_w:
 # o:       the failing outcome
 # runner:  resolved `--runner` launcher, or nil
 # log_dir: the capture-file directory
-fun print_fail_detail(o: *Outcome, runner: *u8, log_dir: *u8) {
-    val label: str = util.cstr_str(o.art.label);
-    print.printf("  FAIL  {}  {}:{}  ", label, util.cstr_str(o.art.file), o.art.line::i64);
+fun print_fail_detail(a: *A.Allocator, o: *Outcome, runner: *u8, log_dir: *u8) {
+    val label: str = o.art.label;
+    print.printf("  FAIL  {}  {}:{}  ", label, o.art.file, o.art.line::i64);
     print_reason(o);
     print.print("\n");
     print_captured(o);
-    print_fail_pointers(o, runner, log_dir);
+    print_fail_pointers(a, o, runner, log_dir);
 }
 
 # write a failing test's trailing pointers: `full output:` when the retained
@@ -1067,11 +1146,11 @@ fun print_fail_detail(o: *Outcome, runner: *u8, log_dir: *u8) {
 # o:       the failing outcome
 # runner:  resolved `--runner` launcher, or nil
 # log_dir: the capture-file directory
-fun print_fail_pointers(o: *Outcome, runner: *u8, log_dir: *u8) {
+fun print_fail_pointers(a: *A.Allocator, o: *Outcome, runner: *u8, log_dir: *u8) {
     if (o.truncated) {
-        var lp: [4096]u8;
-        if (log_path(?lp[0], 4096, log_dir, o.art.idx)) {
-            print.printf("    full output: {}\n", util.cstr_str(?lp[0]));
+        val lp_r: R.Result[str, str] = log_path(a, log_dir, o.art.idx);
+        if (R.is_ok[str, str](lp_r)) {
+            print.printf("    full output: {}\n", R.unwrap_ok[str, str](lp_r));
         }
     }
     print.print("    rerun: ");
@@ -1092,8 +1171,8 @@ fun print_fail_pointers(o: *Outcome, runner: *u8, log_dir: *u8) {
 # label_w: label column width
 # runner:  resolved `--runner` launcher, or nil (for the rerun command)
 # log_dir: the capture-file directory (for the full-output pointer)
-fun print_verbose_test(o: *Outcome, label_w: usize, runner: *u8, log_dir: *u8) {
-    val label: str = util.cstr_str(o.art.label);
+fun print_verbose_test(a: *A.Allocator, o: *Outcome, label_w: usize, runner: *u8, log_dir: *u8) {
+    val label: str = o.art.label;
     if (o.kind == KIND_PASS) {
         print.print("  ok    ");
         print_col(label, label_w);
@@ -1107,9 +1186,9 @@ fun print_verbose_test(o: *Outcome, label_w: usize, runner: *u8, log_dir: *u8) {
         print_dur(o.elapsed);
         print.print("  ");
         print_reason(o);
-        print.printf("  {}:{}\n", util.cstr_str(o.art.file), o.art.line::i64);
+        print.printf("  {}:{}\n", o.art.file, o.art.line::i64);
         print_captured(o);
-        print_fail_pointers(o, runner, log_dir);
+        print_fail_pointers(a, o, runner, log_dir);
     }
 }
 
@@ -1138,7 +1217,7 @@ fun print_captured(o: *Outcome) {
     }
 
     var w: writer.Writer;
-    fs.get_writer(?fs.stdout, ?w);
+    w = fs.writer(fs.STDOUT);
 
     var i:   usize = 0;
     var seg: usize = 0;
@@ -1175,8 +1254,8 @@ fun render_summary(outcomes: *Outcome, len: u32, passed: u32, failed: u32, wall:
         for (i < len) {
             if (outcomes[i].kind != KIND_PASS) {
                 print.printf("  {}  {}:{}  ",
-                    util.cstr_str(outcomes[i].art.label),
-                    util.cstr_str(outcomes[i].art.file),
+                    outcomes[i].art.label,
+                    outcomes[i].art.file,
                     outcomes[i].art.line::i64);
                 print_reason(?outcomes[i]);
                 print.print("\n");
@@ -1210,7 +1289,7 @@ fun count_failed(outcomes: *Outcome, len: u32) u32 {
 # newline (the `--list` line shape)
 # ---
 # art: the test artifact to describe
-fun artifact_report(art: *build.TestArtifact) {
+fun artifact_report(art: *outcome.TestArtifact) {
     print.print(art.label::str);
     print.print(" ");
     print.print(art.file::str);
@@ -1224,9 +1303,9 @@ fun artifact_report(art: *build.TestArtifact) {
 # art:    the artifact to check
 # filter: the filter substring, or nil to select everything
 # ret:    true when selected
-fun filter_matches(art: *build.TestArtifact, filter: *u8) bool {
+fun filter_matches(art: *outcome.TestArtifact, filter: *u8) bool {
     if (filter == nil) { ret true; }
-    ret str_contains(util.cstr_str(art.label), util.cstr_str(filter));
+    ret str_contains(art.label, filter);
 }
 
 # print the per-run note that `n` own-source modules were excluded as target-gated
@@ -1238,7 +1317,7 @@ fun report_skipped(n: u32) {
     var buf: [16]u8;
     write_index(?buf[0], 16, n);
     print.eprint("note: skipped ");
-    print.eprint(util.cstr_str(?buf[0]));
+    print.eprint(?buf[0]);
     if (n == 1) { print.eprint(" target-gated module\n"); }
     or          { print.eprint(" target-gated modules\n"); }
 }
@@ -1280,60 +1359,47 @@ fun parse_count(s: *u8) i64 {
 # derive the capture-file directory - `log/` beside the dispatcher - from the
 # dispatcher's executable path
 # ---
+# a:   allocator for the result
 # exe: the dispatcher executable path
-# buf: the destination buffer, receiving `<exe dir>/log` null-terminated
-# cap: the buffer capacity
-# ret: false when the result would not fit
-fun capture_log_dir(exe: *u8, buf: *u8, cap: usize) bool {
-    val el: usize = str_len(exe::str);
-    # the directory prefix ends at the last path separator, either flavor
-    var cut: usize = 0;
-    var i: usize = 0;
-    for (i < el) {
-        if (exe[i] == '/' || exe[i] == 92) { cut = i + 1; }
-        i = i + 1;
-    }
-    if (cut + 4 >= cap) { ret false; }
-    i = 0;
-    for (i < cut) { buf[i] = exe[i]; i = i + 1; }
-    buf[cut]     = 'l';
-    buf[cut + 1] = 'o';
-    buf[cut + 2] = 'g';
-    buf[cut + 3] = 0;
-    ret true;
+# ret: the `<exe dir>/log` path, or an error
+fun capture_log_dir(a: *A.Allocator, exe: *u8) R.Result[str, str] {
+    val dir_r: R.Result[str, str] = path.parent(a, exe::str);
+    if (R.is_err[str, str](dir_r)) { ret dir_r; }
+    ret path.join(a, R.unwrap_ok[str, str](dir_r), "log");
 }
 
-# compose `<log_dir>/<idx>.log` into `buf`
+# compose the `<log_dir>/<idx>.log` capture path, allocated from `a`
 # ---
-# buf:     the destination buffer
-# cap:     the buffer capacity
+# a:       allocator for the result
 # log_dir: the capture-file directory
 # idx:     the test's dispatch index
-# ret:     false when the result would not fit
-fun log_path(buf: *u8, cap: usize, log_dir: *u8, idx: u32) bool {
+# ret:     the capture path, or an error
+fun log_path(a: *A.Allocator, log_dir: *u8, idx: u32) R.Result[str, str] {
     var leaf: [24]u8;
     write_index(?leaf[0], 16, idx);
-    var k: usize = str_len(util.cstr_str(?leaf[0]));
+    var k: usize = str_len(?leaf[0]);
     leaf[k]     = '.';
     leaf[k + 1] = 'l';
     leaf[k + 2] = 'o';
     leaf[k + 3] = 'g';
     leaf[k + 4] = 0;
-    ret util.join_into(buf, cap, log_dir, ?leaf[0]) > 0;
+    ret path.join(a, log_dir::str, (?leaf[0])::str);
 }
 
 # remove every capture file this build could have written, so `log/` carries
 # only the run about to happen; the directory is created on the way
 # ---
+# a:       allocator for the transient capture paths
 # log_dir: the capture-file directory
 # total:   the build's dispatch-index count (indices are 0..total-1)
-fun wipe_logs(log_dir: *u8, total: u32) {
-    var lp: [4096]u8;
+fun wipe_logs(a: *A.Allocator, log_dir: *u8, total: u32) {
     var idx: u32 = 0;
     for (idx < total) {
-        if (log_path(?lp[0], 4096, log_dir, idx)) {
-            if (idx == 0) { util.ensure_parents(?lp[0]); }
-            fs.unlink(util.cstr_str(?lp[0]));
+        val lp_r: R.Result[str, str] = log_path(a, log_dir, idx);
+        if (R.is_ok[str, str](lp_r)) {
+            val lp: str = R.unwrap_ok[str, str](lp_r);
+            if (idx == 0) { util.ensure_parents(a, lp); }
+            fs.remove_file(lp);
         }
         idx = idx + 1;
     }

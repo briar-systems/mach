@@ -73,7 +73,11 @@ than each carrying their own.
   comptime values.
 - No decl-attached prefix sugar (`$inline pub fun ...` does not exist) —
   use `#[...]` decorators (see [decorators.md](decorators.md)).
-- No comptime function definitions, no comptime loops.
+- No comptime function definitions, and no comptime *execution* — the channel
+  selects and expands, it never runs a loop or mutates state. `$each` is not a
+  counterexample: it splices its body once per element of a fixed comptime
+  sequence (a variadic pack, `$fields(T)`, or a constant array `val`), a bounded
+  structural expansion resolved at compile time, not an iterated computation.
 - No bare `$ident` — see above.
 
 ## See also

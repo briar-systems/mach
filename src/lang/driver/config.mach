@@ -1,0 +1,1164 @@
+# manifest-to-config resolution, target selection, and build-step execution
+#
+# Parses the project (and each dep's) mach.toml, resolves the build selection
+# into one ProjectConfig - a single synthesized target entry plus the unit's
+# concrete, template-expanded output paths and step plan - and composes the
+# selected Target from the registry. Also resolves artifact paths for tooling,
+# validates local link inputs, and runs the manifest's build steps (with glob
+# input expansion and content-fingerprint stamping) for the project and its
+# export-demanded dependencies. Sits atop the load, deps, and union submodules;
+# the facade sequences it around the passes.
+
+use std.collections.sort;
+use std.collections.vector;
+use std.crypto.hash.sha256;
+use ehex: std.encoding.hex;
+use std.data.toml;
+use std.format;
+use fs: std.filesystem;
+use std.collections.vector.Vector;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_compare;
+use std.types.string.str_contains_char;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+use std.types.string.str_copy_slice;
+use spath: std.types.path;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+use sysos: std.system.os;
+use std.process.exec;
+use std.print;
+
+use mach.lang.diagnostic;
+use mach.lang.fe.token;
+use mach.lang.intern;
+use mach.lang.manifest;
+use src: mach.lang.source;
+use mach.lang.target;
+
+use mach.lang.driver.project;
+use dq: mach.lang.driver.query;
+use mach.lang.driver.load;
+use ddep: mach.lang.driver.deps;
+use mach.lang.driver.union;
+
+# resolve a build selection's output-artifact path WITHOUT compiling
+#
+# Reads the project's root manifest, resolves the selection (target, profile,
+# artifact) into one build unit, and returns the produced-artifact path rooted at
+# `project_root` - the exact path `mach build` produces for the same selection.
+# `mach run` uses it to locate and execute the already-built binary instead of
+# rebuilding. Only the manifest is read: no module graph is loaded and no
+# dependencies are resolved. The transient toml table, interner, and manifest are
+# all suballocated from `alloc` and reclaimed when it is (pass an arena); the
+# returned path is owned by `alloc`.
+# ---
+# alloc:        allocator for the transient manifest state and the returned path
+# project_root: the resolved project root directory
+# sel:          the build selection narrowing target/profile/artifact
+# ret:          ok(owned absolute artifact path), or err(manifest/selection message)
+pub fun resolve_artifact_path(alloc: *A.Allocator, project_root: str, sel: *manifest.Selection) R.Result[str, str] {
+    val mp_r: R.Result[str, str] = load.join_path(alloc, project_root, manifest.MANIFEST_FILE);
+    if (R.is_err[str, str](mp_r)) { ret R.err[str, str](R.unwrap_err[str, str](mp_r)); }
+    val manifest_path: str = R.unwrap_ok[str, str](mp_r);
+
+    val toml_r: R.Result[toml.Table, str] = ddep.parse_toml_file(alloc, manifest_path);
+    if (R.is_err[toml.Table, str](toml_r)) { ret R.err[str, str](R.unwrap_err[toml.Table, str](toml_r)); }
+    var t: toml.Table = R.unwrap_ok[toml.Table, str](toml_r);
+
+    var itn: intern.Interner = intern.init(alloc);
+    val mr: R.Result[manifest.Manifest, str] = manifest.parse(alloc, ?itn, ?t, true);
+    if (R.is_err[manifest.Manifest, str](mr)) { ret R.err[str, str](R.unwrap_err[manifest.Manifest, str](mr)); }
+    var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](mr);
+
+    val ur: R.Result[manifest.BuildUnit, str] = manifest.resolve_build_unit(alloc, ?itn, ?m, @sel);
+    if (R.is_err[manifest.BuildUnit, str](ur)) {
+        manifest.dnit(?m, alloc);
+        ret R.err[str, str](R.unwrap_err[manifest.BuildUnit, str](ur));
+    }
+    val bu: manifest.BuildUnit = R.unwrap_ok[manifest.BuildUnit, str](ur);
+
+    val bin_opt: O.Option[str] = intern.lookup(?itn, bu.bin_path);
+    if (O.is_none[str](bin_opt) || str_empty(O.unwrap[str](bin_opt))) {
+        manifest.dnit(?m, alloc);
+        ret R.err[str, str]("selected artifact has no output path; set the `out` template in mach.toml");
+    }
+    val abs_r: R.Result[str, str] = load.join_path(alloc, project_root, O.unwrap[str](bin_opt));
+    manifest.dnit(?m, alloc);
+    ret abs_r;
+}
+
+# read and parse the manifest at `manifest_path`, then synthesize the ProjectConfig
+# through load_config. `manifest_path` is borrowed for the read (conventionally
+# `<project_root>/mach.toml`, or an alternate manifest the CLI resolved).
+pub fun load_project_config(p: *project.Project, project_root: str, manifest_path: str, sel: *manifest.Selection, for_union: bool, is_test: bool) R.Result[bool, str] {
+    val toml_r: R.Result[toml.Table, str] = ddep.parse_toml_file(p.alloc, manifest_path);
+    if (R.is_err[toml.Table, str](toml_r)) { ret R.err[bool, str](R.unwrap_err[toml.Table, str](toml_r)); }
+    var t: toml.Table = R.unwrap_ok[toml.Table, str](toml_r);
+
+    ret load_config(p, project_root, ?t, sel, for_union, is_test);
+}
+
+# parse the manifest out of its toml table, synthesize the ProjectConfig, and
+# tear the manifest down - the self-contained path for entries that were not
+# handed a pre-parsed manifest (doc, union, driver tests)
+fun load_config(p: *project.Project, project_root: str, t: *toml.Table, sel: *manifest.Selection, for_union: bool, is_test: bool) R.Result[bool, str] {
+    val mr: R.Result[manifest.Manifest, str] = manifest.parse(p.alloc, ?p.s.interner, t, true);
+    if (R.is_err[manifest.Manifest, str](mr)) { ret R.err[bool, str](R.unwrap_err[manifest.Manifest, str](mr)); }
+    var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](mr);
+    val r: R.Result[bool, str] = load_config_manifest(p, project_root, ?m, sel, for_union, is_test);
+    manifest.dnit(?m, p.alloc);
+    ret r;
+}
+
+# deep-copy an interned-id array into `alloc`; on a nil/empty source or an
+# allocation failure the destination degrades to nil/0 (the inline behavior this
+# replaces across the link/step config copies)
+fun dup_strid_array(alloc: *A.Allocator, src: *intern.StrId, count: u32, out: **intern.StrId, out_count: *u32) {
+    if (src == nil || count == 0) { @out = nil; @out_count = 0; ret; }
+    val r: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](alloc, count::usize);
+    if (R.is_err[*intern.StrId, str](r)) { @out = nil; @out_count = 0; ret; }
+    val arr: *intern.StrId = R.unwrap_ok[*intern.StrId, str](r);
+    var i: u32 = 0;
+    for (i < count) { arr[i] = src[i]; i = i + 1; }
+    @out       = arr;
+    @out_count = count;
+}
+
+# resolve the build selection against a parsed manifest into one build unit and
+# synthesize the ProjectConfig the rest of the driver consumes - a single target
+# entry plus the unit's concrete, template-expanded output paths. collisions are
+# checked before anything is built. a `native` selection that finds no host
+# match emits an unmissable warning here. the manifest is borrowed: the caller
+# owns it (the CLI hands its once-loaded manifest forward; nothing here
+# re-parses or frees it)
+pub fun load_config_manifest(p: *project.Project, project_root: str, m: *manifest.Manifest, sel: *manifest.Selection, for_union: bool, is_test: bool) R.Result[bool, str] {
+    val abs_root_r: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, project_root);
+    if (R.is_err[intern.StrId, str](abs_root_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](abs_root_r)); }
+    p.config.project_root = R.unwrap_ok[intern.StrId, str](abs_root_r);
+
+    # the primary selection drives the ctx every module resolves under. union mode
+    # (#1505): several declared artifacts with no selector is NOT the ambiguity
+    # `build_project_sel` raises - the union takes the first declared artifact as the
+    # primary (mirroring resolve_native's first-declared-target fallback) and unions
+    # the rest's entries below. a single-artifact or selected build is untouched.
+    var eff_sel: manifest.Selection;
+    eff_sel.target       = sel.target;
+    eff_sel.profile      = sel.profile;
+    eff_sel.artifact     = sel.artifact;
+    eff_sel.want_lib     = sel.want_lib;
+    eff_sel.has_artifact = sel.has_artifact;
+    # `mach test` (is_test) links the whole source tree, not one artifact, so like a
+    # union build it takes the first declared artifact as the primary ctx rather than
+    # raising the multi-artifact ambiguity `build_project_sel` would.
+    if ((for_union || is_test) && !eff_sel.has_artifact && m.artifact_count > 1) {
+        val an_opt: O.Option[str] = intern.lookup(?p.s.interner, m.artifacts[0].name);
+        if (O.is_none[str](an_opt)) { ret R.err[bool, str]("internal: union primary artifact name not interned"); }
+        eff_sel.artifact     = O.unwrap[str](an_opt);
+        eff_sel.want_lib     = m.artifacts[0].is_lib;
+        eff_sel.has_artifact = true;
+    }
+
+    val ur: R.Result[manifest.BuildUnit, str] = manifest.resolve_build_unit(p.alloc, ?p.s.interner, m, eff_sel);
+    if (R.is_err[manifest.BuildUnit, str](ur)) {
+        ret R.err[bool, str](R.unwrap_err[manifest.BuildUnit, str](ur));
+    }
+    val bu: manifest.BuildUnit = R.unwrap_ok[manifest.BuildUnit, str](ur);
+
+    # the closed template-variable set for this build cell (#1964): the target tuple
+    # and profile every {target.*}/{profile.name} path and cmd expands against.
+    var cell_v: manifest.TmplVars = manifest.tmpl_vars_of(?p.s.interner, bu.target,
+        O.unwrap[str](intern.lookup(?p.s.interner, bu.profile_name)));
+
+    # honest collision guard over every artifact for the selected target/profile.
+    val cr: R.Result[bool, str] = manifest.check_collisions(p.alloc, ?p.s.interner, m, ?cell_v);
+    if (R.is_err[bool, str](cr)) {
+        ret R.err[bool, str](R.unwrap_err[bool, str](cr));
+    }
+
+    if (bu.warned) { emit_native_warning(p, bu.target_name); }
+
+    # synthesize the single target entry the downstream driver selects on.
+    val ter: R.Result[*project.TargetEntry, str] = A.allocate[project.TargetEntry](p.alloc, 1::usize);
+    if (R.is_err[*project.TargetEntry, str](ter)) { ret R.err[bool, str](R.unwrap_err[*project.TargetEntry, str](ter)); }
+    val targets: *project.TargetEntry = R.unwrap_ok[*project.TargetEntry, str](ter);
+    var entry: project.TargetEntry;
+    entry.name       = bu.target_name;
+    entry.os_name    = bu.target.os;
+    entry.isa_name   = bu.target.isa;
+    entry.abi_name   = bu.target.abi;
+    entry.of_name    = bu.target.of;
+    entry.entrypoint = bu.entry;
+    entry.mode       = project.MODE_EXECUTABLE;
+    if (bu.is_lib) { entry.mode = project.MODE_LIBRARY; }
+    entry.lib_kind   = bu.kind;
+    entry.opt        = project.map_opt(bu.opt);
+    entry.libs       = bu.libs;
+    entry.lib_count  = bu.lib_count;
+    targets[0] = entry;
+
+    p.config.id           = m.id;
+    p.config.version      = m.version;
+    p.config.name         = m.name;
+    p.config.description  = m.description;
+    # the artifact name feeds `$bin.name`; STR_NIL when the selection bound none.
+    if (bu.artifact != nil) { p.config.bin_name = bu.artifact.name; }
+    p.config.module       = intern.STR_NIL;
+    if (m.artifact_count > 0) {
+        p.config.module = m.artifacts[0].entry;
+    }
+    p.config.dir_src      = m.src;
+    val res_dep_id: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, "dep");
+    if (R.is_ok[intern.StrId, str](res_dep_id)) {
+        p.config.dir_dep = R.unwrap_ok[intern.StrId, str](res_dep_id);
+    }
+    p.config.targets      = targets;
+    p.config.target_count = 1;
+    p.config.bin_out      = bu.bin_path;
+    p.config.obj_root     = bu.obj_root;
+    p.config.ir_root      = bu.ir_root;
+    p.config.asm_root     = bu.asm_root;
+    p.config.test_root    = bu.test_root;
+    p.config.emit_ir      = bu.emit_ir;
+    p.config.emit_asm     = bu.emit_asm;
+    p.config.debug        = bu.debug;
+    p.config.simd         = bu.simd;
+    p.config.defines       = bu.defines;
+    p.config.define_count  = bu.define_count;
+    p.target_entry        = ?p.config.targets[0];
+    p.config.profile      = bu.profile_name;
+    p.config.step_order       = nil;
+    p.config.step_order_count = 0;
+
+    val out_tmpl_s: str = O.unwrap[str](intern.lookup(?p.s.interner, m.out_tmpl));
+    val res_project_out_str: R.Result[str, str] = manifest.expand(p.alloc, out_tmpl_s, "", ?cell_v);
+    if (R.is_ok[str, str](res_project_out_str)) {
+        val project_out_str: str = R.unwrap_ok[str, str](res_project_out_str);
+        val res_po_id: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, project_out_str);
+        if (R.is_ok[intern.StrId, str](res_po_id)) {
+            p.config.project_out = R.unwrap_ok[intern.StrId, str](res_po_id);
+        }
+        # up-front local link path validation (#1969): a `local` entry's path must
+        # match a step's `out` (demanding it) or exist on disk; anything else errors
+        # here naming the entry, instead of flowing to the linker to fail at link time.
+        val vr: R.Result[bool, str] = validate_local_links(p, project_root, m, bu.target, project_out_str, ?cell_v);
+        if (R.is_err[bool, str](vr)) { str_free(p.alloc, project_out_str); ret R.err[bool, str](R.unwrap_err[bool, str](vr)); }
+
+        # `mach test` links the union of every artifact's referenced entries (native
+        # target), not just the primary's, plus the exported dep entries the cascade
+        # pass adds below (#1964). replaces the single-artifact libs synthesized above.
+        if (is_test) {
+            var test_items: *intern.StrId = nil;
+            var test_count: u32 = 0;
+            val tlr: R.Result[bool, str] = manifest.resolve_test_libs(p.alloc, ?p.s.interner, m, bu.target, project_out_str, ?cell_v, ?test_items, ?test_count);
+            if (R.is_err[bool, str](tlr)) { str_free(p.alloc, project_out_str); ret R.err[bool, str](R.unwrap_err[bool, str](tlr)); }
+            p.config.targets[0].libs      = test_items;
+            p.config.targets[0].lib_count = test_count;
+        }
+
+        # compute which steps this build demands, in run order (#1970). indices are
+        # into m.steps, which p.config.steps mirrors 1:1 when copied below.
+        val spr: R.Result[bool, str] = compute_step_plan(p, m, ?bu, is_test, for_union, project_out_str, ?cell_v);
+        if (R.is_err[bool, str](spr)) { str_free(p.alloc, project_out_str); ret R.err[bool, str](R.unwrap_err[bool, str](spr)); }
+        str_free(p.alloc, project_out_str);
+    }
+
+    # Copy links to ProjectConfig
+    p.config.links      = nil;
+    p.config.link_count = 0;
+    if (m.link_count > 0) {
+        val res_links: R.Result[*manifest.LinkDef, str] = A.allocate[manifest.LinkDef](p.alloc, m.link_count::usize);
+        if (R.is_ok[*manifest.LinkDef, str](res_links)) {
+            val links: *manifest.LinkDef = R.unwrap_ok[*manifest.LinkDef, str](res_links);
+            var li: u32 = 0;
+            for (li < m.link_count) {
+                var d: manifest.LinkDef = m.links[li];
+                dup_strid_array(p.alloc, d.os,  d.os_count,  ?d.os,  ?d.os_count);
+                dup_strid_array(p.alloc, d.isa, d.isa_count, ?d.isa, ?d.isa_count);
+                dup_strid_array(p.alloc, d.abi, d.abi_count, ?d.abi, ?d.abi_count);
+                links[li] = d;
+                li = li + 1;
+            }
+            p.config.links      = links;
+            p.config.link_count = m.link_count;
+        }
+    }
+    
+    # Copy steps to ProjectConfig
+    p.config.steps      = nil;
+    p.config.step_count = 0;
+    if (m.step_count > 0) {
+        val res_steps: R.Result[*manifest.StepDef, str] = A.allocate[manifest.StepDef](p.alloc, m.step_count::usize);
+        if (R.is_ok[*manifest.StepDef, str](res_steps)) {
+            val steps: *manifest.StepDef = R.unwrap_ok[*manifest.StepDef, str](res_steps);
+            var si: u32 = 0;
+            for (si < m.step_count) {
+                var d: manifest.StepDef = m.steps[si];
+                dup_strid_array(p.alloc, d.in,   d.in_count,   ?d.in,   ?d.in_count);
+                dup_strid_array(p.alloc, d.out,  d.out_count,  ?d.out,  ?d.out_count);
+                dup_strid_array(p.alloc, d.need, d.need_count, ?d.need, ?d.need_count);
+                steps[si] = d;
+                si = si + 1;
+            }
+            p.config.steps      = steps;
+            p.config.step_count = m.step_count;
+        }
+    }
+
+    val dr: R.Result[bool, str] = ddep.resolve_deps(p, m, project_root);
+    if (R.is_err[bool, str](dr)) { ret dr; }
+
+    val isa_opt: O.Option[str] = intern.lookup(?p.s.interner, bu.target.isa);
+    val os_opt: O.Option[str] = intern.lookup(?p.s.interner, bu.target.os);
+    val abi_opt: O.Option[str] = intern.lookup(?p.s.interner, bu.target.abi);
+    if (O.is_none[str](isa_opt) || O.is_none[str](os_opt) || O.is_none[str](abi_opt)) {
+        ret R.err[bool, str]("internal: selected target tuple not interned");
+    }
+    # dedup exported dep entries against the effective own link surface: the union
+    # for a test build, the single artifact's libs otherwise (both held by the
+    # synthesized target entry).
+    val cr2: R.Result[bool, str] = ddep.resolve_cascade_libs(p, project_root,
+        O.unwrap[str](isa_opt), O.unwrap[str](os_opt), O.unwrap[str](abi_opt),
+        p.target_entry.libs, p.target_entry.lib_count);
+    if (R.is_err[bool, str](cr2)) { ret cr2; }
+
+    # multi-target tooling build (#1391): record every manifest target's tuple so
+    # the union load walk can follow each target's `$if` branches. multi-artifact
+    # tooling build (#1505): record every artifact's entry FQN so the union loads
+    # the closure over the whole (target x artifact) matrix.
+    if (for_union) {
+        val ut: R.Result[bool, str] = union.populate_union_tuples(p, m);
+        if (R.is_err[bool, str](ut)) { ret ut; }
+        val ue: R.Result[bool, str] = union.populate_union_entries(p, m);
+        if (R.is_err[bool, str](ue)) { ret ue; }
+    }
+
+    ret R.ok[bool, str](true);
+}
+
+# file the `native` no-match warning on the session
+# diagnostic sink, naming the host tuple and the target being built instead.
+# filing it (rather than racing a raw stderr write) gives it a `warning:` label
+# and renders it in order with the structured diagnostics. the warning is not
+# tied to a source span, so it carries an out-of-range file id and renders
+# message-only
+fun emit_native_warning(p: *project.Project, target_name: intern.StrId) {
+    val tuple: str = manifest.host_tuple(p.alloc);
+    val name_opt: O.Option[str] = intern.lookup(?p.s.interner, target_name);
+    var name: str = "?";
+    if (O.is_some[str](name_opt)) { name = O.unwrap[str](name_opt); }
+
+    val res_msg: R.Result[str, str] = format.sprint(p.alloc, "no declared target matches the host ({}); building '{}'", tuple, name);
+    if (R.is_err[str, str](res_msg)) { str_free(p.alloc, tuple); ret; }
+    val buf: str = R.unwrap_ok[str, str](res_msg);
+
+    var span: token.Span;
+    span.offset = 0;
+    span.len    = 0;
+    diagnostic.warning(?p.s.diags, 0xFFFFFFFF::src.FileId, span, buf);
+
+    str_free(p.alloc, buf);
+    str_free(p.alloc, tuple);
+}
+
+# build the up-front local-path validation error for a link entry that names
+# neither a step output nor an existing file
+fun local_link_error(alloc: *A.Allocator, name: str, path: str) str {
+    val res_msg: R.Result[str, str] = format.sprint(alloc, "mach.toml: [link.{}] path '{}' matches no step output and does not exist on disk", name, path);
+    if (R.is_err[str, str](res_msg)) { ret "mach.toml: a local link path matches no step output and does not exist on disk"; }
+    ret R.unwrap_ok[str, str](res_msg);
+}
+
+# compute the demanded step plan for the current build cell and store it in
+# p.config.step_order (#1970). demand is driven by the selected artifact for a plain
+# build, or by every declared artifact for a test/union link (which links them all).
+# ---
+# p:        the active project, receiving the plan
+# m:        the parsed root manifest
+# bu:       the resolved build unit (its artifact / target drive demand)
+# is_test:  a `mach test` link (union of all artifacts)
+# for_union: a multi-artifact union build
+# proj_out: the expanded project out the entry paths and step outs home against
+# v:        the target/profile template variables for path expansion
+fun compute_step_plan(p: *project.Project, m: *manifest.Manifest, bu: *manifest.BuildUnit,
+                      is_test: bool, for_union: bool, proj_out: str, v: *manifest.TmplVars) R.Result[bool, str] {
+    p.config.step_order       = nil;
+    p.config.step_order_count = 0;
+    if (m.step_count == 0) { ret R.ok[bool, str](true); }
+
+    var names:  *intern.StrId = nil;
+    var ncount: u32           = 0;
+    var owned:  bool          = false;
+    if ((is_test || for_union) && m.artifact_count > 0) {
+        val ar: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](p.alloc, m.artifact_count::usize);
+        if (R.is_err[*intern.StrId, str](ar)) { ret R.err[bool, str](R.unwrap_err[*intern.StrId, str](ar)); }
+        names = R.unwrap_ok[*intern.StrId, str](ar);
+        owned = true;
+        var i: u32 = 0;
+        for (i < m.artifact_count) { names[i] = m.artifacts[i].name; i = i + 1; }
+        ncount = m.artifact_count;
+    }
+    or {
+        if (bu.artifact == nil) { ret R.ok[bool, str](true); }
+        names  = ?bu.artifact.name;
+        ncount = 1;
+    }
+
+    var order: *u32 = nil;
+    var count: u32  = 0;
+    val r: R.Result[bool, str] = manifest.plan_steps(p.alloc, ?p.s.interner, m, names, ncount, bu.target, proj_out, v, ?order, ?count);
+    if (owned) { A.deallocate[intern.StrId](p.alloc, names, m.artifact_count::usize); }
+    if (R.is_err[bool, str](r)) { ret r; }
+    p.config.step_order       = order;
+    p.config.step_order_count = count;
+    ret R.ok[bool, str](true);
+}
+
+# validate every `local` [link.X] path up-front (#1969): it must match a declared
+# step's `out` (which will produce it) or already exist on disk, else an error names
+# the entry here rather than failing at link time. paths expand against the build
+# cell; the disk check resolves relative to the project root.
+fun validate_local_links(p: *project.Project, project_root: str, m: *manifest.Manifest, t: *manifest.TargetDef, proj_out: str, v: *manifest.TmplVars) R.Result[bool, str] {
+    val local_r: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, "local");
+    if (R.is_err[intern.StrId, str](local_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](local_r)); }
+    val local_id: intern.StrId = R.unwrap_ok[intern.StrId, str](local_r);
+
+    var li: u32 = 0;
+    for (li < m.link_count) {
+        val l: *manifest.LinkDef = ?m.links[li];
+        # only entries selected for this build cell are validated: a cross-target
+        # prebuilt (e.g. os=["windows"]) filters out of a linux build and is skipped,
+        # never expanded against the wrong cell.
+        if (l.source == local_id && manifest.link_matches_target(?p.s.interner, l, t)) {
+            val path_opt: O.Option[str] = intern.lookup(?p.s.interner, l.path);
+            val name_opt: O.Option[str] = intern.lookup(?p.s.interner, l.name);
+            if (O.is_none[str](path_opt) || O.is_none[str](name_opt)) { ret R.err[bool, str]("internal: link entry metadata not interned"); }
+            val raw_path: str = O.unwrap[str](path_opt);
+            val ename:    str = O.unwrap[str](name_opt);
+
+            val exp_r: R.Result[str, str] = manifest.expand(p.alloc, raw_path, proj_out, v);
+            if (R.is_err[str, str](exp_r)) { ret R.err[bool, str](R.unwrap_err[str, str](exp_r)); }
+            val exp: str = R.unwrap_ok[str, str](exp_r);
+
+            var ok_: bool = manifest.local_path_demanded_by_step(p.alloc, ?p.s.interner, m, exp, proj_out, v);
+            if (!ok_) {
+                val abs_r: R.Result[str, str] = load.join_path(p.alloc, project_root, exp);
+                if (R.is_ok[str, str](abs_r)) {
+                    val abs: str = R.unwrap_ok[str, str](abs_r);
+                    ok_ = fs.exists(abs);
+                    str_free(p.alloc, abs);
+                }
+            }
+            if (!ok_) {
+                val msg: str = local_link_error(p.alloc, ename, exp);
+                str_free(p.alloc, exp);
+                ret R.err[bool, str](msg);
+            }
+            str_free(p.alloc, exp);
+        }
+        li = li + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# resolve the selected TargetEntry into a composed
+# target.Target. passes the entry's isa/os/abi/of names to target.select_of, which
+# composes the isa/abi/os/of vtables by name and stores the result on Project. an
+# unknown os/isa name is reported with a precise diagnostic before select runs; an
+# empty of name defers to the os default; an unregistered substrate fails through
+# target.select_of. pointer width is not stored here - consumers read it through
+# p.target.arch
+pub fun select_target(p: *project.Project, t: *project.TargetEntry) R.Result[bool, str] {
+    val os_opt: O.Option[str] = intern.lookup(?p.s.interner, t.os_name);
+    if (O.is_none[str](os_opt)) { ret R.err[bool, str]("target os name not interned"); }
+    val os_name: str = O.unwrap[str](os_opt);
+
+    val isa_opt: O.Option[str] = intern.lookup(?p.s.interner, t.isa_name);
+    if (O.is_none[str](isa_opt)) { ret R.err[bool, str]("target isa name not interned"); }
+    val isa_name: str = O.unwrap[str](isa_opt);
+
+    val abi_opt: O.Option[str] = intern.lookup(?p.s.interner, t.abi_name);
+    if (O.is_none[str](abi_opt)) { ret R.err[bool, str]("target abi name not interned"); }
+    val abi_name: str = O.unwrap[str](abi_opt);
+
+    # the object-format override is optional; an unset/empty name defers to the os
+    # default inside select_of.
+    var of_name: str = "";
+    val of_opt: O.Option[str] = intern.lookup(?p.s.interner, t.of_name);
+    if (O.is_some[str](of_opt)) { of_name = O.unwrap[str](of_opt); }
+
+    # select_of composes the tuple and rejects an unregistered os / isa / abi / of
+    # name with a diagnostic that names the value and lists the live registry - the
+    # single owner of that check, so no manifest-side pre-validation duplicates it.
+    val tr: R.Result[target.Target, str] = target.select_of(?p.s.registry, isa_name, os_name, abi_name, of_name);
+    if (R.is_err[target.Target, str](tr)) { ret R.err[bool, str](R.unwrap_err[target.Target, str](tr)); }
+    p.target = R.unwrap_ok[target.Target, str](tr);
+
+    val rcn: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, "mach");
+    if (R.is_err[intern.StrId, str](rcn)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](rcn)); }
+    p.compiler_name = R.unwrap_ok[intern.StrId, str](rcn);
+
+    val rcv: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, load.MACH_VERSION);
+    if (R.is_err[intern.StrId, str](rcv)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](rcv)); }
+    p.compiler_ver = R.unwrap_ok[intern.StrId, str](rcv);
+
+    ret R.ok[bool, str](true);
+}
+
+# format `fmt` with `va` into a fresh owned string, or "" on allocation failure -
+# the driver's step-string composer over format.sprint (the manifest.sfmt precedent)
+fun sfmt(alloc: *A.Allocator, fmt: str, va: ...) str {
+    val r: R.Result[str, str] = format.sprint(alloc, fmt, va...);
+    if (R.is_err[str, str](r)) { ret ""; }
+    ret R.unwrap_ok[str, str](r);
+}
+
+# lexicographic byte order, for sorting expanded input paths into a stable order
+fun cmp_str(a: *str, b: *str) i64 {
+    ret str_compare(@a, @b);
+}
+
+# whether the single path segment `name` matches the `*`-glob `pat` (no '/' in either)
+pub fun wildcard_match(pat: str, name: str) bool {
+    val pn: usize = str_len(pat);
+    val nn: usize = str_len(name);
+    var pi: usize = 0;
+    var ni: usize = 0;
+    var star: i64 = -1;
+    var mark: usize = 0;
+    for (ni < nn) {
+        if (pi < pn && pat[pi] == '*'::u8) { star = pi::i64; mark = ni; pi = pi + 1; }
+        or (pi < pn && pat[pi] == name[ni]) { pi = pi + 1; ni = ni + 1; }
+        or (star >= 0) { pi = (star::usize) + 1; mark = mark + 1; ni = mark; }
+        or { ret false; }
+    }
+    for (pi < pn && pat[pi] == '*'::u8) { pi = pi + 1; }
+    ret pi == pn;
+}
+
+# handle one directory entry while globbing: match a file basename against `pat`
+# (pushing `<base_rel>/<name>`), or recurse into a subdirectory when `recursive`
+fun glob_visit(alloc: *A.Allocator, root: str, base_rel: str, name: str, pat: str, recursive: bool, out: *vector.Vector[str]) R.Result[bool, str] {
+    val child_rel_r: R.Result[str, str] = load.join_path(alloc, base_rel, name);
+    if (R.is_err[str, str](child_rel_r)) { ret R.err[bool, str](R.unwrap_err[str, str](child_rel_r)); }
+    val child_rel: str = R.unwrap_ok[str, str](child_rel_r);
+
+    val child_abs_r: R.Result[str, str] = load.join_path(alloc, root, child_rel);
+    if (R.is_err[str, str](child_abs_r)) { str_free(alloc, child_rel); ret R.err[bool, str](R.unwrap_err[str, str](child_abs_r)); }
+    val child_abs: str = R.unwrap_ok[str, str](child_abs_r);
+    val fi_r: R.Result[fs.Metadata, str] = fs.metadata_link(child_abs);
+    str_free(alloc, child_abs);
+    if (R.is_err[fs.Metadata, str](fi_r)) { str_free(alloc, child_rel); ret R.ok[bool, str](true); }
+    val fi: fs.Metadata = R.unwrap_ok[fs.Metadata, str](fi_r);
+
+    if (fs.meta_is_dir(?fi) && recursive) {
+        val rr: R.Result[bool, str] = glob_walk(alloc, root, child_rel, pat, recursive, out);
+        str_free(alloc, child_rel);
+        ret rr;
+    }
+    or (fs.meta_is_file(?fi) && wildcard_match(pat, name)) {
+        # the vector takes ownership of child_rel
+        val pr: R.Result[usize, str] = vector.push[str](out, child_rel);
+        if (R.is_err[usize, str](pr)) { str_free(alloc, child_rel); ret R.err[bool, str](R.unwrap_err[usize, str](pr)); }
+        ret R.ok[bool, str](true);
+    }
+    str_free(alloc, child_rel);
+    ret R.ok[bool, str](true);
+}
+
+# enumerate `<root>/<base_rel>`, appending each matching file as `<base_rel>/<name>`
+# relative to root; recurse into subdirectories when `recursive`. a missing directory
+# yields no matches (the empty-match error is the caller's).
+fun glob_walk(alloc: *A.Allocator, root: str, base_rel: str, pat: str, recursive: bool, out: *vector.Vector[str]) R.Result[bool, str] {
+    val dir_abs_r: R.Result[str, str] = load.join_path(alloc, root, base_rel);
+    if (R.is_err[str, str](dir_abs_r)) { ret R.err[bool, str](R.unwrap_err[str, str](dir_abs_r)); }
+    val dir_abs: str = R.unwrap_ok[str, str](dir_abs_r);
+
+    val fd_raw: i64 = sysos.open(sysos.AT_FDCWD, dir_abs, sysos.O_RDONLY | sysos.O_DIRECTORY, 0);
+    str_free(alloc, dir_abs);
+    if (fd_raw < 0) { ret R.ok[bool, str](true); }
+    val fd: i32 = fd_raw::i32;
+
+    var dbuf: [8192]u8;
+    var result: R.Result[bool, str] = R.ok[bool, str](true);
+    var reading: bool = true;
+    for (reading) {
+        val nread: i64 = sysos.read_dir(fd, (?dbuf[0])::*sysos.dirent64, 8192);
+        if (nread < 0)  { result = R.err[bool, str](sysos.message(nread)); reading = false; }
+        or (nread == 0) { reading = false; }
+        or {
+            var pos: usize = 0;
+            for (reading && pos < nread::usize) {
+                val ent:    *sysos.dirent64 = ((?dbuf[0])::usize + pos)::*sysos.dirent64;
+                val reclen: usize           = ent.d_reclen::usize;
+                if (reclen == 0) { reading = false; }
+                or {
+                    val name: *u8 = ?ent.d_name[0];
+                    # skip dot entries entirely - a `*` never matches a dot-file and `**`
+                    # never descends a dot-dir (e.g. `.git`), matching shell glob rules.
+                    if (name[0] != '.'::u8) {
+                        val rr: R.Result[bool, str] = glob_visit(alloc, root, base_rel, name::str, pat, recursive, out);
+                        if (R.is_err[bool, str](rr)) { result = rr; reading = false; }
+                    }
+                    pos = pos + reclen;
+                }
+            }
+        }
+    }
+    sysos.close(fd);
+    ret result;
+}
+
+# whether `pattern` is a glob shape the expander supports: `*` only in the final path
+# segment, with at most one standalone `**` directory segment before it. rejects a `*`
+# in a middle segment or a `**` fused into a name (#1989 review).
+pub fun glob_shape_ok(pattern: str) bool {
+    val n: usize = str_len(pattern);
+    var final_start: usize = 0;
+    var j: usize = 0;
+    for (j < n) { if (pattern[j] == '/'::u8) { final_start = j + 1; } j = j + 1; }
+
+    var dstar: u32 = 0;
+    var i: usize = 0;
+    for (i < final_start) {
+        var seg_end: usize = i;
+        for (seg_end < n && pattern[seg_end] != '/'::u8) { seg_end = seg_end + 1; }
+        val slen: usize = seg_end - i;
+        if (slen > 0) {
+            if (slen == 2 && pattern[i] == '*'::u8 && pattern[i + 1] == '*'::u8) { dstar = dstar + 1; }
+            or {
+                var k: usize = i;
+                for (k < seg_end) { if (pattern[k] == '*'::u8) { ret false; } k = k + 1; }
+            }
+        }
+        i = seg_end + 1;
+    }
+    if (dstar > 1) { ret false; }
+
+    # the final segment may hold single `*` wildcards but not a `**`
+    var f: usize = final_start;
+    var prev_star: bool = false;
+    for (f < n) {
+        if (pattern[f] == '*'::u8) {
+            if (prev_star) { ret false; }
+            prev_star = true;
+        }
+        or { prev_star = false; }
+        f = f + 1;
+    }
+    ret true;
+}
+
+# expand one `*`/`**` pattern (relative to `project_root`) into `out`. `<dir>/**/<pat>`
+# walks `<dir>` recursively matching `<pat>` at any depth; `<dir>/<pat>` or a bare
+# `<pat>` walks a single level.
+fun glob_expand_pattern(alloc: *A.Allocator, project_root: str, pattern: str, out: *vector.Vector[str]) R.Result[bool, str] {
+    val n: usize = str_len(pattern);
+    var star2: i64 = -1;
+    var i: usize = 0;
+    for (i + 1 < n && star2 < 0) {
+        if (pattern[i] == '*'::u8 && pattern[i + 1] == '*'::u8) { star2 = i::i64; }
+        i = i + 1;
+    }
+
+    if (star2 >= 0) {
+        val sp: usize = star2::usize;
+        var base_end: usize = sp;
+        if (base_end > 0 && pattern[base_end - 1] == '/'::u8) { base_end = base_end - 1; }
+        val base_r: R.Result[str, str] = str_copy_slice(alloc, pattern, 0, base_end);
+        if (R.is_err[str, str](base_r)) { ret R.err[bool, str](R.unwrap_err[str, str](base_r)); }
+        val base: str = R.unwrap_ok[str, str](base_r);
+        var pat_start: usize = sp + 2;
+        if (pat_start < n && pattern[pat_start] == '/'::u8) { pat_start = pat_start + 1; }
+        val pat_r: R.Result[str, str] = str_copy_slice(alloc, pattern, pat_start, n - pat_start);
+        if (R.is_err[str, str](pat_r)) { str_free(alloc, base); ret R.err[bool, str](R.unwrap_err[str, str](pat_r)); }
+        val pat: str = R.unwrap_ok[str, str](pat_r);
+        var base_use: str = base;
+        if (str_empty(base)) { base_use = "."; }
+        val gr: R.Result[bool, str] = glob_walk(alloc, project_root, base_use, pat, true, out);
+        str_free(alloc, base);
+        str_free(alloc, pat);
+        ret gr;
+    }
+
+    var last: i64 = -1;
+    i = 0;
+    for (i < n) { if (pattern[i] == '/'::u8) { last = i::i64; } i = i + 1; }
+    if (last < 0) { ret glob_walk(alloc, project_root, ".", pattern, false, out); }
+    val dir_r: R.Result[str, str] = str_copy_slice(alloc, pattern, 0, last::usize);
+    if (R.is_err[str, str](dir_r)) { ret R.err[bool, str](R.unwrap_err[str, str](dir_r)); }
+    val dir: str = R.unwrap_ok[str, str](dir_r);
+    val pat_r: R.Result[str, str] = str_copy_slice(alloc, pattern, (last::usize) + 1, n - ((last::usize) + 1));
+    if (R.is_err[str, str](pat_r)) { str_free(alloc, dir); ret R.err[bool, str](R.unwrap_err[str, str](pat_r)); }
+    val pat: str = R.unwrap_ok[str, str](pat_r);
+    val gr: R.Result[bool, str] = glob_walk(alloc, project_root, dir, pat, false, out);
+    str_free(alloc, dir);
+    str_free(alloc, pat);
+    ret gr;
+}
+
+# expand a step's `in` list into concrete input files (templates then globs), sorted
+# for a stable order (#1970). a `*`/`**` pattern expands against `project_root` and an
+# empty match is a hard error; a plain path is taken literally. `out` receives owned
+# path strings the caller frees.
+fun collect_step_inputs(alloc: *A.Allocator, p: *project.Project, step: *manifest.StepDef, project_root: str, home_out: str, out: *vector.Vector[str]) R.Result[bool, str] {
+    var v: manifest.TmplVars = ddep.cell_tmpl_vars(p);
+    var i: u32 = 0;
+    for (i < step.in_count) {
+        val exp_r: R.Result[str, str] = manifest.expand(alloc, O.unwrap[str](intern.lookup(?p.s.interner, step.in[i])), home_out, ?v);
+        if (R.is_err[str, str](exp_r)) { ret R.err[bool, str](R.unwrap_err[str, str](exp_r)); }
+        val exp: str = R.unwrap_ok[str, str](exp_r);
+        if (!str_contains_char(exp, '*')) {
+            val pr: R.Result[usize, str] = vector.push[str](out, exp);
+            if (R.is_err[usize, str](pr)) { str_free(alloc, exp); ret R.err[bool, str](R.unwrap_err[usize, str](pr)); }
+        }
+        or {
+            if (!glob_shape_ok(exp)) {
+                val msg: str = sfmt(alloc, "mach.toml: step input glob '{}' has an unsupported shape; wildcards are allowed only in the final path segment, with an optional '**' directory segment (e.g. 'dir/*.c' or 'dir/**/*.c')", exp);
+                str_free(alloc, exp);
+                ret R.err[bool, str](msg);
+            }
+            val before: usize = out.len;
+            val gr: R.Result[bool, str] = glob_expand_pattern(alloc, project_root, exp, out);
+            if (R.is_err[bool, str](gr)) { str_free(alloc, exp); ret gr; }
+            if (out.len == before) {
+                val msg: str = sfmt(alloc, "mach.toml: step input glob '{}' matched no files", exp);
+                str_free(alloc, exp);
+                ret R.err[bool, str](msg);
+            }
+            str_free(alloc, exp);
+        }
+        i = i + 1;
+    }
+    sort.sort[str](out.data, out.len, cmp_str);
+    ret R.ok[bool, str](true);
+}
+
+# free the owned input paths in `ins` and the vector backing it
+fun step_free_inputs(alloc: *A.Allocator, ins: *vector.Vector[str]) {
+    var i: usize = 0;
+    for (i < ins.len) { str_free(alloc, ins.data[i]); i = i + 1; }
+    vector.dnit[str](ins);
+}
+
+# the sha256 content fingerprint of a step: the sorted input paths, each input's
+# content hash, and the expanded cmd - reusing the Q_LINK_CONFIG fingerprint helpers.
+# being content-based, a touch that changes no bytes does not invalidate while a cmd
+# or source edit does. this is the SINGLE place the composition lives.
+#
+# The digest is persisted per step in a stamp file rather than a query kind because
+# the query DB is in-memory per process today, so a fresh build would hold no prior
+# revision to compare against; folding step caching into the persisted query store is
+# deferred to the incremental epic (#1164). `digest` receives 32 bytes.
+pub fun step_fingerprint(a: *A.Allocator, project_root: str, ins: *vector.Vector[str], cmd_expanded: str, digest: *u8) R.Result[bool, str] {
+    var fb: dq.FpBuf;
+    fb.alloc = a;
+    fb.buf   = nil;
+    fb.len   = 0;
+    fb.cap   = 0;
+    var i: usize = 0;
+    for (i < ins.len) {
+        val wp: R.Result[bool, str] = dq.fp_cstr(?fb, ins.data[i]::*u8);
+        if (R.is_err[bool, str](wp)) { dq.fp_free(?fb); ret wp; }
+        val abs_r: R.Result[str, str] = load.join_path(a, project_root, ins.data[i]);
+        if (R.is_err[str, str](abs_r)) { dq.fp_free(?fb); ret R.err[bool, str](R.unwrap_err[str, str](abs_r)); }
+        val abs: str = R.unwrap_ok[str, str](abs_r);
+        val wc: R.Result[bool, str] = dq.fp_file_content(?fb, a, abs::*u8);
+        str_free(a, abs);
+        if (R.is_err[bool, str](wc)) { dq.fp_free(?fb); ret wc; }
+        i = i + 1;
+    }
+    val wcmd: R.Result[bool, str] = dq.fp_cstr(?fb, cmd_expanded::*u8);
+    if (R.is_err[bool, str](wcmd)) { dq.fp_free(?fb); ret wcmd; }
+    sha256.hash(fb.buf, fb.len::usize, digest);
+    dq.fp_free(?fb);
+    ret R.ok[bool, str](true);
+}
+
+# lowercase hex of `len` digest bytes, as a fresh owned string
+fun digest_hex(a: *A.Allocator, digest: *u8, len: usize) str {
+    val cap: usize = ehex.encoded_len(len);
+    val rb: R.Result[*u8, str] = A.allocate[u8](a, cap);
+    if (R.is_err[*u8, str](rb)) { ret ""; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+    ehex.encode(digest, len, buf, cap);
+    ret buf::str;
+}
+
+# the stamp path `<root_project>/<root_out>/.steps/<owner>.<step>.stamp`, rooted at the
+# ROOT project dir so it resolves independently of the invoker's cwd (#1989 review);
+# per-cell (the fingerprint expands per cell) and owner-id-keyed so same-named steps in
+# two deps never collide
+pub fun step_stamp_path(a: *A.Allocator, root_project: str, root_out: str, owner_id: str, step_name: str) str {
+    val fname: str = sfmt(a, "{}.{}.stamp", owner_id, step_name);
+    val d1_r: R.Result[str, str] = load.join_path(a, root_project, root_out);
+    if (R.is_err[str, str](d1_r)) { str_free(a, fname); ret ""; }
+    val d1: str = R.unwrap_ok[str, str](d1_r);
+    val d2_r: R.Result[str, str] = load.join_path(a, d1, ".steps");
+    str_free(a, d1);
+    if (R.is_err[str, str](d2_r)) { str_free(a, fname); ret ""; }
+    val d2: str = R.unwrap_ok[str, str](d2_r);
+    val path_r: R.Result[str, str] = load.join_path(a, d2, fname);
+    str_free(a, d2);
+    str_free(a, fname);
+    if (R.is_err[str, str](path_r)) { ret ""; }
+    ret R.unwrap_ok[str, str](path_r);
+}
+
+# whether the stamp at `path` exists and holds exactly `hex`
+fun stamp_matches(a: *A.Allocator, path: str, hex: str) bool {
+    val rr: R.Result[str, str] = fs.read_string(a, path);
+    if (R.is_err[str, str](rr)) { ret false; }
+    val prior: str = R.unwrap_ok[str, str](rr);
+    val eq: bool = str_equals(prior, hex);
+    str_free(a, prior);
+    ret eq;
+}
+
+# whether every declared output of `step` exists on disk (checked from `project_root`)
+fun step_outputs_exist(a: *A.Allocator, p: *project.Project, step: *manifest.StepDef, project_root: str, home_out: str) bool {
+    var v: manifest.TmplVars = ddep.cell_tmpl_vars(p);
+    var oi: u32 = 0;
+    for (oi < step.out_count) {
+        val out_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](intern.lookup(?p.s.interner, step.out[oi])), home_out, ?v);
+        if (R.is_err[str, str](out_r)) { ret false; }
+        val out_s: str = R.unwrap_ok[str, str](out_r);
+        val abs_r: R.Result[str, str] = load.join_path(a, project_root, out_s);
+        str_free(a, out_s);
+        if (R.is_err[str, str](abs_r)) { ret false; }
+        val abs: str = R.unwrap_ok[str, str](abs_r);
+        val ex: bool = fs.exists(abs);
+        str_free(a, abs);
+        if (!ex) { ret false; }
+        oi = oi + 1;
+    }
+    ret true;
+}
+
+# write `hex` to the (fully rooted) stamp `path`, creating its parent `.steps` dir.
+# best effort - a write failure only costs the next build a re-run, never correctness.
+fun write_stamp(a: *A.Allocator, path: str, hex: str) {
+    val dir_r: R.Result[str, str] = spath.parent(a, path);
+    if (R.is_ok[str, str](dir_r)) {
+        val dir: str = R.unwrap_ok[str, str](dir_r);
+        fs.create_dir_all(a, dir, 0o755);
+        str_free(a, dir);
+    }
+    fs.write_bytes(path, hex::*u8, str_len(hex), 0o644);
+}
+
+# create the parent directory of every declared output before a step runs, so a cmd
+# that assumes its out tree exists (no `mkdir`, like the RFC's miniz example) does not
+# fail at the tool (#1989 review). outputs expand against the ROOT out (a clean path,
+# no `..`) and are rooted at the ROOT project dir so they land in the project's out
+# tree regardless of the invoker's cwd - for both root and dep steps.
+fun step_make_output_dirs(a: *A.Allocator, p: *project.Project, step: *manifest.StepDef) R.Result[bool, str] {
+    val root_out: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_out));
+    val root_project: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_root));
+    var v: manifest.TmplVars = ddep.cell_tmpl_vars(p);
+    var oi: u32 = 0;
+    for (oi < step.out_count) {
+        val out_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](intern.lookup(?p.s.interner, step.out[oi])), root_out, ?v);
+        if (R.is_err[str, str](out_r)) { ret R.err[bool, str](R.unwrap_err[str, str](out_r)); }
+        val out_s: str = R.unwrap_ok[str, str](out_r);
+        # path.parent yields "." for a dirless output (never ""), which roots at the
+        # project dir - an existing directory - so a dirless output creates nothing new.
+        val dir_r: R.Result[str, str] = spath.parent(a, out_s);
+        str_free(a, out_s);
+        if (R.is_err[str, str](dir_r)) { ret R.err[bool, str](R.unwrap_err[str, str](dir_r)); }
+        val rel_dir: str = R.unwrap_ok[str, str](dir_r);
+        val abs_r: R.Result[str, str] = load.join_path(a, root_project, rel_dir);
+        str_free(a, rel_dir);
+        if (R.is_err[str, str](abs_r)) { ret R.err[bool, str](R.unwrap_err[str, str](abs_r)); }
+        val abs_dir: str = R.unwrap_ok[str, str](abs_r);
+        val mr: O.Option[str] = fs.create_dir_all(a, abs_dir, 0o755);
+        str_free(a, abs_dir);
+        if (O.is_some[str](mr)) { ret R.err[bool, str](O.unwrap[str](mr)); }
+        oi = oi + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# the step process environment: the inherited environment plus three appended
+# "MACH_TARGET_*=..." cstrings (#1964). the three strings are owned by the caller; only
+# the returned array is allocated here (freed by step_env_free). nil on allocation
+# failure.
+fun step_env(a: *A.Allocator, isa_env: str, os_env: str, abi_env: str) **u8 {
+    val base: **u8 = sysos.environ();
+    var n: usize = 0;
+    for (base[n] != nil) { n = n + 1; }
+    val rb: R.Result[**u8, str] = A.allocate[*u8](a, n + 4);
+    if (R.is_err[**u8, str](rb)) { ret nil; }
+    val env: **u8 = R.unwrap_ok[**u8, str](rb);
+    var i: usize = 0;
+    for (i < n) { env[i] = base[i]; i = i + 1; }
+    env[n]     = isa_env::*u8;
+    env[n + 1] = os_env::*u8;
+    env[n + 2] = abi_env::*u8;
+    env[n + 3] = nil;
+    ret env;
+}
+
+# free the array step_env allocated (not the inherited entries, which the runtime owns,
+# nor the three appended cstrings, which the caller frees)
+fun step_env_free(a: *A.Allocator, env: **u8) {
+    var n: usize = 0;
+    for (env[n] != nil) { n = n + 1; }
+    A.deallocate[*u8](a, env, (n + 1)::usize);
+}
+
+# run one step from `project_root` (its shell CWD), homing `{project.out}` to
+# `home_out`. root steps home to the root out and run from the root; a dependency's
+# steps run from the dep checkout and home to a path that climbs back to the root out
+# (#1970), so `vendor/*` inputs resolve while outputs land in the consumer tree.
+# `owner_id` is the project id owning the step, keying its stamp file. the step process
+# inherits MACH_TARGET_ISA/OS/ABI for the active cell (#1964).
+fun run_one_step(a: *A.Allocator, p: *project.Project, step: *manifest.StepDef, project_root: str, home_out: str, owner_id: str) R.Result[bool, str] {
+    val project_out_s: str = home_out;
+    var v: manifest.TmplVars = ddep.cell_tmpl_vars(p);
+    val step_name: str = O.unwrap[str](intern.lookup(?p.s.interner, step.name));
+
+    # `in`/`out`/`cmd` home through the closed template set ({project.out},
+    # {target.name}, {target.isa}, {target.os}, {target.abi}, {profile.name}); an
+    # unknown `{a.b}` is a hard error and shell `$VAR` is left to the shell. `in` globs
+    # expand sorted against project_root (empty match errors).
+    var ins: vector.Vector[str] = vector.init[str](a);
+    val cir: R.Result[bool, str] = collect_step_inputs(a, p, step, project_root, home_out, ?ins);
+    if (R.is_err[bool, str](cir)) { step_free_inputs(a, ?ins); ret R.err[bool, str](R.unwrap_err[bool, str](cir)); }
+
+    val cmd_r: R.Result[str, str] = manifest.expand(a, O.unwrap[str](intern.lookup(?p.s.interner, step.cmd)), project_out_s, ?v);
+    if (R.is_err[str, str](cmd_r)) { step_free_inputs(a, ?ins); ret R.err[bool, str](R.unwrap_err[str, str](cmd_r)); }
+    val expanded_cmd: str = R.unwrap_ok[str, str](cmd_r);
+
+    # content-fingerprint cache: skip iff the stamp matches AND every output exists.
+    # fail toward running - any error, mismatch, or missing output re-runs (#1970).
+    val root_out: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_out));
+    val root_project: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_root));
+    var digest: [32]u8;
+    val fpr: R.Result[bool, str] = step_fingerprint(a, project_root, ?ins, expanded_cmd, ?digest[0]);
+    step_free_inputs(a, ?ins);
+
+    var hex:        str  = "";
+    var stamp_path: str  = "";
+    val stampable:  bool = R.is_ok[bool, str](fpr) && step.out_count > 0;
+    if (stampable) {
+        hex        = digest_hex(a, ?digest[0], 32::usize);
+        stamp_path = step_stamp_path(a, root_project, root_out, owner_id, step_name);
+        if (step_outputs_exist(a, p, step, project_root, home_out) && stamp_matches(a, stamp_path, hex)) {
+            str_free(a, hex);
+            str_free(a, stamp_path);
+            str_free(a, expanded_cmd);
+            ret R.ok[bool, str](true);
+        }
+    }
+
+    # create the output parent dirs before running, so a `mkdir`-less cmd succeeds.
+    val mdr: R.Result[bool, str] = step_make_output_dirs(a, p, step);
+    if (R.is_err[bool, str](mdr)) {
+        if (stampable) { str_free(a, hex); str_free(a, stamp_path); }
+        str_free(a, expanded_cmd);
+        ret R.err[bool, str](R.unwrap_err[bool, str](mdr));
+    }
+
+    val msg: str = sfmt(a, "step {}: {}\n", step_name, expanded_cmd);
+    print.print(msg);
+    str_free(a, msg);
+
+    var shell_name: *u8 = "/bin/sh";
+    var shell_flag: *u8 = "-c";
+    $if ($mach.build.os == $mach.os.windows) {
+        shell_name = "cmd.exe";
+        shell_flag = "/c";
+    }
+
+    var full_cmd: str;
+    $if ($mach.build.os == $mach.os.windows) {
+        full_cmd = sfmt(a, "cd /d \"{}\" && {}", project_root, expanded_cmd);
+    }
+    $or {
+        full_cmd = sfmt(a, "cd '{}' && {}", project_root, expanded_cmd);
+    }
+
+    val res_argv: R.Result[**u8, str] = A.allocate[*u8](a, 4);
+    if (R.is_err[**u8, str](res_argv)) {
+        if (stampable) { str_free(a, hex); str_free(a, stamp_path); }
+        str_free(a, expanded_cmd);
+        str_free(a, full_cmd);
+        ret R.err[bool, str]("out of memory");
+    }
+    val argv: **u8 = R.unwrap_ok[**u8, str](res_argv);
+    argv[0] = shell_name;
+    argv[1] = shell_flag;
+    argv[2] = full_cmd::*u8;
+    argv[3] = nil;
+
+    # inject the active target tuple so a step's cmd/script can branch on it (#1964).
+    val isa_env: str = sfmt(a, "MACH_TARGET_ISA={}", v.isa);
+    val os_env:  str = sfmt(a, "MACH_TARGET_OS={}", v.os);
+    val abi_env: str = sfmt(a, "MACH_TARGET_ABI={}", v.abi);
+    val env: **u8 = step_env(a, isa_env, os_env, abi_env);
+    if (env == nil) {
+        str_free(a, isa_env); str_free(a, os_env); str_free(a, abi_env);
+        A.deallocate[*u8](a, argv, 4);
+        if (stampable) { str_free(a, hex); str_free(a, stamp_path); }
+        str_free(a, expanded_cmd);
+        str_free(a, full_cmd);
+        ret R.err[bool, str]("out of memory");
+    }
+
+    val res_run: R.Result[exec.ExitStatus, str] = exec.run(shell_name::str, argv, env);
+
+    step_env_free(a, env);
+    str_free(a, isa_env);
+    str_free(a, os_env);
+    str_free(a, abi_env);
+    A.deallocate[*u8](a, argv, 4);
+    str_free(a, expanded_cmd);
+    str_free(a, full_cmd);
+
+    if (R.is_err[exec.ExitStatus, str](res_run)) {
+        if (stampable) { str_free(a, hex); str_free(a, stamp_path); }
+        ret R.err[bool, str]("failed to execute build step");
+    }
+    val status: exec.ExitStatus = R.unwrap_ok[exec.ExitStatus, str](res_run);
+    if (!exec.exited(status) || exec.code(status) != 0) {
+        if (stampable) { str_free(a, hex); str_free(a, stamp_path); }
+        ret R.err[bool, str]("build step exited non-zero");
+    }
+
+    if (stampable) {
+        write_stamp(a, stamp_path, hex);
+        str_free(a, hex);
+        str_free(a, stamp_path);
+    }
+    ret R.ok[bool, str](true);
+}
+
+# run the demanded steps in the planned needs-first order (#1970). the plan
+# (manifest.plan_steps, computed at config time) already resolved demand, ordering,
+# and cycle detection; undemanded steps never run.
+pub fun execute_steps(a: *A.Allocator, p: *project.Project, project_root: str) R.Result[bool, str] {
+    if (p.config.step_order_count == 0) { ret R.ok[bool, str](true); }
+    val root_out: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_out));
+    val owner_id: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.id));
+    var i: u32 = 0;
+    for (i < p.config.step_order_count) {
+        val idx: u32 = p.config.step_order[i];
+        val res: R.Result[bool, str] = run_one_step(a, p, ?p.config.steps[idx], project_root, root_out, owner_id);
+        if (R.is_err[bool, str](res)) { ret res; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# the `{project.out}` a dependency's step homes against (#1970): a relative path that
+# climbs from the dep checkout `dep_vr` (the step's CWD) back to the root, then
+# descends into the root out - so `vendor/*` inputs resolve at the dep while step
+# outputs land in the consumer out tree. the climb is dep_vr's depth BELOW
+# `project_root` (the flat store puts every dep at `<root>/dep/<alias>`), so it is
+# correct whether the root is relative (`.` -> `../../out/...`) or absolute (counting
+# dep_vr's own segments would overshoot to the filesystem root, #1989 review).
+pub fun dep_out_home(alloc: *A.Allocator, project_root: str, dep_vr: str, root_out: str) R.Result[str, str] {
+    # project_root and dep_vr are '..'-free (dep_vr is `<root>/dep/<alias>`), so
+    # seg_count's '..' handling never triggers and the climb depth is unchanged.
+    val root_segs: u32 = spath.seg_count(project_root)::u32;
+    val dep_segs:  u32 = spath.seg_count(dep_vr)::u32;
+    var segs: u32 = 0;
+    if (dep_segs > root_segs) { segs = dep_segs - root_segs; }
+
+    val total: usize = (segs::usize) * 3 + str_len(root_out);
+    val rb: R.Result[*u8, str] = A.allocate[u8](alloc, total + 1);
+    if (R.is_err[*u8, str](rb)) { ret R.err[str, str](R.unwrap_err[*u8, str](rb)); }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+    var k: usize = 0;
+    var s: u32 = 0;
+    for (s < segs) { buf[k] = '.'::u8; buf[k + 1] = '.'::u8; buf[k + 2] = '/'::u8; k = k + 3; s = s + 1; }
+    var j: usize = 0;
+    val rl: usize = str_len(root_out);
+    for (j < rl) { buf[k] = root_out[j]; k = k + 1; j = j + 1; }
+    buf[k] = 0;
+    ret R.ok[str, str](buf::str);
+}
+
+# run every dependency's export-demanded steps before the link (#1970)
+#
+# A dep's exported `local` entries demand steps in the dep's own manifest. Each such
+# step runs from the dep checkout (so `vendor/*` sources resolve) and homes
+# `{project.out}` to a climb path (dep_out_home) so the exported object lands in the
+# consumer out tree, where resolve_cascade_libs registered it as a link input.
+# ---
+# p:   the active project (its resolved deps and target cell drive the walk)
+# isa: build-cell isa, for filtering each dep's exported entries
+# os:  build-cell os
+# abi: build-cell abi
+pub fun execute_dep_steps(p: *project.Project, isa: str, os: str, abi: str) R.Result[bool, str] {
+    val n: u32 = p.config.dep_count;
+    if (n == 0) { ret R.ok[bool, str](true); }
+
+    var tgt: manifest.TargetDef;
+    val ri: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, isa);
+    if (R.is_err[intern.StrId, str](ri)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](ri)); }
+    tgt.isa = R.unwrap_ok[intern.StrId, str](ri);
+    val ro: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, os);
+    if (R.is_err[intern.StrId, str](ro)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](ro)); }
+    tgt.os = R.unwrap_ok[intern.StrId, str](ro);
+    val ra: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, abi);
+    if (R.is_err[intern.StrId, str](ra)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](ra)); }
+    tgt.abi = R.unwrap_ok[intern.StrId, str](ra);
+
+    val root_out: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_out));
+    val root_project: str = O.unwrap[str](intern.lookup(?p.s.interner, p.config.project_root));
+    var cv: manifest.TmplVars = ddep.cell_tmpl_vars(p);
+
+    var i: u32 = 0;
+    for (i < n) {
+        val vr_opt: O.Option[str] = intern.lookup(?p.s.interner, p.config.deps[i].vendor_root);
+        if (O.is_none[str](vr_opt)) { ret R.err[bool, str]("internal: dep metadata not interned"); }
+        val dep_vr: str = O.unwrap[str](vr_opt);
+
+        val tp_r: R.Result[str, str] = load.join_path(p.alloc, dep_vr, manifest.MANIFEST_FILE);
+        if (R.is_err[str, str](tp_r)) { ret R.err[bool, str](R.unwrap_err[str, str](tp_r)); }
+        val tp: str = R.unwrap_ok[str, str](tp_r);
+        val pr: R.Result[toml.Table, str] = ddep.parse_toml_file(p.alloc, tp);
+        str_free(p.alloc, tp);
+        if (R.is_err[toml.Table, str](pr)) { ret R.err[bool, str](R.unwrap_err[toml.Table, str](pr)); }
+        var tbl: toml.Table = R.unwrap_ok[toml.Table, str](pr);
+
+        # a dependency's manifest: as_root false, parsed permissively (#1971).
+        val mf_r: R.Result[manifest.Manifest, str] = manifest.parse(p.alloc, ?p.s.interner, ?tbl, false);
+        if (R.is_err[manifest.Manifest, str](mf_r)) { ret R.err[bool, str](R.unwrap_err[manifest.Manifest, str](mf_r)); }
+        var mfd: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](mf_r);
+
+        var dep_order: *u32 = nil;
+        var dep_count: u32  = 0;
+        val dpr: R.Result[bool, str] = manifest.plan_export_steps(p.alloc, ?p.s.interner, ?mfd, ?tgt, root_out, ?cv, ?dep_order, ?dep_count);
+        if (R.is_err[bool, str](dpr)) { manifest.dnit(?mfd, p.alloc); ret dpr; }
+
+        if (dep_count > 0) {
+            val hr: R.Result[str, str] = dep_out_home(p.alloc, root_project, dep_vr, root_out);
+            if (R.is_err[str, str](hr)) { A.deallocate[u32](p.alloc, dep_order, dep_count::usize); manifest.dnit(?mfd, p.alloc); ret R.err[bool, str](R.unwrap_err[str, str](hr)); }
+            val dep_home: str = R.unwrap_ok[str, str](hr);
+            val dep_owner: str = O.unwrap[str](intern.lookup(?p.s.interner, mfd.id));
+            var si: u32 = 0;
+            for (si < dep_count) {
+                val rs: R.Result[bool, str] = run_one_step(p.alloc, p, ?mfd.steps[dep_order[si]], dep_vr, dep_home, dep_owner);
+                if (R.is_err[bool, str](rs)) { str_free(p.alloc, dep_home); A.deallocate[u32](p.alloc, dep_order, dep_count::usize); manifest.dnit(?mfd, p.alloc); ret rs; }
+                si = si + 1;
+            }
+            str_free(p.alloc, dep_home);
+            A.deallocate[u32](p.alloc, dep_order, dep_count::usize);
+        }
+        manifest.dnit(?mfd, p.alloc);
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}

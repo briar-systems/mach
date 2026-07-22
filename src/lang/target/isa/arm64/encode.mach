@@ -31,10 +31,8 @@
 # RK_ADD_LO12). Phase 3c adds the inline-asm assembler (`encode_asm_block_arm64`):
 # it parses an `asm aarch64 { ... }` body, resolves `{name}` locals to `[x29, #off]`
 # frame slots and bare-symbol / `:lo12:` operands to the #1163 relocations, and
-# emits A64 words for the std `_start` / syscall path. The contract gaps DEFERRED to
-# a later phase (an in-scope function never reaches them, so they fail loudly rather
-# than emit wrong bytes): callee-saved FP registers and the float / float-conversion
-# families (Phase 4).
+# emits A64 words for the std `_start` / syscall path. Also encoded: callee-saved FP
+# registers and the scalar-float, float-conversion, and NEON vector families.
 
 use std.allocator.page;
 use std.text.parse;
@@ -1923,37 +1921,117 @@ fun is_mir_compare(op: mir.MirOpcode) bool {
         op == mir.MIR_SEL_CMP_LE_S || op == mir.MIR_SEL_CMP_LE_U;
 }
 
+# re-narrow a sub-word compare operand into `scratch`, honoring the shared
+# ALU_MIN_WIDTH contract: a register holds a 1 / 2-byte value in its low bits
+# with the higher bits UNSPECIFIED (loads zero-extend, but a truncation's 32-bit
+# move leaves residue in bits 8..31), and every consumer that needs the narrow
+# value must re-narrow it. the W-form SUBS compares all 32 bits, so a sub-word
+# operand is first extended - SXTB/SXTH for a signed relation, UXTB/UXTH for an
+# unsigned relation and for equality (any consistent extension preserves it) -
+# making the 32-bit compare exact at the operand width. a 4 / 8-byte operand
+# compares exactly at its own W/X form and passes through untouched
+# ---
+# st:      encoder driver state
+# reg:     the resolved operand register
+# scratch: the scratch the extended value is written into (the operand's own
+#          materialization scratch, so an immediate extends in place)
+# width:   the compare width riding `mi.width`
+# signed:  true for a signed relation (sign-extend), false to zero-extend
+# ret:     the register the compare should read (`reg`, or `scratch` when narrowed)
+fun narrow_cmp_source(st: *encode.EncodeState, reg: u32, scratch: u32, width: u8, signed: bool) u32 {
+    # width 0 is the documented "unset" sentinel the encoder reads as the
+    # machine word; it passes through like any full-width operand (narrowing it
+    # would compute a shift past the register width / an unallocated bitfield).
+    if (width == 0 || width >= 4) { ret reg; }
+    val imms: u32 = (width::u32 * 8) - 1;
+    if (signed) { emit_word(st, pack_bitfield(SBFM_W, scratch, reg, 0, imms)); }  # sxtb/sxth
+    or          { emit_word(st, pack_bitfield(UBFM_W, scratch, reg, 0, imms)); }  # uxtb/uxth
+    ret scratch;
+}
+
+# the VALUE a compare immediate denotes at the compare width. a sub-word
+# constant arrives WIDTH-MASKED in the operand (`x <= -56` at i8 carries raw
+# bits 200), so the imm12 fold must not read the raw i64: a signed relation
+# re-signs the low `width` bytes (200 -> -56) and an unsigned relation (and
+# equality, whose register operand zero-extends to match) masks to them. wider
+# widths - and the width-0 machine-word sentinel - denote their raw value. the
+# register fallback needs no such interpretation: it materializes the raw bits
+# and `narrow_cmp_source` re-derives the value from the low bytes either way
+# ---
+# imm:    the operand's raw immediate bits
+# width:  the compare width riding `mi.width`
+# signed: true for a signed relation
+# ret:    the value the constant denotes at the compare width
+fun cmp_imm_value(imm: i64, width: u8, signed: bool) i64 {
+    if (width == 1) {
+        var v: i64 = imm & 0xFF;
+        if (signed && (v & 0x80) != 0) { v = v - 0x100; }
+        ret v;
+    }
+    if (width == 2) {
+        var v: i64 = imm & 0xFFFF;
+        if (signed && (v & 0x8000) != 0) { v = v - 0x10000; }
+        ret v;
+    }
+    ret imm;
+}
+
+# emit the flag-setting `SUBS XZR, lhs, rhs` both compare forms share - the
+# split `MIR_SEL_CMP_*` (SUBS ; CSET) and the fused `MIR_SEL_CBR_*`
+# (SUBS ; B.cc ; B). the lhs is usually a register, but the shared lowering
+# canonicalizes the GE/GT relations (which have no MIR opcode) by SWAPPING
+# operands into LE/LT - which can leave an immediate on the lhs (e.g.
+# `c >= 48` -> `48 <= c`, lhs=48): it materializes into SCRATCH1, distinct
+# from the rhs's SCRATCH0, so the operand order - and thus the condition - is
+# preserved. a sub-word operand re-narrows through `narrow_cmp_source` (the
+# W-form SUBS reads all 32 bits), and an immediate rhs folds into the SUBS
+# immediate form when the value it denotes AT THE COMPARE WIDTH
+# (`cmp_imm_value` - a sub-word constant arrives width-masked) is non-negative
+# and in imm12 range; anything else takes the register path, whose narrow
+# re-derives the value
+# ---
+# st:     encoder driver state
+# lhs_op: the compare's left operand
+# rhs_op: the compare's right operand
+# width:  the compare width riding `mi.width`
+# signed: true for a signed relation (selects the narrow / imm interpretation)
+# ret:    ok(true) on success, or an operand-resolution error
+fun emit_flag_cmp(st: *encode.EncodeState, lhs_op: *mir.MirOperand, rhs_op: *mir.MirOperand,
+                  width: u8, signed: bool) R.Result[bool, str] {
+    val use64: bool = is64(width);
+
+    val rnr: R.Result[i32, str] = resolve_source(st, lhs_op, SCRATCH1, use64);
+    if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
+    var rn: u32 = R.unwrap_ok[i32, str](rnr)::u32;
+    rn = narrow_cmp_source(st, rn, SCRATCH1, width, signed);
+
+    val rhs_val: i64 = cmp_imm_value(rhs_op.imm, width, signed);
+    if (rhs_op.kind == mir.MIR_OP_IMM && rhs_val >= 0 && rhs_val <= 4095) {
+        emit_word(st, pack_cmp_imm(sel(use64, SUBS_IMM_X, SUBS_IMM_W), rn, rhs_val::u32));
+    } or {
+        val rmr: R.Result[i32, str] = resolve_source(st, rhs_op, SCRATCH0, use64);
+        if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
+        var rm: u32 = R.unwrap_ok[i32, str](rmr)::u32;
+        rm = narrow_cmp_source(st, rm, SCRATCH0, width, signed);
+        emit_word(st, pack_cmp_reg(sel(use64, SUBS_REG_X, SUBS_REG_W), rn, rm));
+    }
+    ret R.ok[bool, str](true);
+}
+
 # materialize a surviving comparison `[dst, lhs, rhs]` into
-# `SUBS XZR, lhs, rhs` (the flag-setting compare; an immediate right operand folds
-# into the immediate form) followed by `CSET dst, cc` (capture the condition into a
-# zero-extended boolean). the comparison runs at the operand width; the boolean is
-# captured in the 32-bit CSET form (a 0/1 value the W write zero-extends to 64)
+# `SUBS XZR, lhs, rhs` (`emit_flag_cmp`, shared with the fused compare-and-
+# branch) followed by `CSET dst, cc` (capture the condition into a
+# zero-extended boolean). the comparison runs at the operand width; the boolean
+# is captured in the 32-bit CSET form (a 0/1 value the W write zero-extends to 64)
 fun encode_compare(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 3) { ret R.err[bool, str]("encode: compare missing operands"); }
-    val use64: bool = is64(mi.width);
 
     val rdr: R.Result[i32, str] = req_gpr(?mi.operands[0]);
     if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
     val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
 
-    # the lhs is usually a register, but the shared lowering canonicalizes the GE/GT
-    # relations (which have no MIR opcode) by SWAPPING operands into LE/LT - which can
-    # leave an immediate on the lhs (e.g. `c >= 48` -> `48 <= c`, lhs=48). materialize
-    # an immediate lhs into SCRATCH1 (distinct from the rhs's SCRATCH0) so the operand
-    # order - and thus `cmp_cond` - is preserved.
-    val rnr: R.Result[i32, str] = resolve_source(st, ?mi.operands[1], SCRATCH1, use64);
-    if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
-    val rn: u32 = R.unwrap_ok[i32, str](rnr)::u32;
-
-    val rhs: *mir.MirOperand = ?mi.operands[2];
-    if (rhs.kind == mir.MIR_OP_IMM && rhs.imm >= 0 && rhs.imm <= 4095) {
-        emit_word(st, pack_cmp_imm(sel(use64, SUBS_IMM_X, SUBS_IMM_W), rn, rhs.imm::u32));
-    } or {
-        val rmr: R.Result[i32, str] = resolve_source(st, rhs, SCRATCH0, use64);
-        if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
-        val rm: u32 = R.unwrap_ok[i32, str](rmr)::u32;
-        emit_word(st, pack_cmp_reg(sel(use64, SUBS_REG_X, SUBS_REG_W), rn, rm));
-    }
+    val rc: R.Result[bool, str] = emit_flag_cmp(st, ?mi.operands[1], ?mi.operands[2], mi.width, mir.is_signed_cmp(mi.opcode));
+    if (R.is_err[bool, str](rc)) { ret rc; }
 
     emit_word(st, pack_cset(CSINC_W, rd, cmp_cond(mi.opcode)));
     ret R.ok[bool, str](true);
@@ -2000,6 +2078,67 @@ fun encode_cbr(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R.Resul
     val b_pos: u32 = st.buf.len::u32;
     emit_word(st, B_BASE);
     val b_next: u32 = st.buf.len::u32;
+    ret encode.push_fixup(st, b_pos, b_next, else_block, fn_base);
+}
+
+# the A64 condition a fused compare-and-branch terminator branches on. only the
+# EQ / NE / LT / LE forms exist in the fused opcode space (the lowerer
+# canonicalizes GT/GE by swapping operands); signedness selects the signed
+# (LT/LE) versus unsigned (CC/LS) condition, mirroring cmp_cond
+fun fused_cbr_cond(op: mir.MirOpcode) u32 {
+    if (op == mir.MIR_SEL_CBR_EQ)   { ret CC_EQ; }
+    if (op == mir.MIR_SEL_CBR_NE)   { ret CC_NE; }
+    if (op == mir.MIR_SEL_CBR_LT_S) { ret CC_LT; }
+    if (op == mir.MIR_SEL_CBR_LT_U) { ret CC_CC; }
+    if (op == mir.MIR_SEL_CBR_LE_S) { ret CC_LE; }
+    ret CC_LS;
+}
+
+# materialize a fused compare-and-branch terminator
+# `MIR_SEL_CBR_* [lhs, rhs, then_block, else_block]` into `SUBS XZR, lhs, rhs`
+# (the flag-setting compare at the width riding `mi.width`) ; `B.cc then_block`
+# (the condition read straight off the flags) ; `B else_block` (the fall-through
+# edge, always emitted). the compare piece mirrors `encode_compare` exactly - an
+# immediate lhs (a constant landing on the left after lowering swaps `a > b`
+# into `b < a`) is materialized into SCRATCH1, distinct from the rhs's SCRATCH0,
+# and an immediate rhs in 0..4095 folds into the SUBS immediate form - so the
+# fused compare sets the identical flags the split SUBS ; CSET pair produced at
+# every width. each branch records a fixup against its target block; pass 2
+# inserts the imm19 / imm26 displacement once both block offsets are known
+# ---
+# st:      encoder driver state (byte sink + branch-fixup table)
+# fn_base: `.text` offset of the enclosing function, scoping the block fixups
+# mi:      the fused terminator `[lhs, rhs, then_block, else_block]`
+# ret:     ok(true) on success, or an error on a malformed terminator
+fun encode_fused_cbr(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 4) {
+        ret R.err[bool, str]("encode: fused compare-branch missing operands");
+    }
+    if (mi.operands[2].kind != mir.MIR_OP_BLOCK || mi.operands[3].kind != mir.MIR_OP_BLOCK) {
+        ret R.err[bool, str]("encode: fused compare-branch target is not a block");
+    }
+    val then_block: u32 = mi.operands[2].imm::u32;
+    val else_block: u32 = mi.operands[3].imm::u32;
+    val instr_start: u32 = st.buf.len::u32;
+
+    # the shared flag-setting prologue - identical flags to the split
+    # SUBS ; CSET pair at every width.
+    val rc: R.Result[bool, str] = emit_flag_cmp(st, ?mi.operands[0], ?mi.operands[1], mi.width, mir.is_signed_cmp(mi.opcode));
+    if (R.is_err[bool, str](rc)) { ret rc; }
+
+    # B.cc then_block (a zero imm19 placeholder; pass 2 inserts the displacement).
+    val bcc_pos: u32 = st.buf.len::u32;
+    emit_word(st, pack_bcond(0, fused_cbr_cond(mi.opcode)));
+    val bcc_next: u32 = st.buf.len::u32;
+    val f1: R.Result[bool, str] = encode.push_fixup(st, bcc_pos, bcc_next, then_block, fn_base);
+    if (R.is_err[bool, str](f1)) { ret f1; }
+
+    # B else_block (the unconditional fall-through edge).
+    val b_pos: u32 = st.buf.len::u32;
+    emit_word(st, B_BASE);
+    val b_next: u32 = st.buf.len::u32;
+    # bound any fused-condition computed-value records to this terminator's bytes.
+    encode.close_cmp_varlocs(st, instr_start, st.buf.len::u32);
     ret encode.push_fixup(st, b_pos, b_next, else_block, fn_base);
 }
 
@@ -2293,6 +2432,11 @@ fun encode_mir_instr(st: *encode.EncodeState, f: *mir.MirFunction, fn_base: u32,
     # multi-instruction byte sequences.
     if (is_mir_compare(mi.opcode))    { ret encode_compare(st, mi); }
     if (mi.opcode == mir.MIR_SEL_CBR) { ret encode_cbr(st, fn_base, mi); }
+
+    # a fused compare-and-branch terminator `[lhs, rhs, then_block, else_block]`
+    # materializes as SUBS XZR ; B.cc then ; B else - the flags feed the
+    # conditional branch directly, with no CSET boolean or CBNZ in between.
+    if (mir.is_fused_cbr(mi.opcode)) { ret encode_fused_cbr(st, fn_base, mi); }
 
     # the surviving division / remainder sentinel expands into its SDIV/UDIV (+ MSUB)
     # byte sequence with the defined division-by-zero / signed-overflow traps.
@@ -4076,15 +4220,17 @@ test "mach.lang.target.isa.arm64.encode:cmp_plus_cset" {
 # the GE/GT relations have no MIR opcode, so the shared lowering
 # canonicalizes them into LE/LT with SWAPPED operands - which can leave an immediate
 # on the compare lhs (e.g. `c >= 48` -> `48 <= c`, lhs=48). encode_compare must
-# materialize an immediate lhs into SCRATCH1 (IP1), not reject it (real-std char gap).
-# compare with an immediate lhs materializes (real-std char gap)
+# materialize an immediate lhs into SCRATCH1 (IP1), not reject it (real-std char
+# gap); at the u8 width both operands are then re-narrowed (uxtb) so the W-form
+# compare reads only the byte, per the ALU_MIN_WIDTH consumer contract
 test "mach.lang.target.isa.arm64.encode:compare_with_an_immediate_lhs_materializes" {
     var bad: i32 = 0;
     var st: encode.EncodeState;
     var alloc: A.Allocator;
     tbuf(?st, ?alloc);
 
-    # `48 <= c` at u8 width: [dst w0, lhs #48, rhs w1] -> movz w17,#48 ; cmp w17,w1 ; cset w0,ls
+    # `48 <= c` at u8 width: [dst w0, lhs #48, rhs w1]
+    # -> movz w17,#48 ; uxtb w17,w17 ; uxtb w16,w1 ; cmp w17,w16 ; cset w0,ls
     var mi: mir.MirInstr;
     var ops: [3]mir.MirOperand;
     ops[0] = mir.op_preg(0);
@@ -4095,9 +4241,11 @@ test "mach.lang.target.isa.arm64.encode:compare_with_an_immediate_lhs_materializ
 
     val r: R.Result[bool, str] = encode_compare(?st, ?mi);
     if (R.is_err[bool, str](r)) { bad = 1; }
-    if (read_word(?st.buf, 0) != 0x52800611) { bad = 1; }  # movz w17, #48
-    if (read_word(?st.buf, 4) != 0x6B01023F) { bad = 1; }  # cmp w17, w1
-    if (read_word(?st.buf, 8) != 0x1A9F87E0) { bad = 1; }  # cset w0, ls
+    if (read_word(?st.buf, 0)  != 0x52800611) { bad = 1; }  # movz w17, #48
+    if (read_word(?st.buf, 4)  != 0x53001E31) { bad = 1; }  # uxtb w17, w17
+    if (read_word(?st.buf, 8)  != 0x53001C30) { bad = 1; }  # uxtb w16, w1
+    if (read_word(?st.buf, 12) != 0x6B10023F) { bad = 1; }  # cmp w17, w16
+    if (read_word(?st.buf, 16) != 0x1A9F87E0) { bad = 1; }  # cset w0, ls
 
     encode.buf_dnit(?st.buf);
     ret bad;

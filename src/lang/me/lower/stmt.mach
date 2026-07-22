@@ -7,9 +7,14 @@
 # After a statement that produces a terminator (a `ret`, an exhaustive `if`/`or`
 # chain, an infinite `for`), the builder cursor is left on a fresh, unreachable
 # block so the caller's next statement lands somewhere valid; `dce` drops the
-# dead block later. The `fin` stack records deferred bodies that are replayed
-# (lowered inline) before every reachable terminator that closes the enclosing
-# scope.
+# dead block later.
+#
+# `fin` is block-scoped: each block marks the fin stack on entry and replays its
+# own registrations (in reverse) on normal exit, so a loop body replays per
+# iteration. An early exit replays without popping -- `ret` replays every open
+# scope, `brk` / `cnt` replay down to the targeted loop's frame depth -- and the
+# emission lands only on the exiting CFG path; the bookkeeping pop happens once,
+# in the owning block's exit, so sibling paths keep their pending fins.
 
 use std.collections.map;
 use std.types.bool.bool;
@@ -18,6 +23,7 @@ use std.types.bool.true;
 use std.types.char.char;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_join;
 use std.types.string.str_len;
 
 use A: std.allocator;
@@ -105,7 +111,7 @@ pub fun lower_stmt(ctx: *context.LowerContext, sid: id.StmtId) R.Result[bool, st
 pub fun lower_stmt_list(ctx: *context.LowerContext, start: u32, len: u32) R.Result[bool, str] {
     var i: u32 = 0;
     for (i < len) {
-        if (block_terminated(ctx)) { ret R.ok[bool, str](true); }
+        if (context.block_terminated(ctx)) { ret R.ok[bool, str](true); }
         val pool_ix: u32 = start + i;
         if (pool_ix::usize >= ctx.a.stmt_id_len) {
             ret R.err[bool, str]("lower: statement list index out of range");
@@ -131,12 +137,32 @@ fun lower_expr_stmt(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, st
 }
 
 # lower a block statement by lowering its statement list
+#
+# A block is a fin scope: a `fin` declared inside registers here and lives only
+# while the block is open. A normal (non-terminated) exit replays the block's
+# own fins in reverse registration order; a terminated exit (`ret` / `brk` /
+# `cnt` inside) already replayed them on the exiting path, so only the
+# bookkeeping is dropped.
 # ---
 # ctx: the context
 # s:   the block statement
 # ret: true on success, or an error
 fun lower_block(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, str] {
-    ret lower_stmt_list(ctx, s.data.block.stmts_start, s.data.block.stmts_len);
+    val mark: u32 = context.fin_count(ctx);
+    val res_body: R.Result[bool, str] = lower_stmt_list(ctx, s.data.block.stmts_start, s.data.block.stmts_len);
+    if (R.is_err[bool, str](res_body)) {
+        context.pop_fins_to(ctx, mark);
+        ret res_body;
+    }
+    if (!context.block_terminated(ctx)) {
+        val res_fins: R.Result[bool, str] = replay_fins_from(ctx, mark);
+        if (R.is_err[bool, str](res_fins)) {
+            context.pop_fins_to(ctx, mark);
+            ret res_fins;
+        }
+    }
+    context.pop_fins_to(ctx, mark);
+    ret R.ok[bool, str](true);
 }
 
 # lower an `if`/`or` chain into a cbr diamond
@@ -182,7 +208,7 @@ fun lower_if(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, str] {
     builder.set_block(?ctx.builder, then_b);
     val res_then_body: R.Result[bool, str] = lower_stmt(ctx, s.data.if_.then_block);
     if (R.is_err[bool, str](res_then_body)) { ret res_then_body; }
-    if (!block_terminated(ctx)) {
+    if (!context.block_terminated(ctx)) {
         val res_br: R.Result[bool, str] = builder.emit_br(?ctx.builder, merge_b);
         if (R.is_err[bool, str](res_br)) { ret res_br; }
     }
@@ -192,7 +218,7 @@ fun lower_if(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, str] {
         val res_else_body: R.Result[bool, str] = lower_stmt(ctx, s.data.if_.else_block);
         if (R.is_err[bool, str](res_else_body)) { ret res_else_body; }
     }
-    if (!block_terminated(ctx)) {
+    if (!context.block_terminated(ctx)) {
         val res_br: R.Result[bool, str] = builder.emit_br(?ctx.builder, merge_b);
         if (R.is_err[bool, str](res_br)) { ret res_br; }
     }
@@ -258,7 +284,7 @@ fun lower_for(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, str] {
         context.pop_loop(ctx);
         ret res_body_stmt;
     }
-    if (!block_terminated(ctx)) {
+    if (!context.block_terminated(ctx)) {
         val res_back: R.Result[bool, str] = builder.emit_br(?ctx.builder, header);
         if (R.is_err[bool, str](res_back)) {
             context.pop_loop(ctx);
@@ -275,57 +301,83 @@ fun lower_for(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, str] {
 
 # lower a return
 #
-# Replays the pending fin bodies (innermost first), then emits the `ret`
-# terminator. A bare `ret` in a value-returning function returns a typed zero
-# of the function's IR return type so the IR stays well-typed.
+# Lowers the return expression first, then replays every open scope's fin
+# bodies (innermost first), then emits the `ret` terminator: the returned value
+# is fully evaluated before any fin teardown runs, so fin side effects are never
+# observable in the value. A bare `ret` in a value-returning function returns
+# a typed zero of the function's IR return type so the IR stays well-typed.
 # ---
 # ctx: the context
 # s:   the `ret` statement
 # ret: true on success, or an error
 fun lower_ret(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, str] {
-    val res_fins: R.Result[bool, str] = run_fins(ctx);
-    if (R.is_err[bool, str](res_fins)) { ret res_fins; }
-    if (block_terminated(ctx))         { ret R.ok[bool, str](true); }
-
     if (s.data.ret_.value != id.EXPR_NIL) {
         val res_value: R.Result[value.Value, str] = expr.lower_rvalue(ctx, s.data.ret_.value);
         if (R.is_err[value.Value, str](res_value)) {
             ret R.err[bool, str](R.unwrap_err[value.Value, str](res_value));
         }
-        ret builder.emit_ret(?ctx.builder, R.unwrap_ok[value.Value, str](res_value));
+        val v: value.Value = R.unwrap_ok[value.Value, str](res_value);
+
+        val res_fins: R.Result[bool, str] = replay_fins_from(ctx, 0);
+        if (R.is_err[bool, str](res_fins)) { ret res_fins; }
+        if (context.block_terminated(ctx)) { ret R.ok[bool, str](true); }
+        ret builder.emit_ret(?ctx.builder, v);
     }
 
+    val res_fins: R.Result[bool, str] = replay_fins_from(ctx, 0);
+    if (R.is_err[bool, str](res_fins)) { ret res_fins; }
+    if (context.block_terminated(ctx)) { ret R.ok[bool, str](true); }
+
     # bare ret: void when the function returns void, else a typed zero of ret_type
-    if (is_void(ctx, ctx.ret_type)) {
+    if (context.is_void_ir(ctx, ctx.ret_type)) {
         ret builder.emit_ret_void(?ctx.builder);
     }
     ret builder.emit_ret(?ctx.builder, zero_const(ctx, ctx.ret_type));
 }
 
-# lower a `brk` as a branch to the current loop's exit block
+# lower a `brk`: replay the fins of every scope being exited (down through the
+# loop body, innermost first), then branch to the loop's exit block
 # ---
 # ctx: the context
 # ret: true on success, or an error when outside a loop
 fun lower_brk(ctx: *context.LowerContext) R.Result[bool, str] {
     val lf: *context.LoopFrame = context.current_loop(ctx);
     if (lf == nil) { ret R.err[bool, str]("lower: brk outside a loop"); }
-    ret builder.emit_br(?ctx.builder, lf.exit);
+
+    # copy the frame's fields before replaying: a fin body holding its own loop
+    # can grow (reallocate) the loop stack under the frame pointer
+    val exit:  ir.BlockId = lf.exit;
+    val floor: u32        = lf.fin_depth;
+    val res_fins: R.Result[bool, str] = replay_fins_from(ctx, floor);
+    if (R.is_err[bool, str](res_fins)) { ret res_fins; }
+    if (context.block_terminated(ctx)) { ret R.ok[bool, str](true); }
+    ret builder.emit_br(?ctx.builder, exit);
 }
 
-# lower a `cnt` as a branch to the current loop's header block
+# lower a `cnt`: replay the fins of every scope the ending iteration exits (the
+# loop body's included, innermost first), then branch to the loop's header block
 # ---
 # ctx: the context
 # ret: true on success, or an error when outside a loop
 fun lower_cnt(ctx: *context.LowerContext) R.Result[bool, str] {
     val lf: *context.LoopFrame = context.current_loop(ctx);
     if (lf == nil) { ret R.err[bool, str]("lower: cnt outside a loop"); }
-    ret builder.emit_br(?ctx.builder, lf.header);
+
+    # copy the frame's fields before replaying: a fin body holding its own loop
+    # can grow (reallocate) the loop stack under the frame pointer
+    val header: ir.BlockId = lf.header;
+    val floor:  u32        = lf.fin_depth;
+    val res_fins: R.Result[bool, str] = replay_fins_from(ctx, floor);
+    if (R.is_err[bool, str](res_fins)) { ret res_fins; }
+    if (context.block_terminated(ctx)) { ret R.ok[bool, str](true); }
+    ret builder.emit_br(?ctx.builder, header);
 }
 
-# record a deferred `fin` body on the fin stack
+# record a deferred `fin` body on the enclosing block's fin scope
 #
-# The body is replayed before every reachable terminator that closes the
-# enclosing function scope (currently at each `ret` and at fall-through exit).
+# The body is replayed on every path that exits the block: its normal exit, an
+# iteration's end when the block is a loop body, and any `ret` / `brk` / `cnt`
+# that leaves it early.
 # ---
 # ctx: the context
 # s:   the `fin` statement
@@ -334,20 +386,22 @@ fun lower_fin(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, str] {
     ret context.push_fin(ctx, s.data.fin_.body);
 }
 
-# replay every pending fin body in reverse registration order (innermost first)
+# replay the pending fin bodies above stack index `floor`, in reverse
+# registration order (innermost first), without popping them
 #
-# Called immediately before a `ret` and at function fall-through. Exposed for
-# the decl lowerer's default-return path.
+# Emission lands on the current CFG path only; the pop is the owning block's,
+# so a conditional early exit never disturbs the pending fins of the paths that
+# stay. Replay stops once a body terminates the path (a fin body cannot `ret`,
+# but an infinite loop can end it).
 # ---
-# ctx: the context
-# ret: true on success, or an error
-pub fun run_fins(ctx: *context.LowerContext) R.Result[bool, str] {
-    val n: u32 = context.fin_count(ctx);
-    if (n == 0) { ret R.ok[bool, str](true); }
-    var i: u32 = n;
-    for (i > 0) {
+# ctx:   the context
+# floor: fin-stack index to replay down to (exclusive)
+# ret:   true on success, or an error
+fun replay_fins_from(ctx: *context.LowerContext, floor: u32) R.Result[bool, str] {
+    var i: u32 = context.fin_count(ctx);
+    for (i > floor) {
         i = i - 1;
-        if (block_terminated(ctx)) { ret R.ok[bool, str](true); }
+        if (context.block_terminated(ctx)) { ret R.ok[bool, str](true); }
         val body: id.StmtId = context.fin_at(ctx, i);
         if (body != id.STMT_NIL) {
             val res_body: R.Result[bool, str] = lower_stmt(ctx, body);
@@ -453,7 +507,7 @@ fun lower_decl_stmt(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, st
 
     # debug birth: bind the source variable to the value it currently holds. only
     # under -g, so a non-debug build emits identical code.
-    if (ctx.s.debug) {
+    if (ctx.debug) {
         ret context.emit_dbg_birth(ctx, d.data.bind.name, slot_ty, context.decl_type_of(ctx, did), false, birth_val, O.some[value.Value](slot));
     }
     ret R.ok[bool, str](true);
@@ -555,7 +609,7 @@ fun lower_comptime_if(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool, 
             if (R.is_err[comptime.CTValue, str](res_eval)) {
                 ret R.err[bool, str](R.unwrap_err[comptime.CTValue, str](res_eval));
             }
-            active = ct_truthy(R.unwrap_ok[comptime.CTValue, str](res_eval));
+            active = context.ct_truthy(R.unwrap_ok[comptime.CTValue, str](res_eval));
         }
 
         if (active) {
@@ -590,7 +644,12 @@ fun lower_comptime_each(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool
     }
 
     if (!comptime.is_fields_call(ctx.a, src, ce.seq)) {
-        ret R.err[bool, str]("lower: a `$each` sequence must be `$fields(T)` or a variadic pack");
+        # a constant-array `$each x in ARR`: sema validated eligibility, so unroll
+        # over the array literal's elements, binding the loop variable to each.
+        if (is_array_type(ctx, context.expr_type_of(ctx, ce.seq))) {
+            ret lower_const_array_each(ctx, ce);
+        }
+        ret R.err[bool, str]("lower: a `$each` sequence must be `$fields(T)`, a variadic pack, or a constant array `val`");
     }
     val targ: id.ExprId = comptime.fields_type_arg(ctx.a, ce.seq);
     if (targ == id.EXPR_NIL) {
@@ -613,7 +672,7 @@ fun lower_comptime_each(ctx: *context.LowerContext, s: *stmt.Stmt) R.Result[bool
         if (!is_fields_record_type(ctx, owner)) {
             diagnostic.error(?ctx.s.diags, ctx.a.file_id, s.span,
                 "$fields(T): type argument instantiated as a non-record type");
-            ret R.err[bool, str](context.REPORTED);
+            ret R.err[bool, str]("");
         }
     }
 
@@ -741,6 +800,62 @@ fun lower_pack_each(ctx: *context.LowerContext, ce: *stmt.StmtComptimeEach) R.Re
         i = i + 1;
     }
     sema.free_module_deps(ctx.s, ?deps);
+    ret R.ok[bool, str](true);
+}
+
+# lower a constant-array `$each x in ARR { body }` by unrolling over its elements
+#
+# Sema validated eligibility (an immutable array `val` in this module, fully
+# initialized by an array literal). Per element the loop variable is bound in the
+# comptime frame to a CT_KIND_CONST_ELEM descriptor carrying the element
+# initializer's ExprId, so a body reference to `x` (or `x.field`) folds / lowers
+# by re-processing that element expression. The body types identically per element
+# (a homogeneous array), so no per-element re-inference is needed.
+# ---
+# ctx: the context
+# ce:  the comptime-each descriptor
+# ret: true on success, or an error
+fun lower_const_array_each(ctx: *context.LowerContext, ce: *stmt.StmtComptimeEach) R.Result[bool, str] {
+    val src: str = context.module_source(ctx);
+    val seq_ty: type.TypeId = context.expr_type_of(ctx, ce.seq);
+    val opt_arr: O.Option[*type.Type] = type.get(?ctx.s.types, seq_ty);
+    if (O.is_none[*type.Type](opt_arr)) { ret R.err[bool, str]("lower: `$each` array sequence has no type"); }
+    val arr: *type.Type = O.unwrap[*type.Type](opt_arr);
+    val elem_ty: type.TypeId = arr.data.array.base;
+    val count:   u32         = arr.data.array.count;
+
+    val sid: resolve.SymbolId = context.expr_symbol_of(ctx, ce.seq);
+    val opt_sym: O.Option[*resolve.Symbol] = context.symbol_of(ctx, sid);
+    if (O.is_none[*resolve.Symbol](opt_sym)) { ret R.err[bool, str]("lower: `$each` array sequence is unresolved"); }
+    val sym: *resolve.Symbol = O.unwrap[*resolve.Symbol](opt_sym);
+
+    val opt_info: O.Option[comptime.ArrayLitInfo] = comptime.decl_array_lit(ctx.a, sym.decl);
+    if (O.is_none[comptime.ArrayLitInfo](opt_info)) { ret R.err[bool, str]("lower: `$each` array sequence has no array-literal initializer"); }
+    val info: comptime.ArrayLitInfo = O.unwrap[comptime.ArrayLitInfo](opt_info);
+
+    val res_name: R.Result[intern.StrId, str] = intern.intern_span(?ctx.s.interner, src, ce.var_name);
+    if (R.is_err[intern.StrId, str](res_name)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](res_name)); }
+    val fname: intern.StrId = R.unwrap_ok[intern.StrId, str](res_name);
+
+    var i: u32 = 0;
+    for (i < count) {
+        if ((info.elems_start + i)::usize >= ctx.a.expr_id_len) {
+            ret R.err[bool, str]("lower: `$each` array element index out of range");
+        }
+        val elem_eid: id.ExprId = ctx.a.expr_ids[info.elems_start + i];
+        val mark: comptime.FrameMark = comptime.frame_open(ctx.ctx);
+        val res_bind: R.Result[bool, str] = comptime.bind(ctx.ctx, fname, comptime.const_elem_value(elem_eid::u32, elem_ty::u32));
+        if (R.is_err[bool, str](res_bind)) {
+            val res_close: R.Result[bool, str] = comptime.frame_close(ctx.ctx, mark);
+            if (R.is_err[bool, str](res_close)) { ret res_close; }
+            ret res_bind;
+        }
+        val res_body:  R.Result[bool, str] = lower_stmt_list(ctx, ce.body_start, ce.body_len);
+        val res_close: R.Result[bool, str] = comptime.frame_close(ctx.ctx, mark);
+        if (R.is_err[bool, str](res_body))  { ret res_body; }
+        if (R.is_err[bool, str](res_close)) { ret res_close; }
+        i = i + 1;
+    }
     ret R.ok[bool, str](true);
 }
 
@@ -898,16 +1013,19 @@ fun grow_bind_cap(cap: u32) u32 {
     ret cap * 2;
 }
 
-# file a located error at the asm body `span` and return the REPORTED sentinel
+# file a located error at the asm body `span` and return an empty-message error
 # so the driver shows a single file:line:col diagnostic
+#
+# The diagnostic on the sink is the user-facing message, so the orchestration
+# layer renders this failure as reported and prints nothing further.
 # ---
 # ctx:     the context
 # span:    source span of the asm body
 # message: the diagnostic text
-# ret:     the REPORTED sentinel error
+# ret:     an error with an empty message (the diagnostic is the message)
 fun report_asm(ctx: *context.LowerContext, span: token.Span, message: str) R.Result[bool, str] {
     diagnostic.error(?ctx.s.diags, ctx.a.file_id, span, message);
-    ret R.err[bool, str](context.REPORTED);
+    ret R.err[bool, str]("");
 }
 
 # report_asm with the interned `name_id` interpolated between `prefix` and
@@ -918,42 +1036,19 @@ fun report_asm(ctx: *context.LowerContext, span: token.Span, message: str) R.Res
 # prefix:  text before the name
 # name_id: interned name to interpolate
 # suffix:  text after the name
-# ret:     the REPORTED sentinel error
+# ret:     an error with an empty message (the diagnostic is the message)
 fun report_asm_named(ctx: *context.LowerContext, span: token.Span, prefix: str, name_id: intern.StrId, suffix: str) R.Result[bool, str] {
     val opt_name: O.Option[str] = intern.lookup(?ctx.s.interner, name_id);
     if (O.is_none[str](opt_name)) { ret report_asm(ctx, span, prefix); }
     val name: str = O.unwrap[str](opt_name);
 
-    val total: usize = str_len(prefix) + str_len(name) + str_len(suffix);
-    val res_buf: R.Result[*u8, str] = A.allocate[u8](ctx.s.alloc, total + 1);
-    if (R.is_err[*u8, str](res_buf)) { ret report_asm(ctx, span, prefix); }
-    val buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
+    val res_msg: R.Result[str, str] = str_join(ctx.s.alloc, prefix, name, suffix);
+    if (R.is_err[str, str](res_msg)) { ret report_asm(ctx, span, prefix); }
+    val buf: str = R.unwrap_ok[str, str](res_msg);
 
-    var k: usize = 0;
-    k = bytes_append(buf, k, prefix);
-    k = bytes_append(buf, k, name);
-    k = bytes_append(buf, k, suffix);
-    buf[k] = 0;
-
-    diagnostic.error(?ctx.s.diags, ctx.a.file_id, span, buf::str);
-    A.deallocate[u8](ctx.s.alloc, buf, total + 1);
-    ret R.err[bool, str](context.REPORTED);
-}
-
-# copy the bytes of `src` into `dst` at offset `at`, returning the new offset
-# ---
-# dst: destination buffer
-# at:  write offset into `dst`
-# src: source string
-# ret: the offset just past the copied bytes
-fun bytes_append(dst: *u8, at: usize, src: str) usize {
-    val n: usize = str_len(src);
-    var i: usize = 0;
-    for (i < n) {
-        dst[at + i] = src[i];
-        i = i + 1;
-    }
-    ret at + n;
+    diagnostic.error(?ctx.s.diags, ctx.a.file_id, span, buf);
+    A.deallocate[u8](ctx.s.alloc, buf::*u8, str_len(buf) + 1);
+    ret R.err[bool, str]("");
 }
 
 # build the typed zero constant for a slot type
@@ -990,6 +1085,20 @@ fun is_pack_type(ctx: *context.LowerContext, t: type.TypeId) bool {
     ret O.unwrap[*type.Type](opt_ty).kind == type.TYPE_PACK;
 }
 
+# true when a semantic type is a fixed-size array
+#
+# TYPE_ARRAY selects the constant-array unroll in lower_comptime_each once the
+# pack and `$fields` forms are ruled out.
+# ---
+# ctx: the context
+# t:   the semantic type
+# ret: true when `t` is a fixed-size array type
+fun is_array_type(ctx: *context.LowerContext, t: type.TypeId) bool {
+    val opt_ty: O.Option[*type.Type] = type.get(?ctx.s.types, t);
+    if (O.is_none[*type.Type](opt_ty)) { ret false; }
+    ret O.unwrap[*type.Type](opt_ty).kind == type.TYPE_ARRAY;
+}
+
 # true when `t` is an unbound generic type parameter
 #
 # Signals a deferred `$each $fields(T)` over a generic param that needs
@@ -1017,42 +1126,6 @@ fun is_fields_record_type(ctx: *context.LowerContext, t: type.TypeId) bool {
     val k: type.TypeKind = O.unwrap[*type.Type](opt_ty).kind;
     if (k == type.TYPE_REC)                                                                            { ret true; }
     if (k == type.TYPE_INSTANCE && O.is_some[*type.FieldTable](type.field_table_for(?ctx.s.types, t))) { ret true; }
-    ret false;
-}
-
-# true when the builder's current block already has a terminator
-#
-# Used to avoid emitting a second terminator (which the builder refuses) and to
-# skip unreachable trailing statements.
-# ---
-# ctx: the context
-# ret: true when the current block is terminated
-fun block_terminated(ctx: *context.LowerContext) bool {
-    if (ctx.builder.fn == nil) { ret false; }
-    val b: ir.BlockId = ctx.builder.block;
-    if (b == ir.BLOCK_NIL)               { ret false; }
-    if (b >= ctx.builder.fn.block_count) { ret false; }
-    ret ctx.builder.fn.blocks[b].terminator != ir.INSTR_NIL;
-}
-
-# true when an IR type is the void type
-# ---
-# ctx: the context
-# tid: the IR type
-# ret: true when `tid` is void (or out of range)
-fun is_void(ctx: *context.LowerContext, tid: ir_type.IrTypeId) bool {
-    val opt_ty: O.Option[*ir_type.IrType] = ir_type.get(?ctx.m.types, tid);
-    if (O.is_none[*ir_type.IrType](opt_ty)) { ret true; }
-    ret O.unwrap[*ir_type.IrType](opt_ty).kind == ir_type.IRT_VOID;
-}
-
-# truthiness of a comptime value for `$if` arm selection
-# ---
-# v:   the comptime value
-# ret: true when `v` is a truthy bool or non-zero int
-fun ct_truthy(v: comptime.CTValue) bool {
-    if (v.kind == comptime.CT_KIND_BOOL) { ret v.data.b; }
-    if (v.kind == comptime.CT_KIND_INT)  { ret v.data.i != 0; }
     ret false;
 }
 

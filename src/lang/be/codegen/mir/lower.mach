@@ -32,24 +32,24 @@ use std.types.bool.true;
 use std.types.bool.false;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_join;
 use std.types.string.str_len;
 
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
-use mir:     mach.lang.be.codegen.mir;
-use mabi:    mach.lang.be.codegen.mir.abi;
-use lctx:    mach.lang.be.codegen.mir.context;
-use intern:  mach.lang.intern;
-use ir:      mach.lang.me.ir;
-use id:      mach.lang.me.ir.id;
-use instr:   mach.lang.me.ir.instruction;
+use mach.lang.be.codegen.mir;
+use mabi: mach.lang.be.codegen.mir.abi;
+use lctx: mach.lang.be.codegen.mir.context;
+use mach.lang.intern;
+use mach.lang.me.ir;
+use mach.lang.me.ir.id;
+use instr: mach.lang.me.ir.instruction;
 use ir_type: mach.lang.me.ir.type;
-use value:   mach.lang.me.ir.value;
-use source:  mach.lang.source;
-use isa:     mach.lang.target.isa;
-use target:  mach.lang.target.resolved;
+use mach.lang.me.ir.value;
+use mach.lang.source;
+use target: mach.lang.target.resolved;
 
 # lower an IR module to a parallel MIR module, one MIR function per IR function
 # ---
@@ -563,7 +563,14 @@ fun dst_is_pending_src(dsts: *u32, srcs: *mir.MirOperand, done: *bool, n: u32, v
 # which clamps argument / return materialization the same way
 fun imm_merge_width(ctx: *lctx.LowerCtx, wid: u8) u8 {
     if (wid == 4) { ret 4; }
-    ret ctx.tgt.model.gpr_width::u8;
+    # a constant WIDER than the machine word (an i16 / i32 immediate on the 8-bit
+    # mos6502, word 1) materializes at the value's own width so the legalizer splits
+    # it into byte lanes; a gpr-width move would set only the low byte. every
+    # wide-native target has a word >= every scalar, so this keeps the machine-word
+    # move there and is byte-identical.
+    var w: u8 = ctx.tgt.model.gpr_width::u8;
+    if (wid > w) { w = wid; }
+    ret w;
 }
 
 # splice a `mir.MIR_MOV (dst) <- (src)` just before a block's terminator
@@ -576,7 +583,9 @@ fun imm_merge_width(ctx: *lctx.LowerCtx, wid: u8) u8 {
 # mb:  the block to splice into; must end in a terminator
 # dst: the move destination operand
 # src: the move source operand
-# wid: the value's logical width in bytes; consulted only for an immediate source
+# wid: the value's logical width in bytes; used to size an immediate materialization
+#      and to widen a register copy past the machine word (a wider-than-word scalar,
+#      the mos6502 8-bit case) so the legalizer splits it into byte lanes
 # ret: true on success, or an allocation / lowering error
 fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand, wid: u8) R.Result[bool, str] {
     if (mb.instr_count == 0) {
@@ -611,8 +620,17 @@ fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mi
     # `imm_merge_width`: a 32-bit constant rides a width-4 move so the backend re-signs
     # it to its register convention (riscv64 lp64 holds an i32 sign-extended), while
     # every other width keeps the full-register move.
-    mi.width         = ctx.tgt.model.gpr_width::u8;
-    mi.src_width     = ctx.tgt.model.gpr_width::u8;
+    #
+    # a value WIDER than the machine word (a scalar on a target whose word is narrower
+    # than the type - the 8-bit mos6502, word 1, copying an i16 / i32) needs the value's
+    # own width so the width legalizer splits the copy into byte lanes; a gpr-width copy
+    # would move only the low byte and drop the rest. every wide-native target has a
+    # word >= every scalar, so `max(gpr_width, wid)` is `gpr_width` there and this is
+    # byte-identical.
+    var copy_w: u8 = ctx.tgt.model.gpr_width::u8;
+    if (wid > copy_w) { copy_w = wid; }
+    mi.width         = copy_w;
+    mi.src_width     = copy_w;
     if (src.kind == mir.MIR_OP_IMM) {
         val iw: u8 = imm_merge_width(ctx, wid);
         mi.width     = iw;
@@ -865,17 +883,20 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     # code, so neither is the erroring site.
     if (inst.kind != instr.OP_PHI && inst.kind != instr.OP_DBG_VALUE
         && instr_touches_vector(ctx, inst)) {
-        if (!arch_selects_vectors(ctx.tgt.arch.id)) {
+        if (!ctx.tgt.model.has_v128) {
             ret R.err[bool, str](vector_unsupported(ctx));
         }
-        # x86_64: a lane-wise compute op (arithmetic / bitwise / unary not / compare-to-
-        # mask) rides the generic MIR opcodes carrying `vec_lane` directly, bypassing the
-        # scalar-specific float / divide / shift routing below (a vector float divide must
-        # not reach the integer `lower_div`); the x64 isel / encoder select the packed
-        # SSE2 form. load / store / move / call / ret / gep / alloca fall through to the
-        # shared handlers carrying the 16-byte width the vreg's `vector` flag set. aarch64
-        # (NEON) selects in its isa isel and falls through here for every vector op.
-        if (ctx.tgt.arch.id == isa.ARCH_X86_64 && is_vector_compute(inst.kind)) {
+        # a backend that selects packed compute from the generic MIR opcodes (x86-64
+        # SSE2, `vector_compute_generic`) takes a lane-wise compute op (arithmetic /
+        # bitwise / unary not / compare-to-mask) through `lower_generic` directly,
+        # carrying `vec_lane` and bypassing the scalar-specific float / divide / shift
+        # routing below (a vector float divide must not reach the integer `lower_div`);
+        # its isel / encoder select the packed form. load / store / move / call / ret /
+        # gep / alloca fall through to the shared handlers carrying the 16-byte width
+        # the vreg's `vector` flag set. a backend that selects vector ops from the
+        # scalar-shaped handlers in its own isel (aarch64 NEON) falls through here for
+        # every vector op.
+        if (ctx.tgt.model.vector_compute_generic && is_vector_compute(inst.kind)) {
             ret lower_generic(ctx, mb, inst, iid);
         }
     }
@@ -991,15 +1012,24 @@ fun instr_touches_vector(ctx: *lctx.LowerCtx, inst: *instr.Instruction) bool {
     ret false;
 }
 
-# whether the target arch's backend selects 128-bit vector ops to real machine
-# code, so a vector-typed instruction lowers rather than hitting the defined
-# "not yet supported" guard. each backend child flips its arch true as it wires
-# selection: aarch64 (NEON) and x86_64 (#2014 SSE2). riscv64 needs no arm - its
-# scalarization pass rewrites vector ops before MIR lowering, so none reaches here.
-fun arch_selects_vectors(arch_id: u32) bool {
-    if (arch_id == isa.ARCH_AARCH64) { ret true; }
-    if (arch_id == isa.ARCH_X86_64) { ret true; }
-    ret false;
+# intern an owned scratch string, freeing it, and return the canonical interned copy
+#
+# Takes ownership of `buf` (an exact `str_len + 1` allocation from `ctx.alloc`, as a
+# `str_join` result is): interns a deduped copy, frees `buf`, and returns the interned
+# string so it outlives the scratch. Degrades to `fallback` on any intern / lookup
+# failure.
+# ---
+# ctx:      the lowering context (supplies the allocator and interner)
+# buf:      the owned null-terminated scratch string to intern and free
+# fallback: returned on any intern / lookup failure
+# ret:      the interned copy of `buf`, or `fallback`
+fun intern_owned(ctx: *lctx.LowerCtx, buf: str, fallback: str) str {
+    val ir: R.Result[intern.StrId, str] = intern.intern(ctx.interner, buf);
+    A.deallocate[u8](ctx.alloc, buf::*u8, str_len(buf) + 1);
+    if (R.is_err[intern.StrId, str](ir)) { ret fallback; }
+    val rn: O.Option[str] = intern.lookup(ctx.interner, R.unwrap_ok[intern.StrId, str](ir));
+    if (O.is_some[str](rn)) { ret O.unwrap[str](rn); }
+    ret fallback;
 }
 
 # the defined per-target "vectors not yet supported" error, naming the arch
@@ -1015,23 +1045,9 @@ fun vector_unsupported(ctx: *lctx.LowerCtx) str {
     val arch:     str = ctx.tgt.arch.name;
     if (arch == nil) { ret fallback; }
 
-    val total: usize = str_len(prefix) + str_len(arch);
-    val r: R.Result[*u8, str] = A.allocate[u8](ctx.alloc, total + 1);
-    if (R.is_err[*u8, str](r)) { ret fallback; }
-    val buf: *u8 = R.unwrap_ok[*u8, str](r);
-    var k: usize = 0;
-    var j: usize = 0;
-    for (j < str_len(prefix)) { buf[k] = prefix[j]; k = k + 1; j = j + 1; }
-    j = 0;
-    for (j < str_len(arch)) { buf[k] = arch[j]; k = k + 1; j = j + 1; }
-    buf[total] = 0;
-
-    val ir_id: R.Result[intern.StrId, str] = intern.intern(ctx.interner, buf::str);
-    A.deallocate[u8](ctx.alloc, buf, total + 1);
-    if (R.is_err[intern.StrId, str](ir_id)) { ret fallback; }
-    val rn: O.Option[str] = intern.lookup(ctx.interner, R.unwrap_ok[intern.StrId, str](ir_id));
-    if (O.is_some[str](rn)) { ret O.unwrap[str](rn); }
-    ret fallback;
+    val jr: R.Result[str, str] = str_join(ctx.alloc, prefix, arch);
+    if (R.is_err[str, str](jr)) { ret fallback; }
+    ret intern_owned(ctx, R.unwrap_ok[str, str](jr), fallback);
 }
 
 # lower an IR OP_CBR into a `mir.MIR_CBR [cond, then, else]`
@@ -1105,25 +1121,9 @@ fun asm_bind_message(ctx: *lctx.LowerCtx, prefix: str, name_id: intern.StrId, su
     if (O.is_none[str](no)) { ret fallback; }
     val nm: str = O.unwrap[str](no);
 
-    val total: usize = str_len(prefix) + str_len(nm) + str_len(suffix);
-    val r: R.Result[*u8, str] = A.allocate[u8](ctx.alloc, total + 1);
-    if (R.is_err[*u8, str](r)) { ret fallback; }
-    val buf: *u8 = R.unwrap_ok[*u8, str](r);
-    var k: usize = 0;
-    var j: usize = 0;
-    for (j < str_len(prefix)) { buf[k] = prefix[j]; k = k + 1; j = j + 1; }
-    j = 0;
-    for (j < str_len(nm)) { buf[k] = nm[j]; k = k + 1; j = j + 1; }
-    j = 0;
-    for (j < str_len(suffix)) { buf[k] = suffix[j]; k = k + 1; j = j + 1; }
-    buf[total] = 0;
-
-    val ir: R.Result[intern.StrId, str] = intern.intern(ctx.interner, buf::str);
-    A.deallocate[u8](ctx.alloc, buf, total + 1);
-    if (R.is_err[intern.StrId, str](ir)) { ret fallback; }
-    val rn: O.Option[str] = intern.lookup(ctx.interner, R.unwrap_ok[intern.StrId, str](ir));
-    if (O.is_some[str](rn)) { ret O.unwrap[str](rn); }
-    ret fallback;
+    val jr: R.Result[str, str] = str_join(ctx.alloc, prefix, nm, suffix);
+    if (R.is_err[str, str](jr)) { ret fallback; }
+    ret intern_owned(ctx, R.unwrap_ok[str, str](jr), fallback);
 }
 
 # build a mir.MIR_ASM instruction from the IR `IrAsm` payload bound to this OP_ASM id
@@ -1229,7 +1229,7 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     # a sub-word shift result, like any narrow GP ALU write, leaves the upper
     # register bits undefined; clamp the operation width so the spilled word stays
     # clean (mirrors `set_generic_widths` and the byte-divide promotion).
-    val w: u8 = lctx.clamp_alu_width(lctx.op_width_of(ctx, inst.ty));
+    val w: u8 = lctx.clamp_alu_width(ctx.tgt.model.gpr_width, lctx.op_width_of(ctx, inst.ty));
 
     var op: mir.MirOpcode = mir.MIR_SHR_U;
     if (inst.kind == instr.OP_SHL)   { op = mir.MIR_SHL; }
@@ -1602,7 +1602,7 @@ fun set_generic_widths(ctx: *lctx.LowerCtx, inst: *instr.Instruction, mi: *mir.M
     # leak through the word-width spill into a downstream full-width use. the
     # conversions are excluded: their destination width selects the MOVZX / MOVSX
     # narrow form and is load-bearing, not a clamp candidate.
-    if (is_int_alu_kind(inst.kind)) { dw = lctx.clamp_alu_width(dw); }
+    if (is_int_alu_kind(inst.kind)) { dw = lctx.clamp_alu_width(ctx.tgt.model.gpr_width, dw); }
     var sw: u8 = dw;
     if (is_int_conversion_kind(inst.kind) && inst.operand_count >= 1) {
         sw = lctx.op_width_of(ctx, inst.operands[0].ty);
@@ -1985,7 +1985,7 @@ fun lower_load(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
     # gives a sub-word ALU result - makes the backend zero-extend the load into a
     # clean register (a wider load keeps its own width, so width == src_width there).
     mi.src_width     = lctx.op_width_of(ctx, inst.ty);
-    mi.width         = lctx.clamp_alu_width(mi.src_width);
+    mi.width         = lctx.clamp_alu_width(ctx.tgt.model.gpr_width, mi.src_width);
     ret lctx.push_instr(ctx, mb, mi);
 }
 
