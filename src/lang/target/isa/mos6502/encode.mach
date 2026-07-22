@@ -50,9 +50,12 @@ val OP_SBC_IMM: u8 = 0xE9;  val OP_SBC_ZP: u8 = 0xE5;
 val OP_AND_IMM: u8 = 0x29;  val OP_AND_ZP: u8 = 0x25;
 val OP_ORA_IMM: u8 = 0x09;  val OP_ORA_ZP: u8 = 0x05;
 val OP_EOR_IMM: u8 = 0x49;  val OP_EOR_ZP: u8 = 0x45;
+val OP_CMP_IMM: u8 = 0xC9;  val OP_CMP_ZP: u8 = 0xC5;
 val OP_CLC:     u8 = 0x18;  val OP_SEC:    u8 = 0x38;
 val OP_JMP_ABS: u8 = 0x4C;  val OP_JSR_ABS: u8 = 0x20;
 val OP_RTS:     u8 = 0x60;  val OP_BRK:     u8 = 0x00;  val OP_NOP: u8 = 0xEA;
+# the conditional branch opcodes (pc-relative, signed 8-bit displacement)
+val OP_BEQ: u8 = 0xF0;  val OP_BNE: u8 = 0xD0;  val OP_BCC: u8 = 0x90;  val OP_BCS: u8 = 0xB0;
 
 # encode one fully-resolved MIR module into `.text` bytes, symbol marks, and
 # relocations
@@ -119,12 +122,14 @@ fun encode_instr(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr, f
     if (op == mos6502.RTS::u32) { enc.emit_byte(?st.buf, OP_RTS); ret R.ok[bool, str](true); }
     if (op == mos6502.BRK::u32) { enc.emit_byte(?st.buf, OP_BRK); ret R.ok[bool, str](true); }
     if (op == mos6502.NOP::u32) { enc.emit_byte(?st.buf, OP_NOP); ret R.ok[bool, str](true); }
+    if (op == mos6502.JMP::u32) { ret encode_br(st, mi, fn_base); }
 
     if (op == mir.MIR_ADD || op == mir.MIR_SUB ||
         op == mir.MIR_AND || op == mir.MIR_OR || op == mir.MIR_XOR) {
         ret encode_alu(st, mi, op);
     }
     if (op == mir.MIR_NOT) { ret encode_not(st, mi); }
+    if (mir.is_fused_cbr(op)) { ret encode_sel_cbr(st, mi, fn_base); }
     if (op == mir.MIR_CALL) { ret encode_call(st, mi); }
 
     ret R.err[bool, str](unencodable_message(op));
@@ -190,6 +195,80 @@ fun encode_not(st: *enc.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
     ret R.ok[bool, str](true);
 }
 
+# encode an unconditional branch `MIR_BR [block]` as `JMP block` (absolute)
+#
+# The target's absolute address is its `.text` offset, resolved in the driver's
+# second pass: the freestanding flat image loads at base 0 with `.text` at address
+# 0, so a block at `.text` offset O sits at address O. A non-zero load base would
+# need a relocation (deferred with the call path).
+fun encode_br(st: *enc.EncodeState, mi: *mir.MirInstr, fn_base: u32) R.Result[bool, str] {
+    if (mi.operand_count == 0 || mi.operands[0].kind != mir.MIR_OP_BLOCK) {
+        ret R.err[bool, str]("mos6502: malformed unconditional branch");
+    }
+    ret emit_jmp(st, mi.operands[0].imm::u32, fn_base);
+}
+
+# encode a fused compare-and-branch `[lhs, rhs, then_block, else_block]` as the
+# always-correct invert-and-jump long form
+#
+#   LDA lhs ; CMP rhs ; B!cc +3 ; JMP then ; JMP else
+#
+# The inverted conditional skips exactly the 3-byte then-JMP when the condition is
+# false, so its displacement is a fixed +3 and can never exceed the branch range,
+# and both real targets are absolute JMPs with no distance limit. Unsigned and
+# equality conditions are realized directly; signed relations need the 6502's
+# overflow-aware sequence and are a documented frontier.
+fun encode_sel_cbr(st: *enc.EncodeState, mi: *mir.MirInstr, fn_base: u32) R.Result[bool, str] {
+    if (mi.operand_count != 4 ||
+        mi.operands[2].kind != mir.MIR_OP_BLOCK || mi.operands[3].kind != mir.MIR_OP_BLOCK) {
+        ret R.err[bool, str]("mos6502: malformed fused compare-and-branch");
+    }
+    val op:  mir.MirOpcode = mi.opcode;
+    val lhs: *mir.MirOperand = ?mi.operands[0];
+    val rhs: *mir.MirOperand = ?mi.operands[1];
+    val then_block: u32 = mi.operands[2].imm::u32;
+    val else_block: u32 = mi.operands[3].imm::u32;
+
+    # pick the accumulator operand, the compared operand, and the INVERTED branch
+    # (taken when the fused condition is FALSE, to skip the then-JMP). LE_U swaps the
+    # operands so `lhs <= rhs` becomes `rhs >= lhs`, a carry-set test.
+    var load_op: *mir.MirOperand = lhs;
+    var cmp_op:  *mir.MirOperand = rhs;
+    var inv_branch: u8 = 0;
+    if (op == mir.MIR_SEL_CBR_EQ)        { inv_branch = OP_BNE; }
+    or (op == mir.MIR_SEL_CBR_NE)        { inv_branch = OP_BEQ; }
+    or (op == mir.MIR_SEL_CBR_LT_U)      { inv_branch = OP_BCS; }
+    or (op == mir.MIR_SEL_CBR_LE_U)      { load_op = rhs; cmp_op = lhs; inv_branch = OP_BCC; }
+    or {
+        ret R.err[bool, str]("mos6502: signed fused compare-and-branch is not yet encoded on this target");
+    }
+
+    val res_ld: R.Result[bool, str] = emit_load_a(st, load_op);
+    if (R.is_err[bool, str](res_ld)) { ret res_ld; }
+    if (cmp_op.kind == mir.MIR_OP_IMM)  { emit_imm1(st, OP_CMP_IMM, (cmp_op.imm & 0xFF)::u8); }
+    or (cmp_op.kind == mir.MIR_OP_PREG) { emit_zp1(st, OP_CMP_ZP, mos6502.zp_addr(cmp_op.preg::i32)); }
+    or { ret R.err[bool, str]("mos6502: unsupported compare operand"); }
+
+    # inverted branch over the 3-byte then-JMP (fixed +3, no fixup needed).
+    enc.emit_byte(?st.buf, inv_branch);
+    enc.emit_byte(?st.buf, 0x03);
+
+    val res_then: R.Result[bool, str] = emit_jmp(st, then_block, fn_base);
+    if (R.is_err[bool, str](res_then)) { ret res_then; }
+    ret emit_jmp(st, else_block, fn_base);
+}
+
+# emit `JMP block` (absolute) and record a branch fixup so the driver's second pass
+# patches the 16-bit target address once the block's `.text` offset is known
+fun emit_jmp(st: *enc.EncodeState, target_block: u32, fn_base: u32) R.Result[bool, str] {
+    enc.emit_byte(?st.buf, OP_JMP_ABS);
+    val patch_pos: u32 = st.buf.len::u32;
+    enc.emit_byte(?st.buf, 0);
+    enc.emit_byte(?st.buf, 0);
+    val next_ip: u32 = st.buf.len::u32;
+    ret enc.push_fixup(st, patch_pos, next_ip, target_block, fn_base);
+}
+
 # encode a direct call as `JSR callee` (absolute), recording a relocation against
 # the callee symbol for the 16-bit address field
 fun encode_call(st: *enc.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
@@ -234,13 +313,16 @@ fun emit_zp1(st: *enc.EncodeState, opcode: u8, addr: i32) {
     enc.emit_byte(?st.buf, (addr & 0xFF)::u8);
 }
 
-# write one resolved branch displacement into the text (driver pass 2)
+# write one resolved JMP target into the text (driver pass 2)
 #
-# No branch form is emitted yet (conditional branches are a documented frontier),
-# so no fixup is ever recorded and this is never called; it exists to satisfy the
-# driver's hook contract.
+# Every 6502 fixup is an absolute `JMP` (the conditional-branch displacements are
+# fixed +3 skips emitted directly, so they need no fixup). The target's absolute
+# address equals its `.text` offset for the base-0 freestanding flat image, so the
+# 16-bit little-endian address field is `target_off`.
 fun patch_branch(st: *enc.EncodeState, fx: *enc.BranchFixup, target_off: u32) R.Result[bool, str] {
-    ret R.err[bool, str]("mos6502: branch relaxation is not yet implemented");
+    st.buf.data[fx.patch_pos]     = (target_off & 0xFF)::u8;
+    st.buf.data[fx.patch_pos + 1] = ((target_off >> 8) & 0xFF)::u8;
+    ret R.ok[bool, str](true);
 }
 
 # the diagnostic for a generic opcode this encoder does not yet realize
@@ -304,6 +386,17 @@ test "mach.lang.target.isa.mos6502.encode:byte_pins" {
     # RTS -> 60
     enc.emit_byte(?st.buf, OP_RTS);
     if (st.buf.data[12] != 0x60) { ret 1; }
+
+    # CMP #$0A -> C9 0A ; CMP $1D -> C5 1D
+    emit_imm1(?st, OP_CMP_IMM, 0x0A);
+    emit_zp1(?st, OP_CMP_ZP, mos6502.zp_addr(13));
+    if (st.buf.data[13] != 0xC9 || st.buf.data[14] != 0x0A) { ret 1; }
+    if (st.buf.data[15] != 0xC5 || st.buf.data[16] != 0x1D) { ret 1; }
+
+    # the branch opcodes: BEQ F0, BNE D0, BCC 90, BCS B0.
+    if (OP_BEQ != 0xF0 || OP_BNE != 0xD0 || OP_BCC != 0x90 || OP_BCS != 0xB0) { ret 1; }
+    # JMP absolute is 4C.
+    if (OP_JMP_ABS != 0x4C) { ret 1; }
 
     enc.buf_dnit(?st.buf);
     ret 0;
