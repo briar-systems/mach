@@ -56,6 +56,9 @@ val OP_JMP_ABS: u8 = 0x4C;  val OP_JSR_ABS: u8 = 0x20;
 val OP_RTS:     u8 = 0x60;  val OP_BRK:     u8 = 0x00;  val OP_NOP: u8 = 0xEA;
 # the conditional branch opcodes (pc-relative, signed 8-bit displacement)
 val OP_BEQ: u8 = 0xF0;  val OP_BNE: u8 = 0xD0;  val OP_BCC: u8 = 0x90;  val OP_BCS: u8 = 0xB0;
+# rotate the accumulator left through carry ($2A) - used to read the carry flag into
+# a 0/1 boolean when materializing a standalone unsigned compare
+val OP_ROL_A: u8 = 0x2A;
 
 # encode one fully-resolved MIR module into `.text` bytes, symbol marks, and
 # relocations
@@ -129,6 +132,9 @@ fun encode_instr(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr, f
         ret encode_alu(st, mi, op);
     }
     if (op == mir.MIR_NOT) { ret encode_not(st, mi); }
+    if (op == mir.MIR_CMP_EQ || op == mir.MIR_CMP_NE || op == mir.MIR_CMP_LT_U) {
+        ret encode_cmp(st, mi, op);
+    }
     if (mir.is_fused_cbr(op)) { ret encode_sel_cbr(st, mi, fn_base); }
     if (op == mir.MIR_CALL) { ret encode_call(st, mi); }
 
@@ -191,6 +197,43 @@ fun encode_not(st: *enc.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
     val res_ld: R.Result[bool, str] = emit_load_a(st, ?mi.operands[1]);
     if (R.is_err[bool, str](res_ld)) { ret res_ld; }
     emit_imm1(st, OP_EOR_IMM, 0xFF);
+    emit_zp1(st, OP_STA_ZP, mos6502.zp_addr(dst.preg::i32));
+    ret R.ok[bool, str](true);
+}
+
+# encode a standalone comparison `dst = (a rel b)` producing a 0 / 1 byte boolean
+#
+# The unsigned less-than form is what the legalizer's carry chain emits per byte
+# lane: `LDA a ; CMP b` leaves carry set when a >= b, so `LDA #0 ; ROL A ; EOR #1`
+# reads the complement (a < b) into a 0 / 1 result. Equality / inequality branch
+# over a `LDA #1`. Signed and <= forms are a documented frontier.
+fun encode_cmp(st: *enc.EncodeState, mi: *mir.MirInstr, op: mir.MirOpcode) R.Result[bool, str] {
+    if (mi.operand_count != 3) { ret R.err[bool, str]("mos6502: malformed compare"); }
+    val dst: *mir.MirOperand = ?mi.operands[0];
+    if (dst.kind != mir.MIR_OP_PREG) { ret R.err[bool, str](unencodable_message(op)); }
+
+    val res_ld: R.Result[bool, str] = emit_load_a(st, ?mi.operands[1]);
+    if (R.is_err[bool, str](res_ld)) { ret res_ld; }
+    val b: *mir.MirOperand = ?mi.operands[2];
+    if (b.kind == mir.MIR_OP_IMM)  { emit_imm1(st, OP_CMP_IMM, (b.imm & 0xFF)::u8); }
+    or (b.kind == mir.MIR_OP_PREG) { emit_zp1(st, OP_CMP_ZP, mos6502.zp_addr(b.preg::i32)); }
+    or { ret R.err[bool, str]("mos6502: unsupported compare operand"); }
+
+    if (op == mir.MIR_CMP_LT_U) {
+        # A = carry (a >= b), then flip to (a < b).
+        emit_imm1(st, OP_LDA_IMM, 0x00);
+        enc.emit_byte(?st.buf, OP_ROL_A);
+        emit_imm1(st, OP_EOR_IMM, 0x01);
+    }
+    or {
+        # equality: start 0, branch over the `LDA #1` on the appropriate flag.
+        emit_imm1(st, OP_LDA_IMM, 0x00);
+        var skip_branch: u8 = OP_BNE;   # CMP_EQ: not-equal keeps 0
+        if (op == mir.MIR_CMP_NE) { skip_branch = OP_BEQ; }
+        enc.emit_byte(?st.buf, skip_branch);
+        enc.emit_byte(?st.buf, 0x02);   # skip the 2-byte `LDA #1`
+        emit_imm1(st, OP_LDA_IMM, 0x01);
+    }
     emit_zp1(st, OP_STA_ZP, mos6502.zp_addr(dst.preg::i32));
     ret R.ok[bool, str](true);
 }
@@ -316,12 +359,17 @@ fun emit_zp1(st: *enc.EncodeState, opcode: u8, addr: i32) {
 # write one resolved JMP target into the text (driver pass 2)
 #
 # Every 6502 fixup is an absolute `JMP` (the conditional-branch displacements are
-# fixed +3 skips emitted directly, so they need no fixup). The target's absolute
-# address equals its `.text` offset for the base-0 freestanding flat image, so the
-# 16-bit little-endian address field is `target_off`.
+# fixed +3 skips emitted directly, so they need no fixup). A block's absolute
+# address is the image load base plus its `.text` offset, so the 16-bit
+# little-endian address field is `base + target_off`. The load base is the OS's
+# image base; a 6502 image must load ABOVE the zero page and hardware stack (the
+# value register file lives in the zero page), which a base-0 flat image does not
+# provide - the target-aware base is a documented layout frontier. At base 0 this
+# is `target_off`, matching the flat-image default.
 fun patch_branch(st: *enc.EncodeState, fx: *enc.BranchFixup, target_off: u32) R.Result[bool, str] {
-    st.buf.data[fx.patch_pos]     = (target_off & 0xFF)::u8;
-    st.buf.data[fx.patch_pos + 1] = ((target_off >> 8) & 0xFF)::u8;
+    val abs: u32 = st.os.base_addr::u32 + target_off;
+    st.buf.data[fx.patch_pos]     = (abs & 0xFF)::u8;
+    st.buf.data[fx.patch_pos + 1] = ((abs >> 8) & 0xFF)::u8;
     ret R.ok[bool, str](true);
 }
 
