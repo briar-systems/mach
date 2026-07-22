@@ -145,11 +145,12 @@ fun cross(p: Pair, q: Pair) i64 {
 ## `$each` — compile-time unroll
 
 `$each` is a statement form that splices its body once per element of a
-comptime sequence. There are two sequence forms:
+comptime sequence. There are three sequence forms:
 
 ```mach
 $each f in $fields(T) { ... }    # one iteration per field of T
 $each a in va { ... }            # one iteration per element of pack va
+$each x in ARR { ... }           # one iteration per element of a constant array val
 ```
 
 `$each` is valid only in statement scope (inside a function body). It is not
@@ -158,6 +159,57 @@ Enclosing runtime variables (e.g. an index or accumulator) are shared across
 all unrolled copies.
 
 See [variadics.md](variadics.md) for the pack form (`$each a in va`).
+
+### `$each` over a comptime-constant array
+
+`$each x in ARR` unrolls the body once per element of `ARR`, binding `x` to that
+element's compile-time constant per iteration. Unlike the pack and `$fields`
+forms, every element shares one type (the array's element type), so the loop
+variable is an ordinary constant value: it reads as a value, casts, dispatches a
+per-element `$if`, and — for a record element — projects fields with `x.field`.
+
+```mach
+val PRIMES: [4]i64 = [4]i64{2, 3, 5, 7};
+
+fun sum() i64 {
+    var total: i64 = 0;
+    $each x in PRIMES {
+        total = total + x;      # x is 2, then 3, then 5, then 7
+    }
+    ret total;                  # 17
+}
+```
+
+A per-element `$if` selects its arm from the element's constant, so heterogeneous
+handling falls out of the unroll:
+
+```mach
+rec Rule { tag: i64; fn: fun(i64) i64; }
+
+val RULES: [3]Rule = [3]Rule{
+    Rule{tag: 1, fn: inc},
+    Rule{tag: 2, fn: dbl},
+    Rule{tag: 3, fn: neg},
+};
+
+fun run(n: i64) {
+    $each r in RULES {
+        $if (r.tag == 2) { use_double(r.fn(n)); }   # r.fn folds to the element's function
+        $or              { use_other(r.tag, r.fn(n)); }
+    }
+}
+```
+
+**Eligibility.** `ARR` must name an immutable `val` (never a `var`) declared in
+the current module, whose type is a fixed-size array `[N]E` fully initialized by
+an array literal of exactly `N` elements. `E` must be a scalar or record type;
+nested-array element types are not supported. An empty array (`[0]E`) unrolls to
+nothing. Each violation is reported with a teaching diagnostic.
+
+`x.field` on a record element projects the element's constant: a scalar field
+folds to a constant, a function-pointer field yields a function reference, and a
+record field materializes the nested literal. Projection is one level deep
+(`x.field`); `x` itself is a constant and has no address (`?x` is rejected).
 
 ## Diagnostic intrinsics
 

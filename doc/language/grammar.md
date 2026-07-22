@@ -615,8 +615,9 @@ comptime-each-stmt ::= "$" "each" IDENT "in" expr stmt-branch-body
 ```
 
 `$each` is a compile-time unroll: the body is duplicated once per element of
-the sequence, which must be `$fields(T)` or a variadic pack identifier. `in`
-is a contextual keyword.
+the sequence, which must be `$fields(T)`, a variadic pack identifier, or a
+comptime-constant array `val` (see
+[comptime-intrinsics.md](comptime-intrinsics.md)). `in` is a contextual keyword.
 
 Notes:
 - `if` / `or`: the `or` chain models both `else if` (`or (cond) { ... }`)
