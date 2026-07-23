@@ -1066,6 +1066,9 @@ fun encode_branch(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R.Re
         ret R.err[bool, str]("encode: branch target is not a block");
     }
     val target_block: u32 = mi.operands[0].imm::u32;
+    # a branch to the next block in layout order is redundant - control falls
+    # through with no word emitted (issue #1936).
+    if (encode.branch_falls_through(st, target_block)) { ret R.ok[bool, str](true); }
     val patch_pos: u32 = st.buf.len::u32;
     emit_word(st, pack_j(JAL, RZERO, 0));
     val next_ip: u32 = st.buf.len::u32;
@@ -1094,6 +1097,9 @@ fun encode_cbr(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R.Resul
     val f1: R.Result[bool, str] = encode.push_fixup(st, bne_pos, bne_next, then_block, fn_base);
     if (R.is_err[bool, str](f1)) { ret f1; }
 
+    # the not-taken j else edge is elided when else_block is the next block in layout
+    # order (issue #1936); the taken bne above always keeps its edge.
+    if (encode.branch_falls_through(st, else_block)) { ret R.ok[bool, str](true); }
     val j_pos: u32 = st.buf.len::u32;
     emit_word(st, pack_j(JAL, RZERO, 0));
     val j_next: u32 = st.buf.len::u32;
@@ -1167,6 +1173,13 @@ fun encode_fused_cbr(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R
     val f1: R.Result[bool, str] = encode.push_fixup(st, bcc_pos, bcc_next, then_block, fn_base);
     if (R.is_err[bool, str](f1)) { ret f1; }
 
+    # the not-taken j else edge is elided when else_block is the next block in layout
+    # order (issue #1936); the taken bcc above stays and control falls through. the
+    # varloc bound closes on the emitted bytes either way.
+    if (encode.branch_falls_through(st, else_block)) {
+        encode.close_cmp_varlocs(st, instr_start, st.buf.len::u32);
+        ret R.ok[bool, str](true);
+    }
     val j_pos: u32 = st.buf.len::u32;
     emit_word(st, pack_j(JAL, RZERO, 0));
     val j_next: u32 = st.buf.len::u32;
@@ -2154,6 +2167,8 @@ fun encode_function_riscv64(st: *encode.EncodeState, f: *mir.MirFunction) R.Resu
         val blk: *mir.MirBlock = ?f.blocks[bi];
         val rb: R.Result[bool, str] = encode.push_block(st, fn_base, blk.id, st.buf.len::u32);
         if (R.is_err[bool, str](rb)) { ret rb; }
+        # this block's fallthrough successor, so its terminator can elide a jump to it.
+        encode.set_fallthrough(st, f, bi);
 
         var ii: u32 = 0;
         for (ii < blk.instr_count) {
@@ -4001,6 +4016,83 @@ test "mach.lang.target.isa.riscv64.encode:fused_cbr_sequences" {
     if (read_word(?st.buf, 12) != 0x0302D293) { bad = 1; }
     if (read_word(?st.buf, 16) != 0x00536063) { bad = 1; }
     if (st.fixups[12].patch_pos != 16)         { bad = 1; }
+
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# a terminator branching to the next block in layout order emits no jump - control
+# falls through (issue #1936). set_fallthrough records that successor; the encoder
+# elides only the not-taken / unconditional edge, never a taken edge. pins the win
+# byte-count: the elided emission is exactly one 4-byte j shorter and records one
+# fewer fixup, and a branch to any OTHER block still emits its j.
+test "mach.lang.target.isa.riscv64.encode:branch_to_fallthrough_elided" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    tbuf(?st, ?alloc);
+    st.alloc = ?alloc; st.fixups = nil; st.fixup_count = 0; st.fixup_cap = 0;
+
+    # an unconditional branch to block 4.
+    var ub: mir.MirInstr;
+    var uops: [1]mir.MirOperand;
+    uops[0] = mir.op_block(4);
+    ub.operands = ?uops[0]; ub.operand_count = 1; ub.opcode = mir.MIR_BR; ub.width = 8;
+
+    # no successor recorded: the j word is emitted, one fixup against block 4.
+    st.has_next_block = false; st.buf.len = 0; st.fixup_count = 0;
+    encode_branch(?st, 0, ?ub);
+    if (st.buf.len != 4)     { bad = 1; }
+    if (st.fixup_count != 1) { bad = 1; }
+
+    # block 4 is the fallthrough successor: nothing is emitted, no fixup recorded.
+    st.has_next_block = true; st.next_block_id = 4; st.buf.len = 0; st.fixup_count = 0;
+    encode_branch(?st, 0, ?ub);
+    if (st.buf.len != 0)     { bad = 1; }
+    if (st.fixup_count != 0) { bad = 1; }
+
+    # a different successor does not elide the branch.
+    st.has_next_block = true; st.next_block_id = 9; st.buf.len = 0; st.fixup_count = 0;
+    encode_branch(?st, 0, ?ub);
+    if (st.buf.len != 4)     { bad = 1; }
+    if (st.fixup_count != 1) { bad = 1; }
+
+    # a plain conditional `bne cond,x0, then ; j else`: the taken bne always stays;
+    # the not-taken j else elides when else (block 4) is the fallthrough successor.
+    var cbr: mir.MirInstr;
+    var cops: [3]mir.MirOperand;
+    cops[0] = mir.op_preg(10); cops[1] = mir.op_block(3); cops[2] = mir.op_block(4);
+    cbr.operands = ?cops[0]; cbr.operand_count = 3; cbr.width = 8; cbr.opcode = mir.MIR_SEL_CBR;
+
+    st.has_next_block = false; st.buf.len = 0; st.fixup_count = 0;
+    encode_cbr(?st, 0, ?cbr);
+    if (st.buf.len != 8)     { bad = 1; }
+    if (st.fixup_count != 2) { bad = 1; }
+
+    st.has_next_block = true; st.next_block_id = 4; st.buf.len = 0; st.fixup_count = 0;
+    encode_cbr(?st, 0, ?cbr);
+    if (st.buf.len != 4)                    { bad = 1; }   # bne only, j else elided
+    if (st.fixup_count != 1)                { bad = 1; }
+    if (st.fixups[0].target_block != 3)     { bad = 1; }   # taken edge preserved
+
+    # a fused compare-and-branch `bcc a1,a2, then ; j else`: same elision of the
+    # not-taken j else, taken bcc preserved.
+    var mi: mir.MirInstr;
+    var ops: [4]mir.MirOperand;
+    ops[0] = mir.op_preg(11); ops[1] = mir.op_preg(12);
+    ops[2] = mir.op_block(3); ops[3] = mir.op_block(4);
+    mi.operands = ?ops[0]; mi.operand_count = 4; mi.width = 8; mi.opcode = mir.MIR_SEL_CBR_EQ;
+
+    st.has_next_block = false; st.buf.len = 0; st.fixup_count = 0;
+    encode_fused_cbr(?st, 0, ?mi);
+    if (st.buf.len != 8)     { bad = 1; }
+    if (st.fixup_count != 2) { bad = 1; }
+
+    st.has_next_block = true; st.next_block_id = 4; st.buf.len = 0; st.fixup_count = 0;
+    encode_fused_cbr(?st, 0, ?mi);
+    if (st.buf.len != 4)                    { bad = 1; }   # bcc only, j else elided
+    if (st.fixup_count != 1)                { bad = 1; }
+    if (st.fixups[0].target_block != 3)     { bad = 1; }   # taken edge preserved
 
     encode.buf_dnit(?st.buf);
     ret bad;
