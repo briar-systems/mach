@@ -36,14 +36,17 @@
 #     always-unsafe class (div/mod, floating point, incl. vectors) is gated at sema.
 #
 #   - SEEDS for #1648 (contract): this module marks only the secret SOURCES on the
-#     MIR - a secret parameter's vreg, and a load / call whose result is secret
-#     (`MirVReg.secret`, set once at ctx_setup) - plus `:^` becomes an explicit
-#     MIR_DECLASSIFY barrier. It does NOT propagate a per-value taint through
-#     transforms (that model was fragile and non-deterministic). The #1648 validator
-#     re-derives per-instruction taint over the FINAL MIR as a dataflow fixpoint,
-#     seeded from these source markers, propagating any-secret-operand->secret-result
-#     and stopping at the declassify barrier. Because the seeds sit on stable sources
-#     and #1648 re-derives, no transform can launder the taint.
+#     lowered MIR - a secret parameter's vreg, and a load / call whose result is secret
+#     (`MirVReg.secret`, set once at ctx_setup); a store / memzero into secret storage
+#     (`MirInstr.writes_secret`, the zeroization seed); and `:^` lowered to an explicit
+#     MIR_DECLASSIFY barrier. It does NOT propagate a per-value taint through transforms
+#     (that model was fragile and non-deterministic). The #1648 validator re-derives
+#     per-instruction taint as a dataflow fixpoint over the LOWERED (target-independent,
+#     pre-selection) MIR - the layer where all three seed kinds and the barrier live -
+#     seeded from these markers, propagating any-secret-operand->secret-result and
+#     STOPPING at each MIR_DECLASSIFY. (isel retags MIR_DECLASSIFY to the concrete move
+#     afterward, so it is a plain register copy at runtime.) Because the seeds sit on
+#     stable sources and #1648 re-derives, no transform can launder the taint.
 #
 # INVARIANT for any future backend pass: it must not introduce a secret-dependent
 # branch, select a variable-latency instruction on a secret operand, or drop a
@@ -187,6 +190,7 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: 
     ctx.cur_loc        = source.loc_nil();
     ctx.cur_inline_site = 0;
     ctx.cur_vec_lane   = mir.VEC_LANE_NONE;
+    ctx.cur_writes_secret = false;
     ctx.pending        = nil;
     ctx.pending_count  = 0;
     ctx.pending_cap    = 0;
@@ -680,6 +684,7 @@ fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mi
     # vector phi, so it carries no lane descriptor (and struct locals are not
     # zero-initialized, so it is set explicitly like the other push_instr invariants).
     mi.vec_lane          = mir.VEC_LANE_NONE;
+    mi.writes_secret     = false;   # a phi-elimination move never writes secret storage (#1646)
 
     # grow by one, shift the terminator right, and drop the move into its place.
     val gr: R.Result[bool, str] = lctx.grow_instr(ctx, mb);
@@ -807,6 +812,7 @@ fun split_critical_edge(ctx: *lctx.LowerCtx, pred: *mir.MirBlock, succ_id: u32) 
     br.inline_site       = 0;
     br.dbg_bindings      = nil;
     br.dbg_binding_count = 0;
+    br.writes_secret     = false;   # a synthesized branch never writes storage (#1646)
 
     val ri: R.Result[*mir.MirInstr, str] = A.allocate[mir.MirInstr](ctx.alloc, 1::usize);
     if (R.is_err[*mir.MirInstr, str](ri)) { A.deallocate[mir.MirOperand](ctx.alloc, bops, 1::usize); ret R.err[*mir.MirBlock, str](R.unwrap_err[*mir.MirInstr, str](ri)); }
@@ -900,18 +906,26 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     # + width off each lowered MirInstr. VEC_LANE_NONE for every non-vector op, so
     # this is inert until a backend lifts its vector guard below.
     ctx.cur_vec_lane = lctx.compute_vec_lane(ctx, inst);
+    # forward the store-secret SEED: a store / memzero whose IR instruction was marked
+    # writing secret storage stamps every MirInstr it lowers to (read only on the store /
+    # memzero opcode by the #1648 re-derive) (#1646). false for every other instruction.
+    ctx.cur_writes_secret = (inst.kind == instr.OP_STORE || inst.kind == instr.OP_MEMZERO) && inst.secret;
 
-    # GATE (#1646): reject a secret operand of a TARGET-DEPENDENT variable-latency op
-    # the backend would select on this target - integer multiply (unless ct_trust_mul)
-    # and a shift by a secret count (unless ct_trust_var_shift). driven by the SHARED
-    # ct table over every value-producing opcode, not a bespoke per-op special-case:
-    # adding a variable-latency op is one table row plus one opcode->CtOp arm, with no
-    # new gate code (this is the generality [11] was missing). the always-unsafe class
-    # (div/mod, floating point, incl. vectors) is gated at sema; scalarization carries
-    # the taint onto a scalarized vector op's lanes so it trips this gate here too.
-    val cop: ct.CtOp = opcode_ct_op(inst.kind);
-    if (ct.cap_at_mir(ct.ct_cap(cop))
-        && !ct.target_provides(ctx.tgt.model.ct_trust_mul, ctx.tgt.model.ct_trust_var_shift, ct.ct_cap(cop))
+    # GATE (#1646): reject a secret operand of a variable-latency op the backend would
+    # select on this target, driven by the SHARED ct table over every value-producing
+    # opcode (not a bespoke per-op special-case: a new var-latency op is one table row
+    # plus one opcode->CtOp arm - the generality [11] was missing). The target-dependent
+    # class (integer multiply unless ct_trust_mul, variable shift by a secret count
+    # unless ct_trust_var_shift) is PRIMARY here; the always-unsafe class (floating
+    # point) is a defense-in-depth backstop to the sema gate, so a secret fp op that ever
+    # reached MIR ungated is still caught. Integer div/mod stay sema-only. A float op on
+    # the shared integer opcodes reads as CT_OP_FLOAT via is_float_op (not CT_OP_INT_MUL).
+    # Scalarization carries the taint onto a scalarized vector op's lanes so it trips here.
+    var cop: ct.CtOp = opcode_ct_op(inst.kind);
+    if (is_float_op(ctx, inst)) { cop = ct.CT_OP_FLOAT; }
+    val ccap: ct.CtCap = ct.ct_cap(cop);
+    if (ccap != ct.CT_CAP_OK
+        && !ct.target_provides(ctx.tgt.model.ct_trust_mul, ctx.tgt.model.ct_trust_var_shift, ccap)
         && instr_has_secret_ct_operand(inst, cop)) {
         ret R.err[bool, str](secret_ct_op_unsupported(cop));
     }
@@ -985,13 +999,13 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     }
     # a `:^` declassify (#1646) is an identity at runtime (secrecy has no machine shape):
     # a register copy of the operand into the result vreg, at the value's width so the
-    # encoder selects the GP or SSE move by operand class. regalloc coalesces it to
-    # near-zero cost. it stays a distinct MIR value so the result vreg (public, not a
-    # seed) is separate from its secret operand - the taint barrier the #1648 re-derive
-    # stops at.
+    # encoder selects the GP or SSE move by operand class. it lowers to the DISTINGUISHABLE
+    # MIR_DECLASSIFY barrier - NOT a plain MIR_MOV - so the #1648 re-derive over the lowered
+    # MIR stops secrecy propagation here (the public result vreg is separate from its secret
+    # source). isel retags it to the concrete move, so it emits identical bytes at runtime.
     if (inst.kind == instr.OP_DECLASSIFY) {
         val ddst: u32 = lctx.instr_vreg(ctx, iid);
-        ret lctx.emit_mov_w(ctx, mb, mir.op_vreg(ddst), lctx.lower_value(ctx, inst.operands[0]), lctx.op_width_of(ctx, inst.ty));
+        ret lctx.emit_declassify(ctx, mb, mir.op_vreg(ddst), lctx.lower_value(ctx, inst.operands[0]), lctx.op_width_of(ctx, inst.ty));
     }
     # scalar floating-point arithmetic / comparison shares the IR integer opcodes
     # (the front end emits OP_ADD / OP_SUB / OP_MUL / OP_DIV_* / OP_CMP_* for both
@@ -1090,19 +1104,34 @@ fun intern_owned(ctx: *lctx.LowerCtx, buf: str, fallback: str) str {
 # ---
 # ctx: the lowering context (supplies the target arch name and interner)
 # ret: the owned error message
-# map an IR opcode to its constant-time op class for the shared ct table (#1646)
+# map an IR opcode to its constant-time op class for the shared ct table, by opcode
+# alone (#1646)
 #
-# Only the TARGET-DEPENDENT classes are mapped here (integer multiply, variable shift);
-# the always-unsafe classes (div/mod, floating point) are enforced at sema and never
-# reach this gate, so mapping them would be dead. A newly-recognized target-dependent
-# variable-latency opcode is one arm here plus its ct-table row.
+# The floating-point CONVERSION opcodes are their own float-specific opcodes, so they
+# classify as CT_OP_FLOAT here; the shared int opcodes (OP_MUL etc.) that ALSO run on
+# floats are re-classified to CT_OP_FLOAT by the gate via `is_float_op` (fp shares
+# integer opcodes, so a float multiply must not read as CT_OP_INT_MUL). Integer div/mod
+# stay CT_OP_NONE here: they are always-unsafe but enforced at sema (target-independent),
+# so re-gating them at MIR would be redundant. A newly-recognized variable-latency opcode
+# is one arm here plus its ct-table row.
 # ---
 # kind: the IR opcode
-# ret:  the CtOp class, or CT_OP_NONE for a constant-time opcode
+# ret:  the CtOp class, or CT_OP_NONE for a constant-time / sema-gated opcode
 fun opcode_ct_op(kind: instr.InstrKind) ct.CtOp {
+    if (is_fp_convert(kind))  { ret ct.CT_OP_FLOAT; }
     if (kind == instr.OP_MUL) { ret ct.CT_OP_INT_MUL; }
     if (kind == instr.OP_SHL || kind == instr.OP_SHR_S || kind == instr.OP_SHR_U) { ret ct.CT_OP_VAR_SHIFT; }
     ret ct.CT_OP_NONE;
+}
+
+# whether `kind` is a floating-point conversion opcode (fp<->int, fp widen / narrow)
+# ---
+# kind: the IR opcode
+# ret:  true for the OP_FP_* conversion opcodes
+fun is_fp_convert(kind: instr.InstrKind) bool {
+    ret kind == instr.OP_FP_TRUNC || kind == instr.OP_FP_EXT
+     || kind == instr.OP_FP_TO_SI || kind == instr.OP_FP_TO_UI
+     || kind == instr.OP_SI_TO_FP || kind == instr.OP_UI_TO_FP;
 }
 
 # whether the operand the leakage model observes for `cop` is secret (#1646)
@@ -1136,6 +1165,9 @@ fun secret_ct_op_unsupported(cop: ct.CtOp) str {
     if (cop == ct.CT_OP_VAR_SHIFT) {
         ret "codegen: secret value used as a variable shift count on a target without a barrel shifter; the shift's cycle count leaks the secret amount. shift by a public count, or run on a target whose variable shift is constant-time";
     }
+    if (cop == ct.CT_OP_FLOAT) {
+        ret "codegen: secret value used as an operand of a variable-latency floating-point operation; the FP unit's timing can depend on the secret operand. compute on public data, or `:^` to a public value when disclosure is intended";
+    }
     ret "codegen: secret value used as an operand of a variable-latency integer multiply; this target documents no data-independent multiply timing, so the product's latency can leak the secret operand. compute the operation branch-free over public data, or run on a target whose DIT/DOITM mode is trusted";
 }
 
@@ -1152,6 +1184,13 @@ test "mach.lang.be.codegen.mir.lower.ct_gate:mechanism" {
     if (opcode_ct_op(instr.OP_SHR_S) != ct.CT_OP_VAR_SHIFT) { ret 1; }
     if (opcode_ct_op(instr.OP_SHR_U) != ct.CT_OP_VAR_SHIFT) { ret 1; }
     if (opcode_ct_op(instr.OP_ADD)   != ct.CT_OP_NONE)      { ret 1; }
+    # the fp-convert opcodes classify as CT_OP_FLOAT (always-unsafe, defense-in-depth);
+    # integer div/mod stay CT_OP_NONE at MIR (gated at sema, target-independent).
+    if (opcode_ct_op(instr.OP_FP_TO_SI) != ct.CT_OP_FLOAT)  { ret 1; }
+    if (opcode_ct_op(instr.OP_FP_EXT)   != ct.CT_OP_FLOAT)  { ret 1; }
+    if (opcode_ct_op(instr.OP_SI_TO_FP) != ct.CT_OP_FLOAT)  { ret 1; }
+    if (opcode_ct_op(instr.OP_DIV_S)    != ct.CT_OP_NONE)   { ret 1; }
+    if (opcode_ct_op(instr.OP_REM_U)    != ct.CT_OP_NONE)   { ret 1; }
 
     # a shift with a secret COUNT (operand[1]) and a public value (operand[0]).
     var ops: [2]value.Value;
