@@ -2527,6 +2527,8 @@ fun encode_function(st: *enc.EncodeState, f: *mir.MirFunction) R.Result[bool, st
         val blk: *mir.MirBlock = ?f.blocks[bi];
         val rb: R.Result[bool, str] = enc.push_block(st, fn_base, blk.id, st.buf.len::u32);
         if (R.is_err[bool, str](rb)) { ret rb; }
+        # this block's fallthrough successor, so its terminator can elide a jump to it.
+        enc.set_fallthrough(st, f, bi);
 
         var ii: u32 = 0;
         for (ii < blk.instr_count) {
@@ -2718,6 +2720,20 @@ fun encode_mir_instr(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi
     # jump directly, with no SETcc / MOVZX boolean or TEST in between.
     if (mir.is_fused_cbr(mi.opcode)) {
         ret encode_fused_cbr(st, f, fn_base, mi);
+    }
+
+    # an unconditional branch (MIR_BR, retagged to JMP by isel) whose target is the
+    # next block in layout order needs no bytes - control falls through (issue
+    # #1936). a JMP to any other block, or an indirect JMP with no block operand,
+    # still emits through the generic path below.
+    if (opcode == x64.JMP::u16) {
+        var jt: u32 = 0;
+        var jhas: bool = false;
+        var jsym: intern.StrId = intern.STR_NIL;
+        var jhsym: bool = false;
+        var jaddend: i32 = 0;
+        enc.classify_refs(mi, ?jt, ?jhas, ?jsym, ?jhsym, ?jaddend);
+        if (jhas && enc.branch_falls_through(st, jt)) { ret R.ok[bool, str](true); }
     }
 
     # an inline-asm block carries a verbatim body (with `{name}` local
@@ -4388,7 +4404,10 @@ fun encode_cbr(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *mir
     val fj: R.Result[bool, str] = enc.push_fixup(st, jne_patch, jne_next, then_block, fn_base);
     if (R.is_err[bool, str](fj)) { ret fj; }
 
-    # JMP else_block  (the unconditional fall-through edge)
+    # JMP else_block  (the unconditional fall-through edge). when else_block is the
+    # next block in layout order the jump is redundant and emits nothing - control
+    # falls through to it (issue #1936). the taken edge above always keeps its JNE.
+    if (enc.branch_falls_through(st, else_block)) { ret R.ok[bool, str](true); }
     val jmp_start: usize = st.buf.len;
     var jmp: isa.Inst;
     zero_inst(?jmp);
@@ -4462,7 +4481,14 @@ fun encode_fused_cbr(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi
     val fj: R.Result[bool, str] = enc.push_fixup(st, jcc_patch, jcc_next, then_block, fn_base);
     if (R.is_err[bool, str](fj)) { ret fj; }
 
-    # JMP else_block  (the unconditional fall-through edge)
+    # JMP else_block  (the unconditional fall-through edge). elided when else_block
+    # is the next block in layout order (issue #1936); the CMP + taken Jcc above
+    # stay and control falls through. the varloc bound closes on the emitted bytes
+    # either way.
+    if (enc.branch_falls_through(st, else_block)) {
+        enc.close_cmp_varlocs(st, instr_start, st.buf.len::u32);
+        ret R.ok[bool, str](true);
+    }
     val jmp_start: usize = st.buf.len;
     var jmp: isa.Inst;
     zero_inst(?jmp);
@@ -6095,6 +6121,88 @@ test "mach.lang.target.isa.x64.encode.emit_branch_label:local_label_rel32" {
     if (!R.is_err[bool, str](ur)) { bad = 1; }
 
     asm_labels_dnit(?labels);
+    enc.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# a terminator branching to the next block in layout order emits no jmp - control
+# falls through (issue #1936). the unconditional branch (retagged to JMP, handled in
+# encode_mir_instr) and the not-taken edge of a conditional (encode_cbr /
+# encode_fused_cbr) elide their 5-byte E9 jmp against the recorded fallthrough
+# successor; the taken Jcc always stays, and a jmp to any OTHER block still emits.
+test "mach.lang.target.isa.x64.encode:branch_to_fallthrough_elided" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var st: enc.EncodeState;
+    st.alloc    = ?alloc;
+    st.buf      = enc.buf_init(?alloc);
+    st.interner = nil;
+    st.fixups   = nil; st.fixup_count = 0; st.fixup_cap = 0;
+
+    var bad: i32 = 0;
+
+    var f: mir.MirFunction;
+
+    # an unconditional branch (post-isel x64.JMP) to block 4, driven through the full
+    # encode_mir_instr path so the JMP fallthrough short-circuit is exercised.
+    var jm: mir.MirInstr;
+    var jops: [1]mir.MirOperand;
+    jops[0] = mir.op_block(4);
+    jm.operands = ?jops[0]; jm.operand_count = 1; jm.opcode = x64.JMP::u32; jm.width = 8;
+
+    # no successor recorded: the 5-byte E9 jmp is emitted, one fixup against block 4.
+    st.has_next_block = false; st.buf.len = 0; st.fixup_count = 0;
+    encode_mir_instr(?st, ?f, 0, ?jm);
+    if (st.buf.len != 5)     { bad = 1; }
+    if (st.fixup_count != 1) { bad = 1; }
+
+    # block 4 is the fallthrough successor: nothing is emitted, no fixup recorded.
+    st.has_next_block = true; st.next_block_id = 4; st.buf.len = 0; st.fixup_count = 0;
+    encode_mir_instr(?st, ?f, 0, ?jm);
+    if (st.buf.len != 0)     { bad = 1; }
+    if (st.fixup_count != 0) { bad = 1; }
+
+    # a different successor does not elide the branch.
+    st.has_next_block = true; st.next_block_id = 9; st.buf.len = 0; st.fixup_count = 0;
+    encode_mir_instr(?st, ?f, 0, ?jm);
+    if (st.buf.len != 5)     { bad = 1; }
+    if (st.fixup_count != 1) { bad = 1; }
+
+    # a plain conditional `TEST cond,cond ; JNE then ; JMP else`: the not-taken JMP
+    # else elides when else (block 4) is the fallthrough successor, the JNE stays.
+    var cbr: mir.MirInstr;
+    var cops: [3]mir.MirOperand;
+    cops[0] = mir.op_preg(x64.RAX::u32); cops[1] = mir.op_block(3); cops[2] = mir.op_block(4);
+    cbr.operands = ?cops[0]; cbr.operand_count = 3; cbr.width = 8; cbr.opcode = mir.MIR_SEL_CBR;
+
+    st.has_next_block = false; st.buf.len = 0; st.fixup_count = 0;
+    encode_cbr(?st, ?f, 0, ?cbr);
+    val cbr_len: usize = st.buf.len;
+    val cbr_fx:  u32   = st.fixup_count;
+    st.has_next_block = true; st.next_block_id = 4; st.buf.len = 0; st.fixup_count = 0;
+    encode_cbr(?st, ?f, 0, ?cbr);
+    if (st.buf.len != cbr_len - 5)          { bad = 1; }   # JMP else elided (5 bytes)
+    if (st.fixup_count != cbr_fx - 1)       { bad = 1; }
+    if (st.fixups[0].target_block != 3)     { bad = 1; }   # taken edge preserved
+
+    # a fused compare-and-branch `CMP ; Jcc then ; JMP else`: same elision of the
+    # not-taken JMP else, taken Jcc preserved.
+    var mi: mir.MirInstr;
+    var ops: [4]mir.MirOperand;
+    ops[0] = mir.op_preg(x64.RCX::u32); ops[1] = mir.op_preg(x64.RDX::u32);
+    ops[2] = mir.op_block(3); ops[3] = mir.op_block(4);
+    mi.operands = ?ops[0]; mi.operand_count = 4; mi.width = 8; mi.opcode = mir.MIR_SEL_CBR_EQ;
+
+    st.has_next_block = false; st.buf.len = 0; st.fixup_count = 0;
+    encode_fused_cbr(?st, ?f, 0, ?mi);
+    val fus_len: usize = st.buf.len;
+    val fus_fx:  u32   = st.fixup_count;
+    st.has_next_block = true; st.next_block_id = 4; st.buf.len = 0; st.fixup_count = 0;
+    encode_fused_cbr(?st, ?f, 0, ?mi);
+    if (st.buf.len != fus_len - 5)          { bad = 1; }   # JMP else elided (5 bytes)
+    if (st.fixup_count != fus_fx - 1)       { bad = 1; }
+    if (st.fixups[0].target_block != 3)     { bad = 1; }   # taken edge preserved
+
     enc.buf_dnit(?st.buf);
     ret bad;
 }
