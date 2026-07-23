@@ -489,8 +489,9 @@ fun is_defined_weak(sym: *of.Symbol, num_secs: u32) bool {
     ret true;
 }
 
-# count the defined weak symbols in an image - the number of extra COMDAT
-# sections the writer adds, one carrying each weak definition
+# count the defined weak symbols in an image - the number of COMDAT carrier
+# sub-sections the split produces, one per weak body, and the bound the split
+# section count is derived from
 fun count_defined_weak(img: *of.ObjectImage) u32 {
     var n: u32 = 0;
     var i: u32 = 0;
@@ -525,19 +526,100 @@ fun weak_symbol_extent(img: *of.ObjectImage, sym_idx: u32) u32 {
     ret end - start;
 }
 
-# derive a serialization image in which every defined
-# weak symbol is carried by its own COMDAT section, so the weak/dedup attribute
-# round-trips through COFF (which has no defined-weak storage class). mirrors the
-# ELF writer's STB_WEAK binding at the `of.ObjectImage` level; the COMDAT section
-# is the COFF-specific encoding `coff_parse_object` recovers the weak flag from
+# one defined-weak symbol's byte region within its source section, keyed by section
+# so a single sorted pass buckets the regions per source section for the tiling
+# ---
+# sec:   source section index the weak body lives in
+# start: byte offset of the weak body within that section
+# end:   one-past-the-last byte of the weak body (start when zero-length)
+rec WeakRegion {
+    sec:   u32;
+    start: u32;
+    end:   u32;
+}
+
+# order weak regions by (section, start, end) so each source section's regions form
+# one ascending contiguous run the tiling consumes in a single forward pass
+fun weak_region_cmp(a: *WeakRegion, b: *WeakRegion) i64 {
+    if (a.sec < b.sec)     { ret -1; }
+    if (a.sec > b.sec)     { ret 1; }
+    if (a.start < b.start) { ret -1; }
+    if (a.start > b.start) { ret 1; }
+    if (a.end < b.end)     { ret -1; }
+    if (a.end > b.end)     { ret 1; }
+    ret 0;
+}
+
+# the alignment a COMDAT carrier at byte offset `off` must declare: the largest
+# power of two dividing `off`, capped at the source section alignment (and the full
+# section alignment when `off` is 0). a carrier is selected and placed independently
+# across objects, so it must carry its real required alignment rather than 1 - a
+# >1-aligned weak body (e.g. a SIMD constant) otherwise lands under-aligned in
+# whichever object the linker keeps. the result divides `off`, so aligning the
+# carrier to it never shifts the carrier from its source offset, and it is at least
+# the symbol's true alignment, which the code generator already honored by placing
+# the body at an `off` that alignment divides
+fun carrier_align(off: u32, sec_align: u32) u32 {
+    # `p < 0x40000000` bounds the doubling so `p << 1` cannot overflow u32; COFF
+    # alignment tops out at 8192 (`align_characteristic`), so `p < sec_align` always
+    # stops the loop long before, and the bound is a belt-and-braces guard only.
+    var p: u32 = 1;
+    for ((off & p) == 0 && p < sec_align && p < 0x40000000) { p = p << 1; }
+    ret p;
+}
+
+# free the scratch allocations `build_weak_comdat_image` owns (the sorted weak-region
+# table, the sub-section plan, and the per-source-section index metadata); nil-safe
+# in each field, so a partial-allocation error path can call it unconditionally
+fun free_build_scratch(alloc: *A.Allocator, regions: *WeakRegion, weak_n: u32,
+                       plan: *u32, plan_carrier: *bool, cap: u32,
+                       secmeta: *u32, orig_secs: u32) {
+    if (regions != nil)      { A.deallocate[WeakRegion](alloc, regions, weak_n::usize); }
+    if (plan != nil)         { A.deallocate[u32](alloc, plan, (cap * 3)::usize); }
+    if (plan_carrier != nil) { A.deallocate[bool](alloc, plan_carrier, cap::usize); }
+    if (secmeta != nil)      { A.deallocate[u32](alloc, secmeta, (orig_secs * 2)::usize); }
+}
+
+# the planned sub-section covering `off` in source section `sec`: the sub-section
+# with the largest start offset not exceeding `off`. the plan tiles each source
+# section contiguously in increasing start order, so a binary search over that
+# section's ascending starts finds the containing sub-section (and, for an offset at
+# or past the last start, the trailing one) in O(log n)
+fun subsection_for(sec_base: *u32, sec_cnt: *u32, p_start: *u32, sec: u32, off: u32) u32 {
+    val base: u32 = sec_base[sec];
+    var lo: u32 = base;
+    var hi: u32 = base + sec_cnt[sec];
+    var pick: u32 = base;
+    for (lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        if (p_start[mid] <= off) { pick = mid; lo = mid + 1; }
+        or                       { hi = mid; }
+    }
+    ret pick;
+}
+
+# derive a serialization image in which each source section that defines weak
+# symbols is split into per-function sections at the weak boundaries - contiguous
+# non-weak spans plus one `IMAGE_SCN_LNK_COMDAT` carrier per weak body, with no
+# retained original copy. this is MSVC's per-function-section (`/Gy`) model narrowed
+# to the weak boundaries: the weak/dedup attribute round-trips through COFF (which
+# has no defined-weak storage class), mirroring the ELF writer's STB_WEAK binding,
+# while every weak body appears exactly once (in its carrier) instead of being
+# duplicated between the original section and its carrier. the COMDAT carrier is the
+# COFF-specific encoding `coff_parse_object` recovers the weak flag from.
 #
-# each defined weak symbol gets a new section that is a view onto its byte extent
-# in the source section (no copy - the view aliases the source bytes, which the
-# caller keeps live through serialization); the symbol is rebound into that
-# section at offset 0, and every relocation patching its extent moves with it. the
-# original sections are kept whole - the weak body's bytes remain in place but are
-# unreferenced there, exactly as a duplicate weak definition is dead under ELF.
-# `out_comdat[s]` is true for the sections that must be emitted with
+# a section with no weak symbols is copied verbatim as a single sub-section, so a
+# weak-free module's derived image equals its source. every symbol and relocation
+# is remapped to the sub-section covering its offset (section index + rebased
+# offset). the sub-sections tile their source section contiguously and in order.
+# a carrier declares its real required alignment (`carrier_align`) because it is
+# selected and placed independently across objects; a span stays in this object, so
+# the leading span keeps the source alignment and the rest align to 1 and the linker
+# packs them back into exactly the original section bytes. both a carrier's declared
+# alignment and a span's divide the sub-section's source offset, so no sub-section
+# shifts: the emitted `.o` is link-equivalent to the in-memory image (#2125). the
+# sub-sections alias the source bytes (no copy - the caller keeps `img` live through
+# serialization). `out_comdat[s]` is true for the carrier sub-sections, emitted with
 # `IMAGE_SCN_LNK_COMDAT` and a `SELECT_ANY` section-symbol aux record.
 # ---
 # alloc:       allocator for the derived arrays
@@ -547,134 +629,272 @@ fun weak_symbol_extent(img: *of.ObjectImage, sym_idx: u32) u32 {
 # ret:         ok(true) on success, or an error string
 fun build_weak_comdat_image(alloc: *A.Allocator, img: *of.ObjectImage,
                             out: *of.ObjectImage, out_comdat: **bool) R.Result[bool, str] {
+    val orig_secs: u32 = img.section_count;
     val weak_n: u32 = count_defined_weak(img);
-    val new_secs: u32 = img.section_count + weak_n;
 
     out.alloc = alloc;
     out.interner = img.interner;
     out.name = img.name;
-    out.section_count = new_secs;
+    out.section_count = 0;
     out.symbol_count = img.symbol_count;
     out.reloc_count = img.reloc_count;
     out.sections = nil;
     out.symbols = nil;
     out.relocations = nil;
+    @out_comdat = nil;
 
-    val rs: R.Result[*of.Section, str] = A.zallocate[of.Section](alloc, new_secs::usize);
-    if (R.is_err[*of.Section, str](rs)) { ret R.err[bool, str]("coff: comdat section array alloc failed"); }
-    out.sections = R.unwrap_ok[*of.Section, str](rs);
+    # gather each defined weak symbol's (section, start, end) region and sort them by
+    # (section, start), so every source section's regions form one ascending
+    # contiguous run the tiling consumes in a single forward pass.
+    var regions: *WeakRegion = nil;
+    if (weak_n > 0) {
+        val rw: R.Result[*WeakRegion, str] = A.zallocate[WeakRegion](alloc, weak_n::usize);
+        if (R.is_err[*WeakRegion, str](rw)) { ret R.err[bool, str]("coff: comdat weak-region alloc failed"); }
+        regions = R.unwrap_ok[*WeakRegion, str](rw);
+        var w: u32 = 0;
+        var i: u32 = 0;
+        for (i < img.symbol_count) {
+            if (is_defined_weak(?img.symbols[i], orig_secs)) {
+                val st: u32 = img.symbols[i].offset;
+                regions[w].sec   = img.symbols[i].section;
+                regions[w].start = st;
+                regions[w].end   = st + weak_symbol_extent(img, i);
+                w = w + 1;
+            }
+            i = i + 1;
+        }
+        sort.sort[WeakRegion](regions, weak_n::usize, weak_region_cmp);
+    }
 
-    val rc: R.Result[*bool, str] = A.zallocate[bool](alloc, new_secs::usize);
-    if (R.is_err[*bool, str](rc)) { ret R.err[bool, str]("coff: comdat flag array alloc failed"); }
-    @out_comdat = R.unwrap_ok[*bool, str](rc);
+    # the split section count is bounded by one sub-section per source section plus,
+    # per distinct weak region, at most a carrier and a leading span (two more).
+    # per-function sectioning inherently inflates the section count (the old
+    # dup-scheme was orig + weak_n; this is orig + 2*weak_n), so a single object with
+    # tens of thousands of weak symbols could approach `coff_serialize_image`'s hard
+    # COFF 0xFFFF (65535) section ceiling, which MSVC's `/Gy` hits the same way and
+    # answers with `/bigobj`. mach's per-module object model keeps real objects far
+    # under it (the compiler self-build tops out near ~800 sections in one object), so
+    # this is a theoretical bound with a loud, clean failure at the 0xFFFF guard - not
+    # a silent corruption. lifting it with COFF `/bigobj` support is tracked in #2147.
+    val cap: u32 = orig_secs + weak_n * 2;
+
+    # the sub-section plan: per output section its source section, start offset, and
+    # length (one contiguous u32 block of three `cap`-long runs) plus a parallel
+    # carrier flag. `sec_base`/`sec_cnt` index each source section's run of planned
+    # sub-sections for the symbol/relocation remap below.
+    var p_src:     *u32  = nil;
+    var p_start:   *u32  = nil;
+    var p_len:     *u32  = nil;
+    var p_carrier: *bool = nil;
+    var sec_base:  *u32  = nil;
+    var sec_cnt:   *u32  = nil;
+    if (cap > 0) {
+        val rp: R.Result[*u32, str] = A.zallocate[u32](alloc, (cap * 3)::usize);
+        if (R.is_err[*u32, str](rp)) {
+            free_build_scratch(alloc, regions, weak_n, nil, nil, cap, nil, orig_secs);
+            ret R.err[bool, str]("coff: comdat plan alloc failed");
+        }
+        p_src   = R.unwrap_ok[*u32, str](rp);
+        p_start = (p_src::usize + cap::usize * 4)::*u32;
+        p_len   = (p_src::usize + cap::usize * 8)::*u32;
+
+        val rpc: R.Result[*bool, str] = A.zallocate[bool](alloc, cap::usize);
+        if (R.is_err[*bool, str](rpc)) {
+            free_build_scratch(alloc, regions, weak_n, p_src, nil, cap, nil, orig_secs);
+            ret R.err[bool, str]("coff: comdat plan-flag alloc failed");
+        }
+        p_carrier = R.unwrap_ok[*bool, str](rpc);
+    }
+    if (orig_secs > 0) {
+        val rm: R.Result[*u32, str] = A.zallocate[u32](alloc, (orig_secs * 2)::usize);
+        if (R.is_err[*u32, str](rm)) {
+            free_build_scratch(alloc, regions, weak_n, p_src, p_carrier, cap, nil, orig_secs);
+            ret R.err[bool, str]("coff: comdat section-map alloc failed");
+        }
+        sec_base = R.unwrap_ok[*u32, str](rm);
+        sec_cnt  = (sec_base::usize + orig_secs::usize * 4)::*u32;
+    }
+
+    # tile each source section into its ordered sub-sections by walking its sorted
+    # weak regions once: the non-weak span before each weak body (omitted when empty)
+    # and the body's carrier (kept even when zero-length). advancing the region cursor
+    # each step guarantees forward progress, so a zero-length weak body cannot spin.
+    # a weak-free section (and any section with a trailing gap) emits one final span,
+    # and even an empty section emits one verbatim sub-section, so none is dropped.
+    var plan_n: u32 = 0;
+    var wr: u32 = 0;
+    var s: u32 = 0;
+    for (s < orig_secs) {
+        sec_base[s] = plan_n;
+        val seclen: u32 = img.sections[s].len;
+        var cursor: u32 = 0;
+        var have_prev: bool = false;
+        var prev_start: u32 = 0;
+        var prev_end: u32 = 0;
+        for (wr < weak_n && regions[wr].sec == s) {
+            val bstart: u32 = regions[wr].start;
+            val bend:   u32 = regions[wr].end;
+            wr = wr + 1;
+            # aliased weak symbols share one body: skip an exact-duplicate region, and
+            # skip any region already inside the current carrier (disjointness makes
+            # that only the aliased case), so no overlapping carrier is emitted.
+            if (have_prev && bstart == prev_start && bend == prev_end) { cnt; }
+            if (bstart < cursor) { cnt; }
+            if (bstart > cursor) {
+                if (plan_n >= cap) { free_build_scratch(alloc, regions, weak_n, p_src, p_carrier, cap, sec_base, orig_secs); ret R.err[bool, str]("coff: comdat plan overflow"); }
+                p_src[plan_n] = s; p_start[plan_n] = cursor; p_len[plan_n] = bstart - cursor;
+                p_carrier[plan_n] = false;
+                plan_n = plan_n + 1;
+                cursor = bstart;
+            }
+            if (plan_n >= cap) { free_build_scratch(alloc, regions, weak_n, p_src, p_carrier, cap, sec_base, orig_secs); ret R.err[bool, str]("coff: comdat plan overflow"); }
+            p_src[plan_n] = s; p_start[plan_n] = bstart; p_len[plan_n] = bend - bstart;
+            p_carrier[plan_n] = true;
+            plan_n = plan_n + 1;
+            prev_start = bstart; prev_end = bend; have_prev = true;
+            if (bend > cursor) { cursor = bend; }
+        }
+        if (cursor < seclen || plan_n == sec_base[s]) {
+            if (plan_n >= cap) { free_build_scratch(alloc, regions, weak_n, p_src, p_carrier, cap, sec_base, orig_secs); ret R.err[bool, str]("coff: comdat plan overflow"); }
+            p_src[plan_n] = s; p_start[plan_n] = cursor; p_len[plan_n] = seclen - cursor;
+            p_carrier[plan_n] = false;
+            plan_n = plan_n + 1;
+        }
+        sec_cnt[s] = plan_n - sec_base[s];
+        s = s + 1;
+    }
+
+    # allocate the derived section array at the exact plan size and pin the count now
+    # (before the flag alloc), so any later error frees precisely what was allocated.
+    if (plan_n > 0) {
+        val rs: R.Result[*of.Section, str] = A.zallocate[of.Section](alloc, plan_n::usize);
+        if (R.is_err[*of.Section, str](rs)) {
+            free_build_scratch(alloc, regions, weak_n, p_src, p_carrier, cap, sec_base, orig_secs);
+            ret R.err[bool, str]("coff: comdat section array alloc failed");
+        }
+        out.sections = R.unwrap_ok[*of.Section, str](rs);
+        out.section_count = plan_n;
+
+        val rc: R.Result[*bool, str] = A.zallocate[bool](alloc, plan_n::usize);
+        if (R.is_err[*bool, str](rc)) {
+            free_build_scratch(alloc, regions, weak_n, p_src, p_carrier, cap, sec_base, orig_secs);
+            ret R.err[bool, str]("coff: comdat flag array alloc failed");
+        }
+        @out_comdat = R.unwrap_ok[*bool, str](rc);
+    }
+    out.section_count = plan_n;
     val comdat: *bool = @out_comdat;
 
     if (img.symbol_count > 0) {
         val ry: R.Result[*of.Symbol, str] = A.zallocate[of.Symbol](alloc, img.symbol_count::usize);
-        if (R.is_err[*of.Symbol, str](ry)) { ret R.err[bool, str]("coff: comdat symbol array alloc failed"); }
+        if (R.is_err[*of.Symbol, str](ry)) {
+            free_build_scratch(alloc, regions, weak_n, p_src, p_carrier, cap, sec_base, orig_secs);
+            ret R.err[bool, str]("coff: comdat symbol array alloc failed");
+        }
         out.symbols = R.unwrap_ok[*of.Symbol, str](ry);
     }
     if (img.reloc_count > 0) {
         val rr: R.Result[*of.Relocation, str] = A.zallocate[of.Relocation](alloc, img.reloc_count::usize);
-        if (R.is_err[*of.Relocation, str](rr)) { ret R.err[bool, str]("coff: comdat reloc array alloc failed"); }
+        if (R.is_err[*of.Relocation, str](rr)) {
+            free_build_scratch(alloc, regions, weak_n, p_src, p_carrier, cap, sec_base, orig_secs);
+            ret R.err[bool, str]("coff: comdat reloc array alloc failed");
+        }
         out.relocations = R.unwrap_ok[*of.Relocation, str](rr);
     }
 
-    # per-weak-symbol carve geometry (source section, start, extent, new section),
-    # filled in the carve pass and consulted by the single relocation re-home pass
-    # so it need not rescan the whole relocation table once per weak symbol. all
-    # four fields share one contiguous allocation, each run `weak_n` long, so a
-    # single alloc/free manages the table; this block frees itself, while the
-    # caller frees `out`'s arrays on an error return.
-    var carve: *u32 = nil;
-    var w_srcsec: *u32 = nil;
-    var w_start:  *u32 = nil;
-    var w_extent: *u32 = nil;
-    var w_newsec: *u32 = nil;
-    if (weak_n > 0) {
-        val ra: R.Result[*u32, str] = A.zallocate[u32](alloc, (weak_n * 4)::usize);
-        if (R.is_err[*u32, str](ra)) { ret R.err[bool, str]("coff: comdat carve table alloc failed"); }
-        carve = R.unwrap_ok[*u32, str](ra);
-        # four u32 fields laid out contiguously, each `weak_n` long (4 bytes each).
-        w_srcsec = carve;
-        w_start  = (carve::usize + weak_n::usize * 4)::*u32;
-        w_extent = (carve::usize + weak_n::usize * 8)::*u32;
-        w_newsec = (carve::usize + weak_n::usize * 12)::*u32;
-    }
-
-    # copy the source sections verbatim; they keep their original indices.
-    var s: u32 = 0;
-    for (s < img.section_count) {
-        out.sections[s] = img.sections[s];
-        comdat[s] = false;
-        s = s + 1;
-    }
-    # copy the source symbols and relocations verbatim; weak ones are rebound below.
-    var i: u32 = 0;
-    for (i < img.symbol_count) { out.symbols[i] = img.symbols[i]; i = i + 1; }
-    i = 0;
-    for (i < img.reloc_count) { out.relocations[i] = img.relocations[i]; i = i + 1; }
-
-    # carve one COMDAT section per defined weak symbol, rebind the symbol into it,
-    # and record the carve geometry for the relocation pass below.
-    var next_sec: u32 = img.section_count;
-    var w: u32 = 0;
-    i = 0;
-    for (i < img.symbol_count) {
-        if (!is_defined_weak(?img.symbols[i], img.section_count)) { i = i + 1; cnt; }
-
-        val src_sec: u32 = img.symbols[i].section;
-        val start: u32 = img.symbols[i].offset;
-        val extent: u32 = weak_symbol_extent(img, i);
-
-        out.sections[next_sec].name  = img.sections[src_sec].name;
-        out.sections[next_sec].kind  = img.sections[src_sec].kind;
-        out.sections[next_sec].len   = extent;
-        out.sections[next_sec].align = img.sections[src_sec].align;
-        if (section_has_data(img.sections[src_sec].kind) && img.sections[src_sec].bytes != nil
-            && extent > 0) {
-            out.sections[next_sec].bytes = (img.sections[src_sec].bytes::usize + start::usize)::*u8;
+    # materialize the sub-sections, each aliasing its source bytes at its start. a
+    # carrier declares its real required alignment (independent cross-object
+    # placement); a span keeps the source alignment only when it leads the section,
+    # else 1 so the linker packs the spans back into the original bytes.
+    var oi: u32 = 0;
+    for (oi < plan_n) {
+        val src: u32 = p_src[oi];
+        out.sections[oi].name = img.sections[src].name;
+        out.sections[oi].kind = img.sections[src].kind;
+        out.sections[oi].len  = p_len[oi];
+        if (p_carrier[oi]) {
+            out.sections[oi].align = carrier_align(p_start[oi], img.sections[src].align);
+        } or (oi == sec_base[src]) {
+            out.sections[oi].align = img.sections[src].align;
         } or {
-            out.sections[next_sec].bytes = nil;
+            out.sections[oi].align = 1;
         }
-        comdat[next_sec] = true;
+        if (section_has_data(img.sections[src].kind) && img.sections[src].bytes != nil
+            && p_len[oi] > 0) {
+            out.sections[oi].bytes = (img.sections[src].bytes::usize + p_start[oi]::usize)::*u8;
+        } or {
+            out.sections[oi].bytes = nil;
+        }
+        comdat[oi] = p_carrier[oi];
+        oi = oi + 1;
+    }
 
-        out.symbols[i].section = next_sec;
-        out.symbols[i].offset = 0;
-
-        w_srcsec[w] = src_sec;
-        w_start[w]  = start;
-        w_extent[w] = extent;
-        w_newsec[w] = next_sec;
-
-        next_sec = next_sec + 1;
-        w = w + 1;
+    # copy the source symbols, then rebind each defined symbol into the sub-section
+    # covering its offset with the offset rebased.
+    var i: u32 = 0;
+    for (i < img.symbol_count) {
+        out.symbols[i] = img.symbols[i];
+        val sec: u32 = img.symbols[i].section;
+        if (sec != of.SECTION_EXTERNAL && sec < orig_secs) {
+            val off: u32 = img.symbols[i].offset;
+            var sub: u32 = subsection_for(sec_base, sec_cnt, p_start, sec, off);
+            # a non-weak symbol must never bind into a zero-length carrier. a
+            # section-end / size marker at offset==section-length (or a co-located
+            # local) lands on a defensive trailing zero-length carrier by the floor
+            # rule, yet it marks the end of real content, so route it back to the last
+            # non-empty sub-section (the section tail) where it resolves to a real
+            # address rather than a discardable empty COMDAT. the weak symbol that owns
+            # such a carrier keeps it; the code generator never emits a zero-length
+            # weak body, so this only rebalances a co-located non-weak marker.
+            if (p_carrier[sub] && p_len[sub] == 0
+                && (img.symbols[i].flags & of.SYM_OBJ_FLAG_WEAK) == 0) {
+                for (sub > sec_base[sec] && p_len[sub] == 0) { sub = sub - 1; }
+            }
+            # a non-weak global in a (non-empty) carrier would vanish on cross-object
+            # COMDAT dedup; the code generator emits each defined symbol at a distinct
+            # offset, so a non-weak global never shares a weak body's carrier - fail
+            # loudly if that invariant is ever violated rather than emit an unsound
+            # object (a local sharing a carrier is fine - locals are not deduped).
+            if (p_carrier[sub]
+                && (img.symbols[i].flags & of.SYM_OBJ_FLAG_GLOBAL) != 0
+                && (img.symbols[i].flags & of.SYM_OBJ_FLAG_WEAK) == 0) {
+                free_build_scratch(alloc, regions, weak_n, p_src, p_carrier, cap, sec_base, orig_secs);
+                ret R.err[bool, str]("coff: non-weak global shares a weak COMDAT carrier");
+            }
+            out.symbols[i].section = sub;
+            out.symbols[i].offset  = off - p_start[sub];
+        }
         i = i + 1;
     }
 
-    # move each relocation whose patch site lies in a carved extent into the new
-    # COMDAT section, rebasing its offset. one pass over the relocations, each
-    # against the carve table, breaking on the single carve that can contain it
-    # (carve extents are disjoint). a relocation in a section with no carves exits
-    # the inner loop without a match.
+    # copy the source relocations, then move each into the sub-section covering its
+    # patch site with the offset rebased. a relocation patches a field within one
+    # symbol's body, which lies wholly inside one sub-section, so the field never
+    # crosses a span/carrier boundary; verify before rebasing rather than emit a
+    # corrupt patch. the check is scoped to a genuine internal boundary (the
+    # sub-section ends before the source section does): an out-of-range field in a
+    # weak-free section - one verbatim sub-section whose end is the section end -
+    # falls through to `validate_reloc_ranges`' precise out-of-range diagnostic.
     var ri: u32 = 0;
     for (ri < img.reloc_count) {
+        out.relocations[ri] = img.relocations[ri];
         val rsec: u32 = img.relocations[ri].section;
-        val ro: u32 = img.relocations[ri].offset;
-        var k: u32 = 0;
-        for (k < weak_n) {
-            if (w_srcsec[k] == rsec && ro >= w_start[k] && ro < w_start[k] + w_extent[k]) {
-                out.relocations[ri].section = w_newsec[k];
-                out.relocations[ri].offset = ro - w_start[k];
-                brk;
+        if (rsec < orig_secs) {
+            val ro:  u32 = img.relocations[ri].offset;
+            val sub: u32 = subsection_for(sec_base, sec_cnt, p_start, rsec, ro);
+            val sub_end: u32 = p_start[sub] + p_len[sub];
+            val w:   usize = reloc_field_width(img.relocations[ri].kind);
+            if (sub_end < img.sections[rsec].len && ro::usize + w > sub_end::usize) {
+                free_build_scratch(alloc, regions, weak_n, p_src, p_carrier, cap, sec_base, orig_secs);
+                ret R.err[bool, str]("coff: relocation field straddles a weak-split boundary");
             }
-            k = k + 1;
+            out.relocations[ri].section = sub;
+            out.relocations[ri].offset  = ro - p_start[sub];
         }
         ri = ri + 1;
     }
 
-    if (carve != nil) { A.deallocate[u32](alloc, carve, (weak_n * 4)::usize); }
-
+    free_build_scratch(alloc, regions, weak_n, p_src, p_carrier, cap, sec_base, orig_secs);
     ret R.ok[bool, str](true);
 }
 
@@ -2968,10 +3188,12 @@ pub fun register_coff(reg: *of.OfRegistry) R.Result[bool, str] {
     coff_vtable.id               = of.OF_COFF;
     coff_vtable.name             = "coff";
     coff_vtable.produces_image   = false;
-    # the COFF codegen image is NOT yet link-equivalent to its `.o`: the weak-COMDAT
-    # carrier duplicates every weak body into `.text` (#2125), so linking the image
-    # directly diverges from the disk round-trip. keep COFF on paths until #2125.
-    coff_vtable.links_from_image = false;
+    # the COFF codegen image is link-equivalent to its `.o` (#2125): the emit splits
+    # each weak-defining section into per-function sub-sections at the weak boundaries
+    # - non-weak spans plus one COMDAT carrier per weak body, no retained original
+    # copy - which the linker re-concatenates into exactly the source section bytes,
+    # so linking the in-memory image matches the disk round-trip byte-for-byte.
+    coff_vtable.links_from_image = true;
     coff_vtable.emit_object      = coff_emit_object;
     coff_vtable.parse_object     = coff_parse_object;
     coff_vtable.emit_exec        = coff_emit_exec;
@@ -3459,8 +3681,8 @@ test "mach.lang.target.of.coff:defined_weak_comdat_round_trip" {
     if (R.is_err[Vector[u8], str](rb)) { ret 1; }
     val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
 
-    # the file carries the original .text plus one COMDAT carrier section for the
-    # single weak symbol: two sections in total.
+    # the split replaces `.text` with a non-weak span for `main` [0,8) and a COMDAT
+    # carrier for the weak body [8,16): two sections in total, no retained original.
     if (bin.read_u16_le(buf.data, 2) != 2) { ret 1; }
 
     # exactly one section header carries the LNK_COMDAT characteristic.
@@ -3529,6 +3751,287 @@ test "mach.lang.target.of.coff:defined_weak_comdat_round_trip" {
         rj = rj + 1;
     }
     if (!saw_reloc) { ret 1; }
+
+    ret 0;
+}
+
+# the per-function-section split carries each weak body exactly once and leaves a
+# weak-free section untouched: a `.text` interleaving strong and weak functions
+# round-trips with no duplicated weak bytes (the #2125 dead-code fix), and a
+# weak-free `.rodata` survives verbatim
+test "mach.lang.target.of.coff:weak_split_no_duplication" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var of_reg: of.OfRegistry = of.registry_init();
+    val rr: R.Result[bool, str] = register_coff(?of_reg);
+    if (R.is_err[bool, str](rr)) { ret 1; }
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    # `.text` [0,32) = strong af[0,8), weak bw[8,16), strong cf[16,24), weak dw[24,32);
+    # `.rodata` [0,4) with a strong data symbol and no weak members.
+    var text_bytes: [32]u8;
+    var k: usize = 0;
+    for (k < 32) { text_bytes[k] = (0x10 + k)::u8; k = k + 1; }
+    var ro_bytes: [4]u8;
+    ro_bytes[0] = 0xAA; ro_bytes[1] = 0xBB; ro_bytes[2] = 0xCC; ro_bytes[3] = 0xDD;
+
+    var secs: [2]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 32; secs[0].align = 16;
+    secs[1].name = t_intern(?i, ".rodata"); secs[1].kind = of.SK_RODATA;
+    secs[1].bytes = ?ro_bytes[0]; secs[1].len = 4; secs[1].align = 4;
+
+    val fn_fl: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var syms: [5]of.Symbol;
+    syms[0].name = t_intern(?i, "af"); syms[0].section = 0; syms[0].offset = 0;  syms[0].size = 0; syms[0].flags = fn_fl;
+    syms[1].name = t_intern(?i, "bwIu64E"); syms[1].section = 0; syms[1].offset = 8;  syms[1].size = 0; syms[1].flags = fn_fl | of.SYM_OBJ_FLAG_WEAK;
+    syms[2].name = t_intern(?i, "cf"); syms[2].section = 0; syms[2].offset = 16; syms[2].size = 0; syms[2].flags = fn_fl;
+    syms[3].name = t_intern(?i, "dwIu64E"); syms[3].section = 0; syms[3].offset = 24; syms[3].size = 0; syms[3].flags = fn_fl | of.SYM_OBJ_FLAG_WEAK;
+    syms[4].name = t_intern(?i, "rdata"); syms[4].section = 1; syms[4].offset = 0;  syms[4].size = 4; syms[4].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 2;
+    img.symbols = ?syms[0]; img.symbol_count = 5;
+    img.relocations = nil; img.reloc_count = 0;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_sp");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+
+    val em: R.Result[bool, str] = coff_emit_object(?isa_vt, ?img, fs.temp_path(?tf)::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = coff_parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+
+    # no duplication: the total SK_TEXT bytes equal the original 32; the old bug
+    # would leave both the original body and its carrier, summing to 48.
+    var text_total: u32 = 0;
+    var text_secs: u32 = 0;
+    var s: u32 = 0;
+    for (s < out.section_count) {
+        if (out.sections[s].kind == of.SK_TEXT) { text_total = text_total + out.sections[s].len; text_secs = text_secs + 1; }
+        s = s + 1;
+    }
+    if (text_total != 32) { ret 1; }
+    # four text sub-sections: span af, carrier bw, span cf, carrier dw.
+    if (text_secs != 4) { ret 1; }
+
+    # each weak body is carried once in an 8-byte section at offset 0, with its own
+    # bytes; each strong function stays non-weak in a span at a rebased offset.
+    var seen: u32 = 0;
+    var y: u32 = 0;
+    for (y < out.symbol_count) {
+        val nm: intern.StrId = out.symbols[y].name;
+        if (nm == syms[1].name || nm == syms[3].name) {
+            if ((out.symbols[y].flags & of.SYM_OBJ_FLAG_WEAK) == 0) { ret 1; }
+            if (out.symbols[y].offset != 0)                          { ret 1; }
+            val ws: u32 = out.symbols[y].section;
+            if (out.sections[ws].kind != of.SK_TEXT) { ret 1; }
+            if (out.sections[ws].len != 8)           { ret 1; }
+            var base: u8 = 0x28;
+            if (nm == syms[1].name) { base = 0x18; }
+            var wk: usize = 0;
+            for (wk < 8) { if (out.sections[ws].bytes[wk] != (base + wk::u8)) { ret 1; } wk = wk + 1; }
+            seen = seen + 1;
+        }
+        if (nm == syms[0].name || nm == syms[2].name) {
+            if ((out.symbols[y].flags & of.SYM_OBJ_FLAG_WEAK) != 0)   { ret 1; }
+            if ((out.symbols[y].flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { ret 1; }
+            if (out.sections[out.symbols[y].section].kind != of.SK_TEXT) { ret 1; }
+            seen = seen + 1;
+        }
+        # the weak-free `.rodata` survives verbatim: one section, correct bytes.
+        if (nm == syms[4].name) {
+            val rs: u32 = out.symbols[y].section;
+            if ((out.symbols[y].flags & of.SYM_OBJ_FLAG_WEAK) != 0) { ret 1; }
+            if (out.sections[rs].kind != of.SK_RODATA) { ret 1; }
+            if (out.sections[rs].len != 4)             { ret 1; }
+            if (out.symbols[y].offset != 0)            { ret 1; }
+            if (out.sections[rs].bytes[0] != 0xAA || out.sections[rs].bytes[3] != 0xDD) { ret 1; }
+            seen = seen + 1;
+        }
+        y = y + 1;
+    }
+    if (seen != 5) { ret 1; }
+
+    ret 0;
+}
+
+# a zero-extent weak symbol (offset at the section end, or a zero-length
+# weak-defining section) is carried once and terminates the tiling: the split must
+# make forward progress rather than re-select the empty region forever
+test "mach.lang.target.of.coff:zero_extent_weak_terminates" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var of_reg: of.OfRegistry = of.registry_init();
+    val rr: R.Result[bool, str] = register_coff(?of_reg);
+    if (R.is_err[bool, str](rr)) { ret 1; }
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    # sec0 `.text` [0,8): strong `af` [0,8), a zero-extent weak `zend` at offset 8
+    # (== section length), and a LOCAL end-marker `eend` also at offset 8. sec1: a
+    # zero-length weak-defining `.text` with weak `zmt`.
+    var t0: [8]u8;
+    var k: usize = 0;
+    for (k < 8) { t0[k] = (0x40 + k::u8); k = k + 1; }
+
+    var secs: [2]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?t0[0]; secs[0].len = 8; secs[0].align = 16;
+    secs[1].name = t_intern(?i, ".text"); secs[1].kind = of.SK_TEXT;
+    secs[1].bytes = nil; secs[1].len = 0; secs[1].align = 16;
+
+    val fn_fl: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var syms: [4]of.Symbol;
+    syms[0].name = t_intern(?i, "af");   syms[0].section = 0; syms[0].offset = 0; syms[0].size = 0; syms[0].flags = fn_fl;
+    syms[1].name = t_intern(?i, "zend"); syms[1].section = 0; syms[1].offset = 8; syms[1].size = 0; syms[1].flags = fn_fl | of.SYM_OBJ_FLAG_WEAK;
+    syms[2].name = t_intern(?i, "eend"); syms[2].section = 0; syms[2].offset = 8; syms[2].size = 0; syms[2].flags = 0;
+    syms[3].name = t_intern(?i, "zmt");  syms[3].section = 1; syms[3].offset = 0; syms[3].size = 0; syms[3].flags = fn_fl | of.SYM_OBJ_FLAG_WEAK;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 2;
+    img.symbols = ?syms[0]; img.symbol_count = 4;
+    img.relocations = nil; img.reloc_count = 0;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_ze");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+
+    # the emit must return (a zero-extent region that failed to advance the cursor
+    # would spin here / overrun the plan) and succeed.
+    val em: R.Result[bool, str] = coff_emit_object(?isa_vt, ?img, fs.temp_path(?tf)::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = coff_parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+
+    # both zero-extent weak symbols round-trip weak in a zero-length carrier; `af`
+    # stays a non-weak span; the local `eend` marker at the section end is routed to
+    # the real content tail (the 8-byte span), never the discardable empty carrier.
+    var seen: u32 = 0;
+    var y: u32 = 0;
+    for (y < out.symbol_count) {
+        val nm: intern.StrId = out.symbols[y].name;
+        if (nm == syms[1].name || nm == syms[3].name) {
+            if ((out.symbols[y].flags & of.SYM_OBJ_FLAG_WEAK) == 0) { ret 1; }
+            if (out.sections[out.symbols[y].section].len != 0)      { ret 1; }
+            seen = seen + 1;
+        }
+        if (nm == syms[0].name) {
+            if ((out.symbols[y].flags & of.SYM_OBJ_FLAG_WEAK) != 0) { ret 1; }
+            seen = seen + 1;
+        }
+        if (nm == syms[2].name) {
+            if ((out.symbols[y].flags & of.SYM_OBJ_FLAG_WEAK) != 0) { ret 1; }
+            # routed to the section tail (len 8), not a zero-length carrier.
+            if (out.sections[out.symbols[y].section].len != 8) { ret 1; }
+            seen = seen + 1;
+        }
+        y = y + 1;
+    }
+    if (seen != 4) { ret 1; }
+
+    ret 0;
+}
+
+# a weak body that needs >1 alignment and is NOT the first sub-section keeps its real
+# alignment on its COMDAT carrier (not 1): a carrier is placed independently across
+# objects, so an under-aligned carrier would fault an aligned load in whichever
+# object the linker selects
+test "mach.lang.target.of.coff:weak_carrier_alignment_preserved" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var of_reg: of.OfRegistry = of.registry_init();
+    val rr: R.Result[bool, str] = register_coff(?of_reg);
+    if (R.is_err[bool, str](rr)) { ret 1; }
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    # `.rodata` [0,32), align 16: strong `c0` [0,16) then weak `wk16` [16,32) - a
+    # non-leading 16-byte-aligned weak constant. its carrier must declare align 16.
+    var d: [32]u8;
+    var k: usize = 0;
+    for (k < 32) { d[k] = k::u8; k = k + 1; }
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".rodata"); secs[0].kind = of.SK_RODATA;
+    secs[0].bytes = ?d[0]; secs[0].len = 32; secs[0].align = 16;
+
+    val ob_fl: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "c0");   syms[0].section = 0; syms[0].offset = 0;  syms[0].size = 16; syms[0].flags = ob_fl;
+    syms[1].name = t_intern(?i, "wk16"); syms[1].section = 0; syms[1].offset = 16; syms[1].size = 16; syms[1].flags = ob_fl | of.SYM_OBJ_FLAG_WEAK;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = nil; img.reloc_count = 0;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_al");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+
+    val em: R.Result[bool, str] = coff_emit_object(?isa_vt, ?img, fs.temp_path(?tf)::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = coff_parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+
+    var saw: bool = false;
+    var y: u32 = 0;
+    for (y < out.symbol_count) {
+        if (out.symbols[y].name == syms[1].name) {
+            saw = true;
+            if ((out.symbols[y].flags & of.SYM_OBJ_FLAG_WEAK) == 0)   { ret 1; }
+            val ws: u32 = out.symbols[y].section;
+            if (out.sections[ws].kind != of.SK_RODATA) { ret 1; }
+            if (out.sections[ws].len != 16)            { ret 1; }
+            if (out.symbols[y].offset != 0)            { ret 1; }
+            # the non-leading carrier preserved its 16-byte alignment (not 1).
+            if (out.sections[ws].align != 16)          { ret 1; }
+        }
+        y = y + 1;
+    }
+    if (!saw) { ret 1; }
 
     ret 0;
 }
