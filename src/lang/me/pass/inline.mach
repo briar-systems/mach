@@ -47,8 +47,21 @@ val INLINE_INSTR_THRESHOLD: u32 = 25;
 # global ceiling on inlines per pass invocation. with the call-graph recursion
 # guard below, inlining only contracts the graph along a DAG and terminates on
 # its own; the budget is kept solely as an ICE-grade backstop against an
-# unforeseen runaway, not as the termination mechanism
+# unforeseen runaway, not as the termination mechanism. the self-recursion peel
+# draws from the same budget after the ordinary inline loop
 val INLINE_BUDGET: u32 = 1024;
+
+# bounded self-recursion peel depth (K). a directly self-recursive function has its
+# body cloned in place of the self-call this many levels deep; beyond it the residual
+# self-call is left as the recursion tail, so termination never depends on the budget.
+# fixed small for the rewrite; a future cost model reads it off the target
+val PEEL_LEVELS: u32 = 2;
+
+# per-function ceiling on pending self-call sites tracked across a peel level. the
+# frontier is naturally small (branching_factor ^ level), so this is only a runaway
+# guard: sites past it are simply left as residual recursive calls, which is always
+# semantics-preserving
+val PEEL_FRONTIER_CAP: u32 = 256;
 
 # inline eligible call sites across the module until none remain or the budget is
 # exhausted
@@ -110,7 +123,12 @@ pub fun run(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
 
     A.deallocate[u32](m.alloc, counts, m.function_len::usize);
     A.deallocate[bool](m.alloc, recursive, m.function_len::usize);
-    ret R.ok[bool, str](true);
+
+    # bounded self-recursion peel: unroll shallow direct self-recursion so the common
+    # shallow-depth path runs straight-line while the residual self-call keeps the deep
+    # path correct. drains the same budget; the recursion guard above kept every self-call
+    # out of the ordinary loop, so this is the only place a self-call is ever cloned.
+    ret peel_all(m, ?budget);
 }
 
 # inline the first eligible call site in `caller`, if any
@@ -455,6 +473,56 @@ fun do_inline(
     callee_ix: u32,
     callee: *ir.Function
 ) R.Result[bool, str] {
+    val res_body: R.Result[bool, str] =
+        inline_body(m, caller, call_bi, call_ii, call_id, callee, 0xFFFFFFFF, nil, 0, nil);
+    if (R.is_err[bool, str](res_body)) { ret res_body; }
+
+    # maintain the live call-count table: the inlined call no longer exists (it
+    # was a live call to callee_ix, so the count is at least 1), and the cloned
+    # callee body's own live calls now live in the caller.
+    counts[callee_ix] = counts[callee_ix] - 1;
+    add_fn_call_counts(m, callee, counts);
+    ret res_body;
+}
+
+# clone `callee`'s body in place of the call at (call_bi, call_ii)
+#
+# The reusable inline core shared by the ordinary call inliner (do_inline) and the
+# self-recursion peel (peel_function). It snapshots the call's arguments, clones and
+# stitches the callee body through run_inline, and stamps the -g inline-site metadata,
+# owning allocation and teardown of the clone maps regardless of where it fails. It
+# does not touch the live call-count table -- do_inline maintains that around this
+# call, and the peel does not use it.
+#
+# When `harvest_ix` is not 0xFFFFFFFF, the freshly cloned direct calls to `harvest_ix`
+# (the peel's own function index) are appended to `harvest_out` as their new caller-side
+# ids, up to `harvest_cap`, with `harvest_count` advanced. Those are the residual
+# self-call sites the next peel level expands; the peel reads them off before this
+# function frees the clone maps.
+# ---
+# m:             module under mutation
+# caller:        function containing the call site
+# call_bi:       block index of the call within the caller
+# call_ii:       instruction index of the call within its block
+# call_id:       InstructionId of the call
+# callee:        the function body being cloned (a real callee, or a peel snapshot)
+# harvest_ix:    self-call callee index to collect, or 0xFFFFFFFF to collect nothing
+# harvest_out:   buffer receiving the new self-call ids (nil when not harvesting)
+# harvest_cap:   capacity of harvest_out
+# harvest_count: in/out live length of harvest_out (nil when not harvesting)
+# ret:           ok(true) on success, or the first allocation error
+fun inline_body(
+    m: *ir.Module,
+    caller: *ir.Function,
+    call_bi: u32,
+    call_ii: u32,
+    call_id: id.InstructionId,
+    callee: *ir.Function,
+    harvest_ix: u32,
+    harvest_out: *u32,
+    harvest_cap: u32,
+    harvest_count: *u32
+) R.Result[bool, str] {
     val opt_call: O.Option[*instruction.Instruction] = ir.instruction_get(caller, call_id);
     if (O.is_none[*instruction.Instruction](opt_call)) {
         ret R.err[bool, str]("inline: call id out of range");
@@ -507,6 +575,12 @@ fun do_inline(
         res_meta = stamp_inline_metadata(m, ?cx, call_loc, parent_site);
     }
 
+    # collect the freshly cloned residual self-calls for the next peel level, still
+    # reading cx.instr_map before it is freed below.
+    if (!R.is_err[bool, str](res_run) && harvest_ix != 0xFFFFFFFF && harvest_out != nil) {
+        harvest_self_calls(?cx, harvest_ix, harvest_out, harvest_cap, harvest_count);
+    }
+
     if (cx.block_map != nil) {
         A.deallocate[u32](m.alloc, cx.block_map, callee.block_count::usize);
     }
@@ -519,13 +593,295 @@ fun do_inline(
 
     if (R.is_err[bool, str](res_run)) { ret res_run; }
     if (R.is_err[bool, str](res_meta)) { ret res_meta; }
-
-    # maintain the live call-count table: the inlined call no longer exists (it
-    # was a live call to callee_ix, so the count is at least 1), and the cloned
-    # callee body's own live calls now live in the caller.
-    counts[callee_ix] = counts[callee_ix] - 1;
-    add_fn_call_counts(m, callee, counts);
     ret res_run;
+}
+
+# append the freshly cloned direct self-call ids from the last expansion to `out`
+#
+# Walks the snapshot's live block instructions for calls to `self_ix` and maps each
+# through the clone's instr_map to its new caller-side id, the residual self-call sites
+# the next peel level expands. Pool entries not live in a block are skipped, matching
+# the block-list-as-liveness convention; sites past `cap` are dropped (left as residual
+# recursive calls, always semantics-preserving).
+# ---
+# cx:      completed inline context (instr_map still live)
+# self_ix: the peeled function's own index; the callee index a self-call names
+# out:     buffer receiving new self-call ids
+# cap:     capacity of out
+# count:   in/out live length of out
+fun harvest_self_calls(cx: *InlineCtx, self_ix: u32, out: *u32, cap: u32, count: *u32) {
+    val callee: *ir.Function = cx.callee;
+    var i: u32 = 0;
+    for (i < callee.block_count) {
+        val blk: *ir.Block = ?callee.blocks[i];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val iid: id.InstructionId = blk.instructions[ii];
+            val opt_inst: O.Option[*instruction.Instruction] = ir.instruction_get(callee, iid);
+            if (O.is_some[*instruction.Instruction](opt_inst)) {
+                val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_inst);
+                if (inst.kind == instruction.OP_CALL && inst.operand_count >= 1 && callee_index(inst) == self_ix) {
+                    if (@count < cap) {
+                        out[@count] = cx.instr_map[iid::u32];
+                        @count = @count + 1;
+                    }
+                }
+            }
+            ii = ii + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# peel bounded direct self-recursion across the module
+#
+# For each directly self-recursive, peel-eligible function, clone its body in place of
+# the self-call up to PEEL_LEVELS deep, leaving the residual self-call as the recursion
+# tail. Draws from the shared budget; the ordinary inline loop's recursion guard kept
+# every self-call out, so this is the only place a self-call is ever cloned. The guard
+# still refuses mutual recursion and depth beyond the peel, so termination never depends
+# on the budget.
+# ---
+# m:      module to mutate
+# budget: shared inline budget, drawn down per peel expansion
+# ret:    ok(true) after a full sweep, or the first allocation error
+fun peel_all(m: *ir.Module, budget: *u32) R.Result[bool, str] {
+    var f_ix: u32 = 0;
+    for (f_ix < m.function_len && @budget > 0) {
+        val fn: *ir.Function = ?m.functions[f_ix];
+        if ((fn.flags & ir.FN_FLAG_EXTERN) == 0 && peel_eligible(fn, f_ix)) {
+            val r: R.Result[bool, str] = peel_function(m, f_ix, fn, budget);
+            if (R.is_err[bool, str](r)) { ret r; }
+        }
+        f_ix = f_ix + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# whether a function is a candidate for the self-recursion peel
+#
+# Only a function with a body, no inline asm (the clone drops the asm payload), a size
+# under the inline threshold, and at least one live direct self-call is peeled. The asm
+# and size gates mirror should_inline; mutual recursion is never peeled because only the
+# direct self-call edge is expanded.
+# ---
+# fn:   the function to test
+# f_ix: its index in the module
+# ret:  true when the function should be peeled
+fun peel_eligible(fn: *ir.Function, f_ix: u32) bool {
+    if (fn.block_count == 0)                              { ret false; }
+    if (callee_has_asm(fn))                               { ret false; }
+    if (callee_instr_count(fn) >= INLINE_INSTR_THRESHOLD) { ret false; }
+    ret has_direct_self_call(fn, f_ix);
+}
+
+# true when the function has at least one live direct call to itself
+# ---
+# fn:   the function to scan
+# f_ix: its own index; the callee index a direct self-call names
+# ret:  true when a live self-call is present
+fun has_direct_self_call(fn: *ir.Function, f_ix: u32) bool {
+    var i: u32 = 0;
+    for (i < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[i];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val opt_inst: O.Option[*instruction.Instruction] = ir.instruction_get(fn, blk.instructions[ii]);
+            if (O.is_some[*instruction.Instruction](opt_inst)) {
+                val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_inst);
+                if (inst.kind == instruction.OP_CALL && inst.operand_count >= 1 && callee_index(inst) == f_ix) { ret true; }
+            }
+            ii = ii + 1;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# fill `out` with the ids of every live direct self-call in `fn`, returning the count
+#
+# The initial peel frontier: the self-call sites present before any expansion. Sites
+# past `cap` are dropped (left as residual recursive calls).
+# ---
+# fn:   the function to scan
+# f_ix: its own index
+# out:  buffer receiving the self-call ids
+# cap:  capacity of out
+# ret:  number of ids written
+fun collect_self_calls(fn: *ir.Function, f_ix: u32, out: *u32, cap: u32) u32 {
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[i];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val iid: id.InstructionId = blk.instructions[ii];
+            val opt_inst: O.Option[*instruction.Instruction] = ir.instruction_get(fn, iid);
+            if (O.is_some[*instruction.Instruction](opt_inst)) {
+                val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt_inst);
+                if (inst.kind == instruction.OP_CALL && inst.operand_count >= 1 && callee_index(inst) == f_ix) {
+                    if (n < cap) { out[n] = iid::u32; n = n + 1; }
+                }
+            }
+            ii = ii + 1;
+        }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# locate a live instruction by id, reporting its block and in-block index
+#
+# A peel frontier id stays live until its own expansion, but its position drifts as
+# sibling expansions split blocks, so each site is re-located immediately before it is
+# peeled. A miss is an invariant violation (a tracked site vanished), surfaced as an
+# error rather than silently skipped.
+# ---
+# fn:      the function to scan
+# call_id: the instruction id to find
+# out_bi:  receives the block index
+# out_ii:  receives the in-block instruction index
+# ret:     true when found
+fun locate_call(fn: *ir.Function, call_id: id.InstructionId, out_bi: *u32, out_ii: *u32) bool {
+    var i: u32 = 0;
+    for (i < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[i];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            if (blk.instructions[ii] == call_id) {
+                @out_bi = i;
+                @out_ii = ii;
+                ret true;
+            }
+            ii = ii + 1;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# build a pristine standalone clone of `fn`'s body into `snap`
+#
+# The peel clones this snapshot -- never the live function -- at every site and level, so
+# the source stays pristine while the function grows; cloning the mutating function would
+# compound each expansion and make the budget, not the level bound, the terminator. The
+# pool and blocks are copied in order into an empty function, so ids stay identical to
+# `fn`'s and every operand, block list, and -g var/expr entry rides along without a remap.
+# The clone's self-calls still name `fn`'s index, so a residual call after the peels
+# continues into the real (peeled) function. `snap` is returned owning its storage; the
+# caller frees it with ir.function_dnit, including after an error here.
+# ---
+# m:    module owning the allocator
+# fn:   the function whose body to snapshot
+# snap: out; the standalone clone (function_new'd on entry, so always freeable)
+# ret:  ok(true) on success, or the first allocation error
+fun build_snapshot(m: *ir.Module, fn: *ir.Function, snap: *ir.Function) R.Result[bool, str] {
+    @snap = ir.function_new(m.alloc, fn.name, fn.sig, fn.flags);
+
+    var i: u32 = 0;
+    for (i < fn.instr_len) {
+        val rc: R.Result[id.InstructionId, str] = mutate.clone_instruction(m, snap, ?fn.instrs[i]);
+        if (R.is_err[id.InstructionId, str](rc)) { ret R.err[bool, str](R.unwrap_err[id.InstructionId, str](rc)); }
+        val rd: R.Result[bool, str] = ir.clone_dbg_metadata(m, fn, snap, i::id.InstructionId, i::id.InstructionId);
+        if (R.is_err[bool, str](rd)) { ret rd; }
+        i = i + 1;
+    }
+
+    i = 0;
+    for (i < fn.block_count) {
+        val rb: R.Result[id.BlockId, str] = ir.block_add(m, snap);
+        if (R.is_err[id.BlockId, str](rb)) { ret R.err[bool, str](R.unwrap_err[id.BlockId, str](rb)); }
+        val src: *ir.Block = ?fn.blocks[i];
+        val dst: *ir.Block = ?snap.blocks[i];
+        var p: u32 = 0;
+        for (p < src.phi_count) {
+            val rp: R.Result[bool, str] = ir.block_append_phi(m, dst, src.phis[p]);
+            if (R.is_err[bool, str](rp)) { ret rp; }
+            p = p + 1;
+        }
+        var b: u32 = 0;
+        for (b < src.instr_count) {
+            val ri: R.Result[bool, str] = ir.block_append_instr(m, dst, src.instructions[b]);
+            if (R.is_err[bool, str](ri)) { ret ri; }
+            b = b + 1;
+        }
+        dst.terminator = src.terminator;
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# peel one directly self-recursive function to depth PEEL_LEVELS
+#
+# Snapshots the body once, then expands each self-call site level by level by cloning the
+# snapshot in its place; the residual self-calls harvested from one level are the next
+# level's frontier. After the last level the leftover frontier is left as live calls to
+# the function -- the correct recursion tail. Each expansion is an ordinary inline, so
+# semantics are preserved at every depth, including the peel boundary and the base case a
+# peeled level may hit. The level-scaled size gate and the shared budget bound growth.
+# ---
+# m:      module under mutation
+# f_ix:   index of the function being peeled
+# fn:     the function being peeled
+# budget: shared inline budget, drawn down per expansion
+# ret:    ok(true) on success, or the first allocation error
+fun peel_function(m: *ir.Module, f_ix: u32, fn: *ir.Function, budget: *u32) R.Result[bool, str] {
+    var snap: ir.Function;
+    val res_snap: R.Result[bool, str] = build_snapshot(m, fn, ?snap);
+    if (R.is_err[bool, str](res_snap)) { ir.function_dnit(m, ?snap); ret res_snap; }
+
+    val res_cur: R.Result[*u32, str] = A.allocate[u32](m.alloc, PEEL_FRONTIER_CAP::usize);
+    if (R.is_err[*u32, str](res_cur)) { ir.function_dnit(m, ?snap); ret R.err[bool, str](R.unwrap_err[*u32, str](res_cur)); }
+    var cur: *u32 = R.unwrap_ok[*u32, str](res_cur);
+    val res_nxt: R.Result[*u32, str] = A.allocate[u32](m.alloc, PEEL_FRONTIER_CAP::usize);
+    if (R.is_err[*u32, str](res_nxt)) {
+        A.deallocate[u32](m.alloc, cur, PEEL_FRONTIER_CAP::usize);
+        ir.function_dnit(m, ?snap);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](res_nxt));
+    }
+    var nxt: *u32 = R.unwrap_ok[*u32, str](res_nxt);
+
+    var cur_n: u32 = collect_self_calls(fn, f_ix, cur, PEEL_FRONTIER_CAP);
+
+    var err: R.Result[bool, str] = R.ok[bool, str](true);
+    var level: u32 = 0;
+    for (level < PEEL_LEVELS && cur_n > 0 && @budget > 0) {
+        # the inline size threshold scaled by level: a small function keeps peeling
+        # through the shallow levels, while one already grown past a level-scaled
+        # ceiling stops, so growth stays bounded without the budget being the terminator.
+        if (callee_instr_count(fn) >= INLINE_INSTR_THRESHOLD * (level + 2)) { brk; }
+
+        var nxt_n: u32 = 0;
+        var k: u32 = 0;
+        for (k < cur_n && @budget > 0) {
+            val call_id: id.InstructionId = cur[k]::id.InstructionId;
+            var bi: u32 = 0;
+            var ii: u32 = 0;
+            if (locate_call(fn, call_id, ?bi, ?ii)) {
+                val r: R.Result[bool, str] =
+                    inline_body(m, fn, bi, ii, call_id, ?snap, f_ix, nxt, PEEL_FRONTIER_CAP, ?nxt_n);
+                if (R.is_err[bool, str](r)) { err = r; brk; }
+                @budget = @budget - 1;
+            } or {
+                err = R.err[bool, str]("inline: peel self-call site not found");
+                brk;
+            }
+            k = k + 1;
+        }
+        if (R.is_err[bool, str](err)) { brk; }
+
+        # the harvested residual self-calls become the next level's frontier.
+        val tmp: *u32 = cur;
+        cur   = nxt;
+        nxt   = tmp;
+        cur_n = nxt_n;
+        level = level + 1;
+    }
+
+    A.deallocate[u32](m.alloc, cur, PEEL_FRONTIER_CAP::usize);
+    A.deallocate[u32](m.alloc, nxt, PEEL_FRONTIER_CAP::usize);
+    ir.function_dnit(m, ?snap);
+    ret err;
 }
 
 # stamp the -g inline-site side tables for one completed expansion (cx.instr_map maps
@@ -1525,4 +1881,186 @@ test "mach.lang.me.pass.inline.run:preserves_aggregate_result_operand_type_phi" 
     }
     ir.dnit(?m);
     ret bad;
+}
+
+# #1941: a directly self-recursive function is peeled. builds the two-way self-recursion
+# fib shape `f(n) { if (n < 2) ret n; ret f(n-1) + f(n-2); }` and, after run, counts the
+# live residual self-calls in the peeled body. peeling PEEL_LEVELS deep on a two-way
+# branch leaves exactly 2^(PEEL_LEVELS+1) residual calls, each still naming the function
+# itself so the recursion tail continues correctly. proves the self-call the ordinary
+# loop refuses is expanded, bounded, and left with a real recursive tail.
+test "mach.lang.me.pass.inline.run:peels_direct_self_recursion" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val ri: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ri);
+    var pi: type.IrTypeId = i64t;
+    val rs: R.Result[type.IrTypeId, str] = type.intern_fn(?m.types, i64t, ?pi, 1);
+    if (R.is_err[type.IrTypeId, str](rs)) { ir.dnit(?m); ret 1; }
+    val sig: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](rs);
+
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, sig, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fib_ix: u32 = R.unwrap_ok[u32, str](rf);
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, ?m.functions[fib_ix]);
+    val rb0: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    val rb1: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    val rb2: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rb0) || R.is_err[id.BlockId, str](rb1) || R.is_err[id.BlockId, str](rb2)) { ir.dnit(?m); ret 1; }
+    val b0: id.BlockId = R.unwrap_ok[id.BlockId, str](rb0);
+    val b1: id.BlockId = R.unwrap_ok[id.BlockId, str](rb1);
+    val b2: id.BlockId = R.unwrap_ok[id.BlockId, str](rb2);
+
+    # entry: if (n < 2) goto base else recurse
+    builder.set_block(?bld, b0);
+    val rc: R.Result[value.Value, str] = builder.emit_cmp_lt_s(?bld, value.param(0, i64t), value.const_int(2, i64t));
+    if (R.is_err[value.Value, str](rc)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, R.unwrap_ok[value.Value, str](rc), b1, b2))) { ir.dnit(?m); ret 1; }
+
+    # base: ret n
+    builder.set_block(?bld, b1);
+    if (R.is_err[bool, str](builder.emit_ret(?bld, value.param(0, i64t)))) { ir.dnit(?m); ret 1; }
+
+    # recurse: ret fib(n - 1) + fib(n - 2)
+    builder.set_block(?bld, b2);
+    val rn1: R.Result[value.Value, str] = builder.emit_sub(?bld, value.param(0, i64t), value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](rn1)) { ir.dnit(?m); ret 1; }
+    var a1: value.Value = R.unwrap_ok[value.Value, str](rn1);
+    val ra: R.Result[value.Value, str] = builder.emit_call(?bld, value.fn(fib_ix, sig), ?a1, 1, i64t);
+    if (R.is_err[value.Value, str](ra)) { ir.dnit(?m); ret 1; }
+    val rn2: R.Result[value.Value, str] = builder.emit_sub(?bld, value.param(0, i64t), value.const_int(2, i64t));
+    if (R.is_err[value.Value, str](rn2)) { ir.dnit(?m); ret 1; }
+    var a2: value.Value = R.unwrap_ok[value.Value, str](rn2);
+    val rb: R.Result[value.Value, str] = builder.emit_call(?bld, value.fn(fib_ix, sig), ?a2, 1, i64t);
+    if (R.is_err[value.Value, str](rb)) { ir.dnit(?m); ret 1; }
+    val rsum: R.Result[value.Value, str] = builder.emit_add(?bld, R.unwrap_ok[value.Value, str](ra), R.unwrap_ok[value.Value, str](rb));
+    if (R.is_err[value.Value, str](rsum)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?bld, R.unwrap_ok[value.Value, str](rsum)))) { ir.dnit(?m); ret 1; }
+
+    val rr: R.Result[bool, str] = run(?m, nil);
+    if (R.is_err[bool, str](rr)) { ir.dnit(?m); ret 1; }
+
+    # count the live residual self-calls in the peeled body.
+    val fib_fn: *ir.Function = ?m.functions[fib_ix];
+    var selfcalls: u32 = 0;
+    var i: u32 = 0;
+    for (i < fib_fn.block_count) {
+        val blk: *ir.Block = ?fib_fn.blocks[i];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val oi: O.Option[*instruction.Instruction] = ir.instruction_get(fib_fn, blk.instructions[ii]);
+            if (O.is_some[*instruction.Instruction](oi)) {
+                val ins: *instruction.Instruction = O.unwrap[*instruction.Instruction](oi);
+                if (ins.kind == instruction.OP_CALL && ins.operand_count >= 1 &&
+                    ins.operands[0].kind == value.VAL_FN && ins.operands[0].data.fn_ix == fib_ix) {
+                    selfcalls = selfcalls + 1;
+                }
+            }
+            ii = ii + 1;
+        }
+        i = i + 1;
+    }
+    ir.dnit(?m);
+
+    # 2^(PEEL_LEVELS+1) residual calls for a two-way branch peeled PEEL_LEVELS deep.
+    var expected: u32 = 1;
+    var e: u32 = 0;
+    for (e < PEEL_LEVELS + 1) { expected = expected * 2; e = e + 1; }
+    if (selfcalls != expected) { ret 1; }
+    ret 0;
+}
+
+# #1941: mutual recursion is never peeled. builds `f0(n) { ret f1(n); }` and
+# `f1(n) { ret f0(n); }` -- a two-function cycle where neither calls itself directly.
+# after run, each function must still hold exactly its one cross-call and no self-call:
+# the peel touches only direct self-edges, and the ordinary loop's cycle guard refuses
+# the mutual calls, so the pair is left exactly as built.
+test "mach.lang.me.pass.inline.run:mutual_recursion_not_peeled" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_m: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_m)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_m);
+
+    val ri: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](ri)) { ir.dnit(?m); ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](ri);
+    var pi: type.IrTypeId = i64t;
+    val rs: R.Result[type.IrTypeId, str] = type.intern_fn(?m.types, i64t, ?pi, 1);
+    if (R.is_err[type.IrTypeId, str](rs)) { ir.dnit(?m); ret 1; }
+    val sig: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](rs);
+
+    val rf0: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, sig, 0);
+    if (R.is_err[u32, str](rf0)) { ir.dnit(?m); ret 1; }
+    val f0: u32 = R.unwrap_ok[u32, str](rf0);
+    val rf1: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, sig, 0);
+    if (R.is_err[u32, str](rf1)) { ir.dnit(?m); ret 1; }
+    val f1: u32 = R.unwrap_ok[u32, str](rf1);
+
+    var bld: builder.Builder = builder.init(?m);
+
+    # f0(n) { ret f1(n); }
+    builder.set_function(?bld, ?m.functions[f0]);
+    val r0b: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](r0b)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](r0b));
+    var a0: value.Value = value.param(0, i64t);
+    val rc0: R.Result[value.Value, str] = builder.emit_call(?bld, value.fn(f1, sig), ?a0, 1, i64t);
+    if (R.is_err[value.Value, str](rc0)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?bld, R.unwrap_ok[value.Value, str](rc0)))) { ir.dnit(?m); ret 1; }
+
+    # f1(n) { ret f0(n); }
+    builder.set_function(?bld, ?m.functions[f1]);
+    val r1b: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](r1b)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, R.unwrap_ok[id.BlockId, str](r1b));
+    var a1: value.Value = value.param(0, i64t);
+    val rc1: R.Result[value.Value, str] = builder.emit_call(?bld, value.fn(f0, sig), ?a1, 1, i64t);
+    if (R.is_err[value.Value, str](rc1)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?bld, R.unwrap_ok[value.Value, str](rc1)))) { ir.dnit(?m); ret 1; }
+
+    val rr: R.Result[bool, str] = run(?m, nil);
+    if (R.is_err[bool, str](rr)) { ir.dnit(?m); ret 1; }
+
+    var f0_to_f1: u32 = 0;
+    var f0_to_f0: u32 = 0;
+    var f1_to_f0: u32 = 0;
+    var f1_to_f1: u32 = 0;
+    var fi: u32 = 0;
+    for (fi < 2) {
+        val fn: *ir.Function = ?m.functions[fi];
+        var i: u32 = 0;
+        for (i < fn.block_count) {
+            val blk: *ir.Block = ?fn.blocks[i];
+            var ii: u32 = 0;
+            for (ii < blk.instr_count) {
+                val oi: O.Option[*instruction.Instruction] = ir.instruction_get(fn, blk.instructions[ii]);
+                if (O.is_some[*instruction.Instruction](oi)) {
+                    val ins: *instruction.Instruction = O.unwrap[*instruction.Instruction](oi);
+                    if (ins.kind == instruction.OP_CALL && ins.operand_count >= 1 && ins.operands[0].kind == value.VAL_FN) {
+                        val cix: u32 = ins.operands[0].data.fn_ix;
+                        if (fi == f0 && cix == f1) { f0_to_f1 = f0_to_f1 + 1; }
+                        if (fi == f0 && cix == f0) { f0_to_f0 = f0_to_f0 + 1; }
+                        if (fi == f1 && cix == f0) { f1_to_f0 = f1_to_f0 + 1; }
+                        if (fi == f1 && cix == f1) { f1_to_f1 = f1_to_f1 + 1; }
+                    }
+                }
+                ii = ii + 1;
+            }
+            i = i + 1;
+        }
+        fi = fi + 1;
+    }
+    ir.dnit(?m);
+
+    if (f0_to_f1 != 1 || f0_to_f0 != 0) { ret 1; }
+    if (f1_to_f0 != 1 || f1_to_f1 != 0) { ret 1; }
+    ret 0;
 }
