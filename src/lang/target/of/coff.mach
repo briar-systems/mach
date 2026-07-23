@@ -560,8 +560,11 @@ fun weak_region_cmp(a: *WeakRegion, b: *WeakRegion) i64 {
 # the symbol's true alignment, which the code generator already honored by placing
 # the body at an `off` that alignment divides
 fun carrier_align(off: u32, sec_align: u32) u32 {
+    # `p < 0x40000000` bounds the doubling so `p << 1` cannot overflow u32; COFF
+    # alignment tops out at 8192 (`align_characteristic`), so `p < sec_align` always
+    # stops the loop long before, and the bound is a belt-and-braces guard only.
     var p: u32 = 1;
-    for ((off & p) == 0 && p < sec_align) { p = p << 1; }
+    for ((off & p) == 0 && p < sec_align && p < 0x40000000) { p = p << 1; }
     ret p;
 }
 
@@ -665,6 +668,14 @@ fun build_weak_comdat_image(alloc: *A.Allocator, img: *of.ObjectImage,
 
     # the split section count is bounded by one sub-section per source section plus,
     # per distinct weak region, at most a carrier and a leading span (two more).
+    # per-function sectioning inherently inflates the section count (the old
+    # dup-scheme was orig + weak_n; this is orig + 2*weak_n), so a single object with
+    # tens of thousands of weak symbols could approach `coff_serialize_image`'s hard
+    # COFF 0xFFFF (65535) section ceiling, which MSVC's `/Gy` hits the same way and
+    # answers with `/bigobj`. mach's per-module object model keeps real objects far
+    # under it (the compiler self-build tops out near ~800 sections in one object), so
+    # this is a theoretical bound with a loud, clean failure at the 0xFFFF guard - not
+    # a silent corruption. lifting it with COFF `/bigobj` support is tracked in #2147.
     val cap: u32 = orig_secs + weak_n * 2;
 
     # the sub-section plan: per output section its source section, start offset, and
@@ -819,19 +830,31 @@ fun build_weak_comdat_image(alloc: *A.Allocator, img: *of.ObjectImage,
     }
 
     # copy the source symbols, then rebind each defined symbol into the sub-section
-    # covering its offset with the offset rebased. a non-weak global must never land
-    # in a carrier: the carrier is discardable COMDAT, so on cross-object dedup the
-    # strong definition would vanish. the code generator emits each defined symbol at
-    # a distinct offset, so a non-weak global never shares a weak body's carrier; the
-    # emit fails loudly if that invariant is ever violated rather than emit an unsound
-    # object (a local sharing a carrier is fine - locals are not deduped or weakened).
+    # covering its offset with the offset rebased.
     var i: u32 = 0;
     for (i < img.symbol_count) {
         out.symbols[i] = img.symbols[i];
         val sec: u32 = img.symbols[i].section;
         if (sec != of.SECTION_EXTERNAL && sec < orig_secs) {
             val off: u32 = img.symbols[i].offset;
-            val sub: u32 = subsection_for(sec_base, sec_cnt, p_start, sec, off);
+            var sub: u32 = subsection_for(sec_base, sec_cnt, p_start, sec, off);
+            # a non-weak symbol must never bind into a zero-length carrier. a
+            # section-end / size marker at offset==section-length (or a co-located
+            # local) lands on a defensive trailing zero-length carrier by the floor
+            # rule, yet it marks the end of real content, so route it back to the last
+            # non-empty sub-section (the section tail) where it resolves to a real
+            # address rather than a discardable empty COMDAT. the weak symbol that owns
+            # such a carrier keeps it; the code generator never emits a zero-length
+            # weak body, so this only rebalances a co-located non-weak marker.
+            if (p_carrier[sub] && p_len[sub] == 0
+                && (img.symbols[i].flags & of.SYM_OBJ_FLAG_WEAK) == 0) {
+                for (sub > sec_base[sec] && p_len[sub] == 0) { sub = sub - 1; }
+            }
+            # a non-weak global in a (non-empty) carrier would vanish on cross-object
+            # COMDAT dedup; the code generator emits each defined symbol at a distinct
+            # offset, so a non-weak global never shares a weak body's carrier - fail
+            # loudly if that invariant is ever violated rather than emit an unsound
+            # object (a local sharing a carrier is fine - locals are not deduped).
             if (p_carrier[sub]
                 && (img.symbols[i].flags & of.SYM_OBJ_FLAG_GLOBAL) != 0
                 && (img.symbols[i].flags & of.SYM_OBJ_FLAG_WEAK) == 0) {
@@ -847,8 +870,11 @@ fun build_weak_comdat_image(alloc: *A.Allocator, img: *of.ObjectImage,
     # copy the source relocations, then move each into the sub-section covering its
     # patch site with the offset rebased. a relocation patches a field within one
     # symbol's body, which lies wholly inside one sub-section, so the field never
-    # crosses a span/carrier boundary; verify before rebasing (a straddling field
-    # would rebase into a too-short sub-section) rather than emit a corrupt patch.
+    # crosses a span/carrier boundary; verify before rebasing rather than emit a
+    # corrupt patch. the check is scoped to a genuine internal boundary (the
+    # sub-section ends before the source section does): an out-of-range field in a
+    # weak-free section - one verbatim sub-section whose end is the section end -
+    # falls through to `validate_reloc_ranges`' precise out-of-range diagnostic.
     var ri: u32 = 0;
     for (ri < img.reloc_count) {
         out.relocations[ri] = img.relocations[ri];
@@ -856,8 +882,9 @@ fun build_weak_comdat_image(alloc: *A.Allocator, img: *of.ObjectImage,
         if (rsec < orig_secs) {
             val ro:  u32 = img.relocations[ri].offset;
             val sub: u32 = subsection_for(sec_base, sec_cnt, p_start, rsec, ro);
+            val sub_end: u32 = p_start[sub] + p_len[sub];
             val w:   usize = reloc_field_width(img.relocations[ri].kind);
-            if (ro::usize + w > (p_start[sub] + p_len[sub])::usize) {
+            if (sub_end < img.sections[rsec].len && ro::usize + w > sub_end::usize) {
                 free_build_scratch(alloc, regions, weak_n, p_src, p_carrier, cap, sec_base, orig_secs);
                 ret R.err[bool, str]("coff: relocation field straddles a weak-split boundary");
             }
@@ -3859,8 +3886,9 @@ test "mach.lang.target.of.coff:zero_extent_weak_terminates" {
     var isa_vt: isa.IsaVTable;
     isa_vt.id = isa.ARCH_X86_64;
 
-    # sec0 `.text` [0,8): strong `af` [0,8) and a zero-extent weak `zend` at offset 8
-    # (== section length). sec1: a zero-length weak-defining `.text` with weak `zmt`.
+    # sec0 `.text` [0,8): strong `af` [0,8), a zero-extent weak `zend` at offset 8
+    # (== section length), and a LOCAL end-marker `eend` also at offset 8. sec1: a
+    # zero-length weak-defining `.text` with weak `zmt`.
     var t0: [8]u8;
     var k: usize = 0;
     for (k < 8) { t0[k] = (0x40 + k::u8); k = k + 1; }
@@ -3872,17 +3900,18 @@ test "mach.lang.target.of.coff:zero_extent_weak_terminates" {
     secs[1].bytes = nil; secs[1].len = 0; secs[1].align = 16;
 
     val fn_fl: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
-    var syms: [3]of.Symbol;
+    var syms: [4]of.Symbol;
     syms[0].name = t_intern(?i, "af");   syms[0].section = 0; syms[0].offset = 0; syms[0].size = 0; syms[0].flags = fn_fl;
     syms[1].name = t_intern(?i, "zend"); syms[1].section = 0; syms[1].offset = 8; syms[1].size = 0; syms[1].flags = fn_fl | of.SYM_OBJ_FLAG_WEAK;
-    syms[2].name = t_intern(?i, "zmt");  syms[2].section = 1; syms[2].offset = 0; syms[2].size = 0; syms[2].flags = fn_fl | of.SYM_OBJ_FLAG_WEAK;
+    syms[2].name = t_intern(?i, "eend"); syms[2].section = 0; syms[2].offset = 8; syms[2].size = 0; syms[2].flags = 0;
+    syms[3].name = t_intern(?i, "zmt");  syms[3].section = 1; syms[3].offset = 0; syms[3].size = 0; syms[3].flags = fn_fl | of.SYM_OBJ_FLAG_WEAK;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
     img.interner = ?i;
     img.name = t_intern(?i, "test");
     img.sections = ?secs[0]; img.section_count = 2;
-    img.symbols = ?syms[0]; img.symbol_count = 3;
+    img.symbols = ?syms[0]; img.symbol_count = 4;
     img.relocations = nil; img.reloc_count = 0;
 
     val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_ze");
@@ -3904,12 +3933,13 @@ test "mach.lang.target.of.coff:zero_extent_weak_terminates" {
     if (R.is_err[bool, str](pr)) { ret 1; }
 
     # both zero-extent weak symbols round-trip weak in a zero-length carrier; `af`
-    # stays a non-weak span.
+    # stays a non-weak span; the local `eend` marker at the section end is routed to
+    # the real content tail (the 8-byte span), never the discardable empty carrier.
     var seen: u32 = 0;
     var y: u32 = 0;
     for (y < out.symbol_count) {
         val nm: intern.StrId = out.symbols[y].name;
-        if (nm == syms[1].name || nm == syms[2].name) {
+        if (nm == syms[1].name || nm == syms[3].name) {
             if ((out.symbols[y].flags & of.SYM_OBJ_FLAG_WEAK) == 0) { ret 1; }
             if (out.sections[out.symbols[y].section].len != 0)      { ret 1; }
             seen = seen + 1;
@@ -3918,9 +3948,15 @@ test "mach.lang.target.of.coff:zero_extent_weak_terminates" {
             if ((out.symbols[y].flags & of.SYM_OBJ_FLAG_WEAK) != 0) { ret 1; }
             seen = seen + 1;
         }
+        if (nm == syms[2].name) {
+            if ((out.symbols[y].flags & of.SYM_OBJ_FLAG_WEAK) != 0) { ret 1; }
+            # routed to the section tail (len 8), not a zero-length carrier.
+            if (out.sections[out.symbols[y].section].len != 8) { ret 1; }
+            seen = seen + 1;
+        }
         y = y + 1;
     }
-    if (seen != 3) { ret 1; }
+    if (seen != 4) { ret 1; }
 
     ret 0;
 }
