@@ -82,12 +82,13 @@ val NONE_U32: u32 = 0xFFFFFFFF;
 # writes, a single base, or all bases equal) there is no aliasing hazard and the
 # guard is a constant true.
 # ---
-# b:     builder positioned in the guard block
-# d:     the dependence info (must be DEP_INDEPENDENT)
-# init:  the induction variable's initial value (the low index)
-# bound: the loop's upper bound (the exclusive high index)
-# ret:   the i8 guard value, or an allocation error
-pub fun emit_alias_guard(b: *builder.Builder, d: *dep.DepInfo, init: value.Value, bound: value.Value) R.Result[value.Value, str] {
+# b:       builder positioned in the guard block
+# d:       the dependence info (must be DEP_INDEPENDENT)
+# init:    the induction variable's initial value (the low index)
+# counted: the counted-loop exit test; the exclusive high index is derived from it
+#          via emit_exclusive_bound, never from its raw predicate-dependent bound
+# ret:     the i8 guard value, or an allocation error
+pub fun emit_alias_guard(b: *builder.Builder, d: *dep.DepInfo, init: value.Value, counted: *loops.CountedInfo) R.Result[value.Value, str] {
     val m: *ir.Module = b.m;
     val ri8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
     if (R.is_err[ir_type.IrTypeId, str](ri8)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](ri8)); }
@@ -96,52 +97,90 @@ pub fun emit_alias_guard(b: *builder.Builder, d: *dep.DepInfo, init: value.Value
     val n: u32 = d.access_count;
     if (n == 0) { ret R.ok[value.Value, str](value.const_int(1, i8t)); }
 
-    # precompute each access's [start, end) once
-    val rs: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, n::usize);
-    if (R.is_err[*value.Value, str](rs)) { ret R.err[value.Value, str](R.unwrap_err[*value.Value, str](rs)); }
-    val starts: *value.Value = R.unwrap_ok[*value.Value, str](rs);
-    val re: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, n::usize);
-    if (R.is_err[*value.Value, str](re)) { A.deallocate[value.Value](m.alloc, starts, n::usize); ret R.err[value.Value, str](R.unwrap_err[*value.Value, str](re)); }
-    val ends: *value.Value = R.unwrap_ok[*value.Value, str](re);
-
-    var i: u32 = 0;
-    for (i < n) {
-        val acc: *dep.MemAccess = ?d.accesses[i];
-        var ixs: [1]value.Value;
-        ixs[0] = init;
-        val rst: R.Result[value.Value, str] = builder.emit_gep(b, acc.base, acc.stride_ty, ?ixs[0], 1);
-        if (R.is_err[value.Value, str](rst)) { A.deallocate[value.Value](m.alloc, starts, n::usize); A.deallocate[value.Value](m.alloc, ends, n::usize); ret rst; }
-        starts[i] = R.unwrap_ok[value.Value, str](rst);
-        var ixe: [1]value.Value;
-        ixe[0] = bound;
-        val ren: R.Result[value.Value, str] = builder.emit_gep(b, acc.base, acc.stride_ty, ?ixe[0], 1);
-        if (R.is_err[value.Value, str](ren)) { A.deallocate[value.Value](m.alloc, starts, n::usize); A.deallocate[value.Value](m.alloc, ends, n::usize); ret ren; }
-        ends[i] = R.unwrap_ok[value.Value, str](ren);
-        i = i + 1;
-    }
-
-    var have_guard: bool = false;
-    var guard: value.Value = value.const_int(1, i8t);
+    # which accesses participate in a distinct-base write/other pair; only those need
+    # range geps, so a read-only or single-base loop emits none (its guard is const-true)
+    val rpart: R.Result[*bool, str] = A.allocate[bool](m.alloc, n::usize);
+    if (R.is_err[*bool, str](rpart)) { ret R.err[value.Value, str](R.unwrap_err[*bool, str](rpart)); }
+    val part: *bool = R.unwrap_ok[*bool, str](rpart);
+    var p: u32 = 0;
+    for (p < n) { part[p] = false; p = p + 1; }
     var wi: u32 = 0;
     for (wi < n) {
         if (d.accesses[wi].is_store) {
             var oi: u32 = 0;
             for (oi < n) {
-                if (oi != wi && !values_equal(d.accesses[wi].base, d.accesses[oi].base)) {
-                    # end_w <= start_o  ||  end_o <= start_w
+                if (oi != wi && !dep.equal(d.accesses[wi].base, d.accesses[oi].base)) {
+                    part[wi] = true;
+                    part[oi] = true;
+                }
+                oi = oi + 1;
+            }
+        }
+        wi = wi + 1;
+    }
+
+    val rs: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, n::usize);
+    if (R.is_err[*value.Value, str](rs)) { A.deallocate[bool](m.alloc, part, n::usize); ret R.err[value.Value, str](R.unwrap_err[*value.Value, str](rs)); }
+    val starts: *value.Value = R.unwrap_ok[*value.Value, str](rs);
+    val re: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, n::usize);
+    if (R.is_err[*value.Value, str](re)) { A.deallocate[bool](m.alloc, part, n::usize); A.deallocate[value.Value](m.alloc, starts, n::usize); ret R.err[value.Value, str](R.unwrap_err[*value.Value, str](re)); }
+    val ends: *value.Value = R.unwrap_ok[*value.Value, str](re);
+
+    var has_pair: bool = false;
+    var i: u32 = 0;
+    for (i < n) { if (part[i]) { has_pair = true; } i = i + 1; }
+    if (!has_pair) {
+        guard_free3(m, part, starts, ends, n);
+        ret R.ok[value.Value, str](value.const_int(1, i8t));
+    }
+
+    # the normalized exclusive high index (LE adds one element), emitted once
+    val rbe: R.Result[value.Value, str] = emit_exclusive_bound(b, counted);
+    if (R.is_err[value.Value, str](rbe)) { guard_free3(m, part, starts, ends, n); ret rbe; }
+    val bound_ex: value.Value = R.unwrap_ok[value.Value, str](rbe);
+
+    # each participating access's byte range [base+init*sz, base+bound_ex*sz)
+    i = 0;
+    for (i < n) {
+        if (part[i]) {
+            val acc: *dep.MemAccess = ?d.accesses[i];
+            var ixs: [1]value.Value;
+            ixs[0] = init;
+            val rst: R.Result[value.Value, str] = builder.emit_gep(b, acc.base, acc.stride_ty, ?ixs[0], 1);
+            if (R.is_err[value.Value, str](rst)) { guard_free3(m, part, starts, ends, n); ret rst; }
+            starts[i] = R.unwrap_ok[value.Value, str](rst);
+            var ixe: [1]value.Value;
+            ixe[0] = bound_ex;
+            val ren: R.Result[value.Value, str] = builder.emit_gep(b, acc.base, acc.stride_ty, ?ixe[0], 1);
+            if (R.is_err[value.Value, str](ren)) { guard_free3(m, part, starts, ends, n); ret ren; }
+            ends[i] = R.unwrap_ok[value.Value, str](ren);
+        }
+        i = i + 1;
+    }
+
+    # AND each write range's disjointness `(end_w <= start_o) || (end_o <= start_w)`
+    # against every distinct-base access
+    var have_guard: bool = false;
+    var guard: value.Value = value.const_int(1, i8t);
+    wi = 0;
+    for (wi < n) {
+        if (d.accesses[wi].is_store) {
+            var oi: u32 = 0;
+            for (oi < n) {
+                if (oi != wi && !dep.equal(d.accesses[wi].base, d.accesses[oi].base)) {
                     val rc1: R.Result[value.Value, str] = builder.emit_cmp_le_u(b, ends[wi], starts[oi]);
-                    if (R.is_err[value.Value, str](rc1)) { A.deallocate[value.Value](m.alloc, starts, n::usize); A.deallocate[value.Value](m.alloc, ends, n::usize); ret rc1; }
+                    if (R.is_err[value.Value, str](rc1)) { guard_free3(m, part, starts, ends, n); ret rc1; }
                     val rc2: R.Result[value.Value, str] = builder.emit_cmp_le_u(b, ends[oi], starts[wi]);
-                    if (R.is_err[value.Value, str](rc2)) { A.deallocate[value.Value](m.alloc, starts, n::usize); A.deallocate[value.Value](m.alloc, ends, n::usize); ret rc2; }
+                    if (R.is_err[value.Value, str](rc2)) { guard_free3(m, part, starts, ends, n); ret rc2; }
                     val rp: R.Result[value.Value, str] = builder.emit_or(b, R.unwrap_ok[value.Value, str](rc1), R.unwrap_ok[value.Value, str](rc2));
-                    if (R.is_err[value.Value, str](rp)) { A.deallocate[value.Value](m.alloc, starts, n::usize); A.deallocate[value.Value](m.alloc, ends, n::usize); ret rp; }
+                    if (R.is_err[value.Value, str](rp)) { guard_free3(m, part, starts, ends, n); ret rp; }
                     val pair: value.Value = R.unwrap_ok[value.Value, str](rp);
                     if (!have_guard) {
                         guard = pair;
                         have_guard = true;
                     } or {
                         val ra: R.Result[value.Value, str] = builder.emit_and(b, guard, pair);
-                        if (R.is_err[value.Value, str](ra)) { A.deallocate[value.Value](m.alloc, starts, n::usize); A.deallocate[value.Value](m.alloc, ends, n::usize); ret ra; }
+                        if (R.is_err[value.Value, str](ra)) { guard_free3(m, part, starts, ends, n); ret ra; }
                         guard = R.unwrap_ok[value.Value, str](ra);
                     }
                 }
@@ -151,9 +190,29 @@ pub fun emit_alias_guard(b: *builder.Builder, d: *dep.DepInfo, init: value.Value
         wi = wi + 1;
     }
 
+    guard_free3(m, part, starts, ends, n);
+    ret R.ok[value.Value, str](guard);
+}
+
+# free the three working arrays of emit_alias_guard
+fun guard_free3(m: *ir.Module, part: *bool, starts: *value.Value, ends: *value.Value, n: u32) {
+    A.deallocate[bool](m.alloc, part, n::usize);
     A.deallocate[value.Value](m.alloc, starts, n::usize);
     A.deallocate[value.Value](m.alloc, ends, n::usize);
-    ret R.ok[value.Value, str](guard);
+}
+
+# emit (or return) the normalized EXCLUSIVE high index of a counted loop: the raw
+# bound for a `<` (LT) test, or `bound + 1` for a `<=` (LE) test. The single point
+# that turns child 1's predicate-dependent CountedInfo.bound into an exclusive
+# index; every consumer (the alias guard here, child 3's vector trip) routes through
+# it rather than re-deriving the LE/LT off-by-one.
+# ---
+# b:       builder positioned where the bound may be materialized
+# counted: the counted-loop exit test
+# ret:     the exclusive high index value, or an allocation error
+pub fun emit_exclusive_bound(b: *builder.Builder, counted: *loops.CountedInfo) R.Result[value.Value, str] {
+    if (!counted.bound_inclusive) { ret R.ok[value.Value, str](counted.bound); }
+    ret builder.emit_add(b, counted.bound, value.const_int(1, counted.bound.ty));
 }
 
 # version loop `loop_ix`: clone it into a runtime-guarded fast copy plus the original
@@ -217,7 +276,7 @@ pub fun version_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, l
     k = 0;
     for (k < n_instrs) { instr_map[k] = NONE_U32; k = k + 1; }
 
-    # 1. a clone block per loop body block (block_add may grow fn.blocks; store ids only)
+    # a clone block per loop body block (block_add may grow fn.blocks; store ids only)
     bi = 0;
     for (bi < body_len) {
         val radd: R.Result[id.BlockId, str] = ir.block_add(m, fn);
@@ -226,7 +285,7 @@ pub fun version_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, l
         bi = bi + 1;
     }
 
-    # 2. clone every instruction in each body block (fn.blocks stable now; fn.instrs grows,
+    # clone every instruction in each body block (fn.blocks stable now; fn.instrs grows,
     #    so re-fetch the src pointer immediately before each clone)
     bi = 0;
     for (bi < body_len) {
@@ -250,7 +309,7 @@ pub fun version_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, l
         bi = bi + 1;
     }
 
-    # 3. populate the clone blocks' phi / instruction / terminator lists via the maps
+    # populate the clone blocks' phi / instruction / terminator lists via the maps
     bi = 0;
     for (bi < body_len) {
         val src: *ir.Block = ?fn.blocks[body[bi]::u32];
@@ -273,10 +332,10 @@ pub fun version_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, l
         bi = bi + 1;
     }
 
-    # 4. remap cloned operands: loop instr -> clone, loop block target -> clone block
+    # remap cloned operands: loop instr -> clone, loop block target -> clone block
     remap_operands(fn, block_map, n_blocks, instr_map, n_instrs);
 
-    # 5. build the guard and merge blocks
+    # build the guard and merge blocks
     val rg: R.Result[id.BlockId, str] = ir.block_add(m, fn);
     if (R.is_err[id.BlockId, str](rg)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[id.BlockId, str](rg)); }
     val guard_bid: id.BlockId = R.unwrap_ok[id.BlockId, str](rg);
@@ -291,7 +350,7 @@ pub fun version_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, l
     var b: builder.Builder = builder.init(m);
     builder.set_function(?b, fn);
     builder.set_block(?b, guard_bid);
-    val rge: R.Result[value.Value, str] = emit_alias_guard(?b, d, lp.iv.init, lp.counted.bound);
+    val rge: R.Result[value.Value, str] = emit_alias_guard(?b, d, lp.iv.init, ?lp.counted);
     if (R.is_err[value.Value, str](rge)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[value.Value, str](rge)); }
     val guard_val: value.Value = R.unwrap_ok[value.Value, str](rge);
     val rcbr: R.Result[bool, str] = builder.emit_cbr(?b, guard_val, fast_header, header);
@@ -302,23 +361,23 @@ pub fun version_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, l
     val rbr: R.Result[bool, str] = builder.emit_br(?b, exit);
     if (R.is_err[bool, str](rbr)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[bool, str](rbr)); }
 
-    # 6. redirect the preheader from the header to the guard block
+    # redirect the preheader from the header to the guard block
     redirect_terminator(fn, preheader, header, guard_bid);
 
-    # 7. both headers are now entered from the guard: relabel the preheader phi-incoming
+    # both headers are now entered from the guard: relabel the preheader phi-incoming
     relabel_phi_pred(fn, header, preheader, guard_bid);
     relabel_phi_pred(fn, fast_header, preheader, guard_bid);
 
-    # 8. route both exiting blocks through the merge, then to the exit
+    # route both exiting blocks through the merge, then to the exit
     redirect_terminator(fn, exiting, exit, merge_bid);
     redirect_terminator(fn, fast_exiting, exit, merge_bid);
     relabel_phi_pred(fn, exit, exiting, merge_bid);
 
-    # 9. rebuild predecessors after the control-flow surgery
+    # rebuild predecessors after the control-flow surgery
     val rpr: R.Result[bool, str] = ir.preds_rebuild(m, fn);
     if (R.is_err[bool, str](rpr)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[bool, str](rpr)); }
 
-    # 10. fast_blocks parallel to the original body order
+    # fast_blocks parallel to the original body order
     val rfb: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](m.alloc, body_len::usize);
     if (R.is_err[*id.BlockId, str](rfb)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[*id.BlockId, str](rfb)); }
     val fast_blocks: *id.BlockId = R.unwrap_ok[*id.BlockId, str](rfb);
@@ -468,18 +527,6 @@ fun has_live_out(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32) bool {
     ret false;
 }
 
-# structural value equality for base pointers: same param / instruction / global /
-# function reference. Conservative: an unrecognized kind compares unequal, so a
-# redundant self-disjointness check is emitted rather than a pair silently dropped.
-fun values_equal(a: value.Value, b: value.Value) bool {
-    if (a.kind != b.kind) { ret false; }
-    if (a.kind == value.VAL_PARAM)  { ret a.data.param_ix == b.data.param_ix; }
-    if (a.kind == value.VAL_INSTR)  { ret a.data.instr == b.data.instr; }
-    if (a.kind == value.VAL_GLOBAL) { ret a.data.global_ix == b.data.global_ix; }
-    if (a.kind == value.VAL_FN)     { ret a.data.fn_ix == b.data.fn_ix; }
-    ret false;
-}
-
 use std.allocator.page;
 use mach.lang.intern;
 use verify: mach.lang.me.ir.verify;
@@ -605,7 +652,7 @@ test "mach.lang.me.transform.versioning:alias_guard_shape" {
     val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
     if (R.is_err[loops.LoopAnalysis, str](ral)) { ir.dnit(?m); ret 1; }
     var la: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ral);
-    val rd: R.Result[dep.DepInfo, str] = dep.analyze_dependence(fn, ?la, 0, ?alloc);
+    val rd: R.Result[dep.DepInfo, str] = dep.analyze_dependence(fn, ?la, 0, ?m.types, ?alloc);
     if (R.is_err[dep.DepInfo, str](rd)) { loops.dnit(?la); ir.dnit(?m); ret 1; }
     var di: dep.DepInfo = R.unwrap_ok[dep.DepInfo, str](rd);
 
@@ -614,8 +661,7 @@ test "mach.lang.me.transform.versioning:alias_guard_shape" {
     val gb: id.BlockId = R.unwrap_ok[id.BlockId, str](rg);
     builder.set_block(?bld, gb);
     val init: value.Value = la.loops[0].iv.init;
-    val bound: value.Value = la.loops[0].counted.bound;
-    val rge: R.Result[value.Value, str] = emit_alias_guard(?bld, ?di, init, bound);
+    val rge: R.Result[value.Value, str] = emit_alias_guard(?bld, ?di, init, ?la.loops[0].counted);
     if (R.is_err[value.Value, str](rge)) { dep.dep_dnit(?di); loops.dnit(?la); ir.dnit(?m); ret 1; }
 
     if (count_op(fn, gb, instruction.OP_GEP) != 6)      { code = 1; }
@@ -660,7 +706,7 @@ test "mach.lang.me.transform.versioning:version_verifier_clean" {
     val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
     if (R.is_err[loops.LoopAnalysis, str](ral)) { ir.dnit(?m); ret 1; }
     var la: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ral);
-    val rd: R.Result[dep.DepInfo, str] = dep.analyze_dependence(fn, ?la, 0, ?alloc);
+    val rd: R.Result[dep.DepInfo, str] = dep.analyze_dependence(fn, ?la, 0, ?m.types, ?alloc);
     if (R.is_err[dep.DepInfo, str](rd)) { loops.dnit(?la); ir.dnit(?m); ret 1; }
     var di: dep.DepInfo = R.unwrap_ok[dep.DepInfo, str](rd);
 
@@ -776,7 +822,7 @@ test "mach.lang.me.transform.versioning:refuse_dependent" {
     val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
     if (R.is_err[loops.LoopAnalysis, str](ral)) { ir.dnit(?m); ret 1; }
     var la: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ral);
-    val rd: R.Result[dep.DepInfo, str] = dep.analyze_dependence(fn, ?la, 0, ?alloc);
+    val rd: R.Result[dep.DepInfo, str] = dep.analyze_dependence(fn, ?la, 0, ?m.types, ?alloc);
     if (R.is_err[dep.DepInfo, str](rd)) { loops.dnit(?la); ir.dnit(?m); ret 1; }
     var di: dep.DepInfo = R.unwrap_ok[dep.DepInfo, str](rd);
     val rv: R.Result[VersionResult, str] = version_loop(?m, fn, ?la, 0, ?di);
@@ -863,7 +909,7 @@ test "mach.lang.me.transform.versioning:refuse_live_out" {
     val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
     if (R.is_err[loops.LoopAnalysis, str](ral)) { ir.dnit(?m); ret 1; }
     var la: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ral);
-    val rd: R.Result[dep.DepInfo, str] = dep.analyze_dependence(fn, ?la, 0, ?alloc);
+    val rd: R.Result[dep.DepInfo, str] = dep.analyze_dependence(fn, ?la, 0, ?m.types, ?alloc);
     if (R.is_err[dep.DepInfo, str](rd)) { loops.dnit(?la); ir.dnit(?m); ret 1; }
     var di: dep.DepInfo = R.unwrap_ok[dep.DepInfo, str](rd);
     # the loop itself is dependence-independent; the refusal is specifically live-out
@@ -875,6 +921,106 @@ test "mach.lang.me.transform.versioning:refuse_live_out" {
     if (fn.block_count != blocks_before) { code = 1; }
     version_result_dnit(?vres, ?alloc);
     dep.dep_dnit(?di);
+    loops.dnit(?la);
+    ir.dnit(?m);
+    ret code;
+}
+
+# an `i <= n` (LE) loop's exclusive bound must be normalized to `n + 1` so the alias
+# guard's range covers the last accessed element (a[n]); child 1 flags bound_inclusive
+# and emit_exclusive_bound materializes the `+ 1`.
+test "mach.lang.me.transform.versioning:le_bound_exclusive" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    var sig: ir_type.IrTypeId;
+    if (mk_sig(?m, i64t, ptrt, ?sig) != 0) { ir.dnit(?m); ret 1; }
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, sig, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val re: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](re)) { ir.dnit(?m); ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](re);
+    val rh: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rh)) { ir.dnit(?m); ret 1; }
+    val header: id.BlockId = R.unwrap_ok[id.BlockId, str](rh);
+    val rb: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rb)) { ir.dnit(?m); ret 1; }
+    val body: id.BlockId = R.unwrap_ok[id.BlockId, str](rb);
+    val rx: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rx)) { ir.dnit(?m); ret 1; }
+    val exit: id.BlockId = R.unwrap_ok[id.BlockId, str](rx);
+    val n: value.Value = value.param(0, i64t);
+    val a: value.Value = value.param(1, ptrt);
+    val bb: value.Value = value.param(2, ptrt);
+    builder.set_block(?bld, entry);
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, header);
+    val rphi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
+    if (R.is_err[value.Value, str](rphi)) { ir.dnit(?m); ret 1; }
+    val iv: value.Value = R.unwrap_ok[value.Value, str](rphi);
+    val rc: R.Result[value.Value, str] = builder.emit_cmp_le_s(?bld, iv, n);
+    if (R.is_err[value.Value, str](rc)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, R.unwrap_ok[value.Value, str](rc), body, exit))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, body);
+    var ixb: [1]value.Value; ixb[0] = iv;
+    val rgb: R.Result[value.Value, str] = builder.emit_gep(?bld, bb, i64t, ?ixb[0], 1);
+    if (R.is_err[value.Value, str](rgb)) { ir.dnit(?m); ret 1; }
+    val rl: R.Result[value.Value, str] = builder.emit_load(?bld, R.unwrap_ok[value.Value, str](rgb), i64t);
+    if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
+    var ixa: [1]value.Value; ixa[0] = iv;
+    val rga: R.Result[value.Value, str] = builder.emit_gep(?bld, a, i64t, ?ixa[0], 1);
+    if (R.is_err[value.Value, str](rga)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?bld, R.unwrap_ok[value.Value, str](rl), R.unwrap_ok[value.Value, str](rga)))) { ir.dnit(?m); ret 1; }
+    val ru: R.Result[value.Value, str] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](ru)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, exit);
+    if (R.is_err[bool, str](builder.emit_ret_void(?bld))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, iv, entry, value.const_int(0, i64t)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, iv, body, R.unwrap_ok[value.Value, str](ru)))) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
+    if (R.is_err[loops.LoopAnalysis, str](ral)) { ir.dnit(?m); ret 1; }
+    var la: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ral);
+    if (la.loop_len != 1)                       { code = 1; }
+    if (!la.loops[0].is_counted)                { code = 1; }
+    if (!la.loops[0].counted.bound_inclusive)   { code = 1; }
+
+    # emit_exclusive_bound must materialize `n + 1`
+    val rgb2: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rgb2)) { loops.dnit(?la); ir.dnit(?m); ret 1; }
+    val gb: id.BlockId = R.unwrap_ok[id.BlockId, str](rgb2);
+    builder.set_block(?bld, gb);
+    val rex: R.Result[value.Value, str] = emit_exclusive_bound(?bld, ?la.loops[0].counted);
+    if (R.is_err[value.Value, str](rex)) { loops.dnit(?la); ir.dnit(?m); ret 1; }
+    val bex: value.Value = R.unwrap_ok[value.Value, str](rex);
+    if (bex.kind != value.VAL_INSTR) { code = 1; }
+    or {
+        val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, bex.data.instr);
+        if (O.is_none[*instruction.Instruction](opt)) { code = 1; }
+        or {
+            val add: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
+            if (add.kind != instruction.OP_ADD)                 { code = 1; }
+            if (add.operands[0].kind != value.VAL_PARAM)        { code = 1; }
+            if (add.operands[0].data.param_ix != 0)             { code = 1; }
+            if (add.operands[1].kind != value.VAL_CONST_INT)    { code = 1; }
+            if (add.operands[1].data.int_lit != 1)              { code = 1; }
+        }
+    }
+
     loops.dnit(?la);
     ir.dnit(?m);
     ret code;
