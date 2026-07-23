@@ -44,6 +44,7 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_contains;
+use std.types.string.str_equals;
 use std.types.string.str_len;
 
 use A: std.allocator;
@@ -1320,7 +1321,8 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
             A.deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
             ret R.err[bool, str](R.unwrap_err[str, str](rsn));
         }
-        val rin: R.Result[intern.StrId, str] = intern.intern(itn, R.unwrap_ok[str, str](rsn));
+        val sname: str = R.unwrap_ok[str, str](rsn);
+        val rin: R.Result[intern.StrId, str] = intern.intern(itn, sname);
         if (R.is_err[intern.StrId, str](rin)) {
             A.deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
             ret R.err[bool, str](R.unwrap_err[intern.StrId, str](rin));
@@ -1331,7 +1333,14 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
         if ((chars & IMAGE_SCN_CNT_CODE) != 0)               { kind = of.SK_TEXT; }
         or ((chars & IMAGE_SCN_CNT_UNINITIALIZED_DATA) != 0) { kind = of.SK_BSS; }
         or ((chars & IMAGE_SCN_MEM_DISCARDABLE) != 0)        { kind = of.SK_DEBUG; }
-        or ((chars & IMAGE_SCN_MEM_WRITE) == 0)              { kind = of.SK_RODATA; }
+        or ((chars & IMAGE_SCN_MEM_WRITE) == 0) {
+            # a read-only section named `.data.rel.ro` carries relocated read-only
+            # constants (RELRO); every other read-only section is plain rodata. this
+            # mirrors ELF's name-based recovery so the emit -> parse round-trip
+            # preserves the RELRO/RODATA distinction rather than collapsing it.
+            if (str_equals(sname, ".data.rel.ro")) { kind = of.SK_RELRO; }
+            or                                     { kind = of.SK_RODATA; }
+        }
 
         out.sections[s].name  = R.unwrap_ok[intern.StrId, str](rin);
         out.sections[s].kind  = kind;
@@ -3142,6 +3151,77 @@ test "mach.lang.target.of.coff:emit_parse_round_trip" {
     }
     if (!saw_pc32 || !saw_abs64) { ret 1; }
 
+    ret 0;
+}
+
+# a read-only `.data.rel.ro` section round-trips as SK_RELRO, distinct from a plain
+# `.rdata` SK_RODATA: emit keeps the input name + read-only characteristics, and
+# parse recovers the RELRO kind from the name rather than collapsing it into RODATA,
+# so the in-memory image and its re-parsed object are link-equivalent (#1865)
+test "mach.lang.target.of.coff:relro_round_trip" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    var text_bytes: [8]u8;
+    var ro_bytes:   [8]u8;
+    var rel_bytes:  [8]u8;
+    var k: usize = 0;
+    for (k < 8) { text_bytes[k] = 0; ro_bytes[k] = 0; rel_bytes[k] = 0; k = k + 1; }
+
+    var secs: [3]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 8; secs[0].align = 16;
+    secs[1].name = t_intern(?i, ".rdata"); secs[1].kind = of.SK_RODATA;
+    secs[1].bytes = ?ro_bytes[0]; secs[1].len = 8; secs[1].align = 8;
+    secs[2].name = t_intern(?i, ".data.rel.ro"); secs[2].kind = of.SK_RELRO;
+    secs[2].bytes = ?rel_bytes[0]; secs[2].len = 8; secs[2].align = 8;
+
+    var syms: [1]of.Symbol;
+    syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 8; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    # an abs64 relocated pointer in the RELRO section, carrying a non-zero addend.
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 2; relocs[0].offset = 0; relocs[0].kind = of.RK_ABS64;
+    relocs[0].symbol = syms[0].name; relocs[0].addend = 0x20;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 3;
+    img.symbols = ?syms[0]; img.symbol_count = 1;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_relro");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+
+    val em: R.Result[bool, str] = coff_emit_object(?isa_vt, ?img, fs.temp_path(?tf)::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = coff_parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+
+    if (out.section_count != 3) { ret 1; }
+    # the three kinds survive distinctly; RELRO is not collapsed into RODATA.
+    if (out.sections[0].kind != of.SK_TEXT)   { ret 1; }
+    if (out.sections[1].kind != of.SK_RODATA) { ret 1; }
+    if (out.sections[2].kind != of.SK_RELRO)  { ret 1; }
+
+    # the abs64 addend carried in the RELRO section round-trips.
+    if (out.reloc_count != 1) { ret 1; }
+    if (out.relocations[0].kind != of.RK_ABS64 || out.relocations[0].addend != 0x20) { ret 1; }
     ret 0;
 }
 
