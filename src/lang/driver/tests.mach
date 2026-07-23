@@ -608,6 +608,40 @@ fun ut_vec_codegen_defined(src: str, needle: str) i32 {
     ret code;
 }
 
+# 0 only when `src` passes sema + lower but codegen FAILS with an error whose message
+# contains `needle`; 1 on any other outcome (a clean codegen, a different error, or a
+# pre-codegen failure). asserts a codegen-stage gate actually fires - stricter than
+# `ut_vec_codegen_defined`, which also accepts a clean compile (#1646)
+fun ut_codegen_rejects(src: str, needle: str) i32 {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = src;
+    val pr: R.Result[project.Project, outcome.Fail] = ut_build(?s, ?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var code: i32 = 1;
+    val se: R.Result[bool, outcome.Fail] = passes.run_sema_pass(?p);
+    if (R.is_ok[bool, outcome.Fail](se)) {
+        val le: R.Result[bool, outcome.Fail] = passes.run_lower_pass(?p);
+        if (R.is_ok[bool, outcome.Fail](le)) {
+            val ce: R.Result[bool, outcome.Fail] = passes.run_codegen_pass(?p);
+            if (R.is_err[bool, outcome.Fail](ce)
+                && ut_str_contains(R.unwrap_err[bool, outcome.Fail](ce).message, needle)) { code = 0; }
+        }
+    }
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret code;
+}
+
 # a vector op reaching instruction selection always resolves to DEFINED behavior
 # -- never an ICE, never a silent miscompile. driving real vector ops (a pointer
 # lane-wise add and a full-arity literal) through the HOST backend on each CI
@@ -4246,6 +4280,54 @@ test "mach.lang.driver:secret_uni_field_secrecy" {
     if (!ut_sema_rejects("uni U { a: ^u32; b: u32; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
     if (!ut_sema_clean("uni U { a: ^u32; b: ^u32; }\nfun main() i32 { ret 0; }\n"))  { bad = 1; }
     if (!ut_sema_clean("uni U { a: u32; b: u32; }\nfun main() i32 { ret 0; }\n"))    { bad = 1; }
+    ret bad;
+}
+
+# constant-time (#1646): floating point is variable-latency and gated by default, so
+# a secret operand of an FP add / sub / mul / compare is a sema error, while the same
+# ops on public floats are clean - the gate keys on secrecy, not shape
+test "mach.lang.driver:secret_float_gate_rejected" {
+    var bad: i32 = 0;
+    if (!ut_sema_rejects("fun f(a: ^f64, b: ^f64) ^f64 { ret a + b; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    if (!ut_sema_rejects("fun f(a: ^f64, b: ^f64) ^f64 { ret a - b; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    if (!ut_sema_rejects("fun f(a: ^f64, b: ^f64) ^f64 { ret a * b; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    if (!ut_sema_rejects("fun f(a: ^f32, b: ^f32) ^u8 { ret a < b; }\nfun main() i32 { ret 0; }\n"))  { bad = 1; }
+    if (!ut_sema_clean("fun f(a: f64, b: f64) f64 { ret a + b; }\nfun main() i32 { ret 0; }\n"))       { bad = 1; }
+    if (!ut_sema_clean("fun f(a: f32, b: f32) u8 { ret a < b; }\nfun main() i32 { ret 0; }\n"))        { bad = 1; }
+    # the teaching diagnostic names the leak.
+    if (ut_vec_diag("fun f(a: ^f64, b: ^f64) ^f64 { ret a * b; }\nfun main() i32 { ret 0; }\n", "variable-latency floating-point") != 0) { bad = 1; }
+    ret bad;
+}
+
+# constant-time (#1646): `#[oblivious]` is a closed-set, argument-free decorator that
+# applies only to functions. it is a no-op on a secret-free function and is accepted
+# on a secret-handling one; a non-function target or an argument is rejected
+test "mach.lang.driver:oblivious_decorator" {
+    var bad: i32 = 0;
+    if (!ut_sema_clean("#[oblivious]\nfun f(a: ^u32) ^u32 { ret a + a; }\nfun main() i32 { ret 0; }\n"))    { bad = 1; }
+    if (!ut_sema_clean("#[oblivious]\nfun f() i32 { ret 0; }\nfun main() i32 { ret 0; }\n"))                { bad = 1; }
+    if (!ut_sema_rejects("#[oblivious]\nrec R { x: u32; }\nfun main() i32 { ret 0; }\n"))                   { bad = 1; }
+    if (!ut_sema_rejects("#[oblivious(1)]\nfun f() i32 { ret 0; }\nfun main() i32 { ret 0; }\n"))           { bad = 1; }
+    if (ut_vec_diag("#[oblivious]\nrec R { x: u32; }\nfun main() i32 { ret 0; }\n", "applies only to functions") != 0) { bad = 1; }
+    ret bad;
+}
+
+# constant-time (#1646): the taint reaches MIR - the first live consumer, the
+# integer-multiply gate, rejects a secret-tainted `*` at codegen on a target without a
+# trusted data-independent multiply (host default `ct_trust_mul` = false). the secret
+# reaches the multiply through derived values (the public call args up-coerce to the
+# `^u32` params), proving the taint propagates. a public multiply compiles clean, so
+# the gate keys on secrecy, not shape, and non-secret code is unaffected
+test "mach.lang.driver:secret_mul_codegen_rejected" {
+    var bad: i32 = 0;
+    # a secret multiply passes sema (the multiply gate is target-dependent) and is
+    # rejected at codegen with the teaching diagnostic.
+    if (!ut_sema_clean("fun f(a: ^u32, b: ^u32) ^u32 { ret a * b; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    if (ut_codegen_rejects("fun f(a: ^u32, b: ^u32) ^u32 { ret a * b; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { f(1, 2); ret 0; }\n",
+        "variable-latency integer multiply") != 0) { bad = 1; }
+    # a public multiply compiles clean (no gate) - the taint bit never fires on it.
+    if (ut_vec_codegen_defined("fun f(a: u32, b: u32) u32 { ret a * b; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { f(1, 2); ret 0; }\n",
+        "variable-latency integer multiply") != 0) { bad = 1; }
     ret bad;
 }
 
