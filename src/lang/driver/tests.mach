@@ -40,6 +40,7 @@ use mach.lang.me.ir;
 use mach.lang.me.ir.instruction;
 use mach.lang.me.ir.value;
 use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.pass.inline;
 use mach.lang.query;
 use mach.lang.session;
 use src: mach.lang.source;
@@ -3312,6 +3313,115 @@ fun ut_probe_global_agg_arg(m: *ir.Module) i32 {
         fi = fi + 1;
     }
     ret 1;
+}
+
+# count the live OP_CALLs in `m` whose direct callee is a LOCAL definition (a
+# non-extern function carrying a body in this module). #1934: a call to a generic
+# instantiation must bind the instance's own definition, so it is counted here;
+# were it still bound to the bodiless FN_FLAG_EXTERN import shadow the count would
+# be 0. after the release inline pass clones the small instance body into its
+# caller the count returns to 0. only calls live in a block instruction stream are
+# counted, so inline's unlinked pool ghosts are ignored
+fun ut_calls_to_local_def(m: *ir.Module) u32 {
+    var n: u32 = 0;
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        var bi: u32 = 0;
+        for (bi < fn.block_count) {
+            val blk: *ir.Block = ?fn.blocks[bi];
+            var ii: u32 = 0;
+            for (ii < blk.instr_count) {
+                val oi: O.Option[*instruction.Instruction] = ir.instruction_get(fn, blk.instructions[ii]);
+                if (O.is_some[*instruction.Instruction](oi)) {
+                    val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](oi);
+                    if (inst.kind == instruction.OP_CALL && inst.operand_count >= 1) {
+                        val callee: value.Value = inst.operands[0];
+                        if (callee.kind == value.VAL_FN && callee.data.fn_ix < m.function_len) {
+                            val cfn: *ir.Function = ?m.functions[callee.data.fn_ix];
+                            if ((cfn.flags & ir.FN_FLAG_EXTERN) == 0 && cfn.block_count > 0) { n = n + 1; }
+                        }
+                    }
+                }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+        fi = fi + 1;
+    }
+    ret n;
+}
+
+# true when `m` carries a bodiless FN_FLAG_EXTERN entry whose linkage name also
+# names a local definition - the dual same-name Function shape #1934 / #2064 fixed.
+# a materialised generic instance must collapse to a single entry, so this is false
+fun ut_has_extern_def_shadow(m: *ir.Module) bool {
+    var i: u32 = 0;
+    for (i < m.function_len) {
+        val fi: *ir.Function = ?m.functions[i];
+        if ((fi.flags & ir.FN_FLAG_EXTERN) != 0) {
+            var j: u32 = 0;
+            for (j < m.function_len) {
+                val fj: *ir.Function = ?m.functions[j];
+                if (i != j && (fj.flags & ir.FN_FLAG_EXTERN) == 0 && fj.name == fi.name) { ret true; }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a call to a LOCAL generic instantiation binds the instance's definition, not a
+# bodiless FN_FLAG_EXTERN shadow, and therefore inlines at release (#1934). the call
+# site first materialises a signature-only extern for the instance, which the
+# instance drain upgrades in place into the definition (#2064); binding the
+# definition is what lets should_inline see a non-extern, small callee and clone its
+# body. before the fix the call kept naming the bodiless extern, so the release
+# inline stage did nothing and release IR equalled debug IR
+test "mach.lang.driver:generic_instance_call_inlines_at_release" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = "fun wrap[T](x: T) T { ret x; }\nfun main() i32 { ret wrap[i32](7); }\n";
+
+    val pr: R.Result[project.Project, outcome.Fail] = ut_build(?s, ?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    # bad starts failed and clears only on the full success chain, so a build or
+    # lookup failure can never vacuously pass.
+    var bad: i32 = 1;
+    if (R.is_err[bool, outcome.Fail](passes.run_sema_pass(?p)))  { project.dnit_project(?p); session.dnit(?s); ret 1; }
+    if (R.is_err[bool, outcome.Fail](passes.run_lower_pass(?p))) { project.dnit_project(?p); session.dnit(?s); ret 1; }
+
+    val mid: session.ModuleId = ut_mid(?p, ?s, "uniontest.main");
+    if (mid != session.MODULE_NIL) {
+        val me: *project.ModuleEntry = ?p.modules[mid::u32];
+        if (me.ir_module != nil) {
+            val m: *ir.Module = me.ir_module;
+            # post-lower (debug): the instance collapsed to one entry (no extern
+            # shadow) and main's call binds that local definition.
+            val shadow: bool = ut_has_extern_def_shadow(m);
+            val before:  u32 = ut_calls_to_local_def(m);
+            # run the release inline pass directly (its target arg is reserved and
+            # unused); the small single-use instance body is cloned into main,
+            # leaving no live call to a local definition.
+            val ri: R.Result[bool, str] = inline.run(m, ?p.target);
+            val after: u32 = ut_calls_to_local_def(m);
+            if (!shadow && before >= 1 && R.is_ok[bool, str](ri) && after == 0) { bad = 0; }
+        }
+    }
+
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
 }
 
 # driver incremental: editing one dependency's body re-lowers it and its importer
