@@ -26,6 +26,8 @@ use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 
+use std.system.panic.panic;
+
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
@@ -42,8 +44,10 @@ pub val NONE_U32: u32 = 0xFFFFFFFF;
 # ---
 # phi:    the header phi instruction defining the induction variable
 # init:   the value entering the phi from the preheader edge
-# step:   the loop-invariant step added each iteration (a constant in the counted
-#         form; any loop-invariant value in the general form)
+# step:   the step added each iteration. read `step.data.int_lit` as a constant
+#         ONLY under the counted guarantee (Loop.is_counted), which enforces a
+#         non-zero VAL_CONST_INT; a general (has_iv but not is_counted) IV carries
+#         any loop-invariant value here, which may not be a constant
 # update: the `phi + step` instruction on the latch edge
 pub rec InductionVar {
     phi:    id.InstructionId;
@@ -53,6 +57,12 @@ pub rec InductionVar {
 }
 
 # the recognized counted-loop exit test over an induction variable
+#
+# Valid only when Loop.is_counted. Its guarantees, all fully enforced before
+# is_counted is set, are the contract a trip-count consumer relies on: the header
+# is the loop's sole exiting block; the induction variable's step is a non-zero
+# VAL_CONST_INT whose sign drives the variable across `bound` so the test
+# terminates; and `bound` is loop-invariant.
 # ---
 # bound:            the loop-invariant value the induction variable is compared against
 # pred:             the comparison opcode (OP_CMP_LT_S / _LT_U / _LE_S / _LE_U)
@@ -71,19 +81,24 @@ pub rec CountedInfo {
 # one natural loop
 # ---
 # header:     the loop entry; dominates every body block
-# preheader:  the unique out-of-loop predecessor of the header, or BLOCK_NIL
+# preheader:  the unique out-of-loop predecessor of the header whose SOLE successor
+#             is the header (a dedicated pre-loop block), or BLOCK_NIL
 # latch:      the unique in-loop predecessor of the header (the back-edge source),
 #             or BLOCK_NIL
 # exiting:    the unique body block with a successor outside the loop, or BLOCK_NIL
-# exit:       the unique block outside the loop reached from the loop, or BLOCK_NIL
+# exit:       the unique block outside the loop reached from the loop, provided it is
+#             dedicated (no predecessors from outside the loop), or BLOCK_NIL
 # body:       the loop's blocks in ascending id order, including header and latch (owned)
 # body_len:   number of blocks in `body`
 # body_cap:   allocated capacity of `body` (equals body_len; freed at dnit)
 # parent:     index into LoopAnalysis.loops of the tightest enclosing loop, or NONE_U32
 # depth:      nesting depth (0 = outermost)
-# has_iv:     true when a canonical induction variable was recognized
+# has_iv:     true when a canonical induction variable was recognized; its step is
+#             loop-invariant but not necessarily constant (see InductionVar.step)
 # iv:         the induction variable, valid when has_iv
-# is_counted: true when the loop is a recognized counted loop
+# is_counted: true when the loop is a recognized counted loop -- implies the header is
+#             the sole exiting block, the IV step is a non-zero constant with a sign
+#             that terminates the exit test, and the bound is loop-invariant
 # counted:    the counted-loop exit test, valid when is_counted
 pub rec Loop {
     header:     id.BlockId;
@@ -238,14 +253,21 @@ pub fun dominates(la: *LoopAnalysis, a: id.BlockId, b: id.BlockId) bool {
     if (a::u32 >= n || b::u32 >= n) { ret false; }
     if (a == b)                     { ret true; }
     if (la.rpo_index[b::u32] == NONE_U32) { ret false; }
+    # walk b up the immediate-dominator chain to the entry. the chain strictly
+    # decreases in reverse-postorder number and ends at the entry's idom self-loop,
+    # so it is acyclic and terminates within block_count steps by construction; a
+    # longer walk or an unset idom is a corrupt dominator tree, surfaced loudly
+    # rather than silently truncated.
     var x: u32 = b::u32;
     var steps: u32 = 0;
-    for (steps <= n) {
-        if (x == a::u32)              { ret true; }
-        if (la.idom[x] == id.BLOCK_NIL) { ret false; }
-        if (la.idom[x]::u32 == x)     { ret false; }
-        x = la.idom[x]::u32;
+    for (true) {
+        if (x == a::u32) { ret true; }
+        val nx: id.BlockId = la.idom[x];
+        if (nx == id.BLOCK_NIL) { panic("mach.lang.me.analysis.loops: dominator chain reached an unset idom\n"); }
+        if (nx::u32 == x) { ret false; }
+        x = nx::u32;
         steps = steps + 1;
+        if (steps > n) { panic("mach.lang.me.analysis.loops: cyclic dominator chain\n"); }
     }
     ret false;
 }
@@ -707,18 +729,27 @@ fun emit_loop(la: *LoopAnalysis, fn: *ir.Function, h: u32, member: *bool, pred_s
         pi = pi + 1;
     }
     if (in_cnt == 1)  { lp.latch = latch; }
-    if (out_cnt == 1) { lp.preheader = pre; }
+    # the preheader must be a dedicated pre-loop block: its SOLE successor is the
+    # header. a guard block that also branches past the loop (`if n>0 goto header
+    # else after`) is not one -- hoisting a load or an alias guard into it would run
+    # it on the loop-skipped path -- so it does not qualify.
+    if (out_cnt == 1) {
+        var ps0: id.BlockId = id.BLOCK_NIL;
+        var ps1: id.BlockId = id.BLOCK_NIL;
+        val psn: u32 = ir.block_successors(fn, ?fn.blocks[pre::u32], ?ps0, ?ps1);
+        if (psn == 1 && ps0 == lp.header) { lp.preheader = pre; }
+    }
 
-    # unique exiting block and exit target: a body block with a successor outside
-    fill_exit(la, fn, member, lp);
+    # unique exiting block and dedicated exit target
+    fill_exit(la, fn, member, lp, pred_start, pred_len, pred_flat);
 
     la.loop_len = la.loop_len + 1;
     ret R.ok[bool, str](true);
 }
 
-# identify the unique exiting block and exit target for a loop, leaving BLOCK_NIL
-# when either is not unique
-fun fill_exit(la: *LoopAnalysis, fn: *ir.Function, member: *bool, lp: *Loop) {
+# identify the unique exiting block and dedicated exit target for a loop, leaving
+# BLOCK_NIL when either is not unique / not dedicated
+fun fill_exit(la: *LoopAnalysis, fn: *ir.Function, member: *bool, lp: *Loop, pred_start: *u32, pred_len: *u32, pred_flat: *id.BlockId) {
     val n: u32 = la.block_count;
     var exiting: id.BlockId = id.BLOCK_NIL;
     var exit:    id.BlockId = id.BLOCK_NIL;
@@ -745,7 +776,22 @@ fun fill_exit(la: *LoopAnalysis, fn: *ir.Function, member: *bool, lp: *Loop) {
     }
 
     if (exiting_cnt == 1) { lp.exiting = exiting; }
-    if (!exit_multi)      { lp.exit = exit; }
+
+    # the exit is set only when it is unique AND dedicated: every predecessor of the
+    # exit target is inside the loop. a shared join / ret block reached by another
+    # control path is not dedicated -- a consumer placing a loop epilogue or
+    # reduction finalize there would run it on the non-loop path.
+    if (!exit_multi && exit != id.BLOCK_NIL) {
+        val ebase: u32 = pred_start[exit::u32];
+        val ec:    u32 = pred_len[exit::u32];
+        var dedicated: bool = true;
+        var pi: u32 = 0;
+        for (pi < ec) {
+            if (member[pred_flat[ebase + pi]::u32] == false) { dedicated = false; brk; }
+            pi = pi + 1;
+        }
+        if (dedicated) { lp.exit = exit; }
+    }
 }
 
 # compute each loop's tightest enclosing parent and nesting depth
@@ -771,16 +817,19 @@ fun compute_nesting(la: *LoopAnalysis) {
         i = i + 1;
     }
 
+    # each parent points to a strictly larger enclosing loop (greater body_len), so
+    # a parent chain strictly increases in size and cannot exceed loop_len or cycle
+    # by construction; a longer chain is a corrupt forest, surfaced loudly.
     i = 0;
     for (i < la.loop_len) {
         var d: u32 = 0;
         var p: u32 = la.loops[i].parent;
         var guard: u32 = 0;
         for (p != NONE_U32) {
-            if (guard > la.loop_len) { brk; }
             d = d + 1;
             p = la.loops[p].parent;
             guard = guard + 1;
+            if (guard > la.loop_len) { panic("mach.lang.me.analysis.loops: cyclic loop-nesting parent chain\n"); }
         }
         la.loops[i].depth = d;
         i = i + 1;
@@ -830,10 +879,31 @@ fun recognize_counted(la: *LoopAnalysis, fn: *ir.Function, loop_ix: u32) bool {
     val else_in: bool = loop_contains(la, loop_ix, else_b);
     if (then_in == else_in) { ret false; }
 
+    # the header must be the loop's SOLE exiting block. otherwise a mid-body early
+    # exit (a `found` break) leaves before the header test's trip count elapses, and
+    # a consumer deriving trip = (bound - init) / step would vectorize past the
+    # break. lp.exiting is BLOCK_NIL when the exiting block is not unique, and it is
+    # the header exactly when the header is the only block that leaves the loop.
+    if (lp.exiting != lp.header) { ret false; }
+
     var init: value.Value;
     var step: value.Value;
     var upd:  id.InstructionId = id.INSTR_NIL;
     if (!analyze_phi_iv(la, fn, loop_ix, phi_id, ?init, ?step, ?upd)) { ret false; }
+
+    # the counted guarantee requires a NON-ZERO CONSTANT step: a consumer reads
+    # iv.step as a constant and divides by it for the trip count (a param/global step
+    # would be a garbage union read; a zero step a division by zero). its sign must
+    # also drive the induction variable across the boundary so the header test
+    # actually terminates -- otherwise trip is negative/huge and the loop never ends.
+    # for the LT/LE tests, the continue edge in the `iv < bound` direction needs a
+    # positive step; the `iv >= bound`-continue direction needs a negative step.
+    if (step.kind != value.VAL_CONST_INT) { ret false; }
+    val s: i64 = step.data.int_lit:~i64;
+    if (s == 0) { ret false; }
+    val want_pos: bool = (iv_on_left == then_in);
+    if (want_pos && s < 0)  { ret false; }
+    if (!want_pos && s > 0) { ret false; }
 
     lp.has_iv     = true;
     lp.iv.phi     = phi_id;
@@ -1253,6 +1323,9 @@ test "mach.lang.me.analysis.loops:nested_depth_and_parent" {
     val roh: R.Result[id.BlockId, str] = builder.new_block(?bld);
     if (R.is_err[id.BlockId, str](roh)) { ir.dnit(?m); ret 1; }
     val outer_h: id.BlockId = R.unwrap_ok[id.BlockId, str](roh);
+    val rip: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rip)) { ir.dnit(?m); ret 1; }
+    val inner_pre: id.BlockId = R.unwrap_ok[id.BlockId, str](rip);
     val rih: R.Result[id.BlockId, str] = builder.new_block(?bld);
     if (R.is_err[id.BlockId, str](rih)) { ir.dnit(?m); ret 1; }
     val inner_h: id.BlockId = R.unwrap_ok[id.BlockId, str](rih);
@@ -1273,13 +1346,18 @@ test "mach.lang.me.analysis.loops:nested_depth_and_parent" {
     builder.set_block(?bld, entry);
     if (R.is_err[bool, str](builder.emit_br(?bld, outer_h))) { ir.dnit(?m); ret 1; }
 
+    # outer header continues into a dedicated inner-loop preheader, or exits
     builder.set_block(?bld, outer_h);
     val rpo: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
     if (R.is_err[value.Value, str](rpo)) { ir.dnit(?m); ret 1; }
     val phi_o: value.Value = R.unwrap_ok[value.Value, str](rpo);
     val rco: R.Result[value.Value, str] = builder.emit_cmp_lt_s(?bld, phi_o, n);
     if (R.is_err[value.Value, str](rco)) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.emit_cbr(?bld, R.unwrap_ok[value.Value, str](rco), inner_h, exit))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, R.unwrap_ok[value.Value, str](rco), inner_pre, exit))) { ir.dnit(?m); ret 1; }
+
+    # dedicated inner preheader: its sole successor is the inner header
+    builder.set_block(?bld, inner_pre);
+    if (R.is_err[bool, str](builder.emit_br(?bld, inner_h))) { ir.dnit(?m); ret 1; }
 
     builder.set_block(?bld, inner_h);
     val rpi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
@@ -1306,7 +1384,7 @@ test "mach.lang.me.analysis.loops:nested_depth_and_parent" {
 
     if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_o, entry, zero)))         { ir.dnit(?m); ret 1; }
     if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_o, outer_latch, iv_o_upd))) { ir.dnit(?m); ret 1; }
-    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_i, outer_h, zero)))       { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_i, inner_pre, zero)))     { ir.dnit(?m); ret 1; }
     if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_i, inner_body, iv_i_upd))) { ir.dnit(?m); ret 1; }
 
     var code: i32 = 0;
@@ -1316,13 +1394,14 @@ test "mach.lang.me.analysis.loops:nested_depth_and_parent" {
 
     if (la.loop_len != 2) { code = 1; }
     or {
-        # find inner (body_len 2) and outer (body_len 4)
+        # find inner (body_len 2: inner_h + inner_body) and outer (body_len 5:
+        # outer_h + inner_pre + inner_h + inner_body + outer_latch)
         var inner_ix: u32 = NONE_U32;
         var outer_ix: u32 = NONE_U32;
         var i: u32 = 0;
         for (i < la.loop_len) {
             if (la.loops[i].body_len == 2) { inner_ix = i; }
-            if (la.loops[i].body_len == 4) { outer_ix = i; }
+            if (la.loops[i].body_len == 5) { outer_ix = i; }
             i = i + 1;
         }
         if (inner_ix == NONE_U32 || outer_ix == NONE_U32) { code = 1; }
@@ -1337,13 +1416,450 @@ test "mach.lang.me.analysis.loops:nested_depth_and_parent" {
             if (outer.depth != 0)              { code = 1; }
             if (!inner.is_counted)             { code = 1; }
             if (!outer.is_counted)             { code = 1; }
-            if (inner.preheader != outer_h)    { code = 1; }
+            if (inner.preheader != inner_pre)  { code = 1; }
+            if (outer.preheader != entry)      { code = 1; }
             if (inner.latch != inner_body)     { code = 1; }
             if (outer.latch != outer_latch)    { code = 1; }
             if (!loop_contains(?la, outer_ix, inner_h)) { code = 1; }
         }
     }
 
+    dnit(?la);
+    ir.dnit(?m);
+    ret code;
+}
+
+# a search loop whose header carries a counted-looking `i < n` test but whose body
+# has a mid-loop early exit (a `found` break) is NOT counted: the header is not the
+# sole exiting block, so a consumer must not derive a trip count from it.
+test "mach.lang.me.analysis.loops:early_exit_not_counted" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val re: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](re)) { ir.dnit(?m); ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](re);
+    val rh: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rh)) { ir.dnit(?m); ret 1; }
+    val header: id.BlockId = R.unwrap_ok[id.BlockId, str](rh);
+    val rbo: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rbo)) { ir.dnit(?m); ret 1; }
+    val body: id.BlockId = R.unwrap_ok[id.BlockId, str](rbo);
+    val rla: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rla)) { ir.dnit(?m); ret 1; }
+    val latch: id.BlockId = R.unwrap_ok[id.BlockId, str](rla);
+    val rfo: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rfo)) { ir.dnit(?m); ret 1; }
+    val found: id.BlockId = R.unwrap_ok[id.BlockId, str](rfo);
+    val rx: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rx)) { ir.dnit(?m); ret 1; }
+    val exit: id.BlockId = R.unwrap_ok[id.BlockId, str](rx);
+
+    val n: value.Value = value.param(0, i64t);
+    val zero: value.Value = value.const_int(0, i64t);
+    val one: value.Value = value.const_int(1, i64t);
+    val five: value.Value = value.const_int(5, i64t);
+
+    builder.set_block(?bld, entry);
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, header);
+    val rphi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
+    if (R.is_err[value.Value, str](rphi)) { ir.dnit(?m); ret 1; }
+    val phi: value.Value = R.unwrap_ok[value.Value, str](rphi);
+    val rc1: R.Result[value.Value, str] = builder.emit_cmp_lt_s(?bld, phi, n);
+    if (R.is_err[value.Value, str](rc1)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, R.unwrap_ok[value.Value, str](rc1), body, exit))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, body);
+    val rc2: R.Result[value.Value, str] = builder.emit_cmp_eq(?bld, phi, five);
+    if (R.is_err[value.Value, str](rc2)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, R.unwrap_ok[value.Value, str](rc2), found, latch))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, latch);
+    val rupd: R.Result[value.Value, str] = builder.emit_add(?bld, phi, one);
+    if (R.is_err[value.Value, str](rupd)) { ir.dnit(?m); ret 1; }
+    val upd: value.Value = R.unwrap_ok[value.Value, str](rupd);
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, found);
+    if (R.is_err[bool, str](builder.emit_br(?bld, exit))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, exit);
+    if (R.is_err[bool, str](builder.emit_ret_void(?bld))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, entry, zero))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, latch, upd))) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    val ra: R.Result[LoopAnalysis, str] = analyze(fn, ?alloc);
+    if (R.is_err[LoopAnalysis, str](ra)) { ir.dnit(?m); ret 1; }
+    var la: LoopAnalysis = R.unwrap_ok[LoopAnalysis, str](ra);
+    if (la.loop_len != 1) { code = 1; }
+    or {
+        val lp: *Loop = ?la.loops[0];
+        if (lp.is_counted)            { code = 1; }
+        if (lp.exiting != id.BLOCK_NIL) { code = 1; }
+    }
+    dnit(?la);
+    ir.dnit(?m);
+    ret code;
+}
+
+# a loop entered through a guard block that also branches past the loop
+# (`if 0 < n goto header else after`) has no dedicated preheader: the guard's sole
+# successor is not the header, so preheader is BLOCK_NIL and the loop is not counted.
+test "mach.lang.me.analysis.loops:guard_preheader_nil" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val re: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](re)) { ir.dnit(?m); ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](re);
+    val rh: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rh)) { ir.dnit(?m); ret 1; }
+    val header: id.BlockId = R.unwrap_ok[id.BlockId, str](rh);
+    val rla: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rla)) { ir.dnit(?m); ret 1; }
+    val latch: id.BlockId = R.unwrap_ok[id.BlockId, str](rla);
+    val raf: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](raf)) { ir.dnit(?m); ret 1; }
+    val after: id.BlockId = R.unwrap_ok[id.BlockId, str](raf);
+
+    val n: value.Value = value.param(0, i64t);
+    val zero: value.Value = value.const_int(0, i64t);
+    val one: value.Value = value.const_int(1, i64t);
+
+    builder.set_block(?bld, entry);
+    val rcg: R.Result[value.Value, str] = builder.emit_cmp_lt_s(?bld, zero, n);
+    if (R.is_err[value.Value, str](rcg)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, R.unwrap_ok[value.Value, str](rcg), header, after))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, header);
+    val rphi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
+    if (R.is_err[value.Value, str](rphi)) { ir.dnit(?m); ret 1; }
+    val phi: value.Value = R.unwrap_ok[value.Value, str](rphi);
+    val rc1: R.Result[value.Value, str] = builder.emit_cmp_lt_s(?bld, phi, n);
+    if (R.is_err[value.Value, str](rc1)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, R.unwrap_ok[value.Value, str](rc1), latch, after))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, latch);
+    val rupd: R.Result[value.Value, str] = builder.emit_add(?bld, phi, one);
+    if (R.is_err[value.Value, str](rupd)) { ir.dnit(?m); ret 1; }
+    val upd: value.Value = R.unwrap_ok[value.Value, str](rupd);
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, after);
+    if (R.is_err[bool, str](builder.emit_ret_void(?bld))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, entry, zero))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, latch, upd))) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    val ra: R.Result[LoopAnalysis, str] = analyze(fn, ?alloc);
+    if (R.is_err[LoopAnalysis, str](ra)) { ir.dnit(?m); ret 1; }
+    var la: LoopAnalysis = R.unwrap_ok[LoopAnalysis, str](ra);
+    if (la.loop_len != 1) { code = 1; }
+    or {
+        val lp: *Loop = ?la.loops[0];
+        if (lp.preheader != id.BLOCK_NIL) { code = 1; }
+        if (lp.latch != latch)            { code = 1; }
+        if (lp.is_counted)                { code = 1; }
+    }
+    dnit(?la);
+    ir.dnit(?m);
+    ret code;
+}
+
+# a negative constant step under an `i < n` (LT) exit test never crosses the bound
+# upward, so the header test never terminates the loop: it must not be counted
+# (a trip count from it would be negative / astronomically large). the induction
+# variable is still recognized generally.
+test "mach.lang.me.analysis.loops:negative_step_not_counted" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val re: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](re)) { ir.dnit(?m); ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](re);
+    val rh: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rh)) { ir.dnit(?m); ret 1; }
+    val header: id.BlockId = R.unwrap_ok[id.BlockId, str](rh);
+    val rbo: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rbo)) { ir.dnit(?m); ret 1; }
+    val body: id.BlockId = R.unwrap_ok[id.BlockId, str](rbo);
+    val rx: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rx)) { ir.dnit(?m); ret 1; }
+    val exit: id.BlockId = R.unwrap_ok[id.BlockId, str](rx);
+
+    val n: value.Value = value.param(0, i64t);
+    val zero: value.Value = value.const_int(0, i64t);
+    val negone: value.Value = value.const_int(0xFFFFFFFFFFFFFFFF, i64t);
+
+    builder.set_block(?bld, entry);
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, header);
+    val rphi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
+    if (R.is_err[value.Value, str](rphi)) { ir.dnit(?m); ret 1; }
+    val phi: value.Value = R.unwrap_ok[value.Value, str](rphi);
+    val rc1: R.Result[value.Value, str] = builder.emit_cmp_lt_s(?bld, phi, n);
+    if (R.is_err[value.Value, str](rc1)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, R.unwrap_ok[value.Value, str](rc1), body, exit))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, body);
+    val rupd: R.Result[value.Value, str] = builder.emit_add(?bld, phi, negone);
+    if (R.is_err[value.Value, str](rupd)) { ir.dnit(?m); ret 1; }
+    val upd: value.Value = R.unwrap_ok[value.Value, str](rupd);
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, exit);
+    if (R.is_err[bool, str](builder.emit_ret_void(?bld))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, entry, zero))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, body, upd))) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    val ra: R.Result[LoopAnalysis, str] = analyze(fn, ?alloc);
+    if (R.is_err[LoopAnalysis, str](ra)) { ir.dnit(?m); ret 1; }
+    var la: LoopAnalysis = R.unwrap_ok[LoopAnalysis, str](ra);
+    if (la.loop_len != 1) { code = 1; }
+    or {
+        val lp: *Loop = ?la.loops[0];
+        if (lp.is_counted)  { code = 1; }
+        if (!lp.has_iv)     { code = 1; }
+        if ((lp.iv.step.data.int_lit:~i64) != (0 - 1)) { code = 1; }
+    }
+    dnit(?la);
+    ir.dnit(?m);
+    ret code;
+}
+
+# a non-constant (loop-invariant parameter) step is not a counted-loop step: a
+# consumer would read a garbage constant payload from it. the loop is not counted.
+test "mach.lang.me.analysis.loops:param_step_not_counted" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val re: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](re)) { ir.dnit(?m); ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](re);
+    val rh: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rh)) { ir.dnit(?m); ret 1; }
+    val header: id.BlockId = R.unwrap_ok[id.BlockId, str](rh);
+    val rbo: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rbo)) { ir.dnit(?m); ret 1; }
+    val body: id.BlockId = R.unwrap_ok[id.BlockId, str](rbo);
+    val rx: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rx)) { ir.dnit(?m); ret 1; }
+    val exit: id.BlockId = R.unwrap_ok[id.BlockId, str](rx);
+
+    val n: value.Value = value.param(0, i64t);
+    val pstep: value.Value = value.param(1, i64t);
+    val zero: value.Value = value.const_int(0, i64t);
+
+    builder.set_block(?bld, entry);
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, header);
+    val rphi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
+    if (R.is_err[value.Value, str](rphi)) { ir.dnit(?m); ret 1; }
+    val phi: value.Value = R.unwrap_ok[value.Value, str](rphi);
+    val rc1: R.Result[value.Value, str] = builder.emit_cmp_lt_s(?bld, phi, n);
+    if (R.is_err[value.Value, str](rc1)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, R.unwrap_ok[value.Value, str](rc1), body, exit))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, body);
+    val rupd: R.Result[value.Value, str] = builder.emit_add(?bld, phi, pstep);
+    if (R.is_err[value.Value, str](rupd)) { ir.dnit(?m); ret 1; }
+    val upd: value.Value = R.unwrap_ok[value.Value, str](rupd);
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, exit);
+    if (R.is_err[bool, str](builder.emit_ret_void(?bld))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, entry, zero))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, body, upd))) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    val ra: R.Result[LoopAnalysis, str] = analyze(fn, ?alloc);
+    if (R.is_err[LoopAnalysis, str](ra)) { ir.dnit(?m); ret 1; }
+    var la: LoopAnalysis = R.unwrap_ok[LoopAnalysis, str](ra);
+    if (la.loop_len != 1) { code = 1; }
+    or {
+        val lp: *Loop = ?la.loops[0];
+        if (lp.is_counted) { code = 1; }
+    }
+    dnit(?la);
+    ir.dnit(?m);
+    ret code;
+}
+
+# a zero step (`i = i + 0`) yields a division-by-zero trip count, so it is not a
+# counted loop even though the step is a constant.
+test "mach.lang.me.analysis.loops:zero_step_not_counted" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val re: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](re)) { ir.dnit(?m); ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](re);
+    val rh: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rh)) { ir.dnit(?m); ret 1; }
+    val header: id.BlockId = R.unwrap_ok[id.BlockId, str](rh);
+    val rbo: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rbo)) { ir.dnit(?m); ret 1; }
+    val body: id.BlockId = R.unwrap_ok[id.BlockId, str](rbo);
+    val rx: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rx)) { ir.dnit(?m); ret 1; }
+    val exit: id.BlockId = R.unwrap_ok[id.BlockId, str](rx);
+
+    val n: value.Value = value.param(0, i64t);
+    val zero: value.Value = value.const_int(0, i64t);
+
+    builder.set_block(?bld, entry);
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, header);
+    val rphi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
+    if (R.is_err[value.Value, str](rphi)) { ir.dnit(?m); ret 1; }
+    val phi: value.Value = R.unwrap_ok[value.Value, str](rphi);
+    val rc1: R.Result[value.Value, str] = builder.emit_cmp_lt_s(?bld, phi, n);
+    if (R.is_err[value.Value, str](rc1)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, R.unwrap_ok[value.Value, str](rc1), body, exit))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, body);
+    val rupd: R.Result[value.Value, str] = builder.emit_add(?bld, phi, zero);
+    if (R.is_err[value.Value, str](rupd)) { ir.dnit(?m); ret 1; }
+    val upd: value.Value = R.unwrap_ok[value.Value, str](rupd);
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, exit);
+    if (R.is_err[bool, str](builder.emit_ret_void(?bld))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, entry, zero))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, body, upd))) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    val ra: R.Result[LoopAnalysis, str] = analyze(fn, ?alloc);
+    if (R.is_err[LoopAnalysis, str](ra)) { ir.dnit(?m); ret 1; }
+    var la: LoopAnalysis = R.unwrap_ok[LoopAnalysis, str](ra);
+    if (la.loop_len != 1) { code = 1; }
+    or {
+        val lp: *Loop = ?la.loops[0];
+        if (lp.is_counted) { code = 1; }
+    }
+    dnit(?la);
+    ir.dnit(?m);
+    ret code;
+}
+
+# an exit target reached from OUTSIDE the loop too (a shared join block) is not a
+# dedicated exit, so exit is BLOCK_NIL. the loop stays counted (the trip count is
+# unaffected) and keeps its dedicated preheader -- the signals are independent.
+test "mach.lang.me.analysis.loops:shared_exit_nil" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val re: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](re)) { ir.dnit(?m); ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](re);
+    val rp: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rp)) { ir.dnit(?m); ret 1; }
+    val pre: id.BlockId = R.unwrap_ok[id.BlockId, str](rp);
+    val rh: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rh)) { ir.dnit(?m); ret 1; }
+    val header: id.BlockId = R.unwrap_ok[id.BlockId, str](rh);
+    val rla: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rla)) { ir.dnit(?m); ret 1; }
+    val latch: id.BlockId = R.unwrap_ok[id.BlockId, str](rla);
+    val rj: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rj)) { ir.dnit(?m); ret 1; }
+    val join: id.BlockId = R.unwrap_ok[id.BlockId, str](rj);
+
+    val n: value.Value = value.param(0, i64t);
+    val zero: value.Value = value.const_int(0, i64t);
+    val one: value.Value = value.const_int(1, i64t);
+
+    builder.set_block(?bld, entry);
+    val rcg: R.Result[value.Value, str] = builder.emit_cmp_lt_s(?bld, zero, n);
+    if (R.is_err[value.Value, str](rcg)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, R.unwrap_ok[value.Value, str](rcg), pre, join))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, pre);
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, header);
+    val rphi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
+    if (R.is_err[value.Value, str](rphi)) { ir.dnit(?m); ret 1; }
+    val phi: value.Value = R.unwrap_ok[value.Value, str](rphi);
+    val rc1: R.Result[value.Value, str] = builder.emit_cmp_lt_s(?bld, phi, n);
+    if (R.is_err[value.Value, str](rc1)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, R.unwrap_ok[value.Value, str](rc1), latch, join))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, latch);
+    val rupd: R.Result[value.Value, str] = builder.emit_add(?bld, phi, one);
+    if (R.is_err[value.Value, str](rupd)) { ir.dnit(?m); ret 1; }
+    val upd: value.Value = R.unwrap_ok[value.Value, str](rupd);
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+    builder.set_block(?bld, join);
+    if (R.is_err[bool, str](builder.emit_ret_void(?bld))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, pre, zero))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi, latch, upd))) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    val ra: R.Result[LoopAnalysis, str] = analyze(fn, ?alloc);
+    if (R.is_err[LoopAnalysis, str](ra)) { ir.dnit(?m); ret 1; }
+    var la: LoopAnalysis = R.unwrap_ok[LoopAnalysis, str](ra);
+    if (la.loop_len != 1) { code = 1; }
+    or {
+        val lp: *Loop = ?la.loops[0];
+        if (lp.exit != id.BLOCK_NIL) { code = 1; }
+        if (lp.preheader != pre)     { code = 1; }
+        if (lp.exiting != header)    { code = 1; }
+        if (!lp.is_counted)          { code = 1; }
+    }
     dnit(?la);
     ir.dnit(?m);
     ret code;
