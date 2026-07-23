@@ -31,13 +31,18 @@
 #      the instruction that names it, and incoming param-register lifetimes are
 #      held busy from entry until the `MOV vreg <- preg` that captures them;
 #   5. COPY HINTS: each vreg first defined by a plain register copy records its
-#      source register (step done before the scan);
+#      source register; a loop-carried phi copy additionally records a REVERSE hint
+#      on its source so the web's last def biases onto the loop register (step done
+#      before the scan);
 #   6. ranges are assigned in start order (ties broken by ascending end, so a copy
 #      source dying at the copy colors before its destination). Each range prefers
 #      its copy-source register when the hint can be honored (`pick_hint`), so the
-#      copy collapses to a self-move dropped at rewrite; otherwise a call-crossing
-#      range prefers callee-saved and others caller-saved. On pressure the
-#      lowest-density victim is spilled to a fresh `SLOT_SPILL` frame slot;
+#      copy collapses to a self-move dropped at rewrite; a loop-carried source
+#      instead SHARES its still-live destination's register (`pick_target_hint`),
+#      collapsing the latch copy the forward hint cannot reach across the back edge;
+#      otherwise a call-crossing range prefers callee-saved and others caller-saved.
+#      On pressure the lowest-density victim is spilled to a fresh `SLOT_SPILL` frame
+#      slot;
 #   7. around each `MIR_CALL` - the caller-saved clobber barrier (see its MIR
 #      definition) - any live vreg whose assigned register is caller-saved (or
 #      any FP register) is spilled and reloaded;
@@ -131,26 +136,40 @@ rec BlockSpan {
     end:   i64;
 }
 
-# an allocation hint recording the source register a vreg's defining copy reads
+# an allocation hint recording the source register a vreg's defining copy reads,
+# plus the loop-carried reverse hint (issue #1938)
 #
-# When a vreg is first defined by a plain register copy (`MOV v <- src`), the scan
-# prefers to color `v` onto `src`'s register so the copy collapses to `mov x, x`
-# and is dropped at rewrite. The two source shapes are mutually exclusive per
-# hint; a copy with an immediate or otherwise unhintable source leaves both fields
-# at their empty sentinels.
+# FORWARD hint: when a vreg is first defined by a plain register copy (`MOV v <-
+# src`), the scan prefers to color `v` onto `src`'s register so the copy collapses
+# to `mov x, x` and is dropped at rewrite. The two source shapes are mutually
+# exclusive per hint; a copy with an immediate or otherwise unhintable source
+# leaves both source fields at their empty sentinels.
+#
+# REVERSE hint: for a loop-carried phi copy `MOV d <- v` whose destination `d` is
+# live BEFORE the copy (a loop-header phi target the back edge feeds), the source
+# `v` - the web's last def, colored AFTER `d` - records `d` so the scan biases `v`
+# onto `d`'s register, collapsing the latch copy. Recorded only when the coalesce
+# is interference-safe (see `build_hints`); honored by `pick_target_hint`.
 # ---
-# src_vreg: source vreg id for a `MOV v <- v2` copy, else MIR_VREG_NIL
-# src_preg: source composite physical-register id for a `MOV v <- preg` copy, else -1
-# copy_pos: flat-stream position of the defining copy, or -1 when no hint. the
-#           merged-range model extends a phi destination's live range back over its
-#           whole defining block, so its range start no longer marks the copy; this
-#           exact position is what proves the source vreg dies precisely at the copy
-#           (its register may then transfer to the destination), independent of the
-#           extension
+# src_vreg:     source vreg id for a `MOV v <- v2` copy, else MIR_VREG_NIL
+# src_preg:     source composite physical-register id for a `MOV v <- preg` copy, else -1
+# copy_pos:     flat-stream position of the defining copy, or -1 when no hint. the
+#               merged-range model extends a phi destination's live range back over
+#               its whole defining block, so its range start no longer marks the
+#               copy; this exact position is what proves the source vreg dies
+#               precisely at the copy (its register may then transfer to the
+#               destination), independent of the extension
+# dst_vreg:     reverse hint - the loop-carried copy destination `v` should coalesce
+#               onto, else MIR_VREG_NIL
+# dst_copy_pos: flat-stream position of that latch copy, or -1 when no reverse hint.
+#               bounds the window `v` shares the destination's register over, so the
+#               destination is protected from eviction only until here
 rec CopyHint {
-    src_vreg: u32;
-    src_preg: i32;
-    copy_pos: i64;
+    src_vreg:     u32;
+    src_preg:     i32;
+    copy_pos:     i64;
+    dst_vreg:     u32;
+    dst_copy_pos: i64;
 }
 
 # the per-function allocation scratch state
@@ -231,6 +250,13 @@ rec CopyHint {
 #                       coloring toward it so a coalesced copy collapses to a dropped
 #                       self-move. an empty hint (src_vreg == MIR_VREG_NIL and
 #                       src_preg < 0) is advisory-only and never affects correctness
+# anchor_until:         per-vreg latch-copy position a loop-carried coalesce (the
+#                       reverse hint, #1938) parked a shorter-lived source onto this
+#                       vreg's register, or -1. while it is >= the current range's
+#                       start the source still shares the register, so
+#                       find_spill_victim must not evict this vreg - the one
+#                       correctness guard the reverse coalesce adds. sized
+#                       f.vreg_count
 rec AllocCtx {
     alloc:                *A.Allocator;
     interner:             *intern.Interner;
@@ -268,6 +294,7 @@ rec AllocCtx {
     block_spans:          *BlockSpan;
     vreg_slot_flag:       *bool;
     hints:                *CopyHint;
+    anchor_until:         *i64;
 }
 
 # the allocating function's source name, or "<unknown>" when unresolved
@@ -494,6 +521,7 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
     ctx.block_spans          = nil;
     ctx.vreg_slot_flag       = nil;
     ctx.hints                = nil;
+    ctx.anchor_until         = nil;
 
     val ro: R.Result[*u32, str] = A.allocate[u32](m.alloc, f.block_count::usize);
     if (R.is_err[*u32, str](ro)) { ret R.err[bool, str](R.unwrap_err[*u32, str](ro)); }
@@ -581,11 +609,19 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
     ctx.hints = R.unwrap_ok[*CopyHint, str](rh);
     var hi: u32 = 0;
     for (hi < f.vreg_count) {
-        ctx.hints[hi].src_vreg = mir.MIR_VREG_NIL;
-        ctx.hints[hi].src_preg = -1;
-        ctx.hints[hi].copy_pos = -1;
+        ctx.hints[hi].src_vreg     = mir.MIR_VREG_NIL;
+        ctx.hints[hi].src_preg     = -1;
+        ctx.hints[hi].copy_pos     = -1;
+        ctx.hints[hi].dst_vreg     = mir.MIR_VREG_NIL;
+        ctx.hints[hi].dst_copy_pos = -1;
         hi = hi + 1;
     }
+
+    val rau: R.Result[*i64, str] = A.allocate[i64](m.alloc, f.vreg_count::usize);
+    if (R.is_err[*i64, str](rau)) { ctx_dnit(ctx); ret R.err[bool, str](R.unwrap_err[*i64, str](rau)); }
+    ctx.anchor_until = R.unwrap_ok[*i64, str](rau);
+    var ai: u32 = 0;
+    for (ai < f.vreg_count) { ctx.anchor_until[ai] = -1; ai = ai + 1; }
 
     ret R.ok[bool, str](true);
 }
@@ -676,6 +712,10 @@ fun ctx_dnit(ctx: *AllocCtx) {
     if (ctx.hints != nil && ctx.f.vreg_count > 0) {
         A.deallocate[CopyHint](ctx.alloc, ctx.hints, ctx.f.vreg_count::usize);
         ctx.hints = nil;
+    }
+    if (ctx.anchor_until != nil && ctx.f.vreg_count > 0) {
+        A.deallocate[i64](ctx.alloc, ctx.anchor_until, ctx.f.vreg_count::usize);
+        ctx.anchor_until = nil;
     }
 }
 
@@ -1226,16 +1266,67 @@ fun sweep_dead_movs(tgt: *target.Target, ctx: *AllocCtx) R.Result[bool, str] {
     ret R.ok[bool, str](true);
 }
 
-# record each vreg's copy-source allocation hint
+# true when instruction `mi` reads vreg `v` - as a value operand, a MEM base, or a
+# MEM scaled index. the read side of `compute_use_def`, used by the loop-carried
+# coalescing interference scan (`reads_in_window`)
+fun instr_reads_vreg(mi: *mir.MirInstr, v: u32) bool {
+    val has_def: bool = instr_defines(mi);
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        val op: *mir.MirOperand = ?mi.operands[k];
+        if (op.kind == mir.MIR_OP_VREG) {
+            val is_dst: bool = has_def && k == 0;
+            if (!is_dst && op.vreg == v) { ret true; }
+        }
+        if (op.kind == mir.MIR_OP_MEM) {
+            if (op.vreg != mir.MIR_VREG_NIL && op.vreg == v)                        { ret true; }
+            if (!op.index_is_preg && op.index != mir.MIR_VREG_NIL && op.index == v) { ret true; }
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# true when vreg `d` is read at any flat position strictly between `from` and `to`.
+# the caller guarantees the window is one block's straight line (no control flow
+# enters or leaves it), so a position-order scan is exact - the soundness basis of
+# the loop-carried coalesce: a source may take `d`'s register only when nothing in
+# the window still reads `d`'s value
+fun reads_in_window(ctx: *AllocCtx, d: u32, from: i64, to: i64) bool {
+    var p: i64 = from + 1;
+    for (p < to) {
+        if (instr_reads_vreg(flat_instr(ctx, p::u32), d)) { ret true; }
+        p = p + 1;
+    }
+    ret false;
+}
+
+# record each vreg's copy allocation hints
 #
-# For every vreg first defined by a plain register copy, remember the copy's source
-# (a physical register for `MOV v <- preg`, or a vreg for `MOV v <- v2`) and the
-# copy's flat position, so the scan can bias `v`'s color toward the source. Walks
-# the flat stream so the position is in hand and first-def-wins is first in scan
-# order: a vreg defined by copies on several paths (phi merges) can coalesce onto
-# only one source under the one-merged-range-per-vreg model, so the earliest
-# defining copy sets the hint. A self-copy or immediate source yields no register
-# hint. Runs after flatten / liveness so `flat_instr` and the ranges are available.
+# FORWARD: for every vreg first defined by a plain register copy, remember the
+# copy's source (a physical register for `MOV v <- preg`, or a vreg for `MOV v <-
+# v2`) and the copy's flat position, so the scan can bias `v`'s color toward the
+# source. Walks the flat stream so the position is in hand and first-def-wins is
+# first in scan order: a vreg defined by copies on several paths (phi merges) can
+# coalesce onto only one source under the one-merged-range-per-vreg model, so the
+# earliest defining copy sets the hint. A self-copy or immediate source yields no
+# register hint.
+#
+# REVERSE (loop-carried, #1938): for a copy `MOV d <- v` whose destination `d` is
+# live BEFORE the copy - a loop-header phi target the back edge feeds - the source
+# `v` (the web's last def) records `d` so the scan biases `v` onto `d`'s register,
+# collapsing the latch copy the forward hint cannot reach (when `d` is colored `v`
+# is not yet assigned, so the forward bias never connects across the loop). The
+# reverse hint is set only when the coalesce is interference-safe:
+#   - `v` dies exactly at the copy (its only remaining use), so it never outlives
+#     the register it would share;
+#   - `v`'s def and the copy sit in one block, giving a straight-line window;
+#   - `d` is not read anywhere in that window, so handing its register to `v` (which
+#     the defining instruction overwrites) clobbers no still-needed value.
+# `d` stays live-out past the copy, so its register is busy across `v`'s whole life
+# and `pick_target_hint` need only share it (no transfer, no active entry).
+#
+# Runs after flatten / liveness so `flat_instr` and the ranges are available.
 fun build_hints(tgt: *target.Target, ctx: *AllocCtx) {
     if (tgt.arch.is_reg_move == nil) { ret; }
     val nv: u32 = ctx.f.vreg_count;
@@ -1256,9 +1347,46 @@ fun build_hints(tgt: *target.Target, ctx: *AllocCtx) {
                     ctx.hints[d.vreg].copy_pos = pos::i64;
                 }
             }
+            maybe_reverse_hint(ctx, mi, pos, nv);
         }
         pos = pos + 1;
     }
+}
+
+# record the loop-carried reverse hint for a register copy `MOV d <- s` at `pos`,
+# when `s` may safely coalesce onto `d`'s register (see `build_hints`). `mi` is a
+# confirmed reg copy; both operands must be vregs. No-op unless every safety
+# condition holds, and first-write-wins per source vreg
+fun maybe_reverse_hint(ctx: *AllocCtx, mi: *mir.MirInstr, pos: u32, nv: u32) {
+    val d: *mir.MirOperand = ?mi.operands[0];
+    val s: *mir.MirOperand = ?mi.operands[1];
+    if (d.kind != mir.MIR_OP_VREG || s.kind != mir.MIR_OP_VREG) { ret; }
+    if (d.vreg >= nv || s.vreg >= nv || d.vreg == s.vreg)       { ret; }
+    val dv: u32 = d.vreg;
+    val sv: u32 = s.vreg;
+    if (ctx.hints[sv].dst_vreg != mir.MIR_VREG_NIL) { ret; }
+
+    val p: i64 = pos::i64;
+    val dr: *LiveRange = ?ctx.ranges[dv];
+    val sr: *LiveRange = ?ctx.ranges[sv];
+
+    # d loop-carried: live before the copy (so the forward transfer, which needs d
+    # born at the copy, cannot apply) and live through it (its register stays busy
+    # across s's whole life).
+    if (dr.start >= p || dr.end_pos < p) { ret; }
+    # s dies exactly at this copy - its only remaining use - so it never contends
+    # for the shared register past the latch.
+    if (sr.end_pos != p || sr.start >= p || sr.start < 0) { ret; }
+    # s's def and the copy must share one block, so (sr.start, pos) is a
+    # straight-line window the interference scan reads exactly.
+    if (ctx.flat[sr.start::u32].block != ctx.flat[pos].block) { ret; }
+    # d must not be read between s's def and the copy; otherwise handing d's
+    # register to s (which the defining instruction overwrites) clobbers a value the
+    # window still needs.
+    if (reads_in_window(ctx, dv, sr.start, p)) { ret; }
+
+    ctx.hints[sv].dst_vreg     = dv;
+    ctx.hints[sv].dst_copy_pos = p;
 }
 
 # solve per-block live-in/live-out by a backward dataflow
@@ -1608,6 +1736,23 @@ fun linear_scan(tgt: *target.Target, ctx: *AllocCtx) R.Result[bool, str] {
         # back to the normal class pick.
         if (ctx.hints[v].src_vreg != mir.MIR_VREG_NIL || ctx.hints[v].src_preg >= 0) {
             preg = pick_hint(ctx, v, lr);
+        }
+        # loop-carried reverse hint: share the destination's register instead of
+        # taking a fresh one, collapsing the latch copy. the destination owns the
+        # register across v's whole life, so v is not added to the active set and
+        # claims no busy flag - it rides the destination's occupancy. record the
+        # anchor so find_spill_victim does not evict the destination while shared.
+        if (preg < 0 && ctx.hints[v].dst_vreg != mir.MIR_VREG_NIL) {
+            val rr: i32 = pick_target_hint(ctx, v, lr);
+            if (rr >= 0) {
+                ctx.f.vregs[v].assigned = rr::u32;
+                val dv: u32 = ctx.hints[v].dst_vreg;
+                if (ctx.hints[v].dst_copy_pos > ctx.anchor_until[dv]) {
+                    ctx.anchor_until[dv] = ctx.hints[v].dst_copy_pos;
+                }
+                oi = oi + 1;
+                cnt;
+            }
         }
         if (preg < 0) {
             if (lr.reg_class == REG_CLASS_GP) {
@@ -2057,6 +2202,38 @@ fun transfer_source_reg(ctx: *AllocCtx, src: u32, rid: u32) {
     remove_active(ctx, src);
 }
 
+# resolve the loop-carried reverse hint's target register for source vreg `v` - the
+# register the copy destination `d` already holds, which `v` should share so the
+# latch copy collapses. Returns the composite register id, or -1 when the coalesce
+# cannot be honored.
+#
+# The reverse half of issue #1938. `build_hints` proved the interference safety (v
+# dies at the copy, d is not read across the window), so this only confirms d landed
+# in a register of v's class: d was colored before v (its range starts earlier) and,
+# being live past the copy, still owns that register while v is colored. Unlike
+# `pick_hint` this claims no busy flag and adds no active entry - d's own occupancy
+# already reserves the register across v's whole life - and it imposes no
+# callee-saved test: d's assignment already settled the call-crossing question, and
+# `spill_across_calls` sees v as an ordinary assigned vreg, spilling it in step with
+# d should a caller-saved register meet a call.
+fun pick_target_hint(ctx: *AllocCtx, v: u32, lr: *LiveRange) i32 {
+    val d: u32 = ctx.hints[v].dst_vreg;
+    if (d >= ctx.f.vreg_count)                       { ret -1; }
+    if (is_spilled(ctx, d) || vreg_has_slot(ctx, d)) { ret -1; }
+    val a: u32 = ctx.f.vregs[d].assigned;
+    if (a == mir.MIR_VREG_NIL)                       { ret -1; }
+
+    val rid: i32 = a::i32;
+    val rclass: i32 = isa.regid_class(rid);
+    val idx: u32 = isa.regid_index(rid)::u32;
+    if (lr.reg_class == REG_CLASS_GP) {
+        if (rclass != isa.REG_CLASS_ID_GP || idx >= ctx.gp_count) { ret -1; }
+    } or {
+        if (rclass != isa.REG_CLASS_ID_XMM || idx >= ctx.fp_count) { ret -1; }
+    }
+    ret rid;
+}
+
 # true when vreg `v` is in the active set
 fun vreg_in_active(ctx: *AllocCtx, v: u32) bool {
     var i: u32 = 0;
@@ -2282,7 +2459,10 @@ fun remove_active(ctx: *AllocCtx, v: u32) {
 
 # choose the active range to evict - prefer a non-call-crossing
 # one, then the lowest use density (fewest uses per instruction spanned). returns
-# the victim vreg id, or MIR_VREG_NIL when no candidate of the class is active
+# the victim vreg id, or MIR_VREG_NIL when no candidate of the class is active. a
+# vreg anchoring a still-live loop-carried coalesce (its register shared by a source
+# that has not yet passed its latch copy, #1938) is never a victim: evicting it
+# would reassign a register a phantom-coalesced source still owns
 fun find_spill_victim(ctx: *AllocCtx, reg_class: u32) u32 {
     var best: u32 = mir.MIR_VREG_NIL;
     var best_density: i64 = POS_MAX;
@@ -2291,7 +2471,8 @@ fun find_spill_victim(ctx: *AllocCtx, reg_class: u32) u32 {
     for (ai < ctx.active_count) {
         val v: u32 = ctx.active[ai];
         val lr: *LiveRange = ?ctx.ranges[v];
-        if (lr.reg_class != reg_class) { ai = ai + 1; cnt; }
+        if (lr.reg_class != reg_class)            { ai = ai + 1; cnt; }
+        if (ctx.anchor_until[v] >= ctx.cur_start) { ai = ai + 1; cnt; }
 
         val span: i64 = lr.end_pos - lr.start;
         var density: i64 = lr.use_count::i64 * 1000;
