@@ -454,7 +454,10 @@ fun macho_segname(kind: of.SectionKind) str {
     ret "__DATA";
 }
 
-# the Mach-O section name for an abstract section kind
+# the Mach-O section name for a coalesced-by-kind loadable section. SK_DEBUG is not
+# coalesced (each debug section keeps its own name under __DWARF via
+# `write_dwarf_sectname`), so it never routes here; the "__debug" tail is the
+# spelling of last resort for an unnamed debug section
 # ---
 # kind: the abstract section kind
 # ret:  the 16-byte-clamped section name
@@ -634,6 +637,63 @@ fun fixed16_equals(buf: *u8, off: usize, s: str) bool {
     ret true;
 }
 
+# write a Mach-O __DWARF section-name field for an abstract debug section into the
+# fixed 16-byte field at `off`. the format-neutral DWARF producer names its sections
+# ELF-style (".debug_info"); the Mach-O __DWARF segment spells them "__debug_info",
+# the leading "." becoming "__". a name already in Mach-O form ("__debug*") is
+# written verbatim, so the mapping is idempotent. every standard DWARF section name
+# fits the 16-byte field ("__debug_loclists" and "__debug_rnglists" are exactly 16)
+# ---
+# buf:  destination buffer
+# off:  byte offset of the 16-byte sectname field
+# name: the debug section name (ELF-canonical ".debug_*" or Mach-O "__debug_*")
+fun write_dwarf_sectname(buf: *u8, off: usize, name: str) {
+    memory.raw_zero((buf::usize + off)::ptr, 16);
+    if (name == nil) { ret; }
+    if (name[0] == '.') {
+        buf[off]     = '_';
+        buf[off + 1] = '_';
+        var i: usize = 1;
+        var w: usize = 2;
+        for (w < 16 && name[i] != 0) {
+            buf[off + w] = name[i];
+            i = i + 1;
+            w = w + 1;
+        }
+        ret;
+    }
+    var n: usize = str_len(name);
+    if (n > 16) { n = 16; }
+    var j: usize = 0;
+    for (j < n) { buf[off + j] = name[j]; j = j + 1; }
+}
+
+# map a raw Mach-O section name to the abstract model's ELF-canonical spelling,
+# writing the NUL-terminated result into `out` (>= 17 bytes) and returning it as a
+# str. Mach-O names DWARF sections "__debug_info" under the __DWARF segment; the
+# shared object model and the linker's name-keyed debug merge use ".debug_info", so
+# a "__debug*" name maps back (leading "__" -> "."). every other name is copied
+# verbatim, since the linker re-canonicalizes the loadable kinds by kind
+# ---
+# raw: the NUL-terminated section name read from the section_64 entry
+# out: destination buffer (>= 17 bytes)
+# ret: `out` as a NUL-terminated str
+fun canonical_sectname(raw: str, out: *u8) str {
+    if (raw[0] == '_' && raw[1] == '_' && raw[2] == 'd' && raw[3] == 'e' && raw[4] == 'b'
+        && raw[5] == 'u' && raw[6] == 'g') {
+        out[0] = '.';
+        var i: usize = 2;
+        var w: usize = 1;
+        for (raw[i] != 0) { out[w] = raw[i]; i = i + 1; w = w + 1; }
+        out[w] = 0;
+        ret out::str;
+    }
+    var j: usize = 0;
+    for (raw[j] != 0) { out[j] = raw[j]; j = j + 1; }
+    out[j] = 0;
+    ret out::str;
+}
+
 # the byte length of the symbol string table: a leading NUL plus each name
 # ---
 # img: the object image whose symbol names are measured
@@ -685,9 +745,9 @@ fun is_extdef_sym(sym: *of.Symbol) bool {
 # img:      the object image the symbol is drawn from
 # idx:      index of the symbol within the image symbol table
 # sec_addr: per-input-section in-segment base addresses
-# kind_out: per-kind coalesced output-section index (recovers the 1-based n_sect)
+# sec_out:  per-input-section output-section index (recovers the 1-based n_sect)
 fun write_nlist(buf: *u8, sym_off: usize, str_base: usize, str_pos: *usize,
-                img: *of.ObjectImage, idx: u32, sec_addr: *u64, kind_out: *u32) {
+                img: *of.ObjectImage, idx: u32, sec_addr: *u64, sec_out: *u32) {
     val sym: *of.Symbol = ?img.symbols[idx];
     val name: str = bin.resolve_name(img.interner, sym.name);
     var n_strx: u32 = 0;
@@ -708,10 +768,11 @@ fun write_nlist(buf: *u8, sym_off: usize, str_base: usize, str_pos: *usize,
     var n_value: u64 = 0;
     if (sym.section != of.SECTION_EXTERNAL && sym.section < img.section_count) {
         n_type = N_SECT;
-        # the symbol's defining input section was coalesced by kind into one
-        # output section; n_sect is that 1-based coalesced index (within the
-        # 255-section byte), and n_value its absolute in-segment address.
-        n_sect = (kind_out[img.sections[sym.section].kind::u32] + 1)::u8;
+        # the symbol's defining input section maps to one output section (loadable
+        # kinds coalesce; each SK_DEBUG section stays distinct); n_sect is that
+        # 1-based output index (within the 255-section byte), and n_value its
+        # absolute in-segment address.
+        n_sect = (sec_out[sym.section] + 1)::u8;
         n_value = sec_addr[sym.section] + sym.offset::u64;
         if ((sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0) { n_desc = N_WEAK_DEF; }
     }
@@ -733,10 +794,13 @@ fun write_nlist(buf: *u8, sym_off: usize, str_base: usize, str_pos: *usize,
 # fold a relocation's addend into its in-place section field
 #
 # Mach-O has no RELA addend field, so the addend lives in the patched bytes. The
-# 8-byte UNSIGNED form holds the full addend; an x86_64 pc-relative field is
-# next-instruction-relative, so the on-wire value is `A + 4` (a `call sym` with
-# abstract addend -4 writes 0). arm64's page/page-offset/branch kinds carry their
-# addend in a separate ARM64_RELOC_ADDEND entry, so nothing is folded here.
+# 8-byte UNSIGNED form (RK_ABS64) holds the full addend and the 4-byte UNSIGNED form
+# (RK_ABS32, the DWARF cross-section reference) the 32-bit one, both absolute and
+# in-place on either arch. an x86_64 pc-relative field is next-instruction-relative,
+# so the on-wire value is `A + 4` (a `call sym` with abstract addend -4 writes 0).
+# arm64's page/page-offset/branch kinds carry their addend in a separate
+# ARM64_RELOC_ADDEND entry, so nothing is folded here. this mirrors `recover_addend`
+# on the parse side
 # ---
 # buf:     the output buffer
 # field:   byte offset of the patch field
@@ -746,6 +810,10 @@ fun write_nlist(buf: *u8, sym_off: usize, str_base: usize, str_pos: *usize,
 fun fold_inplace_addend(buf: *u8, field: usize, arch_id: u32, kind: of.RelocKind, addend: i64) {
     if (kind == of.RK_ABS64) {
         if (addend != 0) { bin.write_u64_le(buf, field, bin.read_u64_le(buf, field) + addend::u64); }
+        ret;
+    }
+    if (kind == of.RK_ABS32) {
+        if (addend != 0) { bin.write_u32_le(buf, field, bin.read_u32_le(buf, field) + (addend::u64)::u32); }
         ret;
     }
     if (arch_is_arm64(arch_id)) { ret; }
@@ -767,6 +835,29 @@ fun write_reloc_info(buf: *u8, off: usize, address: u32, symnum: u32, pcrel: u32
     bin.write_u32_le(buf, off, address);
     val word: u32 = (symnum & 0xFFFFFF) | (pcrel << 24) | (length << 25) | (extn << 27) | (r_type << 28);
     bin.write_u32_le(buf, off + 4, word);
+}
+
+# one output section of a relocatable Mach-O object. loadable kinds coalesce their
+# input sections into a single output; each non-allocated SK_DEBUG section is its
+# own output under __DWARF
+# ---
+# kind:   the output section's abstract kind
+# srcsec: the source input-section index for an SK_DEBUG output, else 0xFFFFFFFF
+# addr:   in-segment virtual address
+# size:   in-segment byte size
+# fileo:  file offset of the section's bytes (0 for zero-fill __bss)
+# align:  the strictest alignment among the section's members
+# reloff: file offset of the section's relocation_info array (0 when none)
+# nrel:   number of relocation_info entries
+rec MachoOutSec {
+    kind:   of.SectionKind;
+    srcsec: u32;
+    addr:   u64;
+    size:   u64;
+    fileo:  usize;
+    align:  u32;
+    reloff: usize;
+    nrel:   u32;
 }
 
 # serialize an ObjectImage to a relocatable Mach-O (MH_OBJECT) file
@@ -801,52 +892,54 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     # which for a non-trivial module reaches the hundreds, overflowing that byte
     # and corrupting (or dropping, when the index lands on a multiple of 256) every
     # local constant-pool symbol past the limit. a real Mach-O object groups its
-    # content by kind into a handful of sections, so coalesce the input sections
-    # into one output section per kind, laying each kind's members contiguously and
-    # remapping every symbol and relocation onto the coalesced section. the
-    # canonical order keeps the zero-fill __bss section last, where the segment's
-    # file image ends.
-    var korder: [6]of.SectionKind;
-    korder[0] = of.SK_TEXT;
-    korder[1] = of.SK_RODATA;
-    korder[2] = of.SK_RELRO;
-    korder[3] = of.SK_DATA;
-    korder[4] = of.SK_DEBUG;
-    korder[5] = of.SK_BSS;
+    # loadable content by kind into a handful of sections, so coalesce the loadable
+    # input sections into one output section per kind, laying each kind's members
+    # contiguously and remapping every symbol and relocation onto the coalesced
+    # section. non-allocated SK_DEBUG sections are the exception: each is its own
+    # output under __DWARF so .debug_info/.debug_line/... stay distinct and readable
+    # (mirroring the ELF and COFF writers). the canonical order lays the loadable
+    # kinds first, then the debug sections in image order, then the zero-fill __bss
+    # last, where the segment's file image ends.
+    var nd_order: [4]of.SectionKind;
+    nd_order[0] = of.SK_TEXT;
+    nd_order[1] = of.SK_RODATA;
+    nd_order[2] = of.SK_RELRO;
+    nd_order[3] = of.SK_DATA;
 
-    # kind -> coalesced output-section index (0xFFFFFFFF when the kind is absent),
-    # and the kind of each coalesced section in emission order. indexed by kind
-    # value, so sized to the full kind count. SK_RELRO opens its own bucket
+    # count the output sections: one per present loadable kind, one per SK_DEBUG
+    # section, and one __bss when present. SK_RELRO opens its own bucket
     # (__DATA_CONST,__const), distinct from SK_RODATA (__TEXT,__const), so the
     # emit -> parse round-trip recovers the RELRO/RODATA distinction.
-    var kind_to_out: [6]u32;
-    var ki: u32 = 0;
-    for (ki < of.SK_COUNT) { kind_to_out[ki] = 0xFFFFFFFF; ki = ki + 1; }
-    var out_kind: [6]of.SectionKind;
-    var num_out:  u32 = 0;
-    var ko: u32 = 0;
-    for (ko < 6) {
-        var present: bool = false;
+    var num_out: u32 = 0;
+    var ci: u32 = 0;
+    for (ci < 4) {
         var sp: u32 = 0;
         for (sp < num_secs) {
-            if (img.sections[sp].kind == korder[ko]) { present = true; brk; }
+            if (img.sections[sp].kind == nd_order[ci]) { num_out = num_out + 1; brk; }
             sp = sp + 1;
         }
-        if (present) {
-            kind_to_out[korder[ko]::u32] = num_out;
-            out_kind[num_out] = korder[ko];
-            num_out = num_out + 1;
-        }
-        ko = ko + 1;
+        ci = ci + 1;
     }
+    var sp_dbg: u32 = 0;
+    for (sp_dbg < num_secs) {
+        if (img.sections[sp_dbg].kind == of.SK_DEBUG) { num_out = num_out + 1; }
+        sp_dbg = sp_dbg + 1;
+    }
+    var has_bss: bool = false;
+    var sp_bss: u32 = 0;
+    for (sp_bss < num_secs) {
+        if (img.sections[sp_bss].kind == of.SK_BSS) { has_bss = true; brk; }
+        sp_bss = sp_bss + 1;
+    }
+    if (has_bss) { num_out = num_out + 1; }
 
-    # load commands: one segment (with the coalesced sections), symtab, dysymtab.
+    # load commands: one segment (with the output sections), symtab, dysymtab.
     val seg_cmd_size: usize = SEGMENT_CMD_64_SIZE + num_out::usize * SECTION_64_SIZE;
     val sizeofcmds:   usize = seg_cmd_size + SYMTAB_CMD_SIZE + DYSYMTAB_CMD_SIZE;
     val header_end:   usize = MACH_HEADER_64_SIZE + sizeofcmds;
 
     # per-input-section absolute vm address and file offset within the single
-    # segment; both advance through the coalesced section the input section joins.
+    # segment; both advance through the output section the input section joins.
     val res_addr: R.Result[*u64, str] = A.zallocate[u64](alloc, (num_secs + 1)::usize);
     if (R.is_err[*u64, str](res_addr)) { ret R.err[bool, str]("macho: section address table alloc failed"); }
     var sec_addr: *u64 = R.unwrap_ok[*u64, str](res_addr);
@@ -858,34 +951,89 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     }
     var data_off: *usize = R.unwrap_ok[*usize, str](res_doff);
 
-    # per-coalesced-section vm address, vm size, file offset, alignment, relocation
-    # array offset, and relocation_info entry count.
-    var out_addr:   [6]u64;
-    var out_size:   [6]u64;
-    var out_fileo:  [6]usize;
-    var out_align:  [6]u32;
-    var out_reloff: [6]usize;
-    var out_nrel:   [6]u32;
+    # per-input-section output-section index (recovers the 1-based n_sect and keys
+    # member matching in the layout/relocation passes).
+    val res_s2o: R.Result[*u32, str] = A.zallocate[u32](alloc, (num_secs + 1)::usize);
+    if (R.is_err[*u32, str](res_s2o)) {
+        A.deallocate[u64](alloc, sec_addr, (num_secs + 1)::usize);
+        A.deallocate[usize](alloc, data_off, (num_secs + 1)::usize);
+        ret R.err[bool, str]("macho: section map alloc failed");
+    }
+    var sec_to_out: *u32 = R.unwrap_ok[*u32, str](res_s2o);
 
-    # vm layout: lay every coalesced section in canonical order, its members (the
-    # input sections of that kind) contiguous and each individually aligned. the
-    # section's alignment is the strictest of its members'.
+    # per-output-section layout, sized to the computed output count.
+    val res_out: R.Result[*MachoOutSec, str] = A.zallocate[MachoOutSec](alloc, num_out::usize);
+    if (R.is_err[*MachoOutSec, str](res_out)) {
+        A.deallocate[u64](alloc, sec_addr, (num_secs + 1)::usize);
+        A.deallocate[usize](alloc, data_off, (num_secs + 1)::usize);
+        A.deallocate[u32](alloc, sec_to_out, (num_secs + 1)::usize);
+        ret R.err[bool, str]("macho: output section table alloc failed");
+    }
+    var out: *MachoOutSec = R.unwrap_ok[*MachoOutSec, str](res_out);
+
+    # assign each output section and map every input section onto it, in emission
+    # order: loadable kinds, then the SK_DEBUG sections (image order), then __bss.
+    var no: u32 = 0;
+    ci = 0;
+    for (ci < 4) {
+        var present: bool = false;
+        var sp: u32 = 0;
+        for (sp < num_secs) {
+            if (img.sections[sp].kind == nd_order[ci]) { present = true; brk; }
+            sp = sp + 1;
+        }
+        if (present) {
+            out[no].kind   = nd_order[ci];
+            out[no].srcsec = 0xFFFFFFFF;
+            sp = 0;
+            for (sp < num_secs) {
+                if (img.sections[sp].kind == nd_order[ci]) { sec_to_out[sp] = no; }
+                sp = sp + 1;
+            }
+            no = no + 1;
+        }
+        ci = ci + 1;
+    }
+    var sp_d: u32 = 0;
+    for (sp_d < num_secs) {
+        if (img.sections[sp_d].kind == of.SK_DEBUG) {
+            out[no].kind   = of.SK_DEBUG;
+            out[no].srcsec = sp_d;
+            sec_to_out[sp_d] = no;
+            no = no + 1;
+        }
+        sp_d = sp_d + 1;
+    }
+    if (has_bss) {
+        out[no].kind   = of.SK_BSS;
+        out[no].srcsec = 0xFFFFFFFF;
+        var sp: u32 = 0;
+        for (sp < num_secs) {
+            if (img.sections[sp].kind == of.SK_BSS) { sec_to_out[sp] = no; }
+            sp = sp + 1;
+        }
+        no = no + 1;
+    }
+
+    # vm layout: lay every output section in emission order, its members (the input
+    # sections mapped to it) contiguous and each individually aligned. the section's
+    # alignment is the strictest of its members'.
     var vm: u64 = 0;
     var s:  u32 = 0;
-    ko = 0;
+    var ko: u32 = 0;
     for (ko < num_out) {
         var a_sec: u32 = 1;
         var sp: u32 = 0;
         for (sp < num_secs) {
-            if (img.sections[sp].kind == out_kind[ko] && img.sections[sp].align > a_sec) { a_sec = img.sections[sp].align; }
+            if (sec_to_out[sp] == ko && img.sections[sp].align > a_sec) { a_sec = img.sections[sp].align; }
             sp = sp + 1;
         }
-        out_align[ko] = a_sec;
+        out[ko].align = a_sec;
         vm = bin.align_up_u64(vm, a_sec::u64);
-        out_addr[ko] = vm;
+        out[ko].addr = vm;
         sp = 0;
         for (sp < num_secs) {
-            if (img.sections[sp].kind != out_kind[ko]) { sp = sp + 1; cnt; }
+            if (sec_to_out[sp] != ko) { sp = sp + 1; cnt; }
             var a: u32 = img.sections[sp].align;
             if (a < 1) { a = 1; }
             vm = bin.align_up_u64(vm, a::u64);
@@ -893,22 +1041,22 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
             vm = vm + img.sections[sp].len::u64;
             sp = sp + 1;
         }
-        out_size[ko] = vm - out_addr[ko];
+        out[ko].size = vm - out[ko].addr;
         ko = ko + 1;
     }
     val seg_vmsize: u64 = vm;
 
-    # file layout: the non-zero-fill coalesced sections carry bytes after the
-    # header; __bss occupies vm only, so its members keep a zero file offset. each
-    # member's file offset mirrors its in-section vm offset, so the in-place addend
-    # fields and the parsed-back relocation sites stay aligned.
+    # file layout: the non-zero-fill output sections carry bytes after the header;
+    # __bss occupies vm only, so its members keep a zero file offset. each member's
+    # file offset mirrors its in-section vm offset, so the in-place addend fields and
+    # the parsed-back relocation sites stay aligned.
     val seg_fileoff: usize = bin.align_up(header_end, 8);
     var file: usize = seg_fileoff;
     ko = 0;
     for (ko < num_out) {
         var sp: u32 = 0;
-        if (out_kind[ko] == of.SK_BSS) {
-            out_fileo[ko] = 0;
+        if (out[ko].kind == of.SK_BSS) {
+            out[ko].fileo = 0;
             for (sp < num_secs) {
                 if (img.sections[sp].kind == of.SK_BSS) { data_off[sp] = 0; }
                 sp = sp + 1;
@@ -916,19 +1064,19 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
             ko = ko + 1;
             cnt;
         }
-        file = bin.align_up(file, out_align[ko]::usize);
-        out_fileo[ko] = file;
+        file = bin.align_up(file, out[ko].align::usize);
+        out[ko].fileo = file;
         for (sp < num_secs) {
-            if (img.sections[sp].kind != out_kind[ko]) { sp = sp + 1; cnt; }
-            data_off[sp] = out_fileo[ko] + (sec_addr[sp] - out_addr[ko])::usize;
+            if (sec_to_out[sp] != ko) { sp = sp + 1; cnt; }
+            data_off[sp] = out[ko].fileo + (sec_addr[sp] - out[ko].addr)::usize;
             sp = sp + 1;
         }
-        file = out_fileo[ko] + out_size[ko]::usize;
+        file = out[ko].fileo + out[ko].size::usize;
         ko = ko + 1;
     }
     val seg_filesize: usize = file - seg_fileoff;
 
-    # relocation arrays follow the section data, 4-byte aligned, one per coalesced
+    # relocation arrays follow the section data, 4-byte aligned, one per output
     # section (covering every member's relocations).
     var roff: usize = bin.align_up(file, 4);
     ko = 0;
@@ -936,12 +1084,12 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
         var n: u32 = 0;
         var sp: u32 = 0;
         for (sp < num_secs) {
-            if (img.sections[sp].kind == out_kind[ko]) { n = n + reloc_entries_for_section(img, sp, arch_id); }
+            if (sec_to_out[sp] == ko) { n = n + reloc_entries_for_section(img, sp, arch_id); }
             sp = sp + 1;
         }
-        out_nrel[ko] = n;
-        if (n > 0) { out_reloff[ko] = roff; roff = roff + n::usize * RELOC_INFO_SIZE; }
-        or         { out_reloff[ko] = 0; }
+        out[ko].nrel = n;
+        if (n > 0) { out[ko].reloff = roff; roff = roff + n::usize * RELOC_INFO_SIZE; }
+        or         { out[ko].reloff = 0; }
         ko = ko + 1;
     }
 
@@ -955,6 +1103,8 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     if (R.is_err[*u8, str](res_buf)) {
         A.deallocate[u64](alloc, sec_addr, (num_secs + 1)::usize);
         A.deallocate[usize](alloc, data_off, (num_secs + 1)::usize);
+        A.deallocate[u32](alloc, sec_to_out, (num_secs + 1)::usize);
+        A.deallocate[MachoOutSec](alloc, out, num_out::usize);
         ret R.err[bool, str]("macho: output buffer alloc failed");
     }
     var buf: *u8 = R.unwrap_ok[*u8, str](res_buf);
@@ -983,22 +1133,29 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     bin.write_u32_le(buf, lc + 64, num_out);
     bin.write_u32_le(buf, lc + 68, 0);
 
-    # section_64 entries, one per coalesced section. a zero-fill (__bss) section
-    # keeps a zero file offset; the rest point at their coalesced byte run.
+    # section_64 entries, one per output section. a zero-fill (__bss) section keeps
+    # a zero file offset; the rest point at their byte run. an SK_DEBUG section lands
+    # in __DWARF under its Mach-O name (".debug_info" -> "__debug_info"), while the
+    # loadable kinds coalesce under their fixed segment/section names.
     var sh: usize = lc + SEGMENT_CMD_64_SIZE;
     ko = 0;
     for (ko < num_out) {
-        write_fixed16(buf, sh, macho_sectname(out_kind[ko]));
-        write_fixed16(buf, sh + 16, macho_segname(out_kind[ko]));
-        bin.write_u64_le(buf, sh + 32, out_addr[ko]);
-        bin.write_u64_le(buf, sh + 40, out_size[ko]);
+        if (out[ko].kind == of.SK_DEBUG) {
+            write_dwarf_sectname(buf, sh, bin.resolve_name(img.interner, img.sections[out[ko].srcsec].name));
+        }
+        or {
+            write_fixed16(buf, sh, macho_sectname(out[ko].kind));
+        }
+        write_fixed16(buf, sh + 16, macho_segname(out[ko].kind));
+        bin.write_u64_le(buf, sh + 32, out[ko].addr);
+        bin.write_u64_le(buf, sh + 40, out[ko].size);
         var foff: u32 = 0;
-        if (out_kind[ko] != of.SK_BSS) { foff = out_fileo[ko]::u32; }
+        if (out[ko].kind != of.SK_BSS) { foff = out[ko].fileo::u32; }
         bin.write_u32_le(buf, sh + 48, foff);
-        bin.write_u32_le(buf, sh + 52, align_log2(out_align[ko]));
-        bin.write_u32_le(buf, sh + 56, out_reloff[ko]::u32);
-        bin.write_u32_le(buf, sh + 60, out_nrel[ko]);
-        bin.write_u32_le(buf, sh + 64, macho_section_flags(out_kind[ko]));
+        bin.write_u32_le(buf, sh + 52, align_log2(out[ko].align));
+        bin.write_u32_le(buf, sh + 56, out[ko].reloff::u32);
+        bin.write_u32_le(buf, sh + 60, out[ko].nrel);
+        bin.write_u32_le(buf, sh + 64, macho_section_flags(out[ko].kind));
         bin.write_u32_le(buf, sh + 68, 0);
         bin.write_u32_le(buf, sh + 72, 0);
         bin.write_u32_le(buf, sh + 76, 0);
@@ -1067,6 +1224,8 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
         if (R.is_err[*u32, str](res_remap)) {
             A.deallocate[u64](alloc, sec_addr, (num_secs + 1)::usize);
             A.deallocate[usize](alloc, data_off, (num_secs + 1)::usize);
+            A.deallocate[u32](alloc, sec_to_out, (num_secs + 1)::usize);
+            A.deallocate[MachoOutSec](alloc, out, num_out::usize);
             A.deallocate[u8](alloc, buf, total_size);
             ret R.err[bool, str]("macho: symbol remap alloc failed");
         }
@@ -1082,7 +1241,7 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     for (symi < num_syms) {
         if (!is_local_sym(?img.symbols[symi])) { symi = symi + 1; cnt; }
         if (remap != nil) { remap[symi] = nlist_idx; }
-        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr, ?kind_to_out[0]);
+        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr, sec_to_out);
         sym_off = sym_off + NLIST_64_SIZE;
         nlist_idx = nlist_idx + 1;
         symi = symi + 1;
@@ -1092,7 +1251,7 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     for (symi < num_syms) {
         if (!is_extdef_sym(?img.symbols[symi])) { symi = symi + 1; cnt; }
         if (remap != nil) { remap[symi] = nlist_idx; }
-        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr, ?kind_to_out[0]);
+        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr, sec_to_out);
         sym_off = sym_off + NLIST_64_SIZE;
         nlist_idx = nlist_idx + 1;
         symi = symi + 1;
@@ -1102,24 +1261,24 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     for (symi < num_syms) {
         if (img.symbols[symi].section != of.SECTION_EXTERNAL) { symi = symi + 1; cnt; }
         if (remap != nil) { remap[symi] = nlist_idx; }
-        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr, ?kind_to_out[0]);
+        write_nlist(buf, sym_off, strtab_off, ?str_pos, img, symi, sec_addr, sec_to_out);
         sym_off = sym_off + NLIST_64_SIZE;
         nlist_idx = nlist_idx + 1;
         symi = symi + 1;
     }
 
-    # relocation_info arrays, one per coalesced section: each member's relocations
-    # rebased onto the coalesced section (r_address offset by the member's position
+    # relocation_info arrays, one per output section: each member's relocations
+    # rebased onto the output section (r_address offset by the member's position
     # within it), with an ARM64_RELOC_ADDEND entry ahead of a relocation whose
     # addend cannot live in-place.
     ko = 0;
     for (ko < num_out) {
-        if (out_reloff[ko] == 0) { ko = ko + 1; cnt; }
-        var ro: usize = out_reloff[ko];
+        if (out[ko].reloff == 0) { ko = ko + 1; cnt; }
+        var ro: usize = out[ko].reloff;
         var sp: u32 = 0;
         for (sp < num_secs) {
-            if (img.sections[sp].kind != out_kind[ko]) { sp = sp + 1; cnt; }
-            val base: u32 = (sec_addr[sp] - out_addr[ko])::u32;
+            if (sec_to_out[sp] != ko) { sp = sp + 1; cnt; }
+            val base: u32 = (sec_addr[sp] - out[ko].addr)::u32;
             var ri: u32 = 0;
             for (ri < img.reloc_count) {
                 if (img.relocations[ri].section == sp) {
@@ -1145,6 +1304,8 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     if (remap != nil) { A.deallocate[u32](alloc, remap, num_syms::usize); }
     A.deallocate[u64](alloc, sec_addr, (num_secs + 1)::usize);
     A.deallocate[usize](alloc, data_off, (num_secs + 1)::usize);
+    A.deallocate[u32](alloc, sec_to_out, (num_secs + 1)::usize);
+    A.deallocate[MachoOutSec](alloc, out, num_out::usize);
 
     val wr: R.Result[bool, str] = write_file(img.interner, alloc, path, buf, total_size, "macho: object");
     A.deallocate[u8](alloc, buf, total_size);
@@ -1460,7 +1621,7 @@ fun macho_dwarf_write(buf: *u8, itn: *intern.Interner, debug: *of.Section, debug
     var sh: usize = lc + SEGMENT_CMD_64_SIZE;
     var di: u32 = 0;
     for (di < debug_count) {
-        write_fixed16(buf, sh, bin.resolve_name(itn, debug[di].name));
+        write_dwarf_sectname(buf, sh, bin.resolve_name(itn, debug[di].name));
         write_fixed16(buf, sh + 16, "__DWARF");
         bin.write_u64_le(buf, sh + 32, 0);
         bin.write_u64_le(buf, sh + 40, debug[di].len::u64);
@@ -2405,8 +2566,9 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
                   debug: *of.Section, debug_count: u32, path: *u8, name: *u8) R.Result[bool, str] {
     if (isa_vt == nil) { ret R.err[bool, str]("macho: nil dyn-exec isa"); }
     if (path == nil)   { ret R.err[bool, str]("macho: nil dyn-exec path"); }
-    # the debug-section channel is accepted for seam conformance but not yet framed
-    # into the dyld image (non-mapped __DWARF segment + code_limit coverage); see #1887.
+    # the debug-section channel is framed into a non-mapped __DWARF segment placed
+    # below the code signature (so code_limit covers the DWARF bytes), as on the
+    # static exec path.
     if (dyn == nil)    { ret R.err[bool, str]("macho: nil dynamic plan"); }
     if (itn == nil)    { ret R.err[bool, str]("macho: no interner for dyn-exec"); }
     if (seg_count == 0) { ret R.err[bool, str]("macho: dyn-exec has no load segments"); }
@@ -2951,13 +3113,18 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
                 val is_data_const: bool = fixed16_equals(buf, sh + 16, "__DATA_CONST");
                 val kind:    of.SectionKind = macho_kind_from(flags, is_text, is_data_const);
 
-                # intern the section name from the section_64 entry; the linker
-                # re-canonicalizes by kind, so the exact name is informational.
+                # intern the section name from the section_64 entry, mapping a Mach-O
+                # "__debug*" name back to the abstract model's ELF-canonical
+                # ".debug*" so the linker's name-keyed debug merge recovers each
+                # section distinctly; the loadable kinds re-canonicalize by kind, so
+                # their exact name is informational.
                 var name_buf: [17]u8;
                 var ni: usize = 0;
                 for (ni < 16) { name_buf[ni] = buf[sh + ni]; ni = ni + 1; }
                 name_buf[16] = 0;
-                val rin: R.Result[intern.StrId, str] = intern.intern(itn, (?name_buf[0])::str);
+                var canon_buf: [17]u8;
+                val canon: str = canonical_sectname((?name_buf[0])::str, ?canon_buf[0]);
+                val rin: R.Result[intern.StrId, str] = intern.intern(itn, canon);
                 if (R.is_err[intern.StrId, str](rin)) {
                     if (sec_base != nil) { A.deallocate[u64](alloc, sec_base, sec_n::usize); }
                     ret R.err[bool, str](R.unwrap_err[intern.StrId, str](rin));
@@ -4133,10 +4300,12 @@ test "mach.lang.target.of.macho:dyn_exec" {
 }
 
 # emit_exec frames the linker's non-allocated debug sections into a non-mapped
-# __DWARF segment whose bytes sit below the code signature. the of.macho parser
+# __DWARF segment whose bytes sit below the code signature, spelling each ELF-canonical
+# ".debug_*" name in Mach-O form ("__debug_*") on the way out. the of.macho parser
 # re-reads the emitted executable and recovers each debug section as SK_DEBUG with
-# byte-equal payloads under its own name. falsifies a writer that drops the debug
-# channel, mis-tags the sections, or places them outside the segment
+# byte-equal payloads under its canonical name. falsifies a writer that drops the debug
+# channel, mis-tags the sections, collapses their names, or places them outside the
+# segment
 fun ts_exec_debug_roundtrip() u8 {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -4160,8 +4329,8 @@ fun ts_exec_debug_roundtrip() u8 {
     var line_bytes: [3]u8;
     line_bytes[0] = 0x11; line_bytes[1] = 0x22; line_bytes[2] = 0x33;
 
-    val nm_info: R.Result[intern.StrId, str] = intern.intern(?itn, "__debug_info");
-    val nm_line: R.Result[intern.StrId, str] = intern.intern(?itn, "__debug_line");
+    val nm_info: R.Result[intern.StrId, str] = intern.intern(?itn, ".debug_info");
+    val nm_line: R.Result[intern.StrId, str] = intern.intern(?itn, ".debug_line");
     if (R.is_err[intern.StrId, str](nm_info)) { ret 1; }
     if (R.is_err[intern.StrId, str](nm_line)) { ret 1; }
     val id_info: intern.StrId = R.unwrap_ok[intern.StrId, str](nm_info);
@@ -4184,6 +4353,10 @@ fun ts_exec_debug_roundtrip() u8 {
     fs.temp_close_and_remove(?tf);
     if (R.is_err[Vector[u8], str](rb)) { ret 1; }
     val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    # the emitted __DWARF sections carry the Mach-O spelling, not the ELF-canonical one.
+    if (!t_bytes_contain(buf.data, 0, buf.len, "__debug_info")) { ret 1; }
+    if (!t_bytes_contain(buf.data, 0, buf.len, "__debug_line")) { ret 1; }
 
     # re-read the emitted executable through the mach-o parser.
     var img: of.ObjectImage;
@@ -4224,5 +4397,115 @@ fun ts_exec_debug_roundtrip() u8 {
 # recovers as byte-equal SK_DEBUG sections
 test "mach.lang.target.of.macho.emit_exec:debug_dwarf_roundtrip" {
     if (ts_exec_debug_roundtrip() != 0) { ret 1; }
+    ret 0;
+}
+
+# emit_object keeps each SK_DEBUG section distinct under __DWARF rather than
+# collapsing them by kind, spelling the ELF-canonical ".debug_*" names in Mach-O form
+# ("__debug_*"); the parser recovers them canonically and distinctly. an RK_ABS32
+# cross-section reference (the DWARF strp/loclists form) round-trips its in-place
+# 4-byte addend, exercising the fold/recover symmetry that keeps the linker's
+# name-keyed debug merge and .debug_str dedup coherent. falsifies a writer that
+# collapses debug sections into one __debug blob or drops the RK_ABS32 addend
+fun ts_object_debug_roundtrip() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    var text_bytes: [8]u8;
+    var k: usize = 0;
+    for (k < 8) { text_bytes[k] = 0x90; k = k + 1; }
+    # .debug_info: a 4-byte strp field (zeroed placeholder) the writer folds the
+    # RK_ABS32 addend into, plus 4 bytes of padding.
+    var info_bytes: [8]u8;
+    k = 0;
+    for (k < 8) { info_bytes[k] = 0; k = k + 1; }
+    var str_bytes: [6]u8;
+    str_bytes[0] = 'h'; str_bytes[1] = 'i'; str_bytes[2] = 0;
+    str_bytes[3] = 'y'; str_bytes[4] = 'o'; str_bytes[5] = 0;
+
+    var secs: [3]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 8; secs[0].align = 16;
+    secs[1].name = t_intern(?i, ".debug_info"); secs[1].kind = of.SK_DEBUG;
+    secs[1].bytes = ?info_bytes[0]; secs[1].len = 8; secs[1].align = 1;
+    secs[2].name = t_intern(?i, ".debug_str"); secs[2].kind = of.SK_DEBUG;
+    secs[2].bytes = ?str_bytes[0]; secs[2].len = 6; secs[2].align = 1;
+
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "_main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 8; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    # the .debug_str anchor the strp reloc targets: a local symbol at the section base.
+    syms[1].name = t_intern(?i, "l.debug_str"); syms[1].section = 2; syms[1].offset = 0;
+    syms[1].size = 0; syms[1].flags = 0;
+
+    # a strp: RK_ABS32 into .debug_info at offset 0, targeting the .debug_str anchor
+    # with the string's byte offset (3) as the addend.
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 1; relocs[0].offset = 0; relocs[0].kind = of.RK_ABS32;
+    relocs[0].symbol = syms[1].name; relocs[0].addend = 3;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 3;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_odbg");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    # three distinct output sections (text + two debug), not a collapsed __debug blob.
+    if (bin.read_u32_le(buf.data, MACH_HEADER_64_SIZE + 64) != 3) { ret 1; }
+    # the debug sections carry the Mach-O spelling under __DWARF.
+    if (!t_bytes_contain(buf.data, 0, buf.len, "__debug_info")) { ret 1; }
+    if (!t_bytes_contain(buf.data, 0, buf.len, "__debug_str"))  { ret 1; }
+    if (!t_bytes_contain(buf.data, 0, buf.len, "__DWARF"))      { ret 1; }
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+
+    if (out.section_count != 3) { ret 1; }
+
+    # both debug sections survive distinctly under their ELF-canonical names.
+    val cid_info: intern.StrId = t_intern(?i, ".debug_info");
+    val cid_str:  intern.StrId = t_intern(?i, ".debug_str");
+    var found_info: bool = false;
+    var found_str:  bool = false;
+    var si: u32 = 0;
+    for (si < out.section_count) {
+        val sec: *of.Section = ?out.sections[si];
+        if (sec.kind == of.SK_DEBUG && sec.name == cid_info) { found_info = true; }
+        if (sec.kind == of.SK_DEBUG && sec.name == cid_str)  { found_str = true; }
+        si = si + 1;
+    }
+    if (!found_info || !found_str) { ret 1; }
+
+    # the RK_ABS32 strp addend survives the in-place fold/recover round-trip.
+    if (out.reloc_count != 1) { ret 1; }
+    if (out.relocations[0].kind != of.RK_ABS32) { ret 1; }
+    if (out.relocations[0].addend != 3)         { ret 1; }
+    ret 0;
+}
+
+# emit_object keeps DWARF sections distinct under __DWARF (never collapsing them into
+# one __debug section) and round-trips the RK_ABS32 cross-section addend
+test "mach.lang.target.of.macho.emit_object:debug_dwarf_roundtrip" {
+    if (ts_object_debug_roundtrip() != 0) { ret 1; }
     ret 0;
 }
