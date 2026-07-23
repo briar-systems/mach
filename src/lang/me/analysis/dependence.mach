@@ -1,0 +1,643 @@
+# mach.lang.me.analysis.dependence: cross-iteration memory-dependence analysis
+#
+# Over a counted loop recognized by `mach.lang.me.analysis.loops`, decide whether
+# the loop is a unit-stride, offset-0 element-wise map -- `dst[i] = f(src0[i], ...)`
+# -- carrying no cross-iteration memory dependence, and collect its memory accesses.
+#
+# The verdict is deliberately conservative (child 1's lesson): a positive
+# INDEPENDENT verdict is returned ONLY when every memory access in the loop is a
+# non-volatile load/store through `gep(base, iv)` -- a single index equal to the
+# loop's induction variable (offset 0, unit stride) over a loop-invariant base --
+# and the loop carries no register recurrence beyond the induction variable and no
+# opaque memory effect (call / asm / memzero). Anything unproven is DEPENDENT.
+#
+# A DEPENDENT verdict means "do not vectorize". An INDEPENDENT verdict means "safe
+# to vectorize IF the runtime alias check discharges base aliasing" -- distinct
+# pointer bases cannot be proven disjoint at compile time (mach has no `restrict`),
+# so the caller pairs this with the runtime alias guard in the versioning module.
+#
+# This module is a callable analysis; it is not wired into the pipeline (nothing
+# imports it there), so it does not affect emitted code.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.me.ir;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.value;
+use ir_type: mach.lang.me.ir.type;
+use loops: mach.lang.me.analysis.loops;
+
+# one recognized affine memory access `base[iv]` in a counted loop
+# ---
+# instr:     the load or store instruction
+# gep:       the OP_GEP computing `base[iv]` that the access dereferences
+# base:      the loop-invariant base pointer (the gep's first operand)
+# stride_ty: the gep's source pointee type -- the per-element stride, reused to
+#            compute the accessed byte range for the alias guard
+# elem_ty:   the loaded / stored value type
+# bytes:     the contiguous element footprint in bytes -- the gep stride and the
+#            access width, which INDEPENDENT requires to be equal (an exact tiling)
+# is_store:  true for a store, false for a load
+pub rec MemAccess {
+    instr:     id.InstructionId;
+    gep:       id.InstructionId;
+    base:      value.Value;
+    stride_ty: ir_type.IrTypeId;
+    elem_ty:   ir_type.IrTypeId;
+    bytes:     u32;
+    is_store:  bool;
+}
+
+# the dependence verdict for a loop
+pub def DepVerdict: u8;
+# unit-stride offset-0 element-wise map, no cross-iteration dependence: safe to
+# vectorize once base aliasing is discharged by the runtime alias guard
+pub val DEP_INDEPENDENT: DepVerdict = 0;
+# a proven or unprovable cross-iteration dependence / opaque effect: do not vectorize
+pub val DEP_DEPENDENT:   DepVerdict = 1;
+
+# the memory-dependence analysis of one counted loop
+# ---
+# alloc:        allocator backing `accesses`
+# verdict:      DEP_INDEPENDENT or DEP_DEPENDENT
+# accesses:     the recognized element-wise accesses, meaningful only when the
+#               verdict is DEP_INDEPENDENT (owned)
+# access_count: number of accesses
+# access_cap:   allocated capacity of `accesses`
+pub rec DepInfo {
+    alloc:        *A.Allocator;
+    verdict:      DepVerdict;
+    accesses:     *MemAccess;
+    access_count: u32;
+    access_cap:   u32;
+}
+
+# analyze loop `loop_ix` for cross-iteration memory dependence
+#
+# Never mutates `fn`. Returns a DepInfo whose verdict is DEP_INDEPENDENT only for
+# the proven unit-stride offset-0 element-wise shape; every other loop (including a
+# non-counted one) is DEP_DEPENDENT. Allocation failure is the only err.
+# ---
+# fn:      the function
+# la:      the loop analysis for `fn`
+# loop_ix: index into la.loops
+# types:   the module's IR type table, for the target-independent scalar footprints
+# alloc:   allocator for the accesses array
+# ret:     the dependence info, or an allocation error
+pub fun analyze_dependence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, types: *ir_type.IrTypeTable, alloc: *A.Allocator) R.Result[DepInfo, str] {
+    var d: DepInfo;
+    d.alloc        = alloc;
+    d.verdict      = DEP_DEPENDENT;
+    d.accesses     = nil;
+    d.access_count = 0;
+    d.access_cap   = 0;
+
+    if (loop_ix >= la.loop_len) { ret R.ok[DepInfo, str](d); }
+    val lp: *loops.Loop = ?la.loops[loop_ix];
+
+    # only a counted loop with a unit-stride induction variable is a candidate.
+    if (!lp.is_counted) { ret R.ok[DepInfo, str](d); }
+    if (lp.iv.step.kind != value.VAL_CONST_INT) { ret R.ok[DepInfo, str](d); }
+    if (lp.iv.step.data.int_lit != 1) { ret R.ok[DepInfo, str](d); }
+
+    # the induction variable must be the loop's ONLY register recurrence: the header
+    # carries exactly one phi (the iv) and no other loop block carries any phi. an
+    # extra phi is a reduction / scan carried across iterations (child 4's concern).
+    if (!single_iv_recurrence(fn, la, loop_ix)) { ret R.ok[DepInfo, str](d); }
+
+    # upper-bound the accesses array by the loop's instruction count.
+    var total: u32 = 0;
+    var bi: u32 = 0;
+    for (bi < lp.body_len) {
+        total = total + fn.blocks[lp.body[bi]::u32].instr_count;
+        bi = bi + 1;
+    }
+    if (total > 0) {
+        val ra: R.Result[*MemAccess, str] = A.allocate[MemAccess](alloc, total::usize);
+        if (R.is_err[*MemAccess, str](ra)) { ret R.err[DepInfo, str](R.unwrap_err[*MemAccess, str](ra)); }
+        d.accesses  = R.unwrap_ok[*MemAccess, str](ra);
+        d.access_cap = total;
+    }
+
+    # walk every body instruction; any opaque effect or non-element-wise access
+    # forces the conservative DEPENDENT verdict.
+    bi = 0;
+    for (bi < lp.body_len) {
+        val blk: *ir.Block = ?fn.blocks[lp.body[bi]::u32];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val iid: id.InstructionId = blk.instructions[ii];
+            val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, iid);
+            if (O.is_none[*instruction.Instruction](opt)) { dep_dnit(?d); ret dependent(alloc); }
+            val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
+
+            if (inst.kind == instruction.OP_CALL || inst.kind == instruction.OP_ASM || inst.kind == instruction.OP_MEMZERO) {
+                dep_dnit(?d); ret dependent(alloc);
+            }
+            if (inst.kind == instruction.OP_LOAD || inst.kind == instruction.OP_STORE) {
+                var acc: MemAccess;
+                if (!classify_access(fn, la, loop_ix, iid, inst, types, ?acc)) { dep_dnit(?d); ret dependent(alloc); }
+                d.accesses[d.access_count] = acc;
+                d.access_count = d.access_count + 1;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    # every pair of accesses to the SAME base must have an identical footprint. with
+    # stride == width and offset 0 already enforced per access, equal bytes means the
+    # same per-iteration address window; a same-base pair with differing widths (an
+    # i8 load and an i64 store on `a`) is a genuine cross-iteration RAW and the guard
+    # cannot fix it (the ranges are not disjoint, they coincide).
+    var i: u32 = 0;
+    for (i < d.access_count) {
+        var j: u32 = i + 1;
+        for (j < d.access_count) {
+            if (equal(d.accesses[i].base, d.accesses[j].base) && d.accesses[i].bytes != d.accesses[j].bytes) {
+                dep_dnit(?d); ret dependent(alloc);
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    d.verdict = DEP_INDEPENDENT;
+    ret R.ok[DepInfo, str](d);
+}
+
+# structural equality of two values by kind and payload: same instruction /
+# parameter / global / function reference, or the same inline constant (floats by
+# bit pattern, so -0.0 and NaN behave). Borrowed byte-blob and serialized aggregate
+# constants compare unequal. Ignores the `ty` field: identity is the referent, not
+# the use-site stamp. The single value-identity predicate the auto-vectorization
+# modules share (dependence's same-base check, versioning's alias-pairing); it lives
+# here rather than in ir/value.mach so this feature stays dormant / byte-identical
+# until child 3 wires the vectorizer in (an emitted ir/value.mach helper would grow
+# the compiler binary). Mirrors the private copies in constfold / cse.
+# ---
+# a:   first value
+# b:   second value
+# ret: true when a and b denote the same value
+pub fun equal(a: value.Value, b: value.Value) bool {
+    if (a.kind != b.kind)                { ret false; }
+    if (a.kind == value.VAL_INSTR)       { ret a.data.instr == b.data.instr; }
+    if (a.kind == value.VAL_PARAM)       { ret a.data.param_ix == b.data.param_ix; }
+    if (a.kind == value.VAL_CONST_INT)   { ret a.data.int_lit == b.data.int_lit; }
+    if (a.kind == value.VAL_CONST_NULL)  { ret true; }
+    if (a.kind == value.VAL_CONST_FLOAT) { ret (a.data.float_lit:~u64) == (b.data.float_lit:~u64); }
+    if (a.kind == value.VAL_GLOBAL)      { ret a.data.global_ix == b.data.global_ix; }
+    if (a.kind == value.VAL_FN)          { ret a.data.fn_ix == b.data.fn_ix; }
+    ret false;
+}
+
+# the byte footprint of a scalar integer / float type, target-independently (bits /
+# 8); 0 for any other type (pointer, aggregate, vector, void, sub-byte), which is
+# not a vectorizable element and forces a DEPENDENT verdict
+fun scalar_bytes(types: *ir_type.IrTypeTable, id: ir_type.IrTypeId) u32 {
+    val opt: O.Option[*ir_type.IrType] = ir_type.get(types, id);
+    if (O.is_none[*ir_type.IrType](opt)) { ret 0; }
+    val t: *ir_type.IrType = O.unwrap[*ir_type.IrType](opt);
+    if (t.kind == ir_type.IRT_INT || t.kind == ir_type.IRT_FLOAT) { ret t.data.bits / 8; }
+    ret 0;
+}
+
+# a fresh conservative DEPENDENT verdict with no accesses
+fun dependent(alloc: *A.Allocator) R.Result[DepInfo, str] {
+    var d: DepInfo;
+    d.alloc        = alloc;
+    d.verdict      = DEP_DEPENDENT;
+    d.accesses     = nil;
+    d.access_count = 0;
+    d.access_cap   = 0;
+    ret R.ok[DepInfo, str](d);
+}
+
+# release the accesses array
+# ---
+# d: the dependence info to tear down
+pub fun dep_dnit(d: *DepInfo) {
+    if (d.accesses != nil && d.access_cap > 0) {
+        A.deallocate[MemAccess](d.alloc, d.accesses, d.access_cap::usize);
+        d.accesses = nil;
+    }
+    d.access_count = 0;
+    d.access_cap   = 0;
+}
+
+# true when the loop's only phi recurrence is the induction variable: the header
+# has exactly one phi (the iv) and no other loop block has any phi
+fun single_iv_recurrence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32) bool {
+    val lp: *loops.Loop = ?la.loops[loop_ix];
+    var bi: u32 = 0;
+    for (bi < lp.body_len) {
+        val bid: id.BlockId = lp.body[bi];
+        val blk: *ir.Block = ?fn.blocks[bid::u32];
+        if (bid == lp.header) {
+            if (blk.phi_count != 1) { ret false; }
+            if (blk.phis[0] != lp.iv.phi) { ret false; }
+        } or {
+            if (blk.phi_count != 0) { ret false; }
+        }
+        bi = bi + 1;
+    }
+    ret true;
+}
+
+# classify a load/store as an element-wise `base[iv]` access, filling `out` on
+# success. requires: non-volatile; the pointer is a single-index gep whose index is
+# exactly the induction-variable phi (offset 0, unit stride) and whose base is
+# loop-invariant.
+fun classify_access(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, iid: id.InstructionId, inst: *instruction.Instruction, types: *ir_type.IrTypeTable, out: *MemAccess) bool {
+    if ((inst.flags & instruction.INSTR_FLAG_VOLATILE) != 0) { ret false; }
+    val is_store: bool = inst.kind == instruction.OP_STORE;
+
+    # the pointer operand: LOAD = [ptr], STORE = [value, ptr]
+    var ptr: value.Value;
+    if (is_store) {
+        if (inst.operand_count < 2) { ret false; }
+        ptr = inst.operands[1];
+    } or {
+        if (inst.operand_count < 1) { ret false; }
+        ptr = inst.operands[0];
+    }
+    if (ptr.kind != value.VAL_INSTR) { ret false; }
+
+    val gopt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, ptr.data.instr);
+    if (O.is_none[*instruction.Instruction](gopt)) { ret false; }
+    val gep: *instruction.Instruction = O.unwrap[*instruction.Instruction](gopt);
+    if (gep.kind != instruction.OP_GEP || gep.operand_count != 2) { ret false; }
+
+    val base: value.Value = gep.operands[0];
+    val idx:  value.Value = gep.operands[1];
+    val lp: *loops.Loop = ?la.loops[loop_ix];
+    # index must be exactly the induction variable (offset 0)
+    if (idx.kind != value.VAL_INSTR || idx.data.instr != lp.iv.phi) { ret false; }
+    # base must be loop-invariant
+    if (!loops.is_invariant(la, loop_ix, base)) { ret false; }
+
+    # a store produces no value, so its element type is the stored value's type;
+    # a load's element type is its own result type
+    var elem_ty: ir_type.IrTypeId = inst.ty;
+    if (is_store) { elem_ty = inst.operands[0].ty; }
+
+    # the access must exactly tile memory: the gep's per-index stride equals the
+    # access width, both a supported scalar footprint. a wider-than-stride access
+    # (a 1-byte stride feeding an 8-byte store) overlaps its own windows across
+    # iterations; a narrower one leaves gaps -- neither is a contiguous unit map.
+    val stride_bytes: u32 = scalar_bytes(types, gep.aux_ty);
+    val width_bytes:  u32 = scalar_bytes(types, elem_ty);
+    if (stride_bytes == 0 || width_bytes == 0) { ret false; }
+    if (stride_bytes != width_bytes)           { ret false; }
+
+    out.instr     = iid;
+    out.gep       = ptr.data.instr;
+    out.base      = base;
+    out.stride_ty = gep.aux_ty;
+    out.elem_ty   = elem_ty;
+    out.bytes     = width_bytes;
+    out.is_store  = is_store;
+    ret true;
+}
+
+use std.allocator.page;
+use mach.lang.intern;
+use mach.lang.me.ir.builder;
+
+# build a counted-loop skeleton (entry -> header -> body -> exit) with an i64
+# induction variable `{0, +, 1}` tested `iv < param0`; the caller fills `body` and
+# wires the iv's body-incoming + `br header`. Returns 0 on success.
+fun mk_skeleton(m: *ir.Module, bld: *builder.Builder, i64t: ir_type.IrTypeId, o_entry: *id.BlockId, o_header: *id.BlockId, o_body: *id.BlockId, o_exit: *id.BlockId, o_iv: *value.Value) i32 {
+    val re: R.Result[id.BlockId, str] = builder.new_block(bld);
+    if (R.is_err[id.BlockId, str](re)) { ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](re);
+    val rh: R.Result[id.BlockId, str] = builder.new_block(bld);
+    if (R.is_err[id.BlockId, str](rh)) { ret 1; }
+    val header: id.BlockId = R.unwrap_ok[id.BlockId, str](rh);
+    val rb: R.Result[id.BlockId, str] = builder.new_block(bld);
+    if (R.is_err[id.BlockId, str](rb)) { ret 1; }
+    val body: id.BlockId = R.unwrap_ok[id.BlockId, str](rb);
+    val rx: R.Result[id.BlockId, str] = builder.new_block(bld);
+    if (R.is_err[id.BlockId, str](rx)) { ret 1; }
+    val exit: id.BlockId = R.unwrap_ok[id.BlockId, str](rx);
+
+    val n: value.Value = value.param(0, i64t);
+
+    builder.set_block(bld, entry);
+    if (R.is_err[bool, str](builder.emit_br(bld, header))) { ret 1; }
+
+    builder.set_block(bld, header);
+    val rphi: R.Result[value.Value, str] = builder.emit_phi(bld, i64t);
+    if (R.is_err[value.Value, str](rphi)) { ret 1; }
+    val iv: value.Value = R.unwrap_ok[value.Value, str](rphi);
+    val rc: R.Result[value.Value, str] = builder.emit_cmp_lt_s(bld, iv, n);
+    if (R.is_err[value.Value, str](rc)) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_cbr(bld, R.unwrap_ok[value.Value, str](rc), body, exit))) { ret 1; }
+
+    builder.set_block(bld, exit);
+    if (R.is_err[bool, str](builder.emit_ret_void(bld))) { ret 1; }
+
+    if (R.is_err[bool, str](builder.phi_add_incoming(bld, iv, entry, value.const_int(0, i64t)))) { ret 1; }
+
+    @o_entry = entry; @o_header = header; @o_body = body; @o_exit = exit; @o_iv = iv;
+    ret 0;
+}
+
+# emit `dst[iv] = ...` style access geps in the body; helper to keep tests terse:
+# gep(base, iv) with an i64 element stride.
+fun body_gep(bld: *builder.Builder, base: value.Value, iv: value.Value, i64t: ir_type.IrTypeId) R.Result[value.Value, str] {
+    var ix: [1]value.Value;
+    ix[0] = iv;
+    ret builder.emit_gep(bld, base, i64t, ?ix[0], 1);
+}
+
+# an element-wise `a[i] = b[i] + c[i]` over three distinct pointer-parameter bases
+# with unit stride carries no cross-iteration dependence: INDEPENDENT, three accesses.
+test "mach.lang.me.analysis.dependence:elementwise_independent" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    var entry: id.BlockId; var header: id.BlockId; var body: id.BlockId; var exit: id.BlockId; var iv: value.Value;
+    if (mk_skeleton(?m, ?bld, i64t, ?entry, ?header, ?body, ?exit, ?iv) != 0) { ir.dnit(?m); ret 1; }
+
+    val a: value.Value = value.param(1, ptrt);
+    val b: value.Value = value.param(2, ptrt);
+    val c: value.Value = value.param(3, ptrt);
+
+    builder.set_block(?bld, body);
+    val rgb: R.Result[value.Value, str] = body_gep(?bld, b, iv, i64t);
+    if (R.is_err[value.Value, str](rgb)) { ir.dnit(?m); ret 1; }
+    val rlb: R.Result[value.Value, str] = builder.emit_load(?bld, R.unwrap_ok[value.Value, str](rgb), i64t);
+    if (R.is_err[value.Value, str](rlb)) { ir.dnit(?m); ret 1; }
+    val rgc: R.Result[value.Value, str] = body_gep(?bld, c, iv, i64t);
+    if (R.is_err[value.Value, str](rgc)) { ir.dnit(?m); ret 1; }
+    val rlc: R.Result[value.Value, str] = builder.emit_load(?bld, R.unwrap_ok[value.Value, str](rgc), i64t);
+    if (R.is_err[value.Value, str](rlc)) { ir.dnit(?m); ret 1; }
+    val rs: R.Result[value.Value, str] = builder.emit_add(?bld, R.unwrap_ok[value.Value, str](rlb), R.unwrap_ok[value.Value, str](rlc));
+    if (R.is_err[value.Value, str](rs)) { ir.dnit(?m); ret 1; }
+    val rga: R.Result[value.Value, str] = body_gep(?bld, a, iv, i64t);
+    if (R.is_err[value.Value, str](rga)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?bld, R.unwrap_ok[value.Value, str](rs), R.unwrap_ok[value.Value, str](rga)))) { ir.dnit(?m); ret 1; }
+    val ru: R.Result[value.Value, str] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](ru)) { ir.dnit(?m); ret 1; }
+    val upd: value.Value = R.unwrap_ok[value.Value, str](ru);
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, iv, body, upd))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
+    if (R.is_err[loops.LoopAnalysis, str](ral)) { ir.dnit(?m); ret 1; }
+    var la: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ral);
+    val rd: R.Result[DepInfo, str] = analyze_dependence(fn, ?la, 0, ?m.types, ?alloc);
+    if (R.is_err[DepInfo, str](rd)) { loops.dnit(?la); ir.dnit(?m); ret 1; }
+    var di: DepInfo = R.unwrap_ok[DepInfo, str](rd);
+    if (di.verdict != DEP_INDEPENDENT) { code = 1; }
+    if (di.access_count != 3)          { code = 1; }
+    dep_dnit(?di);
+    loops.dnit(?la);
+    ir.dnit(?m);
+    ret code;
+}
+
+# a loop-carried access `a[i] = a[i-1]` (load index iv-1, not iv) is a cross-iteration
+# dependence: DEPENDENT.
+test "mach.lang.me.analysis.dependence:loop_carried_dependent" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    var entry: id.BlockId; var header: id.BlockId; var body: id.BlockId; var exit: id.BlockId; var iv: value.Value;
+    if (mk_skeleton(?m, ?bld, i64t, ?entry, ?header, ?body, ?exit, ?iv) != 0) { ir.dnit(?m); ret 1; }
+
+    val a: value.Value = value.param(1, ptrt);
+    builder.set_block(?bld, body);
+    val rim1: R.Result[value.Value, str] = builder.emit_add(?bld, iv, value.const_int(0xFFFFFFFFFFFFFFFF, i64t));
+    if (R.is_err[value.Value, str](rim1)) { ir.dnit(?m); ret 1; }
+    val rgs: R.Result[value.Value, str] = body_gep(?bld, a, R.unwrap_ok[value.Value, str](rim1), i64t);
+    if (R.is_err[value.Value, str](rgs)) { ir.dnit(?m); ret 1; }
+    val rl: R.Result[value.Value, str] = builder.emit_load(?bld, R.unwrap_ok[value.Value, str](rgs), i64t);
+    if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
+    val rgd: R.Result[value.Value, str] = body_gep(?bld, a, iv, i64t);
+    if (R.is_err[value.Value, str](rgd)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?bld, R.unwrap_ok[value.Value, str](rl), R.unwrap_ok[value.Value, str](rgd)))) { ir.dnit(?m); ret 1; }
+    val ru: R.Result[value.Value, str] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](ru)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, iv, body, R.unwrap_ok[value.Value, str](ru)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
+    if (R.is_err[loops.LoopAnalysis, str](ral)) { ir.dnit(?m); ret 1; }
+    var la: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ral);
+    val rd: R.Result[DepInfo, str] = analyze_dependence(fn, ?la, 0, ?m.types, ?alloc);
+    if (R.is_err[DepInfo, str](rd)) { loops.dnit(?la); ir.dnit(?m); ret 1; }
+    var di: DepInfo = R.unwrap_ok[DepInfo, str](rd);
+    if (di.verdict != DEP_DEPENDENT) { code = 1; }
+    dep_dnit(?di);
+    loops.dnit(?la);
+    ir.dnit(?m);
+    ret code;
+}
+
+# a reduction loop carries a second header phi (the accumulator) beyond the induction
+# variable: conservatively DEPENDENT (child 4 handles reductions).
+test "mach.lang.me.analysis.dependence:reduction_dependent" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    var entry: id.BlockId; var header: id.BlockId; var body: id.BlockId; var exit: id.BlockId; var iv: value.Value;
+    if (mk_skeleton(?m, ?bld, i64t, ?entry, ?header, ?body, ?exit, ?iv) != 0) { ir.dnit(?m); ret 1; }
+
+    # add a second header phi (accumulator) -> two recurrences
+    builder.set_block(?bld, header);
+    val racc: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
+    if (R.is_err[value.Value, str](racc)) { ir.dnit(?m); ret 1; }
+    val acc: value.Value = R.unwrap_ok[value.Value, str](racc);
+
+    val a: value.Value = value.param(1, ptrt);
+    builder.set_block(?bld, body);
+    val rg: R.Result[value.Value, str] = body_gep(?bld, a, iv, i64t);
+    if (R.is_err[value.Value, str](rg)) { ir.dnit(?m); ret 1; }
+    val rl: R.Result[value.Value, str] = builder.emit_load(?bld, R.unwrap_ok[value.Value, str](rg), i64t);
+    if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
+    val racu: R.Result[value.Value, str] = builder.emit_add(?bld, acc, R.unwrap_ok[value.Value, str](rl));
+    if (R.is_err[value.Value, str](racu)) { ir.dnit(?m); ret 1; }
+    val acc_upd: value.Value = R.unwrap_ok[value.Value, str](racu);
+    val ru: R.Result[value.Value, str] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](ru)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, iv, body, R.unwrap_ok[value.Value, str](ru)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, acc, entry, value.const_int(0, i64t)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, acc, body, acc_upd))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
+    if (R.is_err[loops.LoopAnalysis, str](ral)) { ir.dnit(?m); ret 1; }
+    var la: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ral);
+    val rd: R.Result[DepInfo, str] = analyze_dependence(fn, ?la, 0, ?m.types, ?alloc);
+    if (R.is_err[DepInfo, str](rd)) { loops.dnit(?la); ir.dnit(?m); ret 1; }
+    var di: DepInfo = R.unwrap_ok[DepInfo, str](rd);
+    if (di.verdict != DEP_DEPENDENT) { code = 1; }
+    dep_dnit(?di);
+    loops.dnit(?la);
+    ir.dnit(?m);
+    ret code;
+}
+
+# two accesses to the SAME base with different element widths (an i8 store and an
+# i64 store on `a`) are not the same per-iteration address window -- a genuine
+# cross-iteration overlap the alias guard cannot fix: DEPENDENT.
+test "mach.lang.me.analysis.dependence:same_base_diff_width_dependent" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+    val rt8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
+    if (R.is_err[ir_type.IrTypeId, str](rt8)) { ir.dnit(?m); ret 1; }
+    val i8t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt8);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    var entry: id.BlockId; var header: id.BlockId; var body: id.BlockId; var exit: id.BlockId; var iv: value.Value;
+    if (mk_skeleton(?m, ?bld, i64t, ?entry, ?header, ?body, ?exit, ?iv) != 0) { ir.dnit(?m); ret 1; }
+
+    val a: value.Value = value.param(1, ptrt);
+    builder.set_block(?bld, body);
+    var ix8: [1]value.Value; ix8[0] = iv;
+    val rg8: R.Result[value.Value, str] = builder.emit_gep(?bld, a, i8t, ?ix8[0], 1);
+    if (R.is_err[value.Value, str](rg8)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?bld, value.const_int(0, i8t), R.unwrap_ok[value.Value, str](rg8)))) { ir.dnit(?m); ret 1; }
+    var ix64: [1]value.Value; ix64[0] = iv;
+    val rg64: R.Result[value.Value, str] = builder.emit_gep(?bld, a, i64t, ?ix64[0], 1);
+    if (R.is_err[value.Value, str](rg64)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?bld, value.const_int(0, i64t), R.unwrap_ok[value.Value, str](rg64)))) { ir.dnit(?m); ret 1; }
+    val ru: R.Result[value.Value, str] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](ru)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, iv, body, R.unwrap_ok[value.Value, str](ru)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
+    if (R.is_err[loops.LoopAnalysis, str](ral)) { ir.dnit(?m); ret 1; }
+    var la: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ral);
+    val rd: R.Result[DepInfo, str] = analyze_dependence(fn, ?la, 0, ?m.types, ?alloc);
+    if (R.is_err[DepInfo, str](rd)) { loops.dnit(?la); ir.dnit(?m); ret 1; }
+    var di: DepInfo = R.unwrap_ok[DepInfo, str](rd);
+    if (di.verdict != DEP_DEPENDENT) { code = 1; }
+    dep_dnit(?di);
+    loops.dnit(?la);
+    ir.dnit(?m);
+    ret code;
+}
+
+# a wider-than-stride access (a 1-byte gep stride feeding an 8-byte store) overlaps
+# its own window across iterations, so it is not a contiguous unit map: DEPENDENT.
+test "mach.lang.me.analysis.dependence:wider_than_stride_dependent" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+    val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+    val rt8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
+    if (R.is_err[ir_type.IrTypeId, str](rt8)) { ir.dnit(?m); ret 1; }
+    val i8t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt8);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    var entry: id.BlockId; var header: id.BlockId; var body: id.BlockId; var exit: id.BlockId; var iv: value.Value;
+    if (mk_skeleton(?m, ?bld, i64t, ?entry, ?header, ?body, ?exit, ?iv) != 0) { ir.dnit(?m); ret 1; }
+
+    val a: value.Value = value.param(1, ptrt);
+    builder.set_block(?bld, body);
+    var ix: [1]value.Value; ix[0] = iv;
+    val rg: R.Result[value.Value, str] = builder.emit_gep(?bld, a, i8t, ?ix[0], 1);
+    if (R.is_err[value.Value, str](rg)) { ir.dnit(?m); ret 1; }
+    # store an 8-byte value through a 1-byte-stride gep
+    if (R.is_err[bool, str](builder.emit_store(?bld, value.const_int(0, i64t), R.unwrap_ok[value.Value, str](rg)))) { ir.dnit(?m); ret 1; }
+    val ru: R.Result[value.Value, str] = builder.emit_add(?bld, iv, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](ru)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, iv, body, R.unwrap_ok[value.Value, str](ru)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_br(?bld, header))) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
+    if (R.is_err[loops.LoopAnalysis, str](ral)) { ir.dnit(?m); ret 1; }
+    var la: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ral);
+    val rd: R.Result[DepInfo, str] = analyze_dependence(fn, ?la, 0, ?m.types, ?alloc);
+    if (R.is_err[DepInfo, str](rd)) { loops.dnit(?la); ir.dnit(?m); ret 1; }
+    var di: DepInfo = R.unwrap_ok[DepInfo, str](rd);
+    if (di.verdict != DEP_DEPENDENT) { code = 1; }
+    dep_dnit(?di);
+    loops.dnit(?la);
+    ir.dnit(?m);
+    ret code;
+}
