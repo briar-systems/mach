@@ -438,14 +438,18 @@ fun unsupported_type_message(itn: *intern.Interner, alloc: *A.Allocator, r_type:
                            r_type, "macho: unsupported relocation type");
 }
 
-# the Mach-O (segname, sectname) pair for an abstract section kind. read-only data
-# lands in __TEXT,__const; debug in __DWARF; bss/data in __DATA
+# the Mach-O (segname, sectname) pair for an abstract section kind. plain read-only
+# data lands in __TEXT,__const; relocated read-only data (RELRO) in
+# __DATA_CONST,__const, the segment dyld rebases then re-protects read-only; debug
+# in __DWARF; bss/data in __DATA. keeping RELRO in its own section is what lets the
+# emit -> parse round-trip recover SK_RELRO rather than collapse it into SK_RODATA
 # ---
 # kind: the abstract section kind
 # ret:  the 16-byte-clamped segment name
 fun macho_segname(kind: of.SectionKind) str {
     if (kind == of.SK_TEXT)   { ret "__TEXT"; }
     if (kind == of.SK_RODATA) { ret "__TEXT"; }
+    if (kind == of.SK_RELRO)  { ret "__DATA_CONST"; }
     if (kind == of.SK_DEBUG)  { ret "__DWARF"; }
     ret "__DATA";
 }
@@ -458,6 +462,7 @@ fun macho_sectname(kind: of.SectionKind) str {
     if (kind == of.SK_TEXT)   { ret "__text"; }
     if (kind == of.SK_DATA)   { ret "__data"; }
     if (kind == of.SK_RODATA) { ret "__const"; }
+    if (kind == of.SK_RELRO)  { ret "__const"; }
     if (kind == of.SK_BSS)    { ret "__bss"; }
     ret "__debug";
 }
@@ -474,28 +479,21 @@ fun macho_section_flags(kind: of.SectionKind) u32 {
     ret 0;
 }
 
-# recover an abstract section kind from a parsed section's flags and segment name
+# recover an abstract section kind from a parsed section's flags and segment name.
+# a __DATA_CONST section is RELRO; a __TEXT non-instruction section is plain
+# rodata; so the emit -> parse round-trip preserves the RELRO/RODATA distinction
 # ---
-# flags:   the section flags word
-# is_text: whether the segment name is "__TEXT" (selects rodata over data)
-# ret:     the abstract section kind
-fun macho_kind_from(flags: u32, is_text: bool) of.SectionKind {
+# flags:         the section flags word
+# is_text:       whether the enclosing segment name is "__TEXT" (rodata over data)
+# is_data_const: whether the enclosing segment name is "__DATA_CONST" (RELRO)
+# ret:           the abstract section kind
+fun macho_kind_from(flags: u32, is_text: bool, is_data_const: bool) of.SectionKind {
     if ((flags & 0xFF) == S_ZEROFILL)            { ret of.SK_BSS; }
     if ((flags & S_ATTR_PURE_INSTRUCTIONS) != 0) { ret of.SK_TEXT; }
     if ((flags & S_ATTR_DEBUG) != 0)             { ret of.SK_DEBUG; }
+    if (is_data_const)                           { ret of.SK_RELRO; }
     if (is_text)                                 { ret of.SK_RODATA; }
     ret of.SK_DATA;
-}
-
-# the output section a kind coalesces into. Mach-O has no RELRO segment - dyld
-# rebases relocated constants in place - so `.data.rel.ro` folds into the same
-# read-only `__const` output as `.rodata`; every other kind maps to itself
-# ---
-# kind: the abstract section kind
-# ret:  the kind whose coalesced output section this kind joins
-fun coalesce_kind(kind: of.SectionKind) of.SectionKind {
-    if (kind == of.SK_RELRO) { ret of.SK_RODATA; }
-    ret kind;
 }
 
 # whether an arm64 relocation carries its addend in a preceding ARM64_RELOC_ADDEND
@@ -712,9 +710,8 @@ fun write_nlist(buf: *u8, sym_off: usize, str_base: usize, str_pos: *usize,
         n_type = N_SECT;
         # the symbol's defining input section was coalesced by kind into one
         # output section; n_sect is that 1-based coalesced index (within the
-        # 255-section byte), and n_value its absolute in-segment address. rel.ro
-        # symbols fold into the rodata bucket like their sections.
-        n_sect = (kind_out[coalesce_kind(img.sections[sym.section].kind)::u32] + 1)::u8;
+        # 255-section byte), and n_value its absolute in-segment address.
+        n_sect = (kind_out[img.sections[sym.section].kind::u32] + 1)::u8;
         n_value = sec_addr[sym.section] + sym.offset::u64;
         if ((sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0) { n_desc = N_WEAK_DEF; }
     }
@@ -809,28 +806,30 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
     # remapping every symbol and relocation onto the coalesced section. the
     # canonical order keeps the zero-fill __bss section last, where the segment's
     # file image ends.
-    var korder: [5]of.SectionKind;
+    var korder: [6]of.SectionKind;
     korder[0] = of.SK_TEXT;
     korder[1] = of.SK_RODATA;
-    korder[2] = of.SK_DATA;
-    korder[3] = of.SK_DEBUG;
-    korder[4] = of.SK_BSS;
+    korder[2] = of.SK_RELRO;
+    korder[3] = of.SK_DATA;
+    korder[4] = of.SK_DEBUG;
+    korder[5] = of.SK_BSS;
 
     # kind -> coalesced output-section index (0xFFFFFFFF when the kind is absent),
     # and the kind of each coalesced section in emission order. indexed by kind
-    # value, so sized to the full kind count (SK_RELRO folds into the rodata
-    # bucket via `coalesce_kind`, so it never opens a bucket of its own).
+    # value, so sized to the full kind count. SK_RELRO opens its own bucket
+    # (__DATA_CONST,__const), distinct from SK_RODATA (__TEXT,__const), so the
+    # emit -> parse round-trip recovers the RELRO/RODATA distinction.
     var kind_to_out: [6]u32;
     var ki: u32 = 0;
     for (ki < of.SK_COUNT) { kind_to_out[ki] = 0xFFFFFFFF; ki = ki + 1; }
-    var out_kind: [5]of.SectionKind;
+    var out_kind: [6]of.SectionKind;
     var num_out:  u32 = 0;
     var ko: u32 = 0;
-    for (ko < 5) {
+    for (ko < 6) {
         var present: bool = false;
         var sp: u32 = 0;
         for (sp < num_secs) {
-            if (coalesce_kind(img.sections[sp].kind) == korder[ko]) { present = true; brk; }
+            if (img.sections[sp].kind == korder[ko]) { present = true; brk; }
             sp = sp + 1;
         }
         if (present) {
@@ -861,12 +860,12 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
 
     # per-coalesced-section vm address, vm size, file offset, alignment, relocation
     # array offset, and relocation_info entry count.
-    var out_addr:   [5]u64;
-    var out_size:   [5]u64;
-    var out_fileo:  [5]usize;
-    var out_align:  [5]u32;
-    var out_reloff: [5]usize;
-    var out_nrel:   [5]u32;
+    var out_addr:   [6]u64;
+    var out_size:   [6]u64;
+    var out_fileo:  [6]usize;
+    var out_align:  [6]u32;
+    var out_reloff: [6]usize;
+    var out_nrel:   [6]u32;
 
     # vm layout: lay every coalesced section in canonical order, its members (the
     # input sections of that kind) contiguous and each individually aligned. the
@@ -878,7 +877,7 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
         var a_sec: u32 = 1;
         var sp: u32 = 0;
         for (sp < num_secs) {
-            if (coalesce_kind(img.sections[sp].kind) == out_kind[ko] && img.sections[sp].align > a_sec) { a_sec = img.sections[sp].align; }
+            if (img.sections[sp].kind == out_kind[ko] && img.sections[sp].align > a_sec) { a_sec = img.sections[sp].align; }
             sp = sp + 1;
         }
         out_align[ko] = a_sec;
@@ -886,7 +885,7 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
         out_addr[ko] = vm;
         sp = 0;
         for (sp < num_secs) {
-            if (coalesce_kind(img.sections[sp].kind) != out_kind[ko]) { sp = sp + 1; cnt; }
+            if (img.sections[sp].kind != out_kind[ko]) { sp = sp + 1; cnt; }
             var a: u32 = img.sections[sp].align;
             if (a < 1) { a = 1; }
             vm = bin.align_up_u64(vm, a::u64);
@@ -920,7 +919,7 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
         file = bin.align_up(file, out_align[ko]::usize);
         out_fileo[ko] = file;
         for (sp < num_secs) {
-            if (coalesce_kind(img.sections[sp].kind) != out_kind[ko]) { sp = sp + 1; cnt; }
+            if (img.sections[sp].kind != out_kind[ko]) { sp = sp + 1; cnt; }
             data_off[sp] = out_fileo[ko] + (sec_addr[sp] - out_addr[ko])::usize;
             sp = sp + 1;
         }
@@ -937,7 +936,7 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
         var n: u32 = 0;
         var sp: u32 = 0;
         for (sp < num_secs) {
-            if (coalesce_kind(img.sections[sp].kind) == out_kind[ko]) { n = n + reloc_entries_for_section(img, sp, arch_id); }
+            if (img.sections[sp].kind == out_kind[ko]) { n = n + reloc_entries_for_section(img, sp, arch_id); }
             sp = sp + 1;
         }
         out_nrel[ko] = n;
@@ -1119,7 +1118,7 @@ fun emit_object(isa_vt: *isa.IsaVTable, img: *of.ObjectImage, path: *u8) R.Resul
         var ro: usize = out_reloff[ko];
         var sp: u32 = 0;
         for (sp < num_secs) {
-            if (coalesce_kind(img.sections[sp].kind) != out_kind[ko]) { sp = sp + 1; cnt; }
+            if (img.sections[sp].kind != out_kind[ko]) { sp = sp + 1; cnt; }
             val base: u32 = (sec_addr[sp] - out_addr[ko])::u32;
             var ri: u32 = 0;
             for (ri < img.reloc_count) {
@@ -2945,8 +2944,9 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
                 val sec_off: usize = bin.read_u32_le(buf, sh + 48)::usize;
                 val align_l: u32 = bin.read_u32_le(buf, sh + 52);
                 val flags:   u32 = bin.read_u32_le(buf, sh + 64);
-                val is_text: bool = fixed16_equals(buf, sh + 16, "__TEXT");
-                val kind:    of.SectionKind = macho_kind_from(flags, is_text);
+                val is_text:       bool = fixed16_equals(buf, sh + 16, "__TEXT");
+                val is_data_const: bool = fixed16_equals(buf, sh + 16, "__DATA_CONST");
+                val kind:    of.SectionKind = macho_kind_from(flags, is_text, is_data_const);
 
                 # intern the section name from the section_64 entry; the linker
                 # re-canonicalizes by kind, so the exact name is informational.
@@ -3377,6 +3377,87 @@ fun ts_x64_roundtrip() u8 {
         rj = rj + 1;
     }
     if (!ok_plt || !ok_pc || !ok_abs) { ret 1; }
+    ret 0;
+}
+
+# an ObjectImage carrying distinct SK_RODATA and SK_RELRO sections round-trips with
+# the RELRO/RODATA distinction preserved: SK_RELRO emits to __DATA_CONST,__const and
+# parse recovers it as SK_RELRO rather than collapsing it into SK_RODATA, so the
+# in-memory image and its re-parsed object are link-equivalent (#1865)
+fun ts_relro_roundtrip() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = isa.ARCH_X86_64;
+
+    var text_bytes:  [8]u8;
+    var ro_bytes:    [8]u8;
+    var relro_bytes: [8]u8;
+    var k: usize = 0;
+    for (k < 8) { text_bytes[k] = 0; ro_bytes[k] = 0; relro_bytes[k] = 0; k = k + 1; }
+
+    var secs: [3]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 8; secs[0].align = 16;
+    secs[1].name = t_intern(?i, ".rodata"); secs[1].kind = of.SK_RODATA;
+    secs[1].bytes = ?ro_bytes[0]; secs[1].len = 8; secs[1].align = 8;
+    secs[2].name = t_intern(?i, ".data.rel.ro"); secs[2].kind = of.SK_RELRO;
+    secs[2].bytes = ?relro_bytes[0]; secs[2].len = 8; secs[2].align = 8;
+
+    var syms: [1]of.Symbol;
+    syms[0].name = t_intern(?i, "_main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 8; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    # an abs64 relocated pointer living in the RELRO section, with a non-zero addend
+    # that must survive the in-place fold/recover round-trip.
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 2; relocs[0].offset = 0; relocs[0].kind = of.RK_ABS64;
+    relocs[0].symbol = syms[0].name; relocs[0].addend = 0x10;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 3;
+    img.symbols = ?syms[0]; img.symbol_count = 1;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_relro");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+
+    # the three kinds survive as three distinct sections; RELRO is not folded into RODATA.
+    if (out.section_count != 3) { ret 1; }
+    var saw_text:  bool = false;
+    var saw_ro:    bool = false;
+    var saw_relro: bool = false;
+    var s: u32 = 0;
+    for (s < out.section_count) {
+        if (out.sections[s].kind == of.SK_TEXT)   { saw_text = true; }
+        if (out.sections[s].kind == of.SK_RODATA) { saw_ro = true; }
+        if (out.sections[s].kind == of.SK_RELRO)  { saw_relro = true; }
+        s = s + 1;
+    }
+    if (!saw_text || !saw_ro || !saw_relro) { ret 1; }
+
+    # the abs64 addend carried in the RELRO section round-trips.
+    if (out.reloc_count != 1) { ret 1; }
+    if (out.relocations[0].kind != of.RK_ABS64 || out.relocations[0].addend != 0x10) { ret 1; }
     ret 0;
 }
 
@@ -4018,6 +4099,7 @@ fun ts_bad_input() u8 {
 # forward map, and the PAGEOFF12 instruction-decode reverse map
 test "mach.lang.target.of.macho:object_round_trip_and_reloc_maps" {
     if (ts_x64_roundtrip() != 0)         { ret 1; }
+    if (ts_relro_roundtrip() != 0)       { ret 1; }
     if (ts_arm64_roundtrip() != 0)       { ret 1; }
     if (ts_many_sections_coalesce() != 0) { ret 1; }
     if (ts_reloc_map() != 0)             { ret 1; }
