@@ -602,15 +602,14 @@ fun lower_phase(p: *driver.Project, st: *UnitState, rd: *outcome.Render) R.Resul
 # `jobs`) stages images up front; the serial pass adopts them through
 # Q_CODEGEN and the views collect the borrows
 fun codegen_phase(p: *driver.Project, st: *UnitState) R.Result[bool, outcome.Fail] {
-    # when the request asks for workers (jobs >= 1) and the build emits no
-    # DWARF, codegen the stale modules across the pool up front and stage each
-    # finished image on its ModuleEntry; run_codegen_pass then adopts the
-    # staged images (Q_CODEGEN stays the value's system of record). warm-valid
-    # modules never reach the pool - the cache serves them through the pass's
-    # revalidation. a `-g` build keeps the serial path: its DWARF interns IR
-    # types into each module's type table through the shared session
-    # allocator, which the worker arenas do not isolate (#1826
-    # parallel-lowering/-g follow-up).
+    # when the request asks for workers (jobs >= 1), codegen the stale modules
+    # across the pool up front and stage each finished image on its ModuleEntry;
+    # run_codegen_pass then adopts the staged images (Q_CODEGEN stays the value's
+    # system of record). warm-valid modules never reach the pool - the cache serves
+    # them through the pass's revalidation. `-g` builds parallelize too: each
+    # worker's DWARF producer synthesizes debug types into a private IR type table
+    # backed by the worker arena, so no module's shared type state is written under
+    # the pool (#2101).
     if (pcg_enabled(p)) {
         val rp: R.Result[bool, str] = run_codegen_parallel(p);
         if (R.is_err[bool, str](rp)) {
@@ -900,11 +899,12 @@ fun emit_unit_summary(p: *driver.Project, st: *UnitState, ev: *readout.Progress)
 }
 
 # whether the parallel-codegen prelude should run for this build: the request
-# asked for at least one worker, the build emits no DWARF (the worker arenas do
-# not isolate the `-g` type-table writes), and there is at least one module
+# asked for at least one worker and there is at least one module. `-g` builds
+# parallelize too - each worker synthesizes its module's DWARF into a private IR
+# type table (the layout oracle), so no two workers touch shared type state (#2101)
 fun pcg_enabled(p: *driver.Project) bool {
     val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
-    ret ctx.req.jobs >= 1 && !ctx.req.debug && p.topo_len > 0;
+    ret ctx.req.jobs >= 1 && p.topo_len > 0;
 }
 
 # serialize the link-only build configuration into the Q_LINK_CONFIG input, keyed
@@ -1029,6 +1029,9 @@ rec PcgSlot {
 # stale_len:  number of stale entries
 # base_len:   session-interner id count snapshotted before any child - the boundary
 #             below which a name needs no remap
+# dbg:        the build's settled debug-info decision (DW_AT_producer / comp_dir),
+#             resolved once on the main thread; every worker's codegen emits DWARF
+#             through it when `-g` is on, or is a no-op when off
 rec ParallelCodegen {
     p:          *driver.Project;
     next:       i64;
@@ -1040,6 +1043,7 @@ rec ParallelCodegen {
     stale:      *u32;
     stale_len:  u32;
     base_len:   usize;
+    dbg:        codegen.DebugInfo;
 }
 
 # initialise one worker: a fresh page-backed arena and a session view whose
@@ -1103,7 +1107,7 @@ fun pcg_worker_main(arg: *u8) {
         val slot: *PcgSlot         = ?pc.slots[idx::usize];
         slot.worker = wid;
 
-        val r: R.Result[of.ObjectImage, str] = codegen.codegen_module(?w.sess, ?pc.p.target, m.ir_module, nil, codegen.no_debug());
+        val r: R.Result[of.ObjectImage, str] = codegen.codegen_module(?w.sess, ?pc.p.target, m.ir_module, nil, pc.dbg);
         if (R.is_err[of.ObjectImage, str](r)) {
             slot.err   = R.unwrap_err[of.ObjectImage, str](r);
             slot.image = nil;
@@ -1137,16 +1141,19 @@ fun pcg_worker_main(arg: *u8) {
 #
 # Each worker owns a private arena and a child interner over the session interner,
 # so lowering-to-object runs with no shared mutable state (the session interner and
-# allocator are read-only for the span). Modules are handed out by an atomic cursor,
-# so the object tree is independent of worker count and scheduling. Collection is
-# serial in TOPO order: each worker's new interner strings are folded back into the
-# session interner (reintern_child) and each raw image is re-homed onto the session
-# allocator with its names remapped (obj.rehome_remap), so the staged images are
+# allocator are read-only for the span). Under `-g`, each worker's DWARF producer
+# synthesizes its debug types into a private IR type table backed by the worker arena
+# (the layout oracle), so the module's shared type state is never written either.
+# Modules are handed out by an atomic cursor, so the object tree is independent of
+# worker count and scheduling. Collection is serial in TOPO order: each worker's new
+# interner strings are folded back into the session interner (reintern_child) and each
+# raw image is re-homed onto the session allocator with its names remapped
+# (obj.rehome_remap), so the staged images - including their `.debug_*` sections - are
 # byte-identical to a serial build and the link that follows keys on one interner.
 # Pool bookkeeping is per-call (the build channel); the staged images alone are
 # session-owned, so a warm session does not grow per rebuild.
 # ---
-# p:   the active project (jobs resolved, no DWARF - see pcg_enabled)
+# p:   the active project (jobs resolved; DWARF decision settled per debug_info_of)
 # ret: true once every stale module is staged, or the first worker's codegen error
 fun run_codegen_parallel(p: *driver.Project) R.Result[bool, str] {
     val topo_len: u32 = p.topo_len;
@@ -1183,6 +1190,18 @@ fun run_codegen_parallel(p: *driver.Project) R.Result[bool, str] {
     var si: u32 = 0;
     for (si < stale_len) { slots[si].image = nil; slots[si].worker = 0; slots[si].err = nil; si = si + 1; }
 
+    # settle the debug-info decision on the main thread, before any worker child interner
+    # snapshots the base: a `-g` build interns the DW_AT_producer string into the session
+    # interner here, so every child created below sees it below `base_len` and resolves it
+    # without a remap. off (no_debug) when `-g` is not set.
+    val rdbg: R.Result[codegen.DebugInfo, str] = driver.debug_info_of(p);
+    if (R.is_err[codegen.DebugInfo, str](rdbg)) {
+        A.deallocate[PcgSlot](p.alloc, slots, stale_len::usize);
+        A.deallocate[u32](p.alloc, stale, topo_len::usize);
+        ret R.err[bool, str](R.unwrap_err[codegen.DebugInfo, str](rdbg));
+    }
+    val dbg: codegen.DebugInfo = R.unwrap_ok[codegen.DebugInfo, str](rdbg);
+
     val rworkers: R.Result[*PcgWorker, str] = A.allocate[PcgWorker](p.alloc, nworkers::usize);
     if (R.is_err[*PcgWorker, str](rworkers)) {
         A.deallocate[PcgSlot](p.alloc, slots, stale_len::usize);
@@ -1216,6 +1235,7 @@ fun run_codegen_parallel(p: *driver.Project) R.Result[bool, str] {
     ctx.stale      = stale;
     ctx.stale_len  = stale_len;
     ctx.base_len   = intern.count(?p.s.interner);
+    ctx.dbg        = dbg;
 
     # spawn nworkers-1 helper threads; the calling thread is the last worker, so a
     # single-worker (jobs 1) run drives the whole pool on this thread with no spawn.
