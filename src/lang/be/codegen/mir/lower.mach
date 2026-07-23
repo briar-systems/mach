@@ -26,18 +26,30 @@
 # expansion in `mir.va`, and the shared `LowerCtx` and emit primitives in
 # `mir.context`.
 #
-# Constant-time contract (#1646): each IR instruction's secrecy taint is carried
-# onto its MirInstr (via `ctx.cur_secret` at the push_instr chokepoint) and onto its
-# result vreg, so the taint is queryable on the final stream the #1648 validator
-# consumes. `lower_instr` is also the first live consumer of that taint - the
-# integer-multiply gate rejects a secret-tainted `OP_MUL` on a target without a
-# trusted data-independent multiply. INVARIANTS for any future backend pass: it must
-# not introduce a secret-dependent branch (reverse if-conversion of a branchless
-# select), nor select a variable-latency instruction on a secret-tainted operand, nor
-# drop a zeroizing write to secret storage - each such decision must consult the
-# taint (`Instruction.secret` / `MirInstr.secret` / `MirVReg.secret`). The source-level
-# gates (sema) already forbid a secret reaching a branch condition, a memory index, or
-# a div / mod / floating-point operand, so those leaks are unconstructable upstream.
+# Constant-time contract (#1646). Two surfaces, deliberately separate:
+#
+#   - GATES (compile-time enforcement): `lower_instr` rejects a secret operand of a
+#     TARGET-DEPENDENT variable-latency op the target cannot do in constant time
+#     (integer multiply, variable shift), driven by the shared `mach.lang.ct` table
+#     over every opcode. It reads the SOUND IR operand taint (`value.Value.secret`,
+#     propagated by carry_secret with `:^`/OP_DECLASSIFY as a barrier). The
+#     always-unsafe class (div/mod, floating point, incl. vectors) is gated at sema.
+#
+#   - SEEDS for #1648 (contract): this module marks only the secret SOURCES on the
+#     MIR - a secret parameter's vreg, and a load / call whose result is secret
+#     (`MirVReg.secret`, set once at ctx_setup) - plus `:^` becomes an explicit
+#     MIR_DECLASSIFY barrier. It does NOT propagate a per-value taint through
+#     transforms (that model was fragile and non-deterministic). The #1648 validator
+#     re-derives per-instruction taint over the FINAL MIR as a dataflow fixpoint,
+#     seeded from these source markers, propagating any-secret-operand->secret-result
+#     and stopping at the declassify barrier. Because the seeds sit on stable sources
+#     and #1648 re-derives, no transform can launder the taint.
+#
+# INVARIANT for any future backend pass: it must not introduce a secret-dependent
+# branch, select a variable-latency instruction on a secret operand, or drop a
+# zeroizing write to secret storage - the source-level sema gates already make a
+# secret reaching a branch / index / div / mod / float operand unconstructable, and
+# SEED COMPLETENESS (every secret source marked) is what makes #1648's re-derive sound.
 
 use std.collections.map;
 use std.types.bool.bool;
@@ -52,6 +64,7 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
+use ct: mach.lang.ct;
 use mach.lang.be.codegen.mir;
 use mabi: mach.lang.be.codegen.mir.abi;
 use lctx: mach.lang.be.codegen.mir.context;
@@ -174,7 +187,6 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: 
     ctx.cur_loc        = source.loc_nil();
     ctx.cur_inline_site = 0;
     ctx.cur_vec_lane   = mir.VEC_LANE_NONE;
-    ctx.cur_secret     = false;
     ctx.pending        = nil;
     ctx.pending_count  = 0;
     ctx.pending_cap    = 0;
@@ -668,11 +680,6 @@ fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mi
     # vector phi, so it carries no lane descriptor (and struct locals are not
     # zero-initialized, so it is set explicitly like the other push_instr invariants).
     mi.vec_lane          = mir.VEC_LANE_NONE;
-    # this splice bypasses push_instr, so its `secret` bit must be initialized here too:
-    # struct locals are not zero-initialized, and an unset bit reads uninitialized stack
-    # (nondeterministic taint across builds). the durable taint the #1648 validator reads
-    # is re-derived over the final MIR, not this stamp, so false is the safe init (#1646).
-    mi.secret            = false;
 
     # grow by one, shift the terminator right, and drop the move into its place.
     val gr: R.Result[bool, str] = lctx.grow_instr(ctx, mb);
@@ -800,10 +807,6 @@ fun split_critical_edge(ctx: *lctx.LowerCtx, pred: *mir.MirBlock, succ_id: u32) 
     br.inline_site       = 0;
     br.dbg_bindings      = nil;
     br.dbg_binding_count = 0;
-    # this synthesized branch bypasses push_instr; initialize its `secret` bit too, or it
-    # reads uninitialized stack (nondeterministic taint even for secret-free code). a branch
-    # carries no data taint; the durable taint is re-derived over the final MIR (#1646).
-    br.secret            = false;
 
     val ri: R.Result[*mir.MirInstr, str] = A.allocate[mir.MirInstr](ctx.alloc, 1::usize);
     if (R.is_err[*mir.MirInstr, str](ri)) { A.deallocate[mir.MirOperand](ctx.alloc, bops, 1::usize); ret R.err[*mir.MirBlock, str](R.unwrap_err[*mir.MirInstr, str](ri)); }
@@ -897,19 +900,20 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     # + width off each lowered MirInstr. VEC_LANE_NONE for every non-vector op, so
     # this is inert until a backend lifts its vector guard below.
     ctx.cur_vec_lane = lctx.compute_vec_lane(ctx, inst);
-    # carry the IR instruction's result taint to every MirInstr it lowers to, so the
-    # constant-time secrecy reaches the final stream the #1648 validator reads (#1646).
-    ctx.cur_secret = inst.secret;
 
-    # GATE: integer multiply is variable-latency on a target that documents no
-    # data-independent-timing mode, so a secret operand leaks through the product's
-    # latency (#1646). div / mod (always) and floating point (always) are gated in
-    # sema; the multiply gate is target-dependent - the CT capability is known only
-    # here - so it lands at MIR lowering, the first live consumer of the threaded
-    # taint (the anchor proving it reaches MIR). a target that trusts multiply under
-    # its DIT/DOITM mode (`ct_trust_mul`) lets a secret multiply through.
-    if (inst.kind == instr.OP_MUL && !ctx.tgt.model.ct_trust_mul && instr_has_secret_operand(inst)) {
-        ret R.err[bool, str](secret_mul_unsupported());
+    # GATE (#1646): reject a secret operand of a TARGET-DEPENDENT variable-latency op
+    # the backend would select on this target - integer multiply (unless ct_trust_mul)
+    # and a shift by a secret count (unless ct_trust_var_shift). driven by the SHARED
+    # ct table over every value-producing opcode, not a bespoke per-op special-case:
+    # adding a variable-latency op is one table row plus one opcode->CtOp arm, with no
+    # new gate code (this is the generality [11] was missing). the always-unsafe class
+    # (div/mod, floating point, incl. vectors) is gated at sema; scalarization carries
+    # the taint onto a scalarized vector op's lanes so it trips this gate here too.
+    val cop: ct.CtOp = opcode_ct_op(inst.kind);
+    if (ct.cap_at_mir(ct.ct_cap(cop))
+        && !ct.target_provides(ctx.tgt.model.ct_trust_mul, ctx.tgt.model.ct_trust_var_shift, ct.ct_cap(cop))
+        && instr_has_secret_ct_operand(inst, cop)) {
+        ret R.err[bool, str](secret_ct_op_unsupported(cop));
     }
 
     # a 128-bit vector reaching MIR lowering needs backend selection (#1965): a
@@ -978,6 +982,16 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     }
     if (inst.kind == instr.OP_GEP) {
         ret lower_gep(ctx, mb, inst, iid);
+    }
+    # a `:^` declassify (#1646) is an identity at runtime (secrecy has no machine shape):
+    # a register copy of the operand into the result vreg, at the value's width so the
+    # encoder selects the GP or SSE move by operand class. regalloc coalesces it to
+    # near-zero cost. it stays a distinct MIR value so the result vreg (public, not a
+    # seed) is separate from its secret operand - the taint barrier the #1648 re-derive
+    # stops at.
+    if (inst.kind == instr.OP_DECLASSIFY) {
+        val ddst: u32 = lctx.instr_vreg(ctx, iid);
+        ret lctx.emit_mov_w(ctx, mb, mir.op_vreg(ddst), lctx.lower_value(ctx, inst.operands[0]), lctx.op_width_of(ctx, inst.ty));
     }
     # scalar floating-point arithmetic / comparison shares the IR integer opcodes
     # (the front end emits OP_ADD / OP_SUB / OP_MUL / OP_DIV_* / OP_CMP_* for both
@@ -1076,15 +1090,35 @@ fun intern_owned(ctx: *lctx.LowerCtx, buf: str, fallback: str) str {
 # ---
 # ctx: the lowering context (supplies the target arch name and interner)
 # ret: the owned error message
-# whether any operand of `inst` carries the constant-time secrecy taint (#1646)
+# map an IR opcode to its constant-time op class for the shared ct table (#1646)
 #
-# The multiply gate reads operand taint (not the result), matching the leakage model:
-# a variable-latency op leaks its secret *operands*. Block-target operands ride in
-# constant slots and are never secret, so a plain scan is exact.
+# Only the TARGET-DEPENDENT classes are mapped here (integer multiply, variable shift);
+# the always-unsafe classes (div/mod, floating point) are enforced at sema and never
+# reach this gate, so mapping them would be dead. A newly-recognized target-dependent
+# variable-latency opcode is one arm here plus its ct-table row.
+# ---
+# kind: the IR opcode
+# ret:  the CtOp class, or CT_OP_NONE for a constant-time opcode
+fun opcode_ct_op(kind: instr.InstrKind) ct.CtOp {
+    if (kind == instr.OP_MUL) { ret ct.CT_OP_INT_MUL; }
+    if (kind == instr.OP_SHL || kind == instr.OP_SHR_S || kind == instr.OP_SHR_U) { ret ct.CT_OP_VAR_SHIFT; }
+    ret ct.CT_OP_NONE;
+}
+
+# whether the operand the leakage model observes for `cop` is secret (#1646)
+#
+# A shift leaks through its variable COUNT alone - a secret value shifted by a public
+# count is constant-time - so a CT_OP_VAR_SHIFT gate reads operand[1] (the count) only;
+# every other class reads all operands. Block-target operands ride in constant slots and
+# are never secret, so a plain scan is exact.
 # ---
 # inst: the IR instruction to inspect
-# ret:  true when at least one operand is secret
-fun instr_has_secret_operand(inst: *instr.Instruction) bool {
+# cop:  the operation's CtOp class
+# ret:  true when the leakage-observed operand is secret
+fun instr_has_secret_ct_operand(inst: *instr.Instruction, cop: ct.CtOp) bool {
+    if (ct.ct_op_gates_count_only(cop)) {
+        ret inst.operand_count >= 2 && inst.operands[1].secret;
+    }
     var i: u32 = 0;
     for (i < inst.operand_count) {
         if (inst.operands[i].secret) { ret true; }
@@ -1093,12 +1127,59 @@ fun instr_has_secret_operand(inst: *instr.Instruction) bool {
     ret false;
 }
 
-# the teaching diagnostic for a secret-tainted integer multiply on a target that
-# documents no data-independent-timing mode (#1646)
+# the teaching diagnostic for a secret operand of a target-dependent variable-latency
+# op the target cannot perform in constant time (#1646)
 # ---
-# ret: the fixed diagnostic string
-fun secret_mul_unsupported() str {
+# cop: the operation's CtOp class
+# ret: the diagnostic string
+fun secret_ct_op_unsupported(cop: ct.CtOp) str {
+    if (cop == ct.CT_OP_VAR_SHIFT) {
+        ret "codegen: secret value used as a variable shift count on a target without a barrel shifter; the shift's cycle count leaks the secret amount. shift by a public count, or run on a target whose variable shift is constant-time";
+    }
     ret "codegen: secret value used as an operand of a variable-latency integer multiply; this target documents no data-independent multiply timing, so the product's latency can leak the secret operand. compute the operation branch-free over public data, or run on a target whose DIT/DOITM mode is trusted";
+}
+
+# the target-dependent constant-time gate mechanism (#1646): every value-producing
+# opcode classifies through the shared ct table (generality [11]), and the shift gate
+# observes ONLY the count operand while the multiply gate observes any operand. The
+# shift REJECTION on a no-barrel-shifter target is not end-to-end buildable (mos6502 /
+# spirv are the only ct_trust_var_shift=false targets and neither codegens in a unit
+# test), so it is proven here at the mechanism level plus the ct-table test.
+test "mach.lang.be.codegen.mir.lower.ct_gate:mechanism" {
+    # opcode -> CtOp classification (one table, no bespoke per-op code).
+    if (opcode_ct_op(instr.OP_MUL)   != ct.CT_OP_INT_MUL)   { ret 1; }
+    if (opcode_ct_op(instr.OP_SHL)   != ct.CT_OP_VAR_SHIFT) { ret 1; }
+    if (opcode_ct_op(instr.OP_SHR_S) != ct.CT_OP_VAR_SHIFT) { ret 1; }
+    if (opcode_ct_op(instr.OP_SHR_U) != ct.CT_OP_VAR_SHIFT) { ret 1; }
+    if (opcode_ct_op(instr.OP_ADD)   != ct.CT_OP_NONE)      { ret 1; }
+
+    # a shift with a secret COUNT (operand[1]) and a public value (operand[0]).
+    var ops: [2]value.Value;
+    ops[0].kind = value.VAL_CONST_INT; ops[0].secret = false;  # the value being shifted
+    ops[1].kind = value.VAL_CONST_INT; ops[1].secret = true;   # the secret count
+    var shl: instr.Instruction;
+    shl.kind          = instr.OP_SHL;
+    shl.operands      = ?ops[0];
+    shl.operand_count = 2;
+
+    # the count-only gate: a secret shift count IS observed.
+    if (!instr_has_secret_ct_operand(?shl, ct.CT_OP_VAR_SHIFT)) { ret 1; }
+
+    # a secret VALUE shifted by a PUBLIC count is constant-time (a fixed shift), so it
+    # is NOT observed - the precision the leakage model requires.
+    ops[0].secret = true;
+    ops[1].secret = false;
+    if (instr_has_secret_ct_operand(?shl, ct.CT_OP_VAR_SHIFT)) { ret 1; }
+
+    # a multiply observes ANY operand (operand[0] is secret now).
+    if (!instr_has_secret_ct_operand(?shl, ct.CT_OP_INT_MUL)) { ret 1; }
+
+    # the gate decision: a no-barrel-shifter target does NOT provide the capability, so a
+    # secret shift count gates; a barrel-shifter target provides it, so it does not.
+    if (!ct.cap_at_mir(ct.ct_cap(ct.CT_OP_VAR_SHIFT)))                          { ret 1; }
+    if (ct.target_provides(false, false, ct.ct_cap(ct.CT_OP_VAR_SHIFT)))        { ret 1; }
+    if (!ct.target_provides(false, true, ct.ct_cap(ct.CT_OP_VAR_SHIFT)))        { ret 1; }
+    ret 0;
 }
 
 fun vector_unsupported(ctx: *lctx.LowerCtx) str {

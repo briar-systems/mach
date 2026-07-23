@@ -642,6 +642,46 @@ fun ut_codegen_rejects(src: str, needle: str) i32 {
     ret code;
 }
 
+# 0 only when `src`, built for `target_name`, passes sema + lower but codegen FAILS with
+# an error containing `needle`; 1 otherwise. the target-selecting sibling of
+# `ut_codegen_rejects`, for a gate whose firing depends on the target's CT capabilities
+# (a scalarized secret multiply on a no-SIMD target, #1646).
+fun ut_codegen_target_rejects(src: str, target_name: str, needle: str) i32 {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = src;
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val rr: R.Result[bool, str] = driver.setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val pr: R.Result[project.Project, outcome.Fail] = driver.build_project(?s, root, target_name);
+    fs.remove_all(?alloc, root);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var code: i32 = 1;
+    val se: R.Result[bool, outcome.Fail] = passes.run_sema_pass(?p);
+    if (R.is_ok[bool, outcome.Fail](se)) {
+        val le: R.Result[bool, outcome.Fail] = passes.run_lower_pass(?p);
+        if (R.is_ok[bool, outcome.Fail](le)) {
+            val ce: R.Result[bool, outcome.Fail] = passes.run_codegen_pass(?p);
+            if (R.is_err[bool, outcome.Fail](ce)
+                && ut_str_contains(R.unwrap_err[bool, outcome.Fail](ce).message, needle)) { code = 0; }
+        }
+    }
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret code;
+}
+
 # a vector op reaching instruction selection always resolves to DEFINED behavior
 # -- never an ICE, never a silent miscompile. driving real vector ops (a pointer
 # lane-wise add and a full-arity literal) through the HOST backend on each CI
@@ -4296,6 +4336,12 @@ test "mach.lang.driver:secret_float_gate_rejected" {
     if (!ut_sema_clean("fun f(a: f32, b: f32) u8 { ret a < b; }\nfun main() i32 { ret 0; }\n"))        { bad = 1; }
     # the teaching diagnostic names the leak.
     if (ut_vec_diag("fun f(a: ^f64, b: ^f64) ^f64 { ret a * b; }\nfun main() i32 { ret 0; }\n", "variable-latency floating-point") != 0) { bad = 1; }
+    # HOLE [1] (#1646 rework): a secret VECTOR float op previously bypassed every gate
+    # (vectors routed to the lane-wise table, which only joined secrecy). the same
+    # always-unsafe class now gates them at sema, before scalarization.
+    if (!ut_sema_rejects("fun f(a: ^f32x4, b: ^f32x4) ^f32x4 { ret a / b; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    if (!ut_sema_rejects("fun f(a: ^f64x2, b: ^f64x2) ^f64x2 { ret a * b; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    if (!ut_sema_clean("fun f(a: f32x4, b: f32x4) f32x4 { ret a / b; }\nfun main() i32 { ret 0; }\n"))       { bad = 1; }
     ret bad;
 }
 
@@ -4328,6 +4374,49 @@ test "mach.lang.driver:secret_mul_codegen_rejected" {
     # a public multiply compiles clean (no gate) - the taint bit never fires on it.
     if (ut_vec_codegen_defined("fun f(a: u32, b: u32) u32 { ret a * b; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { f(1, 2); ret 0; }\n",
         "variable-latency integer multiply") != 0) { bad = 1; }
+    ret bad;
+}
+
+# constant-time (#1646 rework): a secret VECTOR multiply on a SIMD-incapable target
+# (linux-riscv64) scalarizes to per-lane scalar multiplies, and scalarization now
+# carries the operand taint onto the lanes so the scalar multiply still trips the MIR
+# gate - closing HOLE [2], where the scalarized lanes were built fully public.
+test "mach.lang.driver:secret_vector_mul_scalarized_gated" {
+    var bad: i32 = 0;
+    if (ut_codegen_target_rejects("fun f(a: ^i16x8, b: ^i16x8) ^i16x8 { ret a * b; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux-riscv64", "variable-latency integer multiply") != 0) { bad = 1; }
+    # a public vector multiply scalarizes clean (the taint never fires).
+    if (ut_codegen_target_rejects("fun f(a: i16x8, b: i16x8) i16x8 { ret a * b; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux-riscv64", "variable-latency integer multiply") == 0) { bad = 1; }
+    ret bad;
+}
+
+# constant-time (#1646 rework): `:^` is an explicit declassify BARRIER, so a value
+# declassified from a secret is public and a multiply of two declassified values is NOT
+# gated - closing HOLE [9], where the monotone RAUW join re-tainted a `:^` result when
+# a transform (mem2reg) substituted the secret reaching-def into its operand. The
+# `var x = a` forces the promotion path the hole needed.
+test "mach.lang.driver:declassify_barrier_not_retainted" {
+    var bad: i32 = 0;
+    # declassified operands -> a PUBLIC multiply -> compiles clean (no gate).
+    if (ut_vec_codegen_defined("fun f(a: ^u32) u32 { var x: ^u32 = a; ret (x:^) * (x:^); }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "variable-latency integer multiply") != 0) { bad = 1; }
+    # control: without the `:^`, the same multiply IS gated - so the barrier, not luck,
+    # is what cleared it.
+    if (ut_codegen_rejects("fun f(a: ^u32) ^u32 { var x: ^u32 = a; ret x * x; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "variable-latency integer multiply") != 0) { bad = 1; }
+    ret bad;
+}
+
+# constant-time (#1646 rework): a zeroizing write into SECRET storage - a default-zeroed
+# `^`-qualified local, whose stored value is a public zero - is marked by DESTINATION
+# secrecy (HOLE [10]) so a future dead-store-elimination and the #1648 validator keep
+# it. it compiles and lowers cleanly (the marking is metadata; no gate fires on it).
+test "mach.lang.driver:zeroizing_secret_store_ok" {
+    var bad: i32 = 0;
+    if (!ut_sema_clean("fun f() i32 { var k: ^[4]u8; ret 0; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    if (ut_vec_codegen_defined("fun f() { var k: ^[4]u8; var s: ^u32; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { f(); ret 0; }\n",
+        "never-appears-needle") != 0) { bad = 1; }
     ret bad;
 }
 

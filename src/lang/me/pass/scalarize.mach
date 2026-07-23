@@ -238,7 +238,7 @@ fun new_instr(m: *ir.Module, fn: *ir.Function, kind: instruction.InstrKind, ty: 
     ins.flags         = 0;
     ins.aux_ty        = aux;
     ins.loc           = loc;
-    ins.secret        = false;   # scalarized lanes carry taint via operand RAUW (#1646)
+    ins.secret        = false;   # default public; a secret lane read is marked by lane_secret (#1646)
     ret ir.instruction_add(m, fn, ins);
 }
 
@@ -277,6 +277,29 @@ fun emit_store(c: *Ctx, blk: *ir.Block, v: value.Value, ptr: value.Value, loc: s
     val r: R.Result[value.Value, str] = push(c, blk, instruction.OP_STORE, c.void_ty, ir_type.IRT_NIL, ?ops[0], 2, loc);
     if (R.is_err[value.Value, str](r)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r)); }
     ret R.ok[bool, str](true);
+}
+
+# mark a scalarized lane read of a secret vector operand as secret (#1646)
+#
+# Every lane of a secret vector is secret (welded storage), so a lane read of a secret
+# operand is a secret scalar. Marks both the loaded VALUE - so a scalarized
+# variable-latency op (an integer multiply on a SIMD-incapable target) still trips the
+# MIR gate, closing the scalarize taint-laundering hole - and the load INSTRUCTION, so
+# it is a secret-source seed the #1648 re-derive starts from. A public operand is
+# untouched, so non-secret vector code is unchanged.
+# ---
+# c:          the scalarize context
+# loaded:     the lane-load result value
+# src_secret: whether the vector operand the lane was read from is secret
+# ret:        `loaded`, marked secret when `src_secret`
+fun lane_secret(c: *Ctx, loaded: value.Value, src_secret: bool) value.Value {
+    if (!src_secret) { ret loaded; }
+    var v: value.Value = loaded;
+    v.secret = true;
+    if (v.kind == value.VAL_INSTR && v.data.instr::u32 < c.fn.instr_len) {
+        c.fn.instrs[v.data.instr::u32].secret = true;
+    }
+    ret v;
 }
 
 # a scalar binary op `kind ty a, b`
@@ -330,7 +353,7 @@ fun rewrite_ops(c: *Ctx, inst: *instruction.Instruction) {
 #
 # reads lane k of each operand slot, applies the scalar op, stores lane k of the
 # result slot -- N independent computations, no cross-lane interaction.
-fun expand_binary(c: *Ctx, blk: *ir.Block, kind: instruction.InstrKind, dst: value.Value, a: value.Value, b: value.Value, vi: VInfo, loc: source.SrcLoc) R.Result[bool, str] {
+fun expand_binary(c: *Ctx, blk: *ir.Block, kind: instruction.InstrKind, dst: value.Value, a: value.Value, b: value.Value, a_secret: bool, b_secret: bool, vi: VInfo, loc: source.SrcLoc) R.Result[bool, str] {
     val ra: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?c.m.types, vi.elem, vi.lanes);
     if (R.is_err[ir_type.IrTypeId, str](ra)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ra)); }
     val arr: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ra);
@@ -347,7 +370,11 @@ fun expand_binary(c: *Ctx, blk: *ir.Block, kind: instruction.InstrKind, dst: val
         val vb: R.Result[value.Value, str] = emit_load(c, blk, R.unwrap_ok[value.Value, str](pb), vi.elem, loc);
         if (R.is_err[value.Value, str](vb)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](vb)); }
 
-        val vr: R.Result[value.Value, str] = emit_binop(c, blk, kind, vi.elem, R.unwrap_ok[value.Value, str](va), R.unwrap_ok[value.Value, str](vb), loc);
+        # a lane of a secret vector operand is secret, so the scalar op inherits the taint:
+        # this is what makes a scalarized secret multiply trip the MIR gate (#1646).
+        val va_v: value.Value = lane_secret(c, R.unwrap_ok[value.Value, str](va), a_secret);
+        val vb_v: value.Value = lane_secret(c, R.unwrap_ok[value.Value, str](vb), b_secret);
+        val vr: R.Result[value.Value, str] = emit_binop(c, blk, kind, vi.elem, va_v, vb_v, loc);
         if (R.is_err[value.Value, str](vr)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](vr)); }
 
         val pr: R.Result[value.Value, str] = lane_ptr(c, blk, dst, arr, k, loc);
@@ -691,7 +718,10 @@ fun fill_one(c: *Ctx, blk: *ir.Block, cur: id.InstructionId, i8_ty: ir_type.IrTy
         }
         val a: value.Value = resolve(c, ip.operands[0]);
         val b: value.Value = resolve(c, ip.operands[1]);
-        ret expand_binary(c, blk, kind, dst, a, b, vi, loc);
+        # pass the ORIGINAL operands' secrecy (resolve turns a secret vector into a public
+        # slot pointer, dropping the bit) so a lane read of a secret operand is tainted and
+        # a scalarized secret multiply trips the MIR gate (#1646).
+        ret expand_binary(c, blk, kind, dst, a, b, ip.operands[0].secret, ip.operands[1].secret, vi, loc);
     }
 
     # a whole-vector store: copy the source slot's 16 bytes to the destination.
