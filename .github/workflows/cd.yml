@@ -13,13 +13,12 @@ permissions:
 # to its own self-host fixpoint, then publishes the archives + SHA256SUMS.
 # correctness is CI's job — every change reaches main through a PR it gates.
 #
-# darwin has no prior release to self-seed from, so seed-darwin cross-builds the
-# stage-0 seed on linux first; collapse that bootstrap once a darwin archive ships.
-# the darwin archive builds on macos-15 (apple silicon), aarch64-darwin natively.
+# the darwin lane (seed cross-build + native fixpoint + self-test) lives in
+# darwin-lane.yml, shared with ci.yml's dev -> main release gate; see that file.
 #
-# workflow_dispatch runs the darwin lane (seed + native fixpoint + self-test) on a
-# branch with no tag, so on-Mac validation needs no release; the tag-verify and
-# publish steps are gated to tag pushes and stay skipped on dispatch.
+# workflow_dispatch runs the darwin lane on a branch with no tag, so on-Mac
+# validation needs no release; the tag-verify and publish steps are gated to tag
+# pushes and stay skipped on dispatch.
 jobs:
   verify:
     name: verify tag
@@ -203,119 +202,15 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # bootstrap: no prior darwin release exists to seed the native fixpoint, so
-  # cross-build the stage-0 seed on linux and hand it to the macOS runner. retire
-  # this once the first darwin archive ships and build-darwin can self-seed like
-  # every other target.
-  seed-darwin:
-    name: seed ${{ matrix.target }}
+  # the darwin lane (bootstrap seed cross-build + native fixpoint + self-test) is a
+  # reusable workflow shared with ci.yml's dev -> main release gate — see
+  # darwin-lane.yml. gated the same way build-linux/build-windows are: explicit,
+  # since the default success() skips through verify's dispatch-skip.
+  build-darwin:
+    name: darwin lane
     needs: verify
     if: ${{ !cancelled() && (needs.verify.result == 'success' || needs.verify.result == 'skipped') }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-darwin
-            triple: darwin-aarch64
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: fetch released mach
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SEED: mach-*-x86_64-linux.tar.gz
-        run: |
-          set -euo pipefail
-          tmp="$(mktemp -d)"
-          gh release download -R "$GITHUB_REPOSITORY" -p "$SEED" -D "$tmp"
-          tar -xzf "$tmp"/$SEED -C /usr/local/bin mach
-          chmod +x /usr/local/bin/mach
-
-      - name: cross-build the darwin seed
-        env:
-          TRIPLE: ${{ matrix.triple }}
-        run: |
-          set -euo pipefail
-          mach dep pull
-          mach build . -o m
-          ./m build . --target "$TRIPLE" --profile release -o mach-darwin-seed
-
-      - name: upload seed
-        uses: actions/upload-artifact@v4
-        with:
-          name: seed-${{ matrix.target }}
-          path: mach-darwin-seed
-          if-no-files-found: error
-          retention-days: 1
-
-  build-darwin:
-    name: build ${{ matrix.target }}
-    needs: seed-darwin
-    # explicit, since the default success() skips through verify's dispatch-skip
-    if: ${{ !cancelled() && needs.seed-darwin.result == 'success' }}
-    runs-on: ${{ matrix.runs-on }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # release lanes validate on the oldest supported macOS — forward-compat
-          # covers newer, and macos-14 is next in the runner-retirement line.
-          - target: aarch64-darwin
-            runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: download the darwin seed
-        uses: actions/download-artifact@v4
-        with:
-          name: seed-${{ matrix.target }}
-          path: seed
-
-      - name: build fixpoint
-        run: |
-          set -euo pipefail
-          chmod +x seed/mach-darwin-seed
-
-          # stage-0 is the cross-built seed; a/b/c self-host natively on the arm64 runner
-          ./seed/mach-darwin-seed dep pull
-          ./seed/mach-darwin-seed build . --profile release -o a
-          ./a build . --profile release -o b
-          ./b build . --profile release -o c
-
-          # ship the fixpoint: b == c (stage2 vs stage3) or the build is non-deterministic
-          if ! cmp -s b c; then
-            echo "::error::darwin build did not converge to the fixpoint"
-            exit 1
-          fi
-
-      - name: self test
-        run: |
-          set -euo pipefail
-          # exercises a mach-built arm64-darwin binary whose ad-hoc signature must
-          # hold (no SIGKILL) for the fixpoint and these tests to pass
-          ./c test .
-
-      - name: package archive
-        if: github.event_name == 'push'
-        env:
-          TARGET: ${{ matrix.target }}
-        run: |
-          set -euo pipefail
-          ver="${GITHUB_REF_NAME#v}"
-          mkdir -p dist stage
-          cp c stage/mach
-          cp LICENSE stage/
-          tar -C stage -czf "dist/mach-$ver-$TARGET.tar.gz" mach LICENSE
-
-      - name: upload archive
-        if: github.event_name == 'push'
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-${{ matrix.target }}
-          path: dist/mach-*-${{ matrix.target }}.tar.gz
-          if-no-files-found: error
-          retention-days: 1
+    uses: ./.github/workflows/darwin-lane.yml
 
   release:
     name: publish release
@@ -326,6 +221,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v6
+
       - name: collect archives
         uses: actions/download-artifact@v4
         with:
@@ -333,11 +230,64 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # download-artifact with a glob pattern collects whatever matches and does
+      # not fail on a missing target, so a wrong assumption anywhere upstream
+      # (e.g. a package/upload step silently skipped because github.event_name
+      # didn't propagate through darwin-lane.yml's workflow_call the way the
+      # dev -> main gate assumes — #2179) would otherwise publish an incomplete
+      # release with every job green. the expected archive set is read straight
+      # out of the build matrices (cd.yml's build-linux/build-windows,
+      # darwin-lane.yml's build), not hardcoded here, so it can't drift the next
+      # time a target is added or dropped, as x86_64-darwin was in 3.6.1.
+      - name: verify archive completeness
+        run: |
+          set -euo pipefail
+          ver="${GITHUB_REF_NAME#v}"
+
+          targets=$(grep -h -oP '(?<=- target: )[a-z0-9_-]+$' \
+            .github/workflows/cd.yml .github/workflows/darwin-lane.yml | sort -u)
+          [ -n "$targets" ] || { echo "::error::no targets found in the build matrices"; exit 1; }
+
+          want=""
+          missing=0
+          for t in $targets; do
+            case "$t" in
+              *-windows) f="mach-$ver-$t.zip" ;;
+              *)         f="mach-$ver-$t.tar.gz" ;;
+            esac
+            want="$want$f"$'\n'
+            if [ ! -f "dist/$f" ]; then
+              echo "::error::release is missing the $t archive (dist/$f)"
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ] || { echo "::error::incomplete release — refusing to publish"; exit 1; }
+
+          got="$(cd dist && ls mach-*.tar.gz mach-*.zip 2>/dev/null | sort)"
+          want="$(printf '%s' "$want" | sort)"
+          if [ "$got" != "$want" ]; then
+            echo "::error::dist/ holds archives beyond the expected set"
+            printf 'expected:\n%s\n' "$want"
+            printf 'got:\n%s\n' "$got"
+            exit 1
+          fi
+
+          echo "release archive set complete: $(echo "$targets" | tr '\n' ' ')"
+
       - name: checksums
         run: |
           set -euo pipefail
           cd dist
           sha256sum mach-*.tar.gz mach-*.zip > SHA256SUMS
+
+          # SHA256SUMS must cover exactly the set verify archive completeness
+          # just proved dist/ holds — no more, no fewer.
+          n_files=$(ls mach-*.tar.gz mach-*.zip | wc -l)
+          n_sums=$(wc -l < SHA256SUMS)
+          [ "$n_sums" -eq "$n_files" ] || {
+            echo "::error::SHA256SUMS has $n_sums entries, dist/ holds $n_files archives"
+            exit 1
+          }
 
       - name: publish
         uses: softprops/action-gh-release@v3
