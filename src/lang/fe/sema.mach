@@ -43,6 +43,7 @@ use mach.lang.fe.comptime;
 use mach.lang.fe.resolve;
 use mach.lang.fe.sema.check;
 use mach.lang.fe.sema.context;
+use mach.lang.fe.sema.generics;
 use mach.lang.fe.sema.infer;
 use mach.lang.fe.token;
 use mach.lang.intern;
@@ -135,11 +136,25 @@ pub fun sema(
     comptime.set_field_resolver(ctx, context.resolve_field_member::*u8, scp::ptr);
     comptime.set_type_resolver(ctx, context.resolve_type_comparison_operand::*u8, scp::ptr);
     val res_bodies: R.Result[bool, str] = infer_all_bodies(?sc);
-    comptime.set_field_resolver(ctx, nil, nil);
-    comptime.set_type_resolver(ctx, nil, nil);
     if (R.is_err[bool, str](res_bodies)) {
+        comptime.set_field_resolver(ctx, nil, nil);
+        comptime.set_type_resolver(ctx, nil, nil);
         dnit_context(?sc);
         ret R.err[context.SemaResult, str](R.unwrap_err[bool, str](res_bodies));
+    }
+
+    # per-instance constant-time re-validation (#2157): drain the generic-instantiation
+    # worklist collected during body inference, re-inferring each secret / aggregate
+    # instance body under its concrete substitution so the #1645 leakage gates and the
+    # #2127 aggregate-`==` rejection fire against the instance's real types. runs while
+    # the comptime resolvers are still installed (a re-inferred body may fold gates).
+    val res_reval: R.Result[bool, str] = drain_revalidations(?sc);
+    comptime.set_field_resolver(ctx, nil, nil);
+    comptime.set_type_resolver(ctx, nil, nil);
+    context.inst_worklist_dnit(?sc);
+    if (R.is_err[bool, str](res_reval)) {
+        dnit_context(?sc);
+        ret R.err[context.SemaResult, str](R.unwrap_err[bool, str](res_reval));
     }
 
     ret build_result(?sc);
@@ -198,8 +213,181 @@ pub fun reinfer_pack_each_body(
     sc.in_comptime_gate = false;
     sc.in_fin           = false;
     sc.fin_loop_depth   = 0;
+    sc.subst            = nil;
+    sc.subst_len        = 0;
+    sc.subst_fn         = nil;
+    sc.insts            = nil;
+    sc.collect_insts    = false;
 
     ret infer_stmt_list(?sc, body_start, body_len, fn_ret);
+}
+
+# copy `n` TypeIds from `src` into `dst`
+fun copy_typeids(dst: *type.TypeId, src: *type.TypeId, n: usize) {
+    var i: u32 = 0;
+    for (i < n::u32) {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+}
+
+# free a TypeId array of `n` elements, or nothing when nil / empty
+fun free_typeids(alloc: *A.Allocator, arr: *type.TypeId, n: usize) {
+    if (arr != nil && n > 0) { A.deallocate[type.TypeId](alloc, arr, n); }
+}
+
+# drive the per-instance constant-time re-validation worklist to fixpoint (#2157)
+#
+# Pops each collected generic instantiation and re-validates its body under the
+# instance substitution; a body re-inferred that way appends the further instances it
+# reaches, so the cursor-based loop drains transitively-reached instances too. Each
+# entry is read by value before re-validating, since re-validation may grow the
+# worklist (the owned `args` buffers are separate allocations, so their pointers stay
+# stable across that growth). A full module-deps snapshot is built once so a
+# cross-module instance body resolves every module it references, mirroring the pack
+# re-inference at monomorphization.
+# ---
+# sc:  the main sema context, whose worklist is drained
+# ret: true once drained, or the first internal error (gate violations are reported
+#      diagnostics, not errors)
+fun drain_revalidations(sc: *context.SemaContext) R.Result[bool, str] {
+    if (sc.insts == nil)          { ret R.ok[bool, str](true); }
+    if (sc.insts.len == 0)        { ret R.ok[bool, str](true); }
+
+    val dr: R.Result[context.SemaDeps, str] = collect_module_deps(sc.s);
+    if (R.is_err[context.SemaDeps, str](dr)) { ret R.err[bool, str](R.unwrap_err[context.SemaDeps, str](dr)); }
+    var full_deps: context.SemaDeps = R.unwrap_ok[context.SemaDeps, str](dr);
+
+    for (sc.insts.drained < sc.insts.len) {
+        val idx:     u32              = sc.insts.drained;
+        val origin:  session.ModuleId = sc.insts.items[idx].origin;
+        val decl:    id.DeclId        = sc.insts.items[idx].decl;
+        val sig:     type.TypeId      = sc.insts.items[idx].sig;
+        val args:    *type.TypeId     = sc.insts.items[idx].args;
+        val arg_len: u32              = sc.insts.items[idx].arg_len;
+
+        val r: R.Result[bool, str] = revalidate_one(sc, ?full_deps, origin, decl, args, arg_len, sig);
+        if (R.is_err[bool, str](r)) {
+            free_module_deps(sc.s, ?full_deps);
+            ret r;
+        }
+        sc.insts.drained = sc.insts.drained + 1;
+    }
+
+    free_module_deps(sc.s, ?full_deps);
+    ret R.ok[bool, str](true);
+}
+
+# re-validate one generic instance body against its concrete type arguments (#2157)
+#
+# Binds a transient sema context to the instance's origin module with the substitution
+# active and SCRATCH typing arrays (so the cached template arrays lowering reads stay
+# intact - the byte-identical guarantee), then re-infers the body. The substitution
+# pushes every generic parameter to its concrete instance type at the type-source
+# leaves, so `join_secret` over concrete operands, `check_condition` / `check_index`,
+# `gate_ct_always`, and the aggregate-`==` rejection all evaluate against the real
+# instance types - firing exactly as they would on the equivalent non-generic function.
+# The transient context shares the caller's worklist, so nested generic calls in the
+# body enqueue their own instances for the drain (the transitive case). A missing
+# origin registry or non-function decl is skipped rather than erroring.
+# ---
+# sc:      the main sema context (owns the worklist and the diagnostic sink)
+# deps:    the full module-deps snapshot for cross-module resolution
+# origin:  ModuleId declaring the generic
+# decl:    the generic function's DeclId
+# args:    the concrete type arguments (borrowed; live for this call)
+# arg_len: number of type arguments
+# sig:     the substituted signature (unused directly; the return type is re-resolved)
+# ret:     true on a validated (or skipped) instance, or an allocation error
+fun revalidate_one(sc: *context.SemaContext, deps: *context.SemaDeps, origin: session.ModuleId,
+                   decl_id: id.DeclId, args: *type.TypeId, arg_len: u32, sig: type.TypeId) R.Result[bool, str] {
+    var oa:              *ast.Ast               = nil;
+    var orr:             *resolve.ResolveResult = nil;
+    var octx:            *comptime.ComptimeCtx  = nil;
+    var o_decl_type:     *type.TypeId           = nil;
+    var o_type_resolved: *type.TypeId           = nil;
+    var o_expr_type:     *type.TypeId           = nil;
+
+    if (origin == sc.own_module) {
+        oa              = sc.a;
+        orr             = sc.rr;
+        octx            = sc.ctx;
+        o_decl_type     = sc.decl_type;
+        o_type_resolved = sc.type_resolved_ty;
+        o_expr_type     = sc.expr_type;
+    } or {
+        oa = session.module_ast(sc.s, origin);
+        if (oa == nil) { ret R.ok[bool, str](true); }
+        orr  = (session.module_resolve_ptr(sc.s, origin))::*resolve.ResolveResult;
+        octx = (session.module_comptime_ptr(sc.s, origin))::*comptime.ComptimeCtx;
+        val osp: ptr = session.module_sema_ptr(sc.s, origin);
+        if (osp == nil || orr == nil || octx == nil) { ret R.ok[bool, str](true); }
+        val osr: *context.SemaResult = osp::*context.SemaResult;
+        o_decl_type     = osr.decl_type;
+        o_type_resolved = osr.type_resolved_ty;
+        o_expr_type     = osr.expr_type;
+    }
+    if (oa == nil || o_decl_type == nil) { ret R.ok[bool, str](true); }
+
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(oa, decl_id);
+    if (O.is_none[*decl.Decl](d_opt)) { ret R.ok[bool, str](true); }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+    if (d.kind != decl.DECL_KIND_FUN)    { ret R.ok[bool, str](true); }
+    if (d.data.fun_.body == id.STMT_NIL) { ret R.ok[bool, str](true); }
+
+    var scratch_expr: *type.TypeId = nil;
+    var scratch_decl: *type.TypeId = nil;
+    if (oa.expr_len > 0) {
+        val re: R.Result[*type.TypeId, str] = typeid_array_alloc(sc.s.alloc, oa.expr_len);
+        if (R.is_err[*type.TypeId, str](re)) { ret R.err[bool, str](R.unwrap_err[*type.TypeId, str](re)); }
+        scratch_expr = R.unwrap_ok[*type.TypeId, str](re);
+        if (o_expr_type != nil) { copy_typeids(scratch_expr, o_expr_type, oa.expr_len); }
+    }
+    if (oa.decl_len > 0) {
+        val rd: R.Result[*type.TypeId, str] = typeid_array_alloc(sc.s.alloc, oa.decl_len);
+        if (R.is_err[*type.TypeId, str](rd)) {
+            free_typeids(sc.s.alloc, scratch_expr, oa.expr_len);
+            ret R.err[bool, str](R.unwrap_err[*type.TypeId, str](rd));
+        }
+        scratch_decl = R.unwrap_ok[*type.TypeId, str](rd);
+        copy_typeids(scratch_decl, o_decl_type, oa.decl_len);
+    }
+
+    var tsc: context.SemaContext;
+    tsc.s                = sc.s;
+    tsc.a                = oa;
+    tsc.rr               = orr;
+    tsc.deps             = deps;
+    tsc.ctx              = octx;
+    tsc.own_module       = origin;
+    tsc.source           = source_text_of(sc.s, oa);
+    tsc.expr_type        = scratch_expr;
+    tsc.type_resolved_ty = o_type_resolved;
+    tsc.decl_type        = scratch_decl;
+    tsc.callee_eid       = id.EXPR_NIL;
+    tsc.in_comptime_gate = false;
+    tsc.in_fin           = false;
+    tsc.fin_loop_depth   = 0;
+    tsc.subst            = args;
+    tsc.subst_len        = arg_len;
+    tsc.subst_fn         = generics.substitute;
+    tsc.insts            = sc.insts;
+    tsc.collect_insts    = true;
+
+    val ret_ty: type.TypeId = context.resolved_type_of(?tsc, d.data.fun_.return_type);
+
+    # fold this body's comptime gates against the origin module via the transient
+    # context; restored to uninstalled afterward (the drain re-installs per instance).
+    val tscp: *context.SemaContext = ?tsc;
+    comptime.set_field_resolver(octx, context.resolve_field_member::*u8, tscp::ptr);
+    comptime.set_type_resolver(octx, context.resolve_type_comparison_operand::*u8, tscp::ptr);
+    val res: R.Result[bool, str] = infer_stmt(?tsc, d.data.fun_.body, ret_ty);
+    comptime.set_field_resolver(octx, nil, nil);
+    comptime.set_type_resolver(octx, nil, nil);
+
+    free_typeids(sc.s.alloc, scratch_expr, oa.expr_len);
+    free_typeids(sc.s.alloc, scratch_decl, oa.decl_len);
+    ret res;
 }
 
 # assemble a typing-snapshot set spanning every registered module (#1475)
@@ -329,6 +517,11 @@ fun init_context(
     sc.in_comptime_gate = false;
     sc.in_fin           = false;
     sc.fin_loop_depth   = 0;
+    sc.subst            = nil;
+    sc.subst_len        = 0;
+    sc.subst_fn         = nil;
+    sc.insts            = nil;
+    sc.collect_insts    = true;
 
     if (a.expr_len > 0) {
         val res_expr: R.Result[*type.TypeId, str] = typeid_array_alloc(s.alloc, a.expr_len);
@@ -419,6 +612,7 @@ fun dnit_context(sc: *context.SemaContext) {
     sc.expr_type        = nil;
     sc.type_resolved_ty = nil;
     sc.decl_type        = nil;
+    context.inst_worklist_dnit(sc);
 }
 
 # resolve every syntactic AstType into its interned semantic TypeId
