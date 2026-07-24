@@ -63,6 +63,8 @@ use std.types.string.str;
 use std.types.string.str_len;
 use std.format;
 
+use std.allocator.page;
+
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
@@ -411,4 +413,380 @@ fun fn_name(interner: *intern.Interner, id: intern.StrId) str {
     val o: O.Option[str] = intern.lookup(interner, id);
     if (O.is_some[str](o)) { ret O.unwrap[str](o); }
     ret "<unknown>";
+}
+
+# a virtual register with a given secret seed, other fields defaulted (test helper)
+fun t_vreg(id: u32, secret: bool) mir.MirVReg {
+    var v: mir.MirVReg;
+    v.id         = id;
+    v.class      = mir.REG_CLASS_GP;
+    v.spill_slot = -1;
+    v.assigned   = mir.MIR_VREG_NIL;
+    v.vector     = false;
+    v.secret     = secret;
+    ret v;
+}
+
+# a MIR instruction over a borrowed operand array (test helper)
+fun t_instr(op: mir.MirOpcode, ops: *mir.MirOperand, n: u32) mir.MirInstr {
+    var mi: mir.MirInstr;
+    mi.opcode        = op;
+    mi.operands      = ops;
+    mi.operand_count = n;
+    mi.width         = 8;
+    mi.src_width     = 8;
+    ret mi;
+}
+
+# a MIR block over a borrowed instruction array (test helper)
+fun t_block(id: u32, instrs: *mir.MirInstr, n: u32) mir.MirBlock {
+    var b: mir.MirBlock;
+    b.id          = id;
+    b.instrs      = instrs;
+    b.instr_count = n;
+    b.instr_cap   = n;
+    b.preds       = nil;
+    b.pred_count  = 0;
+    b.pred_cap    = 0;
+    ret b;
+}
+
+# an oblivious MIR function over borrowed block / vreg arrays (test helper)
+fun t_fn(oblivious: bool, blocks: *mir.MirBlock, nb: u32, vregs: *mir.MirVReg, nv: u32) mir.MirFunction {
+    var f: mir.MirFunction;
+    f.name        = intern.STR_NIL;
+    f.blocks      = blocks;
+    f.block_count = nb;
+    f.vregs       = vregs;
+    f.vreg_count  = nv;
+    f.oblivious   = oblivious;
+    ret f;
+}
+
+# a target trusting the named constant-time capabilities, nothing else (test helper)
+fun t_target(trust_mul: bool, trust_var_shift: bool) target.Target {
+    var t: target.Target;
+    t.model.ct_trust_mul      = trust_mul;
+    t.model.ct_trust_var_shift = trust_var_shift;
+    ret t;
+}
+
+# a secret laundered through a phi join (out-of-SSA predecessor moves into one result vreg)
+# is re-derived secret and caught feeding a conditional branch. the merge vreg is NOT seeded;
+# only the fixpoint's any-secret-operand rule, applied across both predecessor definitions,
+# taints it - the exact laundering the seed-only design missed.
+test "mach.lang.be.codegen.ctvalidate.rederive:phi_join_branch" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var t: target.Target = t_target(false, true);
+
+    # v0 secret source; v1 the phi-result (unseeded); v2 a public value.
+    var vregs: [3]mir.MirVReg;
+    vregs[0] = t_vreg(0, true);
+    vregs[1] = t_vreg(1, false);
+    vregs[2] = t_vreg(2, false);
+
+    # B0: v1 <- v0 (secret) ; br B2
+    var b0_mov: [2]mir.MirOperand; b0_mov[0] = mir.op_vreg(1); b0_mov[1] = mir.op_vreg(0);
+    var b0_br:  [1]mir.MirOperand; b0_br[0]  = mir.op_block(2);
+    var b0i: [2]mir.MirInstr;
+    b0i[0] = t_instr(mir.MIR_MOV, ?b0_mov[0], 2);
+    b0i[1] = t_instr(mir.MIR_BR,  ?b0_br[0], 1);
+
+    # B1: v1 <- v2 (public) ; br B2  (the merge's other predecessor)
+    var b1_mov: [2]mir.MirOperand; b1_mov[0] = mir.op_vreg(1); b1_mov[1] = mir.op_vreg(2);
+    var b1_br:  [1]mir.MirOperand; b1_br[0]  = mir.op_block(2);
+    var b1i: [2]mir.MirInstr;
+    b1i[0] = t_instr(mir.MIR_MOV, ?b1_mov[0], 2);
+    b1i[1] = t_instr(mir.MIR_BR,  ?b1_br[0], 1);
+
+    # B2: cbr v1, B0, B1  (branch on the merged value)
+    var b2_cbr: [3]mir.MirOperand; b2_cbr[0] = mir.op_vreg(1); b2_cbr[1] = mir.op_block(0); b2_cbr[2] = mir.op_block(1);
+    var b2i: [1]mir.MirInstr;
+    b2i[0] = t_instr(mir.MIR_CBR, ?b2_cbr[0], 3);
+
+    var blocks: [3]mir.MirBlock;
+    blocks[0] = t_block(0, ?b0i[0], 2);
+    blocks[1] = t_block(1, ?b1i[0], 2);
+    blocks[2] = t_block(2, ?b2i[0], 1);
+
+    var f: mir.MirFunction = t_fn(true, ?blocks[0], 3, ?vregs[0], 3);
+    val r: R.Result[bool, str] = validate_function(?t, ?f, nil, ?alloc);
+    if (!R.is_err[bool, str](r)) { ret 1; }
+    ret 0;
+}
+
+# a secret laundered through a multi-hop copy chain (an inlined return's value copies) is
+# re-derived secret and caught feeding a memory address. v3 is two moves removed from the
+# secret source and never seeded.
+test "mach.lang.be.codegen.ctvalidate.rederive:inlined_return_address" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var t: target.Target = t_target(false, true);
+
+    var vregs: [4]mir.MirVReg;
+    vregs[0] = t_vreg(0, true);    # secret source (callee return)
+    vregs[1] = t_vreg(1, false);
+    vregs[2] = t_vreg(2, false);
+    vregs[3] = t_vreg(3, false);   # loaded value
+
+    # v1 <- v0 ; v2 <- v1 ; v3 <- load [v2]   (a secret-derived address)
+    var mov1: [2]mir.MirOperand; mov1[0] = mir.op_vreg(1); mov1[1] = mir.op_vreg(0);
+    var mov2: [2]mir.MirOperand; mov2[0] = mir.op_vreg(2); mov2[1] = mir.op_vreg(1);
+    var load: [2]mir.MirOperand; load[0] = mir.op_vreg(3); load[1] = mir.op_mem_value(2, 0);
+    var b0i: [3]mir.MirInstr;
+    b0i[0] = t_instr(mir.MIR_MOV,  ?mov1[0], 2);
+    b0i[1] = t_instr(mir.MIR_MOV,  ?mov2[0], 2);
+    b0i[2] = t_instr(mir.MIR_LOAD, ?load[0], 2);
+
+    var blocks: [1]mir.MirBlock;
+    blocks[0] = t_block(0, ?b0i[0], 3);
+    var f: mir.MirFunction = t_fn(true, ?blocks[0], 1, ?vregs[0], 4);
+    val r: R.Result[bool, str] = validate_function(?t, ?f, nil, ?alloc);
+    if (!R.is_err[bool, str](r)) { ret 1; }
+    ret 0;
+}
+
+# a secret carried across a loop back edge (a rotated loop's cloned loop variable) taints
+# the header's branch condition. the loop variable's USE at the header textually precedes
+# its secret DEFINITION in the body, so only the whole-function fixpoint - not a forward
+# sweep - catches it. the derived value the header branches on is re-derived, never seeded.
+test "mach.lang.be.codegen.ctvalidate.rederive:rotated_loop_backedge" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var t: target.Target = t_target(false, true);
+
+    var vregs: [4]mir.MirVReg;
+    vregs[0] = t_vreg(0, true);    # secret source
+    vregs[1] = t_vreg(1, false);   # loop variable (unseeded, becomes secret in the body)
+    vregs[2] = t_vreg(2, false);   # public value
+    vregs[3] = t_vreg(3, false);   # the branch condition, derived from the loop variable
+
+    # B0 header: v3 <- add v1, v2 ; cbr v3, B1, B2
+    var add: [3]mir.MirOperand; add[0] = mir.op_vreg(3); add[1] = mir.op_vreg(1); add[2] = mir.op_vreg(2);
+    var hbr: [3]mir.MirOperand; hbr[0] = mir.op_vreg(3); hbr[1] = mir.op_block(1); hbr[2] = mir.op_block(2);
+    var b0i: [2]mir.MirInstr;
+    b0i[0] = t_instr(mir.MIR_ADD, ?add[0], 3);
+    b0i[1] = t_instr(mir.MIR_CBR, ?hbr[0], 3);
+
+    # B1 body: v1 <- v0 (secret) ; br B0  (the back edge)
+    var lmv: [2]mir.MirOperand; lmv[0] = mir.op_vreg(1); lmv[1] = mir.op_vreg(0);
+    var lbr: [1]mir.MirOperand; lbr[0] = mir.op_block(0);
+    var b1i: [2]mir.MirInstr;
+    b1i[0] = t_instr(mir.MIR_MOV, ?lmv[0], 2);
+    b1i[1] = t_instr(mir.MIR_BR,  ?lbr[0], 1);
+
+    # B2 exit: ret
+    var b2i: [1]mir.MirInstr;
+    b2i[0] = t_instr(mir.MIR_RET, nil, 0);
+
+    var blocks: [3]mir.MirBlock;
+    blocks[0] = t_block(0, ?b0i[0], 2);
+    blocks[1] = t_block(1, ?b1i[0], 2);
+    blocks[2] = t_block(2, ?b2i[0], 1);
+    var f: mir.MirFunction = t_fn(true, ?blocks[0], 3, ?vregs[0], 4);
+    val r: R.Result[bool, str] = validate_function(?t, ?f, nil, ?alloc);
+    if (!R.is_err[bool, str](r)) { ret 1; }
+    ret 0;
+}
+
+# a `:^` declassify is a HARD BARRIER: the result is public even though its source is
+# secret, so a value read through the barrier feeds a branch, an address, and a multiply
+# without a violation. propagation stops at MIR_DECLASSIFY.
+test "mach.lang.be.codegen.ctvalidate.barrier:declassify_stops_taint" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var t: target.Target = t_target(false, true);
+
+    var vregs: [4]mir.MirVReg;
+    vregs[0] = t_vreg(0, true);    # secret source
+    vregs[1] = t_vreg(1, false);   # declassified (public) result
+    vregs[2] = t_vreg(2, false);   # a derived value from the public result
+    vregs[3] = t_vreg(3, false);   # public multiplicand
+
+    # v1 <- declassify v0 ; v2 <- mul v1, v3 ; cbr v1, B0, B0 ; store [v1] <- v3
+    var dcl: [2]mir.MirOperand; dcl[0] = mir.op_vreg(1); dcl[1] = mir.op_vreg(0);
+    var mul: [3]mir.MirOperand; mul[0] = mir.op_vreg(2); mul[1] = mir.op_vreg(1); mul[2] = mir.op_vreg(3);
+    var cbr: [3]mir.MirOperand; cbr[0] = mir.op_vreg(1); cbr[1] = mir.op_block(0); cbr[2] = mir.op_block(0);
+    var st:  [2]mir.MirOperand; st[0]  = mir.op_mem_value(1, 0); st[1] = mir.op_vreg(3);
+    var b0i: [4]mir.MirInstr;
+    b0i[0] = t_instr(mir.MIR_DECLASSIFY, ?dcl[0], 2);
+    b0i[1] = t_instr(mir.MIR_MUL,        ?mul[0], 3);
+    b0i[2] = t_instr(mir.MIR_CBR,        ?cbr[0], 3);
+    b0i[3] = t_instr(mir.MIR_STORE,      ?st[0], 2);
+
+    var blocks: [1]mir.MirBlock;
+    blocks[0] = t_block(0, ?b0i[0], 4);
+    var f: mir.MirFunction = t_fn(true, ?blocks[0], 1, ?vregs[0], 4);
+    val r: R.Result[bool, str] = validate_function(?t, ?f, nil, ?alloc);
+    if (!R.is_ok[bool, str](r)) { ret 1; }
+    ret 0;
+}
+
+# a secret operand of an integer multiply is a violation on a target that does not trust a
+# data-independent multiply, and permitted on one that does - the capability gate.
+test "mach.lang.be.codegen.ctvalidate.varlat:secret_multiply_capability" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var vregs: [3]mir.MirVReg;
+    vregs[0] = t_vreg(0, true);    # secret
+    vregs[1] = t_vreg(1, false);   # public
+    vregs[2] = t_vreg(2, false);   # product
+
+    # v2 <- mul v0, v1
+    var mul: [3]mir.MirOperand; mul[0] = mir.op_vreg(2); mul[1] = mir.op_vreg(0); mul[2] = mir.op_vreg(1);
+    var b0i: [1]mir.MirInstr;
+    b0i[0] = t_instr(mir.MIR_MUL, ?mul[0], 3);
+    var blocks: [1]mir.MirBlock;
+    blocks[0] = t_block(0, ?b0i[0], 1);
+    var f: mir.MirFunction = t_fn(true, ?blocks[0], 1, ?vregs[0], 3);
+
+    # no trusted multiply: a violation.
+    var t_no: target.Target = t_target(false, true);
+    if (!R.is_err[bool, str](validate_function(?t_no, ?f, nil, ?alloc))) { ret 1; }
+    # trusted multiply: permitted.
+    var t_yes: target.Target = t_target(true, true);
+    if (!R.is_ok[bool, str](validate_function(?t_yes, ?f, nil, ?alloc))) { ret 1; }
+    ret 0;
+}
+
+# a shift by a secret COUNT leaks on a target without a barrel shifter and is permitted on
+# one with it; a secret VALUE shifted by a PUBLIC count is always constant-time. the leakage
+# model observes the count operand alone.
+test "mach.lang.be.codegen.ctvalidate.varlat:secret_shift_count_only" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var vregs: [3]mir.MirVReg;
+    vregs[0] = t_vreg(0, true);    # secret
+    vregs[1] = t_vreg(1, false);   # public
+    vregs[2] = t_vreg(2, false);   # result
+
+    # v2 <- shl v1(public value), v0(secret count)
+    var shl: [3]mir.MirOperand; shl[0] = mir.op_vreg(2); shl[1] = mir.op_vreg(1); shl[2] = mir.op_vreg(0);
+    var b0i: [1]mir.MirInstr; b0i[0] = t_instr(mir.MIR_SHL, ?shl[0], 3);
+    var blocks: [1]mir.MirBlock; blocks[0] = t_block(0, ?b0i[0], 1);
+    var f: mir.MirFunction = t_fn(true, ?blocks[0], 1, ?vregs[0], 3);
+
+    # no barrel shifter: a secret count is a violation.
+    var t_no: target.Target = t_target(false, false);
+    if (!R.is_err[bool, str](validate_function(?t_no, ?f, nil, ?alloc))) { ret 1; }
+    # barrel shifter: a variable secret count is constant-time.
+    var t_yes: target.Target = t_target(false, true);
+    if (!R.is_ok[bool, str](validate_function(?t_yes, ?f, nil, ?alloc))) { ret 1; }
+
+    # a secret VALUE shifted by a PUBLIC (immediate) count is constant-time on any target.
+    var shl2: [3]mir.MirOperand; shl2[0] = mir.op_vreg(2); shl2[1] = mir.op_vreg(0); shl2[2] = mir.op_imm(3);
+    var b0i2: [1]mir.MirInstr; b0i2[0] = t_instr(mir.MIR_SHL, ?shl2[0], 3);
+    var blocks2: [1]mir.MirBlock; blocks2[0] = t_block(0, ?b0i2[0], 1);
+    var f2: mir.MirFunction = t_fn(true, ?blocks2[0], 1, ?vregs[0], 3);
+    if (!R.is_ok[bool, str](validate_function(?t_no, ?f2, nil, ?alloc))) { ret 1; }
+    ret 0;
+}
+
+# an integer divide always leaks a secret operand (no target makes it constant-time), and a
+# secret dividend PRE-COLORED into a physical accumulator (the x86-64 RAX division form) is
+# still observed - the block-local physical-register taint follows the value across the
+# register boundary.
+test "mach.lang.be.codegen.ctvalidate.varlat:secret_divide_and_precolor" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var t: target.Target = t_target(true, true);   # trusts everything the flags govern
+
+    # three-address divide [dst, dividend(secret), divisor]: always a violation.
+    var vregs: [3]mir.MirVReg;
+    vregs[0] = t_vreg(0, true);
+    vregs[1] = t_vreg(1, false);
+    vregs[2] = t_vreg(2, false);
+    var dv: [3]mir.MirOperand; dv[0] = mir.op_vreg(2); dv[1] = mir.op_vreg(0); dv[2] = mir.op_vreg(1);
+    var b0i: [1]mir.MirInstr; b0i[0] = t_instr(mir.MIR_DIV_S, ?dv[0], 3);
+    var blocks: [1]mir.MirBlock; blocks[0] = t_block(0, ?b0i[0], 1);
+    var f: mir.MirFunction = t_fn(true, ?blocks[0], 1, ?vregs[0], 3);
+    if (!R.is_err[bool, str](validate_function(?t, ?f, nil, ?alloc))) { ret 1; }
+
+    # x86-64 precolor form: mov RAX <- v0(secret) ; div [RAX, v1(divisor)].
+    var mov: [2]mir.MirOperand; mov[0] = mir.op_preg(0); mov[1] = mir.op_vreg(0);
+    var dv2: [2]mir.MirOperand; dv2[0] = mir.op_preg(0); dv2[1] = mir.op_vreg(1);
+    var p0i: [2]mir.MirInstr;
+    p0i[0] = t_instr(mir.MIR_MOV,   ?mov[0], 2);
+    p0i[1] = t_instr(mir.MIR_DIV_S, ?dv2[0], 2);
+    var pblocks: [1]mir.MirBlock; pblocks[0] = t_block(0, ?p0i[0], 2);
+    var pf: mir.MirFunction = t_fn(true, ?pblocks[0], 1, ?vregs[0], 3);
+    if (!R.is_err[bool, str](validate_function(?t, ?pf, nil, ?alloc))) { ret 1; }
+    ret 0;
+}
+
+# a valid oblivious function raises no false positive: a secret copied, stored to memory at
+# a PUBLIC address, and shifted by a PUBLIC constant is entirely constant-time. storing a
+# secret VALUE is fine; only a secret ADDRESS or a variable-latency secret operand leaks.
+test "mach.lang.be.codegen.ctvalidate.clean:valid_oblivious_no_false_positive" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var t: target.Target = t_target(false, true);
+
+    var vregs: [4]mir.MirVReg;
+    vregs[0] = t_vreg(0, true);    # secret param
+    vregs[1] = t_vreg(1, false);   # public destination pointer
+    vregs[2] = t_vreg(2, false);   # copy of the secret
+    vregs[3] = t_vreg(3, false);   # shifted secret
+
+    # v2 <- v0 ; store [v1(public addr)] <- v2(secret value) ; v3 <- shl v2, imm 5 ; ret
+    var mov: [2]mir.MirOperand; mov[0] = mir.op_vreg(2); mov[1] = mir.op_vreg(0);
+    var st:  [2]mir.MirOperand; st[0]  = mir.op_mem_value(1, 0); st[1] = mir.op_vreg(2);
+    var shl: [3]mir.MirOperand; shl[0] = mir.op_vreg(3); shl[1] = mir.op_vreg(2); shl[2] = mir.op_imm(5);
+    var b0i: [4]mir.MirInstr;
+    b0i[0] = t_instr(mir.MIR_MOV,   ?mov[0], 2);
+    b0i[1] = t_instr(mir.MIR_STORE, ?st[0], 2);
+    b0i[2] = t_instr(mir.MIR_SHL,   ?shl[0], 3);
+    b0i[3] = t_instr(mir.MIR_RET,   nil, 0);
+    var blocks: [1]mir.MirBlock; blocks[0] = t_block(0, ?b0i[0], 4);
+    var f: mir.MirFunction = t_fn(true, ?blocks[0], 1, ?vregs[0], 4);
+    if (!R.is_ok[bool, str](validate_function(?t, ?f, nil, ?alloc))) { ret 1; }
+    ret 0;
+}
+
+# the pass is scoped to #[oblivious]: an identical secret-feeds-branch body is a violation
+# in an oblivious function and completely unaffected (skipped) in a non-oblivious one. driven
+# through `run` so the module-level scope gate is exercised.
+test "mach.lang.be.codegen.ctvalidate.scope:non_oblivious_unaffected" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var t: target.Target = t_target(false, true);
+
+    var vregs: [1]mir.MirVReg;
+    vregs[0] = t_vreg(0, true);   # secret
+
+    # cbr v0, B0, B0  (a secret condition)
+    var cbr: [3]mir.MirOperand; cbr[0] = mir.op_vreg(0); cbr[1] = mir.op_block(0); cbr[2] = mir.op_block(0);
+    var b0i: [1]mir.MirInstr; b0i[0] = t_instr(mir.MIR_CBR, ?cbr[0], 3);
+    var blocks: [1]mir.MirBlock; blocks[0] = t_block(0, ?b0i[0], 1);
+
+    # non-oblivious: run skips it, no error.
+    var funcs_off: [1]mir.MirFunction; funcs_off[0] = t_fn(false, ?blocks[0], 1, ?vregs[0], 1);
+    var mm_off: mir.MirModule; mm_off.alloc = ?alloc; mm_off.interner = nil; mm_off.functions = ?funcs_off[0]; mm_off.function_len = 1;
+    if (!R.is_ok[bool, str](run(?t, ?mm_off))) { ret 1; }
+
+    # oblivious: the same body is a violation.
+    var funcs_on: [1]mir.MirFunction; funcs_on[0] = t_fn(true, ?blocks[0], 1, ?vregs[0], 1);
+    var mm_on: mir.MirModule; mm_on.alloc = ?alloc; mm_on.interner = nil; mm_on.functions = ?funcs_on[0]; mm_on.function_len = 1;
+    if (!R.is_err[bool, str](run(?t, ?mm_on))) { ret 1; }
+    ret 0;
+}
+
+# the validator's MIR-opcode -> constant-time-op classifier: multiply / divide / shift /
+# float map to their leakage class, and an ordinary opcode to CT_OP_NONE. the exhaustive
+# backstop names div / mod and float, which the compile-time gate leaves to sema.
+test "mach.lang.be.codegen.ctvalidate.classify:mir_ct_op_table" {
+    if (mir_ct_op(mir.MIR_MUL)      != ct.CT_OP_INT_MUL)    { ret 1; }
+    if (mir_ct_op(mir.MIR_DIV_S)    != ct.CT_OP_INT_DIVMOD) { ret 1; }
+    if (mir_ct_op(mir.MIR_REM_U)    != ct.CT_OP_INT_DIVMOD) { ret 1; }
+    if (mir_ct_op(mir.MIR_SHL)      != ct.CT_OP_VAR_SHIFT)  { ret 1; }
+    if (mir_ct_op(mir.MIR_SHR_S)    != ct.CT_OP_VAR_SHIFT)  { ret 1; }
+    if (mir_ct_op(mir.MIR_FADD)     != ct.CT_OP_FLOAT)      { ret 1; }
+    if (mir_ct_op(mir.MIR_FCMP)     != ct.CT_OP_FLOAT)      { ret 1; }
+    if (mir_ct_op(mir.MIR_FP_TO_SI) != ct.CT_OP_FLOAT)      { ret 1; }
+    if (mir_ct_op(mir.MIR_ADD)      != ct.CT_OP_NONE)       { ret 1; }
+    if (mir_ct_op(mir.MIR_LOAD)     != ct.CT_OP_NONE)       { ret 1; }
+    ret 0;
 }
