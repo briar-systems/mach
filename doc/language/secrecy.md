@@ -63,7 +63,7 @@ fun leak(a: ^u32, t: *u8) u8 {
 }
 ```
 
-Two more gates decide against the target's constant-time capabilities rather
+Three more gates decide against the target's constant-time capabilities rather
 than the source alone, so they are reported at lowering:
 
 - a secret operand of a **floating-point** operation (always variable-latency,
