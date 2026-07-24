@@ -97,6 +97,15 @@ blocks (which a type system cannot check). Everything else is enforced. A proof
 is always relative to a leakage model. Its fidelity to real silicon is
 empirical.
 
+## Assurance
+
+The type system proves the source respects the leakage model and `#[oblivious]`
+holds it through codegen; that the emitted code is constant-time on real hardware
+is testing-grade until the translation validator lands. The dudect-style timing
+harness at `int/ct/` measures a branchless constant-time reference against a
+deliberately-leaky control and flags the leak with Welch's t-test — run it with
+`bash int/ct/ct.sh`.
+
 ## See also
 
 - [types.md](types.md) — the compound type grammar `^` qualifies
