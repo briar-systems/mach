@@ -35,9 +35,11 @@ stays open; the holes are enumerated under Added below.)
   **bit-identical** to scalar. Measured against a `#[scalar]` twin at N=1024,
   cache-resident: element-wise f64 2.07x, f32 4.90x, i64 sum reduction 1.53x.
 
-  **Gates:** the release pipeline only (`-O2`), and only targets reporting
-  `has_v128` (SSE2 on x86-64, NEON on aarch64). riscv64 has no 128-bit vectors,
-  never enters the pass, and is byte-identical to 4.1.0.
+  **Gates:** the release pipeline only (`opt = 1` or `2`, which `-O1` / `-O2`
+  also select; the stock `release` profile is `opt = 2`), and only targets
+  reporting `has_v128` (SSE2 on x86-64, NEON on aarch64). riscv64 has no 128-bit
+  vectors, never enters the pass, and is byte-identical to 4.1.0. Debug builds
+  are entirely unaffected.
 
   **Opt-outs:** the optional `[profile.X] vectorize` manifest key (absent
   defaults to on; `false` skips the pass at release), and the `#[scalar]`
