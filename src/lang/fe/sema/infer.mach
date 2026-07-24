@@ -1280,11 +1280,11 @@ fun infer_comptime_intrinsic(sc: *context.SemaContext, c: *expr.ExprCall, span: 
 # resolved SymbolId on the argument expression, mapped to a type by
 # `type_for_symbol` (which handles primitives, records, unions, and defs).
 #
-# The result carries the active generic substitution, so this is a type-source leaf
-# on equal footing with `resolved_type_of` / `resolve_type_ref` (#2168). Without it
-# `$fields(T)` still reads the opaque parameter while re-inferring an instance body,
-# the `$each` unroll defers as it does at template time, and the whole body escapes
-# the per-instance constant-time re-validation.
+# `type_for_symbol` applies the active generic substitution at its generic-parameter
+# leaf, so `$fields(T)` resolves to the instance's concrete record while re-inferring
+# an instance body (#2168). Without that the `$each` unroll defers exactly as at
+# template time and the whole body escapes the per-instance constant-time
+# re-validation.
 # ---
 # sc:   sema context
 # eid:  the type-naming argument expression
@@ -1296,7 +1296,7 @@ fun intrinsic_operand_type(sc: *context.SemaContext, eid: id.ExprId, span: token
         # resolve already reported the unresolved name; absorb silently
         ret type.TYPE_ERROR;
     }
-    ret context.apply_subst(sc, type_for_symbol(sc, O.unwrap[*resolve.Symbol](sym_opt), span));
+    ret type_for_symbol(sc, O.unwrap[*resolve.Symbol](sym_opt), span);
 }
 
 # write `ty` into an expression's expr_type slot, the parallel array sema fills
@@ -1337,6 +1337,11 @@ pub fun field_seq_owner(sc: *context.SemaContext, seq_eid: id.ExprId, span: toke
     if (owner == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
     # an unbound generic type param: defer the record check to monomorphization
     if (type_is_generic_param(sc, owner)) { ret owner; }
+    # a generic-instance owner (`Box[u32]`, and every instance a substitution produces)
+    # carries no field table until one is materialized, so materialize BEFORE asking:
+    # `type_is_record` reads the table, and asking first made the answer depend on
+    # whether unrelated code happened to touch a member of the same instance (#2168).
+    generics.ensure_fields(sc.s, owner);
     if (!type_is_record(sc, owner)) {
         context.report(sc, span, "$fields requires a record type");
         ret type.TYPE_ERROR;
@@ -1586,14 +1591,16 @@ fun infer_generic_call(sc: *context.SemaContext, c: *expr.ExprCall, ct: type.Typ
     # the concrete type-args resolved here - before lowering's mangle-based collapse
     # coalesces `foo[^u32]` and `foo[u32]` - the secret instance is visible to the sema
     # drain even when it later shares a symbol with a public twin. a no-op on the
-    # lowering-time pack re-inference, on an instance whose arguments are not yet
-    # concrete, and on all-public-scalar instances (record_instance prunes). the args
-    # are copied there; free_params below still owns this scratch.
-    if (sig != type.TYPE_ERROR && args_all_concrete(sc, args, c.type_args_len)) {
+    # lowering-time pack re-inference and on the instances record_instance prunes. the
+    # args are copied there; free_params below still owns this scratch.
+    if (sig != type.TYPE_ERROR) {
         val rr: R.Result[bool, str] = context.record_instance(sc, sym.origin, sym.decl, args, c.type_args_len, sig);
         if (R.is_err[bool, str](rr)) {
+            # the recorder distinguishes an allocation failure from the instantiation-limit
+            # break, so surface its message rather than reporting every failure as OOM.
+            val msg: str = R.unwrap_err[bool, str](rr);
             free_params(sc, args, c.type_args_len);
-            context.report(sc, span, "internal: out of memory recording a generic instance for constant-time re-validation");
+            context.report(sc, span, msg);
             ret type.TYPE_ERROR;
         }
     }
@@ -1616,26 +1623,6 @@ fun infer_generic_call(sc: *context.SemaContext, c: *expr.ExprCall, ct: type.Typ
     val ret_type: type.TypeId = sfn.data.fn.ret_type;
     check.check_call(sc, sig, c.args_start, c.args_len, span);
     ret ret_type;
-}
-
-# whether every type argument in `args` is fully concrete (#2168)
-#
-# Only a concrete instance can be re-inferred against real types. An argument that
-# still mentions a generic parameter names a template-level instantiation - a generic
-# body forwarding its own parameter to another generic - whose real instances the
-# outer instance's re-inference records with the substitution applied.
-# ---
-# sc:   sema context
-# args: the resolved type arguments
-# n:    number of type arguments
-# ret:  true when no argument mentions a generic parameter
-fun args_all_concrete(sc: *context.SemaContext, args: *type.TypeId, n: u32) bool {
-    var i: u32 = 0;
-    for (i < n) {
-        if (!generics.type_is_concrete(sc.s, args[i])) { ret false; }
-        i = i + 1;
-    }
-    ret true;
 }
 
 # INDEX: object must be a pointer or array, index must be an integer; result is
@@ -2034,11 +2021,13 @@ fun infer_struct_lit(sc: *context.SemaContext, sl: *expr.ExprStructLit, span: to
 # tid: syntactic AstType id to resolve
 # ret: the interned semantic TypeId (TYPE_ERROR on failure)
 pub fun resolve_type_ref(sc: *context.SemaContext, tid: id.TypeId) type.TypeId {
-    # apply the active generic substitution (#2157) to the fresh resolution, so a
-    # type-argument or annotation naming a generic parameter (`T`, `*T`, `Result[T,E]`)
-    # resolves to its concrete instance type while re-inferring an instance body. inert
-    # on the main pass (no substitution active).
-    ret context.apply_subst(sc, resolve_type_ref_raw(sc, tid));
+    # the active generic substitution (#2157) is applied at the NAMED leaf
+    # (`type_for_symbol`), not here: every composite case below rebuilds structurally
+    # by recursing through this function, so substituting the assembled result too
+    # would apply it TWICE. That second pass re-reads a generic parameter the first
+    # pass already substituted IN - and resolves it against the wrong argument list,
+    # yielding TYPE_ERROR whenever its ordinal exceeds the inner arity (#2168).
+    ret resolve_type_ref_raw(sc, tid);
 }
 
 fun resolve_type_ref_raw(sc: *context.SemaContext, tid: id.TypeId) type.TypeId {
@@ -2108,10 +2097,15 @@ fun type_for_symbol(sc: *context.SemaContext, sym: *resolve.Symbol, span: token.
     if (sym.kind == resolve.SYM_VECTOR) {
         ret sym.slot::type.TypeId;
     }
+    # the type-source leaf for a generic parameter, and the single place the active
+    # substitution is applied on this path (#2168): every composite resolver rebuilds
+    # through `resolve_type_ref`, so a leaf-only application substitutes each parameter
+    # exactly once. Reaches `$fields(T)` / `$size_of(T)` through
+    # `intrinsic_operand_type` too, so a `$each` unroll sees the instance's record.
     if (sym.kind == resolve.SYM_GENERIC) {
         val r: R.Result[type.TypeId, str] = type.intern_generic_param(?sc.s.types, sym.name, sym.decl, sym.slot);
         if (R.is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
-        ret R.unwrap_ok[type.TypeId, str](r);
+        ret context.apply_subst(sc, R.unwrap_ok[type.TypeId, str](r));
     }
     if (sym.kind == resolve.SYM_REC || sym.kind == resolve.SYM_UNI) {
         var kind: type.TypeKind = type.TYPE_REC;
