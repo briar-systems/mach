@@ -1,0 +1,192 @@
+# mach.lang.me.analysis.oblivious: the `#[oblivious]`-required check (#2136)
+#
+# The per-monomorphized-instance secrecy-transparency gate of the constant-time epic
+# (#1643). It runs over the freshly-lowered IR module - after monomorphization, before
+# optimization - and requires that any function instance which genuinely COMPUTES on a
+# secret carries `#[oblivious]`, while a secrecy-TRANSPARENT instance that only moves or
+# stores secrets stays annotation-free.
+#
+# Why here, not sema: the requirement is per INSTANCE, and secrecy is stamped onto IR
+# values/instructions per instance by the lowerer only after generic substitution
+# (#1646). A generic template is type-checked once with its parameter opaque, so sema
+# cannot see whether a given instantiation binds a secret type. The lowered module is
+# the first point every monomorphized instance is visible with its concrete taint, so
+# the check consults `Instruction.secret` there. It runs BEFORE the optimization
+# pipeline so a dead secret compute cannot be optimized away first, making the
+# requirement independent of the optimization level.
+#
+# The transparency predicate (`instruction.op_is_secret_move`): an instance is
+# transparent iff it contains NO secret-tainted instruction whose opcode COMPUTES
+# (arithmetic / bitwise / shift / comparison / negation) - only moves (load / store /
+# gep / phi / call / ret / extract / insert / width-cast / declassify). Because a
+# generic body cannot perform arithmetic on its opaque type parameter (sema rejects
+# `a + b` on an unconstrained `T`), every secret compute is over a concrete secret type
+# and appears identically in each instance, so the secrecy-erasing symbol coalescing in
+# mangling (`^T` and `T` share one symbol) cannot hide a secret compute from this check.
+#
+# The check never mutates the module - it only reports - so a program that uses no `^`
+# has no secret-tainted instruction, emits no diagnostic, and lowers byte-identically.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+use std.format;
+
+use mach.lang.diagnostic;
+use mach.lang.intern;
+use mach.lang.me.ir;
+use mach.lang.me.ir.instruction;
+use mach.lang.source;
+use mach.lang.fe.token;
+
+# scan every function instance in `m` and report each one that computes on a secret
+# without `#[oblivious]` (#2136)
+#
+# Reports at most one diagnostic per offending function (the first secret compute it
+# finds), naming the function, the operation class, and - for a generic instance - its
+# instantiation, with a help note pointing at the fix. Extern (body-less) and already
+# `#[oblivious]` functions are skipped. Appends to `diags` and returns ok(false) when
+# any violation was reported, ok(true) when the module is clean, or err on an internal
+# allocation failure.
+# ---
+# m:     the freshly-lowered IR module (every monomorphized instance, taint stamped)
+# itn:   interner, to resolve function names for the diagnostic
+# diags: the sink violations are reported to
+# alloc: allocator for the transient diagnostic message strings
+# ret:   ok(true) clean, ok(false) at least one violation reported, or err on failure
+pub fun check_module(m: *ir.Module, itn: *intern.Interner, diags: *diagnostic.DiagList, alloc: *A.Allocator) R.Result[bool, str] {
+    var clean: bool = true;
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        fi = fi + 1;
+
+        # a body-less extern carries no instructions to scan; an already-oblivious
+        # function has declared its contract, so the requirement is satisfied.
+        if ((fn.flags & ir.FN_FLAG_EXTERN) != 0)    { cnt; }
+        if ((fn.flags & ir.FN_FLAG_OBLIVIOUS) != 0) { cnt; }
+
+        val hit: O.Option[*instruction.Instruction] = first_secret_compute(fn);
+        if (O.is_none[*instruction.Instruction](hit)) { cnt; }
+        val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](hit);
+
+        val rr: R.Result[bool, str] = report(fn, inst, itn, diags, alloc);
+        if (R.is_err[bool, str](rr)) { ret rr; }
+        clean = false;
+    }
+    ret R.ok[bool, str](clean);
+}
+
+# find the first instruction in `fn` that COMPUTES on a secret (a secret-tainted
+# non-move opcode), or none when the function is secrecy-transparent
+#
+# Scans the instruction pool directly rather than the block lists: the pool is the
+# complete set the function lowered, so a secret compute the source wrote is caught
+# regardless of reachability, and the scan needs no CFG walk.
+# ---
+# fn:  the function to scan
+# ret: some(first secret-compute instruction), or none when transparent
+fun first_secret_compute(fn: *ir.Function) O.Option[*instruction.Instruction] {
+    var ii: u32 = 0;
+    for (ii < fn.instr_len) {
+        val inst: *instruction.Instruction = ?fn.instrs[ii];
+        ii = ii + 1;
+        if (inst.secret && !instruction.op_is_secret_move(inst.kind)) {
+            ret O.some[*instruction.Instruction](inst);
+        }
+    }
+    ret O.none[*instruction.Instruction]();
+}
+
+# report one function's missing `#[oblivious]`, at the offending operation's location
+#
+# The primary error names the function and the operation class; a help note states the
+# transparency rule and the fix. A generic instance (weak linkage, whose readable
+# source name differs from its mangled symbol) also gets a note naming the exact
+# instantiation, so a per-instance violation is unambiguous.
+# ---
+# fn:    the offending function
+# inst:  the first secret-compute instruction (its loc anchors the diagnostic)
+# itn:   interner, to resolve the function's names
+# diags: the sink
+# alloc: allocator for the message string
+# ret:   ok(true) on a filed diagnostic, or err on an allocation failure
+fun report(fn: *ir.Function, inst: *instruction.Instruction, itn: *intern.Interner, diags: *diagnostic.DiagList, alloc: *A.Allocator) R.Result[bool, str] {
+    val name: str = name_of(fn, itn);
+    val klass: str = op_class_name(inst.kind);
+
+    var sp: token.Span;
+    sp.offset = inst.loc.offset;
+    sp.len    = 1;
+
+    val mr: R.Result[str, str] = format.sprint(alloc,
+        "`{}` performs a constant-time {} on a secret value but is not declared `#[oblivious]`",
+        name, klass);
+    if (R.is_err[str, str](mr)) { ret R.err[bool, str](R.unwrap_err[str, str](mr)); }
+    val msg: str = R.unwrap_ok[str, str](mr);
+
+    val er: R.Result[bool, str] = diagnostic.error(diags, inst.loc.file, sp, msg);
+    A.deallocate[u8](alloc, msg::*u8, str_len(msg) + 1);
+    if (R.is_err[bool, str](er)) { ret er; }
+
+    # a generic instance: name the exact instantiation so the per-instance requirement
+    # is unambiguous (the readable source name is shared across every instantiation).
+    if ((fn.flags & ir.FN_FLAG_WEAK) != 0) {
+        val ir_o: O.Option[str] = intern.lookup(itn, fn.name);
+        if (O.is_some[str](ir_o)) {
+            val nr: R.Result[str, str] = format.sprint(alloc, "in the instantiation `{}`", O.unwrap[str](ir_o));
+            if (R.is_ok[str, str](nr)) {
+                val note: str = R.unwrap_ok[str, str](nr);
+                diagnostic.attach_note(diags, note);
+                A.deallocate[u8](alloc, note::*u8, str_len(note) + 1);
+            }
+        }
+    }
+
+    diagnostic.attach_help(diags,
+        "annotate the function with `#[oblivious]` to declare its constant-time contract; only a function that merely moves or stores secrets may omit it");
+    ret R.ok[bool, str](true);
+}
+
+# the readable name of a function for the diagnostic: its bare source spelling when
+# present, else its mangled symbol, else a placeholder
+# ---
+# fn:  the function
+# itn: interner
+# ret: a printable name (never allocates; borrows the interned string)
+fun name_of(fn: *ir.Function, itn: *intern.Interner) str {
+    if (fn.disp != intern.STR_NIL) {
+        val d: O.Option[str] = intern.lookup(itn, fn.disp);
+        if (O.is_some[str](d)) { ret O.unwrap[str](d); }
+    }
+    if (fn.name != intern.STR_NIL) {
+        val n: O.Option[str] = intern.lookup(itn, fn.name);
+        if (O.is_some[str](n)) { ret O.unwrap[str](n); }
+    }
+    ret "<anonymous>";
+}
+
+# a readable class name for the secret operation a diagnostic names
+# ---
+# k:   the compute opcode
+# ret: the operation-class word
+fun op_class_name(k: instruction.InstrKind) str {
+    if (k == instruction.OP_ADD || k == instruction.OP_SUB || k == instruction.OP_MUL
+        || k == instruction.OP_DIV_S || k == instruction.OP_DIV_U
+        || k == instruction.OP_REM_S || k == instruction.OP_REM_U
+        || k == instruction.OP_NEG) { ret "arithmetic operation"; }
+    if (k == instruction.OP_AND || k == instruction.OP_OR
+        || k == instruction.OP_XOR || k == instruction.OP_NOT) { ret "bitwise operation"; }
+    if (k == instruction.OP_SHL || k == instruction.OP_SHR_S
+        || k == instruction.OP_SHR_U) { ret "shift"; }
+    if (k == instruction.OP_CMP_EQ || k == instruction.OP_CMP_NE
+        || k == instruction.OP_CMP_LT_S || k == instruction.OP_CMP_LT_U
+        || k == instruction.OP_CMP_LE_S || k == instruction.OP_CMP_LE_U) { ret "comparison"; }
+    ret "computation";
+}
