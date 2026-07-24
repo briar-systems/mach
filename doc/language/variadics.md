@@ -109,6 +109,11 @@ Because a pack-tailed function has no single entry point, it is **not a
 stable-ABI symbol** — it cannot be the target of `ext fun` or a function
 pointer shared across compilation units. It is source-level only.
 
+A `^` secret may not be passed to a pack, including a secret nested inside an
+aggregate argument. A pack instance is re-inferred per call site and commonly
+feeds formatting or logging, so admitting one would launder a secret straight to
+an observable sink — see [secrecy.md](secrecy.md).
+
 ## Cross-module packs
 
 Pack-tailed functions may call functions in other modules from inside the

@@ -5,6 +5,177 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.0] - 2026-07-24
+
+The auto-vectorization release. Counted element-wise and integer-reduction loops
+compile to 128-bit SIMD at `-O2` on capable targets — element-wise f64 **2.07x**,
+f32 **4.90x**, i64 sum reduction **1.53x** — behind a runtime alias guard that
+leaves any loop it cannot prove safe scalar. Around it the optimizer gains loop
+rotation, fallthrough elision, bounded recursion peeling, and loop-carried phi
+coalescing; the backend links executables straight from in-memory images, emits
+real Mach-O DWARF, parallelizes `-g` codegen, and splits COFF per function.
+Built with mach 4.1.0.
+
+(**The constant-time support in this release is an experimental preview and its
+guarantee is not complete.** The flow typing, the codegen taint contract, the
+translation validator, and the timing harness are all in — but a proven
+secret-disclosure path remains open (#2168), along with #2158, #2159, and
+#2167. The `^` / `#[oblivious]` surface has not been audited and is not sound
+today. **Do not build production cryptography on this version.** Epic #1643
+stays open; the holes are enumerated under Added below.)
+
+### Added
+- codegen: **loop auto-vectorization** — a counted, unit-stride, single-block
+  loop whose dependence analysis proves independence is rewritten to 128-bit
+  vector operations with a scalar remainder for the trip-count tail. Two shapes
+  land: **element-wise maps** (`dst[i] = f(src0[i], ...)` over add/sub, float
+  mul/div, and integer bitwise ops) guarded by a runtime alias check that routes
+  overlapping arrays to a scalar fallback, and **integer reductions** (`add`,
+  `xor`, `or`, `and`) via lane-count partial sums and a horizontal combine,
+  **bit-identical** to scalar. Measured against a `#[scalar]` twin at N=1024,
+  cache-resident: element-wise f64 2.07x, f32 4.90x, i64 sum reduction 1.53x.
+
+  **Gates:** the release pipeline only (`opt = 1` or `2`, which `-O1` / `-O2`
+  also select; the stock `release` profile is `opt = 2`), and only targets
+  reporting `has_v128` (SSE2 on x86-64, NEON on aarch64). riscv64 has no 128-bit
+  vectors, never enters the pass, and is byte-identical to 4.1.0. Debug builds
+  are entirely unaffected.
+
+  **Opt-outs:** the optional `[profile.X] vectorize` manifest key (absent
+  defaults to on; `false` skips the pass at release), and the `#[scalar]`
+  function decorator, which also declines inlining so the opt-out survives being
+  inlined into an unflagged caller.
+
+  **Float reductions are deliberately not vectorized.** Reassociating an f32/f64
+  accumulator changes IEEE rounding, so they stay scalar pending a fast-math
+  profile key (#2160). Integer dot/multiply-reduce and non-associative
+  subtraction likewise decline — anything unproven stays scalar (#1942, #2139,
+  #2140, #2141, #2142).
+- language: **constant-time support — `^` secret types and `#[oblivious]` —
+  reaches end-to-end enforcement, as an experimental preview.** The `^` flow
+  typing shipped earlier; this release adds the layers that make it mean
+  something at the machine level:
+  - `#[oblivious]`, a closed-set functions-only decorator marking a constant-time
+    boundary, with a secret-taint bit threaded from sema's flow typing through IR
+    and MIR to the emitted instruction stream, monotonically preserved across
+    every RAUW, inline clone, isel piece-emission, and regalloc copy. Secret-free
+    code is byte-identical (#1646).
+  - an op→CT-capability table (`mach.lang.ct`) shared by the compile-time gates
+    and the validator: integer multiply is gated on the target's `ct_trust_mul`
+    (conservatively false on every ISA, absent a trusted DIT/DOITM mode),
+    variable shift counts on the barrel-shifter fact, and divide/remainder plus
+    all floating point are always gated.
+  - a **`MIR_DECLASSIFY` barrier** marking the one intentional secret-to-public
+    crossing, so taint propagation stops exactly there and nowhere else.
+  - a **translation validator** (`ctvalidate`) that re-derives taint over the
+    lowered, target-independent MIR as a monotone dataflow fixpoint — handling
+    phi joins, inlined-return copy chains, rotated-loop back edges, and
+    precolored physical registers (x86-64's RAX dividend, RCX shift count) by
+    construction — and rejects a secret reaching a branch condition, a memory
+    address, or a forbidden variable-latency op. It is the independent
+    relational backstop behind the compile-time gates (#1648).
+  - an `#[oblivious]`-required check per monomorphized instance: an instance that
+    *computes* on a secret must carry the decorator, while a transparent instance
+    that only moves, stores, or declassifies stays annotation-free (#2136).
+  - a **dudect-style timing harness at `int/ct/`** measuring a branchless
+    `#[oblivious]` reference against a deliberately-leaky control with Welch's
+    t-test — the leaky control lands at |t| ≈ 989 against the reference's |t| < 1.5,
+    a discrimination ratio in the thousands, and the driver self-tests that the
+    assertion genuinely gates. Run it with `bash int/ct/ct.sh` (#1647).
+
+  **Known open holes — the guarantee is incomplete:** `$fields` reflection
+  projection inside a generic erases a secret field's secrecy and discloses the
+  secret (#2168, proven, security-blocking); secret integer `==`/`!=` compiles a
+  timing branch on no-flag targets (#2158); `#[oblivious]` functions compiled to
+  SPIR-V bypass the validator entirely (#2159); deep secrecy placement
+  over-rejects differing-shape aggregates that lack field offsets (#2167). The
+  validator covers the lowered MIR and trusts isel, legalization, regalloc, and
+  encode to be timing-preserving; validation of emitted machine code is future
+  work. A proof is always relative to a leakage model, and this one has not been
+  audited.
+- codegen: **MIR-level loop rotation** — a top-tested loop becomes a guarded
+  bottom-tested one, so the steady-state body carries a single taken branch (the
+  back edge) instead of two. On a branch-throughput-bound counting loop this
+  roughly doubles throughput: 1.774s → 0.888s best-of-5 on x86-64 release
+  (#1937).
+- codegen: **branches to the fallthrough block are elided** — across the
+  compiler's own self-build corpus, jump-to-next-instruction sequences fall from
+  66,975 to ~10 (the residual are jumps over degenerate zero-byte blocks), and
+  `.text` shrinks by exactly the eliminated x64 `rel32` bytes (#1936).
+- inline: **bounded self-recursion peeling** — a directly self-recursive function
+  is peeled K levels from a pristine id-stable snapshot, so the peel stays a
+  uniform K deep with the residual tail calling back into the real function. On
+  `fib`: retired instructions 2.72B → 1.87B (−31%), wall time 305ms → 201ms
+  (1.51x) (#1941).
+- regalloc: **loop-carried phi copies coalesce** — admitted only when the source
+  dies at the copy, both sit in one block, and the destination is unread in the
+  window. The xorshift loop tail drops 11 → 8 instructions; across the self-host
+  corpus (196 modules, ~1.98M instructions) 7,386 instructions disappear, 7,378
+  of them `mov`s (#1938).
+- build: **executables link from in-memory codegen images** on ELF and Mach-O
+  (and, since the COFF fix below, on COFF) instead of re-parsing the `.o` files
+  the compiler wrote moments earlier. Gated on a declared per-format
+  `OfVTable.links_from_image` capability; only genuinely-on-disk inputs (libc,
+  `-l`/`-L`, archives, shared objects) are still parsed. Linked output is
+  byte-identical on every target (#1828).
+- of: **Mach-O `-g` emits real DWARF** — `SK_DEBUG` sections no longer collapse
+  into one `__DWARF,__debug` blob but become individual `section_64`s spelled in
+  Mach-O form (`.debug_info` → `__debug_info`), with the parser reversing the
+  spelling so the linker's name-keyed debug merge and `.debug_str` dedup see
+  canonical names. The in-binary `__DWARF` segment is framed below the code
+  signature so the ad-hoc signature's `code_limit` covers it.
+  `llvm-dwarfdump --verify` reports no errors on both darwin executables
+  (#1701, #1702).
+- build: **`-g` codegen runs in parallel** — the DWARF producer builds debug
+  types into a private per-worker `IrTypeTable` used purely as a layout oracle,
+  removing the shared-session-allocator race that forced `-g` builds serial.
+  Output is byte-identical at `--jobs 1` vs `--jobs 8` (all 196 release objects,
+  `.debug_*` included), `.text` stays byte-identical with and without `-g`, and
+  the `-g` self-build goes 21.4s → 7.5s (~2.9x) at 8 jobs (#2101).
+
+### Fixed
+- of: **`SK_RELRO` survives the Mach-O and COFF object round-trip.** Both writers
+  collapsed RELRO into `SK_RODATA` and never recovered it on parse, so a module's
+  in-memory image was not link-equivalent to its own `.o`: the reparse merged one
+  read-only section where the image had two, shifting every subsequent vaddr and
+  cascading into all address-bearing bytes. Mach-O now emits RELRO to
+  `__DATA_CONST,__const` and recovers it from the segment name; COFF recovers it
+  from a read-only `.data.rel.ro`. Relocation addends were never the cause — they
+  already round-tripped exactly. ELF untouched (#1865).
+- coff: **per-function section split drops weak-body duplication.** The
+  defined-weak COMDAT carrier kept the weak body in the original `.text` as well,
+  so every `.o` shipped every weak body twice. Emit now tiles each source section
+  with non-weak spans plus one carrier per weak body and no retained original,
+  remapping every symbol and relocation. Cross-building the compiler to
+  `windows-x86_64`, `.text` VirtualSize drops 7,629,330 → 6,224,082 bytes
+  (−1.34 MB), and the `.o` becomes link-equivalent to the in-memory image
+  (#2125).
+- resolve: **the `:^` secret-strip cast binds its operand in a full build** — it
+  resolved in isolation but not through the whole-project path, so declassifying
+  a secret failed to compile end-to-end (#2138).
+- sema: **four secret-disclosure paths closed.** A secret passed to a variadic
+  pack is rejected, including a deep (aggregate-wrapped) secret and one reached
+  through a lazily-materialized generic-instance field (#2162); reinterpret
+  placement fails closed by default and the function-type secrecy launder is shut
+  over the whole kind space (#2165); and generic secrecy is re-validated per
+  instantiation, so `cmp_branch[^u32]` is rejected with the same diagnostic as
+  its concrete twin despite monomorphization collapsing it onto a public sibling
+  — a proven false-negative that shipped with the taint foundation (#2157).
+- codegen: **an unencodable inline-asm mnemonic renders a located diagnostic**
+  at the statement's `path:line:col` instead of a blank crash, and worker error
+  messages are re-homed before pool teardown so they survive to be printed
+  (#2153).
+- codegen: **inline asm is rejected inside an `#[oblivious]` function** — a type
+  system cannot check an `asm` block, so it cannot be trusted inside a
+  constant-time boundary (#1648).
+
+### Changed
+- sema: **aggregate-value `==` / `!=` is rejected** with a teaching diagnostic
+  rather than silently comparing representations. Scalar and address comparisons
+  are unaffected; the rejection extends through generic instances (#2127).
+- abi: the SysV vector-count register (AL) is staged **only for variadic calls**,
+  not on every call through a function pointer (#1939).
+
 ## [3.6.1] - 2026-07-12
 
 The build-speed and interop release. Parallel codegen takes the compiler

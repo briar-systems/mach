@@ -4,9 +4,14 @@
 Sema tracks secrecy as an information-flow discipline: secret data may move and
 be stored, but it may never reach a position a classical leakage model observes
 (a branch, a memory address, a variable-latency instruction). This page covers
-the flow-typing rules. The grammar lives in [grammar.md](grammar.md); the
-`#[oblivious]` codegen contract that turns these types into a per-build proof is
-separate.
+the flow-typing rules and the `#[oblivious]` codegen contract. The grammar lives
+in [grammar.md](grammar.md); the decorator reference is in
+[decorators.md](decorators.md).
+
+> **Experimental preview.** The constant-time support is incomplete and
+> unaudited: a proven secret-disclosure path is still open. Read
+> [Assurance](#assurance) before relying on any of this. **Do not build
+> production cryptography on it at this version.**
 
 ## Secrecy lattice
 
@@ -58,9 +63,17 @@ fun leak(a: ^u32, t: *u8) u8 {
 }
 ```
 
-Floating-point operations (gated by default) and integer multiply (gated per the
-target's constant-time capability) join these once the codegen taint contract
-lands.
+Three more gates decide against the target's constant-time capabilities rather
+than the source alone, so they are reported at lowering:
+
+- a secret operand of a **floating-point** operation (always variable-latency,
+  gated on every target)
+- a secret operand of an **integer multiply** on a target without a trusted
+  data-independent-timing mode — conservatively every ISA today
+- a secret **variable shift count** on a target without a barrel shifter
+
+A secret value passed to a variadic pack is also rejected, including a secret
+wrapped inside an aggregate.
 
 ## Downgrade with `:^`
 
@@ -90,6 +103,45 @@ fun erase(p: *^u8) ptr { ret p; }     # error: cannot erase a secret pointer to 
 uni Bad { a: ^u32; b: u32; }          # error: variants disagree on secrecy
 ```
 
+The check is **deep** and **fails closed**: a secret nested anywhere inside an
+aggregate (including a generic instance's lazily-materialized fields) counts as
+secret at these boundaries, and a placement the checker cannot prove severs no
+weld — a `:~` reinterpret across differing shapes, or a secrecy difference
+reachable through a function type — is rejected rather than allowed. This
+over-rejects in some safe cases (briar-systems/mach#2167); rejecting is the
+correct default for a confidentiality property.
+
+## `#[oblivious]` — the codegen contract
+
+The flow typing constrains the *source*; `#[oblivious]` carries the obligation
+through *codegen*. Inside a function carrying it, the backend must not introduce
+a secret-dependent branch, select a variable-latency instruction on a secret
+operand, or dead-store-eliminate a zeroizing write to secret storage. Inline
+`asm` is rejected inside such a function.
+
+A secret-taint bit is threaded from sema's flow typing through IR and MIR to the
+emitted instruction stream, preserved across every value replacement, inline
+clone, instruction selection, and register-allocator copy. The one place taint
+stops is the declassify barrier a `:^` cast lowers to. Secret-free code carries
+no taint and compiles byte-identically.
+
+A function instance that **computes** on a secret must carry `#[oblivious]`; one
+that only moves, stores, or declassifies secrets is transparent and stays
+annotation-free. The check runs per monomorphized instance, so a generic
+instantiated at a secret type is held to the concrete type's rules.
+
+```mach
+#[oblivious]
+fun ct_select(mask: ^u32, a: ^u32, b: ^u32) ^u32 { ret (a & mask) | (b & ~mask); }
+```
+
+A **translation validator** re-derives the taint over the lowered,
+target-independent MIR as a monotone dataflow fixpoint and independently
+re-checks the leakage conditions, so a secret reaching a branch condition, a
+memory address, or a forbidden variable-latency op is a compile error naming the
+function and the offending operation. It is a backstop behind the compile-time
+gates, not a replacement for them.
+
 ## Trusted base
 
 The only secret-to-public crossings are the explicit `:^` cast and inline `asm`
@@ -97,8 +149,38 @@ blocks (which a type system cannot check). Everything else is enforced. A proof
 is always relative to a leakage model. Its fidelity to real silicon is
 empirical.
 
+## Assurance
+
+**The constant-time guarantee is incomplete. This support is an experimental
+preview and has not been audited. Do not build production cryptography on it at
+this version.**
+
+What holds today: the type system checks that the source respects the leakage
+model, `#[oblivious]` carries the obligation through codegen, and the
+translation validator independently re-checks the lowered MIR. The dudect-style
+timing harness at `int/ct/` measures a branchless constant-time reference
+against a deliberately-leaky control and flags the leak with Welch's t-test —
+run it with `bash int/ct/ct.sh`.
+
+What does not hold — the known open holes:
+
+- **`$fields` reflection projection inside a generic erases a secret field's
+  secrecy**, which discloses the secret. Proven, security-blocking
+  (briar-systems/mach#2168).
+- a secret integer `==` / `!=` compiles a timing branch on targets without
+  comparison flags (briar-systems/mach#2158)
+- an `#[oblivious]` function compiled to SPIR-V bypasses the validator entirely
+  (briar-systems/mach#2159)
+- deep secrecy placement over-rejects differing-shape aggregates that lack field
+  offsets — sound but too strict (briar-systems/mach#2167)
+
+The validator's scope is the lowered MIR; it trusts instruction selection, width
+legalization, register allocation, and encoding to be timing-preserving.
+Validation of the emitted machine code is future work.
+
 ## See also
 
 - [types.md](types.md) — the compound type grammar `^` qualifies
 - [operators.md](operators.md) — the `::` / `:~` casts that preserve secrecy
+- [decorators.md](decorators.md) — the `#[oblivious]` decorator reference
 - [grammar.md](grammar.md) — the formal grammar of `^` and `:^`

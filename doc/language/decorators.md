@@ -2,7 +2,8 @@
 
 A decorator is a codegen directive attached to a declaration. It expresses
 metadata that influences how the compiler emits the symbol: its linker name,
-alignment, section placement, inlining, or PE import routing.
+alignment, section placement, inlining, PE import routing, constant-time
+obligations, or exclusion from auto-vectorization.
 
 Decorators are **codegen-only**. Visibility (`pub` / `ext`) is separate and
 unaffected by decorators.
@@ -32,6 +33,8 @@ A decorator is written as an attribute:
 #[inline]            # force inlining (no arguments)
 #[align(expr)]       # alignment; expr is a comptime integer
 #[section(".name")]  # place in a named object section
+#[oblivious]         # constant-time boundary (no arguments)
+#[scalar]            # opt out of auto-vectorization (no arguments)
 ```
 
 Decorators appear **before** the declaration they target, one per line or
@@ -141,15 +144,57 @@ pub var g_sec: u64 = 100;
 The named section is created if absent. Cross-section calls and accesses use
 ordinary relocations.
 
+### `oblivious` — constant-time boundary
+
+Marks a function as a constant-time boundary. Applies to functions only; takes
+no arguments. Inside it the backend must not introduce a secret-dependent
+branch, select a variable-latency instruction on a secret operand, or eliminate
+a zeroizing write to secret storage; a translation validator re-derives the
+secret taint over the lowered MIR and rejects any such leak. Inline `asm` is
+rejected inside an `#[oblivious]` function, since a type system cannot check it.
+
+```mach
+#[oblivious]
+fun ct_eq(a: ^[8]u8, b: ^[8]u8) u8 { ... }
+```
+
+The decorator is purely subtractive — on a secret-free function it is a no-op.
+A function instance that *computes* on a `^` secret (arithmetic, bitwise, shift,
+comparison, negation) is **required** to carry it; an instance that only moves,
+stores, or declassifies secrets stays annotation-free.
+
+> **Experimental preview.** The constant-time guarantee is not complete and has
+> not been audited — see [secrecy.md](secrecy.md#assurance) for the known open
+> holes. Do not build production cryptography on it at this version.
+
+### `scalar` — opt out of auto-vectorization
+
+Excludes a function from loop auto-vectorization, so its loops compile to scalar
+code even in the release pipeline on a vector-capable target. Applies to
+functions only; takes no arguments.
+
+```mach
+#[scalar]
+fun reference_sum(a: *i64, n: usize) i64 { ... }
+```
+
+A `#[scalar]` function is also declined by the inliner, so the opt-out survives
+inlining — it cannot be lost by the body moving into an unflagged caller. Use it
+for a scalar reference twin in a differential test, or where vectorized codegen
+is undesirable for a specific function. The project-wide equivalent is the
+`vectorize` profile key (see [manifest.md](../manifest.md#profilename)).
+
 ## Applicability
 
-| Directive  | `fun` | `ext fun` | `val` / `var` | `rec` / `uni` |
-|------------|:-----:|:---------:|:-------------:|:-------------:|
-| `symbol`   |  yes  |    yes    |      yes      |      no       |
-| `library`  |  no   |    yes    |      no       |      no       |
-| `inline`   |  yes  |    no     |      no       |      no       |
-| `align`    |  no   |    no     |      yes      |      yes      |
-| `section`  |  yes  |    yes    |      yes      |      no       |
+| Directive   | `fun` | `ext fun` | `val` / `var` | `rec` / `uni` |
+|-------------|:-----:|:---------:|:-------------:|:-------------:|
+| `symbol`    |  yes  |    yes    |      yes      |      no       |
+| `library`   |  no   |    yes    |      no       |      no       |
+| `inline`    |  yes  |    no     |      no       |      no       |
+| `align`     |  no   |    no     |      yes      |      yes      |
+| `section`   |  yes  |    yes    |      yes      |      no       |
+| `oblivious` |  yes  |    no     |      no       |      no       |
+| `scalar`    |  yes  |    no     |      no       |      no       |
 
 The set is closed. New directives require a compiler change.
 
@@ -158,3 +203,5 @@ The set is closed. New directives require a compiler change.
 - [ext-fun.md](ext-fun.md) — `ext` imports, `library` and `symbol` use cases
 - [visibility.md](visibility.md) — `pub` / `ext` visibility (not decorator-controlled)
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of` / `$align_of` as `align` arguments
+- [secrecy.md](secrecy.md) — `^` secret types and the `oblivious` constant-time contract
+- [../manifest.md](../manifest.md) — the `vectorize` profile key `scalar` opts out of

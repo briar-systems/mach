@@ -242,8 +242,16 @@ condition, the left operand of `&&`/`||`, a memory index, or a `/`/`%`
 operand - each is a compile error. Public flows up to secret implicitly; the
 **only** downgrade is the explicit strip cast `x:^` (or `x:^T`). Any operation
 with a secret operand yields a secret result; `uni` variants must agree on
-secrecy; a secret-welded pointer (`*^T`) cannot be erased to `ptr`. See
-`doc/language/secrecy.md` before touching crypto code.
+secrecy; a secret-welded pointer (`*^T`) cannot be erased to `ptr`. Also
+rejected: a secret float operand, a secret integer multiply or variable shift
+(target capability permitting), and a secret passed to a variadic pack. The
+weld checks are deep (a secret nested in an aggregate counts) and fail closed.
+Carry the obligation through codegen with `#[oblivious]`.
+
+Constant-time support is an **experimental preview**: the guarantee is
+incomplete and unaudited, with a proven secret-disclosure path still open. Read
+`doc/language/secrecy.md` before touching crypto code, and do not write
+production cryptography against it.
 
 ## Literals
 
@@ -265,7 +273,9 @@ it. `nil` with no context types as `*u8`; `var cb: fun(u32) = nil;` is legal.
   the dividend, floats included). Bitwise `& | ^ ~ << >>` (ints).
 - Comparison `== != < > <= >=` → `u8`. Mixed int signedness/width compares
   **mathematical values** (a negative `i64` < any `u64`). Int vs float
-  comparison is a compile error - cast explicitly.
+  comparison is a compile error - cast explicitly. `==`/`!=` on a `rec`/`uni`
+  **value** is rejected (padding and inactive variants make representation
+  equality meaningless) - compare field-wise.
 - Logical `&& || !` - short-circuit, `u8` operands and result.
 - Pointer: `?expr` address-of, `@p` dereference (`@p = x;` writes through).
 - Casts (postfix): `expr::T` value conversion (resize, int↔float);
@@ -426,6 +436,8 @@ immediately following declaration. Closed set:
 | `#[inline]` | fun | none | force inlining |
 | `#[align(expr)]` | val/var, rec/uni | comptime int | alignment override |
 | `#[section(".name")]` | fun, ext fun, val/var | string | object section placement |
+| `#[oblivious]` | fun | none | constant-time boundary (see `^` above) |
+| `#[scalar]` | fun | none | opt out of auto-vectorization |
 
 ```mach
 #[symbol("read")]
@@ -440,6 +452,18 @@ pin must name a DLL in the target's `libs` set - pinning to an absent library
 is a link error; on ELF the pin is validated but has no binary effect. Beware:
 a line comment starting `#[` with no space parses as a decorator - write
 `# [...]` in prose comments.
+
+`#[oblivious]` marks a constant-time boundary: the backend may not introduce a
+secret-dependent branch, a variable-latency op on a secret, or eliminate a
+zeroizing write inside it, and inline `asm` is rejected there. A function that
+*computes* on a `^` secret must carry it; one that only moves or declassifies
+secrets need not. Constant-time support is an **experimental preview** with a
+known open disclosure path - do not write production crypto against it.
+
+`#[scalar]` excludes a function from loop auto-vectorization (which runs in the
+release pipeline on targets with 128-bit vectors) and also blocks inlining, so
+the opt-out survives. The project-wide lever is the `vectorize` profile key in
+`mach.toml`, optional and default-on.
 
 ### Intrinsics - `$name(args)`
 
