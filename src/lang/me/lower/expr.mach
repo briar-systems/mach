@@ -68,6 +68,24 @@ pub fun lower_rvalue(ctx: *context.LowerContext, eid: id.ExprId) R.Result[value.
     builder.set_loc(?ctx.builder, source.loc(ctx.a.file_id, e.span.offset));
     fin { builder.set_loc(?ctx.builder, saved_loc); }
 
+    # dispatch to the per-kind lowering, then stamp the constant-time secrecy taint
+    # (#1646) onto the produced value from sema's flow typing, so every derived value
+    # carries its secrecy down to codegen.
+    val res: R.Result[value.Value, str] = lower_rvalue_kind(ctx, eid, e);
+    if (R.is_err[value.Value, str](res)) { ret res; }
+    ret R.ok[value.Value, str](stamp_secret(ctx, eid, R.unwrap_ok[value.Value, str](res)));
+}
+
+# dispatch an rvalue expression to its per-kind lowering
+#
+# The bare kind switch; `lower_rvalue` wraps it to stamp the secrecy taint on the
+# result, so every producer routes through one stamping point (#1646).
+# ---
+# ctx: per-module lowering context
+# eid: the expression to lower
+# e:   the resolved expression node
+# ret: the lowered Value, or an error
+fun lower_rvalue_kind(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R.Result[value.Value, str] {
     val k: expr.ExprKind = e.kind;
 
     if (k == expr.EXPR_KIND_LIT_INT)        { ret lower_lit_int(ctx, eid, e); }
@@ -90,6 +108,31 @@ pub fun lower_rvalue(ctx: *context.LowerContext, eid: id.ExprId) R.Result[value.
     if (k == expr.EXPR_KIND_VECTOR_LIT)     { ret lower_vector_lit(ctx, eid, e); }
 
     ret R.err[value.Value, str]("lower: unsupported expression kind in rvalue position");
+}
+
+# stamp the constant-time secrecy taint onto a produced rvalue Value (#1646)
+#
+# The per-use taint is set to exactly sema's classification of the expression: a
+# secret value is marked, a `:^` downgrade (typed public) clears the bit so the
+# declassified value flows public. When the value names an instruction result and the
+# expression is secret, the defining instruction is marked too - MONOTONICALLY (only
+# ever set true), so a `:^` public view sharing a secret definition (a `:^` is a pure
+# value passthrough) can never clear the underlying instruction's result taint. The
+# bit then rides to MIR and the final instructions for the #1648 validator.
+# ---
+# ctx: per-module lowering context
+# eid: the expression the value lowered from
+# v:   the produced value
+# ret: `v` with its secrecy taint set from sema's flow typing
+fun stamp_secret(ctx: *context.LowerContext, eid: id.ExprId, v: value.Value) value.Value {
+    val sec: bool = context.expr_is_secret(ctx, eid);
+    var out: value.Value = v;
+    out.secret = sec;
+    if (sec) {
+        val fn: *ir.Function = ctx.builder.fn;
+        instruction.mark_result_secret(fn.instrs, fn.instr_len, v);
+    }
+    ret out;
 }
 
 # lower an assignable expression to its lvalue: a pointer to the storage it names
@@ -2530,6 +2573,14 @@ fun lower_assign(ctx: *context.LowerContext, e: *expr.Expr) R.Result[value.Value
     val res_store: R.Result[bool, str] = builder.emit_store(?ctx.builder, rhs, ptr);
     if (R.is_err[bool, str](res_store)) { ret R.err[value.Value, str](R.unwrap_err[bool, str](res_store)); }
 
+    # a write into SECRET storage is a secret-memory seed even when the stored value is
+    # public - a zeroizing wipe `k = 0` of a `^` local (#1646). emit_store marks a
+    # secret-VALUE store; this marks by DESTINATION secrecy (the lvalue's semantic type),
+    # so a future dead-store-elimination and the #1648 validator keep the wipe.
+    if (context.type_is_secret(ctx, context.expr_type_of(ctx, e.data.binary.lhs))) {
+        builder.mark_last_secret(?ctx.builder);
+    }
+
     # debug birth on reassignment: rebind a simple named variable to its new value,
     # under -g only. field / index / deref lvalues are memory writes, not variable
     # rebinds, so they carry no debug value.
@@ -2705,18 +2756,25 @@ fun lower_cast(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R.Resu
     ret builder.emit_bitcast(?ctx.builder, v, dst);
 }
 
-# lower a `:^` secret-qualifier strip cast to the value it wraps (#1645)
+# lower a `:^` secret-qualifier strip cast to an explicit declassify barrier (#1646)
 #
 # `:^` removes secrecy without reinterpreting storage: secrecy has no runtime
-# representation (a `^T` shares `T`'s machine shape), so stripping is a pure
-# value passthrough. sema already proved the operand's stripped type matches the
-# result, so no conversion is emitted.
+# representation (a `^T` shares `T`'s machine shape), so at runtime it is an identity
+# the backend selects to a coalescable register move. It must be a DISTINCT SSA
+# definition (OP_DECLASSIFY), not a passthrough: a passthrough returns the operand's own
+# value, so a later substitution into that use (mem2reg promoting the operand's secret
+# reaching-def) re-taints the declassified value through the monotone RAUW join. A
+# distinct definition gives the result its own public identity a substitution cannot
+# reach, and marks the taint barrier the #1648 re-derive stops at. The enclosing
+# `lower_rvalue` stamps the result public (sema types a `:^` public).
 # ---
 # ctx: per-module lowering context
 # e:   the resolved strip node
-# ret: the operand's lowered Value, or an error
+# ret: the declassified (public) Value, or an error
 fun lower_strip(ctx: *context.LowerContext, e: *expr.Expr) R.Result[value.Value, str] {
-    ret lower_rvalue(ctx, e.data.strip.value);
+    val res_inner: R.Result[value.Value, str] = lower_rvalue(ctx, e.data.strip.value);
+    if (R.is_err[value.Value, str](res_inner)) { ret res_inner; }
+    ret builder.emit_declassify(?ctx.builder, R.unwrap_ok[value.Value, str](res_inner));
 }
 
 # fold a value-context comptime path to its constant value
