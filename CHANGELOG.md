@@ -98,9 +98,10 @@ stays open; the holes are enumerated under Added below.)
   back edge) instead of two. On a branch-throughput-bound counting loop this
   roughly doubles throughput: 1.774s → 0.888s best-of-5 on x86-64 release
   (#1937).
-- codegen: **branches to the fallthrough block are elided** — 66,975 dead jumps
-  removed across the compiler's own self-build corpus, exactly the observed
-  `.text` reduction (66,965 × 5 bytes of x64 `rel32`) (#1936).
+- codegen: **branches to the fallthrough block are elided** — across the
+  compiler's own self-build corpus, jump-to-next-instruction sequences fall from
+  66,975 to ~10 (the residual are jumps over degenerate zero-byte blocks), and
+  `.text` shrinks by exactly the eliminated x64 `rel32` bytes (#1936).
 - inline: **bounded self-recursion peeling** — a directly self-recursive function
   is peeled K levels from a pristine id-stable snapshot, so the peel stays a
   uniform K deep with the residual tail calling back into the real function. On
