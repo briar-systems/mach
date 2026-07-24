@@ -1,0 +1,414 @@
+# constant-time translation validator: the relational leakage check over lowered MIR (#1648)
+#
+# The enforcement CONSUMER of the #1646 secret-taint foundation. #1646 stamps only the
+# secret SOURCES on the lowered, target-independent MIR - a secret parameter / welded
+# load / secret call's result vreg (`MirVReg.secret`), a store or memzero into secret
+# storage (`MirInstr.writes_secret`), and a `:^` declassify lowered to a distinguishable
+# `MIR_DECLASSIFY` barrier - and deliberately does NOT thread a per-value taint through
+# the transforms (that model was fragile and non-deterministic). This pass RE-DERIVES the
+# per-instruction taint from those stable seeds as a monotone dataflow FIXPOINT and then
+# checks, in every `#[oblivious]` function, that no secret-tainted value reaches a leaking
+# position. Because the seeds sit on sources and the taint is re-derived here, no earlier
+# transform - phi elimination, inlining, loop rotation, width legalization - can launder a
+# secret past the check: the merge / clone / copy it produces is just another operand the
+# fixpoint propagates through.
+#
+# THE RE-DERIVE. `taint[v]` seeds from `MirVReg.secret` and grows by one rule:
+#   any-secret-operand -> secret-result,
+# with `MIR_DECLASSIFY` a HARD BARRIER - its result is public regardless of its secret
+# source, so propagation stops there (isel later retags the barrier to a plain move, so it
+# costs nothing at runtime; the distinction exists only for this analysis). Out-of-SSA MIR
+# lets one vreg be defined by several instructions (a phi becomes predecessor-end moves,
+# a loop-carried value is re-defined across a back edge), so the taint is a whole-function
+# fixpoint over a monotone boolean lattice, not a single forward sweep: a use that
+# textually precedes its secret definition (a loop header testing a value the body makes
+# secret) is still caught. Physical registers a value is PRE-COLORED into at lowering (an
+# x86-64 division dividend in RAX, a variable shift count in RCX) carry a block-local taint
+# recomputed within the same forward walk, so a secret reaching a fixed-register operand is
+# not lost at the register boundary.
+#
+# THE CHECK. In a function carrying `#[oblivious]` (`MirFunction.oblivious`), a secret-
+# tainted value must not reach:
+#   (a) a conditional-branch CONDITION (`MIR_CBR` operand 0) - the taken path, hence the
+#       timing, would depend on the secret;
+#   (b) a memory ADDRESS - the base or scaled-index vreg of any memory operand (a load
+#       source, a store destination, a GEP), whose access pattern leaks through the cache;
+#       the STORED VALUE being secret is fine, only the address is observed;
+#   (c) an operand of a variable-latency op the shared `mach.lang.ct` table plus the
+#       target's capabilities forbid - an integer multiply on a target with no trusted
+#       data-independent multiply, a variable shift COUNT on a target with no barrel
+#       shifter, and (always, target-independent) an integer divide / remainder or a
+#       floating-point op. The same `ct` table drives the compile-time gates in
+#       `mir.lower`; this pass is the independent RELATIONAL backstop that re-derives taint
+#       and re-checks, catching whatever a future pass might slip past those gates.
+# A violation is a precise compile error naming the function and the leaking op. The pass
+# is CONSERVATIVE by construction (a missed taint would defeat the guarantee, so it errs
+# toward over-taint) and pure analysis: it never mutates the MIR, so a build with no
+# `#[oblivious]` function - and every function within one that handles no secret - is
+# byte-identical to a build without it.
+#
+# SCOPE (documented contract, #1646 -> #1648). The validated layer is the LOWERED,
+# pre-selection MIR: this pass runs after loop rotation and legalization and before
+# instruction selection, so it validates exactly what isel consumes and trusts
+# isel / regalloc / encode to be timing-preserving. True translation-validation of the
+# EMITTED machine code (the epic's eventual goal) needs the seeds and barrier to survive
+# to post-regalloc MIR - additive per-ISA work left as future strengthening; the lowered-
+# MIR contract does not foreclose it.
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.bool.false;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.format;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.be.codegen.mir;
+use mach.lang.ct;
+use mach.lang.intern;
+use target: mach.lang.target.resolved;
+
+# validate every `#[oblivious]` function of a MIR module for constant-time leakage
+#
+# The shared entry point the codegen driver calls between legalization and instruction
+# selection. Re-derives the secret taint from the #1646 seeds and rejects a secret value
+# reaching a branch condition, a memory address, or a forbidden variable-latency op inside
+# any function marked `#[oblivious]`. A function without the marker is skipped; the pass
+# never mutates the MIR, so a module with no oblivious function is validated in a single
+# read and emitted byte-identically.
+# ---
+# tgt: resolved compilation target (supplies the constant-time capability flags)
+# m:   the MIR module to validate in place (read-only)
+# ret: ok(true) when every oblivious function is leak-free, or the first violation's error
+pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
+    if (tgt == nil) { ret R.err[bool, str]("ctvalidate: nil target"); }
+    if (m == nil)   { ret R.err[bool, str]("ctvalidate: nil mir module"); }
+
+    var i: u32 = 0;
+    for (i < m.function_len) {
+        val f: *mir.MirFunction = ?m.functions[i];
+        if (f.oblivious) {
+            val res: R.Result[bool, str] = validate_function(tgt, f, m.interner, m.alloc);
+            if (R.is_err[bool, str](res)) { ret res; }
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# re-derive the secret taint of one function and check it for leakage
+#
+# Seeds `taint` from `MirVReg.secret`, iterates the propagation to a fixpoint, then walks
+# every block once running the three leakage checks. The scratch taint arrays are owned
+# here and freed before return.
+# ---
+# tgt:      resolved target (constant-time capability flags)
+# f:        the function to validate
+# interner: session interner for resolving the function name in a diagnostic (may be nil)
+# alloc:    backing allocator for the scratch taint arrays and diagnostic text
+# ret:      ok(true) when leak-free, or the first violation's error
+fun validate_function(tgt: *target.Target, f: *mir.MirFunction, interner: *intern.Interner, alloc: *A.Allocator) R.Result[bool, str] {
+    val nv: u32 = f.vreg_count;
+    if (nv == 0 || f.block_count == 0) { ret R.ok[bool, str](true); }
+
+    val rv: R.Result[*bool, str] = A.allocate[bool](alloc, nv::usize);
+    if (R.is_err[*bool, str](rv)) { ret R.err[bool, str](R.unwrap_err[*bool, str](rv)); }
+    val vt: *bool = R.unwrap_ok[*bool, str](rv);
+
+    # the taint SEED: a vreg defined by a secret source starts secret (#1646). derived
+    # secrecy is re-derived below, never seeded.
+    var i: u32 = 0;
+    for (i < nv) { vt[i] = f.vregs[i].secret; i = i + 1; }
+
+    # block-local taint for the physical registers a value is pre-colored into at lowering.
+    # sized to the largest physical-register id the function names, or skipped when it
+    # pre-colors nothing.
+    val mp: u32 = max_preg(f);
+    var np: u32 = 0;
+    var pt: *bool = nil;
+    if (mp != NO_PREG) {
+        np = mp + 1;
+        val rp: R.Result[*bool, str] = A.allocate[bool](alloc, np::usize);
+        if (R.is_err[*bool, str](rp)) {
+            A.deallocate[bool](alloc, vt, nv::usize);
+            ret R.err[bool, str](R.unwrap_err[*bool, str](rp));
+        }
+        pt = R.unwrap_ok[*bool, str](rp);
+    }
+
+    # the fixpoint: propagate any-secret-operand -> secret-result over every block until no
+    # vreg's taint changes. monotone over a finite boolean lattice, so it terminates.
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var bi: u32 = 0;
+        for (bi < f.block_count) {
+            val blk: *mir.MirBlock = ?f.blocks[bi];
+            clear_pregs(pt, np);
+            var ii: u32 = 0;
+            for (ii < blk.instr_count) {
+                if (apply_instr(?blk.instrs[ii], vt, nv, pt, np)) { changed = true; }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+    }
+
+    # the checks: one final read-only walk. the physical-register taint is recomputed in the
+    # same forward order so a pre-colored operand is checked against the value moved into it.
+    var bj: u32 = 0;
+    for (bj < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bj];
+        clear_pregs(pt, np);
+        var ij: u32 = 0;
+        for (ij < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ij];
+            val chk: R.Result[bool, str] = check_instr(tgt, f, mi, vt, nv, pt, np, interner, alloc);
+            if (R.is_err[bool, str](chk)) {
+                free_taint(alloc, vt, nv, pt, np);
+                ret chk;
+            }
+            # advance the block-local physical-register taint for the next instruction's reads.
+            if (apply_instr(mi, vt, nv, pt, np)) {}
+            ij = ij + 1;
+        }
+        bj = bj + 1;
+    }
+
+    free_taint(alloc, vt, nv, pt, np);
+    ret R.ok[bool, str](true);
+}
+
+# release the scratch taint arrays
+fun free_taint(alloc: *A.Allocator, vt: *bool, nv: u32, pt: *bool, np: u32) {
+    A.deallocate[bool](alloc, vt, nv::usize);
+    if (pt != nil && np > 0) { A.deallocate[bool](alloc, pt, np::usize); }
+}
+
+# sentinel "the function names no physical register"
+val NO_PREG: u32 = 0xFFFFFFFF;
+
+# the largest physical-register id any PREG operand of the function names, or NO_PREG when
+# it names none. sizes the block-local physical-register taint array
+fun max_preg(f: *mir.MirFunction) u32 {
+    var best: u32 = NO_PREG;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            var k: u32 = 0;
+            for (k < mi.operand_count) {
+                val op: *mir.MirOperand = ?mi.operands[k];
+                if (op.kind == mir.MIR_OP_PREG) {
+                    if (best == NO_PREG || op.preg > best) { best = op.preg; }
+                }
+                k = k + 1;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret best;
+}
+
+# reset every physical-register taint bit to public (called at each block entry)
+fun clear_pregs(pt: *bool, np: u32) {
+    if (pt == nil) { ret; }
+    var i: u32 = 0;
+    for (i < np) { pt[i] = false; i = i + 1; }
+}
+
+# whether an operand reads a secret value: a tainted vreg, a tainted pre-colored physical
+# register, or a memory operand whose base or scaled-index vreg is tainted (a secret-
+# dependent address). immediates, symbols, and block targets are never secret
+fun operand_secret(op: *mir.MirOperand, vt: *bool, nv: u32, pt: *bool, np: u32) bool {
+    if (op.kind == mir.MIR_OP_VREG) { ret op.vreg < nv && vt[op.vreg]; }
+    if (op.kind == mir.MIR_OP_PREG) { ret pt != nil && op.preg < np && pt[op.preg]; }
+    if (op.kind == mir.MIR_OP_MEM) {
+        if (op.vreg != mir.MIR_VREG_NIL && op.vreg < nv && vt[op.vreg])   { ret true; }
+        if (op.index != mir.MIR_VREG_NIL && op.index < nv && vt[op.index]) { ret true; }
+        ret false;
+    }
+    ret false;
+}
+
+# propagate taint across one instruction: mark its destination secret when any operand is
+# secret, updating the vreg taint (monotone, for the fixpoint) and the block-local physical
+# register taint (overwritten, since a physical register is redefined each write). returns
+# whether a vreg's taint bit newly flipped. `MIR_DECLASSIFY` is the barrier: its result is
+# public regardless of its source, so it propagates nothing. `MIR_CALL` clobbers every
+# caller-saved physical register, so it clears the block-local physical-register taint
+fun apply_instr(mi: *mir.MirInstr, vt: *bool, nv: u32, pt: *bool, np: u32) bool {
+    if (mi.opcode == mir.MIR_CALL)       { clear_pregs(pt, np); ret false; }
+    if (mi.opcode == mir.MIR_DECLASSIFY) { ret false; }
+    if (mi.operand_count == 0)           { ret false; }
+
+    var s: bool = false;
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        if (operand_secret(?mi.operands[k], vt, nv, pt, np)) { s = true; }
+        k = k + 1;
+    }
+
+    if (!mir.instr_defines_shape(mi)) { ret false; }
+    val d: *mir.MirOperand = ?mi.operands[0];
+    if (d.kind == mir.MIR_OP_VREG && d.vreg < nv) {
+        if (s && !vt[d.vreg]) { vt[d.vreg] = true; ret true; }
+        ret false;
+    }
+    if (d.kind == mir.MIR_OP_PREG && pt != nil && d.preg < np) { pt[d.preg] = s; }
+    ret false;
+}
+
+# run the three leakage checks on one instruction of an oblivious function
+# ---
+# tgt:      resolved target (constant-time capability flags)
+# f:        the owning function (for its name and vreg count)
+# mi:       the instruction to check
+# vt/nv:    the vreg taint array and its length
+# pt/np:    the block-local physical-register taint array and its length
+# interner: session interner for the diagnostic (may be nil)
+# alloc:    allocator for the diagnostic text
+# ret:      ok(true) when the instruction leaks nothing, or the violation's error
+fun check_instr(tgt: *target.Target, f: *mir.MirFunction, mi: *mir.MirInstr, vt: *bool, nv: u32, pt: *bool, np: u32, interner: *intern.Interner, alloc: *A.Allocator) R.Result[bool, str] {
+    # (a) a conditional branch whose condition is secret leaks through the taken path.
+    if (mi.opcode == mir.MIR_CBR) {
+        if (mi.operand_count >= 1 && operand_secret(?mi.operands[0], vt, nv, pt, np)) {
+            ret R.err[bool, str](leak_msg(alloc, interner, f.name,
+                "uses a secret value as a conditional-branch condition; the branch decides the taken path, so its timing reveals the secret. select branch-free (a masked select) over public data, or `:^`-declassify the value when disclosure is intended"));
+        }
+    }
+    # a fused compare-and-branch (produced by selection, not present at this layer) reads its
+    # two compared values in operands 0 and 1; checked defensively so a future placement stays sound.
+    if (mir.is_fused_cbr(mi.opcode)) {
+        if (mi.operand_count >= 1 && operand_secret(?mi.operands[0], vt, nv, pt, np)) {
+            ret R.err[bool, str](leak_msg(alloc, interner, f.name,
+                "compares a secret value in a conditional branch; the branch's taken path reveals the secret. select branch-free over public data, or `:^`-declassify when disclosure is intended"));
+        }
+        if (mi.operand_count >= 2 && operand_secret(?mi.operands[1], vt, nv, pt, np)) {
+            ret R.err[bool, str](leak_msg(alloc, interner, f.name,
+                "compares a secret value in a conditional branch; the branch's taken path reveals the secret. select branch-free over public data, or `:^`-declassify when disclosure is intended"));
+        }
+    }
+    # (b) a memory operand whose address (base or scaled index) is secret leaks the access.
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        val op: *mir.MirOperand = ?mi.operands[k];
+        if (op.kind == mir.MIR_OP_MEM) {
+            if (op.vreg != mir.MIR_VREG_NIL && op.vreg < nv && vt[op.vreg]) {
+                ret R.err[bool, str](leak_msg(alloc, interner, f.name,
+                    "uses a secret value as a memory address; a secret-dependent load or store address leaks the secret through the memory-access pattern. index at a public offset, or `:^`-declassify the pointer when disclosure is intended"));
+            }
+            if (op.index != mir.MIR_VREG_NIL && op.index < nv && vt[op.index]) {
+                ret R.err[bool, str](leak_msg(alloc, interner, f.name,
+                    "uses a secret value as a memory index; a secret-dependent load or store address leaks the secret through the memory-access pattern. index at a public offset, or `:^`-declassify the index when disclosure is intended"));
+            }
+        }
+        k = k + 1;
+    }
+    # (c) a variable-latency op the target cannot do in constant time on a secret operand.
+    val cop: ct.CtOp = mir_ct_op(mi.opcode);
+    if (cop != ct.CT_OP_NONE) {
+        val cap: ct.CtCap = ct.ct_cap(cop);
+        if (!ct.target_provides(tgt.model.ct_trust_mul, tgt.model.ct_trust_var_shift, cap)) {
+            if (ct_secret_operand(mi, cop, vt, nv, pt, np)) {
+                ret R.err[bool, str](leak_msg(alloc, interner, f.name, ct_op_detail(cop)));
+            }
+        }
+    }
+    ret R.ok[bool, str](true);
+}
+
+# the constant-time op class of a generic MIR opcode, for the shared `mach.lang.ct` table
+#
+# The validator's classifier: unlike the compile-time gate (which leaves div / mod
+# unclassified because sema enforces them target-independently), this is the exhaustive
+# backstop, so it names integer divide / remainder and every floating-point op too. A
+# constant-count shift reaches here as `MIR_SHL/SHR` but its count operand is an immediate,
+# so the count-only observation finds nothing secret - only a variable secret count trips.
+# ---
+# op:  a generic (pre-selection) MIR opcode
+# ret: the CtOp class, or CT_OP_NONE for a constant-time opcode
+fun mir_ct_op(op: mir.MirOpcode) ct.CtOp {
+    if (op == mir.MIR_MUL)                                             { ret ct.CT_OP_INT_MUL; }
+    if (op == mir.MIR_DIV_S || op == mir.MIR_DIV_U ||
+        op == mir.MIR_REM_S || op == mir.MIR_REM_U)                   { ret ct.CT_OP_INT_DIVMOD; }
+    if (op == mir.MIR_SHL || op == mir.MIR_SHR_S || op == mir.MIR_SHR_U) { ret ct.CT_OP_VAR_SHIFT; }
+    if (op == mir.MIR_FP_TRUNC || op == mir.MIR_FP_EXT ||
+        op == mir.MIR_FP_TO_SI || op == mir.MIR_FP_TO_UI ||
+        op == mir.MIR_SI_TO_FP || op == mir.MIR_UI_TO_FP)             { ret ct.CT_OP_FLOAT; }
+    if (op == mir.MIR_FADD || op == mir.MIR_FSUB || op == mir.MIR_FMUL ||
+        op == mir.MIR_FDIV || op == mir.MIR_FCMP || op == mir.MIR_FNEG) { ret ct.CT_OP_FLOAT; }
+    ret ct.CT_OP_NONE;
+}
+
+# whether the leakage-observed operand of a variable-latency op is secret
+#
+# A shift leaks through its variable COUNT alone (a secret value shifted by a public count
+# is constant-time), so a count-only class observes just the count - the LAST operand of
+# the three-address `[dst, value, count]` shift. Every other class observes each INPUT
+# operand: the pure-def destination (operand 0 when a value vreg) is skipped, so a result
+# is judged by its inputs, while a read-modified physical accumulator (an x86-64 division
+# dividend in RAX at operand 0) is observed
+fun ct_secret_operand(mi: *mir.MirInstr, cop: ct.CtOp, vt: *bool, nv: u32, pt: *bool, np: u32) bool {
+    if (ct.ct_op_gates_count_only(cop)) {
+        if (mi.operand_count < 2) { ret false; }
+        ret operand_secret(?mi.operands[mi.operand_count - 1], vt, nv, pt, np);
+    }
+    val skip_def: bool = mir.instr_defines_shape(mi)
+        && mi.operand_count > 0 && mi.operands[0].kind == mir.MIR_OP_VREG;
+    var k: u32 = 0;
+    for (k < mi.operand_count) {
+        if (!(k == 0 && skip_def)) {
+            if (operand_secret(?mi.operands[k], vt, nv, pt, np)) { ret true; }
+        }
+        k = k + 1;
+    }
+    ret false;
+}
+
+# the teaching detail for a secret operand of a forbidden variable-latency op, mirroring
+# the compile-time gate's diagnostics
+fun ct_op_detail(cop: ct.CtOp) str {
+    if (cop == ct.CT_OP_VAR_SHIFT) {
+        ret "uses a secret value as a variable shift count on a target without a barrel shifter; the shift's cycle count leaks the secret amount. shift by a public count, or run on a target whose variable shift is constant-time";
+    }
+    if (cop == ct.CT_OP_FLOAT) {
+        ret "uses a secret value in a variable-latency floating-point operation; the FP unit's timing can depend on the secret operand. compute on public data, or `:^`-declassify when disclosure is intended";
+    }
+    if (cop == ct.CT_OP_INT_DIVMOD) {
+        ret "uses a secret value in an integer divide or remainder; the division unit's latency is data-dependent, so it leaks the secret operand. compute branch-free over public data";
+    }
+    ret "uses a secret value in a variable-latency integer multiply; this target documents no data-independent multiply timing, so the product's latency can leak the secret operand. compute branch-free over public data, or run on a target whose DIT/DOITM mode is trusted";
+}
+
+# build "codegen: #[oblivious] function `<name>` <detail>", interned to a stable string
+#
+# Degrades to the bare `detail` (which already names the leak precisely) when the interner
+# is absent or an allocation fails, so a diagnostic is always produced
+fun leak_msg(alloc: *A.Allocator, interner: *intern.Interner, name_id: intern.StrId, detail: str) str {
+    if (interner == nil) { ret detail; }
+    val name: str = fn_name(interner, name_id);
+    val res: R.Result[str, str] = format.sprint(alloc, "codegen: #[oblivious] function `{}` {}", name, detail);
+    if (R.is_err[str, str](res)) { ret detail; }
+    val buf: str = R.unwrap_ok[str, str](res);
+    val ir: R.Result[intern.StrId, str] = intern.intern(interner, buf);
+    A.deallocate[u8](alloc, buf, str_len(buf) + 1);
+    if (R.is_err[intern.StrId, str](ir)) { ret detail; }
+    val lo: O.Option[str] = intern.lookup(interner, R.unwrap_ok[intern.StrId, str](ir));
+    if (O.is_some[str](lo)) { ret O.unwrap[str](lo); }
+    ret detail;
+}
+
+# the function's source name, or "<unknown>" when unresolved
+fun fn_name(interner: *intern.Interner, id: intern.StrId) str {
+    val o: O.Option[str] = intern.lookup(interner, id);
+    if (O.is_some[str](o)) { ret O.unwrap[str](o); }
+    ret "<unknown>";
+}
