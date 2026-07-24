@@ -50,6 +50,13 @@ A pointer-like value — a pointer or a function — may be compared against `ni
 (the null-address literal). On the seeded vector types, a comparison produces a
 same-shape unsigned **mask** vector (lane-wise) — see [SIMD vectors](#simd-vectors).
 
+`==` / `!=` on an **aggregate value** (a `rec` or `uni`) is a compile error.
+Comparing representations would silently relate padding bytes and unwritten union
+variants, so no structural equality is implied; write an explicit field-wise
+comparison. Comparing pointers *to* aggregates is unaffected, and the rejection
+applies to a generic instantiated at an aggregate type as well as to a concrete
+one.
+
 ## Logical
 
 `&&` `||` `!` — short-circuiting. Operands are `u8` (`0` is false, nonzero is
