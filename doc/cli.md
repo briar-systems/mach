@@ -100,7 +100,7 @@ unit's inputs — prints it, and exits without compiling or linking.
 | Flag           | Value          | Effect |
 |----------------|----------------|--------|
 | `-O0`          | —              | force the debug pipeline for this build, overriding the selected profile's `opt` |
-| `-O1` / `-O2`  | —              | select the release pipeline, overriding the selected profile's `opt` |
+| `-O1` / `-O2`  | —              | select the release pipeline, overriding the selected profile's `opt`; both currently share a pass set, which includes loop auto-vectorization on a vector-capable target (the profile's `vectorize` key and the `#[scalar]` decorator opt out) |
 | `-g`           | —              | emit debug info for this build, forcing the selected profile's `debug` on (precedence `-g` > profile > off) |
 | `--emit <kind>`| `obj`\|`exe`   | `obj` stops at the relocatable objects; `exe` (default) links a binary |
 | `--jobs <n>`   | count          | codegen worker threads (default: host CPUs; `1` serialises) |

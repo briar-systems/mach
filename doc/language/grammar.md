@@ -223,7 +223,7 @@ decorated-decl ::= { decorator } decl
 - Arguments are comptime expressions (not types): `$size_of(T)` is a valid
   argument; `T` as a raw type name is not.
 - The closed directive set is `symbol`, `section`, `inline`, `align`,
-  `library`. See [decorators.md](decorators.md).
+  `library`, `oblivious`, `scalar`. See [decorators.md](decorators.md).
 - A backtick form (`` `name(args)` ``) existed through v2.3.0 and was removed in
   v2.4.0; a backtick at decorator position is a migration error.
 
