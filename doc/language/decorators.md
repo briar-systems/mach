@@ -163,6 +163,10 @@ A function instance that *computes* on a `^` secret (arithmetic, bitwise, shift,
 comparison, negation) is **required** to carry it; an instance that only moves,
 stores, or declassifies secrets stays annotation-free.
 
+It is rejected outright for a target whose back half emits a module for a
+downstream compiler rather than the executed instructions (the experimental
+SPIR-V backend): the contract cannot be validated or upheld there.
+
 > **Experimental preview.** The constant-time guarantee is not complete and has
 > not been audited — see [secrecy.md](secrecy.md#assurance) for the known open
 > holes. Do not build production cryptography on it at this version.

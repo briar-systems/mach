@@ -142,6 +142,13 @@ memory address, or a forbidden variable-latency op is a compile error naming the
 function and the offending operation. It is a backstop behind the compile-time
 gates, not a replacement for them.
 
+The contract is only offered where mach emits the instructions that execute.
+A target whose back half hands a module to a downstream compiler instead — the
+experimental SPIR-V backend — **rejects `#[oblivious]`**: neither that
+translation nor the device's timing behaviour is covered by the leakage model,
+so the obligation could be neither validated nor upheld. Compile constant-time
+code for a machine target and pass such a target only public data.
+
 ## Trusted base
 
 The only secret-to-public crossings are the explicit `:^` cast and inline `asm`
@@ -172,14 +179,14 @@ What does not hold — the known open holes:
   (briar-systems/mach#2168).
 - a secret integer `==` / `!=` compiles a timing branch on targets without
   comparison flags (briar-systems/mach#2158)
-- an `#[oblivious]` function compiled to SPIR-V bypasses the validator entirely
-  (briar-systems/mach#2159)
 - deep secrecy placement over-rejects differing-shape aggregates that lack field
   offsets — sound but too strict (briar-systems/mach#2167)
 
 The validator's scope is the lowered MIR; it trusts instruction selection, width
 legalization, register allocation, and encoding to be timing-preserving.
-Validation of the emitted machine code is future work.
+Validation of the emitted machine code is future work. Where mach does not own
+those stages at all — a whole-module emitter such as SPIR-V — the contract is
+refused rather than assumed.
 
 ## See also
 
