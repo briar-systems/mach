@@ -127,6 +127,13 @@ pub fun run(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
             hi = hi + 1;
         }
         free_candidates(m, headers, deps, hn, cap);
+
+        # the reduction phase, over the (possibly element-wise-transformed) function;
+        # reduction loops are disjoint from element-wise loops (a reduction has no
+        # store), so an element-wise transform never turns one into a reduction
+        val rr: R.Result[bool, str] = run_reductions(m, fn);
+        if (R.is_err[bool, str](rr)) { ret rr; }
+        if (R.unwrap_ok[bool, str](rr)) { changed = true; }
         fi = fi + 1;
     }
     ret R.ok[bool, str](changed);
@@ -237,7 +244,7 @@ fun stores_are_pure_trees(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalys
     val rset: R.Result[*bool, str] = A.allocate[bool](m.alloc, fn.instr_len::usize);
     if (R.is_err[*bool, str](rset)) { ret R.err[bool, str](R.unwrap_err[*bool, str](rset)); }
     val vset: *bool = R.unwrap_ok[*bool, str](rset);
-    build_vset(fn, la, lx, d, shape, vset);
+    build_vset(fn, la, lx, d.accesses, d.access_count, shape.elem_ty, shape.is_float, vset);
 
     var ok: bool = true;
     var i: u32 = 0;
@@ -263,12 +270,12 @@ fun stores_are_pure_trees(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalys
 # induction-variable operand keeps an op out (that would need a splat), the
 # result-type check keeps any width- or kind-changing op out, and the walk skips the
 # header block so only true body computation is admitted.
-fun build_vset(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, d: *dep.DepInfo, shape: *MapShape, vset: *bool) {
+fun build_vset(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, accesses: *dep.MemAccess, access_count: u32, elem_ty: ir_type.IrTypeId, is_float: bool, vset: *bool) {
     var i: u32 = 0;
     for (i < fn.instr_len) { vset[i] = false; i = i + 1; }
     i = 0;
-    for (i < d.access_count) {
-        if (!d.accesses[i].is_store) { vset[d.accesses[i].instr::u32] = true; }
+    for (i < access_count) {
+        if (!accesses[i].is_store) { vset[accesses[i].instr::u32] = true; }
         i = i + 1;
     }
     val lp: *loops.Loop = ?la.loops[lx];
@@ -286,7 +293,7 @@ fun build_vset(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, d: *dep.DepIn
                     val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, iid);
                     if (O.is_some[*instruction.Instruction](opt)) {
                         val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
-                        if (supported_vector_op(inst.kind, shape.is_float) && inst.ty == shape.elem_ty && all_operands_in_set(inst, fn, vset)) {
+                        if (supported_vector_op(inst.kind, is_float) && inst.ty == elem_ty && all_operands_in_set(inst, fn, vset)) {
                             vset[iid::u32] = true;
                             changed = true;
                         }
@@ -429,7 +436,7 @@ fun vectorize_one(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: 
     val rset: R.Result[*bool, str] = A.allocate[bool](m.alloc, fn.instr_len::usize);
     if (R.is_err[*bool, str](rset)) { A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize); A.deallocate[id.BlockId](m.alloc, rem_blocks, body_len::usize); dep.dep_dnit(?fd); loops.dnit(?fla); ret R.err[bool, str](R.unwrap_err[*bool, str](rset)); }
     val vset: *bool = R.unwrap_ok[*bool, str](rset);
-    build_vset(fn, ?fla, flx, ?fd, ?fshape, vset);
+    build_vset(fn, ?fla, flx, fd.accesses, fd.access_count, fshape.elem_ty, fshape.is_float, vset);
     retype_to_vector(fn, flp, vset, vec_ty);
     A.deallocate[bool](m.alloc, vset, fn.instr_len::usize);
 
@@ -529,4 +536,375 @@ fun set_phi_incoming(fn: *ir.Function, blk: id.BlockId, from: id.BlockId, new_bl
         }
         pi = pi + 1;
     }
+}
+
+# vectorize the integer reductions in one function, in two phases like run(): collect
+# the reduction candidates (read-only, keeping each ReductionInfo), then transform
+# each, re-analyzing to relocate it. A pure reduction has no store so no alias guard
+# is needed; the transform builds a vector accumulator (lane 0 = the user's initial
+# value, the other lanes the op identity), a vector main loop, a horizontal combine,
+# and a scalar remainder that continues from the combined value.
+fun run_reductions(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
+    var changed: bool = false;
+    val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, m.alloc);
+    if (R.is_err[loops.LoopAnalysis, str](ral)) { ret R.err[bool, str](R.unwrap_err[loops.LoopAnalysis, str](ral)); }
+    var la: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ral);
+
+    val cap: u32 = la.loop_len + 1;
+    val rhh: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](m.alloc, cap::usize);
+    if (R.is_err[*id.BlockId, str](rhh)) { loops.dnit(?la); ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](rhh)); }
+    val headers: *id.BlockId = R.unwrap_ok[*id.BlockId, str](rhh);
+    val rra: R.Result[*dep.ReductionInfo, str] = A.allocate[dep.ReductionInfo](m.alloc, cap::usize);
+    if (R.is_err[*dep.ReductionInfo, str](rra)) { A.deallocate[id.BlockId](m.alloc, headers, cap::usize); loops.dnit(?la); ret R.err[bool, str](R.unwrap_err[*dep.ReductionInfo, str](rra)); }
+    val reds: *dep.ReductionInfo = R.unwrap_ok[*dep.ReductionInfo, str](rra);
+
+    var hn: u32 = 0;
+    var lx: u32 = 0;
+    for (lx < la.loop_len) {
+        var ri: dep.ReductionInfo;
+        val rc: R.Result[bool, str] = reduction_candidate(m, fn, ?la, lx, ?ri);
+        if (R.is_err[bool, str](rc)) { free_reds(m, headers, reds, hn, cap); loops.dnit(?la); ret rc; }
+        if (R.unwrap_ok[bool, str](rc)) { headers[hn] = la.loops[lx].header; reds[hn] = ri; hn = hn + 1; }
+        lx = lx + 1;
+    }
+    loops.dnit(?la);
+
+    var hi: u32 = 0;
+    for (hi < hn) {
+        val ra2: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, m.alloc);
+        if (R.is_err[loops.LoopAnalysis, str](ra2)) { free_reds(m, headers, reds, hn, cap); ret R.err[bool, str](R.unwrap_err[loops.LoopAnalysis, str](ra2)); }
+        var la2: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ra2);
+        val lx2: u32 = find_loop_by_header(?la2, headers[hi]);
+        if (lx2 != ver.NONE_U32) {
+            val rvz: R.Result[bool, str] = vectorize_reduction(m, fn, ?la2, lx2, ?reds[hi]);
+            if (R.is_err[bool, str](rvz)) { loops.dnit(?la2); free_reds(m, headers, reds, hn, cap); ret rvz; }
+            if (R.unwrap_ok[bool, str](rvz)) { changed = true; }
+        }
+        loops.dnit(?la2);
+        hi = hi + 1;
+    }
+    free_reds(m, headers, reds, hn, cap);
+    ret R.ok[bool, str](changed);
+}
+
+fun free_reds(m: *ir.Module, headers: *id.BlockId, reds: *dep.ReductionInfo, hn: u32, cap: u32) {
+    var i: u32 = 0;
+    for (i < hn) { dep.reduction_dnit(?reds[i]); i = i + 1; }
+    A.deallocate[id.BlockId](m.alloc, headers, cap::usize);
+    A.deallocate[dep.ReductionInfo](m.alloc, reds, cap::usize);
+}
+
+# whether loop `lx` is a vectorizable integer reduction; on true the ReductionInfo is
+# transferred to `out_ri` (caller owns / dnits it)
+fun reduction_candidate(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, out_ri: *dep.ReductionInfo) R.Result[bool, str] {
+    val lp: *loops.Loop = ?la.loops[lx];
+    if (!reduction_shape_ok(lp)) { ret R.ok[bool, str](false); }
+    val rr: R.Result[dep.ReductionInfo, str] = dep.analyze_reduction(fn, la, lx, ?m.types, m.alloc);
+    if (R.is_err[dep.ReductionInfo, str](rr)) { ret R.err[bool, str](R.unwrap_err[dep.ReductionInfo, str](rr)); }
+    var ri: dep.ReductionInfo = R.unwrap_ok[dep.ReductionInfo, str](rr);
+    if (!ri.ok) { dep.reduction_dnit(?ri); ret R.ok[bool, str](false); }
+    # the reduction value must be a pure lane-op tree over the loads (no scalar / splat
+    # operand), exactly the element-wise vector set seeded from the loads
+    if (!rv_is_vector_tree(m, fn, la, lx, ?ri)) { dep.reduction_dnit(?ri); ret R.ok[bool, str](false); }
+    @out_ri = ri;
+    ret R.ok[bool, str](true);
+}
+
+# the structural gate shared by recognition and transform: counted, iv on the left
+# with the continue edge on true, unit step, and the single-block body shape
+fun reduction_shape_ok(lp: *loops.Loop) bool {
+    if (!lp.is_counted) { ret false; }
+    if (lp.preheader == id.BLOCK_NIL || lp.latch == id.BLOCK_NIL || lp.exit == id.BLOCK_NIL || lp.exiting == id.BLOCK_NIL) { ret false; }
+    if (!lp.counted.iv_on_left || !lp.counted.continue_on_true) { ret false; }
+    if (lp.iv.step.kind != value.VAL_CONST_INT || lp.iv.step.data.int_lit != 1) { ret false; }
+    if (lp.body_len != 2 || lp.latch == lp.header) { ret false; }
+    ret true;
+}
+
+# true when the reduction value `ri.rv` is reachable through the vector set (the loads
+# plus supported same-type lane ops over them)
+fun rv_is_vector_tree(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, ri: *dep.ReductionInfo) bool {
+    val rset: R.Result[*bool, str] = A.allocate[bool](m.alloc, fn.instr_len::usize);
+    if (R.is_err[*bool, str](rset)) { ret false; }
+    val vset: *bool = R.unwrap_ok[*bool, str](rset);
+    build_vset(fn, la, lx, ri.accesses, ri.access_count, ri.elem_ty, false, vset);
+    var ok: bool = ri.rv.kind == value.VAL_INSTR && ri.rv.data.instr::u32 < fn.instr_len && vset[ri.rv.data.instr::u32];
+    A.deallocate[bool](m.alloc, vset, fn.instr_len::usize);
+    ret ok;
+}
+
+# the OP identity constant for a reduction op (add/xor/or -> 0; and -> all-ones)
+fun reduction_identity(op: instruction.InstrKind, elem_ty: ir_type.IrTypeId) value.Value {
+    if (op == instruction.OP_AND) { ret value.const_int(0xFFFFFFFFFFFFFFFF, elem_ty); }
+    ret value.const_int(0, elem_ty);
+}
+
+# emit the scalar reduction op `op` (add/xor/or/and) over two scalars into `b`
+fun emit_reduction_op(b: *builder.Builder, op: instruction.InstrKind, x: value.Value, y: value.Value) R.Result[value.Value, str] {
+    if (op == instruction.OP_XOR) { ret builder.emit_xor(b, x, y); }
+    if (op == instruction.OP_OR)  { ret builder.emit_or(b, x, y); }
+    if (op == instruction.OP_AND) { ret builder.emit_and(b, x, y); }
+    ret builder.emit_add(b, x, y);
+}
+
+# vectorize one recognized integer reduction. `ri` is its ReductionInfo from the
+# collect phase (still valid: transforms only append). Builds the vector accumulator
+# main loop + horizontal combine + scalar remainder, and rewrites the accumulator's
+# live-out uses to the remainder's result. Returns ok(true) on success, ok(false) if
+# re-analysis declines (no mutation), or an alloc / build error.
+fun vectorize_reduction(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, ri: *dep.ReductionInfo) R.Result[bool, str] {
+    val lp: *loops.Loop = ?la.loops[lx];
+    if (!reduction_shape_ok(lp)) { ret R.ok[bool, str](false); }
+
+    val header:    id.BlockId = lp.header;
+    val latch:     id.BlockId = lp.latch;
+    val preheader: id.BlockId = lp.preheader;
+    val exit:      id.BlockId = lp.exit;
+    val iv_phi:    id.InstructionId = lp.iv.phi;
+    val iv_upd:    id.InstructionId = lp.iv.update;
+    val iv_ty:     ir_type.IrTypeId = lp.iv.init.ty;
+    val cmp_id:    id.InstructionId = lp.counted.cmp;
+    val lanes:     u32 = ri.lanes;
+    val elem_ty:   ir_type.IrTypeId = ri.elem_ty;
+    val red_op:    instruction.InstrKind = ri.op;
+    val acc_phi:   id.InstructionId = ri.acc_phi;
+    val acc_upd:   id.InstructionId = ri.acc_update;
+    val acc_init:  value.Value = ri.acc_init;
+
+    val rvt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_vector(?m.types, elem_ty, lanes);
+    if (R.is_err[ir_type.IrTypeId, str](rvt)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rvt)); }
+    val vec_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rvt);
+    val rat: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?m.types, elem_ty, lanes);
+    if (R.is_err[ir_type.IrTypeId, str](rat)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rat)); }
+    val arr_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rat);
+
+    # phi index of the accumulator and the induction variable in the header (clone
+    # preserves phi order, so the same index identifies them in the remainder header)
+    val hblk: *ir.Block = ?fn.blocks[header::u32];
+    val acc_idx: u32 = phi_index(hblk, acc_phi);
+    val iv_idx:  u32 = phi_index(hblk, iv_phi);
+
+    # 1. clone the still-scalar loop (header + body) into the remainder
+    val body_len: u32 = lp.body_len;
+    val rfb: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](m.alloc, body_len::usize);
+    if (R.is_err[*id.BlockId, str](rfb)) { ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](rfb)); }
+    val fbody: *id.BlockId = R.unwrap_ok[*id.BlockId, str](rfb);
+    var ci: u32 = 0;
+    for (ci < body_len) { fbody[ci] = lp.body[ci]; ci = ci + 1; }
+    val rrc: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](m.alloc, body_len::usize);
+    if (R.is_err[*id.BlockId, str](rrc)) { A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize); ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](rrc)); }
+    val rem: *id.BlockId = R.unwrap_ok[*id.BlockId, str](rrc);
+    val rcl: R.Result[bool, str] = ver.clone_region(m, fn, fbody, body_len, rem);
+    if (R.is_err[bool, str](rcl)) { A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize); A.deallocate[id.BlockId](m.alloc, rem, body_len::usize); ret R.err[bool, str](R.unwrap_err[bool, str](rcl)); }
+    val rem_header: id.BlockId = rem[ver.region_index(fbody, body_len, header)];
+    val rblk: *ir.Block = ?fn.blocks[rem_header::u32];
+    val sacc: id.InstructionId = rblk.phis[acc_idx];   # remainder accumulator phi
+    val iv_r:  id.InstructionId = rblk.phis[iv_idx];    # remainder induction phi
+    A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize);
+    A.deallocate[id.BlockId](m.alloc, rem, body_len::usize);
+
+    var b: builder.Builder = builder.init(m);
+    builder.set_function(?b, fn);
+
+    # 2. vector preheader: build the vector accumulator init (lane 0 = user init, other
+    # lanes = op identity), the exclusive bound and the lane limit
+    val rvp: R.Result[id.BlockId, str] = ir.block_add(m, fn);
+    if (R.is_err[id.BlockId, str](rvp)) { ret R.err[bool, str](R.unwrap_err[id.BlockId, str](rvp)); }
+    val vpre: id.BlockId = R.unwrap_ok[id.BlockId, str](rvp);
+    builder.set_block(?b, vpre);
+    val rv0: R.Result[value.Value, str] = build_accumulator_init(?b, red_op, acc_init, elem_ty, arr_ty, vec_ty, lanes);
+    if (R.is_err[value.Value, str](rv0)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rv0)); }
+    val vacc0: value.Value = R.unwrap_ok[value.Value, str](rv0);
+    val rbe: R.Result[value.Value, str] = ver.emit_exclusive_bound(?b, ?lp.counted);
+    if (R.is_err[value.Value, str](rbe)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rbe)); }
+    val rlim: R.Result[value.Value, str] = builder.emit_sub(?b, R.unwrap_ok[value.Value, str](rbe), value.const_int(lanes::u64, iv_ty));
+    if (R.is_err[value.Value, str](rlim)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rlim)); }
+    val limit: value.Value = R.unwrap_ok[value.Value, str](rlim);
+    if (R.is_err[bool, str](builder.emit_br(?b, header))) { ret R.err[bool, str]("reduce: preheader branch"); }
+    ver.redirect_terminator(fn, preheader, header, vpre);
+    ver.relabel_phi_pred(fn, header, preheader, vpre);
+    # the vector accumulator's entry value becomes the identity vector (was acc_init)
+    set_phi_value(fn, header, vpre, acc_phi, vacc0);
+
+    # the accumulator's live-out uses become the remainder's result. Done BEFORE the
+    # combine block is built (which adds a legitimate use of the vector accumulator) and
+    # BEFORE retyping, so only pre-existing out-of-loop uses are rewritten to the scalar.
+    val rrp: R.Result[bool, str] = replace_out_of_loop_uses(m, fn, acc_phi, value.instr(sacc, elem_ty), lp.body, lp.body_len, fn.instr_len);
+    if (R.is_err[bool, str](rrp)) { ret R.err[bool, str](R.unwrap_err[bool, str](rrp)); }
+
+    # 3. combine block: horizontal-reduce the vector accumulator to a scalar, then
+    # enter the remainder. Built before the retype so the store sees a scalar-typed
+    # slot type, but the vector value stored is the (about-to-be) vector accumulator.
+    val rcb: R.Result[id.BlockId, str] = ir.block_add(m, fn);
+    if (R.is_err[id.BlockId, str](rcb)) { ret R.err[bool, str](R.unwrap_err[id.BlockId, str](rcb)); }
+    val combine: id.BlockId = R.unwrap_ok[id.BlockId, str](rcb);
+    builder.set_block(?b, combine);
+    val rhc: R.Result[value.Value, str] = emit_horizontal_combine(?b, red_op, value.instr(acc_phi, vec_ty), elem_ty, arr_ty, vec_ty, lanes);
+    if (R.is_err[value.Value, str](rhc)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rhc)); }
+    val s0: value.Value = R.unwrap_ok[value.Value, str](rhc);
+    if (R.is_err[bool, str](builder.emit_br(?b, rem_header))) { ret R.err[bool, str]("reduce: combine branch"); }
+
+    # 4. route the vector header's exit edge to combine; the remainder is entered from
+    # combine with the combined scalar and the vector iv's final value
+    ver.redirect_terminator(fn, header, exit, combine);
+    # the remainder header was cloned with preheader edges on both phis; relabel that
+    # edge to the combine block, then set each phi's incoming value there.
+    ver.relabel_phi_pred(fn, rem_header, preheader, combine);
+    set_phi_value(fn, rem_header, combine, sacc, s0);                          # start from the combined vector partials
+    set_phi_value(fn, rem_header, combine, iv_r, value.instr(iv_phi, iv_ty));  # continue from the vector iv's final value
+
+    # 6. vectorize the main loop body: the reduction value's vector set, plus the
+    # accumulator phi and its update, retyped to the vector type
+    val rset: R.Result[*bool, str] = A.allocate[bool](m.alloc, fn.instr_len::usize);
+    if (R.is_err[*bool, str](rset)) { ret R.err[bool, str](R.unwrap_err[*bool, str](rset)); }
+    val vset: *bool = R.unwrap_ok[*bool, str](rset);
+    build_vset(fn, la, lx, ri.accesses, ri.access_count, elem_ty, false, vset);
+    vset[acc_phi::u32] = true;
+    vset[acc_upd::u32] = true;
+    retype_to_vector(fn, lp, vset, vec_ty);
+    A.deallocate[bool](m.alloc, vset, fn.instr_len::usize);
+
+    # 7. step the induction variable by the lane count; the exit test becomes iv<=limit
+    step_iv_by_lanes(fn, iv_upd, lanes, iv_ty);
+    val copt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, cmp_id);
+    if (O.is_some[*instruction.Instruction](copt)) {
+        val cmp: *instruction.Instruction = O.unwrap[*instruction.Instruction](copt);
+        cmp.kind = instruction.OP_CMP_LE_S;
+        cmp.operands[0] = value.instr(iv_phi, iv_ty);
+        cmp.operands[1] = limit;
+    }
+
+    val rpr: R.Result[bool, str] = ir.preds_rebuild(m, fn);
+    if (R.is_err[bool, str](rpr)) { ret R.err[bool, str](R.unwrap_err[bool, str](rpr)); }
+    ret R.ok[bool, str](true);
+}
+
+# the index of phi `pid` within block `blk`'s phi list (0 if absent; callers pass one)
+fun phi_index(blk: *ir.Block, pid: id.InstructionId) u32 {
+    var i: u32 = 0;
+    for (i < blk.phi_count) { if (blk.phis[i] == pid) { ret i; } i = i + 1; }
+    ret 0;
+}
+
+# change the IV update's constant step to the lane count
+fun step_iv_by_lanes(fn: *ir.Function, iv_upd: id.InstructionId, lanes: u32, iv_ty: ir_type.IrTypeId) {
+    val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, iv_upd);
+    if (O.is_some[*instruction.Instruction](opt)) {
+        val upd: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
+        var si: u32 = 0;
+        for (si < upd.operand_count) {
+            if (upd.operands[si].kind == value.VAL_CONST_INT) { upd.operands[si] = value.const_int(lanes::u64, iv_ty); }
+            si = si + 1;
+        }
+    }
+}
+
+# build the initial vector accumulator into the current block: a 16-byte slot whose
+# lane 0 holds the user's initial accumulator value and whose other lanes hold the op
+# identity, loaded back as a vector. Combined horizontally at loop exit this folds the
+# user init in exactly once (identity elements are absorbed by the op).
+fun build_accumulator_init(b: *builder.Builder, op: instruction.InstrKind, acc_init: value.Value, elem_ty: ir_type.IrTypeId, arr_ty: ir_type.IrTypeId, vec_ty: ir_type.IrTypeId, lanes: u32) R.Result[value.Value, str] {
+    val ras: R.Result[value.Value, str] = builder.emit_alloca(b, arr_ty, value.const_int(1, elem_ty));
+    if (R.is_err[value.Value, str](ras)) { ret ras; }
+    val slot: value.Value = R.unwrap_ok[value.Value, str](ras);
+    val ident: value.Value = reduction_identity(op, elem_ty);
+    var lane: u32 = 0;
+    for (lane < lanes) {
+        val rg: R.Result[value.Value, str] = lane_gep(b, slot, arr_ty, lane, elem_ty);
+        if (R.is_err[value.Value, str](rg)) { ret rg; }
+        var v: value.Value = ident;
+        if (lane == 0) { v = acc_init; }
+        if (R.is_err[bool, str](builder.emit_store(b, v, R.unwrap_ok[value.Value, str](rg)))) { ret R.err[value.Value, str]("reduce: init store"); }
+        lane = lane + 1;
+    }
+    ret builder.emit_load(b, slot, vec_ty);
+}
+
+# horizontal-reduce a vector value to a scalar with `op`: store it to a 16-byte slot,
+# then combine the lanes left to right (op is associative so any order is equal)
+fun emit_horizontal_combine(b: *builder.Builder, op: instruction.InstrKind, vacc: value.Value, elem_ty: ir_type.IrTypeId, arr_ty: ir_type.IrTypeId, vec_ty: ir_type.IrTypeId, lanes: u32) R.Result[value.Value, str] {
+    val ras: R.Result[value.Value, str] = builder.emit_alloca(b, arr_ty, value.const_int(1, elem_ty));
+    if (R.is_err[value.Value, str](ras)) { ret ras; }
+    val slot: value.Value = R.unwrap_ok[value.Value, str](ras);
+    if (R.is_err[bool, str](builder.emit_store(b, vacc, slot))) { ret R.err[value.Value, str]("reduce: combine store"); }
+    val rg0: R.Result[value.Value, str] = lane_gep(b, slot, arr_ty, 0, elem_ty);
+    if (R.is_err[value.Value, str](rg0)) { ret rg0; }
+    val rl0: R.Result[value.Value, str] = builder.emit_load(b, R.unwrap_ok[value.Value, str](rg0), elem_ty);
+    if (R.is_err[value.Value, str](rl0)) { ret rl0; }
+    var acc: value.Value = R.unwrap_ok[value.Value, str](rl0);
+    var lane: u32 = 1;
+    for (lane < lanes) {
+        val rg: R.Result[value.Value, str] = lane_gep(b, slot, arr_ty, lane, elem_ty);
+        if (R.is_err[value.Value, str](rg)) { ret rg; }
+        val rl: R.Result[value.Value, str] = builder.emit_load(b, R.unwrap_ok[value.Value, str](rg), elem_ty);
+        if (R.is_err[value.Value, str](rl)) { ret rl; }
+        val rc: R.Result[value.Value, str] = emit_reduction_op(b, op, acc, R.unwrap_ok[value.Value, str](rl));
+        if (R.is_err[value.Value, str](rc)) { ret rc; }
+        acc = R.unwrap_ok[value.Value, str](rc);
+        lane = lane + 1;
+    }
+    ret R.ok[value.Value, str](acc);
+}
+
+# a `gep(slot, 0, lane)` addressing lane `lane` of a `[lanes]elem` slot (the array
+# shape a vector's 16-byte storage aliases, per the v[i] lowering)
+fun lane_gep(b: *builder.Builder, slot: value.Value, arr_ty: ir_type.IrTypeId, lane: u32, elem_ty: ir_type.IrTypeId) R.Result[value.Value, str] {
+    var idx: [2]value.Value;
+    idx[0] = value.const_int(0, elem_ty);
+    idx[1] = value.const_int(lane::u64, elem_ty);
+    ret builder.emit_gep(b, slot, arr_ty, ?idx[0], 2);
+}
+
+# set the VALUE of block `blk`'s phi `pid` on the incoming edge from `from` (the block
+# id is left unchanged)
+fun set_phi_value(fn: *ir.Function, blk: id.BlockId, from: id.BlockId, pid: id.InstructionId, val_new: value.Value) {
+    val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, pid);
+    if (O.is_none[*instruction.Instruction](opt)) { ret; }
+    val phi: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
+    var o: u32 = 0;
+    for (o < phi.operand_count) {
+        if ((o % 2) == 0 && ir.block_target(phi.operands[o]) == from && o + 1 < phi.operand_count) {
+            phi.operands[o + 1] = value.retype(val_new, phi.operands[o + 1].ty);
+        }
+        o = o + 1;
+    }
+}
+
+# rewrite every out-of-loop use of `old_id` to `repl` across `fn`. Instructions in
+# the loop body blocks keep their reference to `old_id`: the accumulator's own update
+# (which becomes the vector recurrence) and any in-loop debug values stay on the vector
+# accumulator, whereas the live-out result and any post-loop debug values are rewritten
+# to the remainder result, which dominates them. Being loop-aware (rather than skipping
+# a single kept instruction) is what keeps the transform -g additive: a debug value that
+# references the accumulator must not be rewritten to a value that fails to dominate it.
+fun replace_out_of_loop_uses(m: *ir.Module, fn: *ir.Function, old_id: id.InstructionId, repl: value.Value, body: *id.BlockId, body_len: u32, limit: u32) R.Result[bool, str] {
+    val rmask: R.Result[*bool, str] = A.allocate[bool](m.alloc, limit::usize);
+    if (R.is_err[*bool, str](rmask)) { ret R.err[bool, str](R.unwrap_err[*bool, str](rmask)); }
+    val in_loop: *bool = R.unwrap_ok[*bool, str](rmask);
+    var bi: u32 = 0;
+    for (bi < body_len) {
+        val blk: *ir.Block = ?fn.blocks[body[bi]::u32];
+        var pi: u32 = 0;
+        for (pi < blk.phi_count) { if (blk.phis[pi]::u32 < limit) { in_loop[blk.phis[pi]::u32] = true; } pi = pi + 1; }
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) { if (blk.instructions[ii]::u32 < limit) { in_loop[blk.instructions[ii]::u32] = true; } ii = ii + 1; }
+        if (blk.terminator != id.INSTR_NIL && blk.terminator::u32 < limit) { in_loop[blk.terminator::u32] = true; }
+        bi = bi + 1;
+    }
+    var i: u32 = 0;
+    for (i < limit) {
+        if (!in_loop[i]) {
+            val inst: *instruction.Instruction = ?fn.instrs[i];
+            var o: u32 = 0;
+            for (o < inst.operand_count) {
+                if (inst.operands[o].kind == value.VAL_INSTR && inst.operands[o].data.instr == old_id) {
+                    inst.operands[o] = value.retype(repl, inst.operands[o].ty);
+                }
+                o = o + 1;
+            }
+        }
+        i = i + 1;
+    }
+    A.deallocate[bool](m.alloc, in_loop, limit::usize);
+    ret R.ok[bool, str](true);
 }
