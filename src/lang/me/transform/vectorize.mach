@@ -13,8 +13,11 @@
 # This is the first non-dormant middle-end piece: it CHANGES codegen (vectorizes),
 # so its output is intentionally not byte-identical for vectorizable loops. It runs
 # only in the release pipeline on capable targets; rv64 (has_v128 == false) never
-# reaches it and stays scalar. Correctness is by construction conservative: only the
-# shapes child 2 proves independent, with a runtime disjointness guard, are touched.
+# reaches it and stays scalar. Correctness is by construction conservative: the loop
+# body must be the exact single-block element-wise shape (no internal control flow),
+# every access must share ONE element type, and every store value must be a pure
+# tree of baseline-selectable lane ops over the loads -- anything unproven stays
+# scalar, and the runtime disjointness guard discharges base aliasing.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -37,12 +40,27 @@ use loops: mach.lang.me.analysis.loops;
 use dep: mach.lang.me.analysis.dependence;
 use ver: mach.lang.me.transform.versioning;
 
+# the uniform element shape of a vectorizable loop's accesses
+# ---
+# elem_ty:  the ONE scalar element type every access loads / stores
+# bytes:    its byte footprint (equals every access's gep stride)
+# lanes:    128-bit lane count (16 / bytes), always >= 2
+# is_float: whether the element is a float scalar
+rec MapShape {
+    elem_ty:  ir_type.IrTypeId;
+    bytes:    u32;
+    lanes:    u32;
+    is_float: bool;
+}
+
 # run element-wise vectorization over every function in `m`
 #
 # A no-op on an incapable target (has_v128 == false) and on a function carrying the
-# `#[no_vectorize]` opt-out. For each function it collects the vectorizable loop
-# headers first (a read-only pass), then versions + vectorizes each; re-analyzing
-# between transforms keeps the analysis consistent as the CFG grows.
+# `#[scalar]` opt-out. For each function it collects the vectorizable loops first (a
+# read-only pass that keeps each candidate's dependence info), then versions +
+# vectorizes each; re-analyzing between transforms keeps the loop analysis
+# consistent as the CFG grows, while the kept dependence info stays valid (existing
+# instructions are never moved or renumbered).
 # ---
 # m:   the module to transform in place
 # tgt: the target; consulted for the SIMD capability fact
@@ -54,46 +72,68 @@ pub fun run(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
     var fi: u32 = 0;
     for (fi < m.function_len) {
         val fn: *ir.Function = ?m.functions[fi];
-        if (fn.block_count == 0 || (fn.flags & ir.FN_FLAG_NO_VECTORIZE) != 0) { fi = fi + 1; cnt; }
+        if (fn.block_count == 0 || (fn.flags & ir.FN_FLAG_SCALAR) != 0) { fi = fi + 1; cnt; }
 
-        # collect the headers of the vectorizable loops (read-only)
+        # collect the vectorizable loops (read-only), keeping each verdict's DepInfo
         val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, m.alloc);
         if (R.is_err[loops.LoopAnalysis, str](ral)) { ret R.err[bool, str](R.unwrap_err[loops.LoopAnalysis, str](ral)); }
         var la: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ral);
 
-        val rhh: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](m.alloc, (la.loop_len + 1)::usize);
+        val cap: u32 = la.loop_len + 1;
+        val rhh: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](m.alloc, cap::usize);
         if (R.is_err[*id.BlockId, str](rhh)) { loops.dnit(?la); ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](rhh)); }
         val headers: *id.BlockId = R.unwrap_ok[*id.BlockId, str](rhh);
+        val rda: R.Result[*dep.DepInfo, str] = A.allocate[dep.DepInfo](m.alloc, cap::usize);
+        if (R.is_err[*dep.DepInfo, str](rda)) { A.deallocate[id.BlockId](m.alloc, headers, cap::usize); loops.dnit(?la); ret R.err[bool, str](R.unwrap_err[*dep.DepInfo, str](rda)); }
+        val deps: *dep.DepInfo = R.unwrap_ok[*dep.DepInfo, str](rda);
+
         var hn: u32 = 0;
         var lx: u32 = 0;
         for (lx < la.loop_len) {
-            val rv: R.Result[bool, str] = vectorizable(m, fn, ?la, lx);
-            if (R.is_err[bool, str](rv)) { A.deallocate[id.BlockId](m.alloc, headers, (la.loop_len + 1)::usize); loops.dnit(?la); ret R.err[bool, str](R.unwrap_err[bool, str](rv)); }
-            if (R.unwrap_ok[bool, str](rv)) { headers[hn] = la.loops[lx].header; hn = hn + 1; }
+            var d: dep.DepInfo;
+            val rv: R.Result[bool, str] = vectorizable(m, fn, ?la, lx, ?d);
+            if (R.is_err[bool, str](rv)) {
+                free_candidates(m, headers, deps, hn, cap);
+                loops.dnit(?la);
+                ret R.err[bool, str](R.unwrap_err[bool, str](rv));
+            }
+            if (R.unwrap_ok[bool, str](rv)) {
+                headers[hn] = la.loops[lx].header;
+                deps[hn] = d;
+                hn = hn + 1;
+            }
             lx = lx + 1;
         }
-        val hcap: u32 = la.loop_len + 1;
         loops.dnit(?la);
 
-        # version + vectorize each collected loop, re-analyzing to locate it
+        # version + vectorize each candidate, re-analyzing to locate it; the kept
+        # DepInfo stays valid because prior transforms only append blocks / instrs
         var hi: u32 = 0;
         for (hi < hn) {
             val ra2: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, m.alloc);
-            if (R.is_err[loops.LoopAnalysis, str](ra2)) { A.deallocate[id.BlockId](m.alloc, headers, hcap::usize); ret R.err[bool, str](R.unwrap_err[loops.LoopAnalysis, str](ra2)); }
+            if (R.is_err[loops.LoopAnalysis, str](ra2)) { free_candidates(m, headers, deps, hn, cap); ret R.err[bool, str](R.unwrap_err[loops.LoopAnalysis, str](ra2)); }
             var la2: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ra2);
             val lx2: u32 = find_loop_by_header(?la2, headers[hi]);
             if (lx2 != ver.NONE_U32) {
-                val rvz: R.Result[bool, str] = vectorize_one(m, fn, ?la2, lx2);
-                if (R.is_err[bool, str](rvz)) { loops.dnit(?la2); A.deallocate[id.BlockId](m.alloc, headers, hcap::usize); ret R.err[bool, str](R.unwrap_err[bool, str](rvz)); }
+                val rvz: R.Result[bool, str] = vectorize_one(m, fn, ?la2, lx2, ?deps[hi]);
+                if (R.is_err[bool, str](rvz)) { loops.dnit(?la2); free_candidates(m, headers, deps, hn, cap); ret R.err[bool, str](R.unwrap_err[bool, str](rvz)); }
                 if (R.unwrap_ok[bool, str](rvz)) { changed = true; }
             }
             loops.dnit(?la2);
             hi = hi + 1;
         }
-        A.deallocate[id.BlockId](m.alloc, headers, hcap::usize);
+        free_candidates(m, headers, deps, hn, cap);
         fi = fi + 1;
     }
     ret R.ok[bool, str](changed);
+}
+
+# release the collect-phase candidate arrays (each kept DepInfo, then the arrays)
+fun free_candidates(m: *ir.Module, headers: *id.BlockId, deps: *dep.DepInfo, hn: u32, cap: u32) {
+    var i: u32 = 0;
+    for (i < hn) { dep.dep_dnit(?deps[i]); i = i + 1; }
+    A.deallocate[id.BlockId](m.alloc, headers, cap::usize);
+    A.deallocate[dep.DepInfo](m.alloc, deps, cap::usize);
 }
 
 # index of the loop with header `h`, or NONE_U32
@@ -106,55 +146,97 @@ fun find_loop_by_header(la: *loops.LoopAnalysis, h: id.BlockId) u32 {
     ret ver.NONE_U32;
 }
 
-# whether loop `lx` is a vectorizable unit-stride element-wise map: counted,
-# well-formed, iv on the left with unit step, dependence-independent, uniform
-# supported element width giving a lane count >= 2, and every store's value a pure
-# tree of supported vector ops over the loads (no scalar / splat operands)
-fun vectorizable(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32) R.Result[bool, str] {
+# the structural loop-shape gate: counted and well-formed, `iv < / <= bound` with the
+# iv on the left and the continue edge on true, unit constant step, and the body
+# exactly the single-block element-wise shape -- header plus ONE body block that is
+# also the latch, so there is no internal control flow (a conditional store's branch
+# adds a third block and declines here)
+fun loop_shape_ok(lp: *loops.Loop) bool {
+    if (!lp.is_counted) { ret false; }
+    # exit dedication is NOT required here: the versioned fast loop's exit is the
+    # merge block, which legitimately has the scalar path as a second predecessor.
+    # the collect phase separately requires a dedicated exit (version_loop needs it).
+    if (lp.preheader == id.BLOCK_NIL || lp.latch == id.BLOCK_NIL || lp.exiting == id.BLOCK_NIL) { ret false; }
+    if (!lp.counted.iv_on_left) { ret false; }
+    if (!lp.counted.continue_on_true) { ret false; }
+    if (lp.iv.step.kind != value.VAL_CONST_INT || lp.iv.step.data.int_lit != 1) { ret false; }
+    if (lp.body_len != 2) { ret false; }
+    if (lp.latch == lp.header) { ret false; }
+    ret true;
+}
+
+# derive the uniform element shape of a dependence-independent loop's accesses, or
+# decline: every access must load / store the SAME scalar element type (not merely
+# the same byte width -- a same-width i32/f32 mix would stamp float ops with an
+# integer vector type, and a mixed loop would bypass the per-type op legality), with
+# a footprint of 1..8 bytes giving a lane count >= 2, and at least one store
+fun map_shape(d: *dep.DepInfo, out: *MapShape) bool {
+    if (d.access_count == 0) { ret false; }
+    val elem_ty: ir_type.IrTypeId = d.accesses[0].elem_ty;
+    val w: u32 = d.accesses[0].bytes;
+    if (w == 0 || w > 8) { ret false; }
+    if ((16 / w) < 2) { ret false; }
+    var has_store: bool = false;
+    var i: u32 = 0;
+    for (i < d.access_count) {
+        if (d.accesses[i].elem_ty != elem_ty) { ret false; }
+        if (d.accesses[i].bytes != w)         { ret false; }
+        if (d.accesses[i].is_store) { has_store = true; }
+        i = i + 1;
+    }
+    if (!has_store) { ret false; }
+    out.elem_ty  = elem_ty;
+    out.bytes    = w;
+    out.lanes    = 16 / w;
+    out.is_float = false;
+    ret true;
+}
+
+# whether loop `lx` is a vectorizable unit-stride element-wise map. On true the
+# loop's dependence info is transferred to `out_d` (caller owns / dnits it); on
+# false nothing is retained.
+fun vectorizable(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, out_d: *dep.DepInfo) R.Result[bool, str] {
     val lp: *loops.Loop = ?la.loops[lx];
-    if (!lp.is_counted) { ret R.ok[bool, str](false); }
-    if (lp.preheader == id.BLOCK_NIL || lp.latch == id.BLOCK_NIL || lp.exit == id.BLOCK_NIL || lp.exiting == id.BLOCK_NIL) { ret R.ok[bool, str](false); }
-    if (!lp.counted.iv_on_left) { ret R.ok[bool, str](false); }
-    if (lp.iv.step.kind != value.VAL_CONST_INT || lp.iv.step.data.int_lit != 1) { ret R.ok[bool, str](false); }
+    if (!loop_shape_ok(lp)) { ret R.ok[bool, str](false); }
+    if (lp.exit == id.BLOCK_NIL) { ret R.ok[bool, str](false); }
 
     val rd: R.Result[dep.DepInfo, str] = dep.analyze_dependence(fn, la, lx, ?m.types, m.alloc);
     if (R.is_err[dep.DepInfo, str](rd)) { ret R.err[bool, str](R.unwrap_err[dep.DepInfo, str](rd)); }
     var d: dep.DepInfo = R.unwrap_ok[dep.DepInfo, str](rd);
     if (d.verdict != dep.DEP_INDEPENDENT) { dep.dep_dnit(?d); ret R.ok[bool, str](false); }
 
-    val rok: R.Result[bool, str] = elementwise_ok(m, fn, la, lx, ?d);
-    dep.dep_dnit(?d);
-    ret rok;
+    var shape: MapShape;
+    if (!map_shape(?d, ?shape)) { dep.dep_dnit(?d); ret R.ok[bool, str](false); }
+    shape.is_float = ir_type.is_float_scalar(?m.types, shape.elem_ty);
+
+    # every access must live in the single body block (never the header): a header
+    # access would feed the exit test, and retyping it to a vector would leave a
+    # vector operand on a scalar compare
+    var ai: u32 = 0;
+    for (ai < d.access_count) {
+        val ab: id.BlockId = la.instr_block[d.accesses[ai].instr::u32];
+        if (ab != lp.latch) { dep.dep_dnit(?d); ret R.ok[bool, str](false); }
+        ai = ai + 1;
+    }
+
+    val rok: R.Result[bool, str] = stores_are_pure_trees(m, fn, la, lx, ?d, ?shape);
+    if (R.is_err[bool, str](rok)) { dep.dep_dnit(?d); ret rok; }
+    if (!R.unwrap_ok[bool, str](rok)) { dep.dep_dnit(?d); ret R.ok[bool, str](false); }
+
+    @out_d = d;
+    ret R.ok[bool, str](true);
 }
 
-# the element-wise legality over a dependence-independent loop: a uniform supported
-# element width (lane count 16/W >= 2), at least one store, and every store's value
-# reachable through the vector set (loads + supported vector ops over them)
-fun elementwise_ok(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, d: *dep.DepInfo) R.Result[bool, str] {
-    if (d.access_count == 0) { ret R.ok[bool, str](false); }
-    val w: u32 = d.accesses[0].bytes;
-    if (w == 0 || w > 8) { ret R.ok[bool, str](false); }
-    if ((16 / w) < 2) { ret R.ok[bool, str](false); }
-    var has_store: bool = false;
-    var i: u32 = 0;
-    for (i < d.access_count) {
-        if (d.accesses[i].bytes != w) { ret R.ok[bool, str](false); }
-        if (d.accesses[i].is_store) { has_store = true; }
-        i = i + 1;
-    }
-    if (!has_store) { ret R.ok[bool, str](false); }
-
-    val elem_ty: ir_type.IrTypeId = d.accesses[0].elem_ty;
-    val is_float: bool = ir_type.is_float_scalar(?m.types, elem_ty);
-
-    # the vector set: loads, then supported ops all of whose operands are in the set
+# the element-wise legality over the loop's stores: every store's value must be
+# reachable through the vector set (loads + supported same-type lane ops over them)
+fun stores_are_pure_trees(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, d: *dep.DepInfo, shape: *MapShape) R.Result[bool, str] {
     val rset: R.Result[*bool, str] = A.allocate[bool](m.alloc, fn.instr_len::usize);
     if (R.is_err[*bool, str](rset)) { ret R.err[bool, str](R.unwrap_err[*bool, str](rset)); }
     val vset: *bool = R.unwrap_ok[*bool, str](rset);
-    build_vset(fn, la, lx, d, is_float, vset);
+    build_vset(fn, la, lx, d, shape, vset);
 
     var ok: bool = true;
-    i = 0;
+    var i: u32 = 0;
     for (i < d.access_count) {
         if (d.accesses[i].is_store) {
             val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, d.accesses[i].instr);
@@ -172,10 +254,12 @@ fun elementwise_ok(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx:
 }
 
 # fill `vset` with the loop-body instructions that vectorize: the loads (seeds) and,
-# to a fixpoint, every supported vector op whose operands are all already in the set
-# (so a scalar / loop-invariant / induction-variable operand keeps an op out, which
-# is what excludes the iv update and any splat-needing op)
-fun build_vset(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, d: *dep.DepInfo, is_float: bool, vset: *bool) {
+# to a fixpoint, every supported lane op whose result type is exactly the element
+# type and whose operands are all already in the set. A scalar / loop-invariant /
+# induction-variable operand keeps an op out (that would need a splat), the
+# result-type check keeps any width- or kind-changing op out, and the walk skips the
+# header block so only true body computation is admitted.
+fun build_vset(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, d: *dep.DepInfo, shape: *MapShape, vset: *bool) {
     var i: u32 = 0;
     for (i < fn.instr_len) { vset[i] = false; i = i + 1; }
     i = 0;
@@ -189,6 +273,7 @@ fun build_vset(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, d: *dep.DepIn
         changed = false;
         var bi: u32 = 0;
         for (bi < lp.body_len) {
+            if (lp.body[bi] == lp.header) { bi = bi + 1; cnt; }
             val blk: *ir.Block = ?fn.blocks[lp.body[bi]::u32];
             var ii: u32 = 0;
             for (ii < blk.instr_count) {
@@ -197,7 +282,7 @@ fun build_vset(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, d: *dep.DepIn
                     val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, iid);
                     if (O.is_some[*instruction.Instruction](opt)) {
                         val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
-                        if (supported_vector_op(inst.kind, is_float) && all_operands_in_set(inst, fn, vset)) {
+                        if (supported_vector_op(inst.kind, shape.is_float) && inst.ty == shape.elem_ty && all_operands_in_set(inst, fn, vset)) {
                             vset[iid::u32] = true;
                             changed = true;
                         }
@@ -224,13 +309,15 @@ fun all_operands_in_set(inst: *instruction.Instruction, fn: *ir.Function, vset: 
 }
 
 # the lane-wise element-wise ops whose 128-bit vector form is selectable on the
-# baseline capable targets (SSE2 / NEON). Deliberately narrow: float add/sub/mul/div
-# and negate; integer add/sub, bitwise, and negate. Excludes integer multiply
-# (narrow on SSE2), integer divide/remainder, shifts, and comparisons.
+# baseline capable targets (SSE2 / NEON). Deliberately narrow: float add/sub/mul/div;
+# integer add/sub and bitwise. Excludes NEGATE (no vector-negate lowering exists:
+# the scalar float-neg special case is guarded on scalar floatness, so a vector float
+# neg would fall through to a bitwise integer negation of the IEEE bit pattern),
+# integer multiply (narrow on SSE2), integer divide/remainder, shifts, and
+# comparisons.
 fun supported_vector_op(k: instruction.InstrKind, is_float: bool) bool {
     if (k == instruction.OP_ADD) { ret true; }
     if (k == instruction.OP_SUB) { ret true; }
-    if (k == instruction.OP_NEG) { ret true; }
     if (is_float) {
         if (k == instruction.OP_MUL)   { ret true; }
         if (k == instruction.OP_DIV_S) { ret true; }
@@ -246,52 +333,48 @@ fun supported_vector_op(k: instruction.InstrKind, is_float: bool) bool {
 
 # version loop `lx`, then rewrite its fast copy to vector ops with a scalar remainder
 #
-# Assumes `vectorizable` already cleared the loop. Inserts a dedicated vector
-# preheader between the guard and the fast header (so child 1 recognizes the fast
-# loop as counted with a dedicated preheader), re-analyzes, then -- only once the
-# fast loop re-confirms independent -- clones the still-scalar fast copy as the
-# remainder and rewrites the fast copy to vector ops. Returns ok(true) on success,
-# ok(false) if versioning / re-analysis declines, or an allocation / build error.
-fun vectorize_one(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32) R.Result[bool, str] {
+# `d0` is the loop's dependence info from the collect phase (still valid: existing
+# instructions are never moved or renumbered by prior transforms). Inserts a
+# dedicated vector preheader between the guard and the fast header (so the fast loop
+# re-analyzes as counted), re-analyzes, then -- only once the fast loop re-confirms
+# the SAME independent element-wise shape -- clones the still-scalar fast copy as
+# the remainder and rewrites the fast copy to vector ops. Returns ok(true) on
+# success, ok(false) if versioning / re-analysis declines (the versioned structure
+# is behavior-preserving), or an allocation / build error.
+fun vectorize_one(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, d0: *dep.DepInfo) R.Result[bool, str] {
     val lp0: *loops.Loop = ?la.loops[lx];
+    if (!loop_shape_ok(lp0)) { ret R.ok[bool, str](false); }
+    if (d0.verdict != dep.DEP_INDEPENDENT) { ret R.ok[bool, str](false); }
+    var shape: MapShape;
+    if (!map_shape(d0, ?shape)) { ret R.ok[bool, str](false); }
+    shape.is_float = ir_type.is_float_scalar(?m.types, shape.elem_ty);
 
-    val rd: R.Result[dep.DepInfo, str] = dep.analyze_dependence(fn, la, lx, ?m.types, m.alloc);
-    if (R.is_err[dep.DepInfo, str](rd)) { ret R.err[bool, str](R.unwrap_err[dep.DepInfo, str](rd)); }
-    var d0: dep.DepInfo = R.unwrap_ok[dep.DepInfo, str](rd);
-    if (d0.verdict != dep.DEP_INDEPENDENT || d0.access_count == 0) { dep.dep_dnit(?d0); ret R.ok[bool, str](false); }
-
-    # capture what the transform needs before version_loop stale-ifies `la`
-    var oc: loops.CountedInfo = lp0.counted;
-    val w: u32 = d0.accesses[0].bytes;
-    val lanes: u32 = 16 / w;
-    val elem_ty: ir_type.IrTypeId = d0.accesses[0].elem_ty;
-    val is_float: bool = ir_type.is_float_scalar(?m.types, elem_ty);
     val iv_ty: ir_type.IrTypeId = lp0.iv.init.ty;
-    val rvt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_vector(?m.types, elem_ty, lanes);
-    if (R.is_err[ir_type.IrTypeId, str](rvt)) { dep.dep_dnit(?d0); ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rvt)); }
+    val rvt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_vector(?m.types, shape.elem_ty, shape.lanes);
+    if (R.is_err[ir_type.IrTypeId, str](rvt)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rvt)); }
     val vec_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rvt);
 
-    val rvr: R.Result[ver.VersionResult, str] = ver.version_loop(m, fn, la, lx, ?d0);
-    dep.dep_dnit(?d0);
+    val rvr: R.Result[ver.VersionResult, str] = ver.version_loop(m, fn, la, lx, d0);
     if (R.is_err[ver.VersionResult, str](rvr)) { ret R.err[bool, str](R.unwrap_err[ver.VersionResult, str](rvr)); }
     var vr: ver.VersionResult = R.unwrap_ok[ver.VersionResult, str](rvr);
     if (vr.status != ver.VERSION_OK) { ver.version_result_dnit(?vr, m.alloc); ret R.ok[bool, str](false); }
     val fast_header: id.BlockId = vr.fast_header;
     val merge: id.BlockId = vr.merge;
     val guard: id.BlockId = vr.guard;
+    val bound_ex: value.Value = vr.bound_ex;
     ver.version_result_dnit(?vr, m.alloc);
 
-    # insert the dedicated vector preheader: limit = exclusive_bound - lanes, br fast.
-    # this gives the fast loop a dedicated preheader so it re-analyzes as counted.
+    # insert the dedicated vector preheader: limit = bound_ex - lanes (the guard
+    # block's materialized exclusive bound, reused -- never re-derived), then enter
+    # the fast header. this gives the fast loop a dedicated preheader so it
+    # re-analyzes as counted.
     val rvp: R.Result[id.BlockId, str] = ir.block_add(m, fn);
     if (R.is_err[id.BlockId, str](rvp)) { ret R.err[bool, str](R.unwrap_err[id.BlockId, str](rvp)); }
     val vpre: id.BlockId = R.unwrap_ok[id.BlockId, str](rvp);
     var b: builder.Builder = builder.init(m);
     builder.set_function(?b, fn);
     builder.set_block(?b, vpre);
-    val rbe: R.Result[value.Value, str] = ver.emit_exclusive_bound(?b, ?oc);
-    if (R.is_err[value.Value, str](rbe)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rbe)); }
-    val rlim: R.Result[value.Value, str] = builder.emit_sub(?b, R.unwrap_ok[value.Value, str](rbe), value.const_int(lanes::u64, iv_ty));
+    val rlim: R.Result[value.Value, str] = builder.emit_sub(?b, bound_ex, value.const_int(shape.lanes::u64, iv_ty));
     if (R.is_err[value.Value, str](rlim)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rlim)); }
     val limit: value.Value = R.unwrap_ok[value.Value, str](rlim);
     if (R.is_err[bool, str](builder.emit_br(?b, fast_header))) { ret R.err[bool, str]("vectorize: preheader branch"); }
@@ -303,22 +386,26 @@ fun vectorize_one(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: 
     if (R.is_err[loops.LoopAnalysis, str](ra)) { ret R.err[bool, str](R.unwrap_err[loops.LoopAnalysis, str](ra)); }
     var fla: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ra);
     val flx: u32 = find_loop_by_header(?fla, fast_header);
-    if (flx == ver.NONE_U32) { loops.dnit(?fla); ret R.ok[bool, str](false); }
+    if (flx == ver.NONE_U32) { loops.dnit(?fla); ret decline_after_mutation(m, fn); }
     val rdd: R.Result[dep.DepInfo, str] = dep.analyze_dependence(fn, ?fla, flx, ?m.types, m.alloc);
     if (R.is_err[dep.DepInfo, str](rdd)) { loops.dnit(?fla); ret R.err[bool, str](R.unwrap_err[dep.DepInfo, str](rdd)); }
     var fd: dep.DepInfo = R.unwrap_ok[dep.DepInfo, str](rdd);
-    # if the versioned fast loop no longer classifies as the independent element-wise
-    # map, leave it scalar (the guard/preheader structure is behavior-preserving)
-    if (fd.verdict != dep.DEP_INDEPENDENT || fd.access_count == 0) { dep.dep_dnit(?fd); loops.dnit(?fla); ret R.ok[bool, str](false); }
 
+    # the versioned fast loop must re-classify as the SAME independent element-wise
+    # shape; if re-analysis disagrees, leave it scalar (behavior-preserving)
     val flp: *loops.Loop = ?fla.loops[flx];
+    var fshape: MapShape;
+    var fast_ok: bool = loop_shape_ok(flp) && fd.verdict == dep.DEP_INDEPENDENT && map_shape(?fd, ?fshape);
+    if (fast_ok && fshape.elem_ty != shape.elem_ty) { fast_ok = false; }
+    if (!fast_ok) { dep.dep_dnit(?fd); loops.dnit(?fla); ret decline_after_mutation(m, fn); }
+    fshape.is_float = shape.is_float;
+
     val fast_iv_phi: id.InstructionId = flp.iv.phi;
     val fast_iv_upd: id.InstructionId = flp.iv.update;
     val fast_cmp: id.InstructionId = flp.counted.cmp;
     val iv_phi_val: value.Value = value.instr(fast_iv_phi, iv_ty);
 
-    # copy the fast loop's body block ids for cloning (fla is snapshot-stable but we
-    # add blocks below)
+    # copy the fast loop's body block ids for cloning (blocks are added below)
     val body_len: u32 = flp.body_len;
     val rfb: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](m.alloc, body_len::usize);
     if (R.is_err[*id.BlockId, str](rfb)) { dep.dep_dnit(?fd); loops.dnit(?fla); ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](rfb)); }
@@ -326,19 +413,19 @@ fun vectorize_one(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: 
     var ci: u32 = 0;
     for (ci < body_len) { fbody[ci] = flp.body[ci]; ci = ci + 1; }
 
-    # clone the still-scalar fast loop into the remainder loop
+    # clone the still-scalar fast loop into the remainder loop (the shared scaffold)
     val rrc: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](m.alloc, body_len::usize);
     if (R.is_err[*id.BlockId, str](rrc)) { A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize); dep.dep_dnit(?fd); loops.dnit(?fla); ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](rrc)); }
     val rem_blocks: *id.BlockId = R.unwrap_ok[*id.BlockId, str](rrc);
-    val rcl: R.Result[bool, str] = clone_loop(m, fn, fbody, body_len, rem_blocks);
+    val rcl: R.Result[bool, str] = ver.clone_region(m, fn, fbody, body_len, rem_blocks);
     if (R.is_err[bool, str](rcl)) { A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize); A.deallocate[id.BlockId](m.alloc, rem_blocks, body_len::usize); dep.dep_dnit(?fd); loops.dnit(?fla); ret R.err[bool, str](R.unwrap_err[bool, str](rcl)); }
-    val rem_header: id.BlockId = rem_blocks[header_index(fbody, body_len, fast_header)];
+    val rem_header: id.BlockId = rem_blocks[ver.region_index(fbody, body_len, fast_header)];
 
     # vectorize the fast body: retype loads + ops to the vector type
     val rset: R.Result[*bool, str] = A.allocate[bool](m.alloc, fn.instr_len::usize);
     if (R.is_err[*bool, str](rset)) { A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize); A.deallocate[id.BlockId](m.alloc, rem_blocks, body_len::usize); dep.dep_dnit(?fd); loops.dnit(?fla); ret R.err[bool, str](R.unwrap_err[*bool, str](rset)); }
     val vset: *bool = R.unwrap_ok[*bool, str](rset);
-    build_vset(fn, ?fla, flx, ?fd, is_float, vset);
+    build_vset(fn, ?fla, flx, ?fd, ?fshape, vset);
     retype_to_vector(fn, flp, vset, vec_ty);
     A.deallocate[bool](m.alloc, vset, fn.instr_len::usize);
 
@@ -348,12 +435,15 @@ fun vectorize_one(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: 
         val upd: *instruction.Instruction = O.unwrap[*instruction.Instruction](uopt);
         var si: u32 = 0;
         for (si < upd.operand_count) {
-            if (upd.operands[si].kind == value.VAL_CONST_INT) { upd.operands[si] = value.const_int(lanes::u64, iv_ty); }
+            if (upd.operands[si].kind == value.VAL_CONST_INT) { upd.operands[si] = value.const_int(shape.lanes::u64, iv_ty); }
             si = si + 1;
         }
     }
 
-    # the vector header tests `iv <= limit` (a full lane group fits)
+    # the vector header tests `iv <= limit` (a full lane group fits). the SIGNED
+    # compare is safe even for an unsigned loop: when bound_ex < lanes the
+    # subtraction wraps to a huge unsigned value that reads as negative signed, so
+    # the vector loop is skipped and the scalar remainder handles the whole trip.
     val copt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, fast_cmp);
     if (O.is_some[*instruction.Instruction](copt)) {
         val cmp: *instruction.Instruction = O.unwrap[*instruction.Instruction](copt);
@@ -377,11 +467,13 @@ fun vectorize_one(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: 
     ret R.ok[bool, str](true);
 }
 
-# the index of `header` within `blocks`
-fun header_index(blocks: *id.BlockId, len: u32, header: id.BlockId) u32 {
-    var i: u32 = 0;
-    for (i < len) { if (blocks[i] == header) { ret i; } i = i + 1; }
-    ret 0;
+# decline a vectorization AFTER the preheader insertion mutated control flow: the
+# versioned + preheader structure is behavior-preserving, but the predecessor lists
+# must be rebuilt to stay verifier-consistent before returning ok(false)
+fun decline_after_mutation(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
+    val rpr: R.Result[bool, str] = ir.preds_rebuild(m, fn);
+    if (R.is_err[bool, str](rpr)) { ret R.err[bool, str](R.unwrap_err[bool, str](rpr)); }
+    ret R.ok[bool, str](false);
 }
 
 # set the result type of every vector-set instruction to `vec_ty`, and update every
@@ -433,84 +525,4 @@ fun set_phi_incoming(fn: *ir.Function, blk: id.BlockId, from: id.BlockId, new_bl
         }
         pi = pi + 1;
     }
-}
-
-# clone the loop blocks `body[0..body_len]` into fresh blocks, remapping intra-loop
-# references to the clones (loop-invariant operands and out-of-loop block targets are
-# left verbatim); writes out_clones[k] = the clone of body[k]
-fun clone_loop(m: *ir.Module, fn: *ir.Function, body: *id.BlockId, body_len: u32, out_clones: *id.BlockId) R.Result[bool, str] {
-    val n_blocks: u32 = fn.block_count;
-    val n_instrs: u32 = fn.instr_len;
-
-    val rbm: R.Result[*u32, str] = A.allocate[u32](m.alloc, n_blocks::usize);
-    if (R.is_err[*u32, str](rbm)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rbm)); }
-    val block_map: *u32 = R.unwrap_ok[*u32, str](rbm);
-    val rim: R.Result[*u32, str] = A.allocate[u32](m.alloc, n_instrs::usize);
-    if (R.is_err[*u32, str](rim)) { A.deallocate[u32](m.alloc, block_map, n_blocks::usize); ret R.err[bool, str](R.unwrap_err[*u32, str](rim)); }
-    val instr_map: *u32 = R.unwrap_ok[*u32, str](rim);
-    var k: u32 = 0;
-    for (k < n_blocks) { block_map[k] = ver.NONE_U32; k = k + 1; }
-    k = 0;
-    for (k < n_instrs) { instr_map[k] = ver.NONE_U32; k = k + 1; }
-
-    var bi: u32 = 0;
-    for (bi < body_len) {
-        val radd: R.Result[id.BlockId, str] = ir.block_add(m, fn);
-        if (R.is_err[id.BlockId, str](radd)) { clone_free(m, block_map, n_blocks, instr_map, n_instrs); ret R.err[bool, str](R.unwrap_err[id.BlockId, str](radd)); }
-        block_map[body[bi]::u32] = R.unwrap_ok[id.BlockId, str](radd)::u32;
-        bi = bi + 1;
-    }
-    bi = 0;
-    for (bi < body_len) {
-        val blk: *ir.Block = ?fn.blocks[body[bi]::u32];
-        var p: u32 = 0;
-        for (p < blk.phi_count) {
-            val rc: R.Result[bool, str] = ver.clone_one(m, fn, blk.phis[p], instr_map);
-            if (R.is_err[bool, str](rc)) { clone_free(m, block_map, n_blocks, instr_map, n_instrs); ret rc; }
-            p = p + 1;
-        }
-        var ii: u32 = 0;
-        for (ii < blk.instr_count) {
-            val rc: R.Result[bool, str] = ver.clone_one(m, fn, blk.instructions[ii], instr_map);
-            if (R.is_err[bool, str](rc)) { clone_free(m, block_map, n_blocks, instr_map, n_instrs); ret rc; }
-            ii = ii + 1;
-        }
-        if (blk.terminator != id.INSTR_NIL) {
-            val rc: R.Result[bool, str] = ver.clone_one(m, fn, blk.terminator, instr_map);
-            if (R.is_err[bool, str](rc)) { clone_free(m, block_map, n_blocks, instr_map, n_instrs); ret rc; }
-        }
-        bi = bi + 1;
-    }
-    bi = 0;
-    for (bi < body_len) {
-        val src: *ir.Block = ?fn.blocks[body[bi]::u32];
-        val dst: *ir.Block = ?fn.blocks[block_map[body[bi]::u32]];
-        var p: u32 = 0;
-        for (p < src.phi_count) {
-            val rp: R.Result[bool, str] = ir.block_append_phi(m, dst, instr_map[src.phis[p]::u32]::id.InstructionId);
-            if (R.is_err[bool, str](rp)) { clone_free(m, block_map, n_blocks, instr_map, n_instrs); ret rp; }
-            p = p + 1;
-        }
-        var ii: u32 = 0;
-        for (ii < src.instr_count) {
-            val ra: R.Result[bool, str] = ir.block_append_instr(m, dst, instr_map[src.instructions[ii]::u32]::id.InstructionId);
-            if (R.is_err[bool, str](ra)) { clone_free(m, block_map, n_blocks, instr_map, n_instrs); ret ra; }
-            ii = ii + 1;
-        }
-        if (src.terminator != id.INSTR_NIL) {
-            dst.terminator = instr_map[src.terminator::u32]::id.InstructionId;
-        }
-        bi = bi + 1;
-    }
-    ver.remap_operands(fn, block_map, n_blocks, instr_map, n_instrs);
-    bi = 0;
-    for (bi < body_len) { out_clones[bi] = block_map[body[bi]::u32]::id.BlockId; bi = bi + 1; }
-    clone_free(m, block_map, n_blocks, instr_map, n_instrs);
-    ret R.ok[bool, str](true);
-}
-
-# free the clone_loop working maps
-fun clone_free(m: *ir.Module, block_map: *u32, n_blocks: u32, instr_map: *u32, n_instrs: u32) {
-    A.deallocate[u32](m.alloc, block_map, n_blocks::usize);
-    A.deallocate[u32](m.alloc, instr_map, n_instrs::usize);
 }
