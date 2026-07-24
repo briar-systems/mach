@@ -147,20 +147,32 @@ live here because they are variant concerns.
 
 | Key     | Type    | Meaning |
 |---------|---------|---------|
-| `opt`   | integer | Optimization level: `0` selects the debug pipeline (the always-on passes only), `1` and `2` select the release pipeline. `1` and `2` currently share a pass set; `2` is where future loop/vectorization work lands. Any other integer — or a non-integer — is a manifest error. |
+| `opt`   | integer | Optimization level: `0` selects the debug pipeline (the always-on passes only), `1` and `2` select the release pipeline. `1` and `2` currently share a pass set, which includes loop auto-vectorization (see `vectorize` below). Any other integer — or a non-integer — is a manifest error. |
 | `debug` | bool    | Emit debug info (DWARF on ELF/Mach-O, CodeView on COFF) for this profile. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
 | `simd`  | string  | SIMD scalarization lever. `"scalarize"` builds for a target without hardware SIMD by emitting a defined unrolled scalar expansion of each vector operator, with a build-time note (the "skipped N target-gated modules" style). `"require"` makes a build for an incapable target a hard error naming the offending operator. Any other string is a manifest error. |
+| `vectorize` | bool | **Optional** auto-vectorization lever; absent it defaults to `true`. When `true`, the release pipeline rewrites provably-safe counted loops to 128-bit SIMD on a target with hardware vectors; `false` skips the pass, so release output stays scalar. A non-boolean is a manifest error. |
 
-All three keys (`opt`, `debug`, `simd`) are required in a declared profile.
+Three keys (`opt`, `debug`, `simd`) are required in a declared profile;
+`vectorize` is optional and defaults to on.
 Emission of the human-readable IR and assembly side-artifacts is **not** a profile
 concern — it is controlled only by the `--emit-ir` / `--emit-asm` CLI flags (see
 [cli.md](cli.md)).
 
-The `simd` lever is always the **consumer's**. Consistent with the root-vs-dependency
-strictness above, a dependency's `[profile.*]` is parsed permissively and never read
-to build the consumer, so a library's `simd` value is inert — the effective lever
-comes from the consumer's resolved profile. Libraries set nothing SIMD-specific and
-inherit the consumer's choice; there is no ecosystem fork and no dual API.
+The `vectorize` lever only ever *subtracts*. The pass it gates runs in the release
+pipeline on targets that report 128-bit vector support (SSE2 on x86-64, NEON on
+aarch64) and rewrites counted, unit-stride loops whose dependence analysis proves
+independence — element-wise maps behind a runtime alias guard, and associative-exact
+integer reductions. A loop it cannot prove safe stays scalar, and a target without
+hardware vectors (riscv64) never enters the pass, so `vectorize = false` changes
+performance and never semantics. For a single function, the `#[scalar]` decorator is
+the finer-grained opt-out (see [language/decorators.md](language/decorators.md)).
+
+The `simd` and `vectorize` levers are always the **consumer's**. Consistent with the
+root-vs-dependency strictness above, a dependency's `[profile.*]` is parsed
+permissively and never read to build the consumer, so a library's values are inert —
+the effective levers come from the consumer's resolved profile. Libraries set nothing
+SIMD-specific and inherit the consumer's choice; there is no ecosystem fork and no
+dual API.
 
 The CLI selects and overrides at invocation time: `--profile <name>` picks the
 profile; `-g` forces `debug` on for one build regardless of the profile's key
