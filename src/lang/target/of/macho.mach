@@ -4254,6 +4254,141 @@ fun ts_dyn_exec(arch_id: u32) u8 {
     ret 0;
 }
 
+# locate the file offset of the LC_SEGMENT_64 named `name`; returns 0 when absent
+# ---
+# buf:  the Mach-O bytes
+# name: the segment name to match
+# ret:  the load command's file offset, or 0 if not present
+fun t_find_seg(buf: *u8, name: str) usize {
+    val ncmds: u32 = bin.read_u32_le(buf, 16);
+    var off: usize = MACH_HEADER_64_SIZE;
+    var c: u32 = 0;
+    for (c < ncmds) {
+        if (bin.read_u32_le(buf, off) == LC_SEGMENT_64 && fixed16_equals(buf, off + 8, name)) { ret off; }
+        off = off + bin.read_u32_le(buf, off + 4)::usize;
+        c = c + 1;
+    }
+    ret 0;
+}
+
+# count the LC_SEGMENT_64s flagged SG_READ_ONLY
+# ---
+# buf: the Mach-O bytes
+# ret: how many segments carry the flag
+fun t_count_sg_read_only(buf: *u8) u32 {
+    val ncmds: u32 = bin.read_u32_le(buf, 16);
+    var off: usize = MACH_HEADER_64_SIZE;
+    var n:   u32 = 0;
+    var c:   u32 = 0;
+    for (c < ncmds) {
+        if (bin.read_u32_le(buf, off) == LC_SEGMENT_64
+            && (bin.read_u32_le(buf, off + 68) & SG_READ_ONLY) != 0) { n = n + 1; }
+        off = off + bin.read_u32_le(buf, off + 4)::usize;
+        c = c + 1;
+    }
+    ret n;
+}
+
+# a PIE image whose link carries two read-only segments - plain rodata and the
+# rebased rel.ro - marks exactly one of them SG_READ_ONLY: the one the rebase stream
+# writes into, which is the only segment that may be named __DATA_CONST. The other
+# stays r-- under __RODATA and is never mapped writable.
+#
+# Falsifies the permission-derived rule that flagged every read-only segment: that
+# emitted two SG_READ_ONLY segments, which the darwin kernel refuses to exec,
+# SIGKILLing the image before dyld runs (#2172). Also pins the rejection of a layout
+# with base relocations in two read-only segments, which Mach-O cannot express
+fun ts_dyn_exec_relro_segments(arch_id: u32) u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable;
+    isa_vt.id = arch_id;
+
+    var text_bytes: [16]u8;
+    var ro_bytes:   [16]u8;
+    var relro_bytes: [16]u8;
+    var data_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) {
+        text_bytes[k] = 0; ro_bytes[k] = 0; relro_bytes[k] = 0; data_bytes[k] = 0;
+        k = k + 1;
+    }
+
+    # text, rodata, rel.ro, data - each on its own 16 KiB page, mirroring the linker's
+    # per-kind segment layout.
+    val base: u64 = 0x100000000;
+    val pg:   u64 = 0x4000;
+    var segs: [4]of.LoadSegment;
+    segs[0].vaddr = base;          segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text_bytes[0];
+    segs[1].vaddr = base + pg;     segs[1].filesz = 16; segs[1].memsz = 16;
+    segs[1].flags = of.SEG_FLAG_READ; segs[1].bytes = ?ro_bytes[0];
+    segs[2].vaddr = base + pg * 2; segs[2].filesz = 16; segs[2].memsz = 16;
+    segs[2].flags = of.SEG_FLAG_READ; segs[2].bytes = ?relro_bytes[0];
+    segs[3].vaddr = base + pg * 3; segs[3].filesz = 16; segs[3].memsz = 16;
+    segs[3].flags = of.SEG_FLAG_READ | of.SEG_FLAG_WRITE; segs[3].bytes = ?data_bytes[0];
+
+    # one absolute pointer to slide, in the rel.ro segment only.
+    var brs: [2]of.BaseReloc;
+    brs[0].seg_index = 2; brs[0].seg_offset = 0; brs[0].target = base;
+    brs[1].seg_index = 1; brs[1].seg_offset = 0; brs[1].target = base;
+
+    var dyn: of.DynamicInfo;
+    dyn.interp = intern.STR_NIL;
+    dyn.base_relocs = ?brs[0];
+    dyn.base_reloc_count = 1;
+    dyn.pie = true;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_relro_seg");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_dyn_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 4, pg, base,
+                                                nil::*of.ExecFunction, 0, ?dyn, nil::*of.PltFixup, 0,
+                                                nil::*of.Section, 0, tpath::*u8, "machorelro"::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    # exactly one segment claims the flag, and it is the rebased one: __DATA_CONST,
+    # mapped read-write for dyld's fixup pass.
+    if (t_count_sg_read_only(buf.data) != 1)                     { ret 1; }
+    val dc: usize = t_find_seg(buf.data, "__DATA_CONST");
+    if (dc == 0)                                                 { ret 1; }
+    if (bin.read_u64_le(buf.data, dc + 24) != base + pg * 2)     { ret 1; }
+    if ((bin.read_u32_le(buf.data, dc + 68) & SG_READ_ONLY) == 0) { ret 1; }
+    if (bin.read_u32_le(buf.data, dc + 60) != (VM_PROT_READ | VM_PROT_WRITE)) { ret 1; }
+
+    # the un-rebased read-only segment is plain __RODATA: read-only for the process's
+    # whole life, never writable, never flagged.
+    val rd: usize = t_find_seg(buf.data, "__RODATA");
+    if (rd == 0)                                                 { ret 1; }
+    if (bin.read_u64_le(buf.data, rd + 24) != base + pg)         { ret 1; }
+    if (bin.read_u32_le(buf.data, rd + 60) != VM_PROT_READ)      { ret 1; }
+    if (bin.read_u32_le(buf.data, rd + 56) != VM_PROT_READ)      { ret 1; }
+    if ((bin.read_u32_le(buf.data, rd + 68) & SG_READ_ONLY) != 0) { ret 1; }
+
+    # base relocations in two read-only segments have no single __DATA_CONST to live
+    # in, so the write is refused instead of producing an image that dies at exec.
+    dyn.base_reloc_count = 2;
+    val tf2_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_relro_seg2");
+    if (R.is_err[fs.TempFile, str](tf2_r)) { ret 1; }
+    var tf2: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf2_r);
+    val em2: R.Result[bool, str] = emit_dyn_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 4, pg, base,
+                                                 nil::*of.ExecFunction, 0, ?dyn, nil::*of.PltFixup, 0,
+                                                 nil::*of.Section, 0, fs.temp_path(?tf2)::*u8, "machorelro"::*u8);
+    fs.temp_close_and_remove(?tf2);
+    if (!R.is_err[bool, str](em2))                                              { ret 1; }
+    if (!str_contains(R.unwrap_err[bool, str](em2), "read-only segment"))        { ret 1; }
+    ret 0;
+}
+
 # emit_object rejects a relocation whose abstract kind has no Mach-O machine type
 # rather than silently emitting a wrong relocation
 fun ts_unsupported_kind() u8 {
@@ -4354,10 +4489,13 @@ test "mach.lang.target.of.macho:exec_vtable_and_rejections" {
 
 # the dynamic-executable writer: the x86_64 and arm64 dyld-loadable skeletons
 # (loader + dependency load commands, the bind stream, the symbol tables, and the
-# thread entry)
+# thread entry), and the single-SG_READ_ONLY segment contract a PIE image with both
+# a rodata and a rel.ro segment must satisfy
 test "mach.lang.target.of.macho:dyn_exec" {
     if (ts_dyn_exec(isa.ARCH_X86_64) != 0)  { ret 1; }
     if (ts_dyn_exec(isa.ARCH_AARCH64) != 0) { ret 1; }
+    if (ts_dyn_exec_relro_segments(isa.ARCH_X86_64) != 0)  { ret 1; }
+    if (ts_dyn_exec_relro_segments(isa.ARCH_AARCH64) != 0) { ret 1; }
     ret 0;
 }
 
