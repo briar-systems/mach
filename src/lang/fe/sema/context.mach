@@ -8,6 +8,8 @@
 
 use std.format;
 use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
 use std.types.char.char;
 use std.types.size.usize;
 use std.types.string.str;
@@ -82,6 +84,51 @@ pub rec SemaDeps {
 fwd type.FieldEntry;
 fwd type.FieldTable;
 
+# one requested generic-function instantiation, collected during body inference for
+# the per-instance constant-time re-validation (#2157)
+#
+# The instance is identified by (origin, decl, concrete type-args). `sig` is the
+# substituted `TYPE_FUN` signature, carried so the drain reads the instance return
+# type without re-substituting. `args` is an owned copy of the concrete type-arguments
+# (the caller's scratch buffer is freed right after the call).
+# ---
+# origin:  ModuleId declaring the generic function
+# decl:    the generic function's DeclId in `origin`
+# sig:     the substituted signature TypeId (for the instance return type)
+# args:    owned concrete type-argument array (by parameter ordinal)
+# arg_len: number of type arguments
+pub rec InstReq {
+    origin:  session.ModuleId;
+    decl:    id.DeclId;
+    sig:     type.TypeId;
+    args:    *type.TypeId;
+    arg_len: u32;
+}
+
+# the per-instance CT re-validation worklist (#2157): generic instantiations requested
+# during body inference, drained after all bodies are typed
+#
+# Heap-allocated and shared by pointer: the draining pass and each transient
+# re-inference context reference the same worklist, so a body re-inferred under
+# substitution appends the further instances it reaches onto the one list the drain
+# consumes. Deduped by (origin, decl, args) so each distinct instance is validated once
+# and mutually recursive generics terminate. The drain reads `items[i]` by index, so
+# an append that grows `items` never strands a borrowed pointer.
+# ---
+# items:   the requested instances (owned)
+# len:     number of requests
+# cap:     allocated capacity of `items`
+# drained: cursor; requests below it have been re-validated
+# alloc:   allocator backing `items` and each request's owned `args`
+pub rec InstWorklist {
+    items:   *InstReq;
+    len:     u32;
+    cap:     u32;
+    drained: u32;
+    alloc:   *A.Allocator;
+}
+
+
 # sema's working state for one module analysis
 #
 # Owned by `sema` for the duration of one pass and transferred into the returned
@@ -111,6 +158,17 @@ pub rec SemaContext {
     own_module: session.ModuleId;
     source:     str;
 
+    # the shared per-instance CT re-validation worklist (#2157), or nil when the pass
+    # collects no instances. The main pass owns it; a transient re-inference context
+    # borrows the same pointer so its nested generic calls append to the one worklist.
+    insts: *InstWorklist;
+
+    # gate for `record_instance` (#2157): true on the main sema pass and on a sema-time
+    # instance re-validation (which collect generic instantiations to re-validate),
+    # false on the lowering-time pack re-inference (`reinfer_pack_each_body`), which
+    # runs the same inference machinery but must not collect or drain a worklist.
+    collect_insts: bool;
+
     expr_type:        *type.TypeId;
     type_resolved_ty: *type.TypeId;
     decl_type:        *type.TypeId;
@@ -132,6 +190,19 @@ pub rec SemaContext {
     # keeps `brk` / `cnt` legal; a nested fin saves and resets both.
     in_fin:         bool;
     fin_loop_depth: u32;
+
+    # per-monomorphized-instance CT re-validation (#2157): while re-inferring a
+    # generic instance body, `subst` is the active generic substitution (concrete
+    # type-args by parameter ordinal) and `subst_fn` applies it to a resolved type.
+    # nil / 0 on the main sema pass, where every type-source leaf reads its template
+    # type unchanged. On re-inference, `resolved_type_of` and `generic_param_type_for`
+    # push each generic parameter to its concrete instance type through `subst_fn`
+    # (a function pointer to break the context->generics import cycle), so the body's
+    # secrecy / aggregate-ness - and thus the #1645 leakage gates and the #2127
+    # aggregate-`==` rejection - are evaluated against the instance's concrete types.
+    subst:     *type.TypeId;
+    subst_len: u32;
+    subst_fn:  fun(*session.Session, type.TypeId, *type.TypeId, u32) type.TypeId;
 }
 
 # the interned semantic TypeId a syntactic AstType resolved to
@@ -146,7 +217,152 @@ pub fun resolved_type_of(sc: *SemaContext, ast_tid: id.TypeId) type.TypeId {
     if (ast_tid == id.TYPE_NIL)        { ret type.TYPE_NIL; }
     if (sc.type_resolved_ty == nil)    { ret type.TYPE_ERROR; }
     if (ast_tid >= sc.a.type_len::u32) { ret type.TYPE_ERROR; }
-    ret sc.type_resolved_ty[ast_tid];
+    ret apply_subst(sc, sc.type_resolved_ty[ast_tid]);
+}
+
+# apply the active generic substitution (#2157) to `tid`, or return it unchanged
+#
+# A no-op on the main sema pass (`subst` nil), where a type-source leaf reads its
+# template type. While re-inferring a monomorphized instance body it pushes a
+# generic parameter (bare `T`, `*T`, `Result[T,E]`, ...) to its concrete instance
+# type via `subst_fn`, so the leaf reflects the instantiation. Called at every leaf
+# that can surface a generic-parameter type.
+# ---
+# sc:  sema context
+# tid: a resolved semantic TypeId
+# ret: `tid` substituted when a substitution is active, else `tid`
+pub fun apply_subst(sc: *SemaContext, tid: type.TypeId) type.TypeId {
+    if (sc.subst == nil || sc.subst_len == 0 || sc.subst_fn == nil) { ret tid; }
+    ret sc.subst_fn(sc.s, tid, sc.subst, sc.subst_len);
+}
+
+# whether a concrete type argument can newly trip a per-instance CT gate (#2157)
+#
+# A secret-carrying argument can make a `==` / branch / index / div operand secret at
+# the instance; an aggregate argument can make a `==` an aggregate compare (#2127). A
+# bare public scalar can do neither - the template check already covered it - so an
+# instance whose every argument is a public scalar needs no re-validation.
+# ---
+# sc:  sema context
+# tid: a concrete type argument
+# ret: true when the argument warrants re-validating the instance body
+pub fun arg_triggers_revalidation(sc: *SemaContext, tid: type.TypeId) bool {
+    if (type.carries_secret(?sc.s.types, tid)) { ret true; }
+    val t_opt: O.Option[*type.Type] = type.get(?sc.s.types, tid);
+    if (O.is_none[*type.Type](t_opt)) { ret false; }
+    val k: type.TypeKind = O.unwrap[*type.Type](t_opt).kind;
+    ret k == type.TYPE_REC || k == type.TYPE_UNI || k == type.TYPE_INSTANCE || k == type.TYPE_ARRAY;
+}
+
+# whether two concrete type-argument tuples are element-wise equal
+fun args_equal(a: *type.TypeId, b: *type.TypeId, n: u32) bool {
+    var i: u32 = 0;
+    for (i < n) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# record a generic instantiation for per-instance CT re-validation (#2157)
+#
+# A no-op when no argument warrants re-validation (every argument a public scalar) or
+# when this exact (origin, decl, args) instance is already recorded - the dedup that
+# validates each instance once and terminates mutually recursive generics. Otherwise it
+# copies the arguments (the caller's scratch buffer is freed after the call) and appends
+# to the shared worklist, growing it on demand. The worklist is created lazily on the
+# first recorded instance.
+# ---
+# sc:      the sema context whose worklist receives the request
+# origin:  ModuleId declaring the generic
+# decl:    the generic function's DeclId
+# args:    the concrete type arguments (borrowed; copied here)
+# arg_len: number of type arguments
+# sig:     the substituted signature TypeId
+# ret:     ok(true), or err on an allocation failure
+pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.DeclId,
+                        args: *type.TypeId, arg_len: u32, sig: type.TypeId) R.Result[bool, str] {
+    if (!sc.collect_insts) { ret R.ok[bool, str](true); }
+    if (arg_len == 0)      { ret R.ok[bool, str](true); }
+
+    var any: bool = false;
+    var i: u32 = 0;
+    for (i < arg_len) {
+        if (arg_triggers_revalidation(sc, args[i])) { any = true; }
+        i = i + 1;
+    }
+    if (!any) { ret R.ok[bool, str](true); }
+
+    if (sc.insts != nil) {
+        var j: u32 = 0;
+        for (j < sc.insts.len) {
+            val e: *InstReq = ?sc.insts.items[j];
+            if (e.origin == origin && e.decl == decl && e.arg_len == arg_len
+                && args_equal(e.args, args, arg_len)) {
+                ret R.ok[bool, str](true);
+            }
+            j = j + 1;
+        }
+    }
+
+    if (sc.insts == nil) {
+        val wr: R.Result[*InstWorklist, str] = A.allocate[InstWorklist](sc.s.alloc, 1::usize);
+        if (R.is_err[*InstWorklist, str](wr)) { ret R.err[bool, str](R.unwrap_err[*InstWorklist, str](wr)); }
+        val wl: *InstWorklist = R.unwrap_ok[*InstWorklist, str](wr);
+        wl.items   = nil;
+        wl.len     = 0;
+        wl.cap     = 0;
+        wl.drained = 0;
+        wl.alloc   = sc.s.alloc;
+        sc.insts = wl;
+    }
+    val wl: *InstWorklist = sc.insts;
+
+    if (wl.len == wl.cap) {
+        var new_cap: u32 = 8;
+        if (wl.cap > 0) { new_cap = wl.cap * 2; }
+        var nr: R.Result[*InstReq, str] = A.allocate[InstReq](wl.alloc, new_cap::usize);
+        if (wl.cap > 0) { nr = A.reallocate[InstReq](wl.alloc, wl.items, wl.cap::usize, new_cap::usize); }
+        if (R.is_err[*InstReq, str](nr)) { ret R.err[bool, str](R.unwrap_err[*InstReq, str](nr)); }
+        wl.items = R.unwrap_ok[*InstReq, str](nr);
+        wl.cap   = new_cap;
+    }
+
+    val cr: R.Result[*type.TypeId, str] = A.allocate[type.TypeId](wl.alloc, arg_len::usize);
+    if (R.is_err[*type.TypeId, str](cr)) { ret R.err[bool, str](R.unwrap_err[*type.TypeId, str](cr)); }
+    val owned: *type.TypeId = R.unwrap_ok[*type.TypeId, str](cr);
+    var k: u32 = 0;
+    for (k < arg_len) { owned[k] = args[k]; k = k + 1; }
+
+    val slot: *InstReq = ?wl.items[wl.len];
+    slot.origin  = origin;
+    slot.decl    = decl;
+    slot.sig     = sig;
+    slot.args    = owned;
+    slot.arg_len = arg_len;
+    wl.len = wl.len + 1;
+    ret R.ok[bool, str](true);
+}
+
+# free the CT re-validation worklist and every request's owned arguments (#2157)
+# ---
+# sc: the sema context whose worklist is released (nil-safe; cleared to nil)
+pub fun inst_worklist_dnit(sc: *SemaContext) {
+    if (sc.insts == nil) { ret; }
+    val wl: *InstWorklist = sc.insts;
+    var i: u32 = 0;
+    for (i < wl.len) {
+        val e: *InstReq = ?wl.items[i];
+        if (e.args != nil && e.arg_len > 0) {
+            A.deallocate[type.TypeId](wl.alloc, e.args, e.arg_len::usize);
+        }
+        i = i + 1;
+    }
+    if (wl.items != nil && wl.cap > 0) {
+        A.deallocate[InstReq](wl.alloc, wl.items, wl.cap::usize);
+    }
+    A.deallocate[InstWorklist](wl.alloc, wl, 1::usize);
+    sc.insts = nil;
 }
 
 # the ModuleSema snapshot for dependency `module`, or none when it is not a dep
@@ -494,7 +710,7 @@ fun param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId {
 fun generic_param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId {
     val res_intern: R.Result[type.TypeId, str] = type.intern_generic_param(?sc.s.types, sym.name, sym.decl, sym.slot);
     if (R.is_err[type.TypeId, str](res_intern)) { ret type.TYPE_ERROR; }
-    ret R.unwrap_ok[type.TypeId, str](res_intern);
+    ret apply_subst(sc, R.unwrap_ok[type.TypeId, str](res_intern));
 }
 
 # the DeclFun payload of function DeclId `did`
