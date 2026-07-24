@@ -59,6 +59,10 @@ pub val VERSION_LIVE_OUT:    VersionStatus = 4;
 # fast_blocks: the fast clone of each original loop body block, parallel to the
 #              analyzed loop's `body` order (owned); child 3 rewrites these to vectors
 # fast_len:    number of fast_blocks (equals the loop's body_len)
+# bound_ex:    the loop's normalized EXCLUSIVE high index, materialized once in the
+#              guard block (valid when status == VERSION_OK); the single value both
+#              the alias guard and a downstream vectorizer consume, so the LE/LT
+#              normalization is never re-derived
 pub rec VersionResult {
     status:      VersionStatus;
     guard:       id.BlockId;
@@ -66,10 +70,11 @@ pub rec VersionResult {
     fast_header: id.BlockId;
     fast_blocks: *id.BlockId;
     fast_len:    u32;
+    bound_ex:    value.Value;
 }
 
 # sentinel for an unset block-map / instr-map slot
-val NONE_U32: u32 = 0xFFFFFFFF;
+pub val NONE_U32: u32 = 0xFFFFFFFF;
 
 # emit the runtime alias-check guard for a dependence-independent loop into the
 # builder's current block, returning the i8 value that is nonzero exactly when
@@ -82,13 +87,13 @@ val NONE_U32: u32 = 0xFFFFFFFF;
 # writes, a single base, or all bases equal) there is no aliasing hazard and the
 # guard is a constant true.
 # ---
-# b:       builder positioned in the guard block
-# d:       the dependence info (must be DEP_INDEPENDENT)
-# init:    the induction variable's initial value (the low index)
-# counted: the counted-loop exit test; the exclusive high index is derived from it
-#          via emit_exclusive_bound, never from its raw predicate-dependent bound
-# ret:     the i8 guard value, or an allocation error
-pub fun emit_alias_guard(b: *builder.Builder, d: *dep.DepInfo, init: value.Value, counted: *loops.CountedInfo) R.Result[value.Value, str] {
+# b:        builder positioned in the guard block
+# d:        the dependence info (must be DEP_INDEPENDENT)
+# init:     the induction variable's initial value (the low index)
+# bound_ex: the loop's EXCLUSIVE high index, obtained from emit_exclusive_bound --
+#           never the raw predicate-dependent CountedInfo.bound (the LE off-by-one)
+# ret:      the i8 guard value, or an allocation error
+pub fun emit_alias_guard(b: *builder.Builder, d: *dep.DepInfo, init: value.Value, bound_ex: value.Value) R.Result[value.Value, str] {
     val m: *ir.Module = b.m;
     val ri8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
     if (R.is_err[ir_type.IrTypeId, str](ri8)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](ri8)); }
@@ -133,11 +138,6 @@ pub fun emit_alias_guard(b: *builder.Builder, d: *dep.DepInfo, init: value.Value
         guard_free3(m, part, starts, ends, n);
         ret R.ok[value.Value, str](value.const_int(1, i8t));
     }
-
-    # the normalized exclusive high index (LE adds one element), emitted once
-    val rbe: R.Result[value.Value, str] = emit_exclusive_bound(b, counted);
-    if (R.is_err[value.Value, str](rbe)) { guard_free3(m, part, starts, ends, n); ret rbe; }
-    val bound_ex: value.Value = R.unwrap_ok[value.Value, str](rbe);
 
     # each participating access's byte range [base+init*sz, base+bound_ex*sz)
     i = 0;
@@ -238,6 +238,7 @@ pub fun version_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, l
     vr.fast_header = id.BLOCK_NIL;
     vr.fast_blocks = nil;
     vr.fast_len    = 0;
+    vr.bound_ex    = value.const_null(ir_type.IRT_NIL);
 
     if (loop_ix >= la.loop_len) { vr.status = VERSION_NOT_COUNTED; ret R.ok[VersionResult, str](vr); }
     val lp: *loops.Loop = ?la.loops[loop_ix];
@@ -254,9 +255,6 @@ pub fun version_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, l
     val exiting:   id.BlockId = lp.exiting;
     val body_len:  u32        = lp.body_len;
 
-    val n_blocks: u32 = fn.block_count;
-    val n_instrs: u32 = fn.instr_len;
-
     # capture the original body block ids (lp.body is owned by la and stays valid)
     val rbb: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](m.alloc, body_len::usize);
     if (R.is_err[*id.BlockId, str](rbb)) { ret R.err[VersionResult, str](R.unwrap_err[*id.BlockId, str](rbb)); }
@@ -264,102 +262,47 @@ pub fun version_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, l
     var bi: u32 = 0;
     for (bi < body_len) { body[bi] = lp.body[bi]; bi = bi + 1; }
 
-    # block_map / instr_map over the ORIGINAL block / instruction ids
-    val rbm: R.Result[*u32, str] = A.allocate[u32](m.alloc, n_blocks::usize);
-    if (R.is_err[*u32, str](rbm)) { A.deallocate[id.BlockId](m.alloc, body, body_len::usize); ret R.err[VersionResult, str](R.unwrap_err[*u32, str](rbm)); }
-    val block_map: *u32 = R.unwrap_ok[*u32, str](rbm);
-    val rim: R.Result[*u32, str] = A.allocate[u32](m.alloc, n_instrs::usize);
-    if (R.is_err[*u32, str](rim)) { A.deallocate[id.BlockId](m.alloc, body, body_len::usize); A.deallocate[u32](m.alloc, block_map, n_blocks::usize); ret R.err[VersionResult, str](R.unwrap_err[*u32, str](rim)); }
-    val instr_map: *u32 = R.unwrap_ok[*u32, str](rim);
-    var k: u32 = 0;
-    for (k < n_blocks) { block_map[k] = NONE_U32; k = k + 1; }
-    k = 0;
-    for (k < n_instrs) { instr_map[k] = NONE_U32; k = k + 1; }
-
-    # a clone block per loop body block (block_add may grow fn.blocks; store ids only)
-    bi = 0;
-    for (bi < body_len) {
-        val radd: R.Result[id.BlockId, str] = ir.block_add(m, fn);
-        if (R.is_err[id.BlockId, str](radd)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[id.BlockId, str](radd)); }
-        block_map[body[bi]::u32] = R.unwrap_ok[id.BlockId, str](radd)::u32;
-        bi = bi + 1;
+    # clone the loop into the fast copy via the one shared region-clone scaffold
+    val rfb: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](m.alloc, body_len::usize);
+    if (R.is_err[*id.BlockId, str](rfb)) { A.deallocate[id.BlockId](m.alloc, body, body_len::usize); ret R.err[VersionResult, str](R.unwrap_err[*id.BlockId, str](rfb)); }
+    val fast_blocks: *id.BlockId = R.unwrap_ok[*id.BlockId, str](rfb);
+    val rcr: R.Result[bool, str] = clone_region(m, fn, body, body_len, fast_blocks);
+    if (R.is_err[bool, str](rcr)) {
+        A.deallocate[id.BlockId](m.alloc, body, body_len::usize);
+        A.deallocate[id.BlockId](m.alloc, fast_blocks, body_len::usize);
+        ret R.err[VersionResult, str](R.unwrap_err[bool, str](rcr));
     }
-
-    # clone every instruction in each body block (fn.blocks stable now; fn.instrs grows,
-    #    so re-fetch the src pointer immediately before each clone)
-    bi = 0;
-    for (bi < body_len) {
-        val blk: *ir.Block = ?fn.blocks[body[bi]::u32];
-        var p: u32 = 0;
-        for (p < blk.phi_count) {
-            val rc: R.Result[bool, str] = clone_one(m, fn, blk.phis[p], instr_map);
-            if (R.is_err[bool, str](rc)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[bool, str](rc)); }
-            p = p + 1;
-        }
-        var ii: u32 = 0;
-        for (ii < blk.instr_count) {
-            val rc: R.Result[bool, str] = clone_one(m, fn, blk.instructions[ii], instr_map);
-            if (R.is_err[bool, str](rc)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[bool, str](rc)); }
-            ii = ii + 1;
-        }
-        if (blk.terminator != id.INSTR_NIL) {
-            val rc: R.Result[bool, str] = clone_one(m, fn, blk.terminator, instr_map);
-            if (R.is_err[bool, str](rc)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[bool, str](rc)); }
-        }
-        bi = bi + 1;
-    }
-
-    # populate the clone blocks' phi / instruction / terminator lists via the maps
-    bi = 0;
-    for (bi < body_len) {
-        val src: *ir.Block = ?fn.blocks[body[bi]::u32];
-        val dst: *ir.Block = ?fn.blocks[block_map[body[bi]::u32]];
-        var p: u32 = 0;
-        for (p < src.phi_count) {
-            val rp: R.Result[bool, str] = ir.block_append_phi(m, dst, instr_map[src.phis[p]::u32]::id.InstructionId);
-            if (R.is_err[bool, str](rp)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[bool, str](rp)); }
-            p = p + 1;
-        }
-        var ii: u32 = 0;
-        for (ii < src.instr_count) {
-            val ra: R.Result[bool, str] = ir.block_append_instr(m, dst, instr_map[src.instructions[ii]::u32]::id.InstructionId);
-            if (R.is_err[bool, str](ra)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[bool, str](ra)); }
-            ii = ii + 1;
-        }
-        if (src.terminator != id.INSTR_NIL) {
-            dst.terminator = instr_map[src.terminator::u32]::id.InstructionId;
-        }
-        bi = bi + 1;
-    }
-
-    # remap cloned operands: loop instr -> clone, loop block target -> clone block
-    remap_operands(fn, block_map, n_blocks, instr_map, n_instrs);
 
     # build the guard and merge blocks
     val rg: R.Result[id.BlockId, str] = ir.block_add(m, fn);
-    if (R.is_err[id.BlockId, str](rg)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[id.BlockId, str](rg)); }
+    if (R.is_err[id.BlockId, str](rg)) { free2(m, body, fast_blocks, body_len); ret R.err[VersionResult, str](R.unwrap_err[id.BlockId, str](rg)); }
     val guard_bid: id.BlockId = R.unwrap_ok[id.BlockId, str](rg);
     val rmb: R.Result[id.BlockId, str] = ir.block_add(m, fn);
-    if (R.is_err[id.BlockId, str](rmb)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[id.BlockId, str](rmb)); }
+    if (R.is_err[id.BlockId, str](rmb)) { free2(m, body, fast_blocks, body_len); ret R.err[VersionResult, str](R.unwrap_err[id.BlockId, str](rmb)); }
     val merge_bid: id.BlockId = R.unwrap_ok[id.BlockId, str](rmb);
 
-    val fast_header: id.BlockId = block_map[header::u32]::id.BlockId;
-    val fast_exiting: id.BlockId = block_map[exiting::u32]::id.BlockId;
+    val fast_header: id.BlockId = fast_blocks[region_index(body, body_len, header)];
+    val fast_exiting: id.BlockId = fast_blocks[region_index(body, body_len, exiting)];
 
-    # guard block: alias check, then cbr(guard, fast_header, scalar_header). fast on true.
+    # guard block: materialize the exclusive bound ONCE, then the alias check, then
+    # cbr(guard, fast_header, scalar_header). fast on true. the bound rides out in
+    # VersionResult so a downstream vectorizer reuses it instead of re-deriving.
     var b: builder.Builder = builder.init(m);
     builder.set_function(?b, fn);
     builder.set_block(?b, guard_bid);
-    val rge: R.Result[value.Value, str] = emit_alias_guard(?b, d, lp.iv.init, ?lp.counted);
-    if (R.is_err[value.Value, str](rge)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[value.Value, str](rge)); }
+    val rbe: R.Result[value.Value, str] = emit_exclusive_bound(?b, ?lp.counted);
+    if (R.is_err[value.Value, str](rbe)) { free2(m, body, fast_blocks, body_len); ret R.err[VersionResult, str](R.unwrap_err[value.Value, str](rbe)); }
+    val bound_ex: value.Value = R.unwrap_ok[value.Value, str](rbe);
+    val rge: R.Result[value.Value, str] = emit_alias_guard(?b, d, lp.iv.init, bound_ex);
+    if (R.is_err[value.Value, str](rge)) { free2(m, body, fast_blocks, body_len); ret R.err[VersionResult, str](R.unwrap_err[value.Value, str](rge)); }
     val guard_val: value.Value = R.unwrap_ok[value.Value, str](rge);
     val rcbr: R.Result[bool, str] = builder.emit_cbr(?b, guard_val, fast_header, header);
-    if (R.is_err[bool, str](rcbr)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[bool, str](rcbr)); }
+    if (R.is_err[bool, str](rcbr)) { free2(m, body, fast_blocks, body_len); ret R.err[VersionResult, str](R.unwrap_err[bool, str](rcbr)); }
 
     # merge block: br exit
     builder.set_block(?b, merge_bid);
     val rbr: R.Result[bool, str] = builder.emit_br(?b, exit);
-    if (R.is_err[bool, str](rbr)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[bool, str](rbr)); }
+    if (R.is_err[bool, str](rbr)) { free2(m, body, fast_blocks, body_len); ret R.err[VersionResult, str](R.unwrap_err[bool, str](rbr)); }
 
     # redirect the preheader from the header to the guard block
     redirect_terminator(fn, preheader, header, guard_bid);
@@ -375,16 +318,9 @@ pub fun version_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, l
 
     # rebuild predecessors after the control-flow surgery
     val rpr: R.Result[bool, str] = ir.preds_rebuild(m, fn);
-    if (R.is_err[bool, str](rpr)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[bool, str](rpr)); }
+    if (R.is_err[bool, str](rpr)) { free2(m, body, fast_blocks, body_len); ret R.err[VersionResult, str](R.unwrap_err[bool, str](rpr)); }
 
-    # fast_blocks parallel to the original body order
-    val rfb: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](m.alloc, body_len::usize);
-    if (R.is_err[*id.BlockId, str](rfb)) { free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs); ret R.err[VersionResult, str](R.unwrap_err[*id.BlockId, str](rfb)); }
-    val fast_blocks: *id.BlockId = R.unwrap_ok[*id.BlockId, str](rfb);
-    bi = 0;
-    for (bi < body_len) { fast_blocks[bi] = block_map[body[bi]::u32]::id.BlockId; bi = bi + 1; }
-
-    free_maps(m, body, body_len, block_map, n_blocks, instr_map, n_instrs);
+    A.deallocate[id.BlockId](m.alloc, body, body_len::usize);
 
     vr.status      = VERSION_OK;
     vr.guard       = guard_bid;
@@ -392,7 +328,122 @@ pub fun version_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, l
     vr.fast_header = fast_header;
     vr.fast_blocks = fast_blocks;
     vr.fast_len    = body_len;
+    vr.bound_ex    = bound_ex;
     ret R.ok[VersionResult, str](vr);
+}
+
+# free the two body-id arrays on a version_loop error path
+fun free2(m: *ir.Module, body: *id.BlockId, fast: *id.BlockId, len: u32) {
+    A.deallocate[id.BlockId](m.alloc, body, len::usize);
+    A.deallocate[id.BlockId](m.alloc, fast, len::usize);
+}
+
+# the index of `blk` within a region's block-id array (0 when absent; callers pass a
+# member)
+pub fun region_index(blocks: *id.BlockId, len: u32, blk: id.BlockId) u32 {
+    var i: u32 = 0;
+    for (i < len) { if (blocks[i] == blk) { ret i; } i = i + 1; }
+    ret 0;
+}
+
+# clone the region blocks `body[0..body_len]` -- their phis, body instructions, and
+# terminators -- into fresh blocks, remapping intra-region instruction references
+# and block targets to the clones; region-external operands (loop-invariant values,
+# out-of-region block targets) are copied verbatim. writes out_clones[k] = the clone
+# of body[k]. the ONE shared region-clone scaffold (version_loop's fast copy, the
+# vectorizer's scalar remainder), so an Instruction-field addition has a single
+# clone path to keep in step (the vec_lane lesson).
+# ---
+# m:          module owning the allocator
+# fn:         the function containing the region
+# body:       the region's block ids
+# body_len:   number of region blocks
+# out_clones: receives the clone of each region block, parallel to `body`
+# ret:        ok(true), or an allocation error
+pub fun clone_region(m: *ir.Module, fn: *ir.Function, body: *id.BlockId, body_len: u32, out_clones: *id.BlockId) R.Result[bool, str] {
+    val n_blocks: u32 = fn.block_count;
+    val n_instrs: u32 = fn.instr_len;
+
+    val rbm: R.Result[*u32, str] = A.allocate[u32](m.alloc, n_blocks::usize);
+    if (R.is_err[*u32, str](rbm)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rbm)); }
+    val block_map: *u32 = R.unwrap_ok[*u32, str](rbm);
+    val rim: R.Result[*u32, str] = A.allocate[u32](m.alloc, n_instrs::usize);
+    if (R.is_err[*u32, str](rim)) { A.deallocate[u32](m.alloc, block_map, n_blocks::usize); ret R.err[bool, str](R.unwrap_err[*u32, str](rim)); }
+    val instr_map: *u32 = R.unwrap_ok[*u32, str](rim);
+    var k: u32 = 0;
+    for (k < n_blocks) { block_map[k] = NONE_U32; k = k + 1; }
+    k = 0;
+    for (k < n_instrs) { instr_map[k] = NONE_U32; k = k + 1; }
+
+    # a clone block per region block (block_add may grow fn.blocks; store ids only)
+    var bi: u32 = 0;
+    for (bi < body_len) {
+        val radd: R.Result[id.BlockId, str] = ir.block_add(m, fn);
+        if (R.is_err[id.BlockId, str](radd)) { region_free(m, block_map, n_blocks, instr_map, n_instrs); ret R.err[bool, str](R.unwrap_err[id.BlockId, str](radd)); }
+        block_map[body[bi]::u32] = R.unwrap_ok[id.BlockId, str](radd)::u32;
+        bi = bi + 1;
+    }
+
+    # clone every instruction (fn.blocks is stable now; fn.instrs grows, so clone_one
+    # re-fetches the source pointer immediately before each clone)
+    bi = 0;
+    for (bi < body_len) {
+        val blk: *ir.Block = ?fn.blocks[body[bi]::u32];
+        var p: u32 = 0;
+        for (p < blk.phi_count) {
+            val rc: R.Result[bool, str] = clone_one(m, fn, blk.phis[p], instr_map);
+            if (R.is_err[bool, str](rc)) { region_free(m, block_map, n_blocks, instr_map, n_instrs); ret rc; }
+            p = p + 1;
+        }
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val rc: R.Result[bool, str] = clone_one(m, fn, blk.instructions[ii], instr_map);
+            if (R.is_err[bool, str](rc)) { region_free(m, block_map, n_blocks, instr_map, n_instrs); ret rc; }
+            ii = ii + 1;
+        }
+        if (blk.terminator != id.INSTR_NIL) {
+            val rc: R.Result[bool, str] = clone_one(m, fn, blk.terminator, instr_map);
+            if (R.is_err[bool, str](rc)) { region_free(m, block_map, n_blocks, instr_map, n_instrs); ret rc; }
+        }
+        bi = bi + 1;
+    }
+
+    # populate the clone blocks' phi / instruction / terminator lists via the maps
+    bi = 0;
+    for (bi < body_len) {
+        val src: *ir.Block = ?fn.blocks[body[bi]::u32];
+        val dst: *ir.Block = ?fn.blocks[block_map[body[bi]::u32]];
+        var p: u32 = 0;
+        for (p < src.phi_count) {
+            val rp: R.Result[bool, str] = ir.block_append_phi(m, dst, instr_map[src.phis[p]::u32]::id.InstructionId);
+            if (R.is_err[bool, str](rp)) { region_free(m, block_map, n_blocks, instr_map, n_instrs); ret rp; }
+            p = p + 1;
+        }
+        var ii: u32 = 0;
+        for (ii < src.instr_count) {
+            val ra: R.Result[bool, str] = ir.block_append_instr(m, dst, instr_map[src.instructions[ii]::u32]::id.InstructionId);
+            if (R.is_err[bool, str](ra)) { region_free(m, block_map, n_blocks, instr_map, n_instrs); ret ra; }
+            ii = ii + 1;
+        }
+        if (src.terminator != id.INSTR_NIL) {
+            dst.terminator = instr_map[src.terminator::u32]::id.InstructionId;
+        }
+        bi = bi + 1;
+    }
+
+    # remap cloned operands: region instr -> clone, region block target -> clone block
+    remap_operands(fn, block_map, n_blocks, instr_map, n_instrs);
+
+    bi = 0;
+    for (bi < body_len) { out_clones[bi] = block_map[body[bi]::u32]::id.BlockId; bi = bi + 1; }
+    region_free(m, block_map, n_blocks, instr_map, n_instrs);
+    ret R.ok[bool, str](true);
+}
+
+# free the region-clone working maps
+fun region_free(m: *ir.Module, block_map: *u32, n_blocks: u32, instr_map: *u32, n_instrs: u32) {
+    A.deallocate[u32](m.alloc, block_map, n_blocks::usize);
+    A.deallocate[u32](m.alloc, instr_map, n_instrs::usize);
 }
 
 # release a version result's owned array
@@ -407,16 +458,9 @@ pub fun version_result_dnit(vr: *VersionResult, alloc: *A.Allocator) {
     vr.fast_len = 0;
 }
 
-# free the working maps
-fun free_maps(m: *ir.Module, body: *id.BlockId, body_len: u32, block_map: *u32, n_blocks: u32, instr_map: *u32, n_instrs: u32) {
-    if (body != nil && body_len > 0)      { A.deallocate[id.BlockId](m.alloc, body, body_len::usize); }
-    if (block_map != nil && n_blocks > 0) { A.deallocate[u32](m.alloc, block_map, n_blocks::usize); }
-    if (instr_map != nil && n_instrs > 0) { A.deallocate[u32](m.alloc, instr_map, n_instrs::usize); }
-}
-
 # clone one instruction into `fn` and record src -> clone in instr_map (the src
 # pointer is fetched fresh here because a prior clone may have grown fn.instrs)
-fun clone_one(m: *ir.Module, fn: *ir.Function, src_id: id.InstructionId, instr_map: *u32) R.Result[bool, str] {
+pub fun clone_one(m: *ir.Module, fn: *ir.Function, src_id: id.InstructionId, instr_map: *u32) R.Result[bool, str] {
     val src: *instruction.Instruction = ?fn.instrs[src_id::u32];
     val rc: R.Result[id.InstructionId, str] = mutate.clone_instruction(m, fn, src);
     if (R.is_err[id.InstructionId, str](rc)) { ret R.err[bool, str](R.unwrap_err[id.InstructionId, str](rc)); }
@@ -427,7 +471,7 @@ fun clone_one(m: *ir.Module, fn: *ir.Function, src_id: id.InstructionId, instr_m
 # rewrite every cloned instruction's operands: a value naming a loop instruction ->
 # its clone; a block target naming a loop block -> its clone block; everything else
 # (loop-invariant values, the preheader, the exit) is left for the wiring steps
-fun remap_operands(fn: *ir.Function, block_map: *u32, n_blocks: u32, instr_map: *u32, n_instrs: u32) {
+pub fun remap_operands(fn: *ir.Function, block_map: *u32, n_blocks: u32, instr_map: *u32, n_instrs: u32) {
     var s: u32 = 0;
     for (s < n_instrs) {
         if (instr_map[s] != NONE_U32) {
@@ -459,7 +503,7 @@ fun remap_operands(fn: *ir.Function, block_map: *u32, n_blocks: u32, instr_map: 
 }
 
 # change every block-target operand of `blk`'s terminator equal to `from` to `to`
-fun redirect_terminator(fn: *ir.Function, blk: id.BlockId, from: id.BlockId, to: id.BlockId) {
+pub fun redirect_terminator(fn: *ir.Function, blk: id.BlockId, from: id.BlockId, to: id.BlockId) {
     val b: *ir.Block = ?fn.blocks[blk::u32];
     if (b.terminator == id.INSTR_NIL) { ret; }
     val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, b.terminator);
@@ -475,7 +519,7 @@ fun redirect_terminator(fn: *ir.Function, blk: id.BlockId, from: id.BlockId, to:
 }
 
 # change every phi-incoming block slot of `blk` equal to `from` to `to`
-fun relabel_phi_pred(fn: *ir.Function, blk: id.BlockId, from: id.BlockId, to: id.BlockId) {
+pub fun relabel_phi_pred(fn: *ir.Function, blk: id.BlockId, from: id.BlockId, to: id.BlockId) {
     val b: *ir.Block = ?fn.blocks[blk::u32];
     var pi: u32 = 0;
     for (pi < b.phi_count) {
@@ -496,7 +540,7 @@ fun relabel_phi_pred(fn: *ir.Function, blk: id.BlockId, from: id.BlockId, to: id
 
 # true when operand slot `o` of opcode `k` is a block target (BR slot 0; CBR slots
 # 1 and 2; PHI even slots)
-fun operand_is_block(k: instruction.InstrKind, o: u32) bool {
+pub fun operand_is_block(k: instruction.InstrKind, o: u32) bool {
     if (k == instruction.OP_BR)  { ret o == 0; }
     if (k == instruction.OP_CBR) { ret o == 1 || o == 2; }
     if (k == instruction.OP_PHI) { ret (o % 2) == 0; }
@@ -661,7 +705,9 @@ test "mach.lang.me.transform.versioning:alias_guard_shape" {
     val gb: id.BlockId = R.unwrap_ok[id.BlockId, str](rg);
     builder.set_block(?bld, gb);
     val init: value.Value = la.loops[0].iv.init;
-    val rge: R.Result[value.Value, str] = emit_alias_guard(?bld, ?di, init, ?la.loops[0].counted);
+    val rbex: R.Result[value.Value, str] = emit_exclusive_bound(?bld, ?la.loops[0].counted);
+    if (R.is_err[value.Value, str](rbex)) { dep.dep_dnit(?di); loops.dnit(?la); ir.dnit(?m); ret 1; }
+    val rge: R.Result[value.Value, str] = emit_alias_guard(?bld, ?di, init, R.unwrap_ok[value.Value, str](rbex));
     if (R.is_err[value.Value, str](rge)) { dep.dep_dnit(?di); loops.dnit(?la); ir.dnit(?m); ret 1; }
 
     if (count_op(fn, gb, instruction.OP_GEP) != 6)      { code = 1; }
