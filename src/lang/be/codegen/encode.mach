@@ -35,10 +35,12 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 
 use std.allocator.page;
 
 use A: std.allocator;
+use O: std.types.option;
 use R: std.types.result;
 
 use mach.lang.be.codegen.mir;
@@ -475,6 +477,9 @@ rec BlockOffset {
 #                 fallthrough check never fires on a terminator with no successor
 # interner:    session interner; resolves inline-asm `{name}` binding names and
 #              interns symbol names referenced from inline asm into relocations
+# srcmap:      session source map, borrowed off the MIR module so an inline-asm
+#              diagnostic can name its statement's "path:line:col" (#2153); nil
+#              in unit-test states, degrading the location prefix away
 # abi:         target ABI vtable (frame / argument model the encode hook reads)
 # os:          target OS vtable (stack-probe / commit model the encode hook reads)
 pub rec EncodeState {
@@ -505,6 +510,7 @@ pub rec EncodeState {
     next_block_id:  u32;
     has_next_block: bool;
     interner:    *intern.Interner;
+    srcmap:      *source.SourceMap;
     abi:         *abi.AbiVTable;
     os:          *tos.OsVTable;
 }
@@ -1079,6 +1085,7 @@ fun state_init(st: *EncodeState, alloc: *A.Allocator, m: *mir.MirModule, tgt: *t
     st.next_block_id  = 0;
     st.has_next_block = false;
     st.interner    = m.interner;
+    st.srcmap      = m.srcmap;
     st.abi         = tgt.abi;
     st.os          = tgt.os;
 }
@@ -1453,6 +1460,76 @@ pub fun push_inline_pc(st: *EncodeState, text_offset: u32, inline_site: u32) R.R
     ret R.ok[bool, str](true);
 }
 
+# write `n` in decimal into `buf` starting at `at`, returning the next position
+fun put_decimal(buf: *u8, at: usize, n: usize) usize {
+    var digits: [20]u8;
+    var d: usize = 0;
+    var v: usize = n;
+    if (v == 0) { digits[0] = '0'::u8; d = 1; }
+    for (v > 0) {
+        digits[d] = (v % 10)::u8 + '0'::u8;
+        v = v / 10;
+        d = d + 1;
+    }
+    var k: usize = at;
+    for (d > 0) {
+        d = d - 1;
+        buf[k] = digits[d];
+        k = k + 1;
+    }
+    ret k;
+}
+
+# prefix an inline-asm diagnostic with its statement's source position
+#
+# Resolves `loc` through the state's source map to "path:line:col: <msg>",
+# interned into the session interner so the located message outlives the encode
+# (a parallel worker's message is additionally re-homed at the pool boundary).
+# Returns `msg` unchanged when the state carries no source map or interner (the
+# encoder unit tests' minimal states), the loc names no file (a synthetic MIR),
+# or building the prefixed text fails - the diagnostic itself is never lost.
+# ---
+# st:  the encode state (source map + interner)
+# loc: the erring instruction's source location
+# msg: the diagnostic text to prefix
+# ret: "path:line:col: <msg>" when resolvable, else `msg`
+pub fun asm_located_message(st: *EncodeState, loc: source.SrcLoc, msg: str) str {
+    if (st.srcmap == nil || st.interner == nil) { ret msg; }
+    if (!source.loc_is_valid(loc)) { ret msg; }
+    val fo: O.Option[*source.SourceFile] = source.get(st.srcmap, loc.file);
+    if (!O.is_some[*source.SourceFile](fo)) { ret msg; }
+    val file: *source.SourceFile = O.unwrap[*source.SourceFile](fo);
+    val pos: source.Position = source.position(file, loc.offset);
+
+    # "<path>:<line>:<col>: <msg>" - two u64s render in at most 20 digits each.
+    val lp: usize = str_len(file.path);
+    val lm: usize = str_len(msg);
+    val total_cap: usize = lp + 1 + 20 + 1 + 20 + 2 + lm + 1;
+    val rb: R.Result[*u8, str] = A.allocate[u8](st.alloc, total_cap);
+    if (R.is_err[*u8, str](rb)) { ret msg; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](rb);
+
+    var k: usize = 0;
+    var j: usize = 0;
+    for (j < lp) { buf[k] = file.path[j]::u8; k = k + 1; j = j + 1; }
+    buf[k] = ':'::u8; k = k + 1;
+    k = put_decimal(buf, k, pos.line);
+    buf[k] = ':'::u8; k = k + 1;
+    k = put_decimal(buf, k, pos.col);
+    buf[k] = ':'::u8; k = k + 1;
+    buf[k] = ' '::u8; k = k + 1;
+    j = 0;
+    for (j < lm) { buf[k] = msg[j]::u8; k = k + 1; j = j + 1; }
+    buf[k] = 0;
+
+    val ir: R.Result[intern.StrId, str] = intern.intern(st.interner, buf::str);
+    A.deallocate[u8](st.alloc, buf, total_cap);
+    if (R.is_err[intern.StrId, str](ir)) { ret msg; }
+    val nm: O.Option[str] = intern.lookup(st.interner, R.unwrap_ok[intern.StrId, str](ir));
+    if (O.is_some[str](nm)) { ret O.unwrap[str](nm); }
+    ret msg;
+}
+
 # a minimal encode state for the row / varloc / insert_text unit tests: a text sink and
 # an empty set of mark / reloc / fixup / block / row / varloc arrays, no interner or
 # vtables
@@ -1466,7 +1543,7 @@ fun t_row_state(alloc: *A.Allocator, st: *EncodeState) {
     st.rows = nil;   st.row_count = 0;   st.row_cap = 0;
     st.varlocs = nil; st.varloc_count = 0; st.varloc_cap = 0;
     st.inline_pcs = nil; st.inline_pc_count = 0; st.inline_pc_cap = 0;
-    st.interner = nil; st.abi = nil; st.os = nil;
+    st.interner = nil; st.srcmap = nil; st.abi = nil; st.os = nil;
 }
 
 # push_row drops a location naming no file, and insert_text (branch relaxation)
