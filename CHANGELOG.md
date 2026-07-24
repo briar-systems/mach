@@ -5,6 +5,62 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.1] - 2026-07-24
+
+The release that delivers 4.2.0. Its entire payload — auto-vectorization, loop
+rotation, fallthrough elision, bounded recursion peeling, loop-carried phi
+coalescing, in-memory linking, real Mach-O DWARF, parallel `-g` codegen, and the
+constant-time preview — reaches users for the first time here, so the
+`## [4.2.0]` **Added**, **Fixed**, and **Changed** sections below apply in full
+to this release. On top of them sits one fix: a mach-built aarch64-darwin
+executable execs again. Built with mach 4.1.0.
+
+(v4.2.0 was tagged but never published: its CD run caught the cross-built
+aarch64-darwin seed being SIGKILLed at exec, so `publish release` skipped and no
+artifact and no release object ever left the workflow — the full ledger is
+#2172. This release supersedes the tag; the payload is otherwise identical.
+Upgrading from 4.1.0 lands the whole 4.2.0 feature set at once.)
+
+(**The constant-time support in this release is an experimental preview and its
+guarantee is not complete.** The flow typing, the codegen taint contract, the
+translation validator, and the timing harness are all in — but proven
+secret-disclosure paths remain open. A generic instantiated inside a
+variadic-pack `$each` body is never constant-time re-validated, and the program
+prints the secret with zero diagnostics (#2177). `$fields` reflection projection
+inside a generic erases a secret field's secrecy (#2168). Both are joined by
+#2158, #2159, and #2167. The `^` / `#[oblivious]` surface has not been audited
+and is not sound today. **Do not build production cryptography on this
+version.** Epic #1643 stays open; #2177 extends the holes enumerated under
+4.2.0's Added below.)
+
+### Fixed
+- of: **a mach-built aarch64-darwin executable execs again.** The Mach-O writer
+  emitted one `LC_SEGMENT_64` per linker load segment, so two identically-mapped
+  segments wrote the same 16-byte name twice, and every predicate keyed on load
+  segments while the emitter keyed on commands. Introduced by #2126 — the
+  `SK_RELRO` round-trip listed under 4.2.0 — which deleted `coalesce_kind` so an
+  object round-trips RELRO separately from rodata: the link then produced two
+  read-only load segments, and the writer, deriving `SG_READ_ONLY` from
+  permissions alone, flagged **every** read-only segment under PIE. The darwin
+  kernel refuses to exec such an image and SIGKILLs it before dyld runs, which is
+  what killed the 4.2.0 seed. The writers now emit one command per run of
+  identically-mapped load segments, each carrying its own `section_64`, and set
+  `SG_READ_ONLY` on exactly the read-only segment the rebase stream writes into;
+  un-rebased read-only content maps as `__RODATA`, leaving `__DATA_CONST` to mean
+  to the image what it means to dyld. Two rebased read-only segments that no
+  single command can span are now a loud link error rather than a file that dies
+  at exec with no diagnostic. ELF and COFF output are byte-identical (#2172).
+
+### Changed
+- of: **a Mach-O read-only segment holding no relocated pointer now maps with
+  `maxprot` `r--`**, where every read-only segment in a PIE image previously
+  carried `rw-`. The segment holds nothing the loader slides, so capping it is
+  the point rather than a side effect, and `__LINKEDIT` has always shipped
+  `r--`. The visible consequence: an `mprotect` / `vm_protect` requesting write
+  over a page holding a `val` constant now fails on darwin where it previously
+  succeeded — relevant to self-patching code and to warming a constant cache in
+  place (#2172).
+
 ## [4.2.0] - 2026-07-24
 
 The auto-vectorization release. Counted element-wise and integer-reduction loops

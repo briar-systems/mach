@@ -164,6 +164,9 @@ run it with `bash int/ct/ct.sh`.
 
 What does not hold — the known open holes:
 
+- **a generic instantiated inside a variadic-pack `$each` body is never
+  re-validated**, so it computes on a secret and prints it with no diagnostic.
+  Proven, security-blocking (briar-systems/mach#2177).
 - **`$fields` reflection projection inside a generic erases a secret field's
   secrecy**, which discloses the secret. Proven, security-blocking
   (briar-systems/mach#2168).
