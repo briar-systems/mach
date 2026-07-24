@@ -641,3 +641,255 @@ test "mach.lang.me.analysis.dependence:wider_than_stride_dependent" {
     ir.dnit(?m);
     ret code;
 }
+
+# the recognized integer reduction idiom of a counted loop (#2142): a loop whose ONLY
+# cross-iteration recurrence besides the induction variable is a single accumulator
+# phi updated `acc = acc OP rv` with an ASSOCIATIVE + EXACT integer op, over loads of
+# contiguous unit-stride arrays and no stores. Partial-sum vectorization of such a
+# loop is bit-identical to the scalar reduction (integer add/xor/or/and reassociate
+# exactly). Float accumulators are rejected (reassociation changes rounding).
+# ---
+# ok:           true when the loop is a vectorizable integer reduction
+# op:           the reduction opcode (OP_ADD / OP_XOR / OP_OR / OP_AND)
+# acc_phi:      the accumulator header phi
+# acc_update:   the `acc OP rv` instruction (the accumulator's latch value)
+# acc_init:     the accumulator's preheader-incoming value (the user's initial value)
+# rv:           the per-iteration reduction value (acc_update's non-accumulator operand)
+# elem_ty:      the accumulator's scalar element type (an integer; every load matches it)
+# bytes:        its byte width
+# lanes:        the 128-bit lane count (16 / bytes), always >= 2
+# accesses:     the loop's loads, all base[iv] of `elem_ty` (owned)
+# access_count: number of loads
+# access_cap:   allocated capacity of `accesses`
+# alloc:        the allocator `accesses` was taken from
+pub rec ReductionInfo {
+    ok:           bool;
+    op:           instruction.InstrKind;
+    acc_phi:      id.InstructionId;
+    acc_update:   id.InstructionId;
+    acc_init:     value.Value;
+    rv:           value.Value;
+    elem_ty:      ir_type.IrTypeId;
+    bytes:        u32;
+    lanes:        u32;
+    accesses:     *MemAccess;
+    access_count: u32;
+    access_cap:   u32;
+    alloc:        *A.Allocator;
+}
+
+# a fresh "not a reduction" result
+fun reduction_none(alloc: *A.Allocator) ReductionInfo {
+    var ri: ReductionInfo;
+    ri.ok           = false;
+    ri.op           = instruction.OP_ADD;
+    ri.acc_phi      = id.INSTR_NIL;
+    ri.acc_update   = id.INSTR_NIL;
+    ri.rv           = value.const_null(ir_type.IRT_NIL);
+    ri.acc_init     = value.const_null(ir_type.IRT_NIL);
+    ri.elem_ty      = ir_type.IRT_NIL;
+    ri.bytes        = 0;
+    ri.lanes        = 0;
+    ri.accesses     = nil;
+    ri.access_count = 0;
+    ri.access_cap   = 0;
+    ri.alloc        = alloc;
+    ret ri;
+}
+
+# release a reduction result's loads array
+# ---
+# ri: the reduction info to tear down
+pub fun reduction_dnit(ri: *ReductionInfo) {
+    if (ri.accesses != nil && ri.access_cap > 0) {
+        A.deallocate[MemAccess](ri.alloc, ri.accesses, ri.access_cap::usize);
+        ri.accesses = nil;
+    }
+    ri.access_count = 0;
+    ri.access_cap   = 0;
+}
+
+# true for the associative + exact integer reduction opcodes (add, xor, or, and);
+# subtract is excluded (not associative), and float / integer-multiply / min-max are
+# handled elsewhere or left scalar
+fun is_reduction_op(k: instruction.InstrKind) bool {
+    if (k == instruction.OP_ADD) { ret true; }
+    if (k == instruction.OP_XOR) { ret true; }
+    if (k == instruction.OP_OR)  { ret true; }
+    if (k == instruction.OP_AND) { ret true; }
+    ret false;
+}
+
+# recognize loop `loop_ix` as a vectorizable integer reduction; never mutates `fn`
+# ---
+# fn:      the function
+# la:      the loop analysis for `fn`
+# loop_ix: index into la.loops
+# types:   the module's IR type table
+# alloc:   allocator for the loads array
+# ret:     the reduction info (ok == false when not a reduction), or an alloc error
+pub fun analyze_reduction(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, types: *ir_type.IrTypeTable, alloc: *A.Allocator) R.Result[ReductionInfo, str] {
+    if (loop_ix >= la.loop_len) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+    val lp: *loops.Loop = ?la.loops[loop_ix];
+    if (!lp.is_counted) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+    if (lp.iv.step.kind != value.VAL_CONST_INT || lp.iv.step.data.int_lit != 1) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+    # the induction variable and exactly ONE accumulator are the only recurrences: the
+    # header carries exactly two phis, and no other loop block carries any phi
+    var acc_phi: id.InstructionId = id.INSTR_NIL;
+    var bi: u32 = 0;
+    for (bi < lp.body_len) {
+        val bid: id.BlockId = lp.body[bi];
+        val blk: *ir.Block = ?fn.blocks[bid::u32];
+        if (bid == lp.header) {
+            if (blk.phi_count != 2) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+            var pj: u32 = 0;
+            for (pj < 2) {
+                if (blk.phis[pj] != lp.iv.phi) { acc_phi = blk.phis[pj]; }
+                pj = pj + 1;
+            }
+        } or {
+            if (blk.phi_count != 0) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+        }
+        bi = bi + 1;
+    }
+    if (acc_phi == id.INSTR_NIL) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+
+    # the accumulator phi: exactly two incomings (preheader init, latch update)
+    val popt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, acc_phi);
+    if (O.is_none[*instruction.Instruction](popt)) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+    val phi: *instruction.Instruction = O.unwrap[*instruction.Instruction](popt);
+    if (phi.operand_count != 4) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+    var acc_init: value.Value;
+    var upd_val:  value.Value;
+    var got_init: bool = false;
+    var got_upd:  bool = false;
+    var j: u32 = 0;
+    for (j < 2) {
+        val btgt: id.BlockId = ir.block_target(phi.operands[2 * j]);
+        val vv:   value.Value = phi.operands[2 * j + 1];
+        if (btgt == lp.preheader) { acc_init = vv; got_init = true; }
+        if (btgt == lp.latch)     { upd_val = vv; got_upd  = true; }
+        j = j + 1;
+    }
+    if (!got_init || !got_upd || upd_val.kind != value.VAL_INSTR) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+
+    # the update must be `acc OP rv`, OP an associative-exact integer op, one operand
+    # the accumulator phi and the other the reduction value
+    val uopt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, upd_val.data.instr);
+    if (O.is_none[*instruction.Instruction](uopt)) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+    val upd: *instruction.Instruction = O.unwrap[*instruction.Instruction](uopt);
+    if (!is_reduction_op(upd.kind) || upd.operand_count != 2) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+    val a: value.Value = upd.operands[0];
+    val b: value.Value = upd.operands[1];
+    var rv: value.Value = b;
+    if (a.kind == value.VAL_INSTR && a.data.instr == acc_phi) { rv = b; }
+    or {
+        if (b.kind == value.VAL_INSTR && b.data.instr == acc_phi) { rv = a; }
+        or { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+    }
+    if (rv.kind != value.VAL_INSTR) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+
+    # the accumulator's ONLY in-loop use must be its own update: any other in-loop use
+    # would make the recurrence non-linear (and the live-out rewrite would mis-fire).
+    # any out-of-loop use is fine (the reduction result).
+    if (!acc_used_only_by(fn, la, loop_ix, acc_phi, upd_val.data.instr)) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+
+    # the accumulator element type must be an integer scalar of 1..8 bytes giving a
+    # lane count >= 2 (float accumulators reassociate -> left scalar)
+    val elem_ty: ir_type.IrTypeId = phi.ty;
+    if (ir_type.is_float_scalar(types, elem_ty)) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+    val w: u32 = scalar_bytes(types, elem_ty);
+    if (w == 0 || w > 8 || (16 / w) < 2) { ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+
+    # collect the loads (base[iv], element type == accumulator type); reject any store
+    # or opaque effect (a pure reduction has no store, so no aliasing hazard exists)
+    var ri: ReductionInfo = reduction_none(alloc);
+    var total: u32 = 0;
+    bi = 0;
+    for (bi < lp.body_len) { total = total + fn.blocks[lp.body[bi]::u32].instr_count; bi = bi + 1; }
+    if (total > 0) {
+        val ral: R.Result[*MemAccess, str] = A.allocate[MemAccess](alloc, total::usize);
+        if (R.is_err[*MemAccess, str](ral)) { ret R.err[ReductionInfo, str](R.unwrap_err[*MemAccess, str](ral)); }
+        ri.accesses  = R.unwrap_ok[*MemAccess, str](ral);
+        ri.access_cap = total;
+    }
+    bi = 0;
+    for (bi < lp.body_len) {
+        val blk: *ir.Block = ?fn.blocks[lp.body[bi]::u32];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val iid: id.InstructionId = blk.instructions[ii];
+            val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, iid);
+            if (O.is_none[*instruction.Instruction](opt)) { reduction_dnit(?ri); ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+            val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
+            if (inst.kind == instruction.OP_STORE || inst.kind == instruction.OP_CALL || inst.kind == instruction.OP_ASM || inst.kind == instruction.OP_MEMZERO) {
+                reduction_dnit(?ri); ret R.ok[ReductionInfo, str](reduction_none(alloc));
+            }
+            if (inst.kind == instruction.OP_LOAD) {
+                var acc: MemAccess;
+                if (!classify_access(fn, la, loop_ix, iid, inst, types, ?acc)) { reduction_dnit(?ri); ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+                if (acc.elem_ty != elem_ty) { reduction_dnit(?ri); ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+                ri.accesses[ri.access_count] = acc;
+                ri.access_count = ri.access_count + 1;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    if (ri.access_count == 0) { reduction_dnit(?ri); ret R.ok[ReductionInfo, str](reduction_none(alloc)); }
+
+    ri.ok         = true;
+    ri.op         = upd.kind;
+    ri.acc_phi    = acc_phi;
+    ri.acc_update = upd_val.data.instr;
+    ri.acc_init   = acc_init;
+    ri.rv         = rv;
+    ri.elem_ty    = elem_ty;
+    ri.bytes      = w;
+    ri.lanes      = 16 / w;
+    ret R.ok[ReductionInfo, str](ri);
+}
+
+# true when the accumulator phi `acc` is used by no in-loop instruction other than
+# its update `upd` (its result may still be used freely outside the loop). Loop
+# blocks (header + body) are scanned; an operand naming `acc` anywhere but `upd`
+# means the recurrence is non-linear and the reduction is declined.
+fun acc_used_only_by(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, acc: id.InstructionId, upd: id.InstructionId) bool {
+    val lp: *loops.Loop = ?la.loops[loop_ix];
+    var bi: u32 = 0;
+    for (bi < lp.body_len) {
+        val blk: *ir.Block = ?fn.blocks[lp.body[bi]::u32];
+        var pj: u32 = 0;
+        for (pj < blk.phi_count) {
+            if (!instr_uses_only(fn, blk.phis[pj], acc, upd)) { ret false; }
+            pj = pj + 1;
+        }
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            if (!instr_uses_only(fn, blk.instructions[ii], acc, upd)) { ret false; }
+            ii = ii + 1;
+        }
+        if (blk.terminator != id.INSTR_NIL && !instr_uses_only(fn, blk.terminator, acc, upd)) { ret false; }
+        bi = bi + 1;
+    }
+    ret true;
+}
+
+# true unless instruction `iid` (other than the permitted `upd`, or a pure debug
+# value) has an operand naming `acc`
+fun instr_uses_only(fn: *ir.Function, iid: id.InstructionId, acc: id.InstructionId, upd: id.InstructionId) bool {
+    if (iid == upd) { ret true; }
+    val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, iid);
+    if (O.is_none[*instruction.Instruction](opt)) { ret true; }
+    val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
+    # a debug-value is pure -g metadata: its reference to the accumulator neither
+    # affects the recurrence nor emitted code, so it is not a disqualifying use (and
+    # counting it would make the reduction decline under -g -- a -g additivity break)
+    if (inst.kind == instruction.OP_DBG_VALUE) { ret true; }
+    var o: u32 = 0;
+    for (o < inst.operand_count) {
+        if (inst.operands[o].kind == value.VAL_INSTR && inst.operands[o].data.instr == acc) { ret false; }
+        o = o + 1;
+    }
+    ret true;
+}
