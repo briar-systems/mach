@@ -40,17 +40,32 @@
 _produce_lib_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 _flat_loader_bin=
 
+# qemu_bin <target> — the qemu-user interpreter for a harness target, keyed by ISA
+# rather than sliced from the name. linux-riscv64's name suffix happens to match its
+# qemu-user binary (qemu-riscv64), but linux-arm64's does not (qemu-aarch64, never
+# qemu-arm64), and the bare `linux` / `windows` legs carry no ISA suffix at all. keep
+# in sync with the ISA each int/*/mach.toml's `[target.<leg>]` declares when a
+# targets.conf row is added.
+qemu_bin() {
+    case "$1" in
+        linux|windows)              echo qemu-x86_64 ;;
+        linux-arm64|darwin-aarch64) echo qemu-aarch64 ;;
+        linux-riscv64)              echo qemu-riscv64 ;;
+        *) echo "int: no qemu interpreter mapping for target '$1'" >&2; return 1 ;;
+    esac
+}
+
 # produce_exec <runmode> <target> <binary>
-# runs the built binary and forwards its stdout as the observable. native mode
-# runs it directly; qemu mode runs it under the matching qemu-user (the target's
-# arch is its name suffix, e.g. linux-riscv64 -> qemu-riscv64). the producer's
-# exit status is the program's, so a crash (nonzero) fails the case.
+# runs the built binary and forwards its stdout as the observable. native mode runs
+# it directly; qemu mode runs it under the matching qemu-user (qemu_bin). the
+# producer's exit status is the program's, so a crash (nonzero) fails the case.
 produce_exec() {
     runmode=$1
     target=$2
     bin=$3
     if [ "$runmode" = "qemu" ]; then
-        "qemu-${target##*-}" "$bin"
+        interp=$(qemu_bin "$target") || return 1
+        "$interp" "$bin"
     else
         "$bin"
     fi
@@ -68,7 +83,8 @@ produce_relro_fault() {
     target=$2
     bin=$3
     if [ "$runmode" = "qemu" ]; then
-        "qemu-${target##*-}" "$bin" >/dev/null 2>&1
+        interp=$(qemu_bin "$target") || return 1
+        "$interp" "$bin" >/dev/null 2>&1
     else
         "$bin" >/dev/null 2>&1
     fi

@@ -202,7 +202,8 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
                 continue
             fi
             if [ "$runmode" = qemu ]; then
-                buildcc="qemu-${target##*-} $tmp/selfhostcc"
+                interp=$(qemu_bin "$target") || exit 1
+                buildcc="$interp $tmp/selfhostcc"
             else
                 buildcc=$tmp/selfhostcc
             fi
