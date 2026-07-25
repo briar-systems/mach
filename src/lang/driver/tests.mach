@@ -3806,6 +3806,132 @@ test "mach.lang.driver:noinline_decorator_survives_object_all_isas" {
     ret 0;
 }
 
+# the emitted byte span of function symbol `name` in `image`: from its own offset to
+# the next function symbol's, or to the end of its section when it is the last. the
+# encoder leaves `Symbol.size` zero for a function, so the span is derived the same way
+# the DWARF producer derives it
+# ---
+# image: the object image to measure
+# name:  the interned linkage name to find
+# ret:   the function's byte span, or -1 when the symbol is absent
+fun ut_fn_text_span(image: *of.ObjectImage, name: intern.StrId) i64 {
+    var sec: u32 = 0xFFFFFFFF;
+    var lo: u32 = 0;
+    var i: u32 = 0;
+    for (i < image.symbol_count) {
+        val sym: *of.Symbol = ?image.symbols[i];
+        if ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0 && sym.name == name) { sec = sym.section; lo = sym.offset; }
+        i = i + 1;
+    }
+    if (sec == 0xFFFFFFFF)          { ret -1; }
+    if (sec >= image.section_count) { ret -1; }
+
+    # the next function start in the same section bounds this one; nothing beyond it
+    # does, so the section length bounds the last.
+    var hi: u32 = image.sections[sec].len;
+    var j: u32 = 0;
+    for (j < image.symbol_count) {
+        val sym: *of.Symbol = ?image.symbols[j];
+        if ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0 && sym.section == sec
+            && sym.offset > lo && sym.offset < hi) { hi = sym.offset; }
+        j = j + 1;
+    }
+    ret (hi - lo)::i64;
+}
+
+# compile `src` for `target_name` and return the emitted byte spans of its `nk` and
+# `bare` functions through the out parameters
+# ---
+# target_name: a `[target.*]` entry from ut_manifest's six-target manifest
+# src:         the fixture, defining `nk` (naked) and `bare` with identical asm bodies
+# naked_out:   out - the naked function's span, or -1
+# bare_out:    out - the undecorated twin's span, or -1
+# ret:         0 when the build and both lookups succeeded, 1 otherwise
+fun ut_naked_spans(target_name: str, src: str, naked_out: *i64, bare_out: *i64) i32 {
+    @naked_out = -1;
+    @bare_out = -1;
+
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = src;
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val rr: R.Result[bool, str] = driver.setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val pr: R.Result[project.Project, outcome.Fail] = driver.build_project(?s, root, target_name);
+    fs.remove_all(?alloc, root);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var bad: i32 = 1;
+    if (R.is_err[bool, outcome.Fail](passes.run_sema_pass(?p)))  { project.dnit_project(?p); session.dnit(?s); ret 1; }
+    if (R.is_err[bool, outcome.Fail](passes.run_lower_pass(?p))) { project.dnit_project(?p); session.dnit(?s); ret 1; }
+
+    val mid: session.ModuleId = ut_mid(?p, ?s, "uniontest.main");
+    if (mid != session.MODULE_NIL) {
+        val me: *project.ModuleEntry = ?p.modules[mid::u32];
+        if (me.ir_module != nil) {
+            val cg: R.Result[of.ObjectImage, str] =
+                codegen.codegen_module(?s, ?p.target, me.ir_module, nil, codegen.no_debug());
+            if (R.is_ok[of.ObjectImage, str](cg)) {
+                var image: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](cg);
+                val nk: R.Result[intern.StrId, str] = intern.intern(?s.interner, "nk");
+                val br: R.Result[intern.StrId, str] = intern.intern(?s.interner, "bare");
+                if (R.is_ok[intern.StrId, str](nk) && R.is_ok[intern.StrId, str](br)) {
+                    @naked_out = ut_fn_text_span(?image, R.unwrap_ok[intern.StrId, str](nk));
+                    @bare_out  = ut_fn_text_span(?image, R.unwrap_ok[intern.StrId, str](br));
+                    if (@naked_out >= 0 && @bare_out >= 0) { bad = 0; }
+                }
+                obj.dnit(?image);
+            }
+        }
+    }
+
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# a `#[naked]` function emits EXACTLY its inline asm - no prologue, no epilogue, and
+# no terminator (#2198). the fixture's body is one `nop`, so the naked span is one
+# instruction and the undecorated twin's is two: the same `nop` plus the compiler's
+# `ret`. that single-instruction delta is the whole contract, read off the object.
+#
+# mutating `mir.emits_instr` to answer true unconditionally makes the naked span equal
+# the bare one and fails every line here; the spans are asserted absolutely rather than
+# only against each other, so a mutation that suppressed BOTH functions' returns would
+# fail too
+test "mach.lang.driver:naked_emits_only_its_asm_all_isas" {
+    var nk: i64 = -1;
+    var br: i64 = -1;
+
+    # identical bodies per ISA, so every byte of difference is the decorator's doing;
+    # the symbol names are pinned so the lookup needs no mangling rule.
+    val x64: str = "#[naked] #[symbol(\"nk\")]\npub fun nk() { asm x86_64 { nop } }\n#[symbol(\"bare\")]\npub fun bare() { asm x86_64 { nop } }\nfun main() i64 { ret 0; }\n";
+    val a64: str = "#[naked] #[symbol(\"nk\")]\npub fun nk() { asm aarch64 { nop } }\n#[symbol(\"bare\")]\npub fun bare() { asm aarch64 { nop } }\nfun main() i64 { ret 0; }\n";
+    val rv:  str = "#[naked] #[symbol(\"nk\")]\npub fun nk() { asm riscv64 { nop } }\n#[symbol(\"bare\")]\npub fun bare() { asm riscv64 { nop } }\nfun main() i64 { ret 0; }\n";
+
+    # x86_64: `nop` is one byte, `ret` (0xC3) is one more.
+    if (ut_naked_spans("linux", x64, ?nk, ?br) != 0) { ret 1; }
+    if (nk != 1 || br != 2) { ret 1; }
+
+    # aarch64 and riscv64 are fixed four-byte instruction words.
+    if (ut_naked_spans("linux-arm64", a64, ?nk, ?br) != 0) { ret 1; }
+    if (nk != 4 || br != 8) { ret 1; }
+
+    if (ut_naked_spans("linux-riscv64", rv, ?nk, ?br) != 0) { ret 1; }
+    if (nk != 4 || br != 8) { ret 1; }
+    ret 0;
+}
+
 # a `#[naked]` body may hold only inline `asm` (#2198). every other statement lowers
 # to code that assumes a frame the function does not have, and the result runs and
 # returns a wrong answer rather than failing - so each shape is rejected with the
