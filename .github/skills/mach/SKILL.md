@@ -438,6 +438,7 @@ immediately following declaration. Closed set:
 | `#[section(".name")]` | fun, ext fun, val/var | string | object section placement |
 | `#[oblivious]` | fun | none | constant-time boundary (see `^` above) |
 | `#[scalar]` | fun | none | opt out of auto-vectorization |
+| `#[naked]` | fun | none | no prologue/epilogue; body as written |
 
 ```mach
 #[symbol("read")]
@@ -464,6 +465,31 @@ known open disclosure path - do not write production crypto against it.
 release pipeline on targets with 128-bit vectors) and also blocks inlining, so
 the opt-out survives. The project-wide lever is the `vectorize` profile key in
 `mach.toml`, optional and default-on.
+
+`#[naked]` emits the body exactly as written - no frame record, no stack
+allocation, no argument moves, and no return. The body may hold only inline
+`asm` (plus the `$if $mach.build.arch` chain that selects it); anything else is
+rejected, because it would lower to code assuming a frame that does not exist.
+Parameters and the return type are still checked at call sites, but no moves are
+emitted for them: the arguments arrive in the ABI registers and the body reads
+them there. Write the return yourself - none is generated, which is the point
+for an interrupt handler that must leave through `iret`/`rti`. Rejected
+alongside `#[inline]` and `#[oblivious]`. Merely *containing* an `asm` block
+does not make a function naked: one that also calls still gets a frame.
+
+```mach
+#[naked] #[symbol("_start")]
+fun start() {
+    $if ($mach.build.arch == $mach.arch.x86_64) {
+        asm x86_64 {
+            mov rdi, [rsp]
+            lea rsi, [rsp+8]
+            call main
+        }
+    }
+    $or { asm aarch64 { ... } }
+}
+```
 
 ### Intrinsics - `$name(args)`
 

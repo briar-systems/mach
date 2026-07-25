@@ -36,6 +36,7 @@ A decorator is written as an attribute:
 #[section(".name")]  # place in a named object section
 #[oblivious]         # constant-time boundary (no arguments)
 #[scalar]            # opt out of auto-vectorization (no arguments)
+#[naked]             # no prologue or epilogue; body as written (no arguments)
 ```
 
 Decorators appear **before** the declaration they target, one per line or
@@ -214,6 +215,61 @@ for a scalar reference twin in a differential test, or where vectorized codegen
 is undesirable for a specific function. The project-wide equivalent is the
 `vectorize` profile key (see [manifest.md](../manifest.md#profilename)).
 
+### `naked` — no prologue, no epilogue, body as written
+
+Emits the function's body exactly as written and nothing else: no frame-pointer
+record, no stack allocation, no callee-save stores, no argument moves, and no
+return. Applies to functions only; takes no arguments.
+
+```mach
+#[naked] #[symbol("_start")]
+fun start() {
+    $if ($mach.build.arch == $mach.arch.x86_64) {
+        asm x86_64 {
+            mov rdi, [rsp]        # argc, straight off the kernel-supplied stack
+            lea rsi, [rsp+8]      # argv
+            call main
+        }
+    }
+    $or { asm aarch64 { ... } }
+}
+```
+
+The programmer owns the frame, the stack alignment, the link register, and the
+return. That is the whole point: a reset vector, an interrupt handler that must
+return with `iret`/`rti` rather than `ret`, a syscall or context-switch stub, or
+a thread entry point whose register state at entry *is* the interface.
+
+- **The body may contain only inline `asm`** — plus the `$if $mach.build.arch`
+  chain that is how mach spells per-ISA assembly. Any other statement is
+  rejected. A local, an expression, or a `ret` lowers to code that assumes a
+  frame the function does not have, and the result would run and return a wrong
+  answer rather than fail.
+- **No return is generated.** If the asm falls off the end, control runs into
+  whatever the linker placed next. Write the return the ABI (or the interrupt
+  controller) actually calls for.
+- **Parameters and the return type are still checked** at every call site, so a
+  naked function is called like any other. No moves are emitted for them: the
+  arguments arrive in the ABI's registers and the body reads them there.
+- **Mutually exclusive with `inline`** — there is no coherent winner between a
+  body spliced into a caller and one that owns its own frame — and with
+  `oblivious`, which already forbids inline asm because a type system cannot
+  check it. Both combinations are rejected in sema. `noinline` is redundant: the
+  inliner declines a naked function unconditionally.
+- **Debug info carries no `DW_AT_frame_base`** for a naked subprogram. Every
+  other function has a frame base the compiler established and can name; this
+  one does not, so it declares none rather than pointing at a register the asm
+  may have moved.
+
+Frame *elision* is a separate, automatic thing: the compiler already omits the
+prologue for a leaf that provably never touches its frame. `naked` is the
+declared form, and it is unconditional — it suppresses the frame whether or not
+the compiler could prove it safe, because the proof obligation is the author's.
+Merely containing an `asm` block does **not** suppress a frame: a function that
+also makes a call gets one, since an unaligned call boundary (x86-64) or a
+clobbered link register (aarch64, riscv64) is not something the author asked
+for by writing assembly.
+
 ## Applicability
 
 | Directive   | `fun` | `ext fun` | `val` / `var` | `rec` / `uni` |
@@ -226,6 +282,7 @@ is undesirable for a specific function. The project-wide equivalent is the
 | `section`   |  yes  |    yes    |      yes      |      no       |
 | `oblivious` |  yes  |    no     |      no       |      no       |
 | `scalar`    |  yes  |    no     |      no       |      no       |
+| `naked`     |  yes  |    no     |      no       |      no       |
 
 The set is closed. New directives require a compiler change.
 
@@ -235,4 +292,5 @@ The set is closed. New directives require a compiler change.
 - [visibility.md](visibility.md) — `pub` / `ext` visibility (not decorator-controlled)
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of` / `$align_of` as `align` arguments
 - [secrecy.md](secrecy.md) — `^` secret types and the `oblivious` constant-time contract
+- [asm.md](asm.md) — inline `asm`, the only body a `naked` function may have
 - [../manifest.md](../manifest.md) — the `vectorize` profile key `scalar` opts out of
