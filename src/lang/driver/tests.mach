@@ -25,6 +25,7 @@ use std.types.string.str_len;
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
+use ctime: std.chrono.time;
 
 use mach.lang.build.outcome;
 use mach.lang.build.qctx;
@@ -34,6 +35,7 @@ use mach.lang.fe.ast;
 use mach.lang.fe.comptime;
 use mach.lang.fe.resolve;
 use mach.lang.fe.sema;
+use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.manifest;
 use mach.lang.me.ir;
@@ -42,6 +44,7 @@ use mach.lang.me.ir.value;
 use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.pass.inline;
 use mach.lang.query;
+use mach.lang.readout;
 use mach.lang.session;
 use src: mach.lang.source;
 use mach.lang.target;
@@ -620,6 +623,22 @@ fun ut_run_codegen_err(p: *project.Project, needle: str) i32 {
     if (R.is_err[bool, outcome.Fail](ce)
         && ut_str_contains(R.unwrap_err[bool, outcome.Fail](ce).message, needle)) { ret 0; }
     ret 1;
+}
+
+# 0 when project `p` passes sema + lower and its codegen outcome - clean OR failing -
+# carries no `needle`; 1 when the needle appears, or on a pre-codegen failure. the
+# negative sibling of `ut_run_codegen_err`, for asserting a gate does NOT observe a
+# construct it must ignore, without pinning whatever unrelated frontier the target
+# happens to hit next (a partially-implemented backend's missing encoding) (#2149).
+fun ut_run_codegen_without(p: *project.Project, needle: str) i32 {
+    val se: R.Result[bool, outcome.Fail] = passes.run_sema_pass(p);
+    if (R.is_err[bool, outcome.Fail](se)) { ret 1; }
+    val le: R.Result[bool, outcome.Fail] = passes.run_lower_pass(p);
+    if (R.is_err[bool, outcome.Fail](le)) { ret 1; }
+    val ce: R.Result[bool, outcome.Fail] = passes.run_codegen_pass(p);
+    if (R.is_ok[bool, outcome.Fail](ce)) { ret 0; }
+    if (ut_str_contains(R.unwrap_err[bool, outcome.Fail](ce).message, needle)) { ret 1; }
+    ret 0;
 }
 
 # 0 when project `p` passes sema + lower + codegen cleanly; 1 on any error. asserts a
@@ -4591,6 +4610,105 @@ test "mach.lang.driver:declassify_edge_consumers" {
     ret bad;
 }
 
+# constant-time (#2149): the variable-shift gate rejects a secret shift COUNT end to end
+# on a real no-barrel-shifter target, not merely at the mechanism level
+#
+# The multiply gate has had a full compile-reject since #1646 (`secret_mul_codegen_rejected`)
+# because every mainstream target sets `ct_trust_mul = false`. The SHIFT gate had none: the
+# only `ct_trust_var_shift = false` targets are mos6502 and spirv, so the rejection was
+# proven only by the ct-table test plus the gate-mechanism test. This closes that gap by
+# driving a secret shift through the ct-edge manifest's mos6502 target - the gate lives at
+# MIR lowering, ahead of width legalization and selection, so an experimental backend
+# reaches it regardless of what it cannot yet encode.
+#
+# Both halves matter: the gate must FIRE on a secret count [1], and must NOT fire on a
+# secret VALUE shifted by a public count [2], which is constant-time on any target. [2] is
+# asserted as an ABSENCE so it keeps holding once mos6502 learns to encode a shift.
+# `^u8` keeps the operands inside the 8-bit ALU, so the reject under test is the ct gate
+# rather than the target's wide-value handling.
+#
+# THE NEEDLES ARE DELIBERATELY ASYMMETRIC. Two independent enforcement points reject a
+# secret shift and both say "barrel shifter": the compile-time gate in `mir.lower` ("secret
+# value USED AS a variable shift count") and the #1648 validator's backstop ("`f` USES a
+# secret value as a variable shift count"). [1] therefore pins the LOWERING GATE's own
+# wording - a broad "barrel shifter" needle passes on the validator alone, so deleting the
+# gate's wiring would leave this test green. [2] wants the broad needle, because the
+# absence being asserted is that NEITHER point observes a public count.
+test "mach.lang.driver:secret_shift_codegen_rejected_mos6502" {
+    var bad: i32 = 0;
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    # [1] a secret shift COUNT is rejected at codegen by the compile-time gate itself.
+    val p1: R.Result[project.Project, outcome.Fail] = ut_ct_edge_project(?s, ?alloc,
+        "#[oblivious]\nfun f(v: ^u8, n: ^u8) ^u8 { ret v << n; }\nfun main() i32 { ret 0; }\n", "mos");
+    if (R.is_err[project.Project, outcome.Fail](p1)) { bad = 1; }
+    or {
+        var pa: project.Project = R.unwrap_ok[project.Project, outcome.Fail](p1);
+        if (ut_run_codegen_err(?pa, "secret value used as a variable shift count on a target without a barrel shifter") != 0) { bad = 1; }
+        project.dnit_project(?pa);
+    }
+
+    # [2] a secret VALUE shifted by a PUBLIC count is constant-time, so the gate stays
+    # silent - the count-only precision, on the same target that rejects [1].
+    val p2: R.Result[project.Project, outcome.Fail] = ut_ct_edge_project(?s, ?alloc,
+        "#[oblivious]\nfun f(v: ^u8, n: u8) ^u8 { ret v << n; }\nfun main() i32 { ret 0; }\n", "mos");
+    if (R.is_err[project.Project, outcome.Fail](p2)) { bad = 1; }
+    or {
+        var pb: project.Project = R.unwrap_ok[project.Project, outcome.Fail](p2);
+        if (ut_run_codegen_without(?pb, "barrel shifter") != 0) { bad = 1; }
+        project.dnit_project(?pb);
+    }
+
+    session.dnit(?s);
+    ret bad;
+}
+
+# constant-time (#2159): the SPIR-V back half is a whole-module emitter - mach hands a
+# module to a downstream compiler instead of emitting the instructions that execute - so an
+# `#[oblivious]` contract can be neither validated nor upheld there and is REFUSED. the same
+# function compiles clean for a machine target (the refusal keys on the back half, not the
+# body), and a secrecy-transparent function still compiles clean for SPIR-V (the refusal is
+# scoped to the marker, so secret-free and move-only code is unaffected).
+test "mach.lang.driver:oblivious_spirv_refused" {
+    var bad: i32 = 0;
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val obl: str = "#[oblivious]\nfun mask(a: ^u32, b: ^u32) ^u32 { ret a ^ b; }\nfun main() i32 { ret 0; }\n";
+
+    # a machine target compiles the oblivious function all the way through codegen.
+    if (ut_codegen_target_ok(obl, "linux") != 0) { bad = 1; }
+
+    # the SPIR-V target refuses it, naming the target and the reason.
+    val ps: R.Result[project.Project, outcome.Fail] = ut_ct_edge_project(?s, ?alloc, obl, "spv");
+    if (R.is_err[project.Project, outcome.Fail](ps)) { bad = 1; }
+    or {
+        var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](ps);
+        if (ut_run_codegen_err(?p, "cannot be compiled for the `spirv` target") != 0) { bad = 1; }
+        project.dnit_project(?p);
+    }
+
+    # a secrecy-transparent function carries no contract, so SPIR-V still emits it.
+    val pt: R.Result[project.Project, outcome.Fail] = ut_ct_edge_project(?s, ?alloc,
+        "fun down(a: ^u32) u32 { ret a:^; }\nfun main() i32 { ret 0; }\n", "spv");
+    if (R.is_err[project.Project, outcome.Fail](pt)) { bad = 1; }
+    or {
+        var p2: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pt);
+        if (ut_run_codegen_ok(?p2) != 0) { bad = 1; }
+        project.dnit_project(?p2);
+    }
+
+    session.dnit(?s);
+    ret bad;
+}
+
 # count instructions of opcode `kind` across `p`'s lowered IR modules
 fun ut_count_op(p: *project.Project, kind: instruction.InstrKind) u32 {
     var n: u32 = 0;
@@ -5476,6 +5594,267 @@ test "mach.lang.build.engine.execute_warm:pool_error_message_survives_teardown" 
     if (cap.fails != 1) { bad = 1; }
     if (!ut_str_contains(cap.msg, "'frobnicate'")) { bad = 1; }
     if (!ut_str_contains(cap.msg, "c.mach:"))      { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    session.dnit(?s);
+    ret bad;
+}
+
+# which `readout.Progress` callback fires a `UtDiagInject`'s synthetic error
+val UT_HOOK_PHASE_BEGIN: u8 = 0;
+val UT_HOOK_PHASE_END:   u8 = 1;
+val UT_HOOK_ITEM:        u8 = 2;
+
+# a fault injector driven through the `readout.Progress` seam (#2173): the
+# engine's own phase gate has no live trigger today - codegen, emit, and link
+# file no diagnostics yet, which is exactly the fail-open-by-omission the gate
+# closes - so the regression tests below fire a synthetic diagnostic through
+# the progress callback the target phase already invokes, proving the gate
+# closes the CLASS of bug (a phase that reports and returns success) rather
+# than waiting on one specific instance of it
+# ---
+# diags: the session sink to file the synthetic diagnostic onto
+# hook:  which callback fires the injection (a UT_HOOK_* constant)
+# ph:    the readout.PH_* phase id the hook must match
+# sev:   the injected diagnostic's severity
+# msg:   the synthetic diagnostic's message
+# fired: set once fired, so a hook invoked more than once files only one
+rec UtDiagInject {
+    diags: *diagnostic.DiagList;
+    hook:  u8;
+    ph:    u8;
+    sev:   diagnostic.Severity;
+    msg:   str;
+    fired: bool;
+}
+
+# file the injector's synthetic diagnostic when `hook`/`ph` match and it has
+# not already fired
+fun ut_diag_inject_fire(ctx: ptr, hook: u8, ph: u8) {
+    val inj: *UtDiagInject = ctx::*UtDiagInject;
+    if (inj.fired || hook != inj.hook || ph != inj.ph) { ret; }
+    inj.fired = true;
+    var sp: token.Span;
+    sp.offset = 0;
+    sp.len    = 0;
+    if (inj.sev == diagnostic.SEVERITY_ERROR) { diagnostic.error(inj.diags, 0::src.FileId, sp, inj.msg); }
+    or { diagnostic.warning(inj.diags, 0::src.FileId, sp, inj.msg); }
+}
+
+fun ut_pinj_phase_begin(ctx: ptr, ph: u8) { ut_diag_inject_fire(ctx, UT_HOOK_PHASE_BEGIN, ph); }
+
+fun ut_pinj_item_begin(ctx: ptr) ctime.Time {
+    var t: ctime.Time;
+    t.sec  = 0;
+    t.nsec = 0;
+    ret t;
+}
+
+fun ut_pinj_item(ctx: ptr, ph: u8, name: str, start: ctime.Time) { ut_diag_inject_fire(ctx, UT_HOOK_ITEM, ph); }
+
+fun ut_pinj_phase_end(ctx: ptr, ph: u8, count: u32, noun_one: str, noun_many: str) { ut_diag_inject_fire(ctx, UT_HOOK_PHASE_END, ph); }
+
+fun ut_pinj_summary(ctx: ptr, path: str, n: u32, mag: i64, unit: str, show: bool) { }
+
+# build a one-file, no-std host-native program end to end through
+# `execute_warm`, injecting a synthetic error diagnostic at the given
+# hook/phase; the shared body of the per-phase gate regressions below (#2173)
+# ---
+# hook: a UT_HOOK_* constant naming which progress callback fires the injection
+# ph:   the readout.PH_* phase id the hook must match
+# ret:  0 when the build failed and recorded no artifact (the gate caught the
+#       injected error), 1 otherwise
+fun ut_phase_gate_case(hook: u8, ph: u8) i32 {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](driver.setup_registry(?s.registry))) { session.dnit(?s); ret 1; }
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = ut_cc3(?alloc, "#[symbol(\"", ut_entry_symbol(), "\")]\nfun start() i32 { ret 0; }\n");
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    val mr: R.Result[manifest.Manifest, str] = driver.load_manifest(?s, root);
+    if (R.is_err[manifest.Manifest, str](mr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](mr);
+    var rq: request.BuildRequest = request.defaults();
+    rq.project_root = root;
+    val pr: R.Result[bplan.BuildPlan, outcome.Fail] = bplan.plan(?alloc, ?s.interner, ?s.registry, ?m, ?rq);
+    if (R.is_err[bplan.BuildPlan, outcome.Fail](pr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var bp: bplan.BuildPlan = R.unwrap_ok[bplan.BuildPlan, outcome.Fail](pr);
+
+    var inj: UtDiagInject;
+    inj.diags = ?s.diags;
+    inj.hook  = hook;
+    inj.ph    = ph;
+    inj.sev   = diagnostic.SEVERITY_ERROR;
+    inj.msg   = "ut synthetic: phase reported an error but returned success (#2173)";
+    inj.fired = false;
+
+    var ev: readout.Progress;
+    ev.ctx            = (?inj)::ptr;
+    ev.fn_phase_begin = ut_pinj_phase_begin;
+    ev.fn_item_begin  = ut_pinj_item_begin;
+    ev.fn_item        = ut_pinj_item;
+    ev.fn_phase_end   = ut_pinj_phase_end;
+    ev.fn_summary     = ut_pinj_summary;
+
+    var bad: i32 = 0;
+    val r: R.Result[outcome.BuildOutcome, outcome.Fail] = bengine.execute_warm(?bp, 0, ?s, ?alloc, ?ev, nil);
+    if (R.is_err[outcome.BuildOutcome, outcome.Fail](r)) { bad = 1; }
+    or {
+        val bo: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](r);
+        if (bo.ok)                 { bad = 1; }
+        if (bo.artifacts.len != 0) { bad = 1; }
+    }
+    if (!inj.fired) { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    session.dnit(?s);
+    ret bad;
+}
+
+# a diagnostic filed during PH_CODEGEN (#2173): `codegen_phase` adopts every
+# module's object image and returns success with no look at the sink, so an
+# error filed there - synthetically, at `run_codegen_pass`'s own PH_CODEGEN
+# `phase_end` narration, exactly where a future codegen-side check would file
+# one - must still fail the build before PH_EMIT ever writes an object. no
+# object or link narration has fired by the injection point, so nothing is
+# written to disk on the caught path.
+test "mach.lang.build.engine.execute_warm:codegen_phase_diagnostic_fails_build" {
+    ret ut_phase_gate_case(UT_HOOK_PHASE_END, readout.PH_CODEGEN);
+}
+
+# a diagnostic filed during PH_EMIT (#2173): `emit_phase` writes the per-module
+# `.ir`/`.s` dumps and objects with no look at the sink, so an error filed at
+# its very first statement - the link-narration span's `phase_begin`, which
+# `begin_link_narration` fires unconditionally for a GOAL_EXECUTE unit - must
+# still fail the build before PH_LINK ever runs.
+test "mach.lang.build.engine.execute_warm:emit_phase_diagnostic_fails_build" {
+    ret ut_phase_gate_case(UT_HOOK_PHASE_BEGIN, readout.PH_LINK);
+}
+
+# a diagnostic filed during PH_LINK (#2173): `link_phase` narrates its produced
+# binary's `item` event, then returns success, with no look at the sink - the
+# exact shape #2168 found in `run_lower_pass` (a rejected program linked and ran
+# because the phase that owned the diagnostic returned ok anyway). injecting at
+# that `item` event, right where a future link-side check would file one, must
+# still leave the build's outcome failed with no recorded artifact, even though
+# the binary bytes are already on disk by then - matching #2168's own shape,
+# where the artifact existed and only the reported OUTCOME was wrong.
+test "mach.lang.build.engine.execute_warm:link_phase_diagnostic_fails_build" {
+    ret ut_phase_gate_case(UT_HOOK_ITEM, readout.PH_LINK);
+}
+
+# over-rejection control (#2173): `diagnostic.has_errors` counts only
+# SEVERITY_ERROR, so a WARNING left on the sink by a phase - the same
+# `readout.Progress` injection the regressions above use, at PH_CODEGEN's
+# `phase_end` - must not trip run_phase's gate. A legitimate program may not
+# start failing because a recoverable diagnostic sits on the sink.
+test "mach.lang.build.engine.execute_warm:warning_only_sink_does_not_fail_build" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](driver.setup_registry(?s.registry))) { session.dnit(?s); ret 1; }
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = ut_cc3(?alloc, "#[symbol(\"", ut_entry_symbol(), "\")]\nfun start() i32 { ret 0; }\n");
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    val mr: R.Result[manifest.Manifest, str] = driver.load_manifest(?s, root);
+    if (R.is_err[manifest.Manifest, str](mr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](mr);
+    var rq: request.BuildRequest = request.defaults();
+    rq.project_root = root;
+    val pr: R.Result[bplan.BuildPlan, outcome.Fail] = bplan.plan(?alloc, ?s.interner, ?s.registry, ?m, ?rq);
+    if (R.is_err[bplan.BuildPlan, outcome.Fail](pr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var bp: bplan.BuildPlan = R.unwrap_ok[bplan.BuildPlan, outcome.Fail](pr);
+
+    var inj: UtDiagInject;
+    inj.diags = ?s.diags;
+    inj.hook  = UT_HOOK_PHASE_END;
+    inj.ph    = readout.PH_CODEGEN;
+    inj.sev   = diagnostic.SEVERITY_WARNING;
+    inj.msg   = "ut synthetic: a recoverable diagnostic that must not fail the build (#2173)";
+    inj.fired = false;
+
+    var ev: readout.Progress;
+    ev.ctx            = (?inj)::ptr;
+    ev.fn_phase_begin = ut_pinj_phase_begin;
+    ev.fn_item_begin  = ut_pinj_item_begin;
+    ev.fn_item        = ut_pinj_item;
+    ev.fn_phase_end   = ut_pinj_phase_end;
+    ev.fn_summary     = ut_pinj_summary;
+
+    var bad: i32 = 0;
+    val r: R.Result[outcome.BuildOutcome, outcome.Fail] = bengine.execute_warm(?bp, 0, ?s, ?alloc, ?ev, nil);
+    if (R.is_err[outcome.BuildOutcome, outcome.Fail](r)) { bad = 1; }
+    or {
+        val bo: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](r);
+        if (!bo.ok)                { bad = 1; }
+        if (bo.artifacts.len != 1) { bad = 1; }
+        or (!fs.is_file(bo.artifacts.data[0].path)) { bad = 1; }
+    }
+    # the warning must actually have fired (else this proves nothing) and the
+    # sink must still hold it, unpromoted to an error.
+    if (!inj.fired)                      { bad = 1; }
+    if (diagnostic.has_errors(?s.diags)) { bad = 1; }
+    if (s.diags.len == 0)                { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    session.dnit(?s);
+    ret bad;
+}
+
+# sema's engine-level gate, still exercised end to end through `execute_warm`
+# now that `sema_phase` no longer carries its own inline sink check (#2173
+# folded it into run_phase's generic gate, which subsumes it): a real type
+# error must still fail the build before lowering or codegen ever run.
+test "mach.lang.build.engine.execute_warm:sema_phase_diagnostic_fails_build" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](driver.setup_registry(?s.registry))) { session.dnit(?s); ret 1; }
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = ut_cc3(?alloc, "#[symbol(\"", ut_entry_symbol(), "\")]\nfun start() i32 { val x: u32 = \"not a u32\"; ret 0; }\n");
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    val mr: R.Result[manifest.Manifest, str] = driver.load_manifest(?s, root);
+    if (R.is_err[manifest.Manifest, str](mr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](mr);
+    var rq: request.BuildRequest = request.defaults();
+    rq.project_root = root;
+    val pr: R.Result[bplan.BuildPlan, outcome.Fail] = bplan.plan(?alloc, ?s.interner, ?s.registry, ?m, ?rq);
+    if (R.is_err[bplan.BuildPlan, outcome.Fail](pr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var bp: bplan.BuildPlan = R.unwrap_ok[bplan.BuildPlan, outcome.Fail](pr);
+
+    var bad: i32 = 0;
+    val r: R.Result[outcome.BuildOutcome, outcome.Fail] = bengine.execute_warm(?bp, 0, ?s, ?alloc, nil, nil);
+    if (R.is_err[outcome.BuildOutcome, outcome.Fail](r)) { bad = 1; }
+    or {
+        val bo: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](r);
+        if (bo.ok)                 { bad = 1; }
+        if (bo.artifacts.len != 0) { bad = 1; }
+    }
 
     fs.remove_all(?alloc, root);
     session.dnit(?s);

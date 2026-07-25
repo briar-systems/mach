@@ -21,10 +21,24 @@
 # the backend's scorecard (conditional branches, memory access through the software
 # frame, and the 16-bit-pointer forms) reach the encoder as passed-through generic
 # opcodes and are rejected with a loud, specific diagnostic rather than mis-encoded.
+#
+# TIMING OBLIGATION (#2158). The constant-time guarantee treats selection, register
+# allocation, and encoding as timing-PRESERVING: the `#[oblivious]` gate and the #1648
+# validator both read pre-selection MIR, so a leak this encoder introduces is invisible
+# to them. That makes it this file's standing obligation - an instruction NOT itself a
+# control transfer must encode to a fixed-cycle sequence, never a data-dependent branch.
+# `encode_cmp` once broke it, materializing the equality boolean with a `BNE` over a
+# `LDA #1`; every relation now goes through the branchless carry read instead. A
+# conditional branch remains legitimate only where the MIR op IS the branch
+# (`encode_sel_cbr`), which the validator observes directly. The guard is not a reading
+# of the code: `compare_executes_constant_time` below EXECUTES the emitted bytes over
+# every operand pair, because that broken sequence also silently answered wrong and no
+# amount of re-reading it had caught either fault.
 
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.size.usize;
 use std.types.string.str;
 
 use std.allocator.page;
@@ -203,10 +217,24 @@ fun encode_not(st: *enc.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
 
 # encode a standalone comparison `dst = (a rel b)` producing a 0 / 1 byte boolean
 #
-# The unsigned less-than form is what the legalizer's carry chain emits per byte
-# lane: `LDA a ; CMP b` leaves carry set when a >= b, so `LDA #0 ; ROL A ; EOR #1`
-# reads the complement (a < b) into a 0 / 1 result. Equality / inequality branch
-# over a `LDA #1`. Signed and <= forms are a documented frontier.
+# BRANCHLESS for every relation encoded here, so a comparison of SECRET values is
+# constant-time (#2158). The 6502 has no SETcc, but every relation lands in the
+# carry flag and `LDA #0 ; ROL A` reads carry into a 0 / 1 byte without a branch:
+#
+#   a <u b   LDA a ; CMP b        -> C = (a >= b), the complement, so EOR #1 flips it
+#   a != b   LDA a ; EOR b ; CMP #1 -> A is 0 exactly when equal, so C = (a != b)
+#   a == b   the same, then EOR #1
+#
+# Every form is a fixed-cycle immediate / zero-page / accumulator instruction, so the
+# sequence's cycle count is operand-INDEPENDENT, which is what `#[oblivious]` needs.
+#
+# THE CARRY IS THE ONLY FLAG THAT MAY CROSS an instruction here, and `LDA` / `EOR` do not
+# write it. The equality form this replaced ended `CMP b ; LDA #$00 ; BNE +2 ; LDA #$01`,
+# reading the compare's ZERO flag after a `LDA` - which sets Z from the byte it loads. Z
+# was therefore always 1 at the branch, so the branch was a constant and the compare
+# answered 1 for every `==` and 0 for every `!=`, regardless of its operands. A
+# secret-dependent branch in an `#[oblivious]` function on top of a compare that never
+# looked at its inputs. Signed and <= forms are a documented frontier.
 fun encode_cmp(st: *enc.EncodeState, mi: *mir.MirInstr, op: mir.MirOpcode) R.Result[bool, str] {
     if (mi.operand_count != 3) { ret R.err[bool, str]("mos6502: malformed compare"); }
     val dst: *mir.MirOperand = ?mi.operands[0];
@@ -215,27 +243,45 @@ fun encode_cmp(st: *enc.EncodeState, mi: *mir.MirInstr, op: mir.MirOpcode) R.Res
     val res_ld: R.Result[bool, str] = emit_load_a(st, ?mi.operands[1]);
     if (R.is_err[bool, str](res_ld)) { ret res_ld; }
     val b: *mir.MirOperand = ?mi.operands[2];
-    if (b.kind == mir.MIR_OP_IMM)  { emit_imm1(st, OP_CMP_IMM, (b.imm & 0xFF)::u8); }
-    or (b.kind == mir.MIR_OP_PREG) { emit_zp1(st, OP_CMP_ZP, mos6502.zp_addr(b.preg::i32)); }
-    or { ret R.err[bool, str]("mos6502: unsupported compare operand"); }
 
     if (op == mir.MIR_CMP_LT_U) {
-        # A = carry (a >= b), then flip to (a < b).
-        emit_imm1(st, OP_LDA_IMM, 0x00);
-        enc.emit_byte(?st.buf, OP_ROL_A);
-        emit_imm1(st, OP_EOR_IMM, 0x01);
+        # CMP leaves carry set when a >= b.
+        val res_c: R.Result[bool, str] = emit_cmp_operand(st, b, OP_CMP_IMM, OP_CMP_ZP);
+        if (R.is_err[bool, str](res_c)) { ret res_c; }
     }
     or {
-        # equality: start 0, branch over the `LDA #1` on the appropriate flag.
-        emit_imm1(st, OP_LDA_IMM, 0x00);
-        var skip_branch: u8 = OP_BNE;   # CMP_EQ: not-equal keeps 0
-        if (op == mir.MIR_CMP_NE) { skip_branch = OP_BEQ; }
-        enc.emit_byte(?st.buf, skip_branch);
-        enc.emit_byte(?st.buf, 0x02);   # skip the 2-byte `LDA #1`
-        emit_imm1(st, OP_LDA_IMM, 0x01);
+        # difference-to-zero: the accumulator is zero exactly when the operands are
+        # equal, so comparing it against 1 puts (a != b) in the carry.
+        val res_x: R.Result[bool, str] = emit_cmp_operand(st, b, OP_EOR_IMM, OP_EOR_ZP);
+        if (R.is_err[bool, str](res_x)) { ret res_x; }
+        emit_imm1(st, OP_CMP_IMM, 0x01);
     }
+
+    # read the carry into a 0 / 1 boolean; LDA leaves the carry untouched.
+    emit_imm1(st, OP_LDA_IMM, 0x00);
+    enc.emit_byte(?st.buf, OP_ROL_A);
+    # CMP_NE wants the carry as-is; a < b and a == b are both its complement.
+    if (op != mir.MIR_CMP_NE) { emit_imm1(st, OP_EOR_IMM, 0x01); }
+
     emit_zp1(st, OP_STA_ZP, mos6502.zp_addr(dst.preg::i32));
     ret R.ok[bool, str](true);
+}
+
+# emit a compare's right operand in its immediate or zero-page form
+#
+# The one dispatch both the standalone compare and the fused compare-and-branch read
+# their second operand through, so the accepted operand shapes and the diagnostic for
+# an unexpected one cannot drift between them.
+# ---
+# st:     the shared encode state
+# b:      the operand to emit
+# imm_op: the operation's immediate-mode opcode
+# zp_op:  the operation's zero-page opcode
+# ret:    ok(true), or an error naming the unsupported operand shape
+fun emit_cmp_operand(st: *enc.EncodeState, b: *mir.MirOperand, imm_op: u8, zp_op: u8) R.Result[bool, str] {
+    if (b.kind == mir.MIR_OP_IMM)  { emit_imm1(st, imm_op, (b.imm & 0xFF)::u8); ret R.ok[bool, str](true); }
+    if (b.kind == mir.MIR_OP_PREG) { emit_zp1(st, zp_op, mos6502.zp_addr(b.preg::i32)); ret R.ok[bool, str](true); }
+    ret R.err[bool, str]("mos6502: unsupported compare operand");
 }
 
 # encode an unconditional branch `MIR_BR [block]` as `JMP block` (absolute)
@@ -288,9 +334,8 @@ fun encode_sel_cbr(st: *enc.EncodeState, mi: *mir.MirInstr, fn_base: u32) R.Resu
 
     val res_ld: R.Result[bool, str] = emit_load_a(st, load_op);
     if (R.is_err[bool, str](res_ld)) { ret res_ld; }
-    if (cmp_op.kind == mir.MIR_OP_IMM)  { emit_imm1(st, OP_CMP_IMM, (cmp_op.imm & 0xFF)::u8); }
-    or (cmp_op.kind == mir.MIR_OP_PREG) { emit_zp1(st, OP_CMP_ZP, mos6502.zp_addr(cmp_op.preg::i32)); }
-    or { ret R.err[bool, str]("mos6502: unsupported compare operand"); }
+    val res_c: R.Result[bool, str] = emit_cmp_operand(st, cmp_op, OP_CMP_IMM, OP_CMP_ZP);
+    if (R.is_err[bool, str](res_c)) { ret res_c; }
 
     # inverted branch over the 3-byte then-JMP (fixed +3, no fixup needed).
     enc.emit_byte(?st.buf, inv_branch);
@@ -447,5 +492,196 @@ test "mach.lang.target.isa.mos6502.encode:byte_pins" {
     if (OP_JMP_ABS != 0x4C) { ret 1; }
 
     enc.buf_dnit(?st.buf);
+    ret 0;
+}
+
+# encode one standalone `dst = a rel b` over zero-page value registers 8 / 9 -> 10 and
+# report the bytes through `st` (test helper)
+fun t_encode_cmp(st: *enc.EncodeState, op: mir.MirOpcode) R.Result[bool, str] {
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(10);
+    ops[1] = mir.op_preg(8);
+    ops[2] = mir.op_preg(9);
+    var mi: mir.MirInstr;
+    mi.opcode        = op;
+    mi.operands      = ?ops[0];
+    mi.operand_count = 3;
+    mi.width         = 1;
+    mi.src_width     = 1;
+    ret encode_cmp(st, ?mi, op);
+}
+
+# whether the encoded range holds any pc-relative conditional-branch opcode
+fun t_has_branch(st: *enc.EncodeState) bool {
+    var i: usize = 0;
+    for (i < st.buf.len) {
+        val b: u8 = st.buf.data[i];
+        if (b == OP_BEQ || b == OP_BNE || b == OP_BCC || b == OP_BCS) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a standalone compare encodes BRANCHLESS on every relation (#2158)
+#
+# The load-bearing property: a secret `==` reaches this encoder as an ordinary
+# MIR_CMP_EQ, and NEITHER the `#[oblivious]` compile-time gate NOR the #1648 validator
+# can see what happens here - both read pre-selection MIR - so materializing the 0 / 1
+# boolean with a conditional branch puts a secret-dependent instruction stream past every
+# other check in the compiler. Each relation is pinned byte-exact against the published
+# opcode matrix AND the encoded range is scanned for a conditional-branch opcode, so the
+# invariant is asserted directly and survives a rewrite of the sequence.
+test "mach.lang.target.isa.mos6502.encode:compare_is_branchless" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    # a == b -> LDA $18 ; EOR $19 ; CMP #$01 ; LDA #$00 ; ROL A ; EOR #$01 ; STA $1A
+    var eq: enc.EncodeState;
+    eq.buf = enc.buf_init(?alloc);
+    if (R.is_err[bool, str](t_encode_cmp(?eq, mir.MIR_CMP_EQ))) { ret 1; }
+    if (eq.buf.len != 13)                                            { ret 1; }
+    if (eq.buf.data[0]  != 0xA5 || eq.buf.data[1]  != 0x18)          { ret 1; }
+    if (eq.buf.data[2]  != 0x45 || eq.buf.data[3]  != 0x19)          { ret 1; }
+    if (eq.buf.data[4]  != 0xC9 || eq.buf.data[5]  != 0x01)          { ret 1; }
+    if (eq.buf.data[6]  != 0xA9 || eq.buf.data[7]  != 0x00)          { ret 1; }
+    if (eq.buf.data[8]  != 0x2A)                                     { ret 1; }
+    if (eq.buf.data[9]  != 0x49 || eq.buf.data[10] != 0x01)          { ret 1; }
+    if (eq.buf.data[11] != 0x85 || eq.buf.data[12] != 0x1A)          { ret 1; }
+    if (t_has_branch(?eq)) { ret 1; }
+    enc.buf_dnit(?eq.buf);
+
+    # a != b -> the same carry read without the final complement.
+    var ne: enc.EncodeState;
+    ne.buf = enc.buf_init(?alloc);
+    if (R.is_err[bool, str](t_encode_cmp(?ne, mir.MIR_CMP_NE))) { ret 1; }
+    if (ne.buf.len != 11)                                            { ret 1; }
+    if (ne.buf.data[0] != 0xA5 || ne.buf.data[1] != 0x18)            { ret 1; }
+    if (ne.buf.data[2] != 0x45 || ne.buf.data[3] != 0x19)            { ret 1; }
+    if (ne.buf.data[4] != 0xC9 || ne.buf.data[5] != 0x01)            { ret 1; }
+    if (ne.buf.data[6] != 0xA9 || ne.buf.data[7] != 0x00)            { ret 1; }
+    if (ne.buf.data[8] != 0x2A)                                      { ret 1; }
+    if (ne.buf.data[9] != 0x85 || ne.buf.data[10] != 0x1A)           { ret 1; }
+    if (t_has_branch(?ne)) { ret 1; }
+    enc.buf_dnit(?ne.buf);
+
+    # a <u b -> CMP straight into the carry, complemented (unchanged by #2158).
+    var lt: enc.EncodeState;
+    lt.buf = enc.buf_init(?alloc);
+    if (R.is_err[bool, str](t_encode_cmp(?lt, mir.MIR_CMP_LT_U))) { ret 1; }
+    if (lt.buf.len != 11)                                            { ret 1; }
+    if (lt.buf.data[0] != 0xA5 || lt.buf.data[1] != 0x18)            { ret 1; }
+    if (lt.buf.data[2] != 0xC5 || lt.buf.data[3] != 0x19)            { ret 1; }
+    if (lt.buf.data[4] != 0xA9 || lt.buf.data[5] != 0x00)            { ret 1; }
+    if (lt.buf.data[6] != 0x2A)                                      { ret 1; }
+    if (lt.buf.data[7] != 0x49 || lt.buf.data[8] != 0x01)            { ret 1; }
+    if (lt.buf.data[9] != 0x85 || lt.buf.data[10] != 0x1A)           { ret 1; }
+    if (t_has_branch(?lt)) { ret 1; }
+    enc.buf_dnit(?lt.buf);
+    ret 0;
+}
+
+# execute an encoded compare sequence over a 256-byte zero page (test helper)
+#
+# A minimal 6502 core covering exactly the opcodes `encode_cmp` emits, with the REAL
+# published flag semantics: `LDA` / `EOR` write N and Z but LEAVE CARRY ALONE, `CMP`
+# writes N, Z and C, and `ROL A` reads C into bit 0 while taking C from bit 7. Modeling
+# the flags honestly is the entire point. The sequence this replaced read as correct on
+# the page - compare, then branch on the compare's flag - but its `LDA #$00` silently
+# rewrote Z, so the branch tested a CONSTANT: every `==` answered 1 and every `!=`
+# answered 0, for every input. An identity check over the intended algebra cannot see
+# that; executing the bytes can.
+# ---
+# code:   the encoded bytes to execute
+# n:      their length
+# zp:     the 256-byte zero page (operands in, result out)
+# cycles: receives the sequence's total cycle count
+# ret:    true when every opcode was inside the pinned set
+fun t_run_cmp(code: *u8, n: usize, zp: *u8, cycles: *u32) bool {
+    var a:  u32 = 0;
+    var c:  u32 = 0;
+    var cy: u32 = 0;
+    var i:  usize = 0;
+    for (i < n) {
+        val op:  u8    = code[i];
+        val arg: usize = i + 1;
+        if (op == 0xA9)   { a = code[arg]::u32;                       cy = cy + 2; i = i + 2; }
+        or (op == 0xA5)   { a = zp[code[arg]::usize]::u32;            cy = cy + 3; i = i + 2; }
+        or (op == 0x49)   { a = a ^ code[arg]::u32;                   cy = cy + 2; i = i + 2; }
+        or (op == 0x45)   { a = a ^ zp[code[arg]::usize]::u32;        cy = cy + 3; i = i + 2; }
+        or (op == 0xC9)   { c = 0; if (a >= code[arg]::u32) { c = 1; }             cy = cy + 2; i = i + 2; }
+        or (op == 0xC5)   { c = 0; if (a >= zp[code[arg]::usize]::u32) { c = 1; }  cy = cy + 3; i = i + 2; }
+        or (op == 0x2A)   { val nc: u32 = (a >> 7) & 1; a = ((a << 1) | c) & 0xFF; c = nc; cy = cy + 2; i = i + 1; }
+        or (op == 0x85)   { zp[code[arg]::usize] = (a & 0xFF)::u8;    cy = cy + 3; i = i + 2; }
+        or { ret false; }
+    }
+    @cycles = cy;
+    ret true;
+}
+
+# run one encoded relation over every ordered byte pair, checking the ANSWER and that the
+# cycle count never varies with the operands (test helper)
+# ---
+# st:   the encode state holding the sequence to execute
+# want: 0 for `==`, 1 for `!=`, 2 for `<u`
+# ret:  0 when every pair answers correctly at one fixed cycle count
+fun t_check_cmp(st: *enc.EncodeState, want: u32) i32 {
+    var zp: [256]u8;
+    var fixed: u32 = 0;
+    var x: u32 = 0;
+    for (x < 256) {
+        var y: u32 = 0;
+        for (y < 256) {
+            var k: usize = 0;
+            for (k < 256) { zp[k] = 0; k = k + 1; }
+            zp[0x18] = (x & 0xFF)::u8;
+            zp[0x19] = (y & 0xFF)::u8;
+
+            var cy: u32 = 0;
+            if (!t_run_cmp(st.buf.data, st.buf.len, ?zp[0], ?cy)) { ret 1; }
+
+            var expect: u32 = 0;
+            if (want == 0 && x == y) { expect = 1; }
+            or (want == 1 && x != y) { expect = 1; }
+            or (want == 2 && x <  y) { expect = 1; }
+            if (zp[0x1A]::u32 != expect) { ret 1; }
+
+            # the constant-time property, EXECUTED: one cycle count for all 65536 pairs.
+            if (x == 0 && y == 0) { fixed = cy; }
+            or (cy != fixed)      { ret 1; }
+            y = y + 1;
+        }
+        x = x + 1;
+    }
+    ret 0;
+}
+
+# the encoded compare answers correctly and in a fixed number of cycles for every one of
+# the 65536 ordered byte pairs, per relation (#2158)
+#
+# Executes the bytes `encode_cmp` actually produced under the published flag semantics,
+# so this is a check of the MACHINE CODE, not of the algebra it was meant to implement.
+# It is the guard that catches both halves of what the branch form got wrong: a
+# data-dependent cycle count, and a compare whose answer never depended on its operands.
+test "mach.lang.target.isa.mos6502.encode:compare_executes_constant_time" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var eq: enc.EncodeState;
+    eq.buf = enc.buf_init(?alloc);
+    if (R.is_err[bool, str](t_encode_cmp(?eq, mir.MIR_CMP_EQ))) { ret 1; }
+    if (t_check_cmp(?eq, 0) != 0) { ret 1; }
+    enc.buf_dnit(?eq.buf);
+
+    var ne: enc.EncodeState;
+    ne.buf = enc.buf_init(?alloc);
+    if (R.is_err[bool, str](t_encode_cmp(?ne, mir.MIR_CMP_NE))) { ret 1; }
+    if (t_check_cmp(?ne, 1) != 0) { ret 1; }
+    enc.buf_dnit(?ne.buf);
+
+    var lt: enc.EncodeState;
+    lt.buf = enc.buf_init(?alloc);
+    if (R.is_err[bool, str](t_encode_cmp(?lt, mir.MIR_CMP_LT_U))) { ret 1; }
+    if (t_check_cmp(?lt, 2) != 0) { ret 1; }
+    enc.buf_dnit(?lt.buf);
     ret 0;
 }

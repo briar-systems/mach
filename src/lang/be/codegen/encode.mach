@@ -252,10 +252,11 @@ pub def EncodeFn: fun(*A.Allocator, *target.Target, *mir.MirModule) R.Result[Enc
 # vtable or the ISA registered no `encode` operation (an unsupported
 # architecture), and propagates any encoding error from the per-arch encoder.
 # ---
-# tgt: resolved compilation target; its `arch` vtable supplies the encoder
-# m:   the fully-resolved MIR module to encode
-# ret: the populated EncoderOutput (owned arrays), or an error string
-pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[EncoderOutput, str] {
+# tgt:     resolved compilation target; its `arch` vtable supplies the encoder
+# m:       the fully-resolved MIR module to encode
+# asm_out: optional writer receiving the assembly text this encode renders
+# ret:     the populated EncoderOutput (owned arrays), or an error string
+pub fun run(tgt: *target.Target, m: *mir.MirModule, asm_out: *writer.Writer) R.Result[EncoderOutput, str] {
     if (tgt == nil) { ret R.err[EncoderOutput, str]("encode: nil target"); }
     if (m == nil)   { ret R.err[EncoderOutput, str]("encode: nil mir module"); }
     if (tgt.arch == nil) {
@@ -263,6 +264,18 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[EncoderOutput, str]
     }
     if (tgt.arch.encode == nil) {
         ret R.err[EncoderOutput, str]("encode: ISA registered no encoder");
+    }
+
+    if (asm_out != nil) {
+        # an ISA with no printer refuses rather than no-ops: the caller has already
+        # created the `.s`, so a silent skip leaves an empty file claiming to be the
+        # emitted code (#2187). an ISA whose printer is not written yet registers its
+        # own refusal, which names itself and its tracking issue.
+        if (tgt.arch.emit_asm == nil) {
+            ret R.err[EncoderOutput, str]("--emit-asm: the target architecture registered no assembly printer");
+        }
+        val emit_asm: EmitAsmFn = tgt.arch.emit_asm::EmitAsmFn;
+        ret emit_asm(m.alloc, tgt, m, asm_out);
     }
 
     val encode: EncodeFn = tgt.arch.encode::EncodeFn;
@@ -276,43 +289,24 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[EncoderOutput, str]
 # reason as `encode`: its signature names `target.Target` and `mir.MirModule`,
 # both of which import `isa`. This dispatcher already imports `target` and `mir`,
 # so it declares the cast-back type locally and casts the erased pointer to it,
-# exactly as `run` casts `encode` back to `EncodeFn`. The per-arch printer formats
-# every function of the module as Intel-syntax assembly text into the writer; it
-# is a debug-only artifact, byte-exactness is not its contract.
+# exactly as `run` casts `encode` back to `EncodeFn`.
+#
+# This is an ENCODE, not a separate print pass: the ISA runs its ordinary encoder
+# with an `AsmSink` attached to the byte buffer, so the text is rendered from the
+# machine instructions the encoder actually emits and cannot describe anything
+# else. It returns the same `EncoderOutput` the plain path does; `--emit-asm`
+# reaches it through an already-throwaway codegen pass, so the object-producing
+# build never takes this branch and its bytes are untouched.
+#
+# An ISA whose printer is not implemented registers a refusal here rather than
+# leaving the slot nil, so the failure names the architecture (#2187).
 # ---
+# a:   backing allocator for the encoder's output arrays
 # tgt: resolved compilation target
 # m:   the fully-resolved MIR module (post isel / regalloc / frame)
 # out: destination writer the assembly text is written into
-# ret: true on success, or an error string from a write failure
-pub def PrintAsmFn: fun(*target.Target, *mir.MirModule, *writer.Writer) R.Result[bool, str];
-
-# format a fully-resolved MIR module as human-readable assembly text
-#
-# Dispatches the whole module to the active ISA's `emit_asm` operation, reached
-# through `tgt.arch.emit_asm`. Carries no architecture-specific knowledge - the
-# per-arch printer owns the mnemonic, register, and operand formatting. An ISA
-# that registered no `emit_asm` printer (an arch with no debug-asm support) is a
-# clean no-op rather than an error, so `--emit-asm` simply produces no file for
-# it.
-# ---
-# tgt: resolved compilation target; its `arch` vtable supplies the printer
-# m:   the fully-resolved MIR module to format
-# out: destination writer
-# ret: true on success (including the no-printer no-op), or an error string
-pub fun print_asm(tgt: *target.Target, m: *mir.MirModule, out: *writer.Writer) R.Result[bool, str] {
-    if (tgt == nil) { ret R.err[bool, str]("print_asm: nil target"); }
-    if (m == nil)   { ret R.err[bool, str]("print_asm: nil mir module"); }
-    if (out == nil) { ret R.err[bool, str]("print_asm: nil writer"); }
-    if (tgt.arch == nil) {
-        ret R.err[bool, str]("print_asm: target has no ISA vtable");
-    }
-    if (tgt.arch.emit_asm == nil) {
-        ret R.ok[bool, str](true);
-    }
-
-    val emit_asm: PrintAsmFn = tgt.arch.emit_asm::PrintAsmFn;
-    ret emit_asm(tgt, m, out);
-}
+# ret: the populated EncoderOutput (owned arrays), or an error naming the failure
+pub def EmitAsmFn: fun(*A.Allocator, *target.Target, *mir.MirModule, *writer.Writer) R.Result[EncoderOutput, str];
 
 # initial capacity of a freshly grown encoder byte buffer
 val BYTEBUF_INIT_CAP: usize = 256;
@@ -329,11 +323,126 @@ val BYTEBUF_INIT_CAP: usize = 256;
 # len:   number of bytes written
 # cap:   allocated capacity
 # alloc: allocator backing `data`
+# asm:   optional assembly-text sink; nil on an object-producing encode
 pub rec ByteBuf {
     data:  *u8;
     len:   usize;
     cap:   usize;
     alloc: *A.Allocator;
+    asm:   *AsmSink;
+}
+
+# the assembly-text side-channel an encoder renders `--emit-asm` through
+#
+# The `.s` artifact is a rendering of the encoder's own instruction stream, not a
+# second walk over the MIR: an ISA notifies this sink once per machine instruction
+# it emits, immediately after emitting it, and the sink renders that instruction's
+# text. One notification per emitted instruction - never per MIR opcode, since a
+# MIR macro-op expands to several machine instructions and collapsing them is
+# exactly the divergence this replaced (#2187).
+#
+# `accounted` is the totality guard. It trails `ByteBuf.len` as of the last
+# notification, so any byte an ISA appends without notifying leaves the two
+# unequal; `sink_unaccounted` reports the gap and the caller fails loudly naming
+# the opcode responsible. A printer that silently skips an instruction is
+# therefore not expressible - the bytes it failed to render are still counted.
+#
+# `mi` is the MIR instruction currently being encoded, set by the ISA around each
+# dispatch. A renderer reads it only to name what the machine operand cannot carry
+# (a call's target symbol, a branch's block label - `mir_to_operand` erases both),
+# never to choose a mnemonic or an operand.
+# ---
+# out:       destination writer for the rendered text
+# accounted: `ByteBuf.len` as of the last instruction notification
+# failed:    a write error occurred; the first one is kept in `err`
+# err:       the first write error, empty until `failed`
+# mi:        the MIR instruction being encoded, for symbol / label annotation
+# interner:  resolves symbol ids to their source names
+pub rec AsmSink {
+    out:       *writer.Writer;
+    accounted: usize;
+    failed:    bool;
+    err:       str;
+    mi:        *mir.MirInstr;
+    interner:  *intern.Interner;
+}
+
+# construct a sink rendering into `out`
+# ---
+# out:      destination writer the assembly text is written into
+# interner: resolves symbol ids to their source names
+# ret:      an armed sink with nothing yet accounted
+pub fun sink_init(out: *writer.Writer, interner: *intern.Interner) AsmSink {
+    var s: AsmSink;
+    s.out       = out;
+    s.accounted = 0;
+    s.failed    = false;
+    s.err       = "";
+    s.mi        = nil;
+    s.interner  = interner;
+    ret s;
+}
+
+# record a write failure so the encode driver can report it
+#
+# The per-instruction notification runs where no error can be returned (byte
+# emission is on the encoder's hot path), so the first failure is latched here and
+# raised once the module finishes rather than silently truncating the artifact.
+# ---
+# buf: the encoder byte sink
+# msg: the failure to report
+pub fun sink_fail(buf: *ByteBuf, msg: str) {
+    if (buf == nil || buf.asm == nil) { ret; }
+    if (buf.asm.failed) { ret; }
+    buf.asm.failed = true;
+    buf.asm.err    = msg;
+}
+
+# whether a buffer is rendering assembly text
+# ---
+# buf: the encoder byte sink
+# ret: true when a sink is attached and has not failed
+pub fun sink_active(buf: *ByteBuf) bool {
+    if (buf == nil || buf.asm == nil) { ret false; }
+    ret !buf.asm.failed;
+}
+
+# mark every byte written so far as rendered
+#
+# Called by an ISA immediately after it renders one emitted instruction.
+# ---
+# buf: the encoder byte sink whose sink is advanced
+pub fun sink_account(buf: *ByteBuf) {
+    if (buf == nil || buf.asm == nil) { ret; }
+    buf.asm.accounted = buf.len;
+}
+
+# the number of emitted bytes no instruction notification has covered
+#
+# Non-zero means an ISA appended bytes without rendering them, so the artifact
+# would under-report the code the encoder produced. The caller turns this into a
+# loud error naming the offending opcode rather than emitting a short `.s`.
+#
+# `accounted` is only ever assigned `buf.len`, and the text buffer only grows
+# while a function is being encoded, so `accounted <= buf.len` holds throughout.
+# The equal case is the common one (everything rendered); the comparison is
+# written `<=` rather than `==` because the subtraction below is unsigned.
+# ---
+# buf: the encoder byte sink
+# ret: the unaccounted byte count, or 0 when the sink is inactive
+pub fun sink_unaccounted(buf: *ByteBuf) usize {
+    if (!sink_active(buf)) { ret 0; }
+    if (buf.len <= buf.asm.accounted) { ret 0; }
+    ret buf.len - buf.asm.accounted;
+}
+
+# record the MIR instruction an ISA is about to encode, for symbol / label naming
+# ---
+# buf: the encoder byte sink
+# mi:  the MIR instruction being encoded, or nil to clear
+pub fun sink_set_mir(buf: *ByteBuf, mi: *mir.MirInstr) {
+    if (buf == nil || buf.asm == nil) { ret; }
+    buf.asm.mi = mi;
 }
 
 # construct an empty encoder byte buffer
@@ -346,6 +455,7 @@ pub fun buf_init(alloc: *A.Allocator) ByteBuf {
     buf.len   = 0;
     buf.cap   = 0;
     buf.alloc = alloc;
+    buf.asm   = nil;
     ret buf;
 }
 
@@ -582,6 +692,25 @@ pub rec EncodeHooks {
 # hooks: the per-ISA encode / patch operations
 # ret:   the populated `EncoderOutput` (owned arrays), or an error string
 pub fun encode_driver(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirModule, hooks: *EncodeHooks) R.Result[EncoderOutput, str] {
+    ret encode_driver_asm(alloc, tgt, m, hooks, nil);
+}
+
+# encode a module, optionally rendering the assembly text as it goes
+#
+# The body `encode_driver` delegates to. When `asm_out` is non-nil an `AsmSink` is
+# attached to the text buffer for the whole run, so the ISA's per-instruction
+# notifications render into it; the sink never influences a byte, so both paths
+# encode identically. A write failure recorded on the sink is reported here rather
+# than silently truncating the artifact.
+# ---
+# alloc:   backing allocator for the encoder's output arrays
+# tgt:     resolved compilation target
+# m:       the fully-resolved MIR module (post isel / regalloc / frame)
+# hooks:   the per-ISA encode / patch operations
+# asm_out: optional writer receiving the rendered assembly text
+# ret:     the populated `EncoderOutput` (owned arrays), or an error string
+pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirModule,
+                          hooks: *EncodeHooks, asm_out: *writer.Writer) R.Result[EncoderOutput, str] {
     if (tgt == nil)   { ret R.err[EncoderOutput, str]("encode: nil target"); }
     if (m == nil)     { ret R.err[EncoderOutput, str]("encode: nil mir module"); }
     if (hooks == nil) { ret R.err[EncoderOutput, str]("encode: nil encode hooks"); }
@@ -595,6 +724,9 @@ pub fun encode_driver(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirModul
     var st: EncodeState;
     state_init(?st, alloc, m, tgt);
 
+    var sink: AsmSink = sink_init(asm_out, m.interner);
+    if (asm_out != nil) { st.buf.asm = ?sink; }
+
     var fi: u32 = 0;
     for (fi < m.function_len) {
         # each function starts in its own body (inline instance 0); reset the transition
@@ -607,6 +739,11 @@ pub fun encode_driver(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirModul
             ret R.err[EncoderOutput, str](R.unwrap_err[bool, str](res_encode));
         }
         fi = fi + 1;
+    }
+
+    if (sink.failed) {
+        state_dnit(?st);
+        ret R.err[EncoderOutput, str](sink.err);
     }
 
     val res_patch: R.Result[bool, str] = patch_branches(?st, hooks);
@@ -1740,4 +1877,47 @@ test "mach.lang.be.codegen.encode.push_varloc:slot_spill_owner_is_direct_frame" 
     if (st.varlocs != nil && st.varloc_cap > 0) { A.deallocate[VarLoc](?alloc, st.varlocs, st.varloc_cap::usize); }
     buf_dnit(?st.buf);
     ret code;
+}
+
+# the `--emit-asm` totality guard: bytes an ISA emits without notifying the sink
+# stay visible, so an unrendered emission path is reported rather than silently
+# dropped from the artifact (#2187)
+test "mach.lang.be.codegen.encode.sink_unaccounted:tracks_unrendered_bytes" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: ByteBuf = buf_init(?alloc);
+
+    var sink: AsmSink = sink_init(nil, nil);
+    buf.asm = ?sink;
+
+    var bad: i32 = 0;
+
+    # nothing emitted yet, nothing outstanding
+    if (sink_unaccounted(?buf) != 0) { bad = 1; }
+
+    # three bytes emitted with no notification: all three are unaccounted, which is
+    # what makes a printer that skips an instruction impossible to ship quietly
+    emit_byte(?buf, 0x90);
+    emit_byte(?buf, 0x90);
+    emit_byte(?buf, 0x90);
+    if (sink_unaccounted(?buf) != 3) { bad = 1; }
+
+    # rendering that instruction clears the debt
+    sink_account(?buf);
+    if (sink_unaccounted(?buf) != 0) { bad = 1; }
+
+    # and the next unrendered emission is counted on its own, not cumulatively
+    emit_byte(?buf, 0xCC);
+    emit_byte(?buf, 0xCC);
+    if (sink_unaccounted(?buf) != 2) { bad = 1; }
+
+    # a buffer with no sink attached never reports a debt, so an object-producing
+    # encode is unaffected by any of this
+    var plain: ByteBuf = buf_init(?alloc);
+    emit_byte(?plain, 0x90);
+    if (sink_unaccounted(?plain) != 0) { bad = 1; }
+
+    buf_dnit(?plain);
+    buf_dnit(?buf);
+    ret bad;
 }

@@ -67,15 +67,34 @@
 # NOT carry `MirVReg.secret`, so the seeds are intact only here; legalization is itself a
 # constant-time-preserving width splitter (it introduces no branch, no computed address, and
 # no new variable-latency op, and rejects a wide divide / variable shift / non-constant
-# multiply loudly), and isel / regalloc / encode are trusted timing-preserving. True
-# translation-validation of the EMITTED machine code (the epic's eventual goal) needs the
-# seeds and barrier to survive to post-regalloc MIR - additive per-ISA work left as future
-# strengthening; the lowered-MIR contract does not foreclose it.
+# multiply loudly). True translation-validation of the EMITTED machine code (the epic's
+# eventual goal) needs the seeds and barrier to survive to post-regalloc MIR - additive
+# per-ISA work left as future strengthening; the lowered-MIR contract does not foreclose it.
 #
-# TRACKED FOLLOW-UPS (experimental-target-scoped, out of scope here): an 8-bit target whose
-# integer COMPARE is not data-independent needs a `ct_trust_compare` capability so a secret
-# equality feeding a branch condition gates at the compare (mos6502); and the SPIR-V backend's
-# whole-module emitter bypasses the machine pipeline, so this pass never runs on it.
+# BACKEND SCOPE (#2159). The validated layer is mach's own lowered MIR, and the guarantee it
+# carries rests on every REMAINING stage being mach's and timing-preserving. A target whose
+# back half is a whole-module emitter (`isa.emits_whole_module` - SPIR-V) breaks that chain at
+# the root: mach emits a SPIR-V module, not executed instructions, and a vendor driver
+# recompiles it to native GPU code under no constant-time contract, onto hardware whose
+# timing channels (SIMT divergence, memory coalescing, undocumented op latencies) this leakage
+# model does not describe. Re-deriving the taint over that MIR would therefore certify a
+# property of an artifact nobody executes. So `#[oblivious]` is REFUSED for such a target -
+# the same rule this pass applies to inline assembly: reject the unverifiable construct rather
+# than trust it. If a whole-module backend ever gains a documented timing model and a trusted
+# downstream toolchain, this is one predicate to relax.
+#
+# THE TRUSTED SET, STATED PRECISELY (#2158). For a target that IS in scope, everything
+# downstream of this pass - selection, register allocation, encoding - is ASSUMED
+# timing-preserving, and that assumption is an OBLIGATION ON EACH BACKEND, not a property this
+# pass verifies. It is exactly as strong as the weakest encoder: a backend that materializes a
+# value with a data-dependent branch introduces a leak nothing here can see, because the
+# leaking instruction does not exist at this layer. mos6502's `encode_cmp` did precisely that,
+# materializing an integer equality with a `BNE`, and it passed both this validator and the
+# compile-time gate. The fix belongs in the backend that broke the obligation - it is now
+# branchless, pinned and EXECUTED over every operand pair in `isa.mos6502.encode` - rather than
+# in a capability flag that would let an encoder opt out of a property its ISA can in fact
+# provide. A capability row is right only where the HARDWARE cannot do the op in constant time
+# (`ct_trust_mul`, `ct_trust_var_shift`), never where an encoder merely chose a branch.
 
 use std.types.bool.bool;
 use std.types.bool.true;
@@ -94,28 +113,40 @@ use R: std.types.result;
 use mach.lang.be.codegen.mir;
 use mach.lang.ct;
 use mach.lang.intern;
+use mach.lang.target.isa;
 use target: mach.lang.target.resolved;
 
-# validate every `#[oblivious]` function of a MIR module for constant-time leakage
+# enforce the constant-time contract of every `#[oblivious]` function of a MIR module
 #
-# The shared entry point the codegen driver calls after loop rotation and before width
-# legalization. Re-derives the secret taint from the #1646 seeds and rejects a secret value
-# reaching a branch condition, a memory address, or a forbidden variable-latency op inside
-# any function marked `#[oblivious]`. A function without the marker is skipped; the pass
-# never mutates the MIR, so a module with no oblivious function is validated in a single
-# read and emitted byte-identically.
+# The BACKEND-NEUTRAL entry point every back half calls on the lowered MIR - the machine
+# pipeline after loop rotation and before width legalization, the whole-module fork before
+# it dispatches its emitter - so no path can reach an emitter with an unenforced contract.
+# What enforcement means is decided by the target's back half:
+#   - mach's machine pipeline: re-derive the secret taint from the #1646 seeds and reject a
+#     secret value reaching a branch condition, a memory address, or a forbidden
+#     variable-latency op inside any function marked `#[oblivious]`.
+#   - a whole-module emitter (SPIR-V): refuse the `#[oblivious]` function outright, since the
+#     validated MIR is not what executes and the contract cannot be upheld (see BACKEND SCOPE).
+# A function without the marker is skipped either way; the pass never mutates the MIR, so a
+# module with no oblivious function is validated in a single read and emitted byte-identically.
 # ---
-# tgt: resolved compilation target (supplies the constant-time capability flags)
+# tgt: resolved compilation target (supplies the back half's identity and the ct capabilities)
 # m:   the MIR module to validate in place (read-only)
 # ret: ok(true) when every oblivious function is leak-free, or the first violation's error
 pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
-    if (tgt == nil) { ret R.err[bool, str]("ctvalidate: nil target"); }
-    if (m == nil)   { ret R.err[bool, str]("ctvalidate: nil mir module"); }
+    if (tgt == nil)      { ret R.err[bool, str]("ctvalidate: nil target"); }
+    if (tgt.arch == nil) { ret R.err[bool, str]("ctvalidate: target has no instruction set"); }
+    if (m == nil)        { ret R.err[bool, str]("ctvalidate: nil mir module"); }
+
+    val unverifiable: bool = isa.emits_whole_module(tgt.arch);
 
     var i: u32 = 0;
     for (i < m.function_len) {
         val f: *mir.MirFunction = ?m.functions[i];
         if (f.oblivious) {
+            if (unverifiable) {
+                ret R.err[bool, str](unverifiable_msg(m.alloc, m.interner, f.name, tgt.arch.name));
+            }
             val res: R.Result[bool, str] = validate_function(tgt, f, m.interner, m.alloc);
             if (R.is_err[bool, str](res)) { ret res; }
         }
@@ -449,13 +480,35 @@ fun leak_msg(alloc: *A.Allocator, interner: *intern.Interner, name_id: intern.St
     val name: str = fn_name(interner, name_id);
     val res: R.Result[str, str] = format.sprint(alloc, "codegen: #[oblivious] function `{}` {}", name, detail);
     if (R.is_err[str, str](res)) { ret detail; }
-    val buf: str = R.unwrap_ok[str, str](res);
+    ret stable(alloc, interner, R.unwrap_ok[str, str](res), detail);
+}
+
+# the refusal for an `#[oblivious]` function on a whole-module-emitter target (#2159)
+#
+# Names the function and the target and states why no validation is possible there, so the
+# refusal reads as a scope boundary rather than a missing feature. Degrades to the
+# target-agnostic wording when the interner is absent or an allocation fails
+fun unverifiable_msg(alloc: *A.Allocator, interner: *intern.Interner, name_id: intern.StrId, arch: str) str {
+    if (interner == nil) { ret UNVERIFIABLE_DETAIL; }
+    val name: str = fn_name(interner, name_id);
+    val res: R.Result[str, str] = format.sprint(alloc,
+        "codegen: #[oblivious] function `{}` cannot be compiled for the `{}` target: its back half emits a module for a downstream compiler to translate rather than the instructions that execute, and neither that translation nor the device's timing behaviour is covered by mach's leakage model, so the constant-time contract can be neither validated nor upheld. compile the oblivious function for a machine target and pass this one only public data",
+        name, arch);
+    if (R.is_err[str, str](res)) { ret UNVERIFIABLE_DETAIL; }
+    ret stable(alloc, interner, R.unwrap_ok[str, str](res), UNVERIFIABLE_DETAIL);
+}
+
+# the target-agnostic refusal, used when the message cannot be built with the names
+val UNVERIFIABLE_DETAIL: str = "codegen: a #[oblivious] function cannot be compiled for a target whose back half emits a module for a downstream compiler to translate rather than the instructions that execute; the constant-time contract can be neither validated nor upheld there. compile the oblivious function for a machine target and pass this one only public data";
+
+# intern `buf` to a session-stable string and release it, or `fallback` when interning fails
+fun stable(alloc: *A.Allocator, interner: *intern.Interner, buf: str, fallback: str) str {
     val ir: R.Result[intern.StrId, str] = intern.intern(interner, buf);
     A.deallocate[u8](alloc, buf, str_len(buf) + 1);
-    if (R.is_err[intern.StrId, str](ir)) { ret detail; }
+    if (R.is_err[intern.StrId, str](ir)) { ret fallback; }
     val lo: O.Option[str] = intern.lookup(interner, R.unwrap_ok[intern.StrId, str](ir));
     if (O.is_some[str](lo)) { ret O.unwrap[str](lo); }
-    ret detail;
+    ret fallback;
 }
 
 # the function's source name, or "<unknown>" when unresolved
@@ -513,12 +566,22 @@ fun t_fn(oblivious: bool, blocks: *mir.MirBlock, nb: u32, vregs: *mir.MirVReg, n
     ret f;
 }
 
-# a target trusting the named constant-time capabilities, nothing else (test helper)
+# a target trusting the named constant-time capabilities, nothing else. `arch` is left
+# unset; a test driving `run` attaches one with `t_isa` (test helper)
 fun t_target(trust_mul: bool, trust_var_shift: bool) target.Target {
     var t: target.Target;
     t.model.ct_trust_mul      = trust_mul;
     t.model.ct_trust_var_shift = trust_var_shift;
     ret t;
+}
+
+# an instruction-set vtable naming a back half: a machine pipeline when `emit_module` is
+# nil, a whole-module emitter when it is not (test helper)
+fun t_isa(name: str, emit_module: *u8) isa.IsaVTable {
+    var vt: isa.IsaVTable;
+    vt.name        = name;
+    vt.emit_module = emit_module;
+    ret vt;
 }
 
 # a secret laundered through a phi join (out-of-SSA predecessor moves into one result vreg)
@@ -803,6 +866,8 @@ test "mach.lang.be.codegen.ctvalidate.scope:non_oblivious_unaffected" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var t: target.Target = t_target(false, true);
+    var vt: isa.IsaVTable = t_isa("machine", nil);
+    t.arch = ?vt;
 
     var vregs: [1]mir.MirVReg;
     vregs[0] = t_vreg(0, true);   # secret
@@ -859,6 +924,8 @@ test "mach.lang.be.codegen.ctvalidate.opaque:inline_asm_forbidden" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var t: target.Target = t_target(false, true);
+    var vt: isa.IsaVTable = t_isa("machine", nil);
+    t.arch = ?vt;
 
     var vregs: [1]mir.MirVReg;
     vregs[0] = t_vreg(0, false);
@@ -875,6 +942,50 @@ test "mach.lang.be.codegen.ctvalidate.opaque:inline_asm_forbidden" {
     var funcs: [1]mir.MirFunction; funcs[0] = t_fn(false, ?blocks[0], 1, ?vregs[0], 1);
     var mm: mir.MirModule; mm.alloc = ?alloc; mm.interner = nil; mm.functions = ?funcs[0]; mm.function_len = 1;
     if (!R.is_ok[bool, str](run(?t, ?mm))) { ret 1; }
+    ret 0;
+}
+
+# the BACKEND SCOPE boundary (#2159): a body that is provably leak-free - the pass returns
+# ok for it on a machine target - is still REFUSED on a whole-module-emitter target, because
+# the validated MIR is not what that target executes. the refusal keys on the back half, not
+# on the body, and stays scoped to `#[oblivious]`: the same module with the marker cleared is
+# emitted untouched on both back halves.
+test "mach.lang.be.codegen.ctvalidate.scope:whole_module_backend_refused" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var t: target.Target = t_target(false, true);
+
+    # v2 <- add v0(secret), v1 ; ret   - a clean oblivious body, nothing the checks flag.
+    var vregs: [3]mir.MirVReg;
+    vregs[0] = t_vreg(0, true);
+    vregs[1] = t_vreg(1, false);
+    vregs[2] = t_vreg(2, false);
+    var add: [3]mir.MirOperand; add[0] = mir.op_vreg(2); add[1] = mir.op_vreg(0); add[2] = mir.op_vreg(1);
+    var b0i: [2]mir.MirInstr;
+    b0i[0] = t_instr(mir.MIR_ADD, ?add[0], 3);
+    b0i[1] = t_instr(mir.MIR_RET, nil, 0);
+    var blocks: [1]mir.MirBlock; blocks[0] = t_block(0, ?b0i[0], 2);
+
+    var funcs_on: [1]mir.MirFunction; funcs_on[0] = t_fn(true, ?blocks[0], 1, ?vregs[0], 3);
+    var mm_on: mir.MirModule; mm_on.alloc = ?alloc; mm_on.interner = nil; mm_on.functions = ?funcs_on[0]; mm_on.function_len = 1;
+
+    # a machine back half validates the body and finds it clean.
+    var mvt: isa.IsaVTable = t_isa("machine", nil);
+    t.arch = ?mvt;
+    if (!R.is_ok[bool, str](run(?t, ?mm_on))) { ret 1; }
+
+    # a whole-module emitter refuses the same function outright.
+    var hook: u8;
+    var wvt: isa.IsaVTable = t_isa("spirv", ?hook);
+    t.arch = ?wvt;
+    if (!R.is_err[bool, str](run(?t, ?mm_on))) { ret 1; }
+
+    # without the marker there is no contract to refuse: emitted untouched on both.
+    var funcs_off: [1]mir.MirFunction; funcs_off[0] = t_fn(false, ?blocks[0], 1, ?vregs[0], 3);
+    var mm_off: mir.MirModule; mm_off.alloc = ?alloc; mm_off.interner = nil; mm_off.functions = ?funcs_off[0]; mm_off.function_len = 1;
+    if (!R.is_ok[bool, str](run(?t, ?mm_off))) { ret 1; }
+    t.arch = ?mvt;
+    if (!R.is_ok[bool, str](run(?t, ?mm_off))) { ret 1; }
     ret 0;
 }
 

@@ -1,24 +1,30 @@
-# x86-64 assembly text printer - the x64 ISA's `emit_asm` entry point
+# x86-64 assembly text printer - renders the encoder's own instruction stream
 #
-# This is the x86-64 implementation of the ISA vtable's `emit_asm` operation,
-# reached only through `tgt.arch.emit_asm` by the shared `be.codegen.encode.print_asm`
-# dispatcher. It formats a fully-resolved (post-isel, post-regalloc, post-frame)
-# `mir.MirModule` as human-readable Intel-syntax assembly text into a writer - a
-# debug / transparency artifact paralleling the `.o` the encoder emits from the
-# same MIR.
+# This is the text half of the x64 ISA's `emit_asm` operation. It does NOT walk
+# the MIR: `encode.encode_x64_asm` runs the ordinary encoder with an `enc.AsmSink`
+# attached, and the encoder calls `note_inst` once for every machine instruction
+# it emits, immediately after emitting it. Each line of the `.s` is therefore one
+# instruction the encoder really produced, in the order it produced it.
 #
-# Unlike the encoder this is NOT byte-exact: it renders the MIR instruction stream
-# at the level the allocator left it (a three-address ALU op prints as a single
-# `add dst, lhs, rhs`, a comparison as one `cmp dst, lhs, rhs`), so a `.s` line maps
-# to a MIR instruction rather than to the exact machine bytes the encoder expands it
-# into. A `# <symbol>:` header introduces each function and the prologue / epilogue
-# are rendered as comment-flagged `push rbp` / `mov rbp, rsp` / `leave` lines so the
-# frame shape is visible.
+# That is the whole point of the design. The previous printer was a second,
+# independent renderer that walked the post-regalloc MIR, so a MIR macro-op the
+# encoder expands into several machine instructions (a three-address ALU op, a
+# fused compare-and-branch, a compare) printed as a single pseudo-mnemonic line
+# that no assembler would accept and no disassembly would match - the `.s`
+# under-reported the emitted code by 16% on x86-64 and hid the prologue's
+# counterpart entirely (#2187). Rendering from the encoder makes that class of
+# divergence unrepresentable: there is one implementation of "what does this MIR
+# become", and the artifact is a view of it.
 #
-# The x86-64 opcode, register, and encoding namespace is owned by this module's
-# parent `mach.lang.target.isa.x64`, imported here as `x64`; register names come
-# from its `reg_name` / `fp_reg_name`. FP-ness is inferred from the opcode exactly
-# as the encoder infers it (`x64.is_fp_opcode` plus the MIR_F* family).
+# What this module may read is correspondingly narrow. The mnemonic and every
+# operand come from the concrete `isa.Inst` the encoder built. The MIR instruction
+# on the sink is consulted only for names the machine operand cannot carry - a
+# branch's target block and a symbol reference's name, both erased by
+# `mir_to_operand` - and never to choose a mnemonic or an operand.
+#
+# An opcode with no mnemonic, or an operand shape that does not render, is a hard
+# error naming the opcode. Silent degradation is what let the old divergence go
+# unnoticed, so there is no fallback text anywhere in this module.
 
 use std.format;
 use std.io.writer;
@@ -31,327 +37,235 @@ use std.types.string.str;
 use O: std.types.option;
 use R: std.types.result;
 
+use enc: mach.lang.be.codegen.encode;
 use mach.lang.be.codegen.mir;
 use mach.lang.intern;
-use mach.lang.target.abi;
 use mach.lang.target.isa;
 use mach.lang.target.isa.x64;
-use mach.lang.target.isa.x64.encode;
-use mach.lang.target.resolved;
 
-# format a fully-resolved MIR module as Intel-syntax assembly text
-#
-# The `emit_asm` entry point the x64 ISA registers; matches
-# `be.codegen.encode.PrintAsmFn`. Emits a `.intel_syntax` header then each
-# function in turn, each introduced by a `# <symbol>:` label and its rendered
-# prologue / body / epilogue. An extern / body-less function (no blocks)
-# contributes nothing, mirroring the encoder.
+# write the assembly file header
 # ---
-# tgt: resolved compilation target (its interner resolves symbol names)
-# m:   the fully-resolved MIR module to format
 # out: destination writer
-# ret: true on success, or the first write error
-pub fun print_asm_x64(tgt: *resolved.Target, m: *mir.MirModule, out: *writer.Writer) R.Result[bool, str] {
-    if (m == nil)   { ret R.err[bool, str]("print_asm_x64: nil mir module"); }
-    if (out == nil) { ret R.err[bool, str]("print_asm_x64: nil writer"); }
-
-    val res_header: R.Result[bool, str] = emit_str(out, ".intel_syntax noprefix\n\n");
-    if (R.is_err[bool, str](res_header)) { ret res_header; }
-
-    var i: u32 = 0;
-    for (i < m.function_len) {
-        val res_function: R.Result[bool, str] = print_function(tgt.abi, out, m, ?m.functions[i]);
-        if (R.is_err[bool, str](res_function)) { ret res_function; }
-        i = i + 1;
-    }
-    ret R.ok[bool, str](true);
+# ret: true on success, or the write error
+pub fun emit_header(out: *writer.Writer) R.Result[bool, str] {
+    ret emit_str(out, ".intel_syntax noprefix\n");
 }
 
-# render one MIR function: its `# <symbol>:` header, prologue, every block (each
-# preceded by a `.<id>:` local label), and epilogue
+# render one function's introducing header
 #
-# A body-less (extern) function emits nothing.
+# Emits no bytes, so it leaves the sink's byte accounting untouched.
 # ---
-# abi_vt: active calling-convention vtable; sizes the callee-saved reservation
-# out:    destination writer
-# m:      the owning module (its interner resolves the function / symbol names)
-# f:      the function to render
-# ret:    true on success, or the first write error
-fun print_function(abi_vt: *abi.AbiVTable, out: *writer.Writer, m: *mir.MirModule, f: *mir.MirFunction) R.Result[bool, str] {
-    if (f.block_count == 0) { ret R.ok[bool, str](true); }
-
-    val res_hash: R.Result[bool, str] = emit_str(out, "# ");
-    if (R.is_err[bool, str](res_hash)) { ret res_hash; }
-    val res_name: R.Result[bool, str] = emit_name(out, m.interner, f.name);
+# buf:      the encoder byte sink carrying the assembly sink
+# interner: resolves the function's interned name
+# f:        the function whose encoding is starting
+# ret:      true on success, or the write error
+pub fun note_function(buf: *enc.ByteBuf, interner: *intern.Interner, f: *mir.MirFunction) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    val res_nl: R.Result[bool, str] = emit_str(out, "\n# ");
+    if (R.is_err[bool, str](res_nl)) { ret res_nl; }
+    val res_name: R.Result[bool, str] = emit_name(out, interner, f.name);
     if (R.is_err[bool, str](res_name)) { ret res_name; }
-    val res_colon: R.Result[bool, str] = emit_str(out, ":\n");
-    if (R.is_err[bool, str](res_colon)) { ret res_colon; }
-
-    val naked: bool = function_is_naked(f);
-    if (!naked) {
-        val res_prologue: R.Result[bool, str] = print_prologue(abi_vt, out, f);
-        if (R.is_err[bool, str](res_prologue)) { ret res_prologue; }
-    }
-
-    var i: u32 = 0;
-    for (i < f.block_count) {
-        val blk: *mir.MirBlock = ?f.blocks[i];
-
-        val res_dot: R.Result[bool, str] = emit_str(out, ".");
-        if (R.is_err[bool, str](res_dot)) { ret res_dot; }
-        val res_label: R.Result[bool, str] = emit_u64(out, blk.id::u64);
-        if (R.is_err[bool, str](res_label)) { ret res_label; }
-        val res_label_colon: R.Result[bool, str] = emit_str(out, ":\n");
-        if (R.is_err[bool, str](res_label_colon)) { ret res_label_colon; }
-
-        var ii: u32 = 0;
-        for (ii < blk.instr_count) {
-            val mi: *mir.MirInstr = ?blk.instrs[ii];
-            if (mi.opcode == mir.MIR_RET && !naked) {
-                val res_epilogue: R.Result[bool, str] = print_epilogue(out);
-                if (R.is_err[bool, str](res_epilogue)) { ret res_epilogue; }
-            }
-            val res_instr: R.Result[bool, str] = print_instr(out, m, f, mi);
-            if (R.is_err[bool, str](res_instr)) { ret res_instr; }
-            ii = ii + 1;
-        }
-        i = i + 1;
-    }
-
-    ret emit_str(out, "\n");
+    ret emit_str(out, ":\n");
 }
 
-# render the standard x86-64 prologue as comment-flagged lines so the frame shape
-# is visible without re-deriving it
+# render one block's local label
 #
-# Mirrors the encoder's live `encode.emit_prologue`: the frame-pointer setup and
-# the rounded stack reservation. The reservation byte count covers the local
-# frame, the callee-saved home area, and the outgoing-argument region; it shares
-# the encoder's `encode.frame_total` so the debug `.s` reports the exact amount the
-# encoder subtracts from RSP.
+# Emits no bytes, so it leaves the sink's byte accounting untouched.
 # ---
-# abi_vt: active calling-convention vtable; sizes the callee-saved reservation
-# out:    destination writer
-# f:      the function whose frame is being described
-# ret:    true on success, or the first write error
-fun print_prologue(abi_vt: *abi.AbiVTable, out: *writer.Writer, f: *mir.MirFunction) R.Result[bool, str] {
-    val res_setup: R.Result[bool, str] = emit_str(out, "  push  rbp                  # prologue\n  mov   rbp, rsp\n");
-    if (R.is_err[bool, str](res_setup)) { ret res_setup; }
-
-    val reserve: usize = encode.frame_total(abi_vt, f.frame.size, f.callee_mask, f.callee_mask_fp, f.frame.outgoing_size);
-    if (reserve > 0) {
-        val res_sub: R.Result[bool, str] = emit_str(out, "  sub   rsp, ");
-        if (R.is_err[bool, str](res_sub)) { ret res_sub; }
-        val res_amount: R.Result[bool, str] = emit_u64(out, reserve::u64);
-        if (R.is_err[bool, str](res_amount)) { ret res_amount; }
-        ret emit_str(out, "\n");
-    }
-    ret R.ok[bool, str](true);
+# buf: the encoder byte sink carrying the assembly sink
+# id:  the block id being entered
+# ret: true on success, or the write error
+pub fun note_block(buf: *enc.ByteBuf, id: u32) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    val res_dot: R.Result[bool, str] = emit_str(out, ".");
+    if (R.is_err[bool, str](res_dot)) { ret res_dot; }
+    val res_id: R.Result[bool, str] = emit_u64(out, id::u64);
+    if (R.is_err[bool, str](res_id)) { ret res_id; }
+    ret emit_str(out, ":\n");
 }
 
-# render the standard x86-64 epilogue as a single comment-flagged line
+# render one machine instruction the encoder just emitted
 #
-# Mirrors the encoder's live `encode.emit_epilogue` (callee-saved restores then
-# frame teardown), rendered compactly as `leave` since this artifact need not be
-# byte-exact.
+# The sink's single notification point. Renders `mi`, then marks every byte
+# emitted so far as accounted; the encoder's totality guard compares that mark
+# against the buffer length after each MIR opcode, so an emission path that never
+# reaches here is reported rather than silently dropped from the artifact.
+#
+# Returns nothing: it runs on the encoder's hot path where no error can be
+# threaded, so a write failure is latched on the sink and raised by the driver.
 # ---
-# out: destination writer
-# ret: true on success, or the first write error
-fun print_epilogue(out: *writer.Writer) R.Result[bool, str] {
-    ret emit_str(out, "  leave                       # epilogue\n");
+# buf: the encoder byte sink carrying the assembly sink
+# mi:  the machine instruction just encoded
+pub fun note_inst(buf: *enc.ByteBuf, mi: *isa.Inst) {
+    val res: R.Result[bool, str] = render_inst(buf, mi);
+    if (R.is_err[bool, str](res)) {
+        enc.sink_fail(buf, R.unwrap_err[bool, str](res));
+        ret;
+    }
+    enc.sink_account(buf);
 }
 
-# whether an asm-carrying function needs no frame, so its inline asm owns the stack
-# and gets no compiler prologue / epilogue
-#
-# True only when the function reserves no locals, preserves no callee-saved
-# registers, has no outgoing-argument area, and carries an inline-asm block.
-# Mirrors the encoder's predicate.
+# render `<mnemonic> <dst>, <src1>, <src2>` for one machine instruction
 # ---
-# f:   the function to classify
-# ret: true when the function is naked
-fun function_is_naked(f: *mir.MirFunction) bool {
-    if (f.frame.size != 0)          { ret false; }
-    if (f.callee_mask != 0)         { ret false; }
-    if (f.callee_mask_fp != 0)      { ret false; }
-    if (f.frame.outgoing_size != 0) { ret false; }
-
-    var i: u32 = 0;
-    for (i < f.block_count) {
-        val blk: *mir.MirBlock = ?f.blocks[i];
-        var ii: u32 = 0;
-        for (ii < blk.instr_count) {
-            if (blk.instrs[ii].opcode::u16 == x64.ASM_BLOCK::u16) { ret true; }
-            ii = ii + 1;
-        }
-        i = i + 1;
-    }
-    ret false;
-}
-
-# render one fully-resolved MIR instruction
-#
-# The lowering-only pseudos that emit no bytes (PCOPY / USE / LABEL fences, the
-# CALL_RES / ARG liveness markers) are skipped. An inline-asm block prints a
-# `# <inline asm>` marker rather than its expanded body. Every other instruction
-# prints `<mnemonic> <op0>, <op1>, ...` with operands resolved through the same
-# frame layout the encoder reads.
-# ---
-# out: destination writer
-# m:   the owning module (its interner resolves symbol names)
-# f:   the owning function (its frame layout resolves memory operands)
-# mi:  the instruction to render
-# ret: true on success, or the first write error
-fun print_instr(out: *writer.Writer, m: *mir.MirModule, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
-    if (mi.opcode == isa.ISA_PCOPY || mi.opcode == isa.ISA_PCOPY_FENCE ||
-        mi.opcode == isa.ISA_USE || mi.opcode == isa.ISA_LABEL ||
-        mi.opcode == mir.MIR_CALL_RES || mi.opcode == mir.MIR_ARG) {
-        ret R.ok[bool, str](true);
-    }
-
-    if (mi.opcode::u16 == x64.ASM_BLOCK::u16) {
-        ret emit_str(out, "  # <inline asm>\n");
-    }
+# buf: the encoder byte sink carrying the assembly sink
+# mi:  the machine instruction to render
+# ret: true on success, or the first error
+fun render_inst(buf: *enc.ByteBuf, mi: *isa.Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
 
     val res_indent: R.Result[bool, str] = emit_str(out, "  ");
     if (R.is_err[bool, str](res_indent)) { ret res_indent; }
-    val res_mnemonic: R.Result[bool, str] = emit_str(out, mnemonic(mi.opcode));
-    if (R.is_err[bool, str](res_mnemonic)) { ret res_mnemonic; }
 
-    val fp: bool = is_fp_instr(mi.opcode);
-    var i: u32 = 0;
-    for (i < mi.operand_count) {
-        if (i == 0) {
-            val res_sep: R.Result[bool, str] = emit_str(out, " ");
-            if (R.is_err[bool, str](res_sep)) { ret res_sep; }
-        }
-        or {
-            val res_sep: R.Result[bool, str] = emit_str(out, ", ");
-            if (R.is_err[bool, str](res_sep)) { ret res_sep; }
-        }
-        val width: u8 = operand_width(mi, i);
-        val res_operand: R.Result[bool, str] = print_operand(out, m, f, ?mi.operands[i], width, fp);
-        if (R.is_err[bool, str](res_operand)) { ret res_operand; }
-        i = i + 1;
+    # the LOCK prefix is part of the instruction and is what makes the operation
+    # atomic; omitting it would render an atomic RMW indistinguishable from a plain one
+    if ((mi.flags & x64.FLAG_LOCK::u16) != 0) {
+        val res_lock: R.Result[bool, str] = emit_str(out, "lock ");
+        if (R.is_err[bool, str](res_lock)) { ret res_lock; }
     }
+
+    # a packed compare spells its imm8 predicate into the mnemonic (`cmpltps`), which
+    # is how the instruction disassembles; the generic form plus a bare predicate
+    # number would not correspond to the object line for line
+    val packed_cmp: bool = is_packed_compare(mi);
+    var mnem: str = mnemonic_of(mi.opcode);
+    if (packed_cmp) { mnem = packed_compare_mnemonic(mi.opcode, mi.src2.imm); }
+    # the cross-bank move is MOVD or MOVQ by its operation width, not by opcode:
+    # `x64.MOVQ` emits the 32-bit form (no REX.W) whenever the width is not 8
+    if (mi.opcode == x64.MOVQ && mi.size != 8) { mnem = "movd"; }
+    if (mnem == nil) {
+        ret R.err[bool, str]("--emit-asm: no x86-64 mnemonic for the emitted opcode");
+    }
+    val res_write: R.Result[bool, str] = emit_str(out, mnem);
+    if (R.is_err[bool, str](res_write)) { ret res_write; }
+
+    var printed: u32 = 0;
+    val res_dst: R.Result[u32, str] = render_operand(buf, mi, ?mi.dst, printed);
+    if (R.is_err[u32, str](res_dst)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_dst)); }
+    printed = R.unwrap_ok[u32, str](res_dst);
+
+    val res_src1: R.Result[u32, str] = render_operand(buf, mi, ?mi.src1, printed);
+    if (R.is_err[u32, str](res_src1)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_src1)); }
+    printed = R.unwrap_ok[u32, str](res_src1);
+
+    if (!packed_cmp) {
+        val res_src2: R.Result[u32, str] = render_operand(buf, mi, ?mi.src2, printed);
+        if (R.is_err[u32, str](res_src2)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_src2)); }
+    }
+
     ret emit_str(out, "\n");
 }
 
-# return the byte width an operand renders at
-#
-# The destination (operand 0) rides the instruction's operation width; the sources
-# ride its source width (they differ only for the width-changing conversions). A 0
-# width falls back to the machine word so an address-sized pseudo still names
-# full-width registers.
+# whether an instruction is a packed compare carrying an imm8 predicate
 # ---
-# mi:  the instruction owning the operand
-# idx: operand index within the instruction
-# ret: the operand's byte width
-fun operand_width(mi: *mir.MirInstr, idx: u32) u8 {
-    var w: u8 = mi.src_width;
-    if (idx == 0) { w = mi.width; }
-    if (w == 0)   { ret 8; }
-    ret w;
+# mi:  the machine instruction to classify
+# ret: true for CMPPS / CMPPD with an immediate predicate
+fun is_packed_compare(mi: *isa.Inst) bool {
+    if (mi.opcode != x64.CMPPS && mi.opcode != x64.CMPPD) { ret false; }
+    ret mi.src2.kind == isa.OPK_IMM;
 }
 
-# render one MIR operand in Intel syntax
+# the predicate-spelled mnemonic for a packed compare, or nil for a predicate the
+# encoder does not emit
 #
-# A register names its physical register (GP or XMM, by `fp`); an immediate prints
-# its value; a memory operand resolves a frame-slot base to `[rbp + off]` and a
-# physical base to `[preg + disp]`, folding any scaled index; a symbol prints
-# `<name>` (with a `+off` addend); a block prints its `.<id>` local-label target. A
-# surviving virtual register is a regalloc bug and prints `<vreg N>` so the artifact
-# stays legible rather than failing the whole dump.
+# The SSE imm8 predicate encoding: 0 eq, 1 lt, 2 le, 3 unord, 4 neq, 5 nlt, 6 nle,
+# 7 ord. Returning nil for anything else keeps the printer total - a predicate
+# with no spelling fails the render rather than mislabelling the comparison.
 # ---
-# out:   destination writer
-# m:     the owning module (its interner resolves symbol names)
-# f:     the owning function (its frame layout resolves memory operands)
-# op:    the operand to render
-# width: the byte width the operand renders at
-# fp:    whether the instruction operates on the SSE register file
-# ret:   true on success, or the first write error
-fun print_operand(out: *writer.Writer, m: *mir.MirModule, f: *mir.MirFunction,
-                  op: *mir.MirOperand, width: u8, fp: bool) R.Result[bool, str] {
-    if (op.kind == mir.MIR_OP_PREG) {
-        ret emit_reg(out, op.preg::i32, width, fp);
-    }
-    if (op.kind == mir.MIR_OP_VREG) {
-        val res_open: R.Result[bool, str] = emit_str(out, "<vreg ");
-        if (R.is_err[bool, str](res_open)) { ret res_open; }
-        val res_vreg: R.Result[bool, str] = emit_u64(out, op.vreg::u64);
-        if (R.is_err[bool, str](res_vreg)) { ret res_vreg; }
-        ret emit_str(out, ">");
-    }
-    if (op.kind == mir.MIR_OP_IMM) {
-        ret emit_i64(out, op.imm);
-    }
-    if (op.kind == mir.MIR_OP_MEM) {
-        ret print_mem(out, f, op, width);
-    }
-    if (op.kind == mir.MIR_OP_SYM) {
-        val res_name: R.Result[bool, str] = emit_name(out, m.interner, op.sym);
-        if (R.is_err[bool, str](res_name)) { ret res_name; }
-        if (op.sym_off != 0) {
-            val res_plus: R.Result[bool, str] = emit_str(out, "+");
-            if (R.is_err[bool, str](res_plus)) { ret res_plus; }
-            ret emit_i64(out, op.sym_off::i64);
-        }
-        ret R.ok[bool, str](true);
-    }
-    if (op.kind == mir.MIR_OP_BLOCK) {
-        val res_dot: R.Result[bool, str] = emit_str(out, ".");
-        if (R.is_err[bool, str](res_dot)) { ret res_dot; }
-        ret emit_u64(out, op.imm::u64);
-    }
-    ret emit_str(out, "?");
+# op:   CMPPS or CMPPD
+# pred: the imm8 predicate the form carries
+# ret:  the alias mnemonic, or nil for an unrecognized predicate
+fun packed_compare_mnemonic(op: u16, pred: i64) str {
+    val single: bool = op == x64.CMPPS;
+    if (pred == 0) { if (single) { ret "cmpeqps"; }   ret "cmpeqpd"; }
+    if (pred == 1) { if (single) { ret "cmpltps"; }   ret "cmpltpd"; }
+    if (pred == 2) { if (single) { ret "cmpleps"; }   ret "cmplepd"; }
+    if (pred == 3) { if (single) { ret "cmpunordps"; } ret "cmpunordpd"; }
+    if (pred == 4) { if (single) { ret "cmpneqps"; }  ret "cmpneqpd"; }
+    if (pred == 5) { if (single) { ret "cmpnltps"; }  ret "cmpnltpd"; }
+    if (pred == 6) { if (single) { ret "cmpnleps"; }  ret "cmpnlepd"; }
+    if (pred == 7) { if (single) { ret "cmpordps"; }  ret "cmpordpd"; }
+    ret nil;
+}
+
+# render one operand, prefixed by the right separator for its position
+# ---
+# buf:     the encoder byte sink carrying the assembly sink
+# mi:      the owning instruction (supplies the fallback width)
+# op:      the operand to render
+# printed: how many operands have been rendered already
+# ret:     the new rendered-operand count, or an error
+fun render_operand(buf: *enc.ByteBuf, mi: *isa.Inst, op: *isa.Operand, printed: u32) R.Result[u32, str] {
+    if (op.kind == isa.OPK_NONE) { ret R.ok[u32, str](printed); }
+
+    val out: *writer.Writer = buf.asm.out;
+    var sep: str = ", ";
+    if (printed == 0) { sep = " "; }
+    val res_sep: R.Result[bool, str] = emit_str(out, sep);
+    if (R.is_err[bool, str](res_sep)) { ret R.err[u32, str](R.unwrap_err[bool, str](res_sep)); }
+
+    val res: R.Result[bool, str] = render_operand_body(buf, mi, op);
+    if (R.is_err[bool, str](res)) { ret R.err[u32, str](R.unwrap_err[bool, str](res)); }
+    ret R.ok[u32, str](printed + 1);
+}
+
+# render an operand's text
+#
+# A register names its physical register at the operand's width, in its own bank -
+# the composite register id carries its class, so an SSE id prints an XMM name
+# without the opcode being consulted. A memory operand renders
+# `<size> [base + index*scale + disp]`, or `[rip + <symbol>]` for the base-less
+# rip-relative form a symbol reference lowers to. A label renders the target block
+# the branch was emitted for.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# mi:  the owning instruction (supplies the fallback width)
+# op:  the operand to render
+# ret: true on success, or an error naming the unrenderable shape
+fun render_operand_body(buf: *enc.ByteBuf, mi: *isa.Inst, op: *isa.Operand) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+
+    if (op.kind == isa.OPK_REG)   { ret emit_reg(out, op.reg, operand_width(mi, op)); }
+    if (op.kind == isa.OPK_IMM)   { ret emit_i64(out, op.imm); }
+    if (op.kind == isa.OPK_MEM)   { ret render_mem(buf, mi, op); }
+    if (op.kind == isa.OPK_SYM)   { ret emit_sym(out, buf.asm.interner, op.sym_id); }
+    if (op.kind == isa.OPK_LABEL) { ret render_label(buf, op); }
+
+    ret R.err[bool, str]("--emit-asm: instruction operand has no renderable kind");
 }
 
 # render a memory operand as `<size> [base + index*scale + disp]`
 #
-# A frame-slot-key base (`vreg != MIR_VREG_NIL`) resolves to `[rbp + slot.offset +
-# imm]`; a physical-register base (`vreg == MIR_VREG_NIL`) forms `[preg + imm]`.
-# Every memory operand carries a base, so the index and displacement always follow
-# one. A scaled index is appended when present. A slot key owning no slot prints
-# `[<vreg N>]` so a regalloc leak stays legible rather than aborting the dump.
+# A base of -1 is the rip-relative form a symbol reference lowers to; its symbol
+# id rides on the operand so the target is named rather than shown as a zero
+# displacement the linker later fills in.
 # ---
-# out:   destination writer
-# f:     the owning function (its frame layout resolves a slot-key base)
-# op:    the memory operand to render
-# width: the access byte width (drives the size prefix)
-# ret:   true on success, or the first write error
-fun print_mem(out: *writer.Writer, f: *mir.MirFunction, op: *mir.MirOperand, width: u8) R.Result[bool, str] {
-    val res_size: R.Result[bool, str] = emit_str(out, size_prefix(width));
+# buf: the encoder byte sink carrying the assembly sink
+# mi:  the owning instruction (supplies the fallback width)
+# op:  the memory operand to render
+# ret: true on success, or the first write error
+fun render_mem(buf: *enc.ByteBuf, mi: *isa.Inst, op: *isa.Operand) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+
+    val res_size: R.Result[bool, str] = emit_str(out, size_prefix(operand_width(mi, op)));
     if (R.is_err[bool, str](res_size)) { ret res_size; }
     val res_open: R.Result[bool, str] = emit_str(out, "[");
     if (R.is_err[bool, str](res_open)) { ret res_open; }
 
-    var disp: i64 = op.imm;
-    if (op.vreg != mir.MIR_VREG_NIL) {
-        val opt_slot: O.Option[i64] = frame_slot_offset(f, op.vreg);
-        if (O.is_some[i64](opt_slot)) {
-            val res_base: R.Result[bool, str] = emit_str(out, "rbp");
-            if (R.is_err[bool, str](res_base)) { ret res_base; }
-            disp = O.unwrap[i64](opt_slot) + op.imm;
-        }
-        or {
-            val res_base: R.Result[bool, str] = emit_str(out, "<vreg ");
-            if (R.is_err[bool, str](res_base)) { ret res_base; }
-            val res_vreg: R.Result[bool, str] = emit_u64(out, op.vreg::u64);
-            if (R.is_err[bool, str](res_vreg)) { ret res_vreg; }
-            val res_close: R.Result[bool, str] = emit_str(out, ">");
-            if (R.is_err[bool, str](res_close)) { ret res_close; }
-            disp = 0;
-        }
-    }
-    or {
-        val res_base: R.Result[bool, str] = emit_reg(out, op.preg::i32, 8, false);
-        if (R.is_err[bool, str](res_base)) { ret res_base; }
+    if (op.base < 0) {
+        val res_rip: R.Result[bool, str] = emit_str(out, "rip + ");
+        if (R.is_err[bool, str](res_rip)) { ret res_rip; }
+        val res_sym: R.Result[bool, str] = emit_sym(out, buf.asm.interner, op.sym_id);
+        if (R.is_err[bool, str](res_sym)) { ret res_sym; }
+        ret emit_str(out, "]");
     }
 
-    if (op.index != mir.MIR_VREG_NIL && op.index_is_preg) {
+    val res_base: R.Result[bool, str] = emit_reg(out, op.base, 8);
+    if (R.is_err[bool, str](res_base)) { ret res_base; }
+
+    if (op.index >= 0) {
         val res_plus: R.Result[bool, str] = emit_str(out, " + ");
         if (R.is_err[bool, str](res_plus)) { ret res_plus; }
-        val res_index: R.Result[bool, str] = emit_reg(out, op.index::i32, 8, false);
+        val res_index: R.Result[bool, str] = emit_reg(out, op.index, 8);
         if (R.is_err[bool, str](res_index)) { ret res_index; }
         if (op.scale > 1) {
             val res_star: R.Result[bool, str] = emit_str(out, "*");
@@ -361,147 +275,116 @@ fun print_mem(out: *writer.Writer, f: *mir.MirFunction, op: *mir.MirOperand, wid
         }
     }
 
-    if (disp != 0) {
-        if (disp > 0) {
-            val res_sep: R.Result[bool, str] = emit_str(out, " + ");
-            if (R.is_err[bool, str](res_sep)) { ret res_sep; }
-            val res_disp: R.Result[bool, str] = emit_i64(out, disp);
-            if (R.is_err[bool, str](res_disp)) { ret res_disp; }
-        }
-        or {
-            val res_sep: R.Result[bool, str] = emit_str(out, " - ");
-            if (R.is_err[bool, str](res_sep)) { ret res_sep; }
-            val res_disp: R.Result[bool, str] = emit_i64(out, 0 - disp);
-            if (R.is_err[bool, str](res_disp)) { ret res_disp; }
-        }
+    if (op.disp != 0) {
+        var sign: str = " + ";
+        var mag:  i64 = op.disp::i64;
+        if (op.disp < 0) { sign = " - "; mag = 0 - op.disp::i64; }
+        val res_sign: R.Result[bool, str] = emit_str(out, sign);
+        if (R.is_err[bool, str](res_sign)) { ret res_sign; }
+        val res_disp: R.Result[bool, str] = emit_i64(out, mag);
+        if (R.is_err[bool, str](res_disp)) { ret res_disp; }
     }
     ret emit_str(out, "]");
 }
 
-# return the frame-pointer offset of the slot a MIR value owns, or none when it
-# owns no slot
+# render a branch target
 #
-# Mirrors the encoder's lookup over the laid-out frame.
+# A block-target branch carries its destination block id (`isa.make_block_label`).
+# An expansion-internal branch - the stack probe's loop edge and the unsigned
+# 64-bit float conversion's two arms - has no block: the encoder patches its
+# displacement directly, a few bytes later, and there is no name to give it. It
+# renders as `<internal>` rather than inventing a target.
 # ---
-# f:   the owning function (carries the laid-out frame)
-# v:   the MIR value whose slot is sought
-# ret: some(offset) when v owns a slot, or none
-fun frame_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
-    val frame: *mir.MirFrame = ?f.frame;
-    if (frame.slots == nil) { ret O.none[i64](); }
-    var i: u32 = 0;
-    for (i < frame.slot_count) {
-        if (frame.slots[i].value == v) { ret O.some[i64](frame.slots[i].offset); }
-        i = i + 1;
-    }
-    ret O.none[i64]();
+# buf: the encoder byte sink carrying the assembly sink
+# op:  the label operand to render
+# ret: true on success, or the write error
+fun render_label(buf: *enc.ByteBuf, op: *isa.Operand) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    if (op.label != nil) { ret emit_str(out, op.label); }
+    if (!label_is_block(buf, op)) { ret emit_str(out, "<internal>"); }
+
+    val res_dot: R.Result[bool, str] = emit_str(out, ".");
+    if (R.is_err[bool, str](res_dot)) { ret res_dot; }
+    ret emit_u64(out, op.imm::u64);
 }
 
-# write a register name - XMM or GP at the given byte width
+# whether a nameless label operand carries a block id
 #
-# A register id is self-describing (its class rides in the composite id), so an
-# SSE-bank id prints an XMM name regardless of the opcode hint; the `fp` opcode hint
-# covers a float instruction whose operand was already resolved to an XMM scratch.
-# Memory base / index ids are always general-purpose, so they print GP names.
+# `isa.make_label(nil)` leaves `imm` zero and `isa.make_block_label` sets it, so
+# the two are distinguishable except when the target really is block 0. The MIR
+# instruction being encoded settles that case: only a branch carries block
+# operands, so a non-branch reaching here is expansion-internal.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# op:  the label operand to classify
+# ret: true when `imm` names a block
+fun label_is_block(buf: *enc.ByteBuf, op: *isa.Operand) bool {
+    if (op.imm != 0) { ret true; }
+    val mi: *mir.MirInstr = buf.asm.mi;
+    if (mi == nil) { ret false; }
+
+    var i: u32 = 0;
+    for (i < mi.operand_count) {
+        if (mi.operands[i].kind == mir.MIR_OP_BLOCK && mi.operands[i].imm == 0) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the byte width an operand renders at
+#
+# The operand's own size when it carries one (every post-regalloc operand does),
+# falling back to the instruction's operation width.
+# ---
+# mi: the owning instruction
+# op: the operand
+# ret: the render width in bytes
+fun operand_width(mi: *isa.Inst, op: *isa.Operand) u8 {
+    if (op.size != 0) { ret op.size; }
+    if (mi.size != 0) { ret mi.size; }
+    ret 8;
+}
+
+# write a register name in its own bank
+#
+# The composite register id encodes its class, so an SSE id names an XMM register
+# regardless of the opcode and a general-purpose id names its width-appropriate
+# form. A 16-byte width is a vector operand, always XMM.
 # ---
 # out:   destination writer
 # id:    the composite register id to name
-# width: the byte width a GP register names at
-# fp:    whether the owning instruction operates on the SSE register file
-# ret:   true on success, or the first write error
-fun emit_reg(out: *writer.Writer, id: i32, width: u8, fp: bool) R.Result[bool, str] {
-    if (fp || isa.regid_class(id) == isa.REG_CLASS_ID_XMM) { ret emit_str(out, x64.fp_reg_name(id)); }
+# width: the byte width a general-purpose register names at
+# ret:   true on success, or the write error
+fun emit_reg(out: *writer.Writer, id: i32, width: u8) R.Result[bool, str] {
+    if (isa.regid_class(id) == isa.REG_CLASS_ID_XMM || width == 16) {
+        ret emit_str(out, x64.fp_reg_name(id));
+    }
     ret emit_str(out, x64.reg_name(nil, id, width));
 }
 
-# return the Intel operand-size keyword for a memory-access width
+# the Intel operand-size keyword for a memory access width
 # ---
 # width: the access byte width
-# ret:   the size keyword (with trailing space), or empty for an unknown width
+# ret:   the size keyword with a trailing space
 fun size_prefix(width: u8) str {
-    if (width == 1) { ret "byte "; }
-    if (width == 2) { ret "word "; }
-    if (width == 4) { ret "dword "; }
-    if (width == 8) { ret "qword "; }
+    if (width == 1)  { ret "byte "; }
+    if (width == 2)  { ret "word "; }
+    if (width == 4)  { ret "dword "; }
+    if (width == 8)  { ret "qword "; }
+    if (width == 16) { ret "xmmword "; }
     ret "";
 }
 
-# whether an instruction operates on the SSE register file, so its register
-# operands name XMM registers
+# the Intel mnemonic for a concrete x86-64 opcode, or nil when unmapped
 #
-# Covers both the concrete SSE opcodes (`x64.is_fp_opcode`) and the surviving MIR
-# scalar-float family.
-# ---
-# op:  the MIR opcode to classify
-# ret: true when the opcode is float-typed
-fun is_fp_instr(op: mir.MirOpcode) bool {
-    if (op == mir.MIR_FADD || op == mir.MIR_FSUB ||
-        op == mir.MIR_FMUL || op == mir.MIR_FDIV || op == mir.MIR_FCMP ||
-        op == mir.MIR_FNEG) { ret true; }
-    if (op >= mir.MIR_SEL_ADD) { ret false; }
-    ret x64.is_fp_opcode(op::u16);
-}
-
-# return the assembly mnemonic for a fully-resolved MIR opcode
-#
-# The surviving generic / selection-output sentinels (the three-address ALU,
-# divide, compare, float, and branch families plus the MOV / CALL / RET pseudos)
-# map to their natural mnemonic; everything else is a concrete x64 opcode named by
-# `x64_mnemonic`.
-# ---
-# op:  the MIR opcode to name
-# ret: the mnemonic text
-fun mnemonic(op: mir.MirOpcode) str {
-    if (op == mir.MIR_MOV)  { ret "mov"; }
-    if (op == mir.MIR_DECLASSIFY) { ret "declassify"; }   # a move-plus-barrier; retagged to mov by isel (#1646)
-    if (op == mir.MIR_CALL) { ret "call"; }
-    if (op == mir.MIR_RET)  { ret "ret"; }
-    if (op == mir.MIR_BR)   { ret "jmp"; }
-
-    if (op == mir.MIR_SEL_ADD)   { ret "add"; }
-    if (op == mir.MIR_SEL_SUB)   { ret "sub"; }
-    if (op == mir.MIR_SEL_MUL)   { ret "imul"; }
-    if (op == mir.MIR_SEL_AND)   { ret "and"; }
-    if (op == mir.MIR_SEL_OR)    { ret "or"; }
-    if (op == mir.MIR_SEL_XOR)   { ret "xor"; }
-    if (op == mir.MIR_SEL_SHL)   { ret "shl"; }
-    if (op == mir.MIR_SEL_SHR_U) { ret "shr"; }
-    if (op == mir.MIR_SEL_SHR_S) { ret "sar"; }
-    if (op == mir.MIR_SEL_DIV_S) { ret "idiv"; }
-    if (op == mir.MIR_SEL_DIV_U) { ret "div"; }
-    if (op == mir.MIR_SEL_REM_S) { ret "idiv"; }
-    if (op == mir.MIR_SEL_REM_U) { ret "div"; }
-
-    if (op == mir.MIR_SEL_CMP_EQ)   { ret "cmp.eq"; }
-    if (op == mir.MIR_SEL_CMP_NE)   { ret "cmp.ne"; }
-    if (op == mir.MIR_SEL_CMP_LT_S) { ret "cmp.lt_s"; }
-    if (op == mir.MIR_SEL_CMP_LT_U) { ret "cmp.lt_u"; }
-    if (op == mir.MIR_SEL_CMP_LE_S) { ret "cmp.le_s"; }
-    if (op == mir.MIR_SEL_CMP_LE_U) { ret "cmp.le_u"; }
-    if (op == mir.MIR_SEL_CBR)      { ret "cbr"; }
-
-    if (op == mir.MIR_SEL_CBR_EQ)   { ret "cbr.eq"; }
-    if (op == mir.MIR_SEL_CBR_NE)   { ret "cbr.ne"; }
-    if (op == mir.MIR_SEL_CBR_LT_S) { ret "cbr.lt_s"; }
-    if (op == mir.MIR_SEL_CBR_LT_U) { ret "cbr.lt_u"; }
-    if (op == mir.MIR_SEL_CBR_LE_S) { ret "cbr.le_s"; }
-    if (op == mir.MIR_SEL_CBR_LE_U) { ret "cbr.le_u"; }
-
-    if (op == mir.MIR_FADD) { ret "fadd"; }
-    if (op == mir.MIR_FSUB) { ret "fsub"; }
-    if (op == mir.MIR_FMUL) { ret "fmul"; }
-    if (op == mir.MIR_FDIV) { ret "fdiv"; }
-    if (op == mir.MIR_FCMP) { ret "fcmp"; }
-    if (op == mir.MIR_FNEG) { ret "fneg"; }
-
-    ret x64_mnemonic(op::u16);
-}
-
-# return the Intel mnemonic for a concrete x86-64 opcode
+# Total over the opcode space by construction: an unmapped opcode returns nil and
+# the caller fails the build, never placeholder text. A new opcode that reaches
+# the encoder without being added here breaks the render rather than printing
+# something an assembler would reject.
 # ---
 # op:  the concrete x64 opcode to name
-# ret: the mnemonic text, or `???` for an unrecognized opcode
-fun x64_mnemonic(op: u16) str {
+# ret: the mnemonic text, or nil for an opcode with no mapping
+fun mnemonic_of(op: u16) str {
     if (op == x64.NOP)       { ret "nop"; }
     if (op == x64.MOV)       { ret "mov"; }
     if (op == x64.LEA)       { ret "lea"; }
@@ -587,7 +470,43 @@ fun x64_mnemonic(op: u16) str {
     if (op == x64.XADD)      { ret "xadd"; }
     if (op == x64.CMPXCHG)   { ret "cmpxchg"; }
     if (op == x64.RAW_BYTE)  { ret ".byte"; }
-    ret "???";
+
+    # the packed (128-bit SSE2) forms the vector encoders emit
+    if (op == x64.MOVAPS)  { ret "movaps"; }
+    if (op == x64.MOVUPS)  { ret "movups"; }
+    if (op == x64.ADDPS)   { ret "addps"; }
+    if (op == x64.ADDPD)   { ret "addpd"; }
+    if (op == x64.SUBPS)   { ret "subps"; }
+    if (op == x64.SUBPD)   { ret "subpd"; }
+    if (op == x64.MULPS)   { ret "mulps"; }
+    if (op == x64.MULPD)   { ret "mulpd"; }
+    if (op == x64.DIVPS)   { ret "divps"; }
+    if (op == x64.DIVPD)   { ret "divpd"; }
+    if (op == x64.PADDB)   { ret "paddb"; }
+    if (op == x64.PADDW)   { ret "paddw"; }
+    if (op == x64.PADDD)   { ret "paddd"; }
+    if (op == x64.PADDQ)   { ret "paddq"; }
+    if (op == x64.PSUBB)   { ret "psubb"; }
+    if (op == x64.PSUBW)   { ret "psubw"; }
+    if (op == x64.PSUBD)   { ret "psubd"; }
+    if (op == x64.PSUBQ)   { ret "psubq"; }
+    if (op == x64.PSUBUSB) { ret "psubusb"; }
+    if (op == x64.PSUBUSW) { ret "psubusw"; }
+    if (op == x64.PMULLW)  { ret "pmullw"; }
+    if (op == x64.PAND)    { ret "pand"; }
+    if (op == x64.POR)     { ret "por"; }
+    if (op == x64.PXOR)    { ret "pxor"; }
+    if (op == x64.CMPPS)   { ret "cmpps"; }
+    if (op == x64.CMPPD)   { ret "cmppd"; }
+    if (op == x64.PCMPEQB) { ret "pcmpeqb"; }
+    if (op == x64.PCMPEQW) { ret "pcmpeqw"; }
+    if (op == x64.PCMPEQD) { ret "pcmpeqd"; }
+    if (op == x64.PCMPGTB) { ret "pcmpgtb"; }
+    if (op == x64.PCMPGTW) { ret "pcmpgtw"; }
+    if (op == x64.PCMPGTD) { ret "pcmpgtd"; }
+    if (op == x64.PSHUFD)  { ret "pshufd"; }
+    if (op == x64.PSLLD)   { ret "pslld"; }
+    ret nil;
 }
 
 # write a string, mapping a format error to the bool/str result shape
@@ -623,14 +542,30 @@ fun emit_i64(out: *writer.Writer, n: i64) R.Result[bool, str] {
     ret R.ok[bool, str](true);
 }
 
-# write an interned name, or `<?name>` when the id does not resolve
+# write an interned name, failing when the id does not resolve
 # ---
 # out:      destination writer
 # interner: the interner that resolves the id to text
 # id:       the interned string id to write
-# ret:      true on success, or the first write error
+# ret:      true on success, or an error
 fun emit_name(out: *writer.Writer, interner: *intern.Interner, id: intern.StrId) R.Result[bool, str] {
     val opt_name: O.Option[str] = intern.lookup(interner, id);
-    if (O.is_some[str](opt_name)) { ret emit_str(out, O.unwrap[str](opt_name)); }
-    ret emit_str(out, "<?name>");
+    if (O.is_none[str](opt_name)) {
+        ret R.err[bool, str]("--emit-asm: a function name did not resolve in the interner");
+    }
+    ret emit_str(out, O.unwrap[str](opt_name));
+}
+
+# write a symbol reference's name, failing when the id does not resolve
+# ---
+# out:      destination writer
+# interner: the interner that resolves the id to text
+# id:       the symbol's interned string id
+# ret:      true on success, or an error
+fun emit_sym(out: *writer.Writer, interner: *intern.Interner, id: u32) R.Result[bool, str] {
+    val opt_name: O.Option[str] = intern.lookup(interner, id::intern.StrId);
+    if (O.is_none[str](opt_name)) {
+        ret R.err[bool, str]("--emit-asm: a symbol reference did not resolve in the interner");
+    }
+    ret emit_str(out, O.unwrap[str](opt_name));
 }
