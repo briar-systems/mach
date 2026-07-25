@@ -626,16 +626,22 @@ fun union_leaf_ty(st: *State, ty: ir_type.IrTypeId) ir_type.IrTypeId {
     var k: u32 = 0;
     for (k < t.data.struct_.field_count) {
         val mt: ir_type.IrTypeId = t.data.struct_.fields[k];
-        if (!scalar_field(st, mt))                              { ret ir_type.IRT_NIL; }
-        val ms: u32 = ir_type.byte_size(?st.m.types, mt, st.tgt);
-        if (ms > size)                                          { ret ir_type.IRT_NIL; }
-        if (ms < size) { narrow = true; }
+        if (!scalar_field(st, mt)) { ret ir_type.IRT_NIL; }
+        # a union's size is its widest member rounded up to its alignment, so a member
+        # is never wider than the cell and `<` versus `==` covers every case
+        if (ir_type.byte_size(?st.m.types, mt, st.tgt) < size) { narrow = true; }
         or {
             if (storage_rank(st, mt) < rank) { pick = mt; rank = storage_rank(st, mt); }
         }
         k = k + 1;
     }
     if (!narrow) { ret pick; }
+    # UNREACHABLE TODAY, AND NOT DEAD. Every registered isa declares ENDIAN_LITTLE, so no
+    # build reaches this and deleting it changes no test -- but the narrow form rests on
+    # it: a member at offset zero is the cell integer's low bits only under that byte
+    # order, and the mask, the widening and the truncation all read it that way. A
+    # big-endian isa would need the member's bits shifted into place instead, and without
+    # this condition it would silently get the little-endian formula.
     if (st.tgt.model.endianness != isa.ENDIAN_LITTLE) { ret ir_type.IRT_NIL; }
     ret int_of_bytes(st, size);
 }
@@ -1057,11 +1063,7 @@ fun gep_use_ok(st: *State, c: u32, gid: id.InstructionId, uid: id.InstructionId,
         if (cell) { ret union_access_ok(st, c, gid, inst.operands[0].ty); }
         ret true;
     }
-    if (inst.kind == instruction.OP_GEP && o == 0) {
-        # a member gep already stands at the cell; nothing descends past it
-        if (st.uni_gep[gid::u32]) { ret false; }
-        ret gep_stays_in_field(st, c, gid, uid, inst);
-    }
+    if (inst.kind == instruction.OP_GEP && o == 0) { ret gep_stays_in_field(st, c, gid, uid, inst); }
     ret false;
 }
 
@@ -1110,7 +1112,8 @@ fun gep_stays_in_field(st: *State, c: u32, gid: id.InstructionId, uid: id.Instru
     # a union field is one cell rather than a tree to descend: `mark_union_member_geps`
     # tagged the geps that name a member, all of which resolve to the cell's own
     # address. any other gep addresses part of the cell, which one slot cannot stand in
-    # for
+    # for -- including a gep chained onto a member gep, which is never tagged because
+    # tagging refuses a member gep for a base
     if (union_leaf_ty(st, ft) != ir_type.IRT_NIL)     { ret st.uni_gep[uid::u32]; }
     if (inst.operand_count < 2)                       { ret false; }
     if (inst.operands[1].kind != value.VAL_CONST_INT) { ret false; }
@@ -3062,13 +3065,173 @@ test "mach.lang.me.transform.sroa.run:declines_a_narrow_access_to_a_pointer_cell
     ret code;
 }
 
-# a gep that reaches a union member and keeps walking keeps the record whole: the cell
-# is one scalar slot, and an index past its start addresses part of it
+# build `{i8, uni{a, b}}`, open a local of it, and append one load through a member gep
+# plus a return of it (test helper)
 #
-# Accepting the longer walk (dropping the union condition in `classify_one`) retargets
-# the gep onto the cell's slot, which then has a gep for a base and never promotes; the
-# alloca survives either way, but this test pins the decline at the classification so
-# the pass does not silently produce a slot it cannot promote
+# The decline cases differ only in the union's members, the member ordinal and the access
+# type, so they share this body and check the same thing: the record stayed whole.
+# ---
+# m:      the module to build in
+# a:      the union's first member type
+# b:      the union's second member type
+# member: the member ordinal the gep names
+# at:     the type the load reads the member at
+# ret:    the function's index, or NONE_U32 on failure
+fun ut_tagged_probe(m: *ir.Module, a: ir_type.IrTypeId, b: ir_type.IrTypeId, member: u64, at: ir_type.IrTypeId) u32 {
+    var rec: ir_type.IrTypeId;
+    if (ut_tagged(m, a, b, ?rec) != 0) { ret NONE_U32; }
+
+    var bl: builder.Builder = builder.init(m);
+    var slot: value.Value;
+    val ix: u32 = ut_open_local(m, ?bl, rec, ?slot);
+    if (ix == NONE_U32) { ret NONE_U32; }
+
+    val g: R.Result[value.Value, str] = ut_member_gep(?bl, m, slot, rec, member);
+    if (R.is_err[value.Value, str](g)) { ret NONE_U32; }
+    val rl: R.Result[value.Value, str] = builder.emit_load(?bl, R.unwrap_ok[value.Value, str](g), at);
+    if (R.is_err[value.Value, str](rl)) { ret NONE_U32; }
+    if (R.is_err[bool, str](builder.emit_ret(?bl, R.unwrap_ok[value.Value, str](rl)))) { ret NONE_U32; }
+    ret ix;
+}
+
+# four shapes no union cell can hold, each of which must leave its record in memory: an
+# access wider than the cell, an access that is itself an aggregate (which in this IR is
+# an address rather than a value, so there is nothing to reinterpret), a member ordinal
+# past the union's end, and a member that is itself an aggregate
+#
+# Each is a distinct condition, and dropping any one of them splits the record whose case
+# it covers -- the record's alloca is then replaced by its slots, so the count under test
+# moves off 1 and this fails
+test "mach.lang.me.transform.sroa.run:declines_four_shapes_no_cell_can_hold" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    var tgt: resolved.Target;
+    if (ut_target(?reg, ?tgt) != 0) { ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](r64)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r64);
+    val r32: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 32);
+    if (R.is_err[ir_type.IrTypeId, str](r32)) { ir.dnit(?m); ret 1; }
+    val i32t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r32);
+    val r8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
+    if (R.is_err[ir_type.IrTypeId, str](r8)) { ir.dnit(?m); ret 1; }
+    val i8t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r8);
+
+    var pair_fields: [2]ir_type.IrTypeId;
+    pair_fields[0] = i32t;
+    pair_fields[1] = i32t;
+    val rpair: R.Result[ir_type.IrTypeId, str] = ir_type.intern_struct(?m.types, ?pair_fields[0], 2, 0);
+    if (R.is_err[ir_type.IrTypeId, str](rpair)) { ir.dnit(?m); ret 1; }
+    val pair: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rpair);
+
+    # an eight-byte read of a one-byte cell
+    val f_wide: u32 = ut_tagged_probe(?m, i8t, i8t, 0, i64t);
+    if (f_wide == NONE_U32) { ir.dnit(?m); ret 1; }
+    # a read of the cell at an aggregate type, which names an address here, not a value
+    val f_read: u32 = ut_tagged_probe(?m, i64t, i64t, 0, pair);
+    if (f_read == NONE_U32) { ir.dnit(?m); ret 1; }
+    # a member ordinal past a two-member union
+    val f_ord: u32 = ut_tagged_probe(?m, i64t, i64t, 2, i64t);
+    if (f_ord == NONE_U32) { ir.dnit(?m); ret 1; }
+    # a member that is itself a record, which no scalar slot can hold
+    val f_agg: u32 = ut_tagged_probe(?m, pair, i64t, 1, i64t);
+    if (f_agg == NONE_U32) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    val rs: R.Result[bool, str] = run(?m, ?tgt);
+    if (R.is_err[bool, str](rs))         { code = 1; }
+    or { if (R.unwrap_ok[bool, str](rs)) { code = 1; } }
+
+    if (ut_count(?m.functions[f_wide], instruction.OP_ALLOCA) != 1) { code = 1; }
+    if (ut_count(?m.functions[f_read], instruction.OP_ALLOCA) != 1) { code = 1; }
+    if (ut_count(?m.functions[f_ord],  instruction.OP_ALLOCA) != 1) { code = 1; }
+    if (ut_count(?m.functions[f_agg],  instruction.OP_ALLOCA) != 1) { code = 1; }
+
+    ir.dnit(?m);
+    ret code;
+}
+
+# reading a narrow member back is the truncation matching the widening its store used, so
+# the value that comes out is the member's own bits rather than the whole cell's
+#
+# Built over `{i8, uni{i8, ptr}}`, the exact shape `Result[bool, str]` lowers to and the
+# one the compiler is written on. Its narrow member comes FIRST, so a storage type picked
+# member-by-member without noticing the narrowing would land on the `i8` and give an
+# eight-byte cell a one-byte slot -- with no truncation left to name, since the member
+# would then already be the storage type
+#
+# Reinterpreting instead of truncating would be a bit cast between two different widths;
+# this test names the truncation, so dropping either it or the narrowing check fails here
+test "mach.lang.me.transform.sroa.run:reads_a_narrow_member_by_truncation" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    var tgt: resolved.Target;
+    if (ut_target(?reg, ?tgt) != 0) { ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val r8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
+    if (R.is_err[ir_type.IrTypeId, str](r8)) { ir.dnit(?m); ret 1; }
+    val i8t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r8);
+
+    var rec: ir_type.IrTypeId;
+    if (ut_tagged(?m, i8t, ptrt, ?rec) != 0) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    var b: builder.Builder = builder.init(?m);
+    var slot: value.Value;
+    val ix: u32 = ut_open_local(?m, ?b, rec, ?slot);
+    if (ix == NONE_U32) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[ix];
+
+    val gn: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 0);
+    if (R.is_err[value.Value, str](gn)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?b, value.param(0, i8t), R.unwrap_ok[value.Value, str](gn)))) { code = 1; }
+
+    val hn: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 0);
+    if (R.is_err[value.Value, str](hn)) { ir.dnit(?m); ret 1; }
+    val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](hn), i8t);
+    if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+
+    val rs: R.Result[bool, str] = run(?m, ?tgt);
+    if (R.is_err[bool, str](rs))              { code = 1; }
+    if (R.is_err[bool, str](mem2reg.run(?m))) { code = 1; }
+    if (R.is_err[bool, str](dce.run(?m)))     { code = 1; }
+
+    if (ut_count(fn, instruction.OP_ALLOCA) != 0) { code = 1; }
+    val narrow: *instruction.Instruction = ut_def(fn, ut_ret_value(fn));
+    if (narrow == nil) { code = 1; }
+    or {
+        if (narrow.kind != instruction.OP_TRUNC) { code = 1; }
+        if (narrow.ty != i8t)                    { code = 1; }
+    }
+
+    ir.dnit(?m);
+    ret code;
+}
+
+# a gep that reaches a union field and keeps walking keeps the record whole: within the
+# field gep itself, chained onto a member gep, or walking some other aggregate from the
+# field's address. Only a gep naming a member of the union itself resolves to the cell,
+# and the third case is the one that says why -- an ordinal of another type lands
+# somewhere the cell's slot is not
+#
+# Accepting any of the three retargets the gep onto the cell's slot: the first two lose
+# only promotion, the third lands at the wrong address. All three split the record and
+# replace its alloca with two slots, so the count moves off 1 and this fails
 test "mach.lang.me.transform.sroa.run:declines_a_gep_walking_past_a_union_field" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -3092,12 +3255,13 @@ test "mach.lang.me.transform.sroa.run:declines_a_gep_walking_past_a_union_field"
 
     var code: i32 = 0;
     var b: builder.Builder = builder.init(?m);
-    var slot: value.Value;
-    val ix: u32 = ut_open_local(?m, ?b, rec, ?slot);
-    if (ix == NONE_U32) { ir.dnit(?m); ret 1; }
-    val fn: *ir.Function = ?m.functions[ix];
 
-    # `gep s, 0, 1, 0`: the field walk continues into the union within one gep
+    # `gep s, 0, 1, 0`: the walk continues into the union within one gep
+    var slot: value.Value;
+    val ix_one: u32 = ut_open_local(?m, ?b, rec, ?slot);
+    if (ix_one == NONE_U32) { ir.dnit(?m); ret 1; }
+    val fn_one: *ir.Function = ?m.functions[ix_one];
+
     var idx: [3]value.Value;
     idx[0] = value.const_int(0, i64t);
     idx[1] = value.const_int(1, i64t);
@@ -3108,10 +3272,48 @@ test "mach.lang.me.transform.sroa.run:declines_a_gep_walking_past_a_union_field"
     if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
     if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
 
+    # and one chained onto a member gep, which tagging refuses to reach past
+    var slot2: value.Value;
+    val ix_two: u32 = ut_open_local(?m, ?b, rec, ?slot2);
+    if (ix_two == NONE_U32) { ir.dnit(?m); ret 1; }
+    val fn_two: *ir.Function = ?m.functions[ix_two];
+
+    val gm: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot2, rec, 0);
+    if (R.is_err[value.Value, str](gm)) { ir.dnit(?m); ret 1; }
+    val gp: R.Result[value.Value, str] = ut_gep(?b, ?m, R.unwrap_ok[value.Value, str](gm), i64t, 0);
+    if (R.is_err[value.Value, str](gp)) { ir.dnit(?m); ret 1; }
+    val rl2: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](gp), i64t);
+    if (R.is_err[value.Value, str](rl2)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl2)))) { code = 1; }
+
+    # and one that walks a DIFFERENT aggregate from the union field's address: its second
+    # index is an ordinal of that type, so it lands somewhere the cell's slot is not
+    var struct_fields: [2]ir_type.IrTypeId;
+    struct_fields[0] = i64t;
+    struct_fields[1] = i64t;
+    val rother: R.Result[ir_type.IrTypeId, str] = ir_type.intern_struct(?m.types, ?struct_fields[0], 2, 0);
+    if (R.is_err[ir_type.IrTypeId, str](rother)) { ir.dnit(?m); ret 1; }
+    val other: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rother);
+
+    var slot3: value.Value;
+    val ix_three: u32 = ut_open_local(?m, ?b, rec, ?slot3);
+    if (ix_three == NONE_U32) { ir.dnit(?m); ret 1; }
+    val fn_three: *ir.Function = ?m.functions[ix_three];
+
+    val gf: R.Result[value.Value, str] = ut_gep(?b, ?m, slot3, rec, 1);
+    if (R.is_err[value.Value, str](gf)) { ir.dnit(?m); ret 1; }
+    val go: R.Result[value.Value, str] = ut_gep(?b, ?m, R.unwrap_ok[value.Value, str](gf), other, 1);
+    if (R.is_err[value.Value, str](go)) { ir.dnit(?m); ret 1; }
+    val rl3: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](go), i64t);
+    if (R.is_err[value.Value, str](rl3)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl3)))) { code = 1; }
+
     val rs: R.Result[bool, str] = run(?m, ?tgt);
     if (R.is_err[bool, str](rs))         { code = 1; }
     or { if (R.unwrap_ok[bool, str](rs)) { code = 1; } }
-    if (ut_count(fn, instruction.OP_ALLOCA) != 1) { code = 1; }
+    if (ut_count(fn_one, instruction.OP_ALLOCA)   != 1) { code = 1; }
+    if (ut_count(fn_two, instruction.OP_ALLOCA)   != 1) { code = 1; }
+    if (ut_count(fn_three, instruction.OP_ALLOCA) != 1) { code = 1; }
 
     ir.dnit(?m);
     ret code;
