@@ -30,6 +30,11 @@
 #                 execution cannot produce: a vectorizer that silently stops firing
 #                 still computes the right answer, so a run-and-compare case stays
 #                 green while the feature is dead. needs llvm-objdump.
+#   vector-lanes— disassemble the case's own objects and report, per function, whether
+#                 a vector LANE was accessed in a register and whether a whole 128-bit
+#                 vector went to memory (#2236). the same blind spot as vector-emit:
+#                 lane access through a stack round-trip computes the right answer, so
+#                 only the emitted form distinguishes it. needs llvm-objdump.
 #
 # build-fails is a run-mode but not a producer: it asserts the compile is REJECTED
 # and takes the compiler's 'error:' diagnostic as the observable. it is handled in
@@ -397,6 +402,118 @@ vector_emit_scan() {
     '
 }
 
+# produce_vector_lanes <runmode> <target> <binary>
+# disassembles the case's own objects and reports, per function, how a vector LANE
+# was accessed (#2236). Shares produce_vector_emit's object discovery: the case pins
+# `out = "out/int/build"` and the project id comes from its manifest.
+produce_vector_lanes() {
+    bin=$3
+    dir=$(dirname "$(dirname "$(dirname "$bin")")")
+    id=$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/mach.toml" | head -1)
+    if [ -z "$id" ]; then
+        echo "int: vector-lanes: no project id in ${dir}/mach.toml" >&2; return 2
+    fi
+    objdir="$dir/out/int/build/obj/$id"
+    if [ ! -d "$objdir" ]; then
+        echo "int: vector-lanes: no objects at $objdir (the case must pin out = \"out/int/build\")" >&2; return 2
+    fi
+    tool=$(resolve_objdump) || {
+        echo "int: vector-lanes: llvm-objdump not found (install the 'llvm' package)" >&2; return 2
+    }
+    find "$objdir" -name '*.o' | sort | while IFS= read -r o; do
+        "$tool" -d --no-show-raw-insn "$o"
+    done | vector_lanes_scan
+}
+
+# vector_lanes_scan — read a disassembly on stdin, print `<function> lane=<0|1>
+# vecmem=<0|1>` sorted by function, preceded by the ISA the dispatch resolved.
+#
+# The two facts are independent and both matter. `lane` is the win: a scalar left or
+# entered a vector register directly. `vecmem` is the cost it replaces: a whole
+# 128-bit vector moved to or from memory, which before #2236 was the ONLY way to name
+# a lane and which costs a store-to-load forwarding stall on every read.
+#
+#   aarch64 — lane is a lane-indexed operand (`vN.<t>[K]`, what UMOV / DUP-element /
+#             INS render); vecmem is a `qN` memory move (LDR/STR Q).
+#   x86_64  — lane is PEXTR / PINSR (no lane form is selected there yet, so it reads
+#             0 today and flips when x64 opts in); vecmem is MOVUP[SD] / MOVAP[SD] /
+#             MOVDQ[AU].
+#   riscv64 — no 128-bit vector model at all: every vector is scalarized into ordinary
+#             integer loads and stores, so both facts are 0 and that is the target's
+#             own golden, not an exemption.
+vector_lanes_scan() {
+    awk '
+    function demangle(s,   i, len, c, out) {
+        if (substr(s, 1, 2) != "_M") { return s }
+        i = 3
+        out = ""
+        while (i <= length(s)) {
+            c = substr(s, i, 1)
+            if (c == "N") { i++; continue }
+            if (c !~ /[0-9]/) { return s }
+            len = 0
+            while (i <= length(s) && substr(s, i, 1) ~ /[0-9]/) { len = len * 10 + substr(s, i, 1); i++ }
+            out = substr(s, i, len)
+            i += len
+        }
+        if (out == "") { return s }
+        return out
+    }
+    function is_lane(m, rest) {
+        if (isa == "aarch64") { return rest ~ /v[0-9]+\.[bhsd]\[[0-9]+\]/ }
+        if (isa == "x86_64")  { return m ~ /^p(extr|insr)[bwdq]$/ }
+        return 0
+    }
+    function is_vecmem(m, rest) {
+        if (isa == "aarch64") {
+            if (m !~ /^(ldr|str|ldur|stur|ldp|stp)$/) { return 0 }
+            return rest ~ /(^|[ ,])q[0-9]+([ ,]|$)/
+        }
+        if (isa == "x86_64") { return m ~ /^(movup[sd]|movap[sd]|movdq[au])$/ }
+        return 0
+    }
+    /file format/ {
+        if      ($0 ~ /x86-64/)   { isa = "x86_64" }
+        else if ($0 ~ /aarch64/)  { isa = "aarch64" }
+        else if ($0 ~ /riscv/)    { isa = "riscv64" }
+        else                      { bad = $0 }
+        next
+    }
+    /^[0-9a-f]+ <.*>:$/ {
+        sym = $0
+        sub(/^[0-9a-f]+ </, "", sym)
+        sub(/>:$/, "", sym)
+        sym = demangle(sym)
+        if (!(sym in lane)) { names[++n] = sym; lane[sym] = 0; vecmem[sym] = 0 }
+        cur = sym
+        next
+    }
+    cur != "" && /^[[:space:]]*[0-9a-f]+:/ {
+        line = $0
+        sub(/^[[:space:]]*[0-9a-f]+:[[:space:]]*/, "", line)
+        split(line, f, /[[:space:]]+/)
+        rest = line
+        sub(/^[^[:space:]]+[[:space:]]*/, "", rest)
+        if (is_lane(f[1], rest))   { lane[cur] = 1 }
+        if (is_vecmem(f[1], rest)) { vecmem[cur] = 1 }
+    }
+    END {
+        if (bad != "") { print "int: vector-lanes: unrecognized object format (" bad ")" > "/dev/stderr"; exit 2 }
+        # insertion-sort the names so the observable does not depend on emission order
+        for (i = 2; i <= n; i++) {
+            k = names[i]
+            j = i - 1
+            while (j >= 1 && names[j] > k) { names[j + 1] = names[j]; j-- }
+            names[j + 1] = k
+        }
+        print "arch=" isa
+        for (i = 1; i <= n; i++) {
+            print names[i] " lane=" lane[names[i]] " vecmem=" vecmem[names[i]]
+        }
+    }
+    '
+}
+
 # produce <run> <runmode> <target> <binary> [<g_binary>]
 # dispatches to the producer named by <run>, forwarding the remaining arguments. the
 # debuginfo producer takes an extra `-g` artifact path run.sh built alongside the
@@ -413,6 +530,7 @@ produce() {
         built)       produce_built "$@" ;;
         debuginfo)   produce_debuginfo "$@" ;;
         vector-emit) produce_vector_emit "$@" ;;
+        vector-lanes) produce_vector_lanes "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
 }
