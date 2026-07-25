@@ -1,20 +1,23 @@
-# width legalization: rewrite wider-than-native MIR into native-width sequences
+# width legalization: rewrite MIR the target's ALU cannot execute into native
+# sequences
 #
 # A shared backend pass that runs between MIR lowering (`mir.lower_ir`) and
-# instruction selection (`isel.run`). It reads one declared machine fact - the
+# instruction selection (`isel.run`). It reads two declared machine facts - the
 # target's `MachineModel.max_alu_width` (the widest integer operation the ISA
-# computes in one native step, in bytes) - and rewrites every scalar MIR
-# instruction wider than it into a sequence of native-width instructions, so
-# selection and the encoder never see an operation the ISA cannot realize
-# directly. It is the wide-integer analogue of the middle end's `scalarize` pass
-# (which legalizes vectors before codegen): scalarize splits a 128-bit vector
-# into lane scalars, this splits a wide scalar into native-width byte lanes.
+# computes in one native step, in bytes) and `MachineModel.has_var_shift` (whether
+# the ISA shifts by a runtime count at all) - and rewrites every scalar MIR
+# instruction they say the ISA cannot realize into a sequence of native ones, so
+# selection and the encoder never see such an operation. It is the wide-integer
+# analogue of the middle end's `scalarize` pass (which legalizes vectors before
+# codegen): scalarize splits a 128-bit vector into lane scalars, this splits a wide
+# scalar into native-width byte lanes.
 #
-# THE INERTNESS CONTRACT. Every 64-bit target declares `max_alu_width = 8`, and
-# the language's widest scalar is 64-bit (pointers included), so on x86-64 /
-# aarch64 / riscv64 no scalar instruction is ever wider than the native ALU. The
-# pass proves this per function with a single pre-scan (`function_needs_legalize`)
-# and, when nothing exceeds the native width, RETURNS HAVING TOUCHED NOTHING - no
+# THE INERTNESS CONTRACT. Every 64-bit target declares `max_alu_width = 8` and
+# `has_var_shift = true`, and the language's widest scalar is 64-bit (pointers
+# included), so on x86-64 / aarch64 / riscv64 no scalar instruction is ever wider
+# than the native ALU and no shift is ever one the ISA lacks. The pass proves this
+# per function with a single pre-scan (`function_needs_legalize`) and, when nothing
+# needs legalizing, RETURNS HAVING TOUCHED NOTHING - no
 # allocation, no vreg added, no block rebuilt. The output is therefore byte-
 # identical to a build without this pass on every wide-native target; only a
 # target that declares a narrow ALU (the 8-bit mos6502 declares 1) drives the
@@ -40,6 +43,17 @@
 # forced into the selection rule engine, because they are width-driven and
 # target-blind - the same expansion serves any ISA that declares a narrow ALU.
 #
+# THE SHIFT IS BOTH. A constant-count shift is a pure TEMPLATE - a lane renaming plus
+# a fixed number of native shifts, with the bits that cross a lane boundary supplied
+# by the neighbour - and needs no more machinery than the bitwise ops do. A
+# RUNTIME-count shift is an ALGORITHM: a masked barrel over log2(width) stages, each
+# deciding arithmetically (not by branching) whether to apply a constant-distance
+# shift. Both are straight-line, so neither needs the control flow a variable shift
+# was long assumed to require, and the barrel is fixed-cycle by construction. The
+# pass owns EVERY shift on a machine declaring `has_var_shift = false`, including
+# normalizing an out-of-range count to the operation width, so the backend below it
+# only ever sees a native shift at a constant in-range count.
+#
 # THE ADDRESS IS A VALUE TOO. A target whose registers are narrower than an address
 # (mos6502: 8-bit registers, 16-bit pointers) cannot hold a runtime pointer in one
 # register either, so a memory access through one is legalized as well - at ANY
@@ -54,8 +68,8 @@
 #
 # UNSUPPORTED WIDE OPERATIONS fail loudly and specifically (never silently), the
 # same discipline the vector path uses for an unimplemented lane op: a wide
-# multiply by a non-constant, any wide divide / remainder, a variable-count wide
-# shift, a wide floating-point op, and any other operation carrying a
+# multiply by a non-constant, any wide divide / remainder, a wide floating-point op,
+# a shift at a width that is not a power of two, and any other operation carrying a
 # runtime-pointer memory operand are rejected with a diagnostic naming the
 # operation and width.
 
@@ -82,6 +96,8 @@ use target: mach.lang.target.resolved;
 # ---
 # lane_width: the native ALU width in bytes (`model.max_alu_width`); one lane
 # ptr_width:  an address's byte width (`model.pointer_width`)
+# var_shift:  whether the ISA shifts by a RUNTIME count at all
+#             (`model.has_var_shift`); false hands this pass every shift
 # stage_lo:   low half of the backend's reserved address-staging register pair
 #             (`RegMachine.scratch_reg`), the fixed base a runtime-pointer access
 #             is decomposed at
@@ -89,6 +105,7 @@ use target: mach.lang.target.resolved;
 rec Machine {
     lane_width: u8;
     ptr_width:  u8;
+    var_shift:  bool;
     stage_lo:   i32;
     stage_hi:   i32;
 }
@@ -141,6 +158,7 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
     var mach: Machine;
     mach.lane_width = maw::u8;
     mach.ptr_width  = tgt.model.pointer_width::u8;
+    mach.var_shift  = tgt.model.has_var_shift;
     mach.stage_lo   = -1;
     mach.stage_hi   = -1;
     # a register machine declares the reserved scratch pair; a whole-module emitter
@@ -159,23 +177,21 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
     ret R.ok[bool, str](true);
 }
 
-# whether any scalar instruction of the function is wider than the native ALU
+# whether any scalar instruction of the function needs legalizing
 #
-# The inertness gate: an instruction needs legalization when its operation width
-# or its source width exceeds `maw` and it is not a 128-bit vector op (which the
-# vector path owns). When this returns false the function is returned untouched -
+# The inertness gate: when this returns false the function is returned untouched -
 # no allocation, no mutation - so a wide-native target's output is byte-identical.
 # ---
 # f:    the MIR function to scan
-# mach: the machine facts (native lane width, pointer width)
-# ret:  true when some scalar instruction exceeds the native width
+# mach: the machine facts (native lane width, pointer width, shift capability)
+# ret:  true when some scalar instruction needs legalization
 fun function_needs_legalize(f: *mir.MirFunction, mach: *Machine) bool {
     var bi: u32 = 0;
     for (bi < f.block_count) {
         val b: *mir.MirBlock = ?f.blocks[bi];
         var ii: u32 = 0;
         for (ii < b.instr_count) {
-            if (instr_is_wide(f, ?b.instrs[ii], mach)) { ret true; }
+            if (instr_needs_legalize(f, ?b.instrs[ii], mach)) { ret true; }
             ii = ii + 1;
         }
         bi = bi + 1;
@@ -183,8 +199,9 @@ fun function_needs_legalize(f: *mir.MirFunction, mach: *Machine) bool {
     ret false;
 }
 
-# whether one SCALAR instruction operates wider than the native ALU, or reaches
-# memory through an address wider than one register
+# whether one SCALAR instruction operates wider than the native ALU, reaches memory
+# through an address wider than one register, or is a shift the ISA has no
+# instruction for
 #
 # A 128-bit vector instruction is never legalized here - it is the vector path's
 # concern (scalarized or selected in the middle end / vector isel). vec_lane is
@@ -197,15 +214,32 @@ fun function_needs_legalize(f: *mir.MirFunction, mach: *Machine) bool {
 # defining instruction is replaced by lane moves and a base left naming it would
 # name nothing. On every wide-native target the pointer is a machine word, the
 # clause is dead, and the gate is exactly the width test it always was.
+#
+# The SHIFT clause is what makes this pass the sole owner of shifts on a machine
+# declaring `has_var_shift = false` (#2217). It admits EVERY shift there, not just a
+# wide or a runtime-count one, because the pass then also owns normalizing the count
+# to the operation width - and a normalization that fired only sometimes would leave
+# the encoder needing the same rule anyway. A native shift at an in-range constant
+# count rewrites to itself, so the clause costs nothing where nothing is needed. On an
+# ISA with a variable shift the clause is dead and the gate is the width test alone.
 # ---
 # f:    the MIR function (for vreg classes / the vector flag)
 # mi:   the instruction to test
-# mach: the machine facts (native lane width, pointer width)
+# mach: the machine facts (native lane width, pointer width, shift capability)
 # ret:  true when the instruction needs legalization
-fun instr_is_wide(f: *mir.MirFunction, mi: *mir.MirInstr, mach: *Machine) bool {
+fun instr_needs_legalize(f: *mir.MirFunction, mi: *mir.MirInstr, mach: *Machine) bool {
     if (instr_is_vector(f, mi)) { ret false; }
     if (mi.width > mach.lane_width || mi.src_width > mach.lane_width) { ret true; }
+    if (!mach.var_shift && is_shift(mi.opcode)) { ret true; }
     ret mach.ptr_width > mach.lane_width && instr_has_value_base(mi);
+}
+
+# whether an opcode is one of the three integer shifts
+# ---
+# op:  the opcode to classify
+# ret: true for a left, logical-right, or arithmetic-right shift
+fun is_shift(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_SHL || op == mir.MIR_SHR_U || op == mir.MIR_SHR_S;
 }
 
 # whether the instruction carries a memory operand based on a value vreg
@@ -425,7 +459,7 @@ fun legalize_block(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, b:
     var i: u32 = 0;
     for (i < n) {
         val mi: *mir.MirInstr = ?b.instrs[i];
-        if (instr_is_wide(f, mi, ?plan.mach)) {
+        if (instr_needs_legalize(f, mi, ?plan.mach)) {
             val res_c: R.Result[u32, str] = expansion_count(plan, mi);
             if (R.is_err[u32, str](res_c)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_c)); }
             total = total + R.unwrap_ok[u32, str](res_c);
@@ -445,7 +479,7 @@ fun legalize_block(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, b:
     i = 0;
     for (i < n) {
         val mi: *mir.MirInstr = ?b.instrs[i];
-        if (instr_is_wide(f, mi, ?plan.mach)) {
+        if (instr_needs_legalize(f, mi, ?plan.mach)) {
             val res_e: R.Result[bool, str] = expand_instr(alloc, plan, f, mi, dst, ?w);
             if (R.is_err[bool, str](res_e)) {
                 # the pieces already written into dst own fresh operand copies; free
@@ -531,6 +565,7 @@ fun expansion_count(plan: *LanePlan, mi: *mir.MirInstr) R.Result[u32, str] {
     if (op == mir.MIR_AND || op == mir.MIR_OR || op == mir.MIR_XOR || op == mir.MIR_NOT) {
         ret R.ok[u32, str](nl);
     }
+    if (is_shift(op)) { ret shift_piece_count(plan, mi); }
     # a declassify is a move plus a compile-time barrier; it legalizes exactly like a
     # move (the barrier matters only on the pre-legalize lowered MIR the #1648 re-derive
     # reads). legalize runs before isel, so it sees the un-retagged MIR_DECLASSIFY (#1646).
@@ -738,6 +773,9 @@ fun expand_instr(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: 
     }
     if (op == mir.MIR_NOT) {
         ret expand_not(alloc, plan, mi, dst, cursor);
+    }
+    if (is_shift(op)) {
+        ret expand_shift(alloc, plan, f, mi, dst, cursor);
     }
     if (op == mir.MIR_MOV || op == mir.MIR_DECLASSIFY) {
         ret expand_mov(alloc, plan, mi, dst, cursor);
@@ -1058,6 +1096,516 @@ fun expand_neg(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *m
     ret expand_addsub(alloc, plan, f, ?sub, dst, cursor, true);
 }
 
+# the largest lane count a shift expansion works over: the language's widest scalar
+# (8 bytes) over the narrowest lane a machine can declare (1 byte)
+val MAX_SHIFT_LANES: u32 = 8;
+
+# what one destination lane of a constant-count shift is built from
+#
+# `k` whole lanes plus `r` bits is the count, so a destination lane is fed by the two
+# source lanes that straddle it: one contributes its shifted-in-range bits, the
+# neighbour the bits that crossed the lane boundary. The neighbour drops out at the
+# ends of the value, where the fill takes its place.
+val SL_FILL: u32 = 0;  # the fill byte alone (zero, or an arithmetic shift's sign fill)
+val SL_COPY: u32 = 1;  # one whole source lane, unshifted (the count is a lane multiple)
+val SL_ONE:  u32 = 2;  # one source lane shifted within itself, nothing crossing in
+val SL_SIGN: u32 = 3;  # the TOP lane of an arithmetic right shift, shifted arithmetically
+val SL_TWO:  u32 = 4;  # two lanes shifted opposite ways and OR'd together
+
+# classify destination lane `i` of a constant-count shift
+#
+# The single place the lane algebra is stated, so the piece COUNT and the piece EMIT
+# cannot disagree about what a lane costs - the contract `expansion_count` and
+# `expand_instr` owe each other.
+# ---
+# nl:    the operation's lane count
+# k:     whole lanes of the count
+# r:     bits of the count beyond `k` lanes, in [0, lane bits)
+# left:  true for a left shift, false for either right shift
+# arith: true for an arithmetic right shift (the fill is the sign, not zero)
+# i:     the destination lane
+# a_out: receives the source lane supplying the in-range bits, or -1
+# b_out: receives the neighbour lane, -1 for the fill operand
+# ret:   the SL_* kind
+fun shift_lane_kind(nl: u32, k: u32, r: u32, left: bool, arith: bool, i: u32,
+                    a_out: *i32, b_out: *i32) u32 {
+    @a_out = -1;
+    @b_out = -1;
+    if (left) {
+        if (i < k) { ret SL_FILL; }
+        val a: i32 = i::i32 - k::i32;
+        @a_out = a;
+        if (r == 0) { ret SL_COPY; }
+        # below lane 0 a left shift shifts in zeros, so the neighbour drops out.
+        if (a == 0) { ret SL_ONE; }
+        @b_out = a - 1;
+        ret SL_TWO;
+    }
+    val a: i32 = i::i32 + k::i32;
+    if (a >= nl::i32) { ret SL_FILL; }
+    @a_out = a;
+    if (r == 0) { ret SL_COPY; }
+    if (a + 1 >= nl::i32) {
+        # nothing crosses into the top source lane from above: a logical shift fills it
+        # with zeros, and an arithmetic one fills it with its OWN sign - which is what a
+        # native arithmetic shift of that lane already does. Neither costs a second
+        # operand, so neither needs the fill.
+        if (arith) { ret SL_SIGN; }
+        ret SL_ONE;
+    }
+    @b_out = a + 1;
+    ret SL_TWO;
+}
+
+# the native-width pieces one classified destination lane costs
+# ---
+# kind: the SL_* classification
+# ret:  the piece count
+fun shift_kind_pieces(kind: u32) u32 {
+    if (kind == SL_TWO) { ret 3; }
+    ret 1;
+}
+
+# the native-width pieces a whole constant-count shift template costs
+# ---
+# nl:    the operation's lane count
+# k:     whole lanes of the count
+# r:     bits of the count beyond `k` lanes
+# left:  true for a left shift
+# arith: true for an arithmetic right shift
+# ret:   the exact piece count
+fun const_shift_pieces(nl: u32, k: u32, r: u32, left: bool, arith: bool) u32 {
+    var total: u32 = 0;
+    var i: u32 = 0;
+    for (i < nl) {
+        var a: i32 = 0;
+        var b: i32 = 0;
+        total = total + shift_kind_pieces(shift_lane_kind(nl, k, r, left, arith, i, ?a, ?b));
+        i = i + 1;
+    }
+    ret total;
+}
+
+# whether an arithmetic right shift by `k` whole lanes plus `r` bits needs the sign
+# fill materialized
+#
+# Only a destination lane fed ENTIRELY from above the value reads it, and that happens
+# exactly when the count reaches a whole lane. Below that the top lane's own arithmetic
+# shift supplies the sign, so no fill byte is built at all.
+# ---
+# arith: true for an arithmetic right shift
+# k:     whole lanes of the count
+# ret:   true when the expansion must materialize the sign fill
+fun needs_sign_fill(arith: bool, k: u32) bool {
+    ret arith && k > 0;
+}
+
+# the number of masked-barrel stages a shift at `bits` wide needs
+#
+# One stage per bit of the count, so the barrel covers every count in [0, bits) - which
+# is log2(bits). Returns 0 when `bits` is not a power of two, a width the barrel has no
+# meaning for; a lane is at least one byte so `bits` is at least 8 and a real answer is
+# never 0.
+# ---
+# bits: the operation width in bits
+# ret:  the stage count, or 0 when `bits` is not a power of two
+fun shift_stage_count(bits: u32) u32 {
+    if (bits == 0) { ret 0; }
+    var s: u32 = 0;
+    var w: u32 = bits;
+    for (w > 1) {
+        if ((w & 1) != 0) { ret 0; }
+        w = w >> 1;
+        s = s + 1;
+    }
+    ret s;
+}
+
+# the exact piece count of a shift's expansion, or a loud error
+#
+# Rejects the shapes the expansion cannot realize before any block is rebuilt: an
+# operand that is neither lane-split, an immediate, nor a physical register, a lane
+# count past what a scalar can span, and an operation width that is not a power of two
+# (which the barrel's count masking has no meaning for).
+# ---
+# plan: the function's lane assignment
+# mi:   the shift instruction
+# ret:  the exact piece count, or an error naming the unsupported shape
+fun shift_piece_count(plan: *LanePlan, mi: *mir.MirInstr) R.Result[u32, str] {
+    val nl: u32 = wide_lane_count(plan, mi);
+    if (mi.operand_count != 3 || nl > MAX_SHIFT_LANES) {
+        ret R.err[u32, str](unsupported_message(mi.opcode, mi.width));
+    }
+    # the destination and the shifted value span every lane; the COUNT is read out of
+    # its low lane alone, since the barrel needs only log2(width) of its bits.
+    if (mi.operands[0].kind != mir.MIR_OP_VREG ||
+        !operand_is_lane_ready(plan, ?mi.operands[0], nl) ||
+        !operand_is_lane_ready(plan, ?mi.operands[1], nl) ||
+        !operand_is_lane_ready(plan, ?mi.operands[2], 1)) {
+        ret R.err[u32, str](unsupported_message(mi.opcode, mi.width));
+    }
+
+    val lb:   u32 = plan.lane_width::u32 * 8;
+    val bits: u32 = nl * lb;
+    val stages: u32 = shift_stage_count(bits);
+    if (stages == 0) {
+        ret R.err[u32, str]("legalize: a shift at a width that is not a power of two is unsupported on this target");
+    }
+
+    val left:  bool = mi.opcode == mir.MIR_SHL;
+    val arith: bool = mi.opcode == mir.MIR_SHR_S;
+
+    if (mi.operands[2].kind == mir.MIR_OP_IMM) {
+        val c: u32 = (mi.operands[2].imm & (bits - 1)::i64)::u32;
+        var total: u32 = const_shift_pieces(nl, c / lb, c % lb, left, arith);
+        if (needs_sign_fill(arith, c / lb)) { total = total + 1; }
+        ret R.ok[u32, str](total);
+    }
+
+    # the masked barrel: per stage, the count bit, the 0 / -1 mask it becomes, the
+    # constant-distance shift of the running value, and the branchless lane select.
+    var total: u32 = 0;
+    # a stage shifting by a whole lane or more reads the sign fill, so a multi-lane
+    # arithmetic barrel materializes it once for every stage.
+    if (arith && nl > 1) { total = 1; }
+    var j: u32 = 0;
+    for (j < stages) {
+        if (j == 0) { total = total + 1; }
+        or          { total = total + 2; }
+        total = total + 1;
+        val c: u32 = 1 << j;
+        total = total + const_shift_pieces(nl, c / lb, c % lb, left, arith);
+        total = total + 3 * nl;
+        j = j + 1;
+    }
+    ret R.ok[u32, str](total);
+}
+
+# emit one native two-operand piece `d = a` (a lane move)
+fun emit_copy(alloc: *A.Allocator, dst: *mir.MirInstr, cursor: *u32, src: *mir.MirInstr,
+              d: mir.MirOperand, a: mir.MirOperand, w: u8) R.Result[bool, str] {
+    var ops: [2]mir.MirOperand;
+    ops[0] = d;
+    ops[1] = a;
+    ret emit_piece(alloc, dst, cursor, src, mir.MIR_MOV, ?ops[0], 2, w);
+}
+
+# emit `out[] = in[] shifted by a CONSTANT count`, one native piece per classified lane
+#
+# The template half of the shift work: a count of `k` whole lanes plus `r` bits is a
+# lane renaming (free - it only changes which source lane a destination lane names)
+# plus, when `r` is non-zero, one native shift per contributing lane and an OR to join
+# the two that straddle each destination lane. No control flow, no carry chain: unlike
+# add, a shift's lanes do not depend on one another's results.
+#
+# THE LANE WALK ORDER IS LOAD-BEARING. A left shift reads LOWER lanes than it writes and
+# a right shift reads higher ones, so walking the destination from the top for a left
+# shift and from the bottom for a right one guarantees a written lane is never a source
+# some later lane still needs - which is what lets `in` and `out` be the same storage.
+# ---
+# alloc:        backing allocator for piece operand arrays and lane temporaries
+# f:            the MIR function (for appending temporaries)
+# src:          the shift being replaced (source of loc / inline_site)
+# dst:          the rebuilt instruction array
+# cursor:       next write index into `dst`; advanced past the emitted pieces
+# in_ops:       the `nl` source lane operands
+# out_ops:      the `nl` destination lane operands
+# nl:           the lane count
+# lw:           the native lane width in bytes
+# k:      whole lanes of the count
+# r:      bits of the count beyond `k` lanes
+# left:   true for a left shift
+# arith:  true for an arithmetic right shift
+# fill:   the operand shifted in past the end of the value (read only when `arith`
+#         and the count reaches a whole lane)
+# ret:    ok(true) on success, or an allocation error
+fun emit_const_shift(alloc: *A.Allocator, f: *mir.MirFunction, src: *mir.MirInstr,
+                     dst: *mir.MirInstr, cursor: *u32,
+                     in_ops: *mir.MirOperand, out_ops: *mir.MirOperand, nl: u32, lw: u8,
+                     k: u32, r: u32, left: bool, arith: bool,
+                     fill: mir.MirOperand) R.Result[bool, str] {
+    val lb: u32 = lw::u32 * 8;
+    var step: i32 = 1;
+    var i:    i32 = 0;
+    if (left) {
+        i    = nl::i32 - 1;
+        step = -1;
+    }
+    for (i >= 0 && i < nl::i32) {
+        var a: i32 = 0;
+        var b: i32 = 0;
+        val kind: u32 = shift_lane_kind(nl, k, r, left, arith, i::u32, ?a, ?b);
+        val out:  mir.MirOperand = out_ops[i::u32];
+
+        if (kind == SL_FILL) {
+            val r1: R.Result[bool, str] = emit_copy(alloc, dst, cursor, src, out, fill, lw);
+            if (R.is_err[bool, str](r1)) { ret r1; }
+        }
+        or (kind == SL_COPY) {
+            val r1: R.Result[bool, str] = emit_copy(alloc, dst, cursor, src, out, in_ops[a::u32], lw);
+            if (R.is_err[bool, str](r1)) { ret r1; }
+        }
+        or (kind == SL_ONE || kind == SL_SIGN) {
+            var one: mir.MirOpcode = mir.MIR_SHR_U;
+            if (left)            { one = mir.MIR_SHL; }
+            or (kind == SL_SIGN) { one = mir.MIR_SHR_S; }
+            val r1: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, one, out,
+                                                   in_ops[a::u32], mir.op_imm(r::i64), lw);
+            if (R.is_err[bool, str](r1)) { ret r1; }
+        }
+        or {
+            # the two straddling lanes: the in-range bits of one, the crossing bits of
+            # the neighbour (or of the fill, when the neighbour is past the end).
+            var nb: mir.MirOperand = fill;
+            if (b >= 0) { nb = in_ops[b::u32]; }
+
+            val rt1: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](rt1)) { ret R.err[bool, str](R.unwrap_err[u32, str](rt1)); }
+            val t1: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rt1));
+            val rt2: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](rt2)) { ret R.err[bool, str](R.unwrap_err[u32, str](rt2)); }
+            val t2: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rt2));
+
+            var main_op:  mir.MirOpcode = mir.MIR_SHR_U;
+            var cross_op: mir.MirOpcode = mir.MIR_SHL;
+            if (left) { main_op = mir.MIR_SHL; cross_op = mir.MIR_SHR_U; }
+
+            val r1: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, main_op, t1,
+                                                   in_ops[a::u32], mir.op_imm(r::i64), lw);
+            if (R.is_err[bool, str](r1)) { ret r1; }
+            val r2: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, cross_op, t2,
+                                                   nb, mir.op_imm((lb - r)::i64), lw);
+            if (R.is_err[bool, str](r2)) { ret r2; }
+            val r3: R.Result[bool, str] = emit_bin(alloc, dst, cursor, src, mir.MIR_OR, out, t1, t2, lw);
+            if (R.is_err[bool, str](r3)) { ret r3; }
+        }
+        i = i + step;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# emit an arithmetic shift's SIGN FILL: `$00` or `$FF` from the top lane's sign bit
+#
+# A native arithmetic shift of the top lane by one bit less than a lane replicates its
+# sign bit across the whole lane, which is exactly the byte that shifts in past the top
+# of the value. One piece, and one for the whole expansion: an arithmetic right shift
+# never changes the sign of what it shifts, so the barrel's every stage reuses it.
+# ---
+# alloc:  backing allocator for the piece's operand array and the fill vreg
+# f:      the MIR function (for appending the fill vreg)
+# src:    the shift being replaced (source of loc / inline_site)
+# dst:    the rebuilt instruction array
+# cursor: next write index into `dst`; advanced past the emitted piece
+# top:    the value's top lane operand
+# lw:     the native lane width in bytes
+# out:    receives the fill operand
+# ret:    ok(true) on success, or an allocation error
+fun emit_sign_fill(alloc: *A.Allocator, f: *mir.MirFunction, src: *mir.MirInstr,
+                   dst: *mir.MirInstr, cursor: *u32, top: mir.MirOperand, lw: u8,
+                   out: *mir.MirOperand) R.Result[bool, str] {
+    val rv: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](rv)) { ret R.err[bool, str](R.unwrap_err[u32, str](rv)); }
+    @out = mir.op_vreg(R.unwrap_ok[u32, str](rv));
+    ret emit_bin(alloc, dst, cursor, src, mir.MIR_SHR_S, @out, top,
+                 mir.op_imm((lw::u32 * 8 - 1)::i64), lw);
+}
+
+# expand a shift into native-width pieces
+#
+# A CONSTANT count is a pure template (`emit_const_shift`); a RUNTIME count is a masked
+# barrel over that template (`emit_shift_barrel`). Neither needs control flow, which is
+# the thing this expansion was long assumed to require.
+#
+# THE COUNT IS TAKEN MODULO THE OPERATION WIDTH. A count at or past the width has no
+# target-independent answer - the middle end declines to fold one for exactly that
+# reason - so each target defines it, and the definition here is the one the barrel
+# gives for free: it reads log2(width) bits of the count and ignores the rest. That is
+# also what the three wide-native ISAs do at their machine width (x86-64 masks a shift
+# count to 5 or 6 bits, aarch64 and rv64 likewise), so the constant path masks to match
+# rather than answering differently from the runtime path on the same target.
+# ---
+# alloc:  backing allocator for piece operand arrays and lane temporaries
+# plan:   the function's lane assignment
+# f:      the MIR function (for appending temporaries)
+# mi:     the shift instruction to expand
+# dst:    the rebuilt instruction array
+# cursor: next write index into `dst`; advanced past the emitted pieces
+# ret:    ok(true) on success, or an error naming the unsupported shape
+fun expand_shift(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
+                 dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
+    val rc: R.Result[u32, str] = shift_piece_count(plan, mi);
+    if (R.is_err[u32, str](rc)) { ret R.err[bool, str](R.unwrap_err[u32, str](rc)); }
+
+    val nl: u32 = wide_lane_count(plan, mi);
+    val lw: u8  = plan.lane_width;
+    val lb: u32 = lw::u32 * 8;
+    val bits: u32 = nl * lb;
+    val left:  bool = mi.opcode == mir.MIR_SHL;
+    val arith: bool = mi.opcode == mir.MIR_SHR_S;
+
+    var src_ops: [MAX_SHIFT_LANES]mir.MirOperand;
+    var dst_ops: [MAX_SHIFT_LANES]mir.MirOperand;
+    var i: u32 = 0;
+    for (i < nl) {
+        src_ops[i] = lane_operand(plan, ?mi.operands[1], i);
+        dst_ops[i] = lane_operand(plan, ?mi.operands[0], i);
+        i = i + 1;
+    }
+
+    if (mi.operands[2].kind == mir.MIR_OP_IMM) {
+        val c: u32 = (mi.operands[2].imm & (bits - 1)::i64)::u32;
+        var fill: mir.MirOperand = mir.op_imm(0);
+        if (needs_sign_fill(arith, c / lb)) {
+            val rf: R.Result[bool, str] = emit_sign_fill(alloc, f, mi, dst, cursor,
+                                                         src_ops[nl - 1], lw, ?fill);
+            if (R.is_err[bool, str](rf)) { ret rf; }
+        }
+        ret emit_const_shift(alloc, f, mi, dst, cursor, ?src_ops[0], ?dst_ops[0], nl, lw,
+                             c / lb, c % lb, left, arith, fill);
+    }
+
+    ret emit_shift_barrel(alloc, plan, f, mi, dst, cursor, ?src_ops[0], ?dst_ops[0], nl, lw, left, arith);
+}
+
+# expand a RUNTIME-count shift into a straight-line masked barrel
+#
+# The classical barrel-shifter emulation, and the reason this expansion needs no loop
+# and no jump table. The count's bit `j` decides whether the running value is shifted a
+# further `2^j` places, and that decision is made ARITHMETICALLY rather than by
+# branching:
+#
+#   bit    = (count >> j) & 1        a constant-count shift, so the template covers it
+#   mask   = 0 - bit                 all-ones when the bit is set, all-zeros when not
+#   sh     = value shifted by 2^j    a constant distance, so again the template
+#   value  = value ^ ((value ^ sh) & mask)
+#
+# Every operand is fixed-cost and there is no branch, so the whole sequence runs in ONE
+# cycle count for every value AND every count. A jump table over the count would be
+# cheaper on average but its cost would track the count, and a loop's would too; the
+# masked form is the shape that stays safe when the count becomes secret, and is what
+# lets this pass emit a variable shift at all without the control flow it cannot build.
+#
+# The cost is honest rather than cheap - on a byte-lane machine a `u16` shift is 49
+# native pieces, a `u32` one 112 and a `u64` one 251 - which is what a constant-time
+# variable shift costs on an 8-bit machine.
+# ---
+# alloc:   backing allocator for piece operand arrays and lane temporaries
+# plan:    the function's lane assignment
+# f:       the MIR function (for appending temporaries)
+# mi:      the shift instruction being replaced
+# dst:     the rebuilt instruction array
+# cursor:  next write index into `dst`; advanced past the emitted pieces
+# src_ops: the `nl` source lane operands
+# dst_ops: the `nl` destination lane operands
+# nl:      the lane count
+# lw:      the native lane width in bytes
+# left:    true for a left shift
+# arith:   true for an arithmetic right shift (a non-zero fill)
+# ret:     ok(true) on success, or an allocation error
+fun emit_shift_barrel(alloc: *A.Allocator, plan: *LanePlan, f: *mir.MirFunction, mi: *mir.MirInstr,
+                      dst: *mir.MirInstr, cursor: *u32,
+                      src_ops: *mir.MirOperand, dst_ops: *mir.MirOperand, nl: u32, lw: u8,
+                      left: bool, arith: bool) R.Result[bool, str] {
+    val lb:     u32 = lw::u32 * 8;
+    val stages: u32 = shift_stage_count(nl * lb);
+    # only the count's low lane is read: log2(width) bits never reach past one lane.
+    val cnt: mir.MirOperand = lane_operand(plan, ?mi.operands[2], 0);
+
+    var fill: mir.MirOperand = mir.op_imm(0);
+    # a single-lane arithmetic barrel never shifts by a whole lane, so it never reads
+    # the fill and never builds one.
+    if (arith && nl > 1) {
+        val rf: R.Result[bool, str] = emit_sign_fill(alloc, f, mi, dst, cursor,
+                                                     src_ops[nl - 1], lw, ?fill);
+        if (R.is_err[bool, str](rf)) { ret rf; }
+    }
+
+    var cur: [MAX_SHIFT_LANES]mir.MirOperand;
+    var sh:  [MAX_SHIFT_LANES]mir.MirOperand;
+    var nxt: [MAX_SHIFT_LANES]mir.MirOperand;
+    var i: u32 = 0;
+    for (i < nl) { cur[i] = src_ops[i]; i = i + 1; }
+
+    var j: u32 = 0;
+    for (j < stages) {
+        # the count's bit `j`, isolated into a 0 / 1 byte.
+        var bit_src: mir.MirOperand = cnt;
+        if (j > 0) {
+            val rt: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](rt)) { ret R.err[bool, str](R.unwrap_err[u32, str](rt)); }
+            bit_src = mir.op_vreg(R.unwrap_ok[u32, str](rt));
+            val r1: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_SHR_U,
+                                                   bit_src, cnt, mir.op_imm(j::i64), lw);
+            if (R.is_err[bool, str](r1)) { ret r1; }
+        }
+        val rb: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rb)) { ret R.err[bool, str](R.unwrap_err[u32, str](rb)); }
+        val bit: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rb));
+        val r2: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_AND, bit,
+                                               bit_src, mir.op_imm(1), lw);
+        if (R.is_err[bool, str](r2)) { ret r2; }
+
+        # `0 - bit` is all-ones exactly when the bit is set: the select's mask.
+        val rm: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](rm)) { ret R.err[bool, str](R.unwrap_err[u32, str](rm)); }
+        val mask: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rm));
+        val r3: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_SUB, mask,
+                                               mir.op_imm(0), bit, lw);
+        if (R.is_err[bool, str](r3)) { ret r3; }
+
+        i = 0;
+        for (i < nl) {
+            val rs: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](rs)) { ret R.err[bool, str](R.unwrap_err[u32, str](rs)); }
+            sh[i] = mir.op_vreg(R.unwrap_ok[u32, str](rs));
+            i = i + 1;
+        }
+        val c: u32 = 1 << j;
+        val r4: R.Result[bool, str] = emit_const_shift(alloc, f, mi, dst, cursor, ?cur[0], ?sh[0],
+                                                       nl, lw, c / lb, c % lb, left, arith, fill);
+        if (R.is_err[bool, str](r4)) { ret r4; }
+
+        # the last stage lands in the destination lanes; the rest in fresh running ones.
+        if (j == stages - 1) {
+            i = 0;
+            for (i < nl) { nxt[i] = dst_ops[i]; i = i + 1; }
+        }
+        or {
+            i = 0;
+            for (i < nl) {
+                val rn: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+                if (R.is_err[u32, str](rn)) { ret R.err[bool, str](R.unwrap_err[u32, str](rn)); }
+                nxt[i] = mir.op_vreg(R.unwrap_ok[u32, str](rn));
+                i = i + 1;
+            }
+        }
+
+        i = 0;
+        for (i < nl) {
+            val rx: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](rx)) { ret R.err[bool, str](R.unwrap_err[u32, str](rx)); }
+            val x: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](rx));
+            val r5: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_XOR, x, cur[i], sh[i], lw);
+            if (R.is_err[bool, str](r5)) { ret r5; }
+
+            val ry: R.Result[u32, str] = new_vreg(alloc, f, mir.REG_CLASS_GP);
+            if (R.is_err[u32, str](ry)) { ret R.err[bool, str](R.unwrap_err[u32, str](ry)); }
+            val y: mir.MirOperand = mir.op_vreg(R.unwrap_ok[u32, str](ry));
+            val r6: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_AND, y, x, mask, lw);
+            if (R.is_err[bool, str](r6)) { ret r6; }
+
+            val r7: R.Result[bool, str] = emit_bin(alloc, dst, cursor, mi, mir.MIR_XOR, nxt[i], cur[i], y, lw);
+            if (R.is_err[bool, str](r7)) { ret r7; }
+            i = i + 1;
+        }
+
+        i = 0;
+        for (i < nl) { cur[i] = nxt[i]; i = i + 1; }
+        j = j + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
 # the destination lane count of a width-changing op (its operation width in native
 # lanes, at least one)
 fun dst_lane_count(plan: *LanePlan, mi: *mir.MirInstr) u32 {
@@ -1142,8 +1690,8 @@ fun unsupported_message(op: mir.MirOpcode, width: u8) str {
     if (op == mir.MIR_MUL)     { ret "legalize: wide multiply by a non-constant is unsupported on this target"; }
     if (op == mir.MIR_DIV_S || op == mir.MIR_DIV_U) { ret "legalize: wide divide is unsupported on this target"; }
     if (op == mir.MIR_REM_S || op == mir.MIR_REM_U) { ret "legalize: wide remainder is unsupported on this target"; }
-    if (op == mir.MIR_SHL || op == mir.MIR_SHR_S || op == mir.MIR_SHR_U) {
-        ret "legalize: wide shift is not yet legalized on this target";
+    if (is_shift(op)) {
+        ret "legalize: shift through an unsupported operand shape on this target";
     }
     if (op == mir.MIR_LOAD || op == mir.MIR_STORE) {
         ret "legalize: wide memory access through an unsupported operand shape on this target";
@@ -1160,6 +1708,8 @@ fun t_mach(maw: u8, ptr: u8) Machine {
     var m: Machine;
     m.lane_width = maw;
     m.ptr_width  = ptr;
+    # the 6502 shape: no variable-count shift, so the pass owns every shift
+    m.var_shift  = false;
     m.stage_lo   = 6;
     m.stage_hi   = 7;
     ret m;
@@ -1449,5 +1999,247 @@ test "mach.lang.be.codegen.legalize:value_base_is_inert_on_a_wide_pointer_target
     if (b.instrs != before_ptr)       { ret 1; }
     if (b.instr_count != 1)           { ret 1; }
     if (f.vreg_count != before_vregs) { ret 1; }
+    ret 0;
+}
+
+# test-only: a one-instruction function `v0 = v1 <shift> count` at `width` bytes, with
+# `v1` defined by a wide immediate move so the planner marks it (and `v0`) wide
+fun t_shift_fn(alloc: *A.Allocator, f: *mir.MirFunction, b: *mir.MirBlock,
+               op: mir.MirOpcode, width: u8, count: mir.MirOperand) {
+    t_vregs(alloc, f, 3);
+    t_block(alloc, b, 3);
+    var mv: [2]mir.MirOperand;
+    mv[0] = mir.op_vreg(1); mv[1] = mir.op_imm(0x01020304);
+    t_instr(alloc, b, 0, mir.MIR_MOV, ?mv[0], 2, width);
+    var mn: [2]mir.MirOperand;
+    mn[0] = mir.op_vreg(2); mn[1] = mir.op_imm(3);
+    t_instr(alloc, b, 1, mir.MIR_MOV, ?mn[0], 2, 1);
+    var sh: [3]mir.MirOperand;
+    sh[0] = mir.op_vreg(0); sh[1] = mir.op_vreg(1); sh[2] = count;
+    t_instr(alloc, b, 2, op, ?sh[0], 3, width);
+    f.blocks = b; f.block_count = 1;
+}
+
+# a CONSTANT-count wide shift is a pure template: a lane renaming plus one native shift
+# per contributing lane, with the bits crossing a lane boundary OR'd in from the
+# neighbour. no control flow, and no dependence between lanes
+#
+# The issue this closes claimed a wide shift needs control flow the legalizer cannot
+# emit. It does not - and the constant case never did: the rejection keyed on the
+# OPCODE, so `v << 3` on a `u32` died beside `v << n`. A width-4 shift by 3 on an 8-bit
+# ALU is four byte lanes: the low lane shifts alone (nothing crosses in from below) and
+# each of the three above joins its own shifted bits with the neighbour's, so ten
+# pieces - and the block gains no instruction that is not one of them.
+test "mach.lang.be.codegen.legalize:expands_constant_wide_shift_as_a_template" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_shift_fn(?alloc, ?f, ?b, mir.MIR_SHL, 4, mir.op_imm(3));
+
+    var mach: Machine = t_mach(1, 2);
+    val r: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f);
+    if (R.is_err[bool, str](r)) { ret 1; }
+
+    # 4 lanes of the wide immediate move + 1 narrow count move + the 10-piece template.
+    if (b.instr_count != 15) { ret 1; }
+    # lanes are assigned in definition order: the value's four (v3..v6), then the
+    # destination's four (v7..v10). the template's first piece is the TOP destination
+    # lane - a left shift walks DOWN, so a written lane is never a source a later lane
+    # still needs, which is what would let the two lane arrays be the same storage.
+    if (b.instrs[5].opcode != mir.MIR_SHL)      { ret 1; }
+    if (b.instrs[6].opcode != mir.MIR_SHR_U)    { ret 1; }
+    if (b.instrs[7].opcode != mir.MIR_OR)       { ret 1; }
+    if (b.instrs[7].operands[0].vreg != 10)     { ret 1; }  # destination lane 3
+    # the low lane needs no neighbour: one shift, straight into destination lane 0.
+    if (b.instrs[14].opcode != mir.MIR_SHL)     { ret 1; }
+    if (b.instrs[14].operands[0].vreg != 7)     { ret 1; }  # destination lane 0
+    if (b.instrs[14].operands[1].vreg != 3)     { ret 1; }  # value lane 0
+    if (b.instrs[14].operands[2].imm  != 3)     { ret 1; }  # by the constant count
+    # every piece is native width, and none is a branch: a shift emits no control flow.
+    var i: u32 = 5;
+    for (i < 15) {
+        if (b.instrs[i].width != 1)                { ret 1; }
+        if (b.instrs[i].opcode == mir.MIR_BR)      { ret 1; }
+        if (b.instrs[i].opcode == mir.MIR_CBR)     { ret 1; }
+        i = i + 1;
+    }
+    # and the function still has exactly one block: the pass added no region.
+    if (f.block_count != 1) { ret 1; }
+
+    # an ARITHMETIC right shift below one whole lane builds NO sign fill: the top source
+    # lane's own arithmetic shift already fills with its sign, so nothing reads a fill
+    # byte. At one lane that makes a constant shift exactly the one native instruction it
+    # should be, and at two lanes it is the straddling pair plus that top-lane shift.
+    var f1: mir.MirFunction;
+    var b1: mir.MirBlock;
+    t_shift_fn(?alloc, ?f1, ?b1, mir.MIR_SHR_S, 1, mir.op_imm(3));
+    if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f1))) { ret 1; }
+    if (b1.instr_count != 3)                     { ret 1; }  # two moves + the shift
+    if (b1.instrs[2].opcode != mir.MIR_SHR_S)    { ret 1; }
+
+    var f2: mir.MirFunction;
+    var b2: mir.MirBlock;
+    t_shift_fn(?alloc, ?f2, ?b2, mir.MIR_SHR_S, 2, mir.op_imm(3));
+    if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f2))) { ret 1; }
+    if (b2.instr_count != 7)                     { ret 1; }  # 2 move lanes + 1 count + 4
+
+    # a count that DOES reach a whole lane leaves a destination lane fed entirely from
+    # above the value, so the sign fill is materialized - once, and only then.
+    var f3: mir.MirFunction;
+    var b3: mir.MirBlock;
+    t_shift_fn(?alloc, ?f3, ?b3, mir.MIR_SHR_S, 2, mir.op_imm(8));
+    if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f3))) { ret 1; }
+    if (b3.instr_count != 6)                     { ret 1; }  # 2 move lanes + 1 count + 3
+    if (b3.instrs[3].opcode != mir.MIR_SHR_S)    { ret 1; }  # the sign fill itself
+    ret 0;
+}
+
+# a RUNTIME-count shift expands into a straight-line masked barrel, still with no
+# control flow and at a piece count that is a closed formula in the width
+#
+# The other half the issue got wrong. A loop or a jump table would need blocks this pass
+# cannot create; the barrel needs none, and its cost does not depend on the count -
+# which a jump table's would. The counts are pinned per width and per shift so a change
+# to the expansion has to state what it costs.
+test "mach.lang.be.codegen.legalize:expands_runtime_shift_as_a_masked_barrel" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var widths: [3]u8;   widths[0] = 1;  widths[1] = 2;  widths[2] = 4;
+    var shl:    [3]u32;  shl[0]    = 20; shl[1]    = 49; shl[2]    = 112;
+    var shrs:   [3]u32;  shrs[0]   = 20; shrs[1]   = 50; shrs[2]   = 113;
+
+    var w: u32 = 0;
+    for (w < 3) {
+        var f: mir.MirFunction;
+        var b: mir.MirBlock;
+        t_shift_fn(?alloc, ?f, ?b, mir.MIR_SHL, widths[w], mir.op_vreg(2));
+        var mach: Machine = t_mach(1, 2);
+        if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f))) { ret 1; }
+        # the wide immediate move's lanes + the narrow count move + the barrel.
+        if (b.instr_count != widths[w]::u32 + 1 + shl[w]) { ret 1; }
+        if (f.block_count != 1)                           { ret 1; }
+        var i: u32 = 0;
+        for (i < b.instr_count) {
+            if (b.instrs[i].opcode == mir.MIR_BR)  { ret 1; }
+            if (b.instrs[i].opcode == mir.MIR_CBR) { ret 1; }
+            i = i + 1;
+        }
+
+        # the arithmetic form costs one more piece per multi-lane width: the sign fill,
+        # materialized once and reused by every stage. at one lane it costs nothing at
+        # all, because the top lane's own arithmetic shift already fills with its sign.
+        var f2: mir.MirFunction;
+        var b2: mir.MirBlock;
+        t_shift_fn(?alloc, ?f2, ?b2, mir.MIR_SHR_S, widths[w], mir.op_vreg(2));
+        if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f2))) { ret 1; }
+        if (b2.instr_count != widths[w]::u32 + 1 + shrs[w]) { ret 1; }
+        w = w + 1;
+    }
+    ret 0;
+}
+
+# an out-of-range constant count is normalized to the operation width, so the constant
+# and the runtime path answer the same thing on the same target
+#
+# The language declines to fold a count at or past the width (`me.pass.constfold`) - the
+# answer is target-defined - so this pass defines it, and defines it as what the barrel
+# reads for free: the low log2(width) bits. A count of 19 on a 16-bit value is therefore
+# a count of 3, expanding to exactly the same pieces.
+test "mach.lang.be.codegen.legalize:normalizes_an_out_of_range_shift_count" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var mach: Machine = t_mach(1, 2);
+
+    var f3: mir.MirFunction;
+    var b3: mir.MirBlock;
+    t_shift_fn(?alloc, ?f3, ?b3, mir.MIR_SHL, 2, mir.op_imm(3));
+    if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f3))) { ret 1; }
+
+    var f19: mir.MirFunction;
+    var b19: mir.MirBlock;
+    t_shift_fn(?alloc, ?f19, ?b19, mir.MIR_SHL, 2, mir.op_imm(19));
+    if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f19))) { ret 1; }
+
+    if (b19.instr_count != b3.instr_count) { ret 1; }
+    var i: u32 = 0;
+    for (i < b3.instr_count) {
+        if (b19.instrs[i].opcode != b3.instrs[i].opcode) { ret 1; }
+        if (b19.instrs[i].operand_count != b3.instrs[i].operand_count) { ret 1; }
+        var k: u32 = 0;
+        for (k < b3.instrs[i].operand_count) {
+            if (b19.instrs[i].operands[k].kind != b3.instrs[i].operands[k].kind) { ret 1; }
+            if (b19.instrs[i].operands[k].imm  != b3.instrs[i].operands[k].imm)  { ret 1; }
+            if (b19.instrs[i].operands[k].vreg != b3.instrs[i].operands[k].vreg) { ret 1; }
+            k = k + 1;
+        }
+        i = i + 1;
+    }
+    # a count of exactly the width is a count of zero: the shift becomes a lane copy.
+    var f16: mir.MirFunction;
+    var b16: mir.MirBlock;
+    t_shift_fn(?alloc, ?f16, ?b16, mir.MIR_SHL, 2, mir.op_imm(16));
+    if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f16))) { ret 1; }
+    if (b16.instr_count != 5)                  { ret 1; }  # 2 move lanes + 1 count + 2 copies
+    if (b16.instrs[3].opcode != mir.MIR_MOV)   { ret 1; }
+    if (b16.instrs[4].opcode != mir.MIR_MOV)   { ret 1; }
+    ret 0;
+}
+
+# a machine that HAS a variable-count shift is left alone: the shift clause is dead and
+# the pass is the width test it always was
+#
+# This is the inertness half for x86-64 / aarch64 / riscv64, where a shift is a single
+# instruction at any count. A native-width shift there must come back untouched - no
+# rewrite, no vreg added, no block rebuilt - which is what keeps their output
+# byte-identical.
+test "mach.lang.be.codegen.legalize:shift_is_inert_on_a_variable_shift_machine" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 3);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 1);
+    var sh: [3]mir.MirOperand;
+    sh[0] = mir.op_vreg(0); sh[1] = mir.op_vreg(1); sh[2] = mir.op_vreg(2);
+    t_instr(?alloc, ?b, 0, mir.MIR_SHL, ?sh[0], 3, 8);  # width 8 == native
+    f.blocks = ?b; f.block_count = 1;
+
+    val before_ptr:   *mir.MirInstr = b.instrs;
+    val before_vregs: u32           = f.vreg_count;
+
+    var mach: Machine = t_mach(8, 8);
+    mach.var_shift = true;
+    val r: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f);
+    if (R.is_err[bool, str](r))       { ret 1; }
+    if (b.instrs != before_ptr)       { ret 1; }
+    if (b.instr_count != 1)           { ret 1; }
+    if (f.vreg_count != before_vregs) { ret 1; }
+
+    # the SAME machine without the capability legalizes the shift instead, so the clause
+    # is the fact that decides it and not something else about the target.
+    mach.var_shift = false;
+    if (R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f))) { ret 1; }
+    if (b.instrs == before_ptr) { ret 1; }
+    ret 0;
+}
+
+# a shift at a width that is not a power of two is REFUSED, never silently mis-shifted
+#
+# The barrel reads log2(width) bits of the count, which only names a width that is a
+# power of two; a width of three bytes has no such reading, so the expansion says so
+# rather than picking one.
+test "mach.lang.be.codegen.legalize:rejects_a_shift_at_a_non_power_of_two_width" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    var b: mir.MirBlock;
+    t_shift_fn(?alloc, ?f, ?b, mir.MIR_SHL, 3, mir.op_vreg(2));
+    var mach: Machine = t_mach(1, 2);
+    if (!R.is_err[bool, str](legalize_function(?alloc, ?mach, ?f))) { ret 1; }
     ret 0;
 }
