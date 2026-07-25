@@ -118,6 +118,19 @@ sink[u64](p, 1u32)     # instance: [u64] over (u32)
 sink[u32](p, 1u32, 2u64)   # instance: [u32] over (u32, u64)
 ```
 
+The instance's typing covers the **whole body**, not just the `$each`. A `val` /
+`var` declared around the unroll and named inside it carries the instance type,
+so it is gated, checked, and folded exactly as if the concrete type had been
+written out:
+
+```mach
+fun mk[T](seed: T, va: ...) T {
+    var out: T = seed;          # `Box` at mk[Box], not the bare `T`
+    $each a in va { ret out; }
+    ret out;
+}
+```
+
 Because a pack-tailed function has no single entry point, it is **not a
 stable-ABI symbol** — it cannot be the target of `ext fun` or a function
 pointer shared across compilation units. It is source-level only.
