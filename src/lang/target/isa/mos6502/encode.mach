@@ -68,6 +68,9 @@ val OP_CMP_IMM: u8 = 0xC9;  val OP_CMP_ZP: u8 = 0xC5;
 val OP_CLC:     u8 = 0x18;  val OP_SEC:    u8 = 0x38;
 val OP_JMP_ABS: u8 = 0x4C;  val OP_JSR_ABS: u8 = 0x20;
 val OP_RTS:     u8 = 0x60;  val OP_BRK:     u8 = 0x00;  val OP_NOP: u8 = 0xEA;
+# the indirect-indexed forms `(zp),Y` plus the Y load that carries the displacement:
+# the only addressing the 6502 offers through a runtime pointer
+val OP_LDY_IMM: u8 = 0xA0;  val OP_LDA_IND_Y: u8 = 0xB1;  val OP_STA_IND_Y: u8 = 0x91;
 # the conditional branch opcodes (pc-relative, signed 8-bit displacement)
 val OP_BEQ: u8 = 0xF0;  val OP_BNE: u8 = 0xD0;  val OP_BCC: u8 = 0x90;  val OP_BCS: u8 = 0xB0;
 # rotate the accumulator left through carry ($2A) - used to read the carry flag into
@@ -145,6 +148,8 @@ fun encode_instr(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr, f
         op == mir.MIR_AND || op == mir.MIR_OR || op == mir.MIR_XOR) {
         ret encode_alu(st, mi, op);
     }
+    if (op == mir.MIR_LOAD)  { ret encode_load(st, mi); }
+    if (op == mir.MIR_STORE) { ret encode_store(st, mi); }
     if (op == mir.MIR_NOT) { ret encode_not(st, mi); }
     if (op == mir.MIR_CMP_EQ || op == mir.MIR_CMP_NE || op == mir.MIR_CMP_LT_U) {
         ret encode_cmp(st, mi, op);
@@ -200,6 +205,87 @@ fun encode_alu(st: *enc.EncodeState, mi: *mir.MirInstr, op: mir.MirOpcode) R.Res
     val res_op: R.Result[bool, str] = emit_operand(st, b, imm_op, zp_op, op);
     if (R.is_err[bool, str](res_op)) { ret res_op; }
     emit_zp1(st, OP_STA_ZP, mos6502.zp_addr(dst.preg::i32));
+    ret R.ok[bool, str](true);
+}
+
+# encode a one-byte load `dst <- [ptr + disp]` as `LDY #disp ; LDA (ptr),Y ; STA dst`
+#
+# The address comes out of a reserved zero-page POINTER PAIR - the frame pointer, or
+# the staging pair the width legalizer wrote a runtime pointer's lanes into - and the
+# displacement rides Y, the 6502's only indexed-indirect form. The width legalizer
+# has already split every wider access into these one-byte pieces at successive
+# displacements, so a piece that still carries a wider width, or a base that is not a
+# declared pointer pair, is a legalization bug and is refused rather than mis-encoded.
+fun encode_load(st: *enc.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count != 2) { ret R.err[bool, str]("mos6502: malformed load"); }
+    val dst: *mir.MirOperand = ?mi.operands[0];
+    if (dst.kind != mir.MIR_OP_PREG) { ret R.err[bool, str](unencodable_message(mir.MIR_LOAD)); }
+
+    var base: i32 = 0;
+    var disp: u8  = 0;
+    val ra: R.Result[bool, str] = mem_base_disp(mi, ?mi.operands[1], ?base, ?disp);
+    if (R.is_err[bool, str](ra)) { ret ra; }
+
+    emit_imm1(st, OP_LDY_IMM, disp);
+    emit_zp1(st, OP_LDA_IND_Y, mos6502.zp_addr(base));
+    emit_zp1(st, OP_STA_ZP, mos6502.zp_addr(dst.preg::i32));
+    ret R.ok[bool, str](true);
+}
+
+# encode a one-byte store `[ptr + disp] <- src` as `LDA src ; LDY #disp ; STA (ptr),Y`
+#
+# The write twin of `encode_load`; the stored byte rides an immediate or a zero-page
+# value register into A first, since `(zp),Y` stores only the accumulator.
+fun encode_store(st: *enc.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count != 2) { ret R.err[bool, str]("mos6502: malformed store"); }
+
+    var base: i32 = 0;
+    var disp: u8  = 0;
+    val ra: R.Result[bool, str] = mem_base_disp(mi, ?mi.operands[0], ?base, ?disp);
+    if (R.is_err[bool, str](ra)) { ret ra; }
+
+    val res_ld: R.Result[bool, str] = emit_load_a(st, ?mi.operands[1]);
+    if (R.is_err[bool, str](res_ld)) { ret res_ld; }
+    emit_imm1(st, OP_LDY_IMM, disp);
+    emit_zp1(st, OP_STA_IND_Y, mos6502.zp_addr(base));
+    ret R.ok[bool, str](true);
+}
+
+# resolve a memory operand to a reserved pointer-pair base and an 8-bit displacement
+#
+# The one place the encoder's addressing contract is stated, so a load and a store
+# cannot disagree about what they accept. Every refusal names the specific shape:
+# a frame-slot base (the software frame's own addressing, not yet built), a base
+# that is an allocatable value register (one byte - reading its neighbour as an
+# address high byte would be a silent miscompile), a displacement past the 8-bit Y
+# index, and an access still wider than one byte (the legalizer's job, not this
+# encoder's).
+# ---
+# mi:       the accessing instruction (its width is checked here)
+# mem:      the memory operand to resolve
+# out_base: receives the pointer-pair register id
+# out_disp: receives the displacement in bytes
+# ret:      ok(true), or an error naming the unsupported shape
+fun mem_base_disp(mi: *mir.MirInstr, mem: *mir.MirOperand, out_base: *i32, out_disp: *u8) R.Result[bool, str] {
+    if (mem.kind != mir.MIR_OP_MEM) { ret R.err[bool, str](unencodable_message(mi.opcode)); }
+    if (mi.width > 1) {
+        ret R.err[bool, str]("mos6502: a memory access wider than one byte must be split by width legalization before encoding");
+    }
+    if (mem.index != mir.MIR_VREG_NIL) {
+        ret R.err[bool, str]("mos6502: the 6502 has no scaled-index addressing");
+    }
+    if (mem.vreg != mir.MIR_VREG_NIL) {
+        ret R.err[bool, str]("mos6502: frame-slot addressing is not yet implemented on this target");
+    }
+    val base: i32 = mem.preg::i32;
+    if (!mos6502.is_ptr_pair(base)) {
+        ret R.err[bool, str]("mos6502: a memory base must be a reserved zero-page pointer pair on this target");
+    }
+    if (mem.imm < 0 || mem.imm > 255) {
+        ret R.err[bool, str]("mos6502: a memory displacement must fit the 8-bit Y index on this target");
+    }
+    @out_base = base;
+    @out_disp = (mem.imm & 0xFF)::u8;
     ret R.ok[bool, str](true);
 }
 
@@ -431,8 +517,11 @@ fun unencodable_message(op: mir.MirOpcode) str {
     if (op == mir.MIR_FADD || op == mir.MIR_FSUB || op == mir.MIR_FMUL || op == mir.MIR_FDIV) {
         ret "mos6502: floating-point is unsupported on this target";
     }
-    if (op == mir.MIR_LOAD || op == mir.MIR_STORE || op == mir.MIR_GEP || op == mir.MIR_ALLOCA) {
-        ret "mos6502: memory access encoding is not yet implemented on this target";
+    if (op == mir.MIR_GEP || op == mir.MIR_ALLOCA) {
+        ret "mos6502: address arithmetic is not yet implemented on this target";
+    }
+    if (op == mir.MIR_LOAD || op == mir.MIR_STORE) {
+        ret "mos6502: unsupported memory operand shape on this target";
     }
     if (op == mir.MIR_CBR || op == mir.MIR_BR ||
         op == mir.MIR_CMP_EQ || op == mir.MIR_CMP_NE ||
@@ -580,70 +669,156 @@ test "mach.lang.target.isa.mos6502.encode:compare_is_branchless" {
     ret 0;
 }
 
-# execute an encoded compare sequence over a 256-byte zero page (test helper)
+# the observable state of the reference 6502 core (test helper)
+# ---
+# a:      the accumulator
+# y:      the Y index register, the displacement carrier of `(zp),Y`
+# c:      the carry flag, the only flag any sequence this encoder emits carries
+#         across an instruction
+# pc:     the program counter
+# cycles: the running cycle count
+rec Core {
+    a:      u32;
+    y:      u32;
+    c:      u32;
+    pc:     u32;
+    cycles: u32;
+}
+
+# execute encoded bytes on a reference 6502 core over a flat memory image (test helper)
 #
-# A minimal 6502 core covering exactly the opcodes `encode_cmp` emits, with the REAL
-# published flag semantics: `LDA` / `EOR` write N and Z but LEAVE CARRY ALONE, `CMP`
-# writes N, Z and C, and `ROL A` reads C into bit 0 while taking C from bit 7. Modeling
-# the flags honestly is the entire point. The sequence this replaced read as correct on
-# the page - compare, then branch on the compare's flag - but its `LDA #$00` silently
-# rewrote Z, so the branch tested a CONSTANT: every `==` answered 1 and every `!=`
-# answered 0, for every input. An identity check over the intended algebra cannot see
-# that; executing the bytes can.
+# A minimal core covering exactly the opcodes this encoder emits, with the REAL published
+# semantics and cycle counts: `LDA` / `EOR` write N and Z but LEAVE CARRY ALONE, `CMP`
+# writes N, Z and C, `ROL A` reads C into bit 0 while taking C from bit 7, `LDA (zp),Y`
+# reads a 16-bit address out of two adjacent zero-page bytes and costs an extra cycle when
+# the indexed address crosses a page (an ADDRESS-dependent cost, never a data-dependent
+# one), and `STA (zp),Y` costs a flat six. Modeling all of this honestly is the entire
+# point. The compare sequence this core was first written for read as correct on the page
+# - compare, then branch on the compare's flag - but its `LDA #$00` silently rewrote Z, so
+# the branch tested a CONSTANT: every `==` answered 1 and every `!=` answered 0, for every
+# input. An identity check over the intended algebra cannot see that; executing the bytes
+# can.
+#
+# Runs from `core.pc` until `RTS`, accumulating cycles. Any opcode outside the pinned set,
+# any access outside the image, and any run that does not terminate is a failure rather
+# than a silently truncated answer.
+# ---
+# mem:  the flat memory image (zero page at 0, code wherever `core.pc` points)
+# size: the image size in bytes
+# core: the core state; `pc` is the entry point, `cycles` accumulates
+# ret:  true when the run reached RTS inside the pinned opcode set
+fun t_exec(mem: *u8, size: usize, core: *Core) bool {
+    var steps: u32 = 0;
+    for (steps < 4096) {
+        steps = steps + 1;
+        if (core.pc::usize >= size) { ret false; }
+        val op:  u8    = mem[core.pc::usize];
+        val arg: usize = (core.pc + 1)::usize;
+        if (op == 0x60) { core.cycles = core.cycles + 6; ret true; }
+        if (arg >= size) { ret false; }
+        val imm: u32   = mem[arg]::u32;
+        val zpa: usize = mem[arg]::usize;
+
+        if (op == 0xA9)      { core.a = imm;                       core.cycles = core.cycles + 2; core.pc = core.pc + 2; }
+        or (op == 0xA5)      { core.a = mem[zpa]::u32;             core.cycles = core.cycles + 3; core.pc = core.pc + 2; }
+        or (op == 0x85)      { mem[zpa] = (core.a & 0xFF)::u8;     core.cycles = core.cycles + 3; core.pc = core.pc + 2; }
+        or (op == 0xA0)      { core.y = imm;                       core.cycles = core.cycles + 2; core.pc = core.pc + 2; }
+        or (op == 0x49)      { core.a = core.a ^ imm;              core.cycles = core.cycles + 2; core.pc = core.pc + 2; }
+        or (op == 0x45)      { core.a = core.a ^ mem[zpa]::u32;    core.cycles = core.cycles + 3; core.pc = core.pc + 2; }
+        or (op == 0x29)      { core.a = core.a & imm;              core.cycles = core.cycles + 2; core.pc = core.pc + 2; }
+        or (op == 0x25)      { core.a = core.a & mem[zpa]::u32;    core.cycles = core.cycles + 3; core.pc = core.pc + 2; }
+        or (op == 0x09)      { core.a = core.a | imm;              core.cycles = core.cycles + 2; core.pc = core.pc + 2; }
+        or (op == 0x05)      { core.a = core.a | mem[zpa]::u32;    core.cycles = core.cycles + 3; core.pc = core.pc + 2; }
+        or (op == 0xC9)      { core.c = 0; if (core.a >= imm) { core.c = 1; }                    core.cycles = core.cycles + 2; core.pc = core.pc + 2; }
+        or (op == 0xC5)      { core.c = 0; if (core.a >= mem[zpa]::u32) { core.c = 1; }          core.cycles = core.cycles + 3; core.pc = core.pc + 2; }
+        or (op == 0x2A)      { val nc: u32 = (core.a >> 7) & 1; core.a = ((core.a << 1) | core.c) & 0xFF; core.c = nc; core.cycles = core.cycles + 2; core.pc = core.pc + 1; }
+        or (op == 0x18)      { core.c = 0;                         core.cycles = core.cycles + 2; core.pc = core.pc + 1; }
+        or (op == 0x38)      { core.c = 1;                         core.cycles = core.cycles + 2; core.pc = core.pc + 1; }
+        or (op == 0xEA)      {                                     core.cycles = core.cycles + 2; core.pc = core.pc + 1; }
+        or (op == 0x69)      { val t: u32 = core.a + imm + core.c;                     core.c = (t >> 8) & 1; core.a = t & 0xFF; core.cycles = core.cycles + 2; core.pc = core.pc + 2; }
+        or (op == 0x65)      { val t: u32 = core.a + mem[zpa]::u32 + core.c;           core.c = (t >> 8) & 1; core.a = t & 0xFF; core.cycles = core.cycles + 3; core.pc = core.pc + 2; }
+        or (op == 0xE9)      { val t: u32 = (core.a + (imm ^ 0xFF) + core.c);          core.c = (t >> 8) & 1; core.a = t & 0xFF; core.cycles = core.cycles + 2; core.pc = core.pc + 2; }
+        or (op == 0xE5)      { val t: u32 = (core.a + (mem[zpa]::u32 ^ 0xFF) + core.c); core.c = (t >> 8) & 1; core.a = t & 0xFF; core.cycles = core.cycles + 3; core.pc = core.pc + 2; }
+        or (op == 0xB1 || op == 0x91) {
+            if (zpa + 1 >= size) { ret false; }
+            val ptr:  u32   = mem[zpa]::u32 | (mem[zpa + 1]::u32 << 8);
+            val addr: u32   = ptr + core.y;
+            if (addr::usize >= size) { ret false; }
+            if (op == 0xB1) {
+                core.a = mem[addr::usize]::u32;
+                core.cycles = core.cycles + 5;
+                # the published page-crossing penalty: an ADDRESS fact, not a data one.
+                if ((addr & 0xFF00) != (ptr & 0xFF00)) { core.cycles = core.cycles + 1; }
+            } or {
+                mem[addr::usize] = (core.a & 0xFF)::u8;
+                core.cycles = core.cycles + 6;
+            }
+            core.pc = core.pc + 2;
+        }
+        or { ret false; }
+    }
+    ret false;
+}
+
+# execute an encoded compare sequence over a zero page, reporting its cycle count
+# (test helper)
 # ---
 # code:   the encoded bytes to execute
 # n:      their length
-# zp:     the 256-byte zero page (operands in, result out)
+# mem:    the flat memory image, zero page at 0 (operands in, result out)
+# size:   the image size
 # cycles: receives the sequence's total cycle count
 # ret:    true when every opcode was inside the pinned set
-fun t_run_cmp(code: *u8, n: usize, zp: *u8, cycles: *u32) bool {
-    var a:  u32 = 0;
-    var c:  u32 = 0;
-    var cy: u32 = 0;
-    var i:  usize = 0;
-    for (i < n) {
-        val op:  u8    = code[i];
-        val arg: usize = i + 1;
-        if (op == 0xA9)   { a = code[arg]::u32;                       cy = cy + 2; i = i + 2; }
-        or (op == 0xA5)   { a = zp[code[arg]::usize]::u32;            cy = cy + 3; i = i + 2; }
-        or (op == 0x49)   { a = a ^ code[arg]::u32;                   cy = cy + 2; i = i + 2; }
-        or (op == 0x45)   { a = a ^ zp[code[arg]::usize]::u32;        cy = cy + 3; i = i + 2; }
-        or (op == 0xC9)   { c = 0; if (a >= code[arg]::u32) { c = 1; }             cy = cy + 2; i = i + 2; }
-        or (op == 0xC5)   { c = 0; if (a >= zp[code[arg]::usize]::u32) { c = 1; }  cy = cy + 3; i = i + 2; }
-        or (op == 0x2A)   { val nc: u32 = (a >> 7) & 1; a = ((a << 1) | c) & 0xFF; c = nc; cy = cy + 2; i = i + 1; }
-        or (op == 0x85)   { zp[code[arg]::usize] = (a & 0xFF)::u8;    cy = cy + 3; i = i + 2; }
-        or { ret false; }
-    }
-    @cycles = cy;
+fun t_run_cmp(code: *u8, n: usize, mem: *u8, size: usize, cycles: *u32) bool {
+    val base: usize = T_CODE_BASE::usize;
+    if (base + n >= size) { ret false; }
+    var i: usize = 0;
+    for (i < n) { mem[base + i] = code[i]; i = i + 1; }
+    mem[base + n] = OP_RTS;
+
+    var core: Core;
+    core.a = 0; core.y = 0; core.c = 0; core.cycles = 0;
+    core.pc = T_CODE_BASE;
+    if (!t_exec(mem, size, ?core)) { ret false; }
+    # the terminating RTS is scaffolding, not part of the sequence under test.
+    @cycles = core.cycles - 6;
     ret true;
 }
+
+# where the reference core loads an encoded sequence: clear of the zero page the value
+# registers occupy and of the data pages the round-trip tests address
+val T_CODE_BASE: u32 = 0x0200;
+
+# the reference core's memory image size, covering the zero page, the loaded code, and
+# the data pages the round-trip tests place their storage in
+val T_MEM_SIZE: usize = 0x1000;
 
 # run one encoded relation over every ordered byte pair, checking the ANSWER and that the
 # cycle count never varies with the operands (test helper)
 # ---
 # st:   the encode state holding the sequence to execute
 # want: 0 for `==`, 1 for `!=`, 2 for `<u`
+# mem:  the reference core's memory image
 # ret:  0 when every pair answers correctly at one fixed cycle count
-fun t_check_cmp(st: *enc.EncodeState, want: u32) i32 {
-    var zp: [256]u8;
+fun t_check_cmp(st: *enc.EncodeState, want: u32, mem: *u8) i32 {
     var fixed: u32 = 0;
     var x: u32 = 0;
     for (x < 256) {
         var y: u32 = 0;
         for (y < 256) {
             var k: usize = 0;
-            for (k < 256) { zp[k] = 0; k = k + 1; }
-            zp[0x18] = (x & 0xFF)::u8;
-            zp[0x19] = (y & 0xFF)::u8;
+            for (k < 256) { mem[k] = 0; k = k + 1; }
+            mem[0x18] = (x & 0xFF)::u8;
+            mem[0x19] = (y & 0xFF)::u8;
 
             var cy: u32 = 0;
-            if (!t_run_cmp(st.buf.data, st.buf.len, ?zp[0], ?cy)) { ret 1; }
+            if (!t_run_cmp(st.buf.data, st.buf.len, mem, T_MEM_SIZE, ?cy)) { ret 1; }
 
             var expect: u32 = 0;
             if (want == 0 && x == y) { expect = 1; }
             or (want == 1 && x != y) { expect = 1; }
             or (want == 2 && x <  y) { expect = 1; }
-            if (zp[0x1A]::u32 != expect) { ret 1; }
+            if (mem[0x1A]::u32 != expect) { ret 1; }
 
             # the constant-time property, EXECUTED: one cycle count for all 65536 pairs.
             if (x == 0 && y == 0) { fixed = cy; }
@@ -665,23 +840,381 @@ fun t_check_cmp(st: *enc.EncodeState, want: u32) i32 {
 test "mach.lang.target.isa.mos6502.encode:compare_executes_constant_time" {
     var alloc: A.Allocator;
     page.make(?alloc);
+    val mr: R.Result[*u8, str] = A.zallocate[u8](?alloc, T_MEM_SIZE);
+    if (R.is_err[*u8, str](mr)) { ret 1; }
+    val mem: *u8 = R.unwrap_ok[*u8, str](mr);
 
     var eq: enc.EncodeState;
     eq.buf = enc.buf_init(?alloc);
     if (R.is_err[bool, str](t_encode_cmp(?eq, mir.MIR_CMP_EQ))) { ret 1; }
-    if (t_check_cmp(?eq, 0) != 0) { ret 1; }
+    if (t_check_cmp(?eq, 0, mem) != 0) { ret 1; }
     enc.buf_dnit(?eq.buf);
 
     var ne: enc.EncodeState;
     ne.buf = enc.buf_init(?alloc);
     if (R.is_err[bool, str](t_encode_cmp(?ne, mir.MIR_CMP_NE))) { ret 1; }
-    if (t_check_cmp(?ne, 1) != 0) { ret 1; }
+    if (t_check_cmp(?ne, 1, mem) != 0) { ret 1; }
     enc.buf_dnit(?ne.buf);
 
     var lt: enc.EncodeState;
     lt.buf = enc.buf_init(?alloc);
     if (R.is_err[bool, str](t_encode_cmp(?lt, mir.MIR_CMP_LT_U))) { ret 1; }
-    if (t_check_cmp(?lt, 2) != 0) { ret 1; }
+    if (t_check_cmp(?lt, 2, mem) != 0) { ret 1; }
     enc.buf_dnit(?lt.buf);
+
+    A.deallocate[u8](?alloc, mem, T_MEM_SIZE);
+    ret 0;
+}
+
+# a memory base the 6502 cannot reach an address through is REFUSED, never mis-encoded
+#
+# The load-bearing refusal is the allocatable value register: it holds one byte, so
+# `(zp),Y` off it would read the NEXT value in the file as the address's high byte -
+# a silent miscompile that reads and writes wherever that byte happens to point. The
+# reserved pairs are accepted, an odd (high-half) id is not, and neither is a still-wide
+# access, a frame-slot base, or a displacement past the 8-bit Y index.
+test "mach.lang.target.isa.mos6502.encode:refuses_a_base_that_is_not_a_pointer_pair" {
+    # the four reserved pairs are the whole accepted set.
+    if (!mos6502.is_ptr_pair(mos6502.FP_LO))       { ret 1; }
+    if (!mos6502.is_ptr_pair(mos6502.SP_LO))       { ret 1; }
+    if (!mos6502.is_ptr_pair(mos6502.PTR_LO))      { ret 1; }
+    if (!mos6502.is_ptr_pair(mos6502.SCRATCH_REG)) { ret 1; }
+    if (mos6502.is_ptr_pair(mos6502.FP_HI))        { ret 1; }
+    if (mos6502.is_ptr_pair(mos6502.PTR_HI))       { ret 1; }
+    if (mos6502.is_ptr_pair(mos6502.RELOAD0))      { ret 1; }
+    if (mos6502.is_ptr_pair(mos6502.FIRST_VALUE_REG))     { ret 1; }
+    if (mos6502.is_ptr_pair(mos6502.FIRST_VALUE_REG + 1)) { ret 1; }
+
+    var ops: [2]mir.MirOperand;
+    var mi: mir.MirInstr;
+    mi.operands      = ?ops[0];
+    mi.operand_count = 2;
+    mi.opcode        = mir.MIR_LOAD;
+    mi.width         = 1;
+    mi.src_width     = 1;
+    var base: i32 = 0;
+    var disp: u8  = 0;
+
+    # a value-register base is refused rather than read as half an address.
+    ops[1] = mir.op_mem_preg(mos6502.FIRST_VALUE_REG::u32, 0);
+    if (!R.is_err[bool, str](mem_base_disp(?mi, ?ops[1], ?base, ?disp))) { ret 1; }
+    # so is a frame-slot base (the software frame's own addressing is not built yet).
+    ops[1] = mir.op_mem_slot(3, 0);
+    if (!R.is_err[bool, str](mem_base_disp(?mi, ?ops[1], ?base, ?disp))) { ret 1; }
+    # and a displacement past the 8-bit Y index.
+    ops[1] = mir.op_mem_preg(mos6502.FP_LO::u32, 256);
+    if (!R.is_err[bool, str](mem_base_disp(?mi, ?ops[1], ?base, ?disp))) { ret 1; }
+    # an access still wider than one byte is the legalizer's job, not this encoder's.
+    mi.width = 2;
+    ops[1] = mir.op_mem_preg(mos6502.FP_LO::u32, 0);
+    if (!R.is_err[bool, str](mem_base_disp(?mi, ?ops[1], ?base, ?disp))) { ret 1; }
+
+    # a reserved pair at a reachable displacement resolves.
+    mi.width = 1;
+    ops[1] = mir.op_mem_preg(mos6502.FP_LO::u32, 7);
+    if (R.is_err[bool, str](mem_base_disp(?mi, ?ops[1], ?base, ?disp))) { ret 1; }
+    if (base != mos6502.FP_LO || disp != 7) { ret 1; }
+    ret 0;
+}
+
+# the value register the wide-scalar round-trip holds the hidden result pointer's two
+# lanes in, and the first of the run holding the scalar's byte lanes (test helper)
+val T_PTR_REG:  i32 = mos6502.FIRST_VALUE_REG;
+val T_DATA_REG: i32 = mos6502.FIRST_VALUE_REG + 2;
+
+# write one fully-resolved instruction of the round-trip function (test helper)
+fun t_put(f: *mir.MirInstr, ops: *mir.MirOperand, ix: u32, opcode: mir.MirOpcode,
+          a: mir.MirOperand, b: mir.MirOperand, nops: u32) {
+    ops[ix * 2]     = a;
+    ops[ix * 2 + 1] = b;
+    f[ix].opcode        = opcode;
+    f[ix].operands      = ?ops[ix * 2];
+    f[ix].operand_count = nops;
+    f[ix].width         = 1;
+    f[ix].src_width     = 1;
+    f[ix].vec_lane      = mir.VEC_LANE_NONE;
+}
+
+# build the fully-resolved MIR the pipeline hands this encoder for
+# `fun f(v: uN) uN { ret v; }` on mos6502, for an N of `n` bytes (test helper)
+#
+# Every wider-than-one-byte scalar returns through the convention's hidden result
+# pointer and arrives on the software stack, so the function is: capture the pointer's
+# two lanes out of the `PTR_LO` pair, read the parameter's `n` bytes off the frame
+# pointer, stage the pointer into the address pair, write the `n` bytes through it, and
+# hand the pointer back. Post-isel every operand is a physical register, so this is
+# exactly the instruction list the encoder sees - and `wide_scalar_bytes_match_pipeline`
+# pins the result against a real `mach build --target mos` image, so a divergence
+# between this list and what the pipeline actually produces fails there.
+# ---
+# f:      receives the instructions (at least 2n + 7)
+# ops:    operand backing store (at least 4n + 14)
+# blocks: receives the single block
+# fn:     receives the function
+# n:      the scalar's byte width
+fun t_roundtrip_fn(f: *mir.MirInstr, ops: *mir.MirOperand, blocks: *mir.MirBlock,
+                   fn: *mir.MirFunction, n: u32) {
+    var ix: u32 = 0;
+    var i:  u32 = 0;
+    for (i < 2) {
+        t_put(f, ops, ix, mos6502.MOV::u32, mir.op_preg((T_PTR_REG + i::i32)::u32),
+              mir.op_preg((mos6502.PTR_LO + i::i32)::u32), 2);
+        ix = ix + 1; i = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        t_put(f, ops, ix, mir.MIR_LOAD, mir.op_preg((T_DATA_REG + i::i32)::u32),
+              mir.op_mem_preg(mos6502.FRAME_REG::u32, i::i64), 2);
+        ix = ix + 1; i = i + 1;
+    }
+    i = 0;
+    for (i < 2) {
+        t_put(f, ops, ix, mos6502.MOV::u32, mir.op_preg((mos6502.SCRATCH_REG + i::i32)::u32),
+              mir.op_preg((T_PTR_REG + i::i32)::u32), 2);
+        ix = ix + 1; i = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        t_put(f, ops, ix, mir.MIR_STORE, mir.op_mem_preg(mos6502.SCRATCH_REG::u32, i::i64),
+              mir.op_preg((T_DATA_REG + i::i32)::u32), 2);
+        ix = ix + 1; i = i + 1;
+    }
+    i = 0;
+    for (i < 2) {
+        t_put(f, ops, ix, mos6502.MOV::u32, mir.op_preg((mos6502.PTR_LO + i::i32)::u32),
+              mir.op_preg((T_PTR_REG + i::i32)::u32), 2);
+        ix = ix + 1; i = i + 1;
+    }
+    t_put(f, ops, ix, mos6502.RTS::u32, mir.op_imm(0), mir.op_imm(0), 0);
+    ix = ix + 1;
+
+    blocks[0].id          = 0;
+    blocks[0].instrs      = f;
+    blocks[0].instr_count = ix;
+    blocks[0].instr_cap   = ix;
+
+    fn.name        = intern.STR_NIL;
+    fn.blocks      = blocks;
+    fn.block_count = 1;
+    fn.block_cap   = 1;
+}
+
+# encode the `n`-byte wide-scalar round-trip through the real per-function encoder
+# (test helper)
+fun t_encode_roundtrip(st: *enc.EncodeState, n: u32) R.Result[bool, str] {
+    var instrs: [23]mir.MirInstr;
+    var ops:    [46]mir.MirOperand;
+    var blocks: [1]mir.MirBlock;
+    var fn:     mir.MirFunction;
+    t_roundtrip_fn(?instrs[0], ?ops[0], ?blocks[0], ?fn, n);
+    ret encode_function(st, ?fn);
+}
+
+# run the encoded round-trip once and report the stored bytes and the cycle count
+# (test helper)
+# ---
+# code:    the encoded bytes
+# len:     their length
+# mem:     the reference core's memory image
+# n:       the scalar's byte width
+# arg:     address the caller placed the incoming argument at
+# store:   address the caller's result storage sits at
+# value:   the scalar to round-trip
+# cycles:  receives the run's cycle count
+# ret:     true when the run completed and the stored bytes are the scalar's
+fun t_run_roundtrip(code: *u8, len: usize, mem: *u8, n: u32, arg: u32, store: u32,
+                    value: u64, cycles: *u32) bool {
+    val base: usize = T_CODE_BASE::usize;
+    if (base + len >= T_MEM_SIZE) { ret false; }
+    var i: usize = 0;
+    for (i < len) { mem[base + i] = code[i]; i = i + 1; }
+
+    # the frame pointer and the hidden result pointer, each a zero-page pair.
+    mem[mos6502.zp_addr(mos6502.FP_LO)::usize] = (arg & 0xFF)::u8;
+    mem[mos6502.zp_addr(mos6502.FP_HI)::usize] = ((arg >> 8) & 0xFF)::u8;
+    mem[mos6502.zp_addr(mos6502.PTR_LO)::usize] = (store & 0xFF)::u8;
+    mem[mos6502.zp_addr(mos6502.PTR_HI)::usize] = ((store >> 8) & 0xFF)::u8;
+
+    var k: u32 = 0;
+    for (k < n) {
+        mem[(arg + k)::usize]   = ((value >> (k * 8)::u64) & 0xFF)::u8;
+        mem[(store + k)::usize] = 0;
+        k = k + 1;
+    }
+
+    var core: Core;
+    core.a = 0; core.y = 0; core.c = 0; core.cycles = 0;
+    core.pc = T_CODE_BASE;
+    if (!t_exec(mem, T_MEM_SIZE, ?core)) { ret false; }
+    @cycles = core.cycles;
+
+    k = 0;
+    for (k < n) {
+        if (mem[(store + k)::usize]::u64 != ((value >> (k * 8)::u64) & 0xFF)) { ret false; }
+        k = k + 1;
+    }
+    # the callee hands the storage pointer back in the return pair, unchanged.
+    if (mem[mos6502.zp_addr(mos6502.PTR_LO)::usize]::u32 != (store & 0xFF))        { ret false; }
+    if (mem[mos6502.zp_addr(mos6502.PTR_HI)::usize]::u32 != ((store >> 8) & 0xFF)) { ret false; }
+    ret true;
+}
+
+# round-trip a sweep of scalars through the encoded function, checking the answer and
+# that the cycle count never varies with the VALUE (test helper)
+# ---
+# st:    the encode state holding the function's bytes
+# mem:   the reference core's memory image
+# n:     the scalar's byte width
+# arg:   address the incoming argument sits at (varied to exercise page crossing)
+# store: address of the caller's result storage
+# iters: number of sweep values
+# out:   receives the fixed cycle count the sweep settled on
+# ret:   0 when every value round-trips at one fixed cycle count
+fun t_check_roundtrip(st: *enc.EncodeState, mem: *u8, n: u32, arg: u32, store: u32,
+                      iters: u32, out: *u32) i32 {
+    var fixed: u32 = 0;
+    var seed:  u64 = 0x243F6A8885A308D3;
+    var i: u32 = 0;
+    for (i < iters) {
+        # a xorshift walk plus the all-zero, all-ones and alternating patterns, so the
+        # sweep covers both the values a carry-free copy could confuse and a wide spread.
+        seed = seed ^ (seed << 13);
+        seed = seed ^ (seed >> 7);
+        seed = seed ^ (seed << 17);
+        var v: u64 = seed;
+        if (i == 0) { v = 0; }
+        or (i == 1) { v = 0xFFFFFFFFFFFFFFFF; }
+        or (i == 2) { v = 0xAA55AA55AA55AA55; }
+        or (i == 3) { v = 0x0102040810204080; }
+
+        var cy: u32 = 0;
+        if (!t_run_roundtrip(st.buf.data, st.buf.len, mem, n, arg, store, v, ?cy)) { ret 1; }
+        # the constant-time property, EXECUTED: one cycle count for every value.
+        if (i == 0)      { fixed = cy; }
+        or (cy != fixed) { ret 1; }
+        i = i + 1;
+    }
+    @out = fixed;
+    ret 0;
+}
+
+# the encoded wide-scalar round-trip is byte-for-byte what the pipeline emits
+#
+# The instruction list `t_roundtrip_fn` builds is a claim about what the ABI placement,
+# the width legalizer, instruction selection and register allocation hand this encoder
+# for `fun f(v: u32) u32 { ret v; }`. This pins the claim: the bytes below were read out
+# of a real `mach build --target mos` image of that function, so if any stage upstream
+# stops producing this sequence, the executed-bytes proofs below stop being about the
+# real thing and this test says so.
+test "mach.lang.target.isa.mos6502.encode:wide_scalar_bytes_match_pipeline" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var st: enc.EncodeState;
+    st.alloc = ?alloc;
+    st.buf   = enc.buf_init(?alloc);
+    if (R.is_err[bool, str](t_encode_roundtrip(?st, 4))) { ret 1; }
+
+    val want: [73]u8 = [73]u8{
+        0xA5, 0x14, 0x85, 0x1B, 0xA5, 0x15, 0x85, 0x1C,
+        0xA0, 0x00, 0xB1, 0x10, 0x85, 0x1D,
+        0xA0, 0x01, 0xB1, 0x10, 0x85, 0x1E,
+        0xA0, 0x02, 0xB1, 0x10, 0x85, 0x1F,
+        0xA0, 0x03, 0xB1, 0x10, 0x85, 0x20,
+        0xA5, 0x1B, 0x85, 0x16, 0xA5, 0x1C, 0x85, 0x17,
+        0xA5, 0x1D, 0xA0, 0x00, 0x91, 0x16,
+        0xA5, 0x1E, 0xA0, 0x01, 0x91, 0x16,
+        0xA5, 0x1F, 0xA0, 0x02, 0x91, 0x16,
+        0xA5, 0x20, 0xA0, 0x03, 0x91, 0x16,
+        0xA5, 0x1B, 0x85, 0x14, 0xA5, 0x1C, 0x85, 0x15,
+        0x60,
+    };
+    if (st.buf.len != 73) { ret 1; }
+    var i: usize = 0;
+    for (i < 73) {
+        if (st.buf.data[i] != want[i]) { ret 1; }
+        i = i + 1;
+    }
+    # the round-trip is straight-line: a wide scalar carries no branch on this target.
+    if (t_has_branch(?st)) { ret 1; }
+    enc.buf_dnit(?st.buf);
+    ret 0;
+}
+
+# a wide scalar round-trips correctly and in a fixed number of cycles, EXECUTED
+#
+# `fun f(v: uN) uN { ret v; }` for a 2-, 4- and 8-byte N - the shapes that did not build
+# at all before #2216 - encoded and then RUN on the reference core: the parameter is read
+# off the frame pointer, written through the hidden result pointer, and the pointer handed
+# back. Reading the lowering cannot establish this; #2158 is the standing reminder, where
+# a compare that read correctly on the page answered wrong for all 65536 inputs.
+#
+# The cycle count is the constant-time half. Every instruction in the sequence is
+# fixed-cost and there is no branch, so the count cannot depend on the VALUE - which is
+# what `#[oblivious]` needs from a `^uN` round-trip, and is asserted here by executing the
+# bytes over a sweep rather than by inspecting them. The one variability the 6502 has in
+# this sequence is `LDA (zp),Y`'s page-crossing penalty, which is a fact about the
+# ADDRESS: `page_crossing_costs_are_address_only` pins that it moves the constant without
+# making it value-dependent.
+test "mach.lang.target.isa.mos6502.encode:wide_scalar_executes_constant_time" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val mr: R.Result[*u8, str] = A.zallocate[u8](?alloc, T_MEM_SIZE);
+    if (R.is_err[*u8, str](mr)) { ret 1; }
+    val mem: *u8 = R.unwrap_ok[*u8, str](mr);
+
+    var widths: [3]u32;
+    widths[0] = 2; widths[1] = 4; widths[2] = 8;
+    var w: u32 = 0;
+    for (w < 3) {
+        var st: enc.EncodeState;
+        st.alloc = ?alloc;
+        st.buf   = enc.buf_init(?alloc);
+        if (R.is_err[bool, str](t_encode_roundtrip(?st, widths[w]))) { ret 1; }
+        if (t_has_branch(?st))                                       { ret 1; }
+        var fixed: u32 = 0;
+        if (t_check_roundtrip(?st, mem, widths[w], 0x0500, 0x0600, 4096, ?fixed) != 0) { ret 1; }
+        enc.buf_dnit(?st.buf);
+        w = w + 1;
+    }
+
+    A.deallocate[u8](?alloc, mem, T_MEM_SIZE);
+    ret 0;
+}
+
+# the only cycle-count variability in the round-trip is a fact about the ADDRESS
+#
+# `LDA (zp),Y` costs an extra cycle when the indexed address crosses a page, so a
+# parameter placed to straddle a page boundary runs the round-trip at a DIFFERENT
+# constant - but still ONE constant across every value, which is the property
+# `#[oblivious]` requires. Pinning both halves keeps the constant-time claim honest: the
+# sequence is not "always N cycles", it is "N cycles for a given public address, for every
+# secret value". A model that simply forgot the penalty would pass the fixed-count test
+# and fail this one, so the guarantee rests on a faithful core rather than a lenient one.
+test "mach.lang.target.isa.mos6502.encode:page_crossing_costs_are_address_only" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val mr: R.Result[*u8, str] = A.zallocate[u8](?alloc, T_MEM_SIZE);
+    if (R.is_err[*u8, str](mr)) { ret 1; }
+    val mem: *u8 = R.unwrap_ok[*u8, str](mr);
+
+    var st: enc.EncodeState;
+    st.alloc = ?alloc;
+    st.buf   = enc.buf_init(?alloc);
+    if (R.is_err[bool, str](t_encode_roundtrip(?st, 4))) { ret 1; }
+
+    # a page-aligned parameter and one straddling the $0500 boundary each settle on one
+    # fixed count over the whole value sweep.
+    var aligned: u32 = 0;
+    var split:   u32 = 0;
+    if (t_check_roundtrip(?st, mem, 4, 0x0500, 0x0600, 256, ?aligned) != 0) { ret 1; }
+    if (t_check_roundtrip(?st, mem, 4, 0x04FE, 0x0600, 256, ?split)   != 0) { ret 1; }
+
+    # two of the four parameter bytes cross the page, so the straddled placement costs
+    # exactly two more cycles - address-driven, and identical for every value.
+    if (split != aligned + 2) { ret 1; }
+
+    enc.buf_dnit(?st.buf);
+    A.deallocate[u8](?alloc, mem, T_MEM_SIZE);
     ret 0;
 }

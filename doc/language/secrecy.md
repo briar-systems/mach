@@ -110,6 +110,26 @@ fun erase(p: *^u8) ptr { ret p; }     # error: cannot erase a secret pointer to 
 uni Bad { a: ^u32; b: u32; }          # error: variants disagree on secrecy
 ```
 
+The union rule is a property of the union **type**, not of the syntax that
+declared it, so it holds for an inline `uni { ... }` with no declaration to hang
+a check on, and at every **instance** of a generic union. At the declaration a
+variant typed by a generic parameter says nothing about secrecy, so `uni U[T] {
+a: T; b: u32; }` agrees there and is decided where each instance is formed:
+
+```mach
+uni U[T] { a: T; b: u32; }
+rec Box[T] { u: U[T]; }
+
+var s: U[^u32];                       # error: this instantiation makes the variants disagree
+var b: Box[^u32];                     # same error: the instance need not be spelled
+var p: U[u32];                        # fine, and so is an all-secret instantiation
+```
+
+A *partially* concrete template (`U[T, ^u32]` written inside another generic) is
+a legal annotation with both legal and illegal instantiations, so it is never
+rejected where it is written — only at the arguments that actually make a pair
+mixed.
+
 The check is **deep** and **fails closed**: a secret nested anywhere inside an
 aggregate (including a generic instance's lazily-materialized fields) counts as
 secret at these boundaries, and a placement the checker cannot prove severs no
@@ -193,6 +213,11 @@ What does not hold — the known open holes:
 - a literal shift count coerces to `^T` and inherits secrecy, tripping the
   constant-time shift gate — a false positive; it fails safe
   (briar-systems/mach#2196)
+- an anonymous `uni` nested in a **generic** record does not get union layout:
+  its variants occupy distinct storage instead of overlapping
+  (briar-systems/mach#2239). A layout defect, not a secrecy one — the mixed-secrecy
+  rule rejects those instantiations either way — but it is the reason a
+  `Result[^u32, u32]` built before that rule landed leaked nothing at run time
 
 The validator's scope is the lowered MIR; it trusts instruction selection, width
 legalization, register allocation, and encoding to be timing-preserving.

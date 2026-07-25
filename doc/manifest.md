@@ -111,26 +111,32 @@ to whichever *declared* target matches the host.
 
 | Axis  | Values |
 |-------|--------|
-| `isa` | `x86_64`, `aarch64`, `riscv64` |
+| `isa` | `x86_64`, `aarch64`, `riscv64`, `spirv`, `mos6502` |
 | `os`  | `linux`, `windows`, `darwin`, `freestanding` |
-| `abi` | `sysv64`, `win64`, `aapcs64`, `lp64` |
+| `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `spirv`, `mos6502` |
 
 `x86_64`/`linux`/`sysv64` is the primary host and target. `aarch64`-linux builds
 and runs natively in CI on every PR; `riscv64`-linux runs under qemu and
 self-hosts (#1852). `windows` is a supported cross-compilation target (PE/COFF,
 Win64 ABI). `darwin`'s ABI and object-format support exist but the toolchain is not
 yet validated end-to-end. `freestanding` targets a raw flat image with no OS
-runtime.
+runtime. `spirv` is not a machine at all — it emits a finished GPU module rather
+than machine code (see [Finished-module targets](#finished-module-targets)).
+
+`mach info targets` prints the tuples this binary can actually build; it is
+derived from the same declarations composition reads, so it never advertises a
+tuple that would fail to resolve.
 
 A value outside its axis's set is a strict-parse error, so a typo is caught rather
 than silently never matching.
 
 ### Object-format override
 
-`of` overrides the object format an OS implies. Each os has a default format —
+`of` overrides the object format a target implies. Each os has a default format —
 `linux` → `elf`, `windows` → `coff`, `darwin` → `macho`, `freestanding` → `raw` —
 and `of` names a different one from the same closed set: `elf`, `coff`, `macho`,
-`raw`. It is the only optional key on a target; omit it to take the os default.
+`raw`, `spv`. It is the only optional key on a target; omit it to take the
+default.
 
 ```toml
 [target.metal]
@@ -139,6 +145,40 @@ os  = "freestanding"   # os default object format is "raw"
 abi = "sysv64"
 of  = "elf"            # override: emit an ELF object instead
 ```
+
+The default is a function of the whole tuple, not the os alone. An os default
+carries relocatable machine text, which a whole-module emitter does not produce,
+so a `spirv` target resolves to `spv` — the format that carries a finished
+module — regardless of the os it names.
+
+An `of` naming a format whose emission shape does not match the instruction set's
+is refused at composition (`instruction set 'spirv' emits finished modules, but
+object format 'raw' carries linkable objects`), so the override cannot compose a
+tuple that would emit nothing.
+
+### Finished-module targets
+
+A `spirv` target's object output is a complete, self-contained module rather than
+a link input. The build therefore delivers the **module tree** — one
+`<out>/obj/<fqn-as-path>.spv` per module — and runs no link phase, so a default
+build and `--emit obj` produce the same files:
+
+```toml
+[target.gpu]
+isa = "spirv"
+os  = "freestanding"
+abi = "spirv"
+# no `of`: the finished-module format resolves on its own
+```
+
+```
+mach build . --target gpu     # writes out/gpu/<profile>/obj/<module>.spv
+```
+
+The artifact's `out` template and `-o` name a linked binary, which such a target
+has none of; the module tree is delivered instead. A `static` or `shared`
+artifact kind, and `mach test`, are refused by name — there is no archive, shared
+object, or executable form for a module.
 
 ## `[profile.<name>]`
 
@@ -151,9 +191,11 @@ live here because they are variant concerns.
 | `debug` | bool    | Emit debug info (DWARF on ELF/Mach-O, CodeView on COFF) for this profile. Gates emission only, never the optimizer, so a `release` profile can keep symbols with `debug = true`. A non-boolean is a manifest error. |
 | `simd`  | string  | SIMD scalarization lever. `"scalarize"` builds for a target without hardware SIMD by emitting a defined unrolled scalar expansion of each vector operator, with a build-time note (the "skipped N target-gated modules" style). `"require"` makes a build for an incapable target a hard error naming the offending operator. Any other string is a manifest error. |
 | `vectorize` | bool | **Optional** auto-vectorization lever; absent it defaults to `true`. When `true`, the release pipeline rewrites provably-safe counted loops to 128-bit SIMD on a target with hardware vectors; `false` skips the pass, so release output stays scalar. A non-boolean is a manifest error. |
+| `float_reassoc` | bool | **Optional** permission to treat floating-point addition and multiplication as **associative**; absent it defaults to `false`. It lets the vectorizer reduce an `f32`/`f64` accumulator through lane-count partial sums, which changes the result — see [Float reassociation](#float-reassociation) for what that costs and what it buys. A non-boolean is a manifest error. |
 
 Three keys (`opt`, `debug`, `simd`) are required in a declared profile;
-`vectorize` is optional and defaults to on.
+`vectorize` and `float_reassoc` are optional, defaulting to on and off
+respectively.
 Emission of the human-readable IR and assembly side-artifacts is **not** a profile
 concern — it is controlled only by the `--emit-ir` / `--emit-asm` CLI flags (see
 [cli.md](cli.md)).
@@ -167,12 +209,78 @@ hardware vectors (riscv64) never enters the pass, so `vectorize = false` changes
 performance and never semantics. For a single function, the `#[scalar]` decorator is
 the finer-grained opt-out (see [language/decorators.md](language/decorators.md)).
 
-The `simd` and `vectorize` levers are always the **consumer's**. Consistent with the
-root-vs-dependency strictness above, a dependency's `[profile.*]` is parsed
-permissively and never read to build the consumer, so a library's values are inert —
-the effective levers come from the consumer's resolved profile. Libraries set nothing
-SIMD-specific and inherit the consumer's choice; there is no ecosystem fork and no
-dual API.
+`float_reassoc` is the one lever here that *adds*, and the only profile key that can
+change a program's computed answer. It widens that same pass to float reductions and
+does nothing else; `vectorize = false` switches the pass off wholesale and so overrides
+it.
+
+The `simd`, `vectorize` and `float_reassoc` levers are always the **consumer's**.
+Consistent with the root-vs-dependency strictness above, a dependency's `[profile.*]`
+is parsed permissively and never read to build the consumer, so a library's values are
+inert — the effective levers come from the consumer's resolved profile. Libraries set
+nothing SIMD-specific and inherit the consumer's choice; there is no ecosystem fork and
+no dual API.
+
+### Float reassociation
+
+`float_reassoc = true` grants the optimizer exactly one liberty: it may treat
+floating-point `+` and `*` as **associative**, and regroup a reduction accordingly.
+Nothing else changes. It does not license reciprocal substitution for division,
+assumptions that operands are finite or non-NaN, contraction into a fused
+multiply-add, or flushing subnormals to zero. Each of those would be its own key, with
+its own argument.
+
+What it unlocks is the reduction vectorizer. `s = s + a[i]` is a serial dependence
+chain: every iteration must wait for the previous one's rounded result, so it cannot be
+done four lanes at a time without regrouping the additions. With the key set, the loop
+becomes lane-count independent partial accumulators plus a horizontal combine at the
+end — which computes a *differently grouped*, and therefore differently rounded, sum.
+Element-wise float loops (`a[i] = b[i] * c[i]`) never needed the key and are
+unaffected: each lane performs exactly the operation the scalar loop performed.
+
+The reductions it admits are sum (`s = s + x`), product (`s = s * x`), and the dot /
+matmul inner loop (`s = s + a[i]*b[i]`). Subtraction and division reductions are not
+associative in real arithmetic either, so they are refused with the key set exactly as
+without it.
+
+**The accuracy cost, measured.** Summing one million `f64` values of `0.1`, scored
+against a compensated (Kahan) reference on x86-64:
+
+| ordering | result | relative error |
+|---|---|---|
+| strict, sequential | `100000.00000133288` | 1.33e-11 |
+| reassociated, 2 lanes | `99999.9999991058` | 8.94e-12 |
+
+The two answers differ from **each other** by 2.2e-11 relative — about 153,000 `f64`
+ULPs at that magnitude. The same experiment in `f32` (4 lanes) differs by 1.2e-2
+relative: strict gives `100958.34`, reassociated `99759.85`, against a true value of
+`100000.0`.
+
+Note the direction. In both cases the *reassociated* answer is the more accurate one,
+because splitting into per-lane partials keeps each running total smaller and so grinds
+off fewer low bits — the same reason pairwise summation beats sequential summation. But
+that is a property of this input, not a guarantee. The honest statement is that the
+result **changes**, by roughly the accumulated rounding error of the sum, in a direction
+that depends on the data. Code whose correctness depends on the exact bit pattern of a
+float reduction — a checksum, a reproducibility requirement, a comparison against a
+reference implementation — must leave the key off.
+
+Two exactness properties are preserved rather than traded away. The idle lanes are
+seeded with the op's **exact** IEEE identity — `-0.0` for addition (`x + (-0.0)` is `x`
+for every `x`, where `+0.0` would turn a negative-zero sum positive) and `1.0` for
+multiplication — so no signed-zero or NaN behaviour changes. And a trip count below the
+lane count never enters the vector loop at all, so short reductions are bit-identical
+regardless of the key.
+
+The key is profile-wide. For a single function, `#[scalar]` opts out of vectorization
+entirely and takes precedence over it, so a routine that must stay IEEE-strict inside
+an otherwise-reassociating build has a spelling. There is no per-function opt-*in*:
+whether a reduction may be reassociated is the caller's tolerance to decide, not the
+callee author's.
+
+Integer reductions are untouched by this key. They vectorize unconditionally and are
+bit-identical to the scalar reference, because integer add / xor / or / and reassociate
+exactly.
 
 The CLI selects and overrides at invocation time: `--profile <name>` picks the
 profile; `-g` forces `debug` on for one build regardless of the profile's key
