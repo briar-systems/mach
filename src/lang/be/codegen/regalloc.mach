@@ -14,9 +14,15 @@
 #      a fixpoint, since dropping one copy can make an earlier copy into its source
 #      dead). This runs on the raw blocks, so the flat stream and ranges below are
 #      built once on already-clean instruction lists;
-#   2. blocks are reordered into reverse-postorder so the flat instruction stream
+#   2. COPY COALESCING: every copy whose two vregs are each assigned exactly once
+#      merges them into one web and deletes the copy outright, so the allocator
+#      never sees it. Single assignment on both sides makes the rename
+#      unconditionally value-preserving, and the merged interval is the union of two
+#      overlapping ones, so pressure is non-increasing (see `coalesce_copies`). Runs
+#      on the raw blocks with the sweep, before any position-dependent structure;
+#   3. blocks are reordered into reverse-postorder so the flat instruction stream
 #      reads in a topological order;
-#   3. one merged live range per vreg is built over that stream from def/use of
+#   4. one merged live range per vreg is built over that stream from def/use of
 #      `MIR_OP_VREG` operands (including a `MIR_OP_MEM` base vreg), then extended by
 #      per-block live-in/live-out from a backward dataflow fixpoint. THE RANGE MODEL
 #      is a single contiguous [start, end] interval bounding register occupancy:
@@ -26,27 +32,32 @@
 #      mid-block adds no phantom tail, a value born mid-block and flowing out adds
 #      no phantom head - while a loop-carried value (live-in AND live-out) still
 #      spans its blocks;
-#   4. `MIR_OP_PREG` operands (the ABI param / argument / return pre-coloring
+#   5. `MIR_OP_PREG` operands (the ABI param / argument / return pre-coloring
 #      `lower_ir` emitted) are FIXED - their physical register is reserved for
 #      the instruction that names it, and incoming param-register lifetimes are
 #      held busy from entry until the `MOV vreg <- preg` that captures them;
-#   5. COPY HINTS: each vreg first defined by a plain register copy records its
-#      source register; a loop-carried phi copy additionally records a REVERSE hint
-#      on its source so the web's last def biases onto the loop register (step done
-#      before the scan);
-#   6. ranges are assigned in start order (ties broken by ascending end, so a copy
+#   6. COPY HINTS, for the copies the webs could not merge: each vreg first defined
+#      by a plain register copy records its source register (as does the destination
+#      of a two-address op the encoder seeds with its left operand); each vreg a
+#      precolored `MOV preg <- v` consumes records that ABI SINK register; and a
+#      loop-carried phi copy records a REVERSE hint on its source so the web's last
+#      def biases onto the loop register (step done before the scan);
+#   7. ranges are assigned in start order (ties broken by ascending end, so a copy
 #      source dying at the copy colors before its destination). Each range prefers
 #      its copy-source register when the hint can be honored (`pick_hint`), so the
-#      copy collapses to a self-move dropped at rewrite; a loop-carried source
+#      copy collapses to a self-move dropped at rewrite; failing that the ABI
+#      register it is placed into (`pick_sink_hint`); a loop-carried source
 #      instead SHARES its still-live destination's register (`pick_target_hint`),
 #      collapsing the latch copy the forward hint cannot reach across the back edge;
 #      otherwise a call-crossing range prefers callee-saved and others caller-saved.
+#      Every hint is checked against the same interference tests the ordinary pick
+#      applies, so no honored hint takes a register the ordinary pick could not have.
 #      On pressure the lowest-density victim is spilled to a fresh `SLOT_SPILL` frame
 #      slot;
-#   7. around each `MIR_CALL` - the caller-saved clobber barrier (see its MIR
+#   8. around each `MIR_CALL` - the caller-saved clobber barrier (see its MIR
 #      definition) - any live vreg whose assigned register is caller-saved (or
 #      any FP register) is spilled and reloaded;
-#   8. a final pass rewrites every `MIR_OP_VREG` to its assigned `MIR_OP_PREG` and
+#   9. a final pass rewrites every `MIR_OP_VREG` to its assigned `MIR_OP_PREG` and
 #      drops any full-width register move whose operands rewrote to the same
 #      physical register (a coalesced copy);
 #      a `MIR_OP_MEM` base that is a value-pointer vreg becomes a physical-register
@@ -143,7 +154,9 @@ rec BlockSpan {
 # src`), the scan prefers to color `v` onto `src`'s register so the copy collapses
 # to `mov x, x` and is dropped at rewrite. The two source shapes are mutually
 # exclusive per hint; a copy with an immediate or otherwise unhintable source
-# leaves both source fields at their empty sentinels.
+# leaves both source fields at their empty sentinels. The two-address TIE hint
+# (#2203) fills the same slots for the seeding move an encoder materializes rather
+# than one the MIR carries - see `maybe_tie_hint`.
 #
 # REVERSE hint: for a loop-carried phi copy `MOV d <- v` whose destination `d` is
 # live BEFORE the copy (a loop-header phi target the back edge feeds), the source
@@ -454,6 +467,12 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
     val ds: R.Result[bool, str] = sweep_dead_movs(tgt, ?ctx);
     if (R.is_err[bool, str](ds)) { ctx_dnit(?ctx); ret ds; }
 
+    # copy hygiene, step 2: merge each copy-related pair of single-assignment vregs
+    # into one web and delete the copy, so the flat stream and the live ranges below
+    # are built on instruction lists the copies have already left.
+    val cc: R.Result[bool, str] = coalesce_copies(tgt, ?ctx);
+    if (R.is_err[bool, str](cc)) { ctx_dnit(?ctx); ret cc; }
+
     val bo: R.Result[bool, str] = build_order(?ctx);
     if (R.is_err[bool, str](bo)) { ctx_dnit(?ctx); ret bo; }
 
@@ -475,8 +494,8 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
     val mc: R.Result[bool, str] = mark_call_crossing(?ctx);
     if (R.is_err[bool, str](mc)) { ctx_dnit(?ctx); ret mc; }
 
-    # copy hygiene, step 2: record each vreg's copy-source hint so the scan can bias
-    # coloring toward it and collapse the copy to a self-move dropped at rewrite.
+    # copy hygiene, step 3: record each vreg's copy hints so the scan can bias
+    # coloring toward them and collapse the copies the webs could not merge.
     build_hints(tgt, ?ctx);
 
     val sc: R.Result[bool, str] = linear_scan(tgt, ?ctx);
@@ -1300,6 +1319,239 @@ fun instr_reads_vreg(mi: *mir.MirInstr, v: u32) bool {
     ret false;
 }
 
+# the representative of vreg `v`'s coalescing web, with path compression
+fun web_find(parent: *u32, v: u32) u32 {
+    var r: u32 = v;
+    for (parent[r] != r) { r = parent[r]; }
+    var c: u32 = v;
+    for (parent[c] != r) {
+        val n: u32 = parent[c];
+        parent[c] = r;
+        c = n;
+    }
+    ret r;
+}
+
+# tally, per vreg, how many times it is DEFINED across the whole function. a def is
+# operand 0 of a defining instruction, the same classification `build_ranges` and
+# the dead-def sweep apply; the call-result marker and stores define nothing
+fun tally_defs(ctx: *AllocCtx, defs: *u32, nv: u32) {
+    val f: *mir.MirFunction = ctx.f;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            if (instr_defines(mi)) {
+                val d: *mir.MirOperand = ?mi.operands[0];
+                if (d.vreg < nv) { defs[d.vreg] = defs[d.vreg] + 1; }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+}
+
+# merge the copy `MOV d <- s`'s two vregs into one web when the merge is
+# unconditionally value-preserving, returning true when a merge happened
+#
+# The safety condition is single-assignment on BOTH webs. `d`'s only definition is
+# this copy and `s`'s only definition is elsewhere, so at every point `d` is live it
+# holds exactly the value `s` holds: `s`'s definition dominates the copy (it is read
+# there), the copy dominates every use of `d` (it is `d`'s only definition), and no
+# redefinition of either can fall between - there is none anywhere. Renaming every
+# `d` to `s` is therefore correct under any control flow, back edges included, with
+# no interference graph and no dominance computation.
+#
+# The shape guards: both operands are value vregs of one register class and one
+# secrecy / vector marking (a declassifying move, which isel retags to the ordinary
+# machine move, has mismatched secrecy and is refused); neither owns lowering
+# storage, which is addressed as a frame slot rather than held in a register; and
+# the copy is full machine width, since a narrower one carries a zero-extension that
+# deleting it would drop
+fun try_coalesce(tgt: *target.Target, ctx: *AllocCtx, mi: *mir.MirInstr,
+                 parent: *u32, web_defs: *u32, nv: u32) bool {
+    if (!instr_is_reg_copy(tgt, mi))  { ret false; }
+    if (mi.width < ctx.spill_width)   { ret false; }
+    val dop: *mir.MirOperand = ?mi.operands[0];
+    val sop: *mir.MirOperand = ?mi.operands[1];
+    if (dop.kind != mir.MIR_OP_VREG || sop.kind != mir.MIR_OP_VREG) { ret false; }
+    val d: u32 = dop.vreg;
+    val s: u32 = sop.vreg;
+    if (d >= nv || s >= nv || d == s)                { ret false; }
+    if (vreg_has_slot(ctx, d) || vreg_has_slot(ctx, s)) { ret false; }
+
+    val dv: *mir.MirVReg = ?ctx.f.vregs[d];
+    val sv: *mir.MirVReg = ?ctx.f.vregs[s];
+    if (dv.class  != sv.class)  { ret false; }
+    if (dv.secret != sv.secret) { ret false; }
+    if (dv.vector != sv.vector) { ret false; }
+
+    val rd: u32 = web_find(parent, d);
+    val rs: u32 = web_find(parent, s);
+    if (rd == rs)            { ret false; }
+    if (web_defs[rd] != 1)   { ret false; }
+    if (web_defs[rs] != 1)   { ret false; }
+
+    # the source's web keeps the representative, so the surviving name is the one
+    # whose definition survives; `d`'s single definition is this copy, which
+    # `drop_self_copies` deletes once both operands rename to `rs`. the merged web
+    # therefore still holds exactly one definition and the invariant carries.
+    parent[rd] = rs;
+    ret true;
+}
+
+# rewrite every vreg reference in the function to its web representative
+#
+# Covers value operands, a MEM base and scaled index, and the -g debug bindings.
+# Frame-slot keys are deliberately untouched: a slot-owning vreg is never merged, so
+# its representative is itself, and the frame table keys on that id
+fun rename_vregs(ctx: *AllocCtx, parent: *u32, nv: u32) {
+    val f: *mir.MirFunction = ctx.f;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            var k: u32 = 0;
+            for (k < mi.operand_count) {
+                val op: *mir.MirOperand = ?mi.operands[k];
+                if (op.kind == mir.MIR_OP_VREG && op.vreg < nv) {
+                    op.vreg = web_find(parent, op.vreg);
+                } or (op.kind == mir.MIR_OP_MEM) {
+                    if (op.vreg != mir.MIR_VREG_NIL && op.vreg < nv) {
+                        op.vreg = web_find(parent, op.vreg);
+                    }
+                    if (!op.index_is_preg && op.index != mir.MIR_VREG_NIL && op.index < nv) {
+                        op.index = web_find(parent, op.index);
+                    }
+                }
+                k = k + 1;
+            }
+            var b: u32 = 0;
+            for (b < mi.dbg_binding_count) {
+                val db: *mir.MirDbgBinding = ?mi.dbg_bindings[b];
+                if (db.vreg  != mir.MIR_VREG_NIL && db.vreg  < nv) { db.vreg  = web_find(parent, db.vreg); }
+                if (db.vreg2 != mir.MIR_VREG_NIL && db.vreg2 < nv) { db.vreg2 = web_find(parent, db.vreg2); }
+                b = b + 1;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+}
+
+# delete every full-width register copy both of whose operands name the same vreg -
+# the coalesced copies `rename_vregs` collapsed. a sub-word self-move is kept: it
+# still zero-extends. mirrors the compaction of `sweep_dead_movs`, and a block always
+# ends in a terminator so it never empties
+fun drop_self_copies(tgt: *target.Target, ctx: *AllocCtx) {
+    val f: *mir.MirFunction = ctx.f;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var write: u32 = 0;
+        var read:  u32 = 0;
+        for (read < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[read];
+            var drop: bool = false;
+            if (instr_is_reg_copy(tgt, mi) && mi.width >= ctx.spill_width) {
+                val a: *mir.MirOperand = ?mi.operands[0];
+                val b: *mir.MirOperand = ?mi.operands[1];
+                drop = a.kind == mir.MIR_OP_VREG && b.kind == mir.MIR_OP_VREG && a.vreg == b.vreg;
+            }
+            if (drop) {
+                # the copy never reaches encode; release its operand array. a -g
+                # binding on it is released with it - the variable reads as living in
+                # the web's register from its own binding, which survives on the
+                # instructions that remain.
+                if (mi.operands != nil && mi.operand_count > 0) {
+                    A.deallocate[mir.MirOperand](ctx.alloc, mi.operands, mi.operand_count::usize);
+                }
+                if (mi.dbg_bindings != nil && mi.dbg_binding_count > 0) {
+                    A.deallocate[mir.MirDbgBinding](ctx.alloc, mi.dbg_bindings, mi.dbg_binding_count::usize);
+                }
+            } or {
+                if (write != read) { blk.instrs[write] = blk.instrs[read]; }
+                write = write + 1;
+            }
+            read = read + 1;
+        }
+        blk.instr_count = write;
+        bi = bi + 1;
+    }
+}
+
+# coalesce copy-related virtual registers into shared webs
+#
+# The conservative copy coalescing of issue #2203, and the one half of it that is a
+# rewrite rather than a coloring bias: a copy whose two values are each assigned
+# exactly once is deleted outright and its two vregs become one, so the allocator
+# never sees the copy at all. This reaches the shape no allocation hint can - a copy
+# of a value that stays LIVE past it, where source and destination genuinely coexist
+# but hold the same value, which a hint cannot express because the source's register
+# is still busy.
+#
+# It cannot increase register pressure. Under the one-merged-interval-per-vreg range
+# model the source is live at the copy (it is read there) and the destination begins
+# there, so the two intervals always overlap and their union is itself an interval -
+# exactly the merged web's interval. Every point where the merged value is live had
+# at least one of the two live before, and every point where both were live now
+# holds one value instead of two. So the maximum number of simultaneously live values
+# is non-increasing everywhere, and coalescing can never force a spill that was not
+# already forced. That is the bound on the aggressive-coalescing hazard: this
+# coalescer has no uncolorable case to bound.
+#
+# Runs before block ordering / flattening, so the flat stream, the live ranges and
+# the liveness fixpoint are all built once on the already-coalesced instruction lists.
+# ---
+# tgt: the active target, for the ISA's register-move classifier
+# ctx: the allocation context whose function is coalesced in place
+# ret: ok(true), or an error string on an allocation failure
+fun coalesce_copies(tgt: *target.Target, ctx: *AllocCtx) R.Result[bool, str] {
+    val f: *mir.MirFunction = ctx.f;
+    val nv: u32 = f.vreg_count;
+    if (nv == 0)                     { ret R.ok[bool, str](true); }
+    if (tgt.arch.is_reg_move == nil) { ret R.ok[bool, str](true); }
+
+    val rp: R.Result[*u32, str] = A.allocate[u32](ctx.alloc, nv::usize);
+    if (R.is_err[*u32, str](rp)) { ret R.err[bool, str](R.unwrap_err[*u32, str](rp)); }
+    val parent: *u32 = R.unwrap_ok[*u32, str](rp);
+    val rw: R.Result[*u32, str] = A.allocate[u32](ctx.alloc, nv::usize);
+    if (R.is_err[*u32, str](rw)) {
+        A.deallocate[u32](ctx.alloc, parent, nv::usize);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](rw));
+    }
+    val web_defs: *u32 = R.unwrap_ok[*u32, str](rw);
+
+    var i: u32 = 0;
+    for (i < nv) { parent[i] = i; web_defs[i] = 0; i = i + 1; }
+    tally_defs(ctx, web_defs, nv);
+
+    var merged: bool = false;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            if (try_coalesce(tgt, ctx, ?blk.instrs[ii], parent, web_defs, nv)) { merged = true; }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    if (merged) {
+        rename_vregs(ctx, parent, nv);
+        drop_self_copies(tgt, ctx);
+    }
+
+    A.deallocate[u32](ctx.alloc, web_defs, nv::usize);
+    A.deallocate[u32](ctx.alloc, parent, nv::usize);
+    ret R.ok[bool, str](true);
+}
+
 # true when vreg `d` is read at any flat position strictly between `from` and `to`.
 # the caller guarantees the window is one block's straight line (no control flow
 # enters or leaves it), so a position-order scan is exact - the soundness basis of
@@ -1351,6 +1603,12 @@ fun reads_in_window(ctx: *AllocCtx, d: u32, from: i64, to: i64) bool {
 # First-write-wins per source vreg: a value placed into two argument registers can
 # only be colored to one of them.
 #
+# TIE (#2203): a two-address arithmetic op `OP [dst, lhs, rhs]` is materialized by
+# the encoder as `MOV dst, lhs ; OP dst, rhs`, so `dst` is copy-related to `lhs`
+# exactly as if the seeding move were in the MIR. When `lhs` dies at the op and
+# `dst` is born there, `dst` records `lhs` in the forward slots and the same
+# register transfer collapses the seed the encoder would otherwise emit.
+#
 # Runs after flatten / liveness so `flat_instr` and the ranges are available.
 fun build_hints(tgt: *target.Target, ctx: *AllocCtx) {
     if (tgt.arch.is_reg_move == nil) { ret; }
@@ -1374,9 +1632,48 @@ fun build_hints(tgt: *target.Target, ctx: *AllocCtx) {
             }
             maybe_sink_hint(ctx, mi, pos, nv);
             maybe_reverse_hint(ctx, mi, pos, nv);
+        } or {
+            maybe_tie_hint(ctx, mi, pos, nv);
         }
         pos = pos + 1;
     }
+}
+
+# true when a selection-output opcode is one of the two-address arithmetic forms -
+# the family `mir` documents as two-address, which an encoder whose ISA has no
+# three-address form materializes as `MOV dst, lhs ; OP dst, rhs`. Read as data
+# from the opcode a rule pack emitted, never as a branch on an architecture: a pack
+# that selects a native three-address instruction never produces these sentinels
+# and so is never tie-hinted, which is exactly right - it needs no seeding move
+fun is_two_address_op(op: mir.MirOpcode) bool {
+    ret op == mir.MIR_SEL_ADD || op == mir.MIR_SEL_SUB   || op == mir.MIR_SEL_MUL ||
+        op == mir.MIR_SEL_AND || op == mir.MIR_SEL_OR    || op == mir.MIR_SEL_XOR ||
+        op == mir.MIR_SEL_SHL || op == mir.MIR_SEL_SHR_U || op == mir.MIR_SEL_SHR_S;
+}
+
+# record the two-address tie hint for `OP [dst, lhs, rhs]` at `pos`: the encoder
+# will seed `dst` with `lhs` before operating in place, so coloring `dst` onto
+# `lhs`'s register erases that seeding move
+#
+# Recorded through the ordinary forward-hint slots, so `pick_hint` honors it by the
+# same register transfer a defining copy uses: `lhs` dies exactly here and `dst` is
+# born exactly here, the two conditions `can_transfer` requires, so the two provably
+# never coexist and the register passes intact from one to the other. Both are
+# re-checked here rather than left to `pick_hint`, since the hint slot is
+# first-write-wins and a tie that could never be honored would displace a real one
+fun maybe_tie_hint(ctx: *AllocCtx, mi: *mir.MirInstr, pos: u32, nv: u32) {
+    if (!is_two_address_op(mi.opcode)) { ret; }
+    if (mi.operand_count < 3)          { ret; }
+    val d: *mir.MirOperand = ?mi.operands[0];
+    val l: *mir.MirOperand = ?mi.operands[1];
+    if (d.kind != mir.MIR_OP_VREG || l.kind != mir.MIR_OP_VREG) { ret; }
+    if (d.vreg >= nv || l.vreg >= nv || d.vreg == l.vreg)       { ret; }
+    if (ctx.hints[d.vreg].src_vreg != mir.MIR_VREG_NIL
+        || ctx.hints[d.vreg].src_preg >= 0)                     { ret; }
+    if (ctx.ranges[l.vreg].end_pos != pos::i64)                 { ret; }
+    if (ctx.ranges[d.vreg].start != pos::i64)                   { ret; }
+    ctx.hints[d.vreg].src_vreg = l.vreg;
+    ctx.hints[d.vreg].copy_pos = pos::i64;
 }
 
 # record the sink hint for a precolored placement move `MOV preg <- v` at `pos`,
