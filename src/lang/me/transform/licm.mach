@@ -55,6 +55,38 @@
 #           a parameter, a loaded pointer, a phi -- may, and declines the hoist.
 #   5. Volatile loads and stores are never moved.
 #
+# REGISTER-PRESSURE BUDGET (#2255). Safety says what MAY move; whether it is worth
+# moving depends on whether the loop has a register to keep the lifted value in. A
+# value in the preheader is live across every iteration, so it holds one register of
+# its bank for the loop's whole execution. Each loop therefore carries a budget:
+#
+#   - its DEMAND is what the loop's busiest point would need with the candidate, and
+#     every value already lifted, live throughout -- a backward liveness solve over
+#     the function (`solve_liveness`) re-read per candidate (`loop_peak`). Measuring
+#     it that way rather than adding one per hoist is what keeps it honest: a hoisted
+#     value was ALREADY live over part of the loop, so its true cost at the busiest
+#     point is zero as often as it is one;
+#   - its SUPPLY is the register file the target describes: a bank's declared size
+#     less the registers the model withholds from value allocation (`bank_budget`).
+#
+# Under budget, a hoist is pure gain and is taken. Over it, the lifted value (or one
+# it displaces) spills and its uses become reloads -- one instruction per iteration --
+# so the hoist only pays when what it removes from the body costs MORE than that
+# reload. An address does: `OP_GEP` names a whole address computation the back end
+# rebuilds in several instructions, and the arithmetic feeding one is part of the same
+# rebuild. A WIDTH CAST does not, even inside an address chain: it re-presents an index
+# the loop already holds, and the allocator cannot coalesce the result with its source,
+# so the loop carries the datum twice for at most one instruction saved. Everything
+# else -- load, reinterpret, arithmetic, comparison -- is one instruction, and one
+# instruction for one reload cannot pay.
+#
+# Neither number is tuned; both are read from the program and the target. Where
+# either is missing -- a whole-module emitter with no register machine, or a bank the
+# model does not declare -- there is no budget and hoisting is decided on safety
+# alone. The estimate is over IR values, one stage ahead of the selection that fuses
+# and folds some of them, so it is an estimate and not a bound; declining a hoist only
+# forgoes a win, so an inexact one is never a correctness question.
+#
 # The pass runs in the release pipeline only, so debug output is unchanged. It is
 # safe inside an `#[oblivious]` function: every decision is made from the static IR
 # shape and never from a runtime value, no control flow is introduced, nothing is
@@ -80,6 +112,7 @@ use mach.lang.me.ir.instruction;
 use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
 use mach.lang.target;
+use mach.lang.target.isa;
 use loops: mach.lang.me.analysis.loops;
 use dep: mach.lang.me.analysis.dependence;
 
@@ -126,11 +159,20 @@ fun licm_function(m: *ir.Module, fn: *ir.Function, tgt: *target.Target) R.Result
     val order: *u32 = R.unwrap_ok[*u32, str](ro);
     order_innermost_first(?la, order);
 
+    val rpr: R.Result[Pressure, str] = pressure_init(m, fn, ?la, tgt);
+    if (R.is_err[Pressure, str](rpr)) {
+        A.deallocate[u32](m.alloc, order, n::usize);
+        loops.dnit(?la);
+        ret R.err[bool, str](R.unwrap_err[Pressure, str](rpr));
+    }
+    var pr: Pressure = R.unwrap_ok[Pressure, str](rpr);
+
     var changed: bool = false;
     var oi: u32 = 0;
     for (oi < n) {
-        val rl: R.Result[bool, str] = licm_loop(m, fn, ?la, order[oi], tgt);
+        val rl: R.Result[bool, str] = licm_loop(m, fn, ?la, order[oi], tgt, ?pr);
         if (R.is_err[bool, str](rl)) {
+            pressure_dnit(?pr);
             A.deallocate[u32](m.alloc, order, n::usize);
             loops.dnit(?la);
             ret rl;
@@ -139,6 +181,7 @@ fun licm_function(m: *ir.Module, fn: *ir.Function, tgt: *target.Target) R.Result
         oi = oi + 1;
     }
 
+    pressure_dnit(?pr);
     A.deallocate[u32](m.alloc, order, n::usize);
     loops.dnit(?la);
     ret R.ok[bool, str](changed);
@@ -181,18 +224,22 @@ fun order_innermost_first(la: *loops.LoopAnalysis, order: *u32) {
 # which sits before the preheader's terminator because a block's terminator is not
 # part of its instruction list.
 # ---
-# m:   module owning the allocator
-# fn:  the function
-# la:  the loop analysis, kept in step with every move
-# lx:  index into la.loops
-# tgt: the target
-# ret: ok(true) if anything moved, or an allocation error
-fun licm_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, tgt: *target.Target) R.Result[bool, str] {
+# m:        module owning the allocator
+# fn:       the function
+# la:       the loop analysis, kept in step with every move
+# lx:       index into la.loops
+# tgt:      the target
+# pr:       the function's register-pressure state
+# ret:      ok(true) if anything moved, or an allocation error
+fun licm_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, tgt: *target.Target,
+              pr: *Pressure) R.Result[bool, str] {
     val lp: *loops.Loop = ?la.loops[lx];
     val pre_id: id.BlockId = lp.preheader;
     if (pre_id == id.BLOCK_NIL) { ret R.ok[bool, str](false); }
 
     val opaque: bool = loop_has_opaque_effect(fn, la, lx);
+
+    if (pr.active) { fill_addr_feeders(fn, la, lx, pr); }
 
     var changed: bool = false;
     var ri: u32 = 0;
@@ -208,7 +255,9 @@ fun licm_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32,
             val iid: id.InstructionId = blk.instructions[k];
             k = k + 1;
 
-            if (hoistable(m, fn, la, lx, tgt, iid, opaque)) {
+            if (hoistable(m, fn, la, lx, tgt, iid, opaque) &&
+                pressure_admits(m, fn, pr, la, lx, iid, fn.instrs[iid::u32].kind)) {
+                if (iid::u32 < pr.nvals) { bit_set(pr.hoisted, iid::u32); }
                 val rp: R.Result[bool, str] = ir.block_append_instr(m, ?fn.blocks[pre_id::u32], iid);
                 if (R.is_err[bool, str](rp)) { ret rp; }
                 val rs: R.Result[bool, str] = loops.set_instr_block(la, iid, pre_id);
@@ -227,6 +276,86 @@ fun licm_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32,
         blk.instr_count = w;
     }
     ret R.ok[bool, str](changed);
+}
+
+# true when lifting instruction `iid` out of loop `lx` is worth its register
+#
+# A value in the preheader is live across every iteration, so it holds one register
+# of its bank for the loop's whole execution. `loop_peak` reports what the loop's
+# busiest point would demand with that value -- and every value already lifted --
+# live throughout, which is exactly the pressure the allocator will see. While that
+# stays inside the register file the hoist is pure gain.
+#
+# Once the bank is full, the lifted value (or one it displaces) spills and every use
+# inside the loop becomes a RELOAD -- one instruction per iteration. So past the
+# budget the question is no longer "is this invariant" but "does what I remove from
+# the body cost more than the reload that replaces it":
+#
+#   - An address DOES. `OP_GEP` is the one IR opcode naming a whole address
+#     computation rather than a single machine operation, and `gep_is_worth_hoisting`
+#     has already restricted the candidates to the shapes no addressing mode can
+#     absorb. Rebuilding one costs several instructions every iteration, so trading
+#     it for a reload still pays. The index arithmetic FEEDING such a gep is part of
+#     the same rebuild (`addr_feed`): stranding one `add` in the body leaves the gep
+#     variant and forfeits the whole chain.
+#   - A WIDTH CAST does not, even inside an address chain. `zext` / `sext` / `trunc`
+#     do not compute an address; they re-present an index the loop already holds at
+#     another width, and unlike a same-width reinterpret the allocator cannot
+#     coalesce the result with its source. Admitting one under pressure makes the
+#     loop carry the same datum twice for at most one instruction saved, so a chain
+#     is cut where it crosses a width cast rather than followed through it.
+#   - Nothing else does. Every other invariant opcode -- a load, an arithmetic or
+#     bitwise operation, a comparison -- names one machine operation, so lifting it
+#     under pressure exchanges one instruction for one reload and cannot pay.
+#
+# This is a cost rule only: declining a safe hoist forgoes a win and never changes a
+# result. Where the register file is unavailable -- a target with no register machine,
+# or a bank the model does not declare -- there is no budget and the hoist is decided
+# on safety alone.
+# ---
+# m:    the module
+# fn:   the function
+# pr:   the function's pressure state
+# la:   the loop analysis
+# lx:   index into la.loops
+# iid:  the candidate instruction
+# kind: its opcode
+# ret:  true when the hoist is worth making
+fun pressure_admits(m: *ir.Module, fn: *ir.Function, pr: *Pressure, la: *loops.LoopAnalysis, lx: u32,
+                    iid: id.InstructionId, kind: instruction.InstrKind) bool {
+    if (!pr.active) { ret true; }
+
+    val bk: RegBank = bank_of_type(m, fn.instrs[iid::u32].ty);
+    if (bk == BANK_NONE) { ret true; }
+
+    var slot: u32 = NO_SLOT;
+    if (iid::u32 < pr.nvals) { slot = iid::u32; }
+
+    var gp: u32 = 0;
+    var fp: u32 = 0;
+    loop_peak(fn, pr, la, lx, slot, ?gp, ?fp);
+
+    var full: bool = false;
+    if (bk == BANK_GP)      { full = pr.budget_gp != 0 && gp > pr.budget_gp; }
+    or { if (bk == BANK_FP) { full = pr.budget_fp != 0 && fp > pr.budget_fp; } }
+
+    if (!full)                      { ret true; }
+    if (kind == instruction.OP_GEP) { ret true; }
+    if (is_width_cast(kind))        { ret false; }
+    ret slot != NO_SLOT && bit_get(pr.addr_feed, slot);
+}
+
+# true for the casts that re-present a value at a different width
+#
+# `OP_BITCAST` is deliberately absent: a same-width reinterpret selects to a plain
+# register copy, which coalescing removes, so the reinterpreted and original values
+# share a register and lifting one costs nothing. A width change cannot be coalesced
+# -- the two values genuinely differ -- so the loop carries the datum twice.
+# ---
+# k:   the opcode
+# ret: true for sext / zext / trunc
+fun is_width_cast(k: instruction.InstrKind) bool {
+    ret k == instruction.OP_SEXT || k == instruction.OP_ZEXT || k == instruction.OP_TRUNC;
 }
 
 # true when instruction `iid` may be relocated to the loop's preheader
@@ -627,13 +756,13 @@ fun pointer_root(fn: *ir.Function, p: value.Value) value.Value {
 # splitting it would add a preheader instruction, lengthen a live range, and save
 # nothing in the body.
 # ---
-# m:      the module
-# fn:     the function
-# la:     the loop analysis, updated with the new instruction's block
-# lx:     index into la.loops
-# iid:    the candidate gep
-# pre_id: the loop's preheader
-# ret:    ok(true) when the gep was split, or an allocation error
+# m:        the module
+# fn:       the function
+# la:       the loop analysis, updated with the new instruction's block
+# lx:       index into la.loops
+# iid:      the candidate gep
+# pre_id:   the loop's preheader
+# ret:      ok(true) when the gep was split, or an allocation error
 fun split_invariant_gep_prefix(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32,
                                iid: id.InstructionId, pre_id: id.BlockId) R.Result[bool, str] {
     if (iid::u32 >= fn.instr_len)                          { ret R.ok[bool, str](false); }
@@ -786,6 +915,612 @@ fun emit_prefix_gep(m: *ir.Module, fn: *ir.Function, iid: id.InstructionId, k: u
     val ri: R.Result[id.InstructionId, str] = ir.instruction_add(m, fn, ni);
     if (R.is_err[id.InstructionId, str](ri)) { A.deallocate[value.Value](m.alloc, ops, (k + 1)::usize); }
     ret ri;
+}
+
+# the register bank a value competes for
+#
+# A value costs a register only where the back end keeps it in one. Integers,
+# pointers and booleans draw from the general bank; floats and vectors from the
+# float bank. A void result or a whole aggregate is not register-allocated and
+# costs nothing.
+def RegBank: u8;
+val BANK_NONE: RegBank = 0;
+val BANK_GP:   RegBank = 1;
+val BANK_FP:   RegBank = 2;
+
+# the bank a value of IR type `ty` competes in
+# ---
+# m:   the module owning the type table
+# ty:  the value's IR type
+# ret: the bank, or BANK_NONE when the value is not register-allocated
+fun bank_of_type(m: *ir.Module, ty: ir_type.IrTypeId) RegBank {
+    if (ty == ir_type.IRT_NIL) { ret BANK_NONE; }
+    val o: O.Option[*ir_type.IrType] = ir_type.get(?m.types, ty);
+    if (!O.is_some[*ir_type.IrType](o)) { ret BANK_NONE; }
+    val t: *ir_type.IrType = O.unwrap[*ir_type.IrType](o);
+    if (t.kind == ir_type.IRT_INT || t.kind == ir_type.IRT_PTR)      { ret BANK_GP; }
+    if (t.kind == ir_type.IRT_FLOAT || t.kind == ir_type.IRT_VECTOR) { ret BANK_FP; }
+    ret BANK_NONE;
+}
+
+# the number of registers of `kind` the allocator can hand to values
+#
+# Read entirely from the target's own machine model, never assumed: the bank's
+# declared size less the registers the model withholds from value allocation.
+# `reserved_regs` (the frame and stack pointers) and `scratch_regs` (the
+# spill-reload pool) name general-bank registers -- `regalloc.seed_reserved`
+# withholds them from the GP file alone -- so they are subtracted only there. Each
+# ISA's float bank is already declared at its allocatable size, with the encoder's
+# fixed scratch pair excluded from `len`.
+#
+# The count is the model's, so it is exactly as accurate as the model: on x86_64
+# it reports 16 - {RSP, RBP} - {R8, R9, R10} = 11, one more than regalloc's true
+# ten, because the encoder's mem-mem split scratch (R11) is a `RegMachine` field
+# the model does not carry. A budget one register optimistic admits one more hoist
+# than the allocator has room for; it is a cost model, not a correctness bound.
+# ---
+# tgt:  the target
+# kind: the bank to size
+# ret:  allocatable register count, or 0 when the target declares no such bank
+fun bank_budget(tgt: *target.Target, kind: isa.RegClassKind) u32 {
+    var i: u32 = 0;
+    for (i < tgt.model.reg_class_len) {
+        if (tgt.model.reg_classes[i].kind != kind) { i = i + 1; cnt; }
+
+        val len: u32 = tgt.model.reg_classes[i].len;
+        if (kind != isa.RC_GENERAL) { ret len; }
+
+        var held: u32 = 0;
+        if (tgt.model.reserved_len > 0) { held = held + tgt.model.reserved_len::u32; }
+        if (tgt.model.scratch_len  > 0) { held = held + tgt.model.scratch_len::u32; }
+        if (held >= len) { ret 0; }
+        ret len - held;
+    }
+    ret 0;
+}
+
+# one function's value liveness and the per-block peak register pressure it implies
+#
+# `active` is false when the target is a whole-module emitter (`arch == nil`): such
+# a target has no register allocator, so there is no pressure to model and the pass
+# hoists on safety alone.
+# ---
+# alloc:       allocator backing every owned array
+# active:      true when a register budget applies
+# block_count: number of blocks the arrays are sized for
+# nvals:       number of value slots (instruction pool length plus parameters)
+# words:       64-bit words per per-block value set
+# live_in:     block -> values live on entry, excluding the block's own phi results
+# live_out:    block -> values live on exit
+# use_set:     block -> upward-exposed uses (phi operands excluded)
+# def_set:     block -> values the block defines (phis included)
+# scratch:     one spare value set, reused by the solver and the pressure walk
+# addr_feed:   values feeding an address computation in the loop being processed
+# hoisted:     every value this pass has lifted into a preheader, forced live across
+#              any loop the walk measures
+# bank:        value slot -> the RegBank it competes in
+# budget_gp:   allocatable general registers
+# budget_fp:   allocatable float registers
+rec Pressure {
+    alloc:       *A.Allocator;
+    active:      bool;
+    block_count: u32;
+    nvals:       u32;
+    words:       u32;
+    live_in:     *u64;
+    live_out:    *u64;
+    use_set:     *u64;
+    def_set:     *u64;
+    scratch:     *u64;
+    addr_feed:   *u64;
+    hoisted:     *u64;
+    bank:        *u8;
+    budget_gp:   u32;
+    budget_fp:   u32;
+}
+
+# true when bit `i` of value set `b` is set
+fun bit_get(b: *u64, i: u32) bool {
+    ret (b[i / 64] & (1::u64 << (i % 64)::u64)) != 0;
+}
+
+# set bit `i` of value set `b`, reporting whether it was newly set
+fun bit_set(b: *u64, i: u32) bool {
+    val w: u32 = i / 64;
+    val k: u64 = 1::u64 << (i % 64)::u64;
+    if ((b[w] & k) != 0) { ret false; }
+    b[w] = b[w] | k;
+    ret true;
+}
+
+# clear bit `i` of value set `b`, reporting whether it was previously set
+fun bit_clr(b: *u64, i: u32) bool {
+    val w: u32 = i / 64;
+    val k: u64 = 1::u64 << (i % 64)::u64;
+    if ((b[w] & k) == 0) { ret false; }
+    b[w] = b[w] & ~k;
+    ret true;
+}
+
+# the value slot an operand names, or NO_SLOT when it names no register value
+#
+# Instruction results occupy slot `iid`; parameters follow them, one slot each.
+# Constants, globals, function symbols and block targets name no register.
+# ---
+# pr:  the pressure state, for the slot layout
+# fn:  the function
+# v:   the operand value
+# ret: the slot index, or NO_SLOT
+fun value_slot(pr: *Pressure, fn: *ir.Function, v: value.Value) u32 {
+    if (v.kind == value.VAL_INSTR) {
+        val iid: u32 = v.data.instr::u32;
+        if (iid >= fn.instr_len) { ret NO_SLOT; }
+        ret iid;
+    }
+    if (v.kind == value.VAL_PARAM) {
+        if (v.data.param_ix >= fn.param_count) { ret NO_SLOT; }
+        ret fn.instr_len + v.data.param_ix;
+    }
+    ret NO_SLOT;
+}
+
+# marker for an operand that occupies no value slot
+val NO_SLOT: u32 = 0xFFFFFFFF;
+
+# build the liveness and peak-pressure state for one function
+#
+# Solves a textbook backward liveness dataflow over the CFG the loop analysis
+# already ordered, then walks each block once more to record how many values of
+# each bank are live at its busiest point. Never mutates the function.
+# ---
+# m:   the module owning the allocator and type table
+# fn:  the function to analyze
+# la:  the loop analysis, supplying reverse postorder
+# tgt: the target, supplying the register budget
+# ret: the populated state, or an allocation error
+fun pressure_init(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, tgt: *target.Target) R.Result[Pressure, str] {
+    var pr: Pressure;
+    pr.alloc       = m.alloc;
+    pr.active      = tgt.arch != nil;
+    pr.block_count = fn.block_count;
+    pr.nvals       = fn.instr_len + fn.param_count;
+    pr.words       = (pr.nvals + 63) / 64;
+    pr.live_in     = nil;
+    pr.live_out    = nil;
+    pr.use_set     = nil;
+    pr.def_set     = nil;
+    pr.scratch     = nil;
+    pr.addr_feed   = nil;
+    pr.hoisted     = nil;
+    pr.bank        = nil;
+    pr.budget_gp   = bank_budget(tgt, isa.RC_GENERAL);
+    pr.budget_fp   = bank_budget(tgt, isa.RC_FLOAT);
+
+    if (!pr.active || pr.words == 0 || pr.block_count == 0) { pr.active = false; ret R.ok[Pressure, str](pr); }
+
+    val span: usize = (pr.block_count * pr.words)::usize;
+    val r_in: R.Result[*u64, str] = A.allocate[u64](m.alloc, span);
+    if (R.is_err[*u64, str](r_in)) { ret R.err[Pressure, str](R.unwrap_err[*u64, str](r_in)); }
+    pr.live_in = R.unwrap_ok[*u64, str](r_in);
+    val r_out: R.Result[*u64, str] = A.allocate[u64](m.alloc, span);
+    if (R.is_err[*u64, str](r_out)) { pressure_dnit(?pr); ret R.err[Pressure, str](R.unwrap_err[*u64, str](r_out)); }
+    pr.live_out = R.unwrap_ok[*u64, str](r_out);
+    val r_use: R.Result[*u64, str] = A.allocate[u64](m.alloc, span);
+    if (R.is_err[*u64, str](r_use)) { pressure_dnit(?pr); ret R.err[Pressure, str](R.unwrap_err[*u64, str](r_use)); }
+    pr.use_set = R.unwrap_ok[*u64, str](r_use);
+    val r_def: R.Result[*u64, str] = A.allocate[u64](m.alloc, span);
+    if (R.is_err[*u64, str](r_def)) { pressure_dnit(?pr); ret R.err[Pressure, str](R.unwrap_err[*u64, str](r_def)); }
+    pr.def_set = R.unwrap_ok[*u64, str](r_def);
+    val r_sc: R.Result[*u64, str] = A.allocate[u64](m.alloc, pr.words::usize);
+    if (R.is_err[*u64, str](r_sc)) { pressure_dnit(?pr); ret R.err[Pressure, str](R.unwrap_err[*u64, str](r_sc)); }
+    pr.scratch = R.unwrap_ok[*u64, str](r_sc);
+    val r_af: R.Result[*u64, str] = A.allocate[u64](m.alloc, pr.words::usize);
+    if (R.is_err[*u64, str](r_af)) { pressure_dnit(?pr); ret R.err[Pressure, str](R.unwrap_err[*u64, str](r_af)); }
+    pr.addr_feed = R.unwrap_ok[*u64, str](r_af);
+    val r_hs: R.Result[*u64, str] = A.allocate[u64](m.alloc, pr.words::usize);
+    if (R.is_err[*u64, str](r_hs)) { pressure_dnit(?pr); ret R.err[Pressure, str](R.unwrap_err[*u64, str](r_hs)); }
+    pr.hoisted = R.unwrap_ok[*u64, str](r_hs);
+    val r_bk: R.Result[*u8, str] = A.allocate[u8](m.alloc, pr.nvals::usize);
+    if (R.is_err[*u8, str](r_bk)) { pressure_dnit(?pr); ret R.err[Pressure, str](R.unwrap_err[*u8, str](r_bk)); }
+    pr.bank = R.unwrap_ok[*u8, str](r_bk);
+
+    var i: u32 = 0;
+    for (i < pr.block_count * pr.words) {
+        pr.live_in[i] = 0; pr.live_out[i] = 0; pr.use_set[i] = 0; pr.def_set[i] = 0;
+        i = i + 1;
+    }
+    var h: u32 = 0;
+    for (h < pr.words) { pr.hoisted[h] = 0; h = h + 1; }
+
+    fill_banks(m, fn, ?pr);
+    fill_use_def(fn, ?pr);
+    solve_liveness(fn, la, ?pr);
+    ret R.ok[Pressure, str](pr);
+}
+
+# release every array the pressure state owns; safe on a partially built value
+# ---
+# pr: the state to tear down
+fun pressure_dnit(pr: *Pressure) {
+    val span: usize = (pr.block_count * pr.words)::usize;
+    if (pr.live_in  != nil) { A.deallocate[u64](pr.alloc, pr.live_in,  span); pr.live_in  = nil; }
+    if (pr.live_out != nil) { A.deallocate[u64](pr.alloc, pr.live_out, span); pr.live_out = nil; }
+    if (pr.use_set  != nil) { A.deallocate[u64](pr.alloc, pr.use_set,  span); pr.use_set  = nil; }
+    if (pr.def_set  != nil) { A.deallocate[u64](pr.alloc, pr.def_set,  span); pr.def_set  = nil; }
+    if (pr.scratch  != nil) { A.deallocate[u64](pr.alloc, pr.scratch,  pr.words::usize); pr.scratch = nil; }
+    if (pr.addr_feed != nil) { A.deallocate[u64](pr.alloc, pr.addr_feed, pr.words::usize); pr.addr_feed = nil; }
+    if (pr.hoisted  != nil) { A.deallocate[u64](pr.alloc, pr.hoisted,  pr.words::usize); pr.hoisted  = nil; }
+    if (pr.bank     != nil) { A.deallocate[u8](pr.alloc,  pr.bank,     pr.nvals::usize); pr.bank    = nil; }
+}
+
+# classify every value slot by the bank it competes in
+# ---
+# m:  the module
+# fn: the function
+# pr: the state whose `bank` array is filled
+fun fill_banks(m: *ir.Module, fn: *ir.Function, pr: *Pressure) {
+    var i: u32 = 0;
+    for (i < fn.instr_len) { pr.bank[i] = bank_of_type(m, fn.instrs[i].ty); i = i + 1; }
+    var p: u32 = 0;
+    for (p < fn.param_count) { pr.bank[fn.instr_len + p] = bank_of_type(m, fn.params[p].ty); p = p + 1; }
+}
+
+# fill each block's upward-exposed use set and definition set
+#
+# Walked backwards so a value defined and then used within the block never enters
+# `use`. A phi's operands are attributed to the predecessor edge, not to this
+# block, so they are excluded here and added by `solve_liveness`.
+# ---
+# fn: the function
+# pr: the state whose `use_set` / `def_set` are filled
+fun fill_use_def(fn: *ir.Function, pr: *Pressure) {
+    var b: u32 = 0;
+    for (b < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[b];
+        val base: u32 = b * pr.words;
+
+        if (blk.terminator != id.INSTR_NIL && blk.terminator::u32 < fn.instr_len) {
+            add_uses(fn, pr, ?pr.use_set[base], blk.terminator);
+        }
+
+        var k: u32 = blk.instr_count;
+        for (k > 0) {
+            k = k - 1;
+            val iid: id.InstructionId = blk.instructions[k];
+            if (iid::u32 >= fn.instr_len) { cnt; }
+            if (bank_slot(pr, iid::u32) != BANK_NONE) {
+                bit_set(?pr.def_set[base], iid::u32);
+                bit_clr(?pr.use_set[base], iid::u32);
+            }
+            add_uses(fn, pr, ?pr.use_set[base], iid);
+        }
+
+        var p: u32 = 0;
+        for (p < blk.phi_count) {
+            val pid: id.InstructionId = blk.phis[p];
+            p = p + 1;
+            if (pid::u32 >= fn.instr_len) { cnt; }
+            if (bank_slot(pr, pid::u32) == BANK_NONE) { cnt; }
+            bit_set(?pr.def_set[base], pid::u32);
+            bit_clr(?pr.use_set[base], pid::u32);
+        }
+
+        b = b + 1;
+    }
+}
+
+# the bank of value slot `s`, or BANK_NONE when the slot is out of range
+fun bank_slot(pr: *Pressure, s: u32) RegBank {
+    if (s >= pr.nvals) { ret BANK_NONE; }
+    ret pr.bank[s]::RegBank;
+}
+
+# add every register-holding operand of `iid` to value set `dst`
+#
+# Phi operands are skipped: they belong to the predecessor edge. Block targets and
+# constants hold no register and resolve to no slot.
+# ---
+# fn:  the function
+# pr:  the state, for the slot layout
+# dst: the value set to add to
+# iid: the instruction whose operands are read
+fun add_uses(fn: *ir.Function, pr: *Pressure, dst: *u64, iid: id.InstructionId) {
+    val ins: *instruction.Instruction = ?fn.instrs[iid::u32];
+    if (ins.kind == instruction.OP_PHI) { ret; }
+    var o: u32 = 0;
+    for (o < ins.operand_count) {
+        if (operand_holds_value(ins, o)) {
+            val s: u32 = value_slot(pr, fn, ins.operands[o]);
+            if (s != NO_SLOT && bank_slot(pr, s) != BANK_NONE) { bit_set(dst, s); }
+        }
+        o = o + 1;
+    }
+}
+
+# true when operand `o` of `ins` reads a value rather than naming a block
+#
+# The same operand convention the dead-code pass reads: a branch's target slots and
+# a debug record's operands name no runtime value.
+# ---
+# ins: the instruction
+# o:   the operand slot
+# ret: true when the slot holds a value use
+fun operand_holds_value(ins: *instruction.Instruction, o: u32) bool {
+    if (ins.kind == instruction.OP_BR)        { ret false; }
+    if (ins.kind == instruction.OP_CBR)       { ret o == 0; }
+    if (ins.kind == instruction.OP_PHI)       { ret (o % 2) == 1; }
+    if (ins.kind == instruction.OP_DBG_VALUE) { ret false; }
+    ret true;
+}
+
+# solve `live_in = use | (live_out - def)` to a fixed point
+#
+# Blocks are visited in reverse postorder reversed -- successors before
+# predecessors -- so a backward problem converges in few sweeps. The sets only
+# grow, so the iteration terminates.
+# ---
+# fn: the function
+# la: the loop analysis, supplying reverse postorder
+# pr: the state whose `live_in` / `live_out` are solved
+fun solve_liveness(fn: *ir.Function, la: *loops.LoopAnalysis, pr: *Pressure) {
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var ri: u32 = la.rpo_len;
+        for (ri > 0) {
+            ri = ri - 1;
+            val b: id.BlockId = la.rpo[ri];
+            if (b::u32 >= fn.block_count) { cnt; }
+            if (update_block_liveness(fn, pr, b)) { changed = true; }
+        }
+    }
+}
+
+# recompute one block's live-out and live-in, reporting whether either grew
+# ---
+# fn: the function
+# pr: the state
+# b:  the block
+# ret: true when a set changed
+fun update_block_liveness(fn: *ir.Function, pr: *Pressure, b: id.BlockId) bool {
+    val base: u32 = b::u32 * pr.words;
+    var changed: bool = false;
+
+    var s0: id.BlockId = id.BLOCK_NIL;
+    var s1: id.BlockId = id.BLOCK_NIL;
+    val sn: u32 = ir.block_successors(fn, ?fn.blocks[b::u32], ?s0, ?s1);
+    if (sn >= 1) { if (merge_successor(fn, pr, base, b, s0)) { changed = true; } }
+    if (sn >= 2) { if (merge_successor(fn, pr, base, b, s1)) { changed = true; } }
+
+    var w: u32 = 0;
+    for (w < pr.words) {
+        val v: u64 = pr.use_set[base + w] | (pr.live_out[base + w] & ~pr.def_set[base + w]);
+        if (pr.live_in[base + w] != v) { pr.live_in[base + w] = v; changed = true; }
+        w = w + 1;
+    }
+    ret changed;
+}
+
+# union successor `s`'s live-in, plus the phi operands `s` reads on the edge from
+# `b`, into `b`'s live-out
+# ---
+# fn:   the function
+# pr:   the state
+# base: `b`'s offset into the per-block value sets
+# b:    the predecessor block
+# s:    the successor block
+# ret:  true when `b`'s live-out grew
+fun merge_successor(fn: *ir.Function, pr: *Pressure, base: u32, b: id.BlockId, s: id.BlockId) bool {
+    if (s::u32 >= fn.block_count) { ret false; }
+    val sbase: u32 = s::u32 * pr.words;
+    var changed: bool = false;
+
+    var w: u32 = 0;
+    for (w < pr.words) {
+        val v: u64 = pr.live_out[base + w] | pr.live_in[sbase + w];
+        if (pr.live_out[base + w] != v) { pr.live_out[base + w] = v; changed = true; }
+        w = w + 1;
+    }
+
+    val blk: *ir.Block = ?fn.blocks[s::u32];
+    var p: u32 = 0;
+    for (p < blk.phi_count) {
+        val pid: id.InstructionId = blk.phis[p];
+        p = p + 1;
+        if (pid::u32 >= fn.instr_len) { cnt; }
+        val ins: *instruction.Instruction = ?fn.instrs[pid::u32];
+        var o: u32 = 0;
+        for (o + 1 < ins.operand_count) {
+            if (ir.block_target(ins.operands[o]) == b) {
+                val sl: u32 = value_slot(pr, fn, ins.operands[o + 1]);
+                if (sl != NO_SLOT && bank_slot(pr, sl) != BANK_NONE) {
+                    if (bit_set(?pr.live_out[base], sl)) { changed = true; }
+                }
+            }
+            o = o + 2;
+        }
+    }
+    ret changed;
+}
+
+# the most values of each bank live at once anywhere in loop `lx`, counting every
+# value in `hoisted` (plus `extra`, when it is a real slot) as live throughout
+#
+# This is the pressure the allocator would see after the pass finishes: a value in
+# the preheader is live across the whole loop, so measuring a candidate means forcing
+# it live at every point and re-reading the peak. Doing it this way rather than
+# adding one per hoist is what keeps the estimate honest -- a hoisted value was
+# ALREADY live over part of the loop, so its true cost at the busiest point is zero
+# as often as it is one.
+#
+# Each block is walked backwards from its live-out set, which is exactly what the
+# allocator sees: the count just before an instruction is its live-out less its own
+# result plus its operands.
+# ---
+# fn:     the function
+# pr:     the state
+# la:     the loop analysis
+# lx:     index into la.loops
+# extra:  one more value slot to force live, or NO_SLOT
+# out_gp: receives the peak general-bank pressure
+# out_fp: receives the peak float-bank pressure
+fun loop_peak(fn: *ir.Function, pr: *Pressure, la: *loops.LoopAnalysis, lx: u32, extra: u32,
+              out_gp: *u32, out_fp: *u32) {
+    val lp: *loops.Loop = ?la.loops[lx];
+    var pk_gp: u32 = 0;
+    var pk_fp: u32 = 0;
+
+    var bi: u32 = 0;
+    for (bi < lp.body_len) {
+        val b: u32 = lp.body[bi]::u32;
+        bi = bi + 1;
+        if (b >= fn.block_count) { cnt; }
+
+        val blk: *ir.Block = ?fn.blocks[b];
+        val base: u32 = b * pr.words;
+
+        var w: u32 = 0;
+        for (w < pr.words) { pr.scratch[w] = pr.live_out[base + w] | pr.hoisted[w]; w = w + 1; }
+        if (extra != NO_SLOT && extra < pr.nvals) { bit_set(pr.scratch, extra); }
+
+        var gp: u32 = 0;
+        var fp: u32 = 0;
+        count_banks(pr, ?gp, ?fp);
+        if (gp > pk_gp) { pk_gp = gp; }
+        if (fp > pk_fp) { pk_fp = fp; }
+
+        if (blk.terminator != id.INSTR_NIL && blk.terminator::u32 < fn.instr_len) {
+            step_back(fn, pr, blk.terminator, extra, ?gp, ?fp);
+            if (gp > pk_gp) { pk_gp = gp; }
+            if (fp > pk_fp) { pk_fp = fp; }
+        }
+
+        var k: u32 = blk.instr_count;
+        for (k > 0) {
+            k = k - 1;
+            val iid: id.InstructionId = blk.instructions[k];
+            if (iid::u32 >= fn.instr_len) { cnt; }
+            step_back(fn, pr, iid, extra, ?gp, ?fp);
+            if (gp > pk_gp) { pk_gp = gp; }
+            if (fp > pk_fp) { pk_fp = fp; }
+        }
+    }
+
+    @out_gp = pk_gp;
+    @out_fp = pk_fp;
+}
+
+# count the values of each bank in the scratch value set
+# ---
+# pr:     the state
+# out_gp: receives the general-bank count
+# out_fp: receives the float-bank count
+fun count_banks(pr: *Pressure, out_gp: *u32, out_fp: *u32) {
+    var gp: u32 = 0;
+    var fp: u32 = 0;
+    var w: u32 = 0;
+    for (w < pr.words) {
+        if (pr.scratch[w] == 0) { w = w + 1; cnt; }
+        var bit: u32 = 0;
+        for (bit < 64) {
+            val s: u32 = w * 64 + bit;
+            bit = bit + 1;
+            if (s >= pr.nvals) { brk; }
+            if (!bit_get(pr.scratch, s)) { cnt; }
+            if (pr.bank[s]::RegBank == BANK_GP) { gp = gp + 1; }
+            or { if (pr.bank[s]::RegBank == BANK_FP) { fp = fp + 1; } }
+        }
+        w = w + 1;
+    }
+    @out_gp = gp;
+    @out_fp = fp;
+}
+
+# move the scratch value set one instruction earlier, keeping the bank counts in
+# step: the instruction's own result dies and its operands become live
+# ---
+# fn:     the function
+# pr:     the state
+# iid:    the instruction stepped over
+# extra:  the candidate slot forced live, or NO_SLOT
+# out_gp: the running general-bank count, updated in place
+# out_fp: the running float-bank count, updated in place
+fun step_back(fn: *ir.Function, pr: *Pressure, iid: id.InstructionId, extra: u32, out_gp: *u32, out_fp: *u32) {
+    val slot: u32 = iid::u32;
+    val db: RegBank = bank_slot(pr, slot);
+    # a forced-live value never dies inside the loop: its definition is in the
+    # preheader, above every point this walk measures.
+    if (db != BANK_NONE && slot != extra && !bit_get(pr.hoisted, slot)) {
+        if (bit_clr(pr.scratch, slot)) {
+            if (db == BANK_GP && @out_gp > 0) { @out_gp = @out_gp - 1; }
+            or { if (db == BANK_FP && @out_fp > 0) { @out_fp = @out_fp - 1; } }
+        }
+    }
+
+    val ins: *instruction.Instruction = ?fn.instrs[slot];
+    if (ins.kind == instruction.OP_PHI) { ret; }
+    var o: u32 = 0;
+    for (o < ins.operand_count) {
+        if (operand_holds_value(ins, o)) {
+            val s: u32 = value_slot(pr, fn, ins.operands[o]);
+            val ub: RegBank = bank_slot(pr, s);
+            if (s != NO_SLOT && ub != BANK_NONE) {
+                if (bit_set(pr.scratch, s)) {
+                    if (ub == BANK_GP) { @out_gp = @out_gp + 1; }
+                    or { if (ub == BANK_FP) { @out_fp = @out_fp + 1; } }
+                }
+            }
+        }
+        o = o + 1;
+    }
+}
+
+# mark every value that feeds an address computation in loop `lx`
+#
+# A gep is hoisted as a WHOLE ADDRESS, not as one instruction: the index arithmetic
+# feeding it is part of the same rebuild, and leaving a single `add` behind in the
+# body keeps the gep variant and forfeits the whole chain. So the operands of every
+# gep in the loop are marked, and the mark propagates back through their defining
+# instructions.
+#
+# One reverse sweep suffices. Loop blocks are visited in reverse postorder reversed
+# and their instructions backwards, so every use is seen before its definition -- an
+# invariant chain is acyclic and each of its definitions dominates its uses.
+# ---
+# fn: the function
+# la: the loop analysis
+# lx: index into la.loops
+# pr: the state whose `addr_feed` set is filled
+fun fill_addr_feeders(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, pr: *Pressure) {
+    var w: u32 = 0;
+    for (w < pr.words) { pr.addr_feed[w] = 0; w = w + 1; }
+
+    var ri: u32 = la.rpo_len;
+    for (ri > 0) {
+        ri = ri - 1;
+        val b: id.BlockId = la.rpo[ri];
+        if (!loops.loop_contains(la, lx, b)) { cnt; }
+        if (b::u32 >= fn.block_count) { cnt; }
+
+        val blk: *ir.Block = ?fn.blocks[b::u32];
+        var k: u32 = blk.instr_count;
+        for (k > 0) {
+            k = k - 1;
+            val iid: id.InstructionId = blk.instructions[k];
+            if (iid::u32 >= fn.instr_len) { cnt; }
+            val ins: *instruction.Instruction = ?fn.instrs[iid::u32];
+            if (ins.kind != instruction.OP_GEP && !bit_get(pr.addr_feed, iid::u32)) { cnt; }
+
+            var o: u32 = 0;
+            for (o < ins.operand_count) {
+                if (ins.operands[o].kind == value.VAL_INSTR) {
+                    val s: u32 = ins.operands[o].data.instr::u32;
+                    if (s < pr.nvals) { bit_set(pr.addr_feed, s); }
+                }
+                o = o + 1;
+            }
+        }
+    }
 }
 
 use std.allocator.page;
