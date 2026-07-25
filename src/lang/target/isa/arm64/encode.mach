@@ -35,6 +35,7 @@
 # registers and the scalar-float, float-conversion, and NEON vector families.
 
 use std.allocator.page;
+use std.io.writer;
 use std.text.parse;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -57,6 +58,7 @@ use mach.lang.be.codegen.mir;
 use mach.lang.intern;
 use mach.lang.target.isa;
 use mach.lang.target.isa.arm64;
+use printer: mach.lang.target.isa.arm64.printer;
 use mach.lang.target.of;
 use mach.lang.target.resolved;
 
@@ -513,8 +515,528 @@ fun ldst_base_reg(w: u8, is_load: bool) u32 {
 }
 
 # append one 32-bit A64 instruction word to the text sink (little-endian)
+#
+# Every emitted word passes through one of the `emit_*` wrappers below, which pairs
+# this with the assembly-sink notification for the same instruction. Nothing else
+# calls it: a word appended here without a notification is bytes the `.s` would not
+# describe, which `check_accounted` turns into a build failure naming the opcode.
 fun emit_word(st: *encode.EncodeState, word: u32) {
     encode.emit_u32(?st.buf, word);
+}
+
+# the AArch64 instruction-word emitters
+#
+# Each wraps one bitfield-class packer: it emits the packed word and, when an
+# assembly sink is attached, notifies the printer with the SAME fields the packer
+# received. This is the whole reason `--emit-asm` needs no disassembler on a target
+# that emits opaque 32-bit words - the structure is not absent, it is discarded one
+# layer below, so it is captured one layer above (#2194).
+#
+# One notification per emitted machine instruction, never per MIR opcode: a MIR
+# macro-op that expands into several words emits each through its own wrapper, so
+# each is rendered separately. That is the invariant the collapsed MIR-level printer
+# violated (#2187).
+
+# the operand banks and widths a three-register base word names
+#
+# The printer reads the bank and width off the operands themselves, so this is what
+# tells the emitter which to build. `arity` 3 is a two-source form, 2 a one-source
+# form, 0 a form that writes no register (the flag-setting float compare), and 255
+# an unmapped base - which fails the render rather than emitting a wrong operand.
+# ---
+# dst_fp: the destination names a float / vector register
+# dst_w:  the destination width in bytes
+# src_fp: the sources name float / vector registers
+# src_w:  the source width in bytes
+# arity:  3, 2, 0, or 255 for an unmapped base
+rec Alu3Shape {
+    dst_fp: bool;
+    dst_w:  u8;
+    src_fp: bool;
+    src_w:  u8;
+    arity:  u8;
+}
+
+# build a three-register operand shape
+# ---
+# dst_fp: the destination names a float / vector register
+# dst_w:  the destination width in bytes
+# src_fp: the sources name float / vector registers
+# src_w:  the source width in bytes
+# arity:  the number of rendered register operands
+# ret:    the shape
+fun a3(dst_fp: bool, dst_w: u8, src_fp: bool, src_w: u8, arity: u8) Alu3Shape {
+    var s: Alu3Shape;
+    s.dst_fp = dst_fp;
+    s.dst_w  = dst_w;
+    s.src_fp = src_fp;
+    s.src_w  = src_w;
+    s.arity  = arity;
+    ret s;
+}
+
+# the operand shape a three-register base word names
+fun alu3_shape(base: u32) Alu3Shape {
+    if (base == ADD_X || base == SUB_X || base == AND_X || base == ORR_X ||
+        base == EOR_X || base == ORN_X || base == MUL_X || base == LSLV_X ||
+        base == LSRV_X || base == ASRV_X || base == SDIV_X || base == UDIV_X ||
+        base == SUBS_REG_X || base == SUB_SP_REG_X) { ret a3(false, 8, false, 8, 3); }
+    if (base == ADD_W || base == SUB_W || base == AND_W || base == ORR_W ||
+        base == EOR_W || base == ORN_W || base == MUL_W || base == LSLV_W ||
+        base == LSRV_W || base == ASRV_W || base == SDIV_W || base == UDIV_W ||
+        base == SUBS_REG_W)                         { ret a3(false, 4, false, 4, 3); }
+
+    if (base == FADD_S || base == FSUB_S || base == FMUL_S || base == FDIV_S) { ret a3(true, 4, true, 4, 3); }
+    if (base == FADD_D || base == FSUB_D || base == FMUL_D || base == FDIV_D) { ret a3(true, 8, true, 8, 3); }
+    if (base == FNEG_S || base == FMOV_S) { ret a3(true, 4, true, 4, 2); }
+    if (base == FNEG_D || base == FMOV_D) { ret a3(true, 8, true, 8, 2); }
+    if (base == FCVT_S2D)                 { ret a3(true, 8, true, 4, 2); }
+    if (base == FCVT_D2S)                 { ret a3(true, 4, true, 8, 2); }
+    if (base == FCMP_S)                   { ret a3(true, 4, true, 4, 0); }
+    if (base == FCMP_D)                   { ret a3(true, 8, true, 8, 0); }
+
+    if (base == SCVTF_S_W || base == UCVTF_S_W) { ret a3(true, 4, false, 4, 2); }
+    if (base == SCVTF_D_W || base == UCVTF_D_W) { ret a3(true, 8, false, 4, 2); }
+    if (base == SCVTF_S_X || base == UCVTF_S_X) { ret a3(true, 4, false, 8, 2); }
+    if (base == SCVTF_D_X || base == UCVTF_D_X) { ret a3(true, 8, false, 8, 2); }
+
+    if (base == FCVTZS_W_S || base == FCVTZU_W_S) { ret a3(false, 4, true, 4, 2); }
+    if (base == FCVTZS_X_S || base == FCVTZU_X_S) { ret a3(false, 8, true, 4, 2); }
+    if (base == FCVTZS_W_D || base == FCVTZU_W_D) { ret a3(false, 4, true, 8, 2); }
+    if (base == FCVTZS_X_D || base == FCVTZU_X_D) { ret a3(false, 8, true, 8, 2); }
+
+    if (base == FMOV_S_FROM_W) { ret a3(true,  4, false, 4, 2); }
+    if (base == FMOV_D_FROM_X) { ret a3(true,  8, false, 8, 2); }
+    if (base == FMOV_W_FROM_S) { ret a3(false, 4, true,  4, 2); }
+    if (base == FMOV_X_FROM_D) { ret a3(false, 8, true,  8, 2); }
+    ret a3(false, 0, false, 0, 255);
+}
+
+# a register operand in the bank and width a shape names
+# ---
+# fp:    true for a float / vector register
+# n:     the register index
+# bytes: the operand width in bytes
+# ret:   the operand
+fun shaped_reg(fp: bool, n: u32, bytes: u8) isa.Operand {
+    if (fp) { ret printer.vec(n, bytes); }
+    ret printer.gp(n, bytes);
+}
+
+# true when an assembly sink is rendering this encode
+fun noting(st: *encode.EncodeState) bool {
+    ret encode.sink_active(?st.buf);
+}
+
+# emit a three-register data-processing word
+fun emit_alu3(st: *encode.EncodeState, base: u32, rd: u32, rn: u32, rm: u32) {
+    emit_word(st, pack_alu3(base, rd, rn, rm));
+    note_alu3(st, base, rd, rn, rm, 0, false);
+}
+
+# emit a three-register word whose second source is left-shifted by `sh`
+fun emit_alu3_sh(st: *encode.EncodeState, base: u32, rd: u32, rn: u32, rm: u32, sh: u32) {
+    emit_word(st, pack_alu3_sh(base, rd, rn, rm, sh));
+    note_alu3(st, base, rd, rn, rm, sh, sh != 0);
+}
+
+# render a three-register word to the assembly sink
+fun note_alu3(st: *encode.EncodeState, base: u32, rd: u32, rn: u32, rm: u32, sh: u32, shifted: bool) {
+    if (!noting(st)) { ret; }
+    val s: Alu3Shape = alu3_shape(base);
+    if (s.arity == 255) {
+        encode.sink_fail(?st.buf, "--emit-asm: no aarch64 operand shape for an emitted three-register base word");
+        ret;
+    }
+    var i: printer.Inst = printer.inst(printer.FORM_ALU3, base);
+    if (s.arity != 0) { i.dst = shaped_reg(s.dst_fp, rd, s.dst_w); }
+    i.src1 = shaped_reg(s.src_fp, rn, s.src_w);
+    if (s.arity != 2) { i.src2 = shaped_reg(s.src_fp, rm, s.src_w); }
+    if (shifted)      { i.src3 = isa.make_imm(sh::i64, 1); }
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit an ADD/SUB (immediate) word
+fun emit_addsub_imm(st: *encode.EncodeState, base: u32, rd: u32, rn: u32, imm12: u32, sh: u32) {
+    emit_word(st, pack_addsub_imm(base, rd, rn, imm12, sh));
+    if (!noting(st)) { ret; }
+    var w: u8 = 4;
+    if ((base & 0x80000000) != 0) { w = 8; }
+    var i: printer.Inst = printer.inst(printer.FORM_ADDSUB_IMM, base);
+    i.dst  = printer.gp(rd, w);
+    i.src1 = printer.gp(rn, w);
+    i.src2 = isa.make_imm(imm12::i64, w);
+    if (sh != 0) { i.src3 = isa.make_imm(12, 1); }
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit an ADD (immediate) word whose immediate is a symbol's low twelve bits,
+# filled by the linker
+fun emit_addsub_imm_sym(st: *encode.EncodeState, base: u32, rd: u32, rn: u32, sym: intern.StrId, mod: u8) {
+    emit_word(st, pack_addsub_imm(base, rd, rn, 0, 0));
+    if (!noting(st)) { ret; }
+    var w: u8 = 4;
+    if ((base & 0x80000000) != 0) { w = 8; }
+    var i: printer.Inst = printer.inst(printer.FORM_ADDSUB_IMM, base);
+    i.dst     = printer.gp(rd, w);
+    i.src1    = printer.gp(rn, w);
+    i.src2    = isa.make_sym(sym::u32, w);
+    i.sym_mod = mod;
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit a bitfield-move word
+fun emit_bitfield(st: *encode.EncodeState, base: u32, rd: u32, rn: u32, immr: u32, imms: u32) {
+    emit_word(st, pack_bitfield(base, rd, rn, immr, imms));
+    if (!noting(st)) { ret; }
+    var w: u8 = 4;
+    if (base == UBFM_X || base == SBFM_X) { w = 8; }
+    var i: printer.Inst = printer.inst(printer.FORM_BITFIELD, base);
+    i.dst  = printer.gp(rd, w);
+    i.src1 = printer.gp(rn, w);
+    i.src2 = isa.make_imm(immr::i64, 1);
+    i.src3 = isa.make_imm(imms::i64, 1);
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit a move-wide word
+fun emit_movewide(st: *encode.EncodeState, base: u32, rd: u32, hw: u32, imm16: u32) {
+    emit_word(st, pack_movewide(base, rd, hw, imm16));
+    if (!noting(st)) { ret; }
+    var w: u8 = 4;
+    if (base == MOVZ_X || base == MOVK_X) { w = 8; }
+    var i: printer.Inst = printer.inst(printer.FORM_MOVEWIDE, base);
+    i.dst  = printer.gp(rd, w);
+    i.src2 = isa.make_imm(imm16::i64, w);
+    if (hw != 0) { i.src3 = isa.make_imm((hw * 16)::i64, 1); }
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit a multiply-add / multiply-subtract word
+fun emit_madd(st: *encode.EncodeState, base: u32, rd: u32, rn: u32, rm: u32, ra: u32) {
+    emit_word(st, pack_madd(base, rd, rn, rm, ra));
+    if (!noting(st)) { ret; }
+    var w: u8 = 4;
+    if (base == MSUB_X) { w = 8; }
+    var i: printer.Inst = printer.inst(printer.FORM_MADD, base);
+    i.dst  = printer.gp(rd, w);
+    i.src1 = printer.gp(rn, w);
+    i.src2 = printer.gp(rm, w);
+    i.src3 = printer.gp(ra, w);
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit a CSET (CSINC with both sources at the zero register) word
+fun emit_cset(st: *encode.EncodeState, base: u32, rd: u32, cc: u32) {
+    emit_word(st, pack_cset(base, rd, cc));
+    if (!noting(st)) { ret; }
+    var w: u8 = 4;
+    if (base == CSINC_X) { w = 8; }
+    var i: printer.Inst = printer.inst(printer.FORM_CSET, base);
+    i.dst   = printer.gp(rd, w);
+    # the encoded condition field is the inverse of the one the boolean captures
+    i.flags = ((cc ^ 1) & 0xF)::u16;
+    printer.note_inst(?st.buf, ?i);
+}
+
+# the transferred register's bank and width for a load / store base word
+#
+# `scale` is the byte multiplier the scaled unsigned-offset form applies to its
+# imm12; it is 0 for a form whose base fixes the offset field, and 255 marks an
+# unmapped base.
+# ---
+# fp:    the transferred register is a float / vector register
+# w:     the transferred register's width in bytes
+# scale: the imm12 byte multiplier, 0 for an offset-less form, 255 when unmapped
+rec LdStShape {
+    fp:    bool;
+    w:     u8;
+    scale: u32;
+}
+
+# build a load / store operand shape
+fun ls(fp: bool, w: u8, scale: u32) LdStShape {
+    var s: LdStShape;
+    s.fp    = fp;
+    s.w     = w;
+    s.scale = scale;
+    ret s;
+}
+
+# the operand shape a scaled unsigned-offset load / store base word names
+fun ldst_shape(base: u32) LdStShape {
+    if (base == LDRB_OFF || base == STRB_OFF) { ret ls(false, 4, 1); }
+    if (base == LDRH_OFF || base == STRH_OFF) { ret ls(false, 4, 2); }
+    if (base == LDRW_OFF || base == STRW_OFF) { ret ls(false, 4, 4); }
+    if (base == LDR_OFF_X || base == STR_OFF_X) { ret ls(false, 8, 8); }
+    if (base == LDR_D_OFF || base == STR_D_OFF) { ret ls(true, 8, 8); }
+    if (base == LDR_S_OFF || base == STR_S_OFF) { ret ls(true, 4, 4); }
+    if (base == LDR_Q_OFF || base == STR_Q_OFF) { ret ls(true, 16, 16); }
+    if (base == LDAR_X || base == STLR_X || base == LDAXR_X) { ret ls(false, 8, 0); }
+    if (base == LDAR_W || base == STLR_W || base == LDAXR_W) { ret ls(false, 4, 0); }
+    ret ls(false, 0, 255);
+}
+
+# the operand shape an unscaled signed-offset (LDUR / STUR) base word names
+fun ldur_shape(base: u32) LdStShape {
+    if (base == LDURB || base == STURB || base == LDURH || base == STURH ||
+        base == LDURW || base == STURW) { ret ls(false, 4, 1); }
+    if (base == LDUR_X || base == STUR_X)       { ret ls(false, 8, 1); }
+    if (base == LDUR_D_FP || base == STUR_D_FP) { ret ls(true, 8, 1); }
+    if (base == LDUR_S_FP || base == STUR_S_FP) { ret ls(true, 4, 1); }
+    if (base == LDUR_Q_FP || base == STUR_Q_FP) { ret ls(true, 16, 1); }
+    ret ls(false, 0, 255);
+}
+
+# the operand shape a register-offset load / store base word names
+fun ldst_reg_shape(base: u32) LdStShape {
+    if (base == LDRB_REG || base == STRB_REG || base == LDRH_REG || base == STRH_REG ||
+        base == LDRW_REG || base == STRW_REG)     { ret ls(false, 4, 1); }
+    if (base == LDR_REG_X || base == STR_REG_X)   { ret ls(false, 8, 1); }
+    if (base == LDR_D_REG || base == STR_D_REG)   { ret ls(true, 8, 1); }
+    if (base == LDR_S_REG || base == STR_S_REG)   { ret ls(true, 4, 1); }
+    if (base == LDR_Q_REG || base == STR_Q_REG)   { ret ls(true, 16, 1); }
+    ret ls(false, 0, 255);
+}
+
+# true when a load / store base word reads memory rather than writing it
+fun ldst_loads(base: u32) bool {
+    ret base == LDRB_OFF || base == LDRH_OFF || base == LDRW_OFF || base == LDR_OFF_X ||
+        base == LDR_D_OFF || base == LDR_S_OFF || base == LDR_Q_OFF ||
+        base == LDAR_X || base == LDAR_W || base == LDAXR_X || base == LDAXR_W ||
+        base == LDURB || base == LDURH || base == LDURW || base == LDUR_X ||
+        base == LDUR_D_FP || base == LDUR_S_FP || base == LDUR_Q_FP ||
+        base == LDRB_REG || base == LDRH_REG || base == LDRW_REG || base == LDR_REG_X ||
+        base == LDR_D_REG || base == LDR_S_REG || base == LDR_Q_REG;
+}
+
+# render a load or store to the assembly sink
+#
+# The slots are semantic: `dst` holds the location written, so a load puts its
+# register there and a store its memory operand. The printer emits them in AArch64's
+# source-first order.
+fun note_ldst(st: *encode.EncodeState, base: u32, s: *LdStShape, rt: u32, mem: isa.Operand) {
+    if (s.scale == 255) {
+        encode.sink_fail(?st.buf, "--emit-asm: no aarch64 operand shape for an emitted load/store base word");
+        ret;
+    }
+    var i: printer.Inst = printer.inst(printer.FORM_LDST, base);
+    val reg: isa.Operand = shaped_reg(s.fp, rt, s.w);
+    if (ldst_loads(base)) { i.dst = reg; i.src1 = mem; }
+    or                    { i.dst = mem; i.src1 = reg; }
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit a scaled unsigned-offset load / store word
+fun emit_ldst(st: *encode.EncodeState, base: u32, rt: u32, rn: u32, imm12: u32) {
+    emit_word(st, pack_ldst(base, rt, rn, imm12));
+    if (!noting(st)) { ret; }
+    val s: LdStShape = ldst_shape(base);
+    var disp: i32 = 0;
+    if (s.scale != 0 && s.scale != 255) { disp = (imm12 * s.scale)::i32; }
+    note_ldst(st, base, ?s, rt, isa.make_mem(printer.gp(rn, 8).reg, disp, -1, 0, s.w));
+}
+
+# emit a scaled unsigned-offset load / store whose displacement is a symbol's low
+# twelve bits, filled by the linker
+fun emit_ldst_sym(st: *encode.EncodeState, base: u32, rt: u32, rn: u32, sym: intern.StrId, mod: u8) {
+    emit_word(st, pack_ldst(base, rt, rn, 0));
+    if (!noting(st)) { ret; }
+    val s: LdStShape = ldst_shape(base);
+    if (s.scale == 255) {
+        encode.sink_fail(?st.buf, "--emit-asm: no aarch64 operand shape for an emitted load/store base word");
+        ret;
+    }
+    var mem: isa.Operand = isa.make_mem(printer.gp(rn, 8).reg, 0, -1, 0, s.w);
+    mem.sym_id = sym::u32;
+    var i: printer.Inst = printer.inst(printer.FORM_LDST, base);
+    i.sym_mod = mod;
+    val reg: isa.Operand = shaped_reg(s.fp, rt, s.w);
+    if (ldst_loads(base)) { i.dst = reg; i.src1 = mem; }
+    or                    { i.dst = mem; i.src1 = reg; }
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit an unscaled signed-offset (LDUR / STUR) load / store word
+fun emit_ldur(st: *encode.EncodeState, base: u32, rt: u32, rn: u32, imm9: u32) {
+    emit_word(st, pack_ldur(base, rt, rn, imm9));
+    if (!noting(st)) { ret; }
+    val s: LdStShape = ldur_shape(base);
+    note_ldst(st, base, ?s, rt, isa.make_mem(printer.gp(rn, 8).reg, sign_extend_field(imm9, 9)::i32, -1, 0, s.w));
+}
+
+# emit a register-offset load / store word
+fun emit_ldst_reg(st: *encode.EncodeState, base: u32, rt: u32, rn: u32, rm: u32) {
+    emit_word(st, pack_ldst_reg(base, rt, rn, rm));
+    if (!noting(st)) { ret; }
+    val s: LdStShape = ldst_reg_shape(base);
+    note_ldst(st, base, ?s, rt, isa.make_mem(printer.gp(rn, 8).reg, 0, printer.gp(rm, 8).reg, 1, s.w));
+}
+
+# emit a load / store pair word
+fun emit_ldstp(st: *encode.EncodeState, base: u32, rt: u32, rt2: u32, rn: u32, imm7: u32) {
+    emit_word(st, pack_ldstp(base, rt, rt2, rn, imm7));
+    if (!noting(st)) { ret; }
+    val fp: bool = base == STP_OFF_D || base == LDP_OFF_D;
+    val load: bool = base == LDP_OFF_X || base == LDP_PRE_X || base == LDP_POST_X || base == LDP_OFF_D;
+    var i: printer.Inst = printer.inst(printer.FORM_LDSTP, base);
+    if (base == STP_PRE_X || base == LDP_PRE_X)   { i.flags = printer.FLAG_WB_PRE; }
+    if (base == STP_POST_X || base == LDP_POST_X) { i.flags = printer.FLAG_WB_POST; }
+
+    val mem: isa.Operand = isa.make_mem(printer.gp(rn, 8).reg, (sign_extend_field(imm7, 7) * 8)::i32, -1, 0, 8);
+    val ra: isa.Operand = shaped_reg(fp, rt, 8);
+    val rb: isa.Operand = shaped_reg(fp, rt2, 8);
+    if (load) { i.dst = ra; i.src1 = rb; i.src2 = mem; }
+    or        { i.dst = mem; i.src1 = ra; i.src2 = rb; }
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit a NEON three-register-same 128-bit word
+fun emit_neon_3same(st: *encode.EncodeState, base: u32, size: u32, rd: u32, rn: u32, rm: u32, lane: u8) {
+    emit_word(st, pack_neon_3same(base, size, rd, rn, rm));
+    if (!noting(st)) { ret; }
+    var i: printer.Inst = printer.inst(printer.FORM_NEON_3SAME, base);
+    i.dst      = printer.vec(rd, 16);
+    i.src1     = printer.vec(rn, 16);
+    i.src2     = printer.vec(rm, 16);
+    i.vec_lane = lane;
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit a NEON two-register-misc 128-bit word
+fun emit_neon_2misc(st: *encode.EncodeState, base: u32, rd: u32, rn: u32) {
+    emit_word(st, pack_neon_2misc(base, rd, rn));
+    if (!noting(st)) { ret; }
+    var i: printer.Inst = printer.inst(printer.FORM_NEON_2MISC, base);
+    i.dst      = printer.vec(rd, 16);
+    i.src1     = printer.vec(rn, 16);
+    i.vec_lane = mir.vec_lane_make(mir.VEC_LANE_INT, 1);
+    printer.note_inst(?st.buf, ?i);
+}
+
+# the compare register a branch base word tests, as an operand
+#
+# `B` and `B.cond` carry none; `CBZ` / `CBNZ` carry one, at the base word's width.
+fun branch_reg_operand(base: u32, rt: u32, has_rt: bool) isa.Operand {
+    if (!has_rt) { ret printer.none_operand(); }
+    if (base == CBNZ_X || base == CBZ_X) { ret printer.gp(rt, 8); }
+    ret printer.gp(rt, 4);
+}
+
+# emit a branch whose destination is a MIR block, with a placeholder displacement
+fun emit_branch_block(st: *encode.EncodeState, base: u32, rt: u32, has_rt: bool, block: u32) {
+    var word: u32 = base;
+    if (has_rt) { word = base | (rt & 0x1F); }
+    emit_word(st, word);
+    if (!noting(st)) { ret; }
+    var i: printer.Inst = printer.inst(printer.FORM_BRANCH, base);
+    i.src1   = branch_reg_operand(base, rt, has_rt);
+    i.target = printer.TGT_BLOCK;
+    i.block  = block;
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit a branch whose destination is a symbol the linker resolves
+fun emit_branch_sym(st: *encode.EncodeState, base: u32, sym: intern.StrId) {
+    emit_word(st, base);
+    if (!noting(st)) { ret; }
+    var i: printer.Inst = printer.inst(printer.FORM_BRANCH, base);
+    i.src2   = isa.make_sym(sym::u32, 0);
+    i.target = printer.TGT_SYM;
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit a branch whose destination is a fixed forward word displacement
+fun emit_branch_pcrel(st: *encode.EncodeState, base: u32, rt: u32, has_rt: bool, imm19: u32) {
+    var word: u32 = base | ((imm19 & 0x7FFFF) << 5);
+    if (has_rt) { word = word | (rt & 0x1F); }
+    emit_word(st, word);
+    if (!noting(st)) { ret; }
+    var i: printer.Inst = printer.inst(printer.FORM_BRANCH, base);
+    i.src1   = branch_reg_operand(base, rt, has_rt);
+    i.src2   = isa.make_imm(imm19::i64, 4);
+    i.target = printer.TGT_PCREL;
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit a branch to an inline-asm numeric local label, with a placeholder
+# displacement the block's own fixup pass resolves
+fun emit_branch_local(st: *encode.EncodeState, word: u32, base: u32, rt: u32, has_rt: bool, number: u64, fwd: bool) {
+    emit_word(st, word);
+    if (!noting(st)) { ret; }
+    var i: printer.Inst = printer.inst(printer.FORM_BRANCH, base);
+    i.src1   = branch_reg_operand(base, rt, has_rt);
+    i.src2   = isa.make_imm(number::i64, 8);
+    i.target = printer.TGT_LOCAL_BACK;
+    if (fwd) { i.target = printer.TGT_LOCAL_FWD; }
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit a register-indirect branch word
+fun emit_branch_reg(st: *encode.EncodeState, base: u32, rn: u32) {
+    emit_word(st, base | ((rn & 0x1F) << 5));
+    if (!noting(st)) { ret; }
+    var i: printer.Inst = printer.inst(printer.FORM_BRANCH_REG, base);
+    i.src1 = printer.gp(rn, 8);
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit an ADRP page-address word with a placeholder page delta
+fun emit_adrp(st: *encode.EncodeState, rd: u32, sym: intern.StrId, mod: u8) {
+    emit_word(st, pack_adrp(rd));
+    if (!noting(st)) { ret; }
+    var i: printer.Inst = printer.inst(printer.FORM_ADRP, ADRP_BASE);
+    i.dst     = printer.gp(rd, 8);
+    i.src1    = isa.make_sym(sym::u32, 0);
+    i.sym_mod = mod;
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit a whole-word instruction with no operands
+fun emit_nullary(st: *encode.EncodeState, word: u32) {
+    emit_word(st, word);
+    if (!noting(st)) { ret; }
+    var i: printer.Inst = printer.inst(printer.FORM_NULLARY, word);
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit a single-immediate instruction (BRK / SVC) whose imm16 sits at bits[20:5]
+fun emit_imm16(st: *encode.EncodeState, base: u32, imm16: u32) {
+    emit_word(st, base | ((imm16 & 0xFFFF) << 5));
+    if (!noting(st)) { ret; }
+    var i: printer.Inst = printer.inst(printer.FORM_IMM16, base);
+    i.src1 = isa.make_imm(imm16::i64, 2);
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit a data memory barrier word
+fun emit_barrier(st: *encode.EncodeState, crm: u32) {
+    emit_word(st, DMB_BASE | ((crm & 0xF) << 8));
+    if (!noting(st)) { ret; }
+    var i: printer.Inst = printer.inst(printer.FORM_BARRIER, DMB_BASE);
+    i.src1 = isa.make_imm(crm::i64, 1);
+    printer.note_inst(?st.buf, ?i);
+}
+
+# emit a store-release-exclusive word, whose status result rides bits[20:16]
+fun emit_stxr(st: *encode.EncodeState, base: u32, rs: u32, rt: u32, rn: u32) {
+    emit_word(st, pack_ldst(base, rt, rn, 0) | ((rs & 0x1F) << 16));
+    if (!noting(st)) { ret; }
+    var w: u8 = 4;
+    if (base == STLXR_X) { w = 8; }
+    var i: printer.Inst = printer.inst(printer.FORM_STXR, base);
+    i.dst  = printer.gp(rs, 4);
+    i.src1 = printer.gp(rt, w);
+    i.src2 = isa.make_mem(printer.gp(rn, 8).reg, 0, -1, 0, w);
+    printer.note_inst(?st.buf, ?i);
+}
+
+# sign-extend the low `bits` of a field to a signed 64-bit integer
+fun sign_extend_field(v: u32, bits: u32) i64 {
+    val mask: u32 = (1::u32 << bits) - 1;
+    val x: u32 = v & mask;
+    if ((x & (1::u32 << (bits - 1))) != 0) { ret (x::i64) - ((mask::i64) + 1); }
+    ret x::i64;
 }
 
 # read the 32-bit little-endian word at `pos` in the text sink
@@ -560,7 +1082,7 @@ fun emit_movewide_seq(st: *encode.EncodeState, rd: u32, value: u64, use64: bool)
     if (!use64) { v = value & 0xFFFFFFFF; }
 
     if (v == 0) {
-        emit_word(st, pack_movewide(base_z, rd, 0, 0));
+        emit_movewide(st, base_z, rd, 0, 0);
         ret;
     }
 
@@ -570,10 +1092,10 @@ fun emit_movewide_seq(st: *encode.EncodeState, rd: u32, value: u64, use64: bool)
         val chunk: u32 = ((v >> (16::u64 * i::u64)) & 0xFFFF)::u32;
         if (chunk != 0) {
             if (first) {
-                emit_word(st, pack_movewide(base_z, rd, i, chunk));
+                emit_movewide(st, base_z, rd, i, chunk);
                 first = false;
             } or {
-                emit_word(st, pack_movewide(base_k, rd, i, chunk));
+                emit_movewide(st, base_k, rd, i, chunk);
             }
         }
         i = i + 1;
@@ -685,18 +1207,18 @@ fun emit_mem_access(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width
     if (off >= 0) {
         val mask: i64 = (1::i64 << sh::i64) - 1;
         if ((off & mask) == 0 && (off >> sh::i64) <= 4095) {
-            emit_word(st, pack_ldst(ldst_base_scaled(w, is_load), rt, base, (off >> sh::i64)::u32));
+            emit_ldst(st, ldst_base_scaled(w, is_load), rt, base, (off >> sh::i64)::u32);
             ret;
         }
     }
     # unscaled signed imm9: -256..255.
     if (off >= -256 && off <= 255) {
-        emit_word(st, pack_ldur(ldst_base_unscaled(w, is_load), rt, base, off::u32 & 0x1FF));
+        emit_ldur(st, ldst_base_unscaled(w, is_load), rt, base, off::u32 & 0x1FF);
         ret;
     }
     # out of range: materialize the byte offset into IP0 and use `[base + IP0]`.
     emit_movewide_seq(st, SCRATCH0, off::u64, true);
-    emit_word(st, pack_ldst_reg(ldst_base_reg(w, is_load), rt, base, SCRATCH0));
+    emit_ldst_reg(st, ldst_base_reg(w, is_load), rt, base, SCRATCH0);
 }
 
 # materialize `Rd = Rn + off` for a 64-bit address computation,
@@ -705,23 +1227,23 @@ fun emit_mem_access(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width
 # for an offset beyond the immediate range. a zero offset still emits `add Rd, Rn, #0`
 fun emit_add_imm(st: *encode.EncodeState, rd: u32, rn: u32, off: i64) {
     if (off >= 0 && off <= 4095) {
-        emit_word(st, pack_addsub_imm(ADDI_X, rd, rn, off::u32, 0));
+        emit_addsub_imm(st, ADDI_X, rd, rn, off::u32, 0);
         ret;
     }
     if (off < 0 && off >= -4095) {
-        emit_word(st, pack_addsub_imm(SUBI_X, rd, rn, (-off)::u32, 0));
+        emit_addsub_imm(st, SUBI_X, rd, rn, (-off)::u32, 0);
         ret;
     }
     if (off > 0 && (off & 0xFFF) == 0 && (off >> 12) <= 4095) {
-        emit_word(st, pack_addsub_imm(ADDI_X, rd, rn, (off >> 12)::u32, 1));
+        emit_addsub_imm(st, ADDI_X, rd, rn, (off >> 12)::u32, 1);
         ret;
     }
     if (off < 0 && ((-off) & 0xFFF) == 0 && ((-off) >> 12) <= 4095) {
-        emit_word(st, pack_addsub_imm(SUBI_X, rd, rn, ((-off) >> 12)::u32, 1));
+        emit_addsub_imm(st, SUBI_X, rd, rn, ((-off) >> 12)::u32, 1);
         ret;
     }
     emit_movewide_seq(st, SCRATCH0, off::u64, true);
-    emit_word(st, pack_alu3(ADD_X, rd, rn, SCRATCH0));
+    emit_alu3(st, ADD_X, rd, rn, SCRATCH0);
 }
 
 # the LSL amount realizing an index scale (1/2/4/8 -> 0/1/2/3) for the
@@ -740,7 +1262,7 @@ fun scale_shift(scale: u8) u32 {
 # ADD or LDR/STR `:lo12:` low half naming the same symbol
 fun emit_adrp_reloc(st: *encode.EncodeState, rd: u32, sym: intern.StrId, addend: i32) R.Result[bool, str] {
     val pos: u32 = st.buf.len::u32;
-    emit_word(st, pack_adrp(rd));
+    emit_adrp(st, rd, sym, printer.MOD_PCREL_HI);
     ret encode.push_reloc(st, arm64_reloc_offset(pos), of.RK_PAGE21, sym, addend);
 }
 
@@ -755,7 +1277,7 @@ fun emit_global_addr(st: *encode.EncodeState, rd: u32, symop: *mir.MirOperand) R
     val ar: R.Result[bool, str] = emit_adrp_reloc(st, rd, symop.sym, symop.sym_off);
     if (R.is_err[bool, str](ar)) { ret ar; }
     val pos: u32 = st.buf.len::u32;
-    emit_word(st, pack_addsub_imm(ADDI_X, rd, rd, 0, 0));
+    emit_addsub_imm_sym(st, ADDI_X, rd, rd, symop.sym, printer.MOD_PCREL_LO);
     ret encode.push_reloc(st, arm64_reloc_offset(pos), of.RK_ADD_LO12, symop.sym, symop.sym_off);
 }
 
@@ -773,7 +1295,7 @@ fun emit_global_load(st: *encode.EncodeState, rt: u32, symop: *mir.MirOperand, w
     val ar: R.Result[bool, str] = emit_adrp_reloc(st, SCRATCH0, symop.sym, symop.sym_off);
     if (R.is_err[bool, str](ar)) { ret ar; }
     val pos: u32 = st.buf.len::u32;
-    emit_word(st, pack_ldst(ldst_base_scaled(w, true), rt, SCRATCH0, 0));
+    emit_ldst_sym(st, ldst_base_scaled(w, true), rt, SCRATCH0, symop.sym, printer.MOD_PCREL_LO);
     ret encode.push_reloc(st, arm64_reloc_offset(pos), ldst_lo12_kind(w), symop.sym, symop.sym_off);
 }
 
@@ -804,7 +1326,7 @@ fun emit_global_store(st: *encode.EncodeState, symop: *mir.MirOperand, val_op: *
     val ar: R.Result[bool, str] = emit_adrp_reloc(st, SCRATCH0, symop.sym, symop.sym_off);
     if (R.is_err[bool, str](ar)) { ret ar; }
     val pos: u32 = st.buf.len::u32;
-    emit_word(st, pack_ldst(ldst_base_scaled(w, false), rt, SCRATCH0, 0));
+    emit_ldst_sym(st, ldst_base_scaled(w, false), rt, SCRATCH0, symop.sym, printer.MOD_PCREL_LO);
     ret encode.push_reloc(st, arm64_reloc_offset(pos), ldst_lo12_kind(w), symop.sym, symop.sym_off);
 }
 
@@ -816,7 +1338,7 @@ fun emit_global_store(st: *encode.EncodeState, symop: *mir.MirOperand, val_op: *
 # it with the `ldr :got_lo12:` low half that dereferences the slot
 fun emit_adrp_got_reloc(st: *encode.EncodeState, rd: u32, sym: intern.StrId) R.Result[bool, str] {
     val pos: u32 = st.buf.len::u32;
-    emit_word(st, pack_adrp(rd));
+    emit_adrp(st, rd, sym, printer.MOD_GOT_HI);
     ret encode.push_reloc(st, arm64_reloc_offset(pos), of.RK_GOT_PAGE21, sym, 0);
 }
 
@@ -833,7 +1355,7 @@ fun emit_global_addr_got(st: *encode.EncodeState, rd: u32, symop: *mir.MirOperan
     val ar: R.Result[bool, str] = emit_adrp_got_reloc(st, rd, symop.sym);
     if (R.is_err[bool, str](ar)) { ret ar; }
     val pos: u32 = st.buf.len::u32;
-    emit_word(st, pack_ldst(ldst_base_scaled(8, true), rd, rd, 0));
+    emit_ldst_sym(st, ldst_base_scaled(8, true), rd, rd, symop.sym, printer.MOD_GOT_LO);
     val pr: R.Result[bool, str] = encode.push_reloc(st, arm64_reloc_offset(pos), of.RK_GOT_LO12, symop.sym, 0);
     if (R.is_err[bool, str](pr)) { ret pr; }
     if (symop.sym_off != 0) { emit_add_imm(st, rd, rd, symop.sym_off::i64); }
@@ -895,12 +1417,12 @@ fun encode_call(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] 
             ret R.err[bool, str]("encode: direct call has no resolved symbol name");
         }
         val pos: u32 = st.buf.len::u32;
-        emit_word(st, BL_BASE);
+        emit_branch_sym(st, BL_BASE, callee.sym);
         ret encode.push_reloc(st, arm64_reloc_offset(pos), of.RK_PLT32, callee.sym, callee.sym_off);
     }
     val rr: R.Result[i32, str] = req_gpr(callee);
     if (R.is_err[i32, str](rr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rr)); }
-    emit_word(st, pack_blr(R.unwrap_ok[i32, str](rr)::u32));
+    emit_branch_reg(st, BLR_BASE, R.unwrap_ok[i32, str](rr)::u32);
     ret R.ok[bool, str](true);
 }
 
@@ -926,7 +1448,7 @@ fun encode_alu3(st: *encode.EncodeState, mi: *mir.MirInstr, base_x: u32, base_w:
     if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
     val rm: u32 = R.unwrap_ok[i32, str](rmr)::u32;
 
-    emit_word(st, pack_alu3(sel(use64, base_x, base_w), rd, rn, rm));
+    emit_alu3(st, sel(use64, base_x, base_w), rd, rn, rm);
     ret R.ok[bool, str](true);
 }
 
@@ -952,13 +1474,13 @@ fun encode_addsub(st: *encode.EncodeState, mi: *mir.MirInstr, is_sub: bool) R.Re
         if (v >= 0 && v <= 4095) {
             var base_i: u32 = sel(use64, ADDI_X, ADDI_W);
             if (is_sub) { base_i = sel(use64, SUBI_X, SUBI_W); }
-            emit_word(st, pack_addsub_imm(base_i, rd, rn, v::u32, 0));
+            emit_addsub_imm(st, base_i, rd, rn, v::u32, 0);
             ret R.ok[bool, str](true);
         }
         if (v > 0 && (v & 0xFFF) == 0 && (v >> 12) <= 4095) {
             var base_i: u32 = sel(use64, ADDI_X, ADDI_W);
             if (is_sub) { base_i = sel(use64, SUBI_X, SUBI_W); }
-            emit_word(st, pack_addsub_imm(base_i, rd, rn, (v >> 12)::u32, 1));
+            emit_addsub_imm(st, base_i, rd, rn, (v >> 12)::u32, 1);
             ret R.ok[bool, str](true);
         }
     }
@@ -968,7 +1490,7 @@ fun encode_addsub(st: *encode.EncodeState, mi: *mir.MirInstr, is_sub: bool) R.Re
     val rm: u32 = R.unwrap_ok[i32, str](rmr)::u32;
     var base_r: u32 = sel(use64, ADD_X, ADD_W);
     if (is_sub) { base_r = sel(use64, SUB_X, SUB_W); }
-    emit_word(st, pack_alu3(base_r, rd, rn, rm));
+    emit_alu3(st, base_r, rd, rn, rm);
     ret R.ok[bool, str](true);
 }
 
@@ -996,14 +1518,14 @@ fun encode_shift(st: *encode.EncodeState, mi: *mir.MirInstr, kind: u32) R.Result
         if (kind == arm64.LSL::u32) {
             val immr: u32 = (width_bits - sh) & (width_bits - 1);
             val imms: u32 = (width_bits - 1) - sh;
-            emit_word(st, pack_bitfield(sel(use64, UBFM_X, UBFM_W), rd, rn, immr, imms));
+            emit_bitfield(st, sel(use64, UBFM_X, UBFM_W), rd, rn, immr, imms);
             ret R.ok[bool, str](true);
         }
         if (kind == arm64.LSR::u32) {
-            emit_word(st, pack_bitfield(sel(use64, UBFM_X, UBFM_W), rd, rn, sh, width_bits - 1));
+            emit_bitfield(st, sel(use64, UBFM_X, UBFM_W), rd, rn, sh, width_bits - 1);
             ret R.ok[bool, str](true);
         }
-        emit_word(st, pack_bitfield(sel(use64, SBFM_X, SBFM_W), rd, rn, sh, width_bits - 1));
+        emit_bitfield(st, sel(use64, SBFM_X, SBFM_W), rd, rn, sh, width_bits - 1);
         ret R.ok[bool, str](true);
     }
 
@@ -1013,7 +1535,7 @@ fun encode_shift(st: *encode.EncodeState, mi: *mir.MirInstr, kind: u32) R.Result
     var base_x: u32 = LSLV_X; var base_w: u32 = LSLV_W;
     if (kind == arm64.LSR::u32) { base_x = LSRV_X; base_w = LSRV_W; }
     or (kind == arm64.ASR::u32) { base_x = ASRV_X; base_w = ASRV_W; }
-    emit_word(st, pack_alu3(sel(use64, base_x, base_w), rd, rn, rm));
+    emit_alu3(st, sel(use64, base_x, base_w), rd, rn, rm);
     ret R.ok[bool, str](true);
 }
 
@@ -1031,7 +1553,7 @@ fun encode_neg_mvn(st: *encode.EncodeState, mi: *mir.MirInstr, base_x: u32, base
     if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
     val rm: u32 = R.unwrap_ok[i32, str](rmr)::u32;
 
-    emit_word(st, pack_alu3(sel(use64, base_x, base_w), rd, ZR, rm));
+    emit_alu3(st, sel(use64, base_x, base_w), rd, ZR, rm);
     ret R.ok[bool, str](true);
 }
 
@@ -1073,7 +1595,7 @@ fun encode_mov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) 
     val rmr: R.Result[i32, str] = req_gpr(src);
     if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
     val rm: u32 = R.unwrap_ok[i32, str](rmr)::u32;
-    emit_word(st, pack_alu3(sel(use64, ORR_X, ORR_W), rd, ZR, rm));
+    emit_alu3(st, sel(use64, ORR_X, ORR_W), rd, ZR, rm);
     ret R.ok[bool, str](true);
 }
 
@@ -1207,11 +1729,11 @@ fun encode_addr(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
         ret R.ok[bool, str](true);
     }
     if (m.off == 0) {
-        emit_word(st, pack_alu3_sh(ADD_X, rd, m.base, m.index, scale_shift(m.scale)));
+        emit_alu3_sh(st, ADD_X, rd, m.base, m.index, scale_shift(m.scale));
         ret R.ok[bool, str](true);
     }
     emit_add_imm(st, rd, m.base, m.off);
-    emit_word(st, pack_alu3_sh(ADD_X, rd, rd, m.index, scale_shift(m.scale)));
+    emit_alu3_sh(st, ADD_X, rd, rd, m.index, scale_shift(m.scale));
     ret R.ok[bool, str](true);
 }
 
@@ -1241,31 +1763,31 @@ fun encode_convert(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, st
     val rs: u32 = R.unwrap_ok[i32, str](rsr)::u32;
 
     if (mi.opcode == mir.MIR_TRUNC) {
-        emit_word(st, pack_alu3(ORR_W, rd, ZR, rs));
+        emit_alu3(st, ORR_W, rd, ZR, rs);
         ret R.ok[bool, str](true);
     }
     if (mi.opcode == mir.MIR_BITCAST) {
-        emit_word(st, pack_alu3(sel(is64(dw), ORR_X, ORR_W), rd, ZR, rs));
+        emit_alu3(st, sel(is64(dw), ORR_X, ORR_W), rd, ZR, rs);
         ret R.ok[bool, str](true);
     }
     if (mi.opcode == mir.MIR_SEXT) {
         if (sw >= 8) {
-            emit_word(st, pack_alu3(ORR_X, rd, ZR, rs));
+            emit_alu3(st, ORR_X, rd, ZR, rs);
             ret R.ok[bool, str](true);
         }
         val imms: u32 = (sw::u32 * 8) - 1;
-        emit_word(st, pack_bitfield(sel(is64(dw), SBFM_X, SBFM_W), rd, rs, 0, imms));
+        emit_bitfield(st, sel(is64(dw), SBFM_X, SBFM_W), rd, rs, 0, imms);
         ret R.ok[bool, str](true);
     }
     # MIR_ZEXT: a 32->64 (or wider source) zero-extension is a 32-bit move; a
     # sub-word zero-extension is UXTB / UXTH (UBFM_W), which writes the W register
     # (zero-extending to 64).
     if (sw >= 4) {
-        emit_word(st, pack_alu3(ORR_W, rd, ZR, rs));
+        emit_alu3(st, ORR_W, rd, ZR, rs);
         ret R.ok[bool, str](true);
     }
     val imms: u32 = (sw::u32 * 8) - 1;
-    emit_word(st, pack_bitfield(UBFM_W, rd, rs, 0, imms));
+    emit_bitfield(st, UBFM_W, rd, rs, 0, imms);
     ret R.ok[bool, str](true);
 }
 
@@ -1321,15 +1843,15 @@ fun fp_mem_reg_base(use_d: bool, is_load: bool) u32 {
 fun emit_fp_mem(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width: u8, is_load: bool) {
     if (width == 16) {
         if (off >= 0 && (off & 0xF) == 0 && (off >> 4) <= 4095) {
-            emit_word(st, pack_ldst(sel(is_load, LDR_Q_OFF, STR_Q_OFF), rt, base, (off >> 4)::u32));
+            emit_ldst(st, sel(is_load, LDR_Q_OFF, STR_Q_OFF), rt, base, (off >> 4)::u32);
             ret;
         }
         if (off >= -256 && off <= 255) {
-            emit_word(st, pack_ldur(sel(is_load, LDUR_Q_FP, STUR_Q_FP), rt, base, off::u32 & 0x1FF));
+            emit_ldur(st, sel(is_load, LDUR_Q_FP, STUR_Q_FP), rt, base, off::u32 & 0x1FF);
             ret;
         }
         emit_movewide_seq(st, SCRATCH0, off::u64, true);
-        emit_word(st, pack_ldst_reg(sel(is_load, LDR_Q_REG, STR_Q_REG), rt, base, SCRATCH0));
+        emit_ldst_reg(st, sel(is_load, LDR_Q_REG, STR_Q_REG), rt, base, SCRATCH0);
         ret;
     }
     val use_d: bool = width == 8;
@@ -1338,16 +1860,16 @@ fun emit_fp_mem(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width: u8
     if (off >= 0) {
         val mask: i64 = (1::i64 << sh::i64) - 1;
         if ((off & mask) == 0 && (off >> sh::i64) <= 4095) {
-            emit_word(st, pack_ldst(fp_mem_scaled_base(use_d, is_load), rt, base, (off >> sh::i64)::u32));
+            emit_ldst(st, fp_mem_scaled_base(use_d, is_load), rt, base, (off >> sh::i64)::u32);
             ret;
         }
     }
     if (off >= -256 && off <= 255) {
-        emit_word(st, pack_ldur(fp_mem_unscaled_base(use_d, is_load), rt, base, off::u32 & 0x1FF));
+        emit_ldur(st, fp_mem_unscaled_base(use_d, is_load), rt, base, off::u32 & 0x1FF);
         ret;
     }
     emit_movewide_seq(st, SCRATCH0, off::u64, true);
-    emit_word(st, pack_ldst_reg(fp_mem_reg_base(use_d, is_load), rt, base, SCRATCH0));
+    emit_ldst_reg(st, fp_mem_reg_base(use_d, is_load), rt, base, SCRATCH0);
 }
 
 # store vector register `rt` to a frame-slot / pointer MEM
@@ -1396,7 +1918,7 @@ fun emit_fp_imm(st: *encode.EncodeState, vd: u32, bits: u64, width: u8) {
     emit_movewide_seq(st, SCRATCH0, bits, use64);
     var base: u32 = FMOV_S_FROM_W;
     if (use64) { base = FMOV_D_FROM_X; }
-    emit_word(st, pack_alu3(base, vd, SCRATCH0, 0));
+    emit_alu3(st, base, vd, SCRATCH0, 0);
 }
 
 # the vector register index a float source operand contributes.
@@ -1485,12 +2007,12 @@ fun encode_fp_arith(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIn
     val base: u32 = fp_arith_base(mi.opcode, dbl);
     val dst: *mir.MirOperand = ?mi.operands[0];
     if (dst.kind == mir.MIR_OP_MEM) {
-        emit_word(st, pack_alu3(base, FP_SCRATCH0, rn, rm));
+        emit_alu3(st, base, FP_SCRATCH0, rn, rm);
         ret emit_fp_slot_store(st, f, dst, FP_SCRATCH0, w);
     }
     val rdr: R.Result[i32, str] = req_vec(dst);
     if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
-    emit_word(st, pack_alu3(base, R.unwrap_ok[i32, str](rdr)::u32, rn, rm));
+    emit_alu3(st, base, R.unwrap_ok[i32, str](rdr)::u32, rn, rm);
     ret R.ok[bool, str](true);
 }
 
@@ -1549,12 +2071,12 @@ fun encode_neon(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
         val rn: u32 = R.unwrap_ok[i32, str](rnr)::u32;
         val ndst: *mir.MirOperand = ?mi.operands[0];
         if (ndst.kind == mir.MIR_OP_MEM) {
-            emit_word(st, pack_neon_2misc(VNOT, FP_SCRATCH0, rn));
+            emit_neon_2misc(st, VNOT, FP_SCRATCH0, rn);
             ret emit_fp_slot_store(st, f, ndst, FP_SCRATCH0, 16);
         }
         val rdr: R.Result[i32, str] = req_vec(ndst);
         if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
-        emit_word(st, pack_neon_2misc(VNOT, R.unwrap_ok[i32, str](rdr)::u32, rn));
+        emit_neon_2misc(st, VNOT, R.unwrap_ok[i32, str](rdr)::u32, rn);
         ret R.ok[bool, str](true);
     }
 
@@ -1582,8 +2104,8 @@ fun encode_neon(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
     if (op == arm64.VEC_CMNE::u32) {
         var eqbase: u32 = VCMEQ;
         if (is_float) { eqbase = VFCMEQ; }
-        emit_word(st, pack_neon_3same(eqbase, size, rd, rn, rm));
-        emit_word(st, pack_neon_2misc(VNOT, rd, rd));
+        emit_neon_3same(st, eqbase, size, rd, rn, rm, vl);
+        emit_neon_2misc(st, VNOT, rd, rd);
     }
     or {
         # the logical ops (AND/ORR/EOR) are byte-agnostic - the size field is part of
@@ -1591,7 +2113,7 @@ fun encode_neon(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
         # regardless of the lane width the descriptor carries.
         var eff_size: u32 = size;
         if (op == arm64.VEC_AND::u32 || op == arm64.VEC_ORR::u32 || op == arm64.VEC_EOR::u32) { eff_size = 0; }
-        emit_word(st, pack_neon_3same(neon_base(op, is_float), eff_size, rd, rn, rm));
+        emit_neon_3same(st, neon_base(op, is_float), eff_size, rd, rn, rm, vl);
     }
 
     if (to_slot) { ret emit_fp_slot_store(st, f, dst, rd, 16); }
@@ -1616,12 +2138,12 @@ fun encode_fp_neg(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInst
     if (w == 8) { base = FNEG_D; }
     val dst: *mir.MirOperand = ?mi.operands[0];
     if (dst.kind == mir.MIR_OP_MEM) {
-        emit_word(st, pack_alu3(base, FP_SCRATCH0, rn, 0));
+        emit_alu3(st, base, FP_SCRATCH0, rn, 0);
         ret emit_fp_slot_store(st, f, dst, FP_SCRATCH0, w);
     }
     val rdr: R.Result[i32, str] = req_vec(dst);
     if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
-    emit_word(st, pack_alu3(base, R.unwrap_ok[i32, str](rdr)::u32, rn, 0));
+    emit_alu3(st, base, R.unwrap_ok[i32, str](rdr)::u32, rn, 0);
     ret R.ok[bool, str](true);
 }
 
@@ -1653,8 +2175,8 @@ fun encode_fp_cmp(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInst
 
     var base: u32 = FCMP_S;
     if (w == 8) { base = FCMP_D; }
-    emit_word(st, pack_alu3(base, 0, rn, rm));
-    emit_word(st, pack_cset(CSINC_W, rd, fp_cond(cc)));
+    emit_alu3(st, base, 0, rn, rm);
+    emit_cset(st, CSINC_W, rd, fp_cond(cc));
     ret R.ok[bool, str](true);
 }
 
@@ -1708,12 +2230,12 @@ fun encode_fp_conv(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
         if (op == mir.MIR_FP_EXT) { base = FCVT_S2D; }
         val dst: *mir.MirOperand = ?mi.operands[0];
         if (dst.kind == mir.MIR_OP_MEM) {
-            emit_word(st, pack_alu3(base, FP_SCRATCH0, rn, 0));
+            emit_alu3(st, base, FP_SCRATCH0, rn, 0);
             ret emit_fp_slot_store(st, f, dst, FP_SCRATCH0, dw);
         }
         val rdr: R.Result[i32, str] = req_vec(dst);
         if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
-        emit_word(st, pack_alu3(base, R.unwrap_ok[i32, str](rdr)::u32, rn, 0));
+        emit_alu3(st, base, R.unwrap_ok[i32, str](rdr)::u32, rn, 0);
         ret R.ok[bool, str](true);
     }
 
@@ -1727,8 +2249,8 @@ fun encode_fp_conv(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
         # extend it into IP0 to a clean 32-bit value before the W-form convert.
         if (sw < 4) {
             val imms: u32 = (sw::u32 * 8) - 1;
-            if (signed) { emit_word(st, pack_bitfield(SBFM_W, SCRATCH0, gp, 0, imms)); }
-            or          { emit_word(st, pack_bitfield(UBFM_W, SCRATCH0, gp, 0, imms)); }
+            if (signed) { emit_bitfield(st, SBFM_W, SCRATCH0, gp, 0, imms); }
+            or          { emit_bitfield(st, UBFM_W, SCRATCH0, gp, 0, imms); }
             gp = SCRATCH0;
             src_x = false;
         }
@@ -1736,12 +2258,12 @@ fun encode_fp_conv(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
         val base: u32 = cvt_int_to_fp_base(signed, dbl, src_x);
         val dst: *mir.MirOperand = ?mi.operands[0];
         if (dst.kind == mir.MIR_OP_MEM) {
-            emit_word(st, pack_alu3(base, FP_SCRATCH0, gp, 0));
+            emit_alu3(st, base, FP_SCRATCH0, gp, 0);
             ret emit_fp_slot_store(st, f, dst, FP_SCRATCH0, dw);
         }
         val rdr: R.Result[i32, str] = req_vec(dst);
         if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
-        emit_word(st, pack_alu3(base, R.unwrap_ok[i32, str](rdr)::u32, gp, 0));
+        emit_alu3(st, base, R.unwrap_ok[i32, str](rdr)::u32, gp, 0);
         ret R.ok[bool, str](true);
     }
 
@@ -1754,7 +2276,7 @@ fun encode_fp_conv(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
     if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
     val rd: u32 = R.unwrap_ok[i32, str](rdr)::u32;
     val base: u32 = cvt_fp_to_int_base(signed, dw >= 8, sw == 8);
-    emit_word(st, pack_alu3(base, rd, rn, 0));
+    emit_alu3(st, base, rd, rn, 0);
     ret R.ok[bool, str](true);
 }
 
@@ -1795,7 +2317,7 @@ fun encode_fmov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
         val rnr: R.Result[i32, str] = req_vec(src);
         if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
         val rn: u32 = R.unwrap_ok[i32, str](rnr)::u32;
-        emit_word(st, pack_neon_3same(VORR, 0, rd, rn, rn));
+        emit_neon_3same(st, VORR, 0, rd, rn, rn, mir.vec_lane_make(mir.VEC_LANE_INT, 1));
         ret R.ok[bool, str](true);
     }
 
@@ -1829,7 +2351,7 @@ fun encode_fmov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
             if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
             var base: u32 = FMOV_S;
             if (dbl) { base = FMOV_D; }
-            emit_word(st, pack_alu3(base, R.unwrap_ok[i32, str](rdr)::u32, R.unwrap_ok[i32, str](rnr)::u32, 0));
+            emit_alu3(st, base, R.unwrap_ok[i32, str](rdr)::u32, R.unwrap_ok[i32, str](rnr)::u32, 0);
             ret R.ok[bool, str](true);
         }
         if (dvec) {
@@ -1840,7 +2362,7 @@ fun encode_fmov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
             if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
             var base: u32 = FMOV_S_FROM_W;
             if (dbl) { base = FMOV_D_FROM_X; }
-            emit_word(st, pack_alu3(base, R.unwrap_ok[i32, str](rdr)::u32, R.unwrap_ok[i32, str](rnr)::u32, 0));
+            emit_alu3(st, base, R.unwrap_ok[i32, str](rdr)::u32, R.unwrap_ok[i32, str](rnr)::u32, 0);
             ret R.ok[bool, str](true);
         }
         if (svec) {
@@ -1851,7 +2373,7 @@ fun encode_fmov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
             if (R.is_err[i32, str](rnr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rnr)); }
             var base: u32 = FMOV_W_FROM_S;
             if (dbl) { base = FMOV_X_FROM_D; }
-            emit_word(st, pack_alu3(base, R.unwrap_ok[i32, str](rdr)::u32, R.unwrap_ok[i32, str](rnr)::u32, 0));
+            emit_alu3(st, base, R.unwrap_ok[i32, str](rdr)::u32, R.unwrap_ok[i32, str](rnr)::u32, 0);
             ret R.ok[bool, str](true);
         }
         ret R.err[bool, str]("encode: fmov names two general-purpose registers");
@@ -1944,8 +2466,8 @@ fun narrow_cmp_source(st: *encode.EncodeState, reg: u32, scratch: u32, width: u8
     # would compute a shift past the register width / an unallocated bitfield).
     if (width == 0 || width >= 4) { ret reg; }
     val imms: u32 = (width::u32 * 8) - 1;
-    if (signed) { emit_word(st, pack_bitfield(SBFM_W, scratch, reg, 0, imms)); }  # sxtb/sxth
-    or          { emit_word(st, pack_bitfield(UBFM_W, scratch, reg, 0, imms)); }  # uxtb/uxth
+    if (signed) { emit_bitfield(st, SBFM_W, scratch, reg, 0, imms); }  # sxtb/sxth
+    or          { emit_bitfield(st, UBFM_W, scratch, reg, 0, imms); }  # uxtb/uxth
     ret scratch;
 }
 
@@ -2007,13 +2529,13 @@ fun emit_flag_cmp(st: *encode.EncodeState, lhs_op: *mir.MirOperand, rhs_op: *mir
 
     val rhs_val: i64 = cmp_imm_value(rhs_op.imm, width, signed);
     if (rhs_op.kind == mir.MIR_OP_IMM && rhs_val >= 0 && rhs_val <= 4095) {
-        emit_word(st, pack_cmp_imm(sel(use64, SUBS_IMM_X, SUBS_IMM_W), rn, rhs_val::u32));
+        emit_addsub_imm(st, sel(use64, SUBS_IMM_X, SUBS_IMM_W), ZR, rn, rhs_val::u32, 0);
     } or {
         val rmr: R.Result[i32, str] = resolve_source(st, rhs_op, SCRATCH0, use64);
         if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
         var rm: u32 = R.unwrap_ok[i32, str](rmr)::u32;
         rm = narrow_cmp_source(st, rm, SCRATCH0, width, signed);
-        emit_word(st, pack_cmp_reg(sel(use64, SUBS_REG_X, SUBS_REG_W), rn, rm));
+        emit_alu3(st, sel(use64, SUBS_REG_X, SUBS_REG_W), ZR, rn, rm);
     }
     ret R.ok[bool, str](true);
 }
@@ -2033,7 +2555,7 @@ fun encode_compare(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, st
     val rc: R.Result[bool, str] = emit_flag_cmp(st, ?mi.operands[1], ?mi.operands[2], mi.width, mir.is_signed_cmp(mi.opcode));
     if (R.is_err[bool, str](rc)) { ret rc; }
 
-    emit_word(st, pack_cset(CSINC_W, rd, cmp_cond(mi.opcode)));
+    emit_cset(st, CSINC_W, rd, cmp_cond(mi.opcode));
     ret R.ok[bool, str](true);
 }
 
@@ -2049,7 +2571,7 @@ fun encode_branch(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R.Re
     # through with no word emitted (issue #1936).
     if (encode.branch_falls_through(st, target_block)) { ret R.ok[bool, str](true); }
     val patch_pos: u32 = st.buf.len::u32;
-    emit_word(st, B_BASE);
+    emit_branch_block(st, B_BASE, 0, false, target_block);
     val next_ip: u32 = st.buf.len::u32;
     ret encode.push_fixup(st, patch_pos, next_ip, target_block, fn_base);
 }
@@ -2073,7 +2595,7 @@ fun encode_cbr(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R.Resul
     val cond: u32 = R.unwrap_ok[i32, str](rcr)::u32;
 
     val cbnz_pos: u32 = st.buf.len::u32;
-    emit_word(st, pack_cbnz(sel(use64, CBNZ_X, CBNZ_W), cond));
+    emit_branch_block(st, sel(use64, CBNZ_X, CBNZ_W), cond, true, then_block);
     val cbnz_next: u32 = st.buf.len::u32;
     val f1: R.Result[bool, str] = encode.push_fixup(st, cbnz_pos, cbnz_next, then_block, fn_base);
     if (R.is_err[bool, str](f1)) { ret f1; }
@@ -2082,7 +2604,7 @@ fun encode_cbr(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R.Resul
     # order (issue #1936); the taken CBNZ above always keeps its edge.
     if (encode.branch_falls_through(st, else_block)) { ret R.ok[bool, str](true); }
     val b_pos: u32 = st.buf.len::u32;
-    emit_word(st, B_BASE);
+    emit_branch_block(st, B_BASE, 0, false, else_block);
     val b_next: u32 = st.buf.len::u32;
     ret encode.push_fixup(st, b_pos, b_next, else_block, fn_base);
 }
@@ -2134,7 +2656,7 @@ fun encode_fused_cbr(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R
 
     # B.cc then_block (a zero imm19 placeholder; pass 2 inserts the displacement).
     val bcc_pos: u32 = st.buf.len::u32;
-    emit_word(st, pack_bcond(0, fused_cbr_cond(mi.opcode)));
+    emit_branch_block(st, BCOND | (fused_cbr_cond(mi.opcode) & 0xF), 0, false, then_block);
     val bcc_next: u32 = st.buf.len::u32;
     val f1: R.Result[bool, str] = encode.push_fixup(st, bcc_pos, bcc_next, then_block, fn_base);
     if (R.is_err[bool, str](f1)) { ret f1; }
@@ -2148,7 +2670,7 @@ fun encode_fused_cbr(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R
         ret R.ok[bool, str](true);
     }
     val b_pos: u32 = st.buf.len::u32;
-    emit_word(st, B_BASE);
+    emit_branch_block(st, B_BASE, 0, false, else_block);
     val b_next: u32 = st.buf.len::u32;
     # bound any fused-condition computed-value records to this terminator's bytes.
     encode.close_cmp_varlocs(st, instr_start, st.buf.len::u32);
@@ -2199,22 +2721,22 @@ fun encode_divide(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, str
     val rem:    bool = op == mir.MIR_SEL_REM_S || op == mir.MIR_SEL_REM_U;
 
     # division-by-zero trap: skip the brk (one word ahead) when the divisor is non-zero.
-    emit_word(st, pack_cbnz_off(sel(use64, CBNZ_X, CBNZ_W), rm, 2));
-    emit_word(st, BRK_BASE);
+    emit_branch_pcrel(st, sel(use64, CBNZ_X, CBNZ_W), rm, true, 2);
+    emit_imm16(st, BRK_BASE, 0);
 
     # signed-overflow (INT_MIN / -1) trap: only the signed divides can overflow.
     if (signed) {
         # cmn Rm, #1 sets Z iff Rm == -1; if not, no overflow - skip the rest (5 words).
-        emit_word(st, pack_addsub_imm(sel(use64, ADDS_IMM_X, ADDS_IMM_W), ZR, rm, 1, 0));
-        emit_word(st, pack_bcond(5, CC_NE));
+        emit_addsub_imm(st, sel(use64, ADDS_IMM_X, ADDS_IMM_W), ZR, rm, 1, 0);
+        emit_branch_pcrel(st, BCOND | CC_NE, 0, false, 5);
         # IP1 = INT_MIN for this width (a single MOVZ: 0x80000000 W / 0x8000000000000000
         # X); cmp Rn, IP1 sets Z iff the dividend is INT_MIN - then the brk (2 words).
         var hw: u32 = 1;
         if (use64) { hw = 3; }
-        emit_word(st, pack_movewide(sel(use64, MOVZ_X, MOVZ_W), SCRATCH1, hw, 0x8000));
-        emit_word(st, pack_cmp_reg(sel(use64, SUBS_REG_X, SUBS_REG_W), rn, SCRATCH1));
-        emit_word(st, pack_bcond(2, CC_NE));
-        emit_word(st, BRK_BASE);
+        emit_movewide(st, sel(use64, MOVZ_X, MOVZ_W), SCRATCH1, hw, 0x8000);
+        emit_alu3(st, sel(use64, SUBS_REG_X, SUBS_REG_W), ZR, rn, SCRATCH1);
+        emit_branch_pcrel(st, BCOND | CC_NE, 0, false, 2);
+        emit_imm16(st, BRK_BASE, 0);
     }
 
     # the divide base (SDIV signed / UDIV unsigned) for this form.
@@ -2223,12 +2745,12 @@ fun encode_divide(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, str
 
     if (rem) {
         # remainder: the quotient lands in IP0, then `msub Rd, IP0, Rm, Rn`.
-        emit_word(st, pack_alu3(sel(use64, dbase_x, dbase_w), SCRATCH0, rn, rm));
-        emit_word(st, pack_madd(sel(use64, MSUB_X, MSUB_W), rd, SCRATCH0, rm, rn));
+        emit_alu3(st, sel(use64, dbase_x, dbase_w), SCRATCH0, rn, rm);
+        emit_madd(st, sel(use64, MSUB_X, MSUB_W), rd, SCRATCH0, rm, rn);
         ret R.ok[bool, str](true);
     }
     # quotient: Rd = Rn / Rm.
-    emit_word(st, pack_alu3(sel(use64, dbase_x, dbase_w), rd, rn, rm));
+    emit_alu3(st, sel(use64, dbase_x, dbase_w), rd, rn, rm);
     ret R.ok[bool, str](true);
 }
 
@@ -2270,18 +2792,18 @@ fun frame_subsize(f: *mir.MirFunction) u32 {
 # (`SUB SP, SP, X16`, the extended-register form SP requires). `subsize` is non-zero
 fun emit_sp_sub(st: *encode.EncodeState, subsize: u32) {
     if (subsize <= 0xFFF) {
-        emit_word(st, pack_addsub_imm(SUBI_X, ZR, ZR, subsize, 0));
+        emit_addsub_imm(st, SUBI_X, ZR, ZR, subsize, 0);
         ret;
     }
     if (subsize <= MAX_FRAME_SUB) {
         val hi: u32 = subsize >> 12;
         val lo: u32 = subsize & 0xFFF;
-        emit_word(st, pack_addsub_imm(SUBI_X, ZR, ZR, hi, 1));
-        if (lo != 0) { emit_word(st, pack_addsub_imm(SUBI_X, ZR, ZR, lo, 0)); }
+        emit_addsub_imm(st, SUBI_X, ZR, ZR, hi, 1);
+        if (lo != 0) { emit_addsub_imm(st, SUBI_X, ZR, ZR, lo, 0); }
         ret;
     }
     emit_movewide_seq(st, SCRATCH0, subsize::u64, true);
-    emit_word(st, SUB_SP_REG_X | ((SCRATCH0 & 0x1F) << 16));
+    emit_alu3(st, SUB_SP_REG_X, ZR, ZR, SCRATCH0);
 }
 
 # the AArch64 record-at-top prologue. `STP X29, X30, [SP, #-16]!`
@@ -2294,8 +2816,8 @@ fun emit_sp_sub(st: *encode.EncodeState, subsize: u32) {
 # with no frame) the `SUB SP` and the callee-save stores are skipped, so the output is
 # byte-identical to Phase 2b's `stp ; mov x29, sp`
 fun emit_prologue(st: *encode.EncodeState, f: *mir.MirFunction, subsize: u32) {
-    emit_word(st, pack_ldstp(STP_PRE_X, 29, 30, ZR, (0::u32 - 2) & 0x7F));
-    emit_word(st, pack_addsub_imm(ADDI_X, 29, ZR, 0, 0));
+    emit_ldstp(st, STP_PRE_X, 29, 30, ZR, (0::u32 - 2) & 0x7F);
+    emit_addsub_imm(st, ADDI_X, 29, ZR, 0, 0);
     if (subsize > 0) { emit_sp_sub(st, subsize); }
     save_callee_gp(st, f, true);
     save_callee_fp(st, f, true);
@@ -2312,9 +2834,9 @@ fun emit_epilogue(st: *encode.EncodeState, f: *mir.MirFunction, subsize: u32) {
     save_callee_gp(st, f, false);
     if (subsize > 0) {
         # mov sp, x29  (add sp, x29, #0)
-        emit_word(st, pack_addsub_imm(ADDI_X, ZR, 29, 0, 0));
+        emit_addsub_imm(st, ADDI_X, ZR, 29, 0, 0);
     }
-    emit_word(st, pack_ldstp(LDP_POST_X, 29, 30, ZR, 2));
+    emit_ldstp(st, LDP_POST_X, 29, 30, ZR, 2);
 }
 
 # save (or restore) the callee-saved GP registers `callee_mask`
@@ -2360,8 +2882,8 @@ fun save_callee_gp(st: *encode.EncodeState, f: *mir.MirFunction, store: bool) {
     for (p < num_pairs) {
         val base_off: i32 = 0 - (anchor + (16 * p)::i32);
         val imm7: u32 = (base_off / 8)::u32 & 0x7F;
-        if (store) { emit_word(st, pack_ldstp(STP_OFF_X, regs[2 * p], regs[2 * p + 1], base_reg, imm7)); }
-        or         { emit_word(st, pack_ldstp(LDP_OFF_X, regs[2 * p], regs[2 * p + 1], base_reg, imm7)); }
+        if (store) { emit_ldstp(st, STP_OFF_X, regs[2 * p], regs[2 * p + 1], base_reg, imm7); }
+        or         { emit_ldstp(st, LDP_OFF_X, regs[2 * p], regs[2 * p + 1], base_reg, imm7); }
         p = p + 1;
     }
     if ((n & 1) == 1) {
@@ -2404,8 +2926,8 @@ fun save_callee_fp(st: *encode.EncodeState, f: *mir.MirFunction, store: bool) {
     for (p < num_pairs) {
         val base_off: i32 = 0 - (anchor + (16 * p)::i32);
         val imm7: u32 = (base_off / 8)::u32 & 0x7F;
-        if (store) { emit_word(st, pack_ldstp(STP_OFF_D, regs[2 * p], regs[2 * p + 1], base_reg, imm7)); }
-        or         { emit_word(st, pack_ldstp(LDP_OFF_D, regs[2 * p], regs[2 * p + 1], base_reg, imm7)); }
+        if (store) { emit_ldstp(st, STP_OFF_D, regs[2 * p], regs[2 * p + 1], base_reg, imm7); }
+        or         { emit_ldstp(st, LDP_OFF_D, regs[2 * p], regs[2 * p + 1], base_reg, imm7); }
         p = p + 1;
     }
     if ((n & 1) == 1) {
@@ -2509,9 +3031,9 @@ fun encode_mir_instr(st: *encode.EncodeState, f: *mir.MirFunction, fn_base: u32,
     if (op == arm64.MOV::u16)  { ret encode_mov(st, f, mi); }
     if (op == arm64.FMOV::u16) { ret encode_fmov(st, f, mi); }
     if (op == arm64.B::u16)    { ret encode_branch(st, fn_base, mi); }
-    if (op == arm64.RET::u16)  { emit_word(st, RET_WORD); ret R.ok[bool, str](true); }
-    if (op == arm64.BRK::u16)  { emit_word(st, BRK_BASE); ret R.ok[bool, str](true); }
-    if (op == arm64.NOP::u16)  { emit_word(st, NOP_WORD); ret R.ok[bool, str](true); }
+    if (op == arm64.RET::u16)  { emit_nullary(st, RET_WORD); ret R.ok[bool, str](true); }
+    if (op == arm64.BRK::u16)  { emit_imm16(st, BRK_BASE, 0); ret R.ok[bool, str](true); }
+    if (op == arm64.NOP::u16)  { emit_nullary(st, NOP_WORD); ret R.ok[bool, str](true); }
 
     ret R.err[bool, str]("internal compiler error: unhandled opcode in arm64 encode");
 }
@@ -2558,7 +3080,15 @@ fun encode_function_arm64(st: *encode.EncodeState, f: *mir.MirFunction) R.Result
 
     val naked: bool = function_is_naked(f);
     val subsize: u32 = frame_subsize(f);
+
+    if (encode.sink_active(?st.buf)) {
+        val rh: R.Result[bool, str] = printer.note_function(?st.buf, st.interner, f);
+        if (R.is_err[bool, str](rh)) { ret rh; }
+    }
+
     if (!naked) { emit_prologue(st, f, subsize); }
+    val rp: R.Result[bool, str] = check_accounted(st, PROLOGUE_REGION);
+    if (R.is_err[bool, str](rp)) { ret rp; }
 
     var bi: u32 = 0;
     for (bi < f.block_count) {
@@ -2567,6 +3097,11 @@ fun encode_function_arm64(st: *encode.EncodeState, f: *mir.MirFunction) R.Result
         if (R.is_err[bool, str](rb)) { ret rb; }
         # this block's fallthrough successor, so its terminator can elide a jump to it.
         encode.set_fallthrough(st, f, bi);
+
+        if (encode.sink_active(?st.buf)) {
+            val rl: R.Result[bool, str] = printer.note_block(?st.buf, blk.id);
+            if (R.is_err[bool, str](rl)) { ret rl; }
+        }
 
         var ii: u32 = 0;
         for (ii < blk.instr_count) {
@@ -2584,6 +3119,8 @@ fun encode_function_arm64(st: *encode.EncodeState, f: *mir.MirFunction) R.Result
             }
             val ei: R.Result[bool, str] = encode_mir_instr(st, f, fn_base, mi);
             if (R.is_err[bool, str](ei)) { ret ei; }
+            val ra: R.Result[bool, str] = check_accounted(st, mi.opcode::u16);
+            if (R.is_err[bool, str](ra)) { ret ra; }
             ii = ii + 1;
         }
         bi = bi + 1;
@@ -2658,6 +3195,74 @@ pub fun encode_arm64(alloc: *A.Allocator, tgt: *resolved.Target, m: *mir.MirModu
     hooks.encode_function = encode_function_arm64;
     hooks.patch_branch    = patch_branch_arm64;
     ret encode.encode_driver(alloc, tgt, m, ?hooks);
+}
+
+# the pseudo-opcode `check_accounted` reports the prologue under, chosen above every
+# real A64 and MIR opcode so it cannot collide with one
+val PROLOGUE_REGION: u16 = 0xFFFF;
+
+# fail when bytes were emitted that the assembly sink never rendered
+#
+# The totality guard behind `--emit-asm` (#2187). Every byte the encoder appends must
+# be covered by an instruction notification; a gap means some emission path writes
+# bytes without rendering them, so the `.s` would silently under-report the code -
+# the exact failure mode that made the old printers untrustworthy. Naming the opcode
+# points straight at the unrendered path. Inert when no sink is attached, so an
+# object-producing encode pays nothing.
+# ---
+# st:     the shared encode state (its buffer carries the sink)
+# opcode: the opcode whose encoding left bytes unrendered, or `PROLOGUE_REGION`
+# ret:    ok(true) when every byte is accounted, or a precise error
+fun check_accounted(st: *encode.EncodeState, opcode: u16) R.Result[bool, str] {
+    val gap: usize = encode.sink_unaccounted(?st.buf);
+    if (gap == 0) { ret R.ok[bool, str](true); }
+
+    var num: [20]u8;
+    var label: str = "prologue";
+    if (opcode != PROLOGUE_REGION) {
+        val n: usize = u64_to_dec(opcode::u64, ?num[0]);
+        num[n] = 0;
+        label = (?num[0])::str;
+    }
+    ret R.err[bool, str](asm_named_err(st,
+        "--emit-asm: opcode ", label,
+        " emitted bytes the aarch64 assembly printer did not render",
+        "--emit-asm: an opcode emitted bytes the assembly printer did not render"));
+}
+
+# render `n` as base-10 digits into `dst`, returning the digit count
+fun u64_to_dec(n: u64, dst: *u8) usize {
+    if (n == 0) { dst[0] = '0'::u8; ret 1; }
+    var tmp: [20]u8;
+    var len: usize = 0;
+    var v: u64 = n;
+    for (v > 0) { tmp[len] = (v % 10)::u8 + '0'::u8; v = v / 10; len = len + 1; }
+    var k: usize = 0;
+    for (k < len) { dst[k] = tmp[len - 1 - k]; k = k + 1; }
+    ret len;
+}
+
+# encode a module and render its assembly text - the arm64 `emit_asm` entry point
+#
+# The same encode as `encode_arm64` with an `AsmSink` attached, so every line of the
+# `.s` is one machine instruction this run emitted. AArch64 renders as it emits: it
+# has no branch-relaxation pass and never calls `insert_text`, so an instruction's
+# first form is its last. `patch_branch_arm64` writes a displacement into an
+# already-emitted word without changing its length, and a branch renders its target
+# as a label rather than a displacement, so pass 2 cannot desynchronise the text from
+# the object. Matches `encode.EmitAsmFn`.
+# ---
+# alloc: allocator backing the encoder output's owned arrays
+# tgt:   resolved target; must be AArch64
+# m:     the fully-resolved MIR module (post isel / regalloc / frame)
+# out:   destination writer for the assembly text
+# ret:   the populated encode.EncoderOutput (owned arrays), or an error string
+pub fun encode_arm64_asm(alloc: *A.Allocator, tgt: *resolved.Target, m: *mir.MirModule,
+                         out: *writer.Writer) R.Result[encode.EncoderOutput, str] {
+    var hooks: encode.EncodeHooks;
+    hooks.encode_function = encode_function_arm64;
+    hooks.patch_branch    = patch_branch_arm64;
+    ret encode.encode_driver_asm(alloc, tgt, m, ?hooks, out);
 }
 
 # inline-asm assembler (Phase 3c)
@@ -3187,12 +3792,13 @@ fun asm_parse_lsl_amount(s: str, out: *u32) bool {
     ret true;
 }
 
-# intern a borrowed symbol name and record a relocation of
-# `kind` at the instruction-word start `pos` (the A64 reloc-offset convention)
-fun asm_push_sym_reloc(st: *encode.EncodeState, pos: u32, kind: of.RelocKind, name: str, name_len: usize, addend: i32) R.Result[bool, str] {
-    val r: R.Result[intern.StrId, str] = intern.intern_bytes(st.interner, name, name_len);
-    if (R.is_err[intern.StrId, str](r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](r)); }
-    ret encode.push_reloc(st, arm64_reloc_offset(pos), kind, R.unwrap_ok[intern.StrId, str](r), addend);
+# intern a symbol name borrowed from the inline-asm body
+#
+# The name is a region of the asm body, not a NUL-terminated string, so it is
+# interned before either the instruction notification or the relocation can name it
+# - both take the resolved id
+fun asm_intern(st: *encode.EncodeState, name: str, name_len: usize) R.Result[intern.StrId, str] {
+    ret intern.intern_bytes(st.interner, name, name_len);
 }
 
 # append the base-10 digits of `n` (at least one digit for zero)
@@ -3313,7 +3919,7 @@ fun emit_asm_mov_imm(st: *encode.EncodeState, rd: u32, value: u64, use64: bool) 
         val sh: u64 = 16::u64 * i::u64;
         val chunk: u64 = (v >> sh) & 0xFFFF;
         if ((chunk << sh) == v) {
-            emit_word(st, pack_movewide(sel(use64, MOVZ_X, MOVZ_W), rd, i, chunk::u32));
+            emit_movewide(st, sel(use64, MOVZ_X, MOVZ_W), rd, i, chunk::u32);
             ret;
         }
         i = i + 1;
@@ -3336,9 +3942,9 @@ fun emit_asm_mov(st: *encode.EncodeState, args: str) R.Result[bool, str] {
     val use64: bool = dst.is64;
     if (src.kind == ASMOP_REG) {
         if (dst.is_sp || src.is_sp) {
-            emit_word(st, pack_addsub_imm(sel(use64, ADDI_X, ADDI_W), dst.reg, src.reg, 0, 0));
+            emit_addsub_imm(st, sel(use64, ADDI_X, ADDI_W), dst.reg, src.reg, 0, 0);
         } or {
-            emit_word(st, pack_alu3(sel(use64, ORR_X, ORR_W), dst.reg, ZR, src.reg));
+            emit_alu3(st, sel(use64, ORR_X, ORR_W), dst.reg, ZR, src.reg);
         }
         ret R.ok[bool, str](true);
     }
@@ -3373,7 +3979,7 @@ fun emit_asm_movewide(st: *encode.EncodeState, args: str, is_movk: bool) R.Resul
     }
     var base: u32 = sel(rd.is64, MOVZ_X, MOVZ_W);
     if (is_movk) { base = sel(rd.is64, MOVK_X, MOVK_W); }
-    emit_word(st, pack_movewide(base, rd.reg, hw, im.imm::u32));
+    emit_movewide(st, base, rd.reg, hw, im.imm::u32);
     ret R.ok[bool, str](true);
 }
 
@@ -3399,20 +4005,23 @@ fun emit_asm_addsub(st: *encode.EncodeState, args: str, is_sub: bool) R.Result[b
         var base_i: u32 = sel(use64, ADDI_X, ADDI_W);
         if (is_sub) { base_i = sel(use64, SUBI_X, SUBI_W); }
         if (v >= 0 && v <= 4095) {
-            emit_word(st, pack_addsub_imm(base_i, rd.reg, rn.reg, v::u32, 0));
+            emit_addsub_imm(st, base_i, rd.reg, rn.reg, v::u32, 0);
             ret R.ok[bool, str](true);
         }
         if (v > 0 && (v & 0xFFF) == 0 && (v >> 12) <= 4095) {
-            emit_word(st, pack_addsub_imm(base_i, rd.reg, rn.reg, (v >> 12)::u32, 1));
+            emit_addsub_imm(st, base_i, rd.reg, rn.reg, (v >> 12)::u32, 1);
             ret R.ok[bool, str](true);
         }
         ret R.err[bool, str]("encode: inline-asm add/sub immediate is out of imm12 range");
     }
     if (op3.kind == ASMOP_LO12) {
         if (is_sub) { ret R.err[bool, str]("encode: inline-asm 'sub' has no :lo12: form"); }
+        val sr: R.Result[intern.StrId, str] = asm_intern(st, op3.name, op3.name_len);
+        if (R.is_err[intern.StrId, str](sr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sr)); }
+        val sid: intern.StrId = R.unwrap_ok[intern.StrId, str](sr);
         val pos: u32 = st.buf.len::u32;
-        emit_word(st, pack_addsub_imm(sel(use64, ADDI_X, ADDI_W), rd.reg, rn.reg, 0, 0));
-        ret asm_push_sym_reloc(st, pos, of.RK_ADD_LO12, op3.name, op3.name_len, 0);
+        emit_addsub_imm_sym(st, sel(use64, ADDI_X, ADDI_W), rd.reg, rn.reg, sid, printer.MOD_PCREL_LO);
+        ret encode.push_reloc(st, arm64_reloc_offset(pos), of.RK_ADD_LO12, sid, 0);
     }
     if (op3.kind == ASMOP_REG) {
         if (rd.is_sp || rn.is_sp || op3.is_sp) {
@@ -3420,7 +4029,7 @@ fun emit_asm_addsub(st: *encode.EncodeState, args: str, is_sub: bool) R.Result[b
         }
         var base_r: u32 = sel(use64, ADD_X, ADD_W);
         if (is_sub) { base_r = sel(use64, SUB_X, SUB_W); }
-        emit_word(st, pack_alu3(base_r, rd.reg, rn.reg, op3.reg));
+        emit_alu3(st, base_r, rd.reg, rn.reg, op3.reg);
         ret R.ok[bool, str](true);
     }
     ret R.err[bool, str]("encode: malformed inline-asm add/sub operand");
@@ -3439,7 +4048,7 @@ fun emit_asm_logical(st: *encode.EncodeState, args: str, base_x: u32, base_w: u3
     if (!asm_parse_operand((?b0[0])::str, ?rd) || rd.kind != ASMOP_REG) { ret R.err[bool, str]("encode: inline-asm and/orr/eor destination must be a register"); }
     if (!asm_parse_operand((?b1[0])::str, ?rn) || rn.kind != ASMOP_REG) { ret R.err[bool, str]("encode: inline-asm and/orr/eor first source must be a register"); }
     if (!asm_parse_operand((?b2[0])::str, ?rm) || rm.kind != ASMOP_REG) { ret R.err[bool, str]("encode: inline-asm and/orr/eor immediate (bitmask) form unsupported; use a register operand"); }
-    emit_word(st, pack_alu3(sel(rd.is64, base_x, base_w), rd.reg, rn.reg, rm.reg));
+    emit_alu3(st, sel(rd.is64, base_x, base_w), rd.reg, rn.reg, rm.reg);
     ret R.ok[bool, str](true);
 }
 
@@ -3455,11 +4064,11 @@ fun emit_asm_cmp(st: *encode.EncodeState, args: str) R.Result[bool, str] {
     if (!asm_parse_operand((?b1[0])::str, ?op2))                        { ret R.err[bool, str]("encode: malformed inline-asm 'cmp' operand"); }
     val use64: bool = rn.is64;
     if (op2.kind == ASMOP_IMM && op2.imm >= 0 && op2.imm <= 4095) {
-        emit_word(st, pack_cmp_imm(sel(use64, SUBS_IMM_X, SUBS_IMM_W), rn.reg, op2.imm::u32));
+        emit_addsub_imm(st, sel(use64, SUBS_IMM_X, SUBS_IMM_W), ZR, rn.reg, op2.imm::u32, 0);
         ret R.ok[bool, str](true);
     }
     if (op2.kind == ASMOP_REG) {
-        emit_word(st, pack_cmp_reg(sel(use64, SUBS_REG_X, SUBS_REG_W), rn.reg, op2.reg));
+        emit_alu3(st, sel(use64, SUBS_REG_X, SUBS_REG_W), ZR, rn.reg, op2.reg);
         ret R.ok[bool, str](true);
     }
     ret R.err[bool, str]("encode: inline-asm 'cmp' second operand must be a register or imm12");
@@ -3478,7 +4087,7 @@ fun emit_asm_cset(st: *encode.EncodeState, args: str) R.Result[bool, str] {
     if (!asm_parse_operand((?b0[0])::str, ?rd) || rd.kind != ASMOP_REG) { ret R.err[bool, str]("encode: inline-asm 'cset' destination must be a register"); }
     var cc: u32 = 0;
     if (!asm_parse_cond((?b1[0])::str, ?cc)) { ret R.err[bool, str]("encode: inline-asm 'cset' condition is unrecognized"); }
-    emit_word(st, pack_cset(sel(rd.is64, CSINC_X, CSINC_W), rd.reg, cc));
+    emit_cset(st, sel(rd.is64, CSINC_X, CSINC_W), rd.reg, cc);
     ret R.ok[bool, str](true);
 }
 
@@ -3492,9 +4101,12 @@ fun emit_asm_adrp(st: *encode.EncodeState, args: str) R.Result[bool, str] {
     var sym: AsmOp;
     if (!asm_parse_operand((?b0[0])::str, ?rd) || rd.kind != ASMOP_REG)   { ret R.err[bool, str]("encode: inline-asm 'adrp' destination must be a register"); }
     if (!asm_parse_operand((?b1[0])::str, ?sym) || sym.kind != ASMOP_SYM) { ret R.err[bool, str]("encode: inline-asm 'adrp' target must be a symbol"); }
+    val sr: R.Result[intern.StrId, str] = asm_intern(st, sym.name, sym.name_len);
+    if (R.is_err[intern.StrId, str](sr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sr)); }
+    val sid: intern.StrId = R.unwrap_ok[intern.StrId, str](sr);
     val pos: u32 = st.buf.len::u32;
-    emit_word(st, pack_adrp(rd.reg));
-    ret asm_push_sym_reloc(st, pos, of.RK_PAGE21, sym.name, sym.name_len, 0);
+    emit_adrp(st, rd.reg, sid, printer.MOD_PCREL_HI);
+    ret encode.push_reloc(st, arm64_reloc_offset(pos), of.RK_PAGE21, sid, 0);
 }
 
 # `ldr` / `str` / `ldrb` / `strb` / `ldrh` / `strh Rt, <mem>`. the
@@ -3522,12 +4134,15 @@ fun emit_asm_ldst(st: *encode.EncodeState, mnem: str, args: str) R.Result[bool, 
     }
 
     if (mem.is_lo12) {
+        val sr: R.Result[intern.StrId, str] = asm_intern(st, mem.name, mem.name_len);
+        if (R.is_err[intern.StrId, str](sr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sr)); }
+        val sid: intern.StrId = R.unwrap_ok[intern.StrId, str](sr);
         val pos: u32 = st.buf.len::u32;
-        emit_word(st, pack_ldst(ldst_base_scaled(w, is_load), rt.reg, mem.base, 0));
-        ret asm_push_sym_reloc(st, pos, ldst_lo12_kind(w), mem.name, mem.name_len, 0);
+        emit_ldst_sym(st, ldst_base_scaled(w, is_load), rt.reg, mem.base, sid, printer.MOD_PCREL_LO);
+        ret encode.push_reloc(st, arm64_reloc_offset(pos), ldst_lo12_kind(w), sid, 0);
     }
     if (mem.has_index) {
-        emit_word(st, pack_ldst_reg(ldst_base_reg(w, is_load), rt.reg, mem.base, mem.index));
+        emit_ldst_reg(st, ldst_base_reg(w, is_load), rt.reg, mem.base, mem.index);
         ret R.ok[bool, str](true);
     }
     var off: i64 = 0;
@@ -3567,7 +4182,7 @@ fun emit_asm_ldstp(st: *encode.EncodeState, args: str, is_load: bool) R.Result[b
     if ((disp & 7) != 0) { ret R.err[bool, str]("encode: inline-asm stp/ldp offset must be a multiple of 8"); }
     val q: i64 = disp / 8;
     if (q < -64 || q > 63) { ret R.err[bool, str]("encode: inline-asm stp/ldp offset is out of the imm7 range"); }
-    emit_word(st, pack_ldstp(base_word, ra.reg, rb.reg, mem.base, q::u32 & 0x7F));
+    emit_ldstp(st, base_word, ra.reg, rb.reg, mem.base, q::u32 & 0x7F);
     ret R.ok[bool, str](true);
 }
 
@@ -3586,7 +4201,7 @@ fun emit_asm_ldordered(st: *encode.EncodeState, mnem: str, args: str) R.Result[b
     var base: u32 = sel(rt.is64, LDAXR_X, LDAXR_W);
     if (str_equals(mnem, "ldar")) { base = sel(rt.is64, LDAR_X, LDAR_W); }
     or (str_equals(mnem, "stlr")) { base = sel(rt.is64, STLR_X, STLR_W); }
-    emit_word(st, pack_ldst(base, rt.reg, mem.base, 0));
+    emit_ldst(st, base, rt.reg, mem.base, 0);
     ret R.ok[bool, str](true);
 }
 
@@ -3605,7 +4220,7 @@ fun emit_asm_stlxr(st: *encode.EncodeState, args: str) R.Result[bool, str] {
     if (!asm_parse_operand((?b2[0])::str, ?mem) || mem.kind != ASMOP_MEM) { ret R.err[bool, str]("encode: inline-asm stlxr address must be a memory operand"); }
     if (mem.has_index || mem.has_disp || mem.wb_pre)                      { ret R.err[bool, str]("encode: inline-asm stlxr addressing must be a bare [Xn]"); }
     val base: u32 = sel(rt.is64, STLXR_X, STLXR_W);
-    emit_word(st, pack_ldst(base, rt.reg, mem.base, 0) | ((rs.reg & 0x1F) << 16));
+    emit_stxr(st, base, rs.reg, rt.reg, mem.base);
     ret R.ok[bool, str](true);
 }
 
@@ -3617,7 +4232,7 @@ fun emit_asm_dmb(st: *encode.EncodeState, args: str) R.Result[bool, str] {
     if (n != 1)                                                    { ret R.err[bool, str]("encode: inline-asm dmb expects one barrier option"); }
     var opt: u32 = 0;
     if (!asm_barrier_option((?b0[0])::str, ?opt)) { ret R.err[bool, str]("encode: unsupported inline-asm dmb barrier option"); }
-    emit_word(st, DMB_BASE | ((opt & 0xF) << 8));
+    emit_barrier(st, opt);
     ret R.ok[bool, str](true);
 }
 
@@ -3668,11 +4283,11 @@ fun emit_asm_shift(st: *encode.EncodeState, mnem: str, args: str) R.Result[bool,
         if (kind == 0) {
             val immr: u32 = (width - sh) & (width - 1);
             val imms: u32 = (width - 1) - sh;
-            emit_word(st, pack_bitfield(sel(use64, UBFM_X, UBFM_W), rd.reg, rn.reg, immr, imms));
+            emit_bitfield(st, sel(use64, UBFM_X, UBFM_W), rd.reg, rn.reg, immr, imms);
         } or (kind == 1) {
-            emit_word(st, pack_bitfield(sel(use64, UBFM_X, UBFM_W), rd.reg, rn.reg, sh, width - 1));
+            emit_bitfield(st, sel(use64, UBFM_X, UBFM_W), rd.reg, rn.reg, sh, width - 1);
         } or {
-            emit_word(st, pack_bitfield(sel(use64, SBFM_X, SBFM_W), rd.reg, rn.reg, sh, width - 1));
+            emit_bitfield(st, sel(use64, SBFM_X, SBFM_W), rd.reg, rn.reg, sh, width - 1);
         }
         ret R.ok[bool, str](true);
     }
@@ -3680,7 +4295,7 @@ fun emit_asm_shift(st: *encode.EncodeState, mnem: str, args: str) R.Result[bool,
     var bx: u32 = LSLV_X; var bw: u32 = LSLV_W;
     if (kind == 1) { bx = LSRV_X; bw = LSRV_W; }
     or (kind == 2) { bx = ASRV_X; bw = ASRV_W; }
-    emit_word(st, pack_alu3(sel(use64, bx, bw), rd.reg, rn.reg, cnt.reg));
+    emit_alu3(st, sel(use64, bx, bw), rd.reg, rn.reg, cnt.reg);
     ret R.ok[bool, str](true);
 }
 
@@ -3688,9 +4303,10 @@ fun emit_asm_shift(st: *encode.EncodeState, mnem: str, args: str) R.Result[bool,
 # label. a backward reference patches immediately against the nearest preceding
 # definition; a forward reference is recorded and patched when its definition is
 # reached. the imm26 / imm19 insert is the shared `patch_branch_arm64`
-fun emit_asm_branch_label(st: *encode.EncodeState, labels: *AsmLabels, word: u32, number: u64, fwd: bool) R.Result[bool, str] {
+fun emit_asm_branch_label(st: *encode.EncodeState, labels: *AsmLabels, word: u32, base: u32,
+                          rt: u32, has_rt: bool, number: u64, fwd: bool) R.Result[bool, str] {
     val patch_pos: u32 = st.buf.len::u32;
-    emit_word(st, word);
+    emit_branch_local(st, word, base, rt, has_rt, number, fwd);
     if (fwd) { ret asm_label_push_ref(labels, patch_pos, number); }
     val def: O.Option[u32] = asm_label_lookup(labels, number);
     if (!O.is_some[u32](def)) {
@@ -3708,7 +4324,7 @@ fun emit_asm_b(st: *encode.EncodeState, labels: *AsmLabels, args: str) R.Result[
     var number: u64 = 0;
     var fwd: bool = false;
     if (asm_label_ref(target, ?number, ?fwd)) {
-        ret emit_asm_branch_label(st, labels, B_BASE, number, fwd);
+        ret emit_asm_branch_label(st, labels, B_BASE, B_BASE, 0, false, number, fwd);
     }
     if (str_len(target) > 0 && asm_is_digit(target[0])) {
         ret R.err[bool, str]("encode: inline-asm numeric local-label reference must be 'Nf' or 'Nb'");
@@ -3717,9 +4333,12 @@ fun emit_asm_b(st: *encode.EncodeState, labels: *AsmLabels, args: str) R.Result[
     if (!asm_parse_operand(target, ?op) || op.kind != ASMOP_SYM) {
         ret R.err[bool, str]("encode: inline-asm 'b' target must be a symbol or a numeric local label");
     }
+    val sr: R.Result[intern.StrId, str] = asm_intern(st, op.name, op.name_len);
+    if (R.is_err[intern.StrId, str](sr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sr)); }
+    val sid: intern.StrId = R.unwrap_ok[intern.StrId, str](sr);
     val pos: u32 = st.buf.len::u32;
-    emit_word(st, B_BASE);
-    ret asm_push_sym_reloc(st, pos, of.RK_PLT32, op.name, op.name_len, 0);
+    emit_branch_sym(st, B_BASE, sid);
+    ret encode.push_reloc(st, arm64_reloc_offset(pos), of.RK_PLT32, sid, 0);
 }
 
 # `b.<cond> target` - a conditional branch (imm19). a numeric local
@@ -3731,7 +4350,7 @@ fun emit_asm_bcond(st: *encode.EncodeState, labels: *AsmLabels, cond: u32, args:
     var number: u64 = 0;
     var fwd: bool = false;
     if (asm_label_ref(target, ?number, ?fwd)) {
-        ret emit_asm_branch_label(st, labels, BCOND | (cond & 0xF), number, fwd);
+        ret emit_asm_branch_label(st, labels, BCOND | (cond & 0xF), BCOND | (cond & 0xF), 0, false, number, fwd);
     }
     if (str_len(target) > 0 && asm_is_digit(target[0])) {
         ret R.err[bool, str]("encode: inline-asm numeric local-label reference must be 'Nf' or 'Nb'");
@@ -3756,7 +4375,7 @@ fun emit_asm_cbr(st: *encode.EncodeState, labels: *AsmLabels, args: str, is_nz: 
     var number: u64 = 0;
     var fwd: bool = false;
     if (asm_label_ref(target, ?number, ?fwd)) {
-        ret emit_asm_branch_label(st, labels, word, number, fwd);
+        ret emit_asm_branch_label(st, labels, word, base, rt.reg, true, number, fwd);
     }
     if (str_len(target) > 0 && asm_is_digit(target[0])) {
         ret R.err[bool, str]("encode: inline-asm numeric local-label reference must be 'Nf' or 'Nb'");
@@ -3769,8 +4388,8 @@ fun emit_asm_one_reg(st: *encode.EncodeState, args: str, word_is_blr: bool) R.Re
     val s: str = asm_trim(args);
     var op: AsmOp;
     if (!asm_parse_operand(s, ?op) || op.kind != ASMOP_REG) { ret R.err[bool, str]("encode: inline-asm blr/br operand must be a register"); }
-    if (word_is_blr)                                        { emit_word(st, pack_blr(op.reg)); }
-    or { emit_word(st, BR_BASE | ((op.reg & 0x1F) << 5)); }
+    if (word_is_blr)                                        { emit_branch_reg(st, BLR_BASE, op.reg); }
+    or { emit_branch_reg(st, BR_BASE, op.reg); }
     ret R.ok[bool, str](true);
 }
 
@@ -3779,9 +4398,12 @@ fun emit_asm_bl(st: *encode.EncodeState, args: str) R.Result[bool, str] {
     val s: str = asm_trim(args);
     var op: AsmOp;
     if (!asm_parse_operand(s, ?op) || op.kind != ASMOP_SYM) { ret R.err[bool, str]("encode: inline-asm 'bl' target must be a symbol"); }
+    val sr: R.Result[intern.StrId, str] = asm_intern(st, op.name, op.name_len);
+    if (R.is_err[intern.StrId, str](sr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sr)); }
+    val sid: intern.StrId = R.unwrap_ok[intern.StrId, str](sr);
     val pos: u32 = st.buf.len::u32;
-    emit_word(st, BL_BASE);
-    ret asm_push_sym_reloc(st, pos, of.RK_PLT32, op.name, op.name_len, 0);
+    emit_branch_sym(st, BL_BASE, sid);
+    ret encode.push_reloc(st, arm64_reloc_offset(pos), of.RK_PLT32, sid, 0);
 }
 
 # a single-immediate instruction whose imm16 sits at bits[20:5]
@@ -3791,17 +4413,17 @@ fun emit_asm_imm16_op(st: *encode.EncodeState, args: str, base: u32) R.Result[bo
     var op: AsmOp;
     if (!asm_parse_operand(s, ?op) || op.kind != ASMOP_IMM) { ret R.err[bool, str]("encode: inline-asm svc/brk needs an immediate"); }
     if (op.imm < 0 || op.imm > 0xFFFF)                      { ret R.err[bool, str]("encode: inline-asm svc/brk immediate is out of 16-bit range"); }
-    emit_word(st, base | ((op.imm::u32 & 0xFFFF) << 5));
+    emit_imm16(st, base, op.imm::u32);
     ret R.ok[bool, str](true);
 }
 
 # `ret` (return through x30) or `ret Xn`
 fun emit_asm_ret(st: *encode.EncodeState, args: str) R.Result[bool, str] {
     val s: str = asm_trim(args);
-    if (s[0] == 0) { emit_word(st, RET_WORD); ret R.ok[bool, str](true); }
+    if (s[0] == 0) { emit_nullary(st, RET_WORD); ret R.ok[bool, str](true); }
     var op: AsmOp;
     if (!asm_parse_operand(s, ?op) || op.kind != ASMOP_REG) { ret R.err[bool, str]("encode: inline-asm 'ret' operand must be a register"); }
-    emit_word(st, RET_BASE | ((op.reg & 0x1F) << 5));
+    emit_branch_reg(st, RET_BASE, op.reg);
     ret R.ok[bool, str](true);
 }
 
@@ -3958,7 +4580,7 @@ fun encode_asm_stmt_arm64(st: *encode.EncodeState, f: *mir.MirFunction, fn_base:
     if (!asm_first_token(tok, ?mbuf[0], 24, ?args)) { ret R.err[bool, str]("encode: inline-asm mnemonic too long"); }
     val mnem: str = (?mbuf[0])::str;
 
-    if (str_equals(mnem, "nop"))  { emit_word(st, NOP_WORD); ret R.ok[bool, str](true); }
+    if (str_equals(mnem, "nop"))  { emit_nullary(st, NOP_WORD); ret R.ok[bool, str](true); }
     if (str_equals(mnem, "ret"))  { ret emit_asm_ret(st, args); }
     if (str_equals(mnem, "svc"))  { ret emit_asm_imm16_op(st, args, SVC_BASE); }
     if (str_equals(mnem, "brk"))  { ret emit_asm_imm16_op(st, args, BRK_BASE); }
@@ -3994,7 +4616,7 @@ fun encode_asm_stmt_arm64(st: *encode.EncodeState, f: *mir.MirFunction, fn_base:
     if (str_equals(mnem, "stp"))   { ret emit_asm_ldstp(st, args, false); }
     if (str_equals(mnem, "ldp"))   { ret emit_asm_ldstp(st, args, true); }
     if (str_equals(mnem, "dmb"))   { ret emit_asm_dmb(st, args); }
-    if (str_equals(mnem, "yield")) { emit_word(st, YIELD_WORD); ret R.ok[bool, str](true); }
+    if (str_equals(mnem, "yield")) { emit_nullary(st, YIELD_WORD); ret R.ok[bool, str](true); }
     if (str_equals(mnem, "ldar") || str_equals(mnem, "stlr") || str_equals(mnem, "ldaxr")) {
         ret emit_asm_ldordered(st, mnem, args);
     }

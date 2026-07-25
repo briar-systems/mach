@@ -1,39 +1,1546 @@
-# AArch64 assembly text printer - not yet implemented
+# AArch64 assembly text printer - renders the encoder's own instruction stream
 #
-# `--emit-asm` renders its text from the encoder's own instruction stream: the ISA
-# runs its ordinary encoder with an `encode.AsmSink` attached and notifies the sink
-# once per machine instruction emitted, so a `.s` line is an instruction the
-# encoder really produced. x86-64 does this today (see `isa.x64.printer`); AArch64
-# does not yet, and is tracked by briar-systems/mach#2194.
+# This is the text half of the arm64 ISA's `emit_asm` operation. It does NOT walk
+# the MIR: `encode.encode_arm64_asm` runs the ordinary encoder with an `enc.AsmSink`
+# attached, and the encoder calls `note_inst` once for every machine instruction it
+# emits, immediately after emitting it. Each line of the `.s` is therefore one
+# instruction the encoder really produced, in the order it produced it.
 #
-# Until then this refuses, and the ISA registers it rather than leaving the vtable
-# slot nil. Nil was the previous behaviour and it was the worst of the options:
-# the dispatcher treated a missing printer as a clean no-op, but the caller had
-# already created the `.s`, so `--emit-asm` left behind an empty file that claimed
-# to be the emitted code and reported nothing (#2187).
+# AArch64 packs an instruction into a single 32-bit word before it reaches the byte
+# sink, so a printer reading the sink would need a disassembler. It does not read
+# the sink: the encoder's bitfield-class packers (`pack_alu3`, `pack_addsub_imm`,
+# `pack_ldst`, ...) receive every field as an argument, and the emitter that wraps
+# each packer forwards those same fields here. The structure was never absent, only
+# discarded one layer too early; capturing it at the packers costs no decode.
+#
+# The mnemonic and every alias a disassembler prints - `mov` for `orr Rd, XZR, Rm`,
+# `cmp` for `subs XZR, ...`, `lsr` / `uxtb` / `sxtw` for the bitfield moves - are
+# derived from the base word the encoder packed and the fields it packed into it, so
+# a line corresponds to the object line for line. The one thing no machine field can
+# carry is a name: a branch's target block, a call's symbol, and a relocation's
+# symbol ride the notification explicitly.
+#
+# An unmapped base word, or an operand shape that does not render, is a hard error
+# naming the failure. Silent degradation is what let the previous divergence go
+# unnoticed (#2187), so there is no fallback text anywhere in this module.
+#
+# RELATION TO `isa.Inst` - the shared instruction value (#2212, #2214)
+#
+# `Inst` below is field-for-field `isa.Inst` with one substitution: `base` (the 32-bit
+# packer base word) stands where `opcode` (a u16 abstract identifier) does. The
+# operand payloads ARE the shared `isa.Operand` - register, immediate, memory
+# base+index+scale+disp, block label and symbol all map 1:1 - and the slots are
+# SEMANTIC, as they are on x86-64: `dst` is the location written, so a store puts its
+# memory operand there and the renderer emits AArch64's source-first order
+# explicitly rather than inferring it. Collapsing onto `isa.Inst` is then a
+# substitution of the key, not a rewrite of the payloads.
+#
+# The key is deliberately still the base word. AArch64 does not encode through
+# opcodes, and a minted u16 opcode carried ALONGSIDE the base word would be a second,
+# independent naming of the instruction riding next to the bytes - the drift #2197
+# found five instances of on x86-64. Making the opcode the single naming requires the
+# emitters to look the base word UP from it, which is #2118's format-table rewrite of
+# the encoder, not a printer change.
+#
+# Two fields this needs that `isa.Inst` gained for it (#2214): `src3`, because
+# `msub Rd, Rn, Rm, Ra` has four operands and `ubfm Rd, Rn, #immr, #imms` has two
+# immediates - and the bitfield moves are every immediate shift and every sub-word
+# extend on this target; and `vec_lane`, because `Operand.size` says 16 bytes but
+# cannot say `.4s` versus `.8h` versus `.16b`. `vec_lane` reuses the descriptor
+# `mir.MirInstr.vec_lane` already carries, so there is one lane descriptor in the
+# compiler rather than a parallel one that can fall out of step (#2037).
+#
+# `sym_mod` is the exception: the relocation modifier belongs on the operand carrying
+# the symbol, and `isa.Operand.sym_mod` with its shared `SYM_MOD_*` set is landing on
+# the riscv64 branch, which is blocked on it. Until this branch rebases onto that,
+# the modifier rides the arm64-local `MOD_*` field below - a private field on a
+# private record, extending no shared namespace.
 
+use std.format;
 use std.io.writer;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.char.char;
+use std.types.size.usize;
 use std.types.string.str;
 
+use O: std.types.option;
 use R: std.types.result;
 
-use A: std.allocator;
-use encode: mach.lang.be.codegen.encode;
+use enc: mach.lang.be.codegen.encode;
 use mach.lang.be.codegen.mir;
-use mach.lang.target.resolved;
+use mach.lang.intern;
+use mach.lang.target.isa;
 
-# refuse to render AArch64 assembly text, naming the tracking issue
+# a three-register data-processing word (`pack_alu3`), the CMP alias (`pack_cmp_reg`
+# emits one with Rd = XZR), and every two-register scalar-float form
+pub val FORM_ALU3: u8 = 1;
+# an ADD/SUB (immediate) word (`pack_addsub_imm`), and the CMP/CMN immediate aliases
+pub val FORM_ADDSUB_IMM: u8 = 2;
+# a bitfield-move word (`pack_bitfield`) - UBFM / SBFM and their shift / extend aliases
+pub val FORM_BITFIELD: u8 = 3;
+# a move-wide word (`pack_movewide`) - MOVZ / MOVK
+pub val FORM_MOVEWIDE: u8 = 4;
+# a multiply-add / multiply-subtract word (`pack_madd`)
+pub val FORM_MADD: u8 = 5;
+# a CSINC Rd, XZR, XZR, invert(cc) word (`pack_cset`) - the CSET alias
+pub val FORM_CSET: u8 = 6;
+# a scaled unsigned-offset (`pack_ldst`), unscaled signed-offset (`pack_ldur`), or
+# register-offset (`pack_ldst_reg`) load or store; the addressing form rides the
+# memory operand and the mnemonic rides the base word
+pub val FORM_LDST: u8 = 7;
+# a load/store-pair word (`pack_ldstp`) in its signed-offset, pre-index, and
+# post-index forms
+pub val FORM_LDSTP: u8 = 8;
+# a NEON three-register-same 128-bit word (`pack_neon_3same`)
+pub val FORM_NEON_3SAME: u8 = 9;
+# a NEON two-register-misc 128-bit word (`pack_neon_2misc`)
+pub val FORM_NEON_2MISC: u8 = 10;
+# a branch with a destination - B / BL / B.cond / CBZ / CBNZ
+pub val FORM_BRANCH: u8 = 11;
+# a register-indirect branch - BR / BLR / RET Xn
+pub val FORM_BRANCH_REG: u8 = 12;
+# an ADRP page-address word (`pack_adrp`)
+pub val FORM_ADRP: u8 = 13;
+# a whole-word instruction with no operands - RET / NOP / YIELD
+pub val FORM_NULLARY: u8 = 14;
+# a single-immediate instruction whose imm16 sits at bits[20:5] - BRK / SVC
+pub val FORM_IMM16: u8 = 15;
+# a data memory barrier (DMB), whose CRm names the barrier domain
+pub val FORM_BARRIER: u8 = 16;
+# a store-release-exclusive word, whose Rs status register rides bits[20:16]
+pub val FORM_STXR: u8 = 17;
+
+# the instruction's symbol operand carries no relocation modifier
+pub val MOD_NONE: u8 = 0;
+# the symbol's page, as `adrp Xd, sym` names it
+pub val MOD_PCREL_HI: u8 = 1;
+# the symbol's low twelve bits, as `:lo12:sym` names them
+pub val MOD_PCREL_LO: u8 = 2;
+# the symbol's GOT-slot page, as `adrp Xd, :got:sym` names it
+pub val MOD_GOT_HI: u8 = 3;
+# the symbol's GOT-slot low twelve bits, as `:got_lo12:sym` names them
+pub val MOD_GOT_LO: u8 = 4;
+
+# the four-bit condition a B.cond or CSET carries, in `flags`
+pub val FLAG_COND: u16 = 0x000F;
+# the load/store pair writes its updated base back before the access (`[Xn, #off]!`)
+pub val FLAG_WB_PRE: u16 = 0x0010;
+# the load/store pair applies its offset after the access (`[Xn], #off`)
+pub val FLAG_WB_POST: u16 = 0x0020;
+
+# the branch's destination is not named (never emitted; a branch always has one)
+pub val TGT_NONE: u8 = 0;
+# the destination is a MIR block, rendered as its local label
+pub val TGT_BLOCK: u8 = 1;
+# the destination is a symbol the linker resolves
+pub val TGT_SYM: u8 = 2;
+# the destination is a fixed word displacement resolved at emit time
+pub val TGT_PCREL: u8 = 3;
+# the destination is a forward reference to an inline-asm numeric local label
+pub val TGT_LOCAL_FWD: u8 = 4;
+# the destination is a backward reference to an inline-asm numeric local label
+pub val TGT_LOCAL_BACK: u8 = 5;
+
+# one machine instruction the encoder emitted
 #
-# The `emit_asm` entry point the arm64 ISA registers; matches
-# `be.codegen.encode.EmitAsmFn`.
+# The encoder's currency with the printer, and the AArch64 instantiation of the
+# epic's target-facing instruction value (#2212) - see the module header for its
+# exact relation to `isa.Inst`. `base` is the packer base word that names the
+# operation, `form` the operand layout it was packed into, and the operand slots are
+# `isa.Operand` values in semantic (not print) order.
 # ---
-# a:   backing allocator (unused; no encode is performed)
-# tgt: resolved compilation target
-# m:   the fully-resolved MIR module
+# base:     the packer base word, with its register / immediate fields clear
+# form:     FORM_*, the operand layout
+# dst:      the location written
+# src1:     first source operand
+# src2:     second source operand
+# src3:     third source operand - a multiply accumulator, a second bitfield
+#           immediate, or a shift amount decorating `src2`
+# flags:    FLAG_* - the condition, and the pair addressing mode
+# vec_lane: the NEON lane descriptor, in `mir.MirInstr.vec_lane`'s encoding
+# sym_mod:  MOD_*, the relocation modifier on whichever operand carries the symbol
+# target:   TGT_*, how a branch names its destination
+# block:    the destination block id, when `target` is TGT_BLOCK
+pub rec Inst {
+    base:     u32;
+    form:     u8;
+    dst:      isa.Operand;
+    src1:     isa.Operand;
+    src2:     isa.Operand;
+    src3:     isa.Operand;
+    flags:    u16;
+    vec_lane: u8;
+    sym_mod:  u8;
+    target:   u8;
+    block:    u32;
+}
+
+# an instruction of `form` built from `base`, with every operand absent
+# ---
+# form: the operand layout the emitter will fill
+# base: the packer base word
+# ret:  an empty instruction of that form
+pub fun inst(form: u8, base: u32) Inst {
+    var i: Inst;
+    i.base     = base;
+    i.form     = form;
+    i.dst      = none_operand();
+    i.src1     = none_operand();
+    i.src2     = none_operand();
+    i.src3     = none_operand();
+    i.flags    = 0;
+    i.vec_lane = 0;
+    i.sym_mod  = MOD_NONE;
+    i.target   = TGT_NONE;
+    i.block    = 0;
+    ret i;
+}
+
+# an absent operand
+#
+# `isa` builds each populated operand through its own private blank, but exposes no
+# constructor for the empty one - x86-64 clears `kind` by hand where it needs one.
+# A public `isa.make_none()` would suit both; it is deliberately not added here,
+# since three branches are live in that file.
+# ---
+# ret: an operand of kind OPK_NONE with every payload field neutral
+pub fun none_operand() isa.Operand {
+    var op: isa.Operand;
+    op.kind   = isa.OPK_NONE;
+    op.size   = 0;
+    op.reg    = -1;
+    op.imm    = 0;
+    op.base   = -1;
+    op.index  = -1;
+    op.scale  = 0;
+    op.disp   = 0;
+    op.sym_id = 0;
+    op.label  = nil;
+    ret op;
+}
+
+# a general-purpose register operand at `bytes` width
+# ---
+# n:     the register index (31 naming XZR or SP, by position)
+# bytes: the operand width in bytes (4 for a W register, 8 for an X register)
+# ret:   the operand
+pub fun gp(n: u32, bytes: u8) isa.Operand {
+    ret isa.make_reg(isa.regid_make(isa.REG_CLASS_ID_GP, (n & 0x1F)::i32), bytes);
+}
+
+# a float / vector register operand at `bytes` width
+# ---
+# n:     the register index
+# bytes: the operand width in bytes (4 for S, 8 for D, 16 for Q or a NEON vector)
+# ret:   the operand
+pub fun vec(n: u32, bytes: u8) isa.Operand {
+    ret isa.make_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, (n & 0x1F)::i32), bytes);
+}
+
+# render one function's introducing header
+#
+# Emits no bytes, so it leaves the sink's byte accounting untouched.
+# ---
+# buf:      the encoder byte sink carrying the assembly sink
+# interner: resolves the function's interned name
+# f:        the function whose encoding is starting
+# ret:      true on success, or the write error
+pub fun note_function(buf: *enc.ByteBuf, interner: *intern.Interner, f: *mir.MirFunction) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    val res_nl: R.Result[bool, str] = emit_str(out, "\n# ");
+    if (R.is_err[bool, str](res_nl)) { ret res_nl; }
+    val res_name: R.Result[bool, str] = emit_interned(out, interner, f.name);
+    if (R.is_err[bool, str](res_name)) { ret res_name; }
+    ret emit_str(out, ":\n");
+}
+
+# render one block's local label
+#
+# Emits no bytes, so it leaves the sink's byte accounting untouched.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# id:  the block id being entered
+# ret: true on success, or the write error
+pub fun note_block(buf: *enc.ByteBuf, id: u32) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    val res_dot: R.Result[bool, str] = emit_str(out, ".");
+    if (R.is_err[bool, str](res_dot)) { ret res_dot; }
+    val res_id: R.Result[bool, str] = emit_u64(out, id::u64);
+    if (R.is_err[bool, str](res_id)) { ret res_id; }
+    ret emit_str(out, ":\n");
+}
+
+# render one machine instruction the encoder just emitted
+#
+# The sink's single notification point. Renders `i`, then marks every byte emitted
+# so far as accounted; the encoder's totality guard compares that mark against the
+# buffer length after each MIR opcode, so an emission path that never reaches here
+# is reported rather than silently dropped from the artifact.
+#
+# Returns nothing: it runs on the encoder's hot path where no error can be threaded,
+# so a render failure is latched on the sink and raised by the driver.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the machine instruction just emitted
+pub fun note_inst(buf: *enc.ByteBuf, i: *Inst) {
+    val res: R.Result[bool, str] = render_inst(buf, i);
+    if (R.is_err[bool, str](res)) {
+        enc.sink_fail(buf, R.unwrap_err[bool, str](res));
+        ret;
+    }
+    enc.sink_account(buf);
+}
+
+# render one instruction as an indented assembly line
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or the first error
+fun render_inst(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    val res_indent: R.Result[bool, str] = emit_str(out, "  ");
+    if (R.is_err[bool, str](res_indent)) { ret res_indent; }
+    val res_body: R.Result[bool, str] = render_body(buf, i);
+    if (R.is_err[bool, str](res_body)) { ret res_body; }
+    ret emit_str(out, "\n");
+}
+
+# dispatch an instruction to the renderer for its operand layout
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or an error naming the unrenderable form
+fun render_body(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    if (i.form == FORM_ALU3)        { ret render_alu3(buf, i); }
+    if (i.form == FORM_ADDSUB_IMM)  { ret render_addsub_imm(buf, i); }
+    if (i.form == FORM_BITFIELD)    { ret render_bitfield(buf, i); }
+    if (i.form == FORM_MOVEWIDE)    { ret render_movewide(buf, i); }
+    if (i.form == FORM_MADD)        { ret render_madd(buf, i); }
+    if (i.form == FORM_CSET)        { ret render_cset(buf, i); }
+    if (i.form == FORM_LDST)        { ret render_ldst(buf, i); }
+    if (i.form == FORM_LDSTP)       { ret render_ldstp(buf, i); }
+    if (i.form == FORM_NEON_3SAME)  { ret render_neon_3same(buf, i); }
+    if (i.form == FORM_NEON_2MISC)  { ret render_neon_2misc(buf, i); }
+    if (i.form == FORM_BRANCH)      { ret render_branch(buf, i); }
+    if (i.form == FORM_BRANCH_REG)  { ret render_branch_reg(buf, i); }
+    if (i.form == FORM_ADRP)        { ret render_adrp(buf, i); }
+    if (i.form == FORM_NULLARY)     { ret render_nullary(out, i); }
+    if (i.form == FORM_IMM16)       { ret render_imm16(buf, i); }
+    if (i.form == FORM_BARRIER)     { ret render_barrier(out, i); }
+    if (i.form == FORM_STXR)        { ret render_stxr(buf, i); }
+    ret R.err[bool, str]("--emit-asm: an emitted aarch64 instruction has no renderable form");
+}
+
+# the mnemonic a three-register data-processing base word denotes
+#
+# Total over the base words the encoder packs through `pack_alu3` / `pack_cmp_reg` /
+# `pack_alu3_sh`: an unmapped base returns nil and the caller fails the render, never
+# placeholder text. The operand widths and banks come from the operands themselves -
+# a `scvtf` naming an S destination and a W source needs no table entry to say so.
+# ---
+# base: the packer base word
+# ret:  the mnemonic, or nil for an unmapped base
+fun alu3_mnem(base: u32) str {
+    if (base == 0x8B000000 || base == 0x0B000000) { ret "add"; }
+    if (base == 0xCB000000 || base == 0x4B000000) { ret "sub"; }
+    if (base == 0x8A000000 || base == 0x0A000000) { ret "and"; }
+    if (base == 0xAA000000 || base == 0x2A000000) { ret "orr"; }
+    if (base == 0xCA000000 || base == 0x4A000000) { ret "eor"; }
+    if (base == 0xAA200000 || base == 0x2A200000) { ret "orn"; }
+    if (base == 0x9B007C00 || base == 0x1B007C00) { ret "mul"; }
+    if (base == 0x9AC02000 || base == 0x1AC02000) { ret "lsl"; }
+    if (base == 0x9AC02400 || base == 0x1AC02400) { ret "lsr"; }
+    if (base == 0x9AC02800 || base == 0x1AC02800) { ret "asr"; }
+    if (base == 0x9AC00C00 || base == 0x1AC00C00) { ret "sdiv"; }
+    if (base == 0x9AC00800 || base == 0x1AC00800) { ret "udiv"; }
+    if (base == 0xEB000000 || base == 0x6B000000) { ret "subs"; }
+    # `sub sp, sp, Xm` - the extended-register form SP requires
+    if (base == 0xCB2063FF)                       { ret "sub"; }
+
+    if (base == 0x1E202800 || base == 0x1E602800) { ret "fadd"; }
+    if (base == 0x1E203800 || base == 0x1E603800) { ret "fsub"; }
+    if (base == 0x1E200800 || base == 0x1E600800) { ret "fmul"; }
+    if (base == 0x1E201800 || base == 0x1E601800) { ret "fdiv"; }
+    if (base == 0x1E214000 || base == 0x1E614000) { ret "fneg"; }
+    if (base == 0x1E204000 || base == 0x1E604000) { ret "fmov"; }
+    if (base == 0x1E22C000 || base == 0x1E624000) { ret "fcvt"; }
+    if (base == 0x1E202000 || base == 0x1E602000) { ret "fcmp"; }
+
+    if (base == 0x1E220000 || base == 0x1E620000 ||
+        base == 0x9E220000 || base == 0x9E620000) { ret "scvtf"; }
+    if (base == 0x1E230000 || base == 0x1E630000 ||
+        base == 0x9E230000 || base == 0x9E630000) { ret "ucvtf"; }
+    if (base == 0x1E380000 || base == 0x9E380000 ||
+        base == 0x1E780000 || base == 0x9E780000) { ret "fcvtzs"; }
+    if (base == 0x1E390000 || base == 0x9E390000 ||
+        base == 0x1E790000 || base == 0x9E790000) { ret "fcvtzu"; }
+
+    if (base == 0x1E270000 || base == 0x9E670000 ||
+        base == 0x1E260000 || base == 0x9E660000) { ret "fmov"; }
+    ret nil;
+}
+
+# render a three-register data-processing word, taking the alias a disassembler
+# prints when the encoded fields select one
+#
+# `orr Rd, ZR, Rm` is `mov`, `sub Rd, ZR, Rm` is `neg`, `orn Rd, ZR, Rm` is `mvn`,
+# and a flag-setting `subs ZR, Rn, Rm` is `cmp` - each is how the instruction
+# disassembles, so rendering the base spelling would not correspond to the object.
+# The scaled-index form carries its shift in `src3`.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped base
+fun render_alu3(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    var mnem: str = alu3_mnem(i.base);
+    if (mnem == nil) {
+        ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted three-register base word");
+    }
+
+    # the Rn = XZR aliases: a two-operand move / negate / complement
+    var drop_rn: bool = false;
+    if (is_zero_reg(?i.src1) && i.src2.kind == isa.OPK_REG) {
+        if (i.base == 0xAA000000 || i.base == 0x2A000000) { mnem = "mov"; drop_rn = true; }
+        if (i.base == 0xCB000000 || i.base == 0x4B000000) { mnem = "neg"; drop_rn = true; }
+        if (i.base == 0xAA200000 || i.base == 0x2A200000) { mnem = "mvn"; drop_rn = true; }
+    }
+    # the Rd = XZR alias: a flag-setting subtract is a compare
+    var drop_dst: bool = false;
+    if (is_zero_reg(?i.dst) && (i.base == 0xEB000000 || i.base == 0x6B000000)) {
+        mnem = "cmp";
+        drop_dst = true;
+    }
+
+    val rw: R.Result[bool, str] = emit_str(out, mnem);
+    if (R.is_err[bool, str](rw)) { ret rw; }
+
+    var n: u32 = 0;
+    if (!drop_dst) {
+        val rd: R.Result[u32, str] = render_slot(buf, i, ?i.dst, n, false);
+        if (R.is_err[u32, str](rd)) { ret unwrap_slot_err(rd); }
+        n = R.unwrap_ok[u32, str](rd);
+    }
+    if (!drop_rn) {
+        val rn: R.Result[u32, str] = render_slot(buf, i, ?i.src1, n, i.base == 0xCB2063FF);
+        if (R.is_err[u32, str](rn)) { ret unwrap_slot_err(rn); }
+        n = R.unwrap_ok[u32, str](rn);
+    }
+    val rm: R.Result[u32, str] = render_slot(buf, i, ?i.src2, n, false);
+    if (R.is_err[u32, str](rm)) { ret unwrap_slot_err(rm); }
+    n = R.unwrap_ok[u32, str](rm);
+
+    if (i.src3.kind == isa.OPK_NONE) { ret R.ok[bool, str](true); }
+    ret emit_shift(out, ?i.src3);
+}
+
+# the mnemonic an ADD/SUB (immediate) base word denotes, or nil when unmapped
+# ---
+# base: the packer base word
+# ret:  the mnemonic, or nil
+fun addsub_imm_mnem(base: u32) str {
+    if (base == 0x91000000 || base == 0x11000000) { ret "add"; }
+    if (base == 0xD1000000 || base == 0x51000000) { ret "sub"; }
+    if (base == 0xB1000000 || base == 0x31000000) { ret "adds"; }
+    if (base == 0xF1000000 || base == 0x71000000) { ret "subs"; }
+    ret nil;
+}
+
+# render an ADD/SUB (immediate) word, taking the alias a disassembler prints
+#
+# `add Rd, Rn, #0` with SP on either side is `mov` - the only move between SP and a
+# general register - and a flag-setting form writing XZR is `cmp` / `cmn`. ADD/SUB
+# name SP at register 31; ADDS/SUBS name XZR in their destination and SP in Rn.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped base
+fun render_addsub_imm(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    val mnem: str = addsub_imm_mnem(i.base);
+    if (mnem == nil) {
+        ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted add/sub-immediate base word");
+    }
+    val flags: bool = i.base == 0xB1000000 || i.base == 0x31000000 ||
+                      i.base == 0xF1000000 || i.base == 0x71000000;
+    val plain_add: bool = i.base == 0x91000000 || i.base == 0x11000000;
+
+    # `mov Rd, Rn` - an SP-involving add of zero
+    if (plain_add && i.src2.kind == isa.OPK_IMM && i.src2.imm == 0 &&
+        i.src3.kind == isa.OPK_NONE && (is_reg31(?i.dst) || is_reg31(?i.src1))) {
+        val rm: R.Result[bool, str] = emit_str(out, "mov");
+        if (R.is_err[bool, str](rm)) { ret rm; }
+        val rd: R.Result[u32, str] = render_slot(buf, i, ?i.dst, 0, true);
+        if (R.is_err[u32, str](rd)) { ret unwrap_slot_err(rd); }
+        val rn: R.Result[u32, str] = render_slot(buf, i, ?i.src1, 1, true);
+        if (R.is_err[u32, str](rn)) { ret unwrap_slot_err(rn); }
+        ret R.ok[bool, str](true);
+    }
+
+    # `cmp` / `cmn Rn, #imm` - a flag-setting form discarding its result
+    var head: str = mnem;
+    var drop_dst: bool = false;
+    if (flags && is_zero_reg(?i.dst)) {
+        drop_dst = true;
+        head = "cmp";
+        if (i.base == 0xB1000000 || i.base == 0x31000000) { head = "cmn"; }
+    }
+
+    val rw: R.Result[bool, str] = emit_str(out, head);
+    if (R.is_err[bool, str](rw)) { ret rw; }
+    var n: u32 = 0;
+    if (!drop_dst) {
+        # ADDS / SUBS write a zero-register destination; only the plain forms name SP there
+        val rd: R.Result[u32, str] = render_slot(buf, i, ?i.dst, n, !flags);
+        if (R.is_err[u32, str](rd)) { ret unwrap_slot_err(rd); }
+        n = R.unwrap_ok[u32, str](rd);
+    }
+    val rn: R.Result[u32, str] = render_slot(buf, i, ?i.src1, n, true);
+    if (R.is_err[u32, str](rn)) { ret unwrap_slot_err(rn); }
+    n = R.unwrap_ok[u32, str](rn);
+    val ri: R.Result[u32, str] = render_slot(buf, i, ?i.src2, n, false);
+    if (R.is_err[u32, str](ri)) { ret unwrap_slot_err(ri); }
+
+    if (i.src3.kind == isa.OPK_NONE) { ret R.ok[bool, str](true); }
+    ret emit_shift(out, ?i.src3);
+}
+
+# render a bitfield-move word as the shift / extend alias it disassembles to
+#
+# Every UBFM / SBFM the encoder emits carries an alias, and the alias is what a
+# disassembler prints: `lsr` / `lsl` / `ubfx` / `ubfiz` / `uxtb` / `uxth` for UBFM,
+# `asr` / `sbfx` / `sbfiz` / `sxtb` / `sxth` / `sxtw` for SBFM. The extend aliases
+# take precedence over the extract forms, and their source is always a W register -
+# `sxtb x0, w1` widens a byte held in a 32-bit register.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped base
+fun render_bitfield(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    var signed: bool = false;
+    var wide:   bool = false;
+    if (i.base == 0xD3400000)      { wide = true; }
+    or (i.base == 0x53000000)      { }
+    or (i.base == 0x93400000)      { wide = true; signed = true; }
+    or (i.base == 0x13000000)      { signed = true; }
+    or {
+        ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted bitfield base word");
+    }
+
+    var width: u32 = 32;
+    if (wide) { width = 64; }
+    val immr: u32 = i.src2.imm::u32;
+    val imms: u32 = i.src3.imm::u32;
+
+    # the register-extend aliases, which name a W source at either destination width
+    val extend: bool = immr == 0 && (imms == 7 || imms == 15 || (imms == 31 && wide));
+    # UXTB / UXTH exist only in the 32-bit form; a 64-bit UBFM of the same shape
+    # disassembles as the extract
+    if (extend && (signed || !wide)) {
+        var mnem: str = "uxtb";
+        if (imms == 15) { mnem = "uxth"; }
+        if (signed) {
+            mnem = "sxtb";
+            if (imms == 15) { mnem = "sxth"; }
+            if (imms == 31) { mnem = "sxtw"; }
+        }
+        val rm: R.Result[bool, str] = emit_str(out, mnem);
+        if (R.is_err[bool, str](rm)) { ret rm; }
+        val rd: R.Result[u32, str] = render_slot(buf, i, ?i.dst, 0, false);
+        if (R.is_err[u32, str](rd)) { ret unwrap_slot_err(rd); }
+        # the extend aliases always read a 32-bit source register
+        var src: isa.Operand = i.src1;
+        src.size = 4;
+        ret emit_sep_operand(buf, i, ?src, 1, false);
+    }
+
+    # a bitfield move whose high bit ends at the register top is a right shift
+    if (imms == width - 1) {
+        var mnem: str = "lsr";
+        if (signed) { mnem = "asr"; }
+        ret render_shift_alias(buf, i, mnem, immr);
+    }
+    # an unsigned bitfield move one place past its rotation is a left shift
+    if (!signed && imms + 1 == immr) {
+        ret render_shift_alias(buf, i, "lsl", width - 1 - imms);
+    }
+
+    var mnem: str = "ubfx";
+    var lsb:  u32 = immr;
+    var len:  u32 = imms - immr + 1;
+    if (imms < immr) {
+        mnem = "ubfiz";
+        lsb  = width - immr;
+        len  = imms + 1;
+    }
+    if (signed) {
+        mnem = "sbfx";
+        if (imms < immr) { mnem = "sbfiz"; }
+    }
+
+    val rm: R.Result[bool, str] = emit_str(out, mnem);
+    if (R.is_err[bool, str](rm)) { ret rm; }
+    val rd: R.Result[u32, str] = render_slot(buf, i, ?i.dst, 0, false);
+    if (R.is_err[u32, str](rd)) { ret unwrap_slot_err(rd); }
+    val rn: R.Result[u32, str] = render_slot(buf, i, ?i.src1, 1, false);
+    if (R.is_err[u32, str](rn)) { ret unwrap_slot_err(rn); }
+    val rl: R.Result[bool, str] = emit_str(out, ", ");
+    if (R.is_err[bool, str](rl)) { ret rl; }
+    val rv: R.Result[bool, str] = emit_dec_imm(out, lsb::i64);
+    if (R.is_err[bool, str](rv)) { ret rv; }
+    val rc: R.Result[bool, str] = emit_str(out, ", ");
+    if (R.is_err[bool, str](rc)) { ret rc; }
+    ret emit_dec_imm(out, len::i64);
+}
+
+# render a bitfield move as a two-register shift by a constant amount
+# ---
+# buf:  the encoder byte sink carrying the assembly sink
+# i:    the instruction to render
+# mnem: the shift alias
+# sh:   the shift amount the encoded fields denote
+# ret:  true on success, or the first write error
+fun render_shift_alias(buf: *enc.ByteBuf, i: *Inst, mnem: str, sh: u32) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    val rm: R.Result[bool, str] = emit_str(out, mnem);
+    if (R.is_err[bool, str](rm)) { ret rm; }
+    val rd: R.Result[u32, str] = render_slot(buf, i, ?i.dst, 0, false);
+    if (R.is_err[u32, str](rd)) { ret unwrap_slot_err(rd); }
+    val rn: R.Result[u32, str] = render_slot(buf, i, ?i.src1, 1, false);
+    if (R.is_err[u32, str](rn)) { ret unwrap_slot_err(rn); }
+    val rc: R.Result[bool, str] = emit_str(out, ", ");
+    if (R.is_err[bool, str](rc)) { ret rc; }
+    ret emit_dec_imm(out, sh::i64);
+}
+
+# render a move-wide word
+#
+# MOVZ disassembles as `mov Rd, #<value>` with its shift folded into the printed
+# immediate, except for the degenerate zero-at-a-shift form that has no such
+# spelling. MOVK keeps its name and its explicit shift, since it merges into a
+# register the printed immediate alone cannot describe.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped base
+fun render_movewide(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    var keep: bool = false;
+    var wide: bool = false;
+    if (i.base == 0xD2800000)      { wide = true; }
+    or (i.base == 0x52800000)      { }
+    or (i.base == 0xF2800000)      { wide = true; keep = true; }
+    or (i.base == 0x72800000)      { keep = true; }
+    or {
+        ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted move-wide base word");
+    }
+
+    val imm16: u64 = i.src2.imm::u64;
+    var sh: u64 = 0;
+    if (i.src3.kind != isa.OPK_NONE) { sh = i.src3.imm::u64; }
+
+    # a plain MOVZ folds its shift into the value it materializes; the zero-at-a-shift
+    # form does not (its value is zero at every shift) and keeps the MOVZ spelling
+    val folds: bool = !keep && (imm16 != 0 || sh == 0);
+    var mnem: str = "movk";
+    if (!keep) {
+        mnem = "movz";
+        if (folds) { mnem = "mov"; }
+    }
+    val rm: R.Result[bool, str] = emit_str(out, mnem);
+    if (R.is_err[bool, str](rm)) { ret rm; }
+    val rd: R.Result[u32, str] = render_slot(buf, i, ?i.dst, 0, false);
+    if (R.is_err[u32, str](rd)) { ret unwrap_slot_err(rd); }
+    val rc: R.Result[bool, str] = emit_str(out, ", ");
+    if (R.is_err[bool, str](rc)) { ret rc; }
+
+    if (folds) {
+        var v: u64 = imm16 << sh;
+        if (!wide) { v = v & 0xFFFFFFFF; }
+        ret emit_hex_imm(out, signed_at_width(v, wide));
+    }
+    val ri: R.Result[bool, str] = emit_hex_u64_imm(out, imm16);
+    if (R.is_err[bool, str](ri)) { ret ri; }
+    if (sh == 0) { ret R.ok[bool, str](true); }
+    ret emit_shift(out, ?i.src3);
+}
+
+# render a multiply-add / multiply-subtract word
+#
+# A zero-register accumulator is the two-source alias a disassembler prints:
+# `madd Rd, Rn, Rm, ZR` is `mul` and `msub` is `mneg`.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped base
+fun render_madd(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    var sub: bool = false;
+    if (i.base == 0x9B000000 || i.base == 0x1B000000)      { }
+    or (i.base == 0x9B008000 || i.base == 0x1B008000)      { sub = true; }
+    or {
+        ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted multiply-accumulate base word");
+    }
+    val degenerate: bool = is_zero_reg(?i.src3);
+    var mnem: str = "madd";
+    if (sub) { mnem = "msub"; }
+    if (degenerate) {
+        mnem = "mul";
+        if (sub) { mnem = "mneg"; }
+    }
+    val rm: R.Result[bool, str] = emit_str(out, mnem);
+    if (R.is_err[bool, str](rm)) { ret rm; }
+    var n: u32 = 0;
+    val rd: R.Result[u32, str] = render_slot(buf, i, ?i.dst, n, false);
+    if (R.is_err[u32, str](rd)) { ret unwrap_slot_err(rd); }
+    n = R.unwrap_ok[u32, str](rd);
+    val rn: R.Result[u32, str] = render_slot(buf, i, ?i.src1, n, false);
+    if (R.is_err[u32, str](rn)) { ret unwrap_slot_err(rn); }
+    n = R.unwrap_ok[u32, str](rn);
+    val r2: R.Result[u32, str] = render_slot(buf, i, ?i.src2, n, false);
+    if (R.is_err[u32, str](r2)) { ret unwrap_slot_err(r2); }
+    n = R.unwrap_ok[u32, str](r2);
+    if (degenerate) { ret R.ok[bool, str](true); }
+    val r3: R.Result[u32, str] = render_slot(buf, i, ?i.src3, n, false);
+    if (R.is_err[u32, str](r3)) { ret unwrap_slot_err(r3); }
+    ret R.ok[bool, str](true);
+}
+
+# render a CSINC with both sources held at the zero register - the CSET alias
+#
+# The encoded condition is the inverse of the one the boolean captures, which is
+# exactly what `cset` names, so the printed condition is the encoded field inverted.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped base
+fun render_cset(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    if (i.base != 0x9A800400 && i.base != 0x1A800400) {
+        ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted conditional-select base word");
+    }
+    val cc: str = cond_name((i.flags & FLAG_COND)::u32 ^ 1);
+    if (cc == nil) {
+        ret R.err[bool, str]("--emit-asm: an emitted aarch64 cset names no condition");
+    }
+    val rm: R.Result[bool, str] = emit_str(out, "cset");
+    if (R.is_err[bool, str](rm)) { ret rm; }
+    val rd: R.Result[u32, str] = render_slot(buf, i, ?i.dst, 0, false);
+    if (R.is_err[u32, str](rd)) { ret unwrap_slot_err(rd); }
+    val rc: R.Result[bool, str] = emit_str(out, ", ");
+    if (R.is_err[bool, str](rc)) { ret rc; }
+    ret emit_str(out, cc);
+}
+
+# the mnemonic a load / store base word denotes, or nil when unmapped
+#
+# The transferred register's width and bank come from the operand, so one entry
+# covers the W, X, S, D and Q forms of `ldr`; only the mnemonics that genuinely
+# differ - the sub-word accesses, the unscaled LDUR / STUR family, and the ordered
+# and exclusive accesses - need their own.
+# ---
+# base: the packer base word
+# ret:  the mnemonic, or nil for an unmapped base
+fun ldst_mnem(base: u32) str {
+    if (base == 0x39400000 || base == 0x38606800) { ret "ldrb"; }
+    if (base == 0x39000000 || base == 0x38206800) { ret "strb"; }
+    if (base == 0x79400000 || base == 0x78606800) { ret "ldrh"; }
+    if (base == 0x79000000 || base == 0x78206800) { ret "strh"; }
+    if (base == 0xB9400000 || base == 0xF9400000 || base == 0xFD400000 ||
+        base == 0xBD400000 || base == 0x3DC00000 || base == 0xB8606800 ||
+        base == 0xF8606800 || base == 0xFC606800 || base == 0xBC606800 ||
+        base == 0x3CE06800)                       { ret "ldr"; }
+    if (base == 0xB9000000 || base == 0xF9000000 || base == 0xFD000000 ||
+        base == 0xBD000000 || base == 0x3D800000 || base == 0xB8206800 ||
+        base == 0xF8206800 || base == 0xFC206800 || base == 0xBC206800 ||
+        base == 0x3CA06800)                       { ret "str"; }
+    if (base == 0x38400000)                       { ret "ldurb"; }
+    if (base == 0x38000000)                       { ret "sturb"; }
+    if (base == 0x78400000)                       { ret "ldurh"; }
+    if (base == 0x78000000)                       { ret "sturh"; }
+    if (base == 0xB8400000 || base == 0xF8400000 || base == 0xFC400000 ||
+        base == 0xBC400000 || base == 0x3CC00000) { ret "ldur"; }
+    if (base == 0xB8000000 || base == 0xF8000000 || base == 0xFC000000 ||
+        base == 0xBC000000 || base == 0x3C800000) { ret "stur"; }
+    if (base == 0xC8DFFC00 || base == 0x88DFFC00) { ret "ldar"; }
+    if (base == 0xC89FFC00 || base == 0x889FFC00) { ret "stlr"; }
+    if (base == 0xC85FFC00 || base == 0x885FFC00) { ret "ldaxr"; }
+    ret nil;
+}
+
+# true when a load / store base word reads memory rather than writing it
+# ---
+# base: the packer base word
+# ret:  true for a load
+fun ldst_is_load(base: u32) bool {
+    val m: str = ldst_mnem(base);
+    if (m == nil) { ret false; }
+    ret m[0] == 'l'::char;
+}
+
+# render a load or store
+#
+# A load names its destination register first and a store names its source register
+# first, so the semantic slots - `dst` is the location written either way - are
+# emitted in the order AArch64 spells them rather than in slot order.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped base
+fun render_ldst(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    val mnem: str = ldst_mnem(i.base);
+    if (mnem == nil) {
+        ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted load/store base word");
+    }
+    val rm: R.Result[bool, str] = emit_str(out, mnem);
+    if (R.is_err[bool, str](rm)) { ret rm; }
+
+    if (ldst_is_load(i.base)) {
+        val rd: R.Result[u32, str] = render_slot(buf, i, ?i.dst, 0, false);
+        if (R.is_err[u32, str](rd)) { ret unwrap_slot_err(rd); }
+        ret emit_sep_operand(buf, i, ?i.src1, 1, false);
+    }
+    val rv: R.Result[u32, str] = render_slot(buf, i, ?i.src1, 0, false);
+    if (R.is_err[u32, str](rv)) { ret unwrap_slot_err(rv); }
+    ret emit_sep_operand(buf, i, ?i.dst, 1, false);
+}
+
+# render a load / store pair
+#
+# A pre-index form writes the updated base back (`[Xn, #off]!`); a post-index form
+# applies the offset after the access (`[Xn], #off`). A store names its two source
+# registers first, so the memory operand is emitted last regardless of which slot
+# holds it.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped base
+fun render_ldstp(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    var mnem: str = nil;
+    if (i.base == 0xA9800000 || i.base == 0xA8800000 ||
+        i.base == 0xA9000000 || i.base == 0x6D000000) { mnem = "stp"; }
+    if (i.base == 0xA9C00000 || i.base == 0xA8C00000 ||
+        i.base == 0xA9400000 || i.base == 0x6D400000) { mnem = "ldp"; }
+    if (mnem == nil) {
+        ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted load/store-pair base word");
+    }
+    val load: bool = mnem[0] == 'l'::char;
+
+    val rm: R.Result[bool, str] = emit_str(out, mnem);
+    if (R.is_err[bool, str](rm)) { ret rm; }
+
+    # a load writes both registers (dst, src1) and reads the address (src2); a store
+    # reads both registers (src1, src2) and writes the address (dst)
+    var ra: *isa.Operand = ?i.src1;
+    var rb: *isa.Operand = ?i.src2;
+    var mem: *isa.Operand = ?i.dst;
+    if (load) { ra = ?i.dst; rb = ?i.src1; mem = ?i.src2; }
+
+    val r1: R.Result[u32, str] = render_slot(buf, i, ra, 0, false);
+    if (R.is_err[u32, str](r1)) { ret unwrap_slot_err(r1); }
+    val r2: R.Result[u32, str] = render_slot(buf, i, rb, 1, false);
+    if (R.is_err[u32, str](r2)) { ret unwrap_slot_err(r2); }
+    ret emit_sep_operand(buf, i, mem, 2, false);
+}
+
+# the mnemonic a NEON three-register-same base word denotes, or nil when unmapped
+# ---
+# base: the packer base word
+# ret:  the mnemonic, or nil
+fun neon_3same_mnem(base: u32) str {
+    if (base == 0x4E20D400) { ret "fadd"; }
+    if (base == 0x4EA0D400) { ret "fsub"; }
+    if (base == 0x6E20DC00) { ret "fmul"; }
+    if (base == 0x6E20FC00) { ret "fdiv"; }
+    if (base == 0x4E208400) { ret "add"; }
+    if (base == 0x6E208400) { ret "sub"; }
+    if (base == 0x4E209C00) { ret "mul"; }
+    if (base == 0x4E201C00) { ret "and"; }
+    if (base == 0x4EA01C00) { ret "orr"; }
+    if (base == 0x6E201C00) { ret "eor"; }
+    if (base == 0x6E208C00) { ret "cmeq"; }
+    if (base == 0x4E203400) { ret "cmgt"; }
+    if (base == 0x4E203C00) { ret "cmge"; }
+    if (base == 0x6E203400) { ret "cmhi"; }
+    if (base == 0x6E203C00) { ret "cmhs"; }
+    if (base == 0x4E20E400) { ret "fcmeq"; }
+    if (base == 0x6EA0E400) { ret "fcmgt"; }
+    if (base == 0x6E20E400) { ret "fcmge"; }
+    ret nil;
+}
+
+# true when a NEON base word is one of the bitwise forms
+#
+# Their size bits are part of the opcode rather than an arrangement, so they are
+# always byte-wise regardless of the lane descriptor the operation carried.
+# ---
+# base: the packer base word
+# ret:  true for AND / ORR / EOR
+fun neon_is_bitwise(base: u32) bool {
+    ret base == 0x4E201C00 || base == 0x4EA01C00 || base == 0x6E201C00;
+}
+
+# the lane arrangement a NEON operation renders at
+#
+# A 128-bit vector holds sixteen bytes, so the element width fixes the lane count.
+# The bitwise forms are fixed at the byte arrangement.
+# ---
+# base: the packer base word
+# lane: the lane descriptor, in `mir.MirInstr.vec_lane`'s encoding
+# ret:  the arrangement suffix, or nil for an unmodelled element width
+fun neon_arrangement(base: u32, lane: u8) str {
+    if (neon_is_bitwise(base)) { ret ".16b"; }
+    val eb: u8 = mir.vec_lane_elem_bytes(lane);
+    if (eb == 1) { ret ".16b"; }
+    if (eb == 2) { ret ".8h"; }
+    if (eb == 4) { ret ".4s"; }
+    if (eb == 8) { ret ".2d"; }
+    ret nil;
+}
+
+# render a NEON three-register-same 128-bit word
+#
+# The arrangement rides every operand, so it is written after each register name -
+# dropping it would leave a line no assembler accepts and no disassembly matches.
+# A bitwise OR of a register with itself is the vector register move a disassembler
+# prints as `mov`.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped base or arrangement
+fun render_neon_3same(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    val mnem: str = neon_3same_mnem(i.base);
+    if (mnem == nil) {
+        ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted NEON three-register base word");
+    }
+    val arr: str = neon_arrangement(i.base, i.vec_lane);
+    if (arr == nil) {
+        ret R.err[bool, str]("--emit-asm: an emitted NEON instruction has no lane arrangement");
+    }
+
+    # `orr Vd.16b, Vn.16b, Vn.16b` is the vector register move
+    if (i.base == 0x4EA01C00 && i.src1.reg == i.src2.reg) {
+        val rv: R.Result[bool, str] = emit_str(out, "mov");
+        if (R.is_err[bool, str](rv)) { ret rv; }
+        val rd: R.Result[bool, str] = emit_sep_vec(out, " ", ?i.dst, arr);
+        if (R.is_err[bool, str](rd)) { ret rd; }
+        ret emit_sep_vec(out, ", ", ?i.src1, arr);
+    }
+
+    val rm: R.Result[bool, str] = emit_str(out, mnem);
+    if (R.is_err[bool, str](rm)) { ret rm; }
+    val rd: R.Result[bool, str] = emit_sep_vec(out, " ", ?i.dst, arr);
+    if (R.is_err[bool, str](rd)) { ret rd; }
+    val rn: R.Result[bool, str] = emit_sep_vec(out, ", ", ?i.src1, arr);
+    if (R.is_err[bool, str](rn)) { ret rn; }
+    ret emit_sep_vec(out, ", ", ?i.src2, arr);
+}
+
+# render a NEON two-register-misc 128-bit word
+#
+# The bitwise complement is fixed at the byte arrangement and disassembles as `mvn`,
+# the spelling its `NOT` encoding is printed under.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped base
+fun render_neon_2misc(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    if (i.base != 0x6E205800) {
+        ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted NEON two-register base word");
+    }
+    val rm: R.Result[bool, str] = emit_str(out, "mvn");
+    if (R.is_err[bool, str](rm)) { ret rm; }
+    val rd: R.Result[bool, str] = emit_sep_vec(out, " ", ?i.dst, ".16b");
+    if (R.is_err[bool, str](rd)) { ret rd; }
+    ret emit_sep_vec(out, ", ", ?i.src1, ".16b");
+}
+
+# render a branch and its destination
+#
+# The displacement fields hold a zero placeholder until pass 2 patches them, so the
+# destination is rendered from the name the encoder carried: a MIR block's local
+# label, a call target's symbol, an inline-asm numeric local label, or - for the
+# self-contained trap skips, whose distance is fixed at emit time and never patched -
+# the PC-relative distance itself.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped base
+fun render_branch(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    var mnem: str = nil;
+    var reg:  bool = false;
+    if (i.base == 0x14000000) { mnem = "b"; }
+    or (i.base == 0x94000000) { mnem = "bl"; }
+    or (i.base == 0xB5000000 || i.base == 0x35000000) { mnem = "cbnz"; reg = true; }
+    or (i.base == 0xB4000000 || i.base == 0x34000000) { mnem = "cbz";  reg = true; }
+    or ((i.base & 0xFF000000) == 0x54000000) {
+        val cc: str = cond_name(i.base & 0xF);
+        if (cc == nil) {
+            ret R.err[bool, str]("--emit-asm: an emitted aarch64 conditional branch names no condition");
+        }
+        val rb: R.Result[bool, str] = emit_str(out, "b.");
+        if (R.is_err[bool, str](rb)) { ret rb; }
+        val rc: R.Result[bool, str] = emit_str(out, cc);
+        if (R.is_err[bool, str](rc)) { ret rc; }
+        val rs: R.Result[bool, str] = emit_str(out, " ");
+        if (R.is_err[bool, str](rs)) { ret rs; }
+        ret render_target(buf, i);
+    }
+    or {
+        ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted branch base word");
+    }
+
+    val rm: R.Result[bool, str] = emit_str(out, mnem);
+    if (R.is_err[bool, str](rm)) { ret rm; }
+    if (reg) {
+        val rt: R.Result[u32, str] = render_slot(buf, i, ?i.src1, 0, false);
+        if (R.is_err[u32, str](rt)) { ret unwrap_slot_err(rt); }
+        val rc: R.Result[bool, str] = emit_str(out, ", ");
+        if (R.is_err[bool, str](rc)) { ret rc; }
+        ret render_target(buf, i);
+    }
+    val rs: R.Result[bool, str] = emit_str(out, " ");
+    if (R.is_err[bool, str](rs)) { ret rs; }
+    ret render_target(buf, i);
+}
+
+# render a branch destination by the name the encoder carried
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the branch whose destination is rendered
+# ret: true on success, or an error for a branch carrying no destination
+fun render_target(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    if (i.target == TGT_BLOCK) {
+        val rd: R.Result[bool, str] = emit_str(out, ".");
+        if (R.is_err[bool, str](rd)) { ret rd; }
+        ret emit_u64(out, i.block::u64);
+    }
+    if (i.target == TGT_SYM) { ret emit_sym(out, buf.asm.interner, ?i.src2); }
+    if (i.target == TGT_PCREL) {
+        val rd: R.Result[bool, str] = emit_str(out, ".+");
+        if (R.is_err[bool, str](rd)) { ret rd; }
+        ret emit_u64(out, (i.src2.imm * 4)::u64);
+    }
+    if (i.target == TGT_LOCAL_FWD || i.target == TGT_LOCAL_BACK) {
+        val rn: R.Result[bool, str] = emit_u64(out, i.src2.imm::u64);
+        if (R.is_err[bool, str](rn)) { ret rn; }
+        if (i.target == TGT_LOCAL_FWD) { ret emit_str(out, "f"); }
+        ret emit_str(out, "b");
+    }
+    ret R.err[bool, str]("--emit-asm: an emitted aarch64 branch names no destination");
+}
+
+# render a register-indirect branch
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped base
+fun render_branch_reg(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    var mnem: str = nil;
+    if (i.base == 0xD63F0000) { mnem = "blr"; }
+    or (i.base == 0xD61F0000) { mnem = "br"; }
+    or (i.base == 0xD65F0000) { mnem = "ret"; }
+    or {
+        ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted register-branch base word");
+    }
+    val rm: R.Result[bool, str] = emit_str(out, mnem);
+    if (R.is_err[bool, str](rm)) { ret rm; }
+    val rn: R.Result[u32, str] = render_slot(buf, i, ?i.src1, 0, false);
+    if (R.is_err[u32, str](rn)) { ret unwrap_slot_err(rn); }
+    ret R.ok[bool, str](true);
+}
+
+# render an ADRP page-address computation
+#
+# The 21-bit page delta is a zero placeholder the linker fills, so the operand is
+# the symbol the relocation names rather than the encoded zero.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or the first write error
+fun render_adrp(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    val rm: R.Result[bool, str] = emit_str(out, "adrp");
+    if (R.is_err[bool, str](rm)) { ret rm; }
+    val rd: R.Result[u32, str] = render_slot(buf, i, ?i.dst, 0, false);
+    if (R.is_err[u32, str](rd)) { ret unwrap_slot_err(rd); }
+    ret emit_sep_operand(buf, i, ?i.src1, 1, false);
+}
+
+# render an operand-less instruction
+# ---
 # out: destination writer
-# ret: always an error naming aarch64 and its tracking issue
-pub fun print_asm_arm64(a: *A.Allocator, tgt: *resolved.Target, m: *mir.MirModule,
-                        out: *writer.Writer) R.Result[encode.EncoderOutput, str] {
-    ret R.err[encode.EncoderOutput, str](
-        "--emit-asm: no assembly printer for aarch64 yet (tracked by briar-systems/mach#2194)");
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped word
+fun render_nullary(out: *writer.Writer, i: *Inst) R.Result[bool, str] {
+    if (i.base == 0xD65F03C0) { ret emit_str(out, "ret"); }
+    if (i.base == 0xD503201F) { ret emit_str(out, "nop"); }
+    if (i.base == 0xD503203F) { ret emit_str(out, "yield"); }
+    ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted operand-less instruction word");
+}
+
+# render a single-immediate instruction (BRK / SVC)
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped base
+fun render_imm16(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    var mnem: str = nil;
+    if (i.base == 0xD4200000) { mnem = "brk"; }
+    or (i.base == 0xD4000001) { mnem = "svc"; }
+    or {
+        ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted immediate-only base word");
+    }
+    val rm: R.Result[bool, str] = emit_str(out, mnem);
+    if (R.is_err[bool, str](rm)) { ret rm; }
+    val rs: R.Result[bool, str] = emit_str(out, " ");
+    if (R.is_err[bool, str](rs)) { ret rs; }
+    ret emit_trap_imm(out, i.src1.imm);
+}
+
+# render a data memory barrier, naming the domain its CRm field selects
+# ---
+# out: destination writer
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped domain
+fun render_barrier(out: *writer.Writer, i: *Inst) R.Result[bool, str] {
+    if (i.base != 0xD50330BF) {
+        ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted barrier base word");
+    }
+    val name: str = barrier_name(i.src1.imm::u32);
+    if (name == nil) {
+        ret R.err[bool, str]("--emit-asm: an emitted aarch64 barrier names no domain");
+    }
+    val rm: R.Result[bool, str] = emit_str(out, "dmb ");
+    if (R.is_err[bool, str](rm)) { ret rm; }
+    ret emit_str(out, name);
+}
+
+# the barrier-domain name a DMB CRm value selects
+# ---
+# crm: the encoded CRm field
+# ret: the domain name, or nil for an unmodelled value
+fun barrier_name(crm: u32) str {
+    if (crm == 15) { ret "sy"; }
+    if (crm == 14) { ret "st"; }
+    if (crm == 13) { ret "ld"; }
+    if (crm == 11) { ret "ish"; }
+    if (crm == 10) { ret "ishst"; }
+    if (crm == 9)  { ret "ishld"; }
+    if (crm == 7)  { ret "nsh"; }
+    if (crm == 6)  { ret "nshst"; }
+    if (crm == 5)  { ret "nshld"; }
+    if (crm == 3)  { ret "osh"; }
+    if (crm == 2)  { ret "oshst"; }
+    if (crm == 1)  { ret "oshld"; }
+    ret nil;
+}
+
+# render a store-release-exclusive, whose status result rides a third register
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the instruction to render
+# ret: true on success, or an error naming the unmapped base
+fun render_stxr(buf: *enc.ByteBuf, i: *Inst) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    if (i.base != 0xC800FC00 && i.base != 0x8800FC00) {
+        ret R.err[bool, str]("--emit-asm: no aarch64 mnemonic for an emitted exclusive-store base word");
+    }
+    val rm: R.Result[bool, str] = emit_str(out, "stlxr");
+    if (R.is_err[bool, str](rm)) { ret rm; }
+    val rs: R.Result[u32, str] = render_slot(buf, i, ?i.dst, 0, false);
+    if (R.is_err[u32, str](rs)) { ret unwrap_slot_err(rs); }
+    val rt: R.Result[u32, str] = render_slot(buf, i, ?i.src1, 1, false);
+    if (R.is_err[u32, str](rt)) { ret unwrap_slot_err(rt); }
+    ret emit_sep_operand(buf, i, ?i.src2, 2, false);
+}
+
+# render one operand, preceded by the separator its position calls for
+#
+# An absent operand renders nothing and does not advance the position, so a form
+# that leaves a slot empty needs no special case at the call site.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the owning instruction
+# op:  the operand to render
+# n:   how many operands have been rendered already
+# sp:  true when register 31 in this position names the stack pointer
+# ret: the new rendered-operand count, or an error
+fun render_slot(buf: *enc.ByteBuf, i: *Inst, op: *isa.Operand, n: u32, sp: bool) R.Result[u32, str] {
+    if (op.kind == isa.OPK_NONE) { ret R.ok[u32, str](n); }
+    val res: R.Result[bool, str] = emit_sep_operand(buf, i, op, n, sp);
+    if (R.is_err[bool, str](res)) { ret R.err[u32, str](R.unwrap_err[bool, str](res)); }
+    ret R.ok[u32, str](n + 1);
+}
+
+# write the separator for operand position `n`, then the operand
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the owning instruction
+# op:  the operand to render
+# n:   the operand's position
+# sp:  true when register 31 in this position names the stack pointer
+# ret: true on success, or the first error
+fun emit_sep_operand(buf: *enc.ByteBuf, i: *Inst, op: *isa.Operand, n: u32, sp: bool) R.Result[bool, str] {
+    var sep: str = ", ";
+    if (n == 0) { sep = " "; }
+    val rs: R.Result[bool, str] = emit_str(buf.asm.out, sep);
+    if (R.is_err[bool, str](rs)) { ret rs; }
+    ret emit_operand(buf, i, op, sp);
+}
+
+# render an operand's text
+#
+# The operand kinds are the shared `isa.Operand` ones; what AArch64 adds is the
+# stack-pointer spelling of register 31 (a property of the field position, not of
+# the operand) and the relocation modifier decorating a symbol.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the owning instruction
+# op:  the operand to render
+# sp:  true when register 31 names the stack pointer here
+# ret: true on success, or an error naming the unrenderable shape
+fun emit_operand(buf: *enc.ByteBuf, i: *Inst, op: *isa.Operand, sp: bool) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    if (op.kind == isa.OPK_REG) { ret emit_reg(out, op, sp); }
+    if (op.kind == isa.OPK_IMM) { ret emit_hex_imm(out, op.imm); }
+    if (op.kind == isa.OPK_MEM) { ret emit_mem(buf, i, op); }
+    if (op.kind == isa.OPK_SYM) { ret emit_modified_sym(buf, i, op); }
+    ret R.err[bool, str]("--emit-asm: an emitted aarch64 operand has no renderable kind");
+}
+
+# render a memory operand
+#
+# `[Xn]`, `[Xn, #disp]`, `[Xn, Xm]`, or the relocated `[Xn, :lo12:sym]` low half of a
+# symbol address - whose displacement is a zero placeholder the linker fills, so the
+# relocation is printed rather than the placeholder. A pair's addressing mode moves
+# the displacement outside the brackets or appends a writeback marker.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the owning instruction
+# op:  the memory operand to render
+# ret: true on success, or the first write error
+fun emit_mem(buf: *enc.ByteBuf, i: *Inst, op: *isa.Operand) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    val ro: R.Result[bool, str] = emit_str(out, "[");
+    if (R.is_err[bool, str](ro)) { ret ro; }
+    val rb: R.Result[bool, str] = emit_reg_id(out, op.base, 8, true);
+    if (R.is_err[bool, str](rb)) { ret rb; }
+
+    if (i.sym_mod != MOD_NONE) {
+        val rl: R.Result[bool, str] = emit_str(out, ", ");
+        if (R.is_err[bool, str](rl)) { ret rl; }
+        val rp: R.Result[bool, str] = emit_str(out, sym_mod_prefix(i.sym_mod));
+        if (R.is_err[bool, str](rp)) { ret rp; }
+        val rs: R.Result[bool, str] = emit_sym(out, buf.asm.interner, op);
+        if (R.is_err[bool, str](rs)) { ret rs; }
+        ret emit_str(out, "]");
+    }
+
+    if (op.index >= 0) {
+        val ri: R.Result[bool, str] = emit_str(out, ", ");
+        if (R.is_err[bool, str](ri)) { ret ri; }
+        val rx: R.Result[bool, str] = emit_reg_id(out, op.index, 8, false);
+        if (R.is_err[bool, str](rx)) { ret rx; }
+        ret emit_str(out, "]");
+    }
+
+    # a post-index pair applies its displacement after the access, outside the brackets
+    if ((i.flags & FLAG_WB_POST) != 0) {
+        val rc: R.Result[bool, str] = emit_str(out, "], ");
+        if (R.is_err[bool, str](rc)) { ret rc; }
+        ret emit_hex_imm(out, op.disp::i64);
+    }
+    if (op.disp != 0) {
+        val rc: R.Result[bool, str] = emit_str(out, ", ");
+        if (R.is_err[bool, str](rc)) { ret rc; }
+        val rd: R.Result[bool, str] = emit_hex_imm(out, op.disp::i64);
+        if (R.is_err[bool, str](rd)) { ret rd; }
+    }
+    if ((i.flags & FLAG_WB_PRE) != 0) { ret emit_str(out, "]!"); }
+    ret emit_str(out, "]");
+}
+
+# render a symbol operand with the relocation modifier the instruction carries
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# i:   the owning instruction
+# op:  the symbol operand to render
+# ret: true on success, or the first write error
+fun emit_modified_sym(buf: *enc.ByteBuf, i: *Inst, op: *isa.Operand) R.Result[bool, str] {
+    val out: *writer.Writer = buf.asm.out;
+    val rp: R.Result[bool, str] = emit_str(out, sym_mod_prefix(i.sym_mod));
+    if (R.is_err[bool, str](rp)) { ret rp; }
+    ret emit_sym(out, buf.asm.interner, op);
+}
+
+# the assembler spelling of a relocation modifier
+#
+# The page-high modifier has no prefix - `adrp Xd, sym` names the page implicitly.
+# ---
+# mod: the MOD_* modifier
+# ret: the prefix text, empty when the modifier needs none
+fun sym_mod_prefix(mod: u8) str {
+    if (mod == MOD_PCREL_LO) { ret ":lo12:"; }
+    if (mod == MOD_GOT_HI)   { ret ":got:"; }
+    if (mod == MOD_GOT_LO)   { ret ":got_lo12:"; }
+    ret "";
+}
+
+# write a shift modifier decorating the preceding operand
+#
+# A bit position prints in decimal where a value prints in hexadecimal, which is how
+# a disassembler spells them and therefore what the artifact must match.
+# ---
+# out: destination writer
+# op:  the immediate operand holding the shift amount
+# ret: true on success, or the first write error
+fun emit_shift(out: *writer.Writer, op: *isa.Operand) R.Result[bool, str] {
+    val rl: R.Result[bool, str] = emit_str(out, ", lsl ");
+    if (R.is_err[bool, str](rl)) { ret rl; }
+    ret emit_dec_imm(out, op.imm);
+}
+
+# write a bit position or field width in the `#N` decimal form a disassembler prints
+# ---
+# out: destination writer
+# v:   the value to write
+# ret: true on success, or the first write error
+fun emit_dec_imm(out: *writer.Writer, v: i64) R.Result[bool, str] {
+    val rp: R.Result[bool, str] = emit_str(out, "#");
+    if (R.is_err[bool, str](rp)) { ret rp; }
+    ret emit_u64(out, v::u64);
+}
+
+# write a trap code in the `#0` / `#0x...` form a disassembler prints
+# ---
+# out: destination writer
+# v:   the value to write
+# ret: true on success, or the first write error
+fun emit_trap_imm(out: *writer.Writer, v: i64) R.Result[bool, str] {
+    if (v == 0) { ret emit_str(out, "#0"); }
+    ret emit_hex_imm(out, v);
+}
+
+# write a separator then a vector register with its lane arrangement
+# ---
+# out: destination writer
+# sep: the separator preceding the register
+# op:  the vector register operand
+# arr: the arrangement suffix
+# ret: true on success, or the first write error
+fun emit_sep_vec(out: *writer.Writer, sep: str, op: *isa.Operand, arr: str) R.Result[bool, str] {
+    val rs: R.Result[bool, str] = emit_str(out, sep);
+    if (R.is_err[bool, str](rs)) { ret rs; }
+    val rv: R.Result[bool, str] = emit_indexed(out, "v", isa.regid_index(op.reg)::u32);
+    if (R.is_err[bool, str](rv)) { ret rv; }
+    ret emit_str(out, arr);
+}
+
+# true when an operand names register 31
+# ---
+# op:  the operand to test
+# ret: true for register index 31 in either bank
+fun is_reg31(op: *isa.Operand) bool {
+    ret op.kind == isa.OPK_REG && isa.regid_index(op.reg) == 31;
+}
+
+# true when an operand names the general-purpose zero register
+# ---
+# op:  the operand to test
+# ret: true for a general-purpose register 31
+fun is_zero_reg(op: *isa.Operand) bool {
+    ret is_reg31(op) && isa.regid_class(op.reg) == isa.REG_CLASS_ID_GP;
+}
+
+# write a register operand's name
+# ---
+# out: destination writer
+# op:  the register operand
+# sp:  true when register 31 names the stack pointer here
+# ret: true on success, or the write error
+fun emit_reg(out: *writer.Writer, op: *isa.Operand, sp: bool) R.Result[bool, str] {
+    ret emit_reg_id(out, op.reg, op.size, sp);
+}
+
+# write a register name from its composite id and width
+#
+# The bank comes off the id's class tag and the letter off the width, so a float
+# operand names S / D / Q without the opcode being consulted. Register 31 names the
+# zero register in a data position and the stack pointer in an address position;
+# which applies is a property of the encoding, so it rides `sp` rather than being
+# guessed.
+# ---
+# out:  destination writer
+# id:   the composite register id
+# size: the operand width in bytes
+# sp:   true when register 31 names the stack pointer here
+# ret:  true on success, or the write error
+fun emit_reg_id(out: *writer.Writer, id: i32, size: u8, sp: bool) R.Result[bool, str] {
+    val n: u32 = isa.regid_index(id)::u32;
+    if (isa.regid_class(id) == isa.REG_CLASS_ID_XMM) {
+        if (size == 4)  { ret emit_indexed(out, "s", n); }
+        if (size == 8)  { ret emit_indexed(out, "d", n); }
+        if (size == 16) { ret emit_indexed(out, "q", n); }
+        ret R.err[bool, str]("--emit-asm: an emitted aarch64 float operand has no register width");
+    }
+    if (n == 31) {
+        if (sp)         { ret emit_str(out, "sp"); }
+        if (size == 4)  { ret emit_str(out, "wzr"); }
+        ret emit_str(out, "xzr");
+    }
+    if (size == 4) { ret emit_indexed(out, "w", n); }
+    ret emit_indexed(out, "x", n);
+}
+
+# write a register name as its bank letter followed by its index
+# ---
+# out:    destination writer
+# prefix: the bank's letter
+# n:      the register index
+# ret:    true on success, or the first write error
+fun emit_indexed(out: *writer.Writer, prefix: str, n: u32) R.Result[bool, str] {
+    val rp: R.Result[bool, str] = emit_str(out, prefix);
+    if (R.is_err[bool, str](rp)) { ret rp; }
+    ret emit_u64(out, n::u64);
+}
+
+# the condition name an A64 condition-code field selects
+# ---
+# cc:  the four-bit condition field
+# ret: the condition name, or nil for an unmodelled value
+fun cond_name(cc: u32) str {
+    if (cc == 0)  { ret "eq"; }
+    if (cc == 1)  { ret "ne"; }
+    if (cc == 2)  { ret "hs"; }
+    if (cc == 3)  { ret "lo"; }
+    if (cc == 4)  { ret "mi"; }
+    if (cc == 5)  { ret "pl"; }
+    if (cc == 6)  { ret "vs"; }
+    if (cc == 7)  { ret "vc"; }
+    if (cc == 8)  { ret "hi"; }
+    if (cc == 9)  { ret "ls"; }
+    if (cc == 10) { ret "ge"; }
+    if (cc == 11) { ret "lt"; }
+    if (cc == 12) { ret "gt"; }
+    if (cc == 13) { ret "le"; }
+    if (cc == 14) { ret "al"; }
+    ret nil;
+}
+
+# re-shape an operand-position error as a rendering error
+# ---
+# r:   the failed position result
+# ret: the same error in the render result shape
+fun unwrap_slot_err(r: R.Result[u32, str]) R.Result[bool, str] {
+    ret R.err[bool, str](R.unwrap_err[u32, str](r));
+}
+
+# write a signed immediate in the `#0x...` form a disassembler prints
+# ---
+# out: destination writer
+# v:   the value to write
+# ret: true on success, or the first write error
+fun emit_hex_imm(out: *writer.Writer, v: i64) R.Result[bool, str] {
+    if (v < 0) {
+        val rn: R.Result[bool, str] = emit_str(out, "#-0x");
+        if (R.is_err[bool, str](rn)) { ret rn; }
+        ret emit_hex(out, (0 - v)::u64);
+    }
+    ret emit_hex_u64_imm(out, v::u64);
+}
+
+# the signed value a materialized bit pattern denotes at a register width
+#
+# A move-wide builds a bit pattern, but a disassembler names the value that pattern
+# denotes as a signed integer of the destination's width - `movz x17, #0x8000, lsl
+# #48` reads as `mov x17, #-0x8000000000000000`.
+# ---
+# v:    the bit pattern
+# wide: true for a 64-bit destination
+# ret:  the value the pattern denotes
+fun signed_at_width(v: u64, wide: bool) i64 {
+    if (wide) { ret v::i64; }
+    if ((v & 0x80000000) != 0) { ret (v::i64) - 0x100000000; }
+    ret v::i64;
+}
+
+# write an unsigned immediate in the `#0x...` form a disassembler prints
+# ---
+# out: destination writer
+# v:   the value to write
+# ret: true on success, or the first write error
+fun emit_hex_u64_imm(out: *writer.Writer, v: u64) R.Result[bool, str] {
+    val rp: R.Result[bool, str] = emit_str(out, "#0x");
+    if (R.is_err[bool, str](rp)) { ret rp; }
+    ret emit_hex(out, v);
+}
+
+# write a value's lowercase hexadecimal digits
+# ---
+# out: destination writer
+# v:   the value to write
+# ret: true on success, or the write error
+fun emit_hex(out: *writer.Writer, v: u64) R.Result[bool, str] {
+    val res_write: R.Result[usize, str] = format.write_hex_u64(out, v, false);
+    if (R.is_err[usize, str](res_write)) { ret R.err[bool, str](R.unwrap_err[usize, str](res_write)); }
+    ret R.ok[bool, str](true);
+}
+
+# write a string, mapping a format error to the bool/str result shape
+# ---
+# out: destination writer
+# s:   the string to write
+# ret: true on success, or the write error
+fun emit_str(out: *writer.Writer, s: str) R.Result[bool, str] {
+    val res_write: R.Result[usize, str] = format.write_str(out, s);
+    if (R.is_err[usize, str](res_write)) { ret R.err[bool, str](R.unwrap_err[usize, str](res_write)); }
+    ret R.ok[bool, str](true);
+}
+
+# write an unsigned integer
+# ---
+# out: destination writer
+# n:   the value to write
+# ret: true on success, or the write error
+fun emit_u64(out: *writer.Writer, n: u64) R.Result[bool, str] {
+    val res_write: R.Result[usize, str] = format.write_u64(out, n);
+    if (R.is_err[usize, str](res_write)) { ret R.err[bool, str](R.unwrap_err[usize, str](res_write)); }
+    ret R.ok[bool, str](true);
+}
+
+# write an interned name, failing when the id does not resolve
+# ---
+# out:      destination writer
+# interner: the interner that resolves the id to text
+# id:       the interned string id to write
+# ret:      true on success, or an error
+fun emit_interned(out: *writer.Writer, interner: *intern.Interner, id: intern.StrId) R.Result[bool, str] {
+    val opt_name: O.Option[str] = intern.lookup(interner, id);
+    if (O.is_none[str](opt_name)) {
+        ret R.err[bool, str]("--emit-asm: a name did not resolve in the interner");
+    }
+    ret emit_str(out, O.unwrap[str](opt_name));
+}
+
+# write a symbol operand's name, failing when the id does not resolve
+# ---
+# out:      destination writer
+# interner: the interner that resolves the id to text
+# op:       the operand carrying the symbol id
+# ret:      true on success, or an error
+fun emit_sym(out: *writer.Writer, interner: *intern.Interner, op: *isa.Operand) R.Result[bool, str] {
+    ret emit_interned(out, interner, op.sym_id::intern.StrId);
 }
