@@ -75,6 +75,13 @@ than the source alone, so they are reported at lowering:
 A secret value passed to a variadic pack is also rejected, including a secret
 wrapped inside an aggregate.
 
+The gates are checked against the types of the **instance**, not of the template.
+A generic's body is re-checked per instantiation under its concrete type
+arguments, and a pack-tailed function's body — the statements around its `$each`
+as well as the unrolled body itself — is re-typed per monomorphized instance, so
+a `T` that instantiates to a secret is gated exactly as the secret spelled out
+in full would be.
+
 ## Downgrade with `:^`
 
 `:^` is the only way to remove `^`. It produces a new public value and never
@@ -171,13 +178,6 @@ run it with `bash int/ct/ct.sh`.
 
 What does not hold — the known open holes:
 
-- **a pack-tailed function's statements outside its `$each` are never re-typed
-  per instance**, so a `T`-typed local declared there and used inside the unroll
-  is typed against the raw parameter and a value that is secret at the instance
-  is not seen as one — it reaches a variadic pack with no diagnostic. The `$each`
-  body itself, and every parameter, are typed against the concrete arguments
-  (briar-systems/mach#2251); this is the remainder. Proven, security-blocking
-  (briar-systems/mach#2254).
 - **`$fields` reflection projection inside a generic erases a secret field's
   secrecy**, which discloses the secret. Proven, security-blocking
   (briar-systems/mach#2168).
