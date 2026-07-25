@@ -103,14 +103,23 @@ pub rec InstReq {
     sig:     type.TypeId;
     args:    *type.TypeId;
     arg_len: u32;
+    depth:   u32;
 }
 
-# the cap on distinct generic instances the constant-time re-validation will track
+# the cap on how far one chain of DERIVED generic instantiations may run
 #
-# The dedup terminates any finite instance set; an infinite one (a generic instantiating
-# itself at a strictly growing type) needs a hard bound. Reaching it is a loud error, so
-# no instance is ever skipped silently. Sized like the lowerer's MAX_VALUE_INSTANCES.
-pub val MAX_CT_INSTANCES: u32 = 4096;
+# The dedup terminates any finite instance set. An infinite one arises only when an
+# instance's re-validation instantiates a strictly larger instance of the same generic
+# (`f[P]` re-validating into `f[*P]` into `f[**P]`), so the thing to bound is the
+# derivation chain, not the module's total instance count: a large generic-heavy module
+# legitimately records hundreds of unrelated instances at depth 0, and a total cap would
+# conflate "deeply recursive" with "just big". Each instance recorded while re-validating
+# another carries its parent's depth plus one.
+#
+# Measured, not guessed: rebuilding mach and mach-std with the limit lowered, depth 4
+# breaks the build (3 chains cut) and depth 5 is clean, so the deepest legitimate chain
+# in either codebase is 5. 32 leaves 6.4x headroom.
+pub val MAX_CT_INSTANCE_DEPTH: u32 = 32;
 
 # the per-instance CT re-validation worklist (#2157): generic instantiations requested
 # during body inference, drained after all bodies are typed
@@ -127,12 +136,14 @@ pub val MAX_CT_INSTANCES: u32 = 4096;
 # cap:     allocated capacity of `items`
 # drained: cursor; requests below it have been re-validated
 # alloc:   allocator backing `items` and each request's owned `args`
+# limited: the depth cap was reported once; further requests are dropped quietly
 pub rec InstWorklist {
     items:   *InstReq;
     len:     u32;
     cap:     u32;
     drained: u32;
     alloc:   *A.Allocator;
+    limited: bool;
 }
 
 
@@ -207,6 +218,10 @@ pub rec SemaContext {
     # (a function pointer to break the context->generics import cycle), so the body's
     # secrecy / aggregate-ness - and thus the #1645 leakage gates and the #2127
     # aggregate-`==` rejection - are evaluated against the instance's concrete types.
+    # the derivation depth of the instance currently being re-validated (0 on the main
+    # pass); every instance this body records is stamped one deeper.
+    inst_depth: u32;
+
     subst:     *type.TypeId;
     subst_len: u32;
     subst_fn:  fun(*session.Session, type.TypeId, *type.TypeId, u32) type.TypeId;
@@ -258,9 +273,70 @@ pub fun apply_subst(sc: *SemaContext, tid: type.TypeId) type.TypeId {
 # tid: a concrete type argument
 # ret: true when the argument warrants re-validating the instance body
 pub fun arg_triggers_revalidation(sc: *SemaContext, tid: type.TypeId) bool {
+    # the poison and absent sentinels are not types. Both compare >= the interner's
+    # length, so they reach the miss branch below and would be re-validated as "might
+    # reach a secret" - re-inferring a whole generic body, and allocating scratch typing
+    # arrays sized to the origin module's expr and decl tables, for a program the
+    # compiler has already reported on and given up.
+    if (tid == type.TYPE_ERROR || tid == type.TYPE_NIL) { ret false; }
+
+    # an argument that still mentions a generic parameter is abstract: it says nothing
+    # about any instance, and every diagnostic its body can produce was already produced
+    # by the template pass, so re-validating it only duplicates them. Its concrete forms
+    # arrive through the enclosing instance's own re-validation, which resolves this call
+    # site's arguments under the substitution. Note this prunes per ARGUMENT, so
+    # `inner[T, ^u32]` - abstract in one position, concretely secret in another - is
+    # still recorded on the strength of the secret.
+    if (type_mentions_generic_param(sc, tid)) { ret false; }
+
     val t_opt: O.Option[*type.Type] = type.get(?sc.s.types, tid);
     if (O.is_none[*type.Type](t_opt)) { ret true; }
     ret !type_is_public_scalar(O.unwrap[*type.Type](t_opt).kind);
+}
+
+# whether `tid` mentions a generic parameter anywhere on its type spine
+#
+# Walks only the spine - pointer, array, secret, function, and generic-instance
+# arguments - never a nominal's field graph. That is the whole abstract surface a type
+# ARGUMENT can be written with inside a generic body (`T`, `*T`, `^T`, `[N]T`,
+# `fun(T) u32`, `Box[T]`), and it keeps the walk total: no allocation, so no failure
+# path that could answer "abstract" for a concrete type and silently prune a secret
+# instance out of the re-validation.
+# ---
+# sc:  sema context
+# tid: the TypeId to inspect
+# ret: true when a generic parameter appears on the spine
+fun type_mentions_generic_param(sc: *SemaContext, tid: type.TypeId) bool {
+    if (tid == type.TYPE_ERROR || tid == type.TYPE_NIL) { ret false; }
+    val t_opt: O.Option[*type.Type] = type.get(?sc.s.types, tid);
+    if (O.is_none[*type.Type](t_opt)) { ret false; }
+    val t: *type.Type = O.unwrap[*type.Type](t_opt);
+
+    if (t.kind == type.TYPE_GENERIC_PARAM) { ret true; }
+    if (t.kind == type.TYPE_POINTER)       { ret type_mentions_generic_param(sc, t.data.pointer.base); }
+    if (t.kind == type.TYPE_SECRET)        { ret type_mentions_generic_param(sc, t.data.secret.base); }
+    if (t.kind == type.TYPE_ARRAY)         { ret type_mentions_generic_param(sc, t.data.array.base); }
+
+    if (t.kind == type.TYPE_FUN) {
+        if (type_mentions_generic_param(sc, t.data.fn.ret_type)) { ret true; }
+        var i: u32 = 0;
+        for (i < t.data.fn.params_len) {
+            val opt_p: O.Option[type.TypeId] = type.get_param(?sc.s.types, t.data.fn.params_start + i);
+            if (O.is_some[type.TypeId](opt_p) && type_mentions_generic_param(sc, O.unwrap[type.TypeId](opt_p))) { ret true; }
+            i = i + 1;
+        }
+        ret false;
+    }
+
+    if (t.kind == type.TYPE_INSTANCE) {
+        var i: u32 = 0;
+        for (i < t.data.instance.args_len) {
+            val opt_a: O.Option[type.TypeId] = type.get_param(?sc.s.types, t.data.instance.args_start + i);
+            if (O.is_some[type.TypeId](opt_a) && type_mentions_generic_param(sc, O.unwrap[type.TypeId](opt_a))) { ret true; }
+            i = i + 1;
+        }
+    }
+    ret false;
 }
 
 # whether `k` is a public scalar kind - a numeric primitive or the untyped `ptr`
@@ -303,7 +379,9 @@ fun args_equal(a: *type.TypeId, b: *type.TypeId, n: u32) bool {
 # args:    the concrete type arguments (borrowed; copied here)
 # arg_len: number of type arguments
 # sig:     the substituted signature TypeId
-# ret:     ok(true), or err on an allocation failure
+# ret:     ok(true), or err carrying a COMPLETE user-facing message - an allocation
+#          failure or the derivation-depth break. Both are already `internal:`-prefixed,
+#          so the caller reports the string verbatim rather than re-wrapping it.
 pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.DeclId,
                         args: *type.TypeId, arg_len: u32, sig: type.TypeId) R.Result[bool, str] {
     if (!sc.collect_insts) { ret R.ok[bool, str](true); }
@@ -329,24 +407,30 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
         }
     }
 
-    # a generic that instantiates itself at a strictly growing type (`f[T]` calling
-    # `f[*T]`) has an infinite instance set, so the dedup never closes it. Bound the
-    # worklist and fail LOUDLY at the cap - a silent stop would skip the constant-time
-    # re-validation of every instance past it. Mirrors the lowerer's
-    # MAX_VALUE_INSTANCES guard for unbounded comptime-value recursion.
-    if (sc.insts != nil && sc.insts.len >= MAX_CT_INSTANCES) {
-        ret R.err[bool, str]("generic instantiation limit exceeded during constant-time re-validation (likely an unbounded generic recursion, e.g. `f[T]` instantiating `f[*T]`)");
+    # this request's place in its derivation chain: one past the instance being
+    # re-validated, or 0 on the main body-inference pass.
+    val depth: u32 = sc.inst_depth;
+    if (depth >= MAX_CT_INSTANCE_DEPTH) {
+        # the chain diverges: each instance re-validates into a strictly larger one, so
+        # the dedup never closes. Report ONCE - the drain is still walking thousands of
+        # bodies, each of which would otherwise re-report and poison its own call site,
+        # burying the first real offender - and stop recording. The build already fails
+        # on this error, so dropping later requests cannot let anything through.
+        if (sc.insts != nil && sc.insts.limited) { ret R.ok[bool, str](true); }
+        if (sc.insts != nil) { sc.insts.limited = true; }
+        ret R.err[bool, str]("internal: generic instantiation chain exceeded the constant-time re-validation depth limit; a generic that instantiates itself at a strictly larger type (`f[T]` calling `f[*T]`) never terminates");
     }
 
     if (sc.insts == nil) {
         val wr: R.Result[*InstWorklist, str] = A.allocate[InstWorklist](sc.s.alloc, 1::usize);
-        if (R.is_err[*InstWorklist, str](wr)) { ret R.err[bool, str](R.unwrap_err[*InstWorklist, str](wr)); }
+        if (R.is_err[*InstWorklist, str](wr)) { ret R.err[bool, str]("internal: out of memory allocating the constant-time re-validation worklist"); }
         val wl: *InstWorklist = R.unwrap_ok[*InstWorklist, str](wr);
         wl.items   = nil;
         wl.len     = 0;
         wl.cap     = 0;
         wl.drained = 0;
         wl.alloc   = sc.s.alloc;
+        wl.limited = false;
         sc.insts = wl;
     }
     val wl: *InstWorklist = sc.insts;
@@ -356,13 +440,13 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
         if (wl.cap > 0) { new_cap = wl.cap * 2; }
         var nr: R.Result[*InstReq, str] = A.allocate[InstReq](wl.alloc, new_cap::usize);
         if (wl.cap > 0) { nr = A.reallocate[InstReq](wl.alloc, wl.items, wl.cap::usize, new_cap::usize); }
-        if (R.is_err[*InstReq, str](nr)) { ret R.err[bool, str](R.unwrap_err[*InstReq, str](nr)); }
+        if (R.is_err[*InstReq, str](nr)) { ret R.err[bool, str]("internal: out of memory growing the constant-time re-validation worklist"); }
         wl.items = R.unwrap_ok[*InstReq, str](nr);
         wl.cap   = new_cap;
     }
 
     val cr: R.Result[*type.TypeId, str] = A.allocate[type.TypeId](wl.alloc, arg_len::usize);
-    if (R.is_err[*type.TypeId, str](cr)) { ret R.err[bool, str](R.unwrap_err[*type.TypeId, str](cr)); }
+    if (R.is_err[*type.TypeId, str](cr)) { ret R.err[bool, str]("internal: out of memory copying a generic instance's type arguments"); }
     val owned: *type.TypeId = R.unwrap_ok[*type.TypeId, str](cr);
     var k: u32 = 0;
     for (k < arg_len) { owned[k] = args[k]; k = k + 1; }
@@ -373,6 +457,7 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
     slot.sig     = sig;
     slot.args    = owned;
     slot.arg_len = arg_len;
+    slot.depth   = depth;
     wl.len = wl.len + 1;
     ret R.ok[bool, str](true);
 }
@@ -740,7 +825,7 @@ fun param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId {
 # sc:  sema context
 # sym: the SYM_GENERIC symbol
 # ret: the generic parameter's placeholder TypeId, or TYPE_ERROR
-fun generic_param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId {
+pub fun generic_param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId {
     val res_intern: R.Result[type.TypeId, str] = type.intern_generic_param(?sc.s.types, sym.name, sym.decl, sym.slot);
     if (R.is_err[type.TypeId, str](res_intern)) { ret type.TYPE_ERROR; }
     ret apply_subst(sc, R.unwrap_ok[type.TypeId, str](res_intern));
