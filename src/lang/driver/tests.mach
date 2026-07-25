@@ -35,6 +35,7 @@ use mach.lang.fe.ast;
 use mach.lang.fe.comptime;
 use mach.lang.fe.resolve;
 use mach.lang.fe.sema;
+use generics: mach.lang.fe.sema.generics;
 use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.manifest;
@@ -4427,6 +4428,72 @@ fun ut_sema_clean(text: str) bool { ret ut_sema_errs(text) == 0; }
 # whether `text` is rejected with at least one sema error
 fun ut_sema_rejects(text: str) bool { ret ut_sema_errs(text) > 0; }
 
+# the interned TypeId of the nominal named `name`, found by scanning the session's type
+# universe
+#
+# The layout differential (`secrecy_layout_matches_lowering`) needs a handle on the
+# types a compiled corpus declared; a nominal carries its name, so a scan resolves it
+# without reconstructing the declaration's module and decl ids.
+# ---
+# s:    the session whose type universe to scan
+# name: the declared record / union name
+# ret:  some(TypeId) for the first nominal with that name, none when absent
+fun ut_nominal_typeid(s: *session.Session, name: str) O.Option[type.TypeId] {
+    val ir: R.Result[intern.StrId, str] = intern.intern(?s.interner, name);
+    if (R.is_err[intern.StrId, str](ir)) { ret O.none[type.TypeId](); }
+    val want: intern.StrId = R.unwrap_ok[intern.StrId, str](ir);
+
+    var i: u32 = 0;
+    for (i < s.types.type_len) {
+        val t: *type.Type = ?s.types.types[i];
+        if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI) {
+            if (t.data.nominal.name == want) { ret O.some[type.TypeId](i::type.TypeId); }
+        }
+        i = i + 1;
+    }
+    ret O.none[type.TypeId]();
+}
+
+# 0 when sema's computed extent for the nominal `name` declared by `text` is exactly
+# `size` / `align`, 1 otherwise
+# ---
+# text:  a single-module source declaring `name`
+# name:  the nominal to measure
+# size:  the expected size in bytes
+# align: the expected alignment in bytes
+# ret:   0 on a match, 1 on any mismatch or setup failure
+fun ut_sema_extent_is(text: str, name: str, size: u32, align: u32) i32 {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = text;
+
+    val pr: R.Result[project.Project, outcome.Fail] = ut_build(?s, ?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var bad: i32 = 1;
+    val sem: R.Result[bool, outcome.Fail] = passes.run_sema_pass(?p);
+    if (R.is_ok[bool, outcome.Fail](sem)) {
+        val tid: O.Option[type.TypeId] = ut_nominal_typeid(?s, name);
+        if (O.is_some[type.TypeId](tid)) {
+            # the corpus is built for the host x86_64 target, so pointer width is 8
+            val e: generics.Extent = generics.type_extent(?s, 8, O.unwrap[type.TypeId](tid));
+            if (e.ok && e.size == size && e.align == align) { bad = 0; }
+        }
+    }
+
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
 # whether `text` is rejected by a sema error whose message contains `needle`
 #
 # The message-precise counterpart of `ut_sema_rejects`: a gate assertion that only
@@ -4527,6 +4594,105 @@ test "mach.lang.driver:secret_address_gated" {
     if (!ut_sema_clean("fun f(p: ^*u8) u8 { ret @(p:^); }\nfun main() i32 { ret 0; }\n"))      { bad = 1; }
     # moving a secret pointer without dereferencing it is not an access
     if (!ut_sema_clean("fun f(p: ^*u8) ^*u8 { ret p; }\nfun main() i32 { ret 0; }\n"))         { bad = 1; }
+    ret bad;
+}
+
+# secret flow typing: the deep secrecy-placement comparison pairs fields by BYTE EXTENT,
+# not by ordinal (#2167).
+#
+# #2167 reported this comparison as sound but over-strict. It was not sound. Pairing by
+# ordinal and comparing only where `^` sits in the type GRAPH treats `^u8` and `^u32` as
+# the same thing - both "a secret scalar" - so a narrower secret on one side slid every
+# later field against the other and landed a PUBLIC field on top of a secret one. On
+# `dev`, `A { x: ^u8; y: u8; }` overlaid with `B { x: ^u32; y: u8; }` let `u.a.y` read
+# byte 1 of a secret written through `u.b.x`, with no `:^` anywhere. Every shape that
+# makes the `^` land at the same ORDINAL but a different BYTE RANGE is the same hole:
+# scalar width, array count, nested aggregate width, float width.
+#
+# The over-rejection #2167 actually asked about is fixed by the same change: with the
+# common prefix proven identical byte for byte, a longer side's extra fields provably
+# begin after the shorter side ends, so a public field BEYOND the secret extent is
+# admitted instead of failed closed.
+test "mach.lang.driver:secrecy_placement_byte_extent" {
+    val need: str = "union variants must agree on secrecy";
+
+    var bad: i32 = 0;
+    # THE LEAK: same ordinal, different byte range, public field displaced onto a secret
+    if (!ut_sema_rejects_with("rec A { x: ^u8; y: u8; }\nrec B { x: ^u32; y: u8; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n", need)) { bad = 1; }
+    # the same pair through a `:~` reinterpret, which shares the comparison
+    if (!ut_sema_rejects("rec A { x: ^u8; y: u8; }\nrec B { x: ^u32; y: u8; }\nfun f(p: *A) *B { ret p:~*B; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    # every other way to differ in extent at a matching ordinal
+    if (!ut_sema_rejects_with("rec A { x: ^[1]u8; y: u8; }\nrec B { x: ^[4]u8; y: u8; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n", need)) { bad = 1; }
+    if (!ut_sema_rejects_with("rec S { v: ^u8; }\nrec T { v: ^u64; }\nrec A { x: S; y: u8; }\nrec B { x: T; y: u8; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n", need)) { bad = 1; }
+    if (!ut_sema_rejects_with("rec A { x: ^f32; y: u8; }\nrec B { x: ^f64; y: u8; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n", need)) { bad = 1; }
+    # an ALIGNMENT difference at equal size slides later fields just the same
+    if (!ut_sema_rejects_with("rec A { x: ^[4]u8; y: u8; }\nrec B { x: ^u32; y: u8; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n", need)) { bad = 1; }
+
+    # #2167's case: a public field BEYOND the shorter side's extent is safe and is now
+    # admitted rather than failed closed
+    if (!ut_sema_clean("rec A { x: ^u32; }\nrec B { x: ^u32; y: u32; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n"))                        { bad = 1; }
+    if (!ut_sema_clean("rec A { x: ^u32; y: u8; }\nrec B { x: ^u32; y: u8; z: u64; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n"))          { bad = 1; }
+    if (!ut_sema_clean("rec A { x: ^u32; }\nrec B { x: ^u32; y: u32; }\nfun f(p: *A) *B { ret p:~*B; }\nfun main() i32 { ret 0; }\n"))               { bad = 1; }
+
+    # ...but ONLY past the extent. a public field INSIDE the common prefix is still the
+    # real mismatch, and a differing-shape UNION overlays its extra variant at offset 0
+    # rather than after the prefix, so it stays rejected.
+    if (!ut_sema_rejects_with("rec A { x: ^u32; y: u32; }\nrec B { x: u32; y: ^u32; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n", need))   { bad = 1; }
+    if (!ut_sema_rejects_with("rec A { x: u32; }\nrec B { x: ^u32; y: u32; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n", need))            { bad = 1; }
+    # a UNION on either side of a differing-shape pair overlays its variants at offset 0,
+    # so the "extra fields lie beyond the prefix" argument does not hold for it. The
+    # single-variant union is the reachable discriminator: it is a legal declaration (the
+    # variant-agreement rule needs two variants to have anything to disagree about), so
+    # it reaches this comparison where a mixed multi-variant union would already have
+    # been rejected at its own declaration. The record with the identical field list on
+    # the line below is admitted, so the verdict turns on the overlay precondition alone.
+    if (!ut_sema_rejects("uni V { p: ^u32; }\nrec B { x: ^u32; y: u32; }\nfun f(p: *V) *B { ret p:~*B; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    if (!ut_sema_clean("rec A { x: ^u32; }\nrec B { x: ^u32; y: u32; }\nfun f(p: *A) *B { ret p:~*B; }\nfun main() i32 { ret 0; }\n"))   { bad = 1; }
+
+    # the all-secret admission is unchanged: with no public byte on either side, no
+    # public alias can read a secret whatever the shapes, so differing extents are fine
+    if (!ut_sema_clean("rec A { x: ^u8; }\nrec B { x: ^u32; y: ^u32; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    # and a fully public pair never reaches the walk at all
+    if (!ut_sema_clean("rec A { x: u8; }\nrec B { x: u32; y: u32; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n"))    { bad = 1; }
+    ret bad;
+}
+
+# constant-time (#2167): sema's layout must agree EXACTLY with the layout the backend
+# emits, because the secrecy-placement comparison now decides overlay safety from byte
+# extents. Sema admitting an overlay the emitted layout does not produce would convert
+# that check's conservatism into an unsoundness - the leak direction.
+#
+# Sema has no aggregate layout of its own before this (`check.byte_size` reports 0 for
+# every record), so `generics.type_extent` is a second implementation of a policy whose
+# authority is `me.ir.type.byte_size` / `byte_align`. This test is what keeps the two
+# from drifting: both are pinned to ONE table of constants. Each row asserts sema's
+# extent directly, and `$size_of` / `$align_of` - which fold at LOWERING, off the IR
+# layout - assert the same numbers through the other implementation, in a program that
+# must compile clean. A change to either side moves one of the two and fails here.
+#
+# The corpus covers every shape the fold distinguishes: scalar widths, the natural
+# alignment padding a mixed record takes, a nested aggregate, an array, a union's
+# overlap, a pointer field, and an `#[align(...)]` override raising both.
+test "mach.lang.driver:secrecy_layout_matches_lowering" {
+    var bad: i32 = 0;
+
+    # [1] sema's extents, measured directly
+    if (ut_sema_extent_is("rec R { a: u8; }\nfun main() i32 { ret 0; }\n", "R", 1, 1) != 0)                     { bad = 1; }
+    if (ut_sema_extent_is("rec R { a: u8; b: u32; }\nfun main() i32 { ret 0; }\n", "R", 8, 4) != 0)            { bad = 1; }
+    if (ut_sema_extent_is("rec R { a: u32; b: u8; }\nfun main() i32 { ret 0; }\n", "R", 8, 4) != 0)            { bad = 1; }
+    if (ut_sema_extent_is("rec R { a: u8; b: u64; }\nfun main() i32 { ret 0; }\n", "R", 16, 8) != 0)           { bad = 1; }
+    if (ut_sema_extent_is("rec I { a: u8; b: u32; }\nrec R { x: I; y: u8; }\nfun main() i32 { ret 0; }\n", "R", 12, 4) != 0) { bad = 1; }
+    if (ut_sema_extent_is("rec R { a: [3]u16; b: u8; }\nfun main() i32 { ret 0; }\n", "R", 8, 2) != 0)         { bad = 1; }
+    if (ut_sema_extent_is("uni U { a: u8; b: u32; }\nfun main() i32 { ret 0; }\n", "U", 4, 4) != 0)            { bad = 1; }
+    if (ut_sema_extent_is("rec R { a: *u8; b: u8; }\nfun main() i32 { ret 0; }\n", "R", 16, 8) != 0)           { bad = 1; }
+    if (ut_sema_extent_is("#[align(16)]\nrec R { a: u32; }\nfun main() i32 { ret 0; }\n", "R", 16, 16) != 0)   { bad = 1; }
+    # `^` has no runtime representation, so a secret field measures as its public base
+    if (ut_sema_extent_is("rec R { a: ^u8; b: ^u32; }\nfun main() i32 { ret 0; }\n", "R", 8, 4) != 0)          { bad = 1; }
+
+    # [2] THE SAME NUMBERS through the lowering layout, via `$size_of` / `$align_of`.
+    # each mismatch would fold the guard true and fail the compile with `$error`.
+    val probe: str = "rec R1 { a: u8; }\nrec R2 { a: u8; b: u32; }\nrec R3 { a: u32; b: u8; }\nrec R4 { a: u8; b: u64; }\nrec I  { a: u8; b: u32; }\nrec R5 { x: I; y: u8; }\nrec R6 { a: [3]u16; b: u8; }\nuni U1 { a: u8; b: u32; }\nrec R7 { a: *u8; b: u8; }\n#[align(16)]\nrec R8 { a: u32; }\nrec R9 { a: ^u8; b: ^u32; }\nfun main() i32 {\n  if ($size_of(R1) != 1  || $align_of(R1) != 1)  { ret 1; }\n  if ($size_of(R2) != 8  || $align_of(R2) != 4)  { ret 1; }\n  if ($size_of(R3) != 8  || $align_of(R3) != 4)  { ret 1; }\n  if ($size_of(R4) != 16 || $align_of(R4) != 8)  { ret 1; }\n  if ($size_of(R5) != 12 || $align_of(R5) != 4)  { ret 1; }\n  if ($size_of(R6) != 8  || $align_of(R6) != 2)  { ret 1; }\n  if ($size_of(U1) != 4  || $align_of(U1) != 4)  { ret 1; }\n  if ($size_of(R7) != 16 || $align_of(R7) != 8)  { ret 1; }\n  if ($size_of(R8) != 16 || $align_of(R8) != 16) { ret 1; }\n  if ($size_of(R9) != 8  || $align_of(R9) != 4)  { ret 1; }\n  ret 0;\n}\n";
+    if (ut_lower_ok(probe) != 0) { bad = 1; }
     ret bad;
 }
 
