@@ -209,7 +209,7 @@ pub fun sema(
 #     instantiation. The worklist is owned across a whole module's lowering, so its
 #     `drained` cursor validates each distinct instance exactly once.
 #
-# The episode is the whole body, not the `$each` alone: `reinfer_pack_instance_body`
+# The episode is the whole body, not the `$each` alone: `reinfer_instance_body`
 # re-derives the enclosing statements' typing under the same substitution before the
 # unroll begins (#2254), so a `T`-typed local declared outside the `$each` reads back
 # as the instance type here.
@@ -285,16 +285,24 @@ pub fun reinfer_pack_each_body(
     ret drain_instances(?sc, deps);
 }
 
-# re-derive a pack instance's ENCLOSING body typing under its substitution (#2254)
+# re-derive a monomorphized instance's whole body typing under its substitution
+# (#2254, #2257)
 #
-# The prologue of the same inference episode `reinfer_pack_each_body` finishes: a
-# pack-tailed function's `$each` body is re-typed per element at monomorphization,
-# but the statements AROUND it were typed once, at the module sema pass, against the
-# raw generic parameter. A `val` / `var` declared there therefore left the template
-# type in the shared `decl_type` table, and `decl_type_for` reads that table raw - so
-# a use of the local from inside the `$each` saw the bare `T`, escaping the #1645
-# leakage gates, refusing well-typed programs, and folding a `$type_of` gate against
-# the parameter instead of the instance type.
+# A generic template's body is typed ONCE, at the module sema pass, against the raw
+# generic parameter; the instances are emitted later, from lowering, against the
+# concrete type arguments. The typing that pass left in the shared `expr_type` /
+# `decl_type` arrays is therefore the TEMPLATE's, and every lowering read of those
+# arrays - `expr_type_of`, `decl_type_for` - sees the bare `T` no matter which
+# instance is being emitted. Most of lowering is insulated from that because it
+# converts a semantic type to IR through `lower_type`, which applies the active
+# substitution; the reads that consume the semantic type DIRECTLY are not, and
+# `$type_of`'s operand resolver is one of them - so a comptime type gate folded
+# against the parameter and silently selected the fallback arm (#2257).
+#
+# Running this before an instance's body is lowered makes the shared arrays hold THAT
+# instance's typing for as long as it is being emitted, which is the invariant every
+# raw read already assumes. Instances are emitted one at a time, so one shared array
+# suffices; `lower_type`'s own substitution becomes idempotent rather than load-bearing.
 #
 # Substituting on the READ instead is unsound: `decl_type` is a derived table that
 # episodes rewrite IN PLACE, so a slot may already hold an instance type and a second
@@ -307,15 +315,17 @@ pub fun reinfer_pack_each_body(
 # It publishes typing state and reports nothing. Every statement it walks was already
 # checked by the module sema pass against the template parameter and, when a type
 # argument can newly trip a gate, by the CT re-validation drain against the instance's
-# concrete arguments; reporting here would duplicate all of that once per
-# (type-argument x element-type) instance. Recording is off for the same reason: those
-# statements enqueue their instances on both of the episodes that do report. The
-# `$each` bodies inside stay deferred - `infer_stmt_comptime_each` defers a pack
-# sequence, and a `$fields(T)` over a still-generic owner - so the per-element episode
-# remains their sole (and reporting) typing pass.
+# concrete arguments; reporting here would duplicate all of that once per instance.
+# Recording is off for the same reason: those statements enqueue their instances on
+# both of the episodes that do report. A `$each` body inside stays deferred -
+# `infer_stmt_comptime_each` defers a pack sequence, and a `$fields(T)` over a
+# still-generic owner - so the per-element episode remains their sole (and reporting)
+# typing pass; on a pack-tailed template this is exactly the prologue that per-element
+# episode needs (#2254), since it reads the enclosing locals' slots back out of the
+# same shared table.
 # ---
 # s:           the origin module's session
-# a:           the origin module's Ast (declares the pack-tailed template)
+# a:           the origin module's Ast (declares the template)
 # rr:          the origin module's name-resolution output
 # deps:        typing snapshots spanning every module (see collect_module_deps)
 # ctx:         comptime context for the origin module
@@ -326,9 +336,8 @@ pub fun reinfer_pack_each_body(
 # subst:       the instance's generic substitution (required: without one the walk
 #              re-derives the types it reads and there is nothing to publish)
 # subst_len:   number of substitution arguments
-# ret:         true once the enclosing statements are re-typed, or the first
-#              inference error
-pub fun reinfer_pack_instance_body(
+# ret:         true once the body is re-typed, or the first inference error
+pub fun reinfer_instance_body(
     s:           *session.Session,
     a:           *ast.Ast,
     rr:          *resolve.ResolveResult,
@@ -1070,9 +1079,10 @@ fun infer_decorator_args(sc: *context.SemaContext, d: *decl.Decl) {
 # validate every decorator on decl `d`
 #
 # Each must name a directive from the closed set (symbol / section / inline /
-# align / library), carry the right argument shape, and apply to a compatible
-# declaration. Diagnostics are reported against the offending span; sema does not
-# halt.
+# noinline / align / library), carry the right argument shape, and apply to a
+# compatible declaration. Diagnostics are reported against the offending span;
+# sema does not halt. A second, whole-decl pass then rejects the one directly
+# contradictory pair, `inline` + `noinline`.
 # ---
 # sc: the context
 # d:  the decl whose decorators to validate
@@ -1081,6 +1091,32 @@ fun validate_decorators(sc: *context.SemaContext, d: *decl.Decl) {
     for (i < d.decorators_len) {
         validate_one_decorator(sc, d, ?sc.a.decorators[d.decorators_start + i]);
         i = i + 1;
+    }
+    validate_no_inline_conflict(sc, d);
+}
+
+# reject `#[inline]` and `#[noinline]` together on decl `d` (#2200)
+#
+# The pair is a direct contradiction -- force inlining and forbid it -- so
+# picking a winner would silently discard half of the user's intent. Both
+# decorators are named in the single diagnostic, reported at the `noinline`
+# site.
+# ---
+# sc: the context
+# d:  the decl whose decorators to cross-check
+fun validate_no_inline_conflict(sc: *context.SemaContext, d: *decl.Decl) {
+    var has_inline:   bool = false;
+    var has_noinline: bool = false;
+    var noinline_span: token.Span;
+    var i: u32 = 0;
+    for (i < d.decorators_len) {
+        val dec: *decl.Decorator = ?sc.a.decorators[d.decorators_start + i];
+        if (decorator_named(sc, dec, "inline"))   { has_inline = true; }
+        if (decorator_named(sc, dec, "noinline")) { has_noinline = true; noinline_span = dec.name; }
+        i = i + 1;
+    }
+    if (has_inline && has_noinline) {
+        context.report(sc, noinline_span, "`inline` and `noinline` decorators cannot both apply to the same function");
     }
 }
 
@@ -1192,6 +1228,19 @@ fun validate_one_decorator(sc: *context.SemaContext, d: *decl.Decl, dec: *decl.D
         }
         ret;
     }
+    # the inverse of `inline` (#2200): pins a function out-of-line. `inline` and
+    # `noinline` together on one decl are rejected by validate_no_inline_conflict,
+    # below the per-decorator loop that calls this. legal and redundant alongside
+    # `scalar`, which already declines inlining as a side effect (#2141).
+    if (decorator_named(sc, dec, "noinline")) {
+        if (dec.args_len != 0) {
+            context.report(sc, dec.name, "`noinline` decorator takes no arguments");
+        }
+        if (d.kind != decl.DECL_KIND_FUN) {
+            context.report(sc, dec.name, "`noinline` decorator applies only to functions");
+        }
+        ret;
+    }
     # `#[oblivious]` marks a function as a constant-time boundary (#1646): the
     # backend must not introduce a secret-dependent branch, select a variable-latency
     # instruction on a secret operand, or dead-store-eliminate a zeroizing write to
@@ -1249,7 +1298,7 @@ fun validate_one_decorator(sc: *context.SemaContext, d: *decl.Decl, dec: *decl.D
         validate_naked(sc, d, dec);
         ret;
     }
-    context.report(sc, dec.name, "unknown decorator; valid directives are symbol, section, inline, align, library, oblivious, scalar, naked");
+    context.report(sc, dec.name, "unknown decorator; valid directives are symbol, section, inline, noinline, align, library, oblivious, scalar, naked");
 }
 
 # validate a `#[naked]` decorator: its argument shape, its target, the decorators it

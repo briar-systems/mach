@@ -362,6 +362,185 @@ fun secret_deep_walk(s: *session.Session, tid: type.TypeId, scan: *type.SecretSc
     ret true;
 }
 
+# the byte extent of a type: the size and alignment it occupies in storage (#2167)
+#
+# `ok` is false when the extent cannot be determined - an unresolvable field table, a
+# generic parameter with no concrete argument, a graph past the depth bound. Every
+# consumer treats that as "cannot prove", never as a permissive default.
+# ---
+# ok:    whether size / align were determined
+# size:  the type's size in bytes
+# align: the type's alignment in bytes (always >= 1 when ok)
+pub rec Extent {
+    ok:    bool;
+    size:  u32;
+    align: u32;
+}
+
+# an Extent that could not be determined
+fun no_extent() Extent {
+    var e: Extent;
+    e.ok    = false;
+    e.size  = 0;
+    e.align = 0;
+    ret e;
+}
+
+# a determined Extent
+fun extent(size: u32, align: u32) Extent {
+    var e: Extent;
+    e.ok    = true;
+    e.size  = size;
+    e.align = align;
+    ret e;
+}
+
+# round `v` up to the next multiple of `a`; an alignment of 0 or 1 leaves it unchanged
+fun round_up(v: u32, a: u32) u32 {
+    if (a <= 1) { ret v; }
+    val r: u32 = v % a;
+    if (r == 0) { ret v; }
+    ret v + (a - r);
+}
+
+# the depth bound on the extent walk; a graph deeper than this yields `no_extent`
+val EXTENT_MAX_DEPTH: u32 = 64;
+
+# the storage size and alignment of a semantic type (#2167)
+#
+# The secrecy-placement comparison needs BYTE RANGES, not field indices: two fields at
+# the same ordinal whose `^` sits at the same place in the type graph can still occupy
+# different byte ranges, which slides every later field of one side against the other.
+# `check.byte_size` cannot serve - it reports 0 for every aggregate, which is also a
+# legitimate size for an empty record, so a distinguishable `ok` is required.
+#
+# THIS MUST AGREE EXACTLY WITH `me.ir.type.byte_size` / `byte_align`, which is what the
+# backend actually lays out: sema admitting an overlay the emitted layout does not
+# produce would turn this check's conservatism into an unsoundness. It mirrors that
+# natural C-style fold - a struct rounds each field to its alignment and the whole to
+# the aggregate's, a union overlaps every member at offset 0, an `#[align(...)]`
+# override raises (never lowers) the aggregate's alignment - reading the same
+# session-registered override the lowering reads. `generics_layout_matches_lowering`
+# pins the two against each other.
+#
+# `^` has no runtime representation, so it is stripped before measuring.
+# ---
+# s:         the session (type universe, lazy instance fields, align overrides)
+# ptr_width: the target's pointer width in bytes
+# tid:       the type to measure
+# ret:       the determined Extent, or `ok = false` when it cannot be computed
+pub fun type_extent(s: *session.Session, ptr_width: u32, tid: type.TypeId) Extent {
+    ret extent_walk(s, ptr_width, tid, 0);
+}
+
+# the recursive worker for `type_extent`, bounding the graph depth
+fun extent_walk(s: *session.Session, ptr_width: u32, tid: type.TypeId, depth: u32) Extent {
+    if (depth > EXTENT_MAX_DEPTH) { ret no_extent(); }
+
+    val base: type.TypeId = type.strip_secret(?s.types, tid);
+    val opt_type: O.Option[*type.Type] = type.get(?s.types, base);
+    if (O.is_none[*type.Type](opt_type)) { ret no_extent(); }
+    val t: *type.Type = O.unwrap[*type.Type](opt_type);
+
+    val d: type.PrimDesc = type.prim_desc(t.kind);
+    if (d.class == type.PRIM_CLASS_INT || d.class == type.PRIM_CLASS_FLOAT) {
+        ret extent(d.bits / 8, d.bits / 8);
+    }
+    # the raw `ptr`, a typed `*T`, and a function value (a code address) are all
+    # pointer-sized and pointer-aligned.
+    if (d.class == type.PRIM_CLASS_PTR || t.kind == type.TYPE_POINTER || t.kind == type.TYPE_FUN) {
+        ret extent(ptr_width, ptr_width);
+    }
+    # all ten vector shapes are 128-bit and 16-byte aligned (#1965).
+    if (t.kind == type.TYPE_VECTOR) { ret extent(16, 16); }
+
+    if (t.kind == type.TYPE_ARRAY) {
+        val e: Extent = extent_walk(s, ptr_width, t.data.array.base, depth + 1);
+        if (!e.ok) { ret no_extent(); }
+        # widen the product: a >4GiB array would wrap a u32 and report a wrong extent,
+        # so it declines rather than answering wrongly.
+        val total: u64 = e.size::u64 * t.data.array.count::u64;
+        if (total > 4294967295) { ret no_extent(); }
+        ret extent(total::u32, e.align);
+    }
+
+    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI || t.kind == type.TYPE_INSTANCE) {
+        ret nominal_extent(s, ptr_width, base, t.kind, depth);
+    }
+
+    # a generic parameter, a comptime pack, or any kind not measured above has no
+    # storage extent here - FAIL CLOSED rather than answer with a default.
+    ret no_extent();
+}
+
+# the extent of a record / union / generic instance, folding its field table
+fun nominal_extent(s: *session.Session, ptr_width: u32, tid: type.TypeId, kind: type.TypeKind, depth: u32) Extent {
+    if (kind == type.TYPE_INSTANCE) { ensure_fields(s, tid); }
+    # a `rec` and a `uni` instantiate to structurally identical TYPE_INSTANCEs, so the
+    # instance's own kind says nothing about how its fields are placed; the nominal it
+    # carries (#2239) is what decides sequential against overlapping.
+    val ov: O.Option[bool] = nominal_overlays(s, tid);
+    if (O.is_none[bool](ov)) { ret no_extent(); }
+    val overlays: bool = O.unwrap[bool](ov);
+
+    val opt_tab: O.Option[*type.FieldTable] = type.field_table_for(?s.types, tid);
+    if (O.is_none[*type.FieldTable](opt_tab)) { ret no_extent(); }
+    val n: u32 = O.unwrap[*type.FieldTable](opt_tab).fields_len;
+
+    var align:    u32 = 1;
+    var offset:   u32 = 0;
+    var widest:   u32 = 0;
+    var f:        u32 = 0;
+    for (f < n) {
+        val fe: O.Option[*type.FieldEntry] = type.field_at(?s.types, tid, f);
+        if (O.is_none[*type.FieldEntry](fe)) { ret no_extent(); }
+        val e: Extent = extent_walk(s, ptr_width, O.unwrap[*type.FieldEntry](fe).ty, depth + 1);
+        if (!e.ok) { ret no_extent(); }
+        if (e.align > align) { align = e.align; }
+        if (overlays) {
+            if (e.size > widest) { widest = e.size; }
+        }
+        or {
+            offset = round_up(offset, e.align);
+            offset = offset + e.size;
+        }
+        f = f + 1;
+    }
+
+    # an `#[align(...)]` override raises the alignment (never lowers it), which also
+    # rounds the total size up to the larger alignment.
+    val ta: O.Option[u32] = session.type_align(s, tid::u32);
+    if (O.is_some[u32](ta)) {
+        val forced: u32 = O.unwrap[u32](ta);
+        if (forced > align) { align = forced; }
+    }
+
+    if (overlays) { ret extent(round_up(widest, align), align); }
+    ret extent(round_up(offset, align), align);
+}
+
+# whether nominal `tid` overlays every field at offset 0 (a union) rather than laying
+# them out sequentially (a record)
+#
+# A `rec` and a `uni` instantiate to structurally identical TYPE_INSTANCEs, so an
+# instance is resolved through the nominal it carries (#2239). None when the answer
+# cannot be established - an instance over a non-aggregate declaration - so callers
+# fail closed on it.
+# ---
+# s:   the session
+# tid: a TYPE_REC / TYPE_UNI / TYPE_INSTANCE TypeId
+# ret: some(true) for a union, some(false) for a record, none when undetermined
+fun nominal_overlays(s: *session.Session, tid: type.TypeId) O.Option[bool] {
+    val nom: type.TypeId = type.aggregate_nominal(?s.types, tid);
+    if (nom == type.TYPE_ERROR) { ret O.none[bool](); }
+    val opt_nom: O.Option[*type.Type] = type.get(?s.types, nom);
+    if (O.is_none[*type.Type](opt_nom)) { ret O.none[bool](); }
+    val k: type.TypeKind = O.unwrap[*type.Type](opt_nom).kind;
+    if (k == type.TYPE_UNI) { ret O.some[bool](true); }
+    if (k == type.TYPE_REC) { ret O.some[bool](false); }
+    ret O.none[bool]();
+}
+
 # a paired cycle guard for the deep secrecy-placement comparison, so two mutually
 # recursive record graphs compared field-for-field terminate (#2165)
 # ---
@@ -394,15 +573,15 @@ rec SecrecyPairScan {
 # a:   the first type
 # b:   the second type
 # ret: true when `a` and `b` carry `^` at identical positions
-pub fun secrecy_structure_equal_deep(s: *session.Session, a: type.TypeId, b: type.TypeId) bool {
+pub fun secrecy_structure_equal_deep(s: *session.Session, ptr_width: u32, a: type.TypeId, b: type.TypeId) bool {
     if (!contains_secret_deep(s, a) && !contains_secret_deep(s, b)) { ret true; }
     var scan: SecrecyPairScan;
     scan.len = 0;
-    ret sse_deep_walk(s, a, b, ?scan);
+    ret sse_deep_walk(s, ptr_width, a, b, ?scan);
 }
 
 # the recursive lockstep worker for `secrecy_structure_equal_deep`
-fun sse_deep_walk(s: *session.Session, a: type.TypeId, b: type.TypeId, scan: *SecrecyPairScan) bool {
+fun sse_deep_walk(s: *session.Session, ptr_width: u32, a: type.TypeId, b: type.TypeId, scan: *SecrecyPairScan) bool {
     if (type.is_secret(?s.types, a) != type.is_secret(?s.types, b)) { ret false; }
 
     val sa: type.TypeId = type.strip_secret(?s.types, a);
@@ -414,11 +593,11 @@ fun sse_deep_walk(s: *session.Session, a: type.TypeId, b: type.TypeId, scan: *Se
     val tb: *type.Type = O.unwrap[*type.Type](ob);
 
     if (ta.kind == type.TYPE_POINTER && tb.kind == type.TYPE_POINTER) {
-        ret sse_deep_walk(s, ta.data.pointer.base, tb.data.pointer.base, scan);
+        ret sse_deep_walk(s, ptr_width, ta.data.pointer.base, tb.data.pointer.base, scan);
     }
     if (ta.kind == type.TYPE_ARRAY && tb.kind == type.TYPE_ARRAY) {
         # every element shares the base's secrecy, so the count is irrelevant to placement.
-        ret sse_deep_walk(s, ta.data.array.base, tb.data.array.base, scan);
+        ret sse_deep_walk(s, ptr_width, ta.data.array.base, tb.data.array.base, scan);
     }
     if (ta.kind == type.TYPE_FUN && tb.kind == type.TYPE_FUN) {
         # two function types place `^` identically iff same arity, the return pair matches,
@@ -427,13 +606,13 @@ fun sse_deep_walk(s: *session.Session, a: type.TypeId, b: type.TypeId, scan: *Se
         # would call `id` treating a secret arg as public - rejected here). Differing arity
         # cannot be aligned, so it fails closed.
         if (ta.data.fn.params_len != tb.data.fn.params_len) { ret false; }
-        if (!sse_deep_walk(s, ta.data.fn.ret_type, tb.data.fn.ret_type, scan)) { ret false; }
+        if (!sse_deep_walk(s, ptr_width, ta.data.fn.ret_type, tb.data.fn.ret_type, scan)) { ret false; }
         var pi: u32 = 0;
         for (pi < ta.data.fn.params_len) {
             val pa: O.Option[type.TypeId] = type.get_param(?s.types, ta.data.fn.params_start + pi);
             val pb: O.Option[type.TypeId] = type.get_param(?s.types, tb.data.fn.params_start + pi);
             if (O.is_none[type.TypeId](pa) || O.is_none[type.TypeId](pb)) { ret false; }
-            if (!sse_deep_walk(s, O.unwrap[type.TypeId](pa), O.unwrap[type.TypeId](pb), scan)) { ret false; }
+            if (!sse_deep_walk(s, ptr_width, O.unwrap[type.TypeId](pa), O.unwrap[type.TypeId](pb), scan)) { ret false; }
             pi = pi + 1;
         }
         ret true;
@@ -457,28 +636,62 @@ fun sse_deep_walk(s: *session.Session, a: type.TypeId, b: type.TypeId, scan: *Se
         if (ta.kind == type.TYPE_INSTANCE) { ensure_fields(s, sa); }
         if (tb.kind == type.TYPE_INSTANCE) { ensure_fields(s, sb); }
 
+        # NEITHER SIDE EXPOSES A PUBLIC-STORED BYTE: every overlapping byte is secret in
+        # both, so no public alias can read a secret and any layout difference between
+        # them is harmless. Decided BEFORE the field walk, so an all-secret pair is
+        # admitted whatever its shapes - which is what keeps the byte-extent pairing
+        # below from over-rejecting a `^u8` against a `^u32` that has no public byte to
+        # displace.
+        if (deep_all_secret(s, sa) && deep_all_secret(s, sb)) { ret true; }
+
         val tab_a: O.Option[*type.FieldTable] = type.field_table_for(?s.types, sa);
         val tab_b: O.Option[*type.FieldTable] = type.field_table_for(?s.types, sb);
         if (O.is_none[*type.FieldTable](tab_a) || O.is_none[*type.FieldTable](tab_b)) { ret false; }
         val na: u32 = O.unwrap[*type.FieldTable](tab_a).fields_len;
         val nb: u32 = O.unwrap[*type.FieldTable](tab_b).fields_len;
-        if (na != nb) {
-            # differing shapes: the fields cannot be aligned, so placement is provably
-            # identical ONLY when neither side exposes a public-stored byte - then every
-            # overlapping byte is secret in both and no public alias reads a secret. This
-            # keeps an all-secret union with differing field counts legal while rejecting
-            # a real public-vs-secret mismatch. Otherwise fail closed.
-            ret deep_all_secret(s, sa) && deep_all_secret(s, sb);
-        }
 
+        # PAIR THE COMMON FIELDS BY BYTE EXTENT, NOT BY ORDINAL (#2167). Matching `^`
+        # placement in the type GRAPH does not make two fields occupy the same BYTES:
+        # `^u8` and `^u32` are both "a secret scalar" to the walk, and pairing them by
+        # ordinal alone slid every later field of one side against the other, landing a
+        # PUBLIC field on top of a secret one - a disclosure through an entirely
+        # public-typed read, with no `:^` anywhere. Requiring equal size AND alignment on
+        # each pair keeps every subsequent field offset identical by induction (a field's
+        # offset is a fold over the fields BEFORE it), which is what makes the recursive
+        # placement check below sound rather than merely suggestive.
+        var common: u32 = na;
+        if (nb < common) { common = nb; }
         var f: u32 = 0;
-        for (f < na) {
+        for (f < common) {
             val fa: O.Option[*type.FieldEntry] = type.field_at(?s.types, sa, f);
             val fb: O.Option[*type.FieldEntry] = type.field_at(?s.types, sb, f);
             if (O.is_none[*type.FieldEntry](fa) || O.is_none[*type.FieldEntry](fb)) { ret false; }
-            if (!sse_deep_walk(s, O.unwrap[*type.FieldEntry](fa).ty, O.unwrap[*type.FieldEntry](fb).ty, scan)) { ret false; }
+            val ty_a: type.TypeId = O.unwrap[*type.FieldEntry](fa).ty;
+            val ty_b: type.TypeId = O.unwrap[*type.FieldEntry](fb).ty;
+            if (!sse_deep_walk(s, ptr_width, ty_a, ty_b, scan)) { ret false; }
+
+            val ea: Extent = type_extent(s, ptr_width, ty_a);
+            val eb: Extent = type_extent(s, ptr_width, ty_b);
+            if (!ea.ok || !eb.ok)                           { ret false; }
+            if (ea.size != eb.size || ea.align != eb.align) { ret false; }
             f = f + 1;
         }
+        if (na == nb) { ret true; }
+
+        # DIFFERING SHAPES (#2167). With the common prefix proven identical byte for
+        # byte, the longer side's extra fields all begin at or after the shorter side's
+        # last field ends, so none of them can overlay a byte the shorter side
+        # classifies - the case #2167 reported as over-rejected is now admitted instead
+        # of failed closed. The shorter side's trailing padding is not a field, so
+        # nothing reads a secret through it.
+        #
+        # This holds only for SEQUENTIAL layout. A union overlays every variant at offset
+        # 0, so an extra variant sits ON the common bytes rather than after them; such a
+        # pair is admitted only by the all-secret check above.
+        val oa: O.Option[bool] = nominal_overlays(s, sa);
+        val ob: O.Option[bool] = nominal_overlays(s, sb);
+        if (O.is_none[bool](oa) || O.is_none[bool](ob)) { ret false; }
+        if (O.unwrap[bool](oa) || O.unwrap[bool](ob))   { ret false; }
         ret true;
     }
 
@@ -1011,7 +1224,7 @@ fun check_uni_variants(sc: *sema.SemaContext, nom: type.TypeId, args: *type.Type
         val raw: type.TypeId = O.unwrap[*type.FieldEntry](e_opt).ty;
         val ty:  type.TypeId = subst_or_self(s, raw, args, arg_len);
         if (type_mentions_gparam(s, ty)) { ret; }
-        if (!secrecy_structure_equal_deep(s, first, ty)) {
+        if (!secrecy_structure_equal_deep(s, sema.ptr_width_of(sc), first, ty)) {
             if (sema.uni_report_mark(sc.uni_reports, key)) {
                 sema.report(sc, span, "union variants must agree on secrecy: this instantiation makes overlapping fields part secret `^` and part public, which would alias the same storage at two classifications");
             }

@@ -72,6 +72,13 @@ val ok: u8 = (x > 0) && (y < 100);
 - `~` bitwise NOT (integer)
 - `!` logical NOT (`u8`)
 
+On a float, `-` is the IEEE-754 sign-bit flip and is exact for every operand, so
+`-0.0` is negative zero — a constant distinct from `0.0`, whether it is folded at
+comptime or negated at run time. The two compare **equal** (`-0.0 == 0.0` is
+true), so code that must tell them apart compares bit patterns: `(-0.0):~u64` is
+`0x8000000000000000`. Note that `0.0 - x` is subtraction, not negation: it yields
+positive zero for either zero.
+
 ## Pointer
 
 - `?expr` — address-of; produces a pointer to the operand.
