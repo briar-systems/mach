@@ -588,6 +588,147 @@ rec UniInstScan {
     bound_reported: bool;
 }
 
+# whether any type this module names reaches a secret `^` (#2225)
+#
+# The precondition of the whole instance rule: a union's variants cannot disagree unless
+# a `^` is reachable, so a module that names none needs neither the per-annotation walk
+# nor the widened re-validation recording that feeds it.
+#
+# Derived from the MODULE's own resolved annotations rather than from the interner's
+# contents, and so is a function of this module and its dependencies alone. Reading the
+# universe instead would make a module's diagnostics depend on which unrelated modules
+# had been analysed first, which is not a property a cached per-module result may have.
+# The reach is DEEP (`contains_secret_deep`), so a `^` that only a dependency's template
+# writes - `Outer[T]` whose field is `U[T, ^u32]` - is found through the field graph.
+# Call it once the field tables exist, or every unresolvable nominal fails closed and the
+# answer is a uniform yes.
+# ---
+# s:        the session
+# resolved: the module's `type_resolved_ty` table
+# len:      number of entries
+# ret:      true when some annotation reaches a `^`
+pub fun module_reaches_secret(s: *session.Session, resolved: *type.TypeId, len: u32) bool {
+    if (resolved == nil) { ret false; }
+
+    # ONE visited set across every annotation, not one per annotation: a nominal explored
+    # and found secret-free stays secret-free whichever root reached it, so sharing turns
+    # the scan from (annotations x graph) into (distinct types). It grows rather than
+    # capping, because a capped scan would answer "possibly secret" for any large module
+    # and switch the whole rule on for it - paying far more than the scan saved.
+    var scan: GParamScan;
+    scan.visited = nil;
+    scan.len     = 0;
+    scan.cap     = 0;
+
+    var found: bool = false;
+    var i:     u32  = 0;
+    for (i < len) {
+        if (secret_reach_walk(s, resolved[i], ?scan)) {
+            found = true;
+            brk;
+        }
+        i = i + 1;
+    }
+
+    if (scan.visited != nil && scan.cap > 0) {
+        A.deallocate[type.TypeId](s.alloc, scan.visited, scan.cap::usize);
+    }
+    ret found;
+}
+
+# the recursive worker for `module_reaches_secret`, threading one growable visited set
+#
+# The same structural discipline as `secret_deep_walk` - pointer, array, function
+# SIGNATURE, and every field of every aggregate - and the same fail-closed default over
+# the kind space, so an unresolvable table or an unrecognized kind answers "possibly
+# secret" and switches the rule on rather than off.
+fun secret_reach_walk(s: *session.Session, tid: type.TypeId, scan: *GParamScan) bool {
+    if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret false; }
+
+    val opt_t: O.Option[*type.Type] = type.get(?s.types, tid);
+    if (O.is_none[*type.Type](opt_t)) { ret false; }
+    val t: *type.Type    = O.unwrap[*type.Type](opt_t);
+    val k: type.TypeKind = t.kind;
+
+    if (k == type.TYPE_SECRET) { ret true; }
+
+    if (k == type.TYPE_POINTER) {
+        val base: type.TypeId = t.data.pointer.base;
+        ret secret_reach_walk(s, base, scan);
+    }
+    if (k == type.TYPE_ARRAY) {
+        val base: type.TypeId = t.data.array.base;
+        ret secret_reach_walk(s, base, scan);
+    }
+    if (k == type.TYPE_FUN) {
+        val ret_ty:       type.TypeId = t.data.fn.ret_type;
+        val params_start: u32         = t.data.fn.params_start;
+        val params_len:   u32         = t.data.fn.params_len;
+        if (secret_reach_walk(s, ret_ty, scan)) { ret true; }
+        var pi: u32 = 0;
+        for (pi < params_len) {
+            val p_opt: O.Option[type.TypeId] = type.get_param(?s.types, params_start + pi);
+            if (O.is_some[type.TypeId](p_opt) && secret_reach_walk(s, O.unwrap[type.TypeId](p_opt), scan)) { ret true; }
+            pi = pi + 1;
+        }
+        ret false;
+    }
+
+    # an instance is read as (arguments, template), never as its own substituted table: a
+    # `^` in that table comes from one or the other, so materializing it would build a
+    # layout the program may never need - the scan runs on every module, including the
+    # overwhelming majority that reach no secret at all and pay only this walk.
+    if (k == type.TYPE_INSTANCE) {
+        if (scan_contains(scan, tid)) { ret false; }
+        if (!scan_push(s, scan, tid)) { ret true; }
+
+        val origin:     session.ModuleId = t.data.instance.target_origin;
+        val decl_id:    id.DeclId        = t.data.instance.target_decl;
+        val args_start: u32              = t.data.instance.args_start;
+        val args_len:   u32              = t.data.instance.args_len;
+
+        var i: u32 = 0;
+        for (i < args_len) {
+            val a_opt: O.Option[type.TypeId] = type.get_param(?s.types, args_start + i);
+            if (O.is_some[type.TypeId](a_opt) && secret_reach_walk(s, O.unwrap[type.TypeId](a_opt), scan)) { ret true; }
+            i = i + 1;
+        }
+
+        val gnom: type.TypeId = generic_nominal_of(s, origin, decl_id);
+        if (gnom == type.TYPE_ERROR) { ret true; }
+        ret secret_reach_walk(s, gnom, scan);
+    }
+
+    if (k == type.TYPE_REC || k == type.TYPE_UNI) {
+        if (scan_contains(scan, tid)) { ret false; }
+        if (!scan_push(s, scan, tid)) { ret true; }
+
+        val opt_tab: O.Option[*type.FieldTable] = type.field_table_for(?s.types, tid);
+        if (O.is_none[*type.FieldTable](opt_tab)) { ret true; }
+        val fields_len: u32 = O.unwrap[*type.FieldTable](opt_tab).fields_len;
+
+        var f: u32 = 0;
+        for (f < fields_len) {
+            val e_opt: O.Option[*type.FieldEntry] = type.field_at(?s.types, tid, f);
+            if (O.is_some[*type.FieldEntry](e_opt)) {
+                val fty: type.TypeId = O.unwrap[*type.FieldEntry](e_opt).ty;
+                if (secret_reach_walk(s, fty, scan)) { ret true; }
+            }
+            f = f + 1;
+        }
+        ret false;
+    }
+
+    # a `...` pack is a comptime sequence marker, not storage: it is never a union
+    # variant nor a field, so it cannot make a pair of variants disagree. `secret_deep_walk`
+    # fails closed on it because there it guards a value crossing a boundary; here it would
+    # only switch the whole rule on for every module that declares a variadic.
+    if (k == type.TYPE_PACK) { ret false; }
+
+    if (kind_is_public_leaf(k)) { ret false; }
+    ret true;
+}
+
 # the mixed-secrecy union rule at a generic INSTANCE, run over one annotation (#2225)
 #
 # `check_uni_secrecy` runs at the union DECLARATION, where a variant typed by a generic
