@@ -31,6 +31,7 @@ A decorator is written as an attribute:
 #[symbol("name")]    # linker name override
 #[library("dep")]    # PE import routing (ext only)
 #[inline]            # force inlining (no arguments)
+#[noinline]          # forbid inlining (no arguments)
 #[align(expr)]       # alignment; expr is a comptime integer
 #[section(".name")]  # place in a named object section
 #[oblivious]         # constant-time boundary (no arguments)
@@ -103,6 +104,31 @@ size- and use-count heuristics. Applies to functions only; takes no arguments.
 #[inline]
 fun fast_path(x: i64) i64 { ret x * 2; }
 ```
+
+### `noinline` — forbid inlining
+
+The inverse of `inline`: forbids inlining a function into any caller, overriding
+the compiler's size- and use-count heuristics that would otherwise fold it in.
+Applies to functions only; takes no arguments.
+
+```mach
+#[noinline]
+fun cold_path(code: i64) i64 { panic("unreachable state"); }
+```
+
+Use it to keep a function's frame and symbol real — for a profiler or stack
+sampler to attribute its cost correctly, to keep a cold path from bloating a hot
+caller's instruction cache, or to hold code size down on a constrained target.
+
+- `inline` and `noinline` on the same function is a direct contradiction and is
+  rejected in sema; neither wins silently.
+- `scalar` already declines inlining as a side effect (#2141), so pairing it
+  with `noinline` is legal but redundant.
+- Purely a hint to the inliner; it does not otherwise change codegen. It binds
+  at every optimization level — the debug pipeline runs no inlining pass at
+  all, so `noinline` is inert (and unnecessary) there — and it will bind
+  identically to any future cross-module or LTO inlining path, which is not a
+  separate mechanism exempt from it.
 
 ### `align(expr)` — alignment override
 
@@ -195,6 +221,7 @@ is undesirable for a specific function. The project-wide equivalent is the
 | `symbol`    |  yes  |    yes    |      yes      |      no       |
 | `library`   |  no   |    yes    |      no       |      no       |
 | `inline`    |  yes  |    no     |      no       |      no       |
+| `noinline`  |  yes  |    no     |      no       |      no       |
 | `align`     |  no   |    no     |      yes      |      yes      |
 | `section`   |  yes  |    yes    |      yes      |      no       |
 | `oblivious` |  yes  |    no     |      no       |      no       |
