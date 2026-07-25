@@ -27,6 +27,8 @@ use O: std.types.option;
 use R: std.types.result;
 use ctime: std.chrono.time;
 
+use mach.lang.be.codegen;
+use mach.lang.be.obj;
 use mach.lang.build.outcome;
 use mach.lang.build.qctx;
 use mach.lang.build.request;
@@ -35,6 +37,7 @@ use mach.lang.fe.ast;
 use mach.lang.fe.comptime;
 use mach.lang.fe.resolve;
 use mach.lang.fe.sema;
+use generics: mach.lang.fe.sema.generics;
 use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.manifest;
@@ -48,6 +51,7 @@ use mach.lang.readout;
 use mach.lang.session;
 use src: mach.lang.source;
 use mach.lang.target;
+use mach.lang.target.of;
 use mach.lang.type;
 
 use mach.lang.driver.project;
@@ -847,14 +851,19 @@ fun ut_vec_lower(s: *session.Session, alloc: *A.Allocator, src: str, target_name
     ret R.ok[project.Project, outcome.Fail](p);
 }
 
-# tally the gep instructions across `p`'s lowered modules: `@total` counts every
-# gep, `@into_vec` counts those whose base aggregate type (`aux_ty`) is a vector.
+# tally the gep and lane-access instructions across `p`'s lowered modules: `@total`
+# counts every gep, `@into_vec` those whose base aggregate type (`aux_ty`) is a
+# vector, and `@lane_ops` the register-resident lane reads / writes.
+#
 # #2013 lowered a lane `v[i]` to a gep INTO the register-class IRT_VECTOR type --
 # rejected by aarch64, tolerated by x86_64 only through a numeric-offset accident;
-# the fix routes lane access through an array-of-lanes shape so `@into_vec` is 0
-fun ut_count_geps_into_vector(p: *project.Project, total: *u32, into_vec: *u32) {
+# the fix routes lane access through an array-of-lanes shape so `@into_vec` is 0.
+# #2236 then gave lane access a register-resident form, so on a target declaring
+# `has_lane_ops` the access is `@lane_ops` and there is no lane gep at all
+fun ut_count_geps_into_vector(p: *project.Project, total: *u32, into_vec: *u32, lane_ops: *u32) {
     @total    = 0;
     @into_vec = 0;
+    @lane_ops = 0;
     var ti: u32 = 0;
     for (ti < p.topo_len) {
         val m: *ir.Module = p.modules[p.topo[ti]::u32].ir_module;
@@ -871,6 +880,9 @@ fun ut_count_geps_into_vector(p: *project.Project, total: *u32, into_vec: *u32) 
                         if (ins.kind == instruction.OP_GEP) {
                             @total = @total + 1;
                             if (ir_type.is_vector(?m.types, ins.aux_ty)) { @into_vec = @into_vec + 1; }
+                        }
+                        if (ins.kind == instruction.OP_VEC_EXTRACT || ins.kind == instruction.OP_VEC_INSERT) {
+                            @lane_ops = @lane_ops + 1;
                         }
                         ix = ix + 1;
                     }
@@ -924,12 +936,17 @@ fun ut_has_vec_compare_operands(p: *project.Project, want_float: bool, want_byte
     ret false;
 }
 
-# a vector lane `v[i]` read and write lower to a slot round-trip -- a gep through
-# the vector's array-of-lanes storage, never a gep INTO the register-class
-# IRT_VECTOR type -- identically on all three targets' pipelines. x86_64/aarch64
-# keep the vector and riscv64 scalarizes it, yet the lane geps are array-shaped on
-# every one; the regression guard for the #2013 substrate bug aarch64 rejected and
-# x86_64 only tolerated through a numeric-offset accident (#1965)
+# a vector lane `v[i]` read and write lower to EXACTLY ONE of the two lane
+# representations on every target, and never to a gep INTO the register-class
+# IRT_VECTOR type
+#
+# A target declaring `has_lane_ops` (aarch64) keeps the access register-resident as
+# OP_VEC_EXTRACT / OP_VEC_INSERT and emits no lane gep at all; every other target has
+# it rewritten to the vector's memory image, whose geps walk an array-of-lanes shape.
+# The exclusive-or is the invariant: a target must not end up with both, which would
+# mean a lane access left half-legalized. `into_vec == 0` is the original #2013 guard,
+# for the substrate bug aarch64 rejected and x86_64 only tolerated through a
+# numeric-offset accident (#1965, #2236)
 test "mach.lang.driver:vector_lane_access_round_trip" {
     val src: str = "fun lane_rw(p: *i32x4, out: *i32) {\n    @out = (@p)[2];\n    (@p)[0] = 7;\n}\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { lane_rw(argv:~*i32x4, argv:~*i32); ret 0; }\n";
     var targets: [3]str;
@@ -949,11 +966,14 @@ test "mach.lang.driver:vector_lane_access_round_trip" {
         var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
         var total:    u32 = 0;
         var into_vec: u32 = 0;
-        ut_count_geps_into_vector(?p, ?total, ?into_vec);
-        # the lane access must materialize as a gep (base is a pointer param, so it
-        # survives optimization) and none may index into a vector.
-        if (total == 0)     { bad = 1; }
-        if (into_vec != 0)  { bad = 1; }
+        var lane_ops: u32 = 0;
+        ut_count_geps_into_vector(?p, ?total, ?into_vec, ?lane_ops);
+        # exactly one representation, never both and never neither: a register-
+        # resident lane op, or a gep through the vector's memory image (the base is a
+        # pointer param, so it survives optimization). no gep may index into a vector.
+        if (lane_ops == 0 && total == 0) { bad = 1; }
+        if (lane_ops != 0 && total != 0) { bad = 1; }
+        if (into_vec != 0)               { bad = 1; }
         project.dnit_project(?p);
         session.dnit(?s);
         t = t + 1;
@@ -3670,6 +3690,141 @@ test "mach.lang.driver:generic_instance_call_inlines_at_release" {
     ret bad;
 }
 
+# `#[noinline]` blocks the release inliner end to end for `target_name`, proven
+# from the emitted object rather than the inliner's source (#2200): `helper` is
+# small and single-use, so by the ordinary heuristics it would inline into `main`
+# (see the undecorated twin `small_single_use_callee_inlines_by_default` in
+# me.pass.inline). Every direct call - local or not - lowers through a
+# name-targeted relocation (be.codegen.pack_relocs: "a cross-section call from a
+# re-homed site just works"), so a live call to `helper` leaves an RK_PLT32
+# relocation naming it in the object; an inlined call leaves none. `RK_PLT32` is
+# the abstract direct-call kind on all three ISAs this runs against (R_X86_64_PLT32
+# / R_AARCH64_CALL26 / R_RISCV_CALL_PLT).
+# ---
+# target_name: a `[target.*]` entry from ut_manifest's six-target manifest
+# ret:         0 when the call survives release inlining and the object proves it,
+#              1 on any build failure or if the call was inlined away
+fun ut_noinline_survives_object(target_name: str) i32 {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = "#[noinline]\nfun helper(x: i64) i64 { ret x + 1; }\nfun main() i64 { ret helper(41); }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val rr: R.Result[bool, str] = driver.setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val pr: R.Result[project.Project, outcome.Fail] = driver.build_project(?s, root, target_name);
+    fs.remove_all(?alloc, root);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    # bad starts failed and clears only on the full success chain, so a build or
+    # lookup failure can never vacuously pass.
+    var bad: i32 = 1;
+    if (R.is_err[bool, outcome.Fail](passes.run_sema_pass(?p)))  { project.dnit_project(?p); session.dnit(?s); ret 1; }
+    if (R.is_err[bool, outcome.Fail](passes.run_lower_pass(?p))) { project.dnit_project(?p); session.dnit(?s); ret 1; }
+
+    val mid: session.ModuleId = ut_mid(?p, ?s, "uniontest.main");
+    if (mid != session.MODULE_NIL) {
+        val me: *project.ModuleEntry = ?p.modules[mid::u32];
+        if (me.ir_module != nil) {
+            val m: *ir.Module = me.ir_module;
+            val ri: R.Result[bool, str] = inline.run(m, ?p.target);
+            if (R.is_ok[bool, str](ri)) {
+                # the surviving call's callee, read straight off the IR - no guessed
+                # mangled name - so the object check below matches whatever linkage
+                # name codegen actually assigned.
+                val callee_name: intern.StrId = ut_single_local_callee_name(m);
+                if (callee_name != intern.STR_NIL) {
+                    val cg: R.Result[of.ObjectImage, str] =
+                        codegen.codegen_module(?s, ?p.target, m, nil, codegen.no_debug());
+                    if (R.is_ok[of.ObjectImage, str](cg)) {
+                        var image: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](cg);
+                        if (ut_has_direct_call_reloc(?image, callee_name)) { bad = 0; }
+                        obj.dnit(?image);
+                    }
+                }
+            }
+        }
+    }
+
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# the linkage name of `m`'s one surviving local-definition call site, or STR_NIL
+# when there is not exactly one - `ut_noinline_survives_object`'s fixture has a
+# single call, so a count other than one means the fixture shape changed under it.
+fun ut_single_local_callee_name(m: *ir.Module) intern.StrId {
+    var found: intern.StrId = intern.STR_NIL;
+    var hits: u32 = 0;
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        var bi: u32 = 0;
+        for (bi < fn.block_count) {
+            val blk: *ir.Block = ?fn.blocks[bi];
+            var ii: u32 = 0;
+            for (ii < blk.instr_count) {
+                val oi: O.Option[*instruction.Instruction] = ir.instruction_get(fn, blk.instructions[ii]);
+                if (O.is_some[*instruction.Instruction](oi)) {
+                    val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](oi);
+                    if (inst.kind == instruction.OP_CALL && inst.operand_count >= 1) {
+                        val callee: value.Value = inst.operands[0];
+                        if (callee.kind == value.VAL_FN && callee.data.fn_ix < m.function_len) {
+                            val cfn: *ir.Function = ?m.functions[callee.data.fn_ix];
+                            if ((cfn.flags & ir.FN_FLAG_EXTERN) == 0 && cfn.block_count > 0) {
+                                found = cfn.name;
+                                hits = hits + 1;
+                            }
+                        }
+                    }
+                }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+        fi = fi + 1;
+    }
+    if (hits != 1) { ret intern.STR_NIL; }
+    ret found;
+}
+
+# true when `image` carries a direct-call relocation naming `callee_name`. aarch64
+# (BL/CALL26) and riscv64 (auipc+jalr/CALL_PLT) always route a direct call through
+# RK_PLT32 (x64/encode.mach never emits it); x64's CALL rel32 shares the ordinary
+# RIP-relative symbol path with every other x64 symbol reference and so carries the
+# more general RK_PC32. `callee_name`'s only reference anywhere in the fixture is
+# the one call site under test, so either kind naming it is decisive here.
+fun ut_has_direct_call_reloc(image: *of.ObjectImage, callee_name: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < image.reloc_count) {
+        val rel: *of.Relocation = ?image.relocations[i];
+        if ((rel.kind == of.RK_PLT32 || rel.kind == of.RK_PC32) && rel.symbol == callee_name) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the cross-ISA bar (#2200): `#[noinline]` must hold on x86_64, aarch64, and
+# riscv64 - not just wherever the host happens to be - since should_inline itself
+# is target-independent (tgt is a reserved, currently-unused parameter) but the
+# object-level proof still has to be re-derived per ISA's own relocation packer.
+test "mach.lang.driver:noinline_decorator_survives_object_all_isas" {
+    if (ut_noinline_survives_object("linux") != 0)         { ret 1; }
+    if (ut_noinline_survives_object("linux-arm64") != 0)   { ret 1; }
+    if (ut_noinline_survives_object("linux-riscv64") != 0) { ret 1; }
+    ret 0;
+}
+
 # driver incremental: editing one dependency's body re-lowers it and its importer
 # (the importer inlines nothing here, but has no per-hop lowering firewall so it
 # conservatively re-lowers), while an independent sibling module's Q_LOWER is
@@ -4395,10 +4550,18 @@ test "mach.lang.driver:incremental_test_mode_neutralization_variant" {
     ret bad;
 }
 
-# scaffold a single-module project from `text`, run parse + resolve + the sema
-# pass, and return its error-diagnostic count (-1 on a harness failure). the
-# secret flow-typing matrix below asserts this count against an expectation
-# (#1645)
+# scaffold a single-module project from `text`, run parse + resolve and -- when
+# resolve is clean -- the sema pass, and return its error-diagnostic count (-1 on
+# a harness failure). the secret flow-typing matrix below asserts this count
+# against an expectation (#1645)
+#
+# The resolve gate mirrors the real pipeline: `engine.run_phase` checks the
+# diagnostic sink after PH_LOAD, so a module the resolver rejected never reaches
+# sema in a build. Without the gate this harness typed an AST with unbound
+# operands and counted diagnostics no build can produce -- the fidelity gap #2144
+# names, in the direction that makes sema's unbound-identifier assertion
+# unfalsifiable. A resolve-rejected program still returns its resolve error count,
+# so `ut_sema_rejects` covers rejections from either pass.
 fun ut_sema_errs(text: str) i32 {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret -1; }
@@ -4415,9 +4578,12 @@ fun ut_sema_errs(text: str) i32 {
     if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret -1; }
     var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
 
-    var errs: i32 = -1;
-    val sem: R.Result[bool, outcome.Fail] = passes.run_sema_pass(?p);
-    if (R.is_ok[bool, outcome.Fail](sem)) { errs = ut_count_errors(?s.diags)::i32; }
+    var errs: i32 = ut_count_errors(?s.diags)::i32;
+    if (errs == 0) {
+        errs = -1;
+        val sem: R.Result[bool, outcome.Fail] = passes.run_sema_pass(?p);
+        if (R.is_ok[bool, outcome.Fail](sem)) { errs = ut_count_errors(?s.diags)::i32; }
+    }
 
     project.dnit_project(?p);
     session.dnit(?s);
@@ -4429,6 +4595,108 @@ fun ut_sema_clean(text: str) bool { ret ut_sema_errs(text) == 0; }
 
 # whether `text` is rejected with at least one sema error
 fun ut_sema_rejects(text: str) bool { ret ut_sema_errs(text) > 0; }
+
+# the interned TypeId of the nominal named `name`, found by scanning the session's type
+# universe
+#
+# The layout differential (`secrecy_layout_matches_lowering`) needs a handle on the
+# types a compiled corpus declared; a nominal carries its name, so a scan resolves it
+# without reconstructing the declaration's module and decl ids.
+# ---
+# s:    the session whose type universe to scan
+# name: the declared record / union name
+# ret:  some(TypeId) for the first nominal with that name, none when absent
+fun ut_nominal_typeid(s: *session.Session, name: str) O.Option[type.TypeId] {
+    val ir: R.Result[intern.StrId, str] = intern.intern(?s.interner, name);
+    if (R.is_err[intern.StrId, str](ir)) { ret O.none[type.TypeId](); }
+    val want: intern.StrId = R.unwrap_ok[intern.StrId, str](ir);
+
+    var i: u32 = 0;
+    for (i < s.types.type_len) {
+        val t: *type.Type = ?s.types.types[i];
+        if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI) {
+            if (t.data.nominal.name == want) { ret O.some[type.TypeId](i::type.TypeId); }
+        }
+        i = i + 1;
+    }
+    ret O.none[type.TypeId]();
+}
+
+# 0 when sema's computed extent for the nominal `name` declared by `text` is exactly
+# `size` / `align`, 1 otherwise
+# ---
+# text:  a single-module source declaring `name`
+# name:  the nominal to measure
+# size:  the expected size in bytes
+# align: the expected alignment in bytes
+# ret:   0 on a match, 1 on any mismatch or setup failure
+fun ut_sema_extent_is(text: str, name: str, size: u32, align: u32) i32 {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = text;
+
+    val pr: R.Result[project.Project, outcome.Fail] = ut_build(?s, ?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var bad: i32 = 1;
+    val sem: R.Result[bool, outcome.Fail] = passes.run_sema_pass(?p);
+    if (R.is_ok[bool, outcome.Fail](sem)) {
+        val tid: O.Option[type.TypeId] = ut_nominal_typeid(?s, name);
+        if (O.is_some[type.TypeId](tid)) {
+            # the corpus is built for the host x86_64 target, so pointer width is 8
+            val e: generics.Extent = generics.type_extent(?s, 8, O.unwrap[type.TypeId](tid));
+            if (e.ok && e.size == size && e.align == align) { bad = 0; }
+        }
+    }
+
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# whether `text` is rejected by a sema error whose message contains `needle`
+#
+# The message-precise counterpart of `ut_sema_rejects`: a gate assertion that only
+# demanded "some error" would still pass once the gate under test was removed, as
+# long as any unrelated diagnostic remained (a lowering-stage type error masking a
+# missing secrecy gate is exactly how #2191 stayed invisible). Naming the diagnostic
+# makes the assertion fail when the gate itself is gone.
+# ---
+# text:   the single-module source to type-check
+# needle: a substring the expected diagnostic must contain
+# ret:    true when some sema error contains `needle`
+fun ut_sema_rejects_with(text: str, needle: str) bool {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret false; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret false; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = text;
+
+    val pr: R.Result[project.Project, outcome.Fail] = ut_build(?s, ?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret false; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var hit: bool = false;
+    val sem: R.Result[bool, outcome.Fail] = passes.run_sema_pass(?p);
+    if (R.is_ok[bool, outcome.Fail](sem)) { hit = ut_diag_has(?s.diags, needle); }
+
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret hit;
+}
 
 # secret flow typing: a clean program exercising the join, the implicit
 # public->secret up-coerce, the `:^` strip, secret record fields, storing public
@@ -4457,6 +4725,177 @@ test "mach.lang.driver:secret_gates_rejected" {
     # `&&` branches on the LEFT operand only: a public left with a secret right
     # is no secret branch (the result is still tainted secret)
     if (!ut_sema_clean("fun f(a: u32, b: ^u32) ^u8 { ret a && b; }\nfun main() i32 { ret 0; }\n"))         { bad = 1; }
+    ret bad;
+}
+
+# secret flow typing: a secret ADDRESS is gated at source level, everywhere, exactly
+# as the secret INDEX already was (#2191). Both halves are the same memory operand, so
+# the rule that existed only in the `#[oblivious]`-scoped translation validator left
+# `@p` on a `^*T` compiling with no diagnostic in an ordinary function. All four ways
+# to form the access - read, write, index, and the auto-deref in a member projection -
+# are asserted by DIAGNOSTIC, not by mere error count: the index and member forms are
+# independently rejected downstream by a lowering type error, which would keep an
+# error-count assertion passing with the gate removed.
+#
+# The over-rejection arm matters as much: a secret VALUE is not a secret ADDRESS. A
+# `^[N]T` array and a `^Rec` record live at public addresses, a `*^T` is a public
+# pointer to secret storage, and a `:^`-declassified pointer is public again - all four
+# must still compile, as must moving a `^*T` around without dereferencing it
+test "mach.lang.driver:secret_address_gated" {
+    var bad: i32 = 0;
+    val needle: str = "secret value used as a memory address";
+
+    # the four access forms through a secret pointer
+    if (!ut_sema_rejects_with("fun f(p: ^*u8) ^u8 { ret @p; }\nfun main() i32 { ret 0; }\n", needle))            { bad = 1; }
+    if (!ut_sema_rejects_with("fun f(p: ^*u8) { @p = 7; }\nfun main() i32 { ret 0; }\n", needle))                { bad = 1; }
+    if (!ut_sema_rejects_with("fun f(p: ^*u8) ^u8 { ret p[0]; }\nfun main() i32 { ret 0; }\n", needle))          { bad = 1; }
+    if (!ut_sema_rejects_with("rec R { x: u8; }\nfun f(p: ^*R) ^u8 { ret p.x; }\nfun main() i32 { ret 0; }\n", needle)) { bad = 1; }
+    # a secret pointer nested one level deeper is still a secret address
+    if (!ut_sema_rejects_with("fun f(q: **u8) ^u8 { val p: ^*u8 = @q; ret @p; }\nfun main() i32 { ret 0; }\n", needle)) { bad = 1; }
+
+    # a secret VALUE at a public address is untouched
+    if (!ut_sema_clean("fun f(t: ^[8]u8) ^u8 { ret t[3]; }\nfun main() i32 { ret 0; }\n"))     { bad = 1; }
+    if (!ut_sema_clean("fun f(p: *^u8) ^u8 { ret @p; }\nfun main() i32 { ret 0; }\n"))         { bad = 1; }
+    if (!ut_sema_clean("fun f(p: *u8) u8 { ret p[0]; }\nfun main() i32 { ret 0; }\n"))         { bad = 1; }
+    if (!ut_sema_clean("rec R { x: u8; }\nfun f(p: *R) u8 { ret p.x; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    # an explicit `:^` declassify makes the pointer public again
+    if (!ut_sema_clean("fun f(p: ^*u8) u8 { ret @(p:^); }\nfun main() i32 { ret 0; }\n"))      { bad = 1; }
+    # moving a secret pointer without dereferencing it is not an access
+    if (!ut_sema_clean("fun f(p: ^*u8) ^*u8 { ret p; }\nfun main() i32 { ret 0; }\n"))         { bad = 1; }
+    ret bad;
+}
+
+# secret flow typing: the deep secrecy-placement comparison pairs fields by BYTE EXTENT,
+# not by ordinal (#2167).
+#
+# #2167 reported this comparison as sound but over-strict. It was not sound. Pairing by
+# ordinal and comparing only where `^` sits in the type GRAPH treats `^u8` and `^u32` as
+# the same thing - both "a secret scalar" - so a narrower secret on one side slid every
+# later field against the other and landed a PUBLIC field on top of a secret one. On
+# `dev`, `A { x: ^u8; y: u8; }` overlaid with `B { x: ^u32; y: u8; }` let `u.a.y` read
+# byte 1 of a secret written through `u.b.x`, with no `:^` anywhere. Every shape that
+# makes the `^` land at the same ORDINAL but a different BYTE RANGE is the same hole:
+# scalar width, array count, nested aggregate width, float width.
+#
+# The over-rejection #2167 actually asked about is fixed by the same change: with the
+# common prefix proven identical byte for byte, a longer side's extra fields provably
+# begin after the shorter side ends, so a public field BEYOND the secret extent is
+# admitted instead of failed closed.
+test "mach.lang.driver:secrecy_placement_byte_extent" {
+    val need: str = "union variants must agree on secrecy";
+
+    var bad: i32 = 0;
+    # THE LEAK: same ordinal, different byte range, public field displaced onto a secret
+    if (!ut_sema_rejects_with("rec A { x: ^u8; y: u8; }\nrec B { x: ^u32; y: u8; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n", need)) { bad = 1; }
+    # the same pair through a `:~` reinterpret, which shares the comparison
+    if (!ut_sema_rejects("rec A { x: ^u8; y: u8; }\nrec B { x: ^u32; y: u8; }\nfun f(p: *A) *B { ret p:~*B; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    # every other way to differ in extent at a matching ordinal
+    if (!ut_sema_rejects_with("rec A { x: ^[1]u8; y: u8; }\nrec B { x: ^[4]u8; y: u8; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n", need)) { bad = 1; }
+    if (!ut_sema_rejects_with("rec S { v: ^u8; }\nrec T { v: ^u64; }\nrec A { x: S; y: u8; }\nrec B { x: T; y: u8; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n", need)) { bad = 1; }
+    if (!ut_sema_rejects_with("rec A { x: ^f32; y: u8; }\nrec B { x: ^f64; y: u8; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n", need)) { bad = 1; }
+    # an ALIGNMENT difference at equal size slides later fields just the same
+    if (!ut_sema_rejects_with("rec A { x: ^[4]u8; y: u8; }\nrec B { x: ^u32; y: u8; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n", need)) { bad = 1; }
+
+    # #2167's case: a public field BEYOND the shorter side's extent is safe and is now
+    # admitted rather than failed closed
+    if (!ut_sema_clean("rec A { x: ^u32; }\nrec B { x: ^u32; y: u32; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n"))                        { bad = 1; }
+    if (!ut_sema_clean("rec A { x: ^u32; y: u8; }\nrec B { x: ^u32; y: u8; z: u64; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n"))          { bad = 1; }
+    if (!ut_sema_clean("rec A { x: ^u32; }\nrec B { x: ^u32; y: u32; }\nfun f(p: *A) *B { ret p:~*B; }\nfun main() i32 { ret 0; }\n"))               { bad = 1; }
+
+    # ...but ONLY past the extent. a public field INSIDE the common prefix is still the
+    # real mismatch, and a differing-shape UNION overlays its extra variant at offset 0
+    # rather than after the prefix, so it stays rejected.
+    if (!ut_sema_rejects_with("rec A { x: ^u32; y: u32; }\nrec B { x: u32; y: ^u32; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n", need))   { bad = 1; }
+    if (!ut_sema_rejects_with("rec A { x: u32; }\nrec B { x: ^u32; y: u32; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n", need))            { bad = 1; }
+    # a UNION on either side of a differing-shape pair overlays its variants at offset 0,
+    # so the "extra fields lie beyond the prefix" argument does not hold for it. The
+    # single-variant union is the reachable discriminator: it is a legal declaration (the
+    # variant-agreement rule needs two variants to have anything to disagree about), so
+    # it reaches this comparison where a mixed multi-variant union would already have
+    # been rejected at its own declaration. The record with the identical field list on
+    # the line below is admitted, so the verdict turns on the overlay precondition alone.
+    if (!ut_sema_rejects("uni V { p: ^u32; }\nrec B { x: ^u32; y: u32; }\nfun f(p: *V) *B { ret p:~*B; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    if (!ut_sema_clean("rec A { x: ^u32; }\nrec B { x: ^u32; y: u32; }\nfun f(p: *A) *B { ret p:~*B; }\nfun main() i32 { ret 0; }\n"))   { bad = 1; }
+
+    # the all-secret admission is unchanged: with no public byte on either side, no
+    # public alias can read a secret whatever the shapes, so differing extents are fine
+    if (!ut_sema_clean("rec A { x: ^u8; }\nrec B { x: ^u32; y: ^u32; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    # and a fully public pair never reaches the walk at all
+    if (!ut_sema_clean("rec A { x: u8; }\nrec B { x: u32; y: u32; }\nuni U { a: A; b: B; }\nfun main() i32 { ret 0; }\n"))    { bad = 1; }
+    ret bad;
+}
+
+# constant-time (#2167): sema's layout must agree EXACTLY with the layout the backend
+# emits, because the secrecy-placement comparison now decides overlay safety from byte
+# extents. Sema admitting an overlay the emitted layout does not produce would convert
+# that check's conservatism into an unsoundness - the leak direction.
+#
+# Sema has no aggregate layout of its own before this (`check.byte_size` reports 0 for
+# every record), so `generics.type_extent` is a second implementation of a policy whose
+# authority is `me.ir.type.byte_size` / `byte_align`. This test is what keeps the two
+# from drifting: both are pinned to ONE table of constants. Each row asserts sema's
+# extent directly, and `$size_of` / `$align_of` - which fold at LOWERING, off the IR
+# layout - assert the same numbers through the other implementation, in a program that
+# must compile clean. A change to either side moves one of the two and fails here.
+#
+# The corpus covers every shape the fold distinguishes: scalar widths, the natural
+# alignment padding a mixed record takes, a nested aggregate, an array, a union's
+# overlap, a pointer field, and an `#[align(...)]` override raising both.
+test "mach.lang.driver:secrecy_layout_matches_lowering" {
+    var bad: i32 = 0;
+
+    # [1] sema's extents, measured directly
+    if (ut_sema_extent_is("rec R { a: u8; }\nfun main() i32 { ret 0; }\n", "R", 1, 1) != 0)                     { bad = 1; }
+    if (ut_sema_extent_is("rec R { a: u8; b: u32; }\nfun main() i32 { ret 0; }\n", "R", 8, 4) != 0)            { bad = 1; }
+    if (ut_sema_extent_is("rec R { a: u32; b: u8; }\nfun main() i32 { ret 0; }\n", "R", 8, 4) != 0)            { bad = 1; }
+    if (ut_sema_extent_is("rec R { a: u8; b: u64; }\nfun main() i32 { ret 0; }\n", "R", 16, 8) != 0)           { bad = 1; }
+    if (ut_sema_extent_is("rec I { a: u8; b: u32; }\nrec R { x: I; y: u8; }\nfun main() i32 { ret 0; }\n", "R", 12, 4) != 0) { bad = 1; }
+    if (ut_sema_extent_is("rec R { a: [3]u16; b: u8; }\nfun main() i32 { ret 0; }\n", "R", 8, 2) != 0)         { bad = 1; }
+    if (ut_sema_extent_is("uni U { a: u8; b: u32; }\nfun main() i32 { ret 0; }\n", "U", 4, 4) != 0)            { bad = 1; }
+    if (ut_sema_extent_is("rec R { a: *u8; b: u8; }\nfun main() i32 { ret 0; }\n", "R", 16, 8) != 0)           { bad = 1; }
+    if (ut_sema_extent_is("#[align(16)]\nrec R { a: u32; }\nfun main() i32 { ret 0; }\n", "R", 16, 16) != 0)   { bad = 1; }
+    # `^` has no runtime representation, so a secret field measures as its public base
+    if (ut_sema_extent_is("rec R { a: ^u8; b: ^u32; }\nfun main() i32 { ret 0; }\n", "R", 8, 4) != 0)          { bad = 1; }
+
+    # [2] THE SAME NUMBERS through the lowering layout, via `$size_of` / `$align_of`.
+    # each mismatch would fold the guard true and fail the compile with `$error`.
+    val probe: str = "rec R1 { a: u8; }\nrec R2 { a: u8; b: u32; }\nrec R3 { a: u32; b: u8; }\nrec R4 { a: u8; b: u64; }\nrec I  { a: u8; b: u32; }\nrec R5 { x: I; y: u8; }\nrec R6 { a: [3]u16; b: u8; }\nuni U1 { a: u8; b: u32; }\nrec R7 { a: *u8; b: u8; }\n#[align(16)]\nrec R8 { a: u32; }\nrec R9 { a: ^u8; b: ^u32; }\nfun main() i32 {\n  if ($size_of(R1) != 1  || $align_of(R1) != 1)  { ret 1; }\n  if ($size_of(R2) != 8  || $align_of(R2) != 4)  { ret 1; }\n  if ($size_of(R3) != 8  || $align_of(R3) != 4)  { ret 1; }\n  if ($size_of(R4) != 16 || $align_of(R4) != 8)  { ret 1; }\n  if ($size_of(R5) != 12 || $align_of(R5) != 4)  { ret 1; }\n  if ($size_of(R6) != 8  || $align_of(R6) != 2)  { ret 1; }\n  if ($size_of(U1) != 4  || $align_of(U1) != 4)  { ret 1; }\n  if ($size_of(R7) != 16 || $align_of(R7) != 8)  { ret 1; }\n  if ($size_of(R8) != 16 || $align_of(R8) != 16) { ret 1; }\n  if ($size_of(R9) != 8  || $align_of(R9) != 4)  { ret 1; }\n  ret 0;\n}\n";
+    if (ut_lower_ok(probe) != 0) { bad = 1; }
+    ret bad;
+}
+
+# secret flow typing: a LITERAL is public by construction and stays public through a
+# coercion into a secret-typed context (#2196) - while every value COMPUTED with it is
+# still secret. The literal previously took the secret type outright, which classified a
+# constant sitting in the instruction stream as a secret.
+#
+# The arm that must not be lost is the whole second half: relaxing the literal must not
+# relax the JOIN. `infer_binary` reads operand secrecy BEFORE literal unification, so a
+# secret operand still taints the result, and the result is then held to every gate -
+# assignment into a public slot, a branch condition, a memory index. If the join had been
+# read post-unification instead, `v + 3` would have come out public: a silent declassify
+# of every secret an arithmetic literal touched, which is the leak this relaxation is one
+# mistake away from
+test "mach.lang.driver:secret_literal_stays_public" {
+    var bad: i32 = 0;
+
+    # a literal in a secret slot: the coercion succeeds without conferring `^`
+    if (!ut_sema_clean("fun f() i32 { var s: ^u32 = 5; ret 0; }\nfun main() i32 { ret 0; }\n"))          { bad = 1; }
+    if (!ut_sema_clean("fun g(s: ^u32) ^u32 { ret s; }\nfun f() i32 { g(5); ret 0; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    # an out-of-range literal is still reported against the secret slot the user wrote
+    if (!ut_sema_rejects("fun f() i32 { var s: ^u8 = 300; ret 0; }\nfun main() i32 { ret 0; }\n"))       { bad = 1; }
+
+    # THE JOIN IS UNCHANGED: a value computed from a secret and a literal is secret, and
+    # every gate still fires on it
+    if (!ut_sema_rejects("fun f(v: ^u8) u8 { ret v + 3; }\nfun main() i32 { ret 0; }\n"))                { bad = 1; }
+    if (!ut_sema_rejects("fun f(v: ^u8) u8 { ret v << 3; }\nfun main() i32 { ret 0; }\n"))               { bad = 1; }
+    if (!ut_sema_rejects("fun f(v: ^u8) u8 { var x: u8 = v & 3; ret x; }\nfun main() i32 { ret 0; }\n")) { bad = 1; }
+    if (!ut_sema_rejects_with("fun f(v: ^u8) u8 { if (v << 3) { ret 1; } ret 0; }\nfun main() i32 { ret 0; }\n",
+        "secret value used as a branch condition")) { bad = 1; }
+    if (!ut_sema_rejects_with("fun f(v: ^u8, t: *u8) u8 { ret t[v << 3]; }\nfun main() i32 { ret 0; }\n",
+        "secret value used as a memory index")) { bad = 1; }
+    # the declassify is still the only downgrade
+    if (!ut_sema_clean("fun f(v: ^u8) u8 { ret (v << 3):^; }\nfun main() i32 { ret 0; }\n"))             { bad = 1; }
     ret bad;
 }
 
@@ -4786,6 +5225,46 @@ test "mach.lang.driver:secret_shift_codegen_rejected_mos6502" {
         var pb: project.Project = R.unwrap_ok[project.Project, outcome.Fail](p2);
         if (ut_run_codegen_without(?pb, "barrel shifter") != 0) { bad = 1; }
         project.dnit_project(?pb);
+    }
+
+    # [3] a LITERAL count is public BY CONSTRUCTION - its value sits in the instruction
+    # stream - so `v << 3` on a secret `v` is the constant-time idiom, not a leak. The
+    # literal coerced to the operand's `^u8` and INHERITED its secrecy, so the gate saw a
+    # secret shift count and rejected the one shift form that is always safe, on exactly
+    # the targets where constant-time code matters most (#2196). A literal is now fixed
+    # against the PUBLIC base and stays public through the coercion.
+    val p3: R.Result[project.Project, outcome.Fail] = ut_ct_edge_project(?s, ?alloc,
+        "#[oblivious]\nfun f(v: ^u8) ^u8 { ret v << 3; }\nfun main() i32 { ret 0; }\n", "mos");
+    if (R.is_err[project.Project, outcome.Fail](p3)) { bad = 1; }
+    or {
+        var pc: project.Project = R.unwrap_ok[project.Project, outcome.Fail](p3);
+        if (ut_run_codegen_without(?pc, "barrel shifter") != 0) { bad = 1; }
+        project.dnit_project(?pc);
+    }
+
+    # [4] a count FOLDED from literals is equally public - the coercion descends through
+    # the value-preserving operators, so every leaf is a literal.
+    val p4: R.Result[project.Project, outcome.Fail] = ut_ct_edge_project(?s, ?alloc,
+        "#[oblivious]\nfun f(v: ^u8) ^u8 { ret v << (1 + 2); }\nfun main() i32 { ret 0; }\n", "mos");
+    if (R.is_err[project.Project, outcome.Fail](p4)) { bad = 1; }
+    or {
+        var pd: project.Project = R.unwrap_ok[project.Project, outcome.Fail](p4);
+        if (ut_run_codegen_without(?pd, "barrel shifter") != 0) { bad = 1; }
+        project.dnit_project(?pd);
+    }
+
+    # [5] THE ARM THAT MUST NOT BE LOST alongside [1]: a count COMPUTED from a secret is
+    # secret however literal-shaped its spelling. `s + 1` has a literal leaf, but its
+    # other leaf is an identifier, which declines the retype - so the count stays secret
+    # and the gate still fires. This is the boundary between literal-by-construction and
+    # computed, and it is what keeps [3] from being an over-acceptance.
+    val p5: R.Result[project.Project, outcome.Fail] = ut_ct_edge_project(?s, ?alloc,
+        "#[oblivious]\nfun f(v: ^u8, s: ^u8) ^u8 { ret v << (s + 1); }\nfun main() i32 { ret 0; }\n", "mos");
+    if (R.is_err[project.Project, outcome.Fail](p5)) { bad = 1; }
+    or {
+        var pe: project.Project = R.unwrap_ok[project.Project, outcome.Fail](p5);
+        if (ut_run_codegen_err(?pe, "secret value used as a variable shift count on a target without a barrel shifter") != 0) { bad = 1; }
+        project.dnit_project(?pe);
     }
 
     session.dnit(?s);
@@ -5328,6 +5807,90 @@ test "mach.lang.driver:fields_over_generic_instance" {
     # the same at a pointer and at a nested-instance argument.
     if (!ut_sema_clean("rec Box[T] { v: T; w: T; }\nfun count[T](b: T) u32 { var acc: u32 = 0; $each f in $fields(T) { acc = acc + 1; } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { var b: Box[*u32]; count[Box[*u32]](b); ret 0; }\n")) { bad = 1; }
     if (!ut_sema_clean("rec Box[T] { v: T; w: T; }\nfun count[T](b: T) u32 { var acc: u32 = 0; $each f in $fields(T) { acc = acc + 1; } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { var b: Box[Box[u32]]; count[Box[Box[u32]]](b); ret 0; }\n")) { bad = 1; }
+
+    ret bad;
+}
+
+# a comptime intrinsic's type operand is a TYPE, read with the type grammar (#2178)
+#
+# The operand used to be an expression every consumer re-interpreted, and the
+# re-interpretation covered a bare name and `module.Name` only. A generic-instance
+# spelling `Box[T]` therefore resolved to nothing, `field_seq_owner` absorbed the
+# TYPE_ERROR, and the whole `$each` body was dropped - unchecked and unemitted -
+# with no diagnostic at all. Every rejection assertion here needles on a diagnostic
+# from INSIDE the body, which exists only if the body was type-checked
+test "mach.lang.driver:intrinsic_type_operand_is_a_type" {
+    var bad: i32 = 0;
+
+    # the reporting scenario. the body's `u32 = ^u32` projection is a secrecy
+    # violation; on dev this program built clean and printed 0.
+    if (ut_vec_diag("rec Box[T] { v: T; }\nfun leak[T](b: Box[T]) u32 { var acc: u32 = 0; $each f in $fields(Box[T]) { acc = b.[f]; } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { var s: ^u32 = 1234; var b: Box[^u32]; b.v = s; leak[^u32](b); ret 0; }\n",
+        "expected u32, found ^u32") != 0) { bad = 1; }
+
+    # the same at every other spelling the leaf now reaches: a nested instance, a
+    # multi-argument instance, and a concrete instance named from a non-generic
+    # function.
+    if (ut_vec_diag("rec In[T] { x: T; }\nrec Box[T] { v: T; }\nfun leak[T](b: Box[In[T]]) u32 { var acc: u32 = 0; $each f in $fields(Box[In[T]]) { acc = b.[f]; } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { var b: Box[In[u32]]; leak[u32](b); ret 0; }\n",
+        "expected u32, found In[T]") != 0) { bad = 2; }
+    if (ut_vec_diag("rec Pair[A, B] { a: A; b: B; }\nfun leak[A, B](p: Pair[A, B]) u32 { var acc: u32 = 0; $each f in $fields(Pair[A, B]) { acc = p.[f]; } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { var p: Pair[u64, u64]; leak[u64, u64](p); ret 0; }\n",
+        "expected u32, found B") != 0) { bad = 3; }
+    if (ut_vec_diag("rec Box[T] { v: T; }\nfun leak(b: Box[^u32]) u32 { var acc: u32 = 0; $each f in $fields(Box[^u32]) { acc = b.[f]; } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { var b: Box[^u32]; leak(b); ret 0; }\n",
+        "expected u32, found ^u32") != 0) { bad = 4; }
+
+    # a body inside a NESTED `$each` over the same spelling is typed too - the inner
+    # unroll is where a dropped outer sequence hid a second body.
+    if (ut_vec_diag("rec Box[T] { v: T; }\nfun leak[T](b: Box[T]) u32 { var acc: u32 = 0; $each g in $fields(Box[T]) { $each f in $fields(Box[T]) { acc = b.[f]; } } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { var b: Box[^u32]; leak[^u32](b); ret 0; }\n",
+        "expected u32, found ^u32") != 0) { bad = 5; }
+
+    # CONTROLS - the legal forms still compile. a same-typed projection through a
+    # named instance, a nested instance, a multi-argument instance, and a nested
+    # `$each`, none of which parsed or resolved on dev.
+    if (!ut_sema_clean("rec Box[T] { v: T; }\nfun get[T](b: Box[T]) T { var r: T; $each f in $fields(Box[T]) { r = b.[f]; } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { var b: Box[u32]; get[u32](b); ret 0; }\n")) { bad = 6; }
+    if (!ut_sema_clean("rec In[T] { x: T; }\nrec Box[T] { v: In[T]; }\nfun count[T](b: Box[T]) u32 { var acc: u32 = 0; $each f in $fields(Box[In[T]]) { acc = acc + 1; } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { var b: Box[u32]; count[u32](b); ret 0; }\n")) { bad = 7; }
+    if (!ut_sema_clean("rec Pair[A, B] { a: A; b: B; }\nfun count[A, B](p: Pair[A, B]) u32 { var acc: u32 = 0; $each f in $fields(Pair[A, B]) { acc = acc + 1; } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { var p: Pair[u32, u64]; count[u32, u64](p); ret 0; }\n")) { bad = 8; }
+    if (!ut_sema_clean("rec Box[T] { v: T; }\nfun count[T](b: Box[T]) u32 { var acc: u32 = 0; $each g in $fields(Box[T]) { $each f in $fields(Box[T]) { acc = acc + 1; } } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { var b: Box[u32]; count[u32](b); ret 0; }\n")) { bad = 9; }
+
+    # the layout intrinsics reach the same leaf. on dev a generic-instance operand
+    # produced no diagnostic at all here - it reached the middle end and failed the
+    # IR verifier with a spanless "constant carries an incompatible type", so these
+    # two assert through LOWER, where that failure lands.
+    if (ut_lower_ok("rec Box[T] { v: T; }\nfun sz[T]() u64 { ret $size_of(Box[T]); }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { sz[u32](); ret 0; }\n") != 0) { bad = 10; }
+    if (ut_lower_ok("rec Box[T] { v: T; }\nfun al[T]() u64 { ret $align_of(Box[T]); }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { al[u64](); ret 0; }\n") != 0) { bad = 11; }
+    if (!ut_sema_clean("rec Pair[A, B] { a: A; b: B; }\nfun of[A, B]() u64 { ret $offset_of(Pair[A, B], b); }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { of[u32, u64](); ret 0; }\n")) { bad = 12; }
+
+    # composite spellings the expression grammar could never carry: a pointer, an
+    # array, and a `^` secret qualifier.
+    if (!ut_sema_clean("rec Box[T] { v: T; }\nfun sz[T]() u64 { ret $size_of(*Box[T]); }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { sz[u32](); ret 0; }\n")) { bad = 13; }
+    if (!ut_sema_clean("fun sz() u64 { ret $size_of([4]u16); }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { sz(); ret 0; }\n")) { bad = 14; }
+    if (!ut_sema_clean("fun sz() u64 { ret $size_of(^u32); }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { sz(); ret 0; }\n")) { bad = 15; }
+
+    # an operand that names nothing is REPORTED, rather than absorbed as a
+    # TYPE_ERROR that drops the body.
+    if (!ut_sema_rejects("fun count() u32 { var acc: u32 = 0; $each f in $fields(NoSuch) { acc = acc + 1; } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { count(); ret 0; }\n")) { bad = 16; }
+    if (!ut_sema_rejects("fun count() u32 { var acc: u32 = 0; $each f in $fields(NoSuch[u32]) { acc = acc + 1; } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { count(); ret 0; }\n")) { bad = 17; }
+    # a well-formed type that is not a record still fails the record check; a `fun`
+    # type takes the same path.
+    if (ut_vec_diag("fun count() u32 { var acc: u32 = 0; $each f in $fields(u32) { acc = acc + 1; } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { count(); ret 0; }\n",
+        "$fields requires a record type") != 0) { bad = 18; }
+    if (ut_vec_diag("fun count() u32 { var acc: u32 = 0; $each f in $fields(fun(u32) u32) { acc = acc + 1; } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { count(); ret 0; }\n",
+        "$fields requires a record type") != 0) { bad = 19; }
+
+    # a type spelling reached in VALUE position is refused rather than poisoned:
+    # `$fields(T)` is a comptime sequence consumed by `$each`, never an operand.
+    if (ut_vec_diag("rec Box { v: u32; }\nfun f() u64 { var n: u64 = 0; n = $fields(Box); ret n; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { f(); ret 0; }\n",
+        "a type name is not a value") != 0) { bad = 20; }
+
+    # a name the RESOLVER rejected is reported exactly once. sema never re-reports
+    # over it, because a build stops on the diagnostic sink before sema runs and
+    # this harness now mirrors that gate; without the gate the sema unbound-
+    # identifier assertion would fire a second time on the same name, claiming a
+    # resolver silence that did not happen (#2144).
+    if (ut_sema_errs("fun f() i64 { ret nosuchname; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { f(); ret 0; }\n") != 1) { bad = 23; }
+
+    # an inline `rec { ... }` spelling is now expressible and unrolls its own
+    # fields; an empty record still expands to nothing, as documented.
+    if (!ut_sema_clean("fun count() u32 { var acc: u32 = 0; $each f in $fields(rec { x: u32; y: u64; }) { acc = acc + 1; } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { count(); ret 0; }\n")) { bad = 21; }
+    if (!ut_sema_clean("rec Empty { }\nfun count() u32 { var acc: u32 = 0; $each f in $fields(Empty) { acc = acc + 1; } ret acc; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { count(); ret 0; }\n")) { bad = 22; }
 
     ret bad;
 }
@@ -6511,10 +7074,13 @@ fun ut_has_extern_fn(s: *session.Session, m: *ir.Module, needle: str) bool {
 # reaches lowering's comptime-const fold - which read main's own table, keyed by
 # the bare leaf name, and answered 707. silently, and only because the names
 # collide. the fold now reads the DECLARING module's table: 909 appears exactly
-# once (the qualified read) and 707 never appears as an instruction operand (it
-# survives only as main's own global initialiser). the same project pins the two
-# shapes that must not change: the unqualified local `X` still loads main's own
-# global, and a qualified `b.Y` with no colliding name still resolves to b
+# once (the qualified read) and 707 exactly once (main's own unqualified read). a
+# fold answering the qualified read from main's table would put 707 twice and 909
+# never, so the pair of counts is what discriminates. every module-level `val` read
+# folds since #2206, so the same project pins what that left alone: main's own `X`
+# keeps its storage, initialised to 707, for an address-of or a module that cannot
+# fold - nothing loads it any more - and `b.Y`, with no colliding name, still folds
+# to b's value
 test "mach.lang.driver:qualified_const_ignores_local_val_shadow" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
@@ -6538,19 +7104,19 @@ test "mach.lang.driver:qualified_const_ignores_local_val_shadow" {
     if (m == nil) { bad = 1; }
     or {
         if (ut_const_uses(m, 909) != 1) { bad = 1; }  # the qualified read folded to a's value
-        if (ut_const_uses(m, 707) != 0) { bad = 1; }  # main's own const never answers for it
+        if (ut_const_uses(m, 707) != 1) { bad = 1; }  # main's own const answers only its own read
 
-        # the unqualified local reference still reads main's own storage.
+        # main's own `val` keeps its storage - an address-of, or a module that
+        # cannot fold, still needs it - but no use loads it any more (#2206).
         val gx: i64 = ut_global_ix(?s, m, "4mainN1X");
         if (gx < 0) { bad = 1; }
         or {
-            if (ut_global_uses(m, gx::u32) == 0)                        { bad = 1; }
+            if (ut_global_uses(m, gx::u32) != 0)                        { bad = 1; }
             if ((?m.globals[gx::u32]).init.data.int_lit != 707)         { bad = 1; }
         }
 
-        # a qualified reference with no colliding name is untouched: it keeps
-        # reading b's storage through a cross-module extern global.
-        if (!ut_has_extern_global(?s, m, "1bN1Y")) { bad = 1; }
+        # a qualified reference with no colliding name folds to b's value.
+        if (ut_const_uses(m, 505) != 1) { bad = 1; }
     }
 
     project.dnit_project(?p);
@@ -6625,10 +7191,13 @@ test "mach.lang.driver:qualified_member_unexported_still_errors" {
 # the qualified module across a name collision (#2223)
 #
 # Only a comptime-foldable module-level `val` reaches lowering's constant fold, so
-# a `fun`, a `var`, a `def` alias and a function-local `val` were never affected -
-# this pins that, so a later change to the lookup cannot break them silently. each
-# reference must name module `a` in its mangled linkage name / folded size, not
-# main's same-named declaration
+# a `fun`, a `var` and a `def` alias were never affected - this pins that, so a
+# later change to the lookup cannot break them silently. each reference must name
+# module `a` in its mangled linkage name / folded size, not main's same-named
+# declaration. `a.L` is the `val` itself, and since #2206 it folds - which makes
+# `a.L + L` wholly constant, so the sum is what pins the pairing: a's 606 plus
+# main's own function-local 808 is 1414, where either substitution would yield
+# 1212 or 1616
 test "mach.lang.driver:qualified_member_kinds_unaffected" {
     var alloc: A.Allocator;
     if (O.is_some[str](page.make(?alloc))) { ret 1; }
@@ -6654,8 +7223,129 @@ test "mach.lang.driver:qualified_member_kinds_unaffected" {
         if (!ut_has_extern_global(?s, m, "1aN1G"))  { bad = 1; }  # the var read crossed to a
         if (ut_const_uses(m, 7) != 1)               { bad = 1; }  # $size_of(a.T) is a's [7]u8
         if (ut_const_uses(m, 9) != 0)               { bad = 1; }  # never main's [9]u8
-        if (!ut_has_extern_global(?s, m, "1aN1L"))  { bad = 1; }  # a function-local val never shadows
-        if (ut_const_uses(m, 808) != 1)             { bad = 1; }  # and still initialises its own slot
+        if (ut_const_uses(m, 1414) != 1)            { bad = 1; }  # a.L (606) + main's own local L (808)
+    }
+
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# a comptime type gate in a plain generic folds against the INSTANCE, not the
+# template parameter (#2257)
+#
+# `$type_of`'s operand resolver reads the semantic type of its operand directly -
+# it has no substitution of its own to apply - so it read the template's typing and
+# every instantiation of a gated generic selected the same arm, silently. The gate
+# names three distinct constants, so which arm each instance compiled is readable
+# from the operand counts: 111 for the u32 instance, 333 for the u64 one, and each
+# exactly once. Both were 0 before the instance body was re-typed.
+#
+# The two templates cover the two operand shapes: a `T` parameter read directly,
+# and a `T` local. Neither folded.
+test "mach.lang.driver:generic_type_gate_folds_per_instance" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = "fun byloc[T](s: T) i64 { var out: T = s;\n$if ($type_of(out) == u32) { ret 111; }\n$or ($type_of(out) == u64) { ret 333; }\n$or { ret 999; } }\nfun bypar[T](s: T) i64 {\n$if ($type_of(s) == u32) { ret 222; }\n$or ($type_of(s) == u64) { ret 444; }\n$or { ret 999; } }\npub fun p1(x: u32) i64 { ret byloc[u32](x); }\npub fun p2(y: u64) i64 { ret byloc[u64](y); }\npub fun p3(x: u32) i64 { ret bypar[u32](x); }\npub fun p4(y: u64) i64 { ret bypar[u64](y); }\nfun main() i32 { ret 0; }\n";
+
+    val pr: R.Result[project.Project, outcome.Fail] = ut_lower_n(?s, ?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var bad: i32 = 0;
+    val m: *ir.Module = ut_ir_of(?p, ?s, "uniontest.main");
+    if (m == nil) { bad = 1; }
+    or {
+        if (ut_const_uses(m, 111) != 1) { bad = 1; }  # the u32 instance of the local gate
+        if (ut_const_uses(m, 333) != 1) { bad = 1; }  # the u64 instance took the OTHER arm
+        if (ut_const_uses(m, 222) != 1) { bad = 1; }  # and likewise over a bare parameter
+        if (ut_const_uses(m, 444) != 1) { bad = 1; }
+    }
+
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# a module-scope `val` folds at its use sites in its OWN module (#2206)
+#
+# The fold ran only after the mangled-name lookup missed, so the declaring module
+# always found its own global first and loaded it. The storage is still emitted -
+# an address-of needs it, as does a module that cannot fold - it is simply never
+# read: 6543 appears once as an operand and the global has no uses at all.
+test "mach.lang.driver:module_val_folds_in_declaring_module" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = "pub val N: i64 = 6543;\npub fun f() i64 { ret N; }\nfun main() i32 { ret 0; }\n";
+
+    val pr: R.Result[project.Project, outcome.Fail] = ut_lower_n(?s, ?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var bad: i32 = 0;
+    val m: *ir.Module = ut_ir_of(?p, ?s, "uniontest.main");
+    if (m == nil) { bad = 1; }
+    or {
+        if (ut_const_uses(m, 6543) != 1) { bad = 1; }  # the use folded to the value
+        val gx: i64 = ut_global_ix(?s, m, "4mainN1N");
+        if (gx < 0) { bad = 1; }
+        or {
+            if (ut_global_uses(m, gx::u32) != 0)                { bad = 1; }  # nothing loads it
+            if ((?m.globals[gx::u32]).init.data.int_lit != 6543) { bad = 1; }  # storage kept
+        }
+    }
+
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# a module-scope `val` reached through a module ALIAS folds too (#2206)
+#
+# `use x: pkg.a;` binds the alias, not the leaf name, so the old eligibility test -
+# "this module's comptime scope binds the bare name" - never held for `x.N` and the
+# reference declared a storage-less extern global and loaded through it. Keying on
+# the referent's declaration instead makes the alias spelling fold like any other.
+# The `val` whose initializer does NOT fold is the control on the same reference
+# path: it still reaches a's storage.
+test "mach.lang.driver:aliased_module_val_folds" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [2]str;
+    names[0] = "main.mach"; names[1] = "a.mach";
+    var texts: [2]str;
+    texts[0] = "use x: uniontest.a;\npub fun f() i64 { ret x.N; }\npub fun g() ptr { ret x.P; }\nfun main() i32 { ret 0; }\n";
+    texts[1] = "pub val N: i64 = 4321;\npub var G: i64 = 1;\npub val P: ptr = ?G;\n";
+
+    val pr: R.Result[project.Project, outcome.Fail] = ut_lower_n(?s, ?alloc, ?names[0], ?texts[0], 2);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var bad: i32 = 0;
+    val m: *ir.Module = ut_ir_of(?p, ?s, "uniontest.main");
+    if (m == nil) { bad = 1; }
+    or {
+        if (ut_const_uses(m, 4321) != 1)           { bad = 1; }  # the aliased read folded
+        if (ut_has_extern_global(?s, m, "1aN1N"))  { bad = 1; }  # and needs no storage here
+        if (!ut_has_extern_global(?s, m, "1aN1P")) { bad = 1; }  # an unfoldable val still does
     }
 
     project.dnit_project(?p);
