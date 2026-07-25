@@ -63,26 +63,39 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
 
 # report whether a function needs no compiler-generated prologue or epilogue
 #
-# Two disjoint reasons suppress the frame, and both require the same starting
-# point: the compiler allocated no frame of its own - no slots (`frame.size`), no
-# callee-saved GP or vector registers, and no outgoing-argument region.
+# Two disjoint reasons suppress the frame.
 #
-#   1. An inline-asm body owns the stack. The entry point `_start` reads the
-#      kernel-supplied stack pointer directly (`mov rdi, [rsp]` = argc), so a
-#      `push rbp` ahead of it would shift RSP and corrupt the argc/argv it
-#      extracts. The programmer's asm is the prologue; the compiler adds none.
-#      A body with asm in it is opaque, so this reason stands on its own - it
-#      does not additionally require the function to be a leaf.
+#   1. `#[naked]` (#2198). The author declared that this function's prologue,
+#      epilogue, stack alignment, link register and return are theirs. Nothing is
+#      derived and nothing is checked here - a declaration is not a proof
+#      obligation. Sema restricts a naked body to inline `asm`, so the compiler
+#      allocates nothing under it and the shapes the guards below reject cannot
+#      arise anyway.
 #
-#   2. The frame is provably unused (#1940). A function that calls nothing and
-#      addresses nothing through the frame or stack pointer cannot observe the
-#      difference between having a frame record and not having one, so the
-#      `push rbp; mov rbp, rsp` / `mov rsp, rbp; pop rbp` pair is pure cost. The
-#      leaf requirement is load-bearing rather than conservative: entry RSP is
-#      8 mod 16, and the frame-pointer push is what restores the 16-byte call
-#      boundary the ABI demands, so a function that both omits the push and makes
-#      a call would hand its callee a misaligned stack. Making no call, it never
-#      reaches a call boundary and the alignment is unobservable.
+#   2. The frame is provably unused (#1940). A function that allocated no frame of
+#      its own - no slots (`frame.size`), no callee-saved GP or vector registers,
+#      no outgoing-argument region - and that calls nothing and addresses nothing
+#      through the frame or stack pointer cannot observe the difference between
+#      having a frame record and not having one, so the `push rbp; mov rbp, rsp` /
+#      `mov rsp, rbp; pop rbp` pair is pure cost.
+#
+# The leaf requirement in reason 2 is load-bearing rather than conservative, and
+# for a different reason on each ISA. On x86-64 entry RSP is 8 mod 16 and the
+# frame-pointer push is what restores the 16-byte call boundary the ABI demands,
+# so a frameless function that made a call would hand its callee a stack SysV
+# forbids. On aarch64 and riscv64 `bl` / `jalr` write the link register instead of
+# pushing, so alignment survives - but the prologue is also the only thing that
+# saves that register, and a frameless function that made a call would have its
+# own return address overwritten by the call and `ret` back into itself, forever.
+# Making no call, a function reaches neither failure.
+#
+# An inline-asm body used to be a third reason, standing on its own and tolerating
+# a call (#2283). It does not: the two failures above are exactly what
+# `std.system.os.linux.shared.terminate` was compiled into on `dev`, and it
+# survived only because `exit_group` never returns. A function that merely
+# CONTAINS asm is not asking to own its frame; one that says `#[naked]` is. An
+# asm-only leaf still omits its frame, now through reason 2 - an asm payload
+# contributes no MIR operand, so such a function satisfies the scan on its own.
 #
 # The frame-reference scan is what excludes an incoming stack parameter: those
 # are lowered to `[fp + incoming_arg_base + off]` (`mir.abi.emit_param_slot`) and
@@ -98,6 +111,8 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
 # sp:   the target's stack-pointer register id
 # ret:  true when the encoder must emit neither prologue nor epilogue
 pub fun omits_frame(func: *mir.MirFunction, fp: u32, sp: u32) bool {
+    if (func.naked) { ret true; }
+
     if (func.frame.size != 0)          { ret false; }
     if (func.callee_mask != 0)         { ret false; }
     if (func.callee_mask_fp != 0)      { ret false; }
@@ -112,10 +127,6 @@ pub fun omits_frame(func: *mir.MirFunction, fp: u32, sp: u32) bool {
         var ii: u32 = 0;
         for (ii < blk.instr_count) {
             val mi: *mir.MirInstr = ?blk.instrs[ii];
-            # an inline-asm block survives selection under a per-target opcode
-            # (x86-64 retags it to ASM_BLOCK), but its payload pointer is set on
-            # every target - so the payload, not the opcode, identifies it.
-            if (mi.asm_block != nil) { ret true; }
             if (mi.opcode == mir.MIR_CALL) { calls = true; }
             var oi: u32 = 0;
             for (oi < mi.operand_count) {
@@ -348,6 +359,7 @@ fun mk_func(blk: *mir.MirBlock, func: *mir.MirFunction, instrs: *mir.MirInstr, n
     func.frame.omit          = false;
     func.callee_mask         = 0;
     func.callee_mask_fp      = 0;
+    func.naked               = false;
 }
 
 # fill `mi` as an instruction with no operands
@@ -481,31 +493,68 @@ test "mach.lang.be.codegen.frame.omits_frame:frame_relative_operand_keeps_the_fr
     ret 0;
 }
 
-# an inline-asm body owns the stack, so it omits the frame on its own terms - even
-# with a call in the same body, which no other reason tolerates. this is the
-# pre-existing naked-function rule (`_start` reads the kernel-supplied stack pointer
-# directly, and a `push rbp` ahead of it would corrupt the argc/argv it extracts);
-# removing the `asm_block` arm changes the emitted entry point, not just an
-# optimization
-test "mach.lang.be.codegen.frame.omits_frame:asm_body_owns_the_stack" {
+# an inline-asm body carries no weight of its own (#2283). an asm-only leaf still
+# omits its frame - through the leaf rule, since an asm payload contributes no MIR
+# operand - but an asm body that also makes a call is framed like any other caller.
+# restoring the old `if (mi.asm_block != nil) { ret true; }` arm fails the second
+# half here, and it is a hang on aarch64 / riscv64 rather than a lost optimization:
+# the call overwrites the link register the omitted prologue never saved
+test "mach.lang.be.codegen.frame.omits_frame:asm_alone_omits_asm_with_a_call_does_not" {
     var payload: mir.MirAsm;
 
+    var leaf: [2]mir.MirInstr;
+    mk_instr(?leaf[0], mir.MIR_ASM);
+    leaf[0].asm_block = ?payload;
+    mk_instr(?leaf[1], mir.MIR_RET);
+
+    var blk: mir.MirBlock;
+    var func: mir.MirFunction;
+    mk_func(?blk, ?func, ?leaf[0], 2);
+    if (!omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+
+    var calling: [2]mir.MirInstr;
+    mk_instr(?calling[0], mir.MIR_ASM);
+    calling[0].asm_block = ?payload;
+    mk_instr(?calling[1], mir.MIR_CALL);
+    mk_func(?blk, ?func, ?calling[0], 2);
+    if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+
+    # an asm body still needs the frame the compiler allocated under it
+    mk_func(?blk, ?func, ?leaf[0], 2);
+    func.frame.size = 8;
+    if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+
+    ret 0;
+}
+
+# `#[naked]` omits the frame by declaration, so it answers true through every
+# disqualifier the derived reason rejects: allocated slots, callee-saved registers,
+# an outgoing-argument region, a call, and a frame-pointer-relative operand. deleting
+# the `func.naked` arm fails this and leaves the decorator emitting a prologue the
+# author forbade
+test "mach.lang.be.codegen.frame.omits_frame:naked_omits_unconditionally" {
+    var ops: [1]mir.MirOperand;
+    ops[0] = mir.op_mem_preg(TEST_FP, 16);
+
     var instrs: [2]mir.MirInstr;
-    mk_instr(?instrs[0], mir.MIR_ASM);
-    instrs[0].asm_block = ?payload;
-    mk_instr(?instrs[1], mir.MIR_CALL);
+    mk_instr(?instrs[0], mir.MIR_CALL);
+    mk_instr(?instrs[1], mir.MIR_LOAD);
+    instrs[1].operands      = ?ops[0];
+    instrs[1].operand_count = 1;
 
     var blk: mir.MirBlock;
     var func: mir.MirFunction;
     mk_func(?blk, ?func, ?instrs[0], 2);
+    func.frame.size          = 32;
+    func.callee_mask         = 1 << 3;
+    func.callee_mask_fp      = 1 << 6;
+    func.frame.outgoing_size = 16;
 
-    if (!omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
-
-    # an asm body still needs the frame the compiler allocated under it
-    mk_func(?blk, ?func, ?instrs[0], 2);
-    func.frame.size = 8;
+    # every guard above says "keep the frame" ...
     if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
-
+    # ... and the declaration overrides all of them.
+    func.naked = true;
+    if (!omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
     ret 0;
 }
 
