@@ -83,5 +83,6 @@ arch-dispatched `asm`.
 
 ## See also
 
+- [decorators.md](decorators.md#naked--no-prologue-no-epilogue-body-as-written) — `#[naked]`, whose body may hold only `asm`
 - [policy.md](policy.md) — compiler vs stdlib boundary
 - [comptime-control.md](comptime-control.md) — `$if` over `$mach.build.arch`

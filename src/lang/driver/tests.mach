@@ -3882,6 +3882,228 @@ test "mach.lang.driver:noinline_decorator_survives_object_all_isas" {
     ret 0;
 }
 
+# the emitted byte span of function symbol `name` in `image`: from its own offset to
+# the next function symbol's, or to the end of its section when it is the last. the
+# encoder leaves `Symbol.size` zero for a function, so the span is derived the same way
+# the DWARF producer derives it
+# ---
+# image: the object image to measure
+# name:  the interned linkage name to find
+# ret:   the function's byte span, or -1 when the symbol is absent
+fun ut_fn_text_span(image: *of.ObjectImage, name: intern.StrId) i64 {
+    var sec: u32 = 0xFFFFFFFF;
+    var lo: u32 = 0;
+    var i: u32 = 0;
+    for (i < image.symbol_count) {
+        val sym: *of.Symbol = ?image.symbols[i];
+        if ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0 && sym.name == name) { sec = sym.section; lo = sym.offset; }
+        i = i + 1;
+    }
+    if (sec == 0xFFFFFFFF)          { ret -1; }
+    if (sec >= image.section_count) { ret -1; }
+
+    # the next function start in the same section bounds this one; nothing beyond it
+    # does, so the section length bounds the last.
+    var hi: u32 = image.sections[sec].len;
+    var j: u32 = 0;
+    for (j < image.symbol_count) {
+        val sym: *of.Symbol = ?image.symbols[j];
+        if ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0 && sym.section == sec
+            && sym.offset > lo && sym.offset < hi) { hi = sym.offset; }
+        j = j + 1;
+    }
+    ret (hi - lo)::i64;
+}
+
+# compile `src` for `target_name` and return the emitted byte spans of its `nk` and
+# `bare` functions through the out parameters
+# ---
+# target_name: a `[target.*]` entry from ut_manifest's six-target manifest
+# src:         the fixture, defining `nk` (naked) and `bare` with identical asm bodies
+# naked_out:   out - the naked function's span, or -1
+# bare_out:    out - the undecorated twin's span, or -1
+# ret:         0 when the build and both lookups succeeded, 1 otherwise
+fun ut_naked_spans(target_name: str, src: str, naked_out: *i64, bare_out: *i64) i32 {
+    @naked_out = -1;
+    @bare_out = -1;
+
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = src;
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val rr: R.Result[bool, str] = driver.setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val pr: R.Result[project.Project, outcome.Fail] = driver.build_project(?s, root, target_name);
+    fs.remove_all(?alloc, root);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var bad: i32 = 1;
+    if (R.is_err[bool, outcome.Fail](passes.run_sema_pass(?p)))  { project.dnit_project(?p); session.dnit(?s); ret 1; }
+    if (R.is_err[bool, outcome.Fail](passes.run_lower_pass(?p))) { project.dnit_project(?p); session.dnit(?s); ret 1; }
+
+    val mid: session.ModuleId = ut_mid(?p, ?s, "uniontest.main");
+    if (mid != session.MODULE_NIL) {
+        val me: *project.ModuleEntry = ?p.modules[mid::u32];
+        if (me.ir_module != nil) {
+            val cg: R.Result[of.ObjectImage, str] =
+                codegen.codegen_module(?s, ?p.target, me.ir_module, nil, codegen.no_debug());
+            if (R.is_ok[of.ObjectImage, str](cg)) {
+                var image: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](cg);
+                val nk: R.Result[intern.StrId, str] = intern.intern(?s.interner, "nk");
+                val br: R.Result[intern.StrId, str] = intern.intern(?s.interner, "bare");
+                if (R.is_ok[intern.StrId, str](nk) && R.is_ok[intern.StrId, str](br)) {
+                    @naked_out = ut_fn_text_span(?image, R.unwrap_ok[intern.StrId, str](nk));
+                    @bare_out  = ut_fn_text_span(?image, R.unwrap_ok[intern.StrId, str](br));
+                    if (@naked_out >= 0 && @bare_out >= 0) { bad = 0; }
+                }
+                obj.dnit(?image);
+            }
+        }
+    }
+
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# a `#[naked]` function emits EXACTLY its inline asm - no prologue, no epilogue, and
+# no terminator (#2198). the fixture's body is one `nop`, so the naked span is one
+# instruction and the undecorated twin's is two: the same `nop` plus the compiler's
+# `ret`. that single-instruction delta is the whole contract, read off the object.
+#
+# mutating `mir.emits_instr` to answer true unconditionally makes the naked span equal
+# the bare one and fails every line here; the spans are asserted absolutely rather than
+# only against each other, so a mutation that suppressed BOTH functions' returns would
+# fail too
+test "mach.lang.driver:naked_emits_only_its_asm_all_isas" {
+    var nk: i64 = -1;
+    var br: i64 = -1;
+
+    # identical bodies per ISA, so every byte of difference is the decorator's doing;
+    # the symbol names are pinned so the lookup needs no mangling rule.
+    val x64: str = "#[naked] #[symbol(\"nk\")]\npub fun nk() { asm x86_64 { nop } }\n#[symbol(\"bare\")]\npub fun bare() { asm x86_64 { nop } }\nfun main() i64 { ret 0; }\n";
+    val a64: str = "#[naked] #[symbol(\"nk\")]\npub fun nk() { asm aarch64 { nop } }\n#[symbol(\"bare\")]\npub fun bare() { asm aarch64 { nop } }\nfun main() i64 { ret 0; }\n";
+    val rv:  str = "#[naked] #[symbol(\"nk\")]\npub fun nk() { asm riscv64 { nop } }\n#[symbol(\"bare\")]\npub fun bare() { asm riscv64 { nop } }\nfun main() i64 { ret 0; }\n";
+
+    # x86_64: `nop` is one byte, `ret` (0xC3) is one more.
+    if (ut_naked_spans("linux", x64, ?nk, ?br) != 0) { ret 1; }
+    if (nk != 1 || br != 2) { ret 1; }
+
+    # aarch64 and riscv64 are fixed four-byte instruction words.
+    if (ut_naked_spans("linux-arm64", a64, ?nk, ?br) != 0) { ret 1; }
+    if (nk != 4 || br != 8) { ret 1; }
+
+    if (ut_naked_spans("linux-riscv64", rv, ?nk, ?br) != 0) { ret 1; }
+    if (nk != 4 || br != 8) { ret 1; }
+    ret 0;
+}
+
+# `#[naked]` propagates to a generic instance (#2198). an instance is lowered through
+# its own path, which carries only the decorators named there - so an instance that
+# silently gained the prologue its template forbade would be a miscompile with nothing
+# in the source to point at. deleting the FN_FLAG_NAKED line in `lower_weak_instance`
+# leaves the weak instance unflagged and fails here
+test "mach.lang.driver:naked_propagates_to_a_generic_instance" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = "#[naked]\npub fun nk[T]() { asm x86_64 { nop } }\nfun main() i64 { nk[i64](); ret 0; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val rr: R.Result[bool, str] = driver.setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val pr: R.Result[project.Project, outcome.Fail] = driver.build_project(?s, root, "linux");
+    fs.remove_all(?alloc, root);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var bad: i32 = 1;
+    if (R.is_err[bool, outcome.Fail](passes.run_sema_pass(?p)))  { project.dnit_project(?p); session.dnit(?s); ret 1; }
+    if (R.is_err[bool, outcome.Fail](passes.run_lower_pass(?p))) { project.dnit_project(?p); session.dnit(?s); ret 1; }
+
+    val mid: session.ModuleId = ut_mid(?p, ?s, "uniontest.main");
+    if (mid != session.MODULE_NIL) {
+        val me: *project.ModuleEntry = ?p.modules[mid::u32];
+        if (me.ir_module != nil) {
+            val m: *ir.Module = me.ir_module;
+            # the one monomorphized instance in this module: weak, with a body.
+            var instances: u32 = 0;
+            var flagged: u32 = 0;
+            var fi: u32 = 0;
+            for (fi < m.function_len) {
+                val fn: *ir.Function = ?m.functions[fi];
+                if ((fn.flags & ir.FN_FLAG_WEAK) != 0 && fn.block_count > 0) {
+                    instances = instances + 1;
+                    if ((fn.flags & ir.FN_FLAG_NAKED) != 0) { flagged = flagged + 1; }
+                }
+                fi = fi + 1;
+            }
+            # a count other than one means the fixture shape changed under the test.
+            if (instances == 1 && flagged == 1) { bad = 0; }
+        }
+    }
+
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# a `#[naked]` body may hold only inline `asm` (#2198). every other statement lowers
+# to code that assumes a frame the function does not have, and the result runs and
+# returns a wrong answer rather than failing - so each shape is rejected with the
+# body-restriction diagnostic, and the asm-only body it exists to permit is accepted.
+# deleting `check_naked_body` makes all five rejections pass and the guard vanish
+test "mach.lang.driver:naked_body_admits_only_asm" {
+    val restrict: str = "a `naked` function's body may contain only inline `asm` statements";
+
+    # a local declaration, an expression statement, an explicit `ret`, a loop, and a
+    # runtime `if` - one per statement family that could carry compiler-written code.
+    if (ut_vec_diag("#[naked]\nfun f() { var x: i64 = 0; }\n", restrict) != 0)            { ret 1; }
+    if (ut_vec_diag("#[naked]\nfun f() { g(); }\nfun g() {}\n", restrict) != 0)          { ret 1; }
+    if (ut_vec_diag("#[naked]\nfun f() i64 { ret 1; }\n", restrict) != 0)                 { ret 1; }
+    if (ut_vec_diag("#[naked]\nfun f() { for (false) {} }\n", restrict) != 0)             { ret 1; }
+    if (ut_vec_diag("#[naked]\nfun f() { if (false) {} }\n", restrict) != 0)              { ret 1; }
+    # a bodiless declaration has no body to restrict, and is refused as such.
+    if (ut_vec_diag("#[naked]\next fun f();\n", "`naked` decorator applies only to a function with a body") != 0) { ret 1; }
+    # and the shape the decorator exists for is clean, including the per-ISA `$if`
+    # dispatch that is how mach spells an arch-specific asm body.
+    if (!ut_sema_clean("#[naked]\nfun f() { asm x86_64 { nop } }\n")) { ret 1; }
+    if (!ut_sema_clean("#[naked]\nfun f() {\n    $if ($mach.build.arch == $mach.arch.x86_64) { asm x86_64 { nop } }\n    $or { asm aarch64 { nop } }\n}\n")) { ret 1; }
+    ret 0;
+}
+
+# `#[naked]` refuses the two decorators that cannot mean anything alongside it, and
+# refuses the non-function targets, each with its own diagnostic (#2198). deleting
+# any one of the four checks in `validate_naked` fails exactly one line here
+test "mach.lang.driver:naked_decorator_rejections" {
+    if (ut_vec_diag("#[naked] #[inline]\nfun f() { asm x86_64 { nop } }\n",
+        "`naked` and `inline` decorators are mutually exclusive; a naked function cannot be inlined") != 0) { ret 1; }
+    if (ut_vec_diag("#[naked] #[oblivious]\nfun f() { asm x86_64 { nop } }\n",
+        "`naked` and `oblivious` decorators are mutually exclusive; a naked body is inline asm, which `oblivious` forbids") != 0) { ret 1; }
+    if (ut_vec_diag("#[naked]\nvar g: i64 = 0;\n",
+        "`naked` decorator applies only to functions") != 0) { ret 1; }
+    if (ut_vec_diag("#[naked(1)]\nfun f() { asm x86_64 { nop } }\n",
+        "`naked` decorator takes no arguments") != 0) { ret 1; }
+    ret 0;
+}
+
 # driver incremental: editing one dependency's body re-lowers it and its importer
 # (the importer inlines nothing here, but has no per-hop lowering firewall so it
 # conservatively re-lowers), while an independent sibling module's Q_LOWER is
