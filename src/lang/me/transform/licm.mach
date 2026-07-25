@@ -1,0 +1,745 @@
+# mach.lang.me.transform.licm: loop-invariant code motion (#2204)
+#
+# Moves work that does not change across a loop's iterations out of the loop body
+# into the loop's dedicated preheader, so it is computed once on entry instead of
+# once per iteration. Two motions, both driven by the #2139 loop analysis
+# (dominators, natural loops, `is_invariant`) rather than a second loop pass:
+#
+#   - WHOLE-INSTRUCTION HOISTING. An instruction whose every operand is invariant
+#     and which is safe to execute unconditionally is relocated to the preheader.
+#     This covers invariant address arithmetic, casts and ALU work, and -- under
+#     the stricter load rule below -- an invariant load, including the backing
+#     global of a module-scope `val` reloaded as a loop bound every iteration.
+#
+#   - INVARIANT GEP-PREFIX SPLITTING. `gep(@g, 0, i)` over a module-scope array is
+#     not invariant (the index varies), yet its leading `@g + 0` walk is a
+#     link-time constant the back end otherwise rematerializes every iteration (an
+#     `lea` of the symbol before the indexed `lea`). The invariant leading index
+#     prefix is split into its own preheader gep and the body gep is rebased onto
+#     it, so the symbol address is materialized once. The split is exact: the
+#     prefix gep replays the original walk's first k index steps from the same
+#     source pointee, and the body gep restarts from the type that walk descended
+#     into.
+#
+# SAFETY CONDITION. The preheader executes whenever the loop is REACHED, including
+# when the loop then trips zero times, so hoisting is legal only for a computation
+# that is safe to execute speculatively:
+#
+#   1. The loop has a DEDICATED preheader (`Loop.preheader != BLOCK_NIL`): a block
+#      whose sole successor is the header. Anything placed there runs exactly once
+#      per loop entry and on no other path.
+#   2. Every operand is loop-invariant, so the value computed is the same one the
+#      body computed. Invariance also implies each operand's definition dominates
+#      the preheader, so the relocated instruction is still in SSA form.
+#   3. The opcode is pure (`instruction.is_pure`: no store, call, alloca, inline
+#      asm, memzero, phi, or terminator) and cannot fault. Division and remainder
+#      are excluded -- a zero or INT_MIN/-1 divisor traps, and a loop that trips
+#      zero times must not fault because work was hoisted out of it. Integer and
+#      float arithmetic, comparisons, casts, geps, extract/insert and declassify
+#      cannot fault and are hoisted. Poison-generating flags (nsw/nuw/exact) are
+#      preserved rather than dropped: every USE of the hoisted value stays inside
+#      the loop, so a poison value is consumed exactly where it was before.
+#   4. A LOAD additionally requires that its address is UNCONDITIONALLY
+#      DEREFERENCEABLE and that nothing in the loop can write it:
+#        a. the address resolves, through gep / bitcast steps with only constant
+#           indices, to a module-scope global at a compile-time byte offset, and
+#           that offset plus the loaded type's size lies inside the global's own
+#           storage. A module-scope object is mapped for the process lifetime, so
+#           the load cannot trap however many times the loop trips.
+#        b. the loop body contains no call and no inline asm (either may write any
+#           memory), and no store or memzero whose pointer may alias that global.
+#           Aliasing is decided on the pointer's root: a different named global or
+#           an alloca (a distinct stack object) cannot alias it; anything else --
+#           a parameter, a loaded pointer, a phi -- may, and declines the hoist.
+#   5. Volatile loads and stores are never moved.
+#
+# The pass runs in the release pipeline only, so debug output is unchanged. It is
+# safe inside an `#[oblivious]` function: every decision is made from the static IR
+# shape and never from a runtime value, no control flow is introduced, nothing is
+# eliminated, and a hoisted load's address is a link-time constant carrying no
+# secret -- so the constant-time contract (#1646) is preserved.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.system.panic.panic;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.intern;
+use mach.lang.me.ir;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.target;
+use loops: mach.lang.me.analysis.loops;
+use dep: mach.lang.me.analysis.dependence;
+
+# hoist loop-invariant work out of every loop in every function of `m`
+#
+# Never changes the CFG: instructions are relocated between existing blocks and at
+# most one gep per split is added, so the loop analysis computed once per function
+# stays valid for the whole function (each move is reported through
+# `loops.set_instr_block`). Loops are processed innermost-first, so a value lifted
+# out of an inner loop is a candidate for the enclosing one in the same pass.
+# ---
+# m:   the module to transform in place
+# tgt: the target, supplying the pointer width the object-size proofs need
+# ret: ok(true) if anything moved, ok(false) if nothing did, or an allocation error
+pub fun run(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
+    var changed: bool = false;
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        if (fn.block_count == 0 || (fn.flags & ir.FN_FLAG_EXTERN) != 0) { fi = fi + 1; cnt; }
+        val rf: R.Result[bool, str] = licm_function(m, fn, tgt);
+        if (R.is_err[bool, str](rf)) { ret rf; }
+        if (R.unwrap_ok[bool, str](rf)) { changed = true; }
+        fi = fi + 1;
+    }
+    ret R.ok[bool, str](changed);
+}
+
+# hoist out of one function's loops
+# ---
+# m:   module owning the allocator
+# fn:  the function to transform in place
+# tgt: the target
+# ret: ok(true) if anything moved, or an allocation error
+fun licm_function(m: *ir.Module, fn: *ir.Function, tgt: *target.Target) R.Result[bool, str] {
+    val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, m.alloc);
+    if (R.is_err[loops.LoopAnalysis, str](ral)) { ret R.err[bool, str](R.unwrap_err[loops.LoopAnalysis, str](ral)); }
+    var la: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ral);
+    if (la.loop_len == 0) { loops.dnit(?la); ret R.ok[bool, str](false); }
+
+    val n: u32 = la.loop_len;
+    val ro: R.Result[*u32, str] = A.allocate[u32](m.alloc, n::usize);
+    if (R.is_err[*u32, str](ro)) { loops.dnit(?la); ret R.err[bool, str](R.unwrap_err[*u32, str](ro)); }
+    val order: *u32 = R.unwrap_ok[*u32, str](ro);
+    order_innermost_first(?la, order);
+
+    var changed: bool = false;
+    var oi: u32 = 0;
+    for (oi < n) {
+        val rl: R.Result[bool, str] = licm_loop(m, fn, ?la, order[oi], tgt);
+        if (R.is_err[bool, str](rl)) {
+            A.deallocate[u32](m.alloc, order, n::usize);
+            loops.dnit(?la);
+            ret rl;
+        }
+        if (R.unwrap_ok[bool, str](rl)) { changed = true; }
+        oi = oi + 1;
+    }
+
+    A.deallocate[u32](m.alloc, order, n::usize);
+    loops.dnit(?la);
+    ret R.ok[bool, str](changed);
+}
+
+# fill `order` with loop indices sorted by descending nesting depth
+#
+# A selection sort taking the FIRST maximum, so equal-depth loops keep their
+# analysis order and the pass is deterministic. Innermost-first matters: an
+# instruction lifted into an inner loop's preheader sits in the enclosing loop's
+# body, where the enclosing loop's turn can lift it again.
+# ---
+# la:    the analysis
+# order: receives `la.loop_len` loop indices, deepest first
+fun order_innermost_first(la: *loops.LoopAnalysis, order: *u32) {
+    var i: u32 = 0;
+    for (i < la.loop_len) { order[i] = i; i = i + 1; }
+
+    var a: u32 = 0;
+    for (a < la.loop_len) {
+        var best: u32 = a;
+        var b: u32 = a + 1;
+        for (b < la.loop_len) {
+            if (la.loops[order[b]].depth > la.loops[order[best]].depth) { best = b; }
+            b = b + 1;
+        }
+        val t: u32 = order[a];
+        order[a]    = order[best];
+        order[best] = t;
+        a = a + 1;
+    }
+}
+
+# hoist out of one loop
+#
+# Body blocks are walked in reverse postorder and their instructions in program
+# order, so a definition is always visited before its uses: a chain of invariant
+# computations lifts in one sweep. A hoisted instruction is dropped from the body
+# block's list (compacted in place through `w`) and appended to the preheader,
+# which sits before the preheader's terminator because a block's terminator is not
+# part of its instruction list.
+# ---
+# m:   module owning the allocator
+# fn:  the function
+# la:  the loop analysis, kept in step with every move
+# lx:  index into la.loops
+# tgt: the target
+# ret: ok(true) if anything moved, or an allocation error
+fun licm_loop(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, tgt: *target.Target) R.Result[bool, str] {
+    val lp: *loops.Loop = ?la.loops[lx];
+    val pre_id: id.BlockId = lp.preheader;
+    if (pre_id == id.BLOCK_NIL) { ret R.ok[bool, str](false); }
+
+    val opaque: bool = loop_has_opaque_effect(fn, la, lx);
+
+    var changed: bool = false;
+    var ri: u32 = 0;
+    for (ri < la.rpo_len) {
+        val b: id.BlockId = la.rpo[ri];
+        ri = ri + 1;
+        if (!loops.loop_contains(la, lx, b)) { cnt; }
+
+        val blk: *ir.Block = ?fn.blocks[b::u32];
+        var w: u32 = 0;
+        var k: u32 = 0;
+        for (k < blk.instr_count) {
+            val iid: id.InstructionId = blk.instructions[k];
+            k = k + 1;
+
+            if (hoistable(m, fn, la, lx, tgt, iid, opaque)) {
+                val rp: R.Result[bool, str] = ir.block_append_instr(m, ?fn.blocks[pre_id::u32], iid);
+                if (R.is_err[bool, str](rp)) { ret rp; }
+                val rs: R.Result[bool, str] = loops.set_instr_block(la, iid, pre_id);
+                if (R.is_err[bool, str](rs)) { ret rs; }
+                changed = true;
+                cnt;
+            }
+
+            val rg: R.Result[bool, str] = split_invariant_gep_prefix(m, fn, la, lx, iid, pre_id);
+            if (R.is_err[bool, str](rg)) { ret rg; }
+            if (R.unwrap_ok[bool, str](rg)) { changed = true; }
+
+            blk.instructions[w] = iid;
+            w = w + 1;
+        }
+        blk.instr_count = w;
+    }
+    ret R.ok[bool, str](changed);
+}
+
+# true when instruction `iid` may be relocated to the loop's preheader
+#
+# The safety condition stated in the module header, in one place. `opaque` is the
+# loop's precomputed "contains a call or inline asm" fact, which alone disqualifies
+# every load in it.
+# ---
+# m:      the module
+# fn:     the function
+# la:     the loop analysis
+# lx:     index into la.loops
+# tgt:    the target
+# iid:    candidate instruction
+# opaque: true when the loop body contains a call or inline asm
+# ret:    true when the instruction is invariant AND safe to execute speculatively
+fun hoistable(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, tgt: *target.Target,
+              iid: id.InstructionId, opaque: bool) bool {
+    if (iid::u32 >= fn.instr_len) { ret false; }
+    val k: instruction.InstrKind = fn.instrs[iid::u32].kind;
+
+    if (instruction.is_terminator(k))                                     { ret false; }
+    if (k == instruction.OP_PHI)                                          { ret false; }
+    if ((fn.instrs[iid::u32].flags & instruction.INSTR_FLAG_VOLATILE) != 0) { ret false; }
+    if (!operands_invariant(la, lx, ?fn.instrs[iid::u32]))                { ret false; }
+
+    if (k == instruction.OP_LOAD) {
+        if (opaque) { ret false; }
+        ret load_is_speculable(m, fn, la, lx, tgt, iid);
+    }
+
+    if (!instruction.is_pure(k)) { ret false; }
+    # a faulting divisor must keep the loop's control dependence: a zero-trip loop
+    # must not raise a division fault because the divide was lifted above the test.
+    if (k == instruction.OP_DIV_S || k == instruction.OP_DIV_U) { ret false; }
+    if (k == instruction.OP_REM_S || k == instruction.OP_REM_U) { ret false; }
+    ret true;
+}
+
+# true when every operand of `ins` is invariant across loop `lx`
+# ---
+# la:  the loop analysis
+# lx:  index into la.loops
+# ins: the instruction
+# ret: true when no operand changes across iterations
+fun operands_invariant(la: *loops.LoopAnalysis, lx: u32, ins: *instruction.Instruction) bool {
+    var i: u32 = 0;
+    for (i < ins.operand_count) {
+        if (!loops.is_invariant(la, lx, ins.operands[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# true when the loop body contains a call or inline asm
+#
+# Either may read and write any memory, which makes no load in the loop provably
+# invariant and no global provably unwritten.
+# ---
+# fn: the function
+# la: the loop analysis
+# lx: index into la.loops
+# ret: true when an opaque memory effect is present
+fun loop_has_opaque_effect(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32) bool {
+    val lp: *loops.Loop = ?la.loops[lx];
+    var bi: u32 = 0;
+    for (bi < lp.body_len) {
+        val blk: *ir.Block = ?fn.blocks[lp.body[bi]::u32];
+        var k: u32 = 0;
+        for (k < blk.instr_count) {
+            val ik: instruction.InstrKind = fn.instrs[blk.instructions[k]::u32].kind;
+            if (ik == instruction.OP_CALL || ik == instruction.OP_ASM) { ret true; }
+            k = k + 1;
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+# true when load `iid` may be executed unconditionally in the preheader
+#
+# Proves the address is a compile-time offset into a module-scope global whose
+# storage covers the loaded type, then that no write in the loop can reach it.
+# ---
+# m:   the module
+# fn:  the function
+# la:  the loop analysis
+# lx:  index into la.loops
+# tgt: the target, supplying the sizes the containment proof needs
+# iid: the load instruction
+# ret: true when the load is both trap-free and unwritten across the loop
+fun load_is_speculable(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32,
+                       tgt: *target.Target, iid: id.InstructionId) bool {
+    if (fn.instrs[iid::u32].operand_count < 1) { ret false; }
+
+    var gix: u32 = 0;
+    var off: u64 = 0;
+    if (!global_const_address(m, fn, tgt, fn.instrs[iid::u32].operands[0], ?gix, ?off)) { ret false; }
+
+    # both sizes are part of the containment proof, so an untyped load or global
+    # simply leaves it unproven.
+    val lty: ir_type.IrTypeId = fn.instrs[iid::u32].ty;
+    val gty: ir_type.IrTypeId = m.globals[gix].ty;
+    if (lty == ir_type.IRT_NIL || gty == ir_type.IRT_NIL) { ret false; }
+
+    # the accessed bytes must lie inside the global's own storage. computed without
+    # overflow so a wrapped (negative) constant index can never appear in range.
+    val gsz: u64 = ir_type.byte_size(?m.types, gty, tgt)::u64;
+    val lsz: u64 = ir_type.byte_size(?m.types, lty, tgt)::u64;
+    if (lsz == 0)        { ret false; }
+    if (off > gsz)       { ret false; }
+    if (lsz > gsz - off) { ret false; }
+
+    ret !loop_may_write_global(m, fn, la, lx, gix);
+}
+
+# resolve `p` to a module-scope global plus a compile-time byte offset
+#
+# Walks gep and bitcast steps back toward the pointer's root, accumulating each
+# gep's constant displacement. Fails (leaving the outputs untouched) as soon as a
+# step is not a gep/bitcast, or a gep carries a non-constant index -- the offset
+# must be a link-time constant for the containment proof to mean anything.
+# ---
+# m:       the module
+# fn:      the function
+# tgt:     the target
+# p:       the pointer value to resolve
+# out_gix: receives the index into `m.globals`
+# out_off: receives the byte offset from the global's base
+# ret:     true when the address is a constant offset into a module-scope global
+fun global_const_address(m: *ir.Module, fn: *ir.Function, tgt: *target.Target, p: value.Value,
+                         out_gix: *u32, out_off: *u64) bool {
+    var cur: value.Value = p;
+    var off: u64 = 0;
+    var steps: u32 = 0;
+
+    for (true) {
+        if (cur.kind == value.VAL_GLOBAL) {
+            @out_gix = cur.data.global_ix;
+            @out_off = off;
+            ret cur.data.global_ix < m.global_len;
+        }
+        if (cur.kind != value.VAL_INSTR) { ret false; }
+        val iid: id.InstructionId = cur.data.instr;
+        if (iid::u32 >= fn.instr_len) { ret false; }
+
+        val k: instruction.InstrKind = fn.instrs[iid::u32].kind;
+        if (k == instruction.OP_BITCAST) {
+            if (fn.instrs[iid::u32].operand_count < 1) { ret false; }
+            cur = fn.instrs[iid::u32].operands[0];
+        } or (k == instruction.OP_GEP) {
+            var d: u64 = 0;
+            if (!gep_const_disp(m, fn, tgt, iid, ?d)) { ret false; }
+            off = off + d;
+            cur = fn.instrs[iid::u32].operands[0];
+        } or {
+            ret false;
+        }
+
+        # each step moves to an operand, whose definition dominates this one, so the
+        # chain is acyclic in verified SSA and cannot outrun the instruction pool.
+        steps = steps + 1;
+        if (steps > fn.instr_len) { panic("mach.lang.me.transform.licm: cyclic pointer definition chain\n"); }
+    }
+    ret false;
+}
+
+# the constant byte displacement a gep's index walk contributes
+#
+# Replays the back end's getelementptr model -- index 0 strides over the source
+# pointee, each later index descends one aggregate level -- over constant indices
+# only. A non-constant index, a missing source pointee, or a walk off a
+# non-aggregate yields false.
+# ---
+# m:        the module
+# fn:       the function
+# tgt:      the target
+# iid:      the gep instruction
+# out_disp: receives the accumulated displacement
+# ret:      true when every index is constant and the walk is well-formed
+fun gep_const_disp(m: *ir.Module, fn: *ir.Function, tgt: *target.Target, iid: id.InstructionId, out_disp: *u64) bool {
+    val count: u32 = fn.instrs[iid::u32].operand_count;
+    if (count <= 1) { @out_disp = 0; ret true; }
+
+    var cur: ir_type.IrTypeId = fn.instrs[iid::u32].aux_ty;
+    if (cur == ir_type.IRT_NIL) { ret false; }
+
+    var disp: u64 = 0;
+    var k: u32 = 1;
+    for (k < count) {
+        val v: value.Value = fn.instrs[iid::u32].operands[k];
+        if (v.kind != value.VAL_CONST_INT) { ret false; }
+
+        if (k == 1) {
+            # the first index strides over the source pointee without descending.
+            disp = disp + v.data.int_lit * ir_type.byte_size(?m.types, cur, tgt)::u64;
+        } or {
+            var next: ir_type.IrTypeId = ir_type.IRT_NIL;
+            var is_field: bool = false;
+            if (!descend_level(m, cur, v, ?next, ?is_field)) { ret false; }
+            if (is_field) {
+                disp = disp + ir_type.byte_offset(?m.types, cur, v.data.int_lit::u32, tgt)::u64;
+            } or {
+                disp = disp + v.data.int_lit * ir_type.byte_size(?m.types, next, tgt)::u64;
+            }
+            cur = next;
+        }
+        k = k + 1;
+    }
+
+    @out_disp = disp;
+    ret true;
+}
+
+# descend one aggregate level of a gep index walk
+#
+# An array level continues in the element type and scales the index by its size; a
+# struct or union level names a field, so its index must be a constant ordinal and
+# it contributes that field's fixed offset. `out_field` distinguishes the two so a
+# caller accumulating a displacement picks the right rule. Anything else is not a
+# level a gep may walk.
+# ---
+# m:         the module
+# cur:       the aggregate type being descended
+# v:         the index value at this level
+# out_next:  receives the type one level deeper
+# out_field: receives true for a struct / union field level
+# ret:       true when the descent is well-formed
+fun descend_level(m: *ir.Module, cur: ir_type.IrTypeId, v: value.Value,
+                  out_next: *ir_type.IrTypeId, out_field: *bool) bool {
+    if (cur == ir_type.IRT_NIL) { ret false; }
+    val ct_opt: O.Option[*ir_type.IrType] = ir_type.get(?m.types, cur);
+    if (!O.is_some[*ir_type.IrType](ct_opt)) { ret false; }
+    val ct: *ir_type.IrType = O.unwrap[*ir_type.IrType](ct_opt);
+
+    if (ct.kind == ir_type.IRT_ARRAY) {
+        @out_next  = ct.data.array_.element;
+        @out_field = false;
+        ret true;
+    }
+
+    if (ct.kind == ir_type.IRT_STRUCT || ct.kind == ir_type.IRT_UNION) {
+        if (v.kind != value.VAL_CONST_INT)                      { ret false; }
+        if (v.data.int_lit >= ct.data.struct_.field_count::u64) { ret false; }
+        @out_next  = ct.data.struct_.fields[v.data.int_lit::u32];
+        @out_field = true;
+        ret true;
+    }
+
+    ret false;
+}
+
+# true when any write in the loop body may reach global `gix`
+#
+# Every store and memzero in the body is tested by pointer root: a different named
+# global and an alloca are distinct objects that cannot reach it; an unresolved root
+# may, and forces the conservative answer.
+# ---
+# m:   the module
+# fn:  the function
+# la:  the loop analysis
+# lx:  index into la.loops
+# gix: index into `m.globals` of the loaded object
+# ret: true when a write may alias the global
+fun loop_may_write_global(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, gix: u32) bool {
+    val lp: *loops.Loop = ?la.loops[lx];
+    var bi: u32 = 0;
+    for (bi < lp.body_len) {
+        val blk: *ir.Block = ?fn.blocks[lp.body[bi]::u32];
+        var k: u32 = 0;
+        for (k < blk.instr_count) {
+            val wid: id.InstructionId = blk.instructions[k];
+            k = k + 1;
+            val ik: instruction.InstrKind = fn.instrs[wid::u32].kind;
+
+            var dst: value.Value;
+            if (ik == instruction.OP_STORE) {
+                if (fn.instrs[wid::u32].operand_count < 2) { ret true; }
+                dst = fn.instrs[wid::u32].operands[1];
+            } or (ik == instruction.OP_MEMZERO) {
+                if (fn.instrs[wid::u32].operand_count < 1) { ret true; }
+                dst = fn.instrs[wid::u32].operands[0];
+            } or {
+                cnt;
+            }
+
+            if (may_alias_global(m, fn, dst, gix)) { ret true; }
+        }
+        bi = bi + 1;
+    }
+    ret false;
+}
+
+# true when writing through `p` may reach global `gix`
+# ---
+# m:   the module
+# fn:  the function
+# p:   the written pointer
+# gix: index into `m.globals` of the loaded object
+# ret: false only when the write provably targets a different object
+fun may_alias_global(m: *ir.Module, fn: *ir.Function, p: value.Value, gix: u32) bool {
+    val root: value.Value = pointer_root(fn, p);
+
+    if (root.kind == value.VAL_GLOBAL) {
+        if (root.data.global_ix == gix)      { ret true; }
+        if (root.data.global_ix >= m.global_len) { ret true; }
+        # two globals are the same object exactly when they are the same symbol;
+        # an unnamed entry cannot be told apart and stays a possible alias.
+        val a: intern.StrId = m.globals[root.data.global_ix].name;
+        val b: intern.StrId = m.globals[gix].name;
+        if (a == intern.STR_NIL || b == intern.STR_NIL) { ret true; }
+        ret a == b;
+    }
+
+    # a stack slot is a fresh object distinct from every module-scope global.
+    if (root.kind == value.VAL_INSTR) {
+        val iid: id.InstructionId = root.data.instr;
+        if (iid::u32 < fn.instr_len && fn.instrs[iid::u32].kind == instruction.OP_ALLOCA) { ret false; }
+    }
+
+    ret true;
+}
+
+# walk a pointer back through gep and bitcast steps to its root value
+#
+# Unlike `global_const_address` this places no constraint on the indices: it answers
+# "which object is this derived from", which is all the alias test needs.
+# ---
+# fn: the function
+# p:  the pointer value
+# ret: the root value the pointer is derived from
+fun pointer_root(fn: *ir.Function, p: value.Value) value.Value {
+    var cur: value.Value = p;
+    var steps: u32 = 0;
+    for (cur.kind == value.VAL_INSTR) {
+        val iid: id.InstructionId = cur.data.instr;
+        if (iid::u32 >= fn.instr_len) { ret cur; }
+        val k: instruction.InstrKind = fn.instrs[iid::u32].kind;
+        if (k != instruction.OP_GEP && k != instruction.OP_BITCAST) { ret cur; }
+        if (fn.instrs[iid::u32].operand_count < 1) { ret cur; }
+        cur = fn.instrs[iid::u32].operands[0];
+
+        steps = steps + 1;
+        if (steps > fn.instr_len) { panic("mach.lang.me.transform.licm: cyclic pointer definition chain\n"); }
+    }
+    ret cur;
+}
+
+# split a gep's loop-invariant leading index prefix into the preheader
+#
+# `gep(B, i0..in)` whose base and first k indices are invariant while index k is
+# not becomes `gep(gep(B, i0..i(k-1)), ik..in)`, with the prefix gep materialized
+# once in the preheader. The rewrite is exact: the prefix keeps the original source
+# pointee so it replays the original walk's first k steps, and the body gep's new
+# source pointee is the type that walk descended into at level k, so index k strides
+# over exactly what it strode over before. A struct level cannot be the split point
+# -- a field ordinal must be constant, hence invariant, hence inside the prefix.
+# ---
+# m:      the module
+# fn:     the function
+# la:     the loop analysis, updated with the new instruction's block
+# lx:     index into la.loops
+# iid:    the candidate gep
+# pre_id: the loop's preheader
+# ret:    ok(true) when the gep was split, or an allocation error
+fun split_invariant_gep_prefix(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32,
+                               iid: id.InstructionId, pre_id: id.BlockId) R.Result[bool, str] {
+    if (iid::u32 >= fn.instr_len)                          { ret R.ok[bool, str](false); }
+    if (fn.instrs[iid::u32].kind != instruction.OP_GEP)    { ret R.ok[bool, str](false); }
+    if (fn.instrs[iid::u32].aux_ty == ir_type.IRT_NIL)     { ret R.ok[bool, str](false); }
+
+    val count: u32 = fn.instrs[iid::u32].operand_count;
+    # a base plus at least two indices: one to hoist, one to leave behind.
+    if (count < 3) { ret R.ok[bool, str](false); }
+    if (!loops.is_invariant(la, lx, fn.instrs[iid::u32].operands[0])) { ret R.ok[bool, str](false); }
+
+    var k: u32 = 0;
+    for (k + 1 < count) {
+        if (!loops.is_invariant(la, lx, fn.instrs[iid::u32].operands[1 + k])) { brk; }
+        k = k + 1;
+    }
+    # nothing invariant to lift, or everything is (which whole-instruction hoisting
+    # already handles, and which would leave the body gep with no index at all).
+    if (k == 0 || k == count - 1) { ret R.ok[bool, str](false); }
+
+    var body_src: ir_type.IrTypeId = ir_type.IRT_NIL;
+    if (!gep_level_type(m, fn, iid, k, ?body_src)) { ret R.ok[bool, str](false); }
+
+    var prefix: id.InstructionId = find_prefix_gep(fn, ?fn.blocks[pre_id::u32], iid, k);
+    if (prefix == id.INSTR_NIL) {
+        val rn: R.Result[id.InstructionId, str] = emit_prefix_gep(m, fn, iid, k);
+        if (R.is_err[id.InstructionId, str](rn)) { ret R.err[bool, str](R.unwrap_err[id.InstructionId, str](rn)); }
+        prefix = R.unwrap_ok[id.InstructionId, str](rn);
+
+        val rp: R.Result[bool, str] = ir.block_append_instr(m, ?fn.blocks[pre_id::u32], prefix);
+        if (R.is_err[bool, str](rp)) { ret rp; }
+        val rs: R.Result[bool, str] = loops.set_instr_block(la, prefix, pre_id);
+        if (R.is_err[bool, str](rs)) { ret rs; }
+    }
+
+    # rebase the body gep onto the prefix, keeping only the indices from k on.
+    val rest: u32 = count - 1 - k;
+    val rb: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, (rest + 1)::usize);
+    if (R.is_err[*value.Value, str](rb)) { ret R.err[bool, str](R.unwrap_err[*value.Value, str](rb)); }
+    val ops: *value.Value = R.unwrap_ok[*value.Value, str](rb);
+
+    var pv: value.Value = value.instr(prefix, fn.instrs[prefix::u32].ty);
+    pv.secret = fn.instrs[prefix::u32].secret;
+    ops[0] = pv;
+    var j: u32 = 0;
+    for (j < rest) {
+        ops[1 + j] = fn.instrs[iid::u32].operands[1 + k + j];
+        j = j + 1;
+    }
+
+    ir.instr_replace_operands(m, ?fn.instrs[iid::u32], ops, rest + 1);
+    fn.instrs[iid::u32].aux_ty = body_src;
+    ret R.ok[bool, str](true);
+}
+
+# the source pointee the body gep restarts from after `k` hoisted indices
+#
+# Replays the index walk's descents for levels 1..k and reports the type level k
+# descends into, validating that every descended level is a gep-walkable aggregate
+# and that a struct level carries a constant ordinal.
+# ---
+# m:      the module
+# fn:     the function
+# iid:    the gep instruction
+# k:      number of leading indices moving to the prefix
+# out_ty: receives the type level k descends into
+# ret:    true when the walk is well-formed through level k
+fun gep_level_type(m: *ir.Module, fn: *ir.Function, iid: id.InstructionId, k: u32, out_ty: *ir_type.IrTypeId) bool {
+    var cur: ir_type.IrTypeId = fn.instrs[iid::u32].aux_ty;
+    # level 0 strides over the source pointee without descending, so a walk that
+    # only hoists it restarts from that same type.
+    if (k == 0) { @out_ty = cur; ret true; }
+
+    var j: u32 = 1;
+    for (j <= k) {
+        var next: ir_type.IrTypeId = ir_type.IRT_NIL;
+        var is_field: bool = false;
+        if (!descend_level(m, cur, fn.instrs[iid::u32].operands[1 + j], ?next, ?is_field)) { ret false; }
+        cur = next;
+        j = j + 1;
+    }
+    @out_ty = cur;
+    ret true;
+}
+
+# an identical prefix gep already present in the preheader, or INSTR_NIL
+#
+# Several arrays indexed in one loop hoist several prefixes; reusing an equal one
+# keeps the preheader from accumulating duplicates that later blocks would have to
+# carry. Equality is the same structural test local CSE uses: same source pointee,
+# same flags, same operand list.
+# ---
+# fn:  the function
+# pre: the preheader block
+# iid: the gep being split
+# k:   number of leading indices in the prefix
+# ret: the matching instruction id, or INSTR_NIL
+fun find_prefix_gep(fn: *ir.Function, pre: *ir.Block, iid: id.InstructionId, k: u32) id.InstructionId {
+    var i: u32 = 0;
+    for (i < pre.instr_count) {
+        val cid: id.InstructionId = pre.instructions[i];
+        i = i + 1;
+        if (fn.instrs[cid::u32].kind != instruction.OP_GEP)                 { cnt; }
+        if (fn.instrs[cid::u32].operand_count != k + 1)                     { cnt; }
+        if (fn.instrs[cid::u32].aux_ty != fn.instrs[iid::u32].aux_ty)       { cnt; }
+        if (fn.instrs[cid::u32].flags  != fn.instrs[iid::u32].flags)        { cnt; }
+
+        var same: bool = true;
+        var j: u32 = 0;
+        for (j < k + 1) {
+            if (!dep.equal(fn.instrs[cid::u32].operands[j], fn.instrs[iid::u32].operands[j])) { same = false; brk; }
+            j = j + 1;
+        }
+        if (same) { ret cid; }
+    }
+    ret id.INSTR_NIL;
+}
+
+# build the preheader gep carrying `iid`'s base and first `k` indices
+# ---
+# m:   the module
+# fn:  the function
+# iid: the gep being split
+# k:   number of leading indices in the prefix
+# ret: the new instruction's id, or an allocation error
+fun emit_prefix_gep(m: *ir.Module, fn: *ir.Function, iid: id.InstructionId, k: u32) R.Result[id.InstructionId, str] {
+    val ra: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, (k + 1)::usize);
+    if (R.is_err[*value.Value, str](ra)) { ret R.err[id.InstructionId, str](R.unwrap_err[*value.Value, str](ra)); }
+    val ops: *value.Value = R.unwrap_ok[*value.Value, str](ra);
+
+    var j: u32 = 0;
+    for (j < k + 1) {
+        ops[j] = fn.instrs[iid::u32].operands[j];
+        j = j + 1;
+    }
+
+    var ni: instruction.Instruction;
+    ni.kind          = instruction.OP_GEP;
+    ni.ty            = fn.instrs[iid::u32].ty;
+    ni.operands      = ops;
+    ni.operand_count = k + 1;
+    ni.operand_cap   = k + 1;
+    ni.flags         = fn.instrs[iid::u32].flags;
+    ni.aux_ty        = fn.instrs[iid::u32].aux_ty;
+    ni.loc           = fn.instrs[iid::u32].loc;
+    # the split address derives from the original, so it inherits its taint
+    # monotonically rather than being re-derived downward (#1646).
+    ni.secret        = fn.instrs[iid::u32].secret;
+
+    val ri: R.Result[id.InstructionId, str] = ir.instruction_add(m, fn, ni);
+    if (R.is_err[id.InstructionId, str](ri)) { A.deallocate[value.Value](m.alloc, ops, (k + 1)::usize); }
+    ret ri;
+}
