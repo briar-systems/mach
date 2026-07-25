@@ -1,0 +1,1612 @@
+# mach.lang.me.transform.sroa: scalar replacement of aggregates (#2205)
+#
+# Decomposes a small aggregate whose address never escapes into one stack slot per
+# field, so mem2reg can promote each field to an SSA register instead of leaving
+# the whole record in memory. `Result` / `Option` are records, so before this pass
+# every fallible stdlib call paid an alloca, a memzero, and a load/store round trip
+# per use; after it a register-sized payload and its tag reach registers.
+#
+# The pass rewrites storage, never values: it creates per-field slots, retargets the
+# existing field loads/stores onto them, expands a whole-aggregate memzero / copy
+# into per-field traffic, and erases the original slot. It builds no phis -- an
+# aggregate phi and every slot feeding it form one partition that shares a single set
+# of field slots, so the address merge becomes a merge of the slots' contents, and
+# the mem2reg run that follows turns those slots into the scalar phis.
+#
+# ESCAPE CONDITION (the whole legality argument). A candidate is an OP_ALLOCA of a
+# struct / array type (never a union: its fields overlap) with a constant count of
+# one, or an OP_PHI of that same type. Splitting is legal only when every reference
+# to the candidate is one of:
+#
+#   - the base of an OP_GEP whose first two indices are the constants `0, k` with
+#     `k` a valid field ordinal, and whose own result is used only as a load
+#     pointer, a store pointer, or the base of a further gep;
+#   - an OP_MEMZERO of the whole slot (alloca candidates only);
+#   - the pointer of a whole-aggregate OP_STORE (a copy into the slot) whose stored
+#     value is an address of the same aggregate type;
+#   - the value of a whole-aggregate OP_STORE whose destination is itself a
+#     candidate being split (so the destination has no observable padding, which a
+#     per-field copy would otherwise stop writing);
+#   - an incoming value of a candidate OP_PHI of the same partition;
+#   - an OP_DBG_VALUE operand, which is debug metadata and never a real address
+#     escape (treating it as one would make a `-g` build decline where a release
+#     build splits, breaking -g additivity).
+#
+# Anything else escapes and the candidate stays in memory: `?x` address-of (the raw
+# slot pointer reaching a call, a return, or a comparison), a `::` / `:~` reinterpret
+# (an OP_BITCAST of the slot), an inline-asm `{name}` binding, a by-value aggregate
+# argument, a store to a global, and any gep whose indices are not constant field
+# ordinals. `$fields` / `v.[f]` reflection projection resolves its ordinal at
+# comptime and lowers to exactly the constant gep above, so it splits and keeps its
+# field's secrecy rather than defeating the analysis. Escape is propagated over the
+# whole phi partition and to the source of every whole-aggregate copy, to a fixpoint.
+#
+# A phi partition carries two extra rules, both there to make one shared slot set
+# stand in for the several addresses the phi merges. The phi itself must be read-only
+# and local: every use of it lies in its own block, and that block writes no member,
+# so the shared slots are read exactly where the merge selected an incoming. And each
+# incoming slot must be self-contained: all of its own references lie in the one
+# block that defines it, and no other member's defining block is reachable from it
+# without passing the phi -- so on any path reaching the phi, the last member written
+# into the shared slots is exactly the one the phi selects.
+#
+# Secrecy (#1646) is monotone across the rewrite. Existing loads and stores are
+# retargeted, never rebuilt, so they keep their own taint; every instruction the pass
+# synthesizes for a candidate that touches secret storage is marked secret, so a `^T`
+# field cannot be laundered public by being moved into its own slot.
+#
+# Release pipeline only. A debug (`-O0`) build never runs it and stays byte-identical.
+
+use std.collections.map;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.me.ir;
+use mach.lang.me.ir.id;
+use mach.lang.me.ir.instruction;
+use mach.lang.me.ir.mutate;
+use ir_type: mach.lang.me.ir.type;
+use mach.lang.me.ir.value;
+use mach.lang.source;
+use mach.lang.target;
+
+# sentinel for an unset entry in a u32 index map
+val NONE_U32: u32 = 0xFFFFFFFF;
+
+# largest field count a split aggregate may have; bounds both the per-candidate slot
+# work and the register pressure a fully promoted record can create
+val MAX_FIELDS: u32 = 8;
+
+# largest byte footprint a split aggregate may have; keeps the pass on the small
+# records the `Result` / `Option` idiom is built from rather than on buffers
+val MAX_BYTES: u32 = 64;
+
+# how many times a function is re-split; one round peels one level of nesting, so
+# this bounds how deep a nested record is decomposed
+val MAX_ROUNDS: u32 = 4;
+
+# per-function working state
+#
+# Instruction-indexed maps are sized to the instruction pool snapshot taken at entry
+# (`pool_len`); candidate-indexed maps are sized to the same bound, since a function
+# cannot hold more candidates than instructions. Every owned array is freed in
+# `state_dnit` by its allocation size.
+# ---
+# alloc:      backing allocator (the module's)
+# m:          module under mutation
+# fn:         function being split
+# tgt:        target, consulted for aggregate byte sizes
+# pool_len:   snapshot of fn.instr_len at entry; sizes the instruction-indexed maps
+# instr_block: instruction id -> owning block, filled from the block lists (the
+#             liveness source of truth); BLOCK_NIL marks a pool ghost every sweep skips
+# cand_of:    instruction id -> candidate index, or NONE_U32
+# gep_of:     instruction id -> the candidate index a field gep addresses, or NONE_U32
+# gep_field:  instruction id -> the field ordinal a field gep selects
+# erase:      instruction id -> whether the rewrite superseded the instruction
+# cand_id:    per-candidate defining instruction id
+# cand_ty:    per-candidate aggregate type
+# cand_phi:   per-candidate: true for an OP_PHI candidate, false for an OP_ALLOCA
+# cand_nf:    per-candidate field count
+# cand_root:  per-candidate union-find parent (phi partitions)
+# cand_out:   per-candidate escape flag
+# cand_secret: per-candidate secrecy taint, joined over every reference
+# cand_home:  the block holding the candidate's references (its phi-incoming operands
+#             aside), or BLOCK_NIL before the first is seen
+# cand_local: whether every one of those references really is in cand_home
+# cand_slot:  start offset into `slots`, shared across a partition, or NONE_U32 when
+#             the candidate is not split
+# cand_count: number of candidates
+# cand_cap:   allocation size of every candidate-indexed array
+# block_count: the function's block count; sizes visit / queue
+# visit:      per-block scratch mark for the inter-member reachability walk
+# queue:      per-block scratch worklist for the same walk
+# slots:      flattened per-partition field slot pointer Values
+# slot_total: allocation size of `slots`
+# ptr_ty:     the untyped IR pointer an alloca and a gep produce
+# void_ty:    the void a store and a memzero carry
+# i64_ty:     the type the synthesized index and count constants ride in
+rec State {
+    alloc: *A.Allocator;
+    m:     *ir.Module;
+    fn:    *ir.Function;
+    tgt:   *target.Target;
+
+    pool_len:    u32;
+    instr_block: *id.BlockId;
+    cand_of:     *u32;
+    gep_of:      *u32;
+    gep_field:   *u32;
+    erase:       *bool;
+
+    cand_id:     *id.InstructionId;
+    cand_ty:     *ir_type.IrTypeId;
+    cand_phi:    *bool;
+    cand_nf:     *u32;
+    cand_root:   *u32;
+    cand_out:    *bool;
+    cand_secret: *bool;
+    cand_home:   *id.BlockId;
+    cand_local:  *bool;
+    cand_slot:   *u32;
+    cand_count:  u32;
+    cand_cap:    u32;
+
+    block_count: u32;
+    visit:       *bool;
+    queue:       *id.BlockId;
+
+    slots:      *value.Value;
+    slot_total: u32;
+
+    ptr_ty:  ir_type.IrTypeId;
+    void_ty: ir_type.IrTypeId;
+    i64_ty:  ir_type.IrTypeId;
+}
+
+# run scalar replacement over every defined function in `m`
+#
+# Repeats per function until no further candidate splits, so a nested record peels
+# one level per round: splitting `{i8, {i64, ptr}}` yields an `i8` slot mem2reg can
+# promote and a `{i64, ptr}` slot the next round splits again.
+# ---
+# m:   module to transform in place
+# tgt: target, consulted for aggregate byte sizes
+# ret: ok(true) when any aggregate was split, ok(false) when none, or the first error
+pub fun run(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
+    var changed: bool = false;
+    var f: u32 = 0;
+    for (f < m.function_len) {
+        val fn: *ir.Function = ?m.functions[f];
+        if ((fn.flags & ir.FN_FLAG_EXTERN) == 0 && fn.block_count > 0) {
+            var round: u32 = 0;
+            var more: bool = true;
+            for (more && round < MAX_ROUNDS) {
+                val res: R.Result[bool, str] = split_function(m, fn, tgt);
+                if (R.is_err[bool, str](res)) { ret res; }
+                more = R.unwrap_ok[bool, str](res);
+                if (more) { changed = true; }
+                round = round + 1;
+            }
+        }
+        f = f + 1;
+    }
+    ret R.ok[bool, str](changed);
+}
+
+# one split round over a single function: collect candidates, classify escapes to a
+# fixpoint, then materialise the field slots and rewrite every reference
+# ---
+# m:   module under mutation
+# fn:  function to split
+# tgt: target, consulted for aggregate byte sizes
+# ret: ok(true) when at least one aggregate split, ok(false) when none, or an error
+fun split_function(m: *ir.Module, fn: *ir.Function, tgt: *target.Target) R.Result[bool, str] {
+    var st: State;
+    state_init(?st, m, fn, tgt);
+
+    val res_maps: R.Result[bool, str] = state_alloc(?st);
+    if (R.is_err[bool, str](res_maps)) { state_dnit(?st); ret res_maps; }
+    if (st.pool_len == 0) { state_dnit(?st); ret R.ok[bool, str](false); }
+
+    map_instr_blocks(?st);
+    collect_candidates(?st);
+    if (st.cand_count == 0) { state_dnit(?st); ret R.ok[bool, str](false); }
+
+    link_phi_partitions(?st);
+    classify_references(?st);
+    classify_gep_uses(?st);
+    check_partitions(?st);
+    propagate_escapes(?st);
+
+    val survivors: u32 = assign_slots(?st);
+    if (survivors == 0) { state_dnit(?st); ret R.ok[bool, str](false); }
+
+    val res_rw: R.Result[bool, str] = rewrite(?st);
+    state_dnit(?st);
+    if (R.is_err[bool, str](res_rw)) { ret res_rw; }
+    ret R.ok[bool, str](true);
+}
+
+# zero a working state so a partially built one is still safe to tear down
+# ---
+# st:  state to initialise in place
+# m:   module under mutation (also the allocator source)
+# fn:  function being split
+# tgt: target, consulted for aggregate byte sizes
+fun state_init(st: *State, m: *ir.Module, fn: *ir.Function, tgt: *target.Target) {
+    st.alloc = m.alloc;
+    st.m     = m;
+    st.fn    = fn;
+    st.tgt   = tgt;
+
+    st.pool_len    = fn.instr_len;
+    st.instr_block = nil;
+    st.cand_of     = nil;
+    st.gep_of      = nil;
+    st.gep_field   = nil;
+    st.erase       = nil;
+
+    st.cand_id     = nil;
+    st.cand_ty     = nil;
+    st.cand_phi    = nil;
+    st.cand_nf     = nil;
+    st.cand_root   = nil;
+    st.cand_out    = nil;
+    st.cand_secret = nil;
+    st.cand_home   = nil;
+    st.cand_local  = nil;
+    st.cand_slot   = nil;
+    st.cand_count  = 0;
+    st.cand_cap    = 0;
+
+    st.block_count = fn.block_count;
+    st.visit       = nil;
+    st.queue       = nil;
+
+    st.slots      = nil;
+    st.slot_total = 0;
+
+    st.ptr_ty  = ir_type.IRT_NIL;
+    st.void_ty = ir_type.IRT_NIL;
+    st.i64_ty  = ir_type.IRT_NIL;
+}
+
+# allocate and clear every instruction- and candidate-indexed map
+# ---
+# st:  state with pool_len already set
+# ret: ok(true) once every map is live, or the first allocation error
+fun state_alloc(st: *State) R.Result[bool, str] {
+    val n: u32 = st.pool_len;
+    if (n == 0) { ret R.ok[bool, str](true); }
+
+    val r_ib: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](st.alloc, n::usize);
+    if (R.is_err[*id.BlockId, str](r_ib)) { ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](r_ib)); }
+    st.instr_block = R.unwrap_ok[*id.BlockId, str](r_ib);
+
+    val r_co: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](r_co)) { ret R.err[bool, str](R.unwrap_err[*u32, str](r_co)); }
+    st.cand_of = R.unwrap_ok[*u32, str](r_co);
+
+    val r_go: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](r_go)) { ret R.err[bool, str](R.unwrap_err[*u32, str](r_go)); }
+    st.gep_of = R.unwrap_ok[*u32, str](r_go);
+
+    val r_gf: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](r_gf)) { ret R.err[bool, str](R.unwrap_err[*u32, str](r_gf)); }
+    st.gep_field = R.unwrap_ok[*u32, str](r_gf);
+
+    val r_er: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
+    if (R.is_err[*bool, str](r_er)) { ret R.err[bool, str](R.unwrap_err[*bool, str](r_er)); }
+    st.erase = R.unwrap_ok[*bool, str](r_er);
+
+    var i: u32 = 0;
+    for (i < n) {
+        st.instr_block[i] = id.BLOCK_NIL;
+        st.cand_of[i]     = NONE_U32;
+        st.gep_of[i]      = NONE_U32;
+        st.gep_field[i]   = 0;
+        st.erase[i]       = false;
+        i = i + 1;
+    }
+
+    val r_ci: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](st.alloc, n::usize);
+    if (R.is_err[*id.InstructionId, str](r_ci)) { ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](r_ci)); }
+    st.cand_id = R.unwrap_ok[*id.InstructionId, str](r_ci);
+
+    val r_ct: R.Result[*ir_type.IrTypeId, str] = A.allocate[ir_type.IrTypeId](st.alloc, n::usize);
+    if (R.is_err[*ir_type.IrTypeId, str](r_ct)) { ret R.err[bool, str](R.unwrap_err[*ir_type.IrTypeId, str](r_ct)); }
+    st.cand_ty = R.unwrap_ok[*ir_type.IrTypeId, str](r_ct);
+
+    val r_cp: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
+    if (R.is_err[*bool, str](r_cp)) { ret R.err[bool, str](R.unwrap_err[*bool, str](r_cp)); }
+    st.cand_phi = R.unwrap_ok[*bool, str](r_cp);
+
+    val r_cn: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](r_cn)) { ret R.err[bool, str](R.unwrap_err[*u32, str](r_cn)); }
+    st.cand_nf = R.unwrap_ok[*u32, str](r_cn);
+
+    val r_cr: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](r_cr)) { ret R.err[bool, str](R.unwrap_err[*u32, str](r_cr)); }
+    st.cand_root = R.unwrap_ok[*u32, str](r_cr);
+
+    val r_cx: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
+    if (R.is_err[*bool, str](r_cx)) { ret R.err[bool, str](R.unwrap_err[*bool, str](r_cx)); }
+    st.cand_out = R.unwrap_ok[*bool, str](r_cx);
+
+    val r_cs: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
+    if (R.is_err[*bool, str](r_cs)) { ret R.err[bool, str](R.unwrap_err[*bool, str](r_cs)); }
+    st.cand_secret = R.unwrap_ok[*bool, str](r_cs);
+
+    val r_ch: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](st.alloc, n::usize);
+    if (R.is_err[*id.BlockId, str](r_ch)) { ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](r_ch)); }
+    st.cand_home = R.unwrap_ok[*id.BlockId, str](r_ch);
+
+    val r_ck: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
+    if (R.is_err[*bool, str](r_ck)) { ret R.err[bool, str](R.unwrap_err[*bool, str](r_ck)); }
+    st.cand_local = R.unwrap_ok[*bool, str](r_ck);
+
+    val r_cl: R.Result[*u32, str] = A.allocate[u32](st.alloc, n::usize);
+    if (R.is_err[*u32, str](r_cl)) { ret R.err[bool, str](R.unwrap_err[*u32, str](r_cl)); }
+    st.cand_slot = R.unwrap_ok[*u32, str](r_cl);
+
+    st.cand_cap = n;
+
+    val bn: u32 = st.block_count;
+    val r_vi: R.Result[*bool, str] = A.allocate[bool](st.alloc, bn::usize);
+    if (R.is_err[*bool, str](r_vi)) { ret R.err[bool, str](R.unwrap_err[*bool, str](r_vi)); }
+    st.visit = R.unwrap_ok[*bool, str](r_vi);
+
+    val r_qu: R.Result[*id.BlockId, str] = A.allocate[id.BlockId](st.alloc, bn::usize);
+    if (R.is_err[*id.BlockId, str](r_qu)) { ret R.err[bool, str](R.unwrap_err[*id.BlockId, str](r_qu)); }
+    st.queue = R.unwrap_ok[*id.BlockId, str](r_qu);
+
+    ret R.ok[bool, str](true);
+}
+
+# free every owned array by its allocation size; safe partway through construction
+# ---
+# st: state to tear down
+fun state_dnit(st: *State) {
+    val n: u32 = st.pool_len;
+    if (st.instr_block != nil) { A.deallocate[id.BlockId](st.alloc, st.instr_block, n::usize); }
+    if (st.cand_of != nil)     { A.deallocate[u32](st.alloc, st.cand_of, n::usize); }
+    if (st.gep_of != nil)      { A.deallocate[u32](st.alloc, st.gep_of, n::usize); }
+    if (st.gep_field != nil)   { A.deallocate[u32](st.alloc, st.gep_field, n::usize); }
+    if (st.erase != nil)       { A.deallocate[bool](st.alloc, st.erase, n::usize); }
+
+    val c: u32 = st.cand_cap;
+    if (st.cand_id != nil)     { A.deallocate[id.InstructionId](st.alloc, st.cand_id, c::usize); }
+    if (st.cand_ty != nil)     { A.deallocate[ir_type.IrTypeId](st.alloc, st.cand_ty, c::usize); }
+    if (st.cand_phi != nil)    { A.deallocate[bool](st.alloc, st.cand_phi, c::usize); }
+    if (st.cand_nf != nil)     { A.deallocate[u32](st.alloc, st.cand_nf, c::usize); }
+    if (st.cand_root != nil)   { A.deallocate[u32](st.alloc, st.cand_root, c::usize); }
+    if (st.cand_out != nil)    { A.deallocate[bool](st.alloc, st.cand_out, c::usize); }
+    if (st.cand_secret != nil) { A.deallocate[bool](st.alloc, st.cand_secret, c::usize); }
+    if (st.cand_home != nil)   { A.deallocate[id.BlockId](st.alloc, st.cand_home, c::usize); }
+    if (st.cand_local != nil)  { A.deallocate[bool](st.alloc, st.cand_local, c::usize); }
+    if (st.cand_slot != nil)   { A.deallocate[u32](st.alloc, st.cand_slot, c::usize); }
+
+    val bn: u32 = st.block_count;
+    if (st.visit != nil) { A.deallocate[bool](st.alloc, st.visit, bn::usize); }
+    if (st.queue != nil) { A.deallocate[id.BlockId](st.alloc, st.queue, bn::usize); }
+
+    if (st.slots != nil) { A.deallocate[value.Value](st.alloc, st.slots, st.slot_total::usize); }
+}
+
+# fill instr_block from the block lists: every listed phi, body instruction, and
+# terminator maps to its owning block; unlisted pool entries stay BLOCK_NIL
+# ---
+# st: state with instr_block allocated and cleared
+fun map_instr_blocks(st: *State) {
+    val fn: *ir.Function = st.fn;
+    var b: u32 = 0;
+    for (b < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[b];
+        var pi: u32 = 0;
+        for (pi < blk.phi_count) {
+            val pid: id.InstructionId = blk.phis[pi];
+            if (pid::u32 < st.pool_len) { st.instr_block[pid::u32] = b::id.BlockId; }
+            pi = pi + 1;
+        }
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val iid: id.InstructionId = blk.instructions[ii];
+            if (iid::u32 < st.pool_len) { st.instr_block[iid::u32] = b::id.BlockId; }
+            ii = ii + 1;
+        }
+        if (blk.terminator != id.INSTR_NIL && blk.terminator::u32 < st.pool_len) {
+            st.instr_block[blk.terminator::u32] = b::id.BlockId;
+        }
+        b = b + 1;
+    }
+}
+
+# the number of independently addressable fields of a splittable aggregate type, or
+# 0 when the type is not one
+#
+# A union is deliberately excluded: its fields share storage, so per-field slots
+# would break the reinterpretation a union exists to express.
+# ---
+# st: state (for the module's type table)
+# ty: the type to measure
+# ret: field count for a struct, element count for an array, 0 otherwise
+fun agg_field_count(st: *State, ty: ir_type.IrTypeId) u32 {
+    val opt: O.Option[*ir_type.IrType] = ir_type.get(?st.m.types, ty);
+    if (O.is_none[*ir_type.IrType](opt)) { ret 0; }
+    val t: *ir_type.IrType = O.unwrap[*ir_type.IrType](opt);
+    if (t.kind == ir_type.IRT_STRUCT) { ret t.data.struct_.field_count; }
+    if (t.kind == ir_type.IRT_ARRAY)  { ret t.data.array_.count; }
+    ret 0;
+}
+
+# the type of field `k` of a splittable aggregate, or IRT_NIL when out of range
+# ---
+# st: state (for the module's type table)
+# ty: the aggregate type
+# k:  the field ordinal
+# ret: the field's type, or IRT_NIL
+fun agg_field_type(st: *State, ty: ir_type.IrTypeId, k: u32) ir_type.IrTypeId {
+    val opt: O.Option[*ir_type.IrType] = ir_type.get(?st.m.types, ty);
+    if (O.is_none[*ir_type.IrType](opt)) { ret ir_type.IRT_NIL; }
+    val t: *ir_type.IrType = O.unwrap[*ir_type.IrType](opt);
+    if (t.kind == ir_type.IRT_STRUCT) {
+        if (k >= t.data.struct_.field_count) { ret ir_type.IRT_NIL; }
+        ret t.data.struct_.fields[k];
+    }
+    if (t.kind == ir_type.IRT_ARRAY) {
+        if (k >= t.data.array_.count) { ret ir_type.IRT_NIL; }
+        ret t.data.array_.element;
+    }
+    ret ir_type.IRT_NIL;
+}
+
+# whether `ty` is a small enough struct / array, of fields this pass can give their
+# own slot, to be worth splitting
+#
+# Bounded on both field count and byte footprint so the pass stays on the small
+# records the `Result` / `Option` idiom builds from rather than on buffers. Every
+# field must be an integer, a float, a pointer, or a nested aggregate: those are the
+# shapes a per-field slot can be zeroed and copied in, and the shapes mem2reg can
+# then promote. A vector field is left whole (its zero is not an integer constant).
+# ---
+# st: state (for the module's type table and target)
+# ty: the candidate type
+# ret: true when the type may be split
+fun splittable_ty(st: *State, ty: ir_type.IrTypeId) bool {
+    val nf: u32 = agg_field_count(st, ty);
+    if (nf == 0 || nf > MAX_FIELDS)                              { ret false; }
+    if (ir_type.byte_size(?st.m.types, ty, st.tgt) > MAX_BYTES)  { ret false; }
+    var k: u32 = 0;
+    for (k < nf) {
+        if (!splittable_field(st, agg_field_type(st, ty, k))) { ret false; }
+        k = k + 1;
+    }
+    ret true;
+}
+
+# whether a field type can own a slot of its own
+# ---
+# st: state (for the module's type table)
+# ft: the field type
+# ret: true for a scalar (int / float / pointer) or a nested aggregate
+fun splittable_field(st: *State, ft: ir_type.IrTypeId) bool {
+    val opt: O.Option[*ir_type.IrType] = ir_type.get(?st.m.types, ft);
+    if (O.is_none[*ir_type.IrType](opt)) { ret false; }
+    val k: ir_type.IrTypeKind = O.unwrap[*ir_type.IrType](opt).kind;
+    if (k == ir_type.IRT_INT)    { ret true; }
+    if (k == ir_type.IRT_FLOAT)  { ret true; }
+    if (k == ir_type.IRT_PTR)    { ret true; }
+    if (k == ir_type.IRT_STRUCT) { ret true; }
+    if (k == ir_type.IRT_UNION)  { ret true; }
+    if (k == ir_type.IRT_ARRAY)  { ret true; }
+    ret false;
+}
+
+# gather the split candidates in pool-id order: every live aggregate alloca with a
+# constant count of one, and every live aggregate phi
+# ---
+# st: state whose cand_* arrays and cand_of map are populated
+fun collect_candidates(st: *State) {
+    val fn: *ir.Function = st.fn;
+    var i: u32 = 0;
+    for (i < st.pool_len) {
+        if (st.instr_block[i] == id.BLOCK_NIL) { i = i + 1; cnt; }
+        val inst: *instruction.Instruction = ?fn.instrs[i];
+
+        var ty: ir_type.IrTypeId = ir_type.IRT_NIL;
+        var is_phi: bool = false;
+        if (inst.kind == instruction.OP_ALLOCA) {
+            # a variable count keeps the slot whole: its fields are not a fixed set
+            if (inst.operand_count >= 1 && inst.operands[0].kind == value.VAL_CONST_INT
+                && inst.operands[0].data.int_lit == 1) {
+                ty = inst.aux_ty;
+            }
+        } or (inst.kind == instruction.OP_PHI) {
+            ty     = inst.ty;
+            is_phi = true;
+        }
+
+        if (ty != ir_type.IRT_NIL && splittable_ty(st, ty)) {
+            val c: u32 = st.cand_count;
+            st.cand_of[i]     = c;
+            st.cand_id[c]     = i::id.InstructionId;
+            st.cand_ty[c]     = ty;
+            st.cand_phi[c]    = is_phi;
+            st.cand_nf[c]     = agg_field_count(st, ty);
+            st.cand_root[c]   = c;
+            st.cand_out[c]    = false;
+            st.cand_secret[c] = inst.secret;
+            st.cand_home[c]   = st.instr_block[i];
+            st.cand_local[c]  = true;
+            st.cand_slot[c]   = NONE_U32;
+            st.cand_count     = c + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# the partition representative of candidate `c`, with path halving
+# ---
+# st: state with cand_root populated
+# c:  the candidate index
+# ret: the representative candidate index
+fun find_root(st: *State, c: u32) u32 {
+    var x: u32 = c;
+    for (st.cand_root[x] != x) {
+        st.cand_root[x] = st.cand_root[st.cand_root[x]];
+        x = st.cand_root[x];
+    }
+    ret x;
+}
+
+# merge the partitions of two candidates
+# ---
+# st: state with cand_root populated
+# a:  first candidate index
+# b:  second candidate index
+fun union_roots(st: *State, a: u32, b: u32) {
+    val ra: u32 = find_root(st, a);
+    val rb: u32 = find_root(st, b);
+    if (ra != rb) { st.cand_root[rb] = ra; }
+}
+
+# union every phi candidate with its incoming allocas, rejecting a phi whose
+# incomings are not all alloca candidates of the same aggregate type
+#
+# A phi merges addresses, so its incomings must be storage this pass owns end to
+# end; a phi of phis, of a call's return storage, or of a global is left alone.
+# ---
+# st: state whose cand_root is linked and cand_out marks unsplittable phis
+fun link_phi_partitions(st: *State) {
+    val fn: *ir.Function = st.fn;
+    var c: u32 = 0;
+    for (c < st.cand_count) {
+        if (st.cand_phi[c] == false) { c = c + 1; cnt; }
+        val phi: *instruction.Instruction = ?fn.instrs[st.cand_id[c]::u32];
+        if (phi.operand_count == 0) { st.cand_out[c] = true; c = c + 1; cnt; }
+
+        var o: u32 = 1;
+        for (o < phi.operand_count) {
+            val v: value.Value = phi.operands[o];
+            var ok: bool = false;
+            if (v.kind == value.VAL_INSTR && v.data.instr::u32 < st.pool_len) {
+                val ic: u32 = st.cand_of[v.data.instr::u32];
+                if (ic != NONE_U32 && st.cand_phi[ic] == false && st.cand_ty[ic] == st.cand_ty[c]) {
+                    union_roots(st, c, ic);
+                    ok = true;
+                }
+            }
+            if (!ok) { st.cand_out[c] = true; }
+            o = o + 2;
+        }
+        c = c + 1;
+    }
+}
+
+# whether a value names storage by address (the only thing a whole-aggregate copy
+# may read from or write to)
+# ---
+# v:   the value to classify
+# ret: true for an instruction result, a parameter, or a global
+fun is_address_value(v: value.Value) bool {
+    ret v.kind == value.VAL_INSTR || v.kind == value.VAL_PARAM || v.kind == value.VAL_GLOBAL;
+}
+
+# join a candidate's secrecy taint with `s`
+# ---
+# st: state with cand_secret populated
+# c:  the candidate index
+# s:  the taint to join in
+fun taint(st: *State, c: u32, s: bool) {
+    if (s) { st.cand_secret[c] = true; }
+}
+
+# record that a reference to candidate `c` sits in block `b`, clearing the
+# candidate's locality the moment a second block shows up
+# ---
+# st: state with cand_home / cand_local populated
+# c:  the candidate index
+# b:  the referencing block
+fun note_home(st: *State, c: u32, b: id.BlockId) {
+    if (b == id.BLOCK_NIL) { ret; }
+    if (st.cand_home[c] == id.BLOCK_NIL) { st.cand_home[c] = b; ret; }
+    if (st.cand_home[c] != b)            { st.cand_local[c] = false; }
+}
+
+# the single classification sweep: decide, for every reference to a candidate,
+# whether it is a decomposable use or an escape, and record each field gep
+#
+# Also joins each reference's secrecy into the candidate, so a slot that ever
+# carries secret data taints every instruction the rewrite synthesizes for it.
+# ---
+# st: state whose cand_out / cand_secret / gep_of / gep_field are populated
+fun classify_references(st: *State) {
+    val fn: *ir.Function = st.fn;
+    var i: u32 = 0;
+    for (i < st.pool_len) {
+        if (st.instr_block[i] == id.BLOCK_NIL) { i = i + 1; cnt; }
+        val inst: *instruction.Instruction = ?fn.instrs[i];
+
+        # an inline-asm `{name}` binding addresses the slot as [rbp + offset] at
+        # encode time, so its storage must survive as one contiguous object
+        if (inst.kind == instruction.OP_ASM) { mark_asm_binds(st, i::id.InstructionId); }
+
+        # a dbg-value naming a slot is debug metadata, never an address escape:
+        # counting it would make a -g build decline where a release build splits
+        if (inst.kind == instruction.OP_DBG_VALUE) { i = i + 1; cnt; }
+
+        var o: u32 = 0;
+        for (o < inst.operand_count) {
+            val op: value.Value = inst.operands[o];
+            if (op.kind == value.VAL_INSTR && op.data.instr::u32 < st.pool_len) {
+                val c: u32 = st.cand_of[op.data.instr::u32];
+                if (c != NONE_U32) {
+                    taint(st, c, op.secret);
+                    taint(st, c, inst.secret);
+                    # a phi-incoming operand lives in the phi's block by construction,
+                    # so it is not part of the referencing member's locality
+                    if (inst.kind != instruction.OP_PHI) { note_home(st, c, st.instr_block[i]); }
+                    if (!classify_one(st, c, i::id.InstructionId, inst, o)) { st.cand_out[c] = true; }
+                }
+            }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# classify one reference to candidate `c` at operand `o` of instruction `inst`
+# ---
+# st:   state (gep_of / gep_field are written for an accepted field gep)
+# c:    the referenced candidate
+# iid:  the referencing instruction's id
+# inst: the referencing instruction
+# o:    the operand slot naming the candidate
+# ret:  true when the reference is decomposable, false when the address escapes
+fun classify_one(st: *State, c: u32, iid: id.InstructionId, inst: *instruction.Instruction, o: u32) bool {
+    if (inst.kind == instruction.OP_GEP && o == 0) {
+        if (inst.operand_count < 3)                          { ret false; }
+        if (inst.operands[1].kind != value.VAL_CONST_INT)    { ret false; }
+        if (inst.operands[1].data.int_lit != 0)              { ret false; }
+        if (inst.operands[2].kind != value.VAL_CONST_INT)    { ret false; }
+        val k: u64 = inst.operands[2].data.int_lit;
+        if (k >= st.cand_nf[c]::u64)                         { ret false; }
+        st.gep_of[iid::u32]    = c;
+        st.gep_field[iid::u32] = k::u32;
+        ret true;
+    }
+    # a phi's storage is a snapshot, so it is only ever read: no zero fill, no copy in
+    if (inst.kind == instruction.OP_MEMZERO && o == 0) { ret st.cand_phi[c] == false; }
+    if (inst.kind == instruction.OP_STORE && inst.operand_count >= 2) {
+        if (o == 1) {
+            if (st.cand_phi[c])                                  { ret false; }
+            if (inst.operands[0].ty != st.cand_ty[c])            { ret false; }
+            ret is_address_value(inst.operands[0]);
+        }
+        if (o == 0) {
+            # a copy out only stays whole-slot faithful when the destination is itself
+            # decomposed, so no padding byte it stops writing is ever observable
+            if (inst.operands[0].ty != st.cand_ty[c])            { ret false; }
+            val d: value.Value = inst.operands[1];
+            if (d.kind != value.VAL_INSTR)                       { ret false; }
+            if (d.data.instr::u32 >= st.pool_len)                { ret false; }
+            val dc: u32 = st.cand_of[d.data.instr::u32];
+            if (dc == NONE_U32 || st.cand_phi[dc])               { ret false; }
+            ret st.cand_ty[dc] == st.cand_ty[c];
+        }
+        ret false;
+    }
+    if (inst.kind == instruction.OP_PHI && (o % 2) == 1) {
+        val pc: u32 = st.cand_of[iid::u32];
+        if (pc == NONE_U32 || st.cand_phi[pc] == false) { ret false; }
+        ret find_root(st, pc) == find_root(st, c);
+    }
+    ret false;
+}
+
+# mark every candidate bound by an OP_ASM's `{name}` list as escaped
+#
+# The bindings live in the asm payload rather than the instruction's operands, so
+# escape analysis must consult them explicitly.
+# ---
+# st:     state whose cand_out is written
+# asm_id: the OP_ASM instruction whose bindings to scan
+fun mark_asm_binds(st: *State, asm_id: id.InstructionId) {
+    var key: id.InstructionId = asm_id;
+    val res: R.Result[*ir.IrAsm, str] = map.get[id.InstructionId, ir.IrAsm](?st.fn.asm_blocks, ?key);
+    if (R.is_err[*ir.IrAsm, str](res)) { ret; }
+    val payload: *ir.IrAsm = R.unwrap_ok[*ir.IrAsm, str](res);
+    var b: u32 = 0;
+    for (b < payload.bind_count) {
+        val bid: id.InstructionId = payload.binds[b].instr;
+        if (bid::u32 < st.pool_len && st.cand_of[bid::u32] != NONE_U32) {
+            st.cand_out[st.cand_of[bid::u32]] = true;
+        }
+        b = b + 1;
+    }
+}
+
+# check what each accepted field gep's own result feeds
+#
+# A field address may only be dereferenced or descended into further; anything else
+# (a call argument, a return, a bitcast, a comparison) is the field address escaping,
+# which for an array element also defeats the adjacency a caller may rely on. A gep
+# on a phi candidate is stricter still: the merge is only faithful while the shared
+# slots are read, so the address may not be stored through.
+# ---
+# st: state whose cand_out is written for a candidate with an escaping field address
+fun classify_gep_uses(st: *State) {
+    val fn: *ir.Function = st.fn;
+    var i: u32 = 0;
+    for (i < st.pool_len) {
+        if (st.instr_block[i] == id.BLOCK_NIL) { i = i + 1; cnt; }
+        val inst: *instruction.Instruction = ?fn.instrs[i];
+        if (inst.kind == instruction.OP_DBG_VALUE) { i = i + 1; cnt; }
+
+        var o: u32 = 0;
+        for (o < inst.operand_count) {
+            val op: value.Value = inst.operands[o];
+            if (op.kind == value.VAL_INSTR && op.data.instr::u32 < st.pool_len) {
+                val g: u32 = st.gep_of[op.data.instr::u32];
+                if (g != NONE_U32) {
+                    taint(st, g, op.secret);
+                    taint(st, g, inst.secret);
+                    note_home(st, g, st.instr_block[i]);
+                    if (!gep_use_ok(st, g, inst, o)) { st.cand_out[g] = true; }
+                }
+            }
+            o = o + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# whether one use of a field gep keeps its owner splittable
+# ---
+# st:   state
+# c:    the candidate the gep addresses
+# inst: the using instruction
+# o:    the operand slot naming the gep
+# ret:  true when the use is a plain dereference (or a further descent)
+fun gep_use_ok(st: *State, c: u32, inst: *instruction.Instruction, o: u32) bool {
+    if (inst.kind == instruction.OP_LOAD  && o == 0) { ret true; }
+    if (inst.kind == instruction.OP_GEP   && o == 0) { ret true; }
+    if (inst.kind == instruction.OP_STORE && o == 1) { ret st.cand_phi[c] == false; }
+    ret false;
+}
+
+# enforce the two rules that let one shared slot set stand in for the several
+# addresses an aggregate phi merges
+#
+# The phi must be read-only and local: every reference to it (its own uses and the
+# uses of its field geps) sits in the phi's block, and that block writes no member of
+# the partition -- so the shared slots are read exactly where the merge selected an
+# incoming, with nothing overwriting them first.
+#
+# Each incoming slot must be self-contained: `cand_local` says every one of its
+# references is in the one block that defines it, and no other member's defining
+# block is reachable from it without passing the phi. Together these make the last
+# member written into the shared slots, on any path reaching the phi, exactly the one
+# the phi names for that edge.
+# ---
+# st: state whose cand_out is written for a partition the sharing would not be
+#     faithful over
+fun check_partitions(st: *State) {
+    var c: u32 = 0;
+    for (c < st.cand_count) {
+        if (st.cand_phi[c] == false || st.cand_out[c]) { c = c + 1; cnt; }
+        val home: id.BlockId = st.cand_home[c];
+        if (home == id.BLOCK_NIL || st.cand_local[c] == false) { st.cand_out[c] = true; c = c + 1; cnt; }
+        if (block_writes_partition(st, home, c)) { st.cand_out[c] = true; c = c + 1; cnt; }
+
+        val root: u32 = find_root(st, c);
+        var a: u32 = 0;
+        for (a < st.cand_count) {
+            if (st.cand_phi[a] || find_root(st, a) != root) { a = a + 1; cnt; }
+            if (st.cand_local[a] == false || st.cand_home[a] == id.BLOCK_NIL) {
+                st.cand_out[a] = true;
+                a = a + 1;
+                cnt;
+            }
+            var b: u32 = 0;
+            for (b < st.cand_count) {
+                if (b == a || st.cand_phi[b] || find_root(st, b) != root) { b = b + 1; cnt; }
+                if (st.cand_home[b] == st.cand_home[a]) { st.cand_out[a] = true; }
+                or {
+                    if (reaches_between(st, st.cand_home[a], st.cand_home[b], root)) { st.cand_out[a] = true; }
+                }
+                b = b + 1;
+            }
+            a = a + 1;
+        }
+        c = c + 1;
+    }
+}
+
+# whether block `to` is reachable from block `from` without passing through a block
+# that holds one of the partition's phis
+#
+# A phi block is a sink: once control reaches the merge, the phi has already selected
+# its incoming and the shared slots have been read, so what happens beyond it cannot
+# make the selection stale.
+# ---
+# st:   state (visit / queue are its scratch arrays)
+# from: the block to search out of
+# to:   the block being looked for
+# root: the partition whose phi blocks stop the walk
+# ret:  true when `to` is reached
+fun reaches_between(st: *State, from: id.BlockId, to: id.BlockId, root: u32) bool {
+    var i: u32 = 0;
+    for (i < st.block_count) { st.visit[i] = false; i = i + 1; }
+
+    var tail: u32 = 0;
+    push_successors(st, from, ?tail);
+
+    var head: u32 = 0;
+    for (head < tail) {
+        val b: id.BlockId = st.queue[head];
+        head = head + 1;
+        if (b == to)                                 { ret true; }
+        if (is_partition_phi_block(st, b, root))     { cnt; }
+        push_successors(st, b, ?tail);
+    }
+    ret false;
+}
+
+# enqueue the not-yet-visited successors of `b` onto the reachability worklist
+# ---
+# st:   state (visit / queue are its scratch arrays)
+# b:    the block whose successors to enqueue
+# tail: the worklist's end offset, advanced per enqueued block
+fun push_successors(st: *State, b: id.BlockId, tail: *u32) {
+    var s0: id.BlockId = id.BLOCK_NIL;
+    var s1: id.BlockId = id.BLOCK_NIL;
+    val n: u32 = ir.block_successors(st.fn, ?st.fn.blocks[b::u32], ?s0, ?s1);
+    if (n >= 1) { push_block(st, s0, tail); }
+    if (n >= 2) { push_block(st, s1, tail); }
+}
+
+# enqueue one block if it is in range and unvisited
+# ---
+# st:   state (visit / queue are its scratch arrays)
+# b:    the block to enqueue
+# tail: the worklist's end offset, advanced when the block is enqueued
+fun push_block(st: *State, b: id.BlockId, tail: *u32) {
+    if (b == id.BLOCK_NIL || b::u32 >= st.block_count) { ret; }
+    if (st.visit[b::u32]) { ret; }
+    st.visit[b::u32] = true;
+    st.queue[@tail] = b;
+    @tail = @tail + 1;
+}
+
+# whether block `b` holds a phi candidate of partition `root`
+# ---
+# st:   state
+# b:    the block to test
+# root: the partition representative
+# ret:  true when a member phi lives in `b`
+fun is_partition_phi_block(st: *State, b: id.BlockId, root: u32) bool {
+    var c: u32 = 0;
+    for (c < st.cand_count) {
+        if (st.cand_phi[c] && find_root(st, c) == root && st.cand_home[c] == b) { ret true; }
+        c = c + 1;
+    }
+    ret false;
+}
+
+# whether block `b` writes storage belonging to candidate `c`'s partition
+# ---
+# st: state
+# b:  the block to scan
+# c:  a candidate naming the partition
+# ret: true when the block holds a memzero, a whole-slot copy, or a field store to a
+#      member of the partition
+fun block_writes_partition(st: *State, b: id.BlockId, c: u32) bool {
+    val fn: *ir.Function = st.fn;
+    val root: u32 = find_root(st, c);
+    val blk: *ir.Block = ?fn.blocks[b::u32];
+    var ix: u32 = 0;
+    for (ix < blk.instr_count) {
+        val iid: id.InstructionId = blk.instructions[ix];
+        ix = ix + 1;
+        if (iid::u32 >= st.pool_len) { cnt; }
+        val inst: *instruction.Instruction = ?fn.instrs[iid::u32];
+
+        var target: value.Value;
+        if (inst.kind == instruction.OP_MEMZERO && inst.operand_count >= 1) {
+            target = inst.operands[0];
+        } or (inst.kind == instruction.OP_STORE && inst.operand_count >= 2) {
+            target = inst.operands[1];
+        } or { cnt; }
+
+        if (target.kind != value.VAL_INSTR || target.data.instr::u32 >= st.pool_len) { cnt; }
+        val ti: u32 = target.data.instr::u32;
+        var owner: u32 = st.cand_of[ti];
+        if (owner == NONE_U32) { owner = st.gep_of[ti]; }
+        if (owner != NONE_U32 && find_root(st, owner) == root) { ret true; }
+    }
+    ret false;
+}
+
+# propagate escapes to a fixpoint: over each phi partition (an address merge is only
+# as splittable as every slot feeding it) and from a whole-aggregate copy's
+# destination back to its source
+# ---
+# st: state whose cand_out is closed under both rules
+fun propagate_escapes(st: *State) {
+    val fn: *ir.Function = st.fn;
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+
+        # a partition splits whole or not at all: push every member's escape up to
+        # the representative, then pull the representative's back down
+        var c: u32 = 0;
+        for (c < st.cand_count) {
+            if (st.cand_out[c]) { st.cand_out[find_root(st, c)] = true; }
+            c = c + 1;
+        }
+        var d: u32 = 0;
+        for (d < st.cand_count) {
+            if (st.cand_out[d] == false && st.cand_out[find_root(st, d)]) {
+                st.cand_out[d] = true;
+                changed = true;
+            }
+            d = d + 1;
+        }
+
+        # a copy out is only faithful into a destination that is itself decomposed
+        var i: u32 = 0;
+        for (i < st.pool_len) {
+            if (st.instr_block[i] == id.BLOCK_NIL) { i = i + 1; cnt; }
+            val inst: *instruction.Instruction = ?fn.instrs[i];
+            if (inst.kind != instruction.OP_STORE || inst.operand_count < 2) { i = i + 1; cnt; }
+            val sv: value.Value = inst.operands[0];
+            val dv: value.Value = inst.operands[1];
+            if (sv.kind != value.VAL_INSTR || dv.kind != value.VAL_INSTR) { i = i + 1; cnt; }
+            if (sv.data.instr::u32 >= st.pool_len || dv.data.instr::u32 >= st.pool_len) { i = i + 1; cnt; }
+            val sc: u32 = st.cand_of[sv.data.instr::u32];
+            val dc: u32 = st.cand_of[dv.data.instr::u32];
+            if (sc != NONE_U32 && st.cand_out[sc] == false) {
+                if (dc == NONE_U32 || st.cand_out[dc]) {
+                    st.cand_out[sc] = true;
+                    changed = true;
+                }
+            }
+            i = i + 1;
+        }
+    }
+}
+
+# lay out the flattened field-slot table, one set of slots per surviving partition
+#
+# Every member of a phi partition shares one set, which is what turns the address
+# merge into a merge of the slots' contents; a lone alloca is its own partition and
+# gets its own set.
+# ---
+# st:  state whose cand_slot offsets and `slots` array are sized
+# ret: the number of candidates that will be split
+fun assign_slots(st: *State) u32 {
+    var total: u32 = 0;
+    var live: u32 = 0;
+    var c: u32 = 0;
+    for (c < st.cand_count) {
+        if (st.cand_out[c] == false && find_root(st, c) == c) {
+            st.cand_slot[c] = total;
+            total = total + st.cand_nf[c];
+        }
+        c = c + 1;
+    }
+    var d: u32 = 0;
+    for (d < st.cand_count) {
+        if (st.cand_out[d] == false) {
+            st.cand_slot[d] = st.cand_slot[find_root(st, d)];
+            live = live + 1;
+        }
+        d = d + 1;
+    }
+    st.slot_total = total;
+    ret live;
+}
+
+# an insertion point for the rewrite's synthesized traffic
+#
+# The pass emits into blocks that already carry a terminator, which the construction
+# cursor (`ir.builder`) refuses, so it appends to the pool and to the block body
+# directly -- the same post-construction path mem2reg uses to birth a phi. A block's
+# body excludes its terminator, so an append always lands before it, on the edge.
+# ---
+# bid: the block new instructions are appended to
+# loc: the source location stamped onto them, carried from the instruction they replace
+rec Cursor {
+    bid: id.BlockId;
+    loc: source.SrcLoc;
+}
+
+# materialise the field slots, expand every whole-aggregate operation into per-field
+# traffic, retarget every field gep, and erase the superseded instructions
+# ---
+# st:  state with the surviving candidate set finalised
+# ret: ok(true) once the function is rewritten, or the first error
+fun rewrite(st: *State) R.Result[bool, str] {
+    val r_slots: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, st.slot_total::usize);
+    if (R.is_err[*value.Value, str](r_slots)) { ret R.err[bool, str](R.unwrap_err[*value.Value, str](r_slots)); }
+    st.slots = R.unwrap_ok[*value.Value, str](r_slots);
+
+    val r_types: R.Result[bool, str] = intern_types(st);
+    if (R.is_err[bool, str](r_types)) { ret r_types; }
+
+    val r_alloc: R.Result[bool, str] = emit_field_slots(st);
+    if (R.is_err[bool, str](r_alloc)) { ret r_alloc; }
+
+    var rw: mutate.Rewrite;
+    val r_rw: R.Result[bool, str] = mutate.rewrite_init(?rw, st.alloc, st.fn.instr_len);
+    if (R.is_err[bool, str](r_rw)) { ret r_rw; }
+
+    val r_body: R.Result[bool, str] = rewrite_blocks(st, ?rw);
+    if (R.is_err[bool, str](r_body)) { mutate.rewrite_dnit(?rw, st.alloc); ret r_body; }
+
+    mutate.rewrite_apply(st.fn, ?rw);
+    mutate.rewrite_dnit(?rw, st.alloc);
+
+    ret mutate.erase_marked(st.m, st.fn, st::ptr, erase_test);
+}
+
+# intern the three types every synthesized instruction needs
+# ---
+# st:  state whose ptr_ty / void_ty / i64_ty are filled
+# ret: ok(true) once interned, or the first error
+fun intern_types(st: *State) R.Result[bool, str] {
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?st.m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rp)); }
+    st.ptr_ty = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+
+    val rv: R.Result[ir_type.IrTypeId, str] = ir_type.intern_void(?st.m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rv)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rv)); }
+    st.void_ty = R.unwrap_ok[ir_type.IrTypeId, str](rv);
+
+    val ri: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?st.m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](ri)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ri)); }
+    st.i64_ty = R.unwrap_ok[ir_type.IrTypeId, str](ri);
+    ret R.ok[bool, str](true);
+}
+
+# append one instruction to the pool and to the cursor's block body
+# ---
+# st:     state
+# cur:    the insertion point
+# kind:   the opcode
+# ty:     the result type
+# ops:    a freshly allocated operand array the instruction takes ownership of
+# n:      its length
+# aux_ty: the opcode's auxiliary type, or IRT_NIL
+# secret: the constant-time taint to stamp
+# ret:    the new instruction's id, or an allocation error
+fun emit(st: *State, cur: *Cursor, kind: instruction.InstrKind, ty: ir_type.IrTypeId,
+         ops: *value.Value, n: u32, aux_ty: ir_type.IrTypeId, secret: bool) R.Result[id.InstructionId, str] {
+    var inst: instruction.Instruction;
+    inst.kind          = kind;
+    inst.ty            = ty;
+    inst.operands      = ops;
+    inst.operand_count = n;
+    inst.operand_cap   = n;
+    inst.flags         = 0;
+    inst.aux_ty        = aux_ty;
+    inst.loc           = cur.loc;
+    inst.secret        = secret;
+
+    val r: R.Result[id.InstructionId, str] = ir.instruction_add(st.m, st.fn, inst);
+    if (R.is_err[id.InstructionId, str](r)) { ret r; }
+    val iid: id.InstructionId = R.unwrap_ok[id.InstructionId, str](r);
+
+    val ra: R.Result[bool, str] = ir.block_append_instr(st.m, ?st.fn.blocks[cur.bid::u32], iid);
+    if (R.is_err[bool, str](ra)) { ret R.err[id.InstructionId, str](R.unwrap_err[bool, str](ra)); }
+    ret R.ok[id.InstructionId, str](iid);
+}
+
+# emit `alloca ft, 1` naming one field's storage
+# ---
+# st:     state
+# cur:    the insertion point
+# ft:     the field type sizing the slot
+# secret: the taint to stamp
+# ret:    the slot's pointer value, or an error
+fun emit_slot(st: *State, cur: *Cursor, ft: ir_type.IrTypeId, secret: bool) R.Result[value.Value, str] {
+    val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 1::usize);
+    if (R.is_err[*value.Value, str](r)) { ret R.err[value.Value, str](R.unwrap_err[*value.Value, str](r)); }
+    val ops: *value.Value = R.unwrap_ok[*value.Value, str](r);
+    ops[0] = value.const_int(1, st.i64_ty);
+
+    val ri: R.Result[id.InstructionId, str] = emit(st, cur, instruction.OP_ALLOCA, st.ptr_ty, ops, 1, ft, secret);
+    if (R.is_err[id.InstructionId, str](ri)) { ret R.err[value.Value, str](R.unwrap_err[id.InstructionId, str](ri)); }
+    var v: value.Value = value.instr(R.unwrap_ok[id.InstructionId, str](ri), st.ptr_ty);
+    v.secret = secret;
+    ret R.ok[value.Value, str](v);
+}
+
+# emit `store v, ptr`
+# ---
+# st:     state
+# cur:    the insertion point
+# v:      the stored value
+# ptr:    the destination address
+# secret: the taint to stamp
+# ret:    ok(true), or an allocation error
+fun emit_store(st: *State, cur: *Cursor, v: value.Value, ptr: value.Value, secret: bool) R.Result[bool, str] {
+    val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 2::usize);
+    if (R.is_err[*value.Value, str](r)) { ret R.err[bool, str](R.unwrap_err[*value.Value, str](r)); }
+    val ops: *value.Value = R.unwrap_ok[*value.Value, str](r);
+    ops[0] = v;
+    ops[1] = ptr;
+    val ri: R.Result[id.InstructionId, str] = emit(st, cur, instruction.OP_STORE, st.void_ty, ops, 2,
+                                                  ir_type.IRT_NIL, secret || v.secret);
+    if (R.is_err[id.InstructionId, str](ri)) { ret R.err[bool, str](R.unwrap_err[id.InstructionId, str](ri)); }
+    ret R.ok[bool, str](true);
+}
+
+# emit `load ty, ptr`
+# ---
+# st:     state
+# cur:    the insertion point
+# ptr:    the address to read
+# ty:     the loaded type
+# secret: the taint to stamp
+# ret:    the loaded value, or an allocation error
+fun emit_load(st: *State, cur: *Cursor, ptr: value.Value, ty: ir_type.IrTypeId, secret: bool) R.Result[value.Value, str] {
+    val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 1::usize);
+    if (R.is_err[*value.Value, str](r)) { ret R.err[value.Value, str](R.unwrap_err[*value.Value, str](r)); }
+    val ops: *value.Value = R.unwrap_ok[*value.Value, str](r);
+    ops[0] = ptr;
+    val ri: R.Result[id.InstructionId, str] = emit(st, cur, instruction.OP_LOAD, ty, ops, 1, ir_type.IRT_NIL, secret);
+    if (R.is_err[id.InstructionId, str](ri)) { ret R.err[value.Value, str](R.unwrap_err[id.InstructionId, str](ri)); }
+    var v: value.Value = value.instr(R.unwrap_ok[id.InstructionId, str](ri), ty);
+    v.secret = secret;
+    ret R.ok[value.Value, str](v);
+}
+
+# emit `memzero ptr` over a nested aggregate field
+# ---
+# st:     state
+# cur:    the insertion point
+# ptr:    the field slot to zero
+# ft:     the aggregate field type sizing the fill
+# secret: the taint to stamp
+# ret:    ok(true), or an allocation error
+fun emit_memzero(st: *State, cur: *Cursor, ptr: value.Value, ft: ir_type.IrTypeId, secret: bool) R.Result[bool, str] {
+    val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 1::usize);
+    if (R.is_err[*value.Value, str](r)) { ret R.err[bool, str](R.unwrap_err[*value.Value, str](r)); }
+    val ops: *value.Value = R.unwrap_ok[*value.Value, str](r);
+    ops[0] = ptr;
+    val ri: R.Result[id.InstructionId, str] = emit(st, cur, instruction.OP_MEMZERO, st.void_ty, ops, 1, ft, secret);
+    if (R.is_err[id.InstructionId, str](ri)) { ret R.err[bool, str](R.unwrap_err[id.InstructionId, str](ri)); }
+    ret R.ok[bool, str](true);
+}
+
+# emit `gep base, 0, k` naming field `k` of the aggregate at `base`
+# ---
+# st:     state
+# cur:    the insertion point
+# base:   the aggregate's address
+# ty:     the aggregate type the index walk starts from
+# k:      the field ordinal
+# secret: the taint to stamp
+# ret:    the field's address, or an allocation error
+fun emit_field_gep(st: *State, cur: *Cursor, base: value.Value, ty: ir_type.IrTypeId, k: u32, secret: bool) R.Result[value.Value, str] {
+    val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 3::usize);
+    if (R.is_err[*value.Value, str](r)) { ret R.err[value.Value, str](R.unwrap_err[*value.Value, str](r)); }
+    val ops: *value.Value = R.unwrap_ok[*value.Value, str](r);
+    ops[0] = base;
+    ops[1] = value.const_int(0, st.i64_ty);
+    ops[2] = value.const_int(k::u64, st.i64_ty);
+    val ri: R.Result[id.InstructionId, str] = emit(st, cur, instruction.OP_GEP, st.ptr_ty, ops, 3, ty, secret);
+    if (R.is_err[id.InstructionId, str](ri)) { ret R.err[value.Value, str](R.unwrap_err[id.InstructionId, str](ri)); }
+    var v: value.Value = value.instr(R.unwrap_ok[id.InstructionId, str](ri), st.ptr_ty);
+    v.secret = secret;
+    ret R.ok[value.Value, str](v);
+}
+
+# create one alloca per field of every surviving candidate, at the front of the
+# entry block
+#
+# An alloca is a static frame-slot reservation plus an address materialisation, so
+# entry placement is equivalent to placing each slot where its aggregate was, and it
+# is the only placement that also dominates the incoming edges a phi candidate's
+# snapshot slots are written on.
+# ---
+# st: state whose `slots` table is filled
+# ret: ok(true) once every slot exists and the entry body is reordered, or an error
+fun emit_field_slots(st: *State) R.Result[bool, str] {
+    val before: u32 = st.fn.blocks[0].instr_count;
+    var cur: Cursor;
+    cur.bid = 0::id.BlockId;
+
+    var c: u32 = 0;
+    for (c < st.cand_count) {
+        if (st.cand_out[c] || find_root(st, c) != c) { c = c + 1; cnt; }
+        cur.loc = st.fn.instrs[st.cand_id[c]::u32].loc;
+        var k: u32 = 0;
+        for (k < st.cand_nf[c]) {
+            val ft: ir_type.IrTypeId = agg_field_type(st, st.cand_ty[c], k);
+            val r: R.Result[value.Value, str] = emit_slot(st, ?cur, ft, partition_secret(st, c));
+            if (R.is_err[value.Value, str](r)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r)); }
+            st.slots[st.cand_slot[c] + k] = R.unwrap_ok[value.Value, str](r);
+            k = k + 1;
+        }
+        c = c + 1;
+    }
+
+    ret rotate_to_front(st, 0::id.BlockId, before);
+}
+
+# whether any member of `c`'s partition ever carries secret data
+#
+# The slots are shared, so their taint is the join over the partition: a secret
+# reaching one member's storage reaches the storage every member reads.
+# ---
+# st:  state
+# c:   a candidate naming the partition
+# ret: true when any member is tainted
+fun partition_secret(st: *State, c: u32) bool {
+    val root: u32 = find_root(st, c);
+    var d: u32 = 0;
+    for (d < st.cand_count) {
+        if (st.cand_secret[d] && find_root(st, d) == root) { ret true; }
+        d = d + 1;
+    }
+    ret false;
+}
+
+# move the instructions appended past `before` to the front of block `bid`, keeping
+# both groups' relative order
+#
+# A slot must dominate every use already in the entry body; this is a permutation of
+# the block's list, never a removal, so the single-erase-path contract on
+# `mutate.erase_marked` is untouched.
+# ---
+# st:     state
+# bid:    the block to reorder
+# before: the instruction count the block had before the appends
+# ret:    ok(true) once reordered, or an allocation error
+fun rotate_to_front(st: *State, bid: id.BlockId, before: u32) R.Result[bool, str] {
+    val blk: *ir.Block = ?st.fn.blocks[bid::u32];
+    if (blk.instr_count == before) { ret R.ok[bool, str](true); }
+
+    val r: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](st.alloc, blk.instr_count::usize);
+    if (R.is_err[*id.InstructionId, str](r)) { ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](r)); }
+    val tmp: *id.InstructionId = R.unwrap_ok[*id.InstructionId, str](r);
+
+    var w: u32 = 0;
+    var i: u32 = before;
+    for (i < blk.instr_count) { tmp[w] = blk.instructions[i]; w = w + 1; i = i + 1; }
+    var j: u32 = 0;
+    for (j < before) { tmp[w] = blk.instructions[j]; w = w + 1; j = j + 1; }
+    var z: u32 = 0;
+    for (z < blk.instr_count) { blk.instructions[z] = tmp[z]; z = z + 1; }
+
+    A.deallocate[id.InstructionId](st.alloc, tmp, blk.instr_count::usize);
+    ret R.ok[bool, str](true);
+}
+
+# rewrite every block: expand the whole-aggregate operations, retarget the field
+# geps, and append each phi candidate's incoming-edge copies
+# ---
+# st: state
+# rw: rewrite map collecting the field-gep replacements
+# ret: ok(true) once every block is rewritten, or the first error
+fun rewrite_blocks(st: *State, rw: *mutate.Rewrite) R.Result[bool, str] {
+    var bi: u32 = 0;
+    for (bi < st.fn.block_count) {
+        val res: R.Result[bool, str] = rewrite_block(st, rw, bi::id.BlockId);
+        if (R.is_err[bool, str](res)) { ret res; }
+        bi = bi + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# rewrite one block
+#
+# Each old instruction's replacement traffic is appended to the block, then the body
+# is re-laid so every appended group sits immediately before the instruction it
+# replaces; the superseded originals stay in the list and are dropped by the single
+# erase path afterwards.
+# ---
+# st:  state
+# rw:  rewrite map collecting the field-gep replacements
+# bid: the block to rewrite
+# ret: ok(true) once the block is rewritten, or the first error
+fun rewrite_block(st: *State, rw: *mutate.Rewrite, bid: id.BlockId) R.Result[bool, str] {
+    val old_n: u32 = st.fn.blocks[bid::u32].instr_count;
+    if (old_n == 0) { ret R.ok[bool, str](true); }
+
+    # snapshot the body: appending to the block grows the same array underneath
+    val r_old: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](st.alloc, old_n::usize);
+    if (R.is_err[*id.InstructionId, str](r_old)) { ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](r_old)); }
+    val old: *id.InstructionId = R.unwrap_ok[*id.InstructionId, str](r_old);
+    var s: u32 = 0;
+    for (s < old_n) { old[s] = st.fn.blocks[bid::u32].instructions[s]; s = s + 1; }
+
+    # per old instruction, how many replacement instructions were appended for it
+    val r_cnt: R.Result[*u32, str] = A.allocate[u32](st.alloc, old_n::usize);
+    if (R.is_err[*u32, str](r_cnt)) {
+        A.deallocate[id.InstructionId](st.alloc, old, old_n::usize);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](r_cnt));
+    }
+    val added: *u32 = R.unwrap_ok[*u32, str](r_cnt);
+
+    var err: str = nil;
+    var ix: u32 = 0;
+    for (ix < old_n && err == nil) {
+        val at: u32 = st.fn.blocks[bid::u32].instr_count;
+        val res: R.Result[bool, str] = rewrite_instr(st, rw, bid, old[ix]);
+        if (R.is_err[bool, str](res)) { err = R.unwrap_err[bool, str](res); }
+        or { added[ix] = st.fn.blocks[bid::u32].instr_count - at; }
+        ix = ix + 1;
+    }
+
+    if (err == nil) {
+        val res: R.Result[bool, str] = relayout_block(st, bid, old, old_n, added);
+        if (R.is_err[bool, str](res)) { err = R.unwrap_err[bool, str](res); }
+    }
+
+    A.deallocate[id.InstructionId](st.alloc, old, old_n::usize);
+    A.deallocate[u32](st.alloc, added, old_n::usize);
+    if (err != nil) { ret R.err[bool, str](err); }
+    ret R.ok[bool, str](true);
+}
+
+# re-lay a rewritten block's body so each appended group precedes the instruction it
+# replaces, restoring program order
+# ---
+# st:    state
+# bid:   the block to re-lay
+# old:   the body snapshot taken before the appends
+# old_n: its length
+# added: per old instruction, how many replacements were appended for it
+# ret:   ok(true) once the body is re-laid, or an allocation error
+fun relayout_block(st: *State, bid: id.BlockId, old: *id.InstructionId, old_n: u32, added: *u32) R.Result[bool, str] {
+    val blk: *ir.Block = ?st.fn.blocks[bid::u32];
+    val total: u32 = blk.instr_count;
+    if (total == old_n) { ret R.ok[bool, str](true); }
+
+    val r: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](st.alloc, total::usize);
+    if (R.is_err[*id.InstructionId, str](r)) { ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](r)); }
+    val plan: *id.InstructionId = R.unwrap_ok[*id.InstructionId, str](r);
+
+    var w: u32 = 0;
+    var src: u32 = old_n;
+    var ix: u32 = 0;
+    for (ix < old_n) {
+        var a: u32 = 0;
+        for (a < added[ix]) { plan[w] = blk.instructions[src]; w = w + 1; src = src + 1; a = a + 1; }
+        plan[w] = old[ix];
+        w = w + 1;
+        ix = ix + 1;
+    }
+    var z: u32 = 0;
+    for (z < total) { blk.instructions[z] = plan[z]; z = z + 1; }
+
+    A.deallocate[id.InstructionId](st.alloc, plan, total::usize);
+    ret R.ok[bool, str](true);
+}
+
+# rewrite one instruction of a block being split
+#
+# Appends the replacement traffic for a memzero or a whole-aggregate copy, retargets
+# a field gep onto its slot, and marks each superseded original for erasure.
+# ---
+# st:  state
+# rw:  rewrite map collecting the field-gep replacements
+# bid: the instruction's block
+# iid: the instruction to rewrite
+# ret: ok(true) once handled (possibly as a no-op), or the first error
+fun rewrite_instr(st: *State, rw: *mutate.Rewrite, bid: id.BlockId, iid: id.InstructionId) R.Result[bool, str] {
+    if (iid::u32 >= st.pool_len) { ret R.ok[bool, str](true); }
+    val inst: *instruction.Instruction = ?st.fn.instrs[iid::u32];
+    var cur: Cursor;
+    cur.bid = bid;
+    cur.loc = inst.loc;
+
+    val g: u32 = st.gep_of[iid::u32];
+    if (g != NONE_U32 && st.cand_out[g] == false) { ret retarget_gep(st, rw, iid, g); }
+
+    if (inst.kind == instruction.OP_MEMZERO && inst.operand_count >= 1) {
+        val c: u32 = candidate_at(st, inst.operands[0]);
+        if (c != NONE_U32 && st.cand_out[c] == false) {
+            st.erase[iid::u32] = true;
+            ret expand_memzero(st, ?cur, c, inst.secret);
+        }
+        ret R.ok[bool, str](true);
+    }
+
+    if (inst.kind == instruction.OP_STORE && inst.operand_count >= 2) {
+        val dc: u32 = candidate_at(st, inst.operands[1]);
+        if (dc != NONE_U32 && st.cand_out[dc] == false) {
+            st.erase[iid::u32] = true;
+            ret expand_copy(st, ?cur, dc, inst.operands[0], inst.secret);
+        }
+    }
+    ret R.ok[bool, str](true);
+}
+
+# the candidate a value names, or NONE_U32
+# ---
+# st: state
+# v:  the value to resolve
+# ret: the candidate index, or NONE_U32
+fun candidate_at(st: *State, v: value.Value) u32 {
+    if (v.kind != value.VAL_INSTR)         { ret NONE_U32; }
+    if (v.data.instr::u32 >= st.pool_len)  { ret NONE_U32; }
+    ret st.cand_of[v.data.instr::u32];
+}
+
+# point a field gep at its candidate's slot
+#
+# A two-index gep names the field itself, so its uses are rewritten straight to the
+# slot and the gep is dropped. A deeper gep keeps descending, so it is retargeted in
+# place: the slot becomes its base, the field ordinal is consumed, and the field type
+# becomes the pointee its remaining indices walk.
+# ---
+# st:  state
+# rw:  rewrite map collecting the two-index replacements
+# gid: the gep's instruction id
+# c:   the candidate it addresses
+# ret: ok(true) once retargeted, or an allocation error
+fun retarget_gep(st: *State, rw: *mutate.Rewrite, gid: id.InstructionId, c: u32) R.Result[bool, str] {
+    val inst: *instruction.Instruction = ?st.fn.instrs[gid::u32];
+    val k: u32 = st.gep_field[gid::u32];
+    val slot: value.Value = st.slots[st.cand_slot[c] + k];
+
+    if (inst.operand_count == 3) {
+        mutate.replace_value(rw, gid, slot);
+        st.erase[gid::u32] = true;
+        ret R.ok[bool, str](true);
+    }
+
+    val n: u32 = inst.operand_count - 1;
+    val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, n::usize);
+    if (R.is_err[*value.Value, str](r))  { ret R.err[bool, str](R.unwrap_err[*value.Value, str](r)); }
+    val ops: *value.Value = R.unwrap_ok[*value.Value, str](r);
+    ops[0] = slot;
+    ops[1] = inst.operands[1];
+    var i: u32 = 3;
+    var w: u32 = 2;
+    for (i < inst.operand_count) { ops[w] = inst.operands[i]; w = w + 1; i = i + 1; }
+
+    ir.instr_replace_operands(st.m, inst, ops, n);
+    inst.aux_ty = agg_field_type(st, st.cand_ty[c], k);
+    ret R.ok[bool, str](true);
+}
+
+# expand a whole-slot zero fill into one zeroing store per field
+# ---
+# st:     state
+# cur:    the insertion point
+# c:      the candidate being zeroed
+# secret: the memzero's secrecy taint
+# ret:    ok(true) once every field is zeroed, or the first error
+fun expand_memzero(st: *State, cur: *Cursor, c: u32, secret: bool) R.Result[bool, str] {
+    val tainted: bool = secret || st.cand_secret[c];
+    var k: u32 = 0;
+    for (k < st.cand_nf[c]) {
+        val ft: ir_type.IrTypeId = agg_field_type(st, st.cand_ty[c], k);
+        val slot: value.Value = st.slots[st.cand_slot[c] + k];
+        if (ir_type.is_aggregate(?st.m.types, ft)) {
+            val r: R.Result[bool, str] = emit_memzero(st, cur, slot, ft, tainted);
+            if (R.is_err[bool, str](r)) { ret r; }
+        } or {
+            val r: R.Result[bool, str] = emit_store(st, cur, zero_of(st, ft), slot, tainted);
+            if (R.is_err[bool, str](r)) { ret r; }
+        }
+        k = k + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# expand a whole-aggregate copy into `dst`'s slots into one field copy per field
+#
+# The source is read from its own slots when it is itself being split, and through a
+# fresh field gep otherwise -- a copy already dereferences the source at exactly this
+# point, so reading its fields here is as safe as the copy it replaces.
+# ---
+# st:     state
+# cur:    the insertion point
+# dst:    the destination candidate
+# src:    the copied aggregate's address
+# secret: the copy's secrecy taint
+# ret:    ok(true) once every field is copied, or the first error
+fun expand_copy(st: *State, cur: *Cursor, dst: u32, src: value.Value, secret: bool) R.Result[bool, str] {
+    val tainted: bool = secret || src.secret || st.cand_secret[dst];
+    val sc: u32 = candidate_at(st, src);
+    var k: u32 = 0;
+    for (k < st.cand_nf[dst]) {
+        var from: value.Value;
+        if (sc != NONE_U32 && st.cand_out[sc] == false) {
+            from = st.slots[st.cand_slot[sc] + k];
+        } or {
+            val r: R.Result[value.Value, str] = emit_field_gep(st, cur, src, st.cand_ty[dst], k, tainted);
+            if (R.is_err[value.Value, str](r)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r)); }
+            from = R.unwrap_ok[value.Value, str](r);
+        }
+        val res: R.Result[bool, str] = copy_field(st, cur, st.slots[st.cand_slot[dst] + k],
+                                                  from, agg_field_type(st, st.cand_ty[dst], k), tainted);
+        if (R.is_err[bool, str](res)) { ret res; }
+        k = k + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# copy one field from `from` into the slot `slot`
+#
+# A scalar field is a load / store pair; an aggregate field is a whole-aggregate
+# store, which the next split round decomposes in turn.
+# ---
+# st:      state
+# cur:     the insertion point
+# slot:    the destination field slot
+# from:    the source field's address
+# ft:      the field type
+# tainted: whether the traffic carries secret data
+# ret:     ok(true) once copied, or the first error
+fun copy_field(st: *State, cur: *Cursor, slot: value.Value, from: value.Value, ft: ir_type.IrTypeId, tainted: bool) R.Result[bool, str] {
+    if (ir_type.is_aggregate(?st.m.types, ft)) {
+        ret emit_store(st, cur, value.retype(from, ft), slot, tainted);
+    }
+    val r_load: R.Result[value.Value, str] = emit_load(st, cur, from, ft, tainted);
+    if (R.is_err[value.Value, str](r_load)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_load)); }
+    ret emit_store(st, cur, R.unwrap_ok[value.Value, str](r_load), slot, tainted);
+}
+
+# the zero constant of a scalar field type
+# ---
+# st: state
+# ft: the field type
+# ret: the typed zero the field's zeroing store writes
+fun zero_of(st: *State, ft: ir_type.IrTypeId) value.Value {
+    if (ir_type.is_float_scalar(?st.m.types, ft)) { ret value.const_float(0.0, ft); }
+    val opt: O.Option[*ir_type.IrType] = ir_type.get(?st.m.types, ft);
+    if (O.is_some[*ir_type.IrType](opt)) {
+        if (O.unwrap[*ir_type.IrType](opt).kind == ir_type.IRT_PTR) { ret value.const_null(ft); }
+    }
+    ret value.const_int(0, ft);
+}
+
+# the erase predicate `mutate.erase_marked` drives: the split aggregates themselves
+# plus every instruction the rewrite superseded
+# ---
+# ctx: a *State
+# iid: the instruction id to test
+# ret: true when the instruction is to be dropped
+fun erase_test(ctx: ptr, iid: id.InstructionId) bool {
+    val st: *State = ctx::*State;
+    if (iid::u32 >= st.pool_len) { ret false; }
+    if (st.erase[iid::u32])      { ret true; }
+    val c: u32 = st.cand_of[iid::u32];
+    ret c != NONE_U32 && st.cand_out[c] == false;
+}
