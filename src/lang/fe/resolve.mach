@@ -2148,26 +2148,18 @@ fun bind_stmt(rc: *ResolveContext, sid: id.StmtId) R.Result[bool, str] {
     ret R.ok[bool, str](true);
 }
 
-# binds a `$each <ident> in <seq> { body }` (#1473): the sequence's `$fields(T)`
-# binds T as a type; the loop variable is declared in a fresh scope as a comptime
-# binding visible to the body, which is then bound. arm selection / expansion is
-# deferred to sema + lowering
+# binds a `$each <ident> in <seq> { body }` (#1473): the sequence binds as an
+# ordinary expression -- a `$fields(T)` sequence carries its T as a type-operand
+# node the call arm resolves as a type (#2178) -- and the loop variable is
+# declared in a fresh scope as a comptime binding visible to the body, which is
+# then bound. arm selection / expansion is deferred to sema + lowering
 # ---
 # rc:  resolver state for the module being resolved
 # ce:  the `$each` statement payload
 # ret: ok(true), or a binding error
 fun bind_comptime_each(rc: *ResolveContext, ce: *stmt.StmtComptimeEach) R.Result[bool, str] {
-    if (comptime.is_fields_call(rc.a, rc.source, ce.seq)) {
-        val targ: id.ExprId = comptime.fields_type_arg(rc.a, ce.seq);
-        if (targ != id.EXPR_NIL) {
-            val rt: R.Result[bool, str] = bind_intrinsic_type_arg(rc, targ);
-            if (R.is_err[bool, str](rt)) { ret rt; }
-        }
-    }
-    or {
-        val rs: R.Result[bool, str] = bind_expr(rc, ce.seq);
-        if (R.is_err[bool, str](rs)) { ret rs; }
-    }
+    val rs: R.Result[bool, str] = bind_expr(rc, ce.seq);
+    if (R.is_err[bool, str](rs)) { ret rs; }
 
     val r_s: R.Result[ScopeId, str] = open_scope(rc, rc.current_scope);
     if (R.is_err[ScopeId, str](r_s)) { ret R.err[bool, str](R.unwrap_err[ScopeId, str](r_s)); }
@@ -2358,7 +2350,41 @@ fun bind_expr(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str] {
         }
         ret R.ok[bool, str](true);
     }
-    ret R.ok[bool, str](true);
+    if (e.kind == expr.EXPR_KIND_TYPE_REF) {
+        # a comptime intrinsic's type operand (#2178): bind the type spelling it
+        # carries through the ordinary type machinery, so `Box[T]`, `*T`, `^T` and
+        # `[N]T` all resolve exactly as they do in type position.
+        ret bind_type(rc, e.data.type_ref.ty);
+    }
+    if (expr_kind_binds_nothing(e.kind)) { ret R.ok[bool, str](true); }
+
+    # every child-bearing expression kind has an arm above; reaching here means a
+    # kind was added without one, and its identifiers would silently never be bound
+    # -- exactly how a `:^` strip cast shipped unresolved through a whole release
+    # (#2138/#2144). fail loudly at the gap rather than leaving sema to poison the
+    # unbound operand and lowering to report the wreckage.
+    #
+    # unreachable while the arms above stay complete, so no test kills it and it
+    # survives its own mutation. deleting any arm above is what fires it - that is
+    # the fault it exists for, and the whole reason it is not dead code. do not
+    # remove it for being untested.
+    ret diagnostic.error(?rc.s.diags, rc.a.file_id, e.span, "internal: this expression kind has no name-binding rule; the resolver cannot bind its operands");
+}
+
+# whether `k` is an expression kind with no name-bearing children, so binding it
+# is genuinely a no-op
+#
+# The literals, the `$ident` comptime root (a builtin, bound nowhere), and the
+# parse-error placeholder. Kept as an explicit list so `bind_expr`'s fallthrough
+# can treat anything else as a missing rule rather than as nothing to do.
+# ---
+# k:   the expression kind to classify
+# ret: true when the kind carries no names to bind
+fun expr_kind_binds_nothing(k: expr.ExprKind) bool {
+    ret k == expr.EXPR_KIND_LIT_INT   || k == expr.EXPR_KIND_LIT_FLOAT
+     || k == expr.EXPR_KIND_LIT_CHAR  || k == expr.EXPR_KIND_LIT_STR
+     || k == expr.EXPR_KIND_LIT_NIL   || k == expr.EXPR_KIND_COMPTIME_IDENT
+     || k == expr.EXPR_KIND_ERROR;
 }
 
 # bind every expression in `[start, start + len)` of the expr-id pool
@@ -2696,97 +2722,45 @@ fun edit_distance(a: str, b: str, cap: usize) usize {
 # their distance cannot be small anyway
 val SUGGEST_ROW: usize = 128;
 
-# classifies a call's callee as a comptime value intrinsic by its name: 1 for
-# `$size_of`/`$align_of` (one type argument), 2 for `$offset_of` (a type plus a
-# field), or 0 when the callee is not one of these. recognizing the intrinsic
-# in the bind pass lets its type-naming argument resolve through the primitive
-# registry (so `$size_of(i64)` works) and lets `$offset_of`'s bare field name
-# escape value-scope lookup
+# whether a call's callee is `$offset_of`, the one intrinsic whose argument list
+# is not uniformly bindable: its second argument is a bare field name, resolved
+# against the record at lowering time rather than in any scope here
 # ---
 # rc:     resolver state for the module being resolved
 # callee: the call's callee expression
-# ret:    1 for a one-type intrinsic, 2 for `$offset_of`, 0 otherwise
-fun comptime_intrinsic_kind(rc: *ResolveContext, callee: id.ExprId) u8 {
+# ret:    true when the callee is `$offset_of`
+fun callee_is_offset_of(rc: *ResolveContext, callee: id.ExprId) bool {
     val ce_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, callee);
-    if (O.is_none[*expr.Expr](ce_opt)) { ret 0; }
+    if (O.is_none[*expr.Expr](ce_opt)) { ret false; }
     val ce: *expr.Expr = O.unwrap[*expr.Expr](ce_opt);
-    if (ce.kind != expr.EXPR_KIND_COMPTIME_IDENT) { ret 0; }
+    if (ce.kind != expr.EXPR_KIND_COMPTIME_IDENT) { ret false; }
 
     val ns: token.Span = comptime.comptime_ident_name(ce.span);
-    if (ns.len == 0) { ret 0; }
+    if (ns.len == 0) { ret false; }
     val r: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, ns);
-    if (R.is_err[intern.StrId, str](r)) { ret 0; }
-    val name: intern.StrId = R.unwrap_ok[intern.StrId, str](r);
-
-    if (name == interned_literal(rc, "size_of"))   { ret 1; }
-    if (name == interned_literal(rc, "align_of"))  { ret 1; }
-    if (name == interned_literal(rc, "offset_of")) { ret 2; }
-    ret 0;
+    if (R.is_err[intern.StrId, str](r)) { ret false; }
+    ret R.unwrap_ok[intern.StrId, str](r) == interned_literal(rc, "offset_of");
 }
 
-# binds a comptime value intrinsic call's arguments. the first argument names a
-# type, so it resolves as a type spelling (primitive registry first, then the
-# value scope for user types) rather than as a value reference; `$offset_of`'s
-# second argument is a bare field name resolved against the record at lowering
-# time and is left unbound here. returns none when the call is not an intrinsic,
-# letting the caller fall back to ordinary call binding
+# binds a comptime intrinsic call whose argument list is not uniformly value
+# expressions
+#
+# A type-taking intrinsic carries its type operand as an EXPR_KIND_TYPE_REF the
+# parser read with the type grammar, so ordinary call binding already resolves it
+# as a type (#2178). The one shape that still needs handling is `$offset_of`'s
+# SECOND argument: a bare field name resolved against the record at lowering time,
+# which must escape value-scope lookup. Returns none for every other call, letting
+# the caller bind it as an ordinary call.
 # ---
 # rc:  resolver state for the module being resolved
 # c:   the call payload
-# ret: some(result) when handled as an intrinsic, none to fall through
+# ret: some(result) when handled here, none to fall through
 fun bind_comptime_intrinsic_call(rc: *ResolveContext, c: *expr.ExprCall) O.Option[R.Result[bool, str]] {
-    val kind: u8 = comptime_intrinsic_kind(rc, c.callee);
-    if (kind == 0)      { ret O.none[R.Result[bool, str]](); }
-    if (c.args_len < 1) { ret O.some[R.Result[bool, str]](R.ok[bool, str](true)); }
+    if (!callee_is_offset_of(rc, c.callee)) { ret O.none[R.Result[bool, str]](); }
+    if (c.args_len < 1)                     { ret O.some[R.Result[bool, str]](R.ok[bool, str](true)); }
 
     val arg0: id.ExprId = rc.a.expr_ids[c.args_start];
-    ret O.some[R.Result[bool, str]](bind_intrinsic_type_arg(rc, arg0));
-}
-
-# resolves an intrinsic's type-naming argument expression. a bare single
-# identifier resolves to a primitive (`i64`, `bool`, `ptr`, ...) before the
-# value scope, mirroring `resolve_type_path`; a `module.Type` member chain
-# resolves through the module's exports. the resolved SymbolId is recorded in
-# `expr_resolved` so sema can recover the operand type
-# ---
-# rc:  resolver state for the module being resolved
-# eid: the type-naming argument expression
-# ret: ok(true), or a binding error
-fun bind_intrinsic_type_arg(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str] {
-    if (eid == id.EXPR_NIL) { ret R.ok[bool, str](true); }
-    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, eid);
-    if (O.is_none[*expr.Expr](e_opt)) { ret R.ok[bool, str](true); }
-    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
-
-    if (e.kind == expr.EXPR_KIND_IDENT) {
-        val r: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, e.span);
-        if (R.is_err[intern.StrId, str](r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](r)); }
-        val name: intern.StrId = R.unwrap_ok[intern.StrId, str](r);
-
-        var sid: SymbolId = prim_symbol_for(rc, name);
-        if (sid == SYMBOL_NIL) { sid = scope_lookup_chain(rc, rc.current_scope, name); }
-        if (sid == SYMBOL_NIL) {
-            val re: R.Result[bool, str] = report_named(rc, e.span, "unresolved type name `", name, "`");
-            if (R.is_ok[bool, str](re)) { attach_suggestion(rc, name); }
-        }
-        or {
-            if (rc.expr_resolved != nil) { rc.expr_resolved[eid] = sid; }
-        }
-        ret R.ok[bool, str](true);
-    }
-
-    if (e.kind == expr.EXPR_KIND_MEMBER) {
-        # a qualified `module.Type` argument: bind the object alias first, then
-        # resolve the leaf against the module's exports (reuses the qualified
-        # member machinery used for value-position module references).
-        val ro: R.Result[bool, str] = bind_expr(rc, e.data.member.object);
-        if (R.is_err[bool, str](ro)) { ret ro; }
-        ret bind_member_qualified(rc, eid, ?e.data.member);
-    }
-
-    # any other argument shape is not a type spelling; bind it as a normal
-    # expression so a diagnostic surfaces the misuse.
-    ret bind_expr(rc, eid);
+    ret O.some[R.Result[bool, str]](bind_expr(rc, arg0));
 }
 
 # binds the two operands of a type comparison (`$type_of(...) == TypeName`,
@@ -2822,7 +2796,60 @@ fun bind_type_operand(rc: *ResolveContext, operand: id.ExprId) R.Result[bool, st
         if (O.is_none[*expr.Expr](n_opt)) { ret R.ok[bool, str](true); }
         ret bind_expr(rc, O.unwrap[*expr.Expr](n_opt).data.member.object);
     }
-    ret bind_intrinsic_type_arg(rc, operand);
+    ret bind_type_name_expr(rc, operand);
+}
+
+# binds a type name that arrives as an EXPRESSION rather than a type spelling
+#
+# Only the type-comparison operand needs this: `$type_of(x) == Name` is a binary
+# comparison whose right operand cannot be read with the type grammar, because
+# nothing at parse time distinguishes it from an ordinary value comparison -- the
+# comparison is recognized only here, after both operands are already expressions.
+# A single IDENT resolves to a primitive (`i64`, `bool`, `ptr`, ...) before the
+# value scope, mirroring `resolve_type_path`; a `module.Type` member chain
+# resolves through the module's exports. The resolved SymbolId is recorded in
+# `expr_resolved` so sema can recover the named type. A generic-instance spelling
+# (`Box[u32]`) is not expressible in this position -- the intrinsic operands that
+# CAN spell one carry a parsed type instead (#2178).
+# ---
+# rc:  resolver state for the module being resolved
+# eid: the type-naming operand expression
+# ret: ok(true), or a binding error
+fun bind_type_name_expr(rc: *ResolveContext, eid: id.ExprId) R.Result[bool, str] {
+    if (eid == id.EXPR_NIL) { ret R.ok[bool, str](true); }
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(rc.a, eid);
+    if (O.is_none[*expr.Expr](e_opt)) { ret R.ok[bool, str](true); }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
+
+    if (e.kind == expr.EXPR_KIND_IDENT) {
+        val r: R.Result[intern.StrId, str] = intern.intern_span(?rc.s.interner, rc.source, e.span);
+        if (R.is_err[intern.StrId, str](r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](r)); }
+        val name: intern.StrId = R.unwrap_ok[intern.StrId, str](r);
+
+        var sid: SymbolId = prim_symbol_for(rc, name);
+        if (sid == SYMBOL_NIL) { sid = scope_lookup_chain(rc, rc.current_scope, name); }
+        if (sid == SYMBOL_NIL) {
+            val re: R.Result[bool, str] = report_named(rc, e.span, "unresolved type name `", name, "`");
+            if (R.is_ok[bool, str](re)) { attach_suggestion(rc, name); }
+        }
+        or {
+            if (rc.expr_resolved != nil) { rc.expr_resolved[eid] = sid; }
+        }
+        ret R.ok[bool, str](true);
+    }
+
+    if (e.kind == expr.EXPR_KIND_MEMBER) {
+        # a qualified `module.Type` operand: bind the object alias first, then
+        # resolve the leaf against the module's exports (reuses the qualified
+        # member machinery used for value-position module references).
+        val ro: R.Result[bool, str] = bind_expr(rc, e.data.member.object);
+        if (R.is_err[bool, str](ro)) { ret ro; }
+        ret bind_member_qualified(rc, eid, ?e.data.member);
+    }
+
+    # any other operand shape is not a type spelling; bind it as a normal
+    # expression so a diagnostic surfaces the misuse.
+    ret bind_expr(rc, eid);
 }
 
 # whether `eid` is an `f.type` operand whose object resolves, in the current

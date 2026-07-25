@@ -32,6 +32,7 @@ use O: std.types.option;
 use R: std.types.result;
 
 use enc: mach.lang.be.codegen.encode;
+use mach.lang.be.codegen.mir;
 use mach.lang.be.obj;
 use mach.lang.me.ir;
 use ir_type: mach.lang.me.ir.type;
@@ -326,6 +327,10 @@ fun resolve(itn: *intern.Interner, id: intern.StrId) str {
 #            void or an unresolved type (no DW_AT_type)
 # var_start: index of this function's first variable in the shared var array
 # var_count: number of variables this function contributes
+# omit:      true when the back end emitted no frame for this function
+#            (`mir.MirFrame.omit`, #1940), so its DW_AT_frame_base names the stack
+#            pointer rather than a frame-pointer register that still holds the
+#            caller's value
 rec DwFunc {
     name:      intern.StrId;
     offset:    u32;
@@ -339,6 +344,7 @@ rec DwFunc {
     ret_ty:    i32;
     var_start: u32;
     var_count: u32;
+    omit:      bool;
 }
 
 # a variable that lives in one place for its whole scope uses VLOC_REG / VLOC_FRAME /
@@ -895,7 +901,7 @@ fun sem_to_ir(s: *session.Session, dtypes: *ir_type.IrTypeTable, sem: semtype.Ty
     }
 
     if (k == semtype.TYPE_REC || k == semtype.TYPE_UNI || k == semtype.TYPE_INSTANCE) {
-        ret sem_to_ir_nominal(s, dtypes, sem, k == semtype.TYPE_UNI);
+        ret sem_to_ir_nominal(s, dtypes, sem, semtype.is_union(?s.types, sem));
     }
 
     # function / generic-param / error types bridge to an opaque pointer-width slot, as
@@ -960,17 +966,38 @@ fun sem_to_ir_nominal(s: *session.Session, dtypes: *ir_type.IrTypeTable, tid: se
 # DWARF-based targets always wire the hook, so this is defined for every arch that
 # reaches the producer
 #
-# A subprogram's DW_AT_frame_base is `DW_OP_reg<this>`, so `-g` debug info relies on
-# a retained frame pointer (the epic pins one instead of emitting CFI). The back end
-# always emits the rbp/x29/s0 prologue today; a future frame-pointer-omission
-# optimization must stay disabled under a debug build or DW_AT_fbreg locations and
-# `DW_AT_frame_base` would point at a clobbered register.
+# A subprogram's DW_AT_frame_base is `DW_OP_reg<this>`, so a function with a frame
+# resolves its `DW_AT_fbreg` variable locations against a retained frame pointer (the
+# epic pins one instead of emitting CFI). A frame-omitting function (#1940) never took
+# a frame pointer, so this register still holds the CALLER's value there and
+# `frame_base_omit_reg` supplies its base instead.
 # ---
 # tgt: the resolved target
 # ret: the frame pointer's DWARF register number
 fun frame_base_reg(tgt: *target.Target) i32 {
     val f: isa.DwarfRegFn = tgt.arch.dwarf_reg;
     ret f(tgt.arch.frame_ptr_reg);
+}
+
+# the DWARF register number a frame-omitting function's DW_AT_frame_base names -
+# the stack pointer
+#
+# A function reaches `MirFrame.omit` only with no slots, no callee saves, no
+# outgoing-argument region and no call, so nothing in its body moves the stack
+# pointer: it holds the entry value for the whole body and is the one register that
+# describes the (empty) frame truthfully. Naming the frame-pointer register instead
+# would describe the CALLER's frame.
+#
+# No `DW_AT_fbreg` location can occur inside such a function - fbreg locations come
+# from frame slots and it has none - so this base is emitted for completeness rather
+# than to be dereferenced. That is the point: a location added later resolves against
+# a true base rather than silently against the caller's.
+# ---
+# tgt: the resolved target
+# ret: the stack pointer's DWARF register number
+fun frame_base_omit_reg(tgt: *target.Target) i32 {
+    val f: isa.DwarfRegFn = tgt.arch.dwarf_reg;
+    ret f(tgt.arch.stack_ptr_reg);
 }
 
 # the largest number of distinct source files a compile unit's file table holds
@@ -1540,7 +1567,8 @@ fun resolve_type_fixups(b: *enc.ByteBuf, tc: *TypeCtx, fixups: *TypeFixup, nfix:
 # name:         DW_AT_name text (the CU's primary source path)
 # comp_dir:     DW_AT_comp_dir text
 # high_pc:      code span in bytes (high_pc - low_pc)
-# fb_reg:       frame-base DWARF register number
+# fb_reg:       frame-base DWARF register number for a function with a frame
+# fb_omit_reg:  frame-base DWARF register number for a frame-omitting function
 # funcs/nfuncs: the module's functions (with resolved decl / return metadata)
 # tc:           the gathered type table (with resolved DIE / string offsets)
 # relocs:       out - the InfoReloc list
@@ -1549,7 +1577,7 @@ fun resolve_type_fixups(b: *enc.ByteBuf, tc: *TypeCtx, fixups: *TypeFixup, nfix:
 # stmt_off:     out - byte offset of the CU 4-byte stmt_list field
 # fixups:       scratch - the type-DIE ref4 patch list (cap >= type count + member count)
 fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp_dir: str,
-               high_pc: u64, fb_reg: i32, funcs: *DwFunc, nfuncs: u32, tc: *TypeCtx,
+               high_pc: u64, fb_reg: i32, fb_omit_reg: i32, funcs: *DwFunc, nfuncs: u32, tc: *TypeCtx,
                vars: *DwVar, relocs: *InfoReloc, reloc_count: *u32, low_off: *u32, stmt_off: *u32,
                s: *session.Session, irmod: *ir.Module, strtab: *StrTab,
                inlines: *DwInline, ninl: u32, iranges: *DwInlineRange, fixups: *TypeFixup) {
@@ -1626,7 +1654,9 @@ fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp
         if (fn.external) { enc.emit_byte(b, 1); } or { enc.emit_byte(b, 0); }
         uleb(b, fn.decl_file::u64);
         uleb(b, fn.decl_line::u64);
-        emit_frame_base(b, fb_reg);
+        # a frame-omitting function never took a frame pointer, so its base is the
+        # stack pointer it did not move.
+        if (fn.omit) { emit_frame_base(b, fb_omit_reg); } or { emit_frame_base(b, fb_reg); }
         if (fn.ret_ty >= 0) { enc.emit_u32(b, tc.types[fn.ret_ty::u32].off); }   # DW_AT_type (ref4)
 
         # the subprogram's own variable / parameter children: instance-0 vars, plus any
@@ -2349,12 +2379,33 @@ fun count_funcs(image: *of.ObjectImage, text_sec: u32) u32 {
     ret n;
 }
 
+# report whether the back end emitted `name` without a frame
+#
+# The symbol name is the MIR function name (the encoder marks the entry symbol from
+# `MirFunction.name`), so the interned ids compare directly. A name with no MIR
+# function - there is none today, the symbols come from the same module - answers
+# false, the framed shape.
+# ---
+# mirmod: the laid-out MIR module
+# name:   the interned function symbol name
+# ret:    true when the function's frame was omitted (#1940)
+fun mir_omits_frame(mirmod: *mir.MirModule, name: intern.StrId) bool {
+    if (mirmod == nil) { ret false; }
+    var i: u32 = 0;
+    for (i < mirmod.function_len) {
+        if (mirmod.functions[i].name == name) { ret mirmod.functions[i].frame.omit; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 # gather the module's `.text` functions into `out`, sorted by ascending offset
 # ---
 # image:    the object image whose symbols are gathered
+# mirmod:   the laid-out MIR module, for each function's frame-omission fact
 # text_sec: the `.text` section index
 # out:      destination array, sized `count_funcs`
-fun gather_funcs(image: *of.ObjectImage, text_sec: u32, out: *DwFunc) {
+fun gather_funcs(image: *of.ObjectImage, mirmod: *mir.MirModule, text_sec: u32, out: *DwFunc) {
     var n: u32 = 0;
     var i: u32 = 0;
     for (i < image.symbol_count) {
@@ -2364,6 +2415,7 @@ fun gather_funcs(image: *of.ObjectImage, text_sec: u32, out: *DwFunc) {
             out[n].offset   = sym.offset;
             out[n].external = (sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0;
             out[n].weak     = (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0;
+            out[n].omit     = mir_omits_frame(mirmod, sym.name);
             n = n + 1;
         }
         i = i + 1;
@@ -2447,7 +2499,7 @@ fun add_reloc_addend(image: *of.ObjectImage, sec: u32, offset: u32, kind: of.Rel
 # target, the IR module, and the encoder's output - every one of which imports the
 # target layer the vtable lives in - so a typed field there would invert the
 # dependency. `be.codegen` casts `tgt.debug.produce` back to this before calling it.
-pub def ProduceFn: fun(*session.Session, *target.Target, *ir.Module,
+pub def ProduceFn: fun(*session.Session, *target.Target, *ir.Module, *mir.MirModule,
                        *of.ObjectImage, *enc.LineRow, u32,
                        *enc.VarLoc, u32,
                        *enc.InlinePc, u32,
@@ -2465,6 +2517,8 @@ pub def ProduceFn: fun(*session.Session, *target.Target, *ir.Module,
 # s:        session (source map, type universe)
 # tgt:      resolved target (address size, frame-pointer register)
 # irmod:    IR module supplying each function's source name and semantic return type
+# mirmod:   the laid-out MIR module supplying each function's frame facts (which
+#           functions the back end emitted without a frame, #1940)
 # image:    the per-module object image being built
 # rows:     the encoder's re-homed PC<->source rows
 # row_count: number of rows
@@ -2474,7 +2528,7 @@ pub def ProduceFn: fun(*session.Session, *target.Target, *ir.Module,
 # comp_dir_id: interned DW_AT_comp_dir (the project root)
 # text_sec: the `.text` section index
 # ret:      ok(true) on success, or an allocation error
-pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
+pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, mirmod: *mir.MirModule,
                 image: *of.ObjectImage, rows: *enc.LineRow, row_count: u32,
                 varlocs: *enc.VarLoc, varloc_count: u32,
                 inline_pcs: *enc.InlinePc, inline_pc_count: u32,
@@ -2491,7 +2545,7 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     val rf: R.Result[*DwFunc, str] = A.allocate[DwFunc](s.alloc, nfuncs::usize);
     if (R.is_err[*DwFunc, str](rf)) { ret R.err[bool, str](R.unwrap_err[*DwFunc, str](rf)); }
     val funcs: *DwFunc = R.unwrap_ok[*DwFunc, str](rf);
-    gather_funcs(image, text_sec, funcs);
+    gather_funcs(image, mirmod, text_sec, funcs);
 
     # the encoder records no per-symbol size, so a function's extent is the gap to
     # the next function (in `.text` order) and the last runs to the section end.
@@ -2731,7 +2785,8 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
     }
     var low_off:  u32 = 0;
     var stmt_off: u32 = 0;
-    build_info(?b_info, address_size, producer, name, comp_dir, high_pc, frame_base_reg(tgt),
+    build_info(?b_info, address_size, producer, name, comp_dir, high_pc,
+               frame_base_reg(tgt), frame_base_omit_reg(tgt),
                subs, nsub, ?tc, vars, info_relocs, ?info_reloc_count, ?low_off, ?stmt_off,
                s, irmod, ?strtab, inlines, ninl, iranges, type_fixups);
 
@@ -2770,9 +2825,12 @@ var dwarf_debug_vtable: of.DebugVTable;
 
 # install the DWARF producer into a target registry's debug dimension
 #
-# The debug-dimension counterpart of `be.linker.register_reloc_hooks`: the target
-# layer owns the `DebugRegistry` slot but cannot name this be-layer producer, so
-# the wiring lands here. Sets the DWARF vtable's identity and its erased `produce`
+# The target layer owns the `DebugRegistry` slot but cannot name this be-layer
+# producer, so the wiring lands here. It is the last capability attached to a
+# registered vtable after the fact: the ISA relocation packers were the other, and
+# they became a contract the arch declares at construction (#2244). Unlike them
+# this one is keyed on the model's own registered name rather than on a table of
+# names a subsystem holds, so nothing here has to know the set in advance. Sets the DWARF vtable's identity and its erased `produce`
 # hook, then registers it under "dwarf" - the name elf / mach-o's `default_debug`
 # resolves against. Idempotent: `debug_register` keeps the first write-once entry.
 # Must run at startup (from `driver.setup_registry`) before any `select`.
@@ -2781,8 +2839,7 @@ var dwarf_debug_vtable: of.DebugVTable;
 # ret: ok(true) once registered
 pub fun register_debug_hooks(reg: *of.DebugRegistry) R.Result[bool, str] {
     # the target layer registered the model's identity (register_all); wire the
-    # producer onto that entry, mirroring how register_reloc_hooks mutates the
-    # registered ISA vtables. a registry composed without the identities (a
+    # producer onto that entry. a registry composed without the identities (a
     # be-layer test's scratch registry) still gets the full vtable registered.
     val opt_dw: O.Option[*of.DebugVTable] = of.debug_lookup(reg, "dwarf");
     if (O.is_some[*of.DebugVTable](opt_dw)) {
@@ -3473,7 +3530,7 @@ fun struct_intern(s: *session.Session, tgt: *target.Target, dtypes: *ir_type.IrT
     val t: *semtype.Type = O.unwrap[*semtype.Type](to);
 
     var tk: u8 = TK_STRUCT;
-    if (t.kind == semtype.TYPE_UNI) { tk = TK_UNION; }
+    if (semtype.is_union(?s.types, sem)) { tk = TK_UNION; }
     # resolve the name string before any further interning (comp_name reads `t`); an
     # anonymous shape (empty spelling) is marked NAME_OMIT so its DIE drops DW_AT_name (#1955).
     val cnm: str = comp_name(s, t);

@@ -34,6 +34,19 @@ At module top level:
 
 Inside functions, they are local to the enclosing block.
 
+A module-level `val` of integer, `bool` or float type whose initializer is a
+compile-time constant **is** that value at every use site, in its own module and
+in every module that imports it — however the reference is spelled (bare,
+module-qualified, or through a `use` alias). No load is emitted, and arithmetic
+over it folds and strength-reduces like any other literal. Its storage is still
+emitted, so `?NAME` has an address, and a `val` whose initializer is not a
+compile-time constant keeps its load.
+
+A constant whose value **is** an address — a `str`, whose value is a pointer to
+its bytes — is never duplicated this way. It keeps one definition and every
+reference reads it, so two references to one `str` constant compare pointer-equal
+no matter which module they are in or how they are spelled.
+
 ## `ext` — foreign data imports
 
 `ext val` / `ext var` declares a binding whose storage lives in another object,

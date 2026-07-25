@@ -1747,13 +1747,22 @@ fun encode_inst(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
         ret ld_sz + rest;
     }
 
+    val start: usize = buf.len;
     val n: i32 = encode_inst_one(mi, buf);
     # render whatever this call emitted and nobody else claimed. a form that
-    # legalizes itself into several instructions emits each through this same
-    # wrapper, so those are already accounted and only the tail - the instruction
-    # `mi` itself became - is left to render. an emission of zero bytes (a pseudo)
-    # renders nothing.
-    if (enc.sink_unaccounted(buf) > 0) { printer.note_inst(buf, mi); }
+    # legalizes itself into several instructions emits each through its own emitter,
+    # so those are already claimed and only the tail - the instruction `mi` itself
+    # became - is left to render. an emission of zero bytes (a pseudo) renders
+    # nothing.
+    #
+    # `start` is the offset this call began writing at, and it is what makes the
+    # claim exact on a variable-length encoding: the sink accepts a claim only when it
+    # begins where the previous one ended, so bytes some earlier path emitted without
+    # notifying are not swallowed by this instruction's notification (#2250). A
+    # decomposing form claims every byte through its emitters and leaves no tail; one
+    # that left a tail AFTER an inner claim would be claiming a range that starts
+    # behind the cursor, and the sink refuses it rather than papering over it.
+    if (enc.sink_unaccounted(buf) > 0) { printer.note_inst(buf, mi, start); }
     ret n;
 }
 
@@ -2460,40 +2469,14 @@ fun patch_branch_x86(st: *enc.EncodeState, fx: *enc.BranchFixup, target_off: u32
     ret R.ok[bool, str](true);
 }
 
-# true when a function carries inline asm yet needs no stack
-# frame - no locals/spills (frame.size), no callee-saved registers (callee_mask),
-# and no outgoing-argument area. such a function's inline asm owns the stack and
-# must be emitted without a compiler-generated prologue/epilogue: the entry-point
-# `_start`, for instance, reads the kernel-supplied RSP directly
-# (`mov rdi, [rsp]` = argc), so a `push rbp` ahead of it would shift RSP and
-# corrupt the argc/argv it extracts. a function with any frame (e.g. an asm body
-# preceded by a local, like `panic`) is not naked and keeps its prologue
-fun function_is_naked(f: *mir.MirFunction) bool {
-    if (f.frame.size != 0)          { ret false; }
-    if (f.callee_mask != 0)         { ret false; }
-    if (f.callee_mask_fp != 0)      { ret false; }
-    if (f.frame.outgoing_size != 0) { ret false; }
-
-    var bi: u32 = 0;
-    for (bi < f.block_count) {
-        val blk: *mir.MirBlock = ?f.blocks[bi];
-        var ii: u32 = 0;
-        for (ii < blk.instr_count) {
-            val mi: *mir.MirInstr = ?blk.instrs[ii];
-            if (mi.opcode::u16 == x64.ASM_BLOCK::u16) { ret true; }
-            ii = ii + 1;
-        }
-        bi = bi + 1;
-    }
-    ret false;
-}
-
 # encode one function: mark its entry symbol, emit the prologue, then emit each
 # block - emitting the epilogue before every RET. records the `.text` offset of
 # every block (for branch patching) as it goes. the frame size and callee-saved
 # mask come from `frame.run` / `regalloc.run`, which have already laid out the
-# function by the time the encoder sees it. a naked (asm-only) function gets
-# neither prologue nor epilogue - its inline asm owns the stack
+# function by the time the encoder sees it. a frame-omitting function
+# (`frame.omit`, decided once in `frame.run` for every target) gets neither
+# prologue nor epilogue: either its inline asm owns the stack, or it is a leaf
+# that never touches the frame
 fun encode_function(st: *enc.EncodeState, f: *mir.MirFunction) R.Result[bool, str] {
     val fn_base: u32 = st.buf.len::u32;
 
@@ -2503,7 +2486,7 @@ fun encode_function(st: *enc.EncodeState, f: *mir.MirFunction) R.Result[bool, st
     val ms: R.Result[bool, str] = enc.push_symbol(st, f.name, fn_base, of.SYM_OBJ_FLAG_FUNCTION);
     if (R.is_err[bool, str](ms)) { ret ms; }
 
-    val naked: bool = function_is_naked(f);
+    val naked: bool = f.frame.omit;
     val frame_size: u32 = f.frame.size;
     val callee_mask: u32 = f.callee_mask;
     val callee_mask_fp: u32 = f.callee_mask_fp;
@@ -3683,32 +3666,38 @@ fun vec_reg(xmm: i32) isa.Operand {
 # render one packed SSE instruction the vector encoders emitted directly
 #
 # The packed forms write their bytes without building an `isa.Inst`, so they do
-# not pass the `encode_inst` tee and must notify the printer themselves. Missing
-# one is not silent: the sink's byte accounting reports it as unrendered and the
-# encode fails naming the opcode.
+# not pass the `encode_inst` tee and must notify the printer themselves - which makes
+# them the paths where a forgotten notification is easiest to introduce, and #2197
+# found one bypassing the choke point entirely. `start` is the offset the emitter
+# began writing this instruction at, so the claim is that exact range and not
+# "everything outstanding": an emitter that writes bytes and never reaches here is
+# caught by the NEXT emitter's claim beginning past them, rather than being absorbed
+# by it (#2250).
 # ---
 # buf:    the encoder byte sink
+# start:  `.text` offset this instruction's first byte was written to
 # opcode: the concrete packed opcode emitted
 # dst:    the destination operand
 # src:    the source operand, or a NONE operand for a one-operand form
-fun note_packed(buf: *enc.ByteBuf, opcode: u16, dst: isa.Operand, src: isa.Operand) {
+fun note_packed(buf: *enc.ByteBuf, start: usize, opcode: u16, dst: isa.Operand, src: isa.Operand) {
     if (!enc.sink_active(buf)) { ret; }
     var mi: isa.Inst = isa.inst_blank();
     mi.opcode = opcode;
     mi.dst    = dst;
     mi.src1   = src;
     mi.size   = 16;
-    printer.note_inst(buf, ?mi);
+    printer.note_inst(buf, ?mi, start);
 }
 
 # render one packed SSE instruction carrying an imm8 predicate / selector
 # ---
 # buf:    the encoder byte sink
+# start:  `.text` offset this instruction's first byte was written to
 # opcode: the concrete packed opcode emitted
 # dst:    the destination operand
 # src:    the source operand
 # imm:    the imm8 the form carries
-fun note_packed_imm(buf: *enc.ByteBuf, opcode: u16, dst: isa.Operand, src: isa.Operand, imm: u8) {
+fun note_packed_imm(buf: *enc.ByteBuf, start: usize, opcode: u16, dst: isa.Operand, src: isa.Operand, imm: u8) {
     if (!enc.sink_active(buf)) { ret; }
     var mi: isa.Inst = isa.inst_blank();
     mi.opcode = opcode;
@@ -3716,20 +3705,21 @@ fun note_packed_imm(buf: *enc.ByteBuf, opcode: u16, dst: isa.Operand, src: isa.O
     mi.src1   = src;
     mi.src2   = isa.make_imm(imm::i64, 1);
     mi.size   = 16;
-    printer.note_inst(buf, ?mi);
+    printer.note_inst(buf, ?mi, start);
 }
 
 # src is a register or 16-byte-aligned memory operand (#2208): every packed vector
 # value is register- or aligned-slot-resident, so any other shape reaching here is a
 # lowering bug the caller must not swallow
 fun emit_packed_op(op: u16, dst_xmm: i32, src: isa.Operand, buf: *enc.ByteBuf) R.Result[bool, str] {
+    val start: usize = buf.len;
     if (packed_prefix66(op)) { enc.emit_byte(buf, 0x66); }
     if (src.kind == isa.OPK_REG) {
         emit_rex_if_needed(buf, 0, dst_xmm, src.reg);
         enc.emit_byte(buf, 0x0F);
         enc.emit_byte(buf, packed_opbyte(op));
         enc.emit_byte(buf, encode_modrm(3, reg_bits(dst_xmm), reg_bits(src.reg)));
-        note_packed(buf, op, vec_reg(dst_xmm), src);
+        note_packed(buf, start, op, vec_reg(dst_xmm), src);
         ret R.ok[bool, str](true);
     }
     if (src.kind == isa.OPK_MEM) {
@@ -3737,7 +3727,7 @@ fun emit_packed_op(op: u16, dst_xmm: i32, src: isa.Operand, buf: *enc.ByteBuf) R
         enc.emit_byte(buf, 0x0F);
         enc.emit_byte(buf, packed_opbyte(op));
         encode_mem_operand(buf, dst_xmm, ?src);
-        note_packed(buf, op, vec_reg(dst_xmm), src);
+        note_packed(buf, start, op, vec_reg(dst_xmm), src);
         ret R.ok[bool, str](true);
     }
     ret R.err[bool, str]("encode: packed vector op source is not a register or aligned frame slot");
@@ -3745,52 +3735,57 @@ fun emit_packed_op(op: u16, dst_xmm: i32, src: isa.Operand, buf: *enc.ByteBuf) R
 
 # emit a packed reg-reg op with an imm8 (`[66] [REX] 0F <byte> /r ib`): CMPPS/PD and PSHUFD
 fun emit_packed_rri(op: u16, dst_xmm: i32, src_xmm: i32, imm: u8, buf: *enc.ByteBuf) {
+    val start: usize = buf.len;
     if (packed_prefix66(op)) { enc.emit_byte(buf, 0x66); }
     emit_rex_if_needed(buf, 0, dst_xmm, src_xmm);
     enc.emit_byte(buf, 0x0F);
     enc.emit_byte(buf, packed_opbyte(op));
     enc.emit_byte(buf, encode_modrm(3, reg_bits(dst_xmm), reg_bits(src_xmm)));
     enc.emit_byte(buf, imm);
-    note_packed_imm(buf, op, vec_reg(dst_xmm), vec_reg(src_xmm), imm);
+    note_packed_imm(buf, start, op, vec_reg(dst_xmm), vec_reg(src_xmm), imm);
 }
 
 # emit a packed shift-by-imm8 `<op> xmm, imm8` (group form `66 [REX] 0F <byte> /6 ib`);
 # the shifted register is the r/m operand, /6 the opcode extension in the reg field
 fun emit_packed_shift_imm(op: u16, xmm: i32, imm: u8, buf: *enc.ByteBuf) {
+    val start: usize = buf.len;
     enc.emit_byte(buf, 0x66);
     if (needs_rex(xmm)) { enc.emit_byte(buf, encode_rex(0, 0, xmm)); }
     enc.emit_byte(buf, 0x0F);
     enc.emit_byte(buf, packed_opbyte(op));
     enc.emit_byte(buf, encode_modrm(3, 6, reg_bits(xmm)));
     enc.emit_byte(buf, imm);
-    note_packed(buf, op, vec_reg(xmm), isa.make_imm(imm::i64, 1));
+    note_packed(buf, start, op, vec_reg(xmm), isa.make_imm(imm::i64, 1));
 }
 
 # emit a register-register MOVAPS (`0F 28 /r`) copying one 128-bit XMM to another
 fun emit_movaps_rr(dst_xmm: i32, src_xmm: i32, buf: *enc.ByteBuf) {
+    val start: usize = buf.len;
     emit_rex_if_needed(buf, 0, dst_xmm, src_xmm);
     enc.emit_byte(buf, 0x0F);
     enc.emit_byte(buf, 0x28);
     enc.emit_byte(buf, encode_modrm(3, reg_bits(dst_xmm), reg_bits(src_xmm)));
-    note_packed(buf, x64.MOVAPS, vec_reg(dst_xmm), vec_reg(src_xmm));
+    note_packed(buf, start, x64.MOVAPS, vec_reg(dst_xmm), vec_reg(src_xmm));
 }
 
 # emit an unaligned 128-bit load `MOVUPS xmm, [mem]` (`0F 10 /r`)
 fun emit_movups_load(xmm: i32, mem: isa.Operand, buf: *enc.ByteBuf) {
+    val start: usize = buf.len;
     emit_rex_mem(buf, 0, xmm, ?mem);
     enc.emit_byte(buf, 0x0F);
     enc.emit_byte(buf, 0x10);
     encode_mem_operand(buf, xmm, ?mem);
-    note_packed(buf, x64.MOVUPS, vec_reg(xmm), mem);
+    note_packed(buf, start, x64.MOVUPS, vec_reg(xmm), mem);
 }
 
 # emit an unaligned 128-bit store `MOVUPS [mem], xmm` (`0F 11 /r`)
 fun emit_movups_store(mem: isa.Operand, xmm: i32, buf: *enc.ByteBuf) {
+    val start: usize = buf.len;
     emit_rex_mem(buf, 0, xmm, ?mem);
     enc.emit_byte(buf, 0x0F);
     enc.emit_byte(buf, 0x11);
     encode_mem_operand(buf, xmm, ?mem);
-    note_packed(buf, x64.MOVUPS, mem, vec_reg(xmm));
+    note_packed(buf, start, x64.MOVUPS, mem, vec_reg(xmm));
 }
 
 # load a 16-byte vector operand into the XMM scratch `xmm` via MOVAPS (from an XMM
@@ -6023,8 +6018,17 @@ test "mach.lang.target.isa.x64.encode.check_accounted:rejects_unrendered_bytes" 
     if (!R.is_err[bool, str](check_accounted(?st, x64.NOP))) { bad = 1; }
 
     # once rendered, the same state passes again
-    enc.sink_account(?st.buf);
+    enc.sink_claim(?st.buf, 0);
     if (R.is_err[bool, str](check_accounted(?st, x64.NOP))) { bad = 1; }
+
+    # an instruction whose notification never arrives is NOT absorbed by the one
+    # after it: the successor declares its own first byte, the sink refuses a claim
+    # that does not begin at the cursor, and the skipped bytes keep failing the
+    # guard rather than disappearing into a longer claim (#2250)
+    enc.emit_byte(?st.buf, 0x90);
+    enc.emit_byte(?st.buf, 0x90);
+    enc.sink_claim(?st.buf, 2);
+    if (!R.is_err[bool, str](check_accounted(?st, x64.NOP))) { bad = 1; }
 
     # and with no sink attached the guard is inert, so an object-producing encode
     # never pays for it
