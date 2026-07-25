@@ -263,7 +263,41 @@ fun hoistable(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32,
     # must not raise a division fault because the divide was lifted above the test.
     if (k == instruction.OP_DIV_S || k == instruction.OP_DIV_U) { ret false; }
     if (k == instruction.OP_REM_S || k == instruction.OP_REM_U) { ret false; }
+    if (k == instruction.OP_GEP) { ret gep_is_worth_hoisting(fn, iid); }
     ret true;
+}
+
+# true when hoisting a wholly-invariant gep buys more than it costs
+#
+# An address the back end folds ENTIRELY into its users' addressing modes costs
+# nothing where it is, so hoisting it only materializes a real `lea` and pins a
+# register across the whole loop -- a straight loss under any pressure. That is
+# exactly a gep whose indices are all constants over a base that is already a
+# register or a frame slot: every index collapses into the user's displacement.
+#
+# The two shapes the addressing mode cannot absorb are worth lifting:
+#   - a GLOBAL base, whose symbol address has to be materialized into a register
+#     before an index can be scaled against it;
+#   - a RUNTIME index, which has to be scaled into a register rather than folded
+#     as a constant displacement.
+#
+# This is the same profitability rule the prefix split applies, stated once for a
+# whole gep. It is a cost judgement, never a safety one -- a gep cannot fault, so
+# declining here only forgoes a win.
+# ---
+# fn:  the function
+# iid: the wholly-invariant gep
+# ret: true when the back end cannot absorb the address into its users
+fun gep_is_worth_hoisting(fn: *ir.Function, iid: id.InstructionId) bool {
+    if (fn.instrs[iid::u32].operand_count == 0) { ret false; }
+    if (fn.instrs[iid::u32].operands[0].kind == value.VAL_GLOBAL) { ret true; }
+
+    var i: u32 = 1;
+    for (i < fn.instrs[iid::u32].operand_count) {
+        if (fn.instrs[iid::u32].operands[i].kind != value.VAL_CONST_INT) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # true when every operand of `ins` is invariant across loop `lx`
@@ -1226,6 +1260,89 @@ test "mach.lang.me.transform.licm:splits_invariant_gep_prefix" {
             }
         }
     }
+
+    ir.dnit(?m);
+    intern.dnit(?itn);
+    ret code;
+}
+
+# a wholly-invariant gep whose indices are all constants over a pointer PARAMETER
+# folds entirely into its users' displacements, so hoisting it would materialize a
+# real `lea` and pin a register across the loop for nothing: it stays. The two
+# shapes the addressing mode cannot absorb -- a global base and a runtime index --
+# are hoisted in the same run, so the decline is the profitability rule and not an
+# inert pass.
+test "mach.lang.me.transform.licm:absorbed_gep_is_not_hoisted" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    var tgt: resolved.Target;
+    if (mk_target(?tgt) != 0) { intern.dnit(?itn); ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { intern.dnit(?itn); ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val ra: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?m.types, i64t, 16);
+    if (R.is_err[ir_type.IrTypeId, str](ra)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val arrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ra);
+
+    var g: value.Value;
+    if (mk_global(?m, ?itn, "g_absorb", arrt, ptrt, ?g) != 0) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    var entry: id.BlockId; var header: id.BlockId; var body: id.BlockId; var exit: id.BlockId;
+    var iv: value.Value;
+    if (mk_loop(?m, ?bld, i64t, ?entry, ?header, ?body, ?exit, ?iv) != 0) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+
+    val p1: value.Value = value.param(1, ptrt);
+    val k3: value.Value = value.const_int(3, i64t);
+    val k0: value.Value = value.const_int(0, i64t);
+
+    # absorbed: constant indices over a pointer parameter.
+    var ax: [2]value.Value;
+    ax[0] = k0; ax[1] = k3;
+    val rg1: R.Result[value.Value, str] = builder.emit_gep(?bld, p1, arrt, ?ax[0], 2);
+    if (R.is_err[value.Value, str](rg1)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val absorbed: value.Value = R.unwrap_ok[value.Value, str](rg1);
+
+    # not absorbed: a global base needs its symbol address in a register.
+    var bx: [2]value.Value;
+    bx[0] = k0; bx[1] = k3;
+    val rg2: R.Result[value.Value, str] = builder.emit_gep(?bld, g, arrt, ?bx[0], 2);
+    if (R.is_err[value.Value, str](rg2)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val symbased: value.Value = R.unwrap_ok[value.Value, str](rg2);
+
+    # not absorbed: a runtime (parameter) index has to be scaled into a register.
+    var cx: [2]value.Value;
+    cx[0] = k0; cx[1] = value.param(0, i64t);
+    val rg3: R.Result[value.Value, str] = builder.emit_gep(?bld, p1, arrt, ?cx[0], 2);
+    if (R.is_err[value.Value, str](rg3)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val scaled: value.Value = R.unwrap_ok[value.Value, str](rg3);
+
+    if (R.is_err[bool, str](builder.emit_store(?bld, iv, absorbed))) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?bld, iv, symbased))) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?bld, iv, scaled)))   { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    if (close_loop(?bld, i64t, iv, header, body) != 0) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+
+    var code: i32 = 0;
+    if (R.is_err[bool, str](run(?m, ?tgt))) { code = 1; }
+
+    if (!block_holds(fn, body, absorbed.data.instr))   { code = 1; }
+    if (block_holds(fn, entry, absorbed.data.instr))   { code = 1; }
+    if (!block_holds(fn, entry, symbased.data.instr))  { code = 1; }
+    if (!block_holds(fn, entry, scaled.data.instr))    { code = 1; }
 
     ir.dnit(?m);
     intern.dnit(?itn);
