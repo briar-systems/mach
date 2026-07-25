@@ -2704,9 +2704,422 @@ test "mach.lang.me.transform.sroa.run:splits_an_aggregate_phi_partition" {
     ret code;
 }
 
-# a union is never split -- its fields share storage, so per-field slots would break
-# the reinterpretation it exists to express -- and neither is an array past the field
-# bound, which keeps the pass on small records rather than buffers
+# intern `{i8, uni{...}}`, the tagged-payload record shape `Result[T, E]` lowers to
+# (test helper)
+# ---
+# m:   the module owning the type table
+# a:   the union's first member type
+# b:   the union's second member type
+# out: receives the record type
+# ret: 0 on success, 1 on failure
+fun ut_tagged(m: *ir.Module, a: ir_type.IrTypeId, b: ir_type.IrTypeId, out: *ir_type.IrTypeId) i32 {
+    var members: [2]ir_type.IrTypeId;
+    members[0] = a;
+    members[1] = b;
+    val ru: R.Result[ir_type.IrTypeId, str] = ir_type.intern_union(?m.types, ?members[0], 2, 0);
+    if (R.is_err[ir_type.IrTypeId, str](ru)) { ret 1; }
+
+    val r8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
+    if (R.is_err[ir_type.IrTypeId, str](r8)) { ret 1; }
+    var fields: [2]ir_type.IrTypeId;
+    fields[0] = R.unwrap_ok[ir_type.IrTypeId, str](r8);
+    fields[1] = R.unwrap_ok[ir_type.IrTypeId, str](ru);
+    val rs: R.Result[ir_type.IrTypeId, str] = ir_type.intern_struct(?m.types, ?fields[0], 2, 0);
+    if (R.is_err[ir_type.IrTypeId, str](rs)) { ret 1; }
+    @out = R.unwrap_ok[ir_type.IrTypeId, str](rs);
+    ret 0;
+}
+
+# emit `gep (gep base, 0, 1), 0, k`: the address of member `k` of the union payload of
+# a `ut_tagged` record (test helper)
+# ---
+# b:    the construction cursor
+# m:    the module owning the type table
+# base: the record's address
+# ty:   the record type
+# k:    the union member ordinal
+# ret:  the member's address, or an error
+fun ut_member_gep(b: *builder.Builder, m: *ir.Module, base: value.Value, ty: ir_type.IrTypeId, k: u64) R.Result[value.Value, str] {
+    val gf: R.Result[value.Value, str] = ut_gep(b, m, base, ty, 1);
+    if (R.is_err[value.Value, str](gf)) { ret gf; }
+    ret ut_gep(b, m, R.unwrap_ok[value.Value, str](gf), ut_field_type(m, ty, 1), k);
+}
+
+# open a fresh function whose entry block holds `s = alloca ty; memzero s`, leaving the
+# cursor there for the caller to append the body under test (test helper)
+# ---
+# m:    the module to add the function to
+# b:    the construction cursor, positioned on the new function's entry block
+# ty:   the record type of the local
+# slot: receives the local's slot pointer
+# ret:  the new function's index, or NONE_U32 on failure
+fun ut_open_local(m: *ir.Module, b: *builder.Builder, ty: ir_type.IrTypeId, slot: *value.Value) u32 {
+    val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](r64)) { ret NONE_U32; }
+
+    val rf: R.Result[u32, str] = ir.function_add(m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ret NONE_U32; }
+    val ix: u32 = R.unwrap_ok[u32, str](rf);
+
+    builder.set_function(b, ?m.functions[ix]);
+    val rb: R.Result[id.BlockId, str] = builder.new_block(b);
+    if (R.is_err[id.BlockId, str](rb)) { ret NONE_U32; }
+    builder.set_block(b, R.unwrap_ok[id.BlockId, str](rb));
+
+    val ra: R.Result[value.Value, str] = builder.emit_alloca(b, ty, value.const_int(1, R.unwrap_ok[ir_type.IrTypeId, str](r64)));
+    if (R.is_err[value.Value, str](ra)) { ret NONE_U32; }
+    @slot = R.unwrap_ok[value.Value, str](ra);
+    if (R.is_err[bool, str](builder.emit_memzero(b, @slot, ty))) { ret NONE_U32; }
+    ret ix;
+}
+
+# the instruction a value names, or nil when it names something else (test helper)
+# ---
+# fn: the function owning the pool
+# v:  the value to resolve
+# ret: the defining instruction, or nil
+fun ut_def(fn: *ir.Function, v: value.Value) *instruction.Instruction {
+    if (v.kind != value.VAL_INSTR)     { ret nil; }
+    if (v.data.instr >= fn.instr_len)  { ret nil; }
+    ret ?fn.instrs[v.data.instr::u32];
+}
+
+# a `Result`-shaped record -- a tag beside an anonymous union payload -- reaches
+# registers: the union is one cell rather than per-member slots, so the record splits
+# into a tag slot and a cell slot and mem2reg promotes both. Nothing stays in memory and
+# the payload read back IS the stored parameter
+#
+# Refusing the union field in `splittable_at` leaves 1 alloca and 1 memzero, and so does
+# dropping `mark_union_member_geps` (the member gep then reads as a descent into the
+# field, which no whole-cell slot can stand in for): either way this test fails
+test "mach.lang.me.transform.sroa.run:splits_a_tagged_union_payload_into_registers" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    var tgt: resolved.Target;
+    if (ut_target(?reg, ?tgt) != 0) { ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](r64)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r64);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val r8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
+    if (R.is_err[ir_type.IrTypeId, str](r8)) { ir.dnit(?m); ret 1; }
+    val i8t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r8);
+
+    var rec: ir_type.IrTypeId;
+    if (ut_tagged(?m, i64t, ptrt, ?rec) != 0) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    var b: builder.Builder = builder.init(?m);
+    var slot: value.Value;
+    val ix: u32 = ut_open_local(?m, ?b, rec, ?slot);
+    if (ix == NONE_U32) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[ix];
+
+    val gt: R.Result[value.Value, str] = ut_gep(?b, ?m, slot, rec, 0);
+    if (R.is_err[value.Value, str](gt)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?b, value.const_int(1, i8t), R.unwrap_ok[value.Value, str](gt)))) { code = 1; }
+
+    val gp: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 0);
+    if (R.is_err[value.Value, str](gp)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?b, value.param(0, i64t), R.unwrap_ok[value.Value, str](gp)))) { code = 1; }
+
+    val hp: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 0);
+    if (R.is_err[value.Value, str](hp)) { ir.dnit(?m); ret 1; }
+    val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](hp), i64t);
+    if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+
+    if (ut_count(fn, instruction.OP_ALLOCA) != 1) { code = 1; }
+
+    val rs: R.Result[bool, str] = run(?m, ?tgt);
+    if (R.is_err[bool, str](rs))              { code = 1; }
+    or { if (!R.unwrap_ok[bool, str](rs))     { code = 1; } }
+    if (R.is_err[bool, str](mem2reg.run(?m))) { code = 1; }
+    if (R.is_err[bool, str](dce.run(?m)))     { code = 1; }
+
+    if (ut_count(fn, instruction.OP_ALLOCA)  != 0) { code = 1; }
+    if (ut_count(fn, instruction.OP_MEMZERO) != 0) { code = 1; }
+    if (ut_count(fn, instruction.OP_LOAD)    != 0) { code = 1; }
+    if (ut_count(fn, instruction.OP_STORE)   != 0) { code = 1; }
+    val rv: value.Value = ut_ret_value(fn);
+    if (rv.kind != value.VAL_PARAM) { code = 1; }
+    if (rv.data.param_ix != 0)      { code = 1; }
+
+    ir.dnit(?m);
+    ret code;
+}
+
+# a member read at a type other than the cell's storage comes back through a bit
+# reinterpret, so the value is the stored bits rather than a converted number: the cell
+# of `uni{i64, ptr}` is its i64 member, so the pointer written into it is bit-cast in
+# and the i64 read out is the cast itself
+#
+# Dropping the reinterpret in `reinterpret_store` returns the pointer parameter under an
+# i64 use, which is the ill-typed operand the verifier's VC_TYPE_AGREE catches; this
+# test names the cast directly, so it fails either way
+test "mach.lang.me.transform.sroa.run:reinterprets_a_member_of_another_type" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    var tgt: resolved.Target;
+    if (ut_target(?reg, ?tgt) != 0) { ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](r64)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r64);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+
+    var rec: ir_type.IrTypeId;
+    if (ut_tagged(?m, i64t, ptrt, ?rec) != 0) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    var b: builder.Builder = builder.init(?m);
+    var slot: value.Value;
+    val ix: u32 = ut_open_local(?m, ?b, rec, ?slot);
+    if (ix == NONE_U32) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[ix];
+
+    val gp: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 1);
+    if (R.is_err[value.Value, str](gp)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?b, value.param(0, ptrt), R.unwrap_ok[value.Value, str](gp)))) { code = 1; }
+
+    val hp: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 0);
+    if (R.is_err[value.Value, str](hp)) { ir.dnit(?m); ret 1; }
+    val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](hp), i64t);
+    if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+
+    val rs: R.Result[bool, str] = run(?m, ?tgt);
+    if (R.is_err[bool, str](rs))              { code = 1; }
+    if (R.is_err[bool, str](mem2reg.run(?m))) { code = 1; }
+    if (R.is_err[bool, str](dce.run(?m)))     { code = 1; }
+
+    if (ut_count(fn, instruction.OP_ALLOCA) != 0) { code = 1; }
+    val cast: *instruction.Instruction = ut_def(fn, ut_ret_value(fn));
+    if (cast == nil) { code = 1; }
+    or {
+        if (cast.kind != instruction.OP_BITCAST)        { code = 1; }
+        if (cast.ty != i64t)                            { code = 1; }
+        if (cast.operand_count != 1)                    { code = 1; }
+        or {
+            if (cast.operands[0].kind != value.VAL_PARAM) { code = 1; }
+            if (cast.operands[0].data.param_ix != 0)      { code = 1; }
+        }
+    }
+
+    ir.dnit(?m);
+    ret code;
+}
+
+# writing a member narrower than the cell leaves the bytes it does not cover exactly as
+# they were: an `i8` member of an eight-byte cell is widened and merged into the cell
+# under a mask, so a subsequent whole-cell read sees the earlier value in its upper
+# seven bytes and the narrow member in its lowest
+#
+# Storing the widened value straight into the cell -- the obvious simplification --
+# clears those seven bytes, and the returned value is then the zext rather than the or;
+# this test names the mask and the merge, so either shortcut fails it
+test "mach.lang.me.transform.sroa.run:a_narrow_member_preserves_its_cell" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    var tgt: resolved.Target;
+    if (ut_target(?reg, ?tgt) != 0) { ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](r64)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r64);
+    val r8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
+    if (R.is_err[ir_type.IrTypeId, str](r8)) { ir.dnit(?m); ret 1; }
+    val i8t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r8);
+
+    var rec: ir_type.IrTypeId;
+    if (ut_tagged(?m, i64t, i8t, ?rec) != 0) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    var b: builder.Builder = builder.init(?m);
+    var slot: value.Value;
+    val ix: u32 = ut_open_local(?m, ?b, rec, ?slot);
+    if (ix == NONE_U32) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[ix];
+
+    val gw: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 0);
+    if (R.is_err[value.Value, str](gw)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?b, value.param(0, i64t), R.unwrap_ok[value.Value, str](gw)))) { code = 1; }
+
+    val gn: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 1);
+    if (R.is_err[value.Value, str](gn)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?b, value.param(1, i8t), R.unwrap_ok[value.Value, str](gn)))) { code = 1; }
+
+    val hw: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 0);
+    if (R.is_err[value.Value, str](hw)) { ir.dnit(?m); ret 1; }
+    val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](hw), i64t);
+    if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+
+    val rs: R.Result[bool, str] = run(?m, ?tgt);
+    if (R.is_err[bool, str](rs))              { code = 1; }
+    if (R.is_err[bool, str](mem2reg.run(?m))) { code = 1; }
+    if (R.is_err[bool, str](dce.run(?m)))     { code = 1; }
+
+    if (ut_count(fn, instruction.OP_ALLOCA) != 0) { code = 1; }
+
+    # ret = or(and(p0, 0xFFFFFFFFFFFFFF00), zext(p1))
+    val merge: *instruction.Instruction = ut_def(fn, ut_ret_value(fn));
+    if (merge == nil) { code = 1; ir.dnit(?m); ret code; }
+    if (merge.kind != instruction.OP_OR || merge.operand_count != 2) { code = 1; ir.dnit(?m); ret code; }
+
+    val keep: *instruction.Instruction = ut_def(fn, merge.operands[0]);
+    if (keep == nil) { code = 1; }
+    or {
+        if (keep.kind != instruction.OP_AND || keep.operand_count != 2)      { code = 1; }
+        or {
+            if (keep.operands[0].kind != value.VAL_PARAM)                    { code = 1; }
+            if (keep.operands[0].data.param_ix != 0)                         { code = 1; }
+            if (keep.operands[1].kind != value.VAL_CONST_INT)                { code = 1; }
+            or { if (keep.operands[1].data.int_lit != 0xFFFFFFFFFFFFFF00)    { code = 1; } }
+        }
+    }
+
+    val wide: *instruction.Instruction = ut_def(fn, merge.operands[1]);
+    if (wide == nil) { code = 1; }
+    or {
+        if (wide.kind != instruction.OP_ZEXT || wide.ty != i64t)  { code = 1; }
+        or {
+            if (wide.operands[0].kind != value.VAL_PARAM)         { code = 1; }
+            if (wide.operands[0].data.param_ix != 1)              { code = 1; }
+        }
+    }
+
+    ir.dnit(?m);
+    ret code;
+}
+
+# an access narrower than a cell whose storage is not an integer keeps the record whole:
+# `uni{ptr, ptr}` holds its cell in a pointer, and there is no masking form that could
+# merge a byte into one
+#
+# Admitting it (dropping the storage-is-the-cell-integer condition in
+# `union_access_ok`) splits the record and the alloca disappears, failing this test
+test "mach.lang.me.transform.sroa.run:declines_a_narrow_access_to_a_pointer_cell" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    var tgt: resolved.Target;
+    if (ut_target(?reg, ?tgt) != 0) { ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val r8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
+    if (R.is_err[ir_type.IrTypeId, str](r8)) { ir.dnit(?m); ret 1; }
+    val i8t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r8);
+
+    var rec: ir_type.IrTypeId;
+    if (ut_tagged(?m, ptrt, ptrt, ?rec) != 0) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    var b: builder.Builder = builder.init(?m);
+    var slot: value.Value;
+    val ix: u32 = ut_open_local(?m, ?b, rec, ?slot);
+    if (ix == NONE_U32) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[ix];
+
+    val gp: R.Result[value.Value, str] = ut_member_gep(?b, ?m, slot, rec, 0);
+    if (R.is_err[value.Value, str](gp)) { ir.dnit(?m); ret 1; }
+    val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](gp), i8t);
+    if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+
+    val rs: R.Result[bool, str] = run(?m, ?tgt);
+    if (R.is_err[bool, str](rs))         { code = 1; }
+    or { if (R.unwrap_ok[bool, str](rs)) { code = 1; } }
+    if (ut_count(fn, instruction.OP_ALLOCA) != 1) { code = 1; }
+
+    ir.dnit(?m);
+    ret code;
+}
+
+# a gep that reaches a union member and keeps walking keeps the record whole: the cell
+# is one scalar slot, and an index past its start addresses part of it
+#
+# Accepting the longer walk (dropping the union condition in `classify_one`) retargets
+# the gep onto the cell's slot, which then has a gep for a base and never promotes; the
+# alloca survives either way, but this test pins the decline at the classification so
+# the pass does not silently produce a slot it cannot promote
+test "mach.lang.me.transform.sroa.run:declines_a_gep_walking_past_a_union_field" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    var tgt: resolved.Target;
+    if (ut_target(?reg, ?tgt) != 0) { ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](r64)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r64);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+
+    var rec: ir_type.IrTypeId;
+    if (ut_tagged(?m, i64t, ptrt, ?rec) != 0) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    var b: builder.Builder = builder.init(?m);
+    var slot: value.Value;
+    val ix: u32 = ut_open_local(?m, ?b, rec, ?slot);
+    if (ix == NONE_U32) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[ix];
+
+    # `gep s, 0, 1, 0`: the field walk continues into the union within one gep
+    var idx: [3]value.Value;
+    idx[0] = value.const_int(0, i64t);
+    idx[1] = value.const_int(1, i64t);
+    idx[2] = value.const_int(0, i64t);
+    val gd: R.Result[value.Value, str] = builder.emit_gep(?b, slot, rec, ?idx[0], 3);
+    if (R.is_err[value.Value, str](gd)) { ir.dnit(?m); ret 1; }
+    val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](gd), i64t);
+    if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+
+    val rs: R.Result[bool, str] = run(?m, ?tgt);
+    if (R.is_err[bool, str](rs))         { code = 1; }
+    or { if (R.unwrap_ok[bool, str](rs)) { code = 1; } }
+    if (ut_count(fn, instruction.OP_ALLOCA) != 1) { code = 1; }
+
+    ir.dnit(?m);
+    ret code;
+}
+
+# a bare union local is never split -- with no field it could give a slot of its own,
+# there is nothing to decompose -- and neither is an array past the field bound, which
+# keeps the pass on small records rather than buffers
 test "mach.lang.me.transform.sroa.run:declines_a_union_and_an_oversized_array" {
     var alloc: A.Allocator;
     page.make(?alloc);
