@@ -552,20 +552,55 @@ pub rec ModuleEmitter {
     emit_module: *u8;
 }
 
+# the relocatable-object contract: everything an ISA THAT EMITS RELOCATIONS owes
+#
+# The third contract, and unlike `RegMachine` / `ModuleEmitter` it is conditioned
+# on the OBJECT FORMAT rather than on the back-half family: a register machine
+# emitting a raw flat image has no relocations to name or to patch, and neither
+# does a whole-module emitter. So it hangs off the vtable, which the object-format
+# writers and the linker hold, and never off a family payload they cannot see.
+#
+# It exists as ONE record so that its members cannot drift apart. Naming a
+# relocation in an object file and resolving one at link time are the two halves of
+# the same capability, and an arch that has one and not the other emits objects
+# nothing can link. Before this record, `apply_reloc` was attached AFTER
+# registration by matching the arch's name string in `be.linker`, so an arch could
+# declare the naming half, register cleanly, and discover at link time that the
+# resolving half was never attached (#2244).
+#
+# Every member is an erased fn ptr (`*u8`), for the import direction: their
+# signatures name `of.RelocKind`, and `of` imports `isa`.
+# ---
+# apply_reloc:    apply one relocation for this arch, patching the resolved value
+#                 into the merged bytes (cast back to `of.reloc.ApplyRelocFn`).
+#                 REQUIRED: an arch that emits relocations must be able to resolve
+#                 them
+# elf_reloc_type: map an abstract `of.RelocKind` to this arch's ELF machine
+#                 relocation type number (cast back to the ELF writer's
+#                 `ElfRelocTypeFn`); returns 0 (R_*_NONE) for a kind the arch has
+#                 no width-correct ELF type for. the ELF object writer reads it
+#                 instead of branching on the arch id, the relocation analogue of
+#                 `elf_machine`. REQUIRED, but may be deliberately nil for an arch
+#                 whose relocatable objects are not ELF, which the ELF writer then
+#                 reports as unsupported
+# elf_attributes: OPTIONAL capability - return this arch's ELF build-attributes
+#                 descriptor (cast back to the ELF writer's `ElfAttributesFn`). the
+#                 ELF writer reads it to stamp a `.riscv.attributes`-style
+#                 ISA-string section so external tools decode the full instruction
+#                 set; nil for an arch that emits none
+pub rec RelocSeam {
+    apply_reloc:    *u8;
+    elf_reloc_type: *u8;
+    elf_attributes: *u8;
+}
+
 # the ISA runtime-dispatch interface
 #
 # Exactly one of these exists per architecture. It carries what BOTH families have
-# - the ISA's identity, its machine description, and the object-format seam - plus
-# exactly one family payload: `machine` for a register machine, `emitter` for a
-# whole-module emitter, never both and never neither. That pointer pair is the
+# - the ISA's identity, its machine description, and the relocatable-object seam -
+# plus exactly one family payload: `machine` for a register machine, `emitter` for
+# a whole-module emitter, never both and never neither. That pointer pair is the
 # type-level form of the back-half fork; `emits_whole_module` reads it.
-#
-# `apply_reloc`, `elf_reloc_type`, and `elf_attributes` stay here rather than on
-# `RegMachine` because they are conditioned on the OBJECT FORMAT, not the family: a
-# register machine emitting a raw flat image (mos6502) has none of them, and they
-# are handed the `IsaVTable` by writers that never see a family payload.
-# `apply_reloc` is additionally late-bound - `be.linker.register_reloc_hooks`
-# patches it on after registration - so a target cannot supply it at construction.
 # ---
 # id:              architecture id (one of ARCH_*)
 # name:            interned architecture name ("x86_64", "aarch64")
@@ -575,22 +610,10 @@ pub rec ModuleEmitter {
 # pointer_width:   pointer width in bytes
 # reg_classes:     array of register classes
 # reg_class_count: number of register classes
-# apply_reloc:     erased fn ptr - apply one relocation for this arch (cast back to
-#                  the linker's `ApplyRelocFn`); nil until the be-layer linker
-#                  registrar wires it, and the linker errors on a nil slot exactly
-#                  as it does for an unregistered ISA
-# elf_reloc_type:  erased fn ptr - map an abstract `of.RelocKind` to this arch's ELF
-#                  machine relocation type number (cast back to the ELF writer's
-#                  `ElfRelocTypeFn`); returns 0 (R_*_NONE) for a kind the arch has
-#                  no width-correct ELF type for. the ELF object writer reads it
-#                  instead of branching on the arch id, the relocation analogue of
-#                  `elf_machine`. nil when the ISA supplies no ELF relocation
-#                  mapping, which the writer reports as unsupported
-# elf_attributes:  erased fn ptr - return this arch's ELF build-attributes
-#                  descriptor (cast back to the ELF writer's `ElfAttributesFn`), or
-#                  nil for an arch that emits none. the ELF writer reads it to stamp
-#                  a `.riscv.attributes`-style ISA-string section so external tools
-#                  decode the full instruction set
+# reloc:           borrowed relocatable-object contract, or nil for an ISA that
+#                  emits no relocations at all (a raw flat image, a finished
+#                  module). a whole-module emitter cannot even express one:
+#                  `emitter_isa` takes no seam
 # machine:         the register-machine contract, or nil when this ISA is a
 #                  whole-module emitter
 # emitter:         the whole-module contract, or nil when this ISA is a register
@@ -608,9 +631,7 @@ pub rec IsaVTable {
     pointer_width:   u32;
     reg_classes:     *RegClass;
     reg_class_count: u32;
-    apply_reloc:     *u8;
-    elf_reloc_type:  *u8;
-    elf_attributes:  *u8;
+    reloc:           *RelocSeam;
     machine:         *RegMachine;
     emitter:         *ModuleEmitter;
     model:           *MachineModel;
@@ -732,12 +753,52 @@ pub fun module_emitter(emit_module: *u8) ModuleEmitter {
     ret e;
 }
 
+# build the relocatable-object contract, every required slot supplied
+#
+# The completeness mechanism for the seam, and the same one `reg_machine` uses:
+# each required member is a positional parameter, so an arch that omits one is an
+# arity error at build time rather than a hook that turns out to be missing at link
+# time. It guards FORGETTING a member, not lying about one - an arch whose
+# relocatable objects are not ELF may still pass a deliberate nil for
+# `elf_reloc_type`.
+#
+# The one optional capability is cleared here and added afterwards through
+# `with_elf_attributes`, so an arch that declares none still leaves no field
+# reading stack garbage (`var` does not zero).
+# ---
+# apply_reloc:    the relocation applier, erased (`of.reloc.ApplyRelocFn`)
+# elf_reloc_type: the abstract-kind to ELF-type map, erased (the ELF writer's
+#                 `ElfRelocTypeFn`)
+# ret:            the contract, with its optional capability unset
+pub fun reloc_seam(apply_reloc: *u8, elf_reloc_type: *u8) RelocSeam {
+    var s: RelocSeam;
+    s.apply_reloc    = apply_reloc;
+    s.elf_reloc_type = elf_reloc_type;
+
+    s.elf_attributes = nil;
+    ret s;
+}
+
+# declare the optional ELF build-attributes descriptor
+#
+# Without it the ELF writer stamps no `.riscv.attributes`-style ISA-string section.
+# ---
+# s: the relocatable-object contract to extend
+# f: the descriptor source, erased (the ELF writer's `ElfAttributesFn`)
+pub fun with_elf_attributes(s: *RelocSeam, f: *u8) {
+    s.elf_attributes = f;
+}
+
 # compose an ISA vtable for a REGISTER MACHINE
 #
 # Binds the machine contract and leaves `emitter` nil, so the family is settled by
-# construction and `emits_whole_module` reports false. The object-format seam is
-# cleared; an ELF-capable arch adds it through `with_elf` and the linker registrar
-# patches `apply_reloc` on later.
+# construction and `emits_whole_module` reports false.
+#
+# `reloc` is a required parameter rather than a setter called afterwards: whether
+# an arch can resolve its own relocations is not an afterthought a later pass gets
+# to supply, so the arch either names a seam here or writes an explicit nil that a
+# reader can see. An arch whose object format carries no relocations at all - a raw
+# flat image - is the only nil.
 # ---
 # id:              architecture id (one of ARCH_*)
 # name:            interned architecture name
@@ -747,12 +808,16 @@ pub fun module_emitter(emit_module: *u8) ModuleEmitter {
 # reg_class_count: number of register classes
 # model:           borrowed per-arch machine-model template
 # machine:         borrowed register-machine contract
+# reloc:           borrowed relocatable-object contract, or nil for an arch that
+#                  emits no relocations
 # ret:             the composed vtable
 pub fun machine_isa(id: u32, name: str, elf_machine: u32, pointer_width: u32,
                     reg_classes: *RegClass, reg_class_count: u32,
-                    model: *MachineModel, machine: *RegMachine) IsaVTable {
+                    model: *MachineModel, machine: *RegMachine,
+                    reloc: *RelocSeam) IsaVTable {
     var vt: IsaVTable = isa_common(id, name, elf_machine, pointer_width,
                                    reg_classes, reg_class_count, model);
+    vt.reloc   = reloc;
     vt.machine = machine;
     vt.emitter = nil;
     ret vt;
@@ -761,8 +826,9 @@ pub fun machine_isa(id: u32, name: str, elf_machine: u32, pointer_width: u32,
 # compose an ISA vtable for a WHOLE-MODULE EMITTER
 #
 # Binds the emitter contract and leaves `machine` nil, so no machine-code slot
-# exists to be left unset and `emits_whole_module` reports true. There is no
-# `elf_machine` parameter: a whole-module image is not an ELF object.
+# exists to be left unset and `emits_whole_module` reports true. There is neither
+# an `elf_machine` nor a `reloc` parameter: a whole-module image is not an ELF
+# object and carries no relocations, so the family cannot express a seam at all.
 # ---
 # id:              architecture id (one of ARCH_*)
 # name:            interned architecture name
@@ -778,26 +844,14 @@ pub fun emitter_isa(id: u32, name: str, pointer_width: u32,
                     model: *MachineModel, emitter: *ModuleEmitter) IsaVTable {
     var vt: IsaVTable = isa_common(id, name, 0, pointer_width,
                                    reg_classes, reg_class_count, model);
+    vt.reloc   = nil;
     vt.machine = nil;
     vt.emitter = emitter;
     ret vt;
 }
 
-# declare the optional ELF object-format seam
-#
-# Conditioned on the object format, not the family: an arch emitting a raw flat
-# image declares neither, and the ELF writer reports a missing map as unsupported.
-# ---
-# vt:             the vtable to extend
-# elf_reloc_type: the abstract-kind to ELF-type map (the writer's `ElfRelocTypeFn`)
-# elf_attributes: the build-attributes descriptor source, or nil for none
-pub fun with_elf(vt: *IsaVTable, elf_reloc_type: *u8, elf_attributes: *u8) {
-    vt.elf_reloc_type = elf_reloc_type;
-    vt.elf_attributes = elf_attributes;
-}
-
 # the family-agnostic half of a composed vtable: identity, description, and a
-# cleared object-format seam
+# cleared relocatable-object seam
 #
 # Shared by `machine_isa` and `emitter_isa` so neither can forget to clear a slot
 # the other fills - `var` does not zero, so an unwritten field reads stack garbage.
@@ -822,11 +876,9 @@ fun isa_common(id: u32, name: str, elf_machine: u32, pointer_width: u32,
     vt.reg_class_count = reg_class_count;
     vt.model           = model;
 
-    vt.apply_reloc    = nil;
-    vt.elf_reloc_type = nil;
-    vt.elf_attributes = nil;
-    vt.machine        = nil;
-    vt.emitter        = nil;
+    vt.reloc   = nil;
+    vt.machine = nil;
+    vt.emitter = nil;
     ret vt;
 }
 
@@ -1151,6 +1203,20 @@ pub fun emits_whole_module(vt: *IsaVTable) bool {
     ret vt.emitter != nil;
 }
 
+# whether instruction set `vt` declares the relocatable-object contract
+#
+# The named form of the seam test, the object-format counterpart of
+# `emits_whole_module`. True for an ISA whose objects carry relocations to name and
+# to resolve; false for one whose output is a raw flat image or a finished module.
+# The ELF writer and the linker read it rather than testing the pointer, so the
+# question "can this arch relocate?" is asked in one spelling.
+# ---
+# vt:  the instruction-set vtable to test
+# ret: true when the ISA declares a relocatable-object seam
+pub fun emits_relocations(vt: *IsaVTable) bool {
+    ret vt.reloc != nil;
+}
+
 # a blank operand of the given kind and width, with all payload fields cleared
 #
 # The shared base for the make_* operand builders: it sets `kind` and `size` and
@@ -1291,12 +1357,20 @@ fun t_is_reg_move(opcode: u32) bool {
     ret false;
 }
 
+# a relocatable-object contract with both required members supplied and no optional
+# capability, the shortest a relocating arch can be (test helper)
+fun t_reloc() RelocSeam {
+    var hook: u8;
+    ret reloc_seam(?hook, ?hook);
+}
+
 test "mach.lang.target.isa.register:write_once_and_enumerate" {
     var reg: IsaRegistry = registry_init();
     if (registered_count(?reg) != 0) { ret 1; }
 
     var m: RegMachine = t_machine();
-    var vt: IsaVTable = machine_isa(ARCH_X86_64, "x86_64", 62, 8, nil, 0, nil, ?m);
+    var rs: RelocSeam = t_reloc();
+    var vt: IsaVTable = machine_isa(ARCH_X86_64, "x86_64", 62, 8, nil, 0, nil, ?m, ?rs);
     register(?reg, ?vt);
     if (registered_count(?reg) != 1) { ret 1; }
 
@@ -1306,7 +1380,8 @@ test "mach.lang.target.isa.register:write_once_and_enumerate" {
 
     # write-once: a second registration under the same name is ignored
     var m2: RegMachine = t_machine();
-    var vt2: IsaVTable = machine_isa(ARCH_X86_64, "x86_64", 62, 8, nil, 0, nil, ?m2);
+    var rs2: RelocSeam = t_reloc();
+    var vt2: IsaVTable = machine_isa(ARCH_X86_64, "x86_64", 62, 8, nil, 0, nil, ?m2, ?rs2);
     register(?reg, ?vt2);
     if (O.unwrap[*IsaVTable](lookup(?reg, "x86_64")) != ?vt) { ret 1; }
 
@@ -1325,7 +1400,8 @@ test "mach.lang.target.isa.register:write_once_and_enumerate" {
 # slot to leave nil, and a whole-module emitter has no machine slots at all
 test "mach.lang.target.isa.family:payloads_are_exclusive" {
     var m: RegMachine = t_machine();
-    var mvt: IsaVTable = machine_isa(ARCH_X86_64, "x86_64", 62, 8, nil, 0, nil, ?m);
+    var rs: RelocSeam = t_reloc();
+    var mvt: IsaVTable = machine_isa(ARCH_X86_64, "x86_64", 62, 8, nil, 0, nil, ?m, ?rs);
     if (mvt.machine != ?m)         { ret 1; }
     if (mvt.emitter != nil)        { ret 1; }
     if (emits_whole_module(?mvt))  { ret 1; }
@@ -1337,9 +1413,37 @@ test "mach.lang.target.isa.family:payloads_are_exclusive" {
     if (evt.machine != nil)        { ret 1; }
     if (!emits_whole_module(?evt)) { ret 1; }
 
-    # a whole-module emitter is not an ELF object producer, so the seam stays clear
+    # a whole-module emitter is not an ELF object producer and carries no
+    # relocations: the family takes no seam parameter, so there is none to leave set
     if (evt.elf_machine != 0)      { ret 1; }
-    if (evt.elf_reloc_type != nil) { ret 1; }
+    if (evt.reloc != nil)          { ret 1; }
+    if (emits_relocations(?evt))   { ret 1; }
+
+    # a register machine names its seam at construction, never after it
+    if (mvt.reloc != ?rs)          { ret 1; }
+    if (!emits_relocations(?mvt))  { ret 1; }
+    ret 0;
+}
+
+# `reloc_seam` takes each required member positionally, so an arch that omits one
+# is an arity error rather than a hook discovered missing at link time, and it
+# clears the optional descriptor so a declaring arch leaves no field reading stack
+# garbage (`var` does not zero)
+test "mach.lang.target.isa.reloc_seam:required_then_optional" {
+    var s: RelocSeam = t_reloc();
+    if (s.apply_reloc == nil)    { ret 1; }
+    if (s.elf_reloc_type == nil) { ret 1; }
+    if (s.elf_attributes != nil) { ret 1; }
+
+    var hook: u8;
+    with_elf_attributes(?s, ?hook);
+    if (s.elf_attributes == nil) { ret 1; }
+
+    # an arch whose relocatable objects are not ELF passes a deliberate nil for the
+    # ELF map and still owes the applier
+    var s2: RelocSeam = reloc_seam(?hook, nil);
+    if (s2.apply_reloc == nil)    { ret 1; }
+    if (s2.elf_reloc_type != nil) { ret 1; }
     ret 0;
 }
 
@@ -1376,7 +1480,8 @@ fun t_dwarf_reg(regid: i32) i32 {
 # refuses it up front rather than dying deep in codegen
 test "mach.lang.target.isa.has_codegen:per_family" {
     var m: RegMachine = t_machine();
-    var mvt: IsaVTable = machine_isa(ARCH_X86_64, "x86_64", 62, 8, nil, 0, nil, ?m);
+    var rs: RelocSeam = t_reloc();
+    var mvt: IsaVTable = machine_isa(ARCH_X86_64, "x86_64", 62, 8, nil, 0, nil, ?m, ?rs);
     if (!has_codegen(?mvt)) { ret 1; }
 
     # a register machine missing its encoder is not wired
@@ -1390,7 +1495,7 @@ test "mach.lang.target.isa.has_codegen:per_family" {
 
     # description-only: registered so composition reports it, but neither family
     # payload is bound
-    var dvt: IsaVTable = machine_isa(ARCH_MOS6502, "desc", 0, 2, nil, 0, nil, nil);
+    var dvt: IsaVTable = machine_isa(ARCH_MOS6502, "desc", 0, 2, nil, 0, nil, nil, nil);
     if (has_codegen(?dvt)) { ret 1; }
     ret 0;
 }
