@@ -68,6 +68,9 @@ val OP_CMP_IMM: u8 = 0xC9;  val OP_CMP_ZP: u8 = 0xC5;
 val OP_CLC:     u8 = 0x18;  val OP_SEC:    u8 = 0x38;
 val OP_JMP_ABS: u8 = 0x4C;  val OP_JSR_ABS: u8 = 0x20;
 val OP_RTS:     u8 = 0x60;  val OP_BRK:     u8 = 0x00;  val OP_NOP: u8 = 0xEA;
+# the indirect-indexed forms `(zp),Y` plus the Y load that carries the displacement:
+# the only addressing the 6502 offers through a runtime pointer
+val OP_LDY_IMM: u8 = 0xA0;  val OP_LDA_IND_Y: u8 = 0xB1;  val OP_STA_IND_Y: u8 = 0x91;
 # the conditional branch opcodes (pc-relative, signed 8-bit displacement)
 val OP_BEQ: u8 = 0xF0;  val OP_BNE: u8 = 0xD0;  val OP_BCC: u8 = 0x90;  val OP_BCS: u8 = 0xB0;
 # rotate the accumulator left through carry ($2A) - used to read the carry flag into
@@ -145,6 +148,8 @@ fun encode_instr(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr, f
         op == mir.MIR_AND || op == mir.MIR_OR || op == mir.MIR_XOR) {
         ret encode_alu(st, mi, op);
     }
+    if (op == mir.MIR_LOAD)  { ret encode_load(st, mi); }
+    if (op == mir.MIR_STORE) { ret encode_store(st, mi); }
     if (op == mir.MIR_NOT) { ret encode_not(st, mi); }
     if (op == mir.MIR_CMP_EQ || op == mir.MIR_CMP_NE || op == mir.MIR_CMP_LT_U) {
         ret encode_cmp(st, mi, op);
@@ -200,6 +205,87 @@ fun encode_alu(st: *enc.EncodeState, mi: *mir.MirInstr, op: mir.MirOpcode) R.Res
     val res_op: R.Result[bool, str] = emit_operand(st, b, imm_op, zp_op, op);
     if (R.is_err[bool, str](res_op)) { ret res_op; }
     emit_zp1(st, OP_STA_ZP, mos6502.zp_addr(dst.preg::i32));
+    ret R.ok[bool, str](true);
+}
+
+# encode a one-byte load `dst <- [ptr + disp]` as `LDY #disp ; LDA (ptr),Y ; STA dst`
+#
+# The address comes out of a reserved zero-page POINTER PAIR - the frame pointer, or
+# the staging pair the width legalizer wrote a runtime pointer's lanes into - and the
+# displacement rides Y, the 6502's only indexed-indirect form. The width legalizer
+# has already split every wider access into these one-byte pieces at successive
+# displacements, so a piece that still carries a wider width, or a base that is not a
+# declared pointer pair, is a legalization bug and is refused rather than mis-encoded.
+fun encode_load(st: *enc.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count != 2) { ret R.err[bool, str]("mos6502: malformed load"); }
+    val dst: *mir.MirOperand = ?mi.operands[0];
+    if (dst.kind != mir.MIR_OP_PREG) { ret R.err[bool, str](unencodable_message(mir.MIR_LOAD)); }
+
+    var base: i32 = 0;
+    var disp: u8  = 0;
+    val ra: R.Result[bool, str] = mem_base_disp(mi, ?mi.operands[1], ?base, ?disp);
+    if (R.is_err[bool, str](ra)) { ret ra; }
+
+    emit_imm1(st, OP_LDY_IMM, disp);
+    emit_zp1(st, OP_LDA_IND_Y, mos6502.zp_addr(base));
+    emit_zp1(st, OP_STA_ZP, mos6502.zp_addr(dst.preg::i32));
+    ret R.ok[bool, str](true);
+}
+
+# encode a one-byte store `[ptr + disp] <- src` as `LDA src ; LDY #disp ; STA (ptr),Y`
+#
+# The write twin of `encode_load`; the stored byte rides an immediate or a zero-page
+# value register into A first, since `(zp),Y` stores only the accumulator.
+fun encode_store(st: *enc.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count != 2) { ret R.err[bool, str]("mos6502: malformed store"); }
+
+    var base: i32 = 0;
+    var disp: u8  = 0;
+    val ra: R.Result[bool, str] = mem_base_disp(mi, ?mi.operands[0], ?base, ?disp);
+    if (R.is_err[bool, str](ra)) { ret ra; }
+
+    val res_ld: R.Result[bool, str] = emit_load_a(st, ?mi.operands[1]);
+    if (R.is_err[bool, str](res_ld)) { ret res_ld; }
+    emit_imm1(st, OP_LDY_IMM, disp);
+    emit_zp1(st, OP_STA_IND_Y, mos6502.zp_addr(base));
+    ret R.ok[bool, str](true);
+}
+
+# resolve a memory operand to a reserved pointer-pair base and an 8-bit displacement
+#
+# The one place the encoder's addressing contract is stated, so a load and a store
+# cannot disagree about what they accept. Every refusal names the specific shape:
+# a frame-slot base (the software frame's own addressing, not yet built), a base
+# that is an allocatable value register (one byte - reading its neighbour as an
+# address high byte would be a silent miscompile), a displacement past the 8-bit Y
+# index, and an access still wider than one byte (the legalizer's job, not this
+# encoder's).
+# ---
+# mi:       the accessing instruction (its width is checked here)
+# mem:      the memory operand to resolve
+# out_base: receives the pointer-pair register id
+# out_disp: receives the displacement in bytes
+# ret:      ok(true), or an error naming the unsupported shape
+fun mem_base_disp(mi: *mir.MirInstr, mem: *mir.MirOperand, out_base: *i32, out_disp: *u8) R.Result[bool, str] {
+    if (mem.kind != mir.MIR_OP_MEM) { ret R.err[bool, str](unencodable_message(mi.opcode)); }
+    if (mi.width > 1) {
+        ret R.err[bool, str]("mos6502: a memory access wider than one byte must be split by width legalization before encoding");
+    }
+    if (mem.index != mir.MIR_VREG_NIL) {
+        ret R.err[bool, str]("mos6502: the 6502 has no scaled-index addressing");
+    }
+    if (mem.vreg != mir.MIR_VREG_NIL) {
+        ret R.err[bool, str]("mos6502: frame-slot addressing is not yet implemented on this target");
+    }
+    val base: i32 = mem.preg::i32;
+    if (!mos6502.is_ptr_pair(base)) {
+        ret R.err[bool, str]("mos6502: a memory base must be a reserved zero-page pointer pair on this target");
+    }
+    if (mem.imm < 0 || mem.imm > 255) {
+        ret R.err[bool, str]("mos6502: a memory displacement must fit the 8-bit Y index on this target");
+    }
+    @out_base = base;
+    @out_disp = (mem.imm & 0xFF)::u8;
     ret R.ok[bool, str](true);
 }
 
@@ -431,8 +517,11 @@ fun unencodable_message(op: mir.MirOpcode) str {
     if (op == mir.MIR_FADD || op == mir.MIR_FSUB || op == mir.MIR_FMUL || op == mir.MIR_FDIV) {
         ret "mos6502: floating-point is unsupported on this target";
     }
-    if (op == mir.MIR_LOAD || op == mir.MIR_STORE || op == mir.MIR_GEP || op == mir.MIR_ALLOCA) {
-        ret "mos6502: memory access encoding is not yet implemented on this target";
+    if (op == mir.MIR_GEP || op == mir.MIR_ALLOCA) {
+        ret "mos6502: address arithmetic is not yet implemented on this target";
+    }
+    if (op == mir.MIR_LOAD || op == mir.MIR_STORE) {
+        ret "mos6502: unsupported memory operand shape on this target";
     }
     if (op == mir.MIR_CBR || op == mir.MIR_BR ||
         op == mir.MIR_CMP_EQ || op == mir.MIR_CMP_NE ||
