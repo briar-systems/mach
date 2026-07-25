@@ -397,6 +397,114 @@ vector_emit_scan() {
     '
 }
 
+# produce_frame_elision <runmode> <target> <binary>
+# the frame-elision observable (#1940): for each function of the case's own module,
+# whether the emitted prologue builds a frame.
+#
+# execution cannot see this. a frameless leaf and a framed one compute the same
+# answer, so a case that only runs the program is green whether the elision fires,
+# stops firing, or fires on a function that must keep its frame - the last of which
+# is a miscompile (an incoming stack parameter addressed off a frame pointer that
+# was never established). the verdict is read from the bytes for that reason.
+#
+# it disassembles the OBJECTS, not the linked binary: mach's linker emits no symbol
+# table, so per-function attribution exists only before the link. the objects sit
+# beside the artifact because the case pins `out = "out/int/build"` in its own
+# manifest, and the project id is read from that manifest rather than assumed - the
+# same arrangement produce_vector_emit uses.
+produce_frame_elision() {
+    bin=$3
+    dir=$(dirname "$(dirname "$(dirname "$bin")")")
+    id=$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/mach.toml" | head -1)
+    if [ -z "$id" ]; then
+        echo "int: frame-elision: no project id in ${dir}/mach.toml" >&2; return 2
+    fi
+    objdir="$dir/out/int/build/obj/$id"
+    if [ ! -d "$objdir" ]; then
+        echo "int: frame-elision: no objects at $objdir (the case must pin out = \"out/int/build\")" >&2; return 2
+    fi
+    tool=$(resolve_objdump) || {
+        echo "int: frame-elision: llvm-objdump not found (install the 'llvm' package)" >&2; return 2
+    }
+    find "$objdir" -name '*.o' | sort | while IFS= read -r o; do
+        "$tool" -d --no-show-raw-insn "$o"
+    done | frame_elision_scan
+}
+
+# frame_elision_scan — read a disassembly on stdin, print `<function> framed|frameless`
+# sorted by function, preceded by the ISA the dispatch resolved.
+#
+# the verdict is the FIRST instruction only, which is what makes the observable
+# stable: a function's body moves with every unrelated backend change, while its
+# first instruction is the frame decision and nothing else.
+#   x86_64  — `push %rbp` opens every framed prologue.
+#   aarch64 — `stp x29, x30, [sp, #-N]!` is the record-at-top prologue.
+#   riscv64 — `addi sp, sp, -N` opens the frame allocation.
+frame_elision_scan() {
+    awk '
+    function demangle(s,   i, len, c, out) {
+        if (substr(s, 1, 2) != "_M") { return s }
+        i = 3
+        out = ""
+        while (i <= length(s)) {
+            c = substr(s, i, 1)
+            if (c == "N") { i++; continue }
+            if (c !~ /[0-9]/) { return s }
+            len = 0
+            while (i <= length(s) && substr(s, i, 1) ~ /[0-9]/) { len = len * 10 + substr(s, i, 1); i++ }
+            out = substr(s, i, len)
+            i += len
+        }
+        if (out == "") { return s }
+        return out
+    }
+    function framed(m, rest) {
+        if (isa == "x86_64")  { return m ~ /^push/ && rest ~ /%rbp/ }
+        if (isa == "aarch64") { return m == "stp" && rest ~ /x29,[[:space:]]*x30/ }
+        if (isa == "riscv64") { return m == "addi" && rest ~ /^sp,[[:space:]]*sp,[[:space:]]*-/ }
+        return 0
+    }
+    /file format/ {
+        if      ($0 ~ /x86-64/)   { isa = "x86_64" }
+        else if ($0 ~ /aarch64/)  { isa = "aarch64" }
+        else if ($0 ~ /riscv/)    { isa = "riscv64" }
+        else                      { bad = $0 }
+        next
+    }
+    /^[0-9a-f]+ <.*>:$/ {
+        sym = $0
+        sub(/^[0-9a-f]+ </, "", sym)
+        sub(/>:$/, "", sym)
+        sym = demangle(sym)
+        if (!(sym in seen)) { names[++n] = sym; seen[sym] = 1; verdict[sym] = "frameless" }
+        cur = sym
+        first = 1
+        next
+    }
+    cur != "" && first == 1 && /^[[:space:]]*[0-9a-f]+:/ {
+        line = $0
+        sub(/^[[:space:]]*[0-9a-f]+:[[:space:]]*/, "", line)
+        split(line, f, /[[:space:]]+/)
+        rest = line
+        sub(/^[^[:space:]]+[[:space:]]*/, "", rest)
+        if (framed(f[1], rest)) { verdict[cur] = "framed" }
+        first = 0
+    }
+    END {
+        if (bad != "") { print "int: frame-elision: unrecognized object format (" bad ")" > "/dev/stderr"; exit 2 }
+        # insertion-sort the names so the observable does not depend on emission order
+        for (i = 2; i <= n; i++) {
+            k = names[i]
+            j = i - 1
+            while (j >= 1 && names[j] > k) { names[j + 1] = names[j]; j-- }
+            names[j + 1] = k
+        }
+        print "arch=" isa
+        for (i = 1; i <= n; i++) { print names[i] " " verdict[names[i]] }
+    }
+    '
+}
+
 # produce <run> <runmode> <target> <binary> [<g_binary>]
 # dispatches to the producer named by <run>, forwarding the remaining arguments. the
 # debuginfo producer takes an extra `-g` artifact path run.sh built alongside the
@@ -413,6 +521,7 @@ produce() {
         built)       produce_built "$@" ;;
         debuginfo)   produce_debuginfo "$@" ;;
         vector-emit) produce_vector_emit "$@" ;;
+        frame-elision) produce_frame_elision "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
 }
