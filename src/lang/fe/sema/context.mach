@@ -126,6 +126,102 @@ pub rec InstWorklist {
     cap:     u32;
     drained: u32;
     alloc:   *A.Allocator;
+
+    # the #2225 rule's state for the episodes this worklist drives, so a lowering-time
+    # deferred body - which builds its own context per element, per instance - shares one
+    # report set and pays for the `^`-precondition scan once rather than per unrolled copy.
+    uni_reports:  UniReports;
+    secret_state: u8;
+}
+
+# `secret_state` values: the precondition has not been computed, or its answer
+val SECRET_UNKNOWN: u8 = 0;
+val SECRET_ABSENT:  u8 = 1;
+val SECRET_PRESENT: u8 = 2;
+
+# the `^`-precondition for the worklist's episodes, computed once and memoized (#2225)
+#
+# Sound to cache: substitution can only re-wrap a `^` that already exists, and lowering
+# resolves no new annotations, so an absent secret never becomes present after the first
+# episode this worklist drives.
+# ---
+# wl:  the worklist owning the memo
+# s:   the session (its type universe)
+# ret: true when the program uses the secret qualifier anywhere
+pub fun worklist_has_secret(wl: *InstWorklist, s: *session.Session) bool {
+    if (wl == nil) { ret session_has_secret(s); }
+    if (wl.secret_state == SECRET_UNKNOWN) {
+        wl.secret_state = SECRET_ABSENT;
+        if (session_has_secret(s)) { wl.secret_state = SECRET_PRESENT; }
+    }
+    ret wl.secret_state == SECRET_PRESENT;
+}
+
+# the number of distinct mixed-secrecy generic union instances one analysis remembers
+# having reported (#2225)
+val UNI_REPORT_CAP: u32 = 256;
+
+# the set of generic union instances already reported as mixed-secrecy (#2225)
+#
+# The rule is a property of a TYPE, not of a mention: `resolve_type_ref` is not memoized
+# and `def_underlying` re-resolves an alias per use, so one bad instantiation is reached
+# from two or three annotations and a naive check reports it that many times. Keyed by
+# the interned TYPE_INSTANCE the violating (nominal, arguments) pair denotes, so every
+# route to the same ill-formed type collapses to one diagnostic.
+#
+# Owned by the module's analysis and shared BY POINTER into every per-instance
+# re-validation episode it drives, so the sweep and the episodes dedupe against one set.
+# Past the cap it stops deduping and reports again - loud, never silent.
+# ---
+# seen: the interned instance TypeIds already reported
+# len:  number of entries
+pub rec UniReports {
+    seen: [256]type.TypeId;
+    len:  u32;
+}
+
+# record `key` as reported, answering whether this is its first report (#2225)
+#
+# A nil set (an episode that owns none) answers true every time: duplicate diagnostics
+# are a nuisance, a dropped one is a leak.
+# ---
+# ur:  the report set, or nil
+# key: the interned instance TypeId identifying the violation
+# ret: true when the caller should emit the diagnostic
+pub fun uni_report_mark(ur: *UniReports, key: type.TypeId) bool {
+    if (ur == nil) { ret true; }
+    var i: u32 = 0;
+    for (i < ur.len) {
+        if (ur.seen[i] == key) { ret false; }
+        i = i + 1;
+    }
+    if (ur.len >= UNI_REPORT_CAP) { ret true; }
+    ur.seen[ur.len] = key;
+    ur.len = ur.len + 1;
+    ret true;
+}
+
+# whether the type universe holds a secret `^` at all (#2225)
+#
+# The mixed-secrecy union rule can only fire where a `^` exists, so a program that never
+# writes one needs neither the per-annotation instance walk nor the widened
+# re-validation recording that feeds it. Every `^` a module can reach is interned by
+# `resolve_all_types` (its own and, by dependency order, every dependency's) before any
+# body is inferred, and substitution only ever re-wraps an existing one - so a false
+# answer here cannot become true later for any instance this pass records.
+# ---
+# s:   the session (its type universe)
+# ret: true when any interned type is a `^` qualifier
+pub fun session_has_secret(s: *session.Session) bool {
+    var i: u32 = 0;
+    for (i < s.types.type_len) {
+        val t_opt: O.Option[*type.Type] = type.get(?s.types, i);
+        if (O.is_some[*type.Type](t_opt)) {
+            if (O.unwrap[*type.Type](t_opt).kind == type.TYPE_SECRET) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
 }
 
 
@@ -213,6 +309,18 @@ pub rec SemaContext {
     subst:     *type.TypeId;
     subst_len: u32;
     subst_fn:  fun(*session.Session, type.TypeId, *type.TypeId, u32) type.TypeId;
+
+    # the mixed-secrecy union rule at a generic INSTANCE (#2225). `uni_check_fn` is
+    # `generics.check_annotation_uni_secrecy` behind a function pointer, for the same
+    # reason `subst_fn` is: this module is generics' dependency, not its dependent. It
+    # runs from `resolved_type_of` on every annotation an INSTANCE episode reads (where
+    # the substitution is what makes a union mixed); the module's own annotations are
+    # swept once by `sema` after decl inference, when every field table exists.
+    # `uni_reports` dedupes across the sweep and every episode it drives; `has_secret`
+    # is the whole rule's precondition, so a `^`-free program pays nothing.
+    uni_check_fn: fun(*SemaContext, id.TypeId);
+    uni_reports:  *UniReports;
+    has_secret:   bool;
 }
 
 # the interned semantic TypeId a syntactic AstType resolved to
@@ -227,6 +335,15 @@ pub fun resolved_type_of(sc: *SemaContext, ast_tid: id.TypeId) type.TypeId {
     if (ast_tid == id.TYPE_NIL)        { ret type.TYPE_NIL; }
     if (sc.type_resolved_ty == nil)    { ret type.TYPE_ERROR; }
     if (ast_tid >= sc.a.type_len::u32) { ret type.TYPE_ERROR; }
+    # #2225: an annotation read under a substitution is the one place a union that
+    # agreed at the template can turn mixed, so the instance rule runs here rather than
+    # off the module sweep, which sees only the un-substituted `{T, u32}` and agrees.
+    # The check reads the PRISTINE table itself and applies the substitution once, the
+    # #2254 rule: substituting the value below would compose onto an already-derived
+    # slot. Off on the main pass, whose annotations the post-decl sweep covers.
+    if (sc.has_secret && sc.subst != nil && sc.uni_check_fn != nil) {
+        sc.uni_check_fn(sc, ast_tid);
+    }
     ret apply_subst(sc, sc.type_resolved_ty[ast_tid]);
 }
 
@@ -386,6 +503,16 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
     var i: u32 = 0;
     for (i < arg_len) {
         if (arg_triggers_revalidation(sc, args[i])) { any = true; }
+        # #2225: `arg_triggers_revalidation` asks whether the ARGUMENT can reach a
+        # secret, which is the right question for every gate that needs the secret to
+        # arrive through the call. A union's variants can disagree without that: in
+        # `fun f[T]() { var u: U[T, ^u32]; }` the secret is written in the TEMPLATE and
+        # a plain `u32` argument is what makes the pair mixed. So any argument that is
+        # concrete at all records the instance once the program uses `^` anywhere - an
+        # abstract one still says nothing, and its concrete forms arrive through the
+        # enclosing instance's own re-validation.
+        if (sc.has_secret && args[i] != type.TYPE_ERROR && args[i] != type.TYPE_NIL
+            && !type_mentions_generic_param(sc, args[i])) { any = true; }
         i = i + 1;
     }
     if (!any) { ret R.ok[bool, str](true); }
@@ -448,11 +575,13 @@ pub fun inst_worklist_new(alloc: *A.Allocator) R.Result[*InstWorklist, str] {
     val wr: R.Result[*InstWorklist, str] = A.allocate[InstWorklist](alloc, 1::usize);
     if (R.is_err[*InstWorklist, str](wr)) { ret R.err[*InstWorklist, str]("internal: out of memory allocating the constant-time re-validation worklist"); }
     val wl: *InstWorklist = R.unwrap_ok[*InstWorklist, str](wr);
-    wl.items   = nil;
-    wl.len     = 0;
-    wl.cap     = 0;
-    wl.drained = 0;
-    wl.alloc   = alloc;
+    wl.items            = nil;
+    wl.len              = 0;
+    wl.cap              = 0;
+    wl.drained          = 0;
+    wl.alloc            = alloc;
+    wl.uni_reports.len  = 0;
+    wl.secret_state     = SECRET_UNKNOWN;
     ret R.ok[*InstWorklist, str](wl);
 }
 

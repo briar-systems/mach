@@ -28,6 +28,7 @@ use R: std.types.result;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.id;
+use atype: mach.lang.fe.ast.type;
 use sema: mach.lang.fe.sema.context;
 use mach.lang.fe.token;
 use mach.lang.intern;
@@ -570,6 +571,344 @@ fun all_secret_walk(s: *session.Session, tid: type.TypeId, scan: *type.SecretSca
     ret false;
 }
 
+# the (nominal, argument-list) pairs entered during one instance union-secrecy walk
+#
+# Keyed by the interned TYPE_INSTANCE the pair denotes, so the same nominal reached
+# under two different argument lists is examined twice (`rec P[T] { a: U[T]; b: U[u32]; }`)
+# while a recursive generic (`rec Node[T] { next: *Node[T]; }`) terminates on its second
+# entry. A graph past the bound fails CLOSED - it reports rather than returning "no
+# violation", which padding the graph would otherwise exploit.
+# ---
+# seen:          the (nominal, args) keys already entered
+# len:           number of entries
+# bound_reported: true once the depth bound has been reported on this walk
+rec UniInstScan {
+    seen:           [256]type.TypeId;
+    len:            u32;
+    bound_reported: bool;
+}
+
+# the mixed-secrecy union rule at a generic INSTANCE, run over one annotation (#2225)
+#
+# `check_uni_secrecy` runs at the union DECLARATION, where a variant typed by a generic
+# parameter is a public leaf and `uni U[T] { a: T; b: u32 }` honestly agrees. The
+# violation exists only after substitution, which never re-resolves the declaration - so
+# `U[^u32]` compiled clean while its non-generic twin was a hard error.
+#
+# This walks the annotation's PRISTINE resolved type carrying the episode's substitution,
+# rather than the substituted type, for two reasons. A substituted value has already lost
+# the template structure the rule needs (an anonymous `uni {ok: T; err: E}` becomes a
+# TYPE_INSTANCE whose `MODULE_NIL` nominal no classification can recover, which is how
+# mach-std's `Result` escaped every guard keyed on "is this instance a union"); and a
+# derived slot cannot say how many substitutions it has absorbed (#2254). Carrying the
+# substitution instead means every union is met as a NOMINAL, whose rec/uni kind is its
+# own, named or anonymous alike.
+# ---
+# sc:      the active sema context (its substitution, report set, and diagnostic sink)
+# ast_tid: the syntactic annotation being read
+pub fun check_annotation_uni_secrecy(sc: *sema.SemaContext, ast_tid: id.TypeId) {
+    if (!sc.has_secret)             { ret; }
+    if (sc.type_resolved_ty == nil) { ret; }
+    if (ast_tid >= sc.a.type_len::u32) { ret; }
+
+    val t_opt: O.Option[*atype.Type] = ast.get_type(sc.a, ast_tid);
+    if (O.is_none[*atype.Type](t_opt)) { ret; }
+
+    check_type_uni_secrecy(sc, sc.type_resolved_ty[ast_tid], sc.subst, sc.subst_len,
+                           O.unwrap[*atype.Type](t_opt).span);
+}
+
+# the mixed-secrecy union rule over one pristine type under an explicit substitution
+# ---
+# sc:      the active sema context (report set and diagnostic sink)
+# tid:     the pristine resolved type to walk
+# args:    the substitution to carry, or nil
+# arg_len: number of substitution arguments
+# span:    the source range every diagnostic this walk raises is anchored at
+pub fun check_type_uni_secrecy(sc: *sema.SemaContext, tid: type.TypeId, args: *type.TypeId,
+                               arg_len: u32, span: token.Span) {
+    if (!sc.has_secret) { ret; }
+    if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret; }
+
+    var scan: UniInstScan;
+    scan.len            = 0;
+    scan.bound_reported = false;
+    uni_inst_walk(sc, tid, args, arg_len, ?scan, span);
+}
+
+# the recursive worker: descend `tid` carrying `args`, checking every union nominal
+#
+# Structural, not spine-only: a pointer, an array, a function SIGNATURE (a `Box[T]` whose
+# field is `fun(*U[T]) u32` materializes `U[^u32]` in that signature and nowhere else),
+# and every field of every aggregate. A generic-parameter leaf terminates because the
+# instantiation that bound it walks each argument in its own right, so nothing is missed
+# by not re-entering through the binding.
+fun uni_inst_walk(sc: *sema.SemaContext, tid: type.TypeId, args: *type.TypeId, arg_len: u32,
+                  scan: *UniInstScan, span: token.Span) {
+    if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret; }
+    val s: *session.Session = sc.s;
+
+    val opt_t: O.Option[*type.Type] = type.get(?s.types, tid);
+    if (O.is_none[*type.Type](opt_t)) { ret; }
+    val t: *type.Type = O.unwrap[*type.Type](opt_t);
+    val k: type.TypeKind = t.kind;
+
+    # a parameter's binding argument is walked at the instantiation that supplies it.
+    if (k == type.TYPE_GENERIC_PARAM) { ret; }
+
+    # the spine cases read their base out of `t` BEFORE recursing: interning inside the
+    # recursion grows the type array and invalidates the borrow.
+    if (k == type.TYPE_SECRET) {
+        val base: type.TypeId = t.data.secret.base;
+        uni_inst_walk(sc, base, args, arg_len, scan, span);
+        ret;
+    }
+    if (k == type.TYPE_POINTER) {
+        val base: type.TypeId = t.data.pointer.base;
+        uni_inst_walk(sc, base, args, arg_len, scan, span);
+        ret;
+    }
+    if (k == type.TYPE_ARRAY) {
+        val base: type.TypeId = t.data.array.base;
+        uni_inst_walk(sc, base, args, arg_len, scan, span);
+        ret;
+    }
+
+    if (k == type.TYPE_FUN) {
+        val ret_ty:       type.TypeId = t.data.fn.ret_type;
+        val params_start: u32         = t.data.fn.params_start;
+        val params_len:   u32         = t.data.fn.params_len;
+        uni_inst_walk(sc, ret_ty, args, arg_len, scan, span);
+        var i: u32 = 0;
+        for (i < params_len) {
+            val p_opt: O.Option[type.TypeId] = type.get_param(?s.types, params_start + i);
+            if (O.is_some[type.TypeId](p_opt)) {
+                uni_inst_walk(sc, O.unwrap[type.TypeId](p_opt), args, arg_len, scan, span);
+            }
+            i = i + 1;
+        }
+        ret;
+    }
+
+    if (k == type.TYPE_INSTANCE) {
+        uni_inst_walk_instance(sc, tid, args, arg_len, scan, span);
+        ret;
+    }
+    if (k == type.TYPE_REC || k == type.TYPE_UNI) {
+        uni_inst_walk_nominal(sc, tid, args, arg_len, scan, span);
+        ret;
+    }
+}
+
+# descend a `Name[...]` instance: walk each argument, then the nominal it specializes
+# under those arguments composed with the incoming substitution
+#
+# The argument list is copied out of the param pool before anything else runs:
+# substitution appends to that pool and would invalidate a borrowed read.
+fun uni_inst_walk_instance(sc: *sema.SemaContext, tid: type.TypeId, args: *type.TypeId,
+                           arg_len: u32, scan: *UniInstScan, span: token.Span) {
+    val s: *session.Session = sc.s;
+
+    val opt_t: O.Option[*type.Type] = type.get(?s.types, tid);
+    if (O.is_none[*type.Type](opt_t)) { ret; }
+    val t: *type.Type = O.unwrap[*type.Type](opt_t);
+    val origin:     session.ModuleId = t.data.instance.target_origin;
+    val decl_id:    id.DeclId        = t.data.instance.target_decl;
+    val args_start: u32              = t.data.instance.args_start;
+    val args_len:   u32              = t.data.instance.args_len;
+
+    if (args_len == 0) { ret; }
+
+    val res_raw: R.Result[*type.TypeId, str] = A.allocate[type.TypeId](s.alloc, args_len::usize);
+    if (R.is_err[*type.TypeId, str](res_raw)) { ret; }
+    val raw: *type.TypeId = R.unwrap_ok[*type.TypeId, str](res_raw);
+
+    var i: u32 = 0;
+    for (i < args_len) {
+        val a_opt: O.Option[type.TypeId] = type.get_param(?s.types, args_start + i);
+        if (O.is_none[type.TypeId](a_opt)) {
+            A.deallocate[type.TypeId](s.alloc, raw, args_len::usize);
+            ret;
+        }
+        raw[i] = O.unwrap[type.TypeId](a_opt);
+        i = i + 1;
+    }
+
+    # each argument in its own right: an anonymous union written as a type argument is a
+    # NOMINAL here, so it is classified and checked like any other.
+    i = 0;
+    for (i < args_len) {
+        uni_inst_walk(sc, raw[i], args, arg_len, scan, span);
+        i = i + 1;
+    }
+
+    # a pristine annotation can only spell `Name[...]` over a NAMED declaration, so the
+    # nominal always resolves; an unresolvable one means a derived type reached this walk
+    # and the template structure the rule needs is already gone. Reported, never skipped.
+    val gnom: type.TypeId = generic_nominal_of(s, origin, decl_id);
+    if (gnom == type.TYPE_ERROR) {
+        sema.report(sc, span, "internal: #2225 union-secrecy instance walk: generic instance target declaration unavailable (pristine-type invariant violated)");
+        A.deallocate[type.TypeId](s.alloc, raw, args_len::usize);
+        ret;
+    }
+
+    val res_conc: R.Result[*type.TypeId, str] = A.allocate[type.TypeId](s.alloc, args_len::usize);
+    if (R.is_err[*type.TypeId, str](res_conc)) {
+        A.deallocate[type.TypeId](s.alloc, raw, args_len::usize);
+        ret;
+    }
+    val conc: *type.TypeId = R.unwrap_ok[*type.TypeId, str](res_conc);
+
+    i = 0;
+    for (i < args_len) {
+        conc[i] = subst_or_self(s, raw[i], args, arg_len);
+        i = i + 1;
+    }
+
+    uni_inst_walk_nominal(sc, gnom, conc, args_len, scan, span);
+
+    A.deallocate[type.TypeId](s.alloc, conc, args_len::usize);
+    A.deallocate[type.TypeId](s.alloc, raw, args_len::usize);
+}
+
+# check (when it is a union) and descend one nominal under `args`
+#
+# A nominal whose field graph mentions no generic parameter is fully concrete: its
+# arguments are irrelevant to it, and its own declaration-site check already owns it, so
+# it is walked once with no substitution and never re-reported here.
+fun uni_inst_walk_nominal(sc: *sema.SemaContext, nom: type.TypeId, args: *type.TypeId,
+                          arg_len: u32, scan: *UniInstScan, span: token.Span) {
+    val s: *session.Session = sc.s;
+
+    var a: *type.TypeId = args;
+    var n: u32          = arg_len;
+    val generic: bool   = nominal_has_gparam(s, nom);
+    if (!generic) {
+        a = nil;
+        n = 0;
+    }
+
+    val key: type.TypeId = nominal_visit_key(s, nom, a, n);
+    var i: u32 = 0;
+    for (i < scan.len) {
+        if (scan.seen[i] == key) { ret; }
+        i = i + 1;
+    }
+    if (scan.len >= 256) {
+        if (!scan.bound_reported) {
+            scan.bound_reported = true;
+            sema.report(sc, span, "constant-time: this type's graph is too large to prove that every generic union it reaches has variants agreeing on secrecy");
+        }
+        ret;
+    }
+    scan.seen[scan.len] = key;
+    scan.len = scan.len + 1;
+
+    val opt_nom: O.Option[*type.Type] = type.get(?s.types, nom);
+    if (O.is_none[*type.Type](opt_nom)) { ret; }
+    if (generic && O.unwrap[*type.Type](opt_nom).kind == type.TYPE_UNI) {
+        check_uni_variants(sc, nom, a, n, key, span);
+    }
+
+    val opt_tab: O.Option[*type.FieldTable] = type.field_table_for(?s.types, nom);
+    if (O.is_none[*type.FieldTable](opt_tab)) { ret; }
+    val fields_len: u32 = O.unwrap[*type.FieldTable](opt_tab).fields_len;
+
+    # the entry is re-fetched every step and its type copied out before recursing: the
+    # walk below materializes instance field tables, which grows the field pool.
+    var f: u32 = 0;
+    for (f < fields_len) {
+        val e_opt: O.Option[*type.FieldEntry] = type.field_at(?s.types, nom, f);
+        if (O.is_some[*type.FieldEntry](e_opt)) {
+            val fty: type.TypeId = O.unwrap[*type.FieldEntry](e_opt).ty;
+            uni_inst_walk(sc, fty, a, n, scan, span);
+        }
+        f = f + 1;
+    }
+}
+
+# report when union nominal `nom`'s variants disagree on secrecy once `args` is applied
+#
+# Deferred - not rejected - while any variant still mentions a generic parameter, so a
+# partially concrete template like `uni U[A, B]` written `U[T, ^u32]` inside a generic
+# stays legal: it has legal instantiations (`Outer[^u32]`) and illegal ones
+# (`Outer[u32]`), and each is decided when it is actually formed.
+fun check_uni_variants(sc: *sema.SemaContext, nom: type.TypeId, args: *type.TypeId,
+                       arg_len: u32, key: type.TypeId, span: token.Span) {
+    val s: *session.Session = sc.s;
+
+    val opt_tab: O.Option[*type.FieldTable] = type.field_table_for(?s.types, nom);
+    if (O.is_none[*type.FieldTable](opt_tab)) { ret; }
+    val fields_len: u32 = O.unwrap[*type.FieldTable](opt_tab).fields_len;
+    if (fields_len < 2) { ret; }
+
+    val first_opt: O.Option[*type.FieldEntry] = type.field_at(?s.types, nom, 0);
+    if (O.is_none[*type.FieldEntry](first_opt)) { ret; }
+    val first_raw: type.TypeId = O.unwrap[*type.FieldEntry](first_opt).ty;
+    val first:     type.TypeId = subst_or_self(s, first_raw, args, arg_len);
+    if (type_mentions_gparam(s, first)) { ret; }
+
+    var i: u32 = 1;
+    for (i < fields_len) {
+        val e_opt: O.Option[*type.FieldEntry] = type.field_at(?s.types, nom, i);
+        if (O.is_none[*type.FieldEntry](e_opt)) { ret; }
+        val raw: type.TypeId = O.unwrap[*type.FieldEntry](e_opt).ty;
+        val ty:  type.TypeId = subst_or_self(s, raw, args, arg_len);
+        if (type_mentions_gparam(s, ty)) { ret; }
+        if (!secrecy_structure_equal_deep(s, first, ty)) {
+            if (sema.uni_report_mark(sc.uni_reports, key)) {
+                sema.report(sc, span, "union variants must agree on secrecy: this instantiation makes overlapping fields part secret `^` and part public, which would alias the same storage at two classifications");
+            }
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
+# the interned TYPE_INSTANCE that identifies visiting `nom` under `args`
+#
+# The bare nominal identifies itself when no substitution is carried. A failure to intern
+# degrades to the nominal, which can only make the walk stop early on a graph the
+# allocator has already failed on.
+fun nominal_visit_key(s: *session.Session, nom: type.TypeId, args: *type.TypeId, arg_len: u32) type.TypeId {
+    if (args == nil || arg_len == 0) { ret nom; }
+
+    val opt_nom: O.Option[*type.Type] = type.get(?s.types, nom);
+    if (O.is_none[*type.Type](opt_nom)) { ret nom; }
+    val t: *type.Type = O.unwrap[*type.Type](opt_nom);
+    if (t.kind != type.TYPE_REC && t.kind != type.TYPE_UNI) { ret nom; }
+    val origin:  session.ModuleId = t.data.nominal.origin;
+    val decl_id: id.DeclId        = t.data.nominal.decl;
+
+    val r: R.Result[type.TypeId, str] = type.intern_instance(?s.types, origin, decl_id, args, arg_len);
+    if (R.is_err[type.TypeId, str](r)) { ret nom; }
+    ret R.unwrap_ok[type.TypeId, str](r);
+}
+
+# `substitute`, or the type unchanged when no substitution is carried
+#
+# `substitute` maps a generic parameter through an EMPTY argument list to the poison
+# type; the walk needs the template type back instead, so the abstract-variant deferral
+# below sees a parameter rather than an error.
+fun subst_or_self(s: *session.Session, tid: type.TypeId, args: *type.TypeId, arg_len: u32) type.TypeId {
+    if (args == nil || arg_len == 0) { ret tid; }
+    ret substitute(s, tid, args, arg_len);
+}
+
+# whether `tid` is, or structurally contains, a generic parameter (owning the cycle guard)
+fun type_mentions_gparam(s: *session.Session, tid: type.TypeId) bool {
+    var scan: GParamScan;
+    scan.visited = nil;
+    scan.len     = 0;
+    scan.cap     = 0;
+
+    val mentioned: bool = mentions_gparam(s, tid, ?scan);
+    if (scan.visited != nil && scan.cap > 0) {
+        A.deallocate[type.TypeId](s.alloc, scan.visited, scan.cap::usize);
+    }
+    ret mentioned;
+}
+
 # resolve the generic nominal TypeId that instance `(origin, gdecl)` specializes
 #
 # Reads the nominal's name and rec/uni kind from the declaration in its origin
@@ -930,6 +1269,24 @@ fun mentions_gparam(s: *session.Session, tid: type.TypeId, scan: *GParamScan) bo
     if (t.kind == type.TYPE_ARRAY)         { ret mentions_gparam(s, t.data.array.base, scan); }
     if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI) {
         ret nominal_fields_mention(s, tid, scan);
+    }
+
+    # a SIGNATURE is a position like any other: `rec Box[T] { f: fun(*U[T]) u32; }`
+    # mentions `T` only there, and a walk that stopped at the arrow called `Box` fully
+    # concrete - leaving a nested aggregate unspecialized, and hiding the `U[^u32]` the
+    # instance really materialises from the #2225 union rule (#2168 constraint 4).
+    if (t.kind == type.TYPE_FUN) {
+        val ret_ty:       type.TypeId = t.data.fn.ret_type;
+        val params_start: u32         = t.data.fn.params_start;
+        val params_len:   u32         = t.data.fn.params_len;
+        if (mentions_gparam(s, ret_ty, scan)) { ret true; }
+        var i: u32 = 0;
+        for (i < params_len) {
+            val p_opt: O.Option[type.TypeId] = type.get_param(?s.types, params_start + i);
+            if (O.is_some[type.TypeId](p_opt) && mentions_gparam(s, O.unwrap[type.TypeId](p_opt), scan)) { ret true; }
+            i = i + 1;
+        }
+        ret false;
     }
 
     if (t.kind == type.TYPE_INSTANCE) {
