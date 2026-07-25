@@ -67,9 +67,20 @@ CT_WARN="${CT_WARN:-10}"
 
 # address mode asserts on mean_rnd/mean_fix. the planted leak must slow the random
 # class by at least this factor (hard). the clean references are reported and warned
-# on, never failed -- same split as LEAK_MIN / CT_WARN above, and for the same
-# reason: on a loaded box a clean reference's ratio wanders (observed 0.75 to 1.00)
-# while the planted leak's does not fall below 1.29.
+# on, never failed -- same split as LEAK_MIN / CT_WARN above.
+#
+# WHY A RATIO AND NOT |t|: |t| divides by the sample variance, and machine load
+# inflates the variance without moving the means. across runs at load average 8-10
+# the planted leak's |t| swung 2.0 to 482 -- it would have failed a fixed threshold
+# in half of them -- while the ratio stayed at 1.14 to 1.48 and never once missed.
+#
+# THE RATIO IS NOT IMMUNE, THOUGH, and the mechanism matters if you are tuning this:
+# the leak is a fixed cache-miss cost (~100-140ns) over a baseline that GROWS with
+# load, so a busy box compresses the ratio toward 1.0. 1.10 sits below the lowest
+# observed leak (1.14) and above the null's quiet-box wander, but on a loaded box
+# the null itself has been seen 12% off (0.876) -- larger than the leak's own margin.
+# READ THE NULL CONTROL FIRST: if it is not flat, the run cannot discriminate and
+# the leak verdict below it means nothing either way. re-run on a quiet machine.
 ADDR_LEAK_MIN="${ADDR_LEAK_MIN:-1.10}"
 ADDR_REF_WARN="${ADDR_REF_WARN:-0.10}"
 
