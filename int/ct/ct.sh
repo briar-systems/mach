@@ -91,7 +91,7 @@ CT_WARN="${CT_WARN:-10}"
 
 # address mode asserts on mean_rnd/mean_fix. the planted leak must slow the random
 # class by at least this factor (hard). the clean references are reported and warned
-# on, never failed -- same split as LEAK_MIN / CT_WARN above.
+# on, never failed -- same split as LEAK_RATIO_MIN / CT_WARN above.
 #
 # WHY A RATIO AND NOT |t|: |t| divides by the sample variance, and machine load
 # inflates the variance without moving the means. across runs at load average 8-10
