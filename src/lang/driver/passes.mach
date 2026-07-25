@@ -759,7 +759,7 @@ pub fun run_lower_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
 # ---
 # p:   the active project
 # ret: true once the pass may demand Q_LOWER, or the first error
-pub fun lower_prepare(p: *project.Project) R.Result[bool, outcome.Fail] {
+fun lower_prepare(p: *project.Project) R.Result[bool, outcome.Fail] {
     if (!query.is_registered(?p.s.queries, query.Q_LOWERED_SURFACE)) {
         val rls: R.Result[bool, str] = query.register_derived(?p.s.queries, query.Q_LOWERED_SURFACE, q_lowered_surface_compute);
         if (R.is_err[bool, str](rls)) { ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](rls))); }
@@ -809,7 +809,7 @@ pub fun lower_prepare(p: *project.Project) R.Result[bool, outcome.Fail] {
 # p:   the active project
 # mid: the module to probe
 # ret: true when the cached IR will be reused
-pub fun lower_reusable(p: *project.Project, mid: session.ModuleId) bool {
+fun lower_reusable(p: *project.Project, mid: session.ModuleId) bool {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     ret query.peek_valid(?p.s.queries, query.Q_LOWER, back_half_key(m.stable_id, test_build(p)));
 }
@@ -1054,7 +1054,12 @@ pub fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Res
     }
     val irmod: *ir.Module = R.unwrap_ok[*ir.Module, str](rr_raw);
 
-    val ro: R.Result[bool, str] = lower_optimize(p, irmod, test_mode);
+    val nid: R.Result[intern.StrId, str] = neutralize_id(p, test_mode);
+    if (R.is_err[intern.StrId, str](nid)) {
+        ir_release(alloc, home);
+        ret R.err[query.QueryOutput, str](R.unwrap_err[intern.StrId, str](nid));
+    }
+    val ro: R.Result[bool, str] = lower_optimize(p, irmod, R.unwrap_ok[intern.StrId, str](nid));
     if (R.is_err[bool, str](ro)) {
         ir_release(alloc, home);
         ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](ro));
@@ -1113,20 +1118,29 @@ fun lower_raw(p: *project.Project, mid: session.ModuleId, home: *ir.ModuleHome) 
 # post-pipeline IR the object is built from, so an unchanged optimized module
 # reuses its codegen output. The test variant's `main` is neutralized into a
 # body-less extern (the runner supplies the program entry) on this fresh IR before
-# it is cached, so the normal variant's Q_LOWER value stays untouched (#1858).
+# it is cached, so the normal variant's Q_LOWER value stays untouched (#1858); the
+# id it matches against is interned by the caller, on the session-owning thread,
+# so this stays free of shared writes.
 # ---
-# p:         the active project
-# irmod:     the raw module to optimize in place
-# test_mode: whether this is the test-mode variant
-# ret:       true once the module is optimized, or the first pass error
-fun lower_optimize(p: *project.Project, irmod: *ir.Module, test_mode: bool) R.Result[bool, str] {
+# p:       the active project
+# irmod:   the raw module to optimize in place
+# main_id: interned `main` for a test build, STR_NIL for a normal one
+# ret:     true once the module is optimized, or the first pass error
+fun lower_optimize(p: *project.Project, irmod: *ir.Module, main_id: intern.StrId) R.Result[bool, str] {
     val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
 
     val res_opt: R.Result[bool, str] = pipeline.run(irmod, ?p.target, ctx.req.opt, ctx.req.verify_ir, ctx.req.vectorize, ctx.req.simd == manifest.SIMD_REQUIRE, ctx.req.float_reassoc, ?p.s.interner);
     if (R.is_err[bool, str](res_opt)) { ret res_opt; }
 
-    if (test_mode) { ret testrunner.neutralize_main(p.s, irmod); }
+    if (main_id != intern.STR_NIL) { ret testrunner.neutralize_main(main_id, irmod); }
     ret R.ok[bool, str](true);
+}
+
+# the `main` linkage id the optimize half neutralizes against: interned once, on
+# the session-owning thread, and STR_NIL outside a test build
+fun neutralize_id(p: *project.Project, test_mode: bool) R.Result[intern.StrId, str] {
+    if (!test_mode) { ret R.ok[intern.StrId, str](intern.STR_NIL); }
+    ret testrunner.main_linkage_id(p.s);
 }
 
 # box a fresh, empty ModuleHome on `alloc` - the private arena one lowered module
@@ -1152,7 +1166,7 @@ fun ir_home_new(alloc: *A.Allocator) R.Result[*ir.ModuleHome, str] {
 # One arena teardown frees every byte the module owns - its box included - so no
 # per-field `ir.dnit` walk is needed. The home box itself is the only thing that
 # lived outside the arena.
-pub fun ir_release(alloc: *A.Allocator, home: *ir.ModuleHome) {
+fun ir_release(alloc: *A.Allocator, home: *ir.ModuleHome) {
     if (home == nil) { ret; }
     ir.home_dnit(home);
     A.deallocate[ir.ModuleHome](alloc, home, 1::usize);
@@ -1224,19 +1238,20 @@ rec PlwSlot {
 # comes from its own module's arena, the target is read-only, and the interner is
 # read-only for the span, so a worker needs nothing beyond the shared cursor.
 # ---
-# p:         the active project
-# next:      atomic cursor - the next slot index a worker claims
-# stop:      atomic flag - set non-zero by the first worker to error
-# test_mode: whether this build lowers the test variant
-# slots:     the per-module work array, in topo order
-# slot_len:  number of slots
+# p:        the active project
+# next:     atomic cursor - the next slot index a worker claims
+# stop:     atomic flag - set non-zero by the first worker to error
+# main_id:  interned `main` for a test build, STR_NIL for a normal one - resolved
+#           on this thread so no worker ever writes the session interner
+# slots:    the per-module work array, in topo order
+# slot_len: number of slots
 rec ParallelLower {
-    p:         *project.Project;
-    next:      i64;
-    stop:      i64;
-    test_mode: bool;
-    slots:     *PlwSlot;
-    slot_len:  u32;
+    p:        *project.Project;
+    next:     i64;
+    stop:     i64;
+    main_id:  intern.StrId;
+    slots:    *PlwSlot;
+    slot_len: u32;
 }
 
 # the worker thread body: drain slots from the shared cursor and optimize each
@@ -1259,7 +1274,7 @@ fun plw_worker_main(arg: *u8) {
         if (idx_raw >= pl.slot_len::i64) { ret; }
 
         val slot: *PlwSlot = ?pl.slots[idx_raw::usize];
-        val r: R.Result[bool, str] = lower_optimize(pl.p, slot.m, pl.test_mode);
+        val r: R.Result[bool, str] = lower_optimize(pl.p, slot.m, pl.main_id);
         if (R.is_err[bool, str](r)) {
             slot.err = R.unwrap_err[bool, str](r);
             atomic.store(?pl.stop, 1::i64);
@@ -1347,13 +1362,20 @@ fun run_lower_parallel(p: *project.Project) R.Result[bool, str] {
     if (nworkers == 0)        { nworkers = 1; }
     if (nworkers > slot_len)  { nworkers = slot_len; }
 
+    val nid: R.Result[intern.StrId, str] = neutralize_id(p, test_build(p));
+    if (R.is_err[intern.StrId, str](nid)) {
+        lower_sweep_staged(p);
+        A.deallocate[PlwSlot](p.alloc, slots, topo_len::usize);
+        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](nid));
+    }
+
     var pl: ParallelLower;
-    pl.p         = p;
-    pl.next      = 0;
-    pl.stop      = 0;
-    pl.test_mode = test_build(p);
-    pl.slots     = slots;
-    pl.slot_len  = slot_len;
+    pl.p        = p;
+    pl.next     = 0;
+    pl.stop     = 0;
+    pl.main_id  = R.unwrap_ok[intern.StrId, str](nid);
+    pl.slots    = slots;
+    pl.slot_len = slot_len;
 
     # spawn nworkers-1 helper threads; the calling thread is the last worker, so a
     # single-worker (jobs 1) run drives the whole pool on this thread with no spawn.
