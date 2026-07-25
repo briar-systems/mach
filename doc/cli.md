@@ -90,6 +90,14 @@ codegen to one relocatable object, written under the resolved object tree at
 resolved artifact path (its `out` template); for a `static`/`shared` library (or
 with `--emit obj`) the objects are the deliverable and nothing is linked.
 
+A target whose object format delivers **finished modules** — SPIR-V, whose object
+output is a complete self-contained module rather than a link input — always
+takes the second shape. Each module is written as `<out>/obj/<fqn-as-path>.spv`
+and the module tree is the artifact, so `mach build --target <spirv-target>` and
+`mach build --target <spirv-target> --emit obj` produce exactly the same files.
+There is no executable to link, no archive or shared-library form, and no test
+dispatcher to run; each is refused by name rather than attempted.
+
 The optimisation pipeline comes from the selected profile's `opt` (`--profile
 <name>`, or the first declared profile) — the profile is how a build picks its
 optimisation level.
@@ -486,8 +494,11 @@ curated, so a snapshot printed here would only drift.
 
 Each dimension is orthogonal on its own, but the joint cells are not: an
 instruction set emits only with a wired code generator, a calling convention is
-per-ISA, an object format relocates and writes only the ISAs it declares, and an
-operating system links and loads only its own object formats. `mach info targets`
+per-ISA, an object format relocates and writes only the ISAs it declares, an
+operating system links and loads only its own object formats, and an object
+format's emission shape must match the instruction set's back half — a
+whole-module emitter needs a format that carries finished modules, a register
+machine one that carries linkable objects. `mach info targets`
 keeps a `<os>-<isa>` tuple only when some registered calling convention and object
 format compose an emittable full tuple — so `windows-aarch64` is absent (COFF
 covers x86-64 only) and `darwin-riscv64` is absent (Mach-O covers x86-64 and
