@@ -94,6 +94,7 @@ use mach.lang.me.pass.dce;
 use mach.lang.me.pass.mem2reg;
 use mach.lang.source;
 use mach.lang.target;
+use isa: mach.lang.target.isa;
 use mach.lang.target.resolved;
 
 # sentinel for an unset entry in a u32 index map
@@ -157,6 +158,10 @@ val MAX_ROUNDS: u32 = MAX_DEPTH + 1;
 # ptr_ty:     the untyped IR pointer an alloca and a gep produce
 # void_ty:    the void a store and a memzero carry
 # i64_ty:     the type the synthesized index and count constants ride in
+# int_ty:     interned integers of 1, 2, 4 and 8 bytes indexed by log2 of the byte
+#             width, or IRT_NIL where the width did not intern; the storage type of a
+#             union cell some member covers only part of, and the intermediate a
+#             narrow member's value is widened through
 rec State {
     alloc: *A.Allocator;
     m:     *ir.Module;
@@ -194,13 +199,17 @@ rec State {
     ptr_ty:  ir_type.IrTypeId;
     void_ty: ir_type.IrTypeId;
     i64_ty:  ir_type.IrTypeId;
+    int_ty:  [4]ir_type.IrTypeId;
 }
 
 # run scalar replacement over every defined function in `m`
 #
-# Repeats per function until no further candidate splits, so a nested record peels
-# one level per round: splitting `{i8, {i64, ptr}}` yields an `i8` slot mem2reg can
-# promote and a `{i64, ptr}` slot the next round splits again.
+# Repeats per function until no further candidate splits. A round both peels one level
+# of nesting -- splitting `{i8, {i64, ptr}}` yields an `i8` slot mem2reg can promote and
+# a `{i64, ptr}` slot the next round splits again -- and frees candidates the previous
+# round's rewrite unblocked: the source of a whole-aggregate copy is only reachable by
+# field gep once that copy has been expanded, so it first becomes splittable a round
+# after its destination did.
 # ---
 # m:   module to transform in place
 # tgt: target, consulted for aggregate byte sizes
@@ -240,6 +249,12 @@ fun split_function(m: *ir.Module, fn: *ir.Function, tgt: *target.Target) R.Resul
     val res_maps: R.Result[bool, str] = state_alloc(?st);
     if (R.is_err[bool, str](res_maps)) { state_dnit(?st); ret res_maps; }
     if (st.pool_len == 0) { state_dnit(?st); ret R.ok[bool, str](false); }
+
+    # the integer widths a union cell's storage and its narrow members ride in are
+    # interned up front: classification decides splittability from them, and it runs
+    # before the rewrite that would otherwise be the first to need a type
+    val res_ints: R.Result[bool, str] = intern_int_widths(?st);
+    if (R.is_err[bool, str](res_ints)) { state_dnit(?st); ret res_ints; }
 
     map_instr_blocks(?st);
     collect_candidates(?st);
@@ -303,6 +318,36 @@ fun state_init(st: *State, m: *ir.Module, fn: *ir.Function, tgt: *target.Target)
     st.ptr_ty  = ir_type.IRT_NIL;
     st.void_ty = ir_type.IRT_NIL;
     st.i64_ty  = ir_type.IRT_NIL;
+    var w: u32 = 0;
+    for (w < 4) { st.int_ty[w] = ir_type.IRT_NIL; w = w + 1; }
+}
+
+# intern the 1-, 2-, 4- and 8-byte integers into `int_ty`
+# ---
+# st:  state whose int_ty table is filled
+# ret: ok(true) once interned, or the first error
+fun intern_int_widths(st: *State) R.Result[bool, str] {
+    var w: u32 = 0;
+    for (w < 4) {
+        val r: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?st.m.types, 8 << w);
+        if (R.is_err[ir_type.IrTypeId, str](r)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](r)); }
+        st.int_ty[w] = R.unwrap_ok[ir_type.IrTypeId, str](r);
+        w = w + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# the interned integer of `bytes` bytes, or IRT_NIL when that is not a scalar width
+# ---
+# st:    state with int_ty filled
+# bytes: the byte width to name
+# ret:   the integer type, or IRT_NIL
+fun int_of_bytes(st: *State, bytes: u32) ir_type.IrTypeId {
+    if (bytes == 1) { ret st.int_ty[0]; }
+    if (bytes == 2) { ret st.int_ty[1]; }
+    if (bytes == 4) { ret st.int_ty[2]; }
+    if (bytes == 8) { ret st.int_ty[3]; }
+    ret ir_type.IRT_NIL;
 }
 
 # allocate and clear every instruction- and candidate-indexed map
@@ -548,21 +593,24 @@ fun splittable_at(st: *State, ty: ir_type.IrTypeId, depth: u32) bool {
 #
 # A union cannot be split the way a struct is -- its members share storage, and
 # per-member slots would break the reinterpretation a union exists to express. It can
-# still become ONE slot, provided every member covers the whole cell: when each member
-# is a scalar whose byte size is the union's own, every store writes all of it and
-# every load reads all of it, so the bits a later member reads are exactly the bits an
-# earlier one wrote, and no byte survives a store that a whole-cell store would miss.
-# A member narrower than the union is refused for exactly that reason: writing it
-# would have to preserve the bytes it does not cover, which one whole-cell store
-# cannot express.
+# still become ONE slot, provided every member is a scalar the cell can be read and
+# written whole through.
 #
-# The storage type is one of the members rather than a synthesized integer -- the
-# first integer member, else the first pointer member, else member 0 -- so the cell
+# When every member is exactly the cell's width, the slot's storage type is one of the
+# members -- the first integer, else the first pointer, else member 0 -- so the cell
 # stays in the general-purpose bank whenever any member already is, and at least one
-# member always accesses it with no reinterpret at all. `uni{ptr, ptr}` needs none;
+# member accesses it with no reinterpret at all. `uni{ptr, ptr}` needs none;
 # `uni{i64, ptr}` (a `Result[i64, str]` payload) needs one only on the pointer side.
+#
+# A member narrower than the cell (`uni{i8, ptr}`, a `Result[bool, str]` payload) is
+# admitted too, and then the storage type is the whole cell's integer: a narrow store
+# has to leave the bytes it does not cover as they were, which only an integer cell can
+# express -- read, clear the member's bits, or the widened value back in. That is why
+# the narrow form needs a little-endian target: it identifies the member at offset zero
+# with the cell integer's LOW bits, which is a byte-order fact rather than a layout one.
+# Every registered target is little-endian today, so this condition never declines.
 # ---
-# st: state (for the module's type table and target)
+# st: state (for the module's type table, target and interned integers)
 # ty: the field type to classify
 # ret: the storage type of the union's slot, or IRT_NIL when it is not a leaf
 fun union_leaf_ty(st: *State, ty: ir_type.IrTypeId) ir_type.IrTypeId {
@@ -574,15 +622,22 @@ fun union_leaf_ty(st: *State, ty: ir_type.IrTypeId) ir_type.IrTypeId {
     val size: u32 = ir_type.byte_size(?st.m.types, ty, st.tgt);
     var pick: ir_type.IrTypeId = ir_type.IRT_NIL;
     var rank: u32 = 3;
+    var narrow: bool = false;
     var k: u32 = 0;
     for (k < t.data.struct_.field_count) {
         val mt: ir_type.IrTypeId = t.data.struct_.fields[k];
-        if (!scalar_field(st, mt))                                     { ret ir_type.IRT_NIL; }
-        if (ir_type.byte_size(?st.m.types, mt, st.tgt) != size)        { ret ir_type.IRT_NIL; }
-        if (storage_rank(st, mt) < rank) { pick = mt; rank = storage_rank(st, mt); }
+        if (!scalar_field(st, mt))                              { ret ir_type.IRT_NIL; }
+        val ms: u32 = ir_type.byte_size(?st.m.types, mt, st.tgt);
+        if (ms > size)                                          { ret ir_type.IRT_NIL; }
+        if (ms < size) { narrow = true; }
+        or {
+            if (storage_rank(st, mt) < rank) { pick = mt; rank = storage_rank(st, mt); }
+        }
         k = k + 1;
     }
-    ret pick;
+    if (!narrow) { ret pick; }
+    if (st.tgt.model.endianness != isa.ENDIAN_LITTLE) { ret ir_type.IRT_NIL; }
+    ret int_of_bytes(st, size);
 }
 
 # the preference order `union_leaf_ty` picks a union's storage type by: an integer
@@ -994,12 +1049,12 @@ fun classify_gep_uses(st: *State) {
 fun gep_use_ok(st: *State, c: u32, gid: id.InstructionId, uid: id.InstructionId, inst: *instruction.Instruction, o: u32) bool {
     val cell: bool = union_leaf_ty(st, agg_field_type(st, st.cand_ty[c], st.gep_field[gid::u32])) != ir_type.IRT_NIL;
     if (inst.kind == instruction.OP_LOAD && o == 0) {
-        if (cell) { ret union_access_full(st, c, gid, inst.ty); }
+        if (cell) { ret union_access_ok(st, c, gid, inst.ty); }
         ret true;
     }
     if (inst.kind == instruction.OP_STORE && o == 1) {
         if (st.cand_phi[c]) { ret false; }
-        if (cell) { ret union_access_full(st, c, gid, inst.operands[0].ty); }
+        if (cell) { ret union_access_ok(st, c, gid, inst.operands[0].ty); }
         ret true;
     }
     if (inst.kind == instruction.OP_GEP && o == 0) {
@@ -1010,21 +1065,29 @@ fun gep_use_ok(st: *State, c: u32, gid: id.InstructionId, uid: id.InstructionId,
     ret false;
 }
 
-# whether an access through a union member gep covers the whole cell
+# whether an access through a gep addressing a union cell is one the slot can carry
 #
-# The cell's slot holds one scalar, so a load or store naming a member must be a scalar
-# of the cell's own byte size -- then the reinterpret between it and the slot's storage
-# type is a plain bit cast, and no byte of the cell escapes the transfer.
+# The slot holds one scalar, so the access must be a scalar too, and no wider than the
+# cell. A full-width access transfers through a bit cast; a narrower one needs the
+# cell's own integer to mask and widen through, which `union_leaf_ty` guarantees is the
+# storage type whenever the union has a narrow member -- but an access narrower than
+# every member (loading an `i8` out of a `uni{i64, ptr}`) can still land on a cell whose
+# storage is a member's type, and that has no masking form.
 # ---
 # st:  state
-# c:   the candidate the member gep addresses
-# gid: the member gep's instruction id
+# c:   the candidate the gep addresses
+# gid: the gep's instruction id
 # at:  the access type (a load's result type, or a store's value type)
-# ret: true when the access is a full-cell scalar
-fun union_access_full(st: *State, c: u32, gid: id.InstructionId, at: ir_type.IrTypeId) bool {
+# ret: true when the slot can carry the access
+fun union_access_ok(st: *State, c: u32, gid: id.InstructionId, at: ir_type.IrTypeId) bool {
     if (!scalar_field(st, at)) { ret false; }
     val ft: ir_type.IrTypeId = agg_field_type(st, st.cand_ty[c], st.gep_field[gid::u32]);
-    ret ir_type.byte_size(?st.m.types, at, st.tgt) == ir_type.byte_size(?st.m.types, ft, st.tgt);
+    val cell: u32 = ir_type.byte_size(?st.m.types, ft, st.tgt);
+    val acc: u32  = ir_type.byte_size(?st.m.types, at, st.tgt);
+    if (acc > cell) { ret false; }
+    if (acc == cell) { ret true; }
+    if (union_leaf_ty(st, ft) != int_of_bytes(st, cell)) { ret false; }
+    ret int_of_bytes(st, acc) != ir_type.IRT_NIL;
 }
 
 # whether a gep chained onto a field gep still addresses only that field
@@ -1466,6 +1529,53 @@ fun emit_bitcast(st: *State, cur: *Cursor, v: value.Value, to: ir_type.IrTypeId,
     ret R.ok[value.Value, str](out);
 }
 
+# emit a one-operand conversion (`trunc` / `zext`) narrowing or widening `v` to `to`
+# ---
+# st:     state
+# cur:    the insertion point
+# kind:   OP_TRUNC or OP_ZEXT
+# v:      the value to convert
+# to:     the integer type to convert it to
+# secret: the taint to stamp
+# ret:    the converted value, or an allocation error
+fun emit_convert(st: *State, cur: *Cursor, kind: instruction.InstrKind, v: value.Value,
+                 to: ir_type.IrTypeId, secret: bool) R.Result[value.Value, str] {
+    val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 1::usize);
+    if (R.is_err[*value.Value, str](r)) { ret R.err[value.Value, str](R.unwrap_err[*value.Value, str](r)); }
+    val ops: *value.Value = R.unwrap_ok[*value.Value, str](r);
+    ops[0] = v;
+    val tainted: bool = secret || v.secret;
+    val ri: R.Result[id.InstructionId, str] = emit(st, cur, kind, to, ops, 1, ir_type.IRT_NIL, tainted);
+    if (R.is_err[id.InstructionId, str](ri)) { ret R.err[value.Value, str](R.unwrap_err[id.InstructionId, str](ri)); }
+    var out: value.Value = value.instr(R.unwrap_ok[id.InstructionId, str](ri), to);
+    out.secret = tainted;
+    ret R.ok[value.Value, str](out);
+}
+
+# emit a two-operand integer op (`and` / `or`) over `a` and `b`
+# ---
+# st:     state
+# cur:    the insertion point
+# kind:   OP_AND or OP_OR
+# a:      the left operand, whose type the result takes
+# b:      the right operand
+# secret: the taint to stamp
+# ret:    the resulting value, or an allocation error
+fun emit_binary(st: *State, cur: *Cursor, kind: instruction.InstrKind, a: value.Value,
+                b: value.Value, secret: bool) R.Result[value.Value, str] {
+    val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 2::usize);
+    if (R.is_err[*value.Value, str](r)) { ret R.err[value.Value, str](R.unwrap_err[*value.Value, str](r)); }
+    val ops: *value.Value = R.unwrap_ok[*value.Value, str](r);
+    ops[0] = a;
+    ops[1] = b;
+    val tainted: bool = secret || a.secret || b.secret;
+    val ri: R.Result[id.InstructionId, str] = emit(st, cur, kind, a.ty, ops, 2, ir_type.IRT_NIL, tainted);
+    if (R.is_err[id.InstructionId, str](ri)) { ret R.err[value.Value, str](R.unwrap_err[id.InstructionId, str](ri)); }
+    var out: value.Value = value.instr(R.unwrap_ok[id.InstructionId, str](ri), a.ty);
+    out.secret = tainted;
+    ret R.ok[value.Value, str](out);
+}
+
 # emit `memzero ptr` over a nested aggregate field
 # ---
 # st:     state
@@ -1762,15 +1872,16 @@ fun union_access_at(st: *State, v: value.Value) u32 {
 #
 # The load already had its pointer retargeted onto the cell's slot, so when the member
 # it names is the slot's own storage type there is nothing left to do. Otherwise the
-# cell is read at its storage type and bit-cast to the member's, and the original load
-# is superseded by the cast.
+# cell is read whole and narrowed to the access: a `trunc` first when the member is
+# narrower (its bits are the cell integer's low ones), then a bit cast when the result
+# is not already the access type. The original load is superseded by the result.
 # ---
 # st:   state
 # rw:   rewrite map collecting the substitution
 # cur:  the insertion point
 # iid:  the load's instruction id
 # inst: the load
-# gid:  the member gep it reads through
+# gid:  the gep it reads through
 # ret:  ok(true) once rewritten, or the first error
 fun reinterpret_load(st: *State, rw: *mutate.Rewrite, cur: *Cursor, iid: id.InstructionId,
                      inst: *instruction.Instruction, gid: u32) R.Result[bool, str] {
@@ -1782,24 +1893,40 @@ fun reinterpret_load(st: *State, rw: *mutate.Rewrite, cur: *Cursor, iid: id.Inst
     val tainted: bool = inst.secret || st.cand_secret[c];
     val r_load: R.Result[value.Value, str] = emit_load(st, cur, slot, sty, tainted);
     if (R.is_err[value.Value, str](r_load)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_load)); }
-    val r_cast: R.Result[value.Value, str] = emit_bitcast(st, cur, R.unwrap_ok[value.Value, str](r_load), inst.ty, tainted);
-    if (R.is_err[value.Value, str](r_cast)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_cast)); }
+    var cur_v: value.Value = R.unwrap_ok[value.Value, str](r_load);
 
-    mutate.replace_value(rw, iid, R.unwrap_ok[value.Value, str](r_cast));
+    val acc: u32 = ir_type.byte_size(?st.m.types, inst.ty, st.tgt);
+    if (acc < ir_type.byte_size(?st.m.types, sty, st.tgt)) {
+        val r_tr: R.Result[value.Value, str] = emit_convert(st, cur, instruction.OP_TRUNC, cur_v,
+                                                            int_of_bytes(st, acc), tainted);
+        if (R.is_err[value.Value, str](r_tr)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_tr)); }
+        cur_v = R.unwrap_ok[value.Value, str](r_tr);
+    }
+    if (cur_v.ty != inst.ty) {
+        val r_cast: R.Result[value.Value, str] = emit_bitcast(st, cur, cur_v, inst.ty, tainted);
+        if (R.is_err[value.Value, str](r_cast)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_cast)); }
+        cur_v = R.unwrap_ok[value.Value, str](r_cast);
+    }
+
+    mutate.replace_value(rw, iid, cur_v);
     st.erase[iid::u32] = true;
     ret R.ok[bool, str](true);
 }
 
-# reinterpret a stored member as the union cell's storage type and write the whole cell
+# write a stored member back through the union cell's slot
 #
-# Every member covers the whole cell (`union_leaf_ty`), so the reinterpreted store
-# writes exactly the bytes the member's store did.
+# A member the width of the cell is bit-cast and stored whole. A narrower one must leave
+# the bytes it does not cover exactly as they were -- the very thing the memory form did
+# for free -- so it is widened into the cell integer and merged in: read the cell, clear
+# the member's bits, or the widened value back. In the shape this exists for, the cell
+# was zero-filled a moment earlier, and the later simplification passes fold the read,
+# the mask and the merge away, leaving only the widening.
 # ---
 # st:   state
 # cur:  the insertion point
 # iid:  the store's instruction id
 # inst: the store
-# gid:  the member gep it writes through
+# gid:  the gep it writes through
 # ret:  ok(true) once rewritten, or the first error
 fun reinterpret_store(st: *State, cur: *Cursor, iid: id.InstructionId,
                       inst: *instruction.Instruction, gid: u32) R.Result[bool, str] {
@@ -1810,9 +1937,38 @@ fun reinterpret_store(st: *State, cur: *Cursor, iid: id.InstructionId,
 
     val slot: value.Value = st.slots[st.cand_slot[c] + st.gep_field[gid]];
     val tainted: bool = inst.secret || v.secret || st.cand_secret[c];
-    val r_cast: R.Result[value.Value, str] = emit_bitcast(st, cur, v, sty, tainted);
-    if (R.is_err[value.Value, str](r_cast)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_cast)); }
-    val r_store: R.Result[bool, str] = emit_store(st, cur, R.unwrap_ok[value.Value, str](r_cast), slot, tainted);
+    val acc: u32 = ir_type.byte_size(?st.m.types, v.ty, st.tgt);
+    val cell: u32 = ir_type.byte_size(?st.m.types, sty, st.tgt);
+
+    var cur_v: value.Value = v;
+    if (acc < cell) {
+        if (cur_v.ty != int_of_bytes(st, acc)) {
+            val r_ci: R.Result[value.Value, str] = emit_bitcast(st, cur, cur_v, int_of_bytes(st, acc), tainted);
+            if (R.is_err[value.Value, str](r_ci)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_ci)); }
+            cur_v = R.unwrap_ok[value.Value, str](r_ci);
+        }
+        val r_z: R.Result[value.Value, str] = emit_convert(st, cur, instruction.OP_ZEXT, cur_v, sty, tainted);
+        if (R.is_err[value.Value, str](r_z)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_z)); }
+        cur_v = R.unwrap_ok[value.Value, str](r_z);
+
+        val r_old: R.Result[value.Value, str] = emit_load(st, cur, slot, sty, tainted);
+        if (R.is_err[value.Value, str](r_old)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_old)); }
+        val keep: value.Value = value.const_int(~((1::u64 << (acc * 8)) - 1), sty);
+        val r_and: R.Result[value.Value, str] = emit_binary(st, cur, instruction.OP_AND,
+                                                            R.unwrap_ok[value.Value, str](r_old), keep, tainted);
+        if (R.is_err[value.Value, str](r_and)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_and)); }
+        val r_or: R.Result[value.Value, str] = emit_binary(st, cur, instruction.OP_OR,
+                                                           R.unwrap_ok[value.Value, str](r_and), cur_v, tainted);
+        if (R.is_err[value.Value, str](r_or)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_or)); }
+        cur_v = R.unwrap_ok[value.Value, str](r_or);
+    }
+    or {
+        val r_cast: R.Result[value.Value, str] = emit_bitcast(st, cur, cur_v, sty, tainted);
+        if (R.is_err[value.Value, str](r_cast)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_cast)); }
+        cur_v = R.unwrap_ok[value.Value, str](r_cast);
+    }
+
+    val r_store: R.Result[bool, str] = emit_store(st, cur, cur_v, slot, tainted);
     if (R.is_err[bool, str](r_store)) { ret r_store; }
     st.erase[iid::u32] = true;
     ret R.ok[bool, str](true);
