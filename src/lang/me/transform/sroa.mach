@@ -13,6 +13,14 @@
 # of field slots, so the address merge becomes a merge of the slots' contents, and
 # the mem2reg run that follows turns those slots into the scalar phis.
 #
+# A union field is the one member that does not decompose: its members share storage,
+# so per-member slots would break the reinterpretation a union exists to express. It
+# becomes ONE slot instead, whenever every member is a scalar covering the whole cell
+# (`union_leaf_ty`) -- then every store writes all of it and every load reads all of
+# it, so the bits one member reads are exactly the bits another wrote, and a member
+# access naming a different type than the cell's is a plain bit reinterpret. This is
+# what carries `Result[T, E]`, whose payload is an anonymous `uni`, into registers.
+#
 # ESCAPE CONDITION (the whole legality argument). A candidate is an OP_ALLOCA of a
 # struct / array type (never a union: its fields overlap) with a constant count of
 # one, or an OP_PHI of that same type, whose whole type tree splits to scalars.
@@ -21,7 +29,9 @@
 #   - the base of an OP_GEP whose first two indices are the constants `0, k` with
 #     `k` a valid field ordinal, and whose own result is used only as a load
 #     pointer, a store pointer, or the base of a further gep that stays inside the
-#     field (a constant zero first index over the field's own type);
+#     field (a constant zero first index over the field's own type -- or, over a
+#     union field, a gep naming one of its members, which resolves to the cell's own
+#     address and is retargeted onto the cell's slot);
 #   - an OP_MEMZERO of the whole slot (alloca candidates only);
 #   - the pointer of a whole-aggregate OP_STORE (a copy into the slot) whose stored
 #     value is an address of the same aggregate type;
@@ -121,6 +131,9 @@ val MAX_ROUNDS: u32 = MAX_DEPTH + 1;
 # cand_of:    instruction id -> candidate index, or NONE_U32
 # gep_of:     instruction id -> the candidate index a field gep addresses, or NONE_U32
 # gep_field:  instruction id -> the field ordinal a field gep selects
+# uni_gep:    instruction id -> whether the gep names a member of a split union field
+#             rather than the field itself; it carries the field's own ordinal in
+#             gep_field, since every union member sits at the cell's own address
 # erase:      instruction id -> whether the rewrite superseded the instruction
 # cand_id:    per-candidate defining instruction id
 # cand_ty:    per-candidate aggregate type
@@ -155,6 +168,7 @@ rec State {
     cand_of:     *u32;
     gep_of:      *u32;
     gep_field:   *u32;
+    uni_gep:     *bool;
     erase:       *bool;
 
     cand_id:     *id.InstructionId;
@@ -233,6 +247,7 @@ fun split_function(m: *ir.Module, fn: *ir.Function, tgt: *target.Target) R.Resul
 
     link_phi_partitions(?st);
     classify_references(?st);
+    mark_union_member_geps(?st);
     classify_gep_uses(?st);
     check_partitions(?st);
     propagate_escapes(?st);
@@ -314,6 +329,10 @@ fun state_alloc(st: *State) R.Result[bool, str] {
     if (R.is_err[*u32, str](r_gf)) { ret R.err[bool, str](R.unwrap_err[*u32, str](r_gf)); }
     st.gep_field = R.unwrap_ok[*u32, str](r_gf);
 
+    val r_ug: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
+    if (R.is_err[*bool, str](r_ug)) { ret R.err[bool, str](R.unwrap_err[*bool, str](r_ug)); }
+    st.uni_gep = R.unwrap_ok[*bool, str](r_ug);
+
     val r_er: R.Result[*bool, str] = A.allocate[bool](st.alloc, n::usize);
     if (R.is_err[*bool, str](r_er)) { ret R.err[bool, str](R.unwrap_err[*bool, str](r_er)); }
     st.erase = R.unwrap_ok[*bool, str](r_er);
@@ -324,6 +343,7 @@ fun state_alloc(st: *State) R.Result[bool, str] {
         st.cand_of[i]     = NONE_U32;
         st.gep_of[i]      = NONE_U32;
         st.gep_field[i]   = 0;
+        st.uni_gep[i]     = false;
         st.erase[i]       = false;
         i = i + 1;
     }
@@ -391,6 +411,7 @@ fun state_dnit(st: *State) {
     if (st.cand_of != nil)     { A.deallocate[u32](st.alloc, st.cand_of, n::usize); }
     if (st.gep_of != nil)      { A.deallocate[u32](st.alloc, st.gep_of, n::usize); }
     if (st.gep_field != nil)   { A.deallocate[u32](st.alloc, st.gep_field, n::usize); }
+    if (st.uni_gep != nil)     { A.deallocate[bool](st.alloc, st.uni_gep, n::usize); }
     if (st.erase != nil)       { A.deallocate[bool](st.alloc, st.erase, n::usize); }
 
     val c: u32 = st.cand_cap;
@@ -515,10 +536,98 @@ fun splittable_at(st: *State, ty: ir_type.IrTypeId, depth: u32) bool {
     var k: u32 = 0;
     for (k < nf) {
         val ft: ir_type.IrTypeId = agg_field_type(st, ty, k);
-        if (!scalar_field(st, ft) && !splittable_at(st, ft, depth + 1)) { ret false; }
+        if (!scalar_field(st, ft) && union_leaf_ty(st, ft) == ir_type.IRT_NIL
+            && !splittable_at(st, ft, depth + 1)) { ret false; }
         k = k + 1;
     }
     ret true;
+}
+
+# the scalar storage type a union field's single slot is held in, or IRT_NIL when the
+# union must stay in memory
+#
+# A union cannot be split the way a struct is -- its members share storage, and
+# per-member slots would break the reinterpretation a union exists to express. It can
+# still become ONE slot, provided every member covers the whole cell: when each member
+# is a scalar whose byte size is the union's own, every store writes all of it and
+# every load reads all of it, so the bits a later member reads are exactly the bits an
+# earlier one wrote, and no byte survives a store that a whole-cell store would miss.
+# A member narrower than the union is refused for exactly that reason: writing it
+# would have to preserve the bytes it does not cover, which one whole-cell store
+# cannot express.
+#
+# The storage type is one of the members rather than a synthesized integer -- the
+# first integer member, else the first pointer member, else member 0 -- so the cell
+# stays in the general-purpose bank whenever any member already is, and at least one
+# member always accesses it with no reinterpret at all. `uni{ptr, ptr}` needs none;
+# `uni{i64, ptr}` (a `Result[i64, str]` payload) needs one only on the pointer side.
+# ---
+# st: state (for the module's type table and target)
+# ty: the field type to classify
+# ret: the storage type of the union's slot, or IRT_NIL when it is not a leaf
+fun union_leaf_ty(st: *State, ty: ir_type.IrTypeId) ir_type.IrTypeId {
+    val opt: O.Option[*ir_type.IrType] = ir_type.get(?st.m.types, ty);
+    if (O.is_none[*ir_type.IrType](opt)) { ret ir_type.IRT_NIL; }
+    val t: *ir_type.IrType = O.unwrap[*ir_type.IrType](opt);
+    if (t.kind != ir_type.IRT_UNION) { ret ir_type.IRT_NIL; }
+
+    val size: u32 = ir_type.byte_size(?st.m.types, ty, st.tgt);
+    var pick: ir_type.IrTypeId = ir_type.IRT_NIL;
+    var rank: u32 = 3;
+    var k: u32 = 0;
+    for (k < t.data.struct_.field_count) {
+        val mt: ir_type.IrTypeId = t.data.struct_.fields[k];
+        if (!scalar_field(st, mt))                                     { ret ir_type.IRT_NIL; }
+        if (ir_type.byte_size(?st.m.types, mt, st.tgt) != size)        { ret ir_type.IRT_NIL; }
+        if (storage_rank(st, mt) < rank) { pick = mt; rank = storage_rank(st, mt); }
+        k = k + 1;
+    }
+    ret pick;
+}
+
+# the preference order `union_leaf_ty` picks a union's storage type by: an integer
+# first, then a pointer, then anything else
+# ---
+# st: state (for the module's type table)
+# ft: the member type to rank
+# ret: 0 for an integer, 1 for a pointer, 2 otherwise
+fun storage_rank(st: *State, ft: ir_type.IrTypeId) u32 {
+    val opt: O.Option[*ir_type.IrType] = ir_type.get(?st.m.types, ft);
+    if (O.is_none[*ir_type.IrType](opt)) { ret 2; }
+    val k: ir_type.IrTypeKind = O.unwrap[*ir_type.IrType](opt).kind;
+    if (k == ir_type.IRT_INT) { ret 0; }
+    if (k == ir_type.IRT_PTR) { ret 1; }
+    ret 2;
+}
+
+# the member count of a union type, or 0 when `ty` is not one
+# ---
+# st: state (for the module's type table)
+# ty: the type to measure
+# ret: the union's member count
+fun union_member_count(st: *State, ty: ir_type.IrTypeId) u32 {
+    val opt: O.Option[*ir_type.IrType] = ir_type.get(?st.m.types, ty);
+    if (O.is_none[*ir_type.IrType](opt)) { ret 0; }
+    val t: *ir_type.IrType = O.unwrap[*ir_type.IrType](opt);
+    if (t.kind != ir_type.IRT_UNION) { ret 0; }
+    ret t.data.struct_.field_count;
+}
+
+# the type field `k`'s own slot is allocated at, and every whole-field zero fill and
+# copy moves it in
+#
+# A struct or array field's slot holds the field type itself; a union field's slot
+# holds the one scalar `union_leaf_ty` chose to stand in for the whole cell.
+# ---
+# st: state (for the module's type table and target)
+# ty: the aggregate type being split
+# k:  the field ordinal
+# ret: the slot's type
+fun slot_ty(st: *State, ty: ir_type.IrTypeId, k: u32) ir_type.IrTypeId {
+    val ft: ir_type.IrTypeId = agg_field_type(st, ty, k);
+    val ut: ir_type.IrTypeId = union_leaf_ty(st, ft);
+    if (ut != ir_type.IRT_NIL) { ret ut; }
+    ret ft;
 }
 
 # whether a field type is a scalar a slot can hold in a register
@@ -725,6 +834,12 @@ fun classify_one(st: *State, c: u32, iid: id.InstructionId, inst: *instruction.I
         if (inst.operands[2].kind != value.VAL_CONST_INT)    { ret false; }
         val k: u64 = inst.operands[2].data.int_lit;
         if (k >= st.cand_nf[c]::u64)                         { ret false; }
+        # a union field is one cell, not a tree: a walk continuing past it within the
+        # same gep addresses part of the cell, which one whole-cell slot cannot stand
+        # in for. its members are named by a chained gep instead, which
+        # `mark_union_member_geps` resolves onto the cell's own address
+        if (inst.operand_count > 3
+            && union_leaf_ty(st, agg_field_type(st, st.cand_ty[c], k::u32)) != ir_type.IRT_NIL) { ret false; }
         st.gep_of[iid::u32]    = c;
         st.gep_field[iid::u32] = k::u32;
         ret true;
@@ -756,6 +871,52 @@ fun classify_one(st: *State, c: u32, iid: id.InstructionId, inst: *instruction.I
         ret find_root(st, pc) == find_root(st, c);
     }
     ret false;
+}
+
+# tag every gep that names a member of a split union field
+#
+# `classify_references` has already tagged the direct field geps, so a union member gep
+# is exactly a three-index gep based on one of those whose field is a union leaf. Every
+# member of a union starts at the cell's own address, so the member gep resolves to the
+# same address as the field gep it is chained onto: it carries the same candidate and
+# the same field ordinal, is retargeted onto the same slot, and only the load or store
+# on the far side has to reinterpret the cell's bits as the member's type.
+#
+# This runs as its own sweep rather than inside `classify_gep_uses`, which validates a
+# gep's uses when it reaches the *using* instruction -- a use at a lower pool id than
+# the member gep it reads would be walked past before the tag existed.
+# ---
+# st: state whose gep_of / gep_field / uni_gep are written for each member gep
+fun mark_union_member_geps(st: *State) {
+    val fn: *ir.Function = st.fn;
+    var i: u32 = 0;
+    for (i < st.pool_len) {
+        if (st.instr_block[i] == id.BLOCK_NIL) { i = i + 1; cnt; }
+        if (st.gep_of[i] != NONE_U32)          { i = i + 1; cnt; }
+        val inst: *instruction.Instruction = ?fn.instrs[i];
+        if (inst.kind != instruction.OP_GEP || inst.operand_count != 3) { i = i + 1; cnt; }
+
+        val base: value.Value = inst.operands[0];
+        if (base.kind != value.VAL_INSTR)               { i = i + 1; cnt; }
+        if (base.data.instr::u32 >= st.pool_len)        { i = i + 1; cnt; }
+        val bid: u32 = base.data.instr::u32;
+        if (st.gep_of[bid] == NONE_U32 || st.uni_gep[bid]) { i = i + 1; cnt; }
+
+        val c: u32 = st.gep_of[bid];
+        val k: u32 = st.gep_field[bid];
+        val ft: ir_type.IrTypeId = agg_field_type(st, st.cand_ty[c], k);
+        if (union_leaf_ty(st, ft) == ir_type.IRT_NIL)    { i = i + 1; cnt; }
+        if (inst.aux_ty != ft)                           { i = i + 1; cnt; }
+        if (inst.operands[1].kind != value.VAL_CONST_INT) { i = i + 1; cnt; }
+        if (inst.operands[1].data.int_lit != 0)           { i = i + 1; cnt; }
+        if (inst.operands[2].kind != value.VAL_CONST_INT) { i = i + 1; cnt; }
+        if (inst.operands[2].data.int_lit >= union_member_count(st, ft)::u64) { i = i + 1; cnt; }
+
+        st.gep_of[i]    = c;
+        st.gep_field[i] = k;
+        st.uni_gep[i]   = true;
+        i = i + 1;
+    }
 }
 
 # mark every candidate bound by an OP_ASM's `{name}` list as escaped
@@ -806,7 +967,7 @@ fun classify_gep_uses(st: *State) {
                     taint(st, g, op.secret);
                     taint(st, g, inst.secret);
                     note_home(st, g, st.instr_block[i]);
-                    if (!gep_use_ok(st, g, op.data.instr, inst, o)) { st.cand_out[g] = true; }
+                    if (!gep_use_ok(st, g, op.data.instr, i::id.InstructionId, inst, o)) { st.cand_out[g] = true; }
                 }
             }
             o = o + 1;
@@ -816,19 +977,54 @@ fun classify_gep_uses(st: *State) {
 }
 
 # whether one use of a field gep keeps its owner splittable
+#
+# A gep addressing a union field -- the field gep itself, or a chained gep naming one
+# of its members, which is the same address -- is stricter: the cell's slot holds one
+# register-sized scalar, so an access must cover all of it. There is no partial form of
+# a whole-cell store, and a narrower load would read bytes the slot does not model.
 # ---
 # st:   state
 # c:    the candidate the gep addresses
 # gid:  the field gep's instruction id
+# uid:  the using instruction's id
 # inst: the using instruction
 # o:    the operand slot naming the gep
 # ret:  true when the use is a plain dereference, or a further descent that stays
 #       inside the field
-fun gep_use_ok(st: *State, c: u32, gid: id.InstructionId, inst: *instruction.Instruction, o: u32) bool {
-    if (inst.kind == instruction.OP_LOAD  && o == 0) { ret true; }
-    if (inst.kind == instruction.OP_GEP   && o == 0) { ret gep_stays_in_field(st, c, gid, inst); }
-    if (inst.kind == instruction.OP_STORE && o == 1) { ret st.cand_phi[c] == false; }
+fun gep_use_ok(st: *State, c: u32, gid: id.InstructionId, uid: id.InstructionId, inst: *instruction.Instruction, o: u32) bool {
+    val cell: bool = union_leaf_ty(st, agg_field_type(st, st.cand_ty[c], st.gep_field[gid::u32])) != ir_type.IRT_NIL;
+    if (inst.kind == instruction.OP_LOAD && o == 0) {
+        if (cell) { ret union_access_full(st, c, gid, inst.ty); }
+        ret true;
+    }
+    if (inst.kind == instruction.OP_STORE && o == 1) {
+        if (st.cand_phi[c]) { ret false; }
+        if (cell) { ret union_access_full(st, c, gid, inst.operands[0].ty); }
+        ret true;
+    }
+    if (inst.kind == instruction.OP_GEP && o == 0) {
+        # a member gep already stands at the cell; nothing descends past it
+        if (st.uni_gep[gid::u32]) { ret false; }
+        ret gep_stays_in_field(st, c, gid, uid, inst);
+    }
     ret false;
+}
+
+# whether an access through a union member gep covers the whole cell
+#
+# The cell's slot holds one scalar, so a load or store naming a member must be a scalar
+# of the cell's own byte size -- then the reinterpret between it and the slot's storage
+# type is a plain bit cast, and no byte of the cell escapes the transfer.
+# ---
+# st:  state
+# c:   the candidate the member gep addresses
+# gid: the member gep's instruction id
+# at:  the access type (a load's result type, or a store's value type)
+# ret: true when the access is a full-cell scalar
+fun union_access_full(st: *State, c: u32, gid: id.InstructionId, at: ir_type.IrTypeId) bool {
+    if (!scalar_field(st, at)) { ret false; }
+    val ft: ir_type.IrTypeId = agg_field_type(st, st.cand_ty[c], st.gep_field[gid::u32]);
+    ret ir_type.byte_size(?st.m.types, at, st.tgt) == ir_type.byte_size(?st.m.types, ft, st.tgt);
 }
 
 # whether a gep chained onto a field gep still addresses only that field
@@ -843,13 +1039,20 @@ fun gep_use_ok(st: *State, c: u32, gid: id.InstructionId, inst: *instruction.Ins
 # st:   state
 # c:    the candidate the field gep addresses
 # gid:  the field gep's instruction id
+# uid:  the chained gep's instruction id
 # inst: the chained gep
 # ret:  true when the chained gep stays inside the field
-fun gep_stays_in_field(st: *State, c: u32, gid: id.InstructionId, inst: *instruction.Instruction) bool {
+fun gep_stays_in_field(st: *State, c: u32, gid: id.InstructionId, uid: id.InstructionId, inst: *instruction.Instruction) bool {
+    val ft: ir_type.IrTypeId = agg_field_type(st, st.cand_ty[c], st.gep_field[gid::u32]);
+    # a union field is one cell rather than a tree to descend: `mark_union_member_geps`
+    # tagged the geps that name a member, all of which resolve to the cell's own
+    # address. any other gep addresses part of the cell, which one slot cannot stand in
+    # for
+    if (union_leaf_ty(st, ft) != ir_type.IRT_NIL)     { ret st.uni_gep[uid::u32]; }
     if (inst.operand_count < 2)                       { ret false; }
     if (inst.operands[1].kind != value.VAL_CONST_INT) { ret false; }
     if (inst.operands[1].data.int_lit != 0)           { ret false; }
-    ret inst.aux_ty == agg_field_type(st, st.cand_ty[c], st.gep_field[gid::u32]);
+    ret inst.aux_ty == ft;
 }
 
 # enforce the two rules that let one shared slot set stand in for the several
@@ -1241,6 +1444,28 @@ fun emit_load(st: *State, cur: *Cursor, ptr: value.Value, ty: ir_type.IrTypeId, 
     ret R.ok[value.Value, str](v);
 }
 
+# emit `bitcast to, v`, reinterpreting a union cell's bits as a member's type or the
+# other way round
+# ---
+# st:     state
+# cur:    the insertion point
+# v:      the value to reinterpret
+# to:     the type to reinterpret it as
+# secret: the taint to stamp
+# ret:    the reinterpreted value, or an allocation error
+fun emit_bitcast(st: *State, cur: *Cursor, v: value.Value, to: ir_type.IrTypeId, secret: bool) R.Result[value.Value, str] {
+    val r: R.Result[*value.Value, str] = A.allocate[value.Value](st.alloc, 1::usize);
+    if (R.is_err[*value.Value, str](r)) { ret R.err[value.Value, str](R.unwrap_err[*value.Value, str](r)); }
+    val ops: *value.Value = R.unwrap_ok[*value.Value, str](r);
+    ops[0] = v;
+    val tainted: bool = secret || v.secret;
+    val ri: R.Result[id.InstructionId, str] = emit(st, cur, instruction.OP_BITCAST, to, ops, 1, ir_type.IRT_NIL, tainted);
+    if (R.is_err[id.InstructionId, str](ri)) { ret R.err[value.Value, str](R.unwrap_err[id.InstructionId, str](ri)); }
+    var out: value.Value = value.instr(R.unwrap_ok[id.InstructionId, str](ri), to);
+    out.secret = tainted;
+    ret R.ok[value.Value, str](out);
+}
+
 # emit `memzero ptr` over a nested aggregate field
 # ---
 # st:     state
@@ -1303,7 +1528,7 @@ fun emit_field_slots(st: *State) R.Result[bool, str] {
         cur.loc = st.fn.instrs[st.cand_id[c]::u32].loc;
         var k: u32 = 0;
         for (k < st.cand_nf[c]) {
-            val ft: ir_type.IrTypeId = agg_field_type(st, st.cand_ty[c], k);
+            val ft: ir_type.IrTypeId = slot_ty(st, st.cand_ty[c], k);
             val r: R.Result[value.Value, str] = emit_slot(st, ?cur, ft, partition_secret(st, c));
             if (R.is_err[value.Value, str](r)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r)); }
             st.slots[st.cand_slot[c] + k] = R.unwrap_ok[value.Value, str](r);
@@ -1486,6 +1711,16 @@ fun rewrite_instr(st: *State, rw: *mutate.Rewrite, bid: id.BlockId, iid: id.Inst
     val g: u32 = st.gep_of[iid::u32];
     if (g != NONE_U32 && st.cand_out[g] == false) { ret retarget_gep(st, rw, iid, g); }
 
+    if (inst.kind == instruction.OP_LOAD && inst.operand_count >= 1) {
+        val ug: u32 = union_access_at(st, inst.operands[0]);
+        if (ug != NONE_U32) { ret reinterpret_load(st, rw, ?cur, iid, inst, ug); }
+    }
+
+    if (inst.kind == instruction.OP_STORE && inst.operand_count >= 2) {
+        val ug: u32 = union_access_at(st, inst.operands[1]);
+        if (ug != NONE_U32) { ret reinterpret_store(st, ?cur, iid, inst, ug); }
+    }
+
     if (inst.kind == instruction.OP_MEMZERO && inst.operand_count >= 1) {
         val c: u32 = candidate_at(st, inst.operands[0]);
         if (c != NONE_U32 && st.cand_out[c] == false) {
@@ -1502,6 +1737,84 @@ fun rewrite_instr(st: *State, rw: *mutate.Rewrite, bid: id.BlockId, iid: id.Inst
             ret expand_copy(st, ?cur, dc, inst.operands[0], inst.secret);
         }
     }
+    ret R.ok[bool, str](true);
+}
+
+# the gep addressing a split union cell that a value names, or NONE_U32
+#
+# Both the field gep and a chained member gep resolve to the cell's own address, so
+# either one puts the access on the reinterpreting path.
+# ---
+# st: state
+# v:  the address operand to resolve
+# ret: the gep's instruction id, or NONE_U32
+fun union_access_at(st: *State, v: value.Value) u32 {
+    if (v.kind != value.VAL_INSTR)        { ret NONE_U32; }
+    if (v.data.instr::u32 >= st.pool_len) { ret NONE_U32; }
+    val gid: u32 = v.data.instr::u32;
+    val c: u32 = st.gep_of[gid];
+    if (c == NONE_U32 || st.cand_out[c])  { ret NONE_U32; }
+    if (union_leaf_ty(st, agg_field_type(st, st.cand_ty[c], st.gep_field[gid])) == ir_type.IRT_NIL) { ret NONE_U32; }
+    ret gid;
+}
+
+# read a union cell's slot and reinterpret it as the member the load names
+#
+# The load already had its pointer retargeted onto the cell's slot, so when the member
+# it names is the slot's own storage type there is nothing left to do. Otherwise the
+# cell is read at its storage type and bit-cast to the member's, and the original load
+# is superseded by the cast.
+# ---
+# st:   state
+# rw:   rewrite map collecting the substitution
+# cur:  the insertion point
+# iid:  the load's instruction id
+# inst: the load
+# gid:  the member gep it reads through
+# ret:  ok(true) once rewritten, or the first error
+fun reinterpret_load(st: *State, rw: *mutate.Rewrite, cur: *Cursor, iid: id.InstructionId,
+                     inst: *instruction.Instruction, gid: u32) R.Result[bool, str] {
+    val c: u32 = st.gep_of[gid];
+    val sty: ir_type.IrTypeId = slot_ty(st, st.cand_ty[c], st.gep_field[gid]);
+    if (inst.ty == sty) { ret R.ok[bool, str](true); }
+
+    val slot: value.Value = st.slots[st.cand_slot[c] + st.gep_field[gid]];
+    val tainted: bool = inst.secret || st.cand_secret[c];
+    val r_load: R.Result[value.Value, str] = emit_load(st, cur, slot, sty, tainted);
+    if (R.is_err[value.Value, str](r_load)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_load)); }
+    val r_cast: R.Result[value.Value, str] = emit_bitcast(st, cur, R.unwrap_ok[value.Value, str](r_load), inst.ty, tainted);
+    if (R.is_err[value.Value, str](r_cast)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_cast)); }
+
+    mutate.replace_value(rw, iid, R.unwrap_ok[value.Value, str](r_cast));
+    st.erase[iid::u32] = true;
+    ret R.ok[bool, str](true);
+}
+
+# reinterpret a stored member as the union cell's storage type and write the whole cell
+#
+# Every member covers the whole cell (`union_leaf_ty`), so the reinterpreted store
+# writes exactly the bytes the member's store did.
+# ---
+# st:   state
+# cur:  the insertion point
+# iid:  the store's instruction id
+# inst: the store
+# gid:  the member gep it writes through
+# ret:  ok(true) once rewritten, or the first error
+fun reinterpret_store(st: *State, cur: *Cursor, iid: id.InstructionId,
+                      inst: *instruction.Instruction, gid: u32) R.Result[bool, str] {
+    val c: u32 = st.gep_of[gid];
+    val sty: ir_type.IrTypeId = slot_ty(st, st.cand_ty[c], st.gep_field[gid]);
+    val v: value.Value = inst.operands[0];
+    if (v.ty == sty) { ret R.ok[bool, str](true); }
+
+    val slot: value.Value = st.slots[st.cand_slot[c] + st.gep_field[gid]];
+    val tainted: bool = inst.secret || v.secret || st.cand_secret[c];
+    val r_cast: R.Result[value.Value, str] = emit_bitcast(st, cur, v, sty, tainted);
+    if (R.is_err[value.Value, str](r_cast)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](r_cast)); }
+    val r_store: R.Result[bool, str] = emit_store(st, cur, R.unwrap_ok[value.Value, str](r_cast), slot, tainted);
+    if (R.is_err[bool, str](r_store)) { ret r_store; }
+    st.erase[iid::u32] = true;
     ret R.ok[bool, str](true);
 }
 
@@ -1565,7 +1878,7 @@ fun expand_memzero(st: *State, cur: *Cursor, c: u32, secret: bool) R.Result[bool
     val tainted: bool = secret || st.cand_secret[c];
     var k: u32 = 0;
     for (k < st.cand_nf[c]) {
-        val ft: ir_type.IrTypeId = agg_field_type(st, st.cand_ty[c], k);
+        val ft: ir_type.IrTypeId = slot_ty(st, st.cand_ty[c], k);
         val slot: value.Value = st.slots[st.cand_slot[c] + k];
         if (ir_type.is_aggregate(?st.m.types, ft)) {
             val r: R.Result[bool, str] = emit_memzero(st, cur, slot, ft, tainted);
@@ -1605,7 +1918,7 @@ fun expand_copy(st: *State, cur: *Cursor, dst: u32, src: value.Value, secret: bo
             from = R.unwrap_ok[value.Value, str](r);
         }
         val res: R.Result[bool, str] = copy_field(st, cur, st.slots[st.cand_slot[dst] + k],
-                                                  from, agg_field_type(st, st.cand_ty[dst], k), tainted);
+                                                  from, slot_ty(st, st.cand_ty[dst], k), tainted);
         if (R.is_err[bool, str](res)) { ret res; }
         k = k + 1;
     }
