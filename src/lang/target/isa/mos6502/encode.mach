@@ -16,11 +16,14 @@
 # fresh single-byte add / subtract.
 #
 # SCOPE. This encoder realizes the straight-line register-arithmetic core - moves,
-# the byte ALU (add / sub / and / or / xor / not), returns, and direct calls -
+# the byte ALU (add / sub / and / or / xor / not / shift), returns, and direct calls -
 # byte-exact against the published 6502 opcode matrix. The frontiers documented in
 # the backend's scorecard (conditional branches, memory access through the software
 # frame, and the 16-bit-pointer forms) reach the encoder as passed-through generic
 # opcodes and are rejected with a loud, specific diagnostic rather than mis-encoded.
+# A SHIFT arrives already reduced to a constant count below the byte width, because
+# `be.codegen.legalize` owns every shift on a machine declaring no variable shifter
+# (`MachineModel.has_var_shift`); anything else is refused here (`encode_shift`).
 #
 # TIMING OBLIGATION (#2158). The constant-time guarantee treats selection, register
 # allocation, and encoding as timing-PRESERVING: the `#[oblivious]` gate and the #1648
@@ -73,9 +76,14 @@ val OP_RTS:     u8 = 0x60;  val OP_BRK:     u8 = 0x00;  val OP_NOP: u8 = 0xEA;
 val OP_LDY_IMM: u8 = 0xA0;  val OP_LDA_IND_Y: u8 = 0xB1;  val OP_STA_IND_Y: u8 = 0x91;
 # the conditional branch opcodes (pc-relative, signed 8-bit displacement)
 val OP_BEQ: u8 = 0xF0;  val OP_BNE: u8 = 0xD0;  val OP_BCC: u8 = 0x90;  val OP_BCS: u8 = 0xB0;
-# rotate the accumulator left through carry ($2A) - used to read the carry flag into
-# a 0/1 boolean when materializing a standalone unsigned compare
-val OP_ROL_A: u8 = 0x2A;
+# the shift / rotate group in its ACCUMULATOR addressing mode. every operation in this
+# encoder flows through A (the 6502 has no register-to-register ALU), so the value is
+# already in the accumulator when a shift reaches it and the memory forms of these four
+# ($06 / $46 / $26 / $66 and their absolute twins) are never the cheaper choice - they
+# would need the value stored back first. `ROL A` doubles as the carry read a standalone
+# compare materializes its 0/1 boolean with
+val OP_ASL_A: u8 = 0x0A;  val OP_LSR_A: u8 = 0x4A;
+val OP_ROL_A: u8 = 0x2A;  val OP_ROR_A: u8 = 0x6A;
 
 # encode one fully-resolved MIR module into `.text` bytes, symbol marks, and
 # relocations
@@ -151,6 +159,9 @@ fun encode_instr(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr, f
     if (op == mir.MIR_LOAD)  { ret encode_load(st, mi); }
     if (op == mir.MIR_STORE) { ret encode_store(st, mi); }
     if (op == mir.MIR_NOT) { ret encode_not(st, mi); }
+    if (op == mir.MIR_SHL || op == mir.MIR_SHR_U || op == mir.MIR_SHR_S) {
+        ret encode_shift(st, mi, op);
+    }
     if (op == mir.MIR_CMP_EQ || op == mir.MIR_CMP_NE || op == mir.MIR_CMP_LT_U) {
         ret encode_cmp(st, mi, op);
     }
@@ -297,6 +308,62 @@ fun encode_not(st: *enc.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
     val res_ld: R.Result[bool, str] = emit_load_a(st, ?mi.operands[1]);
     if (R.is_err[bool, str](res_ld)) { ret res_ld; }
     emit_imm1(st, OP_EOR_IMM, 0xFF);
+    emit_zp1(st, OP_STA_ZP, mos6502.zp_addr(dst.preg::i32));
+    ret R.ok[bool, str](true);
+}
+
+# encode a byte shift `dst = a shift #count` as `LDA a ; <one step> x count ; STA dst`
+#
+# The 6502 shifts ONE BIT PER INSTRUCTION, so a shift is a run of `count` accumulator
+# steps rather than a single opcode:
+#
+#   a << c    `ASL A` c times          (bit 0 fills with zero)
+#   a >>u c   `LSR A` c times          (bit 7 fills with zero)
+#   a >>s c   `CMP #$80 ; ROR A` c times
+#
+# The arithmetic form has no opcode at all - the 6502 has ASL / LSR / ROL / ROR and no
+# ASR - so it is built from the two it does have: `CMP #$80` puts the SIGN BIT in the
+# carry (carry is set exactly when A >= $80) and `ROR A` rotates that carry into bit 7,
+# which is the sign fill. Every step is a fixed-cost immediate / accumulator instruction,
+# so a sequence's cycle count depends only on the (public) COUNT, never on the value.
+#
+# The count is always an immediate below the 8-bit operation width, because
+# `be.codegen.legalize` owns every shift on a machine that declares no variable shifter:
+# it normalizes an out-of-range count to the operation width and expands a RUNTIME count
+# into a masked barrel of constant-count steps. A piece that still carries a runtime
+# count, a wider-than-one-byte width, or an out-of-range count is a legalization bug and
+# is refused with a diagnostic naming it rather than mis-encoded.
+fun encode_shift(st: *enc.EncodeState, mi: *mir.MirInstr, op: mir.MirOpcode) R.Result[bool, str] {
+    if (mi.operand_count != 3) { ret R.err[bool, str]("mos6502: malformed shift"); }
+    val dst: *mir.MirOperand = ?mi.operands[0];
+    val cnt: *mir.MirOperand = ?mi.operands[2];
+    if (dst.kind != mir.MIR_OP_PREG) { ret R.err[bool, str](unencodable_message(op)); }
+    if (mi.width > 1) {
+        ret R.err[bool, str]("mos6502: a shift wider than one byte must be split by width legalization before encoding");
+    }
+    if (cnt.kind != mir.MIR_OP_IMM) {
+        ret R.err[bool, str]("mos6502: the 6502 has no variable-count shift; a runtime count must be expanded by width legalization before encoding");
+    }
+    if (cnt.imm < 0 || cnt.imm > 7) {
+        ret R.err[bool, str]("mos6502: a byte shift count must be normalized to the 8-bit operation width by width legalization before encoding");
+    }
+
+    val res_ld: R.Result[bool, str] = emit_load_a(st, ?mi.operands[1]);
+    if (R.is_err[bool, str](res_ld)) { ret res_ld; }
+
+    var i: i64 = 0;
+    for (i < cnt.imm) {
+        if (op == mir.MIR_SHL)        { enc.emit_byte(?st.buf, OP_ASL_A); }
+        or (op == mir.MIR_SHR_U)      { enc.emit_byte(?st.buf, OP_LSR_A); }
+        or {
+            # the sign bit into the carry, then the carry into bit 7: an arithmetic
+            # right shift out of the two rotate / shift forms the 6502 does have.
+            emit_imm1(st, OP_CMP_IMM, 0x80);
+            enc.emit_byte(?st.buf, OP_ROR_A);
+        }
+        i = i + 1;
+    }
+
     emit_zp1(st, OP_STA_ZP, mos6502.zp_addr(dst.preg::i32));
     ret R.ok[bool, str](true);
 }
@@ -579,6 +646,9 @@ test "mach.lang.target.isa.mos6502.encode:byte_pins" {
     if (OP_BEQ != 0xF0 || OP_BNE != 0xD0 || OP_BCC != 0x90 || OP_BCS != 0xB0) { ret 1; }
     # JMP absolute is 4C.
     if (OP_JMP_ABS != 0x4C) { ret 1; }
+    # the shift / rotate accumulator forms: ASL A 0A, LSR A 4A, ROL A 2A, ROR A 6A.
+    if (OP_ASL_A != 0x0A || OP_LSR_A != 0x4A) { ret 1; }
+    if (OP_ROL_A != 0x2A || OP_ROR_A != 0x6A) { ret 1; }
 
     enc.buf_dnit(?st.buf);
     ret 0;
@@ -732,6 +802,9 @@ fun t_exec(mem: *u8, size: usize, core: *Core) bool {
         or (op == 0xC9)      { core.c = 0; if (core.a >= imm) { core.c = 1; }                    core.cycles = core.cycles + 2; core.pc = core.pc + 2; }
         or (op == 0xC5)      { core.c = 0; if (core.a >= mem[zpa]::u32) { core.c = 1; }          core.cycles = core.cycles + 3; core.pc = core.pc + 2; }
         or (op == 0x2A)      { val nc: u32 = (core.a >> 7) & 1; core.a = ((core.a << 1) | core.c) & 0xFF; core.c = nc; core.cycles = core.cycles + 2; core.pc = core.pc + 1; }
+        or (op == 0x6A)      { val nc: u32 = core.a & 1; core.a = ((core.a >> 1) | (core.c << 7)) & 0xFF; core.c = nc; core.cycles = core.cycles + 2; core.pc = core.pc + 1; }
+        or (op == 0x0A)      { core.c = (core.a >> 7) & 1; core.a = (core.a << 1) & 0xFF;                 core.cycles = core.cycles + 2; core.pc = core.pc + 1; }
+        or (op == 0x4A)      { core.c = core.a & 1;        core.a = (core.a >> 1) & 0xFF;                 core.cycles = core.cycles + 2; core.pc = core.pc + 1; }
         or (op == 0x18)      { core.c = 0;                         core.cycles = core.cycles + 2; core.pc = core.pc + 1; }
         or (op == 0x38)      { core.c = 1;                         core.cycles = core.cycles + 2; core.pc = core.pc + 1; }
         or (op == 0xEA)      {                                     core.cycles = core.cycles + 2; core.pc = core.pc + 1; }
@@ -863,6 +936,126 @@ test "mach.lang.target.isa.mos6502.encode:compare_executes_constant_time" {
     enc.buf_dnit(?lt.buf);
 
     A.deallocate[u8](?alloc, mem, T_MEM_SIZE);
+    ret 0;
+}
+
+# encode one `dst = a shift #count` over zero-page value register 8 -> 10 (test helper)
+fun t_encode_shift(st: *enc.EncodeState, op: mir.MirOpcode, count: i64) R.Result[bool, str] {
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(10);
+    ops[1] = mir.op_preg(8);
+    ops[2] = mir.op_imm(count);
+    var mi: mir.MirInstr;
+    mi.opcode        = op;
+    mi.operands      = ?ops[0];
+    mi.operand_count = 3;
+    mi.width         = 1;
+    mi.src_width     = 1;
+    ret encode_shift(st, ?mi, op);
+}
+
+# the reference answer for a byte shift, computed independently of the emitted bytes
+# (test helper)
+fun t_shift_ref(op: mir.MirOpcode, v: u32, count: u32) u32 {
+    if (op == mir.MIR_SHL)   { ret (v << count) & 0xFF; }
+    if (op == mir.MIR_SHR_U) { ret (v & 0xFF) >> count; }
+    # arithmetic: sign-extend the byte through the shift, then re-mask.
+    var s: u32 = v & 0xFF;
+    if (s >= 0x80) { s = s | 0xFFFFFF00; }
+    ret (s::i32 >> count::i32)::u32 & 0xFF;
+}
+
+# the encoded byte shift answers correctly for every value at every in-range count, and
+# its cycle count depends on the COUNT alone - never on the value (#2217)
+#
+# The 6502 shifts one bit per instruction, so `encode_shift` emits a RUN of accumulator
+# steps whose length is the count. That makes two claims worth executing rather than
+# reading: the run computes the right answer (the arithmetic form especially, which has
+# no ASR opcode and is built out of `CMP #$80 ; ROR A`), and the run is fixed-cycle for a
+# given count, which is what makes the barrel `be.codegen.legalize` builds on top of it
+# constant-time. Both are checked over all 256 values x all 8 counts x all three shifts.
+test "mach.lang.target.isa.mos6502.encode:byte_shift_executes_constant_time" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val mr: R.Result[*u8, str] = A.zallocate[u8](?alloc, T_MEM_SIZE);
+    if (R.is_err[*u8, str](mr)) { ret 1; }
+    val mem: *u8 = R.unwrap_ok[*u8, str](mr);
+
+    var ops: [3]mir.MirOpcode;
+    ops[0] = mir.MIR_SHL; ops[1] = mir.MIR_SHR_U; ops[2] = mir.MIR_SHR_S;
+    var oi: u32 = 0;
+    for (oi < 3) {
+        var c: u32 = 0;
+        for (c < 8) {
+            var st: enc.EncodeState;
+            st.buf = enc.buf_init(?alloc);
+            if (R.is_err[bool, str](t_encode_shift(?st, ops[oi], c::i64))) { ret 1; }
+            # a shift is not a control transfer, so it must carry no branch.
+            if (t_has_branch(?st)) { ret 1; }
+
+            var fixed: u32 = 0;
+            var v: u32 = 0;
+            for (v < 256) {
+                var k: usize = 0;
+                for (k < 256) { mem[k] = 0; k = k + 1; }
+                mem[0x18] = (v & 0xFF)::u8;
+
+                var cy: u32 = 0;
+                if (!t_run_cmp(st.buf.data, st.buf.len, mem, T_MEM_SIZE, ?cy)) { ret 1; }
+                if (mem[0x1A]::u32 != t_shift_ref(ops[oi], v, c)) { ret 1; }
+                if (v == 0)      { fixed = cy; }
+                or (cy != fixed) { ret 1; }
+                v = v + 1;
+            }
+            enc.buf_dnit(?st.buf);
+            c = c + 1;
+        }
+        oi = oi + 1;
+    }
+
+    A.deallocate[u8](?alloc, mem, T_MEM_SIZE);
+    ret 0;
+}
+
+# a shift the legalizer was supposed to reduce is REFUSED, never mis-encoded
+#
+# The 6502 has no variable-count shift and no shift wider than a byte, so each of those
+# reaching the encoder means `be.codegen.legalize` did not run or did not cover the shape.
+# Encoding one anyway would silently compute something else (a runtime count operand read
+# as an immediate, or a wide shift applied to one lane), so each is named and refused.
+test "mach.lang.target.isa.mos6502.encode:refuses_an_unreduced_shift" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var st: enc.EncodeState;
+    st.buf = enc.buf_init(?alloc);
+
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(10);
+    ops[1] = mir.op_preg(8);
+    var mi: mir.MirInstr;
+    mi.opcode        = mir.MIR_SHL;
+    mi.operands      = ?ops[0];
+    mi.operand_count = 3;
+    mi.width         = 1;
+    mi.src_width     = 1;
+
+    # a runtime count: the operand shape the 6502 has no instruction for.
+    ops[2] = mir.op_preg(9);
+    if (!R.is_err[bool, str](encode_shift(?st, ?mi, mir.MIR_SHL))) { ret 1; }
+    # a count past the byte width: legalization normalizes it, so one here is a bug.
+    ops[2] = mir.op_imm(8);
+    if (!R.is_err[bool, str](encode_shift(?st, ?mi, mir.MIR_SHL))) { ret 1; }
+    ops[2] = mir.op_imm(-1);
+    if (!R.is_err[bool, str](encode_shift(?st, ?mi, mir.MIR_SHL))) { ret 1; }
+    # a still-wide shift is the legalizer's job, not this encoder's.
+    ops[2] = mir.op_imm(1);
+    mi.width = 2;
+    if (!R.is_err[bool, str](encode_shift(?st, ?mi, mir.MIR_SHL))) { ret 1; }
+
+    # the reduced shape encodes.
+    mi.width = 1;
+    if (R.is_err[bool, str](encode_shift(?st, ?mi, mir.MIR_SHL))) { ret 1; }
+    enc.buf_dnit(?st.buf);
     ret 0;
 }
 
