@@ -111,26 +111,32 @@ to whichever *declared* target matches the host.
 
 | Axis  | Values |
 |-------|--------|
-| `isa` | `x86_64`, `aarch64`, `riscv64` |
+| `isa` | `x86_64`, `aarch64`, `riscv64`, `spirv`, `mos6502` |
 | `os`  | `linux`, `windows`, `darwin`, `freestanding` |
-| `abi` | `sysv64`, `win64`, `aapcs64`, `lp64` |
+| `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `spirv`, `mos6502` |
 
 `x86_64`/`linux`/`sysv64` is the primary host and target. `aarch64`-linux builds
 and runs natively in CI on every PR; `riscv64`-linux runs under qemu and
 self-hosts (#1852). `windows` is a supported cross-compilation target (PE/COFF,
 Win64 ABI). `darwin`'s ABI and object-format support exist but the toolchain is not
 yet validated end-to-end. `freestanding` targets a raw flat image with no OS
-runtime.
+runtime. `spirv` is not a machine at all — it emits a finished GPU module rather
+than machine code (see [Finished-module targets](#finished-module-targets)).
+
+`mach info targets` prints the tuples this binary can actually build; it is
+derived from the same declarations composition reads, so it never advertises a
+tuple that would fail to resolve.
 
 A value outside its axis's set is a strict-parse error, so a typo is caught rather
 than silently never matching.
 
 ### Object-format override
 
-`of` overrides the object format an OS implies. Each os has a default format —
+`of` overrides the object format a target implies. Each os has a default format —
 `linux` → `elf`, `windows` → `coff`, `darwin` → `macho`, `freestanding` → `raw` —
 and `of` names a different one from the same closed set: `elf`, `coff`, `macho`,
-`raw`. It is the only optional key on a target; omit it to take the os default.
+`raw`, `spv`. It is the only optional key on a target; omit it to take the
+default.
 
 ```toml
 [target.metal]
@@ -139,6 +145,40 @@ os  = "freestanding"   # os default object format is "raw"
 abi = "sysv64"
 of  = "elf"            # override: emit an ELF object instead
 ```
+
+The default is a function of the whole tuple, not the os alone. An os default
+carries relocatable machine text, which a whole-module emitter does not produce,
+so a `spirv` target resolves to `spv` — the format that carries a finished
+module — regardless of the os it names.
+
+An `of` naming a format whose emission shape does not match the instruction set's
+is refused at composition (`instruction set 'spirv' emits finished modules, but
+object format 'raw' carries linkable objects`), so the override cannot compose a
+tuple that would emit nothing.
+
+### Finished-module targets
+
+A `spirv` target's object output is a complete, self-contained module rather than
+a link input. The build therefore delivers the **module tree** — one
+`<out>/obj/<fqn-as-path>.spv` per module — and runs no link phase, so a default
+build and `--emit obj` produce the same files:
+
+```toml
+[target.gpu]
+isa = "spirv"
+os  = "freestanding"
+abi = "spirv"
+# no `of`: the finished-module format resolves on its own
+```
+
+```
+mach build . --target gpu     # writes out/gpu/<profile>/obj/<module>.spv
+```
+
+The artifact's `out` template and `-o` name a linked binary, which such a target
+has none of; the module tree is delivered instead. A `static` or `shared`
+artifact kind, and `mach test`, are refused by name — there is no archive, shared
+object, or executable form for a module.
 
 ## `[profile.<name>]`
 
