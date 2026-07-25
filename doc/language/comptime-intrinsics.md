@@ -44,6 +44,11 @@ A bare type name (e.g. `i64`, `str`, `Point`) is the other valid operand.
 The comparison selects one branch at compile time per monomorphization
 instance — useful for per-element type dispatch inside `$each` bodies.
 
+The operand is read at the **instance's** concrete type, in a plain generic as
+much as in a pack-tailed one, and whether it is a parameter, a local, a field, or
+a type derived from a generic parameter (`*T`). `$type_of(x) == T` against a
+generic parameter compares the instance's argument on both sides, so it holds.
+
 The provably-dead arms are **pruned** before type-checking, so each arm uses
 `arg` at its own concrete type with no per-arm cast: the `str` arm above is
 never checked against a `u64` element. Only the selected arm is type-checked
