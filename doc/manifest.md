@@ -118,10 +118,11 @@ to whichever *declared* target matches the host.
 `x86_64`/`linux`/`sysv64` is the primary host and target. `aarch64`-linux builds
 and runs natively in CI on every PR; `riscv64`-linux runs under qemu and
 self-hosts (#1852). `windows` is a supported cross-compilation target (PE/COFF,
-Win64 ABI). `darwin`'s ABI and object-format support exist but the toolchain is not
-yet validated end-to-end. `freestanding` targets a raw flat image with no OS
-runtime. `spirv` is not a machine at all — it emits a finished GPU module rather
-than machine code (see [Finished-module targets](#finished-module-targets)).
+Win64 ABI). `darwin` is validated end-to-end on both architectures: each
+self-hosts to a three-generation fixpoint on a native macOS runner and ships a
+release archive. `freestanding` targets a raw flat image with no OS runtime.
+`spirv` is not a machine at all — it emits a finished GPU module rather than
+machine code (see [Finished-module targets](#finished-module-targets)).
 
 `mach info targets` prints the tuples this binary can actually build; it is
 derived from the same declarations composition reads, so it never advertises a
