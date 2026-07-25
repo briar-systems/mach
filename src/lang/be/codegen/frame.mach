@@ -1,4 +1,5 @@
-# assign each MIR frame slot a frame-pointer offset and size the frame
+# assign each MIR frame slot a frame-pointer offset, size the frame, and decide
+# whether the function needs a frame at all
 #
 # Assigns each MIR frame slot a negative offset from the frame pointer, sizes
 # the frame to the ABI stack alignment, and rounds the outgoing-argument region
@@ -7,9 +8,15 @@
 # materialized into `mir.MirFrame` during instruction selection; this pass only
 # computes their final offsets and the total frame size.
 #
-# Completely target-agnostic except for the stack alignment read through the ABI
-# vtable; the resulting offsets are consumed by the encoder when it forms
-# `[rbp + disp]` memory operands.
+# It then records, in `MirFrame.omit`, whether the function needs a compiler-
+# generated prologue and epilogue at all (#1940). This is the single decision
+# point for frame suppression across every target: each encoder reads the flag
+# instead of re-deriving the answer from its own copy of the rule.
+#
+# Target-agnostic but for three reads through the target - the ABI stack
+# alignment, and the frame- and stack-pointer register ids the frame-reference
+# scan recognizes. The resulting offsets are consumed by the encoder when it
+# forms `[rbp + disp]` memory operands.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -41,11 +48,104 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
 
     var fi: u32 = 0;
     for (fi < m.function_len) {
-        layout_function(?m.functions[fi], align);
+        val func: *mir.MirFunction = ?m.functions[fi];
+        layout_function(func, align);
+        # the frame facts are final only now, so the omission decision follows the
+        # layout rather than racing it.
+        func.frame.omit = omits_frame(tgt, func);
         fi = fi + 1;
     }
 
     ret R.ok[bool, str](true);
+}
+
+# report whether a function needs no compiler-generated prologue or epilogue
+#
+# Two disjoint reasons suppress the frame, and both require the same starting
+# point: the compiler allocated no frame of its own - no slots (`frame.size`), no
+# callee-saved GP or vector registers, and no outgoing-argument region.
+#
+#   1. An inline-asm body owns the stack. The entry point `_start` reads the
+#      kernel-supplied stack pointer directly (`mov rdi, [rsp]` = argc), so a
+#      `push rbp` ahead of it would shift RSP and corrupt the argc/argv it
+#      extracts. The programmer's asm is the prologue; the compiler adds none.
+#      A body with asm in it is opaque, so this reason stands on its own - it
+#      does not additionally require the function to be a leaf.
+#
+#   2. The frame is provably unused (#1940). A function that calls nothing and
+#      addresses nothing through the frame or stack pointer cannot observe the
+#      difference between having a frame record and not having one, so the
+#      `push rbp; mov rbp, rsp` / `mov rsp, rbp; pop rbp` pair is pure cost. The
+#      leaf requirement is load-bearing rather than conservative: entry RSP is
+#      8 mod 16, and the frame-pointer push is what restores the 16-byte call
+#      boundary the ABI demands, so a function that both omits the push and makes
+#      a call would hand its callee a misaligned stack. Making no call, it never
+#      reaches a call boundary and the alignment is unobservable.
+#
+# The frame-reference scan is what excludes an incoming stack parameter: those
+# are lowered to `[fp + incoming_arg_base + off]` (`mir.abi.emit_param_slot`) and
+# stay addressable only while the frame pointer is live.
+#
+# Nothing here can read the debug flag, and `-g` adds no MIR instruction and no
+# frame slot (its bindings ride on existing instructions as metadata), so the
+# decision is identical with and without `-g` and `.text` stays byte-identical -
+# the #1944 additivity invariant.
+# ---
+# tgt:  resolved target; supplies the frame- and stack-pointer register ids
+# func: the laid-out function to judge
+# ret:  true when the encoder must emit neither prologue nor epilogue
+pub fun omits_frame(tgt: *target.Target, func: *mir.MirFunction) bool {
+    if (func.frame.size != 0)          { ret false; }
+    if (func.callee_mask != 0)         { ret false; }
+    if (func.callee_mask_fp != 0)      { ret false; }
+    if (func.frame.outgoing_size != 0) { ret false; }
+
+    val fp: u32 = tgt.model.frame_ptr_reg::u32;
+    val sp: u32 = tgt.model.stack_ptr_reg::u32;
+
+    var calls: bool = false;
+    var frame_ref: bool = false;
+
+    var bi: u32 = 0;
+    for (bi < func.block_count) {
+        val blk: *mir.MirBlock = ?func.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            # an inline-asm block survives selection under a per-target opcode
+            # (x86-64 retags it to ASM_BLOCK), but its payload pointer is set on
+            # every target - so the payload, not the opcode, identifies it.
+            if (mi.asm_block != nil) { ret true; }
+            if (mi.opcode == mir.MIR_CALL) { calls = true; }
+            var oi: u32 = 0;
+            for (oi < mi.operand_count) {
+                if (operand_is_frame_relative(?mi.operands[oi], fp, sp)) { frame_ref = true; }
+                oi = oi + 1;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    ret !calls && !frame_ref;
+}
+
+# report whether a MIR operand addresses memory through the frame or stack pointer
+#
+# A frame-slot memory operand carries a slot key in `vreg` and is resolved against
+# the layout, so it is not the shape this looks for; the physical-register base
+# form (`mir.op_mem_preg`) is. Both register fields count - a base and, when the
+# index is a physical register, the index - since either keeps the pointer live.
+# ---
+# o:   the operand to test
+# fp:  the target's frame-pointer register id
+# sp:  the target's stack-pointer register id
+# ret: true when the operand reads or writes relative to fp or sp
+fun operand_is_frame_relative(o: *mir.MirOperand, fp: u32, sp: u32) bool {
+    if (o.kind != mir.MIR_OP_MEM) { ret false; }
+    if (o.vreg == mir.MIR_VREG_NIL && (o.preg == fp || o.preg == sp)) { ret true; }
+    if (o.index_is_preg && (o.index == fp || o.index == sp))          { ret true; }
+    ret false;
 }
 
 # look up the frame-pointer offset assigned to a MIR value's slot
