@@ -462,7 +462,6 @@ fun vectorize_one(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: 
     fshape.is_float = shape.is_float;
 
     val fast_iv_phi: id.InstructionId = flp.iv.phi;
-    val fast_iv_upd: id.InstructionId = flp.iv.update;
     val fast_cmp: id.InstructionId = flp.counted.cmp;
     val iv_phi_val: value.Value = value.instr(fast_iv_phi, iv_ty);
 
@@ -493,16 +492,10 @@ fun vectorize_one(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: 
     A.deallocate[bool](m.alloc, vset, fn.instr_len::usize);
     if (R.is_err[bool, str](rsp)) { A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize); A.deallocate[id.BlockId](m.alloc, rem_blocks, body_len::usize); dep.dep_dnit(?fd); loops.dnit(?fla); ret rsp; }
 
-    # step the induction variable by the lane count (the +1 update becomes +lanes)
-    val uopt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, fast_iv_upd);
-    if (O.is_some[*instruction.Instruction](uopt)) {
-        val upd: *instruction.Instruction = O.unwrap[*instruction.Instruction](uopt);
-        var si: u32 = 0;
-        for (si < upd.operand_count) {
-            if (upd.operands[si].kind == value.VAL_CONST_INT) { upd.operands[si] = value.const_int(shape.lanes::u64, iv_ty); }
-            si = si + 1;
-        }
-    }
+    # step every recurrence the loop carries by the lane count (the +1 update becomes
+    # +lanes); the remainder was cloned above and keeps the scalar steps
+    val rss: R.Result[bool, str] = scale_recurrence_steps(fn, flp, shape.lanes);
+    if (R.is_err[bool, str](rss)) { A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize); A.deallocate[id.BlockId](m.alloc, rem_blocks, body_len::usize); dep.dep_dnit(?fd); loops.dnit(?fla); ret rss; }
 
     # the vector header tests `iv <= limit` (a full lane group fits). the SIGNED
     # compare is safe even for an unsigned loop: when bound_ex < lanes the
@@ -517,14 +510,15 @@ fun vectorize_one(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: 
     }
 
     # the vector header's exit edge (to merge) now enters the remainder, which starts
-    # from the vector iv's final value
+    # from the vector loop's final recurrence values
     ver.redirect_terminator(fn, fast_header, merge, rem_header);
-    set_phi_incoming(fn, rem_header, vpre, fast_header, iv_phi_val);
+    val rer: bool = enter_remainder_from(fn, rem_header, vpre, fast_header);
 
     A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize);
     A.deallocate[id.BlockId](m.alloc, rem_blocks, body_len::usize);
     dep.dep_dnit(?fd);
     loops.dnit(?fla);
+    if (!rer) { ret R.err[bool, str]("vectorize: remainder header phis do not mirror the vector header's"); }
 
     val rpr: R.Result[bool, str] = ir.preds_rebuild(m, fn);
     if (R.is_err[bool, str](rpr)) { ret R.err[bool, str](R.unwrap_err[bool, str](rpr)); }
@@ -734,26 +728,88 @@ fun emit_splat(b: *builder.Builder, v: value.Value, arr_ty: ir_type.IrTypeId, ve
     ret builder.emit_load(b, slot, vec_ty);
 }
 
-# change the phi incoming of `blk` from predecessor `from` to come from `new_block`
-# with value `new_val`
-fun set_phi_incoming(fn: *ir.Function, blk: id.BlockId, from: id.BlockId, new_block: id.BlockId, new_val: value.Value) {
-    val b: *ir.Block = ?fn.blocks[blk::u32];
+# the instruction defining phi `pid`'s incoming value on the edge from `latch`, or
+# INSTR_NIL when that edge is absent or carries a value no instruction defines
+fun latch_update(fn: *ir.Function, pid: id.InstructionId, latch: id.BlockId) id.InstructionId {
+    val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, pid);
+    if (O.is_none[*instruction.Instruction](opt)) { ret id.INSTR_NIL; }
+    val phi: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
+    var o: u32 = 0;
+    for (o < phi.operand_count) {
+        if ((o % 2) == 0 && ir.block_target(phi.operands[o]) == latch && o + 1 < phi.operand_count) {
+            if (phi.operands[o + 1].kind == value.VAL_INSTR) { ret phi.operands[o + 1].data.instr; }
+            ret id.INSTR_NIL;
+        }
+        o = o + 1;
+    }
+    ret id.INSTR_NIL;
+}
+
+# multiply every recurrence's constant step by the lane count
+#
+# A vector iteration covers `lanes` elements, so every add-recurrence the loop
+# carries must advance `lanes` times its scalar step: the induction variable, and
+# each secondary induction variable the dependence analysis admitted (`t = base; ...;
+# t = t + 1`, #2312). The remainder loop is cloned before this runs and keeps the
+# scalar steps.
+#
+# The analysis proved every header phi is `{init, +, c}` for a constant `c`, so a phi
+# that does not present that shape is an invariant breach between analysis and
+# transform. It is reported rather than skipped: a skipped recurrence would advance
+# at the scalar rate through a vector loop and silently miscompile.
+fun scale_recurrence_steps(fn: *ir.Function, lp: *loops.Loop, lanes: u32) R.Result[bool, str] {
+    val hdr: *ir.Block = ?fn.blocks[lp.header::u32];
     var pi: u32 = 0;
-    for (pi < b.phi_count) {
-        val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, b.phis[pi]);
-        if (O.is_some[*instruction.Instruction](opt)) {
-            val phi: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
-            var o: u32 = 0;
-            for (o < phi.operand_count) {
-                if ((o % 2) == 0 && ir.block_target(phi.operands[o]) == from) {
-                    phi.operands[o].data.int_lit = new_block::u64;
-                    if (o + 1 < phi.operand_count) { phi.operands[o + 1] = value.retype(new_val, phi.operands[o + 1].ty); }
-                }
-                o = o + 1;
+    for (pi < hdr.phi_count) {
+        val uid: id.InstructionId = latch_update(fn, hdr.phis[pi], lp.latch);
+        if (uid == id.INSTR_NIL) { ret R.err[bool, str]("vectorize: loop recurrence has no latch update"); }
+        val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, uid);
+        if (O.is_none[*instruction.Instruction](opt)) { ret R.err[bool, str]("vectorize: loop recurrence update is missing"); }
+        val upd: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
+        var scaled: bool = false;
+        var si: u32 = 0;
+        for (si < upd.operand_count) {
+            if (upd.operands[si].kind == value.VAL_CONST_INT) {
+                upd.operands[si] = value.const_int(upd.operands[si].data.int_lit * lanes::u64, upd.operands[si].ty);
+                scaled = true;
             }
+            si = si + 1;
+        }
+        if (!scaled) { ret R.err[bool, str]("vectorize: loop recurrence has no constant step"); }
+        pi = pi + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# re-enter the remainder loop from the vector loop
+#
+# The remainder header is a clone of the vector header, so their phis stand in the
+# same order and phi p continues from vector phi p's final value: for the induction
+# variable the first index the vector loop did not cover, for a secondary induction
+# variable the cursor it left off at. Relabels the cloned `from` edge to come from
+# the vector header and gives each phi that value. False when the two phi lists do
+# not mirror each other, which the clone guarantees they do.
+fun enter_remainder_from(fn: *ir.Function, rem_header: id.BlockId, from: id.BlockId, vec_header: id.BlockId) bool {
+    val rb: *ir.Block = ?fn.blocks[rem_header::u32];
+    val vb: *ir.Block = ?fn.blocks[vec_header::u32];
+    if (rb.phi_count != vb.phi_count) { ret false; }
+    var pi: u32 = 0;
+    for (pi < rb.phi_count) {
+        val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, rb.phis[pi]);
+        if (O.is_none[*instruction.Instruction](opt)) { ret false; }
+        val phi: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
+        val src: value.Value = value.instr(vb.phis[pi], phi.ty);
+        var o: u32 = 0;
+        for (o < phi.operand_count) {
+            if ((o % 2) == 0 && ir.block_target(phi.operands[o]) == from) {
+                phi.operands[o].data.int_lit = vec_header::u64;
+                if (o + 1 < phi.operand_count) { phi.operands[o + 1] = value.retype(src, phi.operands[o + 1].ty); }
+            }
+            o = o + 1;
         }
         pi = pi + 1;
     }
+    ret true;
 }
 
 # vectorize the reductions in one function, in two phases like run(): collect the

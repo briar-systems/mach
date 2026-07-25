@@ -1,15 +1,16 @@
 # mach.lang.me.analysis.dependence: cross-iteration memory-dependence analysis
 #
 # Over a counted loop recognized by `mach.lang.me.analysis.loops`, decide whether
-# the loop is a unit-stride, offset-0 element-wise map -- `dst[i] = f(src0[i], ...)`
-# -- carrying no cross-iteration memory dependence, and collect its memory accesses.
+# the loop is a unit-stride element-wise map -- `dst[c+i] = f(src0[c'+i], ...)` --
+# carrying no cross-iteration memory dependence, and collect its memory accesses.
 #
 # The verdict is deliberately conservative (child 1's lesson): a positive
 # INDEPENDENT verdict is returned ONLY when every memory access in the loop is a
-# non-volatile load/store through `gep(base, iv)` -- a single index equal to the
-# loop's induction variable (offset 0, unit stride) over a loop-invariant base --
-# and the loop carries no register recurrence beyond the induction variable and no
-# opaque memory effect (call / asm / memzero). Anything unproven is DEPENDENT.
+# non-volatile load/store through `gep(base, idx)` over a loop-invariant base, where
+# `idx` is AFFINE in the loop's induction variable at UNIT stride (`off + iv` for a
+# loop-invariant `off`, #2312), and the loop carries no register recurrence beyond
+# the induction variable and its secondary add-recurrences, and no opaque memory
+# effect (call / asm / memzero). Anything unproven is DEPENDENT.
 #
 # A DEPENDENT verdict means "do not vectorize". An INDEPENDENT verdict means "safe
 # to vectorize IF the runtime alias check discharges base aliasing" -- distinct
@@ -36,11 +37,15 @@ use mach.lang.me.ir.value;
 use ir_type: mach.lang.me.ir.type;
 use loops: mach.lang.me.analysis.loops;
 
-# one recognized affine memory access `base[iv]` in a counted loop
+# one recognized affine memory access `base[off + iv]` in a counted loop
 # ---
 # instr:     the load or store instruction
-# gep:       the OP_GEP computing `base[iv]` that the access dereferences
+# gep:       the OP_GEP computing `base[off + iv]` that the access dereferences
 # base:      the loop-invariant base pointer (the gep's first operand)
+# off:       the loop-invariant ELEMENT offset the index is shifted by, in the
+#            induction variable's type. `base[iv]` carries the constant 0; any other
+#            offset shifts the whole accessed window, so every range the alias guard
+#            derives must add it
 # stride_ty: the gep's source pointee type -- the per-element stride, reused to
 #            compute the accessed byte range for the alias guard
 # elem_ty:   the loaded / stored value type
@@ -51,6 +56,7 @@ pub rec MemAccess {
     instr:     id.InstructionId;
     gep:       id.InstructionId;
     base:      value.Value;
+    off:       value.Value;
     stride_ty: ir_type.IrTypeId;
     elem_ty:   ir_type.IrTypeId;
     bytes:     u32;
@@ -109,10 +115,11 @@ pub fun analyze_dependence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u
     if (lp.iv.step.kind != value.VAL_CONST_INT) { ret R.ok[DepInfo, str](d); }
     if (lp.iv.step.data.int_lit != 1) { ret R.ok[DepInfo, str](d); }
 
-    # the induction variable must be the loop's ONLY register recurrence: the header
-    # carries exactly one phi (the iv) and no other loop block carries any phi. an
-    # extra phi is a reduction / scan carried across iterations (child 4's concern).
-    if (!single_iv_recurrence(fn, la, loop_ix)) { ret R.ok[DepInfo, str](d); }
+    # the loop's register recurrences must all be induction variables: the header
+    # carries the iv plus, at most, secondary add-recurrences, and no other loop block
+    # carries any phi. any other extra phi is a reduction / scan carried across
+    # iterations (child 4's concern).
+    if (!ivs_only_recurrence(fn, la, loop_ix)) { ret R.ok[DepInfo, str](d); }
 
     # upper-bound the accesses array by the loop's instruction count.
     var total: u32 = 0;
@@ -154,17 +161,30 @@ pub fun analyze_dependence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u
         bi = bi + 1;
     }
 
-    # every pair of accesses to the SAME base must have an identical footprint. with
-    # stride == width and offset 0 already enforced per access, equal bytes means the
-    # same per-iteration address window; a same-base pair with differing widths (an
-    # i8 load and an i64 store on `a`) is a genuine cross-iteration RAW and the guard
-    # cannot fix it (the ranges are not disjoint, they coincide).
+    # every pair of accesses to the SAME base must have an identical footprint, and --
+    # once either of them writes -- an identical element offset.
+    #
+    # equal bytes with stride == width already enforced per access means the same
+    # per-iteration address window; a same-base pair with differing widths (an i8 load
+    # and an i64 store on `a`) is a genuine cross-iteration RAW the guard cannot fix
+    # (the ranges are not disjoint, they coincide).
+    #
+    # equal offsets make that window the SAME element in every iteration -- a
+    # distance-0 self dependence, which vectorizes. Any other offset relation is a
+    # nonzero cross-iteration distance, and admitting affine indices (#2312) is what
+    # made that reachable: `a[i] = a[i-1]` is same-base at offsets 0 and -1. The
+    # runtime alias guard cannot discharge it, because the two ranges are not two
+    # objects that might overlap -- they are the same storage at a shift. Two READS at
+    # different offsets carry no dependence at all and stay admitted.
     var i: u32 = 0;
     for (i < d.access_count) {
         var j: u32 = i + 1;
         for (j < d.access_count) {
-            if (equal(d.accesses[i].base, d.accesses[j].base) && d.accesses[i].bytes != d.accesses[j].bytes) {
-                dep_dnit(?d); ret dependent(alloc);
+            if (equal(d.accesses[i].base, d.accesses[j].base)) {
+                if (d.accesses[i].bytes != d.accesses[j].bytes) { dep_dnit(?d); ret dependent(alloc); }
+                if ((d.accesses[i].is_store || d.accesses[j].is_store) && !equal(d.accesses[i].off, d.accesses[j].off)) {
+                    dep_dnit(?d); ret dependent(alloc);
+                }
             }
             j = j + 1;
         }
@@ -234,23 +254,41 @@ pub fun dep_dnit(d: *DepInfo) {
     d.access_cap   = 0;
 }
 
-# true when the loop's only phi recurrence is the induction variable: the header
-# has exactly one phi (the iv) and no other loop block has any phi
-fun single_iv_recurrence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32) bool {
+# true when every phi recurrence the loop carries is an induction variable: the
+# header holds the induction variable plus, at most, secondary add-recurrences
+# (`t = base; ...; t = t + c`), and no other loop block holds any phi.
+#
+# A secondary induction variable is not a cross-iteration data dependence -- it is a
+# closed form of the trip count, which the transform re-derives by scaling its step
+# with the lane count. Any OTHER header phi is a value carried between iterations (a
+# reduction, a scan) and still forces the conservative verdict.
+pub fun ivs_only_recurrence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32) bool {
     val lp: *loops.Loop = ?la.loops[loop_ix];
     var bi: u32 = 0;
     for (bi < lp.body_len) {
         val bid: id.BlockId = lp.body[bi];
         val blk: *ir.Block = ?fn.blocks[bid::u32];
         if (bid == lp.header) {
-            if (blk.phi_count != 1) { ret false; }
-            if (blk.phis[0] != lp.iv.phi) { ret false; }
+            var pi: u32 = 0;
+            for (pi < blk.phi_count) {
+                var ai: AffineIndex;
+                if (blk.phis[pi] != lp.iv.phi && !secondary_iv(fn, la, loop_ix, blk.phis[pi], ?ai)) { ret false; }
+                pi = pi + 1;
+            }
+            if (!header_has_phi(blk, lp.iv.phi)) { ret false; }
         } or {
             if (blk.phi_count != 0) { ret false; }
         }
         bi = bi + 1;
     }
     ret true;
+}
+
+# true when block `blk` carries phi `pid`
+fun header_has_phi(blk: *ir.Block, pid: id.InstructionId) bool {
+    var i: u32 = 0;
+    for (i < blk.phi_count) { if (blk.phis[i] == pid) { ret true; } i = i + 1; }
+    ret false;
 }
 
 # the address shape of an element-wise access: `base + iv * elem`, reached through
@@ -290,10 +328,178 @@ fun gep_elem_shape(gep: *instruction.Instruction, types: *ir_type.IrTypeTable, o
     ret true;
 }
 
-# classify a load/store as an element-wise `base[iv]` access, filling `out` on
+# the affine form of a loop index: `off + stride * iv`
+#
+# `stride` is a two's-complement element count, so a backwards index carries the
+# wrapped negative and the only stride a contiguous vector access admits is 1.
+# ---
+# off:    the loop-invariant element offset -- a constant, or a value defined outside
+#         the loop (which therefore dominates the preheader, and so any guard block
+#         spliced in front of it)
+# stride: elements advanced per iteration of the loop's induction variable
+rec AffineIndex {
+    off:    value.Value;
+    stride: u64;
+}
+
+# the recursion bound on the affine walk: an index is a shallow expression over the
+# induction variable, and bounding the descent keeps a pathological operand DAG from
+# costing exponential time. Exceeding it declines the access, never mis-reads it.
+val AFFINE_DEPTH: u32 = 8;
+
+# true when `v` is the integer constant zero, the additive identity the offset
+# algebra folds through
+fun is_zero_const(v: value.Value) bool {
+    ret v.kind == value.VAL_CONST_INT && v.data.int_lit == 0;
+}
+
+# the sum of two affine forms. Strides add; the offsets must combine WITHOUT
+# synthesizing arithmetic (nothing here may emit into the function), so one must be
+# zero or both must be constants -- an `inv1 + inv2 + iv` index declines rather than
+# growing an add the guard would have to materialize.
+fun affine_add(x: *AffineIndex, y: *AffineIndex, out: *AffineIndex) bool {
+    out.stride = x.stride + y.stride;
+    if (is_zero_const(x.off)) { out.off = y.off; ret true; }
+    if (is_zero_const(y.off)) { out.off = x.off; ret true; }
+    if (x.off.kind == value.VAL_CONST_INT && y.off.kind == value.VAL_CONST_INT) {
+        out.off = value.const_int(x.off.data.int_lit + y.off.data.int_lit, x.off.ty);
+        ret true;
+    }
+    ret false;
+}
+
+# the additive inverse of an affine form, for the right operand of a subtract
+fun affine_negate(x: *AffineIndex, out: *AffineIndex) bool {
+    out.stride = 0 - x.stride;
+    if (is_zero_const(x.off)) { out.off = x.off; ret true; }
+    if (x.off.kind == value.VAL_CONST_INT) { out.off = value.const_int(0 - x.off.data.int_lit, x.off.ty); ret true; }
+    ret false;
+}
+
+# an affine form scaled by a compile-time constant
+fun affine_scale(x: *AffineIndex, k: u64, out: *AffineIndex) bool {
+    out.stride = x.stride * k;
+    if (is_zero_const(x.off)) { out.off = x.off; ret true; }
+    if (x.off.kind == value.VAL_CONST_INT) { out.off = value.const_int(x.off.data.int_lit * k, x.off.ty); ret true; }
+    ret false;
+}
+
+# the affine form of a header phi that is itself an add-recurrence `{init, +, c}`
+# over a loop-invariant `init` and a constant `c` -- a SECONDARY induction variable,
+# the shape a loop with its own cursor produces (`t = base; ...; t = t + 1`).
+#
+# At the loop's k-th iteration such a phi holds `init + k*c` while the induction
+# variable holds `iv_init + k`, so the phi is `(init - c*iv_init) + c*iv`. That
+# offset must fold without emitting anything, which it does when the induction
+# variable starts at zero (the canonical form the loop rotation produces) or when
+# both `init` and `iv_init` are constants.
+fun secondary_iv(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, pid: id.InstructionId, out: *AffineIndex) bool {
+    val lp: *loops.Loop = ?la.loops[loop_ix];
+    if (pid::u32 >= la.instr_count || la.instr_block[pid::u32] != lp.header) { ret false; }
+    val popt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, pid);
+    if (O.is_none[*instruction.Instruction](popt)) { ret false; }
+    val phi: *instruction.Instruction = O.unwrap[*instruction.Instruction](popt);
+    if (phi.operand_count != 4) { ret false; }
+
+    var init: value.Value;
+    var upd:  value.Value;
+    var got_init: bool = false;
+    var got_upd:  bool = false;
+    var j: u32 = 0;
+    for (j < 2) {
+        val btgt: id.BlockId = ir.block_target(phi.operands[2 * j]);
+        if (btgt == lp.preheader) { init = phi.operands[2 * j + 1]; got_init = true; }
+        if (btgt == lp.latch)     { upd  = phi.operands[2 * j + 1]; got_upd  = true; }
+        j = j + 1;
+    }
+    if (!got_init || !got_upd) { ret false; }
+    if (!loops.is_invariant(la, loop_ix, init)) { ret false; }
+    if (upd.kind != value.VAL_INSTR) { ret false; }
+
+    # the latch value must be `phi + c` for a constant c
+    val uopt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, upd.data.instr);
+    if (O.is_none[*instruction.Instruction](uopt)) { ret false; }
+    val u: *instruction.Instruction = O.unwrap[*instruction.Instruction](uopt);
+    if (u.kind != instruction.OP_ADD || u.operand_count != 2) { ret false; }
+    var step: value.Value;
+    if (u.operands[0].kind == value.VAL_INSTR && u.operands[0].data.instr == pid) { step = u.operands[1]; }
+    or {
+        if (u.operands[1].kind == value.VAL_INSTR && u.operands[1].data.instr == pid) { step = u.operands[0]; }
+        or { ret false; }
+    }
+    if (step.kind != value.VAL_CONST_INT) { ret false; }
+
+    out.stride = step.data.int_lit;
+    val iv_init: value.Value = lp.iv.init;
+    if (is_zero_const(iv_init)) { out.off = init; ret true; }
+    if (init.kind == value.VAL_CONST_INT && iv_init.kind == value.VAL_CONST_INT) {
+        out.off = value.const_int(init.data.int_lit - out.stride * iv_init.data.int_lit, init.ty);
+        ret true;
+    }
+    ret false;
+}
+
+# decompose index `v` into `off + stride * iv` over loop `loop_ix`, or decline
+#
+# The single rule the access classifier keys on, replacing the syntactic "the index
+# IS the induction-variable phi" test that declined every offset index (#2312). Its
+# leaves are the induction variable, anything the loop leaves unchanged, and a
+# secondary add-recurrence; its interior nodes are the affine operators (add,
+# subtract, and multiply by a constant). Nothing here mutates `fn` or emits.
+# ---
+# fn:      the function
+# la:      the loop analysis for `fn`
+# loop_ix: index into la.loops
+# v:       the index value to decompose
+# depth:   remaining recursion budget (see AFFINE_DEPTH)
+# out:     receives the affine form on success
+# ret:     true when `v` is affine in the loop's induction variable
+fun affine_index(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, v: value.Value, depth: u32, out: *AffineIndex) bool {
+    val lp: *loops.Loop = ?la.loops[loop_ix];
+
+    # the induction variable itself is `0 + 1*iv`
+    if (v.kind == value.VAL_INSTR && v.data.instr == lp.iv.phi) {
+        out.off    = value.const_int(0, v.ty);
+        out.stride = 1;
+        ret true;
+    }
+    # anything the loop does not change is a pure offset, whatever computed it
+    if (loops.is_invariant(la, loop_ix, v)) {
+        out.off    = v;
+        out.stride = 0;
+        ret true;
+    }
+    if (depth == 0 || v.kind != value.VAL_INSTR) { ret false; }
+    val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, v.data.instr);
+    if (O.is_none[*instruction.Instruction](opt)) { ret false; }
+    val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
+
+    if (inst.kind == instruction.OP_PHI) { ret secondary_iv(fn, la, loop_ix, v.data.instr, out); }
+    if (inst.operand_count != 2) { ret false; }
+
+    var x: AffineIndex;
+    var y: AffineIndex;
+    if (!affine_index(fn, la, loop_ix, inst.operands[0], depth - 1, ?x)) { ret false; }
+    if (!affine_index(fn, la, loop_ix, inst.operands[1], depth - 1, ?y)) { ret false; }
+
+    if (inst.kind == instruction.OP_ADD) { ret affine_add(?x, ?y, out); }
+    if (inst.kind == instruction.OP_SUB) {
+        var ny: AffineIndex;
+        if (!affine_negate(?y, ?ny)) { ret false; }
+        ret affine_add(?x, ?ny, out);
+    }
+    if (inst.kind == instruction.OP_MUL) {
+        if (y.stride == 0 && y.off.kind == value.VAL_CONST_INT) { ret affine_scale(?x, y.off.data.int_lit, out); }
+        if (x.stride == 0 && x.off.kind == value.VAL_CONST_INT) { ret affine_scale(?y, x.off.data.int_lit, out); }
+        ret false;
+    }
+    ret false;
+}
+
+# classify a load/store as an element-wise `base[off + iv]` access, filling `out` on
 # success. requires: non-volatile; the pointer is a gep of one of the two element
-# shapes whose index is exactly the induction-variable phi (offset 0, unit stride)
-# and whose base is loop-invariant.
+# shapes whose index is affine in the induction variable at unit stride, and whose
+# base is loop-invariant.
 fun classify_access(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, iid: id.InstructionId, inst: *instruction.Instruction, types: *ir_type.IrTypeTable, out: *MemAccess) bool {
     if ((inst.flags & instruction.INSTR_FLAG_VOLATILE) != 0) { ret false; }
     val is_store: bool = inst.kind == instruction.OP_STORE;
@@ -318,8 +524,16 @@ fun classify_access(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, iid
     var stride_ty: ir_type.IrTypeId;
     if (!gep_elem_shape(gep, types, ?base, ?idx, ?stride_ty)) { ret false; }
     val lp: *loops.Loop = ?la.loops[loop_ix];
-    # index must be exactly the induction variable (offset 0)
-    if (idx.kind != value.VAL_INSTR || idx.data.instr != lp.iv.phi) { ret false; }
+    # the index must be affine in the induction variable at UNIT stride: only a
+    # stride of exactly one element makes consecutive iterations land on adjacent
+    # storage, which is what a vector access over the lane group reads and writes
+    var ax: AffineIndex;
+    if (!affine_index(fn, la, loop_ix, idx, AFFINE_DEPTH, ?ax)) { ret false; }
+    if (ax.stride != 1) { ret false; }
+    # the offset is added to the induction variable's own range to derive the alias
+    # guard's endpoints, so it must carry that arithmetic's type. Unit stride makes
+    # the index the induction variable plus an offset, so this holds by construction
+    if (ax.off.ty != lp.iv.init.ty) { ret false; }
     # base must be loop-invariant
     if (!loops.is_invariant(la, loop_ix, base)) { ret false; }
 
@@ -340,6 +554,7 @@ fun classify_access(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32, iid
     out.instr     = iid;
     out.gep       = ptr.data.instr;
     out.base      = base;
+    out.off       = ax.off;
     out.stride_ty = stride_ty;
     out.elem_ty   = elem_ty;
     out.bytes     = width_bytes;
