@@ -64,9 +64,9 @@ _flat_loader_bin=
 # targets.conf row is added.
 qemu_bin() {
     case "$1" in
-        linux|windows)              echo qemu-x86_64 ;;
-        linux-arm64|darwin-aarch64) echo qemu-aarch64 ;;
-        linux-riscv64)              echo qemu-riscv64 ;;
+        linux|windows|darwin-x86_64) echo qemu-x86_64 ;;
+        linux-arm64|darwin-aarch64)  echo qemu-aarch64 ;;
+        linux-riscv64)               echo qemu-riscv64 ;;
         *) echo "int: no qemu interpreter mapping for target '$1'" >&2; return 1 ;;
     esac
 }
