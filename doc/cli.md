@@ -63,7 +63,7 @@ A verbosity flag (`-v`/`-vv`) and `--quiet` together is a parse error.
 | `--lib <name>`   | artifact name    | narrow the build to one `static`/`shared` `[artifact.<name>]` (mutually exclusive with `--bin`) |
 | `-o <path>`      | path             | override the artifact path, rooted at the project root (build/run/test) |
 | `--all-targets`  | —                | build every declared `[target.*]`, not just the default (mutually exclusive with `-o`, which names one path) |
-| `--emit-asm`     | —                | emit per-module assembly text (`.s`) — each line is one machine instruction the encoder emitted for that module, so the `.s` corresponds to the `.o` instruction for instruction. Supported on x86-64; riscv64 and aarch64 fail naming their tracking issue rather than emit a misleading file. Emission is opt-in, controlled only by this flag |
+| `--emit-asm`     | —                | emit per-module assembly text (`.s`) — each line is one machine instruction the encoder emitted for that module, so the `.s` corresponds to the `.o` instruction for instruction. Supported on x86-64 and aarch64; riscv64 fails naming its tracking issue rather than emit a misleading file. Emission is opt-in, controlled only by this flag |
 | `--emit-ir`      | —                | emit per-module SSA IR text (`.ir`), the final post-pipeline IR the object is built from (so it varies with the profile's `opt`) — emission is opt-in, controlled only by this flag |
 | `--verify-ir`    | —                | run the IR verifier after each optimisation pass |
 
