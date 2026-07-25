@@ -670,11 +670,19 @@ mach-read      ::= comptime-ident { member }        (* $mach.build.os, $mach.arc
 
 - Intrinsic calls (`$size_of(T)`, `$align_of(T)`, `$offset_of(T, field)`,
   `$type_of(e)`, `$fields(T)`, `$error("msg")`, `$assert(cond, "msg")`) are
-  syntactically a `comptime-ident` callee with `call-args`. Their *arguments*
-  are parsed as ordinary expressions — `$size_of(T)` and `$fields(T)` pass a
-  type name that the expression grammar reads as an `IDENT`; the intrinsic
-  reinterprets it as a type at evaluation time. `$type_of(e)` takes a value
-  expression and produces a comptime type value.
+  syntactically a `comptime-ident` callee with `call-args`.
+- The **type-taking** intrinsics — `$size_of`, `$align_of`, `$offset_of`,
+  `$fields` — parse their **first argument with the `type` production**, not the
+  expression grammar, so the whole type language is spellable there:
+  `$fields(Box[T])`, `$size_of(Pair[A, B])`, `$size_of(*T)`, `$size_of([4]u16)`,
+  `$size_of(^u32)`, `$fields(mod.Rec)`. Every other argument is an ordinary
+  expression; `$offset_of`'s second is a bare field name resolved against the
+  record. `$type_of(e)` takes a value expression and produces a comptime type
+  value.
+- A **type comparison** operand (`$type_of(x) == Name`) is the one type spelling
+  read with the expression grammar, because the comparison is only recognizable
+  once both sides are parsed. Only a bare name or `module.Name` is available
+  there; a generic instance is not.
 - `$mach.*` reads are a `comptime-ident` followed by a `.`-member chain. They
   appear in `$if` conditions and as comptime initializers.
 - A bare **directive** `$intrinsic(args);` (e.g. `$error("msg");`) is the
