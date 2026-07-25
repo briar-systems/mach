@@ -53,6 +53,27 @@ rec MapShape {
     is_float: bool;
 }
 
+# one operand slot naming a loop-invariant scalar, awaiting its preheader splat
+# ---
+# instr: the vectorized instruction holding the slot
+# slot:  the operand index within it
+# val:   the invariant scalar the slot names
+rec SplatSite {
+    instr: id.InstructionId;
+    slot:  u32;
+    val:   value.Value;
+}
+
+# one emitted splat: the invariant scalar and the vector it was broadcast into, so a
+# scalar used by several operands is broadcast once
+# ---
+# key: the invariant scalar
+# vec: its vector-typed broadcast, defined in the vector preheader
+rec SplatEntry {
+    key: value.Value;
+    vec: value.Value;
+}
+
 # run element-wise vectorization over every function in `m`
 #
 # A no-op on an incapable target (has_v128 == false), on a function carrying the
@@ -244,7 +265,7 @@ fun stores_are_pure_trees(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalys
     val rset: R.Result[*bool, str] = A.allocate[bool](m.alloc, fn.instr_len::usize);
     if (R.is_err[*bool, str](rset)) { ret R.err[bool, str](R.unwrap_err[*bool, str](rset)); }
     val vset: *bool = R.unwrap_ok[*bool, str](rset);
-    build_vset(fn, la, lx, d.accesses, d.access_count, shape.elem_ty, shape.is_float, vset);
+    build_vset(fn, la, lx, d.accesses, d.access_count, shape.elem_ty, shape.is_float, true, vset);
 
     var ok: bool = true;
     var i: u32 = 0;
@@ -266,11 +287,16 @@ fun stores_are_pure_trees(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalys
 
 # fill `vset` with the loop-body instructions that vectorize: the loads (seeds) and,
 # to a fixpoint, every supported lane op whose result type is exactly the element
-# type and whose operands are all already in the set. A scalar / loop-invariant /
-# induction-variable operand keeps an op out (that would need a splat), the
-# result-type check keeps any width- or kind-changing op out, and the walk skips the
-# header block so only true body computation is admitted.
-fun build_vset(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, accesses: *dep.MemAccess, access_count: u32, elem_ty: ir_type.IrTypeId, is_float: bool, vset: *bool) {
+# type and whose operands are all vectorizable. The result-type check keeps any width-
+# or kind-changing op out, and the walk skips the header block so only true body
+# computation is admitted.
+#
+# `allow_splat` admits an operand that is a loop-invariant scalar of the element type
+# alongside the vector-set operands, on the promise that the caller broadcasts it in
+# the loop's preheader (#2202). The element-wise transform makes good on that promise
+# via splat_invariants; the reduction transform has no such step, so it passes false
+# and keeps its strict all-operands-vectorized rule.
+fun build_vset(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, accesses: *dep.MemAccess, access_count: u32, elem_ty: ir_type.IrTypeId, is_float: bool, allow_splat: bool, vset: *bool) {
     var i: u32 = 0;
     for (i < fn.instr_len) { vset[i] = false; i = i + 1; }
     i = 0;
@@ -293,7 +319,7 @@ fun build_vset(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, accesses: *de
                     val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, iid);
                     if (O.is_some[*instruction.Instruction](opt)) {
                         val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
-                        if (supported_vector_op(inst.kind, is_float) && inst.ty == elem_ty && all_operands_in_set(inst, fn, vset)) {
+                        if (supported_vector_op(inst.kind, is_float) && inst.ty == elem_ty && operands_vectorizable(inst, fn, la, lx, elem_ty, allow_splat, vset)) {
                             vset[iid::u32] = true;
                             changed = true;
                         }
@@ -306,17 +332,36 @@ fun build_vset(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, accesses: *de
     }
 }
 
-# true when every operand of `inst` is a VAL_INSTR already in the vector set (so no
-# constant / parameter / induction-variable operand -- those would need a splat)
-fun all_operands_in_set(inst: *instruction.Instruction, fn: *ir.Function, vset: *bool) bool {
+# true when `inst`'s operands are all vectorizable: each is either a VAL_INSTR already
+# in the vector set or, when `allow_splat`, a splattable loop-invariant scalar. At
+# least one operand must come from the vector set -- an op over invariants alone is
+# itself invariant, and broadcasting its operands would compute a loop-invariant value
+# once per lane rather than hoisting it.
+fun operands_vectorizable(inst: *instruction.Instruction, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, elem_ty: ir_type.IrTypeId, allow_splat: bool, vset: *bool) bool {
     if (inst.operand_count == 0) { ret false; }
+    var from_set: bool = false;
     var o: u32 = 0;
     for (o < inst.operand_count) {
         val op: value.Value = inst.operands[o];
-        if (op.kind != value.VAL_INSTR || op.data.instr::u32 >= fn.instr_len || !vset[op.data.instr::u32]) { ret false; }
+        if (op.kind == value.VAL_INSTR && op.data.instr::u32 < fn.instr_len && vset[op.data.instr::u32]) {
+            from_set = true;
+        } or {
+            if (!allow_splat || !splattable(op, la, lx, elem_ty)) { ret false; }
+        }
         o = o + 1;
     }
-    ret true;
+    ret from_set;
+}
+
+# true when `v` is a loop-invariant scalar of the element type that one preheader
+# broadcast can stand in for: a constant, a parameter, or a value defined outside the
+# loop. The type stamp must be exactly the element type -- a differently typed operand
+# would be splatted into the wrong lane width -- and pointer / global / function
+# values are excluded, since they are addresses rather than lane values.
+fun splattable(v: value.Value, la: *loops.LoopAnalysis, lx: u32, elem_ty: ir_type.IrTypeId) bool {
+    if (v.ty != elem_ty) { ret false; }
+    if (v.kind != value.VAL_CONST_INT && v.kind != value.VAL_CONST_FLOAT && v.kind != value.VAL_PARAM && v.kind != value.VAL_INSTR) { ret false; }
+    ret loops.is_invariant(la, lx, v);
 }
 
 # the lane-wise element-wise ops whose 128-bit vector form is selectable on the
@@ -432,13 +477,16 @@ fun vectorize_one(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: 
     if (R.is_err[bool, str](rcl)) { A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize); A.deallocate[id.BlockId](m.alloc, rem_blocks, body_len::usize); dep.dep_dnit(?fd); loops.dnit(?fla); ret R.err[bool, str](R.unwrap_err[bool, str](rcl)); }
     val rem_header: id.BlockId = rem_blocks[ver.region_index(fbody, body_len, fast_header)];
 
-    # vectorize the fast body: retype loads + ops to the vector type
+    # vectorize the fast body: retype loads + ops to the vector type, then broadcast
+    # every loop-invariant scalar operand the vector set admitted into the preheader
     val rset: R.Result[*bool, str] = A.allocate[bool](m.alloc, fn.instr_len::usize);
     if (R.is_err[*bool, str](rset)) { A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize); A.deallocate[id.BlockId](m.alloc, rem_blocks, body_len::usize); dep.dep_dnit(?fd); loops.dnit(?fla); ret R.err[bool, str](R.unwrap_err[*bool, str](rset)); }
     val vset: *bool = R.unwrap_ok[*bool, str](rset);
-    build_vset(fn, ?fla, flx, fd.accesses, fd.access_count, fshape.elem_ty, fshape.is_float, vset);
+    build_vset(fn, ?fla, flx, fd.accesses, fd.access_count, fshape.elem_ty, fshape.is_float, true, vset);
     retype_to_vector(fn, flp, vset, vec_ty);
+    val rsp: R.Result[bool, str] = splat_invariants(m, fn, flp, vset, vpre, fast_header, ?fshape, vec_ty);
     A.deallocate[bool](m.alloc, vset, fn.instr_len::usize);
+    if (R.is_err[bool, str](rsp)) { A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize); A.deallocate[id.BlockId](m.alloc, rem_blocks, body_len::usize); dep.dep_dnit(?fd); loops.dnit(?fla); ret rsp; }
 
     # step the induction variable by the lane count (the +1 update becomes +lanes)
     val uopt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, fast_iv_upd);
@@ -514,6 +562,171 @@ fun retype_to_vector(fn: *ir.Function, lp: *loops.Loop, vset: *bool, vec_ty: ir_
         }
         bi = bi + 1;
     }
+}
+
+# the total operand count over a loop body's instructions -- an upper bound on the
+# splat sites one vectorized body can hold
+fun body_operand_slots(fn: *ir.Function, lp: *loops.Loop) u32 {
+    var n: u32 = 0;
+    var bi: u32 = 0;
+    for (bi < lp.body_len) {
+        val blk: *ir.Block = ?fn.blocks[lp.body[bi]::u32];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            n = n + fn.instrs[blk.instructions[ii]::u32].operand_count;
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    ret n;
+}
+
+# broadcast the vectorized body's loop-invariant scalar operands ahead of the loop
+#
+# Every operand of a vector-set instruction that is not itself a vector-set value is a
+# splattable loop-invariant scalar -- build_vset admits nothing else -- so each is
+# replaced by a vector whose lanes all hold it, built once before the loop is entered.
+# The broadcast is loop-invariant by construction, so the body gains no per-iteration
+# work: `a[i] = b[i] * k` costs one splat per call, not per iteration (#2202).
+#
+# The splats go in a block of their own, spliced between the vector preheader and the
+# fast header, because the preheader is already terminated by the time the fast loop
+# has re-confirmed its shape. The block is created only when there is a splat to make,
+# so a loop with no invariant operand keeps exactly the control flow it had.
+#
+# Only the lane ops are scanned. A load's operand is its address gep, which is not a
+# lane value and must never be broadcast; a store's value operand is already required
+# to be in the vector set. The sites are collected before anything is emitted, since
+# emitting grows the instruction pool and invalidates every borrowed instruction
+# pointer.
+# ---
+# m:           the module owning `fn`
+# fn:          the function being transformed
+# lp:          the fast (vector) loop
+# vset:        the vector set over `fn`'s instructions
+# vpre:        the vector preheader, which dominates the fast loop
+# fast_header: the fast loop's header, the preheader's successor
+# shape:       the loop's element shape
+# vec_ty:      the interned 128-bit vector type of the element
+# ret:         ok(true), or an allocation / build error
+fun splat_invariants(m: *ir.Module, fn: *ir.Function, lp: *loops.Loop, vset: *bool, vpre: id.BlockId, fast_header: id.BlockId, shape: *MapShape, vec_ty: ir_type.IrTypeId) R.Result[bool, str] {
+    val cap: u32 = body_operand_slots(fn, lp);
+    if (cap == 0) { ret R.ok[bool, str](true); }
+    val rss: R.Result[*SplatSite, str] = A.allocate[SplatSite](m.alloc, cap::usize);
+    if (R.is_err[*SplatSite, str](rss)) { ret R.err[bool, str](R.unwrap_err[*SplatSite, str](rss)); }
+    val sites: *SplatSite = R.unwrap_ok[*SplatSite, str](rss);
+    val rse: R.Result[*SplatEntry, str] = A.allocate[SplatEntry](m.alloc, cap::usize);
+    if (R.is_err[*SplatEntry, str](rse)) { A.deallocate[SplatSite](m.alloc, sites, cap::usize); ret R.err[bool, str](R.unwrap_err[*SplatEntry, str](rse)); }
+    val cache: *SplatEntry = R.unwrap_ok[*SplatEntry, str](rse);
+
+    var n: u32 = 0;
+    var bi: u32 = 0;
+    for (bi < lp.body_len) {
+        val blk: *ir.Block = ?fn.blocks[lp.body[bi]::u32];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val iid: id.InstructionId = blk.instructions[ii];
+            val inst: *instruction.Instruction = ?fn.instrs[iid::u32];
+            if (vset[iid::u32] && supported_vector_op(inst.kind, shape.is_float)) {
+                var o: u32 = 0;
+                for (o < inst.operand_count) {
+                    val op: value.Value = inst.operands[o];
+                    if (op.kind != value.VAL_INSTR || op.data.instr::u32 >= fn.instr_len || !vset[op.data.instr::u32]) {
+                        sites[n].instr = iid;
+                        sites[n].slot  = o;
+                        sites[n].val   = op;
+                        n = n + 1;
+                    }
+                    o = o + 1;
+                }
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+    if (n == 0) { splat_free(m, sites, cache, cap); ret R.ok[bool, str](true); }
+
+    val rat: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?m.types, shape.elem_ty, shape.lanes);
+    if (R.is_err[ir_type.IrTypeId, str](rat)) { splat_free(m, sites, cache, cap); ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rat)); }
+    val arr_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rat);
+
+    val rsb: R.Result[id.BlockId, str] = ir.block_add(m, fn);
+    if (R.is_err[id.BlockId, str](rsb)) { splat_free(m, sites, cache, cap); ret R.err[bool, str](R.unwrap_err[id.BlockId, str](rsb)); }
+    val spre: id.BlockId = R.unwrap_ok[id.BlockId, str](rsb);
+    var b: builder.Builder = builder.init(m);
+    builder.set_function(?b, fn);
+    builder.set_block(?b, spre);
+    var cn: u32 = 0;
+    var i: u32 = 0;
+    for (i < n) {
+        if (splat_lookup(cache, cn, sites[i].val) == ver.NONE_U32) {
+            val rsv: R.Result[value.Value, str] = emit_splat(?b, sites[i].val, arr_ty, vec_ty, shape.lanes);
+            if (R.is_err[value.Value, str](rsv)) { splat_free(m, sites, cache, cap); ret R.err[bool, str](R.unwrap_err[value.Value, str](rsv)); }
+            cache[cn].key = sites[i].val;
+            cache[cn].vec = R.unwrap_ok[value.Value, str](rsv);
+            cn = cn + 1;
+        }
+        i = i + 1;
+    }
+    if (R.is_err[bool, str](builder.emit_br(?b, fast_header))) { splat_free(m, sites, cache, cap); ret R.err[bool, str]("vectorize: splat block branch"); }
+    ver.redirect_terminator(fn, vpre, fast_header, spre);
+    ver.relabel_phi_pred(fn, fast_header, vpre, spre);
+
+    i = 0;
+    for (i < n) {
+        val ci: u32 = splat_lookup(cache, cn, sites[i].val);
+        if (ci != ver.NONE_U32) {
+            val inst: *instruction.Instruction = ?fn.instrs[sites[i].instr::u32];
+            inst.operands[sites[i].slot] = cache[ci].vec;
+        }
+        i = i + 1;
+    }
+    splat_free(m, sites, cache, cap);
+    ret R.ok[bool, str](true);
+}
+
+# release the splat working arrays
+fun splat_free(m: *ir.Module, sites: *SplatSite, cache: *SplatEntry, cap: u32) {
+    A.deallocate[SplatSite](m.alloc, sites, cap::usize);
+    A.deallocate[SplatEntry](m.alloc, cache, cap::usize);
+}
+
+# the cache index whose key is the same value as `v`, or NONE_U32
+fun splat_lookup(cache: *SplatEntry, cn: u32, v: value.Value) u32 {
+    var i: u32 = 0;
+    for (i < cn) {
+        if (dep.equal(cache[i].key, v)) { ret i; }
+        i = i + 1;
+    }
+    ret ver.NONE_U32;
+}
+
+# broadcast a scalar into every lane of a vector, in the builder's current block: a
+# lanes-wide slot written lane by lane and read back as one vector. The same
+# construction the reduction accumulator's initial vector uses, so the splat needs no
+# lowering of its own -- it is a store / load pair the back end already emits.
+# ---
+# b:      builder positioned in the block the splat is built in
+# v:      the scalar to broadcast
+# arr_ty: the interned `[lanes]elem` array type of the slot
+# vec_ty: the interned 128-bit vector type read back
+# lanes:  the lane count
+# ret:    the vector-typed broadcast, or a build error
+fun emit_splat(b: *builder.Builder, v: value.Value, arr_ty: ir_type.IrTypeId, vec_ty: ir_type.IrTypeId, lanes: u32) R.Result[value.Value, str] {
+    val rit: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?b.m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rit)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](rit)); }
+    val idx_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rit);
+    val ras: R.Result[value.Value, str] = builder.emit_alloca(b, arr_ty, value.const_int(1, idx_ty));
+    if (R.is_err[value.Value, str](ras)) { ret ras; }
+    val slot: value.Value = R.unwrap_ok[value.Value, str](ras);
+    var lane: u32 = 0;
+    for (lane < lanes) {
+        val rg: R.Result[value.Value, str] = lane_gep(b, slot, arr_ty, lane, idx_ty);
+        if (R.is_err[value.Value, str](rg)) { ret rg; }
+        if (R.is_err[bool, str](builder.emit_store(b, v, R.unwrap_ok[value.Value, str](rg)))) { ret R.err[value.Value, str]("vectorize: splat store"); }
+        lane = lane + 1;
+    }
+    ret builder.emit_load(b, slot, vec_ty);
 }
 
 # change the phi incoming of `blk` from predecessor `from` to come from `new_block`
@@ -627,7 +840,7 @@ fun rv_is_vector_tree(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, 
     val rset: R.Result[*bool, str] = A.allocate[bool](m.alloc, fn.instr_len::usize);
     if (R.is_err[*bool, str](rset)) { ret false; }
     val vset: *bool = R.unwrap_ok[*bool, str](rset);
-    build_vset(fn, la, lx, ri.accesses, ri.access_count, ri.elem_ty, false, vset);
+    build_vset(fn, la, lx, ri.accesses, ri.access_count, ri.elem_ty, false, false, vset);
     var ok: bool = ri.rv.kind == value.VAL_INSTR && ri.rv.data.instr::u32 < fn.instr_len && vset[ri.rv.data.instr::u32];
     A.deallocate[bool](m.alloc, vset, fn.instr_len::usize);
     ret ok;
@@ -758,7 +971,7 @@ fun vectorize_reduction(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis
     val rset: R.Result[*bool, str] = A.allocate[bool](m.alloc, fn.instr_len::usize);
     if (R.is_err[*bool, str](rset)) { ret R.err[bool, str](R.unwrap_err[*bool, str](rset)); }
     val vset: *bool = R.unwrap_ok[*bool, str](rset);
-    build_vset(fn, la, lx, ri.accesses, ri.access_count, elem_ty, false, vset);
+    build_vset(fn, la, lx, ri.accesses, ri.access_count, elem_ty, false, false, vset);
     vset[acc_phi::u32] = true;
     vset[acc_upd::u32] = true;
     retype_to_vector(fn, lp, vset, vec_ty);
@@ -848,10 +1061,19 @@ fun emit_horizontal_combine(b: *builder.Builder, op: instruction.InstrKind, vacc
 
 # a `gep(slot, 0, lane)` addressing lane `lane` of a `[lanes]elem` slot (the array
 # shape a vector's 16-byte storage aliases, per the v[i] lowering)
-fun lane_gep(b: *builder.Builder, slot: value.Value, arr_ty: ir_type.IrTypeId, lane: u32, elem_ty: ir_type.IrTypeId) R.Result[value.Value, str] {
+# ---
+# b:      builder positioned where the gep is emitted
+# slot:   the slot's address
+# arr_ty: the interned `[lanes]elem` array type
+# lane:   the lane ordinal
+# idx_ty: the INTEGER type the two index constants carry -- an ordinal, not a value of
+#         the element type, which for a float element would stamp an integer constant
+#         with a float type. The reduction callers pass their element type, an integer
+#         by construction; the splat, whose element may be a float, passes i64.
+fun lane_gep(b: *builder.Builder, slot: value.Value, arr_ty: ir_type.IrTypeId, lane: u32, idx_ty: ir_type.IrTypeId) R.Result[value.Value, str] {
     var idx: [2]value.Value;
-    idx[0] = value.const_int(0, elem_ty);
-    idx[1] = value.const_int(lane::u64, elem_ty);
+    idx[0] = value.const_int(0, idx_ty);
+    idx[1] = value.const_int(lane::u64, idx_ty);
     ret builder.emit_gep(b, slot, arr_ty, ?idx[0], 2);
 }
 
