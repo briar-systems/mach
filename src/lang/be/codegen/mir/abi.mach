@@ -46,9 +46,15 @@ val MAX_GP_ARG_REGS: i32 = 16;
 # validate that the active target exposes the ABI and ISA vtable surface
 #
 # ABI lowering is driven purely through the vtables, never gated by an architecture
-# check, so an absent ABI vtable or one missing the classify / arg / ret /
-# arg-register-file accessors (an unsupported convention) is a hard error rather
-# than a silent un-pre-colored off-path.
+# check, so an absent ABI vtable or one missing the classify / arg / ret accessors
+# (an unsupported convention) is a hard error rather than a silent un-pre-colored
+# off-path.
+#
+# Only the surface EVERY lowered call and parameter list reads is demanded here. A
+# capability a single conditional path consumes - the GP argument register file, the
+# variadic save model - is demanded by that path, at its point of use, so an absent
+# one is reported as the construct it actually blocks rather than as a precondition
+# of every call (#2273).
 # ---
 # tgt: the active target
 # ret: ok(true) when the vtable surface is present, or a loud error
@@ -64,24 +70,26 @@ pub fun require_abi(tgt: *target.Target) R.Result[bool, str] {
     if (tgt.abi.arg_passing == nil || tgt.abi.ret_passing == nil) {
         ret R.err[bool, str]("mir.lower_ir: ABI vtable exposes no arg/ret classifier");
     }
-    if (tgt.abi.gp_arg_regs == nil) {
-        ret R.err[bool, str]("mir.lower_ir: ABI vtable exposes no GP argument register file");
-    }
     ret R.ok[bool, str](true);
 }
 
 # read the physical register id of the `index`-th GP argument register
 #
 # Reads the active convention's GP argument bank (`tgt.abi.gp_arg_regs`, in passing
-# order). Used to find the integer register a win64 variadic float duplicates into.
-# Errors loudly when `index` is past the convention's GP argument file rather than
-# returning a wrong register.
+# order). Its sole consumer is the win64 variadic tail-float duplication, so the
+# bank is demanded here rather than by `require_abi`: a convention that publishes no
+# GP argument file is reported at the one construct that needs one. Errors loudly
+# when `index` is past the convention's GP argument file rather than returning a
+# wrong register.
 # ---
 # tgt:   the active target
 # index: zero-based GP argument-register index
 # out:   receives the physical register id on success
 # ret:   ok(true) on success, or a loud error
 pub fun abi_gp_arg_reg(tgt: *target.Target, index: i32, out: *i32) R.Result[bool, str] {
+    if (tgt.abi.gp_arg_regs == nil) {
+        ret R.err[bool, str]("mir.lower_ir: ABI vtable exposes no GP argument register file");
+    }
     var regs: [16]isa.Register;
     val fill: abi.RegFileFn = tgt.abi.gp_arg_regs::abi.RegFileFn;
     val n: i32 = fill(?regs[0]);
@@ -96,15 +104,17 @@ pub fun abi_gp_arg_reg(tgt: *target.Target, index: i32, out: *i32) R.Result[bool
 #
 # The call lowering reads its call-side facts (the conservative vector-count
 # register and win64 tail-float duplication) so the mechanism stays ABI-agnostic
-# and the convention-specific facts live in the vtable. Errors loudly when no ABI
-# exposes a va_model accessor (an unsupported convention).
+# and the convention-specific facts live in the vtable. Every caller sits on a
+# variadic path - the vector-count move and the tail-float duplication are the only
+# two facts the model carries - so a convention publishing no model is refused as
+# what it is: a convention that cannot make a variadic call.
 # ---
 # tgt: the active target
 # out: receives the convention's variadic save model on success
 # ret: ok(true) on success, or a loud error
 pub fun abi_va_model(tgt: *target.Target, out: *abi.VaModel) R.Result[bool, str] {
     if (tgt.abi.va_model == nil) {
-        ret R.err[bool, str]("mir.lower_ir: ABI vtable exposes no variadic save model");
+        ret R.err[bool, str]("mir.lower_ir: a variadic call is not supported by this calling convention (no variadic save model)");
     }
     val model: abi.VaModelFn = tgt.abi.va_model::abi.VaModelFn;
     @out = model();
@@ -775,13 +785,6 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
 
     val classify_arg: abi.ArgPassingFn = ctx.tgt.abi.arg_passing::abi.ArgPassingFn;
 
-    # the convention's variadic save model drives the pre-call vector-count move and
-    # the win64 variadic-float duplication - both ABI facts the call lowering reads
-    # from the model rather than naming a register or convention directly.
-    var vamodel: abi.VaModel;
-    val vmr: R.Result[bool, str] = abi_va_model(ctx.tgt, ?vamodel);
-    if (R.is_err[bool, str](vmr)) { ret vmr; }
-
     # classify the WHOLE declared signature once (the callee's IRT_FN rides on
     # `inst.aux_ty`, the call's result type on `inst.ty`); the return and every
     # fixed argument read their placement from this single layout so the call and
@@ -958,18 +961,29 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         # slots) sees it. duplicate the float's bits into the slot's GP argument
         # register (the positional slot is `gp_used + fp_used`, before the advance);
         # the move is cross-bank (MOVQ), gated on the model's `float_dup_gp` so SysV -
-        # whose FP save area captures floats directly - never emits it.
-        if (pidx >= layout.param_count && vamodel.float_dup_gp && slot.class == abi.CLASS_FP) {
-            var dup_reg: i32 = 0;
-            val dr: R.Result[bool, str] = abi_gp_arg_reg(ctx.tgt, gp_used + fp_used, ?dup_reg);
-            if (R.is_err[bool, str](dr)) {
+        # whose FP save area captures floats directly - never emits it. the model is
+        # read here, inside the tail-float arm, rather than once per call: it is a
+        # variadic-only fact, and demanding it of every call makes a fixed-arity call
+        # report a variadic problem it never had (#2273).
+        if (pidx >= layout.param_count && slot.class == abi.CLASS_FP) {
+            var vamodel: abi.VaModel;
+            val vmr: R.Result[bool, str] = abi_va_model(ctx.tgt, ?vamodel);
+            if (R.is_err[bool, str](vmr)) {
                 sig_layout_free(ctx, ?layout);
-                ret dr;
+                ret vmr;
             }
-            val dm: R.Result[bool, str] = context.emit_mov(ctx, mb, mir.op_preg(dup_reg::u32), argop);
-            if (R.is_err[bool, str](dm)) {
-                sig_layout_free(ctx, ?layout);
-                ret dm;
+            if (vamodel.float_dup_gp) {
+                var dup_reg: i32 = 0;
+                val dr: R.Result[bool, str] = abi_gp_arg_reg(ctx.tgt, gp_used + fp_used, ?dup_reg);
+                if (R.is_err[bool, str](dr)) {
+                    sig_layout_free(ctx, ?layout);
+                    ret dr;
+                }
+                val dm: R.Result[bool, str] = context.emit_mov(ctx, mb, mir.op_preg(dup_reg::u32), argop);
+                if (R.is_err[bool, str](dm)) {
+                    sig_layout_free(ctx, ?layout);
+                    ret dm;
+                }
             }
         }
 
@@ -1007,10 +1021,15 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     # call carries no such write. the move is a 32-bit `mov eax, imm32` (the count is 0-8,
     # so writing EAX sets AL and zero-extends the rest), five bytes rather than the 7-byte
     # 64-bit immediate form.
-    if (vamodel.vector_count_reg >= 0 && variadic_call) {
-        val al: R.Result[bool, str] = context.emit_mov_w(ctx, mb,
-            mir.op_preg(vamodel.vector_count_reg::u32), mir.op_imm(fp_used::i64), 4::u8);
-        if (R.is_err[bool, str](al)) { ret al; }
+    if (variadic_call) {
+        var vamodel: abi.VaModel;
+        val vmr: R.Result[bool, str] = abi_va_model(ctx.tgt, ?vamodel);
+        if (R.is_err[bool, str](vmr)) { ret vmr; }
+        if (vamodel.vector_count_reg >= 0) {
+            val al: R.Result[bool, str] = context.emit_mov_w(ctx, mb,
+                mir.op_preg(vamodel.vector_count_reg::u32), mir.op_imm(fp_used::i64), 4::u8);
+            if (R.is_err[bool, str](al)) { ret al; }
+        }
     }
 
     # the call itself: the caller-saved clobber barrier (see mir.MIR_CALL docs).
@@ -1818,6 +1837,60 @@ test "mach.lang.be.codegen.mir.abi:stack_arg_alignment" {
     # a by-value slot honors the value's alignment, clamped to the 8-byte minimum.
     if (stack_arg_align(abi.CLASS_STACK, 16) != 16) { ret 1; }
     if (stack_arg_align(abi.CLASS_STACK, 4) != 8)   { ret 1; }
+    ret 0;
+}
+
+# an argument classifier that places everything in one GP slot. `require_abi` only
+# tests the accessor's presence, so the ABI-surface test wires a real signature
+# rather than erasing an unrelated function pointer
+fun probe_arg(index: i32, size: u64, align: u64, is_float: bool, fp_eightbytes: u8,
+              is_aggregate: bool, is_vector: bool, is_ext: bool, gp_used: i32, fp_used: i32,
+              hfa_members: u8, hfa_elem: u8, agg: abi.AggLayout) abi.ParamSlot {
+    ret abi.make_slot(abi.CLASS_GP, index, -1, 0, size);
+}
+
+# the return-classifier twin of `probe_arg`
+fun probe_ret(size: u64, align: u64, is_float: bool, fp_eightbytes: u8,
+              is_aggregate: bool, is_vector: bool, hfa_members: u8, hfa_elem: u8,
+              agg: abi.AggLayout) abi.ParamSlot {
+    ret abi.make_slot(abi.CLASS_GP, 0, -1, 0, size);
+}
+
+# the ABI surface every lowered call reads is exactly the arg/ret classifiers (#2273).
+# The two variadic-only facts - the GP argument register file, read solely by the win64
+# tail-float duplication, and the variadic save model - are demanded at their points of
+# use, so a convention that publishes neither still lowers a fixed-arity call and each
+# absent fact is reported as the construct it blocks. Restoring either demand to
+# `require_abi` refuses every call on such a convention naming the wrong cause.
+test "mach.lang.be.codegen.mir.abi.require_abi:variadic_facts_are_not_call_preconditions" {
+    # a whole-module ISA: this is a convention with no register machine behind it,
+    # which is exactly the shape the two variadic facts are absent from.
+    var vt: isa.IsaVTable = isa.emitter_isa(isa.ARCH_SPIRV, "probe", 8, nil, 0, nil, nil);
+    var av: abi.AbiVTable;
+    av.arg_passing = probe_arg::*u8;
+    av.ret_passing = probe_ret::*u8;
+    av.gp_arg_regs = nil;
+    av.va_model    = nil;
+
+    var t: target.Target;
+    t.isa = ?vt;
+    t.abi = ?av;
+
+    # neither variadic fact is a precondition of lowering a call.
+    if (R.is_err[bool, str](require_abi(?t))) { ret 1; }
+
+    # each is refused at its own point of use instead.
+    var reg: i32 = 0;
+    if (!R.is_err[bool, str](abi_gp_arg_reg(?t, 0, ?reg))) { ret 1; }
+    var vm: abi.VaModel;
+    if (!R.is_err[bool, str](abi_va_model(?t, ?vm))) { ret 1; }
+
+    # the classifier surface IS a precondition: every call and parameter list reads it.
+    av.arg_passing = nil;
+    if (!R.is_err[bool, str](require_abi(?t))) { ret 1; }
+    av.arg_passing = probe_arg::*u8;
+    av.ret_passing = nil;
+    if (!R.is_err[bool, str](require_abi(?t))) { ret 1; }
     ret 0;
 }
 
