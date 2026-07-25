@@ -1319,8 +1319,11 @@ fun set_expr_type(sc: *context.SemaContext, eid: id.ExprId, ty: type.TypeId) {
 # The type-argument's expr_type slot is populated for the lowerer. TYPE_ERROR
 # when the sequence is malformed or T is not a record. Returns the
 # TYPE_GENERIC_PARAM TypeId when T is an unbound generic param -- the caller
-# defers the unroll to monomorphization. Shared by the `$each` unroll (sema and
-# lowering).
+# defers the unroll to monomorphization.
+#
+# MUTATES THE SESSION: a generic-instance owner has its field table materialized here,
+# which interns types and can grow `s.types`. Any `*type.Type` borrowed across this call
+# is invalidated.
 # ---
 # sc:      sema context
 # seq_eid: the `$fields(T)` sequence expression
@@ -1338,12 +1341,22 @@ pub fun field_seq_owner(sc: *context.SemaContext, seq_eid: id.ExprId, span: toke
     # an unbound generic type param: defer the record check to monomorphization
     if (type_is_generic_param(sc, owner)) { ret owner; }
     # a generic-instance owner (`Box[u32]`, and every instance a substitution produces)
-    # carries no field table until one is materialized, so materialize BEFORE asking:
-    # `type_is_record` reads the table, and asking first made the answer depend on
-    # whether unrelated code happened to touch a member of the same instance (#2168).
+    # carries no field table until one is materialized, and the `$each` unroll below
+    # reads `field_count` - an absent table would unroll ZERO fields and skip the body in
+    # silence. Materialize here as this site's own precondition rather than relying on
+    # some earlier pass having happened to touch the same instance (#2168).
     generics.ensure_fields(sc.s, owner);
     if (!type_is_record(sc, owner)) {
         context.report(sc, span, "$fields requires a record type");
+        ret type.TYPE_ERROR;
+    }
+    # a generic instance whose table is still absent after the materialization above did
+    # not fail the record check (that reads the target nominal, not the table) - the
+    # materialization itself failed, an allocation failure. Reporting nothing would unroll
+    # zero fields and silently skip the body; reporting the type error would blame valid
+    # source for a resource failure.
+    if (!instance_table_ready(sc, owner)) {
+        context.report(sc, span, "internal: could not materialize the field table for this `$fields` type argument");
         ret type.TYPE_ERROR;
     }
     ret owner;
@@ -1449,6 +1462,22 @@ fun infer_spread(sc: *context.SemaContext, sp: *expr.ExprSpread, span: token.Spa
     ret it;
 }
 
+# whether a generic instance's field table was materialized
+#
+# Only meaningful after `ensure_fields`: a non-instance, or an instance whose table now
+# matches its target nominal's field count, is ready. A short table means the on-demand
+# materialization failed rather than that the type has no fields.
+# ---
+# sc: sema context
+# ty: the TypeId to inspect
+# ret: true when `ty` needs no table or has a complete one
+fun instance_table_ready(sc: *context.SemaContext, ty: type.TypeId) bool {
+    val to: O.Option[*type.Type] = type.get(?sc.s.types, ty);
+    if (O.is_none[*type.Type](to))                                { ret true; }
+    if (O.unwrap[*type.Type](to).kind != type.TYPE_INSTANCE)      { ret true; }
+    ret O.is_some[*type.FieldTable](type.field_table_for(?sc.s.types, ty));
+}
+
 # whether `ty` is a record (or a generic record instance), the aggregate
 # `$fields` accepts
 #
@@ -1461,8 +1490,15 @@ fun type_is_record(sc: *context.SemaContext, ty: type.TypeId) bool {
     val to: O.Option[*type.Type] = type.get(?sc.s.types, ty);
     if (O.is_none[*type.Type](to)) { ret false; }
     val k: type.TypeKind = O.unwrap[*type.Type](to).kind;
-    if (k == type.TYPE_REC)                                                                            { ret true; }
-    if (k == type.TYPE_INSTANCE && O.is_some[*type.FieldTable](type.field_table_for(?sc.s.types, ty))) { ret true; }
+    if (k == type.TYPE_REC) { ret true; }
+    # a generic instance is classified by the nominal it specializes, NOT by carrying a
+    # field table: a generic `uni` instance has one too, and accepting it would unroll a
+    # union's overlapping variants as if they were distinct members at distinct offsets
+    # (#2168). `$fields` rejects the non-generic `uni` twin, so it must reject this.
+    if (k == type.TYPE_INSTANCE) {
+        val nk: O.Option[type.TypeKind] = generics.instance_nominal_kind(sc.s, ty);
+        ret O.is_some[type.TypeKind](nk) && O.unwrap[type.TypeKind](nk) == type.TYPE_REC;
+    }
     ret false;
 }
 
@@ -2100,13 +2136,11 @@ fun type_for_symbol(sc: *context.SemaContext, sym: *resolve.Symbol, span: token.
     # the type-source leaf for a generic parameter, and the single place the active
     # substitution is applied on this path (#2168): every composite resolver rebuilds
     # through `resolve_type_ref`, so a leaf-only application substitutes each parameter
-    # exactly once. Reaches `$fields(T)` / `$size_of(T)` through
-    # `intrinsic_operand_type` too, so a `$each` unroll sees the instance's record.
-    if (sym.kind == resolve.SYM_GENERIC) {
-        val r: R.Result[type.TypeId, str] = type.intern_generic_param(?sc.s.types, sym.name, sym.decl, sym.slot);
-        if (R.is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
-        ret context.apply_subst(sc, R.unwrap_ok[type.TypeId, str](r));
-    }
+    # exactly once. Reaches `$fields(T)` / `$size_of(T)` through `intrinsic_operand_type`
+    # too, so a `$each` unroll sees the instance's record. Delegated so the leaf rule the
+    # per-instance re-validation rests on has ONE definition, shared with the
+    # value-position path in `decl_type_for`.
+    if (sym.kind == resolve.SYM_GENERIC) { ret context.generic_param_type_for(sc, sym); }
     if (sym.kind == resolve.SYM_REC || sym.kind == resolve.SYM_UNI) {
         var kind: type.TypeKind = type.TYPE_REC;
         if (sym.kind == resolve.SYM_UNI) { kind = type.TYPE_UNI; }
@@ -2175,7 +2209,31 @@ fun instantiate_named(sc: *context.SemaContext, sym: *resolve.Symbol, named: *at
     val r: R.Result[type.TypeId, str] = generics.instantiate(sc, sym.decl, sym.origin, args, named.args_len, span);
     free_params(sc, args, named.args_len);
     if (R.is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
-    ret R.unwrap_ok[type.TypeId, str](r);
+    val instance: type.TypeId = R.unwrap_ok[type.TypeId, str](r);
+    check_instance_uni_secrecy(sc, instance, span);
+    ret instance;
+}
+
+# enforce the mixed-secrecy union rule on a generic union INSTANCE (#2168)
+#
+# `check_uni_secrecy` runs once, at the declaration, where a variant typed `T` resolves
+# to an abstract parameter that classifies as a public leaf and agrees with every public
+# variant. The rule it enforces is about the CONCRETE bytes, so `uni U[T] { a: T; b: u32 }`
+# at `T = ^u32` aliases secret storage under a public overlay exactly as the non-generic
+# `uni { a: ^u32; b: u32 }` the declaration check rejects. Re-run it per instantiation,
+# against the instance's substituted field table, reported at the instantiation site.
+#
+# A generic FUNCTION instance reaches its equivalent check through the re-validation
+# worklist; a generic TYPE has no body to re-infer, so this is its whole per-instance
+# check. A no-op until the target's own field table exists, so the type-resolution pass
+# (which runs before nominal tables are built) defers to `check_union_instance_types`.
+# ---
+# sc:       sema context
+# instance: the instantiated TypeId
+# span:     the instantiation span for diagnostics
+pub fun check_instance_uni_secrecy(sc: *context.SemaContext, instance: type.TypeId, span: token.Span) {
+    if (generics.first_mixed_secrecy_union(sc.s, instance) == type.TYPE_NIL) { ret; }
+    context.report(sc, span, "union variants must agree on secrecy: this instantiation makes overlapping fields part secret `^` and part public, which would alias the same storage at two classifications");
 }
 
 # PTR: recurse on the pointee and intern a pointer

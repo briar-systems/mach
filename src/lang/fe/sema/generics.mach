@@ -211,6 +211,30 @@ pub fun substitute(s: *session.Session, body_type: type.TypeId, args: *type.Type
     ret body_type;
 }
 
+# the declared kind of the nominal a generic instance specializes (#2168)
+#
+# A `TYPE_INSTANCE` is structurally identical whether it specializes a `rec` or a `uni`
+# - both carry a synthesized field table - so its aggregate kind must be read from the
+# generic declaration it targets, never inferred from the presence of a table. Callers
+# that treat a union as a record would walk overlapping storage as distinct members.
+# ---
+# s:   the shared session (type universe, AST registry)
+# tid: the TypeId to classify
+# ret: some(TYPE_REC / TYPE_UNI) for a generic instance, none when `tid` is not one or
+#      its target declaration cannot be resolved
+pub fun instance_nominal_kind(s: *session.Session, tid: type.TypeId) O.Option[type.TypeKind] {
+    val opt_type: O.Option[*type.Type] = type.get(?s.types, tid);
+    if (O.is_none[*type.Type](opt_type)) { ret O.none[type.TypeKind](); }
+    val t: *type.Type = O.unwrap[*type.Type](opt_type);
+    if (t.kind != type.TYPE_INSTANCE) { ret O.none[type.TypeKind](); }
+
+    val nominal: type.TypeId = generic_nominal_of(s, t.data.instance.target_origin, t.data.instance.target_decl);
+    if (nominal == type.TYPE_ERROR) { ret O.none[type.TypeKind](); }
+    val opt_nom: O.Option[*type.Type] = type.get(?s.types, nominal);
+    if (O.is_none[*type.Type](opt_nom)) { ret O.none[type.TypeKind](); }
+    ret O.some[type.TypeKind](O.unwrap[*type.Type](opt_nom).kind);
+}
+
 # ensure a field table exists for TypeId `tid`, materializing one on demand for a
 # generic instance
 #
@@ -249,13 +273,12 @@ pub fun ensure_fields(s: *session.Session, tid: type.TypeId) {
 
 # whether type `tid` transitively contains a secret `^` ANYWHERE (#2162)
 #
-# The DEEP counterpart to `type.carries_secret`: it follows the pointer / array spine
-# AND recurses INTO record / union / generic-instance field graphs, so an aggregate that
-# WRAPS a secret (`rec P { x: ^u32 }`, a nested record, an all-secret union, a
-# `Box[^u32]`) is caught. `carries_secret` treats a nominal as a leaf - correct for the
-# welded-storage aliasing rules it guards, but an under-approximation at any boundary
-# where a secret could be observed / aliased / erased, since the secrecy erasure there is
-# deep. Use this wherever a secret must not cross into a secrecy-erasing context.
+# It follows the pointer / array spine AND recurses INTO record / union /
+# generic-instance field graphs, so an aggregate that WRAPS a secret (`rec P { x: ^u32 }`,
+# a nested record, an all-secret union, a `Box[^u32]`) is caught. A spine-only walk that
+# stopped at a nominal would under-approximate at every boundary where a secret could be
+# observed / aliased / erased, since the secrecy erasure there is deep. Use this wherever
+# a secret must not cross into a secrecy-erasing context.
 #
 # It lives here, not in `type`, because a generic-instance field table is materialized
 # LAZILY: a `Box[^u32]` that reaches a boundary with no prior field elaboration has no
@@ -301,6 +324,91 @@ fun fn_sig_carries_secret(s: *session.Session, t: *type.Type, scan: *type.Secret
         pi = pi + 1;
     }
     ret false;
+}
+
+# the first generic UNION instance reachable from `tid` whose variants disagree on
+# secrecy, or TYPE_NIL when there is none (#2168)
+#
+# The mixed-secrecy rule is decided at a union's declaration, where a variant typed `T`
+# is an abstract parameter that classifies as a public leaf and agrees with every public
+# variant. It is really a rule about concrete overlapping bytes, so each INSTANCE must be
+# re-checked - and an offending instance need not be spelled at the use site: `Box[^u32]`
+# whose field is `U[T]` materializes `U[^u32]` inside its own substituted field table.
+# So the whole reachable type graph is walked, not just the named type.
+#
+# Only TYPE_INSTANCE unions are reported; a non-generic one was already decided at its
+# declaration, and reporting it again here would duplicate that diagnostic.
+# ---
+# s:   the shared session (type universe, allocator)
+# tid: the root TypeId to search
+# ret: the offending instance TypeId, or TYPE_NIL
+pub fun first_mixed_secrecy_union(s: *session.Session, tid: type.TypeId) type.TypeId {
+    var scan: type.SecretScan;
+    scan.len = 0;
+    ret mixed_union_walk(s, tid, ?scan);
+}
+
+# the recursive worker for `first_mixed_secrecy_union`, threading the visited set
+fun mixed_union_walk(s: *session.Session, tid: type.TypeId, scan: *type.SecretScan) type.TypeId {
+    val opt_type: O.Option[*type.Type] = type.get(?s.types, tid);
+    if (O.is_none[*type.Type](opt_type)) { ret type.TYPE_NIL; }
+    val t: *type.Type = O.unwrap[*type.Type](opt_type);
+
+    if (t.kind == type.TYPE_POINTER) { ret mixed_union_walk(s, t.data.pointer.base, scan); }
+    if (t.kind == type.TYPE_ARRAY)   { ret mixed_union_walk(s, t.data.array.base, scan); }
+    if (t.kind == type.TYPE_SECRET)  { ret mixed_union_walk(s, t.data.secret.base, scan); }
+
+    if (t.kind != type.TYPE_REC && t.kind != type.TYPE_UNI && t.kind != type.TYPE_INSTANCE) {
+        ret type.TYPE_NIL;
+    }
+
+    var i: u32 = 0;
+    for (i < scan.len) {
+        if (scan.seen[i] == tid) { ret type.TYPE_NIL; }
+        i = i + 1;
+    }
+    # beyond the visited-set bound the walk stops. Unlike the deep-secret predicate this
+    # one cannot fail closed by returning "violation" - it must name a real offending
+    # type - so an over-large graph is simply not searched further.
+    if (scan.len >= 256) { ret type.TYPE_NIL; }
+    scan.seen[scan.len] = tid;
+    scan.len = scan.len + 1;
+
+    if (t.kind == type.TYPE_INSTANCE) { ensure_fields(s, tid); }
+
+    val opt_tab: O.Option[*type.FieldTable] = type.field_table_for(?s.types, tid);
+    if (O.is_none[*type.FieldTable](opt_tab)) { ret type.TYPE_NIL; }
+    val fields_len: u32 = O.unwrap[*type.FieldTable](opt_tab).fields_len;
+
+    # a generic union instance: its concrete variants must agree.
+    if (t.kind == type.TYPE_INSTANCE && fields_len > 1) {
+        val kind_opt: O.Option[type.TypeKind] = instance_nominal_kind(s, tid);
+        if (O.is_some[type.TypeKind](kind_opt) && O.unwrap[type.TypeKind](kind_opt) == type.TYPE_UNI) {
+            val first_opt: O.Option[*type.FieldEntry] = type.field_at(?s.types, tid, 0);
+            if (O.is_some[*type.FieldEntry](first_opt)) {
+                val first_ty: type.TypeId = O.unwrap[*type.FieldEntry](first_opt).ty;
+                var v: u32 = 1;
+                for (v < fields_len) {
+                    val ov: O.Option[*type.FieldEntry] = type.field_at(?s.types, tid, v);
+                    if (O.is_some[*type.FieldEntry](ov)) {
+                        if (!secrecy_structure_equal_deep(s, first_ty, O.unwrap[*type.FieldEntry](ov).ty)) { ret tid; }
+                    }
+                    v = v + 1;
+                }
+            }
+        }
+    }
+
+    var f: u32 = 0;
+    for (f < fields_len) {
+        val opt_e: O.Option[*type.FieldEntry] = type.field_at(?s.types, tid, f);
+        if (O.is_some[*type.FieldEntry](opt_e)) {
+            val hit: type.TypeId = mixed_union_walk(s, O.unwrap[*type.FieldEntry](opt_e).ty, scan);
+            if (hit != type.TYPE_NIL) { ret hit; }
+        }
+        f = f + 1;
+    }
+    ret type.TYPE_NIL;
 }
 
 # the recursive worker for `contains_secret_deep`, threading the visited set
