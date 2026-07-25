@@ -222,6 +222,36 @@ timing harness at `int/ct/` measures a branchless constant-time reference
 against a deliberately-leaky control and flags the leak with Welch's t-test —
 run it with `bash int/ct/ct.sh`.
 
+**What the timing harness does and does not assure.** The leakage model has
+three channels, and the harness does not cover them uniformly
+(briar-systems/mach#2363):
+
+| channel | assured by |
+|---|---|
+| control-flow trace | the source-level branch gate, plus the harness's latency mode |
+| variable-latency operands | the sema/lowering gates, plus the harness's latency mode |
+| memory-address trace | the source-level **secret-index and secret-address gates**, plus the harness's address mode |
+
+The two harness modes need opposite sampling and neither substitutes for the
+other. Latency mode times a large batch of calls per sample, which is what lifts
+a running-time difference above clock resolution. That same batching *hides* an
+address-trace leak: every call in a batch is handed the same input, so after the
+first call both input classes are reading a warm cache line and the single cache
+miss carrying the signal is averaged away. Measured on one function — a
+secret-indexed read over a table larger than the last-level cache — latency mode
+scores |t| ≈ 1–15 across runs (straddling its own threshold, so it neither
+confirms nor denies) while address mode, at one call per sample, scores in the
+hundreds.
+
+Two consequences worth stating plainly:
+
+- A clean latency-mode number for a table lookup is **not** evidence of
+  address-trace safety. It is the wrong instrument for that channel.
+- An address-trace leak is only *measurable* when the table exceeds the
+  last-level cache. A cache-resident table leaks its index just as truly and no
+  timing harness will see it. For small tables the property rests entirely on
+  the secret-index gate and on reading the emitted code.
+
 What does not hold — the known open holes:
 
 - **`$fields` reflection projection inside a generic erases a secret field's

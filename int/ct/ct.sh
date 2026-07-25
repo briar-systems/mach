@@ -12,6 +12,25 @@
 #   * leaky_probe — a deliberately-leaky control that early-exits on the first
 #                  mismatching byte, so its running time leaks how many bytes matched.
 # the leaky control is the planted leak: a harness that cannot catch it is decoration.
+#
+# TWO MODES, BECAUSE THE LEAKAGE MODEL HAS TWO OBSERVABLE CHANNELS (#2363). #1643's
+# model is control-flow trace + memory-address trace + variable-latency operands.
+# the measurement above covers the first and third. it CANNOT see the second, and
+# not by a little: measured with the default batch, a real secret-indexed read over
+# a 256 MB table scores |t| ~= 1-15 across runs -- straddling the threshold, so it
+# can neither confirm nor deny the leak. that is worse than a clean miss, because
+# either verdict looks like an answer.
+#   * LATENCY MODE  (`measure`)      large batches of calls per timed sample. more
+#                                    calls lift a running-time difference above
+#                                    clock resolution.
+#   * ADDRESS MODE  (`measure_addr`) ONE call per sample, many samples. batching is
+#                                    exactly what hides an address leak: every call
+#                                    in a batch gets the same input, so after the
+#                                    first call both classes read a warm cache line
+#                                    and the single miss carrying the signal is
+#                                    averaged away.
+# `addr_leak_in_latency_mode` measures the SAME function under the default batch and
+# is reported, never asserted: it is the blind spot, measured rather than claimed.
 # it is written over PUBLIC values on purpose — sema rejects a secret branch in any
 # function, so this leak is unconstructable with `^` types, which is exactly the point:
 # the static discipline forbids it, and this harness catches it the moment the
@@ -45,6 +64,14 @@ profile="${3:-release}"
 # leaky |t| must clear this (hard). ct |t| above CT_WARN warns but never fails.
 LEAK_MIN="${LEAK_MIN:-10}"
 CT_WARN="${CT_WARN:-10}"
+
+# address mode asserts on mean_rnd/mean_fix. the planted leak must slow the random
+# class by at least this factor (hard). the clean references are reported and warned
+# on, never failed -- same split as LEAK_MIN / CT_WARN above, and for the same
+# reason: on a loaded box a clean reference's ratio wanders (observed 0.75 to 1.00)
+# while the planted leak's does not fall below 1.29.
+ADDR_LEAK_MIN="${ADDR_LEAK_MIN:-1.10}"
+ADDR_REF_WARN="${ADDR_REF_WARN:-0.10}"
 
 fail() { echo "FAIL: $1" >&2; exit 1; }
 
@@ -91,10 +118,24 @@ out=$("$bin")
 echo "$out" | sed 's/^/  /'
 
 extract() { echo "$out" | awk -v n="$1" '$0 ~ ("name=" n " ") { for (i=1;i<=NF;i++) if ($i ~ /^abst=/) { sub("abst=","",$i); print $i } }'; }
+# mean_rnd / mean_fix. the ADDRESS mode asserts on this rather than on |t|, because
+# |t| divides by the sample variance and machine load inflates the variance without
+# moving the means. observed across five runs at load average 10: the ratio held at
+# 1.29-1.47 for the planted leak and 0.95-1.00 for the null control, while |t| for
+# the same leak swung between 3.3 and 461. the ratio is what survives a busy box.
+ratio() { echo "$out" | awk -v n="$1" '$0 ~ ("name=" n " ") { for (i=1;i<=NF;i++) { if ($i ~ /^mean_fix=/) { sub("mean_fix=","",$i); f=$i } if ($i ~ /^mean_rnd=/) { sub("mean_rnd=","",$i); r=$i } } if (f > 0) printf "%.4f", r/f }'; }
 ct_t=$(extract ct)
 leak_t=$(extract leak)
 [ -n "$ct_t" ]   || fail "no ct result parsed from harness output"
 [ -n "$leak_t" ] || fail "no leak result parsed from harness output"
+
+addr_leak_r=$(ratio addr_leak)
+addr_null_r=$(ratio addr_null)
+addr_ct_r=$(ratio addr_ct)
+addr_leak_t=$(extract addr_leak)
+addr_latency_t=$(extract addr_leak_in_latency_mode)
+[ -n "$addr_leak_r" ] || fail "no addr_leak result parsed from harness output"
+[ -n "$addr_null_r" ] || fail "no addr_null result parsed from harness output"
 
 echo
 rc=0
@@ -117,8 +158,38 @@ BEGIN {
     exit rc
 }' || rc=$?
 echo
+
+echo "address-trace mode (#2363) — asserted on the mean ratio, not |t|"
+awk -v lr="$addr_leak_r" -v nr="$addr_null_r" -v cr="$addr_ct_r" \
+    -v lt="$addr_leak_t" -v lat="$addr_latency_t" -v lmin="$ADDR_LEAK_MIN" -v ntol="$ADDR_REF_WARN" '
+BEGIN {
+    printf "  planted address leak    : mean_rnd/mean_fix = %s (must exceed %s)   |t| = %s\n", lr, lmin, lt
+    printf "  null control            : mean_rnd/mean_fix = %s (informational, warns past %s)\n", nr, ntol
+    printf "  masked scan (reference) : mean_rnd/mean_fix = %s\n", cr
+    printf "  SAME leak, latency mode : |t| = %s -- informational: this is the blind spot\n", lat
+    rc = 0
+    if (lr + 0 < lmin + 0) {
+        printf "FAIL: the planted ADDRESS leak was NOT detected (ratio %s < %s).\n", lr, lmin
+        printf "      most likely this machine has a last-level cache at or above the probe table\n"
+        printf "      size -- check `lscpu -C` and raise BIG in int/ct/src/addr.mach.\n"
+        rc = 1
+    } else {
+        printf "OK: the planted address leak was detected (ratio %s >= %s)\n", lr, lmin
+    }
+    d = nr - 1.0; if (d < 0) d = -d
+    if (d > ntol + 0) {
+        printf "WARN: the null control moved (ratio %s) -- runner noise, or the sampling is\n", nr
+        printf "      producing a signal of its own. re-run on a quiet machine before trusting\n"
+        printf "      the leak verdict above.\n"
+    } else {
+        printf "OK: the null control is flat (ratio %s)\n", nr
+    }
+    exit rc
+}' || rc=$?
+
+echo
 if [ "$rc" -eq 0 ]; then
-    echo "OK: ct harness passed — planted leak caught, constant-time reference clean"
+    echo "OK: ct harness passed — both planted leaks caught, constant-time references clean"
 else
     echo "int/ct: harness FAILED"
 fi
