@@ -105,6 +105,19 @@ sum(10, 20)            # instance: (i64, i64)
 sum(5::u8, 1::u32)     # instance: (u8, u32)
 ```
 
+A pack tail composes with generic parameters. The instance key is then the
+**product** of the type arguments and the element type-list, so `sink[u32](x)`
+and `sink[^u32](x)` over the same elements are two instances with two bodies,
+each typed and lowered against its own type arguments:
+
+```mach
+fun sink[T](t: T, va: ...) u32 { ... }
+
+sink[u32](p, 1u32)     # instance: [u32] over (u32)
+sink[u64](p, 1u32)     # instance: [u64] over (u32)
+sink[u32](p, 1u32, 2u64)   # instance: [u32] over (u32, u64)
+```
+
 Because a pack-tailed function has no single entry point, it is **not a
 stable-ABI symbol** — it cannot be the target of `ext fun` or a function
 pointer shared across compilation units. It is source-level only.

@@ -103,20 +103,26 @@ pub rec ValueInstance {
 }
 
 # one collected comptime variadic-pack instance awaiting body emission: a
-# `(decl, origin, pack element type-list)` triple plus the mangled symbol name
-# the instance is emitted under. mirrors `Instance` but keys on the concrete
-# TYPES the pack absorbs at a call site, so a pack-tailed function is
-# monomorphized once per distinct trailing arg-type sequence. the worklist
-# dedups by `name`
+# `(decl, origin, generic type-args, pack element type-list)` tuple plus the
+# mangled symbol name the instance is emitted under. mirrors `Instance` but keys
+# on BOTH the call's generic type-arguments and the concrete TYPES the pack
+# absorbs, so a pack-tailed function is monomorphized once per distinct
+# `(type-args x trailing arg-types)` pair (#2251). the worklist dedups by `name`
 # ---
 # decl:     DeclId of the pack-tailed function in `origin`'s AST
 # origin:   ModuleId that declares the function
+# args:     owned copy of the concrete generic type-argument sequence (by
+#           ordinal), nil for a non-generic pack tail; the substitution the
+#           instance body is lowered and re-typed under
+# arg_len:  number of generic type arguments
 # types:    owned copy of the pack element type-list (by pack ordinal)
 # type_len: number of pack element types
-# name:     instance linkage name (mangled, with the type-list suffix)
+# name:     instance linkage name (mangled, with both suffixes)
 pub rec PackInstance {
     decl:     id.DeclId;
     origin:   session.ModuleId;
+    args:     *type.TypeId;
+    arg_len:  u32;
     types:    *type.TypeId;
     type_len: u32;
     name:     intern.StrId;
@@ -427,6 +433,9 @@ pub fun dnit_context(lc: *LowerContext) {
     if (lc.pinsts != nil && lc.pinst_cap > 0) {
         var i: u32 = 0;
         for (i < lc.pinst_len) {
+            if (lc.pinsts[i].args != nil && lc.pinsts[i].arg_len > 0) {
+                A.deallocate[type.TypeId](lc.s.alloc, lc.pinsts[i].args, lc.pinsts[i].arg_len::usize);
+            }
             if (lc.pinsts[i].types != nil && lc.pinsts[i].type_len > 0) {
                 A.deallocate[type.TypeId](lc.s.alloc, lc.pinsts[i].types, lc.pinsts[i].type_len::usize);
             }
@@ -838,19 +847,23 @@ pub fun enqueue_value_instance(lc: *LowerContext, decl: id.DeclId, origin: sessi
     ret R.ok[bool, str](true);
 }
 
-# record a comptime variadic-pack instance `(decl, origin, type-list)` on the
-# per-module worklist under its mangled `name`, deduped by name (a linear scan,
-# as `enqueue_instance`). takes an OWNED copy of `types` so the caller's buffer
-# can be reused / freed; the copy is released when the context is torn down
+# record a comptime variadic-pack instance `(decl, origin, type-args, type-list)`
+# on the per-module worklist under its mangled `name`, deduped by name (a linear
+# scan, as `enqueue_instance`). takes OWNED copies of `args` and `types` so the
+# caller's buffers can be reused / freed; the copies are released when the
+# context is torn down
 # ---
 # lc:       the context
 # decl:     DeclId of the pack-tailed function in `origin`'s AST
 # origin:   ModuleId declaring the function
+# args:     generic type-argument sequence (copied), by ordinal
+# arg_len:  number of generic type arguments (0 for a non-generic pack tail)
 # types:    pack element type-list (copied), by pack ordinal
 # type_len: number of pack element types
 # name:     instance linkage name
 # ret:      true on success, or an allocation error
 pub fun enqueue_pack_instance(lc: *LowerContext, decl: id.DeclId, origin: session.ModuleId,
+                              args: *type.TypeId, arg_len: u32,
                               types: *type.TypeId, type_len: u32, name: intern.StrId) R.Result[bool, str] {
     var i: u32 = 0;
     for (i < lc.pinst_len) {
@@ -874,10 +887,21 @@ pub fun enqueue_pack_instance(lc: *LowerContext, decl: id.DeclId, origin: sessio
         lc.pinst_cap = new_cap;
     }
 
+    var args_copy: *type.TypeId = nil;
+    if (arg_len > 0) {
+        val res_args: R.Result[*type.TypeId, str] = A.allocate[type.TypeId](lc.s.alloc, arg_len::usize);
+        if (R.is_err[*type.TypeId, str](res_args)) { ret R.err[bool, str](R.unwrap_err[*type.TypeId, str](res_args)); }
+        args_copy = R.unwrap_ok[*type.TypeId, str](res_args);
+        memory.copy[type.TypeId](args_copy, args, arg_len::usize);
+    }
+
     var types_copy: *type.TypeId = nil;
     if (type_len > 0) {
         val res_copy: R.Result[*type.TypeId, str] = A.allocate[type.TypeId](lc.s.alloc, type_len::usize);
-        if (R.is_err[*type.TypeId, str](res_copy)) { ret R.err[bool, str](R.unwrap_err[*type.TypeId, str](res_copy)); }
+        if (R.is_err[*type.TypeId, str](res_copy)) {
+            if (args_copy != nil) { A.deallocate[type.TypeId](lc.s.alloc, args_copy, arg_len::usize); }
+            ret R.err[bool, str](R.unwrap_err[*type.TypeId, str](res_copy));
+        }
         types_copy = R.unwrap_ok[*type.TypeId, str](res_copy);
         memory.copy[type.TypeId](types_copy, types, type_len::usize);
     }
@@ -885,6 +909,8 @@ pub fun enqueue_pack_instance(lc: *LowerContext, decl: id.DeclId, origin: sessio
     var inst: PackInstance;
     inst.decl     = decl;
     inst.origin   = origin;
+    inst.args     = args_copy;
+    inst.arg_len  = arg_len;
     inst.types    = types_copy;
     inst.type_len = type_len;
     inst.name     = name;
@@ -1391,16 +1417,23 @@ pub fun instance_ref_sig(lc: *LowerContext, decl_id: id.DeclId, origin: session.
 # The pack expands to `type_len` concrete element parameters after the leading
 # fixed ones, so the signature is built by `pack_instance_sig` (not the whole
 # declared function type), exactly as the drained definition builds it. Binds the
-# origin module's typing so the return and fixed-parameter types resolve against
-# the declaring module, then restores the caller's state.
+# origin module's typing AND the instance's generic substitution (as the pack
+# drain does), so a `T`-typed fixed parameter or return lowers to the concrete
+# argument here exactly as it does in the definition; without it the reference
+# erased `T` to pointer width while the call passed the concrete value, which the
+# IR verifier rejected as a call-argument type disagreement (#2251). Restores the
+# caller's state afterwards.
 # ---
 # lc:       the referencing context
 # decl_id:  DeclId of the pack-tailed template in `origin`'s AST
 # origin:   ModuleId declaring the template
+# args:     the instance's concrete generic type-arguments, or nil
+# arg_len:  number of generic type arguments
 # types:    the concrete pack element type-list (by pack ordinal)
 # type_len: number of pack element types
 # ret:      the interned IRT_FN, or an error
 pub fun pack_instance_ref_sig(lc: *LowerContext, decl_id: id.DeclId, origin: session.ModuleId,
+                              args: *type.TypeId, arg_len: u32,
                               types: *type.TypeId, type_len: u32) R.Result[ir_type.IrTypeId, str] {
     val oa: *ast.Ast = session.module_ast(lc.s, origin);
     if (oa == nil) { ret R.err[ir_type.IrTypeId, str]("lower: pack-instance-reference origin AST not registered"); }
@@ -1417,8 +1450,8 @@ pub fun pack_instance_ref_sig(lc: *LowerContext, decl_id: id.DeclId, origin: ses
     val home_subst_len: u32                = lc.subst_len;
     lc.a           = oa;
     lc.sema_result = osema;
-    lc.subst       = nil;
-    lc.subst_len   = 0;
+    lc.subst       = args;
+    lc.subst_len   = arg_len;
 
     var res_sig: R.Result[ir_type.IrTypeId, str] = R.err[ir_type.IrTypeId, str]("");
     val res_ret_ir: R.Result[ir_type.IrTypeId, str] = function_return_ir(lc, decl_id);

@@ -171,10 +171,13 @@ run it with `bash int/ct/ct.sh`.
 
 What does not hold — the known open holes:
 
-- **a pack-tailed generic loses its type arguments at monomorphization**, so its
-  `$each` body is typed against the raw parameter and a value that is secret at
-  the instance is not seen as one — it reaches a variadic pack with no
-  diagnostic. Proven, security-blocking (briar-systems/mach#2251).
+- **a pack-tailed function's statements outside its `$each` are never re-typed
+  per instance**, so a `T`-typed local declared there and used inside the unroll
+  is typed against the raw parameter and a value that is secret at the instance
+  is not seen as one — it reaches a variadic pack with no diagnostic. The `$each`
+  body itself, and every parameter, are typed against the concrete arguments
+  (briar-systems/mach#2251); this is the remainder. Proven, security-blocking
+  (briar-systems/mach#2254).
 - **`$fields` reflection projection inside a generic erases a secret field's
   secrecy**, which discloses the secret. Proven, security-blocking
   (briar-systems/mach#2168).
