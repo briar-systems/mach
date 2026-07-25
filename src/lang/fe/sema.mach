@@ -60,6 +60,9 @@ fwd context.SemaDeps;
 fwd context.FieldEntry;
 fwd context.FieldTable;
 fwd context.SemaContext;
+fwd context.InstWorklist;
+fwd context.inst_worklist_new;
+fwd context.inst_worklist_free;
 fwd context.resolved_type_of;
 fwd context.module_sema_for;
 fwd context.decl_type_for;
@@ -160,11 +163,12 @@ pub fun sema(
     ret build_result(?sc);
 }
 
-# re-type a `$each a in va` pack-unroll body for one concrete element (#1475)
+# re-type a deferred `$each` body for one concrete element (#1475, #1523)
 #
-# A pack element's type is fixed only at the call site, so the body cannot be
-# typed at the original sema pass. At monomorphization the monomorphizer binds
-# the loop variable in the comptime context to the element's CT_KIND_PACK_ELEM
+# A pack element's type - and a `$fields(T)` unroll over a generic parameter - is
+# fixed only at monomorphization, so the body cannot be typed at the original sema
+# pass. This is therefore the ONLY pass that ever type-checks that body. The
+# monomorphizer binds the loop variable in the comptime context to the element's
 # descriptor (so `infer_ident` types `a` to the element type) and calls this to
 # write the body expressions' types into the origin module's shared `expr_type`
 # array - exactly the array lowering then reads. Distinct elements and instances
@@ -172,6 +176,19 @@ pub fun sema(
 # typing and emission), so one shared array suffices. The transient context
 # reuses the origin SemaResult's arrays in place rather than allocating, so it
 # must not be torn down.
+#
+# Being the sole typing pass over that body, it carries both halves of per-instance
+# validation rather than deferring them to the module sema pass that already ran:
+#
+#   - the enclosing instance's substitution (#2174), so a body naming a generic
+#     parameter is typed against the concrete instance type - which makes the
+#     #1645 leakage gates fire on a secret arriving through a parameter, and names
+#     the concrete type in every diagnostic the body raises; and
+#   - the caller's constant-time re-validation worklist (#2177), drained here
+#     rather than by the sema pass, so a generic instantiated only from inside this
+#     body is re-validated under its concrete type arguments like every other
+#     instantiation. The worklist is owned across a whole module's lowering, so its
+#     `drained` cursor validates each distinct instance exactly once.
 # ---
 # s:           the origin module's session
 # a:           the origin module's Ast (declares the pack-tailed template)
@@ -183,7 +200,11 @@ pub fun sema(
 # fn_ret:      the instance's semantic return type (checks any body `ret`)
 # body_start:  index of the first `$each` body statement
 # body_len:    number of `$each` body statements
-# ret:         true once the body is typed, or the first inference error
+# subst:       the enclosing instance's generic substitution, or nil outside one
+# subst_len:   number of substitution arguments
+# insts:       the caller-owned CT re-validation worklist, drained before returning
+# ret:         true once the body is typed and its instances re-validated, or the
+#              first inference error
 pub fun reinfer_pack_each_body(
     s:           *session.Session,
     a:           *ast.Ast,
@@ -194,8 +215,16 @@ pub fun reinfer_pack_each_body(
     sema_result: *context.SemaResult,
     fn_ret:      type.TypeId,
     body_start:  u32,
-    body_len:    u32
+    body_len:    u32,
+    subst:       *type.TypeId,
+    subst_len:   u32,
+    insts:       *context.InstWorklist
 ) R.Result[bool, str] {
+    # the worklist is the caller's contract, not an optional extra: without one a
+    # generic instantiated from this body would be silently dropped from the CT
+    # re-validation - the #2177 disclosure - so a nil is a loud invariant break.
+    if (insts == nil) { ret R.err[bool, str]("internal: #2177 deferred-body re-inference: no constant-time re-validation worklist supplied (invariant violated)"); }
+
     var sc: context.SemaContext;
     sc.s          = s;
     sc.a          = a;
@@ -213,13 +242,16 @@ pub fun reinfer_pack_each_body(
     sc.in_comptime_gate = false;
     sc.in_fin           = false;
     sc.fin_loop_depth   = 0;
-    sc.subst            = nil;
-    sc.subst_len        = 0;
-    sc.subst_fn         = nil;
-    sc.insts            = nil;
-    sc.collect_insts    = false;
+    sc.subst            = subst;
+    sc.subst_len        = subst_len;
+    sc.subst_fn         = generics.substitute;
+    sc.insts            = insts;
+    sc.collect_insts    = true;
 
-    ret infer_stmt_list(?sc, body_start, body_len, fn_ret);
+    val res_body: R.Result[bool, str] = infer_stmt_list(?sc, body_start, body_len, fn_ret);
+    if (R.is_err[bool, str](res_body)) { ret res_body; }
+
+    ret drain_instances(?sc, deps);
 }
 
 # copy `n` TypeIds from `src` into `dst`
@@ -251,12 +283,35 @@ fun free_typeids(alloc: *A.Allocator, arr: *type.TypeId, n: usize) {
 # ret: true once drained, or the first internal error (gate violations are reported
 #      diagnostics, not errors)
 fun drain_revalidations(sc: *context.SemaContext) R.Result[bool, str] {
-    if (sc.insts == nil)          { ret R.ok[bool, str](true); }
-    if (sc.insts.len == 0)        { ret R.ok[bool, str](true); }
+    if (sc.insts == nil)                       { ret R.ok[bool, str](true); }
+    if (sc.insts.drained >= sc.insts.len)      { ret R.ok[bool, str](true); }
 
     val dr: R.Result[context.SemaDeps, str] = collect_module_deps(sc.s);
     if (R.is_err[context.SemaDeps, str](dr)) { ret R.err[bool, str](R.unwrap_err[context.SemaDeps, str](dr)); }
     var full_deps: context.SemaDeps = R.unwrap_ok[context.SemaDeps, str](dr);
+
+    val r: R.Result[bool, str] = drain_instances(sc, ?full_deps);
+    free_module_deps(sc.s, ?full_deps);
+    ret r;
+}
+
+# drain the worklist against an already-built module-deps snapshot (#2157, #2177)
+#
+# The drain proper, split out so an inference episode that already holds a
+# module-spanning snapshot - the lowering-time deferred-body re-inference, which
+# built one to resolve the body's cross-module references - reuses it rather than
+# rebuilding it per element. Reads each entry by value before re-validating, since
+# re-validation may grow the worklist (the owned `args` buffers are separate
+# allocations, so their pointers stay stable across that growth). The `drained`
+# cursor persists on the worklist, so repeated calls over one shared worklist
+# re-validate each distinct instance exactly once.
+# ---
+# sc:   the context owning the worklist and the diagnostic sink
+# deps: a module-spanning typing snapshot for cross-module instance bodies
+# ret:  true once drained, or the first internal error (gate violations are
+#       reported diagnostics, not errors)
+fun drain_instances(sc: *context.SemaContext, deps: *context.SemaDeps) R.Result[bool, str] {
+    if (sc.insts == nil) { ret R.ok[bool, str](true); }
 
     for (sc.insts.drained < sc.insts.len) {
         val idx:     u32              = sc.insts.drained;
@@ -266,15 +321,10 @@ fun drain_revalidations(sc: *context.SemaContext) R.Result[bool, str] {
         val args:    *type.TypeId     = sc.insts.items[idx].args;
         val arg_len: u32              = sc.insts.items[idx].arg_len;
 
-        val r: R.Result[bool, str] = revalidate_one(sc, ?full_deps, origin, decl, args, arg_len, sig);
-        if (R.is_err[bool, str](r)) {
-            free_module_deps(sc.s, ?full_deps);
-            ret r;
-        }
+        val r: R.Result[bool, str] = revalidate_one(sc, deps, origin, decl, args, arg_len, sig);
+        if (R.is_err[bool, str](r)) { ret r; }
         sc.insts.drained = sc.insts.drained + 1;
     }
-
-    free_module_deps(sc.s, ?full_deps);
     ret R.ok[bool, str](true);
 }
 
@@ -388,13 +438,20 @@ fun revalidate_one(sc: *context.SemaContext, deps: *context.SemaDeps, origin: se
     val ret_ty: type.TypeId = context.resolved_type_of(?tsc, d.data.fun_.return_type);
 
     # fold this body's comptime gates against the origin module via the transient
-    # context; restored to uninstalled afterward (the drain re-installs per instance).
-    val tscp: *context.SemaContext = ?tsc;
+    # context, then put back whatever was installed. the drain also runs during
+    # lowering (#2177), where the origin's context carries LOWERING's resolvers and
+    # the rest of that module's lowering still needs them - clearing them here would
+    # strip a live installation, so save and restore rather than clear.
+    val tscp:      *context.SemaContext = ?tsc;
+    val saved_ffn: *u8                  = octx.field_fn;
+    val saved_fd:  ptr                  = octx.field_data;
+    val saved_tfn: *u8                  = octx.type_fn;
+    val saved_td:  ptr                  = octx.type_data;
     comptime.set_field_resolver(octx, context.resolve_field_member::*u8, tscp::ptr);
     comptime.set_type_resolver(octx, context.resolve_type_comparison_operand::*u8, tscp::ptr);
     val res: R.Result[bool, str] = infer_stmt(?tsc, d.data.fun_.body, ret_ty);
-    comptime.set_field_resolver(octx, nil, nil);
-    comptime.set_type_resolver(octx, nil, nil);
+    comptime.set_field_resolver(octx, saved_ffn, saved_fd);
+    comptime.set_type_resolver(octx, saved_tfn, saved_td);
 
     free_typeids(sc.s.alloc, scratch_expr, oa.expr_len);
     free_typeids(sc.s.alloc, scratch_decl, oa.decl_len);
