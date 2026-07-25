@@ -5,6 +5,116 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.2.2] - 2026-07-24
+
+The correctness release. Two of its fixes carry it: on mos6502 a secret integer
+`==` did not merely leak through a timing branch, it answered **wrong for every
+input** — 65280 of the 65536 ordered byte pairs — and three build phases
+returned success while an error already sat on the diagnostic sink, so a program
+the compiler had rejected still produced an artifact. Around them, a Windows
+image stops carrying two `.rdata` sections, `--emit-asm` renders what the
+encoder actually emitted rather than a second printer's account of it, and CI
+gates the `dev` → `main` release merge on darwin. Built with mach 4.2.1.
+
+(**The constant-time support in this release is an experimental preview and its
+guarantee is not complete.** The flow typing, the codegen taint contract, the
+translation validator, and the timing harness are all in, and #2158 and #2159
+close below — but proven secret-disclosure paths remain open. A generic
+instantiated inside a variadic-pack `$each` body is never constant-time
+re-validated, and the program prints the secret with zero diagnostics (#2177).
+`$fields` reflection projection inside a generic erases a secret field's secrecy
+(#2168). A secret pointer dereference is gated only by the validator, which runs
+inside `#[oblivious]` functions alone, so anywhere else it compiles silently
+(#2191). Deep secrecy placement still over-rejects differing-shape aggregates
+that lack field offsets (#2167). Two new false positives join them, both failing
+safe — they reject a correct program rather than accept a leaking one: the
+validator over-taints a wide secret on a narrow-ALU target and rejects a
+public-count shift as a secret memory address (#2195), and a literal shift count
+coerces to `^T` and inherits secrecy, tripping the constant-time shift gate
+(#2196). The `^` / `#[oblivious]` surface has not been audited and is not sound
+today. **Do not build production cryptography on this version.** Epic #1643
+stays open.)
+
+### Fixed
+- mos6502: **a secret integer `==` / `!=` compiles branchlessly, and answers
+  correctly.** The emitted sequence read the compare's zero flag after
+  `LDA #$00` — and `LDA` sets `Z` from the byte it loads, so `Z` was always 1,
+  the branch was a constant, and `==` returned 1 while `!=` returned 0 for
+  **every** input: 65280 of 65536 ordered byte pairs wrong on both relations.
+  A leak and a miscompile in one sequence. Every relation now lands in the carry
+  and is read out through fixed-cycle immediate / zero-page / accumulator forms,
+  with no branch opcode anywhere in the image. Both enforcement layers had
+  passed the old form — the compile-time constant-time gate and the translation
+  validator each read pre-selection MIR and trust the encoders to be
+  timing-preserving — so it surfaced only by executing the emitted bytes, not by
+  reading the lowering. The end-to-end shift-gate compile-reject test #2149 asked
+  for lands with it. Every other target is byte-identical (#2158, #2149).
+- build: **`codegen`, `emit`, and `link` no longer return success with an error
+  on the diagnostic sink**, so a program the compiler has already rejected can no
+  longer produce an artifact. The check moved to `run_phase` — the single
+  dispatch point every phase flows through — where it covers all eight phases
+  uniformly and a phase added later inherits it, rather than being restated in
+  each; `sema_phase`'s own copy folded into it. A warning-severity diagnostic
+  still does not fail the build (#2173).
+- coff: **a Windows image carries one `.rdata` section, not two.** The PE exec
+  writer named each linker load segment from its permission bits alone, so a
+  plain rodata segment and a RELRO segment — both read-only, neither writable
+  nor executable — collapsed onto the same name, and every image built since
+  #2126 shipped the duplicate. Sections are now named by kind: RELRO-ness is
+  derived from whether the base-relocation stream touches the segment, and that
+  segment is named `.data.rel.ro`, matching the COFF object writer's own
+  convention so the two writers agree. That name is 12 bytes and does not fit
+  COFF's inline 8-byte name field, so exec-writer segment names now take the
+  same `/<offset>` string-table indirection the debug names already used —
+  closing a latent overrun into the next header field that the permission-only
+  naming could never reach. The loader keys sections by table entry rather than
+  name, so this is cosmetic to it; it misrepresented the image to anything that
+  groups sections by name. ELF and Mach-O output are byte-identical (#2176).
+- asm: **`--emit-asm` renders the encoder's own instruction stream.** The `.s`
+  came from a second, independent MIR-level printer walking the post-regalloc
+  MIR beside the encoder, and the two disagreed at scale: on x86_64 the old
+  artifact accounted for 58,798 of the object's 69,976 instructions, with all 26
+  modules of the cross-check corpus diverging, and 767 printed prologues carried
+  0 epilogues. Worst on vector code — a module whose object holds **858 SIMD
+  instructions** rendered **zero** of them, its vectorized loops appearing as
+  scalar `mov` / `add` / `cmp.eq`, so the artifact read as if auto-vectorization
+  had fired nowhere. The text now falls out of the encoder itself through a
+  notifying sink, under a totality guard that fails the build naming any opcode
+  whose bytes went unrendered: a printer that silently skips an instruction is
+  no longer expressible. The guard earned its keep immediately, finding three
+  encoder paths that emitted two instructions under one notification and five
+  that named an opcode rather than the form emitted — including a dropped `LOCK`
+  prefix that made an atomic read-modify-write read as a plain one. Emitted
+  objects are byte-identical, with and without the flag; this is artifact-only
+  (#2187).
+- ci: **the darwin lane gates the `dev` → `main` release merge.** It ran only
+  from a tag push or a manual dispatch before, so nothing in the merge path
+  invoked it and #2172 reached a pushed `v4.2.0` tag through a 17/17-green
+  release PR. The lane is now a reusable workflow called by both CD and a
+  `ci.yml` job conditioned on a `main` base, and CD's release job asserts its
+  archive set against the build matrices themselves, so an incomplete publish
+  cannot go out green either. Merges into `dev` schedule no macOS runner
+  (#2179).
+
+### Changed
+- ct: **`#[oblivious]` is refused when the target's back half emits a whole
+  module** — SPIR-V today — rather than accepted where nothing enforced it. That
+  path forks to the emitter right after MIR lowering and returned before the
+  translation validator ran, so the compiler reported success on a contract it
+  had not checked. Running the validator there would have certified an artifact
+  nobody executes: a vendor driver recompiles the module under no constant-time
+  contract, onto hardware whose timing channels this leakage model does not
+  describe. Refusal is the rule already applied to inline assembly — reject the
+  unverifiable construct rather than trust it. A secrecy-transparent function
+  still compiles for SPIR-V, and secret-free code is untouched (#2159).
+- asm: **`--emit-asm` now fails with a diagnostic on riscv64 and aarch64**
+  instead of writing a misleading file and reporting success. The riscv64
+  artifact accounted for 49,380 of 102,503 instructions — 48% complete — and
+  aarch64 wrote a 0-byte file. The refusal names the issue that restores each:
+  #2193 for riscv64, #2194 for aarch64. x86_64 is unaffected. Anything scripted
+  against the flag on those two targets now stops rather than reads a wrong
+  answer (#2187).
+
 ## [4.2.1] - 2026-07-24
 
 The release that delivers 4.2.0. Its entire payload — auto-vectorization, loop

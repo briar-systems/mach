@@ -177,10 +177,18 @@ What does not hold — the known open holes:
 - **`$fields` reflection projection inside a generic erases a secret field's
   secrecy**, which discloses the secret. Proven, security-blocking
   (briar-systems/mach#2168).
-- a secret integer `==` / `!=` compiles a timing branch on targets without
-  comparison flags (briar-systems/mach#2158)
+- a **secret pointer dereference is gated only by the translation validator**,
+  which runs inside `#[oblivious]` functions alone, so anywhere else it compiles
+  with no diagnostic — where the equivalent secret *index* is a source-level
+  error everywhere (briar-systems/mach#2191)
 - deep secrecy placement over-rejects differing-shape aggregates that lack field
   offsets — sound but too strict (briar-systems/mach#2167)
+- the validator over-taints a wide secret on a narrow-ALU target, rejecting a
+  public-count shift as a secret memory address — a false positive; it fails safe
+  (briar-systems/mach#2195)
+- a literal shift count coerces to `^T` and inherits secrecy, tripping the
+  constant-time shift gate — a false positive; it fails safe
+  (briar-systems/mach#2196)
 
 The validator's scope is the lowered MIR; it trusts instruction selection, width
 legalization, register allocation, and encoding to be timing-preserving.
