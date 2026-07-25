@@ -25,6 +25,11 @@
 #                 image and `-g` is loadable-byte additive (PT_LOAD segments identical).
 #                 the one producer that needs external validators (llvm-dwarfdump,
 #                 readelf); it runs only on the ELF debug-info legs, which install them.
+#   spirv-val   — validate every `.spv` module a finished-module target delivered
+#                 with the Khronos validator (spirv-tools). the target links
+#                 nothing, so there is no binary to run and the module tree is the
+#                 artifact; the external validator is what makes this a validity
+#                 check rather than a round-trip through mach's own reader.
 #   vector-emit — disassemble the case's own objects and report, per function,
 #                 whether the compiler EMITTED packed SIMD (#2207). the observable
 #                 execution cannot produce: a vectorizer that silently stops firing
@@ -185,6 +190,32 @@ produce_built() {
         echo "int: built: artifact missing or empty" >&2
         return 2
     fi
+}
+
+# produce_spirv_val <runmode> <target> <binary>
+# validate every SPIR-V module the build delivered, with the Khronos validator.
+# a finished-module target has no linked binary: the delivery is the module tree,
+# so this globs the case's output root (the directory <binary> would have been
+# written into) and runs spirv-val over each `.spv`. an EXTERNAL validator is the
+# point — mach reading back its own bytes proves self-consistency, not validity.
+# the observable is the module count plus the verdict, so a build that silently
+# stopped emitting fails on the count rather than passing vacuously.
+produce_spirv_val() {
+    out_dir=$(dirname "$3")
+    if ! command -v spirv-val >/dev/null 2>&1; then
+        echo "int: spirv-val: the validator is not installed (spirv-tools)" >&2
+        return 2
+    fi
+    n=0
+    for m in $(find "$out_dir" -name '*.spv' | sort); do
+        spirv-val "$m" || return 1
+        n=$((n + 1))
+    done
+    if [ "$n" -eq 0 ]; then
+        echo "int: spirv-val: the build delivered no .spv module" >&2
+        return 2
+    fi
+    printf 'modules=%d validator=clean\n' "$n"
 }
 
 # resolve_dwarfdump — print an llvm-dwarfdump on PATH, preferring the unversioned
@@ -412,6 +443,7 @@ produce() {
         flat-loader) produce_flat_loader "$@" ;;
         built)       produce_built "$@" ;;
         debuginfo)   produce_debuginfo "$@" ;;
+        spirv-val)   produce_spirv_val "$@" ;;
         vector-emit) produce_vector_emit "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
