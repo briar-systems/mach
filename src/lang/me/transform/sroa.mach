@@ -57,6 +57,7 @@
 #
 # Release pipeline only. A debug (`-O0`) build never runs it and stays byte-identical.
 
+use std.allocator.page;
 use std.collections.map;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -68,14 +69,19 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
+use mach.lang.intern;
 use mach.lang.me.ir;
+use mach.lang.me.ir.builder;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
 use mach.lang.me.ir.mutate;
 use ir_type: mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
+use mach.lang.me.pass.dce;
+use mach.lang.me.pass.mem2reg;
 use mach.lang.source;
 use mach.lang.target;
+use mach.lang.target.resolved;
 
 # sentinel for an unset entry in a u32 index map
 val NONE_U32: u32 = 0xFFFFFFFF;
@@ -1609,4 +1615,603 @@ fun erase_test(ctx: ptr, iid: id.InstructionId) bool {
     if (st.erase[iid::u32])      { ret true; }
     val c: u32 = st.cand_of[iid::u32];
     ret c != NONE_U32 && st.cand_out[c] == false;
+}
+
+# select the host-shaped target the tests measure aggregate sizes against
+# (test helper)
+# ---
+# reg: registry to populate in place
+# out: receives the resolved target
+# ret: 0 on success, 1 on failure
+fun ut_target(reg: *target.TargetRegistry, out: *resolved.Target) i32 {
+    @reg = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(reg))) { ret 1; }
+    val r: R.Result[resolved.Target, str] = target.select(reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[resolved.Target, str](r)) { ret 1; }
+    @out = R.unwrap_ok[resolved.Target, str](r);
+    ret 0;
+}
+
+# count the live instructions of `kind` across every block list of `fn`, the block
+# lists being the liveness source of truth (test helper)
+# ---
+# fn:   the function to scan
+# kind: the opcode to tally
+# ret:  the number of live instructions of that opcode
+fun ut_count(fn: *ir.Function, kind: instruction.InstrKind) u32 {
+    var n: u32 = 0;
+    var b: u32 = 0;
+    for (b < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[b];
+        var i: u32 = 0;
+        for (i < blk.instr_count) {
+            if (fn.instrs[blk.instructions[i]::u32].kind == kind) { n = n + 1; }
+            i = i + 1;
+        }
+        var p: u32 = 0;
+        for (p < blk.phi_count) {
+            if (fn.instrs[blk.phis[p]::u32].kind == kind) { n = n + 1; }
+            p = p + 1;
+        }
+        b = b + 1;
+    }
+    ret n;
+}
+
+# the operand of `fn`'s first live OP_RET, or a null value when it has none
+# (test helper)
+# ---
+# fn:  the function to scan
+# ret: the returned Value
+fun ut_ret_value(fn: *ir.Function) value.Value {
+    var b: u32 = 0;
+    for (b < fn.block_count) {
+        val blk: *ir.Block = ?fn.blocks[b];
+        if (blk.terminator != id.INSTR_NIL) {
+            val t: *instruction.Instruction = ?fn.instrs[blk.terminator::u32];
+            if (t.kind == instruction.OP_RET && t.operand_count >= 1) { ret t.operands[0]; }
+        }
+        b = b + 1;
+    }
+    ret value.const_null(ir_type.IRT_NIL);
+}
+
+# intern `{i8, i64}`, the two-field record the split tests build over (test helper)
+# ---
+# m:   the module owning the type table
+# out: receives the record type
+# ret: 0 on success, 1 on failure
+fun ut_rec2(m: *ir.Module, out: *ir_type.IrTypeId) i32 {
+    val r8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
+    if (R.is_err[ir_type.IrTypeId, str](r8)) { ret 1; }
+    val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](r64)) { ret 1; }
+    var fields: [2]ir_type.IrTypeId;
+    fields[0] = R.unwrap_ok[ir_type.IrTypeId, str](r8);
+    fields[1] = R.unwrap_ok[ir_type.IrTypeId, str](r64);
+    val rs: R.Result[ir_type.IrTypeId, str] = ir_type.intern_struct(?m.types, ?fields[0], 2, 0);
+    if (R.is_err[ir_type.IrTypeId, str](rs)) { ret 1; }
+    @out = R.unwrap_ok[ir_type.IrTypeId, str](rs);
+    ret 0;
+}
+
+# emit `gep base, 0, k` against the aggregate `ty` (test helper)
+# ---
+# b:    the construction cursor
+# m:    the module owning the type table
+# base: the aggregate's address
+# ty:   the aggregate type
+# k:    the field ordinal
+# ret:  the field address, or an error
+fun ut_gep(b: *builder.Builder, m: *ir.Module, base: value.Value, ty: ir_type.IrTypeId, k: u64) R.Result[value.Value, str] {
+    val r: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](r)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](r)); }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r);
+    var idx: [2]value.Value;
+    idx[0] = value.const_int(0, i64t);
+    idx[1] = value.const_int(k, i64t);
+    ret builder.emit_gep(b, base, ty, ?idx[0], 2);
+}
+
+# a non-escaping record local reaches registers: `{i8, i64}` built by a memzero plus
+# per-field stores and then read back is split into two slots, both promoted, so no
+# alloca and no memzero survive and the returned payload IS the stored parameter --
+# the #2205 acceptance criterion, checked by counts
+#
+# Disabling the pass (an early `ret R.ok[bool, str](false)` in `run`) leaves 1 alloca
+# and 1 memzero, and the return value stays a load, so this test fails.
+test "mach.lang.me.transform.sroa.run:splits_a_local_record_into_registers" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    var tgt: resolved.Target;
+    if (ut_target(?reg, ?tgt) != 0) { ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    var rec: ir_type.IrTypeId;
+    if (ut_rec2(?m, ?rec) != 0) { ir.dnit(?m); ret 1; }
+    val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](r64)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r64);
+    val r8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
+    if (R.is_err[ir_type.IrTypeId, str](r8)) { ir.dnit(?m); ret 1; }
+    val i8t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r8);
+
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+
+    var b: builder.Builder = builder.init(?m);
+    builder.set_function(?b, fn);
+    val rb: R.Result[id.BlockId, str] = builder.new_block(?b);
+    if (R.is_err[id.BlockId, str](rb)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?b, R.unwrap_ok[id.BlockId, str](rb));
+
+    var code: i32 = 0;
+    val ra: R.Result[value.Value, str] = builder.emit_alloca(?b, rec, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](ra)) { ir.dnit(?m); ret 1; }
+    val s: value.Value = R.unwrap_ok[value.Value, str](ra);
+    if (R.is_err[bool, str](builder.emit_memzero(?b, s, rec))) { code = 1; }
+
+    val g0: R.Result[value.Value, str] = ut_gep(?b, ?m, s, rec, 0);
+    if (R.is_err[value.Value, str](g0)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?b, value.const_int(1, i8t), R.unwrap_ok[value.Value, str](g0)))) { code = 1; }
+    val g1: R.Result[value.Value, str] = ut_gep(?b, ?m, s, rec, 1);
+    if (R.is_err[value.Value, str](g1)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?b, value.param(0, i64t), R.unwrap_ok[value.Value, str](g1)))) { code = 1; }
+
+    val h1: R.Result[value.Value, str] = ut_gep(?b, ?m, s, rec, 1);
+    if (R.is_err[value.Value, str](h1)) { ir.dnit(?m); ret 1; }
+    val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](h1), i64t);
+    if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+
+    # before: one aggregate slot, one whole-slot zero fill.
+    if (ut_count(fn, instruction.OP_ALLOCA)  != 1) { code = 1; }
+    if (ut_count(fn, instruction.OP_MEMZERO) != 1) { code = 1; }
+
+    val rs: R.Result[bool, str] = run(?m, ?tgt);
+    if (R.is_err[bool, str](rs))              { code = 1; }
+    or { if (!R.unwrap_ok[bool, str](rs))     { code = 1; } }
+    if (R.is_err[bool, str](mem2reg.run(?m))) { code = 1; }
+    if (R.is_err[bool, str](dce.run(?m)))     { code = 1; }
+
+    # after: nothing in memory, and the payload flows straight from the parameter.
+    if (ut_count(fn, instruction.OP_ALLOCA)  != 0) { code = 1; }
+    if (ut_count(fn, instruction.OP_MEMZERO) != 0) { code = 1; }
+    if (ut_count(fn, instruction.OP_LOAD)    != 0) { code = 1; }
+    if (ut_count(fn, instruction.OP_STORE)   != 0) { code = 1; }
+    val rv: value.Value = ut_ret_value(fn);
+    if (rv.kind != value.VAL_PARAM)  { code = 1; }
+    if (rv.data.param_ix != 0)       { code = 1; }
+
+    ir.dnit(?m);
+    ret code;
+}
+
+# open a fresh function whose body is `s = alloca rec; memzero s; store p0 -> s.1`,
+# leaving the construction cursor in its entry block so the caller can append the use
+# under test and a terminator (test helper)
+# ---
+# m:    the module to add the function to
+# b:    the construction cursor, positioned on the new function's entry block
+# rec:  the record type of the local
+# slot: receives the local's slot pointer
+# ret:  the new function's index, or NONE_U32 on failure
+fun ut_build_local(m: *ir.Module, b: *builder.Builder, rec: ir_type.IrTypeId, slot: *value.Value) u32 {
+    val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](r64)) { ret NONE_U32; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r64);
+
+    val rf: R.Result[u32, str] = ir.function_add(m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ret NONE_U32; }
+    val ix: u32 = R.unwrap_ok[u32, str](rf);
+
+    builder.set_function(b, ?m.functions[ix]);
+    val rb: R.Result[id.BlockId, str] = builder.new_block(b);
+    if (R.is_err[id.BlockId, str](rb)) { ret NONE_U32; }
+    builder.set_block(b, R.unwrap_ok[id.BlockId, str](rb));
+
+    val ra: R.Result[value.Value, str] = builder.emit_alloca(b, rec, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](ra)) { ret NONE_U32; }
+    @slot = R.unwrap_ok[value.Value, str](ra);
+    if (R.is_err[bool, str](builder.emit_memzero(b, @slot, rec))) { ret NONE_U32; }
+
+    val g1: R.Result[value.Value, str] = ut_gep(b, m, @slot, rec, 1);
+    if (R.is_err[value.Value, str](g1)) { ret NONE_U32; }
+    if (R.is_err[bool, str](builder.emit_store(b, value.param(0, i64t), R.unwrap_ok[value.Value, str](g1)))) { ret NONE_U32; }
+    ret ix;
+}
+
+# every form that can defeat the analysis really does, and each leaves its record
+# whole: a `::` / `:~` reinterpret of the slot (an OP_BITCAST), a gep whose field
+# index is not a constant, the slot crossing the ABI boundary as a by-value return,
+# and a field address itself escaping into a call. All four in one module, so the
+# pass must decline every one of them rather than the module as a whole
+test "mach.lang.me.transform.sroa.run:declines_each_defeating_form" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    var tgt: resolved.Target;
+    if (ut_target(?reg, ?tgt) != 0) { ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    var rec: ir_type.IrTypeId;
+    if (ut_rec2(?m, ?rec) != 0) { ir.dnit(?m); ret 1; }
+    val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](r64)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r64);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val rv: R.Result[ir_type.IrTypeId, str] = ir_type.intern_void(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rv)) { ir.dnit(?m); ret 1; }
+    val voidt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rv);
+
+    val rc: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, ir.FN_FLAG_EXTERN);
+    if (R.is_err[u32, str](rc)) { ir.dnit(?m); ret 1; }
+    val callee: value.Value = value.fn(R.unwrap_ok[u32, str](rc), ptrt);
+
+    var code: i32 = 0;
+    var b: builder.Builder = builder.init(?m);
+    var slot: value.Value;
+
+    # a `:~` reinterpret of the record's storage
+    val f_cast: u32 = ut_build_local(?m, ?b, rec, ?slot);
+    if (f_cast == NONE_U32) { ir.dnit(?m); ret 1; }
+    if (R.is_err[value.Value, str](builder.emit_bitcast(?b, slot, ptrt))) { code = 1; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?b)))                   { code = 1; }
+
+    # a gep whose field ordinal is a run-time value
+    val f_var: u32 = ut_build_local(?m, ?b, rec, ?slot);
+    if (f_var == NONE_U32) { ir.dnit(?m); ret 1; }
+    var idx: [2]value.Value;
+    idx[0] = value.const_int(0, i64t);
+    idx[1] = value.param(0, i64t);
+    if (R.is_err[value.Value, str](builder.emit_gep(?b, slot, rec, ?idx[0], 2))) { code = 1; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?b)))                          { code = 1; }
+
+    # the record crossing the ABI boundary as a by-value return
+    val f_ret: u32 = ut_build_local(?m, ?b, rec, ?slot);
+    if (f_ret == NONE_U32) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?b, value.retype(slot, rec)))) { code = 1; }
+
+    # a field address escaping into a call
+    val f_field: u32 = ut_build_local(?m, ?b, rec, ?slot);
+    if (f_field == NONE_U32) { ir.dnit(?m); ret 1; }
+    val g0: R.Result[value.Value, str] = ut_gep(?b, ?m, slot, rec, 0);
+    if (R.is_err[value.Value, str](g0)) { ir.dnit(?m); ret 1; }
+    var args: [1]value.Value;
+    args[0] = R.unwrap_ok[value.Value, str](g0);
+    if (R.is_err[value.Value, str](builder.emit_call(?b, callee, ?args[0], 1, voidt))) { code = 1; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?b)))                                { code = 1; }
+
+    val rs: R.Result[bool, str] = run(?m, ?tgt);
+    if (R.is_err[bool, str](rs))         { code = 1; }
+    or { if (R.unwrap_ok[bool, str](rs)) { code = 1; } }
+
+    if (ut_count(?m.functions[f_cast],  instruction.OP_ALLOCA) != 1) { code = 1; }
+    if (ut_count(?m.functions[f_var],   instruction.OP_ALLOCA) != 1) { code = 1; }
+    if (ut_count(?m.functions[f_ret],   instruction.OP_ALLOCA) != 1) { code = 1; }
+    if (ut_count(?m.functions[f_field], instruction.OP_ALLOCA) != 1) { code = 1; }
+
+    ir.dnit(?m);
+    ret code;
+}
+
+# a `^T` field survives the split: a secret value stored into a record field and read
+# back is still secret once the field lives in its own slot. The slot itself carries
+# the taint, and the value reaching the return does too -- the split cannot launder a
+# secret public (#1646)
+test "mach.lang.me.transform.sroa.run:preserves_a_secret_field" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    var tgt: resolved.Target;
+    if (ut_target(?reg, ?tgt) != 0) { ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    var rec: ir_type.IrTypeId;
+    if (ut_rec2(?m, ?rec) != 0) { ir.dnit(?m); ret 1; }
+    val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](r64)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r64);
+
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+
+    var b: builder.Builder = builder.init(?m);
+    builder.set_function(?b, fn);
+    val rb: R.Result[id.BlockId, str] = builder.new_block(?b);
+    if (R.is_err[id.BlockId, str](rb)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?b, R.unwrap_ok[id.BlockId, str](rb));
+
+    var code: i32 = 0;
+    val ra: R.Result[value.Value, str] = builder.emit_alloca(?b, rec, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](ra)) { ir.dnit(?m); ret 1; }
+    val s: value.Value = R.unwrap_ok[value.Value, str](ra);
+    if (R.is_err[bool, str](builder.emit_memzero(?b, s, rec))) { code = 1; }
+
+    # a `^u32`-shaped payload: the stored value carries the taint, so the store does too
+    var secret_v: value.Value = value.param(0, i64t);
+    secret_v.secret = true;
+    val g1: R.Result[value.Value, str] = ut_gep(?b, ?m, s, rec, 1);
+    if (R.is_err[value.Value, str](g1)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?b, secret_v, R.unwrap_ok[value.Value, str](g1)))) { code = 1; }
+
+    val h1: R.Result[value.Value, str] = ut_gep(?b, ?m, s, rec, 1);
+    if (R.is_err[value.Value, str](h1)) { ir.dnit(?m); ret 1; }
+    val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](h1), i64t);
+    if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
+    var loaded: value.Value = R.unwrap_ok[value.Value, str](rl);
+    fn.instrs[loaded.data.instr::u32].secret = true;
+    loaded.secret = true;
+    if (R.is_err[bool, str](builder.emit_ret(?b, loaded))) { code = 1; }
+
+    val rs: R.Result[bool, str] = run(?m, ?tgt);
+    if (R.is_err[bool, str](rs))          { code = 1; }
+    or { if (!R.unwrap_ok[bool, str](rs)) { code = 1; } }
+
+    # the field's own slot carries the taint...
+    var tainted_slots: u32 = 0;
+    var i: u32 = 0;
+    for (i < fn.instr_len) {
+        if (fn.instrs[i].kind == instruction.OP_ALLOCA && fn.instrs[i].secret) { tainted_slots = tainted_slots + 1; }
+        i = i + 1;
+    }
+    if (tainted_slots == 0) { code = 1; }
+
+    # ...and the value reaching the return is still secret after promotion.
+    if (R.is_err[bool, str](mem2reg.run(?m))) { code = 1; }
+    if (R.is_err[bool, str](dce.run(?m)))     { code = 1; }
+    if (ut_count(fn, instruction.OP_ALLOCA) != 0) { code = 1; }
+    if (!ut_ret_value(fn).secret)                 { code = 1; }
+
+    ir.dnit(?m);
+    ret code;
+}
+
+# the `Result` / `Option` idiom: two records built in opposite arms, merged by an
+# aggregate phi, then read. The partition shares one slot set, so the address merge
+# becomes a scalar phi over the fields and nothing is left in memory
+#
+# Disabling the pass leaves both slots, both zero fills, and the aggregate phi.
+test "mach.lang.me.transform.sroa.run:splits_an_aggregate_phi_partition" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    var tgt: resolved.Target;
+    if (ut_target(?reg, ?tgt) != 0) { ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    var rec: ir_type.IrTypeId;
+    if (ut_rec2(?m, ?rec) != 0) { ir.dnit(?m); ret 1; }
+    val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](r64)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r64);
+    val r8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
+    if (R.is_err[ir_type.IrTypeId, str](r8)) { ir.dnit(?m); ret 1; }
+    val i8t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r8);
+
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+
+    var b: builder.Builder = builder.init(?m);
+    builder.set_function(?b, fn);
+    var blocks: [4]id.BlockId;
+    var n: u32 = 0;
+    for (n < 4) {
+        val rb: R.Result[id.BlockId, str] = builder.new_block(?b);
+        if (R.is_err[id.BlockId, str](rb)) { ir.dnit(?m); ret 1; }
+        blocks[n] = R.unwrap_ok[id.BlockId, str](rb);
+        n = n + 1;
+    }
+
+    var code: i32 = 0;
+    var arm: [2]value.Value;
+
+    # entry: branch on the parameter into the two arms
+    builder.set_block(?b, blocks[0]);
+    val rcmp: R.Result[value.Value, str] = builder.emit_cmp_eq(?b, value.param(0, i64t), value.const_int(0, i64t));
+    if (R.is_err[value.Value, str](rcmp)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_cbr(?b, R.unwrap_ok[value.Value, str](rcmp), blocks[1], blocks[2]))) { code = 1; }
+
+    # each arm builds its own record and branches to the merge
+    var a: u32 = 0;
+    for (a < 2) {
+        builder.set_block(?b, blocks[1 + a]);
+        val ra: R.Result[value.Value, str] = builder.emit_alloca(?b, rec, value.const_int(1, i64t));
+        if (R.is_err[value.Value, str](ra)) { ir.dnit(?m); ret 1; }
+        arm[a] = R.unwrap_ok[value.Value, str](ra);
+        if (R.is_err[bool, str](builder.emit_memzero(?b, arm[a], rec))) { code = 1; }
+        val g0: R.Result[value.Value, str] = ut_gep(?b, ?m, arm[a], rec, 0);
+        if (R.is_err[value.Value, str](g0)) { ir.dnit(?m); ret 1; }
+        if (R.is_err[bool, str](builder.emit_store(?b, value.const_int(a::u64, i8t), R.unwrap_ok[value.Value, str](g0)))) { code = 1; }
+        val g1: R.Result[value.Value, str] = ut_gep(?b, ?m, arm[a], rec, 1);
+        if (R.is_err[value.Value, str](g1)) { ir.dnit(?m); ret 1; }
+        if (R.is_err[bool, str](builder.emit_store(?b, value.const_int(10 + a::u64, i64t), R.unwrap_ok[value.Value, str](g1)))) { code = 1; }
+        if (R.is_err[bool, str](builder.emit_br(?b, blocks[3]))) { code = 1; }
+        a = a + 1;
+    }
+
+    # merge: phi the two records' addresses, then read the payload back
+    builder.set_block(?b, blocks[3]);
+    val rphi: R.Result[value.Value, str] = builder.emit_phi(?b, rec);
+    if (R.is_err[value.Value, str](rphi)) { ir.dnit(?m); ret 1; }
+    val phi: value.Value = R.unwrap_ok[value.Value, str](rphi);
+    if (R.is_err[bool, str](builder.phi_add_incoming(?b, phi, blocks[1], value.retype(arm[0], rec)))) { code = 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?b, phi, blocks[2], value.retype(arm[1], rec)))) { code = 1; }
+    val hp: R.Result[value.Value, str] = ut_gep(?b, ?m, phi, rec, 1);
+    if (R.is_err[value.Value, str](hp)) { ir.dnit(?m); ret 1; }
+    val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](hp), i64t);
+    if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+
+    # before: two slots, two zero fills, one aggregate phi.
+    if (ut_count(fn, instruction.OP_ALLOCA)  != 2) { code = 1; }
+    if (ut_count(fn, instruction.OP_MEMZERO) != 2) { code = 1; }
+    if (ut_count(fn, instruction.OP_PHI)     != 1) { code = 1; }
+
+    val rs: R.Result[bool, str] = run(?m, ?tgt);
+    if (R.is_err[bool, str](rs))          { code = 1; }
+    or { if (!R.unwrap_ok[bool, str](rs)) { code = 1; } }
+    if (R.is_err[bool, str](mem2reg.run(?m))) { code = 1; }
+    if (R.is_err[bool, str](dce.run(?m)))     { code = 1; }
+
+    # after: nothing in memory, and the payload is a scalar phi of the two constants.
+    if (ut_count(fn, instruction.OP_ALLOCA)  != 0) { code = 1; }
+    if (ut_count(fn, instruction.OP_MEMZERO) != 0) { code = 1; }
+    if (ut_count(fn, instruction.OP_LOAD)    != 0) { code = 1; }
+    if (ut_count(fn, instruction.OP_STORE)   != 0) { code = 1; }
+    val rv: value.Value = ut_ret_value(fn);
+    if (rv.kind != value.VAL_INSTR) { code = 1; }
+    or {
+        val d: *instruction.Instruction = ?fn.instrs[rv.data.instr::u32];
+        if (d.kind != instruction.OP_PHI) { code = 1; }
+        if (d.ty != i64t)                 { code = 1; }
+    }
+
+    ir.dnit(?m);
+    ret code;
+}
+
+# a union is never split -- its fields share storage, so per-field slots would break
+# the reinterpretation it exists to express -- and neither is an array past the field
+# bound, which keeps the pass on small records rather than buffers
+test "mach.lang.me.transform.sroa.run:declines_a_union_and_an_oversized_array" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    var tgt: resolved.Target;
+    if (ut_target(?reg, ?tgt) != 0) { ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](r64)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r64);
+    val r8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
+    if (R.is_err[ir_type.IrTypeId, str](r8)) { ir.dnit(?m); ret 1; }
+    var ufields: [2]ir_type.IrTypeId;
+    ufields[0] = R.unwrap_ok[ir_type.IrTypeId, str](r8);
+    ufields[1] = i64t;
+    val ru: R.Result[ir_type.IrTypeId, str] = ir_type.intern_union(?m.types, ?ufields[0], 2, 0);
+    if (R.is_err[ir_type.IrTypeId, str](ru)) { ir.dnit(?m); ret 1; }
+    val uni: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ru);
+    val rarr: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?m.types, i64t, 32);
+    if (R.is_err[ir_type.IrTypeId, str](rarr)) { ir.dnit(?m); ret 1; }
+    val arr: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rarr);
+
+    var code: i32 = 0;
+    var b: builder.Builder = builder.init(?m);
+    var slot: value.Value;
+
+    val f_uni: u32 = ut_build_local(?m, ?b, uni, ?slot);
+    if (f_uni == NONE_U32) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?b))) { code = 1; }
+
+    val f_arr: u32 = ut_build_local(?m, ?b, arr, ?slot);
+    if (f_arr == NONE_U32) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?b))) { code = 1; }
+
+    val rs: R.Result[bool, str] = run(?m, ?tgt);
+    if (R.is_err[bool, str](rs))         { code = 1; }
+    or { if (R.unwrap_ok[bool, str](rs)) { code = 1; } }
+
+    if (ut_count(?m.functions[f_uni], instruction.OP_ALLOCA) != 1) { code = 1; }
+    if (ut_count(?m.functions[f_arr], instruction.OP_ALLOCA) != 1) { code = 1; }
+
+    ir.dnit(?m);
+    ret code;
+}
+
+# a record whose address genuinely escapes stays whole: passing the slot pointer to a
+# call is exactly the `?x` address-of form, and the slot, its zero fill and its
+# load/store traffic all survive untouched
+test "mach.lang.me.transform.sroa.run:declines_when_the_address_escapes" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var reg: target.TargetRegistry;
+    var tgt: resolved.Target;
+    if (ut_target(?reg, ?tgt) != 0) { ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    var rec: ir_type.IrTypeId;
+    if (ut_rec2(?m, ?rec) != 0) { ir.dnit(?m); ret 1; }
+    val r64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](r64)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](r64);
+    val rv: R.Result[ir_type.IrTypeId, str] = ir_type.intern_void(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rv)) { ir.dnit(?m); ret 1; }
+    val voidt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rv);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+
+    val rc: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, ir.FN_FLAG_EXTERN);
+    if (R.is_err[u32, str](rc)) { ir.dnit(?m); ret 1; }
+    val callee_ix: u32 = R.unwrap_ok[u32, str](rc);
+
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+
+    var b: builder.Builder = builder.init(?m);
+    builder.set_function(?b, fn);
+    val rb: R.Result[id.BlockId, str] = builder.new_block(?b);
+    if (R.is_err[id.BlockId, str](rb)) { ir.dnit(?m); ret 1; }
+    builder.set_block(?b, R.unwrap_ok[id.BlockId, str](rb));
+
+    var code: i32 = 0;
+    val ra: R.Result[value.Value, str] = builder.emit_alloca(?b, rec, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](ra)) { ir.dnit(?m); ret 1; }
+    val s: value.Value = R.unwrap_ok[value.Value, str](ra);
+    if (R.is_err[bool, str](builder.emit_memzero(?b, s, rec))) { code = 1; }
+
+    val g1: R.Result[value.Value, str] = ut_gep(?b, ?m, s, rec, 1);
+    if (R.is_err[value.Value, str](g1)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_store(?b, value.param(0, i64t), R.unwrap_ok[value.Value, str](g1)))) { code = 1; }
+
+    # the slot pointer itself crosses a call boundary: the address escapes.
+    var args: [1]value.Value;
+    args[0] = s;
+    if (R.is_err[value.Value, str](builder.emit_call(?b, value.fn(callee_ix, ptrt), ?args[0], 1, voidt))) { code = 1; }
+
+    val h1: R.Result[value.Value, str] = ut_gep(?b, ?m, s, rec, 1);
+    if (R.is_err[value.Value, str](h1)) { ir.dnit(?m); ret 1; }
+    val rl: R.Result[value.Value, str] = builder.emit_load(?b, R.unwrap_ok[value.Value, str](h1), i64t);
+    if (R.is_err[value.Value, str](rl)) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](rl)))) { code = 1; }
+
+    val rs: R.Result[bool, str] = run(?m, ?tgt);
+    if (R.is_err[bool, str](rs))          { code = 1; }
+    or { if (R.unwrap_ok[bool, str](rs))  { code = 1; } }
+
+    # untouched: the slot, its zero fill, and its field traffic all stand.
+    if (ut_count(fn, instruction.OP_ALLOCA)  != 1) { code = 1; }
+    if (ut_count(fn, instruction.OP_MEMZERO) != 1) { code = 1; }
+    if (ut_count(fn, instruction.OP_LOAD)    != 1) { code = 1; }
+    if (ut_count(fn, instruction.OP_STORE)   != 1) { code = 1; }
+
+    ir.dnit(?m);
+    ret code;
 }
