@@ -1237,6 +1237,33 @@ test "mach.lang.be.codegen.mir.lower.ct_gate:mechanism" {
     ret 0;
 }
 
+# a sub-word integer constant reaches the backend as its width-masked bits, so a
+# consumer computing above that width re-derives the value they denote: signed
+# re-signs the top bit of the low `width` bytes, unsigned masks to them. widths at
+# or above the machine word - and the width-0 sentinel - denote their raw value
+test "mach.lang.be.codegen.mir.lower.narrow_imm_value" {
+    # i8: 200 denotes -56; 127 and 0 are unchanged; 128 is the sign boundary.
+    if (narrow_imm_value(200, 1, true)  != -56)  { ret 1; }
+    if (narrow_imm_value(127, 1, true)  != 127)  { ret 1; }
+    if (narrow_imm_value(128, 1, true)  != -128) { ret 1; }
+    if (narrow_imm_value(0, 1, true)    != 0)    { ret 1; }
+    # u8: the same bits denote themselves.
+    if (narrow_imm_value(200, 1, false) != 200)  { ret 1; }
+    if (narrow_imm_value(255, 1, false) != 255)  { ret 1; }
+    # i16 / u16 at the same boundaries.
+    if (narrow_imm_value(65535, 2, true)  != -1)     { ret 1; }
+    if (narrow_imm_value(32768, 2, true)  != -32768) { ret 1; }
+    if (narrow_imm_value(65535, 2, false) != 65535)  { ret 1; }
+    # a value already carrying its sign re-derives to itself, so the widening is
+    # idempotent however many times a lowering path applies it.
+    if (narrow_imm_value(-56, 1, true)  != -56)  { ret 1; }
+    # 4 and 8 byte widths, and the width-0 machine-word sentinel, pass through.
+    if (narrow_imm_value(-56, 4, true)  != -56)  { ret 1; }
+    if (narrow_imm_value(-56, 8, true)  != -56)  { ret 1; }
+    if (narrow_imm_value(-56, 0, true)  != -56)  { ret 1; }
+    ret 0;
+}
+
 fun vector_unsupported(ctx: *lctx.LowerCtx) str {
     val prefix:   str = "codegen: 128-bit vectors not yet supported on ";
     val fallback: str = "codegen: 128-bit vectors not yet supported on this target";
@@ -1391,6 +1418,54 @@ fun lower_asm_instr(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, iid: id.InstructionI
     ret R.ok[bool, str](true);
 }
 
+# canonicalize a sub-word right shift's value operand to its declared width
+#
+# The `mir.ALU_MIN_WIDTH` contract computes a sub-word ALU op at the ALU floor and
+# leaves the register bits ABOVE the declared width undefined, requiring every
+# consumer that needs the narrow value to re-narrow it. A right shift is such a
+# consumer, and the only ALU one that was never enrolled (#2357): it moves high bits
+# DOWN into the result, so residue above the declared width lands inside the value -
+# `(0 - a) >> 7` at u8 shifted a full 0xFFFFFFFF and read 255 where the u8 answer is
+# 1. Extending the value into a fresh vreg first makes the floor-width shift exact at
+# the declared width, and leaves the result defined across the whole floor, so the
+# producer half of the contract still holds.
+#
+# ONLY THE RIGHT SHIFTS NEED THIS. An operation is input-sensitive exactly when its
+# low N result bits depend on operand bits above N. For OP_SHL, and for ADD / SUB /
+# MUL / AND / OR / XOR / NOT / NEG, they do not - carries and borrows propagate only
+# upward and the bitwise ops are bit-independent - so those stay exact on a dirty
+# operand and are left alone. The other two input-sensitive classes were already
+# enrolled: the divides promote both operands in `lower_div`, and a comparison keeps
+# its true operand width in `set_generic_widths` for the per-ISA `narrow_cmp_source`.
+# The shift COUNT needs no canonicalization either: every ISA masks it to the low
+# log2(register-width) bits, which a narrow count already holds exactly.
+#
+# The extension is chosen by the OPCODE, which is where the IR carries signedness -
+# OP_SHR_U zero-extends and OP_SHR_S sign-extends, each matching the fill its own
+# shift performs - so no signedness needs to enter the IR type.
+# ---
+# ctx:       the per-function lowering context
+# mb:        the destination MIR block
+# inst:      the IR shift instruction
+# value:     the lowered value operand (IR operand 0)
+# natural_w: the shift's declared type width in bytes
+# w:         the clamped operation width the shift executes at
+# ret:       the operand the shift should read, or a lowering / allocation error
+fun narrow_shift_value(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
+                       value: mir.MirOperand, natural_w: u8, w: u8) R.Result[mir.MirOperand, str] {
+    if (inst.kind == instr.OP_SHL) { ret R.ok[mir.MirOperand, str](value); }
+    if (natural_w >= w)            { ret R.ok[mir.MirOperand, str](value); }
+
+    val vr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](vr)) { ret R.err[mir.MirOperand, str](R.unwrap_err[u32, str](vr)); }
+    val v: u32 = R.unwrap_ok[u32, str](vr);
+
+    val pr: R.Result[bool, str] = emit_promote(ctx, mb, mir.op_vreg(v), value, w, natural_w,
+                                               inst.kind == instr.OP_SHR_S);
+    if (R.is_err[bool, str](pr)) { ret R.err[mir.MirOperand, str](R.unwrap_err[bool, str](pr)); }
+    ret R.ok[mir.MirOperand, str](mir.op_vreg(v));
+}
+
 # lower an integer OP_SHL / OP_SHR_S / OP_SHR_U into a three-address generic shift
 #
 # Emits `mir.MIR_SHL/SHR_S/SHR_U [dst, value, count]`. The IR operands are
@@ -1419,14 +1494,22 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     # a sub-word shift result, like any narrow GP ALU write, leaves the upper
     # register bits undefined; clamp the operation width so the spilled word stays
     # clean (mirrors `set_generic_widths` and the byte-divide promotion).
-    val w: u8 = lctx.clamp_alu_width(ctx.tgt.model.gpr_width, lctx.op_width_of(ctx, inst.ty));
+    val natural_w: u8 = lctx.op_width_of(ctx, inst.ty);
+    val w: u8 = lctx.clamp_alu_width(ctx.tgt.model.gpr_width, natural_w);
 
     var op: mir.MirOpcode = mir.MIR_SHR_U;
     if (inst.kind == instr.OP_SHL)   { op = mir.MIR_SHL; }
     or (inst.kind == instr.OP_SHR_S) { op = mir.MIR_SHR_S; }
 
-    val value: mir.MirOperand = lctx.lower_value(ctx, inst.operands[0]);
+    val raw: mir.MirOperand = lctx.lower_value(ctx, inst.operands[0]);
     val count: mir.MirOperand = lctx.lower_value(ctx, inst.operands[1]);
+
+    # a RIGHT shift reads bits above the declared width, so its value operand is
+    # canonicalized to that width first; a left shift and a full-width shift pass
+    # through untouched.
+    val rv: R.Result[mir.MirOperand, str] = narrow_shift_value(ctx, mb, inst, raw, natural_w, w);
+    if (R.is_err[mir.MirOperand, str](rv)) { ret R.err[bool, str](R.unwrap_err[mir.MirOperand, str](rv)); }
+    val value: mir.MirOperand = R.unwrap_ok[mir.MirOperand, str](rv);
 
     var count_op: mir.MirOperand = count;
     if (count.kind != mir.MIR_OP_IMM) {
@@ -1642,14 +1725,40 @@ fun lower_div_three_address(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr
     ret lctx.push_instr(ctx, mb, mi);
 }
 
+# the VALUE a width-masked narrow immediate denotes at `width`
+#
+# An integer constant of a sub-word type reaches the backend carrying its RAW
+# `width`-byte bit pattern, not its value: i8 `-56` arrives as 200. Widening it
+# with a plain move would therefore promote the bits rather than the number, so a
+# consumer computing above the narrow width (a promoted divide, a right shift) must
+# re-derive what the constant means first - sign-extending the top bit for a signed
+# interpretation, masking to the width for an unsigned one. Wider widths, and the
+# documented width-0 machine-word sentinel, already denote their raw value.
+# ---
+# imm:    the operand's raw immediate bits
+# width:  the width in bytes the constant is masked to
+# signed: true to re-sign the low `width` bytes, false to mask to them
+# ret:    the value the constant denotes at `width`
+fun narrow_imm_value(imm: i64, width: u8, signed: bool) i64 {
+    if (width == 0 || width >= 8) { ret imm; }
+    val bits: u32 = width::u32 * 8;
+    val m: u64 = (1::u64 << bits) - 1;
+    val v: u64 = imm::u64 & m;
+    if (!signed) { ret v::i64; }
+    val sign: u64 = 1::u64 << (bits - 1);
+    if ((v & sign) == 0) { ret v::i64; }
+    ret (v | ~m)::i64;
+}
+
 # move `src` into `dst` at `dst_w` bytes, widening from `src_w` when narrower
 #
-# An immediate source carries its full value, so it is a plain width-`dst_w` move
-# (a MOVSX/MOVZX of an immediate has no encoding). A register / memory source
-# narrower than the destination is sign-extended (`signed`, MOVSX) or
-# zero-extended (MOVZX); at equal width it is a plain move. Used to load a
-# division's dividend into RAX and to widen a promoted byte divisor into a value
-# vreg.
+# A register / memory source narrower than the destination is sign-extended
+# (`signed`, MOVSX) or zero-extended (MOVZX); at equal width it is a plain move. An
+# immediate has no MOVSX/MOVZX encoding, so it widens by re-deriving the value its
+# width-masked bits denote (`narrow_imm_value`) and moving that at `dst_w` - moving
+# the raw bits instead would compute on 200 where the source said i8 `-56`. Used to
+# load a division's dividend into RAX, to widen a promoted byte divisor into a value
+# vreg, and to canonicalize a narrow right shift's value operand.
 # ---
 # ctx:    the per-function lowering context
 # mb:     the destination MIR block
@@ -1661,8 +1770,11 @@ fun lower_div_three_address(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr
 # ret:    true on success, or a lowering / allocation error
 fun emit_promote(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand,
                  dst_w: u8, src_w: u8, signed: bool) R.Result[bool, str] {
-    if (src_w >= dst_w || src.kind == mir.MIR_OP_IMM) {
+    if (src_w >= dst_w) {
         ret lctx.emit_mov_w(ctx, mb, dst, src, dst_w);
+    }
+    if (src.kind == mir.MIR_OP_IMM) {
+        ret lctx.emit_mov_w(ctx, mb, dst, mir.op_imm(narrow_imm_value(src.imm, src_w, signed)), dst_w);
     }
     val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
     if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }

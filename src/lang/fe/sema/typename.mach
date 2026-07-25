@@ -1,0 +1,527 @@
+# rendering a semantic type to its source spelling
+#
+# The spelling a diagnostic shows for a type is a property of the type universe,
+# not of any one pass: sema names types in its messages, and so does the
+# monomorphizer when it reports an instantiation chain it refuses to keep
+# expanding. This leaf therefore takes the session directly, so a caller with no
+# `SemaContext` - lowering - can render exactly what sema would.
+#
+# Every entry point is total: an unresolvable type, name, or argument renders to
+# an `<error>` / `<anon>` placeholder rather than failing, so a diagnostic never
+# depends on the type universe being well-formed at the moment it is written.
+
+use std.format;
+use std.types.bool.bool;
+use std.memory;
+use std.types.char.char;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.fe.sema.generics;
+use mach.lang.intern;
+use mach.lang.session;
+use mach.lang.type;
+
+# render `t` to an owned, human-readable spelling for diagnostics
+#
+# primitives render to their keyword (`i64`, `f32`, `ptr`); a pointer to `*T`;
+# an array to `[N]T`; a record / union / generic parameter to its declared name;
+# a function to `fun(A, B) R`; and a generic instance to `Name[Arg, ...]`.
+# composite forms recurse over their components; an unknown or unnamed type
+# renders to a `<error>` / `<anon>` placeholder. the result is allocated from
+# the session allocator and must be released with type_str_free.
+# ---
+# s:   the shared session (type universe, interner, allocator)
+# t:   the type to render
+# ret: an owned, null-terminated spelling, or an allocation error
+pub fun type_to_str(s: *session.Session, t: type.TypeId) R.Result[str, str] {
+    val len: usize = type_str_len(s, t);
+    val res_buf: R.Result[*char, str] = A.allocate[char](s.alloc, len + 1);
+    if (R.is_err[*char, str](res_buf)) { ret R.err[str, str](R.unwrap_err[*char, str](res_buf)); }
+    val buf: str   = R.unwrap_ok[*char, str](res_buf);
+    val w:   usize = write_type_str(s, buf, 0, t);
+    buf[w] = 0;
+    ret R.ok[str, str](buf);
+}
+
+# release a string returned by type_to_str
+# ---
+# s:     the session whose allocator backed the string
+# owned: the owned string to free (nil is a no-op)
+pub fun type_str_free(s: *session.Session, owned: str) {
+    if (owned == nil) { ret; }
+    A.deallocate[char](s.alloc, owned, str_len(owned) + 1);
+}
+
+# append `piece` to the owned message `acc`, releasing `acc` (and `piece`, when it
+# is owned too)
+#
+# One ownership rule for a diagnostic assembled from many rendered spellings: the
+# accumulator is always owned and always consumed, and a nil accumulator
+# propagates, so a caller checks for failure once at the end rather than after
+# every join.
+# ---
+# s:           the session whose allocator backs both strings
+# acc:         the owned accumulator, or nil to propagate an earlier failure
+# piece:       the text to append
+# piece_owned: whether `piece` must be released too
+# ret:         the extended owned message, or nil on an allocation failure
+pub fun text_join(s: *session.Session, acc: str, piece: str, piece_owned: bool) str {
+    if (acc == nil) {
+        if (piece_owned) { type_str_free(s, piece); }
+        ret nil;
+    }
+    val r: R.Result[str, str] = format.sprint(s.alloc, "{}{}", acc, piece);
+    type_str_free(s, acc);
+    if (piece_owned) { type_str_free(s, piece); }
+    if (R.is_err[str, str](r)) { ret nil; }
+    ret R.unwrap_ok[str, str](r);
+}
+
+# intern an assembled message and release the owned copy
+#
+# A diagnostic assembled this way outlives the pass that built it - a lowering
+# error string is read after the lowering context (and its working allocations)
+# are torn down - so the stable text is the interner's, not the builder's.
+# ---
+# s:        the session (interner and allocator)
+# owned:    the assembled message, consumed; nil yields the fallback
+# fallback: the text to return when interning is impossible
+# ret:      the interned message, or `fallback`
+pub fun text_stable(s: *session.Session, owned: str, fallback: str) str {
+    if (owned == nil) { ret fallback; }
+    val id_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, owned);
+    type_str_free(s, owned);
+    if (R.is_err[intern.StrId, str](id_r)) { ret fallback; }
+    val text: O.Option[str] = intern.lookup(?s.interner, R.unwrap_ok[intern.StrId, str](id_r));
+    if (O.is_none[str](text)) { ret fallback; }
+    ret O.unwrap[str](text);
+}
+
+# render an instantiation `Name[Arg, ...]` from its parts
+#
+# The same spelling `type_to_str` gives a TYPE_INSTANCE, assembled from a name
+# and an argument sequence instead of read off a TypeId - because a generic
+# FUNCTION instantiation is not a type and so has no TypeId to render. Used by
+# the monomorphizer to name the links of a derivation chain it refuses to keep
+# expanding (#2163). A zero-argument instantiation renders as the bare name.
+# ---
+# s:       the shared session (type universe, interner, allocator)
+# name:    the generic's declared name
+# args:    the concrete type arguments, by ordinal
+# arg_len: number of type arguments
+# ret:     an owned, null-terminated spelling (free with type_str_free), or an
+#          allocation error
+pub fun instance_spelling(s: *session.Session, name: intern.StrId, args: *type.TypeId, arg_len: u32) R.Result[str, str] {
+    var len: usize = name_str_len(s, name);
+    if (arg_len > 0) {
+        len = len + 2;
+        var i: u32 = 0;
+        for (i < arg_len) {
+            if (i > 0) { len = len + 2; }
+            len = len + type_str_len(s, args[i]);
+            i = i + 1;
+        }
+    }
+
+    val res_buf: R.Result[*char, str] = A.allocate[char](s.alloc, len + 1);
+    if (R.is_err[*char, str](res_buf)) { ret R.err[str, str](R.unwrap_err[*char, str](res_buf)); }
+    val buf: str = R.unwrap_ok[*char, str](res_buf);
+
+    var w: usize = write_name(s, buf, 0, name);
+    if (arg_len > 0) {
+        w = write_char(buf, w, '[');
+        var i: u32 = 0;
+        for (i < arg_len) {
+            if (i > 0) { w = write_kw(buf, w, ", "); }
+            w = write_type_str(s, buf, w, args[i]);
+            i = i + 1;
+        }
+        w = write_char(buf, w, ']');
+    }
+    buf[w] = 0;
+    ret R.ok[str, str](buf);
+}
+
+# the byte length type_to_str will write for `t`, excluding the null terminator
+#
+# mirrors write_type_str branch-for-branch so the single allocation in
+# type_to_str is sized exactly.
+# ---
+# s:   the shared session (type universe, interner)
+# t:   the type to measure
+# ret: the number of bytes write_type_str will emit for `t`
+fun type_str_len(s: *session.Session, t: type.TypeId) usize {
+    if (t == type.TYPE_U8)                          { ret 2; }
+    if (t == type.TYPE_U16)                         { ret 3; }
+    if (t == type.TYPE_U32)                         { ret 3; }
+    if (t == type.TYPE_U64)                         { ret 3; }
+    if (t == type.TYPE_I8)                          { ret 2; }
+    if (t == type.TYPE_I16)                         { ret 3; }
+    if (t == type.TYPE_I32)                         { ret 3; }
+    if (t == type.TYPE_I64)                         { ret 3; }
+    if (t == type.TYPE_F32)                         { ret 3; }
+    if (t == type.TYPE_F64)                         { ret 3; }
+    if (t == type.TYPE_PTR)                         { ret 3; }
+    if (t == type.TYPE_ERROR || t == type.TYPE_NIL) { ret 7; }
+
+    val opt_type: O.Option[*type.Type] = type.get(?s.types, t);
+    if (O.is_none[*type.Type](opt_type)) { ret 7; }
+    val tp: *type.Type    = O.unwrap[*type.Type](opt_type);
+    val k:  type.TypeKind = tp.kind;
+
+    if (k == type.TYPE_POINTER) {
+        ret 1 + type_str_len(s, tp.data.pointer.base);
+    }
+    if (k == type.TYPE_SECRET) {
+        ret 1 + type_str_len(s, tp.data.secret.base);
+    }
+    if (k == type.TYPE_ARRAY) {
+        ret 1 + decimal_len(tp.data.array.count::usize) + 1 + type_str_len(s, tp.data.array.base);
+    }
+    if (k == type.TYPE_VECTOR) {
+        # `<element>x<lanes>`, e.g. f32x4
+        var el: usize = 0;
+        val ep: O.Option[type.TypeId] = type.prim(?s.types, tp.data.vector.element);
+        if (O.is_some[type.TypeId](ep)) { el = type_str_len(s, O.unwrap[type.TypeId](ep)); }
+        ret el + 1 + decimal_len(tp.data.vector.lanes::usize);
+    }
+    if (k == type.TYPE_REC || k == type.TYPE_UNI) {
+        ret name_str_len(s, tp.data.nominal.name);
+    }
+    if (k == type.TYPE_GENERIC_PARAM) {
+        ret name_str_len(s, tp.data.generic_param.name);
+    }
+    if (k == type.TYPE_INSTANCE) {
+        ret instance_str_len(s, tp);
+    }
+    if (k == type.TYPE_FUN) {
+        ret fun_str_len(s, tp);
+    }
+    ret 7;
+}
+
+# write type_to_str's spelling for `t` into `buf` at offset `k`
+# ---
+# s:   the shared session (type universe, interner)
+# buf: destination buffer
+# k:   offset to begin writing at
+# t:   the type to render
+# ret: the offset just past the written spelling
+fun write_type_str(s: *session.Session, buf: str, k: usize, t: type.TypeId) usize {
+    if (t == type.TYPE_U8)                          { ret write_kw(buf, k, "u8"); }
+    if (t == type.TYPE_U16)                         { ret write_kw(buf, k, "u16"); }
+    if (t == type.TYPE_U32)                         { ret write_kw(buf, k, "u32"); }
+    if (t == type.TYPE_U64)                         { ret write_kw(buf, k, "u64"); }
+    if (t == type.TYPE_I8)                          { ret write_kw(buf, k, "i8"); }
+    if (t == type.TYPE_I16)                         { ret write_kw(buf, k, "i16"); }
+    if (t == type.TYPE_I32)                         { ret write_kw(buf, k, "i32"); }
+    if (t == type.TYPE_I64)                         { ret write_kw(buf, k, "i64"); }
+    if (t == type.TYPE_F32)                         { ret write_kw(buf, k, "f32"); }
+    if (t == type.TYPE_F64)                         { ret write_kw(buf, k, "f64"); }
+    if (t == type.TYPE_PTR)                         { ret write_kw(buf, k, "ptr"); }
+    if (t == type.TYPE_ERROR || t == type.TYPE_NIL) { ret write_kw(buf, k, "<error>"); }
+
+    val opt_type: O.Option[*type.Type] = type.get(?s.types, t);
+    if (O.is_none[*type.Type](opt_type)) { ret write_kw(buf, k, "<error>"); }
+    val tp:   *type.Type    = O.unwrap[*type.Type](opt_type);
+    val kind: type.TypeKind = tp.kind;
+
+    if (kind == type.TYPE_POINTER) {
+        val w: usize = write_char(buf, k, '*');
+        ret write_type_str(s, buf, w, tp.data.pointer.base);
+    }
+    if (kind == type.TYPE_SECRET) {
+        val w: usize = write_char(buf, k, '^');
+        ret write_type_str(s, buf, w, tp.data.secret.base);
+    }
+    if (kind == type.TYPE_ARRAY) {
+        var w: usize = write_char(buf, k, '[');
+        w = write_decimal(buf, w, tp.data.array.count::usize);
+        w = write_char(buf, w, ']');
+        ret write_type_str(s, buf, w, tp.data.array.base);
+    }
+    if (kind == type.TYPE_VECTOR) {
+        var w: usize = k;
+        val ep: O.Option[type.TypeId] = type.prim(?s.types, tp.data.vector.element);
+        if (O.is_some[type.TypeId](ep)) { w = write_type_str(s, buf, w, O.unwrap[type.TypeId](ep)); }
+        w = write_char(buf, w, 'x');
+        ret write_decimal(buf, w, tp.data.vector.lanes::usize);
+    }
+    if (kind == type.TYPE_REC || kind == type.TYPE_UNI) {
+        ret write_name(s, buf, k, tp.data.nominal.name);
+    }
+    if (kind == type.TYPE_GENERIC_PARAM) {
+        ret write_name(s, buf, k, tp.data.generic_param.name);
+    }
+    if (kind == type.TYPE_INSTANCE) {
+        ret write_instance(s, buf, k, tp);
+    }
+    if (kind == type.TYPE_FUN) {
+        ret write_fun(s, buf, k, tp);
+    }
+    ret write_kw(buf, k, "<error>");
+}
+
+# the rendered length of a generic instance `Name[Arg, ...]`
+#
+# the name recovered from the generic declaration via generics.generic_nominal_of
+# and the arguments measured recursively.
+# ---
+# s:   the shared session (type universe, interner)
+# tp:  the TYPE_INSTANCE payload to measure
+# ret: the number of bytes write_instance will emit
+fun instance_str_len(s: *session.Session, tp: *type.Type) usize {
+    var total: usize = instance_name_len(s, tp);
+    total = total + 1;
+    val args_start: u32 = tp.data.instance.args_start;
+    val args_len:   u32 = tp.data.instance.args_len;
+    var i: u32 = 0;
+    for (i < args_len) {
+        if (i > 0) { total = total + 2; }
+        total = total + type_str_len(s, instance_arg(s, args_start + i));
+        i = i + 1;
+    }
+    total = total + 1;
+    ret total;
+}
+
+# write a generic instance `Name[Arg, ...]` into `buf` at offset `k`
+# ---
+# s:   the shared session (type universe, interner)
+# buf: destination buffer
+# k:   offset to begin writing at
+# tp:  the TYPE_INSTANCE payload to render
+# ret: the offset just past the written spelling
+fun write_instance(s: *session.Session, buf: str, k: usize, tp: *type.Type) usize {
+    var w: usize = write_instance_name(s, buf, k, tp);
+    w = write_char(buf, w, '[');
+    val args_start: u32 = tp.data.instance.args_start;
+    val args_len:   u32 = tp.data.instance.args_len;
+    var i: u32 = 0;
+    for (i < args_len) {
+        if (i > 0) { w = write_kw(buf, w, ", "); }
+        w = write_type_str(s, buf, w, instance_arg(s, args_start + i));
+        i = i + 1;
+    }
+    w = write_char(buf, w, ']');
+    ret w;
+}
+
+# the concrete argument TypeId at pool slot `idx`
+#
+# returns TYPE_ERROR when out of range so rendering stays total.
+# ---
+# s:   the shared session (type universe, interner)
+# idx: index into the type interner's parameter pool
+# ret: the argument type, or TYPE_ERROR when out of range
+fun instance_arg(s: *session.Session, idx: u32) type.TypeId {
+    val opt_arg: O.Option[type.TypeId] = type.get_param(?s.types, idx);
+    if (O.is_none[type.TypeId](opt_arg)) { ret type.TYPE_ERROR; }
+    ret O.unwrap[type.TypeId](opt_arg);
+}
+
+# the rendered length of a generic instance's declared name
+#
+# recovered through generics.generic_nominal_of (which re-interns the name the
+# declaring module used). falls back to `<anon>` when the declaration cannot be
+# reached.
+# ---
+# s:   the shared session (type universe, interner)
+# tp:  the TYPE_INSTANCE payload
+# ret: the rendered length of the instance's name
+fun instance_name_len(s: *session.Session, tp: *type.Type) usize {
+    val generic_nominal: type.TypeId = generics.generic_nominal_of(s, tp.data.instance.target_origin, tp.data.instance.target_decl);
+    val name: intern.StrId = nominal_name_of(s, generic_nominal);
+    if (name == intern.STR_NIL) { ret 6; }
+    ret name_str_len(s, name);
+}
+
+# write a generic instance's declared name into `buf` at offset `k`
+# ---
+# s:   the shared session (type universe, interner)
+# buf: destination buffer
+# k:   offset to begin writing at
+# tp:  the TYPE_INSTANCE payload
+# ret: the offset just past the written name
+fun write_instance_name(s: *session.Session, buf: str, k: usize, tp: *type.Type) usize {
+    val generic_nominal: type.TypeId = generics.generic_nominal_of(s, tp.data.instance.target_origin, tp.data.instance.target_decl);
+    val name: intern.StrId = nominal_name_of(s, generic_nominal);
+    if (name == intern.STR_NIL) { ret write_kw(buf, k, "<anon>"); }
+    ret write_name(s, buf, k, name);
+}
+
+# the `name` StrId of a nominal TypeId, or STR_NIL when `t` is not a nominal
+# ---
+# s:   the shared session (type universe, interner)
+# t:   the type to read the nominal name of
+# ret: the nominal's interned name, or STR_NIL when `t` is not rec/uni
+fun nominal_name_of(s: *session.Session, t: type.TypeId) intern.StrId {
+    if (t == type.TYPE_ERROR || t == type.TYPE_NIL) { ret intern.STR_NIL; }
+    val opt_type: O.Option[*type.Type] = type.get(?s.types, t);
+    if (O.is_none[*type.Type](opt_type)) { ret intern.STR_NIL; }
+    val tp: *type.Type = O.unwrap[*type.Type](opt_type);
+    if (tp.kind != type.TYPE_REC && tp.kind != type.TYPE_UNI) { ret intern.STR_NIL; }
+    ret tp.data.nominal.name;
+}
+
+# the rendered length of a function type `fun(A, B) R`
+#
+# a void return renders as the bare `fun(A, B)` with no trailing type.
+# ---
+# s:   the shared session (type universe, interner)
+# tp:  the TYPE_FUN payload to measure
+# ret: the number of bytes write_fun will emit
+fun fun_str_len(s: *session.Session, tp: *type.Type) usize {
+    var total: usize = 4;
+    val params_start: u32 = tp.data.fn.params_start;
+    val params_len:   u32 = tp.data.fn.params_len;
+    var i: u32 = 0;
+    for (i < params_len) {
+        if (i > 0) { total = total + 2; }
+        total = total + type_str_len(s, instance_arg(s, params_start + i));
+        i = i + 1;
+    }
+    total = total + 1;
+    if (tp.data.fn.ret_type != type.TYPE_NIL) {
+        total = total + 1 + type_str_len(s, tp.data.fn.ret_type);
+    }
+    ret total;
+}
+
+# write a function type `fun(A, B) R` into `buf` at offset `k`
+# ---
+# s:   the shared session (type universe, interner)
+# buf: destination buffer
+# k:   offset to begin writing at
+# tp:  the TYPE_FUN payload to render
+# ret: the offset just past the written spelling
+fun write_fun(s: *session.Session, buf: str, k: usize, tp: *type.Type) usize {
+    var w: usize = write_kw(buf, k, "fun");
+    w = write_char(buf, w, '(');
+    val params_start: u32 = tp.data.fn.params_start;
+    val params_len:   u32 = tp.data.fn.params_len;
+    var i: u32 = 0;
+    for (i < params_len) {
+        if (i > 0) { w = write_kw(buf, w, ", "); }
+        w = write_type_str(s, buf, w, instance_arg(s, params_start + i));
+        i = i + 1;
+    }
+    w = write_char(buf, w, ')');
+    if (tp.data.fn.ret_type != type.TYPE_NIL) {
+        w = write_char(buf, w, ' ');
+        w = write_type_str(s, buf, w, tp.data.fn.ret_type);
+    }
+    ret w;
+}
+
+# the rendered length of an interned identifier
+#
+# falls back to `<anon>` (length 6) when the StrId is nil or unresolvable.
+# ---
+# s:    the shared session (type universe, interner)
+# name: the interned identifier to measure
+# ret:  the identifier's length, or 6 for the `<anon>` fallback
+fun name_str_len(s: *session.Session, name: intern.StrId) usize {
+    val opt_name: O.Option[str] = intern.lookup(?s.interner, name);
+    if (O.is_none[str](opt_name)) { ret 6; }
+    val name_str: str = O.unwrap[str](opt_name);
+    if (str_len(name_str) == 0) { ret 6; }
+    ret str_len(name_str);
+}
+
+# the interned spelling of `name`, or `<anon>` when it is nil, unresolvable, or empty
+# ---
+# s:    the shared session (type universe, interner)
+# name: the interned identifier to resolve
+# ret:  the identifier's text, or the `<anon>` fallback
+pub fun name_str(s: *session.Session, name: intern.StrId) str {
+    val opt_name: O.Option[str] = intern.lookup(?s.interner, name);
+    if (O.is_none[str](opt_name)) { ret "<anon>"; }
+    val resolved: str = O.unwrap[str](opt_name);
+    if (str_len(resolved) == 0) { ret "<anon>"; }
+    ret resolved;
+}
+
+# write an interned identifier into `buf` at offset `k`
+#
+# falls back to `<anon>` when the StrId is nil or unresolvable.
+# ---
+# s:    the shared session (type universe, interner)
+# buf:  destination buffer
+# k:    offset to begin writing at
+# name: the interned identifier to render
+# ret:  the offset just past the written name
+fun write_name(s: *session.Session, buf: str, k: usize, name: intern.StrId) usize {
+    ret write_kw(buf, k, name_str(s, name));
+}
+
+# write a single character into `buf` at offset `k`
+# ---
+# buf: destination buffer
+# k:   offset to write at
+# c:   the character to write
+# ret: the offset just past it (`k + 1`)
+fun write_char(buf: str, k: usize, c: char) usize {
+    buf[k] = c;
+    ret k + 1;
+}
+
+# copy a string's bytes into `buf` at offset `k`
+# ---
+# buf: destination buffer
+# k:    offset to begin writing at
+# text: source string to copy
+# ret:  the offset just past the copied bytes
+fun write_kw(buf: str, k: usize, text: str) usize {
+    val len: usize = str_len(text);
+    memory.raw_copy((buf::usize + k)::ptr, text::ptr, len);
+    ret k + len;
+}
+
+# the number of base-10 digits in `n` (1 for 0)
+# ---
+# n:   the value to measure
+# ret: the digit count
+fun decimal_len(n: usize) usize {
+    if (n == 0) { ret 1; }
+    var len: usize = 0;
+    var v:   usize = n;
+    for (v > 0) {
+        len = len + 1;
+        v = v / 10;
+    }
+    ret len;
+}
+
+# write the base-10 digits of `n` into `buf` at offset `k`
+# ---
+# buf: destination buffer
+# k:   offset to begin writing at
+# n:   the value to render
+# ret: the offset just past the digits
+fun write_decimal(buf: str, k: usize, n: usize) usize {
+    if (n == 0) { ret write_char(buf, k, '0'); }
+
+    var tmp:    [24]char;
+    var digits: usize = 0;
+    var v:      usize = n;
+    for (v > 0) {
+        tmp[digits] = (v % 10)::char + '0';
+        v = v / 10;
+        digits = digits + 1;
+    }
+
+    var w: usize = k;
+    var i: usize = 0;
+    for (i < digits) {
+        w = write_char(buf, w, tmp[digits - 1 - i]);
+        i = i + 1;
+    }
+    ret w;
+}
