@@ -27,6 +27,14 @@ syntax:
 fun up(p: u32) ^u32 { ret p; }      # public u32 flows into a secret slot
 ```
 
+A **literal is public by construction** and stays public through that coercion:
+its value sits in the instruction stream, so classifying it as secret would
+protect nothing. `var s: ^u32 = 5;` types `5` as `u32` and relies on the
+up-coerce. The join below is unaffected — a value *computed* with a secret is
+secret however its other operand is spelled — so `v << 3` on a secret `v` still
+yields a secret, while the constant `3` is not mistaken for a secret shift
+count.
+
 The reverse never happens implicitly. The only downgrade is the explicit `:^`
 strip below.
 
@@ -54,12 +62,18 @@ error decided by operand type:
 - a secret left operand of a short-circuiting `&&` / `||` (it is the branch the
   operator keys on; a secret right operand only taints the result)
 - a secret memory index (`table[i]` with `i` secret)
+- a secret memory address — an access through a secret *pointer*, whether by
+  `@p`, `p[i]`, or the auto-deref in `p.x`. The index and the address are the
+  two halves of one effective address, so both are gated. Only a secret
+  *pointer* is an address: a `^[N]T` or `^Rec` is a secret value living at a
+  public address, and a `*^T` is a public address to secret storage
 - a secret operand of the always-variable-latency `/` or `%`
 
 ```mach
-fun leak(a: ^u32, t: *u8) u8 {
+fun leak(a: ^u32, t: *u8, p: ^*u8) u8 {
     if (a) { ret 1; }       # error: secret value used as a branch condition
     ret t[a];               # error: secret value used as a memory index
+    ret @p;                 # error: secret value used as a memory address
 }
 ```
 
@@ -133,10 +147,22 @@ mixed.
 The check is **deep** and **fails closed**: a secret nested anywhere inside an
 aggregate (including a generic instance's lazily-materialized fields) counts as
 secret at these boundaries, and a placement the checker cannot prove severs no
-weld — a `:~` reinterpret across differing shapes, or a secrecy difference
-reachable through a function type — is rejected rather than allowed. This
-over-rejects in some safe cases (briar-systems/mach#2167); rejecting is the
-correct default for a confidentiality property.
+weld — a secrecy difference reachable through a function type, or a shape whose
+layout it cannot determine — is rejected rather than allowed.
+
+Two aggregates are compared **by byte extent**, not by field ordinal: matching
+`^` placement in the type graph does not put two fields on the same bytes, so
+each paired field must also agree in size and alignment. That is what keeps
+every later field aligned between the two, and without it a narrower secret on
+one side displaced a public field onto a secret one. Differing *shapes* are
+fine — with the common prefix identical byte for byte, a longer aggregate's
+extra fields provably begin past the shorter one's extent, so a public field
+beyond the secret is accepted. This holds only for sequential layout; a union
+overlays every variant at offset 0, so a differing-shape pair involving one is
+admitted only when neither side has a public-stored byte at all.
+
+The comparison reads the same layout the backend emits. Where it cannot
+determine a layout it declines, which rejects.
 
 ## `#[oblivious]` — the codegen contract
 
@@ -201,18 +227,13 @@ What does not hold — the known open holes:
 - **`$fields` reflection projection inside a generic erases a secret field's
   secrecy**, which discloses the secret. Proven, security-blocking
   (briar-systems/mach#2168).
-- a **secret pointer dereference is gated only by the translation validator**,
-  which runs inside `#[oblivious]` functions alone, so anywhere else it compiles
-  with no diagnostic — where the equivalent secret *index* is a source-level
-  error everywhere (briar-systems/mach#2191)
-- deep secrecy placement over-rejects differing-shape aggregates that lack field
-  offsets — sound but too strict (briar-systems/mach#2167)
 - the validator over-taints a wide secret on a narrow-ALU target, rejecting a
   public-count shift as a secret memory address — a false positive; it fails safe
   (briar-systems/mach#2195)
-- a literal shift count coerces to `^T` and inherits secrecy, tripping the
-  constant-time shift gate — a false positive; it fails safe
-  (briar-systems/mach#2196)
+- a **member or index access through a secret pointer** is rejected by the
+  secret-address gate, but a `p.x` / `p[i]` on a plain `^Rec` or `^[N]T` — which
+  this page documents as legal — fails at lowering, which does not strip the `^`
+  before resolving the field. A spurious error, not a disclosure
 - an anonymous `uni` nested in a **generic** record does not get union layout:
   its variants occupy distinct storage instead of overlapping
   (briar-systems/mach#2239). A layout defect, not a secrecy one — the mixed-secrecy
