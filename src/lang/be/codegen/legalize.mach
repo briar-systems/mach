@@ -630,10 +630,10 @@ fun memory_piece_count(plan: *LanePlan, mi: *mir.MirInstr) R.Result[u32, str] {
     if (mi.operand_count != 2) { ret R.err[u32, str](unsupported_message(mi.opcode, mi.width)); }
     val mx: i32 = mem_operand_index(mi);
     val vx: u32 = 1 - mx::u32;
-    if (!operand_is_lane_ready(plan, ?mi.operands[vx])) {
+    var n: u32 = wide_lane_count(plan, mi);
+    if (!operand_is_lane_ready(plan, ?mi.operands[vx], n)) {
         ret R.err[u32, str](unsupported_message(mi.opcode, mi.width));
     }
-    var n: u32 = wide_lane_count(plan, mi);
     val mem: *mir.MirOperand = ?mi.operands[mx::u32];
     if (base_needs_staging(plan, mem)) {
         val pl: u32 = plan.lane_count[mem.vreg]::u32;
@@ -827,17 +827,21 @@ fun lane_operand(plan: *LanePlan, op: *mir.MirOperand, i: u32) mir.MirOperand {
     ret @op;
 }
 
-# whether one operand can be decomposed into native-width lanes
+# whether one operand can be decomposed into `nl` native-width lanes
 #
 # A lane-split vreg, an immediate, and a physical register each yield a lane
 # operand; anything else (a symbol, a block, a second memory reference) does not.
+# A vreg the plan did NOT split is its own lane 0, so it is ready for a single-lane
+# operation - the shape a narrow access through a wide pointer takes.
 # ---
 # plan: the function's lane assignment
 # op:   the operand to test
+# nl:   the number of lanes the operation spans
 # ret:  true when `lane_operand` yields a meaningful lane for it
-fun operand_is_lane_ready(plan: *LanePlan, op: *mir.MirOperand) bool {
+fun operand_is_lane_ready(plan: *LanePlan, op: *mir.MirOperand, nl: u32) bool {
     if (op.kind == mir.MIR_OP_VREG) {
-        ret op.vreg < plan.orig_count && plan.lane_base[op.vreg] != LANE_NONE;
+        if (op.vreg < plan.orig_count && plan.lane_base[op.vreg] != LANE_NONE) { ret true; }
+        ret nl == 1;
     }
     ret op.kind == mir.MIR_OP_IMM || op.kind == mir.MIR_OP_PREG;
 }
@@ -923,11 +927,11 @@ fun expand_not(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
 # which is what naming one register for a multi-register value means.
 fun expand_mov(alloc: *A.Allocator, plan: *LanePlan, mi: *mir.MirInstr,
                dst: *mir.MirInstr, cursor: *u32) R.Result[bool, str] {
-    if (mi.operand_count != 2 || !operand_is_lane_ready(plan, ?mi.operands[0]) ||
-        !operand_is_lane_ready(plan, ?mi.operands[1])) {
+    val nl: u32 = wide_lane_count(plan, mi);
+    if (mi.operand_count != 2 || !operand_is_lane_ready(plan, ?mi.operands[0], nl) ||
+        !operand_is_lane_ready(plan, ?mi.operands[1], nl)) {
         ret R.err[bool, str](unsupported_message(mi.opcode, mi.width));
     }
-    val nl: u32 = wide_lane_count(plan, mi);
     val lw: u8  = plan.lane_width;
     var i: u32 = 0;
     for (i < nl) {
@@ -1298,5 +1302,152 @@ test "mach.lang.be.codegen.legalize:rejects_unsupported_wide_op" {
     var mach: Machine = t_mach(1, 2);
     val r: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f);
     if (!R.is_err[bool, str](r)) { ret 1; }
+    ret 0;
+}
+
+# a wide memory access at a FIXED base - a physical register, the shape the ABI emits
+# for an incoming stack parameter - decomposes into one native access per lane at
+# successive displacements, and a move with a memory operand becomes the load it is
+test "mach.lang.be.codegen.legalize:expands_wide_access_at_a_fixed_base" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    # v0 = [fp + 0] as a width-4 move, exactly `emit_param_slot`'s stack-scalar form.
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 1);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 1);
+    var ld: [2]mir.MirOperand;
+    ld[0] = mir.op_vreg(0); ld[1] = mir.op_mem_preg(0, 0);
+    t_instr(?alloc, ?b, 0, mir.MIR_MOV, ?ld[0], 2, 4);
+    f.blocks = ?b; f.block_count = 1;
+
+    var mach: Machine = t_mach(1, 2);
+    val r: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f);
+    if (R.is_err[bool, str](r))  { ret 1; }
+    if (b.instr_count != 4)      { ret 1; }
+
+    var i: u32 = 0;
+    for (i < 4) {
+        if (b.instrs[i].opcode != mir.MIR_LOAD)             { ret 1; }
+        if (b.instrs[i].width != 1)                         { ret 1; }
+        if (b.instrs[i].operands[0].vreg != 1 + i)          { ret 1; }  # v0's byte lanes
+        if (b.instrs[i].operands[1].kind != mir.MIR_OP_MEM) { ret 1; }
+        if (b.instrs[i].operands[1].preg != 0)              { ret 1; }  # still off fp
+        if (b.instrs[i].operands[1].imm != i::i64)          { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# a wide value placed in a physical register decomposes onto the CONSECUTIVE register
+# run starting there - the hidden result pointer arriving in the convention's pair
+test "mach.lang.be.codegen.legalize:expands_wide_preg_move_onto_consecutive_regs" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 1);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 1);
+    var mv: [2]mir.MirOperand;
+    mv[0] = mir.op_vreg(0); mv[1] = mir.op_preg(4);
+    t_instr(?alloc, ?b, 0, mir.MIR_MOV, ?mv[0], 2, 2);
+    f.blocks = ?b; f.block_count = 1;
+
+    var mach: Machine = t_mach(1, 2);
+    val r: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f);
+    if (R.is_err[bool, str](r)) { ret 1; }
+    if (b.instr_count != 2)     { ret 1; }
+    if (b.instrs[0].operands[0].vreg != 1 || b.instrs[0].operands[1].preg != 4) { ret 1; }
+    if (b.instrs[1].operands[0].vreg != 2 || b.instrs[1].operands[1].preg != 5) { ret 1; }
+    ret 0;
+}
+
+# a memory access through a RUNTIME pointer stages the pointer's lanes into the
+# backend's reserved address pair and decomposes at that fixed base
+#
+# Both the wide access (the four bytes of a `u32`) and the NARROW one are covered: the
+# narrow case is not an optimization but a correctness requirement, since the pointer's
+# defining instruction is replaced by its lane moves and a base still naming it would
+# name a vreg nothing defines.
+test "mach.lang.be.codegen.legalize:stages_runtime_pointer_into_the_address_pair" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    # v0 = the incoming pointer (2 lanes); v1 = a wide value; store v1 through v0, then
+    # read one byte back through the same pointer.
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 3);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 4);
+    var p: [2]mir.MirOperand;
+    p[0] = mir.op_vreg(0); p[1] = mir.op_preg(4);
+    t_instr(?alloc, ?b, 0, mir.MIR_MOV, ?p[0], 2, 2);
+    var v: [2]mir.MirOperand;
+    v[0] = mir.op_vreg(1); v[1] = mir.op_imm(0x01020304);
+    t_instr(?alloc, ?b, 1, mir.MIR_MOV, ?v[0], 2, 4);
+    var stv: [2]mir.MirOperand;
+    stv[0] = mir.op_mem_value(0, 0); stv[1] = mir.op_vreg(1);
+    t_instr(?alloc, ?b, 2, mir.MIR_STORE, ?stv[0], 2, 4);
+    var ldv: [2]mir.MirOperand;
+    ldv[0] = mir.op_vreg(2); ldv[1] = mir.op_mem_value(0, 3);
+    t_instr(?alloc, ?b, 3, mir.MIR_LOAD, ?ldv[0], 2, 1);
+    f.blocks = ?b; f.block_count = 1;
+
+    var mach: Machine = t_mach(1, 2);
+    val r: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f);
+    if (R.is_err[bool, str](r)) { ret 1; }
+    # 2 pointer lanes + 4 value lanes + (2 staging + 4 stores) + (2 staging + 1 load).
+    if (b.instr_count != 15) { ret 1; }
+
+    # the wide store: staged into the reserved pair, then four byte writes off it.
+    if (b.instrs[6].operands[0].preg != 6) { ret 1; }
+    if (b.instrs[7].operands[0].preg != 7) { ret 1; }
+    var i: u32 = 0;
+    for (i < 4) {
+        val st: *mir.MirInstr = ?b.instrs[8 + i];
+        if (st.opcode != mir.MIR_STORE)             { ret 1; }
+        if (st.width != 1)                          { ret 1; }
+        if (st.operands[0].kind != mir.MIR_OP_MEM)  { ret 1; }
+        if (st.operands[0].vreg != mir.MIR_VREG_NIL){ ret 1; }
+        if (st.operands[0].preg != 6)               { ret 1; }
+        if (st.operands[0].imm != i::i64)           { ret 1; }
+        i = i + 1;
+    }
+    # the narrow load through the same pointer is staged too, keeping its displacement.
+    if (b.instrs[12].operands[0].preg != 6)          { ret 1; }
+    if (b.instrs[13].operands[0].preg != 7)          { ret 1; }
+    if (b.instrs[14].opcode != mir.MIR_LOAD)         { ret 1; }
+    if (b.instrs[14].operands[1].preg != 6)          { ret 1; }
+    if (b.instrs[14].operands[1].imm != 3)           { ret 1; }
+    ret 0;
+}
+
+# a target whose pointer is a machine word never takes the staging path: a narrow
+# access through a value base is not wide, so the function is returned untouched.
+# this is the inertness clause that keeps every wide-native target byte-identical
+test "mach.lang.be.codegen.legalize:value_base_is_inert_on_a_wide_pointer_target" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 2);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 1);
+    var ops: [2]mir.MirOperand;
+    ops[0] = mir.op_vreg(1); ops[1] = mir.op_mem_value(0, 0);
+    t_instr(?alloc, ?b, 0, mir.MIR_LOAD, ?ops[0], 2, 8);  # width 8 == native
+    f.blocks = ?b; f.block_count = 1;
+
+    val before_ptr:   *mir.MirInstr = b.instrs;
+    val before_vregs: u32           = f.vreg_count;
+
+    var mach: Machine = t_mach(8, 8);
+    val r: R.Result[bool, str] = legalize_function(?alloc, ?mach, ?f);
+    if (R.is_err[bool, str](r))       { ret 1; }
+    if (b.instrs != before_ptr)       { ret 1; }
+    if (b.instr_count != 1)           { ret 1; }
+    if (f.vreg_count != before_vregs) { ret 1; }
     ret 0;
 }
