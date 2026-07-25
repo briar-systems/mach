@@ -884,8 +884,8 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         # already reserved the GP slot in `gp_used`.
         if (sret_ptr != mir.MIR_VREG_NIL) {
             val sret_reg: i32 = ctx.tgt.abi.indirect_result_reg;
-            val pre: R.Result[bool, str] = context.emit_mov(ctx, mb,
-                mir.op_preg(sret_reg::u32), mir.op_vreg(sret_ptr));
+            val pre: R.Result[bool, str] = context.emit_mov_w(ctx, mb,
+                mir.op_preg(sret_reg::u32), mir.op_vreg(sret_ptr), ptr_move_width(ctx));
             if (R.is_err[bool, str](pre)) {
                 sig_layout_free(ctx, ?layout);
                 ret pre;
@@ -1227,8 +1227,11 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
         }
         # the outgoing scalar argument is stored at `[sp + stack_off]`; the stack
         # pointer is fixed after the prologue and points at the base of the outgoing
-        # region, so the store lands in the slot frame.run reserved for it.
-        ret context.emit_store_to(ctx, mb, mir.op_mem_preg(sp, stack_off), argop);
+        # region, so the store lands in the slot frame.run reserved for it. the write
+        # is the scalar's own width when that exceeds the machine word (the read twin
+        # in `emit_param_slot`), so an 8-bit target passes all of a wide argument.
+        ret context.emit_store_to_w(ctx, mb, mir.op_mem_preg(sp, stack_off), argop,
+                                    scalar_mem_move_width(ctx.tgt.model.gpr_width, size));
     }
     if (slot.class == abi.CLASS_BYREF) {
         # the aggregate is passed by hidden pointer; move its address into the
@@ -1236,7 +1239,7 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
         var base: u32 = mir.MIR_VREG_NIL;
         val ar: R.Result[bool, str] = context.addr_to_vreg(ctx, mb, argop, ?base);
         if (R.is_err[bool, str](ar)) { ret ar; }
-        ret context.emit_mov(ctx, mb, mir.op_preg(slot.reg::u32), mir.op_vreg(base));
+        ret context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), mir.op_vreg(base), ptr_move_width(ctx));
     }
     if (is_aggr) {
         # register / register-plus-stack aggregate: place each chunk from the
@@ -1267,7 +1270,7 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
     # single GP register scalar argument. a 32-bit value rides a width-4 move so the
     # backend re-extends it to the register width by its own convention (RV64 lp64
     # sign-extends a 32-bit register).
-    ret context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), argop, scalar_reg_move_width(ctx, size));
+    ret context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), argop, scalar_reg_move_width(ctx.tgt.model.gpr_width, size));
 }
 
 # store a register-resident vector to a fresh 16-byte-aligned frame temporary and
@@ -1333,13 +1336,56 @@ fun capture_slot_reg(ctx: *context.LowerCtx, mb: *mir.MirBlock, dst: u32, slot: 
 # register. a 32-bit value rides a width-4 move so a backend can re-extend it to the
 # register width by its own convention -- RV64 lp64 holds a 32-bit register
 # sign-extended, so a directly materialized i32 constant must be re-signed there, and
-# the carried width is what lets it. every other size keeps the full gpr-width move:
-# a 64-bit value / pointer is already register-width, and narrowing below 32 bits
-# would leave a target's upper register bits unspecified (an x86 `mov al` does not
-# clear them). value-equivalent on x86 / arm64, where a 32-bit move zero-extends
-fun scalar_reg_move_width(ctx: *context.LowerCtx, size: u64) u8 {
+# the carried width is what lets it. a scalar WIDER than the machine word rides its
+# own size: on a target whose register is narrower than a scalar (the 8-bit mos6502)
+# the machine word would truncate the value, and the carried width is what the width
+# legalizer splits into register-sized lanes. every other size keeps the full
+# gpr-width move: a 64-bit value / pointer is already register-width, and narrowing
+# below 32 bits would leave a target's upper register bits unspecified (an x86
+# `mov al` does not clear them). value-equivalent on x86 / arm64, where a 32-bit move
+# zero-extends; inert on every wide-native target, whose widest scalar is the machine
+# word
+# ---
+# gpr_width: the target's machine word in bytes
+# size:      the scalar's byte size
+# ret:       the move width in bytes
+fun scalar_reg_move_width(gpr_width: u32, size: u64) u8 {
     if (size == 4) { ret 4; }
-    ret ctx.tgt.model.gpr_width::u8;
+    if (size > gpr_width::u64) { ret size::u8; }
+    ret gpr_width::u8;
+}
+
+# the move width for reading / writing a scalar in its incoming / outgoing STACK
+# argument slot
+#
+# The memory twin of `scalar_reg_move_width`, and it deliberately lacks that
+# function's 32-bit special case: a stack slot is not a register, so nothing has to
+# re-extend it and the machine-word access every wide-native target already emits is
+# preserved exactly. The one rule it adds is the same: a scalar wider than the machine
+# word is accessed at its own size, so an 8-bit target reads all four bytes of a `u32`
+# stack parameter instead of its low byte.
+# ---
+# gpr_width: the target's machine word in bytes
+# size:      the scalar's byte size
+# ret:       the access width in bytes
+fun scalar_mem_move_width(gpr_width: u32, size: u64) u8 {
+    if (size > gpr_width::u64) { ret size::u8; }
+    ret gpr_width::u8;
+}
+
+# the move width for placing a hidden POINTER -- an sret result-storage address, a
+# by-reference aggregate address -- into its register or stack slot
+#
+# A pointer is `pointer_width` bytes, which equals the machine word on every
+# wide-native target and exceeds it on a target whose registers are narrower than an
+# address (mos6502's 8-bit registers, 16-bit addresses). Carrying the pointer's own
+# width is what keeps the placement from truncating the address there, and what the
+# width legalizer splits into register-sized lanes.
+# ---
+# ctx: the active lowering context (supplies the pointer width)
+# ret: the pointer move width in bytes
+fun ptr_move_width(ctx: *context.LowerCtx) u8 {
+    ret ctx.tgt.model.pointer_width::u8;
 }
 
 # grow the function's reserved outgoing-argument region to cover one call's footprint
@@ -1425,7 +1471,8 @@ pub fun lower_params(ctx: *context.LowerCtx, mb: *mir.MirBlock) R.Result[bool, s
             ret R.err[bool, str](R.unwrap_err[u32, str](svr));
         }
         val sv: u32 = R.unwrap_ok[u32, str](svr);
-        val mv: R.Result[bool, str] = context.emit_mov(ctx, mb, mir.op_vreg(sv), mir.op_preg(sret_reg::u32));
+        val mv: R.Result[bool, str] = context.emit_mov_w(ctx, mb, mir.op_vreg(sv), mir.op_preg(sret_reg::u32),
+                                                         ptr_move_width(ctx));
         if (R.is_err[bool, str](mv)) {
             sig_layout_free(ctx, ?layout);
             ret mv;
@@ -1499,7 +1546,8 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSl
         # pointer into this stack slot; load it so `pv` is the aggregate's address,
         # matching the register BYREF parameter form.
         val fp: u32 = ctx.tgt.model.frame_ptr_reg::u32;
-        ret context.emit_mov(ctx, mb, mir.op_vreg(pv), mir.op_mem_preg(fp, arg_base + stack_off));
+        ret context.emit_mov_w(ctx, mb, mir.op_vreg(pv), mir.op_mem_preg(fp, arg_base + stack_off),
+                               ptr_move_width(ctx));
     }
     if (slot.class == abi.CLASS_STACK) {
         val fp: u32 = ctx.tgt.model.frame_ptr_reg::u32;
@@ -1510,10 +1558,13 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSl
         }
         # a scalar stack argument lives above the return address and saved frame
         # pointer, addressed through the physical frame pointer at the running offset.
-        ret context.emit_mov(ctx, mb, mir.op_vreg(pv), mir.op_mem_preg(fp, arg_base + stack_off));
+        # the read is the scalar's own width when that exceeds the machine word, so an
+        # 8-bit target loads all of a wide parameter rather than its low byte.
+        ret context.emit_mov_w(ctx, mb, mir.op_vreg(pv), mir.op_mem_preg(fp, arg_base + stack_off),
+                               scalar_mem_move_width(ctx.tgt.model.gpr_width, size));
     }
     if (slot.class == abi.CLASS_BYREF) {
-        ret context.emit_mov(ctx, mb, mir.op_vreg(pv), mir.op_preg(slot.reg::u32));
+        ret context.emit_mov_w(ctx, mb, mir.op_vreg(pv), mir.op_preg(slot.reg::u32), ptr_move_width(ctx));
     }
     if (is_aggr) {
         # register / register-plus-stack aggregate: materialize a spill slot keyed on
@@ -1661,7 +1712,8 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
             val sr: R.Result[bool, str] = context.emit_store_to_w(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rsz::u8);
             if (R.is_err[bool, str](sr)) { ret sr; }
         }
-        val mr: R.Result[bool, str] = context.emit_mov(ctx, mb, mir.op_preg(slot.reg::u32), mir.op_vreg(ctx.sret_vreg));
+        val mr: R.Result[bool, str] = context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32),
+                                                         mir.op_vreg(ctx.sret_vreg), ptr_move_width(ctx));
         if (R.is_err[bool, str](mr)) { ret mr; }
     } or (rag) {
         # aggregate return by address: load each register chunk from the aggregate's
@@ -1695,7 +1747,7 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
         # scalar GP return: a 32-bit value rides a width-4 move so the backend
         # re-extends it to the register width by its own convention (RV64 lp64
         # sign-extends a 32-bit register).
-        val mr: R.Result[bool, str] = context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), rvop, scalar_reg_move_width(ctx, rsz));
+        val mr: R.Result[bool, str] = context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), rvop, scalar_reg_move_width(ctx.tgt.model.gpr_width, rsz));
         if (R.is_err[bool, str](mr)) { ret mr; }
     }
 
@@ -1719,6 +1771,37 @@ fun emit_bare_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock) R.Result[bool, str]
     mi.width         = ctx.tgt.model.gpr_width::u8;
     mi.src_width     = ctx.tgt.model.gpr_width::u8;
     ret context.push_instr(ctx, mb, mi);
+}
+
+# a scalar placement carries the value's own width once it exceeds the machine word
+#
+# The register and memory sides of the same rule, and the reason `fun f(v: u32) u32`
+# could not build for an 8-bit target: every placement moved a machine word, so a 4-byte
+# stack parameter read one byte. Both halves are pinned at an 8-byte machine word too,
+# where the rule is dead and the widths are exactly what they always were - that column
+# is the byte-identity of every wide-native target.
+test "mach.lang.be.codegen.mir.abi:scalar_move_widths" {
+    # an 8-byte machine word: no scalar exceeds it, so only the 32-bit re-extension
+    # case moves the register width and the memory side is the machine word throughout.
+    if (scalar_reg_move_width(8, 1) != 8) { ret 1; }
+    if (scalar_reg_move_width(8, 2) != 8) { ret 1; }
+    if (scalar_reg_move_width(8, 4) != 4) { ret 1; }
+    if (scalar_reg_move_width(8, 8) != 8) { ret 1; }
+    if (scalar_mem_move_width(8, 1) != 8) { ret 1; }
+    if (scalar_mem_move_width(8, 4) != 8) { ret 1; }
+    if (scalar_mem_move_width(8, 8) != 8) { ret 1; }
+
+    # a 1-byte machine word: every wider scalar carries its own size, so the width
+    # legalizer downstream sees the whole value rather than its low byte.
+    if (scalar_reg_move_width(1, 1) != 1) { ret 1; }
+    if (scalar_reg_move_width(1, 2) != 2) { ret 1; }
+    if (scalar_reg_move_width(1, 4) != 4) { ret 1; }
+    if (scalar_reg_move_width(1, 8) != 8) { ret 1; }
+    if (scalar_mem_move_width(1, 1) != 1) { ret 1; }
+    if (scalar_mem_move_width(1, 2) != 2) { ret 1; }
+    if (scalar_mem_move_width(1, 4) != 4) { ret 1; }
+    if (scalar_mem_move_width(1, 8) != 8) { ret 1; }
+    ret 0;
 }
 
 # an sret return seeds a GP argument slot only when the pointer is in the argfile
