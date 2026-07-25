@@ -1049,8 +1049,9 @@ pub fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Res
 
     val rr_raw: R.Result[*ir.Module, str] = lower_raw(p, mid, home);
     if (R.is_err[*ir.Module, str](rr_raw)) {
+        val emsg: str = lower_stable_err(p, R.unwrap_err[*ir.Module, str](rr_raw));
         ir_release(alloc, home);
-        ret R.err[query.QueryOutput, str](R.unwrap_err[*ir.Module, str](rr_raw));
+        ret R.err[query.QueryOutput, str](emsg);
     }
     val irmod: *ir.Module = R.unwrap_ok[*ir.Module, str](rr_raw);
 
@@ -1061,8 +1062,9 @@ pub fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Res
     }
     val ro: R.Result[bool, str] = lower_optimize(p, irmod, R.unwrap_ok[intern.StrId, str](nid));
     if (R.is_err[bool, str](ro)) {
+        val emsg: str = lower_stable_err(p, R.unwrap_err[bool, str](ro));
         ir_release(alloc, home);
-        ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](ro));
+        ret R.err[query.QueryOutput, str](emsg);
     }
 
     ret ir_handle_encode(alloc, irmod, home);
@@ -1159,6 +1161,29 @@ fun ir_home_new(alloc: *A.Allocator) R.Result[*ir.ModuleHome, str] {
         ret R.err[*ir.ModuleHome, str](O.unwrap[str](io));
     }
     ret R.ok[*ir.ModuleHome, str](home);
+}
+
+# re-home an error message that may live in a module's arena onto the session
+# interner
+#
+# A lowering or optimization failure can report through a message built on the
+# module allocator - `pipeline.run`'s `simd = "require"` diagnostic formats itself
+# with `format.sprint(m.alloc, ...)` - and every failure path here releases that
+# arena before returning. Copying the text onto session-owned storage first is
+# what keeps the render from reading freed memory (#2153, the same trap the
+# codegen pool hit). A static-literal message re-interns harmlessly; a failure to
+# intern degrades to a fixed message rather than losing the report.
+# ---
+# p:   the active project (its session interner outlives the release)
+# msg: the raw message, possibly backed by a module arena
+# ret: the same text on session-owned storage
+fun lower_stable_err(p: *project.Project, msg: str) str {
+    val ir_r: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, msg);
+    if (R.is_ok[intern.StrId, str](ir_r)) {
+        val nm: O.Option[str] = intern.lookup(?p.s.interner, R.unwrap_ok[intern.StrId, str](ir_r));
+        if (O.is_some[str](nm)) { ret O.unwrap[str](nm); }
+    }
+    ret "lowering failed, and re-homing its diagnostic off the module arena failed in turn (allocation failure)";
 }
 
 # release a lowered module and the arena it lives in
@@ -1300,8 +1325,10 @@ fun plw_worker_main(arg: *u8) {
 # that module alone.
 #
 # Failure is deterministic: the first error in topo order wins whichever worker
-# hit it, and every module built so far is released rather than staged, so a
-# failed pass leaves no half-optimized IR for a later demand to adopt.
+# hit it, and every module built so far is released, so a failed pass leaves no
+# half-optimized IR for a later demand to adopt. The message is re-homed onto the
+# session interner first, because the arena that may back it is one of the ones
+# released.
 # ---
 # p:   the active project (lower_prepare has settled the staleness verdicts)
 # ret: true once every stale module is staged, or the first error
@@ -1340,6 +1367,7 @@ fun run_lower_parallel(p: *project.Project) R.Result[bool, str] {
 
         val hr: R.Result[*ir.ModuleHome, str] = ir_home_new(p.s.alloc);
         if (R.is_err[*ir.ModuleHome, str](hr)) {
+            lower_sweep_staged(p);
             A.deallocate[PlwSlot](p.alloc, slots, topo_len::usize);
             ret R.err[bool, str](R.unwrap_err[*ir.ModuleHome, str](hr));
         }
@@ -1347,9 +1375,11 @@ fun run_lower_parallel(p: *project.Project) R.Result[bool, str] {
 
         val rr_raw: R.Result[*ir.Module, str] = lower_raw(p, mid, home);
         if (R.is_err[*ir.Module, str](rr_raw)) {
+            val emsg: str = lower_stable_err(p, R.unwrap_err[*ir.Module, str](rr_raw));
             ir_release(p.s.alloc, home);
+            lower_sweep_staged(p);
             A.deallocate[PlwSlot](p.alloc, slots, topo_len::usize);
-            ret R.err[bool, str](R.unwrap_err[*ir.Module, str](rr_raw));
+            ret R.err[bool, str](emsg);
         }
         m.staged_ir   = R.unwrap_ok[*ir.Module, str](rr_raw);
         m.staged_home = home;
@@ -1384,6 +1414,7 @@ fun run_lower_parallel(p: *project.Project) R.Result[bool, str] {
     if (extra > 0) {
         val rt: R.Result[*thread.Thread, str] = A.allocate[thread.Thread](p.alloc, extra::usize);
         if (R.is_err[*thread.Thread, str](rt)) {
+            lower_sweep_staged(p);
             A.deallocate[PlwSlot](p.alloc, slots, topo_len::usize);
             ret R.err[bool, str](R.unwrap_err[*thread.Thread, str](rt));
         }
@@ -1404,12 +1435,12 @@ fun run_lower_parallel(p: *project.Project) R.Result[bool, str] {
     }
 
     # first error in topo order wins - deterministic regardless of which worker hit
-    # it. the message is a static literal or session-interned by the failing pass,
-    # so it outlives the sweep that follows.
+    # it. the message is re-homed onto the session interner BEFORE the sweep below
+    # frees the module arena that may back it (#2153).
     var ei: u32 = 0;
     for (ei < slot_len) {
         if (slots[ei].err != nil) {
-            val msg: str = slots[ei].err;
+            val msg: str = lower_stable_err(p, slots[ei].err);
             lower_sweep_staged(p);
             A.deallocate[PlwSlot](p.alloc, slots, topo_len::usize);
             ret R.err[bool, str](msg);
