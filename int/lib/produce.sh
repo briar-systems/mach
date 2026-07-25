@@ -35,6 +35,17 @@
 #                 execution cannot produce: a vectorizer that silently stops firing
 #                 still computes the right answer, so a run-and-compare case stays
 #                 green while the feature is dead. needs llvm-objdump.
+#   vector-lanes— disassemble the case's own objects and report, per function, whether
+#                 a vector LANE was accessed in a register and whether a whole 128-bit
+#                 vector went to memory (#2236). the same blind spot as vector-emit:
+#                 lane access through a stack round-trip computes the right answer, so
+#                 only the emitted form distinguishes it. needs llvm-objdump.
+#   float-emit  — disassemble the case's own objects and report, per function, how
+#                 many emitted instructions name the back end's reserved FP scratch
+#                 registers (#2237). the same argument as vector-emit: an encoder
+#                 that stages every allocated float operand through scratch computes
+#                 the right answer while emitting twice the instructions, so only a
+#                 shape observable can see it. needs llvm-objdump.
 #
 # build-fails is a run-mode but not a producer: it asserts the compile is REJECTED
 # and takes the compiler's 'error:' diagnostic as the observable. it is handled in
@@ -336,42 +347,129 @@ resolve_objdump() {
 # moves with every unrelated backend change, while `simd` / `scalar` moves only when
 # the vectorizer's own decision does.
 produce_vector_emit() {
-    bin=$3
+    dis_case_objects vector-emit "$3" | vector_emit_scan
+}
+
+# dis_case_objects <producer> <binary>
+# disassemble the case's OWN module objects (not its dependencies') to stdout, the
+# shared front half of every emitted-shape producer.
+#
+# the objects rather than the linked binary: mach's linker emits no symbol table, so
+# per-function attribution exists only before the link. they sit beside the artifact
+# because such a case pins `out = "out/int/build"` in its own manifest; the project
+# id (the directory under obj/ holding the case's modules) is read from that same
+# manifest rather than assumed. <producer> only names the caller in diagnostics.
+dis_case_objects() {
+    who=$1
+    bin=$2
     dir=$(dirname "$(dirname "$(dirname "$bin")")")
     id=$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/mach.toml" | head -1)
     if [ -z "$id" ]; then
-        echo "int: vector-emit: no project id in ${dir}/mach.toml" >&2; return 2
+        echo "int: $who: no project id in ${dir}/mach.toml" >&2; return 2
     fi
     objdir="$dir/out/int/build/obj/$id"
     if [ ! -d "$objdir" ]; then
-        echo "int: vector-emit: no objects at $objdir (the case must pin out = \"out/int/build\")" >&2; return 2
+        echo "int: $who: no objects at $objdir (the case must pin out = \"out/int/build\")" >&2; return 2
     fi
     tool=$(resolve_objdump) || {
-        echo "int: vector-emit: llvm-objdump not found (install the 'llvm' package)" >&2; return 2
+        echo "int: $who: llvm-objdump not found (install the 'llvm' package)" >&2; return 2
     }
     find "$objdir" -name '*.o' | sort | while IFS= read -r o; do
         "$tool" -d --no-show-raw-insn "$o"
-    done | vector_emit_scan
+    done
 }
 
-# vector_emit_scan — read a disassembly on stdin, print `<function> simd|scalar`
-# sorted by function, preceded by the ISA the dispatch resolved.
+# produce_float_emit <runmode> <target> <binary>
+# the scalar-float EMISSION observable (#2237): for each function of the case's own
+# module, how many emitted instructions name the back end's reserved FP scratch
+# registers.
 #
-# packed-SIMD recognition is per ISA and deliberately narrow, so a scalar function
-# can never read as vectorized:
-#   x86_64  — the packed SSE opcodes, plus MOVUPS / MOVAPS / MOVDQU / MOVDQA, which
-#             the backend emits only for a 128-bit value. the scalar `*ss` / `*sd`
-#             forms and the bank-crossing MOVD / MOVQ are excluded, as is XORPS,
-#             which zeroes an XMM for scalar float negation, and PXOR, which clears
-#             one.
-#   aarch64 — any operand naming a NEON register: a `vN.<arrangement>` or a 128-bit
-#             `qN`. scalar float uses `sN` / `dN` and never matches.
-#   riscv64 — any RVV mnemonic (`v...`); no scalar riscv64 mnemonic starts with `v`.
-#             riscv64 has no 128-bit vector model, so every verdict there is scalar.
-# a case whose source writes SIMD types directly would defeat this (its packed ops
-# are not the vectorizer's); the vectorize cases use scalar element types only.
-vector_emit_scan() {
-    awk '
+# the same argument as vector-emit. an encoder that stages every already-allocated
+# float operand through a fixed scratch pair — which is what x86-64 did for every
+# operand of every scalar float op before #2237 — computes exactly the right answer
+# while emitting four instructions where two suffice, so a run-and-compare case is
+# vacuously green against it. the scratch count is what changes.
+#
+# the count IS the observable here, unlike vector-emit's verdict: zero is a
+# statement ("no allocated operand was staged"), and the number a regression
+# reintroduces is the diagnostic. it is stable against unrelated backend work
+# because only a genuine spill legitimately reaches scratch, which is why the case
+# pins the release profile and keeps its kernels under register pressure.
+produce_float_emit() {
+    dis_case_objects float-emit "$3" | float_emit_scan
+}
+
+# vector_emit_scan — `<function> simd|scalar` per function (see emit_scan)
+vector_emit_scan() { emit_scan simd; }
+
+# float_emit_scan — `<function> scratch=<count>` per function (see emit_scan)
+float_emit_scan() { emit_scan fpscratch; }
+
+# frame_elision_scan — `<function> framed|frameless` per function (see emit_scan)
+frame_elision_scan() { emit_scan frame; }
+
+# vector_lanes_scan — `<function> lane=<0|1> vecmem=<0|1>` per function (see emit_scan)
+vector_lanes_scan() { emit_scan lanes; }
+
+# emit_scan <mode> — read a disassembly on stdin, print one line per function,
+# sorted by function, preceded by the ISA the dispatch resolved. one scanner for
+# every emitted-shape observable: the demangler, the symbol attribution and the
+# sort are the same question regardless of what is being counted, and <mode>
+# selects only the per-instruction predicate and the line format.
+#
+#   simd      — `<function> simd|scalar`, whether the function contains packed SIMD
+#               (#2207). packed recognition is per ISA and deliberately narrow, so
+#               a scalar function can never read as vectorized:
+#     x86_64  — the packed SSE opcodes, plus MOVUPS / MOVAPS / MOVDQU / MOVDQA,
+#               which the backend emits only for a 128-bit value. the scalar `*ss` /
+#               `*sd` forms and the bank-crossing MOVD / MOVQ are excluded, as is
+#               XORPS, which zeroes an XMM for scalar float negation, and PXOR,
+#               which clears one.
+#     aarch64 — any operand naming a NEON register: a `vN.<arrangement>` or a
+#               128-bit `qN`. scalar float uses `sN` / `dN` and never matches.
+#     riscv64 — any RVV mnemonic (`v...`); no scalar riscv64 mnemonic starts with
+#               `v`. riscv64 has no 128-bit vector model, so every verdict there is
+#               scalar.
+#     a case whose source writes SIMD types directly would defeat this (its packed
+#     ops are not the vectorizer's); the vectorize cases use scalar element types
+#     only.
+#
+#   fpscratch — `<function> scratch=<count>`, how many instructions name a register
+#               the back end reserves from FP allocation (#2237). each back end
+#               holds out one pair, so a value only appears there when the encoder
+#               STAGED it rather than operating on it where the allocator put it:
+#     x86_64  — xmm14 / xmm15
+#     aarch64 — v30 / v31, under any of their scalar or vector spellings
+#     riscv64 — f30 / f31, spelled ft10 / ft11 in the ABI names the disassembler
+#               prints
+#     a genuine spill legitimately reaches these, so a case asserting zero must keep
+#     its kernels under register pressure and pin the release profile.
+#
+#   frame     — `<function> framed|frameless`, whether the emitted prologue builds a
+#               frame (#1940). the only mode that reads the FIRST instruction and no
+#               other, which is what makes the observable stable: a function's body
+#               moves with every unrelated backend change, while its first
+#               instruction is the frame decision and nothing else.
+#     x86_64  — `push %rbp` opens every framed prologue.
+#     aarch64 — `stp x29, x30, [sp, #-N]!` is the record-at-top prologue.
+#     riscv64 — `addi sp, sp, -N` opens the frame allocation.
+#
+#   lanes     — `<function> lane=<0|1> vecmem=<0|1>`, how a vector lane was accessed
+#               (#2236). the only mode reporting TWO independent facts, and both
+#               matter: `lane` is the win, a scalar entering or leaving a vector
+#               register directly; `vecmem` is the cost it replaces, a whole 128-bit
+#               vector moved through memory, which was once the only way to name a
+#               lane and costs a store-to-load forwarding stall on every read.
+#     aarch64 — lane is a lane-indexed operand (`vN.<t>[K]`, what UMOV / DUP-element
+#               / INS render); vecmem is a `qN` memory move (LDR/STR Q).
+#     x86_64  — lane is PEXTR / PINSR (no lane form is selected there yet, so it
+#               reads 0 today and flips when x64 opts in); vecmem is MOVUP[SD] /
+#               MOVAP[SD] / MOVDQ[AU].
+#     riscv64 — no 128-bit vector model at all: every vector is scalarized into
+#               ordinary integer loads and stores, so both facts are 0 - the
+#               target's own golden, not an exemption.
+emit_scan() {
+    awk -v mode="$1" '
     function demangle(s,   i, len, c, out) {
         if (substr(s, 1, 2) != "_M") { return s }
         i = 3
@@ -403,6 +501,44 @@ vector_emit_scan() {
         if (isa == "riscv64") { return m ~ /^v[a-z]/ }
         return 0
     }
+    function fp_scratch(m, rest) {
+        if (isa == "x86_64")  { return rest ~ /xmm1[45]/ }
+        if (isa == "aarch64") { return rest ~ /(^|[^0-9a-zA-Z_])[bhsdqv]3[01]([^0-9]|$)/ }
+        if (isa == "riscv64") { return rest ~ /(^|[^0-9a-zA-Z_])ft1[01]([^0-9]|$)/ }
+        return 0
+    }
+    function framed(m, rest) {
+        if (isa == "x86_64")  { return m ~ /^push/ && rest ~ /%rbp/ }
+        if (isa == "aarch64") { return m == "stp" && rest ~ /x29,[[:space:]]*x30/ }
+        if (isa == "riscv64") { return m == "addi" && rest ~ /^sp,[[:space:]]*sp,[[:space:]]*-/ }
+        return 0
+    }
+    function is_lane(m, rest) {
+        if (isa == "aarch64") { return rest ~ /v[0-9]+\.[bhsd]\[[0-9]+\]/ }
+        if (isa == "x86_64")  { return m ~ /^p(extr|insr)[bwdq]$/ }
+        return 0
+    }
+    function is_vecmem(m, rest) {
+        if (isa == "aarch64") {
+            if (m !~ /^(ldr|str|ldur|stur|ldp|stp)$/) { return 0 }
+            return rest ~ /(^|[ ,])q[0-9]+([ ,]|$)/
+        }
+        if (isa == "x86_64") { return m ~ /^(movup[sd]|movap[sd]|movdq[au])$/ }
+        return 0
+    }
+    # the SECOND, independent fact. a mode reporting two facts keeps them in separate
+    # accumulators rather than folding one into the other, so neither can mask it.
+    function counts2(m, rest) {
+        if (mode == "lanes") { return is_vecmem(m, rest) }
+        return 0
+    }
+    function counts(m, rest) {
+        if (mode == "simd")      { return packed(m, rest) }
+        if (mode == "fpscratch") { return fp_scratch(m, rest) }
+        if (mode == "frame")     { return framed(m, rest) }
+        if (mode == "lanes")     { return is_lane(m, rest) }
+        return 0
+    }
     /file format/ {
         if      ($0 ~ /x86-64/)   { isa = "x86_64" }
         else if ($0 ~ /aarch64/)  { isa = "aarch64" }
@@ -415,20 +551,26 @@ vector_emit_scan() {
         sub(/^[0-9a-f]+ </, "", sym)
         sub(/>:$/, "", sym)
         sym = demangle(sym)
-        if (!(sym in count)) { names[++n] = sym; count[sym] = 0 }
+        if (!(sym in count)) { names[++n] = sym; count[sym] = 0; count2[sym] = 0 }
         cur = sym
+        first = 1
         next
     }
     cur != "" && /^[[:space:]]*[0-9a-f]+:/ {
+        # the frame verdict is the FIRST instruction and nothing else; every other
+        # mode reads the whole function.
+        if (mode == "frame" && !first) { next }
+        first = 0
         line = $0
         sub(/^[[:space:]]*[0-9a-f]+:[[:space:]]*/, "", line)
         split(line, f, /[[:space:]]+/)
         rest = line
         sub(/^[^[:space:]]+[[:space:]]*/, "", rest)
-        if (packed(f[1], rest)) { count[cur]++ }
+        if (counts(f[1], rest))  { count[cur]++ }
+        if (counts2(f[1], rest)) { count2[cur]++ }
     }
     END {
-        if (bad != "") { print "int: vector-emit: unrecognized object format (" bad ")" > "/dev/stderr"; exit 2 }
+        if (bad != "") { print "int: emit-scan: " mode " scan hit an unrecognized object format (" bad ")" > "/dev/stderr"; exit 2 }
         # insertion-sort the names so the observable does not depend on emission order
         for (i = 2; i <= n; i++) {
             k = names[i]
@@ -438,11 +580,24 @@ vector_emit_scan() {
         }
         print "arch=" isa
         for (i = 1; i <= n; i++) {
-            print names[i] " " (count[names[i]] > 0 ? "simd" : "scalar")
+            if (mode == "simd")       { print names[i] " " (count[names[i]] > 0 ? "simd" : "scalar") }
+            else if (mode == "frame") { print names[i] " " (count[names[i]] > 0 ? "framed" : "frameless") }
+            else if (mode == "lanes") { print names[i] " lane=" (count[names[i]] > 0 ? 1 : 0) " vecmem=" (count2[names[i]] > 0 ? 1 : 0) }
+            else                      { print names[i] " scratch=" count[names[i]] }
         }
     }
     '
 }
+
+# produce_vector_lanes <runmode> <target> <binary>
+# disassembles the case's own objects and reports, per function, how a vector LANE
+# was accessed (#2236). Shares produce_vector_emit's object discovery: the case pins
+# `out = "out/int/build"` and the project id comes from its manifest.
+produce_vector_lanes() {
+    dis_case_objects vector-lanes "$3" | vector_lanes_scan
+}
+
+
 
 # produce_frame_elision <runmode> <target> <binary>
 # the frame-elision observable (#1940): for each function of the case's own module,
@@ -460,97 +615,9 @@ vector_emit_scan() {
 # manifest, and the project id is read from that manifest rather than assumed - the
 # same arrangement produce_vector_emit uses.
 produce_frame_elision() {
-    bin=$3
-    dir=$(dirname "$(dirname "$(dirname "$bin")")")
-    id=$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/mach.toml" | head -1)
-    if [ -z "$id" ]; then
-        echo "int: frame-elision: no project id in ${dir}/mach.toml" >&2; return 2
-    fi
-    objdir="$dir/out/int/build/obj/$id"
-    if [ ! -d "$objdir" ]; then
-        echo "int: frame-elision: no objects at $objdir (the case must pin out = \"out/int/build\")" >&2; return 2
-    fi
-    tool=$(resolve_objdump) || {
-        echo "int: frame-elision: llvm-objdump not found (install the 'llvm' package)" >&2; return 2
-    }
-    find "$objdir" -name '*.o' | sort | while IFS= read -r o; do
-        "$tool" -d --no-show-raw-insn "$o"
-    done | frame_elision_scan
+    dis_case_objects frame-elision "$3" | frame_elision_scan
 }
 
-# frame_elision_scan — read a disassembly on stdin, print `<function> framed|frameless`
-# sorted by function, preceded by the ISA the dispatch resolved.
-#
-# the verdict is the FIRST instruction only, which is what makes the observable
-# stable: a function's body moves with every unrelated backend change, while its
-# first instruction is the frame decision and nothing else.
-#   x86_64  — `push %rbp` opens every framed prologue.
-#   aarch64 — `stp x29, x30, [sp, #-N]!` is the record-at-top prologue.
-#   riscv64 — `addi sp, sp, -N` opens the frame allocation.
-frame_elision_scan() {
-    awk '
-    function demangle(s,   i, len, c, out) {
-        if (substr(s, 1, 2) != "_M") { return s }
-        i = 3
-        out = ""
-        while (i <= length(s)) {
-            c = substr(s, i, 1)
-            if (c == "N") { i++; continue }
-            if (c !~ /[0-9]/) { return s }
-            len = 0
-            while (i <= length(s) && substr(s, i, 1) ~ /[0-9]/) { len = len * 10 + substr(s, i, 1); i++ }
-            out = substr(s, i, len)
-            i += len
-        }
-        if (out == "") { return s }
-        return out
-    }
-    function framed(m, rest) {
-        if (isa == "x86_64")  { return m ~ /^push/ && rest ~ /%rbp/ }
-        if (isa == "aarch64") { return m == "stp" && rest ~ /x29,[[:space:]]*x30/ }
-        if (isa == "riscv64") { return m == "addi" && rest ~ /^sp,[[:space:]]*sp,[[:space:]]*-/ }
-        return 0
-    }
-    /file format/ {
-        if      ($0 ~ /x86-64/)   { isa = "x86_64" }
-        else if ($0 ~ /aarch64/)  { isa = "aarch64" }
-        else if ($0 ~ /riscv/)    { isa = "riscv64" }
-        else                      { bad = $0 }
-        next
-    }
-    /^[0-9a-f]+ <.*>:$/ {
-        sym = $0
-        sub(/^[0-9a-f]+ </, "", sym)
-        sub(/>:$/, "", sym)
-        sym = demangle(sym)
-        if (!(sym in seen)) { names[++n] = sym; seen[sym] = 1; verdict[sym] = "frameless" }
-        cur = sym
-        first = 1
-        next
-    }
-    cur != "" && first == 1 && /^[[:space:]]*[0-9a-f]+:/ {
-        line = $0
-        sub(/^[[:space:]]*[0-9a-f]+:[[:space:]]*/, "", line)
-        split(line, f, /[[:space:]]+/)
-        rest = line
-        sub(/^[^[:space:]]+[[:space:]]*/, "", rest)
-        if (framed(f[1], rest)) { verdict[cur] = "framed" }
-        first = 0
-    }
-    END {
-        if (bad != "") { print "int: frame-elision: unrecognized object format (" bad ")" > "/dev/stderr"; exit 2 }
-        # insertion-sort the names so the observable does not depend on emission order
-        for (i = 2; i <= n; i++) {
-            k = names[i]
-            j = i - 1
-            while (j >= 1 && names[j] > k) { names[j + 1] = names[j]; j-- }
-            names[j + 1] = k
-        }
-        print "arch=" isa
-        for (i = 1; i <= n; i++) { print names[i] " " verdict[names[i]] }
-    }
-    '
-}
 
 # produce <run> <runmode> <target> <binary> [<g_binary>]
 # dispatches to the producer named by <run>, forwarding the remaining arguments. the
@@ -569,7 +636,9 @@ produce() {
         debuginfo)   produce_debuginfo "$@" ;;
         spirv-val)   produce_spirv_val "$@" ;;
         vector-emit) produce_vector_emit "$@" ;;
+        vector-lanes) produce_vector_lanes "$@" ;;
         frame-elision) produce_frame_elision "$@" ;;
+        float-emit)  produce_float_emit "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
 }

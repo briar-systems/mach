@@ -32,6 +32,7 @@ use atype: mach.lang.fe.ast.type;
 use sema: mach.lang.fe.sema.context;
 use mach.lang.fe.token;
 use mach.lang.intern;
+use mach.lang.layout;
 use mach.lang.session;
 use mach.lang.source;
 use mach.lang.type;
@@ -123,11 +124,8 @@ pub fun check_arity(
     arg_count:      u32,
     span:           token.Span
 ) bool {
-    var a: *ast.Ast = sc.a;
-    if (generic_origin != sc.own_module) {
-        a = session.module_ast(sc.s, generic_origin);
-        if (a == nil) { ret true; }
-    }
+    val a: *ast.Ast = declaring_ast(sc, generic_origin);
+    if (a == nil) { ret true; }
 
     val opt_want: O.Option[u32] = generic_count_in(a, generic_decl);
     if (O.is_none[u32](opt_want)) {
@@ -141,6 +139,43 @@ pub fun check_arity(
         ret false;
     }
     ret true;
+}
+
+# the number of type parameters a declaration declares
+#
+# The counterpart to `check_arity` for the argument-free spelling, where there is
+# no argument list to check against and the only question is whether one was
+# required (#2311). A declaration that cannot carry type parameters reads 0, so
+# a `def` or a plain record is not an arity error. An origin AST that cannot be
+# reached reads 0 for the same reason `check_arity` accepts it: the reference
+# fails at its own leaf (`type_for_symbol` reports the unresolvable import), so
+# a missing dependency never masquerades as an arity error.
+# ---
+# sc:             the active sema context
+# generic_decl:   DeclId of the declaration
+# generic_origin: ModuleId that declared it
+# ret:            the declared type-parameter count, 0 when it declares none
+pub fun declared_arity(sc: *sema.SemaContext, generic_decl: id.DeclId, generic_origin: session.ModuleId) u32 {
+    val a: *ast.Ast = declaring_ast(sc, generic_origin);
+    if (a == nil) { ret 0; }
+
+    val opt_want: O.Option[u32] = generic_count_in(a, generic_decl);
+    if (O.is_none[u32](opt_want)) { ret 0; }
+    ret O.unwrap[u32](opt_want);
+}
+
+# the AST of the module that declares a referenced declaration
+#
+# This module's own AST for a local declaration, the origin dependency's (through
+# the session registry) for a cross-module one: a use site's arity is measured
+# against the declaring module, never against the use site's.
+# ---
+# sc:     the active sema context
+# origin: ModuleId that declared the referenced declaration
+# ret:    the declaring module's AST, or nil when it cannot be reached
+fun declaring_ast(sc: *sema.SemaContext, origin: session.ModuleId) *ast.Ast {
+    if (origin == sc.own_module) { ret sc.a; }
+    ret session.module_ast(sc.s, origin);
 }
 
 # rewrite a generic body type by substituting each generic parameter with the
@@ -362,49 +397,85 @@ fun secret_deep_walk(s: *session.Session, tid: type.TypeId, scan: *type.SecretSc
     ret true;
 }
 
-# the byte extent of a type: the size and alignment it occupies in storage (#2167)
+# describe one semantic type to the shared layout policy (a layout.NodeFn)
 #
-# `ok` is false when the extent cannot be determined - an unresolvable field table, a
-# generic parameter with no concrete argument, a graph past the depth bound. Every
-# consumer treats that as "cannot prove", never as a permissive default.
+# The sema half of the #2289 seam: it names each semantic kind's storage shape and
+# leaves the fold to `mach.lang.layout`, which `me.ir.type` drives over the IR type
+# universe through the matching describer. One policy, so sema's idea of a layout
+# cannot drift from the one the backend emits - and a drift here would let the
+# secrecy-placement comparison admit an overlay that does not exist, which is a
+# disclosure rather than a wrong number.
+#
+# `^` has no runtime representation, so it is stripped before measuring. A generic
+# parameter, a comptime pack, or a nominal whose field table cannot be resolved is
+# described as NODE_UNKNOWN, which the policy propagates as `ok = false` - the
+# fail-closed answer every secrecy caller needs.
 # ---
-# ok:    whether size / align were determined
-# size:  the type's size in bytes
-# align: the type's alignment in bytes (always >= 1 when ok)
-pub rec Extent {
-    ok:    bool;
-    size:  u32;
-    align: u32;
+# ctx: the *session.Session, erased
+# id:  the TypeId to describe
+# ret: the node's layout shape, or NODE_UNKNOWN when it cannot be established
+fun describe_type(ctx: ptr, id: u32) layout.Node {
+    val s:    *session.Session = ctx::*session.Session;
+    val base: type.TypeId      = type.strip_secret(?s.types, id::type.TypeId);
+
+    val opt_type: O.Option[*type.Type] = type.get(?s.types, base);
+    if (O.is_none[*type.Type](opt_type)) { ret layout.node(layout.NODE_UNKNOWN); }
+    val t: *type.Type = O.unwrap[*type.Type](opt_type);
+
+    val d: type.PrimDesc = type.prim_desc(t.kind);
+    if (d.class == type.PRIM_CLASS_INT || d.class == type.PRIM_CLASS_FLOAT) {
+        var n: layout.Node = layout.node(layout.NODE_SCALAR);
+        n.bytes = d.bits / 8;
+        ret n;
+    }
+    # the raw `ptr`, a typed `*T`, and a function value (a code address) all lay out
+    # as a pointer.
+    if (d.class == type.PRIM_CLASS_PTR || t.kind == type.TYPE_POINTER || t.kind == type.TYPE_FUN) {
+        ret layout.node(layout.NODE_POINTER);
+    }
+    # all ten vector shapes are 128-bit (#1965).
+    if (t.kind == type.TYPE_VECTOR) { ret layout.node(layout.NODE_VECTOR); }
+
+    if (t.kind == type.TYPE_ARRAY) {
+        var n: layout.Node = layout.node(layout.NODE_ARRAY);
+        n.child = t.data.array.base::u32;
+        n.count = t.data.array.count;
+        ret n;
+    }
+
+    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI || t.kind == type.TYPE_INSTANCE) {
+        # a generic instance's field table is materialized lazily, so a type that
+        # reaches here with no prior elaboration must be elaborated before its fields
+        # can be read - otherwise an absent table would read as "no fields".
+        if (t.kind == type.TYPE_INSTANCE) { ensure_fields(s, base); }
+
+        val ov: O.Option[bool] = nominal_overlays(s, base);
+        if (O.is_none[bool](ov)) { ret layout.node(layout.NODE_UNKNOWN); }
+        val opt_tab: O.Option[*type.FieldTable] = type.field_table_for(?s.types, base);
+        if (O.is_none[*type.FieldTable](opt_tab)) { ret layout.node(layout.NODE_UNKNOWN); }
+
+        var n: layout.Node = layout.node(layout.NODE_AGGREGATE);
+        n.field_count = O.unwrap[*type.FieldTable](opt_tab).fields_len;
+        n.overlays    = O.unwrap[bool](ov);
+        val ta: O.Option[u32] = session.type_align(s, base::u32);
+        if (O.is_some[u32](ta)) { n.decl_align = O.unwrap[u32](ta); }
+        ret n;
+    }
+
+    ret layout.node(layout.NODE_UNKNOWN);
 }
 
-# an Extent that could not be determined
-fun no_extent() Extent {
-    var e: Extent;
-    e.ok    = false;
-    e.size  = 0;
-    e.align = 0;
-    ret e;
+# name field `index` of aggregate type `id` (a layout.FieldFn)
+#
+# An absent entry yields TYPE_ERROR, which describes as NODE_UNKNOWN and so fails the
+# enclosing extent closed.
+fun describe_type_field(ctx: ptr, id: u32, index: u32) u32 {
+    val s:    *session.Session = ctx::*session.Session;
+    val base: type.TypeId      = type.strip_secret(?s.types, id::type.TypeId);
+    val fe: O.Option[*type.FieldEntry] = type.field_at(?s.types, base, index);
+    if (O.is_none[*type.FieldEntry](fe)) { ret type.TYPE_ERROR::u32; }
+    ret O.unwrap[*type.FieldEntry](fe).ty::u32;
 }
-
-# a determined Extent
-fun extent(size: u32, align: u32) Extent {
-    var e: Extent;
-    e.ok    = true;
-    e.size  = size;
-    e.align = align;
-    ret e;
-}
-
-# round `v` up to the next multiple of `a`; an alignment of 0 or 1 leaves it unchanged
-fun round_up(v: u32, a: u32) u32 {
-    if (a <= 1) { ret v; }
-    val r: u32 = v % a;
-    if (r == 0) { ret v; }
-    ret v + (a - r);
-}
-
-# the depth bound on the extent walk; a graph deeper than this yields `no_extent`
-val EXTENT_MAX_DEPTH: u32 = 64;
 
 # the storage size and alignment of a semantic type (#2167)
 #
@@ -414,109 +485,15 @@ val EXTENT_MAX_DEPTH: u32 = 64;
 # `check.byte_size` cannot serve - it reports 0 for every aggregate, which is also a
 # legitimate size for an empty record, so a distinguishable `ok` is required.
 #
-# THIS MUST AGREE EXACTLY WITH `me.ir.type.byte_size` / `byte_align`, which is what the
-# backend actually lays out: sema admitting an overlay the emitted layout does not
-# produce would turn this check's conservatism into an unsoundness. It mirrors that
-# natural C-style fold - a struct rounds each field to its alignment and the whole to
-# the aggregate's, a union overlaps every member at offset 0, an `#[align(...)]`
-# override raises (never lowers) the aggregate's alignment - reading the same
-# session-registered override the lowering reads. `generics_layout_matches_lowering`
-# pins the two against each other.
-#
-# `^` has no runtime representation, so it is stripped before measuring.
+# Folded by `mach.lang.layout`, the same policy `me.ir.type` measures the emitted
+# layout with, so the two cannot disagree (#2289).
 # ---
 # s:         the session (type universe, lazy instance fields, align overrides)
 # ptr_width: the target's pointer width in bytes
 # tid:       the type to measure
 # ret:       the determined Extent, or `ok = false` when it cannot be computed
-pub fun type_extent(s: *session.Session, ptr_width: u32, tid: type.TypeId) Extent {
-    ret extent_walk(s, ptr_width, tid, 0);
-}
-
-# the recursive worker for `type_extent`, bounding the graph depth
-fun extent_walk(s: *session.Session, ptr_width: u32, tid: type.TypeId, depth: u32) Extent {
-    if (depth > EXTENT_MAX_DEPTH) { ret no_extent(); }
-
-    val base: type.TypeId = type.strip_secret(?s.types, tid);
-    val opt_type: O.Option[*type.Type] = type.get(?s.types, base);
-    if (O.is_none[*type.Type](opt_type)) { ret no_extent(); }
-    val t: *type.Type = O.unwrap[*type.Type](opt_type);
-
-    val d: type.PrimDesc = type.prim_desc(t.kind);
-    if (d.class == type.PRIM_CLASS_INT || d.class == type.PRIM_CLASS_FLOAT) {
-        ret extent(d.bits / 8, d.bits / 8);
-    }
-    # the raw `ptr`, a typed `*T`, and a function value (a code address) are all
-    # pointer-sized and pointer-aligned.
-    if (d.class == type.PRIM_CLASS_PTR || t.kind == type.TYPE_POINTER || t.kind == type.TYPE_FUN) {
-        ret extent(ptr_width, ptr_width);
-    }
-    # all ten vector shapes are 128-bit and 16-byte aligned (#1965).
-    if (t.kind == type.TYPE_VECTOR) { ret extent(16, 16); }
-
-    if (t.kind == type.TYPE_ARRAY) {
-        val e: Extent = extent_walk(s, ptr_width, t.data.array.base, depth + 1);
-        if (!e.ok) { ret no_extent(); }
-        # widen the product: a >4GiB array would wrap a u32 and report a wrong extent,
-        # so it declines rather than answering wrongly.
-        val total: u64 = e.size::u64 * t.data.array.count::u64;
-        if (total > 4294967295) { ret no_extent(); }
-        ret extent(total::u32, e.align);
-    }
-
-    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI || t.kind == type.TYPE_INSTANCE) {
-        ret nominal_extent(s, ptr_width, base, t.kind, depth);
-    }
-
-    # a generic parameter, a comptime pack, or any kind not measured above has no
-    # storage extent here - FAIL CLOSED rather than answer with a default.
-    ret no_extent();
-}
-
-# the extent of a record / union / generic instance, folding its field table
-fun nominal_extent(s: *session.Session, ptr_width: u32, tid: type.TypeId, kind: type.TypeKind, depth: u32) Extent {
-    if (kind == type.TYPE_INSTANCE) { ensure_fields(s, tid); }
-    # a `rec` and a `uni` instantiate to structurally identical TYPE_INSTANCEs, so the
-    # instance's own kind says nothing about how its fields are placed; the nominal it
-    # carries (#2239) is what decides sequential against overlapping.
-    val ov: O.Option[bool] = nominal_overlays(s, tid);
-    if (O.is_none[bool](ov)) { ret no_extent(); }
-    val overlays: bool = O.unwrap[bool](ov);
-
-    val opt_tab: O.Option[*type.FieldTable] = type.field_table_for(?s.types, tid);
-    if (O.is_none[*type.FieldTable](opt_tab)) { ret no_extent(); }
-    val n: u32 = O.unwrap[*type.FieldTable](opt_tab).fields_len;
-
-    var align:    u32 = 1;
-    var offset:   u32 = 0;
-    var widest:   u32 = 0;
-    var f:        u32 = 0;
-    for (f < n) {
-        val fe: O.Option[*type.FieldEntry] = type.field_at(?s.types, tid, f);
-        if (O.is_none[*type.FieldEntry](fe)) { ret no_extent(); }
-        val e: Extent = extent_walk(s, ptr_width, O.unwrap[*type.FieldEntry](fe).ty, depth + 1);
-        if (!e.ok) { ret no_extent(); }
-        if (e.align > align) { align = e.align; }
-        if (overlays) {
-            if (e.size > widest) { widest = e.size; }
-        }
-        or {
-            offset = round_up(offset, e.align);
-            offset = offset + e.size;
-        }
-        f = f + 1;
-    }
-
-    # an `#[align(...)]` override raises the alignment (never lowers it), which also
-    # rounds the total size up to the larger alignment.
-    val ta: O.Option[u32] = session.type_align(s, tid::u32);
-    if (O.is_some[u32](ta)) {
-        val forced: u32 = O.unwrap[u32](ta);
-        if (forced > align) { align = forced; }
-    }
-
-    if (overlays) { ret extent(round_up(widest, align), align); }
-    ret extent(round_up(offset, align), align);
+pub fun type_extent(s: *session.Session, ptr_width: u32, tid: type.TypeId) layout.Extent {
+    ret layout.extent_of(s::ptr, describe_type, describe_type_field, tid::u32, ptr_width);
 }
 
 # whether nominal `tid` overlays every field at offset 0 (a union) rather than laying
@@ -670,8 +647,8 @@ fun sse_deep_walk(s: *session.Session, ptr_width: u32, a: type.TypeId, b: type.T
             val ty_b: type.TypeId = O.unwrap[*type.FieldEntry](fb).ty;
             if (!sse_deep_walk(s, ptr_width, ty_a, ty_b, scan)) { ret false; }
 
-            val ea: Extent = type_extent(s, ptr_width, ty_a);
-            val eb: Extent = type_extent(s, ptr_width, ty_b);
+            val ea: layout.Extent = type_extent(s, ptr_width, ty_a);
+            val eb: layout.Extent = type_extent(s, ptr_width, ty_b);
             if (!ea.ok || !eb.ok)                           { ret false; }
             if (ea.size != eb.size || ea.align != eb.align) { ret false; }
             f = f + 1;
