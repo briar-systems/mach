@@ -2357,3 +2357,246 @@ test "mach.lang.me.transform.licm:no_preheader_declines" {
     ir.dnit(?m);
     ret code;
 }
+
+# raise loop pressure by `n` registers: define `n` values off the induction variable
+# and consume them all afterwards, so every one is live at once at the point the last
+# is defined. Each depends on the induction variable, so none is itself a hoist
+# candidate and the pressure is the only thing the helper contributes. Returns 0 on
+# success.
+fun fill_live_through(m: *ir.Module, bld: *builder.Builder, i64t: ir_type.IrTypeId,
+                      body: id.BlockId, n: u32, iv: value.Value) i32 {
+    val ra: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, n::usize);
+    if (R.is_err[*value.Value, str](ra)) { ret 1; }
+    val vs: *value.Value = R.unwrap_ok[*value.Value, str](ra);
+
+    builder.set_block(bld, body);
+    var i: u32 = 0;
+    for (i < n) {
+        val rv: R.Result[value.Value, str] = builder.emit_add(bld, iv, value.const_int(i::u64, i64t));
+        if (R.is_err[value.Value, str](rv)) { A.deallocate[value.Value](m.alloc, vs, n::usize); ret 1; }
+        vs[i] = R.unwrap_ok[value.Value, str](rv);
+        i = i + 1;
+    }
+
+    var acc: value.Value = iv;
+    i = 0;
+    for (i < n) {
+        val rs: R.Result[value.Value, str] = builder.emit_add(bld, acc, vs[i]);
+        if (R.is_err[value.Value, str](rs)) { A.deallocate[value.Value](m.alloc, vs, n::usize); ret 1; }
+        acc = R.unwrap_ok[value.Value, str](rs);
+        i = i + 1;
+    }
+
+    A.deallocate[value.Value](m.alloc, vs, n::usize);
+    ret 0;
+}
+
+# the register budget is the target's own description of its register file, never a
+# constant this pass carries. x86_64 declares sixteen general registers and withholds
+# five from value allocation -- the stack and frame pointers, and the three-register
+# reload-scratch pool -- leaving eleven; its float bank is declared at its allocatable
+# size of fourteen, the two encoder scratch registers already excluded from `len`.
+test "mach.lang.me.transform.licm:budget_is_the_target_register_file" {
+    var tgt: resolved.Target;
+    if (mk_target(?tgt) != 0) { ret 1; }
+
+    var code: i32 = 0;
+    if (bank_budget(?tgt, isa.RC_GENERAL) != 11) { code = 1; }
+    if (bank_budget(?tgt, isa.RC_FLOAT)   != 14) { code = 1; }
+
+    # a bank the target does not declare carries no budget, which the admission test
+    # reads as "no information", not as "no registers".
+    if (bank_budget(?tgt, isa.RC_VECTOR) != 0) { code = 1; }
+    ret code;
+}
+
+# a loop whose live values already fill the general bank declines an invariant
+# multiply: lifting it would hold a twelfth register on an eleven-register file, so
+# the multiply the body repeats is cheaper than the spill the hoist would cause. The
+# same loop with room lifts the identical multiply, so the decline is the budget and
+# not an inert pass.
+test "mach.lang.me.transform.licm:pressure_declines_a_saturated_loop" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var tgt: resolved.Target;
+    if (mk_target(?tgt) != 0) { ret 1; }
+
+    var code: i32 = 0;
+    var pass: u32 = 0;
+    # pass 0 saturates the general bank, pass 1 leaves it nearly empty.
+    for (pass < 2) {
+        var live: u32 = 20;
+        if (pass == 1) { live = 2; }
+
+        val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+        if (R.is_err[ir.Module, str](rm)) { ret 1; }
+        var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+        val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+        if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); ret 1; }
+        val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+
+        val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+        if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+        val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+        var bld: builder.Builder = builder.init(?m);
+        builder.set_function(?bld, fn);
+
+        var entry: id.BlockId; var header: id.BlockId; var body: id.BlockId; var exit: id.BlockId;
+        var iv: value.Value;
+        if (mk_loop(?m, ?bld, i64t, ?entry, ?header, ?body, ?exit, ?iv) != 0) { ir.dnit(?m); ret 1; }
+        if (fill_live_through(?m, ?bld, i64t, body, live, iv) != 0) { ir.dnit(?m); ret 1; }
+
+        builder.set_block(?bld, body);
+        val rp: R.Result[value.Value, str] = builder.emit_mul(?bld, value.param(0, i64t), value.param(0, i64t));
+        if (R.is_err[value.Value, str](rp)) { ir.dnit(?m); ret 1; }
+        val cand: value.Value = R.unwrap_ok[value.Value, str](rp);
+        if (close_loop(?bld, i64t, iv, header, body) != 0) { ir.dnit(?m); ret 1; }
+
+        if (R.is_err[bool, str](run(?m, ?tgt))) { code = 1; }
+
+        if (pass == 0 && !block_holds(fn, body, cand.data.instr))  { code = 1; }
+        if (pass == 1 && !block_holds(fn, entry, cand.data.instr)) { code = 1; }
+
+        ir.dnit(?m);
+        pass = pass + 1;
+    }
+    ret code;
+}
+
+# an address survives a saturated loop where a plain computation does not. The gep
+# indexes a module-scope array by a runtime value, so the back end has to materialize
+# the symbol and scale the index every iteration -- several instructions, against the
+# one reload a spilled hoist costs. The multiply beside it is one instruction and is
+# declined, so the pair tests the cost rule and not the budget alone.
+test "mach.lang.me.transform.licm:address_survives_a_saturated_loop" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    var tgt: resolved.Target;
+    if (mk_target(?tgt) != 0) { intern.dnit(?itn); ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { intern.dnit(?itn); ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val rr: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?m.types, i64t, 16);
+    if (R.is_err[ir_type.IrTypeId, str](rr)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val arrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rr);
+
+    var g: value.Value;
+    if (mk_global(?m, ?itn, "g_arr", arrt, ptrt, ?g) != 0) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    var entry: id.BlockId; var header: id.BlockId; var body: id.BlockId; var exit: id.BlockId;
+    var iv: value.Value;
+    if (mk_loop(?m, ?bld, i64t, ?entry, ?header, ?body, ?exit, ?iv) != 0) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    if (fill_live_through(?m, ?bld, i64t, body, 20, iv) != 0) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+
+    builder.set_block(?bld, body);
+    var idx: [2]value.Value;
+    idx[0] = value.const_int(0, i64t);
+    idx[1] = value.param(0, i64t);
+    val rg: R.Result[value.Value, str] = builder.emit_gep(?bld, g, arrt, ?idx[0], 2);
+    if (R.is_err[value.Value, str](rg)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val addr: value.Value = R.unwrap_ok[value.Value, str](rg);
+    val rq: R.Result[value.Value, str] = builder.emit_mul(?bld, value.param(0, i64t), value.param(0, i64t));
+    if (R.is_err[value.Value, str](rq)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val plain: value.Value = R.unwrap_ok[value.Value, str](rq);
+    if (close_loop(?bld, i64t, iv, header, body) != 0) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+
+    var code: i32 = 0;
+    if (R.is_err[bool, str](run(?m, ?tgt))) { code = 1; }
+
+    if (!block_holds(fn, entry, addr.data.instr)) { code = 1; }
+    if (!block_holds(fn, body, plain.data.instr)) { code = 1; }
+
+    ir.dnit(?m);
+    intern.dnit(?itn);
+    ret code;
+}
+
+# an address chain is cut where it crosses a width cast. Both casts below feed a gep
+# in a saturated loop, so both are part of an address the budget still admits -- but
+# the `zext` re-presents an index the loop already holds at another width, which the
+# allocator cannot coalesce with its source, so lifting it would make the loop carry
+# the same datum twice. The same-width `bitcast` coalesces away and is lifted.
+test "mach.lang.me.transform.licm:width_cast_is_cut_from_an_address_chain" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    var tgt: resolved.Target;
+    if (mk_target(?tgt) != 0) { intern.dnit(?itn); ret 1; }
+
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { intern.dnit(?itn); ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    val rt: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt);
+    val ri: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 32);
+    if (R.is_err[ir_type.IrTypeId, str](ri)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val i32t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ri);
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val ptrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+    val rr: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?m.types, i64t, 16);
+    if (R.is_err[ir_type.IrTypeId, str](rr)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val arrt: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rr);
+
+    var ga: value.Value;
+    var gb: value.Value;
+    if (mk_global(?m, ?itn, "w_a", arrt, ptrt, ?ga) != 0) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    if (mk_global(?m, ?itn, "w_b", arrt, ptrt, ?gb) != 0) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    var entry: id.BlockId; var header: id.BlockId; var body: id.BlockId; var exit: id.BlockId;
+    var iv: value.Value;
+    if (mk_loop(?m, ?bld, i64t, ?entry, ?header, ?body, ?exit, ?iv) != 0) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    if (fill_live_through(?m, ?bld, i64t, body, 20, iv) != 0) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+
+    builder.set_block(?bld, body);
+    val rw: R.Result[value.Value, str] = builder.emit_zext(?bld, value.param(1, i32t), i64t);
+    if (R.is_err[value.Value, str](rw)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val widened: value.Value = R.unwrap_ok[value.Value, str](rw);
+    var ia: [2]value.Value;
+    ia[0] = value.const_int(0, i64t);
+    ia[1] = widened;
+    if (R.is_err[value.Value, str](builder.emit_gep(?bld, ga, arrt, ?ia[0], 2))) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+
+    val rc: R.Result[value.Value, str] = builder.emit_bitcast(?bld, gb, ptrt);
+    if (R.is_err[value.Value, str](rc)) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    val recast: value.Value = R.unwrap_ok[value.Value, str](rc);
+    var ib: [2]value.Value;
+    ib[0] = value.const_int(0, i64t);
+    ib[1] = value.param(0, i64t);
+    if (R.is_err[value.Value, str](builder.emit_gep(?bld, recast, arrt, ?ib[0], 2))) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+    if (close_loop(?bld, i64t, iv, header, body) != 0) { ir.dnit(?m); intern.dnit(?itn); ret 1; }
+
+    var code: i32 = 0;
+    if (R.is_err[bool, str](run(?m, ?tgt))) { code = 1; }
+
+    if (!block_holds(fn, body, widened.data.instr))  { code = 1; }
+    if (!block_holds(fn, entry, recast.data.instr))  { code = 1; }
+
+    ir.dnit(?m);
+    intern.dnit(?itn);
+    ret code;
+}
