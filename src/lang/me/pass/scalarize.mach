@@ -748,6 +748,420 @@ fun fill_one(c: *Ctx, blk: *ir.Block, cur: id.InstructionId, i8_ty: ir_type.IrTy
     ret ir.block_append_instr(c.m, blk, cur);
 }
 
+# per-function state for the lane-access expansion (#2236)
+#
+# Wraps the shared `Ctx` so the expansion emits through the same `push` / `lane_ptr`
+# / `emit_load` / `emit_store` helpers the scalarizer uses. `c.pval` carries the
+# REPLACEMENT VALUE of each expanded lane op (the scalar a read became, the reloaded
+# vector a write became), so `rewrite_ops` redirects later uses exactly as it does
+# for the full pass. `c.pcount` is held at 0: this pass never retypes a parameter, so
+# `resolve`'s parameter arm must stay inert.
+# ---
+# c:         the shared rewrite context (pval carries lane-op replacements)
+# slot:      per instruction id, the stack slot holding that vector value
+# slot_set:  whether slot[iid] is meaningful
+# store_at:  whether a `store <result>, slot[iid]` follows instruction iid; false for
+#            a lane write, whose own expansion stores into its result slot
+# pslot:     per parameter index, the stack slot holding that vector parameter
+# pslot_set: whether pslot[p] is meaningful
+# allocas:   slot alloca ids to prepend to the entry block
+# alloca_len: number of slot allocas
+# pn:        parameter count (bounds pslot / pslot_set)
+rec LaneCtx {
+    c:          Ctx;
+    slot:       *value.Value;
+    slot_set:   *bool;
+    store_at:   *bool;
+    pslot:      *value.Value;
+    pslot_set:  *bool;
+    allocas:    *id.InstructionId;
+    alloca_len: u32;
+    pn:         u32;
+}
+
+# create the stack slot a lane expansion addresses a vector through
+#
+# Unlike `make_slot`, the slot is typed by the VECTOR, not by its `[lanes]elem` view:
+# a vector aligns to 16 and an array of its lanes only to the lane element, so the
+# array shape would hand the frame a 16-byte object with 4-byte alignment. The lane
+# GEPs still walk the array view - only the storage's size and alignment come from
+# the vector. On a SIMD-incapable target `scalarize.run`'s `retype_aux` retypes this
+# alloca to the array form afterwards, exactly as it does every other vector slot.
+fun make_lane_slot(c: *Ctx, vty: ir_type.IrTypeId, slots: *id.InstructionId, slot_len: *u32) R.Result[value.Value, str] {
+    var ops: [1]value.Value;
+    ops[0] = value.const_int(1, c.idx_ty);
+    val ri: R.Result[id.InstructionId, str] = new_instr(c.m, c.fn, instruction.OP_ALLOCA, c.ptr_ty, vty, ?ops[0], 1, source.loc(source.FILE_NIL, 0));
+    if (R.is_err[id.InstructionId, str](ri)) { ret R.err[value.Value, str](R.unwrap_err[id.InstructionId, str](ri)); }
+    val iid: id.InstructionId = R.unwrap_ok[id.InstructionId, str](ri);
+    slots[@slot_len] = iid;
+    @slot_len = @slot_len + 1;
+    ret R.ok[value.Value, str](value.instr(iid, c.ptr_ty));
+}
+
+# whether a function contains any lane access at all
+fun has_lane_op(fn: *ir.Function) bool {
+    var i: u32 = 0;
+    for (i < fn.instr_len) {
+        val k: instruction.InstrKind = fn.instrs[i].kind;
+        if (k == instruction.OP_VEC_EXTRACT || k == instruction.OP_VEC_INSERT) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the constant lane index of a lane op, or an error when it is not a constant
+fun lane_index_of(inst: *instruction.Instruction) R.Result[u32, str] {
+    if (inst.operands[1].kind != value.VAL_CONST_INT) {
+        ret R.err[u32, str]("scalarize: vector lane index is not a constant");
+    }
+    ret R.ok[u32, str](inst.operands[1].data.int_lit::u32);
+}
+
+# reserve the stack slot a lane READ will address `v` through, if it has none yet
+#
+# A value already carrying a slot - a lane write's result, or an earlier read's
+# source - is reused, so N reads of one vector share one slot and one store, which is
+# both the shape the pre-#2236 lowering produced and the one that avoids re-spilling
+# the vector per lane.
+# ---
+# lc: the lane-expansion state
+# v:  the vector value a lane is being read out of
+# ret: ok(true) once a slot exists for `v`, or an error
+fun reserve_read_slot(lc: *LaneCtx, v: value.Value) R.Result[bool, str] {
+    if (v.kind == value.VAL_INSTR) {
+        val j: u32 = v.data.instr::u32;
+        if (j >= lc.c.n) { ret R.err[bool, str]("scalarize: lane read of an out-of-range value"); }
+        if (lc.slot_set[j]) { ret R.ok[bool, str](true); }
+        val ms: R.Result[value.Value, str] = make_lane_slot(?lc.c, v.ty, lc.allocas, ?lc.alloca_len);
+        if (R.is_err[value.Value, str](ms)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](ms)); }
+        lc.slot[j]     = R.unwrap_ok[value.Value, str](ms);
+        lc.slot_set[j] = true;
+        lc.store_at[j] = true;
+        ret R.ok[bool, str](true);
+    }
+    if (v.kind == value.VAL_PARAM) {
+        val p: u32 = v.data.param_ix;
+        if (p >= lc.pn) { ret R.err[bool, str]("scalarize: lane read of an out-of-range parameter"); }
+        if (lc.pslot_set[p]) { ret R.ok[bool, str](true); }
+        val ms: R.Result[value.Value, str] = make_lane_slot(?lc.c, v.ty, lc.allocas, ?lc.alloca_len);
+        if (R.is_err[value.Value, str](ms)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](ms)); }
+        lc.pslot[p]     = R.unwrap_ok[value.Value, str](ms);
+        lc.pslot_set[p] = true;
+        ret R.ok[bool, str](true);
+    }
+    ret R.err[bool, str]("scalarize: lane read of a value with no stack home");
+}
+
+# the slot holding vector value `v` (reserved by `reserve_read_slot`)
+fun slot_of(lc: *LaneCtx, v: value.Value) R.Result[value.Value, str] {
+    if (v.kind == value.VAL_INSTR) {
+        val j: u32 = v.data.instr::u32;
+        if (j < lc.c.n && lc.slot_set[j]) { ret R.ok[value.Value, str](lc.slot[j]); }
+    }
+    if (v.kind == value.VAL_PARAM) {
+        val p: u32 = v.data.param_ix;
+        if (p < lc.pn && lc.pslot_set[p]) { ret R.ok[value.Value, str](lc.pslot[p]); }
+    }
+    ret R.err[value.Value, str]("scalarize: lane read has no reserved slot");
+}
+
+# expand one lane READ into `gep` + scalar `load` out of the vector's stack slot
+fun expand_lane_read(lc: *LaneCtx, blk: *ir.Block, cur: id.InstructionId) R.Result[bool, str] {
+    val fn: *ir.Function = lc.c.fn;
+    val ip: *instruction.Instruction = ?fn.instrs[cur::u32];
+    val src:  value.Value      = ip.operands[0];
+    val elem: ir_type.IrTypeId = ip.ty;
+    val loc:  source.SrcLoc    = ip.loc;
+
+    val rk: R.Result[u32, str] = lane_index_of(ip);
+    if (R.is_err[u32, str](rk)) { ret R.err[bool, str](R.unwrap_err[u32, str](rk)); }
+    val k: u32 = R.unwrap_ok[u32, str](rk);
+
+    var vi: VInfo;
+    val vr: R.Result[bool, str] = vec_info(lc.c.m, src.ty, ?vi);
+    if (R.is_err[bool, str](vr)) { ret vr; }
+    val ra: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?lc.c.m.types, vi.elem, vi.lanes);
+    if (R.is_err[ir_type.IrTypeId, str](ra)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ra)); }
+
+    val rb: R.Result[value.Value, str] = slot_of(lc, src);
+    if (R.is_err[value.Value, str](rb)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rb)); }
+
+    val rp: R.Result[value.Value, str] = lane_ptr(?lc.c, blk, R.unwrap_ok[value.Value, str](rb),
+        R.unwrap_ok[ir_type.IrTypeId, str](ra), k, loc);
+    if (R.is_err[value.Value, str](rp)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rp)); }
+
+    val rl: R.Result[value.Value, str] = emit_load(?lc.c, blk, R.unwrap_ok[value.Value, str](rp), elem, loc);
+    if (R.is_err[value.Value, str](rl)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rl)); }
+
+    # every lane of a secret vector is secret, the same welded-storage rule the
+    # scalarizer's per-lane reads follow (#1646).
+    lc.c.pval[cur::u32]     = lane_secret(?lc.c, R.unwrap_ok[value.Value, str](rl), src.secret);
+    lc.c.pval_set[cur::u32] = true;
+    ret R.ok[bool, str](true);
+}
+
+# expand one lane WRITE into a whole-vector store, a lane store, and a reload
+fun expand_lane_write(lc: *LaneCtx, blk: *ir.Block, cur: id.InstructionId) R.Result[bool, str] {
+    val fn: *ir.Function = lc.c.fn;
+    val ip: *instruction.Instruction = ?fn.instrs[cur::u32];
+    val vty: ir_type.IrTypeId = ip.ty;
+    val loc: source.SrcLoc    = ip.loc;
+    val src: value.Value      = resolve(?lc.c, ip.operands[0]);
+    val lane_val: value.Value = resolve(?lc.c, ip.operands[2]);
+
+    val rk: R.Result[u32, str] = lane_index_of(ip);
+    if (R.is_err[u32, str](rk)) { ret R.err[bool, str](R.unwrap_err[u32, str](rk)); }
+    val k: u32 = R.unwrap_ok[u32, str](rk);
+
+    var vi: VInfo;
+    val vr: R.Result[bool, str] = vec_info(lc.c.m, vty, ?vi);
+    if (R.is_err[bool, str](vr)) { ret vr; }
+    val ra: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?lc.c.m.types, vi.elem, vi.lanes);
+    if (R.is_err[ir_type.IrTypeId, str](ra)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ra)); }
+    val arr: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ra);
+
+    val slot: value.Value = lc.slot[cur::u32];
+
+    val rs: R.Result[bool, str] = emit_store(?lc.c, blk, src, slot, loc);
+    if (R.is_err[bool, str](rs)) { ret rs; }
+
+    val rp: R.Result[value.Value, str] = lane_ptr(?lc.c, blk, slot, arr, k, loc);
+    if (R.is_err[value.Value, str](rp)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rp)); }
+
+    val rs2: R.Result[bool, str] = emit_store(?lc.c, blk, lane_val, R.unwrap_ok[value.Value, str](rp), loc);
+    if (R.is_err[bool, str](rs2)) { ret rs2; }
+
+    val rl: R.Result[value.Value, str] = emit_load(?lc.c, blk, slot, vty, loc);
+    if (R.is_err[value.Value, str](rl)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rl)); }
+
+    lc.c.pval[cur::u32]     = R.unwrap_ok[value.Value, str](rl);
+    lc.c.pval_set[cur::u32] = true;
+    ret R.ok[bool, str](true);
+}
+
+# reserve every slot the function's lane ops need, in instruction-id order
+#
+# A lane WRITE takes its own result slot (its expansion stores the source vector into
+# it, so it must not share a slot with the source); a lane READ borrows whatever slot
+# already holds its source, or reserves one whose store is placed right after the
+# source's definition.
+fun reserve_lane_slots(lc: *LaneCtx) R.Result[bool, str] {
+    val fn: *ir.Function = lc.c.fn;
+    var iid: u32 = 0;
+    for (iid < lc.c.n) {
+        val k: instruction.InstrKind = fn.instrs[iid].kind;
+        if (k == instruction.OP_VEC_INSERT) {
+            val ms: R.Result[value.Value, str] = make_lane_slot(?lc.c, fn.instrs[iid].ty, lc.allocas, ?lc.alloca_len);
+            if (R.is_err[value.Value, str](ms)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](ms)); }
+            lc.slot[iid]     = R.unwrap_ok[value.Value, str](ms);
+            lc.slot_set[iid] = true;
+        }
+        or (k == instruction.OP_VEC_EXTRACT) {
+            val rr: R.Result[bool, str] = reserve_read_slot(lc, fn.instrs[iid].operands[0]);
+            if (R.is_err[bool, str](rr)) { ret rr; }
+        }
+        iid = iid + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# rebuild one block, expanding its lane ops and placing the reserved slots' stores
+fun expand_lane_block(lc: *LaneCtx, blk: *ir.Block, is_entry: bool) R.Result[bool, str] {
+    val fn: *ir.Function = lc.c.fn;
+
+    val old_len: u32 = blk.instr_count;
+    var old: *id.InstructionId = nil;
+    if (old_len > 0) {
+        val ro: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](lc.c.m.alloc, old_len::usize);
+        if (R.is_err[*id.InstructionId, str](ro)) { ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](ro)); }
+        old = R.unwrap_ok[*id.InstructionId, str](ro);
+        var i: u32 = 0;
+        for (i < old_len) { old[i] = blk.instructions[i]; i = i + 1; }
+    }
+    blk.instr_count = 0;
+
+    if (is_entry) {
+        var s: u32 = 0;
+        for (s < lc.alloca_len) {
+            val rap: R.Result[bool, str] = ir.block_append_instr(lc.c.m, blk, lc.allocas[s]);
+            if (R.is_err[bool, str](rap)) { body_free(?lc.c, old, old_len); ret rap; }
+            s = s + 1;
+        }
+        # a vector parameter's home store leads the body, dominating every lane read.
+        var p: u32 = 0;
+        for (p < lc.pn) {
+            if (lc.pslot_set[p]) {
+                val rsp: R.Result[bool, str] = emit_store(?lc.c, blk,
+                    value.param(p, fn.params[p].ty), lc.pslot[p], source.loc(source.FILE_NIL, 0));
+                if (R.is_err[bool, str](rsp)) { body_free(?lc.c, old, old_len); ret rsp; }
+            }
+            p = p + 1;
+        }
+    }
+
+    # a phi executes at block entry, so a slot store for a phi-defined vector leads
+    # the body rather than following an instruction in it.
+    var ph: u32 = 0;
+    for (ph < blk.phi_count) {
+        val pid: u32 = blk.phis[ph]::u32;
+        if (pid < lc.c.n && lc.store_at[pid]) {
+            val rsp: R.Result[bool, str] = emit_store(?lc.c, blk,
+                value.instr(pid::id.InstructionId, fn.instrs[pid].ty), lc.slot[pid], fn.instrs[pid].loc);
+            if (R.is_err[bool, str](rsp)) { body_free(?lc.c, old, old_len); ret rsp; }
+        }
+        ph = ph + 1;
+    }
+
+    var oi: u32 = 0;
+    for (oi < old_len) {
+        val cur: id.InstructionId = old[oi];
+        val kind: instruction.InstrKind = fn.instrs[cur::u32].kind;
+        var rr: R.Result[bool, str] = R.ok[bool, str](true);
+        if (kind == instruction.OP_VEC_EXTRACT) {
+            rr = expand_lane_read(lc, blk, cur);
+        }
+        or (kind == instruction.OP_VEC_INSERT) {
+            rr = expand_lane_write(lc, blk, cur);
+        }
+        or {
+            rewrite_ops(?lc.c, ?fn.instrs[cur::u32]);
+            rr = ir.block_append_instr(lc.c.m, blk, cur);
+            if (!R.is_err[bool, str](rr) && cur::u32 < lc.c.n && lc.store_at[cur::u32]) {
+                rr = emit_store(?lc.c, blk,
+                    value.instr(cur, fn.instrs[cur::u32].ty), lc.slot[cur::u32], fn.instrs[cur::u32].loc);
+            }
+        }
+        if (R.is_err[bool, str](rr)) { body_free(?lc.c, old, old_len); ret rr; }
+        oi = oi + 1;
+    }
+
+    body_free(?lc.c, old, old_len);
+
+    var p2: u32 = 0;
+    for (p2 < blk.phi_count) {
+        rewrite_ops(?lc.c, ?fn.instrs[blk.phis[p2]::u32]);
+        p2 = p2 + 1;
+    }
+    if (blk.terminator != id.INSTR_NIL) {
+        rewrite_ops(?lc.c, ?fn.instrs[blk.terminator::u32]);
+    }
+    ret R.ok[bool, str](true);
+}
+
+# free a LaneCtx's owned scratch arrays
+fun lane_ctx_free(m: *ir.Module, lc: *LaneCtx) {
+    if (lc.slot != nil && lc.c.n > 0)      { A.deallocate[value.Value](m.alloc, lc.slot, lc.c.n::usize); }
+    if (lc.slot_set != nil && lc.c.n > 0)  { A.deallocate[bool](m.alloc, lc.slot_set, lc.c.n::usize); }
+    if (lc.store_at != nil && lc.c.n > 0)  { A.deallocate[bool](m.alloc, lc.store_at, lc.c.n::usize); }
+    if (lc.allocas != nil && lc.c.n > 0)   { A.deallocate[id.InstructionId](m.alloc, lc.allocas, lc.c.n::usize); }
+    if (lc.pslot != nil && lc.pn > 0)      { A.deallocate[value.Value](m.alloc, lc.pslot, lc.pn::usize); }
+    if (lc.pslot_set != nil && lc.pn > 0)  { A.deallocate[bool](m.alloc, lc.pslot_set, lc.pn::usize); }
+    lc.slot = nil; lc.slot_set = nil; lc.store_at = nil; lc.allocas = nil;
+    lc.pslot = nil; lc.pslot_set = nil;
+    ctx_free(m, ?lc.c);
+}
+
+# expand one function's lane ops; the function is untouched when it has none
+fun expand_lane_function(m: *ir.Module, fn: *ir.Function, void_ty: ir_type.IrTypeId,
+                         ptr_ty: ir_type.IrTypeId, idx_ty: ir_type.IrTypeId) R.Result[bool, str] {
+    if (!has_lane_op(fn)) { ret R.ok[bool, str](true); }
+
+    var lc: LaneCtx;
+    lc.c.m       = m;
+    lc.c.fn      = fn;
+    lc.c.n       = fn.instr_len;
+    lc.c.pcount  = 0;          # this pass never retypes a parameter; keep resolve's param arm inert
+    lc.c.is_vp   = nil;
+    lc.c.void_ty = void_ty;
+    lc.c.ptr_ty  = ptr_ty;
+    lc.c.idx_ty  = idx_ty;
+    lc.pn        = fn.param_count;
+    lc.alloca_len = 0;
+
+    val rpv: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, lc.c.n::usize);
+    if (R.is_err[*value.Value, str](rpv)) { ret R.err[bool, str](R.unwrap_err[*value.Value, str](rpv)); }
+    lc.c.pval = R.unwrap_ok[*value.Value, str](rpv);
+    val rps: R.Result[*bool, str] = A.zallocate[bool](m.alloc, lc.c.n::usize);
+    if (R.is_err[*bool, str](rps)) { lane_ctx_free(m, ?lc); ret R.err[bool, str](R.unwrap_err[*bool, str](rps)); }
+    lc.c.pval_set = R.unwrap_ok[*bool, str](rps);
+
+    val rsl: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, lc.c.n::usize);
+    if (R.is_err[*value.Value, str](rsl)) { lane_ctx_free(m, ?lc); ret R.err[bool, str](R.unwrap_err[*value.Value, str](rsl)); }
+    lc.slot = R.unwrap_ok[*value.Value, str](rsl);
+    val rss: R.Result[*bool, str] = A.zallocate[bool](m.alloc, lc.c.n::usize);
+    if (R.is_err[*bool, str](rss)) { lane_ctx_free(m, ?lc); ret R.err[bool, str](R.unwrap_err[*bool, str](rss)); }
+    lc.slot_set = R.unwrap_ok[*bool, str](rss);
+    val rsa: R.Result[*bool, str] = A.zallocate[bool](m.alloc, lc.c.n::usize);
+    if (R.is_err[*bool, str](rsa)) { lane_ctx_free(m, ?lc); ret R.err[bool, str](R.unwrap_err[*bool, str](rsa)); }
+    lc.store_at = R.unwrap_ok[*bool, str](rsa);
+    val ral: R.Result[*id.InstructionId, str] = A.allocate[id.InstructionId](m.alloc, lc.c.n::usize);
+    if (R.is_err[*id.InstructionId, str](ral)) { lane_ctx_free(m, ?lc); ret R.err[bool, str](R.unwrap_err[*id.InstructionId, str](ral)); }
+    lc.allocas = R.unwrap_ok[*id.InstructionId, str](ral);
+
+    if (lc.pn > 0) {
+        val rpl: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, lc.pn::usize);
+        if (R.is_err[*value.Value, str](rpl)) { lane_ctx_free(m, ?lc); ret R.err[bool, str](R.unwrap_err[*value.Value, str](rpl)); }
+        lc.pslot = R.unwrap_ok[*value.Value, str](rpl);
+        val rpss: R.Result[*bool, str] = A.zallocate[bool](m.alloc, lc.pn::usize);
+        if (R.is_err[*bool, str](rpss)) { lane_ctx_free(m, ?lc); ret R.err[bool, str](R.unwrap_err[*bool, str](rpss)); }
+        lc.pslot_set = R.unwrap_ok[*bool, str](rpss);
+    }
+
+    val rr: R.Result[bool, str] = reserve_lane_slots(?lc);
+    if (R.is_err[bool, str](rr)) { lane_ctx_free(m, ?lc); ret rr; }
+
+    var bi: u32 = 0;
+    for (bi < fn.block_count) {
+        val rb: R.Result[bool, str] = expand_lane_block(?lc, ?fn.blocks[bi], bi == 0);
+        if (R.is_err[bool, str](rb)) { lane_ctx_free(m, ?lc); ret rb; }
+        bi = bi + 1;
+    }
+
+    lane_ctx_free(m, ?lc);
+    ret R.ok[bool, str](true);
+}
+
+# rewrite every vector lane access in `m` to the vector's memory image, for a target
+# whose ISA cannot read or write a lane in a register (#2236)
+#
+# A no-op on a target that selects lane access natively (`has_lane_ops == true`).
+# Everywhere else this restores exactly the shape lane access had before the IR
+# gained OP_VEC_EXTRACT / OP_VEC_INSERT: one stack slot per vector value, a
+# whole-vector store into it, and a scalar load or store at the lane's offset.
+#
+# Runs BEFORE `run`, so a SIMD-incapable target's scalarizer sees only the memory
+# form it already understands and needs no lane-op arm of its own.
+# ---
+# m:   the module to legalize in place
+# tgt: the target, consulted for the lane-access capability fact
+# ret: ok(true) on success, or an allocation / internal error
+pub fun expand_lane_ops(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
+    if (tgt.model.has_lane_ops) { ret R.ok[bool, str](true); }
+
+    val rv: R.Result[ir_type.IrTypeId, str] = ir_type.intern_void(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rv)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rv)); }
+    val void_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rv);
+
+    val rp: R.Result[ir_type.IrTypeId, str] = ir_type.intern_ptr(?m.types);
+    if (R.is_err[ir_type.IrTypeId, str](rp)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rp)); }
+    val ptr_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rp);
+
+    val ri: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, tgt.isa.pointer_width * 8);
+    if (R.is_err[ir_type.IrTypeId, str](ri)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](ri)); }
+    val idx_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](ri);
+
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        if ((fn.flags & ir.FN_FLAG_EXTERN) == 0 && fn.instr_len > 0) {
+            val rf: R.Result[bool, str] = expand_lane_function(m, fn, void_ty, ptr_ty, idx_ty);
+            if (R.is_err[bool, str](rf)) { ret rf; }
+        }
+        fi = fi + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
 # scalarize every lane-wise vector value and operator in `m` for a SIMD-incapable
 # target; a no-op on a capable target (`has_v128 == true`)
 #

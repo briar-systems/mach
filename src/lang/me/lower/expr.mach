@@ -1145,21 +1145,86 @@ fun lower_project_lvalue(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Ex
     ret field_gep(ctx, R.unwrap_ok[value.Value, str](res_base), rec_ty, field_ix);
 }
 
+# the comptime lane index of `v[i]` when the indexed object is a vector (#2236)
+#
+# Re-evaluates the index through the SAME `comptime.eval` sema used to accept it
+# (`infer_vector_lane`), rather than lowering it as a runtime rvalue: sema admits any
+# comptime-constant expression, so `v[K]` for a `val K` is legal and its lowered
+# rvalue would not be a literal. Sema has already proved the index is a
+# non-negative in-bounds integer constant, so a failure here is not a user error but
+# a lowering that disagrees with sema, and it is reported as such.
+# ---
+# ctx: per-module lowering context
+# e:   the resolved index node
+# ret: some(lane index) when the object is a vector, none when it is not
+fun vector_lane_of(ctx: *context.LowerContext, e: *expr.Expr) O.Option[R.Result[u64, str]] {
+    val obj_ty: type.TypeId = context.expr_type_of(ctx, e.data.index.object);
+    if (!type.is_vector(?ctx.s.types, obj_ty)) { ret O.none[R.Result[u64, str]](); }
+
+    val cr: R.Result[comptime.CTValue, str] = comptime.eval(ctx.ctx, ctx.a,
+        context.module_source(ctx), e.data.index.index, ?ctx.s.interner);
+    if (R.is_err[comptime.CTValue, str](cr)) {
+        ret O.some[R.Result[u64, str]](R.err[u64, str](
+            "lower: vector lane index is not a comptime constant"));
+    }
+    val cv: comptime.CTValue = R.unwrap_ok[comptime.CTValue, str](cr);
+    if (cv.kind != comptime.CT_KIND_INT || comptime.ct_is_negative(cv)) {
+        ret O.some[R.Result[u64, str]](R.err[u64, str](
+            "lower: vector lane index is not a non-negative integer constant"));
+    }
+    ret O.some[R.Result[u64, str]](R.ok[u64, str](cv.data.i:~u64));
+}
+
 # lower an index access in rvalue position
 #
 # A load from the element pointer, except for an aggregate element whose rvalue is
-# its storage address (see lower_ident_rvalue).
+# its storage address (see lower_ident_rvalue), and except for a VECTOR LANE, which
+# reads out of the vector value itself rather than out of its memory image (#2236).
 # ---
 # ctx: per-module lowering context
 # eid: the index expression
 # e:   the resolved index node
 # ret: the element's rvalue, or an error
 fun lower_index_rvalue(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R.Result[value.Value, str] {
+    val opt_lane: O.Option[R.Result[u64, str]] = vector_lane_of(ctx, e);
+    if (O.is_some[R.Result[u64, str]](opt_lane)) {
+        ret lower_vector_lane_read(ctx, eid, e, O.unwrap[R.Result[u64, str]](opt_lane));
+    }
     val res_ptr: R.Result[value.Value, str] = lower_index_lvalue(ctx, eid, e);
     if (R.is_err[value.Value, str](res_ptr)) { ret res_ptr; }
     val res_ir: R.Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
     if (R.is_err[ir_type.IrTypeId, str](res_ir)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](res_ir)); }
     ret rvalue_at(ctx, R.unwrap_ok[value.Value, str](res_ptr), R.unwrap_ok[ir_type.IrTypeId, str](res_ir));
+}
+
+# lower a vector lane read `v[K]` to an OP_VEC_EXTRACT of the vector VALUE (#2236)
+#
+# The vector is consumed as an rvalue, so the lane never needs the vector's memory
+# image. `lower_index_lvalue` still serves a genuine address-of (`?v[0]`), which
+# does need it and which correctly keeps the slot in memory.
+# ---
+# ctx:  per-module lowering context
+# eid:  the index expression (supplies the lane's IR type)
+# e:    the resolved index node
+# lane: the comptime lane index, or the disagreement with sema
+# ret:  the lane value, or an error
+fun lower_vector_lane_read(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr,
+                           lane: R.Result[u64, str]) R.Result[value.Value, str] {
+    if (R.is_err[u64, str](lane)) { ret R.err[value.Value, str](R.unwrap_err[u64, str](lane)); }
+
+    val res_vec: R.Result[value.Value, str] = lower_rvalue(ctx, e.data.index.object);
+    if (R.is_err[value.Value, str](res_vec)) { ret res_vec; }
+
+    val res_ir: R.Result[ir_type.IrTypeId, str] = ir_type_of_expr(ctx, eid);
+    if (R.is_err[ir_type.IrTypeId, str](res_ir)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](res_ir)); }
+
+    val res_xty: R.Result[ir_type.IrTypeId, str] = index_type(ctx);
+    if (R.is_err[ir_type.IrTypeId, str](res_xty)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](res_xty)); }
+
+    ret builder.emit_vec_extract(?ctx.builder,
+        R.unwrap_ok[value.Value, str](res_vec),
+        value.const_int(R.unwrap_ok[u64, str](lane), R.unwrap_ok[ir_type.IrTypeId, str](res_xty)),
+        R.unwrap_ok[ir_type.IrTypeId, str](res_ir));
 }
 
 # lower an index access in lvalue position to the element pointer
@@ -2657,6 +2722,15 @@ fun lower_assign(ctx: *context.LowerContext, e: *expr.Expr) R.Result[value.Value
     if (R.is_err[value.Value, str](res_rhs)) { ret res_rhs; }
     val rhs: value.Value = R.unwrap_ok[value.Value, str](res_rhs);
 
+    # a vector lane write reads the whole vector, replaces the lane functionally, and
+    # writes the whole vector back (#2236); the slot then has only whole-value
+    # accesses, so mem2reg can promote it and the read-modify-write collapses to one
+    # lane-insert instruction. the RHS is already evaluated, preserving the
+    # right-then-left order of the general path below.
+    val res_lane: R.Result[bool, str] = lower_vector_lane_write(ctx, e.data.binary.lhs, rhs);
+    if (R.is_err[bool, str](res_lane)) { ret R.err[value.Value, str](R.unwrap_err[bool, str](res_lane)); }
+    if (R.unwrap_ok[bool, str](res_lane)) { ret assign_epilogue(ctx, e, rhs); }
+
     val res_lhs: R.Result[value.Value, str] = lower_lvalue(ctx, e.data.binary.lhs);
     if (R.is_err[value.Value, str](res_lhs)) { ret res_lhs; }
     val ptr: value.Value = R.unwrap_ok[value.Value, str](res_lhs);
@@ -2664,6 +2738,20 @@ fun lower_assign(ctx: *context.LowerContext, e: *expr.Expr) R.Result[value.Value
     val res_store: R.Result[bool, str] = builder.emit_store(?ctx.builder, rhs, ptr);
     if (R.is_err[bool, str](res_store)) { ret R.err[value.Value, str](R.unwrap_err[bool, str](res_store)); }
 
+    ret assign_epilogue(ctx, e, rhs);
+}
+
+# the secrecy seed and debug rebind every assignment shape shares
+#
+# Runs after the write, whichever form it took: the general store, or the vector
+# lane read-modify-write. Both end in a store to the destination's storage, so the
+# destination-secrecy seed marks the same instruction either way.
+# ---
+# ctx: per-module lowering context
+# e:   the resolved assignment node
+# rhs: the assigned value (also the assignment's own result)
+# ret: the assigned value, or an error
+fun assign_epilogue(ctx: *context.LowerContext, e: *expr.Expr, rhs: value.Value) R.Result[value.Value, str] {
     # a write into SECRET storage is a secret-memory seed even when the stored value is
     # public - a zeroizing wipe `k = 0` of a `^` local (#1646). emit_store marks a
     # secret-VALUE store; this marks by DESTINATION secrecy (the lvalue's semantic type),
@@ -2689,6 +2777,53 @@ fun lower_assign(ctx: *context.LowerContext, e: *expr.Expr) R.Result[value.Value
         }
     }
     ret R.ok[value.Value, str](rhs);
+}
+
+# lower `v[K] = x` as a functional lane replacement written back to v's storage
+# (#2236)
+#
+# Declines (ok(false), emitting nothing) unless the destination is an index into a
+# vector, leaving every other assignment to the general store path. The vector's
+# storage is loaded whole, the lane replaced with OP_VEC_INSERT, and the result
+# stored whole - so the slot carries only whole-value accesses and mem2reg promotes
+# it, leaving one lane-insert instruction and no memory traffic at all.
+# ---
+# ctx: per-module lowering context
+# lhs: the assignment's destination expression
+# rhs: the already-evaluated assigned value
+# ret: ok(true) when the lane write was emitted, ok(false) to decline, or an error
+fun lower_vector_lane_write(ctx: *context.LowerContext, lhs: id.ExprId, rhs: value.Value) R.Result[bool, str] {
+    val opt_e: O.Option[*expr.Expr] = ast.get_expr(ctx.a, lhs);
+    if (O.is_none[*expr.Expr](opt_e)) { ret R.ok[bool, str](false); }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](opt_e);
+    if (e.kind != expr.EXPR_KIND_INDEX) { ret R.ok[bool, str](false); }
+
+    val opt_lane: O.Option[R.Result[u64, str]] = vector_lane_of(ctx, e);
+    if (O.is_none[R.Result[u64, str]](opt_lane)) { ret R.ok[bool, str](false); }
+    val lane_r: R.Result[u64, str] = O.unwrap[R.Result[u64, str]](opt_lane);
+    if (R.is_err[u64, str](lane_r)) { ret R.err[bool, str](R.unwrap_err[u64, str](lane_r)); }
+
+    val res_slot: R.Result[value.Value, str] = lower_lvalue(ctx, e.data.index.object);
+    if (R.is_err[value.Value, str](res_slot)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_slot)); }
+    val slot: value.Value = R.unwrap_ok[value.Value, str](res_slot);
+
+    val res_vty: R.Result[ir_type.IrTypeId, str] = context.lower_type(ctx, context.expr_type_of(ctx, e.data.index.object));
+    if (R.is_err[ir_type.IrTypeId, str](res_vty)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](res_vty)); }
+    val vty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_vty);
+
+    val res_xty: R.Result[ir_type.IrTypeId, str] = index_type(ctx);
+    if (R.is_err[ir_type.IrTypeId, str](res_xty)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](res_xty)); }
+
+    val res_old: R.Result[value.Value, str] = builder.emit_load(?ctx.builder, slot, vty);
+    if (R.is_err[value.Value, str](res_old)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_old)); }
+
+    val res_new: R.Result[value.Value, str] = builder.emit_vec_insert(?ctx.builder,
+        R.unwrap_ok[value.Value, str](res_old),
+        value.const_int(R.unwrap_ok[u64, str](lane_r), R.unwrap_ok[ir_type.IrTypeId, str](res_xty)),
+        rhs);
+    if (R.is_err[value.Value, str](res_new)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](res_new)); }
+
+    ret builder.emit_store(?ctx.builder, R.unwrap_ok[value.Value, str](res_new), slot);
 }
 
 # lower a short-circuiting `&&` / `||`
