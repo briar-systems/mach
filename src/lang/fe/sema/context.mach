@@ -97,13 +97,56 @@ fwd type.FieldTable;
 # sig:     the substituted signature TypeId (for the instance return type)
 # args:    owned concrete type-argument array (by parameter ordinal)
 # arg_len: number of type arguments
+# bare:    the generic's source name, for the instantiation-chain diagnostic
+# depth:   length of the derivation chain that reached this request: 0 for one
+#          recorded by the module pass, one more than its parent's for one
+#          recorded while re-validating another instance's body
+# parent:  worklist index of the instance whose re-validation recorded this one,
+#          or INST_NONE at the root of a chain
 pub rec InstReq {
     origin:  session.ModuleId;
     decl:    id.DeclId;
     sig:     type.TypeId;
     args:    *type.TypeId;
     arg_len: u32;
+    bare:    intern.StrId;
+    depth:   u32;
+    parent:  u32;
 }
+
+# `InstReq.parent` sentinel: recorded by the module pass, so it begins a chain
+pub val INST_NONE: u32 = 4294967295;
+
+# the cap on how far one chain of DERIVED generic instantiations may run
+#
+# The dedup terminates any FINITE instance set, mutual recursion included. An
+# infinite one arises when an instance's re-validation instantiates a strictly
+# larger instance of the same generic (`f[P]` re-validating into `f[*P]` into
+# `f[**P]`), so the thing to bound is the derivation chain, not the module's
+# total instance count: a large generic-heavy module legitimately records
+# hundreds of unrelated instances at depth 0, and a total cap would conflate
+# "deeply recursive" with "just big". The total is bounded too, separately, by
+# MAX_CT_INSTANCES.
+#
+# The same policy the monomorphizer enforces on the instances it EMITS (see
+# `me.lower.context.MAX_INSTANCE_DEPTH`); the two engines track different
+# instance sets, so each is measured against its own. Measured, not guessed: see
+# doc/design/instantiation-limits.md.
+pub val MAX_CT_INSTANCE_DEPTH: u32 = 32;
+
+# the cap on how many distinct instances one module's re-validation may track
+#
+# The depth bound alone is not enough: a body that instantiates itself twice at
+# two different growing arguments stays inside any depth budget while recording
+# 2^depth instances, and the dedup here is a linear scan, so that is a hang well
+# before the depth bound is reached.
+pub val MAX_CT_INSTANCES: u32 = 8192;
+
+# `record_instance` outcomes: recorded (or pruned - both leave the pass clean),
+# or refused by one of the two instantiation limits
+pub val RECORD_OK:           u8 = 0;
+pub val RECORD_LIMIT_DEPTH:  u8 = 1;
+pub val RECORD_LIMIT_COUNT:  u8 = 2;
 
 # the per-instance CT re-validation worklist (#2157): generic instantiations requested
 # during body inference, drained after all bodies are typed
@@ -120,12 +163,14 @@ pub rec InstReq {
 # cap:     allocated capacity of `items`
 # drained: cursor; requests below it have been re-validated
 # alloc:   allocator backing `items` and each request's owned `args`
+# limited: an instantiation limit was reported; further requests are dropped
 pub rec InstWorklist {
     items:   *InstReq;
     len:     u32;
     cap:     u32;
     drained: u32;
     alloc:   *A.Allocator;
+    limited: bool;
 
     # the #2225 rule's state for the episodes this worklist drives, so a lowering-time
     # deferred body - which builds its own context per element, per instance - shares one
@@ -232,6 +277,16 @@ pub rec SemaContext {
     # only on an episode with no worklist, where a recorded instance would never be
     # re-validated and would leak its arguments.
     collect_insts: bool;
+
+    # the derivation depth to stamp on every instance this episode records (#2163):
+    # 0 on the module pass, one more than the re-validated instance's own depth
+    # inside a drain, which is what makes a chain of derived instantiations
+    # measurable rather than a flat count.
+    inst_depth: u32;
+
+    # the worklist index of the instance being re-validated, or INST_NONE outside a
+    # drain; the link the chain diagnostic walks.
+    inst_parent: u32;
 
     # gate for `report` / `report_note` (#2254): false on every episode that is the
     # authority for the statements it walks, true only on the re-derivation prologue
@@ -485,13 +540,16 @@ fun args_equal(a: *type.TypeId, b: *type.TypeId, n: u32) bool {
 # args:    the concrete type arguments (borrowed; copied here)
 # arg_len: number of type arguments
 # sig:     the substituted signature TypeId
-# ret:     ok(true), or err carrying a COMPLETE user-facing message - an allocation
-#          failure or the derivation-depth break. Both are already `internal:`-prefixed,
-#          so the caller reports the string verbatim rather than re-wrapping it.
+# ret:     one of the RECORD_* outcomes - recorded, pruned, or refused by an
+#          instantiation limit, which the CALLER reports (it holds the call span,
+#          and the chain diagnostic needs the type renderer this leaf cannot
+#          import) - or err carrying a COMPLETE `internal:`-prefixed allocation
+#          failure the caller reports verbatim.
 pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.DeclId,
-                        args: *type.TypeId, arg_len: u32, sig: type.TypeId) R.Result[bool, str] {
-    if (!sc.collect_insts) { ret R.ok[bool, str](true); }
-    if (arg_len == 0)      { ret R.ok[bool, str](true); }
+                        args: *type.TypeId, arg_len: u32, sig: type.TypeId,
+                        bare: intern.StrId) R.Result[u8, str] {
+    if (!sc.collect_insts) { ret R.ok[u8, str](RECORD_OK); }
+    if (arg_len == 0)      { ret R.ok[u8, str](RECORD_OK); }
 
     var any: bool = false;
     var i: u32 = 0;
@@ -509,7 +567,7 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
             && !type_mentions_generic_param(sc, args[i])) { any = true; }
         i = i + 1;
     }
-    if (!any) { ret R.ok[bool, str](true); }
+    if (!any) { ret R.ok[u8, str](RECORD_OK); }
 
     if (sc.insts != nil) {
         var j: u32 = 0;
@@ -517,7 +575,7 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
             val e: *InstReq = ?sc.insts.items[j];
             if (e.origin == origin && e.decl == decl && e.arg_len == arg_len
                 && args_equal(e.args, args, arg_len)) {
-                ret R.ok[bool, str](true);
+                ret R.ok[u8, str](RECORD_OK);
             }
             j = j + 1;
         }
@@ -525,23 +583,39 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
 
     if (sc.insts == nil) {
         val wr: R.Result[*InstWorklist, str] = inst_worklist_new(sc.s.alloc);
-        if (R.is_err[*InstWorklist, str](wr)) { ret R.err[bool, str](R.unwrap_err[*InstWorklist, str](wr)); }
+        if (R.is_err[*InstWorklist, str](wr)) { ret R.err[u8, str](R.unwrap_err[*InstWorklist, str](wr)); }
         sc.insts = R.unwrap_ok[*InstWorklist, str](wr);
     }
     val wl: *InstWorklist = sc.insts;
+
+    # the limit is reported ONCE. every novel request after it would return the same
+    # message and poison its own call site, burying the first offender under one
+    # diagnostic per still-draining body. dropping the rest re-validates less than a
+    # clean pass would, which is sound here and only here: the reported break already
+    # fails the build, so no instance of a program that still compiles is skipped.
+    if (wl.limited) { ret R.ok[u8, str](RECORD_OK); }
+
+    if (sc.inst_depth > MAX_CT_INSTANCE_DEPTH) {
+        wl.limited = true;
+        ret R.ok[u8, str](RECORD_LIMIT_DEPTH);
+    }
+    if (wl.len >= MAX_CT_INSTANCES) {
+        wl.limited = true;
+        ret R.ok[u8, str](RECORD_LIMIT_COUNT);
+    }
 
     if (wl.len == wl.cap) {
         var new_cap: u32 = 8;
         if (wl.cap > 0) { new_cap = wl.cap * 2; }
         var nr: R.Result[*InstReq, str] = A.allocate[InstReq](wl.alloc, new_cap::usize);
         if (wl.cap > 0) { nr = A.reallocate[InstReq](wl.alloc, wl.items, wl.cap::usize, new_cap::usize); }
-        if (R.is_err[*InstReq, str](nr)) { ret R.err[bool, str]("internal: out of memory growing the constant-time re-validation worklist"); }
+        if (R.is_err[*InstReq, str](nr)) { ret R.err[u8, str]("internal: out of memory growing the constant-time re-validation worklist"); }
         wl.items = R.unwrap_ok[*InstReq, str](nr);
         wl.cap   = new_cap;
     }
 
     val cr: R.Result[*type.TypeId, str] = A.allocate[type.TypeId](wl.alloc, arg_len::usize);
-    if (R.is_err[*type.TypeId, str](cr)) { ret R.err[bool, str]("internal: out of memory copying a generic instance's type arguments"); }
+    if (R.is_err[*type.TypeId, str](cr)) { ret R.err[u8, str]("internal: out of memory copying a generic instance's type arguments"); }
     val owned: *type.TypeId = R.unwrap_ok[*type.TypeId, str](cr);
     var k: u32 = 0;
     for (k < arg_len) { owned[k] = args[k]; k = k + 1; }
@@ -552,8 +626,11 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
     slot.sig     = sig;
     slot.args    = owned;
     slot.arg_len = arg_len;
+    slot.bare    = bare;
+    slot.depth   = sc.inst_depth;
+    slot.parent  = sc.inst_parent;
     wl.len = wl.len + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok[u8, str](RECORD_OK);
 }
 
 # allocate an empty CT re-validation worklist (#2157)
@@ -576,6 +653,7 @@ pub fun inst_worklist_new(alloc: *A.Allocator) R.Result[*InstWorklist, str] {
     wl.alloc            = alloc;
     wl.uni_reports.len  = 0;
     wl.secret_state     = SECRET_UNKNOWN;
+    wl.limited          = false;
     ret R.ok[*InstWorklist, str](wl);
 }
 
