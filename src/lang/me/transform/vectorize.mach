@@ -84,10 +84,15 @@ rec SplatEntry {
 # consistent as the CFG grows, while the kept dependence info stays valid (existing
 # instructions are never moved or renumbered).
 # ---
-# m:   the module to transform in place
-# tgt: the target; consulted for the SIMD capability fact
-# ret: ok(true) if any loop was vectorized, ok(false) if none, or an error
-pub fun run(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
+# m:             the module to transform in place
+# tgt:           the target; consulted for the SIMD capability fact
+# float_reassoc: the resolved `[profile.X] float_reassoc` lever (#2160); when true the
+#                reduction path also admits float accumulators, whose lane-partial form
+#                reassociates and so is not bit-identical to the scalar reduction. When
+#                false (the default) every float reduction stays scalar and the emitted
+#                code is exactly what a compiler without the lever emits.
+# ret:           ok(true) if any loop was vectorized, ok(false) if none, or an error
+pub fun run(m: *ir.Module, tgt: *target.Target, float_reassoc: bool) R.Result[bool, str] {
     if (!tgt.model.has_v128) { ret R.ok[bool, str](false); }
 
     var changed: bool = false;
@@ -152,7 +157,7 @@ pub fun run(m: *ir.Module, tgt: *target.Target) R.Result[bool, str] {
         # the reduction phase, over the (possibly element-wise-transformed) function;
         # reduction loops are disjoint from element-wise loops (a reduction has no
         # store), so an element-wise transform never turns one into a reduction
-        val rr: R.Result[bool, str] = run_reductions(m, fn);
+        val rr: R.Result[bool, str] = run_reductions(m, fn, float_reassoc);
         if (R.is_err[bool, str](rr)) { ret rr; }
         if (R.unwrap_ok[bool, str](rr)) { changed = true; }
         fi = fi + 1;
@@ -751,13 +756,17 @@ fun set_phi_incoming(fn: *ir.Function, blk: id.BlockId, from: id.BlockId, new_bl
     }
 }
 
-# vectorize the integer reductions in one function, in two phases like run(): collect
-# the reduction candidates (read-only, keeping each ReductionInfo), then transform
-# each, re-analyzing to relocate it. A pure reduction has no store so no alias guard
-# is needed; the transform builds a vector accumulator (lane 0 = the user's initial
+# vectorize the reductions in one function, in two phases like run(): collect the
+# reduction candidates (read-only, keeping each ReductionInfo), then transform each,
+# re-analyzing to relocate it. A pure reduction has no store so no alias guard is
+# needed; the transform builds a vector accumulator (lane 0 = the user's initial
 # value, the other lanes the op identity), a vector main loop, a horizontal combine,
 # and a scalar remainder that continues from the combined value.
-fun run_reductions(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
+#
+# `float_reassoc` widens the candidate set to float accumulators. The transform below
+# is the SAME one either way -- there is one reduction path, and the lever only
+# decides which accumulator element types reach it.
+fun run_reductions(m: *ir.Module, fn: *ir.Function, float_reassoc: bool) R.Result[bool, str] {
     var changed: bool = false;
     val ral: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, m.alloc);
     if (R.is_err[loops.LoopAnalysis, str](ral)) { ret R.err[bool, str](R.unwrap_err[loops.LoopAnalysis, str](ral)); }
@@ -775,7 +784,7 @@ fun run_reductions(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
     var lx: u32 = 0;
     for (lx < la.loop_len) {
         var ri: dep.ReductionInfo;
-        val rc: R.Result[bool, str] = reduction_candidate(m, fn, ?la, lx, ?ri);
+        val rc: R.Result[bool, str] = reduction_candidate(m, fn, ?la, lx, float_reassoc, ?ri);
         if (R.is_err[bool, str](rc)) { free_reds(m, headers, reds, hn, cap); loops.dnit(?la); ret rc; }
         if (R.unwrap_ok[bool, str](rc)) { headers[hn] = la.loops[lx].header; reds[hn] = ri; hn = hn + 1; }
         lx = lx + 1;
@@ -807,12 +816,12 @@ fun free_reds(m: *ir.Module, headers: *id.BlockId, reds: *dep.ReductionInfo, hn:
     A.deallocate[dep.ReductionInfo](m.alloc, reds, cap::usize);
 }
 
-# whether loop `lx` is a vectorizable integer reduction; on true the ReductionInfo is
+# whether loop `lx` is a vectorizable reduction; on true the ReductionInfo is
 # transferred to `out_ri` (caller owns / dnits it)
-fun reduction_candidate(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, out_ri: *dep.ReductionInfo) R.Result[bool, str] {
+fun reduction_candidate(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, float_reassoc: bool, out_ri: *dep.ReductionInfo) R.Result[bool, str] {
     val lp: *loops.Loop = ?la.loops[lx];
     if (!reduction_shape_ok(lp)) { ret R.ok[bool, str](false); }
-    val rr: R.Result[dep.ReductionInfo, str] = dep.analyze_reduction(fn, la, lx, ?m.types, m.alloc);
+    val rr: R.Result[dep.ReductionInfo, str] = dep.analyze_reduction(fn, la, lx, ?m.types, m.alloc, float_reassoc);
     if (R.is_err[dep.ReductionInfo, str](rr)) { ret R.err[bool, str](R.unwrap_err[dep.ReductionInfo, str](rr)); }
     var ri: dep.ReductionInfo = R.unwrap_ok[dep.ReductionInfo, str](rr);
     if (!ri.ok) { dep.reduction_dnit(?ri); ret R.ok[bool, str](false); }
@@ -840,31 +849,50 @@ fun rv_is_vector_tree(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, 
     val rset: R.Result[*bool, str] = A.allocate[bool](m.alloc, fn.instr_len::usize);
     if (R.is_err[*bool, str](rset)) { ret false; }
     val vset: *bool = R.unwrap_ok[*bool, str](rset);
-    build_vset(fn, la, lx, ri.accesses, ri.access_count, ri.elem_ty, false, false, vset);
+    build_vset(fn, la, lx, ri.accesses, ri.access_count, ri.elem_ty, ri.is_float, false, vset);
     var ok: bool = ri.rv.kind == value.VAL_INSTR && ri.rv.data.instr::u32 < fn.instr_len && vset[ri.rv.data.instr::u32];
     A.deallocate[bool](m.alloc, vset, fn.instr_len::usize);
     ret ok;
 }
 
-# the OP identity constant for a reduction op (add/xor/or -> 0; and -> all-ones)
-fun reduction_identity(op: instruction.InstrKind, elem_ty: ir_type.IrTypeId) value.Value {
+# the EXACT identity element of a reduction op: what the idle lanes are seeded with,
+# absorbed without trace by the horizontal combine.
+#
+# integer: add/xor/or -> 0, and -> all-ones.
+#
+# float add -> NEGATIVE zero, not +0.0. Under round-to-nearest `x + (-0.0)` is `x` for
+# every x, both zeros included, whereas `(-0.0) + (+0.0)` is `+0.0` -- seeding with
+# +0.0 would flip the sign of an all-negative-zero sum and so quietly buy a
+# no-signed-zeros liberty on top of the reassociation the lever licenses.
+#
+# float mul -> 1.0, an exact identity for every operand.
+fun reduction_identity(op: instruction.InstrKind, elem_ty: ir_type.IrTypeId, is_float: bool) value.Value {
+    if (is_float) {
+        if (op == instruction.OP_MUL) { ret value.const_float(1.0, elem_ty); }
+        ret value.const_float(-0.0, elem_ty);
+    }
     if (op == instruction.OP_AND) { ret value.const_int(0xFFFFFFFFFFFFFFFF, elem_ty); }
     ret value.const_int(0, elem_ty);
 }
 
-# emit the scalar reduction op `op` (add/xor/or/and) over two scalars into `b`
+# emit the scalar reduction op `op` over two scalars into `b`
 fun emit_reduction_op(b: *builder.Builder, op: instruction.InstrKind, x: value.Value, y: value.Value) R.Result[value.Value, str] {
     if (op == instruction.OP_XOR) { ret builder.emit_xor(b, x, y); }
     if (op == instruction.OP_OR)  { ret builder.emit_or(b, x, y); }
     if (op == instruction.OP_AND) { ret builder.emit_and(b, x, y); }
+    if (op == instruction.OP_MUL) { ret builder.emit_mul(b, x, y); }
     ret builder.emit_add(b, x, y);
 }
 
-# vectorize one recognized integer reduction. `ri` is its ReductionInfo from the
-# collect phase (still valid: transforms only append). Builds the vector accumulator
-# main loop + horizontal combine + scalar remainder, and rewrites the accumulator's
-# live-out uses to the remainder's result. Returns ok(true) on success, ok(false) if
-# re-analysis declines (no mutation), or an alloc / build error.
+# vectorize one recognized reduction, integer or float. `ri` is its ReductionInfo from
+# the collect phase (still valid: transforms only append). Builds the vector
+# accumulator main loop + horizontal combine + scalar remainder, and rewrites the
+# accumulator's live-out uses to the remainder's result. Returns ok(true) on success,
+# ok(false) if re-analysis declines (no mutation), or an alloc / build error.
+#
+# The element kind changes nothing structurally: the same partial-sum + horizontal-
+# combine shape serves both, and the only float-specific choices are the identity
+# constant (reduction_identity) and the ops the reduction value's tree may use.
 fun vectorize_reduction(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, ri: *dep.ReductionInfo) R.Result[bool, str] {
     val lp: *loops.Loop = ?la.loops[lx];
     if (!reduction_shape_ok(lp)) { ret R.ok[bool, str](false); }
@@ -879,6 +907,7 @@ fun vectorize_reduction(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis
     val cmp_id:    id.InstructionId = lp.counted.cmp;
     val lanes:     u32 = ri.lanes;
     val elem_ty:   ir_type.IrTypeId = ri.elem_ty;
+    val is_float:  bool = ri.is_float;
     val red_op:    instruction.InstrKind = ri.op;
     val acc_phi:   id.InstructionId = ri.acc_phi;
     val acc_upd:   id.InstructionId = ri.acc_update;
@@ -890,6 +919,12 @@ fun vectorize_reduction(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis
     val rat: R.Result[ir_type.IrTypeId, str] = ir_type.intern_array(?m.types, elem_ty, lanes);
     if (R.is_err[ir_type.IrTypeId, str](rat)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rat)); }
     val arr_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rat);
+    # the type the lane ordinals and the alloca count carry: an ordinal is an integer,
+    # never a value of the element type (which for a float element would stamp an
+    # integer constant with a float type)
+    val rot: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rot)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](rot)); }
+    val ord_ty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rot);
 
     # phi index of the accumulator and the induction variable in the header (clone
     # preserves phi order, so the same index identifies them in the remainder header)
@@ -925,7 +960,7 @@ fun vectorize_reduction(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis
     if (R.is_err[id.BlockId, str](rvp)) { ret R.err[bool, str](R.unwrap_err[id.BlockId, str](rvp)); }
     val vpre: id.BlockId = R.unwrap_ok[id.BlockId, str](rvp);
     builder.set_block(?b, vpre);
-    val rv0: R.Result[value.Value, str] = build_accumulator_init(?b, red_op, acc_init, elem_ty, arr_ty, vec_ty, lanes);
+    val rv0: R.Result[value.Value, str] = build_accumulator_init(?b, red_op, acc_init, elem_ty, is_float, arr_ty, vec_ty, ord_ty, lanes);
     if (R.is_err[value.Value, str](rv0)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rv0)); }
     val vacc0: value.Value = R.unwrap_ok[value.Value, str](rv0);
     val rbe: R.Result[value.Value, str] = ver.emit_exclusive_bound(?b, ?lp.counted);
@@ -952,7 +987,7 @@ fun vectorize_reduction(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis
     if (R.is_err[id.BlockId, str](rcb)) { ret R.err[bool, str](R.unwrap_err[id.BlockId, str](rcb)); }
     val combine: id.BlockId = R.unwrap_ok[id.BlockId, str](rcb);
     builder.set_block(?b, combine);
-    val rhc: R.Result[value.Value, str] = emit_horizontal_combine(?b, red_op, value.instr(acc_phi, vec_ty), elem_ty, arr_ty, vec_ty, lanes);
+    val rhc: R.Result[value.Value, str] = emit_horizontal_combine(?b, red_op, value.instr(acc_phi, vec_ty), elem_ty, arr_ty, vec_ty, ord_ty, lanes);
     if (R.is_err[value.Value, str](rhc)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rhc)); }
     val s0: value.Value = R.unwrap_ok[value.Value, str](rhc);
     if (R.is_err[bool, str](builder.emit_br(?b, rem_header))) { ret R.err[bool, str]("reduce: combine branch"); }
@@ -971,7 +1006,7 @@ fun vectorize_reduction(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis
     val rset: R.Result[*bool, str] = A.allocate[bool](m.alloc, fn.instr_len::usize);
     if (R.is_err[*bool, str](rset)) { ret R.err[bool, str](R.unwrap_err[*bool, str](rset)); }
     val vset: *bool = R.unwrap_ok[*bool, str](rset);
-    build_vset(fn, la, lx, ri.accesses, ri.access_count, elem_ty, false, false, vset);
+    build_vset(fn, la, lx, ri.accesses, ri.access_count, elem_ty, is_float, false, vset);
     vset[acc_phi::u32] = true;
     vset[acc_upd::u32] = true;
     retype_to_vector(fn, lp, vset, vec_ty);
@@ -1016,14 +1051,24 @@ fun step_iv_by_lanes(fn: *ir.Function, iv_upd: id.InstructionId, lanes: u32, iv_
 # lane 0 holds the user's initial accumulator value and whose other lanes hold the op
 # identity, loaded back as a vector. Combined horizontally at loop exit this folds the
 # user init in exactly once (identity elements are absorbed by the op).
-fun build_accumulator_init(b: *builder.Builder, op: instruction.InstrKind, acc_init: value.Value, elem_ty: ir_type.IrTypeId, arr_ty: ir_type.IrTypeId, vec_ty: ir_type.IrTypeId, lanes: u32) R.Result[value.Value, str] {
-    val ras: R.Result[value.Value, str] = builder.emit_alloca(b, arr_ty, value.const_int(1, elem_ty));
+# ---
+# b:        builder positioned in the vector preheader
+# op:       the reduction opcode
+# acc_init: the user's initial accumulator value, seeded into lane 0
+# elem_ty:  the accumulator's scalar element type
+# is_float: whether that element is a float scalar (selects the identity)
+# arr_ty:   the interned `[lanes]elem` array type of the slot
+# vec_ty:   the interned 128-bit vector type read back
+# ord_ty:   the integer type the lane ordinals and the alloca count carry
+# lanes:    the lane count
+fun build_accumulator_init(b: *builder.Builder, op: instruction.InstrKind, acc_init: value.Value, elem_ty: ir_type.IrTypeId, is_float: bool, arr_ty: ir_type.IrTypeId, vec_ty: ir_type.IrTypeId, ord_ty: ir_type.IrTypeId, lanes: u32) R.Result[value.Value, str] {
+    val ras: R.Result[value.Value, str] = builder.emit_alloca(b, arr_ty, value.const_int(1, ord_ty));
     if (R.is_err[value.Value, str](ras)) { ret ras; }
     val slot: value.Value = R.unwrap_ok[value.Value, str](ras);
-    val ident: value.Value = reduction_identity(op, elem_ty);
+    val ident: value.Value = reduction_identity(op, elem_ty, is_float);
     var lane: u32 = 0;
     for (lane < lanes) {
-        val rg: R.Result[value.Value, str] = lane_gep(b, slot, arr_ty, lane, elem_ty);
+        val rg: R.Result[value.Value, str] = lane_gep(b, slot, arr_ty, lane, ord_ty);
         if (R.is_err[value.Value, str](rg)) { ret rg; }
         var v: value.Value = ident;
         if (lane == 0) { v = acc_init; }
@@ -1034,20 +1079,22 @@ fun build_accumulator_init(b: *builder.Builder, op: instruction.InstrKind, acc_i
 }
 
 # horizontal-reduce a vector value to a scalar with `op`: store it to a 16-byte slot,
-# then combine the lanes left to right (op is associative so any order is equal)
-fun emit_horizontal_combine(b: *builder.Builder, op: instruction.InstrKind, vacc: value.Value, elem_ty: ir_type.IrTypeId, arr_ty: ir_type.IrTypeId, vec_ty: ir_type.IrTypeId, lanes: u32) R.Result[value.Value, str] {
-    val ras: R.Result[value.Value, str] = builder.emit_alloca(b, arr_ty, value.const_int(1, elem_ty));
+# then combine the lanes left to right. For an integer op any order is equal; for a
+# float op left-to-right is one arbitrary grouping among many, which is precisely the
+# reassociation the `float_reassoc` lever licenses.
+fun emit_horizontal_combine(b: *builder.Builder, op: instruction.InstrKind, vacc: value.Value, elem_ty: ir_type.IrTypeId, arr_ty: ir_type.IrTypeId, vec_ty: ir_type.IrTypeId, ord_ty: ir_type.IrTypeId, lanes: u32) R.Result[value.Value, str] {
+    val ras: R.Result[value.Value, str] = builder.emit_alloca(b, arr_ty, value.const_int(1, ord_ty));
     if (R.is_err[value.Value, str](ras)) { ret ras; }
     val slot: value.Value = R.unwrap_ok[value.Value, str](ras);
     if (R.is_err[bool, str](builder.emit_store(b, vacc, slot))) { ret R.err[value.Value, str]("reduce: combine store"); }
-    val rg0: R.Result[value.Value, str] = lane_gep(b, slot, arr_ty, 0, elem_ty);
+    val rg0: R.Result[value.Value, str] = lane_gep(b, slot, arr_ty, 0, ord_ty);
     if (R.is_err[value.Value, str](rg0)) { ret rg0; }
     val rl0: R.Result[value.Value, str] = builder.emit_load(b, R.unwrap_ok[value.Value, str](rg0), elem_ty);
     if (R.is_err[value.Value, str](rl0)) { ret rl0; }
     var acc: value.Value = R.unwrap_ok[value.Value, str](rl0);
     var lane: u32 = 1;
     for (lane < lanes) {
-        val rg: R.Result[value.Value, str] = lane_gep(b, slot, arr_ty, lane, elem_ty);
+        val rg: R.Result[value.Value, str] = lane_gep(b, slot, arr_ty, lane, ord_ty);
         if (R.is_err[value.Value, str](rg)) { ret rg; }
         val rl: R.Result[value.Value, str] = builder.emit_load(b, R.unwrap_ok[value.Value, str](rg), elem_ty);
         if (R.is_err[value.Value, str](rl)) { ret rl; }
@@ -1068,8 +1115,7 @@ fun emit_horizontal_combine(b: *builder.Builder, op: instruction.InstrKind, vacc
 # lane:   the lane ordinal
 # idx_ty: the INTEGER type the two index constants carry -- an ordinal, not a value of
 #         the element type, which for a float element would stamp an integer constant
-#         with a float type. The reduction callers pass their element type, an integer
-#         by construction; the splat, whose element may be a float, passes i64.
+#         with a float type. Every caller passes i64.
 fun lane_gep(b: *builder.Builder, slot: value.Value, arr_ty: ir_type.IrTypeId, lane: u32, idx_ty: ir_type.IrTypeId) R.Result[value.Value, str] {
     var idx: [2]value.Value;
     idx[0] = value.const_int(0, idx_ty);
