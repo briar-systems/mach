@@ -150,6 +150,14 @@ rec BlockSpan {
 # `v` - the web's last def, colored AFTER `d` - records `d` so the scan biases `v`
 # onto `d`'s register, collapsing the latch copy. Recorded only when the coalesce
 # is interference-safe (see `build_hints`); honored by `pick_target_hint`.
+#
+# SINK hint (issue #2203): for a precolored copy `MOV preg <- v` - the ABI plumbing
+# `lower_call` emits to place an outgoing argument, and `lower_ret` to place a
+# return value - the source `v` records that register so the scan colors `v` there
+# directly and the placement move collapses. Recorded only when `v` dies exactly at
+# the move, so the register it takes is one it holds up to the very instruction that
+# overwrites it; honored by `pick_sink_hint`, which re-runs every interference test
+# an ordinary pick applies.
 # ---
 # src_vreg:     source vreg id for a `MOV v <- v2` copy, else MIR_VREG_NIL
 # src_preg:     source composite physical-register id for a `MOV v <- preg` copy, else -1
@@ -164,12 +172,16 @@ rec BlockSpan {
 # dst_copy_pos: flat-stream position of that latch copy, or -1 when no reverse hint.
 #               bounds the window `v` shares the destination's register over, so the
 #               destination is protected from eviction only until here
+# sink_preg:    sink hint - the composite physical-register id a full-width
+#               `MOV preg <- v` placement move writes at this vreg's last position,
+#               else -1
 rec CopyHint {
     src_vreg:     u32;
     src_preg:     i32;
     copy_pos:     i64;
     dst_vreg:     u32;
     dst_copy_pos: i64;
+    sink_preg:    i32;
 }
 
 # the per-function allocation scratch state
@@ -614,6 +626,7 @@ fun ctx_init(ctx: *AllocCtx, tgt: *target.Target, m: *mir.MirModule, f: *mir.Mir
         ctx.hints[hi].copy_pos     = -1;
         ctx.hints[hi].dst_vreg     = mir.MIR_VREG_NIL;
         ctx.hints[hi].dst_copy_pos = -1;
+        ctx.hints[hi].sink_preg    = -1;
         hi = hi + 1;
     }
 
@@ -1326,6 +1339,18 @@ fun reads_in_window(ctx: *AllocCtx, d: u32, from: i64, to: i64) bool {
 # `d` stays live-out past the copy, so its register is busy across `v`'s whole life
 # and `pick_target_hint` need only share it (no transfer, no active entry).
 #
+# SINK (#2203): for a copy `MOV preg <- v` into a precolored register - an outgoing
+# call argument or a return value - the source `v` records that register, so the
+# scan colors `v` there and the placement move collapses to a dropped self-move.
+# Recorded only when the coalesce is interference-safe:
+#   - `v` dies exactly at the move, so it never holds the register past the
+#     instruction that overwrites it (and `def_reg_reserved`, which admits a value
+#     ending exactly at a precolored def, therefore does not reject the register);
+#   - the move is full machine width, since the rewrite drops only a full-width
+#     self-move (a narrower one still owes its zero-extension).
+# First-write-wins per source vreg: a value placed into two argument registers can
+# only be colored to one of them.
+#
 # Runs after flatten / liveness so `flat_instr` and the ranges are available.
 fun build_hints(tgt: *target.Target, ctx: *AllocCtx) {
     if (tgt.arch.is_reg_move == nil) { ret; }
@@ -1347,10 +1372,31 @@ fun build_hints(tgt: *target.Target, ctx: *AllocCtx) {
                     ctx.hints[d.vreg].copy_pos = pos::i64;
                 }
             }
+            maybe_sink_hint(ctx, mi, pos, nv);
             maybe_reverse_hint(ctx, mi, pos, nv);
         }
         pos = pos + 1;
     }
+}
+
+# record the sink hint for a precolored placement move `MOV preg <- v` at `pos`,
+# when `v` may safely be colored onto that register (see `build_hints`). `mi` is a
+# confirmed reg copy; the destination must be a physical register and the source a
+# vreg dying exactly here. No-op otherwise, and first-write-wins per source vreg
+fun maybe_sink_hint(ctx: *AllocCtx, mi: *mir.MirInstr, pos: u32, nv: u32) {
+    val d: *mir.MirOperand = ?mi.operands[0];
+    val s: *mir.MirOperand = ?mi.operands[1];
+    if (d.kind != mir.MIR_OP_PREG || s.kind != mir.MIR_OP_VREG) { ret; }
+    if (s.vreg >= nv)                                           { ret; }
+    # a sub-word move still owes its zero-extension, so the rewrite keeps it even as
+    # a self-move; coloring for it would buy nothing and could cost a better register.
+    if (mi.width < ctx.spill_width)                             { ret; }
+    val sv: u32 = s.vreg;
+    if (ctx.hints[sv].sink_preg >= 0)                           { ret; }
+    # `v` must die at the move: the register is overwritten here, so a value live
+    # past it would be clobbered.
+    if (ctx.ranges[sv].end_pos != pos::i64)                     { ret; }
+    ctx.hints[sv].sink_preg = d.preg::i32;
 }
 
 # record the loop-carried reverse hint for a register copy `MOV d <- s` at `pos`,
@@ -1736,6 +1782,12 @@ fun linear_scan(tgt: *target.Target, ctx: *AllocCtx) R.Result[bool, str] {
         # back to the normal class pick.
         if (ctx.hints[v].src_vreg != mir.MIR_VREG_NIL || ctx.hints[v].src_preg >= 0) {
             preg = pick_hint(ctx, v, lr);
+        }
+        # no defining copy to collapse, or its source register was unavailable: aim
+        # instead at the precolored register this value is placed INTO - its outgoing
+        # argument or return register - so that move collapses (#2203).
+        if (preg < 0 && ctx.hints[v].sink_preg >= 0) {
+            preg = pick_sink_hint(ctx, v, lr);
         }
         # loop-carried reverse hint: share the destination's register instead of
         # taking a fresh one, collapsing the latch copy. the destination owns the
@@ -2200,6 +2252,49 @@ fun transfer_source_reg(ctx: *AllocCtx, src: u32, rid: u32) {
         panic("regalloc: copy-hint transfer source is not the live owner of its register\n");
     }
     remove_active(ctx, src);
+}
+
+# try to color vreg `v` onto the precolored register its placement move
+# `MOV preg <- v` writes, so that move collapses to a dropped self-move
+#
+# The sink half of issue #2203, and the counterpart of `pick_hint`: where the
+# forward hint chases the register a value is copied FROM, this chases the register
+# it is copied TO - the ABI argument and return registers, which are the largest
+# single family of surviving copies. Returns the composite register id (with the
+# bank's busy flag already claimed) or -1.
+#
+# Purely conservative: the register is taken only when it passes every test
+# `pick_gp` / `pick_fp` apply to this range - not reserved, not busy, not pinned for
+# an incoming param, not inside an outgoing-argument window, and not overwritten by
+# a precolored def the range lives past - plus the caller-saved test `pick_hint`
+# applies to a call-crossing range. So an honored sink hint occupies a register the
+# ordinary pick could equally have returned, and can neither create an uncolorable
+# assignment nor force a spill that was not already forced. Unlike `pick_hint` there
+# is no transfer path: the register is a fixed physical one, not a dying vreg's, so
+# a busy register simply declines the hint.
+fun pick_sink_hint(ctx: *AllocCtx, v: u32, lr: *LiveRange) i32 {
+    val rid: i32 = ctx.hints[v].sink_preg;
+    if (rid < 0) { ret -1; }
+
+    val rclass: i32 = isa.regid_class(rid);
+    val idx: u32 = isa.regid_index(rid)::u32;
+
+    if (lr.reg_class == REG_CLASS_GP) {
+        if (rclass != isa.REG_CLASS_ID_GP) { ret -1; }
+        if (idx >= ctx.gp_count)           { ret -1; }
+        if (ctx.reserved[idx])             { ret -1; }
+        if (lr.crosses_call && !ctx.callee_saved[idx]) { ret -1; }
+        if (!gp_available(ctx, idx))       { ret -1; }
+        ctx.gp_busy[idx] = true;
+        ret rid;
+    } or {
+        if (rclass != isa.REG_CLASS_ID_XMM) { ret -1; }
+        if (idx >= ctx.fp_count)            { ret -1; }
+        if (lr.crosses_call && (ctx.fp_callee_saved == nil || !ctx.fp_callee_saved[idx])) { ret -1; }
+        if (!fp_available(ctx, idx))        { ret -1; }
+        ctx.fp_busy[idx] = true;
+        ret rid;
+    }
 }
 
 # resolve the loop-carried reverse hint's target register for source vreg `v` - the
