@@ -22,6 +22,20 @@ pub val POINT_SIZE: i64 = $size_of(Point);
 pub val POINT_X:    i64 = $offset_of(Point, x);
 ```
 
+`T` is a **type**, written with the ordinary type grammar — not just a bare
+name. A generic instance, a pointer, an array, a `^` secret, and a qualified
+`module.Type` are all valid, including inside the generic that owns the
+parameter:
+
+```mach
+fun probe[T]() u64 {
+    ret $size_of(Box[T]) + $align_of(Pair[T, u64]) + $size_of(*T) + $size_of([4]T);
+}
+```
+
+`$offset_of`'s **second** argument is the exception: a bare field name, resolved
+against the record's layout, never a type or a value.
+
 ## Type intrinsic
 
 `$type_of(expr)` produces a comptime type value — the resolved type of its
@@ -56,8 +70,12 @@ and emitted.
 
 ## Field intrinsic and projection
 
-`$fields(T)` produces a comptime sequence of field descriptors for record or
-union type `T`. Each descriptor carries three readable properties:
+`$fields(T)` produces a comptime sequence of field descriptors for record type
+`T`, written with the full type grammar exactly as the layout intrinsics take it
+(`$fields(Box[T])`, `$fields(Pair[A, B])`, `$fields(mod.Rec)`). A union is
+refused: its variants overlap in storage, so a member walk over them would report
+distinct fields at distinct offsets that do not exist. Each descriptor carries
+three readable properties:
 
 | Property   | Type     | Value                                        |
 |------------|----------|----------------------------------------------|
