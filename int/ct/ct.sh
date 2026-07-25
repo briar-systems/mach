@@ -40,7 +40,7 @@
 #   bash int/ct/ct.sh                     # bootstrap a from-source compiler, measure
 #   bash int/ct/ct.sh /path/to/mach       # use a prebuilt CT-capable compiler
 #   bash int/ct/ct.sh /path/to/mach linux release
-#   LEAK_MIN=10 CT_WARN=10 bash int/ct/ct.sh   # override thresholds
+#   LEAK_RATIO_MIN=2.0 CT_WARN=10 bash int/ct/ct.sh   # override thresholds
 # the PATH `mach` seed predates the `^`/#[oblivious] surface, so the harness cannot be
 # built with it directly; omitting the compiler argument bootstraps one from source.
 #
@@ -48,9 +48,23 @@
 # and noisy, so this is run-on-demand, not wired into CI. it lives beside the int/
 # cases but is NOT discovered by int/run.sh (which scans only surface/ and regression/),
 # so it never becomes a flaky gate. the assertion is a leak-detection smoke: the leaky
-# control MUST exceed LEAK_MIN (a wide margin — observed |t| in the hundreds against a
-# threshold of 10), while the constant-time reference is informational (its |t| is
-# reported and warned on, never failed) so ambient noise cannot break the build.
+# control MUST separate the two classes' MEAN times by LEAK_RATIO_MIN, while the
+# constant-time reference is informational (reported and warned on, never failed) so
+# ambient noise cannot break the build.
+#
+# THE LEAK GATE IS A MEAN RATIO, NOT |t| (#2371). it used to be `|t| >= 10`, and that
+# threshold produced FALSE FAILURES on a busy machine: Welch divides by the sample
+# variance, and concurrent builds inflate the variance without moving the means, so
+# |t| collapses while the leak is still plainly there. measured on this harness at
+# load average 27, six consecutive runs of the SAME binary:
+#
+#     |t|          11.00  10.35   7.51   7.78   9.27  11.24    <- 3 of 6 below 10
+#     mean ratio    4.84   4.66   3.88   4.04   3.45   4.52    <- never below 3.4
+#
+# the |t| gate fails half the time under load; the ratio never came within 1.7x of
+# its threshold. a statistic that swings two orders of magnitude while the underlying
+# effect does not is not something to assert on. |t| is still REPORTED - it is the
+# right statistic for judging significance on a quiet box - it is just not the gate.
 set -euo pipefail
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -61,8 +75,18 @@ mach="${1:-}"
 target="${2:-linux}"
 profile="${3:-release}"
 
-# leaky |t| must clear this (hard). ct |t| above CT_WARN warns but never fails.
-LEAK_MIN="${LEAK_MIN:-10}"
+# the leaky control must separate the class means by at least this factor (hard).
+# it is slowest on the FIXED class by construction - class 0 feeds the all-bytes-match
+# reference, its longest path - so the expected direction is mean_fix > mean_rnd, and
+# a flip would mean the probe stopped doing what it claims. 2.0 sits between the two
+# populations measured at load average 25-27: the planted leak never fell below 3.45
+# (range 3.45-4.84) and the clean reference never rose above 1.58 (range 0.68-1.58).
+# that is 1.7x of headroom under the leak and 1.27x over the reference. the reference
+# is the tighter side, so if this threshold ever needs moving it is that wander -
+# which grows with machine load - that will force it, not the leak.
+LEAK_RATIO_MIN="${LEAK_RATIO_MIN:-2.0}"
+
+# ct |t| above CT_WARN warns but never fails.
 CT_WARN="${CT_WARN:-10}"
 
 # address mode asserts on mean_rnd/mean_fix. the planted leak must slow the random
@@ -135,8 +159,13 @@ extract() { echo "$out" | awk -v n="$1" '$0 ~ ("name=" n " ") { for (i=1;i<=NF;i
 # 1.29-1.47 for the planted leak and 0.95-1.00 for the null control, while |t| for
 # the same leak swung between 3.3 and 461. the ratio is what survives a busy box.
 ratio() { echo "$out" | awk -v n="$1" '$0 ~ ("name=" n " ") { for (i=1;i<=NF;i++) { if ($i ~ /^mean_fix=/) { sub("mean_fix=","",$i); f=$i } if ($i ~ /^mean_rnd=/) { sub("mean_rnd=","",$i); r=$i } } if (f > 0) printf "%.4f", r/f }'; }
+# mean_fix/mean_rnd for the latency probes, which are slowest on the fixed class.
+inv_ratio() { echo "$out" | awk -v n="$1" '$0 ~ ("name=" n " ") { for (i=1;i<=NF;i++) { if ($i ~ /^mean_fix=/) { sub("mean_fix=","",$i); f=$i } if ($i ~ /^mean_rnd=/) { sub("mean_rnd=","",$i); r=$i } } if (r > 0) printf "%.4f", f/r }'; }
 ct_t=$(extract ct)
 leak_t=$(extract leak)
+leak_r=$(inv_ratio leak)
+ct_r=$(inv_ratio ct)
+[ -n "$leak_r" ] || fail "no leak means parsed from harness output"
 [ -n "$ct_t" ]   || fail "no ct result parsed from harness output"
 [ -n "$leak_t" ] || fail "no leak result parsed from harness output"
 
@@ -150,16 +179,16 @@ addr_latency_t=$(extract addr_leak_in_latency_mode)
 
 echo
 rc=0
-awk -v ct="$ct_t" -v lk="$leak_t" -v lmin="$LEAK_MIN" -v cwarn="$CT_WARN" '
+awk -v ct="$ct_t" -v lk="$leak_t" -v lr="$leak_r" -v cr="$ct_r" -v lmin="$LEAK_RATIO_MIN" -v cwarn="$CT_WARN" '
 BEGIN {
-    printf "constant-time reference : |t| = %s (threshold %s, informational)\n", ct, cwarn
-    printf "planted leak (control)  : |t| = %s (must exceed %s)\n", lk, lmin
+    printf "constant-time reference : mean_fix/mean_rnd = %s   |t| = %s (threshold %s, informational)\n", cr, ct, cwarn
+    printf "planted leak (control)  : mean_fix/mean_rnd = %s (must exceed %s)   |t| = %s\n", lr, lmin, lk
     rc = 0
-    if (lk + 0 < lmin + 0) {
-        printf "FAIL: the planted leak was NOT detected — |t| %s < %s; the harness is not measuring\n", lk, lmin
+    if (lr + 0 < lmin + 0) {
+        printf "FAIL: the planted leak was NOT detected — mean ratio %s < %s; the harness is not measuring\n", lr, lmin
         rc = 1
     } else {
-        printf "OK: the planted leak was detected (|t| %s >= %s)\n", lk, lmin
+        printf "OK: the planted leak was detected (mean ratio %s >= %s)\n", lr, lmin
     }
     if (ct + 0 >= cwarn + 0) {
         printf "WARN: the constant-time reference showed |t| %s >= %s — investigate (runner noise, or a real regression)\n", ct, cwarn
