@@ -27,6 +27,8 @@ use O: std.types.option;
 use R: std.types.result;
 use ctime: std.chrono.time;
 
+use mach.lang.be.codegen;
+use mach.lang.be.obj;
 use mach.lang.build.outcome;
 use mach.lang.build.qctx;
 use mach.lang.build.request;
@@ -49,6 +51,7 @@ use mach.lang.readout;
 use mach.lang.session;
 use src: mach.lang.source;
 use mach.lang.target;
+use mach.lang.target.of;
 use mach.lang.type;
 
 use mach.lang.driver.project;
@@ -3666,6 +3669,141 @@ test "mach.lang.driver:generic_instance_call_inlines_at_release" {
     project.dnit_project(?p);
     session.dnit(?s);
     ret bad;
+}
+
+# `#[noinline]` blocks the release inliner end to end for `target_name`, proven
+# from the emitted object rather than the inliner's source (#2200): `helper` is
+# small and single-use, so by the ordinary heuristics it would inline into `main`
+# (see the undecorated twin `small_single_use_callee_inlines_by_default` in
+# me.pass.inline). Every direct call - local or not - lowers through a
+# name-targeted relocation (be.codegen.pack_relocs: "a cross-section call from a
+# re-homed site just works"), so a live call to `helper` leaves an RK_PLT32
+# relocation naming it in the object; an inlined call leaves none. `RK_PLT32` is
+# the abstract direct-call kind on all three ISAs this runs against (R_X86_64_PLT32
+# / R_AARCH64_CALL26 / R_RISCV_CALL_PLT).
+# ---
+# target_name: a `[target.*]` entry from ut_manifest's six-target manifest
+# ret:         0 when the call survives release inlining and the object proves it,
+#              1 on any build failure or if the call was inlined away
+fun ut_noinline_survives_object(target_name: str) i32 {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = "#[noinline]\nfun helper(x: i64) i64 { ret x + 1; }\nfun main() i64 { ret helper(41); }\n";
+    val root_r: R.Result[str, str] = ut_scaffold(?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val rr: R.Result[bool, str] = driver.setup_registry(?s.registry);
+    if (R.is_err[bool, str](rr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val pr: R.Result[project.Project, outcome.Fail] = driver.build_project(?s, root, target_name);
+    fs.remove_all(?alloc, root);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    # bad starts failed and clears only on the full success chain, so a build or
+    # lookup failure can never vacuously pass.
+    var bad: i32 = 1;
+    if (R.is_err[bool, outcome.Fail](passes.run_sema_pass(?p)))  { project.dnit_project(?p); session.dnit(?s); ret 1; }
+    if (R.is_err[bool, outcome.Fail](passes.run_lower_pass(?p))) { project.dnit_project(?p); session.dnit(?s); ret 1; }
+
+    val mid: session.ModuleId = ut_mid(?p, ?s, "uniontest.main");
+    if (mid != session.MODULE_NIL) {
+        val me: *project.ModuleEntry = ?p.modules[mid::u32];
+        if (me.ir_module != nil) {
+            val m: *ir.Module = me.ir_module;
+            val ri: R.Result[bool, str] = inline.run(m, ?p.target);
+            if (R.is_ok[bool, str](ri)) {
+                # the surviving call's callee, read straight off the IR - no guessed
+                # mangled name - so the object check below matches whatever linkage
+                # name codegen actually assigned.
+                val callee_name: intern.StrId = ut_single_local_callee_name(m);
+                if (callee_name != intern.STR_NIL) {
+                    val cg: R.Result[of.ObjectImage, str] =
+                        codegen.codegen_module(?s, ?p.target, m, nil, codegen.no_debug());
+                    if (R.is_ok[of.ObjectImage, str](cg)) {
+                        var image: of.ObjectImage = R.unwrap_ok[of.ObjectImage, str](cg);
+                        if (ut_has_direct_call_reloc(?image, callee_name)) { bad = 0; }
+                        obj.dnit(?image);
+                    }
+                }
+            }
+        }
+    }
+
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret bad;
+}
+
+# the linkage name of `m`'s one surviving local-definition call site, or STR_NIL
+# when there is not exactly one - `ut_noinline_survives_object`'s fixture has a
+# single call, so a count other than one means the fixture shape changed under it.
+fun ut_single_local_callee_name(m: *ir.Module) intern.StrId {
+    var found: intern.StrId = intern.STR_NIL;
+    var hits: u32 = 0;
+    var fi: u32 = 0;
+    for (fi < m.function_len) {
+        val fn: *ir.Function = ?m.functions[fi];
+        var bi: u32 = 0;
+        for (bi < fn.block_count) {
+            val blk: *ir.Block = ?fn.blocks[bi];
+            var ii: u32 = 0;
+            for (ii < blk.instr_count) {
+                val oi: O.Option[*instruction.Instruction] = ir.instruction_get(fn, blk.instructions[ii]);
+                if (O.is_some[*instruction.Instruction](oi)) {
+                    val inst: *instruction.Instruction = O.unwrap[*instruction.Instruction](oi);
+                    if (inst.kind == instruction.OP_CALL && inst.operand_count >= 1) {
+                        val callee: value.Value = inst.operands[0];
+                        if (callee.kind == value.VAL_FN && callee.data.fn_ix < m.function_len) {
+                            val cfn: *ir.Function = ?m.functions[callee.data.fn_ix];
+                            if ((cfn.flags & ir.FN_FLAG_EXTERN) == 0 && cfn.block_count > 0) {
+                                found = cfn.name;
+                                hits = hits + 1;
+                            }
+                        }
+                    }
+                }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+        fi = fi + 1;
+    }
+    if (hits != 1) { ret intern.STR_NIL; }
+    ret found;
+}
+
+# true when `image` carries a direct-call relocation naming `callee_name`. aarch64
+# (BL/CALL26) and riscv64 (auipc+jalr/CALL_PLT) always route a direct call through
+# RK_PLT32 (x64/encode.mach never emits it); x64's CALL rel32 shares the ordinary
+# RIP-relative symbol path with every other x64 symbol reference and so carries the
+# more general RK_PC32. `callee_name`'s only reference anywhere in the fixture is
+# the one call site under test, so either kind naming it is decisive here.
+fun ut_has_direct_call_reloc(image: *of.ObjectImage, callee_name: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < image.reloc_count) {
+        val rel: *of.Relocation = ?image.relocations[i];
+        if ((rel.kind == of.RK_PLT32 || rel.kind == of.RK_PC32) && rel.symbol == callee_name) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the cross-ISA bar (#2200): `#[noinline]` must hold on x86_64, aarch64, and
+# riscv64 - not just wherever the host happens to be - since should_inline itself
+# is target-independent (tgt is a reserved, currently-unused parameter) but the
+# object-level proof still has to be re-derived per ISA's own relocation packer.
+test "mach.lang.driver:noinline_decorator_survives_object_all_isas" {
+    if (ut_noinline_survives_object("linux") != 0)         { ret 1; }
+    if (ut_noinline_survives_object("linux-arm64") != 0)   { ret 1; }
+    if (ut_noinline_survives_object("linux-riscv64") != 0) { ret 1; }
+    ret 0;
 }
 
 # driver incremental: editing one dependency's body re-lowers it and its importer
