@@ -80,6 +80,7 @@
 # never branches on an architecture id; the linear-scan algorithm itself is fully
 # target-agnostic. An absent ABI / ISA vtable is a loud error.
 
+use std.allocator.page;
 use std.format;
 use std.system.panic.panic;
 use std.types.bool.bool;
@@ -4028,4 +4029,341 @@ test "mach.lang.be.codegen.regalloc.phi_neg_i32_signed_compare:1851" {
     if (probe > 100) { v = probe; }
     if (v < 0) { ret 0; }
     ret 1;
+}
+
+# test-only: a heap vreg table of `n` general-purpose value vregs
+fun t_vregs(alloc: *A.Allocator, f: *mir.MirFunction, n: u32) {
+    val r: R.Result[*mir.MirVReg, str] = A.allocate[mir.MirVReg](alloc, n::usize);
+    f.vregs      = R.unwrap_ok[*mir.MirVReg, str](r);
+    f.vreg_count = n;
+    f.vreg_cap   = n;
+    var i: u32 = 0;
+    for (i < n) {
+        f.vregs[i].id         = i;
+        f.vregs[i].class      = REG_CLASS_GP;
+        f.vregs[i].spill_slot = -1;
+        f.vregs[i].assigned   = mir.MIR_VREG_NIL;
+        f.vregs[i].vector     = false;
+        f.vregs[i].secret     = false;
+        i = i + 1;
+    }
+}
+
+# test-only: a heap block of `n` zeroed instructions
+fun t_block(alloc: *A.Allocator, b: *mir.MirBlock, n: u32) {
+    val r: R.Result[*mir.MirInstr, str] = A.zallocate[mir.MirInstr](alloc, n::usize);
+    b.instrs      = R.unwrap_ok[*mir.MirInstr, str](r);
+    b.instr_count = n;
+    b.instr_cap   = n;
+    b.id          = 0;
+}
+
+# test-only: write instruction `ix` of a block as a two-operand full-width MIR_MOV
+fun t_mov(alloc: *A.Allocator, b: *mir.MirBlock, ix: u32, dst: mir.MirOperand, src: mir.MirOperand) {
+    val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](alloc, 2::usize);
+    val arr: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
+    arr[0] = dst;
+    arr[1] = src;
+    b.instrs[ix].opcode        = mir.MIR_MOV;
+    b.instrs[ix].operands      = arr;
+    b.instrs[ix].operand_count = 2;
+    b.instrs[ix].width         = 8;
+    b.instrs[ix].src_width     = 8;
+    b.instrs[ix].asm_block     = nil;
+    b.instrs[ix].vec_lane      = mir.VEC_LANE_NONE;
+}
+
+# test-only: an allocation context carrying only what the pre-scan coalescer reads
+fun t_ctx(ctx: *AllocCtx, alloc: *A.Allocator, f: *mir.MirFunction, slots: *bool) {
+    ctx.alloc          = alloc;
+    ctx.interner       = nil;
+    ctx.f              = f;
+    ctx.spill_width    = 8;
+    ctx.vreg_slot_flag = slots;
+}
+
+# test-only: the host x86-64 target, for the ISA register-move classifier
+fun t_target(out: *target.Target) bool {
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret false; }
+    val ts: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[target.Target, str](ts)) { ret false; }
+    @out = R.unwrap_ok[target.Target, str](ts);
+    ret true;
+}
+
+# the copy-web coalescer deletes a copy whose two vregs are each assigned exactly
+# once and renames every later reference to the surviving web. this is the pin that
+# a coalescable copy is GONE from the instruction stream, not merely colored onto
+# one register: the block loses the instruction outright, before the flat stream is
+# ever built
+test "mach.lang.be.codegen.regalloc.coalesce_copies:single_assignment_web_is_merged" {
+    var t: target.Target;
+    if (!t_target(?t)) { ret 1; }
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    #   v0 <- preg 3        (a value arriving in a fixed register)
+    #   v1 <- v0            (the coalescable copy: both sides assigned once)
+    #   preg 4 <- v1        (a use of the copy's destination)
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 2);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 3);
+    t_mov(?alloc, ?b, 0, mir.op_vreg(0), mir.op_preg(3));
+    t_mov(?alloc, ?b, 1, mir.op_vreg(1), mir.op_vreg(0));
+    t_mov(?alloc, ?b, 2, mir.op_preg(4), mir.op_vreg(1));
+    f.blocks      = ?b;
+    f.block_count = 1;
+    f.block_cap   = 1;
+
+    var slots: [2]bool;
+    slots[0] = false; slots[1] = false;
+    var ctx: AllocCtx;
+    t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
+
+    if (R.is_err[bool, str](coalesce_copies(?t, ?ctx))) { ret 1; }
+
+    # the copy is deleted and the block is one instruction shorter.
+    if (b.instr_count != 2) { ret 1; }
+    # the surviving use names the source web, not the deleted destination.
+    if (b.instrs[1].operands[1].kind != mir.MIR_OP_VREG) { ret 1; }
+    if (b.instrs[1].operands[1].vreg != 0)               { ret 1; }
+    # the defining move is untouched.
+    if (b.instrs[0].operands[0].vreg != 0)               { ret 1; }
+
+    ret 0;
+}
+
+# the coalescer refuses every unsafe shape: a destination assigned more than once
+# (a phi target several edges write), a sub-word copy whose zero-extension deleting
+# it would drop, and a vreg owning lowering storage
+test "mach.lang.be.codegen.regalloc.coalesce_copies:refuses_unsafe_shapes" {
+    var t: target.Target;
+    if (!t_target(?t)) { ret 1; }
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    #   v0 <- preg 3
+    #   v1 <- v0            copy; v1 is written again below, so it must NOT merge
+    #   v1 <- preg 5
+    #   preg 4 <- v1
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 2);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 4);
+    t_mov(?alloc, ?b, 0, mir.op_vreg(0), mir.op_preg(3));
+    t_mov(?alloc, ?b, 1, mir.op_vreg(1), mir.op_vreg(0));
+    t_mov(?alloc, ?b, 2, mir.op_vreg(1), mir.op_preg(5));
+    t_mov(?alloc, ?b, 3, mir.op_preg(4), mir.op_vreg(1));
+    f.blocks      = ?b;
+    f.block_count = 1;
+    f.block_cap   = 1;
+
+    var slots: [2]bool;
+    slots[0] = false; slots[1] = false;
+    var ctx: AllocCtx;
+    t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
+
+    if (R.is_err[bool, str](coalesce_copies(?t, ?ctx))) { ret 1; }
+    if (b.instr_count != 4) { ret 1; }
+
+    # a sub-word copy is refused even with both sides assigned once: the move still
+    # zero-extends, so deleting it would drop the clear.
+    var f2: mir.MirFunction;
+    t_vregs(?alloc, ?f2, 2);
+    var b2: mir.MirBlock;
+    t_block(?alloc, ?b2, 3);
+    t_mov(?alloc, ?b2, 0, mir.op_vreg(0), mir.op_preg(3));
+    t_mov(?alloc, ?b2, 1, mir.op_vreg(1), mir.op_vreg(0));
+    b2.instrs[1].width     = 4;
+    b2.instrs[1].src_width = 4;
+    t_mov(?alloc, ?b2, 2, mir.op_preg(4), mir.op_vreg(1));
+    f2.blocks      = ?b2;
+    f2.block_count = 1;
+    f2.block_cap   = 1;
+
+    var slots2: [2]bool;
+    slots2[0] = false; slots2[1] = false;
+    var ctx2: AllocCtx;
+    t_ctx(?ctx2, ?alloc, ?f2, ?slots2[0]);
+    if (R.is_err[bool, str](coalesce_copies(?t, ?ctx2))) { ret 1; }
+    if (b2.instr_count != 3) { ret 1; }
+
+    # a storage-owning destination is refused: it lives in a frame slot, never a
+    # register, so there is no register to share.
+    var f3: mir.MirFunction;
+    t_vregs(?alloc, ?f3, 2);
+    var b3: mir.MirBlock;
+    t_block(?alloc, ?b3, 3);
+    t_mov(?alloc, ?b3, 0, mir.op_vreg(0), mir.op_preg(3));
+    t_mov(?alloc, ?b3, 1, mir.op_vreg(1), mir.op_vreg(0));
+    t_mov(?alloc, ?b3, 2, mir.op_preg(4), mir.op_vreg(1));
+    f3.blocks      = ?b3;
+    f3.block_count = 1;
+    f3.block_cap   = 1;
+
+    var slots3: [2]bool;
+    slots3[0] = false; slots3[1] = true;
+    var ctx3: AllocCtx;
+    t_ctx(?ctx3, ?alloc, ?f3, ?slots3[0]);
+    if (R.is_err[bool, str](coalesce_copies(?t, ?ctx3))) { ret 1; }
+    if (b3.instr_count != 3) { ret 1; }
+
+    ret 0;
+}
+
+# a value placed into a precolored register by a full-width `MOV preg <- v` records
+# that register as its sink hint, but only when it dies exactly at the move (a value
+# live past it would be clobbered) and only at full machine width (a narrower move
+# still owes its zero-extension and survives as a self-move anyway)
+test "mach.lang.be.codegen.regalloc.maybe_sink_hint:records_only_a_dying_full_width_placement" {
+    var ctx: AllocCtx;
+    var ranges: [2]LiveRange;
+    var hints:  [2]CopyHint;
+    ctx.ranges = ?ranges[0];
+    ctx.hints  = ?hints[0];
+    ctx.spill_width = 8;
+    var i: u32 = 0;
+    for (i < 2) {
+        hints[i].src_vreg     = mir.MIR_VREG_NIL;
+        hints[i].src_preg     = -1;
+        hints[i].copy_pos     = -1;
+        hints[i].dst_vreg     = mir.MIR_VREG_NIL;
+        hints[i].dst_copy_pos = -1;
+        hints[i].sink_preg    = -1;
+        i = i + 1;
+    }
+
+    var ops: [2]mir.MirOperand;
+    ops[0] = mir.op_preg(7);
+    ops[1] = mir.op_vreg(1);
+    var mv: mir.MirInstr;
+    mv.opcode        = mir.MIR_MOV;
+    mv.operands      = ?ops[0];
+    mv.operand_count = 2;
+    mv.width         = 8;
+    mv.src_width     = 8;
+
+    # v1 dies exactly at position 10: the hint is recorded.
+    ranges[1].end_pos = 10;
+    maybe_sink_hint(?ctx, ?mv, 10, 2);
+    if (hints[1].sink_preg != 7) { ret 1; }
+
+    # first-write-wins: a second placement of the same value does not overwrite it.
+    ops[0] = mir.op_preg(6);
+    maybe_sink_hint(?ctx, ?mv, 10, 2);
+    if (hints[1].sink_preg != 7) { ret 1; }
+
+    # a value still live past the move records nothing.
+    hints[1].sink_preg = -1;
+    ranges[1].end_pos  = 14;
+    ops[0] = mir.op_preg(7);
+    maybe_sink_hint(?ctx, ?mv, 10, 2);
+    if (hints[1].sink_preg != -1) { ret 1; }
+
+    # a sub-word placement records nothing.
+    ranges[1].end_pos = 10;
+    mv.width     = 4;
+    mv.src_width = 4;
+    maybe_sink_hint(?ctx, ?mv, 10, 2);
+    if (hints[1].sink_preg != -1) { ret 1; }
+
+    # a vreg destination is not a placement at all (that is the forward-hint shape).
+    mv.width     = 8;
+    mv.src_width = 8;
+    ops[0] = mir.op_vreg(0);
+    maybe_sink_hint(?ctx, ?mv, 10, 2);
+    if (hints[1].sink_preg != -1) { ret 1; }
+
+    ret 0;
+}
+
+# the two-address tie records the left operand in the forward hint slots exactly
+# when the transfer conditions hold - the operand dies at the op and the destination
+# is born there - and only for an opcode whose encoder seeds the destination
+test "mach.lang.be.codegen.regalloc.maybe_tie_hint:ties_a_dying_left_operand" {
+    var ctx: AllocCtx;
+    var ranges: [3]LiveRange;
+    var hints:  [3]CopyHint;
+    ctx.ranges = ?ranges[0];
+    ctx.hints  = ?hints[0];
+    var i: u32 = 0;
+    for (i < 3) {
+        hints[i].src_vreg     = mir.MIR_VREG_NIL;
+        hints[i].src_preg     = -1;
+        hints[i].copy_pos     = -1;
+        hints[i].dst_vreg     = mir.MIR_VREG_NIL;
+        hints[i].dst_copy_pos = -1;
+        hints[i].sink_preg    = -1;
+        i = i + 1;
+    }
+
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_vreg(0);
+    ops[1] = mir.op_vreg(1);
+    ops[2] = mir.op_vreg(2);
+    var op: mir.MirInstr;
+    op.opcode        = mir.MIR_SEL_MUL;
+    op.operands      = ?ops[0];
+    op.operand_count = 3;
+
+    # v1 dies at position 20 and v0 is born there: the tie is recorded.
+    ranges[1].end_pos = 20;
+    ranges[0].start   = 20;
+    maybe_tie_hint(?ctx, ?op, 20, 3);
+    if (hints[0].src_vreg != 1)  { ret 1; }
+    if (hints[0].copy_pos != 20) { ret 1; }
+
+    # a left operand still live past the op is not tied.
+    hints[0].src_vreg = mir.MIR_VREG_NIL;
+    hints[0].copy_pos = -1;
+    ranges[1].end_pos = 24;
+    maybe_tie_hint(?ctx, ?op, 20, 3);
+    if (hints[0].src_vreg != mir.MIR_VREG_NIL) { ret 1; }
+
+    # a destination live BEFORE the op (a loop-carried target the liveness pass
+    # extended back) is not tied: the register transfer would clobber it.
+    ranges[1].end_pos = 20;
+    ranges[0].start   = 12;
+    maybe_tie_hint(?ctx, ?op, 20, 3);
+    if (hints[0].src_vreg != mir.MIR_VREG_NIL) { ret 1; }
+
+    # a three-address opcode (one no encoder seeds) is never tied.
+    ranges[0].start = 20;
+    op.opcode = mir.MIR_SEL_CMP_EQ;
+    maybe_tie_hint(?ctx, ?op, 20, 3);
+    if (hints[0].src_vreg != mir.MIR_VREG_NIL) { ret 1; }
+
+    # and the classifier itself: the two-address family in, the rest out.
+    if (!is_two_address_op(mir.MIR_SEL_ADD))   { ret 1; }
+    if (!is_two_address_op(mir.MIR_SEL_SHR_S)) { ret 1; }
+    if (is_two_address_op(mir.MIR_SEL_DIV_S))  { ret 1; }
+    if (is_two_address_op(mir.MIR_MOV))        { ret 1; }
+
+    ret 0;
+}
+
+# test-only: a call whose argument and result both travel through ABI registers,
+# so the caller's values are placed into and captured out of precolored registers
+fun t_scale(v: i64, k: i64) i64 {
+    ret v * k;
+}
+
+# an end-to-end value check over a shape every coalescing path touches: values
+# forwarded through copies into call arguments and back out of return registers, a
+# two-address accumulate whose left operand dies at the op, and a loop-carried
+# induction variable. a coalesce that renamed one vreg onto another holding a
+# different value would corrupt the sum
+test "mach.lang.be.codegen.regalloc.coalesce_copies:forwarded_values_survive" {
+    var acc: i64 = 0;
+    var i:   i64 = 0;
+    for (i < 8) {
+        val a: i64 = t_scale(i, 3);
+        val b: i64 = t_scale(a, 2);
+        acc = acc + (b - a);
+        i = i + 1;
+    }
+    if (acc != 84) { ret 1; }
+    ret 0;
 }
