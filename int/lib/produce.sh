@@ -40,6 +40,12 @@
 #                 vector went to memory (#2236). the same blind spot as vector-emit:
 #                 lane access through a stack round-trip computes the right answer, so
 #                 only the emitted form distinguishes it. needs llvm-objdump.
+#   float-emit  — disassemble the case's own objects and report, per function, how
+#                 many emitted instructions name the back end's reserved FP scratch
+#                 registers (#2237). the same argument as vector-emit: an encoder
+#                 that stages every allocated float operand through scratch computes
+#                 the right answer while emitting twice the instructions, so only a
+#                 shape observable can see it. needs llvm-objdump.
 #
 # build-fails is a run-mode but not a producer: it asserts the compile is REJECTED
 # and takes the compiler's 'error:' diagnostic as the observable. it is handled in
@@ -341,42 +347,99 @@ resolve_objdump() {
 # moves with every unrelated backend change, while `simd` / `scalar` moves only when
 # the vectorizer's own decision does.
 produce_vector_emit() {
-    bin=$3
+    dis_case_objects vector-emit "$3" | vector_emit_scan
+}
+
+# dis_case_objects <producer> <binary>
+# disassemble the case's OWN module objects (not its dependencies') to stdout, the
+# shared front half of every emitted-shape producer.
+#
+# the objects rather than the linked binary: mach's linker emits no symbol table, so
+# per-function attribution exists only before the link. they sit beside the artifact
+# because such a case pins `out = "out/int/build"` in its own manifest; the project
+# id (the directory under obj/ holding the case's modules) is read from that same
+# manifest rather than assumed. <producer> only names the caller in diagnostics.
+dis_case_objects() {
+    who=$1
+    bin=$2
     dir=$(dirname "$(dirname "$(dirname "$bin")")")
     id=$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/mach.toml" | head -1)
     if [ -z "$id" ]; then
-        echo "int: vector-emit: no project id in ${dir}/mach.toml" >&2; return 2
+        echo "int: $who: no project id in ${dir}/mach.toml" >&2; return 2
     fi
     objdir="$dir/out/int/build/obj/$id"
     if [ ! -d "$objdir" ]; then
-        echo "int: vector-emit: no objects at $objdir (the case must pin out = \"out/int/build\")" >&2; return 2
+        echo "int: $who: no objects at $objdir (the case must pin out = \"out/int/build\")" >&2; return 2
     fi
     tool=$(resolve_objdump) || {
-        echo "int: vector-emit: llvm-objdump not found (install the 'llvm' package)" >&2; return 2
+        echo "int: $who: llvm-objdump not found (install the 'llvm' package)" >&2; return 2
     }
     find "$objdir" -name '*.o' | sort | while IFS= read -r o; do
         "$tool" -d --no-show-raw-insn "$o"
-    done | vector_emit_scan
+    done
 }
 
-# vector_emit_scan — read a disassembly on stdin, print `<function> simd|scalar`
-# sorted by function, preceded by the ISA the dispatch resolved.
+# produce_float_emit <runmode> <target> <binary>
+# the scalar-float EMISSION observable (#2237): for each function of the case's own
+# module, how many emitted instructions name the back end's reserved FP scratch
+# registers.
 #
-# packed-SIMD recognition is per ISA and deliberately narrow, so a scalar function
-# can never read as vectorized:
-#   x86_64  — the packed SSE opcodes, plus MOVUPS / MOVAPS / MOVDQU / MOVDQA, which
-#             the backend emits only for a 128-bit value. the scalar `*ss` / `*sd`
-#             forms and the bank-crossing MOVD / MOVQ are excluded, as is XORPS,
-#             which zeroes an XMM for scalar float negation, and PXOR, which clears
-#             one.
-#   aarch64 — any operand naming a NEON register: a `vN.<arrangement>` or a 128-bit
-#             `qN`. scalar float uses `sN` / `dN` and never matches.
-#   riscv64 — any RVV mnemonic (`v...`); no scalar riscv64 mnemonic starts with `v`.
-#             riscv64 has no 128-bit vector model, so every verdict there is scalar.
-# a case whose source writes SIMD types directly would defeat this (its packed ops
-# are not the vectorizer's); the vectorize cases use scalar element types only.
-vector_emit_scan() {
-    awk '
+# the same argument as vector-emit. an encoder that stages every already-allocated
+# float operand through a fixed scratch pair — which is what x86-64 did for every
+# operand of every scalar float op before #2237 — computes exactly the right answer
+# while emitting four instructions where two suffice, so a run-and-compare case is
+# vacuously green against it. the scratch count is what changes.
+#
+# the count IS the observable here, unlike vector-emit's verdict: zero is a
+# statement ("no allocated operand was staged"), and the number a regression
+# reintroduces is the diagnostic. it is stable against unrelated backend work
+# because only a genuine spill legitimately reaches scratch, which is why the case
+# pins the release profile and keeps its kernels under register pressure.
+produce_float_emit() {
+    dis_case_objects float-emit "$3" | float_emit_scan
+}
+
+# vector_emit_scan — `<function> simd|scalar` per function (see emit_scan)
+vector_emit_scan() { emit_scan simd; }
+
+# float_emit_scan — `<function> scratch=<count>` per function (see emit_scan)
+float_emit_scan() { emit_scan fpscratch; }
+
+# emit_scan <mode> — read a disassembly on stdin, print one line per function,
+# sorted by function, preceded by the ISA the dispatch resolved. one scanner for
+# every emitted-shape observable: the demangler, the symbol attribution and the
+# sort are the same question regardless of what is being counted, and <mode>
+# selects only the per-instruction predicate and the line format.
+#
+#   simd      — `<function> simd|scalar`, whether the function contains packed SIMD
+#               (#2207). packed recognition is per ISA and deliberately narrow, so
+#               a scalar function can never read as vectorized:
+#     x86_64  — the packed SSE opcodes, plus MOVUPS / MOVAPS / MOVDQU / MOVDQA,
+#               which the backend emits only for a 128-bit value. the scalar `*ss` /
+#               `*sd` forms and the bank-crossing MOVD / MOVQ are excluded, as is
+#               XORPS, which zeroes an XMM for scalar float negation, and PXOR,
+#               which clears one.
+#     aarch64 — any operand naming a NEON register: a `vN.<arrangement>` or a
+#               128-bit `qN`. scalar float uses `sN` / `dN` and never matches.
+#     riscv64 — any RVV mnemonic (`v...`); no scalar riscv64 mnemonic starts with
+#               `v`. riscv64 has no 128-bit vector model, so every verdict there is
+#               scalar.
+#     a case whose source writes SIMD types directly would defeat this (its packed
+#     ops are not the vectorizer's); the vectorize cases use scalar element types
+#     only.
+#
+#   fpscratch — `<function> scratch=<count>`, how many instructions name a register
+#               the back end reserves from FP allocation (#2237). each back end
+#               holds out one pair, so a value only appears there when the encoder
+#               STAGED it rather than operating on it where the allocator put it:
+#     x86_64  — xmm14 / xmm15
+#     aarch64 — v30 / v31, under any of their scalar or vector spellings
+#     riscv64 — f30 / f31, spelled ft10 / ft11 in the ABI names the disassembler
+#               prints
+#     a genuine spill legitimately reaches these, so a case asserting zero must keep
+#     its kernels under register pressure and pin the release profile.
+emit_scan() {
+    awk -v mode="$1" '
     function demangle(s,   i, len, c, out) {
         if (substr(s, 1, 2) != "_M") { return s }
         i = 3
@@ -408,6 +471,17 @@ vector_emit_scan() {
         if (isa == "riscv64") { return m ~ /^v[a-z]/ }
         return 0
     }
+    function fp_scratch(m, rest) {
+        if (isa == "x86_64")  { return rest ~ /xmm1[45]/ }
+        if (isa == "aarch64") { return rest ~ /(^|[^0-9a-zA-Z_])[bhsdqv]3[01]([^0-9]|$)/ }
+        if (isa == "riscv64") { return rest ~ /(^|[^0-9a-zA-Z_])ft1[01]([^0-9]|$)/ }
+        return 0
+    }
+    function counts(m, rest) {
+        if (mode == "simd")      { return packed(m, rest) }
+        if (mode == "fpscratch") { return fp_scratch(m, rest) }
+        return 0
+    }
     /file format/ {
         if      ($0 ~ /x86-64/)   { isa = "x86_64" }
         else if ($0 ~ /aarch64/)  { isa = "aarch64" }
@@ -430,10 +504,10 @@ vector_emit_scan() {
         split(line, f, /[[:space:]]+/)
         rest = line
         sub(/^[^[:space:]]+[[:space:]]*/, "", rest)
-        if (packed(f[1], rest)) { count[cur]++ }
+        if (counts(f[1], rest)) { count[cur]++ }
     }
     END {
-        if (bad != "") { print "int: vector-emit: unrecognized object format (" bad ")" > "/dev/stderr"; exit 2 }
+        if (bad != "") { print "int: emit-scan: unrecognized object format (" bad ")" > "/dev/stderr"; exit 2 }
         # insertion-sort the names so the observable does not depend on emission order
         for (i = 2; i <= n; i++) {
             k = names[i]
@@ -443,7 +517,8 @@ vector_emit_scan() {
         }
         print "arch=" isa
         for (i = 1; i <= n; i++) {
-            print names[i] " " (count[names[i]] > 0 ? "simd" : "scalar")
+            if (mode == "simd") { print names[i] " " (count[names[i]] > 0 ? "simd" : "scalar") }
+            else                { print names[i] " scratch=" count[names[i]] }
         }
     }
     '
@@ -689,6 +764,7 @@ produce() {
         vector-emit) produce_vector_emit "$@" ;;
         vector-lanes) produce_vector_lanes "$@" ;;
         frame-elision) produce_frame_elision "$@" ;;
+        float-emit)  produce_float_emit "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
 }
