@@ -31,9 +31,13 @@
 # `addi`/load/store `%pcrel_lo`) for an address-of (`emit_global_addr`), a folded-global
 # load (`emit_global_load`), and a folded-global store (`emit_global_store`), each
 # recording the RK_PCREL_HI20 + RK_PCREL_LO12_I / _S markers the linker / ELF relocation
-# seam packs. The final slice adds the inline-asm assembler (`encode_asm_block_riscv64`),
-# which substitutes `{name}` locals to `off(s0)` and encodes each RV64 statement through
-# the `rv_*` helpers.
+# seam packs. The final slice adds the inline-asm assembler, which since #2232 is the
+# riscv64 half of the SHARED parser in `isa.asm`: this module supplies the mnemonic
+# table, the operand lexer and the emitter (`rv_grammar`), and the shared spine owns
+# the statement cursor, the byte accounting, numeric local labels, `{name}` binding
+# and the effect model. There is no second reading of the text anywhere - the
+# register set `asm_clobbers` reports and the bytes `encode_asm_block_riscv64` emits
+# come from one parse of one grammar.
 #
 # WIDTH-HONESTY: the 32-bit instruction-word format machinery (pack_r/i/s/b/u/j),
 # the register field positions, the immediate bit-scatter, and the branch / jump
@@ -66,6 +70,7 @@ use mach.lang.be.codegen.encode;
 use mach.lang.be.codegen.mir;
 use mach.lang.intern;
 use mach.lang.target.isa;
+use iasm: mach.lang.target.isa.asm;
 use mach.lang.target.isa.riscv64;
 use mach.lang.target.isa.riscv64.inst;
 use printer: mach.lang.target.isa.riscv64.printer;
@@ -569,7 +574,7 @@ fun unnamed_form_message(st: *encode.EncodeState, fmt: str, opcode: u32) str {
     buf[i] = ' '::u8; i = i + 1;
     i = i + rv_dec_into(?buf[i], opcode::u64);
     buf[i] = 0;
-    ret rv_named_err(st,
+    ret iasm.named_message(st.alloc, st.interner,
         "--emit-asm: no riscv64 mnemonic for an emitted ", (?buf[0])::str, " instruction",
         "--emit-asm: no riscv64 mnemonic for an emitted instruction");
 }
@@ -3091,7 +3096,7 @@ fun check_accounted(st: *encode.EncodeState, fn_base: u32, opcode: u16) R.Result
         num[n] = 0;
         label = (?num[0])::str;
     }
-    ret R.err[bool, str](rv_named_err(st,
+    ret R.err[bool, str](iasm.named_message(st.alloc, st.interner,
         "--emit-asm: ", label, " emitted instructions the riscv64 assembly printer did not render",
         "--emit-asm: an opcode emitted instructions the riscv64 assembly printer did not render"));
 }
@@ -3249,1297 +3254,969 @@ fun asm_reg_index(tok: str) i32 {
     ret -1;
 }
 
-# copy the first whitespace / comma-delimited token of `s` into `out` (null-
-# terminated) and report the index in `s` just past it. used to lift the mnemonic and
-# the first operand of an inline-asm statement
-fun asm_token(s: str, start: usize, out: *u8, cap: usize, next: *usize) bool {
-    var i: usize = start;
-    for (s[i] != 0 && asm_is_space(s[i])) { i = i + 1; }
-    var j: usize = 0;
-    for (s[i] != 0 && !asm_is_space(s[i]) && s[i] != ','::char && j < cap - 1) {
-        out[j] = s[i]::u8;
-        i = i + 1;
-        j = j + 1;
-    }
-    out[j] = 0;
-    @next = i;
-    ret j > 0;
+# the RV64 inline-assembly grammar
+#
+# The riscv64 half of the shared parser (`isa.asm`): the instructions an
+# `asm riscv64 { ... }` body may name, what each one writes, and how its operands
+# and bytes are formed. Everything above an operand token - statement splitting,
+# byte accounting, numeric local labels, `{name}` binding, the effect fold and the
+# block driver - is the shared spine's and appears nowhere here.
+#
+# RV64 spells addresses `off(base)`, so the operand lexer differs from x86-64's
+# bracketed form; it accepts the psABI register names through `asm_reg_index`, and
+# it reads the `%pcrel_hi` / `%pcrel_lo` / `%got_pcrel_hi` relocation modifiers back
+# into `isa.SymModifier` - the same values the encoder's own notifications carry, so
+# what `--emit-asm` prints for a symbol pair is what this parser reads.
+#
+# A pseudo-instruction is not a separate concept here: it is a real instruction plus
+# an operand pattern. `mv rd, rs` is `addi rd, rs, 0`, `ret` is `jalr zero, 0(ra)`,
+# `neg rd, rs` is `sub rd, zero, rs`. The row names the real instruction, so the
+# effect model and `--emit-asm` see the machine, never the spelling.
+
+# the operand pattern a mnemonic's fields follow, carried in `Mnemonic.flags[7:0]`
+#
+# The instruction the row names (`Mnemonic.code`, an `inst.MachOp`) fixes the format
+# and the funct fields; the pattern says which written operand becomes which field
+# and what fills the rest.
+val RVP_ECALL:     u16 = 1;   # `ecall`
+val RVP_EBREAK:    u16 = 2;   # `ebreak`
+val RVP_NOP:       u16 = 3;   # `nop`  -> addi zero, zero, 0
+val RVP_RET:       u16 = 4;   # `ret`  -> jalr zero, 0(ra)
+val RVP_FENCE:     u16 = 5;   # `fence` -> the full-barrier predecessor / successor set
+val RVP_PAUSE:     u16 = 6;   # `pause` -> the `fence w, 0` hint encoding
+val RVP_RRR:       u16 = 7;   # rd, rs1, rs2
+val RVP_RRI:       u16 = 8;   # rd, rs1, imm12
+val RVP_SHIFT:     u16 = 9;   # rd, rs1, shamt
+val RVP_LOAD:      u16 = 10;  # rd, off(rs1)
+val RVP_STORE:     u16 = 11;  # rs2, off(rs1)
+val RVP_UIMM:      u16 = 12;  # rd, imm20
+val RVP_BRANCH:    u16 = 13;  # rs1, rs2, label
+val RVP_BRANCH_SW: u16 = 14;  # rs2, rs1, label - the reversed pseudo branches
+val RVP_BRANCH_Z1: u16 = 15;  # rs1, label with rs2 = zero
+val RVP_BRANCH_Z2: u16 = 16;  # rs2, label with rs1 = zero
+val RVP_J:         u16 = 17;  # label, linking through zero
+val RVP_JAL:       u16 = 18;  # label | rd, label
+val RVP_JR:        u16 = 19;  # rs, linking through zero
+val RVP_JALR:      u16 = 20;  # rs | rd, rs, imm
+val RVP_MV:        u16 = 21;  # rd, rs -> <op> rd, rs, 0
+val RVP_NOT:       u16 = 22;  # rd, rs -> xori rd, rs, -1
+val RVP_SEQZ:      u16 = 23;  # rd, rs -> sltiu rd, rs, 1
+val RVP_NEG:       u16 = 24;  # rd, rs -> <op> rd, zero, rs
+val RVP_SNEZ:      u16 = 25;  # rd, rs -> sltu rd, zero, rs
+val RVP_LI:        u16 = 26;  # rd, imm - a materialization sequence
+val RVP_LA:        u16 = 27;  # rd, sym - the pc-relative address-of pair
+val RVP_CALL:      u16 = 28;  # sym, linking through ra
+val RVP_TAIL:      u16 = 29;  # sym, linking through t1 and returning nowhere
+val RVP_AMO:       u16 = 30;  # rd, rs2, (rs1)
+val RVP_AMO_LR:    u16 = 31;  # rd, (rs1)
+
+# the RV64A ordering bits an atomic's mnemonic suffix names, in `Mnemonic.flags[15:8]`
+#
+# An atomic's acquire / release bits ARE its memory-ordering guarantee, so they ride
+# the row the decoder synthesizes rather than being recovered from the text twice.
+val RVF_AQ: u16 = 0x0100;  # the atomic acquires (`.aq`)
+val RVF_RL: u16 = 0x0200;  # the atomic releases (`.rl`)
+
+# the operand pattern half of a mnemonic row's flags
+fun rv_pattern(flags: u16) u16 { ret flags & 0x00FF; }
+
+# number of rows in the RV64 inline-asm mnemonic table
+val RV_MNEMONIC_COUNT: usize = 91;
+
+# the RV64 inline-asm instruction surface
+#
+# Exactly the instructions an `asm riscv64` body may name, beyond the RV64A atomic
+# family `rv_decode_amo` synthesizes. A mnemonic absent from both is refused with a
+# diagnostic naming it - there is no permissive path, so the effect model can never
+# be asked about an instruction nobody described.
+#
+# Rows are matched in order, and a mnemonic matches only when followed by a space (or
+# is the whole statement, for a no-operand form), so `add` never shadows `addi` and
+# `j` never shadows `jal`.
+val RV_MNEMONICS: [RV_MNEMONIC_COUNT]iasm.Mnemonic = [RV_MNEMONIC_COUNT]iasm.Mnemonic{
+    # no-operand forms. the environment calls, the barriers and the returns write no
+    # register: `ret` jumps through ra without linking, and a fence orders memory.
+    iasm.Mnemonic{ name: "ecall",  code: inst.ECALL::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: RVP_ECALL,  words: 1 },
+    iasm.Mnemonic{ name: "ebreak", code: inst.EBREAK::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: RVP_EBREAK, words: 1 },
+    iasm.Mnemonic{ name: "nop",    code: inst.ADDI::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: RVP_NOP,    words: 1 },
+    iasm.Mnemonic{ name: "ret",    code: inst.JALR::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: RVP_RET,    words: 1 },
+    iasm.Mnemonic{ name: "fence",  code: inst.FENCE::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: RVP_FENCE,  words: 1 },
+    iasm.Mnemonic{ name: "pause",  code: inst.PAUSE::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: RVP_PAUSE,  words: 1 },
+
+    # register-register integer ALU, and its RV64 word twins. each writes rd.
+    iasm.Mnemonic{ name: "addw",   code: inst.ADDW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "subw",   code: inst.SUBW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "sllw",   code: inst.SLLW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "srlw",   code: inst.SRLW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "sraw",   code: inst.SRAW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "mulw",   code: inst.MULW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "divuw",  code: inst.DIVUW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "divw",   code: inst.DIVW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "remuw",  code: inst.REMUW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "remw",   code: inst.REMW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "add",    code: inst.ADD::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "sub",    code: inst.SUB::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "sll",    code: inst.SLL::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "sltu",   code: inst.SLTU::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "slt",    code: inst.SLT::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "xor",    code: inst.XOR::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "srl",    code: inst.SRL::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "sra",    code: inst.SRA::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "or",     code: inst.OR::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "and",    code: inst.AND::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "mulhsu", code: inst.MULHSU::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "mulhu",  code: inst.MULHU::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "mulh",   code: inst.MULH::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "mul",    code: inst.MUL::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "divu",   code: inst.DIVU::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "div",    code: inst.DIV::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "remu",   code: inst.REMU::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+    iasm.Mnemonic{ name: "rem",    code: inst.REM::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRR, words: 1 },
+
+    # register-immediate integer ALU. the shifts take a shift amount rather than a
+    # signed twelve-bit immediate, so they carry their own pattern.
+    iasm.Mnemonic{ name: "addiw", code: inst.ADDIW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRI,   words: 1 },
+    iasm.Mnemonic{ name: "addi",  code: inst.ADDI::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRI,   words: 1 },
+    iasm.Mnemonic{ name: "andi",  code: inst.ANDI::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRI,   words: 1 },
+    iasm.Mnemonic{ name: "ori",   code: inst.ORI::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRI,   words: 1 },
+    iasm.Mnemonic{ name: "xori",  code: inst.XORI::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRI,   words: 1 },
+    iasm.Mnemonic{ name: "sltiu", code: inst.SLTIU::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRI,   words: 1 },
+    iasm.Mnemonic{ name: "slti",  code: inst.SLTI::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_RRI,   words: 1 },
+    iasm.Mnemonic{ name: "slliw", code: inst.SLLIW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_SHIFT, words: 1 },
+    iasm.Mnemonic{ name: "srliw", code: inst.SRLIW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_SHIFT, words: 1 },
+    iasm.Mnemonic{ name: "sraiw", code: inst.SRAIW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_SHIFT, words: 1 },
+    iasm.Mnemonic{ name: "slli",  code: inst.SLLI::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_SHIFT, words: 1 },
+    iasm.Mnemonic{ name: "srli",  code: inst.SRLI::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_SHIFT, words: 1 },
+    iasm.Mnemonic{ name: "srai",  code: inst.SRAI::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_SHIFT, words: 1 },
+
+    # integer loads write their destination; integer stores write memory and no
+    # register.
+    iasm.Mnemonic{ name: "lbu", code: inst.LBU::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_LOAD, words: 1 },
+    iasm.Mnemonic{ name: "lhu", code: inst.LHU::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_LOAD, words: 1 },
+    iasm.Mnemonic{ name: "lwu", code: inst.LWU::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_LOAD, words: 1 },
+    iasm.Mnemonic{ name: "lb",  code: inst.LB::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_LOAD, words: 1 },
+    iasm.Mnemonic{ name: "lh",  code: inst.LH::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_LOAD, words: 1 },
+    iasm.Mnemonic{ name: "lw",  code: inst.LW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_LOAD, words: 1 },
+    iasm.Mnemonic{ name: "ld",  code: inst.LD::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_LOAD, words: 1 },
+    iasm.Mnemonic{ name: "sb",  code: inst.SB::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_STORE, words: 1 },
+    iasm.Mnemonic{ name: "sh",  code: inst.SH::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_STORE, words: 1 },
+    iasm.Mnemonic{ name: "sw",  code: inst.SW::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_STORE, words: 1 },
+    iasm.Mnemonic{ name: "sd",  code: inst.SD::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_STORE, words: 1 },
+
+    # upper-immediate address formation writes its destination.
+    iasm.Mnemonic{ name: "lui",   code: inst.LUI::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_UIMM, words: 1 },
+    iasm.Mnemonic{ name: "auipc", code: inst.AUIPC::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_UIMM, words: 1 },
+
+    # conditional branches to a numeric local label, including the reversed and
+    # compare-against-zero pseudo spellings. a branch writes no register.
+    iasm.Mnemonic{ name: "beqz", code: inst.BEQ::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH_Z1, words: 1 },
+    iasm.Mnemonic{ name: "bnez", code: inst.BNE::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH_Z1, words: 1 },
+    iasm.Mnemonic{ name: "bltz", code: inst.BLT::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH_Z1, words: 1 },
+    iasm.Mnemonic{ name: "bgez", code: inst.BGE::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH_Z1, words: 1 },
+    iasm.Mnemonic{ name: "blez", code: inst.BGE::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH_Z2, words: 1 },
+    iasm.Mnemonic{ name: "bgtz", code: inst.BLT::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH_Z2, words: 1 },
+    iasm.Mnemonic{ name: "bltu", code: inst.BLTU::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH,    words: 1 },
+    iasm.Mnemonic{ name: "bgeu", code: inst.BGEU::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH,    words: 1 },
+    iasm.Mnemonic{ name: "bgtu", code: inst.BLTU::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH_SW, words: 1 },
+    iasm.Mnemonic{ name: "bleu", code: inst.BGEU::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH_SW, words: 1 },
+    iasm.Mnemonic{ name: "beq",  code: inst.BEQ::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH,    words: 1 },
+    iasm.Mnemonic{ name: "bne",  code: inst.BNE::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH,    words: 1 },
+    iasm.Mnemonic{ name: "blt",  code: inst.BLT::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH,    words: 1 },
+    iasm.Mnemonic{ name: "bge",  code: inst.BGE::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH,    words: 1 },
+    iasm.Mnemonic{ name: "bgt",  code: inst.BLT::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH_SW, words: 1 },
+    iasm.Mnemonic{ name: "ble",  code: inst.BGE::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: RVP_BRANCH_SW, words: 1 },
+
+    # jumps and calls. a linking jump destroys the caller-saved file, which is what
+    # licenses the allocator to hold nothing across it; a non-linking one (`j`, `jr`)
+    # transfers control and writes nothing.
+    iasm.Mnemonic{ name: "jalr", code: inst.JALR::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: CALLER_SAVED_GP, flags: RVP_JALR, words: 1 },
+    iasm.Mnemonic{ name: "jal",  code: inst.JAL::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0,  implicit: CALLER_SAVED_GP, flags: RVP_JAL,  words: 1 },
+    iasm.Mnemonic{ name: "jr",   code: inst.JALR::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0,          flags: RVP_JR,   words: 1 },
+    iasm.Mnemonic{ name: "j",    code: inst.JAL::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0,          flags: RVP_J,    words: 1 },
+    iasm.Mnemonic{ name: "call", code: inst.AUIPC::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: CALLER_SAVED_GP, flags: RVP_CALL, words: 2 },
+    iasm.Mnemonic{ name: "tail", code: inst.AUIPC::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: CALLER_SAVED_GP, flags: RVP_TAIL, words: 2 },
+
+    # the pseudo data-movement and unary forms, each naming the real instruction it
+    # spells.
+    iasm.Mnemonic{ name: "li",     code: inst.LUI::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_LI,   words: iasm.WORDS_VARIABLE },
+    iasm.Mnemonic{ name: "la",     code: inst.AUIPC::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_LA,   words: 2 },
+    iasm.Mnemonic{ name: "mv",     code: inst.ADDI::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_MV,   words: 1 },
+    iasm.Mnemonic{ name: "sext.w", code: inst.ADDIW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_MV,   words: 1 },
+    iasm.Mnemonic{ name: "negw",   code: inst.SUBW::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_NEG,  words: 1 },
+    iasm.Mnemonic{ name: "neg",    code: inst.SUB::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_NEG,  words: 1 },
+    iasm.Mnemonic{ name: "not",    code: inst.XORI::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_NOT,  words: 1 },
+    iasm.Mnemonic{ name: "seqz",   code: inst.SLTIU::u32, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_SEQZ, words: 1 },
+    iasm.Mnemonic{ name: "snez",   code: inst.SLTU::u32,  form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: RVP_SNEZ, words: 1 },
+};
+
+# decode an RV64A atomic mnemonic the table cannot enumerate
+#
+# `lr` / `sc` / `amo<op>` cross a width suffix (`.w` / `.d`) with an ordering suffix
+# (none / `.aq` / `.rl` / `.aqrl`), which is a hundred-odd spellings of twenty-two
+# instructions - a family, not a list. The decoder names the concrete instruction and
+# carries the ordering in the row's flags, so `amoswap.d.rl` can never render or
+# model as a plain exchange.
+# ---
+# body:  the asm body
+# lo:    body offset the statement starts at
+# hi:    body offset just past the statement
+# m:     receives the synthesized row
+# n_out: receives the mnemonic's byte length
+# ret:   true when the statement names an atomic
+fun rv_decode_amo(body: str, lo: usize, hi: usize, m: *iasm.Mnemonic, n_out: *usize) bool {
+    var end: usize = lo;
+    for (end < hi && !iasm.is_space(body[end])) { end = end + 1; }
+    var len: usize = end - lo;
+    if (len < 4) { ret false; }
+
+    var order: u16 = 0;
+    if (len >= 5 && str_region_equals(body, lo + len - 5, 5, ".aqrl")) { order = RVF_AQ | RVF_RL; len = len - 5; }
+    or (len >= 3 && str_region_equals(body, lo + len - 3, 3, ".aq"))   { order = RVF_AQ;           len = len - 3; }
+    or (len >= 3 && str_region_equals(body, lo + len - 3, 3, ".rl"))   { order = RVF_RL;           len = len - 3; }
+    if (len < 4) { ret false; }
+
+    var word: bool = false;
+    if (str_region_equals(body, lo + len - 2, 2, ".w"))      { word = true; }
+    or (str_region_equals(body, lo + len - 2, 2, ".d"))      { word = false; }
+    or { ret false; }
+    val blen: usize = len - 2;
+
+    var code: u32 = 0;
+    var pat: u16 = RVP_AMO;
+    if (str_region_equals(body, lo, blen, "lr"))           { code = inst.LR_W::u32; pat = RVP_AMO_LR; }
+    or (str_region_equals(body, lo, blen, "sc"))           { code = inst.SC_W::u32; }
+    or (str_region_equals(body, lo, blen, "amoswap"))      { code = inst.AMOSWAP_W::u32; }
+    or (str_region_equals(body, lo, blen, "amoadd"))       { code = inst.AMOADD_W::u32; }
+    or (str_region_equals(body, lo, blen, "amoxor"))       { code = inst.AMOXOR_W::u32; }
+    or (str_region_equals(body, lo, blen, "amoand"))       { code = inst.AMOAND_W::u32; }
+    or (str_region_equals(body, lo, blen, "amoor"))        { code = inst.AMOOR_W::u32; }
+    or (str_region_equals(body, lo, blen, "amominu"))      { code = inst.AMOMINU_W::u32; }
+    or (str_region_equals(body, lo, blen, "amomaxu"))      { code = inst.AMOMAXU_W::u32; }
+    or (str_region_equals(body, lo, blen, "amomin"))       { code = inst.AMOMIN_W::u32; }
+    or (str_region_equals(body, lo, blen, "amomax"))       { code = inst.AMOMAX_W::u32; }
+    or { ret false; }
+    # the table pairs each atomic as (word form, doubleword form) in that order.
+    if (!word) { code = code + 1; }
+
+    m.name     = nil;
+    m.code     = code;
+    m.form     = iasm.AF_OPS;
+    m.writes   = iasm.AW_OP0;
+    m.implicit = 0;
+    m.flags    = pat | order;
+    m.words    = 1;
+    @n_out     = end - lo;
+    ret true;
 }
 
-# true when `mnem` names an RV64A atomic (lr / sc / amo*). the width (.w/.d) and
-# ordering (.aq/.rl/.aqrl) suffixes ride along, so a prefix test classifies the whole
-# family. used by the clobber classifier - lr / sc / amo* all write their rd operand
-fun rv_mnem_is_amo(mnem: str) bool {
-    val len: usize = str_len(mnem);
-    if (len >= 3 && mnem[0] == 'l'::char && mnem[1] == 'r'::char && mnem[2] == '.'::char) { ret true; }
-    if (len >= 3 && mnem[0] == 's'::char && mnem[1] == 'c'::char && mnem[2] == '.'::char) { ret true; }
-    if (len >= 3 && mnem[0] == 'a'::char && mnem[1] == 'm'::char && mnem[2] == 'o'::char) { ret true; }
+# the instruction format an RV64 instruction takes
+val RVFMT_R: u8 = 0;  # register-register
+val RVFMT_I: u8 = 1;  # register-immediate
+val RVFMT_S: u8 = 2;  # store
+val RVFMT_B: u8 = 3;  # conditional branch
+val RVFMT_U: u8 = 4;  # upper immediate
+val RVFMT_J: u8 = 5;  # jump
+
+# the format and funct fields an RV64 instruction encodes to
+#
+# The inverse of the encoder's `classify_*` family: those name an instruction FROM
+# the fields a packer received, this recovers the fields FROM the instruction. The
+# two are proved mutually inverse by a test over every instruction this grammar can
+# name, so an assembled instruction and the one the printer renders cannot drift.
+# This is the direction #2118 makes the encoder's only one.
+# ---
+# op:     the instruction
+# fmt:    receives the instruction format (RVFMT_*)
+# opcode: receives the seven-bit major opcode
+# f3:     receives the funct3 field
+# f7:     receives the funct7 field
+# ret:    true when the instruction is one this grammar encodes
+fun rv_fields(op: inst.MachOp, fmt: *u8, opcode: *u32, f3: *u32, f7: *u32) bool {
+    @fmt = RVFMT_R; @opcode = 0; @f3 = 0; @f7 = F7_ZERO;
+
+    # register-register integer ALU (OP), and the RV64 word forms (OP_32).
+    if (op == inst.ADD)  { @opcode = OPC_OP; @f3 = F3_ADD;  ret true; }
+    if (op == inst.SLL)  { @opcode = OPC_OP; @f3 = F3_SLL;  ret true; }
+    if (op == inst.SLT)  { @opcode = OPC_OP; @f3 = F3_SLT;  ret true; }
+    if (op == inst.SLTU) { @opcode = OPC_OP; @f3 = F3_SLTU; ret true; }
+    if (op == inst.XOR)  { @opcode = OPC_OP; @f3 = F3_XOR;  ret true; }
+    if (op == inst.SRL)  { @opcode = OPC_OP; @f3 = F3_SRL;  ret true; }
+    if (op == inst.OR)   { @opcode = OPC_OP; @f3 = F3_OR;   ret true; }
+    if (op == inst.AND)  { @opcode = OPC_OP; @f3 = F3_AND;  ret true; }
+    if (op == inst.SUB)  { @opcode = OPC_OP; @f3 = F3_ADD; @f7 = F7_SUB; ret true; }
+    if (op == inst.SRA)  { @opcode = OPC_OP; @f3 = F3_SRL; @f7 = F7_SUB; ret true; }
+    if (op == inst.ADDW) { @opcode = OPC_OP_32; @f3 = F3_ADD; ret true; }
+    if (op == inst.SLLW) { @opcode = OPC_OP_32; @f3 = F3_SLL; ret true; }
+    if (op == inst.SRLW) { @opcode = OPC_OP_32; @f3 = F3_SRL; ret true; }
+    if (op == inst.SUBW) { @opcode = OPC_OP_32; @f3 = F3_ADD; @f7 = F7_SUB; ret true; }
+    if (op == inst.SRAW) { @opcode = OPC_OP_32; @f3 = F3_SRL; @f7 = F7_SUB; ret true; }
+
+    # the M extension, and its RV64 word forms.
+    if (op == inst.MUL)    { @opcode = OPC_OP; @f3 = F3_ADD;  @f7 = F7_MULDIV; ret true; }
+    if (op == inst.MULH)   { @opcode = OPC_OP; @f3 = F3_SLL;  @f7 = F7_MULDIV; ret true; }
+    if (op == inst.MULHSU) { @opcode = OPC_OP; @f3 = F3_SLT;  @f7 = F7_MULDIV; ret true; }
+    if (op == inst.MULHU)  { @opcode = OPC_OP; @f3 = F3_SLTU; @f7 = F7_MULDIV; ret true; }
+    if (op == inst.DIV)    { @opcode = OPC_OP; @f3 = F3_DIV;  @f7 = F7_MULDIV; ret true; }
+    if (op == inst.DIVU)   { @opcode = OPC_OP; @f3 = F3_DIVU; @f7 = F7_MULDIV; ret true; }
+    if (op == inst.REM)    { @opcode = OPC_OP; @f3 = F3_REM;  @f7 = F7_MULDIV; ret true; }
+    if (op == inst.REMU)   { @opcode = OPC_OP; @f3 = F3_REMU; @f7 = F7_MULDIV; ret true; }
+    if (op == inst.MULW)   { @opcode = OPC_OP_32; @f3 = F3_ADD;  @f7 = F7_MULDIV; ret true; }
+    if (op == inst.DIVW)   { @opcode = OPC_OP_32; @f3 = F3_DIV;  @f7 = F7_MULDIV; ret true; }
+    if (op == inst.DIVUW)  { @opcode = OPC_OP_32; @f3 = F3_DIVU; @f7 = F7_MULDIV; ret true; }
+    if (op == inst.REMW)   { @opcode = OPC_OP_32; @f3 = F3_REM;  @f7 = F7_MULDIV; ret true; }
+    if (op == inst.REMUW)  { @opcode = OPC_OP_32; @f3 = F3_REMU; @f7 = F7_MULDIV; ret true; }
+
+    # register-immediate integer ALU (OP_IMM / OP_IMM_32). the arithmetic right
+    # shifts share a funct3 with the logical ones and are selected by imm[10], which
+    # the emitter sets from the instruction.
+    if (op == inst.ADDI)  { @fmt = RVFMT_I; @opcode = OPC_OP_IMM; @f3 = F3_ADD;  ret true; }
+    if (op == inst.SLTI)  { @fmt = RVFMT_I; @opcode = OPC_OP_IMM; @f3 = F3_SLT;  ret true; }
+    if (op == inst.SLTIU) { @fmt = RVFMT_I; @opcode = OPC_OP_IMM; @f3 = F3_SLTU; ret true; }
+    if (op == inst.XORI)  { @fmt = RVFMT_I; @opcode = OPC_OP_IMM; @f3 = F3_XOR;  ret true; }
+    if (op == inst.ORI)   { @fmt = RVFMT_I; @opcode = OPC_OP_IMM; @f3 = F3_OR;   ret true; }
+    if (op == inst.ANDI)  { @fmt = RVFMT_I; @opcode = OPC_OP_IMM; @f3 = F3_AND;  ret true; }
+    if (op == inst.SLLI)  { @fmt = RVFMT_I; @opcode = OPC_OP_IMM; @f3 = F3_SLL;  ret true; }
+    if (op == inst.SRLI)  { @fmt = RVFMT_I; @opcode = OPC_OP_IMM; @f3 = F3_SRL;  ret true; }
+    if (op == inst.SRAI)  { @fmt = RVFMT_I; @opcode = OPC_OP_IMM; @f3 = F3_SRL;  ret true; }
+    if (op == inst.ADDIW) { @fmt = RVFMT_I; @opcode = OPC_OP_IMM_32; @f3 = F3_ADD; ret true; }
+    if (op == inst.SLLIW) { @fmt = RVFMT_I; @opcode = OPC_OP_IMM_32; @f3 = F3_SLL; ret true; }
+    if (op == inst.SRLIW) { @fmt = RVFMT_I; @opcode = OPC_OP_IMM_32; @f3 = F3_SRL; ret true; }
+    if (op == inst.SRAIW) { @fmt = RVFMT_I; @opcode = OPC_OP_IMM_32; @f3 = F3_SRL; ret true; }
+
+    # integer loads and stores, and the register-indirect jump, which is a load-form
+    # instruction taking an `off(base)` address.
+    if (op == inst.LB)   { @fmt = RVFMT_I; @opcode = OPC_LOAD; @f3 = 0x0; ret true; }
+    if (op == inst.LH)   { @fmt = RVFMT_I; @opcode = OPC_LOAD; @f3 = 0x1; ret true; }
+    if (op == inst.LW)   { @fmt = RVFMT_I; @opcode = OPC_LOAD; @f3 = 0x2; ret true; }
+    if (op == inst.LD)   { @fmt = RVFMT_I; @opcode = OPC_LOAD; @f3 = 0x3; ret true; }
+    if (op == inst.LBU)  { @fmt = RVFMT_I; @opcode = OPC_LOAD; @f3 = 0x4; ret true; }
+    if (op == inst.LHU)  { @fmt = RVFMT_I; @opcode = OPC_LOAD; @f3 = 0x5; ret true; }
+    if (op == inst.LWU)  { @fmt = RVFMT_I; @opcode = OPC_LOAD; @f3 = 0x6; ret true; }
+    if (op == inst.JALR) { @fmt = RVFMT_I; @opcode = OPC_JALR; @f3 = F3_ADD; ret true; }
+    if (op == inst.SB) { @fmt = RVFMT_S; @opcode = OPC_STORE; @f3 = 0x0; ret true; }
+    if (op == inst.SH) { @fmt = RVFMT_S; @opcode = OPC_STORE; @f3 = 0x1; ret true; }
+    if (op == inst.SW) { @fmt = RVFMT_S; @opcode = OPC_STORE; @f3 = 0x2; ret true; }
+    if (op == inst.SD) { @fmt = RVFMT_S; @opcode = OPC_STORE; @f3 = 0x3; ret true; }
+
+    # the environment and memory-ordering forms, whose immediate the emitter supplies.
+    if (op == inst.ECALL || op == inst.EBREAK) { @fmt = RVFMT_I; @opcode = OPC_SYSTEM;   @f3 = F3_ADD; ret true; }
+    if (op == inst.FENCE || op == inst.PAUSE)  { @fmt = RVFMT_I; @opcode = OPC_MISC_MEM; @f3 = F3_ADD; ret true; }
+
+    # conditional branches, upper-immediate address formation and the direct jump.
+    if (op == inst.BEQ)  { @fmt = RVFMT_B; @opcode = OPC_BRANCH; @f3 = F3_BEQ;  ret true; }
+    if (op == inst.BNE)  { @fmt = RVFMT_B; @opcode = OPC_BRANCH; @f3 = F3_BNE;  ret true; }
+    if (op == inst.BLT)  { @fmt = RVFMT_B; @opcode = OPC_BRANCH; @f3 = F3_BLT;  ret true; }
+    if (op == inst.BGE)  { @fmt = RVFMT_B; @opcode = OPC_BRANCH; @f3 = F3_BGE;  ret true; }
+    if (op == inst.BLTU) { @fmt = RVFMT_B; @opcode = OPC_BRANCH; @f3 = F3_BLTU; ret true; }
+    if (op == inst.BGEU) { @fmt = RVFMT_B; @opcode = OPC_BRANCH; @f3 = F3_BGEU; ret true; }
+    if (op == inst.LUI)   { @fmt = RVFMT_U; @opcode = OPC_LUI;   ret true; }
+    if (op == inst.AUIPC) { @fmt = RVFMT_U; @opcode = OPC_AUIPC; ret true; }
+    if (op == inst.JAL)   { @fmt = RVFMT_J; @opcode = OPC_JAL;   ret true; }
+
+    # the A extension. the ordering bits are the emitter's, from the row's flags.
+    if (op >= inst.LR_W && op <= inst.AMOMAXU_D) {
+        @opcode = OPC_AMO;
+        @f3     = F3_AMO_D;
+        if (rv_amo_is_word(op)) { @f3 = F3_AMO_W; }
+        @f7 = rv_amo_funct5(op) << 2;
+        ret true;
+    }
     ret false;
 }
 
-# OR the registers one trimmed RISC-V inline-asm statement writes into `@gp`. a
-# leading `label:` is stripped and the remainder re-dispatched. a call clobbers the
-# caller-saved file; the stores / branches / system / fence / pause / return forms write
-# nothing; the recognized destination-writing forms (including the RV64A atomics) clobber
-# their first register operand; an unrecognized statement conservatively clobbers
-# everything
-fun asm_stmt_clobbers(s: str, gp: *u32, fp: *u32) {
-    var mbuf: [32]u8;
-    var after: usize = 0;
-    if (!asm_token(s, 0, ?mbuf[0], 32, ?after)) { ret; }
-    var mnem: str = (?mbuf[0])::str;
-
-    # a `label:` prefix (named or numeric) carries no write; re-dispatch the rest.
-    val mlen: usize = str_len(mnem);
-    if (mlen > 0 && mnem[mlen - 1] == ':'::char) {
-        var rest: usize = after;
-        for (s[rest] != 0 && asm_is_space(s[rest])) { rest = rest + 1; }
-        if (s[rest] != 0) { asm_stmt_clobbers((s::usize + rest)::str, gp, fp); }
-        ret;
-    }
-
-    # write nothing: stores, conditional branches (including the pseudo-branch
-    # spellings), unconditional jumps, return, system, fence, nop.
-    if (str_equals(mnem, "sb") || str_equals(mnem, "sh") || str_equals(mnem, "sw") ||
-        str_equals(mnem, "sd") || str_equals(mnem, "nop") || str_equals(mnem, "ret") ||
-        str_equals(mnem, "ecall") || str_equals(mnem, "ebreak") || str_equals(mnem, "fence") ||
-        str_equals(mnem, "pause") ||
-        str_equals(mnem, "j") || str_equals(mnem, "jr") ||
-        str_equals(mnem, "beq") || str_equals(mnem, "bne") || str_equals(mnem, "blt") ||
-        str_equals(mnem, "bge") || str_equals(mnem, "bltu") || str_equals(mnem, "bgeu") ||
-        str_equals(mnem, "bgt") || str_equals(mnem, "ble") || str_equals(mnem, "bgtu") ||
-        str_equals(mnem, "bleu") || str_equals(mnem, "beqz") || str_equals(mnem, "bnez") ||
-        str_equals(mnem, "bltz") || str_equals(mnem, "bgez") || str_equals(mnem, "blez") ||
-        str_equals(mnem, "bgtz")) {
-        ret;
-    }
-
-    # a call clobbers the caller-saved file (ra, t0-t6, a0-a7); none callee-saved.
-    if (str_equals(mnem, "call") || str_equals(mnem, "tail") ||
-        str_equals(mnem, "jal") || str_equals(mnem, "jalr")) {
-        @gp = @gp | CALLER_SAVED_GP;
-        ret;
-    }
-
-    # the destination-writing forms clobber their first register operand (rd). the
-    # RV64A atomics (lr / sc / amo*) join this set: each writes rd, the leftmost operand.
-    if (rv_mnem_is_amo(mnem) ||
-        str_equals(mnem, "li") || str_equals(mnem, "la") || str_equals(mnem, "lui") ||
-        str_equals(mnem, "auipc") || str_equals(mnem, "mv") || str_equals(mnem, "neg") ||
-        str_equals(mnem, "not") || str_equals(mnem, "seqz") || str_equals(mnem, "snez") ||
-        str_equals(mnem, "add") || str_equals(mnem, "addi") || str_equals(mnem, "sub") ||
-        str_equals(mnem, "and") || str_equals(mnem, "andi") || str_equals(mnem, "or") ||
-        str_equals(mnem, "ori") || str_equals(mnem, "xor") || str_equals(mnem, "xori") ||
-        str_equals(mnem, "sll") || str_equals(mnem, "slli") || str_equals(mnem, "srl") ||
-        str_equals(mnem, "srli") || str_equals(mnem, "sra") || str_equals(mnem, "srai") ||
-        str_equals(mnem, "slt") || str_equals(mnem, "slti") || str_equals(mnem, "sltu") ||
-        str_equals(mnem, "sltiu") || str_equals(mnem, "addw") || str_equals(mnem, "addiw") ||
-        str_equals(mnem, "subw") || str_equals(mnem, "sllw") || str_equals(mnem, "slliw") ||
-        str_equals(mnem, "srlw") || str_equals(mnem, "srliw") || str_equals(mnem, "sraw") ||
-        str_equals(mnem, "sraiw") || str_equals(mnem, "negw") || str_equals(mnem, "sext.w") ||
-        str_equals(mnem, "mul") || str_equals(mnem, "mulw") || str_equals(mnem, "mulh") ||
-        str_equals(mnem, "mulhu") || str_equals(mnem, "mulhsu") || str_equals(mnem, "div") ||
-        str_equals(mnem, "divu") || str_equals(mnem, "divw") || str_equals(mnem, "rem") ||
-        str_equals(mnem, "remu") || str_equals(mnem, "remw") || str_equals(mnem, "lb") ||
-        str_equals(mnem, "lh") || str_equals(mnem, "lw") || str_equals(mnem, "ld") ||
-        str_equals(mnem, "lbu") || str_equals(mnem, "lhu") || str_equals(mnem, "lwu")) {
-        var rbuf: [32]u8;
-        var rnext: usize = 0;
-        if (asm_token(s, after, ?rbuf[0], 32, ?rnext)) {
-            val ri: i32 = asm_reg_index((?rbuf[0])::str);
-            if (ri >= 0 && ri < 32) { @gp = @gp | (1::u32 << ri::u32); }
-        }
-        ret;
-    }
-
-    # unrecognized: opaque, clobber everything (a sound over-approximation).
-    @gp = @gp | 0xFFFFFFFF;
-    @fp = @fp | 0xFFFFFFFF;
+# true when an A-extension instruction is the 32-bit (`.w`) form
+#
+# The list pairs each atomic as (word, doubleword), so the word form is the even
+# member of its pair counting from `LR_W`.
+fun rv_amo_is_word(op: inst.MachOp) bool {
+    ret ((op - inst.LR_W) & 1) == 0;
 }
 
-# the AsmClobbersFn the RV64 ISA vtable exposes - infer the GP registers an
-# inline-asm body writes, so the allocator leaves no live value in one and the
-# prologue preserves any callee-saved register the body clobbers. without this hook a
-# nil slot forces a conservative all-register clobber, framing every asm function
-# (e.g. `_start`, whose frame allocation then mis-reads argc off the entry stack). the
-# body is split into statements on newline / `;`, each trimmed and classified. the
-# grammar has no FP write yet, so `fp_out` stays empty unless an unrecognized
-# statement forces the conservative all-clobber
+# the five-bit operation field an A-extension instruction encodes
+fun rv_amo_funct5(op: inst.MachOp) u32 {
+    if (op == inst.LR_W || op == inst.LR_D)             { ret A5_LR; }
+    if (op == inst.SC_W || op == inst.SC_D)             { ret A5_SC; }
+    if (op == inst.AMOSWAP_W || op == inst.AMOSWAP_D)   { ret A5_AMOSWAP; }
+    if (op == inst.AMOADD_W || op == inst.AMOADD_D)     { ret A5_AMOADD; }
+    if (op == inst.AMOXOR_W || op == inst.AMOXOR_D)     { ret A5_AMOXOR; }
+    if (op == inst.AMOAND_W || op == inst.AMOAND_D)     { ret A5_AMOAND; }
+    if (op == inst.AMOOR_W || op == inst.AMOOR_D)       { ret A5_AMOOR; }
+    if (op == inst.AMOMIN_W || op == inst.AMOMIN_D)     { ret A5_AMOMIN; }
+    if (op == inst.AMOMAX_W || op == inst.AMOMAX_D)     { ret A5_AMOMAX; }
+    if (op == inst.AMOMINU_W || op == inst.AMOMINU_D)   { ret A5_AMOMINU; }
+    ret A5_AMOMAXU;
+}
+
+# parse one RV64 operand token into `op`
+#
+# The RV64 operand syntax: a psABI or `xN` register name, an `off(base)` address, a
+# bare or `%mod(sym)` symbol reference, a `{name}` local binding, or an integer
+# literal.
+# ---
+# c:  the cursor
+# lo: body offset the token starts at
+# hi: body offset just past it
+# op: receives the parsed operand
+# ret: ok(true), or the refusal naming the malformed operand
+fun rv_operand(c: *iasm.Cursor, lo: usize, hi: usize, op: *iasm.Operand) R.Result[bool, str] {
+    @op = iasm.op_none();
+    if (hi <= lo) { ret R.err[bool, str]("encode: malformed inline-asm operand"); }
+
+    # a `{name}` local: with a laid-out frame it becomes the `off(s0)` stack slot it
+    # denotes; without one the displacement is genuinely unknown, and the operand
+    # stays a binding - it names a stack slot either way, so it can never be a
+    # register and the effect model reads it exactly as it reads memory.
+    if (c.body[lo] == '{'::char) {
+        var off: i64 = 0;
+        val br: R.Result[bool, str] = iasm.bind_offset(c, lo, hi, ?off);
+        if (R.is_err[bool, str](br)) { ret br; }
+        if (R.unwrap_ok[bool, str](br)) {
+            @op = iasm.op_mem(RFP::i32, off, -1, 0, 8);
+            ret R.ok[bool, str](true);
+        }
+        op.kind     = iasm.AOP_BIND;
+        op.size     = 8;
+        op.name_off = lo + 1;
+        op.name_len = hi - lo - 2;
+        ret R.ok[bool, str](true);
+    }
+
+    var buf: [64]u8;
+    if (!iasm.copy_region(c.body, lo, hi, ?buf[0], 64)) { ret R.err[bool, str]("encode: malformed inline-asm operand"); }
+    val tok: str = (?buf[0])::str;
+
+    val ri: i32 = asm_reg_index(tok);
+    if (ri >= 0) { @op = iasm.op_reg(ri, 8); ret R.ok[bool, str](true); }
+
+    # a relocation modifier `%mod(sym)`, the spelling the printer emits for the two
+    # halves of a pc-relative symbol pair.
+    if (c.body[lo] == '%'::char) { ret rv_modifier(c, lo, hi, op); }
+
+    # an `off(base)` address; `(base)` is the zero-displacement form atomics require.
+    if (c.body[hi - 1] == ')'::char) { ret rv_mem(c, lo, hi, op); }
+
+    val iv: O.Option[i64] = iasm.region_i64(c.body, lo, hi);
+    if (O.is_some[i64](iv)) { @op = iasm.op_imm(O.unwrap[i64](iv), 8); ret R.ok[bool, str](true); }
+
+    if (iasm.is_sym_region(c.body, lo, hi)) {
+        @op = iasm.op_sym(lo, hi - lo, isa.SYM_MOD_NONE, 8);
+        ret R.ok[bool, str](true);
+    }
+    ret R.err[bool, str]("encode: malformed inline-asm operand");
+}
+
+# parse a `%pcrel_hi(sym)` / `%pcrel_lo(sym)` / `%got_pcrel_hi(sym)` operand
+#
+# The modifier belongs to the symbol REFERENCE, so it rides `Operand.mod` with the
+# shared `isa.SYM_MOD_*` values the encoder's own notifications carry. This backend
+# forms a pc-relative pair against the symbol itself rather than against the paired
+# `auipc`'s label, and the low half here names the symbol for the same reason.
+fun rv_modifier(c: *iasm.Cursor, lo: usize, hi: usize, op: *iasm.Operand) R.Result[bool, str] {
+    if (c.body[hi - 1] != ')'::char) { ret R.err[bool, str]("encode: malformed inline-asm relocation modifier"); }
+    var open: usize = lo;
+    var found: bool = false;
+    for (open < hi && !found) {
+        if (c.body[open] == '('::char) { found = true; } or { open = open + 1; }
+    }
+    if (!found) { ret R.err[bool, str]("encode: malformed inline-asm relocation modifier"); }
+
+    var mod: isa.SymModifier = isa.SYM_MOD_NONE;
+    val nlen: usize = open - lo - 1;
+    if (str_region_equals(c.body, lo + 1, nlen, "pcrel_hi") && nlen == 8)      { mod = isa.SYM_MOD_PCREL_HI; }
+    or (str_region_equals(c.body, lo + 1, nlen, "pcrel_lo") && nlen == 8)      { mod = isa.SYM_MOD_PCREL_LO; }
+    or (str_region_equals(c.body, lo + 1, nlen, "got_pcrel_hi") && nlen == 12) { mod = isa.SYM_MOD_GOT_HI; }
+    or {
+        ret R.err[bool, str](iasm.span_message(c,
+            "encode: unsupported riscv64 inline-asm relocation modifier '", lo, hi, "'",
+            "encode: unsupported riscv64 inline-asm relocation modifier"));
+    }
+    if (!iasm.is_sym_region(c.body, open + 1, hi - 1)) {
+        ret R.err[bool, str]("encode: malformed inline-asm relocation modifier");
+    }
+    @op = iasm.op_sym(open + 1, hi - 1 - (open + 1), mod, 8);
+    ret R.ok[bool, str](true);
+}
+
+# parse an `off(base)` address, the only memory shape RV64 load / store forms take
+fun rv_mem(c: *iasm.Cursor, lo: usize, hi: usize, op: *iasm.Operand) R.Result[bool, str] {
+    var open: usize = lo;
+    var found: bool = false;
+    for (open < hi && !found) {
+        if (c.body[open] == '('::char) { found = true; } or { open = open + 1; }
+    }
+    if (!found) { ret R.err[bool, str]("encode: malformed inline-asm memory operand"); }
+
+    var bbuf: [24]u8;
+    if (!iasm.copy_region(c.body, open + 1, hi - 1, ?bbuf[0], 24)) { ret R.err[bool, str]("encode: malformed inline-asm memory operand"); }
+    val base: i32 = asm_reg_index((?bbuf[0])::str);
+    if (base < 0) { ret R.err[bool, str]("encode: malformed inline-asm memory operand"); }
+
+    var disp: i64 = 0;
+    var flags: u8 = 0;
+    var a: usize = lo;
+    var b: usize = open;
+    for (a < b && iasm.is_space(c.body[a])) { a = a + 1; }
+    for (b > a && iasm.is_space(c.body[b - 1])) { b = b - 1; }
+    if (b > a) {
+        val dv: O.Option[i64] = iasm.region_i64(c.body, a, b);
+        if (!O.is_some[i64](dv)) { ret R.err[bool, str]("encode: malformed inline-asm memory operand"); }
+        disp  = O.unwrap[i64](dv);
+        flags = iasm.AOF_HAS_DISP;
+    }
+    @op = iasm.op_mem(base, disp, -1, 0, 8);
+    op.flags = flags;
+    ret R.ok[bool, str](true);
+}
+
+# a memory-position operand: an `off(base)` address, or an unresolved `{name}` whose
+# displacement the emitter's parse will supply
+fun rv_is_addr(op: *iasm.Operand) bool {
+    ret op.kind == iasm.AOP_MEM || op.kind == iasm.AOP_BIND;
+}
+
+# the operand index a pattern's branch target occupies, or a value no index reaches
+#
+# The last operand of every branching form is its label; `jal` takes one either
+# alone or after a link register, so the position follows the operand count.
+fun rv_label_operand(pat: u16, n: u32) u32 {
+    if (pat == RVP_BRANCH || pat == RVP_BRANCH_SW)       { ret 2; }
+    if (pat == RVP_BRANCH_Z1 || pat == RVP_BRANCH_Z2)    { ret 1; }
+    if (pat == RVP_J)                                    { ret 0; }
+    if (pat == RVP_JAL)                                  { ret n - 1; }
+    ret 0xFFFFFFFF;
+}
+
+# turn one resolved RV64 statement into a parsed item
+#
+# Reads each operand token in the shape its mnemonic's pattern names, refusing any
+# other shape. Operand-count and operand-kind checks are the whole validation: an
+# instruction that parses is one this grammar can encode.
+fun rv_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, str] {
+    val pat: u16 = rv_pattern(s.m.flags);
+    val n: u32 = s.nargs;
+
+    # a branch target is a numeric local label, not a machine operand, so it is read
+    # by `rv_local_target` and skipped here - `1b` is neither a register nor a symbol
+    # nor an integer, and the operand lexer would rightly refuse it.
+    val label_at: u32 = rv_label_operand(pat, n);
+    var i: u32 = 0;
+    for (i < n) {
+        if (i != label_at) {
+            val r: R.Result[bool, str] = rv_operand(c, s.arg_lo[i::usize], s.arg_hi[i::usize], ?item.ops[i::usize]);
+            if (R.is_err[bool, str](r)) { ret r; }
+        }
+        i = i + 1;
+    }
+
+    if (pat == RVP_RRR || pat == RVP_RRI || pat == RVP_SHIFT) {
+        if (n != 3) { ret R.err[bool, str]("encode: inline-asm instruction expects three operands"); }
+        if (item.ops[0].kind != iasm.AOP_REG || item.ops[1].kind != iasm.AOP_REG) {
+            ret R.err[bool, str]("encode: inline-asm instruction operand must be a register");
+        }
+        if (pat == RVP_RRR) {
+            if (item.ops[2].kind != iasm.AOP_REG) { ret R.err[bool, str]("encode: inline-asm instruction source must be a register"); }
+            ret R.ok[bool, str](true);
+        }
+        # a register-immediate ALU form also spells the low half of a pc-relative
+        # symbol pair, whose twelve bits the linker fills.
+        if (pat == RVP_RRI && item.ops[2].kind == iasm.AOP_SYM) { ret R.ok[bool, str](true); }
+        if (item.ops[2].kind != iasm.AOP_IMM) { ret R.err[bool, str]("encode: inline-asm operand must be an immediate"); }
+        ret R.ok[bool, str](true);
+    }
+    if (pat == RVP_LOAD || pat == RVP_STORE) {
+        if (n != 2) { ret R.err[bool, str]("encode: inline-asm load/store expects rd, off(base)"); }
+        if (item.ops[0].kind != iasm.AOP_REG) { ret R.err[bool, str]("encode: inline-asm load/store value must be a register"); }
+        if (!rv_is_addr(?item.ops[1]))        { ret R.err[bool, str]("encode: inline-asm load/store address must be off(base)"); }
+        ret R.ok[bool, str](true);
+    }
+    if (pat == RVP_UIMM) {
+        if (n != 2) { ret R.err[bool, str]("encode: inline-asm lui/auipc expects rd, imm"); }
+        if (item.ops[0].kind != iasm.AOP_REG) { ret R.err[bool, str]("encode: inline-asm destination must be a register"); }
+        if (item.ops[1].kind == iasm.AOP_SYM) { ret R.ok[bool, str](true); }
+        if (item.ops[1].kind != iasm.AOP_IMM) { ret R.err[bool, str]("encode: inline-asm lui/auipc needs an immediate"); }
+        ret R.ok[bool, str](true);
+    }
+    if (pat == RVP_BRANCH || pat == RVP_BRANCH_SW) {
+        if (n != 3) { ret R.err[bool, str]("encode: inline-asm branch expects rs1, rs2, label"); }
+        if (item.ops[0].kind != iasm.AOP_REG || item.ops[1].kind != iasm.AOP_REG) {
+            ret R.err[bool, str]("encode: inline-asm branch operand must be a register");
+        }
+        ret rv_local_target(c, s, item, 2);
+    }
+    if (pat == RVP_BRANCH_Z1 || pat == RVP_BRANCH_Z2) {
+        if (n != 2) { ret R.err[bool, str]("encode: inline-asm branch expects rs, label"); }
+        if (item.ops[0].kind != iasm.AOP_REG) { ret R.err[bool, str]("encode: inline-asm branch operand must be a register"); }
+        ret rv_local_target(c, s, item, 1);
+    }
+    if (pat == RVP_J) {
+        if (n != 1) { ret R.err[bool, str]("encode: inline-asm jump expects a label"); }
+        ret rv_local_target(c, s, item, 0);
+    }
+    if (pat == RVP_JAL) {
+        if (n == 1) { item.writes = iasm.AW_NONE; ret rv_local_target(c, s, item, 0); }
+        if (n != 2) { ret R.err[bool, str]("encode: inline-asm jump expects label or rd, label"); }
+        if (item.ops[0].kind != iasm.AOP_REG) { ret R.err[bool, str]("encode: inline-asm 'jal' destination must be a register"); }
+        ret rv_local_target(c, s, item, 1);
+    }
+    if (pat == RVP_JR) {
+        if (n != 1) { ret R.err[bool, str]("encode: inline-asm 'jr' expects a register"); }
+        if (item.ops[0].kind != iasm.AOP_REG) { ret R.err[bool, str]("encode: inline-asm jr/jalr operand must be a register"); }
+        ret R.ok[bool, str](true);
+    }
+    if (pat == RVP_JALR) {
+        # `jalr rs` links through ra, which the caller-saved mask already names; the
+        # three-operand form names its own link register, so only then is operand 0
+        # a destination.
+        if (n == 1) {
+            if (item.ops[0].kind != iasm.AOP_REG) { ret R.err[bool, str]("encode: inline-asm jr/jalr operand must be a register"); }
+            ret R.ok[bool, str](true);
+        }
+        if (n != 3) { ret R.err[bool, str]("encode: inline-asm jalr expects rs or rd, rs, imm"); }
+        if (item.ops[0].kind != iasm.AOP_REG || item.ops[1].kind != iasm.AOP_REG) {
+            ret R.err[bool, str]("encode: inline-asm jalr operand must be a register");
+        }
+        if (item.ops[2].kind != iasm.AOP_IMM) { ret R.err[bool, str]("encode: inline-asm jalr needs an immediate"); }
+        item.writes = iasm.AW_OP0;
+        ret R.ok[bool, str](true);
+    }
+    if (pat == RVP_MV || pat == RVP_NOT || pat == RVP_SEQZ || pat == RVP_NEG || pat == RVP_SNEZ) {
+        if (n != 2) { ret R.err[bool, str]("encode: inline-asm instruction expects rd, rs"); }
+        if (item.ops[0].kind != iasm.AOP_REG || item.ops[1].kind != iasm.AOP_REG) {
+            ret R.err[bool, str]("encode: inline-asm instruction operand must be a register");
+        }
+        ret R.ok[bool, str](true);
+    }
+    if (pat == RVP_LI) {
+        if (n != 2) { ret R.err[bool, str]("encode: inline-asm 'li' expects rd, imm"); }
+        if (item.ops[0].kind != iasm.AOP_REG) { ret R.err[bool, str]("encode: inline-asm 'li' destination must be a register"); }
+        if (item.ops[1].kind != iasm.AOP_IMM) { ret R.err[bool, str]("encode: inline-asm 'li' needs an immediate"); }
+        ret R.ok[bool, str](true);
+    }
+    if (pat == RVP_LA) {
+        if (n != 2) { ret R.err[bool, str]("encode: inline-asm 'la' expects rd, sym"); }
+        if (item.ops[0].kind != iasm.AOP_REG) { ret R.err[bool, str]("encode: inline-asm 'la' destination must be a register"); }
+        if (item.ops[1].kind != iasm.AOP_SYM) { ret R.err[bool, str]("encode: inline-asm 'la' target must be a symbol"); }
+        ret R.ok[bool, str](true);
+    }
+    if (pat == RVP_CALL || pat == RVP_TAIL) {
+        if (n != 1)                           { ret R.err[bool, str]("encode: inline-asm call/tail expects a symbol"); }
+        if (item.ops[0].kind != iasm.AOP_SYM) { ret R.err[bool, str]("encode: inline-asm call/tail target must be a symbol"); }
+        ret R.ok[bool, str](true);
+    }
+    if (pat == RVP_AMO) {
+        if (n != 3) { ret R.err[bool, str]("encode: inline-asm atomic expects rd, rs2, (rs1)"); }
+        if (item.ops[0].kind != iasm.AOP_REG || item.ops[1].kind != iasm.AOP_REG) {
+            ret R.err[bool, str]("encode: inline-asm atomic operand must be a register");
+        }
+        ret rv_amo_addr(?item.ops[2]);
+    }
+    if (pat == RVP_AMO_LR) {
+        if (n != 2)                           { ret R.err[bool, str]("encode: inline-asm 'lr' expects rd, (rs1)"); }
+        if (item.ops[0].kind != iasm.AOP_REG) { ret R.err[bool, str]("encode: inline-asm 'lr' destination must be a register"); }
+        ret rv_amo_addr(?item.ops[1]);
+    }
+    # every no-operand form.
+    if (n != 0) { ret R.err[bool, str]("encode: inline-asm instruction takes no operands"); }
+    ret R.ok[bool, str](true);
+}
+
+# an atomic's address must be the bare `(rs1)` form, never a displacement
+fun rv_amo_addr(op: *iasm.Operand) R.Result[bool, str] {
+    if (!rv_is_addr(op))                   { ret R.err[bool, str]("encode: inline-asm atomic address must be (rs1)"); }
+    if ((op.flags & iasm.AOF_HAS_DISP) != 0 || op.imm != 0) {
+        ret R.err[bool, str]("encode: inline-asm atomic address takes no displacement");
+    }
+    ret R.ok[bool, str](true);
+}
+
+# resolve operand `idx` as a numeric local-label reference
+#
+# A riscv conditional branch reaches only +-4 KiB and there is no in-block relocation
+# kind for a symbol target, so a branch names a numeric local label and nothing else.
+fun rv_local_target(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item, idx: u32) R.Result[bool, str] {
+    var num: u64 = 0;
+    var fwd: bool = false;
+    if (!iasm.label_ref_span(c.body, s.arg_lo[idx::usize], s.arg_hi[idx::usize], ?num, ?fwd)) {
+        ret R.err[bool, str]("encode: inline-asm branch/jump target must be a numeric local label (Nf / Nb)");
+    }
+    item.ref     = iasm.AR_LOCAL;
+    item.ref_num = num;
+    item.ref_fwd = fwd;
+    ret R.ok[bool, str](true);
+}
+
+# the register field an operand denotes, or the zero register when it names none
+fun rv_reg(op: *iasm.Operand) u32 {
+    if (op.kind != iasm.AOP_REG || op.reg < 0) { ret RZERO; }
+    ret op.reg::u32;
+}
+
+# emit one parsed RV64 item
+#
+# Every instruction goes through the same `emit_r` / `emit_i` / `emit_s` / `emit_b` /
+# `emit_u` / `emit_j` packers the instruction selector drives, so an inline-asm
+# instruction and a selected one are the same bytes and the same notification.
+fun rv_emit(st: *encode.EncodeState, c: *iasm.Cursor, l: *iasm.Labels, item: *iasm.Item) R.Result[bool, str] {
+    val pat: u16 = rv_pattern(item.flags);
+    val op: inst.MachOp = item.code::inst.MachOp;
+
+    var fmt: u8 = 0;
+    var opcode: u32 = 0;
+    var f3: u32 = 0;
+    var f7: u32 = 0;
+    if (pat != RVP_LI && pat != RVP_LA && pat != RVP_CALL && pat != RVP_TAIL) {
+        if (!rv_fields(op, ?fmt, ?opcode, ?f3, ?f7)) {
+            ret R.err[bool, str]("internal compiler error: inline-asm riscv64 instruction has no encoding");
+        }
+    }
+
+    if (pat == RVP_ECALL)  { emit_i(st, OPC_SYSTEM, F3_ADD, RZERO, RZERO, 0); ret R.ok[bool, str](true); }
+    if (pat == RVP_EBREAK) { emit_i(st, OPC_SYSTEM, F3_ADD, RZERO, RZERO, 1); ret R.ok[bool, str](true); }
+    if (pat == RVP_NOP)    { emit_i(st, OPC_OP_IMM, F3_ADD, RZERO, RZERO, 0); ret R.ok[bool, str](true); }
+    if (pat == RVP_RET)    { emit_i(st, OPC_JALR, F3_ADD, RZERO, RRA, 0); ret R.ok[bool, str](true); }
+    if (pat == RVP_FENCE)  { emit_i(st, OPC_MISC_MEM, F3_ADD, RZERO, RZERO, 0xFF); ret R.ok[bool, str](true); }
+    if (pat == RVP_PAUSE)  { emit_i(st, OPC_MISC_MEM, F3_ADD, RZERO, RZERO, 0x010); ret R.ok[bool, str](true); }
+
+    if (pat == RVP_RRR) {
+        emit_r(st, opcode, f3, f7, rv_reg(?item.ops[0]), rv_reg(?item.ops[1]), rv_reg(?item.ops[2]));
+        ret R.ok[bool, str](true);
+    }
+    if (pat == RVP_RRI) {
+        if (item.ops[2].kind == iasm.AOP_SYM) { ret rv_emit_pcrel_lo(st, c, item, opcode, f3); }
+        val v: i64 = item.ops[2].imm;
+        if (v < -2048 || v > 2047) { ret R.err[bool, str]("encode: inline-asm immediate is out of the 12-bit signed range"); }
+        emit_i(st, opcode, f3, rv_reg(?item.ops[0]), rv_reg(?item.ops[1]), v::u32 & 0xFFF);
+        ret R.ok[bool, str](true);
+    }
+    if (pat == RVP_SHIFT) {
+        var mask: u32 = 0x3F;
+        if (opcode == OPC_OP_IMM_32) { mask = 0x1F; }
+        val v: i64 = item.ops[2].imm;
+        if (v < 0 || v::u32 > mask) { ret R.err[bool, str]("encode: inline-asm shift amount is out of range"); }
+        var imm: u32 = v::u32 & mask;
+        if (op == inst.SRAI || op == inst.SRAIW) { imm = imm | 0x400; }
+        emit_i(st, opcode, f3, rv_reg(?item.ops[0]), rv_reg(?item.ops[1]), imm);
+        ret R.ok[bool, str](true);
+    }
+    if (pat == RVP_LOAD || pat == RVP_STORE) {
+        val mem: *iasm.Operand = ?item.ops[1];
+        if (mem.kind != iasm.AOP_MEM) { ret R.err[bool, str]("internal compiler error: inline-asm statement reached the encoder unresolved"); }
+        if (mem.imm < -2048 || mem.imm > 2047) { ret R.err[bool, str]("encode: inline-asm load/store offset is out of the 12-bit signed range"); }
+        if (pat == RVP_LOAD) {
+            emit_i(st, opcode, f3, rv_reg(?item.ops[0]), mem.reg::u32, mem.imm::u32 & 0xFFF);
+        } or {
+            emit_s(st, opcode, f3, mem.reg::u32, rv_reg(?item.ops[0]), mem.imm::u32 & 0xFFF);
+        }
+        ret R.ok[bool, str](true);
+    }
+    if (pat == RVP_UIMM) { ret rv_emit_uimm(st, c, item, opcode); }
+    if (pat == RVP_BRANCH || pat == RVP_BRANCH_SW || pat == RVP_BRANCH_Z1 || pat == RVP_BRANCH_Z2) {
+        var rs1: u32 = RZERO;
+        var rs2: u32 = RZERO;
+        if (pat == RVP_BRANCH)         { rs1 = rv_reg(?item.ops[0]); rs2 = rv_reg(?item.ops[1]); }
+        or (pat == RVP_BRANCH_SW)      { rs1 = rv_reg(?item.ops[1]); rs2 = rv_reg(?item.ops[0]); }
+        or (pat == RVP_BRANCH_Z1)      { rs1 = rv_reg(?item.ops[0]); }
+        or                             { rs2 = rv_reg(?item.ops[0]); }
+        val pos: u32 = st.buf.len::u32;
+        emit_b(st, opcode, f3, rs1, rs2, 0);
+        note_local_target(st, item.ref_num, item.ref_fwd);
+        ret iasm.resolve_local(st, c.g, l, pos, item.ref_num, item.ref_fwd);
+    }
+    if (pat == RVP_J || pat == RVP_JAL) {
+        var rd: u32 = RZERO;
+        if (pat == RVP_JAL) {
+            rd = RRA;
+            if (item.nops == 2) { rd = rv_reg(?item.ops[0]); }
+        }
+        val pos: u32 = st.buf.len::u32;
+        emit_j(st, OPC_JAL, rd, 0);
+        note_local_target(st, item.ref_num, item.ref_fwd);
+        ret iasm.resolve_local(st, c.g, l, pos, item.ref_num, item.ref_fwd);
+    }
+    if (pat == RVP_JR)   { emit_i(st, OPC_JALR, F3_ADD, RZERO, rv_reg(?item.ops[0]), 0); ret R.ok[bool, str](true); }
+    if (pat == RVP_JALR) {
+        if (item.nops == 1) { emit_i(st, OPC_JALR, F3_ADD, RRA, rv_reg(?item.ops[0]), 0); ret R.ok[bool, str](true); }
+        val v: i64 = item.ops[2].imm;
+        if (v < -2048 || v > 2047) { ret R.err[bool, str]("encode: inline-asm jalr offset is out of the 12-bit signed range"); }
+        emit_i(st, OPC_JALR, F3_ADD, rv_reg(?item.ops[0]), rv_reg(?item.ops[1]), v::u32 & 0xFFF);
+        ret R.ok[bool, str](true);
+    }
+    if (pat == RVP_MV)   { emit_i(st, opcode, f3, rv_reg(?item.ops[0]), rv_reg(?item.ops[1]), 0); ret R.ok[bool, str](true); }
+    if (pat == RVP_NOT)  { emit_i(st, opcode, f3, rv_reg(?item.ops[0]), rv_reg(?item.ops[1]), 0xFFF); ret R.ok[bool, str](true); }
+    if (pat == RVP_SEQZ) { emit_i(st, opcode, f3, rv_reg(?item.ops[0]), rv_reg(?item.ops[1]), 1); ret R.ok[bool, str](true); }
+    if (pat == RVP_NEG)  { emit_r(st, opcode, f3, f7, rv_reg(?item.ops[0]), RZERO, rv_reg(?item.ops[1])); ret R.ok[bool, str](true); }
+    if (pat == RVP_SNEZ) { emit_r(st, opcode, f3, f7, rv_reg(?item.ops[0]), RZERO, rv_reg(?item.ops[1])); ret R.ok[bool, str](true); }
+    if (pat == RVP_LI)   { emit_li(st, rv_reg(?item.ops[0]), item.ops[1].imm); ret R.ok[bool, str](true); }
+    if (pat == RVP_LA)   { ret rv_emit_la(st, c, item); }
+    if (pat == RVP_CALL) { ret rv_emit_call(st, c, item, RRA, RRA); }
+    if (pat == RVP_TAIL) { ret rv_emit_call(st, c, item, SCRATCH2, RZERO); }
+    if (pat == RVP_AMO || pat == RVP_AMO_LR) {
+        var f7o: u32 = f7;
+        if ((item.flags & RVF_AQ) != 0) { f7o = f7o | 0x2; }
+        if ((item.flags & RVF_RL) != 0) { f7o = f7o | 0x1; }
+        if (pat == RVP_AMO_LR) {
+            emit_r(st, opcode, f3, f7o, rv_reg(?item.ops[0]), item.ops[1].reg::u32, RZERO);
+            ret R.ok[bool, str](true);
+        }
+        emit_r(st, opcode, f3, f7o, rv_reg(?item.ops[0]), item.ops[2].reg::u32, rv_reg(?item.ops[1]));
+        ret R.ok[bool, str](true);
+    }
+    ret R.err[bool, str]("internal compiler error: inline-asm riscv64 form has no emitter");
+}
+
+# emit a `lui` / `auipc`, whose immediate may be a `%mod(sym)` reference the linker
+# fills rather than a written constant
+#
+# Only the high half of a pc-relative pair is expressible as one instruction, so
+# `auipc rd, %pcrel_hi(sym)` is the sole symbol form here; `%pcrel_lo` belongs to the
+# paired low instruction, and `%got_pcrel_hi` has no riscv64 relocation kind in this
+# backend at all - both are refused by name rather than encoded as something else.
+fun rv_emit_uimm(st: *encode.EncodeState, c: *iasm.Cursor, item: *iasm.Item, opcode: u32) R.Result[bool, str] {
+    val src: *iasm.Operand = ?item.ops[1];
+    if (src.kind == iasm.AOP_SYM) {
+        if (src.mod == isa.SYM_MOD_GOT_HI) {
+            ret R.err[bool, str]("encode: riscv64 has no GOT-relative relocation kind, so inline-asm '%got_pcrel_hi' cannot be encoded");
+        }
+        if (opcode != OPC_AUIPC || src.mod != isa.SYM_MOD_PCREL_HI) {
+            ret R.err[bool, str]("encode: inline-asm upper-immediate symbol reference must be an 'auipc rd, %pcrel_hi(sym)'");
+        }
+        val sr: R.Result[intern.StrId, str] = rv_intern(st, c, src);
+        if (R.is_err[intern.StrId, str](sr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sr)); }
+        ret emit_pcrel_hi(st, rv_reg(?item.ops[0]), R.unwrap_ok[intern.StrId, str](sr), 0);
+    }
+    if (src.imm < 0 || src.imm > 0xFFFFF) { ret R.err[bool, str]("encode: inline-asm lui/auipc immediate is out of the 20-bit range"); }
+    emit_u(st, opcode, rv_reg(?item.ops[0]), src.imm::u32 & 0xFFFFF);
+    ret R.ok[bool, str](true);
+}
+
+# emit the low half of a pc-relative symbol pair, `addi rd, rs1, %pcrel_lo(sym)`
+#
+# The immediate is a zero placeholder the RK_PCREL_LO12_I relocation fills. This
+# backend forms the pair against the symbol itself rather than against the paired
+# `auipc`'s label - the same convention `la` and every compiler-emitted global
+# reference use - so what the printer writes for one half is what this reads back.
+fun rv_emit_pcrel_lo(st: *encode.EncodeState, c: *iasm.Cursor, item: *iasm.Item, opcode: u32, f3: u32) R.Result[bool, str] {
+    val src: *iasm.Operand = ?item.ops[2];
+    if (src.mod != isa.SYM_MOD_PCREL_LO) {
+        ret R.err[bool, str]("encode: inline-asm register-immediate symbol reference must be a '%pcrel_lo(sym)'");
+    }
+    val sr: R.Result[intern.StrId, str] = rv_intern(st, c, src);
+    if (R.is_err[intern.StrId, str](sr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sr)); }
+    val sym: intern.StrId = R.unwrap_ok[intern.StrId, str](sr);
+    val pos: u32 = st.buf.len::u32;
+    emit_i(st, opcode, f3, rv_reg(?item.ops[0]), rv_reg(?item.ops[1]), 0);
+    note_sym_target(st, sym, isa.SYM_MOD_PCREL_LO);
+    ret encode.push_reloc(st, pos, of.RK_PCREL_LO12_I, sym, 0);
+}
+
+# `la rd, sym` - the pc-relative address-of pair `auipc rd, %pcrel_hi(sym)` then
+# `addi rd, rd, %pcrel_lo(sym)`, with zero placeholders and both relocations
+fun rv_emit_la(st: *encode.EncodeState, c: *iasm.Cursor, item: *iasm.Item) R.Result[bool, str] {
+    val sr: R.Result[intern.StrId, str] = rv_intern(st, c, ?item.ops[1]);
+    if (R.is_err[intern.StrId, str](sr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sr)); }
+    val sym: intern.StrId = R.unwrap_ok[intern.StrId, str](sr);
+    val rd: u32 = rv_reg(?item.ops[0]);
+    val hr: R.Result[bool, str] = emit_pcrel_hi(st, rd, sym, 0);
+    if (R.is_err[bool, str](hr)) { ret hr; }
+    val lo_pos: u32 = st.buf.len::u32;
+    emit_i(st, OPC_OP_IMM, F3_ADD, rd, rd, 0);
+    note_sym_target(st, sym, isa.SYM_MOD_PCREL_LO);
+    ret encode.push_reloc(st, lo_pos, of.RK_PCREL_LO12_I, sym, 0);
+}
+
+# a direct call to a symbol - `auipc <link>, 0` then `jalr <ret>, <link>, 0` with a
+# zero placeholder pair and an RK_PLT32 marker at the auipc (the abstract
+# direct-call kind the linker maps to R_RISCV_CALL_PLT). `call` links through ra;
+# `tail` links through t1 and returns nowhere (rd = x0), the standard tail-call form
+fun rv_emit_call(st: *encode.EncodeState, c: *iasm.Cursor, item: *iasm.Item, link: u32, ret_reg: u32) R.Result[bool, str] {
+    val sr: R.Result[intern.StrId, str] = rv_intern(st, c, ?item.ops[0]);
+    if (R.is_err[intern.StrId, str](sr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sr)); }
+    val sym: intern.StrId = R.unwrap_ok[intern.StrId, str](sr);
+    val pos: u32 = st.buf.len::u32;
+    emit_u(st, OPC_AUIPC, link, 0);
+    note_sym_target(st, sym, isa.SYM_MOD_PCREL_HI);
+    emit_i(st, OPC_JALR, F3_ADD, ret_reg, link, 0);
+    note_sym_target(st, sym, isa.SYM_MOD_PCREL_LO);
+    ret encode.push_reloc(st, pos, of.RK_PLT32, sym, 0);
+}
+
+# intern the symbol name an operand spans out of the asm body
+#
+# The name is a region of the body, not a NUL-terminated string, so it is interned
+# before either the notification or the relocation can name it - both take the id.
+fun rv_intern(st: *encode.EncodeState, c: *iasm.Cursor, op: *iasm.Operand) R.Result[intern.StrId, str] {
+    ret intern.intern_bytes(st.interner, (c.body::usize + op.name_off)::str, op.name_len);
+}
+
+# insert the displacement from an inline-asm branch to a numeric local label
+#
+# The B-type / J-type immediate scatter is the shared `patch_branch_riscv64`, which
+# dispatches on the placeholder word's opcode, so this carries no encoding.
+fun rv_patch(st: *encode.EncodeState, patch_pos: u32, target_off: u32) R.Result[bool, str] {
+    var fx: encode.BranchFixup;
+    fx.patch_pos    = patch_pos;
+    fx.next_ip      = 0;
+    fx.target_block = 0;
+    fx.fn_text_base = 0;
+    ret patch_branch_riscv64(st, ?fx, target_off);
+}
+
+# the RV64 inline-assembly grammar
+fun rv_grammar() iasm.Grammar {
+    var g: iasm.Grammar;
+    g.isa       = "riscv64";
+    g.unknown   = "unknown riscv64 inline-asm instruction '";
+    g.rows      = ?RV_MNEMONICS[0];
+    g.row_count = RV_MNEMONIC_COUNT;
+    g.decode    = rv_decode_amo;
+    g.parse     = rv_parse;
+    g.emit      = rv_emit;
+    g.patch     = rv_patch;
+    g.slot      = frame_slot_offset;
+    g.all_gp    = 0xFFFFFFFF;
+    g.all_fp    = 0xFFFFFFFF;
+    g.word      = 4;
+    ret g;
+}
+
+# the `AsmClobbersFn` the RV64 ISA vtable exposes - the registers an inline-asm body
+# writes, derived from the instructions the body parses to
+#
+# Without this hook a nil slot forces a conservative all-register clobber, framing
+# every asm function (`_start`, whose frame allocation then mis-reads argc off the
+# entry stack). The derivation runs the same parser the assembler runs, so the
+# register set and the emitted bytes describe one instruction stream.
 # ---
 # body:   the inline-asm body text
 # gp_out: out - the GP registers the body writes (bit n = register n)
 # fp_out: out - the FP registers the body writes (bit n = register n)
 pub fun asm_clobbers(body: str, gp_out: *u32, fp_out: *u32) {
-    var gp: u32 = 0;
-    var fp: u32 = 0;
-    val len: usize = str_len(body);
-    var start: usize = 0;
-    for (start < len) {
-        var end: usize = start;
-        for (end < len && body[end] != '\n'::char && body[end] != ';'::char) { end = end + 1; }
-        var lo: usize = start;
-        for (lo < end && asm_is_space(body[lo])) { lo = lo + 1; }
-        var hi: usize = end;
-        for (hi > lo && asm_is_space(body[hi - 1])) { hi = hi - 1; }
-        if (hi > lo) {
-            var line: [512]u8;
-            val ll: usize = hi - lo;
-            if (ll >= 512) { gp = 0xFFFFFFFF; fp = 0xFFFFFFFF; }
-            or {
-                var c: usize = 0;
-                for (c < ll) { line[c] = body[lo + c]::u8; c = c + 1; }
-                line[ll] = 0;
-                asm_stmt_clobbers((?line[0])::str, ?gp, ?fp);
-            }
-        }
-        start = end + 1;
-    }
-    @gp_out = gp;
-    @fp_out = fp;
+    var g: iasm.Grammar = rv_grammar();
+    iasm.clobbers(?g, body, gp_out, fp_out);
 }
 
-# inline-asm assembler
+# expand an inline-asm MIR_ASM instruction into RV64 bytes
 #
-# parses an `asm riscv64 { ... }` body line-by-line and emits RV64 words, resolving
-# `{name}` locals to their frame slots (`off(s0)`) and bare-symbol operands to the
-# riscv relocations - the RV64 analogue of x86-64's `encode_asm_block` and
-# AArch64's `encode_asm_block_arm64`. it reuses the slice-2 R/I/S/B/U/J packers and
-# the slice-2 register-name resolver (`asm_reg_index`). numeric local labels
-# (`1:` / `1f` / `1b`) resolve within the block; the B-type / J-type displacement
-# insert reuses the shared `patch_branch_riscv64`. an unrecognized mnemonic or a
-# malformed operand is a hard error rather than wrong bytes.
-
-# a parsed RV64 inline-asm operand. distinguishes a register / immediate / `off(base)`
-# memory form (encoded directly) from a bare symbol (resolved to a relocation)
-# ---
-# kind:     one of RVOP_*
-# reg:      register index for RVOP_REG, or the base register for RVOP_MEM
-# imm:      immediate (RVOP_IMM) or the memory displacement (RVOP_MEM)
-# name:     borrowed symbol name (RVOP_SYM)
-# name_len: length of `name`
-rec RvAsmOp {
-    kind:     u8;
-    reg:      i32;
-    imm:      i64;
-    name:     str;
-    name_len: usize;
-}
-
-# no operand parsed
-val RVOP_NONE: u8 = 0;
-# a register operand
-val RVOP_REG:  u8 = 1;
-# an immediate constant
-val RVOP_IMM:  u8 = 2;
-# an `off(base)` memory operand (the load / store address form)
-val RVOP_MEM:  u8 = 3;
-# a bare symbol / branch-target name (resolved to a relocation)
-val RVOP_SYM:  u8 = 4;
-
-# initial capacity for the numeric local-label definition / forward-ref arrays
-val RV_LABEL_INIT_CAP: u32 = 8;
-
-# a numeric local label's nearest definition: the label number and its `.text` offset
-# ---
-# number: the numeric label
-# offset: byte offset of the definition within `.text`
-rec RvLabelDef { number: u64; offset: u32; }
-
-# a pending forward reference to a numeric local label: the placeholder branch word is
-# at `patch_pos`, resolved by `patch_branch_riscv64` when the definition is reached
-# ---
-# patch_pos: byte offset of the branch instruction word within `.text`
-# number:    the referenced numeric label
-rec RvLabelRef { patch_pos: u32; number: u64; }
-
-# per-asm-block numeric-local-label scope (`1:` / `1f` / `1b`). owns its def /
-# forward-ref arrays, freed when the block finishes. the displacement insert reuses
-# the shared `patch_branch_riscv64` (J-type for j / jal, B-type for the branches -
-# distinguished there by the placeholder word's opcode), so this bookkeeping carries
-# no encoding
-# ---
-# alloc:     backing allocator
-# defs:      recorded label definitions (latest offset per number)
-# def_count: number of definitions
-# def_cap:   capacity of `defs`
-# refs:      pending forward references
-# ref_count: number of pending forward references
-# ref_cap:   capacity of `refs`
-rec RvLabels {
-    alloc:     *A.Allocator;
-    defs:      *RvLabelDef;
-    def_count: u32;
-    def_cap:   u32;
-    refs:      *RvLabelRef;
-    ref_count: u32;
-    ref_cap:   u32;
-}
-
-# initialize an empty numeric-local-label scope backed by `alloc`
-fun rv_labels_init(labels: *RvLabels, alloc: *A.Allocator) {
-    labels.alloc = alloc;
-    labels.defs = nil; labels.def_count = 0; labels.def_cap = 0;
-    labels.refs = nil; labels.ref_count = 0; labels.ref_cap = 0;
-}
-
-# release a label scope's owned arrays
-fun rv_labels_dnit(labels: *RvLabels) {
-    if (labels.defs != nil && labels.def_cap > 0) {
-        A.deallocate[RvLabelDef](labels.alloc, labels.defs, labels.def_cap::usize);
-        labels.defs = nil; labels.def_cap = 0; labels.def_count = 0;
-    }
-    if (labels.refs != nil && labels.ref_cap > 0) {
-        A.deallocate[RvLabelRef](labels.alloc, labels.refs, labels.ref_cap::usize);
-        labels.refs = nil; labels.ref_cap = 0; labels.ref_count = 0;
-    }
-}
-
-# grow the label-definition array (or allocate it on first use)
-fun grow_rv_defs(labels: *RvLabels) R.Result[bool, str] {
-    if (labels.defs == nil) {
-        val r: R.Result[*RvLabelDef, str] = A.allocate[RvLabelDef](labels.alloc, RV_LABEL_INIT_CAP::usize);
-        if (R.is_err[*RvLabelDef, str](r)) { ret R.err[bool, str](R.unwrap_err[*RvLabelDef, str](r)); }
-        labels.defs = R.unwrap_ok[*RvLabelDef, str](r); labels.def_cap = RV_LABEL_INIT_CAP;
-        ret R.ok[bool, str](true);
-    }
-    val nc: u32 = labels.def_cap * 2;
-    val r: R.Result[*RvLabelDef, str] = A.reallocate[RvLabelDef](labels.alloc, labels.defs, labels.def_cap::usize, nc::usize);
-    if (R.is_err[*RvLabelDef, str](r)) { ret R.err[bool, str](R.unwrap_err[*RvLabelDef, str](r)); }
-    labels.defs = R.unwrap_ok[*RvLabelDef, str](r); labels.def_cap = nc;
-    ret R.ok[bool, str](true);
-}
-
-# grow the forward-reference array (or allocate it on first use)
-fun grow_rv_refs(labels: *RvLabels) R.Result[bool, str] {
-    if (labels.refs == nil) {
-        val r: R.Result[*RvLabelRef, str] = A.allocate[RvLabelRef](labels.alloc, RV_LABEL_INIT_CAP::usize);
-        if (R.is_err[*RvLabelRef, str](r)) { ret R.err[bool, str](R.unwrap_err[*RvLabelRef, str](r)); }
-        labels.refs = R.unwrap_ok[*RvLabelRef, str](r); labels.ref_cap = RV_LABEL_INIT_CAP;
-        ret R.ok[bool, str](true);
-    }
-    val nc: u32 = labels.ref_cap * 2;
-    val r: R.Result[*RvLabelRef, str] = A.reallocate[RvLabelRef](labels.alloc, labels.refs, labels.ref_cap::usize, nc::usize);
-    if (R.is_err[*RvLabelRef, str](r)) { ret R.err[bool, str](R.unwrap_err[*RvLabelRef, str](r)); }
-    labels.refs = R.unwrap_ok[*RvLabelRef, str](r); labels.ref_cap = nc;
-    ret R.ok[bool, str](true);
-}
-
-# the nearest preceding definition offset of `number`, or none
-fun rv_label_lookup(labels: *RvLabels, number: u64) O.Option[u32] {
-    var i: u32 = 0;
-    for (i < labels.def_count) {
-        if (labels.defs[i].number == number) { ret O.some[u32](labels.defs[i].offset); }
-        i = i + 1;
-    }
-    ret O.none[u32]();
-}
-
-# record a pending forward reference to `number` whose branch word is at `patch_pos`
-fun rv_label_push_ref(labels: *RvLabels, patch_pos: u32, number: u64) R.Result[bool, str] {
-    if (labels.ref_count >= labels.ref_cap) {
-        val gr: R.Result[bool, str] = grow_rv_refs(labels);
-        if (R.is_err[bool, str](gr)) { ret gr; }
-    }
-    labels.refs[labels.ref_count].patch_pos = patch_pos;
-    labels.refs[labels.ref_count].number    = number;
-    labels.ref_count = labels.ref_count + 1;
-    ret R.ok[bool, str](true);
-}
-
-# record a definition of `number` at `.text` offset `off`, patching (and dropping)
-# every pending forward reference to it through the shared `patch_branch_riscv64`, and
-# updating the nearest-preceding-definition offset
-fun rv_label_record_def(st: *encode.EncodeState, labels: *RvLabels, number: u64, off: u32) R.Result[bool, str] {
-    var w: u32 = 0;
-    var r: u32 = 0;
-    for (r < labels.ref_count) {
-        if (labels.refs[r].number == number) {
-            var fx: encode.BranchFixup;
-            fx.patch_pos = labels.refs[r].patch_pos; fx.next_ip = 0;
-            fx.target_block = 0; fx.fn_text_base = 0;
-            val pr: R.Result[bool, str] = patch_branch_riscv64(st, ?fx, off);
-            if (R.is_err[bool, str](pr)) { ret pr; }
-        } or {
-            labels.refs[w].patch_pos = labels.refs[r].patch_pos;
-            labels.refs[w].number    = labels.refs[r].number;
-            w = w + 1;
-        }
-        r = r + 1;
-    }
-    labels.ref_count = w;
-
-    var i: u32 = 0;
-    for (i < labels.def_count) {
-        if (labels.defs[i].number == number) { labels.defs[i].offset = off; ret R.ok[bool, str](true); }
-        i = i + 1;
-    }
-    if (labels.def_count >= labels.def_cap) {
-        val gr: R.Result[bool, str] = grow_rv_defs(labels);
-        if (R.is_err[bool, str](gr)) { ret gr; }
-    }
-    labels.defs[labels.def_count].number = number;
-    labels.defs[labels.def_count].offset = off;
-    labels.def_count = labels.def_count + 1;
-    ret R.ok[bool, str](true);
-}
-
-# true for an ASCII decimal digit
-fun rv_is_digit(c: char) bool { ret c >= '0'::char && c <= '9'::char; }
-
-# true for a character valid inside a bare symbol name
-fun rv_is_sym_char(c: char) bool {
-    ret c == '_'::char || c == '.'::char ||
-        (c >= 'a'::char && c <= 'z'::char) ||
-        (c >= 'A'::char && c <= 'Z'::char) ||
-        (c >= '0'::char && c <= '9'::char);
-}
-
-# true when `tok[0..len)` is a valid bare symbol name (leading char a letter /
-# underscore, the rest symbol characters)
-fun rv_is_sym_token(tok: str, len: usize) bool {
-    if (len == 0) { ret false; }
-    val c0: char = tok[0];
-    if (!(c0 == '_'::char || (c0 >= 'a'::char && c0 <= 'z'::char) || (c0 >= 'A'::char && c0 <= 'Z'::char))) {
-        ret false;
-    }
-    var i: usize = 1;
-    for (i < len) { if (!rv_is_sym_char(tok[i])) { ret false; } i = i + 1; }
-    ret true;
-}
-
-# a pointer past leading whitespace in `s` (trailing whitespace already stripped by
-# the statement tokenizer)
-fun rv_trim(s: str) str {
-    var i: usize = 0;
-    for (s[i] != 0 && asm_is_space(s[i])) { i = i + 1; }
-    ret (s::usize + i)::str;
-}
-
-# copy `s[lo..hi)` (trimming surrounding whitespace) into `dst` as a NUL-terminated
-# string. returns false on an empty or oversized slice
-fun rv_copy_region(s: str, lo: usize, hi: usize, dst: *u8, cap: usize) bool {
-    var a: usize = lo;
-    var b: usize = hi;
-    for (a < b && asm_is_space(s[a])) { a = a + 1; }
-    for (b > a && asm_is_space(s[b - 1])) { b = b - 1; }
-    val n: usize = b - a;
-    if (n == 0 || n + 1 > cap) { ret false; }
-    var i: usize = 0;
-    for (i < n) { dst[i] = s[a + i]::u8; i = i + 1; }
-    dst[n] = 0;
-    ret true;
-}
-
-# if `tok` begins with `<digits>:`, return the prefix length (through the colon) and
-# the parsed number via `num_out`; otherwise return 0
-fun rv_label_def_len(tok: str, num_out: *u64) usize {
-    if (!rv_is_digit(tok[0])) { ret 0; }
-    var i: usize = 0;
-    var n: u64 = 0;
-    for (rv_is_digit(tok[i])) { n = n * 10 + (tok[i]::u64 - '0'::u64); i = i + 1; }
-    if (tok[i] != ':'::char) { ret 0; }
-    @num_out = n;
-    ret i + 1;
-}
-
-# parse a numeric local-label reference `<digits>f` / `<digits>b` into its number and
-# direction. returns false when `tok` is not that shape
-fun rv_label_ref(tok: str, num_out: *u64, fwd_out: *bool) bool {
-    val len: usize = str_len(tok);
-    if (len < 2)              { ret false; }
-    if (!rv_is_digit(tok[0])) { ret false; }
-    var n: u64 = 0;
-    var i: usize = 0;
-    for (i < len - 1) {
-        if (!rv_is_digit(tok[i])) { ret false; }
-        n = n * 10 + (tok[i]::u64 - '0'::u64);
-        i = i + 1;
-    }
-    val suf: char = tok[len - 1];
-    if (suf == 'f'::char) { @fwd_out = true; }
-    or (suf == 'b'::char) { @fwd_out = false; }
-    or { ret false; }
-    @num_out = n;
-    ret true;
-}
-
-# copy the first whitespace-delimited token of `tok` (the mnemonic) into `mbuf`
-# NUL-terminated and set `args_out` to the trimmed remainder. returns false when the
-# mnemonic exceeds `cap`
-fun rv_first_token(tok: str, mbuf: *u8, cap: usize, args_out: *str) bool {
-    var i: usize = 0;
-    for (tok[i] != 0 && asm_is_space(tok[i])) { i = i + 1; }
-    var k: usize = 0;
-    for (tok[i] != 0 && !asm_is_space(tok[i])) {
-        if (k + 1 >= cap) { ret false; }
-        mbuf[k] = tok[i]::u8; k = k + 1; i = i + 1;
-    }
-    mbuf[k] = 0;
-    for (tok[i] != 0 && asm_is_space(tok[i])) { i = i + 1; }
-    @args_out = (tok::usize + i)::str;
-    ret true;
-}
-
-# build "<prefix><name><suffix>" interned into the session interner so the
-# diagnostic outlives this call; degrades to `fallback` when interning is unavailable.
-# mirrors the AArch64 `asm_named_err`
-fun rv_named_err(st: *encode.EncodeState, prefix: str, name: str, suffix: str, fallback: str) str {
-    if (st.interner == nil || name == nil) { ret fallback; }
-    val lp: usize = str_len(prefix);
-    val ln: usize = str_len(name);
-    val ls: usize = str_len(suffix);
-    val total: usize = lp + ln + ls;
-    val r: R.Result[*u8, str] = A.allocate[u8](st.alloc, total + 1);
-    if (R.is_err[*u8, str](r)) { ret fallback; }
-    val buf: *u8 = R.unwrap_ok[*u8, str](r);
-    var k: usize = 0;
-    var j: usize = 0;
-    for (j < lp) { buf[k] = prefix[j]::u8; k = k + 1; j = j + 1; }
-    j = 0;
-    for (j < ln) { buf[k] = name[j]::u8; k = k + 1; j = j + 1; }
-    j = 0;
-    for (j < ls) { buf[k] = suffix[j]::u8; k = k + 1; j = j + 1; }
-    buf[total] = 0;
-    val ir: R.Result[intern.StrId, str] = intern.intern(st.interner, buf::str);
-    A.deallocate[u8](st.alloc, buf, total + 1);
-    if (R.is_err[intern.StrId, str](ir)) { ret fallback; }
-    val nm: O.Option[str] = intern.lookup(st.interner, R.unwrap_ok[intern.StrId, str](ir));
-    if (O.is_some[str](nm)) { ret O.unwrap[str](nm); }
-    ret fallback;
-}
-
-# map a register token to its index through the slice-2 `asm_reg_index` resolver
-fun rv_parse_reg(tok: str, op: *RvAsmOp) bool {
-    val idx: i32 = asm_reg_index(tok);
-    if (idx < 0) { ret false; }
-    op.kind = RVOP_REG; op.reg = idx; op.imm = 0; op.name = nil; op.name_len = 0;
-    ret true;
-}
-
-# parse the `off(base)` memory operand form (the only memory shape RV64 load / store
-# instructions take). `off` defaults to 0 when omitted (`(base)`); the base must be a
-# register. returns false on any other shape
-fun rv_parse_mem(tok: str, len: usize, op: *RvAsmOp) bool {
-    var lp: usize = 0;
-    var found: bool = false;
-    var i: usize = 0;
-    for (i < len && !found) {
-        if (tok[i] == '('::char) { lp = i; found = true; }
-        i = i + 1;
-    }
-    if (!found)                    { ret false; }
-    if (tok[len - 1] != ')'::char) { ret false; }
-
-    var bbuf: [16]u8;
-    if (!rv_copy_region(tok, lp + 1, len - 1, ?bbuf[0], 16)) { ret false; }
-    val bidx: i32 = asm_reg_index((?bbuf[0])::str);
-    if (bidx < 0) { ret false; }
-
-    var off: i64 = 0;
-    var a: usize = 0;
-    var b: usize = lp;
-    for (a < b && asm_is_space(tok[a])) { a = a + 1; }
-    for (b > a && asm_is_space(tok[b - 1])) { b = b - 1; }
-    if (b > a) {
-        var obuf: [32]u8;
-        if (!rv_copy_region(tok, a, b, ?obuf[0], 32)) { ret false; }
-        val r: R.Result[i64, str] = parse.parse_i64_exact((?obuf[0])::str, 0);
-        if (R.is_err[i64, str](r)) { ret false; }
-        off = R.unwrap_ok[i64, str](r);
-    }
-    op.kind = RVOP_MEM; op.reg = bidx; op.imm = off; op.name = nil; op.name_len = 0;
-    ret true;
-}
-
-# parse one trimmed operand token into `op` - a register, an `off(base)` memory
-# reference, an immediate, or a bare symbol. returns false when the token matches none
-fun rv_parse_operand(tok: str, op: *RvAsmOp) bool {
-    op.kind = RVOP_NONE; op.reg = -1; op.imm = 0; op.name = nil; op.name_len = 0;
-    val len: usize = str_len(tok);
-    if (len == 0)               { ret false; }
-    if (rv_parse_reg(tok, op))  { ret true; }
-
-    var has_paren: bool = false;
-    var i: usize = 0;
-    for (i < len && !has_paren) { if (tok[i] == '('::char) { has_paren = true; } i = i + 1; }
-    if (has_paren && tok[len - 1] == ')'::char) { ret rv_parse_mem(tok, len, op); }
-
-    val r: R.Result[i64, str] = parse.parse_i64_exact(tok, 0);
-    if (R.is_ok[i64, str](r)) {
-        op.kind = RVOP_IMM; op.imm = R.unwrap_ok[i64, str](r);
-        ret true;
-    }
-    if (rv_is_sym_token(tok, len)) {
-        op.kind = RVOP_SYM; op.name = tok; op.name_len = len;
-        ret true;
-    }
-    ret false;
-}
-
-# split `args` into trimmed top-level operand tokens (commas outside `(...)`),
-# copying each NUL-terminated into `b0`..`b3` (each `cap` bytes). returns false on more
-# than four operands, an empty token, or an oversized token
-fun rv_split(args: str, b0: *u8, b1: *u8, b2: *u8, b3: *u8, cap: usize, count_out: *u32) bool {
-    val len: usize = str_len(args);
-    var count: u32 = 0;
-    var depth: i32 = 0;
-    var start: usize = 0;
-    var i: usize = 0;
-    for (i <= len) {
-        var is_sep: bool = false;
-        if (i == len)                           { is_sep = true; }
-        or (args[i] == '('::char)               { depth = depth + 1; }
-        or (args[i] == ')'::char)               { depth = depth - 1; }
-        or (args[i] == ','::char && depth == 0) { is_sep = true; }
-        if (is_sep) {
-            if (count >= 4) { ret false; }
-            var dst: *u8 = b0;
-            if (count == 1) { dst = b1; } or (count == 2) { dst = b2; } or (count == 3) { dst = b3; }
-            if (!rv_copy_region(args, start, i, dst, cap)) { ret false; }
-            count = count + 1;
-            start = i + 1;
-        }
-        i = i + 1;
-    }
-    @count_out = count;
-    ret true;
-}
-
-# parse exactly two register operands from `args` into `r0` / `r1`. used by the
-# two-register pseudo forms (mv / neg / not / seqz / snez / sext.w / negw)
-fun rv_two_reg_args(args: str, r0: *u32, r1: *u32) bool {
-    var b0: [64]u8; var b1: [64]u8; var b2: [64]u8; var b3: [64]u8;
-    var n: u32 = 0;
-    if (!rv_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 64, ?n)) { ret false; }
-    if (n != 2)                                                  { ret false; }
-    var a: RvAsmOp; var b: RvAsmOp;
-    if (!rv_parse_operand((?b0[0])::str, ?a) || a.kind != RVOP_REG) { ret false; }
-    if (!rv_parse_operand((?b1[0])::str, ?b) || b.kind != RVOP_REG) { ret false; }
-    @r0 = a.reg::u32; @r1 = b.reg::u32;
-    ret true;
-}
-
-# a three-register R-type form `rd, rs1, rs2`
-fun rv_three_reg(st: *encode.EncodeState, args: str, opcode: u32, funct3: u32, funct7: u32) R.Result[bool, str] {
-    var b0: [64]u8; var b1: [64]u8; var b2: [64]u8; var b3: [64]u8;
-    var n: u32 = 0;
-    if (!rv_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 64, ?n)) { ret R.err[bool, str]("encode: malformed inline-asm operands"); }
-    if (n != 3)                                                  { ret R.err[bool, str]("encode: inline-asm instruction expects rd, rs1, rs2"); }
-    var rd: RvAsmOp; var rs1: RvAsmOp; var rs2: RvAsmOp;
-    if (!rv_parse_operand((?b0[0])::str, ?rd) || rd.kind != RVOP_REG)   { ret R.err[bool, str]("encode: inline-asm destination must be a register"); }
-    if (!rv_parse_operand((?b1[0])::str, ?rs1) || rs1.kind != RVOP_REG) { ret R.err[bool, str]("encode: inline-asm source must be a register"); }
-    if (!rv_parse_operand((?b2[0])::str, ?rs2) || rs2.kind != RVOP_REG) { ret R.err[bool, str]("encode: inline-asm source must be a register"); }
-    emit_r(st, opcode, funct3, funct7, rd.reg::u32, rs1.reg::u32, rs2.reg::u32);
-    ret R.ok[bool, str](true);
-}
-
-# a register-immediate I-type ALU form `rd, rs1, imm` (the immediate within the 12-bit
-# signed reach)
-fun rv_imm_alu(st: *encode.EncodeState, args: str, opcode: u32, funct3: u32) R.Result[bool, str] {
-    var b0: [64]u8; var b1: [64]u8; var b2: [64]u8; var b3: [64]u8;
-    var n: u32 = 0;
-    if (!rv_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 64, ?n)) { ret R.err[bool, str]("encode: malformed inline-asm operands"); }
-    if (n != 3)                                                  { ret R.err[bool, str]("encode: inline-asm instruction expects rd, rs1, imm"); }
-    var rd: RvAsmOp; var rs1: RvAsmOp; var im: RvAsmOp;
-    if (!rv_parse_operand((?b0[0])::str, ?rd) || rd.kind != RVOP_REG)   { ret R.err[bool, str]("encode: inline-asm destination must be a register"); }
-    if (!rv_parse_operand((?b1[0])::str, ?rs1) || rs1.kind != RVOP_REG) { ret R.err[bool, str]("encode: inline-asm source must be a register"); }
-    if (!rv_parse_operand((?b2[0])::str, ?im) || im.kind != RVOP_IMM)   { ret R.err[bool, str]("encode: inline-asm operand must be an immediate"); }
-    if (im.imm < -2048 || im.imm > 2047)                               { ret R.err[bool, str]("encode: inline-asm immediate is out of the 12-bit signed range"); }
-    emit_i(st, opcode, funct3, rd.reg::u32, rs1.reg::u32, im.imm::u32 & 0xFFF);
-    ret R.ok[bool, str](true);
-}
-
-# an immediate shift I-type form `rd, rs1, shamt` (slli / srli / srai and their RV64
-# word twins). `word` selects the 5-bit word shift amount, else the 6-bit full-register
-# amount; `arith` folds the srai funct7 into imm[10]
-fun rv_shift_imm(st: *encode.EncodeState, args: str, opcode: u32, funct3: u32, arith: bool, word: bool) R.Result[bool, str] {
-    var b0: [64]u8; var b1: [64]u8; var b2: [64]u8; var b3: [64]u8;
-    var n: u32 = 0;
-    if (!rv_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 64, ?n)) { ret R.err[bool, str]("encode: malformed inline-asm operands"); }
-    if (n != 3)                                                  { ret R.err[bool, str]("encode: inline-asm shift expects rd, rs1, shamt"); }
-    var rd: RvAsmOp; var rs1: RvAsmOp; var sh: RvAsmOp;
-    if (!rv_parse_operand((?b0[0])::str, ?rd) || rd.kind != RVOP_REG)   { ret R.err[bool, str]("encode: inline-asm destination must be a register"); }
-    if (!rv_parse_operand((?b1[0])::str, ?rs1) || rs1.kind != RVOP_REG) { ret R.err[bool, str]("encode: inline-asm source must be a register"); }
-    if (!rv_parse_operand((?b2[0])::str, ?sh) || sh.kind != RVOP_IMM)   { ret R.err[bool, str]("encode: inline-asm shift amount must be an immediate"); }
-    var mask: u32 = 0x3F;
-    if (word) { mask = 0x1F; }
-    if (sh.imm < 0 || sh.imm::u32 > mask) { ret R.err[bool, str]("encode: inline-asm shift amount is out of range"); }
-    var imm: u32 = sh.imm::u32 & mask;
-    if (arith) { imm = imm | 0x400; }
-    emit_i(st, opcode, funct3, rd.reg::u32, rs1.reg::u32, imm);
-    ret R.ok[bool, str](true);
-}
-
-# a load I-type form `rd, off(base)` with the explicit (sign / zero) funct3 the
-# mnemonic names - not the width-driven zero-extending `load_funct3`, since inline asm
-# spells the exact load
-fun rv_load(st: *encode.EncodeState, args: str, funct3: u32) R.Result[bool, str] {
-    var b0: [64]u8; var b1: [64]u8; var b2: [64]u8; var b3: [64]u8;
-    var n: u32 = 0;
-    if (!rv_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 64, ?n)) { ret R.err[bool, str]("encode: malformed inline-asm load operands"); }
-    if (n != 2)                                                  { ret R.err[bool, str]("encode: inline-asm load expects rd, off(base)"); }
-    var rd: RvAsmOp; var mem: RvAsmOp;
-    if (!rv_parse_operand((?b0[0])::str, ?rd) || rd.kind != RVOP_REG)    { ret R.err[bool, str]("encode: inline-asm load destination must be a register"); }
-    if (!rv_parse_operand((?b1[0])::str, ?mem) || mem.kind != RVOP_MEM)  { ret R.err[bool, str]("encode: inline-asm load address must be off(base)"); }
-    if (mem.imm < -2048 || mem.imm > 2047)                              { ret R.err[bool, str]("encode: inline-asm load offset is out of the 12-bit signed range"); }
-    emit_i(st, OPC_LOAD, funct3, rd.reg::u32, mem.reg::u32, mem.imm::u32 & 0xFFF);
-    ret R.ok[bool, str](true);
-}
-
-# a store S-type form `rs2, off(base)`
-fun rv_store(st: *encode.EncodeState, args: str, funct3: u32) R.Result[bool, str] {
-    var b0: [64]u8; var b1: [64]u8; var b2: [64]u8; var b3: [64]u8;
-    var n: u32 = 0;
-    if (!rv_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 64, ?n)) { ret R.err[bool, str]("encode: malformed inline-asm store operands"); }
-    if (n != 2)                                                  { ret R.err[bool, str]("encode: inline-asm store expects rs, off(base)"); }
-    var rs: RvAsmOp; var mem: RvAsmOp;
-    if (!rv_parse_operand((?b0[0])::str, ?rs) || rs.kind != RVOP_REG)    { ret R.err[bool, str]("encode: inline-asm store value must be a register"); }
-    if (!rv_parse_operand((?b1[0])::str, ?mem) || mem.kind != RVOP_MEM)  { ret R.err[bool, str]("encode: inline-asm store address must be off(base)"); }
-    if (mem.imm < -2048 || mem.imm > 2047)                             { ret R.err[bool, str]("encode: inline-asm store offset is out of the 12-bit signed range"); }
-    emit_s(st, OPC_STORE, funct3, mem.reg::u32, rs.reg::u32, mem.imm::u32 & 0xFFF);
-    ret R.ok[bool, str](true);
-}
-
-# a U-type form `rd, imm20` (lui / auipc). the immediate is the raw 20-bit upper field
-fun rv_uimm(st: *encode.EncodeState, args: str, opcode: u32) R.Result[bool, str] {
-    var b0: [64]u8; var b1: [64]u8; var b2: [64]u8; var b3: [64]u8;
-    var n: u32 = 0;
-    if (!rv_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 64, ?n)) { ret R.err[bool, str]("encode: malformed inline-asm operands"); }
-    if (n != 2)                                                  { ret R.err[bool, str]("encode: inline-asm lui/auipc expects rd, imm"); }
-    var rd: RvAsmOp; var im: RvAsmOp;
-    if (!rv_parse_operand((?b0[0])::str, ?rd) || rd.kind != RVOP_REG) { ret R.err[bool, str]("encode: inline-asm destination must be a register"); }
-    if (!rv_parse_operand((?b1[0])::str, ?im) || im.kind != RVOP_IMM) { ret R.err[bool, str]("encode: inline-asm lui/auipc needs an immediate"); }
-    if (im.imm < 0 || im.imm > 0xFFFFF)                              { ret R.err[bool, str]("encode: inline-asm lui/auipc immediate is out of the 20-bit range"); }
-    emit_u(st, opcode, rd.reg::u32, im.imm::u32 & 0xFFFFF);
-    ret R.ok[bool, str](true);
-}
-
-# `li rd, imm` - materialize the signed immediate through the slice-2 `emit_li`
-fun rv_li(st: *encode.EncodeState, args: str) R.Result[bool, str] {
-    var b0: [64]u8; var b1: [64]u8; var b2: [64]u8; var b3: [64]u8;
-    var n: u32 = 0;
-    if (!rv_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 64, ?n)) { ret R.err[bool, str]("encode: malformed inline-asm 'li' operands"); }
-    if (n != 2)                                                  { ret R.err[bool, str]("encode: inline-asm 'li' expects rd, imm"); }
-    var rd: RvAsmOp; var im: RvAsmOp;
-    if (!rv_parse_operand((?b0[0])::str, ?rd) || rd.kind != RVOP_REG) { ret R.err[bool, str]("encode: inline-asm 'li' destination must be a register"); }
-    if (!rv_parse_operand((?b1[0])::str, ?im) || im.kind != RVOP_IMM) { ret R.err[bool, str]("encode: inline-asm 'li' needs an immediate"); }
-    emit_li(st, rd.reg::u32, im.imm);
-    ret R.ok[bool, str](true);
-}
-
-# `la rd, sym` - the pc-relative address-of `auipc rd, %pcrel_hi(sym)` (RK_PCREL_HI20)
-# ; `addi rd, rd, %pcrel_lo(sym)` (RK_PCREL_LO12_I) sequence with zero placeholders
-fun rv_la(st: *encode.EncodeState, args: str) R.Result[bool, str] {
-    var b0: [64]u8; var b1: [64]u8; var b2: [64]u8; var b3: [64]u8;
-    var n: u32 = 0;
-    if (!rv_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 64, ?n)) { ret R.err[bool, str]("encode: malformed inline-asm 'la' operands"); }
-    if (n != 2)                                                  { ret R.err[bool, str]("encode: inline-asm 'la' expects rd, sym"); }
-    var rd: RvAsmOp; var sym: RvAsmOp;
-    if (!rv_parse_operand((?b0[0])::str, ?rd) || rd.kind != RVOP_REG)   { ret R.err[bool, str]("encode: inline-asm 'la' destination must be a register"); }
-    if (!rv_parse_operand((?b1[0])::str, ?sym) || sym.kind != RVOP_SYM) { ret R.err[bool, str]("encode: inline-asm 'la' target must be a symbol"); }
-    val symr: R.Result[intern.StrId, str] = intern.intern_bytes(st.interner, sym.name, sym.name_len);
-    if (R.is_err[intern.StrId, str](symr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](symr)); }
-    val symid: intern.StrId = R.unwrap_ok[intern.StrId, str](symr);
-    val hr: R.Result[bool, str] = emit_pcrel_hi(st, rd.reg::u32, symid, 0);
-    if (R.is_err[bool, str](hr)) { ret hr; }
-    val lo_pos: u32 = st.buf.len::u32;
-    emit_i(st, OPC_OP_IMM, F3_ADD, rd.reg::u32, rd.reg::u32, 0);
-    note_sym_target(st, symid, isa.SYM_MOD_PCREL_LO);
-    ret encode.push_reloc(st, lo_pos, of.RK_PCREL_LO12_I, symid, 0);
-}
-
-# a direct call to a symbol - `auipc <link>, 0` ; `jalr <ret>, <link>, 0` with a zero
-# placeholder pair and an RK_PLT32 marker at the auipc (the abstract direct-call kind
-# the linker maps to R_RISCV_CALL_PLT). `call` links through ra; `tail` links through
-# t1 and returns nowhere (rd = x0), the standard tail-call form
-fun rv_call_sym(st: *encode.EncodeState, args: str, link: u32, ret_reg: u32) R.Result[bool, str] {
-    var op: RvAsmOp;
-    if (!rv_parse_operand(rv_trim(args), ?op) || op.kind != RVOP_SYM) {
-        ret R.err[bool, str]("encode: inline-asm call/tail target must be a symbol");
-    }
-    val symr: R.Result[intern.StrId, str] = intern.intern_bytes(st.interner, op.name, op.name_len);
-    if (R.is_err[intern.StrId, str](symr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](symr)); }
-    val symid: intern.StrId = R.unwrap_ok[intern.StrId, str](symr);
-    val pos: u32 = st.buf.len::u32;
-    emit_u(st, OPC_AUIPC, link, 0);
-    note_sym_target(st, symid, isa.SYM_MOD_PCREL_HI);
-    emit_i(st, OPC_JALR, F3_ADD, ret_reg, link, 0);
-    note_sym_target(st, symid, isa.SYM_MOD_PCREL_LO);
-    ret encode.push_reloc(st, pos, of.RK_PLT32, symid, 0);
-}
-
-# resolve a branch / jump target token to a numeric local label
-#
-# A symbol target is rejected loud - a riscv conditional branch reaches only +-4 KiB
-# and there is no in-block relocation kind for it, so branch to a numeric local label
-# instead (the AArch64 conditional-branch path makes the same restriction)
-# ---
-# target_tok: the target token as written
-# number:     out - the local label's number
-# fwd:        out - true for a forward reference (`Nf`)
-# ret:        true when the token names a local label, or an error
-fun rv_local_target(target_tok: str, number: *u64, fwd: *bool) R.Result[bool, str] {
-    if (rv_label_ref(rv_trim(target_tok), number, fwd)) { ret R.ok[bool, str](true); }
-    ret R.err[bool, str]("encode: inline-asm branch/jump target must be a numeric local label (Nf / Nb)");
-}
-
-# resolve the displacement of a branch just emitted against a numeric local label
-#
-# A backward reference patches immediately against the nearest preceding definition;
-# a forward reference is recorded and patched when its definition is reached. The
-# B-type / J-type displacement insert is the shared `patch_branch_riscv64` (it
-# dispatches on the placeholder word's opcode)
-# ---
-# st:        encoder driver state
-# labels:    the asm block's local-label scope
-# patch_pos: the emitted branch's `.text` offset
-# number:    the local label's number
-# fwd:       true for a forward reference
-# ret:       ok(true), or an error naming the unresolved reference
-fun rv_resolve_local(st: *encode.EncodeState, labels: *RvLabels, patch_pos: u32, number: u64, fwd: bool) R.Result[bool, str] {
-    if (fwd) { ret rv_label_push_ref(labels, patch_pos, number); }
-    val def: O.Option[u32] = rv_label_lookup(labels, number);
-    if (!O.is_some[u32](def)) {
-        ret R.err[bool, str]("encode: inline-asm backward reference to a local label has no preceding definition in this asm block");
-    }
-    var fx: encode.BranchFixup;
-    fx.patch_pos = patch_pos; fx.next_ip = 0; fx.target_block = 0; fx.fn_text_base = 0;
-    ret patch_branch_riscv64(st, ?fx, O.unwrap[u32](def));
-}
-
-# emit a B-type conditional branch to a numeric local label
-# ---
-# st:         encoder driver state
-# labels:     the asm block's local-label scope
-# funct3:     the relation field
-# rs1:        the first compared register
-# rs2:        the second compared register
-# target_tok: the target token as written
-# ret:        ok(true), or an error
-fun rv_branch_local(st: *encode.EncodeState, labels: *RvLabels, funct3: u32, rs1: u32, rs2: u32, target_tok: str) R.Result[bool, str] {
-    var number: u64 = 0;
-    var fwd:    bool = false;
-    val tr: R.Result[bool, str] = rv_local_target(target_tok, ?number, ?fwd);
-    if (R.is_err[bool, str](tr)) { ret tr; }
-    val patch_pos: u32 = st.buf.len::u32;
-    emit_b(st, OPC_BRANCH, funct3, rs1, rs2, 0);
-    note_local_target(st, number, fwd);
-    ret rv_resolve_local(st, labels, patch_pos, number, fwd);
-}
-
-# emit a J-type jump to a numeric local label
-# ---
-# st:         encoder driver state
-# labels:     the asm block's local-label scope
-# rd:         the link register field
-# target_tok: the target token as written
-# ret:        ok(true), or an error
-fun rv_jump_local(st: *encode.EncodeState, labels: *RvLabels, rd: u32, target_tok: str) R.Result[bool, str] {
-    var number: u64 = 0;
-    var fwd:    bool = false;
-    val tr: R.Result[bool, str] = rv_local_target(target_tok, ?number, ?fwd);
-    if (R.is_err[bool, str](tr)) { ret tr; }
-    val patch_pos: u32 = st.buf.len::u32;
-    emit_j(st, OPC_JAL, rd, 0);
-    note_local_target(st, number, fwd);
-    ret rv_resolve_local(st, labels, patch_pos, number, fwd);
-}
-
-# a two-register conditional branch `rs1, rs2, label`. `swap` exchanges the operands
-# for the reversed pseudo forms (bgt / ble / bgtu / bleu)
-fun rv_branch2(st: *encode.EncodeState, labels: *RvLabels, args: str, funct3: u32, swap: bool) R.Result[bool, str] {
-    var b0: [64]u8; var b1: [64]u8; var b2: [64]u8; var b3: [64]u8;
-    var n: u32 = 0;
-    if (!rv_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 64, ?n)) { ret R.err[bool, str]("encode: malformed inline-asm branch operands"); }
-    if (n != 3)                                                  { ret R.err[bool, str]("encode: inline-asm branch expects rs1, rs2, label"); }
-    var ra_: RvAsmOp; var rb: RvAsmOp;
-    if (!rv_parse_operand((?b0[0])::str, ?ra_) || ra_.kind != RVOP_REG) { ret R.err[bool, str]("encode: inline-asm branch operand must be a register"); }
-    if (!rv_parse_operand((?b1[0])::str, ?rb) || rb.kind != RVOP_REG)   { ret R.err[bool, str]("encode: inline-asm branch operand must be a register"); }
-    var rs1: u32 = ra_.reg::u32;
-    var rs2: u32 = rb.reg::u32;
-    if (swap) { val t: u32 = rs1; rs1 = rs2; rs2 = t; }
-    ret rv_branch_local(st, labels, funct3, rs1, rs2, (?b2[0])::str);
-}
-
-# a compare-against-zero pseudo branch `rs, label`. `reg_is_rs1` puts the register in
-# rs1 (x0 in rs2) for beqz / bnez / bgez / bltz, else in rs2 for blez / bgtz
-fun rv_branchz(st: *encode.EncodeState, labels: *RvLabels, args: str, funct3: u32, reg_is_rs1: bool) R.Result[bool, str] {
-    var b0: [64]u8; var b1: [64]u8; var b2: [64]u8; var b3: [64]u8;
-    var n: u32 = 0;
-    if (!rv_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 64, ?n)) { ret R.err[bool, str]("encode: malformed inline-asm branch operands"); }
-    if (n != 2)                                                  { ret R.err[bool, str]("encode: inline-asm branch expects rs, label"); }
-    var rs: RvAsmOp;
-    if (!rv_parse_operand((?b0[0])::str, ?rs) || rs.kind != RVOP_REG) { ret R.err[bool, str]("encode: inline-asm branch operand must be a register"); }
-    var rs1: u32 = RZERO;
-    var rs2: u32 = RZERO;
-    if (reg_is_rs1) { rs1 = rs.reg::u32; } or { rs2 = rs.reg::u32; }
-    ret rv_branch_local(st, labels, funct3, rs1, rs2, (?b1[0])::str);
-}
-
-# `j label` / `jal label` / `jal rd, label` - a J-type jump to a numeric local label,
-# linking through `rd` (x0 for `j`, ra for `jal label`, the named register otherwise)
-fun rv_jump(st: *encode.EncodeState, labels: *RvLabels, args: str, default_rd: u32) R.Result[bool, str] {
-    var b0: [64]u8; var b1: [64]u8; var b2: [64]u8; var b3: [64]u8;
-    var n: u32 = 0;
-    if (!rv_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 64, ?n)) { ret R.err[bool, str]("encode: malformed inline-asm jump operands"); }
-    if (n == 1) {
-        ret rv_jump_local(st, labels, default_rd, (?b0[0])::str);
-    }
-    if (n == 2) {
-        var rd: RvAsmOp;
-        if (!rv_parse_operand((?b0[0])::str, ?rd) || rd.kind != RVOP_REG) { ret R.err[bool, str]("encode: inline-asm 'jal' destination must be a register"); }
-        ret rv_jump_local(st, labels, rd.reg::u32, (?b1[0])::str);
-    }
-    ret R.err[bool, str]("encode: inline-asm jump expects label or rd, label");
-}
-
-# `jr rs` (jalr x0, rs, 0) or `jalr rs` (jalr ra, rs, 0) / `jalr rd, rs, imm`
-fun rv_jalr(st: *encode.EncodeState, args: str, default_rd: u32) R.Result[bool, str] {
-    var b0: [64]u8; var b1: [64]u8; var b2: [64]u8; var b3: [64]u8;
-    var n: u32 = 0;
-    if (!rv_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 64, ?n)) { ret R.err[bool, str]("encode: malformed inline-asm jalr operands"); }
-    if (n == 1) {
-        var rs: RvAsmOp;
-        if (!rv_parse_operand((?b0[0])::str, ?rs) || rs.kind != RVOP_REG) { ret R.err[bool, str]("encode: inline-asm jr/jalr operand must be a register"); }
-        emit_i(st, OPC_JALR, F3_ADD, default_rd, rs.reg::u32, 0);
-        ret R.ok[bool, str](true);
-    }
-    if (n == 3) {
-        var rd: RvAsmOp; var rs: RvAsmOp; var im: RvAsmOp;
-        if (!rv_parse_operand((?b0[0])::str, ?rd) || rd.kind != RVOP_REG)  { ret R.err[bool, str]("encode: inline-asm jalr destination must be a register"); }
-        if (!rv_parse_operand((?b1[0])::str, ?rs) || rs.kind != RVOP_REG)  { ret R.err[bool, str]("encode: inline-asm jalr base must be a register"); }
-        if (!rv_parse_operand((?b2[0])::str, ?im) || im.kind != RVOP_IMM)  { ret R.err[bool, str]("encode: inline-asm jalr needs an immediate"); }
-        if (im.imm < -2048 || im.imm > 2047)                             { ret R.err[bool, str]("encode: inline-asm jalr offset is out of the 12-bit signed range"); }
-        emit_i(st, OPC_JALR, F3_ADD, rd.reg::u32, rs.reg::u32, im.imm::u32 & 0xFFF);
-        ret R.ok[bool, str](true);
-    }
-    ret R.err[bool, str]("encode: inline-asm jalr expects rs or rd, rs, imm");
-}
-
-# strip a trailing RV64A ordering suffix (`.aqrl` / `.aq` / `.rl`) from atomic mnemonic
-# `mnem` of length `len`, returning the length without the suffix and setting the aq / rl
-# bits. an atomic with no ordering suffix leaves both clear
-fun rv_amo_ordering(mnem: str, len: usize, aq_out: *bool, rl_out: *bool) usize {
-    @aq_out = false; @rl_out = false;
-    if (len >= 5 && str_region_equals(mnem, len - 5, 5, ".aqrl")) { @aq_out = true; @rl_out = true; ret len - 5; }
-    if (len >= 3 && str_region_equals(mnem, len - 3, 3, ".aq"))   { @aq_out = true; ret len - 3; }
-    if (len >= 3 && str_region_equals(mnem, len - 3, 3, ".rl"))   { @rl_out = true; ret len - 3; }
-    ret len;
-}
-
-# map an atomic base name `mnem[0..len)` (the mnemonic with its width and ordering
-# suffixes already stripped) to its 5-bit funct5, setting `is_lr_out` for the two-operand
-# `lr` form. returns false when the base is not an RV64A atomic
-fun rv_amo_base(mnem: str, len: usize, funct5_out: *u32, is_lr_out: *bool) bool {
-    @is_lr_out = false;
-    if (str_region_equals(mnem, 0, len, "lr"))      { @funct5_out = A5_LR; @is_lr_out = true; ret true; }
-    if (str_region_equals(mnem, 0, len, "sc"))      { @funct5_out = A5_SC;      ret true; }
-    if (str_region_equals(mnem, 0, len, "amoswap")) { @funct5_out = A5_AMOSWAP; ret true; }
-    if (str_region_equals(mnem, 0, len, "amoadd"))  { @funct5_out = A5_AMOADD;  ret true; }
-    if (str_region_equals(mnem, 0, len, "amoand"))  { @funct5_out = A5_AMOAND;  ret true; }
-    if (str_region_equals(mnem, 0, len, "amoor"))   { @funct5_out = A5_AMOOR;   ret true; }
-    if (str_region_equals(mnem, 0, len, "amoxor"))  { @funct5_out = A5_AMOXOR;  ret true; }
-    if (str_region_equals(mnem, 0, len, "amomax"))  { @funct5_out = A5_AMOMAX;  ret true; }
-    if (str_region_equals(mnem, 0, len, "amomin"))  { @funct5_out = A5_AMOMIN;  ret true; }
-    if (str_region_equals(mnem, 0, len, "amomaxu")) { @funct5_out = A5_AMOMAXU; ret true; }
-    if (str_region_equals(mnem, 0, len, "amominu")) { @funct5_out = A5_AMOMINU; ret true; }
-    ret false;
-}
-
-# encode one RV64A atomic statement (the OPC_AMO major opcode, R-type with the aq / rl
-# ordering bits folded into funct7). `lr` is `rd, (rs1)` with rs2 forced to x0; `sc` and
-# the `amo*` read-modify-writes are `rd, rs2, (rs1)`. the address is the base-only
-# `(rs1)` form atomics require - a displacement is rejected, unlike a regular load /
-# store. `matched` is set only when `mnem` decodes to a real atomic, so an unrelated
-# mnemonic falls through to the dispatch's unsupported-mnemonic error
-fun rv_amo(st: *encode.EncodeState, mnem: str, args: str, matched: *bool) R.Result[bool, str] {
-    @matched = false;
-    val len: usize = str_len(mnem);
-    var aq: bool = false; var rl: bool = false;
-    val wlen: usize = rv_amo_ordering(mnem, len, ?aq, ?rl);
-    if (wlen < 4) { ret R.ok[bool, str](true); }
-    var funct3: u32 = 0;
-    if (str_region_equals(mnem, wlen - 2, 2, ".w")) { funct3 = F3_AMO_W; }
-    or (str_region_equals(mnem, wlen - 2, 2, ".d")) { funct3 = F3_AMO_D; }
-    or { ret R.ok[bool, str](true); }
-    var funct5: u32 = 0; var is_lr: bool = false;
-    if (!rv_amo_base(mnem, wlen - 2, ?funct5, ?is_lr)) { ret R.ok[bool, str](true); }
-    @matched = true;
-
-    var funct7: u32 = funct5 << 2;
-    if (aq) { funct7 = funct7 | 0x2; }
-    if (rl) { funct7 = funct7 | 0x1; }
-
-    var b0: [64]u8; var b1: [64]u8; var b2: [64]u8; var b3: [64]u8;
-    var n: u32 = 0;
-    if (!rv_split(args, ?b0[0], ?b1[0], ?b2[0], ?b3[0], 64, ?n)) { ret R.err[bool, str]("encode: malformed inline-asm atomic operands"); }
-
-    if (is_lr) {
-        if (n != 2)                                                         { ret R.err[bool, str]("encode: inline-asm 'lr' expects rd, (rs1)"); }
-        var rd: RvAsmOp; var mem: RvAsmOp;
-        if (!rv_parse_operand((?b0[0])::str, ?rd) || rd.kind != RVOP_REG)   { ret R.err[bool, str]("encode: inline-asm 'lr' destination must be a register"); }
-        if (!rv_parse_operand((?b1[0])::str, ?mem) || mem.kind != RVOP_MEM) { ret R.err[bool, str]("encode: inline-asm 'lr' address must be (rs1)"); }
-        if (mem.imm != 0)                                                   { ret R.err[bool, str]("encode: inline-asm atomic address takes no displacement"); }
-        emit_r(st, OPC_AMO, funct3, funct7, rd.reg::u32, mem.reg::u32, RZERO);
-        ret R.ok[bool, str](true);
-    }
-
-    if (n != 3)                                                        { ret R.err[bool, str]("encode: inline-asm atomic expects rd, rs2, (rs1)"); }
-    var rd: RvAsmOp; var rs2: RvAsmOp; var mem: RvAsmOp;
-    if (!rv_parse_operand((?b0[0])::str, ?rd) || rd.kind != RVOP_REG)   { ret R.err[bool, str]("encode: inline-asm atomic destination must be a register"); }
-    if (!rv_parse_operand((?b1[0])::str, ?rs2) || rs2.kind != RVOP_REG) { ret R.err[bool, str]("encode: inline-asm atomic source must be a register"); }
-    if (!rv_parse_operand((?b2[0])::str, ?mem) || mem.kind != RVOP_MEM) { ret R.err[bool, str]("encode: inline-asm atomic address must be (rs1)"); }
-    if (mem.imm != 0)                                                   { ret R.err[bool, str]("encode: inline-asm atomic address takes no displacement"); }
-    emit_r(st, OPC_AMO, funct3, funct7, rd.reg::u32, mem.reg::u32, rs2.reg::u32);
-    ret R.ok[bool, str](true);
-}
-
-# parse and encode one trimmed inline-asm statement. a numeric local-label definition
-# `<digits>:` records the current offset (resolving forward references) and re-dispatches
-# any instruction following it. an unrecognized mnemonic is a hard error so the
-# assembler is cleanly extensible
-fun encode_asm_stmt_riscv64(st: *encode.EncodeState, f: *mir.MirFunction, fn_base: u32, labels: *RvLabels, tok: str) R.Result[bool, str] {
-    var label_num: u64 = 0;
-    val dlen: usize = rv_label_def_len(tok, ?label_num);
-    if (dlen > 0) {
-        val dr: R.Result[bool, str] = rv_label_record_def(st, labels, label_num, st.buf.len::u32);
-        if (R.is_err[bool, str](dr)) { ret dr; }
-        val rest: str = rv_trim((tok::usize + dlen)::str);
-        if (rest[0] == 0) { ret R.ok[bool, str](true); }
-        ret encode_asm_stmt_riscv64(st, f, fn_base, labels, rest);
-    }
-
-    var mbuf: [24]u8;
-    var args: str;
-    if (!rv_first_token(tok, ?mbuf[0], 24, ?args)) { ret R.err[bool, str]("encode: inline-asm mnemonic too long"); }
-    val mnem: str = (?mbuf[0])::str;
-
-    # zero-operand forms.
-    if (str_equals(mnem, "ecall"))  { emit_i(st, OPC_SYSTEM, F3_ADD, RZERO, RZERO, 0); ret R.ok[bool, str](true); }
-    if (str_equals(mnem, "ebreak")) { emit_i(st, OPC_SYSTEM, F3_ADD, RZERO, RZERO, 1); ret R.ok[bool, str](true); }
-    if (str_equals(mnem, "nop"))    { emit_i(st, OPC_OP_IMM, F3_ADD, RZERO, RZERO, 0); ret R.ok[bool, str](true); }
-    if (str_equals(mnem, "ret"))    { emit_i(st, OPC_JALR, F3_ADD, RZERO, RRA, 0); ret R.ok[bool, str](true); }
-    if (str_equals(mnem, "fence"))  { emit_i(st, OPC_MISC_MEM, F3_ADD, RZERO, RZERO, 0xFF); ret R.ok[bool, str](true); }
-    if (str_equals(mnem, "pause"))  { emit_i(st, OPC_MISC_MEM, F3_ADD, RZERO, RZERO, 0x010); ret R.ok[bool, str](true); }
-
-    # register-register ALU (R-type).
-    if (str_equals(mnem, "add"))    { ret rv_three_reg(st, args, OPC_OP, F3_ADD, F7_ZERO); }
-    if (str_equals(mnem, "sub"))    { ret rv_three_reg(st, args, OPC_OP, F3_ADD, F7_SUB); }
-    if (str_equals(mnem, "and"))    { ret rv_three_reg(st, args, OPC_OP, F3_AND, F7_ZERO); }
-    if (str_equals(mnem, "or"))     { ret rv_three_reg(st, args, OPC_OP, F3_OR, F7_ZERO); }
-    if (str_equals(mnem, "xor"))    { ret rv_three_reg(st, args, OPC_OP, F3_XOR, F7_ZERO); }
-    if (str_equals(mnem, "sll"))    { ret rv_three_reg(st, args, OPC_OP, F3_SLL, F7_ZERO); }
-    if (str_equals(mnem, "srl"))    { ret rv_three_reg(st, args, OPC_OP, F3_SRL, F7_ZERO); }
-    if (str_equals(mnem, "sra"))    { ret rv_three_reg(st, args, OPC_OP, F3_SRL, F7_SUB); }
-    if (str_equals(mnem, "slt"))    { ret rv_three_reg(st, args, OPC_OP, F3_SLT, F7_ZERO); }
-    if (str_equals(mnem, "sltu"))   { ret rv_three_reg(st, args, OPC_OP, F3_SLTU, F7_ZERO); }
-    if (str_equals(mnem, "mul"))    { ret rv_three_reg(st, args, OPC_OP, F3_ADD, F7_MULDIV); }
-    if (str_equals(mnem, "mulh"))   { ret rv_three_reg(st, args, OPC_OP, F3_SLL, F7_MULDIV); }
-    if (str_equals(mnem, "mulhsu")) { ret rv_three_reg(st, args, OPC_OP, F3_SLT, F7_MULDIV); }
-    if (str_equals(mnem, "mulhu"))  { ret rv_three_reg(st, args, OPC_OP, F3_SLTU, F7_MULDIV); }
-    if (str_equals(mnem, "div"))    { ret rv_three_reg(st, args, OPC_OP, F3_DIV, F7_MULDIV); }
-    if (str_equals(mnem, "divu"))   { ret rv_three_reg(st, args, OPC_OP, F3_DIVU, F7_MULDIV); }
-    if (str_equals(mnem, "rem"))    { ret rv_three_reg(st, args, OPC_OP, F3_REM, F7_MULDIV); }
-    if (str_equals(mnem, "remu"))   { ret rv_three_reg(st, args, OPC_OP, F3_REMU, F7_MULDIV); }
-    if (str_equals(mnem, "addw"))   { ret rv_three_reg(st, args, OPC_OP_32, F3_ADD, F7_ZERO); }
-    if (str_equals(mnem, "subw"))   { ret rv_three_reg(st, args, OPC_OP_32, F3_ADD, F7_SUB); }
-    if (str_equals(mnem, "sllw"))   { ret rv_three_reg(st, args, OPC_OP_32, F3_SLL, F7_ZERO); }
-    if (str_equals(mnem, "srlw"))   { ret rv_three_reg(st, args, OPC_OP_32, F3_SRL, F7_ZERO); }
-    if (str_equals(mnem, "sraw"))   { ret rv_three_reg(st, args, OPC_OP_32, F3_SRL, F7_SUB); }
-    if (str_equals(mnem, "mulw"))   { ret rv_three_reg(st, args, OPC_OP_32, F3_ADD, F7_MULDIV); }
-    if (str_equals(mnem, "divw"))   { ret rv_three_reg(st, args, OPC_OP_32, F3_DIV, F7_MULDIV); }
-    if (str_equals(mnem, "divuw"))  { ret rv_three_reg(st, args, OPC_OP_32, F3_DIVU, F7_MULDIV); }
-    if (str_equals(mnem, "remw"))   { ret rv_three_reg(st, args, OPC_OP_32, F3_REM, F7_MULDIV); }
-    if (str_equals(mnem, "remuw"))  { ret rv_three_reg(st, args, OPC_OP_32, F3_REMU, F7_MULDIV); }
-
-    # register-immediate ALU (I-type).
-    if (str_equals(mnem, "addi"))  { ret rv_imm_alu(st, args, OPC_OP_IMM, F3_ADD); }
-    if (str_equals(mnem, "andi"))  { ret rv_imm_alu(st, args, OPC_OP_IMM, F3_AND); }
-    if (str_equals(mnem, "ori"))   { ret rv_imm_alu(st, args, OPC_OP_IMM, F3_OR); }
-    if (str_equals(mnem, "xori"))  { ret rv_imm_alu(st, args, OPC_OP_IMM, F3_XOR); }
-    if (str_equals(mnem, "slti"))  { ret rv_imm_alu(st, args, OPC_OP_IMM, F3_SLT); }
-    if (str_equals(mnem, "sltiu")) { ret rv_imm_alu(st, args, OPC_OP_IMM, F3_SLTU); }
-    if (str_equals(mnem, "addiw")) { ret rv_imm_alu(st, args, OPC_OP_IMM_32, F3_ADD); }
-
-    # immediate shifts (I-type, shamt).
-    if (str_equals(mnem, "slli"))  { ret rv_shift_imm(st, args, OPC_OP_IMM, F3_SLL, false, false); }
-    if (str_equals(mnem, "srli"))  { ret rv_shift_imm(st, args, OPC_OP_IMM, F3_SRL, false, false); }
-    if (str_equals(mnem, "srai"))  { ret rv_shift_imm(st, args, OPC_OP_IMM, F3_SRL, true, false); }
-    if (str_equals(mnem, "slliw")) { ret rv_shift_imm(st, args, OPC_OP_IMM_32, F3_SLL, false, true); }
-    if (str_equals(mnem, "srliw")) { ret rv_shift_imm(st, args, OPC_OP_IMM_32, F3_SRL, false, true); }
-    if (str_equals(mnem, "sraiw")) { ret rv_shift_imm(st, args, OPC_OP_IMM_32, F3_SRL, true, true); }
-
-    # loads (I-type) - the explicit signed / zero funct3 the mnemonic names.
-    if (str_equals(mnem, "lb"))  { ret rv_load(st, args, 0x0); }
-    if (str_equals(mnem, "lh"))  { ret rv_load(st, args, 0x1); }
-    if (str_equals(mnem, "lw"))  { ret rv_load(st, args, 0x2); }
-    if (str_equals(mnem, "ld"))  { ret rv_load(st, args, 0x3); }
-    if (str_equals(mnem, "lbu")) { ret rv_load(st, args, 0x4); }
-    if (str_equals(mnem, "lhu")) { ret rv_load(st, args, 0x5); }
-    if (str_equals(mnem, "lwu")) { ret rv_load(st, args, 0x6); }
-
-    # stores (S-type).
-    if (str_equals(mnem, "sb")) { ret rv_store(st, args, 0x0); }
-    if (str_equals(mnem, "sh")) { ret rv_store(st, args, 0x1); }
-    if (str_equals(mnem, "sw")) { ret rv_store(st, args, 0x2); }
-    if (str_equals(mnem, "sd")) { ret rv_store(st, args, 0x3); }
-
-    # upper-immediate (U-type).
-    if (str_equals(mnem, "lui"))   { ret rv_uimm(st, args, OPC_LUI); }
-    if (str_equals(mnem, "auipc")) { ret rv_uimm(st, args, OPC_AUIPC); }
-
-    # conditional branches (B-type) to a numeric local label.
-    if (str_equals(mnem, "beq"))  { ret rv_branch2(st, labels, args, F3_BEQ, false); }
-    if (str_equals(mnem, "bne"))  { ret rv_branch2(st, labels, args, F3_BNE, false); }
-    if (str_equals(mnem, "blt"))  { ret rv_branch2(st, labels, args, 0x4, false); }
-    if (str_equals(mnem, "bge"))  { ret rv_branch2(st, labels, args, 0x5, false); }
-    if (str_equals(mnem, "bltu")) { ret rv_branch2(st, labels, args, 0x6, false); }
-    if (str_equals(mnem, "bgeu")) { ret rv_branch2(st, labels, args, 0x7, false); }
-    # reversed two-register pseudo branches.
-    if (str_equals(mnem, "bgt"))  { ret rv_branch2(st, labels, args, 0x4, true); }
-    if (str_equals(mnem, "ble"))  { ret rv_branch2(st, labels, args, 0x5, true); }
-    if (str_equals(mnem, "bgtu")) { ret rv_branch2(st, labels, args, 0x6, true); }
-    if (str_equals(mnem, "bleu")) { ret rv_branch2(st, labels, args, 0x7, true); }
-    # compare-against-zero pseudo branches.
-    if (str_equals(mnem, "beqz")) { ret rv_branchz(st, labels, args, F3_BEQ, true); }
-    if (str_equals(mnem, "bnez")) { ret rv_branchz(st, labels, args, F3_BNE, true); }
-    if (str_equals(mnem, "bgez")) { ret rv_branchz(st, labels, args, 0x5, true); }
-    if (str_equals(mnem, "bltz")) { ret rv_branchz(st, labels, args, 0x4, true); }
-    if (str_equals(mnem, "blez")) { ret rv_branchz(st, labels, args, 0x5, false); }
-    if (str_equals(mnem, "bgtz")) { ret rv_branchz(st, labels, args, 0x4, false); }
-
-    # jumps and calls.
-    if (str_equals(mnem, "j"))    { ret rv_jump(st, labels, args, RZERO); }
-    if (str_equals(mnem, "jal"))  { ret rv_jump(st, labels, args, RRA); }
-    if (str_equals(mnem, "jr"))   { ret rv_jalr(st, args, RZERO); }
-    if (str_equals(mnem, "jalr")) { ret rv_jalr(st, args, RRA); }
-    if (str_equals(mnem, "call")) { ret rv_call_sym(st, args, RRA, RRA); }
-    if (str_equals(mnem, "tail")) { ret rv_call_sym(st, args, SCRATCH2, RZERO); }
-
-    # pseudo data-movement / unary forms.
-    if (str_equals(mnem, "li")) { ret rv_li(st, args); }
-    if (str_equals(mnem, "la")) { ret rv_la(st, args); }
-    if (str_equals(mnem, "mv")) {
-        var rd: u32 = 0; var rs: u32 = 0;
-        if (!rv_two_reg_args(args, ?rd, ?rs)) { ret R.err[bool, str]("encode: inline-asm 'mv' expects rd, rs"); }
-        emit_i(st, OPC_OP_IMM, F3_ADD, rd, rs, 0);
-        ret R.ok[bool, str](true);
-    }
-    if (str_equals(mnem, "neg")) {
-        var rd: u32 = 0; var rs: u32 = 0;
-        if (!rv_two_reg_args(args, ?rd, ?rs)) { ret R.err[bool, str]("encode: inline-asm 'neg' expects rd, rs"); }
-        emit_r(st, OPC_OP, F3_ADD, F7_SUB, rd, RZERO, rs);
-        ret R.ok[bool, str](true);
-    }
-    if (str_equals(mnem, "negw")) {
-        var rd: u32 = 0; var rs: u32 = 0;
-        if (!rv_two_reg_args(args, ?rd, ?rs)) { ret R.err[bool, str]("encode: inline-asm 'negw' expects rd, rs"); }
-        emit_r(st, OPC_OP_32, F3_ADD, F7_SUB, rd, RZERO, rs);
-        ret R.ok[bool, str](true);
-    }
-    if (str_equals(mnem, "not")) {
-        var rd: u32 = 0; var rs: u32 = 0;
-        if (!rv_two_reg_args(args, ?rd, ?rs)) { ret R.err[bool, str]("encode: inline-asm 'not' expects rd, rs"); }
-        emit_i(st, OPC_OP_IMM, F3_XOR, rd, rs, 0xFFF);
-        ret R.ok[bool, str](true);
-    }
-    if (str_equals(mnem, "seqz")) {
-        var rd: u32 = 0; var rs: u32 = 0;
-        if (!rv_two_reg_args(args, ?rd, ?rs)) { ret R.err[bool, str]("encode: inline-asm 'seqz' expects rd, rs"); }
-        emit_i(st, OPC_OP_IMM, F3_SLTU, rd, rs, 1);
-        ret R.ok[bool, str](true);
-    }
-    if (str_equals(mnem, "snez")) {
-        var rd: u32 = 0; var rs: u32 = 0;
-        if (!rv_two_reg_args(args, ?rd, ?rs)) { ret R.err[bool, str]("encode: inline-asm 'snez' expects rd, rs"); }
-        emit_r(st, OPC_OP, F3_SLTU, F7_ZERO, rd, RZERO, rs);
-        ret R.ok[bool, str](true);
-    }
-    if (str_equals(mnem, "sext.w")) {
-        var rd: u32 = 0; var rs: u32 = 0;
-        if (!rv_two_reg_args(args, ?rd, ?rs)) { ret R.err[bool, str]("encode: inline-asm 'sext.w' expects rd, rs"); }
-        emit_i(st, OPC_OP_IMM_32, F3_ADD, rd, rs, 0);
-        ret R.ok[bool, str](true);
-    }
-
-    # atomics (RV64A) - lr / sc / amo* with their width (.w/.d) and ordering
-    # (.aq/.rl/.aqrl) suffixes parsed inline; only a real atomic claims the dispatch.
-    var amo_matched: bool = false;
-    val amo_r: R.Result[bool, str] = rv_amo(st, mnem, args, ?amo_matched);
-    if (amo_matched) { ret amo_r; }
-
-    ret R.err[bool, str](rv_named_err(st, "encode: unsupported riscv64 inline-asm mnemonic '", mnem, "'", "encode: unsupported riscv64 inline-asm mnemonic"));
-}
-
-# append the base-10 digits of `n` (at least one digit for zero)
-fun rv_emit_dec(out: *encode.ByteBuf, n: u64) {
-    if (n == 0) { encode.emit_byte(out, '0'::u8); ret; }
-    var tmp: [20]u8;
-    var len: usize = 0;
-    var v: u64 = n;
-    for (v > 0) { tmp[len] = (v % 10)::u8 + '0'::u8; v = v / 10; len = len + 1; }
-    var k: usize = 0;
-    for (k < len) { encode.emit_byte(out, tmp[len - 1 - k]); k = k + 1; }
-}
-
-# append the `off(s0)` / `-off(s0)` text for a local's frame-slot displacement (the
-# RV64 analogue of x86-64's `[rbp+off]` and AArch64's `[x29, #off]`). a `{name}` local
-# resolves to this load / store address form against the frame pointer s0
-fun rv_emit_frame_ref(out: *encode.ByteBuf, off: i64) {
-    var mag: i64 = off;
-    if (off < 0) { encode.emit_byte(out, '-'::u8); mag = -off; }
-    rv_emit_dec(out, mag::u64);
-    encode.emit_byte(out, '('::u8);
-    encode.emit_byte(out, 's'::u8);
-    encode.emit_byte(out, '0'::u8);
-    encode.emit_byte(out, ')'::u8);
-}
-
-# true when the interned binding name equals `body[start..start+n)`
-fun rv_bind_name_eq(interner: *intern.Interner, name: intern.StrId, body: str, start: usize, name_len: usize) bool {
-    val nopt: O.Option[str] = intern.lookup(interner, name);
-    if (!O.is_some[str](nopt)) { ret false; }
-    ret str_region_equals(body, start, name_len, O.unwrap[str](nopt));
-}
-
-# release a byte buffer's backing storage on an error path
-fun rv_free_buf(b: *encode.ByteBuf) {
-    if (b.data != nil && b.cap > 0) {
-        A.deallocate[u8](b.alloc, b.data, b.cap);
-        b.data = nil; b.cap = 0; b.len = 0;
-    }
-}
-
-# produce a NUL-terminated copy of the asm body with each `{name}` replaced by its
-# local's `off(s0)` frame-slot text. the offset comes from the slot-vreg binding
-# resolved against the laid-out frame. an unbound `{name}` is a hard error. mirrors
-# x86-64's `substitute_asm_locals`
-fun substitute_asm_locals_riscv64(alloc: *A.Allocator, interner: *intern.Interner, f: *mir.MirFunction, pl: *mir.MirAsm) R.Result[str, str] {
-    var out: encode.ByteBuf = encode.buf_init(alloc);
-    val body: str = pl.body;
-    var i: usize = 0;
-    for (body[i] != 0) {
-        if (body[i] != '{'::char) {
-            encode.emit_byte(?out, body[i]::u8);
-            i = i + 1;
-            cnt;
-        }
-        val name_start: usize = i + 1;
-        var j: usize = name_start;
-        for (body[j] != 0 && body[j] != '}'::char) { j = j + 1; }
-        if (body[j] == 0) {
-            rv_free_buf(?out);
-            ret R.err[str, str]("encode: unterminated '{' in inline asm body");
-        }
-        val name_len: usize = j - name_start;
-
-        var off: i64 = 0;
-        var found: bool = false;
-        var b: u32 = 0;
-        for (b < pl.bind_count) {
-            if (rv_bind_name_eq(interner, pl.binds[b].name, body, name_start, name_len)) {
-                val so: O.Option[i64] = frame_slot_offset(f, pl.binds[b].slot_vreg);
-                if (!O.is_some[i64](so)) {
-                    rv_free_buf(?out);
-                    ret R.err[str, str]("encode: inline-asm '{name}' local has no frame slot");
-                }
-                off = O.unwrap[i64](so);
-                found = true;
-                b = pl.bind_count;
-            } or {
-                b = b + 1;
-            }
-        }
-        if (!found) {
-            rv_free_buf(?out);
-            ret R.err[str, str]("encode: unknown local in inline asm '{name}' reference");
-        }
-
-        rv_emit_frame_ref(?out, off);
-        i = j + 1;
-    }
-    encode.emit_byte(?out, 0);
-
-    if (out.data == nil || out.len == 0) {
-        rv_free_buf(?out);
-        val r: R.Result[*u8, str] = A.allocate[u8](alloc, 1::usize);
-        if (R.is_err[*u8, str](r)) { ret R.err[str, str](R.unwrap_err[*u8, str](r)); }
-        val one: *u8 = R.unwrap_ok[*u8, str](r);
-        one[0] = 0;
-        ret R.ok[str, str](one::str);
-    }
-    if (out.cap != out.len) {
-        val r: R.Result[*u8, str] = A.reallocate[u8](alloc, out.data, out.cap, out.len);
-        if (R.is_err[*u8, str](r)) { ret R.err[str, str](R.unwrap_err[*u8, str](r)); }
-        out.data = R.unwrap_ok[*u8, str](r);
-        out.cap  = out.len;
-    }
-    ret R.ok[str, str](out.data::str);
-}
-
-# tokenize the (already `{name}`-substituted) asm body on newlines / `;`, trim each
-# statement, and encode it. `#` line comments were stripped at lower time, so none reach
-# here. mirrors x86-64's `encode_asm_text`
-fun encode_asm_text_riscv64(st: *encode.EncodeState, f: *mir.MirFunction, fn_base: u32, labels: *RvLabels, text: str) R.Result[bool, str] {
-    val len: usize = str_len(text);
-    var start: usize = 0;
-    for (start < len) {
-        var end: usize = start;
-        for (end < len && text[end] != '\n'::char && text[end] != ';'::char) { end = end + 1; }
-
-        var lo: usize = start;
-        for (lo < end && asm_is_space(text[lo])) { lo = lo + 1; }
-        var hi: usize = end;
-        for (hi > lo && asm_is_space(text[hi - 1])) { hi = hi - 1; }
-
-        if (hi > lo) {
-            var line: [512]u8;
-            val ll: usize = hi - lo;
-            if (ll >= 512) { ret R.err[bool, str]("encode: inline asm statement too long"); }
-            var c: usize = 0;
-            for (c < ll) { line[c] = text[lo + c]::u8; c = c + 1; }
-            line[ll] = 0;
-            val er: R.Result[bool, str] = encode_asm_stmt_riscv64(st, f, fn_base, labels, (?line[0])::str);
-            if (R.is_err[bool, str](er)) { ret er; }
-        }
-        start = end + 1;
-    }
-    ret R.ok[bool, str](true);
-}
-
-# expand an inline-asm MIR_ASM instruction into RV64 bytes. substitutes `{name}`
-# locals to `off(s0)`, encodes each statement, and verifies every forward local-label
-# reference was defined within the block. the RV64 analogue of x86-64's
-# `encode_asm_block`; a rejection is located at the asm statement's "path:line:col"
-# through the instruction's stamped loc (#2153)
+# The riscv64 instantiation of the shared block driver: it supplies the grammar and
+# the driver does the rest, so `{name}` resolution, numeric local labels, byte
+# accounting and the located diagnostic are the same code every target runs.
 fun encode_asm_block_riscv64(st: *encode.EncodeState, f: *mir.MirFunction, fn_base: u32, mi: *mir.MirInstr) R.Result[bool, str] {
-    if (mi.asm_block == nil) { ret R.err[bool, str]("encode: MIR_ASM has no payload"); }
-    val pl: *mir.MirAsm = mi.asm_block;
-    if (!str_equals(pl.isa, "riscv64")) {
-        ret R.err[bool, str](encode.asm_located_message(st, mi.loc, "encode: inline-asm block is not riscv64"));
-    }
-
-    val sr: R.Result[str, str] = substitute_asm_locals_riscv64(st.alloc, st.interner, f, pl);
-    if (R.is_err[str, str](sr)) {
-        ret R.err[bool, str](encode.asm_located_message(st, mi.loc, R.unwrap_err[str, str](sr)));
-    }
-    val text: str = R.unwrap_ok[str, str](sr);
-
-    var labels: RvLabels;
-    rv_labels_init(?labels, st.alloc);
-    val er: R.Result[bool, str] = encode_asm_text_riscv64(st, f, fn_base, ?labels, text);
-    A.deallocate[u8](st.alloc, text::*u8, (str_len(text) + 1)::usize);
-    if (R.is_err[bool, str](er)) {
-        rv_labels_dnit(?labels);
-        ret R.err[bool, str](encode.asm_located_message(st, mi.loc, R.unwrap_err[bool, str](er)));
-    }
-    if (labels.ref_count > 0) {
-        rv_labels_dnit(?labels);
-        ret R.err[bool, str](encode.asm_located_message(st, mi.loc, "encode: inline-asm forward reference to a local label has no definition in this asm block"));
-    }
-    rv_labels_dnit(?labels);
-    ret R.ok[bool, str](true);
+    var g: iasm.Grammar = rv_grammar();
+    ret iasm.encode_block(st, ?g, f, mi);
 }
+
+# assemble `text` as an inline-asm body into `st`, with no `{name}` bindings
+#
+# The encoder tests' entry point: it drives the same cursor and the same driver the
+# block path does, so a byte-exact golden is a fact about the shipping parser rather
+# than about a test-only path beside it.
+fun rv_asm_text(st: *encode.EncodeState, f: *mir.MirFunction, l: *iasm.Labels, text: str) R.Result[bool, str] {
+    var g: iasm.Grammar = rv_grammar();
+    var c: iasm.Cursor;
+    iasm.cursor_init(?c, ?g, text, st.alloc, st.interner, f, nil);
+    ret iasm.run(st, ?g, ?c, l);
+}
+
 
 # a fresh page-backed EncodeState carrying only a byte sink, for exercising the
 # emit-level helpers (packers / prologue / epilogue / branch patch) directly
@@ -5299,18 +4976,18 @@ test "mach.lang.target.isa.riscv64.encode:global_la_sequences" {
     ret bad;
 }
 
-# the inline-asm clobber analyzer classifies the RISC-V statement grammar: a call
+# the inline-asm effect model classifies the RISC-V statement grammar: a call
 # clobbers the caller-saved file, destination-writing forms their first register, the
-# store / branch / system / fence forms nothing, and an unrecognized statement
-# conservatively clobbers everything
+# store / branch / system / fence forms nothing, and a body the assembler could not
+# read conservatively clobbers everything
 test "mach.lang.target.isa.riscv64.encode:asm_clobbers_classification" {
     var bad: i32 = 0;
     var gp: u32 = 0;
     var fp: u32 = 0;
 
-    # a load + store + jal call body: ld writes a0(10), addi writes a1(11), the call
-    # clobbers the caller-saved file; sd writes nothing.
-    asm_clobbers("ld a0, 0(sp)\naddi a1, sp, 8\nsd a0, 0(a1)\njal main", ?gp, ?fp);
+    # a load + store + linking jump body: ld writes a0(10), addi writes a1(11), the
+    # linking jump destroys the caller-saved file; sd writes nothing.
+    asm_clobbers("ld a0, 0(sp)\naddi a1, sp, 8\nsd a0, 0(a1)\ncall main", ?gp, ?fp);
     if ((gp & (1::u32 << 10)) == 0) { bad = 1; }  # a0 written by ld
     if ((gp & (1::u32 << 11)) == 0) { bad = 1; }  # a1 written by addi
     if ((gp & CALLER_SAVED_GP) != CALLER_SAVED_GP) { bad = 1; }  # call clobbers caller-saved
@@ -5318,14 +4995,28 @@ test "mach.lang.target.isa.riscv64.encode:asm_clobbers_classification" {
 
     # a pure store / branch / ecall body writes no register.
     gp = 0; fp = 0;
-    asm_clobbers("sd a0, 0(sp)\nbeq a0, a1, end\necall", ?gp, ?fp);
+    asm_clobbers("sd a0, 0(sp)\nbeq a0, a1, 1f\necall\n1:", ?gp, ?fp);
     if (gp != 0) { bad = 1; }
 
-    # a label prefix is skipped; the following addi still writes its destination.
+    # a `{name}` binding is a stack slot, so it names no register; the destination
+    # register beside it is still credited even before the frame is laid out.
     gp = 0; fp = 0;
-    asm_clobbers("loop: addi t0, t0, 1", ?gp, ?fp);
+    asm_clobbers("ld a0, {v}\nsd a1, {out}", ?gp, ?fp);
+    if (gp != (1::u32 << 10)) { bad = 1; }
+
+    # a numeric local-label definition is its own statement; the instruction sharing
+    # its line still writes its destination.
+    gp = 0; fp = 0;
+    asm_clobbers("1: addi t0, t0, 1", ?gp, ?fp);
     if ((gp & (1::u32 << 5)) == 0) { bad = 1; }  # t0 = x5
     if ((gp & ~(1::u32 << 5)) != 0) { bad = 1; } # nothing else
+
+    # the effect model and the assembler read one grammar: a branch to a symbol is
+    # not encodable on riscv64, so it is not modeled either - the body is opaque
+    # rather than described as writing nothing.
+    gp = 0; fp = 0;
+    asm_clobbers("beq a0, a1, end", ?gp, ?fp);
+    if (gp != 0xFFFFFFFF) { bad = 1; }
 
     # the RV64A atomics write their rd operand (the leftmost register); pause writes
     # nothing. lr / sc / amo* must classify precisely, not fall to the all-clobber path.
@@ -5379,39 +5070,39 @@ test "mach.lang.target.isa.riscv64.encode:inline_asm_core_forms" {
     var alloc: A.Allocator;
     var interner: intern.Interner;
     tasm(?st, ?alloc, ?interner);
-    var labels: RvLabels;
-    rv_labels_init(?labels, ?alloc);
+    var labels: iasm.Labels;
+    iasm.labels_init(?labels, ?alloc);
     var f: mir.MirFunction;
 
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "ecall");           # 0
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "ebreak");          # 4
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "nop");             # 8
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "ret");             # 12
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "fence");           # 16
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "li a7, 93");       # 20
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "li a0, 0");        # 24
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "mv a0, a1");       # 28
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "add a0, a1, a2");  # 32
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "sub a0, a1, a2");  # 36
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "addi a0, a1, 5");  # 40
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "ld a0, 8(sp)");    # 44
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "sd a0, 16(sp)");   # 48
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "lw a0, 0(a1)");    # 52
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "lbu a0, 0(a1)");   # 56
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "sb a0, 0(a1)");    # 60
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "lui a0, 0x12345"); # 64
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "auipc a0, 0");     # 68
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "slli a0, a1, 3");  # 72
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "srai a0, a1, 3");  # 76
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "addiw a0, a1, 1"); # 80
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "neg a0, a1");      # 84
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "not a0, a1");      # 88
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "sext.w a0, a1");   # 92
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "seqz a0, a1");     # 96
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "snez a0, a1");     # 100
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "mul a0, a1, a2");  # 104
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "divu a0, a1, a2"); # 108
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "addw a0, a1, a2"); # 112
+    rv_asm_text(?st, ?f, ?labels, "ecall");           # 0
+    rv_asm_text(?st, ?f, ?labels, "ebreak");          # 4
+    rv_asm_text(?st, ?f, ?labels, "nop");             # 8
+    rv_asm_text(?st, ?f, ?labels, "ret");             # 12
+    rv_asm_text(?st, ?f, ?labels, "fence");           # 16
+    rv_asm_text(?st, ?f, ?labels, "li a7, 93");       # 20
+    rv_asm_text(?st, ?f, ?labels, "li a0, 0");        # 24
+    rv_asm_text(?st, ?f, ?labels, "mv a0, a1");       # 28
+    rv_asm_text(?st, ?f, ?labels, "add a0, a1, a2");  # 32
+    rv_asm_text(?st, ?f, ?labels, "sub a0, a1, a2");  # 36
+    rv_asm_text(?st, ?f, ?labels, "addi a0, a1, 5");  # 40
+    rv_asm_text(?st, ?f, ?labels, "ld a0, 8(sp)");    # 44
+    rv_asm_text(?st, ?f, ?labels, "sd a0, 16(sp)");   # 48
+    rv_asm_text(?st, ?f, ?labels, "lw a0, 0(a1)");    # 52
+    rv_asm_text(?st, ?f, ?labels, "lbu a0, 0(a1)");   # 56
+    rv_asm_text(?st, ?f, ?labels, "sb a0, 0(a1)");    # 60
+    rv_asm_text(?st, ?f, ?labels, "lui a0, 0x12345"); # 64
+    rv_asm_text(?st, ?f, ?labels, "auipc a0, 0");     # 68
+    rv_asm_text(?st, ?f, ?labels, "slli a0, a1, 3");  # 72
+    rv_asm_text(?st, ?f, ?labels, "srai a0, a1, 3");  # 76
+    rv_asm_text(?st, ?f, ?labels, "addiw a0, a1, 1"); # 80
+    rv_asm_text(?st, ?f, ?labels, "neg a0, a1");      # 84
+    rv_asm_text(?st, ?f, ?labels, "not a0, a1");      # 88
+    rv_asm_text(?st, ?f, ?labels, "sext.w a0, a1");   # 92
+    rv_asm_text(?st, ?f, ?labels, "seqz a0, a1");     # 96
+    rv_asm_text(?st, ?f, ?labels, "snez a0, a1");     # 100
+    rv_asm_text(?st, ?f, ?labels, "mul a0, a1, a2");  # 104
+    rv_asm_text(?st, ?f, ?labels, "divu a0, a1, a2"); # 108
+    rv_asm_text(?st, ?f, ?labels, "addw a0, a1, a2"); # 112
 
     if (read_word(?st.buf, 0)   != 0x00000073) { bad = 1; }
     if (read_word(?st.buf, 4)   != 0x00100073) { bad = 1; }
@@ -5443,7 +5134,7 @@ test "mach.lang.target.isa.riscv64.encode:inline_asm_core_forms" {
     if (read_word(?st.buf, 108) != 0x02C5D533) { bad = 1; }
     if (read_word(?st.buf, 112) != 0x00C5853B) { bad = 1; }
 
-    rv_labels_dnit(?labels);
+    iasm.labels_dnit(?labels);
     encode.buf_dnit(?st.buf);
     ret bad;
 }
@@ -5458,8 +5149,8 @@ test "mach.lang.target.isa.riscv64.encode:inline_asm_local_labels" {
     var alloc: A.Allocator;
     var interner: intern.Interner;
     tasm(?st, ?alloc, ?interner);
-    var labels: RvLabels;
-    rv_labels_init(?labels, ?alloc);
+    var labels: iasm.Labels;
+    iasm.labels_init(?labels, ?alloc);
     var f: mir.MirFunction;
 
     # 1: addi a0, a0, 1   (label def at 0, addi at 0)
@@ -5467,13 +5158,13 @@ test "mach.lang.target.isa.riscv64.encode:inline_asm_local_labels" {
     # j 2f                (offset 8, forward to 16 -> disp +8)
     # nop                 (offset 12)
     # 2: ret              (label def at 16, ret at 16)
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "1:");
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "addi a0, a0, 1");
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "bne a0, a1, 1b");
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "j 2f");
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "nop");
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "2:");
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "ret");
+    rv_asm_text(?st, ?f, ?labels, "1:");
+    rv_asm_text(?st, ?f, ?labels, "addi a0, a0, 1");
+    rv_asm_text(?st, ?f, ?labels, "bne a0, a1, 1b");
+    rv_asm_text(?st, ?f, ?labels, "j 2f");
+    rv_asm_text(?st, ?f, ?labels, "nop");
+    rv_asm_text(?st, ?f, ?labels, "2:");
+    rv_asm_text(?st, ?f, ?labels, "ret");
 
     # addi a0, a0, 1 = 0x00150513
     if (read_word(?st.buf, 0)  != 0x00150513) { bad = 1; }
@@ -5486,9 +5177,9 @@ test "mach.lang.target.isa.riscv64.encode:inline_asm_local_labels" {
     # ret = 0x00008067
     if (read_word(?st.buf, 16) != 0x00008067) { bad = 1; }
     # every forward reference resolved.
-    if (labels.ref_count != 0) { bad = 1; }
+    if (labels.fixup_count != 0) { bad = 1; }
 
-    rv_labels_dnit(?labels);
+    iasm.labels_dnit(?labels);
     encode.buf_dnit(?st.buf);
     ret bad;
 }
@@ -5502,12 +5193,12 @@ test "mach.lang.target.isa.riscv64.encode:inline_asm_symbol_relocs" {
     var alloc: A.Allocator;
     var interner: intern.Interner;
     tasm(?st, ?alloc, ?interner);
-    var labels: RvLabels;
-    rv_labels_init(?labels, ?alloc);
+    var labels: iasm.Labels;
+    iasm.labels_init(?labels, ?alloc);
     var f: mir.MirFunction;
 
     # call foo: auipc ra,0 = 0x00000097 ; jalr ra,ra,0 = 0x000080E7, RK_PLT32 @0.
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "call foo");
+    rv_asm_text(?st, ?f, ?labels, "call foo");
     if (read_word(?st.buf, 0) != 0x00000097) { bad = 1; }
     if (read_word(?st.buf, 4) != 0x000080E7) { bad = 1; }
     if (st.reloc_count != 1) { bad = 1; }
@@ -5517,7 +5208,7 @@ test "mach.lang.target.isa.riscv64.encode:inline_asm_symbol_relocs" {
     }
 
     # tail foo: auipc t1,0 = 0x00000317 ; jalr x0,t1,0 = 0x00030067, RK_PLT32 @8.
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "tail foo");
+    rv_asm_text(?st, ?f, ?labels, "tail foo");
     if (read_word(?st.buf, 8)  != 0x00000317) { bad = 1; }
     if (read_word(?st.buf, 12) != 0x00030067) { bad = 1; }
     if (st.reloc_count != 2) { bad = 1; }
@@ -5527,7 +5218,7 @@ test "mach.lang.target.isa.riscv64.encode:inline_asm_symbol_relocs" {
     }
 
     # la a0, foo: auipc a0,0 = 0x00000517 ; addi a0,a0,0 = 0x00050513, HI20 @16 + LO12_I @20.
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "la a0, foo");
+    rv_asm_text(?st, ?f, ?labels, "la a0, foo");
     if (read_word(?st.buf, 16) != 0x00000517) { bad = 1; }
     if (read_word(?st.buf, 20) != 0x00050513) { bad = 1; }
     if (st.reloc_count != 4) { bad = 1; }
@@ -5539,11 +5230,11 @@ test "mach.lang.target.isa.riscv64.encode:inline_asm_symbol_relocs" {
     }
 
     # an unknown mnemonic is a hard error, not silent bytes.
-    val ur: R.Result[bool, str] = encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "frobnicate a0, a1");
+    val ur: R.Result[bool, str] = rv_asm_text(?st, ?f, ?labels, "frobnicate a0, a1");
     if (!R.is_err[bool, str](ur)) { bad = 1; }
-    or { if (!str_contains(R.unwrap_err[bool, str](ur), "unsupported riscv64 inline-asm mnemonic")) { bad = 1; } }
+    or { if (!str_contains(R.unwrap_err[bool, str](ur), "unknown riscv64 inline-asm instruction")) { bad = 1; } }
 
-    rv_labels_dnit(?labels);
+    iasm.labels_dnit(?labels);
     encode.buf_dnit(?st.buf);
     ret bad;
 }
@@ -5558,46 +5249,46 @@ test "mach.lang.target.isa.riscv64.encode:inline_asm_atomics" {
     var alloc: A.Allocator;
     var interner: intern.Interner;
     tasm(?st, ?alloc, ?interner);
-    var labels: RvLabels;
-    rv_labels_init(?labels, ?alloc);
+    var labels: iasm.Labels;
+    iasm.labels_init(?labels, ?alloc);
     var f: mir.MirFunction;
 
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "lr.w a0, (a1)");           # 0
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "lr.d a0, (a1)");           # 4
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "sc.w a0, a2, (a1)");       # 8
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "sc.d a0, a2, (a1)");       # 12
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoswap.w a0, a2, (a1)");  # 16
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoswap.d a0, a2, (a1)");  # 20
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoadd.w a0, a2, (a1)");   # 24
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoadd.d a0, a2, (a1)");   # 28
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoand.w a0, a2, (a1)");   # 32
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoand.d a0, a2, (a1)");   # 36
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoor.w a0, a2, (a1)");    # 40
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoor.d a0, a2, (a1)");    # 44
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoxor.w a0, a2, (a1)");   # 48
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoxor.d a0, a2, (a1)");   # 52
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amomax.w a0, a2, (a1)");   # 56
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amomax.d a0, a2, (a1)");   # 60
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amomin.w a0, a2, (a1)");   # 64
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amomin.d a0, a2, (a1)");   # 68
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amomaxu.w a0, a2, (a1)");  # 72
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amomaxu.d a0, a2, (a1)");  # 76
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amominu.w a0, a2, (a1)");  # 80
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amominu.d a0, a2, (a1)");  # 84
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "lr.w.aq a0, (a1)");        # 88
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "lr.d.aq a0, (a1)");        # 92
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "lr.w.aqrl a0, (a1)");      # 96
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "sc.w.rl a0, a2, (a1)");    # 100
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "sc.d.rl a0, a2, (a1)");    # 104
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "sc.d.aqrl a0, a2, (a1)");  # 108
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoswap.w.aq a0, a2, (a1)");  # 112
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoswap.d.rl a0, a2, (a1)");  # 116
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoadd.w.aqrl a0, a2, (a1)"); # 120
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoadd.d.aq a0, a2, (a1)");   # 124
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoadd.d.rl a0, a2, (a1)");   # 128
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amoadd.d.aqrl a0, a2, (a1)"); # 132
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amomaxu.d.aqrl a0, a2, (a1)");# 136
-    encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "pause");                   # 140
+    rv_asm_text(?st, ?f, ?labels, "lr.w a0, (a1)");           # 0
+    rv_asm_text(?st, ?f, ?labels, "lr.d a0, (a1)");           # 4
+    rv_asm_text(?st, ?f, ?labels, "sc.w a0, a2, (a1)");       # 8
+    rv_asm_text(?st, ?f, ?labels, "sc.d a0, a2, (a1)");       # 12
+    rv_asm_text(?st, ?f, ?labels, "amoswap.w a0, a2, (a1)");  # 16
+    rv_asm_text(?st, ?f, ?labels, "amoswap.d a0, a2, (a1)");  # 20
+    rv_asm_text(?st, ?f, ?labels, "amoadd.w a0, a2, (a1)");   # 24
+    rv_asm_text(?st, ?f, ?labels, "amoadd.d a0, a2, (a1)");   # 28
+    rv_asm_text(?st, ?f, ?labels, "amoand.w a0, a2, (a1)");   # 32
+    rv_asm_text(?st, ?f, ?labels, "amoand.d a0, a2, (a1)");   # 36
+    rv_asm_text(?st, ?f, ?labels, "amoor.w a0, a2, (a1)");    # 40
+    rv_asm_text(?st, ?f, ?labels, "amoor.d a0, a2, (a1)");    # 44
+    rv_asm_text(?st, ?f, ?labels, "amoxor.w a0, a2, (a1)");   # 48
+    rv_asm_text(?st, ?f, ?labels, "amoxor.d a0, a2, (a1)");   # 52
+    rv_asm_text(?st, ?f, ?labels, "amomax.w a0, a2, (a1)");   # 56
+    rv_asm_text(?st, ?f, ?labels, "amomax.d a0, a2, (a1)");   # 60
+    rv_asm_text(?st, ?f, ?labels, "amomin.w a0, a2, (a1)");   # 64
+    rv_asm_text(?st, ?f, ?labels, "amomin.d a0, a2, (a1)");   # 68
+    rv_asm_text(?st, ?f, ?labels, "amomaxu.w a0, a2, (a1)");  # 72
+    rv_asm_text(?st, ?f, ?labels, "amomaxu.d a0, a2, (a1)");  # 76
+    rv_asm_text(?st, ?f, ?labels, "amominu.w a0, a2, (a1)");  # 80
+    rv_asm_text(?st, ?f, ?labels, "amominu.d a0, a2, (a1)");  # 84
+    rv_asm_text(?st, ?f, ?labels, "lr.w.aq a0, (a1)");        # 88
+    rv_asm_text(?st, ?f, ?labels, "lr.d.aq a0, (a1)");        # 92
+    rv_asm_text(?st, ?f, ?labels, "lr.w.aqrl a0, (a1)");      # 96
+    rv_asm_text(?st, ?f, ?labels, "sc.w.rl a0, a2, (a1)");    # 100
+    rv_asm_text(?st, ?f, ?labels, "sc.d.rl a0, a2, (a1)");    # 104
+    rv_asm_text(?st, ?f, ?labels, "sc.d.aqrl a0, a2, (a1)");  # 108
+    rv_asm_text(?st, ?f, ?labels, "amoswap.w.aq a0, a2, (a1)");  # 112
+    rv_asm_text(?st, ?f, ?labels, "amoswap.d.rl a0, a2, (a1)");  # 116
+    rv_asm_text(?st, ?f, ?labels, "amoadd.w.aqrl a0, a2, (a1)"); # 120
+    rv_asm_text(?st, ?f, ?labels, "amoadd.d.aq a0, a2, (a1)");   # 124
+    rv_asm_text(?st, ?f, ?labels, "amoadd.d.rl a0, a2, (a1)");   # 128
+    rv_asm_text(?st, ?f, ?labels, "amoadd.d.aqrl a0, a2, (a1)"); # 132
+    rv_asm_text(?st, ?f, ?labels, "amomaxu.d.aqrl a0, a2, (a1)");# 136
+    rv_asm_text(?st, ?f, ?labels, "pause");                   # 140
 
     if (read_word(?st.buf, 0)   != 0x1005A52F) { bad = 1; }
     if (read_word(?st.buf, 4)   != 0x1005B52F) { bad = 1; }
@@ -5637,18 +5328,137 @@ test "mach.lang.target.isa.riscv64.encode:inline_asm_atomics" {
     if (read_word(?st.buf, 140) != 0x0100000F) { bad = 1; }
 
     # an atomic address takes no displacement, unlike a regular load / store.
-    val dr: R.Result[bool, str] = encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "lr.d a0, 8(a1)");
+    val dr: R.Result[bool, str] = rv_asm_text(?st, ?f, ?labels, "lr.d a0, 8(a1)");
     if (!R.is_err[bool, str](dr)) { bad = 1; }
     or { if (!str_contains(R.unwrap_err[bool, str](dr), "no displacement")) { bad = 1; } }
 
     # a non-atomic mnemonic that shares the `amo` prefix is still unsupported, not
     # silently swallowed by the atomic dispatch.
-    val ur: R.Result[bool, str] = encode_asm_stmt_riscv64(?st, ?f, 0, ?labels, "amobogus.q a0, a2, (a1)");
+    val ur: R.Result[bool, str] = rv_asm_text(?st, ?f, ?labels, "amobogus.q a0, a2, (a1)");
     if (!R.is_err[bool, str](ur)) { bad = 1; }
-    or { if (!str_contains(R.unwrap_err[bool, str](ur), "unsupported riscv64 inline-asm mnemonic")) { bad = 1; } }
+    or { if (!str_contains(R.unwrap_err[bool, str](ur), "unknown riscv64 inline-asm instruction")) { bad = 1; } }
 
-    rv_labels_dnit(?labels);
+    iasm.labels_dnit(?labels);
     encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# the instruction a mnemonic row names must survive a round trip through the
+# encoding: `rv_fields` recovers the format fields from the instruction, and the
+# encoder's own `classify_*` names the instruction back from those same fields. This
+# is the conformance check that keeps the assembler and the printer from drifting -
+# an instruction they disagree about fails here rather than in an object file
+test "mach.lang.target.isa.riscv64.encode:asm_fields_classify_round_trip" {
+    var bad: i32 = 0;
+    var i: usize = 0;
+    for (i < RV_MNEMONIC_COUNT) {
+        val op: inst.MachOp = RV_MNEMONICS[i].code::inst.MachOp;
+        var fmt: u8 = 0;
+        var opcode: u32 = 0;
+        var f3: u32 = 0;
+        var f7: u32 = 0;
+        if (!rv_fields(op, ?fmt, ?opcode, ?f3, ?f7)) { bad = 1; }
+        or {
+            # the immediate the classifier reads to separate forms sharing a funct3.
+            var imm: u32 = 0;
+            if (op == inst.SRAI || op == inst.SRAIW) { imm = 0x400; }
+            or (op == inst.EBREAK)                   { imm = 1; }
+            or (op == inst.PAUSE)                    { imm = 0x010; }
+            or (op == inst.FENCE)                    { imm = 0xFF; }
+
+            var back: inst.MachOp = inst.MOP_NONE;
+            if (fmt == RVFMT_R)      { back = classify_r(opcode, f3, f7, 0); }
+            or (fmt == RVFMT_I)      { back = classify_i(opcode, f3, imm); }
+            or (fmt == RVFMT_S)      { back = classify_s(opcode, f3); }
+            or (fmt == RVFMT_B)      { back = classify_b(opcode, f3); }
+            or (fmt == RVFMT_U)      { back = classify_u(opcode); }
+            or                       { back = classify_j(opcode); }
+            if (back != op) { bad = 1; }
+        }
+        i = i + 1;
+    }
+
+    # every A-extension form the suffix decoder can synthesize, across both widths.
+    var op2: inst.MachOp = inst.LR_W;
+    for (op2 <= inst.AMOMAXU_D) {
+        var fmt: u8 = 0;
+        var opcode: u32 = 0;
+        var f3: u32 = 0;
+        var f7: u32 = 0;
+        if (!rv_fields(op2, ?fmt, ?opcode, ?f3, ?f7)) { bad = 1; }
+        or { if (classify_r(opcode, f3, f7 | 0x3, 0) != op2) { bad = 1; } }
+        op2 = op2 + 1;
+    }
+    ret bad;
+}
+
+# the parse accounts for every byte of a statement or refuses it: an operand the
+# grammar does not reach cannot be silently dropped, and the diagnostic names the
+# statement rather than the file
+test "mach.lang.target.isa.riscv64.encode:asm_byte_accounting" {
+    var bad: i32 = 0;
+    var gp: u32 = 0;
+    var fp: u32 = 0;
+
+    # `fence` takes no operands here, so a fence with an ordering set is refused
+    # rather than assembled as a bare full barrier with the operands ignored.
+    asm_clobbers("fence rw, rw", ?gp, ?fp);
+    if (gp != 0xFFFFFFFF) { bad = 1; }
+
+    # a trailing token no operand claims fails the accounting.
+    gp = 0; fp = 0;
+    asm_clobbers("addi a0, a1, 1 junk", ?gp, ?fp);
+    if (gp != 0xFFFFFFFF) { bad = 1; }
+
+    # a well-formed statement claims all of itself, separators and whitespace aside.
+    gp = 0; fp = 0;
+    asm_clobbers("  addi a0 , a1 , 1  ;  mv a2, a3  ", ?gp, ?fp);
+    if (gp != ((1::u32 << 10) | (1::u32 << 12))) { bad = 1; }
+    ret bad;
+}
+
+# a relocation modifier is read back into the shared `isa.SymModifier` the encoder's
+# own notifications carry, so the two halves of a pc-relative symbol pair round-trip
+# between the printer and the parser. `%got_pcrel_hi` parses but has no riscv64
+# relocation kind in this backend, and is refused by name rather than encoded as a
+# plain pc-relative reference
+test "mach.lang.target.isa.riscv64.encode:asm_relocation_modifiers" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: iasm.Labels;
+    iasm.labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+
+    # auipc a0, %pcrel_hi(foo) = 0x00000517 with RK_PCREL_HI20 at 0;
+    # addi a0, a0, %pcrel_lo(foo) = 0x00050513 with RK_PCREL_LO12_I at 4.
+    val hr: R.Result[bool, str] = rv_asm_text(?st, ?f, ?labels, "auipc a0, %pcrel_hi(foo)");
+    if (R.is_err[bool, str](hr)) { bad = 1; }
+    val lr: R.Result[bool, str] = rv_asm_text(?st, ?f, ?labels, "addi a0, a0, %pcrel_lo(foo)");
+    if (R.is_err[bool, str](lr)) { bad = 1; }
+    if (read_word(?st.buf, 0) != 0x00000517) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x00050513) { bad = 1; }
+    if (st.reloc_count != 2) { bad = 1; }
+    or {
+        if (st.relocs[0].kind != of.RK_PCREL_HI20)   { bad = 1; }
+        if (st.relocs[1].kind != of.RK_PCREL_LO12_I) { bad = 1; }
+    }
+
+    val gr: R.Result[bool, str] = rv_asm_text(?st, ?f, ?labels, "auipc a0, %got_pcrel_hi(foo)");
+    if (!R.is_err[bool, str](gr)) { bad = 1; }
+    or { if (!str_contains(R.unwrap_err[bool, str](gr), "no GOT-relative relocation kind")) { bad = 1; } }
+
+    val br: R.Result[bool, str] = rv_asm_text(?st, ?f, ?labels, "auipc a0, %bogus(foo)");
+    if (!R.is_err[bool, str](br)) { bad = 1; }
+    or { if (!str_contains(R.unwrap_err[bool, str](br), "unsupported riscv64 inline-asm relocation modifier")) { bad = 1; } }
+
+    iasm.labels_dnit(?labels);
+    encode.buf_dnit(?st.buf);
+    if (st.relocs != nil && st.reloc_cap > 0) {
+        A.deallocate[encode.PendingReloc](?alloc, st.relocs, st.reloc_cap::usize);
+    }
     ret bad;
 }
 
