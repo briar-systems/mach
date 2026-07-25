@@ -25,6 +25,11 @@
 #                 image and `-g` is loadable-byte additive (PT_LOAD segments identical).
 #                 the one producer that needs external validators (llvm-dwarfdump,
 #                 readelf); it runs only on the ELF debug-info legs, which install them.
+#   vector-emit — disassemble the case's own objects and report, per function,
+#                 whether the compiler EMITTED packed SIMD (#2207). the observable
+#                 execution cannot produce: a vectorizer that silently stops firing
+#                 still computes the right answer, so a run-and-compare case stays
+#                 green while the feature is dead. needs llvm-objdump.
 #
 # build-fails is a run-mode but not a producer: it asserts the compile is REJECTED
 # and takes the compiler's 'error:' diagnostic as the observable. it is handled in
@@ -254,6 +259,144 @@ produce_debuginfo() {
     fi
 }
 
+# resolve_objdump — print an llvm-objdump on PATH, preferring the unversioned name
+# and falling back to the highest-versioned one (ubuntu ships llvm-objdump-NN, from
+# the same `llvm` package as llvm-dwarfdump). llvm-objdump decodes every ISA mach
+# targets regardless of the runner's own, which GNU objdump does not. empty output
+# (return 1) when none is installed.
+resolve_objdump() {
+    if command -v llvm-objdump >/dev/null 2>&1; then echo llvm-objdump; return 0; fi
+    newest=$(compgen -c 'llvm-objdump-' 2>/dev/null | sort -t- -k3 -n | tail -1)
+    [ -n "$newest" ] && { echo "$newest"; return 0; }
+    return 1
+}
+
+# produce_vector_emit <runmode> <target> <binary>
+# the auto-vectorizer's EMISSION observable (#2207): for each function of the case's
+# own module, whether the emitted machine code contains packed SIMD instructions.
+#
+# a vectorize case that only runs the program and compares against a `#[scalar]`
+# reference is vacuously green when the pass declines — both sides are scalar and
+# agree — so this is the only assertion that can see the pass stop firing, or start
+# firing on a shape it must refuse. it disassembles the OBJECTS rather than the
+# linked binary: mach's linker emits no symbol table, so per-function attribution
+# exists only before the link. the objects sit beside the artifact because the case
+# pins `out = "out/int/build"` in its own manifest; the project id (the directory
+# under obj/ holding the case's modules, as opposed to its dependencies') is read
+# from that same manifest rather than assumed.
+#
+# the per-function verdict, not the instruction count, is the observable: the count
+# moves with every unrelated backend change, while `simd` / `scalar` moves only when
+# the vectorizer's own decision does.
+produce_vector_emit() {
+    bin=$3
+    dir=$(dirname "$(dirname "$(dirname "$bin")")")
+    id=$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/mach.toml" | head -1)
+    if [ -z "$id" ]; then
+        echo "int: vector-emit: no project id in ${dir}/mach.toml" >&2; return 2
+    fi
+    objdir="$dir/out/int/build/obj/$id"
+    if [ ! -d "$objdir" ]; then
+        echo "int: vector-emit: no objects at $objdir (the case must pin out = \"out/int/build\")" >&2; return 2
+    fi
+    tool=$(resolve_objdump) || {
+        echo "int: vector-emit: llvm-objdump not found (install the 'llvm' package)" >&2; return 2
+    }
+    find "$objdir" -name '*.o' | sort | while IFS= read -r o; do
+        "$tool" -d --no-show-raw-insn "$o"
+    done | vector_emit_scan
+}
+
+# vector_emit_scan — read a disassembly on stdin, print `<function> simd|scalar`
+# sorted by function, preceded by the ISA the dispatch resolved.
+#
+# packed-SIMD recognition is per ISA and deliberately narrow, so a scalar function
+# can never read as vectorized:
+#   x86_64  — the packed SSE opcodes, plus MOVUPS / MOVAPS / MOVDQU / MOVDQA, which
+#             the backend emits only for a 128-bit value. the scalar `*ss` / `*sd`
+#             forms and the bank-crossing MOVD / MOVQ are excluded, as is XORPS,
+#             which zeroes an XMM for scalar float negation, and PXOR, which clears
+#             one.
+#   aarch64 — any operand naming a NEON register: a `vN.<arrangement>` or a 128-bit
+#             `qN`. scalar float uses `sN` / `dN` and never matches.
+#   riscv64 — any RVV mnemonic (`v...`); no scalar riscv64 mnemonic starts with `v`.
+#             riscv64 has no 128-bit vector model, so every verdict there is scalar.
+# a case whose source writes SIMD types directly would defeat this (its packed ops
+# are not the vectorizer's); the vectorize cases use scalar element types only.
+vector_emit_scan() {
+    awk '
+    function demangle(s,   i, len, c, out) {
+        if (substr(s, 1, 2) != "_M") { return s }
+        i = 3
+        out = ""
+        while (i <= length(s)) {
+            c = substr(s, i, 1)
+            if (c == "N") { i++; continue }
+            if (c !~ /[0-9]/) { return s }
+            len = 0
+            while (i <= length(s) && substr(s, i, 1) ~ /[0-9]/) { len = len * 10 + substr(s, i, 1); i++ }
+            out = substr(s, i, len)
+            i += len
+        }
+        if (out == "") { return s }
+        return out
+    }
+    function packed(m, rest) {
+        if (isa == "x86_64") {
+            if (m ~ /^(movup[sd]|movap[sd]|movdq[au])$/) { return 1 }
+            if (m ~ /^(add|sub|mul|div|min|max|sqrt|rcp|rsqrt|hadd|hsub|unpckh|unpckl|shuf|cmp[a-z]*)p[sd]$/) { return 1 }
+            if (m ~ /^p(add|sub|and|andn|or|cmp|mul|mull|mulh|madd|min|max|avg|abs|sign|sll|srl|sra|shuf|unpck|ack)[a-z0-9]*$/) { return 1 }
+            return 0
+        }
+        if (isa == "aarch64") {
+            if (rest ~ /(^|[ ,[])v[0-9]+\.[0-9]+[bhsd]/) { return 1 }
+            if (rest ~ /(^|[ ,[])q[0-9]+([ ,\]]|$)/)     { return 1 }
+            return 0
+        }
+        if (isa == "riscv64") { return m ~ /^v[a-z]/ }
+        return 0
+    }
+    /file format/ {
+        if      ($0 ~ /x86-64/)   { isa = "x86_64" }
+        else if ($0 ~ /aarch64/)  { isa = "aarch64" }
+        else if ($0 ~ /riscv/)    { isa = "riscv64" }
+        else                      { bad = $0 }
+        next
+    }
+    /^[0-9a-f]+ <.*>:$/ {
+        sym = $0
+        sub(/^[0-9a-f]+ </, "", sym)
+        sub(/>:$/, "", sym)
+        sym = demangle(sym)
+        if (!(sym in count)) { names[++n] = sym; count[sym] = 0 }
+        cur = sym
+        next
+    }
+    cur != "" && /^[[:space:]]*[0-9a-f]+:/ {
+        line = $0
+        sub(/^[[:space:]]*[0-9a-f]+:[[:space:]]*/, "", line)
+        split(line, f, /[[:space:]]+/)
+        rest = line
+        sub(/^[^[:space:]]+[[:space:]]*/, "", rest)
+        if (packed(f[1], rest)) { count[cur]++ }
+    }
+    END {
+        if (bad != "") { print "int: vector-emit: unrecognized object format (" bad ")" > "/dev/stderr"; exit 2 }
+        # insertion-sort the names so the observable does not depend on emission order
+        for (i = 2; i <= n; i++) {
+            k = names[i]
+            j = i - 1
+            while (j >= 1 && names[j] > k) { names[j + 1] = names[j]; j-- }
+            names[j + 1] = k
+        }
+        print "arch=" isa
+        for (i = 1; i <= n; i++) {
+            print names[i] " " (count[names[i]] > 0 ? "simd" : "scalar")
+        }
+    }
+    '
+}
+
 # produce <run> <runmode> <target> <binary> [<g_binary>]
 # dispatches to the producer named by <run>, forwarding the remaining arguments. the
 # debuginfo producer takes an extra `-g` artifact path run.sh built alongside the
@@ -269,6 +412,7 @@ produce() {
         flat-loader) produce_flat_loader "$@" ;;
         built)       produce_built "$@" ;;
         debuginfo)   produce_debuginfo "$@" ;;
+        vector-emit) produce_vector_emit "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
 }
