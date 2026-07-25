@@ -11,6 +11,12 @@
 # iterated frontier of each alloca's defining blocks, then rename in
 # dominator-tree order with a per-alloca value stack. Aliasing is intentionally
 # trivial -- only allocas whose address never escapes are touched.
+#
+# The pass promotes a slot into SSA *values*, and an aggregate has no SSA value
+# form in this IR: it flows by address. So an aggregate slot is promotable only in
+# the degenerate case where nothing reads it, where promotion means deleting memory
+# traffic no one can observe rather than producing a value, and it takes no phi
+# (#2246).
 
 use std.allocator.page;
 use std.collections.map;
@@ -32,6 +38,7 @@ use mach.lang.me.ir.instruction;
 use mach.lang.me.ir.mutate;
 use mach.lang.me.ir.type;
 use mach.lang.me.ir.value;
+use mach.lang.me.ir.verify;
 use mach.lang.source;
 use semtype: mach.lang.type;
 
@@ -258,13 +265,16 @@ fun phi_table_init(st: *State) R.Result[bool, str] {
 }
 
 # classify promotable allocas: an OP_ALLOCA whose result Value is referenced
-# only as the pointer operand of an OP_LOAD or OP_STORE
+# only as the pointer operand of an OP_LOAD or OP_STORE, and whose slot type is
+# either a scalar or an aggregate nothing reads
 #
 # Any other reference (the stored value of a store, a gep base, a call argument,
 # ...) means the address escaped and the alloca stays in memory. Each accepted
 # alloca's value (slot) type is recorded in the parallel alloca_ty array, derived
 # from its first (lowest-id) load/store -- the alloca's own result type is always
-# the IR pointer type.
+# the IR pointer type. An aggregate slot that is read back is rejected as well
+# (#2246): an aggregate has no SSA value form here, so there is nothing to
+# substitute a load of one with (see compact_promotable).
 #
 # Block lists are the liveness source of truth (mirroring dce): the per-
 # instruction instr_block map is filled from them first, and every sweep skips
@@ -332,19 +342,29 @@ fun collect_promotable(st: *State) R.Result[bool, str] {
     val res_escaped: R.Result[*bool, str] = A.allocate[bool](st.alloc, cand_n::usize);
     if (R.is_err[*bool, str](res_escaped)) { ret R.err[bool, str](R.unwrap_err[*bool, str](res_escaped)); }
     val escaped: *bool = R.unwrap_ok[*bool, str](res_escaped);
-    var e: u32 = 0;
-    for (e < cand_n) { escaped[e] = false; e = e + 1; }
 
-    classify_escapes(st, escaped);
-    compact_promotable(st, escaped);
+    val res_loaded: R.Result[*bool, str] = A.allocate[bool](st.alloc, cand_n::usize);
+    if (R.is_err[*bool, str](res_loaded)) {
+        A.deallocate[bool](st.alloc, escaped, cand_n::usize);
+        ret R.err[bool, str](R.unwrap_err[*bool, str](res_loaded));
+    }
+    val loaded: *bool = R.unwrap_ok[*bool, str](res_loaded);
+
+    var e: u32 = 0;
+    for (e < cand_n) { escaped[e] = false; loaded[e] = false; e = e + 1; }
+
+    classify_escapes(st, escaped, loaded);
+    compact_promotable(st, escaped, loaded);
     A.deallocate[bool](st.alloc, escaped, cand_n::usize);
+    A.deallocate[bool](st.alloc, loaded, cand_n::usize);
     if (st.alloca_count == 0) { ret R.ok[bool, str](true); }
 
     ret collect_store_blocks(st);
 }
 
 # one classification sweep over the live instructions: record each candidate's
-# slot type from its first load/store and mark every escape
+# slot type from its first load/store, mark every escape, and note which
+# candidates are read back
 #
 # An escape is any reference outside load-slot-0 / store-slot-1, or an inline-asm
 # {name} binding -- an asm-referenced alloca is addressed as [rbp + offset] at
@@ -352,7 +372,8 @@ fun collect_promotable(st: *State) R.Result[bool, str] {
 # ---
 # st:      state with the candidate set already gathered
 # escaped: per-candidate escape flags, written true where the address escapes
-fun classify_escapes(st: *State, escaped: *bool) {
+# loaded:  per-candidate read flags, written true where a load reads the slot
+fun classify_escapes(st: *State, escaped: *bool, loaded: *bool) {
     val fn: *ir.Function = st.fn;
     var c: u32 = 0;
     for (c < st.pool_len) {
@@ -378,6 +399,7 @@ fun classify_escapes(st: *State, escaped: *bool) {
                             if (ok_load == false && ok_store == false) {
                                 escaped[ai] = true;
                             } or {
+                                if (ok_load) { loaded[ai] = true; }
                                 if (st.alloca_ty[ai] == type.IRT_NIL) {
                                     if (ok_load) { st.alloca_ty[ai] = inst.ty; }
                                     or           { st.alloca_ty[ai] = inst.operands[0].ty; }
@@ -393,18 +415,27 @@ fun classify_escapes(st: *State, escaped: *bool) {
     }
 }
 
-# compact the escaped candidates out (keeping pool-id order) and retag the
+# compact the rejected candidates out (keeping pool-id order) and retag the
 # alloca_of map with the surviving indices
+#
+# A candidate is rejected when its address escapes, or when it is an aggregate slot
+# that is read back (#2246): an aggregate has no SSA value form in this IR - it flows
+# by address - so substituting a load of one with the value a store placed in the slot
+# would alias the source's storage instead of copying it. An aggregate slot that is
+# never read is still promotable, in the degenerate sense of deleting memory traffic
+# no one can observe; insert_phis places no phi for it.
 # ---
 # st:      state whose alloca_ids / alloca_ty / alloca_of are rewritten in place
 # escaped: per-candidate escape flags from classify_escapes
-fun compact_promotable(st: *State, escaped: *bool) {
+# loaded:  per-candidate read flags from classify_escapes
+fun compact_promotable(st: *State, escaped: *bool, loaded: *bool) {
     val cand_n: u32 = st.alloca_count;
     var w: u32 = 0;
     var r: u32 = 0;
     for (r < cand_n) {
         val aid: id.InstructionId = st.alloca_ids[r];
-        if (escaped[r] == false) {
+        val agg_read: bool = loaded[r] && type.is_aggregate(?st.m.types, st.alloca_ty[r]);
+        if (escaped[r] == false && agg_read == false) {
             st.alloca_ids[w]       = aid;
             st.alloca_ty[w]        = st.alloca_ty[r];
             st.alloca_of[aid::u32] = w;
@@ -885,6 +916,14 @@ fun frontier_add(st: *State, node: u32, target: id.BlockId) {
 # blocks themselves rejoin the worklist (iterated frontier). Each inserted phi
 # records the alloca it stands for in phi_alloca so rename can wire its incoming
 # values.
+#
+# An aggregate slot is skipped (#2246). A phi exists to merge a slot's value for a
+# later read, and an aggregate slot only survives collect_promotable when nothing
+# reads it, so every phi placed for one would be dead on arrival - and would be
+# stamped with the aggregate type, whose only legal operand form is an address.
+# On a path with no prior store rename has no address to offer and substitutes
+# `const_null`, which the aggregate-representation invariant (VC_AGG_ADDRESS)
+# forbids and the back end would read as a null pointer.
 # ---
 # st:  state with store blocks and dominance frontiers ready
 # ret: ok(true) once every phi is placed, or the first error encountered
@@ -914,6 +953,7 @@ fun insert_phis(st: *State) R.Result[bool, str] {
     var a: u32 = 0;
     for (a < st.alloca_count && err_msg == nil) {
         val alloca_id: id.InstructionId = st.alloca_ids[a];
+        if (type.is_aggregate(?st.m.types, st.alloca_ty[a])) { a = a + 1; cnt; }
         var i: u32 = 0;
         for (i < n) { has_phi[i] = false; on_work[i] = false; i = i + 1; }
 
@@ -1802,5 +1842,153 @@ test "mach.lang.me.pass.mem2reg.run:phi_dbg_birth" {
         i = i + 1;
     }
     if (!found) { ret 1; }
+    ret 0;
+}
+
+# count the VC_AGG_ADDRESS violations the representation checks report for `m`
+# (test helper)
+# ---
+# m:   the module to verify
+# ret: the number of aggregate-representation violations, or -1 on an allocation error
+fun agg_address_violations(m: *ir.Module) i64 {
+    val res_rep: R.Result[verify.VerifyReport, str] = verify.verify_module_ext(m, m.alloc, false, true);
+    if (R.is_err[verify.VerifyReport, str](res_rep)) { ret -1; }
+    var rep: verify.VerifyReport = R.unwrap_ok[verify.VerifyReport, str](res_rep);
+    var n: i64 = 0;
+    var i: u32 = 0;
+    for (i < rep.len) {
+        if (rep.violations[i].check == verify.VC_AGG_ADDRESS) { n = n + 1; }
+        i = i + 1;
+    }
+    verify.dnit_report(?rep);
+    ret n;
+}
+
+# #2246: an aggregate slot copied into on one arm of a diamond, never read. mem2reg
+# used to promote it, place a phi of aggregate type at the merge, and - on the arm
+# with no prior store - hand that phi a `value.const_null`, which the aggregate
+# representation invariant forbids (an aggregate operand must name storage by
+# address) and the back end would read as a null pointer. The slot is still promoted
+# (nothing reads it, so its alloca and stores are dead memory traffic), but no phi is
+# placed, so no undefined incoming can arise. Reverting either half of the fix - the
+# aggregate skip in insert_phis, or the read-back rejection in compact_promotable -
+# leaves a phi in the merge block and a VC_AGG_ADDRESS violation here.
+test "mach.lang.me.pass.mem2reg.run:aggregate_slot_takes_no_phi" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_module: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_module)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_module);
+
+    val res_i64: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64)) { ret 1; }
+    var i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
+
+    # a two-i64 struct: an aggregate, so it flows by address.
+    var fields: [2]type.IrTypeId;
+    fields[0] = i64t;
+    fields[1] = i64t;
+    val res_st: R.Result[type.IrTypeId, str] = type.intern_struct(?m.types, ?fields[0], 2, 0);
+    if (R.is_err[type.IrTypeId, str](res_st)) { ret 1; }
+    val stty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_st);
+
+    val res_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](res_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val rb0: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    val rb1: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    val rb2: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    val rb3: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rb0) || R.is_err[id.BlockId, str](rb1)) { ret 1; }
+    if (R.is_err[id.BlockId, str](rb2) || R.is_err[id.BlockId, str](rb3)) { ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](rb0);
+    val arm:   id.BlockId = R.unwrap_ok[id.BlockId, str](rb1);
+    val skip:  id.BlockId = R.unwrap_ok[id.BlockId, str](rb2);
+    val merge: id.BlockId = R.unwrap_ok[id.BlockId, str](rb3);
+
+    # entry: s = alloca St; cbr p0, arm, skip   -- no store dominates the merge.
+    builder.set_block(?bld, entry);
+    val res_alloca: R.Result[value.Value, str] = builder.emit_alloca(?bld, stty, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](res_alloca)) { ret 1; }
+    val s: value.Value = R.unwrap_ok[value.Value, str](res_alloca);
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, value.param(0, i64t), arm, skip))) { ret 1; }
+
+    # arm: store p1 -> s   (a whole-aggregate copy; the parameter carries its storage)
+    builder.set_block(?bld, arm);
+    if (R.is_err[bool, str](builder.emit_store(?bld, value.param(1, stty), s))) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_br(?bld, merge)))                      { ret 1; }
+
+    # skip: br merge   -- the arm the old promotion handed a const_null
+    builder.set_block(?bld, skip);
+    if (R.is_err[bool, str](builder.emit_br(?bld, merge))) { ret 1; }
+
+    # merge: ret p0    -- the slot is never read
+    builder.set_block(?bld, merge);
+    if (R.is_err[bool, str](builder.emit_ret(?bld, value.param(0, i64t)))) { ret 1; }
+
+    if (R.is_err[bool, str](run(?m))) { ret 1; }
+
+    # the dead copy still goes: the alloca and its store leave the block lists.
+    if (live_alloca_count(fn, ?fn.blocks[entry::u32]) != 0) { ret 1; }
+    # no phi of aggregate type is placed anywhere, so no undefined incoming exists.
+    var b: u32 = 0;
+    for (b < fn.block_count) {
+        if ((?fn.blocks[b]).phi_count != 0) { ret 1; }
+        b = b + 1;
+    }
+    if (agg_address_violations(?m) != 0) { ret 1; }
+    ret 0;
+}
+
+# #2246: an aggregate slot that is read back is not promotable at all. Substituting
+# the load with the value a store placed in the slot would hand the reader the
+# SOURCE's address - an alias, not the copy the store performed. The slot stays in
+# memory; dropping the read-back rejection promotes it and the alloca disappears.
+test "mach.lang.me.pass.mem2reg.run:read_aggregate_slot_stays_in_memory" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val res_module: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](res_module)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](res_module);
+
+    val res_i64: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64)) { ret 1; }
+    var i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64);
+
+    var fields: [2]type.IrTypeId;
+    fields[0] = i64t;
+    fields[1] = i64t;
+    val res_st: R.Result[type.IrTypeId, str] = type.intern_struct(?m.types, ?fields[0], 2, 0);
+    if (R.is_err[type.IrTypeId, str](res_st)) { ret 1; }
+    val stty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_st);
+
+    val res_fn: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](res_fn)];
+
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+    val res_entry: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](res_entry)) { ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](res_entry);
+    builder.set_block(?bld, entry);
+
+    # s = alloca St; store p0 -> s; v = load s; ret p1 -- v names the copy, not p0.
+    val res_alloca: R.Result[value.Value, str] = builder.emit_alloca(?bld, stty, value.const_int(1, i64t));
+    if (R.is_err[value.Value, str](res_alloca)) { ret 1; }
+    val s: value.Value = R.unwrap_ok[value.Value, str](res_alloca);
+    if (R.is_err[bool, str](builder.emit_store(?bld, value.param(0, stty), s))) { ret 1; }
+    val res_load: R.Result[value.Value, str] = builder.emit_load(?bld, s, stty);
+    if (R.is_err[value.Value, str](res_load)) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret(?bld, value.param(1, i64t)))) { ret 1; }
+
+    if (R.is_err[bool, str](run(?m))) { ret 1; }
+
+    # the slot keeps its storage: the read must observe the copy, not its source.
+    if (live_alloca_count(fn, ?fn.blocks[entry::u32]) != 1) { ret 1; }
     ret 0;
 }
