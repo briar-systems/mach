@@ -15,10 +15,13 @@
 #   - Integer width lives in bits on the `IRT_INT` payload, float width likewise
 #     on `IRT_FLOAT`.
 #
-# `byte_size` / `byte_align` are target-aware: pointer size and alignment come
-# from the target ISA's `pointer_width`. Aggregate layout follows the natural
-# C-style rule (each field aligned to its own alignment, struct alignment is the
-# max field alignment, total size rounded up to that).
+# `byte_size` / `byte_align` / `byte_offset` are target-aware (pointer size comes from
+# the target ISA's `pointer_width`) and are ADAPTERS over `mach.lang.layout`, the shared
+# natural-C-style layout policy sema folds through as well. The rule lives there, in one
+# place, because sema's secrecy-placement check decides overlay safety from byte extents:
+# a second copy here that drifted from it would let sema admit an overlay this layout does
+# not produce, which is the disclosure #2289 documents. This module's job is to DESCRIBE an
+# IR node to that policy, not to re-derive the fold.
 
 use std.allocator.page;
 use std.collections.map;
@@ -35,6 +38,7 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
+use mach.lang.layout;
 use mach.lang.target.isa;
 use target: mach.lang.target.resolved;
 
@@ -427,76 +431,102 @@ pub fun intern_fn(t: *IrTypeTable, ret_type: IrTypeId, params: *IrTypeId, param_
     ret intern_owned(t, probe, params, param_count);
 }
 
+# describe one IrType to the shared layout policy (a layout.NodeFn)
+#
+# The IR half of the #2289 seam: it names each IR kind's storage shape and leaves the
+# fold itself to `mach.lang.layout`, which sema drives over its own type universe
+# through the matching describer. Every IR kind is classified, so an unknown node here
+# means the table handed out an id it does not hold.
+# ---
+# ctx: the *IrTypeTable, erased
+# id:  the IrTypeId to describe
+# ret: the node's layout shape, or a NODE_UNKNOWN node for an out-of-range id
+fun describe_node(ctx: ptr, id: u32) layout.Node {
+    val t: *IrTypeTable = ctx::*IrTypeTable;
+    if (id >= t.len) { ret layout.node(layout.NODE_UNKNOWN); }
+    val ir: *IrType = ?t.types[id];
+
+    if (ir.kind == IRT_VOID) { ret layout.node(layout.NODE_ZERO); }
+    if (ir.kind == IRT_INT || ir.kind == IRT_FLOAT) {
+        var n: layout.Node = layout.node(layout.NODE_SCALAR);
+        n.bytes = bits_to_bytes(ir.data.bits);
+        ret n;
+    }
+    # a first-class `fun(...)` value is a function pointer, so it lays out as one.
+    if (ir.kind == IRT_PTR || ir.kind == IRT_FN) { ret layout.node(layout.NODE_POINTER); }
+    # all ten vector shapes are 128-bit (#1965).
+    if (ir.kind == IRT_VECTOR) { ret layout.node(layout.NODE_VECTOR); }
+    if (ir.kind == IRT_ARRAY) {
+        var n: layout.Node = layout.node(layout.NODE_ARRAY);
+        n.child = ir.data.array_.element;
+        n.count = ir.data.array_.count;
+        ret n;
+    }
+    if (ir.kind == IRT_STRUCT || ir.kind == IRT_UNION) {
+        var n: layout.Node = layout.node(layout.NODE_AGGREGATE);
+        n.field_count = ir.data.struct_.field_count;
+        n.decl_align  = ir.data.struct_.align;
+        n.overlays    = ir.kind == IRT_UNION;
+        ret n;
+    }
+    ret layout.node(layout.NODE_UNKNOWN);
+}
+
+# name field `index` of aggregate `id` (a layout.FieldFn)
+fun describe_field(ctx: ptr, id: u32, index: u32) u32 {
+    val t: *IrTypeTable = ctx::*IrTypeTable;
+    if (id >= t.len) { ret IRT_NIL; }
+    val ir: *IrType = ?t.types[id];
+    if (ir.kind != IRT_STRUCT && ir.kind != IRT_UNION) { ret IRT_NIL; }
+    if (index >= ir.data.struct_.field_count)          { ret IRT_NIL; }
+    ret ir.data.struct_.fields[index];
+}
+
+# the extent of `id` under the shared policy, panicking on a graph it cannot fold
+#
+# An unresolvable extent means a stale handle or a malformed table - what the verifier's
+# VC_TYPE_RESOLVE rules out - so it panics rather than silently answering 0, preserving
+# the contract these three entry points have always had.
+fun ir_extent(t: *IrTypeTable, id: IrTypeId, tgt: *target.Target, what: str) layout.Extent {
+    val e: layout.Extent = layout.extent_of(t::ptr, describe_node, describe_field, id, ptr_width_of(tgt));
+    if (!e.ok) { panic(what); }
+    ret e;
+}
+
+# the target's pointer width, which every layout query needs
+#
+# A Target with no ISA is not a resolved target and cannot answer this. The layout
+# reads the width up front rather than only on reaching a pointer, so an unresolved
+# target is reported here instead of surfacing as a fault deep in a walk - or, worse,
+# going unnoticed on the types that happen not to contain a pointer.
+fun ptr_width_of(tgt: *target.Target) u32 {
+    if (tgt == nil || tgt.isa == nil) {
+        panic("ir.type: layout query needs a resolved target with an instruction set\n");
+    }
+    ret tgt.isa.pointer_width;
+}
+
 # the size in bytes of an IR type for the given target
 #
-# Pointer size comes from `tgt.isa.pointer_width`. Aggregates use natural
-# C-style layout. A function type sizes as a pointer (a first-class `fun(...)`
-# value is a function pointer) and IRT_VOID is 0. An out-of-range id is a stale
-# handle the verifier's VC_TYPE_RESOLVE rules out, so it panics rather than
-# silently sizing to 0.
+# Pointer size comes from `tgt.isa.pointer_width`. Aggregates use the natural C-style
+# layout the shared `mach.lang.layout` policy defines, which sema folds through as well
+# so the two can never disagree (#2289). IRT_VOID is 0. An out-of-range id is a stale
+# handle the verifier's VC_TYPE_RESOLVE rules out, so it panics rather than silently
+# sizing to 0.
 # ---
 # t:   the table
 # id:  IrTypeId to measure
 # tgt: resolved compilation target supplying pointer width via its ISA
 # ret: size in bytes
 pub fun byte_size(t: *IrTypeTable, id: IrTypeId, tgt: *target.Target) u32 {
-    if (id >= t.len) { panic("ir.type.byte_size: type id out of range\n"); }
-    val ir: *IrType = ?t.types[id];
-
-    if (ir.kind == IRT_VOID)                        { ret 0; }
-    if (ir.kind == IRT_INT || ir.kind == IRT_FLOAT) { ret bits_to_bytes(ir.data.bits); }
-    # a first-class `fun(...)` value is a function pointer, so it sizes as one.
-    if (ir.kind == IRT_PTR || ir.kind == IRT_FN) { ret tgt.isa.pointer_width; }
-
-    if (ir.kind == IRT_ARRAY) {
-        ret byte_size(t, ir.data.array_.element, tgt) * ir.data.array_.count;
-    }
-    # all ten vector shapes are 128-bit (#1965).
-    if (ir.kind == IRT_VECTOR) { ret 16; }
-
-    if (ir.kind == IRT_STRUCT) {
-        var offset: u32 = 0;
-        var align:  u32 = 1;
-        var i:      u32 = 0;
-        for (i < ir.data.struct_.field_count) {
-            val fid:         IrTypeId = ir.data.struct_.fields[i];
-            val field_align: u32      = byte_align(t, fid, tgt);
-            val field_size:  u32      = byte_size(t, fid, tgt);
-            offset = round_up(offset, field_align);
-            offset = offset + field_size;
-            if (field_align > align) { align = field_align; }
-            i = i + 1;
-        }
-        # an `#[align(...)]` override raises alignment (never lowers it), which
-        # also rounds the total size up to the larger alignment.
-        if (ir.data.struct_.align > align) { align = ir.data.struct_.align; }
-        ret round_up(offset, align);
-    }
-
-    if (ir.kind == IRT_UNION) {
-        var size:  u32 = 0;
-        var align: u32 = 1;
-        var i:     u32 = 0;
-        for (i < ir.data.struct_.field_count) {
-            val fid:         IrTypeId = ir.data.struct_.fields[i];
-            val field_size:  u32      = byte_size(t, fid, tgt);
-            val field_align: u32      = byte_align(t, fid, tgt);
-            if (field_size > size)   { size = field_size; }
-            if (field_align > align) { align = field_align; }
-            i = i + 1;
-        }
-        if (ir.data.struct_.align > align) { align = ir.data.struct_.align; }
-        ret round_up(size, align);
-    }
-
-    ret 0;
+    ret ir_extent(t, id, tgt, "ir.type.byte_size: type id out of range\n").size;
 }
 
 # the alignment in bytes of an IR type for the given target
 #
 # Pointer alignment equals pointer width (a function type aligns as a pointer).
-# Struct alignment is the max of its field alignments (1 for an empty struct).
-# IRT_VOID aligns to 1. An out-of-range id is a stale handle the verifier's
+# Aggregate alignment is the max of its field alignments, raised by an `#[align(...)]`
+# override; IRT_VOID aligns to 1. An out-of-range id is a stale handle the verifier's
 # VC_TYPE_RESOLVE rules out, so it panics rather than silently aligning to 1.
 # ---
 # t:   the table
@@ -504,81 +534,27 @@ pub fun byte_size(t: *IrTypeTable, id: IrTypeId, tgt: *target.Target) u32 {
 # tgt: resolved compilation target supplying pointer width via its ISA
 # ret: alignment in bytes (always >= 1)
 pub fun byte_align(t: *IrTypeTable, id: IrTypeId, tgt: *target.Target) u32 {
-    if (id >= t.len) { panic("ir.type.byte_align: type id out of range\n"); }
-    val ir: *IrType = ?t.types[id];
-
-    if (ir.kind == IRT_INT || ir.kind == IRT_FLOAT) { ret bits_to_bytes(ir.data.bits); }
-    # a function value is a function pointer; align as one.
-    if (ir.kind == IRT_PTR || ir.kind == IRT_FN) { ret tgt.isa.pointer_width; }
-    if (ir.kind == IRT_ARRAY)                    { ret byte_align(t, ir.data.array_.element, tgt); }
-    # 128-bit vectors are 16-byte aligned (#1965).
-    if (ir.kind == IRT_VECTOR)                   { ret 16; }
-
-    if (ir.kind == IRT_STRUCT || ir.kind == IRT_UNION) {
-        var align: u32 = 1;
-        var i:     u32 = 0;
-        for (i < ir.data.struct_.field_count) {
-            val field_align: u32 = byte_align(t, ir.data.struct_.fields[i], tgt);
-            if (field_align > align) { align = field_align; }
-            i = i + 1;
-        }
-        # an `#[align(...)]` override raises alignment above the natural maximum.
-        if (ir.data.struct_.align > align) { align = ir.data.struct_.align; }
-        ret align;
-    }
-
-    # IRT_VOID and any unhandled kind align to 1.
-    ret 1;
+    ret ir_extent(t, id, tgt, "ir.type.byte_align: type id out of range\n").align;
 }
 
-# the byte offset of field `field_ix` within struct type `id`
+# the byte offset of field `field_ix` within aggregate type `id`
 #
-# Uses the same natural C-style layout as byte_size; a union's members all
-# overlap at offset 0. An out-of-range id, a non-aggregate type, or a field
-# index past the struct's fields are all malformed inputs the front end and
-# verifier rule out, so each panics rather than silently landing on field 0.
+# Uses the same shared layout policy as byte_size; a union's members all overlap at
+# offset 0. An out-of-range id, a non-aggregate type, or a field index past the
+# aggregate's fields are all malformed inputs the front end and verifier rule out, so
+# each panics rather than silently landing on field 0.
 # ---
 # t:        the table
-# id:       the struct IrTypeId
+# id:       the aggregate IrTypeId
 # field_ix: zero-based field index
 # tgt:      resolved compilation target supplying pointer width via its ISA
 # ret:      byte offset of the field
 pub fun byte_offset(t: *IrTypeTable, id: IrTypeId, field_ix: u32, tgt: *target.Target) u32 {
-    if (id >= t.len) { panic("ir.type.byte_offset: type id out of range\n"); }
-    val ir: *IrType = ?t.types[id];
-
-    # a union's members all overlap at offset 0.
-    if (ir.kind == IRT_UNION)  { ret 0; }
-    if (ir.kind != IRT_STRUCT) { panic("ir.type.byte_offset: field offset of a non-aggregate type\n"); }
-
-    var offset: u32 = 0;
-    var i:      u32 = 0;
-    for (i < ir.data.struct_.field_count) {
-        val fid: IrTypeId = ir.data.struct_.fields[i];
-        offset = round_up(offset, byte_align(t, fid, tgt));
-        if (i == field_ix) { ret offset; }
-        offset = offset + byte_size(t, fid, tgt);
-        i = i + 1;
-    }
-
-    panic("ir.type.byte_offset: field index out of range\n");
-    ret 0;
+    val e: layout.Extent = layout.field_offset_of(t::ptr, describe_node, describe_field, id, field_ix, ptr_width_of(tgt));
+    if (!e.ok) { panic("ir.type.byte_offset: field offset of a non-aggregate type or out-of-range index\n"); }
+    ret e.size;
 }
 
-# round `value` up to the next multiple of `align`
-#
-# An alignment of 0 or 1 returns `value` unchanged. Used by the natural C-style
-# aggregate-layout computations.
-# ---
-# value: the value to align
-# align: the alignment to round up to (a power of two)
-# ret:   the smallest multiple of `align` that is >= `value`
-fun round_up(value: u32, align: u32) u32 {
-    if (align <= 1) { ret value; }
-    val rem: u32 = value % align;
-    if (rem == 0) { ret value; }
-    ret value + (align - rem);
-}
 
 # intern a kind whose IrType is a complete, self-contained key - no
 # externally-owned payload to copy (void/int/float/ptr and arrays, whose element

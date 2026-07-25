@@ -1,0 +1,268 @@
+# mach.lang.layout: the aggregate-layout policy both type universes fold through
+#
+# The single source of truth for how a type occupies storage (#2289). Both the front
+# end (sema, over `lang.type` TypeIds) and the back end (`me.ir.type`, over IrTypeIds)
+# describe their own nodes to this module and read the resulting size / alignment /
+# field offset here, so the two never drift and the rule lives in one place.
+#
+# WHY THIS IS A SHARED POLICY AND NOT A CONVENIENCE. Sema's deep secrecy-placement
+# check decides whether two aggregates may overlay each other by comparing their BYTE
+# EXTENTS. If sema's idea of a layout and the backend's ever disagreed, sema would
+# admit an overlay the emitted layout does not produce - a public field landing on a
+# secret's bytes, which is exactly the disclosure #2289 documents. That makes a second
+# layout implementation a drift risk on the PERMISSIVE side of a security boundary:
+# while the copies agree everything looks correct, and when they diverge the failure is
+# a silent under-rejection. One policy removes the failure mode by construction rather
+# than detecting it after the fact.
+#
+# A leaf module (no compiler-internal dependencies) so both fe.sema and me.ir import it
+# without a cycle - the same shape as `mach.lang.ct`, the constant-time table the front
+# and back ends likewise share.
+#
+# THE POLICY. Natural C-style layout:
+#   - a void occupies nothing and aligns to 1
+#   - a scalar occupies its own width and aligns to it
+#   - a pointer or function value occupies the target's pointer width and aligns to it
+#   - an array is `count` elements of the element's size, aligned as the element
+#   - a RECORD lays its fields out sequentially, rounding each up to its own alignment
+#   - a UNION overlays every field at offset 0 and takes the widest
+#   - either aggregate's alignment is the maximum of its fields', which an
+#     `#[align(...)]` override may RAISE but never lower, and its total size is rounded
+#     up to that alignment
+# A field's offset therefore depends only on the fields BEFORE it, never on later ones
+# or on the aggregate's own alignment - the property sema's placement comparison relies
+# on to pair two aggregates' prefixes.
+#
+# THE SEAM. A caller supplies an erased context plus two accessors - one describing a
+# node, one naming a field's node - mirroring the `fun(ptr, ...)` callback the comptime
+# resolvers already use. Every walk is depth-bounded and reports `ok = false` rather
+# than guessing, so a caller that must fail closed can, and one that treats a malformed
+# graph as a compiler bug can panic on it.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+
+# how a node occupies storage; the discriminator for `Node`
+pub def NodeKind: u8;
+
+# a node this describer cannot classify; yields `ok = false`
+pub val NODE_UNKNOWN:   NodeKind = 0;
+# an integer or float of `bytes` width, aligned to its width
+pub val NODE_SCALAR:    NodeKind = 1;
+# a pointer or function value: the target's pointer width, aligned to it
+pub val NODE_POINTER:   NodeKind = 2;
+# a 128-bit vector: 16 bytes, 16-byte aligned
+pub val NODE_VECTOR:    NodeKind = 3;
+# `count` elements of node `child`
+pub val NODE_ARRAY:     NodeKind = 4;
+# a record or union of `field_count` fields; `overlays` selects which
+pub val NODE_AGGREGATE: NodeKind = 5;
+# a node occupying no storage (a void), which still aligns to 1 so it neither moves a
+# following field nor lowers an enclosing aggregate's alignment
+pub val NODE_ZERO:      NodeKind = 6;
+
+# one type node, described by the caller in terms this policy folds
+#
+# Only the fields its `kind` selects are read, so a describer fills the rest with
+# anything. A `kind` of NODE_UNKNOWN - or any node the describer cannot resolve -
+# propagates as `ok = false` through every enclosing extent.
+# ---
+# kind:        which storage shape this node has
+# bytes:       NODE_SCALAR: the scalar's width in bytes
+# count:       NODE_ARRAY: the element count
+# child:       NODE_ARRAY: the element's node id
+# field_count: NODE_AGGREGATE: the number of fields
+# decl_align:  NODE_AGGREGATE: an `#[align(...)]` override, 0 for none
+# overlays:    NODE_AGGREGATE: true for a union (fields at offset 0), false for a record
+pub rec Node {
+    kind:        NodeKind;
+    bytes:       u32;
+    count:       u32;
+    child:       u32;
+    field_count: u32;
+    decl_align:  u32;
+    overlays:    bool;
+}
+
+# describe node `id` within the caller's erased context
+pub def NodeFn: fun(ptr, u32) Node;
+
+# the node id of field `index` of aggregate node `id`, within the caller's erased
+# context. Only called for indices below the aggregate's reported `field_count`
+pub def FieldFn: fun(ptr, u32, u32) u32;
+
+# a node's storage size and alignment, or the fact that neither could be determined
+#
+# `ok` is false when any part of the walk could not be resolved - an unknown node kind,
+# an unresolvable field, an array whose total would not fit, or a graph past the depth
+# bound. Callers that must fail closed test it; callers for whom a malformed graph is a
+# compiler bug panic on it.
+# ---
+# ok:    whether size and align were determined
+# size:  the size in bytes
+# align: the alignment in bytes (>= 1 when ok)
+pub rec Extent {
+    ok:    bool;
+    size:  u32;
+    align: u32;
+}
+
+# the depth bound on a layout walk; a graph deeper than this reports `ok = false`
+val MAX_DEPTH: u32 = 64;
+
+# the largest total an array may occupy; a bigger product would wrap a u32 and report a
+# wrong extent, so it declines instead
+val MAX_SIZE: u64 = 4294967295;
+
+# an Extent that could not be determined
+pub fun unknown_extent() Extent {
+    var e: Extent;
+    e.ok    = false;
+    e.size  = 0;
+    e.align = 0;
+    ret e;
+}
+
+# a determined Extent
+pub fun extent(size: u32, align: u32) Extent {
+    var e: Extent;
+    e.ok    = true;
+    e.size  = size;
+    e.align = align;
+    ret e;
+}
+
+# a Node of the given kind with every other field cleared, for a describer to fill
+pub fun node(kind: NodeKind) Node {
+    var n: Node;
+    n.kind        = kind;
+    n.bytes       = 0;
+    n.count       = 0;
+    n.child       = 0;
+    n.field_count = 0;
+    n.decl_align  = 0;
+    n.overlays    = false;
+    ret n;
+}
+
+# round `value` up to the next multiple of `align`
+#
+# An alignment of 0 or 1 returns `value` unchanged. The one arithmetic primitive the
+# whole policy is built from.
+# ---
+# value: the value to align
+# align: the alignment to round up to (a power of two)
+# ret:   the smallest multiple of `align` that is >= `value`
+pub fun round_up(value: u32, align: u32) u32 {
+    if (align <= 1) { ret value; }
+    val rem: u32 = value % align;
+    if (rem == 0) { ret value; }
+    ret value + (align - rem);
+}
+
+# the storage size and alignment of node `id`
+# ---
+# ctx:       the caller's erased context, passed back to both accessors
+# describe:  names a node's storage shape
+# field:     names an aggregate's field node ids
+# id:        the node to measure
+# ptr_width: the target's pointer width in bytes
+# ret:       the determined Extent, or `ok = false` when it cannot be computed
+pub fun extent_of(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, ptr_width: u32) Extent {
+    ret walk(ctx, describe, field, id, ptr_width, 0);
+}
+
+# the byte offset of field `field_ix` within aggregate node `id`
+#
+# A union's fields all overlay at offset 0. A record's offset is the fold over the
+# fields BEFORE it, which is why it never depends on the aggregate's own alignment.
+# ---
+# ctx:       the caller's erased context
+# describe:  names a node's storage shape
+# field:     names an aggregate's field node ids
+# id:        the aggregate node
+# field_ix:  the zero-based field index
+# ptr_width: the target's pointer width in bytes
+# ret:       an Extent whose `size` is the offset, or `ok = false` when undeterminable
+pub fun field_offset_of(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, field_ix: u32, ptr_width: u32) Extent {
+    val n: Node = describe(ctx, id);
+    if (n.kind != NODE_AGGREGATE)  { ret unknown_extent(); }
+    if (field_ix >= n.field_count) { ret unknown_extent(); }
+    if (n.overlays)                { ret extent(0, 1); }
+
+    var offset: u32 = 0;
+    var i:      u32 = 0;
+    for (i < n.field_count) {
+        val fe: Extent = walk(ctx, describe, field, field(ctx, id, i), ptr_width, 1);
+        if (!fe.ok) { ret unknown_extent(); }
+        offset = round_up(offset, fe.align);
+        if (i == field_ix) { ret extent(offset, fe.align); }
+        offset = offset + fe.size;
+        i = i + 1;
+    }
+    ret unknown_extent();
+}
+
+# the recursive worker for `extent_of`, bounding the graph depth
+fun walk(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, ptr_width: u32, depth: u32) Extent {
+    if (depth > MAX_DEPTH) { ret unknown_extent(); }
+
+    val n: Node = describe(ctx, id);
+
+    if (n.kind == NODE_ZERO)    { ret extent(0, 1); }
+    if (n.kind == NODE_SCALAR)  { ret extent(n.bytes, n.bytes); }
+    if (n.kind == NODE_POINTER) { ret extent(ptr_width, ptr_width); }
+    if (n.kind == NODE_VECTOR)  { ret extent(16, 16); }
+
+    if (n.kind == NODE_ARRAY) {
+        val e: Extent = walk(ctx, describe, field, n.child, ptr_width, depth + 1);
+        if (!e.ok) { ret unknown_extent(); }
+        # widen the product: a total past a u32 would wrap and report a wrong extent.
+        val total: u64 = e.size::u64 * n.count::u64;
+        if (total > MAX_SIZE) { ret unknown_extent(); }
+        ret extent(total::u32, e.align);
+    }
+
+    if (n.kind == NODE_AGGREGATE) {
+        var align:  u32 = 1;
+        var offset: u32 = 0;
+        var widest: u32 = 0;
+        var i:      u32 = 0;
+        for (i < n.field_count) {
+            val e: Extent = walk(ctx, describe, field, field(ctx, id, i), ptr_width, depth + 1);
+            if (!e.ok) { ret unknown_extent(); }
+            if (e.align > align) { align = e.align; }
+            if (n.overlays) {
+                if (e.size > widest) { widest = e.size; }
+            }
+            or {
+                offset = round_up(offset, e.align);
+                offset = offset + e.size;
+            }
+            i = i + 1;
+        }
+        # an `#[align(...)]` override raises the alignment, which also rounds the total
+        # size up to the larger alignment. it never lowers it.
+        if (n.decl_align > align) { align = n.decl_align; }
+        if (n.overlays) { ret extent(round_up(widest, align), align); }
+        ret extent(round_up(offset, align), align);
+    }
+
+    # NODE_UNKNOWN, and any kind a future describer adds without teaching this fold.
+    ret unknown_extent();
+}
+
+# the policy's own arithmetic, pinned independently of either type universe: rounding
+# is identity at alignment 0 / 1, a no-op on an already-aligned value, and otherwise
+# lifts to the next multiple.
+test "mach.lang.layout.round_up:cases" {
+    if (round_up(0, 0)   != 0)  { ret 1; }
+    if (round_up(7, 1)   != 7)  { ret 1; }
+    if (round_up(8, 4)   != 8)  { ret 1; }
+    if (round_up(9, 4)   != 12) { ret 1; }
+    if (round_up(1, 8)   != 8)  { ret 1; }
+    if (round_up(16, 16) != 16) { ret 1; }
+    if (round_up(17, 16) != 32) { ret 1; }
+    ret 0;
+}
