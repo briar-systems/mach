@@ -47,6 +47,7 @@ use mach.lang.be.codegen.mir;
 use mach.lang.intern;
 use mach.lang.source;
 use mach.lang.target.abi;
+use mach.lang.target.isa;
 use mach.lang.target.of;
 use tos: mach.lang.target.os;
 use target: mach.lang.target.resolved;
@@ -221,7 +222,7 @@ pub rec SymbolMark {
     flags:  u32;
 }
 
-# the concrete signature the erased `isa.IsaVTable.encode` pointer is cast back to
+# the concrete signature the erased `isa.RegMachine.encode` pointer is cast back to
 # before it is called
 #
 # The vtable stores `encode` type-erased (`*u8`) because its signature names
@@ -282,7 +283,7 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule, asm_out: *writer.Writer) R.R
     ret encode(m.alloc, tgt, m);
 }
 
-# the concrete signature the erased `isa.IsaVTable.emit_asm` pointer is cast back
+# the concrete signature the erased `isa.RegMachine.emit_asm` pointer is cast back
 # to before it is called
 #
 # The vtable stores `emit_asm` type-erased (`*u8`) for the same import-cycle
@@ -341,31 +342,99 @@ pub rec ByteBuf {
 # MIR macro-op expands to several machine instructions and collapsing them is
 # exactly the divergence this replaced (#2187).
 #
-# `accounted` is the totality guard. It trails `ByteBuf.len` as of the last
-# notification, so any byte an ISA appends without notifying leaves the two
-# unequal; `sink_unaccounted` reports the gap and the caller fails loudly naming
-# the opcode responsible. A printer that silently skips an instruction is
-# therefore not expressible - the bytes it failed to render are still counted.
+# `accounted` is the totality guard: the end of the last byte range an instruction
+# notification claimed. A notification claims `[start, ByteBuf.len)` and DECLARES its
+# own `start`, which must be exactly where the previous claim ended - so the claims
+# tile the text, each byte belongs to exactly one instruction, and a notification an
+# emitting path never sent cannot be absorbed by the next one (#2250). A claim that
+# does not begin at the cursor leaves the cursor where it is, so the bytes it skipped
+# stay unclaimed and `sink_unaccounted` reports them; the caller fails loudly naming
+# the opcode responsible. A printer that silently skips an instruction is therefore
+# not expressible - the bytes it failed to render are still counted.
+#
+# Declaring the start is what a running high-water mark could not do. `accounted` used
+# to be assigned `ByteBuf.len` outright, which made a claim cover everything back to
+# the last one: a dropped notification in the MIDDLE of a sequence was swallowed by
+# its successor, and only a miss at the very END of a MIR opcode was caught.
 #
 # `mi` is the MIR instruction currently being encoded, set by the ISA around each
 # dispatch. A renderer reads it only to name what the machine operand cannot carry
 # (a call's target symbol, a branch's block label - `mir_to_operand` erases both),
 # never to choose a mnemonic or an operand.
+#
+# A notification may be RENDERED IMMEDIATELY or BUFFERED. An architecture whose
+# instruction's first form is its last renders on the spot and needs nothing more
+# than `sink_claim`. One whose final form is settled later - RISC-V, whose branch
+# relaxation rewrites an over-range conditional into an inverted guard plus a jump
+# after the whole function is laid out - buffers its notifications as `AsmNote`s
+# here, lets the relaxation pass edit them exactly as it edits the text, and renders
+# once the layout is final. Streaming such a target would print the instruction it
+# first planned rather than the one the object holds, which is the divergence this
+# whole mechanism exists to make unrepresentable (#2187).
+#
+# The note offsets are one more table that must stay consistent with the text, so
+# they live beside the block / fixup / symbol / relocation tables `insert_text`
+# already shifts rather than in ISA-private memory that a future shift path could
+# forget. A target that renders as it goes never pushes a note and pays nothing.
 # ---
-# out:       destination writer for the rendered text
-# accounted: `ByteBuf.len` as of the last instruction notification
-# failed:    a write error occurred; the first one is kept in `err`
-# err:       the first write error, empty until `failed`
-# mi:        the MIR instruction being encoded, for symbol / label annotation
-# interner:  resolves symbol ids to their source names
+# The buffer is backed by the owning `ByteBuf`'s allocator, so buffering costs the
+# sink no extra construction argument and a target that never pushes a note never
+# allocates.
+# ---
+# out:        destination writer for the rendered text
+# accounted:  end of the last byte range an instruction notification claimed
+# failed:     a write error occurred; the first one is kept in `err`
+# err:        the first write error, empty until `failed`
+# mi:         the MIR instruction being encoded, for symbol / label annotation
+# interner:   resolves symbol ids to their source names
+# notes:      buffered notifications, in emission order (nil until the first push)
+# note_count: number of buffered notifications
+# note_cap:   capacity of `notes`
+# note_insts: how many of the buffered notifications are instructions
+# claims:     instruction notifications accepted, buffered and streamed alike
+# refused:    notifications whose declared start was not where the last claim ended
 pub rec AsmSink {
-    out:       *writer.Writer;
-    accounted: usize;
-    failed:    bool;
-    err:       str;
-    mi:        *mir.MirInstr;
-    interner:  *intern.Interner;
+    out:        *writer.Writer;
+    accounted:  usize;
+    failed:     bool;
+    err:        str;
+    mi:         *mir.MirInstr;
+    interner:   *intern.Interner;
+    notes:      *AsmNote;
+    note_count: u32;
+    note_cap:   u32;
+    note_insts: u32;
+    claims:     u32;
+    refused:    u32;
 }
+
+# what one buffered notification stands for
+pub val ASM_NOTE_INST:  u8 = 0;  # one emitted machine instruction
+pub val ASM_NOTE_FUNC:  u8 = 1;  # a function's heading; emits no bytes
+pub val ASM_NOTE_BLOCK: u8 = 2;  # a block's local label; emits no bytes
+
+# one buffered notification: a machine instruction the encoder emitted, or a
+# function / block heading
+#
+# `off` is the instruction's `.text` offset, kept correct by `insert_text` exactly
+# as the block and fixup offsets are, so a relaxation pass can find the note whose
+# text it is about to rewrite after any number of earlier growths.
+# ---
+# kind: ASM_NOTE_INST / ASM_NOTE_FUNC / ASM_NOTE_BLOCK
+# off:  `.text` byte offset of the instruction's first byte
+# inst: the emitted machine instruction (ASM_NOTE_INST)
+# name: the function's interned name (ASM_NOTE_FUNC)
+# id:   the block id (ASM_NOTE_BLOCK)
+pub rec AsmNote {
+    kind: u8;
+    off:  u32;
+    inst: isa.Inst;
+    name: intern.StrId;
+    id:   u32;
+}
+
+# initial capacity of a sink's note buffer
+val ASM_NOTE_INIT_CAP: u32 = 64;
 
 # construct a sink rendering into `out`
 # ---
@@ -374,13 +443,201 @@ pub rec AsmSink {
 # ret:      an armed sink with nothing yet accounted
 pub fun sink_init(out: *writer.Writer, interner: *intern.Interner) AsmSink {
     var s: AsmSink;
-    s.out       = out;
-    s.accounted = 0;
-    s.failed    = false;
-    s.err       = "";
-    s.mi        = nil;
-    s.interner  = interner;
+    s.out        = out;
+    s.accounted  = 0;
+    s.failed     = false;
+    s.err        = "";
+    s.mi         = nil;
+    s.interner   = interner;
+    s.notes      = nil;
+    s.note_count = 0;
+    s.note_cap   = 0;
+    s.note_insts = 0;
+    s.claims     = 0;
+    s.refused    = 0;
     ret s;
+}
+
+# construct a cleared instruction notification
+# ---
+# ret: an ASM_NOTE_INST note with an empty instruction
+pub fun note_blank() AsmNote {
+    var n: AsmNote;
+    n.kind = ASM_NOTE_INST;
+    n.off  = 0;
+    n.inst = isa.inst_blank();
+    n.name = intern.STR_NIL;
+    n.id   = 0;
+    ret n;
+}
+
+# buffer one notification, claiming the bytes it covers
+#
+# An instruction note claims its byte range exactly as an immediate render does, and
+# it needs no separate start: `AsmNote.off` is already the instruction's first byte,
+# so the note itself declares where its claim begins and the tiling check falls out
+# of the buffered path for free.
+# ---
+# buf: the encoder byte sink carrying the assembly sink
+# n:   the notification to buffer
+# ret: true on success, or an allocation error
+pub fun note_push(buf: *ByteBuf, n: *AsmNote) R.Result[bool, str] {
+    if (!sink_active(buf)) { ret R.ok[bool, str](true); }
+    val s: *AsmSink = buf.asm;
+    if (s.note_count >= s.note_cap) {
+        val res_grow: R.Result[bool, str] = grow_notes(s, buf.alloc);
+        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+    }
+    s.notes[s.note_count] = @n;
+    s.note_count = s.note_count + 1;
+    if (n.kind == ASM_NOTE_INST) {
+        s.note_insts = s.note_insts + 1;
+        sink_claim(buf, n.off::usize);
+    }
+    ret R.ok[bool, str](true);
+}
+
+# insert one notification after the note at `idx`
+#
+# The relaxation counterpart of writing an instruction into a gap `insert_text` just
+# opened: the new word is a real emitted instruction and must be rendered as one.
+#
+# Its bytes did not arrive at the end of the text, so this is not a sequential claim
+# and the tiling cursor cannot check a start against it. What it checks instead is
+# just as exact: the gap the caller opened must be exactly the `nbytes` this
+# notification covers, so the cursor and the text end the operation back in step. An
+# insertion that grew the text by more than one notification's worth, or a
+# notification for a gap nobody opened, breaks the equality.
+# ---
+# buf:    the encoder byte sink carrying the assembly sink
+# idx:    the note the new one follows
+# n:      the notification to insert (its `off` is already set)
+# nbytes: the size of the instruction inserted into the text
+# ret:    true on success, or an allocation error
+pub fun note_insert_after(buf: *ByteBuf, idx: u32, n: *AsmNote, nbytes: u32) R.Result[bool, str] {
+    if (!sink_active(buf)) { ret R.ok[bool, str](true); }
+    val s: *AsmSink = buf.asm;
+    if (idx >= s.note_count) {
+        ret R.err[bool, str]("--emit-asm: an instruction notification was inserted after an unknown one");
+    }
+    if (n.kind == ASM_NOTE_INST && s.accounted + nbytes::usize != buf.len) {
+        ret R.err[bool, str]("--emit-asm: an inserted instruction notification does not cover the text gap that was opened for it");
+    }
+    if (s.note_count >= s.note_cap) {
+        val res_grow: R.Result[bool, str] = grow_notes(s, buf.alloc);
+        if (R.is_err[bool, str](res_grow)) { ret res_grow; }
+    }
+    var i: u32 = s.note_count;
+    val at: u32 = idx + 1;
+    for (i > at) {
+        s.notes[i] = s.notes[i - 1];
+        i = i - 1;
+    }
+    s.notes[at] = @n;
+    s.note_count = s.note_count + 1;
+    if (n.kind == ASM_NOTE_INST) {
+        s.note_insts = s.note_insts + 1;
+        s.claims     = s.claims + 1;
+        s.accounted  = buf.len;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# the number of buffered notifications
+# ---
+# buf: the encoder byte sink
+# ret: the note count, or 0 when no sink is buffering
+pub fun note_count(buf: *ByteBuf) u32 {
+    if (!sink_active(buf)) { ret 0; }
+    ret buf.asm.note_count;
+}
+
+# the buffered notification at `idx`, or nil
+# ---
+# buf: the encoder byte sink
+# idx: the note index
+# ret: the note, or nil when the index is out of range
+pub fun note_at(buf: *ByteBuf, idx: u32) *AsmNote {
+    if (!sink_active(buf)) { ret nil; }
+    if (idx >= buf.asm.note_count) { ret nil; }
+    ret ?buf.asm.notes[idx];
+}
+
+# the index of the buffered instruction whose bytes begin at `off`, or -1
+#
+# A relaxation pass works in `.text` offsets; this is how it reaches the note whose
+# instruction it is rewriting.
+# ---
+# buf: the encoder byte sink
+# off: the `.text` offset to look up
+# ret: the note index, or -1 when no instruction begins there
+pub fun note_index_at(buf: *ByteBuf, off: u32) i32 {
+    if (!sink_active(buf)) { ret -1; }
+    val s: *AsmSink = buf.asm;
+    var i: u32 = 0;
+    for (i < s.note_count) {
+        if (s.notes[i].kind == ASM_NOTE_INST && s.notes[i].off == off) { ret i::i32; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# drop every buffered notification, keeping the allocated capacity
+#
+# Called once a function's notes have been rendered, so the buffer is reused across
+# functions rather than reallocated per function.
+# ---
+# buf: the encoder byte sink
+pub fun notes_reset(buf: *ByteBuf) {
+    if (buf == nil || buf.asm == nil) { ret; }
+    buf.asm.note_count = 0;
+    buf.asm.note_insts = 0;
+}
+
+# how many buffered notifications are instructions
+#
+# A fixed-width ISA turns this into a whole-function totality check - emitted bytes
+# must equal the instruction count times the instruction width - which covers the
+# out-of-sequence growth a relaxation pass produces, where the per-claim tiling in
+# `sink_claim` has no sequential cursor to check against.
+# ---
+# buf: the encoder byte sink
+# ret: the instruction-notification count, or 0 when no sink is buffering
+pub fun note_inst_count(buf: *ByteBuf) u32 {
+    if (!sink_active(buf)) { ret 0; }
+    ret buf.asm.note_insts;
+}
+
+# release a sink's note buffer
+# ---
+# buf: the encoder byte sink; safe when no sink or no buffer was ever used
+pub fun notes_free(buf: *ByteBuf) {
+    if (buf == nil || buf.asm == nil) { ret; }
+    val s: *AsmSink = buf.asm;
+    if (s.notes == nil || s.note_cap == 0) { ret; }
+    A.deallocate[AsmNote](buf.alloc, s.notes, s.note_cap::usize);
+    s.notes      = nil;
+    s.note_count = 0;
+    s.note_cap   = 0;
+    s.note_insts = 0;
+}
+
+# double a sink's note-buffer capacity
+# ---
+# s:     the sink whose buffer grows
+# alloc: the owning byte sink's allocator
+# ret:   true on success, or an allocation error
+fun grow_notes(s: *AsmSink, alloc: *A.Allocator) R.Result[bool, str] {
+    var new_cap: u32 = ASM_NOTE_INIT_CAP;
+    if (s.note_cap > 0) { new_cap = s.note_cap * 2; }
+    val res_realloc: R.Result[*AsmNote, str] =
+        A.reallocate[AsmNote](alloc, s.notes, s.note_cap::usize, new_cap::usize);
+    if (R.is_err[*AsmNote, str](res_realloc)) {
+        ret R.err[bool, str](R.unwrap_err[*AsmNote, str](res_realloc));
+    }
+    s.notes    = R.unwrap_ok[*AsmNote, str](res_realloc);
+    s.note_cap = new_cap;
+    ret R.ok[bool, str](true);
 }
 
 # record a write failure so the encode driver can report it
@@ -407,29 +664,62 @@ pub fun sink_active(buf: *ByteBuf) bool {
     ret !buf.asm.failed;
 }
 
-# mark every byte written so far as rendered
+# claim `[start, ByteBuf.len)` for one instruction notification
 #
-# Called by an ISA immediately after it renders one emitted instruction.
+# Called by an ISA immediately after it renders one emitted instruction, with the
+# `.text` offset that instruction's first byte went to. Declaring the start is the
+# whole of the guard: the claim is accepted only when it begins exactly where the
+# previous one ended, so consecutive notifications tile the text and no notification
+# can stand for two instructions.
+#
+# A claim that does not begin at the cursor is REFUSED - the cursor stays put, so the
+# bytes between it and this claim remain unclaimed and `sink_unaccounted` keeps
+# reporting them until the ISA's own guard fails the build naming the opcode. A claim
+# that covers no bytes is refused for the same reason: a notification that describes
+# an instruction the encoder did not emit is the mirror image of the same defect and
+# would otherwise leave the counts looking healthy.
 # ---
-# buf: the encoder byte sink whose sink is advanced
-pub fun sink_account(buf: *ByteBuf) {
+# buf:   the encoder byte sink whose sink is advanced
+# start: `.text` offset of the notified instruction's first byte
+pub fun sink_claim(buf: *ByteBuf, start: usize) {
     if (buf == nil || buf.asm == nil) { ret; }
-    buf.asm.accounted = buf.len;
+    val s: *AsmSink = buf.asm;
+    if (start != s.accounted || buf.len <= start) {
+        s.refused = s.refused + 1;
+        ret;
+    }
+    s.accounted = buf.len;
+    s.claims    = s.claims + 1;
 }
 
-# the number of emitted bytes no instruction notification has covered
+# the number of instruction notifications this sink accepted
 #
-# Non-zero means an ISA appended bytes without rendering them, so the artifact
-# would under-report the code the encoder produced. The caller turns this into a
-# loud error naming the offending opcode rather than emitting a short `.s`.
-#
-# `accounted` is only ever assigned `buf.len`, and the text buffer only grows
-# while a function is being encoded, so `accounted <= buf.len` holds throughout.
-# The equal case is the common one (everything rendered); the comparison is
-# written `<=` rather than `==` because the subtraction below is unsigned.
+# Counts buffered and streamed claims alike, so a caller that needs "did this
+# emitting path notify at all" can take a difference across it on every target,
+# including one whose printer renders on the spot and buffers nothing.
 # ---
 # buf: the encoder byte sink
-# ret: the unaccounted byte count, or 0 when the sink is inactive
+# ret: the accepted-claim count, or 0 when no sink is attached
+pub fun sink_claims(buf: *ByteBuf) u32 {
+    if (!sink_active(buf)) { ret 0; }
+    ret buf.asm.claims;
+}
+
+# the number of emitted bytes no instruction notification has claimed
+#
+# Non-zero means an ISA appended bytes without rendering them, or rendered them under
+# a notification that did not begin where the last one ended, so the artifact would
+# under-report the code the encoder produced. The caller turns this into a loud error
+# naming the offending opcode rather than emitting a short `.s`.
+#
+# `accounted` is only ever advanced to `buf.len` by an accepted claim, and the text
+# buffer only grows while a function is being encoded, so `accounted <= buf.len`
+# holds throughout. The equal case is the common one (everything claimed); the
+# comparison is written `<=` rather than `==` because the subtraction below is
+# unsigned.
+# ---
+# buf: the encoder byte sink
+# ret: the unclaimed byte count, or 0 when the sink is inactive
 pub fun sink_unaccounted(buf: *ByteBuf) usize {
     if (!sink_active(buf)) { ret 0; }
     if (buf.len <= buf.asm.accounted) { ret 0; }
@@ -735,6 +1025,7 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirM
         st.last_inline_site = 0;
         val res_encode: R.Result[bool, str] = hooks.encode_function(?st, ?m.functions[fi]);
         if (R.is_err[bool, str](res_encode)) {
+            notes_free(?st.buf);
             state_dnit(?st);
             ret R.err[EncoderOutput, str](R.unwrap_err[bool, str](res_encode));
         }
@@ -742,9 +1033,21 @@ pub fun encode_driver_asm(alloc: *A.Allocator, tgt: *target.Target, m: *mir.MirM
     }
 
     if (sink.failed) {
+        notes_free(?st.buf);
         state_dnit(?st);
         ret R.err[EncoderOutput, str](sink.err);
     }
+    # a refused claim normally leaves a byte gap the ISA's own per-opcode guard has
+    # already failed the build over, naming it. the one shape that leaves no gap is a
+    # notification re-claiming bytes an earlier one covered - "exactly one" broken from
+    # the other side - so the count is the backstop that keeps it from passing.
+    if (sink.refused > 0) {
+        notes_free(?st.buf);
+        state_dnit(?st);
+        ret R.err[EncoderOutput, str](
+            "--emit-asm: an instruction notification claimed a byte range that does not begin where the previous one ended");
+    }
+    notes_free(?st.buf);
 
     val res_patch: R.Result[bool, str] = patch_branches(?st, hooks);
     if (R.is_err[bool, str](res_patch)) {
@@ -1451,6 +1754,17 @@ pub fun insert_text(st: *EncodeState, pos: u32, nbytes: u32) R.Result[bool, str]
         if (st.inline_pcs[ipi].text_offset >= pos) { st.inline_pcs[ipi].text_offset = st.inline_pcs[ipi].text_offset + nbytes; }
         ipi = ipi + 1;
     }
+    # a buffered assembly notification names the instruction at an offset, so it
+    # shifts with the text exactly as the block and fixup offsets do; a note left
+    # behind would have the relaxation pass rewrite the wrong instruction on its next
+    # iteration and the artifact would name a form the object does not hold.
+    if (st.buf.asm != nil) {
+        var ni: u32 = 0;
+        for (ni < st.buf.asm.note_count) {
+            if (st.buf.asm.notes[ni].off >= pos) { st.buf.asm.notes[ni].off = st.buf.asm.notes[ni].off + nbytes; }
+            ni = ni + 1;
+        }
+    }
     ret R.ok[bool, str](true);
 }
 
@@ -1903,7 +2217,7 @@ test "mach.lang.be.codegen.encode.sink_unaccounted:tracks_unrendered_bytes" {
     if (sink_unaccounted(?buf) != 3) { bad = 1; }
 
     # rendering that instruction clears the debt
-    sink_account(?buf);
+    sink_claim(?buf, 0);
     if (sink_unaccounted(?buf) != 0) { bad = 1; }
 
     # and the next unrendered emission is counted on its own, not cumulatively
@@ -1918,6 +2232,61 @@ test "mach.lang.be.codegen.encode.sink_unaccounted:tracks_unrendered_bytes" {
     if (sink_unaccounted(?plain) != 0) { bad = 1; }
 
     buf_dnit(?plain);
+    buf_dnit(?buf);
+    ret bad;
+}
+
+# the blind spot #2250 closed: a notification dropped in the MIDDLE of a sequence is
+# not absorbed by the next one
+#
+# A claim declares the offset its instruction started at, so the successor of a
+# dropped notification claims a range that does not begin at the cursor. The claim is
+# refused, the skipped bytes stay outstanding, and the ISA's per-opcode guard fails
+# the build. A running high-water mark could not tell the two cases apart: it moved to
+# the buffer end either way and only a miss at the very end of a MIR opcode survived
+# to be seen.
+test "mach.lang.be.codegen.encode.sink_claim:refuses_a_claim_that_skips_bytes" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: ByteBuf = buf_init(?alloc);
+
+    var sink: AsmSink = sink_init(nil, nil);
+    buf.asm = ?sink;
+
+    var bad: i32 = 0;
+
+    # two four-byte instructions, only the second notified - the shape a dropped
+    # notification takes mid-sequence.
+    emit_u32(?buf, 0xD503201F);
+    emit_u32(?buf, 0xD503201F);
+    sink_claim(?buf, 4);
+
+    # the claim is refused, so the first instruction's bytes are still outstanding and
+    # nothing was counted as rendered
+    if (sink_unaccounted(?buf) != 8) { bad = 1; }
+    if (sink_claims(?buf) != 0)      { bad = 1; }
+    if (sink.refused != 1)           { bad = 1; }
+
+    # the same two instructions, both notified, tile the text exactly
+    var ok_buf: ByteBuf = buf_init(?alloc);
+    var ok_sink: AsmSink = sink_init(nil, nil);
+    ok_buf.asm = ?ok_sink;
+
+    emit_u32(?ok_buf, 0xD503201F);
+    sink_claim(?ok_buf, 0);
+    emit_u32(?ok_buf, 0xD503201F);
+    sink_claim(?ok_buf, 4);
+    if (sink_unaccounted(?ok_buf) != 0) { bad = 1; }
+    if (sink_claims(?ok_buf) != 2)      { bad = 1; }
+    if (ok_sink.refused != 0)           { bad = 1; }
+
+    # a notification covering no bytes is refused too: it would describe an
+    # instruction the encoder never emitted
+    sink_claim(?ok_buf, 8);
+    if (sink_claims(?ok_buf) != 2) { bad = 1; }
+    if (ok_sink.refused != 1)      { bad = 1; }
+
+    buf_dnit(?ok_buf);
     buf_dnit(?buf);
     ret bad;
 }

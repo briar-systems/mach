@@ -1,4 +1,5 @@
-# assign each MIR frame slot a frame-pointer offset and size the frame
+# assign each MIR frame slot a frame-pointer offset, size the frame, and decide
+# whether the function needs a frame at all
 #
 # Assigns each MIR frame slot a negative offset from the frame pointer, sizes
 # the frame to the ABI stack alignment, and rounds the outgoing-argument region
@@ -7,9 +8,15 @@
 # materialized into `mir.MirFrame` during instruction selection; this pass only
 # computes their final offsets and the total frame size.
 #
-# Completely target-agnostic except for the stack alignment read through the ABI
-# vtable; the resulting offsets are consumed by the encoder when it forms
-# `[rbp + disp]` memory operands.
+# It then records, in `MirFrame.omit`, whether the function needs a compiler-
+# generated prologue and epilogue at all (#1940). This is the single decision
+# point for frame suppression across every target: each encoder reads the flag
+# instead of re-deriving the answer from its own copy of the rule.
+#
+# Target-agnostic but for three reads through the target - the ABI stack
+# alignment, and the frame- and stack-pointer register ids the frame-reference
+# scan recognizes. The resulting offsets are consumed by the encoder when it
+# forms `[rbp + disp]` memory operands.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -21,6 +28,7 @@ use O: std.types.option;
 use R: std.types.result;
 
 use mach.lang.be.codegen.mir;
+use mach.lang.target.abi;
 use target: mach.lang.target.resolved;
 
 # frame alignment used when no ABI override applies; the 16-byte call-boundary minimum
@@ -41,22 +49,138 @@ pub fun run(tgt: *target.Target, m: *mir.MirModule) R.Result[bool, str] {
 
     var fi: u32 = 0;
     for (fi < m.function_len) {
-        layout_function(?m.functions[fi], align);
+        val func: *mir.MirFunction = ?m.functions[fi];
+        layout_function(func, align);
+        # the frame facts are final only now, so the omission decision follows the
+        # layout rather than racing it.
+        func.frame.omit = omits_frame(func, tgt.model.frame_ptr_reg::u32,
+                                      tgt.model.stack_ptr_reg::u32);
         fi = fi + 1;
     }
 
     ret R.ok[bool, str](true);
 }
 
+# report whether a function needs no compiler-generated prologue or epilogue
+#
+# Two disjoint reasons suppress the frame.
+#
+#   1. `#[naked]` (#2198). The author declared that this function's prologue,
+#      epilogue, stack alignment, link register and return are theirs. Nothing is
+#      derived and nothing is checked here - a declaration is not a proof
+#      obligation. Sema restricts a naked body to inline `asm`, so the compiler
+#      allocates nothing under it and the shapes the guards below reject cannot
+#      arise anyway.
+#
+#   2. The frame is provably unused (#1940). A function that allocated no frame of
+#      its own - no slots (`frame.size`), no callee-saved GP or vector registers,
+#      no outgoing-argument region - and that calls nothing and addresses nothing
+#      through the frame or stack pointer cannot observe the difference between
+#      having a frame record and not having one, so the `push rbp; mov rbp, rsp` /
+#      `mov rsp, rbp; pop rbp` pair is pure cost.
+#
+# The leaf requirement in reason 2 is load-bearing rather than conservative, and
+# for a different reason on each ISA. On x86-64 entry RSP is 8 mod 16 and the
+# frame-pointer push is what restores the 16-byte call boundary the ABI demands,
+# so a frameless function that made a call would hand its callee a stack SysV
+# forbids. On aarch64 and riscv64 `bl` / `jalr` write the link register instead of
+# pushing, so alignment survives - but the prologue is also the only thing that
+# saves that register, and a frameless function that made a call would have its
+# own return address overwritten by the call and `ret` back into itself, forever.
+# Making no call, a function reaches neither failure.
+#
+# An inline-asm body used to be a third reason, standing on its own and tolerating
+# a call (#2283). It does not: the two failures above are exactly what
+# `std.system.os.linux.shared.terminate` was compiled into on `dev`, and it
+# survived only because `exit_group` never returns. A function that merely
+# CONTAINS asm is not asking to own its frame; one that says `#[naked]` is. An
+# asm-only leaf still omits its frame, now through reason 2 - an asm payload
+# contributes no MIR operand, so such a function satisfies the scan on its own.
+#
+# The frame-reference scan is what excludes an incoming stack parameter: those
+# are lowered to `[fp + incoming_arg_base + off]` (`mir.abi.emit_param_slot`) and
+# stay addressable only while the frame pointer is live.
+#
+# Nothing here can read the debug flag, and `-g` adds no MIR instruction and no
+# frame slot (its bindings ride on existing instructions as metadata), so the
+# decision is identical with and without `-g` and `.text` stays byte-identical -
+# the #1944 additivity invariant.
+# ---
+# func: the laid-out function to judge
+# fp:   the target's frame-pointer register id
+# sp:   the target's stack-pointer register id
+# ret:  true when the encoder must emit neither prologue nor epilogue
+pub fun omits_frame(func: *mir.MirFunction, fp: u32, sp: u32) bool {
+    if (func.naked) { ret true; }
+
+    if (func.frame.size != 0)          { ret false; }
+    if (func.callee_mask != 0)         { ret false; }
+    if (func.callee_mask_fp != 0)      { ret false; }
+    if (func.frame.outgoing_size != 0) { ret false; }
+
+    var calls: bool = false;
+    var frame_ref: bool = false;
+
+    var bi: u32 = 0;
+    for (bi < func.block_count) {
+        val blk: *mir.MirBlock = ?func.blocks[bi];
+        var ii: u32 = 0;
+        for (ii < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ii];
+            if (mi.opcode == mir.MIR_CALL) { calls = true; }
+            var oi: u32 = 0;
+            for (oi < mi.operand_count) {
+                if (operand_is_frame_relative(?mi.operands[oi], fp, sp)) { frame_ref = true; }
+                oi = oi + 1;
+            }
+            ii = ii + 1;
+        }
+        bi = bi + 1;
+    }
+
+    ret !calls && !frame_ref;
+}
+
+# report whether a MIR operand addresses memory through the frame or stack pointer
+#
+# A frame-slot memory operand carries a slot key in `vreg` and is resolved against
+# the layout, so it is not the shape this looks for; the physical-register base
+# form (`mir.op_mem_preg`) is. Both register fields count - a base and, when the
+# index is a physical register, the index - since either keeps the pointer live.
+# ---
+# o:   the operand to test
+# fp:  the target's frame-pointer register id
+# sp:  the target's stack-pointer register id
+# ret: true when the operand reads or writes relative to fp or sp
+fun operand_is_frame_relative(o: *mir.MirOperand, fp: u32, sp: u32) bool {
+    if (o.kind != mir.MIR_OP_MEM) { ret false; }
+    if (o.vreg == mir.MIR_VREG_NIL && (o.preg == fp || o.preg == sp)) { ret true; }
+    if (o.index_is_preg && (o.index == fp || o.index == sp))          { ret true; }
+    ret false;
+}
+
 # look up the frame-pointer offset assigned to a MIR value's slot
+#
+# `bias` is the ONE thing that differs between targets, so it is a named argument
+# rather than three copies of this walk. the frame phase lays slots out relative to
+# a frame pointer that sits immediately above the locals; a target whose prologue
+# reserves space between the two must subtract that reservation or the offsets
+# alias what the prologue saved. x86-64 and aarch64 reserve nothing there and pass
+# 0; riscv64 pins `s0` at the frame top and passes its ra/s0-plus-callee-saved
+# reservation. `isa.asm.SlotFn` documents the same fact from the `{name}` side.
+#
+# measured over an identical corpus, one record per lookup (#2291): the bias is 0
+# on every one of 12 969 x86-64 and 7 291 aarch64 lookups, and nonzero on all
+# 3 865 riscv64 ones, ranging 16..200 bytes. it is not an occasional correction.
 # ---
 # frame: the laid-out frame to search
 # v:     the MIR value id whose slot offset is requested
-# ret:   the negative offset, or none if `v` owns no frame slot
-pub fun slot_offset(frame: *mir.MirFrame, v: u32) O.Option[i64] {
+# bias:  bytes the prologue reserves between the frame pointer and the locals
+# ret:   the offset, or none if `v` owns no frame slot
+pub fun slot_offset(frame: *mir.MirFrame, v: u32, bias: i64) O.Option[i64] {
     val opt_slot: O.Option[*mir.MirSlot] = slot_find(frame, v);
     if (!O.is_some[*mir.MirSlot](opt_slot)) { ret O.none[i64](); }
-    ret O.some[i64](O.unwrap[*mir.MirSlot](opt_slot).offset);
+    ret O.some[i64](O.unwrap[*mir.MirSlot](opt_slot).offset - bias);
 }
 
 # report whether a MIR value owns a frame slot
@@ -192,19 +316,297 @@ test "mach.lang.be.codegen.frame.slot_offset:alloca_and_spill_lookup" {
     frame.align         = 0;
     frame.outgoing_size = 0;
 
-    val opt_off10: O.Option[i64] = slot_offset(?frame, 10);
+    val opt_off10: O.Option[i64] = slot_offset(?frame, 10, 0);
     if (!O.is_some[i64](opt_off10))      { ret 1; }
     if (O.unwrap[i64](opt_off10) != -16) { ret 1; }
 
-    val opt_off20: O.Option[i64] = slot_offset(?frame, 20);
+    val opt_off20: O.Option[i64] = slot_offset(?frame, 20, 0);
     if (!O.is_some[i64](opt_off20))      { ret 1; }
     if (O.unwrap[i64](opt_off20) != -24) { ret 1; }
 
-    val opt_off99: O.Option[i64] = slot_offset(?frame, 99);
+    val opt_off99: O.Option[i64] = slot_offset(?frame, 99, 0);
     if (O.is_some[i64](opt_off99))       { ret 1; }
 
     if (!is_alloca_slot(?frame, 10)) { ret 1; }
     if (is_alloca_slot(?frame, 20))  { ret 1; }
     if (!is_slot(?frame, 10))        { ret 1; }
+    ret 0;
+}
+
+# the frame-pointer and stack-pointer register ids the omission tests use. arbitrary
+# distinct values: `omits_frame` compares operand register fields against whatever it
+# is handed, so the numbering matters only in being distinguishable from a third id
+# the tests use for an ordinary register.
+val TEST_FP:    u32 = 5;
+val TEST_SP:    u32 = 4;
+val TEST_OTHER: u32 = 9;
+
+# build a one-block function around `instrs`, with an otherwise empty frame
+# ---
+# blk:    caller-owned block storage
+# func:   caller-owned function storage, filled in
+# instrs: the block's instruction array
+# n:      number of instructions
+fun mk_func(blk: *mir.MirBlock, func: *mir.MirFunction, instrs: *mir.MirInstr, n: u32) {
+    blk.id          = 0;
+    blk.instrs      = instrs;
+    blk.instr_count = n;
+    blk.instr_cap   = n;
+    blk.preds       = nil;
+    blk.pred_count  = 0;
+    blk.pred_cap    = 0;
+
+    func.blocks      = blk;
+    func.block_count = 1;
+    func.block_cap   = 1;
+    func.vregs       = nil;
+    func.vreg_count  = 0;
+    func.vreg_cap    = 0;
+
+    func.frame.slots         = nil;
+    func.frame.slot_count    = 0;
+    func.frame.slot_cap      = 0;
+    func.frame.size          = 0;
+    func.frame.align         = 16;
+    func.frame.outgoing_size = 0;
+    func.frame.omit          = false;
+    func.callee_mask         = 0;
+    func.callee_mask_fp      = 0;
+    func.naked               = false;
+}
+
+# fill `mi` as an instruction with no operands
+# ---
+# mi: the instruction to fill
+# op: its opcode
+fun mk_instr(mi: *mir.MirInstr, op: mir.MirOpcode) {
+    mi.opcode            = op;
+    mi.operands          = nil;
+    mi.operand_count     = 0;
+    mi.width             = 8;
+    mi.src_width         = 8;
+    mi.asm_block         = nil;
+    mi.dbg_bindings      = nil;
+    mi.dbg_binding_count = 0;
+    mi.inline_site       = 0;
+    mi.vec_lane          = 0;
+}
+
+# a leaf that allocates nothing and touches neither pointer omits its frame - the
+# shape #1940 exists for. mutating `omits_frame` to answer false unconditionally
+# fails here, and mutating it to answer true unconditionally fails every disqualifier
+# test below
+test "mach.lang.be.codegen.frame.omits_frame:bare_leaf_omits" {
+    var instrs: [2]mir.MirInstr;
+    mk_instr(?instrs[0], mir.MIR_ADD);
+    mk_instr(?instrs[1], mir.MIR_RET);
+
+    var blk: mir.MirBlock;
+    var func: mir.MirFunction;
+    mk_func(?blk, ?func, ?instrs[0], 2);
+
+    if (!omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+    ret 0;
+}
+
+# each frame fact the compiler itself allocated keeps the frame: a slot, a callee-saved
+# GP register, a callee-saved vector register, or an outgoing-argument region. deleting
+# any one of the four guards in `omits_frame` fails this test
+test "mach.lang.be.codegen.frame.omits_frame:allocated_frame_keeps_it" {
+    var instrs: [1]mir.MirInstr;
+    mk_instr(?instrs[0], mir.MIR_RET);
+
+    var blk: mir.MirBlock;
+    var func: mir.MirFunction;
+
+    mk_func(?blk, ?func, ?instrs[0], 1);
+    func.frame.size = 16;
+    if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+
+    mk_func(?blk, ?func, ?instrs[0], 1);
+    func.callee_mask = 1 << 3;
+    if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+
+    mk_func(?blk, ?func, ?instrs[0], 1);
+    func.callee_mask_fp = 1 << 6;
+    if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+
+    mk_func(?blk, ?func, ?instrs[0], 1);
+    func.frame.outgoing_size = 32;
+    if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+
+    ret 0;
+}
+
+# a call keeps the frame. entry RSP is 8 mod 16 and the frame-pointer push is what
+# restores the 16-byte call boundary, so a frame-omitting function that called
+# anything would hand its callee a misaligned stack. deleting the MIR_CALL scan fails
+# here
+test "mach.lang.be.codegen.frame.omits_frame:a_call_keeps_the_frame" {
+    var instrs: [2]mir.MirInstr;
+    mk_instr(?instrs[0], mir.MIR_CALL);
+    mk_instr(?instrs[1], mir.MIR_RET);
+
+    var blk: mir.MirBlock;
+    var func: mir.MirFunction;
+    mk_func(?blk, ?func, ?instrs[0], 2);
+
+    if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+    ret 0;
+}
+
+# a memory operand based on the frame or stack pointer keeps the frame: an incoming
+# stack parameter is lowered to `[fp + incoming_arg_base + off]` and stays addressable
+# only while the frame pointer is live. eliding such a function is a miscompile that
+# still returns the right answer for a small enough argument list, so this is the
+# guard worth mutating. an ordinary physical-register base, and a frame-slot base
+# (which carries a slot key rather than a register), both stay elidable
+test "mach.lang.be.codegen.frame.omits_frame:frame_relative_operand_keeps_the_frame" {
+    var blk: mir.MirBlock;
+    var func: mir.MirFunction;
+
+    var fp_ops: [1]mir.MirOperand;
+    fp_ops[0] = mir.op_mem_preg(TEST_FP, 16);
+    var fp_instrs: [1]mir.MirInstr;
+    mk_instr(?fp_instrs[0], mir.MIR_LOAD);
+    fp_instrs[0].operands      = ?fp_ops[0];
+    fp_instrs[0].operand_count = 1;
+    mk_func(?blk, ?func, ?fp_instrs[0], 1);
+    if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+
+    var sp_ops: [1]mir.MirOperand;
+    sp_ops[0] = mir.op_mem_preg(TEST_SP, 8);
+    var sp_instrs: [1]mir.MirInstr;
+    mk_instr(?sp_instrs[0], mir.MIR_STORE);
+    sp_instrs[0].operands      = ?sp_ops[0];
+    sp_instrs[0].operand_count = 1;
+    mk_func(?blk, ?func, ?sp_instrs[0], 1);
+    if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+
+    var ix_ops: [1]mir.MirOperand;
+    ix_ops[0] = mir.op_mem_preg(TEST_OTHER, 0);
+    ix_ops[0].index         = TEST_FP;
+    ix_ops[0].index_is_preg = true;
+    var ix_instrs: [1]mir.MirInstr;
+    mk_instr(?ix_instrs[0], mir.MIR_LOAD);
+    ix_instrs[0].operands      = ?ix_ops[0];
+    ix_instrs[0].operand_count = 1;
+    mk_func(?blk, ?func, ?ix_instrs[0], 1);
+    if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+
+    var ok_ops: [1]mir.MirOperand;
+    ok_ops[0] = mir.op_mem_preg(TEST_OTHER, 0);
+    var ok_instrs: [1]mir.MirInstr;
+    mk_instr(?ok_instrs[0], mir.MIR_LOAD);
+    ok_instrs[0].operands      = ?ok_ops[0];
+    ok_instrs[0].operand_count = 1;
+    mk_func(?blk, ?func, ?ok_instrs[0], 1);
+    if (!omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+
+    ret 0;
+}
+
+# an inline-asm body carries no weight of its own (#2283). an asm-only leaf still
+# omits its frame - through the leaf rule, since an asm payload contributes no MIR
+# operand - but an asm body that also makes a call is framed like any other caller.
+# restoring the old `if (mi.asm_block != nil) { ret true; }` arm fails the second
+# half here, and it is a hang on aarch64 / riscv64 rather than a lost optimization:
+# the call overwrites the link register the omitted prologue never saved
+test "mach.lang.be.codegen.frame.omits_frame:asm_alone_omits_asm_with_a_call_does_not" {
+    var payload: mir.MirAsm;
+
+    var leaf: [2]mir.MirInstr;
+    mk_instr(?leaf[0], mir.MIR_ASM);
+    leaf[0].asm_block = ?payload;
+    mk_instr(?leaf[1], mir.MIR_RET);
+
+    var blk: mir.MirBlock;
+    var func: mir.MirFunction;
+    mk_func(?blk, ?func, ?leaf[0], 2);
+    if (!omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+
+    var calling: [2]mir.MirInstr;
+    mk_instr(?calling[0], mir.MIR_ASM);
+    calling[0].asm_block = ?payload;
+    mk_instr(?calling[1], mir.MIR_CALL);
+    mk_func(?blk, ?func, ?calling[0], 2);
+    if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+
+    # an asm body still needs the frame the compiler allocated under it
+    mk_func(?blk, ?func, ?leaf[0], 2);
+    func.frame.size = 8;
+    if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+
+    ret 0;
+}
+
+# `#[naked]` omits the frame by declaration, so it answers true through every
+# disqualifier the derived reason rejects: allocated slots, callee-saved registers,
+# an outgoing-argument region, a call, and a frame-pointer-relative operand. deleting
+# the `func.naked` arm fails this and leaves the decorator emitting a prologue the
+# author forbade
+test "mach.lang.be.codegen.frame.omits_frame:naked_omits_unconditionally" {
+    var ops: [1]mir.MirOperand;
+    ops[0] = mir.op_mem_preg(TEST_FP, 16);
+
+    var instrs: [2]mir.MirInstr;
+    mk_instr(?instrs[0], mir.MIR_CALL);
+    mk_instr(?instrs[1], mir.MIR_LOAD);
+    instrs[1].operands      = ?ops[0];
+    instrs[1].operand_count = 1;
+
+    var blk: mir.MirBlock;
+    var func: mir.MirFunction;
+    mk_func(?blk, ?func, ?instrs[0], 2);
+    func.frame.size          = 32;
+    func.callee_mask         = 1 << 3;
+    func.callee_mask_fp      = 1 << 6;
+    func.frame.outgoing_size = 16;
+
+    # every guard above says "keep the frame" ...
+    if (omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+    # ... and the declaration overrides all of them.
+    func.naked = true;
+    if (!omits_frame(?func, TEST_FP, TEST_SP)) { ret 1; }
+    ret 0;
+}
+
+# `run` writes the decision onto every function's frame, so the encoders read a fact
+# rather than re-deriving it. reverting `run` to leave `omit` untouched fails here
+test "mach.lang.be.codegen.frame.run:stamps_the_omission_decision" {
+    var leaf_instrs: [1]mir.MirInstr;
+    mk_instr(?leaf_instrs[0], mir.MIR_RET);
+
+    var call_instrs: [1]mir.MirInstr;
+    mk_instr(?call_instrs[0], mir.MIR_CALL);
+
+    var blocks: [2]mir.MirBlock;
+    var funcs: [2]mir.MirFunction;
+    mk_func(?blocks[0], ?funcs[0], ?leaf_instrs[0], 1);
+    mk_func(?blocks[1], ?funcs[1], ?call_instrs[0], 1);
+
+    var m: mir.MirModule;
+    m.alloc        = nil;
+    m.interner     = nil;
+    m.srcmap       = nil;
+    m.functions    = ?funcs[0];
+    m.function_len = 2;
+    m.function_cap = 2;
+
+    # only the two fields `run` reads are set: the ABI's stack alignment and the two
+    # register ids the frame-reference scan compares against.
+    var abi_vt: abi.AbiVTable;
+    abi_vt.stack_align = 16;
+
+    var tgt: target.Target;
+    tgt.abi                = ?abi_vt;
+    tgt.model.frame_ptr_reg = TEST_FP::i32;
+    tgt.model.stack_ptr_reg = TEST_SP::i32;
+
+    val r: R.Result[bool, str] = run(?tgt, ?m);
+    if (R.is_err[bool, str](r)) { ret 1; }
+
+    if (!funcs[0].frame.omit) { ret 1; }
+    if (funcs[1].frame.omit)  { ret 1; }
     ret 0;
 }

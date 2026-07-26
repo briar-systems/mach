@@ -27,6 +27,14 @@ syntax:
 fun up(p: u32) ^u32 { ret p; }      # public u32 flows into a secret slot
 ```
 
+A **literal is public by construction** and stays public through that coercion:
+its value sits in the instruction stream, so classifying it as secret would
+protect nothing. `var s: ^u32 = 5;` types `5` as `u32` and relies on the
+up-coerce. The join below is unaffected — a value *computed* with a secret is
+secret however its other operand is spelled — so `v << 3` on a secret `v` still
+yields a secret, while the constant `3` is not mistaken for a secret shift
+count.
+
 The reverse never happens implicitly. The only downgrade is the explicit `:^`
 strip below.
 
@@ -54,12 +62,18 @@ error decided by operand type:
 - a secret left operand of a short-circuiting `&&` / `||` (it is the branch the
   operator keys on; a secret right operand only taints the result)
 - a secret memory index (`table[i]` with `i` secret)
+- a secret memory address — an access through a secret *pointer*, whether by
+  `@p`, `p[i]`, or the auto-deref in `p.x`. The index and the address are the
+  two halves of one effective address, so both are gated. Only a secret
+  *pointer* is an address: a `^[N]T` or `^Rec` is a secret value living at a
+  public address, and a `*^T` is a public address to secret storage
 - a secret operand of the always-variable-latency `/` or `%`
 
 ```mach
-fun leak(a: ^u32, t: *u8) u8 {
+fun leak(a: ^u32, t: *u8, p: ^*u8) u8 {
     if (a) { ret 1; }       # error: secret value used as a branch condition
     ret t[a];               # error: secret value used as a memory index
+    ret @p;                 # error: secret value used as a memory address
 }
 ```
 
@@ -74,6 +88,13 @@ than the source alone, so they are reported at lowering:
 
 A secret value passed to a variadic pack is also rejected, including a secret
 wrapped inside an aggregate.
+
+The gates are checked against the types of the **instance**, not of the template.
+A generic's body is re-checked per instantiation under its concrete type
+arguments, and a pack-tailed function's body — the statements around its `$each`
+as well as the unrolled body itself — is re-typed per monomorphized instance, so
+a `T` that instantiates to a secret is gated exactly as the secret spelled out
+in full would be.
 
 ## Downgrade with `:^`
 
@@ -103,13 +124,45 @@ fun erase(p: *^u8) ptr { ret p; }     # error: cannot erase a secret pointer to 
 uni Bad { a: ^u32; b: u32; }          # error: variants disagree on secrecy
 ```
 
+The union rule is a property of the union **type**, not of the syntax that
+declared it, so it holds for an inline `uni { ... }` with no declaration to hang
+a check on, and at every **instance** of a generic union. At the declaration a
+variant typed by a generic parameter says nothing about secrecy, so `uni U[T] {
+a: T; b: u32; }` agrees there and is decided where each instance is formed:
+
+```mach
+uni U[T] { a: T; b: u32; }
+rec Box[T] { u: U[T]; }
+
+var s: U[^u32];                       # error: this instantiation makes the variants disagree
+var b: Box[^u32];                     # same error: the instance need not be spelled
+var p: U[u32];                        # fine, and so is an all-secret instantiation
+```
+
+A *partially* concrete template (`U[T, ^u32]` written inside another generic) is
+a legal annotation with both legal and illegal instantiations, so it is never
+rejected where it is written — only at the arguments that actually make a pair
+mixed.
+
 The check is **deep** and **fails closed**: a secret nested anywhere inside an
 aggregate (including a generic instance's lazily-materialized fields) counts as
 secret at these boundaries, and a placement the checker cannot prove severs no
-weld — a `:~` reinterpret across differing shapes, or a secrecy difference
-reachable through a function type — is rejected rather than allowed. This
-over-rejects in some safe cases (briar-systems/mach#2167); rejecting is the
-correct default for a confidentiality property.
+weld — a secrecy difference reachable through a function type, or a shape whose
+layout it cannot determine — is rejected rather than allowed.
+
+Two aggregates are compared **by byte extent**, not by field ordinal: matching
+`^` placement in the type graph does not put two fields on the same bytes, so
+each paired field must also agree in size and alignment. That is what keeps
+every later field aligned between the two, and without it a narrower secret on
+one side displaced a public field onto a secret one. Differing *shapes* are
+fine — with the common prefix identical byte for byte, a longer aggregate's
+extra fields provably begin past the shorter one's extent, so a public field
+beyond the secret is accepted. This holds only for sequential layout; a union
+overlays every variant at offset 0, so a differing-shape pair involving one is
+admitted only when neither side has a public-stored byte at all.
+
+The comparison reads the same layout the backend emits. Where it cannot
+determine a layout it declines, which rejects.
 
 ## `#[oblivious]` — the codegen contract
 
@@ -169,26 +222,53 @@ timing harness at `int/ct/` measures a branchless constant-time reference
 against a deliberately-leaky control and flags the leak with Welch's t-test —
 run it with `bash int/ct/ct.sh`.
 
+**What the timing harness does and does not assure.** The leakage model has
+three channels, and the harness does not cover them uniformly
+(briar-systems/mach#2363):
+
+| channel | assured by |
+|---|---|
+| control-flow trace | the source-level branch gate, plus the harness's latency mode |
+| variable-latency operands | the sema/lowering gates, plus the harness's latency mode |
+| memory-address trace | the source-level **secret-index and secret-address gates**, plus the harness's address mode |
+
+The two harness modes need opposite sampling and neither substitutes for the
+other. Latency mode times a large batch of calls per sample, which is what lifts
+a running-time difference above clock resolution. That same batching *hides* an
+address-trace leak: every call in a batch is handed the same input, so after the
+first call both input classes are reading a warm cache line and the single cache
+miss carrying the signal is averaged away. Measured on one function — a
+secret-indexed read over a table larger than the last-level cache — latency mode
+scores |t| ≈ 1–15 across runs (straddling its own threshold, so it neither
+confirms nor denies) while address mode, at one call per sample, scores in the
+hundreds.
+
+Two consequences worth stating plainly:
+
+- A clean latency-mode number for a table lookup is **not** evidence of
+  address-trace safety. It is the wrong instrument for that channel.
+- An address-trace leak is only *measurable* when the table exceeds the
+  last-level cache. A cache-resident table leaks its index just as truly and no
+  timing harness will see it. For small tables the property rests entirely on
+  the secret-index gate and on reading the emitted code.
+
 What does not hold — the known open holes:
 
-- **a generic instantiated inside a variadic-pack `$each` body is never
-  re-validated**, so it computes on a secret and prints it with no diagnostic.
-  Proven, security-blocking (briar-systems/mach#2177).
 - **`$fields` reflection projection inside a generic erases a secret field's
   secrecy**, which discloses the secret. Proven, security-blocking
   (briar-systems/mach#2168).
-- a **secret pointer dereference is gated only by the translation validator**,
-  which runs inside `#[oblivious]` functions alone, so anywhere else it compiles
-  with no diagnostic — where the equivalent secret *index* is a source-level
-  error everywhere (briar-systems/mach#2191)
-- deep secrecy placement over-rejects differing-shape aggregates that lack field
-  offsets — sound but too strict (briar-systems/mach#2167)
 - the validator over-taints a wide secret on a narrow-ALU target, rejecting a
   public-count shift as a secret memory address — a false positive; it fails safe
   (briar-systems/mach#2195)
-- a literal shift count coerces to `^T` and inherits secrecy, tripping the
-  constant-time shift gate — a false positive; it fails safe
-  (briar-systems/mach#2196)
+- a **member or index access through a secret pointer** is rejected by the
+  secret-address gate, but a `p.x` / `p[i]` on a plain `^Rec` or `^[N]T` — which
+  this page documents as legal — fails at lowering, which does not strip the `^`
+  before resolving the field. A spurious error, not a disclosure
+- an anonymous `uni` nested in a **generic** record does not get union layout:
+  its variants occupy distinct storage instead of overlapping
+  (briar-systems/mach#2239). A layout defect, not a secrecy one — the mixed-secrecy
+  rule rejects those instantiations either way — but it is the reason a
+  `Result[^u32, u32]` built before that rule landed leaked nothing at run time
 
 The validator's scope is the lowered MIR; it trusts instruction selection, width
 legalization, register allocation, and encoding to be timing-preserving.

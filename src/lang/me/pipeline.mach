@@ -38,6 +38,8 @@ use mach.lang.me.pass.dce;
 use mach.lang.me.pass.inline;
 use mach.lang.me.pass.mem2reg;
 use mach.lang.me.pass.scalarize;
+use mach.lang.me.transform.licm;
+use mach.lang.me.transform.sroa;
 use mach.lang.me.transform.vectorize;
 use mach.lang.source;
 use mach.lang.target;
@@ -70,10 +72,13 @@ pub val OPT_RELEASE: OptLevel = 1;
 # simd_require: the resolved `[profile.X] simd == "require"` posture (#2017); on an
 #               incapable target it turns a would-scalarize vector op into a build
 #               error at the same gate where the scalarize pass would otherwise run
+# float_reassoc: the resolved `[profile.X] float_reassoc` lever (#2160); when true the
+#               vectorizer may reassociate a float reduction into lane partials. false
+#               (the default) keeps every float reduction scalar and IEEE-strict
 # itn:          interner, consulted only on the require-error path to name the site
 # ret:          ok(true) on a clean pipeline, or an internal-compiler-error / a
 #               require-mode build-error message
-pub fun run(m: *ir.Module, tgt: *target.Target, level: OptLevel, verify_ir: bool, vectorize_enabled: bool, simd_require: bool, itn: *intern.Interner) R.Result[bool, str] {
+pub fun run(m: *ir.Module, tgt: *target.Target, level: OptLevel, verify_ir: bool, vectorize_enabled: bool, simd_require: bool, float_reassoc: bool, itn: *intern.Interner) R.Result[bool, str] {
     # entry verification sanity-checks the lowered input. reachability and
     # dominance are not enforced here: freshly-lowered IR still carries the
     # unreachable blocks the lowerer parks after terminators, which dce removes
@@ -137,6 +142,34 @@ pub fun run(m: *ir.Module, tgt: *target.Target, level: OptLevel, verify_ir: bool
         val res_verify_constfold2: R.Result[bool, str] = verify_stage(m, false, verify_ir);
         if (R.is_err[bool, str](res_verify_constfold2)) { ret res_verify_constfold2; }
 
+        # a reachability sweep before the split stage. inlining a non-returning callee
+        # and the constant-branch simplification above both strand predecessor-less
+        # blocks, and the mem2reg that finishes the split renames only reachable
+        # blocks -- an unreachable predecessor would leave a phi one incoming short of
+        # its block's predecessor multiset. the CFG is connected afterward (full=true).
+        val res_dce_pre: R.Result[bool, str] = dce.run(m);
+        if (R.is_err[bool, str](res_dce_pre)) { ret res_dce_pre; }
+        val res_verify_dce_pre: R.Result[bool, str] = verify_stage(m, true, verify_ir);
+        if (R.is_err[bool, str](res_verify_dce_pre)) { ret res_verify_dce_pre; }
+
+        # scalar replacement of aggregates (#2205): decompose every small record /
+        # array local whose address never escapes into per-field slots, so the
+        # `Result` / `Option` idiom stops round-tripping through memory. It leaves
+        # the field slots as plain load/store traffic, so a third mem2reg promotes
+        # them (and builds the scalar phis the shared slots of a split aggregate phi
+        # imply) before the late simplification sweep folds the copies away.
+        val res_sroa: R.Result[bool, str] = sroa.run(m, tgt);
+        if (R.is_err[bool, str](res_sroa)) { ret res_sroa; }
+        if (R.unwrap_ok[bool, str](res_sroa)) {
+            val res_verify_sroa: R.Result[bool, str] = verify_stage(m, true, verify_ir);
+            if (R.is_err[bool, str](res_verify_sroa)) { ret res_verify_sroa; }
+
+            val res_mem2reg3: R.Result[bool, str] = mem2reg.run(m);
+            if (R.is_err[bool, str](res_mem2reg3)) { ret res_mem2reg3; }
+            val res_verify_mem2reg3: R.Result[bool, str] = verify_stage(m, false, verify_ir);
+            if (R.is_err[bool, str](res_verify_mem2reg3)) { ret res_verify_mem2reg3; }
+        }
+
         # algebraic simplification: peephole identities (x+0, x*1, x&x, x^x, ...)
         # the all-constant cases constfold cannot reach. value-preserving by
         # construction (integer-only where float semantics differ).
@@ -168,6 +201,18 @@ pub fun run(m: *ir.Module, tgt: *target.Target, level: OptLevel, verify_ir: bool
         val res_verify_dce2: R.Result[bool, str] = verify_stage(m, true, verify_ir);
         if (R.is_err[bool, str](res_verify_dce2)) { ret res_verify_dce2; }
 
+        # loop-invariant code motion (#2204): lift work that does not change across a
+        # loop's iterations -- invariant loads, address arithmetic and the invariant
+        # leading walk of an indexed gep -- into the loop's preheader, so it is computed
+        # once per loop entry instead of once per iteration. Runs before vectorization so
+        # an invariant scalar operand is already available in the preheader. Relocates
+        # instructions between existing blocks (plus at most one gep per split) without
+        # touching the CFG, so reachability/dominance still hold (full=true).
+        val res_licm: R.Result[bool, str] = licm.run(m, tgt);
+        if (R.is_err[bool, str](res_licm)) { ret res_licm; }
+        val res_verify_licm: R.Result[bool, str] = verify_stage(m, true, verify_ir);
+        if (R.is_err[bool, str](res_verify_licm)) { ret res_verify_licm; }
+
         # element-wise loop vectorization (#2141): on a capable target, recognize
         # counted unit-stride element-wise maps that dependence analysis proves
         # independent and rewrite them to runtime-guarded 128-bit vector loops with a
@@ -175,7 +220,7 @@ pub fun run(m: *ir.Module, tgt: *target.Target, level: OptLevel, verify_ir: bool
         # is intentionally not byte-identical for vectorizable loops; rv64
         # (has_v128 == false) never enters and stays scalar.
         if (tgt.model.has_v128 && vectorize_enabled) {
-            val res_vec: R.Result[bool, str] = vectorize.run(m, tgt);
+            val res_vec: R.Result[bool, str] = vectorize.run(m, tgt, float_reassoc);
             if (R.is_err[bool, str](res_vec)) { ret res_vec; }
             if (R.unwrap_ok[bool, str](res_vec)) {
                 val res_dce_vec: R.Result[bool, str] = dce.run(m);
@@ -184,6 +229,19 @@ pub fun run(m: *ir.Module, tgt: *target.Target, level: OptLevel, verify_ir: bool
                 if (R.is_err[bool, str](res_verify_vec)) { ret res_verify_vec; }
             }
         }
+    }
+
+    # vector lane access is legalized ahead of the SIMD gate (#2236): a target that
+    # keeps vectors but has no lane-access form (x86-64 today) has every
+    # OP_VEC_EXTRACT / OP_VEC_INSERT rewritten to the vector's memory image here. a
+    # target selecting lane access natively keeps them to its isel, and a SIMD-
+    # incapable one has the scalarizer below expand them against the slots it already
+    # reserves - so this is inert for both, and only the middle case pays.
+    val res_lanes: R.Result[bool, str] = scalarize.expand_lane_ops(m, tgt);
+    if (R.is_err[bool, str](res_lanes)) { ret res_lanes; }
+    if (!tgt.model.has_lane_ops && tgt.model.has_v128) {
+        val res_verify_lanes: R.Result[bool, str] = verify_stage(m, true, verify_ir);
+        if (R.is_err[bool, str](res_verify_lanes)) { ret res_verify_lanes; }
     }
 
     # the single SIMD gate (#2017), keyed on the resolved posture over the target
@@ -240,7 +298,7 @@ fun require_msg(m: *ir.Module, tgt: *target.Target, itn: *intern.Interner, site:
 
     val rj: R.Result[str, str] = format.sprint(m.alloc,
         "simd = \"require\": vector {} in '{}' would scalarize on {} (target has no 128-bit SIMD); set simd = \"scalarize\" to build with the scalar expansion",
-        op, fname, tgt.arch.name);
+        op, fname, tgt.isa.name);
     if (R.is_err[str, str](rj)) { ret R.unwrap_err[str, str](rj); }
     ret R.unwrap_ok[str, str](rj);
 }
@@ -619,7 +677,7 @@ test "mach.lang.me.pipeline.run:simd_require_gate" {
     or { if (R.is_err[bool, str](builder.emit_ret(?b, R.unwrap_ok[value.Value, str](radd)))) { code = 1; } }
 
     # require + incapable + vector -> a precise error naming op, function, and arch
-    val e1: R.Result[bool, str] = run(?m, ?rv, OPT_DEBUG, false, true, true, ?itn);
+    val e1: R.Result[bool, str] = run(?m, ?rv, OPT_DEBUG, false, true, true, false, ?itn);
     if (R.is_ok[bool, str](e1)) { code = 1; }
     or {
         val msg: str = R.unwrap_err[bool, str](e1);
@@ -643,7 +701,7 @@ test "mach.lang.me.pipeline.run:simd_require_gate" {
     if (R.is_err[id.BlockId, str](rb2)) { ir.dnit(?m2); intern.dnit(?itn); ret 1; }
     builder.set_block(?b2, R.unwrap_ok[id.BlockId, str](rb2));
     if (R.is_err[bool, str](builder.emit_ret_void(?b2))) { code = 1; }
-    if (R.is_err[bool, str](run(?m2, ?rv, OPT_DEBUG, false, true, true, ?itn))) { code = 1; }
+    if (R.is_err[bool, str](run(?m2, ?rv, OPT_DEBUG, false, true, true, false, ?itn))) { code = 1; }
     ir.dnit(?m2);
 
     intern.dnit(?itn);

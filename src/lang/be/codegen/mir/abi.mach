@@ -46,21 +46,29 @@ val MAX_GP_ARG_REGS: i32 = 16;
 # validate that the active target exposes the ABI and ISA vtable surface
 #
 # ABI lowering is driven purely through the vtables, never gated by an architecture
-# check, so an absent ABI vtable or one missing the classify / arg / ret /
-# arg-register-file accessors (an unsupported convention) is a hard error rather
-# than a silent un-pre-colored off-path.
+# check, so an absent ABI vtable or one missing the classify / arg / ret accessors
+# (an unsupported convention) is a hard error rather than a silent un-pre-colored
+# off-path.
+#
+# Only the surface EVERY lowered call and parameter list reads is demanded here. A
+# capability a single conditional path consumes - the GP argument register file, the
+# variadic save model - is demanded by that path, at its point of use, so an absent
+# one is reported as the construct it actually blocks rather than as a precondition
+# of every call (#2273).
 # ---
 # tgt: the active target
 # ret: ok(true) when the vtable surface is present, or a loud error
 pub fun require_abi(tgt: *target.Target) R.Result[bool, str] {
-    if (tgt == nil)      { ret R.err[bool, str]("mir.lower_ir: nil target"); }
-    if (tgt.abi == nil)  { ret R.err[bool, str]("mir.lower_ir: target has no ABI vtable"); }
-    if (tgt.arch == nil) { ret R.err[bool, str]("mir.lower_ir: target has no ISA vtable"); }
+    if (tgt == nil)     { ret R.err[bool, str]("mir.lower_ir: nil target"); }
+    if (tgt.abi == nil) { ret R.err[bool, str]("mir.lower_ir: target has no ABI vtable"); }
+    # the isa, not `tgt.arch`: MIR lowering runs AHEAD of the whole-module fork, so a
+    # whole-module emitter reaches here carrying no register-machine contract. the
+    # register identities this pass needs come from `tgt.model`, the family-agnostic
+    # description, where a registerless target's -1 is a statement rather than a
+    # sentinel standing in for a contract it does not implement.
+    if (tgt.isa == nil) { ret R.err[bool, str]("mir.lower_ir: target has no ISA vtable"); }
     if (tgt.abi.arg_passing == nil || tgt.abi.ret_passing == nil) {
         ret R.err[bool, str]("mir.lower_ir: ABI vtable exposes no arg/ret classifier");
-    }
-    if (tgt.abi.gp_arg_regs == nil) {
-        ret R.err[bool, str]("mir.lower_ir: ABI vtable exposes no GP argument register file");
     }
     ret R.ok[bool, str](true);
 }
@@ -68,15 +76,20 @@ pub fun require_abi(tgt: *target.Target) R.Result[bool, str] {
 # read the physical register id of the `index`-th GP argument register
 #
 # Reads the active convention's GP argument bank (`tgt.abi.gp_arg_regs`, in passing
-# order). Used to find the integer register a win64 variadic float duplicates into.
-# Errors loudly when `index` is past the convention's GP argument file rather than
-# returning a wrong register.
+# order). Its sole consumer is the win64 variadic tail-float duplication, so the
+# bank is demanded here rather than by `require_abi`: a convention that publishes no
+# GP argument file is reported at the one construct that needs one. Errors loudly
+# when `index` is past the convention's GP argument file rather than returning a
+# wrong register.
 # ---
 # tgt:   the active target
 # index: zero-based GP argument-register index
 # out:   receives the physical register id on success
 # ret:   ok(true) on success, or a loud error
 pub fun abi_gp_arg_reg(tgt: *target.Target, index: i32, out: *i32) R.Result[bool, str] {
+    if (tgt.abi.gp_arg_regs == nil) {
+        ret R.err[bool, str]("mir.lower_ir: ABI vtable exposes no GP argument register file");
+    }
     var regs: [16]isa.Register;
     val fill: abi.RegFileFn = tgt.abi.gp_arg_regs::abi.RegFileFn;
     val n: i32 = fill(?regs[0]);
@@ -91,15 +104,17 @@ pub fun abi_gp_arg_reg(tgt: *target.Target, index: i32, out: *i32) R.Result[bool
 #
 # The call lowering reads its call-side facts (the conservative vector-count
 # register and win64 tail-float duplication) so the mechanism stays ABI-agnostic
-# and the convention-specific facts live in the vtable. Errors loudly when no ABI
-# exposes a va_model accessor (an unsupported convention).
+# and the convention-specific facts live in the vtable. Every caller sits on a
+# variadic path - the vector-count move and the tail-float duplication are the only
+# two facts the model carries - so a convention publishing no model is refused as
+# what it is: a convention that cannot make a variadic call.
 # ---
 # tgt: the active target
 # out: receives the convention's variadic save model on success
 # ret: ok(true) on success, or a loud error
 pub fun abi_va_model(tgt: *target.Target, out: *abi.VaModel) R.Result[bool, str] {
     if (tgt.abi.va_model == nil) {
-        ret R.err[bool, str]("mir.lower_ir: ABI vtable exposes no variadic save model");
+        ret R.err[bool, str]("mir.lower_ir: a variadic call is not supported by this calling convention (no variadic save model)");
     }
     val model: abi.VaModelFn = tgt.abi.va_model::abi.VaModelFn;
     @out = model();
@@ -770,13 +785,6 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
 
     val classify_arg: abi.ArgPassingFn = ctx.tgt.abi.arg_passing::abi.ArgPassingFn;
 
-    # the convention's variadic save model drives the pre-call vector-count move and
-    # the win64 variadic-float duplication - both ABI facts the call lowering reads
-    # from the model rather than naming a register or convention directly.
-    var vamodel: abi.VaModel;
-    val vmr: R.Result[bool, str] = abi_va_model(ctx.tgt, ?vamodel);
-    if (R.is_err[bool, str](vmr)) { ret vmr; }
-
     # classify the WHOLE declared signature once (the callee's IRT_FN rides on
     # `inst.aux_ty`, the call's result type on `inst.ty`); the return and every
     # fixed argument read their placement from this single layout so the call and
@@ -826,6 +834,14 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     # a vector return is the memory (sret) class on a scalarized target: it arrives by
     # address exactly like an aggregate, so it needs caller-owned result storage.
     val ret_mem:   bool = ret_aggr || (context.value_is_vector(ctx, ret_type) && rslot.class == abi.CLASS_SRET);
+    # a SCALAR returned indirectly: a convention with no register wide enough for the
+    # value (mos6502 returns everything past one byte this way) still hands the callee
+    # caller-owned storage, but the result is a VALUE, so the storage ADDRESS rides its
+    # own vreg and the value is loaded back out after the call - the result vreg must
+    # hold the scalar, not a pointer to it (#2195). Every wide-native convention reaches
+    # CLASS_SRET only for an aggregate (lp64 also for a vector, covered by `ret_mem`),
+    # so this is false there and the lowering is byte-identical.
+    val ret_sret_scalar: bool = rslot.class == abi.CLASS_SRET && !ret_mem;
 
     # the running register / stack cursors resume from the fixed-parameter walk so
     # a variadic call's tail arguments continue against the same counters.
@@ -839,8 +855,25 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     # move (>16B) passes it and the two-register form (9-16B) stores each half into
     # it; downstream consumers then read the aggregate result by this pointer.
     val res_dst: u32 = context.instr_vreg(ctx, iid);
+    # the hidden result-storage pointer the callee writes through: the result vreg
+    # itself for a by-address return, a separate address vreg for an indirect scalar.
+    var sret_ptr: u32 = mir.MIR_VREG_NIL;
     if (ret_mem && res_dst != mir.MIR_VREG_NIL) {
         val ra: R.Result[bool, str] = context.alloc_result_storage(ctx, mb, res_dst, ret_size, context.ret_align(ctx, ret_type));
+        if (R.is_err[bool, str](ra)) {
+            sig_layout_free(ctx, ?layout);
+            ret ra;
+        }
+        sret_ptr = res_dst;
+    }
+    or (ret_sret_scalar && res_dst != mir.MIR_VREG_NIL) {
+        val sa: R.Result[u32, str] = context.new_vreg(ctx, mir.REG_CLASS_GP);
+        if (R.is_err[u32, str](sa)) {
+            sig_layout_free(ctx, ?layout);
+            ret R.err[bool, str](R.unwrap_err[u32, str](sa));
+        }
+        sret_ptr = R.unwrap_ok[u32, str](sa);
+        val ra: R.Result[bool, str] = context.alloc_result_storage(ctx, mb, sret_ptr, ret_size, context.ret_align(ctx, ret_type));
         if (R.is_err[bool, str](ra)) {
             sig_layout_free(ctx, ?layout);
             ret ra;
@@ -850,12 +883,12 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     if (rslot.class == abi.CLASS_SRET) {
         # the caller allocates the return storage (above) and passes its address in
         # the convention's indirect-result register (RDI under SysV, RCX under win64,
-        # the dedicated X8 under AAPCS64); the result vreg names that storage. for an
-        # in-argfile convention the layout already reserved the GP slot in `gp_used`.
-        if (res_dst != mir.MIR_VREG_NIL) {
+        # the dedicated X8 under AAPCS64). for an in-argfile convention the layout
+        # already reserved the GP slot in `gp_used`.
+        if (sret_ptr != mir.MIR_VREG_NIL) {
             val sret_reg: i32 = ctx.tgt.abi.indirect_result_reg;
-            val pre: R.Result[bool, str] = context.emit_mov(ctx, mb,
-                mir.op_preg(sret_reg::u32), mir.op_vreg(res_dst));
+            val pre: R.Result[bool, str] = context.emit_mov_w(ctx, mb,
+                mir.op_preg(sret_reg::u32), mir.op_vreg(sret_ptr), ptr_move_width(ctx));
             if (R.is_err[bool, str](pre)) {
                 sig_layout_free(ctx, ?layout);
                 ret pre;
@@ -928,18 +961,29 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         # slots) sees it. duplicate the float's bits into the slot's GP argument
         # register (the positional slot is `gp_used + fp_used`, before the advance);
         # the move is cross-bank (MOVQ), gated on the model's `float_dup_gp` so SysV -
-        # whose FP save area captures floats directly - never emits it.
-        if (pidx >= layout.param_count && vamodel.float_dup_gp && slot.class == abi.CLASS_FP) {
-            var dup_reg: i32 = 0;
-            val dr: R.Result[bool, str] = abi_gp_arg_reg(ctx.tgt, gp_used + fp_used, ?dup_reg);
-            if (R.is_err[bool, str](dr)) {
+        # whose FP save area captures floats directly - never emits it. the model is
+        # read here, inside the tail-float arm, rather than once per call: it is a
+        # variadic-only fact, and demanding it of every call makes a fixed-arity call
+        # report a variadic problem it never had (#2273).
+        if (pidx >= layout.param_count && slot.class == abi.CLASS_FP) {
+            var vamodel: abi.VaModel;
+            val vmr: R.Result[bool, str] = abi_va_model(ctx.tgt, ?vamodel);
+            if (R.is_err[bool, str](vmr)) {
                 sig_layout_free(ctx, ?layout);
-                ret dr;
+                ret vmr;
             }
-            val dm: R.Result[bool, str] = context.emit_mov(ctx, mb, mir.op_preg(dup_reg::u32), argop);
-            if (R.is_err[bool, str](dm)) {
-                sig_layout_free(ctx, ?layout);
-                ret dm;
+            if (vamodel.float_dup_gp) {
+                var dup_reg: i32 = 0;
+                val dr: R.Result[bool, str] = abi_gp_arg_reg(ctx.tgt, gp_used + fp_used, ?dup_reg);
+                if (R.is_err[bool, str](dr)) {
+                    sig_layout_free(ctx, ?layout);
+                    ret dr;
+                }
+                val dm: R.Result[bool, str] = context.emit_mov(ctx, mb, mir.op_preg(dup_reg::u32), argop);
+                if (R.is_err[bool, str](dm)) {
+                    sig_layout_free(ctx, ?layout);
+                    ret dm;
+                }
             }
         }
 
@@ -977,10 +1021,15 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     # call carries no such write. the move is a 32-bit `mov eax, imm32` (the count is 0-8,
     # so writing EAX sets AL and zero-extends the rest), five bytes rather than the 7-byte
     # 64-bit immediate form.
-    if (vamodel.vector_count_reg >= 0 && variadic_call) {
-        val al: R.Result[bool, str] = context.emit_mov_w(ctx, mb,
-            mir.op_preg(vamodel.vector_count_reg::u32), mir.op_imm(fp_used::i64), 4::u8);
-        if (R.is_err[bool, str](al)) { ret al; }
+    if (variadic_call) {
+        var vamodel: abi.VaModel;
+        val vmr: R.Result[bool, str] = abi_va_model(ctx.tgt, ?vamodel);
+        if (R.is_err[bool, str](vmr)) { ret vmr; }
+        if (vamodel.vector_count_reg >= 0) {
+            val al: R.Result[bool, str] = context.emit_mov_w(ctx, mb,
+                mir.op_preg(vamodel.vector_count_reg::u32), mir.op_imm(fp_used::i64), 4::u8);
+            if (R.is_err[bool, str](al)) { ret al; }
+        }
     }
 
     # the call itself: the caller-saved clobber barrier (see mir.MIR_CALL docs).
@@ -988,13 +1037,9 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
     if (R.is_err[*mir.MirOperand, str](rcall)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](rcall)); }
     val callops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](rcall);
     callops[0] = context.lower_value(ctx, inst.operands[0]);
-    var cmi: mir.MirInstr;
-    cmi.opcode        = mir.MIR_CALL;
-    cmi.operands      = callops;
-    cmi.operand_count = 1;
     # the call selects to an address-sized CALL; its operand carries no value width.
-    cmi.width         = ctx.tgt.model.gpr_width::u8;
-    cmi.src_width     = ctx.tgt.model.gpr_width::u8;
+    var cmi: mir.MirInstr = mir.instr(mir.MIR_CALL, callops, 1,
+                                      ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
     val pc: R.Result[bool, str] = context.push_instr(ctx, mb, cmi);
     if (R.is_err[bool, str](pc)) { ret pc; }
 
@@ -1006,18 +1051,21 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         val rr: R.Result[bool, str] = emit_ret_slot_to_vreg(ctx, mb, rslot, dst, ret_aggr, ret_size);
         if (R.is_err[bool, str](rr)) { ret rr; }
     }
+    # an indirect SCALAR return: the callee stored the value into the caller-owned
+    # storage, so load it back at the scalar's own width. a by-address return needs no
+    # such reload - its result vreg already names the storage (#2195).
+    if (ret_sret_scalar && dst != mir.MIR_VREG_NIL) {
+        val lr: R.Result[bool, str] = context.emit_load_from_w(ctx, mb, dst, mir.op_mem_value(sret_ptr, 0), ret_size::u8);
+        if (R.is_err[bool, str](lr)) { ret lr; }
+    }
     if (dst != mir.MIR_VREG_NIL) {
         val rres: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 1::usize);
         if (R.is_err[*mir.MirOperand, str](rres)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](rres)); }
         val resops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](rres);
         resops[0] = mir.op_vreg(dst);
-        var rmi: mir.MirInstr;
-        rmi.opcode        = mir.MIR_CALL_RES;
-        rmi.operands      = resops;
-        rmi.operand_count = 1;
         # a pure liveness marker; it emits no bytes, so its width is unobserved.
-        rmi.width         = ctx.tgt.model.gpr_width::u8;
-        rmi.src_width     = ctx.tgt.model.gpr_width::u8;
+        var rmi: mir.MirInstr = mir.instr(mir.MIR_CALL_RES, resops, 1,
+                                          ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
         val pr: R.Result[bool, str] = context.push_instr(ctx, mb, rmi);
         if (R.is_err[bool, str](pr)) { ret pr; }
     }
@@ -1165,7 +1213,7 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
         val sr: R.Result[bool, str] = spill_vector_to_temp(ctx, mb, argop, size, ?addr);
         if (R.is_err[bool, str](sr)) { ret sr; }
         if (slot.class == abi.CLASS_VEC_STACK_BYREF) {
-            val sp: u32 = ctx.tgt.arch.stack_ptr_reg::u32;
+            val sp: u32 = ctx.tgt.model.stack_ptr_reg::u32;
             ret context.emit_store_to(ctx, mb, mir.op_mem_preg(sp, stack_off), mir.op_vreg(addr));
         }
         ret context.emit_mov(ctx, mb, mir.op_preg(slot.reg::u32), mir.op_vreg(addr));
@@ -1173,7 +1221,7 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
     if (slot.class == abi.CLASS_STACK_BYREF) {
         # win64 by-reference overflow: store the hidden aggregate pointer into the
         # outgoing stack slot, not a by-value copy of the aggregate bytes.
-        val sp: u32 = ctx.tgt.arch.stack_ptr_reg::u32;
+        val sp: u32 = ctx.tgt.model.stack_ptr_reg::u32;
         var base: u32 = mir.MIR_VREG_NIL;
         val ar: R.Result[bool, str] = context.addr_to_vreg(ctx, mb, argop, ?base);
         if (R.is_err[bool, str](ar)) { ret ar; }
@@ -1181,8 +1229,8 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
     }
     if (slot.class == abi.CLASS_STACK) {
         # outgoing stack arguments are addressed off the ISA's stack pointer
-        # (x86-64 RSP), named through `tgt.arch.stack_ptr_reg` rather than a literal.
-        val sp: u32 = ctx.tgt.arch.stack_ptr_reg::u32;
+        # (x86-64 RSP), named through `tgt.model.stack_ptr_reg` rather than a literal.
+        val sp: u32 = ctx.tgt.model.stack_ptr_reg::u32;
         if (is_aggr) {
             # the by-value aggregate is copied into the outgoing stack slot from its
             # storage; argop is a pointer to that storage.
@@ -1190,8 +1238,11 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
         }
         # the outgoing scalar argument is stored at `[sp + stack_off]`; the stack
         # pointer is fixed after the prologue and points at the base of the outgoing
-        # region, so the store lands in the slot frame.run reserved for it.
-        ret context.emit_store_to(ctx, mb, mir.op_mem_preg(sp, stack_off), argop);
+        # region, so the store lands in the slot frame.run reserved for it. the write
+        # is the scalar's own width when that exceeds the machine word (the read twin
+        # in `emit_param_slot`), so an 8-bit target passes all of a wide argument.
+        ret context.emit_store_to_w(ctx, mb, mir.op_mem_preg(sp, stack_off), argop,
+                                    scalar_mem_move_width(ctx.tgt.model.gpr_width, size));
     }
     if (slot.class == abi.CLASS_BYREF) {
         # the aggregate is passed by hidden pointer; move its address into the
@@ -1199,7 +1250,7 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
         var base: u32 = mir.MIR_VREG_NIL;
         val ar: R.Result[bool, str] = context.addr_to_vreg(ctx, mb, argop, ?base);
         if (R.is_err[bool, str](ar)) { ret ar; }
-        ret context.emit_mov(ctx, mb, mir.op_preg(slot.reg::u32), mir.op_vreg(base));
+        ret context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), mir.op_vreg(base), ptr_move_width(ctx));
     }
     if (is_aggr) {
         # register / register-plus-stack aggregate: place each chunk from the
@@ -1212,7 +1263,7 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
         plan.store      = false;
         plan.mem_base   = base;
         plan.mem_slot   = false;
-        plan.stack_base = ctx.tgt.arch.stack_ptr_reg::u32;
+        plan.stack_base = ctx.tgt.model.stack_ptr_reg::u32;
         plan.stack_off  = stack_off;
         plan.stack_ok   = true;
         ret materialize_pieces(ctx, mb, slot, plan);
@@ -1230,7 +1281,7 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
     # single GP register scalar argument. a 32-bit value rides a width-4 move so the
     # backend re-extends it to the register width by its own convention (RV64 lp64
     # sign-extends a 32-bit register).
-    ret context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), argop, scalar_reg_move_width(ctx, size));
+    ret context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), argop, scalar_reg_move_width(ctx.tgt.model.gpr_width, size));
 }
 
 # store a register-resident vector to a fresh 16-byte-aligned frame temporary and
@@ -1296,13 +1347,56 @@ fun capture_slot_reg(ctx: *context.LowerCtx, mb: *mir.MirBlock, dst: u32, slot: 
 # register. a 32-bit value rides a width-4 move so a backend can re-extend it to the
 # register width by its own convention -- RV64 lp64 holds a 32-bit register
 # sign-extended, so a directly materialized i32 constant must be re-signed there, and
-# the carried width is what lets it. every other size keeps the full gpr-width move:
-# a 64-bit value / pointer is already register-width, and narrowing below 32 bits
-# would leave a target's upper register bits unspecified (an x86 `mov al` does not
-# clear them). value-equivalent on x86 / arm64, where a 32-bit move zero-extends
-fun scalar_reg_move_width(ctx: *context.LowerCtx, size: u64) u8 {
+# the carried width is what lets it. a scalar WIDER than the machine word rides its
+# own size: on a target whose register is narrower than a scalar (the 8-bit mos6502)
+# the machine word would truncate the value, and the carried width is what the width
+# legalizer splits into register-sized lanes. every other size keeps the full
+# gpr-width move: a 64-bit value / pointer is already register-width, and narrowing
+# below 32 bits would leave a target's upper register bits unspecified (an x86
+# `mov al` does not clear them). value-equivalent on x86 / arm64, where a 32-bit move
+# zero-extends; inert on every wide-native target, whose widest scalar is the machine
+# word
+# ---
+# gpr_width: the target's machine word in bytes
+# size:      the scalar's byte size
+# ret:       the move width in bytes
+fun scalar_reg_move_width(gpr_width: u32, size: u64) u8 {
     if (size == 4) { ret 4; }
-    ret ctx.tgt.model.gpr_width::u8;
+    if (size > gpr_width::u64) { ret size::u8; }
+    ret gpr_width::u8;
+}
+
+# the move width for reading / writing a scalar in its incoming / outgoing STACK
+# argument slot
+#
+# The memory twin of `scalar_reg_move_width`, and it deliberately lacks that
+# function's 32-bit special case: a stack slot is not a register, so nothing has to
+# re-extend it and the machine-word access every wide-native target already emits is
+# preserved exactly. The one rule it adds is the same: a scalar wider than the machine
+# word is accessed at its own size, so an 8-bit target reads all four bytes of a `u32`
+# stack parameter instead of its low byte.
+# ---
+# gpr_width: the target's machine word in bytes
+# size:      the scalar's byte size
+# ret:       the access width in bytes
+fun scalar_mem_move_width(gpr_width: u32, size: u64) u8 {
+    if (size > gpr_width::u64) { ret size::u8; }
+    ret gpr_width::u8;
+}
+
+# the move width for placing a hidden POINTER -- an sret result-storage address, a
+# by-reference aggregate address -- into its register or stack slot
+#
+# A pointer is `pointer_width` bytes, which equals the machine word on every
+# wide-native target and exceeds it on a target whose registers are narrower than an
+# address (mos6502's 8-bit registers, 16-bit addresses). Carrying the pointer's own
+# width is what keeps the placement from truncating the address there, and what the
+# width legalizer splits into register-sized lanes.
+# ---
+# ctx: the active lowering context (supplies the pointer width)
+# ret: the pointer move width in bytes
+fun ptr_move_width(ctx: *context.LowerCtx) u8 {
+    ret ctx.tgt.model.pointer_width::u8;
 }
 
 # grow the function's reserved outgoing-argument region to cover one call's footprint
@@ -1388,7 +1482,8 @@ pub fun lower_params(ctx: *context.LowerCtx, mb: *mir.MirBlock) R.Result[bool, s
             ret R.err[bool, str](R.unwrap_err[u32, str](svr));
         }
         val sv: u32 = R.unwrap_ok[u32, str](svr);
-        val mv: R.Result[bool, str] = context.emit_mov(ctx, mb, mir.op_vreg(sv), mir.op_preg(sret_reg::u32));
+        val mv: R.Result[bool, str] = context.emit_mov_w(ctx, mb, mir.op_vreg(sv), mir.op_preg(sret_reg::u32),
+                                                         ptr_move_width(ctx));
         if (R.is_err[bool, str](mv)) {
             sig_layout_free(ctx, ?layout);
             ret mv;
@@ -1461,11 +1556,12 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSl
         # win64 by-reference overflow: the caller stored the hidden aggregate
         # pointer into this stack slot; load it so `pv` is the aggregate's address,
         # matching the register BYREF parameter form.
-        val fp: u32 = ctx.tgt.arch.frame_ptr_reg::u32;
-        ret context.emit_mov(ctx, mb, mir.op_vreg(pv), mir.op_mem_preg(fp, arg_base + stack_off));
+        val fp: u32 = ctx.tgt.model.frame_ptr_reg::u32;
+        ret context.emit_mov_w(ctx, mb, mir.op_vreg(pv), mir.op_mem_preg(fp, arg_base + stack_off),
+                               ptr_move_width(ctx));
     }
     if (slot.class == abi.CLASS_STACK) {
-        val fp: u32 = ctx.tgt.arch.frame_ptr_reg::u32;
+        val fp: u32 = ctx.tgt.model.frame_ptr_reg::u32;
         if (is_aggr) {
             # the aggregate's bytes already sit in the caller's by-value stack copy;
             # `pv` is its address so reads / the local copy index it directly.
@@ -1473,10 +1569,13 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSl
         }
         # a scalar stack argument lives above the return address and saved frame
         # pointer, addressed through the physical frame pointer at the running offset.
-        ret context.emit_mov(ctx, mb, mir.op_vreg(pv), mir.op_mem_preg(fp, arg_base + stack_off));
+        # the read is the scalar's own width when that exceeds the machine word, so an
+        # 8-bit target loads all of a wide parameter rather than its low byte.
+        ret context.emit_mov_w(ctx, mb, mir.op_vreg(pv), mir.op_mem_preg(fp, arg_base + stack_off),
+                               scalar_mem_move_width(ctx.tgt.model.gpr_width, size));
     }
     if (slot.class == abi.CLASS_BYREF) {
-        ret context.emit_mov(ctx, mb, mir.op_vreg(pv), mir.op_preg(slot.reg::u32));
+        ret context.emit_mov_w(ctx, mb, mir.op_vreg(pv), mir.op_preg(slot.reg::u32), ptr_move_width(ctx));
     }
     if (is_aggr) {
         # register / register-plus-stack aggregate: materialize a spill slot keyed on
@@ -1489,7 +1588,7 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSl
         plan.store      = true;
         plan.mem_base   = pv;
         plan.mem_slot   = true;
-        plan.stack_base = ctx.tgt.arch.frame_ptr_reg::u32;
+        plan.stack_base = ctx.tgt.model.frame_ptr_reg::u32;
         plan.stack_off  = arg_base + stack_off;
         plan.stack_ok   = true;
         ret materialize_pieces(ctx, mb, slot, plan);
@@ -1603,16 +1702,29 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
     val rvop: mir.MirOperand = R.unwrap_ok[mir.MirOperand, str](rvr);
 
     if (slot.class == abi.CLASS_SRET) {
-        # copy the returned aggregate into the caller-owned result storage (the
-        # hidden pointer captured from the first GP argument register in
-        # `lower_params`), then return that pointer in RAX. without the copy the
-        # callee would return the address of a dead local the caller never reads.
+        # write the returned value into the caller-owned result storage (the hidden
+        # pointer captured from the indirect-result register in `lower_params`), then
+        # return that pointer in the return register. without the write the callee would
+        # return the address of a dead local the caller never reads.
         if (ctx.sret_vreg == mir.MIR_VREG_NIL) {
             ret R.err[bool, str]("mir.lower_ir: sret return without a captured result-storage pointer");
         }
-        val cr: R.Result[bool, str] = context.copy_aggregate(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rsz);
-        if (R.is_err[bool, str](cr)) { ret cr; }
-        val mr: R.Result[bool, str] = context.emit_mov(ctx, mb, mir.op_preg(slot.reg::u32), mir.op_vreg(ctx.sret_vreg));
+        # an aggregate / vector flows BY ADDRESS, so `rvop` is a pointer and the write is
+        # a memcpy out of that storage. a SCALAR returned indirectly - a convention with
+        # no register wide enough for it, mos6502's every-return-past-one-byte - is a
+        # VALUE in a register, so it is STORED at the scalar's own width: memcpy'ing from
+        # it would dereference the value as an address (#2195). Every wide-native
+        # convention reaches CLASS_SRET only for an aggregate (lp64 also for a vector),
+        # so the scalar arm is unreachable there and this is byte-identical.
+        if (rag || context.value_is_vector(ctx, rt)) {
+            val cr: R.Result[bool, str] = context.copy_aggregate(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rsz);
+            if (R.is_err[bool, str](cr)) { ret cr; }
+        } or {
+            val sr: R.Result[bool, str] = context.emit_store_to_w(ctx, mb, mir.op_mem_value(ctx.sret_vreg, 0), rvop, rsz::u8);
+            if (R.is_err[bool, str](sr)) { ret sr; }
+        }
+        val mr: R.Result[bool, str] = context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32),
+                                                         mir.op_vreg(ctx.sret_vreg), ptr_move_width(ctx));
         if (R.is_err[bool, str](mr)) { ret mr; }
     } or (rag) {
         # aggregate return by address: load each register chunk from the aggregate's
@@ -1646,7 +1758,7 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
         # scalar GP return: a 32-bit value rides a width-4 move so the backend
         # re-extends it to the register width by its own convention (RV64 lp64
         # sign-extends a 32-bit register).
-        val mr: R.Result[bool, str] = context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), rvop, scalar_reg_move_width(ctx, rsz));
+        val mr: R.Result[bool, str] = context.emit_mov_w(ctx, mb, mir.op_preg(slot.reg::u32), rvop, scalar_reg_move_width(ctx.tgt.model.gpr_width, rsz));
         if (R.is_err[bool, str](mr)) { ret mr; }
     }
 
@@ -1663,13 +1775,39 @@ pub fun lower_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction.
 # mb:  the MIR block the terminator is appended to
 # ret: ok(true) on success, or a loud error
 fun emit_bare_ret(ctx: *context.LowerCtx, mb: *mir.MirBlock) R.Result[bool, str] {
-    var mi: mir.MirInstr;
-    mi.opcode        = mir.MIR_RET;
-    mi.operands      = nil;
-    mi.operand_count = 0;
-    mi.width         = ctx.tgt.model.gpr_width::u8;
-    mi.src_width     = ctx.tgt.model.gpr_width::u8;
+    var mi: mir.MirInstr = mir.instr(mir.MIR_RET, nil, 0, ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
     ret context.push_instr(ctx, mb, mi);
+}
+
+# a scalar placement carries the value's own width once it exceeds the machine word
+#
+# The register and memory sides of the same rule, and the reason `fun f(v: u32) u32`
+# could not build for an 8-bit target: every placement moved a machine word, so a 4-byte
+# stack parameter read one byte. Both halves are pinned at an 8-byte machine word too,
+# where the rule is dead and the widths are exactly what they always were - that column
+# is the byte-identity of every wide-native target.
+test "mach.lang.be.codegen.mir.abi:scalar_move_widths" {
+    # an 8-byte machine word: no scalar exceeds it, so only the 32-bit re-extension
+    # case moves the register width and the memory side is the machine word throughout.
+    if (scalar_reg_move_width(8, 1) != 8) { ret 1; }
+    if (scalar_reg_move_width(8, 2) != 8) { ret 1; }
+    if (scalar_reg_move_width(8, 4) != 4) { ret 1; }
+    if (scalar_reg_move_width(8, 8) != 8) { ret 1; }
+    if (scalar_mem_move_width(8, 1) != 8) { ret 1; }
+    if (scalar_mem_move_width(8, 4) != 8) { ret 1; }
+    if (scalar_mem_move_width(8, 8) != 8) { ret 1; }
+
+    # a 1-byte machine word: every wider scalar carries its own size, so the width
+    # legalizer downstream sees the whole value rather than its low byte.
+    if (scalar_reg_move_width(1, 1) != 1) { ret 1; }
+    if (scalar_reg_move_width(1, 2) != 2) { ret 1; }
+    if (scalar_reg_move_width(1, 4) != 4) { ret 1; }
+    if (scalar_reg_move_width(1, 8) != 8) { ret 1; }
+    if (scalar_mem_move_width(1, 1) != 1) { ret 1; }
+    if (scalar_mem_move_width(1, 2) != 2) { ret 1; }
+    if (scalar_mem_move_width(1, 4) != 4) { ret 1; }
+    if (scalar_mem_move_width(1, 8) != 8) { ret 1; }
+    ret 0;
 }
 
 # an sret return seeds a GP argument slot only when the pointer is in the argfile
@@ -1699,6 +1837,60 @@ test "mach.lang.be.codegen.mir.abi:stack_arg_alignment" {
     # a by-value slot honors the value's alignment, clamped to the 8-byte minimum.
     if (stack_arg_align(abi.CLASS_STACK, 16) != 16) { ret 1; }
     if (stack_arg_align(abi.CLASS_STACK, 4) != 8)   { ret 1; }
+    ret 0;
+}
+
+# an argument classifier that places everything in one GP slot. `require_abi` only
+# tests the accessor's presence, so the ABI-surface test wires a real signature
+# rather than erasing an unrelated function pointer
+fun probe_arg(index: i32, size: u64, align: u64, is_float: bool, fp_eightbytes: u8,
+              is_aggregate: bool, is_vector: bool, is_ext: bool, gp_used: i32, fp_used: i32,
+              hfa_members: u8, hfa_elem: u8, agg: abi.AggLayout) abi.ParamSlot {
+    ret abi.make_slot(abi.CLASS_GP, index, -1, 0, size);
+}
+
+# the return-classifier twin of `probe_arg`
+fun probe_ret(size: u64, align: u64, is_float: bool, fp_eightbytes: u8,
+              is_aggregate: bool, is_vector: bool, hfa_members: u8, hfa_elem: u8,
+              agg: abi.AggLayout) abi.ParamSlot {
+    ret abi.make_slot(abi.CLASS_GP, 0, -1, 0, size);
+}
+
+# the ABI surface every lowered call reads is exactly the arg/ret classifiers (#2273).
+# The two variadic-only facts - the GP argument register file, read solely by the win64
+# tail-float duplication, and the variadic save model - are demanded at their points of
+# use, so a convention that publishes neither still lowers a fixed-arity call and each
+# absent fact is reported as the construct it blocks. Restoring either demand to
+# `require_abi` refuses every call on such a convention naming the wrong cause.
+test "mach.lang.be.codegen.mir.abi.require_abi:variadic_facts_are_not_call_preconditions" {
+    # a whole-module ISA: this is a convention with no register machine behind it,
+    # which is exactly the shape the two variadic facts are absent from.
+    var vt: isa.IsaVTable = isa.emitter_isa(isa.ARCH_SPIRV, "probe", 8, nil, nil);
+    var av: abi.AbiVTable;
+    av.arg_passing = probe_arg::*u8;
+    av.ret_passing = probe_ret::*u8;
+    av.gp_arg_regs = nil;
+    av.va_model    = nil;
+
+    var t: target.Target;
+    t.isa = ?vt;
+    t.abi = ?av;
+
+    # neither variadic fact is a precondition of lowering a call.
+    if (R.is_err[bool, str](require_abi(?t))) { ret 1; }
+
+    # each is refused at its own point of use instead.
+    var reg: i32 = 0;
+    if (!R.is_err[bool, str](abi_gp_arg_reg(?t, 0, ?reg))) { ret 1; }
+    var vm: abi.VaModel;
+    if (!R.is_err[bool, str](abi_va_model(?t, ?vm))) { ret 1; }
+
+    # the classifier surface IS a precondition: every call and parameter list reads it.
+    av.arg_passing = nil;
+    if (!R.is_err[bool, str](require_abi(?t))) { ret 1; }
+    av.arg_passing = probe_arg::*u8;
+    av.ret_passing = nil;
+    if (!R.is_err[bool, str](require_abi(?t))) { ret 1; }
     ret 0;
 }
 

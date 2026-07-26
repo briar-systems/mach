@@ -169,9 +169,112 @@ fun infer_nominal_uni(sc: *context.SemaContext, did: id.DeclId, name_span: token
     val ty: type.TypeId = R.unwrap_ok[type.TypeId, str](tr);
 
     build_field_table(sc, ty, u.fields_start, u.fields_len);
-    check_uni_secrecy(sc, u.fields_start, u.fields_len);
     record_type_align(sc, did, ty);
     ret ty;
+}
+
+# whether `ty` reaches nominal `target` BY VALUE (#2355)
+#
+# A field descends into the containment graph when it stores the contained type's
+# bytes inline: a nominal, a generic instance, or an array of one. A pointer or a
+# function value stores an ADDRESS, so neither descends -- which is precisely what
+# keeps `rec Node { next: *Node; }`, the ordinary linked list, legal.
+#
+# OVER DECLARATIONS, NOT INSTANCES. `rec Wrap[T] { inner: Wrap[Wrap[T]]; }` mints a
+# fresh TYPE_INSTANCE at every level, so a walk over instance ids descends forever
+# without ever revisiting a node -- there is no cycle in that graph to find.
+# Resolving each instance to the nominal it instantiates makes the same program a
+# self-edge on `Wrap`, caught at the first step. The nominal set is finite, and
+# `stamp` expands each nominal at most once per query, so the walk terminates on
+# any input including a cycle that does not involve `target`.
+#
+# The visited marks are generation-stamped rather than cleared per query, and the
+# recursion is bounded by the number of distinct nominals rather than by a constant,
+# so a legal 200-deep nest costs 200 frames and is accepted. A fixed depth cap here
+# would reject well-formed programs - which is not hypothetical: `layout.walk`'s
+# MAX_DEPTH does exactly that to a 65-deep nest today (#2368). Terminating on the
+# structure rather than on a constant is what makes this rule exact.
+# ---
+# s:      the session (type universe)
+# seen:   per-TypeId stamp of the query that last expanded that nominal
+# cap:    number of slots in `seen`
+# stamp:  this query's stamp
+# target: the nominal being tested for self-containment
+# ty:     the type to descend
+# ret:    true when `target` is reachable from `ty` without passing an indirection
+fun reaches_nominal(s: *session.Session, seen: *u32, cap: u32, stamp: u32,
+                    target: type.TypeId, ty: type.TypeId) bool {
+    val base: type.TypeId = type.strip_secret(?s.types, ty);
+    val opt: O.Option[*type.Type] = type.get(?s.types, base);
+    if (O.is_none[*type.Type](opt)) { ret false; }
+    val t: *type.Type = O.unwrap[*type.Type](opt);
+
+    # an array stores its elements inline, so it carries the element's containment.
+    # a zero-length array is included: it still names the element type, and lowering
+    # would build an IR aggregate for it exactly as for any other element count.
+    if (t.kind == type.TYPE_ARRAY) {
+        ret reaches_nominal(s, seen, cap, stamp, target, t.data.array.base);
+    }
+
+    if (t.kind != type.TYPE_REC && t.kind != type.TYPE_UNI && t.kind != type.TYPE_INSTANCE) {
+        ret false;
+    }
+
+    val nom: type.TypeId = type.aggregate_nominal(?s.types, base);
+    if (nom == type.TYPE_ERROR) { ret false; }
+    if (nom == target)          { ret true; }
+    if (nom::u32 >= cap)        { ret false; }
+    if (seen[nom::u32] == stamp) { ret false; }
+    seen[nom::u32] = stamp;
+
+    val n: u32 = type.field_count(?s.types, nom);
+    var i: u32 = 0;
+    for (i < n) {
+        val fe: O.Option[*type.FieldEntry] = type.field_at(?s.types, nom, i);
+        if (O.is_some[*type.FieldEntry](fe)) {
+            if (reaches_nominal(s, seen, cap, stamp, target, O.unwrap[*type.FieldEntry](fe).ty)) {
+                ret true;
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# reject a rec/uni whose own fields make it contain itself by value (#2355)
+#
+# An infinitely-sized type has no layout and nothing downstream can represent one:
+# `lower_type` / `lower_nominal` walk the field graph to build the IR aggregate and
+# recur without bound, exhausting the native stack with no diagnostic at all. Before
+# this rule `rec R { next: R; }` was accepted outright when never used and crashed
+# the compiler when used. This is the classic occurs-check (Rust's E0072).
+#
+# Reported per FIELD, on the field's own span, because each offending field is a
+# distinct site the author has to change; a mutually recursive pair reports on both
+# declarations, each being independently ill-formed.
+# ---
+# sc:           sema context
+# nom:          the declaration's nominal TypeId
+# fields_start: start index into ast.typed_names
+# fields_len:   number of fields
+# seen:         the shared stamp array
+# cap:          number of slots in `seen`
+# stamp:        the next unused stamp, advanced once per field queried
+# ret:          the next unused stamp
+fun check_occurs(sc: *context.SemaContext, nom: type.TypeId, fields_start: u32, fields_len: u32,
+                 seen: *u32, cap: u32, stamp: u32) u32 {
+    var next: u32 = stamp;
+    var i:    u32 = 0;
+    for (i < fields_len) {
+        val tn: *decl.TypedName = ?sc.a.typed_names[fields_start + i];
+        val ty: type.TypeId     = context.resolved_type_of(sc, tn.ty);
+        if (reaches_nominal(sc.s, seen, cap, next, nom, ty)) {
+            context.report(sc, tn.name, "recursive type has infinite size: this field contains the type being declared by value, so the type would have to contain itself; store it behind a pointer (`*T`) to break the cycle");
+        }
+        next = next + 1;
+        i = i + 1;
+    }
+    ret next;
 }
 
 # enforce that a union's overlapping variants agree on secrecy (#1645)
@@ -179,30 +282,203 @@ fun infer_nominal_uni(sc: *context.SemaContext, did: id.DeclId, name_span: token
 # A `uni`'s fields share storage, so a mixed-secrecy union would let the same
 # bytes be read as both secret and public - the welded-storage aliasing leak. All
 # variants must be uniformly secret or uniformly public. The first variant whose
-# secrecy disagrees with the first variant's is reported on its own field span.
+# secrecy disagrees with the baseline variant's is reported on its own field span.
+#
+# A variant that closes a by-value cycle with `nom` is SKIPPED, baseline included
+# (#2356). The deep comparison measures byte extents, and an infinitely-sized type
+# has none, so it fails closed and reported this rule's violation for a program with
+# no `^` anywhere - naming a secrecy defect the program does not have and sending
+# the reader to fix it. Such a union is already rejected by the occurs-check with its
+# real cause. Only that provably-cyclic case is skipped: every other undeterminable
+# extent still fails closed, since this rule guards a disclosure channel and must
+# never be loosened into a permissive default.
 # ---
 # sc:           sema context
+# nom:          the union's own TypeId, for the cycle test
 # fields_start: start index into ast.typed_names
 # fields_len:   number of variants
-fun check_uni_secrecy(sc: *context.SemaContext, fields_start: u32, fields_len: u32) {
-    if (fields_len < 2) { ret; }
+# seen:         the shared stamp array
+# cap:          number of slots in `seen`
+# stamp:        the next unused stamp, advanced once per variant queried
+# ret:          the next unused stamp
+fun check_uni_secrecy(sc: *context.SemaContext, nom: type.TypeId, fields_start: u32, fields_len: u32,
+                      seen: *u32, cap: u32, stamp: u32) u32 {
+    var next: u32 = stamp;
+    if (fields_len < 2) { ret next; }
 
-    val first_tn: *decl.TypedName = ?sc.a.typed_names[fields_start];
-    val first_ty: type.TypeId     = context.resolved_type_of(sc, first_tn.ty);
+    # the baseline is the first variant that is not itself part of a cycle; a union
+    # whose every variant is cyclic has nothing to compare and reports nothing here.
+    var first_ty: type.TypeId = type.TYPE_NIL;
+    var b:        u32         = 0;
+    for (b < fields_len) {
+        val btn: *decl.TypedName = ?sc.a.typed_names[fields_start + b];
+        val bty: type.TypeId     = context.resolved_type_of(sc, btn.ty);
+        if (!reaches_nominal(sc.s, seen, cap, next, nom, bty)) {
+            first_ty = bty;
+            next = next + 1;
+            b = b + 1;
+            brk;
+        }
+        next = next + 1;
+        b = b + 1;
+    }
+    if (first_ty == type.TYPE_NIL) { ret next; }
 
-    var i: u32 = 1;
+    var i: u32 = b;
     for (i < fields_len) {
         val tn: *decl.TypedName = ?sc.a.typed_names[fields_start + i];
         val ty: type.TypeId     = context.resolved_type_of(sc, tn.ty);
+        val cyclic: bool        = reaches_nominal(sc.s, seen, cap, next, nom, ty);
+        next = next + 1;
         # DEEP (#2165): variants must agree on secrecy through their whole field graph,
         # not just at the top level - else `uni { a: P; b: Q }` with a `^` field inside P
         # aliases the secret bytes under the public `Q` overlay and reads them out. A
         # shallow `is_secret` per variant treats `P` as public and misses it.
-        if (!generics.secrecy_structure_equal_deep(sc.s, first_ty, ty)) {
-            context.report(sc, tn.name, "union variants must agree on secrecy: overlapping fields are part secret `^` and part public, which would alias the same storage at two classifications");
+        if (!cyclic) {
+            if (!generics.secrecy_structure_equal_deep(sc.s, context.ptr_width_of(sc), first_ty, ty)) {
+                context.report(sc, tn.name, "union variants must agree on secrecy: overlapping fields are part secret `^` and part public, which would alias the same storage at two classifications");
+            }
         }
         i = i + 1;
     }
+    ret next;
+}
+
+# reject every rec/uni in this module that contains itself by value (#2355)
+#
+# Runs after `infer_all_decls` for the same reason the union secrecy rule below does:
+# the walk reads field tables, so it needs them all built, and it is then independent
+# of declaration order. It runs BEFORE that rule deliberately - a recursive union
+# makes the deep secrecy comparison fail closed, which reported an ill-formed type as
+# a mixed-secrecy violation in a program containing no `^` at all (#2356). Rejecting
+# it here first means the diagnostic names the actual defect.
+#
+# Only NAMED declarations are walked. An anonymous `rec { ... }` has no name to be
+# referred to, so it can never close a cycle by itself; it can only sit INSIDE one,
+# reached from the named declaration that spells it, and the walk descends through it
+# from there. Named decls are filtered by `decl_type`, so an untaken comptime-`$if`
+# arm stays unchecked, matching the rule that a discarded branch is not compiled.
+#
+# The stamp array is sized to the type universe and shared across every declaration,
+# so the whole pass allocates once. A failed allocation skips the rule rather than
+# failing the build: the crash it prevents is a compiler bug, not a program error,
+# and sema has no path to report an out-of-memory here.
+# ---
+# sc: sema context
+pub fun check_occurs_all(sc: *context.SemaContext) {
+    if (sc.decl_type == nil) { ret; }
+
+    val cap: u32 = sc.s.types.type_len;
+    if (cap == 0) { ret; }
+
+    val res: R.Result[*u32, str] = A.allocate[u32](sc.s.alloc, cap::usize);
+    if (R.is_err[*u32, str](res)) { ret; }
+    val seen: *u32 = R.unwrap_ok[*u32, str](res);
+
+    # stamps start at 1 so the zeroed array reads as "never expanded"
+    var z: u32 = 0;
+    for (z < cap) { seen[z] = 0; z = z + 1; }
+    var stamp: u32 = 1;
+
+    var d: u32 = 0;
+    for (d < sc.a.decl_len::u32) {
+        if (sc.decl_type[d] != type.TYPE_NIL) {
+            val d_opt: O.Option[*decl.Decl] = ast.get_decl(sc.a, d);
+            if (O.is_some[*decl.Decl](d_opt)) {
+                val dd: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+                if (dd.kind == decl.DECL_KIND_REC) {
+                    stamp = check_occurs(sc, sc.decl_type[d], dd.data.rec_.fields_start,
+                                         dd.data.rec_.fields_len, seen, cap, stamp);
+                }
+                if (dd.kind == decl.DECL_KIND_UNI) {
+                    stamp = check_occurs(sc, sc.decl_type[d], dd.data.uni_.fields_start,
+                                         dd.data.uni_.fields_len, seen, cap, stamp);
+                }
+            }
+        }
+        d = d + 1;
+    }
+
+    A.deallocate[u32](sc.s.alloc, seen, cap::usize);
+}
+
+# enforce the mixed-secrecy union rule on every union the module forms - named
+# declarations and anonymous `uni { ... }` type nodes alike (#2224)
+#
+# An inline union has no declaration, so a check hung off `infer_nominal_uni` never
+# reached it and `uni { a: ^u32; b: u32 }` aliased secret storage under a public overlay
+# exactly as the named twin that check rejects. Which syntactic form declared the union
+# is irrelevant to the channel the rule closes.
+#
+# The whole rule runs here, after `infer_all_decls`, for two reasons the obvious earlier
+# placements get wrong. Inside `infer_all_decls` a variant naming a record declared LATER
+# has no field table yet, and the deep comparison fails closed on it - which is why the
+# named form used to reject an all-public `uni U { a: S; b: P }` written above `S` and
+# accept the very same union written below it. And in `resolve_type_anon` the check would
+# fire once per REFERENCE to a shape (a `[2]uni {...}` resolves it both nested and again
+# at its own index), reporting one site two or three times, on top of the same
+# missing-table problem. Here every field table is complete and every site is visited
+# exactly once, so the rule is declaration-order independent.
+#
+# Named declarations are filtered by `decl_type`, which `infer_all_decls` wrote for the
+# decls it actually typed: an untaken comptime-`$if` arm is left at TYPE_NIL and stays
+# unchecked, matching the rule that a discarded branch is not compiled.
+#
+# The stamp array backs the per-variant cycle test `check_uni_secrecy` uses to skip a
+# variant whose extent is undeterminable because the union contains itself (#2356);
+# allocating it here keeps the pass to one allocation. A failed allocation runs the
+# rule with no skip, which is the previous behaviour: a false report on an already
+# rejected type, never a missed one.
+# ---
+# sc: sema context
+pub fun check_uni_secrecy_all(sc: *context.SemaContext) {
+    # cap stays 0 when there is no array to index, which `reaches_nominal` reads as
+    # "no nominal is expandable" and answers false to - the pre-#2356 behaviour.
+    var seen: *u32 = nil;
+    var cap:  u32  = 0;
+    if (sc.s.types.type_len > 0) {
+        val res: R.Result[*u32, str] = A.allocate[u32](sc.s.alloc, sc.s.types.type_len::usize);
+        if (R.is_ok[*u32, str](res)) {
+            seen = R.unwrap_ok[*u32, str](res);
+            cap  = sc.s.types.type_len;
+            var z: u32 = 0;
+            for (z < cap) { seen[z] = 0; z = z + 1; }
+        }
+    }
+    # stamps start at 1 so the zeroed array reads as "never expanded"
+    var stamp: u32 = 1;
+
+    if (sc.decl_type != nil) {
+        var d: u32 = 0;
+        for (d < sc.a.decl_len::u32) {
+            if (sc.decl_type[d] != type.TYPE_NIL) {
+                val d_opt: O.Option[*decl.Decl] = ast.get_decl(sc.a, d);
+                if (O.is_some[*decl.Decl](d_opt)) {
+                    val dd: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+                    if (dd.kind == decl.DECL_KIND_UNI) {
+                        stamp = check_uni_secrecy(sc, sc.decl_type[d], dd.data.uni_.fields_start,
+                                                  dd.data.uni_.fields_len, seen, cap, stamp);
+                    }
+                }
+            }
+            d = d + 1;
+        }
+    }
+
+    var i: u32 = 0;
+    for (i < sc.a.type_len::u32) {
+        val t_opt: O.Option[*atype.Type] = ast.get_type(sc.a, i);
+        if (O.is_some[*atype.Type](t_opt)) {
+            val t: *atype.Type = O.unwrap[*atype.Type](t_opt);
+            if (t.kind == atype.TYPE_KIND_UNI) {
+                stamp = check_uni_secrecy(sc, sc.type_resolved_ty[i], t.data.uni_.fields_start,
+                                          t.data.uni_.fields_len, seen, cap, stamp);
+            }
+        }
+        i = i + 1;
+    }
+
+    if (seen != nil) { A.deallocate[u32](sc.s.alloc, seen, cap::usize); }
 }
 
 # fold an `#[align(...)]` decorator on `did` and record the resulting alignment
@@ -403,6 +679,14 @@ pub fun infer_expr(sc: *context.SemaContext, eid: id.ExprId) type.TypeId {
     or (e.kind == expr.EXPR_KIND_VECTOR_LIT) {
         t = infer_vector_lit(sc, ?e.data.vector_lit, e.span);
     }
+    or (e.kind == expr.EXPR_KIND_TYPE_REF) {
+        # a comptime intrinsic's type operand (#2178). the two legitimate consumers
+        # (`infer_comptime_intrinsic`, `field_seq_owner`) read it directly through
+        # `intrinsic_operand_type` and never come through here, so arriving in this
+        # walk means the intrinsic call itself sits in a value position.
+        context.report(sc, e.span, "a type name is not a value; this position takes a value expression");
+        t = type.TYPE_ERROR;
+    }
     or {
         t = type.TYPE_ERROR;
     }
@@ -415,15 +699,21 @@ pub fun infer_expr(sc: *context.SemaContext, eid: id.ExprId) type.TypeId {
 
 # IDENT: the type of the resolved symbol
 #
-# An unresolved symbol (SYMBOL_NIL upstream) yields TYPE_ERROR without a fresh
-# diagnostic -- resolve already reported the root cause.
+# An identifier with no bound symbol is an INVARIANT BREACH, not a quiet
+# TYPE_ERROR (#2144). A name the resolver rejected never reaches here at all --
+# the build stops on the diagnostic sink between the load phase and sema -- so
+# the only way to arrive unbound is for the resolver to have skipped the operand
+# without a word, as a missing `bind_expr` arm did for a `:^` strip cast through
+# an entire release (#2138). Poisoning it silently hands lowering a broken
+# expression and moves the error a whole phase away from its cause, so report it
+# here, where the gap is.
 # ---
 # sc:  sema context
 # eid: the identifier expression
 # ret: the symbol's value type, or TYPE_ERROR
 fun infer_ident(sc: *context.SemaContext, eid: id.ExprId) type.TypeId {
     val sym_opt: O.Option[*resolve.Symbol] = context.symbol_for_expr(sc, eid);
-    if (O.is_none[*resolve.Symbol](sym_opt)) { ret type.TYPE_ERROR; }
+    if (O.is_none[*resolve.Symbol](sym_opt)) { ret report_unbound_ident(sc, eid); }
     val sym: *resolve.Symbol = O.unwrap[*resolve.Symbol](sym_opt);
 
     # a `$each a in va` pack loop variable: a comptime-flagged `SYM_VAL` with no
@@ -456,6 +746,30 @@ fun infer_ident(sc: *context.SemaContext, eid: id.ExprId) type.TypeId {
     }
 
     ret context.decl_type_for(sc, sym);
+}
+
+# report an identifier that reached type inference with no bound symbol
+#
+# The message names the actual cause -- the resolver, not the source -- because
+# the source is well-formed by construction: a name the resolver could not find
+# is reported there and stops the build before sema runs.
+#
+# NO SOURCE REACHES THIS, and that is the point: it is an assertion about the
+# resolver, so deleting it changes no test and it survives its own mutation. What
+# kills it is mutating the invariant instead -- delete a `bind_expr` arm and this
+# fires, where on dev the same program reported `unresolved identifier` from
+# LOWERING, blaming source for a resolver bug (#2138 shipped that way for a whole
+# release). Untested is not the same as unjustified; do not remove it.
+# ---
+# sc:  sema context
+# eid: the unbound identifier expression
+# ret: TYPE_ERROR
+fun report_unbound_ident(sc: *context.SemaContext, eid: id.ExprId) type.TypeId {
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (O.is_some[*expr.Expr](e_opt)) {
+        context.report(sc, O.unwrap[*expr.Expr](e_opt).span, "internal: this identifier reached type inference unbound; the name resolver neither bound it nor reported it");
+    }
+    ret type.TYPE_ERROR;
 }
 
 # the concrete element type of a `$each a in va` pack loop variable, or TYPE_NIL
@@ -953,9 +1267,35 @@ fun infer_type_operand(sc: *context.SemaContext, operand: id.ExprId, span: token
     if (is_field_type_operand(sc, operand)) {
         ret field_type_operand_type(sc, operand);
     }
-    val op_ty: type.TypeId = intrinsic_operand_type(sc, operand, span);
+    val op_ty: type.TypeId = type_name_expr_type(sc, operand, span);
     set_expr_type(sc, operand, op_ty);
     ret op_ty;
+}
+
+# resolve a type name that arrives as an EXPRESSION to the type it names
+#
+# The type-comparison operand is the one type spelling the parser cannot read
+# with the type grammar: `$type_of(x) == Name` is a binary comparison, and
+# nothing distinguishes it from a value comparison until resolve recognizes the
+# shape, by which point both sides are expressions. So the name arrives as an
+# IDENT or a `module.Type` member chain carrying the SymbolId resolve recorded
+# (`bind_type_name_expr`), and only those two spellings are available here -- a
+# generic instance `Box[u32]` is not expressible in this position. The intrinsic
+# operands that CAN spell one take a parsed type instead (`intrinsic_operand_type`).
+# ---
+# sc:   sema context
+# eid:  the type-name operand expression
+# span: the operand span for diagnostics
+# ret:  the named TypeId, or TYPE_ERROR
+fun type_name_expr_type(sc: *context.SemaContext, eid: id.ExprId, span: token.Span) type.TypeId {
+    val sym_opt: O.Option[*resolve.Symbol] = context.symbol_for_expr(sc, eid);
+    if (O.is_none[*resolve.Symbol](sym_opt)) {
+        # resolve reports an unresolved type name at this leaf and stops the build
+        # before sema, so an unbound operand here is a discarded comptime arm's --
+        # unreachable, and no place for a diagnostic.
+        ret type.TYPE_ERROR;
+    }
+    ret type_for_symbol(sc, O.unwrap[*resolve.Symbol](sym_opt), span);
 }
 
 # whether `eid` is an `f.type` operand whose object evaluates to a comptime field
@@ -1019,7 +1359,8 @@ fun infer_assign(sc: *context.SemaContext, b: *expr.ExprBinary, span: token.Span
 # type, ADDR returns a pointer to the operand type, DEREF returns the pointee of
 # a pointer operand. The value operators (`-`, `!`, `~`) join the operand's
 # secrecy onto their result; `&` instead nests it (`&^T` is the public pointer
-# `*^T`), and DEREF recovers it from the pointee (`@(*^T)` is `^T`).
+# `*^T`), and DEREF recovers it from the pointee (`@(*^T)` is `^T`). A DEREF
+# through a SECRET pointer is a secret memory address and is gated (#2191).
 # ---
 # sc:   sema context
 # u:    the unary operation payload
@@ -1060,9 +1401,22 @@ fun infer_unary(sc: *context.SemaContext, u: *expr.ExprUnary, span: token.Span) 
             context.report(sc, span, "cannot take the address of a comptime parameter");
             ret type.TYPE_ERROR;
         }
+        # an UNINSTANTIATED generic has no address for the same reason (#2305): a
+        # `fun f[T](...)` is a template, not code, and only `f[i64]` denotes a
+        # function. Taking its address emitted a reference to the bare template body -
+        # whose parameters are the collapsed generic parameters - producing an object
+        # carrying one linkage name as two symbol-table entries, a defined FUNC beside
+        # an undefined OBJECT. Rejected here, at the one place a template symbol was
+        # reachable from source, rather than fabricating that reference at lower.
+        if (operand_is_uninstantiated_generic(sc, u.operand)) {
+            context.report(sc, span, "cannot take the address of an uninstantiated generic function: a generic is a template, not code, so it has no address until its type arguments are supplied. call it with them (`f[i64](x)`), or take the address of a non-generic function");
+            ret type.TYPE_ERROR;
+        }
         ret ptr_to(sc, ot);
     }
     if (u.op == expr.UN_DEREF) {
+        # GATE (#2191): `@p` on a `^*T` reads through a secret address.
+        check.check_secret_address(sc, ot, span);
         ret pointee_of(sc, ot, span);
     }
     ret type.TYPE_ERROR;
@@ -1084,6 +1438,33 @@ fun operand_is_comptime_param(sc: *context.SemaContext, eid: id.ExprId) bool {
     if (O.is_none[*resolve.Symbol](so)) { ret false; }
     val sym: *resolve.Symbol = O.unwrap[*resolve.Symbol](so);
     ret sym.kind == resolve.SYM_PARAM && (sym.flags & resolve.SYM_FLAG_COMPTIME) != 0;
+}
+
+# whether `eid` names a generic function with no type arguments applied (#2305)
+#
+# Keyed on the DECLARATION, not on the expression's type: a bare generic name types as
+# `fun(T) T`, but so does a local variable of that type, and the address of such a
+# VARIABLE is a legitimate `*fun(T) T`. Only a reference that resolves to the generic
+# declaration itself denotes a template with no address.
+#
+# `callee_fun_decl` reads the symbol's ORIGIN AST, so the qualified cross-module
+# spelling `?a.ident` is caught by the same predicate as the local one - which matters,
+# because that form emitted a storage-less extern reference the linker silently bound to
+# another module's bare template symbol. A call `f[i64](x)` never reaches here: its type
+# arguments ride on the CALL, not on this operand.
+# ---
+# sc:  sema context
+# eid: the operand expression
+# ret: true when `eid` names an uninstantiated generic function
+fun operand_is_uninstantiated_generic(sc: *context.SemaContext, eid: id.ExprId) bool {
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (O.is_none[*expr.Expr](e_opt)) { ret false; }
+    val k: expr.ExprKind = O.unwrap[*expr.Expr](e_opt).kind;
+    if (k != expr.EXPR_KIND_IDENT && k != expr.EXPR_KIND_MEMBER) { ret false; }
+
+    val cf: O.Option[*decl.DeclFun] = callee_fun_decl(sc, eid);
+    if (O.is_none[*decl.DeclFun](cf)) { ret false; }
+    ret O.unwrap[*decl.DeclFun](cf).generics_len > 0;
 }
 
 # CALL: callee must be TYPE_FUN; check arity and each argument against the
@@ -1273,24 +1654,59 @@ fun infer_comptime_intrinsic(sc: *context.SemaContext, c: *expr.ExprCall, span: 
     ret prim_or_error(sc, type.TYPE_U64);
 }
 
-# resolve a comptime intrinsic's type-naming argument to its semantic type
+# resolve a comptime intrinsic's type operand to its semantic type
 #
-# The argument is a name expression bound in the resolve pass: a single IDENT
-# (primitive or user type) or a `module.Type` member chain. Both carry their
-# resolved SymbolId on the argument expression, mapped to a type by
-# `type_for_symbol` (which handles primitives, records, unions, and defs).
+# The operand is an EXPR_KIND_TYPE_REF: the parser read it with the type grammar
+# and it carries the syntactic AstType, so the whole type language is available
+# here -- a plain name, `module.Type`, a generic instance `Box[T]` / `Pair[A, B]`,
+# a pointer, a `^` secret, an array. Resolution is `resolve_type_ref`, the same
+# one type position uses, so this leaf can never drift behind the type grammar
+# the way a hand-rolled IDENT/MEMBER reinterpretation did (#2178).
+#
+# `resolve_type_ref` applies the active generic substitution at its generic-parameter
+# leaf, so `$fields(T)` resolves to the instance's concrete record while re-inferring
+# an instance body (#2168). Without that the `$each` unroll defers exactly as at
+# template time and the whole body escapes the per-instance constant-time
+# re-validation.
+#
+# A TYPE_ERROR from here drops an entire `$each` body, so this leaf guarantees a
+# diagnostic accompanies one. Every way an operand can fail to name a type is
+# reported by resolve or by `resolve_type_ref` itself; what is left is an
+# allocation failure interning the type, which those paths propagate silently.
+# Filing a diagnostic for that is what stops a resource failure from reading as a
+# body the program never had.
 # ---
 # sc:   sema context
-# eid:  the type-naming argument expression
-# span: the argument span for diagnostics
-# ret:  the named TypeId, or TYPE_ERROR
+# eid:  the type-operand expression
+# span: the operand span for diagnostics
+# ret:  the named TypeId, substituted at an instance, or TYPE_ERROR
 fun intrinsic_operand_type(sc: *context.SemaContext, eid: id.ExprId, span: token.Span) type.TypeId {
-    val sym_opt: O.Option[*resolve.Symbol] = context.symbol_for_expr(sc, eid);
-    if (O.is_none[*resolve.Symbol](sym_opt)) {
-        # resolve already reported the unresolved name; absorb silently
+    val e_opt: O.Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    # the parser reads this slot with the type grammar for exactly these callees, so
+    # a node that is not a type spelling cannot be produced from source. NOTHING IN
+    # THE SUITE REACHES THIS ARM and deleting it changes no test - it asserts that
+    # parser guarantee, and without it a violation is back to dropping the `$each`
+    # body in silence. Do not remove it for being untested; see `report_unbound_ident`.
+    if (O.is_none[*expr.Expr](e_opt) || O.unwrap[*expr.Expr](e_opt).kind != expr.EXPR_KIND_TYPE_REF) {
+        context.report(sc, span, "internal: a comptime intrinsic argument was not parsed as a type");
         ret type.TYPE_ERROR;
     }
-    ret type_for_symbol(sc, O.unwrap[*resolve.Symbol](sym_opt), span);
+    val e: *expr.Expr = O.unwrap[*expr.Expr](e_opt);
+
+    val mark: usize       = context.diag_mark(sc);
+    val ty:   type.TypeId = resolve_type_ref(sc, e.data.type_ref.ty);
+    # only an allocation failure gets here, so no test kills this either. It is the
+    # assertion that a resource failure can never read as an empty `$each`, and it is
+    # the same call `infer_generic_call` makes for the same reason (#1348).
+    #
+    # The question is asked through `resolve_reported` rather than the sink directly:
+    # this operand's node is normally resolved once by `resolve_all_types` and reached
+    # here a second time, and once that repeat is suppressed (#2334) the sink shows
+    # nothing filed across THIS call even though the operand was reported on properly.
+    if (ty == type.TYPE_ERROR && !resolve_reported(sc, e.data.type_ref.ty, mark)) {
+        context.report(sc, e.span, "internal: could not intern the type named by this comptime intrinsic argument");
+    }
+    ret ty;
 }
 
 # write `ty` into an expression's expr_type slot, the parallel array sema fills
@@ -1313,8 +1729,11 @@ fun set_expr_type(sc: *context.SemaContext, eid: id.ExprId, ty: type.TypeId) {
 # The type-argument's expr_type slot is populated for the lowerer. TYPE_ERROR
 # when the sequence is malformed or T is not a record. Returns the
 # TYPE_GENERIC_PARAM TypeId when T is an unbound generic param -- the caller
-# defers the unroll to monomorphization. Shared by the `$each` unroll (sema and
-# lowering).
+# defers the unroll to monomorphization.
+#
+# MUTATES THE SESSION: a generic-instance owner has its field table materialized here,
+# which interns types and can grow `s.types`. Any `*type.Type` borrowed across this call
+# is invalidated.
 # ---
 # sc:      sema context
 # seq_eid: the `$fields(T)` sequence expression
@@ -1331,8 +1750,27 @@ pub fun field_seq_owner(sc: *context.SemaContext, seq_eid: id.ExprId, span: toke
     if (owner == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
     # an unbound generic type param: defer the record check to monomorphization
     if (type_is_generic_param(sc, owner)) { ret owner; }
+    # a generic-instance owner (`Box[u32]`, and every instance a substitution produces)
+    # carries no field table until one is materialized, and the `$each` unroll below
+    # reads `field_count` - an absent table would unroll ZERO fields and skip the body in
+    # silence. Materialize here as this site's own precondition rather than relying on
+    # some earlier pass having happened to touch the same instance (#2168).
+    generics.ensure_fields(sc.s, owner);
     if (!type_is_record(sc, owner)) {
         context.report(sc, span, "$fields requires a record type");
+        ret type.TYPE_ERROR;
+    }
+    # a record that passed the check above but still carries no table: the record check
+    # reads the type's kind (for an instance, its target nominal), never the table, so a
+    # materialization that failed outright lands here. The unroll reads `field_count`,
+    # which is 0 for an absent table exactly as it is for a record with no fields --
+    # opposite outcomes, one expanding to nothing and one dropping the body unchecked.
+    # Reporting nothing would silently pick the wrong one; reporting a type error would
+    # blame valid source for a resource failure. Only that failure reaches this, so no
+    # test kills it; it is the instance-only guard #2168 added for the same reason,
+    # widened to every owner. Do not remove it for being untested.
+    if (O.is_none[*context.FieldTable](context.field_table_for(sc, owner))) {
+        context.report(sc, span, "internal: could not materialize the field table for this `$fields` type argument");
         ret type.TYPE_ERROR;
     }
     ret owner;
@@ -1447,12 +1885,11 @@ fun infer_spread(sc: *context.SemaContext, sp: *expr.ExprSpread, span: token.Spa
 # ty:  the TypeId to classify
 # ret: true for a record or a fielded generic instance
 fun type_is_record(sc: *context.SemaContext, ty: type.TypeId) bool {
-    val to: O.Option[*type.Type] = type.get(?sc.s.types, ty);
-    if (O.is_none[*type.Type](to)) { ret false; }
-    val k: type.TypeKind = O.unwrap[*type.Type](to).kind;
-    if (k == type.TYPE_REC)                                                                            { ret true; }
-    if (k == type.TYPE_INSTANCE && O.is_some[*type.FieldTable](type.field_table_for(?sc.s.types, ty))) { ret true; }
-    ret false;
+    # a generic instance is classified by the nominal it specializes, NOT by carrying a
+    # field table: a generic `uni` instance has one too, and accepting it would unroll a
+    # union's overlapping variants as if they were distinct members at distinct offsets
+    # (#2168). `$fields` rejects the non-generic `uni` twin, so it must reject this.
+    ret type.is_record(?sc.s.types, ty);
 }
 
 # PROJECT: type a `v.[f]` field projection
@@ -1580,13 +2017,23 @@ fun infer_generic_call(sc: *context.SemaContext, c: *expr.ExprCall, ct: type.Typ
     # the concrete type-args resolved here - before lowering's mangle-based collapse
     # coalesces `foo[^u32]` and `foo[u32]` - the secret instance is visible to the sema
     # drain even when it later shares a symbol with a public twin. a no-op on the
-    # lowering-time pack re-inference and on all-public-scalar instances (record_instance
-    # prunes). the args are copied there; free_params below still owns this scratch.
+    # lowering-time pack re-inference and on the instances record_instance prunes. the
+    # args are copied there; free_params below still owns this scratch.
     if (sig != type.TYPE_ERROR) {
-        val rr: R.Result[bool, str] = context.record_instance(sc, sym.origin, sym.decl, args, c.type_args_len, sig);
-        if (R.is_err[bool, str](rr)) {
+        val rr: R.Result[u8, str] = context.record_instance(sc, sym.origin, sym.decl, args, c.type_args_len, sig, sym.name);
+        if (R.is_err[u8, str](rr)) {
+            val msg: str = R.unwrap_err[u8, str](rr);
             free_params(sc, args, c.type_args_len);
-            context.report(sc, span, "internal: out of memory recording a generic instance for constant-time re-validation");
+            context.report(sc, span, msg);
+            ret type.TYPE_ERROR;
+        }
+        # an instantiation limit is the caller's to report: the chain diagnostic needs
+        # this call's span and the type renderer, neither of which the recorder has
+        # (#2163).
+        val outcome: u8 = R.unwrap_ok[u8, str](rr);
+        if (outcome != context.RECORD_OK) {
+            check.report_instantiation_limit(sc, span, outcome, sym.name, args, c.type_args_len);
+            free_params(sc, args, c.type_args_len);
             ret type.TYPE_ERROR;
         }
     }
@@ -2007,11 +2454,79 @@ fun infer_struct_lit(sc: *context.SemaContext, sl: *expr.ExprStructLit, span: to
 # tid: syntactic AstType id to resolve
 # ret: the interned semantic TypeId (TYPE_ERROR on failure)
 pub fun resolve_type_ref(sc: *context.SemaContext, tid: id.TypeId) type.TypeId {
-    # apply the active generic substitution (#2157) to the fresh resolution, so a
-    # type-argument or annotation naming a generic parameter (`T`, `*T`, `Result[T,E]`)
-    # resolves to its concrete instance type while re-inferring an instance body. inert
-    # on the main pass (no substitution active).
-    ret context.apply_subst(sc, resolve_type_ref_raw(sc, tid));
+    # a node already resolved by this pass yields the answer it yielded then, without
+    # re-running the resolution or re-emitting its diagnostics (#2334). The memo exists
+    # only on the main pass, whose substitution is nil throughout, so an instance
+    # episode is never served a template's answer -- see `type_resolved_done`.
+    if (memo_state(sc, tid) != context.TYPE_MEMO_NONE) { ret sc.type_resolved_ty[tid]; }
+
+    # the active generic substitution (#2157) is applied at the NAMED leaf
+    # (`type_for_symbol`), not here: every composite case below rebuilds structurally
+    # by recursing through this function, so substituting the assembled result too
+    # would apply it TWICE. That second pass re-reads a generic parameter the first
+    # pass already substituted IN - and resolves it against the wrong argument list,
+    # yielding TYPE_ERROR whenever its ordinal exceeds the inner arity (#2168).
+    val mark:     usize       = context.diag_mark(sc);
+    val resolved: type.TypeId = resolve_type_ref_raw(sc, tid);
+    memo_record(sc, tid, resolved, context.reported_since(sc, mark));
+    ret resolved;
+}
+
+# `tid`'s memo state for this pass (#2334)
+#
+# TYPE_MEMO_NONE whenever the memo is absent (every episode) or the id is out of range,
+# so the caller resolves exactly as it did before the memo existed.
+# ---
+# sc:  sema context
+# tid: syntactic AstType id
+# ret: the recorded state, or TYPE_MEMO_NONE
+fun memo_state(sc: *context.SemaContext, tid: id.TypeId) u8 {
+    if (sc.type_resolved_memo == nil) { ret context.TYPE_MEMO_NONE; }
+    if (sc.type_resolved_ty == nil)   { ret context.TYPE_MEMO_NONE; }
+    if (tid >= sc.a.type_len::u32)    { ret context.TYPE_MEMO_NONE; }
+    ret sc.type_resolved_memo[tid];
+}
+
+# publish `tid`'s resolution to the memo (#2334)
+#
+# Writes the answer as well as the state, so a node first reached as some composite's
+# CHILD is recorded when that resolution completes rather than waiting for the index
+# walk to reach it -- which is where most of the redundancy was.
+#
+# `reported` is folded in because it is the resolution's outcome as much as the type
+# is: a later caller that suppresses the repeat also suppresses its diagnostic, and
+# must still be able to tell a failure that was reported from one that was silent.
+# ---
+# sc:       sema context
+# tid:      syntactic AstType id
+# resolved: the interned semantic TypeId just computed
+# reported: whether that resolution filed a diagnostic
+fun memo_record(sc: *context.SemaContext, tid: id.TypeId, resolved: type.TypeId, reported: bool) {
+    if (sc.type_resolved_memo == nil) { ret; }
+    if (sc.type_resolved_ty == nil)   { ret; }
+    if (tid >= sc.a.type_len::u32)    { ret; }
+    sc.type_resolved_ty[tid] = resolved;
+    if (reported) {
+        sc.type_resolved_memo[tid] = context.TYPE_MEMO_REPORTED;
+        ret;
+    }
+    sc.type_resolved_memo[tid] = context.TYPE_MEMO_QUIET;
+}
+
+# whether resolving `tid` filed a diagnostic, asked of whichever authority exists
+#
+# The memo when this pass has one -- a suppressed repeat files nothing, so the sink
+# cannot answer for it -- and the sink otherwise, where the resolution genuinely just
+# ran. Both answer the same question: did this node's failure go unreported (#2334)?
+# ---
+# sc:   sema context
+# tid:  syntactic AstType id just resolved
+# mark: a `diag_mark` taken before the resolution
+# ret:  true when the resolution reported
+fun resolve_reported(sc: *context.SemaContext, tid: id.TypeId, mark: usize) bool {
+    val state: u8 = memo_state(sc, tid);
+    if (state != context.TYPE_MEMO_NONE) { ret state == context.TYPE_MEMO_REPORTED; }
+    ret context.reported_since(sc, mark);
 }
 
 fun resolve_type_ref_raw(sc: *context.SemaContext, tid: id.TypeId) type.TypeId {
@@ -2040,6 +2555,18 @@ fun resolve_type_ref_raw(sc: *context.SemaContext, tid: id.TypeId) type.TypeId {
 # The symbol is recorded by resolve in type_resolved; it maps to the nominal /
 # primitive / transparent type it names, and -- when generic args are present --
 # instantiates.
+#
+# An unbound node yields TYPE_ERROR with no diagnostic, and that silence is
+# load-bearing rather than a fallback: `resolve_all_types` walks EVERY syntactic
+# AstType in the module, including the ones the resolver deliberately never
+# visited -- a discarded `$if` arm's annotations, and the orphan nodes the
+# parser's speculative type probe leaves behind for a bracket call. Those are
+# unreachable, so a name lookup there is meaningless and reporting one would
+# reject valid programs. A REACHABLE unresolved name is reported by resolve
+# itself (`resolve_type_path`), which stops the build before sema. Contrast
+# `infer_ident`, whose unbound case really is an invariant breach (#2144), and
+# `intrinsic_operand_type`, which guarantees a diagnostic for the reachable
+# operand it owns (#2178).
 # ---
 # sc:    sema context
 # tid:   syntactic AstType id of the name
@@ -2049,7 +2576,7 @@ fun resolve_type_ref_raw(sc: *context.SemaContext, tid: id.TypeId) type.TypeId {
 fun resolve_type_named(sc: *context.SemaContext, tid: id.TypeId, named: *atype.TypeNamed, span: token.Span) type.TypeId {
     val sym_opt: O.Option[*resolve.Symbol] = context.symbol_for_type(sc, tid);
     if (O.is_none[*resolve.Symbol](sym_opt)) {
-        # resolve already reported the unresolved name; absorb silently
+        # an unreachable node the resolver never visited; see the note above
         ret type.TYPE_ERROR;
     }
     val sym: *resolve.Symbol = O.unwrap[*resolve.Symbol](sym_opt);
@@ -2068,12 +2595,32 @@ fun resolve_type_named(sc: *context.SemaContext, tid: id.TypeId, named: *atype.T
 # resolves to SYM_IMPORTED (the originating rec/uni/def kind is not carried on
 # the import symbol), so its type is read from the dependency's recorded
 # decl_type, which already holds the nominal TypeId or the def's underlying.
+#
+# Both callers reach here only with an ARGUMENT-FREE spelling -- `resolve_type_named`
+# forks to `instantiate_named` the moment args are present, and a `$type_of`
+# comparand cannot spell an instance -- so this is where a generic named bare is
+# caught (#2311).
 # ---
 # sc:   sema context
 # sym:  the resolved type-name symbol
 # span: the name span for diagnostics
 # ret:  the named TypeId, or TYPE_ERROR
 fun type_for_symbol(sc: *context.SemaContext, sym: *resolve.Symbol, span: token.Span) type.TypeId {
+    # a generic declaration named with no type arguments is the TEMPLATE, whose
+    # parameters are unbound and which therefore has no layout. Laying it out
+    # answered `$size_of(Box)` with a constant wrong for every instantiation, and
+    # leaked the unbound `T` into non-generic signatures, where the mismatch was
+    # reported against a type the user cannot write (#2311). Only the kinds whose
+    # `decl` IS the type declaration are asked: a SYM_GENERIC's `decl` is the owner
+    # of the parameter, whose arity is not the parameter's own.
+    if (sym.kind == resolve.SYM_REC || sym.kind == resolve.SYM_UNI || sym.kind == resolve.SYM_IMPORTED) {
+        val arity: u32 = generics.declared_arity(sc, sym.decl, sym.origin);
+        if (arity > 0) {
+            check.report_missing_type_args(sc, span, sym.name, arity);
+            ret type.TYPE_ERROR;
+        }
+    }
+
     if (sym.kind == resolve.SYM_PRIM) {
         ret prim_or_error(sc, sym.slot::type.TypeKind);
     }
@@ -2081,11 +2628,14 @@ fun type_for_symbol(sc: *context.SemaContext, sym: *resolve.Symbol, span: token.
     if (sym.kind == resolve.SYM_VECTOR) {
         ret sym.slot::type.TypeId;
     }
-    if (sym.kind == resolve.SYM_GENERIC) {
-        val r: R.Result[type.TypeId, str] = type.intern_generic_param(?sc.s.types, sym.name, sym.decl, sym.slot);
-        if (R.is_err[type.TypeId, str](r)) { ret type.TYPE_ERROR; }
-        ret R.unwrap_ok[type.TypeId, str](r);
-    }
+    # the type-source leaf for a generic parameter, and the single place the active
+    # substitution is applied on this path (#2168): every composite resolver rebuilds
+    # through `resolve_type_ref`, so a leaf-only application substitutes each parameter
+    # exactly once. Reaches `$fields(T)` / `$size_of(T)` through `intrinsic_operand_type`
+    # too, so a `$each` unroll sees the instance's record. Delegated so the leaf rule the
+    # per-instance re-validation rests on has ONE definition, shared with the
+    # value-position path in `decl_type_for`.
+    if (sym.kind == resolve.SYM_GENERIC) { ret context.generic_param_type_for(sc, sym); }
     if (sym.kind == resolve.SYM_REC || sym.kind == resolve.SYM_UNI) {
         var kind: type.TypeKind = type.TYPE_REC;
         if (sym.kind == resolve.SYM_UNI) { kind = type.TYPE_UNI; }

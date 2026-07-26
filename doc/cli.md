@@ -63,7 +63,7 @@ A verbosity flag (`-v`/`-vv`) and `--quiet` together is a parse error.
 | `--lib <name>`   | artifact name    | narrow the build to one `static`/`shared` `[artifact.<name>]` (mutually exclusive with `--bin`) |
 | `-o <path>`      | path             | override the artifact path, rooted at the project root (build/run/test) |
 | `--all-targets`  | —                | build every declared `[target.*]`, not just the default (mutually exclusive with `-o`, which names one path) |
-| `--emit-asm`     | —                | emit per-module assembly text (`.s`) — each line is one machine instruction the encoder emitted for that module, so the `.s` corresponds to the `.o` instruction for instruction. Supported on x86-64; riscv64 and aarch64 fail naming their tracking issue rather than emit a misleading file. Emission is opt-in, controlled only by this flag |
+| `--emit-asm`     | —                | emit per-module assembly text (`.s`) — each line is one machine instruction the encoder emitted for that module, so the `.s` corresponds to the `.o` instruction for instruction. Emission is opt-in, controlled only by this flag |
 | `--emit-ir`      | —                | emit per-module SSA IR text (`.ir`), the final post-pipeline IR the object is built from (so it varies with the profile's `opt`) — emission is opt-in, controlled only by this flag |
 | `--verify-ir`    | —                | run the IR verifier after each optimisation pass |
 
@@ -89,6 +89,14 @@ codegen to one relocatable object, written under the resolved object tree at
 `<out>/obj/<fqn-as-path>.o`. For a `bin` artifact the objects are linked into the
 resolved artifact path (its `out` template); for a `static`/`shared` library (or
 with `--emit obj`) the objects are the deliverable and nothing is linked.
+
+A target whose object format delivers **finished modules** — SPIR-V, whose object
+output is a complete self-contained module rather than a link input — always
+takes the second shape. Each module is written as `<out>/obj/<fqn-as-path>.spv`
+and the module tree is the artifact, so `mach build --target <spirv-target>` and
+`mach build --target <spirv-target> --emit obj` produce exactly the same files.
+There is no executable to link, no archive or shared-library form, and no test
+dispatcher to run; each is refused by name rather than attempted.
 
 The optimisation pipeline comes from the selected profile's `opt` (`--profile
 <name>`, or the first declared profile) — the profile is how a build picks its
@@ -486,15 +494,20 @@ curated, so a snapshot printed here would only drift.
 
 Each dimension is orthogonal on its own, but the joint cells are not: an
 instruction set emits only with a wired code generator, a calling convention is
-per-ISA, an object format relocates and writes only the ISAs it declares, and an
-operating system links and loads only its own object formats. `mach info targets`
-keeps a `<os>-<isa>` tuple only when some registered calling convention and object
-format compose an emittable full tuple — so `windows-aarch64` is absent (COFF
-covers x86-64 only) and `darwin-riscv64` is absent (Mach-O covers x86-64 and
-aarch64), while freestanding tuples appear for every ISA with an encoder.
+per-ISA, an object format relocates and writes only the ISAs it declares, an
+operating system runs on only the ISAs it was ported to and links and loads only
+its own object formats, and an object format's emission shape must match the
+instruction set's back half — a whole-module emitter needs a format that carries
+finished modules, a register machine one that carries linkable objects. `mach info
+targets` keeps a `<os>-<isa>` tuple only when some registered calling convention and
+object format compose an emittable full tuple — so `windows-aarch64` is absent (COFF
+covers x86-64 only), `darwin-riscv64` is absent (Mach-O covers x86-64 and
+aarch64), and `bmos-aarch64` is absent (the BareMetal kernel is x86-64 only),
+while freestanding tuples appear for every ISA with an encoder.
 Selecting an uncovered tuple fails at composition naming the missing capability
-(for example `object format 'coff' does not cover aarch64 relocations`, or
-`operating system 'windows' does not support object format 'elf'`) rather than
+(for example `object format 'coff' does not cover aarch64 relocations`,
+`operating system 'windows' does not support object format 'elf'`, or `operating
+system 'bmos' does not run on instruction set 'aarch64'`) rather than
 deep in codegen or link. Adding a capability declaration to a vtable is the only
 step needed for a new tuple to appear.
 

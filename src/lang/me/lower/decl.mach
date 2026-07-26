@@ -33,6 +33,7 @@ use aexpr: mach.lang.fe.ast.expr;
 use mach.lang.fe.ast.id;
 use mach.lang.fe.comptime;
 use mach.lang.fe.resolve;
+use mach.lang.fe.sema;
 use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.me.ir;
@@ -85,12 +86,15 @@ pub fun lower_decl(ctx: *context.LowerContext, did: id.DeclId) R.Result[bool, st
 # lower a `fun` declaration into an IR function
 #
 # An external function (no body) is emitted as a signature-only `Function` tagged
-# FN_FLAG_EXTERN. A function with comptime value parameters or a trailing pack
-# parameter is a TEMPLATE rather than a concrete function: it is emitted once per
-# distinct instance through the value- / pack-instance worklists, never as a
-# standalone body here. Emitting one directly would fail, since its `$param`-gated
-# `$if`s and pack `$each` cannot fold without a bound value or concrete element
-# list.
+# FN_FLAG_EXTERN. A function with generic type parameters, comptime value
+# parameters, or a trailing pack parameter is a TEMPLATE rather than a concrete
+# function: it is emitted once per distinct instance through the generic- /
+# value- / pack-instance worklists, never as a standalone body here. Emitting one
+# directly would fail for the latter two, since their `$param`-gated `$if`s and
+# pack `$each` cannot fold without a bound value or concrete element list; for a
+# generic one it silently succeeded, collapsing every `T` to an opaque
+# pointer-width slot and publishing a defined symbol for code no call can reach
+# (#2302). Nothing can name that symbol since #2305 rejects `?generic`.
 # ---
 # ctx:     the context
 # did:     the function's DeclId
@@ -98,6 +102,7 @@ pub fun lower_decl(ctx: *context.LowerContext, did: id.DeclId) R.Result[bool, st
 # is_test: true when lowering a `test` decl through the function path
 # ret:     true on success, or an error
 pub fun lower_fun(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Decl, is_test: bool) R.Result[bool, str] {
+    if (d.data.fun_.generics_len > 0)   { ret R.ok[bool, str](true); }
     if (fun_has_comptime_param(ctx, d)) { ret R.ok[bool, str](true); }
     if (fun_has_pack_param(ctx, d))     { ret R.ok[bool, str](true); }
 
@@ -121,9 +126,13 @@ pub fun lower_fun(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Decl, is_
     if (is_test)                              { flags = flags | ir.FN_FLAG_TEST; }
     # an `inline` decorator hints the inline pass, which already honors the flag.
     if (decl_has_decorator(ctx, d, "inline")) { flags = flags | ir.FN_FLAG_INLINE; }
+    # a `noinline` decorator is the inverse hint (#2200); sema rejects it alongside `inline`.
+    if (decl_has_decorator(ctx, d, "noinline")) { flags = flags | ir.FN_FLAG_NOINLINE; }
     # an `oblivious` decorator carries the constant-time contract to codegen (#1646).
     if (decl_has_decorator(ctx, d, "oblivious")) { flags = flags | ir.FN_FLAG_OBLIVIOUS; }
     if (decl_has_decorator(ctx, d, "scalar")) { flags = flags | ir.FN_FLAG_SCALAR; }
+    # a `naked` decorator suppresses the prologue and epilogue outright (#2198).
+    if (decl_has_decorator(ctx, d, "naked")) { flags = flags | ir.FN_FLAG_NAKED; }
 
     val res_ret_ir: R.Result[ir_type.IrTypeId, str] = context.function_return_ir(ctx, did);
     if (R.is_err[ir_type.IrTypeId, str](res_ret_ir)) { ret R.err[bool, str](R.unwrap_err[ir_type.IrTypeId, str](res_ret_ir)); }
@@ -151,7 +160,7 @@ pub fun lower_fun(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Decl, is_
     # an external function carries no body
     if ((flags & ir.FN_FLAG_EXTERN) != 0) { ret R.ok[bool, str](true); }
 
-    ret emit_function_body(ctx, did, d, fn_index, ret_ir, type.TYPE_NIL);
+    ret emit_function_body(ctx, did, d, fn_index, ret_ir, context.decl_ret_sem(ctx, did));
 }
 
 # lower one monomorphized generic instance: a concrete body for the template
@@ -188,7 +197,7 @@ pub fun lower_instance(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Decl
 # name: the instance's mangled linkage name
 # ret:  true on success, or an error
 pub fun lower_value_instance(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Decl, name: intern.StrId) R.Result[bool, str] {
-    ret lower_weak_instance(ctx, did, d, name, type.TYPE_NIL);
+    ret lower_weak_instance(ctx, did, d, name, context.decl_ret_sem(ctx, did));
 }
 
 # lower one comptime variadic-pack instance: a concrete body for the pack-tailed
@@ -236,10 +245,12 @@ pub fun lower_pack_instance(ctx: *context.LowerContext, did: id.DeclId, d: *decl
 
     # publish the pack body state the `$each a in va` unroll reads: the N element
     # types and the semantic return type now; the N alloca slots are filled by
-    # lower_pack_params below.
+    # lower_pack_params below. the return type is read through the active
+    # substitution, so a pack-tailed generic returning `T` checks its body `ret`
+    # against the instance's concrete return (#2251).
     ctx.pack_types    = types;
     ctx.pack_len      = type_len;
-    ctx.pack_ret_type = pack_instance_ret_sem(ctx, did);
+    ctx.pack_ret_type = context.decl_ret_sem(ctx, did);
 
     builder.set_function(?ctx.builder, ?ctx.m.functions[fn_index]);
 
@@ -254,12 +265,48 @@ pub fun lower_pack_instance(ctx: *context.LowerContext, did: id.DeclId, d: *decl
     val res_params: R.Result[bool, str] = lower_pack_params(ctx, did, d, fn_index, fixed_count, types, type_len);
     if (R.is_err[bool, str](res_params)) { clear_pack_state(ctx); ret res_params; }
 
+    # re-derive the statements AROUND the `$each` under this instance's substitution
+    # before the body is walked (#2254): they were typed once, at the module sema pass,
+    # against the raw generic parameter, and the `$each` body's own re-inference reads
+    # their `decl_type` slots back out of the same shared table.
+    val res_encl: R.Result[bool, str] = reinfer_instance_typing(ctx, d, ctx.pack_ret_type);
+    if (R.is_err[bool, str](res_encl)) { clear_pack_state(ctx); ret res_encl; }
+
     val res_body: R.Result[bool, str] = stmt.lower_stmt(ctx, d.data.fun_.body);
     if (R.is_err[bool, str](res_body)) { clear_pack_state(ctx); ret res_body; }
 
     val res_close: R.Result[bool, str] = close_function(ctx, ret_ir);
     clear_pack_state(ctx);
     ret res_close;
+}
+
+# re-type a monomorphized instance's body under its substitution (#2254, #2257)
+#
+# A no-op outside a generic instance - with no substitution active the template types
+# ARE the instance types. Otherwise it builds the module-spanning typing snapshot the
+# re-inference needs to resolve the body's cross-module references (the same snapshot
+# the per-element unroll builds for a `$each` body) and hands it to the silent
+# re-derivation episode, which republishes the shared typing arrays as this instance's
+# before the body is emitted from them.
+# ---
+# ctx:    the context, bound to the origin module with the instance substitution active
+# d:      the template Decl
+# fn_ret: the instance's semantic return type, against which the body's `ret`s check
+# ret:    true once re-typed (or skipped), or the first error
+fun reinfer_instance_typing(ctx: *context.LowerContext, d: *decl.Decl, fn_ret: type.TypeId) R.Result[bool, str] {
+    if (ctx.subst == nil || ctx.subst_len == 0) { ret R.ok[bool, str](true); }
+
+    val res_deps: R.Result[sema.SemaDeps, str] = sema.collect_module_deps(ctx.s);
+    if (R.is_err[sema.SemaDeps, str](res_deps)) {
+        ret R.err[bool, str](R.unwrap_err[sema.SemaDeps, str](res_deps));
+    }
+    var deps: sema.SemaDeps = R.unwrap_ok[sema.SemaDeps, str](res_deps);
+
+    val res: R.Result[bool, str] = sema.reinfer_instance_body(ctx.s, ctx.a, ctx.rr, ?deps, ctx.ctx,
+        ctx.own_module, ctx.sema_result, fn_ret, d.data.fun_.body,
+        ctx.subst, ctx.subst_len);
+    sema.free_module_deps(ctx.s, ?deps);
+    ret res;
 }
 
 # report whether a function declaration declares any comptime value parameter
@@ -421,9 +468,20 @@ fun lower_weak_instance(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Dec
     # codegen), so it does not perturb non-secret generics.
     var flags: u32 = ir.FN_FLAG_PUB | ir.FN_FLAG_WEAK;
     if (decl_has_decorator(ctx, d, "oblivious")) { flags = flags | ir.FN_FLAG_OBLIVIOUS; }
+    # `#[naked]` propagates for the same reason: an instance that silently gained a
+    # prologue the template forbade would be the miscompile the decorator exists to
+    # prevent, and it would be invisible in the source.
+    if (decl_has_decorator(ctx, d, "naked")) { flags = flags | ir.FN_FLAG_NAKED; }
     val res_idx: R.Result[u32, str] = append_function(ctx, name, sig, flags, d.data.fun_.params_len);
     if (R.is_err[u32, str](res_idx)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_idx)); }
     val fn_index: u32 = R.unwrap_ok[u32, str](res_idx);
+
+    # republish the shared typing arrays as THIS instance's before the body is emitted
+    # from them (#2257): they hold the template's typing, against the raw generic
+    # parameter, and lowering's direct semantic-type reads - `$type_of`'s operand
+    # resolver among them - have no substitution of their own to apply.
+    val res_ty: R.Result[bool, str] = reinfer_instance_typing(ctx, d, context.decl_ret_sem(ctx, did));
+    if (R.is_err[bool, str](res_ty)) { ret res_ty; }
 
     ret emit_function_body(ctx, did, d, fn_index, ret_ir, ret_sem);
 }
@@ -433,9 +491,12 @@ fun lower_weak_instance(ctx: *context.LowerContext, did: id.DeclId, d: *decl.Dec
 #
 # Shared by the concrete function and the generic / value instance lowerings. The
 # pack instance manages its own parameter expansion and does not use this.
-# `ret_sem` is the semantic return type published for deferred `$each $fields(T)`
-# body re-inference (#1523); it is TYPE_NIL for a function or value instance and
-# the substituted return type for a generic instance.
+# `ret_sem` is the semantic return type published for `$each $fields(T)` body
+# re-inference (#1523, #2376), which type-checks the body's `ret`s against it: the
+# substituted return type inside a generic instance, the declared one otherwise.
+# Every function that can carry such a body must publish it - a `$fields` unroll
+# is re-typed per element in a plain function too, and a TYPE_NIL here would check
+# its `ret`s against a void return.
 # ---
 # ctx:     the context
 # did:     the function's DeclId
@@ -483,24 +544,6 @@ fun clear_pack_state(ctx: *context.LowerContext) {
     ctx.pack_types    = nil;
     ctx.pack_len      = 0;
     ctx.pack_ret_type = type.TYPE_NIL;
-}
-
-# the semantic return type of a pack instance, recovered from its template's
-# TYPE_FUN signature
-#
-# Supplied to the per-element body re-inference so a `ret` inside the `$each` body
-# checks against it.
-# ---
-# ctx: the context
-# did: DeclId of the pack-tailed template
-# ret: the semantic return TypeId, or TYPE_NIL when unavailable
-fun pack_instance_ret_sem(ctx: *context.LowerContext, did: id.DeclId) type.TypeId {
-    val sem: type.TypeId = context.decl_type_of(ctx, did);
-    val opt_type: O.Option[*type.Type] = type.get(?ctx.s.types, sem);
-    if (O.is_none[*type.Type](opt_type)) { ret type.TYPE_NIL; }
-    val t: *type.Type = O.unwrap[*type.Type](opt_type);
-    if (t.kind != type.TYPE_FUN) { ret type.TYPE_NIL; }
-    ret t.data.fn.ret_type;
 }
 
 # materialise the pack instance's parameters

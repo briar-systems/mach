@@ -20,6 +20,7 @@
 # (`isel`) replaces these generic opcodes with the concrete encoder opcodes
 # owned by the active ISA.
 
+use std.memory;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -164,6 +165,17 @@ pub val MIR_CALL_RES: MirOpcode = 0x1003;
 # analysis on the pre-selection MIR
 pub val MIR_DECLASSIFY: MirOpcode = 0x1004;
 
+# a vector lane read; operands [dst, vector, lane index] (#2236). `vec_lane`
+# describes the SOURCE vector's arrangement and `width` the lane element's byte
+# width, so the encoder reads the element size from `width` and the lane position
+# from the immediate. the destination is a scalar of the lane's bank
+pub val MIR_VEC_EXTRACT: MirOpcode = 0x1005;
+# a vector lane write; operands [dst, vector, lane index, value] (#2236). functional
+# like its IR opcode: the destination is a new vector, not an in-place mutation, and
+# isel ties it to the source vector where the machine form is two-address. `vec_lane`
+# describes the destination vector and `src_width` the written lane's byte width
+pub val MIR_VEC_INSERT:  MirOpcode = 0x1006;
+
 # selection-output sentinels for the generic opcodes that survive instruction
 # selection because they need a multi-instruction byte sequence the encoder
 # materializes. isel rewrites each surviving generic opcode to a high sentinel
@@ -238,9 +250,19 @@ pub fun fused_cbr_opcode(cmp: MirOpcode) MirOpcode {
 # lowers to moves, so MIR_EXTRACT / MIR_INSERT never reach a selector) that a
 # table must keep default-deny; `fused` the compare-and-branch survivors the
 # engine's combine produces, which a fusing pack's table must admit.
+#
+# `reachable` is UNCONDITIONAL: every pack must model each of its opcodes, and that
+# is enforced statically by each pack's `generic_opcode_coverage` test probing
+# `find_rule`. The test never runs the pipeline, so "a pass removes it first" does
+# not excuse a pack from covering a reachable opcode - a capability-gated opcode
+# therefore cannot live in this list. `fused` and `lane` are the two CAPABILITY-
+# GATED lists: an opcode only reaches selection on a target that opted into
+# producing it, so only that target's coverage test consults the list and every
+# other pack keeps it default-deny.
 pub val SELECTION_REACHABLE_COUNT:  u32 = 46;
 pub val SELECTION_ELIMINATED_COUNT: u32 = 3;
 pub val SELECTION_FUSED_COUNT:      u32 = 6;
+pub val SELECTION_LANE_COUNT:       u32 = 2;
 
 # fill `out` (SELECTION_REACHABLE_COUNT wide) with the reachable alphabet
 pub fun selection_reachable(out: *u32) {
@@ -297,6 +319,16 @@ pub fun selection_eliminated(out: *u32) {
     out[0]  = MIR_CALL_IR;
     out[1]  = MIR_EXTRACT;
     out[2]  = MIR_INSERT;
+}
+
+# fill `out` (SELECTION_LANE_COUNT wide) with the vector lane-access opcodes
+#
+# Reachable only on a target whose `MachineModel.has_lane_ops` is set; every other
+# target has `me.pass.scalarize.expand_lane_ops` rewrite them to the vector's memory
+# image before selection, so their packs keep these default-deny.
+pub fun selection_lane(out: *u32) {
+    out[0] = MIR_VEC_EXTRACT;
+    out[1] = MIR_VEC_INSERT;
 }
 
 # fill `out` (SELECTION_FUSED_COUNT wide) with the fused survivors
@@ -563,6 +595,73 @@ pub rec MirInstr {
     writes_secret:     bool;
 }
 
+# build a fresh MIR instruction, every caller-owned field supplied
+#
+# THIS IS THE ONLY PLACE A `MirInstr` IS CLEARED. `var` does not zero, so a site
+# that builds one field by field leaves whatever it does not name holding the
+# frame's residue - and a field added later is named by no site at all. That is not
+# hypothetical here: `vec_lane` was added and `regalloc.rewrite_instr` did not learn
+# about it, so every rewritten vector op read as the `.16b` byte arrangement and the
+# NEON encoder collapsed every arrangement after register assignment (#2032, #2321).
+#
+# The five fields a caller genuinely chooses are positional parameters, so omitting
+# one is an arity error at build time rather than a garbage operation width reaching
+# the encoder. Everything else is METADATA the caller does not author: `asm_block`
+# belongs to MIR_ASM alone, `loc` / `inline_site` / `vec_lane` / `writes_secret` are
+# stamped from the lowering context at `mir.context.push_instr`, and the dbg-binding
+# list is attached there too. Cleared here, so an instruction built outside that
+# chokepoint carries defined metadata rather than the stack's.
+# ---
+# opcode:        the MIR opcode
+# operands:      the operand array (borrowed or owned per the caller's convention)
+# operand_count: number of operands
+# width:         operation width in bytes
+# src_width:     source width in bytes, for a widening / narrowing op
+# ret:           the instruction, with every metadata field cleared
+pub fun instr(opcode: MirOpcode, operands: *MirOperand, operand_count: u32,
+              width: u8, src_width: u8) MirInstr {
+    var mi: MirInstr;
+    mi.opcode        = opcode;
+    mi.operands      = operands;
+    mi.operand_count = operand_count;
+    mi.width         = width;
+    mi.src_width     = src_width;
+
+    mi.asm_block         = nil;
+    mi.loc               = source.loc_nil();
+    mi.dbg_bindings      = nil;
+    mi.dbg_binding_count = 0;
+    mi.inline_site       = 0;
+    mi.vec_lane          = VEC_LANE_NONE;
+    mi.writes_secret     = false;
+    ret mi;
+}
+
+# derive an instruction from an existing one, replacing its operand list
+#
+# The rewrite/clone constructor, and the one #2032 needed. A pass that rebuilds an
+# instruction with new operands - register assignment rewriting vregs to physical
+# registers, loop rotation cloning a block - must carry every field it is not
+# deliberately changing, and doing that field by field is how `vec_lane` was
+# dropped. Deciding carry-or-reset ONCE, here, means a field added to `MirInstr`
+# later flows through both callers with no visit to either.
+#
+# EVERY field is carried, including `asm_block` and the dbg-binding list. A caller
+# that must not duplicate one of those - a CLONE aliases an owned list rather than
+# taking it over - clears it explicitly afterwards, which is a semantic decision
+# visible at the site rather than a field silently missed here.
+# ---
+# src:           the instruction to derive from
+# operands:      the replacement operand array
+# operand_count: number of replacement operands
+# ret:           the derived instruction
+pub fun instr_like(src: *MirInstr, operands: *MirOperand, operand_count: u32) MirInstr {
+    var mi: MirInstr = @src;
+    mi.operands      = operands;
+    mi.operand_count = operand_count;
+    ret mi;
+}
+
 # the vector-lane element kinds packed into `MirInstr.vec_lane`'s high nibble.
 # VEC_LANE_NONE (0) means the instruction is not vector-typed. signedness is NOT a
 # lane-descriptor field: it rides the consuming opcode (a signed vs unsigned
@@ -649,7 +748,7 @@ pub rec MirBlock {
 # a virtual register and its register-allocation state
 # ---
 # id:         the vreg's own index into MirFunction.vregs
-# class:      index into target.arch.reg_classes selecting the register bank
+# class:      index into `tgt.model.reg_classes` selecting the register bank
 # spill_slot: stack-frame slot index when spilled (-1 while unspilled)
 # assigned:   physical register id assigned by regalloc (MIR_VREG_NIL until then)
 # vector:     true when the vreg holds a 128-bit SIMD vector; distinguishes a vector
@@ -713,6 +812,14 @@ pub rec MirSlot {
 #                locals, spills, or the callee-saved save area, and the call-site
 #                RSP stays 16-byte aligned. zero when the function makes no call
 #                with stack-passed arguments.
+# omit:          this function gets NO compiler-generated prologue or epilogue -
+#                no frame-pointer record, no stack allocation, no callee-save
+#                stores. decided once by `frame.run` (`frame.omits_frame`) from
+#                the laid-out frame facts and read by every target's encoder, so
+#                one predicate governs all three ISAs. two disjoint reasons set
+#                it: a `#[naked]` declaration, and a leaf that provably never
+#                touches the frame. `-g` cannot influence either, so `.text` stays
+#                byte-identical with and without it.
 pub rec MirFrame {
     slots:         *MirSlot;
     slot_count:    u32;
@@ -720,6 +827,7 @@ pub rec MirFrame {
     size:          u32;
     align:         u32;
     outgoing_size: u32;
+    omit:          bool;
 }
 
 # a function in MIR form - blocks, the virtual-register table, and frame layout
@@ -749,6 +857,12 @@ pub rec MirFrame {
 #                 is self-describing for the constant-time validator: the leakage
 #                 checks run only in a function marked here. pure metadata (like the
 #                 vreg / store secret seeds); a non-oblivious function is byte-identical.
+# naked:          the `#[naked]` declaration (#2198), mirroring the IR function's
+#                 FN_FLAG_NAKED and stamped at lowering the same way `oblivious` is.
+#                 `frame.omits_frame` reads it as the one omission reason that needs
+#                 no proof: the author asked for no frame and owns the alignment, the
+#                 link register and the return. a declaration rather than a derived
+#                 fact, so it belongs to the function, not to the laid-out `frame`.
 pub rec MirFunction {
     name:        intern.StrId;
 
@@ -764,6 +878,7 @@ pub rec MirFunction {
     callee_mask:    u32;
     callee_mask_fp: u32;
     oblivious:      bool;
+    naked:          bool;
 }
 
 # the per-source-module unit produced by `lower_ir`
@@ -793,6 +908,32 @@ pub val INITIAL_FN_CAP:    u32 = 8;
 pub val INITIAL_VREG_CAP:  u32 = 32;
 pub val INITIAL_INSTR_CAP: u32 = 16;
 pub val INITIAL_SLOT_CAP:  u32 = 8;
+
+# report whether the encoder emits instruction `mi` of function `f`
+#
+# The whole of `#[naked]`'s "body as written" contract, in one predicate every
+# target's encoder reads rather than three copies of the rule (#2198). A naked
+# function emits its inline asm and NOTHING else: not the prologue and epilogue
+# (`frame.omit` already suppresses those), not the argument moves - the body owns
+# the ABI registers as they arrive - and not the terminator, whose `ret` would
+# return through a stack or link register only the author's asm understands. That
+# last one is the `ret`-instead-of-`iret` bug an interrupt handler exists to avoid,
+# and the return-value materialization ahead of it is compiler-written code in a
+# body that declared it would have none.
+#
+# Sema restricts a naked body to `asm` statements, so what this drops is only ever
+# code the compiler synthesized around them.
+# ---
+# f:   the function being encoded
+# mi:  the instruction to judge
+# ret: true when the encoder must emit it
+pub fun emits_instr(f: *MirFunction, mi: *MirInstr) bool {
+    if (!f.naked) { ret true; }
+    # an inline-asm block survives selection under a per-target opcode (x86-64 retags
+    # it to ASM_BLOCK), but its payload pointer is set on every target - so the
+    # payload, not the opcode, identifies it.
+    ret mi.asm_block != nil;
+}
 
 # build a virtual-register operand
 # ---
@@ -1182,5 +1323,63 @@ test "mach.lang.be.codegen.mir.vec_lane:pack_unpack" {
     val i2: u8 = vec_lane_make(VEC_LANE_INT, 2);
     if (vec_lane_kind(i2) != VEC_LANE_INT) { ret 1; }
     if (vec_lane_elem_bytes(i2) != 2)      { ret 1; }
+    ret 0;
+}
+
+# `instr` CLEARS EVERY FIELD IT DOES NOT TAKE.
+#
+# The five parameters land where they are named and the seven metadata fields come
+# back neutral, so an instruction built outside the `push_instr` chokepoint carries
+# defined metadata rather than the caller's stack.
+test "mach.lang.be.codegen.mir.instr:clears_the_metadata" {
+    var ops: [2]MirOperand;
+    val mi: MirInstr = instr(MIR_MOV, ?ops[0], 2, 8, 4);
+
+    if (mi.opcode != MIR_MOV)      { ret 1; }
+    if (mi.operands != ?ops[0])    { ret 1; }
+    if (mi.operand_count != 2)     { ret 1; }
+    if (mi.width != 8)             { ret 1; }
+    if (mi.src_width != 4)         { ret 1; }
+
+    if (mi.asm_block != nil)         { ret 1; }
+    if (mi.dbg_bindings != nil)      { ret 1; }
+    if (mi.dbg_binding_count != 0)   { ret 1; }
+    if (mi.inline_site != 0)         { ret 1; }
+    if (mi.vec_lane != VEC_LANE_NONE) { ret 1; }
+    if (mi.writes_secret)            { ret 1; }
+    ret 0;
+}
+
+# `instr_like` CARRIES EVERY FIELD, INCLUDING ONES THAT DO NOT EXIST YET.
+#
+# The guard #2032 needed. A rewrite that rebuilds an instruction field by field
+# drops whatever field it was not taught about - there, `vec_lane`, which left every
+# rewritten vector op reading as element bytes 0 and collapsed the NEON arrangement
+# to `.16b` after register assignment. Asserting the fields one by one would repeat
+# that mistake in the test, so this compares the WHOLE RECORD: derive with the same
+# operand list the source already carries, and the result must be byte-identical to
+# it. A field added to `MirInstr` that the derive forgets fails this with no edit.
+#
+# Both records are pattern-filled first, so any padding the layout holds agrees
+# whether a whole-record assignment lowers to a memcpy or to field-wise moves.
+#
+# To see it fail, replace the whole-record copy in `instr_like` with a field-by-field
+# rebuild that omits one field.
+test "mach.lang.be.codegen.mir.instr_like:carries_every_field" {
+    var src: MirInstr = instr(MIR_ADD, nil, 0, 0, 0);
+    var out: MirInstr = instr(MIR_ADD, nil, 0, 0, 0);
+    memory.raw_fill((?src)::ptr, 0xA5, $size_of(MirInstr));
+    memory.raw_fill((?out)::ptr, 0xA5, $size_of(MirInstr));
+
+    out = instr_like(?src, src.operands, src.operand_count);
+    if (!memory.equal[MirInstr](?out, ?src, 1)) { ret 1; }
+
+    # and the operand list really is the one passed, not the source's
+    var ops: [3]MirOperand;
+    val moved: MirInstr = instr_like(?src, ?ops[0], 3);
+    if (moved.operands != ?ops[0]) { ret 1; }
+    if (moved.operand_count != 3)  { ret 1; }
+    if (moved.opcode != src.opcode)     { ret 1; }
+    if (moved.vec_lane != src.vec_lane) { ret 1; }
     ret 0;
 }

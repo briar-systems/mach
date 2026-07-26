@@ -9,13 +9,16 @@
 # abstract `RK_*` kinds; each format maps those to its own machine relocation
 # types internally with a plain integer compare.
 
+use std.allocator.page;
 use std.system.panic.panic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_contains;
 use std.types.string.str_equals;
+use std.types.string.str_join;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -588,13 +591,16 @@ val OF_ISA_MAX: u32 = 8;
 # the abstract `RK_*` kinds to its own machine relocation types internally. It
 # never branches on `id`.
 #
-# `produces_image` declares whether the format is a container-free flat image
-# (true) or a relocatable-object format that round-trips through `.o` files
-# (false). The build driver dispatches on it: a relocatable format codegens each
-# module to a `.o` (`emit_object`), then the linker reads every input back
-# (`parse_object`) before laying out the executable; a flat-image format has no
+# `produces_image` and `object_is_artifact` name the three emission shapes the
+# build driver dispatches on, and every format is exactly one of them. A
+# RELOCATABLE format (both false: elf, coff, mach-o) codegens each module to a
+# `.o` (`emit_object`), then the linker reads every input back (`parse_object`)
+# before laying out the executable. A FLAT IMAGE (`produces_image`: raw) has no
 # relocatable container, so the driver links straight from the in-memory codegen
-# images and never calls `emit_object`/`parse_object`.
+# images and never calls `emit_object`/`parse_object`. A FINISHED MODULE
+# (`object_is_artifact`: spv) inverts the relocatable shape - `emit_object`
+# writes a complete, self-contained artifact, so the module tree is the build's
+# delivery and there is no link phase at all.
 # ---
 # id:             object-format id (one of OF_*)
 # name:           format name ("elf", "coff", "macho", "raw"); an immutable str constant
@@ -612,6 +618,18 @@ val OF_ISA_MAX: u32 = 8;
 #                 until #2125 lands (its weak-COMDAT carrier duplicates every weak
 #                 body into `.text`, so the coff image diverges from its `.o`),
 #                 keeping coff on the disk round-trip
+# object_is_artifact: true when `emit_object`'s output is a FINISHED artifact
+#                 rather than a linkable input - a self-contained module no
+#                 linker consumes (spv). the build driver reads it to end the
+#                 build at the emit phase and deliver the module tree, so the
+#                 default goal and `--emit obj` produce the same files;
+#                 `target.select_of` reads it to resolve a whole-module
+#                 emitter's object format, which the os cannot supply
+# object_ext:     the filename extension `emit_object`'s output carries, without
+#                 the dot ("o" for elf / coff / mach-o, "spv" for a finished
+#                 SPIR-V module); "" for a format that emits no object at all
+#                 (raw). the emit path names each module's object through it
+#                 rather than assuming `.o`
 # emit_object:    serializes an ObjectImage to a relocatable object file
 # parse_object:   reads a relocatable object file into an ObjectImage
 # emit_exec:      serializes laid-out load segments into a static executable
@@ -653,6 +671,8 @@ pub rec OfVTable {
     name:                str;
     produces_image:      bool;
     links_from_image:    bool;
+    object_is_artifact:  bool;
+    object_ext:          str;
     emit_object:         WriterFn;
     parse_object:        ParserFn;
     emit_exec:           ExecFn;
@@ -767,15 +787,16 @@ pub val DBG_CODEVIEW: u32 = 2;  # codeview (coff/pe)
 # the session, the resolved target, the IR module, and the encoder's output, each
 # of which imports this target layer, so a typed field here would invert the
 # dependency. The be-layer `dwarf.register_debug_hooks` installs the producer
-# post-hoc (exactly as `be.linker.register_reloc_hooks` wires `apply_reloc`), and
-# `be.codegen` casts the pointer back to the producer's `dwarf.ProduceFn` signature
-# before calling it.
+# post-hoc, and `be.codegen` casts the pointer back to the producer's
+# `dwarf.ProduceFn` signature before calling it.
 # ---
 # id:      debug-model id (one of DBG_*)
 # name:    model name ("dwarf", "codeview"); an immutable str constant
 # produce: erased fn ptr - writes a module's debug sections into the object image
 #          (cast back to the be-layer producer's `ProduceFn`); nil until the
-#          be-layer registrar wires it
+#          be-layer registrar wires it, and still nil past bring-up only in a
+#          registry composed without the back end (`debug_hooks_complete` refuses a
+#          fully composed one that leaves it so)
 pub rec DebugVTable {
     id:      u32;
     name:    str;
@@ -857,12 +878,10 @@ var dwarf_identity: DebugVTable;
 
 # register the debug-model IDENTITIES the target layer declares, hooks nil
 #
-# The debug-dimension analogue of the ISA vtables' registration split: the
-# target layer owns each model's identity (id + name, resolvable by
+# The target layer owns each model's identity (id + name, resolvable by
 # `target.select_of` against a format's `default_debug`), while the be-layer
 # registrar (`dwarf.register_debug_hooks`) wires the erased `produce` hook onto
-# the registered entry post-hoc - exactly as `be.linker.register_reloc_hooks`
-# wires `apply_reloc` onto the registered ISA vtables. Called from
+# the registered entry post-hoc, keyed on that same registered name. Called from
 # `target.register_all`, so a registry is identity-complete before any select
 # and a format naming an unknown producer fails the select loudly.
 # ---
@@ -872,6 +891,57 @@ pub fun debug_register_identities(reg: *DebugRegistry) {
     dwarf_identity.name    = "dwarf";
     dwarf_identity.produce = nil;
     debug_register(reg, ?dwarf_identity);
+}
+
+# the message a registered-but-unwired debug model is refused with, naming it
+#
+# Page-allocated through `str_join`, the same shape `target.unregistered_message`
+# uses for the tuple diagnostics. The generic fallback is taken only when the page
+# allocator or the join itself fails; the refusal still fires, it just cannot name
+# the model.
+# ---
+# name: the registered model name whose producer is missing
+# ret:  the refusal message
+fun unwired_debug_message(name: str) str {
+    var alloc: A.Allocator;
+    val fb: str = "a registered debug-info model carries no producer hook";
+    if (O.is_some[str](page.make(?alloc))) { ret fb; }
+    val r: R.Result[str, str] = str_join(?alloc, "debug model '", name, "' is registered but no producer wired its hooks (its be-layer registrar is missing from driver.setup_registry)");
+    if (R.is_err[str, str](r)) { ret fb; }
+    ret R.unwrap_ok[str, str](r);
+}
+
+# refuse a debug registry holding an identity that no producer ever wired
+#
+# The identity/producer split is real and load-bearing: the target layer must be
+# able to register a model's name without the back end present (`mach info`,
+# `mach doc` and `mach init` compose registries from `target.register_all` alone,
+# and a format naming an unregistered model must fail `select_of` loudly there
+# too), while the producer itself can only be named from `be`. That is the same
+# import direction that erases `produce` to `*u8`, so a required constructor
+# parameter - the shape #2244 gave the relocation seam - is not available here.
+#
+# The split is also what lets the wiring MISS. The identity list and the be-layer
+# registrars are hardcoded in two files in two layers, joined only by the order
+# `driver.setup_registry` calls them; adding a model to one without the other
+# registers cleanly, resolves cleanly through `select_of`, and surfaces only when a
+# `-g` build of a target whose format names that model reaches codegen - which
+# refuses at dispatch, but names neither the model nor the missing registrar
+# (#2295). This is the invariant that split cannot express, checked at the one
+# point where both halves are present: a fully composed registry either has every
+# identity wired or refuses to come up, naming the model.
+# ---
+# reg: the debug registry, after every be-layer registrar has run
+# ret: ok(true) when every registered identity carries a producer, or the first gap
+pub fun debug_hooks_complete(reg: *DebugRegistry) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < reg.count) {
+        if (reg.entries[i].produce == nil) {
+            ret R.err[bool, str](unwired_debug_message(reg.entries[i].name));
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
 }
 
 # the debug-info vtable at enumeration index `idx` (0-based, in registration order)
@@ -1011,5 +1081,38 @@ test "mach.lang.target.of.debug_register:install_lookup_dispatch" {
 
     # an unregistered model name resolves to none.
     if (O.is_some[*DebugVTable](debug_lookup(?reg, "codeview"))) { ret 1; }
+    ret 0;
+}
+
+# the completeness check refuses exactly the state the identity/producer split can
+# leave behind: an identity registered by the target layer that no be-layer
+# registrar wired. an empty registry and a fully wired one both pass, so the check
+# fires on the gap rather than on composition order
+test "mach.lang.target.of.debug_hooks_complete:refuses_unwired_identity" {
+    var empty: DebugRegistry = debug_registry_init();
+    if (R.is_err[bool, str](debug_hooks_complete(?empty))) { ret 1; }
+
+    # what `debug_register_identities` leaves behind before the be layer runs.
+    var reg: DebugRegistry = debug_registry_init();
+    debug_register_identities(?reg);
+    if (debug_registered_count(?reg) == 0) { ret 1; }
+    val unwired: R.Result[bool, str] = debug_hooks_complete(?reg);
+    if (!R.is_err[bool, str](unwired)) { ret 1; }
+    # the refusal names the model, so the missing registrar is identifiable.
+    if (!str_contains(R.unwrap_err[bool, str](unwired), "dwarf")) { ret 1; }
+
+    # wiring the producer, as the be-layer registrar does, satisfies it.
+    val opt: O.Option[*DebugVTable] = debug_lookup(?reg, "dwarf");
+    if (!O.is_some[*DebugVTable](opt)) { ret 1; }
+    O.unwrap[*DebugVTable](opt).produce = t_debug_produce::*u8;
+    if (R.is_err[bool, str](debug_hooks_complete(?reg))) { ret 1; }
+
+    # one unwired entry among wired ones is still refused, and named.
+    var extra: DebugVTable;
+    extra.id = DBG_CODEVIEW; extra.name = "codeview"; extra.produce = nil;
+    debug_register(?reg, ?extra);
+    val mixed: R.Result[bool, str] = debug_hooks_complete(?reg);
+    if (!R.is_err[bool, str](mixed))                            { ret 1; }
+    if (!str_contains(R.unwrap_err[bool, str](mixed), "codeview")) { ret 1; }
     ret 0;
 }

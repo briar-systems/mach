@@ -173,11 +173,14 @@ fun lower_function(tgt: *target.Target, m: *ir.Module, fn: *ir.Function, alloc: 
     mf.frame.size          = 0;
     mf.frame.align         = 0;
     mf.frame.outgoing_size = 0;
+    mf.frame.omit          = false;
     mf.callee_mask         = 0;
     mf.callee_mask_fp      = 0;
     # the #[oblivious] seed for #1648: mark the MIR self-describing so the constant-time
     # validator runs its leakage checks only in a function the source opted in.
     mf.oblivious           = (fn.flags & ir.FN_FLAG_OBLIVIOUS) != 0;
+    # the #[naked] seed for #2198, read by `frame.omits_frame`.
+    mf.naked               = (fn.flags & ir.FN_FLAG_NAKED) != 0;
 
     # extern / body-less functions lower to an empty mir.MirFunction shell.
     if ((fn.flags & ir.FN_FLAG_EXTERN) != 0 || fn.block_count == 0) {
@@ -649,16 +652,13 @@ fun insert_mov_before_terminator(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mi
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = dst;
     ops[1] = src;
-    var mi: mir.MirInstr;
+    var mi: mir.MirInstr = mir.instr(mir.MIR_MOV, ops, 2, 0, 0);
     # a global / function symbol incoming value is its ADDRESS as an rvalue: a
     # mir.MIR_MOV of a symbol selects to `mov dst, [sym]` (loading the symbol's
     # contents), so it is emitted as the address-computing mir.MIR_GEP (`lea dst,
     # [sym]`) instead - the same LEA-materialization the store / call-arg / return
     # symbol paths use.
-    mi.opcode        = mir.MIR_MOV;
     if (src.kind == mir.MIR_OP_SYM) { mi.opcode = mir.MIR_GEP; }
-    mi.operands      = ops;
-    mi.operand_count = 2;
     # a register / symbol source transfers a value already in its target-canonical
     # register form, so a full GPR-width bit copy is width-agnostic for a GP or scalar
     # float value. a 128-bit vector vreg is the exception: it is 16 bytes, so a
@@ -811,26 +811,14 @@ fun split_critical_edge(ctx: *lctx.LowerCtx, pred: *mir.MirBlock, succ_id: u32) 
     if (R.is_err[*mir.MirOperand, str](rb)) { ret R.err[*mir.MirBlock, str](R.unwrap_err[*mir.MirOperand, str](rb)); }
     val bops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](rb);
     bops[0] = mir.op_block(succ_id);
-    var br: mir.MirInstr;
-    br.opcode        = mir.MIR_BR;
-    br.operands      = bops;
-    br.operand_count = 1;
-    br.width         = ctx.tgt.model.gpr_width::u8;
-    br.src_width     = ctx.tgt.model.gpr_width::u8;
-    # this splice bypasses lctx.push_instr, so enforce the asm_block invariant here:
-    # struct locals are not zero-initialized, and regalloc.flatten reads a non-nil
-    # asm_block as an inline-asm clobber barrier. this is a synthesized critical-edge
-    # branch with no source instruction, so its loc is nil (the line table attributes
-    # it to the surrounding code) and it carries no dbg bindings.
-    br.asm_block         = nil;
-    br.loc               = source.loc_nil();
-    # a synthesized critical-edge branch has no inlined-from origin; attribute it to the
-    # function body (0). the encoder groups by instance, so this at worst splits an
-    # inline instance's PC range at the edge, which the range list represents faithfully.
-    br.inline_site       = 0;
-    br.dbg_bindings      = nil;
-    br.dbg_binding_count = 0;
-    br.writes_secret     = false;   # a synthesized branch never writes storage (#1646)
+    # this splice bypasses lctx.push_instr, so the constructor's cleared metadata IS
+    # the invariant: asm_block nil (regalloc.flatten reads a non-nil one as an
+    # inline-asm clobber barrier), loc nil for a synthesized branch with no source
+    # instruction (the line table attributes it to the surrounding code), inline_site
+    # 0 so it is attributed to the function body, no dbg bindings, and writes_secret
+    # false because a synthesized branch never writes storage (#1646).
+    var br: mir.MirInstr = mir.instr(mir.MIR_BR, bops, 1,
+                                     ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
 
     val ri: R.Result[*mir.MirInstr, str] = A.allocate[mir.MirInstr](ctx.alloc, 1::usize);
     if (R.is_err[*mir.MirInstr, str](ri)) { A.deallocate[mir.MirOperand](ctx.alloc, bops, 1::usize); ret R.err[*mir.MirBlock, str](R.unwrap_err[*mir.MirInstr, str](ri)); }
@@ -1015,6 +1003,16 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     if (inst.kind == instr.OP_GEP) {
         ret lower_gep(ctx, mb, inst, iid);
     }
+    # vector lane access (#2236). only reaches here on a target that selects it
+    # natively - `me.pass.scalarize.expand_lane_ops` has already rewritten these to
+    # the vector's memory image everywhere else - so the opcodes stay out of the
+    # unconditional selection alphabet.
+    if (inst.kind == instr.OP_VEC_EXTRACT) {
+        ret lower_vec_extract(ctx, mb, inst, iid);
+    }
+    if (inst.kind == instr.OP_VEC_INSERT) {
+        ret lower_vec_insert(ctx, mb, inst, iid);
+    }
     # a `:^` declassify (#1646) is an identity at runtime (secrecy has no machine shape):
     # a register copy of the operand into the result vreg, at the value's width so the
     # encoder selects the GP or SSE move by operand class. it lowers to the DISTINGUISHABLE
@@ -1044,7 +1042,7 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     # integer division / remainder needs the dividend / remainder register wiring
     # the active ISA's division form mandates (x86-64 IDIV/DIV reads the dividend
     # in RAX and yields the quotient in RAX / remainder in RDX). the accumulator
-    # and high-half registers come from `tgt.arch.div_reg` / `div_hi_reg`; an ISA
+    # and high-half registers come from `tgt.model.div_reg` / `div_hi_reg`; an ISA
     # whose division wires no fixed register reports -1 and `lower_div` errors
     # loudly rather than emitting an un-pre-colored divide.
     if (inst.kind == instr.OP_DIV_S || inst.kind == instr.OP_DIV_U ||
@@ -1053,7 +1051,7 @@ fun lower_instr(ctx: *lctx.LowerCtx, fn: *ir.Function, mb: *mir.MirBlock, iid: i
     }
 
     # a shift (SHL / SHR_S / SHR_U): an ISA whose variable-shift form hard-wires the
-    # count register (x86-64 CL) pre-colors a runtime count into `tgt.arch.shift_count_reg`;
+    # count register (x86-64 CL) pre-colors a runtime count into `tgt.model.shift_count_reg`;
     # an ISA wiring no fixed shift-count register (-1, e.g. AArch64 LSLV/LSRV/ASRV)
     # passes the count straight through to the three-address register-shift form.
     if (inst.kind == instr.OP_SHL || inst.kind == instr.OP_SHR_S ||
@@ -1239,10 +1237,37 @@ test "mach.lang.be.codegen.mir.lower.ct_gate:mechanism" {
     ret 0;
 }
 
+# a sub-word integer constant reaches the backend as its width-masked bits, so a
+# consumer computing above that width re-derives the value they denote: signed
+# re-signs the top bit of the low `width` bytes, unsigned masks to them. widths at
+# or above the machine word - and the width-0 sentinel - denote their raw value
+test "mach.lang.be.codegen.mir.lower.narrow_imm_value" {
+    # i8: 200 denotes -56; 127 and 0 are unchanged; 128 is the sign boundary.
+    if (narrow_imm_value(200, 1, true)  != -56)  { ret 1; }
+    if (narrow_imm_value(127, 1, true)  != 127)  { ret 1; }
+    if (narrow_imm_value(128, 1, true)  != -128) { ret 1; }
+    if (narrow_imm_value(0, 1, true)    != 0)    { ret 1; }
+    # u8: the same bits denote themselves.
+    if (narrow_imm_value(200, 1, false) != 200)  { ret 1; }
+    if (narrow_imm_value(255, 1, false) != 255)  { ret 1; }
+    # i16 / u16 at the same boundaries.
+    if (narrow_imm_value(65535, 2, true)  != -1)     { ret 1; }
+    if (narrow_imm_value(32768, 2, true)  != -32768) { ret 1; }
+    if (narrow_imm_value(65535, 2, false) != 65535)  { ret 1; }
+    # a value already carrying its sign re-derives to itself, so the widening is
+    # idempotent however many times a lowering path applies it.
+    if (narrow_imm_value(-56, 1, true)  != -56)  { ret 1; }
+    # 4 and 8 byte widths, and the width-0 machine-word sentinel, pass through.
+    if (narrow_imm_value(-56, 4, true)  != -56)  { ret 1; }
+    if (narrow_imm_value(-56, 8, true)  != -56)  { ret 1; }
+    if (narrow_imm_value(-56, 0, true)  != -56)  { ret 1; }
+    ret 0;
+}
+
 fun vector_unsupported(ctx: *lctx.LowerCtx) str {
     val prefix:   str = "codegen: 128-bit vectors not yet supported on ";
     val fallback: str = "codegen: 128-bit vectors not yet supported on this target";
-    val arch:     str = ctx.tgt.arch.name;
+    val arch:     str = ctx.tgt.isa.name;
     if (arch == nil) { ret fallback; }
 
     val jr: R.Result[str, str] = str_join(ctx.alloc, prefix, arch);
@@ -1290,10 +1315,7 @@ fun lower_cbr(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
     ops[1] = lctx.lower_operand(ctx, inst, 1);
     ops[2] = lctx.lower_operand(ctx, inst, 2);
 
-    var mi: mir.MirInstr;
-    mi.opcode        = inst.kind::u32;
-    mi.operands      = ops;
-    mi.operand_count = 3;
+    var mi: mir.MirInstr = mir.instr(inst.kind::u32, ops, 3, 0, 0);
     set_generic_widths(ctx, inst, ?mi);
     # a conditional branch tests its boolean condition, but a bare bool value (e.g.
     # a struct's `tag` field) reaches the encoder in a register's low byte WITHOUT
@@ -1384,12 +1406,7 @@ fun lower_asm_instr(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, iid: id.InstructionI
         payload.bind_count = src.bind_count;
     }
 
-    var mi: mir.MirInstr;
-    mi.opcode        = mir.MIR_ASM;
-    mi.operands      = nil;
-    mi.operand_count = 0;
-    mi.width         = 0;
-    mi.src_width     = 0;
+    var mi: mir.MirInstr = mir.instr(mir.MIR_ASM, nil, 0, 0, 0);
     mi.asm_block     = payload;
 
     val push: R.Result[bool, str] = lctx.push_instr(ctx, mb, mi);
@@ -1399,6 +1416,54 @@ fun lower_asm_instr(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, iid: id.InstructionI
         ret push;
     }
     ret R.ok[bool, str](true);
+}
+
+# canonicalize a sub-word right shift's value operand to its declared width
+#
+# The `mir.ALU_MIN_WIDTH` contract computes a sub-word ALU op at the ALU floor and
+# leaves the register bits ABOVE the declared width undefined, requiring every
+# consumer that needs the narrow value to re-narrow it. A right shift is such a
+# consumer, and the only ALU one that was never enrolled (#2357): it moves high bits
+# DOWN into the result, so residue above the declared width lands inside the value -
+# `(0 - a) >> 7` at u8 shifted a full 0xFFFFFFFF and read 255 where the u8 answer is
+# 1. Extending the value into a fresh vreg first makes the floor-width shift exact at
+# the declared width, and leaves the result defined across the whole floor, so the
+# producer half of the contract still holds.
+#
+# ONLY THE RIGHT SHIFTS NEED THIS. An operation is input-sensitive exactly when its
+# low N result bits depend on operand bits above N. For OP_SHL, and for ADD / SUB /
+# MUL / AND / OR / XOR / NOT / NEG, they do not - carries and borrows propagate only
+# upward and the bitwise ops are bit-independent - so those stay exact on a dirty
+# operand and are left alone. The other two input-sensitive classes were already
+# enrolled: the divides promote both operands in `lower_div`, and a comparison keeps
+# its true operand width in `set_generic_widths` for the per-ISA `narrow_cmp_source`.
+# The shift COUNT needs no canonicalization either: every ISA masks it to the low
+# log2(register-width) bits, which a narrow count already holds exactly.
+#
+# The extension is chosen by the OPCODE, which is where the IR carries signedness -
+# OP_SHR_U zero-extends and OP_SHR_S sign-extends, each matching the fill its own
+# shift performs - so no signedness needs to enter the IR type.
+# ---
+# ctx:       the per-function lowering context
+# mb:        the destination MIR block
+# inst:      the IR shift instruction
+# value:     the lowered value operand (IR operand 0)
+# natural_w: the shift's declared type width in bytes
+# w:         the clamped operation width the shift executes at
+# ret:       the operand the shift should read, or a lowering / allocation error
+fun narrow_shift_value(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
+                       value: mir.MirOperand, natural_w: u8, w: u8) R.Result[mir.MirOperand, str] {
+    if (inst.kind == instr.OP_SHL) { ret R.ok[mir.MirOperand, str](value); }
+    if (natural_w >= w)            { ret R.ok[mir.MirOperand, str](value); }
+
+    val vr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
+    if (R.is_err[u32, str](vr)) { ret R.err[mir.MirOperand, str](R.unwrap_err[u32, str](vr)); }
+    val v: u32 = R.unwrap_ok[u32, str](vr);
+
+    val pr: R.Result[bool, str] = emit_promote(ctx, mb, mir.op_vreg(v), value, w, natural_w,
+                                               inst.kind == instr.OP_SHR_S);
+    if (R.is_err[bool, str](pr)) { ret R.err[mir.MirOperand, str](R.unwrap_err[bool, str](pr)); }
+    ret R.ok[mir.MirOperand, str](mir.op_vreg(v));
 }
 
 # lower an integer OP_SHL / OP_SHR_S / OP_SHR_U into a three-address generic shift
@@ -1429,14 +1494,22 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     # a sub-word shift result, like any narrow GP ALU write, leaves the upper
     # register bits undefined; clamp the operation width so the spilled word stays
     # clean (mirrors `set_generic_widths` and the byte-divide promotion).
-    val w: u8 = lctx.clamp_alu_width(ctx.tgt.model.gpr_width, lctx.op_width_of(ctx, inst.ty));
+    val natural_w: u8 = lctx.op_width_of(ctx, inst.ty);
+    val w: u8 = lctx.clamp_alu_width(ctx.tgt.model.gpr_width, natural_w);
 
     var op: mir.MirOpcode = mir.MIR_SHR_U;
     if (inst.kind == instr.OP_SHL)   { op = mir.MIR_SHL; }
     or (inst.kind == instr.OP_SHR_S) { op = mir.MIR_SHR_S; }
 
-    val value: mir.MirOperand = lctx.lower_value(ctx, inst.operands[0]);
+    val raw: mir.MirOperand = lctx.lower_value(ctx, inst.operands[0]);
     val count: mir.MirOperand = lctx.lower_value(ctx, inst.operands[1]);
+
+    # a RIGHT shift reads bits above the declared width, so its value operand is
+    # canonicalized to that width first; a left shift and a full-width shift pass
+    # through untouched.
+    val rv: R.Result[mir.MirOperand, str] = narrow_shift_value(ctx, mb, inst, raw, natural_w, w);
+    if (R.is_err[mir.MirOperand, str](rv)) { ret R.err[bool, str](R.unwrap_err[mir.MirOperand, str](rv)); }
+    val value: mir.MirOperand = R.unwrap_ok[mir.MirOperand, str](rv);
 
     var count_op: mir.MirOperand = count;
     if (count.kind != mir.MIR_OP_IMM) {
@@ -1448,7 +1521,7 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
         # LSLV/LSRV/ASRV, which read the count from any GP register) passes the count
         # straight through to the three-address register-shift form - mirroring the
         # division's `div_reg < 0` three-address path.
-        val cnt_reg: i32 = ctx.tgt.arch.shift_count_reg;
+        val cnt_reg: i32 = ctx.tgt.model.shift_count_reg;
         if (cnt_reg >= 0) {
             val mc: R.Result[bool, str] = lctx.emit_mov_w(ctx, mb, mir.op_preg(cnt_reg::u32), count, w);
             if (R.is_err[bool, str](mc)) { ret mc; }
@@ -1464,12 +1537,7 @@ fun lower_shift(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     ops[0] = mir.op_vreg(dst);
     ops[1] = value;
     ops[2] = count_op;
-    var mi: mir.MirInstr;
-    mi.opcode        = op;
-    mi.operands      = ops;
-    mi.operand_count = 3;
-    mi.width         = w;
-    mi.src_width     = w;
+    var mi: mir.MirInstr = mir.instr(op, ops, 3, w, w);
     ret lctx.push_instr(ctx, mb, mi);
 }
 
@@ -1524,8 +1592,8 @@ fun lower_div(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
     # division register (`div_reg < 0` / `div_hi_reg < 0`, e.g. AArch64 SDIV/UDIV)
     # lowers to the generic three-address divide the per-ISA encoder realizes, rather
     # than this pre-coloring path.
-    val acc_reg: i32 = ctx.tgt.arch.div_reg;
-    val hi_reg:  i32 = ctx.tgt.arch.div_hi_reg;
+    val acc_reg: i32 = ctx.tgt.model.div_reg;
+    val hi_reg:  i32 = ctx.tgt.model.div_hi_reg;
     if (acc_reg < 0 || hi_reg < 0) {
         ret lower_div_three_address(ctx, mb, inst, iid, dst);
     }
@@ -1571,12 +1639,7 @@ fun lower_div(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](rop);
     ops[0] = mir.op_preg(acc_reg::u32);
     ops[1] = div_op;
-    var mi: mir.MirInstr;
-    mi.opcode        = inst.kind::u32;
-    mi.operands      = ops;
-    mi.operand_count = 2;
-    mi.width         = w;
-    mi.src_width     = w;
+    var mi: mir.MirInstr = mir.instr(inst.kind::u32, ops, 2, w, w);
     val pd: R.Result[bool, str] = lctx.push_instr(ctx, mb, mi);
     if (R.is_err[bool, str](pd)) { ret pd; }
 
@@ -1658,23 +1721,44 @@ fun lower_div_three_address(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr
     ops[0] = mir.op_vreg(dst);
     ops[1] = n_op;
     ops[2] = m_op;
-    var mi: mir.MirInstr;
-    mi.opcode        = inst.kind::u32;
-    mi.operands      = ops;
-    mi.operand_count = 3;
-    mi.width         = w;
-    mi.src_width     = w;
+    var mi: mir.MirInstr = mir.instr(inst.kind::u32, ops, 3, w, w);
     ret lctx.push_instr(ctx, mb, mi);
+}
+
+# the VALUE a width-masked narrow immediate denotes at `width`
+#
+# An integer constant of a sub-word type reaches the backend carrying its RAW
+# `width`-byte bit pattern, not its value: i8 `-56` arrives as 200. Widening it
+# with a plain move would therefore promote the bits rather than the number, so a
+# consumer computing above the narrow width (a promoted divide, a right shift) must
+# re-derive what the constant means first - sign-extending the top bit for a signed
+# interpretation, masking to the width for an unsigned one. Wider widths, and the
+# documented width-0 machine-word sentinel, already denote their raw value.
+# ---
+# imm:    the operand's raw immediate bits
+# width:  the width in bytes the constant is masked to
+# signed: true to re-sign the low `width` bytes, false to mask to them
+# ret:    the value the constant denotes at `width`
+fun narrow_imm_value(imm: i64, width: u8, signed: bool) i64 {
+    if (width == 0 || width >= 8) { ret imm; }
+    val bits: u32 = width::u32 * 8;
+    val m: u64 = (1::u64 << bits) - 1;
+    val v: u64 = imm::u64 & m;
+    if (!signed) { ret v::i64; }
+    val sign: u64 = 1::u64 << (bits - 1);
+    if ((v & sign) == 0) { ret v::i64; }
+    ret (v | ~m)::i64;
 }
 
 # move `src` into `dst` at `dst_w` bytes, widening from `src_w` when narrower
 #
-# An immediate source carries its full value, so it is a plain width-`dst_w` move
-# (a MOVSX/MOVZX of an immediate has no encoding). A register / memory source
-# narrower than the destination is sign-extended (`signed`, MOVSX) or
-# zero-extended (MOVZX); at equal width it is a plain move. Used to load a
-# division's dividend into RAX and to widen a promoted byte divisor into a value
-# vreg.
+# A register / memory source narrower than the destination is sign-extended
+# (`signed`, MOVSX) or zero-extended (MOVZX); at equal width it is a plain move. An
+# immediate has no MOVSX/MOVZX encoding, so it widens by re-deriving the value its
+# width-masked bits denote (`narrow_imm_value`) and moving that at `dst_w` - moving
+# the raw bits instead would compute on 200 where the source said i8 `-56`. Used to
+# load a division's dividend into RAX, to widen a promoted byte divisor into a value
+# vreg, and to canonicalize a narrow right shift's value operand.
 # ---
 # ctx:    the per-function lowering context
 # mb:     the destination MIR block
@@ -1686,21 +1770,19 @@ fun lower_div_three_address(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr
 # ret:    true on success, or a lowering / allocation error
 fun emit_promote(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, dst: mir.MirOperand, src: mir.MirOperand,
                  dst_w: u8, src_w: u8, signed: bool) R.Result[bool, str] {
-    if (src_w >= dst_w || src.kind == mir.MIR_OP_IMM) {
+    if (src_w >= dst_w) {
         ret lctx.emit_mov_w(ctx, mb, dst, src, dst_w);
+    }
+    if (src.kind == mir.MIR_OP_IMM) {
+        ret lctx.emit_mov_w(ctx, mb, dst, mir.op_imm(narrow_imm_value(src.imm, src_w, signed)), dst_w);
     }
     val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
     if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = dst;
     ops[1] = src;
-    var mi: mir.MirInstr;
-    mi.opcode        = mir.MIR_ZEXT;
+    var mi: mir.MirInstr = mir.instr(mir.MIR_ZEXT, ops, 2, dst_w, src_w);
     if (signed) { mi.opcode = mir.MIR_SEXT; }
-    mi.operands      = ops;
-    mi.operand_count = 2;
-    mi.width         = dst_w;
-    mi.src_width     = src_w;
     ret lctx.push_instr(ctx, mb, mi);
 }
 
@@ -1758,10 +1840,7 @@ fun lower_generic(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructi
         k = k + 1;
     }
 
-    var mi: mir.MirInstr;
-    mi.opcode        = inst.kind::u32;
-    mi.operands      = ops;
-    mi.operand_count = total;
+    var mi: mir.MirInstr = mir.instr(inst.kind::u32, ops, total, 0, 0);
     set_generic_widths(ctx, inst, ?mi);
     ret lctx.push_instr(ctx, mb, mi);
 }
@@ -1980,26 +2059,23 @@ fun lower_float_op(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruct
 
     val w: u8 = float_op_width(ctx, inst);
 
-    var mi: mir.MirInstr;
-    mi.operands      = ops;
-    mi.operand_count = 3;
-    mi.width         = w;
-    mi.src_width     = w;
-
+    # a float compare rides its condition code in src_width; every other float op
+    # keeps the operand width.
     val k: instr.InstrKind = inst.kind;
+    var op: mir.MirOpcode = mir.MIR_FDIV;
+    var sw: u8 = w;
     if (is_compare_kind(k)) {
-        mi.opcode    = mir.MIR_FCMP;
-        mi.src_width = float_cmp_cc(k);
+        op = mir.MIR_FCMP;
+        sw = float_cmp_cc(k);
     } or (k == instr.OP_ADD) {
-        mi.opcode = mir.MIR_FADD;
+        op = mir.MIR_FADD;
     } or (k == instr.OP_SUB) {
-        mi.opcode = mir.MIR_FSUB;
+        op = mir.MIR_FSUB;
     } or (k == instr.OP_MUL) {
-        mi.opcode = mir.MIR_FMUL;
-    } or {
-        mi.opcode = mir.MIR_FDIV;
+        op = mir.MIR_FMUL;
     }
 
+    var mi: mir.MirInstr = mir.instr(op, ops, 3, w, sw);
     ret lctx.push_instr(ctx, mb, mi);
 }
 
@@ -2034,12 +2110,7 @@ fun lower_float_neg(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruc
 
     val w: u8 = lctx.op_width_of(ctx, inst.ty);
 
-    var mi: mir.MirInstr;
-    mi.opcode        = mir.MIR_FNEG;
-    mi.operands      = ops;
-    mi.operand_count = 2;
-    mi.width         = w;
-    mi.src_width     = w;
+    var mi: mir.MirInstr = mir.instr(mir.MIR_FNEG, ops, 2, w, w);
     ret lctx.push_instr(ctx, mb, mi);
 }
 
@@ -2121,13 +2192,76 @@ fun lower_alloca(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructio
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = mir.op_vreg(dst);
     ops[1] = mir.op_mem_slot(sk, 0);
-    var mi: mir.MirInstr;
-    mi.opcode        = mir.MIR_ALLOCA;
-    mi.operands      = ops;
-    mi.operand_count = 2;
     # the alloca selects to a LEA computing a pointer-sized address.
-    mi.width         = ctx.tgt.model.gpr_width::u8;
-    mi.src_width     = ctx.tgt.model.gpr_width::u8;
+    var mi: mir.MirInstr = mir.instr(mir.MIR_ALLOCA, ops, 2,
+                                     ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
+    ret lctx.push_instr(ctx, mb, mi);
+}
+
+# lower an OP_VEC_EXTRACT into `mir.MIR_VEC_EXTRACT (dst) <- (vector), #lane`
+#
+# `width` is the LANE element's byte width (the destination scalar's), while
+# `vec_lane` - stamped at the shared `push_instr` chokepoint from the operand's
+# vector type - carries the source arrangement. The encoder needs both: the element
+# size selects the machine form and the immediate selects the position. The
+# destination's register bank follows its IR type, so an integer lane lands in the
+# general bank and a float lane in the float/vector bank without a special case.
+# ---
+# ctx:  the per-function lowering context
+# mb:   the destination MIR block
+# inst: the IR OP_VEC_EXTRACT instruction
+# iid:  the IR instruction id
+# ret:  true on success, or a lowering / allocation error
+fun lower_vec_extract(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
+    val dst: u32 = lctx.instr_vreg(ctx, iid);
+    if (dst == mir.MIR_VREG_NIL) {
+        ret R.err[bool, str]("mir.lower_ir: vector lane read defines no result vreg");
+    }
+    if (inst.operands[1].kind != value.VAL_CONST_INT) {
+        ret R.err[bool, str]("mir.lower_ir: vector lane index is not a constant");
+    }
+
+    val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 3::usize);
+    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+    val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
+    ops[0] = mir.op_vreg(dst);
+    ops[1] = lctx.lower_value(ctx, inst.operands[0]);
+    ops[2] = mir.op_imm(inst.operands[1].data.int_lit::i64);
+
+    var mi: mir.MirInstr = mir.instr(mir.MIR_VEC_EXTRACT, ops, 3, lctx.op_width_of(ctx, inst.ty), lctx.op_width_of(ctx, inst.operands[0].ty));
+    ret lctx.push_instr(ctx, mb, mi);
+}
+
+# lower an OP_VEC_INSERT into `mir.MIR_VEC_INSERT (dst) <- (vector), #lane, (value)`
+#
+# The IR opcode is functional - a new vector rather than a mutation - so the source
+# vector stays a pure use here and isel ties the destination to it on a target whose
+# machine form writes in place. `width` is the vector's and `src_width` the written
+# lane element's, the pair the encoder reads to size the insert.
+# ---
+# ctx:  the per-function lowering context
+# mb:   the destination MIR block
+# inst: the IR OP_VEC_INSERT instruction
+# iid:  the IR instruction id
+# ret:  true on success, or a lowering / allocation error
+fun lower_vec_insert(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, iid: id.InstructionId) R.Result[bool, str] {
+    val dst: u32 = lctx.instr_vreg(ctx, iid);
+    if (dst == mir.MIR_VREG_NIL) {
+        ret R.err[bool, str]("mir.lower_ir: vector lane write defines no result vreg");
+    }
+    if (inst.operands[1].kind != value.VAL_CONST_INT) {
+        ret R.err[bool, str]("mir.lower_ir: vector lane index is not a constant");
+    }
+
+    val r: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 4::usize);
+    if (R.is_err[*mir.MirOperand, str](r)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](r)); }
+    val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
+    ops[0] = mir.op_vreg(dst);
+    ops[1] = lctx.lower_value(ctx, inst.operands[0]);
+    ops[2] = mir.op_imm(inst.operands[1].data.int_lit::i64);
+    ops[3] = lctx.lower_value(ctx, inst.operands[2]);
+
+    var mi: mir.MirInstr = mir.instr(mir.MIR_VEC_INSERT, ops, 4, lctx.op_width_of(ctx, inst.ty), lctx.op_width_of(ctx, inst.operands[2].ty));
     ret lctx.push_instr(ctx, mb, mi);
 }
 
@@ -2172,10 +2306,6 @@ fun lower_load(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = mir.op_vreg(dst);
     ops[1] = mem;
-    var mi: mir.MirInstr;
-    mi.opcode        = mir.MIR_LOAD;
-    mi.operands      = ops;
-    mi.operand_count = 2;
     # the load accesses memory at the loaded result type's width (`src_width`) but
     # must DEFINE the full register it lands in (`width`): a sub-word load of a
     # scalar leaves the upper register bits undefined, and a downstream wider use
@@ -2184,8 +2314,9 @@ fun lower_load(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
     # `mir.ALU_MIN_WIDTH` - the same full-register-definition invariant `lctx.clamp_alu_width`
     # gives a sub-word ALU result - makes the backend zero-extend the load into a
     # clean register (a wider load keeps its own width, so width == src_width there).
-    mi.src_width     = lctx.op_width_of(ctx, inst.ty);
-    mi.width         = lctx.clamp_alu_width(ctx.tgt.model.gpr_width, mi.src_width);
+    val acc_w: u8 = lctx.op_width_of(ctx, inst.ty);
+    var mi: mir.MirInstr = mir.instr(mir.MIR_LOAD, ops, 2,
+                                     lctx.clamp_alu_width(ctx.tgt.model.gpr_width, acc_w), acc_w);
     ret lctx.push_instr(ctx, mb, mi);
 }
 
@@ -2240,14 +2371,10 @@ fun lower_store(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = dest;
     ops[1] = stored;
-    var mi: mir.MirInstr;
-    mi.opcode        = mir.MIR_STORE;
-    mi.operands      = ops;
-    mi.operand_count = 2;
     # the store accesses memory at the stored value's type width (IR operand 0);
     # the store result is void, so the value type is the only width carrier.
-    mi.width         = lctx.op_width_of(ctx, inst.operands[0].ty);
-    mi.src_width     = mi.width;
+    val st_w: u8 = lctx.op_width_of(ctx, inst.operands[0].ty);
+    var mi: mir.MirInstr = mir.instr(mir.MIR_STORE, ops, 2, st_w, st_w);
     ret lctx.push_instr(ctx, mb, mi);
 }
 
@@ -2291,12 +2418,7 @@ fun lower_store_aggregate(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.I
         val ldops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ldr);
         ldops[0] = mir.op_vreg(tmp);
         ldops[1] = src;
-        var ld: mir.MirInstr;
-        ld.opcode        = mir.MIR_LOAD;
-        ld.operands      = ldops;
-        ld.operand_count = 2;
-        ld.width         = chunk;
-        ld.src_width     = chunk;
+        var ld: mir.MirInstr = mir.instr(mir.MIR_LOAD, ldops, 2, chunk, chunk);
         val pl: R.Result[bool, str] = lctx.push_instr(ctx, mb, ld);
         if (R.is_err[bool, str](pl)) { ret pl; }
 
@@ -2488,13 +2610,9 @@ fun lower_gep(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction, 
     val ops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](r);
     ops[0] = mir.op_vreg(dst);
     ops[1] = R.unwrap_ok[mir.MirOperand, str](mem);
-    var mi: mir.MirInstr;
-    mi.opcode        = mir.MIR_GEP;
-    mi.operands      = ops;
-    mi.operand_count = 2;
     # the GEP selects to a LEA computing a pointer-sized effective address.
-    mi.width         = ctx.tgt.model.gpr_width::u8;
-    mi.src_width     = ctx.tgt.model.gpr_width::u8;
+    var mi: mir.MirInstr = mir.instr(mir.MIR_GEP, ops, 2,
+                                     ctx.tgt.model.gpr_width::u8, ctx.tgt.model.gpr_width::u8);
     ret lctx.push_instr(ctx, mb, mi);
 }
 

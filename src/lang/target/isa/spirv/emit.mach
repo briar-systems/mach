@@ -19,17 +19,24 @@
 # (OpSDiv vs OpUDiv), never the type. The function signature and linkage come from
 # the IR function.
 #
-# Milestone scope: straight-line scalar functions (integer arithmetic including
-# signed / unsigned division and remainder, bitwise, shifts, comparisons, moves,
-# calls, returns). Control flow (branches), floating point, aggregates, memory
-# addressing, inline asm, and vectors are out of this milestone and raise a loud,
-# precise diagnostic rather than emitting an invalid module.
+# Control flow is reconstructed rather than laid out: SPIR-V requires structured
+# regions, so `cfg.analyze` derives the merge blocks, continue targets, and block
+# order from the MIR CFG, and this module emits that structure. A shape the
+# reconstruction cannot express is refused by name.
+#
+# Milestone scope: scalar functions over the reconstructed control flow (integer
+# arithmetic including signed / unsigned division and remainder, bitwise, shifts,
+# comparisons, moves, branches, direct calls, returns). Floating point,
+# aggregates, memory addressing, inline asm, and vectors are out of this milestone
+# and raise a loud, precise diagnostic rather than emitting an invalid module.
 
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_join;
+use std.types.string.str_len;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -41,6 +48,7 @@ use mach.lang.me.ir;
 use mach.lang.me.ir.type;
 use mach.lang.be.codegen.mir;
 use mach.lang.target.isa.spirv;
+use mach.lang.target.isa.spirv.cfg;
 use mach.lang.target.isa.spirv.types;
 
 # the per-module emission state threaded through the walk
@@ -55,6 +63,9 @@ use mach.lang.target.isa.spirv.types;
 # ir:       the IR module (function signatures + linkage)
 # b:        the SPIR-V module builder
 # tt:       the type / constant dedup table over `b`
+# fn_ids:   SPIR-V id per IR function index, allocated before any body is emitted
+#           so a call can name a callee defined later in the module (0 for a
+#           function with no body)
 rec Emit {
     alloc:    *A.Allocator;
     interner: *intern.Interner;
@@ -62,6 +73,7 @@ rec Emit {
     ir:       *ir.Module;
     b:        *spirv.Builder;
     tt:       *types.TypeTable;
+    fn_ids:   *u32;
 }
 
 # the per-function value maps, sized to the function's vreg count
@@ -81,6 +93,24 @@ rec VMaps {
     n:       u32;
 }
 
+# the identity convention's nominal register file during one block's emission
+#
+# A value moved into "register" k is the k-th argument of the call that follows or
+# the function's result, and both are typed by the callee's declaration, not by the
+# move. An immediate therefore rides here unmaterialized: `is_imm` marks the slot as
+# carrying `imm` rather than an id, and the constant is minted at the use site with
+# the width the declaration asks for. A parameter's slot holds its
+# OpFunctionParameter id from the start.
+# ---
+# val_id: the SSA id held in each register index (0 when empty or pending)
+# imm:    the pending immediate value per register index
+# is_imm: whether the slot holds a pending immediate rather than an id
+rec Regs {
+    val_id: [16]u32;
+    imm:    [16]i64;
+    is_imm: [16]bool;
+}
+
 # emit a complete SPIR-V module for one lowered MIR module
 #
 # Builds the module preamble (Shader + Linkage capabilities, the logical GLSL450
@@ -89,7 +119,7 @@ rec VMaps {
 # allocated from the session allocator and handed back through the out-params; the
 # `codegen_module` fork wraps them into an object image.
 #
-# This is the concrete `EmitModuleFn` the SPIR-V `IsaVTable.emit_module` erased
+# This is the concrete `EmitModuleFn` the SPIR-V `ModuleEmitter.emit_module` erased
 # pointer is cast back to. The allocator and interner ride the MIR module.
 # ---
 # tgt:      the resolved target
@@ -109,7 +139,27 @@ pub fun emit_module(tgt: *resolved.Target, irmod: *ir.Module,
 
     var e: Emit;
     e.alloc = mirmod.alloc; e.interner = mirmod.interner;
-    e.tgt = tgt; e.ir = irmod; e.b = ?b; e.tt = ?tt;
+    e.tgt = tgt; e.ir = irmod; e.b = ?b; e.tt = ?tt; e.fn_ids = nil;
+
+    # every defined function gets its id before any body is emitted, so a call can
+    # name a callee that appears later in the module (or itself).
+    if (irmod.function_len > 0) {
+        val rf: R.Result[*u32, str] = A.allocate[u32](mirmod.alloc, irmod.function_len::usize);
+        if (R.is_err[*u32, str](rf)) {
+            types.types_dnit(?tt);
+            spirv.builder_dnit(?b);
+            ret R.err[bool, str](R.unwrap_err[*u32, str](rf));
+        }
+        e.fn_ids = R.unwrap_ok[*u32, str](rf);
+        var ii: u32 = 0;
+        for (ii < irmod.function_len) {
+            e.fn_ids[ii] = 0;
+            if ((irmod.functions[ii].flags & ir.FN_FLAG_EXTERN) == 0) {
+                e.fn_ids[ii] = spirv.alloc_id(?b);
+            }
+            ii = ii + 1;
+        }
+    }
 
     var fi: u32 = 0;
     for (fi < mirmod.function_len) {
@@ -119,12 +169,14 @@ pub fun emit_module(tgt: *resolved.Target, irmod: *ir.Module,
         if (mf.block_count == 0) { fi = fi + 1; cnt; }
         val fr: R.Result[bool, str] = emit_function(?e, mf);
         if (R.is_err[bool, str](fr)) {
+            emit_dnit(?e, irmod.function_len);
             types.types_dnit(?tt);
             spirv.builder_dnit(?b);
             ret fr;
         }
         fi = fi + 1;
     }
+    emit_dnit(?e, irmod.function_len);
 
     # the preamble is emitted last so it can declare exactly the width capabilities
     # the functions' types accumulated; it still serializes first (fixed section order).
@@ -138,6 +190,15 @@ pub fun emit_module(tgt: *resolved.Target, irmod: *ir.Module,
     @out_bytes = R.unwrap_ok[*u8, str](rs);
     @out_len   = len;
     ret R.ok[bool, str](true);
+}
+
+# release the per-module function-id table
+# ---
+# e: the emission state
+# n: the IR module's function count (the table's length)
+fun emit_dnit(e: *Emit, n: u32) {
+    if (e.fn_ids != nil && n > 0) { A.deallocate[u32](e.alloc, e.fn_ids, n::usize); }
+    e.fn_ids = nil;
 }
 
 # emit the module preamble: capabilities and the memory model
@@ -175,22 +236,19 @@ fun emit_cap(e: *Emit, cap: u32) {
 # emit one exported OpFunction for a defined MIR function
 #
 # Rebuilds the signature from the IR function, declares the parameters, emits an
-# OpVariable per body vreg at the entry, then translates the single body block's
-# instructions. The function is decorated Export under its own name.
+# OpVariable per body vreg at the entry, reconstructs the structured control flow,
+# then translates each block in the reconstruction's order. The function is
+# decorated Export under its own name.
 # ---
 # e:  the emission state
 # mf: the MIR function to emit
 # ret: true on success, or a precise error string
 fun emit_function(e: *Emit, mf: *mir.MirFunction) R.Result[bool, str] {
-    val irfn: *ir.Function = ir_function_by_name(e.ir, mf.name);
-    if (irfn == nil) {
+    val fix: u32 = ir_function_index(e.ir, mf.name);
+    if (fix == IR_FN_NONE) {
         ret R.err[bool, str]("spirv.emit: no IR function matches a lowered MIR function");
     }
-
-    # milestone scope: one body block (no control-flow reconstruction yet).
-    if (mf.block_count != 1) {
-        ret unsupported(e, "control flow (branches) is not yet supported by the SPIR-V target");
-    }
+    val irfn: *ir.Function = ?e.ir.functions[fix];
 
     # signature: return type + parameter types from the IR function.
     var returns_void: bool = false;
@@ -208,12 +266,23 @@ fun emit_function(e: *Emit, mf: *mir.MirFunction) R.Result[bool, str] {
     }
     val fnty: u32 = types.type_fn(e.tt, ret_ty, ?ptypes[0], irfn.param_count);
 
-    val fn_id: u32 = spirv.alloc_id(e.b);
+    val fn_id: u32 = e.fn_ids[fix];
 
     # export decoration: OpDecorate <fn> LinkageAttributes "<name>" Export.
     val name_opt: O.Option[str] = intern.lookup(e.interner, mf.name);
     if (O.is_none[str](name_opt)) { ret R.err[bool, str]("spirv.emit: function name not interned"); }
-    emit_linkage_export(e, fn_id, O.unwrap[str](name_opt));
+    val fn_name: str = O.unwrap[str](name_opt);
+    emit_linkage_export(e, fn_id, fn_name);
+
+    # the structured shape of the body, or a refusal naming the construct.
+    val cr: R.Result[cfg.Structure, str] = cfg.analyze(mf, e.alloc);
+    if (R.is_err[cfg.Structure, str](cr)) { ret R.err[bool, str](R.unwrap_err[cfg.Structure, str](cr)); }
+    var st: cfg.Structure = R.unwrap_ok[cfg.Structure, str](cr);
+    if (st.status != cfg.CFG_OK) {
+        val msg: str = cfg_refusal(e, fn_name, ?st);
+        cfg.dnit(?st);
+        ret R.err[bool, str](msg);
+    }
 
     # OpFunction <ret_ty> <fn_id> None <fnty>.
     var fop: [4]u32;
@@ -232,24 +301,259 @@ fun emit_function(e: *Emit, mf: *mir.MirFunction) R.Result[bool, str] {
         pi = pi + 1;
     }
 
-    # entry label.
-    val entry_label: u32 = spirv.alloc_id(e.b);
+    # one label id per node, allocated before any block is emitted so a branch can
+    # name a block the walk has not reached.
+    val rl: R.Result[*u32, str] = A.allocate[u32](e.alloc, st.count::usize);
+    if (R.is_err[*u32, str](rl)) {
+        cfg.dnit(?st);
+        ret R.err[bool, str](R.unwrap_err[*u32, str](rl));
+    }
+    val labels: *u32 = R.unwrap_ok[*u32, str](rl);
+    var li: u32 = 0;
+    for (li < st.count) { labels[li] = spirv.alloc_id(e.b); li = li + 1; }
+
+    # the entry label opens the body; every Function-storage variable lives here.
     var lb: [1]u32;
-    lb[0] = entry_label;
+    lb[0] = labels[st.order[0]];
     spirv.inst(e.b, ?e.b.functions, spirv.OP_LABEL, ?lb[0], 1);
 
-    # build the per-vreg type / variable maps and emit the OpVariables at the entry.
     var vm: VMaps;
     val mr: R.Result[bool, str] = build_vmaps(e, mf, irfn, ?vm);
-    if (R.is_err[bool, str](mr)) { ret mr; }
+    if (R.is_err[bool, str](mr)) {
+        A.deallocate[u32](e.alloc, labels, st.count::usize);
+        cfg.dnit(?st);
+        ret mr;
+    }
 
-    val body: R.Result[bool, str] = emit_block(e, mf, ?mf.blocks[0], ?vm, ?param_ids[0], irfn.param_count, returns_void, ret_bits);
+    var body: R.Result[bool, str] = R.ok[bool, str](true);
+    var oi: u32 = 0;
+    for (oi < st.count) {
+        body = emit_node(e, mf, ?st, st.order[oi], oi == 0, labels, ?vm,
+                         ?param_ids[0], irfn.param_count, returns_void, ret_bits);
+        if (R.is_err[bool, str](body)) { oi = st.count; cnt; }
+        oi = oi + 1;
+    }
+
     vmaps_dnit(e, ?vm);
+    A.deallocate[u32](e.alloc, labels, st.count::usize);
+    cfg.dnit(?st);
     if (R.is_err[bool, str](body)) { ret body; }
 
     spirv.inst(e.b, ?e.b.functions, spirv.OP_FUNCTION_END, nil, 0);
     if (e.b.err) { ret R.err[bool, str]("spirv.emit: module builder hit an allocation error"); }
     ret R.ok[bool, str](true);
+}
+
+# the diagnostic for a CFG the reconstruction cannot express, naming the function
+# and the block the shape was found at
+#
+# The message is interned so the caller need not own it; interning failure falls
+# back to the bare reason, which still names the construct.
+# ---
+# e:    the emission state
+# name: the function's exported name
+# st:   the failed reconstruction
+# ret:  the diagnostic text
+fun cfg_refusal(e: *Emit, name: str, st: *cfg.Structure) str {
+    val reason: str = cfg.status_message(st.status);
+    val jr: R.Result[str, str] = str_join(e.alloc, "spirv.emit: ", name, ": ", reason);
+    if (R.is_err[str, str](jr)) { ret reason; }
+    val buf: str = R.unwrap_ok[str, str](jr);
+    val ir: R.Result[intern.StrId, str] = intern.intern(e.interner, buf);
+    A.deallocate[u8](e.alloc, buf::*u8, str_len(buf) + 1);
+    if (R.is_err[intern.StrId, str](ir)) { ret reason; }
+    val io: O.Option[str] = intern.lookup(e.interner, R.unwrap_ok[intern.StrId, str](ir));
+    if (O.is_none[str](io)) { ret reason; }
+    ret O.unwrap[str](io);
+}
+
+# emit one node of the reconstruction: its label, its body, its merge declaration,
+# and its terminator
+#
+# A real block contributes its MIR instructions; the synthesized nodes carry no MIR
+# and exist only to give the structure the shape SPIR-V requires - a loop's single
+# back edge, a construct's merge point, a header's displaced branch.
+# ---
+# e:            the emission state
+# mf:           the MIR function
+# st:           the reconstructed structure
+# ix:           the node to emit
+# is_entry:     whether this is the function's first block (its label is already out)
+# labels:       the per-node label ids
+# vm:           the per-vreg value maps
+# param_ids:    the OpFunctionParameter ids, in order
+# param_count:  number of parameters
+# returns_void: whether the function returns void
+# ret_bits:     the integer return width in bits (0 for float / void)
+# ret:          true on success, or a precise error string
+fun emit_node(e: *Emit, mf: *mir.MirFunction, st: *cfg.Structure, ix: u32, is_entry: bool,
+              labels: *u32, vm: *VMaps, param_ids: *u32, param_count: u32,
+              returns_void: bool, ret_bits: u32) R.Result[bool, str] {
+    if (!is_entry) {
+        var lb: [1]u32;
+        lb[0] = labels[ix];
+        spirv.inst(e.b, ?e.b.functions, spirv.OP_LABEL, ?lb[0], 1);
+    }
+
+    val role: u8 = st.nodes[ix].role;
+    if (role == cfg.ROLE_UNREACHABLE) {
+        spirv.inst(e.b, ?e.b.functions, spirv.OP_UNREACHABLE, nil, 0);
+        ret R.ok[bool, str](true);
+    }
+    if (role == cfg.ROLE_CONTINUE || role == cfg.ROLE_FORWARD) {
+        emit_branch(e, labels[st.nodes[ix].succ0]);
+        ret R.ok[bool, str](true);
+    }
+
+    # the register file is per block: the ABI pre-coloring a lowered call or return
+    # emits never spans one, and a physical register index is otherwise a parameter
+    # position, valid for the whole function.
+    var rg: Regs;
+    var i: u32 = 0;
+    for (i < 16) { rg.val_id[i] = 0; rg.imm[i] = 0; rg.is_imm[i] = false; i = i + 1; }
+    i = 0;
+    for (i < param_count && i < 16) { rg.val_id[i] = param_ids[i]; i = i + 1; }
+
+    val blk: *mir.MirBlock = ?mf.blocks[st.nodes[ix].block];
+    if (role == cfg.ROLE_REAL) {
+        var ii: u32 = 0;
+        for (ii + 1 < blk.instr_count) {
+            val r: R.Result[bool, str] = emit_instr(e, mf, vm, ?rg, ?blk.instrs[ii]);
+            if (R.is_err[bool, str](r)) { ret r; }
+            ii = ii + 1;
+        }
+    }
+
+    ret emit_terminator(e, mf, st, ix, labels, vm, ?rg, returns_void, ret_bits);
+}
+
+# declare where a construct's control reconverges, ahead of its branch
+# ---
+# e:      the emission state
+# st:     the reconstructed structure
+# ix:     the header node
+# labels: the per-node label ids
+fun emit_merge(e: *Emit, st: *cfg.Structure, ix: u32, labels: *u32) {
+    if (st.nodes[ix].kind == cfg.CK_LOOP) {
+        var lm: [3]u32;
+        lm[0] = labels[st.nodes[ix].merge];
+        lm[1] = labels[st.nodes[ix].cont];
+        lm[2] = spirv.LOOP_CONTROL_NONE;
+        spirv.inst(e.b, ?e.b.functions, spirv.OP_LOOP_MERGE, ?lm[0], 3);
+        ret;
+    }
+    if (st.nodes[ix].kind == cfg.CK_SELECTION) {
+        var sm: [2]u32;
+        sm[0] = labels[st.nodes[ix].merge];
+        sm[1] = spirv.SELECTION_CONTROL_NONE;
+        spirv.inst(e.b, ?e.b.functions, spirv.OP_SELECTION_MERGE, ?sm[0], 2);
+    }
+}
+
+# emit one OpBranch
+# ---
+# e:     the emission state
+# label: the target label id
+fun emit_branch(e: *Emit, label: u32) {
+    var o: [1]u32;
+    o[0] = label;
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_BRANCH, ?o[0], 1);
+}
+
+# emit a node's terminator from the reconstruction's successor edges
+#
+# The branch targets come from the structure, not the MIR terminator: a back edge
+# was rewritten to the loop's continue block, and a header whose branch was
+# displaced falls into its split block instead. Only the condition and the returned
+# value still come from the MIR.
+# ---
+# e:            the emission state
+# mf:           the MIR function
+# st:           the reconstructed structure
+# ix:           the node being terminated
+# labels:       the per-node label ids
+# vm:           the per-vreg value maps
+# preg_val:     the identity convention's nominal register file
+# returns_void: whether the function returns void
+# ret_bits:     the integer return width in bits
+# ret:          true on success, or a precise error string
+fun emit_terminator(e: *Emit, mf: *mir.MirFunction, st: *cfg.Structure, ix: u32, labels: *u32,
+                    vm: *VMaps, preg_val: *Regs, returns_void: bool, ret_bits: u32) R.Result[bool, str] {
+    # a header that kept no branch of its own falls into the block carrying it.
+    if (st.nodes[ix].split != cfg.NO_BLOCK) {
+        emit_merge(e, st, ix, labels);
+        emit_branch(e, labels[st.nodes[ix].split]);
+        ret R.ok[bool, str](true);
+    }
+
+    val blk: *mir.MirBlock = ?mf.blocks[st.nodes[ix].block];
+    val term: *mir.MirInstr = ?blk.instrs[blk.instr_count - 1];
+
+    if (term.opcode == mir.MIR_BR) {
+        emit_merge(e, st, ix, labels);
+        emit_branch(e, labels[st.nodes[ix].succ0]);
+        ret R.ok[bool, str](true);
+    }
+    if (term.opcode == mir.MIR_CBR) {
+        # the condition is materialized ahead of the merge declaration: SPIR-V wants
+        # the merge instruction immediately before the branch it describes.
+        val cond: u32 = read_condition(e, vm, preg_val, ?term.operands[0], term.width::u32);
+        if (cond == 0) { ret R.err[bool, str]("spirv.emit: unreadable branch condition"); }
+        emit_merge(e, st, ix, labels);
+        var bc: [3]u32;
+        bc[0] = cond;
+        bc[1] = labels[st.nodes[ix].succ0];
+        bc[2] = labels[st.nodes[ix].succ1];
+        spirv.inst(e.b, ?e.b.functions, spirv.OP_BRANCH_CONDITIONAL, ?bc[0], 3);
+        ret R.ok[bool, str](true);
+    }
+    if (term.opcode == mir.MIR_UNREACHABLE) {
+        spirv.inst(e.b, ?e.b.functions, spirv.OP_UNREACHABLE, nil, 0);
+        ret R.ok[bool, str](true);
+    }
+    if (term.opcode == mir.MIR_RET) {
+        if (returns_void) {
+            spirv.inst(e.b, ?e.b.functions, spirv.OP_RETURN, nil, 0);
+            ret R.ok[bool, str](true);
+        }
+        val rid: u32 = reg_value(e, preg_val, 0, ret_bits);
+        if (rid == 0) { ret R.err[bool, str]("spirv.emit: value return with no pre-colored result"); }
+        var rv: [1]u32;
+        rv[0] = rid;
+        spirv.inst(e.b, ?e.b.functions, spirv.OP_RETURN_VALUE, ?rv[0], 1);
+        ret R.ok[bool, str](true);
+    }
+    ret unsupported(e, "instruction is not yet supported by the SPIR-V target");
+}
+
+# produce a boolean SSA value for a conditional branch's condition
+#
+# A vreg defined by a comparison already holds a SPIR-V boolean; anything else is
+# an integer flag, which is compared against zero to become one.
+# ---
+# e:        the emission state
+# vm:       the per-vreg value maps
+# preg_val: the identity convention's nominal register file
+# op:       the condition operand
+# width:    the condition's byte width, for typing the zero it is compared against
+# ret:      the boolean SSA id, or 0 on failure
+fun read_condition(e: *Emit, vm: *VMaps, preg_val: *Regs, op: *mir.MirOperand, width: u32) u32 {
+    if (op.kind != mir.MIR_OP_VREG) { e.b.err = true; ret 0; }
+    val v: u32 = op.vreg;
+    if (v >= vm.n) { e.b.err = true; ret 0; }
+    val raw: u32 = read_operand(e, vm, preg_val, op, vm.bits[v]);
+    if (e.b.err || raw == 0) { ret 0; }
+    if (vm.is_bool[v]) { ret raw; }
+
+    var bits: u32 = vm.bits[v];
+    if (bits == 0) { bits = width * 8; }
+    if (bits == 0) { bits = e.tgt.model.gpr_width * 8; }
+    val zero: u32 = types.const_int(e.tt, bits, 0);
+    val result: u32 = spirv.alloc_id(e.b);
+    var ops: [4]u32;
+    ops[0] = types.type_bool(e.tt); ops[1] = result; ops[2] = raw; ops[3] = zero;
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_I_NOT_EQUAL, ?ops[0], 4);
+    ret result;
 }
 
 # emit the LinkageAttributes Export decoration for a function
@@ -314,31 +618,91 @@ fun build_vmaps(e: *Emit, mf: *mir.MirFunction, irfn: *ir.Function, out: *VMaps)
     var i: u32 = 0;
     for (i < n) { out.type_id[i] = 0; out.var_id[i] = 0; out.bits[i] = 0; out.is_bool[i] = false; i = i + 1; }
 
-    # seed parameter vregs from the IR signature. the entry block opens with the
-    # ABI param pre-coloring `MIR_MOV pv <- preg(k)` (identity convention: preg k =
-    # parameter k); type pv from IR parameter k rather than the word-padded move.
-    val entry: *mir.MirBlock = ?mf.blocks[0];
-    var ei: u32 = 0;
-    for (ei < entry.instr_count) {
-        val mi: *mir.MirInstr = ?entry.instrs[ei];
-        if (mi.opcode == mir.MIR_MOV && mi.operand_count == 2 &&
-            mi.operands[0].kind == mir.MIR_OP_VREG && mi.operands[1].kind == mir.MIR_OP_PREG) {
-            val k: u32 = mi.operands[1].preg;
-            val v: u32 = mi.operands[0].vreg;
-            if (k < irfn.param_count && v < n && out.type_id[v] == 0) {
-                val t: u32 = ir_scalar_spv_type(e, irfn.params[k].ty);
-                if (t != 0) {
+    # a vreg fed from a nominal register is typed by the DECLARATION behind that
+    # register, never by the move: the ABI pre-coloring is emitted at the machine
+    # word, so an i32 parameter or an i32 call result would over-widen. Register k
+    # means parameter k at the head of the function and the return value right after
+    # a call, so the two are told apart by the call that precedes the move.
+    var pb: u32 = 0;
+    for (pb < mf.block_count) {
+        val blk: *mir.MirBlock = ?mf.blocks[pb];
+        var ei: u32 = 0;
+        var callee: intern.StrId = intern.STR_NIL;
+        for (ei < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[ei];
+            if (mi.opcode == mir.MIR_CALL && mi.operand_count >= 1 && mi.operands[0].kind == mir.MIR_OP_SYM) {
+                callee = mi.operands[0].sym;
+            }
+            or (mi.opcode == mir.MIR_CALL_RES) { callee = intern.STR_NIL; }
+            or (mi.opcode == mir.MIR_MOV && mi.operand_count == 2 &&
+                mi.operands[0].kind == mir.MIR_OP_VREG && mi.operands[1].kind == mir.MIR_OP_PREG) {
+                val k: u32 = mi.operands[1].preg;
+                val v: u32 = mi.operands[0].vreg;
+                var t: u32 = 0;
+                var b: u32 = 0;
+                if (callee != intern.STR_NIL) {
+                    val cix: u32 = ir_function_index(e.ir, callee);
+                    if (cix != IR_FN_NONE) {
+                        var cvoid: bool = false;
+                        t = ir_return_spv_type(e, ?e.ir.functions[cix], ?cvoid, ?b);
+                        if (cvoid) { t = 0; }
+                    }
+                    callee = intern.STR_NIL;
+                }
+                or (k < irfn.param_count) {
+                    t = ir_scalar_spv_type(e, irfn.params[k].ty);
+                    b = ir_scalar_bits(e, irfn.params[k].ty);
+                }
+                if (t != 0 && v < n && out.type_id[v] == 0) {
                     out.type_id[v] = t;
-                    out.bits[v]    = ir_scalar_bits(e, irfn.params[k].ty);
+                    out.bits[v]    = b;
                     out.is_bool[v] = false;
                 }
             }
+            ei = ei + 1;
         }
-        ei = ei + 1;
+        pb = pb + 1;
     }
 
-    # scan every instruction; a vreg written at operand 0 is defined there. record
-    # its width (bytes) and whether the defining op is a comparison (boolean result).
+    # a vreg's type comes from the operation that computes it. A register copy is
+    # not one - it moves a value already typed elsewhere - so copies are left for the
+    # propagation below and only revisited if nothing typed them.
+    val r1: R.Result[bool, str] = type_computed_defs(e, mf, out, true);
+    if (R.is_err[bool, str](r1)) { ret r1; }
+    propagate_copy_types(mf, out);
+    val r2: R.Result[bool, str] = type_computed_defs(e, mf, out, false);
+    if (R.is_err[bool, str](r2)) { ret r2; }
+
+    # emit one OpVariable(Function) per defined vreg, at the entry, and record its id.
+    i = 0;
+    for (i < n) {
+        if (out.type_id[i] != 0) {
+            val ptr_ty: u32 = types.type_ptr(e.tt, spirv.STORAGE_FUNCTION, out.type_id[i]);
+            val var_id: u32 = spirv.alloc_id(e.b);
+            var vop: [3]u32;
+            vop[0] = ptr_ty; vop[1] = var_id; vop[2] = spirv.STORAGE_FUNCTION;
+            spirv.inst(e.b, ?e.b.functions, spirv.OP_VARIABLE, ?vop[0], 3);
+            out.var_id[i] = var_id;
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# type every vreg a computing instruction defines, from its result width and class
+#
+# A comparison yields a boolean; anything else yields the integer or float type of
+# the defining instruction's result width. When `skip_copies` is set, a register-to-
+# register move is passed over: its width is the machine word the ABI and phi
+# lowering copy at, not the value's, so its destination is typed by propagation
+# instead.
+# ---
+# e:           the emission state
+# mf:          the MIR function
+# out:         the maps being filled
+# skip_copies: leave register-to-register moves untyped
+# ret:         true on success, or a precise error string
+fun type_computed_defs(e: *Emit, mf: *mir.MirFunction, out: *VMaps, skip_copies: bool) R.Result[bool, str] {
     var bi: u32 = 0;
     for (bi < mf.block_count) {
         val blk: *mir.MirBlock = ?mf.blocks[bi];
@@ -347,7 +711,7 @@ fun build_vmaps(e: *Emit, mf: *mir.MirFunction, irfn: *ir.Function, out: *VMaps)
             val mi: *mir.MirInstr = ?blk.instrs[ii];
             if (mir.instr_defines_shape(mi) && mi.operands[0].kind == mir.MIR_OP_VREG) {
                 val v: u32 = mi.operands[0].vreg;
-                if (v < n && out.type_id[v] == 0) {
+                if (v < out.n && out.type_id[v] == 0 && !(skip_copies && is_reg_copy(mi))) {
                     val boolean: bool = mir.is_cmp_opcode(mi.opcode) || mi.opcode == mir.MIR_FCMP;
                     out.is_bool[v] = boolean;
                     if (boolean) {
@@ -368,21 +732,54 @@ fun build_vmaps(e: *Emit, mf: *mir.MirFunction, irfn: *ir.Function, out: *VMaps)
         }
         bi = bi + 1;
     }
-
-    # emit one OpVariable(Function) per defined vreg, at the entry, and record its id.
-    i = 0;
-    for (i < n) {
-        if (out.type_id[i] != 0) {
-            val ptr_ty: u32 = types.type_ptr(e.tt, spirv.STORAGE_FUNCTION, out.type_id[i]);
-            val var_id: u32 = spirv.alloc_id(e.b);
-            var vop: [3]u32;
-            vop[0] = ptr_ty; vop[1] = var_id; vop[2] = spirv.STORAGE_FUNCTION;
-            spirv.inst(e.b, ?e.b.functions, spirv.OP_VARIABLE, ?vop[0], 3);
-            out.var_id[i] = var_id;
-        }
-        i = i + 1;
-    }
     ret R.ok[bool, str](true);
+}
+
+# whether an instruction is a register-to-register copy, whose destination type is
+# the source's rather than the move's width
+# ---
+# mi:  the instruction
+# ret: true for a move or declassify from a virtual or physical register
+fun is_reg_copy(mi: *mir.MirInstr) bool {
+    if (mi.opcode != mir.MIR_MOV && mi.opcode != mir.MIR_DECLASSIFY) { ret false; }
+    if (mi.operand_count != 2) { ret false; }
+    ret mi.operands[1].kind == mir.MIR_OP_VREG || mi.operands[1].kind == mir.MIR_OP_PREG;
+}
+
+# carry types across register copies to a fixed point
+#
+# The phi edge copies a lowered `if` / `for` leaves behind are emitted at the machine
+# word, so a copied i32 or boolean would come out 64 bits wide. The destination takes
+# the source's type instead.
+# ---
+# mf:  the MIR function
+# out: the maps being filled
+fun propagate_copy_types(mf: *mir.MirFunction, out: *VMaps) {
+    var changed: bool = true;
+    for (changed) {
+        changed = false;
+        var bi: u32 = 0;
+        for (bi < mf.block_count) {
+            val blk: *mir.MirBlock = ?mf.blocks[bi];
+            var ii: u32 = 0;
+            for (ii < blk.instr_count) {
+                val mi: *mir.MirInstr = ?blk.instrs[ii];
+                if (is_reg_copy(mi) && mi.operands[0].kind == mir.MIR_OP_VREG &&
+                    mi.operands[1].kind == mir.MIR_OP_VREG) {
+                    val d:  u32 = mi.operands[0].vreg;
+                    val sv: u32 = mi.operands[1].vreg;
+                    if (d < out.n && sv < out.n && out.type_id[d] == 0 && out.type_id[sv] != 0) {
+                        out.type_id[d] = out.type_id[sv];
+                        out.bits[d]    = out.bits[sv];
+                        out.is_bool[d] = out.is_bool[sv];
+                        changed = true;
+                    }
+                }
+                ii = ii + 1;
+            }
+            bi = bi + 1;
+        }
+    }
 }
 
 # free the per-vreg maps
@@ -473,19 +870,25 @@ fun ir_return_spv_type(e: *Emit, irfn: *ir.Function, out_void: *bool, out_bits: 
     ret ir_scalar_spv_type(e, rt);
 }
 
-# the defined (non-extern) IR function of the given interned name, or nil
+# no IR function carries the requested name
+val IR_FN_NONE: u32 = 0xFFFFFFFF;
+
+# the index of the defined (non-extern) IR function of the given interned name
+#
+# The index, not the pointer: it also selects the function's pre-allocated SPIR-V
+# id, which is what a call needs to name its callee.
 # ---
 # irmod: the IR module
 # name:  the interned function name
-# ret:   the matching defined IR function, or nil
-fun ir_function_by_name(irmod: *ir.Module, name: intern.StrId) *ir.Function {
+# ret:   the function's index, or IR_FN_NONE
+fun ir_function_index(irmod: *ir.Module, name: intern.StrId) u32 {
     var i: u32 = 0;
     for (i < irmod.function_len) {
         val fn: *ir.Function = ?irmod.functions[i];
-        if (fn.name == name && (fn.flags & ir.FN_FLAG_EXTERN) == 0) { ret fn; }
+        if (fn.name == name && (fn.flags & ir.FN_FLAG_EXTERN) == 0) { ret i; }
         i = i + 1;
     }
-    ret nil;
+    ret IR_FN_NONE;
 }
 
 # raise a precise unsupported-feature diagnostic
@@ -497,51 +900,17 @@ fun unsupported(e: *Emit, msg: str) R.Result[bool, str] {
     ret R.err[bool, str](msg);
 }
 
-# translate one MIR block's instructions into the current function body
-#
-# The identity calling convention places parameter / argument `i` in "register"
-# `i`, so an incoming parameter is the i-th OpFunctionParameter and a value moved
-# into the return register is the function's result. `preg_val` tracks the SSA id
-# currently held in each register index, seeded with the parameters at entry.
-# ---
-# e:            the emission state
-# mf:           the MIR function
-# blk:          the block to translate
-# vm:           the per-vreg value maps
-# param_ids:    the OpFunctionParameter ids, in order
-# param_count:  number of parameters
-# returns_void: whether the function returns void
-# ret_bits:     the integer return width in bits (0 for float / void)
-# ret:          true on success, or a precise error string
-fun emit_block(e: *Emit, mf: *mir.MirFunction, blk: *mir.MirBlock, vm: *VMaps,
-               param_ids: *u32, param_count: u32, returns_void: bool, ret_bits: u32) R.Result[bool, str] {
-    var preg_val: [16]u32;
-    var i: u32 = 0;
-    for (i < 16) { preg_val[i] = 0; i = i + 1; }
-    i = 0;
-    for (i < param_count && i < 16) { preg_val[i] = param_ids[i]; i = i + 1; }
-
-    var ii: u32 = 0;
-    for (ii < blk.instr_count) {
-        val r: R.Result[bool, str] = emit_instr(e, mf, vm, ?preg_val[0], returns_void, ret_bits, ?blk.instrs[ii]);
-        if (R.is_err[bool, str](r)) { ret r; }
-        ii = ii + 1;
-    }
-    ret R.ok[bool, str](true);
-}
-
 # translate one MIR instruction into SPIR-V, using the value-variable model
 # ---
 # e:            the emission state
 # mf:           the MIR function
 # vm:           the per-vreg value maps
-# preg_val:     the register-index -> SSA id map (16 wide)
+# preg_val:     the identity convention's nominal register file (16 wide)
 # returns_void: whether the function returns void
 # ret_bits:     the integer return width in bits
 # mi:           the instruction to translate
 # ret:          true on success, or a precise error string
-fun emit_instr(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *u32,
-               returns_void: bool, ret_bits: u32, mi: *mir.MirInstr) R.Result[bool, str] {
+fun emit_instr(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] {
     val op: mir.MirOpcode = mi.opcode;
 
     # binary integer arithmetic / bitwise / shift: dst = a <op> b.
@@ -576,35 +945,71 @@ fun emit_instr(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *u32,
     if (op == mir.MIR_ZEXT)  { ret emit_convert(e, vm, preg_val, mi, spirv.OP_U_CONVERT); }
     if (op == mir.MIR_SEXT)  { ret emit_convert(e, vm, preg_val, mi, spirv.OP_S_CONVERT); }
 
-    if (op == mir.MIR_MOV) { ret emit_mov(e, vm, preg_val, ret_bits, mi); }
+    if (op == mir.MIR_MOV) { ret emit_mov(e, vm, preg_val, mi); }
     # a `:^` declassify is a register copy plus a compile-time taint barrier; SPIR-V is
     # not rule-based (no isel retag), so its emitter handles MIR_DECLASSIFY directly as
     # the same value copy as MIR_MOV - identical runtime semantics (#1646).
-    if (op == mir.MIR_DECLASSIFY) { ret emit_mov(e, vm, preg_val, ret_bits, mi); }
+    if (op == mir.MIR_DECLASSIFY) { ret emit_mov(e, vm, preg_val, mi); }
 
-    if (op == mir.MIR_RET) {
-        if (returns_void) {
-            spirv.inst(e.b, ?e.b.functions, spirv.OP_RETURN, nil, 0);
-            ret R.ok[bool, str](true);
-        }
-        if (preg_val[0] == 0) { ret R.err[bool, str]("spirv.emit: value return with no pre-colored result"); }
-        var rv: [1]u32;
-        rv[0] = preg_val[0];
-        spirv.inst(e.b, ?e.b.functions, spirv.OP_RETURN_VALUE, ?rv[0], 1);
-        ret R.ok[bool, str](true);
-    }
-    if (op == mir.MIR_UNREACHABLE) {
-        spirv.inst(e.b, ?e.b.functions, spirv.OP_UNREACHABLE, nil, 0);
-        ret R.ok[bool, str](true);
-    }
+    if (op == mir.MIR_CALL) { ret emit_call(e, preg_val, mi); }
+    # the liveness marker pairing the call with its result move: nothing to emit.
+    if (op == mir.MIR_CALL_RES) { ret R.ok[bool, str](true); }
 
-    if (op == mir.MIR_BR || op == mir.MIR_CBR) {
-        ret unsupported(e, "control flow (branches) is not yet supported by the SPIR-V target");
-    }
-    if (op == mir.MIR_CALL || op == mir.MIR_CALL_RES) {
-        ret unsupported(e, "function calls are not yet supported by the SPIR-V target");
-    }
     ret unsupported(e, "instruction is not yet supported by the SPIR-V target");
+}
+
+# emit an OpFunctionCall for a lowered direct call
+#
+# The identity convention put argument `i` in register `i`, so the argument list is
+# the register map's prefix, as wide as the callee's declared parameter count. The
+# result goes back into register 0, where the pre-coloring move that follows the
+# call reads it. SPIR-V has no call through a value and no imports in this
+# milestone, so an indirect call and a call to a body-less function are refused.
+# ---
+# e:        the emission state
+# preg_val: the identity convention's nominal register file
+# mi:       the MIR_CALL instruction (operand 0 is the callee)
+# ret:      true on success, or a precise error string
+fun emit_call(e: *Emit, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] {
+    if (mi.operand_count < 1) { ret R.err[bool, str]("spirv.emit: call with no callee operand"); }
+    val callee: *mir.MirOperand = ?mi.operands[0];
+    if (callee.kind != mir.MIR_OP_SYM) {
+        ret unsupported(e, "a call through a function pointer is not yet supported by the SPIR-V target");
+    }
+    val fix: u32 = ir_function_index(e.ir, callee.sym);
+    if (fix == IR_FN_NONE || e.fn_ids == nil || e.fn_ids[fix] == 0) {
+        ret unsupported(e, "a call to a function defined outside the module is not yet supported by the SPIR-V target");
+    }
+    val irfn: *ir.Function = ?e.ir.functions[fix];
+
+    var returns_void: bool = false;
+    var ret_bits: u32 = 0;
+    val ret_ty: u32 = ir_return_spv_type(e, irfn, ?returns_void, ?ret_bits);
+    if (ret_ty == 0) { ret unsupported(e, "unsupported return type in the SPIR-V target"); }
+    if (irfn.param_count > 16) {
+        ret unsupported(e, "more than 16 parameters is not supported by the SPIR-V target");
+    }
+
+    val total: u32 = 3 + irfn.param_count;
+    var ops: [19]u32;
+    ops[0] = ret_ty;
+    val result: u32 = spirv.alloc_id(e.b);
+    ops[1] = result;
+    ops[2] = e.fn_ids[fix];
+    var i: u32 = 0;
+    for (i < irfn.param_count) {
+        val aid: u32 = reg_value(e, preg_val, i, ir_scalar_bits(e, irfn.params[i].ty));
+        if (aid == 0) { ret R.err[bool, str]("spirv.emit: call argument with no pre-colored value"); }
+        ops[3 + i] = aid;
+        i = i + 1;
+    }
+    spirv.inst(e.b, ?e.b.functions, spirv.OP_FUNCTION_CALL, ?ops[0], total);
+    # the return register, which the result move reads next.
+    if (!returns_void) {
+        preg_val.val_id[0] = result;
+        preg_val.is_imm[0] = false;
+    }
+    ret R.ok[bool, str](true);
 }
 
 # produce an SSA value id for an operand, materializing a load / constant as needed
@@ -620,7 +1025,7 @@ fun emit_instr(e: *Emit, mf: *mir.MirFunction, vm: *VMaps, preg_val: *u32,
 # op:        the operand
 # want_bits: the integer width to type an immediate at
 # ret:       the SSA value id, or 0 on failure
-fun read_operand(e: *Emit, vm: *VMaps, preg_val: *u32, op: *mir.MirOperand, want_bits: u32) u32 {
+fun read_operand(e: *Emit, vm: *VMaps, preg_val: *Regs, op: *mir.MirOperand, want_bits: u32) u32 {
     if (op.kind == mir.MIR_OP_VREG) {
         val v: u32 = op.vreg;
         if (v >= vm.n || vm.var_id[v] == 0) { e.b.err = true; ret 0; }
@@ -637,7 +1042,7 @@ fun read_operand(e: *Emit, vm: *VMaps, preg_val: *u32, op: *mir.MirOperand, want
     }
     if (op.kind == mir.MIR_OP_PREG) {
         if (op.preg >= 16) { e.b.err = true; ret 0; }
-        ret preg_val[op.preg];
+        ret reg_value(e, preg_val, op.preg, want_bits);
     }
     e.b.err = true;
     ret 0;
@@ -664,11 +1069,11 @@ fun store_vreg(e: *Emit, vm: *VMaps, vreg: u32, value: u32) R.Result[bool, str] 
 # ---
 # e:      the emission state
 # vm:     the per-vreg value maps
-# preg_val: the register-index map
+# preg_val: the identity convention's nominal register file
 # mi:     the MIR instruction ([dst, a, b])
 # spv_op: the SPIR-V opcode
 # ret:    true on success, or an error string
-fun emit_binary(e: *Emit, vm: *VMaps, preg_val: *u32, mi: *mir.MirInstr, spv_op: u32) R.Result[bool, str] {
+fun emit_binary(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, spv_op: u32) R.Result[bool, str] {
     if (mi.operand_count != 3 || mi.operands[0].kind != mir.MIR_OP_VREG) {
         ret R.err[bool, str]("spirv.emit: malformed binary instruction");
     }
@@ -689,11 +1094,11 @@ fun emit_binary(e: *Emit, vm: *VMaps, preg_val: *u32, mi: *mir.MirInstr, spv_op:
 # ---
 # e:      the emission state
 # vm:     the per-vreg value maps
-# preg_val: the register-index map
+# preg_val: the identity convention's nominal register file
 # mi:     the MIR instruction ([dst, a])
 # spv_op: the SPIR-V opcode
 # ret:    true on success, or an error string
-fun emit_unary(e: *Emit, vm: *VMaps, preg_val: *u32, mi: *mir.MirInstr, spv_op: u32) R.Result[bool, str] {
+fun emit_unary(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, spv_op: u32) R.Result[bool, str] {
     if (mi.operand_count != 2 || mi.operands[0].kind != mir.MIR_OP_VREG) {
         ret R.err[bool, str]("spirv.emit: malformed unary instruction");
     }
@@ -715,11 +1120,11 @@ fun emit_unary(e: *Emit, vm: *VMaps, preg_val: *u32, mi: *mir.MirInstr, spv_op: 
 # ---
 # e:      the emission state
 # vm:     the per-vreg value maps
-# preg_val: the register-index map
+# preg_val: the identity convention's nominal register file
 # mi:     the MIR instruction ([dst, a, b])
 # spv_op: the SPIR-V comparison opcode
 # ret:    true on success, or an error string
-fun emit_compare(e: *Emit, vm: *VMaps, preg_val: *u32, mi: *mir.MirInstr, spv_op: u32) R.Result[bool, str] {
+fun emit_compare(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, spv_op: u32) R.Result[bool, str] {
     if (mi.operand_count != 3 || mi.operands[0].kind != mir.MIR_OP_VREG) {
         ret R.err[bool, str]("spirv.emit: malformed comparison instruction");
     }
@@ -742,11 +1147,11 @@ fun emit_compare(e: *Emit, vm: *VMaps, preg_val: *u32, mi: *mir.MirInstr, spv_op
 # ---
 # e:      the emission state
 # vm:     the per-vreg value maps
-# preg_val: the register-index map
+# preg_val: the identity convention's nominal register file
 # mi:     the MIR instruction ([dst, a]) carrying the source width in src_width
 # spv_op: OpUConvert (truncate / zero-extend) or OpSConvert (sign-extend)
 # ret:    true on success, or an error string
-fun emit_convert(e: *Emit, vm: *VMaps, preg_val: *u32, mi: *mir.MirInstr, spv_op: u32) R.Result[bool, str] {
+fun emit_convert(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr, spv_op: u32) R.Result[bool, str] {
     if (mi.operand_count != 2 || mi.operands[0].kind != mir.MIR_OP_VREG) {
         ret R.err[bool, str]("spirv.emit: malformed conversion instruction");
     }
@@ -771,11 +1176,11 @@ fun emit_convert(e: *Emit, vm: *VMaps, preg_val: *u32, mi: *mir.MirInstr, spv_op
 # ---
 # e:        the emission state
 # vm:       the per-vreg value maps
-# preg_val: the register-index map
+# preg_val: the identity convention's nominal register file
 # ret_bits: the integer return width, used to type an immediate moved into a register
 # mi:       the MIR instruction ([dst, src])
 # ret:      true on success, or an error string
-fun emit_mov(e: *Emit, vm: *VMaps, preg_val: *u32, ret_bits: u32, mi: *mir.MirInstr) R.Result[bool, str] {
+fun emit_mov(e: *Emit, vm: *VMaps, preg_val: *Regs, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count != 2) { ret R.err[bool, str]("spirv.emit: malformed move instruction"); }
     val dst: *mir.MirOperand = ?mi.operands[0];
     val src: *mir.MirOperand = ?mi.operands[1];
@@ -788,10 +1193,34 @@ fun emit_mov(e: *Emit, vm: *VMaps, preg_val: *u32, ret_bits: u32, mi: *mir.MirIn
     }
     if (dst.kind == mir.MIR_OP_PREG) {
         if (dst.preg >= 16) { ret R.err[bool, str]("spirv.emit: move destination register out of range"); }
-        val val_id: u32 = read_operand(e, vm, preg_val, src, ret_bits);
+        # an immediate waits here untyped: the width it takes is the one the callee's
+        # parameter or the function's return type asks for, not the move's, which the
+        # ABI pre-coloring always emits at the machine word.
+        if (src.kind == mir.MIR_OP_IMM) {
+            preg_val.val_id[dst.preg] = 0;
+            preg_val.imm[dst.preg]    = src.imm;
+            preg_val.is_imm[dst.preg] = true;
+            ret R.ok[bool, str](true);
+        }
+        val val_id: u32 = read_operand(e, vm, preg_val, src, 0);
         if (e.b.err) { ret R.err[bool, str]("spirv.emit: unreadable move source"); }
-        preg_val[dst.preg] = val_id;
+        preg_val.val_id[dst.preg] = val_id;
+        preg_val.is_imm[dst.preg] = false;
         ret R.ok[bool, str](true);
     }
     ret unsupported(e, "memory-destination move is not yet supported by the SPIR-V target");
+}
+
+# the SSA value in a nominal register, minting a pending immediate at `bits`
+# ---
+# e:    the emission state
+# rg:   the register file
+# k:    the register index
+# bits: the integer width the consumer wants a pending immediate at
+# ret:  the SSA value id, or 0 when the register holds nothing
+fun reg_value(e: *Emit, rg: *Regs, k: u32, bits: u32) u32 {
+    if (!rg.is_imm[k]) { ret rg.val_id[k]; }
+    var w: u32 = bits;
+    if (w == 0) { w = e.tgt.model.gpr_width * 8; }
+    ret types.const_int(e.tt, w, rg.imm[k]);
 }

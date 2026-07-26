@@ -97,13 +97,56 @@ fwd type.FieldTable;
 # sig:     the substituted signature TypeId (for the instance return type)
 # args:    owned concrete type-argument array (by parameter ordinal)
 # arg_len: number of type arguments
+# bare:    the generic's source name, for the instantiation-chain diagnostic
+# depth:   length of the derivation chain that reached this request: 0 for one
+#          recorded by the module pass, one more than its parent's for one
+#          recorded while re-validating another instance's body
+# parent:  worklist index of the instance whose re-validation recorded this one,
+#          or INST_NONE at the root of a chain
 pub rec InstReq {
     origin:  session.ModuleId;
     decl:    id.DeclId;
     sig:     type.TypeId;
     args:    *type.TypeId;
     arg_len: u32;
+    bare:    intern.StrId;
+    depth:   u32;
+    parent:  u32;
 }
+
+# `InstReq.parent` sentinel: recorded by the module pass, so it begins a chain
+pub val INST_NONE: u32 = 4294967295;
+
+# the cap on how far one chain of DERIVED generic instantiations may run
+#
+# The dedup terminates any FINITE instance set, mutual recursion included. An
+# infinite one arises when an instance's re-validation instantiates a strictly
+# larger instance of the same generic (`f[P]` re-validating into `f[*P]` into
+# `f[**P]`), so the thing to bound is the derivation chain, not the module's
+# total instance count: a large generic-heavy module legitimately records
+# hundreds of unrelated instances at depth 0, and a total cap would conflate
+# "deeply recursive" with "just big". The total is bounded too, separately, by
+# MAX_CT_INSTANCES.
+#
+# The same policy the monomorphizer enforces on the instances it EMITS (see
+# `me.lower.context.MAX_INSTANCE_DEPTH`); the two engines track different
+# instance sets, so each is measured against its own. Measured, not guessed: see
+# doc/design/instantiation-limits.md.
+pub val MAX_CT_INSTANCE_DEPTH: u32 = 32;
+
+# the cap on how many distinct instances one module's re-validation may track
+#
+# The depth bound alone is not enough: a body that instantiates itself twice at
+# two different growing arguments stays inside any depth budget while recording
+# 2^depth instances, and the dedup here is a linear scan, so that is a hang well
+# before the depth bound is reached.
+pub val MAX_CT_INSTANCES: u32 = 8192;
+
+# `record_instance` outcomes: recorded (or pruned - both leave the pass clean),
+# or refused by one of the two instantiation limits
+pub val RECORD_OK:           u8 = 0;
+pub val RECORD_LIMIT_DEPTH:  u8 = 1;
+pub val RECORD_LIMIT_COUNT:  u8 = 2;
 
 # the per-instance CT re-validation worklist (#2157): generic instantiations requested
 # during body inference, drained after all bodies are typed
@@ -120,14 +163,78 @@ pub rec InstReq {
 # cap:     allocated capacity of `items`
 # drained: cursor; requests below it have been re-validated
 # alloc:   allocator backing `items` and each request's owned `args`
+# limited: an instantiation limit was reported; further requests are dropped
 pub rec InstWorklist {
     items:   *InstReq;
     len:     u32;
     cap:     u32;
     drained: u32;
     alloc:   *A.Allocator;
+    limited: bool;
+
+    # the #2225 rule's state for the episodes this worklist drives, so a lowering-time
+    # deferred body - which builds its own context per element, per instance - shares one
+    # report set and pays for the `^`-precondition scan once rather than per unrolled copy.
+    uni_reports:  UniReports;
+    secret_state: u8;
 }
 
+# `secret_state` values: the precondition has not been computed, or its answer
+pub val SECRET_UNKNOWN: u8 = 0;
+pub val SECRET_ABSENT:  u8 = 1;
+pub val SECRET_PRESENT: u8 = 2;
+
+# `type_resolved_memo` states (#2334)
+#
+# QUIET and REPORTED both mean resolved; they differ on whether that resolution filed a
+# diagnostic, which is what a caller watching the sink across its own call needs back.
+pub val TYPE_MEMO_NONE:     u8 = 0;
+pub val TYPE_MEMO_QUIET:    u8 = 1;
+pub val TYPE_MEMO_REPORTED: u8 = 2;
+
+# the number of distinct mixed-secrecy generic union instances one analysis remembers
+# having reported (#2225)
+val UNI_REPORT_CAP: u32 = 256;
+
+# the set of generic union instances already reported as mixed-secrecy (#2225)
+#
+# The rule is a property of a TYPE, not of a mention: `resolve_type_ref` is not memoized
+# and `def_underlying` re-resolves an alias per use, so one bad instantiation is reached
+# from two or three annotations and a naive check reports it that many times. Keyed by
+# the interned TYPE_INSTANCE the violating (nominal, arguments) pair denotes, so every
+# route to the same ill-formed type collapses to one diagnostic.
+#
+# Owned by the module's analysis and shared BY POINTER into every per-instance
+# re-validation episode it drives, so the sweep and the episodes dedupe against one set.
+# Past the cap it stops deduping and reports again - loud, never silent.
+# ---
+# seen: the interned instance TypeIds already reported
+# len:  number of entries
+pub rec UniReports {
+    seen: [UNI_REPORT_CAP]type.TypeId;
+    len:  u32;
+}
+
+# record `key` as reported, answering whether this is its first report (#2225)
+#
+# A nil set (an episode that owns none) answers true every time: duplicate diagnostics
+# are a nuisance, a dropped one is a leak.
+# ---
+# ur:  the report set, or nil
+# key: the interned instance TypeId identifying the violation
+# ret: true when the caller should emit the diagnostic
+pub fun uni_report_mark(ur: *UniReports, key: type.TypeId) bool {
+    if (ur == nil) { ret true; }
+    var i: u32 = 0;
+    for (i < ur.len) {
+        if (ur.seen[i] == key) { ret false; }
+        i = i + 1;
+    }
+    if (ur.len >= UNI_REPORT_CAP) { ret true; }
+    ur.seen[ur.len] = key;
+    ur.len = ur.len + 1;
+    ret true;
+}
 
 # sema's working state for one module analysis
 #
@@ -145,6 +252,7 @@ pub rec InstWorklist {
 # expr_type:        parallel to ast.exprs; written by infer_expr
 # type_resolved_ty: parallel to ast.types; written by resolve_type_ref
 # decl_type:        parallel to ast.decls; written by infer_decl
+# type_resolved_memo: parallel to type_resolved_ty; resolve_type_ref's memo, nil on an episode
 # callee_eid:       call-callee expr currently being inferred, or EXPR_NIL
 # in_comptime_gate: true while inferring a comptime `$if` gate condition
 # in_fin:           true while walking a `fin` body's statements
@@ -163,15 +271,62 @@ pub rec SemaContext {
     # borrows the same pointer so its nested generic calls append to the one worklist.
     insts: *InstWorklist;
 
-    # gate for `record_instance` (#2157): true on the main sema pass and on a sema-time
-    # instance re-validation (which collect generic instantiations to re-validate),
-    # false on the lowering-time pack re-inference (`reinfer_pack_each_body`), which
-    # runs the same inference machinery but must not collect or drain a worklist.
+    # gate for `record_instance` (#2157): true on every inference episode that owns a
+    # worklist it will drain - the main sema pass, a sema-time instance re-validation,
+    # and the lowering-time pack / deferred-`$fields` body re-inference (#2177). false
+    # only on an episode with no worklist, where a recorded instance would never be
+    # re-validated and would leak its arguments.
     collect_insts: bool;
+
+    # the derivation depth to stamp on every instance this episode records (#2163):
+    # 0 on the module pass, one more than the re-validated instance's own depth
+    # inside a drain, which is what makes a chain of derived instantiations
+    # measurable rather than a flat count.
+    inst_depth: u32;
+
+    # the worklist index of the instance being re-validated, or INST_NONE outside a
+    # drain; the link the chain diagnostic walks.
+    inst_parent: u32;
+
+    # gate for `report` / `report_note` (#2254): false on every episode that is the
+    # authority for the statements it walks, true only on the re-derivation prologue
+    # that republishes a pack instance's enclosing-body typing. Those statements were
+    # already checked twice - by the module sema pass against the template parameter,
+    # and by the CT re-validation drain against the instance's concrete arguments - so
+    # a reporting prologue would duplicate every one of their diagnostics once per
+    # (type-argument x element-type) instance.
+    silent: bool;
 
     expr_type:        *type.TypeId;
     type_resolved_ty: *type.TypeId;
     decl_type:        *type.TypeId;
+
+    # `resolve_type_ref`'s memo (#2334): parallel to `type_resolved_ty`, marking the
+    # nodes this episode has already resolved.
+    #
+    # `resolve_all_types` walks every AstType by index, and every composite resolver
+    # recurses into children that are themselves indexed nodes, so a node nested in a
+    # composite was resolved once for its own index plus once per enclosing composite;
+    # `intrinsic_operand_type` then resolved its operand again during body inference.
+    # Each resolution re-emitted that node's diagnostics, so one ill-formed annotation
+    # read as two or three distinct problems. 38.3% of the resolutions in a compiler
+    # build recomputed an answer already held.
+    #
+    # NIL ON EVERY EPISODE, which is what makes the memo sound rather than a cache that
+    # happens to work. A resolution is redundant only when the ACTIVE SUBSTITUTION is
+    # the same: the identical node under `Box[u8]` and under `Box[u64]` asks two
+    # different questions, and collapsing them would answer with the TEMPLATE's types -
+    # the #2178 / #2257 defect. Within one module sema pass `subst` is nil throughout
+    # (`init_context` sets it so, and the re-validation drain builds NEW contexts rather
+    # than mutating this one), so there the memo is keyed by tid alone and can conflate
+    # nothing. An episode carries a substitution and gets no memo.
+    #
+    # It records whether the resolution REPORTED, not merely that it happened, because
+    # suppressing a repeat resolution also suppresses its diagnostic - and one caller
+    # (`intrinsic_operand_type`) asks "did this operand fail silently?" by watching the
+    # sink across its own call. That question survives memoization only if the answer is
+    # remembered with the node.
+    type_resolved_memo: *u8;
 
     # set transiently by infer_call so infer_ident permits a comptime-parameter
     # function in callee position (a template, callable but not a value) and
@@ -203,6 +358,18 @@ pub rec SemaContext {
     subst:     *type.TypeId;
     subst_len: u32;
     subst_fn:  fun(*session.Session, type.TypeId, *type.TypeId, u32) type.TypeId;
+
+    # the mixed-secrecy union rule at a generic INSTANCE (#2225). `uni_check_fn` is
+    # `generics.check_annotation_uni_secrecy` behind a function pointer, for the same
+    # reason `subst_fn` is: this module is generics' dependency, not its dependent. It
+    # runs from `resolved_type_of` on every annotation an INSTANCE episode reads (where
+    # the substitution is what makes a union mixed); the module's own annotations are
+    # swept once by `sema` after decl inference, when every field table exists.
+    # `uni_reports` dedupes across the sweep and every episode it drives; `has_secret`
+    # is the whole rule's precondition, so a `^`-free program pays nothing.
+    uni_check_fn: fun(*SemaContext, id.TypeId);
+    uni_reports:  *UniReports;
+    has_secret:   bool;
 }
 
 # the interned semantic TypeId a syntactic AstType resolved to
@@ -217,6 +384,15 @@ pub fun resolved_type_of(sc: *SemaContext, ast_tid: id.TypeId) type.TypeId {
     if (ast_tid == id.TYPE_NIL)        { ret type.TYPE_NIL; }
     if (sc.type_resolved_ty == nil)    { ret type.TYPE_ERROR; }
     if (ast_tid >= sc.a.type_len::u32) { ret type.TYPE_ERROR; }
+    # #2225: an annotation read under a substitution is the one place a union that
+    # agreed at the template can turn mixed, so the instance rule runs here rather than
+    # off the module sweep, which sees only the un-substituted `{T, u32}` and agrees.
+    # The check reads the PRISTINE table itself and applies the substitution once, the
+    # #2254 rule: substituting the value below would compose onto an already-derived
+    # slot. Off on the main pass, whose annotations the post-decl sweep covers.
+    if (sc.has_secret && sc.subst != nil && sc.uni_check_fn != nil) {
+        sc.uni_check_fn(sc, ast_tid);
+    }
     ret apply_subst(sc, sc.type_resolved_ty[ast_tid]);
 }
 
@@ -239,19 +415,104 @@ pub fun apply_subst(sc: *SemaContext, tid: type.TypeId) type.TypeId {
 # whether a concrete type argument can newly trip a per-instance CT gate (#2157)
 #
 # A secret-carrying argument can make a `==` / branch / index / div operand secret at
-# the instance; an aggregate argument can make a `==` an aggregate compare (#2127). A
-# bare public scalar can do neither - the template check already covered it - so an
-# instance whose every argument is a public scalar needs no re-validation.
+# the instance; an aggregate argument can make a `==` an aggregate compare (#2127) or
+# expose a secret field to `$fields` reflection. The predicate fails CLOSED (#2168):
+# it names the kinds that provably cannot reach a secret - a public numeric primitive
+# and the untyped `ptr`, whose spines carry no type at all - and re-validates every
+# other kind. An enumeration of the reaching kinds instead under-reports the moment a
+# kind is added or a new reach path (a pointer to a secret-bearing record, a vector of
+# secret lanes) is found.
 # ---
 # sc:  sema context
 # tid: a concrete type argument
 # ret: true when the argument warrants re-validating the instance body
 pub fun arg_triggers_revalidation(sc: *SemaContext, tid: type.TypeId) bool {
+    # the poison and absent sentinels are not types. Both compare >= the interner's
+    # length, so they reach the miss branch below and would be re-validated as "might
+    # reach a secret" - re-inferring a whole generic body, and allocating scratch typing
+    # arrays sized to the origin module's expr and decl tables, for a program the
+    # compiler has already reported on and given up.
+    if (tid == type.TYPE_ERROR || tid == type.TYPE_NIL) { ret false; }
+
+    # a `^` anywhere on the spine is CONCRETE secrecy, whatever sits under it: `^T` is
+    # secret at every instantiation, and so is `*^T`. This is checked BEFORE the abstract
+    # prune below, which would otherwise see the `T` inside `^T`, call the whole argument
+    # abstract, and drop a provably-secret instance - `idx[^T]` using its parameter as a
+    # memory index compiled clean that way.
     if (type.carries_secret(?sc.s.types, tid)) { ret true; }
+
+    # an argument that still mentions a generic parameter and carries no secrecy of its
+    # own is abstract: it says nothing about any instance, and every diagnostic its body
+    # can produce was already produced by the template pass, so re-validating it only
+    # duplicates them. Its concrete forms arrive through the enclosing instance's own
+    # re-validation, which resolves this call site's arguments under the substitution.
+    # Note this prunes per ARGUMENT, so `inner[T, ^u32]` - abstract in one position,
+    # concretely secret in another - is still recorded on the strength of the secret.
+    if (type_mentions_generic_param(sc, tid)) { ret false; }
+
+    val t_opt: O.Option[*type.Type] = type.get(?sc.s.types, tid);
+    if (O.is_none[*type.Type](t_opt)) { ret true; }
+    ret !type_is_public_scalar(O.unwrap[*type.Type](t_opt).kind);
+}
+
+# whether `tid` mentions a generic parameter anywhere on its type spine
+#
+# Walks only the spine - pointer, array, secret, function, and generic-instance
+# arguments - never a nominal's field graph. That is the whole abstract surface a type
+# ARGUMENT can be written with inside a generic body (`T`, `*T`, `^T`, `[N]T`,
+# `fun(T) u32`, `Box[T]`), and it keeps the walk total: no allocation, so no failure
+# path that could answer "abstract" for a concrete type and silently prune a secret
+# instance out of the re-validation.
+# ---
+# sc:  sema context
+# tid: the TypeId to inspect
+# ret: true when a generic parameter appears on the spine
+fun type_mentions_generic_param(sc: *SemaContext, tid: type.TypeId) bool {
+    if (tid == type.TYPE_ERROR || tid == type.TYPE_NIL) { ret false; }
     val t_opt: O.Option[*type.Type] = type.get(?sc.s.types, tid);
     if (O.is_none[*type.Type](t_opt)) { ret false; }
-    val k: type.TypeKind = O.unwrap[*type.Type](t_opt).kind;
-    ret k == type.TYPE_REC || k == type.TYPE_UNI || k == type.TYPE_INSTANCE || k == type.TYPE_ARRAY;
+    val t: *type.Type = O.unwrap[*type.Type](t_opt);
+
+    if (t.kind == type.TYPE_GENERIC_PARAM) { ret true; }
+    if (t.kind == type.TYPE_POINTER)       { ret type_mentions_generic_param(sc, t.data.pointer.base); }
+    if (t.kind == type.TYPE_SECRET)        { ret type_mentions_generic_param(sc, t.data.secret.base); }
+    if (t.kind == type.TYPE_ARRAY)         { ret type_mentions_generic_param(sc, t.data.array.base); }
+
+    if (t.kind == type.TYPE_FUN) {
+        if (type_mentions_generic_param(sc, t.data.fn.ret_type)) { ret true; }
+        var i: u32 = 0;
+        for (i < t.data.fn.params_len) {
+            val opt_p: O.Option[type.TypeId] = type.get_param(?sc.s.types, t.data.fn.params_start + i);
+            if (O.is_some[type.TypeId](opt_p) && type_mentions_generic_param(sc, O.unwrap[type.TypeId](opt_p))) { ret true; }
+            i = i + 1;
+        }
+        ret false;
+    }
+
+    if (t.kind == type.TYPE_INSTANCE) {
+        var i: u32 = 0;
+        for (i < t.data.instance.args_len) {
+            val opt_a: O.Option[type.TypeId] = type.get_param(?sc.s.types, t.data.instance.args_start + i);
+            if (O.is_some[type.TypeId](opt_a) && type_mentions_generic_param(sc, O.unwrap[type.TypeId](opt_a))) { ret true; }
+            i = i + 1;
+        }
+    }
+    ret false;
+}
+
+# whether `k` is a public scalar kind - a numeric primitive or the untyped `ptr`
+#
+# These are the only kinds with no reachable secret: they have no field graph, no
+# element type, and no pointee, so an instance whose every type argument is one of
+# them behaves exactly as the template check already validated. Classified through
+# `prim_desc`, the shared primitive classifier, so it never depends on the kind
+# ordinals' relative order.
+# ---
+# k:   the TypeKind to classify
+# ret: true for a numeric primitive or `ptr`
+fun type_is_public_scalar(k: type.TypeKind) bool {
+    val c: type.PrimClass = type.prim_desc(k).class;
+    ret c == type.PRIM_CLASS_INT || c == type.PRIM_CLASS_FLOAT || c == type.PRIM_CLASS_PTR;
 }
 
 # whether two concrete type-argument tuples are element-wise equal
@@ -279,19 +540,34 @@ fun args_equal(a: *type.TypeId, b: *type.TypeId, n: u32) bool {
 # args:    the concrete type arguments (borrowed; copied here)
 # arg_len: number of type arguments
 # sig:     the substituted signature TypeId
-# ret:     ok(true), or err on an allocation failure
+# ret:     one of the RECORD_* outcomes - recorded, pruned, or refused by an
+#          instantiation limit, which the CALLER reports (it holds the call span,
+#          and the chain diagnostic needs the type renderer this leaf cannot
+#          import) - or err carrying a COMPLETE `internal:`-prefixed allocation
+#          failure the caller reports verbatim.
 pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.DeclId,
-                        args: *type.TypeId, arg_len: u32, sig: type.TypeId) R.Result[bool, str] {
-    if (!sc.collect_insts) { ret R.ok[bool, str](true); }
-    if (arg_len == 0)      { ret R.ok[bool, str](true); }
+                        args: *type.TypeId, arg_len: u32, sig: type.TypeId,
+                        bare: intern.StrId) R.Result[u8, str] {
+    if (!sc.collect_insts) { ret R.ok[u8, str](RECORD_OK); }
+    if (arg_len == 0)      { ret R.ok[u8, str](RECORD_OK); }
 
     var any: bool = false;
     var i: u32 = 0;
     for (i < arg_len) {
         if (arg_triggers_revalidation(sc, args[i])) { any = true; }
+        # #2225: `arg_triggers_revalidation` asks whether the ARGUMENT can reach a
+        # secret, which is the right question for every gate that needs the secret to
+        # arrive through the call. A union's variants can disagree without that: in
+        # `fun f[T]() { var u: U[T, ^u32]; }` the secret is written in the TEMPLATE and
+        # a plain `u32` argument is what makes the pair mixed. So any argument that is
+        # concrete at all records the instance once the program uses `^` anywhere - an
+        # abstract one still says nothing, and its concrete forms arrive through the
+        # enclosing instance's own re-validation.
+        if (sc.has_secret && args[i] != type.TYPE_ERROR && args[i] != type.TYPE_NIL
+            && !type_mentions_generic_param(sc, args[i])) { any = true; }
         i = i + 1;
     }
-    if (!any) { ret R.ok[bool, str](true); }
+    if (!any) { ret R.ok[u8, str](RECORD_OK); }
 
     if (sc.insts != nil) {
         var j: u32 = 0;
@@ -299,37 +575,47 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
             val e: *InstReq = ?sc.insts.items[j];
             if (e.origin == origin && e.decl == decl && e.arg_len == arg_len
                 && args_equal(e.args, args, arg_len)) {
-                ret R.ok[bool, str](true);
+                ret R.ok[u8, str](RECORD_OK);
             }
             j = j + 1;
         }
     }
 
     if (sc.insts == nil) {
-        val wr: R.Result[*InstWorklist, str] = A.allocate[InstWorklist](sc.s.alloc, 1::usize);
-        if (R.is_err[*InstWorklist, str](wr)) { ret R.err[bool, str](R.unwrap_err[*InstWorklist, str](wr)); }
-        val wl: *InstWorklist = R.unwrap_ok[*InstWorklist, str](wr);
-        wl.items   = nil;
-        wl.len     = 0;
-        wl.cap     = 0;
-        wl.drained = 0;
-        wl.alloc   = sc.s.alloc;
-        sc.insts = wl;
+        val wr: R.Result[*InstWorklist, str] = inst_worklist_new(sc.s.alloc);
+        if (R.is_err[*InstWorklist, str](wr)) { ret R.err[u8, str](R.unwrap_err[*InstWorklist, str](wr)); }
+        sc.insts = R.unwrap_ok[*InstWorklist, str](wr);
     }
     val wl: *InstWorklist = sc.insts;
+
+    # the limit is reported ONCE. every novel request after it would return the same
+    # message and poison its own call site, burying the first offender under one
+    # diagnostic per still-draining body. dropping the rest re-validates less than a
+    # clean pass would, which is sound here and only here: the reported break already
+    # fails the build, so no instance of a program that still compiles is skipped.
+    if (wl.limited) { ret R.ok[u8, str](RECORD_OK); }
+
+    if (sc.inst_depth > MAX_CT_INSTANCE_DEPTH) {
+        wl.limited = true;
+        ret R.ok[u8, str](RECORD_LIMIT_DEPTH);
+    }
+    if (wl.len >= MAX_CT_INSTANCES) {
+        wl.limited = true;
+        ret R.ok[u8, str](RECORD_LIMIT_COUNT);
+    }
 
     if (wl.len == wl.cap) {
         var new_cap: u32 = 8;
         if (wl.cap > 0) { new_cap = wl.cap * 2; }
         var nr: R.Result[*InstReq, str] = A.allocate[InstReq](wl.alloc, new_cap::usize);
         if (wl.cap > 0) { nr = A.reallocate[InstReq](wl.alloc, wl.items, wl.cap::usize, new_cap::usize); }
-        if (R.is_err[*InstReq, str](nr)) { ret R.err[bool, str](R.unwrap_err[*InstReq, str](nr)); }
+        if (R.is_err[*InstReq, str](nr)) { ret R.err[u8, str]("internal: out of memory growing the constant-time re-validation worklist"); }
         wl.items = R.unwrap_ok[*InstReq, str](nr);
         wl.cap   = new_cap;
     }
 
     val cr: R.Result[*type.TypeId, str] = A.allocate[type.TypeId](wl.alloc, arg_len::usize);
-    if (R.is_err[*type.TypeId, str](cr)) { ret R.err[bool, str](R.unwrap_err[*type.TypeId, str](cr)); }
+    if (R.is_err[*type.TypeId, str](cr)) { ret R.err[u8, str]("internal: out of memory copying a generic instance's type arguments"); }
     val owned: *type.TypeId = R.unwrap_ok[*type.TypeId, str](cr);
     var k: u32 = 0;
     for (k < arg_len) { owned[k] = args[k]; k = k + 1; }
@@ -340,16 +626,42 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
     slot.sig     = sig;
     slot.args    = owned;
     slot.arg_len = arg_len;
+    slot.bare    = bare;
+    slot.depth   = sc.inst_depth;
+    slot.parent  = sc.inst_parent;
     wl.len = wl.len + 1;
-    ret R.ok[bool, str](true);
+    ret R.ok[u8, str](RECORD_OK);
 }
 
-# free the CT re-validation worklist and every request's owned arguments (#2157)
+# allocate an empty CT re-validation worklist (#2157)
+#
+# An inference episode that runs outside the module sema pass - the lowering-time
+# pack / deferred-`$fields` body re-inference (#2177) - owns its worklist for the
+# whole lowering of one module and hands the same pointer to every episode, so the
+# `drained` cursor validates each distinct instance exactly once.
 # ---
-# sc: the sema context whose worklist is released (nil-safe; cleared to nil)
-pub fun inst_worklist_dnit(sc: *SemaContext) {
-    if (sc.insts == nil) { ret; }
-    val wl: *InstWorklist = sc.insts;
+# alloc: allocator backing the worklist and every request's owned arguments
+# ret:   the empty worklist, or a complete user-facing allocation-failure message
+pub fun inst_worklist_new(alloc: *A.Allocator) R.Result[*InstWorklist, str] {
+    val wr: R.Result[*InstWorklist, str] = A.allocate[InstWorklist](alloc, 1::usize);
+    if (R.is_err[*InstWorklist, str](wr)) { ret R.err[*InstWorklist, str]("internal: out of memory allocating the constant-time re-validation worklist"); }
+    val wl: *InstWorklist = R.unwrap_ok[*InstWorklist, str](wr);
+    wl.items            = nil;
+    wl.len              = 0;
+    wl.cap              = 0;
+    wl.drained          = 0;
+    wl.alloc            = alloc;
+    wl.uni_reports.len  = 0;
+    wl.secret_state     = SECRET_UNKNOWN;
+    wl.limited          = false;
+    ret R.ok[*InstWorklist, str](wl);
+}
+
+# free a CT re-validation worklist and every request's owned arguments (#2157)
+# ---
+# wl: the worklist to release; nil is a no-op
+pub fun inst_worklist_free(wl: *InstWorklist) {
+    if (wl == nil) { ret; }
     var i: u32 = 0;
     for (i < wl.len) {
         val e: *InstReq = ?wl.items[i];
@@ -362,6 +674,13 @@ pub fun inst_worklist_dnit(sc: *SemaContext) {
         A.deallocate[InstReq](wl.alloc, wl.items, wl.cap::usize);
     }
     A.deallocate[InstWorklist](wl.alloc, wl, 1::usize);
+}
+
+# free the CT re-validation worklist a sema context owns (#2157)
+# ---
+# sc: the sema context whose worklist is released (nil-safe; cleared to nil)
+pub fun inst_worklist_dnit(sc: *SemaContext) {
+    inst_worklist_free(sc.insts);
     sc.insts = nil;
 }
 
@@ -453,28 +772,67 @@ pub fun symbol_by_id(sc: *SemaContext, sid: resolve.SymbolId) O.Option[*resolve.
     ret O.some[*resolve.Symbol](?sc.rr.symbols[sid]);
 }
 
+# the active target's pointer width in bytes
+#
+# Read from the comptime context the driver seeds with the target's parameters. The
+# secrecy-placement comparison measures byte extents (#2167), which is a
+# target-dependent type property, so the width must come from the target layer
+# rather than a hardcoded constant.
+# ---
+# sc:  sema context
+# ret: the active target's pointer width in bytes
+pub fun ptr_width_of(sc: *SemaContext) u32 {
+    ret sc.ctx.pointer_width;
+}
+
 # emit a SEVERITY_ERROR diagnostic at `span`
 #
 # An allocation failure in the diagnostic sink is swallowed so a single
-# out-of-memory diagnostic does not abort the whole pass.
+# out-of-memory diagnostic does not abort the whole pass. A `silent` episode drops
+# the diagnostic: it re-derives typing state for statements another episode already
+# reported on (#2254).
 # ---
 # sc:      sema context
 # span:    source span the diagnostic refers to
 # message: human-readable error text
 pub fun report(sc: *SemaContext, span: token.Span, message: str) {
+    if (sc.silent) { ret; }
     diagnostic.error(?sc.s.diags, sc.a.file_id, span, message);
+}
+
+# snapshot the diagnostic sink's length, to be paired with `reported_since`
+#
+# Lets a leaf that must never fail silently confirm that a nested resolution
+# actually filed the diagnostic explaining its failure, and supply one itself
+# when nothing did (#2178).
+# ---
+# sc:  sema context
+# ret: the current diagnostic count
+pub fun diag_mark(sc: *SemaContext) usize {
+    ret sc.s.diags.len;
+}
+
+# whether any diagnostic was filed since `mark`
+# ---
+# sc:   sema context
+# mark: a `diag_mark` snapshot taken before the work in question
+# ret:  true when the sink grew
+pub fun reported_since(sc: *SemaContext, mark: usize) bool {
+    ret sc.s.diags.len > mark;
 }
 
 # emit a SEVERITY_ERROR diagnostic at `span` with a secondary `note:` line
 #
 # The note attaches only when the error diagnostic itself landed, so a failed
-# error emit never misattaches the note to the previous diagnostic.
+# error emit never misattaches the note to the previous diagnostic. Dropped on a
+# `silent` episode, like `report`.
 # ---
 # sc:      sema context
 # span:    source span the diagnostic refers to
 # message: human-readable error text
 # note:    secondary clarifying message rendered on a `note:` line
 pub fun report_note(sc: *SemaContext, span: token.Span, message: str, note: str) {
+    if (sc.silent) { ret; }
     val res_error: R.Result[bool, str] = diagnostic.error(?sc.s.diags, sc.a.file_id, span, message);
     if (R.is_err[bool, str](res_error)) { ret; }
     diagnostic.attach_note(?sc.s.diags, note);
@@ -707,7 +1065,7 @@ fun param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId {
 # sc:  sema context
 # sym: the SYM_GENERIC symbol
 # ret: the generic parameter's placeholder TypeId, or TYPE_ERROR
-fun generic_param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId {
+pub fun generic_param_type_for(sc: *SemaContext, sym: *resolve.Symbol) type.TypeId {
     val res_intern: R.Result[type.TypeId, str] = type.intern_generic_param(?sc.s.types, sym.name, sym.decl, sym.slot);
     if (R.is_err[type.TypeId, str](res_intern)) { ret type.TYPE_ERROR; }
     ret apply_subst(sc, R.unwrap_ok[type.TypeId, str](res_intern));

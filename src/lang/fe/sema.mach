@@ -60,6 +60,9 @@ fwd context.SemaDeps;
 fwd context.FieldEntry;
 fwd context.FieldTable;
 fwd context.SemaContext;
+fwd context.InstWorklist;
+fwd context.inst_worklist_new;
+fwd context.inst_worklist_free;
 fwd context.resolved_type_of;
 fwd context.module_sema_for;
 fwd context.decl_type_for;
@@ -95,6 +98,11 @@ pub fun sema(
     own_module: session.ModuleId
 ) R.Result[context.SemaResult, str] {
     var sc: context.SemaContext;
+    # the #2225 report set lives on the frame for the whole pass: the annotation sweep
+    # below and every per-instance re-validation episode the drain runs share it, so one
+    # ill-formed instantiation reached from several annotations is reported once.
+    var uni_reports: context.UniReports;
+    uni_reports.len = 0;
 
     val res_init: R.Result[bool, str] = init_context(?sc, s, a, rr, deps, ctx, own_module);
     if (R.is_err[bool, str](res_init)) {
@@ -123,6 +131,26 @@ pub fun sema(
         dnit_context(?sc);
         ret R.err[context.SemaResult, str](R.unwrap_err[bool, str](res_decls));
     }
+
+    # the recursive-type occurs-check (#2355). First of the post-decl rules: a type that
+    # contains itself by value has no layout, and every later rule that measures one
+    # fails closed on it and reports its own precondition instead of the real defect
+    # (#2356). Reads field tables, so it runs once `infer_all_decls` has built them.
+    infer.check_occurs_all(?sc);
+
+    # the mixed-secrecy union rule (#2224), for named and anonymous unions alike. Runs
+    # here rather than during decl inference or type resolution: the deep secrecy
+    # comparison reads the variants' field tables, which `infer_all_decls` has just
+    # finished building, so the rule no longer depends on declaration order.
+    infer.check_uni_secrecy_all(?sc);
+
+    # the same rule at every generic INSTANCE this module's annotations reach (#2225).
+    # Shares the placement and its reason: the walk reads field tables, so it runs once
+    # they all exist. Annotations inside a generic body are abstract here and deferred to
+    # the per-instance episodes below, which read them under the concrete substitution.
+    sc.has_secret  = generics.module_reaches_secret(s, sc.type_resolved_ty, a.type_len::u32);
+    sc.uni_reports = ?uni_reports;
+    check_annotation_uni_secrecy_all(?sc);
 
     # install the field / type-comparison resolvers so `comptime.eval` can fold a
     # `$each $fields(T)` body's gates during inference, selecting the live arm
@@ -160,11 +188,12 @@ pub fun sema(
     ret build_result(?sc);
 }
 
-# re-type a `$each a in va` pack-unroll body for one concrete element (#1475)
+# re-type a deferred `$each` body for one concrete element (#1475, #1523)
 #
-# A pack element's type is fixed only at the call site, so the body cannot be
-# typed at the original sema pass. At monomorphization the monomorphizer binds
-# the loop variable in the comptime context to the element's CT_KIND_PACK_ELEM
+# A pack element's type - and a `$fields(T)` unroll over a generic parameter - is
+# fixed only at monomorphization, so the body cannot be typed at the original sema
+# pass. This is therefore the ONLY pass that ever type-checks that body. The
+# monomorphizer binds the loop variable in the comptime context to the element's
 # descriptor (so `infer_ident` types `a` to the element type) and calls this to
 # write the body expressions' types into the origin module's shared `expr_type`
 # array - exactly the array lowering then reads. Distinct elements and instances
@@ -172,6 +201,24 @@ pub fun sema(
 # typing and emission), so one shared array suffices. The transient context
 # reuses the origin SemaResult's arrays in place rather than allocating, so it
 # must not be torn down.
+#
+# Being the sole typing pass over that body, it carries both halves of per-instance
+# validation rather than deferring them to the module sema pass that already ran:
+#
+#   - the enclosing instance's substitution (#2174), so a body naming a generic
+#     parameter is typed against the concrete instance type - which makes the
+#     #1645 leakage gates fire on a secret arriving through a parameter, and names
+#     the concrete type in every diagnostic the body raises; and
+#   - the caller's constant-time re-validation worklist (#2177), drained here
+#     rather than by the sema pass, so a generic instantiated only from inside this
+#     body is re-validated under its concrete type arguments like every other
+#     instantiation. The worklist is owned across a whole module's lowering, so its
+#     `drained` cursor validates each distinct instance exactly once.
+#
+# The episode is the whole body, not the `$each` alone: `reinfer_instance_body`
+# re-derives the enclosing statements' typing under the same substitution before the
+# unroll begins (#2254), so a `T`-typed local declared outside the `$each` reads back
+# as the instance type here.
 # ---
 # s:           the origin module's session
 # a:           the origin module's Ast (declares the pack-tailed template)
@@ -183,7 +230,11 @@ pub fun sema(
 # fn_ret:      the instance's semantic return type (checks any body `ret`)
 # body_start:  index of the first `$each` body statement
 # body_len:    number of `$each` body statements
-# ret:         true once the body is typed, or the first inference error
+# subst:       the enclosing instance's generic substitution, or nil outside one
+# subst_len:   number of substitution arguments
+# insts:       the caller-owned CT re-validation worklist, drained before returning
+# ret:         true once the body is typed and its instances re-validated, or the
+#              first inference error
 pub fun reinfer_pack_each_body(
     s:           *session.Session,
     a:           *ast.Ast,
@@ -194,7 +245,123 @@ pub fun reinfer_pack_each_body(
     sema_result: *context.SemaResult,
     fn_ret:      type.TypeId,
     body_start:  u32,
-    body_len:    u32
+    body_len:    u32,
+    subst:       *type.TypeId,
+    subst_len:   u32,
+    insts:       *context.InstWorklist
+) R.Result[bool, str] {
+    # the worklist is the caller's contract, not an optional extra: without one a
+    # generic instantiated from this body would be silently dropped from the CT
+    # re-validation - the #2177 disclosure - so a nil is a loud invariant break.
+    if (insts == nil) { ret R.err[bool, str]("internal: #2177 deferred-body re-inference: no constant-time re-validation worklist supplied (invariant violated)"); }
+
+    var sc: context.SemaContext;
+    sc.s          = s;
+    sc.a          = a;
+    sc.rr         = rr;
+    sc.deps       = deps;
+    sc.ctx        = ctx;
+    sc.own_module = own_module;
+    sc.source     = source_text_of(s, a);
+
+    sc.expr_type        = sema_result.expr_type;
+    sc.type_resolved_ty = sema_result.type_resolved_ty;
+    sc.decl_type        = sema_result.decl_type;
+    # no memo: an episode resolves under its instance's substitution, where the same
+    # node asks a different question per instantiation (#2334).
+    sc.type_resolved_memo = nil;
+
+    sc.callee_eid       = id.EXPR_NIL;
+    sc.in_comptime_gate = false;
+    sc.in_fin           = false;
+    sc.fin_loop_depth   = 0;
+    sc.subst            = subst;
+    sc.subst_len        = subst_len;
+    sc.subst_fn         = generics.substitute;
+    sc.insts            = insts;
+    sc.collect_insts    = true;
+    # a deferred body re-inferred at monomorphization is not reached THROUGH the
+    # worklist, so the instances it records begin their own chains (#2163).
+    sc.inst_depth       = 0;
+    sc.inst_parent      = context.INST_NONE;
+    sc.silent           = false;
+    sc.uni_check_fn     = generics.check_annotation_uni_secrecy;
+    # this episode is the sole typing pass over the body, so it carries the #2225 rule
+    # too. The precondition is memoized on the worklist it already owns: recomputing it
+    # per element would rescan the whole type universe once per unrolled copy.
+    sc.uni_reports      = ?insts.uni_reports;
+    sc.has_secret       = worklist_reaches_secret(insts, s, a, sema_result);
+
+    val res_body: R.Result[bool, str] = infer_stmt_list(?sc, body_start, body_len, fn_ret);
+    if (R.is_err[bool, str](res_body)) { ret res_body; }
+
+    ret drain_instances(?sc, deps);
+}
+
+# re-derive a monomorphized instance's whole body typing under its substitution
+# (#2254, #2257)
+#
+# A generic template's body is typed ONCE, at the module sema pass, against the raw
+# generic parameter; the instances are emitted later, from lowering, against the
+# concrete type arguments. The typing that pass left in the shared `expr_type` /
+# `decl_type` arrays is therefore the TEMPLATE's, and every lowering read of those
+# arrays - `expr_type_of`, `decl_type_for` - sees the bare `T` no matter which
+# instance is being emitted. Most of lowering is insulated from that because it
+# converts a semantic type to IR through `lower_type`, which applies the active
+# substitution; the reads that consume the semantic type DIRECTLY are not, and
+# `$type_of`'s operand resolver is one of them - so a comptime type gate folded
+# against the parameter and silently selected the fallback arm (#2257).
+#
+# Running this before an instance's body is lowered makes the shared arrays hold THAT
+# instance's typing for as long as it is being emitted, which is the invariant every
+# raw read already assumes. Instances are emitted one at a time, so one shared array
+# suffices; `lower_type`'s own substitution becomes idempotent rather than load-bearing.
+#
+# Substituting on the READ instead is unsound: `decl_type` is a derived table that
+# episodes rewrite IN PLACE, so a slot may already hold an instance type and a second
+# substitution composes onto it (measured: `Result[T, E]` becomes `Result[**T, *u8]`
+# and the standard library stops compiling). This re-derives instead - `infer_decl`
+# reads the syntactic annotation through `type_resolved_ty`, a pristine input written
+# once by `resolve_all_types` and never rewritten - so exactly one substitution is
+# ever applied, however many times the episode runs.
+#
+# It publishes typing state and reports nothing. Every statement it walks was already
+# checked by the module sema pass against the template parameter and, when a type
+# argument can newly trip a gate, by the CT re-validation drain against the instance's
+# concrete arguments; reporting here would duplicate all of that once per instance.
+# Recording is off for the same reason: those statements enqueue their instances on
+# both of the episodes that do report. A `$each` body inside stays deferred -
+# `infer_stmt_comptime_each` defers a pack sequence, and a `$fields(T)` over a
+# still-generic owner - so the per-element episode remains their sole (and reporting)
+# typing pass; on a pack-tailed template this is exactly the prologue that per-element
+# episode needs (#2254), since it reads the enclosing locals' slots back out of the
+# same shared table.
+# ---
+# s:           the origin module's session
+# a:           the origin module's Ast (declares the template)
+# rr:          the origin module's name-resolution output
+# deps:        typing snapshots spanning every module (see collect_module_deps)
+# ctx:         comptime context for the origin module
+# own_module:  ModuleId of the origin module
+# sema_result: the origin module's SemaResult, whose arrays this reuses in place
+# fn_ret:      the instance's semantic return type
+# body:        the template function's body statement
+# subst:       the instance's generic substitution (required: without one the walk
+#              re-derives the types it reads and there is nothing to publish)
+# subst_len:   number of substitution arguments
+# ret:         true once the body is re-typed, or the first inference error
+pub fun reinfer_instance_body(
+    s:           *session.Session,
+    a:           *ast.Ast,
+    rr:          *resolve.ResolveResult,
+    deps:        *context.SemaDeps,
+    ctx:         *comptime.ComptimeCtx,
+    own_module:  session.ModuleId,
+    sema_result: *context.SemaResult,
+    fn_ret:      type.TypeId,
+    body:        id.StmtId,
+    subst:       *type.TypeId,
+    subst_len:   u32
 ) R.Result[bool, str] {
     var sc: context.SemaContext;
     sc.s          = s;
@@ -208,18 +375,27 @@ pub fun reinfer_pack_each_body(
     sc.expr_type        = sema_result.expr_type;
     sc.type_resolved_ty = sema_result.type_resolved_ty;
     sc.decl_type        = sema_result.decl_type;
+    sc.type_resolved_memo = nil;
 
     sc.callee_eid       = id.EXPR_NIL;
     sc.in_comptime_gate = false;
     sc.in_fin           = false;
     sc.fin_loop_depth   = 0;
-    sc.subst            = nil;
-    sc.subst_len        = 0;
-    sc.subst_fn         = nil;
+    sc.subst            = subst;
+    sc.subst_len        = subst_len;
+    sc.subst_fn         = generics.substitute;
     sc.insts            = nil;
     sc.collect_insts    = false;
+    sc.inst_depth       = 0;
+    sc.inst_parent      = context.INST_NONE;
+    sc.silent           = true;
+    # a re-derivation prologue reports nothing, so it runs no #2225 walk either: the same
+    # annotations are walked by the reporting episode that follows.
+    sc.uni_check_fn     = nil;
+    sc.uni_reports      = nil;
+    sc.has_secret       = false;
 
-    ret infer_stmt_list(?sc, body_start, body_len, fn_ret);
+    ret infer_stmt(?sc, body, fn_ret);
 }
 
 # copy `n` TypeIds from `src` into `dst`
@@ -251,12 +427,35 @@ fun free_typeids(alloc: *A.Allocator, arr: *type.TypeId, n: usize) {
 # ret: true once drained, or the first internal error (gate violations are reported
 #      diagnostics, not errors)
 fun drain_revalidations(sc: *context.SemaContext) R.Result[bool, str] {
-    if (sc.insts == nil)          { ret R.ok[bool, str](true); }
-    if (sc.insts.len == 0)        { ret R.ok[bool, str](true); }
+    if (sc.insts == nil)                       { ret R.ok[bool, str](true); }
+    if (sc.insts.drained >= sc.insts.len)      { ret R.ok[bool, str](true); }
 
     val dr: R.Result[context.SemaDeps, str] = collect_module_deps(sc.s);
     if (R.is_err[context.SemaDeps, str](dr)) { ret R.err[bool, str](R.unwrap_err[context.SemaDeps, str](dr)); }
     var full_deps: context.SemaDeps = R.unwrap_ok[context.SemaDeps, str](dr);
+
+    val r: R.Result[bool, str] = drain_instances(sc, ?full_deps);
+    free_module_deps(sc.s, ?full_deps);
+    ret r;
+}
+
+# drain the worklist against an already-built module-deps snapshot (#2157, #2177)
+#
+# The drain proper, split out so an inference episode that already holds a
+# module-spanning snapshot - the lowering-time deferred-body re-inference, which
+# built one to resolve the body's cross-module references - reuses it rather than
+# rebuilding it per element. Reads each entry by value before re-validating, since
+# re-validation may grow the worklist (the owned `args` buffers are separate
+# allocations, so their pointers stay stable across that growth). The `drained`
+# cursor persists on the worklist, so repeated calls over one shared worklist
+# re-validate each distinct instance exactly once.
+# ---
+# sc:   the context owning the worklist and the diagnostic sink
+# deps: a module-spanning typing snapshot for cross-module instance bodies
+# ret:  true once drained, or the first internal error (gate violations are
+#       reported diagnostics, not errors)
+fun drain_instances(sc: *context.SemaContext, deps: *context.SemaDeps) R.Result[bool, str] {
+    if (sc.insts == nil) { ret R.ok[bool, str](true); }
 
     for (sc.insts.drained < sc.insts.len) {
         val idx:     u32              = sc.insts.drained;
@@ -266,15 +465,12 @@ fun drain_revalidations(sc: *context.SemaContext) R.Result[bool, str] {
         val args:    *type.TypeId     = sc.insts.items[idx].args;
         val arg_len: u32              = sc.insts.items[idx].arg_len;
 
-        val r: R.Result[bool, str] = revalidate_one(sc, ?full_deps, origin, decl, args, arg_len, sig);
-        if (R.is_err[bool, str](r)) {
-            free_module_deps(sc.s, ?full_deps);
-            ret r;
-        }
+        val depth:   u32              = sc.insts.items[idx].depth;
+
+        val r: R.Result[bool, str] = revalidate_one(sc, deps, origin, decl, args, arg_len, sig, idx, depth);
+        if (R.is_err[bool, str](r)) { ret r; }
         sc.insts.drained = sc.insts.drained + 1;
     }
-
-    free_module_deps(sc.s, ?full_deps);
     ret R.ok[bool, str](true);
 }
 
@@ -298,9 +494,13 @@ fun drain_revalidations(sc: *context.SemaContext) R.Result[bool, str] {
 # args:    the concrete type arguments (borrowed; live for this call)
 # arg_len: number of type arguments
 # sig:     the substituted signature (unused directly; the return type is re-resolved)
+# index:   this instance's worklist index, stamped as the parent of everything its
+#          body records so the derivation chain stays walkable (#2163)
+# depth:   this instance's own derivation depth
 # ret:     true on a validated (or skipped) instance, or an allocation error
 fun revalidate_one(sc: *context.SemaContext, deps: *context.SemaDeps, origin: session.ModuleId,
-                   decl_id: id.DeclId, args: *type.TypeId, arg_len: u32, sig: type.TypeId) R.Result[bool, str] {
+                   decl_id: id.DeclId, args: *type.TypeId, arg_len: u32, sig: type.TypeId,
+                   index: u32, depth: u32) R.Result[bool, str] {
     var oa:              *ast.Ast               = nil;
     var orr:             *resolve.ResolveResult = nil;
     var octx:            *comptime.ComptimeCtx  = nil;
@@ -374,6 +574,7 @@ fun revalidate_one(sc: *context.SemaContext, deps: *context.SemaDeps, origin: se
     tsc.source           = source_text_of(sc.s, oa);
     tsc.expr_type        = scratch_expr;
     tsc.type_resolved_ty = o_type_resolved;
+    tsc.type_resolved_memo = nil;
     tsc.decl_type        = scratch_decl;
     tsc.callee_eid       = id.EXPR_NIL;
     tsc.in_comptime_gate = false;
@@ -384,17 +585,42 @@ fun revalidate_one(sc: *context.SemaContext, deps: *context.SemaDeps, origin: se
     tsc.subst_fn         = generics.substitute;
     tsc.insts            = sc.insts;
     tsc.collect_insts    = true;
+    # every instance this body records is DERIVED from the one being re-validated:
+    # one link deeper, and linked back to it so the chain is nameable (#2163).
+    tsc.inst_depth       = depth + 1;
+    tsc.inst_parent      = index;
+    tsc.silent           = false;
+    tsc.uni_check_fn     = generics.check_annotation_uni_secrecy;
+    tsc.uni_reports      = sc.uni_reports;
+    tsc.has_secret       = sc.has_secret;
 
     val ret_ty: type.TypeId = context.resolved_type_of(?tsc, d.data.fun_.return_type);
 
+    # the signature is part of this episode's input, not only its body: a parameter typed
+    # `U[T]` that the body never names would otherwise be typed by nobody under the
+    # instance's arguments. The return type is covered by the read above.
+    var pi: u32 = 0;
+    for (pi < d.data.fun_.params_len) {
+        val ptn: *decl.TypedName = ?oa.typed_names[d.data.fun_.params_start + pi];
+        generics.check_annotation_uni_secrecy(?tsc, ptn.ty);
+        pi = pi + 1;
+    }
+
     # fold this body's comptime gates against the origin module via the transient
-    # context; restored to uninstalled afterward (the drain re-installs per instance).
-    val tscp: *context.SemaContext = ?tsc;
+    # context, then put back whatever was installed. the drain also runs during
+    # lowering (#2177), where the origin's context carries LOWERING's resolvers and
+    # the rest of that module's lowering still needs them - clearing them here would
+    # strip a live installation, so save and restore rather than clear.
+    val tscp:      *context.SemaContext = ?tsc;
+    val saved_ffn: *u8                  = octx.field_fn;
+    val saved_fd:  ptr                  = octx.field_data;
+    val saved_tfn: *u8                  = octx.type_fn;
+    val saved_td:  ptr                  = octx.type_data;
     comptime.set_field_resolver(octx, context.resolve_field_member::*u8, tscp::ptr);
     comptime.set_type_resolver(octx, context.resolve_type_comparison_operand::*u8, tscp::ptr);
     val res: R.Result[bool, str] = infer_stmt(?tsc, d.data.fun_.body, ret_ty);
-    comptime.set_field_resolver(octx, nil, nil);
-    comptime.set_type_resolver(octx, nil, nil);
+    comptime.set_field_resolver(octx, saved_ffn, saved_fd);
+    comptime.set_type_resolver(octx, saved_tfn, saved_td);
 
     free_typeids(sc.s.alloc, scratch_expr, oa.expr_len);
     free_typeids(sc.s.alloc, scratch_decl, oa.decl_len);
@@ -522,6 +748,7 @@ fun init_context(
 
     sc.expr_type        = nil;
     sc.type_resolved_ty = nil;
+    sc.type_resolved_memo = nil;
     sc.decl_type        = nil;
 
     sc.callee_eid       = id.EXPR_NIL;
@@ -533,6 +760,12 @@ fun init_context(
     sc.subst_fn         = nil;
     sc.insts            = nil;
     sc.collect_insts    = true;
+    sc.inst_depth       = 0;
+    sc.inst_parent      = context.INST_NONE;
+    sc.silent           = false;
+    sc.uni_check_fn     = generics.check_annotation_uni_secrecy;
+    sc.uni_reports      = nil;
+    sc.has_secret       = false;
 
     if (a.expr_len > 0) {
         val res_expr: R.Result[*type.TypeId, str] = typeid_array_alloc(s.alloc, a.expr_len);
@@ -549,6 +782,16 @@ fun init_context(
             ret R.err[bool, str](R.unwrap_err[*type.TypeId, str](res_type));
         }
         sc.type_resolved_ty = R.unwrap_ok[*type.TypeId, str](res_type);
+
+        # the memo is the main pass's alone (#2334): it is sized and cleared here, freed
+        # by `dnit_context`, and deliberately NOT carried on the SemaResult, so every
+        # later episode resolves afresh under its own substitution.
+        val res_memo: R.Result[*u8, str] = memo_array_alloc(s.alloc, a.type_len);
+        if (R.is_err[*u8, str](res_memo)) {
+            dnit_context(sc);
+            ret R.err[bool, str](R.unwrap_err[*u8, str](res_memo));
+        }
+        sc.type_resolved_memo = R.unwrap_ok[*u8, str](res_memo);
     }
     if (a.decl_len > 0) {
         val res_decl: R.Result[*type.TypeId, str] = typeid_array_alloc(s.alloc, a.decl_len);
@@ -586,6 +829,24 @@ fun typeid_array_alloc(a: *A.Allocator, len: usize) R.Result[*type.TypeId, str] 
     ret R.ok[*type.TypeId, str](arr);
 }
 
+# allocate a `len`-slot memo-state array, each slot TYPE_MEMO_NONE
+# ---
+# a:   allocator
+# len: number of state slots
+# ret: the allocated array, or an allocation error
+fun memo_array_alloc(a: *A.Allocator, len: usize) R.Result[*u8, str] {
+    val res_arr: R.Result[*u8, str] = A.allocate[u8](a, len);
+    if (R.is_err[*u8, str](res_arr)) { ret res_arr; }
+    val arr: *u8 = R.unwrap_ok[*u8, str](res_arr);
+
+    var i: u32 = 0;
+    for (i < len::u32) {
+        arr[i] = context.TYPE_MEMO_NONE;
+        i = i + 1;
+    }
+    ret R.ok[*u8, str](arr);
+}
+
 # the module's source text, used to read identifier spans during inference
 #
 # The driver registers Ast.file_id with the session before sema runs, and an Ast
@@ -620,10 +881,60 @@ fun dnit_context(sc: *context.SemaContext) {
     if (sc.decl_type != nil && sc.a.decl_len > 0) {
         A.deallocate[type.TypeId](sc.s.alloc, sc.decl_type, sc.a.decl_len);
     }
-    sc.expr_type        = nil;
-    sc.type_resolved_ty = nil;
-    sc.decl_type        = nil;
+    # `build_result` clears the three transferred handles but never this one: the memo
+    # does not outlive the pass, so it is always freed here (#2334).
+    if (sc.type_resolved_memo != nil && sc.a.type_len > 0) {
+        A.deallocate[u8](sc.s.alloc, sc.type_resolved_memo, sc.a.type_len);
+    }
+    sc.expr_type          = nil;
+    sc.type_resolved_ty   = nil;
+    sc.type_resolved_memo = nil;
+    sc.decl_type          = nil;
     context.inst_worklist_dnit(sc);
+}
+
+# the #2225 precondition for a lowering-time deferred body, memoized on the worklist
+#
+# The worklist is owned across one module's lowering, so the module-local reach is
+# computed once rather than per unrolled copy - a `$each` body is re-typed per element,
+# per instance, and each rescan would walk the whole annotation table again. Sound to
+# memoize: lowering resolves no new annotations, so the module's reach does not move.
+# ---
+# wl:          the worklist owning the memo
+# s:           the session
+# a:           the origin module's Ast
+# sema_result: the origin module's SemaResult (its resolved-annotation table)
+# ret:         true when some annotation of the origin module reaches a `^`
+fun worklist_reaches_secret(wl: *context.InstWorklist, s: *session.Session, a: *ast.Ast,
+                            sema_result: *context.SemaResult) bool {
+    if (wl == nil) { ret generics.module_reaches_secret(s, sema_result.type_resolved_ty, a.type_len::u32); }
+    if (wl.secret_state == context.SECRET_UNKNOWN) {
+        wl.secret_state = context.SECRET_ABSENT;
+        if (generics.module_reaches_secret(s, sema_result.type_resolved_ty, a.type_len::u32)) {
+            wl.secret_state = context.SECRET_PRESENT;
+        }
+    }
+    ret wl.secret_state == context.SECRET_PRESENT;
+}
+
+# apply the #2225 instance union-secrecy rule to every annotation in the module
+#
+# One enumeration of one thing: each syntactic type node, at the substitution the main
+# pass carries (none). Instances the module never spells are still reached, because the
+# walk descends the field graph of the ones it does - `rec Box[T] { u: U[T]; }` at
+# `Box[^u32]` materialises `U[^u32]` inside its own substituted table and never names it.
+# A node that failed to resolve holds TYPE_ERROR (a discarded comptime arm's names are
+# never looked up), which the walk skips - so an untaken `$if` arm stays unchecked.
+# ---
+# sc: the context, with `has_secret` and `uni_reports` already installed
+fun check_annotation_uni_secrecy_all(sc: *context.SemaContext) {
+    if (!sc.has_secret)             { ret; }
+    if (sc.type_resolved_ty == nil) { ret; }
+    var i: u32 = 0;
+    for (i < sc.a.type_len::u32) {
+        generics.check_annotation_uni_secrecy(sc, i);
+        i = i + 1;
+    }
 }
 
 # resolve every syntactic AstType into its interned semantic TypeId
@@ -832,9 +1143,10 @@ fun infer_decorator_args(sc: *context.SemaContext, d: *decl.Decl) {
 # validate every decorator on decl `d`
 #
 # Each must name a directive from the closed set (symbol / section / inline /
-# align / library), carry the right argument shape, and apply to a compatible
-# declaration. Diagnostics are reported against the offending span; sema does not
-# halt.
+# noinline / align / library), carry the right argument shape, and apply to a
+# compatible declaration. Diagnostics are reported against the offending span;
+# sema does not halt. A second, whole-decl pass then rejects the one directly
+# contradictory pair, `inline` + `noinline`.
 # ---
 # sc: the context
 # d:  the decl whose decorators to validate
@@ -843,6 +1155,32 @@ fun validate_decorators(sc: *context.SemaContext, d: *decl.Decl) {
     for (i < d.decorators_len) {
         validate_one_decorator(sc, d, ?sc.a.decorators[d.decorators_start + i]);
         i = i + 1;
+    }
+    validate_no_inline_conflict(sc, d);
+}
+
+# reject `#[inline]` and `#[noinline]` together on decl `d` (#2200)
+#
+# The pair is a direct contradiction -- force inlining and forbid it -- so
+# picking a winner would silently discard half of the user's intent. Both
+# decorators are named in the single diagnostic, reported at the `noinline`
+# site.
+# ---
+# sc: the context
+# d:  the decl whose decorators to cross-check
+fun validate_no_inline_conflict(sc: *context.SemaContext, d: *decl.Decl) {
+    var has_inline:   bool = false;
+    var has_noinline: bool = false;
+    var noinline_span: token.Span;
+    var i: u32 = 0;
+    for (i < d.decorators_len) {
+        val dec: *decl.Decorator = ?sc.a.decorators[d.decorators_start + i];
+        if (decorator_named(sc, dec, "inline"))   { has_inline = true; }
+        if (decorator_named(sc, dec, "noinline")) { has_noinline = true; noinline_span = dec.name; }
+        i = i + 1;
+    }
+    if (has_inline && has_noinline) {
+        context.report(sc, noinline_span, "`inline` and `noinline` decorators cannot both apply to the same function");
     }
 }
 
@@ -954,6 +1292,19 @@ fun validate_one_decorator(sc: *context.SemaContext, d: *decl.Decl, dec: *decl.D
         }
         ret;
     }
+    # the inverse of `inline` (#2200): pins a function out-of-line. `inline` and
+    # `noinline` together on one decl are rejected by validate_no_inline_conflict,
+    # below the per-decorator loop that calls this. legal and redundant alongside
+    # `scalar`, which already declines inlining as a side effect (#2141).
+    if (decorator_named(sc, dec, "noinline")) {
+        if (dec.args_len != 0) {
+            context.report(sc, dec.name, "`noinline` decorator takes no arguments");
+        }
+        if (d.kind != decl.DECL_KIND_FUN) {
+            context.report(sc, dec.name, "`noinline` decorator applies only to functions");
+        }
+        ret;
+    }
     # `#[oblivious]` marks a function as a constant-time boundary (#1646): the
     # backend must not introduce a secret-dependent branch, select a variable-latency
     # instruction on a secret operand, or dead-store-eliminate a zeroizing write to
@@ -1004,7 +1355,109 @@ fun validate_one_decorator(sc: *context.SemaContext, d: *decl.Decl, dec: *decl.D
         }
         ret;
     }
-    context.report(sc, dec.name, "unknown decorator; valid directives are symbol, section, inline, align, library, oblivious, scalar");
+    # `#[naked]` suppresses the prologue and epilogue outright (#2198): the body is
+    # emitted exactly as written and the author owns the frame, the stack alignment,
+    # the link register and the return.
+    if (decorator_named(sc, dec, "naked")) {
+        validate_naked(sc, d, dec);
+        ret;
+    }
+    context.report(sc, dec.name, "unknown decorator; valid directives are symbol, section, inline, noinline, align, library, oblivious, scalar, naked");
+}
+
+# validate a `#[naked]` decorator: its argument shape, its target, the decorators it
+# cannot be combined with, and its body restriction
+#
+# The body restriction is the load-bearing one. Every non-asm statement a naked body
+# could hold - a local, an expression, a `ret` - lowers to code that assumes a frame
+# the function does not have, and the result runs and returns a wrong answer rather
+# than failing. Clang and GCC restrict a naked body to basic asm and Rust requires
+# `naked_asm!` for the same reason; mach rejects it outright.
+# ---
+# sc:  the context
+# d:   the decorated decl
+# dec: the `naked` decorator
+fun validate_naked(sc: *context.SemaContext, d: *decl.Decl, dec: *decl.Decorator) {
+    if (dec.args_len != 0) {
+        context.report(sc, dec.name, "`naked` decorator takes no arguments");
+    }
+    if (d.kind != decl.DECL_KIND_FUN) {
+        context.report(sc, dec.name, "`naked` decorator applies only to functions");
+        ret;
+    }
+    # inlining a naked function would splice a body that owns its own frame into one
+    # that has its own; there is no winner to pick, so the combination is refused.
+    if (has_decorator(sc, d, "inline")) {
+        context.report(sc, dec.name, "`naked` and `inline` decorators are mutually exclusive; a naked function cannot be inlined");
+    }
+    # `ctvalidate` already forbids inline asm inside an `#[oblivious]` function (#1648)
+    # because a type system cannot check it, and a naked body is nothing but asm.
+    if (has_decorator(sc, d, "oblivious")) {
+        context.report(sc, dec.name, "`naked` and `oblivious` decorators are mutually exclusive; a naked body is inline asm, which `oblivious` forbids");
+    }
+    if (d.data.fun_.body == id.STMT_NIL) {
+        context.report(sc, dec.name, "`naked` decorator applies only to a function with a body");
+        ret;
+    }
+    check_naked_body(sc, d.data.fun_.body);
+}
+
+# report every statement in a `#[naked]` function's body that is not inline asm
+#
+# A block is transparent (the function body itself is one) and so is a comptime `$if`
+# chain, which is how mach spells per-ISA asm dispatch - `$if ($mach.build.arch ==
+# $mach.arch.x86_64) { asm x86_64 { ... } }`. Both arms of the chain are walked rather
+# than the selected one: the restriction is a property of the source, so it holds for
+# every target the file could be built for, not only this one.
+# ---
+# sc:  the context
+# sid: the statement to check
+fun check_naked_body(sc: *context.SemaContext, sid: id.StmtId) {
+    val opt_stmt: O.Option[*stmt.Stmt] = ast.get_stmt(sc.a, sid);
+    if (O.is_none[*stmt.Stmt](opt_stmt)) { ret; }
+    val s: *stmt.Stmt = O.unwrap[*stmt.Stmt](opt_stmt);
+
+    if (s.kind == stmt.STMT_KIND_ASM) { ret; }
+
+    if (s.kind == stmt.STMT_KIND_BLOCK) {
+        var i: u32 = 0;
+        for (i < s.data.block.stmts_len) {
+            check_naked_body(sc, sc.a.stmt_ids[s.data.block.stmts_start + i]);
+            i = i + 1;
+        }
+        ret;
+    }
+
+    if (s.kind == stmt.STMT_KIND_COMPTIME_IF) {
+        var b: u32 = 0;
+        for (b < s.data.comptime_if.branches_len) {
+            val br: *decl.ComptimeBranch = ?sc.a.comptime_branches[s.data.comptime_if.branches_start + b];
+            var i: u32 = 0;
+            for (i < br.body_len) {
+                check_naked_body(sc, sc.a.stmt_ids[br.body_start + i]);
+                i = i + 1;
+            }
+            b = b + 1;
+        }
+        ret;
+    }
+
+    context.report(sc, s.span, "a `naked` function's body may contain only inline `asm` statements");
+}
+
+# whether decl `d` carries a decorator named `name`
+# ---
+# sc:   the context (its source text)
+# d:    the decl to inspect
+# name: the directive name to match
+# ret:  true when `d` carries it
+fun has_decorator(sc: *context.SemaContext, d: *decl.Decl, name: str) bool {
+    var i: u32 = 0;
+    for (i < d.decorators_len) {
+        if (decorator_named(sc, ?sc.a.decorators[d.decorators_start + i], name)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # the return type a `test` body is checked against: the interned i32 primitive
