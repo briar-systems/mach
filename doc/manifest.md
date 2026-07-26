@@ -112,7 +112,7 @@ to whichever *declared* target matches the host.
 | Axis  | Values |
 |-------|--------|
 | `isa` | `x86_64`, `aarch64`, `riscv64`, `spirv`, `mos6502` |
-| `os`  | `linux`, `windows`, `darwin`, `freestanding` |
+| `os`  | `linux`, `windows`, `darwin`, `freestanding`, `bmos` |
 | `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `spirv`, `mos6502` |
 
 `x86_64`/`linux`/`sysv64` is the primary host and target. `aarch64`-linux builds
@@ -121,8 +121,12 @@ self-hosts (#1852). `windows` is a supported cross-compilation target (PE/COFF,
 Win64 ABI). `darwin` is validated end-to-end on both architectures: each
 self-hosts to a three-generation fixpoint on a native macOS runner and ships a
 release archive. `freestanding` targets a raw flat image with no OS runtime.
-`spirv` is not a machine at all — it emits a finished GPU module rather than
-machine code (see [Finished-module targets](#finished-module-targets)).
+`bmos` targets [BareMetal](https://github.com/ReturnInfinity/BareMetal), an
+x86-64 exokernel that loads a flat image at a fixed address and enters it with a
+`call` (see [bmos targets](#bmos-targets)); it is a real OS with its own load
+contract, not a spelling of `freestanding`. `spirv` is not a machine at all — it
+emits a finished GPU module rather than machine code (see
+[Finished-module targets](#finished-module-targets)).
 
 `mach info targets` prints the tuples this binary can actually build; it is
 derived from the same declarations composition reads, so it never advertises a
@@ -134,10 +138,11 @@ than silently never matching.
 ### Object-format override
 
 `of` overrides the object format a target implies. Each os has a default format —
-`linux` → `elf`, `windows` → `coff`, `darwin` → `macho`, `freestanding` → `raw` —
-and `of` names a different one from the same closed set: `elf`, `coff`, `macho`,
-`raw`, `spv`. It is the only optional key on a target; omit it to take the
-default.
+`linux` → `elf`, `windows` → `coff`, `darwin` → `macho`, `freestanding` → `raw`,
+`bmos` → `raw` — and `of` names a different one from the same closed set: `elf`,
+`coff`, `macho`, `raw`, `spv`. It is the only optional key on a target; omit it to
+take the default. An os accepts only the formats it can load, so an override the
+os cannot enter is refused (`bmos`, whose loader reads raw bytes, takes no other).
 
 ```toml
 [target.metal]
@@ -180,6 +185,39 @@ The artifact's `out` template and `-o` name a linked binary, which such a target
 has none of; the module tree is delivered instead. A `static` or `shared`
 artifact kind, and `mach test`, are refused by name — there is no archive, shared
 object, or executable form for a module.
+
+### bmos targets
+
+`bmos` is [BareMetal](https://github.com/ReturnInfinity/BareMetal), Return
+Infinity's x86-64 exokernel. Its load contract, not this compiler, fixes every
+parameter of the build:
+
+```toml
+[target.x86_64-bmos]
+isa = "x86_64"
+os  = "bmos"
+abi = "sysv64"
+# no `of`: bmos's default (and only) object format is "raw"
+```
+
+- The artifact is a **flat binary** — no header, no sections, no entry record.
+  The kernel copies the file's bytes verbatim to its load address.
+- That address is **fixed at `0xFFFF800000000000`** and the loader relocates
+  nothing, so the image is never position-independent.
+- Execution begins at the **first byte of the image**, which the kernel reaches
+  with a `call`. The entry function is marked `#[symbol("_start")]`, and it must
+  be the only function or the first one emitted, since a flat image cannot say
+  where else to enter. An entry anywhere but the base is refused at link.
+- A program **exits by returning**: the entry function's `ret` goes back to the
+  kernel's command loop. There is no exit syscall.
+
+`bmos` is x86-64 only — the kernel is x86-64 assembly and has been ported nowhere
+else — and any other instruction set is refused at composition (`operating system
+'bmos' does not run on instruction set 'aarch64'`).
+
+Two facts the kernel leaves to the program, which no part of the compiler
+supplies: the stack is not guaranteed 16-byte aligned at entry, and `.bss` is not
+zeroed (a flat image stores file bytes only). Both belong to a bmos startup shim.
 
 ## `[profile.<name>]`
 
