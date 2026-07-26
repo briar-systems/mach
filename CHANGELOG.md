@@ -5,6 +5,194 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.0] - 2026-07-26
+
+124 merged pull requests. **Three of its fixes are wrong-answer defects present in
+released 4.2.2** — narrow integer arithmetic that skipped its truncation, every
+signed *secret* operation emitted in its unsigned form, and a field-wise `$each`
+compare that read every field at the last field's type. All three are silent: no
+diagnostic, no crash, wrong values. If you are on 4.2.2 read
+[Affects 4.2.2](#affects-422) below and check whether your code has the shape.
+
+Around them: **`bmos` joins linux / darwin / windows / freestanding** as a target
+operating system — ReturnInfinity's BareMetal x86-64 exokernel — the middle end
+gains loop-invariant code motion, scalar replacement of aggregates and three more
+vectorization forms, SPIR-V grows structured control flow and calls, mos6502 grows
+wide scalars and legalized shifts, and inline assembly becomes one parser across
+all three ISAs with `#[naked]`, `#[noinline]`, aarch64 `msr`/`mrs`, and the
+x86-64 indirect `call` forms. The standard library moves to **mach-std 0.19.0**.
+Built with mach 4.2.2.
+
+(**The constant-time support in this release remains an experimental preview and
+its guarantee is not complete.** Several of the disclosures 4.2.2 carried are
+closed here — the generic reflection-projection leak (#2168), the deferred
+`$each` re-validation gap (#2177, #2174), the secret address gate and literal
+shift count (#2195, #2196), and secret field/index resolution (#2297) — and the
+signed-opcode defect below was itself a constant-time correctness hole. The `^` /
+`#[oblivious]` surface still has not been audited end to end. **Do not build
+production cryptography on this version.** Epic #1643 stays open.)
+
+### Affects 4.2.2
+
+All three were verified by execution against the shipped 4.2.2 compiler, not by
+reading the diff — each is a program whose output carries the answer, run on both
+profiles.
+
+- **Narrow (`u8` / `u16`) arithmetic kept its full 32-bit register content
+  instead of truncating to the declared width.** Any later operation that reads
+  the high bits then computed on bits that are not part of the value — `>>` and
+  `<<` are the ones that do.
+
+  ```
+  (0 - a) >> 7   at u8,  a = 1   want 1   4.2.2 gives 255
+  (0 - a) >> 15  at u16, a = 1   want 1   4.2.2 gives 65535
+  (a << 1) >> 1  at u8,  a = 255 want 127 4.2.2 gives 255
+  ```
+
+  Wrong on **both profiles**. An explicit `::u8` cast did not save it; an
+  explicit `& 0xFF` mask saved it at `opt=0` but not at `opt=2`. The value was
+  truncated only when it crossed a store, a call argument, a return into a narrow
+  slot, or a widening cast — which is why code that merely stores narrow results
+  never saw it, and why it surfaced from byte-width comparison work in
+  `crypto.ct` rather than from the test corpus (#2357).
+
+- **Every signed *secret* operation was emitted in its unsigned form.** The three
+  classifiers that answer a type's width, signedness and float-ness read the raw
+  type without stripping the `^` qualifier, so `^i32` reported *0 bits, unsigned*
+  — and `is_signed_type` is what picks the opcode for shifts and comparisons.
+
+  ```
+  ^i32 >> 4        on -64      want -4  4.2.2 gives 268435452   (shr_u for shr_s)
+  ^i8  >> 2        on -64      want -16 4.2.2 gives 48
+  ^i32 < ^i32      on (-64, 1) want 1   4.2.2 gives 0           (cmp_lt_u for cmp_lt_s)
+  ^i32 <= ^i32     on (-64, 1) want 1   4.2.2 gives 0
+  ```
+
+  **No dirty-operand precondition — wrong on every input, on both profiles.**
+  The same omission made every secret-to-secret `::` cast a *width-changing*
+  bitcast, which is malformed IR: `^i8 -1` widened to 255, and a widened `^u8`
+  read uninitialized register residue, so that face was non-deterministic across
+  builds. `--verify-ir` did not catch it, because the verifier constrains a
+  conversion's arity but never relates its result width to its operand width
+  (recorded on #2288).
+
+  **Shipped `crypto.ct` was not corrupted by this** — it contains the malformed
+  cast in four places, but has no signed secret types at all, and an `& 1`
+  immediately before each cast is emitted at register width with an immediate
+  that clears every high bit. That is a property of the current lowering, not a
+  guarantee the source expresses (#2373).
+
+- **A `$each f in $fields(T)` body read every field at the LAST field's type**, so
+  a field-wise compare reported two **identical** records as unequal. The typing
+  arrays hold one stamp per expression node and the body is walked once per
+  field, so whatever the last field left behind is what every emitted copy read.
+
+  Reading identical bytes at the wrong type still compares equal for almost every
+  type, which is why this survived so long. **It becomes visible exactly when the
+  wrong type turns the bit pattern into a NaN**, since `NaN != NaN`:
+
+  ```
+  rec M4 { i: i32; u: u16; f: f64; g: f32; }
+  ```
+
+  `M4`'s first field holding `i32 -2` (`0xFFFFFFFE`) read as `f32` is a NaN, so a
+  record compared against **itself** reported field 1 unequal, and every differing
+  pair reported field 1 whichever field actually differed. The same record ending
+  in `f64` instead reports nothing — `0xFFFFFFFE` inside an `f64` is a denormal,
+  not a NaN.
+
+  In released 4.2.2 this affects the **concrete** unroll — a `$each` over a named
+  record — on both profiles. The **generic** unroll (`$each` over a type
+  parameter) answered correctly in 4.2.2; it regressed later on `dev` via #2286
+  and is fixed here by the same change, so it never reached a release. Both
+  unrolls are pinned by `int/regression/2376-fields-each-per-element` (#2376).
+
+### Added
+- **`bmos`, a new target operating system**: ReturnInfinity's
+  [BareMetal](https://github.com/ReturnInfinity/BareMetal) x86-64 exokernel. A
+  real OS with its own load contract rather than a spelling of `freestanding` —
+  a container-free flat image, loaded at a fixed `0xFFFF800000000000`, entered at
+  its first byte with a `call`, and exited by returning. x86-64 only; any other
+  instruction set is refused at composition. The stack is not 16-byte aligned at
+  entry and `.bss` is not zeroed — both belong to a startup shim, and both are
+  documented in `doc/manifest.md` (#2396).
+- **A joint (os, isa) capability on the target vtable.** Each operating system
+  declares the architectures it runs on, alongside the object formats it can
+  load. The object format could not stand in for this: an isa-agnostic flat image
+  covers every architecture, so an OS defaulting to `raw` would otherwise be
+  advertised on every machine with an encoder (#2396).
+- **x86-64 indirect `call`**: `call rax`, `call [0x100018]`, `call [rax + 8]`.
+  The absolute form (`ff 14 25 <disp32>`) reaches a fixed-address ABI, whose
+  entry points are addresses rather than symbols. `.byte` also gains its own
+  bound — one directive now carries a whole sequence rather than four values,
+  and a value that does not fit in a byte is refused instead of truncated
+  (#2398).
+- **`#[naked]`** — a function with no prologue or epilogue, whose body may hold
+  only inline asm — and **`#[noinline]`**, the inverse of `#[inline]` (#2198,
+  #2200).
+- **One inline-asm parser across all three ISAs.** x86-64, aarch64 and riscv64
+  now share the statement grammar, the effect model and the numeric-local-label
+  scope; each supplies only its mnemonic table and encoder. aarch64 gains
+  `msr`/`mrs`, so `PSTATE.DIT` is settable from Mach source (#2243, #2253,
+  #2258, #2352).
+- **Middle end**: loop-invariant code motion, scalar replacement of aggregates,
+  conservative copy coalescing, and leaf frame elision (#2204, #1940).
+- **Vectorization**: module-scope arrays and loop-invariant scalars, affine loop
+  indices, and fast-math-gated float reduction (#2312).
+- **SPIR-V v2**: structured control flow and function calls, and
+  `freestanding-spirv` builds a `.spv` end to end (#2120).
+- **mos6502**: wide scalars built on a narrow-register target, and a constant-count
+  wide shift plus a runtime public-count shift legalized as a masked barrel
+  (#2217).
+- **`--emit-asm` renders aarch64 and riscv64 from the encoder's instruction
+  stream**, as x86-64 already did, so the `.s` is what was emitted rather than a
+  second printer's account of it.
+
+### Changed
+- **The standard library moves to mach-std 0.19.0** (`eff1e8e` → `fad0355`),
+  which carries the string / io / filesystem overhaul and the `crypto.ct`
+  constant-time primitives.
+- `x86_64-darwin` is a released target again, on native Intel runners rather than
+  Rosetta (#2104, #2327).
+- Internal structure, no behaviour change: `IsaVTable` split by target family
+  (#2213), the relocation applier became a contract the ISA declares, both type
+  universes fold through one layout policy (#2289), and every `MirInstr` and
+  machine operand is built through a constructor rather than field by field
+  (#2215, #2358) — the change that makes a dropped field a compile error instead
+  of a silent miscompile.
+
+### Fixed
+- **Secrecy and constant-time**: a generic instantiated inside a variadic-pack
+  `$each` body is re-validated (#2177, #2174); reflection projection inside a
+  generic no longer erases a secret field's secrecy (#2168); the secret address
+  gate, the literal shift count, and an unsound placement comparison are
+  corrected (#2195, #2196); `^` is stripped before resolving a field or index of
+  a secret container (#2297) and before classifying a type's machine shape
+  (#2373); `#[oblivious]` is refused on a whole-module-emitter target (#2189).
+- **Generics and comptime**: a pack instance is keyed on its generic type-args
+  (#2251) and its whole body re-typed (#2254); a generic union's variants are re-checked
+  at the instance and a union instance lays out as a union (#2225, #2239);
+  comptime type gates and module-scope vals fold against what they actually name
+  (#2257, #2206); instantiation depth and count are bounded (#2163); a generic
+  template no longer emits a bare body (#2302); a `rec`/`uni` that contains
+  itself by value is rejected instead of segfaulting the compiler (#2355, #2356);
+  a generic type named without its type arguments, and the address of an
+  uninstantiated generic, are both rejected (#2311, #2305).
+- **Codegen**: an indirect scalar is returned by value (#2195 was a real
+  miscompile, not a validator over-taint); multi-block and memory-tested loops
+  rotate; x86-64 scalar float ops take the two-address form; vector lane access
+  has a register-resident form; `-0.0` is spellable; an 8-byte scalar reports its
+  width as 8 rather than as the machine word (#2346); same-register copies the
+  machine says write nothing are deleted (#2275).
+- **Diagnostics**: a type node resolves once per pass, so a diagnostic fires once
+  instead of two or three times (#2334); a layout depth bound is given to the
+  caller and names the real failure cause rather than reporting the wrong one
+  (#2368); a comptime intrinsic's type operand is read with the type grammar
+  (#2178); an unbound identifier reports the invariant breach instead of falling
+  through (#2144).
+- **Windows**: `std.system.panic` on Windows no longer compiles darwin syscalls
+  (mach-std#397); COFF gains `/bigobj` support.
+
 ## [4.2.2] - 2026-07-24
 
 The correctness release. Two of its fixes carry it: on mos6502 a secret integer
