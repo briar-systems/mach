@@ -215,9 +215,14 @@ abi = "sysv64"
 else — and any other instruction set is refused at composition (`operating system
 'bmos' does not run on instruction set 'aarch64'`).
 
-Two facts the kernel leaves to the program, which no part of the compiler
-supplies: the stack is not guaranteed 16-byte aligned at entry, and `.bss` is not
-zeroed (a flat image stores file bytes only). Both belong to a bmos startup shim.
+One fact the kernel leaves to the program: **the stack is not guaranteed 16-byte
+aligned at entry**, so a startup shim must align it before calling anything that
+may use SSE. BareMetal's own `crt0.c` does exactly this.
+
+Zero-initialized data needs no such step. A flat image spans its whole memory
+extent, so `.bss` is stored as the zero bytes it is and arrives zeroed with the
+rest of the image (#2402) — an image costs its bss size in file bytes, and nothing
+has to zero anything at startup.
 
 ## `[profile.<name>]`
 
