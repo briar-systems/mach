@@ -10,9 +10,17 @@
 # A flat image carries no entry record: execution begins at the image base (the
 # reset vector / load address jumps there), so the program entry must sit at
 # `image_base`. `emit_exec` rejects an entry that is not the image base rather
-# than silently producing an image that enters at the wrong address. Only file
-# bytes (`filesz`) are stored - a trailing zero-fill (`memsz > filesz`, bss) is
-# not written, since bare-metal startup zeroes bss itself.
+# than silently producing an image that enters at the wrong address.
+#
+# THE IMAGE SPANS `memsz`, NOT `filesz`: a zero-initialized segment (bss) is
+# stored as the zero bytes it is. This writer used to store file bytes only and
+# say bare-metal startup would zero bss itself - but the linker exports no
+# `__bss_start` / `__bss_end`, so no startup could find the region, and the bytes
+# were simply absent from the image and never written by anyone (#2402). A flat
+# image has exactly one contract - the loader copies these bytes to this address -
+# and an unbacked tail is outside it. Storing the zeros costs the image its bss
+# size and removes the whole class of "global read before anything initialized
+# it", rather than leaving a startup obligation nothing can discharge.
 #
 # `emit_object` and `emit_dyn_exec` are unsupported - a flat image is neither a
 # relocatable object nor a dynamically-linked executable - and return a clear
@@ -47,10 +55,11 @@ val RAW_UNSUPPORTED: str = "raw output supports only executables";
 #
 # The image base is the lowest segment virtual address; each segment's file bytes
 # are copied at offset `vaddr - image_base`, and the inter-segment gaps are left
-# zero (the buffer is zero-allocated). The total size spans from the image base
-# to the highest segment file end. Only `filesz` bytes are stored; a trailing
-# zero-fill (memsz > filesz) is not written. Reports the image base and total
-# size through `out_base`/`out_size`.
+# zero (the buffer is zero-allocated). The total size spans from the image base to
+# the highest segment's MEMORY end, so a zero-initialized segment contributes its
+# whole length: the buffer is already zero there and the copy loop simply has no
+# bytes to move for it. That is what puts bss in the file (#2402). Reports the
+# image base and total size through `out_base`/`out_size`.
 # ---
 # alloc:     allocator backing the returned buffer
 # segs:      loadable segments (need not be sorted; the base is the minimum vaddr)
@@ -63,11 +72,11 @@ fun build_flat_image(alloc: *A.Allocator, segs: *of.LoadSegment, seg_count: u32,
     if (seg_count == 0) { ret R.err[*u8, str]("raw: no loadable segments"); }
 
     var base: u64 = segs[0].vaddr;
-    var end:  u64 = segs[0].vaddr + segs[0].filesz::u64;
+    var end:  u64 = segs[0].vaddr + segs[0].memsz::u64;
     var i: u32 = 1;
     for (i < seg_count) {
-        if (segs[i].vaddr < base)                      { base = segs[i].vaddr; }
-        if (segs[i].vaddr + segs[i].filesz::u64 > end) { end  = segs[i].vaddr + segs[i].filesz::u64; }
+        if (segs[i].vaddr < base)                     { base = segs[i].vaddr; }
+        if (segs[i].vaddr + segs[i].memsz::u64 > end) { end  = segs[i].vaddr + segs[i].memsz::u64; }
         i = i + 1;
     }
 
@@ -350,6 +359,66 @@ test "mach.lang.target.of.raw.emit_exec:flat_layout" {
     # the second segment lands at file offset 0x10 (its vaddr 0x1010 minus base).
     if (b.data[0x10] != 0xDE) { vector.dnit[u8](?b); ret 1; }
     if (b.data[0x13] != 0xEF) { vector.dnit[u8](?b); ret 1; }
+
+    vector.dnit[u8](?b);
+    ret 0;
+}
+
+# a zero-initialized segment is STORED, as the zero bytes it is
+#
+# The shape #2402 was found on: a bss segment carries `memsz` with `filesz` 0 and a
+# nil `bytes`, and the image used to end at the last FILE byte - so those bytes were
+# outside the file, and the loader (which copies the file and nothing else) left
+# whatever the memory held. Nothing zeroed them and nothing could: the linker exports
+# no `__bss_start` / `__bss_end` for a startup to find.
+#
+# The assertion that matters is the LENGTH: a writer that reverts to `filesz` produces
+# an image ending at 0x8 and every zero check below becomes vacuous, because there is
+# nothing to read.
+test "mach.lang.target.of.raw.emit_exec:bss_is_stored_as_zeroes" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+
+    var code_bytes: [8]u8;
+    code_bytes[0] = 0xEB; code_bytes[1] = 0xFE; code_bytes[2] = 0x90; code_bytes[3] = 0x90;
+    code_bytes[4] = 0x90; code_bytes[5] = 0x90; code_bytes[6] = 0x90; code_bytes[7] = 0x90;
+
+    # text at the base, then a 64-byte bss directly after it: memsz 64, no file bytes.
+    var segs: [2]of.LoadSegment;
+    segs[0].vaddr = 0x1000; segs[0].filesz = 8; segs[0].memsz = 8;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?code_bytes[0];
+    segs[1].vaddr = 0x1008; segs[1].filesz = 0; segs[1].memsz = 64;
+    segs[1].flags = of.SEG_FLAG_READ | of.SEG_FLAG_WRITE; segs[1].bytes = nil;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "raw_bss");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[bool, str] =
+        emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 2, 4096, 0x1000, nil::*of.ExecFunction, 0, nil::*of.Section, 0, tpath::*u8, "rawbss"::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rr: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rr)) { ret 1; }
+    var b: Vector[u8] = R.unwrap_ok[Vector[u8], str](rr);
+
+    # 8 bytes of text plus the bss's whole 64: the image spans memory, not file bytes.
+    if (b.len != 72) { vector.dnit[u8](?b); ret 1; }
+
+    if (b.data[0] != 0xEB) { vector.dnit[u8](?b); ret 1; }
+    if (b.data[7] != 0x90) { vector.dnit[u8](?b); ret 1; }
+
+    # every byte of the bss region is present and zero.
+    var k: usize = 8;
+    for (k < 72) {
+        if (b.data[k] != 0x00) { vector.dnit[u8](?b); ret 1; }
+        k = k + 1;
+    }
 
     vector.dnit[u8](?b);
     ret 0;
