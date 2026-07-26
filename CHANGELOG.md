@@ -7,10 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [4.3.0] - 2026-07-26
 
-124 merged pull requests. **Two of its fixes are wrong-answer defects present in
-released 4.2.2** — narrow integer arithmetic that skipped its truncation, and
-every signed *secret* operation emitted in its unsigned form. Both are silent:
-no diagnostic, no crash, wrong values. If you are on 4.2.2 read
+124 merged pull requests. **Three of its fixes are wrong-answer defects present in
+released 4.2.2** — narrow integer arithmetic that skipped its truncation, every
+signed *secret* operation emitted in its unsigned form, and a field-wise `$each`
+compare that read every field at the last field's type. All three are silent: no
+diagnostic, no crash, wrong values. If you are on 4.2.2 read
 [Affects 4.2.2](#affects-422) below and check whether your code has the shape.
 
 Around them: **`bmos` joins linux / darwin / windows / freestanding** as a target
@@ -33,9 +34,9 @@ production cryptography on this version.** Epic #1643 stays open.)
 
 ### Affects 4.2.2
 
-Both were verified by execution against the shipped 4.2.2 compiler, not by
-reading the diff — each is a program whose exit status carries the answer, run on
-both profiles.
+All three were verified by execution against the shipped 4.2.2 compiler, not by
+reading the diff — each is a program whose output carries the answer, run on both
+profiles.
 
 - **Narrow (`u8` / `u16`) arithmetic kept its full 32-bit register content
   instead of truncating to the declared width.** Any later operation that reads
@@ -81,11 +82,30 @@ both profiles.
   that clears every high bit. That is a property of the current lowering, not a
   guarantee the source expresses (#2373).
 
-**Not affected: the `$each $fields` field-wise compare (#2376).** It reported two
-identical records as unequal, but the defect was introduced *after* 4.2.2 by
-#2286 and fixed by #2380 inside this same release window; released 4.2.2 answers
-correctly on both the concrete and the generic path, on both profiles, verified
-the same way. It never reached a release.
+- **A `$each f in $fields(T)` body read every field at the LAST field's type**, so
+  a field-wise compare reported two **identical** records as unequal. The typing
+  arrays hold one stamp per expression node and the body is walked once per
+  field, so whatever the last field left behind is what every emitted copy read.
+
+  Reading identical bytes at the wrong type still compares equal for almost every
+  type, which is why this survived so long. **It becomes visible exactly when the
+  wrong type turns the bit pattern into a NaN**, since `NaN != NaN`:
+
+  ```
+  rec M4 { i: i32; u: u16; f: f64; g: f32; }
+  ```
+
+  `M4`'s first field holding `i32 -2` (`0xFFFFFFFE`) read as `f32` is a NaN, so a
+  record compared against **itself** reported field 1 unequal, and every differing
+  pair reported field 1 whichever field actually differed. The same record ending
+  in `f64` instead reports nothing — `0xFFFFFFFE` inside an `f64` is a denormal,
+  not a NaN.
+
+  In released 4.2.2 this affects the **concrete** unroll — a `$each` over a named
+  record — on both profiles. The **generic** unroll (`$each` over a type
+  parameter) answered correctly in 4.2.2; it regressed later on `dev` via #2286
+  and is fixed here by the same change, so it never reached a release. Both
+  unrolls are pinned by `int/regression/2376-fields-each-per-element` (#2376).
 
 ### Added
 - **`bmos`, a new target operating system**: ReturnInfinity's
@@ -150,8 +170,7 @@ the same way. It never reached a release.
   a secret container (#2297) and before classifying a type's machine shape
   (#2373); `#[oblivious]` is refused on a whole-module-emitter target (#2189).
 - **Generics and comptime**: a pack instance is keyed on its generic type-args
-  (#2251) and its whole body re-typed (#2254); a `$each $fields` body is re-typed
-  per element in every unroll (#2376); a generic union's variants are re-checked
+  (#2251) and its whole body re-typed (#2254); a generic union's variants are re-checked
   at the instance and a union instance lays out as a union (#2225, #2239);
   comptime type gates and module-scope vals fold against what they actually name
   (#2257, #2206); instantiation depth and count are bounded (#2163); a generic
