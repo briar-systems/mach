@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.1] - 2026-07-26
+
+A dependency move and one flat-image fix. The standard library advances to
+**mach-std 0.20.0**, which carries the BareMetal arm — `std.system.bmos`'s kernel
+call table, `std.runtime.bmos`'s entrypoint, and a `std.system.panic` arm that
+terminates. Together with 4.3.0's `bmos` target and indirect `call`, a BareMetal
+program can now be written in Mach against the standard library.
+
+**The pin move adds nothing to a hosted compiler.** mach-std's new modules gate
+their declarations on `$mach.build.os == $mach.os.bmos`, so a linux, darwin or
+windows build links none of them: the compiler binary is **byte-identical at both
+pins** over the same source. That is the gating working, stated as a measurement
+rather than an expectation.
+
+### Fixed
+- raw: **a flat image stores its zero-fill.** The writer sized the image by the
+  last *file* byte and its header said bare-metal startup would zero `.bss`
+  itself - but the linker exports no `__bss_start` / `__bss_end`, or any symbol
+  naming a section boundary, so no startup written in Mach could find the region.
+  A 64-byte zero-initialized global landed at the first address *past the end* of
+  a 48-byte image, and the loader, which copies the file and nothing else, left
+  whatever the memory held. The image is now sized by its last *memory* byte, so
+  the zeros are part of it.
+
+  This affected **every `of=raw` target**, `freestanding` included, and went
+  unnoticed because no fixture declared a zero-initialized global - which is also
+  why the image-size delta on all four existing raw fixtures is exactly zero. The
+  cost is the bss size and nothing else: a 4 KiB zero-initialized array grows its
+  image by 4096 bytes. Non-raw formats are untouched (#2402).
+- vectorize: the float reduction identity is spelled as the `-0.0` literal rather
+  than a bit pattern. A bootstrap workaround, load-bearing until a released seed
+  carried #2274's fix - 4.3.0 is that seed, and `int/lib/seed-tripwire.sh` failed
+  the build the day it became removable, which is what the tripwire exists for.
+  The tripwire's last entry left with it, taking the script and its CI step
+  (#2284).
+
+### Changed
+- dep: mach-std `0.19.0` → `0.20.0`.
+
 ## [4.3.0] - 2026-07-26
 
 124 merged pull requests. **Three of its fixes are wrong-answer defects present in
