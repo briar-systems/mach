@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.2] - 2026-07-27
+
+A patch release fixing macOS execution and project scaffolding issues (#2327). Advances standard library dependency to **mach-std 0.20.1**.
+
+### Fixed
+- darwin: **`getcwd` path length on success.** Fixes `mach init` on macOS where raw Darwin `__getcwd` syscall returning 0 caused working directory resolution to error out.
+- macho: **`__DWARF` section layout formatting.** Fixes malformed Mach-O executable headers when compiling with debug profile enabled on macOS.
+
 ## [4.3.1] - 2026-07-26
 
 A dependency move and one flat-image fix. The standard library advances to
