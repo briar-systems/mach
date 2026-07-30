@@ -30,9 +30,10 @@ to 8,200,192 bytes.
   (#2419).
 - link: manifest requirements retain their `local`, `system`, and `framework`
   source semantics through direct and cascading links. Darwin resolves
-  frameworks and `.dylib` install names for native and cross-target plans, and
-  the optional `[link.X].library` identity makes `#[library]` attribution
-  portable across platform loader names (#2424).
+  version-independent framework paths and `.dylib` install names for native and
+  cross-target plans, and the optional `[link.X].library` identity makes
+  `#[library]` attribution portable across platform loader names without
+  order-dependent identity collisions (#2424).
 - linker: final executable links discard proven losing weak function bodies and
   their dead relocations across ELF, COFF, and Mach-O; ELF shared links do
   likewise. Relocatable output and target-specific relocation semantics remain

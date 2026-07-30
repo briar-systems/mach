@@ -56,7 +56,8 @@ ext fun WSAStartup(ver: u16, data: *u8) i32;
   accepted for compatibility. The named library **must** be among the link's
   dependencies; pinning to one that is not is a hard link error
   (`import '<sym>' pinned to library '<lib>' not among the link's dependencies`),
-  never a silent fallback.
+  never a silent fallback. A logical identity that equals a different
+  dependency's loader name is rejected as ambiguous.
 - An `ext` import with no `library` is unattributed. PE and Mach-O require every
   dynamic import to identify its provider, so an unattributed import is a hard
   link error on those targets.

@@ -392,12 +392,14 @@ same API; one unconditional `#[library("glfw")]` can then bind against
 `libglfw.so.3` on Linux, an `LC_ID_DYLIB` install name on Darwin, and
 `glfw3.dll` on Windows. Exact canonical loader names remain accepted for
 compatibility. Selecting two dependencies that map the same logical name to
-different loader names in one build is an error.
+different loader names in one build is an error. A logical name that equals a
+different dependency's canonical loader name is likewise rejected, so
+attribution never depends on requirement order.
 
 Whether an input links **statically** or **dynamically** follows the resolved file
 — a loose `.o` or static `.a` links statically; ELF `.so`, Mach-O `.dylib`,
-Darwin framework, and PE `.dll` inputs are recorded using their format's
-canonical loader name. See
+and PE `.dll` inputs are recorded using their format's canonical loader name.
+Darwin frameworks use a version-independent system framework path. See
 [cli.md](cli.md#static-vs-dynamic-resolution) for the resolution rules and
 [language/ext-fun.md](language/ext-fun.md#linking-external-objects) for the
 `ext fun` workflow that consumes these inputs.

@@ -87,7 +87,8 @@ ext fun wsa_startup(ver: u16, data: *u8) i32;
 - The value normally names a `[link.X]` requirement's stable logical identity:
   its `library` value, or `X` when that key is omitted. A bare command-line
   `-l name` also exposes `name`. Exact canonical loader names remain accepted.
-  Pinning to an absent dependency is a link error, never a silent fallback.
+  Pinning to an absent dependency is a link error, never a silent fallback. A
+  logical identity may not equal a different dependency's loader name.
 - PE and Mach-O use two-level namespaces, so every dynamic import on those
   targets needs a `library` attribution.
 - On ELF (Linux) the loader resolves imports by global search, so `library`

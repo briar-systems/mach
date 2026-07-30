@@ -168,8 +168,8 @@ How an input resolves decides whether the link is static or dynamic:
 - A shared **`.so`**, **`.dylib`**, or **`.dll`** is a **dynamic** dependency.
   ELF records the library's `DT_SONAME`, Mach-O records its `LC_ID_DYLIB`
   install name, and PE records the DLL basename. Darwin frameworks are declared
-  through `[link.X]` with `source = "framework"` and become their canonical
-  system install names. Undefined `ext` functions are then emitted as imports
+  through `[link.X]` with `source = "framework"` and become version-independent
+  system framework paths. Undefined `ext` functions are then emitted as imports
   for the target format. A static definition of the same symbol always wins.
 
 `-l <name>` prefers a static `.o`/`.a` over a shared library, so an `-l name`
