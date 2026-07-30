@@ -180,8 +180,11 @@ pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ```
 
 Body-less, ends in `;`, C ABI is the contract. Provide the definition at link
-time (`mach build . -l c`, manifest `libs`, or an explicit `.o`/`.a`/`.so`).
-On PE targets pin imports to their DLL with `#[library("ws2_32.dll")]`.
+time (`mach build . -l c`, a `[link.X]` manifest requirement, or an explicit
+`.o`/`.a`/`.so`/`.dylib`/`.dll`). On PE and Mach-O targets, pin each dynamic
+import with `#[library("name")]`. The value is the requirement's stable
+`library` identity (defaulting to the `[link.X]` table name); exact loader names
+remain accepted.
 
 ### `val` / `var`
 
@@ -432,7 +435,7 @@ immediately following declaration. Closed set:
 | Decorator | Applies to | Argument | Purpose |
 |---|---|---|---|
 | `#[symbol("name")]` | fun, ext fun, val/var | string | linker name override |
-| `#[library("x.dll")]` | ext fun | string | PE import DLL pin |
+| `#[library("name")]` | ext import | string | dynamic import dependency pin |
 | `#[inline]` | fun | none | force inlining |
 | `#[align(expr)]` | val/var, rec/uni | comptime int | alignment override |
 | `#[section(".name")]` | fun, ext fun, val/var | string | object section placement |
