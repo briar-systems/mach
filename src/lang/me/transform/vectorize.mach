@@ -26,9 +26,11 @@ use std.types.size.usize;
 use std.types.string.str;
 
 use A: std.allocator;
+use std.allocator.page;
 use O: std.types.option;
 use R: std.types.result;
 
+use mach.lang.intern;
 use mach.lang.me.ir;
 use mach.lang.me.ir.id;
 use mach.lang.me.ir.instruction;
@@ -184,9 +186,7 @@ fun find_loop_by_header(la: *loops.LoopAnalysis, h: id.BlockId) u32 {
     ret ver.NONE_U32;
 }
 
-# one recognized if-convertible body: a guarded region that touches NO memory, so
-# predicating it introduces no load and no store the scalar loop did not already
-# perform (#2348)
+# one recognized if-convertible body whose guarded arms touch no memory (#2348)
 # ---
 # ok:    whether the body is the recognized diamond (false means the flat shape)
 # entry: the block the header branches into -- the loads and the guard compare
@@ -201,16 +201,11 @@ rec PredShape {
     cmp:   id.InstructionId;
 }
 
-# the structural loop-shape gate: counted and well-formed, `iv < / <= bound` with the
-# iv on the left and the continue edge on true, unit constant step, and a body that is
-# either the single-block element-wise shape -- header plus ONE body block that is also
-# the latch -- or the if-convertible diamond `recognize_predicated` admits.
+# admit a counted unit-step flat body or one recognized guarded diamond
 fun loop_shape_ok(fn: *ir.Function, lp: *loops.Loop, out_p: *PredShape) bool {
     out_p.ok = false;
     if (!lp.is_counted) { ret false; }
-    # exit dedication is NOT required here: the versioned fast loop's exit is the
-    # merge block, which legitimately has the scalar path as a second predecessor.
-    # the collect phase separately requires a dedicated exit (version_loop needs it).
+    # a versioned fast loop may share its exit merge with the scalar path
     if (lp.preheader == id.BLOCK_NIL || lp.latch == id.BLOCK_NIL || lp.exiting == id.BLOCK_NIL) { ret false; }
     if (!lp.counted.iv_on_left) { ret false; }
     if (!lp.counted.continue_on_true) { ret false; }
@@ -220,18 +215,10 @@ fun loop_shape_ok(fn: *ir.Function, lp: *loops.Loop, out_p: *PredShape) bool {
     ret recognize_predicated(fn, lp, out_p);
 }
 
-# recognize the one guarded body shape this increment predicates: the header branches
-# into a block holding the loads and a guard comparison, whose two edges are EMPTY
-# blocks meeting again at the latch, where a phi per guarded value selects between
-# them.
+# recognize an entry comparison, two empty arms, and a phi join at the latch
 #
-# The arms holding nothing is what makes this sound without any dereferenceability
-# argument. Every load and every store in the loop already sits in the entry block or
-# the latch, both of which run on every iteration, so predicating the body introduces
-# no memory access the scalar loop did not already perform -- the vector form differs
-# only in computing both arms' values and selecting. A guarded region containing a
-# LOAD or a STORE is a different problem (the vector form would have to speculate the
-# access, or write lanes the scalar never wrote) and declines here.
+# empty arms keep every access in the always-executed entry or latch, so folding the
+# branch introduces no speculative load or conditional store.
 fun recognize_predicated(fn: *ir.Function, lp: *loops.Loop, out: *PredShape) bool {
     if (lp.body_len != 5) { ret false; }
     val hdr: *ir.Block = ?fn.blocks[lp.header::u32];
@@ -313,15 +300,7 @@ fun empty_forwarder(fn: *ir.Function, b: id.BlockId, to: id.BlockId) bool {
     ret ir.block_target(t.operands[0]) == to;
 }
 
-# true when phi `pid` has exactly the two incomings `t_arm` and `f_arm`
-#
-# Implied by the rest of the shape, so no test kills it: with a five-block body the
-# only blocks that exist are the header, the entry, the two arms and the latch, the
-# header branches to the entry and the exit, the entry to the two arms, and each arm
-# unconditionally to the latch -- so the latch's only predecessors ARE the arms. It
-# stays because the fold reads each incoming BY ARM (phi_value_from), and a phi whose
-# edges were something else would hand the select a value that names nothing. Do not
-# remove it for being untested; a widened body shape is what fires it.
+# true when phi `pid` joins exactly `t_arm` and `f_arm`
 fun joins_arms(fn: *ir.Function, pid: id.InstructionId, t_arm: id.BlockId, f_arm: id.BlockId) bool {
     val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, pid);
     if (O.is_none[*instruction.Instruction](opt)) { ret false; }
@@ -349,11 +328,7 @@ fun phi_value_from(fn: *ir.Function, pid: id.InstructionId, from: id.BlockId) va
     ret value.const_null(ir_type.IRT_NIL);
 }
 
-# derive the uniform element shape of a dependence-independent loop's accesses, or
-# decline: every access must load / store the SAME scalar element type (not merely
-# the same byte width -- a same-width i32/f32 mix would stamp float ops with an
-# integer vector type, and a mixed loop would bypass the per-type op legality), with
-# a footprint of 1..8 bytes giving a lane count >= 2, and at least one store
+# derive one scalar element type and 128-bit lane count for every access
 fun map_shape(d: *dep.DepInfo, out: *MapShape) bool {
     if (d.access_count == 0) { ret false; }
     val elem_ty: ir_type.IrTypeId = d.accesses[0].elem_ty;
@@ -394,20 +369,9 @@ fun vectorizable(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u
     if (!map_shape(?d, ?shape)) { dep.dep_dnit(?d); ret R.ok[bool, str](false); }
     shape.is_float = ir_type.is_float_scalar(?m.types, shape.elem_ty);
 
-    # every access must live in a block that runs on EVERY iteration and is never the
-    # header: a header access would feed the exit test, and retyping it to a vector
-    # would leave a vector operand on a scalar compare. For the flat body that is the
-    # latch alone; for the predicated diamond the entry block qualifies too, since it
-    # and the latch both precede and follow the guard rather than sitting under it.
-    # An access in an ARM would be one the predicated form has to speculate, and the
-    # arms are required to be empty, so none can appear there. That is also why
-    # deleting this rule kills no test and it survives its own mutation: for a
-    # predicated body the arm-emptiness rule already excludes the dangerous case, and
-    # for a flat body every access is in the latch because the latch is the only body
-    # block. It stays as the statement of WHERE an access may live, which is the
-    # premise both the fold and the retype rely on. Do not remove it for being
-    # untested -- the mutation that fires it is a widened body shape, which is exactly
-    # when its absence would stop being harmless.
+    # accesses must run on every iteration. The flat body permits only the latch; the
+    # predicated body also permits its entry block. An access in either arm would be
+    # speculated by if-conversion and is refused.
     var ai: u32 = 0;
     for (ai < d.access_count) {
         val ab: id.BlockId = la.instr_block[d.accesses[ai].instr::u32];
@@ -445,8 +409,27 @@ fun stores_are_pure_trees(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalys
         }
         i = i + 1;
     }
+    if (pred_ok && !pred_joins_in_vset(fn, la, lx, vset)) { ok = false; }
     A.deallocate[bool](m.alloc, vset, fn.instr_len::usize);
     ret R.ok[bool, str](ok);
+}
+
+# true when every phi that if-conversion rewrites has entered the vector set
+#
+# entry requires the element type and vectorizable incomings, so this also prevents
+# a mixed-width join from consuming the element mask.
+fun pred_joins_in_vset(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, vset: *bool) bool {
+    val lp: *loops.Loop = ?la.loops[lx];
+    if (lp.latch::u32 >= fn.block_count) { ret false; }
+    val latch: *ir.Block = ?fn.blocks[lp.latch::u32];
+    if (latch.phi_count == 0) { ret false; }
+    var i: u32 = 0;
+    for (i < latch.phi_count) {
+        val pid: id.InstructionId = latch.phis[i];
+        if (pid::u32 >= fn.instr_len || !vset[pid::u32]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # fill `vset` with the loop-body instructions that vectorize: the loads (seeds) and,
@@ -476,12 +459,7 @@ fun build_vset(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, accesses: *de
         for (bi < lp.body_len) {
             if (lp.body[bi] == lp.header) { bi = bi + 1; cnt; }
             val blk: *ir.Block = ?fn.blocks[lp.body[bi]::u32];
-            # a join phi of the guarded diamond stands for the select if-conversion
-            # will put in its place, so it enters the set on the same terms that
-            # select will: both of its incomings vectorizable. Admitting it here is
-            # what lets the store above it read as a pure lane-op tree BEFORE the
-            # body is folded -- the recognition runs on the branchy IR, the transform
-            # on the folded one.
+            # admit a guarded join when both values can feed its eventual lane select
             if (admit_joins && lp.body[bi] == lp.latch) {
                 var pi: u32 = 0;
                 for (pi < blk.phi_count) {
@@ -519,10 +497,7 @@ fun build_vset(fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, accesses: *de
     }
 }
 
-# true when both of a join phi's incoming VALUES are vectorizable -- each already in
-# the set, or a splattable loop-invariant scalar. Unlike an ordinary lane op, a join
-# needs no operand from the set: `t = c ? 3 : 5` over two invariants is still a lane
-# value once the mask varies per lane.
+# true when both join values are vectorized or splattable scalars
 fun phi_incomings_vectorizable(phi: *instruction.Instruction, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, elem_ty: ir_type.IrTypeId, allow_splat: bool, vset: *bool) bool {
     if (phi.operand_count != 4) { ret false; }
     var o: u32 = 1;
@@ -537,11 +512,7 @@ fun phi_incomings_vectorizable(phi: *instruction.Instruction, fn: *ir.Function, 
     ret true;
 }
 
-# true when `inst`'s operands are all vectorizable: each is either a VAL_INSTR already
-# in the vector set or, when `allow_splat`, a splattable loop-invariant scalar. At
-# least one operand must come from the vector set -- an op over invariants alone is
-# itself invariant, and broadcasting its operands would compute a loop-invariant value
-# once per lane rather than hoisting it.
+# true when every operand vectorizes and at least one comes from the vector set
 fun operands_vectorizable(inst: *instruction.Instruction, fn: *ir.Function, la: *loops.LoopAnalysis, lx: u32, elem_ty: ir_type.IrTypeId, allow_splat: bool, vset: *bool) bool {
     if (inst.operand_count == 0) { ret false; }
     var from_set: bool = false;
@@ -558,11 +529,7 @@ fun operands_vectorizable(inst: *instruction.Instruction, fn: *ir.Function, la: 
     ret from_set;
 }
 
-# true when `v` is a loop-invariant scalar of the element type that one preheader
-# broadcast can stand in for: a constant, a parameter, or a value defined outside the
-# loop. The type stamp must be exactly the element type -- a differently typed operand
-# would be splatted into the wrong lane width -- and pointer / global / function
-# values are excluded, since they are addresses rather than lane values.
+# true when `v` is an element-typed invariant that may be broadcast in the preheader
 fun splattable(v: value.Value, la: *loops.LoopAnalysis, lx: u32, elem_ty: ir_type.IrTypeId) bool {
     if (v.ty != elem_ty) { ret false; }
     if (v.kind != value.VAL_CONST_INT && v.kind != value.VAL_CONST_FLOAT && v.kind != value.VAL_PARAM && v.kind != value.VAL_INSTR) { ret false; }
@@ -576,11 +543,7 @@ fun splattable(v: value.Value, la: *loops.LoopAnalysis, lx: u32, elem_ty: ir_typ
 # neg would fall through to a bitwise integer negation of the IEEE bit pattern),
 # integer multiply (narrow on SSE2), integer divide/remainder, shifts, and
 # comparisons.
-# the comparisons whose 128-bit form yields a same-shape all-ones / all-zeros lane
-# MASK on the baseline capable targets, which is what the predicated body selects
-# with. Deliberately the same six the language's vector compare exposes; an opcode
-# outside this set is refused by name rather than falling through to a scalar compare
-# left holding vector operands.
+# comparisons whose vector form yields an all-ones or all-zeros lane mask
 fun is_mask_compare(k: instruction.InstrKind) bool {
     if (k == instruction.OP_CMP_EQ)   { ret true; }
     if (k == instruction.OP_CMP_NE)   { ret true; }
@@ -597,14 +560,10 @@ fun pred_mask(p: *PredShape) id.InstructionId {
     ret id.INSTR_NIL;
 }
 
-# whether instruction `iid` of kind `k` may enter the vector set
+# whether `iid` may enter the vector set
 #
-# The lane ops are admitted on kind alone. A COMPARISON is admitted only when it is
-# the one guard `recognize_predicated` identified, never on kind: a comparison the
-# scalar body stores as a value yields 0 or 1, where its vector form yields an
-# all-ones lane mask, so retyping any other compare would silently change the value
-# stored. `a[i] = b[i] > c[i]` over byte lanes is exactly that shape -- a compare
-# whose result type already equals the element type -- and it stays scalar.
+# only the recognized guard comparison may become a mask; another comparison must
+# retain its scalar 0-or-1 value.
 fun admits(k: instruction.InstrKind, iid: id.InstructionId, is_float: bool, mask_cmp: id.InstructionId) bool {
     if (is_mask_compare(k)) { ret iid == mask_cmp && mask_cmp != id.INSTR_NIL; }
     ret supported_vector_op(k, is_float);
@@ -622,9 +581,7 @@ fun supported_vector_op(k: instruction.InstrKind, is_float: bool) bool {
         if (k == instruction.OP_OR)  { ret true; }
         if (k == instruction.OP_XOR) { ret true; }
         if (k == instruction.OP_NOT) { ret true; }
-        # the guard of a predicated body, whose vector form is the lane mask the
-        # select consumes (#2348). Integer lanes only: a float compare's mask is an
-        # integer vector of the same width, a second type this body does not carry
+        # integer guards share the selected value's vector type
         if (is_mask_compare(k)) { ret true; }
     }
     ret false;
@@ -691,19 +648,14 @@ fun vectorize_one(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: 
     if (R.is_err[dep.DepInfo, str](rdd)) { loops.dnit(?fla); ret R.err[bool, str](R.unwrap_err[dep.DepInfo, str](rdd)); }
     var fd: dep.DepInfo = R.unwrap_ok[dep.DepInfo, str](rdd);
 
-    # the versioned fast loop must re-classify as the SAME independent element-wise
-    # shape; if re-analysis disagrees, leave it scalar (behavior-preserving)
+    # re-analysis must recover the same independent element shape
     val flp: *loops.Loop = ?fla.loops[flx];
     var fshape: MapShape;
     var fpred: PredShape;
     var fast_ok: bool = loop_shape_ok(fn, flp, ?fpred) && fd.verdict == dep.DEP_INDEPENDENT && map_shape(?fd, ?fshape);
     if (fast_ok && fshape.elem_ty != shape.elem_ty) { fast_ok = false; }
     if (fast_ok && fpred.ok != pred0.ok)            { fast_ok = false; }
-    # a predicated body selects with a lane MASK, which is the same vector type as the
-    # element only for an integer element. A float element's mask is an integer vector
-    # of the same lane width, a second type this transform's one-vector-type body does
-    # not carry -- so a predicated float loop declines by name rather than stamping a
-    # float type on a mask.
+    # float comparison masks need a second integer vector type this transform lacks
     if (fast_ok && fpred.ok && shape.is_float)      { fast_ok = false; }
     if (!fast_ok) { dep.dep_dnit(?fd); loops.dnit(?fla); ret decline_after_mutation(m, fn); }
     fshape.is_float = shape.is_float;
@@ -728,10 +680,7 @@ fun vectorize_one(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: 
     if (R.is_err[bool, str](rcl)) { A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize); A.deallocate[id.BlockId](m.alloc, rem_blocks, body_len::usize); dep.dep_dnit(?fd); loops.dnit(?fla); ret R.err[bool, str](R.unwrap_err[bool, str](rcl)); }
     val rem_header: id.BlockId = rem_blocks[ver.region_index(fbody, body_len, fast_header)];
 
-    # if-convert the fast copy: fold the guarded diamond into the latch, replacing
-    # each join phi with a lane select. Done AFTER the remainder clone, so the
-    # remainder and the scalar fallback both keep their branch, and BEFORE the vector
-    # set is built, so the select's ops are part of the body the retype covers.
+    # fold only the fast copy after preserving the scalar remainder
     if (fpred.ok) {
         val rif: R.Result[bool, str] = if_convert(m, fn, flp, ?fpred, fshape.elem_ty);
         if (R.is_err[bool, str](rif)) { A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize); A.deallocate[id.BlockId](m.alloc, rem_blocks, body_len::usize); dep.dep_dnit(?fd); loops.dnit(?fla); ret rif; }
@@ -753,7 +702,7 @@ fun vectorize_one(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: 
     val rss: R.Result[bool, str] = scale_recurrence_steps(fn, flp, shape.lanes);
     if (R.is_err[bool, str](rss)) { A.deallocate[id.BlockId](m.alloc, fbody, body_len::usize); A.deallocate[id.BlockId](m.alloc, rem_blocks, body_len::usize); dep.dep_dnit(?fd); loops.dnit(?fla); ret rss; }
 
-    # the vector header tests `iv <= limit` (a full lane group fits). the SIGNED
+    # the vector header tests `iv <= limit` (a full lane group fits). the signed
     # compare is safe even for an unsigned loop: when bound_ex < lanes the
     # subtraction wraps to a huge unsigned value that reads as negative signed, so
     # the vector loop is skipped and the scalar remainder handles the whole trip.
@@ -781,31 +730,21 @@ fun vectorize_one(m: *ir.Module, fn: *ir.Function, la: *loops.LoopAnalysis, lx: 
     ret R.ok[bool, str](true);
 }
 
-# fold a recognized guarded diamond into straight-line code, replacing each join phi
-# with a lane select over the guard's mask
+# fold a guarded diamond into lane selects in the fast loop
 #
-# The entry block's instructions move to the front of the latch, the guard's branch
-# becomes an unconditional edge, and both arms fall out of the graph. Each latch phi
-# `[t_arm x, f_arm y]` becomes `(mask & x) | (~mask & y)`, built from the three
-# bitwise ops the vector set already admits, so the retype that follows carries the
-# whole select into vector form with nothing left over.
-#
-# The guard comparison stays exactly where it was, ahead of the selects that consume
-# it. Its scalar result type is the i8 boolean; the retype restamps it to the vector
-# type, where the same opcode yields the all-ones / all-zeros lane mask the select
-# needs. That restamp is why a predicated body is admitted only for an integer
-# element, whose mask type IS the element's own vector type.
+# the comparison is restamped to the integer element type, then each join becomes
+# `(mask & t) | (~mask & f)` before the straight-line body is vectorized.
 # ---
-# m:  the module owning `fn`
-# fn: the function being transformed
-# lp: the fast (vector) loop, whose latch receives the folded body
-# p:  the recognized diamond
-# ret: ok(true), or a build error
+# m:       module owning `fn`
+# fn:      function being transformed
+# lp:      fast loop whose latch receives the folded body
+# p:       recognized diamond
+# elem_ty: integer lane element type
+# ret:     ok(true), or a build error
 fun if_convert(m: *ir.Module, fn: *ir.Function, lp: *loops.Loop, p: *PredShape, elem_ty: ir_type.IrTypeId) R.Result[bool, str] {
     val latch: id.BlockId = lp.latch;
 
-    # collect the joins before anything moves: emitting grows the instruction pool and
-    # invalidates every borrowed instruction pointer
+    # collect joins before emission can grow the instruction pool
     val lb0: *ir.Block = ?fn.blocks[latch::u32];
     val np: u32 = lb0.phi_count;
     if (np == 0) { ret R.err[bool, str]("vectorize: predicated latch lost its join phis"); }
@@ -821,20 +760,10 @@ fun if_convert(m: *ir.Module, fn: *ir.Function, lp: *loops.Loop, p: *PredShape, 
         i = i + 1;
     }
 
-    # the guard's result type becomes the ELEMENT type, because that is what its
-    # vector form produces: a same-shape all-ones / all-zeros lane mask. A scalar
-    # compare yields the i8 boolean instead, so this restamp makes the fast copy
-    # correct only once it is retyped to vectors -- which the one caller does
-    # unconditionally, two statements later. It is also what puts the compare in the
-    # vector set at all, since admission there keys on the result type.
+    # the vector comparison produces an element-shaped all-ones or all-zeros mask
     fn.instrs[p.cmp::u32].ty = elem_ty;
 
-    # each join becomes a select over the mask, built at the END of the ENTRY block:
-    # there it sits after the guard it reads and before everything in the latch that
-    # consumes it, which is the only placement that dominates the store. The block is
-    # already terminated, so it is reopened for the append and closed again -- a
-    # block's terminator is a field of its own rather than the last entry of its
-    # instruction list, so an append while it is detached lands in the right place.
+    # append selects after the guard and before their latch uses
     val term_e: id.InstructionId = fn.blocks[p.entry::u32].terminator;
     fn.blocks[p.entry::u32].terminator = id.INSTR_NIL;
     val mask: value.Value = value.instr(p.cmp, elem_ty);
@@ -850,13 +779,11 @@ fun if_convert(m: *ir.Module, fn: *ir.Function, lp: *loops.Loop, p: *PredShape, 
         i = i + 1;
     }
     fn.blocks[p.entry::u32].terminator = term_e;
-    # the phis are dead now that every use names the select; dropping them is what
-    # makes the latch a plain block again
+    # every phi use now names its select
     fn.blocks[latch::u32].phi_count = 0;
     A.deallocate[SelectSite](m.alloc, joins, np::usize);
 
-    # move the entry block's instructions -- loads, guard and selects, in that order --
-    # to the front of the latch, so the whole body is one straight line
+    # move loads, guard, and selects to the front of the latch
     val eb: *ir.Block = ?fn.blocks[p.entry::u32];
     var k: u32 = eb.instr_count;
     for (k > 0) {
@@ -875,11 +802,7 @@ fun if_convert(m: *ir.Module, fn: *ir.Function, lp: *loops.Loop, p: *PredShape, 
     ret R.ok[bool, str](true);
 }
 
-# rewrite block `blk`'s existing terminator into an unconditional branch to `to`
-#
-# In place rather than emitted: the block is already terminated, and the guard's
-# condition survives as an ordinary value the selects consume, so only the branch
-# itself changes shape.
+# rewrite block `blk`'s existing terminator into a branch to `to`
 fun make_unconditional(m: *ir.Module, fn: *ir.Function, blk: id.BlockId, to: id.BlockId) R.Result[bool, str] {
     val b: *ir.Block = ?fn.blocks[blk::u32];
     if (b.terminator == id.INSTR_NIL) { ret R.err[bool, str]("vectorize: if-convert block has no terminator"); }
@@ -887,9 +810,7 @@ fun make_unconditional(m: *ir.Module, fn: *ir.Function, blk: id.BlockId, to: id.
     if (O.is_none[*instruction.Instruction](opt)) { ret R.err[bool, str]("vectorize: if-convert terminator is missing"); }
     val rt: R.Result[value.Value, str] = ir.block_target_make(m, to);
     if (R.is_err[value.Value, str](rt)) { ret R.err[bool, str](R.unwrap_err[value.Value, str](rt)); }
-    # instr_replace_operands ADOPTS the array as the instruction's owned storage, so
-    # it has to come from the module allocator: handing it a stack buffer leaves the
-    # terminator naming a block id in a dead frame
+    # the instruction adopts module-allocated operand storage
     val ra: R.Result[ir.OperandArray, str] = ir.operands_alloc(m, 1);
     if (R.is_err[ir.OperandArray, str](ra)) { ret R.err[bool, str](R.unwrap_err[ir.OperandArray, str](ra)); }
     val ops: ir.OperandArray = R.unwrap_ok[ir.OperandArray, str](ra);
@@ -913,10 +834,7 @@ rec SelectSite {
     ty:    ir_type.IrTypeId;
 }
 
-# emit `(mask & t) | (~mask & f)` at the end of `blk`, ahead of its terminator
-#
-# The documented lane-select idiom, built from the three bitwise ops the vector set
-# admits, so it needs no lowering of its own on either capable target.
+# emit `(mask & t) | (~mask & f)` ahead of `blk`'s terminator
 fun emit_select(m: *ir.Module, fn: *ir.Function, blk: id.BlockId, mask: value.Value, s: *SelectSite) R.Result[value.Value, str] {
     var b: builder.Builder = builder.init(m);
     builder.set_function(?b, fn);
@@ -930,9 +848,7 @@ fun emit_select(m: *ir.Module, fn: *ir.Function, blk: id.BlockId, mask: value.Va
     ret builder.emit_or(?b, R.unwrap_ok[value.Value, str](rt), R.unwrap_ok[value.Value, str](rf));
 }
 
-# decline a vectorization AFTER the preheader insertion mutated control flow: the
-# versioned + preheader structure is behavior-preserving, but the predecessor lists
-# must be rebuilt to stay verifier-consistent before returning ok(false)
+# decline after rebuilding predecessors for the already-inserted preheader
 fun decline_after_mutation(m: *ir.Module, fn: *ir.Function) R.Result[bool, str] {
     val rpr: R.Result[bool, str] = ir.preds_rebuild(m, fn);
     if (R.is_err[bool, str](rpr)) { ret R.err[bool, str](R.unwrap_err[bool, str](rpr)); }
@@ -1636,4 +1552,80 @@ fun replace_out_of_loop_uses(m: *ir.Module, fn: *ir.Function, old_id: id.Instruc
     }
     A.deallocate[bool](m.alloc, in_loop, limit::usize);
     ret R.ok[bool, str](true);
+}
+
+# a predicated body must decline when one join has a different lane type
+test "mach.lang.me.transform.vectorize:predicated_mixed_join_declines" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    val rt32: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 32);
+    if (R.is_err[ir_type.IrTypeId, str](rt32)) { ir.dnit(?m); ret 1; }
+    val i32t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt32);
+    val rt64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt64)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt64);
+
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val rta: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rta)) { ir.dnit(?m); ret 1; }
+    val t_arm: id.BlockId = R.unwrap_ok[id.BlockId, str](rta);
+    val rfa: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rfa)) { ir.dnit(?m); ret 1; }
+    val f_arm: id.BlockId = R.unwrap_ok[id.BlockId, str](rfa);
+    val rlb: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rlb)) { ir.dnit(?m); ret 1; }
+    val latch: id.BlockId = R.unwrap_ok[id.BlockId, str](rlb);
+
+    builder.set_block(?bld, latch);
+    val rp32: R.Result[value.Value, str] = builder.emit_phi(?bld, i32t);
+    if (R.is_err[value.Value, str](rp32)) { ir.dnit(?m); ret 1; }
+    val phi32: value.Value = R.unwrap_ok[value.Value, str](rp32);
+    val rp64: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
+    if (R.is_err[value.Value, str](rp64)) { ir.dnit(?m); ret 1; }
+    val phi64: value.Value = R.unwrap_ok[value.Value, str](rp64);
+
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi32, t_arm, value.const_int(1, i32t)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi32, f_arm, value.const_int(2, i32t)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi64, t_arm, value.const_int(1, i64t)))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi64, f_arm, value.const_int(2, i64t)))) { ir.dnit(?m); ret 1; }
+
+    var body: [1]id.BlockId;
+    body[0] = latch;
+    var loop_list: [1]loops.Loop;
+    loop_list[0].header   = t_arm;
+    loop_list[0].latch    = latch;
+    loop_list[0].body     = ?body[0];
+    loop_list[0].body_len = 1;
+    var la: loops.LoopAnalysis;
+    la.block_count = fn.block_count;
+    la.instr_count = fn.instr_len;
+    la.loops       = ?loop_list[0];
+    la.loop_len    = 1;
+
+    var d: dep.DepInfo;
+    d.alloc        = ?alloc;
+    d.verdict      = dep.DEP_INDEPENDENT;
+    d.accesses     = nil;
+    d.access_count = 0;
+    d.access_cap   = 0;
+    var shape: MapShape;
+    shape.elem_ty  = i32t;
+    shape.bytes    = 4;
+    shape.lanes    = 4;
+    shape.is_float = false;
+
+    val rr: R.Result[bool, str] = stores_are_pure_trees(?m, fn, ?la, 0, ?d, ?shape, true, id.INSTR_NIL);
+    var code: i32 = 0;
+    if (R.is_err[bool, str](rr) || R.unwrap_ok[bool, str](rr)) { code = 1; }
+    ir.dnit(?m);
+    ret code;
 }
