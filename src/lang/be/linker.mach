@@ -171,6 +171,17 @@ rec AtomCandidate {
     symbol: u32;
 }
 
+# one relocation indexed by its already-resolved target section for candidate
+# reachability checks
+rec AtomRelocRef {
+    target_section: u32;
+    target_module:  u32;
+    target_symbol:  u32;
+    source_module:  u32;
+    reloc:           u32;
+    width:           u32;
+}
+
 # the linker's mutable dynamic-link state: the format-neutral plan (`of.DynamicInfo`)
 # being assembled plus the import call-site fixups (`of.PltFixup`) collected during
 # relocation patching, and the map from an imported symbol name to its index in the
@@ -522,7 +533,8 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     # definition actually lost global resolution. A relocatable link receives an
     # inert plan and preserves its native weak/group representation byte-for-byte.
     val atom_r: R.Result[bool, str] =
-        build_atom_plan(s, modules, module_count, sec_base, sec_total, patching, ?atoms);
+        build_atom_plan(s, modules, module_count, sec_base, sec_total, patching,
+                        tgt.isa, ?atoms);
     if (R.is_err[bool, str](atom_r)) {
         free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[bool, str](atom_r));
@@ -1604,6 +1616,30 @@ fun atom_drop_cmp(a: *AtomDrop, b: *AtomDrop) i64 {
     ret 0;
 }
 
+# order relocation references by resolved flat target section, then source site
+fun atom_reloc_ref_cmp(a: *AtomRelocRef, b: *AtomRelocRef) i64 {
+    if (a.target_section < b.target_section) { ret -1; }
+    if (a.target_section > b.target_section) { ret 1; }
+    if (a.source_module < b.source_module)   { ret -1; }
+    if (a.source_module > b.source_module)   { ret 1; }
+    if (a.reloc < b.reloc)                   { ret -1; }
+    if (a.reloc > b.reloc)                   { ret 1; }
+    ret 0;
+}
+
+# first relocation-reference index whose flat target section is not less than
+# `section`
+fun atom_reloc_ref_lower(refs: *AtomRelocRef, count: u32, section: u32) u32 {
+    var lo: u32 = 0;
+    var hi: u32 = count;
+    for (lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        if (refs[mid].target_section < section) { lo = mid + 1; }
+        or                                      { hi = mid; }
+    }
+    ret lo;
+}
+
 # largest power-of-two alignment required by the source byte at `off`, capped
 # at the input section's declared alignment
 fun atom_resume_align(off: u32, section_align: u32) u32 {
@@ -1615,10 +1651,97 @@ fun atom_resume_align(off: u32, section_align: u32) u32 {
 }
 
 # byte width patched by an abstract relocation kind
-fun atom_reloc_width(kind: of.RelocKind) u32 {
+fun atom_reloc_width(kind: of.RelocKind, arch: *isa.IsaVTable) u32 {
     if (kind == of.RK_ABS64)   { ret 8; }
     if (kind == of.RK_SECTION) { ret 2; }
+    # rv64's abstract PLT32 is an AUIPC+JALR pair, patched as one 8-byte site.
+    # x64 and AArch64 patch one 4-byte instruction/field for the same kind.
+    if (kind == of.RK_PLT32 && arch != nil && arch.id == isa.ARCH_RISCV64) { ret 8; }
     ret 4;
+}
+
+# whether a second symbol is the exact synthetic section anchor emitted by COFF
+# for a full-section weak COMDAT carrier. the parser surfaces that STATIC record
+# as a local zero-sized symbol at offset zero, named for the section. relocation
+# reachability is checked separately, so this exemption removes only the inert
+# bookkeeping symbol, never an addressable label
+fun atom_is_carrier_anchor(m: *of.ObjectImage, owner: *of.Symbol,
+                           other: *of.Symbol, start: u32, end: u32) bool {
+    if (start != 0 || owner.offset != 0) { ret false; }
+    if (owner.section >= m.section_count || end != m.sections[owner.section].len) { ret false; }
+    if (other.section != owner.section || other.offset != 0 || other.size != 0)   { ret false; }
+    if (other.flags != 0 || other.name != m.sections[owner.section].name)          { ret false; }
+    ret true;
+}
+
+# apply a signed relocation addend to a section offset without overflow. offsets
+# one-past-the-section are representable so end-marker references can be audited
+fun atom_effective_offset(base: u32, addend: i64, out: *u32) bool {
+    if (addend >= 0) {
+        val plus: u64 = addend::u64;
+        if (plus > 0xFFFFFFFF - base::u64) { ret false; }
+        @out = base + plus::u32;
+        ret true;
+    }
+    if (addend < -(base::i64)) { ret false; }
+    @out = (base::i64 + addend)::u32;
+    ret true;
+}
+
+# whether a relocation's addend is a true offset from S rather than an
+# instruction-field bias such as x64 PC32/PLT32's -4
+fun atom_addend_is_symbol_relative(kind: of.RelocKind) bool {
+    if (kind == of.RK_PC32 || kind == of.RK_PLT32 || kind == of.RK_GOTPCREL
+        || kind == of.RK_GOT_PAGE21 || kind == of.RK_GOT_LO12
+        || kind == of.RK_SECTION) { ret false; }
+    ret true;
+}
+
+# whether a relocation whose patch field survives `candidate` resolves through
+# a local or winning-global anchor across the candidate boundary. symbol offsets
+# are remapped but relocation addends are not; crossing the removed interval
+# would therefore silently retarget the relocation, so the candidate must stay
+# live. a relocation to the losing weak name resolves to the winner recorded in
+# `winners`, not to the discarded definition
+fun atom_reloc_crosses_candidate(modules: *of.ObjectImage, reference: *AtomRelocRef,
+                                 r: *of.Relocation,
+                                 candidate_module: u32, candidate_section: u32,
+                                 start: u32, end: u32) bool {
+    val source_module: u32 = reference.source_module;
+    val width: u64 = reference.width::u64;
+    if (source_module == candidate_module && r.section == candidate_section
+        && r.offset::u64 >= start::u64
+        && r.offset::u64 + width <= end::u64) {
+        ret false;
+    }
+
+    val target_module: u32 = reference.target_module;
+    val target_symbol: u32 = reference.target_symbol;
+
+    val target: *of.Symbol = ?modules[target_module].symbols[target_symbol];
+    if (target_module != candidate_module || target.section != candidate_section) { ret false; }
+    if (target.offset > modules[candidate_module].sections[candidate_section].len) { ret false; }
+
+    # a resolved entry inside the atom disappears regardless of relocation kind.
+    # pc-relative field biases are otherwise not S-relative addends: a normal
+    # call to the next global function carries -4 and must not look like it
+    # points four bytes backward into this candidate. A biased relocation through
+    # any local in this section is retained conservatively because foreign
+    # containers may encode an anchor-relative target behind that bias.
+    if (target.offset >= start && target.offset < end) { ret true; }
+    if (!atom_addend_is_symbol_relative(r.kind)) {
+        ret (target.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0;
+    }
+
+    var effective: u32 = 0;
+    if (!atom_effective_offset(target.offset, r.addend, ?effective)) { ret false; }
+    if (effective > modules[candidate_module].sections[candidate_section].len) { ret false; }
+
+    # source anchor and effective target must remain on the same side of the
+    # removed interval.
+    if (target.offset < start && effective >= start)   { ret true; }
+    if (target.offset >= end && effective < end)       { ret true; }
+    ret false;
 }
 
 # fill each module's base in the flat input-section array
@@ -1714,7 +1837,7 @@ fun copy_live_section(dst: *u8, src: *u8, src_len: u32, plan: *AtomPlan, section
 # keeps the interval conservatively live
 fun build_atom_plan(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
                     sec_base: *u32, sec_total: u32, enabled: bool,
-                    plan: *AtomPlan) R.Result[bool, str] {
+                    arch: *isa.IsaVTable, plan: *AtomPlan) R.Result[bool, str] {
     fill_section_bases(modules, module_count, sec_base);
     if (!enabled) { ret R.ok[bool, str](true); }
 
@@ -1804,9 +1927,8 @@ fun build_atom_plan(s: *session.Session, modules: *of.ObjectImage, module_count:
         }
         m = m + 1;
     }
-    map.dnit[intern.StrId, AtomWinner](?winners);
-
     if (candidate_count == 0) {
+        map.dnit[intern.StrId, AtomWinner](?winners);
         if (candidates != nil) {
             A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
         }
@@ -1816,11 +1938,108 @@ fun build_atom_plan(s: *session.Session, modules: *of.ObjectImage, module_count:
     val dr: R.Result[*AtomDrop, str] =
         A.zallocate[AtomDrop](s.alloc, candidate_count::usize);
     if (R.is_err[*AtomDrop, str](dr)) {
+        map.dnit[intern.StrId, AtomWinner](?winners);
         A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
         ret R.err[bool, str](R.unwrap_err[*AtomDrop, str](dr));
     }
     val drops: *AtomDrop = R.unwrap_ok[*AtomDrop, str](dr);
     var drop_count: u32 = 0;
+
+    # index relocation targets once. candidate checks then inspect only references
+    # to symbols in that candidate's section instead of rescanning every relocation
+    # for every duplicate weak body.
+    var reloc_total64: u64 = 0;
+    m = 0;
+    for (m < module_count) {
+        reloc_total64 = reloc_total64 + modules[m].reloc_count::u64;
+        if (reloc_total64 > 0xFFFFFFFF) {
+            map.dnit[intern.StrId, AtomWinner](?winners);
+            A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+            A.deallocate[AtomDrop](s.alloc, drops, candidate_count::usize);
+            ret R.err[bool, str]("linker: input relocation count exceeds the u32 limit");
+        }
+        m = m + 1;
+    }
+    val reloc_total: u32 = reloc_total64::u32;
+    var refs: *AtomRelocRef = nil;
+    if (reloc_total > 0) {
+        val rr: R.Result[*AtomRelocRef, str] =
+            A.zallocate[AtomRelocRef](s.alloc, reloc_total::usize);
+        if (R.is_err[*AtomRelocRef, str](rr)) {
+            map.dnit[intern.StrId, AtomWinner](?winners);
+            A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+            A.deallocate[AtomDrop](s.alloc, drops, candidate_count::usize);
+            ret R.err[bool, str](R.unwrap_err[*AtomRelocRef, str](rr));
+        }
+        refs = R.unwrap_ok[*AtomRelocRef, str](rr);
+        var rw: u32 = 0;
+        m = 0;
+        for (m < module_count) {
+            var locals: map.Map[intern.StrId, u32] =
+                map.init[intern.StrId, u32](s.alloc, map.hash_u32, map.eq_u32);
+            var sy: u32 = 0;
+            for (sy < modules[m].symbol_count) {
+                val local: *of.Symbol = ?modules[m].symbols[sy];
+                if (local.section != of.SECTION_EXTERNAL
+                    && local.section < modules[m].section_count
+                    && (local.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0
+                    && R.is_err[*u32, str](map.get[intern.StrId, u32](?locals, ?local.name))) {
+                    val li: R.Result[bool, str] =
+                        map.insert[intern.StrId, u32](?locals, local.name, sy);
+                    if (R.is_err[bool, str](li)) {
+                        map.dnit[intern.StrId, u32](?locals);
+                        map.dnit[intern.StrId, AtomWinner](?winners);
+                        A.deallocate[AtomRelocRef](s.alloc, refs, reloc_total::usize);
+                        A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+                        A.deallocate[AtomDrop](s.alloc, drops, candidate_count::usize);
+                        ret R.err[bool, str](R.unwrap_err[bool, str](li));
+                    }
+                }
+                sy = sy + 1;
+            }
+
+            var ri: u32 = 0;
+            for (ri < modules[m].reloc_count) {
+                refs[rw].target_section = 0xFFFFFFFF;
+                refs[rw].target_module = 0xFFFFFFFF;
+                refs[rw].target_symbol = 0xFFFFFFFF;
+                refs[rw].source_module = m;
+                refs[rw].reloc = ri;
+                refs[rw].width = atom_reloc_width(modules[m].relocations[ri].kind, arch);
+
+                val r: *of.Relocation = ?modules[m].relocations[ri];
+                val lr: R.Result[*u32, str] =
+                    map.get[intern.StrId, u32](?locals, ?r.symbol);
+                if (R.is_ok[*u32, str](lr)) {
+                    refs[rw].target_module = m;
+                    refs[rw].target_symbol = @R.unwrap_ok[*u32, str](lr);
+                }
+                or {
+                    val wr: R.Result[*AtomWinner, str] =
+                        map.get[intern.StrId, AtomWinner](?winners, ?r.symbol);
+                    if (R.is_ok[*AtomWinner, str](wr)) {
+                        val winner: *AtomWinner = R.unwrap_ok[*AtomWinner, str](wr);
+                        refs[rw].target_module = winner.module;
+                        refs[rw].target_symbol = winner.symbol;
+                    }
+                }
+                if (refs[rw].target_module != 0xFFFFFFFF) {
+                    val target: *of.Symbol =
+                        ?modules[refs[rw].target_module].symbols[refs[rw].target_symbol];
+                    if (target.section != of.SECTION_EXTERNAL
+                        && target.section < modules[refs[rw].target_module].section_count) {
+                        refs[rw].target_section =
+                            sec_base[refs[rw].target_module] + target.section;
+                    }
+                }
+                rw = rw + 1;
+                ri = ri + 1;
+            }
+            map.dnit[intern.StrId, u32](?locals);
+            m = m + 1;
+        }
+        sort.sort[AtomRelocRef](refs, reloc_total::usize, atom_reloc_ref_cmp);
+    }
 
     var ci: u32 = 0;
     for (ci < candidate_count) {
@@ -1836,30 +2055,49 @@ fun build_atom_plan(s: *session.Session, modules: *of.ObjectImage, module_count:
         }
 
         val start: u32 = sym.offset;
-        var end: u32 = sec.len;
-        var sy: u32 = 0;
-        for (sy < modules[cm].symbol_count) {
-            val other: *of.Symbol = ?modules[cm].symbols[sy];
-            if (other.section == sym.section
-                && (other.flags & (of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION))
-                    == (of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION)
-                && other.offset > start && other.offset < end) {
-                end = other.offset;
+        var end: u32 = 0;
+        if (sym.size > 0) {
+            # a validated producer size is authoritative. foreign objects may put
+            # unsymbolized literal/island bytes after the function; an inferred
+            # section-tail extent would incorrectly delete those bytes.
+            val sized_end: u64 = start::u64 + sym.size::u64;
+            if (sized_end > sec.len::u64) { ci = ci + 1; cnt; }
+            end = sized_end::u32;
+        }
+        or {
+            end = sec.len;
+            var nsy: u32 = 0;
+            for (nsy < modules[cm].symbol_count) {
+                val other: *of.Symbol = ?modules[cm].symbols[nsy];
+                if (other.section == sym.section
+                    && (other.flags & (of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION))
+                        == (of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION)
+                    && other.offset > start && other.offset < end) {
+                    end = other.offset;
+                }
+                nsy = nsy + 1;
             }
-            sy = sy + 1;
         }
         if (end <= start) { ci = ci + 1; cnt; }
 
-        # A second symbol in the candidate interval may be addressable from live
-        # code. Keep the whole atom rather than needing a target-reachability
-        # closure; normal generated generic bodies have only their entry symbol.
+        # a second symbol entry or nonzero extent overlapping the candidate may
+        # remain addressable from live code. The sole exception is COFF's exact
+        # synthetic section anchor for a full COMDAT carrier; relocation
+        # reachability through that anchor is audited below.
         var safe: bool = true;
-        sy = 0;
+        var sy: u32 = 0;
         for (sy < modules[cm].symbol_count) {
             if (sy != cy) {
                 val other: *of.Symbol = ?modules[cm].symbols[sy];
-                if (other.section == sym.section && other.offset >= start && other.offset < end) {
-                    safe = false;
+                if (other.section == sym.section
+                    && !atom_is_carrier_anchor(?modules[cm], sym, other, start, end)) {
+                    if (other.offset >= start && other.offset < end) { safe = false; }
+                    if (other.size > 0) {
+                        val other_end: u64 = other.offset::u64 + other.size::u64;
+                        if (other.offset < end && other_end > start::u64) {
+                            safe = false;
+                        }
+                    }
                 }
             }
             sy = sy + 1;
@@ -1872,13 +2110,29 @@ fun build_atom_plan(s: *session.Session, modules: *of.ObjectImage, module_count:
             val r: *of.Relocation = ?modules[cm].relocations[ri];
             if (r.section == sym.section) {
                 val rstart: u64 = r.offset::u64;
-                val rend: u64 = rstart + atom_reloc_width(r.kind)::u64;
+                val rend: u64 = rstart + atom_reloc_width(r.kind, arch)::u64;
                 if (rstart < end::u64 && rend > start::u64
                     && (rstart < start::u64 || rend > end::u64)) {
                     safe = false;
                 }
             }
             ri = ri + 1;
+        }
+
+        # a surviving relocation through a local/section anchor (or through the
+        # actual winning global) must not span the removed interval: the target
+        # symbol is remapped but its raw addend is not.
+        val candidate_flat: u32 = sec_base[cm] + sym.section;
+        var ref_i: u32 = atom_reloc_ref_lower(refs, reloc_total, candidate_flat);
+        for (safe && ref_i < reloc_total
+            && refs[ref_i].target_section == candidate_flat) {
+            val rm: u32 = refs[ref_i].source_module;
+            val rx: u32 = refs[ref_i].reloc;
+            if (atom_reloc_crosses_candidate(modules, ?refs[ref_i],
+                ?modules[rm].relocations[rx], cm, sym.section, start, end)) {
+                safe = false;
+            }
+            ref_i = ref_i + 1;
         }
         if (safe) {
             drops[drop_count].section = sec_base[cm] + sym.section;
@@ -1889,6 +2143,8 @@ fun build_atom_plan(s: *session.Session, modules: *of.ObjectImage, module_count:
         }
         ci = ci + 1;
     }
+    map.dnit[intern.StrId, AtomWinner](?winners);
+    if (refs != nil) { A.deallocate[AtomRelocRef](s.alloc, refs, reloc_total::usize); }
     A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
 
     if (drop_count == 0) {
@@ -2544,7 +2800,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         if (r.section >= modules[m].section_count) {
             ret R.err[bool, str]("linker: relocation names an out-of-range section");
         }
-        if (r.offset::u64 + atom_reloc_width(r.kind)::u64
+        if (r.offset::u64 + atom_reloc_width(r.kind, arch)::u64
             > modules[m].sections[r.section].len::u64) {
             ret R.err[bool, str]("linker: relocation offset is past the end of its section");
         }
@@ -3681,6 +3937,36 @@ fun lt_link(s: *session.Session, name: intern.StrId, a: *of.Symbol, b: *of.Symbo
     ret R.ok[u64, str](v);
 }
 
+# intern a test symbol name, returning STR_NIL only on allocation failure
+fun lt_name(s: *session.Session, name: str) intern.StrId {
+    val r: R.Result[intern.StrId, str] = intern.intern(?s.interner, name);
+    if (R.is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+    ret R.unwrap_ok[intern.StrId, str](r);
+}
+
+# construct one test object image over borrowed section/symbol/relocation arrays
+fun lt_image(s: *session.Session, name: intern.StrId,
+             sections: *of.Section, section_count: u32,
+             symbols: *of.Symbol, symbol_count: u32,
+             relocations: *of.Relocation, reloc_count: u32) of.ObjectImage {
+    var img: of.ObjectImage;
+    img.alloc = s.alloc;
+    img.interner = ?s.interner;
+    img.name = name;
+    img.sections = sections;
+    img.section_count = section_count;
+    img.symbols = symbols;
+    img.symbol_count = symbol_count;
+    img.relocations = relocations;
+    img.reloc_count = reloc_count;
+    ret img;
+}
+
+# construct a description-only ISA vtable for architecture-sensitive linker tests
+fun lt_isa(id: u32) isa.IsaVTable {
+    ret isa.machine_isa(id, "test", 0, 8, nil, nil, nil);
+}
+
 # weak/strong symbol resolution is order-independent (#1257)
 test "mach.lang.be.linker.collect_symbols:weak_strong_order_independent" {
     var alloc: A.Allocator;
@@ -3717,5 +4003,518 @@ test "mach.lang.be.linker.collect_symbols:weak_strong_order_independent" {
     # strong-then-strong: still a multiple-definition error.
     val r3: R.Result[u64, str] = lt_link(?s, nm, ?strong, ?strong2);
     if (!R.is_err[u64, str](r3)) { ret 1; }
+    ret 0;
+}
+
+# final-link atomization activates only for a real losing weak definition, accepts
+# byte-different semantic copies, and mirrors strong-over-weak resolution in both
+# input orders. the disabled plan is the relocatable-link control
+test "mach.lang.be.linker.atom_plan:resolution_and_inert_gate" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val dup: intern.StrId = lt_name(?s, "dupI3u64E");
+    val other: intern.StrId = lt_name(?s, "otherI3u64E");
+    val text: intern.StrId = lt_name(?s, ".text");
+    if (dup == intern.STR_NIL || other == intern.STR_NIL || text == intern.STR_NIL) { ret 1; }
+
+    # deliberately divergent bytes: weak resolution is semantic, not a byte-equality
+    # fold, and whichever definition loses must be removable.
+    var bytes0: [8]u8;
+    var bytes1: [8]u8;
+    var i: u32 = 0;
+    for (i < 8) {
+        bytes0[i] = (0x10 + i)::u8;
+        bytes1[i] = (0x80 + i)::u8;
+        i = i + 1;
+    }
+    var secs0: [1]of.Section;
+    var secs1: [1]of.Section;
+    secs0[0].name = text; secs0[0].kind = of.SK_TEXT; secs0[0].bytes = ?bytes0[0];
+    secs0[0].len = 8; secs0[0].align = 1;
+    secs1[0].name = text; secs1[0].kind = of.SK_TEXT; secs1[0].bytes = ?bytes1[0];
+    secs1[0].len = 8; secs1[0].align = 1;
+
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    val strong_flags: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var syms0: [1]of.Symbol;
+    var syms1: [1]of.Symbol;
+    syms0[0].name = dup; syms0[0].section = 0; syms0[0].offset = 0;
+    syms0[0].size = 0; syms0[0].flags = weak_flags;
+    syms1[0].name = dup; syms1[0].section = 0; syms1[0].offset = 0;
+    syms1[0].size = 0; syms1[0].flags = weak_flags;
+
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "m0"), ?secs0[0], 1, ?syms0[0], 1,
+                       nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "m1"), ?secs1[0], 1, ?syms1[0], 1,
+                       nil::*of.Relocation, 0);
+    var bases: [2]u32;
+
+    # relocatable/native-group output never atomizes.
+    var plan: AtomPlan;
+    init_atom_plan(?plan);
+    val disabled: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, false, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](disabled) || plan.active) { ret 1; }
+
+    # weak/weak: first wins, later body is the one discarded.
+    val ww: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](ww) || !plan.active || plan.drop_count != 1) { ret 1; }
+    if (plan.drops[0].section != 1 || plan.drops[0].start != 0
+        || plan.drops[0].end != 8 || plan.removed_bytes != 8) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    # a later strong replaces and discards the earlier weak winner.
+    syms1[0].flags = strong_flags;
+    val ws: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](ws) || !plan.active || plan.drops[0].section != 0) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    # a strong seen first remains the winner and the later weak is discarded.
+    syms0[0].flags = strong_flags;
+    syms1[0].flags = weak_flags;
+    val sw: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](sw) || !plan.active || plan.drops[0].section != 1) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    # two strong definitions remain a hard error.
+    syms1[0].flags = strong_flags;
+    val ss: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (!R.is_err[bool, str](ss)) { ret 1; }
+
+    # distinct weak names have no loser: the plan stays wholly inert.
+    syms0[0].flags = weak_flags;
+    syms1[0].flags = weak_flags;
+    syms1[0].name = other;
+    val unique: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](unique) || plan.active) { ret 1; }
+    ret 0;
+}
+
+# adjacent losing atoms coalesce, surviving bytes/symbol sites are remapped with
+# alignment intact, and relocations owned only by dead bodies cannot retain an
+# import. a live relocation to another import remains visible
+test "mach.lang.be.linker.atom_plan:copy_remap_and_reloc_liveness" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val wa: intern.StrId = lt_name(?s, "waI3u64E");
+    val wb: intern.StrId = lt_name(?s, "wbI3u64E");
+    val head: intern.StrId = lt_name(?s, "head");
+    val tail: intern.StrId = lt_name(?s, "tail");
+    val dead_ext: intern.StrId = lt_name(?s, "dead_ext");
+    val live_ext: intern.StrId = lt_name(?s, "live_ext");
+    val text: intern.StrId = lt_name(?s, ".text");
+    if (wa == intern.STR_NIL || wb == intern.STR_NIL || head == intern.STR_NIL
+        || tail == intern.STR_NIL || dead_ext == intern.STR_NIL
+        || live_ext == intern.STR_NIL || text == intern.STR_NIL) { ret 1; }
+
+    var win_bytes: [16]u8;
+    var lose_bytes: [32]u8;
+    var i: u32 = 0;
+    for (i < 16) { win_bytes[i] = (0x20 + i)::u8; i = i + 1; }
+    i = 0;
+    for (i < 32) { lose_bytes[i] = (0x80 + i)::u8; i = i + 1; }
+
+    var win_sec: [1]of.Section;
+    var lose_sec: [1]of.Section;
+    win_sec[0].name = text; win_sec[0].kind = of.SK_TEXT;
+    win_sec[0].bytes = ?win_bytes[0]; win_sec[0].len = 16; win_sec[0].align = 8;
+    lose_sec[0].name = text; lose_sec[0].kind = of.SK_TEXT;
+    lose_sec[0].bytes = ?lose_bytes[0]; lose_sec[0].len = 32; lose_sec[0].align = 8;
+
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    val strong_flags: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var win_syms: [2]of.Symbol;
+    win_syms[0].name = wa; win_syms[0].section = 0; win_syms[0].offset = 0;
+    win_syms[0].size = 0; win_syms[0].flags = weak_flags;
+    win_syms[1].name = wb; win_syms[1].section = 0; win_syms[1].offset = 8;
+    win_syms[1].size = 0; win_syms[1].flags = weak_flags;
+
+    var lose_syms: [6]of.Symbol;
+    lose_syms[0].name = head; lose_syms[0].section = 0; lose_syms[0].offset = 0;
+    lose_syms[0].size = 0; lose_syms[0].flags = strong_flags;
+    lose_syms[1].name = wa; lose_syms[1].section = 0; lose_syms[1].offset = 8;
+    lose_syms[1].size = 0; lose_syms[1].flags = weak_flags;
+    lose_syms[2].name = wb; lose_syms[2].section = 0; lose_syms[2].offset = 16;
+    lose_syms[2].size = 0; lose_syms[2].flags = weak_flags;
+    lose_syms[3].name = tail; lose_syms[3].section = 0; lose_syms[3].offset = 24;
+    lose_syms[3].size = 0; lose_syms[3].flags = strong_flags;
+    lose_syms[4].name = dead_ext; lose_syms[4].section = of.SECTION_EXTERNAL;
+    lose_syms[4].offset = 0; lose_syms[4].size = 0;
+    lose_syms[4].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_FUNCTION;
+    lose_syms[5].name = live_ext; lose_syms[5].section = of.SECTION_EXTERNAL;
+    lose_syms[5].offset = 0; lose_syms[5].size = 0;
+    lose_syms[5].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var relocs: [2]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 10; relocs[0].kind = of.RK_PC32;
+    relocs[0].symbol = dead_ext; relocs[0].addend = -4;
+    relocs[1].section = 0; relocs[1].offset = 26; relocs[1].kind = of.RK_PC32;
+    relocs[1].symbol = live_ext; relocs[1].addend = -4;
+
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "winners"), ?win_sec[0], 1,
+                       ?win_syms[0], 2, nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "losers"), ?lose_sec[0], 1,
+                       ?lose_syms[0], 6, ?relocs[0], 2);
+    var bases: [2]u32;
+    var plan: AtomPlan;
+    init_atom_plan(?plan);
+    val pr: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](pr) || !plan.active || plan.drop_count != 1) { ret 1; }
+
+    # [8,16) and [16,24) merge, leaving head then tail packed at an 8-byte
+    # boundary. no alignment padding is needed and 16 bytes disappear.
+    if (plan.drops[0].section != 1 || plan.drops[0].start != 8
+        || plan.drops[0].end != 24 || plan.drops[0].resume != 8
+        || plan.sections[1].live_len != 16 || plan.removed_bytes != 16) { ret 1; }
+    if (!atom_offset_dead(?plan, 1, 10) || !atom_offset_dead(?plan, 1, 20)) { ret 1; }
+    if (atom_offset_dead(?plan, 1, 24) || atom_live_offset(?plan, 1, 24) != 8) { ret 1; }
+
+    var copied: [16]u8;
+    copy_live_section(?copied[0], ?lose_bytes[0], 32, ?plan, 1);
+    i = 0;
+    for (i < 8) {
+        if (copied[i] != lose_bytes[i]) { ret 1; }
+        if (copied[8 + i] != lose_bytes[24 + i]) { ret 1; }
+        i = i + 1;
+    }
+
+    if (import_symbol_live(?mods[0], 2, dead_ext, ?bases[0], ?plan)) { ret 1; }
+    if (has_call_reloc(?mods[0], 2, dead_ext, ?bases[0], ?plan))     { ret 1; }
+    if (!import_symbol_live(?mods[0], 2, live_ext, ?bases[0], ?plan)) { ret 1; }
+    if (!has_call_reloc(?mods[0], 2, live_ext, ?bases[0], ?plan))     { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+    ret 0;
+}
+
+# a second symbol inside a losing function interval keeps that interval live;
+# this is the conservative control for an exposed local/shared label that a live
+# relocation could still address
+test "mach.lang.be.linker.atom_plan:shared_symbol_retains_loser" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val dup: intern.StrId = lt_name(?s, "dupI3u64E");
+    val local: intern.StrId = lt_name(?s, "inside_label");
+    val text: intern.StrId = lt_name(?s, ".text");
+    var a_bytes: [8]u8;
+    var b_bytes: [8]u8;
+    var a_sec: [1]of.Section;
+    var b_sec: [1]of.Section;
+    a_sec[0].name = text; a_sec[0].kind = of.SK_TEXT; a_sec[0].bytes = ?a_bytes[0];
+    a_sec[0].len = 8; a_sec[0].align = 1;
+    b_sec[0].name = text; b_sec[0].kind = of.SK_TEXT; b_sec[0].bytes = ?b_bytes[0];
+    b_sec[0].len = 8; b_sec[0].align = 1;
+
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    var a_syms: [1]of.Symbol;
+    var b_syms: [2]of.Symbol;
+    a_syms[0].name = dup; a_syms[0].section = 0; a_syms[0].offset = 0;
+    a_syms[0].size = 0; a_syms[0].flags = weak_flags;
+    b_syms[0].name = dup; b_syms[0].section = 0; b_syms[0].offset = 0;
+    b_syms[0].size = 0; b_syms[0].flags = weak_flags;
+    b_syms[1].name = local; b_syms[1].section = 0; b_syms[1].offset = 4;
+    b_syms[1].size = 0; b_syms[1].flags = of.SYM_OBJ_FLAG_FUNCTION;
+
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "a"), ?a_sec[0], 1, ?a_syms[0], 1,
+                       nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "b"), ?b_sec[0], 1, ?b_syms[0], 2,
+                       nil::*of.Relocation, 0);
+    var bases: [2]u32;
+    var plan: AtomPlan;
+    init_atom_plan(?plan);
+    val pr: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](pr) || plan.active || plan.drop_count != 0) { ret 1; }
+    ret 0;
+}
+
+# a validated nonzero function size bounds the discarded bytes exactly, preserving
+# unsymbolized trailing islands. another symbol whose nonzero extent covers the
+# candidate from an earlier entry keeps it live
+test "mach.lang.be.linker.atom_plan:sized_extent_and_covering_symbol" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val dup: intern.StrId = lt_name(?s, "sizedI3u64E");
+    val cover: intern.StrId = lt_name(?s, "cover");
+    val text: intern.StrId = lt_name(?s, ".text");
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var a_bytes: [8]u8;
+    var b_bytes: [16]u8;
+    var i: u32 = 0;
+    for (i < 16) { b_bytes[i] = (0x50 + i)::u8; i = i + 1; }
+    var a_sec: [1]of.Section;
+    var b_sec: [1]of.Section;
+    a_sec[0].name = text; a_sec[0].kind = of.SK_TEXT; a_sec[0].bytes = ?a_bytes[0];
+    a_sec[0].len = 8; a_sec[0].align = 1;
+    b_sec[0].name = text; b_sec[0].kind = of.SK_TEXT; b_sec[0].bytes = ?b_bytes[0];
+    b_sec[0].len = 16; b_sec[0].align = 1;
+
+    var a_syms: [1]of.Symbol;
+    var b_syms: [2]of.Symbol;
+    a_syms[0].name = dup; a_syms[0].section = 0; a_syms[0].offset = 0;
+    a_syms[0].size = 8; a_syms[0].flags = weak_flags;
+    b_syms[0].name = dup; b_syms[0].section = 0; b_syms[0].offset = 0;
+    b_syms[0].size = 8; b_syms[0].flags = weak_flags;
+    b_syms[1].name = cover; b_syms[1].section = 0; b_syms[1].offset = 16;
+    b_syms[1].size = 0; b_syms[1].flags = 0;
+
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "a"), ?a_sec[0], 1, ?a_syms[0], 1,
+                       nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "b"), ?b_sec[0], 1, ?b_syms[0], 2,
+                       nil::*of.Relocation, 0);
+    var bases: [2]u32;
+    var plan: AtomPlan;
+    init_atom_plan(?plan);
+    val sized: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](sized) || !plan.active || plan.drop_count != 1) { ret 1; }
+    if (plan.drops[0].start != 0 || plan.drops[0].end != 8
+        || plan.sections[1].live_len != 8) { ret 1; }
+    var copied: [8]u8;
+    copy_live_section(?copied[0], ?b_bytes[0], 16, ?plan, 1);
+    i = 0;
+    for (i < 8) {
+        if (copied[i] != b_bytes[8 + i]) { ret 1; }
+        i = i + 1;
+    }
+    free_atom_plan(?alloc, ?plan);
+
+    # move the losing function behind an earlier symbol whose declared extent
+    # covers it. The earlier entry is outside [8,16), but its bytes are not.
+    b_syms[0].offset = 8;
+    b_syms[0].size = 8;
+    b_syms[1].offset = 0;
+    b_syms[1].size = 16;
+    val covered: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](covered) || plan.active) { ret 1; }
+    ret 0;
+}
+
+# coff's parser surfaces a weak COMDAT carrier's STATIC section symbol beside
+# its weak global. that exact unreferenced bookkeeping anchor does not retain the
+# loser; a live relocation through it does
+test "mach.lang.be.linker.atom_plan:coff_carrier_anchor" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val dup: intern.StrId = lt_name(?s, "coffI3u64E");
+    val text: intern.StrId = lt_name(?s, ".text");
+    val data: intern.StrId = lt_name(?s, ".data");
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    var a_bytes: [8]u8;
+    var b_text: [8]u8;
+    var b_data: [8]u8;
+    var a_sec: [1]of.Section;
+    var b_secs: [2]of.Section;
+    a_sec[0].name = text; a_sec[0].kind = of.SK_TEXT; a_sec[0].bytes = ?a_bytes[0];
+    a_sec[0].len = 8; a_sec[0].align = 1;
+    b_secs[0].name = text; b_secs[0].kind = of.SK_TEXT; b_secs[0].bytes = ?b_text[0];
+    b_secs[0].len = 8; b_secs[0].align = 1;
+    b_secs[1].name = data; b_secs[1].kind = of.SK_DATA; b_secs[1].bytes = ?b_data[0];
+    b_secs[1].len = 8; b_secs[1].align = 8;
+
+    var a_syms: [1]of.Symbol;
+    var b_syms: [2]of.Symbol;
+    a_syms[0].name = dup; a_syms[0].section = 0; a_syms[0].offset = 0;
+    a_syms[0].size = 0; a_syms[0].flags = weak_flags;
+    # parser shape: the section symbol precedes the image symbol, is local,
+    # zero-sized, and shares the carrier section's name and offset zero.
+    b_syms[0].name = text; b_syms[0].section = 0; b_syms[0].offset = 0;
+    b_syms[0].size = 0; b_syms[0].flags = 0;
+    b_syms[1].name = dup; b_syms[1].section = 0; b_syms[1].offset = 0;
+    b_syms[1].size = 0; b_syms[1].flags = weak_flags;
+
+    var refs: [1]of.Relocation;
+    refs[0].section = 1; refs[0].offset = 0; refs[0].kind = of.RK_ABS64;
+    refs[0].symbol = text; refs[0].addend = 0;
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "winner"), ?a_sec[0], 1, ?a_syms[0], 1,
+                       nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "carrier"), ?b_secs[0], 2, ?b_syms[0], 2,
+                       ?refs[0], 0);
+    var bases: [2]u32;
+    var plan: AtomPlan;
+    init_atom_plan(?plan);
+    val inert_anchor: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 3, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](inert_anchor) || !plan.active || plan.drop_count != 1) { ret 1; }
+    if (plan.drops[0].section != 1 || plan.drops[0].start != 0
+        || plan.drops[0].end != 8) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    mods[1].reloc_count = 1;
+    val referenced_anchor: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 3, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](referenced_anchor) || plan.active) { ret 1; }
+    ret 0;
+}
+
+# a live relocation through a local/section anchor before a losing atom keeps the
+# atom when its unchanged addend reaches across the removed interval. this covers
+# effective targets after the atom as well as targets inside it
+test "mach.lang.be.linker.atom_plan:anchor_addend_crossing_retains_loser" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val dup: intern.StrId = lt_name(?s, "crossI3u64E");
+    val base: intern.StrId = lt_name(?s, "section_base");
+    val tail: intern.StrId = lt_name(?s, "tail");
+    val text: intern.StrId = lt_name(?s, ".text");
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    val strong_flags: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var a_bytes: [8]u8;
+    var b_bytes: [24]u8;
+    var a_sec: [1]of.Section;
+    var b_sec: [1]of.Section;
+    a_sec[0].name = text; a_sec[0].kind = of.SK_TEXT; a_sec[0].bytes = ?a_bytes[0];
+    a_sec[0].len = 8; a_sec[0].align = 1;
+    b_sec[0].name = text; b_sec[0].kind = of.SK_TEXT; b_sec[0].bytes = ?b_bytes[0];
+    b_sec[0].len = 24; b_sec[0].align = 1;
+
+    var a_syms: [1]of.Symbol;
+    var b_syms: [3]of.Symbol;
+    a_syms[0].name = dup; a_syms[0].section = 0; a_syms[0].offset = 0;
+    a_syms[0].size = 8; a_syms[0].flags = weak_flags;
+    b_syms[0].name = base; b_syms[0].section = 0; b_syms[0].offset = 0;
+    b_syms[0].size = 0; b_syms[0].flags = 0;
+    b_syms[1].name = dup; b_syms[1].section = 0; b_syms[1].offset = 8;
+    b_syms[1].size = 8; b_syms[1].flags = weak_flags;
+    b_syms[2].name = tail; b_syms[2].section = 0; b_syms[2].offset = 16;
+    b_syms[2].size = 8; b_syms[2].flags = strong_flags;
+
+    var reloc: [1]of.Relocation;
+    reloc[0].section = 0; reloc[0].offset = 0; reloc[0].kind = of.RK_ABS64;
+    reloc[0].symbol = base; reloc[0].addend = 16;
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "winner"), ?a_sec[0], 1, ?a_syms[0], 1,
+                       nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "loser"), ?b_sec[0], 1, ?b_syms[0], 3,
+                       ?reloc[0], 1);
+    var bases: [2]u32;
+    var plan: AtomPlan;
+    init_atom_plan(?plan);
+    val crossing: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](crossing) || plan.active) { ret 1; }
+
+    # a target that remains before the candidate does not cross it and leaves the
+    # duplicate eligible, proving retention is caused by the addend relationship.
+    reloc[0].addend = 4;
+    val same_side: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](same_side) || !plan.active || plan.drop_count != 1) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    # raw PC addends include an instruction-field bias. retain a local-anchor
+    # reference conservatively, but do not mistake a normal -4 call to the next
+    # global function for a pointer back into the candidate.
+    reloc[0].kind = of.RK_PC32;
+    reloc[0].addend = -4;
+    val pc_local: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](pc_local) || plan.active) { ret 1; }
+    reloc[0].symbol = tail;
+    val pc_global: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](pc_global) || !plan.active || plan.drop_count != 1) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+    ret 0;
+}
+
+# rk_plt32 is one 4-byte field on x64/aarch64 but an 8-byte auipc+jalr pair on
+# rv64. a pair starting before a losing atom and ending inside it must retain the
+# atom so the live JALR instruction is never discarded
+test "mach.lang.be.linker.atom_plan:rv64_plt_pair_boundary" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val dup: intern.StrId = lt_name(?s, "rvpairI3u64E");
+    val ext: intern.StrId = lt_name(?s, "callee");
+    val text: intern.StrId = lt_name(?s, ".text");
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    var a_bytes: [8]u8;
+    var b_bytes: [16]u8;
+    var a_sec: [1]of.Section;
+    var b_sec: [1]of.Section;
+    a_sec[0].name = text; a_sec[0].kind = of.SK_TEXT; a_sec[0].bytes = ?a_bytes[0];
+    a_sec[0].len = 8; a_sec[0].align = 1;
+    b_sec[0].name = text; b_sec[0].kind = of.SK_TEXT; b_sec[0].bytes = ?b_bytes[0];
+    b_sec[0].len = 16; b_sec[0].align = 1;
+
+    var a_syms: [1]of.Symbol;
+    var b_syms: [2]of.Symbol;
+    a_syms[0].name = dup; a_syms[0].section = 0; a_syms[0].offset = 0;
+    a_syms[0].size = 8; a_syms[0].flags = weak_flags;
+    b_syms[0].name = dup; b_syms[0].section = 0; b_syms[0].offset = 8;
+    b_syms[0].size = 8; b_syms[0].flags = weak_flags;
+    b_syms[1].name = ext; b_syms[1].section = of.SECTION_EXTERNAL;
+    b_syms[1].offset = 0; b_syms[1].size = 0;
+    b_syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var reloc: [1]of.Relocation;
+    reloc[0].section = 0; reloc[0].offset = 4; reloc[0].kind = of.RK_PLT32;
+    reloc[0].symbol = ext; reloc[0].addend = 0;
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "winner"), ?a_sec[0], 1, ?a_syms[0], 1,
+                       nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "loser"), ?b_sec[0], 1, ?b_syms[0], 2,
+                       ?reloc[0], 1);
+    var bases: [2]u32;
+    var plan: AtomPlan;
+    var x64: isa.IsaVTable = lt_isa(isa.ARCH_X86_64);
+    var rv64: isa.IsaVTable = lt_isa(isa.ARCH_RISCV64);
+    init_atom_plan(?plan);
+
+    val x: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, ?x64, ?plan);
+    if (R.is_err[bool, str](x) || !plan.active || plan.drop_count != 1) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    val rv: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, ?rv64, ?plan);
+    if (R.is_err[bool, str](rv) || plan.active) { ret 1; }
     ret 0;
 }
