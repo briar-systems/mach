@@ -31,7 +31,8 @@ to 8,200,192 bytes.
 - link: manifest requirements retain their `local`, `system`, and `framework`
   source semantics through direct and cascading links. Darwin resolves
   version-independent framework paths and `.dylib` install names for native and
-  cross-target plans, and the optional `[link.X].library` identity makes
+  cross-target plans, retaining resolved `@rpath/` search directories in Mach-O
+  executables, and the optional `[link.X].library` identity makes
   `#[library]` attribution portable across platform loader names without
   order-dependent identity collisions (#2424).
 - linker: final executable links discard proven losing weak function bodies and

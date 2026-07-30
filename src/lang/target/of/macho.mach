@@ -85,6 +85,8 @@ val LC_DYSYMTAB:      u32 = 0xB;
 val LC_UNIXTHREAD:    u32 = 0x5;
 val LC_LOAD_DYLIB:    u32 = 0xC;
 val LC_LOAD_DYLINKER: u32 = 0xE;
+# LC_REQ_DYLD marks LC_RPATH as required for correct loading semantics
+val LC_RPATH:         u32 = 0x8000001C;
 # the LC_REQ_DYLD bit is set on LC_DYLD_INFO_ONLY so a loader that cannot read
 # the compressed dyld-info stream refuses the image rather than mis-loading it
 val LC_DYLD_INFO_ONLY: u32 = 0x80000022;
@@ -171,6 +173,7 @@ val DYSYMTAB_CMD_SIZE:   usize = 80;
 val DYLD_INFO_CMD_SIZE:  usize = 48;   # cmd + cmdsize + 5 (off,size) pairs
 val DYLINKER_CMD_BASE:   usize = 12;   # cmd + cmdsize + name lc_str offset
 val DYLIB_CMD_BASE:      usize = 24;   # the dylib lc_str, then 3 version words
+val RPATH_CMD_BASE:      usize = 12;   # cmd + cmdsize + path lc_str offset
 val NLIST_64_SIZE:       usize = 16;
 val RELOC_INFO_SIZE:     usize = 8;
 
@@ -2110,6 +2113,13 @@ fun dylib_cmd_size(name: str) usize {
     ret bin.align_up(DYLIB_CMD_BASE + n + 1, 8);
 }
 
+# the byte size of an LC_RPATH command for one runtime search directory
+fun rpath_cmd_size(name: str) usize {
+    var n: usize = 0;
+    if (name != nil) { n = str_len(name); }
+    ret bin.align_up(RPATH_CMD_BASE + n + 1, 8);
+}
+
 # write the LC_LOAD_DYLINKER command naming the dynamic loader
 # ---
 # buf: the output buffer
@@ -2143,6 +2153,26 @@ fun write_load_dylib(buf: *u8, off: usize, name: str) usize {
     bin.write_u32_le(buf, off + 20, 0x10000);
     bin.write_str(buf, off + DYLIB_CMD_BASE, name);
     ret off + sz;
+}
+
+# write one LC_RPATH command naming a runtime search directory
+fun write_rpath(buf: *u8, off: usize, name: str) usize {
+    val sz: usize = rpath_cmd_size(name);
+    bin.write_u32_le(buf, off, LC_RPATH);
+    bin.write_u32_le(buf, off + 4, sz::u32);
+    bin.write_u32_le(buf, off + 8, RPATH_CMD_BASE::u32);
+    bin.write_str(buf, off + RPATH_CMD_BASE, name);
+    ret off + sz;
+}
+
+# whether a dependency's run path already appeared in the preceding prefix
+fun rpath_seen_before(libs: *of.DynLib, end: u32, rpath: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < end) {
+        if (libs[i].rpath == rpath) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # write the LC_UNIXTHREAD command carrying the entry point in the arch's thread
@@ -2864,9 +2894,20 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
                           + dylinker_cmd_size() + entry_cmd_size + LINKEDIT_DATA_CMD_SIZE;   # + LC_CODE_SIGNATURE
     if (pie) { sizeofcmds = sizeofcmds + BUILD_VERSION_CMD_SIZE + UUID_CMD_SIZE; }
     var di: u32 = 0;
-    for (di < dyn.lib_count) { sizeofcmds = sizeofcmds + dylib_cmd_size(bin.resolve_name(itn, dyn.libs[di].soname)); di = di + 1; }
+    var rpath_count: u32 = 0;
+    for (di < dyn.lib_count) {
+        sizeofcmds = sizeofcmds + dylib_cmd_size(bin.resolve_name(itn, dyn.libs[di].soname));
+        if (dyn.libs[di].rpath != intern.STR_NIL
+            && !rpath_seen_before(dyn.libs, di, dyn.libs[di].rpath)) {
+            sizeofcmds = sizeofcmds
+                + rpath_cmd_size(bin.resolve_name(itn, dyn.libs[di].rpath));
+            rpath_count = rpath_count + 1;
+        }
+        di = di + 1;
+    }
 
-    var ncmds: u32 = seg_cmds + 6 + dyn.lib_count;   # dyld_info,symtab,dysymtab,dylinker,entry,code_signature
+    var ncmds: u32 = seg_cmds + 6 + dyn.lib_count + rpath_count;
+    # dyld_info,symtab,dysymtab,dylinker,entry,code_signature + dylibs + rpaths
     if (pie) { ncmds = ncmds + 2; }                  # LC_BUILD_VERSION + LC_UUID
 
     # a non-mapped __DWARF segment (debug sections) is placed below the code
@@ -3151,8 +3192,17 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     bin.write_u32_le(buf, lc + 28, nimp);                   # nundefsym
     lc = lc + DYSYMTAB_CMD_SIZE;
 
-    # LC_LOAD_DYLINKER, then one LC_LOAD_DYLIB per dependency.
+    # LC_LOAD_DYLINKER, each distinct required LC_RPATH, then one LC_LOAD_DYLIB
+    # per dependency.
     lc = write_load_dylinker(buf, lc);
+    di = 0;
+    for (di < dyn.lib_count) {
+        if (dyn.libs[di].rpath != intern.STR_NIL
+            && !rpath_seen_before(dyn.libs, di, dyn.libs[di].rpath)) {
+            lc = write_rpath(buf, lc, bin.resolve_name(itn, dyn.libs[di].rpath));
+        }
+        di = di + 1;
+    }
     di = 0;
     for (di < dyn.lib_count) {
         lc = write_load_dylib(buf, lc, bin.resolve_name(itn, dyn.libs[di].soname));
@@ -4411,7 +4461,9 @@ fun ts_dyn_exec(arch_id: u32) u8 {
     segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?code[0];
 
     var libs: [1]of.DynLib;
-    libs[0].soname = t_intern(?itn, "libprobe.dylib");
+    libs[0].name = t_intern(?itn, "probe");
+    libs[0].soname = t_intern(?itn, "@rpath/libprobe.dylib");
+    libs[0].rpath = t_intern(?itn, "/opt/probe/lib");
     var imps: [1]of.DynImport;
     imps[0].symbol = t_intern(?itn, "probe_add");
     imps[0].lib_index = 0;
@@ -4464,6 +4516,9 @@ fun ts_dyn_exec(arch_id: u32) u8 {
     val ld: usize = t_find_lc(buf.data, LC_LOAD_DYLIB);
     if (ld == 0)                                                           { ret 1; }
     if (!t_bytes_contain(buf.data, ld, bin.read_u32_le(buf.data, ld + 4)::usize, "libprobe.dylib")) { ret 1; }
+    val rp: usize = t_find_lc(buf.data, LC_RPATH);
+    if (rp == 0)                                                           { ret 1; }
+    if (!t_bytes_contain(buf.data, rp, bin.read_u32_le(buf.data, rp + 4)::usize, "/opt/probe/lib")) { ret 1; }
 
     val info: usize = t_find_lc(buf.data, LC_DYLD_INFO_ONLY);
     if (info == 0)                                                         { ret 1; }

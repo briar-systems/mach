@@ -167,10 +167,13 @@ How an input resolves decides whether the link is static or dynamic:
   undefined `ext` that no input defines is a hard error.
 - A shared **`.so`**, **`.dylib`**, or **`.dll`** is a **dynamic** dependency.
   ELF records the library's `DT_SONAME`, Mach-O records its `LC_ID_DYLIB`
-  install name, and PE records the DLL basename. Darwin frameworks are declared
-  through `[link.X]` with `source = "framework"` and become version-independent
-  system framework paths. Undefined `ext` functions are then emitted as imports
-  for the target format. A static definition of the same symbol always wins.
+  install name, and PE records the DLL basename. When a discovered Mach-O
+  install name starts with `@rpath/`, the resolved library directory is retained
+  as an `LC_RPATH`; an unresolved explicit `@rpath/...` input is rejected because
+  it supplies no usable search directory. Darwin frameworks are declared through
+  `[link.X]` with `source = "framework"` and become version-independent system
+  framework paths. Undefined `ext` functions are then emitted as imports for the
+  target format. A static definition of the same symbol always wins.
 
 `-l <name>` prefers a static `.o`/`.a` over a shared library, so an `-l name`
 that has a local object is resolved statically exactly as before; the `.so`

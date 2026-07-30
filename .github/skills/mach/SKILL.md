@@ -184,7 +184,8 @@ time (`mach build . -l c`, a `[link.X]` manifest requirement, or an explicit
 `.o`/`.a`/`.so`/`.dylib`/`.dll`). On PE and Mach-O targets, pin each dynamic
 import with `#[library("name")]`. The value is the requirement's stable
 `library` identity (defaulting to the `[link.X]` table name); exact loader names
-remain accepted.
+remain accepted. A discovered Darwin `@rpath/` install name retains its selected
+library directory as an `LC_RPATH` command.
 
 ### `val` / `var`
 

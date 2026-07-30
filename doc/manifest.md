@@ -399,7 +399,9 @@ attribution never depends on requirement order.
 Whether an input links **statically** or **dynamically** follows the resolved file
 — a loose `.o` or static `.a` links statically; ELF `.so`, Mach-O `.dylib`,
 and PE `.dll` inputs are recorded using their format's canonical loader name.
-Darwin frameworks use a version-independent system framework path. See
+An `@rpath/` Mach-O install name also retains the directory where resolution found
+the dylib, which the executable records as `LC_RPATH`. Darwin frameworks use a
+version-independent system framework path. See
 [cli.md](cli.md#static-vs-dynamic-resolution) for the resolution rules and
 [language/ext-fun.md](language/ext-fun.md#linking-external-objects) for the
 `ext fun` workflow that consumes these inputs.

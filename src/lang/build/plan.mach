@@ -25,6 +25,7 @@ use std.data.toml;
 use fs: std.filesystem;
 use std.memory;
 use std.print;
+use std.process.env;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -39,6 +40,7 @@ use std.types.string.str_equals;
 use std.types.string.str_join;
 use std.types.string.str_len;
 use std.types.string.str_replace;
+use std.types.string.str_starts_with;
 use std.types.path;
 
 use A: std.allocator;
@@ -98,10 +100,12 @@ pub val LINK_DYNAMIC: LinkInputKind = 1;
 #          the plan allocator
 # library: stable logical `#[library]` attribution name; STR_NIL for an explicit
 #          path without a portable identity
+# rpath:   resolved root for a Mach-O `@rpath/` dependency; empty otherwise
 pub rec LinkInput {
     kind:    LinkInputKind;
     text:    str;
     library: intern.StrId;
+    rpath:   str;
 }
 
 # one build unit: a (target, profile, artifact) cell, everything concrete
@@ -663,10 +667,14 @@ pub fun resolve_token(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
         if (exists) {
             var install_name: [4096]u8;
             if (read_dylib_install_name(a, actual, ?install_name[0], 4096)) {
-                ret dyn_copy(a, ?install_name[0]);
+                ret dylib_copy(a, actual, ?install_name[0]);
             }
             ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "'", actual::str,
                 "' is not a loadable Mach-O dylib (missing a valid LC_ID_DYLIB)")));
+        }
+        if (str_starts_with(tok::str, "@rpath/")) {
+            ret R.err[LinkInput, outcome.Fail](outcome.user(
+                "an @rpath dylib input must resolve to an existing file so its runtime search path can be retained"));
         }
         ret dyn_copy(a, tok);
     }
@@ -703,8 +711,11 @@ pub fun resolve_token(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
     # `resolve_shared_into` writes the library's own canonical loader name.
     if (!found && !request.is_object_path(tok) && !is_shared_path(tok)) {
         var sname: [4096]u8;
-        if (resolve_shared_into(a, tgt, dirs, tok, ?sname[0], 4096)) {
-            ret dyn_copy(a, ?sname[0]);
+        var rpath: [4096]u8;
+        rpath[0] = 0;
+        if (resolve_shared_into(a, tgt, dirs, tok, ?sname[0], 4096,
+                                ?rpath[0], 4096)) {
+            ret dyn_copy_with_rpath(a, ?sname[0], ?rpath[0]);
         }
     }
 
@@ -718,6 +729,7 @@ pub fun resolve_token(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
     li.kind = LINK_STATIC;
     li.text = R.unwrap_ok[str, str](dup_r);
     li.library = intern.STR_NIL;
+    li.rpath = "";
     ret R.ok[LinkInput, outcome.Fail](li);
 }
 
@@ -773,18 +785,45 @@ fun resolve_framework(a: *A.Allocator, tgt: *target.Target,
     li.kind    = LINK_DYNAMIC;
     li.text    = install_name;
     li.library = intern.STR_NIL;
+    li.rpath   = "";
     ret R.ok[LinkInput, outcome.Fail](li);
 }
 
 # a DYNAMIC fact carrying an owned copy of `name`
 fun dyn_copy(a: *A.Allocator, name: *u8) R.Result[LinkInput, outcome.Fail] {
+    ret dyn_copy_with_rpath(a, name, ""::*u8);
+}
+
+# a DYNAMIC fact carrying owned copies of its loader name and optional run path
+fun dyn_copy_with_rpath(a: *A.Allocator, name: *u8,
+                        rpath: *u8) R.Result[LinkInput, outcome.Fail] {
     val dup_r: R.Result[str, str] = str_copy(a, name);
     if (R.is_err[str, str](dup_r)) { ret R.err[LinkInput, outcome.Fail](outcome.internal("out of memory")); }
+    var run_path: str = "";
+    if (rpath != nil && !str_empty(rpath::str)) {
+        val rp_r: R.Result[str, str] = str_copy(a, rpath);
+        if (R.is_err[str, str](rp_r)) { ret R.err[LinkInput, outcome.Fail](outcome.internal("out of memory")); }
+        run_path = R.unwrap_ok[str, str](rp_r);
+    }
     var li: LinkInput;
-    li.kind = LINK_DYNAMIC;
-    li.text = R.unwrap_ok[str, str](dup_r);
+    li.kind    = LINK_DYNAMIC;
+    li.text    = R.unwrap_ok[str, str](dup_r);
     li.library = intern.STR_NIL;
+    li.rpath   = run_path;
     ret R.ok[LinkInput, outcome.Fail](li);
+}
+
+# retain an existing dylib's resolved directory when its install name uses @rpath
+fun dylib_copy(a: *A.Allocator, actual: *u8,
+               install_name: *u8) R.Result[LinkInput, outcome.Fail] {
+    if (!str_starts_with(install_name::str, "@rpath/")) {
+        ret dyn_copy(a, install_name);
+    }
+    val rp_r: R.Result[str, str] = dylib_rpath(a, actual, install_name);
+    if (R.is_err[str, str](rp_r)) {
+        ret R.err[LinkInput, outcome.Fail](outcome.user(R.unwrap_err[str, str](rp_r)));
+    }
+    ret dyn_copy_with_rpath(a, install_name, R.unwrap_ok[str, str](rp_r)::*u8);
 }
 
 # concatenate `va` into one owned message string on `al`, for a Fail's message
@@ -1105,9 +1144,10 @@ fun dll_basename(path: *u8) *u8 {
 # dynamic fallback here. Target format gating prevents a Darwin cross-plan from
 # probing or consuming a host ELF shared library.
 fun resolve_shared_into(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
-                        name: *u8, buf: *u8, cap: usize) bool {
+                        name: *u8, buf: *u8, cap: usize,
+                        rpath: *u8, rpath_cap: usize) bool {
     if (str_equals(tgt.of.shared_input_ext, ".dylib")) {
-        ret resolve_dylib_into(a, tgt, dirs, name, buf, cap);
+        ret resolve_dylib_into(a, tgt, dirs, name, buf, cap, rpath, rpath_cap);
     }
     if (!str_equals(tgt.of.shared_input_ext, ".so")) { ret false; }
     ret resolve_elf_shared_into(a, tgt, dirs, name, buf, cap);
@@ -1134,17 +1174,20 @@ fun resolve_elf_shared_into(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[
 
 # resolve a bare Mach-O library name through -L and target system directories
 fun resolve_dylib_into(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
-                       name: *u8, buf: *u8, cap: usize) bool {
+                       name: *u8, buf: *u8, cap: usize,
+                       rpath: *u8, rpath_cap: usize) bool {
     var i: usize = 0;
     for (i < dirs.len) {
-        if (try_dylib_in_dir(a, dirs.data[i]::*u8, name, buf, cap)) { ret true; }
+        if (try_dylib_in_dir(a, dirs.data[i]::*u8, name, buf, cap,
+                             rpath, rpath_cap)) { ret true; }
         i = i + 1;
     }
     if (tgt.os != nil) {
         var li: u32 = 0;
         for (li < tgt.os.libdir_len) {
             val ld: str = tgt.os.libdirs[li];
-            if (!str_empty(ld) && try_dylib_in_dir(a, ld::*u8, name, buf, cap)) { ret true; }
+            if (!str_empty(ld) && try_dylib_in_dir(a, ld::*u8, name, buf, cap,
+                                                   rpath, rpath_cap)) { ret true; }
             li = li + 1;
         }
     }
@@ -1153,17 +1196,69 @@ fun resolve_dylib_into(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
 
 # probe `<dir>/lib<name>.dylib`, then `lib<name>.<N>.dylib` for N in 6..0
 fun try_dylib_in_dir(a: *A.Allocator, dir: *u8, name: *u8,
-                     buf: *u8, cap: usize) bool {
+                     buf: *u8, cap: usize, rpath: *u8, rpath_cap: usize) bool {
     var cand: [4096]u8;
     if (write_named_candidate(dir, "lib", name, "dylib", ?cand[0], 4096)
-        && accept_dylib(a, ?cand[0], buf, cap)) { ret true; }
+        && accept_dylib(a, ?cand[0], buf, cap)) {
+        ret dylib_rpath_into(a, ?cand[0], buf, rpath, rpath_cap);
+    }
     var v: i64 = 6;
     for (v >= 0) {
         if (write_named_dylib_version(dir, name, v::u32, ?cand[0], 4096)
-            && accept_dylib(a, ?cand[0], buf, cap)) { ret true; }
+            && accept_dylib(a, ?cand[0], buf, cap)) {
+            ret dylib_rpath_into(a, ?cand[0], buf, rpath, rpath_cap);
+        }
         v = v - 1;
     }
     ret false;
+}
+
+# write the selected file's resolved directory for an @rpath install name
+fun dylib_rpath_into(a: *A.Allocator, candidate: *u8, install_name: *u8,
+                     out: *u8, cap: usize) bool {
+    if (out == nil || cap == 0) { ret false; }
+    out[0] = 0;
+    if (!str_starts_with(install_name::str, "@rpath/")) { ret true; }
+    val rp_r: R.Result[str, str] = dylib_rpath(a, candidate, install_name);
+    if (R.is_err[str, str](rp_r)) { ret false; }
+    val rp: str = R.unwrap_ok[str, str](rp_r);
+    val n: usize = str_len(rp);
+    if (n + 1 > cap) { ret false; }
+    memory.raw_copy(out::ptr, rp::ptr, n + 1);
+    ret true;
+}
+
+# derive the runtime root whose appended @rpath suffix reaches `candidate`
+fun dylib_rpath(a: *A.Allocator, candidate: *u8,
+                install_name: *u8) R.Result[str, str] {
+    val abs_r: R.Result[str, str] = resolve_from_cwd(a, candidate::str);
+    if (R.is_err[str, str](abs_r)) { ret abs_r; }
+    val abs: str = R.unwrap_ok[str, str](abs_r);
+    val suffix: str = (install_name::usize + 7)::str;
+    if (!str_contains(suffix, "/")) { ret path.parent(a, abs); }
+    val abs_len: usize = str_len(abs);
+    val suffix_len: usize = str_len(suffix);
+    if (suffix_len == 0 || suffix[0] == '/' || abs_len <= suffix_len
+        || !str_ends_with(abs, suffix)) {
+        ret R.err[str, str](
+            "the selected dylib path does not match its @rpath install-name suffix");
+    }
+    var cut: usize = abs_len - suffix_len;
+    if (abs[cut - 1] != '/') {
+        ret R.err[str, str](
+            "the selected dylib path does not match its @rpath install-name suffix");
+    }
+    if (cut > 1) { cut = cut - 1; }
+    (abs::*u8)[cut] = 0;
+    ret R.ok[str, str](abs);
+}
+
+# resolve a relative selected path against the directory the probe used
+fun resolve_from_cwd(a: *A.Allocator, p: str) R.Result[str, str] {
+    if (path.is_abs(p)) { ret path.clone(a, p); }
+    val cwd_r: R.Result[str, str] = env.current_dir(a);
+    if (R.is_err[str, str](cwd_r)) { ret R.err[str, str](R.unwrap_err[str, str](cwd_r)); }
+    ret path.resolve(a, R.unwrap_ok[str, str](cwd_r), p);
 }
 
 # accept an existing Mach-O dylib and retain its canonical install name
@@ -1263,7 +1358,10 @@ pub fun explain(p: *BuildPlan, itn: *intern.Interner) {
         for (li < u.link_inputs.len) {
             val inp: *LinkInput = ?u.link_inputs.data[li];
             if (inp.kind == LINK_STATIC) { print.printf("  link    static  {}\n", inp.text); }
-            or                           { print.printf("  link    dynamic {}\n", inp.text); }
+            or {
+                print.printf("  link    dynamic {}\n", inp.text);
+                if (!str_empty(inp.rpath)) { print.printf("  rpath   {}\n", inp.rpath); }
+            }
             li = li + 1;
         }
 
@@ -1461,7 +1559,8 @@ test "mach.lang.build.plan.resolve_token:darwin_dylib_install_name" {
         ret 1;
     }
     val li: LinkInput = R.unwrap_ok[LinkInput, outcome.Fail](rr);
-    if (li.kind != LINK_DYNAMIC || !str_equals(li.text, "@rpath/libglfw.3.dylib")) {
+    if (li.kind != LINK_DYNAMIC || !str_equals(li.text, "@rpath/libglfw.3.dylib")
+        || !str_equals(li.rpath, root)) {
         fs.remove_all(?alloc, root);
         ret 1;
     }
@@ -1471,6 +1570,26 @@ test "mach.lang.build.plan.resolve_token:darwin_dylib_install_name" {
         resolve_token(?alloc, ?tgt, ?dirs, "", "hostonly"::*u8);
     fs.remove_all(?alloc, root);
     if (R.is_ok[LinkInput, outcome.Fail](host_only)) { ret 1; }
+    ret 0;
+}
+
+# @rpath roots preserve basename symlinks and strip nested install-name suffixes
+test "mach.lang.build.plan.dylib_rpath:matches_install_name_suffix" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val base: R.Result[str, str] =
+        dylib_rpath(?alloc, "/opt/lib/libfoo.dylib"::*u8,
+                    "@rpath/libfoo.3.dylib"::*u8);
+    val nested: R.Result[str, str] =
+        dylib_rpath(?alloc, "/opt/lib/sub/libfoo.dylib"::*u8,
+                    "@rpath/sub/libfoo.dylib"::*u8);
+    val mismatch: R.Result[str, str] =
+        dylib_rpath(?alloc, "/opt/lib/libfoo.dylib"::*u8,
+                    "@rpath/sub/libfoo.dylib"::*u8);
+    if (R.is_err[str, str](base) || R.is_err[str, str](nested)
+        || R.is_ok[str, str](mismatch)) { ret 1; }
+    if (!str_equals(R.unwrap_ok[str, str](base), "/opt/lib")
+        || !str_equals(R.unwrap_ok[str, str](nested), "/opt/lib")) { ret 1; }
     ret 0;
 }
 

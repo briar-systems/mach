@@ -132,7 +132,9 @@ mach build . -l c
   finally the working directory is searched for the same four names (loose
   objects preferred over archives). Only if no static candidate exists does it
   fall back to the selected target's shared spelling: `lib<name>.so[.N]` for
-  ELF or `lib<name>[.<N>].dylib` for Mach-O. `-L` and `-l` may each be repeated.
+  ELF or `lib<name>[.<N>].dylib` for Mach-O. A resolved `@rpath/` dylib carries
+  its selected directory into the executable as `LC_RPATH`. `-L` and `-l` may
+  each be repeated.
 
 ### Manifest
 
