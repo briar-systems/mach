@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.5] - 2026-07-30
+
+A compiler-output and vectorization patch. In controlled Linux x86_64 release
+self-host measurements, omitting production test bodies reduced the compiler
+from 11,177,984 to 8,884,224 bytes; pruning losing weak bodies reduced it again
+to 8,200,192 bytes.
+
+### Added
+- vectorize: register-only guarded diamonds in integer loops can be predicated
+  into packed mask/select operations on x86_64 and AArch64. Conditional memory,
+  float lanes, and unsupported guards remain scalar (#2348).
+
+### Changed
+- build: normal production IR no longer contains test bodies or test-only
+  generic/comptime instances. Tests remain semantically checked, discovered,
+  and emitted by `mach test` (#2320).
+- repository: the root `dep` checkout is ignored whether it is a directory or
+  symlink, without hiding nested `dep` paths (#2422).
+
+### Fixed
+- verify: `-g --verify-ir` accepts aggregate locals that SROA made unavailable
+  to debug metadata, while retaining the runtime aggregate-address check
+  (#2419).
+- linker: final executable links discard proven losing weak function bodies and
+  their dead relocations across ELF, COFF, and Mach-O; ELF shared links do
+  likewise. Relocatable output and target-specific relocation semantics remain
+  unchanged (#2386).
+
 ## [4.3.4] - 2026-07-30
 
 The release that actually closes #2327. `v4.3.3` was tagged at `4d482ca0` but
