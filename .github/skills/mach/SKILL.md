@@ -452,10 +452,12 @@ pub var cache_line: u8 = 0;
 ```
 
 `align` takes any comptime expression (`#[align($align_of(T))]`). A `library`
-pin must name a DLL in the target's `libs` set - pinning to an absent library
-is a link error; on ELF the pin is validated but has no binary effect. Beware:
-a line comment starting `#[` with no space parses as a decorator - write
-`# [...]` in prose comments.
+pin must name a selected dynamic dependency by its stable logical identity or
+exact loader name; pinning to an absent library is a link error. PE and Mach-O
+require attribution, while ELF validates the pin but emits global-search
+binding. Logical identities may not collide with a different dependency's
+loader name. Beware: a line comment starting `#[` with no space parses as a
+decorator - write `# [...]` in prose comments.
 
 `#[oblivious]` marks a constant-time boundary: the backend may not introduce a
 secret-dependent branch, a variable-latency op on a secret, or eliminate a
