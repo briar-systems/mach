@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.3.4] - 2026-07-30
+
+The release that actually closes #2327. `v4.3.3` was tagged at `4d482ca0` but
+never published: its `x86_64-darwin` PIE change exhausted memory during the
+native self-host, so CD produced no release. The merge was reverted and the tag
+deleted. This release supersedes it with the two root-cause fixes while keeping
+`x86_64-darwin` on its fixed-layout executable path.
+
+### Fixed
+- darwin: **`mach init` resolves the working directory on macOS.** Advances
+  mach-std to 0.20.2, whose Darwin `current_dir` path uses `F_GETPATH` rather
+  than the unsupported raw `__getcwd` syscall.
+- macho: **debug executables page-align their `__DWARF` segment.** XNU checks
+  every segment file offset before skipping a zero-`vmsize` segment, so the old
+  8-byte alignment made some small debug executables malformed. The writer now
+  uses the target's Mach-O page size: 4 KiB on x86_64 and 16 KiB on arm64.
+
+### Changed
+- dep: mach-std 0.20.1 → 0.20.2.
+
 ## [4.3.2] - 2026-07-27
 
 A patch release fixing macOS execution and project scaffolding issues (#2327). Advances standard library dependency to **mach-std 0.20.1**.
