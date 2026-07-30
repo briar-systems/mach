@@ -180,6 +180,9 @@ rec AtomRelocRef {
     source_module:  u32;
     reloc:           u32;
     width:           u32;
+    addend_mode:     rel.RelocAddendMode;
+    text_bias_min:   i32;
+    text_bias_max:   i32;
 }
 
 # the linker's mutable dynamic-link state: the format-neutral plan (`of.DynamicInfo`)
@@ -1650,14 +1653,9 @@ fun atom_resume_align(off: u32, section_align: u32) u32 {
     ret p;
 }
 
-# byte width patched by an abstract relocation kind
-fun atom_reloc_width(kind: of.RelocKind, arch: *isa.IsaVTable) u32 {
-    if (kind == of.RK_ABS64)   { ret 8; }
-    if (kind == of.RK_SECTION) { ret 2; }
-    # rv64's abstract PLT32 is an AUIPC+JALR pair, patched as one 8-byte site.
-    # x64 and AArch64 patch one 4-byte instruction/field for the same kind.
-    if (kind == of.RK_PLT32 && arch != nil && arch.id == isa.ARCH_RISCV64) { ret 8; }
-    ret 4;
+# physical relocation shape supplied by the active ISA's relocatable-object seam
+fun atom_reloc_traits(kind: of.RelocKind, arch: *isa.IsaVTable) rel.RelocTraits {
+    ret arch.reloc.reloc_traits::rel.RelocTraitsFn(kind);
 }
 
 # whether a second symbol is the exact synthetic section anchor emitted by COFF
@@ -1685,15 +1683,6 @@ fun atom_effective_offset(base: u32, addend: i64, out: *u32) bool {
     }
     if (addend < -(base::i64)) { ret false; }
     @out = (base::i64 + addend)::u32;
-    ret true;
-}
-
-# whether a relocation's addend is a true offset from S rather than an
-# instruction-field bias such as x64 PC32/PLT32's -4
-fun atom_addend_is_symbol_relative(kind: of.RelocKind) bool {
-    if (kind == of.RK_PC32 || kind == of.RK_PLT32 || kind == of.RK_GOTPCREL
-        || kind == of.RK_GOT_PAGE21 || kind == of.RK_GOT_LO12
-        || kind == of.RK_SECTION) { ret false; }
     ret true;
 }
 
@@ -1729,18 +1718,33 @@ fun atom_reloc_crosses_candidate(modules: *of.ObjectImage, reference: *AtomReloc
     # any local in this section is retained conservatively because foreign
     # containers may encode an anchor-relative target behind that bias.
     if (target.offset >= start && target.offset < end) { ret true; }
-    if (!atom_addend_is_symbol_relative(r.kind)) {
-        ret (target.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0;
+    if (reference.addend_mode == rel.RELOC_ADDEND_IGNORED) { ret false; }
+
+    var bias_min: i64 = 0;
+    var bias_max: i64 = 0;
+    if (reference.addend_mode == rel.RELOC_ADDEND_FIELD_BIAS
+        && r.section < modules[source_module].section_count
+        && modules[source_module].sections[r.section].kind == of.SK_TEXT) {
+        bias_min = reference.text_bias_min::i64;
+        bias_max = reference.text_bias_max::i64;
+    }
+    if ((bias_min > 0 && r.addend > 9223372036854775807 - bias_min)
+        || (bias_min < 0 && r.addend < (-9223372036854775807 - 1) - bias_min)
+        || (bias_max > 0 && r.addend > 9223372036854775807 - bias_max)
+        || (bias_max < 0 && r.addend < (-9223372036854775807 - 1) - bias_max)) {
+        ret true;
     }
 
-    var effective: u32 = 0;
-    if (!atom_effective_offset(target.offset, r.addend, ?effective)) { ret false; }
-    if (effective > modules[candidate_module].sections[candidate_section].len) { ret false; }
-
-    # source anchor and effective target must remain on the same side of the
-    # removed interval.
-    if (target.offset < start && effective >= start)   { ret true; }
-    if (target.offset >= end && effective < end)       { ret true; }
+    var effective_min: u32 = 0;
+    var effective_max: u32 = 0;
+    if (!atom_effective_offset(target.offset, r.addend + bias_min, ?effective_min)
+        || !atom_effective_offset(target.offset, r.addend + bias_max, ?effective_max)) {
+        ret true;
+    }
+    # the anchor and every possible effective target must remain on one side of
+    # the removed interval.
+    if (target.offset < start && effective_max >= start) { ret true; }
+    if (target.offset >= end && effective_min < end)     { ret true; }
     ret false;
 }
 
@@ -1963,6 +1967,12 @@ fun build_atom_plan(s: *session.Session, modules: *of.ObjectImage, module_count:
     val reloc_total: u32 = reloc_total64::u32;
     var refs: *AtomRelocRef = nil;
     if (reloc_total > 0) {
+        if (arch == nil || arch.reloc == nil || arch.reloc.reloc_traits == nil) {
+            map.dnit[intern.StrId, AtomWinner](?winners);
+            A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+            A.deallocate[AtomDrop](s.alloc, drops, candidate_count::usize);
+            ret R.err[bool, str]("linker: target cannot describe relocations");
+        }
         val rr: R.Result[*AtomRelocRef, str] =
             A.zallocate[AtomRelocRef](s.alloc, reloc_total::usize);
         if (R.is_err[*AtomRelocRef, str](rr)) {
@@ -2005,7 +2015,12 @@ fun build_atom_plan(s: *session.Session, modules: *of.ObjectImage, module_count:
                 refs[rw].target_symbol = 0xFFFFFFFF;
                 refs[rw].source_module = m;
                 refs[rw].reloc = ri;
-                refs[rw].width = atom_reloc_width(modules[m].relocations[ri].kind, arch);
+                val traits: rel.RelocTraits =
+                    atom_reloc_traits(modules[m].relocations[ri].kind, arch);
+                refs[rw].width = traits.field_width;
+                refs[rw].addend_mode = traits.addend_mode;
+                refs[rw].text_bias_min = traits.text_bias_min;
+                refs[rw].text_bias_max = traits.text_bias_max;
 
                 val r: *of.Relocation = ?modules[m].relocations[ri];
                 val lr: R.Result[*u32, str] =
@@ -2110,7 +2125,8 @@ fun build_atom_plan(s: *session.Session, modules: *of.ObjectImage, module_count:
             val r: *of.Relocation = ?modules[cm].relocations[ri];
             if (r.section == sym.section) {
                 val rstart: u64 = r.offset::u64;
-                val rend: u64 = rstart + atom_reloc_width(r.kind, arch)::u64;
+                val rend: u64 =
+                    rstart + atom_reloc_traits(r.kind, arch).field_width::u64;
                 if (rstart < end::u64 && rend > start::u64
                     && (rstart < start::u64 || rend > end::u64)) {
                     safe = false;
@@ -2793,6 +2809,10 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
     var ri: u32 = 0;
     for (ri < modules[m].reloc_count) {
         val r: *of.Relocation = ?modules[m].relocations[ri];
+        if (arch == nil || arch.reloc == nil || arch.reloc.reloc_traits == nil
+            || arch.reloc.apply_reloc == nil) {
+            ret R.err[bool, str](unsupported_message(s, r.kind));
+        }
         # a corrupt object can name an out-of-range section, or an offset past the
         # end of its own section (which would wrap the u32 patch cursor and scribble
         # outside the merged buffer). reject both loudly instead of silently dropping
@@ -2800,7 +2820,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         if (r.section >= modules[m].section_count) {
             ret R.err[bool, str]("linker: relocation names an out-of-range section");
         }
-        if (r.offset::u64 + atom_reloc_width(r.kind, arch)::u64
+        if (r.offset::u64 + atom_reloc_traits(r.kind, arch).field_width::u64
             > modules[m].sections[r.section].len::u64) {
             ret R.err[bool, str]("linker: relocation offset is past the end of its section");
         }
@@ -3962,9 +3982,11 @@ fun lt_image(s: *session.Session, name: intern.StrId,
     ret img;
 }
 
-# construct a description-only ISA vtable for architecture-sensitive linker tests
-fun lt_isa(id: u32) isa.IsaVTable {
-    ret isa.machine_isa(id, "test", 0, 8, nil, nil, nil);
+# look up one production ISA vtable from a populated test registry
+fun lt_isa(reg: *target.TargetRegistry, name: str) *isa.IsaVTable {
+    val found: O.Option[*isa.IsaVTable] = isa.lookup(?reg.isa, name);
+    if (!O.is_some[*isa.IsaVTable](found)) { ret nil; }
+    ret O.unwrap[*isa.IsaVTable](found);
 }
 
 # weak/strong symbol resolution is order-independent (#1257)
@@ -4110,6 +4132,10 @@ test "mach.lang.be.linker.atom_plan:copy_remap_and_reloc_liveness" {
     val sr: R.Result[session.Session, str] = session.init(?alloc);
     if (R.is_err[session.Session, str](sr)) { ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val x64: *isa.IsaVTable = lt_isa(?reg, "x86_64");
+    if (x64 == nil) { ret 1; }
 
     val wa: intern.StrId = lt_name(?s, "waI3u64E");
     val wb: intern.StrId = lt_name(?s, "wbI3u64E");
@@ -4176,7 +4202,7 @@ test "mach.lang.be.linker.atom_plan:copy_remap_and_reloc_liveness" {
     var plan: AtomPlan;
     init_atom_plan(?plan);
     val pr: R.Result[bool, str] =
-        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, x64, ?plan);
     if (R.is_err[bool, str](pr) || !plan.active || plan.drop_count != 1) { ret 1; }
 
     # [8,16) and [16,24) merge, leaving head then tail packed at an 8-byte
@@ -4330,6 +4356,10 @@ test "mach.lang.be.linker.atom_plan:coff_carrier_anchor" {
     val sr: R.Result[session.Session, str] = session.init(?alloc);
     if (R.is_err[session.Session, str](sr)) { ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val x64: *isa.IsaVTable = lt_isa(?reg, "x86_64");
+    if (x64 == nil) { ret 1; }
 
     val dup: intern.StrId = lt_name(?s, "coffI3u64E");
     val text: intern.StrId = lt_name(?s, ".text");
@@ -4371,7 +4401,7 @@ test "mach.lang.be.linker.atom_plan:coff_carrier_anchor" {
     var plan: AtomPlan;
     init_atom_plan(?plan);
     val inert_anchor: R.Result[bool, str] =
-        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 3, true, nil::*isa.IsaVTable, ?plan);
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 3, true, x64, ?plan);
     if (R.is_err[bool, str](inert_anchor) || !plan.active || plan.drop_count != 1) { ret 1; }
     if (plan.drops[0].section != 1 || plan.drops[0].start != 0
         || plan.drops[0].end != 8) { ret 1; }
@@ -4379,7 +4409,7 @@ test "mach.lang.be.linker.atom_plan:coff_carrier_anchor" {
 
     mods[1].reloc_count = 1;
     val referenced_anchor: R.Result[bool, str] =
-        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 3, true, nil::*isa.IsaVTable, ?plan);
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 3, true, x64, ?plan);
     if (R.is_err[bool, str](referenced_anchor) || plan.active) { ret 1; }
     ret 0;
 }
@@ -4393,6 +4423,11 @@ test "mach.lang.be.linker.atom_plan:anchor_addend_crossing_retains_loser" {
     val sr: R.Result[session.Session, str] = session.init(?alloc);
     if (R.is_err[session.Session, str](sr)) { ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val x64: *isa.IsaVTable = lt_isa(?reg, "x86_64");
+    val arm64: *isa.IsaVTable = lt_isa(?reg, "aarch64");
+    if (x64 == nil || arm64 == nil) { ret 1; }
 
     val dup: intern.StrId = lt_name(?s, "crossI3u64E");
     val base: intern.StrId = lt_name(?s, "section_base");
@@ -4433,14 +4468,14 @@ test "mach.lang.be.linker.atom_plan:anchor_addend_crossing_retains_loser" {
     var plan: AtomPlan;
     init_atom_plan(?plan);
     val crossing: R.Result[bool, str] =
-        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, x64, ?plan);
     if (R.is_err[bool, str](crossing) || plan.active) { ret 1; }
 
     # a target that remains before the candidate does not cross it and leaves the
     # duplicate eligible, proving retention is caused by the addend relationship.
     reloc[0].addend = 4;
     val same_side: R.Result[bool, str] =
-        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, x64, ?plan);
     if (R.is_err[bool, str](same_side) || !plan.active || plan.drop_count != 1) { ret 1; }
     free_atom_plan(?alloc, ?plan);
 
@@ -4450,13 +4485,20 @@ test "mach.lang.be.linker.atom_plan:anchor_addend_crossing_retains_loser" {
     reloc[0].kind = of.RK_PC32;
     reloc[0].addend = -4;
     val pc_local: R.Result[bool, str] =
-        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, x64, ?plan);
     if (R.is_err[bool, str](pc_local) || plan.active) { ret 1; }
     reloc[0].symbol = tail;
+    reloc[0].kind = of.RK_PLT32;
     val pc_global: R.Result[bool, str] =
-        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, x64, ?plan);
     if (R.is_err[bool, str](pc_global) || !plan.active || plan.drop_count != 1) { ret 1; }
     free_atom_plan(?alloc, ?plan);
+
+    # darwin arm64 CALL26 preserves its S-relative addend: tail-4 lands inside
+    # the candidate. x64's canonical field bias above instead reaches tail.
+    val arm_global: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, arm64, ?plan);
+    if (R.is_err[bool, str](arm_global) || plan.active) { ret 1; }
     ret 0;
 }
 
@@ -4469,6 +4511,12 @@ test "mach.lang.be.linker.atom_plan:rv64_plt_pair_boundary" {
     val sr: R.Result[session.Session, str] = session.init(?alloc);
     if (R.is_err[session.Session, str](sr)) { ret 1; }
     var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val x64: *isa.IsaVTable = lt_isa(?reg, "x86_64");
+    val arm64: *isa.IsaVTable = lt_isa(?reg, "aarch64");
+    val rv64: *isa.IsaVTable = lt_isa(?reg, "riscv64");
+    if (x64 == nil || arm64 == nil || rv64 == nil) { ret 1; }
 
     val dup: intern.StrId = lt_name(?s, "rvpairI3u64E");
     val ext: intern.StrId = lt_name(?s, "callee");
@@ -4504,17 +4552,20 @@ test "mach.lang.be.linker.atom_plan:rv64_plt_pair_boundary" {
                        ?reloc[0], 1);
     var bases: [2]u32;
     var plan: AtomPlan;
-    var x64: isa.IsaVTable = lt_isa(isa.ARCH_X86_64);
-    var rv64: isa.IsaVTable = lt_isa(isa.ARCH_RISCV64);
     init_atom_plan(?plan);
 
     val x: R.Result[bool, str] =
-        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, ?x64, ?plan);
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, x64, ?plan);
     if (R.is_err[bool, str](x) || !plan.active || plan.drop_count != 1) { ret 1; }
     free_atom_plan(?alloc, ?plan);
 
+    val arm: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, arm64, ?plan);
+    if (R.is_err[bool, str](arm) || !plan.active || plan.drop_count != 1) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
     val rv: R.Result[bool, str] =
-        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, ?rv64, ?plan);
+        build_atom_plan(?s, ?mods[0], 2, ?bases[0], 2, true, rv64, ?plan);
     if (R.is_err[bool, str](rv) || plan.active) { ret 1; }
     ret 0;
 }
