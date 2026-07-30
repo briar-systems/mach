@@ -28,9 +28,10 @@ to 8,200,192 bytes.
 - verify: `-g --verify-ir` accepts aggregate locals that SROA made unavailable
   to debug metadata, while retaining the runtime aggregate-address check
   (#2419).
-- linker: executable and shared links discard proven losing weak function
-  bodies and their dead relocations across ELF, COFF, and Mach-O. Relocatable
-  output and target-specific relocation semantics remain unchanged (#2386).
+- linker: final executable links discard proven losing weak function bodies and
+  their dead relocations across ELF, COFF, and Mach-O; ELF shared links do
+  likewise. Relocatable output and target-specific relocation semantics remain
+  unchanged (#2386).
 
 ## [4.3.4] - 2026-07-30
 
