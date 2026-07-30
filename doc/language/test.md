@@ -43,9 +43,11 @@ function body.
 
 ## Semantics
 
-Each `test` lowers to a zero-parameter, `i32`-returning function tagged as
-a test entry point so the runner can iterate it. The label is interned and
-becomes the lowered function's name.
+Every build resolves and type-checks each `test` body. Under `mach test`, each
+test also lowers to a zero-parameter, `i32`-returning function tagged as a test
+entry point so the runner can iterate it. The label is interned and becomes the
+lowered function's name. Ordinary builds omit test bodies from IR and object
+files.
 
 The body is checked against an `i32` return type. A test reports its result
 through that return value, treated as a process-style status:
