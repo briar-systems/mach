@@ -26,6 +26,7 @@
 
 use std.allocator.page;
 use std.collections.map;
+use std.collections.sort;
 use fs: std.filesystem;
 use std.collections.vector;
 use std.collections.vector.Vector;
@@ -123,6 +124,51 @@ rec MergedSection {
 rec SymbolLoc {
     vaddr: u64;
     weak:  bool;
+}
+
+# one losing weak function's byte interval in a flat input section. final-image
+# links remove [start,end); resume is the compressed offset at which the first
+# surviving byte after the interval lands
+rec AtomDrop {
+    section: u32;
+    start:   u32;
+    end:     u32;
+    resume:  u32;
+}
+
+# one input section's slice of the sorted drop array and its compressed length
+rec AtomSection {
+    first:    u32;
+    count:    u32;
+    live_len: u32;
+}
+
+# transient final-link function-atom liveness. it exists only inside the internal
+# executable/shared-object linker; relocatable objects and their native weak/group
+# encodings never consult it. an inactive plan is the exact legacy byte path
+rec AtomPlan {
+    drops:         *AtomDrop;
+    drop_count:    u32;
+    drop_cap:      u32;
+    sections:      *AtomSection;
+    section_count: u32;
+    removed_bytes: u64;
+    active:        bool;
+}
+
+# the current winning definition while the atom planner mirrors global
+# weak/strong resolution. module+symbol identify an earlier weak when a later
+# strong definition displaces it
+rec AtomWinner {
+    module: u32;
+    symbol: u32;
+    weak:   bool;
+}
+
+# a weak definition proven to lose global name resolution
+rec AtomCandidate {
+    module: u32;
+    symbol: u32;
 }
 
 # the linker's mutable dynamic-link state: the format-neutral plan (`of.DynamicInfo`)
@@ -422,6 +468,8 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     # in-place-patched modes (executable, shared object) dedup; a relocatable output
     # gets an inactive StrMerge and keeps the classic concatenation (#1708).
     val patching: bool = (mode == LINK_EXE) || shared;
+    var atoms: AtomPlan;
+    init_atom_plan(?atoms);
     var strm: StrMerge;
     val sm_r: R.Result[StrMerge, str] = build_str_merge(s, modules, module_count, patching);
     if (R.is_err[StrMerge, str](sm_r)) {
@@ -455,7 +503,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     if (sec_total > 0) {
         val pr: R.Result[*Placement, str] = A.zallocate[Placement](alloc, sec_total::usize);
         if (R.is_err[*Placement, str](pr)) {
-            free_scratch(alloc, nil, 0, nil, 0, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+            free_scratch(alloc, nil, 0, nil, 0, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
             ret R.err[bool, str](R.unwrap_err[*Placement, str](pr));
         }
         placements = R.unwrap_ok[*Placement, str](pr);
@@ -465,15 +513,26 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     var sec_base: *u32 = nil;
     val br: R.Result[*u32, str] = A.zallocate[u32](alloc, module_count::usize);
     if (R.is_err[*u32, str](br)) {
-        free_scratch(alloc, placements, sec_total, nil, 0, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, nil, 0, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[*u32, str](br));
     }
     sec_base = R.unwrap_ok[*u32, str](br);
 
+    # Final executable/shared links may discard only function atoms whose weak
+    # definition actually lost global resolution. A relocatable link receives an
+    # inert plan and preserves its native weak/group representation byte-for-byte.
+    val atom_r: R.Result[bool, str] =
+        build_atom_plan(s, modules, module_count, sec_base, sec_total, patching, ?atoms);
+    if (R.is_err[bool, str](atom_r)) {
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
+        ret R.err[bool, str](R.unwrap_err[bool, str](atom_r));
+    }
+
     val acc_r: R.Result[bool, str] =
-        accumulate_sections(s, modules, module_count, merged, debug_names, debug_count, placements, sec_base, ?strm);
+        accumulate_sections(s, modules, module_count, merged, debug_names, debug_count,
+                            placements, sec_base, ?strm, ?atoms);
     if (R.is_err[bool, str](acc_r)) {
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[bool, str](acc_r));
     }
 
@@ -493,10 +552,11 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
         map.init[intern.StrId, SymbolLoc](alloc, map.hash_u32, map.eq_u32);
 
     val collect_r: R.Result[bool, str] =
-        collect_symbols(s, modules, module_count, placements, sec_base, ?sym_locs, assign_vaddrs);
+        collect_symbols(s, modules, module_count, placements, sec_base, ?sym_locs,
+                        assign_vaddrs, ?atoms);
     if (R.is_err[bool, str](collect_r)) {
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[bool, str](collect_r));
     }
 
@@ -506,7 +566,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     val img_r: R.Result[of.ObjectImage, str] = obj.init(alloc, ?s.interner, image_name(modules, module_count));
     if (R.is_err[of.ObjectImage, str](img_r)) {
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[of.ObjectImage, str](img_r));
     }
     out_img = R.unwrap_ok[of.ObjectImage, str](img_r);
@@ -517,17 +577,18 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     if (R.is_err[*u32, str](mto_r)) {
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[*u32, str](mto_r));
     }
     merged_to_out = R.unwrap_ok[*u32, str](mto_r);
 
     val build_r: R.Result[bool, str] =
-        build_merged_image(s, ?out_img, modules, module_count, merged, merged_count, placements, sec_base, merged_to_out, ?strm);
+        build_merged_image(s, ?out_img, modules, module_count, merged, merged_count,
+                           placements, sec_base, merged_to_out, ?strm, ?atoms);
     if (R.is_err[bool, str](build_r)) {
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[bool, str](build_r));
     }
 
@@ -548,23 +609,25 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
         dyn.info.pie = position_independent;
         if (dynamic) {
             val dr: R.Result[bool, str] =
-                build_dynamic_info(s, tgt, ?dyn, modules, module_count, ?sym_locs, sonames, soname_count);
+                build_dynamic_info(s, tgt, ?dyn, modules, module_count, ?sym_locs,
+                                   sonames, soname_count, sec_base, ?atoms);
             if (R.is_err[bool, str](dr)) {
                 free_dynstate(alloc, ?dyn);
                 obj.dnit(?out_img);
                 map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-                free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+                free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
                 ret R.err[bool, str](R.unwrap_err[bool, str](dr));
             }
         }
 
         val patch_r: R.Result[bool, str] =
-            patch_relocations(s, ?out_img, modules, module_count, placements, sec_base, merged_to_out, ?sym_locs, ?dyn, ?strm, tgt.isa);
+            patch_relocations(s, ?out_img, modules, module_count, placements, sec_base,
+                              merged_to_out, ?sym_locs, ?dyn, ?strm, tgt.isa, ?atoms);
         if (R.is_err[bool, str](patch_r)) {
             free_dynstate(alloc, ?dyn);
             obj.dnit(?out_img);
             map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-            free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+            free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
             ret R.err[bool, str](R.unwrap_err[bool, str](patch_r));
         }
 
@@ -582,7 +645,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
         free_dynstate(alloc, ?dyn);
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
 
         if (R.is_err[bool, str](emit_r)) {
             ret R.err[bool, str](R.unwrap_err[bool, str](emit_r));
@@ -597,7 +660,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     if (R.is_err[bool, str](carry_r)) {
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[bool, str](carry_r));
     }
 
@@ -605,7 +668,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
 
     obj.dnit(?out_img);
     map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-    free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+    free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
 
     if (R.is_err[bool, str](obj_r)) {
         ret R.err[bool, str](R.unwrap_err[bool, str](obj_r));
@@ -1507,6 +1570,412 @@ fun free_str_merge(sm: *StrMerge) {
     enc.buf_dnit(?sm.buf);
 }
 
+# reset a final-link atom plan to its inert state
+fun init_atom_plan(plan: *AtomPlan) {
+    plan.drops         = nil;
+    plan.drop_count    = 0;
+    plan.drop_cap      = 0;
+    plan.sections      = nil;
+    plan.section_count = 0;
+    plan.removed_bytes = 0;
+    plan.active        = false;
+}
+
+# release a final-link atom plan's sorted ranges and section index
+fun free_atom_plan(alloc: *A.Allocator, plan: *AtomPlan) {
+    if (plan == nil) { ret; }
+    if (plan.drops != nil && plan.drop_cap > 0) {
+        A.deallocate[AtomDrop](alloc, plan.drops, plan.drop_cap::usize);
+    }
+    if (plan.sections != nil && plan.section_count > 0) {
+        A.deallocate[AtomSection](alloc, plan.sections, plan.section_count::usize);
+    }
+    init_atom_plan(plan);
+}
+
+# order discarded atoms by flat input section and source interval
+fun atom_drop_cmp(a: *AtomDrop, b: *AtomDrop) i64 {
+    if (a.section < b.section) { ret -1; }
+    if (a.section > b.section) { ret 1; }
+    if (a.start < b.start)     { ret -1; }
+    if (a.start > b.start)     { ret 1; }
+    if (a.end < b.end)         { ret -1; }
+    if (a.end > b.end)         { ret 1; }
+    ret 0;
+}
+
+# largest power-of-two alignment required by the source byte at `off`, capped
+# at the input section's declared alignment
+fun atom_resume_align(off: u32, section_align: u32) u32 {
+    var limit: u32 = section_align;
+    if (limit == 0) { limit = 1; }
+    var p: u32 = 1;
+    for ((off & p) == 0 && p < limit && p < 0x40000000) { p = p << 1; }
+    ret p;
+}
+
+# byte width patched by an abstract relocation kind
+fun atom_reloc_width(kind: of.RelocKind) u32 {
+    if (kind == of.RK_ABS64)   { ret 8; }
+    if (kind == of.RK_SECTION) { ret 2; }
+    ret 4;
+}
+
+# fill each module's base in the flat input-section array
+fun fill_section_bases(modules: *of.ObjectImage, module_count: u32, sec_base: *u32) {
+    var flat: u32 = 0;
+    var m: u32 = 0;
+    for (m < module_count) {
+        sec_base[m] = flat;
+        flat = flat + modules[m].section_count;
+        m = m + 1;
+    }
+}
+
+# whether `off` lies in a discarded atom of flat input section `section`
+fun atom_offset_dead(plan: *AtomPlan, section: u32, off: u32) bool {
+    if (plan == nil || !plan.active || section >= plan.section_count) { ret false; }
+    val meta: *AtomSection = ?plan.sections[section];
+    var i: u32 = meta.first;
+    val end: u32 = meta.first + meta.count;
+    for (i < end) {
+        val drop: *AtomDrop = ?plan.drops[i];
+        if (off < drop.start) { ret false; }
+        if (off < drop.end)   { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# map a live source offset into its compressed input-section offset. callers
+# test atom_offset_dead first; an offset inside a dead interval maps to its
+# resume point defensively
+fun atom_live_offset(plan: *AtomPlan, section: u32, off: u32) u32 {
+    if (plan == nil || !plan.active || section >= plan.section_count) { ret off; }
+    val meta: *AtomSection = ?plan.sections[section];
+    var src_cursor: u32 = 0;
+    var dst_cursor: u32 = 0;
+    var i: u32 = meta.first;
+    val end: u32 = meta.first + meta.count;
+    for (i < end) {
+        val drop: *AtomDrop = ?plan.drops[i];
+        if (off < drop.start) { ret dst_cursor + (off - src_cursor); }
+        if (off < drop.end)   { ret drop.resume; }
+        src_cursor = drop.end;
+        dst_cursor = drop.resume;
+        i = i + 1;
+    }
+    ret dst_cursor + (off - src_cursor);
+}
+
+# compressed byte length of a flat input section, or the original length on
+# the inert path
+fun atom_live_len(plan: *AtomPlan, section: u32, original_len: u32) u32 {
+    if (plan == nil || !plan.active || section >= plan.section_count) { ret original_len; }
+    ret plan.sections[section].live_len;
+}
+
+# copy one input section while omitting its discarded atom intervals. output
+# storage is zero-initialized, so alignment gaps inserted at resume points need
+# no explicit writes
+fun copy_live_section(dst: *u8, src: *u8, src_len: u32, plan: *AtomPlan, section: u32) {
+    if (plan == nil || !plan.active || section >= plan.section_count
+        || plan.sections[section].count == 0) {
+        memory.copy[u8](dst, src, src_len::usize);
+        ret;
+    }
+
+    val meta: *AtomSection = ?plan.sections[section];
+    var src_cursor: u32 = 0;
+    var dst_cursor: u32 = 0;
+    var i: u32 = meta.first;
+    val end: u32 = meta.first + meta.count;
+    for (i < end) {
+        val drop: *AtomDrop = ?plan.drops[i];
+        val n: u32 = drop.start - src_cursor;
+        if (n > 0) {
+            memory.copy[u8](?dst[dst_cursor], ?src[src_cursor], n::usize);
+            dst_cursor = dst_cursor + n;
+        }
+        src_cursor = drop.end;
+        dst_cursor = drop.resume;
+        i = i + 1;
+    }
+    if (src_cursor < src_len) {
+        memory.copy[u8](?dst[dst_cursor], ?src[src_cursor], (src_len - src_cursor)::usize);
+    }
+}
+
+# build transient function-atom liveness for a final internal link. global
+# definitions are first resolved with the same first-weak/strong-override rules
+# as collect_symbols. only a weak GLOBAL FUNCTION in SK_TEXT that actually loses
+# is eligible. its extent runs to the next global function entry (or section end);
+# another symbol inside the interval or a relocation field crossing its boundary
+# keeps the interval conservatively live
+fun build_atom_plan(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+                    sec_base: *u32, sec_total: u32, enabled: bool,
+                    plan: *AtomPlan) R.Result[bool, str] {
+    fill_section_bases(modules, module_count, sec_base);
+    if (!enabled) { ret R.ok[bool, str](true); }
+
+    var symbol_total64: u64 = 0;
+    var m: u32 = 0;
+    for (m < module_count) {
+        symbol_total64 = symbol_total64 + modules[m].symbol_count::u64;
+        if (symbol_total64 > 0xFFFFFFFF) {
+            ret R.err[bool, str]("linker: input symbol count exceeds the u32 limit");
+        }
+        m = m + 1;
+    }
+    val symbol_total: u32 = symbol_total64::u32;
+
+    var candidates: *AtomCandidate = nil;
+    if (symbol_total > 0) {
+        val cr: R.Result[*AtomCandidate, str] =
+            A.zallocate[AtomCandidate](s.alloc, symbol_total::usize);
+        if (R.is_err[*AtomCandidate, str](cr)) {
+            ret R.err[bool, str](R.unwrap_err[*AtomCandidate, str](cr));
+        }
+        candidates = R.unwrap_ok[*AtomCandidate, str](cr);
+    }
+
+    var winners: map.Map[intern.StrId, AtomWinner] =
+        map.init[intern.StrId, AtomWinner](s.alloc, map.hash_u32, map.eq_u32);
+    var candidate_count: u32 = 0;
+    m = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (sym.section == of.SECTION_EXTERNAL) { sy = sy + 1; cnt; }
+            if (sym.section >= modules[m].section_count) {
+                map.dnit[intern.StrId, AtomWinner](?winners);
+                if (candidates != nil) {
+                    A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+                }
+                ret R.err[bool, str](oor_section_message(s, sym.name, modules[m].name));
+            }
+            if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { sy = sy + 1; cnt; }
+
+            val weak: bool = (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0;
+            val existing: R.Result[*AtomWinner, str] =
+                map.get[intern.StrId, AtomWinner](?winners, ?sym.name);
+            if (R.is_ok[*AtomWinner, str](existing)) {
+                val cur: *AtomWinner = R.unwrap_ok[*AtomWinner, str](existing);
+                if (weak) {
+                    candidates[candidate_count].module = m;
+                    candidates[candidate_count].symbol = sy;
+                    candidate_count = candidate_count + 1;
+                    sy = sy + 1;
+                    cnt;
+                }
+                if (!cur.weak) {
+                    map.dnit[intern.StrId, AtomWinner](?winners);
+                    if (candidates != nil) {
+                        A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+                    }
+                    ret R.err[bool, str](dup_message(s, sym.name));
+                }
+                # a later strong definition displaces the earlier weak winner.
+                candidates[candidate_count].module = cur.module;
+                candidates[candidate_count].symbol = cur.symbol;
+                candidate_count = candidate_count + 1;
+                cur.module = m;
+                cur.symbol = sy;
+                cur.weak = false;
+                sy = sy + 1;
+                cnt;
+            }
+
+            var winner: AtomWinner;
+            winner.module = m;
+            winner.symbol = sy;
+            winner.weak = weak;
+            val ins: R.Result[bool, str] =
+                map.insert[intern.StrId, AtomWinner](?winners, sym.name, winner);
+            if (R.is_err[bool, str](ins)) {
+                map.dnit[intern.StrId, AtomWinner](?winners);
+                if (candidates != nil) {
+                    A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+                }
+                ret R.err[bool, str](R.unwrap_err[bool, str](ins));
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    map.dnit[intern.StrId, AtomWinner](?winners);
+
+    if (candidate_count == 0) {
+        if (candidates != nil) {
+            A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+        }
+        ret R.ok[bool, str](true);
+    }
+
+    val dr: R.Result[*AtomDrop, str] =
+        A.zallocate[AtomDrop](s.alloc, candidate_count::usize);
+    if (R.is_err[*AtomDrop, str](dr)) {
+        A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+        ret R.err[bool, str](R.unwrap_err[*AtomDrop, str](dr));
+    }
+    val drops: *AtomDrop = R.unwrap_ok[*AtomDrop, str](dr);
+    var drop_count: u32 = 0;
+
+    var ci: u32 = 0;
+    for (ci < candidate_count) {
+        val cm: u32 = candidates[ci].module;
+        val cy: u32 = candidates[ci].symbol;
+        val sym: *of.Symbol = ?modules[cm].symbols[cy];
+        val sec: *of.Section = ?modules[cm].sections[sym.section];
+        val need: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+        if ((sym.flags & need) != need || sec.kind != of.SK_TEXT || sec.bytes == nil
+            || sym.offset >= sec.len) {
+            ci = ci + 1;
+            cnt;
+        }
+
+        val start: u32 = sym.offset;
+        var end: u32 = sec.len;
+        var sy: u32 = 0;
+        for (sy < modules[cm].symbol_count) {
+            val other: *of.Symbol = ?modules[cm].symbols[sy];
+            if (other.section == sym.section
+                && (other.flags & (of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION))
+                    == (of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION)
+                && other.offset > start && other.offset < end) {
+                end = other.offset;
+            }
+            sy = sy + 1;
+        }
+        if (end <= start) { ci = ci + 1; cnt; }
+
+        # A second symbol in the candidate interval may be addressable from live
+        # code. Keep the whole atom rather than needing a target-reachability
+        # closure; normal generated generic bodies have only their entry symbol.
+        var safe: bool = true;
+        sy = 0;
+        for (sy < modules[cm].symbol_count) {
+            if (sy != cy) {
+                val other: *of.Symbol = ?modules[cm].symbols[sy];
+                if (other.section == sym.section && other.offset >= start && other.offset < end) {
+                    safe = false;
+                }
+            }
+            sy = sy + 1;
+        }
+
+        # A patch field wholly inside the losing body dies with it. A field that
+        # crosses either boundary makes the inferred function extent unsafe.
+        var ri: u32 = 0;
+        for (safe && ri < modules[cm].reloc_count) {
+            val r: *of.Relocation = ?modules[cm].relocations[ri];
+            if (r.section == sym.section) {
+                val rstart: u64 = r.offset::u64;
+                val rend: u64 = rstart + atom_reloc_width(r.kind)::u64;
+                if (rstart < end::u64 && rend > start::u64
+                    && (rstart < start::u64 || rend > end::u64)) {
+                    safe = false;
+                }
+            }
+            ri = ri + 1;
+        }
+        if (safe) {
+            drops[drop_count].section = sec_base[cm] + sym.section;
+            drops[drop_count].start = start;
+            drops[drop_count].end = end;
+            drops[drop_count].resume = 0;
+            drop_count = drop_count + 1;
+        }
+        ci = ci + 1;
+    }
+    A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+
+    if (drop_count == 0) {
+        A.deallocate[AtomDrop](s.alloc, drops, candidate_count::usize);
+        ret R.ok[bool, str](true);
+    }
+
+    sort.sort[AtomDrop](drops, drop_count::usize, atom_drop_cmp);
+
+    # Merge adjacent/overlapping losing functions before alignment is restored,
+    # so no padding is inserted between two bytes ranges that both disappear.
+    var merged_count: u32 = 0;
+    var di: u32 = 0;
+    for (di < drop_count) {
+        if (merged_count > 0
+            && drops[merged_count - 1].section == drops[di].section
+            && drops[di].start <= drops[merged_count - 1].end) {
+            if (drops[di].end > drops[merged_count - 1].end) {
+                drops[merged_count - 1].end = drops[di].end;
+            }
+        }
+        or {
+            drops[merged_count] = drops[di];
+            merged_count = merged_count + 1;
+        }
+        di = di + 1;
+    }
+
+    val sr: R.Result[*AtomSection, str] =
+        A.zallocate[AtomSection](s.alloc, sec_total::usize);
+    if (R.is_err[*AtomSection, str](sr)) {
+        A.deallocate[AtomDrop](s.alloc, drops, candidate_count::usize);
+        ret R.err[bool, str](R.unwrap_err[*AtomSection, str](sr));
+    }
+    val sections: *AtomSection = R.unwrap_ok[*AtomSection, str](sr);
+
+    di = 0;
+    var flat: u32 = 0;
+    m = 0;
+    for (m < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            val sec: *of.Section = ?modules[m].sections[sc];
+            val meta: *AtomSection = ?sections[flat];
+            meta.first = di;
+            var src_cursor: u32 = 0;
+            var dst_cursor: u32 = 0;
+            for (di < merged_count && drops[di].section == flat) {
+                dst_cursor = dst_cursor + (drops[di].start - src_cursor);
+                if (drops[di].end < sec.len) {
+                    val a: u32 = atom_resume_align(drops[di].end, sec.align);
+                    dst_cursor = bin.align_up_u64(dst_cursor::u64, a::u64)::u32;
+                }
+                drops[di].resume = dst_cursor;
+                src_cursor = drops[di].end;
+                di = di + 1;
+            }
+            meta.count = di - meta.first;
+            meta.live_len = dst_cursor + (sec.len - src_cursor);
+            flat = flat + 1;
+            sc = sc + 1;
+        }
+        m = m + 1;
+    }
+
+    plan.drops = drops;
+    plan.drop_count = merged_count;
+    plan.drop_cap = candidate_count;
+    plan.sections = sections;
+    plan.section_count = sec_total;
+    plan.removed_bytes = 0;
+    flat = 0;
+    m = 0;
+    for (m < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            plan.removed_bytes = plan.removed_bytes
+                + (modules[m].sections[sc].len - sections[flat].live_len)::u64;
+            flat = flat + 1;
+            sc = sc + 1;
+        }
+        m = m + 1;
+    }
+    plan.active = true;
+    ret R.ok[bool, str](true);
+}
+
 # whether the NUL-terminated string at `src[src_off..]` byte-equals the one at
 # `ded[ded_off..]`, both bounded by their buffer lengths. the load-bearing guard on the
 # `.debug_str` dedup remap (#1708): a wrong-but-valid strp offset is invisible to
@@ -1566,7 +2035,8 @@ fun total_sections(modules: *of.ObjectImage, module_count: u32) u32 {
 # ret:          ok(true) on success, or an error string
 fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
                         merged: *MergedSection, debug_names: *intern.StrId, debug_count: u32,
-                        placements: *Placement, sec_base: *u32, strm: *StrMerge) R.Result[bool, str] {
+                        placements: *Placement, sec_base: *u32, strm: *StrMerge,
+                        atoms: *AtomPlan) R.Result[bool, str] {
     # .debug_abbrev is byte-identical across every module (a deterministic, complete
     # build_abbrev) and every CU references it at offset 0, so only the first copy is
     # ever read. dedup it: a later object's table shares the first at offset 0 and adds
@@ -1642,7 +2112,8 @@ fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_co
                 # rejected rather than wrapping the u32 length into a tiny value that
                 # later truncates the output.
                 val off64: u64 = bin.align_up_u64(merged[ki].len::u64, a::u64);
-                val newlen: u64 = off64 + sec.len::u64;
+                val contribution_len: u32 = atom_live_len(atoms, flat, sec.len);
+                val newlen: u64 = off64 + contribution_len::u64;
                 if (newlen > 0xFFFFFFFF) {
                     ret R.err[bool, str](named_message(s, "linker: merged section '", merged_section_name(s, sec.kind), "' exceeds the 4 GiB u32 limit", "linker: merged section size exceeds the 4 GiB u32 limit"));
                 }
@@ -1732,7 +2203,8 @@ fun finalize_placement_vaddrs(merged: *MergedSection, placements: *Placement, se
 # ret:          ok(true) on success, or an error string
 fun collect_symbols(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
                     placements: *Placement, sec_base: *u32,
-                    sym_locs: *map.Map[intern.StrId, SymbolLoc], have_vaddrs: bool) R.Result[bool, str] {
+                    sym_locs: *map.Map[intern.StrId, SymbolLoc], have_vaddrs: bool,
+                    atoms: *AtomPlan) R.Result[bool, str] {
     var m: u32 = 0;
     for (m < module_count) {
         var sy: u32 = 0;
@@ -1748,11 +2220,14 @@ fun collect_symbols(s: *session.Session, modules: *of.ObjectImage, module_count:
             if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { sy = sy + 1; cnt; }
 
             val flat: u32 = sec_base[m] + sym.section;
+            if (atom_offset_dead(atoms, flat, sym.offset)) { sy = sy + 1; cnt; }
             val pl: *Placement = ?placements[flat];
 
             val is_weak: bool = (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0;
             var vaddr: u64 = 0;
-            if (have_vaddrs) { vaddr = pl.vaddr + sym.offset::u64; }
+            if (have_vaddrs) {
+                vaddr = pl.vaddr + atom_live_offset(atoms, flat, sym.offset)::u64;
+            }
 
             val existing: R.Result[*SymbolLoc, str] =
                 map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name);
@@ -1808,7 +2283,8 @@ fun collect_symbols(s: *session.Session, modules: *of.ObjectImage, module_count:
 fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
                        modules: *of.ObjectImage, module_count: u32,
                        merged: *MergedSection, merged_count: u32, placements: *Placement, sec_base: *u32,
-                       merged_to_out: *u32, strm: *StrMerge) R.Result[bool, str] {
+                       merged_to_out: *u32, strm: *StrMerge,
+                       atoms: *AtomPlan) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
 
     # map each used merged slot to its output-section index so symbols/relocations
@@ -1871,7 +2347,9 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
 
             val dst: *u8 = out_img.sections[out_ix].bytes;
             val off: u32 = placements[flat].offset;
-            memory.copy[u8](?dst[off], src.bytes, src.len::usize);
+            if (atom_live_len(atoms, flat, src.len) > 0) {
+                copy_live_section(?dst[off], src.bytes, src.len, atoms, flat);
+            }
 
             sc = sc + 1;
         }
@@ -1892,6 +2370,7 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
             }
 
             val flat: u32 = sec_base[m] + isym.section;
+            if (atom_offset_dead(atoms, flat, isym.offset)) { sy = sy + 1; cnt; }
             val ki: u32 = placements[flat].merged_index;
             val out_ix: u32 = merged_to_out[ki];
             if (out_ix == 0xFFFFFFFF) { sy = sy + 1; cnt; }
@@ -1899,7 +2378,8 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
             var osym: of.Symbol;
             osym.name    = isym.name;
             osym.section = out_ix;
-            osym.offset  = placements[flat].offset + isym.offset;
+            osym.offset  = placements[flat].offset
+                + atom_live_offset(atoms, flat, isym.offset);
             osym.size    = isym.size;
             osym.flags   = isym.flags;
 
@@ -1944,7 +2424,8 @@ fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
                      modules: *of.ObjectImage, module_count: u32,
                      placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                      sym_locs: *map.Map[intern.StrId, SymbolLoc],
-                     dyn: *DynState, strm: *StrMerge, arch: *isa.IsaVTable) R.Result[bool, str] {
+                     dyn: *DynState, strm: *StrMerge, arch: *isa.IsaVTable,
+                     atoms: *AtomPlan) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
 
     var m: u32 = 0;
@@ -1956,14 +2437,16 @@ fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
         # module's relocations are patched, regardless of outcome.
         var local_map: map.Map[intern.StrId, u64] =
             map.init[intern.StrId, u64](alloc, map.hash_u32, map.eq_u32);
-        val br: R.Result[bool, str] = build_local_index(modules, m, placements, sec_base, ?local_map);
+        val br: R.Result[bool, str] =
+            build_local_index(modules, m, placements, sec_base, ?local_map, atoms);
         if (R.is_err[bool, str](br)) {
             map.dnit[intern.StrId, u64](?local_map);
             ret R.err[bool, str](R.unwrap_err[bool, str](br));
         }
 
         val pr: R.Result[bool, str] = patch_module_relocations(s, out_img, modules, m,
-            placements, sec_base, merged_to_out, sym_locs, dyn, ?local_map, strm, arch);
+            placements, sec_base, merged_to_out, sym_locs, dyn, ?local_map, strm,
+            arch, atoms);
         map.dnit[intern.StrId, u64](?local_map);
         if (R.is_err[bool, str](pr)) { ret R.err[bool, str](R.unwrap_err[bool, str](pr)); }
 
@@ -1984,7 +2467,8 @@ fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
 # out:        out - the local-name -> virtual-address index to fill
 # ret:        ok(true) on success, or an error string
 fun build_local_index(modules: *of.ObjectImage, m: u32, placements: *Placement, sec_base: *u32,
-                      out: *map.Map[intern.StrId, u64]) R.Result[bool, str] {
+                      out: *map.Map[intern.StrId, u64],
+                      atoms: *AtomPlan) R.Result[bool, str] {
     var sy: u32 = 0;
     for (sy < modules[m].symbol_count) {
         val sym: *of.Symbol = ?modules[m].symbols[sy];
@@ -1994,7 +2478,9 @@ fun build_local_index(modules: *of.ObjectImage, m: u32, placements: *Placement, 
 
         if (R.is_err[*u64, str](map.get[intern.StrId, u64](out, ?sym.name))) {
             val flat: u32 = sec_base[m] + sym.section;
-            val va: u64 = placements[flat].vaddr + sym.offset::u64;
+            if (atom_offset_dead(atoms, flat, sym.offset)) { sy = sy + 1; cnt; }
+            val va: u64 = placements[flat].vaddr
+                + atom_live_offset(atoms, flat, sym.offset)::u64;
             val ins: R.Result[bool, str] = map.insert[intern.StrId, u64](out, sym.name, va);
             if (R.is_err[bool, str](ins)) { ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
         }
@@ -2026,7 +2512,8 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                              placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                              sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState,
                              local_map: *map.Map[intern.StrId, u64], strm: *StrMerge,
-                             arch: *isa.IsaVTable) R.Result[bool, str] {
+                             arch: *isa.IsaVTable,
+                             atoms: *AtomPlan) R.Result[bool, str] {
     # locate module m's .debug_str section and its anchor symbol once: a strp
     # relocation is exactly one whose target is that anchor. resolving it remaps the
     # string to its deduped offset rather than the concatenated placement (#1708).
@@ -2057,7 +2544,8 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         if (r.section >= modules[m].section_count) {
             ret R.err[bool, str]("linker: relocation names an out-of-range section");
         }
-        if (r.offset > modules[m].sections[r.section].len) {
+        if (r.offset::u64 + atom_reloc_width(r.kind)::u64
+            > modules[m].sections[r.section].len::u64) {
             ret R.err[bool, str]("linker: relocation offset is past the end of its section");
         }
 
@@ -2065,8 +2553,13 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         # merged_index selects a merged slot (kind or debug-name); map it to the
         # output-section index the merge assigned.
         val flat: u32 = sec_base[m] + r.section;
+        # A relocation field wholly owned by a discarded function atom has no
+        # output patch site and must not retain its target through a PLT/GOT/base
+        # relocation side effect.
+        if (atom_offset_dead(atoms, flat, r.offset)) { ri = ri + 1; cnt; }
         val pl: *Placement = ?placements[flat];
-        val patch_va: u64 = pl.vaddr + r.offset::u64;
+        val live_off: u32 = atom_live_offset(atoms, flat, r.offset);
+        val patch_va: u64 = pl.vaddr + live_off::u64;
         val out_ix: u32 = merged_to_out[pl.merged_index];
         # a relocation in a section with no merged output, or one whose patch site
         # lands in a (byteless) BSS section, cannot be applied - that is a contract
@@ -2078,7 +2571,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         if (dst == nil) {
             ret R.err[bool, str]("linker: relocation patch site lands in a BSS section");
         }
-        val patch_off: u32 = pl.offset + r.offset;
+        val patch_off: u32 = pl.offset + live_off;
 
         # a strp into .debug_str: remap it to the string's deduped offset instead of
         # resolving the anchor's placement. skips the normal apply_one below (#1708).
@@ -2253,13 +2746,49 @@ fun free_dynstate(alloc: *A.Allocator, dyn: *DynState) {
     init_dynstate(dyn);
 }
 
-fun has_call_reloc(modules: *of.ObjectImage, module_count: u32, symbol_name: intern.StrId) bool {
+# whether a relocation's source field survives the atom plan. malformed section
+# references remain live here so relocation patching reports the input error
+fun reloc_source_live(modules: *of.ObjectImage, m: u32, r: *of.Relocation,
+                      sec_base: *u32, atoms: *AtomPlan) bool {
+    if (atoms == nil || !atoms.active) { ret true; }
+    if (r.section >= modules[m].section_count) { ret true; }
+    ret !atom_offset_dead(atoms, sec_base[m] + r.section, r.offset);
+}
+
+# an undefined name remains an import unless it is referenced exclusively from
+# discarded atoms. an unused declaration (no relocations at all) retains the
+# legacy import behavior
+fun import_symbol_live(modules: *of.ObjectImage, module_count: u32,
+                       symbol_name: intern.StrId, sec_base: *u32,
+                       atoms: *AtomPlan) bool {
+    if (atoms == nil || !atoms.active) { ret true; }
+    var saw: bool = false;
     var m: u32 = 0;
     for (m < module_count) {
         var ri: u32 = 0;
         for (ri < modules[m].reloc_count) {
             val r: *of.Relocation = ?modules[m].relocations[ri];
-            if (r.symbol == symbol_name && is_call_kind(r.kind)) {
+            if (r.symbol == symbol_name) {
+                saw = true;
+                if (reloc_source_live(modules, m, r, sec_base, atoms)) { ret true; }
+            }
+            ri = ri + 1;
+        }
+        m = m + 1;
+    }
+    ret !saw;
+}
+
+fun has_call_reloc(modules: *of.ObjectImage, module_count: u32,
+                   symbol_name: intern.StrId, sec_base: *u32,
+                   atoms: *AtomPlan) bool {
+    var m: u32 = 0;
+    for (m < module_count) {
+        var ri: u32 = 0;
+        for (ri < modules[m].reloc_count) {
+            val r: *of.Relocation = ?modules[m].relocations[ri];
+            if (r.symbol == symbol_name && is_call_kind(r.kind)
+                && reloc_source_live(modules, m, r, sec_base, atoms)) {
                 ret true;
             }
             ri = ri + 1;
@@ -2297,7 +2826,8 @@ fun has_call_reloc(modules: *of.ObjectImage, module_count: u32, symbol_name: int
 fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
                        modules: *of.ObjectImage, module_count: u32,
                        sym_locs: *map.Map[intern.StrId, SymbolLoc],
-                       sonames: *intern.StrId, soname_count: u32) R.Result[bool, str] {
+                       sonames: *intern.StrId, soname_count: u32,
+                       sec_base: *u32, atoms: *AtomPlan) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
 
     # the interpreter path is the OS's run-time loader recorded into a PT_INTERP
@@ -2353,6 +2883,7 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             val sym: *of.Symbol = ?modules[m].symbols[sy];
             if (!is_undefined_extern(sym))                                                       { sy = sy + 1; cnt; }
             if (R.is_ok[*SymbolLoc, str](map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name))) { sy = sy + 1; cnt; }
+            if (!import_symbol_live(modules, module_count, sym.name, sec_base, atoms))            { sy = sy + 1; cnt; }
             if (R.is_ok[*u32, str](map.get[intern.StrId, u32](?seen, ?sym.name)))                { sy = sy + 1; cnt; }
             val ins: R.Result[bool, str] = map.insert[intern.StrId, u32](?seen, sym.name, n_imports);
             if (R.is_err[bool, str](ins)) { map.dnit[intern.StrId, u32](?seen); ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
@@ -2377,6 +2908,7 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             val sym: *of.Symbol = ?modules[m].symbols[sy];
             if (!is_undefined_extern(sym))                                                       { sy = sy + 1; cnt; }
             if (R.is_ok[*SymbolLoc, str](map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name))) { sy = sy + 1; cnt; }
+            if (!import_symbol_live(modules, module_count, sym.name, sec_base, atoms))            { sy = sy + 1; cnt; }
             if (R.is_ok[*u32, str](map.get[intern.StrId, u32](?dyn.import_map, ?sym.name)))      { sy = sy + 1; cnt; }
 
             val idx: u32 = dyn.info.import_count;
@@ -2404,7 +2936,9 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             # flag) is recorded but not yet bound - its abs reference still hits
             # the undefined-symbol error in patch_relocations, since data imports
             # (GLOB_DAT) are deferred.
-            dyn.info.imports[idx].is_func   = ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0) || has_call_reloc(modules, module_count, sym.name);
+            dyn.info.imports[idx].is_func   =
+                ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0)
+                || has_call_reloc(modules, module_count, sym.name, sec_base, atoms);
             val ins: R.Result[bool, str] = map.insert[intern.StrId, u32](?dyn.import_map, sym.name, idx);
             if (R.is_err[bool, str](ins)) { ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
             dyn.info.import_count = idx + 1;
@@ -3051,11 +3585,12 @@ fun free_placements(alloc: *A.Allocator, placements: *Placement, sec_total: u32)
 # debug_count:   length of the debug-name array
 # merged_to_out: the merged-slot -> output-section map to release (may be nil)
 # strm:          the deduped .debug_str table to release (may be nil)
+# atoms:         the transient final-link atom plan to release (may be nil)
 fun free_scratch(alloc: *A.Allocator, placements: *Placement, sec_total: u32,
                 sec_base: *u32, module_count: u32,
                 merged: *MergedSection, merged_count: u32,
                 debug_names: *intern.StrId, debug_count: u32,
-                merged_to_out: *u32, strm: *StrMerge) {
+                merged_to_out: *u32, strm: *StrMerge, atoms: *AtomPlan) {
     free_placements(alloc, placements, sec_total);
     if (sec_base != nil && module_count > 0) {
         A.deallocate[u32](alloc, sec_base, module_count::usize);
@@ -3070,6 +3605,7 @@ fun free_scratch(alloc: *A.Allocator, placements: *Placement, sec_total: u32,
         A.deallocate[u32](alloc, merged_to_out, merged_count::usize);
     }
     free_str_merge(strm);
+    free_atom_plan(alloc, atoms);
 }
 
 # tear down every parsed input image and release the image array.
@@ -3128,7 +3664,9 @@ fun lt_link(s: *session.Session, name: intern.StrId, a: *of.Symbol, b: *of.Symbo
 
     var locs: map.Map[intern.StrId, SymbolLoc] =
         map.init[intern.StrId, SymbolLoc](s.alloc, map.hash_u32, map.eq_u32);
-    val cr: R.Result[bool, str] = collect_symbols(s, ?mods[0], 2, ?placements[0], ?sec_base[0], ?locs, true);
+    val cr: R.Result[bool, str] =
+        collect_symbols(s, ?mods[0], 2, ?placements[0], ?sec_base[0],
+                        ?locs, true, nil::*AtomPlan);
     if (R.is_err[bool, str](cr)) {
         map.dnit[intern.StrId, SymbolLoc](?locs);
         ret R.err[u64, str](R.unwrap_err[bool, str](cr));
