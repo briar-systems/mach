@@ -13,9 +13,9 @@ from 11,177,984 to 8,884,224 bytes; pruning losing weak bodies reduced it again
 to 8,200,192 bytes.
 
 ### Added
-- vectorize: memory-free guarded integer loops can be predicated into packed
-  mask/select operations on x86_64 and AArch64. Conditional memory, float lanes,
-  and unsupported guards remain scalar (#2348).
+- vectorize: register-only guarded diamonds in integer loops can be predicated
+  into packed mask/select operations on x86_64 and AArch64. Conditional memory,
+  float lanes, and unsupported guards remain scalar (#2348).
 
 ### Changed
 - build: normal production IR no longer contains test bodies or test-only
