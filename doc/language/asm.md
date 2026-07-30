@@ -42,6 +42,47 @@ pub fun add_via_asm(a: i64, b: i64) i64 {
 }
 ```
 
+## Calls (x86-64)
+
+`call` takes three shapes, and which one a statement means is read off the
+operand:
+
+```mach
+asm x86_64 {
+    call some_symbol     # direct: E8 rel32, relocated against the symbol
+    call rax             # indirect through a register: FF /2, mod=11
+    call [0x100018]      # indirect through an absolute address: ff 14 25 <disp32>
+    call [rax + 8]       # indirect through a computed address
+}
+```
+
+The absolute form exists for a fixed-address ABI — one whose entry points are
+addresses rather than symbols, like BareMetal's kernel call table at
+`0x100010..0x100040`. Its displacement is sign-extended to 64 bits, so an address
+outside signed 32-bit range is refused rather than silently truncated. `call
+[symbol]` is refused too: the rip-relative form would mean "call the pointer
+*stored* at the symbol", which is not what the `call symbol` beside it means.
+
+An indirect call clobbers exactly as a direct one does — the callee's caller-saved
+registers, which the surrounding block's barrier already covers. The register or
+memory holding the target is **read**, not written.
+
+## Raw bytes
+
+`.byte` emits its values verbatim, for an encoding the ISA's mnemonic table does
+not name:
+
+```mach
+asm x86_64 {
+    .byte 0x0f, 0x01, 0xd0    # xgetbv
+}
+```
+
+One directive carries a whole sequence (up to 256 values), not four. A value that
+does not fit in a byte is refused. Raw bytes are an instruction stream the parser
+cannot read, so the block's clobber set becomes **every register in every bank** —
+which is why a real mnemonic is always preferable where one exists.
+
 ## What the compiler infers
 
 - **Operand direction.** Position within an instruction determines whether
