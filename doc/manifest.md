@@ -105,14 +105,16 @@ to whichever *declared* target matches the host.
 | `isa` | yes      | Instruction-set architecture. Read by `$project.target.arch`. |
 | `os`  | yes      | Operating system. Read by `$project.target.os`. |
 | `abi` | yes      | Application binary interface. Read by `$project.target.abi`. |
-| `of`  | no       | Object-format override; defers to the os's format when omitted (the one optional target key). See [Object-format override](#object-format-override). |
+| `of`  | no       | Object-format override; defers to the os's format when omitted. See [Object-format override](#object-format-override). |
+| `base` | no      | Load-address override (integer). Overrides the os's default base virtual address; defers to it (`0` for `freestanding`) when omitted. |
+| `platform` | no  | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
 
 ### Accepted tuple values
 
 | Axis  | Values |
 |-------|--------|
 | `isa` | `x86_64`, `aarch64`, `riscv64`, `spirv`, `mos6502` |
-| `os`  | `linux`, `windows`, `darwin`, `freestanding`, `bmos` |
+| `os`  | `linux`, `windows`, `darwin`, `freestanding` |
 | `abi` | `sysv64`, `win64`, `aapcs64`, `lp64`, `spirv`, `mos6502` |
 
 `x86_64`/`linux`/`sysv64` is the primary host and target. `aarch64`-linux builds
@@ -120,11 +122,10 @@ and runs natively in CI on every PR; `riscv64`-linux runs under qemu and
 self-hosts (#1852). `windows` is a supported cross-compilation target (PE/COFF,
 Win64 ABI). `darwin` is validated end-to-end on both architectures: each
 self-hosts to a three-generation fixpoint on a native macOS runner and ships a
-release archive. `freestanding` targets a raw flat image with no OS runtime.
-`bmos` targets [BareMetal](https://github.com/ReturnInfinity/BareMetal), an
-x86-64 exokernel that loads a flat image at a fixed address and enters it with a
-`call` (see [bmos targets](#bmos-targets)); it is a real OS with its own load
-contract, not a spelling of `freestanding`. `spirv` is not a machine at all — it
+release archive. `freestanding` targets a raw flat image with no OS runtime; a
+bare-metal platform such as BareMetal (`bmos`) is a `freestanding` target plus a
+`platform` tag and `base` override (see [Platform targets](#platform-targets-bare-metal)),
+not an os of its own. `spirv` is not a machine at all — it
 emits a finished GPU module rather than machine code (see
 [Finished-module targets](#finished-module-targets)).
 
@@ -138,11 +139,11 @@ than silently never matching.
 ### Object-format override
 
 `of` overrides the object format a target implies. Each os has a default format —
-`linux` → `elf`, `windows` → `coff`, `darwin` → `macho`, `freestanding` → `raw`,
-`bmos` → `raw` — and `of` names a different one from the same closed set: `elf`,
-`coff`, `macho`, `raw`, `spv`. It is the only optional key on a target; omit it to
+`linux` → `elf`, `windows` → `coff`, `darwin` → `macho`, `freestanding` → `raw` —
+and `of` names a different one from the same closed set: `elf`,
+`coff`, `macho`, `raw`, `spv`. `of` is optional; omit it to
 take the default. An os accepts only the formats it can load, so an override the
-os cannot enter is refused (`bmos`, whose loader reads raw bytes, takes no other).
+os cannot enter is refused.
 
 ```toml
 [target.metal]
@@ -186,34 +187,40 @@ has none of; the module tree is delivered instead. A `static` or `shared`
 artifact kind, and `mach test`, are refused by name — there is no archive, shared
 object, or executable form for a module.
 
-### bmos targets
+### Platform targets (bare metal)
 
-`bmos` is [BareMetal](https://github.com/ReturnInfinity/BareMetal), Return
-Infinity's x86-64 exokernel. Its load contract, not this compiler, fixes every
-parameter of the build:
+A bare-metal platform — such as [BareMetal](https://github.com/ReturnInfinity/BareMetal)
+(`bmos`), Return Infinity's x86-64 exokernel — is not its own `os`. It is
+`os = "freestanding"` plus two optional keys: a `base` load-address override and an
+open `platform` tag a support library keys its backend on (surfaced to comptime as
+`$mach.build.platform`). A BareMetal target:
 
 ```toml
-[target.x86_64-bmos]
-isa = "x86_64"
-os  = "bmos"
-abi = "sysv64"
-# no `of`: bmos's default (and only) object format is "raw"
+[target.bmos]
+isa      = "x86_64"
+os       = "freestanding"
+abi      = "sysv64"
+base     = 0xFFFF800000000000   # BareMetal copies the flat image here and calls it
+platform = "bmos"               # selects the mach-bmos backend
+# no `of`: freestanding's default object format is "raw"
 ```
 
 - The artifact is a **flat binary** — no header, no sections, no entry record.
-  The kernel copies the file's bytes verbatim to its load address.
-- That address is **fixed at `0xFFFF800000000000`** and the loader relocates
-  nothing, so the image is never position-independent.
-- Execution begins at the **first byte of the image**, which the kernel reaches
+  The loader copies the file's bytes verbatim to `base`.
+- The load address is set by **`base`** and the loader relocates nothing, so the
+  image is never position-independent.
+- Execution begins at the **first byte of the image**, which the loader reaches
   with a `call`. The entry function is marked `#[symbol("_start")]`, and it must
   be the only function or the first one emitted, since a flat image cannot say
   where else to enter. An entry anywhere but the base is refused at link.
-- A program **exits by returning**: the entry function's `ret` goes back to the
-  kernel's command loop. There is no exit syscall.
+- A program **exits by returning**: the entry function's `ret` goes back to its
+  caller. There is no exit syscall.
 
-`bmos` is x86-64 only — the kernel is x86-64 assembly and has been ported nowhere
-else — and any other instruction set is refused at composition (`operating system
-'bmos' does not run on instruction set 'aarch64'`).
+The compiler encodes no BareMetal knowledge — `base` places the image and
+`platform` is an opaque string. The kernel-call machinery lives in the `mach-bmos`
+platform package, which gates on `$mach.build.platform == "bmos"`; because that is
+a library, a non-x86-64 bmos build fails at the package's own `$mach.build.arch`
+gate rather than in the compiler.
 
 One fact the kernel leaves to the program: **the stack is not guaranteed 16-byte
 aligned at entry**, so a startup shim must align it before calling anything that
