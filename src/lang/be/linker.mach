@@ -559,6 +559,20 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
         ret R.err[bool, str](R.unwrap_err[bool, str](acc_r));
     }
 
+    # a flat image (raw) enters at its base, so the entry symbol's section must lead
+    # the merged .text regardless of link order; restack the text placements so the
+    # entry-defining section is first (#2409). only a flat-image executable needs it;
+    # every other format carries an explicit entry record and is left untouched.
+    if (tgt.of.produces_image && mode == LINK_EXE) {
+        val ei_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, tgt.os.entry_symbol);
+        if (R.is_err[intern.StrId, str](ei_r)) {
+            free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
+            ret R.err[bool, str](R.unwrap_err[intern.StrId, str](ei_r));
+        }
+        reorder_flat_entry_first(modules, module_count, merged, placements, sec_base,
+                                 ?atoms, R.unwrap_ok[intern.StrId, str](ei_r));
+    }
+
     # assign each merged section a virtual address (an executable or a shared
     # object; a relocatable library carries none). sections are placed in canonical
     # order from the OS base, each kind page-aligned; a position-independent image
@@ -2430,6 +2444,88 @@ fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_co
         m = m + 1;
     }
     ret R.ok[bool, str](true);
+}
+
+# reorder the merged `.text` so the entry symbol's input section leads, for a flat
+# image whose entry must sit at the image base
+#
+# A flat (raw) image carries no entry record: execution begins at the image base,
+# so the entry symbol must land at offset 0 of the merged `.text` (the lowest-vaddr
+# section). `accumulate_sections` lays the input text sections out in link order,
+# so a module linked before the entry-defining one displaces the entry and the raw
+# writer rejects the image (#2409). This restacks the SK_TEXT placements - the
+# entry-defining section first, every other text section after it in its original
+# (stable) order - and updates the merged text length, mirroring the align/liveness
+# math `accumulate_sections` uses. Only `.text` offsets change; every downstream
+# reader (vaddr finalization, symbol carry, byte copy, relocation patching) reads
+# `placements[].offset`, so the reorder needs no other change.
+#
+# The entry symbol must still be the first function in its own defining section (a
+# runtime contract); this removes the cross-module link-order dependency, not the
+# intra-section one. A no-op when no defined text symbol carries the entry name (the
+# emit path reports the missing entry) or when the entry section already leads.
+# ---
+# modules:      the input image array
+# module_count: number of input images
+# merged:       the merged accumulators; the SK_TEXT slot's length is rewritten
+# placements:   per-input-section placement; SK_TEXT offsets are rewritten in place
+# sec_base:     per-module prefix offset into `placements`
+# atoms:        the atom-liveness plan (per-section live contribution length)
+# entry_name:   the interned OS entry symbol name
+fun reorder_flat_entry_first(modules: *of.ObjectImage, module_count: u32,
+                             merged: *MergedSection, placements: *Placement, sec_base: *u32,
+                             atoms: *AtomPlan, entry_name: intern.StrId) {
+    # locate the flat index of the input SK_TEXT section that defines the entry
+    # symbol. a later definition wins, matching the symbol table's last-writer view.
+    var entry_flat: u32 = 0xFFFFFFFF;
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (sym.name == entry_name && sym.section != of.SECTION_EXTERNAL
+                && sym.section < modules[m].section_count
+                && modules[m].sections[sym.section].kind == of.SK_TEXT) {
+                entry_flat = sec_base[m] + sym.section;
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    if (entry_flat == 0xFFFFFFFF) { ret; }
+
+    val text_slot: u32 = of.SK_TEXT::u32;
+
+    # relay every SK_TEXT section in two passes - the entry section, then the rest in
+    # original order - recomputing each offset exactly as accumulate_sections does
+    # (align the running length up to the section's alignment, add its live
+    # contribution). the running length becomes the merged text slot's new length.
+    var run: u64 = 0;
+    var pass: u32 = 0;
+    for (pass < 2) {
+        m = 0;
+        for (m < module_count) {
+            var sc: u32 = 0;
+            for (sc < modules[m].section_count) {
+                val flat: u32 = sec_base[m] + sc;
+                if (placements[flat].merged_index == text_slot) {
+                    val is_entry: bool = flat == entry_flat;
+                    if ((pass == 0 && is_entry) || (pass == 1 && !is_entry)) {
+                        var a: u32 = modules[m].sections[sc].align;
+                        if (a == 0) { a = 1; }
+                        run = bin.align_up_u64(run, a::u64);
+                        placements[flat].offset = run::u32;
+                        run = run + atom_live_len(atoms, flat, modules[m].sections[sc].len)::u64;
+                    }
+                }
+                sc = sc + 1;
+            }
+            m = m + 1;
+        }
+        pass = pass + 1;
+    }
+
+    merged[text_slot].len = run::u32;
 }
 
 # give each used merged section a base virtual address,
@@ -4331,6 +4427,86 @@ test "mach.lang.be.linker.os_base_addr:manifest_base_override" {
     # a nonzero manifest base wins over the vtable value (the bmos high-half placement).
     tgt.base = 0xFFFF800000000000;
     if (os_base_addr(?tgt) != 0xFFFF800000000000) { ret 1; }
+    ret 0;
+}
+
+# a flat (raw) image enters at its base, so the entry symbol's section must lead the
+# merged .text no matter the link order. this links a function-defining module BEFORE
+# the entry-defining one - the arrangement that displaced `_start` and made the raw
+# writer reject the image (#2409) - and asserts the entry now leads: the image begins
+# with the entry module's bytes and the writer accepts entry-at-base. removing the
+# reorder in link_modules fails this link with "flat image must enter at its base".
+test "mach.lang.be.linker.link_modules:flat_entry_leads_regardless_of_order" {
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val tr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "freestanding", "sysv64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    # the freestanding target links a flat image (no entry record) based at 0.
+    if (!tgt.of.produces_image) { ret 1; }
+
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val text:  intern.StrId = lt_name(?s, ".text");
+    val other: intern.StrId = lt_name(?s, "other_fn");
+    val entry: intern.StrId = lt_name(?s, tgt.os.entry_symbol);
+    if (text == intern.STR_NIL || other == intern.STR_NIL || entry == intern.STR_NIL) { ret 1; }
+
+    # module 0 is a non-entry function-defining module (32 bytes of 0x90); module 1 is
+    # the entry module whose sole function is the entry symbol at offset 0 (16 bytes of
+    # 0xCC). in link order module 0's .text merges first, displacing the entry.
+    var b0: [32]u8;
+    var b1: [16]u8;
+    var i: u32 = 0;
+    for (i < 32) { b0[i] = 0x90; i = i + 1; }
+    i = 0;
+    for (i < 16) { b1[i] = 0xCC; i = i + 1; }
+
+    var secs0: [1]of.Section;
+    secs0[0].name = text; secs0[0].kind = of.SK_TEXT; secs0[0].bytes = ?b0[0];
+    secs0[0].len = 32; secs0[0].align = 16;
+    var secs1: [1]of.Section;
+    secs1[0].name = text; secs1[0].kind = of.SK_TEXT; secs1[0].bytes = ?b1[0];
+    secs1[0].len = 16; secs1[0].align = 16;
+
+    val fn_flags: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var syms0: [1]of.Symbol;
+    syms0[0].name = other; syms0[0].section = 0; syms0[0].offset = 0; syms0[0].size = 0; syms0[0].flags = fn_flags;
+    var syms1: [1]of.Symbol;
+    syms1[0].name = entry; syms1[0].section = 0; syms1[0].offset = 0; syms1[0].size = 0; syms1[0].flags = fn_flags;
+
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "m0"), ?secs0[0], 1, ?syms0[0], 1, nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "m1"), ?secs1[0], 1, ?syms1[0], 1, nil::*of.Relocation, 0);
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "flat_entry");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    # both modules are in-memory codegen images (codegen_count == 2), static exe.
+    val lr: R.Result[bool, str] =
+        link_modules(?s, ?tgt, ?mods[0], 2, 2, nil::*of.DynLib, 0, tpath::*u8, "flat_entry"::*u8, LINK_EXE, false);
+    if (R.is_err[bool, str](lr)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rr: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rr)) { ret 1; }
+    var b: Vector[u8] = R.unwrap_ok[Vector[u8], str](rr);
+
+    # the entry module's .text leads: the image begins with its 0xCC bytes, and the
+    # earlier-linked function-defining module follows at offset 16.
+    if (b.len != 48)        { vector.dnit[u8](?b); ret 1; }
+    if (b.data[0]  != 0xCC) { vector.dnit[u8](?b); ret 1; }
+    if (b.data[15] != 0xCC) { vector.dnit[u8](?b); ret 1; }
+    if (b.data[16] != 0x90) { vector.dnit[u8](?b); ret 1; }
+
+    vector.dnit[u8](?b);
+    session.dnit(?s);
     ret 0;
 }
 
