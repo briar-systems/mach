@@ -41,33 +41,33 @@ Common reasons to rename:
 
 ## Library attribution
 
-On a dynamic format that attributes each import to a specific dependency — the
-PE (Windows) import directory — the `library` decorator pins an `ext` import to
-the DLL that exports it:
+On a two-level dynamic format — PE (Windows) or Mach-O (Darwin) — the `library`
+decorator pins an `ext` import to the dependency that exports it:
 
 ```mach
 #[library("ws2_32.dll")]
 ext fun WSAStartup(ver: u16, data: *u8) i32;
 ```
 
-- The value names one of the OS's dependency libraries (the manifest
-  `[os.*].libs` set, e.g. `[os.windows].libs = ["kernel32.dll", "ws2_32.dll"]`).
-  The named library **must** be among the link's dependencies; pinning to a
-  library that is not is a hard link error
+- The value names a link dependency's stable logical identity. A `[link.X]`
+  requirement supplies it through `library = "..."`, defaulting to `X`; a bare
+  command-line `-l name` uses `name`. The dependency's exact canonical loader
+  name (`libfoo.so.3`, an `LC_ID_DYLIB` install name, or `foo.dll`) is also
+  accepted for compatibility. The named library **must** be among the link's
+  dependencies; pinning to one that is not is a hard link error
   (`import '<sym>' pinned to library '<lib>' not among the link's dependencies`),
-  never a silent fallback.
-- An `ext` import with no `library` is unattributed. On PE the loader has no
-  global search, so an unattributed import binds to the **first** declared
-  dependency. Pin every import that does not belong to that first library —
-  adding extra DLLs to `libs` without attribution only emits empty import
-  descriptors.
+  never a silent fallback. A logical identity that equals a different
+  dependency's loader name is rejected as ambiguous.
+- An `ext` import with no `library` is unattributed. PE and Mach-O require every
+  dynamic import to identify its provider, so an unattributed import is a hard
+  link error on those targets.
 
 `library` composes with `symbol`: the rename sets the imported symbol's name,
-`library` sets the DLL it is imported from. On one decl the import is emitted
+`library` sets the dependency it is imported from. On one decl the import is emitted
 under the renamed symbol within the named library.
 
 ```mach
-# imported as `socket` from ws2_32.dll, called as `ws2_socket` in Mach.
+# imported as `socket` from ws2_32.dll, called as `ws2_socket` in Mach
 #[library("ws2_32.dll")] #[symbol("socket")]
 ext fun ws2_socket(af: i32, kind: i32, proto: i32) i64;
 ```
@@ -113,8 +113,10 @@ C-toolchain-style flags, consumed by `mach build`:
 mach build . path/to/libfoo.o
 mach build . path/to/libfoo.a
 mach build . path/to/libfoo.so
+mach build . path/to/libfoo.dylib
+mach build . foo.dll
 
-# search dir + library name: resolves lib<name>.o / <name>.o / lib<name>.a / <name>.a, then lib<name>.so
+# search dir + library name: static candidates first, then the target's .so/.dylib spelling
 mach build . -L build/libs -l foo
 
 # link against a system shared library (libc) dynamically
@@ -122,42 +124,56 @@ mach build . -l c
 ```
 
 - A bare argument that contains a `/`, ends in `.o` (object) or `.a` (archive),
-  or names a `.so` (shared library) is treated as an explicit input path. A
+  or names a `.so`, `.dylib`, or `.dll` is treated as an explicit input. A
   relative path is tried first against the working directory, then against the
   project root.
 - `-l <name>` resolves to an object, archive, or shared library: each `-L <dir>`
   is searched for `lib<name>.o`, `<name>.o`, `lib<name>.a`, then `<name>.a`;
   finally the working directory is searched for the same four names (loose
   objects preferred over archives). Only if no static candidate exists does it
-  fall back to a shared `lib<name>.so` (in the `-L` dirs and the system library
-  directories). `-L` and `-l` may each be repeated.
+  fall back to the selected target's shared spelling: `lib<name>.so[.N]` for
+  ELF or `lib<name>[.<N>].dylib` for Mach-O. A resolved `@rpath/` dylib carries
+  its selected directory into the executable as `LC_RPATH`. `-L` and `-l` may
+  each be repeated.
 
 ### Manifest
 
-`[targets.*].libs` lists project-level link inputs, each an explicit object /
-archive / shared-library path (project-relative or absolute) or a bare
-`-l`-style name:
+Artifacts name typed `[link.X]` requirements. Use `system` for a named library,
+`framework` for a Darwin framework, or `local` for an object/archive/shared
+library path. Filters select the applicable target:
 
 ```toml
-[targets.linux]
-# ...
-libs = ["build/libs/libfoo.a", "bar", "c"]
+[link.foo-unix]
+source  = "system"
+name    = "foo"
+library = "foo"
+os      = ["linux", "darwin"]
+isa     = "*"
+abi     = "*"
+export  = false
+
+[link.foo-win]
+source  = "system"
+name    = "foo.dll"
+library = "foo"
+os      = "windows"
+isa     = "*"
+abi     = "*"
+export  = false
 ```
 
-`link` is accepted as an alias for `libs`. Manifest inputs and command-line
-inputs are both included; a name that resolves to no existing file is a hard
-error.
+Both entries expose the logical name `foo`, so `#[library("foo")]` is portable
+across the mutually exclusive target filters. Manifest and command-line inputs
+are both included; a name that cannot be resolved is a hard error.
 
 ### Scope
 
 Loose `.o` relocatable objects and static `.a` archives are linked **statically**
 (a `.a` contributes every one of its member objects — all members are pulled, not
-just those satisfying an undefined symbol). A shared `.so` library is a **dynamic**
-dependency: its `DT_SONAME` is recorded and undefined `ext` symbols are bound
-against it at load time through a `PT_INTERP`/PLT in the produced binary. A
-static definition always wins over a same-named dynamic import. Dynamic linking
-is currently implemented for the ELF (Linux) target; the PE (Windows) and Mach-O
-(Darwin) import paths are in progress.
+just those satisfying an undefined symbol). A shared `.so`, `.dylib`, framework,
+or `.dll` is a **dynamic** dependency: its format-specific canonical loader name
+is recorded and undefined `ext` functions become run-time imports. A static
+definition always wins over a same-named dynamic import.
 
 ## See also
 

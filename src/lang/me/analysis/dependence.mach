@@ -115,10 +115,8 @@ pub fun analyze_dependence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u
     if (lp.iv.step.kind != value.VAL_CONST_INT) { ret R.ok[DepInfo, str](d); }
     if (lp.iv.step.data.int_lit != 1) { ret R.ok[DepInfo, str](d); }
 
-    # the loop's register recurrences must all be induction variables: the header
-    # carries the iv plus, at most, secondary add-recurrences, and no other loop block
-    # carries any phi. any other extra phi is a reduction / scan carried across
-    # iterations (child 4's concern).
+    # the header carries only induction variables; non-header phis may join paths
+    # within one iteration but must not feed themselves across a backedge
     if (!ivs_only_recurrence(fn, la, loop_ix)) { ret R.ok[DepInfo, str](d); }
 
     # upper-bound the accesses array by the loop's instruction count.
@@ -254,23 +252,16 @@ pub fun dep_dnit(d: *DepInfo) {
     d.access_cap   = 0;
 }
 
-# true when every phi recurrence the loop carries is an induction variable: the
-# header holds the induction variable plus, at most, secondary add-recurrences
-# (`t = base; ...; t = t + c`), and no other loop block holds any phi.
+# true when the loop carries only its primary and secondary induction variables
 #
-# A secondary induction variable is not a cross-iteration data dependence -- it is a
-# closed form of the trip count, which the transform re-derives by scaling its step
-# with the lane count. Any OTHER header phi is a value carried between iterations (a
-# reduction, a scan) and still forces the conservative verdict.
-#
-# Admitting anything as a recurrence kills no test today, because two later gates
-# already refuse everything that would reach the transform: a store whose value
-# involves the extra phi is not a pure lane-op tree (stores_are_pure_trees), and one
-# whose value is live after the loop is refused by versioning (has_live_out), leaving
-# only a dead phi that DCE removed. That coincidence is not the reason this rule is
-# here -- it is the precondition scale_recurrence_steps asserts, and if one ever slips
-# past both gates this is the difference between declining the loop and aborting the
-# build on an internal invariant. Do not remove it for being untested.
+# non-header phis may join paths within one iteration. A phi whose block dominates
+# an incoming predecessor instead has a back edge, as at a nested-loop header, and is
+# another recurrence that this loop's vector transform cannot scale.
+# ---
+# fn:      function containing the loop
+# la:      loop analysis for `fn`
+# loop_ix: loop to inspect
+# ret:     true when every recurrence is a supported induction variable
 pub fun ivs_only_recurrence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: u32) bool {
     val lp: *loops.Loop = ?la.loops[loop_ix];
     var bi: u32 = 0;
@@ -286,9 +277,28 @@ pub fun ivs_only_recurrence(fn: *ir.Function, la: *loops.LoopAnalysis, loop_ix: 
             }
             if (!header_has_phi(blk, lp.iv.phi)) { ret false; }
         } or {
-            if (blk.phi_count != 0) { ret false; }
+            var pi: u32 = 0;
+            for (pi < blk.phi_count) {
+                if (!same_iteration_phi(fn, la, bid, blk.phis[pi])) { ret false; }
+                pi = pi + 1;
+            }
         }
         bi = bi + 1;
+    }
+    ret true;
+}
+
+# true when `pid` has no back-edge incoming to its block
+fun same_iteration_phi(fn: *ir.Function, la: *loops.LoopAnalysis, bid: id.BlockId, pid: id.InstructionId) bool {
+    val opt: O.Option[*instruction.Instruction] = ir.instruction_get(fn, pid);
+    if (O.is_none[*instruction.Instruction](opt)) { ret false; }
+    val phi: *instruction.Instruction = O.unwrap[*instruction.Instruction](opt);
+    if (phi.kind != instruction.OP_PHI || phi.operand_count == 0 || (phi.operand_count % 2) != 0) { ret false; }
+    var o: u32 = 0;
+    for (o < phi.operand_count) {
+        val pred: id.BlockId = ir.block_target(phi.operands[o]);
+        if (pred::u32 >= fn.block_count || loops.dominates(la, bid, pred)) { ret false; }
+        o = o + 2;
     }
     ret true;
 }
@@ -637,6 +647,95 @@ fun body_gep(bld: *builder.Builder, base: value.Value, iv: value.Value, i64t: ir
     var ix: [1]value.Value;
     ix[0] = iv;
     ret builder.emit_gep(bld, base, i64t, ?ix[0], 1);
+}
+
+# a nested-loop header phi is a recurrence of the outer loop even though it is not
+# in the outer header
+test "mach.lang.me.analysis.dependence:nested_recurrence_declines" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val rm: R.Result[ir.Module, str] = ir.init(?alloc, intern.STR_NIL);
+    if (R.is_err[ir.Module, str](rm)) { ret 1; }
+    var m: ir.Module = R.unwrap_ok[ir.Module, str](rm);
+
+    val rt64: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 64);
+    if (R.is_err[ir_type.IrTypeId, str](rt64)) { ir.dnit(?m); ret 1; }
+    val i64t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt64);
+    val rt8: R.Result[ir_type.IrTypeId, str] = ir_type.intern_int(?m.types, 8);
+    if (R.is_err[ir_type.IrTypeId, str](rt8)) { ir.dnit(?m); ret 1; }
+    val i8t: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](rt8);
+
+    val rf: R.Result[u32, str] = ir.function_add(?m, intern.STR_NIL, ir_type.IRT_NIL, 0);
+    if (R.is_err[u32, str](rf)) { ir.dnit(?m); ret 1; }
+    val fn: *ir.Function = ?m.functions[R.unwrap_ok[u32, str](rf)];
+    var bld: builder.Builder = builder.init(?m);
+    builder.set_function(?bld, fn);
+
+    val re: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](re)) { ir.dnit(?m); ret 1; }
+    val entry: id.BlockId = R.unwrap_ok[id.BlockId, str](re);
+    val roh: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](roh)) { ir.dnit(?m); ret 1; }
+    val outer_h: id.BlockId = R.unwrap_ok[id.BlockId, str](roh);
+    val rih: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rih)) { ir.dnit(?m); ret 1; }
+    val inner_h: id.BlockId = R.unwrap_ok[id.BlockId, str](rih);
+    val rib: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rib)) { ir.dnit(?m); ret 1; }
+    val inner_body: id.BlockId = R.unwrap_ok[id.BlockId, str](rib);
+    val rol: R.Result[id.BlockId, str] = builder.new_block(?bld);
+    if (R.is_err[id.BlockId, str](rol)) { ir.dnit(?m); ret 1; }
+    val outer_latch: id.BlockId = R.unwrap_ok[id.BlockId, str](rol);
+
+    val zero: value.Value = value.const_int(0, i64t);
+    val one: value.Value = value.const_int(1, i64t);
+
+    builder.set_block(?bld, entry);
+    if (R.is_err[bool, str](builder.emit_br(?bld, outer_h))) { ir.dnit(?m); ret 1; }
+
+    builder.set_block(?bld, outer_h);
+    val rpo: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
+    if (R.is_err[value.Value, str](rpo)) { ir.dnit(?m); ret 1; }
+    val phi_o: value.Value = R.unwrap_ok[value.Value, str](rpo);
+    if (R.is_err[bool, str](builder.emit_br(?bld, inner_h))) { ir.dnit(?m); ret 1; }
+
+    builder.set_block(?bld, inner_h);
+    val rpi: R.Result[value.Value, str] = builder.emit_phi(?bld, i64t);
+    if (R.is_err[value.Value, str](rpi)) { ir.dnit(?m); ret 1; }
+    val phi_i: value.Value = R.unwrap_ok[value.Value, str](rpi);
+    if (R.is_err[bool, str](builder.emit_cbr(?bld, value.param(0, i8t), inner_body, outer_latch))) { ir.dnit(?m); ret 1; }
+
+    builder.set_block(?bld, inner_body);
+    if (R.is_err[bool, str](builder.emit_br(?bld, inner_h))) { ir.dnit(?m); ret 1; }
+
+    builder.set_block(?bld, outer_latch);
+    val ruo: R.Result[value.Value, str] = builder.emit_add(?bld, phi_o, one);
+    if (R.is_err[value.Value, str](ruo)) { ir.dnit(?m); ret 1; }
+    val upd_o: value.Value = R.unwrap_ok[value.Value, str](ruo);
+    if (R.is_err[bool, str](builder.emit_br(?bld, outer_h))) { ir.dnit(?m); ret 1; }
+
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_o, entry, zero))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_o, outer_latch, upd_o))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_i, outer_h, zero))) { ir.dnit(?m); ret 1; }
+    if (R.is_err[bool, str](builder.phi_add_incoming(?bld, phi_i, inner_body, one))) { ir.dnit(?m); ret 1; }
+
+    var code: i32 = 0;
+    val ra: R.Result[loops.LoopAnalysis, str] = loops.analyze(fn, ?alloc);
+    if (R.is_err[loops.LoopAnalysis, str](ra)) { ir.dnit(?m); ret 1; }
+    var la: loops.LoopAnalysis = R.unwrap_ok[loops.LoopAnalysis, str](ra);
+    var outer_ix: u32 = loops.NONE_U32;
+    var i: u32 = 0;
+    for (i < la.loop_len) {
+        if (la.loops[i].header == outer_h) { outer_ix = i; }
+        i = i + 1;
+    }
+    if (outer_ix == loops.NONE_U32 || !la.loops[outer_ix].has_iv) { code = 1; }
+    or {
+        if (ivs_only_recurrence(fn, ?la, outer_ix)) { code = 1; }
+    }
+    loops.dnit(?la);
+    ir.dnit(?m);
+    ret code;
 }
 
 # an element-wise `a[i] = b[i] + c[i]` over three distinct pointer-parameter bases

@@ -822,22 +822,65 @@ pub fun instruction_add(m: *Module, fn: *Function, inst: instruction.Instruction
     ret R.ok[id.InstructionId, str](iid);
 }
 
-# replace an instruction's operand array wholesale with `ops` (owned, length `n`),
-# freeing the old array by its true allocation size (`operand_cap`) and normalizing
-# count and capacity to `n`. the single primitive for swapping an operand array, so
-# no caller frees by a count a pass may have shrunk
+# an operand array allocated from the module allocator, carrying its own length
+#
+# The storage an instruction will ADOPT: `instr_replace_operands` installs it and the
+# instruction frees it at teardown. `operands_alloc` is the only thing that produces
+# one, so the array a caller hands over cannot be a stack buffer - the shape that
+# leaves an instruction naming values in a dead frame, which survives the middle end
+# and faults in a later pass with no relation to the mistake (#2358).
+#
+# The length travels with the pointer for the same reason: the old signature took the
+# count separately and freed by it, so a count that disagreed with the allocation
+# corrupted the heap silently.
+# ---
+# ops: the allocated array, or nil when len is 0
+# len: number of operands, and the array's exact allocation size
+pub rec OperandArray {
+    ops: *value.Value;
+    len: u32;
+}
+
+# allocate an operand array of exactly `n` values for an instruction to adopt
+#
+# The caller fills the returned array and hands it to `instr_replace_operands`. The
+# instruction's existing operands stay valid until that call, so a rewrite may read
+# the operands it is replacing while it builds their replacement.
+# ---
+# m:   module owning the allocator
+# n:   number of operands to allocate; 0 yields the empty array
+# ret: the owned array, or an allocation error
+pub fun operands_alloc(m: *Module, n: u32) R.Result[OperandArray, str] {
+    var arr: OperandArray;
+    arr.ops = nil;
+    arr.len = n;
+    if (n == 0) { ret R.ok[OperandArray, str](arr); }
+
+    val res: R.Result[*value.Value, str] = A.allocate[value.Value](m.alloc, n::usize);
+    if (R.is_err[*value.Value, str](res)) { ret R.err[OperandArray, str](R.unwrap_err[*value.Value, str](res)); }
+    arr.ops = R.unwrap_ok[*value.Value, str](res);
+    ret R.ok[OperandArray, str](arr);
+}
+
+# replace an instruction's operand array wholesale with `arr`, freeing the old array
+# by its true allocation size (`operand_cap`) and normalizing count and capacity to
+# the new length. the single primitive for swapping an operand array, so no caller
+# frees by a count a pass may have shrunk
+#
+# ADOPTS `arr`: the instruction owns the storage from here and frees it at teardown.
+# That is why the parameter is an `OperandArray` and not a bare pointer - only
+# `operands_alloc` produces one.
 # ---
 # m:   module owning the allocator
 # ins: instruction whose operands are replaced
-# ops: the new owned operand array (nil for n == 0)
-# n:   number of operands in `ops` (its allocation size)
-pub fun instr_replace_operands(m: *Module, ins: *instruction.Instruction, ops: *value.Value, n: u32) {
+# arr: the new owned operand array
+pub fun instr_replace_operands(m: *Module, ins: *instruction.Instruction, arr: OperandArray) {
     if (ins.operands != nil && ins.operand_cap > 0) {
         A.deallocate[value.Value](m.alloc, ins.operands, ins.operand_cap::usize);
     }
-    ins.operands      = ops;
-    ins.operand_count = n;
-    ins.operand_cap   = n;
+    ins.operands      = arr.ops;
+    ins.operand_count = arr.len;
+    ins.operand_cap   = arr.len;
 }
 
 # append one incoming `(pred, value)` edge to a phi's operand list
@@ -1579,6 +1622,93 @@ test "mach.lang.me.ir.dnit:frees_by_capacity_not_count" {
     if (!track_is_freed(?tracker, blob_p))  { ret 1; } # agg blob leaked
     if (!track_is_freed(?tracker, reloc_p)) { ret 1; } # agg reloc table leaked
     if (tracker.live != 0) { ret 1; }                  # any residual live allocation is a leak
+
+    A.deallocate[TrackEntry](?page_alloc, tracker.entries, 8192::usize);
+    ret 0;
+}
+
+# `instr_replace_operands` frees the array it displaces by that array's true
+# allocation size and adopts the new one at its own length, so a rewrite that SHRINKS
+# the operand list leaves no capacity behind for teardown to free by the wrong count
+# (#2358). The size-checking allocator reports a wrong-size free as a mismatch and an
+# unfreed array as a residual live entry, so both halves are observable.
+#
+# The other half of #2358 - that the adopted array cannot be a stack buffer - is a
+# type rule, not a runtime one: `instr_replace_operands` takes an `OperandArray`, and
+# only `operands_alloc` produces one, so the failing shape does not compile and no
+# test can reach it.
+test "mach.lang.me.ir.instr_replace_operands:frees_displaced_by_capacity" {
+    var page_alloc: A.Allocator;
+    page.make(?page_alloc);
+
+    var tracker: Tracker;
+    val res_entries: R.Result[*TrackEntry, str] = A.allocate[TrackEntry](?page_alloc, 8192::usize);
+    if (R.is_err[*TrackEntry, str](res_entries)) { ret 1; }
+    tracker.entries  = R.unwrap_ok[*TrackEntry, str](res_entries);
+    tracker.cap      = 8192;
+    tracker.count    = 0;
+    tracker.live     = 0;
+    tracker.mismatch = false;
+    tracker.overflow = false;
+
+    var tp: *Tracker = ?tracker;
+    var alloc: A.Allocator;
+    alloc.ctx           = tp::ptr;
+    alloc.fn_allocate   = track_allocate;
+    alloc.fn_reallocate = track_reallocate;
+    alloc.fn_deallocate = track_deallocate;
+
+    val res_module: R.Result[Module, str] = init(?alloc, intern.STR_NIL);
+    if (R.is_err[Module, str](res_module)) { ret 1; }
+    var m: Module = R.unwrap_ok[Module, str](res_module);
+
+    val res_i64t: R.Result[type.IrTypeId, str] = type.intern_int(?m.types, 64);
+    if (R.is_err[type.IrTypeId, str](res_i64t)) { ret 1; }
+    val i64t: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](res_i64t);
+
+    val res_fn: R.Result[u32, str] = function_add(?m, intern.STR_NIL, type.IRT_NIL, 0);
+    if (R.is_err[u32, str](res_fn)) { ret 1; }
+    val fn: *Function = ?m.functions[R.unwrap_ok[u32, str](res_fn)];
+
+    # a 3-operand conditional branch, as the inline pass finds one before rewriting it.
+    val res_ops3: R.Result[OperandArray, str] = operands_alloc(?m, 3);
+    if (R.is_err[OperandArray, str](res_ops3)) { ret 1; }
+    val ops3: OperandArray = R.unwrap_ok[OperandArray, str](res_ops3);
+    ops3.ops[0] = value.const_int(0, i64t);
+    ops3.ops[1] = value.const_int(0, i64t);
+    ops3.ops[2] = value.const_int(0, i64t);
+    val displaced: ptr = ops3.ops::ptr;
+
+    var cbr: instruction.Instruction;
+    cbr.kind          = instruction.OP_CBR;
+    cbr.ty            = i64t;
+    cbr.operands      = ops3.ops;
+    cbr.operand_count = 3;
+    cbr.flags         = 0;
+    cbr.aux_ty        = type.IRT_NIL;
+    val res_cbr: R.Result[id.InstructionId, str] = instruction_add(?m, fn, cbr);
+    if (R.is_err[id.InstructionId, str](res_cbr)) { ret 1; }
+    val ins: *instruction.Instruction = ?fn.instrs[R.unwrap_ok[id.InstructionId, str](res_cbr)::u32];
+
+    # fold it to a one-operand branch: the displaced array must be freed at 3, and the
+    # instruction must end up describing the new array's length as BOTH count and cap.
+    val res_ops1: R.Result[OperandArray, str] = operands_alloc(?m, 1);
+    if (R.is_err[OperandArray, str](res_ops1)) { ret 1; }
+    val ops1: OperandArray = R.unwrap_ok[OperandArray, str](res_ops1);
+    ops1.ops[0] = value.const_int(7, i64t);
+    instr_replace_operands(?m, ins, ops1);
+
+    if (!track_is_freed(?tracker, displaced)) { ret 1; }  # displaced array leaked
+    if (tracker.mismatch)         { ret 1; }              # it was freed at the wrong size
+    if (ins.operand_count != 1)   { ret 1; }
+    if (ins.operand_cap != 1)     { ret 1; }
+    if (ins.operands != ops1.ops) { ret 1; }              # adopted, not copied
+
+    dnit(?m);
+
+    if (tracker.overflow)  { ret 1; }                     # entry table too small; test invalid
+    if (tracker.mismatch)  { ret 1; }
+    if (tracker.live != 0) { ret 1; }                     # the adopted array leaked
 
     A.deallocate[TrackEntry](?page_alloc, tracker.entries, 8192::usize);
     ret 0;

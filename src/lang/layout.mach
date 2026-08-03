@@ -35,13 +35,21 @@
 #
 # THE SEAM. A caller supplies an erased context plus two accessors - one describing a
 # node, one naming a field's node - mirroring the `fun(ptr, ...)` callback the comptime
-# resolvers already use. Every walk is depth-bounded and reports `ok = false` rather
-# than guessing, so a caller that must fail closed can, and one that treats a malformed
-# graph as a compiler bug can panic on it.
+# resolvers already use. A walk reports `ok = false` with a CAUSE rather than guessing,
+# so a caller that must fail closed can, and one that treats a malformed graph as a
+# compiler bug can panic naming the real reason.
+#
+# THE DEPTH BOUND BELONGS TO THE CALLER. Termination on a cyclic graph is the caller's
+# property, not this policy's: whoever owns the node universe knows whether it can cycle.
+# A caller with an acyclic graph passes DEPTH_UNBOUNDED and no legal input is ever
+# refused; one whose graph may cycle passes its own limit. A single constant here refused
+# a legal 65-deep nest in the acyclic IR universe for the sake of the cyclic semantic one
+# (#2368).
 
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.string.str;
 
 # how a node occupies storage; the discriminator for `Node`
 pub def NodeKind: u8;
@@ -92,33 +100,67 @@ pub def NodeFn: fun(ptr, u32) Node;
 # context. Only called for indices below the aggregate's reported `field_count`
 pub def FieldFn: fun(ptr, u32, u32) u32;
 
+# why a walk could not determine an extent; `EXTENT_OK` when it did
+#
+# A single boolean cannot say WHICH of the failures happened, so a caller reporting one
+# had to guess - and `ir.type`'s panic guessed "stale handle" for every cause, naming a
+# handle problem when the graph was merely deeper than the bound (#2368). The cause
+# propagates unchanged out of a nested walk, so the message names the ORIGINAL reason
+# rather than "a field failed".
+pub def ExtentCause: u8;
+
+# size and alignment were determined
+pub val EXTENT_OK:             ExtentCause = 0;
+# the describer could not classify a node (NODE_UNKNOWN, or a kind this fold predates)
+pub val EXTENT_UNKNOWN_NODE:   ExtentCause = 1;
+# the graph is deeper than the caller's depth bound
+pub val EXTENT_DEPTH:          ExtentCause = 2;
+# an array's element count times its element size would not fit a u32
+pub val EXTENT_ARRAY_OVERFLOW: ExtentCause = 3;
+# a field offset was asked of a node that is not an aggregate
+pub val EXTENT_NOT_AGGREGATE:  ExtentCause = 4;
+# a field index at or past the aggregate's field count
+pub val EXTENT_FIELD_RANGE:    ExtentCause = 5;
+
 # a node's storage size and alignment, or the fact that neither could be determined
 #
-# `ok` is false when any part of the walk could not be resolved - an unknown node kind,
-# an unresolvable field, an array whose total would not fit, or a graph past the depth
-# bound. Callers that must fail closed test it; callers for whom a malformed graph is a
-# compiler bug panic on it.
+# `ok` is false when any part of the walk could not be resolved; `cause` says which of
+# the failures it was. Callers that must fail closed test `ok`; callers for whom a
+# malformed graph is a compiler bug panic, and report `cause` so the message is true.
 # ---
 # ok:    whether size and align were determined
+# cause: why not, when `ok` is false; EXTENT_OK when it is true
 # size:  the size in bytes
 # align: the alignment in bytes (>= 1 when ok)
 pub rec Extent {
     ok:    bool;
+    cause: ExtentCause;
     size:  u32;
     align: u32;
 }
 
-# the depth bound on a layout walk; a graph deeper than this reports `ok = false`
-val MAX_DEPTH: u32 = 64;
+# passed as `max_depth` by a caller whose node graph cannot contain a cycle, so the walk
+# runs to the graph's own depth and no legal input is ever refused
+#
+# A depth bound is cycle protection, not a layout rule, so it belongs to the caller that
+# knows whether its graph can cycle - not to this policy as one constant for everyone.
+# `me.ir.type` interns a struct only after every field id exists, so a field id is always
+# SMALLER than the aggregate's own: the IR graph is a DAG by construction and passes this.
+# `fe.sema` cannot: a by-value cyclic type is reported by the occurs-check (#2355) but
+# stays in the type universe, so a later walk can still reach one and must bound itself.
+pub val DEPTH_UNBOUNDED: u32 = 0;
 
 # the largest total an array may occupy; a bigger product would wrap a u32 and report a
 # wrong extent, so it declines instead
 val MAX_SIZE: u64 = 4294967295;
 
-# an Extent that could not be determined
-pub fun unknown_extent() Extent {
+# an Extent that could not be determined, carrying the reason
+# ---
+# cause: why the walk could not answer
+pub fun unknown_extent(cause: ExtentCause) Extent {
     var e: Extent;
     e.ok    = false;
+    e.cause = cause;
     e.size  = 0;
     e.align = 0;
     ret e;
@@ -128,6 +170,7 @@ pub fun unknown_extent() Extent {
 pub fun extent(size: u32, align: u32) Extent {
     var e: Extent;
     e.ok    = true;
+    e.cause = EXTENT_OK;
     e.size  = size;
     e.align = align;
     ret e;
@@ -168,9 +211,11 @@ pub fun round_up(value: u32, align: u32) u32 {
 # field:     names an aggregate's field node ids
 # id:        the node to measure
 # ptr_width: the target's pointer width in bytes
-# ret:       the determined Extent, or `ok = false` when it cannot be computed
-pub fun extent_of(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, ptr_width: u32) Extent {
-    ret walk(ctx, describe, field, id, ptr_width, 0);
+# max_depth: the depth past which the walk declines; DEPTH_UNBOUNDED for an acyclic graph
+# ret:       the determined Extent, or `ok = false` with a cause when it cannot be computed
+pub fun extent_of(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, ptr_width: u32,
+                  max_depth: u32) Extent {
+    ret walk(ctx, describe, field, id, ptr_width, 0, max_depth);
 }
 
 # the byte offset of field `field_ix` within aggregate node `id`
@@ -184,29 +229,38 @@ pub fun extent_of(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, ptr_width
 # id:        the aggregate node
 # field_ix:  the zero-based field index
 # ptr_width: the target's pointer width in bytes
-# ret:       an Extent whose `size` is the offset, or `ok = false` when undeterminable
-pub fun field_offset_of(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, field_ix: u32, ptr_width: u32) Extent {
+# max_depth: the depth past which the walk declines; DEPTH_UNBOUNDED for an acyclic graph
+# ret:       an Extent whose `size` is the offset, or `ok = false` with a cause
+pub fun field_offset_of(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, field_ix: u32,
+                        ptr_width: u32, max_depth: u32) Extent {
     val n: Node = describe(ctx, id);
-    if (n.kind != NODE_AGGREGATE)  { ret unknown_extent(); }
-    if (field_ix >= n.field_count) { ret unknown_extent(); }
+    if (n.kind != NODE_AGGREGATE)  { ret unknown_extent(EXTENT_NOT_AGGREGATE); }
+    if (field_ix >= n.field_count) { ret unknown_extent(EXTENT_FIELD_RANGE); }
     if (n.overlays)                { ret extent(0, 1); }
 
     var offset: u32 = 0;
     var i:      u32 = 0;
     for (i < n.field_count) {
-        val fe: Extent = walk(ctx, describe, field, field(ctx, id, i), ptr_width, 1);
-        if (!fe.ok) { ret unknown_extent(); }
+        val fe: Extent = walk(ctx, describe, field, field(ctx, id, i), ptr_width, 1, max_depth);
+        if (!fe.ok) { ret unknown_extent(fe.cause); }
         offset = round_up(offset, fe.align);
         if (i == field_ix) { ret extent(offset, fe.align); }
         offset = offset + fe.size;
         i = i + 1;
     }
-    ret unknown_extent();
+    # field_ix < field_count was checked above, so the loop always returns; an arrival
+    # here means `describe` reported a different field_count on the second call.
+    ret unknown_extent(EXTENT_FIELD_RANGE);
 }
 
-# the recursive worker for `extent_of`, bounding the graph depth
-fun walk(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, ptr_width: u32, depth: u32) Extent {
-    if (depth > MAX_DEPTH) { ret unknown_extent(); }
+# the recursive worker for `extent_of`
+#
+# `max_depth` of DEPTH_UNBOUNDED disables the depth test entirely, so an acyclic caller
+# pays nothing and no legal graph is refused. A failing child's cause propagates
+# unchanged, so a depth failure eight levels down still reports as a depth failure.
+fun walk(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, ptr_width: u32, depth: u32,
+         max_depth: u32) Extent {
+    if (max_depth != DEPTH_UNBOUNDED && depth > max_depth) { ret unknown_extent(EXTENT_DEPTH); }
 
     val n: Node = describe(ctx, id);
 
@@ -216,11 +270,11 @@ fun walk(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, ptr_width: u32, de
     if (n.kind == NODE_VECTOR)  { ret extent(16, 16); }
 
     if (n.kind == NODE_ARRAY) {
-        val e: Extent = walk(ctx, describe, field, n.child, ptr_width, depth + 1);
-        if (!e.ok) { ret unknown_extent(); }
+        val e: Extent = walk(ctx, describe, field, n.child, ptr_width, depth + 1, max_depth);
+        if (!e.ok) { ret unknown_extent(e.cause); }
         # widen the product: a total past a u32 would wrap and report a wrong extent.
         val total: u64 = e.size::u64 * n.count::u64;
-        if (total > MAX_SIZE) { ret unknown_extent(); }
+        if (total > MAX_SIZE) { ret unknown_extent(EXTENT_ARRAY_OVERFLOW); }
         ret extent(total::u32, e.align);
     }
 
@@ -230,8 +284,8 @@ fun walk(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, ptr_width: u32, de
         var widest: u32 = 0;
         var i:      u32 = 0;
         for (i < n.field_count) {
-            val e: Extent = walk(ctx, describe, field, field(ctx, id, i), ptr_width, depth + 1);
-            if (!e.ok) { ret unknown_extent(); }
+            val e: Extent = walk(ctx, describe, field, field(ctx, id, i), ptr_width, depth + 1, max_depth);
+            if (!e.ok) { ret unknown_extent(e.cause); }
             if (e.align > align) { align = e.align; }
             if (n.overlays) {
                 if (e.size > widest) { widest = e.size; }
@@ -250,7 +304,21 @@ fun walk(ctx: ptr, describe: NodeFn, field: FieldFn, id: u32, ptr_width: u32, de
     }
 
     # NODE_UNKNOWN, and any kind a future describer adds without teaching this fold.
-    ret unknown_extent();
+    ret unknown_extent(EXTENT_UNKNOWN_NODE);
+}
+
+# a short, stable name for a cause, for a caller composing a message
+# ---
+# cause: the cause to name
+# ret:   a human-readable phrase, never nil
+pub fun cause_name(cause: ExtentCause) str {
+    if (cause == EXTENT_OK)             { ret "no failure"; }
+    if (cause == EXTENT_UNKNOWN_NODE)   { ret "a type the layout policy cannot classify"; }
+    if (cause == EXTENT_DEPTH)          { ret "a type graph deeper than the walk's depth bound"; }
+    if (cause == EXTENT_ARRAY_OVERFLOW) { ret "an array whose total size does not fit in 32 bits"; }
+    if (cause == EXTENT_NOT_AGGREGATE)  { ret "a field offset asked of a non-aggregate type"; }
+    if (cause == EXTENT_FIELD_RANGE)    { ret "a field index past the aggregate's field count"; }
+    ret "an unrecorded cause";
 }
 
 # the policy's own arithmetic, pinned independently of either type universe: rounding
@@ -264,5 +332,145 @@ test "mach.lang.layout.round_up:cases" {
     if (round_up(1, 8)   != 8)  { ret 1; }
     if (round_up(16, 16) != 16) { ret 1; }
     if (round_up(17, 16) != 32) { ret 1; }
+    ret 0;
+}
+
+# a node table the cause tests describe to the policy, so each failure can be provoked
+# directly. The seam takes an erased context and two accessors, so a test supplies its
+# own graph without going through either type universe.
+var tg_nodes:  [72]Node;
+var tg_fields: [72]u32;
+
+fun tg_describe(ctx: ptr, id: u32) Node { ret tg_nodes[id]; }
+
+# every test aggregate here has exactly one field, so the index is not consulted
+fun tg_field(ctx: ptr, id: u32, index: u32) u32 { ret tg_fields[id]; }
+
+# build a chain of `n` single-field aggregates ending in a 1-byte scalar, so node 0 sits
+# at depth n-1
+fun tg_chain(n: u32) {
+    var i: u32 = 0;
+    for (i < n - 1) {
+        tg_nodes[i]             = node(NODE_AGGREGATE);
+        tg_nodes[i].field_count = 1;
+        tg_fields[i]            = i + 1;
+        i = i + 1;
+    }
+    tg_nodes[n - 1]       = node(NODE_SCALAR);
+    tg_nodes[n - 1].bytes = 1;
+}
+
+# #2368: `ok = false` had to answer for four different failures at once, so `ir.type`
+# reported "type id out of range" for every one - telling the reader a handle was stale
+# when the graph was merely deeper than the bound. Each cause must now be nameable, and
+# a cause raised deep in a walk must reach the top UNCHANGED rather than being flattened
+# into "a field failed", or the message is still wrong just less obviously.
+test "mach.lang.layout.extent:causes_are_distinguishable" {
+    # a node the describer cannot classify
+    tg_nodes[0] = node(NODE_UNKNOWN);
+    val unk: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, DEPTH_UNBOUNDED);
+    if (unk.ok)                            { ret 1; }
+    if (unk.cause != EXTENT_UNKNOWN_NODE)  { ret 1; }
+
+    # ...and the same cause raised one level down, through an aggregate
+    tg_nodes[0]             = node(NODE_AGGREGATE);
+    tg_nodes[0].field_count = 1;
+    tg_fields[0]            = 1;
+    tg_nodes[1]             = node(NODE_UNKNOWN);
+    val prop: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, DEPTH_UNBOUNDED);
+    if (prop.ok)                           { ret 1; }
+    if (prop.cause != EXTENT_UNKNOWN_NODE) { ret 1; }
+
+    # PROPAGATION PROPER, and it must be a cause the enclosing level would not have
+    # produced on its own: an aggregate over an OVERFLOWING ARRAY must report the
+    # overflow, not the unknown-node the flattening version reached for. Pairing the
+    # nested case with EXTENT_UNKNOWN_NODE alone proves nothing, since that is exactly
+    # what a walk that discards the child's cause would answer.
+    tg_nodes[0]             = node(NODE_AGGREGATE);
+    tg_nodes[0].field_count = 1;
+    tg_fields[0]            = 1;
+    tg_nodes[1]             = node(NODE_ARRAY);
+    tg_nodes[1].child       = 2;
+    tg_nodes[1].count       = 4294967295;
+    tg_nodes[2]             = node(NODE_SCALAR);
+    tg_nodes[2].bytes       = 4;
+    val prop2: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, DEPTH_UNBOUNDED);
+    if (prop2.ok)                             { ret 1; }
+    if (prop2.cause != EXTENT_ARRAY_OVERFLOW) { ret 1; }
+
+    # the same, through field_offset_of's own propagation path
+    val prop3: Extent = field_offset_of(nil, tg_describe, tg_field, 0, 0, 8, DEPTH_UNBOUNDED);
+    if (prop3.ok)                             { ret 1; }
+    if (prop3.cause != EXTENT_ARRAY_OVERFLOW) { ret 1; }
+
+    # a depth failure raised below an aggregate must arrive as a DEPTH failure too
+    tg_chain(8);
+    val prop4: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, 3);
+    if (prop4.ok)                    { ret 1; }
+    if (prop4.cause != EXTENT_DEPTH) { ret 1; }
+
+    # an array whose total would wrap a u32
+    tg_nodes[0]       = node(NODE_ARRAY);
+    tg_nodes[0].child = 1;
+    tg_nodes[0].count = 4294967295;
+    tg_nodes[1]       = node(NODE_SCALAR);
+    tg_nodes[1].bytes = 4;
+    val ovf: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, DEPTH_UNBOUNDED);
+    if (ovf.ok)                             { ret 1; }
+    if (ovf.cause != EXTENT_ARRAY_OVERFLOW) { ret 1; }
+
+    # deeper than the caller's bound
+    tg_chain(8);
+    val deep: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, 3);
+    if (deep.ok)                   { ret 1; }
+    if (deep.cause != EXTENT_DEPTH) { ret 1; }
+
+    # a field offset asked of something that is not an aggregate
+    tg_nodes[0]       = node(NODE_SCALAR);
+    tg_nodes[0].bytes = 4;
+    val nag: Extent = field_offset_of(nil, tg_describe, tg_field, 0, 0, 8, DEPTH_UNBOUNDED);
+    if (nag.ok)                            { ret 1; }
+    if (nag.cause != EXTENT_NOT_AGGREGATE) { ret 1; }
+
+    # a field index past the end
+    tg_nodes[0]             = node(NODE_AGGREGATE);
+    tg_nodes[0].field_count = 1;
+    tg_fields[0]            = 1;
+    tg_nodes[1]             = node(NODE_SCALAR);
+    tg_nodes[1].bytes       = 4;
+    val rng: Extent = field_offset_of(nil, tg_describe, tg_field, 0, 3, 8, DEPTH_UNBOUNDED);
+    if (rng.ok)                          { ret 1; }
+    if (rng.cause != EXTENT_FIELD_RANGE) { ret 1; }
+
+    # and a determined extent carries EXTENT_OK, so `cause` is never stale from a
+    # previous failure
+    val good: Extent = extent_of(nil, tg_describe, tg_field, 1, 8, DEPTH_UNBOUNDED);
+    if (!good.ok)                 { ret 1; }
+    if (good.cause != EXTENT_OK)  { ret 1; }
+    ret 0;
+}
+
+# #2368: the depth bound is CYCLE PROTECTION and belongs to the caller, not a constant
+# every caller shares. A caller whose graph cannot cycle passes DEPTH_UNBOUNDED and the
+# walk runs to the graph's own depth - the IR type universe is such a caller, and the old
+# shared constant refused its legal 65-deep nest.
+test "mach.lang.layout.extent:unbounded_walks_past_any_constant" {
+    # 70 levels: past the 64 that used to be hardcoded, and past any bound a caller
+    # would plausibly pick
+    tg_chain(70);
+    val deep: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, DEPTH_UNBOUNDED);
+    if (!deep.ok)          { ret 1; }
+    if (deep.size  != 1)   { ret 1; }
+    if (deep.align != 1)   { ret 1; }
+
+    # the same graph declines under a bound below its depth, and says why
+    val bounded: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, 64);
+    if (bounded.ok)                    { ret 1; }
+    if (bounded.cause != EXTENT_DEPTH) { ret 1; }
+
+    # a bound at or above the depth admits it
+    val fits: Extent = extent_of(nil, tg_describe, tg_field, 0, 8, 69);
+    if (!fits.ok)        { ret 1; }
+    if (fits.size != 1)  { ret 1; }
     ret 0;
 }

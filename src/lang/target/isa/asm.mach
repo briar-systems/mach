@@ -47,6 +47,16 @@
 # Precision is earned per mnemonic, on that mnemonic's own table row, and never
 # credited by category - `opaque-and-slow` is safe, `modeled-and-wrong` is a
 # miscompile.
+#
+# A `{name}` binding is the one operand every grammar reads the same way, so it is
+# stated here rather than three times (#2258): it denotes a frame slot, a frame slot
+# is memory, and memory is not a register - so it contributes nothing to the write
+# set and the statement around it is modeled whether or not the frame is laid out
+# yet. That is what makes the effect model a property of the parsed instruction
+# stream rather than of the parse phase: the same body folds to the same set before
+# register allocation and at emit time. The emitter never sees an unresolved binding,
+# because it always parses with a binding context, and the driver CHECKS that rather
+# than assuming it.
 
 use std.text.parse;
 use std.types.bool.bool;
@@ -109,6 +119,7 @@ pub val AOF_HAS_INDEX: u8 = 0x04;  # a memory operand carries an index register
 pub val AOF_WRITEBACK: u8 = 0x08;  # the access writes its updated base register back
 pub val AOF_STACK_PTR: u8 = 0x10;  # the register names the stack pointer, not the zero register
 pub val AOF_WIDE:      u8 = 0x20;  # the index register is the wide (64-bit) form
+pub val AOF_MEM_ABS:   u8 = 0x40;  # a memory operand addresses an absolute constant (`imm` set, no base, no index)
 
 # a parsed inline-asm operand
 #
@@ -189,14 +200,12 @@ pub rec Mnemonic {
 }
 
 # the parse outcomes one statement can have
+#
+# There is no "parsed but unmodeled" outcome: a statement the grammar accepts is one
+# the effect model describes, and one it does not accept refuses the block.
 pub val AI_INST:   u8 = 0;  # a modeled machine instruction
 pub val AI_LABEL:  u8 = 1;  # a numeric local-label definition
 pub val AI_BYTES:  u8 = 2;  # a raw byte directive's payload
-# a statement whose mnemonic is known but whose operands are not resolvable - a
-# `{name}` binding parsed before the frame is laid out, on a target whose effect
-# model does not attempt to model one. the instruction is not modeled, so its
-# effects fall back to everything the target's inline grammar can reach
-pub val AI_OPAQUE: u8 = 3;
 
 # what a parsed instruction still needs the encoder to resolve
 pub val AR_NONE:  u8 = 0;  # nothing: the instruction is self-contained
@@ -735,18 +744,60 @@ fun split_ops(c: *Cursor, lo: usize, hi: usize, s: *Stmt) R.Result[bool, str] {
     ret R.ok[bool, str](true);
 }
 
-# decode a raw byte directive's payload, claiming each value and separator
-fun parse_bytes(c: *Cursor, s: *Stmt, item: *Item) R.Result[bool, str] {
+# decode a raw byte directive's payload from `body[lo..hi)`, claiming each value and
+# separator
+#
+# `.byte` is a directive, not an instruction: its payload is a byte sequence, not an
+# operand list, so it splits here rather than through `split_ops` and is bounded by
+# `BYTES_MAX` rather than by `MAX_OPS`. Routing it through the operand splitter is
+# what capped a byte sequence at four (#2398) - a limit that belongs to instruction
+# operands, where four is a real machine fact, and means nothing here.
+#
+# A value outside a byte's range is refused rather than truncated: `.byte 0x1FF`
+# naming one byte is a typo, and silently emitting 0xFF makes it an instruction
+# stream nobody wrote.
+fun parse_bytes(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[bool, str] {
     item.kind = AI_BYTES;
-    var i: u32 = 0;
-    for (i < s.nargs) {
-        val v: O.Option[i64] = region_i64(c.body, s.arg_lo[i::usize], s.arg_hi[i::usize]);
-        if (!O.is_some[i64](v)) { ret R.err[bool, str]("encode: malformed inline-asm .byte value"); }
-        item.bytes[item.byte_count] = O.unwrap[i64](v)::u8;
-        item.byte_count = item.byte_count + 1;
+
+    var a: usize = lo;
+    for (a < hi && is_space(c.body[a])) { a = a + 1; }
+
+    var start: usize = a;
+    var i: usize = a;
+    for (i <= hi) {
+        var sep: bool = false;
+        if (i == hi)                    { sep = true; }
+        or (c.body[i] == ','::char)     { sep = true; }
+
+        if (sep) {
+            if (item.byte_count >= BYTES_MAX) {
+                ret R.err[bool, str](span_message(c,
+                    "encode: inline-asm directive '", lo, hi, "' names more bytes than a statement can carry",
+                    "encode: an inline-asm .byte directive names more bytes than a statement can carry"));
+            }
+            var ta: usize = start;
+            var tb: usize = i;
+            for (ta < tb && is_space(c.body[ta])) { ta = ta + 1; }
+            for (tb > ta && is_space(c.body[tb - 1])) { tb = tb - 1; }
+            if (tb <= ta) { ret R.err[bool, str]("encode: malformed inline-asm .byte value"); }
+
+            val v: O.Option[i64] = region_i64(c.body, ta, tb);
+            if (!O.is_some[i64](v)) { ret R.err[bool, str]("encode: malformed inline-asm .byte value"); }
+            val b: i64 = O.unwrap[i64](v);
+            if (b < -128 || b > 255) { ret R.err[bool, str]("encode: inline-asm .byte value does not fit in a byte"); }
+
+            val cr: R.Result[bool, str] = claim(c, ta, tb - ta);
+            if (R.is_err[bool, str](cr)) { ret cr; }
+            item.bytes[item.byte_count] = b::u8;
+            item.byte_count = item.byte_count + 1;
+            if (i < hi) {
+                val cc: R.Result[bool, str] = claim(c, i, 1);
+                if (R.is_err[bool, str](cc)) { ret cc; }
+            }
+            start = i + 1;
+        }
         i = i + 1;
     }
-    if (item.byte_count == 0) { ret R.err[bool, str]("encode: malformed inline-asm .byte value"); }
     ret R.ok[bool, str](true);
 }
 
@@ -836,15 +887,17 @@ fun parse_stmt(c: *Cursor, lo: usize, hi: usize, item: *Item) R.Result[usize, st
     item.implicit = s.m.implicit;
     item.words    = s.m.words;
 
+    # a raw byte payload is not an operand list, so it never reaches the operand
+    # splitter and is bounded by `BYTES_MAX` instead of `MAX_OPS`.
+    if (s.m.form == AF_BYTES) {
+        val br: R.Result[bool, str] = parse_bytes(c, lo + mlen, hi, item);
+        if (R.is_err[bool, str](br)) { ret R.err[usize, str](R.unwrap_err[bool, str](br)); }
+        ret R.ok[usize, str](hi);
+    }
+
     if (s.m.form != AF_NONE) {
         val sr: R.Result[bool, str] = split_ops(c, lo + mlen, hi, ?s);
         if (R.is_err[bool, str](sr)) { ret R.err[usize, str](R.unwrap_err[bool, str](sr)); }
-    }
-
-    if (s.m.form == AF_BYTES) {
-        val br: R.Result[bool, str] = parse_bytes(c, ?s, item);
-        if (R.is_err[bool, str](br)) { ret R.err[usize, str](R.unwrap_err[bool, str](br)); }
-        ret R.ok[usize, str](hi);
     }
 
     item.nops = s.nargs;
@@ -865,9 +918,10 @@ fun unknown_message(c: *Cursor, lo: usize, hi: usize) str {
 # target's - `[rbp + off]`, `off(s0)`, `[x29, #off]` - so the ISA's lexer calls this
 # and builds its own memory operand.
 #
-# Returns none when the parse carries no binding context: before the frame is laid
-# out a binding's displacement genuinely is unknown, and the ISA decides whether its
-# effect model can still describe the statement.
+# Returns ok(false) when the parse carries no binding context: before the frame is
+# laid out a binding's displacement genuinely is unknown. The operand stays a binding
+# and the statement is still modeled - what the displacement turns out to be cannot
+# change which registers the statement writes, since a slot is memory either way.
 # ---
 # c:   the cursor
 # lo:  body offset of the `{`
@@ -912,10 +966,13 @@ fun bind_name_eq(interner: *intern.Interner, name: intern.StrId, body: str, star
 
 # the registers one parsed item writes, folded into the running masks
 #
-# The whole effect model. A modeled instruction writes exactly the registers its
-# mnemonic's facts name; an item the parser could not model writes worst-case. An
-# unreadable byte stream reaches every bank, while an unresolved statement is bounded
-# by the general-purpose bank - no target's inline grammar names a vector register.
+# The whole effect model, and the same one on every target. An instruction writes
+# exactly the registers its mnemonic's facts name among its own operands, plus the
+# ones its form writes regardless. A raw byte payload is not an instruction the
+# parser read at all, so it reaches every register in every bank.
+#
+# A `{name}` binding names a frame slot, never a register, so a statement carrying
+# one folds to the same set resolved or unresolved (#2258).
 # ---
 # g:    the target's grammar
 # item: the parsed statement
@@ -926,10 +983,6 @@ pub fun fold_clobbers(g: *Grammar, item: *Item, gp: *u32, fp: *u32) {
     if (item.kind == AI_BYTES) {
         @gp = @gp | g.all_gp;
         @fp = @fp | g.all_fp;
-        ret;
-    }
-    if (item.kind == AI_OPAQUE) {
-        @gp = @gp | g.all_gp;
         ret;
     }
     @gp = @gp | item.implicit;
@@ -1315,12 +1368,26 @@ fun emit_one(st: *encode.EncodeState, g: *Grammar, c: *Cursor, l: *Labels, item:
         }
         ret R.ok[bool, str](true);
     }
-    # the emitter always parses with a binding context, so every `{name}` either
-    # resolved or failed the parse; an unresolved statement here is a parser bug.
-    if (item.kind == AI_OPAQUE) {
-        ret R.err[bool, str]("internal compiler error: inline-asm statement reached the encoder unresolved");
+    # the emitter always parses with a binding context, so every `{name}` resolved to
+    # its frame slot or failed the parse. checking it here, over every operand of
+    # every statement, is what lets each grammar read a binding as the memory operand
+    # it is without three emitters re-deriving the same refusal - and it covers every
+    # operand position, including the ones whose emitter reads a register field
+    # directly and would otherwise encode a base the binding never named (#2258).
+    var i: u32 = 0;
+    for (i < item.nops) {
+        if (item.ops[i::usize].kind == AOP_BIND) { ret R.err[bool, str](unresolved_message(c, item)); }
+        i = i + 1;
     }
     ret g.emit(st, c, l, item);
+}
+
+# the diagnostic for a statement whose `{name}` never resolved to a frame slot
+fun unresolved_message(c: *Cursor, item: *Item) str {
+    ret span_message(c,
+        "internal compiler error: inline-asm statement '", item.src_off, item.src_off + item.src_len,
+        "' reached the encoder with an unresolved '{name}'",
+        "internal compiler error: an inline-asm statement reached the encoder with an unresolved '{name}'");
 }
 
 # check an emitted instruction against the word count its mnemonic declares and the

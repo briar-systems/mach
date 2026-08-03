@@ -57,6 +57,7 @@ use O: std.types.option;
 use R: std.types.result;
 
 use mach.lang.be.codegen.encode;
+use codegen_frame: mach.lang.be.codegen.frame;
 use mach.lang.be.codegen.mir;
 use mach.lang.intern;
 use mach.lang.target.isa;
@@ -222,10 +223,11 @@ val CC_LE: u32 = 13;
 val CC_AL: u32 = 14;
 
 # the two fixed FP scratch registers held back from vector allocation (V0-V29 are
-# allocatable, so these are never an assigned value): V31 is the primary scratch
-# (the vtable's `fp_scratch_reg`) used for a spilled left/source operand and for a
-# spilled destination's result; V30 the secondary, used for a spilled right
-# operand. both are caller-saved under AAPCS64, so neither needs prologue saving
+# allocatable, so these are never an assigned value): V31 is the primary scratch,
+# used for a spilled left/source operand and for a spilled destination's result;
+# V30 the secondary, used for a spilled right operand. both are caller-saved under
+# AAPCS64, so neither needs prologue saving. this module is the only owner - the
+# vtable declares no FP scratch, so there is no second copy to disagree (#2365)
 val FP_SCRATCH0: u32 = 31;
 val FP_SCRATCH1: u32 = 30;
 
@@ -320,6 +322,50 @@ val STLXR_X: u32 = 0xC800FC00; val STLXR_W: u32 = 0x8800FC00;
 # yield = HINT #1; dmb's barrier option goes in CRm[11:8]
 val YIELD_WORD: u32 = 0xD503203F;
 val DMB_BASE:   u32 = 0xD50330BF;
+
+# the system-register moves (#2352). Three encodings share one field layout:
+#
+#   MSR (immediate)  op1[18:16] CRm[11:8] op2[7:5], Rt = 0b11111, CRn fixed at 0b0100
+#   MSR (register)   o0[19] op1[18:16] CRn[15:12] CRm[11:8] op2[7:5] Rt[4:0]
+#   MRS              the same as MSR (register) with bit[21] set to read instead
+#
+# `o0` is the low bit of the architectural `op0`, which is 2 or 3, so o0 = op0 - 2.
+# Every base below is checked against llvm-mc rather than derived on paper: `msr DIT,
+# #1` is 0xD503415F, `mrs x0, DIT` is 0xD53B42A0, `msr DIT, x1` is 0xD51B42A1.
+val MSR_IMM_BASE: u32 = 0xD500401F;
+val MSR_REG_BASE: u32 = 0xD5100000;
+val MRS_BASE:     u32 = 0xD5300000;
+
+# the (op1, op2) of a PSTATE field writable by `msr <field>, #imm`
+#
+# The immediate rides CRm, so the field itself contributes only op1 and op2. DIT is the
+# data-independent-timing mode: with it set, the ARM architecture guarantees that the
+# timing of the instructions in its scope does not depend on their data values, which is
+# the hardware half of the constant-time story (#1643). It is EL0-writable, so a
+# userspace program may set it for itself.
+#
+# ARM spells these fields in capitals and mach's asm text is matched verbatim - nothing
+# in the pipeline case-folds - so both spellings are accepted rather than forcing a
+# reader to write the one this table happened to pick.
+fun a64_pstate_field(name: str, op1_out: *u32, op2_out: *u32) bool {
+    if (str_equals(name, "DIT") || str_equals(name, "dit")) {
+        @op1_out = 3; @op2_out = 2; ret true;
+    }
+    ret false;
+}
+
+# the (op0, op1, CRn, CRm, op2) of a system register named by `msr`/`mrs`
+#
+# DIT is both a PSTATE field and a system register: the immediate form writes the mode
+# bit directly, and the register form is how a program reads it back to confirm the mode
+# actually engaged. Same name, different encodings - which is why the two lookups are
+# separate tables rather than one.
+fun a64_sysreg(name: str, op0_out: *u32, op1_out: *u32, crn_out: *u32, crm_out: *u32, op2_out: *u32) bool {
+    if (str_equals(name, "DIT") || str_equals(name, "dit")) {
+        @op0_out = 3; @op1_out = 3; @crn_out = 4; @crm_out = 2; @op2_out = 5; ret true;
+    }
+    ret false;
+}
 
 # a three-register data-processing word - Rm[20:16], Rn[9:5], Rd[4:0]
 # OR-ed into `base`. used for the register ALU forms (ADD/SUB/AND/ORR/EOR), the
@@ -1106,6 +1152,42 @@ fun emit_barrier(st: *encode.EncodeState, crm: u32) {
     printer.note_inst(?st.buf, ?i);
 }
 
+# emit `msr <pstatefield>, #imm`
+#
+# The immediate occupies CRm, so it is 4 bits wide; the caller has already range-checked
+# it. Rt is baked into the base as 0b11111.
+fun emit_msr_imm(st: *encode.EncodeState, op1: u32, op2: u32, imm: u32) {
+    emit_word(st, MSR_IMM_BASE | ((op1 & 0x7) << 16) | ((imm & 0xF) << 8) | ((op2 & 0x7) << 5));
+}
+
+# fold a system register's five architectural selectors into one operand payload
+#
+# The parser resolves the register name and the emitter needs the fields; carrying them
+# as one packed immediate keeps the parsed instruction a plain operand list rather than
+# growing a system-register-shaped operand kind for two mnemonics.
+fun a64_sysreg_pack(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) u32 {
+    ret ((op0 & 0x3) << 16) | ((op1 & 0x7) << 12) | ((crn & 0xF) << 8) | ((crm & 0xF) << 4) | (op2 & 0x7);
+}
+
+# emit `msr <sysreg>, Xt` or `mrs Xt, <sysreg>`
+#
+# One packer for both directions: the encodings differ only in `base`, which selects read
+# or write, so a single field layout serves and the two cannot drift apart.
+#
+# The encoded `o0` field is the LOW BIT of `op0`, which the architecture restricts to 2 or
+# 3 - so masking is the whole conversion. Subtracting 2 first would be equivalent for both
+# legal values and is left out deliberately: it reads as a meaningful adjustment while
+# being unable to change any result, so no test could ever hold it honest.
+fun a64_emit_sysreg(st: *encode.EncodeState, base: u32, packed: u32, rt: u32) {
+    val op0: u32 = (packed >> 16) & 0x3;
+    val op1: u32 = (packed >> 12) & 0x7;
+    val crn: u32 = (packed >> 8) & 0xF;
+    val crm: u32 = (packed >> 4) & 0xF;
+    val op2: u32 = packed & 0x7;
+    emit_word(st, base | ((op0 & 0x1) << 19) | (op1 << 16)
+                       | (crn << 12) | (crm << 8) | (op2 << 5) | (rt & 0x1F));
+}
+
 # emit a store-release-exclusive word, whose status result rides bits[20:16]
 fun emit_stxr(st: *encode.EncodeState, base: u32, rs: u32, rt: u32, rn: u32) {
     emit_word(st, pack_ldst(base, rt, rn, 0) | ((rs & 0x1F) << 16));
@@ -1238,14 +1320,7 @@ rec A64Mem {
 # physical-register base (carrying MIR_VREG_NIL) never matches. mirrors the x86-64
 # encoder's twin, reading the laid-out frame directly
 fun frame_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
-    val frame: *mir.MirFrame = ?f.frame;
-    if (frame.slots == nil) { ret O.none[i64](); }
-    var i: u32 = 0;
-    for (i < frame.slot_count) {
-        if (frame.slots[i].value == v) { ret O.some[i64](frame.slots[i].offset); }
-        i = i + 1;
-    }
-    ret O.none[i64]();
+    ret codegen_frame.slot_offset(?f.frame, v, 0);
 }
 
 # lower a post-regalloc MIR_OP_MEM operand to its A64 base / offset /
@@ -3587,6 +3662,8 @@ val A64P_DMB:      u16 = 18;  # `dmb <option>`
 val A64P_LDORD:    u16 = 19;  # `ldar` / `stlr` / `ldaxr Rt, [Xn]`
 val A64P_STLXR:    u16 = 20;  # `stlxr Ws, Rt, [Xn]`
 val A64P_SHIFT:    u16 = 21;  # `lsl` / `lsr` / `asr` and their variable forms
+val A64P_MSR:      u16 = 22;  # `msr <pstatefield>, #imm` / `msr <sysreg>, Xt`
+val A64P_MRS:      u16 = 23;  # `mrs Xt, <sysreg>`
 
 # the four-bit condition a `b.<cond>` or `cset` carries, in `Mnemonic.flags[11:8]`
 val A64F_COND_SHIFT: u16 = 8;
@@ -3638,6 +3715,8 @@ val A64M_ASR:   u32 = 37;
 val A64M_LSLV:  u32 = 38;
 val A64M_LSRV:  u32 = 39;
 val A64M_ASRV:  u32 = 40;
+val A64M_MSR:   u32 = 41;
+val A64M_MRS:   u32 = 42;
 
 # the caller-saved general-purpose file (x0-x18 and x30), which a call destroys
 #
@@ -3646,7 +3725,7 @@ val A64M_ASRV:  u32 = 40;
 val A64_CALLER_SAVED: u32 = 0x4007FFFF;
 
 # number of rows in the AArch64 inline-asm mnemonic table
-val A64_MNEMONIC_COUNT: usize = 42;
+val A64_MNEMONIC_COUNT: usize = 44;
 
 # the AArch64 inline-asm instruction surface
 #
@@ -3720,6 +3799,16 @@ val A64_MNEMONICS: [A64_MNEMONIC_COUNT]iasm.Mnemonic = [A64_MNEMONIC_COUNT]iasm.
     iasm.Mnemonic{ name: "lslv", code: A64M_LSLV, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: A64P_SHIFT, words: 1 },
     iasm.Mnemonic{ name: "lsrv", code: A64M_LSRV, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: A64P_SHIFT, words: 1 },
     iasm.Mnemonic{ name: "asrv", code: A64M_ASRV, form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: A64P_SHIFT, words: 1 },
+
+    # the system-register moves (#2352). THE EFFECT MODEL'S ANSWER, stated rather than
+    # inherited: `msr` writes PSTATE, which is not an allocatable location - no general
+    # register, no vector register, no memory - so it writes NOTHING the register
+    # allocator tracks, exactly as `dmb` writes nothing while ordering memory. Declaring
+    # it a full clobber would be less accurate, not safer: it would force spills around a
+    # `ct.begin` that cannot disturb a single value. `mrs` is the one that writes, and it
+    # writes only its destination register.
+    iasm.Mnemonic{ name: "msr", code: A64M_MSR, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: A64P_MSR, words: 1 },
+    iasm.Mnemonic{ name: "mrs", code: A64M_MRS, form: iasm.AF_OPS, writes: iasm.AW_OP0,  implicit: 0, flags: A64P_MRS, words: 1 },
     iasm.Mnemonic{ name: "lsl",  code: A64M_LSL,  form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: A64P_SHIFT, words: 1 },
     iasm.Mnemonic{ name: "lsr",  code: A64M_LSR,  form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: A64P_SHIFT, words: 1 },
     iasm.Mnemonic{ name: "asr",  code: A64M_ASR,  form: iasm.AF_OPS, writes: iasm.AW_OP0, implicit: 0, flags: A64P_SHIFT, words: 1 },
@@ -3766,7 +3855,8 @@ fun a64_decode_bcond(body: str, lo: usize, hi: usize, m: *iasm.Mnemonic, n_out: 
 # pattern names their position and the lexer skips them.
 fun a64_name_operand(pat: u16) u32 {
     if (pat == A64P_B || pat == A64P_BCOND || pat == A64P_DMB)  { ret 0; }
-    if (pat == A64P_CBR || pat == A64P_CSET)                    { ret 1; }
+    if (pat == A64P_MSR)                                        { ret 0; }
+    if (pat == A64P_CBR || pat == A64P_CSET || pat == A64P_MRS) { ret 1; }
     if (pat == A64P_MOVEWIDE)                                   { ret 2; }
     ret 0xFFFFFFFF;
 }
@@ -4108,6 +4198,51 @@ fun a64_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, s
         item.ops[0] = iasm.op_imm(opt::i64, 1);
         ret R.ok[bool, str](true);
     }
+    if (pat == A64P_MSR) {
+        if (n != 2) { ret R.err[bool, str]("encode: inline-asm msr expects a system register or PSTATE field and a source"); }
+        var nbuf: [16]u8;
+        if (!iasm.copy_region(c.body, s.arg_lo[0], s.arg_hi[0], ?nbuf[0], 16)) {
+            ret R.err[bool, str]("encode: inline-asm msr destination name is too long");
+        }
+        # the SECOND operand picks the form, and with it which table names the first:
+        # an immediate writes a PSTATE field, a register writes a system register. DIT is
+        # spelled the same in both and encodes differently in each, so the form has to be
+        # decided before the name is resolved.
+        var op1: u32 = 0; var op2: u32 = 0;
+        if (item.ops[1].kind == iasm.AOP_IMM) {
+            if (!a64_pstate_field((?nbuf[0])::str, ?op1, ?op2)) {
+                ret R.err[bool, str]("encode: unsupported inline-asm msr PSTATE field");
+            }
+            if (item.ops[1].imm < 0 || item.ops[1].imm > 15) {
+                ret R.err[bool, str]("encode: inline-asm msr immediate must be 0-15");
+            }
+            item.ops[0] = iasm.op_imm(((op1 << 8) | op2)::i64, 1);
+            ret R.ok[bool, str](true);
+        }
+        if (item.ops[1].kind != iasm.AOP_REG) {
+            ret R.err[bool, str]("encode: inline-asm msr source must be an immediate or a register");
+        }
+        var op0: u32 = 0; var crn: u32 = 0; var crm: u32 = 0;
+        if (!a64_sysreg((?nbuf[0])::str, ?op0, ?op1, ?crn, ?crm, ?op2)) {
+            ret R.err[bool, str]("encode: unsupported inline-asm msr system register");
+        }
+        item.ops[0] = iasm.op_imm(a64_sysreg_pack(op0, op1, crn, crm, op2)::i64, 1);
+        ret R.ok[bool, str](true);
+    }
+    if (pat == A64P_MRS) {
+        if (n != 2)                           { ret R.err[bool, str]("encode: inline-asm mrs expects Xt, <sysreg>"); }
+        if (item.ops[0].kind != iasm.AOP_REG) { ret R.err[bool, str]("encode: inline-asm mrs destination must be a register"); }
+        var mbuf: [16]u8;
+        if (!iasm.copy_region(c.body, s.arg_lo[1], s.arg_hi[1], ?mbuf[0], 16)) {
+            ret R.err[bool, str]("encode: inline-asm mrs system register name is too long");
+        }
+        var m0: u32 = 0; var m1: u32 = 0; var mn: u32 = 0; var mm: u32 = 0; var m2: u32 = 0;
+        if (!a64_sysreg((?mbuf[0])::str, ?m0, ?m1, ?mn, ?mm, ?m2)) {
+            ret R.err[bool, str]("encode: unsupported inline-asm mrs system register");
+        }
+        item.ops[1] = iasm.op_imm(a64_sysreg_pack(m0, m1, mn, mm, m2)::i64, 1);
+        ret R.ok[bool, str](true);
+    }
     if (pat == A64P_LDORD) {
         if (n != 2)                           { ret R.err[bool, str]("encode: inline-asm ldar/stlr/ldaxr expects Rt, [Xn]"); }
         if (item.ops[0].kind != iasm.AOP_REG) { ret R.err[bool, str]("encode: inline-asm ldar/stlr/ldaxr value must be a register"); }
@@ -4225,6 +4360,19 @@ fun a64_emit(st: *encode.EncodeState, c: *iasm.Cursor, l: *iasm.Labels, item: *i
     if (pat == A64P_LDST)  { ret a64_emit_ldst(st, c, item); }
     if (pat == A64P_LDSTP) { ret a64_emit_ldstp(st, item); }
     if (pat == A64P_DMB)   { emit_barrier(st, item.ops[0].imm::u32); ret R.ok[bool, str](true); }
+    if (pat == A64P_MSR) {
+        if (item.ops[1].kind == iasm.AOP_IMM) {
+            val f: u32 = item.ops[0].imm::u32;
+            emit_msr_imm(st, (f >> 8) & 0x7, f & 0x7, item.ops[1].imm::u32);
+            ret R.ok[bool, str](true);
+        }
+        a64_emit_sysreg(st, MSR_REG_BASE, item.ops[0].imm::u32, item.ops[1].reg::u32);
+        ret R.ok[bool, str](true);
+    }
+    if (pat == A64P_MRS) {
+        a64_emit_sysreg(st, MRS_BASE, item.ops[1].imm::u32, item.ops[0].reg::u32);
+        ret R.ok[bool, str](true);
+    }
     if (pat == A64P_LDORD) { ret a64_emit_ldord(st, item); }
     if (pat == A64P_STLXR) {
         val base: u32 = sel(a64_is64(?item.ops[1]), STLXR_X, STLXR_W);
@@ -4401,8 +4549,6 @@ fun a64_emit_branch(st: *encode.EncodeState, c: *iasm.Cursor, l: *iasm.Labels, i
 fun a64_emit_ldst(st: *encode.EncodeState, c: *iasm.Cursor, item: *iasm.Item) R.Result[bool, str] {
     val rt: *iasm.Operand = ?item.ops[0];
     val mem: *iasm.Operand = ?item.ops[1];
-    if (mem.kind != iasm.AOP_MEM) { ret R.err[bool, str]("internal compiler error: inline-asm statement reached the encoder unresolved"); }
-
     val is_load: bool = item.code == A64M_LDR || item.code == A64M_LDRB || item.code == A64M_LDRH;
     var w: u8 = 4;
     if (a64_is64(rt))                                          { w = 8; }
@@ -6142,6 +6288,56 @@ test "mach.lang.target.isa.arm64.encode:inline_asm_data_processing_forms" {
     if (read_word(?st.buf, 92)  != 0x6B01001F) { bad = 1; }
     if (read_word(?st.buf, 96)  != 0xD63F0000) { bad = 1; }
     if (read_word(?st.buf, 100) != 0xD61F0000) { bad = 1; }
+
+    iasm.labels_dnit(?labels);
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# the system-register moves round-trip through the inline-asm assembler, byte-exact
+# against llvm-mc (#2352). `msr DIT, #imm` is the ONLY way to write PSTATE.DIT, the
+# hardware data-independent-timing mode, and it is EL0-executable - so this is what makes
+# a real DIT mode reachable from Mach source rather than only describable in a comment.
+#
+# EVERY WORD BELOW CAME FROM `llvm-mc -triple=aarch64 -mattr=+dit -show-encoding`, not
+# from re-deriving the field layout by hand. #2236 found a real encoding bug in a
+# hand-written packer that unit tests alone missed, and a table checked against itself
+# would reproduce whatever the encoder does.
+#
+# Note DIT is spelled the same as a PSTATE field and as a system register while encoding
+# differently in each: `msr DIT, #1` is 0xD503415F and `msr DIT, x1` is 0xD51B42A1. The
+# immediate and register forms are separate lookups for that reason, and both are pinned
+# here so a future edit cannot collapse them.
+test "mach.lang.target.isa.arm64.encode:inline_asm_sysreg_moves" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: iasm.Labels;
+    iasm.labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+
+    a64_asm_text(?st, ?f, ?labels, "msr DIT, 1");    # 0
+    a64_asm_text(?st, ?f, ?labels, "msr DIT, 0");    # 4
+    a64_asm_text(?st, ?f, ?labels, "msr DIT, 15");   # 8
+    a64_asm_text(?st, ?f, ?labels, "mrs x0, DIT");   # 12
+    a64_asm_text(?st, ?f, ?labels, "mrs x19, DIT");  # 16
+    a64_asm_text(?st, ?f, ?labels, "msr DIT, x1");   # 20
+    a64_asm_text(?st, ?f, ?labels, "msr DIT, x9");   # 24
+    # the lowercase spelling is the same instruction; nothing case-folds asm text
+    a64_asm_text(?st, ?f, ?labels, "msr dit, 1");    # 28
+    a64_asm_text(?st, ?f, ?labels, "mrs x0, dit");   # 32
+
+    if (read_word(?st.buf, 0)  != 0xD503415F) { bad = 1; }  # msr DIT, #1
+    if (read_word(?st.buf, 4)  != 0xD503405F) { bad = 1; }  # msr DIT, #0
+    if (read_word(?st.buf, 8)  != 0xD5034F5F) { bad = 1; }  # msr DIT, #15
+    if (read_word(?st.buf, 12) != 0xD53B42A0) { bad = 1; }  # mrs x0, DIT
+    if (read_word(?st.buf, 16) != 0xD53B42B3) { bad = 1; }  # mrs x19, DIT
+    if (read_word(?st.buf, 20) != 0xD51B42A1) { bad = 1; }  # msr DIT, x1
+    if (read_word(?st.buf, 24) != 0xD51B42A9) { bad = 1; }  # msr DIT, x9
+    if (read_word(?st.buf, 28) != 0xD503415F) { bad = 1; }  # msr dit, #1
+    if (read_word(?st.buf, 32) != 0xD53B42A0) { bad = 1; }  # mrs x0, dit
 
     iasm.labels_dnit(?labels);
     encode.buf_dnit(?st.buf);

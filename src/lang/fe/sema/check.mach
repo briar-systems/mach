@@ -38,10 +38,14 @@ use mach.lang.fe.resolve;
 use mach.lang.fe.sema.coerce;
 use mach.lang.fe.sema.context;
 use mach.lang.fe.sema.generics;
+use mach.lang.fe.sema.typename;
 use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.session;
 use mach.lang.type;
+
+# how many links of a refused instantiation chain a diagnostic spells
+val CHAIN_LINKS: u32 = 5;
 
 # checks that a value of type `actual` may flow into a slot of type `expected`
 #
@@ -715,33 +719,22 @@ pub fun byte_size(sc: *context.SemaContext, t: type.TypeId) u32 {
 
 # render `t` to an owned, human-readable spelling for diagnostics
 #
-# primitives render to their keyword (`i64`, `f32`, `ptr`); a pointer to `*T`;
-# an array to `[N]T`; a record / union / generic parameter to its declared name;
-# a function to `fun(A, B) R`; and a generic instance to `Name[Arg, ...]`.
-# composite forms recurse over their components; an unknown or unnamed type
-# renders to a `<error>` / `<anon>` placeholder. the result is allocated from
-# the session allocator and must be released with type_str_free.
+# the sema-facing spelling of `typename.type_to_str`: the renderer itself needs
+# only the session, so it lives in `typename` where lowering can reach it too.
 # ---
-# sc: the active sema context (type universe, interner, AST registry)
-# t:  the type to render
+# sc:  the active sema context (supplies the session)
+# t:   the type to render
 # ret: an owned, null-terminated spelling, or an allocation error
 pub fun type_to_str(sc: *context.SemaContext, t: type.TypeId) R.Result[str, str] {
-    val len: usize = type_str_len(sc, t);
-    val res_buf: R.Result[*char, str] = A.allocate[char](sc.s.alloc, len + 1);
-    if (R.is_err[*char, str](res_buf)) { ret R.err[str, str](R.unwrap_err[*char, str](res_buf)); }
-    val buf: str   = R.unwrap_ok[*char, str](res_buf);
-    val w:   usize = write_type_str(sc, buf, 0, t);
-    buf[w] = 0;
-    ret R.ok[str, str](buf);
+    ret typename.type_to_str(sc.s, t);
 }
 
 # release a string returned by type_to_str
 # ---
-# sc: the sema context whose allocator backed the string
-# s:  the owned string to free (nil is a no-op)
-pub fun type_str_free(sc: *context.SemaContext, s: str) {
-    if (s == nil) { ret; }
-    A.deallocate[char](sc.s.alloc, s, str_len(s) + 1);
+# sc:    the sema context whose allocator backed the string
+# owned: the owned string to free (nil is a no-op)
+pub fun type_str_free(sc: *context.SemaContext, owned: str) {
+    typename.type_str_free(sc.s, owned);
 }
 
 # report a `no such field `<name>` on type <T>` diagnostic
@@ -762,7 +755,7 @@ pub fun report_no_field(sc: *context.SemaContext, span: token.Span, name: intern
     }
     val type_str: str = R.unwrap_ok[str, str](res_type);
 
-    val res_msg: R.Result[str, str] = format.sprint(sc.s.alloc, "no such field `{}` on type {}", name_str(sc, name), type_str);
+    val res_msg: R.Result[str, str] = format.sprint(sc.s.alloc, "no such field `{}` on type {}", typename.name_str(sc.s, name), type_str);
     if (R.is_err[str, str](res_msg)) {
         report(sc, span, "no such field: type has no field with that name");
         type_str_free(sc, type_str);
@@ -787,7 +780,7 @@ pub fun report_no_field(sc: *context.SemaContext, span: token.Span, name: intern
 # suffix:   text after the rendered name
 # fallback: name-free message used when allocation fails
 pub fun report_named(sc: *context.SemaContext, span: token.Span, prefix: str, name: intern.StrId, suffix: str, fallback: str) {
-    val res_msg: R.Result[str, str] = format.sprint(sc.s.alloc, "{}{}{}", prefix, name_str(sc, name), suffix);
+    val res_msg: R.Result[str, str] = format.sprint(sc.s.alloc, "{}{}{}", prefix, typename.name_str(sc.s, name), suffix);
     if (R.is_err[str, str](res_msg)) {
         report(sc, span, fallback);
         ret;
@@ -811,7 +804,7 @@ pub fun report_named(sc: *context.SemaContext, span: token.Span, prefix: str, na
 # expected: the declared type-parameter count
 pub fun report_missing_type_args(sc: *context.SemaContext, span: token.Span, name: intern.StrId, expected: u32) {
     val note: str = "a generic declaration is a template, not a type; name it with its type arguments";
-    val res_msg: R.Result[str, str] = format.sprint(sc.s.alloc, "generic type `{}` named without type arguments: expected {}, found 0", name_str(sc, name), expected::usize);
+    val res_msg: R.Result[str, str] = format.sprint(sc.s.alloc, "generic type `{}` named without type arguments: expected {}, found 0", typename.name_str(sc.s, name), expected::usize);
     if (R.is_err[str, str](res_msg)) {
         context.report_note(sc, span, "generic type named without type arguments", note);
         ret;
@@ -1298,380 +1291,100 @@ fun report_reinterpret_mismatch(sc: *context.SemaContext, span: token.Span, from
     type_str_free(sc, to_str);
 }
 
-# the byte length type_to_str will write for `t`, excluding the null terminator
+
+# report a refused generic instantiation, naming the derivation chain that
+# reached it (#2163)
 #
-# mirrors write_type_str branch-for-branch so the single allocation in
-# type_to_str is sized exactly.
+# The recorder refuses an instantiation on one of two limits and says which; the
+# chain is assembled here, where the type renderer is reachable and the call's
+# span is in hand. The chain is the actionable half - the limit alone says only
+# that something diverged, while `f[u32]` recording `f[*u32]` recording
+# `f[**u32]` is a fix the author can see. Only the last CHAIN_LINKS links are
+# spelled, with a count of those elided: the growth is visible in the tail, and a
+# whole chain at the depth limit runs to thousands of characters (its last
+# argument alone carries one qualifier per link). The refused instantiation is
+# always the final link, and any allocation failure degrades to the bare limit,
+# so the break is always reported.
 # ---
-# sc:  the active sema context
-# t:   the type to measure
-# ret: the number of bytes write_type_str will emit for `t`
-fun type_str_len(sc: *context.SemaContext, t: type.TypeId) usize {
-    if (t == type.TYPE_U8)                          { ret 2; }
-    if (t == type.TYPE_U16)                         { ret 3; }
-    if (t == type.TYPE_U32)                         { ret 3; }
-    if (t == type.TYPE_U64)                         { ret 3; }
-    if (t == type.TYPE_I8)                          { ret 2; }
-    if (t == type.TYPE_I16)                         { ret 3; }
-    if (t == type.TYPE_I32)                         { ret 3; }
-    if (t == type.TYPE_I64)                         { ret 3; }
-    if (t == type.TYPE_F32)                         { ret 3; }
-    if (t == type.TYPE_F64)                         { ret 3; }
-    if (t == type.TYPE_PTR)                         { ret 3; }
-    if (t == type.TYPE_ERROR || t == type.TYPE_NIL) { ret 7; }
-
-    val opt_type: O.Option[*type.Type] = type.get(?sc.s.types, t);
-    if (O.is_none[*type.Type](opt_type)) { ret 7; }
-    val tp: *type.Type    = O.unwrap[*type.Type](opt_type);
-    val k:  type.TypeKind = tp.kind;
-
-    if (k == type.TYPE_POINTER) {
-        ret 1 + type_str_len(sc, tp.data.pointer.base);
+# sc:      the active sema context (its worklist holds the chain)
+# span:    source range of the instantiating call
+# outcome: the RECORD_LIMIT_* code the recorder returned
+# bare:    source name of the generic the refused instance specializes
+# args:    the refused instance's concrete type arguments
+# arg_len: number of type arguments
+pub fun report_instantiation_limit(sc: *context.SemaContext, span: token.Span, outcome: u8,
+                                   bare: intern.StrId, args: *type.TypeId, arg_len: u32) {
+    var headline: str = "generic instantiation limit exceeded: one module reached the cap on distinct instances";
+    if (outcome == context.RECORD_LIMIT_DEPTH) {
+        headline = "generic instantiation depth limit exceeded: a generic instantiates itself at a growing type argument";
     }
-    if (k == type.TYPE_SECRET) {
-        ret 1 + type_str_len(sc, tp.data.secret.base);
-    }
-    if (k == type.TYPE_ARRAY) {
-        ret 1 + decimal_len(tp.data.array.count::usize) + 1 + type_str_len(sc, tp.data.array.base);
-    }
-    if (k == type.TYPE_VECTOR) {
-        # `<element>x<lanes>`, e.g. f32x4
-        var el: usize = 0;
-        val ep: O.Option[type.TypeId] = type.prim(?sc.s.types, tp.data.vector.element);
-        if (O.is_some[type.TypeId](ep)) { el = type_str_len(sc, O.unwrap[type.TypeId](ep)); }
-        ret el + 1 + decimal_len(tp.data.vector.lanes::usize);
-    }
-    if (k == type.TYPE_REC || k == type.TYPE_UNI) {
-        ret name_str_len(sc, tp.data.nominal.name);
-    }
-    if (k == type.TYPE_GENERIC_PARAM) {
-        ret name_str_len(sc, tp.data.generic_param.name);
-    }
-    if (k == type.TYPE_INSTANCE) {
-        ret instance_str_len(sc, tp);
-    }
-    if (k == type.TYPE_FUN) {
-        ret fun_str_len(sc, tp);
-    }
-    ret 7;
+    report(sc, span, instantiation_chain(sc, headline, bare, args, arg_len));
 }
 
-# write type_to_str's spelling for `t` into `buf` at offset `k`
+# the refused instantiation's message: the limit, then the chain that reached it
 # ---
-# sc:  the active sema context
-# buf: destination buffer
-# k:   offset to begin writing at
-# t:   the type to render
-# ret: the offset just past the written spelling
-fun write_type_str(sc: *context.SemaContext, buf: str, k: usize, t: type.TypeId) usize {
-    if (t == type.TYPE_U8)                          { ret write_kw(buf, k, "u8"); }
-    if (t == type.TYPE_U16)                         { ret write_kw(buf, k, "u16"); }
-    if (t == type.TYPE_U32)                         { ret write_kw(buf, k, "u32"); }
-    if (t == type.TYPE_U64)                         { ret write_kw(buf, k, "u64"); }
-    if (t == type.TYPE_I8)                          { ret write_kw(buf, k, "i8"); }
-    if (t == type.TYPE_I16)                         { ret write_kw(buf, k, "i16"); }
-    if (t == type.TYPE_I32)                         { ret write_kw(buf, k, "i32"); }
-    if (t == type.TYPE_I64)                         { ret write_kw(buf, k, "i64"); }
-    if (t == type.TYPE_F32)                         { ret write_kw(buf, k, "f32"); }
-    if (t == type.TYPE_F64)                         { ret write_kw(buf, k, "f64"); }
-    if (t == type.TYPE_PTR)                         { ret write_kw(buf, k, "ptr"); }
-    if (t == type.TYPE_ERROR || t == type.TYPE_NIL) { ret write_kw(buf, k, "<error>"); }
+# sc:       the active sema context (its worklist holds the chain)
+# headline: the limit that was reached
+# bare:     source name of the generic the refused instance specializes
+# args:     the refused instance's concrete type arguments
+# arg_len:  number of type arguments
+# ret:      the message, interned so it outlives this pass's scratch
+fun instantiation_chain(sc: *context.SemaContext, headline: str, bare: intern.StrId,
+                        args: *type.TypeId, arg_len: u32) str {
+    val wl: *context.InstWorklist = sc.insts;
+    if (wl == nil) { ret headline; }
 
-    val opt_type: O.Option[*type.Type] = type.get(?sc.s.types, t);
-    if (O.is_none[*type.Type](opt_type)) { ret write_kw(buf, k, "<error>"); }
-    val tp:   *type.Type    = O.unwrap[*type.Type](opt_type);
-    val kind: type.TypeKind = tp.kind;
+    # the ancestors nearest the refusal, nearest first, and how many there are in
+    # total; a chain longer than the window is reported with the elided count.
+    var shown: [CHAIN_LINKS]u32;
+    var count: u32 = 0;
+    var total: u32 = 0;
+    var walk:  u32 = sc.inst_parent;
+    for (walk != context.INST_NONE && walk < wl.len) {
+        if (count < CHAIN_LINKS) {
+            shown[count] = walk;
+            count = count + 1;
+        }
+        total = total + 1;
+        walk = wl.items[walk].parent;
+    }
 
-    if (kind == type.TYPE_POINTER) {
-        val w: usize = write_char(buf, k, '*');
-        ret write_type_str(sc, buf, w, tp.data.pointer.base);
+    val head_r: R.Result[str, str] = format.sprint(sc.s.alloc, "{}; chain: ", headline);
+    if (R.is_err[str, str](head_r)) { ret headline; }
+    var msg: str = R.unwrap_ok[str, str](head_r);
+
+    if (total > count) {
+        val elided: R.Result[str, str] = format.sprint(sc.s.alloc, "... ({} more) -> ", (total - count)::usize);
+        if (R.is_err[str, str](elided)) { typename.type_str_free(sc.s, msg); ret headline; }
+        msg = typename.text_join(sc.s, msg, R.unwrap_ok[str, str](elided), true);
     }
-    if (kind == type.TYPE_SECRET) {
-        val w: usize = write_char(buf, k, '^');
-        ret write_type_str(sc, buf, w, tp.data.secret.base);
+
+    var i: u32 = count;
+    for (i > 0) {
+        i = i - 1;
+        val e: *context.InstReq = ?wl.items[shown[i]];
+        msg = chain_link(sc, msg, e.bare, e.args, e.arg_len);
+        msg = typename.text_join(sc.s, msg, " -> ", false);
     }
-    if (kind == type.TYPE_ARRAY) {
-        var w: usize = write_char(buf, k, '[');
-        w = write_decimal(buf, w, tp.data.array.count::usize);
-        w = write_char(buf, w, ']');
-        ret write_type_str(sc, buf, w, tp.data.array.base);
-    }
-    if (kind == type.TYPE_VECTOR) {
-        var w: usize = k;
-        val ep: O.Option[type.TypeId] = type.prim(?sc.s.types, tp.data.vector.element);
-        if (O.is_some[type.TypeId](ep)) { w = write_type_str(sc, buf, w, O.unwrap[type.TypeId](ep)); }
-        w = write_char(buf, w, 'x');
-        ret write_decimal(buf, w, tp.data.vector.lanes::usize);
-    }
-    if (kind == type.TYPE_REC || kind == type.TYPE_UNI) {
-        ret write_name(sc, buf, k, tp.data.nominal.name);
-    }
-    if (kind == type.TYPE_GENERIC_PARAM) {
-        ret write_name(sc, buf, k, tp.data.generic_param.name);
-    }
-    if (kind == type.TYPE_INSTANCE) {
-        ret write_instance(sc, buf, k, tp);
-    }
-    if (kind == type.TYPE_FUN) {
-        ret write_fun(sc, buf, k, tp);
-    }
-    ret write_kw(buf, k, "<error>");
+    msg = chain_link(sc, msg, bare, args, arg_len);
+
+    ret typename.text_stable(sc.s, msg, headline);
 }
 
-# the rendered length of a generic instance `Name[Arg, ...]`
-#
-# the name recovered from the generic declaration via generics.generic_nominal_of
-# and the arguments measured recursively.
+# append one `Name[Arg, ...]` link to a chain message
 # ---
-# sc:  the active sema context
-# tp:  the TYPE_INSTANCE payload to measure
-# ret: the number of bytes write_instance will emit
-fun instance_str_len(sc: *context.SemaContext, tp: *type.Type) usize {
-    var total: usize = instance_name_len(sc, tp);
-    total = total + 1;
-    val args_start: u32 = tp.data.instance.args_start;
-    val args_len:   u32 = tp.data.instance.args_len;
-    var i: u32 = 0;
-    for (i < args_len) {
-        if (i > 0) { total = total + 2; }
-        total = total + type_str_len(sc, instance_arg(sc, args_start + i));
-        i = i + 1;
+# sc:      the active sema context
+# msg:     the owned accumulator (nil propagates)
+# bare:    the link's declared name
+# args:    the link's concrete type arguments
+# arg_len: number of type arguments
+# ret:     the extended message, or nil on an allocation failure
+fun chain_link(sc: *context.SemaContext, msg: str, bare: intern.StrId,
+               args: *type.TypeId, arg_len: u32) str {
+    val link: R.Result[str, str] = typename.instance_spelling(sc.s, bare, args, arg_len);
+    if (R.is_err[str, str](link)) {
+        typename.type_str_free(sc.s, msg);
+        ret nil;
     }
-    total = total + 1;
-    ret total;
-}
-
-# write a generic instance `Name[Arg, ...]` into `buf` at offset `k`
-# ---
-# sc:  the active sema context
-# buf: destination buffer
-# k:   offset to begin writing at
-# tp:  the TYPE_INSTANCE payload to render
-# ret: the offset just past the written spelling
-fun write_instance(sc: *context.SemaContext, buf: str, k: usize, tp: *type.Type) usize {
-    var w: usize = write_instance_name(sc, buf, k, tp);
-    w = write_char(buf, w, '[');
-    val args_start: u32 = tp.data.instance.args_start;
-    val args_len:   u32 = tp.data.instance.args_len;
-    var i: u32 = 0;
-    for (i < args_len) {
-        if (i > 0) { w = write_kw(buf, w, ", "); }
-        w = write_type_str(sc, buf, w, instance_arg(sc, args_start + i));
-        i = i + 1;
-    }
-    w = write_char(buf, w, ']');
-    ret w;
-}
-
-# the concrete argument TypeId at pool slot `idx`
-#
-# returns TYPE_ERROR when out of range so rendering stays total.
-# ---
-# sc:  the active sema context
-# idx: index into the type interner's parameter pool
-# ret: the argument type, or TYPE_ERROR when out of range
-fun instance_arg(sc: *context.SemaContext, idx: u32) type.TypeId {
-    val opt_arg: O.Option[type.TypeId] = type.get_param(?sc.s.types, idx);
-    if (O.is_none[type.TypeId](opt_arg)) { ret type.TYPE_ERROR; }
-    ret O.unwrap[type.TypeId](opt_arg);
-}
-
-# the rendered length of a generic instance's declared name
-#
-# recovered through generics.generic_nominal_of (which re-interns the name the
-# declaring module used). falls back to `<anon>` when the declaration cannot be
-# reached.
-# ---
-# sc:  the active sema context
-# tp:  the TYPE_INSTANCE payload
-# ret: the rendered length of the instance's name
-fun instance_name_len(sc: *context.SemaContext, tp: *type.Type) usize {
-    val generic_nominal: type.TypeId = generics.generic_nominal_of(sc.s, tp.data.instance.target_origin, tp.data.instance.target_decl);
-    val name: intern.StrId = nominal_name_of(sc, generic_nominal);
-    if (name == intern.STR_NIL) { ret 6; }
-    ret name_str_len(sc, name);
-}
-
-# write a generic instance's declared name into `buf` at offset `k`
-# ---
-# sc:  the active sema context
-# buf: destination buffer
-# k:   offset to begin writing at
-# tp:  the TYPE_INSTANCE payload
-# ret: the offset just past the written name
-fun write_instance_name(sc: *context.SemaContext, buf: str, k: usize, tp: *type.Type) usize {
-    val generic_nominal: type.TypeId = generics.generic_nominal_of(sc.s, tp.data.instance.target_origin, tp.data.instance.target_decl);
-    val name: intern.StrId = nominal_name_of(sc, generic_nominal);
-    if (name == intern.STR_NIL) { ret write_kw(buf, k, "<anon>"); }
-    ret write_name(sc, buf, k, name);
-}
-
-# the `name` StrId of a nominal TypeId, or STR_NIL when `t` is not a nominal
-# ---
-# sc:  the active sema context
-# t:   the type to read the nominal name of
-# ret: the nominal's interned name, or STR_NIL when `t` is not rec/uni
-fun nominal_name_of(sc: *context.SemaContext, t: type.TypeId) intern.StrId {
-    if (t == type.TYPE_ERROR || t == type.TYPE_NIL) { ret intern.STR_NIL; }
-    val opt_type: O.Option[*type.Type] = type.get(?sc.s.types, t);
-    if (O.is_none[*type.Type](opt_type)) { ret intern.STR_NIL; }
-    val tp: *type.Type = O.unwrap[*type.Type](opt_type);
-    if (tp.kind != type.TYPE_REC && tp.kind != type.TYPE_UNI) { ret intern.STR_NIL; }
-    ret tp.data.nominal.name;
-}
-
-# the rendered length of a function type `fun(A, B) R`
-#
-# a void return renders as the bare `fun(A, B)` with no trailing type.
-# ---
-# sc:  the active sema context
-# tp:  the TYPE_FUN payload to measure
-# ret: the number of bytes write_fun will emit
-fun fun_str_len(sc: *context.SemaContext, tp: *type.Type) usize {
-    var total: usize = 4;
-    val params_start: u32 = tp.data.fn.params_start;
-    val params_len:   u32 = tp.data.fn.params_len;
-    var i: u32 = 0;
-    for (i < params_len) {
-        if (i > 0) { total = total + 2; }
-        total = total + type_str_len(sc, instance_arg(sc, params_start + i));
-        i = i + 1;
-    }
-    total = total + 1;
-    if (tp.data.fn.ret_type != type.TYPE_NIL) {
-        total = total + 1 + type_str_len(sc, tp.data.fn.ret_type);
-    }
-    ret total;
-}
-
-# write a function type `fun(A, B) R` into `buf` at offset `k`
-# ---
-# sc:  the active sema context
-# buf: destination buffer
-# k:   offset to begin writing at
-# tp:  the TYPE_FUN payload to render
-# ret: the offset just past the written spelling
-fun write_fun(sc: *context.SemaContext, buf: str, k: usize, tp: *type.Type) usize {
-    var w: usize = write_kw(buf, k, "fun");
-    w = write_char(buf, w, '(');
-    val params_start: u32 = tp.data.fn.params_start;
-    val params_len:   u32 = tp.data.fn.params_len;
-    var i: u32 = 0;
-    for (i < params_len) {
-        if (i > 0) { w = write_kw(buf, w, ", "); }
-        w = write_type_str(sc, buf, w, instance_arg(sc, params_start + i));
-        i = i + 1;
-    }
-    w = write_char(buf, w, ')');
-    if (tp.data.fn.ret_type != type.TYPE_NIL) {
-        w = write_char(buf, w, ' ');
-        w = write_type_str(sc, buf, w, tp.data.fn.ret_type);
-    }
-    ret w;
-}
-
-# the rendered length of an interned identifier
-#
-# falls back to `<anon>` (length 6) when the StrId is nil or unresolvable.
-# ---
-# sc:   the active sema context
-# name: the interned identifier to measure
-# ret:  the identifier's length, or 6 for the `<anon>` fallback
-fun name_str_len(sc: *context.SemaContext, name: intern.StrId) usize {
-    val opt_name: O.Option[str] = intern.lookup(?sc.s.interner, name);
-    if (O.is_none[str](opt_name)) { ret 6; }
-    val name_str: str = O.unwrap[str](opt_name);
-    if (str_len(name_str) == 0) { ret 6; }
-    ret str_len(name_str);
-}
-
-# the interned spelling of `name`, or `<anon>` when it is nil, unresolvable, or empty
-# ---
-# sc:   the active sema context
-# name: the interned identifier to resolve
-# ret:  the identifier's text, or the `<anon>` fallback
-fun name_str(sc: *context.SemaContext, name: intern.StrId) str {
-    val opt_name: O.Option[str] = intern.lookup(?sc.s.interner, name);
-    if (O.is_none[str](opt_name)) { ret "<anon>"; }
-    val resolved: str = O.unwrap[str](opt_name);
-    if (str_len(resolved) == 0) { ret "<anon>"; }
-    ret resolved;
-}
-
-# write an interned identifier into `buf` at offset `k`
-#
-# falls back to `<anon>` when the StrId is nil or unresolvable.
-# ---
-# sc:   the active sema context
-# buf:  destination buffer
-# k:    offset to begin writing at
-# name: the interned identifier to render
-# ret:  the offset just past the written name
-fun write_name(sc: *context.SemaContext, buf: str, k: usize, name: intern.StrId) usize {
-    ret write_kw(buf, k, name_str(sc, name));
-}
-
-# write a single character into `buf` at offset `k`
-# ---
-# buf: destination buffer
-# k:   offset to write at
-# c:   the character to write
-# ret: the offset just past it (`k + 1`)
-fun write_char(buf: str, k: usize, c: char) usize {
-    buf[k] = c;
-    ret k + 1;
-}
-
-# copy a string's bytes into `buf` at offset `k`
-# ---
-# buf: destination buffer
-# k:   offset to begin writing at
-# s:   source string to copy
-# ret: the offset just past the copied bytes
-fun write_kw(buf: str, k: usize, s: str) usize {
-    val len: usize = str_len(s);
-    memory.raw_copy((buf::usize + k)::ptr, s::ptr, len);
-    ret k + len;
-}
-
-# the number of base-10 digits in `n` (1 for 0)
-# ---
-# n:   the value to measure
-# ret: the digit count
-fun decimal_len(n: usize) usize {
-    if (n == 0) { ret 1; }
-    var len: usize = 0;
-    var v:   usize = n;
-    for (v > 0) {
-        len = len + 1;
-        v = v / 10;
-    }
-    ret len;
-}
-
-# write the base-10 digits of `n` into `buf` at offset `k`
-# ---
-# buf: destination buffer
-# k:   offset to begin writing at
-# n:   the value to render
-# ret: the offset just past the digits
-fun write_decimal(buf: str, k: usize, n: usize) usize {
-    if (n == 0) { ret write_char(buf, k, '0'); }
-
-    var tmp:    [24]char;
-    var digits: usize = 0;
-    var v:      usize = n;
-    for (v > 0) {
-        tmp[digits] = (v % 10)::char + '0';
-        v = v / 10;
-        digits = digits + 1;
-    }
-
-    var w: usize = k;
-    var i: usize = 0;
-    for (i < digits) {
-        w = write_char(buf, w, tmp[digits - 1 - i]);
-        i = i + 1;
-    }
-    ret w;
+    ret typename.text_join(sc.s, msg, R.unwrap_ok[str, str](link), true);
 }

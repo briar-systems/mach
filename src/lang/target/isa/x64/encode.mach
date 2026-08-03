@@ -52,6 +52,7 @@ use O: std.types.option;
 use R: std.types.result;
 
 use enc: mach.lang.be.codegen.encode;
+use codegen_frame: mach.lang.be.codegen.frame;
 use mach.lang.be.codegen.mir;
 use mach.lang.intern;
 use mach.lang.target.abi;
@@ -168,8 +169,8 @@ fun needs_rex_for_byte_reg(reg: i32) bool {
 }
 
 # emit ModR/M + optional SIB + displacement for a memory
-# operand. handles the RBP/R13 disp-0 (mod=1, disp8=0), RSP/R12 forced-SIB, and
-# rip-relative (mod=0, rm=5) special cases
+# operand. handles the RBP/R13 disp-0 (mod=1, disp8=0), RSP/R12 forced-SIB,
+# rip-relative (mod=0, rm=5), and absolute (mod=0, rm=4 + SIB 0x25) special cases
 # ---
 # buf: byte sink
 # reg: value for the ModR/M reg field (register id or opcode extension)
@@ -183,12 +184,25 @@ fun encode_mem_operand(buf: *enc.ByteBuf, reg: i32, op: *isa.Operand) {
     # a memory base / scaled index is always a general-purpose register: x86-64 has
     # no SSE-register addressing form. an XMM-class base or index reaching here is a
     # register-allocation / lowering bug (it would silently encode the GP register
-    # that aliases the XMM index), rejected loudly rather than mis-encoded.
-    if (base != -1 && isa.regid_class(base) != isa.REG_CLASS_ID_GP) {
+    # that aliases the XMM index), rejected loudly rather than mis-encoded. the two
+    # register-less bases (-1 rip-relative, MEM_BASE_ABS absolute) name no register
+    # at all, so neither carries a class to check.
+    if (base != -1 && base != x64.MEM_BASE_ABS && isa.regid_class(base) != isa.REG_CLASS_ID_GP) {
         panic("encode: memory base register is not general-purpose\n");
     }
     if (has_index && isa.regid_class(index) != isa.REG_CLASS_ID_GP) {
         panic("encode: memory index register is not general-purpose\n");
+    }
+
+    # an absolute address: mod=00 rm=100 escapes to a SIB naming neither base
+    # (base=101 with mod=00) nor index (index=100), leaving a bare sign-extended
+    # disp32. mod=00 rm=101 cannot be reused - in 64-bit mode that is rip-relative.
+    if (base == x64.MEM_BASE_ABS) {
+        if (has_index) { panic("encode: absolute memory operand carries an index register\n"); }
+        enc.emit_byte(buf, encode_modrm(0, reg_bits(reg), 4));
+        enc.emit_byte(buf, encode_sib(0, 4, 5));
+        enc.emit_u32(buf, disp::u32);
+        ret;
     }
 
     if (base == -1 && !has_index) {
@@ -2339,7 +2353,9 @@ fun emit_epilogue(st: *enc.EncodeState, frame_size: u32, callee_mask: u32, calle
 # true when a memory operand is the rip-relative form `[rip + disp32]`
 # - a base of -1 with no scaled index, which `encode_mem_operand` encodes as the
 # mod=0, rm=5 displacement-only addressing mode. a symbol reference lowers to this
-# form (see `mir_to_operand`), so its disp32 is the relocation patch site
+# form (see `mir_to_operand`), so its disp32 is the relocation patch site.
+# x86-64's other register-less base, `x64.MEM_BASE_ABS`, is deliberately not this:
+# an absolute address is a constant the linker never patches
 fun is_rip_mem(op: *isa.Operand) bool {
     ret op.kind == isa.OPK_MEM && op.base == -1 && op.index == -1;
 }
@@ -4863,14 +4879,7 @@ fun mir_to_operand(f: *mir.MirFunction, op: *mir.MirOperand, width: u8) R.Result
 # `frame.slot_offset` but reads the function's already-laid-out frame directly so
 # the encoder need not depend on the frame module
 fun frame_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
-    val frame: *mir.MirFrame = ?f.frame;
-    if (frame.slots == nil) { ret O.none[i64](); }
-    var i: u32 = 0;
-    for (i < frame.slot_count) {
-        if (frame.slots[i].value == v) { ret O.some[i64](frame.slots[i].offset); }
-        i = i + 1;
-    }
-    ret O.none[i64]();
+    ret codegen_frame.slot_offset(?f.frame, v, 0);
 }
 
 # the x86-64 inline-assembly grammar
@@ -4891,12 +4900,21 @@ val X64P_NONE:   u16 = 1;  # the mnemonic is the whole statement
 val X64P_ONE:    u16 = 2;  # one operand
 val X64P_TWO:    u16 = 3;  # `dst, src`
 val X64P_BRANCH: u16 = 4;  # a branch target: a symbol or a numeric local label
+val X64P_CALL:   u16 = 5;  # a call target: a branch target, a register, or a memory operand
 
 # the mnemonic carries a LOCK prefix, in `Mnemonic.flags[15:8]`
 #
 # Private to this grammar; the emitter translates it to the encoder's own
 # `x64.FLAG_LOCK`, whose value sits in the pattern's byte and must not be mixed here.
 val X64F_LOCK: u16 = 0x0100;
+
+# the statement resolved to an indirect form, in `Mnemonic.flags[15:8]`
+#
+# The one per-STATEMENT bit in a field that otherwise carries per-mnemonic facts:
+# `call` names one mnemonic but two encodings, and which one a statement takes is a
+# property of its operand, not of the name. `x64_call_target` sets it and `x64_build`
+# translates it to the encoder's `x64.FLAG_INDIRECT`.
+val X64F_INDIRECT: u16 = 0x0200;
 
 # the registers the syscall ABI destroys: the kernel's return register plus the two
 # the instruction itself overwrites (RAX, RCX, R11)
@@ -4935,8 +4953,10 @@ val X64_MNEMONICS: [X64_MNEMONIC_COUNT]iasm.Mnemonic = [X64_MNEMONIC_COUNT]iasm.
     iasm.Mnemonic{ name: "nop",     code: x64.NOP::u32,     form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
 
     # control transfers. a call's caller-saved clobbers are already covered by the
-    # asm block's own barrier, and no branch form writes a register itself.
-    iasm.Mnemonic{ name: "call", code: x64.CALL::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: X64P_BRANCH, words: 0 },
+    # asm block's own barrier, and no branch form writes a register itself - an
+    # indirect call no more than a direct one: it READS the register or memory
+    # holding its target, and what the callee destroys is the barrier's business.
+    iasm.Mnemonic{ name: "call", code: x64.CALL::u32, form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: X64P_CALL, words: 0 },
     iasm.Mnemonic{ name: "jmp",  code: x64.JMP::u32,  form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: X64P_BRANCH, words: 0 },
     iasm.Mnemonic{ name: "je",   code: x64.JE::u32,   form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: X64P_BRANCH, words: 0 },
     iasm.Mnemonic{ name: "jz",   code: x64.JE::u32,   form: iasm.AF_OPS, writes: iasm.AW_NONE, implicit: 0, flags: X64P_BRANCH, words: 0 },
@@ -5000,8 +5020,8 @@ val X64_MNEMONICS: [X64_MNEMONIC_COUNT]iasm.Mnemonic = [X64_MNEMONIC_COUNT]iasm.
 # map a register name to its (id, size), or false when the token names no register
 #
 # Covers the 64/32/16/8-bit general-purpose register names the x86-64 inline-asm
-# grammar accepts. It names no vector register, which is why an unresolved statement's
-# effects stay bounded by the general-purpose bank.
+# grammar accepts. It names no vector register, so only a body the parser cannot read
+# at all reaches the vector bank.
 fun x64_reg(name: str, op: *iasm.Operand) bool {
     # 64-bit
     if (str_equals(name, "rax")) { @op = iasm.op_reg(x64.RAX, 8); ret true; }
@@ -5074,8 +5094,10 @@ fun x64_operand(c: *iasm.Cursor, lo: usize, hi: usize, role: str, op: *iasm.Oper
     @op = iasm.op_none();
     if (hi <= lo) { ret R.err[bool, str]("encode: malformed inline-asm operand"); }
 
-    # a `{name}` local binding: resolved against the laid-out frame when there is one,
-    # else left unresolved for the caller to treat as opaque.
+    # a `{name}` local: with a laid-out frame it becomes the `[rbp + off]` stack slot
+    # it denotes; without one the displacement is genuinely unknown, and the operand
+    # stays a binding - it names a stack slot either way, so it can never be a
+    # register and the effect model reads it exactly as it reads memory.
     if (c.body[lo] == '{'::char) {
         var off: i64 = 0;
         val br: R.Result[bool, str] = iasm.bind_offset(c, lo, hi, ?off);
@@ -5114,9 +5136,10 @@ fun x64_operand(c: *iasm.Cursor, lo: usize, hi: usize, role: str, op: *iasm.Oper
 # parse the `[...]` memory operand spanning `body[lo..hi)`
 #
 # Handles `[base]`, `[base+disp]`, `[base-disp]`, `[base+index*scale]`,
-# `[base+index*scale+disp]`, and `[symbol]` (a rip-relative reference the caller
-# relocates). A `{name}` binding inside the brackets is a stack slot used as an
-# address, which no addressing mode expresses - it is refused with the fix.
+# `[base+index*scale+disp]`, `[symbol]` (a rip-relative reference the caller
+# relocates), and `[constant]` (an absolute address). A `{name}` binding inside the
+# brackets is a stack slot used as an address, which no addressing mode expresses -
+# it is refused with the fix.
 fun x64_mem(c: *iasm.Cursor, lo: usize, hi: usize, role: str, op: *iasm.Operand) R.Result[bool, str] {
     @op = iasm.op_none();
     op.kind = iasm.AOP_MEM;
@@ -5194,13 +5217,33 @@ fun x64_mem(c: *iasm.Cursor, lo: usize, hi: usize, role: str, op: *iasm.Operand)
         if (x64_reg((?buf[0])::str, ?base_op)) {
             op.reg = base_op.reg;
         } or {
-            # a bare name in brackets is a rip-relative symbol reference, valid only
-            # without a displacement term.
-            if (has_sep) { ret R.err[bool, str]("encode: malformed inline-asm memory operand"); }
             var a: usize = inner_lo;
             var b: usize = bi_hi;
             for (a < b && iasm.is_space(c.body[a])) { a = a + 1; }
             for (b > a && iasm.is_space(c.body[b - 1])) { b = b - 1; }
+
+            # a bare constant in brackets is an absolute address - the only way to
+            # reach a fixed-address ABI, whose slots are not symbols to relocate. it
+            # takes no displacement term of its own: the constant IS the address.
+            val av: O.Option[i64] = iasm.region_i64(c.body, a, b);
+            if (O.is_some[i64](av)) {
+                if (has_sep) { ret R.err[bool, str]("encode: inline-asm absolute memory address takes no displacement term"); }
+                val addr: i64 = O.unwrap[i64](av);
+                # the disp32 is sign-extended to 64 bits, so an address outside signed
+                # 32-bit range is unreachable in this form; refused rather than
+                # silently truncated to a different address.
+                if (addr < -2147483648 || addr > 2147483647) {
+                    ret R.err[bool, str]("encode: inline-asm absolute memory address does not fit a signed 32-bit displacement");
+                }
+                op.flags = iasm.AOF_MEM_ABS;
+                op.reg   = -1;
+                op.imm   = addr;
+                ret R.ok[bool, str](true);
+            }
+
+            # a bare name in brackets is a rip-relative symbol reference, valid only
+            # without a displacement term.
+            if (has_sep) { ret R.err[bool, str]("encode: malformed inline-asm memory operand"); }
             if (!iasm.is_sym_region(c.body, a, b)) { ret R.err[bool, str]("encode: malformed inline-asm memory operand"); }
             op.flags    = iasm.AOF_MEM_SYM;
             op.reg      = -1;
@@ -5238,9 +5281,8 @@ fun x64_bind_base_message(c: *iasm.Cursor, role: str) str {
 #
 # The operation width comes from whichever side is a register (a memory or immediate
 # operand inherits it); a `[symbol]` on either side becomes the instruction's pending
-# relocation. A statement carrying an unresolved `{name}` is not modeled: before the
-# frame is laid out its displacement genuinely is unknown, and the effect model falls
-# back to the general-purpose bank rather than describing a half-known instruction.
+# relocation. An unresolved `{name}` is a memory operand whose displacement is not
+# known yet, so the statement is modeled exactly as it is once the frame is laid out.
 fun x64_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, str] {
     val pat: u16 = x64_pattern(s.m.flags);
     val n: u32 = s.nargs;
@@ -5252,6 +5294,10 @@ fun x64_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, s
     if (pat == X64P_BRANCH) {
         if (n != 1) { ret R.err[bool, str]("encode: inline-asm branch expects one target"); }
         ret x64_branch_target(c, s, item);
+    }
+    if (pat == X64P_CALL) {
+        if (n != 1) { ret R.err[bool, str]("encode: inline-asm call expects one target"); }
+        ret x64_call_target(c, s, item);
     }
 
     var i: u32 = 0;
@@ -5270,7 +5316,6 @@ fun x64_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, s
         if (op.kind == iasm.AOP_SYM || (op.kind == iasm.AOP_MEM && (op.flags & iasm.AOF_MEM_SYM) != 0)) {
             ret R.err[bool, str]("encode: inline-asm one-operand symbol form unsupported");
         }
-        if (op.kind == iasm.AOP_BIND) { item.kind = iasm.AI_OPAQUE; ret R.ok[bool, str](true); }
         ret R.ok[bool, str](true);
     }
 
@@ -5281,10 +5326,6 @@ fun x64_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, s
     }
     if (item.ops[0].kind == iasm.AOP_SYM || item.ops[1].kind == iasm.AOP_SYM) {
         ret R.err[bool, str]("encode: inline-asm bare-symbol operand unsupported (use [symbol])");
-    }
-    if (item.ops[0].kind == iasm.AOP_BIND || item.ops[1].kind == iasm.AOP_BIND) {
-        item.kind = iasm.AI_OPAQUE;
-        ret R.ok[bool, str](true);
     }
     if ((item.ops[0].flags & iasm.AOF_MEM_SYM) != 0) {
         item.ref     = iasm.AR_SYM;
@@ -5299,7 +5340,49 @@ fun x64_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, s
     ret R.ok[bool, str](true);
 }
 
-# resolve a CALL / JMP / Jcc target: a numeric local label or a named symbol
+# resolve a CALL target, which is one of three things
+#
+# `call [...]` calls through memory and `call <reg>` through a register - both the
+# `FF /2` indirect encoding, which the ABI clobbers exactly as a direct call does.
+# Anything else is a direct `E8 rel32` to a label or symbol, resolved by
+# `x64_branch_target` unchanged. The fork is on the operand's SHAPE, so a register
+# named `call` could never take is a malformed branch target rather than a silently
+# accepted indirect call.
+#
+# `call [symbol]` is refused: the rip-relative form would need a relocation whose
+# meaning (call the pointer STORED at the symbol) differs from the direct
+# `call symbol` beside it, and nothing in the language produces it today.
+fun x64_call_target(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, str] {
+    val lo: usize = s.arg_lo[0];
+    val hi: usize = s.arg_hi[0];
+
+    if (hi - lo >= 3 && c.body[lo] == '['::char && c.body[hi - 1] == ']'::char) {
+        val r: R.Result[bool, str] = x64_mem(c, lo, hi, "", ?item.ops[0]);
+        if (R.is_err[bool, str](r)) { ret r; }
+        if ((item.ops[0].flags & iasm.AOF_MEM_SYM) != 0) {
+            ret R.err[bool, str]("encode: inline-asm indirect call through a symbol's address is unsupported; use `call <symbol>` for a direct call, or load the address into a register");
+        }
+        item.flags = item.flags | X64F_INDIRECT;
+        ret R.ok[bool, str](true);
+    }
+
+    var buf: [32]u8;
+    var reg_op: iasm.Operand = iasm.op_none();
+    if (iasm.copy_region(c.body, lo, hi, ?buf[0], 32) && x64_reg((?buf[0])::str, ?reg_op)) {
+        # `FF /2` in 64-bit mode has a fixed 64-bit operand size; a narrower register
+        # name cannot be encoded and is refused rather than widened behind the author.
+        if (reg_op.size != 8) {
+            ret R.err[bool, str]("encode: inline-asm indirect call requires a 64-bit register");
+        }
+        item.ops[0] = reg_op;
+        item.flags  = item.flags | X64F_INDIRECT;
+        ret R.ok[bool, str](true);
+    }
+
+    ret x64_branch_target(c, s, item);
+}
+
+# resolve a JMP / Jcc target: a numeric local label or a named symbol
 fun x64_branch_target(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, str] {
     val lo: usize = s.arg_lo[0];
     val hi: usize = s.arg_hi[0];
@@ -5328,12 +5411,15 @@ fun x64_branch_target(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result
 # convert a parsed operand into the `isa.Operand` the encoder takes
 #
 # A rip-relative `[symbol]` becomes the `[rip + disp32]` form (no base, no index)
-# whose disp32 the caller patches with a PC32 relocation.
+# whose disp32 the caller patches with a PC32 relocation. An absolute `[constant]`
+# becomes the `MEM_BASE_ABS` form, whose disp32 is the address itself and which no
+# relocation touches.
 fun x64_to_isa(op: *iasm.Operand, size: u8) isa.Operand {
     if (op.kind == iasm.AOP_REG) { ret isa.make_reg(op.reg, size); }
     if (op.kind == iasm.AOP_IMM) { ret isa.make_imm(op.imm, size); }
     if (op.kind == iasm.AOP_MEM) {
         if ((op.flags & iasm.AOF_MEM_SYM) != 0) { ret isa.make_mem(-1, 0, -1, 0, size); }
+        if ((op.flags & iasm.AOF_MEM_ABS) != 0) { ret isa.make_mem(x64.MEM_BASE_ABS, op.imm::i32, -1, 0, size); }
         ret isa.make_mem(op.reg, op.imm::i32, op.index, op.scale, size);
     }
     ret isa.make_none();
@@ -5352,6 +5438,19 @@ fun x64_build(item: *iasm.Item) isa.Inst {
     val pat: u16 = x64_pattern(item.flags);
     if (pat == X64P_NONE || pat == X64P_BRANCH) {
         mi.flags = enc_flags;
+        ret mi;
+    }
+    if (pat == X64P_CALL) {
+        # a direct call carries its target as a relocation or a local-label fixup, not
+        # as an operand, so it builds like any other branch.
+        if ((item.flags & X64F_INDIRECT) == 0) {
+            mi.flags = enc_flags;
+            ret mi;
+        }
+        # `FF /2` is fixed 64-bit in long mode: it takes no REX.W and no width flag.
+        mi.size  = 8;
+        mi.flags = enc_flags | x64.FLAG_INDIRECT::u16;
+        mi.dst   = x64_to_isa(?item.ops[0], 8);
         ret mi;
     }
 
@@ -5492,6 +5591,208 @@ fun u64_to_dec(n: u64, dst: *u8) usize {
     var k: usize = 0;
     for (k < len) { dst[k] = tmp[len - 1 - k]; k = k + 1; }
     ret len;
+}
+
+# assemble an inline-asm body and compare its bytes against `want` (test helper)
+#
+# Runs the whole block path a real body takes - `iasm.run` over the same grammar the
+# codegen installs - so a test states the machine bytes a spelling produces rather
+# than a property of an intermediate. A statement needing a relocation is out of
+# scope here: the interner is nil, so only self-contained encodings are asserted.
+# ---
+# body: the inline-asm body text
+# want: the expected encoding, as bytes
+# n:    number of expected bytes
+# ret:  true when the body encodes to exactly those bytes
+fun t_asm_bytes(body: str, want: *u8, n: usize) bool {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var st: enc.EncodeState;
+    st.alloc    = ?alloc;
+    st.buf      = enc.buf_init(?alloc);
+    st.interner = nil;
+
+    var g: iasm.Grammar = x64_grammar();
+    var labels: iasm.Labels;
+    iasm.labels_init(?labels, ?alloc);
+    var c: iasm.Cursor;
+    iasm.cursor_init(?c, ?g, body, ?alloc, nil, nil, nil);
+
+    val rr: R.Result[bool, str] = iasm.run(?st, ?g, ?c, ?labels);
+    if (R.is_err[bool, str](rr)) { ret false; }
+
+    if (st.buf.len != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (st.buf.data[i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# true when parsing one inline-asm statement fails with a message naming `want`
+# (test helper)
+#
+# Matching on a substring of the diagnostic, not merely on failure, is what keeps a
+# refusal test from passing on the wrong refusal.
+# ---
+# body: the inline-asm statement text
+# want: a substring the diagnostic must contain
+# ret:  true when the statement is refused and the message names `want`
+fun t_asm_refused(body: str, want: str) bool {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var g: iasm.Grammar = x64_grammar();
+    var c: iasm.Cursor;
+    iasm.cursor_init(?c, ?g, body, ?alloc, nil, nil, nil);
+
+    var item: iasm.Item;
+    val pr: R.Result[bool, str] = iasm.next(?c, ?item);
+    if (!R.is_err[bool, str](pr)) { ret false; }
+    ret str_contains(R.unwrap_err[bool, str](pr), want);
+}
+
+# every indirect `call` shape encodes to the exact bytes an independent assembler
+# produces for the same spelling
+#
+# `FF /2` with the absolute form is what a fixed-address kernel ABI needs
+# (BareMetal's call table at 0x100010..0x100040, #2396): mod=00 rm=100 escapes to a
+# SIB naming neither base nor index, so the seven bytes are `ff 14 25 <disp32>`.
+# These are byte-for-byte the nasm encodings of the same statements, so the SIB
+# escape and the REX.B on an extended register are asserted, not assumed.
+test "mach.lang.target.isa.x64.encode.x64_call_target:indirect_forms_byte_exact" {
+    var bad: i32 = 0;
+
+    # `call [0x100018]` - the absolute form. a wrong SIB (or a mod=00 rm=101 that
+    # reused the rip-relative encoding) changes these bytes.
+    var abs_want: [7]u8;
+    abs_want[0] = 0xFF; abs_want[1] = 0x14; abs_want[2] = 0x25;
+    abs_want[3] = 0x18; abs_want[4] = 0x00; abs_want[5] = 0x10; abs_want[6] = 0x00;
+    if (!t_asm_bytes("call [0x100018]", ?abs_want[0], 7)) { bad = 1; }
+
+    # `call rax` - register-indirect, mod=11, no REX.
+    var rax_want: [2]u8;
+    rax_want[0] = 0xFF; rax_want[1] = 0xD0;
+    if (!t_asm_bytes("call rax", ?rax_want[0], 2)) { bad = 1; }
+
+    # `call r11` - the extended register takes REX.B.
+    var r11_want: [3]u8;
+    r11_want[0] = 0x41; r11_want[1] = 0xFF; r11_want[2] = 0xD3;
+    if (!t_asm_bytes("call r11", ?r11_want[0], 3)) { bad = 1; }
+
+    # the register-based memory forms, which the shared addressing encoder already
+    # produced and which the new fork must not disturb.
+    var m0_want: [2]u8;
+    m0_want[0] = 0xFF; m0_want[1] = 0x10;
+    if (!t_asm_bytes("call [rax]", ?m0_want[0], 2)) { bad = 1; }
+
+    var m8_want: [3]u8;
+    m8_want[0] = 0xFF; m8_want[1] = 0x50; m8_want[2] = 0x08;
+    if (!t_asm_bytes("call [rax + 8]", ?m8_want[0], 3)) { bad = 1; }
+
+    var mi_want: [4]u8;
+    mi_want[0] = 0xFF; mi_want[1] = 0x54; mi_want[2] = 0xD8; mi_want[3] = 0x10;
+    if (!t_asm_bytes("call [rax + rbx*8 + 16]", ?mi_want[0], 4)) { bad = 1; }
+
+    # a direct call is untouched: it still resolves as a branch target, carrying its
+    # symbol as a relocation rather than as an operand, and takes no indirect flag.
+    var g: iasm.Grammar = x64_grammar();
+    var c: iasm.Cursor;
+    iasm.cursor_init(?c, ?g, "call main", nil, nil, nil, nil);
+    var item: iasm.Item;
+    if (R.is_err[bool, str](iasm.next(?c, ?item)))                  { ret 1; }
+    if (item.ref != iasm.AR_SYM)                                    { bad = 1; }
+    val dm: isa.Inst = x64_build(?item);
+    if (dm.opcode != x64.CALL)                                      { bad = 1; }
+    if ((dm.flags & x64.FLAG_INDIRECT::u16) != 0)                   { bad = 1; }
+    if (dm.dst.kind != isa.OPK_NONE)                                { bad = 1; }
+
+    ret bad;
+}
+
+# an indirect call reads its target and writes nothing: the callee's caller-saved
+# clobbers are the asm block's barrier, exactly as for a direct call
+#
+# The register holding the target must NOT be reported as written - that would be
+# the opaque model #2258 removed - and the block must not become opaque either.
+test "mach.lang.target.isa.x64.encode.asm_clobbers:indirect_call_is_not_opaque" {
+    var gp: u32 = 0;
+    var fp: u32 = 0;
+    var bad: i32 = 0;
+
+    asm_clobbers("call rax", ?gp, ?fp);
+    if (gp != 0) { bad = 1; }
+    if (fp != 0) { bad = 1; }
+
+    asm_clobbers("call [0x100018]", ?gp, ?fp);
+    if (gp != 0) { bad = 1; }
+    if (fp != 0) { bad = 1; }
+
+    # for contrast: the raw-byte spelling this replaces IS opaque, reaching every
+    # register in every bank, because the parser cannot read the stream.
+    asm_clobbers(".byte 0xff, 0x14, 0x25, 0x18, 0x00, 0x10, 0x00", ?gp, ?fp);
+    if (gp != X64_ALL_GP) { bad = 1; }
+    if (fp != X64_ALL_FP) { bad = 1; }
+
+    ret bad;
+}
+
+# a `.byte` directive carries a whole byte sequence in one statement, bounded by
+# `BYTES_MAX` rather than by the four-operand instruction limit
+#
+# The seven bytes of an indirect call were the case that exposed the conflation
+# (#2398): a directive is not an instruction, so its payload never reaches the
+# operand splitter. A value outside a byte's range is refused rather than truncated.
+test "mach.lang.target.isa.x64.encode.parse_bytes:sequence_is_not_an_operand_list" {
+    var bad: i32 = 0;
+
+    # seven values in one statement - one more than the four-operand instruction
+    # limit, and exactly the shape that needed two statements before.
+    var want: [7]u8;
+    want[0] = 0xFF; want[1] = 0x14; want[2] = 0x25;
+    want[3] = 0x18; want[4] = 0x00; want[5] = 0x10; want[6] = 0x00;
+    if (!t_asm_bytes(".byte 0xff, 0x14, 0x25, 0x18, 0x00, 0x10, 0x00", ?want[0], 7)) { bad = 1; }
+
+    # a single value still works, and so does a negative one (a signed byte).
+    var one: [1]u8;
+    one[0] = 0x90;
+    if (!t_asm_bytes(".byte 0x90", ?one[0], 1)) { bad = 1; }
+    var neg: [1]u8;
+    neg[0] = 0xFF;
+    if (!t_asm_bytes(".byte -1", ?neg[0], 1)) { bad = 1; }
+
+    # a value too wide for a byte is refused, not truncated to 0xFF.
+    if (!t_asm_refused(".byte 0x1ff", "byte"))   { bad = 1; }
+    if (!t_asm_refused(".byte -129", "byte"))    { bad = 1; }
+    # a bare `.byte` is not the directive at all: the mnemonic matcher requires a
+    # following space for any form that takes operands, so it never reaches the
+    # payload parser.
+    if (!t_asm_refused(".byte", "unknown"))      { bad = 1; }
+    # a payload that is only a separator names no value.
+    if (!t_asm_refused(".byte ,", "value"))      { bad = 1; }
+
+    # a four-operand INSTRUCTION limit still holds: the cap moved off `.byte`, it
+    # was not removed from the operand splitter.
+    if (!t_asm_refused("mov rax, rbx, rcx, rdx, rsi", "too many operands")) { bad = 1; }
+
+    ret bad;
+}
+
+# the indirect-call forms the grammar refuses, each by name
+test "mach.lang.target.isa.x64.encode.x64_call_target:refused_forms" {
+    var bad: i32 = 0;
+
+    # a symbol's address is the rip-relative form, whose meaning (call the pointer
+    # STORED there) differs from the `call <symbol>` beside it.
+    if (!t_asm_refused("call [main]", "symbol"))                { bad = 1; }
+    # `FF /2` is fixed 64-bit; a narrower register cannot be encoded.
+    if (!t_asm_refused("call eax", "64-bit"))                   { bad = 1; }
+    # the disp32 is sign-extended, so a wider address would land elsewhere.
+    if (!t_asm_refused("call [0x100000000]", "32-bit"))         { bad = 1; }
+    # an absolute address is the whole operand; it takes no displacement term.
+    if (!t_asm_refused("call [0x100018 + 8]", "displacement"))  { bad = 1; }
+
+    ret bad;
 }
 
 # a `{name}` binding inside a memory operand yields an actionable diagnostic
@@ -5653,12 +5954,24 @@ test "mach.lang.target.isa.x64.encode.asm_clobbers:derived_from_parse" {
     asm_clobbers("cmpxchg rbx, rdx", ?gp, ?fp);
     if (gp != ((1::u32 << x64.RBX::u32) | (1::u32 << x64.RAX::u32))) { bad = 1; }
 
-    # a `{name}` binding has no known stack displacement before the frame is laid
-    # out, so the instruction is not modeled: worst case within the bank the
-    # grammar can reach, which names no vector register.
+    # a `{name}` binding is a stack slot, so it names no register; the destination
+    # register beside it is still credited even before the frame is laid out, and a
+    # binding IN the destination position writes memory rather than a register
+    # (#2258).
     asm_clobbers("mov rax, {v}", ?gp, ?fp);
-    if (gp != X64_ALL_GP) { bad = 1; }
-    if (fp != 0)          { bad = 1; }
+    if (gp != (1::u32 << x64.RAX::u32)) { bad = 1; }
+    if (fp != 0)                        { bad = 1; }
+    asm_clobbers("mov {result}, rax", ?gp, ?fp);
+    if (gp != 0) { bad = 1; }
+    # both halves of a read-modify-write through a binding: the register half is
+    # written, the memory half is not a register.
+    asm_clobbers("lock xadd {slot}, rax", ?gp, ?fp);
+    if (gp != (1::u32 << x64.RAX::u32)) { bad = 1; }
+
+    # the load-bearing consumer: `std.sync.atomic.load`'s seq-cst body names RCX and
+    # RAX and nothing else - callee-saved registers stay allocatable across it.
+    asm_clobbers("mov rcx, {ptr}\nmov rax, [rcx]\nmov {result}, rax", ?gp, ?fp);
+    if (gp != ((1::u32 << x64.RAX::u32) | (1::u32 << x64.RCX::u32))) { bad = 1; }
 
     # raw bytes and an instruction nobody described are unreadable: every bank.
     asm_clobbers(".byte 0x90", ?gp, ?fp);
@@ -5692,6 +6005,45 @@ test "mach.lang.target.isa.x64.encode.asm_claim:refuses_unclaimed_byte" {
     if (R.is_err[bool, str](iasm.claim(?q, 4, 3)))  { bad = 1; }
     # a claim overlapping an earlier one is refused too.
     if (!R.is_err[bool, str](iasm.claim(?q, 5, 2))) { bad = 1; }
+    ret bad;
+}
+
+# an unresolved `{name}` never reaches the encoder
+#
+# The block driver always parses with a binding context, so a binding either resolved
+# to its frame slot or failed the parse. The shared driver CHECKS that over every
+# operand of every statement rather than trusting it, which is what lets each grammar
+# read a binding as the memory operand it is instead of refusing the statement early
+# (#2258). The assembly-text entry point supplies no bindings, so it is the one path
+# that reaches the check; without it a binding would encode as a whole-instruction
+# operand nobody filled in.
+test "mach.lang.target.isa.x64.encode:asm_unresolved_binding_refused_at_emit" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var st: enc.EncodeState;
+    st.alloc    = ?alloc;
+    st.buf      = enc.buf_init(?alloc);
+    st.interner = nil;
+    st.fixups   = nil; st.fixup_count = 0; st.fixup_cap = 0;
+
+    var bad: i32 = 0;
+    var f: mir.MirFunction;
+    var l: iasm.Labels;
+    iasm.labels_init(?l, ?alloc);
+
+    # a binding as the source, as the destination, and as a one-operand form's only
+    # operand - every position the check has to cover.
+    val src: R.Result[bool, str] = x64_asm_text(?st, ?f, ?l, "mov rax, {v}");
+    if (!R.is_err[bool, str](src)) { bad = 1; }
+    or { if (!str_contains(R.unwrap_err[bool, str](src), "unresolved '{name}'")) { bad = 1; } }
+    if (!R.is_err[bool, str](x64_asm_text(?st, ?f, ?l, "mov {v}, rax"))) { bad = 1; }
+    if (!R.is_err[bool, str](x64_asm_text(?st, ?f, ?l, "neg {v}")))      { bad = 1; }
+
+    # the refusal precedes the encoder, so no bytes were written for any of them.
+    if (st.buf.len != 0) { bad = 1; }
+
+    iasm.labels_dnit(?l);
+    enc.buf_dnit(?st.buf);
     ret bad;
 }
 

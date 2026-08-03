@@ -508,6 +508,14 @@ fun alloc_function(tgt: *target.Target, m: *mir.MirModule, f: *mir.MirFunction) 
     val rw: R.Result[bool, str] = rewrite(tgt, ?ctx);
     if (R.is_err[bool, str](rw)) { ctx_dnit(?ctx); ret rw; }
 
+    # copy hygiene, step 4: now that coloring has chosen physical registers, delete
+    # the copies whose two sides landed on the same one - the ABI pre-coloring moves
+    # step 2 could not see, because one of their operands was already physical. runs
+    # after `rewrite` by necessity and after `record_callee_mask` would be too late,
+    # but before it is fine: a deleted self-copy writes a register it also reads, so
+    # it can neither add nor remove a callee-saved register from the mask (#2275).
+    drop_self_copies_physical(tgt, ?ctx);
+
     record_callee_mask(tgt, ?ctx);
 
     ctx_dnit(?ctx);
@@ -1444,10 +1452,28 @@ fun rename_vregs(ctx: *AllocCtx, parent: *u32, nv: u32) {
     }
 }
 
-# delete every full-width register copy both of whose operands name the same vreg -
-# the coalesced copies `rename_vregs` collapsed. a sub-word self-move is kept: it
-# still zero-extends. mirrors the compaction of `sweep_dead_movs`, and a block always
-# ends in a terminator so it never empties
+# true when a register-to-register move at `width` is a no-op when its source and
+# destination are the same register
+#
+# A move is observable only if it writes bits it does not read - a sub-word move that
+# extends into the rest of the register. Whether one does is a per-ISA register-file
+# fact, not a universal: x86-64 extends at 4 bytes only, aarch64 at every sub-word
+# width, riscv64 at none (`isa.MachineModel.move_extends_from`). A width at or above
+# the spill width is full-width, so there is nothing above it to write (#2275).
+# ---
+# tgt:   the active target, supplying the machine model
+# width: the move's operation width in bytes
+# ret:   true when a same-register move at this width writes nothing
+fun self_move_is_inert(tgt: *target.Target, width: u8) bool {
+    if (width::u32 >= tgt.model.spill_width) { ret true; }
+    if (tgt.model.move_extends_from == 0)    { ret true; }
+    ret width::u32 < tgt.model.move_extends_from;
+}
+
+# delete every register copy both of whose operands name the same vreg - the
+# coalesced copies `rename_vregs` collapsed - whenever a same-register move at that
+# width writes nothing (`self_move_is_inert`). mirrors the compaction of
+# `sweep_dead_movs`, and a block always ends in a terminator so it never empties
 fun drop_self_copies(tgt: *target.Target, ctx: *AllocCtx) {
     val f: *mir.MirFunction = ctx.f;
     var bi: u32 = 0;
@@ -1458,7 +1484,7 @@ fun drop_self_copies(tgt: *target.Target, ctx: *AllocCtx) {
         for (read < blk.instr_count) {
             val mi: *mir.MirInstr = ?blk.instrs[read];
             var drop: bool = false;
-            if (instr_is_reg_copy(tgt, mi) && mi.width >= ctx.spill_width) {
+            if (instr_is_reg_copy(tgt, mi) && self_move_is_inert(tgt, mi.width)) {
                 val a: *mir.MirOperand = ?mi.operands[0];
                 val b: *mir.MirOperand = ?mi.operands[1];
                 drop = a.kind == mir.MIR_OP_VREG && b.kind == mir.MIR_OP_VREG && a.vreg == b.vreg;
@@ -3261,6 +3287,62 @@ fun record_callee_mask(tgt: *target.Target, ctx: *AllocCtx) {
 # reload-before-use MIR_MOV and its defs get a store-after-def MIR_MOV. after this
 # no MIR_OP_VREG naming an allocatable value, and no value vreg in a MEM base,
 # remains
+# delete every register copy both of whose operands name the same PHYSICAL register,
+# once allocation has chosen them
+#
+# The post-allocation twin of `drop_self_copies`, and it catches a different
+# population. That pass runs before coloring and requires both operands to be
+# virtual, so it never examines a copy that already had a physical side - which is
+# every ABI pre-coloring move (`MOV preg(arg) <- vreg` at a call, `MOV vreg <-
+# preg(arg)` at entry, `MOV preg(ret) <- vreg` at a return). Those become
+# same-register copies precisely when the allocator does its job and colors the vreg
+# into the register the copy hints point at, and until #2275 nothing looked at them
+# again: 37,662 on riscv64, 168 on x86-64.
+#
+# Deletes only what `self_move_is_inert` clears, so a sub-word move that zero-extends
+# is kept on the ISAs where one does. Compacts in place like `drop_self_copies`; a
+# block always ends in a terminator, which is never a copy, so no block empties.
+# ---
+# tgt: the active target, supplying the move-extension fact
+# ctx: the allocation context whose function is compacted
+fun drop_self_copies_physical(tgt: *target.Target, ctx: *AllocCtx) {
+    val f: *mir.MirFunction = ctx.f;
+    var bi: u32 = 0;
+    for (bi < f.block_count) {
+        val blk: *mir.MirBlock = ?f.blocks[bi];
+        var write: u32 = 0;
+        var read:  u32 = 0;
+        for (read < blk.instr_count) {
+            val mi: *mir.MirInstr = ?blk.instrs[read];
+            var drop: bool = false;
+            if (instr_is_reg_copy(tgt, mi) && self_move_is_inert(tgt, mi.width)) {
+                val a: *mir.MirOperand = ?mi.operands[0];
+                val b: *mir.MirOperand = ?mi.operands[1];
+                drop = a.kind == mir.MIR_OP_PREG && b.kind == mir.MIR_OP_PREG && a.preg == b.preg;
+            }
+            if (drop) {
+                # the copy never reaches encode; release its operand array and any -g
+                # bindings with it, exactly as `drop_self_copies` does. unlike that
+                # pass this runs AFTER allocation, so deleting here cannot perturb the
+                # flat stream the allocation was computed from - the bytes stay
+                # identical with and without -g for the same reason.
+                if (mi.operands != nil && mi.operand_count > 0) {
+                    A.deallocate[mir.MirOperand](ctx.alloc, mi.operands, mi.operand_count::usize);
+                }
+                if (mi.dbg_bindings != nil && mi.dbg_binding_count > 0) {
+                    A.deallocate[mir.MirDbgBinding](ctx.alloc, mi.dbg_bindings, mi.dbg_binding_count::usize);
+                }
+            } or {
+                if (write != read) { blk.instrs[write] = blk.instrs[read]; }
+                write = write + 1;
+            }
+            read = read + 1;
+        }
+        blk.instr_count = write;
+        bi = bi + 1;
+    }
+}
+
 fun rewrite(tgt: *target.Target, ctx: *AllocCtx) R.Result[bool, str] {
     val f: *mir.MirFunction = ctx.f;
     var bi: u32 = 0;
@@ -4380,5 +4462,90 @@ test "mach.lang.be.codegen.regalloc.coalesce_copies:forwarded_values_survive" {
         i = i + 1;
     }
     if (acc != 84) { ret 1; }
+    ret 0;
+}
+
+# a same-register copy is deleted only where the machine says the move writes
+# nothing, and the answer is per-ISA rather than universal
+#
+# `self_move_is_inert` is the whole of #2275: a move from a register to itself is
+# observable exactly when it extends into the bits above its own width, which is a
+# register-file property no two of the three ISAs share. Pinning it against the
+# three real targets rather than a synthetic model, so the values under test are the
+# ones the ISAs actually declare
+test "mach.lang.be.codegen.regalloc.self_move_is_inert:per_isa_extension_rules" {
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+
+    # x86-64: a 4-byte write zero-extends into the 64-bit register, so that self-move
+    # is load-bearing; 1- and 2-byte writes preserve the bits above them.
+    val tx: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[target.Target, str](tx)) { ret 1; }
+    var x: target.Target = R.unwrap_ok[target.Target, str](tx);
+    if (!self_move_is_inert(?x, 1)) { ret 1; }
+    if (!self_move_is_inert(?x, 2)) { ret 1; }
+    if (self_move_is_inert(?x, 4))  { ret 1; }
+    if (!self_move_is_inert(?x, 8)) { ret 1; }
+
+    # aarch64: every non-64-bit move encodes as ORR_W and zero-extends into X, so no
+    # sub-word self-move is inert.
+    val ta: R.Result[target.Target, str] = target.select(?reg, "aarch64", "linux", "aapcs64");
+    if (R.is_err[target.Target, str](ta)) { ret 1; }
+    var a: target.Target = R.unwrap_ok[target.Target, str](ta);
+    if (self_move_is_inert(?a, 1)) { ret 1; }
+    if (self_move_is_inert(?a, 2)) { ret 1; }
+    if (self_move_is_inert(?a, 4)) { ret 1; }
+    if (!self_move_is_inert(?a, 8)) { ret 1; }
+
+    # riscv64: a move is `addi rd,rs,0` at XLEN whatever the width, extending
+    # nothing, so a self-move is inert at every width.
+    val tr: R.Result[target.Target, str] = target.select(?reg, "riscv64", "linux", "lp64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var r: target.Target = R.unwrap_ok[target.Target, str](tr);
+    if (!self_move_is_inert(?r, 1)) { ret 1; }
+    if (!self_move_is_inert(?r, 2)) { ret 1; }
+    if (!self_move_is_inert(?r, 4)) { ret 1; }
+    if (!self_move_is_inert(?r, 8)) { ret 1; }
+    ret 0;
+}
+
+# the post-allocation sweep deletes a physical self-copy and leaves everything else
+#
+# The population `drop_self_copies` structurally cannot see: by the time coloring has
+# turned an ABI pre-coloring move into `preg N <- preg N`, that pass has long run and
+# only ever compared vregs. Pins that the instruction is GONE from the block, and
+# that a copy between two DIFFERENT physical registers next to it survives - the
+# selectivity that separates this from a pass that just deletes moves (#2275)
+test "mach.lang.be.codegen.regalloc.drop_self_copies_physical:deletes_only_the_same_register_copy" {
+    var t: target.Target;
+    if (!t_target(?t)) { ret 1; }
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    #   preg 3 <- preg 3    (an ABI pre-coloring move the allocator collapsed: gone)
+    #   preg 4 <- preg 5    (a real copy between two registers: kept)
+    #   preg 6 <- preg 6    (a second collapsed copy, to prove compaction repeats)
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 1);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 3);
+    t_mov(?alloc, ?b, 0, mir.op_preg(3), mir.op_preg(3));
+    t_mov(?alloc, ?b, 1, mir.op_preg(4), mir.op_preg(5));
+    t_mov(?alloc, ?b, 2, mir.op_preg(6), mir.op_preg(6));
+    f.blocks      = ?b;
+    f.block_count = 1;
+    f.block_cap   = 1;
+
+    var slots: [1]bool;
+    slots[0] = false;
+    var ctx: AllocCtx;
+    t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
+
+    drop_self_copies_physical(?t, ?ctx);
+
+    if (b.instr_count != 1) { ret 1; }
+    val kept: *mir.MirOperand = b.instrs[0].operands;
+    if (kept[0].kind != mir.MIR_OP_PREG || kept[0].preg != 4) { ret 1; }
+    if (kept[1].kind != mir.MIR_OP_PREG || kept[1].preg != 5) { ret 1; }
     ret 0;
 }

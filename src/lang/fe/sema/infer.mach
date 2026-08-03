@@ -173,35 +173,233 @@ fun infer_nominal_uni(sc: *context.SemaContext, did: id.DeclId, name_span: token
     ret ty;
 }
 
+# whether `ty` reaches nominal `target` BY VALUE (#2355)
+#
+# A field descends into the containment graph when it stores the contained type's
+# bytes inline: a nominal, a generic instance, or an array of one. A pointer or a
+# function value stores an ADDRESS, so neither descends -- which is precisely what
+# keeps `rec Node { next: *Node; }`, the ordinary linked list, legal.
+#
+# OVER DECLARATIONS, NOT INSTANCES. `rec Wrap[T] { inner: Wrap[Wrap[T]]; }` mints a
+# fresh TYPE_INSTANCE at every level, so a walk over instance ids descends forever
+# without ever revisiting a node -- there is no cycle in that graph to find.
+# Resolving each instance to the nominal it instantiates makes the same program a
+# self-edge on `Wrap`, caught at the first step. The nominal set is finite, and
+# `stamp` expands each nominal at most once per query, so the walk terminates on
+# any input including a cycle that does not involve `target`.
+#
+# The visited marks are generation-stamped rather than cleared per query, and the
+# recursion is bounded by the number of distinct nominals rather than by a constant,
+# so a legal 200-deep nest costs 200 frames and is accepted. A fixed depth cap here
+# would reject well-formed programs - which is not hypothetical: `layout.walk`'s
+# MAX_DEPTH does exactly that to a 65-deep nest today (#2368). Terminating on the
+# structure rather than on a constant is what makes this rule exact.
+# ---
+# s:      the session (type universe)
+# seen:   per-TypeId stamp of the query that last expanded that nominal
+# cap:    number of slots in `seen`
+# stamp:  this query's stamp
+# target: the nominal being tested for self-containment
+# ty:     the type to descend
+# ret:    true when `target` is reachable from `ty` without passing an indirection
+fun reaches_nominal(s: *session.Session, seen: *u32, cap: u32, stamp: u32,
+                    target: type.TypeId, ty: type.TypeId) bool {
+    val base: type.TypeId = type.strip_secret(?s.types, ty);
+    val opt: O.Option[*type.Type] = type.get(?s.types, base);
+    if (O.is_none[*type.Type](opt)) { ret false; }
+    val t: *type.Type = O.unwrap[*type.Type](opt);
+
+    # an array stores its elements inline, so it carries the element's containment.
+    # a zero-length array is included: it still names the element type, and lowering
+    # would build an IR aggregate for it exactly as for any other element count.
+    if (t.kind == type.TYPE_ARRAY) {
+        ret reaches_nominal(s, seen, cap, stamp, target, t.data.array.base);
+    }
+
+    if (t.kind != type.TYPE_REC && t.kind != type.TYPE_UNI && t.kind != type.TYPE_INSTANCE) {
+        ret false;
+    }
+
+    val nom: type.TypeId = type.aggregate_nominal(?s.types, base);
+    if (nom == type.TYPE_ERROR) { ret false; }
+    if (nom == target)          { ret true; }
+    if (nom::u32 >= cap)        { ret false; }
+    if (seen[nom::u32] == stamp) { ret false; }
+    seen[nom::u32] = stamp;
+
+    val n: u32 = type.field_count(?s.types, nom);
+    var i: u32 = 0;
+    for (i < n) {
+        val fe: O.Option[*type.FieldEntry] = type.field_at(?s.types, nom, i);
+        if (O.is_some[*type.FieldEntry](fe)) {
+            if (reaches_nominal(s, seen, cap, stamp, target, O.unwrap[*type.FieldEntry](fe).ty)) {
+                ret true;
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# reject a rec/uni whose own fields make it contain itself by value (#2355)
+#
+# An infinitely-sized type has no layout and nothing downstream can represent one:
+# `lower_type` / `lower_nominal` walk the field graph to build the IR aggregate and
+# recur without bound, exhausting the native stack with no diagnostic at all. Before
+# this rule `rec R { next: R; }` was accepted outright when never used and crashed
+# the compiler when used. This is the classic occurs-check (Rust's E0072).
+#
+# Reported per FIELD, on the field's own span, because each offending field is a
+# distinct site the author has to change; a mutually recursive pair reports on both
+# declarations, each being independently ill-formed.
+# ---
+# sc:           sema context
+# nom:          the declaration's nominal TypeId
+# fields_start: start index into ast.typed_names
+# fields_len:   number of fields
+# seen:         the shared stamp array
+# cap:          number of slots in `seen`
+# stamp:        the next unused stamp, advanced once per field queried
+# ret:          the next unused stamp
+fun check_occurs(sc: *context.SemaContext, nom: type.TypeId, fields_start: u32, fields_len: u32,
+                 seen: *u32, cap: u32, stamp: u32) u32 {
+    var next: u32 = stamp;
+    var i:    u32 = 0;
+    for (i < fields_len) {
+        val tn: *decl.TypedName = ?sc.a.typed_names[fields_start + i];
+        val ty: type.TypeId     = context.resolved_type_of(sc, tn.ty);
+        if (reaches_nominal(sc.s, seen, cap, next, nom, ty)) {
+            context.report(sc, tn.name, "recursive type has infinite size: this field contains the type being declared by value, so the type would have to contain itself; store it behind a pointer (`*T`) to break the cycle");
+        }
+        next = next + 1;
+        i = i + 1;
+    }
+    ret next;
+}
+
 # enforce that a union's overlapping variants agree on secrecy (#1645)
 #
 # A `uni`'s fields share storage, so a mixed-secrecy union would let the same
 # bytes be read as both secret and public - the welded-storage aliasing leak. All
 # variants must be uniformly secret or uniformly public. The first variant whose
-# secrecy disagrees with the first variant's is reported on its own field span.
+# secrecy disagrees with the baseline variant's is reported on its own field span.
+#
+# A variant that closes a by-value cycle with `nom` is SKIPPED, baseline included
+# (#2356). The deep comparison measures byte extents, and an infinitely-sized type
+# has none, so it fails closed and reported this rule's violation for a program with
+# no `^` anywhere - naming a secrecy defect the program does not have and sending
+# the reader to fix it. Such a union is already rejected by the occurs-check with its
+# real cause. Only that provably-cyclic case is skipped: every other undeterminable
+# extent still fails closed, since this rule guards a disclosure channel and must
+# never be loosened into a permissive default.
 # ---
 # sc:           sema context
+# nom:          the union's own TypeId, for the cycle test
 # fields_start: start index into ast.typed_names
 # fields_len:   number of variants
-fun check_uni_secrecy(sc: *context.SemaContext, fields_start: u32, fields_len: u32) {
-    if (fields_len < 2) { ret; }
+# seen:         the shared stamp array
+# cap:          number of slots in `seen`
+# stamp:        the next unused stamp, advanced once per variant queried
+# ret:          the next unused stamp
+fun check_uni_secrecy(sc: *context.SemaContext, nom: type.TypeId, fields_start: u32, fields_len: u32,
+                      seen: *u32, cap: u32, stamp: u32) u32 {
+    var next: u32 = stamp;
+    if (fields_len < 2) { ret next; }
 
-    val first_tn: *decl.TypedName = ?sc.a.typed_names[fields_start];
-    val first_ty: type.TypeId     = context.resolved_type_of(sc, first_tn.ty);
+    # the baseline is the first variant that is not itself part of a cycle; a union
+    # whose every variant is cyclic has nothing to compare and reports nothing here.
+    var first_ty: type.TypeId = type.TYPE_NIL;
+    var b:        u32         = 0;
+    for (b < fields_len) {
+        val btn: *decl.TypedName = ?sc.a.typed_names[fields_start + b];
+        val bty: type.TypeId     = context.resolved_type_of(sc, btn.ty);
+        if (!reaches_nominal(sc.s, seen, cap, next, nom, bty)) {
+            first_ty = bty;
+            next = next + 1;
+            b = b + 1;
+            brk;
+        }
+        next = next + 1;
+        b = b + 1;
+    }
+    if (first_ty == type.TYPE_NIL) { ret next; }
 
-    var i: u32 = 1;
+    var i: u32 = b;
     for (i < fields_len) {
         val tn: *decl.TypedName = ?sc.a.typed_names[fields_start + i];
         val ty: type.TypeId     = context.resolved_type_of(sc, tn.ty);
+        val cyclic: bool        = reaches_nominal(sc.s, seen, cap, next, nom, ty);
+        next = next + 1;
         # DEEP (#2165): variants must agree on secrecy through their whole field graph,
         # not just at the top level - else `uni { a: P; b: Q }` with a `^` field inside P
         # aliases the secret bytes under the public `Q` overlay and reads them out. A
         # shallow `is_secret` per variant treats `P` as public and misses it.
-        if (!generics.secrecy_structure_equal_deep(sc.s, context.ptr_width_of(sc), first_ty, ty)) {
-            context.report(sc, tn.name, "union variants must agree on secrecy: overlapping fields are part secret `^` and part public, which would alias the same storage at two classifications");
+        if (!cyclic) {
+            if (!generics.secrecy_structure_equal_deep(sc.s, context.ptr_width_of(sc), first_ty, ty)) {
+                context.report(sc, tn.name, "union variants must agree on secrecy: overlapping fields are part secret `^` and part public, which would alias the same storage at two classifications");
+            }
         }
         i = i + 1;
     }
+    ret next;
+}
+
+# reject every rec/uni in this module that contains itself by value (#2355)
+#
+# Runs after `infer_all_decls` for the same reason the union secrecy rule below does:
+# the walk reads field tables, so it needs them all built, and it is then independent
+# of declaration order. It runs BEFORE that rule deliberately - a recursive union
+# makes the deep secrecy comparison fail closed, which reported an ill-formed type as
+# a mixed-secrecy violation in a program containing no `^` at all (#2356). Rejecting
+# it here first means the diagnostic names the actual defect.
+#
+# Only NAMED declarations are walked. An anonymous `rec { ... }` has no name to be
+# referred to, so it can never close a cycle by itself; it can only sit INSIDE one,
+# reached from the named declaration that spells it, and the walk descends through it
+# from there. Named decls are filtered by `decl_type`, so an untaken comptime-`$if`
+# arm stays unchecked, matching the rule that a discarded branch is not compiled.
+#
+# The stamp array is sized to the type universe and shared across every declaration,
+# so the whole pass allocates once. A failed allocation skips the rule rather than
+# failing the build: the crash it prevents is a compiler bug, not a program error,
+# and sema has no path to report an out-of-memory here.
+# ---
+# sc: sema context
+pub fun check_occurs_all(sc: *context.SemaContext) {
+    if (sc.decl_type == nil) { ret; }
+
+    val cap: u32 = sc.s.types.type_len;
+    if (cap == 0) { ret; }
+
+    val res: R.Result[*u32, str] = A.allocate[u32](sc.s.alloc, cap::usize);
+    if (R.is_err[*u32, str](res)) { ret; }
+    val seen: *u32 = R.unwrap_ok[*u32, str](res);
+
+    # stamps start at 1 so the zeroed array reads as "never expanded"
+    var z: u32 = 0;
+    for (z < cap) { seen[z] = 0; z = z + 1; }
+    var stamp: u32 = 1;
+
+    var d: u32 = 0;
+    for (d < sc.a.decl_len::u32) {
+        if (sc.decl_type[d] != type.TYPE_NIL) {
+            val d_opt: O.Option[*decl.Decl] = ast.get_decl(sc.a, d);
+            if (O.is_some[*decl.Decl](d_opt)) {
+                val dd: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+                if (dd.kind == decl.DECL_KIND_REC) {
+                    stamp = check_occurs(sc, sc.decl_type[d], dd.data.rec_.fields_start,
+                                         dd.data.rec_.fields_len, seen, cap, stamp);
+                }
+                if (dd.kind == decl.DECL_KIND_UNI) {
+                    stamp = check_occurs(sc, sc.decl_type[d], dd.data.uni_.fields_start,
+                                         dd.data.uni_.fields_len, seen, cap, stamp);
+                }
+            }
+        }
+        d = d + 1;
+    }
+
+    A.deallocate[u32](sc.s.alloc, seen, cap::usize);
 }
 
 # enforce the mixed-secrecy union rule on every union the module forms - named
@@ -225,9 +423,31 @@ fun check_uni_secrecy(sc: *context.SemaContext, fields_start: u32, fields_len: u
 # Named declarations are filtered by `decl_type`, which `infer_all_decls` wrote for the
 # decls it actually typed: an untaken comptime-`$if` arm is left at TYPE_NIL and stays
 # unchecked, matching the rule that a discarded branch is not compiled.
+#
+# The stamp array backs the per-variant cycle test `check_uni_secrecy` uses to skip a
+# variant whose extent is undeterminable because the union contains itself (#2356);
+# allocating it here keeps the pass to one allocation. A failed allocation runs the
+# rule with no skip, which is the previous behaviour: a false report on an already
+# rejected type, never a missed one.
 # ---
 # sc: sema context
 pub fun check_uni_secrecy_all(sc: *context.SemaContext) {
+    # cap stays 0 when there is no array to index, which `reaches_nominal` reads as
+    # "no nominal is expandable" and answers false to - the pre-#2356 behaviour.
+    var seen: *u32 = nil;
+    var cap:  u32  = 0;
+    if (sc.s.types.type_len > 0) {
+        val res: R.Result[*u32, str] = A.allocate[u32](sc.s.alloc, sc.s.types.type_len::usize);
+        if (R.is_ok[*u32, str](res)) {
+            seen = R.unwrap_ok[*u32, str](res);
+            cap  = sc.s.types.type_len;
+            var z: u32 = 0;
+            for (z < cap) { seen[z] = 0; z = z + 1; }
+        }
+    }
+    # stamps start at 1 so the zeroed array reads as "never expanded"
+    var stamp: u32 = 1;
+
     if (sc.decl_type != nil) {
         var d: u32 = 0;
         for (d < sc.a.decl_len::u32) {
@@ -236,7 +456,8 @@ pub fun check_uni_secrecy_all(sc: *context.SemaContext) {
                 if (O.is_some[*decl.Decl](d_opt)) {
                     val dd: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
                     if (dd.kind == decl.DECL_KIND_UNI) {
-                        check_uni_secrecy(sc, dd.data.uni_.fields_start, dd.data.uni_.fields_len);
+                        stamp = check_uni_secrecy(sc, sc.decl_type[d], dd.data.uni_.fields_start,
+                                                  dd.data.uni_.fields_len, seen, cap, stamp);
                     }
                 }
             }
@@ -250,11 +471,14 @@ pub fun check_uni_secrecy_all(sc: *context.SemaContext) {
         if (O.is_some[*atype.Type](t_opt)) {
             val t: *atype.Type = O.unwrap[*atype.Type](t_opt);
             if (t.kind == atype.TYPE_KIND_UNI) {
-                check_uni_secrecy(sc, t.data.uni_.fields_start, t.data.uni_.fields_len);
+                stamp = check_uni_secrecy(sc, sc.type_resolved_ty[i], t.data.uni_.fields_start,
+                                          t.data.uni_.fields_len, seen, cap, stamp);
             }
         }
         i = i + 1;
     }
+
+    if (seen != nil) { A.deallocate[u32](sc.s.alloc, seen, cap::usize); }
 }
 
 # fold an `#[align(...)]` decorator on `did` and record the resulting alignment
@@ -1796,13 +2020,20 @@ fun infer_generic_call(sc: *context.SemaContext, c: *expr.ExprCall, ct: type.Typ
     # lowering-time pack re-inference and on the instances record_instance prunes. the
     # args are copied there; free_params below still owns this scratch.
     if (sig != type.TYPE_ERROR) {
-        val rr: R.Result[bool, str] = context.record_instance(sc, sym.origin, sym.decl, args, c.type_args_len, sig);
-        if (R.is_err[bool, str](rr)) {
-            # the recorder distinguishes an allocation failure from the instantiation-limit
-            # break, so surface its message rather than reporting every failure as OOM.
-            val msg: str = R.unwrap_err[bool, str](rr);
+        val rr: R.Result[u8, str] = context.record_instance(sc, sym.origin, sym.decl, args, c.type_args_len, sig, sym.name);
+        if (R.is_err[u8, str](rr)) {
+            val msg: str = R.unwrap_err[u8, str](rr);
             free_params(sc, args, c.type_args_len);
             context.report(sc, span, msg);
+            ret type.TYPE_ERROR;
+        }
+        # an instantiation limit is the caller's to report: the chain diagnostic needs
+        # this call's span and the type renderer, neither of which the recorder has
+        # (#2163).
+        val outcome: u8 = R.unwrap_ok[u8, str](rr);
+        if (outcome != context.RECORD_OK) {
+            check.report_instantiation_limit(sc, span, outcome, sym.name, args, c.type_args_len);
+            free_params(sc, args, c.type_args_len);
             ret type.TYPE_ERROR;
         }
     }

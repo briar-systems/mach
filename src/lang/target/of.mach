@@ -9,13 +9,16 @@
 # abstract `RK_*` kinds; each format maps those to its own machine relocation
 # types internally with a plain integer compare.
 
+use std.allocator.page;
 use std.system.panic.panic;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_contains;
 use std.types.string.str_equals;
+use std.types.string.str_join;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -245,9 +248,13 @@ pub rec ObjectImage {
 # The linker collects one per shared-library link input; the format writer emits
 # it into the format's dependency list. format-neutral so PE/Mach-O reuse it.
 # ---
-# soname: interned shared-object name the loader resolves (e.g. "libc.so.6")
+# name:   stable logical dependency name used by `#[library]` attribution
+# soname: canonical shared-object name the loader resolves (e.g. "libc.so.6")
+# rpath:  Mach-O runtime search root for an `@rpath/` soname, or STR_NIL
 pub rec DynLib {
+    name:   intern.StrId;
     soname: intern.StrId;
+    rpath:  intern.StrId;
 }
 
 # one dynamic import: an undefined symbol satisfied at run time by a shared
@@ -791,7 +798,9 @@ pub val DBG_CODEVIEW: u32 = 2;  # codeview (coff/pe)
 # name:    model name ("dwarf", "codeview"); an immutable str constant
 # produce: erased fn ptr - writes a module's debug sections into the object image
 #          (cast back to the be-layer producer's `ProduceFn`); nil until the
-#          be-layer registrar wires it
+#          be-layer registrar wires it, and still nil past bring-up only in a
+#          registry composed without the back end (`debug_hooks_complete` refuses a
+#          fully composed one that leaves it so)
 pub rec DebugVTable {
     id:      u32;
     name:    str;
@@ -886,6 +895,57 @@ pub fun debug_register_identities(reg: *DebugRegistry) {
     dwarf_identity.name    = "dwarf";
     dwarf_identity.produce = nil;
     debug_register(reg, ?dwarf_identity);
+}
+
+# the message a registered-but-unwired debug model is refused with, naming it
+#
+# Page-allocated through `str_join`, the same shape `target.unregistered_message`
+# uses for the tuple diagnostics. The generic fallback is taken only when the page
+# allocator or the join itself fails; the refusal still fires, it just cannot name
+# the model.
+# ---
+# name: the registered model name whose producer is missing
+# ret:  the refusal message
+fun unwired_debug_message(name: str) str {
+    var alloc: A.Allocator;
+    val fb: str = "a registered debug-info model carries no producer hook";
+    if (O.is_some[str](page.make(?alloc))) { ret fb; }
+    val r: R.Result[str, str] = str_join(?alloc, "debug model '", name, "' is registered but no producer wired its hooks (its be-layer registrar is missing from driver.setup_registry)");
+    if (R.is_err[str, str](r)) { ret fb; }
+    ret R.unwrap_ok[str, str](r);
+}
+
+# refuse a debug registry holding an identity that no producer ever wired
+#
+# The identity/producer split is real and load-bearing: the target layer must be
+# able to register a model's name without the back end present (`mach info`,
+# `mach doc` and `mach init` compose registries from `target.register_all` alone,
+# and a format naming an unregistered model must fail `select_of` loudly there
+# too), while the producer itself can only be named from `be`. That is the same
+# import direction that erases `produce` to `*u8`, so a required constructor
+# parameter - the shape #2244 gave the relocation seam - is not available here.
+#
+# The split is also what lets the wiring MISS. The identity list and the be-layer
+# registrars are hardcoded in two files in two layers, joined only by the order
+# `driver.setup_registry` calls them; adding a model to one without the other
+# registers cleanly, resolves cleanly through `select_of`, and surfaces only when a
+# `-g` build of a target whose format names that model reaches codegen - which
+# refuses at dispatch, but names neither the model nor the missing registrar
+# (#2295). This is the invariant that split cannot express, checked at the one
+# point where both halves are present: a fully composed registry either has every
+# identity wired or refuses to come up, naming the model.
+# ---
+# reg: the debug registry, after every be-layer registrar has run
+# ret: ok(true) when every registered identity carries a producer, or the first gap
+pub fun debug_hooks_complete(reg: *DebugRegistry) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < reg.count) {
+        if (reg.entries[i].produce == nil) {
+            ret R.err[bool, str](unwired_debug_message(reg.entries[i].name));
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
 }
 
 # the debug-info vtable at enumeration index `idx` (0-based, in registration order)
@@ -1025,5 +1085,38 @@ test "mach.lang.target.of.debug_register:install_lookup_dispatch" {
 
     # an unregistered model name resolves to none.
     if (O.is_some[*DebugVTable](debug_lookup(?reg, "codeview"))) { ret 1; }
+    ret 0;
+}
+
+# the completeness check refuses exactly the state the identity/producer split can
+# leave behind: an identity registered by the target layer that no be-layer
+# registrar wired. an empty registry and a fully wired one both pass, so the check
+# fires on the gap rather than on composition order
+test "mach.lang.target.of.debug_hooks_complete:refuses_unwired_identity" {
+    var empty: DebugRegistry = debug_registry_init();
+    if (R.is_err[bool, str](debug_hooks_complete(?empty))) { ret 1; }
+
+    # what `debug_register_identities` leaves behind before the be layer runs.
+    var reg: DebugRegistry = debug_registry_init();
+    debug_register_identities(?reg);
+    if (debug_registered_count(?reg) == 0) { ret 1; }
+    val unwired: R.Result[bool, str] = debug_hooks_complete(?reg);
+    if (!R.is_err[bool, str](unwired)) { ret 1; }
+    # the refusal names the model, so the missing registrar is identifiable.
+    if (!str_contains(R.unwrap_err[bool, str](unwired), "dwarf")) { ret 1; }
+
+    # wiring the producer, as the be-layer registrar does, satisfies it.
+    val opt: O.Option[*DebugVTable] = debug_lookup(?reg, "dwarf");
+    if (!O.is_some[*DebugVTable](opt)) { ret 1; }
+    O.unwrap[*DebugVTable](opt).produce = t_debug_produce::*u8;
+    if (R.is_err[bool, str](debug_hooks_complete(?reg))) { ret 1; }
+
+    # one unwired entry among wired ones is still refused, and named.
+    var extra: DebugVTable;
+    extra.id = DBG_CODEVIEW; extra.name = "codeview"; extra.produce = nil;
+    debug_register(?reg, ?extra);
+    val mixed: R.Result[bool, str] = debug_hooks_complete(?reg);
+    if (!R.is_err[bool, str](mixed))                            { ret 1; }
+    if (!str_contains(R.unwrap_err[bool, str](mixed), "codeview")) { ret 1; }
     ret 0;
 }
