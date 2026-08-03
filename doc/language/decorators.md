@@ -2,7 +2,7 @@
 
 A decorator is a codegen directive attached to a declaration. It expresses
 metadata that influences how the compiler emits the symbol: its linker name,
-alignment, section placement, inlining, PE import routing, constant-time
+alignment, section placement, inlining, dynamic import attribution, constant-time
 obligations, or exclusion from auto-vectorization.
 
 Decorators are **codegen-only**. Visibility (`pub` / `ext`) is separate and
@@ -29,7 +29,7 @@ A decorator is written as an attribute:
 
 ```
 #[symbol("name")]    # linker name override
-#[library("dep")]    # PE import routing (ext only)
+#[library("dep")]    # dynamic import attribution (ext only)
 #[inline]            # force inlining (no arguments)
 #[noinline]          # forbid inlining (no arguments)
 #[align(expr)]       # alignment; expr is a comptime integer
@@ -74,27 +74,28 @@ ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 Without `symbol`, the compiler mangles the Mach name. `symbol` gives the
 exact name the linker sees.
 
-### `library(str)` — PE import routing
+### `library(str)` — dynamic import attribution
 
-Pins an `ext` import to a specific DLL in the link's dependency set. Applies
-to `ext` functions only.
+Pins an `ext` import to a specific dependency in the link set. Applies to
+`ext` functions only.
 
 ```mach
 #[library("ws2_32.dll")] #[symbol("WSAStartup")]
 ext fun wsa_startup(ver: u16, data: *u8) i32;
 ```
 
-- The named DLL must appear in the manifest's `[os.*].libs` for the target OS
-  (e.g. `[os.windows].libs = ["kernel32.dll", "ws2_32.dll", ...]`). Pinning
-  to an absent library is a link error, never a silent fallback.
-- Without `library`, an unattributed PE import binds to the **first** declared
-  dependency. Every import that belongs to a different DLL needs an explicit
-  `library` pin.
+- The value normally names a `[link.X]` requirement's stable logical identity:
+  its `library` value, or `X` when that key is omitted. A bare command-line
+  `-l name` also exposes `name`. Exact canonical loader names remain accepted.
+  Pinning to an absent dependency is a link error, never a silent fallback. A
+  logical identity may not equal a different dependency's loader name.
+- PE and Mach-O use two-level namespaces, so every dynamic import on those
+  targets needs a `library` attribution.
 - On ELF (Linux) the loader resolves imports by global search, so `library`
   has no effect on the emitted binary; the value is still validated against
   the link's dependency set.
 - `library` composes with `symbol`: the import is emitted under the renamed
-  symbol within the named DLL.
+  symbol within the named dependency.
 
 ### `inline` — force inlining
 

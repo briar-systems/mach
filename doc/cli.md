@@ -114,9 +114,9 @@ unit's inputs — prints it, and exits without compiling or linking.
 | `--jobs <n>`   | count          | codegen worker threads (default: host CPUs; `1` serialises) |
 | `--pie`        | —              | emit a position-independent (ET_DYN) executable for ASLR instead of the default fixed-address one; opt-in (see below) |
 | `-L <dir>`     | dir            | add a search directory for `-l`-resolved inputs; repeatable |
-| `-l <name>`    | name           | link a named object, archive, or shared library, resolved through the `-L` dirs (see below); repeatable |
+| `-l <name>`    | name           | link a named object, archive, or target-format shared library, resolved through the `-L` dirs (see below); repeatable |
 | `--explain`    | —              | print the resolved build plan and exit without building |
-| *(positional)* | input path     | a bare argument that contains `/`, ends in `.o` / `.a`, or names a `.so` is linked verbatim |
+| *(positional)* | input path     | a bare argument that contains `/`, ends in `.o` / `.a`, or names a `.so`, `.dylib`, or `.dll` is linked explicitly |
 
 Plus the global flags above.
 
@@ -131,14 +131,15 @@ dependency is rejected.
 
 `ext fun` declarations are forward references whose definitions are supplied at
 link time by external precompiled code — a loose `.o` object, a static `.a`
-archive, or a shared `.so` library. Those inputs come from the command line and
+archive, or a target-format shared library. Those inputs come from the command line and
 from the manifest's matching `[link.X]` entries — an artifact's referenced entries
 plus exported dependency entries whose `os`/`isa`/`abi` filters match the build
 (see [manifest.md](manifest.md)); both sets are linked. An input that resolves to no
 existing file is a hard error, so a typo never silently drops a dependency.
 
 - **Explicit input path** — a bare (non-flag) argument that contains a `/`, ends
-  in `.o` (object) or `.a` (archive), or names a `.so` (shared library) is
+  in `.o` (object) or `.a` (archive), or names an ELF `.so`, Mach-O `.dylib`,
+  or PE `.dll` is
   treated as an input path. The first non-flag positional after `build` is the
   project root and is skipped; remaining input-path positionals are link inputs.
   A relative path is tried verbatim against the working directory first, then
@@ -147,10 +148,11 @@ existing file is a hard error, so a typo never silently drops a dependency.
   `-L <dir>` is searched for `<dir>/lib<name>.o`, `<dir>/<name>.o`,
   `<dir>/lib<name>.a`, then `<dir>/<name>.a`; if none hit, the same four
   candidates relative to the working directory are tried. Only if no static
-  object or archive is found does resolution fall back to a shared
-  `lib<name>.so` (searched in the `-L` dirs, the target OS's default library
-  directory, then the common system library directories `/lib64`, `/usr/lib64`,
-  the multiarch dirs, `/usr/lib`, `/lib`).
+  object or archive is found does resolution fall back to the selected target's
+  shared-library spelling: `lib<name>.so[.N]` for ELF or
+  `lib<name>[.<N>].dylib` for Mach-O. The `-L` directories are searched first,
+  followed by the selected target OS's system library directories; cross-target
+  planning does not consume a host library of another format.
 - **`-L <dir>`** — adds a search directory for the `-l` resolution above. Both
   `-L` and `-l` may be repeated.
 
@@ -163,21 +165,23 @@ How an input resolves decides whether the link is static or dynamic:
   member objects (all members are pulled, not just those satisfying an undefined
   symbol). With only static inputs the output is a fully static binary, and any
   undefined `ext` that no input defines is a hard error.
-- A shared **`.so`** library is a **dynamic** dependency. Its `DT_SONAME` (read
-  from the library, e.g. `libc.so.6` for `-l c`) is recorded as a run-time
-  dependency, and any undefined `ext` left after merging is bound against it at
-  load time through a PLT the linker emits — producing a dynamically-linked ELF
-  with a `PT_INTERP` (the OS dynamic loader) and a `.dynamic`/PLT/GOT. A static
-  definition of a symbol always wins over a dynamic import of the same name.
+- A shared **`.so`**, **`.dylib`**, or **`.dll`** is a **dynamic** dependency.
+  ELF records the library's `DT_SONAME`, Mach-O records its `LC_ID_DYLIB`
+  install name, and PE records the DLL basename. When a discovered Mach-O
+  install name starts with `@rpath/`, the resolved library directory is retained
+  as an `LC_RPATH`; an unresolved explicit `@rpath/...` input is rejected because
+  it supplies no usable search directory. Darwin frameworks are declared through
+  `[link.X]` with `source = "framework"` and become version-independent system
+  framework paths. Undefined `ext` functions are then emitted as imports for the
+  target format. A static definition of the same symbol always wins.
 
-`-l <name>` prefers a static `.o`/`.a` over a shared `.so`, so an `-l name`
+`-l <name>` prefers a static `.o`/`.a` over a shared library, so an `-l name`
 that has a local object is resolved statically exactly as before; the `.so`
-fallback only applies when no static candidate exists (the common case for
-system libraries like libc). Manifest `libs` are resolved before the CLI inputs,
-giving a stable, deterministic link order.
-
-> Dynamic linking is implemented for the ELF (Linux) and PE (Windows) targets;
-> the Mach-O (Darwin) import path is not yet implemented (#1176).
+or `.dylib` fallback only applies when no static candidate exists. A bare `-l`
+name is also the logical identity accepted by `#[library("name")]`; manifest
+requirements can set a cross-platform logical identity explicitly with their
+`library` key. Manifest requirements are resolved before CLI inputs, giving a
+stable, deterministic link order.
 
 Exit codes: `0` ok, `1` user error (missing project path, no `mach.toml`,
 unknown target, compile errors, an unresolvable link input), `2` internal error.
