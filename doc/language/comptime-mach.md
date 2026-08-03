@@ -84,7 +84,6 @@ $mach.os.linux
 $mach.os.darwin
 $mach.os.windows
 $mach.os.freestanding           # no OS / bare metal
-$mach.os.bmos                   # BareMetal, ReturnInfinity's x86-64 exokernel
 $mach.arch.x86_64
 $mach.arch.aarch64
 $mach.arch.riscv64
