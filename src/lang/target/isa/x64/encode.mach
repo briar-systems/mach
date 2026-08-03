@@ -1236,15 +1236,27 @@ fun encode_jcc(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
 }
 
 # encode an unconditional jump (relative with a placeholder, or
-# indirect through a register)
+# indirect through a register or memory operand)
+#
+# The indirect arm is total: an operand shape it does not model emits nothing and
+# returns zero, which every caller rejects as "concrete opcode produced no bytes"
+# (#2400). It previously fell through to the direct arm, so an indirect jump
+# through MEMORY encoded as `E9 00000000` - a relative jump to the next
+# instruction, carrying neither a fixup nor a relocation.
 fun encode_jmp(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     val start: usize = buf.len;
     val dst: *isa.Operand = ?mi.dst;
 
-    if ((mi.flags & x64.FLAG_INDIRECT::u16) != 0 && dst.kind == isa.OPK_REG) {
-        emit_rex_if_needed(buf, 0, 0, dst.reg);
-        enc.emit_byte(buf, 0xFF);
-        enc.emit_byte(buf, encode_modrm(3, 4, reg_bits(dst.reg)));
+    if ((mi.flags & x64.FLAG_INDIRECT::u16) != 0) {
+        if (dst.kind == isa.OPK_REG) {
+            emit_rex_if_needed(buf, 0, 0, dst.reg);
+            enc.emit_byte(buf, 0xFF);
+            enc.emit_byte(buf, encode_modrm(3, 4, reg_bits(dst.reg)));
+        } or (dst.kind == isa.OPK_MEM) {
+            emit_rex_mem(buf, 0, 4, dst);
+            enc.emit_byte(buf, 0xFF);
+            encode_mem_operand(buf, 4, dst);
+        }
         ret (buf.len - start)::i32;
     }
 
@@ -4789,15 +4801,21 @@ fun mir_to_inst(f: *mir.MirFunction, mi: *mir.MirInstr, inst: *isa.Inst) R.Resul
         inst.src2 = R.unwrap_ok[isa.Operand, str](r);
     }
 
-    # a CALL / JMP whose target is NOT a symbol is an indirect transfer through a
-    # register (a function-pointer vreg regalloc placed in a preg) or a memory
-    # slot, so it must encode FF /2 (call) or FF /4 (jmp) rather than the direct
-    # E8 / E9 rel32 form. a MIR_OP_SYM target stays direct (rip-relative rel32 +
-    # relocation). without this flag the MIR path always took the direct arm and
-    # emitted a bogus E8 against a register operand.
+    # a CALL / JMP whose target is a register (a function-pointer vreg regalloc
+    # placed in a preg) or a memory slot is an indirect transfer, so it must encode
+    # FF /2 (call) or FF /4 (jmp) rather than the direct E8 / E9 rel32 form. without
+    # this flag the MIR path always took the direct arm and emitted a bogus E8
+    # against a register operand.
+    #
+    # The two DIRECT target shapes are named rather than assumed: a MIR_OP_SYM
+    # target is rip-relative rel32 + relocation, and a MIR_OP_BLOCK target is rel32
+    # + a block fixup. Flagging a block target indirect was harmless only while the
+    # indirect arm silently fell through to the direct one; now that the arm is
+    # total (#2400), the flag has to mean what it says.
     if (mi.operand_count >= 1 &&
         (inst.opcode == x64.CALL::u16 || inst.opcode == x64.JMP::u16) &&
-        mi.operands[0].kind != mir.MIR_OP_SYM) {
+        mi.operands[0].kind != mir.MIR_OP_SYM &&
+        mi.operands[0].kind != mir.MIR_OP_BLOCK) {
         inst.flags = inst.flags | x64.FLAG_INDIRECT::u16;
     }
     ret R.ok[bool, str](true);
@@ -5791,6 +5809,205 @@ test "mach.lang.target.isa.x64.encode.x64_call_target:refused_forms" {
     if (!t_asm_refused("call [0x100000000]", "32-bit"))         { bad = 1; }
     # an absolute address is the whole operand; it takes no displacement term.
     if (!t_asm_refused("call [0x100018 + 8]", "displacement"))  { bad = 1; }
+
+    ret bad;
+}
+
+# encode one built machine instruction and compare its bytes against `want`
+# (test helper)
+#
+# The compiler-side counterpart to `t_asm_bytes`, for a shape no inline-asm
+# spelling reaches: the instruction is stated as the `isa.Inst` isel would build
+# and taken through `encode_inst`, the same entry point a lowered instruction
+# takes, rather than through one arm called directly.
+# ---
+# mi:   the instruction to encode
+# want: the expected encoding, as bytes
+# n:    number of expected bytes
+# ret:  true when the instruction encodes to exactly those bytes
+fun t_inst_bytes(mi: *isa.Inst, want: *u8, n: usize) bool {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: enc.ByteBuf = enc.buf_init(?alloc);
+    val got: i32 = encode_inst(mi, ?buf);
+    var ok: bool = got::usize == n && buf.len == n;
+    var i: usize = 0;
+    for (ok && i < n) {
+        if (buf.data[i] != want[i]) { ok = false; }
+        i = i + 1;
+    }
+    enc.buf_dnit(?buf);
+    ret ok;
+}
+
+# true when encoding `mi` emits nothing at all (test helper)
+#
+# Zero bytes is the encoder's "operand shape I do not model" signal, and both
+# entry points turn it into a hard error: the MIR one into "concrete opcode
+# produced no bytes", the inline-asm one into "inline-asm instruction encoded to
+# no bytes". So a refusal is asserted as an empty buffer - a partially emitted
+# instruction would be a different failure, and is caught here too.
+# ---
+# mi:  the instruction to encode
+# ret: true when nothing was emitted
+fun t_inst_refused(mi: *isa.Inst) bool {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var buf: enc.ByteBuf = enc.buf_init(?alloc);
+    val got: i32 = encode_inst(mi, ?buf);
+    val ok: bool = got == 0 && buf.len == 0;
+    enc.buf_dnit(?buf);
+    ret ok;
+}
+
+# an indirect `JMP` through `dst`, as isel would build it (test helper)
+#
+# `FF /4` is fixed 64-bit in long mode, so it takes no REX.W and no width flag -
+# the same shape `x64_build` gives an indirect `CALL`.
+# ---
+# dst: the transfer target
+# ret: the instruction
+fun t_indirect_jmp(dst: isa.Operand) isa.Inst {
+    var mi: isa.Inst = isa.inst_blank();
+    mi.opcode = x64.JMP;
+    mi.size   = 8;
+    mi.flags  = x64.FLAG_INDIRECT::u16;
+    mi.dst    = dst;
+    ret mi;
+}
+
+# every indirect `JMP` shape encodes to the exact bytes an independent assembler
+# produces for the same spelling
+#
+# `FF /4` is the indirect jump. The memory form was the one the encoder did not
+# model: it fell through to the direct arm and emitted `E9 00000000`, a relative
+# jump to the next instruction carrying neither a fixup nor a relocation (#2400).
+# These are byte-for-byte the nasm encodings of the same statements, so the SIB
+# escape, the `/4` digit and the REX.B on an extended register are asserted, not
+# assumed. No inline-asm spelling reaches them - `jmp` stays a branch target in
+# the grammar - so they are stated as built instructions.
+test "mach.lang.target.isa.x64.encode.encode_jmp:indirect_forms_byte_exact" {
+    var bad: i32 = 0;
+
+    # `jmp rax` - register-indirect, mod=11, no REX. the `/4` digit is what
+    # separates it from `call rax` (`/2`, `ff d0`).
+    var rax: isa.Inst = t_indirect_jmp(isa.make_reg(x64.RAX, 8));
+    var rax_want: [2]u8;
+    rax_want[0] = 0xFF; rax_want[1] = 0xE0;
+    if (!t_inst_bytes(?rax, ?rax_want[0], 2)) { bad = 1; }
+
+    # `jmp r11` - the extended register takes REX.B.
+    var r11: isa.Inst = t_indirect_jmp(isa.make_reg(x64.R11, 8));
+    var r11_want: [3]u8;
+    r11_want[0] = 0x41; r11_want[1] = 0xFF; r11_want[2] = 0xE3;
+    if (!t_inst_bytes(?r11, ?r11_want[0], 3)) { bad = 1; }
+
+    # `jmp [rax]` - the memory form the fallthrough silently mis-encoded.
+    var m0: isa.Inst = t_indirect_jmp(isa.make_mem(x64.RAX, 0, -1, 0, 8));
+    var m0_want: [2]u8;
+    m0_want[0] = 0xFF; m0_want[1] = 0x20;
+    if (!t_inst_bytes(?m0, ?m0_want[0], 2)) { bad = 1; }
+
+    # `jmp [rax + 8]` - a displacement takes mod=01.
+    var m8: isa.Inst = t_indirect_jmp(isa.make_mem(x64.RAX, 8, -1, 0, 8));
+    var m8_want: [3]u8;
+    m8_want[0] = 0xFF; m8_want[1] = 0x60; m8_want[2] = 0x08;
+    if (!t_inst_bytes(?m8, ?m8_want[0], 3)) { bad = 1; }
+
+    # `jmp [rax + rbx*8 + 16]` - the scaled-index form a jump table would use.
+    var midx: isa.Inst = t_indirect_jmp(isa.make_mem(x64.RAX, 16, x64.RBX, 8, 8));
+    var mi_want: [4]u8;
+    mi_want[0] = 0xFF; mi_want[1] = 0x64; mi_want[2] = 0xD8; mi_want[3] = 0x10;
+    if (!t_inst_bytes(?midx, ?mi_want[0], 4)) { bad = 1; }
+
+    # `jmp [r13]` - an extended base takes REX.B, and r13 (rm=101) cannot use
+    # mod=00, which is rip-relative, so it carries a zero disp8.
+    var m13: isa.Inst = t_indirect_jmp(isa.make_mem(x64.R13, 0, -1, 0, 8));
+    var m13_want: [4]u8;
+    m13_want[0] = 0x41; m13_want[1] = 0xFF; m13_want[2] = 0x65; m13_want[3] = 0x00;
+    if (!t_inst_bytes(?m13, ?m13_want[0], 4)) { bad = 1; }
+
+    # `jmp [0x100018]` - the absolute form: mod=00 rm=100 escapes to a SIB naming
+    # neither base nor index, so a wrong SIB (or a mod=00 rm=101 reusing the
+    # rip-relative encoding) changes these bytes.
+    var mabs: isa.Inst = t_indirect_jmp(isa.make_mem(x64.MEM_BASE_ABS, 0x100018, -1, 0, 8));
+    var abs_want: [7]u8;
+    abs_want[0] = 0xFF; abs_want[1] = 0x24; abs_want[2] = 0x25;
+    abs_want[3] = 0x18; abs_want[4] = 0x00; abs_want[5] = 0x10; abs_want[6] = 0x00;
+    if (!t_inst_bytes(?mabs, ?abs_want[0], 7)) { bad = 1; }
+
+    ret bad;
+}
+
+# an indirect `JMP` through a target shape the encoder does not model emits
+# nothing, rather than falling through to a different instruction
+#
+# The fallthrough (#2400) is what made a memory target encode as `E9 00000000`;
+# with the indirect arm total, an unmodelled shape produces zero bytes, which both
+# encoder entry points reject as a hard error. A label target is the exact shape
+# that used to reach `E9`: it is a DIRECT jump, so carrying the indirect flag is
+# now a contradiction rather than a silently tolerated one.
+test "mach.lang.target.isa.x64.encode.encode_jmp:refuses_unmodelled_indirect_target" {
+    var bad: i32 = 0;
+
+    var lbl: isa.Inst = t_indirect_jmp(isa.make_block_label(7));
+    if (!t_inst_refused(?lbl)) { bad = 1; }
+
+    var mimm: isa.Inst = t_indirect_jmp(isa.make_imm(0x100018, 8));
+    if (!t_inst_refused(?mimm)) { bad = 1; }
+
+    var mnone: isa.Inst = t_indirect_jmp(isa.make_none());
+    if (!t_inst_refused(?mnone)) { bad = 1; }
+
+    ret bad;
+}
+
+# a block-target `JMP` is a DIRECT relative jump: `mir_to_inst` must not flag it
+# indirect, and it must still encode `E9` plus the zero rel32 the fixup patches
+#
+# Every unconditional branch in a compiled function is this shape, and the flag
+# was set on all of them - the operand-kind test on the encoder's indirect arm was
+# the only thing keeping them off it. That made the whole safety margin "isel
+# never emits a memory target", which is exactly the margin #2400 removed.
+test "mach.lang.target.isa.x64.encode.mir_to_inst:block_jmp_target_stays_direct" {
+    var bad: i32 = 0;
+
+    var ops: [1]mir.MirOperand;
+    ops[0] = mir.op_block(7);
+    var mi: mir.MirInstr = mir.instr(x64.JMP::u32, ?ops[0], 1, 8, 8);
+
+    var inst: isa.Inst = isa.inst_blank();
+    # a block operand resolves to a label without touching the function's frame,
+    # so no MirFunction is needed to state this.
+    val r: R.Result[bool, str] = mir_to_inst(nil, ?mi, ?inst);
+    if (R.is_err[bool, str](r))                        { ret 1; }
+    if ((inst.flags & x64.FLAG_INDIRECT::u16) != 0)    { bad = 1; }
+    if (inst.dst.kind != isa.OPK_LABEL)                { bad = 1; }
+
+    var want: [5]u8;
+    want[0] = 0xE9; want[1] = 0x00; want[2] = 0x00; want[3] = 0x00; want[4] = 0x00;
+    if (!t_inst_bytes(?inst, ?want[0], 5)) { bad = 1; }
+
+    ret bad;
+}
+
+# a symbol-target `JMP` stays direct too: `E9` plus the rel32 its PC32 relocation
+# patches, with no indirect flag
+test "mach.lang.target.isa.x64.encode.mir_to_inst:sym_jmp_target_stays_direct" {
+    var bad: i32 = 0;
+
+    var ops: [1]mir.MirOperand;
+    ops[0] = mir.op_sym(intern.STR_NIL, 0);
+    var mi: mir.MirInstr = mir.instr(x64.JMP::u32, ?ops[0], 1, 8, 8);
+
+    var inst: isa.Inst = isa.inst_blank();
+    val r: R.Result[bool, str] = mir_to_inst(nil, ?mi, ?inst);
+    if (R.is_err[bool, str](r))                        { ret 1; }
+    if ((inst.flags & x64.FLAG_INDIRECT::u16) != 0)    { bad = 1; }
+
+    var want: [5]u8;
+    want[0] = 0xE9; want[1] = 0x00; want[2] = 0x00; want[3] = 0x00; want[4] = 0x00;
+    if (!t_inst_bytes(?inst, ?want[0], 5)) { bad = 1; }
 
     ret bad;
 }
