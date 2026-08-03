@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.4.0] - 2026-08-03
+
+Adds an open `platform` tag and a load-address `base` override to the target
+manifest, letting a bespoke bare-metal environment be expressed as
+`freestanding` plus a platform tag rather than a hardcoded OS in the compiler.
+Also preserves Darwin framework and dylib link semantics through the driver.
+
+### Added
+- manifest: `[target.<name>]` accepts an optional `platform` string tag and a
+  `base` load-address override. `platform` is surfaced to comptime as
+  `$mach.build.platform` — an open string (empty when unset) that libraries key a
+  backend on — folded before the `$mach.build.<name>` define lookup so a define
+  cannot shadow it. `base` overrides the first loadable segment's virtual address
+  at link time, deferring to the OS default when 0 (#2426, #2427).
+
+### Fixed
+- link: Darwin framework and dylib link semantics are preserved end to end —
+  frameworks and named dylibs resolve to stable logical `#[library]` identities,
+  dynamic requirements carry typed manifest attribution, Darwin runtime search
+  paths are retained, and duplicate static/loader inputs are deduplicated (#2424).
+
 ## [4.3.5] - 2026-07-30
 
 A compiler-output and vectorization patch. In controlled Linux x86_64 release
