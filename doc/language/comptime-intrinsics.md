@@ -36,6 +36,26 @@ fun probe[T]() u64 {
 `$offset_of`'s **second** argument is the exception: a bare field name, resolved
 against the record's layout, never a type or a value.
 
+### Where a layout intrinsic is constant
+
+These three measure a type's storage, so they have a value only once that type's
+layout is resolved. That happens after the front end has settled every type, which
+puts two positions out of reach — both of them decided *while* layout is still
+being worked out:
+
+| position | layout intrinsic |
+|---|---|
+| `val` / `var` initializer | yes |
+| global `align` | yes |
+| record / union type `align` | **no** |
+| array length `[N]T` | **no** |
+| `$if` / `$or` condition | **no** |
+
+A literal is accepted in all of them. Binding the intrinsic to a `val` and using
+the name does not work around a rejection — the binding's own value is folded
+after the point that needs it. Every rejected position reports the reason at the
+point of failure. Lifting the restriction is tracked as #2442.
+
 ## Type intrinsic
 
 `$type_of(expr)` produces a comptime type value — the resolved type of its
@@ -260,7 +280,10 @@ $or { $error("no writer for this argument type"); }    # compile error on an unh
 > **`$assert` not yet implemented.** `$assert` parses as a comptime directive
 > but the compiler does not yet evaluate it. It is intended as sugar over `$if`
 > plus `$error` — `$assert(cond, "msg")` ≡ `$if (!cond) { $error("msg"); }`,
-> e.g. `$assert($size_of(i64) == 8, "expected 64-bit i64");`.
+> e.g. `$assert($mach.build.arch == $mach.arch.x86_64, "expected x86_64");`. Being `$if`
+> sugar, it will inherit `$if`'s restrictions: a layout intrinsic in `cond` is
+> rejected for the reason above, so `$assert($size_of(i64) == 8, ...)` is not a
+> spelling to plan on until #2442 lands.
 
 ## Not provided as intrinsics
 
