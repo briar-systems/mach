@@ -180,8 +180,12 @@ pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ```
 
 Body-less, ends in `;`, C ABI is the contract. Provide the definition at link
-time (`mach build . -l c`, manifest `libs`, or an explicit `.o`/`.a`/`.so`).
-On PE targets pin imports to their DLL with `#[library("ws2_32.dll")]`.
+time (`mach build . -l c`, a `[link.X]` manifest requirement, or an explicit
+`.o`/`.a`/`.so`/`.dylib`/`.dll`). On PE and Mach-O targets, pin each dynamic
+import with `#[library("name")]`. The value is the requirement's stable
+`library` identity (defaulting to the `[link.X]` table name); exact loader names
+remain accepted. A discovered Darwin `@rpath/` install name retains its selected
+library directory as an `LC_RPATH` command.
 
 ### `val` / `var`
 
@@ -432,7 +436,7 @@ immediately following declaration. Closed set:
 | Decorator | Applies to | Argument | Purpose |
 |---|---|---|---|
 | `#[symbol("name")]` | fun, ext fun, val/var | string | linker name override |
-| `#[library("x.dll")]` | ext fun | string | PE import DLL pin |
+| `#[library("name")]` | ext import | string | dynamic import dependency pin |
 | `#[inline]` | fun | none | force inlining |
 | `#[align(expr)]` | val/var, rec/uni | comptime int | alignment override |
 | `#[section(".name")]` | fun, ext fun, val/var | string | object section placement |
@@ -449,10 +453,12 @@ pub var cache_line: u8 = 0;
 ```
 
 `align` takes any comptime expression (`#[align($align_of(T))]`). A `library`
-pin must name a DLL in the target's `libs` set - pinning to an absent library
-is a link error; on ELF the pin is validated but has no binary effect. Beware:
-a line comment starting `#[` with no space parses as a decorator - write
-`# [...]` in prose comments.
+pin must name a selected dynamic dependency by its stable logical identity or
+exact loader name; pinning to an absent library is a link error. PE and Mach-O
+require attribution, while ELF validates the pin but emits global-search
+binding. Logical identities may not collide with a different dependency's
+loader name. Beware: a line comment starting `#[` with no space parses as a
+decorator - write `# [...]` in prose comments.
 
 `#[oblivious]` marks a constant-time boundary: the backend may not introduce a
 secret-dependent branch, a variable-latency op on a secret, or eliminate a

@@ -105,7 +105,9 @@ to whichever *declared* target matches the host.
 | `isa` | yes      | Instruction-set architecture. Read by `$project.target.arch`. |
 | `os`  | yes      | Operating system. Read by `$project.target.os`. |
 | `abi` | yes      | Application binary interface. Read by `$project.target.abi`. |
-| `of`  | no       | Object-format override; defers to the os's format when omitted (the one optional target key). See [Object-format override](#object-format-override). |
+| `of`  | no       | Object-format override; defers to the os's format when omitted. See [Object-format override](#object-format-override). |
+| `base` | no      | Load-address override (integer). Overrides the os's default base virtual address; defers to it (`0` for `freestanding`) when omitted. |
+| `platform` | no  | Open platform tag (string), surfaced to comptime as `$mach.build.platform` (empty when unset). A support library keys its backend on it; the compiler treats it as opaque. See [Platform targets](#platform-targets-bare-metal). |
 
 ### Accepted tuple values
 
@@ -120,9 +122,12 @@ and runs natively in CI on every PR; `riscv64`-linux runs under qemu and
 self-hosts (#1852). `windows` is a supported cross-compilation target (PE/COFF,
 Win64 ABI). `darwin` is validated end-to-end on both architectures: each
 self-hosts to a three-generation fixpoint on a native macOS runner and ships a
-release archive. `freestanding` targets a raw flat image with no OS runtime.
-`spirv` is not a machine at all — it emits a finished GPU module rather than
-machine code (see [Finished-module targets](#finished-module-targets)).
+release archive. `freestanding` targets a raw flat image with no OS runtime; a
+bare-metal platform such as BareMetal (`bmos`) is a `freestanding` target plus a
+`platform` tag and `base` override (see [Platform targets](#platform-targets-bare-metal)),
+not an os of its own. `spirv` is not a machine at all — it
+emits a finished GPU module rather than machine code (see
+[Finished-module targets](#finished-module-targets)).
 
 `mach info targets` prints the tuples this binary can actually build; it is
 derived from the same declarations composition reads, so it never advertises a
@@ -135,9 +140,10 @@ than silently never matching.
 
 `of` overrides the object format a target implies. Each os has a default format —
 `linux` → `elf`, `windows` → `coff`, `darwin` → `macho`, `freestanding` → `raw` —
-and `of` names a different one from the same closed set: `elf`, `coff`, `macho`,
-`raw`, `spv`. It is the only optional key on a target; omit it to take the
-default.
+and `of` names a different one from the same closed set: `elf`,
+`coff`, `macho`, `raw`, `spv`. `of` is optional; omit it to
+take the default. An os accepts only the formats it can load, so an override the
+os cannot enter is refused.
 
 ```toml
 [target.metal]
@@ -180,6 +186,50 @@ The artifact's `out` template and `-o` name a linked binary, which such a target
 has none of; the module tree is delivered instead. A `static` or `shared`
 artifact kind, and `mach test`, are refused by name — there is no archive, shared
 object, or executable form for a module.
+
+### Platform targets (bare metal)
+
+A bare-metal platform — such as [BareMetal](https://github.com/ReturnInfinity/BareMetal)
+(`bmos`), Return Infinity's x86-64 exokernel — is not its own `os`. It is
+`os = "freestanding"` plus two optional keys: a `base` load-address override and an
+open `platform` tag a support library keys its backend on (surfaced to comptime as
+`$mach.build.platform`). A BareMetal target:
+
+```toml
+[target.bmos]
+isa      = "x86_64"
+os       = "freestanding"
+abi      = "sysv64"
+base     = 0xFFFF800000000000   # BareMetal copies the flat image here and calls it
+platform = "bmos"               # selects the mach-bmos backend
+# no `of`: freestanding's default object format is "raw"
+```
+
+- The artifact is a **flat binary** — no header, no sections, no entry record.
+  The loader copies the file's bytes verbatim to `base`.
+- The load address is set by **`base`** and the loader relocates nothing, so the
+  image is never position-independent.
+- Execution begins at the **first byte of the image**, which the loader reaches
+  with a `call`. The entry function is marked `#[symbol("_start")]`, and it must
+  be the only function or the first one emitted, since a flat image cannot say
+  where else to enter. An entry anywhere but the base is refused at link.
+- A program **exits by returning**: the entry function's `ret` goes back to its
+  caller. There is no exit syscall.
+
+The compiler encodes no BareMetal knowledge — `base` places the image and
+`platform` is an opaque string. The kernel-call machinery lives in the `mach-bmos`
+platform package, which gates on `$mach.build.platform == "bmos"`; because that is
+a library, a non-x86-64 bmos build fails at the package's own `$mach.build.arch`
+gate rather than in the compiler.
+
+One fact the kernel leaves to the program: **the stack is not guaranteed 16-byte
+aligned at entry**, so a startup shim must align it before calling anything that
+may use SSE. BareMetal's own `crt0.c` does exactly this.
+
+Zero-initialized data needs no such step. A flat image spans its whole memory
+extent, so `.bss` is stored as the zero bytes it is and arrives zeroed with the
+rest of the image (#2402) — an image costs its bss size in file bytes, and nothing
+has to zero anything at startup.
 
 ## `[profile.<name>]`
 
@@ -322,15 +372,16 @@ project's modules, so a platform link requirement lives once — in the manifest
 needs it — and cascades to consumers. A standalone build and a consumed build use
 the same entries, so nothing behaves differently as a dependency.
 
-| Key      | Required | Meaning |
-|----------|----------|---------|
-| `source` | yes | `"system"` (a system library resolved by name), `"framework"` (a macOS framework), or `"local"` (a file on disk). |
-| `name`   | shape | Library/framework name — required for `source = "system"`/`"framework"`, forbidden for `"local"`. |
-| `path`   | shape | File path — required for `source = "local"`, forbidden otherwise. A template (see below). |
-| `os`     | yes | Filter axis: a canonical `os` value, `"*"` (any), an array of values, or `[]` (none). |
-| `isa`    | yes | Filter axis over `isa`, same forms. |
-| `abi`    | yes | Filter axis over `abi`, same forms. |
-| `export` | yes | `true` cascades this entry to consumers; `false` keeps it to this project's own builds. |
+| Key       | Required | Meaning |
+|-----------|----------|---------|
+| `source`  | yes | `"system"` (a system library resolved by name), `"framework"` (a macOS framework), or `"local"` (a file on disk). |
+| `name`    | shape | Library/framework name — required for `source = "system"`/`"framework"`, forbidden for `"local"`. |
+| `path`    | shape | File path — required for `source = "local"`, forbidden otherwise. A template (see below). |
+| `library` | no | Stable logical name used by `#[library("...")]`; defaults to the `[link.<name>]` table name. |
+| `os`      | yes | Filter axis: a canonical `os` value, `"*"` (any), an array of values, or `[]` (none). |
+| `isa`     | yes | Filter axis over `isa`, same forms. |
+| `abi`     | yes | Filter axis over `abi`, same forms. |
+| `export`  | yes | `true` cascades this entry to consumers; `false` keeps it to this project's own builds. |
 
 The `os`/`isa`/`abi` axes select the build cells an entry applies to. Each takes a
 single canonical value, `"*"` for any, or an array — `os = "linux"` and
@@ -342,9 +393,22 @@ A `local` entry's `path` must, at build time, either match a `[step.X]`'s `out`
 (which demands that step) or already exist on disk — anything else is an up-front
 error, so a typo never silently drops an input.
 
+`library` decouples source attribution from platform loader spelling. Give
+mutually exclusive platform entries the same logical value when they provide the
+same API; one unconditional `#[library("glfw")]` can then bind against
+`libglfw.so.3` on Linux, an `LC_ID_DYLIB` install name on Darwin, and
+`glfw3.dll` on Windows. Exact canonical loader names remain accepted for
+compatibility. Selecting two dependencies that map the same logical name to
+different loader names in one build is an error. A logical name that equals a
+different dependency's canonical loader name is likewise rejected, so
+attribution never depends on requirement order.
+
 Whether an input links **statically** or **dynamically** follows the resolved file
-— a loose `.o` or static `.a` links statically; a shared `.so` is recorded as a
-dynamic dependency by its `DT_SONAME`. See
+— a loose `.o` or static `.a` links statically; ELF `.so`, Mach-O `.dylib`,
+and PE `.dll` inputs are recorded using their format's canonical loader name.
+An `@rpath/` Mach-O install name also retains the directory where resolution found
+the dylib, which the executable records as `LC_RPATH`. Darwin frameworks use a
+version-independent system framework path. See
 [cli.md](cli.md#static-vs-dynamic-resolution) for the resolution rules and
 [language/ext-fun.md](language/ext-fun.md#linking-external-objects) for the
 `ext fun` workflow that consumes these inputs.
@@ -601,6 +665,7 @@ out     = "out/{target.name}/{profile.name}"
 [link.glfw]
 source = "system"
 name   = "glfw"
+library = "glfw"
 os     = ["linux", "darwin"]
 isa    = "*"
 abi    = "*"
@@ -609,6 +674,7 @@ export = true
 [link.glfw-win]
 source = "system"
 name   = "glfw3.dll"
+library = "glfw"
 os     = ["windows"]
 isa    = "*"
 abi    = "*"
@@ -621,6 +687,14 @@ os     = ["darwin"]
 isa    = "*"
 abi    = "*"
 export = true
+```
+
+Both GLFW entries expose the logical name `glfw`, so the binding can use the
+same attribution on every target:
+
+```mach
+#[library("glfw")]
+pub ext fun glfwInit() i32;
 ```
 
 ## Worked example: a vendored-C dependency

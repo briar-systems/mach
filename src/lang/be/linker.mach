@@ -26,6 +26,7 @@
 
 use std.allocator.page;
 use std.collections.map;
+use std.collections.sort;
 use fs: std.filesystem;
 use std.collections.vector;
 use std.collections.vector.Vector;
@@ -125,6 +126,65 @@ rec SymbolLoc {
     weak:  bool;
 }
 
+# one losing weak function's byte interval in a flat input section. final-image
+# links remove [start,end); resume is the compressed offset at which the first
+# surviving byte after the interval lands
+rec AtomDrop {
+    section: u32;
+    start:   u32;
+    end:     u32;
+    resume:  u32;
+}
+
+# one input section's slice of the sorted drop array and its compressed length
+rec AtomSection {
+    first:    u32;
+    count:    u32;
+    live_len: u32;
+}
+
+# transient final-link function-atom liveness. it exists only inside the internal
+# executable/shared-object linker; relocatable objects and their native weak/group
+# encodings never consult it. an inactive plan is the exact legacy byte path
+rec AtomPlan {
+    drops:         *AtomDrop;
+    drop_count:    u32;
+    drop_cap:      u32;
+    sections:      *AtomSection;
+    section_count: u32;
+    removed_bytes: u64;
+    active:        bool;
+}
+
+# the current winning definition while the atom planner mirrors global
+# weak/strong resolution. module+symbol identify an earlier weak when a later
+# strong definition displaces it
+rec AtomWinner {
+    module: u32;
+    symbol: u32;
+    weak:   bool;
+}
+
+# a weak definition proven to lose global name resolution
+rec AtomCandidate {
+    module: u32;
+    symbol: u32;
+}
+
+# one relocation indexed by its already-resolved target section for candidate
+# reachability checks
+rec AtomRelocRef {
+    target_section: u32;
+    target_module:  u32;
+    target_symbol:  u32;
+    source_module:  u32;
+    reloc:           u32;
+    width:           u32;
+    addend_mode:     rel.RelocAddendMode;
+    text_bias_min:   i32;
+    text_bias_max:   i32;
+}
+
 # the linker's mutable dynamic-link state: the format-neutral plan (`of.DynamicInfo`)
 # being assembled plus the import call-site fixups (`of.PltFixup`) collected during
 # relocation patching, and the map from an imported symbol name to its index in the
@@ -179,7 +239,7 @@ rec StrMerge {
 # input relocations forward and writes a single merged object through `obj.emit`.
 #
 # DYNAMIC vs STATIC resolution of an undefined `ext` symbol: when no shared
-# dependencies are supplied (`soname_count == 0`) every undefined `ext` must be
+# dependencies are supplied (`dynlib_count == 0`) every undefined `ext` must be
 # satisfied by an input object/archive or the link fails - the fully static path,
 # emitted byte-for-byte as before through `emit_exec`. when shared dependencies
 # are supplied, any `ext` left undefined after merging is taken as a DYNAMIC
@@ -195,15 +255,15 @@ rec StrMerge {
 # tgt:          active target - selects OS base address, entry symbol, and writers
 # obj_paths:    array of null-terminated paths to the per-module object files
 # obj_count:    number of input object files
-# sonames:      interned shared-library sonames to depend on dynamically (or nil)
-# soname_count: number of shared-library dependencies
+# dynlibs:      logical names and loader names of dynamic dependencies (or nil)
+# dynlib_count: number of dynamic dependencies
 # out_path:     null-terminated output file path
 # name:         null-terminated product name; the writer's stable signing identity
 # mode:         executable, relocatable (library), or shared
 # pie:          the build opted into a position-independent executable (`--pie`)
 # ret:          true once the artifact is written, or an error string
 pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
-             obj_count: u32, sonames: *intern.StrId, soname_count: u32,
+             obj_count: u32, dynlibs: *of.DynLib, dynlib_count: u32,
              out_path: *u8, name: *u8, mode: LinkMode, pie: bool) R.Result[bool, str] {
     if (s == nil)      { ret R.err[bool, str]("link: nil session"); }
     if (tgt == nil)    { ret R.err[bool, str]("link: nil target"); }
@@ -229,7 +289,8 @@ pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
     # the parsed images are owned here (read from disk), so they are torn down
     # after linking regardless of outcome.
     val r: R.Result[bool, str] =
-        link_modules(s, tgt, modules, module_count, sonames, soname_count, out_path, name, mode, pie);
+        link_modules(s, tgt, modules, module_count, 0, dynlibs, dynlib_count,
+                     out_path, name, mode, pie);
     free_modules(alloc, modules, module_count);
     ret r;
 }
@@ -249,15 +310,15 @@ pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
 # tgt:          active target - selects OS base address, entry symbol, and writers
 # images:       the in-memory codegen images, one per module
 # image_count:  number of images
-# sonames:      interned shared-library sonames to depend on dynamically (or nil)
-# soname_count: number of shared-library dependencies
+# dynlibs:      logical names and loader names of dynamic dependencies (or nil)
+# dynlib_count: number of dynamic dependencies
 # out_path:     null-terminated output file path
 # name:         null-terminated product name; the writer's stable signing identity
 # mode:         executable, relocatable (library), or shared
 # pie:          the build opted into a position-independent executable (`--pie`)
 # ret:          true once the artifact is written, or an error string
 pub fun link_images(s: *session.Session, tgt: *target.Target, images: *of.ObjectImage,
-                    image_count: u32, sonames: *intern.StrId, soname_count: u32,
+                    image_count: u32, dynlibs: *of.DynLib, dynlib_count: u32,
                     out_path: *u8, name: *u8, mode: LinkMode, pie: bool) R.Result[bool, str] {
     if (s == nil)      { ret R.err[bool, str]("link: nil session"); }
     if (tgt == nil)    { ret R.err[bool, str]("link: nil target"); }
@@ -266,7 +327,8 @@ pub fun link_images(s: *session.Session, tgt: *target.Target, images: *of.Object
     if (images == nil || image_count == 0) {
         ret R.err[bool, str]("link: no input objects");
     }
-    ret link_modules(s, tgt, images, image_count, sonames, soname_count, out_path, name, mode, pie);
+    ret link_modules(s, tgt, images, image_count, image_count, dynlibs,
+                     dynlib_count, out_path, name, mode, pie);
 }
 
 # combine the project's in-memory codegen images with on-disk external link
@@ -292,8 +354,8 @@ pub fun link_images(s: *session.Session, tgt: *target.Target, images: *of.Object
 # image_count:  number of project images
 # obj_paths:    null-terminated paths to external input objects/archives, or nil
 # obj_count:    number of external input paths
-# sonames:      interned shared-library sonames to depend on dynamically (or nil)
-# soname_count: number of shared-library dependencies
+# dynlibs:      logical names and loader names of dynamic dependencies (or nil)
+# dynlib_count: number of dynamic dependencies
 # out_path:     null-terminated output file path
 # name:         null-terminated product name; the writer's stable signing identity
 # mode:         executable, relocatable (library), or shared
@@ -302,7 +364,7 @@ pub fun link_images(s: *session.Session, tgt: *target.Target, images: *of.Object
 pub fun link_mixed(s: *session.Session, tgt: *target.Target,
                    images: *of.ObjectImage, image_count: u32,
                    obj_paths: **u8, obj_count: u32,
-                   sonames: *intern.StrId, soname_count: u32,
+                   dynlibs: *of.DynLib, dynlib_count: u32,
                    out_path: *u8, name: *u8, mode: LinkMode, pie: bool) R.Result[bool, str] {
     if (s == nil)      { ret R.err[bool, str]("link: nil session"); }
     if (tgt == nil)    { ret R.err[bool, str]("link: nil target"); }
@@ -343,7 +405,8 @@ pub fun link_mixed(s: *session.Session, tgt: *target.Target,
     for (j < ext_count) { combined[image_count + j] = ext[j]; j = j + 1; }
 
     val r: R.Result[bool, str] =
-        link_modules(s, tgt, combined, total, sonames, soname_count, out_path, name, mode, pie);
+        link_modules(s, tgt, combined, total, image_count, dynlibs, dynlib_count,
+                     out_path, name, mode, pie);
 
     # tear down only the parsed external images (the project images are caller-owned)
     # and free the `combined` wrapper without dnit'ing its shallow-copied slots.
@@ -373,15 +436,17 @@ pub fun link_mixed(s: *session.Session, tgt: *target.Target,
 # tgt:          active target - selects OS base address, entry symbol, and writers
 # modules:      the input module images (caller-owned)
 # module_count: number of modules
-# sonames:      interned shared-library sonames to depend on dynamically (or nil)
-# soname_count: number of shared-library dependencies
+# codegen_count: number of leading in-memory compiler images; the rest were parsed
+# dynlibs:      logical names and loader names of dynamic dependencies (or nil)
+# dynlib_count: number of dynamic dependencies
 # out_path:     null-terminated output file path
 # name:         null-terminated product name; the writer's stable signing identity
 # mode:         executable, relocatable (library), or shared
 # pie_opt_in:   the build opted into a position-independent executable (`--pie`)
 # ret:          true once the artifact is written, or an error string
 fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectImage,
-                 module_count: u32, sonames: *intern.StrId, soname_count: u32,
+                 module_count: u32, codegen_count: u32,
+                 dynlibs: *of.DynLib, dynlib_count: u32,
                  out_path: *u8, name: *u8, mode: LinkMode, pie_opt_in: bool) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
     # a shared object is always position-independent: the loader maps it at an
@@ -396,7 +461,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     # a dynamic link is requested when shared dependencies are present or the image
     # is position-independent, and the output is an executable; libraries/
     # relocatables ignore dependencies.
-    val dynamic: bool = (mode == LINK_EXE) && (soname_count > 0 || pie);
+    val dynamic: bool = (mode == LINK_EXE) && (dynlib_count > 0 || pie);
     # both a PIE executable and a shared object need a position-independent layout
     # (based a page above the OS base, with a base-relocation set collected during
     # patching).
@@ -406,6 +471,9 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     # nothing to link, so reject rather than emit an empty artifact.
     if (module_count == 0) {
         ret R.err[bool, str]("link: no input objects");
+    }
+    if (codegen_count > module_count) {
+        ret R.err[bool, str]("link: codegen image count exceeds module count");
     }
 
     # discover the distinct debug-section names (first-encounter order) so the merge
@@ -422,6 +490,8 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     # in-place-patched modes (executable, shared object) dedup; a relocatable output
     # gets an inactive StrMerge and keeps the classic concatenation (#1708).
     val patching: bool = (mode == LINK_EXE) || shared;
+    var atoms: AtomPlan;
+    init_atom_plan(?atoms);
     var strm: StrMerge;
     val sm_r: R.Result[StrMerge, str] = build_str_merge(s, modules, module_count, patching);
     if (R.is_err[StrMerge, str](sm_r)) {
@@ -455,7 +525,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     if (sec_total > 0) {
         val pr: R.Result[*Placement, str] = A.zallocate[Placement](alloc, sec_total::usize);
         if (R.is_err[*Placement, str](pr)) {
-            free_scratch(alloc, nil, 0, nil, 0, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+            free_scratch(alloc, nil, 0, nil, 0, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
             ret R.err[bool, str](R.unwrap_err[*Placement, str](pr));
         }
         placements = R.unwrap_ok[*Placement, str](pr);
@@ -465,16 +535,42 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     var sec_base: *u32 = nil;
     val br: R.Result[*u32, str] = A.zallocate[u32](alloc, module_count::usize);
     if (R.is_err[*u32, str](br)) {
-        free_scratch(alloc, placements, sec_total, nil, 0, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, nil, 0, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[*u32, str](br));
     }
     sec_base = R.unwrap_ok[*u32, str](br);
 
+    # Final executable/shared links may discard only function atoms whose weak
+    # definition actually lost global resolution. A relocatable link receives an
+    # inert plan and preserves its native weak/group representation byte-for-byte.
+    val atom_r: R.Result[bool, str] =
+        build_atom_plan(s, modules, module_count, codegen_count, sec_base,
+                        sec_total, patching, tgt.isa, ?atoms);
+    if (R.is_err[bool, str](atom_r)) {
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
+        ret R.err[bool, str](R.unwrap_err[bool, str](atom_r));
+    }
+
     val acc_r: R.Result[bool, str] =
-        accumulate_sections(s, modules, module_count, merged, debug_names, debug_count, placements, sec_base, ?strm);
+        accumulate_sections(s, modules, module_count, merged, debug_names, debug_count,
+                            placements, sec_base, ?strm, ?atoms);
     if (R.is_err[bool, str](acc_r)) {
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[bool, str](acc_r));
+    }
+
+    # a flat image (raw) enters at its base, so the entry symbol's section must lead
+    # the merged .text regardless of link order; restack the text placements so the
+    # entry-defining section is first (#2409). only a flat-image executable needs it;
+    # every other format carries an explicit entry record and is left untouched.
+    if (tgt.of.produces_image && mode == LINK_EXE) {
+        val ei_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, tgt.os.entry_symbol);
+        if (R.is_err[intern.StrId, str](ei_r)) {
+            free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
+            ret R.err[bool, str](R.unwrap_err[intern.StrId, str](ei_r));
+        }
+        reorder_flat_entry_first(modules, module_count, merged, placements, sec_base,
+                                 ?atoms, R.unwrap_ok[intern.StrId, str](ei_r));
     }
 
     # assign each merged section a virtual address (an executable or a shared
@@ -493,10 +589,11 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
         map.init[intern.StrId, SymbolLoc](alloc, map.hash_u32, map.eq_u32);
 
     val collect_r: R.Result[bool, str] =
-        collect_symbols(s, modules, module_count, placements, sec_base, ?sym_locs, assign_vaddrs);
+        collect_symbols(s, modules, module_count, placements, sec_base, ?sym_locs,
+                        assign_vaddrs, ?atoms);
     if (R.is_err[bool, str](collect_r)) {
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[bool, str](collect_r));
     }
 
@@ -506,7 +603,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     val img_r: R.Result[of.ObjectImage, str] = obj.init(alloc, ?s.interner, image_name(modules, module_count));
     if (R.is_err[of.ObjectImage, str](img_r)) {
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[of.ObjectImage, str](img_r));
     }
     out_img = R.unwrap_ok[of.ObjectImage, str](img_r);
@@ -517,17 +614,18 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     if (R.is_err[*u32, str](mto_r)) {
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[*u32, str](mto_r));
     }
     merged_to_out = R.unwrap_ok[*u32, str](mto_r);
 
     val build_r: R.Result[bool, str] =
-        build_merged_image(s, ?out_img, modules, module_count, merged, merged_count, placements, sec_base, merged_to_out, ?strm);
+        build_merged_image(s, ?out_img, modules, module_count, merged, merged_count,
+                           placements, sec_base, merged_to_out, ?strm, ?atoms);
     if (R.is_err[bool, str](build_r)) {
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[bool, str](build_r));
     }
 
@@ -548,23 +646,26 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
         dyn.info.pie = position_independent;
         if (dynamic) {
             val dr: R.Result[bool, str] =
-                build_dynamic_info(s, tgt, ?dyn, modules, module_count, ?sym_locs, sonames, soname_count);
+                build_dynamic_info(s, tgt, ?dyn, modules, module_count, ?sym_locs,
+                                   dynlibs, dynlib_count, sec_base, ?atoms);
             if (R.is_err[bool, str](dr)) {
                 free_dynstate(alloc, ?dyn);
                 obj.dnit(?out_img);
                 map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-                free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+                free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
                 ret R.err[bool, str](R.unwrap_err[bool, str](dr));
             }
         }
 
         val patch_r: R.Result[bool, str] =
-            patch_relocations(s, ?out_img, modules, module_count, placements, sec_base, merged_to_out, ?sym_locs, ?dyn, ?strm, tgt.isa);
+            patch_relocations(s, ?out_img, modules, module_count, codegen_count,
+                              placements, sec_base, merged_to_out, ?sym_locs,
+                              ?dyn, ?strm, tgt.isa, ?atoms);
         if (R.is_err[bool, str](patch_r)) {
             free_dynstate(alloc, ?dyn);
             obj.dnit(?out_img);
             map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-            free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+            free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
             ret R.err[bool, str](R.unwrap_err[bool, str](patch_r));
         }
 
@@ -582,7 +683,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
         free_dynstate(alloc, ?dyn);
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
 
         if (R.is_err[bool, str](emit_r)) {
             ret R.err[bool, str](R.unwrap_err[bool, str](emit_r));
@@ -597,7 +698,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     if (R.is_err[bool, str](carry_r)) {
         obj.dnit(?out_img);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+        free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[bool, str](carry_r));
     }
 
@@ -605,7 +706,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
 
     obj.dnit(?out_img);
     map.dnit[intern.StrId, SymbolLoc](?sym_locs);
-    free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm);
+    free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, ?strm, ?atoms);
 
     if (R.is_err[bool, str](obj_r)) {
         ret R.err[bool, str](R.unwrap_err[bool, str](obj_r));
@@ -1507,6 +1608,686 @@ fun free_str_merge(sm: *StrMerge) {
     enc.buf_dnit(?sm.buf);
 }
 
+# reset a final-link atom plan to its inert state
+fun init_atom_plan(plan: *AtomPlan) {
+    plan.drops         = nil;
+    plan.drop_count    = 0;
+    plan.drop_cap      = 0;
+    plan.sections      = nil;
+    plan.section_count = 0;
+    plan.removed_bytes = 0;
+    plan.active        = false;
+}
+
+# release a final-link atom plan's sorted ranges and section index
+fun free_atom_plan(alloc: *A.Allocator, plan: *AtomPlan) {
+    if (plan == nil) { ret; }
+    if (plan.drops != nil && plan.drop_cap > 0) {
+        A.deallocate[AtomDrop](alloc, plan.drops, plan.drop_cap::usize);
+    }
+    if (plan.sections != nil && plan.section_count > 0) {
+        A.deallocate[AtomSection](alloc, plan.sections, plan.section_count::usize);
+    }
+    init_atom_plan(plan);
+}
+
+# order discarded atoms by flat input section and source interval
+fun atom_drop_cmp(a: *AtomDrop, b: *AtomDrop) i64 {
+    if (a.section < b.section) { ret -1; }
+    if (a.section > b.section) { ret 1; }
+    if (a.start < b.start)     { ret -1; }
+    if (a.start > b.start)     { ret 1; }
+    if (a.end < b.end)         { ret -1; }
+    if (a.end > b.end)         { ret 1; }
+    ret 0;
+}
+
+# order relocation references by resolved flat target section, then source site
+fun atom_reloc_ref_cmp(a: *AtomRelocRef, b: *AtomRelocRef) i64 {
+    if (a.target_section < b.target_section) { ret -1; }
+    if (a.target_section > b.target_section) { ret 1; }
+    if (a.source_module < b.source_module)   { ret -1; }
+    if (a.source_module > b.source_module)   { ret 1; }
+    if (a.reloc < b.reloc)                   { ret -1; }
+    if (a.reloc > b.reloc)                   { ret 1; }
+    ret 0;
+}
+
+# first relocation-reference index whose flat target section is not less than
+# `section`
+fun atom_reloc_ref_lower(refs: *AtomRelocRef, count: u32, section: u32) u32 {
+    var lo: u32 = 0;
+    var hi: u32 = count;
+    for (lo < hi) {
+        val mid: u32 = lo + (hi - lo) / 2;
+        if (refs[mid].target_section < section) { lo = mid + 1; }
+        or                                      { hi = mid; }
+    }
+    ret lo;
+}
+
+# earliest destination offset at or after `dst` that preserves `end`'s residue
+# modulo the input section alignment. every suffix offset is translated by
+# `resume - end`, so this keeps all later aligned symbols aligned
+fun atom_resume_offset(dst: u32, end: u32, section_align: u32) u32 {
+    if (end <= dst) { ret dst; }
+    var a: u32 = section_align;
+    if (a == 0) { a = 1; }
+    ret dst + (end - dst) % a;
+}
+
+# physical relocation shape supplied by the active ISA's relocatable-object seam
+fun atom_reloc_traits(r: *of.Relocation, section: *of.Section,
+                      arch: *isa.IsaVTable,
+                      codegen_image: bool) rel.RelocTraits {
+    ret arch.reloc.reloc_traits::rel.RelocTraitsFn(
+        r.kind, section.kind, codegen_image);
+}
+
+# whether a second symbol is the exact synthetic section anchor emitted by COFF
+# for a full-section weak COMDAT carrier. the parser surfaces that STATIC record
+# as a local zero-sized symbol at offset zero, named for the section. relocation
+# reachability is checked separately, so this exemption removes only the inert
+# bookkeeping symbol, never an addressable label
+fun atom_is_carrier_anchor(m: *of.ObjectImage, owner: *of.Symbol,
+                           other: *of.Symbol, start: u32, end: u32) bool {
+    if (start != 0 || owner.offset != 0) { ret false; }
+    if (owner.section >= m.section_count || end != m.sections[owner.section].len) { ret false; }
+    if (other.section != owner.section || other.offset != 0 || other.size != 0)   { ret false; }
+    if (other.flags != 0 || other.name != m.sections[owner.section].name)          { ret false; }
+    ret true;
+}
+
+# apply a signed relocation addend to a section offset without overflow. offsets
+# one-past-the-section are representable so end-marker references can be audited
+fun atom_effective_offset(base: u32, addend: i64, out: *u32) bool {
+    if (addend >= 0) {
+        val plus: u64 = addend::u64;
+        if (plus > 0xFFFFFFFF - base::u64) { ret false; }
+        @out = base + plus::u32;
+        ret true;
+    }
+    if (addend < -(base::i64)) { ret false; }
+    @out = (base::i64 + addend)::u32;
+    ret true;
+}
+
+# whether a relocation whose patch field survives `candidate` resolves through
+# a local or winning-global anchor across the candidate boundary. symbol offsets
+# are remapped but relocation addends are not; crossing the removed interval
+# would therefore silently retarget the relocation, so the candidate must stay
+# live. a relocation to the losing weak name resolves to the winner recorded in
+# `winners`, not to the discarded definition
+fun atom_reloc_crosses_candidate(modules: *of.ObjectImage, reference: *AtomRelocRef,
+                                 r: *of.Relocation,
+                                 candidate_module: u32, candidate_section: u32,
+                                 start: u32, end: u32) bool {
+    val source_module: u32 = reference.source_module;
+    val width: u64 = reference.width::u64;
+    if (source_module == candidate_module && r.section == candidate_section
+        && r.offset::u64 >= start::u64
+        && r.offset::u64 + width <= end::u64) {
+        ret false;
+    }
+
+    val target_module: u32 = reference.target_module;
+    val target_symbol: u32 = reference.target_symbol;
+
+    val target: *of.Symbol = ?modules[target_module].symbols[target_symbol];
+    if (target_module != candidate_module || target.section != candidate_section) { ret false; }
+    if (target.offset > modules[candidate_module].sections[candidate_section].len) { ret false; }
+
+    # a resolved entry inside the atom disappears regardless of relocation kind.
+    # field-biased kinds carry an ISA-owned range: x64 plt32 is exactly +4, while
+    # ambiguous text pc32 includes both a raw symbol delta and every possible
+    # instruction-end bias.
+    if (target.offset >= start && target.offset < end) { ret true; }
+    if (reference.addend_mode == rel.RELOC_ADDEND_IGNORED) { ret false; }
+
+    var bias_min: i64 = 0;
+    var bias_max: i64 = 0;
+    if (reference.addend_mode == rel.RELOC_ADDEND_FIELD_BIAS
+        && r.section < modules[source_module].section_count
+        && modules[source_module].sections[r.section].kind == of.SK_TEXT) {
+        bias_min = reference.text_bias_min::i64;
+        bias_max = reference.text_bias_max::i64;
+    }
+    if ((bias_min > 0 && r.addend > 9223372036854775807 - bias_min)
+        || (bias_min < 0 && r.addend < (-9223372036854775807 - 1) - bias_min)
+        || (bias_max > 0 && r.addend > 9223372036854775807 - bias_max)
+        || (bias_max < 0 && r.addend < (-9223372036854775807 - 1) - bias_max)) {
+        ret true;
+    }
+
+    var effective_min: u32 = 0;
+    var effective_max: u32 = 0;
+    if (!atom_effective_offset(target.offset, r.addend + bias_min, ?effective_min)
+        || !atom_effective_offset(target.offset, r.addend + bias_max, ?effective_max)) {
+        ret true;
+    }
+    # the anchor and every possible effective target must remain on one side of
+    # the removed interval.
+    if (target.offset < start && effective_max >= start) { ret true; }
+    if (target.offset >= end && effective_min < end)     { ret true; }
+    ret false;
+}
+
+# fill each module's base in the flat input-section array
+fun fill_section_bases(modules: *of.ObjectImage, module_count: u32, sec_base: *u32) {
+    var flat: u32 = 0;
+    var m: u32 = 0;
+    for (m < module_count) {
+        sec_base[m] = flat;
+        flat = flat + modules[m].section_count;
+        m = m + 1;
+    }
+}
+
+# whether `off` lies in a discarded atom of flat input section `section`
+fun atom_offset_dead(plan: *AtomPlan, section: u32, off: u32) bool {
+    if (plan == nil || !plan.active || section >= plan.section_count) { ret false; }
+    val meta: *AtomSection = ?plan.sections[section];
+    var i: u32 = meta.first;
+    val end: u32 = meta.first + meta.count;
+    for (i < end) {
+        val drop: *AtomDrop = ?plan.drops[i];
+        if (off < drop.start) { ret false; }
+        if (off < drop.end)   { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# map a live source offset into its compressed input-section offset. callers
+# test atom_offset_dead first; an offset inside a dead interval maps to its
+# resume point defensively
+fun atom_live_offset(plan: *AtomPlan, section: u32, off: u32) u32 {
+    if (plan == nil || !plan.active || section >= plan.section_count) { ret off; }
+    val meta: *AtomSection = ?plan.sections[section];
+    var src_cursor: u32 = 0;
+    var dst_cursor: u32 = 0;
+    var i: u32 = meta.first;
+    val end: u32 = meta.first + meta.count;
+    for (i < end) {
+        val drop: *AtomDrop = ?plan.drops[i];
+        if (off < drop.start) { ret dst_cursor + (off - src_cursor); }
+        if (off < drop.end)   { ret drop.resume; }
+        src_cursor = drop.end;
+        dst_cursor = drop.resume;
+        i = i + 1;
+    }
+    ret dst_cursor + (off - src_cursor);
+}
+
+# compressed byte length of a flat input section, or the original length on
+# the inert path
+fun atom_live_len(plan: *AtomPlan, section: u32, original_len: u32) u32 {
+    if (plan == nil || !plan.active || section >= plan.section_count) { ret original_len; }
+    ret plan.sections[section].live_len;
+}
+
+# copy one input section while omitting its discarded atom intervals. output
+# storage is zero-initialized, so alignment gaps inserted at resume points need
+# no explicit writes
+fun copy_live_section(dst: *u8, src: *u8, src_len: u32, plan: *AtomPlan, section: u32) {
+    if (plan == nil || !plan.active || section >= plan.section_count
+        || plan.sections[section].count == 0) {
+        memory.copy[u8](dst, src, src_len::usize);
+        ret;
+    }
+
+    val meta: *AtomSection = ?plan.sections[section];
+    var src_cursor: u32 = 0;
+    var dst_cursor: u32 = 0;
+    var i: u32 = meta.first;
+    val end: u32 = meta.first + meta.count;
+    for (i < end) {
+        val drop: *AtomDrop = ?plan.drops[i];
+        val n: u32 = drop.start - src_cursor;
+        if (n > 0) {
+            memory.copy[u8](?dst[dst_cursor], ?src[src_cursor], n::usize);
+            dst_cursor = dst_cursor + n;
+        }
+        src_cursor = drop.end;
+        dst_cursor = drop.resume;
+        i = i + 1;
+    }
+    if (src_cursor < src_len) {
+        memory.copy[u8](?dst[dst_cursor], ?src[src_cursor], (src_len - src_cursor)::usize);
+    }
+}
+
+# build transient function-atom liveness for a final internal link. global
+# definitions are first resolved with the same first-weak/strong-override rules
+# as collect_symbols. only a weak GLOBAL FUNCTION in SK_TEXT that actually loses
+# is eligible. its extent runs to the next global function entry (or section end);
+# another symbol inside the interval or a relocation field crossing its boundary
+# keeps the interval conservatively live. the leading `codegen_count` modules
+# came directly from this compiler; remaining modules came through an object parser
+fun build_atom_plan(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
+                    codegen_count: u32, sec_base: *u32, sec_total: u32, enabled: bool,
+                    arch: *isa.IsaVTable, plan: *AtomPlan) R.Result[bool, str] {
+    if (codegen_count > module_count) {
+        ret R.err[bool, str]("linker: codegen image count exceeds module count");
+    }
+    fill_section_bases(modules, module_count, sec_base);
+    if (!enabled) { ret R.ok[bool, str](true); }
+
+    var symbol_total64: u64 = 0;
+    var m: u32 = 0;
+    for (m < module_count) {
+        symbol_total64 = symbol_total64 + modules[m].symbol_count::u64;
+        if (symbol_total64 > 0xFFFFFFFF) {
+            ret R.err[bool, str]("linker: input symbol count exceeds the u32 limit");
+        }
+        m = m + 1;
+    }
+    val symbol_total: u32 = symbol_total64::u32;
+
+    var candidates: *AtomCandidate = nil;
+    if (symbol_total > 0) {
+        val cr: R.Result[*AtomCandidate, str] =
+            A.zallocate[AtomCandidate](s.alloc, symbol_total::usize);
+        if (R.is_err[*AtomCandidate, str](cr)) {
+            ret R.err[bool, str](R.unwrap_err[*AtomCandidate, str](cr));
+        }
+        candidates = R.unwrap_ok[*AtomCandidate, str](cr);
+    }
+
+    var winners: map.Map[intern.StrId, AtomWinner] =
+        map.init[intern.StrId, AtomWinner](s.alloc, map.hash_u32, map.eq_u32);
+    var candidate_count: u32 = 0;
+    m = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (sym.section == of.SECTION_EXTERNAL) { sy = sy + 1; cnt; }
+            if (sym.section >= modules[m].section_count) {
+                map.dnit[intern.StrId, AtomWinner](?winners);
+                if (candidates != nil) {
+                    A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+                }
+                ret R.err[bool, str](oor_section_message(s, sym.name, modules[m].name));
+            }
+            if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { sy = sy + 1; cnt; }
+
+            val weak: bool = (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0;
+            val existing: R.Result[*AtomWinner, str] =
+                map.get[intern.StrId, AtomWinner](?winners, ?sym.name);
+            if (R.is_ok[*AtomWinner, str](existing)) {
+                val cur: *AtomWinner = R.unwrap_ok[*AtomWinner, str](existing);
+                if (weak) {
+                    candidates[candidate_count].module = m;
+                    candidates[candidate_count].symbol = sy;
+                    candidate_count = candidate_count + 1;
+                    sy = sy + 1;
+                    cnt;
+                }
+                if (!cur.weak) {
+                    map.dnit[intern.StrId, AtomWinner](?winners);
+                    if (candidates != nil) {
+                        A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+                    }
+                    ret R.err[bool, str](dup_message(s, sym.name));
+                }
+                # a later strong definition displaces the earlier weak winner.
+                candidates[candidate_count].module = cur.module;
+                candidates[candidate_count].symbol = cur.symbol;
+                candidate_count = candidate_count + 1;
+                cur.module = m;
+                cur.symbol = sy;
+                cur.weak = false;
+                sy = sy + 1;
+                cnt;
+            }
+
+            var winner: AtomWinner;
+            winner.module = m;
+            winner.symbol = sy;
+            winner.weak = weak;
+            val ins: R.Result[bool, str] =
+                map.insert[intern.StrId, AtomWinner](?winners, sym.name, winner);
+            if (R.is_err[bool, str](ins)) {
+                map.dnit[intern.StrId, AtomWinner](?winners);
+                if (candidates != nil) {
+                    A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+                }
+                ret R.err[bool, str](R.unwrap_err[bool, str](ins));
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    if (candidate_count == 0) {
+        map.dnit[intern.StrId, AtomWinner](?winners);
+        if (candidates != nil) {
+            A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+        }
+        ret R.ok[bool, str](true);
+    }
+
+    val dr: R.Result[*AtomDrop, str] =
+        A.zallocate[AtomDrop](s.alloc, candidate_count::usize);
+    if (R.is_err[*AtomDrop, str](dr)) {
+        map.dnit[intern.StrId, AtomWinner](?winners);
+        A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+        ret R.err[bool, str](R.unwrap_err[*AtomDrop, str](dr));
+    }
+    val drops: *AtomDrop = R.unwrap_ok[*AtomDrop, str](dr);
+    var drop_count: u32 = 0;
+
+    # index relocation targets once. candidate checks then inspect only references
+    # to symbols in that candidate's section instead of rescanning every relocation
+    # for every duplicate weak body.
+    var reloc_total64: u64 = 0;
+    m = 0;
+    for (m < module_count) {
+        reloc_total64 = reloc_total64 + modules[m].reloc_count::u64;
+        if (reloc_total64 > 0xFFFFFFFF) {
+            map.dnit[intern.StrId, AtomWinner](?winners);
+            A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+            A.deallocate[AtomDrop](s.alloc, drops, candidate_count::usize);
+            ret R.err[bool, str]("linker: input relocation count exceeds the u32 limit");
+        }
+        m = m + 1;
+    }
+    val reloc_total: u32 = reloc_total64::u32;
+    var refs: *AtomRelocRef = nil;
+    if (reloc_total > 0) {
+        if (arch == nil || arch.reloc == nil || arch.reloc.reloc_traits == nil) {
+            map.dnit[intern.StrId, AtomWinner](?winners);
+            A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+            A.deallocate[AtomDrop](s.alloc, drops, candidate_count::usize);
+            ret R.err[bool, str]("linker: target cannot describe relocations");
+        }
+        val rr: R.Result[*AtomRelocRef, str] =
+            A.zallocate[AtomRelocRef](s.alloc, reloc_total::usize);
+        if (R.is_err[*AtomRelocRef, str](rr)) {
+            map.dnit[intern.StrId, AtomWinner](?winners);
+            A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+            A.deallocate[AtomDrop](s.alloc, drops, candidate_count::usize);
+            ret R.err[bool, str](R.unwrap_err[*AtomRelocRef, str](rr));
+        }
+        refs = R.unwrap_ok[*AtomRelocRef, str](rr);
+        var rw: u32 = 0;
+        m = 0;
+        for (m < module_count) {
+            var locals: map.Map[intern.StrId, u32] =
+                map.init[intern.StrId, u32](s.alloc, map.hash_u32, map.eq_u32);
+            var sy: u32 = 0;
+            for (sy < modules[m].symbol_count) {
+                val local: *of.Symbol = ?modules[m].symbols[sy];
+                if (local.section != of.SECTION_EXTERNAL
+                    && local.section < modules[m].section_count
+                    && (local.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0
+                    && R.is_err[*u32, str](map.get[intern.StrId, u32](?locals, ?local.name))) {
+                    val li: R.Result[bool, str] =
+                        map.insert[intern.StrId, u32](?locals, local.name, sy);
+                    if (R.is_err[bool, str](li)) {
+                        map.dnit[intern.StrId, u32](?locals);
+                        map.dnit[intern.StrId, AtomWinner](?winners);
+                        A.deallocate[AtomRelocRef](s.alloc, refs, reloc_total::usize);
+                        A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+                        A.deallocate[AtomDrop](s.alloc, drops, candidate_count::usize);
+                        ret R.err[bool, str](R.unwrap_err[bool, str](li));
+                    }
+                }
+                sy = sy + 1;
+            }
+
+            var ri: u32 = 0;
+            for (ri < modules[m].reloc_count) {
+                refs[rw].target_section = 0xFFFFFFFF;
+                refs[rw].target_module = 0xFFFFFFFF;
+                refs[rw].target_symbol = 0xFFFFFFFF;
+                refs[rw].source_module = m;
+                refs[rw].reloc = ri;
+                val relocation: *of.Relocation = ?modules[m].relocations[ri];
+                var traits: rel.RelocTraits;
+                if (relocation.section < modules[m].section_count) {
+                    traits = atom_reloc_traits(
+                        relocation, ?modules[m].sections[relocation.section],
+                        arch, m < codegen_count);
+                }
+                or {
+                    # the normal patch pass reports the corrupt section index;
+                    # width is irrelevant until then, but keep this index build
+                    # bounded and initialized.
+                    traits = rel.traits(0, rel.RELOC_ADDEND_IGNORED, 0, 0);
+                }
+                refs[rw].width = traits.field_width;
+                refs[rw].addend_mode = traits.addend_mode;
+                refs[rw].text_bias_min = traits.text_bias_min;
+                refs[rw].text_bias_max = traits.text_bias_max;
+
+                val r: *of.Relocation = ?modules[m].relocations[ri];
+                val lr: R.Result[*u32, str] =
+                    map.get[intern.StrId, u32](?locals, ?r.symbol);
+                if (R.is_ok[*u32, str](lr)) {
+                    refs[rw].target_module = m;
+                    refs[rw].target_symbol = @R.unwrap_ok[*u32, str](lr);
+                }
+                or {
+                    val wr: R.Result[*AtomWinner, str] =
+                        map.get[intern.StrId, AtomWinner](?winners, ?r.symbol);
+                    if (R.is_ok[*AtomWinner, str](wr)) {
+                        val winner: *AtomWinner = R.unwrap_ok[*AtomWinner, str](wr);
+                        refs[rw].target_module = winner.module;
+                        refs[rw].target_symbol = winner.symbol;
+                    }
+                }
+                if (refs[rw].target_module != 0xFFFFFFFF) {
+                    val target: *of.Symbol =
+                        ?modules[refs[rw].target_module].symbols[refs[rw].target_symbol];
+                    if (target.section != of.SECTION_EXTERNAL
+                        && target.section < modules[refs[rw].target_module].section_count) {
+                        refs[rw].target_section =
+                            sec_base[refs[rw].target_module] + target.section;
+                    }
+                }
+                rw = rw + 1;
+                ri = ri + 1;
+            }
+            map.dnit[intern.StrId, u32](?locals);
+            m = m + 1;
+        }
+        sort.sort[AtomRelocRef](refs, reloc_total::usize, atom_reloc_ref_cmp);
+    }
+
+    var ci: u32 = 0;
+    for (ci < candidate_count) {
+        val cm: u32 = candidates[ci].module;
+        val cy: u32 = candidates[ci].symbol;
+        val sym: *of.Symbol = ?modules[cm].symbols[cy];
+        val sec: *of.Section = ?modules[cm].sections[sym.section];
+        val need: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+        if ((sym.flags & need) != need || sec.kind != of.SK_TEXT || sec.bytes == nil
+            || sym.offset >= sec.len) {
+            ci = ci + 1;
+            cnt;
+        }
+
+        val start: u32 = sym.offset;
+        var end: u32 = 0;
+        if (sym.size > 0) {
+            # a validated producer size is authoritative. foreign objects may put
+            # unsymbolized literal/island bytes after the function; an inferred
+            # section-tail extent would incorrectly delete those bytes.
+            val sized_end: u64 = start::u64 + sym.size::u64;
+            if (sized_end > sec.len::u64) { ci = ci + 1; cnt; }
+            end = sized_end::u32;
+        }
+        or {
+            end = sec.len;
+            var nsy: u32 = 0;
+            for (nsy < modules[cm].symbol_count) {
+                val other: *of.Symbol = ?modules[cm].symbols[nsy];
+                if (other.section == sym.section
+                    && (other.flags & (of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION))
+                        == (of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION)
+                    && other.offset > start && other.offset < end) {
+                    end = other.offset;
+                }
+                nsy = nsy + 1;
+            }
+        }
+        if (end <= start) { ci = ci + 1; cnt; }
+
+        # a second symbol entry or nonzero extent overlapping the candidate may
+        # remain addressable from live code. The sole exception is COFF's exact
+        # synthetic section anchor for a full COMDAT carrier; relocation
+        # reachability through that anchor is audited below.
+        var safe: bool = true;
+        var sy: u32 = 0;
+        for (sy < modules[cm].symbol_count) {
+            if (sy != cy) {
+                val other: *of.Symbol = ?modules[cm].symbols[sy];
+                if (other.section == sym.section
+                    && !atom_is_carrier_anchor(?modules[cm], sym, other, start, end)) {
+                    if (other.offset >= start && other.offset < end) { safe = false; }
+                    if (other.size > 0) {
+                        val other_end: u64 = other.offset::u64 + other.size::u64;
+                        if (other.offset < end && other_end > start::u64) {
+                            safe = false;
+                        }
+                    }
+                }
+            }
+            sy = sy + 1;
+        }
+
+        # A patch field wholly inside the losing body dies with it. A field that
+        # crosses either boundary makes the inferred function extent unsafe.
+        var ri: u32 = 0;
+        for (safe && ri < modules[cm].reloc_count) {
+            val r: *of.Relocation = ?modules[cm].relocations[ri];
+            if (r.section == sym.section) {
+                val rstart: u64 = r.offset::u64;
+                val rend: u64 = rstart
+                    + atom_reloc_traits(r, ?modules[cm].sections[r.section],
+                                        arch, cm < codegen_count).field_width::u64;
+                if (rstart < end::u64 && rend > start::u64
+                    && (rstart < start::u64 || rend > end::u64)) {
+                    safe = false;
+                }
+            }
+            ri = ri + 1;
+        }
+
+        # a surviving relocation through a local/section anchor (or through the
+        # actual winning global) must not span the removed interval: the target
+        # symbol is remapped but its raw addend is not.
+        val candidate_flat: u32 = sec_base[cm] + sym.section;
+        var ref_i: u32 = atom_reloc_ref_lower(refs, reloc_total, candidate_flat);
+        for (safe && ref_i < reloc_total
+            && refs[ref_i].target_section == candidate_flat) {
+            val rm: u32 = refs[ref_i].source_module;
+            val rx: u32 = refs[ref_i].reloc;
+            if (atom_reloc_crosses_candidate(modules, ?refs[ref_i],
+                ?modules[rm].relocations[rx], cm, sym.section, start, end)) {
+                safe = false;
+            }
+            ref_i = ref_i + 1;
+        }
+        if (safe) {
+            drops[drop_count].section = sec_base[cm] + sym.section;
+            drops[drop_count].start = start;
+            drops[drop_count].end = end;
+            drops[drop_count].resume = 0;
+            drop_count = drop_count + 1;
+        }
+        ci = ci + 1;
+    }
+    map.dnit[intern.StrId, AtomWinner](?winners);
+    if (refs != nil) { A.deallocate[AtomRelocRef](s.alloc, refs, reloc_total::usize); }
+    A.deallocate[AtomCandidate](s.alloc, candidates, symbol_total::usize);
+
+    if (drop_count == 0) {
+        A.deallocate[AtomDrop](s.alloc, drops, candidate_count::usize);
+        ret R.ok[bool, str](true);
+    }
+
+    sort.sort[AtomDrop](drops, drop_count::usize, atom_drop_cmp);
+
+    # Merge adjacent/overlapping losing functions before alignment is restored,
+    # so no padding is inserted between two bytes ranges that both disappear.
+    var merged_count: u32 = 0;
+    var di: u32 = 0;
+    for (di < drop_count) {
+        if (merged_count > 0
+            && drops[merged_count - 1].section == drops[di].section
+            && drops[di].start <= drops[merged_count - 1].end) {
+            if (drops[di].end > drops[merged_count - 1].end) {
+                drops[merged_count - 1].end = drops[di].end;
+            }
+        }
+        or {
+            drops[merged_count] = drops[di];
+            merged_count = merged_count + 1;
+        }
+        di = di + 1;
+    }
+
+    val sr: R.Result[*AtomSection, str] =
+        A.zallocate[AtomSection](s.alloc, sec_total::usize);
+    if (R.is_err[*AtomSection, str](sr)) {
+        A.deallocate[AtomDrop](s.alloc, drops, candidate_count::usize);
+        ret R.err[bool, str](R.unwrap_err[*AtomSection, str](sr));
+    }
+    val sections: *AtomSection = R.unwrap_ok[*AtomSection, str](sr);
+
+    di = 0;
+    var flat: u32 = 0;
+    m = 0;
+    for (m < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            val sec: *of.Section = ?modules[m].sections[sc];
+            val meta: *AtomSection = ?sections[flat];
+            meta.first = di;
+            var src_cursor: u32 = 0;
+            var dst_cursor: u32 = 0;
+            for (di < merged_count && drops[di].section == flat) {
+                dst_cursor = dst_cursor + (drops[di].start - src_cursor);
+                if (drops[di].end < sec.len) {
+                    dst_cursor =
+                        atom_resume_offset(dst_cursor, drops[di].end, sec.align);
+                }
+                drops[di].resume = dst_cursor;
+                src_cursor = drops[di].end;
+                di = di + 1;
+            }
+            meta.count = di - meta.first;
+            meta.live_len = dst_cursor + (sec.len - src_cursor);
+            flat = flat + 1;
+            sc = sc + 1;
+        }
+        m = m + 1;
+    }
+
+    plan.drops = drops;
+    plan.drop_count = merged_count;
+    plan.drop_cap = candidate_count;
+    plan.sections = sections;
+    plan.section_count = sec_total;
+    plan.removed_bytes = 0;
+    flat = 0;
+    m = 0;
+    for (m < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            plan.removed_bytes = plan.removed_bytes
+                + (modules[m].sections[sc].len - sections[flat].live_len)::u64;
+            flat = flat + 1;
+            sc = sc + 1;
+        }
+        m = m + 1;
+    }
+    plan.active = true;
+    ret R.ok[bool, str](true);
+}
+
 # whether the NUL-terminated string at `src[src_off..]` byte-equals the one at
 # `ded[ded_off..]`, both bounded by their buffer lengths. the load-bearing guard on the
 # `.debug_str` dedup remap (#1708): a wrong-but-valid strp offset is invisible to
@@ -1566,7 +2347,8 @@ fun total_sections(modules: *of.ObjectImage, module_count: u32) u32 {
 # ret:          ok(true) on success, or an error string
 fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
                         merged: *MergedSection, debug_names: *intern.StrId, debug_count: u32,
-                        placements: *Placement, sec_base: *u32, strm: *StrMerge) R.Result[bool, str] {
+                        placements: *Placement, sec_base: *u32, strm: *StrMerge,
+                        atoms: *AtomPlan) R.Result[bool, str] {
     # .debug_abbrev is byte-identical across every module (a deterministic, complete
     # build_abbrev) and every CU references it at offset 0, so only the first copy is
     # ever read. dedup it: a later object's table shares the first at offset 0 and adds
@@ -1642,7 +2424,8 @@ fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_co
                 # rejected rather than wrapping the u32 length into a tiny value that
                 # later truncates the output.
                 val off64: u64 = bin.align_up_u64(merged[ki].len::u64, a::u64);
-                val newlen: u64 = off64 + sec.len::u64;
+                val contribution_len: u32 = atom_live_len(atoms, flat, sec.len);
+                val newlen: u64 = off64 + contribution_len::u64;
                 if (newlen > 0xFFFFFFFF) {
                     ret R.err[bool, str](named_message(s, "linker: merged section '", merged_section_name(s, sec.kind), "' exceeds the 4 GiB u32 limit", "linker: merged section size exceeds the 4 GiB u32 limit"));
                 }
@@ -1661,6 +2444,88 @@ fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_co
         m = m + 1;
     }
     ret R.ok[bool, str](true);
+}
+
+# reorder the merged `.text` so the entry symbol's input section leads, for a flat
+# image whose entry must sit at the image base
+#
+# A flat (raw) image carries no entry record: execution begins at the image base,
+# so the entry symbol must land at offset 0 of the merged `.text` (the lowest-vaddr
+# section). `accumulate_sections` lays the input text sections out in link order,
+# so a module linked before the entry-defining one displaces the entry and the raw
+# writer rejects the image (#2409). This restacks the SK_TEXT placements - the
+# entry-defining section first, every other text section after it in its original
+# (stable) order - and updates the merged text length, mirroring the align/liveness
+# math `accumulate_sections` uses. Only `.text` offsets change; every downstream
+# reader (vaddr finalization, symbol carry, byte copy, relocation patching) reads
+# `placements[].offset`, so the reorder needs no other change.
+#
+# The entry symbol must still be the first function in its own defining section (a
+# runtime contract); this removes the cross-module link-order dependency, not the
+# intra-section one. A no-op when no defined text symbol carries the entry name (the
+# emit path reports the missing entry) or when the entry section already leads.
+# ---
+# modules:      the input image array
+# module_count: number of input images
+# merged:       the merged accumulators; the SK_TEXT slot's length is rewritten
+# placements:   per-input-section placement; SK_TEXT offsets are rewritten in place
+# sec_base:     per-module prefix offset into `placements`
+# atoms:        the atom-liveness plan (per-section live contribution length)
+# entry_name:   the interned OS entry symbol name
+fun reorder_flat_entry_first(modules: *of.ObjectImage, module_count: u32,
+                             merged: *MergedSection, placements: *Placement, sec_base: *u32,
+                             atoms: *AtomPlan, entry_name: intern.StrId) {
+    # locate the flat index of the input SK_TEXT section that defines the entry
+    # symbol. a later definition wins, matching the symbol table's last-writer view.
+    var entry_flat: u32 = 0xFFFFFFFF;
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (sym.name == entry_name && sym.section != of.SECTION_EXTERNAL
+                && sym.section < modules[m].section_count
+                && modules[m].sections[sym.section].kind == of.SK_TEXT) {
+                entry_flat = sec_base[m] + sym.section;
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    if (entry_flat == 0xFFFFFFFF) { ret; }
+
+    val text_slot: u32 = of.SK_TEXT::u32;
+
+    # relay every SK_TEXT section in two passes - the entry section, then the rest in
+    # original order - recomputing each offset exactly as accumulate_sections does
+    # (align the running length up to the section's alignment, add its live
+    # contribution). the running length becomes the merged text slot's new length.
+    var run: u64 = 0;
+    var pass: u32 = 0;
+    for (pass < 2) {
+        m = 0;
+        for (m < module_count) {
+            var sc: u32 = 0;
+            for (sc < modules[m].section_count) {
+                val flat: u32 = sec_base[m] + sc;
+                if (placements[flat].merged_index == text_slot) {
+                    val is_entry: bool = flat == entry_flat;
+                    if ((pass == 0 && is_entry) || (pass == 1 && !is_entry)) {
+                        var a: u32 = modules[m].sections[sc].align;
+                        if (a == 0) { a = 1; }
+                        run = bin.align_up_u64(run, a::u64);
+                        placements[flat].offset = run::u32;
+                        run = run + atom_live_len(atoms, flat, modules[m].sections[sc].len)::u64;
+                    }
+                }
+                sc = sc + 1;
+            }
+            m = m + 1;
+        }
+        pass = pass + 1;
+    }
+
+    merged[text_slot].len = run::u32;
 }
 
 # give each used merged section a base virtual address,
@@ -1732,7 +2597,8 @@ fun finalize_placement_vaddrs(merged: *MergedSection, placements: *Placement, se
 # ret:          ok(true) on success, or an error string
 fun collect_symbols(s: *session.Session, modules: *of.ObjectImage, module_count: u32,
                     placements: *Placement, sec_base: *u32,
-                    sym_locs: *map.Map[intern.StrId, SymbolLoc], have_vaddrs: bool) R.Result[bool, str] {
+                    sym_locs: *map.Map[intern.StrId, SymbolLoc], have_vaddrs: bool,
+                    atoms: *AtomPlan) R.Result[bool, str] {
     var m: u32 = 0;
     for (m < module_count) {
         var sy: u32 = 0;
@@ -1748,11 +2614,14 @@ fun collect_symbols(s: *session.Session, modules: *of.ObjectImage, module_count:
             if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { sy = sy + 1; cnt; }
 
             val flat: u32 = sec_base[m] + sym.section;
+            if (atom_offset_dead(atoms, flat, sym.offset)) { sy = sy + 1; cnt; }
             val pl: *Placement = ?placements[flat];
 
             val is_weak: bool = (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0;
             var vaddr: u64 = 0;
-            if (have_vaddrs) { vaddr = pl.vaddr + sym.offset::u64; }
+            if (have_vaddrs) {
+                vaddr = pl.vaddr + atom_live_offset(atoms, flat, sym.offset)::u64;
+            }
 
             val existing: R.Result[*SymbolLoc, str] =
                 map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name);
@@ -1808,7 +2677,8 @@ fun collect_symbols(s: *session.Session, modules: *of.ObjectImage, module_count:
 fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
                        modules: *of.ObjectImage, module_count: u32,
                        merged: *MergedSection, merged_count: u32, placements: *Placement, sec_base: *u32,
-                       merged_to_out: *u32, strm: *StrMerge) R.Result[bool, str] {
+                       merged_to_out: *u32, strm: *StrMerge,
+                       atoms: *AtomPlan) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
 
     # map each used merged slot to its output-section index so symbols/relocations
@@ -1871,7 +2741,9 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
 
             val dst: *u8 = out_img.sections[out_ix].bytes;
             val off: u32 = placements[flat].offset;
-            memory.copy[u8](?dst[off], src.bytes, src.len::usize);
+            if (atom_live_len(atoms, flat, src.len) > 0) {
+                copy_live_section(?dst[off], src.bytes, src.len, atoms, flat);
+            }
 
             sc = sc + 1;
         }
@@ -1892,6 +2764,7 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
             }
 
             val flat: u32 = sec_base[m] + isym.section;
+            if (atom_offset_dead(atoms, flat, isym.offset)) { sy = sy + 1; cnt; }
             val ki: u32 = placements[flat].merged_index;
             val out_ix: u32 = merged_to_out[ki];
             if (out_ix == 0xFFFFFFFF) { sy = sy + 1; cnt; }
@@ -1899,7 +2772,8 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
             var osym: of.Symbol;
             osym.name    = isym.name;
             osym.section = out_ix;
-            osym.offset  = placements[flat].offset + isym.offset;
+            osym.offset  = placements[flat].offset
+                + atom_live_offset(atoms, flat, isym.offset);
             osym.size    = isym.size;
             osym.flags   = isym.flags;
 
@@ -1932,6 +2806,7 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
 # out_img:      the merged image whose section bytes are patched in place
 # modules:      the input image array (source of the relocations)
 # module_count: number of input images
+# codegen_count: number of leading in-memory compiler images; the rest were parsed
 # placements:    per-input-section placement (merged index + offset + vaddr)
 # sec_base:      per-module prefix offset into `placements`
 # merged_to_out: per-merged-slot output-section index (from build_merged_image)
@@ -1941,10 +2816,11 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
 # arch:          active instruction-set vtable, owning the relocation packer
 # ret:           ok(true) on success, or an error string
 fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
-                     modules: *of.ObjectImage, module_count: u32,
+                     modules: *of.ObjectImage, module_count: u32, codegen_count: u32,
                      placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                      sym_locs: *map.Map[intern.StrId, SymbolLoc],
-                     dyn: *DynState, strm: *StrMerge, arch: *isa.IsaVTable) R.Result[bool, str] {
+                     dyn: *DynState, strm: *StrMerge, arch: *isa.IsaVTable,
+                     atoms: *AtomPlan) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
 
     var m: u32 = 0;
@@ -1956,14 +2832,16 @@ fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
         # module's relocations are patched, regardless of outcome.
         var local_map: map.Map[intern.StrId, u64] =
             map.init[intern.StrId, u64](alloc, map.hash_u32, map.eq_u32);
-        val br: R.Result[bool, str] = build_local_index(modules, m, placements, sec_base, ?local_map);
+        val br: R.Result[bool, str] =
+            build_local_index(modules, m, placements, sec_base, ?local_map, atoms);
         if (R.is_err[bool, str](br)) {
             map.dnit[intern.StrId, u64](?local_map);
             ret R.err[bool, str](R.unwrap_err[bool, str](br));
         }
 
         val pr: R.Result[bool, str] = patch_module_relocations(s, out_img, modules, m,
-            placements, sec_base, merged_to_out, sym_locs, dyn, ?local_map, strm, arch);
+            placements, sec_base, merged_to_out, sym_locs, dyn, ?local_map, strm,
+            arch, m < codegen_count, atoms);
         map.dnit[intern.StrId, u64](?local_map);
         if (R.is_err[bool, str](pr)) { ret R.err[bool, str](R.unwrap_err[bool, str](pr)); }
 
@@ -1984,7 +2862,8 @@ fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
 # out:        out - the local-name -> virtual-address index to fill
 # ret:        ok(true) on success, or an error string
 fun build_local_index(modules: *of.ObjectImage, m: u32, placements: *Placement, sec_base: *u32,
-                      out: *map.Map[intern.StrId, u64]) R.Result[bool, str] {
+                      out: *map.Map[intern.StrId, u64],
+                      atoms: *AtomPlan) R.Result[bool, str] {
     var sy: u32 = 0;
     for (sy < modules[m].symbol_count) {
         val sym: *of.Symbol = ?modules[m].symbols[sy];
@@ -1994,7 +2873,9 @@ fun build_local_index(modules: *of.ObjectImage, m: u32, placements: *Placement, 
 
         if (R.is_err[*u64, str](map.get[intern.StrId, u64](out, ?sym.name))) {
             val flat: u32 = sec_base[m] + sym.section;
-            val va: u64 = placements[flat].vaddr + sym.offset::u64;
+            if (atom_offset_dead(atoms, flat, sym.offset)) { sy = sy + 1; cnt; }
+            val va: u64 = placements[flat].vaddr
+                + atom_live_offset(atoms, flat, sym.offset)::u64;
             val ins: R.Result[bool, str] = map.insert[intern.StrId, u64](out, sym.name, va);
             if (R.is_err[bool, str](ins)) { ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
         }
@@ -2020,13 +2901,15 @@ fun build_local_index(modules: *of.ObjectImage, m: u32, placements: *Placement, 
 # local_map:     module `m`'s LOCAL-name -> virtual-address index
 # strm:          the deduped .debug_str table, for strp remap (inactive to skip)
 # arch:          active instruction-set vtable, owning the relocation packer
+# codegen_image: true when module `m` is an in-memory compiler image
 # ret:           ok(true) on success, or an error string
 fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                              modules: *of.ObjectImage, m: u32,
                              placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                              sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState,
                              local_map: *map.Map[intern.StrId, u64], strm: *StrMerge,
-                             arch: *isa.IsaVTable) R.Result[bool, str] {
+                             arch: *isa.IsaVTable, codegen_image: bool,
+                             atoms: *AtomPlan) R.Result[bool, str] {
     # locate module m's .debug_str section and its anchor symbol once: a strp
     # relocation is exactly one whose target is that anchor. resolving it remaps the
     # string to its deduped offset rather than the concatenated placement (#1708).
@@ -2050,6 +2933,10 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
     var ri: u32 = 0;
     for (ri < modules[m].reloc_count) {
         val r: *of.Relocation = ?modules[m].relocations[ri];
+        if (arch == nil || arch.reloc == nil || arch.reloc.reloc_traits == nil
+            || arch.reloc.apply_reloc == nil) {
+            ret R.err[bool, str](unsupported_message(s, r.kind));
+        }
         # a corrupt object can name an out-of-range section, or an offset past the
         # end of its own section (which would wrap the u32 patch cursor and scribble
         # outside the merged buffer). reject both loudly instead of silently dropping
@@ -2057,7 +2944,10 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         if (r.section >= modules[m].section_count) {
             ret R.err[bool, str]("linker: relocation names an out-of-range section");
         }
-        if (r.offset > modules[m].sections[r.section].len) {
+        if (r.offset::u64
+            + atom_reloc_traits(r, ?modules[m].sections[r.section],
+                                arch, codegen_image).field_width::u64
+            > modules[m].sections[r.section].len::u64) {
             ret R.err[bool, str]("linker: relocation offset is past the end of its section");
         }
 
@@ -2065,8 +2955,13 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         # merged_index selects a merged slot (kind or debug-name); map it to the
         # output-section index the merge assigned.
         val flat: u32 = sec_base[m] + r.section;
+        # A relocation field wholly owned by a discarded function atom has no
+        # output patch site and must not retain its target through a PLT/GOT/base
+        # relocation side effect.
+        if (atom_offset_dead(atoms, flat, r.offset)) { ri = ri + 1; cnt; }
         val pl: *Placement = ?placements[flat];
-        val patch_va: u64 = pl.vaddr + r.offset::u64;
+        val live_off: u32 = atom_live_offset(atoms, flat, r.offset);
+        val patch_va: u64 = pl.vaddr + live_off::u64;
         val out_ix: u32 = merged_to_out[pl.merged_index];
         # a relocation in a section with no merged output, or one whose patch site
         # lands in a (byteless) BSS section, cannot be applied - that is a contract
@@ -2078,7 +2973,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         if (dst == nil) {
             ret R.err[bool, str]("linker: relocation patch site lands in a BSS section");
         }
-        val patch_off: u32 = pl.offset + r.offset;
+        val patch_off: u32 = pl.offset + live_off;
 
         # a strp into .debug_str: remap it to the string's deduped offset instead of
         # resolving the anchor's placement. skips the normal apply_one below (#1708).
@@ -2253,13 +3148,49 @@ fun free_dynstate(alloc: *A.Allocator, dyn: *DynState) {
     init_dynstate(dyn);
 }
 
-fun has_call_reloc(modules: *of.ObjectImage, module_count: u32, symbol_name: intern.StrId) bool {
+# whether a relocation's source field survives the atom plan. malformed section
+# references remain live here so relocation patching reports the input error
+fun reloc_source_live(modules: *of.ObjectImage, m: u32, r: *of.Relocation,
+                      sec_base: *u32, atoms: *AtomPlan) bool {
+    if (atoms == nil || !atoms.active) { ret true; }
+    if (r.section >= modules[m].section_count) { ret true; }
+    ret !atom_offset_dead(atoms, sec_base[m] + r.section, r.offset);
+}
+
+# an undefined name remains an import unless it is referenced exclusively from
+# discarded atoms. an unused declaration (no relocations at all) retains the
+# legacy import behavior
+fun import_symbol_live(modules: *of.ObjectImage, module_count: u32,
+                       symbol_name: intern.StrId, sec_base: *u32,
+                       atoms: *AtomPlan) bool {
+    if (atoms == nil || !atoms.active) { ret true; }
+    var saw: bool = false;
     var m: u32 = 0;
     for (m < module_count) {
         var ri: u32 = 0;
         for (ri < modules[m].reloc_count) {
             val r: *of.Relocation = ?modules[m].relocations[ri];
-            if (r.symbol == symbol_name && is_call_kind(r.kind)) {
+            if (r.symbol == symbol_name) {
+                saw = true;
+                if (reloc_source_live(modules, m, r, sec_base, atoms)) { ret true; }
+            }
+            ri = ri + 1;
+        }
+        m = m + 1;
+    }
+    ret !saw;
+}
+
+fun has_call_reloc(modules: *of.ObjectImage, module_count: u32,
+                   symbol_name: intern.StrId, sec_base: *u32,
+                   atoms: *AtomPlan) bool {
+    var m: u32 = 0;
+    for (m < module_count) {
+        var ri: u32 = 0;
+        for (ri < modules[m].reloc_count) {
+            val r: *of.Relocation = ?modules[m].relocations[ri];
+            if (r.symbol == symbol_name && is_call_kind(r.kind)
+                && reloc_source_live(modules, m, r, sec_base, atoms)) {
                 ret true;
             }
             ri = ri + 1;
@@ -2272,18 +3203,17 @@ fun has_call_reloc(modules: *of.ObjectImage, module_count: u32, symbol_name: int
 # assemble the dynamic-link plan from the shared dependencies
 # and the undefined `ext` symbols left after symbol merging
 #
-# every soname becomes a `DynLib` (a DT_NEEDED dependency, in input order). every
-# global `ext` symbol that no input object defines (not in `sym_locs`) becomes a
-# function `DynImport`, deduplicated by name through `import_map`; a relocation
-# targeting it is later bound to its PLT stub. an import is pinned to a specific
-# dependency when a `$<sym>.library` directive attributed it (the session's
-# `import_library` map, keyed by the import's link name); otherwise it stays
-# `DYNLIB_ANY` and the loader's global search resolves it (on PE: the first
-# dependency). a directive naming a library not among the link's dependencies is
-# a hard link error rather than a silent fallback. the interpreter path comes from
-# the OS vtable - a real loader path for ELF (PT_INTERP), or STR_NIL for a format
-# that embeds the loader differently (PE's import directory, Mach-O's dyld bind),
-# which the writer ignores.
+# every distinct loader name becomes a `DynLib` dependency in first-seen order;
+# additional logical aliases map to that same emitted index. every global `ext`
+# symbol that no input object defines (not in `sym_locs`) becomes a function
+# `DynImport`, deduplicated by name through `import_map`; a relocation targeting
+# it is later bound to its PLT stub. an import is pinned when `#[library]`
+# attributed it (the session's `import_library` map, keyed by the import's link
+# name). otherwise it stays `DYNLIB_ANY` on a global-search format and is rejected
+# on a two-level format. an attribution naming no dependency is a hard link error.
+# the interpreter path comes from the OS vtable - a real loader path for ELF
+# (PT_INTERP), or STR_NIL for a format that embeds the loader differently (PE's
+# import directory, Mach-O's dyld bind), which the writer ignores.
 # ---
 # s:            shared session (allocator, interner, import-library directives)
 # tgt:          active target - supplies the OS dynamic-linker path
@@ -2291,13 +3221,14 @@ fun has_call_reloc(modules: *of.ObjectImage, module_count: u32, symbol_name: int
 # modules:      the input image array (source of the undefined externs)
 # module_count: number of input images
 # sym_locs:     the global symbol table; a name found here is not an import
-# sonames:      interned shared-library sonames to depend on
-# soname_count: number of shared-library dependencies
+# dynlibs:      logical names and loader names of dynamic dependencies
+# dynlib_count: number of dynamic dependencies
 # ret:          ok(true) on success, or an error string
 fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
                        modules: *of.ObjectImage, module_count: u32,
                        sym_locs: *map.Map[intern.StrId, SymbolLoc],
-                       sonames: *intern.StrId, soname_count: u32) R.Result[bool, str] {
+                       dynlibs: *of.DynLib, dynlib_count: u32,
+                       sec_base: *u32, atoms: *AtomPlan) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
 
     # the interpreter path is the OS's run-time loader recorded into a PT_INTERP
@@ -2314,7 +3245,7 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
 
     # a PIE image implicitly links the OS platform library (darwin libSystem): a
     # dyld-loaded executable that names no LC_LOAD_DYLIB is rejected, so it is
-    # recorded as a trailing dependency after the manifest sonames.
+    # recorded as a trailing dependency after the manifest dependencies.
     var implicit: u32 = 0;
     var implicit_soname: intern.StrId = intern.STR_NIL;
     if (dyn.info.pie && !str_empty(tgt.os.platform_lib)) {
@@ -2324,18 +3255,66 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
         implicit = 1;
     }
 
-    # one DynLib per soname, in input order, then the implicit platform library.
-    val total_libs: u32 = soname_count + implicit;
+    # treat the implicit platform library as part of the same identity set used
+    # for validation and import attribution. Otherwise an explicit dependency
+    # could claim libSystem's loader name as its logical alias and capture an
+    # import before the implicit dependency was appended.
+    if (implicit == 1 && dynlib_soname_present(dynlibs, dynlib_count, implicit_soname)) {
+        implicit = 0;
+    }
+    var implicit_lib: of.DynLib;
+    var implicit_ptr: *of.DynLib = nil::*of.DynLib;
+    if (implicit == 1) {
+        implicit_lib.name = implicit_soname;
+        implicit_lib.soname = implicit_soname;
+        implicit_lib.rpath = intern.STR_NIL;
+        implicit_ptr = ?implicit_lib;
+    }
+    var collision_first: intern.StrId = intern.STR_NIL;
+    var collision_second: intern.StrId = intern.STR_NIL;
+    var collision_identity: intern.StrId = intern.STR_NIL;
+    if (dynlib_identity_collision(dynlibs, dynlib_count, implicit_ptr,
+                                  ?collision_first, ?collision_second,
+                                  ?collision_identity)) {
+        ret R.err[bool, str](dynlib_identity_conflict_message(
+            s, collision_identity, collision_first, collision_second));
+    }
+
+    # Emit each canonical loader dependency once even when several logical names
+    # alias it. Attribution below maps every alias back to this compact index.
+    val explicit_libs: u32 = unique_dynlib_count(dynlibs, dynlib_count);
+    val total_libs: u32 = explicit_libs + implicit;
     if (total_libs > 0) {
         val lr: R.Result[*of.DynLib, str] = A.zallocate[of.DynLib](alloc, total_libs::usize);
         if (R.is_err[*of.DynLib, str](lr)) { ret R.err[bool, str](R.unwrap_err[*of.DynLib, str](lr)); }
         dyn.info.libs = R.unwrap_ok[*of.DynLib, str](lr);
         var i: u32 = 0;
-        for (i < soname_count) {
-            dyn.info.libs[i].soname = sonames[i];
+        var w: u32 = 0;
+        for (i < dynlib_count) {
+            if (!dynlib_soname_seen_before(dynlibs, i, dynlibs[i].soname)) {
+                dyn.info.libs[w] = dynlibs[i];
+                # aliases of one loader compact to one emitted dependency. retain
+                # the first available run path even if the first alias had none.
+                if (dyn.info.libs[w].rpath == intern.STR_NIL) {
+                    var j: u32 = i + 1;
+                    for (j < dynlib_count) {
+                        if (dynlibs[j].soname == dynlibs[i].soname
+                            && dynlibs[j].rpath != intern.STR_NIL) {
+                            dyn.info.libs[w].rpath = dynlibs[j].rpath;
+                            brk;
+                        }
+                        j = j + 1;
+                    }
+                }
+                w = w + 1;
+            }
             i = i + 1;
         }
-        if (implicit == 1) { dyn.info.libs[soname_count].soname = implicit_soname; }
+        if (implicit == 1) {
+            dyn.info.libs[explicit_libs].name   = implicit_soname;
+            dyn.info.libs[explicit_libs].soname = implicit_soname;
+            dyn.info.libs[explicit_libs].rpath  = intern.STR_NIL;
+        }
         dyn.info.lib_count = total_libs;
     }
 
@@ -2353,6 +3332,7 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             val sym: *of.Symbol = ?modules[m].symbols[sy];
             if (!is_undefined_extern(sym))                                                       { sy = sy + 1; cnt; }
             if (R.is_ok[*SymbolLoc, str](map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name))) { sy = sy + 1; cnt; }
+            if (!import_symbol_live(modules, module_count, sym.name, sec_base, atoms))            { sy = sy + 1; cnt; }
             if (R.is_ok[*u32, str](map.get[intern.StrId, u32](?seen, ?sym.name)))                { sy = sy + 1; cnt; }
             val ins: R.Result[bool, str] = map.insert[intern.StrId, u32](?seen, sym.name, n_imports);
             if (R.is_err[bool, str](ins)) { map.dnit[intern.StrId, u32](?seen); ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
@@ -2377,11 +3357,12 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             val sym: *of.Symbol = ?modules[m].symbols[sy];
             if (!is_undefined_extern(sym))                                                       { sy = sy + 1; cnt; }
             if (R.is_ok[*SymbolLoc, str](map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name))) { sy = sy + 1; cnt; }
+            if (!import_symbol_live(modules, module_count, sym.name, sec_base, atoms))            { sy = sy + 1; cnt; }
             if (R.is_ok[*u32, str](map.get[intern.StrId, u32](?dyn.import_map, ?sym.name)))      { sy = sy + 1; cnt; }
 
             val idx: u32 = dyn.info.import_count;
             dyn.info.imports[idx].symbol    = sym.name;
-            # pin the import to the library a `$<sym>.library` directive named, when
+            # pin the import to the library its `#[library]` attribution named, when
             # present. a directive naming a library not among this link's
             # dependencies is a hard error. an unattributed import stays DYNLIB_ANY
             # on a flat-namespace format (ELF), but is a hard error on a two-level
@@ -2390,12 +3371,13 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             val lib_opt: O.Option[intern.StrId] = session.import_library(s, sym.name);
             if (O.is_some[intern.StrId](lib_opt)) {
                 val want: intern.StrId = O.unwrap[intern.StrId](lib_opt);
-                val li_opt: O.Option[u32] = soname_index_of(sonames, soname_count, want);
+                val li_opt: O.Option[u32] =
+                    dynlib_index_of(dynlibs, dynlib_count, implicit_ptr, want);
                 if (!O.is_some[u32](li_opt)) { ret R.err[bool, str](pinned_lib_message(s, sym.name, want)); }
                 dyn.info.imports[idx].lib_index = O.unwrap[u32](li_opt);
             }
             or (tgt.of.two_level_namespace) {
-                ret R.err[bool, str](unattributed_import_message(s, sym.name, sonames, soname_count));
+                ret R.err[bool, str](unattributed_import_message(s, sym.name, dynlibs, dynlib_count));
             }
             or {
                 dyn.info.imports[idx].lib_index = of.DYNLIB_ANY;
@@ -2404,7 +3386,9 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             # flag) is recorded but not yet bound - its abs reference still hits
             # the undefined-symbol error in patch_relocations, since data imports
             # (GLOB_DAT) are deferred.
-            dyn.info.imports[idx].is_func   = ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0) || has_call_reloc(modules, module_count, sym.name);
+            dyn.info.imports[idx].is_func   =
+                ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0)
+                || has_call_reloc(modules, module_count, sym.name, sec_base, atoms);
             val ins: R.Result[bool, str] = map.insert[intern.StrId, u32](?dyn.import_map, sym.name, idx);
             if (R.is_err[bool, str](ins)) { ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
             dyn.info.import_count = idx + 1;
@@ -2416,21 +3400,135 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
     ret R.ok[bool, str](true);
 }
 
-# the index of `lib` in the dependency soname list, or none when
-# no dependency carries that name. names are interned in the session, so equal
-# names share a StrId and the match is an identity comparison
+# the emitted dependency index of `lib`, or none when no dependency carries that
+# logical name or loader name. aliases sharing one loader name map to the same
+# compact index. names are interned in the session, so matching is by identity
 # ---
-# sonames:      the dependency soname list
-# soname_count: number of dependencies
+# dynlibs:      the explicit dependency logical and loader names
+# dynlib_count: number of explicit dependencies
+# implicit:     optional trailing platform dependency
 # lib:          the interned library name to find
 # ret:          the dependency index, or none when no dependency carries that name
-fun soname_index_of(sonames: *intern.StrId, soname_count: u32, lib: intern.StrId) O.Option[u32] {
+fun dynlib_index_of(dynlibs: *of.DynLib, dynlib_count: u32,
+                    implicit: *of.DynLib, lib: intern.StrId) O.Option[u32] {
     var i: u32 = 0;
-    for (i < soname_count) {
-        if (sonames[i] == lib) { ret O.some[u32](i); }
+    for (i < dynlib_count) {
+        if (dynlibs[i].name == lib || dynlibs[i].soname == lib) {
+            var index: u32 = 0;
+            var j: u32 = 0;
+            for (j < dynlib_count) {
+                if (!dynlib_soname_seen_before(dynlibs, j, dynlibs[j].soname)) {
+                    if (dynlibs[j].soname == dynlibs[i].soname) {
+                        ret O.some[u32](index);
+                    }
+                    index = index + 1;
+                }
+                j = j + 1;
+            }
+        }
         i = i + 1;
     }
+    if (implicit != nil && (implicit.name == lib || implicit.soname == lib)) {
+        ret O.some[u32](unique_dynlib_count(dynlibs, dynlib_count));
+    }
     ret O.none[u32]();
+}
+
+# whether two dynamic dependencies share an identity but not a loader
+fun dynlib_identity_pair(a: *of.DynLib, b: *of.DynLib,
+                         identity: *intern.StrId) bool {
+    if (a.soname == b.soname) { ret false; }
+    if (a.name == b.name || a.name == b.soname) {
+        @identity = a.name;
+        ret true;
+    }
+    if (a.soname == b.name) {
+        @identity = a.soname;
+        ret true;
+    }
+    ret false;
+}
+
+# find an identity that names two distinct loader dependencies
+#
+# a `#[library]` value may match either a logical name or an exact loader name.
+# those namespaces may overlap only when both spellings identify the same loader;
+# otherwise attribution would depend on requirement order. the optional implicit
+# dependency participates in the same namespace as explicit requirements.
+fun dynlib_identity_collision(dynlibs: *of.DynLib, count: u32,
+                              implicit: *of.DynLib,
+                              first: *intern.StrId, second: *intern.StrId,
+                              identity: *intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        var j: u32 = i + 1;
+        for (j < count) {
+            if (dynlib_identity_pair(?dynlibs[i], ?dynlibs[j], identity)) {
+                @first = dynlibs[i].soname;
+                @second = dynlibs[j].soname;
+                ret true;
+            }
+            j = j + 1;
+        }
+        if (implicit != nil && dynlib_identity_pair(?dynlibs[i], implicit, identity)) {
+            @first = dynlibs[i].soname;
+            @second = implicit.soname;
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# render a cross-namespace dynamic dependency collision
+fun dynlib_identity_conflict_message(s: *session.Session, identity: intern.StrId,
+                                     first: intern.StrId, second: intern.StrId) str {
+    val n: O.Option[str] = intern.lookup(?s.interner, identity);
+    val a: O.Option[str] = intern.lookup(?s.interner, first);
+    val b: O.Option[str] = intern.lookup(?s.interner, second);
+    if (!O.is_some[str](n) || !O.is_some[str](a) || !O.is_some[str](b)) {
+        ret "one link library identity names multiple loader dependencies";
+    }
+    val fallback: str = "one link library identity names multiple loader dependencies";
+    val head: str = join3(s, "link library identity '", O.unwrap[str](n),
+        "' names both loader dependencies '", fallback);
+    val middle: str = join3(s, head, O.unwrap[str](a), "' and '", fallback);
+    ret join3(s, middle, O.unwrap[str](b), "'", fallback);
+}
+
+# whether `soname` appeared before index `end`
+fun dynlib_soname_seen_before(dynlibs: *of.DynLib, end: u32,
+                              soname: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < end) {
+        if (dynlibs[i].soname == soname) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# whether the dependency requirements contain a canonical loader name
+fun dynlib_soname_present(dynlibs: *of.DynLib, count: u32,
+                          soname: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        if (dynlibs[i].soname == soname) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# number of distinct canonical loader dependencies in the requirement list
+fun unique_dynlib_count(dynlibs: *of.DynLib, count: u32) u32 {
+    var unique: u32 = 0;
+    var i: u32 = 0;
+    for (i < count) {
+        if (!dynlib_soname_seen_before(dynlibs, i, dynlibs[i].soname)) {
+            unique = unique + 1;
+        }
+        i = i + 1;
+    }
+    ret unique;
 }
 
 # whether an object symbol is an undefined external - a
@@ -2737,14 +3835,16 @@ fun image_name(modules: *of.ObjectImage, module_count: u32) intern.StrId {
     ret modules[0].name;
 }
 
-# the base virtual address for the active OS's executables, read
-# from the OS vtable (`tgt.os.base_addr`). the loader parameters belong to the OS
-# layer, so the linker never branches on the numeric os id. `link` validates
-# `tgt.os != nil` before any vaddr assignment, so the vtable is always present
+# the base virtual address for the active target's executables. a per-target
+# manifest `base` override (nonzero `tgt.base`) wins; otherwise the OS vtable's
+# `base_addr` applies. the loader parameters belong to the OS layer, so the linker
+# never branches on the numeric os id. `link` validates `tgt.os != nil` before any
+# vaddr assignment, so the vtable is always present
 # ---
-# tgt: active target - supplies the OS base address
-# ret: the base virtual address for the OS's executables
+# tgt: active target - supplies the base override and the OS base address
+# ret: the base virtual address for the target's executables
 fun os_base_addr(tgt: *target.Target) u64 {
+    if (tgt.base != 0) { ret tgt.base; }
     ret tgt.os.base_addr;
 }
 
@@ -2850,16 +3950,16 @@ fun pinned_lib_message(s: *session.Session, sym_name: intern.StrId, lib: intern.
 # build the diagnostic for a dynamic import with no `#[library]` attribution on a
 # two-level-namespace format (PE, Mach-O), where the image must name a providing
 # library per import. names the symbol, points at `#[library]`, and lists the
-# link's dependency sonames as the candidate libraries to attribute to. degrades
+# link's logical dependency names as candidate libraries to attribute to. degrades
 # to a symbol-less form when the name cannot be resolved
 # ---
 # s:            shared session holding the interner
 # sym_name:     interned name of the unattributed import
-# sonames:      the link's dependency soname list (candidate libraries)
-# soname_count: number of dependencies
+# dynlibs:      the link's dynamic dependencies
+# dynlib_count: number of dependencies
 # ret:          the diagnostic string
 fun unattributed_import_message(s: *session.Session, sym_name: intern.StrId,
-                                sonames: *intern.StrId, soname_count: u32) str {
+                                dynlibs: *of.DynLib, dynlib_count: u32) str {
     val sno: O.Option[str] = intern.lookup(?s.interner, sym_name);
     if (!O.is_some[str](sno)) {
         ret "dynamic import has no #[library] attribution; a two-level-namespace target requires every import to name its providing library with #[library(\"...\")]";
@@ -2867,26 +3967,35 @@ fun unattributed_import_message(s: *session.Session, sym_name: intern.StrId,
     val head: str = join3(s, "dynamic import '", O.unwrap[str](sno),
         "' has no #[library] attribution; a two-level-namespace target requires every import to name its providing library - annotate the declaration with #[library(\"...\")]",
         "dynamic import has no #[library] attribution");
-    val cands: str = join_sonames(s, sonames, soname_count);
+    val cands: str = join_dynlibs(s, dynlibs, dynlib_count);
     if (str_len(cands) == 0) { ret head; }
     val pre: str = join2(s, head, "; candidate libraries: ", head);
     ret join2(s, pre, cands, pre);
 }
 
-# join a link's dependency sonames into a "a, b, c" list for a diagnostic. an
-# unresolvable name is skipped; the empty list yields the empty string
+# join a link's dynamic dependencies into a "name (loader), ..." list for a
+# diagnostic. an unresolvable name is skipped; the empty list yields the empty
+# string. dependencies whose logical and loader names match display only once
 # ---
 # s:            shared session (allocator, interner)
-# sonames:      the dependency soname list
-# soname_count: number of dependencies
-# ret:          the comma-separated soname list, or "" when none resolve
-fun join_sonames(s: *session.Session, sonames: *intern.StrId, soname_count: u32) str {
+# dynlibs:      the dynamic dependencies
+# dynlib_count: number of dependencies
+# ret:          the comma-separated dependency list, or "" when none resolve
+fun join_dynlibs(s: *session.Session, dynlibs: *of.DynLib, dynlib_count: u32) str {
     var acc: str = "";
     var i: u32 = 0;
-    for (i < soname_count) {
-        val nm: O.Option[str] = intern.lookup(?s.interner, sonames[i]);
+    for (i < dynlib_count) {
+        val nm: O.Option[str] = intern.lookup(?s.interner, dynlibs[i].name);
         if (!O.is_some[str](nm)) { i = i + 1; cnt; }
-        val piece: str = O.unwrap[str](nm);
+        var piece: str = O.unwrap[str](nm);
+        if (dynlibs[i].soname != dynlibs[i].name) {
+            val so: O.Option[str] = intern.lookup(?s.interner, dynlibs[i].soname);
+            if (O.is_some[str](so)) {
+                val pre: str = join2(s, piece, " (", piece);
+                piece = join2(s, pre, O.unwrap[str](so), pre);
+                piece = join2(s, piece, ")", piece);
+            }
+        }
         if (str_len(acc) == 0) { acc = piece; }
         or {
             val sep: str = join2(s, acc, ", ", acc);
@@ -3051,11 +4160,12 @@ fun free_placements(alloc: *A.Allocator, placements: *Placement, sec_total: u32)
 # debug_count:   length of the debug-name array
 # merged_to_out: the merged-slot -> output-section map to release (may be nil)
 # strm:          the deduped .debug_str table to release (may be nil)
+# atoms:         the transient final-link atom plan to release (may be nil)
 fun free_scratch(alloc: *A.Allocator, placements: *Placement, sec_total: u32,
                 sec_base: *u32, module_count: u32,
                 merged: *MergedSection, merged_count: u32,
                 debug_names: *intern.StrId, debug_count: u32,
-                merged_to_out: *u32, strm: *StrMerge) {
+                merged_to_out: *u32, strm: *StrMerge, atoms: *AtomPlan) {
     free_placements(alloc, placements, sec_total);
     if (sec_base != nil && module_count > 0) {
         A.deallocate[u32](alloc, sec_base, module_count::usize);
@@ -3070,6 +4180,7 @@ fun free_scratch(alloc: *A.Allocator, placements: *Placement, sec_total: u32,
         A.deallocate[u32](alloc, merged_to_out, merged_count::usize);
     }
     free_str_merge(strm);
+    free_atom_plan(alloc, atoms);
 }
 
 # tear down every parsed input image and release the image array.
@@ -3128,7 +4239,9 @@ fun lt_link(s: *session.Session, name: intern.StrId, a: *of.Symbol, b: *of.Symbo
 
     var locs: map.Map[intern.StrId, SymbolLoc] =
         map.init[intern.StrId, SymbolLoc](s.alloc, map.hash_u32, map.eq_u32);
-    val cr: R.Result[bool, str] = collect_symbols(s, ?mods[0], 2, ?placements[0], ?sec_base[0], ?locs, true);
+    val cr: R.Result[bool, str] =
+        collect_symbols(s, ?mods[0], 2, ?placements[0], ?sec_base[0],
+                        ?locs, true, nil::*AtomPlan);
     if (R.is_err[bool, str](cr)) {
         map.dnit[intern.StrId, SymbolLoc](?locs);
         ret R.err[u64, str](R.unwrap_err[bool, str](cr));
@@ -3141,6 +4254,260 @@ fun lt_link(s: *session.Session, name: intern.StrId, a: *of.Symbol, b: *of.Symbo
     val v: u64 = R.unwrap_ok[*SymbolLoc, str](g).vaddr;
     map.dnit[intern.StrId, SymbolLoc](?locs);
     ret R.ok[u64, str](v);
+}
+
+# intern a test symbol name, returning STR_NIL only on allocation failure
+fun lt_name(s: *session.Session, name: str) intern.StrId {
+    val r: R.Result[intern.StrId, str] = intern.intern(?s.interner, name);
+    if (R.is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+    ret R.unwrap_ok[intern.StrId, str](r);
+}
+
+# construct one test object image over borrowed section/symbol/relocation arrays
+fun lt_image(s: *session.Session, name: intern.StrId,
+             sections: *of.Section, section_count: u32,
+             symbols: *of.Symbol, symbol_count: u32,
+             relocations: *of.Relocation, reloc_count: u32) of.ObjectImage {
+    var img: of.ObjectImage;
+    img.alloc = s.alloc;
+    img.interner = ?s.interner;
+    img.name = name;
+    img.sections = sections;
+    img.section_count = section_count;
+    img.symbols = symbols;
+    img.symbol_count = symbol_count;
+    img.relocations = relocations;
+    img.reloc_count = reloc_count;
+    ret img;
+}
+
+# look up one production ISA vtable from a populated test registry
+fun lt_isa(reg: *target.TargetRegistry, name: str) *isa.IsaVTable {
+    val found: O.Option[*isa.IsaVTable] = isa.lookup(?reg.isa, name);
+    if (!O.is_some[*isa.IsaVTable](found)) { ret nil; }
+    ret O.unwrap[*isa.IsaVTable](found);
+}
+
+# library attribution accepts both a portable logical name and the exact loader
+# name retained for compatibility
+test "mach.lang.be.linker.dynlib_index_of:logical_and_loader_names" {
+    var libs: [3]of.DynLib;
+    libs[0].name = 41;
+    libs[0].soname = 73;
+    libs[0].rpath = intern.STR_NIL;
+    libs[1].name = 42;
+    libs[1].soname = 73;
+    libs[1].rpath = intern.STR_NIL;
+    libs[2].name = 43;
+    libs[2].soname = 74;
+    libs[2].rpath = intern.STR_NIL;
+
+    val logical: O.Option[u32] =
+        dynlib_index_of(?libs[0], 3, nil::*of.DynLib, 41);
+    val alias: O.Option[u32] =
+        dynlib_index_of(?libs[0], 3, nil::*of.DynLib, 42);
+    val loader: O.Option[u32] =
+        dynlib_index_of(?libs[0], 3, nil::*of.DynLib, 73);
+    val other: O.Option[u32] =
+        dynlib_index_of(?libs[0], 3, nil::*of.DynLib, 74);
+    val missing: O.Option[u32] =
+        dynlib_index_of(?libs[0], 3, nil::*of.DynLib, 99);
+    if (!O.is_some[u32](logical) || O.unwrap[u32](logical) != 0) { ret 1; }
+    if (!O.is_some[u32](alias) || O.unwrap[u32](alias) != 0)     { ret 1; }
+    if (!O.is_some[u32](loader) || O.unwrap[u32](loader) != 0)   { ret 1; }
+    if (!O.is_some[u32](other) || O.unwrap[u32](other) != 1)     { ret 1; }
+    if (O.is_some[u32](missing) || unique_dynlib_count(?libs[0], 3) != 2) { ret 1; }
+
+    # a logical name may alias the same loader, but it may not equal another
+    # dependency's loader name: that spelling would select two providers.
+    var collision: [2]of.DynLib;
+    collision[0].name = 41;
+    collision[0].soname = 73;
+    collision[0].rpath = intern.STR_NIL;
+    collision[1].name = 73;
+    collision[1].soname = 74;
+    collision[1].rpath = intern.STR_NIL;
+    var first: intern.StrId = intern.STR_NIL;
+    var second: intern.StrId = intern.STR_NIL;
+    var identity: intern.StrId = intern.STR_NIL;
+    if (!dynlib_identity_collision(?collision[0], 2, nil::*of.DynLib,
+                                   ?first, ?second, ?identity)) { ret 1; }
+    if (first != 73 || second != 74 || identity != 73) { ret 1; }
+
+    var reversed: [2]of.DynLib;
+    reversed[0] = collision[1];
+    reversed[1] = collision[0];
+    if (!dynlib_identity_collision(?reversed[0], 2, nil::*of.DynLib,
+                                   ?first, ?second, ?identity)) { ret 1; }
+    if (identity != 73) { ret 1; }
+    ret 0;
+}
+
+# darwin's implicit libSystem participates in both alias validation and import
+# attribution before it is appended to the emitted dependency list.
+test "mach.lang.be.linker.build_dynamic_info:implicit_platform_identity" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val tr: R.Result[target.Target, str] =
+        target.select(?reg, "aarch64", "darwin", "aapcs64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+
+    val platform: intern.StrId = lt_name(?s, "/usr/lib/libSystem.B.dylib");
+    val other: intern.StrId = lt_name(?s, "@rpath/libother.dylib");
+    val symbol: intern.StrId = lt_name(?s, "_platform_call");
+    if (platform == intern.STR_NIL || other == intern.STR_NIL
+        || symbol == intern.STR_NIL) { ret 1; }
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var explicit: [1]of.DynLib;
+    explicit[0].name = platform;
+    explicit[0].soname = other;
+    explicit[0].rpath = intern.STR_NIL;
+    var collision_dyn: DynState;
+    init_dynstate(?collision_dyn);
+    collision_dyn.info.pie = true;
+    val collision: R.Result[bool, str] =
+        build_dynamic_info(?s, ?tgt, ?collision_dyn, nil::*of.ObjectImage, 0,
+                           ?locs, ?explicit[0], 1, nil::*u32, nil::*AtomPlan);
+    if (!R.is_err[bool, str](collision)) { ret 1; }
+    free_dynstate(?alloc, ?collision_dyn);
+
+    var sym: of.Symbol;
+    sym.name = symbol;
+    sym.section = of.SECTION_EXTERNAL;
+    sym.offset = 0;
+    sym.size = 0;
+    sym.flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+              | of.SYM_OBJ_FLAG_FUNCTION;
+    var module: of.ObjectImage =
+        lt_image(?s, lt_name(?s, "platform-user"), nil::*of.Section, 0,
+                 ?sym, 1, nil::*of.Relocation, 0);
+    if (R.is_err[bool, str](session.register_import_library(?s, symbol, platform))) {
+        ret 1;
+    }
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    dyn.info.pie = true;
+    val built: R.Result[bool, str] =
+        build_dynamic_info(?s, ?tgt, ?dyn, ?module, 1, ?locs,
+                           nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    if (R.is_err[bool, str](built)) { ret 1; }
+    if (dyn.info.lib_count != 1 || dyn.info.libs[0].name != platform
+        || dyn.info.libs[0].soname != platform || dyn.info.import_count != 1
+        || dyn.info.imports[0].lib_index != 0) { ret 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+# a per-target manifest base overrides the OS vtable base; an unset (0) base defers
+# to the vtable value - the mechanism a freestanding bmos image places itself (#2426)
+test "mach.lang.be.linker.os_base_addr:manifest_base_override" {
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val tr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "freestanding", "sysv64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+
+    # select installs no override; freestanding's vtable base is 0, so os_base_addr
+    # reports the vtable value.
+    if (tgt.base != 0)                            { ret 1; }
+    if (os_base_addr(?tgt) != tgt.os.base_addr)   { ret 1; }
+    if (os_base_addr(?tgt) != 0)                  { ret 1; }
+
+    # a nonzero manifest base wins over the vtable value (the bmos high-half placement).
+    tgt.base = 0xFFFF800000000000;
+    if (os_base_addr(?tgt) != 0xFFFF800000000000) { ret 1; }
+    ret 0;
+}
+
+# a flat (raw) image enters at its base, so the entry symbol's section must lead the
+# merged .text no matter the link order. this links a function-defining module BEFORE
+# the entry-defining one - the arrangement that displaced `_start` and made the raw
+# writer reject the image (#2409) - and asserts the entry now leads: the image begins
+# with the entry module's bytes and the writer accepts entry-at-base. removing the
+# reorder in link_modules fails this link with "flat image must enter at its base".
+test "mach.lang.be.linker.link_modules:flat_entry_leads_regardless_of_order" {
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val tr: R.Result[target.Target, str] = target.select(?reg, "x86_64", "freestanding", "sysv64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    # the freestanding target links a flat image (no entry record) based at 0.
+    if (!tgt.of.produces_image) { ret 1; }
+
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val text:  intern.StrId = lt_name(?s, ".text");
+    val other: intern.StrId = lt_name(?s, "other_fn");
+    val entry: intern.StrId = lt_name(?s, tgt.os.entry_symbol);
+    if (text == intern.STR_NIL || other == intern.STR_NIL || entry == intern.STR_NIL) { ret 1; }
+
+    # module 0 is a non-entry function-defining module (32 bytes of 0x90); module 1 is
+    # the entry module whose sole function is the entry symbol at offset 0 (16 bytes of
+    # 0xCC). in link order module 0's .text merges first, displacing the entry.
+    var b0: [32]u8;
+    var b1: [16]u8;
+    var i: u32 = 0;
+    for (i < 32) { b0[i] = 0x90; i = i + 1; }
+    i = 0;
+    for (i < 16) { b1[i] = 0xCC; i = i + 1; }
+
+    var secs0: [1]of.Section;
+    secs0[0].name = text; secs0[0].kind = of.SK_TEXT; secs0[0].bytes = ?b0[0];
+    secs0[0].len = 32; secs0[0].align = 16;
+    var secs1: [1]of.Section;
+    secs1[0].name = text; secs1[0].kind = of.SK_TEXT; secs1[0].bytes = ?b1[0];
+    secs1[0].len = 16; secs1[0].align = 16;
+
+    val fn_flags: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var syms0: [1]of.Symbol;
+    syms0[0].name = other; syms0[0].section = 0; syms0[0].offset = 0; syms0[0].size = 0; syms0[0].flags = fn_flags;
+    var syms1: [1]of.Symbol;
+    syms1[0].name = entry; syms1[0].section = 0; syms1[0].offset = 0; syms1[0].size = 0; syms1[0].flags = fn_flags;
+
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "m0"), ?secs0[0], 1, ?syms0[0], 1, nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "m1"), ?secs1[0], 1, ?syms1[0], 1, nil::*of.Relocation, 0);
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "flat_entry");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    # both modules are in-memory codegen images (codegen_count == 2), static exe.
+    val lr: R.Result[bool, str] =
+        link_modules(?s, ?tgt, ?mods[0], 2, 2, nil::*of.DynLib, 0, tpath::*u8, "flat_entry"::*u8, LINK_EXE, false);
+    if (R.is_err[bool, str](lr)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rr: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rr)) { ret 1; }
+    var b: Vector[u8] = R.unwrap_ok[Vector[u8], str](rr);
+
+    # the entry module's .text leads: the image begins with its 0xCC bytes, and the
+    # earlier-linked function-defining module follows at offset 16.
+    if (b.len != 48)        { vector.dnit[u8](?b); ret 1; }
+    if (b.data[0]  != 0xCC) { vector.dnit[u8](?b); ret 1; }
+    if (b.data[15] != 0xCC) { vector.dnit[u8](?b); ret 1; }
+    if (b.data[16] != 0x90) { vector.dnit[u8](?b); ret 1; }
+
+    vector.dnit[u8](?b);
+    session.dnit(?s);
+    ret 0;
 }
 
 # weak/strong symbol resolution is order-independent (#1257)
@@ -3179,5 +4546,661 @@ test "mach.lang.be.linker.collect_symbols:weak_strong_order_independent" {
     # strong-then-strong: still a multiple-definition error.
     val r3: R.Result[u64, str] = lt_link(?s, nm, ?strong, ?strong2);
     if (!R.is_err[u64, str](r3)) { ret 1; }
+    ret 0;
+}
+
+# final-link atomization activates only for a real losing weak definition, accepts
+# byte-different semantic copies, and mirrors strong-over-weak resolution in both
+# input orders. the disabled plan is the relocatable-link control
+test "mach.lang.be.linker.atom_plan:resolution_and_inert_gate" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val dup: intern.StrId = lt_name(?s, "dupI3u64E");
+    val other: intern.StrId = lt_name(?s, "otherI3u64E");
+    val text: intern.StrId = lt_name(?s, ".text");
+    if (dup == intern.STR_NIL || other == intern.STR_NIL || text == intern.STR_NIL) { ret 1; }
+
+    # deliberately divergent bytes: weak resolution is semantic, not a byte-equality
+    # fold, and whichever definition loses must be removable.
+    var bytes0: [8]u8;
+    var bytes1: [8]u8;
+    var i: u32 = 0;
+    for (i < 8) {
+        bytes0[i] = (0x10 + i)::u8;
+        bytes1[i] = (0x80 + i)::u8;
+        i = i + 1;
+    }
+    var secs0: [1]of.Section;
+    var secs1: [1]of.Section;
+    secs0[0].name = text; secs0[0].kind = of.SK_TEXT; secs0[0].bytes = ?bytes0[0];
+    secs0[0].len = 8; secs0[0].align = 1;
+    secs1[0].name = text; secs1[0].kind = of.SK_TEXT; secs1[0].bytes = ?bytes1[0];
+    secs1[0].len = 8; secs1[0].align = 1;
+
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    val strong_flags: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var syms0: [1]of.Symbol;
+    var syms1: [1]of.Symbol;
+    syms0[0].name = dup; syms0[0].section = 0; syms0[0].offset = 0;
+    syms0[0].size = 0; syms0[0].flags = weak_flags;
+    syms1[0].name = dup; syms1[0].section = 0; syms1[0].offset = 0;
+    syms1[0].size = 0; syms1[0].flags = weak_flags;
+
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "m0"), ?secs0[0], 1, ?syms0[0], 1,
+                       nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "m1"), ?secs1[0], 1, ?syms1[0], 1,
+                       nil::*of.Relocation, 0);
+    var bases: [2]u32;
+
+    # relocatable/native-group output never atomizes.
+    var plan: AtomPlan;
+    init_atom_plan(?plan);
+    val disabled: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, false, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](disabled) || plan.active) { ret 1; }
+
+    # weak/weak: first wins, later body is the one discarded.
+    val ww: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](ww) || !plan.active || plan.drop_count != 1) { ret 1; }
+    if (plan.drops[0].section != 1 || plan.drops[0].start != 0
+        || plan.drops[0].end != 8 || plan.removed_bytes != 8) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    # a later strong replaces and discards the earlier weak winner.
+    syms1[0].flags = strong_flags;
+    val ws: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](ws) || !plan.active || plan.drops[0].section != 0) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    # a strong seen first remains the winner and the later weak is discarded.
+    syms0[0].flags = strong_flags;
+    syms1[0].flags = weak_flags;
+    val sw: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](sw) || !plan.active || plan.drops[0].section != 1) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    # two strong definitions remain a hard error.
+    syms1[0].flags = strong_flags;
+    val ss: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (!R.is_err[bool, str](ss)) { ret 1; }
+
+    # distinct weak names have no loser: the plan stays wholly inert.
+    syms0[0].flags = weak_flags;
+    syms1[0].flags = weak_flags;
+    syms1[0].name = other;
+    val unique: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](unique) || plan.active) { ret 1; }
+    ret 0;
+}
+
+# adjacent losing atoms coalesce, surviving bytes/symbol sites are remapped with
+# alignment intact, and relocations owned only by dead bodies cannot retain an
+# import. a live relocation to another import remains visible
+test "mach.lang.be.linker.atom_plan:copy_remap_and_reloc_liveness" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val x64: *isa.IsaVTable = lt_isa(?reg, "x86_64");
+    if (x64 == nil) { ret 1; }
+
+    val wa: intern.StrId = lt_name(?s, "waI3u64E");
+    val wb: intern.StrId = lt_name(?s, "wbI3u64E");
+    val head: intern.StrId = lt_name(?s, "head");
+    val tail: intern.StrId = lt_name(?s, "tail");
+    val dead_ext: intern.StrId = lt_name(?s, "dead_ext");
+    val live_ext: intern.StrId = lt_name(?s, "live_ext");
+    val text: intern.StrId = lt_name(?s, ".text");
+    if (wa == intern.STR_NIL || wb == intern.STR_NIL || head == intern.STR_NIL
+        || tail == intern.STR_NIL || dead_ext == intern.STR_NIL
+        || live_ext == intern.STR_NIL || text == intern.STR_NIL) { ret 1; }
+
+    var win_bytes: [16]u8;
+    var lose_bytes: [32]u8;
+    var i: u32 = 0;
+    for (i < 16) { win_bytes[i] = (0x20 + i)::u8; i = i + 1; }
+    i = 0;
+    for (i < 32) { lose_bytes[i] = (0x80 + i)::u8; i = i + 1; }
+
+    var win_sec: [1]of.Section;
+    var lose_sec: [1]of.Section;
+    win_sec[0].name = text; win_sec[0].kind = of.SK_TEXT;
+    win_sec[0].bytes = ?win_bytes[0]; win_sec[0].len = 16; win_sec[0].align = 8;
+    lose_sec[0].name = text; lose_sec[0].kind = of.SK_TEXT;
+    lose_sec[0].bytes = ?lose_bytes[0]; lose_sec[0].len = 32; lose_sec[0].align = 8;
+
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    val strong_flags: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var win_syms: [2]of.Symbol;
+    win_syms[0].name = wa; win_syms[0].section = 0; win_syms[0].offset = 0;
+    win_syms[0].size = 0; win_syms[0].flags = weak_flags;
+    win_syms[1].name = wb; win_syms[1].section = 0; win_syms[1].offset = 8;
+    win_syms[1].size = 0; win_syms[1].flags = weak_flags;
+
+    var lose_syms: [6]of.Symbol;
+    lose_syms[0].name = head; lose_syms[0].section = 0; lose_syms[0].offset = 0;
+    lose_syms[0].size = 0; lose_syms[0].flags = strong_flags;
+    lose_syms[1].name = wa; lose_syms[1].section = 0; lose_syms[1].offset = 8;
+    lose_syms[1].size = 0; lose_syms[1].flags = weak_flags;
+    lose_syms[2].name = wb; lose_syms[2].section = 0; lose_syms[2].offset = 16;
+    lose_syms[2].size = 0; lose_syms[2].flags = weak_flags;
+    lose_syms[3].name = tail; lose_syms[3].section = 0; lose_syms[3].offset = 24;
+    lose_syms[3].size = 0; lose_syms[3].flags = strong_flags;
+    lose_syms[4].name = dead_ext; lose_syms[4].section = of.SECTION_EXTERNAL;
+    lose_syms[4].offset = 0; lose_syms[4].size = 0;
+    lose_syms[4].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_FUNCTION;
+    lose_syms[5].name = live_ext; lose_syms[5].section = of.SECTION_EXTERNAL;
+    lose_syms[5].offset = 0; lose_syms[5].size = 0;
+    lose_syms[5].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var relocs: [2]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 10; relocs[0].kind = of.RK_PC32;
+    relocs[0].symbol = dead_ext; relocs[0].addend = -4;
+    relocs[1].section = 0; relocs[1].offset = 26; relocs[1].kind = of.RK_PC32;
+    relocs[1].symbol = live_ext; relocs[1].addend = -4;
+
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "winners"), ?win_sec[0], 1,
+                       ?win_syms[0], 2, nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "losers"), ?lose_sec[0], 1,
+                       ?lose_syms[0], 6, ?relocs[0], 2);
+    var bases: [2]u32;
+    var plan: AtomPlan;
+    init_atom_plan(?plan);
+    val pr: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, x64, ?plan);
+    if (R.is_err[bool, str](pr) || !plan.active || plan.drop_count != 1) { ret 1; }
+
+    # [8,16) and [16,24) merge, leaving head then tail packed at an 8-byte
+    # boundary. no alignment padding is needed and 16 bytes disappear.
+    if (plan.drops[0].section != 1 || plan.drops[0].start != 8
+        || plan.drops[0].end != 24 || plan.drops[0].resume != 8
+        || plan.sections[1].live_len != 16 || plan.removed_bytes != 16) { ret 1; }
+    if (!atom_offset_dead(?plan, 1, 10) || !atom_offset_dead(?plan, 1, 20)) { ret 1; }
+    if (atom_offset_dead(?plan, 1, 24) || atom_live_offset(?plan, 1, 24) != 8) { ret 1; }
+
+    var copied: [16]u8;
+    copy_live_section(?copied[0], ?lose_bytes[0], 32, ?plan, 1);
+    i = 0;
+    for (i < 8) {
+        if (copied[i] != lose_bytes[i]) { ret 1; }
+        if (copied[8 + i] != lose_bytes[24 + i]) { ret 1; }
+        i = i + 1;
+    }
+
+    if (import_symbol_live(?mods[0], 2, dead_ext, ?bases[0], ?plan)) { ret 1; }
+    if (has_call_reloc(?mods[0], 2, dead_ext, ?bases[0], ?plan))     { ret 1; }
+    if (!import_symbol_live(?mods[0], 2, live_ext, ?bases[0], ?plan)) { ret 1; }
+    if (!has_call_reloc(?mods[0], 2, live_ext, ?bases[0], ?plan))     { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+    ret 0;
+}
+
+# a second symbol inside a losing function interval keeps that interval live;
+# this is the conservative control for an exposed local/shared label that a live
+# relocation could still address
+test "mach.lang.be.linker.atom_plan:shared_symbol_retains_loser" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val dup: intern.StrId = lt_name(?s, "dupI3u64E");
+    val local: intern.StrId = lt_name(?s, "inside_label");
+    val text: intern.StrId = lt_name(?s, ".text");
+    var a_bytes: [8]u8;
+    var b_bytes: [8]u8;
+    var a_sec: [1]of.Section;
+    var b_sec: [1]of.Section;
+    a_sec[0].name = text; a_sec[0].kind = of.SK_TEXT; a_sec[0].bytes = ?a_bytes[0];
+    a_sec[0].len = 8; a_sec[0].align = 1;
+    b_sec[0].name = text; b_sec[0].kind = of.SK_TEXT; b_sec[0].bytes = ?b_bytes[0];
+    b_sec[0].len = 8; b_sec[0].align = 1;
+
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    var a_syms: [1]of.Symbol;
+    var b_syms: [2]of.Symbol;
+    a_syms[0].name = dup; a_syms[0].section = 0; a_syms[0].offset = 0;
+    a_syms[0].size = 0; a_syms[0].flags = weak_flags;
+    b_syms[0].name = dup; b_syms[0].section = 0; b_syms[0].offset = 0;
+    b_syms[0].size = 0; b_syms[0].flags = weak_flags;
+    b_syms[1].name = local; b_syms[1].section = 0; b_syms[1].offset = 4;
+    b_syms[1].size = 0; b_syms[1].flags = of.SYM_OBJ_FLAG_FUNCTION;
+
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "a"), ?a_sec[0], 1, ?a_syms[0], 1,
+                       nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "b"), ?b_sec[0], 1, ?b_syms[0], 2,
+                       nil::*of.Relocation, 0);
+    var bases: [2]u32;
+    var plan: AtomPlan;
+    init_atom_plan(?plan);
+    val pr: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](pr) || plan.active || plan.drop_count != 0) { ret 1; }
+    ret 0;
+}
+
+# a validated nonzero function size bounds the discarded bytes exactly, preserving
+# unsymbolized trailing islands. another symbol whose nonzero extent covers the
+# candidate from an earlier entry keeps it live
+test "mach.lang.be.linker.atom_plan:sized_extent_and_covering_symbol" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val dup: intern.StrId = lt_name(?s, "sizedI3u64E");
+    val cover: intern.StrId = lt_name(?s, "cover");
+    val text: intern.StrId = lt_name(?s, ".text");
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var a_bytes: [8]u8;
+    var b_bytes: [16]u8;
+    var i: u32 = 0;
+    for (i < 16) { b_bytes[i] = (0x50 + i)::u8; i = i + 1; }
+    var a_sec: [1]of.Section;
+    var b_sec: [1]of.Section;
+    a_sec[0].name = text; a_sec[0].kind = of.SK_TEXT; a_sec[0].bytes = ?a_bytes[0];
+    a_sec[0].len = 8; a_sec[0].align = 1;
+    b_sec[0].name = text; b_sec[0].kind = of.SK_TEXT; b_sec[0].bytes = ?b_bytes[0];
+    b_sec[0].len = 16; b_sec[0].align = 1;
+
+    var a_syms: [1]of.Symbol;
+    var b_syms: [2]of.Symbol;
+    a_syms[0].name = dup; a_syms[0].section = 0; a_syms[0].offset = 0;
+    a_syms[0].size = 8; a_syms[0].flags = weak_flags;
+    b_syms[0].name = dup; b_syms[0].section = 0; b_syms[0].offset = 0;
+    b_syms[0].size = 8; b_syms[0].flags = weak_flags;
+    b_syms[1].name = cover; b_syms[1].section = 0; b_syms[1].offset = 16;
+    b_syms[1].size = 0; b_syms[1].flags = 0;
+
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "a"), ?a_sec[0], 1, ?a_syms[0], 1,
+                       nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "b"), ?b_sec[0], 1, ?b_syms[0], 2,
+                       nil::*of.Relocation, 0);
+    var bases: [2]u32;
+    var plan: AtomPlan;
+    init_atom_plan(?plan);
+    val sized: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](sized) || !plan.active || plan.drop_count != 1) { ret 1; }
+    if (plan.drops[0].start != 0 || plan.drops[0].end != 8
+        || plan.sections[1].live_len != 8) { ret 1; }
+    var copied: [8]u8;
+    copy_live_section(?copied[0], ?b_bytes[0], 16, ?plan, 1);
+    i = 0;
+    for (i < 8) {
+        if (copied[i] != b_bytes[8 + i]) { ret 1; }
+        i = i + 1;
+    }
+    free_atom_plan(?alloc, ?plan);
+
+    # move the losing function behind an earlier symbol whose declared extent
+    # covers it. The earlier entry is outside [8,16), but its bytes are not.
+    b_syms[0].offset = 8;
+    b_syms[0].size = 8;
+    b_syms[1].offset = 0;
+    b_syms[1].size = 16;
+    val covered: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](covered) || plan.active) { ret 1; }
+    ret 0;
+}
+
+# a non-alignment-sized weak body may shift the suffix only by a whole section
+# alignment unit. the later function therefore keeps its original alignment
+test "mach.lang.be.linker.atom_plan:suffix_alignment_grid" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val dup: intern.StrId = lt_name(?s, "alignedI3u64E");
+    val head: intern.StrId = lt_name(?s, "aligned_head");
+    val tail: intern.StrId = lt_name(?s, "aligned_tail");
+    val text: intern.StrId = lt_name(?s, ".text");
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    val strong_flags: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var winner_bytes: [21]u8;
+    var loser_bytes: [64]u8;
+    var winner_sec: [1]of.Section;
+    var loser_sec: [1]of.Section;
+    winner_sec[0].name = text;
+    winner_sec[0].kind = of.SK_TEXT;
+    winner_sec[0].bytes = ?winner_bytes[0];
+    winner_sec[0].len = 21;
+    winner_sec[0].align = 16;
+    loser_sec[0].name = text;
+    loser_sec[0].kind = of.SK_TEXT;
+    loser_sec[0].bytes = ?loser_bytes[0];
+    loser_sec[0].len = 64;
+    loser_sec[0].align = 16;
+
+    var winner_syms: [1]of.Symbol;
+    var loser_syms: [3]of.Symbol;
+    winner_syms[0].name = dup;
+    winner_syms[0].section = 0;
+    winner_syms[0].offset = 0;
+    winner_syms[0].size = 21;
+    winner_syms[0].flags = weak_flags;
+    loser_syms[0].name = head;
+    loser_syms[0].section = 0;
+    loser_syms[0].offset = 0;
+    loser_syms[0].size = 16;
+    loser_syms[0].flags = strong_flags;
+    loser_syms[1].name = dup;
+    loser_syms[1].section = 0;
+    loser_syms[1].offset = 16;
+    loser_syms[1].size = 21;
+    loser_syms[1].flags = weak_flags;
+    loser_syms[2].name = tail;
+    loser_syms[2].section = 0;
+    loser_syms[2].offset = 48;
+    loser_syms[2].size = 16;
+    loser_syms[2].flags = strong_flags;
+
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "winner"), ?winner_sec[0], 1,
+                       ?winner_syms[0], 1, nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "loser"), ?loser_sec[0], 1,
+                       ?loser_syms[0], 3, nil::*of.Relocation, 0);
+    var bases: [2]u32;
+    var plan: AtomPlan;
+    init_atom_plan(?plan);
+    val pr: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true,
+                        nil::*isa.IsaVTable, ?plan);
+    if (R.is_err[bool, str](pr) || !plan.active || plan.drop_count != 1) { ret 1; }
+    if (plan.drops[0].start != 16 || plan.drops[0].end != 37
+        || plan.drops[0].resume != 21 || plan.sections[1].live_len != 48
+        || plan.removed_bytes != 16) { ret 1; }
+    if (atom_live_offset(?plan, 1, 48) != 32
+        || (atom_live_offset(?plan, 1, 48) & 15) != 0) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+    ret 0;
+}
+
+# coff's parser surfaces a weak COMDAT carrier's STATIC section symbol beside
+# its weak global. that exact unreferenced bookkeeping anchor does not retain the
+# loser; a live relocation through it does
+test "mach.lang.be.linker.atom_plan:coff_carrier_anchor" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val x64: *isa.IsaVTable = lt_isa(?reg, "x86_64");
+    if (x64 == nil) { ret 1; }
+
+    val dup: intern.StrId = lt_name(?s, "coffI3u64E");
+    val text: intern.StrId = lt_name(?s, ".text");
+    val data: intern.StrId = lt_name(?s, ".data");
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    var a_bytes: [8]u8;
+    var b_text: [8]u8;
+    var b_data: [8]u8;
+    var a_sec: [1]of.Section;
+    var b_secs: [2]of.Section;
+    a_sec[0].name = text; a_sec[0].kind = of.SK_TEXT; a_sec[0].bytes = ?a_bytes[0];
+    a_sec[0].len = 8; a_sec[0].align = 1;
+    b_secs[0].name = text; b_secs[0].kind = of.SK_TEXT; b_secs[0].bytes = ?b_text[0];
+    b_secs[0].len = 8; b_secs[0].align = 1;
+    b_secs[1].name = data; b_secs[1].kind = of.SK_DATA; b_secs[1].bytes = ?b_data[0];
+    b_secs[1].len = 8; b_secs[1].align = 8;
+
+    var a_syms: [1]of.Symbol;
+    var b_syms: [2]of.Symbol;
+    a_syms[0].name = dup; a_syms[0].section = 0; a_syms[0].offset = 0;
+    a_syms[0].size = 0; a_syms[0].flags = weak_flags;
+    # parser shape: the section symbol precedes the image symbol, is local,
+    # zero-sized, and shares the carrier section's name and offset zero.
+    b_syms[0].name = text; b_syms[0].section = 0; b_syms[0].offset = 0;
+    b_syms[0].size = 0; b_syms[0].flags = 0;
+    b_syms[1].name = dup; b_syms[1].section = 0; b_syms[1].offset = 0;
+    b_syms[1].size = 0; b_syms[1].flags = weak_flags;
+
+    var refs: [1]of.Relocation;
+    refs[0].section = 1; refs[0].offset = 0; refs[0].kind = of.RK_ABS64;
+    refs[0].symbol = text; refs[0].addend = 0;
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "winner"), ?a_sec[0], 1, ?a_syms[0], 1,
+                       nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "carrier"), ?b_secs[0], 2, ?b_syms[0], 2,
+                       ?refs[0], 0);
+    var bases: [2]u32;
+    var plan: AtomPlan;
+    init_atom_plan(?plan);
+    val inert_anchor: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 3, true, x64, ?plan);
+    if (R.is_err[bool, str](inert_anchor) || !plan.active || plan.drop_count != 1) { ret 1; }
+    if (plan.drops[0].section != 1 || plan.drops[0].start != 0
+        || plan.drops[0].end != 8) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    mods[1].reloc_count = 1;
+    val referenced_anchor: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 3, true, x64, ?plan);
+    if (R.is_err[bool, str](referenced_anchor) || plan.active) { ret 1; }
+    ret 0;
+}
+
+# a live relocation through a local/section anchor before a losing atom keeps the
+# atom when its unchanged addend reaches across the removed interval. this covers
+# effective targets after the atom as well as targets inside it
+test "mach.lang.be.linker.atom_plan:anchor_addend_crossing_retains_loser" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val x64: *isa.IsaVTable = lt_isa(?reg, "x86_64");
+    val arm64: *isa.IsaVTable = lt_isa(?reg, "aarch64");
+    if (x64 == nil || arm64 == nil) { ret 1; }
+
+    val dup: intern.StrId = lt_name(?s, "crossI3u64E");
+    val base: intern.StrId = lt_name(?s, "section_base");
+    val tail: intern.StrId = lt_name(?s, "tail");
+    val text: intern.StrId = lt_name(?s, ".text");
+    val data: intern.StrId = lt_name(?s, ".data");
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    val strong_flags: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var a_bytes: [8]u8;
+    var b_bytes: [24]u8;
+    var b_data: [4]u8;
+    var a_sec: [1]of.Section;
+    var b_secs: [2]of.Section;
+    a_sec[0].name = text; a_sec[0].kind = of.SK_TEXT; a_sec[0].bytes = ?a_bytes[0];
+    a_sec[0].len = 8; a_sec[0].align = 1;
+    b_secs[0].name = text; b_secs[0].kind = of.SK_TEXT; b_secs[0].bytes = ?b_bytes[0];
+    b_secs[0].len = 24; b_secs[0].align = 1;
+    b_secs[1].name = data; b_secs[1].kind = of.SK_DATA; b_secs[1].bytes = ?b_data[0];
+    b_secs[1].len = 4; b_secs[1].align = 4;
+
+    var a_syms: [1]of.Symbol;
+    var b_syms: [3]of.Symbol;
+    a_syms[0].name = dup; a_syms[0].section = 0; a_syms[0].offset = 0;
+    a_syms[0].size = 8; a_syms[0].flags = weak_flags;
+    b_syms[0].name = base; b_syms[0].section = 0; b_syms[0].offset = 0;
+    b_syms[0].size = 0; b_syms[0].flags = 0;
+    b_syms[1].name = dup; b_syms[1].section = 0; b_syms[1].offset = 8;
+    b_syms[1].size = 8; b_syms[1].flags = weak_flags;
+    b_syms[2].name = tail; b_syms[2].section = 0; b_syms[2].offset = 16;
+    b_syms[2].size = 8; b_syms[2].flags = strong_flags;
+
+    var reloc: [1]of.Relocation;
+    reloc[0].section = 0; reloc[0].offset = 0; reloc[0].kind = of.RK_ABS64;
+    reloc[0].symbol = base; reloc[0].addend = 16;
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "winner"), ?a_sec[0], 1, ?a_syms[0], 1,
+                       nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "loser"), ?b_secs[0], 2, ?b_syms[0], 3,
+                       ?reloc[0], 1);
+    var bases: [2]u32;
+    var plan: AtomPlan;
+    init_atom_plan(?plan);
+    val crossing: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 3, true, x64, ?plan);
+    if (R.is_err[bool, str](crossing) || plan.active) { ret 1; }
+
+    # a target that remains before the candidate does not cross it and leaves the
+    # duplicate eligible, proving retention is caused by the addend relationship.
+    reloc[0].addend = 4;
+    val same_side: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 3, true, x64, ?plan);
+    if (R.is_err[bool, str](same_side) || !plan.active || plan.drop_count != 1) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    # parsed text pc32 remains ambiguous even when the preceding byte looks like a
+    # call opcode: data can contain 0xe8 too, so bias zero stays possible.
+    b_bytes[3] = 0xE8;
+    reloc[0].offset = 4;
+    reloc[0].kind = of.RK_PC32;
+    reloc[0].addend = -4;
+    val pc_local: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 3, true, x64, ?plan);
+    if (R.is_err[bool, str](pc_local) || plan.active) { ret 1; }
+    reloc[0].symbol = tail;
+    reloc[0].kind = of.RK_PLT32;
+
+    # link_mixed places compiler images first. module 1 is therefore parsed when
+    # codegen_count is one: its PLT32 may be a raw `.long tail@PLT-4`, so bias
+    # zero reaches the candidate and conservatively retains it.
+    val parsed_plt_data: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 1, ?bases[0], 3, true, x64, ?plan);
+    if (R.is_err[bool, str](parsed_plt_data) || plan.active) { ret 1; }
+
+    # a foreign PLT32 displacement can also precede a trailing immediate. with
+    # the anchor before [8,16), addend three plus the canonical four-byte bias
+    # remains at seven, while an eight-byte field-to-next-ip bias reaches eleven
+    # inside the candidate. this therefore requires the parsed upper bound.
+    reloc[0].symbol = base;
+    reloc[0].addend = 3;
+    val parsed_plt_trailing: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 1, ?bases[0], 3, true, x64, ?plan);
+    if (R.is_err[bool, str](parsed_plt_trailing) || plan.active) { ret 1; }
+
+    # with two compiler-produced images, module 1's PC32 is known to hold an
+    # instruction relocation. its field-to-next-ip bias is at least four, so
+    # tail-4 cannot reach backward into the candidate.
+    reloc[0].symbol = tail;
+    reloc[0].addend = -4;
+    reloc[0].kind = of.RK_PC32;
+    val codegen_pc: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 2, ?bases[0], 3, true, x64, ?plan);
+    if (R.is_err[bool, str](codegen_pc) || !plan.active || plan.drop_count != 1) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    # darwin arm64 CALL26 preserves its S-relative addend: tail-4 lands inside
+    # the candidate, regardless of image provenance.
+    val arm_global: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 2, ?bases[0], 3, true, arm64, ?plan);
+    if (R.is_err[bool, str](arm_global) || plan.active) { ret 1; }
+
+    # non-text pc32 has no instruction bias: tail-4 reaches the candidate and
+    # therefore retains it.
+    reloc[0].section = 1;
+    reloc[0].offset = 0;
+    reloc[0].kind = of.RK_PC32;
+    val data_pc: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 2, ?bases[0], 3, true, x64, ?plan);
+    if (R.is_err[bool, str](data_pc) || plan.active) { ret 1; }
+    ret 0;
+}
+
+# rk_plt32 is one 4-byte field on x64/aarch64 but an 8-byte auipc+jalr pair on
+# rv64. a pair starting before a losing atom and ending inside it must retain the
+# atom so the live JALR instruction is never discarded
+test "mach.lang.be.linker.atom_plan:rv64_plt_pair_boundary" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val x64: *isa.IsaVTable = lt_isa(?reg, "x86_64");
+    val arm64: *isa.IsaVTable = lt_isa(?reg, "aarch64");
+    val rv64: *isa.IsaVTable = lt_isa(?reg, "riscv64");
+    if (x64 == nil || arm64 == nil || rv64 == nil) { ret 1; }
+
+    val dup: intern.StrId = lt_name(?s, "rvpairI3u64E");
+    val ext: intern.StrId = lt_name(?s, "callee");
+    val text: intern.StrId = lt_name(?s, ".text");
+    val weak_flags: u32 =
+        of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    var a_bytes: [8]u8;
+    var b_bytes: [16]u8;
+    var a_sec: [1]of.Section;
+    var b_sec: [1]of.Section;
+    a_sec[0].name = text; a_sec[0].kind = of.SK_TEXT; a_sec[0].bytes = ?a_bytes[0];
+    a_sec[0].len = 8; a_sec[0].align = 1;
+    b_sec[0].name = text; b_sec[0].kind = of.SK_TEXT; b_sec[0].bytes = ?b_bytes[0];
+    b_sec[0].len = 16; b_sec[0].align = 1;
+
+    var a_syms: [1]of.Symbol;
+    var b_syms: [2]of.Symbol;
+    a_syms[0].name = dup; a_syms[0].section = 0; a_syms[0].offset = 0;
+    a_syms[0].size = 8; a_syms[0].flags = weak_flags;
+    b_syms[0].name = dup; b_syms[0].section = 0; b_syms[0].offset = 8;
+    b_syms[0].size = 8; b_syms[0].flags = weak_flags;
+    b_syms[1].name = ext; b_syms[1].section = of.SECTION_EXTERNAL;
+    b_syms[1].offset = 0; b_syms[1].size = 0;
+    b_syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var reloc: [1]of.Relocation;
+    reloc[0].section = 0; reloc[0].offset = 4; reloc[0].kind = of.RK_PLT32;
+    reloc[0].symbol = ext; reloc[0].addend = 0;
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "winner"), ?a_sec[0], 1, ?a_syms[0], 1,
+                       nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "loser"), ?b_sec[0], 1, ?b_syms[0], 2,
+                       ?reloc[0], 1);
+    var bases: [2]u32;
+    var plan: AtomPlan;
+    init_atom_plan(?plan);
+
+    val x: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, x64, ?plan);
+    if (R.is_err[bool, str](x) || !plan.active || plan.drop_count != 1) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    val arm: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, arm64, ?plan);
+    if (R.is_err[bool, str](arm) || !plan.active || plan.drop_count != 1) { ret 1; }
+    free_atom_plan(?alloc, ?plan);
+
+    val rv: R.Result[bool, str] =
+        build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, rv64, ?plan);
+    if (R.is_err[bool, str](rv) || plan.active) { ret 1; }
     ret 0;
 }

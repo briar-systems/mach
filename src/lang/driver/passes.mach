@@ -577,15 +577,16 @@ val BACK_HALF_TEST_BIT: u64 = 0x100000000;
 
 # the packed Q_LOWER / Q_CODEGEN key for module `stable` under build mode
 # `test_mode`: the stable id in the low 32 bits, the test-mode flag in bit 32. A
-# test build (its `main` neutralized) and a normal build cache under distinct keys,
-# so the query-owned IR is never mutated in place to switch variants (#1858)
+# test build (tests present, `main` neutralized) and a normal build (tests absent)
+# cache under distinct keys, so query-owned IR is never mutated to switch variants
+# (#1858, #2320)
 pub fun back_half_key(stable: session.StableModuleId, test_mode: bool) u64 {
     var k: u64 = stable::u64;
     if (test_mode) { k = k | BACK_HALF_TEST_BIT; }
     ret k;
 }
 
-# whether a packed back-half key names the test-mode (neutralized-main) variant
+# whether a packed back-half key names the test-mode (tests present, `main` neutralized) variant
 fun back_half_key_is_test(key: u64) bool {
     ret (key & BACK_HALF_TEST_BIT) != 0;
 }
@@ -608,9 +609,9 @@ pub fun codegen_reusable(p: *project.Project, mid: session.ModuleId) bool {
     ret query.peek_valid(?p.s.queries, query.Q_CODEGEN, back_half_key(m.stable_id, test_build(p)));
 }
 
-# whether this build lowers the test variant (the module's `main` neutralized) -
-# the request's goal, folded into the back-half query keys so the test and
-# normal variants cache independently (#1858)
+# whether this build lowers the test variant (tests present, `main` neutralized) -
+# the request's goal, folded into the back-half query keys so it caches independently
+# from normal test-free IR (#1858, #2320)
 fun test_build(p: *project.Project) bool {
     val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
     ret request.test_goal(ctx.req.goal);
@@ -783,12 +784,13 @@ fun run_lower_one(p: *project.Project, mid: session.ModuleId) R.Result[bool, str
 # the Q_LOWERED_SURFACE derived compute - a deterministic byte fingerprint of the
 # module material that can monomorphize into an importer's IR (#1859). records a dep
 # on Q_RESOLVE(module), so any parse/resolve change refreshes it, then fingerprints
-# the module's whole source text MINUS the bodies of regular (non-generic,
-# non-comptime-param) functions: those bodies are emitted extern in importers and
-# never flow in, so an impl-only edit to one reproduces identical bytes and importers
-# reuse their lowered IR (the firewall). a generic-body, comptime-value, type-layout,
-# signature, or decorator edit changes these bytes and re-lowers importers. a plain
-# byte-valued derived kind (early-cutoff ON), keyed by StableModuleId
+# the module's whole source text MINUS bodies that cannot flow into an importer:
+# regular (non-generic, non-comptime-param) functions are emitted extern there,
+# and test declarations cannot be named outside their own test build. an edit to
+# either kind of body therefore reproduces identical bytes and importers reuse their
+# lowered IR (the firewall). a generic-body, comptime-value, type-layout, signature,
+# or decorator edit changes these bytes and re-lowers importers. a plain byte-valued
+# derived kind (early-cutoff ON), keyed by StableModuleId
 pub fun q_lowered_surface_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
     val ctx: *qctx.QueryCtx = db.ctx::*qctx.QueryCtx;
     if (ctx == nil) { ret R.err[query.QueryOutput, str]("Q_LOWERED_SURFACE: query db has no context"); }
@@ -826,12 +828,13 @@ pub fun q_lowered_surface_compute(db: *query.QueryDb, key: u64, alloc: *A.Alloca
 }
 
 # append the module's lowered surface to `fb`: the whole source text minus the byte
-# ranges of regular (non-generic, non-comptime-param) function bodies. the module's
-# top-level decls are walked in source order; each such body span is skipped, so its
-# contents never enter the fingerprint. everything else - signatures, generic and
-# comptime-param bodies, comptime values, record/union layouts, decorators, use/fwd -
-# is included verbatim. body spans nest inside their decls and decls do not overlap,
-# so the skipped ranges are strictly increasing and non-overlapping
+# ranges of bodies that cannot flow into an importer - regular (non-generic,
+# non-comptime-param) functions and tests. the module's declaration tree is walked
+# in source order; each such body span is skipped, so its contents never enter the
+# fingerprint. everything else - signatures, generic and comptime-param bodies,
+# comptime values, record/union layouts, decorators, use/fwd - is included verbatim.
+# body spans nest inside their decls and decls do not overlap, so the skipped ranges
+# are strictly increasing and non-overlapping
 fun fp_lowered_surface(fb: *dq.FpBuf, a: *ast.Ast, text: str) R.Result[bool, str] {
     val base:  *u8    = text::*u8;
     val total: usize  = str_len(text);
@@ -844,36 +847,83 @@ fun fp_lowered_surface(fb: *dq.FpBuf, a: *ast.Ast, text: str) R.Result[bool, str
     var i: u32 = 0;
     for (i < mod_node.decls_len) {
         val did: id.DeclId = a.decl_ids[mod_node.decls_start + i];
-        val d_opt: O.Option[*decl.Decl] = ast.get_decl(a, did);
-        if (O.is_some[*decl.Decl](d_opt)) {
-            val bs_o: O.Option[token.Span] = regular_fn_body_span(a, O.unwrap[*decl.Decl](d_opt));
-            if (O.is_some[token.Span](bs_o)) {
-                val bs: token.Span = O.unwrap[token.Span](bs_o);
-                val w: R.Result[bool, str] = dq.fp_bytes(fb, ?base[cursor], (bs.offset - cursor)::u32);
-                if (R.is_err[bool, str](w)) { ret w; }
-                cursor = bs.offset + bs.len;
-            }
-        }
+        val w: R.Result[bool, str] = fp_non_flowing_decl_bodies(fb, a, base, did, ?cursor);
+        if (R.is_err[bool, str](w)) { ret w; }
         i = i + 1;
     }
     ret dq.fp_bytes(fb, ?base[cursor], (total - cursor)::u32);
 }
 
-# the source span of a regular function's body - the bytes to EXCLUDE from the lowered
-# surface - or none when `d` is not a body-carrying regular function. a function's body
-# flows into importers (and stays in the fingerprint) when the function is generic or
-# takes a comptime parameter; otherwise its body is emitted extern in importers and
-# excluded. non-function decls and body-less (extern/forward) functions yield none
-fun regular_fn_body_span(a: *ast.Ast, d: *decl.Decl) O.Option[token.Span] {
-    if (d.kind != decl.DECL_KIND_FUN) { ret O.none[token.Span](); }
-    if (d.data.fun_.body == id.STMT_NIL) { ret O.none[token.Span](); }
-    if (d.data.fun_.generics_len > 0) { ret O.none[token.Span](); }
-    var pi: u32 = 0;
-    for (pi < d.data.fun_.params_len) {
-        if (a.typed_names[d.data.fun_.params_start + pi].comptime) { ret O.none[token.Span](); }
-        pi = pi + 1;
+# append through the source before every non-flowing body under declaration `did`,
+# advancing `cursor` past each body. declaration-level comptime branches recurse
+# over every arm: inactive syntax remains part of the surface, but a regular
+# function or test body in any arm still cannot flow into an importer
+fun fp_non_flowing_decl_bodies(fb: *dq.FpBuf, a: *ast.Ast, base: *u8,
+                               did: id.DeclId, cursor: *usize) R.Result[bool, str] {
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(a, did);
+    if (O.is_none[*decl.Decl](d_opt)) {
+        ret R.err[bool, str]("Q_LOWERED_SURFACE: declaration id out of range");
     }
-    val st_o: O.Option[*stmt.Stmt] = ast.get_stmt(a, d.data.fun_.body);
+    val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+
+    val bs_o: O.Option[token.Span] = non_flowing_body_span(a, d);
+    if (O.is_some[token.Span](bs_o)) {
+        val bs: token.Span = O.unwrap[token.Span](bs_o);
+        if (bs.offset < @cursor) {
+            ret R.err[bool, str]("Q_LOWERED_SURFACE: declaration body spans overlap");
+        }
+        val w: R.Result[bool, str] = dq.fp_bytes(fb, ?base[@cursor], (bs.offset - @cursor)::u32);
+        if (R.is_err[bool, str](w)) { ret w; }
+        @cursor = bs.offset + bs.len;
+        ret R.ok[bool, str](true);
+    }
+
+    if (d.kind != decl.DECL_KIND_COMPTIME_IF) { ret R.ok[bool, str](true); }
+    var bi: u32 = 0;
+    for (bi < d.data.comptime_if.branches_len) {
+        val branch_ix: u32 = d.data.comptime_if.branches_start + bi;
+        if (branch_ix::usize >= a.comptime_branch_len) {
+            ret R.err[bool, str]("Q_LOWERED_SURFACE: comptime branch index out of range");
+        }
+        val branch: *decl.ComptimeBranch = ?a.comptime_branches[branch_ix];
+        var di: u32 = 0;
+        for (di < branch.body_len) {
+            val pool_ix: u32 = branch.body_start + di;
+            if (pool_ix::usize >= a.decl_id_len) {
+                ret R.err[bool, str]("Q_LOWERED_SURFACE: comptime declaration index out of range");
+            }
+            val w: R.Result[bool, str] = fp_non_flowing_decl_bodies(fb, a, base, a.decl_ids[pool_ix], cursor);
+            if (R.is_err[bool, str](w)) { ret w; }
+            di = di + 1;
+        }
+        bi = bi + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# the source span of a body that cannot flow into an importer's IR - the bytes to
+# EXCLUDE from the lowered surface - or none. every test body is module-local and
+# belongs only to the test variant. a function body flows into importers (and stays
+# in the fingerprint) when the function is generic or takes a comptime parameter;
+# otherwise it is emitted extern there and excluded. other declarations and
+# body-less (extern/forward) functions yield none
+fun non_flowing_body_span(a: *ast.Ast, d: *decl.Decl) O.Option[token.Span] {
+    var body: id.StmtId = id.STMT_NIL;
+    if (d.kind == decl.DECL_KIND_TEST) {
+        body = d.data.test_.body;
+    }
+    or (d.kind == decl.DECL_KIND_FUN) {
+        if (d.data.fun_.generics_len > 0) { ret O.none[token.Span](); }
+        var pi: u32 = 0;
+        for (pi < d.data.fun_.params_len) {
+            if (a.typed_names[d.data.fun_.params_start + pi].comptime) { ret O.none[token.Span](); }
+            pi = pi + 1;
+        }
+        body = d.data.fun_.body;
+    }
+    if (body == id.STMT_NIL) { ret O.none[token.Span](); }
+
+    val st_o: O.Option[*stmt.Stmt] = ast.get_stmt(a, body);
     if (O.is_none[*stmt.Stmt](st_o)) { ret O.none[token.Span](); }
     ret O.some[token.Span](O.unwrap[*stmt.Stmt](st_o).span);
 }
@@ -894,10 +944,11 @@ fun regular_fn_body_span(a: *ast.Ast, d: *decl.Decl) O.Option[token.Span] {
 #     lowering firewall: an inlined instance can originate in a transitively-
 #     imported module the direct closure omits (#1618).
 # the key packs the module's stable id with the test-mode flag (back_half_key): the
-# test-mode variant neutralizes the module's `main` on its own freshly-lowered IR
-# before caching, so the two variants cache independently and query-owned IR is never
-# mutated in place (#1858). the deps below key on the stable id alone (test-mode does
-# not fan a module's typing)
+# test-mode variant includes test declarations and neutralizes the module's `main`
+# on its own freshly-lowered IR before caching; the normal variant omits test IR.
+# the two variants cache independently and query-owned IR is never mutated in place
+# (#1858, #2320). the deps below key on the stable id alone (test-mode does not fan
+# a module's typing)
 pub fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
     val ctx: *qctx.QueryCtx = db.ctx::*qctx.QueryCtx;
     if (ctx == nil) { ret R.err[query.QueryOutput, str]("Q_LOWER: query db has no context"); }
@@ -957,7 +1008,7 @@ pub fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Res
     }
     free_lower_closure(s.alloc, ?cl);
 
-    val res_lower: R.Result[ir.Module, str] = lower.lower_module(s, ?p.target, a, m.fqn, mid, sr, m.resolve_result, ?m.ctx, ctx.req.debug);
+    val res_lower: R.Result[ir.Module, str] = lower.lower_module(s, ?p.target, a, m.fqn, mid, sr, m.resolve_result, ?m.ctx, test_mode, ctx.req.debug);
     if (R.is_err[ir.Module, str](res_lower)) { ret R.err[query.QueryOutput, str](R.unwrap_err[ir.Module, str](res_lower)); }
     var irmod: ir.Module = R.unwrap_ok[ir.Module, str](res_lower);
 
@@ -1182,9 +1233,9 @@ fun run_codegen_one(p: *project.Project, mid: session.ModuleId) R.Result[bool, s
 #                      hash-and-skip);
 #   - Q_TARGET:        a build-config change re-codegens every module.
 # the key is the same packed (stable id, test-mode) key as Q_LOWER, so the Q_LOWER
-# dep names the matching variant and a test build codegens the neutralized IR while a
-# normal build codegens the untouched IR (#1858). emits no assembly side-channel (the
-# `.s` debug artifact is rendered by the CLI from the borrowed IR when requested)
+# dep names the matching variant. a test build codegens tests with `main` neutralized;
+# a normal build codegens test-free IR (#1858, #2320). emits no assembly side-channel
+# (the `.s` debug artifact is rendered by the CLI from the borrowed IR when requested)
 pub fun q_codegen_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Result[query.QueryOutput, str] {
     val ctx: *qctx.QueryCtx = db.ctx::*qctx.QueryCtx;
     if (ctx == nil) { ret R.err[query.QueryOutput, str]("Q_CODEGEN: query db has no context"); }
@@ -1467,6 +1518,10 @@ fun write_build_config(fb: *dq.FpBuf, p: *project.Project) R.Result[bool, str] {
     val a5: R.Result[bool, str] = dq.fp_u32(fb, p.target_entry.os_name::u32);  if (R.is_err[bool, str](a5)) { ret a5; }
     val a6: R.Result[bool, str] = dq.fp_u32(fb, p.target_entry.isa_name::u32); if (R.is_err[bool, str](a6)) { ret a6; }
     val a7: R.Result[bool, str] = dq.fp_u32(fb, p.target_entry.abi_name::u32); if (R.is_err[bool, str](a7)) { ret a7; }
+    # platform tag folds comptime output and base overrides the linked image base;
+    # both must key the cache so two builds differing only in these don't alias.
+    val apl: R.Result[bool, str] = dq.fp_u32(fb, p.target_entry.platform_name::u32); if (R.is_err[bool, str](apl)) { ret apl; }
+    val abz: R.Result[bool, str] = dq.fp_u64(fb, p.target.base);        if (R.is_err[bool, str](abz)) { ret abz; }
     val a8: R.Result[bool, str] = dq.fp_u32(fb, p.config.id::u32);      if (R.is_err[bool, str](a8)) { ret a8; }
     val a9: R.Result[bool, str] = dq.fp_u32(fb, p.config.version::u32); if (R.is_err[bool, str](a9)) { ret a9; }
     val aa: R.Result[bool, str] = dq.fp_u32(fb, p.config.name::u32);    if (R.is_err[bool, str](aa)) { ret aa; }

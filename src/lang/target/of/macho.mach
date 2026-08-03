@@ -85,6 +85,8 @@ val LC_DYSYMTAB:      u32 = 0xB;
 val LC_UNIXTHREAD:    u32 = 0x5;
 val LC_LOAD_DYLIB:    u32 = 0xC;
 val LC_LOAD_DYLINKER: u32 = 0xE;
+# LC_REQ_DYLD marks LC_RPATH as required for correct loading semantics
+val LC_RPATH:         u32 = 0x8000001C;
 # the LC_REQ_DYLD bit is set on LC_DYLD_INFO_ONLY so a loader that cannot read
 # the compressed dyld-info stream refuses the image rather than mis-loading it
 val LC_DYLD_INFO_ONLY: u32 = 0x80000022;
@@ -171,6 +173,7 @@ val DYSYMTAB_CMD_SIZE:   usize = 80;
 val DYLD_INFO_CMD_SIZE:  usize = 48;   # cmd + cmdsize + 5 (off,size) pairs
 val DYLINKER_CMD_BASE:   usize = 12;   # cmd + cmdsize + name lc_str offset
 val DYLIB_CMD_BASE:      usize = 24;   # the dylib lc_str, then 3 version words
+val RPATH_CMD_BASE:      usize = 12;   # cmd + cmdsize + path lc_str offset
 val NLIST_64_SIZE:       usize = 16;
 val RELOC_INFO_SIZE:     usize = 8;
 
@@ -1568,18 +1571,21 @@ fun macho_dwarf_cmd_bytes(debug_count: u32) usize {
     ret SEGMENT_CMD_64_SIZE + debug_count::usize * SECTION_64_SIZE;
 }
 
-# plan the __DWARF segment's file region starting at offset `base` (past the linker
-# segments, below the code signature). allocates the per-section offset array on
+# plan the __DWARF segment's file region after offset `base` (past the linker
+# segments, below the code signature). every Mach-O segment's file offset must be
+# page-aligned even when its vm size is zero, so the debug region starts at the
+# target's segment alignment (#2327). allocates the per-section offset array on
 # success; the caller frees it through `macho_dwarf_free`. an empty plan (no debug)
 # allocates nothing
 # ---
 # alloc:       allocator backing the plan's offset array
 # debug:       the non-allocated debug sections
 # debug_count: number of debug sections
-# base:        file offset where the segment's bytes begin
+# base:        file offset after the preceding segment's bytes
+# segment_align: target page alignment required for an LC_SEGMENT_64 file offset
 # ret:         the layout plan, or an allocation error
 fun macho_dwarf_plan(alloc: *A.Allocator, debug: *of.Section, debug_count: u32,
-                     base: usize) R.Result[MachoDwarf, str] {
+                     base: usize, segment_align: usize) R.Result[MachoDwarf, str] {
     var d: MachoDwarf;
     d.present = false; d.seg_foff = 0; d.seg_size = 0; d.end = base; d.sec_offs = nil;
     if (debug_count == 0) { ret R.ok[MachoDwarf, str](d); }
@@ -1588,7 +1594,7 @@ fun macho_dwarf_plan(alloc: *A.Allocator, debug: *of.Section, debug_count: u32,
     if (R.is_err[*usize, str](ro)) { ret R.err[MachoDwarf, str](R.unwrap_err[*usize, str](ro)); }
     d.sec_offs = R.unwrap_ok[*usize, str](ro);
 
-    val seg_foff: usize = bin.align_up(base, 8);
+    val seg_foff: usize = bin.align_up(base, segment_align);
     var cur: usize = seg_foff;
     var di: u32 = 0;
     for (di < debug_count) {
@@ -1798,7 +1804,8 @@ fun emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable
     # the __DWARF segment's byte region follows the linker segments (below the code
     # signature so the signature covers it). extends total_size when present.
     var dw: MachoDwarf;
-    val dwp: R.Result[MachoDwarf, str] = macho_dwarf_plan(alloc, debug, debug_count, total_size);
+    val dwp: R.Result[MachoDwarf, str] =
+        macho_dwarf_plan(alloc, debug, debug_count, total_size, macho_page_size(arch_id)::usize);
     if (R.is_err[MachoDwarf, str](dwp)) {
         if (seg_offsets != nil) { A.deallocate[usize](alloc, seg_offsets, seg_count::usize); }
         ret R.err[bool, str](R.unwrap_err[MachoDwarf, str](dwp));
@@ -2106,6 +2113,13 @@ fun dylib_cmd_size(name: str) usize {
     ret bin.align_up(DYLIB_CMD_BASE + n + 1, 8);
 }
 
+# the byte size of an LC_RPATH command for one runtime search directory
+fun rpath_cmd_size(name: str) usize {
+    var n: usize = 0;
+    if (name != nil) { n = str_len(name); }
+    ret bin.align_up(RPATH_CMD_BASE + n + 1, 8);
+}
+
 # write the LC_LOAD_DYLINKER command naming the dynamic loader
 # ---
 # buf: the output buffer
@@ -2139,6 +2153,26 @@ fun write_load_dylib(buf: *u8, off: usize, name: str) usize {
     bin.write_u32_le(buf, off + 20, 0x10000);
     bin.write_str(buf, off + DYLIB_CMD_BASE, name);
     ret off + sz;
+}
+
+# write one LC_RPATH command naming a runtime search directory
+fun write_rpath(buf: *u8, off: usize, name: str) usize {
+    val sz: usize = rpath_cmd_size(name);
+    bin.write_u32_le(buf, off, LC_RPATH);
+    bin.write_u32_le(buf, off + 4, sz::u32);
+    bin.write_u32_le(buf, off + 8, RPATH_CMD_BASE::u32);
+    bin.write_str(buf, off + RPATH_CMD_BASE, name);
+    ret off + sz;
+}
+
+# whether a dependency's run path already appeared in the preceding prefix
+fun rpath_seen_before(libs: *of.DynLib, end: u32, rpath: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < end) {
+        if (libs[i].rpath == rpath) { ret true; }
+        i = i + 1;
+    }
+    ret false;
 }
 
 # write the LC_UNIXTHREAD command carrying the entry point in the arch's thread
@@ -2860,9 +2894,20 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
                           + dylinker_cmd_size() + entry_cmd_size + LINKEDIT_DATA_CMD_SIZE;   # + LC_CODE_SIGNATURE
     if (pie) { sizeofcmds = sizeofcmds + BUILD_VERSION_CMD_SIZE + UUID_CMD_SIZE; }
     var di: u32 = 0;
-    for (di < dyn.lib_count) { sizeofcmds = sizeofcmds + dylib_cmd_size(bin.resolve_name(itn, dyn.libs[di].soname)); di = di + 1; }
+    var rpath_count: u32 = 0;
+    for (di < dyn.lib_count) {
+        sizeofcmds = sizeofcmds + dylib_cmd_size(bin.resolve_name(itn, dyn.libs[di].soname));
+        if (dyn.libs[di].rpath != intern.STR_NIL
+            && !rpath_seen_before(dyn.libs, di, dyn.libs[di].rpath)) {
+            sizeofcmds = sizeofcmds
+                + rpath_cmd_size(bin.resolve_name(itn, dyn.libs[di].rpath));
+            rpath_count = rpath_count + 1;
+        }
+        di = di + 1;
+    }
 
-    var ncmds: u32 = seg_cmds + 6 + dyn.lib_count;   # dyld_info,symtab,dysymtab,dylinker,entry,code_signature
+    var ncmds: u32 = seg_cmds + 6 + dyn.lib_count + rpath_count;
+    # dyld_info,symtab,dysymtab,dylinker,entry,code_signature + dylibs + rpaths
     if (pie) { ncmds = ncmds + 2; }                  # LC_BUILD_VERSION + LC_UUID
 
     # a non-mapped __DWARF segment (debug sections) is placed below the code
@@ -2949,7 +2994,8 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     # the non-mapped __DWARF segment's byte region, below __LINKEDIT (and thus below
     # the code signature, which covers it). extends `file` when present.
     var dw: MachoDwarf;
-    val dwp: R.Result[MachoDwarf, str] = macho_dwarf_plan(alloc, debug, debug_count, file);
+    val dwp: R.Result[MachoDwarf, str] =
+        macho_dwarf_plan(alloc, debug, debug_count, file, page);
     if (R.is_err[MachoDwarf, str](dwp)) {
         A.deallocate[usize](alloc, seg_offsets, seg_count::usize);
         ret R.err[bool, str](R.unwrap_err[MachoDwarf, str](dwp));
@@ -3146,8 +3192,17 @@ fun emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVT
     bin.write_u32_le(buf, lc + 28, nimp);                   # nundefsym
     lc = lc + DYSYMTAB_CMD_SIZE;
 
-    # LC_LOAD_DYLINKER, then one LC_LOAD_DYLIB per dependency.
+    # LC_LOAD_DYLINKER, each distinct required LC_RPATH, then one LC_LOAD_DYLIB
+    # per dependency.
     lc = write_load_dylinker(buf, lc);
+    di = 0;
+    for (di < dyn.lib_count) {
+        if (dyn.libs[di].rpath != intern.STR_NIL
+            && !rpath_seen_before(dyn.libs, di, dyn.libs[di].rpath)) {
+            lc = write_rpath(buf, lc, bin.resolve_name(itn, dyn.libs[di].rpath));
+        }
+        di = di + 1;
+    }
     di = 0;
     for (di < dyn.lib_count) {
         lc = write_load_dylib(buf, lc, bin.resolve_name(itn, dyn.libs[di].soname));
@@ -3702,6 +3757,23 @@ fun t_find_lc(buf: *u8, cmd: u32) usize {
     var c: u32 = 0;
     for (c < ncmds) {
         if (bin.read_u32_le(buf, off) == cmd) { ret off; }
+        off = off + bin.read_u32_le(buf, off + 4)::usize;
+        c = c + 1;
+    }
+    ret 0;
+}
+
+# locate the file offset of the LC_SEGMENT_64 named `name`; returns 0 when absent
+# ---
+# buf:  the Mach-O bytes
+# name: the segment name to match
+# ret:  the load command's file offset, or 0 if not present
+fun t_find_seg(buf: *u8, name: str) usize {
+    val ncmds: u32 = bin.read_u32_le(buf, 16);
+    var off: usize = MACH_HEADER_64_SIZE;
+    var c: u32 = 0;
+    for (c < ncmds) {
+        if (bin.read_u32_le(buf, off) == LC_SEGMENT_64 && fixed16_equals(buf, off + 8, name)) { ret off; }
         off = off + bin.read_u32_le(buf, off + 4)::usize;
         c = c + 1;
     }
@@ -4389,7 +4461,9 @@ fun ts_dyn_exec(arch_id: u32) u8 {
     segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?code[0];
 
     var libs: [1]of.DynLib;
-    libs[0].soname = t_intern(?itn, "libprobe.dylib");
+    libs[0].name = t_intern(?itn, "probe");
+    libs[0].soname = t_intern(?itn, "@rpath/libprobe.dylib");
+    libs[0].rpath = t_intern(?itn, "/opt/probe/lib");
     var imps: [1]of.DynImport;
     imps[0].symbol = t_intern(?itn, "probe_add");
     imps[0].lib_index = 0;
@@ -4404,13 +4478,20 @@ fun ts_dyn_exec(arch_id: u32) u8 {
     fx[0].seg_index = 0; fx[0].seg_offset = fixup_off; fx[0].import_index = 0;
     fx[0].patch_vaddr = base + fixup_off::u64; fx[0].addend = fixup_add;
 
+    var debug_bytes: [3]u8;
+    debug_bytes[0] = 0x11; debug_bytes[1] = 0x22; debug_bytes[2] = 0x33;
+    var dbg: [1]of.Section;
+    dbg[0].name = t_intern(?itn, ".debug_info"); dbg[0].kind = of.SK_DEBUG;
+    dbg[0].bytes = ?debug_bytes[0]; dbg[0].len = 3; dbg[0].align = 1;
+
     val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_dyn");
     if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
     val tpath: str = fs.temp_path(?tf);
 
     val em: R.Result[bool, str] = emit_dyn_exec(?alloc, ?itn, ?isa_vt, ?segs[0], 1, 4096, entry,
-                                                nil::*of.ExecFunction, 0, ?dyn, ?fx[0], 1, nil::*of.Section, 0, tpath::*u8, "machodyn"::*u8);
+                                                nil::*of.ExecFunction, 0, ?dyn, ?fx[0], 1,
+                                                ?dbg[0], 1, tpath::*u8, "machodyn"::*u8);
     if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
 
     val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
@@ -4422,6 +4503,12 @@ fun ts_dyn_exec(arch_id: u32) u8 {
     if (bin.read_u32_le(buf.data, 12) != MH_EXECUTE)                       { ret 1; }
     if (bin.read_u32_le(buf.data, 24) != (MH_DYLDLINK | MH_TWOLEVEL))      { ret 1; }
 
+    # XNU validates every segment's file offset before skipping a zero-vmsize
+    # segment, so the non-mapped __DWARF still starts on the architecture's page.
+    val dw: usize = t_find_seg(buf.data, "__DWARF");
+    if (dw == 0) { ret 1; }
+    if ((bin.read_u64_le(buf.data, dw + 40) % macho_page_size(arch_id)) != 0) { ret 1; }
+
     # the loader, the dependency, and the dyld bind stream.
     val dl: usize = t_find_lc(buf.data, LC_LOAD_DYLINKER);
     if (dl == 0)                                                           { ret 1; }
@@ -4429,6 +4516,9 @@ fun ts_dyn_exec(arch_id: u32) u8 {
     val ld: usize = t_find_lc(buf.data, LC_LOAD_DYLIB);
     if (ld == 0)                                                           { ret 1; }
     if (!t_bytes_contain(buf.data, ld, bin.read_u32_le(buf.data, ld + 4)::usize, "libprobe.dylib")) { ret 1; }
+    val rp: usize = t_find_lc(buf.data, LC_RPATH);
+    if (rp == 0)                                                           { ret 1; }
+    if (!t_bytes_contain(buf.data, rp, bin.read_u32_le(buf.data, rp + 4)::usize, "/opt/probe/lib")) { ret 1; }
 
     val info: usize = t_find_lc(buf.data, LC_DYLD_INFO_ONLY);
     if (info == 0)                                                         { ret 1; }
@@ -4461,23 +4551,6 @@ fun ts_dyn_exec(arch_id: u32) u8 {
     val sig_off: usize = bin.read_u32_le(buf.data, cs + 8)::usize;
     if (bin.read_u32_be(buf.data, sig_off) != CSMAGIC_EMBEDDED_SIGNATURE) { ret 1; }
     if (bin.read_u32_be(buf.data, sig_off + SUPERBLOB_HEADER_SIZE) != CSMAGIC_CODEDIRECTORY) { ret 1; }
-    ret 0;
-}
-
-# locate the file offset of the LC_SEGMENT_64 named `name`; returns 0 when absent
-# ---
-# buf:  the Mach-O bytes
-# name: the segment name to match
-# ret:  the load command's file offset, or 0 if not present
-fun t_find_seg(buf: *u8, name: str) usize {
-    val ncmds: u32 = bin.read_u32_le(buf, 16);
-    var off: usize = MACH_HEADER_64_SIZE;
-    var c: u32 = 0;
-    for (c < ncmds) {
-        if (bin.read_u32_le(buf, off) == LC_SEGMENT_64 && fixed16_equals(buf, off + 8, name)) { ret off; }
-        off = off + bin.read_u32_le(buf, off + 4)::usize;
-        c = c + 1;
-    }
     ret 0;
 }
 
@@ -5039,6 +5112,12 @@ fun ts_exec_debug_roundtrip() u8 {
     # the emitted __DWARF sections carry the Mach-O spelling, not the ELF-canonical one.
     if (!t_bytes_contain(buf.data, 0, buf.len, "__debug_info")) { ret 1; }
     if (!t_bytes_contain(buf.data, 0, buf.len, "__debug_line")) { ret 1; }
+
+    # the kernel applies its segment file-offset alignment check before accepting
+    # __DWARF's zero vm size, so this non-mapped segment still starts on a page.
+    val dw: usize = t_find_seg(buf.data, "__DWARF");
+    if (dw == 0) { ret 1; }
+    if ((bin.read_u64_le(buf.data, dw + 40) % macho_page_size(isa.ARCH_X86_64)) != 0) { ret 1; }
 
     # re-read the emitted executable through the mach-o parser.
     var img: of.ObjectImage;
