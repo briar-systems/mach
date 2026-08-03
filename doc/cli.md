@@ -505,13 +505,11 @@ instruction set's back half — a whole-module emitter needs a format that carri
 finished modules, a register machine one that carries linkable objects. `mach info
 targets` keeps a `<os>-<isa>` tuple only when some registered calling convention and
 object format compose an emittable full tuple — so `windows-aarch64` is absent (COFF
-covers x86-64 only), `darwin-riscv64` is absent (Mach-O covers x86-64 and
-aarch64), and `bmos-aarch64` is absent (the BareMetal kernel is x86-64 only),
-while freestanding tuples appear for every ISA with an encoder.
+covers x86-64 only) and `darwin-riscv64` is absent (Mach-O covers x86-64 and
+aarch64), while freestanding tuples appear for every ISA with an encoder.
 Selecting an uncovered tuple fails at composition naming the missing capability
-(for example `object format 'coff' does not cover aarch64 relocations`,
-`operating system 'windows' does not support object format 'elf'`, or `operating
-system 'bmos' does not run on instruction set 'aarch64'`) rather than
+(for example `object format 'coff' does not cover aarch64 relocations` or
+`operating system 'windows' does not support object format 'elf'`) rather than
 deep in codegen or link. Adding a capability declaration to a vtable is the only
 step needed for a new tuple to appear.
 
