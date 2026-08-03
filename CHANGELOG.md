@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.5.0] - 2026-08-03
+
+Retires bmos as a built-in OS in favor of the freestanding + platform-tag model,
+and lands a flat image's entry symbol at its base regardless of link order.
+
+### Removed
+- target: `os = "bmos"` and the `$mach.os.bmos` selector. A BareMetal target is now
+  a `freestanding` target with a `base` load-address override and a `platform =
+  "bmos"` tag; the kernel-call machinery lives in the external `mach-bmos` package,
+  gated on `$mach.build.platform`. bmos as a built-in OS never composed with the
+  standard library (#2408); the platform-tag replacement shipped in 4.4.0. The
+  mach-std pin advances to 0.21.0, which drops its bmos arm (#2426).
+
+### Fixed
+- link: a raw flat image's entry symbol is placed at the image base regardless of
+  module link order, rather than only when the runtime module links first (#2409).
+
 ## [4.4.0] - 2026-08-03
 
 Adds an open `platform` tag and a load-address `base` override to the target
