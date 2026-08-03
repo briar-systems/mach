@@ -221,7 +221,9 @@ decorated-decl ::= { decorator } decl
 - Clauses may appear on the same line (space-separated) or one per line.
 - The argument list is optional; a bare `#[inline]` carries no arguments.
 - Arguments are comptime expressions (not types): `$size_of(T)` is a valid
-  argument; `T` as a raw type name is not.
+  argument; `T` as a raw type name is not. A layout intrinsic argument is
+  further restricted by position — accepted on a global's `align`, rejected on a
+  record/union type's, see [decorators.md](decorators.md).
 - The closed directive set is `symbol`, `section`, `inline`, `align`,
   `library`, `oblivious`, `scalar`. See [decorators.md](decorators.md).
 - A backtick form (`` `name(args)` ``) existed through v2.3.0 and was removed in
@@ -415,7 +417,9 @@ Notes:
 - `*T` is a pointer; the untyped pointer type is the primitive name `ptr`
   (an ordinary `named-type`, not its own syntax).
 - `[N]T` is a fixed-length array; `N` is a full expression (a comptime
-  constant). Nesting (`[N][M]T`) falls out of the recursion.
+  constant). Nesting (`[N][M]T`) falls out of the recursion. A layout intrinsic
+  is not a usable `N` — the length is needed before layout is resolved — see
+  [comptime-intrinsics.md](comptime-intrinsics.md).
 - `named-type` covers both plain names (`i64`, `Point`) and generic
   instantiations (`Pair[i64, u8]`, `Map[str, u32]`). The dotted path allows
   module-qualified names (`core.Thing`).

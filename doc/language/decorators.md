@@ -135,17 +135,29 @@ caller's instruction cache, or to hold code size down on a constrained target.
 ### `align(expr)` — alignment override
 
 Sets the alignment of a global variable or a record/union type. `expr` must
-be a comptime integer — either a literal or a comptime expression such as
-`$size_of(T)` or `$align_of(T)`.
+be a comptime integer.
+
+Which spellings are accepted depends on the target, because the two are decided
+at different points in the compile:
+
+| target | literal | `$size_of(T)` / `$align_of(T)` |
+|---|---|---|
+| global variable | yes | yes |
+| record / union type | yes | **no** |
+
+A type's alignment is settled while the layouts it would measure are themselves
+still being resolved, so a layout intrinsic has no value yet at that point; a
+global's alignment is decided later, once layout is known. Binding the intrinsic
+to a `val` first does not help — the same ordering applies. Tracked as #2442.
 
 ```mach
 #[align(64)]
 pub var cache_line: u8 = 0;
 
-#[align($size_of(Pair))]
+#[align($size_of(Pair))]   # ok: layout is known by the time a global is aligned
 pub var g_cmp: u8 = 0;
 
-#[align(32)]
+#[align(32)]               # ok: a literal needs no layout
 rec Over { a: u8; }
 ```
 
