@@ -365,15 +365,16 @@ project's modules, so a platform link requirement lives once — in the manifest
 needs it — and cascades to consumers. A standalone build and a consumed build use
 the same entries, so nothing behaves differently as a dependency.
 
-| Key      | Required | Meaning |
-|----------|----------|---------|
-| `source` | yes | `"system"` (a system library resolved by name), `"framework"` (a macOS framework), or `"local"` (a file on disk). |
-| `name`   | shape | Library/framework name — required for `source = "system"`/`"framework"`, forbidden for `"local"`. |
-| `path`   | shape | File path — required for `source = "local"`, forbidden otherwise. A template (see below). |
-| `os`     | yes | Filter axis: a canonical `os` value, `"*"` (any), an array of values, or `[]` (none). |
-| `isa`    | yes | Filter axis over `isa`, same forms. |
-| `abi`    | yes | Filter axis over `abi`, same forms. |
-| `export` | yes | `true` cascades this entry to consumers; `false` keeps it to this project's own builds. |
+| Key       | Required | Meaning |
+|-----------|----------|---------|
+| `source`  | yes | `"system"` (a system library resolved by name), `"framework"` (a macOS framework), or `"local"` (a file on disk). |
+| `name`    | shape | Library/framework name — required for `source = "system"`/`"framework"`, forbidden for `"local"`. |
+| `path`    | shape | File path — required for `source = "local"`, forbidden otherwise. A template (see below). |
+| `library` | no | Stable logical name used by `#[library("...")]`; defaults to the `[link.<name>]` table name. |
+| `os`      | yes | Filter axis: a canonical `os` value, `"*"` (any), an array of values, or `[]` (none). |
+| `isa`     | yes | Filter axis over `isa`, same forms. |
+| `abi`     | yes | Filter axis over `abi`, same forms. |
+| `export`  | yes | `true` cascades this entry to consumers; `false` keeps it to this project's own builds. |
 
 The `os`/`isa`/`abi` axes select the build cells an entry applies to. Each takes a
 single canonical value, `"*"` for any, or an array — `os = "linux"` and
@@ -385,9 +386,22 @@ A `local` entry's `path` must, at build time, either match a `[step.X]`'s `out`
 (which demands that step) or already exist on disk — anything else is an up-front
 error, so a typo never silently drops an input.
 
+`library` decouples source attribution from platform loader spelling. Give
+mutually exclusive platform entries the same logical value when they provide the
+same API; one unconditional `#[library("glfw")]` can then bind against
+`libglfw.so.3` on Linux, an `LC_ID_DYLIB` install name on Darwin, and
+`glfw3.dll` on Windows. Exact canonical loader names remain accepted for
+compatibility. Selecting two dependencies that map the same logical name to
+different loader names in one build is an error. A logical name that equals a
+different dependency's canonical loader name is likewise rejected, so
+attribution never depends on requirement order.
+
 Whether an input links **statically** or **dynamically** follows the resolved file
-— a loose `.o` or static `.a` links statically; a shared `.so` is recorded as a
-dynamic dependency by its `DT_SONAME`. See
+— a loose `.o` or static `.a` links statically; ELF `.so`, Mach-O `.dylib`,
+and PE `.dll` inputs are recorded using their format's canonical loader name.
+An `@rpath/` Mach-O install name also retains the directory where resolution found
+the dylib, which the executable records as `LC_RPATH`. Darwin frameworks use a
+version-independent system framework path. See
 [cli.md](cli.md#static-vs-dynamic-resolution) for the resolution rules and
 [language/ext-fun.md](language/ext-fun.md#linking-external-objects) for the
 `ext fun` workflow that consumes these inputs.
@@ -644,6 +658,7 @@ out     = "out/{target.name}/{profile.name}"
 [link.glfw]
 source = "system"
 name   = "glfw"
+library = "glfw"
 os     = ["linux", "darwin"]
 isa    = "*"
 abi    = "*"
@@ -652,6 +667,7 @@ export = true
 [link.glfw-win]
 source = "system"
 name   = "glfw3.dll"
+library = "glfw"
 os     = ["windows"]
 isa    = "*"
 abi    = "*"
@@ -664,6 +680,14 @@ os     = ["darwin"]
 isa    = "*"
 abi    = "*"
 export = true
+```
+
+Both GLFW entries expose the logical name `glfw`, so the binding can use the
+same attribution on every target:
+
+```mach
+#[library("glfw")]
+pub ext fun glfwInit() i32;
 ```
 
 ## Worked example: a vendored-C dependency
