@@ -217,6 +217,22 @@ pub val FIELD_SEL_OFFSET: u8 = 2;
 # installs this hook with `set_field_resolver`
 pub def FieldMemberFn: fun(ptr, u32, u32, u8) R.Result[O.Option[CTValue], str];
 
+# the questions a comptime type query answers about one already-resolved type
+# (#2128). `eval` holds no type universe, so the typed layer installs the answer
+# with `set_type_query_resolver`, the same shape as the field-member hook above.
+pub val TYPE_QUERY_IS_RECORD:  u8 = 0;  # a record, or an instance of one
+pub val TYPE_QUERY_IS_UNION:   u8 = 1;  # a union, or an instance of one
+pub val TYPE_QUERY_IS_POINTER: u8 = 2;  # the raw `ptr` or a typed `*T`
+pub val TYPE_QUERY_NAME:       u8 = 3;  # the type's spelling, as a string
+
+# answers one TYPE_QUERY_* about a TypeId: a bool for the predicates, a string for
+# the name, or none when this context cannot answer (no resolver installed)
+pub def TypeQueryFn: fun(ptr, u32, u8) R.Result[O.Option[CTValue], str];
+
+# surfaced when a type predicate is used where no type query resolver is installed
+pub val COMPTIME_TYPE_QUERY_NO_RESOLVER_MSG: str =
+    "a comptime type predicate is only evaluable after type checking";
+
 # surfaced when a field-descriptor member is read
 # in a context that installed no field resolver (every pass before sema)
 pub val COMPTIME_FIELD_NO_RESOLVER_MSG: str =
@@ -328,6 +344,8 @@ pub rec ComptimeCtx {
     type_data:      ptr;
     field_fn:       *u8;
     field_data:     ptr;
+    query_fn:       *u8;
+    query_data:     ptr;
 }
 
 val INITIAL_CONST_CAP: u32 = 8;
@@ -439,6 +457,16 @@ pub fun set_type_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
 pub fun set_field_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
     c.field_fn   = fn;
     c.field_data = data;
+}
+
+# install the type-query resolver `eval` calls to answer a type predicate (#2128)
+# ---
+# c:    the comptime context
+# fn:   erased TypeQueryFn, or nil to clear
+# data: opaque context handed back to `fn`
+pub fun set_type_query_resolver(c: *ComptimeCtx, fn: *u8, data: ptr) {
+    c.query_fn   = fn;
+    c.query_data = data;
 }
 
 # bind the manifest-derived project metadata, the selected
@@ -718,6 +746,11 @@ pub fun eval(
     # asking the evaluator (#2442) - so what reaches this arm is a position with no
     # layout to force: a `$if` / `$or` condition, or a `$assert` once it evaluates.
     if (k == expr.EXPR_KIND_CALL) {
+        # a type predicate answers about the SHAPE of its operand type rather than
+        # its storage, so it folds here in the comptime channel - which is where the
+        # `$if` gate that consumes it is decided (#2128).
+        val q: O.Option[R.Result[CTValue, str]] = eval_type_query(c, a, source, e, interner);
+        if (O.is_some[R.Result[CTValue, str]](q)) { ret O.unwrap[R.Result[CTValue, str]](q); }
         if (is_layout_intrinsic_call(a, source, e)) {
             ret R.err[CTValue, str]("a layout intrinsic has no value in this position: it measures a type's storage, which only a type position resolves");
         }
@@ -1328,7 +1361,11 @@ pub fun intrinsic_takes_type_operand(source: str, full: token.Span) bool {
     ret view_eq_str(text, "size_of")
      || view_eq_str(text, "align_of")
      || view_eq_str(text, "offset_of")
-     || view_eq_str(text, "fields");
+     || view_eq_str(text, "fields")
+     || view_eq_str(text, "is_record")
+     || view_eq_str(text, "is_union")
+     || view_eq_str(text, "is_pointer")
+     || view_eq_str(text, "type_name");
 }
 
 # whether `eid` is a `$type_of(arg)` intrinsic call, recognized
@@ -1607,6 +1644,76 @@ fun eval_type_comparison(
 # `$type_of(...)` or type-name operand resolves through the installed type
 # resolver (#1472). errors when no resolver is installed, or when the operand has
 # no resolvable type identity
+# fold `$is_record(T)` / `$is_union(T)` / `$is_pointer(T)` / `$type_name(T)` (#2128)
+#
+# These ask about the SHAPE of a type rather than its storage, which is what makes
+# them the missing half of reflection-driven generics: `$fields` can now descend
+# into a field's own type (#2454), but only a predicate can say whether descending
+# is meaningful. The operand is resolved through the same path a type comparison
+# uses, so a type spelling, an `f.type` field descriptor, and `$type_of(v)` are all
+# spellable here.
+#
+# eval holds no type universe, so the answer comes from the installed
+# TypeQueryFn; without one this is a context that cannot answer rather than a
+# false predicate, and says so.
+# ---
+# ret: none when `e` is not one of the four, else the folded answer or an error
+fun eval_type_query(
+    c:        *ComptimeCtx,
+    a:        *ast.Ast,
+    source:   str,
+    e:        id.ExprId,
+    interner: *intern.Interner
+) O.Option[R.Result[CTValue, str]] {
+    var which: u8 = TYPE_QUERY_IS_RECORD;
+    if      (is_comptime_call(a, source, e, "is_record"))  { which = TYPE_QUERY_IS_RECORD; }
+    or      (is_comptime_call(a, source, e, "is_union"))   { which = TYPE_QUERY_IS_UNION; }
+    or      (is_comptime_call(a, source, e, "is_pointer")) { which = TYPE_QUERY_IS_POINTER; }
+    or      (is_comptime_call(a, source, e, "type_name"))  { which = TYPE_QUERY_NAME; }
+    or      { ret O.none[R.Result[CTValue, str]](); }
+
+    val arg: id.ExprId = first_call_arg(a, e);
+    if (arg == id.EXPR_NIL) {
+        ret O.some[R.Result[CTValue, str]](
+            R.err[CTValue, str]("a comptime type query takes one type argument"));
+    }
+
+    val tv: R.Result[CTValue, str] = eval_type_operand(c, a, source, arg, interner);
+    if (R.is_err[CTValue, str](tv)) { ret O.some[R.Result[CTValue, str]](tv); }
+    val t: CTValue = R.unwrap_ok[CTValue, str](tv);
+    if (t.kind != CT_KIND_TYPE) {
+        ret O.some[R.Result[CTValue, str]](
+            R.err[CTValue, str]("a comptime type query's argument must name a type"));
+    }
+
+    if (c.query_fn == nil) {
+        ret O.some[R.Result[CTValue, str]](R.err[CTValue, str](COMPTIME_TYPE_QUERY_NO_RESOLVER_MSG));
+    }
+    val fn: TypeQueryFn = c.query_fn::TypeQueryFn;
+    val r: R.Result[O.Option[CTValue], str] = fn(c.query_data, t.data.t, which);
+    if (R.is_err[O.Option[CTValue], str](r)) {
+        ret O.some[R.Result[CTValue, str]](R.err[CTValue, str](R.unwrap_err[O.Option[CTValue], str](r)));
+    }
+    val ans: O.Option[CTValue] = R.unwrap_ok[O.Option[CTValue], str](r);
+    if (O.is_none[CTValue](ans)) {
+        ret O.some[R.Result[CTValue, str]](R.err[CTValue, str](COMPTIME_TYPE_QUERY_NO_RESOLVER_MSG));
+    }
+    ret O.some[R.Result[CTValue, str]](R.ok[CTValue, str](O.unwrap[CTValue](ans)));
+}
+
+# whether `eid` is one of the four comptime type queries (#2128)
+pub fun is_type_query_call(a: *ast.Ast, source: str, eid: id.ExprId) bool {
+    if (is_comptime_call(a, source, eid, "is_record"))  { ret true; }
+    if (is_comptime_call(a, source, eid, "is_union"))   { ret true; }
+    if (is_comptime_call(a, source, eid, "is_pointer")) { ret true; }
+    ret is_comptime_call(a, source, eid, "type_name");
+}
+
+# whether `eid` is the string-valued `$type_name(T)` rather than a bool predicate
+pub fun is_type_name_call(a: *ast.Ast, source: str, eid: id.ExprId) bool {
+    ret is_comptime_call(a, source, eid, "type_name");
+}
+
 fun eval_type_operand(
     c:        *ComptimeCtx,
     a:        *ast.Ast,
@@ -2507,6 +2614,18 @@ pub fun ct_str(s: intern.StrId) CTValue {
     var v: CTValue;
     v.kind   = CT_KIND_STR;
     v.data.s = s;
+    ret v;
+}
+
+# a comptime bool value, for a caller outside this module building a predicate
+# answer (#2128)
+# ---
+# b:   the answer
+# ret: a CT_KIND_BOOL value
+pub fun ct_bool(b: bool) CTValue {
+    var v: CTValue;
+    v.kind   = CT_KIND_BOOL;
+    v.data.b = b;
     ret v;
 }
 
