@@ -277,6 +277,8 @@ pub fun reinfer_pack_each_body(
 
     sc.callee_eid       = id.EXPR_NIL;
     sc.in_comptime_gate = false;
+    sc.in_deferred_arm  = false;
+    sc.inst_site_set    = false;
     sc.in_fin           = false;
     sc.fin_loop_depth   = 0;
     sc.subst            = subst;
@@ -384,6 +386,8 @@ pub fun reinfer_instance_body(
 
     sc.callee_eid       = id.EXPR_NIL;
     sc.in_comptime_gate = false;
+    sc.in_deferred_arm  = false;
+    sc.inst_site_set    = false;
     sc.in_fin           = false;
     sc.fin_loop_depth   = 0;
     sc.subst            = subst;
@@ -471,8 +475,9 @@ fun drain_instances(sc: *context.SemaContext, deps: *context.SemaDeps) R.Result[
         val arg_len: u32              = sc.insts.items[idx].arg_len;
 
         val depth:   u32              = sc.insts.items[idx].depth;
+        val site:    token.Span        = sc.insts.items[idx].site;
 
-        val r: R.Result[bool, str] = revalidate_one(sc, deps, origin, decl, args, arg_len, sig, idx, depth);
+        val r: R.Result[bool, str] = revalidate_one(sc, deps, origin, decl, args, arg_len, sig, idx, depth, site);
         if (R.is_err[bool, str](r)) { ret r; }
         sc.insts.drained = sc.insts.drained + 1;
     }
@@ -502,10 +507,11 @@ fun drain_instances(sc: *context.SemaContext, deps: *context.SemaDeps) R.Result[
 # index:   this instance's worklist index, stamped as the parent of everything its
 #          body records so the derivation chain stays walkable (#2163)
 # depth:   this instance's own derivation depth
+# site:    the instantiation's call span, where a directive this body fires reports
 # ret:     true on a validated (or skipped) instance, or an allocation error
 fun revalidate_one(sc: *context.SemaContext, deps: *context.SemaDeps, origin: session.ModuleId,
                    decl_id: id.DeclId, args: *type.TypeId, arg_len: u32, sig: type.TypeId,
-                   index: u32, depth: u32) R.Result[bool, str] {
+                   index: u32, depth: u32, site: token.Span) R.Result[bool, str] {
     var oa:              *ast.Ast               = nil;
     var orr:             *resolve.ResolveResult = nil;
     var octx:            *comptime.ComptimeCtx  = nil;
@@ -584,6 +590,8 @@ fun revalidate_one(sc: *context.SemaContext, deps: *context.SemaDeps, origin: se
     tsc.decl_type        = scratch_decl;
     tsc.callee_eid       = id.EXPR_NIL;
     tsc.in_comptime_gate = false;
+    tsc.in_deferred_arm  = false;
+    tsc.inst_site_set    = false;
     tsc.in_fin           = false;
     tsc.fin_loop_depth   = 0;
     tsc.subst            = args;
@@ -627,7 +635,10 @@ fun revalidate_one(sc: *context.SemaContext, deps: *context.SemaDeps, origin: se
     comptime.set_field_resolver(octx, context.resolve_field_member::*u8, tscp::ptr);
     comptime.set_type_resolver(octx, context.resolve_type_comparison_operand::*u8, tscp::ptr);
     comptime.set_type_query_resolver(octx, infer.resolve_type_query::*u8, tscp::ptr);
+    tsc.inst_site     = site;
+    tsc.inst_site_set = true;
     val res: R.Result[bool, str] = infer_stmt(?tsc, d.data.fun_.body, ret_ty);
+    tsc.inst_site_set = false;
     comptime.set_field_resolver(octx, saved_ffn, saved_fd);
     comptime.set_type_resolver(octx, saved_tfn, saved_td);
     comptime.set_type_query_resolver(octx, saved_qfn, saved_qd);
@@ -764,6 +775,8 @@ fun init_context(
 
     sc.callee_eid       = id.EXPR_NIL;
     sc.in_comptime_gate = false;
+    sc.in_deferred_arm  = false;
+    sc.inst_site_set    = false;
     sc.in_fin           = false;
     sc.fin_loop_depth   = 0;
     sc.subst            = nil;
@@ -1664,14 +1677,22 @@ fun infer_stmt(sc: *context.SemaContext, sid: id.StmtId, fn_ret: type.TypeId) R.
 # target: the directive's target expression
 # span:   span to report the message against
 fun eval_comptime_directive(sc: *context.SemaContext, target: id.ExprId, span: token.Span) {
-    if (target == id.EXPR_NIL)                            { ret; }
+    if (target == id.EXPR_NIL)     { ret; }
+    # an arm of an unfolded chain is type-checked but not taken; its directives belong
+    # to the instance that selects it (#2465).
+    if (sc.in_deferred_arm)        { ret; }
+
+    # in a per-instance episode the directive is the template's but the mistake is the
+    # instantiation's, so it is reported there (#2465).
+    var at: token.Span = span;
+    if (sc.inst_site_set) { at = sc.inst_site; }
     if (!comptime.is_error_call(sc.a, sc.source, target)) { ret; }
     val res_msg: R.Result[str, str] = comptime.error_message(sc.ctx, sc.a, sc.source, target, ?sc.s.interner);
     if (R.is_err[str, str](res_msg)) {
-        context.report(sc, span, R.unwrap_err[str, str](res_msg));
+        context.report(sc, at, R.unwrap_err[str, str](res_msg));
         ret;
     }
-    context.report(sc, span, R.unwrap_ok[str, str](res_msg));
+    context.report(sc, at, R.unwrap_ok[str, str](res_msg));
 }
 
 # type-check a `$each <ident> in $fields(T) { body }` by unrolling it (#1473)
@@ -1907,7 +1928,12 @@ fun infer_stmt_comptime_if(sc: *context.SemaContext, start: u32, len: u32, fn_re
             # mistake - the second of them the very falsehood the gate error exists to
             # replace (#2464).
             if (!chain_bad) {
+                # the arms of a chain that did not fold are checked, not executed:
+                # this one may be the arm the instance discards (#2465).
+                val saved_def: bool = sc.in_deferred_arm;
+                sc.in_deferred_arm  = true;
                 val res_body: R.Result[bool, str] = infer_stmt_list(sc, arm.body_start, arm.body_len, fn_ret);
+                sc.in_deferred_arm  = saved_def;
                 if (R.is_err[bool, str](res_body)) { ret res_body; }
             }
             i = i + 1;
@@ -2133,6 +2159,14 @@ fun check_comptime_gate(sc: *context.SemaContext, eid: id.ExprId) {
             ret;
         }
         check_comptime_gate(sc, e.data.unary.operand);
+        ret;
+    }
+
+    # a comptime type query is a well-formed gate for the same reason a type
+    # comparison is: its operand names a type, validated by infer, and over a generic
+    # parameter it folds per instantiation rather than here (#2465). Without this
+    # exemption the deferral it needs would be reported as a non-constant gate.
+    if (k == expr.EXPR_KIND_CALL && comptime.is_type_query_call(sc.a, sc.source, eid)) {
         ret;
     }
 
