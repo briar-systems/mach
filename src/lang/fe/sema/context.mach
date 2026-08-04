@@ -22,6 +22,7 @@ use R: std.types.result;
 use mach.lang.diagnostic;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
+use mach.lang.fe.ast.stmt;
 use mach.lang.fe.ast.id;
 use mach.lang.fe.comptime;
 use mach.lang.fe.resolve;
@@ -103,6 +104,10 @@ fwd type.FieldTable;
 #          recorded while re-validating another instance's body
 # parent:  worklist index of the instance whose re-validation recorded this one,
 #          or INST_NONE at the root of a chain
+# site:    span of the call that requested this instantiation, so a diagnostic the
+#          re-validation raises lands on the instantiation rather than on the
+#          template - the template is shared by every instance and is not where the
+#          mistake is (#2465)
 pub rec InstReq {
     origin:  session.ModuleId;
     decl:    id.DeclId;
@@ -112,6 +117,7 @@ pub rec InstReq {
     bare:    intern.StrId;
     depth:   u32;
     parent:  u32;
+    site:    token.Span;
 }
 
 # `InstReq.parent` sentinel: recorded by the module pass, so it begins a chain
@@ -357,6 +363,27 @@ pub rec SemaContext {
     # forcing here.
     layout_state: *u8;
 
+    # the instantiation site of the episode currently being re-validated, and whether
+    # one is set (#2465).
+    #
+    # A comptime directive that fires during a per-instance episode is authored in the
+    # TEMPLATE, whose span is identical for every instantiation and is therefore not
+    # where the mistake is: `probe[u64]()` is. Only the directive report is re-pointed
+    # - a genuine type error in the template body still belongs at the template.
+    inst_site:     token.Span;
+    inst_site_set: bool;
+
+    # set while type-checking the arms of a chain whose gate could not be folded
+    # (#2465).
+    #
+    # A deferred chain checks EVERY arm structurally, which is right for typing and
+    # wrong for directives: an `$error` in the arm that the instance would not select
+    # fires anyway, so a template with a `$or { $error(...) }` guard reported for
+    # every instantiation including the valid ones. Directives in such an arm are
+    # skipped here and evaluated by the per-instance episode, where the gate folds and
+    # exactly one arm is live.
+    in_deferred_arm: bool;
+
     # set transiently by infer_call so infer_ident permits a comptime-parameter
     # function in callee position (a template, callable but not a value) and
     # rejects it in every other position.
@@ -494,6 +521,68 @@ pub fun arg_triggers_revalidation(sc: *SemaContext, tid: type.TypeId) bool {
 # instance out of the re-validation.
 # ---
 # sc:  sema context
+# whether declaration `decl` in module `origin` has a body carrying a TYPE-DEPENDENT
+# comptime directive - one whose answer differs per instantiation (#2465)
+#
+# The population is tiny and syntactic: a `$if` / `$or` gate or a `$each` whose
+# expression mentions `$type_of`, a type predicate, or `$fields`. Measured on the
+# tree at design time: zero such bodies in the compiler, three in the standard
+# library (derive's eq / fmt / hash). So this walk runs rarely and decides a
+# recording that would otherwise not happen at all.
+#
+# Cross-module is handled: the origin of an instantiated generic is a dependency,
+# already sema-analysed, so its Ast is registered on the session - the same
+# invariant the re-validation itself rests on. An unavailable Ast answers false,
+# which records nothing extra rather than guessing.
+# ---
+# sc:     sema context
+# origin: module declaring the generic
+# did:    the generic declaration
+# ret:    true when the body carries a directive whose answer is per-instance
+fun decl_body_has_type_directive(sc: *SemaContext, origin: session.ModuleId, did: id.DeclId) bool {
+    var a: *ast.Ast = sc.a;
+    if (origin != sc.own_module) { a = session.module_ast(sc.s, origin); }
+    if (a == nil) { ret false; }
+
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(a, did);
+    if (O.is_none[*decl.Decl](d_opt)) { ret false; }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+    if (d.kind != decl.DECL_KIND_FUN)        { ret false; }
+    if (d.data.fun_.body == id.STMT_NIL)     { ret false; }
+    ret stmt_has_type_directive(a, d.data.fun_.body);
+}
+
+# the recursive half of `decl_body_has_type_directive`, over one statement
+fun stmt_has_type_directive(a: *ast.Ast, sid: id.StmtId) bool {
+    if (sid == id.STMT_NIL) { ret false; }
+    val s_opt: O.Option[*stmt.Stmt] = ast.get_stmt(a, sid);
+    if (O.is_none[*stmt.Stmt](s_opt)) { ret false; }
+    val s: *stmt.Stmt = O.unwrap[*stmt.Stmt](s_opt);
+
+    if (s.kind == stmt.STMT_KIND_COMPTIME_IF) {
+        ret true;
+    }
+    if (s.kind == stmt.STMT_KIND_COMPTIME_EACH || s.kind == stmt.STMT_KIND_COMPTIME_ATTR) {
+        ret true;
+    }
+    if (s.kind == stmt.STMT_KIND_BLOCK) {
+        var i: u32 = 0;
+        for (i < s.data.block.stmts_len) {
+            if (stmt_has_type_directive(a, a.stmt_ids[s.data.block.stmts_start + i])) { ret true; }
+            i = i + 1;
+        }
+        ret false;
+    }
+    if (s.kind == stmt.STMT_KIND_IF) {
+        if (stmt_has_type_directive(a, s.data.if_.then_block)) { ret true; }
+        ret stmt_has_type_directive(a, s.data.if_.else_block);
+    }
+    if (s.kind == stmt.STMT_KIND_FOR) {
+        ret stmt_has_type_directive(a, s.data.for_.body);
+    }
+    ret false;
+}
+
 # tid: the TypeId to inspect
 # ret: true when a generic parameter appears on the spine
 fun type_mentions_generic_param(sc: *SemaContext, tid: type.TypeId) bool {
@@ -576,7 +665,7 @@ fun args_equal(a: *type.TypeId, b: *type.TypeId, n: u32) bool {
 #          failure the caller reports verbatim.
 pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.DeclId,
                         args: *type.TypeId, arg_len: u32, sig: type.TypeId,
-                        bare: intern.StrId) R.Result[u8, str] {
+                        bare: intern.StrId, site: token.Span) R.Result[u8, str] {
     if (!sc.collect_insts) { ret R.ok[u8, str](RECORD_OK); }
     if (arg_len == 0)      { ret R.ok[u8, str](RECORD_OK); }
 
@@ -596,6 +685,14 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
             && !type_mentions_generic_param(sc, args[i])) { any = true; }
         i = i + 1;
     }
+    # a body carrying a type-dependent comptime directive is recorded for EVERY
+    # instantiation, whatever its arguments (#2465). The secrecy/aggregate filters
+    # above ask whether an argument can reach a secret - the right question for the
+    # #2157 gates, and the wrong one entirely for a `$if ($is_record(T))`, whose
+    # answer differs per instance for arguments none of those filters care about.
+    # Without this `probe[u64]` is never recorded, its body never re-visited, and the
+    # gate never evaluated for that instance at all.
+    if (!any && decl_body_has_type_directive(sc, origin, decl)) { any = true; }
     if (!any) { ret R.ok[u8, str](RECORD_OK); }
 
     if (sc.insts != nil) {
@@ -658,6 +755,7 @@ pub fun record_instance(sc: *SemaContext, origin: session.ModuleId, decl: id.Dec
     slot.bare    = bare;
     slot.depth   = sc.inst_depth;
     slot.parent  = sc.inst_parent;
+    slot.site    = site;
     wl.len = wl.len + 1;
     ret R.ok[u8, str](RECORD_OK);
 }
