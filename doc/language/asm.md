@@ -67,21 +67,48 @@ An indirect call clobbers exactly as a direct one does — the callee's caller-s
 registers, which the surrounding block's barrier already covers. The register or
 memory holding the target is **read**, not written.
 
-## Raw bytes
+## Raw encodings
 
-`.byte` emits its values verbatim, for an encoding the ISA's mnemonic table does
-not name:
+Four data directives emit their values verbatim, for an encoding the ISA's mnemonic
+table does not name. They work on every target:
 
 ```mach
 asm x86_64 {
     .byte 0x0f, 0x01, 0xd0    # xgetbv
 }
+
+asm aarch64 {
+    .word 0xd53be040          # mrs x0, cntvct_el0
+}
+
+asm riscv64 {
+    .word 0xc0102573          # csrr a0, time
+}
 ```
 
-One directive carries a whole sequence (up to 256 values), not four. A value that
-does not fit in a byte is refused. Raw bytes are an instruction stream the parser
-cannot read, so the block's clobber set becomes **every register in every bank** —
-which is why a real mnemonic is always preferable where one exists.
+The widths are GNU as's, per target — `.word` is the one that differs:
+
+| directive | x86-64 | aarch64 / riscv64 |
+|---|---|---|
+| `.byte` | 1 byte | 1 byte |
+| `.word` | **2 bytes** | **4 bytes** |
+| `.long` | 4 bytes | 4 bytes |
+| `.quad` | 8 bytes | 8 bytes |
+
+Values are written in the target's byte order, so `.word 0xd503201f` is the aarch64
+`nop` as its manual prints it. A non-negative value is read unsigned (`.quad
+0xFFFFFFFFFFFFFFFF` is a legal address); a negative one is its two's complement at the
+directive's width. A value the width cannot hold is refused rather than truncated, and
+one directive carries a whole sequence — up to 256 payload bytes — not four.
+
+On aarch64 and riscv64 a statement must emit a whole number of instruction words:
+`.byte 0x1f, 0x20, 0x03` is refused, because three bytes would misalign every
+instruction after it. x86-64 has no such constraint.
+
+A raw encoding is an instruction stream the parser cannot read, so the block's clobber
+set becomes **every register in every bank**, and an `#[oblivious]` function may not
+contain one at all — which is why a real mnemonic is always preferable where one
+exists.
 
 ## What the compiler infers
 
