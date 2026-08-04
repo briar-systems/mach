@@ -95,7 +95,7 @@ pub def SelectFn: fun(*A.Allocator, *target.Target, *mir.MirFunction) R.Result[b
 # rules covering every generic opcode that can reach aarch64 selection, plus the
 # six fused compare-and-branch survivors. the coverage test pins it so a rule
 # added to the table and this count cannot drift apart
-pub val RULE_COUNT: usize = 83;
+pub val RULE_COUNT: usize = 85;
 
 # the number of post-selection plain register-copy opcodes: the concrete GP move
 # (`orr xd, xzr, xn`), the concrete float move (`fmov`), and the generic
@@ -391,6 +391,7 @@ pub val RULES: [RULE_COUNT]rules.Rule = [RULE_COUNT]rules.Rule{
     # MIR_BITCAST, the plain register copy the integer conversion encoder handles.
     # the float-bank guard precedes its plain pass-through fallback.
     rules.Rule{ op: mir.MIR_BITCAST, gate: rules.GATE_ANY, guard: rules.guard_fp_bank_move, kind: rules.RULE_RETAG, to: arm64.FMOV::u32, expand: nil, expansion_length: 0 },
+    rules.Rule{ op: mir.MIR_BITCAST, gate: rules.GATE_ANY, guard: guard_identity_copy,        kind: rules.RULE_RETAG, to: arm64.MOV::u32,  expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_BITCAST, gate: rules.GATE_ANY, guard: nil,                        kind: rules.RULE_PASS,  to: 0,             expand: nil, expansion_length: 0 },
 
     # the integer width conversions and the float conversions pass through unchanged:
@@ -399,6 +400,7 @@ pub val RULES: [RULE_COUNT]rules.Rule = [RULE_COUNT]rules.Rule{
     # FCVT / SCVTF / UCVTF / FCVTZS / FCVTZU for the float forms) and the allocator
     # reads operand 0 as a clean def.
     rules.Rule{ op: mir.MIR_TRUNC,    gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
+    rules.Rule{ op: mir.MIR_SEXT,     gate: rules.GATE_ANY, guard: guard_identity_copy, kind: rules.RULE_RETAG, to: arm64.MOV::u32, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_SEXT,     gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_ZEXT,     gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
     rules.Rule{ op: mir.MIR_FP_TRUNC, gate: rules.GATE_ANY, guard: nil, kind: rules.RULE_PASS, to: 0, expand: nil, expansion_length: 0 },
@@ -445,6 +447,54 @@ pub val PACK: rules.RulePack = rules.RulePack{
     fused_cbr_ccs:      ?FUSED_CCS[0],
     fused_cbr_cc_count: FUSED_CC_COUNT::u32,
 };
+
+# whether an operation width selects the 64-bit (X-register) form
+#
+# MIRRORS `arm64.encode.is64`, including its width-0 fallback to the machine word
+# (a pseudo carrying no natural width). The guard below must agree with it exactly,
+# because that predicate is what both `encode_convert` and `encode_mov` use to pick
+# ORR_X versus ORR_W - so the width-0 case is pinned by the test beside them rather
+# than left to drift.
+# ---
+# width: the operation width in bytes
+# ret:   true when the operation selects the X-register form
+fun width_is_64(width: u8) bool {
+    if (width == 0) { ret true; }
+    ret width >= 8;
+}
+
+# guard admitting a conversion that is the IDENTITY on A64, so selection can retag
+# it to the plain register move it already encodes as
+#
+# Same selection gap as riscv64 (#2392), but the width rule is DERIVED FROM A64's
+# own canonicalization contract, not carried over. `encode_convert` emits
+# `ORR rd, ZR, rs` for a BITCAST and for a SEXT whose source is already 8 bytes;
+# emitted as CONVERSIONS, so `instr_is_reg_copy` rejected them and the coalescer
+# could not see them (#2443).
+#
+# What differs from riscv64:
+#
+#   - A narrow BITCAST is not a copy HERE either, but for the opposite reason. RV64
+#     canonicalizes a 32-bit value through `sext.w` because lp64 holds it
+#     sign-extended; A64 emits ORR_W, and a W-register write ZERO-extends into bits
+#     63:32. `mov w0, w0` is therefore not a no-op - it clears the top half - so
+#     only the X form is an identity.
+#   - The SEXT arm needs the DESTINATION width too, which the RV64 guard did not.
+#     RV64's `encode_mov` emits the same `mv` at every width, so a destination term
+#     there was inert; A64's picks ORR_X vs ORR_W off `mi.width`, while
+#     `encode_convert` emits ORR_X unconditionally once the source is 8 bytes. A
+#     SEXT with an 8-byte source and a narrower destination would therefore change
+#     bytes if retagged, so it is not admitted.
+# ---
+# f:   the MIR function owning the instruction (unused; the widths are self-contained)
+# mi:  the instruction under selection
+# ret: true when the conversion is a full-width register copy
+fun guard_identity_copy(f: *mir.MirFunction, mi: *mir.MirInstr) bool {
+    if (mi.operand_count != 2)   { ret false; }
+    if (!width_is_64(mi.width))  { ret false; }
+    if (mi.opcode == mir.MIR_BITCAST) { ret true; }
+    ret mi.src_width >= 8;
+}
 
 # a float / vector-bank physical register operand for register index `idx` (the
 # composite vector id the allocator hands the float pre-coloring), so a test can
@@ -586,11 +636,16 @@ test "mach.lang.target.isa.arm64.rules:bitcast_bank_selects_fmov" {
     if (R.is_err[bool, str](select(?alloc, ?tgt, ?f))) { ret 1; }
     if (instrs[0].opcode != arm64.FMOV::u32) { ret 1; }
 
-    # a same-bank GP<->GP reinterpret stays MIR_BITCAST (the GP register copy).
+    # a same-bank GP<->GP reinterpret is a plain GP register copy, and at machine
+    # width it now selects to the concrete MOV so the coalescer can see it (#2443 -
+    # this fixture sets no width, which `width_is_64` reads as the machine word).
+    # what #2082 guards is unchanged and asserted more strictly than before: the GP
+    # reinterpret must NOT reach FMOV, whose encoder would write the float bank.
     vregs[0].class = mir.REG_CLASS_GP; vregs[1].class = mir.REG_CLASS_GP;
     instrs[0].opcode = mir.MIR_BITCAST;
     if (R.is_err[bool, str](select(?alloc, ?tgt, ?f))) { ret 2; }
-    if (instrs[0].opcode != mir.MIR_BITCAST) { ret 2; }
+    if (instrs[0].opcode == arm64.FMOV::u32) { ret 2; }
+    if (instrs[0].opcode != arm64.MOV::u32)  { ret 2; }
 
     # a cross-bank scalar reinterpret (one float side) -> FMOV.
     vregs[0].class = 1; vregs[1].class = mir.REG_CLASS_GP;
@@ -608,7 +663,7 @@ test "mach.lang.target.isa.arm64.rules:bitcast_bank_selects_fmov" {
 # so an appended rule and the storage size can never drift apart
 test "mach.lang.target.isa.arm64.rules:generic_opcode_coverage" {
     val pack: *rules.RulePack = ?PACK;
-    if (pack.rule_count != 83) { ret 1; }
+    if (pack.rule_count != 85) { ret 1; }
 
     # the shared selection alphabet (a property of mir.lower_ir, one table for
     # every pack's coverage test): reachable opcodes must terminate in a rule.
@@ -903,4 +958,101 @@ fun vec_op_select_fails(opcode: u32, lane: u8) bool {
     f.vreg_count  = 0;
 
     ret R.is_err[bool, str](select(?backing, ?tgt, ?f));
+}
+
+# a conversion that is the identity at X-register width selects to the plain
+# register move it already encodes as, and every narrower form does not
+#
+# `encode_convert` emitted `ORR rd, ZR, rs` for a BITCAST and for a SEXT whose
+# source is already 8 bytes, but as a CONVERSION - so `instr_is_reg_copy` rejected
+# it and the coalescer never saw it (#2443, the aarch64 sibling of #2392).
+#
+# The narrow cases are what make the guard A64-SPECIFIC rather than a copy of the
+# RV64 one, and each is pinned here:
+#
+#   - a 4-byte BITCAST stays generic because ORR_W ZERO-extends into bits 63:32, so
+#     `mov w0, w0` clears the top half and is not a no-op. RV64 rejects the same
+#     case for the opposite reason (`sext.w`).
+#   - a SEXT with an 8-byte SOURCE and a narrower DESTINATION stays generic. This
+#     term does not exist in the RV64 guard: RV64's `encode_mov` emits the same `mv`
+#     at every width, but A64's picks ORR_X vs ORR_W off `mi.width` while
+#     `encode_convert` emits ORR_X unconditionally - so retagging that shape would
+#     change the emitted bytes.
+#   - a width of 0 IS admitted, matching `encode.is64`'s machine-word fallback,
+#     which is what keeps `width_is_64` from drifting away from it.
+test "mach.lang.target.isa.arm64.rules:identity_conversions_select_to_a_move" {
+    var bad: i32 = 0;
+    var alloc: A.Allocator;
+    var tgt:   target.Target;
+
+    var instrs: [8]mir.MirInstr;
+    var ops:    [8][2]mir.MirOperand;
+    var i:      u32 = 0;
+    for (i < 8) {
+        ops[i][0] = mir.op_preg(10);
+        ops[i][1] = mir.op_preg(11);
+        instrs[i].operands      = ?ops[i][0];
+        instrs[i].operand_count = 2;
+        instrs[i].width         = 8;
+        instrs[i].src_width     = 8;
+        instrs[i].vec_lane      = mir.VEC_LANE_NONE;
+        i = i + 1;
+    }
+
+    # an 8-byte GP reinterpret is a full-width copy.
+    instrs[0].opcode = mir.MIR_BITCAST;
+    # a 4-byte reinterpret is NOT: ORR_W zero-extends into the high half.
+    instrs[1].opcode = mir.MIR_BITCAST;
+    instrs[1].width  = 4;
+    # a sign-extension whose source already fills the register has nothing to do.
+    instrs[2].opcode = mir.MIR_SEXT;
+    # a real widening sign-extension does.
+    instrs[3].opcode    = mir.MIR_SEXT;
+    instrs[3].src_width = 1;
+    # an 8-byte source into a NARROWER destination: ORR_X from the conversion
+    # encoder, but ORR_W from the move encoder, so retagging would change bytes.
+    instrs[4].opcode = mir.MIR_SEXT;
+    instrs[4].width  = 4;
+    # a width of 0 is the machine word, matching `encode.is64`.
+    instrs[5].opcode = mir.MIR_BITCAST;
+    instrs[5].width  = 0;
+    # the float-bank rule still precedes the identity guard at full width.
+    instrs[6].opcode = mir.MIR_BITCAST;
+    ops[6][0] = fp_preg(10);
+    # a 4-byte source widened to 8: the destination IS the machine word, so only the
+    # `src_width >= 8` half rejects it - and it must be rejected. this is a real
+    # SBFM sign-extension, and retagging it to a MOV would emit ORR_X and drop the
+    # sign extension entirely.
+    instrs[7].opcode    = mir.MIR_SEXT;
+    instrs[7].src_width = 4;
+
+    var blk: mir.MirBlock;
+    blk.id          = 0;
+    blk.instrs      = ?instrs[0];
+    blk.instr_count = 8;
+
+    var f: mir.MirFunction;
+    f.blocks      = ?blk;
+    f.block_count = 1;
+    f.vreg_count  = 0;
+
+    val r: R.Result[bool, str] = select(?alloc, ?tgt, ?f);
+    if (R.is_err[bool, str](r)) { ret 1; }
+
+    if (instrs[0].opcode != arm64.MOV::u32)  { bad = 1; }
+    if (instrs[1].opcode != mir.MIR_BITCAST) { bad = 1; }
+    if (instrs[2].opcode != arm64.MOV::u32)  { bad = 1; }
+    if (instrs[3].opcode != mir.MIR_SEXT)    { bad = 1; }
+    if (instrs[4].opcode != mir.MIR_SEXT)    { bad = 1; }
+    if (instrs[5].opcode != arm64.MOV::u32)  { bad = 1; }
+    if (instrs[6].opcode != arm64.FMOV::u32) { bad = 1; }
+    if (instrs[7].opcode != mir.MIR_SEXT)    { bad = 1; }
+
+    # the retagged form must now be what the copy machinery calls a move, which is
+    # the entire point of the retag - a conversion opcode is not one.
+    if (!is_reg_move(arm64.MOV::u32)) { bad = 1; }
+    if (is_reg_move(mir.MIR_BITCAST)) { bad = 1; }
+    if (is_reg_move(mir.MIR_SEXT))    { bad = 1; }
+
+    ret bad;
 }
