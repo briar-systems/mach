@@ -23,6 +23,7 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_join;
 use std.types.string.str_region_equals;
 
 use A: std.allocator;
@@ -41,6 +42,7 @@ use mach.lang.fe.sema.check;
 use mach.lang.fe.sema.coerce;
 use mach.lang.fe.sema.context;
 use mach.lang.fe.sema.generics;
+use mach.lang.layout;
 use mach.lang.fe.token;
 use mach.lang.intern;
 use mach.lang.session;
@@ -149,8 +151,7 @@ fun infer_nominal(sc: *context.SemaContext, did: id.DeclId, name_span: token.Spa
     if (R.is_err[type.TypeId, str](tr)) { ret type.TYPE_ERROR; }
     val ty: type.TypeId = R.unwrap_ok[type.TypeId, str](tr);
 
-    build_field_table(sc, ty, r.fields_start, r.fields_len);
-    record_type_align(sc, did, ty);
+    elaborate_nominal(sc, did, ty, r.fields_start, r.fields_len);
     ret ty;
 }
 
@@ -168,10 +169,218 @@ fun infer_nominal_uni(sc: *context.SemaContext, did: id.DeclId, name_span: token
     if (R.is_err[type.TypeId, str](tr)) { ret type.TYPE_ERROR; }
     val ty: type.TypeId = R.unwrap_ok[type.TypeId, str](tr);
 
-    build_field_table(sc, ty, u.fields_start, u.fields_len);
-    record_type_align(sc, did, ty);
+    elaborate_nominal(sc, did, ty, u.fields_start, u.fields_len);
     ret ty;
 }
+
+# establish declaration `did`'s layout material - its field table and its `align`
+# override - exactly once, whoever asks first (#2442)
+#
+# The decl pass reaches declarations in source order, but a layout intrinsic can ask
+# for a type's size from a declaration written above it. Routing both the pass and
+# the on-demand forcer through here makes "has this been elaborated" a property of
+# the declaration rather than of how far the walk has got, which is what removes the
+# declaration-order dependence.
+#
+# LAYOUT_ACTIVE for the duration is the cycle detector: re-entering a declaration
+# that is still being elaborated means its layout is an input to itself, so the
+# caller is told which declaration closed the loop instead of recursing until the
+# stack ends. The state is left ACTIVE on that path - the elaboration genuinely did
+# not complete - and the query that started it fails, so no half-built table is ever
+# published as READY.
+# ---
+# sc:           sema context
+# did:          the record / union declaration
+# ty:           its interned nominal TypeId
+# fields_start: index of its first field
+# fields_len:   number of fields
+# ret:          none once elaborated, or the name of the declaration closing a cycle
+fun elaborate_nominal(sc: *context.SemaContext, did: id.DeclId, ty: type.TypeId,
+                      fields_start: u32, fields_len: u32) O.Option[intern.StrId] {
+    val st: u8 = layout_state_of(sc, did);
+    if (st == context.LAYOUT_READY)  { ret O.none[intern.StrId](); }
+    if (st == context.LAYOUT_ACTIVE) { ret O.some[intern.StrId](nominal_name_id(sc, did)); }
+
+    layout_state_set(sc, did, context.LAYOUT_ACTIVE);
+    build_field_table(sc, ty, fields_start, fields_len);
+    record_type_align(sc, did, ty);
+    layout_state_set(sc, did, context.LAYOUT_READY);
+    ret O.none[intern.StrId]();
+}
+
+# `did`'s layout state, LAYOUT_READY when this context keeps no state array
+#
+# An episode (a per-instance re-validation) has no array: it reads tables the
+# producing pass already elaborated, so every declaration it sees is finished and
+# nothing it does may re-enter one.
+fun layout_state_of(sc: *context.SemaContext, did: id.DeclId) u8 {
+    if (sc.layout_state == nil)     { ret context.LAYOUT_READY; }
+    if (did >= sc.a.decl_len::u32)  { ret context.LAYOUT_READY; }
+    ret sc.layout_state[did];
+}
+
+fun layout_state_set(sc: *context.SemaContext, did: id.DeclId, st: u8) {
+    if (sc.layout_state == nil)    { ret; }
+    if (did >= sc.a.decl_len::u32) { ret; }
+    sc.layout_state[did] = st;
+}
+
+# a record / union declaration's interned name, for the diagnostic that has to point
+# at the declaration closing a cycle
+fun nominal_name_id(sc: *context.SemaContext, did: id.DeclId) intern.StrId {
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(sc.a, did);
+    if (O.is_none[*decl.Decl](d_opt)) { ret intern.STR_NIL; }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+    if (d.kind == decl.DECL_KIND_UNI) { ret intern_span_or_nil(sc, d.data.uni_.name); }
+    if (d.kind == decl.DECL_KIND_REC) { ret intern_span_or_nil(sc, d.data.rec_.name); }
+    ret intern.STR_NIL;
+}
+
+# force every declaration whose layout `tid` depends on to be elaborated (#2442)
+#
+# BY-VALUE CONTAINMENT ONLY, the same relation the occurs-check walks (#2355): a
+# record, a union, a generic instance and an array all store the contained bytes
+# inline, so measuring the outer type needs the inner one's table. A pointer or a
+# function value stores an address of fixed width, so the walk stops there - which
+# is what keeps `rec Node { next: *Node; }` measurable rather than cyclic.
+#
+# This FORCES tables; it does not measure anything. `generics.type_extent` remains
+# the only thing in sema that turns a type into a size or an alignment, so there is
+# no second layout policy to drift from `me.ir.type` (#2289).
+#
+# Only same-module declarations are forced. Another module's nominal was elaborated
+# by that module's completed sema pass - dependencies are type-checked first, in topo
+# order - so it is already finished and its DeclId does not even index this context.
+# ---
+# sc:  sema context
+# tid: the type about to be measured
+# ret: none when every dependency is elaborated, or the name closing a layout cycle
+fun ensure_layout_ready(sc: *context.SemaContext, tid: type.TypeId) O.Option[intern.StrId] {
+    ret ensure_layout_walk(sc, tid, 0);
+}
+
+# `ensure_layout_ready`'s recursion. `depth` bounds a by-value nest the same way
+# SEMA_LAYOUT_MAX_DEPTH bounds the measuring walk: the cycle marker catches a
+# declaration reached twice, but a semantic universe can hold a legal nest deeper
+# than any walk should follow, and an over-deep one is left to the measurement to
+# refuse with its own cause.
+fun ensure_layout_walk(sc: *context.SemaContext, tid: type.TypeId, depth: u32) O.Option[intern.StrId] {
+    if (depth > LAYOUT_FORCE_MAX_DEPTH) { ret O.none[intern.StrId](); }
+    if (tid == type.TYPE_NIL || tid == type.TYPE_ERROR) { ret O.none[intern.StrId](); }
+
+    val base: type.TypeId = type.strip_secret(?sc.s.types, tid);
+    val t_opt: O.Option[*type.Type] = type.get(?sc.s.types, base);
+    if (O.is_none[*type.Type](t_opt)) { ret O.none[intern.StrId](); }
+    val t: *type.Type = O.unwrap[*type.Type](t_opt);
+
+    if (t.kind == type.TYPE_ARRAY) { ret ensure_layout_walk(sc, t.data.array.base, depth + 1); }
+
+    if (t.kind == type.TYPE_REC || t.kind == type.TYPE_UNI) {
+        if (t.data.nominal.origin != sc.own_module) { ret O.none[intern.StrId](); }
+        val did: id.DeclId = t.data.nominal.decl;
+        val d_opt: O.Option[*decl.Decl] = ast.get_decl(sc.a, did);
+        if (O.is_none[*decl.Decl](d_opt)) { ret O.none[intern.StrId](); }
+        val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+
+        var fstart: u32 = d.data.rec_.fields_start;
+        var flen:   u32 = d.data.rec_.fields_len;
+        if (d.kind == decl.DECL_KIND_UNI) {
+            fstart = d.data.uni_.fields_start;
+            flen   = d.data.uni_.fields_len;
+        }
+        or (d.kind != decl.DECL_KIND_REC) { ret O.none[intern.StrId](); }
+
+        val cyc: O.Option[intern.StrId] = elaborate_nominal(sc, did, base, fstart, flen);
+        if (O.is_some[intern.StrId](cyc)) { ret cyc; }
+        ret ensure_layout_fields(sc, base, depth);
+    }
+
+    if (t.kind == type.TYPE_INSTANCE) {
+        # an instance's table is materialized from its generic's, which the walk
+        # above elaborates when the generic is declared in this module.
+        val cyc: O.Option[intern.StrId] = ensure_layout_walk(sc, t.data.instance.nominal, depth + 1);
+        if (O.is_some[intern.StrId](cyc)) { ret cyc; }
+        generics.ensure_fields(sc.s, base);
+        ret ensure_layout_fields(sc, base, depth);
+    }
+
+    ret O.none[intern.StrId]();
+}
+
+# force each field type of an already-elaborated aggregate
+fun ensure_layout_fields(sc: *context.SemaContext, ty: type.TypeId, depth: u32) O.Option[intern.StrId] {
+    val n: u32 = type.field_count(?sc.s.types, ty);
+    var i: u32 = 0;
+    for (i < n) {
+        val fe: O.Option[*type.FieldEntry] = type.field_at(?sc.s.types, ty, i);
+        if (O.is_some[*type.FieldEntry](fe)) {
+            val cyc: O.Option[intern.StrId] = ensure_layout_walk(sc, O.unwrap[*type.FieldEntry](fe).ty, depth + 1);
+            if (O.is_some[intern.StrId](cyc)) { ret cyc; }
+        }
+        i = i + 1;
+    }
+    ret O.none[intern.StrId]();
+}
+
+# fold `$size_of(T)` / `$align_of(T)` to its measured constant, forcing `T`'s layout
+# material first (#2442)
+#
+# The two positions that need this - a type's `align` and an array length - are
+# decided during type resolution, where the measured type may not have been reached
+# yet. Forcing is what makes the answer independent of declaration order; the
+# measurement itself is `generics.type_extent`, the same policy `me.ir.type` uses
+# (#2289), so a length folded here and the same intrinsic folded in the middle end
+# cannot disagree.
+#
+# `$offset_of` is deliberately NOT folded here: sema's field-descriptor contract
+# answers `.offset` with none and leaves offsets to lowering, and moving that line
+# is a separate decision from this one. It keeps reporting through the evaluator.
+# ---
+# sc:   sema context
+# eid:  the expression in constant position
+# span: the span to report against
+# ret:  none when `eid` is not a layout intrinsic; some(none) when one was reported
+#       on; some(some(v)) with the measured constant
+fun fold_layout_intrinsic(sc: *context.SemaContext, eid: id.ExprId, span: token.Span) O.Option[O.Option[comptime.CTValue]] {
+    val is_size:  bool = comptime.is_size_of_call(sc.a, sc.source, eid);
+    val is_align: bool = comptime.is_align_of_call(sc.a, sc.source, eid);
+    if (!is_size && !is_align) { ret O.none[O.Option[comptime.CTValue]](); }
+
+    val arg: id.ExprId = comptime.layout_intrinsic_type_arg(sc.a, eid);
+    if (arg == id.EXPR_NIL) {
+        context.report(sc, span, "a layout intrinsic takes one type argument");
+        ret O.some[O.Option[comptime.CTValue]](O.none[comptime.CTValue]());
+    }
+
+    # `intrinsic_operand_type` reports its own failure, so a TYPE_ERROR here is
+    # already on the sink and must not be doubled.
+    val tid: type.TypeId = intrinsic_operand_type(sc, arg, span);
+    if (tid == type.TYPE_ERROR) { ret O.some[O.Option[comptime.CTValue]](O.none[comptime.CTValue]()); }
+
+    val cyc: O.Option[intern.StrId] = ensure_layout_ready(sc, tid);
+    if (O.is_some[intern.StrId](cyc)) {
+        check.report_named(sc, span, "layout cycle: measuring `", O.unwrap[intern.StrId](cyc),
+                           "` here needs a layout this measurement is itself deciding. break the cycle with a literal alignment or length",
+                           "layout cycle: this measurement's answer is one of its own inputs");
+        ret O.some[O.Option[comptime.CTValue]](O.none[comptime.CTValue]());
+    }
+
+    val ext: layout.Extent = generics.type_extent(sc.s, context.ptr_width_of(sc), tid);
+    if (!ext.ok) {
+        context.report(sc, span, "the layout of the type named by this intrinsic could not be determined");
+        ret O.some[O.Option[comptime.CTValue]](O.none[comptime.CTValue]());
+    }
+
+    var n: u32 = ext.size;
+    if (is_align) { n = ext.align; }
+    ret O.some[O.Option[comptime.CTValue]](O.some[comptime.CTValue](comptime.ct_uint(n::u64)));
+}
+
+# the by-value nesting depth the forcing walk follows before leaving the rest to the
+# measurement. cycle protection is the ACTIVE marker, not this; the bound only stops
+# a pathological nest from running the stack out ahead of `SEMA_LAYOUT_MAX_DEPTH`,
+# which refuses the same shape with a cause the caller reports.
+val LAYOUT_FORCE_MAX_DEPTH: u32 = 64;
 
 # whether `ty` reaches nominal `target` BY VALUE (#2355)
 #
@@ -504,16 +713,24 @@ fun record_type_align(sc: *context.SemaContext, did: id.DeclId, ty: type.TypeId)
         if (str_region_equals(sc.source, dec.name.offset, dec.name.len, "align")) {
             if (dec.args_len != 1) { ret; }
             val arg: id.ExprId = sc.a.expr_ids[dec.args_start];
-            val ev: R.Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, arg, ?sc.s.interner);
-            if (R.is_err[comptime.CTValue, str](ev)) {
-                if (comptime.is_layout_intrinsic_call(sc.a, sc.source, arg)) {
-                    context.report(sc, dec.name, "a layout intrinsic is not available in an `align` on a type: this alignment is decided while the layout it would measure is still being resolved. use a literal, or `#[align(...)]` on a global, where layout is known (#2442)");
+            # a layout intrinsic is folded against forced layout material rather than
+            # by the evaluator, which has no layout of its own (#2442). it reports its
+            # own failures, so a none payload is already on the sink.
+            var cv: comptime.CTValue;
+            val lay: O.Option[O.Option[comptime.CTValue]] = fold_layout_intrinsic(sc, arg, dec.name);
+            if (O.is_some[O.Option[comptime.CTValue]](lay)) {
+                val got: O.Option[comptime.CTValue] = O.unwrap[O.Option[comptime.CTValue]](lay);
+                if (O.is_none[comptime.CTValue](got)) { ret; }
+                cv = O.unwrap[comptime.CTValue](got);
+            }
+            or {
+                val ev: R.Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, arg, ?sc.s.interner);
+                if (R.is_err[comptime.CTValue, str](ev)) {
+                    context.report(sc, dec.name, "`align` on a type must be a compile-time constant");
                     ret;
                 }
-                context.report(sc, dec.name, "`align` on a type must be a compile-time constant");
-                ret;
+                cv = R.unwrap_ok[comptime.CTValue, str](ev);
             }
-            val cv: comptime.CTValue = R.unwrap_ok[comptime.CTValue, str](ev);
             # the body-pass validator skips the type-arg checks for rec/uni (it
             # would double-report against this fold), so every invalid case is
             # reported here -- a non-integer, a negative, a non-power-of-two, or
@@ -576,7 +793,18 @@ fun build_field_table(sc: *context.SemaContext, ty: type.TypeId, fields_start: u
     for (i < fields_len) {
         val tn: *decl.TypedName = ?sc.a.typed_names[fields_start + i];
         val fname: intern.StrId = intern_span_or_nil(sc, tn.name);
-        val fty: type.TypeId = context.resolved_type_of(sc, tn.ty);
+        var fty: type.TypeId = context.resolved_type_of(sc, tn.ty);
+        # `resolved_type_of` READS the resolution table. A layout query can force this
+        # declaration before `resolve_all_types` has indexed its annotations (#2442),
+        # and an unresolved slot read as nil would give the table nil field types -
+        # measuring as an unknown extent rather than the real one. Resolving on demand
+        # here fills the same memo the index walk would have, so the walk later finds
+        # it done and the answer does not depend on which arrived first. Main pass
+        # only: under a substitution the annotation's answer comes from the producer's
+        # table through `apply_subst`, and re-resolving would apply it twice (#2168).
+        if (fty == type.TYPE_NIL && sc.subst == nil && tn.ty != id.TYPE_NIL) {
+            fty = resolve_type_ref(sc, tn.ty);
+        }
         context.field_table_push(sc, tbl, fname, fty);
         i = i + 1;
     }
@@ -2748,16 +2976,23 @@ fun resolve_type_array(sc: *context.SemaContext, ar: *atype.TypeArray, span: tok
     val elem: type.TypeId = resolve_type_ref(sc, ar.element);
     if (elem == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
 
-    val len_r: R.Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, ar.length, ?sc.s.interner);
-    if (R.is_err[comptime.CTValue, str](len_r)) {
-        if (comptime.is_layout_intrinsic_call(sc.a, sc.source, ar.length)) {
-            context.report(sc, span, "a layout intrinsic is not available as an array length: the length is needed while the layout it would measure is still being resolved. use a literal length (binding the intrinsic to a `val` first does not help - its value is folded after this point) (#2442)");
+    # a layout intrinsic length is measured against forced layout material; the
+    # evaluator has no layout of its own (#2442). it reports its own failures.
+    var cv: comptime.CTValue;
+    val lay: O.Option[O.Option[comptime.CTValue]] = fold_layout_intrinsic(sc, ar.length, span);
+    if (O.is_some[O.Option[comptime.CTValue]](lay)) {
+        val got: O.Option[comptime.CTValue] = O.unwrap[O.Option[comptime.CTValue]](lay);
+        if (O.is_none[comptime.CTValue](got)) { ret type.TYPE_ERROR; }
+        cv = O.unwrap[comptime.CTValue](got);
+    }
+    or {
+        val len_r: R.Result[comptime.CTValue, str] = comptime.eval(sc.ctx, sc.a, sc.source, ar.length, ?sc.s.interner);
+        if (R.is_err[comptime.CTValue, str](len_r)) {
+            context.report(sc, span, "cannot infer type: array length is not a comptime constant");
             ret type.TYPE_ERROR;
         }
-        context.report(sc, span, "cannot infer type: array length is not a comptime constant");
-        ret type.TYPE_ERROR;
+        cv = R.unwrap_ok[comptime.CTValue, str](len_r);
     }
-    val cv: comptime.CTValue = R.unwrap_ok[comptime.CTValue, str](len_r);
     if (cv.kind != comptime.CT_KIND_INT) {
         context.report(sc, span, "type mismatch: array length must be an integer");
         ret type.TYPE_ERROR;
