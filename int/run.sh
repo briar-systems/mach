@@ -109,6 +109,33 @@ in_list() {
     return 1
 }
 
+# dep_commits <case-dir> — print "name@shortsha ..." for every [dep.<name>] a
+# case's mach.lock records, or nothing when no lock exists.
+#
+# A case's `ref = "branch/main"` deliberately tracks mach-std's latest RELEASE
+# (moving `main` is the reviewed release event, not drift - see doc/cli.md's
+# Lockfile section), so int/.gitignore excludes `mach.lock`: committing it here
+# would freeze every case to whatever commit happened to be resolved when someone
+# last regenerated it, contradicting that intent. But an ephemeral lock means
+# nothing durable records which commit a given run actually compiled against -
+# `mach dep pull`'s own lock write vanishes with the rest of the case's gitignored
+# state (#2387). Printing it into every PASS/FAIL/BLESS line is that record: it
+# survives exactly as long as the CI log does, which is exactly as long as anyone
+# would want to ask "what did this run compile against".
+dep_commits() {
+    dir=$1
+    [ -f "$dir/mach.lock" ] || return 0
+    awk '
+        /^\[dep\./ { name = $0; sub(/^\[dep\./, "", name); sub(/\]$/, "", name); next }
+        /^commit = / && name != "" {
+            sha = $0
+            sub(/^commit = "/, "", sha); sub(/"$/, "", sha)
+            printf "%s@%s ", name, substr(sha, 1, 7)
+            name = ""
+        }
+    ' "$dir/mach.lock"
+}
+
 runmode=$(conf_runmode "$target") || {
     echo "run.sh: target '$target' is not in targets.conf" >&2
     exit 2
@@ -216,20 +243,26 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
             build_ok=0
         fi
 
+        # a label suffix naming what mach-std commit `dep pull` resolved (#2387),
+        # once one exists to report; every PASS/FAIL line from here on carries it.
+        deps=$(dep_commits "$dir")
+        flabel=$label
+        [ -n "$deps" ] && flabel="$label (${deps% })"
+
         # a build-fails case asserts the compile is rejected and takes the compiler's
         # 'error:' diagnostic as its observable (deterministic: no paths, just the
         # message text). every other mode requires a clean build and runs a producer
         # on the artifact.
         if [ "$case_run" = build-fails ]; then
             if [ "$build_ok" -eq 1 ]; then
-                echo "FAIL $label (build succeeded; expected a link error)"
+                echo "FAIL $flabel (build succeeded; expected a link error)"
                 fails=$((fails + 1))
                 rm -rf "$tmp" "$dir/out/int"
                 continue
             fi
             grep '^error:' "$tmp/build.log" >"$tmp/out.txt" || true
             if [ ! -s "$tmp/out.txt" ]; then
-                echo "FAIL $label (build failed without an 'error:' diagnostic)"
+                echo "FAIL $flabel (build failed without an 'error:' diagnostic)"
                 sed 's/^/    /' "$tmp/build.log" >&2
                 fails=$((fails + 1))
                 rm -rf "$tmp" "$dir/out/int"
@@ -237,7 +270,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
             fi
         else
             if [ "$build_ok" -eq 0 ]; then
-                echo "FAIL $label (build)"
+                echo "FAIL $flabel (build)"
                 sed 's/^/    /' "$tmp/build.log" >&2
                 fails=$((fails + 1))
                 rm -rf "$tmp" "$dir/out/int"
@@ -252,7 +285,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
             if [ "$case_run" = debuginfo ]; then
                 gbin="$dir/out/int/prog-g$exe"
                 if ! (cd "$dir" && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -g -o "out/int/prog-g$exe") >"$tmp/build-g.log" 2>&1; then
-                    echo "FAIL $label (build -g)"
+                    echo "FAIL $flabel (build -g)"
                     sed 's/^/    /' "$tmp/build-g.log" >&2
                     fails=$((fails + 1))
                     rm -rf "$tmp" "$dir/out/int"
@@ -266,7 +299,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
                 prc=$?
             fi
             if [ "$prc" -ne 0 ]; then
-                echo "FAIL $label (producer exit $prc)"
+                echo "FAIL $flabel (producer exit $prc)"
                 sed 's/^/    /' "$tmp/err.txt" >&2
                 fails=$((fails + 1))
                 rm -rf "$tmp" "$dir/out/int"
@@ -276,22 +309,22 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
 
         if [ "$bless" -eq 1 ]; then
             cp "$tmp/out.txt" "$golden"
-            echo "BLESS $label -> ${golden#"$here"/}"
+            echo "BLESS $flabel -> ${golden#"$here"/}"
             rm -rf "$tmp" "$dir/out/int"
             continue
         fi
 
         if [ ! -f "$golden" ]; then
-            echo "FAIL $label (no golden ${golden#"$here"/}; run with --bless)"
+            echo "FAIL $flabel (no golden ${golden#"$here"/}; run with --bless)"
             fails=$((fails + 1))
             rm -rf "$tmp" "$dir/out/int"
             continue
         fi
 
         if diff -u "$golden" "$tmp/out.txt" >"$tmp/diff.txt" 2>&1; then
-            echo "PASS $label"
+            echo "PASS $flabel"
         else
-            echo "FAIL $label (diff)"
+            echo "FAIL $flabel (diff)"
             sed 's/^/    /' "$tmp/diff.txt" >&2
             fails=$((fails + 1))
         fi
