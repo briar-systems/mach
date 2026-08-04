@@ -184,10 +184,17 @@ ordinary relocations.
 
 Marks a function as a constant-time boundary. Applies to functions only; takes
 no arguments. Inside it the backend must not introduce a secret-dependent
-branch, select a variable-latency instruction on a secret operand, or eliminate
-a zeroizing write to secret storage; a translation validator re-derives the
-secret taint over the lowered MIR and rejects any such leak. Inline `asm` is
-rejected inside an `#[oblivious]` function, since a type system cannot check it.
+branch or select a variable-latency instruction on a secret operand; a
+translation validator re-derives the secret taint over the lowered MIR and
+rejects any such leak. Inline `asm` is rejected inside an `#[oblivious]`
+function, since a type system cannot check it.
+
+The **zeroizing-write** guarantee is *not* one of the decorator's obligations,
+and describing it as one understates it. A write into secret storage carries a
+taint applied at lowering, keyed on the storage's secrecy rather than on any
+decorator, so a zeroizing wipe is protected in a function carrying no
+`#[oblivious]` at all. See [secrecy.md](secrecy.md#the-zeroizing-write-guarantee)
+for what that covers and what it does not.
 
 ```mach
 #[oblivious]
