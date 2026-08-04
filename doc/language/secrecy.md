@@ -169,7 +169,37 @@ determine a layout it declines, which rejects.
 The flow typing constrains the *source*; `#[oblivious]` carries the obligation
 through *codegen*. Inside a function carrying it, the backend must not introduce
 a secret-dependent branch or select a variable-latency instruction on a secret
-operand. Inline `asm` is rejected inside such a function.
+operand.
+
+Inline `asm` inside such a function is **validated**, not rejected. The block is
+parsed into instructions and walked for the same three leaks the compiler checks
+everywhere else — a secret reaching a branch condition, a memory address, or a
+variable-latency operation the target cannot do in constant time. Taint enters
+through the block's `{name}` bindings, whose secrecy is stamped from the local's
+declared type. What the walk cannot model, it refuses:
+
+| construct | why |
+|---|---|
+| a body that does not parse | nothing to analyze |
+| a `.byte` directive | its payload can encode any instruction |
+| a mnemonic the target has not classified | its timing behaviour is unknown |
+| **a conditional branch, on x86-64 only** | its condition rides FLAGS, which the inline-asm effect model does not represent (#2460) |
+
+That last row is a per-target asymmetry worth stating plainly. aarch64's only
+conditional forms are `cbz`/`cbnz` and riscv64's branches compare two registers, so
+on both the condition is a register operand the walk can see, and both get the full
+three checks. x86-64's `jcc` family conditions on flags the model does not carry, so
+a `cmp` of a secret before it would be invisible — the branch is refused there until
+flags are modeled.
+
+The variable-latency check also bites unevenly: x86-64's and aarch64's asm grammars
+carry no divide, multiply or float instruction at all, so it reaches only their
+register-count shifts. riscv64's grammar admits the whole M-extension, so on that
+target the check is substantive.
+
+`#[oblivious]` remains a **per-function** contract. A call out to a non-oblivious
+function is not validated — that is the boundary the decorator draws, not a hole in
+it, and it applies to a callee containing `asm` exactly as it applies to any other.
 
 The zeroizing-write guarantee is separate and broader; it is described below.
 
@@ -231,9 +261,8 @@ x = 0;          # NOT guaranteed: `x` may never have been in memory
 Adding `#[oblivious]` does not change this — the wipe is outside the memory-address
 leakage model rather than an exception within it. To wipe reliably, write through a
 pointer whose target is memory the compiler cannot promote away, which is what the
-standard library's `zeroize` does. Whether the language should instead *enforce* the
-register boundary — by refusing to promote a wiped secret local, or by other means —
-is open in RFC #2456 and deliberately undecided here.
+standard library's `zeroize` does. Settled: the wipe guarantee is memory-scoped; secret register lifetimes are outside
+it (#2456).
 
 **Today the guarantee is not yet load-bearing**, because no dead-store elimination
 exists to remove anything: an entirely dead fill of a *public* local also survives at

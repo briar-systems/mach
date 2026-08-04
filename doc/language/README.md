@@ -44,7 +44,7 @@ neighboring links; start from the index below.
 - [comptime.md](comptime.md) — channel overview
 - [comptime-mach.md](comptime-mach.md) — `$mach.*` compiler-owned namespace
 - [decorators.md](decorators.md) — codegen decorators, `#[name]` (replaces the removed `$sym.attr` setters)
-- [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`, `$align_of`, `$offset_of`, `$type_of`, `$fields`, `$each`, `$error`, `$assert`
+- [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`, `$align_of`, `$offset_of`, `$type_of`, `$fields`, `$is_record`, `$is_union`, `$is_pointer`, `$type_name`, `$each`, `$error`
 - [comptime-control.md](comptime-control.md) — `$if` / `$or`
 
 ## Low-level

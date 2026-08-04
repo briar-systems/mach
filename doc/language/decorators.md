@@ -186,8 +186,13 @@ Marks a function as a constant-time boundary. Applies to functions only; takes
 no arguments. Inside it the backend must not introduce a secret-dependent
 branch or select a variable-latency instruction on a secret operand; a
 translation validator re-derives the secret taint over the lowered MIR and
-rejects any such leak. Inline `asm` is rejected inside an `#[oblivious]`
-function, since a type system cannot check it.
+rejects any such leak.
+
+Inline `asm` inside such a function is **validated rather than rejected**: the
+block is parsed and walked for the same leaks, and refused only where a leak is
+found or where the construct cannot be modelled. See
+[secrecy.md](secrecy.md#oblivious--the-codegen-contract) for what is checked and
+what is refused, including the x86-64 conditional-branch limitation.
 
 The **zeroizing-write** guarantee is *not* one of the decorator's obligations,
 and describing it as one understates it. A write into secret storage carries a
