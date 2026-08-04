@@ -183,14 +183,18 @@ declared type. What the walk cannot model, it refuses:
 | a body that does not parse | nothing to analyze |
 | a data directive (`.byte`, `.word`, `.long`, `.quad`) | its payload can encode any instruction |
 | a mnemonic the target has not classified | its timing behaviour is unknown |
-| **a conditional branch, on x86-64 only** | its condition rides FLAGS, which the inline-asm effect model does not represent (#2460) |
+| **a flags-conditioned branch** (x86-64 `jcc`, aarch64 `b.<cond>`) | its condition rides the flags register, which the inline-asm effect model does not represent (#2460) |
 
-That last row is a per-target asymmetry worth stating plainly. aarch64's only
-conditional forms are `cbz`/`cbnz` and riscv64's branches compare two registers, so
-on both the condition is a register operand the walk can see, and both get the full
-three checks. x86-64's `jcc` family conditions on flags the model does not carry, so
-a `cmp` of a secret before it would be invisible — the branch is refused there until
-flags are modeled.
+That last row is a per-target asymmetry worth stating precisely, because getting it
+wrong was a real hole (#2477). A branch whose condition is a **register operand** is
+visible to the walk and is checked: aarch64's `cbz`/`cbnz`, and every riscv64 branch,
+which compares two registers — RISC-V has no flags register at all. A branch whose
+condition rides the **flags register** cannot be checked, because the effect model
+carries no flags, so a `cmp` of a secret before it would be invisible: those are
+refused. x86-64's `jcc` family is flags-conditioned, and so is **aarch64's
+`b.<cond>`** — which is easy to miss, because `b.<cond>` does not appear in aarch64's
+mnemonic table at all. It is admitted by the grammar's *decode hook*, carrying the
+unconditional branch's own opcode with the condition in its flags.
 
 The variable-latency check also bites unevenly: x86-64's and aarch64's asm grammars
 carry no divide, multiply or float instruction at all, so it reaches only their

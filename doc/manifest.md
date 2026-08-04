@@ -465,7 +465,7 @@ A stanza declares exactly one source key:
 | Key    | Meaning |
 |--------|---------|
 | `git`  | Git URL to clone into `dep/<alias>/`. Requires `ref`. |
-| `path` | Local project tree, resolved relative to this manifest's directory; never fetched. `mach dep pull` materialises it at `dep/<alias>/` as a relative symlink. Forbids `ref`. |
+| `path` | Local project tree; never fetched. A relative `path` is resolved relative to this manifest's directory; an absolute `path` is used as-is. `mach dep pull` materialises it at `dep/<alias>/` as a symlink (relative for a relative `path`, absolute for an absolute one). Forbids `ref`. |
 | `ref`  | Git ref to check out (git only): `tag/<name>`, `branch/<name>`, a bare tag/branch, or a commit SHA. |
 
 `git` and `path` are mutually exclusive and exactly one is required. A
