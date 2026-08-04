@@ -73,6 +73,65 @@ is reported as a layout cycle naming the type that closes it. A pointer field do
 not create one: it stores an address of fixed width, so `rec Node { next: *Node; }`
 measures normally.
 
+## Type predicates
+
+Ask about a type's **shape** rather than its storage. Each takes one type operand
+and folds in a `$if` / `$or` gate:
+
+```mach
+$is_record(T)           # T is a record (or an instance of one)
+$is_union(T)            # T is a union  (or an instance of one)
+$is_pointer(T)          # T is a reference: the raw `ptr` or a typed `*U`
+```
+
+They are **comptime-only** — a gate condition selects an arm, and there is no
+runtime boolean for one to become, so using a predicate as a value is an error.
+
+A `^` secret wrapper is stripped before the question is answered: `^Pair` is a
+record, because `^T` is a wrapper over `T`'s storage. A generic instance answers as
+the declaration it instantiates, so `Box[i64]` is a record — which is the type a
+reflection loop actually meets.
+
+```mach
+rec Inner { x: u64; y: u64; }
+rec Outer { i: Inner; n: u64; }
+
+$each f in $fields(Outer) {
+    $if ($is_record(f.type)) {
+        $each g in $fields(f.type) { ... }   # descend
+    } $or { ... }                            # a scalar field
+}
+```
+
+## `$type_name(T)` — a type's spelling
+
+```mach
+$type_name(T)           # the type's spelling, as a NUL-terminated string
+```
+
+Unlike the predicates this **is** a value (`*u8`), usable anywhere one is. The
+spelling is the same one diagnostics print, so a name a program reads and a name an
+error reports cannot drift. Composites spell compositely (`$type_name(*Pair)` is
+`"*Pair"`), and a `^` wrapper is stripped as it is for the predicates.
+
+## The type operand
+
+`$size_of` / `$align_of` / `$offset_of` / `$fields` and the queries above all take a
+**type** in argument 0, written with the ordinary type grammar — plus one extra
+form: a field descriptor's `f.type` inside a `$each` body.
+
+```mach
+$each f in $fields(T) {
+    val n: u64 = $size_of(f.type);      # the field's own size
+    $each g in $fields(f.type) { ... }  # its own fields
+}
+```
+
+That form is what makes recursive reflection expressible: inside the loop a field's
+type has no spelling, only the descriptor. A path that is genuinely a qualified type
+name (`mod.Type`) still reads as one, and a wrong one still reports against the type
+grammar.
+
 ## Type intrinsic
 
 `$type_of(expr)` produces a comptime type value — the resolved type of its

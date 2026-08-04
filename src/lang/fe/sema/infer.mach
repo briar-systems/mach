@@ -21,8 +21,10 @@
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
+use std.types.char.char;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_len;
 use std.types.string.str_region_equals;
 
 use A: std.allocator;
@@ -41,6 +43,7 @@ use mach.lang.fe.sema.check;
 use mach.lang.fe.sema.coerce;
 use mach.lang.fe.sema.context;
 use mach.lang.fe.sema.generics;
+use mach.lang.fe.sema.typename;
 use mach.lang.layout;
 use mach.lang.fe.token;
 use mach.lang.intern;
@@ -327,6 +330,56 @@ fun ensure_layout_fields(sc: *context.SemaContext, ty: type.TypeId, depth: u32) 
         i = i + 1;
     }
     ret O.none[intern.StrId]();
+}
+
+# the type-query resolver (a comptime.TypeQueryFn) sema installs alongside the
+# others, so `comptime.eval` can answer a `$is_record` / `$is_union` /
+# `$is_pointer` / `$type_name` about an already-resolved type (#2128)
+#
+# The shape rule itself is `type.shape_kind` - shared with the lowering-side twin so
+# a gate folded at sema and the same gate deferred to monomorphization cannot
+# disagree. Here it only maps that kind onto the asked question.
+# ---
+# data:  the *SemaContext, erased to a ptr by the installer
+# tid:   the already-resolved TypeId to ask about
+# which: a comptime.TYPE_QUERY_* selector
+# ret:   some(bool) for a predicate, some(string) for the name, none when unanswerable
+pub fun resolve_type_query(data: ptr, tid: u32, which: u8) R.Result[O.Option[comptime.CTValue], str] {
+    val sc: *context.SemaContext = data::*context.SemaContext;
+    if (sc == nil) { ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]()); }
+    ret answer_type_query(sc.s, tid, which);
+}
+
+# the shared body of both type-query resolvers: everything either side needs is on
+# the session, so neither holds a rule of its own (#2128)
+pub fun answer_type_query(s: *session.Session, tid: u32, which: u8) R.Result[O.Option[comptime.CTValue], str] {
+    val t: type.TypeId = tid::type.TypeId;
+    if (t == type.TYPE_NIL || t == type.TYPE_ERROR) {
+        ret R.ok[O.Option[comptime.CTValue], str](O.none[comptime.CTValue]());
+    }
+
+    if (which == comptime.TYPE_QUERY_NAME) {
+        # `typename.type_to_str` is the spelling sema already uses in diagnostics, so
+        # the name a program reads and the name an error prints cannot drift.
+        val r: R.Result[str, str] = typename.type_to_str(s, type.strip_secret(?s.types, t));
+        if (R.is_err[str, str](r)) { ret R.err[O.Option[comptime.CTValue], str](R.unwrap_err[str, str](r)); }
+        val text: str = R.unwrap_ok[str, str](r);
+        val ir_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, text);
+        A.deallocate[char](s.alloc, text, str_len(text) + 1);
+        if (R.is_err[intern.StrId, str](ir_r)) {
+            ret R.err[O.Option[comptime.CTValue], str](R.unwrap_err[intern.StrId, str](ir_r));
+        }
+        ret R.ok[O.Option[comptime.CTValue], str](
+            O.some[comptime.CTValue](comptime.ct_str(R.unwrap_ok[intern.StrId, str](ir_r))));
+    }
+
+    val k: type.TypeKind = type.shape_kind(?s.types, t);
+    var answer: bool = false;
+    if (which == comptime.TYPE_QUERY_IS_RECORD)  { answer = k == type.TYPE_REC; }
+    if (which == comptime.TYPE_QUERY_IS_UNION)   { answer = k == type.TYPE_UNI; }
+    # both spellings of a reference: the raw `ptr` primitive and a typed `*T`.
+    if (which == comptime.TYPE_QUERY_IS_POINTER) { answer = k == type.TYPE_POINTER || k == type.TYPE_PTR; }
+    ret R.ok[O.Option[comptime.CTValue], str](O.some[comptime.CTValue](comptime.ct_bool(answer)));
 }
 
 # fold `$size_of(T)` / `$align_of(T)` to its measured constant, forcing `T`'s layout
@@ -1863,6 +1916,39 @@ fun infer_comptime_intrinsic(sc: *context.SemaContext, c: *expr.ExprCall, span: 
     if (name == interned(sc, "type_of")) {
         context.report(sc, span, "`$type_of` yields a comptime type, not a value; use it as a type-comparison operand inside a `$if` gate");
         ret type.TYPE_ERROR;
+    }
+
+    # the type queries (#2128) take the same single type-naming argument and answer
+    # about its SHAPE rather than its storage: three bool predicates and the string
+    # `$type_name`. Typed here so the operand's expr_type is stamped for the
+    # resolver `comptime.eval` calls, exactly as the size/align path below does.
+    val is_rec_q:  bool = name == interned(sc, "is_record");
+    val is_uni_q:  bool = name == interned(sc, "is_union");
+    val is_ptr_q:  bool = name == interned(sc, "is_pointer");
+    val is_name_q: bool = name == interned(sc, "type_name");
+    if (is_rec_q || is_uni_q || is_ptr_q || is_name_q) {
+        if (c.args_len != 1) {
+            context.report_numbered(sc, span, "a comptime type query: expected ", 1::usize, " argument(s)", "comptime type query: wrong number of arguments");
+            ret type.TYPE_ERROR;
+        }
+        val qarg: id.ExprId   = sc.a.expr_ids[c.args_start];
+        val qty:  type.TypeId = intrinsic_operand_type(sc, qarg, span);
+        set_expr_type(sc, qarg, qty);
+        if (qty == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+
+        # `$type_name` is an ordinary value - a string, valid anywhere one is.
+        if (is_name_q) { ret ptr_to(sc, prim_or_error(sc, type.TYPE_U8)); }
+
+        # the three predicates answer a comptime question and are folded by arm
+        # selection, so like a `$type_of` comparison they are gate-only: there is no
+        # runtime boolean for one to become. Reported here rather than left to
+        # surface as an opaque bare-comptime-ident error at lowering.
+        if (!sc.in_comptime_gate) {
+            context.report(sc, span, "a comptime type predicate is comptime-only; it is valid only as a `$if` gate condition");
+            ret type.TYPE_ERROR;
+        }
+        # u8 stands in for the comptime boolean, the same as a type comparison's.
+        ret prim_or_error(sc, type.TYPE_U8);
     }
 
     val is_size:   bool = name == interned(sc, "size_of");
