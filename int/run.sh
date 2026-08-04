@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run.sh — the integration-test harness.
 #
-# usage: run.sh --target <name> [--bless] [--filter <glob>] <compiler>
+# usage: run.sh --target <name> [--runmode native|qemu] [--bless] [--filter <glob>] <compiler>
 #
 # for each case directory under int/{surface,regression}/ that holds a mach.toml,
 # the harness loads its defaults (overridable by an optional line-based case.conf),
@@ -12,7 +12,7 @@
 #
 # the harness is the same on every OS (git-bash on windows, bash on linux/macOS);
 # the only target-specific knowledge it holds is the run-mode looked up per target
-# from targets.conf.
+# from targets.conf, `--runmode` overriding it for this invocation only.
 #
 # LEG vs BUILD-TARGET. --target names the LEG: the runner the harness runs on (and
 # the target an exec case builds + runs). a structural case (field / flat-loader)
@@ -33,23 +33,39 @@
 # where a 64K-aligned aarch64 image faulted ENOMEM on a native 4K-page kernel that every
 # qemu-aarch64 leg had reported green). keep the aarch64 int leg `native` for this
 # reason - do not move it to qemu.
+#
+# --runmode OVERRIDES targets.conf FOR THIS INVOCATION ONLY; the file itself, the
+# source of truth for CI's matrix, is never touched (#2314). It exists so a
+# developer on an x86-64 host can exercise a leg targets.conf marks `native` -
+# today, only `linux-arm64` - without hand-editing the SoT, which is exactly the
+# accidental-commit risk #2314 named. It does NOT make a qemu run CI-equivalent:
+# the RELRO/mprotect fidelity gap two paragraphs up applies exactly the same
+# whether qemu-user runs because targets.conf says so or because `--runmode`
+# said so. Use it to iterate locally; CI never passes it, so the authoritative
+# lane - native on the real runner targets.conf names - is unaffected.
 set -eu
 
 usage() {
-    echo "usage: run.sh --target <name> [--bless] [--filter <glob>] <compiler>" >&2
+    echo "usage: run.sh --target <name> [--runmode native|qemu] [--bless] [--filter <glob>] <compiler>" >&2
     exit 2
 }
 
 target=
+runmode_override=
 bless=0
 filter='*'
 compiler=
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --target) shift; [ $# -gt 0 ] || usage; target=$1 ;;
-        --filter) shift; [ $# -gt 0 ] || usage; filter=$1 ;;
-        --bless)  bless=1 ;;
+        --target)  shift; [ $# -gt 0 ] || usage; target=$1 ;;
+        --runmode) shift; [ $# -gt 0 ] || usage; runmode_override=$1
+                   case "$runmode_override" in
+                       native|qemu) : ;;
+                       *) echo "run.sh: --runmode must be 'native' or 'qemu', got '$runmode_override'" >&2; usage ;;
+                   esac ;;
+        --filter)  shift; [ $# -gt 0 ] || usage; filter=$1 ;;
+        --bless)   bless=1 ;;
         -h|--help) usage ;;
         -*) echo "run.sh: unknown flag '$1'" >&2; usage ;;
         *)  [ -z "$compiler" ] || { echo "run.sh: unexpected argument '$1'" >&2; usage; }
@@ -181,6 +197,10 @@ runmode=$(conf_runmode "$target") || {
     echo "run.sh: target '$target' is not in targets.conf" >&2
     exit 2
 }
+if [ -n "$runmode_override" ] && [ "$runmode_override" != "$runmode" ]; then
+    echo "run.sh: --runmode overrides '$target' to $runmode_override (targets.conf says $runmode; not CI-equivalent, see NATIVE vs QEMU FIDELITY above)" >&2
+    runmode=$runmode_override
+fi
 
 fails=0
 ran=0
