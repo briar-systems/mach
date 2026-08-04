@@ -20,6 +20,11 @@
 #                 for a cross-built target with no host runner (a freestanding
 #                 aarch64/riscv64 image on the x86_64 leg). the observable is a
 #                 constant, so the golden is the fact "it emitted".
+#   panic-exit  — run a binary EXPECTED to call std.system.panic and report its
+#                 stderr message plus its exit status, distinguishing a deliberate
+#                 termination from a signal death (#2369). unlike relro-fault, the
+#                 message is part of the observable: printing it and then faulting
+#                 is exactly the regression this guards.
 #   debuginfo   — build the case with and without `-g` (run.sh builds both) and
 #                 assert over the artifacts: llvm-dwarfdump --verify accepts the `-g`
 #                 image and `-g` is loadable-byte additive (PT_LOAD segments identical).
@@ -109,6 +114,42 @@ produce_relro_fault() {
         echo "relro_write=faulted"
     else
         echo "relro_write=exit$ec"
+    fi
+}
+
+# produce_panic_exit <runmode> <target> <binary>
+# runs a binary EXPECTED to call std.system.panic and reports its stderr message
+# followed by its exit status, distinguishing a deliberate PANIC_EXIT from a signal
+# death (#2369): panic used to write its message and then execute a trap
+# instruction with no exit syscall, which faulted (SIGSEGV, exit 139 on x86_64;
+# SIGTRAP, exit 133, on aarch64 / riscv64) and made a correctly detected internal
+# error indistinguishable from memory corruption. stdout+stderr are captured to a
+# file rather than a command substitution, both to avoid stripping the message's
+# own trailing newline (`$()` strips all of them) and to keep the exit-status read
+# on the line directly after the command, matching produce_relro_fault - the
+# proven-safe shape under this harness's `set -e`.
+#
+# a signal death is 128 + N with N in 1..64 (POSIX real-time signals cap there); the
+# fact is reported as `signal(<n>)` rather than the raw number so a golden reviewer
+# does not have to recompute N to see what regressed.
+produce_panic_exit() {
+    runmode=$1
+    target=$2
+    bin=$3
+    out=$(mktemp)
+    if [ "$runmode" = "qemu" ]; then
+        interp=$(qemu_bin "$target") || { rm -f "$out"; return 1; }
+        "$interp" "$bin" >"$out" 2>&1
+    else
+        "$bin" >"$out" 2>&1
+    fi
+    ec=$?
+    cat "$out"
+    rm -f "$out"
+    if [ "$ec" -ge 129 ] && [ "$ec" -le 192 ]; then
+        echo "exit=signal($((ec - 128)))"
+    else
+        echo "exit=$ec"
     fi
 }
 
@@ -629,6 +670,7 @@ produce() {
     case "$run" in
         exec)        produce_exec "$@" ;;
         relro-fault) produce_relro_fault "$@" ;;
+        panic-exit)  produce_panic_exit "$@" ;;
         field)       produce_field "$@" ;;
         relro)       produce_relro "$@" ;;
         flat-loader) produce_flat_loader "$@" ;;
