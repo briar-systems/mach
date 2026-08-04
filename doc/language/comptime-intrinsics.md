@@ -67,6 +67,12 @@ front end.
 A `$if` / `$or` condition is not a type position and does not get the on-demand
 layout, so a layout intrinsic there is still rejected, and reports why.
 
+**Inside a generic, a predicate is answered per instantiation.** `$is_record(T)`
+in a `fun f[T]()` body is not decided against the template's placeholder — the gate
+is deferred and re-folded once for each instantiation with `T` substituted, so
+`f[SomeRecord]` and `f[u64]` take different arms from one template. A template that
+is never instantiated has no instance to answer for and reports nothing.
+
 **Cycles are refused, not resolved.** A measurement whose answer is one of its own
 inputs — `#[align($size_of(Self))]`, or two types each aligned to the other's size —
 is reported as a layout cycle naming the type that closes it. A pointer field does
