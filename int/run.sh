@@ -43,6 +43,11 @@
 # whether qemu-user runs because targets.conf says so or because `--runmode`
 # said so. Use it to iterate locally; CI never passes it, so the authoritative
 # lane - native on the real runner targets.conf names - is unaffected.
+#
+# `--runmode qemu` only reaches a leg qemu-user can actually load: qemu_bin() in
+# lib/produce.sh names the ELF-only rule and the three targets that can never
+# work under it (#2453) - passing `qemu` for one of those fails loudly with that
+# reason once the case's producer runs, not silently as an `Exec format error`.
 set -eu
 
 usage() {
@@ -78,7 +83,7 @@ done
 [ -n "$compiler" ] || { echo "run.sh: a compiler path is required" >&2; usage; }
 
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-conf="$here/targets.conf"
+. "$here/lib/case.sh"
 . "$here/lib/produce.sh"
 
 # resolve the compiler to an absolute path; cases are built from their own dirs.
@@ -101,29 +106,6 @@ esac
 if [ ! -f "$compiler" ] && [ -f "$compiler$exe" ]; then
     compiler=$compiler$exe
 fi
-
-# conf_runmode <target> — print the run-mode column for a target, or fail.
-conf_runmode() {
-    while read -r name runner runmode rowcadence rest; do
-        case "$name" in ''|\#*) continue ;; esac
-        if [ "$name" = "$1" ]; then echo "$runmode"; return 0; fi
-    done < "$conf"
-    return 1
-}
-
-# all_targets — print every target name declared in targets.conf.
-all_targets() {
-    while read -r name runner runmode rowcadence rest; do
-        case "$name" in ''|\#*) continue ;; esac
-        echo "$name"
-    done < "$conf"
-}
-
-# in_list <item> <space-separated-list>
-in_list() {
-    case " $2 " in *" $1 "*) return 0 ;; esac
-    return 1
-}
 
 # lock_commit <mach.lock> <name> — the commit mach.lock records for [dep.<name>],
 # or empty when the file or the entry is absent.
@@ -210,42 +192,11 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
     [ -f "$dir/mach.toml" ] || continue
     case_id=${dir#"$here"/}
 
-    # case defaults; case.conf overrides any of them (line-based `key: value`).
-    case_targets=all
-    case_exempt=
-    case_profiles="debug release"
-    case_run=exec
-    case_build_target=
-    case_build_flags=
-    case_self_host=false
-    if [ -f "$dir/case.conf" ]; then
-        while IFS= read -r line || [ -n "$line" ]; do
-            case "$line" in ''|\#*) continue ;; esac
-            key=${line%%:*}
-            value=${line#*:}
-            key=$(echo "$key" | tr -d '[:space:]')
-            value=$(echo "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
-            case "$key" in
-                targets)        case_targets=$value ;;
-                exempt)         case_exempt=$value ;;
-                profiles)       case_profiles=$value ;;
-                run)            case_run=$value ;;
-                build-target)   case_build_target=$value ;;
-                build-flags)    case_build_flags=$value ;;
-                self-host)      case_self_host=$value ;;
-                *) echo "run.sh: $case_id/case.conf: unknown key '$key'" >&2; exit 2 ;;
-            esac
-        done < "$dir/case.conf"
-    fi
-
-    # resolve the applicable target set: the allowlist (all, or an explicit list)
-    # minus the exempt list.
-    if [ "$case_targets" = all ]; then
-        allow=$(all_targets | tr '\n' ' ')
-    else
-        allow=$case_targets
-    fi
-    if ! in_list "$target" "$allow"; then continue; fi
+    # case defaults, overridden by case.conf if present, and the resolved
+    # `targets: all`-or-explicit allowlist - shared with check-target-matrix.sh
+    # (#2353) so the two never disagree about what a case.conf line means.
+    read_case_conf "$dir"
+    if ! in_list "$target" "$case_allow"; then continue; fi
     if in_list "$target" "$case_exempt"; then continue; fi
 
     # the mach target to compile: the build-target if set, else the leg itself.
