@@ -38,23 +38,40 @@ against the record's layout, never a type or a value.
 
 ### Where a layout intrinsic is constant
 
-These three measure a type's storage, so they have a value only once that type's
-layout is resolved. That happens after the front end has settled every type, which
-puts two positions out of reach — both of them decided *while* layout is still
-being worked out:
+`$size_of` and `$align_of` fold in every **type** position, including ones resolved
+before layout would otherwise be known — the measured type's layout is established
+on demand when the measurement asks for it, so where the type is *declared* relative
+to where it is measured makes no difference:
 
-| position | layout intrinsic |
+| position | `$size_of` / `$align_of` |
 |---|---|
 | `val` / `var` initializer | yes |
 | global `align` | yes |
-| record / union type `align` | **no** |
-| array length `[N]T` | **no** |
+| record / union type `align` | yes |
+| array length `[N]T` | yes |
 | `$if` / `$or` condition | **no** |
 
-A literal is accepted in all of them. Binding the intrinsic to a `val` and using
-the name does not work around a rejection — the binding's own value is folded
-after the point that needs it. Every rejected position reports the reason at the
-point of failure. Lifting the restriction is tracked as #2442.
+```mach
+rec Pair { a: u64; b: u64; }
+
+#[align($align_of(Pair))]        # a type's alignment
+rec Over { x: u8; }
+
+rec Holder { buf: [$size_of(Pair)]u8; }   # an array length, inside a field type
+```
+
+`$offset_of` is the exception among the three: it folds in a value position but not
+in a type one, because a field offset is settled during lowering rather than by the
+front end.
+
+A `$if` / `$or` condition is not a type position and does not get the on-demand
+layout, so a layout intrinsic there is still rejected, and reports why.
+
+**Cycles are refused, not resolved.** A measurement whose answer is one of its own
+inputs — `#[align($size_of(Self))]`, or two types each aligned to the other's size —
+is reported as a layout cycle naming the type that closes it. A pointer field does
+not create one: it stores an address of fixed width, so `rec Node { next: *Node; }`
+measures normally.
 
 ## Type intrinsic
 
@@ -283,7 +300,7 @@ $or { $error("no writer for this argument type"); }    # compile error on an unh
 > e.g. `$assert($mach.build.arch == $mach.arch.x86_64, "expected x86_64");`. Being `$if`
 > sugar, it will inherit `$if`'s restrictions: a layout intrinsic in `cond` is
 > rejected for the reason above, so `$assert($size_of(i64) == 8, ...)` is not a
-> spelling to plan on until #2442 lands.
+> spelling to plan on.
 
 ## Not provided as intrinsics
 
