@@ -9906,6 +9906,178 @@ test "mach.lang.driver:shift_executes_on_a_6502_core_mos6502" {
     ret bad;
 }
 
+# build the source of a two-operand multiply probe module at width `bits`: both
+# operands arrive and the result leaves as `u64` (the ABI shape every mos6502 probe
+# in this file already uses). For a narrower `ty`, both operands are truncated to
+# it and multiplied at THAT width, then widened back, so the multiply itself
+# happens at `bits` wide while the function's own calling convention stays the one
+# this harness already exercises. `ty == "u64"` skips the cast pair entirely - a
+# same-width cast is its own untested legalize frontier (a bare BITCAST reaches no
+# arm in `expand_instr`), unrelated to #2344 and not this issue's to fix; `v * w`
+# directly exercises the identical multiply at the same width without it (test
+# helper)
+# ---
+# buf: the source buffer to write
+# ty:  the multiply's own operand type (`u8` / `u16` / `u32` / `u64`)
+fun ut_mos_mul_src(buf: *u8, ty: str) usize {
+    var w: usize = 0;
+    if (str_equals(ty, "u64")) {
+        w = ut_app(buf, w, "fun f(v: u64, w: u64) u64 { ret v * w; }\n");
+    }
+    or {
+        w = ut_app(buf, w, "fun f(v: u64, w: u64) u64 { ret ((v::");
+        w = ut_app(buf, w, ty);
+        w = ut_app(buf, w, ") * (w::");
+        w = ut_app(buf, w, ty);
+        w = ut_app(buf, w, "))::u64; }\n");
+    }
+    w = ut_app(buf, w, "fun main() i32 { ret 0; }\n");
+    buf[w] = 0;
+    ret w;
+}
+
+# the reference answer for a multiply at `bits` wide, computed independently of the
+# emitted bytes (test helper)
+fun ut_mul_ref(bits: u32, v: u64, w: u64) u64 {
+    var mask: u64 = 0xFFFFFFFFFFFFFFFF;
+    if (bits < 64) { mask = (1::u64 << bits::u64) - 1; }
+    ret ((v & mask) * (w & mask)) & mask;
+}
+
+# sweep one width of the mos6502 wide-multiply work over a real build (test helper)
+#
+# `w` is paired with `v` at a fixed offset into the same `ut_shift_value` sweep
+# (rather than the full 16x16 cross product), so both operands range over every
+# value pattern the set names - zero, all-ones, alternating, lane boundaries, a
+# spread - at a sixteenth of the cost.
+# ---
+# s:     the session to build in
+# alloc: allocator for the source buffer and the memory image
+# bits:  the scalar width in bits
+# ty:    the scalar type name
+# ret:   0 when every pair answered correctly at a fixed cycle count
+fun ut_mos_mul_sweep(s: *session.Session, alloc: *A.Allocator, bits: u32, ty: str) i32 {
+    val sr: R.Result[*u8, str] = A.allocate[u8](alloc, 8192);
+    if (R.is_err[*u8, str](sr)) { ret 1; }
+    val srcbuf: *u8 = R.unwrap_ok[*u8, str](sr);
+    ut_mos_mul_src(srcbuf, ty);
+
+    val mr: R.Result[*u8, str] = A.zallocate[u8](alloc, UT_MOS_MEM);
+    if (R.is_err[*u8, str](mr)) { A.deallocate[u8](alloc, srcbuf, 8192); ret 1; }
+    val mem: *u8 = R.unwrap_ok[*u8, str](mr);
+
+    var bad: i32 = 0;
+    val pr: R.Result[project.Project, outcome.Fail] = ut_ct_edge_project(s, alloc, srcbuf::str, "mos");
+    if (R.is_err[project.Project, outcome.Fail](pr)) { bad = 1; }
+    or {
+        var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+        if (ut_run_codegen_ok(?p) != 0) { bad = 1; }
+        or {
+            var text: *u8 = nil;
+            var tlen: u32 = 0;
+            var offs: [1]u32;
+            if (!ut_mos_text(?p, ?text, ?tlen, ?offs[0], 1))    { bad = 1; }
+            or (UT_MOS_CODE + tlen >= UT_MOS_ARGS)              { bad = 1; }
+            or {
+                ut_mos_load(text, tlen, mem);
+                var fixed: u32 = 0;
+                var vi: u32 = 0;
+                for (vi < UT_SHIFT_VALUES) {
+                    val v: u64 = ut_shift_value(vi);
+                    val ww: u64 = ut_shift_value((vi + 5) % UT_SHIFT_VALUES);
+                    var got: u64 = 0;
+                    var cy:  u32 = 0;
+                    if (!ut_mos_run(mem, offs[0], 8, v, ww, ?got, ?cy)) { bad = 1; }
+                    or {
+                        if (got != ut_mul_ref(bits, v, ww)) { bad = 1; }
+                        # branchless double-and-add (#2344): one cycle count for
+                        # every value pair, the same discipline the shift barrel
+                        # and the carry chain are already held to.
+                        if (vi == 0)     { fixed = cy; }
+                        or (cy != fixed) { bad = 1; }
+                    }
+                    vi = vi + 1;
+                }
+            }
+        }
+        project.dnit_project(?p);
+    }
+
+    A.deallocate[u8](alloc, mem, UT_MOS_MEM);
+    A.deallocate[u8](alloc, srcbuf, 8192);
+    ret bad;
+}
+
+# mos6502 (#2344): a wide multiply BUILDS AND RUNS, executed on a reference 6502 core
+#
+# The 6502 has no hardware multiply at any width, so `be.codegen.legalize` owns
+# every `MIR_MUL` here - the native-width case (`u8 * u8`) alongside the wide one,
+# unlike every other expansion in this file, which only ever admits a wide
+# instruction. Swept at the width boundary (`u8`, the narrowest and the only
+# native-width case), a middle width (`u16`), and the widest (`u64`, `u32` also
+# covered), each a genuine two-operand runtime multiply - neither operand a
+# compile-time constant, so the general double-and-add algorithm is exercised with
+# no shortcut available.
+#
+# THE CONSTANT-MULTIPLIER CASE, PROVEN SEPARATELY. The issue's own reproducer,
+# `v * 2`, is a constant multiplier only because no algebraic pass runs at `opt =
+# 0`; this expansion draws no distinction between a constant and a runtime operand
+# - both are ordinary lane operands to the same algorithm (an immediate's lane is
+# read through `imm_lane`, exactly like any other immediate operand elsewhere in
+# this pass) - so there is no separate "strength reduction" code path to exercise
+# here. The message the old refusal used to give ("wide multiply by a
+# non-constant") is retired along with it: the new expansion does not distinguish.
+test "mach.lang.driver:mul_executes_on_a_6502_core_mos6502" {
+    var bad: i32 = 0;
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    if (ut_mos_mul_sweep(?s, ?alloc, 8,  "u8")  != 0) { bad = 1; }
+    if (ut_mos_mul_sweep(?s, ?alloc, 16, "u16") != 0) { bad = 1; }
+    if (ut_mos_mul_sweep(?s, ?alloc, 32, "u32") != 0) { bad = 1; }
+    if (ut_mos_mul_sweep(?s, ?alloc, 64, "u64") != 0) { bad = 1; }
+
+    val mr: R.Result[*u8, str] = A.zallocate[u8](?alloc, UT_MOS_MEM);
+    if (R.is_err[*u8, str](mr)) { bad = 1; }
+    or {
+        val mem: *u8 = R.unwrap_ok[*u8, str](mr);
+        val pe: R.Result[project.Project, outcome.Fail] = ut_ct_edge_project(?s, ?alloc,
+            "fun f(v: u64) u64 { ret v * 2; }\nfun main() i32 { ret 0; }\n", "mos");
+        if (R.is_err[project.Project, outcome.Fail](pe)) { bad = 1; }
+        or {
+            var pf: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pe);
+            if (ut_run_codegen_ok(?pf) != 0) { bad = 1; }
+            or {
+                var text: *u8 = nil;
+                var tlen: u32 = 0;
+                var offs: [1]u32;
+                if (!ut_mos_text(?pf, ?text, ?tlen, ?offs[0], 1)) { bad = 1; }
+                or {
+                    ut_mos_load(text, tlen, mem);
+                    var vi: u32 = 0;
+                    for (vi < UT_SHIFT_VALUES) {
+                        val v: u64 = ut_shift_value(vi);
+                        var got: u64 = 0;
+                        var cy:  u32 = 0;
+                        if (!ut_mos_run(mem, offs[0], 8, v, 0, ?got, ?cy)) { bad = 1; }
+                        or (got != v * 2) { bad = 1; }
+                        vi = vi + 1;
+                    }
+                }
+            }
+            project.dnit_project(?pf);
+        }
+        A.deallocate[u8](?alloc, mem, UT_MOS_MEM);
+    }
+
+    session.dnit(?s);
+    ret bad;
+}
+
+
 # `setup_registry` refuses a debug identity whose producer no registrar wired
 #
 # The identity list (target layer) and the be-layer registrars are joined only by
@@ -10046,27 +10218,93 @@ test "mach.lang.driver:secret_store_taint_survives_lower" {
     ret 0;
 }
 
-# with the constant-time classification tables landed but no scanner wired, an
-# inline-asm block inside `#[oblivious]` is still refused, verbatim
+# an #[oblivious] function may now CONTAIN inline asm, and the block is validated
+# instruction by instruction rather than refused (#2230)
 #
-# The neutrality claim of #2230's first half, pinned as BEHAVIOUR rather than as a
-# comment. The tables classify every mnemonic all three grammars admit, and the
-# `asm_ct_scan` vtable slot exists - but every ISA leaves it nil, and a nil scanner
-# means `ctvalidate` keeps refusing. That is the fail-closed default being
-# STRUCTURAL: the analysis can land, and be reviewed, without widening by a single
-# program what `#[oblivious]` accepts. When the walk is wired this test is the one
-# that must be deliberately changed, which is exactly the review checkpoint wanted.
-test "mach.lang.driver:oblivious_asm_still_refused_without_a_scanner" {
+# The accept half. A block whose instructions are all constant-time on their operands
+# compiles, on every target, with no decorator escape hatch and no declassification.
+test "mach.lang.driver:oblivious_asm_validated_not_refused" {
     var bad: i32 = 0;
 
-    # a block that leaks nothing on any axis - a bare `nop` - is refused, so the
-    # refusal is unconditional rather than a leak finding.
-    if (ut_codegen_rejects("#[oblivious]\nfun f(x: ^u64) ^u64 { var r: ^u64 = x; asm x86_64 { nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
-        "contains inline assembly, which cannot be verified constant-time") != 0) { bad = 1; }
+    # a block that leaks nothing: the case the blanket refusal used to reject.
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(x: ^u64) ^u64 { var r: ^u64 = x; asm x86_64 { nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
 
-    # and the guidance the message offers is unchanged.
-    if (ut_codegen_rejects("#[oblivious]\nfun g(x: ^u64) ^u64 { var r: ^u64 = x; asm x86_64 { nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
-        "move it to a non-oblivious function and `:^`-declassify at the boundary") != 0) { bad = 1; }
+    # an UNCONDITIONAL jump is not a conditional branch: it validates on x86-64 even
+    # though every `jcc` there is refused.
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(x: ^u64) ^u64 { var r: ^u64 = x; asm x86_64 { jmp 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+
+    # THE MOTIVATING CASE: a straight-line atomic read-modify-write. its latency
+    # varies with contention, not with the value, and check (b) keeps the address
+    # public - so it is constant-time in the leakage model's sense.
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(p: *i64) i64 { var v: i64 = 1; asm x86_64 { mov rax, {v}\n lock xadd {p}, rax\n mov {v}, rax } ret v; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+
+    # aarch64 and riscv64 get the full three checks, including their branches.
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(x: ^u64) ^u64 { var r: ^u64 = x; asm aarch64 { nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux-arm64") != 0) { bad = 1; }
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(x: ^u64) ^u64 { var r: ^u64 = x; asm riscv64 { nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux-riscv64") != 0) { bad = 1; }
+
+    ret bad;
+}
+
+# the leaks the walk must still refuse, each naming what it found (#2230)
+#
+# The reject half, and the reason the accept half above is not simply a relaxation.
+test "mach.lang.driver:oblivious_asm_leaks_refused" {
+    var bad: i32 = 0;
+
+    # THE NIGHTMARE CASE. `cmp {secret}, rbx ; je` conditions the branch on FLAGS,
+    # which the inline-asm effect model does not represent - so a register-only walk
+    # would pass it as leak-free. Refused on x86-64 whether or not a secret is
+    # present, and the message says why and where the lift is tracked.
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { cmp {r}, rbx\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "its condition rides the flags register") != 0) { bad = 1; }
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { cmp {r}, rbx\n je 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "#2460") != 0) { bad = 1; }
+
+    # a `.byte` payload can encode ANY instruction, including a secret-dependent
+    # branch. there is nothing to analyze, so it is refused on KIND.
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(x: ^u64) ^u64 { var r: ^u64 = x; asm x86_64 { .byte 0x90 } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "its payload can encode any instruction") != 0) { bad = 1; }
+
+    # (a) a REGISTER-conditioned branch on a secret, on a target where the condition
+    # is visible: aarch64's `cbnz` reads a register, so this one is caught rather
+    # than refused wholesale.
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm aarch64 { ldr x9, {r}\n cbnz x9, 1f\n1:\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux-arm64", "branches on a secret value inside an inline-asm block") != 0) { bad = 1; }
+
+    # (c) a variable-latency operation on a secret operand. riscv64 is the target
+    # where this check is substantive - its grammar admits the whole M-extension.
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm riscv64 { ld a0, {r}\n div a1, a0, a0\n nop } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux-riscv64", "variable-latency inline-asm operation on a secret value") != 0) { bad = 1; }
+
+    ret bad;
+}
+
+# the `{name}` binding boundary: a binding is a taint SOURCE but never a secret
+# ADDRESS, and the pair below is where that exclusion ends (#2230)
+#
+# A binding substitutes to a compiler-chosen frame slot, so its address is a fixed
+# `[fp+off]` - public even when its contents are not. Using the binding directly as
+# a memory operand is therefore fine. The moment its VALUE reaches a register and
+# that register addresses memory, check (b) fires. That is the boundary a future
+# editor would widen wrongly, so both sides are pinned.
+test "mach.lang.driver:oblivious_asm_binding_is_not_a_secret_address" {
+    var bad: i32 = 0;
+
+    # accepted: the binding IS the memory operand. its address is the frame slot.
+    if (ut_codegen_target_ok("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r} } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n", "linux") != 0) { bad = 1; }
+
+    # a local typed `*^u8` holds a POINTER whose pointee is secret. the stamp uses the
+    # SPINE predicate, so its storage counts as secret and a leak through it refuses -
+    # the boundary between the spine predicate and the top-level one, and the case that
+    # distinguishes them. erring toward refusal is the fail-closed direction here.
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(p: *^u8) *^u8 { var q: *^u8 = p; asm x86_64 { mov rax, {q}\n mov rbx, [rax] } ret q; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "addresses memory with a secret value") != 0) { bad = 1; }
+
+
+    # refused: the secret reached rax, and rax is then an address BASE. the access
+    # pattern reveals the secret through the cache.
+    if (ut_codegen_target_rejects("#[oblivious]\nfun f(k: ^u64) ^u64 { var r: ^u64 = k; asm x86_64 { mov rax, {r}\n mov rbx, [rax] } ret r; }\n#[symbol(\"main\")]\nfun main(argc: i64, argv: **u8) i32 { ret 0; }\n",
+        "linux", "addresses memory with a secret value") != 0) { bad = 1; }
 
     ret bad;
 }
