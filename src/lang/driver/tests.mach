@@ -9778,6 +9778,177 @@ test "mach.lang.driver:shift_executes_on_a_6502_core_mos6502" {
     ret bad;
 }
 
+# build the source of a two-operand multiply probe module at width `bits`: both
+# operands arrive and the result leaves as `u64` (the ABI shape every mos6502 probe
+# in this file already uses). For a narrower `ty`, both operands are truncated to
+# it and multiplied at THAT width, then widened back, so the multiply itself
+# happens at `bits` wide while the function's own calling convention stays the one
+# this harness already exercises. `ty == "u64"` skips the cast pair entirely - a
+# same-width cast is its own untested legalize frontier (a bare BITCAST reaches no
+# arm in `expand_instr`), unrelated to #2344 and not this issue's to fix; `v * w`
+# directly exercises the identical multiply at the same width without it (test
+# helper)
+# ---
+# buf: the source buffer to write
+# ty:  the multiply's own operand type (`u8` / `u16` / `u32` / `u64`)
+fun ut_mos_mul_src(buf: *u8, ty: str) usize {
+    var w: usize = 0;
+    if (str_equals(ty, "u64")) {
+        w = ut_app(buf, w, "fun f(v: u64, w: u64) u64 { ret v * w; }\n");
+    }
+    or {
+        w = ut_app(buf, w, "fun f(v: u64, w: u64) u64 { ret ((v::");
+        w = ut_app(buf, w, ty);
+        w = ut_app(buf, w, ") * (w::");
+        w = ut_app(buf, w, ty);
+        w = ut_app(buf, w, "))::u64; }\n");
+    }
+    w = ut_app(buf, w, "fun main() i32 { ret 0; }\n");
+    buf[w] = 0;
+    ret w;
+}
+
+# the reference answer for a multiply at `bits` wide, computed independently of the
+# emitted bytes (test helper)
+fun ut_mul_ref(bits: u32, v: u64, w: u64) u64 {
+    var mask: u64 = 0xFFFFFFFFFFFFFFFF;
+    if (bits < 64) { mask = (1::u64 << bits::u64) - 1; }
+    ret ((v & mask) * (w & mask)) & mask;
+}
+
+# sweep one width of the mos6502 wide-multiply work over a real build (test helper)
+#
+# `w` is paired with `v` at a fixed offset into the same `ut_shift_value` sweep
+# (rather than the full 16x16 cross product), so both operands range over every
+# value pattern the set names - zero, all-ones, alternating, lane boundaries, a
+# spread - at a sixteenth of the cost.
+# ---
+# s:     the session to build in
+# alloc: allocator for the source buffer and the memory image
+# bits:  the scalar width in bits
+# ty:    the scalar type name
+# ret:   0 when every pair answered correctly at a fixed cycle count
+fun ut_mos_mul_sweep(s: *session.Session, alloc: *A.Allocator, bits: u32, ty: str) i32 {
+    val sr: R.Result[*u8, str] = A.allocate[u8](alloc, 8192);
+    if (R.is_err[*u8, str](sr)) { ret 1; }
+    val srcbuf: *u8 = R.unwrap_ok[*u8, str](sr);
+    ut_mos_mul_src(srcbuf, ty);
+
+    val mr: R.Result[*u8, str] = A.zallocate[u8](alloc, UT_MOS_MEM);
+    if (R.is_err[*u8, str](mr)) { A.deallocate[u8](alloc, srcbuf, 8192); ret 1; }
+    val mem: *u8 = R.unwrap_ok[*u8, str](mr);
+
+    var bad: i32 = 0;
+    val pr: R.Result[project.Project, outcome.Fail] = ut_ct_edge_project(s, alloc, srcbuf::str, "mos");
+    if (R.is_err[project.Project, outcome.Fail](pr)) { bad = 1; }
+    or {
+        var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+        if (ut_run_codegen_ok(?p) != 0) { bad = 1; }
+        or {
+            var text: *u8 = nil;
+            var tlen: u32 = 0;
+            var offs: [1]u32;
+            if (!ut_mos_text(?p, ?text, ?tlen, ?offs[0], 1))    { bad = 1; }
+            or (UT_MOS_CODE + tlen >= UT_MOS_ARGS)              { bad = 1; }
+            or {
+                ut_mos_load(text, tlen, mem);
+                var fixed: u32 = 0;
+                var vi: u32 = 0;
+                for (vi < UT_SHIFT_VALUES) {
+                    val v: u64 = ut_shift_value(vi);
+                    val ww: u64 = ut_shift_value((vi + 5) % UT_SHIFT_VALUES);
+                    var got: u64 = 0;
+                    var cy:  u32 = 0;
+                    if (!ut_mos_run(mem, offs[0], 8, v, ww, ?got, ?cy)) { bad = 1; }
+                    or {
+                        if (got != ut_mul_ref(bits, v, ww)) { bad = 1; }
+                        # branchless double-and-add (#2344): one cycle count for
+                        # every value pair, the same discipline the shift barrel
+                        # and the carry chain are already held to.
+                        if (vi == 0)     { fixed = cy; }
+                        or (cy != fixed) { bad = 1; }
+                    }
+                    vi = vi + 1;
+                }
+            }
+        }
+        project.dnit_project(?p);
+    }
+
+    A.deallocate[u8](alloc, mem, UT_MOS_MEM);
+    A.deallocate[u8](alloc, srcbuf, 8192);
+    ret bad;
+}
+
+# mos6502 (#2344): a wide multiply BUILDS AND RUNS, executed on a reference 6502 core
+#
+# The 6502 has no hardware multiply at any width, so `be.codegen.legalize` owns
+# every `MIR_MUL` here - the native-width case (`u8 * u8`) alongside the wide one,
+# unlike every other expansion in this file, which only ever admits a wide
+# instruction. Swept at the width boundary (`u8`, the narrowest and the only
+# native-width case), a middle width (`u16`), and the widest (`u64`, `u32` also
+# covered), each a genuine two-operand runtime multiply - neither operand a
+# compile-time constant, so the general double-and-add algorithm is exercised with
+# no shortcut available.
+#
+# THE CONSTANT-MULTIPLIER CASE, PROVEN SEPARATELY. The issue's own reproducer,
+# `v * 2`, is a constant multiplier only because no algebraic pass runs at `opt =
+# 0`; this expansion draws no distinction between a constant and a runtime operand
+# - both are ordinary lane operands to the same algorithm (an immediate's lane is
+# read through `imm_lane`, exactly like any other immediate operand elsewhere in
+# this pass) - so there is no separate "strength reduction" code path to exercise
+# here. The message the old refusal used to give ("wide multiply by a
+# non-constant") is retired along with it: the new expansion does not distinguish.
+test "mach.lang.driver:mul_executes_on_a_6502_core_mos6502" {
+    var bad: i32 = 0;
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    if (ut_mos_mul_sweep(?s, ?alloc, 8,  "u8")  != 0) { bad = 1; }
+    if (ut_mos_mul_sweep(?s, ?alloc, 16, "u16") != 0) { bad = 1; }
+    if (ut_mos_mul_sweep(?s, ?alloc, 32, "u32") != 0) { bad = 1; }
+    if (ut_mos_mul_sweep(?s, ?alloc, 64, "u64") != 0) { bad = 1; }
+
+    val mr: R.Result[*u8, str] = A.zallocate[u8](?alloc, UT_MOS_MEM);
+    if (R.is_err[*u8, str](mr)) { bad = 1; }
+    or {
+        val mem: *u8 = R.unwrap_ok[*u8, str](mr);
+        val pe: R.Result[project.Project, outcome.Fail] = ut_ct_edge_project(?s, ?alloc,
+            "fun f(v: u64) u64 { ret v * 2; }\nfun main() i32 { ret 0; }\n", "mos");
+        if (R.is_err[project.Project, outcome.Fail](pe)) { bad = 1; }
+        or {
+            var pf: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pe);
+            if (ut_run_codegen_ok(?pf) != 0) { bad = 1; }
+            or {
+                var text: *u8 = nil;
+                var tlen: u32 = 0;
+                var offs: [1]u32;
+                if (!ut_mos_text(?pf, ?text, ?tlen, ?offs[0], 1)) { bad = 1; }
+                or {
+                    ut_mos_load(text, tlen, mem);
+                    var vi: u32 = 0;
+                    for (vi < UT_SHIFT_VALUES) {
+                        val v: u64 = ut_shift_value(vi);
+                        var got: u64 = 0;
+                        var cy:  u32 = 0;
+                        if (!ut_mos_run(mem, offs[0], 8, v, 0, ?got, ?cy)) { bad = 1; }
+                        or (got != v * 2) { bad = 1; }
+                        vi = vi + 1;
+                    }
+                }
+            }
+            project.dnit_project(?pf);
+        }
+        A.deallocate[u8](?alloc, mem, UT_MOS_MEM);
+    }
+
+    session.dnit(?s);
+    ret bad;
+}
+
 
 # `setup_registry` refuses a debug identity whose producer no registrar wired
 #
