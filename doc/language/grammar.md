@@ -154,8 +154,11 @@ LIT_STR  ::= '"' { str-char } '"'
 
 The lexer captures the raw span between the quotes and treats `\` as an
 escape that consumes the next character (so an escaped quote does not
-terminate the literal). Escape decoding happens later
-(`comptime.eval_lit_char`); the recognized escapes are:
+terminate the literal). Escape decoding happens later — in
+`comptime.eval_lit_char` / `comptime.eval_lit_str` for a comptime-evaluated
+literal, and in `me/lower/expr.lit_decode_escape` (an intentional mirror of the
+same table, #2472) for one lowered as ordinary runtime code. The recognized
+escapes are:
 
 ```
 char escapes:   \n  \t  \r  \\  \'  \0  \xHH
