@@ -109,8 +109,44 @@ in_list() {
     return 1
 }
 
-# dep_commits <case-dir> — print "name@shortsha ..." for every [dep.<name>] a
-# case's mach.lock records, or nothing when no lock exists.
+# lock_commit <mach.lock> <name> — the commit mach.lock records for [dep.<name>],
+# or empty when the file or the entry is absent.
+lock_commit() {
+    lockfile=$1
+    want=$2
+    [ -f "$lockfile" ] || return 0
+    awk -v want="$want" '
+        /^\[dep\./ { name = $0; sub(/^\[dep\./, "", name); sub(/\]$/, "", name); next }
+        /^commit = / && name == want {
+            sha = $0
+            sub(/^commit = "/, "", sha); sub(/"$/, "", sha)
+            print sha
+            exit
+        }
+    ' "$lockfile"
+}
+
+# dep_commits <case-dir> — print "name@shortsha ..." for every git dep checked
+# out under a case's dep/, or nothing when none exist.
+#
+# Ground-truthed from the CHECKOUT (`git rev-parse --short HEAD`), not from
+# mach.lock: the lock is the RECORD of a resolution, the checkout is the
+# ENTITY that was actually compiled against, and #2387's own observation was a
+# case where those disagreed - lock said one commit, dep/mach-std's HEAD was on
+# another (reproduced locally: a manual `git checkout` inside dep/mach-std,
+# bypassing `mach dep`, leaves mach.lock exactly where it was). Reading the
+# lock here would print the record, not the entity, and inherit that gap one
+# level up. When the checkout and the lock disagree, this prints
+# "name@<checkout>!lock=<locked>" instead of silently trusting either one.
+#
+# Traced (process_git_node in src/cli/cmd/dep.mach) and reproduced: `dep pull`
+# itself repairs a drifted checkout LOUDLY every time it runs, restoring it to
+# the lock and printing `repaired <name> (checkout drift: ...)`. Since run.sh
+# always calls `dep pull` immediately before build in the same command, a case
+# actually BUILT under this harness cannot disagree with its own lock by the
+# time this function reads it - the mismatch marker exists as a tripwire for a
+# future path that reads dep/ without first pulling (or a `dep pull` that
+# somehow stopped repairing), not because the current flow produces one.
 #
 # A case's `ref = "branch/main"` deliberately tracks mach-std's latest RELEASE
 # (moving `main` is the reviewed release event, not drift - see doc/cli.md's
@@ -119,21 +155,26 @@ in_list() {
 # last regenerated it, contradicting that intent. But an ephemeral lock means
 # nothing durable records which commit a given run actually compiled against -
 # `mach dep pull`'s own lock write vanishes with the rest of the case's gitignored
-# state (#2387). Printing it into every PASS/FAIL/BLESS line is that record: it
+# state. Printing the checkout into every PASS/FAIL/BLESS line is that record: it
 # survives exactly as long as the CI log does, which is exactly as long as anyone
 # would want to ask "what did this run compile against".
 dep_commits() {
     dir=$1
-    [ -f "$dir/mach.lock" ] || return 0
-    awk '
-        /^\[dep\./ { name = $0; sub(/^\[dep\./, "", name); sub(/\]$/, "", name); next }
-        /^commit = / && name != "" {
-            sha = $0
-            sub(/^commit = "/, "", sha); sub(/"$/, "", sha)
-            printf "%s@%s ", name, substr(sha, 1, 7)
-            name = ""
-        }
-    ' "$dir/mach.lock"
+    [ -d "$dir/dep" ] || return 0
+    for depdir in "$dir"/dep/*/; do
+        [ -d "${depdir}.git" ] || [ -f "${depdir}.git" ] || continue
+        name=$(basename "$depdir")
+        head=$(git -C "$depdir" rev-parse --short HEAD 2>/dev/null) || continue
+        locked=$(lock_commit "$dir/mach.lock" "$name")
+        if [ -n "$locked" ]; then
+            case "$locked" in
+                "$head"*) printf '%s@%s ' "$name" "$head" ;;
+                *)        printf '%s@%s!lock=%s ' "$name" "$head" "$(printf '%s' "$locked" | cut -c1-7)" ;;
+            esac
+        else
+            printf '%s@%s ' "$name" "$head"
+        fi
+    done
 }
 
 runmode=$(conf_runmode "$target") || {
