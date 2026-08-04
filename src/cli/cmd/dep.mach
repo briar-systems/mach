@@ -491,13 +491,17 @@ fun materialize_path_node(a: *A.Allocator, node: *DepNode, dep_root: str, dep_na
 # below the project root per path segment of the dep dir, so the target climbs
 # that many `..` before applying the source path. A relative target keeps a tree
 # that moves as a whole (a monorepo, a committed examples dir) linked without a
-# re-pull (#1370).
+# re-pull (#1370). An absolute `src` needs no climb - it is already rooted, and
+# prefixing `../` onto it would walk off it entirely (#2470) - so it is returned
+# verbatim.
 # ---
 # a:        allocator for the owned target buffer
 # dep_name: the dep-dir name, whose segment count sets the climb depth
-# src:      the source path relative to the project root
-# ret:      the owned relative target, or an allocation error
+# src:      the source path, relative to the project root, or absolute
+# ret:      the owned target (relative, or `src` verbatim when absolute), or an
+#           allocation error
 fun link_target(a: *A.Allocator, dep_name: str, src: str) R.Result[str, str] {
+    if (path_is_absolute(src)) { ret R.ok[str, str](own(a, src)); }
     val depth:   usize = path_segments(dep_name);
     val src_len: usize = str_len(src);
     val res_buf: R.Result[*u8, str] = A.allocate[u8](a, depth * 3 + src_len + 1);
@@ -905,9 +909,10 @@ fun read_dep_spec(a: *A.Allocator, sub: *toml.Table, name: str) R.Result[DepNode
 
 # read every `[dep.*]` of a parsed manifest and merge each into the flat tree
 #
-# A git dep's flat-tree directory is `<dep_root>/<name>`; a path dep is resolved
-# relative to the requiring manifest. A name already present must match its source
-# and ref exactly, else it is a conflict naming both requirers.
+# A git dep's flat-tree directory is `<dep_root>/<name>`; a path dep is used as-is
+# when absolute, else resolved relative to the requiring manifest. A name already
+# present must match its source and ref exactly, else it is a conflict naming both
+# requirers.
 # ---
 # nv:           the flat tree to grow
 # manifest_dir: directory of the manifest being read (for relative path deps)
@@ -934,8 +939,13 @@ fun enqueue_manifest(nv: *NodeVec, manifest_dir: str, dep_root: str, mt: *toml.T
         node.req = own(nv.a, req);
 
         var res_dir: R.Result[str, str];
-        if (node.is_git) { res_dir = join2(nv.a, dep_root, node.name::*u8); }
-        or               { res_dir = join2(nv.a, manifest_dir, node.path::*u8); }
+        if (node.is_git) {
+            res_dir = join2(nv.a, dep_root, node.name::*u8);
+        }
+        or {
+            if (path_is_absolute(node.path)) { res_dir = R.ok[str, str](own(nv.a, node.path)); }
+            or                               { res_dir = join2(nv.a, manifest_dir, node.path::*u8); }
+        }
         if (R.is_err[str, str](res_dir)) { ret R.err[bool, str]("out of memory"); }
         node.dir = R.unwrap_ok[str, str](res_dir);
 
@@ -1935,6 +1945,14 @@ fun with_prefix(a: *A.Allocator, prefix: *u8, s: str) str {
     ret buf::str;
 }
 
+# whether `p` is an absolute (`/`-rooted) path
+# ---
+# p:   the path to inspect
+# ret: true when `p` is non-empty and starts with `/`
+fun path_is_absolute(p: str) bool {
+    ret str_len(p) > 0 && p[0] == '/'::u8;
+}
+
 # join `a` and `b` with a single '/', as an owned null-terminated path
 # ---
 # a:    allocator for the joined path
@@ -2118,7 +2136,19 @@ test "mach.cli.cmd.dep.path_segments" {
     ret 0;
 }
 
-# link_target climbs the dep dir, then applies the source path (#1370)
+# path_is_absolute answers on a leading '/', never on emptiness (#2470)
+test "mach.cli.cmd.dep.path_is_absolute" {
+    if (!path_is_absolute("/abs/path"))  { ret 1; }
+    if (!path_is_absolute("/"))          { ret 1; }
+    if (path_is_absolute("rel/path"))    { ret 1; }
+    if (path_is_absolute("./rel"))       { ret 1; }
+    if (path_is_absolute(""))            { ret 1; }
+    ret 0;
+}
+
+# link_target climbs the dep dir, then applies the source path (#1370); an
+# absolute source needs no climb and is returned verbatim, never prefixed with
+# `../` (#2470)
 test "mach.cli.cmd.dep.link_target" {
     var a: A.Allocator;
     if (O.is_some[str](page.make(?a))) { ret 1; }
@@ -2130,6 +2160,37 @@ test "mach.cli.cmd.dep.link_target" {
     val res_two: R.Result[str, str] = link_target(?a, "a/b", "x");
     if (R.is_err[str, str](res_two))                            { ret 1; }
     if (!str_equals(R.unwrap_ok[str, str](res_two), "../../x")) { ret 1; }
+    # an absolute source is the target verbatim, regardless of dep dir depth.
+    val res_abs: R.Result[str, str] = link_target(?a, "a/b", "/home/x/lib-y");
+    if (R.is_err[str, str](res_abs))                                     { ret 1; }
+    if (!str_equals(R.unwrap_ok[str, str](res_abs), "/home/x/lib-y"))    { ret 1; }
+    ret 0;
+}
+
+# an absolute [dep.*] path is used verbatim, never joined onto the manifest
+# directory (the bug: `join2` ignored the leading `/`); a relative one still
+# resolves against it as before (#2470)
+test "mach.cli.cmd.dep.enqueue_manifest:absolute_path_verbatim" {
+    var a: A.Allocator;
+    if (O.is_some[str](page.make(?a))) { ret 1; }
+
+    val res_mt: R.Result[toml.Table, str] = toml.parse(?a,
+        "[dep.abs]\npath = \"/abs/somewhere/lib\"\n[dep.rel]\npath = \"../lib-rel\"\n");
+    if (R.is_err[toml.Table, str](res_mt)) { ret 1; }
+    var mt: toml.Table = R.unwrap_ok[toml.Table, str](res_mt);
+
+    var nv: NodeVec;
+    if (R.is_err[bool, str](nv_init(?a, ?nv, 4))) { ret 1; }
+
+    val res_enq: R.Result[bool, str] = enqueue_manifest(?nv, "/project/root", "/project/root/dep", ?mt, "root");
+    if (R.is_err[bool, str](res_enq)) { ret 1; }
+    if (nv.len != 2) { ret 1; }
+
+    val i_abs: i64 = nv_find(?nv, "abs");
+    val i_rel: i64 = nv_find(?nv, "rel");
+    if (i_abs < 0 || i_rel < 0) { ret 1; }
+    if (!str_equals(nv.data[i_abs::usize].dir, "/abs/somewhere/lib"))       { ret 1; }
+    if (!str_equals(nv.data[i_rel::usize].dir, "/project/root/../lib-rel")) { ret 1; }
     ret 0;
 }
 
