@@ -1452,28 +1452,23 @@ fun rename_vregs(ctx: *AllocCtx, parent: *u32, nv: u32) {
     }
 }
 
-# true when a register-to-register move at `width` is a no-op when its source and
-# destination are the same register
-#
-# A move is observable only if it writes bits it does not read - a sub-word move that
-# extends into the rest of the register. Whether one does is a per-ISA register-file
-# fact, not a universal: x86-64 extends at 4 bytes only, aarch64 at every sub-word
-# width, riscv64 at none (`isa.MachineModel.move_extends_from`). A width at or above
-# the spill width is full-width, so there is nothing above it to write (#2275).
-# ---
-# tgt:   the active target, supplying the machine model
-# width: the move's operation width in bytes
-# ret:   true when a same-register move at this width writes nothing
-fun self_move_is_inert(tgt: *target.Target, width: u8) bool {
-    if (width::u32 >= tgt.model.spill_width) { ret true; }
-    if (tgt.model.move_extends_from == 0)    { ret true; }
-    ret width::u32 < tgt.model.move_extends_from;
-}
-
 # delete every register copy both of whose operands name the same vreg - the
-# coalesced copies `rename_vregs` collapsed - whenever a same-register move at that
-# width writes nothing (`self_move_is_inert`). mirrors the compaction of
+# coalesced copies `rename_vregs` collapsed. mirrors the compaction of
 # `sweep_dead_movs`, and a block always ends in a terminator so it never empties
+#
+# A same-vreg copy is dropped at EVERY width, on every target. This used to be
+# gated on whether the ISA's move writes the bits above its own width - x86-64's
+# 4-byte move zero-extends into the 64-bit register, aarch64's every sub-word move
+# does - on the reading that such a move performs an extension something relies on.
+# That premise was false (#2395): `MirInstr.width` sizes the OPERATION and leaves
+# the bits above it undefined, a `MirVReg` carries no width at all, and a consumer
+# wanting a wider value must go through an explicit conversion op. The witness is
+# riscv64, whose move is `addi rd,rs,0` at the machine width and extends nothing -
+# it self-hosts and passes CI on the same MIR, which it could not if a width-4 move
+# were specified to define bits 32..63.
+#
+# So the ISA's extension behaviour is real and decides nothing here, and the
+# `move_extends_from` model field it was read from is gone with this gate.
 fun drop_self_copies(tgt: *target.Target, ctx: *AllocCtx) {
     val f: *mir.MirFunction = ctx.f;
     var bi: u32 = 0;
@@ -1484,7 +1479,7 @@ fun drop_self_copies(tgt: *target.Target, ctx: *AllocCtx) {
         for (read < blk.instr_count) {
             val mi: *mir.MirInstr = ?blk.instrs[read];
             var drop: bool = false;
-            if (instr_is_reg_copy(tgt, mi) && self_move_is_inert(tgt, mi.width)) {
+            if (instr_is_reg_copy(tgt, mi)) {
                 val a: *mir.MirOperand = ?mi.operands[0];
                 val b: *mir.MirOperand = ?mi.operands[1];
                 drop = a.kind == mir.MIR_OP_VREG && b.kind == mir.MIR_OP_VREG && a.vreg == b.vreg;
@@ -3299,11 +3294,13 @@ fun record_callee_mask(tgt: *target.Target, ctx: *AllocCtx) {
 # into the register the copy hints point at, and until #2275 nothing looked at them
 # again: 37,662 on riscv64, 168 on x86-64.
 #
-# Deletes only what `self_move_is_inert` clears, so a sub-word move that zero-extends
-# is kept on the ISAs where one does. Compacts in place like `drop_self_copies`; a
-# block always ends in a terminator, which is never a copy, so no block empties.
+# Deletes a same-register copy at EVERY width, for the reason `drop_self_copies`
+# records: MIR leaves the bits above an instruction`s width undefined, so no move is
+# kept for an extension nothing relies on (#2395). Compacts in place like
+# `drop_self_copies`; a block always ends in a terminator, which is never a copy, so
+# no block empties.
 # ---
-# tgt: the active target, supplying the move-extension fact
+# tgt: the active target, supplying the register-copy classifier
 # ctx: the allocation context whose function is compacted
 fun drop_self_copies_physical(tgt: *target.Target, ctx: *AllocCtx) {
     val f: *mir.MirFunction = ctx.f;
@@ -3315,7 +3312,7 @@ fun drop_self_copies_physical(tgt: *target.Target, ctx: *AllocCtx) {
         for (read < blk.instr_count) {
             val mi: *mir.MirInstr = ?blk.instrs[read];
             var drop: bool = false;
-            if (instr_is_reg_copy(tgt, mi) && self_move_is_inert(tgt, mi.width)) {
+            if (instr_is_reg_copy(tgt, mi)) {
                 val a: *mir.MirOperand = ?mi.operands[0];
                 val b: *mir.MirOperand = ?mi.operands[1];
                 drop = a.kind == mir.MIR_OP_PREG && b.kind == mir.MIR_OP_PREG && a.preg == b.preg;
@@ -4465,47 +4462,84 @@ test "mach.lang.be.codegen.regalloc.coalesce_copies:forwarded_values_survive" {
     ret 0;
 }
 
-# a same-register copy is deleted only where the machine says the move writes
-# nothing, and the answer is per-ISA rather than universal
+# test-only: true when `drop_self_copies` removes a same-vreg copy at `width` on
+# `t`, keeping a real copy beside it
 #
-# `self_move_is_inert` is the whole of #2275: a move from a register to itself is
-# observable exactly when it extends into the bits above its own width, which is a
-# register-file property no two of the three ISAs share. Pinning it against the
-# three real targets rather than a synthetic model, so the values under test are the
-# ones the ISAs actually declare
-test "mach.lang.be.codegen.regalloc.self_move_is_inert:per_isa_extension_rules" {
+# Drives the real sweep rather than a predicate, so the test cannot pass against a
+# gate that was merely renamed. The second copy is the control: a sweep that emptied
+# the block indiscriminately would also delete it.
+# ---
+# t:     the target whose register-copy classifier the sweep reads
+# width: the copy's operation width in bytes
+# ret:   true when exactly the self-copy was removed
+fun t_self_copy_is_dropped(t: *target.Target, width: u8) bool {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var f: mir.MirFunction;
+    t_vregs(?alloc, ?f, 3);
+    var b: mir.MirBlock;
+    t_block(?alloc, ?b, 2);
+    t_mov(?alloc, ?b, 0, mir.op_vreg(1), mir.op_vreg(1));   # the self-copy: dropped
+    t_mov(?alloc, ?b, 1, mir.op_vreg(2), mir.op_vreg(0));   # a real copy: kept
+    b.instrs[0].width = width; b.instrs[0].src_width = width;
+    b.instrs[1].width = width; b.instrs[1].src_width = width;
+    f.blocks      = ?b;
+    f.block_count = 1;
+    f.block_cap   = 1;
+
+    var slots: [3]bool;
+    slots[0] = false; slots[1] = false; slots[2] = false;
+    var ctx: AllocCtx;
+    t_ctx(?ctx, ?alloc, ?f, ?slots[0]);
+
+    drop_self_copies(t, ?ctx);
+
+    if (b.instr_count != 1) { ret false; }
+    val kept: *mir.MirOperand = b.instrs[0].operands;
+    ret kept[0].kind == mir.MIR_OP_VREG && kept[0].vreg == 2 &&
+        kept[1].kind == mir.MIR_OP_VREG && kept[1].vreg == 0;
+}
+
+# a same-vreg copy is dropped at every width, on every target - the MIR contract
+# decides this, not the ISA's register file
+#
+# This replaces the per-ISA extension table #2275 shipped. That table was correct
+# about the ISAs and wrong about what governs: it kept a same-register copy wherever
+# the machine's move writes the bits above its own width, on the reading that the
+# move performs an extension something relies on. `MirInstr.width` sizes the
+# OPERATION and leaves those bits undefined (#2395), so nothing may rely on it, and
+# the three targets are pinned here at the same answer rather than three.
+test "mach.lang.be.codegen.regalloc.drop_self_copies:width_is_not_a_gate" {
     var reg: target.TargetRegistry = target.registry_init();
     if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
 
-    # x86-64: a 4-byte write zero-extends into the 64-bit register, so that self-move
-    # is load-bearing; 1- and 2-byte writes preserve the bits above them.
-    val tx: R.Result[target.Target, str] = target.select(?reg, "x86_64", "linux", "sysv64");
-    if (R.is_err[target.Target, str](tx)) { ret 1; }
-    var x: target.Target = R.unwrap_ok[target.Target, str](tx);
-    if (!self_move_is_inert(?x, 1)) { ret 1; }
-    if (!self_move_is_inert(?x, 2)) { ret 1; }
-    if (self_move_is_inert(?x, 4))  { ret 1; }
-    if (!self_move_is_inert(?x, 8)) { ret 1; }
+    # the three register targets disagree about the bits above a move's width -
+    # x86-64 zero-extends at 4, aarch64 at every sub-word width, riscv64 never - and
+    # all three drop the copy anyway. riscv64 is the witness the other two follow:
+    # it has always extended nothing and has always self-hosted.
+    var isa: [3]str;
+    var abi: [3]str;
+    isa[0] = "x86_64";  abi[0] = "sysv64";
+    isa[1] = "aarch64"; abi[1] = "aapcs64";
+    isa[2] = "riscv64"; abi[2] = "lp64";
 
-    # aarch64: every non-64-bit move encodes as ORR_W and zero-extends into X, so no
-    # sub-word self-move is inert.
-    val ta: R.Result[target.Target, str] = target.select(?reg, "aarch64", "linux", "aapcs64");
-    if (R.is_err[target.Target, str](ta)) { ret 1; }
-    var a: target.Target = R.unwrap_ok[target.Target, str](ta);
-    if (self_move_is_inert(?a, 1)) { ret 1; }
-    if (self_move_is_inert(?a, 2)) { ret 1; }
-    if (self_move_is_inert(?a, 4)) { ret 1; }
-    if (!self_move_is_inert(?a, 8)) { ret 1; }
+    var i: usize = 0;
+    for (i < 3) {
+        val tr: R.Result[target.Target, str] = target.select(?reg, isa[i], "linux", abi[i]);
+        if (R.is_err[target.Target, str](tr)) { ret 1; }
+        var t: target.Target = R.unwrap_ok[target.Target, str](tr);
 
-    # riscv64: a move is `addi rd,rs,0` at XLEN whatever the width, extending
-    # nothing, so a self-move is inert at every width.
-    val tr: R.Result[target.Target, str] = target.select(?reg, "riscv64", "linux", "lp64");
-    if (R.is_err[target.Target, str](tr)) { ret 1; }
-    var r: target.Target = R.unwrap_ok[target.Target, str](tr);
-    if (!self_move_is_inert(?r, 1)) { ret 1; }
-    if (!self_move_is_inert(?r, 2)) { ret 1; }
-    if (!self_move_is_inert(?r, 4)) { ret 1; }
-    if (!self_move_is_inert(?r, 8)) { ret 1; }
+        # a same-vreg copy at each width, which `drop_self_copies` must remove.
+        var w: usize = 0;
+        var widths: [4]u8;
+        widths[0] = 1; widths[1] = 2; widths[2] = 4; widths[3] = 8;
+        for (w < 4) {
+            if (!t_self_copy_is_dropped(?t, widths[w])) { ret 1; }
+            w = w + 1;
+        }
+        i = i + 1;
+    }
     ret 0;
 }
 

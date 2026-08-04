@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run.sh — the integration-test harness.
 #
-# usage: run.sh --target <name> [--bless] [--filter <glob>] <compiler>
+# usage: run.sh --target <name> [--runmode native|qemu] [--bless] [--filter <glob>] <compiler>
 #
 # for each case directory under int/{surface,regression}/ that holds a mach.toml,
 # the harness loads its defaults (overridable by an optional line-based case.conf),
@@ -12,7 +12,7 @@
 #
 # the harness is the same on every OS (git-bash on windows, bash on linux/macOS);
 # the only target-specific knowledge it holds is the run-mode looked up per target
-# from targets.conf.
+# from targets.conf, `--runmode` overriding it for this invocation only.
 #
 # LEG vs BUILD-TARGET. --target names the LEG: the runner the harness runs on (and
 # the target an exec case builds + runs). a structural case (field / flat-loader)
@@ -33,23 +33,39 @@
 # where a 64K-aligned aarch64 image faulted ENOMEM on a native 4K-page kernel that every
 # qemu-aarch64 leg had reported green). keep the aarch64 int leg `native` for this
 # reason - do not move it to qemu.
+#
+# --runmode OVERRIDES targets.conf FOR THIS INVOCATION ONLY; the file itself, the
+# source of truth for CI's matrix, is never touched (#2314). It exists so a
+# developer on an x86-64 host can exercise a leg targets.conf marks `native` -
+# today, only `linux-arm64` - without hand-editing the SoT, which is exactly the
+# accidental-commit risk #2314 named. It does NOT make a qemu run CI-equivalent:
+# the RELRO/mprotect fidelity gap two paragraphs up applies exactly the same
+# whether qemu-user runs because targets.conf says so or because `--runmode`
+# said so. Use it to iterate locally; CI never passes it, so the authoritative
+# lane - native on the real runner targets.conf names - is unaffected.
 set -eu
 
 usage() {
-    echo "usage: run.sh --target <name> [--bless] [--filter <glob>] <compiler>" >&2
+    echo "usage: run.sh --target <name> [--runmode native|qemu] [--bless] [--filter <glob>] <compiler>" >&2
     exit 2
 }
 
 target=
+runmode_override=
 bless=0
 filter='*'
 compiler=
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --target) shift; [ $# -gt 0 ] || usage; target=$1 ;;
-        --filter) shift; [ $# -gt 0 ] || usage; filter=$1 ;;
-        --bless)  bless=1 ;;
+        --target)  shift; [ $# -gt 0 ] || usage; target=$1 ;;
+        --runmode) shift; [ $# -gt 0 ] || usage; runmode_override=$1
+                   case "$runmode_override" in
+                       native|qemu) : ;;
+                       *) echo "run.sh: --runmode must be 'native' or 'qemu', got '$runmode_override'" >&2; usage ;;
+                   esac ;;
+        --filter)  shift; [ $# -gt 0 ] || usage; filter=$1 ;;
+        --bless)   bless=1 ;;
         -h|--help) usage ;;
         -*) echo "run.sh: unknown flag '$1'" >&2; usage ;;
         *)  [ -z "$compiler" ] || { echo "run.sh: unexpected argument '$1'" >&2; usage; }
@@ -109,10 +125,82 @@ in_list() {
     return 1
 }
 
+# lock_commit <mach.lock> <name> — the commit mach.lock records for [dep.<name>],
+# or empty when the file or the entry is absent.
+lock_commit() {
+    lockfile=$1
+    want=$2
+    [ -f "$lockfile" ] || return 0
+    awk -v want="$want" '
+        /^\[dep\./ { name = $0; sub(/^\[dep\./, "", name); sub(/\]$/, "", name); next }
+        /^commit = / && name == want {
+            sha = $0
+            sub(/^commit = "/, "", sha); sub(/"$/, "", sha)
+            print sha
+            exit
+        }
+    ' "$lockfile"
+}
+
+# dep_commits <case-dir> — print "name@shortsha ..." for every git dep checked
+# out under a case's dep/, or nothing when none exist.
+#
+# Ground-truthed from the CHECKOUT (`git rev-parse --short HEAD`), not from
+# mach.lock: the lock is the RECORD of a resolution, the checkout is the
+# ENTITY that was actually compiled against, and #2387's own observation was a
+# case where those disagreed - lock said one commit, dep/mach-std's HEAD was on
+# another (reproduced locally: a manual `git checkout` inside dep/mach-std,
+# bypassing `mach dep`, leaves mach.lock exactly where it was). Reading the
+# lock here would print the record, not the entity, and inherit that gap one
+# level up. When the checkout and the lock disagree, this prints
+# "name@<checkout>!lock=<locked>" instead of silently trusting either one.
+#
+# Traced (process_git_node in src/cli/cmd/dep.mach) and reproduced: `dep pull`
+# itself repairs a drifted checkout LOUDLY every time it runs, restoring it to
+# the lock and printing `repaired <name> (checkout drift: ...)`. Since run.sh
+# always calls `dep pull` immediately before build in the same command, a case
+# actually BUILT under this harness cannot disagree with its own lock by the
+# time this function reads it - the mismatch marker exists as a tripwire for a
+# future path that reads dep/ without first pulling (or a `dep pull` that
+# somehow stopped repairing), not because the current flow produces one.
+#
+# A case's `ref = "branch/main"` deliberately tracks mach-std's latest RELEASE
+# (moving `main` is the reviewed release event, not drift - see doc/cli.md's
+# Lockfile section), so int/.gitignore excludes `mach.lock`: committing it here
+# would freeze every case to whatever commit happened to be resolved when someone
+# last regenerated it, contradicting that intent. But an ephemeral lock means
+# nothing durable records which commit a given run actually compiled against -
+# `mach dep pull`'s own lock write vanishes with the rest of the case's gitignored
+# state. Printing the checkout into every PASS/FAIL/BLESS line is that record: it
+# survives exactly as long as the CI log does, which is exactly as long as anyone
+# would want to ask "what did this run compile against".
+dep_commits() {
+    dir=$1
+    [ -d "$dir/dep" ] || return 0
+    for depdir in "$dir"/dep/*/; do
+        [ -d "${depdir}.git" ] || [ -f "${depdir}.git" ] || continue
+        name=$(basename "$depdir")
+        head=$(git -C "$depdir" rev-parse --short HEAD 2>/dev/null) || continue
+        locked=$(lock_commit "$dir/mach.lock" "$name")
+        if [ -n "$locked" ]; then
+            case "$locked" in
+                "$head"*) printf '%s@%s ' "$name" "$head" ;;
+                *)        printf '%s@%s!lock=%s ' "$name" "$head" "$(printf '%s' "$locked" | cut -c1-7)" ;;
+            esac
+        else
+            printf '%s@%s ' "$name" "$head"
+        fi
+    done
+}
+
 runmode=$(conf_runmode "$target") || {
     echo "run.sh: target '$target' is not in targets.conf" >&2
     exit 2
 }
+if [ -n "$runmode_override" ] && [ "$runmode_override" != "$runmode" ]; then
+    echo "run.sh: --runmode overrides '$target' to $runmode_override (targets.conf says $runmode; not CI-equivalent, see NATIVE vs QEMU FIDELITY above)" >&2
+    runmode=$runmode_override
+fi
 
 fails=0
 ran=0
@@ -216,20 +304,26 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
             build_ok=0
         fi
 
+        # a label suffix naming what mach-std commit `dep pull` resolved (#2387),
+        # once one exists to report; every PASS/FAIL line from here on carries it.
+        deps=$(dep_commits "$dir")
+        flabel=$label
+        [ -n "$deps" ] && flabel="$label (${deps% })"
+
         # a build-fails case asserts the compile is rejected and takes the compiler's
         # 'error:' diagnostic as its observable (deterministic: no paths, just the
         # message text). every other mode requires a clean build and runs a producer
         # on the artifact.
         if [ "$case_run" = build-fails ]; then
             if [ "$build_ok" -eq 1 ]; then
-                echo "FAIL $label (build succeeded; expected a link error)"
+                echo "FAIL $flabel (build succeeded; expected a link error)"
                 fails=$((fails + 1))
                 rm -rf "$tmp" "$dir/out/int"
                 continue
             fi
             grep '^error:' "$tmp/build.log" >"$tmp/out.txt" || true
             if [ ! -s "$tmp/out.txt" ]; then
-                echo "FAIL $label (build failed without an 'error:' diagnostic)"
+                echo "FAIL $flabel (build failed without an 'error:' diagnostic)"
                 sed 's/^/    /' "$tmp/build.log" >&2
                 fails=$((fails + 1))
                 rm -rf "$tmp" "$dir/out/int"
@@ -237,7 +331,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
             fi
         else
             if [ "$build_ok" -eq 0 ]; then
-                echo "FAIL $label (build)"
+                echo "FAIL $flabel (build)"
                 sed 's/^/    /' "$tmp/build.log" >&2
                 fails=$((fails + 1))
                 rm -rf "$tmp" "$dir/out/int"
@@ -252,7 +346,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
             if [ "$case_run" = debuginfo ]; then
                 gbin="$dir/out/int/prog-g$exe"
                 if ! (cd "$dir" && $buildcc build . --target "$build_target" --profile "$profile" $case_build_flags -g -o "out/int/prog-g$exe") >"$tmp/build-g.log" 2>&1; then
-                    echo "FAIL $label (build -g)"
+                    echo "FAIL $flabel (build -g)"
                     sed 's/^/    /' "$tmp/build-g.log" >&2
                     fails=$((fails + 1))
                     rm -rf "$tmp" "$dir/out/int"
@@ -266,7 +360,7 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
                 prc=$?
             fi
             if [ "$prc" -ne 0 ]; then
-                echo "FAIL $label (producer exit $prc)"
+                echo "FAIL $flabel (producer exit $prc)"
                 sed 's/^/    /' "$tmp/err.txt" >&2
                 fails=$((fails + 1))
                 rm -rf "$tmp" "$dir/out/int"
@@ -276,22 +370,22 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
 
         if [ "$bless" -eq 1 ]; then
             cp "$tmp/out.txt" "$golden"
-            echo "BLESS $label -> ${golden#"$here"/}"
+            echo "BLESS $flabel -> ${golden#"$here"/}"
             rm -rf "$tmp" "$dir/out/int"
             continue
         fi
 
         if [ ! -f "$golden" ]; then
-            echo "FAIL $label (no golden ${golden#"$here"/}; run with --bless)"
+            echo "FAIL $flabel (no golden ${golden#"$here"/}; run with --bless)"
             fails=$((fails + 1))
             rm -rf "$tmp" "$dir/out/int"
             continue
         fi
 
         if diff -u "$golden" "$tmp/out.txt" >"$tmp/diff.txt" 2>&1; then
-            echo "PASS $label"
+            echo "PASS $flabel"
         else
-            echo "FAIL $label (diff)"
+            echo "FAIL $flabel (diff)"
             sed 's/^/    /' "$tmp/diff.txt" >&2
             fails=$((fails + 1))
         fi
