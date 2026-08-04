@@ -43,6 +43,11 @@
 # whether qemu-user runs because targets.conf says so or because `--runmode`
 # said so. Use it to iterate locally; CI never passes it, so the authoritative
 # lane - native on the real runner targets.conf names - is unaffected.
+#
+# `--runmode qemu` only reaches a leg qemu-user can actually load: qemu_bin() in
+# lib/produce.sh names the ELF-only rule and the three targets that can never
+# work under it (#2453) - passing `qemu` for one of those fails loudly with that
+# reason once the case's producer runs, not silently as an `Exec format error`.
 set -eu
 
 usage() {

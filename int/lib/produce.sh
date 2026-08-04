@@ -64,14 +64,27 @@ _flat_loader_bin=
 # qemu_bin <target> — the qemu-user interpreter for a harness target, keyed by ISA
 # rather than sliced from the name. linux-riscv64's name suffix happens to match its
 # qemu-user binary (qemu-riscv64), but linux-arm64's does not (qemu-aarch64, never
-# qemu-arm64), and the bare `linux` / `windows` legs carry no ISA suffix at all. keep
-# in sync with the ISA each int/*/mach.toml's `[target.<leg>]` declares when a
-# targets.conf row is added.
+# qemu-arm64), and the bare `linux` leg carries no ISA suffix at all. keep in sync
+# with the ISA each int/*/mach.toml's `[target.<leg>]` declares when a targets.conf
+# row is added.
+#
+# ELF ONLY. qemu-user's loader understands the Linux ELF ABI and nothing else - a
+# PE or Mach-O artifact can never load under it, on any host, no matter which
+# qemu-<arch> binary is named. A target whose `[target.<leg>].os` is not `linux`
+# has no qemu interpreter and never will (#2453, found by executing qemu-x86_64
+# against a real windows PE artifact and qemu-aarch64 against a real darwin-aarch64
+# Mach-O one: both fail `Exec format error` unconditionally). Naming that here
+# explicitly is what keeps the next target addition from reintroducing a mapping
+# that looks alive and cannot work - the same shape #2314 found for linux-arm64,
+# except that one was dead-but-workable and these are dead-permanently.
 qemu_bin() {
     case "$1" in
-        linux|windows|darwin-x86_64) echo qemu-x86_64 ;;
-        linux-arm64|darwin-aarch64)  echo qemu-aarch64 ;;
-        linux-riscv64)               echo qemu-riscv64 ;;
+        linux)         echo qemu-x86_64 ;;
+        linux-arm64)   echo qemu-aarch64 ;;
+        linux-riscv64) echo qemu-riscv64 ;;
+        windows|darwin-x86_64|darwin-aarch64)
+            echo "int: '$1' is not linux - qemu-user loads ELF only, so a PE or Mach-O target has no qemu interpreter (#2453)" >&2
+            return 1 ;;
         *) echo "int: no qemu interpreter mapping for target '$1'" >&2; return 1 ;;
     esac
 }
