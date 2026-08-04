@@ -672,8 +672,9 @@ mach-read      ::= comptime-ident { member }        (* $mach.build.os, $mach.arc
 ```
 
 - Intrinsic calls (`$size_of(T)`, `$align_of(T)`, `$offset_of(T, field)`,
-  `$type_of(e)`, `$fields(T)`, `$error("msg")`, `$assert(cond, "msg")`) are
-  syntactically a `comptime-ident` callee with `call-args`.
+  `$type_of(e)`, `$fields(T)`, `$is_record(T)`, `$is_union(T)`,
+  `$is_pointer(T)`, `$type_name(T)`, `$error("msg")`) are syntactically a
+  `comptime-ident` callee with `call-args`.
 - The **type-taking** intrinsics — `$size_of`, `$align_of`, `$offset_of`,
   `$fields` — parse their **first argument with the `type` production**, not the
   expression grammar, so the whole type language is spellable there:
@@ -749,8 +750,9 @@ Doc-only (intended surface, not a distinct parser production):
   sets are enforced later (see [asm.md](asm.md),
   [comptime-mach.md](comptime-mach.md)).
 - The closed intrinsic set (`$size_of`, `$align_of`, `$offset_of`,
-  `$type_of`, `$fields`, `$error`, `$assert`) — syntactically
-  indistinguishable from any other `comptime-ident` call.
+  `$type_of`, `$fields`, `$is_record`, `$is_union`, `$is_pointer`,
+  `$type_name`, `$error`) — syntactically indistinguishable from any other
+  `comptime-ident` call.
 - The closed decorator directive set (`symbol`, `library`, `inline`, `align`,
   `section`) — the parser accepts any `IDENT` after `#[`; sema enforces the
   closed set.

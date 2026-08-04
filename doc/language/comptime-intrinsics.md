@@ -353,19 +353,27 @@ $or ($type_of(arg) == str) { write_str(w, arg); }
 $or { $error("no writer for this argument type"); }    # compile error on an unhandled type
 ```
 
-> **`$assert` not yet implemented.** `$assert` is rejected wherever it is written -
-> with any condition, a plain `1 == 1` included - not merely accepted and ignored.
-> It is intended as sugar over `$if` plus `$error` — `$assert(cond, "msg")` ≡ `$if (!cond) { $error("msg"); }`,
-> e.g. `$assert($mach.build.arch == $mach.arch.x86_64, "expected x86_64");`. Being `$if`
-> sugar, it will inherit `$if`'s restrictions: a layout intrinsic in `cond` is
-> rejected for the reason above, so `$assert($size_of(i64) == 8, ...)` is not a
-> spelling to plan on.
-
 ## Not provided as intrinsics
 
 Code intrinsics — runtime-instruction emitters like `trap`, `fence`,
 `pause` — are not in the compiler-shipped set. They belong in stdlib as
 functions with per-arch `asm` bodies. See [policy.md](policy.md).
+
+**`$assert` is not an intrinsic either**, and is not planned as one: `$if` and
+`$error` already compose to it exactly, so a dedicated directive would add spelling
+without adding capability. Write the composition directly.
+
+```mach
+# instead of $assert(cond, "msg")
+$if (!cond) { $error("msg"); }
+
+$if (!($mach.build.arch == $mach.arch.x86_64)) { $error("expected x86_64"); }
+```
+
+The composition inherits `$if`'s condition rules, which is the point: the same
+conditions fold there as in any other gate, and the ones that do not — a layout
+intrinsic, a type query over an unbound generic parameter — refuse with their own
+cause rather than through a second surface that could describe them differently.
 
 ## See also
 
