@@ -181,7 +181,7 @@ declared type. What the walk cannot model, it refuses:
 | construct | why |
 |---|---|
 | a body that does not parse | nothing to analyze |
-| a `.byte` directive | its payload can encode any instruction |
+| a data directive (`.byte`, `.word`, `.long`, `.quad`) | its payload can encode any instruction |
 | a mnemonic the target has not classified | its timing behaviour is unknown |
 | **a flags-conditioned branch** (x86-64 `jcc`, aarch64 `b.<cond>`) | its condition rides the flags register, which the inline-asm effect model does not represent (#2460) |
 
