@@ -59,6 +59,7 @@
 # than assuming it.
 
 use std.text.parse;
+use mach.lang.ct;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
@@ -356,6 +357,16 @@ pub def PatchFn: fun(*encode.EncodeState, u32, u32) R.Result[bool, str];
 # `{name}` to a different address than the same target's own loads and stores.
 pub def SlotFn: fun(*mir.MirFunction, u32) O.Option[i64];
 
+# the constant-time classification of one of this grammar's mnemonics
+#
+# The per-ISA half of the `#[oblivious]` asm walk (#2230): given a mnemonic's own
+# code, what the walk needs to know about it beyond the register-effect facts the
+# `Mnemonic` row already carries. An unclassified code returns `ct.asm_unknown()`,
+# which refuses the moment a secret reaches it.
+# ---
+# code: the mnemonic's code, in the ISA's own space
+pub def CtClassFn: fun(u32) ct.AsmClass;
+
 # one target's inline-assembly grammar
 #
 # Everything the shared parser needs that is not the same on every machine. A target
@@ -390,6 +401,7 @@ pub rec Grammar {
     all_gp:    u32;
     all_fp:    u32;
     word:      u8;
+    ct_class:  CtClassFn;
 }
 
 # an operand in the neutral state each lexer fills in
@@ -1462,4 +1474,182 @@ test "mach.lang.target.isa.asm:label_token_shapes" {
     if (label_ref_span("1x", 0, 2, ?num, ?fwd))   { bad = 1; }
     if (label_ref_span("1", 0, 1, ?num, ?fwd))    { bad = 1; }
     ret bad;
+}
+
+# true when operand `op` names a `{name}` binding listed in `secret_names`
+#
+# A binding substitutes to the local's frame slot, so its ADDRESS is public (a fixed
+# `[fp+off]`) while its CONTENTS are secret. That distinction is why a secret binding
+# is a taint SOURCE but never a secret-address violation.
+fun bind_is_secret(body: str, op: *Operand, secret_names: *str, n_secret: u32) bool {
+    if (op.kind != AOP_BIND) { ret false; }
+    var i: u32 = 0;
+    for (i < n_secret) {
+        val nm: str = secret_names[i];
+        if (str_region_equals(body, op.name_off, op.name_len, nm)) {
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# true when register index `r` is tainted in `taint`
+fun reg_tainted(taint: u32, r: i32) bool {
+    if (r < 0 || r >= 32) { ret false; }
+    ret (taint & (1::u32 << r::u32)) != 0;
+}
+
+# true when any operand of `item` carries a secret - a secret `{name}` binding, or a
+# register the walk has already tainted
+fun item_reads_secret(body: str, item: *Item, taint: u32, secret_names: *str, n_secret: u32) bool {
+    var i: u32 = 0;
+    for (i < item.nops) {
+        val op: *Operand = ?item.ops[i::usize];
+        if (bind_is_secret(body, op, secret_names, n_secret)) { ret true; }
+        if (op.kind == AOP_REG && reg_tainted(taint, op.reg))  { ret true; }
+        if (op.kind == AOP_MEM) {
+            if (reg_tainted(taint, op.reg))   { ret true; }
+            if (reg_tainted(taint, op.index)) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# walk an inline-asm body for the `#[oblivious]` leakage checks (#2230)
+#
+# The shared half of the asm validation every ISA runs: the same parser the emitter
+# and the clobber analyzer use, so the checks are facts about the parsed instruction
+# stream rather than a second reading of the text.
+#
+# Taint enters through the `{name}` bindings named in `secret_names` and propagates
+# by the effect model's WRITE facts - an instruction that reads a secret taints every
+# register it writes. Reads are taken conservatively (every operand is treated as
+# read), which can only over-taint and therefore only refuse more.
+#
+# FAILS CLOSED on every construct it cannot model:
+#   - a body that does not parse (the emitter will reject it too, with a location)
+#   - a `.byte` payload, whose bytes can encode any instruction at all
+#   - a mnemonic the ISA has not classified
+#   - a conditional branch whose condition rides FLAGS (x86-64), which the effect
+#     model does not represent - see `ct.AsmClass` and #2460
+#
+# Returns the FIRST violation, so the caller's diagnostic can name one instruction.
+# ---
+# g:            the target's grammar
+# body:         raw inline-asm body text
+# secret_names: `{name}` bindings whose storage is secret
+# n_secret:     number of entries in `secret_names`
+# trust_mul:    the target's data-independent-multiply capability
+# trust_shift:  the target's constant-time variable-shift capability
+# ret:          ok(true) when the body leaks nothing, or the first violation
+pub fun ct_scan(g: *Grammar, body: str, secret_names: *str, n_secret: u32,
+                trust_mul: bool, trust_shift: bool) R.Result[bool, str] {
+    var c: Cursor;
+    cursor_init(?c, g, body, nil, nil, nil, nil);
+
+    var taint: u32 = 0;
+    var item: Item;
+    var done: bool = false;
+    for (!done) {
+        val pr: R.Result[bool, str] = next(?c, ?item);
+        if (R.is_err[bool, str](pr)) {
+            ret R.err[bool, str]("contains an inline-asm block this compiler cannot parse, so it cannot be verified constant-time");
+        }
+        if (!R.unwrap_ok[bool, str](pr)) { done = true; }
+        or {
+            val vr: R.Result[bool, str] = ct_check_item(g, body, ?item, ?taint, secret_names, n_secret, trust_mul, trust_shift);
+            if (R.is_err[bool, str](vr)) { ret vr; }
+        }
+    }
+    ret R.ok[bool, str](true);
+}
+
+# run the leakage checks on one parsed item and fold its taint
+#
+# Split out so the walk above reads as the loop it is. `taint` is updated in place:
+# an instruction that reads a secret taints the registers it writes.
+fun ct_check_item(g: *Grammar, body: str, item: *Item, taint: *u32,
+                  secret_names: *str, n_secret: u32,
+                  trust_mul: bool, trust_shift: bool) R.Result[bool, str] {
+    if (item.kind == AI_LABEL) { ret R.ok[bool, str](true); }
+
+    # a raw byte payload can encode ANY instruction, including a secret-dependent
+    # branch. there is nothing to analyze, so it is refused outright.
+    if (item.kind == AI_BYTES) {
+        ret R.err[bool, str]("contains a `.byte` directive inside an #[oblivious] function; its payload can encode any instruction, so it cannot be verified constant-time");
+    }
+
+    val cls: ct.AsmClass = g.ct_class(item.code);
+    val reads_secret: bool = item_reads_secret(body, item, @taint, secret_names, n_secret);
+
+    # a conditional branch whose condition rides the flags register cannot be checked
+    # at all: the effect model represents no flags, so a preceding `cmp` of a secret
+    # is invisible here. refused whether or not this block carries a secret (#2460).
+    if (cls.cond_flags) {
+        ret R.err[bool, str]("contains a conditional branch inside an #[oblivious] inline-asm block; its condition rides the flags register, which this compiler's inline-asm effect model does not represent, so the branch cannot be verified constant-time (see issue #2460). use a branch-free sequence, or move the branch outside the #[oblivious] function");
+    }
+
+    # (a) a register-conditioned branch on a secret leaks through the taken path.
+    if (cls.cond_reg && reads_secret) {
+        ret R.err[bool, str]("branches on a secret value inside an inline-asm block; the branch decides the taken path, so its timing reveals the secret. select branch-free over public data, or `:^`-declassify when disclosure is intended");
+    }
+
+    # (b) a memory operand whose ADDRESS is secret leaks through the access pattern.
+    # a `{name}` binding is excluded: it addresses a fixed frame slot, so its address
+    # is public even when its contents are not.
+    var i: u32 = 0;
+    for (i < item.nops) {
+        val op: *Operand = ?item.ops[i::usize];
+        if (op.kind == AOP_MEM) {
+            if (reg_tainted(@taint, op.reg) || reg_tainted(@taint, op.index)) {
+                ret R.err[bool, str]("addresses memory with a secret value inside an inline-asm block; the access pattern reveals the secret through the cache. index with public data, or `:^`-declassify when disclosure is intended");
+            }
+        }
+        i = i + 1;
+    }
+
+    # an instruction the ISA has not classified is opaque to check (c): refuse the
+    # moment a secret reaches it, rather than assume it is constant-time.
+    if (!cls.known && reads_secret) {
+        ret R.err[bool, str]("passes a secret value to an inline-asm instruction whose constant-time behaviour this compiler does not model; it cannot be verified, so it is refused");
+    }
+
+    # (c) a variable-latency operation on a secret operand leaks through its timing,
+    # unless the target documents the capability that makes it constant-time.
+    if (cls.known && cls.op != ct.CT_OP_NONE) {
+        val cap: ct.CtCap = ct.ct_cap(cls.op);
+        if (!ct.target_provides(trust_mul, trust_shift, cap)) {
+            # a shift leaks through its variable COUNT, not the value shifted, so it
+            # observes the count operand alone.
+            var offending: bool = reads_secret;
+            if (ct.ct_op_gates_count_only(cls.op)) {
+                offending = false;
+                if (item.nops > 0) {
+                    val cnt: *Operand = ?item.ops[(item.nops - 1)::usize];
+                    if (bind_is_secret(body, cnt, secret_names, n_secret)) { offending = true; }
+                    if (cnt.kind == AOP_REG && reg_tainted(@taint, cnt.reg)) { offending = true; }
+                }
+            }
+            if (offending) {
+                ret R.err[bool, str]("performs a variable-latency inline-asm operation on a secret value; its latency depends on the operand, so its timing reveals the secret. use a constant-time sequence, or `:^`-declassify when disclosure is intended");
+            }
+        }
+    }
+
+    # fold the taint: an instruction reading a secret taints every register it writes.
+    if (reads_secret) {
+        @taint = @taint | item.implicit;
+        if ((item.writes & AW_OP0) != 0 && item.nops > 0) { taint_written(?item.ops[0], taint); }
+        if ((item.writes & AW_OP1) != 0 && item.nops > 1) { taint_written(?item.ops[1], taint); }
+    }
+    ret R.ok[bool, str](true);
+}
+
+# OR a written operand's register bit into `@taint` (the taint twin of `mark_written`)
+fun taint_written(op: *Operand, taint: *u32) {
+    if (op.kind == AOP_REG && op.reg >= 0 && op.reg < 32) {
+        @taint = @taint | (1::u32 << op.reg::u32);
+    }
 }
