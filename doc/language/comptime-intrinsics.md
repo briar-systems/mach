@@ -353,9 +353,9 @@ $or ($type_of(arg) == str) { write_str(w, arg); }
 $or { $error("no writer for this argument type"); }    # compile error on an unhandled type
 ```
 
-> **`$assert` not yet implemented.** `$assert` parses as a comptime directive
-> but the compiler does not yet evaluate it. It is intended as sugar over `$if`
-> plus `$error` — `$assert(cond, "msg")` ≡ `$if (!cond) { $error("msg"); }`,
+> **`$assert` not yet implemented.** `$assert` is rejected wherever it is written -
+> with any condition, a plain `1 == 1` included - not merely accepted and ignored.
+> It is intended as sugar over `$if` plus `$error` — `$assert(cond, "msg")` ≡ `$if (!cond) { $error("msg"); }`,
 > e.g. `$assert($mach.build.arch == $mach.arch.x86_64, "expected x86_64");`. Being `$if`
 > sugar, it will inherit `$if`'s restrictions: a layout intrinsic in `cond` is
 > rejected for the reason above, so `$assert($size_of(i64) == 8, ...)` is not a
