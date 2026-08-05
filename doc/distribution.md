@@ -450,11 +450,48 @@ and Mach-O itself and links each without a system linker, so there is no
 cross-toolchain to acquire and no SDK to extract — a stock linux checkout
 produces all three.
 
-To run the foreign ones, `--runner` hands the binary to a launcher:
+### Checking a cross-build
 
-```sh
-mach run . --profile release --bin demo-win --target windows-x86_64 --runner wine
+Two of those three cannot run on the machine that produced them, so verify a
+cross-build by **reading its headers**, not by executing it. The questions worth
+asking are: right container, right machine, right image type.
+
 ```
+$ objdump -f out/windows-x86_64/release/bin/demo.exe
+out/windows-x86_64/release/bin/demo.exe:     file format pei-x86-64
+architecture: i386:x86-64, flags 0x0000010b:
+HAS_RELOC, EXEC_P, HAS_DEBUG, D_PAGED
+start address 0x0000000140001000
+
+$ objdump -p out/windows-x86_64/release/bin/demo.exe | grep -E "^Magic|^Subsystem"
+Magic			020b	(PE32+)
+Subsystem		00000003	(Windows CUI)
+```
+
+```
+$ llvm-objdump --macho --private-headers \
+    out/darwin-x86_64/release/Demo.app/Contents/MacOS/Demo
+out/darwin-x86_64/release/Demo.app/Contents/MacOS/Demo:
+Mach header
+      magic cputype cpusubtype  caps    filetype ncmds sizeofcmds      flags
+MH_MAGIC_64  X86_64        ALL  0x00     EXECUTE     7        560   NOUNDEFS
+```
+
+`NOUNDEFS` on the Mach-O is the one worth pausing on: it says no symbol was left
+unresolved at link time, so the vendored C archive really did go in and there is
+nothing waiting to bind at load. The import directory (`objdump -p | grep "DLL
+Name"`, above) is the PE equivalent — it enumerates exactly what the loader will
+be asked for. Between them you know the binary is well-formed and complete
+without ever launching it.
+
+GNU `objdump` reads ELF and PE but not Mach-O; `llvm-objdump` reads all three, so
+one tool covers every target if you prefer that.
+
+> `mach run` and `mach test` accept `--runner <cmd>`, which hands a foreign
+> binary to a host-side launcher instead of exec'ing it. That is a property of
+> the environment a build is tested in, not of the build itself, and it is not
+> needed to check that a cross-build is correct — see
+> [cli.md](cli.md#mach-run).
 
 ### Vendored C is where it gets real
 
