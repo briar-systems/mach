@@ -115,17 +115,16 @@ rec MergedSection {
     used:  bool;
 }
 
-# resolved location of a defined symbol: its final virtual address (what
-# relocation patching needs) and whether the winning definition is weak, so a
-# later strong definition can override it rather than collide. undefined symbols
-# never enter this table
+# resolved location of a symbol: either its final virtual address or a weak
+# fallback name to chase after all real definitions have been collected
 # ---
-# vaddr: final virtual address of the symbol (its section's vaddr + offset)
-# weak:  true while the current winner is a weak definition (overridable by a
-#        later strong definition; a strong winner errors on a second strong)
+# vaddr:    final virtual address of a direct definition (unused for a fallback)
+# weak:     true while the current winner is weak (overridable by a strong one)
+# fallback: alternate name for a weak external, or STR_NIL for a real definition
 rec SymbolLoc {
-    vaddr: u64;
-    weak:  bool;
+    vaddr:    u64;
+    weak:     bool;
+    fallback: intern.StrId;
 }
 
 # one losing weak function's byte interval in a flat input section. final-image
@@ -946,11 +945,29 @@ fun archive_require(state: *ArchiveResolution,
 # make an otherwise-unused member eligible. Weak definitions still provide a
 # name; ordinary global resolution later lets a strong definition override one.
 fun archive_symbol_provides(img: *of.ObjectImage, sym: *of.Symbol) bool {
-    if (sym.section == of.SECTION_EXTERNAL)        { ret false; }
     if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { ret false; }
+    # A COFF SEARCH_ALIAS weak external provides its public spelling while its
+    # fallback supplies the eventual address. Other weak-external modes are
+    # references, not archive definitions.
+    if (sym.section == of.SECTION_EXTERNAL) {
+        ret (sym.flags & (of.SYM_OBJ_FLAG_FALLBACK | of.SYM_OBJ_FLAG_ALIAS))
+            == (of.SYM_OBJ_FLAG_FALLBACK | of.SYM_OBJ_FLAG_ALIAS);
+    }
     if (sym.section < img.section_count
         && img.sections[sym.section].kind == of.SK_DEBUG) { ret false; }
     ret true;
+}
+
+# the name of a weak external's fallback symbol, validating its image-local index
+fun weak_fallback_name(img: *of.ObjectImage,
+                       sym: *of.Symbol) R.Result[intern.StrId, str] {
+    if ((sym.flags & of.SYM_OBJ_FLAG_FALLBACK) == 0) {
+        ret R.err[intern.StrId, str]("link: symbol has no weak fallback");
+    }
+    if (sym.fallback >= img.symbol_count || sym.fallback == of.SYMBOL_NONE) {
+        ret R.err[intern.StrId, str]("link: weak fallback index is out of range");
+    }
+    ret R.ok[intern.StrId, str](img.symbols[sym.fallback].name);
 }
 
 # intern the PE import-address spelling corresponding to an import declaration
@@ -1014,16 +1031,26 @@ fun archive_note_image(s: *session.Session, state: *ArchiveResolution,
     i = 0;
     for (i < img.symbol_count) {
         val sym: *of.Symbol = ?img.symbols[i];
-        # An undefined weak is an optional reference: classic archive semantics
-        # do not extract a member solely to satisfy it. COFF ALIAS fallbacks are
-        # normalized by the object parser into defined weak public symbols, so
-        # skipping unresolved weak records here does not suppress those providers.
-        if (is_undefined_extern(sym)
-            && (sym.flags & of.SYM_OBJ_FLAG_WEAK) == 0
-            && !map.contains[intern.StrId, u32](?state.providers, ?sym.name)) {
-            val ur: R.Result[bool, str] =
-                map.insert[intern.StrId, u32](?state.unresolved, sym.name, 1);
-            if (R.is_err[bool, str](ur)) { ret R.err[bool, str](R.unwrap_err[bool, str](ur)); }
+        if (!is_undefined_extern(sym)) { i = i + 1; cnt; }
+        if ((sym.flags & of.SYM_OBJ_FLAG_FALLBACK) != 0) {
+            # Every COFF weak external requires sym2. SEARCH_LIBRARY additionally
+            # searches archives for sym1 before final resolution falls back;
+            # NOLIBRARY and ALIAS deliberately do not add that search root.
+            val fr: R.Result[intern.StrId, str] = weak_fallback_name(img, sym);
+            if (R.is_err[intern.StrId, str](fr)) {
+                ret R.err[bool, str](R.unwrap_err[intern.StrId, str](fr));
+            }
+            val rr: R.Result[bool, str] =
+                archive_require(state, R.unwrap_ok[intern.StrId, str](fr));
+            if (R.is_err[bool, str](rr)) { ret rr; }
+            if ((sym.flags & of.SYM_OBJ_FLAG_SEARCH) != 0) {
+                val sr: R.Result[bool, str] = archive_require(state, sym.name);
+                if (R.is_err[bool, str](sr)) { ret sr; }
+            }
+        }
+        or ((sym.flags & of.SYM_OBJ_FLAG_WEAK) == 0) {
+            val ur: R.Result[bool, str] = archive_require(state, sym.name);
+            if (R.is_err[bool, str](ur)) { ret ur; }
         }
         i = i + 1;
     }
@@ -1616,8 +1643,11 @@ fun entry_vaddr(s: *session.Session, tgt: *target.Target,
     val er: R.Result[intern.StrId, str] = intern.intern(?s.interner, tgt.os.entry_symbol);
     if (R.is_err[intern.StrId, str](er)) { ret R.err[u64, str](R.unwrap_err[intern.StrId, str](er)); }
     val entry_name: intern.StrId = R.unwrap_ok[intern.StrId, str](er);
+    val rr: R.Result[intern.StrId, str] = resolved_symbol_name(sym_locs, entry_name);
+    if (R.is_err[intern.StrId, str](rr)) { ret R.err[u64, str](R.unwrap_err[intern.StrId, str](rr)); }
+    val resolved_name: intern.StrId = R.unwrap_ok[intern.StrId, str](rr);
     val el: R.Result[*SymbolLoc, str] =
-        map.get[intern.StrId, SymbolLoc](sym_locs, ?entry_name);
+        map.get[intern.StrId, SymbolLoc](sym_locs, ?resolved_name);
     if (R.is_err[*SymbolLoc, str](el)) {
         ret R.err[u64, str](entry_message(s, entry_name));
     }
@@ -2980,6 +3010,28 @@ fun finalize_placement_vaddrs(merged: *MergedSection, placements: *Placement, se
     }
 }
 
+# chase format-neutral weak fallbacks until reaching a real definition or an
+# unresolved terminal name. A chain longer than the symbol map contains a cycle.
+fun resolved_symbol_name(sym_locs: *map.Map[intern.StrId, SymbolLoc],
+                         name: intern.StrId) R.Result[intern.StrId, str] {
+    var cur: intern.StrId = name;
+    var hops: usize = 0;
+    for (hops <= sym_locs.len) {
+        val lr: R.Result[*SymbolLoc, str] =
+            map.get[intern.StrId, SymbolLoc](sym_locs, ?cur);
+        if (R.is_err[*SymbolLoc, str](lr)) {
+            ret R.ok[intern.StrId, str](cur);
+        }
+        val loc: *SymbolLoc = R.unwrap_ok[*SymbolLoc, str](lr);
+        if (loc.fallback == intern.STR_NIL) {
+            ret R.ok[intern.StrId, str](cur);
+        }
+        cur = loc.fallback;
+        hops = hops + 1;
+    }
+    ret R.err[intern.StrId, str]("link: weak fallback cycle");
+}
+
 # merge every defined GLOBAL symbol into the global table keyed
 # by name. records the symbol's merged section and final virtual address. rejects
 # a second strong (non-weak) definition of the same name. LOCAL (object-private)
@@ -3036,6 +3088,7 @@ fun collect_symbols(s: *session.Session, modules: *of.ObjectImage, module_count:
                 if (!cur.weak) { ret R.err[bool, str](dup_message(s, sym.name)); }
                 cur.vaddr = vaddr;
                 cur.weak = false;
+                cur.fallback = intern.STR_NIL;
                 sy = sy + 1;
                 cnt;
             }
@@ -3043,6 +3096,7 @@ fun collect_symbols(s: *session.Session, modules: *of.ObjectImage, module_count:
             var loc: SymbolLoc;
             loc.vaddr = vaddr;
             loc.weak = is_weak;
+            loc.fallback = intern.STR_NIL;
 
             val ins: R.Result[bool, str] =
                 map.insert[intern.StrId, SymbolLoc](sym_locs, sym.name, loc);
@@ -3050,6 +3104,69 @@ fun collect_symbols(s: *session.Session, modules: *of.ObjectImage, module_count:
                 ret R.err[bool, str](R.unwrap_err[bool, str](ins));
             }
 
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+
+    # Add weak fallback relations only after every real definition. This makes a
+    # definition of sym1 win regardless of object order while retaining external
+    # and chained sym1 -> sym2 relations for final resolution.
+    m = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (!is_undefined_extern(sym)
+                || (sym.flags & of.SYM_OBJ_FLAG_FALLBACK) == 0) {
+                sy = sy + 1; cnt;
+            }
+            val fr: R.Result[intern.StrId, str] = weak_fallback_name(?modules[m], sym);
+            if (R.is_err[intern.StrId, str](fr)) {
+                ret R.err[bool, str](R.unwrap_err[intern.StrId, str](fr));
+            }
+            val fallback: intern.StrId = R.unwrap_ok[intern.StrId, str](fr);
+            if (fallback == intern.STR_NIL) {
+                ret R.err[bool, str]("link: weak fallback has no symbol name");
+            }
+            val existing: R.Result[*SymbolLoc, str] =
+                map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name);
+            if (R.is_err[*SymbolLoc, str](existing)) {
+                var loc: SymbolLoc;
+                loc.vaddr = 0;
+                loc.weak = true;
+                loc.fallback = fallback;
+                val ir: R.Result[bool, str] =
+                    map.insert[intern.StrId, SymbolLoc](sym_locs, sym.name, loc);
+                if (R.is_err[bool, str](ir)) {
+                    ret R.err[bool, str](R.unwrap_err[bool, str](ir));
+                }
+            }
+            or {
+                val cur: *SymbolLoc = R.unwrap_ok[*SymbolLoc, str](existing);
+                if (cur.fallback != intern.STR_NIL && cur.fallback != fallback) {
+                    ret R.err[bool, str]("link: conflicting weak fallback targets");
+                }
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+
+    # Every fallback must terminate at a definition or a genuinely unresolved
+    # name. More than one map-length hop proves a cycle.
+    m = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if ((sym.flags & of.SYM_OBJ_FLAG_FALLBACK) != 0) {
+                val rr: R.Result[intern.StrId, str] =
+                    resolved_symbol_name(sym_locs, sym.name);
+                if (R.is_err[intern.StrId, str](rr)) {
+                    ret R.err[bool, str](R.unwrap_err[intern.StrId, str](rr));
+                }
+            }
             sy = sy + 1;
         }
         m = m + 1;
@@ -3380,8 +3497,14 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
             }
         }
         or {
+            val rn: R.Result[intern.StrId, str] =
+                resolved_symbol_name(sym_locs, target_name);
+            if (R.is_err[intern.StrId, str](rn)) {
+                ret R.err[bool, str](R.unwrap_err[intern.StrId, str](rn));
+            }
+            val resolved_name: intern.StrId = R.unwrap_ok[intern.StrId, str](rn);
             val sl: R.Result[*SymbolLoc, str] =
-                map.get[intern.StrId, SymbolLoc](sym_locs, ?target_name);
+                map.get[intern.StrId, SymbolLoc](sym_locs, ?resolved_name);
             if (R.is_ok[*SymbolLoc, str](sl)) {
                 sym_va = R.unwrap_ok[*SymbolLoc, str](sl).vaddr;
             }
@@ -3392,7 +3515,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                 # a GOT fixup (the writer builds its GOT slot + GLOB_DAT). any other
                 # unresolved reference - a call against a data import, an absolute
                 # reference to any import - is rejected as undefined.
-                val imp: R.Result[u32, str] = dynstate_import_index(dyn, target_name);
+                val imp: R.Result[u32, str] = dynstate_import_index(dyn, resolved_name);
                 if (R.is_ok[u32, str](imp) && is_call_kind(r.kind)
                     && dynstate_import_is_func(dyn, R.unwrap_ok[u32, str](imp))) {
                     val rec_r: R.Result[bool, str] = dynstate_add_fixup(s, dyn,
@@ -3409,7 +3532,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                     if (R.is_err[bool, str](rec_g)) { ret R.err[bool, str](R.unwrap_err[bool, str](rec_g)); }
                     ri = ri + 1; cnt;
                 }
-                ret R.err[bool, str](undef_message(s, target_name));
+                ret R.err[bool, str](undef_message(s, resolved_name));
             }
         }
 
@@ -3767,11 +3890,17 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
         var sy: u32 = 0;
         for (sy < modules[m].symbol_count) {
             val sym: *of.Symbol = ?modules[m].symbols[sy];
-            if (!is_undefined_extern(sym))                                                       { sy = sy + 1; cnt; }
-            if (R.is_ok[*SymbolLoc, str](map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name))) { sy = sy + 1; cnt; }
-            if (!import_symbol_live(modules, module_count, sym.name, sec_base, atoms))            { sy = sy + 1; cnt; }
-            if (R.is_ok[*u32, str](map.get[intern.StrId, u32](?seen, ?sym.name)))                { sy = sy + 1; cnt; }
-            val ins: R.Result[bool, str] = map.insert[intern.StrId, u32](?seen, sym.name, n_imports);
+            if (!is_undefined_extern(sym)) { sy = sy + 1; cnt; }
+            val rr: R.Result[intern.StrId, str] = resolved_symbol_name(sym_locs, sym.name);
+            if (R.is_err[intern.StrId, str](rr)) {
+                map.dnit[intern.StrId, u32](?seen);
+                ret R.err[bool, str](R.unwrap_err[intern.StrId, str](rr));
+            }
+            val effective: intern.StrId = R.unwrap_ok[intern.StrId, str](rr);
+            if (R.is_ok[*SymbolLoc, str](map.get[intern.StrId, SymbolLoc](sym_locs, ?effective))) { sy = sy + 1; cnt; }
+            if (!import_symbol_live(modules, module_count, sym.name, sec_base, atoms))             { sy = sy + 1; cnt; }
+            if (R.is_ok[*u32, str](map.get[intern.StrId, u32](?seen, ?effective)))                { sy = sy + 1; cnt; }
+            val ins: R.Result[bool, str] = map.insert[intern.StrId, u32](?seen, effective, n_imports);
             if (R.is_err[bool, str](ins)) { map.dnit[intern.StrId, u32](?seen); ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
             n_imports = n_imports + 1;
             sy = sy + 1;
@@ -3792,14 +3921,19 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
         var sy: u32 = 0;
         for (sy < modules[m].symbol_count) {
             val sym: *of.Symbol = ?modules[m].symbols[sy];
-            if (!is_undefined_extern(sym))                                                       { sy = sy + 1; cnt; }
-            if (R.is_ok[*SymbolLoc, str](map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name))) { sy = sy + 1; cnt; }
-            if (!import_symbol_live(modules, module_count, sym.name, sec_base, atoms))            { sy = sy + 1; cnt; }
-            if (R.is_ok[*u32, str](map.get[intern.StrId, u32](?dyn.import_map, ?sym.name)))      { sy = sy + 1; cnt; }
+            if (!is_undefined_extern(sym)) { sy = sy + 1; cnt; }
+            val rr: R.Result[intern.StrId, str] = resolved_symbol_name(sym_locs, sym.name);
+            if (R.is_err[intern.StrId, str](rr)) {
+                ret R.err[bool, str](R.unwrap_err[intern.StrId, str](rr));
+            }
+            val effective: intern.StrId = R.unwrap_ok[intern.StrId, str](rr);
+            if (R.is_ok[*SymbolLoc, str](map.get[intern.StrId, SymbolLoc](sym_locs, ?effective))) { sy = sy + 1; cnt; }
+            if (!import_symbol_live(modules, module_count, sym.name, sec_base, atoms))             { sy = sy + 1; cnt; }
+            if (R.is_ok[*u32, str](map.get[intern.StrId, u32](?dyn.import_map, ?effective)))      { sy = sy + 1; cnt; }
 
             val idx: u32 = dyn.info.import_count;
-            dyn.info.imports[idx].symbol    = sym.name;
-            val decl: *of.ImportDecl = declared_import_for(modules, module_count, sym.name);
+            dyn.info.imports[idx].symbol    = effective;
+            val decl: *of.ImportDecl = declared_import_for(modules, module_count, effective);
             # pin the import to the library its `#[library]` attribution named, when
             # present. a directive naming a library not among this link's
             # dependencies is a hard error. an unattributed import stays DYNLIB_ANY
@@ -3807,7 +3941,7 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             # namespace (PE, Mach-O) where the image must name a providing library
             # per import. a short import declaration overrides an equivalent
             # source/manifest alias with its exact loader spelling for this link.
-            var lib_opt: O.Option[intern.StrId] = session.import_library(s, sym.name);
+            var lib_opt: O.Option[intern.StrId] = session.import_library(s, effective);
             if (decl != nil) { lib_opt = O.some[intern.StrId](decl.library); }
             if (O.is_some[intern.StrId](lib_opt)) {
                 val want: intern.StrId = O.unwrap[intern.StrId](lib_opt);
@@ -3819,11 +3953,11 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
                     li_opt = emitted_lib_index(dyn.info.libs, explicit_libs + implicit,
                                                dyn.info.lib_count, want);
                 }
-                if (!O.is_some[u32](li_opt)) { ret R.err[bool, str](pinned_lib_message(s, sym.name, want)); }
+                if (!O.is_some[u32](li_opt)) { ret R.err[bool, str](pinned_lib_message(s, effective, want)); }
                 dyn.info.imports[idx].lib_index = O.unwrap[u32](li_opt);
             }
             or (tgt.of.two_level_namespace) {
-                ret R.err[bool, str](unattributed_import_message(s, sym.name, dynlibs, dynlib_count));
+                ret R.err[bool, str](unattributed_import_message(s, effective, dynlibs, dynlib_count));
             }
             or {
                 dyn.info.imports[idx].lib_index = of.DYNLIB_ANY;
@@ -3834,7 +3968,8 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             # (GLOB_DAT) are deferred.
             dyn.info.imports[idx].is_func   =
                 ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0)
-                || has_call_reloc(modules, module_count, sym.name, sec_base, atoms);
+                || has_call_reloc(modules, module_count, sym.name, sec_base, atoms)
+                || has_call_reloc(modules, module_count, effective, sec_base, atoms);
             # short import records also carry the loader's hint or ordinal. Keep
             # that binding metadata beside the source symbol so the PE writer can
             # emit an ordinal thunk instead of silently changing it to by-name.
@@ -3845,7 +3980,7 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
                 dyn.info.imports[idx].ordinal = decl.ordinal;
                 dyn.info.imports[idx].by_ordinal = !decl.by_name;
             }
-            val ins: R.Result[bool, str] = map.insert[intern.StrId, u32](?dyn.import_map, sym.name, idx);
+            val ins: R.Result[bool, str] = map.insert[intern.StrId, u32](?dyn.import_map, effective, idx);
             if (R.is_err[bool, str](ins)) { ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
             dyn.info.import_count = idx + 1;
 
@@ -4362,6 +4497,39 @@ fun apply_one(s: *session.Session, kind: of.RelocKind,
 # sym_base:      per-module prefix offset into `sym_out`
 # sym_out:       per-input-symbol merged-image symbol index (from build_merged_image)
 # ret:           ok(true) on success, or an error string
+fun carry_symbol(out_img: *of.ObjectImage, modules: *of.ObjectImage, m: u32, sy: u32,
+                 sym_base: *u32, sym_out: *u32) R.Result[u32, str] {
+    if (sy >= modules[m].symbol_count) {
+        ret R.err[u32, str]("linker: weak fallback index is out of range");
+    }
+    val slot: u32 = sym_base[m] + sy;
+    if (sym_out[slot] != of.SYMBOL_NONE) {
+        ret R.ok[u32, str](sym_out[slot]);
+    }
+
+    var carried: of.Symbol = modules[m].symbols[sy];
+    carried.section = of.SECTION_EXTERNAL;
+    carried.offset = 0;
+    val has_fallback: bool = (carried.flags & of.SYM_OBJ_FLAG_FALLBACK) != 0;
+    val fallback: u32 = carried.fallback;
+    if (has_fallback) { carried.fallback = of.SYMBOL_NONE; }
+
+    val ar: R.Result[u32, str] = obj.add_symbol(out_img, carried);
+    if (R.is_err[u32, str](ar)) { ret ar; }
+    val out_sy: u32 = R.unwrap_ok[u32, str](ar);
+    sym_out[slot] = out_sy;
+
+    # Publish the source index before recursing so a carried cycle terminates
+    # and remains available for the eventual final linker's cycle diagnostic.
+    if (has_fallback) {
+        val fr: R.Result[u32, str] =
+            carry_symbol(out_img, modules, m, fallback, sym_base, sym_out);
+        if (R.is_err[u32, str](fr)) { ret fr; }
+        out_img.symbols[out_sy].fallback = R.unwrap_ok[u32, str](fr);
+    }
+    ret R.ok[u32, str](out_sy);
+}
+
 fun carry_relocations(out_img: *of.ObjectImage, modules: *of.ObjectImage, module_count: u32,
                      placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                      sym_base: *u32, sym_out: *u32) R.Result[bool, str] {
@@ -4391,21 +4559,17 @@ fun carry_relocations(out_img: *of.ObjectImage, modules: *of.ObjectImage, module
                 ret R.err[bool, str]("linker: relocation targets a section with no merged output");
             }
 
-            val slot: u32 = sym_base[m] + r.sym;
-            if (sym_out[slot] == of.SYMBOL_NONE) {
-                var usym: of.Symbol = modules[m].symbols[r.sym];
-                usym.section = of.SECTION_EXTERNAL;
-                usym.offset  = 0;
-                val sa: R.Result[u32, str] = obj.add_symbol(out_img, usym);
-                if (R.is_err[u32, str](sa)) { ret R.err[bool, str](R.unwrap_err[u32, str](sa)); }
-                sym_out[slot] = R.unwrap_ok[u32, str](sa);
+            val sr: R.Result[u32, str] =
+                carry_symbol(out_img, modules, m, r.sym, sym_base, sym_out);
+            if (R.is_err[u32, str](sr)) {
+                ret R.err[bool, str](R.unwrap_err[u32, str](sr));
             }
 
             var orel: of.Relocation;
             orel.section = out_ix;
             orel.offset  = pl.offset + r.offset;
             orel.kind    = r.kind;
-            orel.sym     = sym_out[slot];
+            orel.sym     = R.unwrap_ok[u32, str](sr);
             orel.addend  = r.addend;
 
             val ar: R.Result[bool, str] = obj.add_relocation(out_img, orel);
@@ -5083,6 +5247,214 @@ test "mach.lang.be.linker.archive_resolution:undefined_weak_does_not_extract" {
     if (R.is_err[bool, str](required) || !R.unwrap_ok[bool, str](required)) { ret 1; }
 
     free_archive_resolution(?state);
+    session.dnit(?s);
+    ret 0;
+}
+
+# COFF weak fallbacks always require sym2; only SEARCH_LIBRARY adds sym1 to the
+# archive frontier, while SEARCH_ALIAS can satisfy an existing sym1 requirement.
+test "mach.lang.be.linker.archive_resolution:weak_fallback_modes" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    val public: intern.StrId = lt_name(?s, "weak_public");
+    val fallback: intern.StrId = lt_name(?s, "weak_fallback");
+    val ext: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
+    var syms: [2]of.Symbol;
+    syms[0].name = public; syms[0].section = of.SECTION_EXTERNAL;
+    syms[0].offset = 0; syms[0].size = 0; syms[0].fallback = 1;
+    syms[1].name = fallback; syms[1].section = of.SECTION_EXTERNAL;
+    syms[1].offset = 0; syms[1].size = 0; syms[1].flags = ext;
+    syms[1].fallback = of.SYMBOL_NONE;
+    var img: of.ObjectImage = lt_image(?s, lt_name(?s, "weak-user"),
+        nil::*of.Section, 0, ?syms[0], 2, nil::*of.Relocation, 0);
+
+    var modes: [3]u32;
+    modes[0] = 0;
+    modes[1] = of.SYM_OBJ_FLAG_SEARCH;
+    modes[2] = of.SYM_OBJ_FLAG_ALIAS;
+    var mi: u32 = 0;
+    for (mi < 3) {
+        syms[0].flags = ext | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FALLBACK
+            | modes[mi];
+        var state: ArchiveResolution;
+        init_archive_resolution(?alloc, ?state);
+        if (mi == 2 && R.is_err[bool, str](archive_require(?state, public))) { ret 1; }
+        if (R.is_err[bool, str](archive_note_image(?s, ?state, ?img))) { ret 1; }
+        if (!map.contains[intern.StrId, u32](?state.unresolved, ?fallback)) { ret 1; }
+        val wants_public: bool =
+            map.contains[intern.StrId, u32](?state.unresolved, ?public);
+        val provides_public: bool =
+            map.contains[intern.StrId, u32](?state.providers, ?public);
+        if (wants_public != (mi == 1) || provides_public != (mi == 2)) { ret 1; }
+        free_archive_resolution(?state);
+        mi = mi + 1;
+    }
+
+    syms[0].fallback = 99;
+    var malformed: ArchiveResolution;
+    init_archive_resolution(?alloc, ?malformed);
+    val mr: R.Result[bool, str] = archive_note_image(?s, ?malformed, ?img);
+    free_archive_resolution(?malformed);
+    session.dnit(?s);
+    if (!R.is_err[bool, str](mr)) { ret 1; }
+    ret 0;
+}
+
+# Final symbol resolution prefers a real sym1 definition, otherwise follows
+# external and chained fallbacks. Cycles and conflicting aliases are rejected,
+# and a dynamic terminal becomes the one import row.
+test "mach.lang.be.linker.collect_symbols:weak_fallback_resolution" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    val one: intern.StrId = lt_name(?s, "fallback_one");
+    val two: intern.StrId = lt_name(?s, "fallback_two");
+    val three: intern.StrId = lt_name(?s, "fallback_three");
+    val ext: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
+    val relation: u32 = ext | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FALLBACK;
+
+    var rel_syms: [2]of.Symbol;
+    rel_syms[0].name = one; rel_syms[0].section = of.SECTION_EXTERNAL;
+    rel_syms[0].offset = 0; rel_syms[0].size = 0;
+    rel_syms[0].flags = relation; rel_syms[0].fallback = 1;
+    rel_syms[1].name = two; rel_syms[1].section = of.SECTION_EXTERNAL;
+    rel_syms[1].offset = 0; rel_syms[1].size = 0;
+    rel_syms[1].flags = ext; rel_syms[1].fallback = of.SYMBOL_NONE;
+    var real_one: of.Symbol;
+    real_one.name = one; real_one.section = 0; real_one.offset = 0;
+    real_one.size = 0; real_one.flags = of.SYM_OBJ_FLAG_GLOBAL;
+    real_one.fallback = of.SYMBOL_NONE;
+    var real_two: of.Symbol = real_one; real_two.name = two;
+
+    var modules: [3]of.ObjectImage;
+    modules[0] = lt_image(?s, lt_name(?s, "relation"), nil::*of.Section, 0,
+        ?rel_syms[0], 2, nil::*of.Relocation, 0);
+    modules[1] = lt_image(?s, lt_name(?s, "real-one"), nil::*of.Section, 1,
+        ?real_one, 1, nil::*of.Relocation, 0);
+    modules[2] = lt_image(?s, lt_name(?s, "real-two"), nil::*of.Section, 1,
+        ?real_two, 1, nil::*of.Relocation, 0);
+    var placements: [2]Placement;
+    placements[0].vaddr = 0x1000; placements[0].offset = 0; placements[0].merged_index = 0;
+    placements[1].vaddr = 0x2000; placements[1].offset = 0; placements[1].merged_index = 0;
+    var sec_base: [3]u32; sec_base[0] = 0; sec_base[1] = 0; sec_base[2] = 1;
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    val cr: R.Result[bool, str] = collect_symbols(?s, ?modules[0], 3,
+        ?placements[0], ?sec_base[0], ?locs, true, nil::*AtomPlan);
+    if (R.is_err[bool, str](cr)) { ret 1; }
+    val rn: R.Result[intern.StrId, str] = resolved_symbol_name(?locs, one);
+    val ol: R.Result[*SymbolLoc, str] = map.get[intern.StrId, SymbolLoc](?locs, ?one);
+    if (R.is_err[intern.StrId, str](rn) || R.unwrap_ok[intern.StrId, str](rn) != one
+        || R.is_err[*SymbolLoc, str](ol)
+        || R.unwrap_ok[*SymbolLoc, str](ol).vaddr != 0x1000) { ret 1; }
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+
+    # Without a real sym1, the same-object sym2 definition supplies its address.
+    var same_object: [2]of.ObjectImage;
+    same_object[0] = modules[0]; same_object[1] = modules[2];
+    var same_base: [2]u32; same_base[0] = 0; same_base[1] = 0;
+    locs = map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    val sc: R.Result[bool, str] = collect_symbols(?s, ?same_object[0], 2,
+        ?placements[1], ?same_base[0], ?locs, true, nil::*AtomPlan);
+    val sn: R.Result[intern.StrId, str] = resolved_symbol_name(?locs, one);
+    val tl: R.Result[*SymbolLoc, str] = map.get[intern.StrId, SymbolLoc](?locs, ?two);
+    if (R.is_err[bool, str](sc) || R.is_err[intern.StrId, str](sn)
+        || R.unwrap_ok[intern.StrId, str](sn) != two
+        || R.is_err[*SymbolLoc, str](tl)
+        || R.unwrap_ok[*SymbolLoc, str](tl).vaddr != 0x2000) { ret 1; }
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+
+    # one -> two -> three, with three unresolved, canonicalizes the dynamic row.
+    var chain: [3]of.Symbol;
+    chain[0] = rel_syms[0]; chain[0].fallback = 1;
+    chain[1] = rel_syms[0]; chain[1].name = two; chain[1].fallback = 2;
+    chain[2] = rel_syms[1]; chain[2].name = three;
+    var chain_img: of.ObjectImage = lt_image(?s, lt_name(?s, "chain"),
+        nil::*of.Section, 0, ?chain[0], 3, nil::*of.Relocation, 0);
+    locs = map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    val cc: R.Result[bool, str] = collect_symbols(?s, ?chain_img, 1,
+        nil::*Placement, nil::*u32, ?locs, false, nil::*AtomPlan);
+    if (R.is_err[bool, str](cc)) { ret 1; }
+    val cn: R.Result[intern.StrId, str] = resolved_symbol_name(?locs, one);
+    if (R.is_err[intern.StrId, str](cn)
+        || R.unwrap_ok[intern.StrId, str](cn) != three) { ret 1; }
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val tr: R.Result[target.Target, str] =
+        target.select(?reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+    var dyn: DynState; init_dynstate(?dyn);
+    val dr: R.Result[bool, str] = build_dynamic_info(?s, ?tgt, ?dyn, ?chain_img, 1,
+        ?locs, nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    if (R.is_err[bool, str](dr) || dyn.info.import_count != 1
+        || dyn.info.imports[0].symbol != three) { ret 1; }
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+
+    # Conflicting targets for one public weak name are deterministic errors.
+    var conflict: [4]of.Symbol;
+    conflict[0] = rel_syms[0]; conflict[0].fallback = 1;
+    conflict[1] = rel_syms[1];
+    conflict[2] = rel_syms[0]; conflict[2].fallback = 1;
+    conflict[3] = rel_syms[1]; conflict[3].name = three;
+    var conflict_mods: [2]of.ObjectImage;
+    conflict_mods[0] = lt_image(?s, lt_name(?s, "conflict-a"), nil::*of.Section, 0,
+        ?conflict[0], 2, nil::*of.Relocation, 0);
+    conflict_mods[1] = lt_image(?s, lt_name(?s, "conflict-b"), nil::*of.Section, 0,
+        ?conflict[2], 2, nil::*of.Relocation, 0);
+    locs = map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    val cf: R.Result[bool, str] = collect_symbols(?s, ?conflict_mods[0], 2,
+        nil::*Placement, nil::*u32, ?locs, false, nil::*AtomPlan);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    if (!R.is_err[bool, str](cf)) { ret 1; }
+
+    chain[0].fallback = 1; chain[1].fallback = 0;
+    chain_img.symbol_count = 2;
+    locs = map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    val cy: R.Result[bool, str] = collect_symbols(?s, ?chain_img, 1,
+        nil::*Placement, nil::*u32, ?locs, false, nil::*AtomPlan);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    if (!R.is_err[bool, str](cy)) { ret 1; }
+    ret 0;
+}
+
+# Relocatable carry appends an aux-only fallback target and rewrites the relation
+# into the merged symbol index space, including when prior symbols shift indices.
+test "mach.lang.be.linker.carry_symbol:weak_fallback_remap" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    val ext: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
+    var syms: [2]of.Symbol;
+    syms[0].name = lt_name(?s, "carry-public");
+    syms[0].section = of.SECTION_EXTERNAL; syms[0].offset = 0; syms[0].size = 0;
+    syms[0].flags = ext | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FALLBACK;
+    syms[0].fallback = 1;
+    syms[1].name = lt_name(?s, "carry-fallback");
+    syms[1].section = of.SECTION_EXTERNAL; syms[1].offset = 0; syms[1].size = 0;
+    syms[1].flags = ext; syms[1].fallback = of.SYMBOL_NONE;
+    var input: of.ObjectImage = lt_image(?s, lt_name(?s, "carry-input"),
+        nil::*of.Section, 0, ?syms[0], 2, nil::*of.Relocation, 0);
+    var out: of.ObjectImage = lt_image(?s, lt_name(?s, "carry-out"),
+        nil::*of.Section, 0, nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+    var dummy: of.Symbol = syms[1]; dummy.name = lt_name(?s, "dummy");
+    if (R.is_err[u32, str](obj.add_symbol(?out, dummy))) { ret 1; }
+    var base: [1]u32; base[0] = 0;
+    var remap: [2]u32; remap[0] = of.SYMBOL_NONE; remap[1] = of.SYMBOL_NONE;
+    val cr: R.Result[u32, str] =
+        carry_symbol(?out, ?input, 0, 0, ?base[0], ?remap[0]);
+    if (R.is_err[u32, str](cr) || R.unwrap_ok[u32, str](cr) != 1
+        || out.symbol_count != 3 || out.symbols[1].fallback != 2
+        || out.symbols[2].name != syms[1].name) { ret 1; }
     session.dnit(?s);
     ret 0;
 }
