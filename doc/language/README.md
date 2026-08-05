@@ -66,3 +66,4 @@ neighboring links; start from the index below.
 
 - [../manifest.md](../manifest.md) — the `mach.toml` manifest reference
 - [../cli.md](../cli.md) — the `mach` command-line reference
+- [../distribution.md](../distribution.md) — shipping an application to users

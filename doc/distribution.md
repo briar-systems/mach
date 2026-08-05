@@ -1,0 +1,532 @@
+# Shipping an application
+
+`mach build` produces a binary. This page covers everything after that: how to
+decide what links statically, what each operating system expects a shipped
+application to look like, and how to produce all three from one machine.
+
+Mach owns the binary and its link. It does not own code signing, installers, or
+store submission — those are other people's tools, and where one is required
+this page names it and says so plainly. Nothing here is a `mach` subcommand
+waiting to be written; the division is deliberate.
+
+The worked example throughout is a project with one `bin` artifact, a vendored C
+library (`libqz.a`) built by a `[step]`, and a loose asset directory. See
+[manifest.md](manifest.md) for the manifest keys it uses.
+
+## The shape of a release
+
+One artifact per target, staged into a directory, archived. The archive is the
+deliverable.
+
+| Target  | Archive  | Contains |
+|---------|----------|----------|
+| linux   | `tar.gz` | one top-level directory: the binary, assets, `LICENSE` |
+| windows | `zip`    | one top-level directory: the `.exe`, any DLLs, assets, `LICENSE` |
+| darwin  | `zip`    | a `.app` bundle at the archive root |
+
+A top-level directory on linux and windows keeps an extraction from scattering
+files into whatever directory the user was standing in. The darwin archive is
+the exception: a `.app` is *already* a directory, and macOS expects to find it at
+the root of the archive it arrives in.
+
+> Mach's own release archives are flat — a single `mach` binary and `LICENSE`,
+> no top-level directory (see `.github/workflows/cd.yml`). That is a reasonable
+> shape for a single-file CLI tool and a poor one for an application with assets.
+
+## linux
+
+### The static route
+
+Link everything you can. A linux executable whose every input is a loose `.o` or
+a static `.a` has no dynamic dependencies at all:
+
+```sh
+mach build . --profile release
+```
+
+```
+$ file out/linux-x86_64/release/bin/demo
+ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped
+$ ldd out/linux-x86_64/release/bin/demo
+	not a dynamic executable
+```
+
+This is the default outcome, not a mode you opt into. Mach links its own objects
+without a system linker and does not link libc, so a pure-Mach project is
+statically linked whether or not you thought about it. A vendored C dependency
+joins that binary the moment its `[link.X]` resolves to an `.a`:
+
+```toml
+[link.qz]
+source = "local"
+path   = "{project.out}/obj/qz/libqz.a"
+os     = "*"
+isa    = "*"
+abi    = "*"
+export = false
+```
+
+An `.a` contributes *every* member object, not just the ones satisfying an
+undefined symbol, so what you vendor is what you ship.
+
+**No rpath is needed, and none is emitted.** `rpath` exists to tell a dynamic
+loader where to look; a static executable never invokes one. There is no
+interpreter, no `DT_NEEDED`, no search path to get wrong, and no `LD_LIBRARY_PATH`
+wrapper script to write. The binary in the archive is the binary that runs.
+
+### Where the dynamic boundary belongs
+
+Some libraries should not be vendored. A system library that is part of the
+running desktop — X11, OpenGL, Wayland, ALSA — must be the *host's* copy, because
+it talks to a server and a driver stack that shipped with the host. Ship your own
+`libX11.so` and you have built a program that cannot talk to the display it was
+installed next to.
+
+Declare those as `system` and let them stay dynamic:
+
+```toml
+[link.x11]
+source  = "system"
+name    = "X11"
+library = "X11"
+os      = "linux"
+isa     = "*"
+abi     = "*"
+export  = false
+```
+
+```
+$ file out/linux-x86_64/release/bin/demo-x11
+ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked,
+interpreter /lib64/ld-linux-x86-64.so.2, stripped
+$ readelf -dW out/linux-x86_64/release/bin/demo-x11 | grep NEEDED
+ 0x0000000000000001 (NEEDED)             Shared library: [libX11.so.6]
+```
+
+The recorded name is the library's `DT_SONAME` — `libX11.so.6`, with its ABI
+version, not the `libX11.so` development symlink the link resolved through. That
+is what makes the dependency portable across distributions: every distribution
+that ships an ABI-6 X11 satisfies it.
+
+Note that still no rpath is emitted. `libX11.so.6` lives in the system library
+path, which is exactly where the loader looks first without being told. An rpath
+is only interesting for a library you ship yourself in a non-standard place —
+which, on this route, you are not doing.
+
+The rule of thumb: **vendor what you compiled, borrow what the desktop owns.**
+Everything you built from source goes in the binary; anything that brokers access
+to hardware or a display server stays dynamic.
+
+### tar.gz layout
+
+```
+demo-0.1.0-linux-x86_64/
+demo-0.1.0-linux-x86_64/demo
+demo-0.1.0-linux-x86_64/assets/
+demo-0.1.0-linux-x86_64/assets/level1.dat
+demo-0.1.0-linux-x86_64/LICENSE
+```
+
+```sh
+mkdir -p stage/demo-0.1.0-linux-x86_64
+cp out/linux-x86_64/release/bin/demo stage/demo-0.1.0-linux-x86_64/
+cp -r assets LICENSE stage/demo-0.1.0-linux-x86_64/
+tar -C stage -czf dist/demo-0.1.0-linux-x86_64.tar.gz demo-0.1.0-linux-x86_64
+```
+
+The binary finds `assets/` relative to its own location, not the working
+directory — a user who launches from a desktop entry has a working directory you
+did not choose.
+
+## windows
+
+### DLLs beside the exe
+
+Anything you ship dynamically on windows goes in the same directory as the `.exe`.
+This works because of what the link records: a PE import directory names the
+dependency by **bare basename** and nothing else — no path, no version, no
+SONAME equivalent.
+
+```
+$ mach build . --profile release --target windows-x86_64
+$ objdump -p out/windows-x86_64/release/bin/demo.exe | grep "DLL Name"
+	DLL Name: kernel32.dll
+	DLL Name: render.dll
+```
+
+The Windows loader resolves that basename at load time, and the directory
+containing the executable is the first place it looks. So a DLL sitting next to
+the `.exe` wins over any other copy on the system, which is what you want for a
+library you shipped, and is the whole mechanism — there is nothing to configure.
+
+A consequence worth knowing: because only the name is recorded, **the DLL does
+not need to exist when you link.** `render.dll` above exists nowhere on the build
+machine. That is what makes cross-building to windows from linux practical, and
+it is also why a typo'd DLL name is not caught until someone runs the program.
+
+Declare each one as a `system` entry with its full filename:
+
+```toml
+[link.render]
+source = "system"
+name   = "render.dll"
+os     = ["windows"]
+isa    = ["*"]
+abi    = ["*"]
+export = false
+```
+
+and attribute the imports, which PE requires — an unattributed dynamic import is
+a hard link error on a two-level-namespace format, never a silent fallback:
+
+```mach
+#[library("render.dll")]
+ext fun render_init() i32;
+```
+
+See [language/ext-fun.md](language/ext-fun.md#library-attribution) for the
+attribution rules.
+
+### The `.exe` extension
+
+An artifact's `out` is written literally, so the extension is yours to spell.
+Per-target naming is a second artifact stanza rather than a per-cell exception:
+
+```toml
+[artifact.demo]
+kind    = "bin"
+entry   = "main.mach"
+out     = "bin/demo"
+targets = ["linux-x86_64"]
+link    = ["qz"]
+need    = []
+
+[artifact.demo-win]
+kind    = "bin"
+entry   = "main.mach"
+out     = "bin/demo.exe"
+targets = ["windows-x86_64"]
+link    = ["qz"]
+need    = []
+```
+
+### zip layout
+
+```
+demo-0.1.0-windows-x86_64/
+demo-0.1.0-windows-x86_64/demo.exe
+demo-0.1.0-windows-x86_64/render.dll
+demo-0.1.0-windows-x86_64/assets/
+demo-0.1.0-windows-x86_64/LICENSE
+```
+
+```sh
+bsdtar -C stage -a -cf dist/demo-0.1.0-windows-x86_64.zip demo-0.1.0-windows-x86_64
+```
+
+`bsdtar` (libarchive) writes both `tar.gz` and `zip`, so one tool covers every
+archive on this page; it is what macOS ships as `tar`, and a package away
+elsewhere. `zip -r` produces the same thing where you have it instead.
+
+## darwin
+
+### The `.app` bundle
+
+macOS expects a graphical application to be a directory with a fixed shape:
+
+```
+Demo.app/
+Demo.app/Contents/
+Demo.app/Contents/Info.plist
+Demo.app/Contents/MacOS/
+Demo.app/Contents/MacOS/Demo
+Demo.app/Contents/Resources/
+Demo.app/Contents/Resources/Demo.icns
+```
+
+`Contents/MacOS/<name>` is the executable, `Contents/Resources/` holds icons and
+data files, and `Contents/Info.plist` tells Launch Services how to treat the
+whole thing. The name in `CFBundleExecutable` must match the file in
+`Contents/MacOS/`.
+
+You do not need a build step to assemble this. An artifact's `out` is just a
+path under the project output, so point it into the bundle and the link writes
+the executable where it belongs:
+
+```toml
+[artifact.demo-mac]
+kind    = "bin"
+entry   = "main.mach"
+out     = "Demo.app/Contents/MacOS/Demo"
+targets = ["darwin-x86_64"]
+link    = ["qz"]
+need    = []
+```
+
+The `Info.plist` and `Resources/` are static files you copy in beside it. A
+minimum viable plist:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>               <string>Demo</string>
+    <key>CFBundleDisplayName</key>        <string>Demo</string>
+    <key>CFBundleIdentifier</key>         <string>org.example.demo</string>
+    <key>CFBundleExecutable</key>         <string>Demo</string>
+    <key>CFBundlePackageType</key>        <string>APPL</string>
+    <key>CFBundleVersion</key>            <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key> <string>0.1.0</string>
+    <key>CFBundleIconFile</key>           <string>Demo</string>
+    <key>LSMinimumSystemVersion</key>     <string>11.0</string>
+    <key>NSHighResolutionCapable</key>    <true/>
+</dict>
+</plist>
+```
+
+| Key | Why it matters |
+|-----|----------------|
+| `CFBundleIdentifier` | reverse-DNS identity; the codesigning and notarization records key on it, and two applications sharing one are the same application as far as macOS is concerned |
+| `CFBundleExecutable` | the filename under `Contents/MacOS/`; a mismatch is a bundle that will not launch |
+| `CFBundleShortVersionString` | the version a user sees; `CFBundleVersion` is the build number and may differ |
+| `CFBundleIconFile` | basename of the `.icns` in `Resources/`, conventionally without the extension |
+| `NSHighResolutionCapable` | absent or false, the window server scales the app up from 1x and it looks blurry on every Mac sold in the last decade |
+
+Archive the bundle at the root:
+
+```sh
+bsdtar -C out/darwin-x86_64/release -a -cf dist/demo-0.1.0-darwin-x86_64.zip Demo.app
+```
+
+The executable bit on `Contents/MacOS/Demo` has to survive the round trip or the
+bundle will not launch. `bsdtar` records unix permissions in the zip; verify
+rather than assume:
+
+```
+$ bsdtar -C /tmp/unz -xf dist/demo-0.1.0-darwin-x86_64.zip
+$ ls -l /tmp/unz/Demo.app/Contents/MacOS/Demo
+-rwxr-xr-x  ... /tmp/unz/Demo.app/Contents/MacOS/Demo
+```
+
+### Signing and notarization
+
+**This is external tooling.** The compiler emits a Mach-O binary and stops; it
+has no signing code, holds no keys, and will not grow a `mach sign`. Signing is
+Apple's protocol, tied to Apple's certificate authority, and belongs to a tool
+built for it.
+
+From a linux host that tool is [`rcodesign`](https://github.com/indygreg/apple-platform-rs),
+which implements Apple code signing and notarization without needing macOS:
+
+```sh
+cargo install apple-codesign
+```
+
+You need a **Developer ID Application** certificate from Apple (a paid developer
+account) exported as a `.p12`, and an **App Store Connect API key** for
+notarization. Neither is something the compiler can supply.
+
+Sign the bundle — `rcodesign` recurses into nested Mach-O binaries by default,
+unlike Apple's `codesign`:
+
+```sh
+rcodesign sign \
+  --p12-file developer-id.p12 --p12-password-file ~/.certificate-password \
+  --code-signature-flags runtime \
+  Demo.app
+```
+
+`--code-signature-flags runtime` enables the hardened runtime. Notarization
+rejects a bundle without it, with `The executable does not have the hardened
+runtime enabled.` The flag applies to the main binary only; a bundle with several
+binaries needs the scoped form (`--code-signature-flags Contents/MacOS/helper:runtime`)
+for each additional one. `rcodesign sign --for-notarization` validates the whole
+configuration against notarization's requirements up front and is worth using
+while you are still getting a pipeline working.
+
+Then notarize. A bundle can be submitted directly — `rcodesign` zips it for you,
+so there is no separate archive step — and `--staple` waits for the result and
+attaches the ticket on success:
+
+```sh
+rcodesign notary-submit \
+  --api-key-file ~/.appstoreconnect/key.json \
+  --staple \
+  Demo.app
+```
+
+Encode the API key file once, beforehand:
+
+```sh
+rcodesign encode-app-store-connect-api-key \
+  -o ~/.appstoreconnect/key.json \
+  <issuer-id> <key-id> ~/Downloads/AuthKey_<key-id>.p8
+```
+
+Notarization is asynchronous and can take anywhere from seconds to much longer;
+`rcodesign notary-list`, `notary-wait`, and `notary-log` inspect a submission
+that was interrupted or that failed.
+
+> These four commands are a recipe, not a verified transcript. Signing requires a
+> Developer ID certificate and notarization requires an App Store Connect key, so
+> unlike everything else on this page they cannot be exercised from a
+> credential-less build host. Flags are quoted against `rcodesign` 0.29's
+> documentation. Re-check them against `rcodesign <command> --help` before you
+> depend on them.
+
+Zip the bundle **after** signing and stapling. Signing rewrites files inside the
+bundle, so an archive made first ships an unsigned copy.
+
+### The Gatekeeper reality
+
+Signing and notarizing are not optional for public distribution, and it is worth
+being precise about why. Gatekeeper evaluates a downloaded application against
+the system policy database, which contains these rules among others:
+
+```
+11[Notarized Developer ID] P5 allow execute
+        ... certificate leaf[...] exists and notarized
+13[Unnotarized Developer ID] P0 deny execute
+        ... certificate leaf[...] exists and (... timestamp >= "20190408000000Z")
+```
+
+A Developer ID signature that has *not* been notarized matches an explicit
+**deny**. Signing alone does not get you there; since April 2019 the notarization
+step is what moves an application from the deny rule to the allow rule.
+
+An unsigned application is worse off still: it carries the
+`com.apple.quarantine` attribute after download and is refused with a dialog
+offering no obvious way past it. Users can clear it through System Settings or
+`xattr -d`, but an application that requires a terminal command to launch is not
+one you can hand to the public.
+
+For a private tool, a team build, or CI, ad-hoc signing (`rcodesign sign
+Demo.app` with no certificate) plus locally clearing quarantine is enough. The
+moment a stranger downloads the archive, you need the certificate and the
+notarization.
+
+## Assets
+
+An application's data files ship one of two ways.
+
+A **loose asset directory** beside the executable is the right default. Files
+stay patchable without a rebuild, a large asset does not inflate the binary or
+its link time, and users can see what they installed. Everything on this page's
+archive layouts assumes it. Resolve paths relative to the executable's own
+location rather than the working directory, which you do not control.
+
+Loose assets stop being the right answer when the deliverable is a **single
+file** — a CLI tool people drop on their `PATH`, something distributed by copying
+one binary — or when an asset is load-bearing for correctness and must not drift
+out of sync with the code that reads it. Compiling those into the binary is what
+`#[embed]` is for.
+
+## Cross-building from one host
+
+`--all-targets` builds every declared `[target.*]` in one invocation:
+
+```sh
+mach build . --profile release --all-targets
+```
+
+One cell per artifact × target, and three shipping binaries at the end of it:
+
+```
+$ file out/linux-x86_64/release/bin/demo
+ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, stripped
+$ file out/windows-x86_64/release/bin/demo.exe
+PE32+ executable for MS Windows 6.00 (console), x86-64, 11 sections
+$ file out/darwin-x86_64/release/Demo.app/Contents/MacOS/Demo
+Mach-O 64-bit x86_64 executable, flags:<NOUNDEFS>
+```
+
+For a **pure-Mach project this needs nothing installed.** Mach emits ELF, COFF,
+and Mach-O itself and links each without a system linker, so there is no
+cross-toolchain to acquire and no SDK to extract — a stock linux checkout
+produces all three.
+
+To run the foreign ones, `--runner` hands the binary to a launcher:
+
+```sh
+mach run . --profile release --bin demo-win --target windows-x86_64 --runner wine
+```
+
+### Vendored C is where it gets real
+
+The moment a `[step]` shells out to a C compiler, that compiler — not mach — has
+to produce an object in the target's format. The naive step runs the host `cc`
+for every build cell and produces host ELF every time:
+
+```
+building demo-win (windows-x86_64)
+error: coff: not an x86-64 object
+building demo-mac (darwin-x86_64)
+error: macho: not a 64-bit Mach-O object (bad magic; expected 0xFEEDFACF)
+```
+
+Every step process inherits `MACH_TARGET_ISA`, `MACH_TARGET_OS`, and
+`MACH_TARGET_ABI` for exactly this reason. Branch on them and select a C target
+per cell:
+
+```toml
+[step.qz]
+cmd  = "vendor/build-qz.sh {project.out}/obj/qz/libqz.a"
+in   = ["vendor/qz/*.c", "vendor/qz/*.h", "vendor/build-qz.sh"]
+out  = ["{project.out}/obj/qz/libqz.a"]
+need = []
+```
+
+```sh
+#!/bin/sh
+# compile the vendored C for this build cell's target and archive it.
+set -eu
+out="$1"
+obj="${out%.a}.o"
+mkdir -p "$(dirname "$out")"
+case "$MACH_TARGET_OS" in
+    linux)   cc -c -O2 -Ivendor/qz -o "$obj" vendor/qz/qz.c ;;
+    windows) clang --target="$MACH_TARGET_ISA-pc-windows-msvc" \
+                 -c -O2 -Ivendor/qz -o "$obj" vendor/qz/qz.c ;;
+    darwin)  clang --target="$MACH_TARGET_ISA-apple-darwin" \
+                 -c -O2 -Ivendor/qz -o "$obj" vendor/qz/qz.c ;;
+    *) echo "no C toolchain configured for $MACH_TARGET_OS" >&2; exit 1 ;;
+esac
+rm -f "$out"
+ar rcs "$out" "$obj"
+```
+
+A single `clang` cross-compiles to all three object formats, which is why it is
+the easy answer here; a per-target gcc cross-toolchain works equally well. What
+you cannot do is skip the question. **This is the one part of cross-building
+mach does not do for you**, and it applies to every dependency that vendors C.
+
+C that includes system headers needs those headers too, which is a larger
+undertaking than a target triple — a windows SDK or a macOS SDK, per target.
+Self-contained C (no system includes) needs only the compiler.
+
+### Mach-O prefixes C symbols
+
+Mach-O decorates C symbols with a leading underscore; ELF and COFF do not. The
+same C function is `qz_answer` in an ELF or COFF object and `_qz_answer` in a
+Mach-O one, so one unadorned `ext fun` cannot bind on all three. Gate the
+declaration:
+
+```mach
+$if ($mach.build.os == $mach.os.darwin) {
+    #[symbol("_qz_answer")]
+    ext fun qz_answer() i32;
+} $or {
+    ext fun qz_answer() i32;
+}
+```
+
+The symptom when you forget is `error: undefined symbol: qz_answer` on the darwin
+cell alone, while linux and windows link.
+
+## See also
+
+- [manifest.md](manifest.md) — `[artifact.*]`, `[link.*]`, and `[step.*]`
+- [cli.md](cli.md) — `--all-targets`, `--runner`, and link-input resolution
+- [language/ext-fun.md](language/ext-fun.md) — `ext fun`, `#[symbol]`, `#[library]`
