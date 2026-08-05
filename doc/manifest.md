@@ -441,6 +441,16 @@ A step is cached by content: its `in` contents plus its expanded `cmd` fingerpri
 the step (the query engine's `Q_LINK_CONFIG` pattern). An unchanged step whose
 outputs still exist is skipped; change an input or the command and it re-runs.
 
+A source file's `#[embed(...)]` decorator (see
+[decorators.md](language/decorators.md#embedstr--compile-time-file-embedding))
+is a build input under the same content-based principle, by a different
+mechanism: it has no `[step]` stanza of its own. The embedded file's content
+digest is published into a `Q_EMBED_FILE` query input that the embedding
+module's sema depends on, so an edited asset invalidates that module's cached
+sema and an untouched asset is a cache hit — the same guarantee `in` gives a
+step, keyed to one file instead of a step's whole input list, and by digest
+rather than timestamp either way.
+
 **Output homing.** `{project.out}` resolves to the **root** project's expanded
 `out` in every manifest of the closure. A dependency's step outputs land in the
 consumer's output tree — exactly as a dependency's compiled modules do — and the
