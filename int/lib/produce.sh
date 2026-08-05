@@ -535,11 +535,12 @@ kernel32.dll:Sleep'
 }
 
 # produce_pe_local_import <runmode> <target> <binary>
-# Verify the DefinedLocalImport shape from two real Clang objects. Their duplicate
-# `__imp_local_add` rel32 sites must address one synthesized cell; provider.o's
-# direct local_add call must still address the function itself. The cell stores the
-# image VA of that function, receives the sole DIR64 base relocation, and produces
-# neither an import directory nor an IAT (#2552).
+# Verify the DefinedLocalImport shape from real Clang objects. Duplicate live
+# `__imp_local_add` sites share one cell even though an earlier import archive was
+# selected; a losing SELECT_ANY body's `__imp_dead_local` site leaves no cell.
+# provider.o's direct local_add call still addresses the function. The sole cell
+# stores that function's image VA, receives the sole DIR64 base relocation, and
+# produces neither an import directory nor an IAT (#2552).
 produce_pe_local_import() {
     bin=$3
     elfanew=$(read_le_uint "$bin" 60 4)
