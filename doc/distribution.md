@@ -2,7 +2,9 @@
 
 `mach build` produces a binary. This page covers everything after that: how to
 decide what links statically, what each operating system expects a shipped
-application to look like, and how to produce all three from one machine.
+application to look like, and how much of a three-platform release one machine
+can actually produce (more than you would expect, but not all of it — see
+[the darwin limit](#the-darwin-limit-vendored-c-builds-on-macos)).
 
 Mach owns the binary and its link. It does not own code signing, installers, or
 store submission — those are other people's tools, and where one is required
@@ -139,6 +141,48 @@ directory — a user who launches from a desktop entry has a working directory y
 did not choose.
 
 ## windows
+
+### Console or GUI
+
+A PE records in its optional header which environment it wants, and the Windows
+loader honours it: a `console` image gets a console window attached to the
+process, a `gui` image does not. For a graphical application this is the
+difference between launching cleanly and launching with an empty black console
+sitting behind your window.
+
+The default is `console`. A graphical application says so:
+
+```toml
+[artifact.game]
+kind    = "bin"
+entry   = "main.mach"
+out     = "bin/game.exe"
+targets = ["windows-x86_64"]
+link    = ["kernel32"]
+need    = []
+subsystem = "gui"
+```
+
+`--subsystem console|gui` overrides the key for one build. Either way, the header
+is where you confirm what you got:
+
+```
+$ objdump -p out/windows-x86_64/release/bin/game.exe | grep "^Subsystem"
+Subsystem		00000002	(Windows GUI)
+```
+
+Omitting the key leaves the output byte-identical to a build from before the key
+existed, and the key is **inert on every other target** rather than an error — a
+linux build with `subsystem = "gui"` set produces a byte-identical ELF, because
+only the PE writer reads it. One manifest therefore describes every platform
+without splitting into a per-OS file. [manifest.md](manifest.md#subsystem--the-windows-consolegui-selector)
+and [cli.md](cli.md#mach-build) carry the full rules.
+
+This is a packaging decision, not a code one — it changes nothing the program
+does, only what Windows hands it at startup. Note the consequence for a `gui`
+image: it starts with no console attached, so anything the program writes to
+stdout goes nowhere by default. A graphical application that also wants
+diagnostics should write them to a file rather than assume a stream is there.
 
 ### DLLs beside the exe
 
@@ -544,9 +588,44 @@ the easy answer here; a per-target gcc cross-toolchain works equally well. What
 you cannot do is skip the question. **This is the one part of cross-building
 mach does not do for you**, and it applies to every dependency that vendors C.
 
-C that includes system headers needs those headers too, which is a larger
-undertaking than a target triple — a windows SDK or a macOS SDK, per target.
-Self-contained C (no system includes) needs only the compiler.
+Note what the script above is getting away with: `qz.c` includes no system
+headers, so a target triple is the whole story. C that includes system headers
+needs those headers too, which is a different order of problem — a Windows SDK or
+a macOS SDK, per target.
+
+### The darwin limit: vendored C builds on macOS
+
+**A darwin build that vendors C, or that touches any Apple framework, has to run
+on a macOS machine.** This is the single most surprising constraint in planning a
+release pipeline, so it is worth stating without hedging.
+
+The macOS SDK — its headers, and the frameworks a real application links against
+(Cocoa, Metal, CoreAudio) — is licensed for use on Apple hardware and is not
+redistributable. You cannot lawfully stage it on a linux builder, which means no
+amount of toolchain work makes this leg cross-buildable. It is not awkward, and
+it is not a gap in mach waiting to be closed; it is a licensing boundary, and the
+fix is a macOS runner.
+
+What still cross-builds from linux, and what does not:
+
+| Darwin build | Cross-buildable from linux? |
+|---|---|
+| pure Mach, no external link inputs | **yes** — mach emits and links Mach-O itself |
+| vendored C with no system includes | yes, with a clang darwin triple (the script above) |
+| vendored C that includes SDK headers | **no** — needs the macOS SDK |
+| anything linking an Apple framework | **no** — needs the frameworks |
+
+So the split is not linux-versus-macOS for the whole release; it is per leg. Mach
+itself is the worked example: its CI cross-builds a darwin *seed* on an
+`ubuntu-latest` runner — pure Mach, so nothing of Apple's is involved — and then
+does the real fixpoint build on `macos-15` and `macos-15-intel` runners (see
+`.github/workflows/darwin-lane.yml`).
+
+Plan the pipeline accordingly. Linux and windows come off one linux host; darwin
+gets its own macOS job the moment a framework or a vendored C dependency enters
+the picture. Signing is a separate question and does *not* force the same
+choice — `rcodesign` runs from linux, so a macOS build job can hand its bundle to
+a linux signing step if that is how your CI is shaped.
 
 ### Mach-O prefixes C symbols
 
