@@ -109,9 +109,9 @@ is what makes the dependency portable across distributions: every distribution
 that ships an ABI-6 X11 satisfies it.
 
 Note that still no rpath is emitted. `libX11.so.6` lives in the system library
-path, which is exactly where the loader looks first without being told. An rpath
-is only interesting for a library you ship yourself in a non-standard place —
-which, on this route, you are not doing.
+path, which the loader searches by default. An rpath is only interesting for a
+library you ship yourself in a place the loader would not otherwise look — which,
+on this route, you are not doing.
 
 The rule of thumb: **vendor what you compiled, borrow what the desktop owns.**
 Everything you built from source goes in the binary; anything that brokers access
@@ -155,9 +155,12 @@ $ objdump -p out/windows-x86_64/release/bin/demo.exe | grep "DLL Name"
 ```
 
 The Windows loader resolves that basename at load time, and the directory
-containing the executable is the first place it looks. So a DLL sitting next to
-the `.exe` wins over any other copy on the system, which is what you want for a
-library you shipped, and is the whole mechanism — there is nothing to configure.
+containing the executable is the first directory it searches. So a DLL sitting
+next to the `.exe` wins over any other copy on the system, which is what you want
+for a library you shipped, and is the whole mechanism — there is nothing to
+configure. (The protected system libraries, `kernel32.dll` among them, are
+resolved from the system directory regardless; you cannot shadow those, and
+should not want to.)
 
 A consequence worth knowing: because only the name is recorded, **the DLL does
 not need to exist when you link.** `render.dll` above exists nowhere on the build
@@ -369,12 +372,12 @@ Notarization is asynchronous and can take anywhere from seconds to much longer;
 `rcodesign notary-list`, `notary-wait`, and `notary-log` inspect a submission
 that was interrupted or that failed.
 
-> These four commands are a recipe, not a verified transcript. Signing requires a
-> Developer ID certificate and notarization requires an App Store Connect key, so
-> unlike everything else on this page they cannot be exercised from a
-> credential-less build host. Flags are quoted against `rcodesign` 0.29's
-> documentation. Re-check them against `rcodesign <command> --help` before you
-> depend on them.
+> The `rcodesign` commands in this section are a recipe, not a verified
+> transcript. Signing requires a Developer ID certificate and notarization an App
+> Store Connect key, so unlike everything else on this page they cannot be
+> exercised from a credential-less build host. Their flags are quoted against
+> `rcodesign` 0.29's documentation; re-check them with `rcodesign <command>
+> --help` before you depend on them.
 
 Zip the bundle **after** signing and stapling. Signing rewrites files inside the
 bundle, so an archive made first ships an unsigned copy.
