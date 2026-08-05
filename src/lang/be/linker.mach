@@ -468,8 +468,11 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     val pie: bool = (mode == LINK_EXE) && (target_requires_pie(tgt) || pie_opt_in);
     # a dynamic link is requested when shared dependencies are present or the image
     # is position-independent, and the output is an executable; libraries/
-    # relocatables ignore dependencies.
-    val dynamic: bool = (mode == LINK_EXE) && (dynlib_count > 0 || pie);
+    # relocatables ignore dependencies. an import library brings its dependencies in
+    # through its members rather than the link inputs, so a declared import counts
+    # the same as a shared-library input here (#2525).
+    val dynamic: bool = (mode == LINK_EXE)
+        && (dynlib_count > 0 || pie || has_declared_imports(modules, module_count));
     # both a PIE executable and a shared object need a position-independent layout
     # (based a page above the OS base, with a base-relocation set collected during
     # patching).
@@ -880,6 +883,8 @@ fun grow_modules(alloc: *A.Allocator, modules: **of.ObjectImage, count: *u32, ca
     slot.symbol_count  = 0;
     slot.relocations   = nil;
     slot.reloc_count   = 0;
+    slot.imports       = nil;
+    slot.import_count  = 0;
 
     @count = old + 1;
     ret R.ok[u32, str](old);
@@ -3322,7 +3327,11 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
     # Emit each canonical loader dependency once even when several logical names
     # alias it. Attribution below maps every alias back to this compact index.
     val explicit_libs: u32 = unique_dynlib_count(dynlibs, dynlib_count);
-    val total_libs: u32 = explicit_libs + implicit;
+    # an import library names its DLLs in its members rather than as link inputs, so
+    # a DLL only a declared import mentions still becomes a dependency (#2525)
+    val declared_libs: u32 =
+        declared_library_count(modules, module_count, dynlibs, dynlib_count, implicit_ptr);
+    val total_libs: u32 = explicit_libs + implicit + declared_libs;
     if (total_libs > 0) {
         val lr: R.Result[*of.DynLib, str] = A.zallocate[of.DynLib](alloc, total_libs::usize);
         if (R.is_err[*of.DynLib, str](lr)) { ret R.err[bool, str](R.unwrap_err[*of.DynLib, str](lr)); }
@@ -3354,7 +3363,48 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             dyn.info.libs[explicit_libs].soname = implicit_soname;
             dyn.info.libs[explicit_libs].rpath  = intern.STR_NIL;
         }
+        # the declared-import DLLs, appended after the inputs so an explicitly linked
+        # dependency keeps its index. the loader name is the record's own spelling and
+        # doubles as the logical name, since no manifest named it.
+        var dw: u32 = explicit_libs + implicit;
+        var dm: u32 = 0;
+        for (dm < module_count) {
+            var di: u32 = 0;
+            for (di < modules[dm].import_count) {
+                val lib: intern.StrId = modules[dm].imports[di].library;
+                if (!dynlib_name_present(dynlibs, dynlib_count, implicit_ptr, lib)
+                    && !emitted_lib_present(dyn.info.libs, dw, lib)) {
+                    dyn.info.libs[dw].name   = lib;
+                    dyn.info.libs[dw].soname = lib;
+                    dyn.info.libs[dw].rpath  = intern.STR_NIL;
+                    dw = dw + 1;
+                }
+                di = di + 1;
+            }
+            dm = dm + 1;
+        }
         dyn.info.lib_count = total_libs;
+    }
+
+    # an import record is authoritative for this link without becoming session
+    # state: a project may build several artifacts from different import libraries.
+    # validate any source/manifest attribution against the record's canonical loader
+    # identity, accepting a logical alias of that same dependency.
+    var am: u32 = 0;
+    for (am < module_count) {
+        var ai: u32 = 0;
+        for (ai < modules[am].import_count) {
+            val d: *of.ImportDecl = ?modules[am].imports[ai];
+            val prev: O.Option[intern.StrId] = session.import_library(s, d.symbol);
+            if (O.is_some[intern.StrId](prev)
+                && !declared_attribution_matches(dynlibs, dynlib_count, implicit_ptr,
+                    O.unwrap[intern.StrId](prev), d.library)) {
+                ret R.err[bool, str](declared_conflict_message(
+                    s, d.symbol, O.unwrap[intern.StrId](prev), d.library));
+            }
+            ai = ai + 1;
+        }
+        am = am + 1;
     }
 
     dyn.import_map = map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
@@ -3401,17 +3451,26 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
 
             val idx: u32 = dyn.info.import_count;
             dyn.info.imports[idx].symbol    = sym.name;
+            val decl: *of.ImportDecl = declared_import_for(modules, module_count, sym.name);
             # pin the import to the library its `#[library]` attribution named, when
             # present. a directive naming a library not among this link's
             # dependencies is a hard error. an unattributed import stays DYNLIB_ANY
             # on a flat-namespace format (ELF), but is a hard error on a two-level
             # namespace (PE, Mach-O) where the image must name a providing library
-            # per import.
-            val lib_opt: O.Option[intern.StrId] = session.import_library(s, sym.name);
+            # per import. a short import declaration overrides an equivalent
+            # source/manifest alias with its exact loader spelling for this link.
+            var lib_opt: O.Option[intern.StrId] = session.import_library(s, sym.name);
+            if (decl != nil) { lib_opt = O.some[intern.StrId](decl.library); }
             if (O.is_some[intern.StrId](lib_opt)) {
                 val want: intern.StrId = O.unwrap[intern.StrId](lib_opt);
-                val li_opt: O.Option[u32] =
+                var li_opt: O.Option[u32] =
                     dynlib_index_of(dynlibs, dynlib_count, implicit_ptr, want);
+                # a library named only by an import library is not among the inputs,
+                # so it is found in the emitted set the declared appends extended
+                if (!O.is_some[u32](li_opt)) {
+                    li_opt = emitted_lib_index(dyn.info.libs, explicit_libs + implicit,
+                                               dyn.info.lib_count, want);
+                }
                 if (!O.is_some[u32](li_opt)) { ret R.err[bool, str](pinned_lib_message(s, sym.name, want)); }
                 dyn.info.imports[idx].lib_index = O.unwrap[u32](li_opt);
             }
@@ -3428,6 +3487,16 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             dyn.info.imports[idx].is_func   =
                 ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0)
                 || has_call_reloc(modules, module_count, sym.name, sec_base, atoms);
+            # short import records also carry the loader's hint or ordinal. Keep
+            # that binding metadata beside the source symbol so the PE writer can
+            # emit an ordinal thunk instead of silently changing it to by-name.
+            dyn.info.imports[idx].ordinal = 0;
+            dyn.info.imports[idx].by_ordinal = false;
+            if (decl != nil) {
+                dyn.info.imports[idx].symbol = decl.import_name;
+                dyn.info.imports[idx].ordinal = decl.ordinal;
+                dyn.info.imports[idx].by_ordinal = !decl.by_name;
+            }
             val ins: R.Result[bool, str] = map.insert[intern.StrId, u32](?dyn.import_map, sym.name, idx);
             if (R.is_err[bool, str](ins)) { ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
             dyn.info.import_count = idx + 1;
@@ -3555,6 +3624,145 @@ fun dynlib_soname_present(dynlibs: *of.DynLib, count: u32,
         i = i + 1;
     }
     ret false;
+}
+
+# whether any input image declares an import, i.e. an import library member was
+# among the link inputs. the dependency it names makes the link dynamic even when
+# no shared library was passed as an input
+fun has_declared_imports(modules: *of.ObjectImage, module_count: u32) bool {
+    var m: u32 = 0;
+    for (m < module_count) {
+        if (modules[m].import_count > 0) { ret true; }
+        m = m + 1;
+    }
+    ret false;
+}
+
+# the short-import declaration for `symbol`, or nil when the import came from
+# source/manifest attribution alone. Conflicting libraries were rejected before
+# dynamic-plan construction, so the first matching declaration is authoritative.
+fun declared_import_for(modules: *of.ObjectImage, module_count: u32,
+                        symbol: intern.StrId) *of.ImportDecl {
+    var m: u32 = 0;
+    for (m < module_count) {
+        var i: u32 = 0;
+        for (i < modules[m].import_count) {
+            if (modules[m].imports[i].symbol == symbol) { ret ?modules[m].imports[i]; }
+            i = i + 1;
+        }
+        m = m + 1;
+    }
+    ret nil;
+}
+
+# whether an existing source/manifest attribution identifies the loader an import
+# record names. an attribution may use either the dependency's logical alias or
+# its loader name; both are equivalent only when they resolve to this exact loader
+fun declared_attribution_matches(dynlibs: *of.DynLib, count: u32,
+                                 implicit: *of.DynLib,
+                                 attributed: intern.StrId, loader: intern.StrId) bool {
+    if (attributed == loader) { ret true; }
+    var i: u32 = 0;
+    for (i < count) {
+        if ((dynlibs[i].name == attributed || dynlibs[i].soname == attributed)
+            && dynlibs[i].soname == loader) { ret true; }
+        i = i + 1;
+    }
+    if (implicit != nil
+        && (implicit.name == attributed || implicit.soname == attributed)
+        && implicit.soname == loader) { ret true; }
+    ret false;
+}
+
+# whether the dependency requirements carry a logical or loader name
+fun dynlib_name_present(dynlibs: *of.DynLib, count: u32,
+                        implicit: *of.DynLib, name: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        if (dynlibs[i].name == name || dynlibs[i].soname == name) { ret true; }
+        i = i + 1;
+    }
+    if (implicit != nil && (implicit.name == name || implicit.soname == name)) { ret true; }
+    ret false;
+}
+
+# whether a loader name is already among the dependencies emitted so far
+fun emitted_lib_present(libs: *of.DynLib, count: u32, name: intern.StrId) bool {
+    var i: u32 = 0;
+    for (i < count) {
+        if (libs[i].soname == name) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the emitted index of a dependency carrying `name`, searching the emitted array
+# from `start`. used for the declared-import range, which the input requirement
+# list does not contain and `dynlib_index_of` therefore cannot find
+fun emitted_lib_index(libs: *of.DynLib, start: u32, count: u32,
+                      name: intern.StrId) O.Option[u32] {
+    if (libs == nil) { ret O.none[u32](); }
+    var i: u32 = start;
+    for (i < count) {
+        if (libs[i].name == name || libs[i].soname == name) { ret O.some[u32](i); }
+        i = i + 1;
+    }
+    ret O.none[u32]();
+}
+
+# number of distinct libraries named only by declared imports - those the link
+# inputs did not already supply. sizing the dependency array exactly, so the count
+# here and the append below must agree on what counts as already present
+fun declared_library_count(modules: *of.ObjectImage, module_count: u32,
+                           dynlibs: *of.DynLib, dynlib_count: u32,
+                           implicit: *of.DynLib) u32 {
+    var n: u32 = 0;
+    var m: u32 = 0;
+    for (m < module_count) {
+        var i: u32 = 0;
+        for (i < modules[m].import_count) {
+            val lib: intern.StrId = modules[m].imports[i].library;
+            if (!dynlib_name_present(dynlibs, dynlib_count, implicit, lib)
+                && !declared_library_seen_before(modules, module_count, m, i, lib)) {
+                n = n + 1;
+            }
+            i = i + 1;
+        }
+        m = m + 1;
+    }
+    ret n;
+}
+
+# whether an earlier declared import already named this library, in the same
+# module-then-index order the append walks
+fun declared_library_seen_before(modules: *of.ObjectImage, module_count: u32,
+                                 upto_m: u32, upto_i: u32, lib: intern.StrId) bool {
+    var m: u32 = 0;
+    for (m <= upto_m && m < module_count) {
+        var i: u32 = 0;
+        var end: u32 = modules[m].import_count;
+        if (m == upto_m) { end = upto_i; }
+        for (i < end) {
+            if (modules[m].imports[i].library == lib) { ret true; }
+            i = i + 1;
+        }
+        m = m + 1;
+    }
+    ret false;
+}
+
+# name the two claimants when an import record disagrees with a source or manifest
+# attribution, so the contradiction is resolved by an edit rather than by order
+fun declared_conflict_message(s: *session.Session, sym: intern.StrId,
+                              had: intern.StrId, decl: intern.StrId) str {
+    val fallback: str = "an import library contradicts an existing library attribution";
+    val n: O.Option[str] = intern.lookup(?s.interner, sym);
+    val a: O.Option[str] = intern.lookup(?s.interner, had);
+    val b: O.Option[str] = intern.lookup(?s.interner, decl);
+    if (!O.is_some[str](n) || !O.is_some[str](a) || !O.is_some[str](b)) { ret fallback; }
+    val p1: str = join3(s, "import '", O.unwrap[str](n), "' is attributed to library '", fallback);
+    val p2: str = join3(s, p1, O.unwrap[str](a), "' but an import library declares it in '", fallback);
+    ret join3(s, p2, O.unwrap[str](b), "'", fallback);
 }
 
 # number of distinct canonical loader dependencies in the requirement list
@@ -4350,6 +4558,8 @@ fun lt_image(s: *session.Session, name: intern.StrId,
     img.symbol_count = symbol_count;
     img.relocations = relocations;
     img.reloc_count = reloc_count;
+    img.imports = nil;
+    img.import_count = 0;
     ret img;
 }
 
@@ -4389,6 +4599,9 @@ test "mach.lang.be.linker.dynlib_index_of:logical_and_loader_names" {
     if (!O.is_some[u32](loader) || O.unwrap[u32](loader) != 0)   { ret 1; }
     if (!O.is_some[u32](other) || O.unwrap[u32](other) != 1)     { ret 1; }
     if (O.is_some[u32](missing) || unique_dynlib_count(?libs[0], 3) != 2) { ret 1; }
+    if (!declared_attribution_matches(?libs[0], 3, nil::*of.DynLib, 41, 73)) { ret 1; }
+    if (!declared_attribution_matches(?libs[0], 3, nil::*of.DynLib, 73, 73)) { ret 1; }
+    if (declared_attribution_matches(?libs[0], 3, nil::*of.DynLib, 41, 74))  { ret 1; }
 
     # a logical name may alias the same loader, but it may not equal another
     # dependency's loader name: that spelling would select two providers.
@@ -4412,6 +4625,67 @@ test "mach.lang.be.linker.dynlib_index_of:logical_and_loader_names" {
     if (!dynlib_identity_collision(?reversed[0], 2, nil::*of.DynLib,
                                    ?first, ?second, ?identity)) { ret 1; }
     if (identity != 73) { ret 1; }
+    ret 0;
+}
+
+# a short-import declaration builds a loader binding without persisting an
+# attribution in the shared session, which may link a later artifact
+test "mach.lang.be.linker.build_dynamic_info:declared_import_is_link_local" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val tr: R.Result[target.Target, str] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+
+    val symbol: intern.StrId = lt_name(?s, "PublicName");
+    val export_name: intern.StrId = lt_name(?s, "ExportName");
+    val library: intern.StrId = lt_name(?s, "demo.dll");
+    if (symbol == intern.STR_NIL || export_name == intern.STR_NIL
+        || library == intern.STR_NIL) { ret 1; }
+
+    var sym: of.Symbol;
+    sym.name = symbol;
+    sym.section = of.SECTION_EXTERNAL;
+    sym.offset = 0;
+    sym.size = 0;
+    sym.flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+              | of.SYM_OBJ_FLAG_FUNCTION;
+    var decl: of.ImportDecl;
+    decl.symbol = symbol;
+    decl.import_name = export_name;
+    decl.library = library;
+    decl.ordinal = 7;
+    decl.by_name = true;
+    decl.is_code = true;
+    var module: of.ObjectImage =
+        lt_image(?s, lt_name(?s, "import-user"), nil::*of.Section, 0,
+                 ?sym, 1, nil::*of.Relocation, 0);
+    module.imports = ?decl;
+    module.import_count = 1;
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val built: R.Result[bool, str] =
+        build_dynamic_info(?s, ?tgt, ?dyn, ?module, 1, ?locs,
+                           nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    if (R.is_err[bool, str](built)) { ret 1; }
+    if (dyn.info.lib_count != 1 || dyn.info.libs[0].soname != library
+        || dyn.info.import_count != 1 || dyn.info.imports[0].symbol != export_name
+        || dyn.info.imports[0].lib_index != 0 || dyn.info.imports[0].ordinal != 7
+        || dyn.info.imports[0].by_ordinal
+        || O.is_some[intern.StrId](session.import_library(?s, symbol))) { ret 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
     ret 0;
 }
 
