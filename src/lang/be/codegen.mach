@@ -632,6 +632,85 @@ fun section_bytes_copy(image: *of.ObjectImage, src: *u8, len: u32) R.Result[*u8,
     ret R.ok[*u8, str](buf);
 }
 
+# add global `g`'s defining symbol, pointing at section `sec_idx`
+#
+# A named user global is given GLOBAL linkage - its name is module-path-mangled
+# and globally unique, so it resolves cross-object without collision (mirroring
+# every defined function). Only a compiler-synthesized anonymous data global
+# (`is_local`, a string / byte-blob literal) stays object-private.
+# ---
+# image:   object image being built
+# g:       the global being defined
+# sec_idx: index of the section holding its bytes
+# sec_len: the symbol's size in bytes
+# ret:     true on success, or an error string
+fun add_global_symbol(image: *of.ObjectImage, g: *ir.Global, sec_idx: u32, sec_len: u32) R.Result[bool, str] {
+    var flags: u32 = of.SYM_OBJ_FLAG_OBJECT;
+    if (!g.is_local) { flags = flags | of.SYM_OBJ_FLAG_GLOBAL; }
+
+    var sym: of.Symbol;
+    sym.name    = g.name;
+    sym.section = sec_idx;
+    sym.offset  = 0;
+    sym.size    = sec_len;
+    sym.flags   = flags;
+
+    val res: R.Result[u32, str] = obj.add_symbol(image, sym);
+    if (R.is_err[u32, str](res)) { ret R.err[bool, str](R.unwrap_err[u32, str](res)); }
+    ret R.ok[bool, str](true);
+}
+
+# the index of a section already packed for an earlier `#[embed]` global whose
+# bytes, length, section name, and kind all match, or -1 when there is none
+#
+# Scans the globals packed before index `upto`, so the match is against sections
+# this loop has already added and the first embed of a given content owns the
+# placement. Content is compared in full rather than by digest: the digest lives
+# in the frontend's cache and the equality that matters here is of the bytes about
+# to be written.
+# ---
+# image:    object image being built
+# irmod:    the IR module being packed
+# upto:     index of the global currently being packed
+# bytes:    its initializer bytes
+# len:      their length
+# sec_name: the interned section name it would use
+# kind:     the section kind it would use
+# ret:      the matching section index, or -1
+fun embed_section_of(image: *of.ObjectImage, irmod: *ir.Module, upto: u32, bytes: *u8, len: u32,
+                     sec_name: intern.StrId, kind: of.SectionKind) i64 {
+    var j: u32 = 0;
+    for (j < upto) {
+        val o: *ir.Global = ?irmod.globals[j];
+        if (!o.is_embed || o.is_extern)               { j = j + 1; cnt; }
+        if (o.init.kind != value.VAL_CONST_BYTES)     { j = j + 1; cnt; }
+        if (o.init.data.bytes.len != len)             { j = j + 1; cnt; }
+        if (o.section != sec_name && o.section != intern.STR_NIL) { j = j + 1; cnt; }
+
+        val si: i64 = section_index_of(image, o.name);
+        if (si < 0)                                   { j = j + 1; cnt; }
+        val sec: *of.Section = ?image.sections[si::u32];
+        if (sec.kind != kind || sec.name != sec_name || sec.len != len) { j = j + 1; cnt; }
+        if (!memory.raw_equal(sec.bytes::ptr, bytes::ptr, len::usize))  { j = j + 1; cnt; }
+        ret si;
+    }
+    ret -1;
+}
+
+# the index of the section the symbol named `name` defines, or -1
+# ---
+# image: object image being built
+# name:  the interned symbol name
+# ret:   the section index, or -1
+fun section_index_of(image: *of.ObjectImage, name: intern.StrId) i64 {
+    var i: u32 = 0;
+    for (i < image.symbol_count) {
+        if (image.symbols[i].name == name) { ret image.symbols[i].section::i64; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
 fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImage,
                  irmod: *ir.Module) R.Result[bool, str] {
     var i: u32 = 0;
@@ -776,6 +855,22 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
             sec_len = type.byte_size(?irmod.types, g.ty, tgt);
         }
 
+        # two `#[embed]` globals naming byte-identical files share one placement
+        # (#2507): the section is emitted once and both symbols point at it. Sound
+        # only for embedded data - a named object's address is otherwise its own,
+        # and merging two ordinary globals would make `?A == ?B` observably true -
+        # so the scan is gated on `is_embed` at both ends.
+        if (g.is_embed && bytes != nil) {
+            val dup: i64 = embed_section_of(image, irmod, i, bytes, sec_len, sec_name, kind);
+            if (dup >= 0) {
+                A.deallocate[u8](image.alloc, bytes, sec_len::usize);
+                val res_alias: R.Result[bool, str] = add_global_symbol(image, g, dup::u32, sec_len);
+                if (R.is_err[bool, str](res_alias)) { ret res_alias; }
+                i = i + 1;
+                cnt;
+            }
+        }
+
         var sec: of.Section;
         sec.name  = sec_name;
         sec.kind  = kind;
@@ -797,25 +892,8 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
         }
         val sec_idx: u32 = R.unwrap_ok[u32, str](res_section);
 
-        # a named user global is given GLOBAL linkage - its name is module-path-
-        # mangled and globally unique, so it resolves cross-object without
-        # collision (mirroring every defined function). only a compiler-
-        # synthesized anonymous data global (`is_local`, a string / byte-blob
-        # literal) stays object-private.
-        var flags: u32 = of.SYM_OBJ_FLAG_OBJECT;
-        if (!g.is_local) { flags = flags | of.SYM_OBJ_FLAG_GLOBAL; }
-
-        var sym: of.Symbol;
-        sym.name    = g.name;
-        sym.section = sec_idx;
-        sym.offset  = 0;
-        sym.size    = sec_len;
-        sym.flags   = flags;
-
-        val res_sym: R.Result[u32, str] = obj.add_symbol(image, sym);
-        if (R.is_err[u32, str](res_sym)) {
-            ret R.err[bool, str](R.unwrap_err[u32, str](res_sym));
-        }
+        val res_sym: R.Result[bool, str] = add_global_symbol(image, g, sec_idx, sec_len);
+        if (R.is_err[bool, str](res_sym)) { ret res_sym; }
 
         # an aggregate constant's pointer leaves (a `str` / address-of-global) are
         # patched at link time: each side-table entry becomes an abs64 relocation
