@@ -115,15 +115,21 @@ rec MergedSection {
     used:  bool;
 }
 
-# resolved location of a symbol: either its final virtual address or a weak
-# fallback name to chase after all real definitions have been collected
+# resolved location of a global symbol: either its final address and owning
+# merged output section, or a weak fallback name to chase after all real
+# definitions have been collected
 # ---
-# vaddr:    final virtual address of a direct definition (unused for a fallback)
-# weak:     true while the current winner is weak (overridable by a strong one)
-# fallback: alternate name for a weak external, or STR_NIL for a real definition
+# vaddr:         final virtual address of the symbol (section base + offset)
+# section_vaddr: final virtual address of the merged output section's first byte
+# merged_index:  merged output section owning the winning definition
+# weak:          true while the current winner is a weak definition (overridable
+#                by a later strong definition; a strong winner errors on another)
+# fallback:      alternate name for a weak external, or STR_NIL for a definition
 rec SymbolLoc {
-    vaddr:    u64;
-    weak:     bool;
+    vaddr:         u64;
+    section_vaddr: u64;
+    merged_index:  u32;
+    weak:          bool;
     fallback: intern.StrId;
 }
 
@@ -737,7 +743,7 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
         val patch_r: R.Result[bool, str] =
             patch_relocations(s, ?out_img, modules, module_count, codegen_count,
                               placements, sec_base, merged_to_out, ?sym_locs,
-                              ?dyn, ?strm, tgt.of.import_address_prefix,
+                              ?dyn, ?strm, tgt.of,
                               tgt.isa, os_base_addr(tgt), ?atoms);
         if (R.is_err[bool, str](patch_r)) {
             free_dynstate(alloc, ?dyn);
@@ -3084,8 +3090,10 @@ fun collect_symbols(s: *session.Session, modules: *of.ObjectImage, module_count:
 
             val is_weak: bool = (sym.flags & of.SYM_OBJ_FLAG_WEAK) != 0;
             var vaddr: u64 = 0;
+            var section_vaddr: u64 = 0;
             if (have_vaddrs) {
                 vaddr = pl.vaddr + atom_live_offset(atoms, flat, sym.offset)::u64;
+                section_vaddr = pl.vaddr - pl.offset::u64;
             }
 
             val existing: R.Result[*SymbolLoc, str] =
@@ -3099,6 +3107,8 @@ fun collect_symbols(s: *session.Session, modules: *of.ObjectImage, module_count:
                 if (is_weak)   { sy = sy + 1; cnt; }
                 if (!cur.weak) { ret R.err[bool, str](dup_message(s, sym.name)); }
                 cur.vaddr = vaddr;
+                cur.section_vaddr = section_vaddr;
+                cur.merged_index = pl.merged_index;
                 cur.weak = false;
                 cur.fallback = intern.STR_NIL;
                 sy = sy + 1;
@@ -3107,6 +3117,8 @@ fun collect_symbols(s: *session.Session, modules: *of.ObjectImage, module_count:
 
             var loc: SymbolLoc;
             loc.vaddr = vaddr;
+            loc.section_vaddr = section_vaddr;
+            loc.merged_index = pl.merged_index;
             loc.weak = is_weak;
             loc.fallback = intern.STR_NIL;
 
@@ -3146,6 +3158,8 @@ fun collect_symbols(s: *session.Session, modules: *of.ObjectImage, module_count:
             if (R.is_err[*SymbolLoc, str](existing)) {
                 var loc: SymbolLoc;
                 loc.vaddr = 0;
+                loc.section_vaddr = 0;
+                loc.merged_index = 0;
                 loc.weak = true;
                 loc.fallback = fallback;
                 val ir: R.Result[bool, str] =
@@ -3352,7 +3366,7 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
 # sym_locs:      the global symbol table, for GLOBAL/extern target resolution
 # dyn:           dynamic-link state; out - collects deferred import fixups
 # strm:          the deduped .debug_str table, for strp remap (inactive to skip)
-# import_address_prefix: active format's slot-reference symbol prefix, or empty
+# format:        active object-format vtable, owning final executable-section layout
 # arch:          active instruction-set vtable, owning the relocation packer
 # image_base:    base virtual address of the linked image
 # ret:           ok(true) on success, or an error string
@@ -3360,14 +3374,14 @@ fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
                      modules: *of.ObjectImage, module_count: u32, codegen_count: u32,
                      placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                      sym_locs: *map.Map[intern.StrId, SymbolLoc],
-                     dyn: *DynState, strm: *StrMerge, import_address_prefix: str,
+                     dyn: *DynState, strm: *StrMerge, format: *of.OfVTable,
                      arch: *isa.IsaVTable,
                      image_base: u64, atoms: *AtomPlan) R.Result[bool, str] {
     var m: u32 = 0;
     for (m < module_count) {
         val pr: R.Result[bool, str] = patch_module_relocations(s, out_img, modules, m,
             placements, sec_base, merged_to_out, sym_locs, dyn, strm,
-            import_address_prefix, arch, image_base, m < codegen_count, atoms);
+            format, arch, image_base, m < codegen_count, atoms);
         if (R.is_err[bool, str](pr)) { ret R.err[bool, str](R.unwrap_err[bool, str](pr)); }
 
         m = m + 1;
@@ -3375,27 +3389,40 @@ fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
     ret R.ok[bool, str](true);
 }
 
-# the final virtual address of module `m`'s object-private symbol `sy`
+# the final location of module `m`'s object-private symbol `sy`
 #
 # A LOCAL target is resolved straight from its own definition: the symbol names
-# its defining section and offset, and the placement of that section carries the
-# vaddr. No name is consulted, so the several `st_name = 0` section symbols a
-# foreign object carries stay distinct (#2520).
+# its defining section and offset, and the placement of that section carries both
+# its virtual address and merged output section. No name is consulted, so the
+# several `st_name = 0` section symbols a foreign object carries stay distinct
+# (#2520).
 # ---
-# modules:    the input image array
-# m:          index of the module owning the symbol
-# sy:         index of the symbol within module `m`
-# placements: per-input-section placement (carries final vaddrs)
-# sec_base:   per-module prefix offset into `placements`
-# atoms:      the dead-atom plan, for the live-offset remap
-# out_va:     out - the symbol's final virtual address, when live
-# ret:        true when the symbol has a live address, false when atom-dropped
-fun local_symbol_vaddr(modules: *of.ObjectImage, m: u32, sy: u32, placements: *Placement,
-                       sec_base: *u32, atoms: *AtomPlan, out_va: *u64) bool {
+# modules:       the input image array
+# m:             index of the module owning the symbol
+# sy:            index of the symbol within module `m`
+# placements:    per-input-section placement (carries final vaddrs)
+# sec_base:      per-module prefix offset into `placements`
+# merged_to_out: per-merged-slot output-section index
+# out_img:       merged image establishing final output-section order
+# format:        active object-format vtable, owning final section layout
+# image_base:    base virtual address used by the executable writer
+# atoms:         the dead-atom plan, for the live-offset remap
+# out:           out - the symbol and owning-section location, when live
+# ret:           true when the symbol has a live location, false when atom-dropped
+fun local_symbol_target(modules: *of.ObjectImage, m: u32, sy: u32,
+                        placements: *Placement, sec_base: *u32, merged_to_out: *u32,
+                        out_img: *of.ObjectImage, format: *of.OfVTable,
+                        image_base: u64, atoms: *AtomPlan,
+                        out: *rel.RelocTarget) bool {
     val sym: *of.Symbol = ?modules[m].symbols[sy];
     val flat: u32 = sec_base[m] + sym.section;
     if (atom_offset_dead(atoms, flat, sym.offset)) { ret false; }
-    @out_va = placements[flat].vaddr + atom_live_offset(atoms, flat, sym.offset)::u64;
+    val pl: *Placement = ?placements[flat];
+    val out_ix: u32 = merged_to_out[pl.merged_index];
+    val section: of.ExecutableSectionLocation = final_section_location_for(
+        format, image_base, out_img, out_ix, pl.vaddr - pl.offset::u64);
+    @out = rel.target(pl.vaddr + atom_live_offset(atoms, flat, sym.offset)::u64,
+                      section.vaddr, section.ordinal);
     ret true;
 }
 
@@ -3414,7 +3441,7 @@ fun local_symbol_vaddr(modules: *of.ObjectImage, m: u32, sy: u32, placements: *P
 # sym_locs:      the global symbol table, for GLOBAL/extern target resolution
 # dyn:           dynamic-link state; out - collects deferred import fixups
 # strm:          the deduped .debug_str table, for strp remap (inactive to skip)
-# import_address_prefix: active format's slot-reference symbol prefix, or empty
+# format:        active object-format vtable, owning import aliases and final sections
 # arch:          active instruction-set vtable, owning the relocation packer
 # image_base:    base virtual address of the linked image
 # codegen_image: true when module `m` is an in-memory compiler image
@@ -3423,7 +3450,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                              modules: *of.ObjectImage, m: u32,
                              placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                              sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState,
-                             strm: *StrMerge, import_address_prefix: str,
+                             strm: *StrMerge, format: *of.OfVTable,
                              arch: *isa.IsaVTable, image_base: u64, codegen_image: bool,
                              atoms: *AtomPlan) R.Result[bool, str] {
     # locate module m's .debug_str section once: a strp relocation is exactly one
@@ -3491,6 +3518,10 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         }
         val target: *of.Symbol = ?modules[m].symbols[r.sym];
         val target_name: intern.StrId = target.name;
+        if (target.section != of.SECTION_EXTERNAL
+            && target.section >= modules[m].section_count) {
+            ret R.err[bool, str](oor_section_message(s, target_name, modules[m].name));
+        }
 
         # a strp into .debug_str: remap it to the string's deduped offset instead of
         # resolving the target's placement. skips the normal apply_one below (#1708).
@@ -3501,13 +3532,15 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
             ri = ri + 1; cnt;
         }
 
-        # locate the target symbol's final virtual address. an object-private target
-        # is resolved straight from its own definition in module `m`. GLOBAL targets
-        # (and undefined externs) resolve by name via sym_locs.
-        var sym_va: u64 = 0;
+        # locate the target symbol and its final output section. an object-private
+        # target resolves straight from its own definition in module `m`. GLOBAL
+        # targets (and undefined externs) resolve the entire winning location by name.
+        var resolved: rel.RelocTarget = rel.target(0, 0, 0);
         if ((target.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0
             && target.section != of.SECTION_EXTERNAL) {
-            if (!local_symbol_vaddr(modules, m, r.sym, placements, sec_base, atoms, ?sym_va)) {
+            if (!local_symbol_target(modules, m, r.sym, placements, sec_base,
+                                     merged_to_out, out_img, format, image_base,
+                                     atoms, ?resolved)) {
                 ret R.err[bool, str](undef_message(s, target_name));
             }
         }
@@ -3521,7 +3554,11 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
             val sl: R.Result[*SymbolLoc, str] =
                 map.get[intern.StrId, SymbolLoc](sym_locs, ?resolved_name);
             if (R.is_ok[*SymbolLoc, str](sl)) {
-                sym_va = R.unwrap_ok[*SymbolLoc, str](sl).vaddr;
+                val loc: *SymbolLoc = R.unwrap_ok[*SymbolLoc, str](sl);
+                val target_out_ix: u32 = merged_to_out[loc.merged_index];
+                val section: of.ExecutableSectionLocation = final_section_location_for(
+                    format, image_base, out_img, target_out_ix, loc.section_vaddr);
+                resolved = rel.target(loc.vaddr, section.vaddr, section.ordinal);
             }
             or {
                 # not defined anywhere: a dynamic import, or a hard error. a
@@ -3531,7 +3568,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                 # unresolved reference - a call against a data import, an absolute
                 # reference to any import - is rejected as undefined.
                 val cn_r: R.Result[ImportName, str] =
-                    canonical_import_name(s, import_address_prefix, resolved_name);
+                    canonical_import_name(s, format.import_address_prefix, resolved_name);
                 if (R.is_err[ImportName, str](cn_r)) {
                     ret R.err[bool, str](R.unwrap_err[ImportName, str](cn_r));
                 }
@@ -3571,7 +3608,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         }
 
         val pr: R.Result[bool, str] =
-            apply_one(s, r.kind, dst, patch_off, out_img.sections[out_ix].len, sym_va,
+            apply_one(s, r.kind, dst, patch_off, out_img.sections[out_ix].len, resolved,
                       r.addend, patch_va, target_name, arch, image_base);
         if (R.is_err[bool, str](pr)) {
             ret R.err[bool, str](R.unwrap_err[bool, str](pr));
@@ -3585,7 +3622,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         if (dyn.info.pie && r.kind == of.RK_ABS64
             && is_loadable_kind(out_img.sections[out_ix].kind)) {
             val brr: R.Result[bool, str] = dynstate_add_base_reloc(s, dyn,
-                segment_index_for(out_img, out_ix), patch_off, sym_va + r.addend::u64);
+                segment_index_for(out_img, out_ix), patch_off, resolved.vaddr + r.addend::u64);
             if (R.is_err[bool, str](brr)) { ret R.err[bool, str](R.unwrap_err[bool, str](brr)); }
         }
 
@@ -3642,8 +3679,8 @@ fun resolve_strp(s: *session.Session, modules: *of.ObjectImage, m: u32, str_sec:
     }
 
     # write the deduped offset as the strp value: RK_ABS32 into a non-loadable section,
-    # so `sym_va` is the debug-section-relative offset itself and the addend is zero.
-    ret apply_one(s, r.kind, dst, patch_off, sec_len, ded_off::u64, 0, patch_va,
+    # so the target address is the debug-section-relative offset and the addend is zero.
+    ret apply_one(s, r.kind, dst, patch_off, sec_len, rel.target(ded_off::u64, 0, 0), 0, patch_va,
                   sym_name, arch, image_base);
 }
 
@@ -4490,6 +4527,39 @@ fun segment_index_for(out_img: *of.ObjectImage, out_ix: u32) u32 {
     ret seg;
 }
 
+# locate a merged loadable section in the final executable container
+#
+# The generic fallback matches writers whose section begins at the load-segment
+# content. A format hook may describe a wider containing section instead: PE's
+# first section can start one header page above ImageBase and contain alignment
+# padding before a more highly aligned first segment. Invalid/non-loadable output
+# sections return ordinal zero so section-number relocations fail loudly.
+# ---
+# format:        active object-format vtable, or nil for the generic mapping
+# image_base:    base virtual address used by the executable writer
+# out_img:       merged image whose sections establish segment order
+# out_ix:        output-section index containing the relocation target
+# content_vaddr: final load-segment content address
+# ret:           final executable section base and one-based ordinal
+fun final_section_location_for(format: *of.OfVTable, image_base: u64,
+                               out_img: *of.ObjectImage, out_ix: u32,
+                               content_vaddr: u64) of.ExecutableSectionLocation {
+    var loc: of.ExecutableSectionLocation;
+    loc.vaddr = content_vaddr;
+    loc.ordinal = 0;
+    if (out_ix >= out_img.section_count || !is_loadable_kind(out_img.sections[out_ix].kind)) {
+        ret loc;
+    }
+
+    val seg_index: u32 = segment_index_for(out_img, out_ix);
+    loc.ordinal = seg_index + 1;
+    if (format != nil && format.executable_section_location != nil) {
+        ret format.executable_section_location::of.ExecutableSectionLocationFn(
+            image_base, content_vaddr, seg_index);
+    }
+    ret loc;
+}
+
 # append an import call-site fixup, growing the array
 # geometrically. the writer redirects each to its import's PLT stub
 # ---
@@ -4612,7 +4682,7 @@ fun dynstate_add_base_reloc(s: *session.Session, dyn: *DynState, seg_index: u32,
 # dst:       the merged section bytes to patch
 # patch_off: byte offset of the patch site within `dst`
 # sec_len:   length of the section `dst` backs, for the bounds check
-# sym_va:    the target symbol's final virtual address
+# target:    target symbol address plus its final output-section base and ordinal
 # addend:    the relocation addend
 # patch_va:  the patch site's own virtual address
 # sym_name:  interned symbol name for the overflow diagnostic (STR_NIL if absent)
@@ -4621,7 +4691,7 @@ fun dynstate_add_base_reloc(s: *session.Session, dyn: *DynState, seg_index: u32,
 # ret:       ok(true) once written, or an overflow/unsupported error
 fun apply_one(s: *session.Session, kind: of.RelocKind,
              dst: *u8, patch_off: u32, sec_len: u32,
-             sym_va: u64, addend: i64, patch_va: u64,
+             target: rel.RelocTarget, addend: i64, patch_va: u64,
              sym_name: intern.StrId, arch: *isa.IsaVTable,
              image_base: u64) R.Result[bool, str] {
     if (!isa.emits_relocations(arch)) {
@@ -4629,7 +4699,7 @@ fun apply_one(s: *session.Session, kind: of.RelocKind,
     }
     val r: R.Result[bool, rel.RelocError] =
         arch.reloc.apply_reloc::rel.ApplyRelocFn(kind, dst, patch_off, sec_len,
-                                                 sym_va, addend, patch_va, image_base);
+                                                 target, addend, patch_va, image_base);
     if (!R.is_err[bool, rel.RelocError](r)) { ret R.ok[bool, str](true); }
     if (R.unwrap_err[bool, rel.RelocError](r) == rel.RELOC_OVERFLOW) {
         ret R.err[bool, str](overflow_message(s, kind, sym_name));
@@ -6524,6 +6594,90 @@ test "mach.lang.be.linker.collect_symbols:weak_strong_order_independent" {
     # strong-then-strong: still a multiple-definition error.
     val r3: R.Result[u64, str] = lt_link(?s, nm, ?strong, ?strong2);
     if (!R.is_err[u64, str](r3)) { ret 1; }
+    ret 0;
+}
+
+# a strong global that replaces a weak definition replaces its section metadata
+# with its address, so section-relative relocations cannot retain the loser's section
+test "mach.lang.be.linker.collect_symbols:winning_section_metadata" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    val name: intern.StrId = lt_name(?s, "section_winner");
+
+    var weak: of.Symbol;
+    weak.name = name; weak.section = 0; weak.offset = 0x20; weak.size = 0;
+    weak.flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK;
+    var strong: of.Symbol;
+    strong.name = name; strong.section = 0; strong.offset = 0x30; strong.size = 0;
+    strong.flags = of.SYM_OBJ_FLAG_GLOBAL;
+
+    var modules: [2]of.ObjectImage;
+    modules[0] = lt_image(?s, lt_name(?s, "weak"), nil::*of.Section, 1,
+                          ?weak, 1, nil::*of.Relocation, 0);
+    modules[1] = lt_image(?s, lt_name(?s, "strong"), nil::*of.Section, 1,
+                          ?strong, 1, nil::*of.Relocation, 0);
+    var placements: [2]Placement;
+    placements[0].vaddr = 0x1100; placements[0].offset = 0x100; placements[0].merged_index = 0;
+    placements[1].vaddr = 0x2400; placements[1].offset = 0x400; placements[1].merged_index = 1;
+    var sec_base: [2]u32;
+    sec_base[0] = 0; sec_base[1] = 1;
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+
+    val cr: R.Result[bool, str] = collect_symbols(?s, ?modules[0], 2,
+        ?placements[0], ?sec_base[0], ?locs, true, nil::*AtomPlan);
+    if (R.is_err[bool, str](cr)) { map.dnit[intern.StrId, SymbolLoc](?locs); ret 1; }
+    val lr: R.Result[*SymbolLoc, str] = map.get[intern.StrId, SymbolLoc](?locs, ?name);
+    if (R.is_err[*SymbolLoc, str](lr)) { map.dnit[intern.StrId, SymbolLoc](?locs); ret 1; }
+    val loc: *SymbolLoc = R.unwrap_ok[*SymbolLoc, str](lr);
+    if (loc.vaddr != 0x2430 || loc.section_vaddr != 0x2000
+        || loc.merged_index != 1 || loc.weak) {
+        map.dnit[intern.StrId, SymbolLoc](?locs);
+        ret 1;
+    }
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    ret 0;
+}
+
+# a local/section symbol keeps its owning module placement and maps across skipped
+# non-loadable sections to the writer's one-based load-segment ordinal
+test "mach.lang.be.linker.local_symbol_target:owning_section" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var sym: of.Symbol;
+    sym.name = lt_name(?s, ".data"); sym.section = 0; sym.offset = 0x34;
+    sym.size = 0; sym.flags = 0;
+    var module: of.ObjectImage = lt_image(?s, lt_name(?s, "local"),
+        nil::*of.Section, 1, ?sym, 1, nil::*of.Relocation, 0);
+
+    var placement: [1]Placement;
+    placement[0].vaddr = 0x2200;
+    placement[0].offset = 0x200;
+    placement[0].merged_index = 1;
+    var sec_base: [1]u32;
+    sec_base[0] = 0;
+    var merged_to_out: [2]u32;
+    merged_to_out[0] = 0; merged_to_out[1] = 2;
+    var out_sections: [3]of.Section;
+    out_sections[0].kind = of.SK_TEXT;
+    out_sections[1].kind = of.SK_DEBUG;
+    out_sections[2].kind = of.SK_DATA;
+    var out_img: of.ObjectImage;
+    out_img.sections = ?out_sections[0]; out_img.section_count = 3;
+
+    var resolved: rel.RelocTarget;
+    if (!local_symbol_target(?module, 0, 0, ?placement[0], ?sec_base[0],
+                             ?merged_to_out[0], ?out_img, nil::*of.OfVTable,
+                             0, nil::*AtomPlan, ?resolved)) { ret 1; }
+    if (resolved.vaddr != 0x2234 || resolved.section_vaddr != 0x2000
+        || resolved.section_index != 2) { ret 1; }
     ret 0;
 }
 
