@@ -5687,3 +5687,288 @@ test "mach.lang.target.of.coff.coff_serialize_image:bigobj_round_trip" {
     A.deallocate[of.Section](?alloc, secs, n::usize);
     ret bad;
 }
+
+# a two-image ICO container in `buf`: the 6-byte ICONDIR, two 16-byte directory
+# entries, then the two image payloads. returns the container length
+fun ts_build_ico(buf: *u8) usize {
+    val n0:   usize = 8;
+    val n1:   usize = 12;
+    val off0: usize = 6 + 32;
+    val off1: usize = off0 + n0;
+
+    bin.write_u16_le(buf, 0, 0);
+    bin.write_u16_le(buf, 2, 1);
+    bin.write_u16_le(buf, 4, 2);
+
+    buf[6] = 16; buf[7] = 16; buf[8] = 0; buf[9] = 0;
+    bin.write_u16_le(buf, 10, 1);
+    bin.write_u16_le(buf, 12, 32);
+    bin.write_u32_le(buf, 14, n0::u32);
+    bin.write_u32_le(buf, 18, off0::u32);
+
+    buf[22] = 32; buf[23] = 32; buf[24] = 0; buf[25] = 0;
+    bin.write_u16_le(buf, 26, 1);
+    bin.write_u16_le(buf, 28, 32);
+    bin.write_u32_le(buf, 30, n1::u32);
+    bin.write_u32_le(buf, 34, off1::u32);
+
+    var k: usize = 0;
+    for (k < n0) { buf[off0 + k] = (0xA0 + k)::u8; k = k + 1; }
+    k = 0;
+    for (k < n1) { buf[off1 + k] = (0x50 + k)::u8; k = k + 1; }
+    ret off1 + n1;
+}
+
+# locate a section by name in the emitted section table, reporting its RVA,
+# virtual size, file offset, and characteristics
+fun ts_find_section(d: *u8, sec_table: usize, nsec: u32, want: str,
+                    rva: *u32, vsize: *u32, rawptr: *u32, chars: *u32) bool {
+    var s: u32 = 0;
+    for (s < nsec) {
+        val sh: usize = sec_table + s::usize * SECTION_HEADER_SIZE;
+        var match: bool = true;
+        var j: usize = 0;
+        for (j < 8) {
+            var w: u8 = 0;
+            if (j < str_len(want)) { w = want[j]; }
+            if (d[sh + j] != w) { match = false; }
+            j = j + 1;
+        }
+        if (match) {
+            @vsize  = bin.read_u32_le(d, sh + 8);
+            @rva    = bin.read_u32_le(d, sh + 12);
+            @rawptr = bin.read_u32_le(d, sh + 20);
+            @chars  = bin.read_u32_le(d, sh + 36);
+            ret true;
+        }
+        s = s + 1;
+    }
+    ret false;
+}
+
+# resolve one (type, name, language) leaf in the `.rsrc` tree based at `base`,
+# reporting its data entry's RVA and byte length. false when absent, or when a
+# level carries the wrong subdirectory flag
+fun ts_rsrc_leaf(d: *u8, base: usize, tid: u32, nid: u32, lid: u32,
+                 out_rva: *u32, out_size: *u32) bool {
+    val sub: u32 = 0x80000000;
+    val mask: u32 = 0x7FFFFFFF;
+
+    val nt: u32 = bin.read_u16_le(d, base + 14)::u32;
+    var a: u32 = 0;
+    for (a < nt) {
+        val ea: usize = base + 16 + a::usize * 8;
+        if (bin.read_u32_le(d, ea) == tid) {
+            val toff: u32 = bin.read_u32_le(d, ea + 4);
+            if ((toff & sub) == 0) { ret false; }
+            val tb: usize = base + (toff & mask)::usize;
+            val nn: u32 = bin.read_u16_le(d, tb + 14)::u32;
+            var b: u32 = 0;
+            for (b < nn) {
+                val eb: usize = tb + 16 + b::usize * 8;
+                if (bin.read_u32_le(d, eb) == nid) {
+                    val noff: u32 = bin.read_u32_le(d, eb + 4);
+                    if ((noff & sub) == 0) { ret false; }
+                    val nb: usize = base + (noff & mask)::usize;
+                    val nl: u32 = bin.read_u16_le(d, nb + 14)::u32;
+                    var c: u32 = 0;
+                    for (c < nl) {
+                        val ec: usize = nb + 16 + c::usize * 8;
+                        if (bin.read_u32_le(d, ec) == lid) {
+                            val doff: u32 = bin.read_u32_le(d, ec + 4);
+                            if ((doff & sub) != 0) { ret false; }
+                            val db: usize = base + doff::usize;
+                            @out_rva  = bin.read_u32_le(d, db);
+                            @out_size = bin.read_u32_le(d, db + 4);
+                            ret true;
+                        }
+                        c = c + 1;
+                    }
+                    ret false;
+                }
+                b = b + 1;
+            }
+            ret false;
+        }
+        a = a + 1;
+    }
+    ret false;
+}
+
+# coff_emit_exec frames the artifact's resource inputs into a `.rsrc` section and
+# points the RESOURCE data directory at it: the ICO decomposes into one RT_ICON
+# leaf per embedded image plus an RT_GROUP_ICON directory, the project version
+# becomes an RT_VERSION block, and the application manifest is carried through
+# byte for byte. falsifies a writer that mislays the tree, truncates a payload,
+# writes a section-relative offset where the format wants an image RVA, or lets
+# the manifest bytes drift
+fun ts_pe_rsrc_tree() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x90; k = k + 1; }
+    val base:  u64 = 0x140001000;
+    val entry: u64 = base;
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = base; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text_bytes[0];
+
+    var ico: [64]u8;
+    val ico_len: usize = ts_build_ico(?ico[0]);
+
+    val man: str = "<assembly manifestVersion=\"1.0\"/>";
+    var ri: of.ResourceInfo;
+    ri.icon             = ?ico[0];
+    ri.icon_len         = ico_len;
+    ri.app_manifest     = man::*u8;
+    ri.app_manifest_len = str_len(man);
+    ri.version          = "9.4.2";
+    ri.product          = "coffrsrc";
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_rsrc");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+
+    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1, 4096, entry,
+                                                 nil, 0, nil::*of.Section, 0, fs.temp_path(?tf)::*u8,
+                                                 "coffrsrc"::*u8, ?ri);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+    val d: *u8 = buf.data;
+
+    val pe_off:   usize = bin.read_u32_le(d, 0x3C)::usize;
+    val ch:       usize = pe_off + 4;
+    val nsec:     u32   = bin.read_u16_le(d, ch + 2)::u32;
+    val opt_size: usize = bin.read_u16_le(d, ch + 16)::usize;
+    val oh:       usize = ch + 20;
+    val sec_table: usize = oh + opt_size;
+
+    var rva: u32 = 0; var vsize: u32 = 0; var rawptr: u32 = 0; var chars: u32 = 0;
+    if (!ts_find_section(d, sec_table, nsec, ".rsrc", ?rva, ?vsize, ?rawptr, ?chars)) { ret 1; }
+    if (chars != (IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ)) { ret 1; }
+
+    # the RESOURCE data directory must name exactly the section just found.
+    val dd: usize = oh + 112;
+    if (bin.read_u32_le(d, dd + IMAGE_DIRECTORY_ENTRY_RESOURCE::usize * DATA_DIR_SIZE) != rva)         { ret 1; }
+    if (bin.read_u32_le(d, dd + IMAGE_DIRECTORY_ENTRY_RESOURCE::usize * DATA_DIR_SIZE + 4) != vsize)   { ret 1; }
+
+    val rb_base: usize = rawptr::usize;
+    # four resource types: RT_ICON, RT_GROUP_ICON, RT_VERSION, RT_MANIFEST.
+    if (bin.read_u16_le(d, rb_base + 12) != 0) { ret 1; }
+    if (bin.read_u16_le(d, rb_base + 14) != 4) { ret 1; }
+
+    var lr: u32 = 0; var ls: u32 = 0;
+
+    # each RT_ICON leaf carries its embedded image verbatim, keyed 1..n.
+    var e: usize = 0;
+    for (e < 2) {
+        if (!ts_rsrc_leaf(d, rb_base, rs.RT_ICON, (e + 1)::u32, 0, ?lr, ?ls)) { ret 1; }
+        val want_len: u32 = bin.read_u32_le(?ico[0], 6 + e * 16 + 8);
+        val want_off: u32 = bin.read_u32_le(?ico[0], 6 + e * 16 + 12);
+        if (ls != want_len) { ret 1; }
+        # the data entry's OffsetToData is an image RVA, not a section offset.
+        if (lr < rva || lr::usize - rva::usize + ls::usize > vsize::usize) { ret 1; }
+        val at: usize = rb_base + (lr - rva)::usize;
+        var j: usize = 0;
+        for (j < ls::usize) {
+            if (d[at + j] != ico[want_off::usize + j]) { ret 1; }
+            j = j + 1;
+        }
+        e = e + 1;
+    }
+
+    # the group directory names both icons: 6-byte header then 14 bytes per entry.
+    if (!ts_rsrc_leaf(d, rb_base, rs.RT_GROUP_ICON, 1, 0, ?lr, ?ls)) { ret 1; }
+    if (ls::usize != 6 + 2 * 14) { ret 1; }
+    val gat: usize = rb_base + (lr - rva)::usize;
+    if (bin.read_u16_le(d, gat + 4) != 2) { ret 1; }
+    if (bin.read_u16_le(d, gat + 6 + 12) != 1)      { ret 1; }
+    if (bin.read_u16_le(d, gat + 6 + 14 + 12) != 2) { ret 1; }
+
+    # the version block's fixed header follows the root node's key and padding.
+    if (!ts_rsrc_leaf(d, rb_base, rs.RT_VERSION, 1, 0, ?lr, ?ls)) { ret 1; }
+    val vat: usize = rb_base + (lr - rva)::usize;
+    if (bin.read_u16_le(d, vat) != ls::u16)          { ret 1; }
+    if (bin.read_u32_le(d, vat + 40) != 0xFEEF04BD)  { ret 1; }
+    if (bin.read_u32_le(d, vat + 48) != 0x00090004)  { ret 1; }
+    if (bin.read_u32_le(d, vat + 52) != 0x00020000)  { ret 1; }
+
+    # the application manifest is carried through untouched.
+    if (!ts_rsrc_leaf(d, rb_base, rs.RT_MANIFEST, 1, 0, ?lr, ?ls)) { ret 1; }
+    if (ls::usize != str_len(man)) { ret 1; }
+    val mat: usize = rb_base + (lr - rva)::usize;
+    var m: usize = 0;
+    for (m < str_len(man)) {
+        if (d[mat + m] != man[m]) { ret 1; }
+        m = m + 1;
+    }
+    ret 0;
+}
+
+test "mach.lang.target.of.coff.coff_emit_exec:rsrc_tree" {
+    ret ts_pe_rsrc_tree()::i32;
+}
+
+# an artifact that declares no resource inputs emits no `.rsrc` section and
+# leaves the RESOURCE data directory empty, so the image is the one mach wrote
+# before resource emission existed. this is the in-CI form of the byte-identity
+# guarantee; falsifies a writer that emits an empty section or a stale directory
+# entry when the plan is absent
+fun ts_pe_no_rsrc() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x90; k = k + 1; }
+    val base:  u64 = 0x140001000;
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = base; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text_bytes[0];
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_nrsrc");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+
+    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1, 4096, base,
+                                                 nil, 0, nil::*of.Section, 0, fs.temp_path(?tf)::*u8,
+                                                 "coffnorsrc"::*u8, nil);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+    val d: *u8 = buf.data;
+
+    val pe_off:   usize = bin.read_u32_le(d, 0x3C)::usize;
+    val ch:       usize = pe_off + 4;
+    val nsec:     u32   = bin.read_u16_le(d, ch + 2)::u32;
+    val opt_size: usize = bin.read_u16_le(d, ch + 16)::usize;
+    val oh:       usize = ch + 20;
+
+    var rva: u32 = 0; var vsize: u32 = 0; var rawptr: u32 = 0; var chars: u32 = 0;
+    if (ts_find_section(d, oh + opt_size, nsec, ".rsrc", ?rva, ?vsize, ?rawptr, ?chars)) { ret 1; }
+    if (nsec != 1) { ret 1; }
+
+    val dd: usize = oh + 112;
+    if (bin.read_u32_le(d, dd + IMAGE_DIRECTORY_ENTRY_RESOURCE::usize * DATA_DIR_SIZE) != 0)     { ret 1; }
+    if (bin.read_u32_le(d, dd + IMAGE_DIRECTORY_ENTRY_RESOURCE::usize * DATA_DIR_SIZE + 4) != 0) { ret 1; }
+    ret 0;
+}
+
+test "mach.lang.target.of.coff.coff_emit_exec:no_rsrc_when_unset" {
+    ret ts_pe_no_rsrc()::i32;
+}
