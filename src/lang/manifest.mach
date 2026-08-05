@@ -1197,6 +1197,7 @@ pub fun dnit(m: *Manifest, alloc: *A.Allocator) {
             free_strarr(alloc, l.os, l.os_count);
             free_strarr(alloc, l.isa, l.isa_count);
             free_strarr(alloc, l.abi, l.abi_count);
+            free_strarr(alloc, l.symbols, l.symbol_count);
             i = i + 1;
         }
         A.deallocate[LinkDef](alloc, m.links, m.link_count::usize);
@@ -1221,6 +1222,26 @@ pub fun dnit(m: *Manifest, alloc: *A.Allocator) {
 fun free_strarr(alloc: *A.Allocator, items: *intern.StrId, count: u32) {
     if (items != nil && count > 0) {
         A.deallocate[intern.StrId](alloc, items, count::usize);
+    }
+}
+
+# release the claim arrays `link_requirement` copied onto `alloc` for the first
+# `count` populated requirements; the caller still owns the requirement array
+#
+# `count` is the populated prefix, not the allocation's capacity: a partly filled
+# buffer would otherwise read claim pointers out of uninitialized entries.
+# ---
+# alloc: allocator the claim copies were made on
+# items: the requirement array, or nil
+# count: number of populated requirements to release
+pub fun free_link_claims(alloc: *A.Allocator, items: *LinkRequirement, count: u32) {
+    if (items == nil) { ret; }
+    var i: u32 = 0;
+    for (i < count) {
+        free_strarr(alloc, items[i].symbols, items[i].symbol_count);
+        items[i].symbols      = nil;
+        items[i].symbol_count = 0;
+        i = i + 1;
     }
 }
 
@@ -1530,8 +1551,14 @@ fun join_path_canonical(alloc: *A.Allocator, a: str, b: str) str {
 }
 
 # resolve a matched link entry without discarding its declared source semantics
+#
+# The requirement owns its claim array rather than borrowing the entry's. A
+# requirement outlives the manifest it came from on the export cascade, which
+# tears down the dependency manifests before the link reads the claims, so a
+# borrow would dangle. Release it with `free_link_claims` when the requirement
+# is dropped.
 # ---
-# alloc:    allocator used while expanding a local path
+# alloc:    allocator used while expanding a local path and owning the claim copy
 # itn:      interner owning the requirement text and stable library name
 # l:        target-matched manifest entry
 # proj_out: expanded project output root for a local path
@@ -1542,16 +1569,28 @@ pub fun link_requirement(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef
     var req: LinkRequirement;
     req.source  = l.source;
     req.library = l.library;
-    req.symbols      = l.symbols;
-    req.symbol_count = l.symbol_count;
+    req.symbols      = nil;
+    req.symbol_count = 0;
+    if (l.symbol_count > 0) {
+        val cr: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](alloc, l.symbol_count::usize);
+        if (R.is_err[*intern.StrId, str](cr)) { ret R.err[LinkRequirement, str](R.unwrap_err[*intern.StrId, str](cr)); }
+        req.symbols = R.unwrap_ok[*intern.StrId, str](cr);
+        var si: u32 = 0;
+        for (si < l.symbol_count) { req.symbols[si] = l.symbols[si]; si = si + 1; }
+        req.symbol_count = l.symbol_count;
+    }
     if (l.source == LINK_LOCAL) {
         val raw_path: str = idstr(itn, l.path);
         val expanded_r: R.Result[str, str] = expand(alloc, raw_path, proj_out, v);
-        if (R.is_err[str, str](expanded_r)) { ret R.err[LinkRequirement, str](R.unwrap_err[str, str](expanded_r)); }
+        if (R.is_err[str, str](expanded_r)) {
+            free_strarr(alloc, req.symbols, req.symbol_count);
+            ret R.err[LinkRequirement, str](R.unwrap_err[str, str](expanded_r));
+        }
         val expanded: str = R.unwrap_ok[str, str](expanded_r);
         val res_int: R.Result[intern.StrId, str] = intern.intern(itn, expanded);
         str_free(alloc, expanded);
         if (R.is_err[intern.StrId, str](res_int)) {
+            free_strarr(alloc, req.symbols, req.symbol_count);
             ret R.err[LinkRequirement, str](R.unwrap_err[intern.StrId, str](res_int));
         }
         req.text = R.unwrap_ok[intern.StrId, str](res_int);
@@ -2000,11 +2039,14 @@ pub fun resolve_test_libs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manife
                 if (link_matches_target(itn, found_l, t)) {
                     val req_r: R.Result[LinkRequirement, str] = link_requirement(alloc, itn, found_l, proj_out, v);
                     if (R.is_err[LinkRequirement, str](req_r)) {
+                        free_link_claims(alloc, buf, w);
                         A.deallocate[LinkRequirement](alloc, buf, max::usize);
                         ret R.err[bool, str](R.unwrap_err[LinkRequirement, str](req_r));
                     }
-                    val req: LinkRequirement = R.unwrap_ok[LinkRequirement, str](req_r);
+                    var req: LinkRequirement = R.unwrap_ok[LinkRequirement, str](req_r);
                     if (!requirement_in_buf(buf, w, ?req)) { buf[w] = req; w = w + 1; }
+                    # a duplicate is dropped here, so its claim copy is released
+                    or { free_link_claims(alloc, ?req, 1); }
                 }
             }
             li = li + 1;
@@ -3224,6 +3266,56 @@ test "mach.lang.manifest.parse:link_symbols_claim" {
         "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\nsymbols=[\"Sleep\",\"Sleep\"]\n"));
     if (R.is_ok[Manifest, str](dup)
         || !str_equals(R.unwrap_err[Manifest, str](dup), "mach.toml: [link.k].symbols lists 'Sleep' twice")) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+# a requirement must OWN its claim array, not borrow the entry's (#2510). on the
+# export cascade the dependency manifest is torn down before the link reads the
+# claims, so a borrow dangles - and a behavioural test cannot see that, since
+# freed storage usually still holds the old bytes. this asserts the invariant
+# directly: distinct storage, and the values survive the entry's array being
+# freed and its slots overwritten
+test "mach.lang.manifest.link_requirement:owns_its_claim_array" {
+    var backing: A.Allocator; var ar: arena.Arena; var alloc: A.Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val sleep_r: R.Result[intern.StrId, str] = intern.intern(?itn, "Sleep");
+    val k32_r:   R.Result[intern.StrId, str] = intern.intern(?itn, "kernel32");
+    if (R.is_err[intern.StrId, str](sleep_r) || R.is_err[intern.StrId, str](k32_r)) { arena.dnit(?ar); ret 1; }
+    val sleep: intern.StrId = R.unwrap_ok[intern.StrId, str](sleep_r);
+
+    val owned_r: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](?alloc, 1::usize);
+    if (R.is_err[*intern.StrId, str](owned_r)) { arena.dnit(?ar); ret 1; }
+    var l: LinkDef;
+    l.source       = LINK_SYSTEM;
+    l.name         = R.unwrap_ok[intern.StrId, str](k32_r);
+    l.library      = R.unwrap_ok[intern.StrId, str](k32_r);
+    l.lib_name     = R.unwrap_ok[intern.StrId, str](k32_r);
+    l.path         = intern.STR_NIL;
+    l.symbols      = R.unwrap_ok[*intern.StrId, str](owned_r);
+    l.symbol_count = 1;
+    l.symbols[0]   = sleep;
+
+    var v: TmplVars;
+    val req_r: R.Result[LinkRequirement, str] = link_requirement(?alloc, ?itn, ?l, "", ?v);
+    if (R.is_err[LinkRequirement, str](req_r)) { arena.dnit(?ar); ret 1; }
+    var req: LinkRequirement = R.unwrap_ok[LinkRequirement, str](req_r);
+
+    # distinct storage is the invariant; a borrow would alias here
+    if (req.symbols == l.symbols) { code = 1; }
+    if (req.symbol_count != 1 || req.symbols[0] != sleep) { code = 1; }
+
+    # release the entry's array as `dnit` does, then overwrite the slot it held.
+    # an aliasing requirement would read the overwrite back.
+    free_strarr(?alloc, l.symbols, l.symbol_count);
+    l.symbols[0] = intern.STR_NIL;
+    if (req.symbols[0] != sleep) { code = 1; }
+
+    free_link_claims(?alloc, ?req, 1);
+    if (req.symbols != nil || req.symbol_count != 0) { code = 1; }
 
     arena.dnit(?ar);
     ret code;
