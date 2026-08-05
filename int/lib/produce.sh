@@ -37,9 +37,10 @@
 #                 is exactly the regression this guards.
 #   debuginfo   — build the case with and without `-g` (run.sh builds both) and
 #                 assert over the artifacts: llvm-dwarfdump --verify accepts the `-g`
-#                 image and `-g` is loadable-byte additive (PT_LOAD segments identical).
-#                 the one producer that needs external validators (llvm-dwarfdump,
-#                 readelf); it runs only on the ELF debug-info legs, which install them.
+#                 image, `-g` is loadable-byte additive, discarded weak templates do
+#                 not alias live line/location metadata, and live names symbolize.
+#                 requires llvm-dwarfdump, llvm-symbolizer, and readelf; it runs only
+#                 on the ELF debug-info legs, which install them.
 #   spirv-val   — validate every `.spv` module a finished-module target delivered
 #                 with the Khronos validator (spirv-tools). the target links
 #                 nothing, so there is no binary to run and the module tree is the
@@ -757,7 +758,8 @@ elf_seg_identical() {
 # host-side over the artifacts run.sh built with and without `-g`, that (1) the
 # standard structural validator accepts the whole `-g` image, (2) `-g` is loadable-
 # byte additive, and (3) duplicate generic, comptime-value, and pack instances retain
-# one live, symbolizable DIE while each discarded copy carries DWARF's dead-code address.
+# one live, symbolizable DIE while each discarded copy carries DWARF's dead-code address,
+# has no line-table sequence at the winner, and has no location list at the winner.
 # the facts are ISA-independent, so the golden is shared. requires llvm-dwarfdump,
 # llvm-symbolizer, and readelf on the leg; a missing validator is a hard error.
 produce_debuginfo() {
@@ -788,6 +790,8 @@ produce_debuginfo() {
     # helper and main instantiate all three weak template forms. each winner must
     # symbolize by source name while the losing atom's DIE retains a dead low_pc.
     info=$("$dd_tool" --debug-info "$g") || return 1
+    lines=$("$dd_tool" --debug-line "$g") || return 1
+    locations=$("$dd_tool" --debug-loclists "$g") || return 1
     for spec in ident:ident value:add_n pack:pack_sum; do
         label=${spec%%:*}
         want=${spec#*:}
@@ -812,6 +816,30 @@ produce_debuginfo() {
             if [ "$resolved" = "$want" ]; then symbol=$resolved; fi
         fi
         printf 'weak_%s_symbol=%s\n' "$label" "$symbol"
+
+        # every live template has exactly one sequence beginning at its entry. a
+        # losing weak set_address that resolves to the winner creates a second
+        # prologue_end row at that address while remaining validator-clean.
+        line_starts=$(printf '%s\n' "$lines" | awk -v addr="$3" '
+            $1 == addr && /prologue_end/ { n++ }
+            END { print n + 0 }
+        ')
+        line_state="count:$line_starts"
+        [ "$line_starts" -eq 1 ] && line_state=unique
+        printf 'weak_%s_lines=%s\n' "$label" "$line_state"
+
+        # pack_sum's changing accumulator home gives it a location list in debug
+        # builds. release may optimize that list away, so the invariant is that at
+        # most one list starts at the winner; a losing base_address alias makes two.
+        if [ "$label" = pack ]; then
+            loc_starts=$(printf '%s\n' "$locations" | awk -v addr="$3" '
+                index($0, "[" addr ",") { n++ }
+                END { print n + 0 }
+            ')
+            loc_state="aliased:$loc_starts"
+            [ "$loc_starts" -le 1 ] && loc_state=not-aliased
+            printf 'weak_pack_locations=%s\n' "$loc_state"
+        fi
     done
 }
 
