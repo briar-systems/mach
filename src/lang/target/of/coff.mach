@@ -125,15 +125,15 @@ val BIGOBJ_SYMBOL_SIZE:         usize = 20;
 # the short import record (`IMPORT_OBJECT_HEADER`), the member an import library
 # carries instead of an object: it defines nothing and states that one symbol is
 # provided by one DLL. it opens with the SAME Sig1/Sig2 pair as /bigobj, so the
-# two are told apart by the field directly after it - a /bigobj header carries
-# Version >= BIGOBJ_MIN_VERSION, a short import record always carries 0. Version
-# is the discriminator rather than /bigobj's ClassID because it sits at a fixed
-# offset present in both shapes, so no size check has to precede the test.
+# two are told apart by the complete /bigobj discriminator: a sufficiently large
+# header with Version >= BIGOBJ_MIN_VERSION and the fixed /bigobj ClassID. Every
+# other member with the shared signature is a short import record. This mirrors
+# the format's structural discriminator without constraining future import-header
+# versions.
 #
 # header: Sig1, Sig2, Version, Machine, TimeDateStamp, SizeOfData, OrdinalOrHint,
 # then a bitfield of Type (2 bits) and NameType (3 bits). `SizeOfData` bytes
 # follow, holding the NUL-terminated symbol name then the NUL-terminated DLL name.
-val IMPORT_OBJECT_VERSION:     u16   = 0;
 val IMPORT_OBJECT_HEADER_SIZE: usize = 20;
 val IMPORT_OBJECT_TYPE_CODE:   u16   = 0;
 val IMPORT_OBJECT_ORDINAL:     u16   = 0;
@@ -187,6 +187,7 @@ val PE_FILE_ALIGN:       u64   = 0x200;
 # one IMAGE_IMPORT_DESCRIPTOR (20 bytes) and one PE thunk slot (8 bytes, PE32+)
 val IMPORT_DESCRIPTOR_SIZE: usize = 20;
 val THUNK_SIZE:             usize = 8;
+val IMPORT_ORDINAL_FLAG64:  u64   = 0x8000000000000000;
 # the per-function import stub: `jmp qword [rip+disp32]` through the IAT slot
 val IMPORT_STUB_SIZE:       usize = 6;
 # one RUNTIME_FUNCTION table row (`BeginAddress`, `EndAddress`, `UnwindInfoAddress`)
@@ -1724,12 +1725,16 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
     val sig2: u16 = bin.read_u16_le(buf, 2);
     val anon: bool = sig1 == IMAGE_FILE_MACHINE_UNKNOWN && sig2 == BIGOBJ_SIG2;
 
-    # an import library's member shares that signature pair; Version separates it
-    # from a /bigobj object before either header shape is otherwise read.
-    if (anon && buf_size >= 6 && bin.read_u16_le(buf, 4) == IMPORT_OBJECT_VERSION) {
+    # an import library's member shares that signature pair. /bigobj is the more
+    # restrictive shape: it must be large enough for its header, carry a supported
+    # version, and carry the fixed ClassID. Anything else with the pair is a short
+    # import record, as specified for import-library pseudo-objects.
+    val bigobj: bool = anon && buf_size >= BIGOBJ_HEADER_SIZE
+        && bin.read_u16_le(buf, 4) >= BIGOBJ_MIN_VERSION
+        && bigobj_class_id_matches(buf, 12);
+    if (anon && !bigobj) {
         ret coff_parse_import_record(alloc, itn, buf, buf_size, out);
     }
-    val bigobj: bool = anon;
 
     var num_secs:     u32   = 0;
     var symtab_off:   usize = 0;
@@ -2705,11 +2710,12 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
         lay.iat_size = (lay.nimp + dyn.lib_count)::usize * THUNK_SIZE::u64;
         ioff = ioff + (lay.nimp + dyn.lib_count)::usize * THUNK_SIZE;
 
-        # hint/name table: one (hint:u16 + name + NUL, 2-byte aligned) per import.
+        # hint/name table: one (hint:u16 + name + NUL, 2-byte aligned) per
+        # by-name import. Ordinal imports encode the ordinal directly in the thunk.
         ioff = bin.align_up(ioff, 2);
         var i: u32 = 0;
         for (i < dyn.import_count) {
-            if (dyn.imports[i].is_func) {
+            if (dyn.imports[i].is_func && !dyn.imports[i].by_ordinal) {
                 ioff = ioff + 2 + name_len_z(itn, dyn.imports[i].symbol);
                 ioff = bin.align_up(ioff, 2);
             }
@@ -3033,10 +3039,9 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
 # RVAs are recovered by `write_pe_stubs` and `patch_pe_fixups` (recomputed by the
 # same import ordinal), so this lays the same offsets `compute_pe_layout` used
 #
-# the ILT and IAT are identical on disk (both are by-name thunks pointing at the
-# hint/name entries); the loader overwrites each IAT thunk with the resolved
-# function address. a thunk with bit 63 set would be an import-by-ordinal; every
-# thunk here is an RVA into the hint/name table (import-by-name).
+# the ILT and IAT are identical on disk. A by-name thunk points at its hint/name
+# entry; an ordinal thunk carries bit 63 plus the 16-bit ordinal directly. The
+# loader overwrites each IAT thunk with the resolved function address.
 fun write_pe_imports(itn: *intern.Interner, buf: *u8, lay: *PeLayout, dyn: *of.DynamicInfo) {
     val sec_off: usize = lay.idata_sec.file_off;
     val sec_rva: u64   = lay.idata_sec.rva;
@@ -3070,16 +3075,21 @@ fun write_pe_imports(itn: *intern.Interner, buf: *u8, lay: *PeLayout, dyn: *of.D
         var imp: u32 = 0;
         for (imp < dyn.import_count) {
             if (dyn.imports[imp].is_func && import_lib_of(dyn, imp) == lib) {
-                val hint_rva: u64 = sec_rva + hcur::u64;
-                # hint = 0; the loader falls back to a binary search by name.
-                bin.write_u16_le(buf, sec_off + hcur, 0);
-                hcur = hcur + 2;
-                hcur = hcur + bin.write_str(buf, sec_off + hcur, bin.resolve_name(itn, dyn.imports[imp].symbol));
-                hcur = bin.align_up(hcur, 2);
+                var thunk: u64 = 0;
+                if (dyn.imports[imp].by_ordinal) {
+                    thunk = IMPORT_ORDINAL_FLAG64 | dyn.imports[imp].ordinal::u64;
+                }
+                or {
+                    thunk = sec_rva + hcur::u64;
+                    bin.write_u16_le(buf, sec_off + hcur, dyn.imports[imp].ordinal);
+                    hcur = hcur + 2;
+                    hcur = hcur + bin.write_str(buf, sec_off + hcur,
+                        bin.resolve_name(itn, dyn.imports[imp].symbol));
+                    hcur = bin.align_up(hcur, 2);
+                }
 
-                # ILT[thunk_ix] and IAT[thunk_ix] = RVA of the hint/name entry.
-                bin.write_u64_le(buf, sec_off + ilt_off + thunk_ix::usize * THUNK_SIZE, hint_rva);
-                bin.write_u64_le(buf, sec_off + iat_off + thunk_ix::usize * THUNK_SIZE, hint_rva);
+                bin.write_u64_le(buf, sec_off + ilt_off + thunk_ix::usize * THUNK_SIZE, thunk);
+                bin.write_u64_le(buf, sec_off + iat_off + thunk_ix::usize * THUNK_SIZE, thunk);
                 thunk_ix = thunk_ix + 1;
             }
             imp = imp + 1;
@@ -3879,9 +3889,9 @@ test "mach.lang.target.of.coff:relro_round_trip" {
 # a REL32 addend translates the COFF next-byte-relative (P+4) convention on both
 # parse and emit (#1409)
 # a short import record parses to a declaration rather than an object, and is told
-# apart from /bigobj by Version alone - the two share the Sig1/Sig2 pair, and
-# before #2525 the record was misclassified as /bigobj and rejected for being
-# smaller than a /bigobj header
+# apart from /bigobj by the latter's version and ClassID - the two share the
+# Sig1/Sig2 pair, and before #2525 the record was misclassified as /bigobj and
+# rejected for being smaller than a /bigobj header
 test "mach.lang.target.of.coff.coff_parse_object:short_import_record" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -3919,13 +3929,14 @@ test "mach.lang.target.of.coff.coff_parse_object:short_import_record" {
     if (!img.imports[0].by_name) { ret 1; }
     if (!img.imports[0].is_code) { ret 1; }
 
-    # Version >= 2 is a /bigobj header, not an import record: the same leading bytes
-    # must take the object path and fail its own size check, not this one
+    # Version alone cannot make this a /bigobj header. Without the fixed ClassID it
+    # remains an import record, so a future header version with the same payload
+    # shape is not misclassified.
     rec[4] = BIGOBJ_MIN_VERSION::u8;
     var img2: of.ObjectImage;
     val br: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?rec[0], 39, ?img2);
-    if (R.is_ok[bool, str](br)) { ret 1; }
-    if (!str_equals(R.unwrap_err[bool, str](br), "coff: bigobj object too small")) { ret 1; }
+    if (R.is_err[bool, str](br)) { ret 1; }
+    if (img2.import_count != 1) { ret 1; }
     ret 0;
 }
 
@@ -5495,6 +5506,8 @@ fun t_iat_slots_exact(i: *intern.Interner, counts: *u32, nlib: u32) bool {
             imports[total].symbol = t_intern(i, "fn");
             imports[total].lib_index = l;
             imports[total].is_func = true;
+            imports[total].ordinal = 0;
+            imports[total].by_ordinal = false;
             total = total + 1;
             j = j + 1;
         }

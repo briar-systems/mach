@@ -170,7 +170,7 @@ produce_panic_exit() {
 }
 
 # read_le_uint <file> <offset> <size>
-# print the unsigned little-endian integer of <size> bytes (2 or 4) at <offset>.
+# print the unsigned little-endian integer of <size> bytes (1, 2, or 4) at <offset>.
 # od reads in host byte order; every CI runner is little-endian.
 read_le_uint() {
     dd if="$1" bs=1 skip="$2" count="$3" 2>/dev/null | od -An -tu"$3" | tr -d ' \n'
@@ -290,13 +290,19 @@ produce_pe_imports() {
 
         t=0
         while :; do
-            entry=$(read_le_uint "$bin" $((thunk_off + t * 8)) 8)
-            [ "$entry" -eq 0 ] && break
-            # bit 63 set marks an ordinal import, which names no symbol
-            if [ $((entry >> 63)) -eq 1 ]; then
-                echo "$dll:#$((entry & 0xFFFF))" >>"$out"
+            thunk=$((thunk_off + t * 8))
+            entry_lo=$(read_le_uint "$bin" "$thunk" 4)
+            entry_hi=$(read_le_uint "$bin" $((thunk + 4)) 4)
+            [ "$entry_lo" -eq 0 ] && [ "$entry_hi" -eq 0 ] && break
+            # Inspect bit 63 as a byte. A by-ordinal thunk is an unsigned u64
+            # above the shell's signed arithmetic range, so reading the whole
+            # value into `$((...))` would overflow before the test.
+            top=$(read_le_uint "$bin" $((thunk + 7)) 1)
+            if [ $((top & 128)) -ne 0 ]; then
+                ordinal=$(read_le_uint "$bin" "$thunk" 2)
+                echo "$dll:#$ordinal" >>"$out"
             else
-                hn_off=$(pe_rva_to_off "$bin" "$sec" "$nsec" $((entry & 0x7FFFFFFF))) || return 2
+                hn_off=$(pe_rva_to_off "$bin" "$sec" "$nsec" "$entry_lo") || return 2
                 echo "$dll:$(read_cstr "$bin" $((hn_off + 2)))" >>"$out"
             fi
             t=$((t + 1))

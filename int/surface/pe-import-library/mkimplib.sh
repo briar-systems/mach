@@ -3,28 +3,31 @@
 # case needs no LLVM on the leg. each member is a COFF short import record
 # (IMPORT_OBJECT_HEADER): Sig1=0, Sig2=0xFFFF, Version=0 (what separates it from a
 # /bigobj object), Machine=0x8664, then SizeOfData bytes holding the NUL-terminated
-# symbol name followed by the NUL-terminated DLL name.
+# symbol name followed by the NUL-terminated DLL name. The records cover both
+# by-name and by-ordinal loader bindings.
 set -eu
 out=$1
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-# record <file> <symbol> <dll>
+# record <file> <symbol> <dll> <hint-or-ordinal> <flags>
 record() {
-    f=$1; sym=$2; dll=$3
+    f=$1; sym=$2; dll=$3; hint=$4; flags=$5
     n=$(( ${#sym} + 1 + ${#dll} + 1 ))
     # header: sig1, sig2, version, machine(0x8664 LE), timestamp, size(LE u32),
-    # ordinal/hint, then type/name-type (NameType=1, bind by name)
+    # ordinal/hint, then type/name-type
     printf '\000\000\377\377\000\000\144\206\000\000\000\000' >"$f"
     printf "$(printf '\\%03o\\%03o\\%03o\\%03o' \
         $(( n & 255 )) $(( (n >> 8) & 255 )) $(( (n >> 16) & 255 )) $(( (n >> 24) & 255 )))" >>"$f"
-    printf '\000\000\004\000' >>"$f"
+    printf "$(printf '\\%03o\\%03o\\%03o\\%03o' \
+        $(( hint & 255 )) $(( (hint >> 8) & 255 )) \
+        $(( flags & 255 )) $(( (flags >> 8) & 255 )))" >>"$f"
     printf '%s\000%s\000' "$sym" "$dll" >>"$f"
 }
 
-record "$tmp/a" Sleep       kernel32.dll
-record "$tmp/b" ExitProcess kernel32.dll
-record "$tmp/c" MessageBeep user32.dll
+record "$tmp/a" Sleep       kernel32.dll 0   4  # code, by name
+record "$tmp/b" ExitProcess kernel32.dll 0   4  # code, by name
+record "$tmp/c" MessageBeep user32.dll   123 0  # code, by ordinal
 
 mkdir -p "$(dirname "$out")"
 printf '!<arch>\n' >"$out"
