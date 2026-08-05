@@ -155,9 +155,10 @@ existing file is a hard error, so a typo never silently drops a dependency.
   A relative path is tried verbatim against the working directory first, then
   rooted at the project root.
 - **`-l <name>`** — resolves to an object, archive, or shared library. Each
-  `-L <dir>` is searched for the `lib<name>` and `<name>` forms of `.o`, `.obj`,
-  `.a`, and `.lib`, in that order; if none hit, the same candidates relative to
-  the working directory are tried. Only if no static
+  `-L <dir>` is searched for the `lib<name>` and `<name>` forms of `.o` and
+  `.a`; a PE/COFF target additionally probes `.obj` and `.lib`. If none hit,
+  the same target-appropriate candidates relative to the working directory are
+  tried. Only if no static
   object or archive is found does resolution fall back to the selected target's
   shared-library spelling: `lib<name>.so[.N]` for ELF or
   `lib<name>[.<N>].dylib` for Mach-O. The `-L` directories are searched first,
@@ -193,9 +194,11 @@ unused member is never linked, but it must still be a parseable object for the
 selected target; keep an archive target-homogeneous. This preserves the existing
 archive-parser constraint while changing which members reach symbol resolution.
 
-`-l <name>` prefers a static `.o`/`.obj`/`.a`/`.lib` over a shared library, so an `-l name`
-that has a local object is resolved statically exactly as before; the `.so`
-or `.dylib` fallback only applies when no static candidate exists. A bare `-l`
+`-l <name>` prefers a target-appropriate static object/archive over a shared
+library, so an `-l name` that has a local object is resolved statically exactly
+as before; PE/COFF adds `.obj`/`.lib` to the portable `.o`/`.a` probes, while an
+ELF or Mach-O plan ignores those COFF-only bare-name candidates. The `.so` or
+`.dylib` fallback only applies when no static candidate exists. A bare `-l`
 name is also the logical identity accepted by `#[library("name")]`; manifest
 requirements can set a cross-platform logical identity explicitly with their
 `library` key. Manifest requirements are resolved before CLI inputs, giving a

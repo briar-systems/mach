@@ -191,6 +191,10 @@ import with `#[library("name")]`. The value is the requirement's stable
 remain accepted. A discovered Darwin `@rpath/` install name retains its selected
 library directory as an `LC_RPATH` command.
 
+For a bare `-l name`, every target probes `.o`/`.a`; only PE/COFF also probes
+the `.obj`/`.lib` spellings. Explicit paths retain their spelling so a format
+mismatch produces a direct diagnostic.
+
 ### `val` / `var`
 
 ```mach
