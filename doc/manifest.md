@@ -352,6 +352,8 @@ reads the selected artifact's name.
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
 | `link`    | yes | Array of `[link.X]` names this artifact links (see below). `[]` for none. |
 | `need`    | yes | Array of `[step.X]` names this artifact demands directly, for step outputs that are not themselves link inputs. `[]` for none. |
+| `icon`    | no  | Windows only. Path to an `.ico` container, relative to the project root. Every image the container embeds is carried into the executable. |
+| `manifest` | no | Windows only. Path to an XML application manifest, relative to the project root. Embedded byte for byte. |
 
 - **`bin`** links an executable at the resolved `out` path.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
@@ -362,6 +364,49 @@ reads the selected artifact's name.
 
 Per-target extension or per-target entry is not a per-cell exception table — it is a
 second artifact stanza, so the condition stays visible like everything else.
+
+### Windows resources
+
+`icon` and `manifest` are the PE resource inputs. They are accepted on every
+target and read only when the build cell's OS is `windows`; a linux or darwin
+build of the same artifact parses them, ignores them, and emits exactly the image
+it emitted before they were declared. That is the same posture every windows-only
+artifact key takes — the key is inert per target, never rejected per target — so
+one artifact stanza still covers every platform it ships to.
+
+```toml
+[artifact.game]
+kind = "bin"
+entry = "main.mach"
+out = "bin/game.exe"
+targets = ["*"]
+link = []
+need = []
+icon = "assets/game.ico"
+manifest = "assets/game.manifest"
+```
+
+What lands in the PE's `.rsrc` section:
+
+- `RT_ICON` — one entry per image embedded in the `.ico`, carried through
+  unmodified, plus the `RT_GROUP_ICON` directory that names them. Explorer picks
+  the size it wants, so ship every size you care about in the one container.
+- `RT_VERSION` — a `VS_VERSIONINFO` block. Its fixed header is built from
+  `[project].version`, read as up to four dot-separated numeric components
+  (`4.5.0` becomes `4.5.0.0`, and a trailing pre-release tag like `-rc1` is
+  ignored). The artifact's name fills the product and internal-name strings.
+- `RT_MANIFEST` — the `manifest` file, byte for byte. Mach does not parse, rewrite,
+  or validate it; what the file holds is what the executable declares.
+
+Both keys are optional and independent. With neither set the artifact gets no
+`.rsrc` section at all and the emitted image is byte-identical to one built before
+resource emission existed. Both paths use `/` separators like every other manifest
+path, and a declared file that cannot be read fails the link rather than silently
+dropping the resource. Editing an icon or a manifest re-links on the next build
+even though no source changed, because both are fingerprinted by content.
+
+There is no `.rc` surface and no dependency on `rc.exe` or `windres`: resource
+emission is part of mach's own PE writer.
 
 ## `[link.<name>]` — link requirements
 
