@@ -119,6 +119,30 @@ format family `printf`/`printlnf`/`eprintf`/`eprintlnf` - pack-variadic, with
 `{:5}`, `{:<5}`, `{:08x}`; `{{`/`}}` for literal braces). All return
 `Result[usize, str]`.
 
+### Windows executable resources
+
+An executable artifact may declare project-root-relative PE assets:
+
+```toml
+[artifact.game]
+kind = "bin"
+entry = "main.mach"
+out = "bin/game.exe"
+targets = ["*"]
+link = []
+need = []
+icon = "assets/game.ico"
+manifest = "assets/game.manifest"
+```
+
+`icon` is a valid ICO container; `manifest` is embedded byte-for-byte. Either
+adds PE icon/manifest resources plus version information. Version strings come
+from `[project].version`, `InternalName`/`ProductName` from the artifact table
+key, and `OriginalFilename` from the resolved output basename. These keys are
+accepted but not read on non-Windows targets, and are rejected on `static` or
+`shared` artifacts. If a build step generates an asset, name that step in
+`need` and make its output exactly match the resource path.
+
 ```mach
 print.printlnf("built {} in {}ms", name, elapsed);
 ```
