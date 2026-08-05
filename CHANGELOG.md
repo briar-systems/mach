@@ -5,6 +5,80 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.6.0] - 2026-08-05
+
+Opens inline assembly to the privileged and system instruction families on every
+target, adds comptime type reflection, and validates inline assembly inside
+`#[oblivious]` rather than refusing it. Also builds every artifact a manifest
+declares for the selected target, and legalizes the remaining wide integer
+operations on mos6502.
+
+### Added
+- asm: the privileged and system instruction families are reachable from inline
+  assembly on every target — x86-64 port i/o (`in`/`out`), `cli`/`sti`/`lidt`,
+  and `rdtsc`/`rdmsr`/`wrmsr` (#2468); AArch64 `mrs`/`msr`, by register name or
+  by `s<op0>_<op1>_c<crn>_c<crm>_<op2>` encoding (#2480); and the RISC-V CSR
+  family — `csrrw`/`csrrs`/`csrrc`, their immediate forms, and the
+  `csrr`/`csrw`/`rdtime` pseudo-forms, by CSR name or numeric address (#2481).
+  A name table can never be complete, so every target accepts the numeric
+  escape alongside its names.
+- asm: raw-encoding data directives (`.byte`, and the half/word/quad forms as
+  each target spells them) are available on every target, so an encoding the
+  assembler does not know can still be emitted inline (#2479).
+- comptime: type predicates (`$is_record`, `$is_union`, `$is_pointer`, and
+  siblings) and `$type_name`, taking a field-descriptor type operand so a
+  `$fields` walk can branch on each field's type (#2128, #2454).
+- ct: inline assembly inside `#[oblivious]` is validated rather than refused. A
+  taint walk over the parsed assembly rejects a secret reaching a branch, a
+  secret reaching an address, and a variable-latency instruction on a secret,
+  and fails closed on any construct it cannot model (#2230).
+- sema: a type-dependent comptime directive is evaluated per instantiation, so
+  `$fields` and the type predicates answer for the instance rather than the
+  template (#2465).
+- build: every artifact a manifest declares for the selected target is built,
+  not only the first. `-o` is refused by plan shape — when the plan resolves to
+  more than one unit — rather than by target count (#2474, #2484).
+- legalize: wide multiply (#2344) and wide sign-extension (#2345) on mos6502,
+  built from the lane primitives the width-legalization pass already has and
+  costed honestly rather than approximated.
+
+### Changed
+- build: per-module optimization runs in parallel across cores. In a controlled
+  Linux x86_64 measurement, release `--jobs 16` self-host went 15.45s -> 8.89s
+  (-42%) and debug -11%; serial builds are unchanged (#2100).
+- arm64, riscv64: an identity conversion selects to a move, so the register
+  allocator can coalesce the copy away (#2443, #2392).
+
+### Fixed
+- ct: constant-time classification keys on the instruction's code *and* its
+  flags. AArch64 `b.<cond>` shares its code with the unconditional branch, so a
+  secret-dependent conditional branch was validating clean under `#[oblivious]`
+  (#2477).
+- asm: the assembly printer is notified from the system-register and directive
+  emitters, and the sink from a `.byte` payload, so `--emit-asm` renders what
+  the encoder actually emitted (#2467, #2493, #2501).
+- sema: a global initialiser that references another global in the same module
+  folds (#2486); a type query over an unbound generic parameter is refused
+  instead of answering for the template (#2464); type layout resolves on demand,
+  so a layout intrinsic folds in a type position (#2442).
+- mangle: a type with no mangling encoding fails the compile instead of silently
+  writing `'v'`, which collided distinct symbols (#2303).
+- regalloc: a same-vreg copy is dropped at every width, on every target (#2395).
+- encode: x86-64 encodes an indirect `JMP` through memory rather than taking the
+  fallthrough path (#2400); an unnamed relation is refused instead of defaulting
+  to one (#2435).
+- legalize: `MIR_BITCAST` has a mos6502 arm, and its encoder retag (#2483).
+- mos6502: the JSR callee relocation applier is named (#2280).
+- link: the output is renamed over the target instead of truncated in place, so
+  relinking cannot corrupt a running binary (#2475).
+- driver: an absolute `[dep.*]` path is used verbatim, never joined onto the
+  manifest directory (#2470); an unresolved path dep names both the dep and the
+  fix (#2471).
+- lower: the unknown-escape diagnostic carries a location (#2472).
+- codegen: the "var does not zero" claim is corrected and the redundant clears
+  it justified are dropped; `AbiVTable` and `MirVReg` construction is visible to
+  the census (#2335).
+
 ## [4.5.0] - 2026-08-03
 
 Retires bmos as a built-in OS in favor of the freestanding + platform-tag model,
