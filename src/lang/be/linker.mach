@@ -497,6 +497,54 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
                  dynlibs: *of.DynLib, dynlib_count: u32,
                  out_path: *u8, name: *u8, mode: LinkMode, pie_opt_in: bool,
                  subsystem: of.Subsystem) R.Result[bool, str] {
+    var local_imports: of.ObjectImage;
+    val sr: R.Result[bool, str] = synthesize_local_imports(
+        s, tgt.of.import_address_prefix, modules, module_count, mode, ?local_imports);
+    if (R.is_err[bool, str](sr)) {
+        ret R.err[bool, str](R.unwrap_err[bool, str](sr));
+    }
+    if (!R.unwrap_ok[bool, str](sr)) {
+        ret link_modules_core(s, tgt, modules, module_count, codegen_count,
+            dynlibs, dynlib_count, out_path, name, mode, pie_opt_in, subsystem);
+    }
+
+    # The synthesized cells are an ordinary final input image. Keeping them in
+    # the regular merge means symbol resolution, relocation bounds checking, and
+    # every format's base-relocation collection apply without a PE-only side path.
+    val alloc: *A.Allocator = s.alloc;
+    if (module_count == 0xFFFFFFFF) {
+        obj.dnit(?local_imports);
+        ret R.err[bool, str]("link: too many input objects for local import pointers");
+    }
+    val all_r: R.Result[*of.ObjectImage, str] =
+        A.allocate[of.ObjectImage](alloc, (module_count + 1)::usize);
+    if (R.is_err[*of.ObjectImage, str](all_r)) {
+        obj.dnit(?local_imports);
+        ret R.err[bool, str](R.unwrap_err[*of.ObjectImage, str](all_r));
+    }
+    val all: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](all_r);
+    var i: u32 = 0;
+    for (i < module_count) {
+        all[i] = modules[i];
+        i = i + 1;
+    }
+    all[module_count] = local_imports;
+
+    val linked: R.Result[bool, str] = link_modules_core(
+        s, tgt, all, module_count + 1, codegen_count,
+        dynlibs, dynlib_count, out_path, name, mode, pie_opt_in, subsystem);
+    A.deallocate[of.ObjectImage](alloc, all, (module_count + 1)::usize);
+    obj.dnit(?local_imports);
+    ret linked;
+}
+
+# link the prepared image set after format-owned synthetic inputs have been
+# appended by `link_modules`; ownership remains with the wrapper and its caller
+fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.ObjectImage,
+                      module_count: u32, codegen_count: u32,
+                      dynlibs: *of.DynLib, dynlib_count: u32,
+                      out_path: *u8, name: *u8, mode: LinkMode, pie_opt_in: bool,
+                      subsystem: of.Subsystem) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
     # a shared object is always position-independent: the loader maps it at an
     # arbitrary base and slides its in-image absolute pointers, so it takes the same
@@ -4415,6 +4463,272 @@ fun canonical_import_name(s: *session.Session, prefix: str,
     ret R.ok[ImportName, str](out);
 }
 
+# classify one undefined object symbol as a local import-address alias. the
+# alias qualifies only when its canonical suffix has a strong, loadable global
+# definition in the graph and the alias itself has no definition. weak fallback
+# relations retain their own resolution semantics and are never rewritten
+fun local_import_candidate(s: *session.Session, prefix: str, sym: *of.Symbol,
+                           strong: *map.Map[intern.StrId, u32],
+                           defined: *map.Map[intern.StrId, u32]) R.Result[ImportName, str] {
+    var none: ImportName;
+    none.canonical = sym.name;
+    none.indirect = false;
+    if (!is_undefined_extern(sym)
+        || (sym.flags & of.SYM_OBJ_FLAG_FALLBACK) != 0) {
+        ret R.ok[ImportName, str](none);
+    }
+
+    val cn_r: R.Result[ImportName, str] =
+        canonical_import_name(s, prefix, sym.name);
+    if (R.is_err[ImportName, str](cn_r)) {
+        ret R.err[ImportName, str](R.unwrap_err[ImportName, str](cn_r));
+    }
+    val cn: ImportName = R.unwrap_ok[ImportName, str](cn_r);
+    if (!cn.indirect
+        || R.is_err[*u32, str](map.get[intern.StrId, u32](strong, ?cn.canonical))
+        || R.is_ok[*u32, str](map.get[intern.StrId, u32](defined, ?sym.name))) {
+        ret R.ok[ImportName, str](none);
+    }
+    ret R.ok[ImportName, str](cn);
+}
+
+# lower COFF DefinedLocalImport semantics into one ordinary synthetic object.
+# Every distinct live-style undefined `__imp_X` whose X has a strong in-graph
+# definition becomes an eight-byte global cell symbol with an ABS64 relocation
+# to X. The normal merge then resolves relocations against `__imp_X` to the cell,
+# leaves direct X references untouched, and records the cell's absolute pointer
+# in the image's ASLR base-relocation set. Aliases without a local definition are
+# not included and continue through the loader-owned import path (#2526).
+# ---
+# s:            shared session (allocator and interner)
+# prefix:       format-owned import-address prefix, or empty
+# modules:      complete archive-resolved input graph
+# module_count: number of input images
+# mode:         requested link mode; relocatable output preserves the alias
+# out:          receives the owned synthetic image when the result is true
+# ret:          true when an image was produced, false when no alias qualifies
+fun synthesize_local_imports(s: *session.Session, prefix: str,
+                             modules: *of.ObjectImage, module_count: u32,
+                             mode: LinkMode, out: *of.ObjectImage) R.Result[bool, str] {
+    if (str_empty(prefix) || mode == LINK_RELOCATABLE || modules == nil
+        || module_count == 0) {
+        ret R.ok[bool, str](false);
+    }
+
+    val alloc: *A.Allocator = s.alloc;
+    var strong: map.Map[intern.StrId, u32] =
+        map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+    var defined: map.Map[intern.StrId, u32] =
+        map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+
+    # Resolve the shape against strong GLOBAL definitions only. Invalid section
+    # indices are deliberately ignored here so the regular collector retains its
+    # authoritative malformed-object diagnostic.
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            if (sym.section != of.SECTION_EXTERNAL
+                && sym.section < modules[m].section_count
+                && (sym.flags & of.SYM_OBJ_FLAG_GLOBAL) != 0
+                && is_loadable_kind(modules[m].sections[sym.section].kind)) {
+                if (R.is_err[*u32, str](map.get[intern.StrId, u32](?defined, ?sym.name))) {
+                    val di: R.Result[bool, str] =
+                        map.insert[intern.StrId, u32](?defined, sym.name, 0);
+                    if (R.is_err[bool, str](di)) {
+                        map.dnit[intern.StrId, u32](?defined);
+                        map.dnit[intern.StrId, u32](?strong);
+                        ret R.err[bool, str](R.unwrap_err[bool, str](di));
+                    }
+                }
+                if ((sym.flags & of.SYM_OBJ_FLAG_WEAK) == 0
+                    && R.is_err[*u32, str](map.get[intern.StrId, u32](?strong, ?sym.name))) {
+                    val si: R.Result[bool, str] =
+                        map.insert[intern.StrId, u32](?strong, sym.name, 0);
+                    if (R.is_err[bool, str](si)) {
+                        map.dnit[intern.StrId, u32](?defined);
+                        map.dnit[intern.StrId, u32](?strong);
+                        ret R.err[bool, str](R.unwrap_err[bool, str](si));
+                    }
+                }
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+
+    # First occurrence in module/symbol order owns the cell. A map is used only
+    # for membership, never iteration, keeping output bytes deterministic.
+    var seen: map.Map[intern.StrId, u32] =
+        map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+    var count: u32 = 0;
+    m = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            val cn_r: R.Result[ImportName, str] =
+                local_import_candidate(s, prefix, sym, ?strong, ?defined);
+            if (R.is_err[ImportName, str](cn_r)) {
+                map.dnit[intern.StrId, u32](?seen);
+                map.dnit[intern.StrId, u32](?defined);
+                map.dnit[intern.StrId, u32](?strong);
+                ret R.err[bool, str](R.unwrap_err[ImportName, str](cn_r));
+            }
+            val cn: ImportName = R.unwrap_ok[ImportName, str](cn_r);
+            if (cn.indirect
+                && R.is_err[*u32, str](map.get[intern.StrId, u32](?seen, ?sym.name))) {
+                if (count == 0x1FFFFFFF) {
+                    map.dnit[intern.StrId, u32](?seen);
+                    map.dnit[intern.StrId, u32](?defined);
+                    map.dnit[intern.StrId, u32](?strong);
+                    ret R.err[bool, str]("link: local import pointer section exceeds 32 bits");
+                }
+                val ins: R.Result[bool, str] =
+                    map.insert[intern.StrId, u32](?seen, sym.name, count);
+                if (R.is_err[bool, str](ins)) {
+                    map.dnit[intern.StrId, u32](?seen);
+                    map.dnit[intern.StrId, u32](?defined);
+                    map.dnit[intern.StrId, u32](?strong);
+                    ret R.err[bool, str](R.unwrap_err[bool, str](ins));
+                }
+                count = count + 1;
+            }
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    map.dnit[intern.StrId, u32](?seen);
+
+    if (count == 0) {
+        map.dnit[intern.StrId, u32](?defined);
+        map.dnit[intern.StrId, u32](?strong);
+        ret R.ok[bool, str](false);
+    }
+
+    val image_name_r: R.Result[intern.StrId, str] =
+        intern.intern(?s.interner, "<local-import-pointers>");
+    val section_name_r: R.Result[intern.StrId, str] =
+        intern.intern(?s.interner, ".data.rel.ro");
+    if (R.is_err[intern.StrId, str](image_name_r)
+        || R.is_err[intern.StrId, str](section_name_r)) {
+        map.dnit[intern.StrId, u32](?defined);
+        map.dnit[intern.StrId, u32](?strong);
+        if (R.is_err[intern.StrId, str](image_name_r)) {
+            ret R.err[bool, str](R.unwrap_err[intern.StrId, str](image_name_r));
+        }
+        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](section_name_r));
+    }
+    @out = R.unwrap_ok[of.ObjectImage, str](
+        obj.init(alloc, ?s.interner, R.unwrap_ok[intern.StrId, str](image_name_r)));
+
+    val byte_count: u32 = count * 8;
+    val bytes_r: R.Result[*u8, str] = A.zallocate[u8](alloc, byte_count::usize);
+    if (R.is_err[*u8, str](bytes_r)) {
+        map.dnit[intern.StrId, u32](?defined);
+        map.dnit[intern.StrId, u32](?strong);
+        ret R.err[bool, str](R.unwrap_err[*u8, str](bytes_r));
+    }
+    var sec: of.Section;
+    sec.name = R.unwrap_ok[intern.StrId, str](section_name_r);
+    sec.kind = of.SK_RELRO;
+    sec.bytes = R.unwrap_ok[*u8, str](bytes_r);
+    sec.len = byte_count;
+    sec.align = 8;
+    val sec_r: R.Result[u32, str] = obj.add_section(out, sec);
+    if (R.is_err[u32, str](sec_r)) {
+        A.deallocate[u8](alloc, sec.bytes, byte_count::usize);
+        obj.dnit(out);
+        map.dnit[intern.StrId, u32](?defined);
+        map.dnit[intern.StrId, u32](?strong);
+        ret R.err[bool, str](R.unwrap_err[u32, str](sec_r));
+    }
+
+    val symbols_r: R.Result[*of.Symbol, str] =
+        A.zallocate[of.Symbol](alloc, (count * 2)::usize);
+    if (R.is_err[*of.Symbol, str](symbols_r)) {
+        obj.dnit(out);
+        map.dnit[intern.StrId, u32](?defined);
+        map.dnit[intern.StrId, u32](?strong);
+        ret R.err[bool, str](R.unwrap_err[*of.Symbol, str](symbols_r));
+    }
+    out.symbols = R.unwrap_ok[*of.Symbol, str](symbols_r);
+    out.symbol_count = count * 2;
+
+    val relocs_r: R.Result[*of.Relocation, str] =
+        A.zallocate[of.Relocation](alloc, count::usize);
+    if (R.is_err[*of.Relocation, str](relocs_r)) {
+        obj.dnit(out);
+        map.dnit[intern.StrId, u32](?defined);
+        map.dnit[intern.StrId, u32](?strong);
+        ret R.err[bool, str](R.unwrap_err[*of.Relocation, str](relocs_r));
+    }
+    out.relocations = R.unwrap_ok[*of.Relocation, str](relocs_r);
+    out.reloc_count = count;
+
+    seen = map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+    var w: u32 = 0;
+    m = 0;
+    for (m < module_count) {
+        var sy: u32 = 0;
+        for (sy < modules[m].symbol_count) {
+            val sym: *of.Symbol = ?modules[m].symbols[sy];
+            val cn_r: R.Result[ImportName, str] =
+                local_import_candidate(s, prefix, sym, ?strong, ?defined);
+            if (R.is_err[ImportName, str](cn_r)) {
+                map.dnit[intern.StrId, u32](?seen);
+                obj.dnit(out);
+                map.dnit[intern.StrId, u32](?defined);
+                map.dnit[intern.StrId, u32](?strong);
+                ret R.err[bool, str](R.unwrap_err[ImportName, str](cn_r));
+            }
+            val cn: ImportName = R.unwrap_ok[ImportName, str](cn_r);
+            if (!cn.indirect
+                || R.is_ok[*u32, str](map.get[intern.StrId, u32](?seen, ?sym.name))) {
+                sy = sy + 1; cnt;
+            }
+            val ins: R.Result[bool, str] =
+                map.insert[intern.StrId, u32](?seen, sym.name, w);
+            if (R.is_err[bool, str](ins)) {
+                map.dnit[intern.StrId, u32](?seen);
+                obj.dnit(out);
+                map.dnit[intern.StrId, u32](?defined);
+                map.dnit[intern.StrId, u32](?strong);
+                ret R.err[bool, str](R.unwrap_err[bool, str](ins));
+            }
+
+            val alias_ix: u32 = w * 2;
+            val target_ix: u32 = alias_ix + 1;
+            out.symbols[alias_ix].name = sym.name;
+            out.symbols[alias_ix].section = 0;
+            out.symbols[alias_ix].offset = w * 8;
+            out.symbols[alias_ix].size = 8;
+            out.symbols[alias_ix].flags = of.SYM_OBJ_FLAG_GLOBAL;
+            out.symbols[target_ix].name = cn.canonical;
+            out.symbols[target_ix].section = of.SECTION_EXTERNAL;
+            out.symbols[target_ix].flags = of.SYM_OBJ_FLAG_GLOBAL;
+
+            out.relocations[w].section = 0;
+            out.relocations[w].offset = w * 8;
+            out.relocations[w].kind = of.RK_ABS64;
+            out.relocations[w].sym = target_ix;
+            out.relocations[w].addend = 0;
+            w = w + 1;
+            sy = sy + 1;
+        }
+        m = m + 1;
+    }
+    map.dnit[intern.StrId, u32](?seen);
+    map.dnit[intern.StrId, u32](?defined);
+    map.dnit[intern.StrId, u32](?strong);
+    if (w != count) {
+        obj.dnit(out);
+        ret R.err[bool, str]("link: local import pointer synthesis changed between passes");
+    }
+    ret R.ok[bool, str](true);
+}
+
 # whether an object symbol is an undefined external - a
 # reference the owning object does not define. these are the candidates for a
 # dynamic import when no input object supplies the definition
@@ -5990,6 +6304,112 @@ test "mach.lang.be.linker.build_dynamic_info:coff_import_address_alias" {
     free_dynstate(?alloc, ?dyn);
     map.dnit[intern.StrId, SymbolLoc](?locs);
     session.dnit(?s);
+    ret 0;
+}
+
+# A COFF import-address alias with a strong local target lowers to one ordinary
+# ABS64 cell. Duplicate aliases share it, while weak targets, already-defined
+# aliases, unresolved aliases, weak fallbacks, and relocatable links stay intact.
+test "mach.lang.be.linker.synthesize_local_imports:defined_local_import" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val x: intern.StrId = lt_name(?s, "local_x");
+    val y: intern.StrId = lt_name(?s, "weak_y");
+    val z: intern.StrId = lt_name(?s, "defined_z");
+    val missing: intern.StrId = lt_name(?s, "missing");
+    val imp_x: intern.StrId = lt_name(?s, "__imp_local_x");
+    val imp_y: intern.StrId = lt_name(?s, "__imp_weak_y");
+    val imp_z: intern.StrId = lt_name(?s, "__imp_defined_z");
+    val imp_missing: intern.StrId = lt_name(?s, "__imp_missing");
+    if (x == intern.STR_NIL || y == intern.STR_NIL || z == intern.STR_NIL
+        || missing == intern.STR_NIL || imp_x == intern.STR_NIL
+        || imp_y == intern.STR_NIL || imp_z == intern.STR_NIL
+        || imp_missing == intern.STR_NIL) { ret 1; }
+
+    var code: [1]u8; code[0] = 0xC3;
+    var text: of.Section;
+    text.name = lt_name(?s, ".text"); text.kind = of.SK_TEXT;
+    text.bytes = ?code[0]; text.len = 1; text.align = 1;
+    val global: u32 = of.SYM_OBJ_FLAG_GLOBAL;
+    val external: u32 = global | of.SYM_OBJ_FLAG_EXTERN;
+
+    var defs: [4]of.Symbol;
+    defs[0].name = x; defs[0].section = 0; defs[0].offset = 0;
+    defs[0].size = 1; defs[0].flags = global | of.SYM_OBJ_FLAG_FUNCTION;
+    defs[1].name = y; defs[1].section = 0; defs[1].offset = 0;
+    defs[1].size = 1; defs[1].flags = global | of.SYM_OBJ_FLAG_WEAK;
+    defs[2].name = z; defs[2].section = 0; defs[2].offset = 0;
+    defs[2].size = 1; defs[2].flags = global;
+    defs[3].name = imp_z; defs[3].section = 0; defs[3].offset = 0;
+    defs[3].size = 1; defs[3].flags = global;
+
+    var refs: [6]of.Symbol;
+    refs[0].name = imp_x; refs[0].section = of.SECTION_EXTERNAL;
+    refs[0].flags = external | of.SYM_OBJ_FLAG_FUNCTION;
+    refs[1] = refs[0];
+    refs[2].name = imp_y; refs[2].section = of.SECTION_EXTERNAL;
+    refs[2].flags = external;
+    refs[3].name = imp_z; refs[3].section = of.SECTION_EXTERNAL;
+    refs[3].flags = external;
+    refs[4].name = imp_missing; refs[4].section = of.SECTION_EXTERNAL;
+    refs[4].flags = external;
+    refs[5].name = imp_x; refs[5].section = of.SECTION_EXTERNAL;
+    refs[5].flags = external | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FALLBACK;
+    refs[5].fallback = 4;
+
+    var modules: [2]of.ObjectImage;
+    modules[0] = lt_image(?s, lt_name(?s, "local-defs"), ?text, 1,
+                          ?defs[0], 4, nil::*of.Relocation, 0);
+    modules[1] = lt_image(?s, lt_name(?s, "local-refs"), nil::*of.Section, 0,
+                          ?refs[0], 6, nil::*of.Relocation, 0);
+
+    var synth: of.ObjectImage;
+    val made: R.Result[bool, str] = synthesize_local_imports(
+        ?s, "__imp_", ?modules[0], 2, LINK_EXE, ?synth);
+    if (R.is_err[bool, str](made) || !R.unwrap_ok[bool, str](made)
+        || synth.section_count != 1 || synth.sections[0].kind != of.SK_RELRO
+        || synth.sections[0].len != 8 || synth.sections[0].align != 8
+        || synth.symbol_count != 2 || synth.reloc_count != 1
+        || synth.symbols[0].name != imp_x || synth.symbols[0].section != 0
+        || synth.symbols[0].offset != 0 || synth.symbols[0].size != 8
+        || synth.symbols[0].flags != global
+        || synth.symbols[1].name != x
+        || synth.symbols[1].section != of.SECTION_EXTERNAL
+        || synth.relocations[0].section != 0 || synth.relocations[0].offset != 0
+        || synth.relocations[0].kind != of.RK_ABS64
+        || synth.relocations[0].sym != 1 || synth.relocations[0].addend != 0) {
+        if (R.is_ok[bool, str](made) && R.unwrap_ok[bool, str](made)) { obj.dnit(?synth); }
+        session.dnit(?s);
+        ret 1;
+    }
+    obj.dnit(?synth);
+
+    var untouched: of.ObjectImage;
+    val relocatable: R.Result[bool, str] = synthesize_local_imports(
+        ?s, "__imp_", ?modules[0], 2, LINK_RELOCATABLE, ?untouched);
+    if (R.is_err[bool, str](relocatable)
+        || R.unwrap_ok[bool, str](relocatable)) {
+        session.dnit(?s);
+        ret 1;
+    }
+
+    # A malformed would-be definition never masks the regular collector's
+    # out-of-range-section diagnostic by creating a local pointer cell.
+    var corrupt_def: of.Symbol = defs[0];
+    corrupt_def.section = 1;
+    var corrupt_modules: [2]of.ObjectImage;
+    corrupt_modules[0] = lt_image(?s, lt_name(?s, "corrupt-local-def"), ?text, 1,
+                                  ?corrupt_def, 1, nil::*of.Relocation, 0);
+    corrupt_modules[1] = modules[1];
+    val malformed: R.Result[bool, str] = synthesize_local_imports(
+        ?s, "__imp_", ?corrupt_modules[0], 2, LINK_EXE, ?untouched);
+    session.dnit(?s);
+    if (R.is_err[bool, str](malformed)
+        || R.unwrap_ok[bool, str](malformed)) { ret 1; }
     ret 0;
 }
 
