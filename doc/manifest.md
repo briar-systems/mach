@@ -518,7 +518,12 @@ rather than timestamp either way.
 **Output homing.** `{project.out}` resolves to the **root** project's expanded
 `out` in every manifest of the closure. A dependency's step outputs land in the
 consumer's output tree — exactly as a dependency's compiled modules do — and the
-dependency's own checkout is never written to.
+dependency's own checkout is never written to. For an exported dependency step,
+the command receives `{project.out}` as an absolute path rooted at the consumer;
+it does not depend on whether `dep/<alias>` is a directory or a local-path symlink,
+nor on the directory from which the consumer was invoked. An ordinary relative
+consumer root (including `./` segments) and its normalized absolute spelling produce
+the same expanded command and cache key.
 
 **Target environment.** Every step process additionally inherits the active
 build cell's target tuple as `MACH_TARGET_ISA`, `MACH_TARGET_OS`, and
