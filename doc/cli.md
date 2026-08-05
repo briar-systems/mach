@@ -113,6 +113,7 @@ unit's inputs — prints it, and exits without compiling or linking.
 | `--emit <kind>`| `obj`\|`exe`   | `obj` stops at the relocatable objects; `exe` (default) links a binary |
 | `--jobs <n>`   | count          | codegen worker threads (default: host CPUs; `1` serialises) |
 | `--pie`        | —              | emit a position-independent (ET_DYN) executable for ASLR instead of the default fixed-address one; opt-in (see below) |
+| `--subsystem <k>` | `console`\|`gui` | the environment a windows executable declares it runs under, overriding the artifact's `subsystem` key (see below) |
 | `-L <dir>`     | dir            | add a search directory for `-l`-resolved inputs; repeatable |
 | `-l <name>`    | name           | link a named object, archive, or target-format shared library, resolved through the `-L` dirs (see below); repeatable |
 | `--explain`    | —              | print the resolved build plan and exit without building |
@@ -126,6 +127,15 @@ linker emits a position-independent `ET_DYN` image the kernel loads at a
 randomized base (ASLR), self-relocated by the runtime before `main` (no `ld.so`).
 It applies to a static executable; combining `--pie` with a dynamic `-l<lib>`
 dependency is rejected.
+
+`--subsystem` overrides the selected artifact's
+[`subsystem`](manifest.md#artifactname) key for this invocation, with the usual
+precedence — the flag wins over the manifest, and the manifest over the `console`
+default. `gui` writes `IMAGE_SUBSYSTEM_WINDOWS_GUI` into the PE optional header so
+the Windows loader starts the process without attaching a console window; `console`
+is the default and what mach has always emitted. Only the PE writer reads it, so
+passing the flag on a non-windows target is accepted and changes nothing about the
+output — the same inertness the manifest key has.
 
 ### External link inputs
 
