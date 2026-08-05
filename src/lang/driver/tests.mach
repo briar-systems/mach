@@ -863,6 +863,80 @@ fun ut_lower_ok(src: str) i32 {
     ret code;
 }
 
+# the located sibling of `ut_lower_rejects`: 0 when `src` fails at LOWER with an
+# error diagnostic containing `needle` whose primary span is EXACTLY
+# [want_offset, want_offset + want_len) - not merely present in the sink, but
+# pointed at the right bytes. Pins the located form #2472 requires: a bare,
+# span-less message propagated to the top-level printer without ever reaching
+# `p.s.diags` at all, so `ut_lower_rejects` alone (message-only) would not have
+# caught a regression back to that shape.
+# ---
+# src:         the one-file fixture
+# needle:      substring the diagnostic message must contain
+# want_offset: expected byte offset of the diagnostic's primary span
+# want_len:    expected byte length of the diagnostic's primary span
+# ret:         0 on a match, 1 otherwise
+fun ut_lower_rejects_at(src: str, needle: str, want_offset: usize, want_len: usize) i32 {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    var names: [1]str;
+    names[0] = "main.mach";
+    var texts: [1]str;
+    texts[0] = src;
+    val pr: R.Result[project.Project, outcome.Fail] = ut_build(?s, ?alloc, ?names[0], ?texts[0], 1);
+    if (R.is_err[project.Project, outcome.Fail](pr)) { session.dnit(?s); ret 1; }
+    var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+
+    var code: i32 = 1;
+    val se: R.Result[bool, outcome.Fail] = passes.run_sema_pass(?p);
+    if (R.is_ok[bool, outcome.Fail](se)) {
+        val le: R.Result[bool, outcome.Fail] = passes.run_lower_pass(?p);
+        if (R.is_err[bool, outcome.Fail](le)) {
+            var i: usize = 0;
+            for (i < p.s.diags.len) {
+                if (p.s.diags.items[i].severity == diagnostic.SEVERITY_ERROR
+                 && ut_str_contains(p.s.diags.items[i].message, needle)
+                 && p.s.diags.items[i].loc.span.offset == want_offset
+                 && p.s.diags.items[i].loc.span.len    == want_len) {
+                    code = 0;
+                }
+                i = i + 1;
+            }
+        }
+    }
+    project.dnit_project(?p);
+    session.dnit(?s);
+    ret code;
+}
+
+# a malformed escape in a plain (non-comptime) string literal fires a LOCATED
+# diagnostic at LOWER - #2472 found it bare, with no file/line/snippet, unlike
+# every other fe/sema diagnostic. Root cause: sema never decodes string content
+# (matching comptime.eval's own deferral - #2465's sibling design), so the
+# escape table only runs during ME lowering, whose bare `str` error used to
+# propagate to the top-level printer without ever reaching the diagnostic sink.
+#
+# The span (offset 30, len 4) is the literal token `"\b"` itself, empirically
+# the exact position `mach build` points its caret at on this fixture -
+# `error --> file:1:31` (1-indexed column = offset + 1 on a single-line file).
+#
+# `\b` itself stays UNSUPPORTED: the escape set (`\n \t \r \\ \' \" \0 \xHH`) is
+# a deliberately minimal one, identical in comptime.eval's decoder and here, and
+# already the exact set `doc/language/literals.md` documents - `\b` is not an
+# oversight alongside `\a` `\f` `\v`, all equally absent. `\x08` is the
+# documented spelling and must keep compiling clean.
+test "mach.lang.driver:unknown_escape_has_location" {
+    var bad: i32 = 0;
+    if (ut_lower_rejects_at("fun main() i32 { val s: *u8 = \"\\b\"; ret 0; }\n",
+        "lower: unknown escape sequence in string literal", 30, 4) != 0) { bad = 1; }
+    if (ut_lower_ok("fun main() i32 { val s: *u8 = \"\\x08\"; ret 0; }\n") != 0) { bad = 1; }
+    ret bad;
+}
+
 # a vector op reaching instruction selection always resolves to DEFINED behavior
 # -- never an ICE, never a silent miscompile. driving real vector ops (a pointer
 # lane-wise add and a full-arity literal) through the HOST backend on each CI
@@ -7883,6 +7957,91 @@ test "mach.lang.build.engine.execute_warm_all:two_artifacts_both_link" {
     ret bad;
 }
 
+# the artifact identity in the build-config cache key is LOAD-BEARING, not
+# conservative padding: `$bin.name` folds the artifact being built into every
+# module's comptime context, so one source file legitimately compiles to
+# different code per artifact.
+#
+# The identity reaches the key through two REDUNDANT sites:
+# `write_semantic_fields` hashes `artifact` / `want_lib` into the request's
+# semantic hash, and `write_build_config` folds `config.bin_name` explicitly.
+# (`config.defines` rides the same fold and is per-artifact by construction, but
+# contributes nothing while `BuildUnit.defines` is nil.) Measured by mutation:
+# removing EITHER site alone leaves the cache correctly keyed and this test
+# still passes; removing BOTH makes the two artifacts share one compilation of
+# the shared module and this test fails. So this guards the last line of
+# defence - which is exactly the state anyone chasing artifact-axis cache
+# sharing arrives at, since no reuse appears until both are gone.
+#
+# That reuse is the artifact-axis form of the stale-reuse miscompile that closed
+# #1827 wontfix, and the reason #2485 was closed the same way. The failure mode
+# is SILENT - no diagnostic, no crash, just the second artifact carrying the
+# first one's code - so the assertion is on the delivered bytes.
+test "mach.lang.build.engine.execute_warm:bin_name_keys_the_artifact_cache" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    if (R.is_err[bool, str](driver.setup_registry(?s.registry))) { session.dnit(?s); ret 1; }
+
+    # one shared module, compiled into both artifacts, whose body forks on which
+    # artifact is being built - the two binaries must not agree.
+    var names: [3]str;
+    names[0] = "alpha.mach"; names[1] = "beta.mach"; names[2] = "shared.mach";
+    var texts: [3]str;
+    texts[0] = ut_cc3(?alloc, "use uniontest.shared.sh;\n#[symbol(\"", ut_entry_symbol(), "\")]\nfun sa() i32 { ret sh(); }\n");
+    texts[1] = ut_cc3(?alloc, "use uniontest.shared.sh;\n#[symbol(\"", ut_entry_symbol(), "\")]\nfun sb() i32 { ret sh(); }\n");
+    texts[2] = "pub fun sh() i32 { $if ($bin.name == \"alpha\") { ret 111; } ret 222; }\n";
+    val root_r: R.Result[str, str] = ut_scaffold_m(?alloc, ut_manifest_two_bins(), ?names[0], ?texts[0], 3);
+    if (R.is_err[str, str](root_r)) { session.dnit(?s); ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+
+    val mr: R.Result[manifest.Manifest, str] = driver.load_manifest(?s, root);
+    if (R.is_err[manifest.Manifest, str](mr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var m: manifest.Manifest = R.unwrap_ok[manifest.Manifest, str](mr);
+    var rq: request.BuildRequest = request.defaults();
+    rq.project_root = root;
+    val pr: R.Result[bplan.BuildPlan, outcome.Fail] = bplan.plan(?alloc, ?s.interner, ?s.registry, ?m, ?rq);
+    if (R.is_err[bplan.BuildPlan, outcome.Fail](pr)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    var bp: bplan.BuildPlan = R.unwrap_ok[bplan.BuildPlan, outcome.Fail](pr);
+
+    # both units on ONE session: the sharing the key has to defeat
+    var bad: i32 = 0;
+    if (bp.units.len != 2) { bad = 1; }
+
+    val r0: R.Result[outcome.BuildOutcome, outcome.Fail] = bengine.execute_warm(?bp, 0, ?s, ?alloc, nil, nil);
+    if (R.is_err[outcome.BuildOutcome, outcome.Fail](r0)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val bo0: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](r0);
+    val r1: R.Result[outcome.BuildOutcome, outcome.Fail] = bengine.execute_warm(?bp, 1, ?s, ?alloc, nil, nil);
+    if (R.is_err[outcome.BuildOutcome, outcome.Fail](r1)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val bo1: outcome.BuildOutcome = R.unwrap_ok[outcome.BuildOutcome, outcome.Fail](r1);
+
+    if (!bo0.ok || !bo1.ok)                               { bad = 1; }
+    if (bo0.artifacts.len != 1 || bo1.artifacts.len != 1) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+
+    val f0: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, bo0.artifacts.data[0].path);
+    val f1: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, bo1.artifacts.data[0].path);
+    if (R.is_err[Vector[u8], str](f0) || R.is_err[Vector[u8], str](f1)) { fs.remove_all(?alloc, root); session.dnit(?s); ret 1; }
+    val v0: Vector[u8] = R.unwrap_ok[Vector[u8], str](f0);
+    val v1: Vector[u8] = R.unwrap_ok[Vector[u8], str](f1);
+
+    var differ: bool = false;
+    if (v0.len != v1.len) { differ = true; }
+    or {
+        var i: usize = 0;
+        for (i < v0.len) {
+            if (v0.data[i] != v1.data[i]) { differ = true; brk; }
+            i = i + 1;
+        }
+    }
+    if (!differ) { bad = 1; }
+
+    fs.remove_all(?alloc, root);
+    session.dnit(?s);
+    ret bad;
+}
+
 # warm engine failure path: the fail event must carry the intact error text.
 # plan against a valid manifest, break the manifest on disk, execute_warm with
 # a render seam installed - the engine's per-call manifest load fails with a
@@ -10281,6 +10440,58 @@ test "mach.lang.driver:samewidth_cast_executes_on_a_6502_core_mos6502" {
     if (ut_mos_cast_sweep(?s, ?alloc, 16, "u16") != 0) { bad = 1; }
     if (ut_mos_cast_sweep(?s, ?alloc, 32, "u32") != 0) { bad = 1; }
     if (ut_mos_cast_sweep(?s, ?alloc, 64, "u64") != 0) { bad = 1; }
+
+    session.dnit(?s);
+    ret bad;
+}
+
+# mos6502 (#2280): a direct call's `JSR` operand records an RK_ABS16 relocation,
+# never the RK_ABS64 the encoder used to name for a 2-byte field
+#
+# A native-width call (both `f` and its callee `g` scalar, avoiding the
+# still-separately-unimplemented sret/ALLOCA frontier a wide-returning call hits)
+# now reaches `encode_call` at all only because #2280 also gave `MIR_CALL_RES` /
+# `MIR_ARG` the same no-op treatment every other target's encoder already holds
+# for them - found reachable-but-unarmed during this issue's own investigation,
+# a second instance of the exact defect shape #2483 named. Checked directly
+# against the object's own relocation table (not executed on the reference
+# core): reaching a genuine link + run needs mos6502's native image base / entry
+# point, #2119's own separate scope, not #2280's.
+test "mach.lang.driver:mos6502_call_records_abs16_relocation" {
+    var bad: i32 = 0;
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val pr: R.Result[project.Project, outcome.Fail] = ut_ct_edge_project(?s, ?alloc,
+        "fun g(v: u8) u8 { ret v; }\nfun f(v: u8) u8 { ret g(v); }\nfun main() i32 { ret 0; }\n", "mos");
+    if (R.is_err[project.Project, outcome.Fail](pr)) { bad = 1; }
+    or {
+        var p: project.Project = R.unwrap_ok[project.Project, outcome.Fail](pr);
+        if (ut_run_codegen_ok(?p) != 0) { bad = 1; }
+        or {
+            var found_abs16: u32 = 0;
+            var mi: u32 = 0;
+            for (mi < p.module_len) {
+                val m: *project.ModuleEntry = ?p.modules[mi];
+                if (m.object_image != nil) {
+                    val img: *of.ObjectImage = m.object_image;
+                    var ri: u32 = 0;
+                    for (ri < img.reloc_count) {
+                        if (img.relocations[ri].kind == of.RK_ABS16) { found_abs16 = found_abs16 + 1; }
+                        # the width-mismatched kind #2280 replaced must never reappear.
+                        if (img.relocations[ri].kind == of.RK_ABS64) { bad = 1; }
+                        ri = ri + 1;
+                    }
+                }
+                mi = mi + 1;
+            }
+            if (found_abs16 == 0) { bad = 1; }
+        }
+        project.dnit_project(?p);
+    }
 
     session.dnit(?s);
     ret bad;
