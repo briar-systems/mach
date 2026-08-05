@@ -12,6 +12,9 @@
 #                 execution cannot observe (PE ASLR bit, macho PIE bit). dispatched
 #                 on the artifact's own magic, so it is independent of how the case
 #                 maps to a leg. no LLVM; reads little-endian fields (every runner is LE).
+#   pe-imports  — like field, but walks the PE import directory and reports every
+#                 `<dll>:<symbol>` binding (#2510). PE-only; the observable for
+#                 two-level-namespace attribution, which execution cannot check.
 #   relro       — like field, but walks the ELF program headers for a PT_GNU_RELRO
 #                 (the static-PIE RELRO region). ELF-only; used by the elf-relro guard.
 #   flat-loader — load an os=freestanding, of=raw flat image via a tiny C loader
@@ -199,6 +202,110 @@ field_elf() {
     bin=$1
     etype=$(read_le_uint "$bin" 16 2)
     echo "e_type=$etype"
+}
+
+# read_cstr <file> <offset> — print the NUL-terminated string at <offset>. splitting
+# the byte window on NUL and taking the first record ends the string exactly where
+# the format does; a name longer than the window is not a case this suite writes.
+read_cstr() {
+    dd if="$1" bs=1 skip="$2" count=256 2>/dev/null | tr '\0' '\n' | head -n 1
+}
+
+# pe_rva_to_off <file> <sec_table_off> <nsec> <rva>
+# map an image RVA to a file offset through the section table. a section covers
+# [VirtualAddress, VirtualAddress + max(VirtualSize, SizeOfRawData)); the raw
+# window is the larger bound because a section whose VirtualSize rounds below its
+# raw size still owns those bytes on disk.
+pe_rva_to_off() {
+    bin=$1; sec=$2; nsec=$3; rva=$4
+    i=0
+    while [ "$i" -lt "$nsec" ]; do
+        base=$((sec + i * 40))
+        vaddr=$(read_le_uint "$bin" $((base + 12)) 4)
+        vsize=$(read_le_uint "$bin" $((base + 8)) 4)
+        rsize=$(read_le_uint "$bin" $((base + 16)) 4)
+        praw=$(read_le_uint "$bin" $((base + 20)) 4)
+        span=$vsize
+        [ "$rsize" -gt "$span" ] && span=$rsize
+        if [ "$rva" -ge "$vaddr" ] && [ "$rva" -lt $((vaddr + span)) ]; then
+            echo $((praw + rva - vaddr))
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+# produce_pe_imports <runmode> <target> <binary>
+# emit the PE import table's symbol->DLL bindings, one `<dll>:<symbol>` line per
+# imported function, sorted. this is the fact the two-level-namespace attribution
+# rules decide (#2510) and the one execution cannot observe: a wrongly attributed
+# import still links and still runs on the host that happens to export it, so only
+# the emitted descriptor distinguishes a correct binding from a lucky one.
+#
+# walks the PE32+ headers with coreutils alone (no LLVM on the linux legs): the
+# import data directory is entry 1 of the optional header's directory array, which
+# for PE32+ begins at optional-header offset 112, i.e. e_lfanew + 24 + 112.
+produce_pe_imports() {
+    bin=$3
+    elfanew=$(read_le_uint "$bin" 60 4)
+    nsec=$(read_le_uint "$bin" $((elfanew + 6)) 2)
+    optsize=$(read_le_uint "$bin" $((elfanew + 20)) 2)
+    sec=$((elfanew + 24 + optsize))
+
+    magic=$(read_le_uint "$bin" $((elfanew + 24)) 2)
+    if [ "$magic" != "523" ]; then
+        echo "int: pe-imports: not a PE32+ image (optional-header magic $magic)" >&2
+        return 2
+    fi
+
+    imp_rva=$(read_le_uint "$bin" $((elfanew + 24 + 112 + 8)) 4)
+    if [ "$imp_rva" -eq 0 ]; then
+        echo "no-import-table"
+        return 0
+    fi
+    imp_off=$(pe_rva_to_off "$bin" "$sec" "$nsec" "$imp_rva") || {
+        echo "int: pe-imports: import directory RVA $imp_rva is in no section" >&2
+        return 2
+    }
+
+    out=$(mktemp)
+    d=0
+    while :; do
+        desc=$((imp_off + d * 20))
+        ilt_rva=$(read_le_uint "$bin" "$desc" 4)
+        name_rva=$(read_le_uint "$bin" $((desc + 12)) 4)
+        iat_rva=$(read_le_uint "$bin" $((desc + 16)) 4)
+        # the descriptor array ends at an all-zero entry
+        if [ "$ilt_rva" -eq 0 ] && [ "$name_rva" -eq 0 ] && [ "$iat_rva" -eq 0 ]; then break; fi
+
+        name_off=$(pe_rva_to_off "$bin" "$sec" "$nsec" "$name_rva") || return 2
+        dll=$(read_cstr "$bin" "$name_off")
+
+        # prefer the ILT; a linker may leave it zero and describe imports through
+        # the IAT alone, which holds the same thunk encoding before the loader runs
+        thunks=$ilt_rva
+        [ "$thunks" -eq 0 ] && thunks=$iat_rva
+        thunk_off=$(pe_rva_to_off "$bin" "$sec" "$nsec" "$thunks") || return 2
+
+        t=0
+        while :; do
+            entry=$(read_le_uint "$bin" $((thunk_off + t * 8)) 8)
+            [ "$entry" -eq 0 ] && break
+            # bit 63 set marks an ordinal import, which names no symbol
+            if [ $((entry >> 63)) -eq 1 ]; then
+                echo "$dll:#$((entry & 0xFFFF))" >>"$out"
+            else
+                hn_off=$(pe_rva_to_off "$bin" "$sec" "$nsec" $((entry & 0x7FFFFFFF))) || return 2
+                echo "$dll:$(read_cstr "$bin" $((hn_off + 2)))" >>"$out"
+            fi
+            t=$((t + 1))
+        done
+        d=$((d + 1))
+    done
+
+    LC_ALL=C sort "$out"
+    rm -f "$out"
 }
 
 # produce_field <runmode> <target> <binary>
@@ -685,6 +792,7 @@ produce() {
         relro-fault) produce_relro_fault "$@" ;;
         panic-exit)  produce_panic_exit "$@" ;;
         field)       produce_field "$@" ;;
+        pe-imports)  produce_pe_imports "$@" ;;
         relro)       produce_relro "$@" ;;
         flat-loader) produce_flat_loader "$@" ;;
         built)       produce_built "$@" ;;
