@@ -343,15 +343,16 @@ fun apply_instr(mi: *mir.MirInstr, vt: *bool, nv: u32, pt: *bool, np: u32) bool 
 # alloc:    allocator for the diagnostic text
 # ret:      ok(true) when the instruction leaks nothing, or the violation's error
 fun check_instr(tgt: *target.Target, f: *mir.MirFunction, mi: *mir.MirInstr, vt: *bool, nv: u32, pt: *bool, np: u32, interner: *intern.Interner, alloc: *A.Allocator) R.Result[bool, str] {
-    # inline assembly is OPAQUE to this analysis: its secret ins / outs ride on the asm block's
-    # `{name}` bindings (not the instruction's operands - MIR_ASM has none the taint sees), and
-    # its body can branch on or address with a secret invisibly. Tainting its output slots would
-    # still miss a secret-dependent branch INSIDE the body, so it is not airtight; the sound,
-    # conservative rule is to FORBID inline asm in an oblivious function outright. (A vouching
-    # mechanism for hand-audited constant-time asm is a separate future design, not built here.)
+    # inline assembly is VALIDATED rather than refused (#2230), when the target
+    # supplies a scanner. The block's `{name}` bindings are its secret ins and outs -
+    # `MIR_ASM` carries no operands the taint sees - so the binding names whose slot
+    # vreg is tainted are handed to the ISA's scanner, which walks the instructions
+    # the body parses to and runs the same three checks this function runs on MIR.
+    #
+    # An ISA with NO scanner keeps the blanket refusal: that is the fail-closed
+    # default, and the reason the capability is optional rather than assumed.
     if (mi.opcode == mir.MIR_ASM) {
-        ret R.err[bool, str](leak_msg(alloc, interner, f.name,
-            "contains inline assembly, which cannot be verified constant-time and is not permitted in a #[oblivious] function; express the operation with the constant-time primitives, or move it to a non-oblivious function and `:^`-declassify at the boundary"));
+        ret check_asm(tgt, f, mi, vt, nv, interner, alloc);
     }
     # (a) a conditional branch whose condition is secret leaks through the taken path.
     if (mi.opcode == mir.MIR_CBR) {
@@ -406,6 +407,68 @@ fun check_instr(tgt: *target.Target, f: *mir.MirFunction, mi: *mir.MirInstr, vt:
                 ret R.err[bool, str](leak_msg(alloc, interner, f.name, ct_op_detail(cop)));
             }
         }
+    }
+    ret R.ok[bool, str](true);
+}
+
+# run the target's inline-asm constant-time scan over one MIR_ASM instruction
+#
+# The bridge between this validator's taint state and the ISA's parser. A binding
+# whose slot vreg is tainted names a SECRET in of the block; the scanner walks the
+# parsed instructions and reports the first leak. An ISA that supplies no scanner
+# keeps the blanket refusal - the fail-closed default (#2230).
+# ---
+# tgt:      resolved target, supplying the scanner and the ct capability flags
+# f:        the owning function, for the diagnostic's name
+# mi:       the MIR_ASM instruction
+# vt/nv:    the vreg taint array and its length
+# interner: session interner for the binding names and the diagnostic (may be nil)
+# alloc:    allocator for the diagnostic text
+# ret:      ok(true) when the block leaks nothing, or the violation
+fun check_asm(tgt: *target.Target, f: *mir.MirFunction, mi: *mir.MirInstr, vt: *bool, nv: u32,
+              interner: *intern.Interner, alloc: *A.Allocator) R.Result[bool, str] {
+    # FAIL CLOSED on both unverifiable shapes. No scanner (or no arch at all) is the
+    # capability's absence, which keeps the blanket refusal. A MIR_ASM carrying NO
+    # payload is worse: there is no body to walk, so accepting it would certify a
+    # block this validator never read.
+    if (tgt.arch == nil || tgt.arch.asm_ct_scan == nil || mi.asm_block == nil) {
+        ret R.err[bool, str](leak_msg(alloc, interner, f.name,
+            "contains inline assembly, which cannot be verified constant-time and is not permitted in a #[oblivious] function; express the operation with the constant-time primitives, or move it to a non-oblivious function and `:^`-declassify at the boundary"));
+    }
+    val blk: *mir.MirAsm = mi.asm_block;
+
+    # the bindings whose storage is secret: taint enters the block through exactly
+    # these. resolved to text because the ISA contract holds no interner.
+    var names: *str = nil;
+    var n: u32 = 0;
+    if (blk.bind_count > 0) {
+        val rn: R.Result[*str, str] = A.allocate[str](alloc, blk.bind_count::usize);
+        if (R.is_err[*str, str](rn)) { ret R.err[bool, str](R.unwrap_err[*str, str](rn)); }
+        names = R.unwrap_ok[*str, str](rn);
+        var i: u32 = 0;
+        for (i < blk.bind_count) {
+            val b: *mir.MirAsmBind = ?blk.binds[i];
+            if (b.secret) {
+                val nm: O.Option[str] = intern.lookup(interner, b.name);
+                if (O.is_some[str](nm)) {
+                    names[n] = O.unwrap[str](nm);
+                    n = n + 1;
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    val scan: isa.AsmCtScanFn = tgt.arch.asm_ct_scan;
+    val r: R.Result[bool, str] = scan(blk.body, names, n, tgt.model.ct_trust_mul, tgt.model.ct_trust_var_shift, alloc);
+
+    # the name list is scratch for this one scan: the scanner borrows the strings and
+    # keeps nothing, so it is released on BOTH exits. a `bind_count` of zero allocated
+    # nothing and leaves `names` nil, which `deallocate` is not asked to free.
+    if (names != nil) { A.deallocate[str](alloc, names, blk.bind_count::usize); }
+
+    if (R.is_err[bool, str](r)) {
+        ret R.err[bool, str](leak_msg(alloc, interner, f.name, R.unwrap_err[bool, str](r)));
     }
     ret R.ok[bool, str](true);
 }
@@ -522,14 +585,7 @@ fun fn_name(interner: *intern.Interner, id: intern.StrId) str {
 
 # a virtual register with a given secret seed, other fields defaulted (test helper)
 fun t_vreg(id: u32, secret: bool) mir.MirVReg {
-    var v: mir.MirVReg;
-    v.id         = id;
-    v.class      = mir.REG_CLASS_GP;
-    v.spill_slot = -1;
-    v.assigned   = mir.MIR_VREG_NIL;
-    v.vector     = false;
-    v.secret     = secret;
-    ret v;
+    ret mir.vreg(id, mir.REG_CLASS_GP, false, secret);
 }
 
 # a MIR instruction over a borrowed operand array (test helper)

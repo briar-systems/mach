@@ -67,21 +67,125 @@ An indirect call clobbers exactly as a direct one does — the callee's caller-s
 registers, which the surrounding block's barrier already covers. The register or
 memory holding the target is **read**, not written.
 
-## Raw bytes
+## Raw encodings
 
-`.byte` emits its values verbatim, for an encoding the ISA's mnemonic table does
-not name:
+Four data directives emit their values verbatim, for an encoding the ISA's mnemonic
+table does not name. They work on every target:
 
 ```mach
 asm x86_64 {
     .byte 0x0f, 0x01, 0xd0    # xgetbv
 }
+
+asm aarch64 {
+    .word 0xd53be040          # mrs x0, cntvct_el0
+}
+
+asm riscv64 {
+    .word 0xc0102573          # csrr a0, time
+}
 ```
 
-One directive carries a whole sequence (up to 256 values), not four. A value that
-does not fit in a byte is refused. Raw bytes are an instruction stream the parser
-cannot read, so the block's clobber set becomes **every register in every bank** —
-which is why a real mnemonic is always preferable where one exists.
+The widths are GNU as's, per target — `.word` is the one that differs:
+
+| directive | x86-64 | aarch64 / riscv64 |
+|---|---|---|
+| `.byte` | 1 byte | 1 byte |
+| `.word` | **2 bytes** | **4 bytes** |
+| `.long` | 4 bytes | 4 bytes |
+| `.quad` | 8 bytes | 8 bytes |
+
+Values are written in the target's byte order, so `.word 0xd503201f` is the aarch64
+`nop` as its manual prints it. A non-negative value is read unsigned (`.quad
+0xFFFFFFFFFFFFFFFF` is a legal address); a negative one is its two's complement at the
+directive's width. A value the width cannot hold is refused rather than truncated, and
+one directive carries a whole sequence — up to 256 payload bytes — not four.
+
+On aarch64 and riscv64 a statement must emit a whole number of instruction words:
+`.byte 0x1f, 0x20, 0x03` is refused, because three bytes would misalign every
+instruction after it. x86-64 has no such constraint.
+
+A raw encoding is an instruction stream the parser cannot read, so the block's clobber
+set becomes **every register in every bank**, and an `#[oblivious]` function may not
+contain one at all — which is why a real mnemonic is always preferable where one
+exists.
+
+## System registers (aarch64)
+
+`mrs` and `msr` name a system register by its architectural name, in either case:
+
+```mach
+asm aarch64 {
+    mrs x0, cntvct_el0        # the virtual counter
+    mrs x1, CNTFRQ_EL0        # ... and its frequency, capitalized as ARM spells it
+    msr vbar_el1, x2          # install an exception vector base
+    msr daifset, 0xf          # mask every interrupt
+}
+```
+
+The named set covers what freestanding code reaches for — the generic timer, the
+exception vectors and their syndrome registers, the MMU control registers, the thread
+pointers, and enough identification registers to detect a CPU. It is deliberately not
+exhaustive: **any** system register is also nameable by its encoding, exactly as ARM and
+GNU as spell it, which is what makes the surface complete rather than a list that always
+lags the architecture:
+
+```mach
+asm aarch64 {
+    mrs x0, s3_3_c14_c0_2     # the same register as `mrs x0, cntvct_el0`
+}
+```
+
+`op0` must be 2 or 3 — the whole of the `mrs` / `msr` register space — and each remaining
+field is bounded by its own width. A field the architecture cannot hold is refused rather
+than truncated, because a truncated selector would name a *different* register than the
+text does.
+
+`msr <field>, #imm` writes a PSTATE field (`daifset`, `daifclr`, `spsel`, `pan`, `uao`,
+`ssbs`, `dit`, `tco`). The architecture spells these by name only, so there is no numeric
+escape for this form.
+
+Access permission is not checked: whether a register is writable depends on the exception
+level the code runs at, which the compiler does not know. Writing a register that is
+read-only at the current level traps at run time, as the architecture defines.
+
+## Control-and-status registers (riscv64)
+
+The Zicsr extension's six instructions — read-write, read-set and read-clear, each
+taking its source from a register or a five-bit immediate — reach a CSR by name:
+
+```mach
+asm riscv64 {
+    csrrw a0, mstatus, a1   # read mstatus into a0, write a1 into it
+    csrr  a0, mtvec         # csrrs a0, mtvec, x0 - the read-only pseudo
+    csrw  stvec, a1         # csrrw x0, stvec, a1 - install a trap vector
+    rdtime a0               # csrrs a0, time, x0  - the unprivileged counters
+}
+```
+
+The named set covers what freestanding code reaches for — the machine and supervisor
+trap vector / exception-PC / cause registers, the interrupt enable / pending pairs, the
+address-translation root, the hart id an SMP boot path reads to tell cores apart, and
+the three unprivileged counters `rdtime` / `rdcycle` / `rdinstret` name. It is
+deliberately not exhaustive: the privileged spec defines several hundred addresses
+across three privilege levels, so **any** CSR is also reachable by its numeric address,
+exactly as a name resolves to one:
+
+```mach
+asm riscv64 {
+    csrr a0, 0xc01   # the same register as `csrr a0, time`
+}
+```
+
+Unlike aarch64's system registers, RISC-V spells no separate escape syntax for this —
+a CSR operand simply parses as the ordinary integer literal it looks like, bounded to
+the twelve bits a CSR address occupies. `csrrwi` / `csrrsi` / `csrrci` (and their
+`csrwi` / `csrsi` / `csrci` pseudos) take a five-bit unsigned immediate in the same
+position a register would occupy in the non-`i` form.
+
+Access permission is not checked: whether a CSR is readable or writable depends on the
+privilege level the code runs at, which the compiler does not know. Accessing a CSR the
+current level cannot reach traps at run time, as the architecture defines.
 
 ## What the compiler infers
 

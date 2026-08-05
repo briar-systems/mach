@@ -10,6 +10,7 @@
 # re-exports the leaf id types so downstream code can spell them as ir.BlockId /
 # ir.InstructionId / ir.BLOCK_NIL / ir.INSTR_NIL.
 
+use std.allocator.arena;
 use std.allocator.page;
 use std.collections.map;
 use std.memory;
@@ -85,8 +86,9 @@ pub val FN_FLAG_NAKED: u32 = 0x200;
 # name:  interned source local name (the text inside `{ }`)
 # instr: OP_ALLOCA instruction id naming the local's storage slot
 pub rec IrAsmBind {
-    name:  intern.StrId;
-    instr: id.InstructionId;
+    name:   intern.StrId;
+    instr:  id.InstructionId;
+    secret: bool;
 }
 
 # the inline-asm payload attached to an OP_ASM instruction. kept out of the
@@ -356,6 +358,54 @@ pub rec Global {
     is_local:  bool;
     align:     u32;
     section:   intern.StrId;
+}
+
+# the private allocation channel one IR module owns
+#
+# Every byte a Module owns - its functions, instruction pools, IR type table,
+# const-aggregate blobs, asm bindings - is bumped out of `ar`, so the whole
+# module is released by one `home_dnit` instead of a walk that hands each field
+# back individually. That makes the module the sole owner of its free set, which
+# is what lets two modules be optimized concurrently: a pass allocating through
+# `Module.alloc` touches only its own module's arena, never a channel shared
+# with another thread (#2100).
+#
+# The record must be heap-boxed and outlive every reader of its module, because
+# `Module.alloc` points into it.
+# ---
+# backing: page allocator the arena draws its chunks from
+# ar:      the bump arena owning the module's storage
+# alloc:   allocator interface over `ar`; the module's `alloc` points here
+pub rec ModuleHome {
+    backing: A.Allocator;
+    ar:      arena.Arena;
+    alloc:   A.Allocator;
+}
+
+# bring a ModuleHome up: a page-backed arena and the allocator interface over it
+#
+# The arena starts empty (lazy first chunk), so a module that lowers to nothing
+# costs no pages.
+# ---
+# h:   the home to initialise (must already sit at its final address)
+# ret: none on success, or the first allocation error
+pub fun home_init(h: *ModuleHome) O.Option[str] {
+    if (h == nil) { ret O.some[str]("ir: module home is nil"); }
+    if (O.is_some[str](page.make(?h.backing)))             { ret O.some[str]("ir: module home backing alloc failed"); }
+    if (O.is_some[str](arena.init(?h.ar, ?h.backing, 0)))  { ret O.some[str]("ir: module home arena init failed"); }
+    if (O.is_some[str](arena.make(?h.alloc, ?h.ar)))       { arena.dnit(?h.ar); ret O.some[str]("ir: module home arena bind failed"); }
+    ret O.none[str]();
+}
+
+# release every byte the home's arena handed out, and the arena's chunks with it
+#
+# This replaces a per-field `dnit` walk over the module: after it returns, the
+# module's storage is gone, so the module must not be read again.
+# ---
+# h: the home to tear down
+pub fun home_dnit(h: *ModuleHome) {
+    if (h == nil) { ret; }
+    arena.dnit(?h.ar);
 }
 
 # an IR module: one per source module
@@ -1707,5 +1757,40 @@ test "mach.lang.me.ir.inline_site_channel:add_get_group" {
     if (instr_inline_site_of(caller, 8::id.InstructionId) != 0) { dnit(?m); ret 1; }
 
     dnit(?m);
+    ret 0;
+}
+
+# a ModuleHome is a self-contained allocation channel: a module built through it
+# owns every byte from that arena and nothing from anywhere else, so `home_dnit`
+# alone releases the whole artifact. checked by building through the home and then
+# tearing only the home down -- the size-checking allocator that backs the other
+# tests would report any byte the module took from a foreign channel, and this
+# asserts the complementary property, that the home really is one (#2100)
+test "mach.lang.me.ir.home:owns_the_whole_module" {
+    var h: ModuleHome;
+    if (O.is_some[str](home_init(?h))) { ret 1; }
+
+    val rm: R.Result[Module, str] = init(?h.alloc, 42::intern.StrId);
+    if (R.is_err[Module, str](rm)) { home_dnit(?h); ret 1; }
+    var m: Module = R.unwrap_ok[Module, str](rm);
+    if (m.alloc != ?h.alloc) { home_dnit(?h); ret 1; }
+
+    val rvoid: R.Result[type.IrTypeId, str] = type.intern_void(?m.types);
+    if (R.is_err[type.IrTypeId, str](rvoid)) { home_dnit(?h); ret 1; }
+    val rsig: R.Result[type.IrTypeId, str] = type.intern_fn(?m.types, R.unwrap_ok[type.IrTypeId, str](rvoid), nil, 0);
+    if (R.is_err[type.IrTypeId, str](rsig)) { home_dnit(?h); ret 1; }
+    val sigty: type.IrTypeId = R.unwrap_ok[type.IrTypeId, str](rsig);
+
+    # enough functions to force the module's arrays past their seed capacity, so the
+    # arena has grown a second chunk and teardown must walk the chunk list.
+    var i: u32 = 0;
+    for (i < 32) {
+        if (R.is_err[u32, str](function_add(?m, (i + 1)::intern.StrId, sigty, 0))) { home_dnit(?h); ret 1; }
+        i = i + 1;
+    }
+    if (m.function_len != 32) { home_dnit(?h); ret 1; }
+
+    # one teardown, no `dnit(?m)`: the arena is the module's free set.
+    home_dnit(?h);
     ret 0;
 }

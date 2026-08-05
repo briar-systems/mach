@@ -28,6 +28,7 @@
 # and how one resolved branch displacement is written into the text. No opcode,
 # register, displacement-width, or byte-encoding knowledge lives here.
 
+use std.format;
 use std.io.writer;
 use std.system.panic.panic;
 use std.types.bool.bool;
@@ -390,7 +391,8 @@ pub rec ByteBuf {
 # notes:      buffered notifications, in emission order (nil until the first push)
 # note_count: number of buffered notifications
 # note_cap:   capacity of `notes`
-# note_insts: how many of the buffered notifications are instructions
+# note_insts: how many of the buffered notifications are one instruction-word wide
+#             (ASM_NOTE_INST and ASM_NOTE_BYTES alike)
 # claims:     instruction notifications accepted, buffered and streamed alike
 # refused:    notifications whose declared start was not where the last claim ended
 pub rec AsmSink {
@@ -412,25 +414,40 @@ pub rec AsmSink {
 pub val ASM_NOTE_INST:  u8 = 0;  # one emitted machine instruction
 pub val ASM_NOTE_FUNC:  u8 = 1;  # a function's heading; emits no bytes
 pub val ASM_NOTE_BLOCK: u8 = 2;  # a block's local label; emits no bytes
+pub val ASM_NOTE_BYTES: u8 = 3;  # one instruction-word-wide slice of a raw-byte
+                                  # directive's payload (`bytes`, `ASM_NOTE_BYTES_WIDTH`
+                                  # of them valid)
 
-# one buffered notification: a machine instruction the encoder emitted, or a
-# function / block heading
+# the payload width one buffered `ASM_NOTE_BYTES` note carries
+#
+# A printer that buffers its notifications accounts a directive exactly as it
+# accounts an instruction - one note per instruction-word's worth of bytes - so a
+# directive wider than one word is pushed as several notes, each this wide (#2493).
+# Every fixed-width ISA that buffers (today, only riscv64) emits four-byte words, so
+# one constant serves; a buffering target with a different fixed width would need
+# its own note kind rather than stretching this one.
+pub val ASM_NOTE_BYTES_WIDTH: usize = 4;
+
+# one buffered notification: a machine instruction the encoder emitted, a function /
+# block heading, or a slice of a raw-byte directive's payload
 #
 # `off` is the instruction's `.text` offset, kept correct by `insert_text` exactly
 # as the block and fixup offsets are, so a relaxation pass can find the note whose
 # text it is about to rewrite after any number of earlier growths.
 # ---
-# kind: ASM_NOTE_INST / ASM_NOTE_FUNC / ASM_NOTE_BLOCK
-# off:  `.text` byte offset of the instruction's first byte
-# inst: the emitted machine instruction (ASM_NOTE_INST)
-# name: the function's interned name (ASM_NOTE_FUNC)
-# id:   the block id (ASM_NOTE_BLOCK)
+# kind:  ASM_NOTE_INST / ASM_NOTE_FUNC / ASM_NOTE_BLOCK / ASM_NOTE_BYTES
+# off:   `.text` byte offset of the note's first byte (ASM_NOTE_INST, ASM_NOTE_BYTES)
+# inst:  the emitted machine instruction (ASM_NOTE_INST)
+# name:  the function's interned name (ASM_NOTE_FUNC)
+# id:    the block id (ASM_NOTE_BLOCK)
+# bytes: the payload slice, `ASM_NOTE_BYTES_WIDTH` bytes (ASM_NOTE_BYTES)
 pub rec AsmNote {
-    kind: u8;
-    off:  u32;
-    inst: isa.Inst;
-    name: intern.StrId;
-    id:   u32;
+    kind:  u8;
+    off:   u32;
+    inst:  isa.Inst;
+    name:  intern.StrId;
+    id:    u32;
+    bytes: [ASM_NOTE_BYTES_WIDTH]u8;
 }
 
 # initial capacity of a sink's note buffer
@@ -476,7 +493,9 @@ pub fun note_blank() AsmNote {
 # An instruction note claims its byte range exactly as an immediate render does, and
 # it needs no separate start: `AsmNote.off` is already the instruction's first byte,
 # so the note itself declares where its claim begins and the tiling check falls out
-# of the buffered path for free.
+# of the buffered path for free. `ASM_NOTE_BYTES` claims the same way - it is a
+# directive's payload, but it is exactly one instruction-word wide, so it counts
+# against `note_insts` (and the totality check built on it) identically (#2493).
 # ---
 # buf: the encoder byte sink carrying the assembly sink
 # n:   the notification to buffer
@@ -490,7 +509,7 @@ pub fun note_push(buf: *ByteBuf, n: *AsmNote) R.Result[bool, str] {
     }
     s.notes[s.note_count] = @n;
     s.note_count = s.note_count + 1;
-    if (n.kind == ASM_NOTE_INST) {
+    if (n.kind == ASM_NOTE_INST || n.kind == ASM_NOTE_BYTES) {
         s.note_insts = s.note_insts + 1;
         sink_claim(buf, n.off::usize);
     }
@@ -594,15 +613,17 @@ pub fun notes_reset(buf: *ByteBuf) {
     buf.asm.note_insts = 0;
 }
 
-# how many buffered notifications are instructions
+# how many buffered notifications are one instruction-word wide
 #
 # A fixed-width ISA turns this into a whole-function totality check - emitted bytes
-# must equal the instruction count times the instruction width - which covers the
-# out-of-sequence growth a relaxation pass produces, where the per-claim tiling in
-# `sink_claim` has no sequential cursor to check against.
+# must equal this count times the instruction width - which covers the out-of-sequence
+# growth a relaxation pass produces, where the per-claim tiling in `sink_claim` has no
+# sequential cursor to check against. A raw-byte directive's payload is not an
+# instruction, but it is exactly one word wide per `ASM_NOTE_BYTES` note, so it counts
+# here too rather than opening a blind spot the totality check cannot see (#2493).
 # ---
 # buf: the encoder byte sink
-# ret: the instruction-notification count, or 0 when no sink is buffering
+# ret: the instruction-word-notification count, or 0 when no sink is buffering
 pub fun note_inst_count(buf: *ByteBuf) u32 {
     if (!sink_active(buf)) { ret 0; }
     ret buf.asm.note_insts;
@@ -690,6 +711,75 @@ pub fun sink_claim(buf: *ByteBuf, start: usize) {
     }
     s.accounted = buf.len;
     s.claims    = s.claims + 1;
+}
+
+# write a raw-byte directive's payload as `  .byte 0x.., 0x.., ...\n`
+#
+# THE ONE PLACE `.byte` TEXT IS PRODUCED. A directive renders identically on every
+# target - it is a payload, not an instruction - so putting the text here rather than
+# in each printer means a target cannot render it differently, and a target added
+# later inherits it rather than reimplementing it (#2467).
+#
+# Pure text: no sink accounting. `render_bytes_directive` wraps this for a printer
+# that renders on the spot, claiming the bytes in the same call it writes them; one
+# that BUFFERS its notifications (riscv64, #2493) claims them once at push time and
+# calls this directly when the buffered note is replayed, so the claim is never made
+# twice for the same bytes.
+# ---
+# out:   destination writer
+# bytes: the payload
+# n:     number of payload bytes
+# ret:   true on success, or the first write error
+pub fun render_bytes_text(out: *writer.Writer, bytes: *u8, n: usize) R.Result[bool, str] {
+    val ri: R.Result[usize, str] = format.write_str(out, "  .byte ");
+    if (R.is_err[usize, str](ri)) { ret R.err[bool, str](R.unwrap_err[usize, str](ri)); }
+    var i: usize = 0;
+    for (i < n) {
+        if (i > 0) {
+            val rc: R.Result[usize, str] = format.write_str(out, ", ");
+            if (R.is_err[usize, str](rc)) { ret R.err[bool, str](R.unwrap_err[usize, str](rc)); }
+        }
+        val rb: R.Result[usize, str] = format.write_str(out, "0x");
+        if (R.is_err[usize, str](rb)) { ret R.err[bool, str](R.unwrap_err[usize, str](rb)); }
+        var hex: [3]u8;
+        hex[0] = hex_digit((bytes[i] >> 4) & 0xF);
+        hex[1] = hex_digit(bytes[i] & 0xF);
+        hex[2] = 0;
+        val rh: R.Result[usize, str] = format.write_str(out, (?hex[0])::str);
+        if (R.is_err[usize, str](rh)) { ret R.err[bool, str](R.unwrap_err[usize, str](rh)); }
+        i = i + 1;
+    }
+    val rn: R.Result[usize, str] = format.write_str(out, "\n");
+    if (R.is_err[usize, str](rn)) { ret R.err[bool, str](R.unwrap_err[usize, str](rn)); }
+    ret R.ok[bool, str](true);
+}
+
+# render a raw-byte directive's payload into the sink and account for its bytes
+#
+# The per-ISA half is only WHEN to call this: a printer that renders on the spot
+# (x86-64, aarch64) calls it as the bytes are emitted, so the directive lands in
+# program order and is accounted in the same call. A printer that buffers its
+# notifications for a later pass (riscv64) claims the bytes at push time instead
+# (`ASM_NOTE_BYTES`) and calls `render_bytes_text` directly when it replays them,
+# never this function (#2493).
+# ---
+# buf:   the encoder byte sink carrying the assembly sink
+# bytes: the payload
+# n:     number of payload bytes
+# start: `.text` offset of the payload's first byte
+# ret:   true on success, or the first write error
+pub fun render_bytes_directive(buf: *ByteBuf, bytes: *u8, n: usize, start: usize) R.Result[bool, str] {
+    if (!sink_active(buf)) { ret R.ok[bool, str](true); }
+    val res: R.Result[bool, str] = render_bytes_text(buf.asm.out, bytes, n);
+    if (R.is_err[bool, str](res)) { ret res; }
+    sink_claim(buf, start);
+    ret R.ok[bool, str](true);
+}
+
+# one lowercase hex digit for a nibble
+fun hex_digit(v: u8) u8 {
+    if (v < 10) { ret 48 + v; }
+    ret 87 + v;
 }
 
 # the number of instruction notifications this sink accepted

@@ -168,6 +168,15 @@ fun encode_instr(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr, f
     if (mir.is_fused_cbr(op)) { ret encode_sel_cbr(st, mi, fn_base); }
     if (op == mir.MIR_CALL) { ret encode_call(st, mi); }
 
+    # MIR_CALL_RES is a pure liveness marker (its result vreg was bound by the
+    # preceding return-register MIR_MOV) and MIR_ARG only appears on the off-path
+    # generic lowering; neither emits bytes - the same no-op x64/encode.mach and
+    # every other target hold for these two survivors of instruction selection
+    # (found reachable-but-unarmed during #2280's own investigation: a native-width
+    # call reaches this dispatch with no arm for either, falling into the generic
+    # "instruction encoding is not yet implemented" refusal).
+    if (op == mir.MIR_CALL_RES || op == mir.MIR_ARG) { ret R.ok[bool, str](true); }
+
     ret R.err[bool, str](unencodable_message(op));
 }
 
@@ -199,19 +208,24 @@ fun encode_alu(st: *enc.EncodeState, mi: *mir.MirInstr, op: mir.MirOpcode) R.Res
     val b:   *mir.MirOperand = ?mi.operands[2];
     if (dst.kind != mir.MIR_OP_PREG) { ret R.err[bool, str](unencodable_message(op)); }
 
-    val res_ld: R.Result[bool, str] = emit_load_a(st, a);
-    if (R.is_err[bool, str](res_ld)) { ret res_ld; }
-
-    if (op == mir.MIR_ADD) { enc.emit_byte(?st.buf, OP_CLC); }
-    if (op == mir.MIR_SUB) { enc.emit_byte(?st.buf, OP_SEC); }
-
+    # every operation is named, and the selection happens BEFORE any byte is
+    # emitted: an opcode this encoder does not realize is refused with nothing
+    # written, rather than riding the default into an EOR (#2435). the reachable set
+    # is bounded by `encode_instr`'s dispatch, one function away.
     var imm_op: u8 = 0;
     var zp_op:  u8 = 0;
     if (op == mir.MIR_ADD) { imm_op = OP_ADC_IMM; zp_op = OP_ADC_ZP; }
     or (op == mir.MIR_SUB) { imm_op = OP_SBC_IMM; zp_op = OP_SBC_ZP; }
     or (op == mir.MIR_AND) { imm_op = OP_AND_IMM; zp_op = OP_AND_ZP; }
     or (op == mir.MIR_OR)  { imm_op = OP_ORA_IMM; zp_op = OP_ORA_ZP; }
-    or                     { imm_op = OP_EOR_IMM; zp_op = OP_EOR_ZP; }
+    or (op == mir.MIR_XOR) { imm_op = OP_EOR_IMM; zp_op = OP_EOR_ZP; }
+    or                     { ret R.err[bool, str](unencodable_message(op)); }
+
+    val res_ld: R.Result[bool, str] = emit_load_a(st, a);
+    if (R.is_err[bool, str](res_ld)) { ret res_ld; }
+
+    if (op == mir.MIR_ADD) { enc.emit_byte(?st.buf, OP_CLC); }
+    if (op == mir.MIR_SUB) { enc.emit_byte(?st.buf, OP_SEC); }
 
     val res_op: R.Result[bool, str] = emit_operand(st, b, imm_op, zp_op, op);
     if (R.is_err[bool, str](res_op)) { ret res_op; }
@@ -347,6 +361,12 @@ fun encode_shift(st: *enc.EncodeState, mi: *mir.MirInstr, op: mir.MirOpcode) R.R
     if (cnt.imm < 0 || cnt.imm > 7) {
         ret R.err[bool, str]("mos6502: a byte shift count must be normalized to the 8-bit operation width by width legalization before encoding");
     }
+    # every direction is named, and the check precedes the first emitted byte: an
+    # opcode this encoder does not realize is refused with nothing written, rather
+    # than riding the default into the arithmetic-shift sequence (#2435).
+    if (op != mir.MIR_SHL && op != mir.MIR_SHR_U && op != mir.MIR_SHR_S) {
+        ret R.err[bool, str](unencodable_message(op));
+    }
 
     val res_ld: R.Result[bool, str] = emit_load_a(st, ?mi.operands[1]);
     if (R.is_err[bool, str](res_ld)) { ret res_ld; }
@@ -392,6 +412,13 @@ fun encode_cmp(st: *enc.EncodeState, mi: *mir.MirInstr, op: mir.MirOpcode) R.Res
     if (mi.operand_count != 3) { ret R.err[bool, str]("mos6502: malformed compare"); }
     val dst: *mir.MirOperand = ?mi.operands[0];
     if (dst.kind != mir.MIR_OP_PREG) { ret R.err[bool, str](unencodable_message(op)); }
+    # every relation is named, and the check precedes the first emitted byte: a
+    # relation this encoder does not realize is refused with nothing written, rather
+    # than riding the default into the difference-to-zero equality form (#2435).
+    # the signed and <= relations are the documented frontier this names.
+    if (op != mir.MIR_CMP_EQ && op != mir.MIR_CMP_NE && op != mir.MIR_CMP_LT_U) {
+        ret R.err[bool, str](unencodable_message(op));
+    }
 
     val res_ld: R.Result[bool, str] = emit_load_a(st, ?mi.operands[1]);
     if (R.is_err[bool, str](res_ld)) { ret res_ld; }
@@ -510,8 +537,11 @@ fun emit_jmp(st: *enc.EncodeState, target_block: u32, fn_base: u32) R.Result[boo
     ret enc.push_fixup(st, patch_pos, next_ip, target_block, fn_base);
 }
 
-# encode a direct call as `JSR callee` (absolute), recording a relocation against
-# the callee symbol for the 16-bit address field
+# encode a direct call as `JSR callee` (absolute), recording an RK_ABS16
+# relocation against the callee symbol for the 16-bit address field (#2280: the
+# kind matches this target's own pointer width, and mos6502.reloc names the
+# applier that resolves it - a naming half with no resolving half is exactly the
+# defect #2244 made the vtable's own construction refuse to produce)
 fun encode_call(st: *enc.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count == 0) { ret R.err[bool, str]("mos6502: malformed call"); }
     val callee: *mir.MirOperand = ?mi.operands[0];
@@ -520,7 +550,7 @@ fun encode_call(st: *enc.EncodeState, mi: *mir.MirInstr) R.Result[bool, str] {
     }
     enc.emit_byte(?st.buf, OP_JSR_ABS);
     val site: u32 = st.buf.len::u32;
-    val res_rel: R.Result[bool, str] = enc.push_reloc(st, site, of.RK_ABS64, callee.sym, callee.sym_off);
+    val res_rel: R.Result[bool, str] = enc.push_reloc(st, site, of.RK_ABS16, callee.sym, callee.sym_off);
     if (R.is_err[bool, str](res_rel)) { ret res_rel; }
     # 16-bit absolute address placeholder patched by the linker via the relocation.
     enc.emit_byte(?st.buf, 0);
@@ -771,6 +801,16 @@ pub rec Core {
 # Runs from `core.pc` until `RTS`, accumulating cycles. Any opcode outside the pinned set,
 # any access outside the image, and any run that does not terminate is a failure rather
 # than a silently truncated answer.
+#
+# THE STEP CAP IS A RUNAWAY BACKSTOP, NOT A WORKLOAD CEILING - raised from 4096 to 65536
+# (#2344) once a legitimate, terminating sequence exceeded it: the width legalizer's
+# double-and-add wide multiply is honest-cost by design (bits stages of a carry chain
+# plus two shifts, #2344's own doc comment), and a u64 runtime multiply's ~48KB of
+# emitted bytes needs on the close order of 16-19K real 6502 instructions to finish - a
+# real, executed answer, not a hang. 65536 keeps the backstop's actual job (catching a
+# genuinely non-terminating sequence, the #2158-shaped failure this core exists to
+# catch) while giving the largest expansion this pass has ever produced room to run to
+# completion.
 # ---
 # mem:  the flat memory image (zero page at 0, code wherever `core.pc` points)
 # size: the image size in bytes
@@ -778,7 +818,7 @@ pub rec Core {
 # ret:  true when the run reached RTS inside the pinned opcode set
 pub fun exec_reference(mem: *u8, size: usize, core: *Core) bool {
     var steps: u32 = 0;
-    for (steps < 4096) {
+    for (steps < 65536) {
         steps = steps + 1;
         if (core.pc::usize >= size) { ret false; }
         val op:  u8    = mem[core.pc::usize];
@@ -1394,4 +1434,64 @@ test "mach.lang.target.isa.mos6502.encode:page_crossing_costs_are_address_only" 
     enc.buf_dnit(?st.buf);
     A.deallocate[u8](?alloc, mem, T_MEM_SIZE);
     ret 0;
+}
+
+# an operation this encoder does not realize is REFUSED with nothing written, not
+# encoded as whichever one the default arm named - the #2435 audit
+#
+# The three dispatches here each ended in a bare `or { ... }` that named a real
+# instruction: an unmodeled binary op became an EOR, an unmodeled shift the
+# arithmetic-right sequence, and an unmodeled relation the difference-to-zero
+# equality form. The reachable set was bounded by `encode_instr`'s dispatch one
+# function away, so nothing mis-encoded - but nothing here said so either.
+#
+# The buffer length is asserted, not just the error: each dispatch used to sit
+# BELOW the `LDA` that starts the sequence, so refusing there would have left a
+# partial instruction in the text for the next one to run into.
+test "mach.lang.target.isa.mos6502.encode:unnamed_operations_are_refused" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var st: enc.EncodeState;
+    st.buf = enc.buf_init(?alloc);
+    var bad: i32 = 0;
+
+    var ops: [3]mir.MirOperand;
+    ops[0] = mir.op_preg(10);
+    ops[1] = mir.op_preg(8);
+    ops[2] = mir.op_imm(1);
+
+    # a binary op with no 6502 form. MIR_MUL is the honest example: the 6502 has no
+    # hardware multiply, and it used to encode as an exclusive-or.
+    var alu: mir.MirInstr = mir.instr(mir.MIR_MUL, ?ops[0], 3, 1, 1);
+    if (!R.is_err[bool, str](encode_alu(?st, ?alu, mir.MIR_MUL)))     { bad = 1; }
+    if (st.buf.len != 0)                                             { bad = 1; }
+    if (!R.is_err[bool, str](encode_alu(?st, ?alu, mir.MIR_SHL)))     { bad = 1; }
+    if (st.buf.len != 0)                                             { bad = 1; }
+
+    # a shift direction with no 6502 form.
+    var sh: mir.MirInstr = mir.instr(mir.MIR_SHL, ?ops[0], 3, 1, 1);
+    if (!R.is_err[bool, str](encode_shift(?st, ?sh, mir.MIR_MUL)))   { bad = 1; }
+    if (st.buf.len != 0)                                             { bad = 1; }
+
+    # a relation outside the branchless trio. the SIGNED and <= relations are the
+    # documented frontier, and they used to encode as the EQUALITY sequence - a
+    # compare that answers a different question, not one that fails to build.
+    var cm: mir.MirInstr = mir.instr(mir.MIR_CMP_LT_S, ?ops[0], 3, 1, 1);
+    if (!R.is_err[bool, str](encode_cmp(?st, ?cm, mir.MIR_CMP_LT_S))) { bad = 1; }
+    if (st.buf.len != 0)                                             { bad = 1; }
+    if (!R.is_err[bool, str](encode_cmp(?st, ?cm, mir.MIR_CMP_LE_U))) { bad = 1; }
+    if (st.buf.len != 0)                                             { bad = 1; }
+
+    # the modeled forms still encode, so the guards did not close over real work.
+    if (R.is_err[bool, str](encode_alu(?st, ?alu, mir.MIR_XOR)))      { bad = 1; }
+    if (st.buf.len == 0)                                             { bad = 1; }
+    st.buf.len = 0;
+    if (R.is_err[bool, str](encode_shift(?st, ?sh, mir.MIR_SHR_S)))   { bad = 1; }
+    if (st.buf.len == 0)                                             { bad = 1; }
+    st.buf.len = 0;
+    if (R.is_err[bool, str](encode_cmp(?st, ?cm, mir.MIR_CMP_NE)))    { bad = 1; }
+    if (st.buf.len == 0)                                             { bad = 1; }
+
+    enc.buf_dnit(?st.buf);
+    ret bad;
 }

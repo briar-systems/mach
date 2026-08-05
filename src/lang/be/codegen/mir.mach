@@ -496,6 +496,27 @@ pub rec MirOperand {
 pub rec MirAsmBind {
     name:      intern.StrId;
     slot_vreg: u32;
+    secret:    bool;
+}
+
+# build one `{name}` binding, every field supplied
+#
+# THIS IS THE ONLY PLACE A `MirAsmBind` IS BUILT. The array it lands in comes from a
+# non-zeroing `A.allocate`, so a field a site forgets carries the previous
+# allocation's residue - the hazard that dropped `vec_lane` from a rebuilt MirInstr
+# (#2032, #2335). `secret` makes that hazard a SECURITY one: a binding whose secrecy
+# is residue is a constant-time guarantee issued over an unknown (#2230).
+# ---
+# name:      interned source local name (the text inside `{ }`)
+# slot_vreg: slot-owning vreg id of the local's alloca storage
+# secret:    true when the local's declared type carries `^` on its by-value spine
+# ret:       the binding
+pub fun asm_bind(name: intern.StrId, slot_vreg: u32, secret: bool) MirAsmBind {
+    var b: MirAsmBind;
+    b.name      = name;
+    b.slot_vreg = slot_vreg;
+    b.secret    = secret;
+    ret b;
 }
 
 # the inline-asm payload carried by a MIR_ASM instruction
@@ -530,6 +551,25 @@ pub rec MirAsm {
 #                the encoder treats as the machine-word width so a pseudo with no
 #                natural width (call / ret / branch / asm) still encodes its
 #                address-sized fields correctly.
+#
+#                BITS ABOVE `width` ARE UNDEFINED. Width is a property of the
+#                OPERATION, not of the value - a `MirVReg` carries no width at
+#                all - so an instruction states how many bytes it operates on and
+#                says nothing about the rest of the register. A consumer that
+#                wants a value at a wider width must go through an explicit
+#                conversion op (TRUNC / SEXT / ZEXT); none may read above the
+#                width its producer declared.
+#
+#                This is settled, not assumed (#2395). The three register targets
+#                already disagree about those bits and all three are correct:
+#                x86-64's 4-byte move zero-extends into the 64-bit register,
+#                aarch64's every sub-word move does, and riscv64's is `addi
+#                rd,rs,0` at the machine width and extends nothing. riscv64
+#                self-hosts and passes CI on the same MIR, which is the witness -
+#                if a width-4 move were specified to define bits 32..63, riscv64
+#                would be miscompiling every one of them. Regalloc relied on the
+#                opposite reading to keep same-register copies alive on x86-64 and
+#                aarch64; that premise was false and the copies are now dropped.
 # src_width:     source operand width in bytes for the width-changing conversions
 #                (TRUNC / SEXT / ZEXT and the integer-side CVT forms), where the
 #                source is narrower or wider than the destination. for every other
@@ -597,27 +637,29 @@ pub rec MirInstr {
 
 # build a fresh MIR instruction, every caller-owned field supplied
 #
-# THIS IS THE ONLY PLACE A `MirInstr` IS CLEARED. `var` does not zero, so a site
-# that builds one field by field leaves whatever it does not name holding the
-# frame's residue - and a field added later is named by no site at all. That is not
-# hypothetical here: `vec_lane` was added and `regalloc.rewrite_instr` did not learn
-# about it, so every rewritten vector op read as the `.16b` byte arrangement and the
-# NEON encoder collapsed every arrangement after register assignment (#2032, #2321).
+# THIS IS THE ONLY PLACE A `MirInstr` IS BUILT. `var` zero-fills a bare declaration,
+# so every metadata field below already comes back at its zero default without being
+# named - but that is exactly the hazard, not the absence of one: a field whose
+# meaningful default is not zero would be silently wrong here with nothing to catch
+# it, the way `vec_lane` read as element 0 - a plausible arrangement, not a crash -
+# after `regalloc.rewrite_instr` rebuilt a `MirInstr` without it (#2032, #2321).
+# Naming this as the one construction site means a field added later is a decision
+# made once, here, rather than a silent zero at every caller.
 #
 # The five fields a caller genuinely chooses are positional parameters, so omitting
 # one is an arity error at build time rather than a garbage operation width reaching
 # the encoder. Everything else is METADATA the caller does not author: `asm_block`
 # belongs to MIR_ASM alone, `loc` / `inline_site` / `vec_lane` / `writes_secret` are
 # stamped from the lowering context at `mir.context.push_instr`, and the dbg-binding
-# list is attached there too. Cleared here, so an instruction built outside that
-# chokepoint carries defined metadata rather than the stack's.
+# list is attached there too - all zero-valued by default, which is what an
+# instruction built outside that chokepoint would otherwise leave undefined.
 # ---
 # opcode:        the MIR opcode
 # operands:      the operand array (borrowed or owned per the caller's convention)
 # operand_count: number of operands
 # width:         operation width in bytes
 # src_width:     source width in bytes, for a widening / narrowing op
-# ret:           the instruction, with every metadata field cleared
+# ret:           the instruction, with every metadata field at its zero default
 pub fun instr(opcode: MirOpcode, operands: *MirOperand, operand_count: u32,
               width: u8, src_width: u8) MirInstr {
     var mi: MirInstr;
@@ -626,14 +668,6 @@ pub fun instr(opcode: MirOpcode, operands: *MirOperand, operand_count: u32,
     mi.operand_count = operand_count;
     mi.width         = width;
     mi.src_width     = src_width;
-
-    mi.asm_block         = nil;
-    mi.loc               = source.loc_nil();
-    mi.dbg_bindings      = nil;
-    mi.dbg_binding_count = 0;
-    mi.inline_site       = 0;
-    mi.vec_lane          = VEC_LANE_NONE;
-    mi.writes_secret     = false;
     ret mi;
 }
 
@@ -771,6 +805,64 @@ pub rec MirVReg {
     assigned:   u32;
     vector:     bool;
     secret:     bool;
+}
+
+# build a fresh MIR virtual register, unspilled and unassigned
+#
+# THIS IS THE ONLY PLACE A `MirVReg` IS BUILT. Every caller grows `MirFunction.vregs`
+# with a non-zeroing `A.reallocate` before writing into the new slot, so an unnamed
+# field here would carry the previous allocation's residue rather than a defined
+# value - the same hazard `mir.instr` guards for `MirInstr` (#2032, #2335). `id` is
+# always the slot's own index and `spill_slot` / `assigned` always start at their
+# unspilled / unassigned sentinels at every call site, so those three are not
+# parameters: a caller cannot pass an inconsistent one, and a new caller cannot
+# forget to set them to anything but the one correct start state.
+# ---
+# id:     the vreg's own index into MirFunction.vregs (its slot, by construction)
+# class:  register-class index the new vreg belongs to
+# vector: whether the vreg holds a 128-bit SIMD vector (#2014)
+# secret: the constant-time SEED marker (#1646): true when defined by a secret source
+# ret:    the vreg, unspilled and unassigned
+pub fun vreg(id: u32, class: u32, vector: bool, secret: bool) MirVReg {
+    var v: MirVReg;
+    v.id         = id;
+    v.class      = class;
+    v.spill_slot = -1;
+    v.assigned   = MIR_VREG_NIL;
+    v.vector     = vector;
+    v.secret     = secret;
+    ret v;
+}
+
+# `mir.vreg` SETS EVERY FIELD OF A FRESH VIRTUAL REGISTER.
+#
+# The guard the three vreg-table growth sites need: each grows `MirFunction.vregs`
+# with a non-zeroing `A.reallocate` and then calls this constructor into the new
+# slot, so a field this left unset would read the previous allocation's residue
+# rather than a defined value (#2335, the same hazard #2032 shipped for `MirInstr`).
+#
+# Every field below is asserted against a value that DIFFERS from the field's own
+# zero default (`id` / `class` nonzero, `vector` / `secret` true), because `var`
+# zero-fills a forgotten field - so a check against the zero value itself would
+# pass whether or not the assignment that produces it is still there. `spill_slot`
+# / `assigned` are not parameters (every call site starts a vreg unspilled and
+# unassigned), so their fixed sentinels are checked directly.
+# ---
+# To see it fail, drop a field from `vreg`'s assignment list.
+test "mach.lang.be.codegen.mir.vreg:sets_every_field" {
+    val v: MirVReg = vreg(7, 3, true, true);
+    if (v.id != 7)                  { ret 1; }
+    if (v.class != 3)               { ret 1; }
+    if (v.spill_slot != -1)         { ret 1; }
+    if (v.assigned != MIR_VREG_NIL) { ret 1; }
+    if (!v.vector)                  { ret 1; }
+    if (!v.secret)                  { ret 1; }
+
+    # and the flags genuinely echo the parameter rather than being hard-coded true.
+    val v2: MirVReg = vreg(0, 0, false, false);
+    if (v2.vector) { ret 1; }
+    if (v2.secret) { ret 1; }
+    ret 0;
 }
 
 # discriminant distinguishing an addressed alloca slot from a by-value spill slot

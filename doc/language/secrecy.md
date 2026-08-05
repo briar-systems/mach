@@ -168,9 +168,44 @@ determine a layout it declines, which rejects.
 
 The flow typing constrains the *source*; `#[oblivious]` carries the obligation
 through *codegen*. Inside a function carrying it, the backend must not introduce
-a secret-dependent branch, select a variable-latency instruction on a secret
-operand, or dead-store-eliminate a zeroizing write to secret storage. Inline
-`asm` is rejected inside such a function.
+a secret-dependent branch or select a variable-latency instruction on a secret
+operand.
+
+Inline `asm` inside such a function is **validated**, not rejected. The block is
+parsed into instructions and walked for the same three leaks the compiler checks
+everywhere else — a secret reaching a branch condition, a memory address, or a
+variable-latency operation the target cannot do in constant time. Taint enters
+through the block's `{name}` bindings, whose secrecy is stamped from the local's
+declared type. What the walk cannot model, it refuses:
+
+| construct | why |
+|---|---|
+| a body that does not parse | nothing to analyze |
+| a data directive (`.byte`, `.word`, `.long`, `.quad`) | its payload can encode any instruction |
+| a mnemonic the target has not classified | its timing behaviour is unknown |
+| **a flags-conditioned branch** (x86-64 `jcc`, aarch64 `b.<cond>`) | its condition rides the flags register, which the inline-asm effect model does not represent (#2460) |
+
+That last row is a per-target asymmetry worth stating precisely, because getting it
+wrong was a real hole (#2477). A branch whose condition is a **register operand** is
+visible to the walk and is checked: aarch64's `cbz`/`cbnz`, and every riscv64 branch,
+which compares two registers — RISC-V has no flags register at all. A branch whose
+condition rides the **flags register** cannot be checked, because the effect model
+carries no flags, so a `cmp` of a secret before it would be invisible: those are
+refused. x86-64's `jcc` family is flags-conditioned, and so is **aarch64's
+`b.<cond>`** — which is easy to miss, because `b.<cond>` does not appear in aarch64's
+mnemonic table at all. It is admitted by the grammar's *decode hook*, carrying the
+unconditional branch's own opcode with the condition in its flags.
+
+The variable-latency check also bites unevenly: x86-64's and aarch64's asm grammars
+carry no divide, multiply or float instruction at all, so it reaches only their
+register-count shifts. riscv64's grammar admits the whole M-extension, so on that
+target the check is substantive.
+
+`#[oblivious]` remains a **per-function** contract. A call out to a non-oblivious
+function is not validated — that is the boundary the decorator draws, not a hole in
+it, and it applies to a callee containing `asm` exactly as it applies to any other.
+
+The zeroizing-write guarantee is separate and broader; it is described below.
 
 A secret-taint bit is threaded from sema's flow typing through IR and MIR to the
 emitted instruction stream, preserved across every value replacement, inline
@@ -194,6 +229,49 @@ re-checks the leakage conditions, so a secret reaching a branch condition, a
 memory address, or a forbidden variable-latency op is a compile error naming the
 function and the offending operation. It is a backstop behind the compile-time
 gates, not a replacement for them.
+
+## The zeroizing-write guarantee
+
+Wiping a secret is only useful if the wipe survives to run. That guarantee exists,
+but it is **not** provided by `#[oblivious]`, and it is scoped more broadly than the
+decorator is.
+
+A store into secret storage is tainted at lowering, from two composing sources: the
+stored **value**'s secrecy, and — for a public value written into secret storage, the
+shape a wipe takes — the **destination**'s secrecy, read from the lvalue's semantic
+type. Either one marks the store. That taint is the thing an optimization must
+consult, and it is keyed on the storage, not on any decorator, so:
+
+```mach
+# no decorator: the wipe is protected anyway
+fun clear(p: *^u8, n: usize) {
+    var i: usize = 0;
+    for (i < n) { p[i] = 0; i = i + 1; }
+}
+```
+
+**What it covers.** Memory, reached through a pointer that escapes the function — the
+shape `crypto.ct.zeroize` has. Such a store cannot be promoted out of memory, and the
+taint is present for any future pass to read.
+
+**What it does not cover.** A value the compiler keeps in a **register**. Writing to a
+promoted local is not a memory write, so wiping one is not preserved:
+
+```mach
+var x: ^u8 = k;
+x = 0;          # NOT guaranteed: `x` may never have been in memory
+```
+
+Adding `#[oblivious]` does not change this — the wipe is outside the memory-address
+leakage model rather than an exception within it. To wipe reliably, write through a
+pointer whose target is memory the compiler cannot promote away, which is what the
+standard library's `zeroize` does. Settled: the wipe guarantee is memory-scoped; secret register lifetimes are outside
+it (#2456).
+
+**Today the guarantee is not yet load-bearing**, because no dead-store elimination
+exists to remove anything: an entirely dead fill of a *public* local also survives at
+release. The taint is what makes the requirement enforceable *before* such a pass
+lands, and `mach.lang.driver:secret_store_taint_survives_lower` pins it.
 
 The contract is only offered where mach emits the instructions that execute.
 A target whose back half hands a module to a downstream compiler instead — the

@@ -36,6 +36,108 @@ fun probe[T]() u64 {
 `$offset_of`'s **second** argument is the exception: a bare field name, resolved
 against the record's layout, never a type or a value.
 
+### Where a layout intrinsic is constant
+
+`$size_of` and `$align_of` fold in every **type** position, including ones resolved
+before layout would otherwise be known — the measured type's layout is established
+on demand when the measurement asks for it, so where the type is *declared* relative
+to where it is measured makes no difference:
+
+| position | `$size_of` / `$align_of` |
+|---|---|
+| `val` / `var` initializer | yes |
+| global `align` | yes |
+| record / union type `align` | yes |
+| array length `[N]T` | yes |
+| `$if` / `$or` condition | **no** |
+
+```mach
+rec Pair { a: u64; b: u64; }
+
+#[align($align_of(Pair))]        # a type's alignment
+rec Over { x: u8; }
+
+rec Holder { buf: [$size_of(Pair)]u8; }   # an array length, inside a field type
+```
+
+`$offset_of` is the exception among the three: it folds in a value position but not
+in a type one, because a field offset is settled during lowering rather than by the
+front end.
+
+A `$if` / `$or` condition is not a type position and does not get the on-demand
+layout, so a layout intrinsic there is still rejected, and reports why.
+
+**Inside a generic, a predicate is answered per instantiation.** `$is_record(T)`
+in a `fun f[T]()` body is not decided against the template's placeholder — the gate
+is deferred and re-folded once for each instantiation with `T` substituted, so
+`f[SomeRecord]` and `f[u64]` take different arms from one template. A template that
+is never instantiated has no instance to answer for and reports nothing.
+
+**Cycles are refused, not resolved.** A measurement whose answer is one of its own
+inputs — `#[align($size_of(Self))]`, or two types each aligned to the other's size —
+is reported as a layout cycle naming the type that closes it. A pointer field does
+not create one: it stores an address of fixed width, so `rec Node { next: *Node; }`
+measures normally.
+
+## Type predicates
+
+Ask about a type's **shape** rather than its storage. Each takes one type operand
+and folds in a `$if` / `$or` gate:
+
+```mach
+$is_record(T)           # T is a record (or an instance of one)
+$is_union(T)            # T is a union  (or an instance of one)
+$is_pointer(T)          # T is a reference: the raw `ptr` or a typed `*U`
+```
+
+They are **comptime-only** — a gate condition selects an arm, and there is no
+runtime boolean for one to become, so using a predicate as a value is an error.
+
+A `^` secret wrapper is stripped before the question is answered: `^Pair` is a
+record, because `^T` is a wrapper over `T`'s storage. A generic instance answers as
+the declaration it instantiates, so `Box[i64]` is a record — which is the type a
+reflection loop actually meets.
+
+```mach
+rec Inner { x: u64; y: u64; }
+rec Outer { i: Inner; n: u64; }
+
+$each f in $fields(Outer) {
+    $if ($is_record(f.type)) {
+        $each g in $fields(f.type) { ... }   # descend
+    } $or { ... }                            # a scalar field
+}
+```
+
+## `$type_name(T)` — a type's spelling
+
+```mach
+$type_name(T)           # the type's spelling, as a NUL-terminated string
+```
+
+Unlike the predicates this **is** a value (`*u8`), usable anywhere one is. The
+spelling is the same one diagnostics print, so a name a program reads and a name an
+error reports cannot drift. Composites spell compositely (`$type_name(*Pair)` is
+`"*Pair"`), and a `^` wrapper is stripped as it is for the predicates.
+
+## The type operand
+
+`$size_of` / `$align_of` / `$offset_of` / `$fields` and the queries above all take a
+**type** in argument 0, written with the ordinary type grammar — plus one extra
+form: a field descriptor's `f.type` inside a `$each` body.
+
+```mach
+$each f in $fields(T) {
+    val n: u64 = $size_of(f.type);      # the field's own size
+    $each g in $fields(f.type) { ... }  # its own fields
+}
+```
+
+That form is what makes recursive reflection expressible: inside the loop a field's
+type has no spelling, only the descriptor. A path that is genuinely a qualified type
+name (`mod.Type`) still reads as one, and a wrong one still reports against the type
+grammar.
+
 ## Type intrinsic
 
 `$type_of(expr)` produces a comptime type value — the resolved type of its
@@ -257,16 +359,27 @@ $or ($type_of(arg) == str) { write_str(w, arg); }
 $or { $error("no writer for this argument type"); }    # compile error on an unhandled type
 ```
 
-> **`$assert` not yet implemented.** `$assert` parses as a comptime directive
-> but the compiler does not yet evaluate it. It is intended as sugar over `$if`
-> plus `$error` — `$assert(cond, "msg")` ≡ `$if (!cond) { $error("msg"); }`,
-> e.g. `$assert($size_of(i64) == 8, "expected 64-bit i64");`.
-
 ## Not provided as intrinsics
 
 Code intrinsics — runtime-instruction emitters like `trap`, `fence`,
 `pause` — are not in the compiler-shipped set. They belong in stdlib as
 functions with per-arch `asm` bodies. See [policy.md](policy.md).
+
+**`$assert` is not an intrinsic either**, and is not planned as one: `$if` and
+`$error` already compose to it exactly, so a dedicated directive would add spelling
+without adding capability. Write the composition directly.
+
+```mach
+# instead of $assert(cond, "msg")
+$if (!cond) { $error("msg"); }
+
+$if (!($mach.build.arch == $mach.arch.x86_64)) { $error("expected x86_64"); }
+```
+
+The composition inherits `$if`'s condition rules, which is the point: the same
+conditions fold there as in any other gate, and the ones that do not — a layout
+intrinsic, a type query over an unbound generic parameter — refuse with their own
+cause rather than through a second surface that could describe them differently.
 
 ## See also
 

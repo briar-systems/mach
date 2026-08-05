@@ -85,5 +85,5 @@ than each carrying their own.
 - [comptime-mach.md](comptime-mach.md) — the `$mach.*` namespace
 - [decorators.md](decorators.md) — `#[...]` codegen decorators
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of`,
-  `$assert`, …
+  `$is_record`, `$type_name`, …
 - [comptime-control.md](comptime-control.md) — `$if` / `$or`

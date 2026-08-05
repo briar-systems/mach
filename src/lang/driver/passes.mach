@@ -8,6 +8,16 @@
 # its own computes at entry, and the build engine (or build_project_impl for
 # the legacy flows) sequences the passes. The parallel-codegen worker pool is
 # an engine property; the serial Q_CODEGEN loop here adopts its staged images.
+#
+# The parallel-OPTIMIZATION pool is a property of the lowering pass instead
+# (#2100), because everything that decides which modules it may touch is
+# pass-local: the topo-ordered lowered-surface refresh, the resulting Q_LOWER
+# staleness verdict, and the test-mode variant key. Splitting those across the
+# engine boundary would put one invariant in two places. Lowering runs in two
+# stages: monomorphize-and-lower is serial (it writes the origin modules' shared
+# typing tables and comptime contexts), then the optimization pipeline - which
+# touches nothing but its own module's IR, its own module's arena, and the
+# read-only target - runs across a worker pool.
 
 use std.allocator.page;
 use std.types.bool.bool;
@@ -26,6 +36,8 @@ use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 use ctime: std.chrono.time;
+use std.sync.atomic;
+use std.sync.thread;
 
 use mach.lang.be.codegen;
 use mach.lang.be.obj;
@@ -694,9 +706,61 @@ test "mach.lang.driver.passes.intern_producer:name_version" {
 # p:   the active project; its topo order and per-build module graph drive the pass
 # ret: true once every module is lowered, or the first error
 pub fun run_lower_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
-    # this pass owns its query binding: Q_LOWER (an opaque owned handle keyed by
-    # the packed back-half key) and Q_LOWERED_SURFACE (a plain fingerprint, the
-    # monomorphization firewall, keyed by StableModuleId). once per session.
+    val pr: R.Result[bool, outcome.Fail] = lower_prepare(p);
+    if (R.is_err[bool, outcome.Fail](pr)) { ret pr; }
+
+    val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
+    ctx.p = p;
+
+    readout.phase_begin(p.events, readout.PH_LOWER);
+
+    # the parallel prelude, when the request asks for workers: monomorphize and
+    # lower the stale modules serially, then optimize them across a pool, and
+    # stage each finished module for the loop below to adopt through Q_LOWER
+    # (which stays the value's system of record). It runs inside the phase span,
+    # so `-v` still reports the whole phase's wall; the per-module `-vv` items
+    # below then measure the adoption rather than the work, which is inherent to
+    # any prelude.
+    if (lower_parallel_enabled(p)) {
+        val rp: R.Result[bool, str] = run_lower_parallel(p);
+        if (R.is_err[bool, str](rp)) {
+            ctx.p = nil;
+            ret R.err[bool, outcome.Fail](lower_fail(p, R.unwrap_err[bool, str](rp)));
+        }
+    }
+
+    var i: u32 = 0;
+    for (i < p.topo_len) {
+        val mid: session.ModuleId = p.topo[i];
+        val r: R.Result[bool, str] = run_lower_one(p, mid);
+        if (R.is_err[bool, str](r)) {
+            ctx.p = nil;
+            ret R.err[bool, outcome.Fail](lower_fail(p, R.unwrap_err[bool, str](r)));
+        }
+        i = i + 1;
+    }
+    readout.phase_end(p.events, readout.PH_LOWER, p.topo_len, "module", "modules");
+    ctx.p = nil;
+    ret R.ok[bool, outcome.Fail](true);
+}
+
+# bind the lowering pass's query surface and settle every input its staleness
+# verdicts read
+#
+# Registers Q_LOWER and Q_LOWERED_SURFACE, publishes the IR-verifier toggle into
+# Q_LOWER_FLAGS, and refreshes every module's lowered-surface fingerprint in topo
+# order. The refresh must precede any Q_LOWER demand: the engine's validator reads
+# a dep's STORED last_changed without recomputing it, so a dependent is only
+# firewalled (impl-only edit: identical bytes) or invalidated (surface change:
+# bytes differ) correctly when its deps' fingerprints are already current (#1859).
+# Doing the whole topo order up front rather than interleaved with the demands is
+# what fixes each module's Q_LOWER verdict for the rest of the pass, which the
+# parallel prelude needs before it can choose a work set. Q_LOWERED_SURFACE
+# depends only on Q_RESOLVE, so hoisting the refresh changes no fingerprint.
+# ---
+# p:   the active project
+# ret: true once the pass may demand Q_LOWER, or the first error
+fun lower_prepare(p: *project.Project) R.Result[bool, outcome.Fail] {
     if (!query.is_registered(?p.s.queries, query.Q_LOWERED_SURFACE)) {
         val rls: R.Result[bool, str] = query.register_derived(?p.s.queries, query.Q_LOWERED_SURFACE, q_lowered_surface_compute);
         if (R.is_err[bool, str](rls)) { ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[bool, str](rls))); }
@@ -720,20 +784,35 @@ pub fun run_lower_pass(p: *project.Project) R.Result[bool, outcome.Fail] {
         ret R.err[bool, outcome.Fail](outcome.user(R.unwrap_err[bool, str](vf)));
     }
 
-    readout.phase_begin(p.events, readout.PH_LOWER);
     var i: u32 = 0;
     for (i < p.topo_len) {
-        val mid: session.ModuleId = p.topo[i];
-        val r: R.Result[bool, str] = run_lower_one(p, mid);
-        if (R.is_err[bool, str](r)) {
+        val m: *project.ModuleEntry = ?p.modules[p.topo[i]::u32];
+        val sf_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LOWERED_SURFACE, m.stable_id::u64);
+        if (R.is_err[*query.QueryEntry, str](sf_r)) {
             ctx.p = nil;
-            ret R.err[bool, outcome.Fail](lower_fail(p, R.unwrap_err[bool, str](r)));
+            ret R.err[bool, outcome.Fail](outcome.internal(R.unwrap_err[*query.QueryEntry, str](sf_r)));
         }
         i = i + 1;
     }
-    readout.phase_end(p.events, readout.PH_LOWER, p.topo_len, "module", "modules");
     ctx.p = nil;
     ret R.ok[bool, outcome.Fail](true);
+}
+
+# whether module `mid`'s Q_LOWER entry would revalidate on the next demand -
+# present under this build's variant key with every recorded dep unchanged
+#
+# The parallel prelude's split, mirroring codegen_reusable: a reusable module is
+# served by the cache (run_lower_one revalidates it, so a staged module would
+# never be adopted) and must not reach the prelude; only the stale remainder is
+# lowered and optimized there. Meaningful once lower_prepare has settled every
+# dep the verdict reads.
+# ---
+# p:   the active project
+# mid: the module to probe
+# ret: true when the cached IR will be reused
+fun lower_reusable(p: *project.Project, mid: session.ModuleId) bool {
+    val m: *project.ModuleEntry = ?p.modules[mid::u32];
+    ret query.peek_valid(?p.s.queries, query.Q_LOWER, back_half_key(m.stable_id, test_build(p)));
 }
 
 # wrap a lowering-pass error into a Fail, marking it reported when a located
@@ -762,15 +841,8 @@ fun run_lower_one(p: *project.Project, mid: session.ModuleId) R.Result[bool, str
 
     val t_item: ctime.Time = readout.item_begin(p.events);
 
-    # refresh this module's lowered-surface fingerprint NOW, in topo order, so an
-    # importer later in the pass validates its Q_LOWER against a current fingerprint:
-    # the engine's validator reads a dep's STORED last_changed without recomputing it,
-    # so a dependent is only firewalled (impl-only edit: identical bytes) or invalidated
-    # (surface change: bytes differ) correctly when its deps' fingerprints are already
-    # current. mirror of run_sema_one's Q_TYPED_EXPORTS refresh (#1859).
-    val sf_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LOWERED_SURFACE, m.stable_id::u64);
-    if (R.is_err[*query.QueryEntry, str](sf_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](sf_r)); }
-
+    # the lowered-surface fingerprints were all refreshed in topo order by
+    # lower_prepare, so every dep this demand validates against is already current.
     val e_r: R.Result[*query.QueryEntry, str] = query.get(?p.s.queries, query.Q_LOWER, back_half_key(m.stable_id, test_build(p)));
     if (R.is_err[*query.QueryEntry, str](e_r)) { ret R.err[bool, str](R.unwrap_err[*query.QueryEntry, str](e_r)); }
     val irm: *ir.Module = ir_handle_decode(R.unwrap_ok[*query.QueryEntry, str](e_r));
@@ -983,8 +1055,8 @@ pub fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Res
     # identical fingerprint and this module reuses its IR, while a generic-body or
     # comptime-value edit advances the fingerprint and re-lowers this module (#1859).
     # each surface entry is fetched first so record_dep captures its current revision
-    # (run_lower_one refreshed the earlier-topo deps, but a fresh recompute demands
-    # them directly). the transitive closure - not the direct closure - is required
+    # (lower_prepare already refreshed every one, but a fresh recompute demands them
+    # directly rather than assume it). the transitive closure - not the direct closure - is required
     # because there is no per-hop lowering firewall: an inlined instance can originate
     # in a transitively-imported module the direct closure omits (#1618).
     val cl_r: R.Result[LowerClosure, str] = collect_lower_closure(p, m);
@@ -1008,91 +1080,453 @@ pub fun q_lower_compute(db: *query.QueryDb, key: u64, alloc: *A.Allocator) R.Res
     }
     free_lower_closure(s.alloc, ?cl);
 
-    val res_lower: R.Result[ir.Module, str] = lower.lower_module(s, ?p.target, a, m.fqn, mid, sr, m.resolve_result, ?m.ctx, test_mode, ctx.req.debug);
-    if (R.is_err[ir.Module, str](res_lower)) { ret R.err[query.QueryOutput, str](R.unwrap_err[ir.Module, str](res_lower)); }
-    var irmod: ir.Module = R.unwrap_ok[ir.Module, str](res_lower);
-
-    # the `#[oblivious]`-required check (#2136): over the freshly-lowered IR, before
-    # optimization, so a dead secret compute cannot be optimized away first and the
-    # requirement is independent of the optimization level. every monomorphized instance
-    # is visible here with its concrete secret taint, which sema could not see through a
-    # generic template. a filed diagnostic makes the failure a reported user error.
-    val res_obl: R.Result[bool, str] = oblivious.check_module(?irmod, ?s.interner, ?s.diags, s.alloc);
-    if (R.is_err[bool, str](res_obl)) {
-        ir.dnit(?irmod);
-        ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](res_obl));
-    }
-    if (!R.unwrap_ok[bool, str](res_obl)) {
-        ir.dnit(?irmod);
-        ret R.err[query.QueryOutput, str]("oblivious-required check: a function computes on a secret without `#[oblivious]`");
+    # the parallel prelude may already have lowered and optimized this module (its
+    # monomorphization serial, its optimization across the pool) into a private
+    # arena and staged both. adopt them as this query's value instead of
+    # recomputing; the same lower_module and pipeline.run produced them, over the
+    # same inputs, so the IR is identical to the serial compute below. cleared once
+    # taken so a later demand recomputes.
+    if (m.staged_ir != nil) {
+        val sir:  *ir.Module     = m.staged_ir;
+        val shome: *ir.ModuleHome = m.staged_home;
+        m.staged_ir   = nil;
+        m.staged_home = nil;
+        ret ir_handle_encode(alloc, sir, shome);
     }
 
-    # optimize in place: the cached artifact is the post-pipeline IR the object is
-    # built from, so an unchanged optimized module reuses its codegen output.
-    val res_opt: R.Result[bool, str] = pipeline.run(?irmod, ?p.target, ctx.req.opt, ctx.req.verify_ir, ctx.req.vectorize, ctx.req.simd == manifest.SIMD_REQUIRE, ctx.req.float_reassoc, ?p.s.interner);
-    if (R.is_err[bool, str](res_opt)) {
-        ir.dnit(?irmod);
-        ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](res_opt));
+    val hr: R.Result[*ir.ModuleHome, str] = ir_home_new(alloc);
+    if (R.is_err[*ir.ModuleHome, str](hr)) { ret R.err[query.QueryOutput, str](R.unwrap_err[*ir.ModuleHome, str](hr)); }
+    val home: *ir.ModuleHome = R.unwrap_ok[*ir.ModuleHome, str](hr);
+
+    val rr_raw: R.Result[*ir.Module, str] = lower_raw(p, mid, home, test_mode);
+    if (R.is_err[*ir.Module, str](rr_raw)) {
+        val emsg: str = lower_stable_err(p, R.unwrap_err[*ir.Module, str](rr_raw));
+        ir_release(alloc, home);
+        ret R.err[query.QueryOutput, str](emsg);
+    }
+    val irmod: *ir.Module = R.unwrap_ok[*ir.Module, str](rr_raw);
+
+    val nid: R.Result[intern.StrId, str] = neutralize_id(p, test_mode);
+    if (R.is_err[intern.StrId, str](nid)) {
+        ir_release(alloc, home);
+        ret R.err[query.QueryOutput, str](R.unwrap_err[intern.StrId, str](nid));
+    }
+    val ro: R.Result[bool, str] = lower_optimize(p, irmod, R.unwrap_ok[intern.StrId, str](nid));
+    if (R.is_err[bool, str](ro)) {
+        val emsg: str = lower_stable_err(p, R.unwrap_err[bool, str](ro));
+        ir_release(alloc, home);
+        ret R.err[query.QueryOutput, str](emsg);
     }
 
-    # test variant: neutralize this module's `main` into a body-less extern (the
-    # runner supplies the program entry) on the fresh IR before it is cached, so the
-    # normal variant's Q_LOWER value stays untouched.
-    if (test_mode) {
-        val res_neu: R.Result[bool, str] = testrunner.neutralize_main(s, ?irmod);
-        if (R.is_err[bool, str](res_neu)) {
-            ir.dnit(?irmod);
-            ret R.err[query.QueryOutput, str](R.unwrap_err[bool, str](res_neu));
-        }
-    }
+    ret ir_handle_encode(alloc, irmod, home);
+}
 
-    val br: R.Result[*ir.Module, str] = A.allocate[ir.Module](alloc, 1::usize);
-    if (R.is_err[*ir.Module, str](br)) {
-        ir.dnit(?irmod);
-        ret R.err[query.QueryOutput, str](R.unwrap_err[*ir.Module, str](br));
-    }
+# monomorphize and lower one module to raw, unoptimized IR inside `home`'s arena,
+# then run the `#[oblivious]`-required check over it
+#
+# The serial half of lowering: it writes the origin modules' shared typing tables
+# and comptime contexts (a generic body is re-derived under its instance's
+# substitution into the DECLARING module's `expr_type` / `decl_type` arrays), so
+# exactly one of these may run at a time. The oblivious check belongs here, over
+# the freshly-lowered IR and before optimization (#2136), so a dead secret compute
+# cannot be optimized away first and the requirement is independent of the
+# optimization level; every monomorphized instance is visible with its concrete
+# secret taint, which sema could not see through a generic template. A filed
+# diagnostic makes the failure a reported user error.
+# ---
+# p:         the active project
+# mid:       the module to lower
+# home:      the private arena the produced module owns every byte of
+# test_mode: true to lower test declarations; false to omit their IR (#2320)
+# ret:       the raw module (boxed inside `home`), or the first lowering error
+fun lower_raw(p: *project.Project, mid: session.ModuleId, home: *ir.ModuleHome, test_mode: bool) R.Result[*ir.Module, str] {
+    val ctx: *qctx.QueryCtx     = p.s.queries.ctx::*qctx.QueryCtx;
+    val s:   *session.Session   = p.s;
+    val m:   *project.ModuleEntry = ?p.modules[mid::u32];
+
+    val res_lower: R.Result[ir.Module, str] = lower.lower_module(s, ?p.target, ?home.alloc, m.a, m.fqn, mid, m.sema_result, m.resolve_result, ?m.ctx, test_mode, ctx.req.debug);
+    if (R.is_err[ir.Module, str](res_lower)) { ret R.err[*ir.Module, str](R.unwrap_err[ir.Module, str](res_lower)); }
+
+    # the module box lives in the module's own arena, so the whole artifact - box
+    # included - is released by one arena teardown.
+    val br: R.Result[*ir.Module, str] = A.allocate[ir.Module](?home.alloc, 1::usize);
+    if (R.is_err[*ir.Module, str](br)) { ret br; }
     val box: *ir.Module = R.unwrap_ok[*ir.Module, str](br);
-    box[0] = irmod;
-    ret ir_handle_encode(alloc, box);
+    box[0] = R.unwrap_ok[ir.Module, str](res_lower);
+
+    val res_obl: R.Result[bool, str] = oblivious.check_module(box, ?s.interner, ?s.diags, s.alloc);
+    if (R.is_err[bool, str](res_obl)) { ret R.err[*ir.Module, str](R.unwrap_err[bool, str](res_obl)); }
+    if (!R.unwrap_ok[bool, str](res_obl)) {
+        ret R.err[*ir.Module, str]("oblivious-required check: a function computes on a secret without `#[oblivious]`");
+    }
+    ret R.ok[*ir.Module, str](box);
+}
+
+# optimize one raw module in place, and neutralize its `main` for a test build
+#
+# The parallel half of lowering, and the reason a module owns its arena: every
+# byte the pipeline allocates comes from `m.alloc`, the target is read-only, and
+# the interner is read-only here (the passes only `lookup`, on the scalarize
+# require-error path), so two modules optimize concurrently with no shared mutable
+# state at all. Optimizing in place is what makes the cached artifact the
+# post-pipeline IR the object is built from, so an unchanged optimized module
+# reuses its codegen output. The test variant's `main` is neutralized into a
+# body-less extern (the runner supplies the program entry) on this fresh IR before
+# it is cached, so the normal variant's Q_LOWER value stays untouched (#1858); the
+# id it matches against is interned by the caller, on the session-owning thread,
+# so this stays free of shared writes.
+# ---
+# p:       the active project
+# irmod:   the raw module to optimize in place
+# main_id: interned `main` for a test build, STR_NIL for a normal one
+# ret:     true once the module is optimized, or the first pass error
+fun lower_optimize(p: *project.Project, irmod: *ir.Module, main_id: intern.StrId) R.Result[bool, str] {
+    val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
+
+    val res_opt: R.Result[bool, str] = pipeline.run(irmod, ?p.target, ctx.req.opt, ctx.req.verify_ir, ctx.req.vectorize, ctx.req.simd == manifest.SIMD_REQUIRE, ctx.req.float_reassoc, ?p.s.interner);
+    if (R.is_err[bool, str](res_opt)) { ret res_opt; }
+
+    if (main_id != intern.STR_NIL) { testrunner.neutralize_main(main_id, irmod); }
+    ret R.ok[bool, str](true);
+}
+
+# the `main` linkage id the optimize half neutralizes against: interned once, on
+# the session-owning thread, and STR_NIL outside a test build
+fun neutralize_id(p: *project.Project, test_mode: bool) R.Result[intern.StrId, str] {
+    if (!test_mode) { ret R.ok[intern.StrId, str](intern.STR_NIL); }
+    ret testrunner.main_linkage_id(p.s);
+}
+
+# box a fresh, empty ModuleHome on `alloc` - the private arena one lowered module
+# owns every byte of
+#
+# The box must outlive the module because `ir.Module.alloc` points into it, so it
+# comes from the query allocator (the same channel the Q_LOWER finalize frees it
+# with) rather than from any per-call arena.
+fun ir_home_new(alloc: *A.Allocator) R.Result[*ir.ModuleHome, str] {
+    val hr: R.Result[*ir.ModuleHome, str] = A.allocate[ir.ModuleHome](alloc, 1::usize);
+    if (R.is_err[*ir.ModuleHome, str](hr)) { ret hr; }
+    val home: *ir.ModuleHome = R.unwrap_ok[*ir.ModuleHome, str](hr);
+    val io: O.Option[str] = ir.home_init(home);
+    if (O.is_some[str](io)) {
+        A.deallocate[ir.ModuleHome](alloc, home, 1::usize);
+        ret R.err[*ir.ModuleHome, str](O.unwrap[str](io));
+    }
+    ret R.ok[*ir.ModuleHome, str](home);
+}
+
+# re-home an error message that may live in a module's arena onto the session
+# interner
+#
+# A lowering or optimization failure can report through a message built on the
+# module allocator - `pipeline.run`'s `simd = "require"` diagnostic formats itself
+# with `format.sprint(m.alloc, ...)` - and every failure path here releases that
+# arena before returning. Copying the text onto session-owned storage first is
+# what keeps the render from reading freed memory (#2153, the same trap the
+# codegen pool hit). A static-literal message re-interns harmlessly; a failure to
+# intern degrades to a fixed message rather than losing the report.
+# ---
+# p:   the active project (its session interner outlives the release)
+# msg: the raw message, possibly backed by a module arena
+# ret: the same text on session-owned storage
+fun lower_stable_err(p: *project.Project, msg: str) str {
+    val ir_r: R.Result[intern.StrId, str] = intern.intern(?p.s.interner, msg);
+    if (R.is_ok[intern.StrId, str](ir_r)) {
+        val nm: O.Option[str] = intern.lookup(?p.s.interner, R.unwrap_ok[intern.StrId, str](ir_r));
+        if (O.is_some[str](nm)) { ret O.unwrap[str](nm); }
+    }
+    ret "lowering failed, and re-homing its diagnostic off the module arena failed in turn (allocation failure)";
+}
+
+# release a lowered module and the arena it lives in
+#
+# One arena teardown frees every byte the module owns - its box included - so no
+# per-field `ir.dnit` walk is needed. The home box itself is the only thing that
+# lived outside the arena.
+fun ir_release(alloc: *A.Allocator, home: *ir.ModuleHome) {
+    if (home == nil) { ret; }
+    ir.home_dnit(home);
+    A.deallocate[ir.ModuleHome](alloc, home, 1::usize);
 }
 
 # release the optimized IR a Q_LOWER handle owns, called by the engine before it
 # frees the handle buffer (on recompute, invalidate, dnit)
 pub fun q_lower_finalize(value: *u8, value_len: u32, alloc: *A.Allocator) {
-    if (value == nil || value_len::usize < $size_of(ptr)) { ret; }
+    if (value == nil || value_len < ir_handle_len()) { ret; }
     val slot: *ptr = value::ptr::*ptr;
-    val r: *ir.Module = slot[0]::*ir.Module;
-    if (r == nil) { ret; }
-    ir.dnit(r);
-    A.deallocate[ir.Module](alloc, r, 1::usize);
+    ir_release(alloc, slot[1]::*ir.ModuleHome);
 }
 
-# wrap a heap ir.Module pointer as a pointer-sized opaque handle buffer - the
-# Q_LOWER query value. like the front-half handles, the heavy IR graph lives in the
-# byte-buffer DB as a handle, never serialized
-fun ir_handle_encode(alloc: *A.Allocator, r: *ir.Module) R.Result[query.QueryOutput, str] {
-    val n: u32 = $size_of(ptr)::u32;
-    val rb: R.Result[*u8, str] = A.allocate[u8](alloc, n::usize);
+# byte width of a Q_LOWER handle buffer: the module pointer plus its arena's
+fun ir_handle_len() u32 {
+    ret ($size_of(ptr) * 2)::u32;
+}
+
+# wrap a lowered module and its owning arena as a two-pointer opaque handle buffer
+# - the Q_LOWER query value. like the front-half handles, the heavy IR graph lives
+# in the byte-buffer DB as a handle, never serialized. the arena travels with the
+# module because it is what releases it
+fun ir_handle_encode(alloc: *A.Allocator, r: *ir.Module, home: *ir.ModuleHome) R.Result[query.QueryOutput, str] {
+    val rb: R.Result[*u8, str] = A.allocate[u8](alloc, ir_handle_len()::usize);
     if (R.is_err[*u8, str](rb)) {
-        ir.dnit(r);
-        A.deallocate[ir.Module](alloc, r, 1::usize);
+        ir_release(alloc, home);
         ret R.err[query.QueryOutput, str](R.unwrap_err[*u8, str](rb));
     }
     val buf: *u8 = R.unwrap_ok[*u8, str](rb);
     val slot: *ptr = buf::ptr::*ptr;
     slot[0] = r::ptr;
+    slot[1] = home::ptr;
     var out: query.QueryOutput;
     out.bytes = buf;
-    out.len   = n;
+    out.len   = ir_handle_len();
     ret R.ok[query.QueryOutput, str](out);
 }
 
 # read the ir.Module pointer back out of a Q_LOWER handle entry, or nil when the
 # entry carries no value
 fun ir_handle_decode(e: *query.QueryEntry) *ir.Module {
-    if (e.value == nil || e.value_len::usize < $size_of(ptr)) { ret nil; }
+    if (e.value == nil || e.value_len < ir_handle_len()) { ret nil; }
     val slot: *ptr = e.value::ptr::*ptr;
     ret slot[0]::*ir.Module;
+}
+
+# whether the parallel-optimization prelude should run for this build: the request
+# asked for at least one worker and there is at least one module
+fun lower_parallel_enabled(p: *project.Project) bool {
+    val ctx: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
+    ret ctx.req.jobs >= 1 && p.topo_len > 0;
+}
+
+# one module's parallel-optimization slot, indexed by stale position
+# ---
+# mid: the module being optimized
+# m:   its raw IR, staged in its own arena
+# err: nil on success, else the module's first pass error
+rec PlwSlot {
+    mid: session.ModuleId;
+    m:   *ir.Module;
+    err: str;
+}
+
+# the running parallel-optimization job, handed to each worker thread as its
+# userdata pointer
+#
+# There is no per-worker state, and deliberately so: every byte a pass allocates
+# comes from its own module's arena, the target is read-only, and the interner is
+# read-only for the span, so a worker needs nothing beyond the shared cursor.
+# ---
+# p:        the active project
+# next:     atomic cursor - the next slot index a worker claims
+# stop:     atomic flag - set non-zero by the first worker to error
+# main_id:  interned `main` for a test build, STR_NIL for a normal one - resolved
+#           on this thread so no worker ever writes the session interner
+# slots:    the per-module work array, in topo order
+# slot_len: number of slots
+rec ParallelLower {
+    p:        *project.Project;
+    next:     i64;
+    stop:     i64;
+    main_id:  intern.StrId;
+    slots:    *PlwSlot;
+    slot_len: u32;
+}
+
+# the worker thread body: drain slots from the shared cursor and optimize each
+# module in place
+#
+# Receives the job as its userdata pointer (spawn_with). Modules are handed out by
+# an atomic cursor, so which worker optimizes which module - and in what order -
+# has no bearing on the result: `lower_optimize` is a pure function of one
+# module's IR and the build's read-only settings. The first error sets the stop
+# flag so peers wind down.
+# ---
+# arg: the ParallelLower job, as an opaque pointer
+fun plw_worker_main(arg: *u8) {
+    val pl: *ParallelLower = arg::*ParallelLower;
+    if (pl == nil) { ret; }
+
+    for (true) {
+        if (atomic.load(?pl.stop) != 0) { ret; }
+        val idx_raw: i64 = atomic.fetch_add(?pl.next, 1::i64);
+        if (idx_raw >= pl.slot_len::i64) { ret; }
+
+        val slot: *PlwSlot = ?pl.slots[idx_raw::usize];
+        val r: R.Result[bool, str] = lower_optimize(pl.p, slot.m, pl.main_id);
+        if (R.is_err[bool, str](r)) {
+            slot.err = R.unwrap_err[bool, str](r);
+            atomic.store(?pl.stop, 1::i64);
+            ret;
+        }
+    }
+}
+
+# lower every stale module and stage each finished one for Q_LOWER to adopt
+#
+# The warm split first, mirroring the codegen prelude: a module whose Q_LOWER
+# would revalidate is served by the cache and never reaches the prelude; only the
+# stale remainder is built. A cold cache is the degenerate case where every module
+# is stale.
+#
+# The two halves are split because only one of them is parallelizable.
+# Monomorphization runs serially, in topo order, over the whole stale set: an
+# instance is emitted by re-deriving the DECLARING module's typing in place under
+# the instance's substitution, and by installing resolvers and comptime frames on
+# the declaring module's shared context, so two modules cannot monomorphize at
+# once without racing on state neither of them owns. Optimization then fans out,
+# because each module's IR, and the arena every pass allocates from, belongs to
+# that module alone.
+#
+# Failure is deterministic: the first error in topo order wins whichever worker
+# hit it, and every module built so far is released, so a failed pass leaves no
+# half-optimized IR for a later demand to adopt. The message is re-homed onto the
+# session interner first, because the arena that may back it is one of the ones
+# released.
+# ---
+# p:   the active project (lower_prepare has settled the staleness verdicts)
+# ret: true once every stale module is staged, or the first error
+fun run_lower_parallel(p: *project.Project) R.Result[bool, str] {
+    val topo_len: u32 = p.topo_len;
+    if (topo_len == 0) { ret R.ok[bool, str](true); }
+
+    val rslots: R.Result[*PlwSlot, str] = A.allocate[PlwSlot](p.alloc, topo_len::usize);
+    if (R.is_err[*PlwSlot, str](rslots)) { ret R.err[bool, str](R.unwrap_err[*PlwSlot, str](rslots)); }
+    val slots: *PlwSlot = R.unwrap_ok[*PlwSlot, str](rslots);
+
+    var slot_len: u32 = 0;
+    var ti: u32 = 0;
+    for (ti < topo_len) {
+        val mid: session.ModuleId = p.topo[ti];
+        if (!lower_reusable(p, mid)) {
+            slots[slot_len].mid = mid;
+            slots[slot_len].m   = nil;
+            slots[slot_len].err = nil;
+            slot_len = slot_len + 1;
+        }
+        ti = ti + 1;
+    }
+    if (slot_len <= 1) {
+        A.deallocate[PlwSlot](p.alloc, slots, topo_len::usize);
+        ret R.ok[bool, str](true);
+    }
+
+    # the variant the staged IR must be, read once: it is the same flag `lower_reusable`
+    # keyed its verdicts on above and the same one `q_lower_compute` will unpack from
+    # the key it adopts the staging under.
+    val test_mode: bool = test_build(p);
+
+    # the serial half: monomorphize and lower each stale module into its own arena,
+    # staging it on its ModuleEntry as it lands so a failure below has one sweep to
+    # reclaim it.
+    var si: u32 = 0;
+    for (si < slot_len) {
+        val mid: session.ModuleId = slots[si].mid;
+        val m:   *project.ModuleEntry = ?p.modules[mid::u32];
+
+        val hr: R.Result[*ir.ModuleHome, str] = ir_home_new(p.s.alloc);
+        if (R.is_err[*ir.ModuleHome, str](hr)) {
+            lower_sweep_staged(p);
+            A.deallocate[PlwSlot](p.alloc, slots, topo_len::usize);
+            ret R.err[bool, str](R.unwrap_err[*ir.ModuleHome, str](hr));
+        }
+        val home: *ir.ModuleHome = R.unwrap_ok[*ir.ModuleHome, str](hr);
+
+        val rr_raw: R.Result[*ir.Module, str] = lower_raw(p, mid, home, test_mode);
+        if (R.is_err[*ir.Module, str](rr_raw)) {
+            val emsg: str = lower_stable_err(p, R.unwrap_err[*ir.Module, str](rr_raw));
+            ir_release(p.s.alloc, home);
+            lower_sweep_staged(p);
+            A.deallocate[PlwSlot](p.alloc, slots, topo_len::usize);
+            ret R.err[bool, str](emsg);
+        }
+        m.staged_ir   = R.unwrap_ok[*ir.Module, str](rr_raw);
+        m.staged_home = home;
+        slots[si].m   = m.staged_ir;
+        si = si + 1;
+    }
+
+    val qc: *qctx.QueryCtx = p.s.queries.ctx::*qctx.QueryCtx;
+    var nworkers: u32 = qc.req.jobs;
+    if (nworkers == 0)        { nworkers = 1; }
+    if (nworkers > slot_len)  { nworkers = slot_len; }
+
+    val nid: R.Result[intern.StrId, str] = neutralize_id(p, test_mode);
+    if (R.is_err[intern.StrId, str](nid)) {
+        lower_sweep_staged(p);
+        A.deallocate[PlwSlot](p.alloc, slots, topo_len::usize);
+        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](nid));
+    }
+
+    var pl: ParallelLower;
+    pl.p        = p;
+    pl.next     = 0;
+    pl.stop     = 0;
+    pl.main_id  = R.unwrap_ok[intern.StrId, str](nid);
+    pl.slots    = slots;
+    pl.slot_len = slot_len;
+
+    # spawn nworkers-1 helper threads; the calling thread is the last worker, so a
+    # single-worker (jobs 1) run drives the whole pool on this thread with no spawn.
+    var threads: *thread.Thread = nil;
+    val extra: u32 = nworkers - 1;
+    if (extra > 0) {
+        val rt: R.Result[*thread.Thread, str] = A.allocate[thread.Thread](p.alloc, extra::usize);
+        if (R.is_err[*thread.Thread, str](rt)) {
+            lower_sweep_staged(p);
+            A.deallocate[PlwSlot](p.alloc, slots, topo_len::usize);
+            ret R.err[bool, str](R.unwrap_err[*thread.Thread, str](rt));
+        }
+        threads = R.unwrap_ok[*thread.Thread, str](rt);
+        var k: u32 = 0;
+        for (k < extra) { thread.spawn_with(plw_worker_main, (?pl)::*u8, ?threads[k]); k = k + 1; }
+    }
+
+    plw_worker_main((?pl)::*u8);
+
+    if (extra > 0) {
+        var k: u32 = 0;
+        for (k < extra) {
+            if (threads[k].tid >= 0) { thread.join(?threads[k]); }
+            k = k + 1;
+        }
+        A.deallocate[thread.Thread](p.alloc, threads, extra::usize);
+    }
+
+    # first error in topo order wins - deterministic regardless of which worker hit
+    # it. the message is re-homed onto the session interner BEFORE the sweep below
+    # frees the module arena that may back it (#2153).
+    var ei: u32 = 0;
+    for (ei < slot_len) {
+        if (slots[ei].err != nil) {
+            val msg: str = lower_stable_err(p, slots[ei].err);
+            lower_sweep_staged(p);
+            A.deallocate[PlwSlot](p.alloc, slots, topo_len::usize);
+            ret R.err[bool, str](msg);
+        }
+        ei = ei + 1;
+    }
+
+    A.deallocate[PlwSlot](p.alloc, slots, topo_len::usize);
+    ret R.ok[bool, str](true);
+}
+
+# reclaim any module the lowering prelude built that no Q_LOWER compute adopted
+#
+# A pass failure between staging and adoption leaves them behind, and each owns a
+# session-allocated arena, so on a warm session they would outlive the call. A
+# no-op after a successful lowering pass (every staged module was adopted).
+# ---
+# p: the active project
+pub fun lower_sweep_staged(p: *project.Project) {
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        val m: *project.ModuleEntry = ?p.modules[i];
+        if (m.staged_home != nil) {
+            ir_release(p.s.alloc, m.staged_home);
+            m.staged_home = nil;
+        }
+        m.staged_ir = nil;
+        i = i + 1;
+    }
 }
 
 # collect the transitive import closure of module `m` (every module reachable from

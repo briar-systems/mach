@@ -465,7 +465,7 @@ A stanza declares exactly one source key:
 | Key    | Meaning |
 |--------|---------|
 | `git`  | Git URL to clone into `dep/<alias>/`. Requires `ref`. |
-| `path` | Local project tree, resolved relative to this manifest's directory; never fetched. `mach dep pull` materialises it at `dep/<alias>/` as a relative symlink. Forbids `ref`. |
+| `path` | Local project tree; never fetched. A relative `path` is resolved relative to this manifest's directory; an absolute `path` is used as-is. `mach dep pull` materialises it at `dep/<alias>/` as a symlink (relative for a relative `path`, absolute for an absolute one). Forbids `ref`. |
 | `ref`  | Git ref to check out (git only): `tag/<name>`, `branch/<name>`, a bare tag/branch, or a commit SHA. |
 
 `git` and `path` are mutually exclusive and exactly one is required. A
@@ -529,6 +529,36 @@ A build cell is one artifact × one target × one profile.
   dependency entries, filtered to the native target (tests run on native hardware
   only). If two artifacts' objects collide on symbols in that union, that is an
   honest link error — restructure the entries.
+
+### Enumerated cells are filtered; named ones are not
+
+A cell whose artifact does not list the cell's target is a cell the manifest never
+declared, so enumerating skips it. Naming that pair is a different act: `--bin
+kernel --target host` is refused by name, because you asked for a cell that does not
+exist. `--bin kernel --all-targets` re-enumerates the target axis and so filters
+back to the targets `kernel` declares.
+
+If a selection is well-formed but enumerates nothing — a `--target` no artifact
+lists — the build fails naming that target and the declared artifacts, rather than
+succeeding with an empty plan.
+
+### `-o` names one output
+
+`-o` is accepted exactly when the selection resolves to a single build cell, and
+refused otherwise, naming the cells it resolved to. Two artifacts collide on one
+output path the same way two targets do: each would link over the previous, leaving
+only the last with no warning. Narrow with `--bin`/`--lib` and `--target`.
+
+### When one cell fails
+
+Every cell is attempted; a failure does not abandon the ones after it. Each cell's
+diagnostics are reported under its own heading as it happens, and every cell that
+succeeded leaves its artifact on disk at its own path — nothing is rolled back. The
+exit code is `0` when all cells succeeded, `2` if the first failure was an internal
+error, and `1` otherwise.
+
+Artifacts cannot share an output path: a manifest whose expanded `out` templates
+collide is rejected before the build starts.
 
 ### `native` target resolution
 

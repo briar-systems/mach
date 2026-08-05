@@ -154,8 +154,11 @@ LIT_STR  ::= '"' { str-char } '"'
 
 The lexer captures the raw span between the quotes and treats `\` as an
 escape that consumes the next character (so an escaped quote does not
-terminate the literal). Escape decoding happens later
-(`comptime.eval_lit_char`); the recognized escapes are:
+terminate the literal). Escape decoding happens later — in
+`comptime.eval_lit_char` / `comptime.eval_lit_str` for a comptime-evaluated
+literal, and in `me/lower/expr.lit_decode_escape` (an intentional mirror of the
+same table, #2472) for one lowered as ordinary runtime code. The recognized
+escapes are:
 
 ```
 char escapes:   \n  \t  \r  \\  \'  \0  \xHH
@@ -221,7 +224,8 @@ decorated-decl ::= { decorator } decl
 - Clauses may appear on the same line (space-separated) or one per line.
 - The argument list is optional; a bare `#[inline]` carries no arguments.
 - Arguments are comptime expressions (not types): `$size_of(T)` is a valid
-  argument; `T` as a raw type name is not.
+  argument; `T` as a raw type name is not. A layout intrinsic is accepted on both
+  a global's `align` and a record/union type's, see [decorators.md](decorators.md).
 - The closed directive set is `symbol`, `section`, `inline`, `align`,
   `library`, `oblivious`, `scalar`. See [decorators.md](decorators.md).
 - A backtick form (`` `name(args)` ``) existed through v2.3.0 and was removed in
@@ -415,7 +419,9 @@ Notes:
 - `*T` is a pointer; the untyped pointer type is the primitive name `ptr`
   (an ordinary `named-type`, not its own syntax).
 - `[N]T` is a fixed-length array; `N` is a full expression (a comptime
-  constant). Nesting (`[N][M]T`) falls out of the recursion.
+  constant), including `$size_of(T)` / `$align_of(T)` — see
+  [comptime-intrinsics.md](comptime-intrinsics.md). Nesting (`[N][M]T`) falls out
+  of the recursion.
 - `named-type` covers both plain names (`i64`, `Point`) and generic
   instantiations (`Pair[i64, u8]`, `Map[str, u32]`). The dotted path allows
   module-qualified names (`core.Thing`).
@@ -669,8 +675,9 @@ mach-read      ::= comptime-ident { member }        (* $mach.build.os, $mach.arc
 ```
 
 - Intrinsic calls (`$size_of(T)`, `$align_of(T)`, `$offset_of(T, field)`,
-  `$type_of(e)`, `$fields(T)`, `$error("msg")`, `$assert(cond, "msg")`) are
-  syntactically a `comptime-ident` callee with `call-args`.
+  `$type_of(e)`, `$fields(T)`, `$is_record(T)`, `$is_union(T)`,
+  `$is_pointer(T)`, `$type_name(T)`, `$error("msg")`) are syntactically a
+  `comptime-ident` callee with `call-args`.
 - The **type-taking** intrinsics — `$size_of`, `$align_of`, `$offset_of`,
   `$fields` — parse their **first argument with the `type` production**, not the
   expression grammar, so the whole type language is spellable there:
@@ -746,8 +753,9 @@ Doc-only (intended surface, not a distinct parser production):
   sets are enforced later (see [asm.md](asm.md),
   [comptime-mach.md](comptime-mach.md)).
 - The closed intrinsic set (`$size_of`, `$align_of`, `$offset_of`,
-  `$type_of`, `$fields`, `$error`, `$assert`) — syntactically
-  indistinguishable from any other `comptime-ident` call.
+  `$type_of`, `$fields`, `$is_record`, `$is_union`, `$is_pointer`,
+  `$type_name`, `$error`) — syntactically indistinguishable from any other
+  `comptime-ident` call.
 - The closed decorator directive set (`symbol`, `library`, `inline`, `align`,
   `section`) — the parser accepts any `IDENT` after `#[`; sema enforces the
   closed set.

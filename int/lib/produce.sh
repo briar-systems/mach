@@ -20,6 +20,11 @@
 #                 for a cross-built target with no host runner (a freestanding
 #                 aarch64/riscv64 image on the x86_64 leg). the observable is a
 #                 constant, so the golden is the fact "it emitted".
+#   panic-exit  — run a binary EXPECTED to call std.system.panic and report its
+#                 stderr message plus its exit status, distinguishing a deliberate
+#                 termination from a signal death (#2369). unlike relro-fault, the
+#                 message is part of the observable: printing it and then faulting
+#                 is exactly the regression this guards.
 #   debuginfo   — build the case with and without `-g` (run.sh builds both) and
 #                 assert over the artifacts: llvm-dwarfdump --verify accepts the `-g`
 #                 image and `-g` is loadable-byte additive (PT_LOAD segments identical).
@@ -59,14 +64,27 @@ _flat_loader_bin=
 # qemu_bin <target> — the qemu-user interpreter for a harness target, keyed by ISA
 # rather than sliced from the name. linux-riscv64's name suffix happens to match its
 # qemu-user binary (qemu-riscv64), but linux-arm64's does not (qemu-aarch64, never
-# qemu-arm64), and the bare `linux` / `windows` legs carry no ISA suffix at all. keep
-# in sync with the ISA each int/*/mach.toml's `[target.<leg>]` declares when a
-# targets.conf row is added.
+# qemu-arm64), and the bare `linux` leg carries no ISA suffix at all. keep in sync
+# with the ISA each int/*/mach.toml's `[target.<leg>]` declares when a targets.conf
+# row is added.
+#
+# ELF ONLY. qemu-user's loader understands the Linux ELF ABI and nothing else - a
+# PE or Mach-O artifact can never load under it, on any host, no matter which
+# qemu-<arch> binary is named. A target whose `[target.<leg>].os` is not `linux`
+# has no qemu interpreter and never will (#2453, found by executing qemu-x86_64
+# against a real windows PE artifact and qemu-aarch64 against a real darwin-aarch64
+# Mach-O one: both fail `Exec format error` unconditionally). Naming that here
+# explicitly is what keeps the next target addition from reintroducing a mapping
+# that looks alive and cannot work - the same shape #2314 found for linux-arm64,
+# except that one was dead-but-workable and these are dead-permanently.
 qemu_bin() {
     case "$1" in
-        linux|windows|darwin-x86_64) echo qemu-x86_64 ;;
-        linux-arm64|darwin-aarch64)  echo qemu-aarch64 ;;
-        linux-riscv64)               echo qemu-riscv64 ;;
+        linux)         echo qemu-x86_64 ;;
+        linux-arm64)   echo qemu-aarch64 ;;
+        linux-riscv64) echo qemu-riscv64 ;;
+        windows|darwin-x86_64|darwin-aarch64)
+            echo "int: '$1' is not linux - qemu-user loads ELF only, so a PE or Mach-O target has no qemu interpreter (#2453)" >&2
+            return 1 ;;
         *) echo "int: no qemu interpreter mapping for target '$1'" >&2; return 1 ;;
     esac
 }
@@ -109,6 +127,42 @@ produce_relro_fault() {
         echo "relro_write=faulted"
     else
         echo "relro_write=exit$ec"
+    fi
+}
+
+# produce_panic_exit <runmode> <target> <binary>
+# runs a binary EXPECTED to call std.system.panic and reports its stderr message
+# followed by its exit status, distinguishing a deliberate PANIC_EXIT from a signal
+# death (#2369): panic used to write its message and then execute a trap
+# instruction with no exit syscall, which faulted (SIGSEGV, exit 139 on x86_64;
+# SIGTRAP, exit 133, on aarch64 / riscv64) and made a correctly detected internal
+# error indistinguishable from memory corruption. stdout+stderr are captured to a
+# file rather than a command substitution, both to avoid stripping the message's
+# own trailing newline (`$()` strips all of them) and to keep the exit-status read
+# on the line directly after the command, matching produce_relro_fault - the
+# proven-safe shape under this harness's `set -e`.
+#
+# a signal death is 128 + N with N in 1..64 (POSIX real-time signals cap there); the
+# fact is reported as `signal(<n>)` rather than the raw number so a golden reviewer
+# does not have to recompute N to see what regressed.
+produce_panic_exit() {
+    runmode=$1
+    target=$2
+    bin=$3
+    out=$(mktemp)
+    if [ "$runmode" = "qemu" ]; then
+        interp=$(qemu_bin "$target") || { rm -f "$out"; return 1; }
+        "$interp" "$bin" >"$out" 2>&1
+    else
+        "$bin" >"$out" 2>&1
+    fi
+    ec=$?
+    cat "$out"
+    rm -f "$out"
+    if [ "$ec" -ge 129 ] && [ "$ec" -le 192 ]; then
+        echo "exit=signal($((ec - 128)))"
+    else
+        echo "exit=$ec"
     fi
 }
 
@@ -629,6 +683,7 @@ produce() {
     case "$run" in
         exec)        produce_exec "$@" ;;
         relro-fault) produce_relro_fault "$@" ;;
+        panic-exit)  produce_panic_exit "$@" ;;
         field)       produce_field "$@" ;;
         relro)       produce_relro "$@" ;;
         flat-loader) produce_flat_loader "$@" ;;

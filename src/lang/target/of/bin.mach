@@ -14,16 +14,21 @@
 
 use std.memory;
 use std.format;
+use std.crypto.rand;
+use std.allocator.page;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_len;
+use std.types.path.Path;
 
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
+use fs: std.filesystem;
+use spath: std.types.path;
 
 use mach.lang.intern;
 use mach.lang.target.of;
@@ -298,6 +303,118 @@ pub fun io_message(itn: *intern.Interner, a: *A.Allocator, op: str, path: str, o
     ret message_finish(itn, a, buf, str_len(buf), generic);
 }
 
+# write `buf` to `path` by creating a same-directory temp file and atomically
+# renaming it over `path`, rather than truncating `path` in place
+#
+# Writing in place fails with ETXTBSY when `path` is a binary a process is
+# currently executing (or, for a shared object, has mapped executable) - the
+# self-rebuild case #2475 names. Standard toolchain behavior (gcc/clang/go) is
+# to link to a temp file and rename over the target instead: a running process
+# keeps its unlinked image while `path` serves the new binary on the next
+# invocation, and a build killed mid-write never leaves a half-written file at
+# `path` - the temp file is either renamed whole or removed.
+#
+# The temp file MUST share `path`'s directory: `rename` fails with EXDEV
+# across filesystems, and a build output routinely lands on a different
+# filesystem than the OS temp directory (contrast `fs.temp_create`). The temp
+# name carries no exclusivity guarantee (a single random 64-bit suffix, no
+# O_EXCL retry) - collisions are gcc-`ccXXXXXX`-rare and, unlike `path` itself,
+# a clobbered temp file for a concurrent build of the same output belongs to
+# a build that was already racing this one.
+# ---
+# itn:            interner backing the returned diagnostic
+# a:              allocator for the transient temp-path text
+# path:           final destination path
+# buf:            bytes to write
+# len:            byte length of `buf`
+# mode:           permission bits for the created file
+# create_op:      leading diagnostic text for a temp-file create failure
+# create_generic: fallback text when `create_op` cannot be interned
+# write_op:       leading diagnostic text for a write failure
+# write_generic:  fallback text when `write_op` cannot be interned
+# rename_op:      leading diagnostic text for the final rename failure
+# rename_generic: fallback text when `rename_op` cannot be interned
+# ret:              ok(true) on success, or an interned diagnostic naming `path`
+pub fun write_atomic(itn: *intern.Interner, a: *A.Allocator, path: *u8, buf: *u8, len: usize, mode: i32,
+                      create_op: str, create_generic: str,
+                      write_op: str, write_generic: str,
+                      rename_op: str, rename_generic: str) R.Result[bool, str] {
+    val dir_r: R.Result[Path, str] = spath.parent(a, path::str);
+    if (R.is_err[Path, str](dir_r)) { ret R.err[bool, str](R.unwrap_err[Path, str](dir_r)); }
+    val dir: Path = R.unwrap_ok[Path, str](dir_r);
+
+    val name_r: R.Result[str, str] = format.sprint(a, ".{}.tmp{}", spath.filename(path::str), rand.u64());
+    if (R.is_err[str, str](name_r)) {
+        A.deallocate[u8](a, dir, str_len(dir) + 1);
+        ret R.err[bool, str](R.unwrap_err[str, str](name_r));
+    }
+    val tmp_name: str = R.unwrap_ok[str, str](name_r);
+
+    val tmp_r: R.Result[Path, str] = spath.join(a, dir, tmp_name);
+    A.deallocate[u8](a, dir, str_len(dir) + 1);
+    A.deallocate[u8](a, tmp_name, str_len(tmp_name) + 1);
+    if (R.is_err[Path, str](tmp_r)) { ret R.err[bool, str](R.unwrap_err[Path, str](tmp_r)); }
+    val tmp: Path = R.unwrap_ok[Path, str](tmp_r);
+
+    val res_file: R.Result[fs.File, str] = fs.create(tmp, mode);
+    if (R.is_err[fs.File, str](res_file)) {
+        val cm: str = io_message(itn, a, create_op, path::str, R.unwrap_err[fs.File, str](res_file), create_generic);
+        A.deallocate[u8](a, tmp, str_len(tmp) + 1);
+        ret R.err[bool, str](cm);
+    }
+    var f: fs.File = R.unwrap_ok[fs.File, str](res_file);
+    val res_write: R.Result[usize, str] = fs.write(f, buf, len);
+    fs.close(f);
+    if (R.is_err[usize, str](res_write)) {
+        val cm: str = io_message(itn, a, write_op, path::str, R.unwrap_err[usize, str](res_write), write_generic);
+        fs.remove_file(tmp);
+        A.deallocate[u8](a, tmp, str_len(tmp) + 1);
+        ret R.err[bool, str](cm);
+    }
+    # `fs.write` is one `write(2)` call, not a loop to completion: a short write
+    # (a resource limit, an interrupting signal) returns ok() with a byte count
+    # under `len` rather than an error. Left unchecked, that truncated temp file
+    # would still rename over `path`, replacing a good executable with a broken
+    # one and reporting success.
+    if (R.unwrap_ok[usize, str](res_write) != len) {
+        val cm: str = io_message(itn, a, write_op, path::str, "short write", write_generic);
+        fs.remove_file(tmp);
+        A.deallocate[u8](a, tmp, str_len(tmp) + 1);
+        ret R.err[bool, str](cm);
+    }
+
+    var res_rename: O.Option[str] = fs.rename(tmp, path::str);
+    if (O.is_some[str](res_rename)) {
+        # `rename` replacing an existing destination is POSIX-atomic but not
+        # universal: Windows' underlying MoveFile does not replace an existing
+        # file (mach-std's `os.rename` wraps the non-replacing `MoveFileA`,
+        # briar-systems/mach-std#414), so the first attempt fails here on every
+        # target host whenever `path` already exists - the common case, since
+        # this function exists specifically for REBUILDING an existing output.
+        # Falling back to remove-then-retry recovers the common case at the cost
+        # of a brief window (between the remove and the retry) where `path` does
+        # not exist, rather than a true atomic swap - the best available without
+        # a replacing primitive. If the remove fails, nothing was touched and the
+        # original rename error is reported unchanged.
+        if (O.is_some[str](fs.remove_file(path::str))) {
+            val cm: str = io_message(itn, a, rename_op, path::str, O.unwrap[str](res_rename), rename_generic);
+            fs.remove_file(tmp);
+            A.deallocate[u8](a, tmp, str_len(tmp) + 1);
+            ret R.err[bool, str](cm);
+        }
+        res_rename = fs.rename(tmp, path::str);
+        if (O.is_some[str](res_rename)) {
+            val cm: str = io_message(itn, a, rename_op, path::str, O.unwrap[str](res_rename), rename_generic);
+            fs.remove_file(tmp);
+            A.deallocate[u8](a, tmp, str_len(tmp) + 1);
+            ret R.err[bool, str](cm);
+        }
+    }
+
+    A.deallocate[u8](a, tmp, str_len(tmp) + 1);
+    ret R.ok[bool, str](true);
+}
+
 # count the relocations targeting each section of `img` in one pass, returning a
 # `section_count`-long array (`counts[s]` = relocations patching section `s`)
 #
@@ -356,5 +473,113 @@ test "mach.lang.target.of.bin.region_ok:wrap_around" {
     if (!region_ok(0x10, 8, 8)) { ret 1; }
     # one byte over: len exceeds remaining space -> false
     if (region_ok(0x10, 8, 9)) { ret 1; }
+    ret 0;
+}
+
+# write_atomic lands the requested bytes at `path`, readable back afterward
+test "mach.lang.target.of.bin.write_atomic:replaces_target_content" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "atomic_dst");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val dst: str = fs.temp_path(?tf);
+    fs.temp_close(?tf);
+
+    var content: [4]u8;
+    content[0] = 0xDE; content[1] = 0xAD; content[2] = 0xBE; content[3] = 0xEF;
+
+    val wr: R.Result[bool, str] = write_atomic(?itn, ?alloc, dst::*u8, ?content[0], 4, 0o644,
+        "test: create", "test: create failed", "test: write", "test: write failed",
+        "test: rename", "test: rename failed");
+    if (R.is_err[bool, str](wr)) { fs.remove_file(dst); ret 1; }
+
+    val or_: R.Result[fs.File, str] = fs.open(dst);
+    if (R.is_err[fs.File, str](or_)) { ret 1; }
+    val rf: fs.File = R.unwrap_ok[fs.File, str](or_);
+    var readback: [4]u8;
+    val rr: R.Result[usize, str] = fs.read(rf, ?readback[0], 4);
+    fs.close(rf);
+    fs.remove_file(dst);
+    if (R.is_err[usize, str](rr))              { ret 1; }
+    if (R.unwrap_ok[usize, str](rr) != 4)      { ret 1; }
+    if (readback[0] != 0xDE || readback[1] != 0xAD
+     || readback[2] != 0xBE || readback[3] != 0xEF) { ret 1; }
+
+    ret 0;
+}
+
+# the mechanism #2475 exists for: a handle opened on `path` BEFORE the replace -
+# standing in for a process that `execve`'d the old image - keeps reading the old
+# bytes after `write_atomic` returns, because the rename repoints the directory
+# entry without touching the inode the open handle already resolved to. A fresh
+# open of the same path sees the new content. This is the in-process form of the
+# ETXTBSY repro (#2475): a rebuild that truncated `path` in place would instead
+# corrupt the still-open handle's view, or fail outright while a real execve'd
+# process holds it.
+test "mach.lang.target.of.bin.write_atomic:open_handle_survives_replace" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "atomic_live");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val dst: str = fs.temp_path(?tf);
+
+    var old_content: [4]u8;
+    old_content[0] = 0x11; old_content[1] = 0x22; old_content[2] = 0x33; old_content[3] = 0x44;
+    val ww: R.Result[usize, str] = fs.write(tf.file, ?old_content[0], 4);
+    if (R.is_err[usize, str](ww)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val or_: R.Result[fs.File, str] = fs.open(dst);
+    if (R.is_err[fs.File, str](or_)) { fs.temp_close_and_remove(?tf); ret 1; }
+    val held: fs.File = R.unwrap_ok[fs.File, str](or_);
+    fs.temp_close(?tf);
+
+    var new_content: [4]u8;
+    new_content[0] = 0xAA; new_content[1] = 0xBB; new_content[2] = 0xCC; new_content[3] = 0xDD;
+    val wr: R.Result[bool, str] = write_atomic(?itn, ?alloc, dst::*u8, ?new_content[0], 4, 0o644,
+        "test: create", "test: create failed", "test: write", "test: write failed",
+        "test: rename", "test: rename failed");
+    if (R.is_err[bool, str](wr)) { fs.close(held); fs.remove_file(dst); ret 1; }
+
+    var readback_old: [4]u8;
+    val rr_old: R.Result[usize, str] = fs.read(held, ?readback_old[0], 4);
+    fs.close(held);
+    if (R.is_err[usize, str](rr_old)) { fs.remove_file(dst); ret 1; }
+    if (readback_old[0] != 0x11 || readback_old[1] != 0x22
+     || readback_old[2] != 0x33 || readback_old[3] != 0x44) { fs.remove_file(dst); ret 1; }
+
+    val or2: R.Result[fs.File, str] = fs.open(dst);
+    if (R.is_err[fs.File, str](or2)) { ret 1; }
+    val fresh: fs.File = R.unwrap_ok[fs.File, str](or2);
+    var readback_new: [4]u8;
+    val rr_new: R.Result[usize, str] = fs.read(fresh, ?readback_new[0], 4);
+    fs.close(fresh);
+    fs.remove_file(dst);
+    if (R.is_err[usize, str](rr_new)) { ret 1; }
+    if (readback_new[0] != 0xAA || readback_new[1] != 0xBB
+     || readback_new[2] != 0xCC || readback_new[3] != 0xDD) { ret 1; }
+
+    ret 0;
+}
+
+# a destination whose directory does not exist fails cleanly through the
+# caller-supplied create diagnostic, rather than a crash or a silent no-op
+test "mach.lang.target.of.bin.write_atomic:missing_directory_fails_cleanly" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+
+    var buf: [4]u8;
+    buf[0] = 1; buf[1] = 2; buf[2] = 3; buf[3] = 4;
+
+    val wr: R.Result[bool, str] = write_atomic(?itn, ?alloc, "/mach-2475-no-such-dir/target"::*u8, ?buf[0], 4, 0o644,
+        "test: create", "test: create failed", "test: write", "test: write failed",
+        "test: rename", "test: rename failed");
+    if (R.is_ok[bool, str](wr)) { ret 1; }
     ret 0;
 }

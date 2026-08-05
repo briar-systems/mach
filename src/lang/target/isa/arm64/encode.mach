@@ -59,6 +59,7 @@ use R: std.types.result;
 use mach.lang.be.codegen.encode;
 use codegen_frame: mach.lang.be.codegen.frame;
 use mach.lang.be.codegen.mir;
+use mach.lang.ct;
 use mach.lang.intern;
 use mach.lang.target.isa;
 use iasm: mach.lang.target.isa.asm;
@@ -336,35 +337,233 @@ val MSR_IMM_BASE: u32 = 0xD500401F;
 val MSR_REG_BASE: u32 = 0xD5100000;
 val MRS_BASE:     u32 = 0xD5300000;
 
+# longest system-register or PSTATE-field name the parser accepts, with its terminator
+#
+# Sized to the surface rather than guessed: `id_aa64isar0_el1` is sixteen characters, one
+# more than the buffer this replaced could hold, so the longest names in the table would
+# have been refused as "too long" while the table listed them (#2480).
+val A64_SYSREG_NAME_MAX: usize = 32;
+
+# true when `name` equals the lowercase `want`, ignoring ASCII case
+#
+# ARM's manuals capitalize a system register (`CNTVCT_EL0`), assembly sources usually do
+# not, and nothing in mach's pipeline case-folds asm text. Folding HERE rather than
+# spelling both cases per row is what keeps the tables below from doubling into a
+# lowercase half that can be forgotten one register at a time (#2480).
+fun a64_name_eq(name: str, want: str) bool {
+    val n: usize = str_len(name);
+    if (n != str_len(want)) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        var c: u32 = name[i]::u32;
+        if (c >= 'A'::u32 && c <= 'Z'::u32) { c = c + ('a'::u32 - 'A'::u32); }
+        if (c != want[i]::u32) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# read one decimal field of a numeric system-register name, bounded by `max`
+#
+# A FIELD THE ARCHITECTURE CANNOT HOLD IS REFUSED, NOT MASKED. `a64_sysreg_pack`
+# truncates each selector to its own width, so an accepted `s3_9_c0_c0_0` would encode
+# op1 = 1 and read a DIFFERENT register than the one written - a working-looking program
+# reading the wrong system register, which is the failure mode this whole surface has to
+# avoid.
+# ---
+# name: the full register name
+# pos:  cursor into `name`, advanced past the digits read
+# max:  the largest value this field may hold
+# out:  receives the parsed value
+# ret:  true when one in-range decimal field was read
+fun a64_sysreg_field(name: str, pos: *usize, max: u32, out: *u32) bool {
+    val n: usize = str_len(name);
+    var i: usize = @pos;
+    var v: u32 = 0;
+    var digits: u32 = 0;
+    for (i < n && name[i]::u32 >= '0'::u32 && name[i]::u32 <= '9'::u32) {
+        v      = v * 10 + (name[i]::u32 - '0'::u32);
+        digits = digits + 1;
+        if (digits > 2) { ret false; }
+        i = i + 1;
+    }
+    if (digits == 0 || v > max) { ret false; }
+    @pos = i;
+    @out = v;
+    ret true;
+}
+
+# consume one literal character of a numeric system-register name, ignoring ASCII case
+fun a64_sysreg_char(name: str, pos: *usize, want: char) bool {
+    if (@pos >= str_len(name)) { ret false; }
+    var c: u32 = name[@pos]::u32;
+    if (c >= 'A'::u32 && c <= 'Z'::u32) { c = c + ('a'::u32 - 'A'::u32); }
+    if (c != want::u32) { ret false; }
+    @pos = @pos + 1;
+    ret true;
+}
+
+# the selectors of the architectural `s<op0>_<op1>_c<CRn>_c<CRm>_<op2>` spelling
+#
+# THE ESCAPE IS WHAT MAKES THIS SURFACE FINITE. A name table can never be complete - the
+# architecture adds registers faster than any compiler tracks them, and an implementation
+# may define its own - so the general answer is the encoding itself, spelled the way ARM
+# and GNU as spell it. `mrs x0, s3_3_c14_c0_2` is `mrs x0, cntvct_el0`, and this
+# equivalence is asserted byte-for-byte in the tests rather than assumed.
+#
+# op0 IS RESTRICTED TO 2 AND 3, which is the whole of the MRS / MSR register space. An
+# op0 of 0 or 1 selects the SYS / SYSL instruction space (`dc`, `ic`, `at`, `tlbi`) -
+# different instructions with their own mnemonics - and `a64_emit_sysreg` bakes the high
+# bit of op0 into its base word, so accepting `s1_...` here would silently encode op0 = 3
+# and address a register nobody named.
+fun a64_sysreg_numeric(name: str, op0_out: *u32, op1_out: *u32, crn_out: *u32, crm_out: *u32, op2_out: *u32) bool {
+    var i: usize = 0;
+    if (!a64_sysreg_char(name, ?i, 's'::char)) { ret false; }
+
+    var op0: u32 = 0;
+    if (!a64_sysreg_field(name, ?i, 3, ?op0)) { ret false; }
+    if (op0 < 2)                              { ret false; }
+    if (!a64_sysreg_char(name, ?i, '_'::char)) { ret false; }
+
+    var op1: u32 = 0;
+    if (!a64_sysreg_field(name, ?i, 7, ?op1))  { ret false; }
+    if (!a64_sysreg_char(name, ?i, '_'::char)) { ret false; }
+
+    var crn: u32 = 0;
+    if (!a64_sysreg_char(name, ?i, 'c'::char)) { ret false; }
+    if (!a64_sysreg_field(name, ?i, 15, ?crn)) { ret false; }
+    if (!a64_sysreg_char(name, ?i, '_'::char)) { ret false; }
+
+    var crm: u32 = 0;
+    if (!a64_sysreg_char(name, ?i, 'c'::char)) { ret false; }
+    if (!a64_sysreg_field(name, ?i, 15, ?crm)) { ret false; }
+    if (!a64_sysreg_char(name, ?i, '_'::char)) { ret false; }
+
+    var op2: u32 = 0;
+    if (!a64_sysreg_field(name, ?i, 7, ?op2)) { ret false; }
+    # trailing text means this is not the numeric form at all.
+    if (i != str_len(name)) { ret false; }
+
+    @op0_out = op0; @op1_out = op1; @crn_out = crn; @crm_out = crm; @op2_out = op2;
+    ret true;
+}
+
 # the (op1, op2) of a PSTATE field writable by `msr <field>, #imm`
 #
-# The immediate rides CRm, so the field itself contributes only op1 and op2. DIT is the
-# data-independent-timing mode: with it set, the ARM architecture guarantees that the
-# timing of the instructions in its scope does not depend on their data values, which is
-# the hardware half of the constant-time story (#1643). It is EL0-writable, so a
-# userspace program may set it for itself.
+# The immediate rides CRm, so the field itself contributes only op1 and op2. There is no
+# numeric escape for this form - the architecture spells a PSTATE field by name only - so
+# this table is the whole surface, and it holds every field the MSR-immediate encoding
+# defines.
 #
-# ARM spells these fields in capitals and mach's asm text is matched verbatim - nothing
-# in the pipeline case-folds - so both spellings are accepted rather than forcing a
-# reader to write the one this table happened to pick.
+# DIT is the data-independent-timing mode: with it set, the ARM architecture guarantees
+# that the timing of the instructions in its scope does not depend on their data values,
+# which is the hardware half of the constant-time story (#1643). It is EL0-writable, so a
+# userspace program may set it for itself. DAIFSet / DAIFClr are the interrupt mask a trap
+# handler runs behind, which is why a kernel needs them (#2480).
+#
+# EVERY PAIR BELOW WAS READ OFF `llvm-mc -triple=aarch64 --show-encoding`, decoding op1
+# from bits[18:16] and op2 from bits[7:5] of the word it produced for `msr <field>, #1` -
+# not derived on paper, and not read back from this encoder.
 fun a64_pstate_field(name: str, op1_out: *u32, op2_out: *u32) bool {
-    if (str_equals(name, "DIT") || str_equals(name, "dit")) {
-        @op1_out = 3; @op2_out = 2; ret true;
-    }
+    if (a64_name_eq(name, "daifset")) { @op1_out = 3; @op2_out = 6; ret true; }
+    if (a64_name_eq(name, "daifclr")) { @op1_out = 3; @op2_out = 7; ret true; }
+    if (a64_name_eq(name, "spsel"))   { @op1_out = 0; @op2_out = 5; ret true; }
+    if (a64_name_eq(name, "pan"))     { @op1_out = 0; @op2_out = 4; ret true; }
+    if (a64_name_eq(name, "uao"))     { @op1_out = 0; @op2_out = 3; ret true; }
+    if (a64_name_eq(name, "ssbs"))    { @op1_out = 3; @op2_out = 1; ret true; }
+    if (a64_name_eq(name, "dit"))     { @op1_out = 3; @op2_out = 2; ret true; }
+    if (a64_name_eq(name, "tco"))     { @op1_out = 3; @op2_out = 4; ret true; }
     ret false;
 }
 
 # the (op0, op1, CRn, CRm, op2) of a system register named by `msr`/`mrs`
 #
-# DIT is both a PSTATE field and a system register: the immediate form writes the mode
-# bit directly, and the register form is how a program reads it back to confirm the mode
+# DIT is both a PSTATE field and a system register: the immediate form writes the mode bit
+# directly, and the register form is how a program reads it back to confirm the mode
 # actually engaged. Same name, different encodings - which is why the two lookups are
 # separate tables rather than one.
+#
+# EVERY ROW BELOW WAS DECODED FROM `llvm-mc -triple=aarch64 --show-encoding` for `mrs x0,
+# <name>`, taking op0 from bit[19], op1 from bits[18:16], CRn from [15:12], CRm from
+# [11:8] and op2 from [7:5]. A row derived on paper is a register read that works, returns
+# a plausible number, and is the wrong register - the exact defect no test written beside
+# the same reasoning would catch.
+#
+# THE TABLE IS DELIBERATELY NOT EXHAUSTIVE, and cannot be: it names what freestanding code
+# actually reaches for - the generic timer, the exception vectors and their syndrome
+# registers, the MMU control registers, the thread pointers, and enough identification
+# registers to detect a CPU. Everything else is spelled by `s<op0>_<op1>_c<CRn>_c<CRm>_
+# <op2>`, which addresses the whole space.
+#
+# ACCESS PERMISSION IS NOT MODELLED, and that is a decision rather than an omission.
+# Whether a register is readable or writable depends on the current exception level -
+# CNTFRQ_EL0 is writable at EL1 and read-only at EL0 - and a compiler that does not know
+# the EL its code will run at cannot decide it. Refusing a write to a register that is
+# read-only at SOME level would refuse correct kernel code; the architecture's own answer
+# (an UNDEFINED exception at run time) is left to stand.
 fun a64_sysreg(name: str, op0_out: *u32, op1_out: *u32, crn_out: *u32, crm_out: *u32, op2_out: *u32) bool {
-    if (str_equals(name, "DIT") || str_equals(name, "dit")) {
-        @op0_out = 3; @op1_out = 3; @crn_out = 4; @crm_out = 2; @op2_out = 5; ret true;
-    }
-    ret false;
+    # the generic timer: the counter, its frequency, and the virtual / physical timer
+    # control, comparison and countdown registers.
+    if (a64_name_eq(name, "cntvct_el0"))    { @op0_out = 3; @op1_out = 3; @crn_out = 14; @crm_out = 0; @op2_out = 2; ret true; }
+    if (a64_name_eq(name, "cntpct_el0"))    { @op0_out = 3; @op1_out = 3; @crn_out = 14; @crm_out = 0; @op2_out = 1; ret true; }
+    if (a64_name_eq(name, "cntfrq_el0"))    { @op0_out = 3; @op1_out = 3; @crn_out = 14; @crm_out = 0; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "cntv_ctl_el0"))  { @op0_out = 3; @op1_out = 3; @crn_out = 14; @crm_out = 3; @op2_out = 1; ret true; }
+    if (a64_name_eq(name, "cntv_cval_el0")) { @op0_out = 3; @op1_out = 3; @crn_out = 14; @crm_out = 3; @op2_out = 2; ret true; }
+    if (a64_name_eq(name, "cntv_tval_el0")) { @op0_out = 3; @op1_out = 3; @crn_out = 14; @crm_out = 3; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "cntp_ctl_el0"))  { @op0_out = 3; @op1_out = 3; @crn_out = 14; @crm_out = 2; @op2_out = 1; ret true; }
+    if (a64_name_eq(name, "cntp_cval_el0")) { @op0_out = 3; @op1_out = 3; @crn_out = 14; @crm_out = 2; @op2_out = 2; ret true; }
+    if (a64_name_eq(name, "cntp_tval_el0")) { @op0_out = 3; @op1_out = 3; @crn_out = 14; @crm_out = 2; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "cntkctl_el1"))   { @op0_out = 3; @op1_out = 0; @crn_out = 14; @crm_out = 1; @op2_out = 0; ret true; }
+
+    # the EL1 exception state: the vector base a trap handler installs, the return
+    # address and saved state, and the syndrome / fault address a handler decodes.
+    if (a64_name_eq(name, "vbar_el1"))  { @op0_out = 3; @op1_out = 0; @crn_out = 12; @crm_out = 0; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "elr_el1"))   { @op0_out = 3; @op1_out = 0; @crn_out =  4; @crm_out = 0; @op2_out = 1; ret true; }
+    if (a64_name_eq(name, "spsr_el1"))  { @op0_out = 3; @op1_out = 0; @crn_out =  4; @crm_out = 0; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "esr_el1"))   { @op0_out = 3; @op1_out = 0; @crn_out =  5; @crm_out = 2; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "far_el1"))   { @op0_out = 3; @op1_out = 0; @crn_out =  6; @crm_out = 0; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "sp_el0"))    { @op0_out = 3; @op1_out = 0; @crn_out =  4; @crm_out = 1; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "sp_el1"))    { @op0_out = 3; @op1_out = 4; @crn_out =  4; @crm_out = 1; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "spsel"))     { @op0_out = 3; @op1_out = 0; @crn_out =  4; @crm_out = 2; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "currentel")) { @op0_out = 3; @op1_out = 0; @crn_out =  4; @crm_out = 2; @op2_out = 2; ret true; }
+    if (a64_name_eq(name, "daif"))      { @op0_out = 3; @op1_out = 3; @crn_out =  4; @crm_out = 2; @op2_out = 1; ret true; }
+    if (a64_name_eq(name, "nzcv"))      { @op0_out = 3; @op1_out = 3; @crn_out =  4; @crm_out = 2; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "dit"))       { @op0_out = 3; @op1_out = 3; @crn_out =  4; @crm_out = 2; @op2_out = 5; ret true; }
+
+    # the EL2 twins, reached by code that boots at EL2 and drops to EL1.
+    if (a64_name_eq(name, "vbar_el2"))  { @op0_out = 3; @op1_out = 4; @crn_out = 12; @crm_out = 0; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "elr_el2"))   { @op0_out = 3; @op1_out = 4; @crn_out =  4; @crm_out = 0; @op2_out = 1; ret true; }
+    if (a64_name_eq(name, "spsr_el2"))  { @op0_out = 3; @op1_out = 4; @crn_out =  4; @crm_out = 0; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "esr_el2"))   { @op0_out = 3; @op1_out = 4; @crn_out =  5; @crm_out = 2; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "far_el2"))   { @op0_out = 3; @op1_out = 4; @crn_out =  6; @crm_out = 0; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "sctlr_el2")) { @op0_out = 3; @op1_out = 4; @crn_out =  1; @crm_out = 0; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "hcr_el2"))   { @op0_out = 3; @op1_out = 4; @crn_out =  1; @crm_out = 1; @op2_out = 0; ret true; }
+
+    # the EL1 MMU control: the system control register, the translation control and its
+    # two base registers, and the memory attribute indirection.
+    if (a64_name_eq(name, "sctlr_el1")) { @op0_out = 3; @op1_out = 0; @crn_out =  1; @crm_out = 0; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "tcr_el1"))   { @op0_out = 3; @op1_out = 0; @crn_out =  2; @crm_out = 0; @op2_out = 2; ret true; }
+    if (a64_name_eq(name, "ttbr0_el1")) { @op0_out = 3; @op1_out = 0; @crn_out =  2; @crm_out = 0; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "ttbr1_el1")) { @op0_out = 3; @op1_out = 0; @crn_out =  2; @crm_out = 0; @op2_out = 1; ret true; }
+    if (a64_name_eq(name, "mair_el1"))  { @op0_out = 3; @op1_out = 0; @crn_out = 10; @crm_out = 2; @op2_out = 0; ret true; }
+
+    # the thread pointers, including the read-only EL0 one a userspace TLS ABI uses.
+    if (a64_name_eq(name, "tpidr_el0"))   { @op0_out = 3; @op1_out = 3; @crn_out = 13; @crm_out = 0; @op2_out = 2; ret true; }
+    if (a64_name_eq(name, "tpidrro_el0")) { @op0_out = 3; @op1_out = 3; @crn_out = 13; @crm_out = 0; @op2_out = 3; ret true; }
+    if (a64_name_eq(name, "tpidr_el1"))   { @op0_out = 3; @op1_out = 0; @crn_out = 13; @crm_out = 0; @op2_out = 4; ret true; }
+
+    # identification: which core this is, which core within the cluster, the cache
+    # geometry, and the feature registers a run-time capability check reads.
+    if (a64_name_eq(name, "midr_el1"))         { @op0_out = 3; @op1_out = 0; @crn_out = 0; @crm_out = 0; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "mpidr_el1"))        { @op0_out = 3; @op1_out = 0; @crn_out = 0; @crm_out = 0; @op2_out = 5; ret true; }
+    if (a64_name_eq(name, "ctr_el0"))          { @op0_out = 3; @op1_out = 3; @crn_out = 0; @crm_out = 0; @op2_out = 1; ret true; }
+    if (a64_name_eq(name, "dczid_el0"))        { @op0_out = 3; @op1_out = 3; @crn_out = 0; @crm_out = 0; @op2_out = 7; ret true; }
+    if (a64_name_eq(name, "id_aa64pfr0_el1"))  { @op0_out = 3; @op1_out = 0; @crn_out = 0; @crm_out = 4; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "id_aa64isar0_el1")) { @op0_out = 3; @op1_out = 0; @crn_out = 0; @crm_out = 6; @op2_out = 0; ret true; }
+    if (a64_name_eq(name, "id_aa64mmfr0_el1")) { @op0_out = 3; @op1_out = 0; @crn_out = 0; @crm_out = 7; @op2_out = 0; ret true; }
+
+    # anything the table does not name is spelled by its encoding.
+    ret a64_sysreg_numeric(name, op0_out, op1_out, crn_out, crm_out, op2_out);
 }
 
 # a three-register data-processing word - Rm[20:16], Rn[9:5], Rd[4:0]
@@ -1158,6 +1357,11 @@ fun emit_barrier(st: *encode.EncodeState, crm: u32) {
 # it. Rt is baked into the base as 0b11111.
 fun emit_msr_imm(st: *encode.EncodeState, op1: u32, op2: u32, imm: u32) {
     emit_word(st, MSR_IMM_BASE | ((op1 & 0x7) << 16) | ((imm & 0xF) << 8) | ((op2 & 0x7) << 5));
+    if (!noting(st)) { ret; }
+    var i: printer.Inst = printer.inst(printer.FORM_SYSREG_IMM, MSR_IMM_BASE);
+    i.src1 = isa.make_imm((((op1 & 0x7) << 3) | (op2 & 0x7))::i64, 1);
+    i.src2 = isa.make_imm(imm::i64, 1);
+    printer.note_inst(?st.buf, ?i);
 }
 
 # fold a system register's five architectural selectors into one operand payload
@@ -1186,6 +1390,11 @@ fun a64_emit_sysreg(st: *encode.EncodeState, base: u32, packed: u32, rt: u32) {
     val op2: u32 = packed & 0x7;
     emit_word(st, base | ((op0 & 0x1) << 19) | (op1 << 16)
                        | (crn << 12) | (crm << 8) | (op2 << 5) | (rt & 0x1F));
+    if (!noting(st)) { ret; }
+    var i: printer.Inst = printer.inst(printer.FORM_SYSREG, base);
+    i.dst  = printer.gp(rt, 8);
+    i.src1 = isa.make_imm(packed::i64, 4);
+    printer.note_inst(?st.buf, ?i);
 }
 
 # emit a store-release-exclusive word, whose status result rides bits[20:16]
@@ -1410,13 +1619,21 @@ fun emit_add_imm(st: *encode.EncodeState, rd: u32, rn: u32, off: i64) {
 }
 
 # the LSL amount realizing an index scale (1/2/4/8 -> 0/1/2/3) for the
-# GEP scaled-index ADD. an unmodeled scale (never produced by the SIB-legal lowering)
-# takes 0
-fun scale_shift(scale: u8) u32 {
-    if (scale == 2) { ret 1; }
-    if (scale == 4) { ret 2; }
-    if (scale == 8) { ret 3; }
-    ret 0;
+# GEP scaled-index ADD
+#
+# Scale 1 is named rather than defaulted. The bound is `is_sib_scale` in the shared
+# GEP lowering, one module away, and an unmodeled scale used to take the same 0 as
+# scale 1 - so `base + index*3` computed `base + index`, a wrong address with no
+# diagnostic (#2435). x86-64 refuses the identical condition.
+# ---
+# scale: the index scale
+# ret:   the LSL amount, or an error naming the unrepresentable scale
+fun scale_shift(scale: u8) R.Result[u32, str] {
+    if (scale == 1) { ret R.ok[u32, str](0); }
+    if (scale == 2) { ret R.ok[u32, str](1); }
+    if (scale == 4) { ret R.ok[u32, str](2); }
+    if (scale == 8) { ret R.ok[u32, str](3); }
+    ret R.err[u32, str]("encode: a scaled-index address must have a scale of 1, 2, 4, or 8");
 }
 
 # emit `adrp Xd, sym` with a zero page-delta placeholder and record
@@ -1891,12 +2108,15 @@ fun encode_addr(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
         emit_add_imm(st, rd, m.base, m.off);
         ret R.ok[bool, str](true);
     }
+    val shr: R.Result[u32, str] = scale_shift(m.scale);
+    if (R.is_err[u32, str](shr)) { ret R.err[bool, str](R.unwrap_err[u32, str](shr)); }
+    val sh: u32 = R.unwrap_ok[u32, str](shr);
     if (m.off == 0) {
-        emit_alu3_sh(st, ADD_X, rd, m.base, m.index, scale_shift(m.scale));
+        emit_alu3_sh(st, ADD_X, rd, m.base, m.index, sh);
         ret R.ok[bool, str](true);
     }
     emit_add_imm(st, rd, m.base, m.off);
-    emit_alu3_sh(st, ADD_X, rd, rd, m.index, scale_shift(m.scale));
+    emit_alu3_sh(st, ADD_X, rd, rd, m.index, sh);
     ret R.ok[bool, str](true);
 }
 
@@ -2109,12 +2329,20 @@ fun resolve_fp_source(st: *encode.EncodeState, f: *mir.MirFunction, op: *mir.Mir
 
 # the A64 two-source base word for a float arithmetic MIR opcode and
 # precision (D when `dbl`, else S)
-fun fp_arith_base(op: mir.MirOpcode, dbl: bool) u32 {
-    if (op == mir.MIR_FADD) { if (dbl) { ret FADD_D; } ret FADD_S; }
-    if (op == mir.MIR_FSUB) { if (dbl) { ret FSUB_D; } ret FSUB_S; }
-    if (op == mir.MIR_FMUL) { if (dbl) { ret FMUL_D; } ret FMUL_S; }
-    if (dbl)                           { ret FDIV_D; }
-    ret FDIV_S;
+#
+# All four are named; an unmatched opcode is refused rather than taking the
+# trailing FDIV, which would silently turn some other operation into a division
+# (#2435).
+# ---
+# op:  the float arithmetic opcode
+# dbl: true for the double-precision form
+# ret: the A64 base word, or an error naming the unrealized opcode
+fun fp_arith_base(op: mir.MirOpcode, dbl: bool) R.Result[u32, str] {
+    if (op == mir.MIR_FADD) { if (dbl) { ret R.ok[u32, str](FADD_D); } ret R.ok[u32, str](FADD_S); }
+    if (op == mir.MIR_FSUB) { if (dbl) { ret R.ok[u32, str](FSUB_D); } ret R.ok[u32, str](FSUB_S); }
+    if (op == mir.MIR_FMUL) { if (dbl) { ret R.ok[u32, str](FMUL_D); } ret R.ok[u32, str](FMUL_S); }
+    if (op == mir.MIR_FDIV) { if (dbl) { ret R.ok[u32, str](FDIV_D); } ret R.ok[u32, str](FDIV_S); }
+    ret R.err[u32, str]("encode: aarch64 has no float arithmetic form for this opcode");
 }
 
 # the A64 condition a float comparison materializes through CSET. mirrors
@@ -2123,13 +2351,22 @@ fun fp_arith_base(op: mir.MirOpcode, dbl: bool) u32 {
 # unordered-aware conditions an FCMP's NZCV select - `<` is MI (N=1, set only for an
 # ordered less-than; an unordered compare leaves N=0), `<=` is LS, with GT / GE for
 # the swapped relations the lowerer never emits directly (canonicalized to LT/LE)
-fun fp_cond(cc: u8) u32 {
-    if (cc == mir.FCC_EQ) { ret CC_EQ; }
-    if (cc == mir.FCC_NE) { ret CC_NE; }
-    if (cc == mir.FCC_LT) { ret CC_MI; }
-    if (cc == mir.FCC_LE) { ret CC_LS; }
-    if (cc == mir.FCC_GT) { ret CC_GT; }
-    ret CC_GE;
+#
+# Every FCC code is named; a value that is not one is refused rather than taking
+# the trailing `CC_GE` and capturing the compare as a different relation (#2435).
+# The condition rides `mi.src_width`, a byte field the FCC codes share with the
+# operand widths, so nothing about its type bounds it to this alphabet.
+# ---
+# cc:  the FCC_* float condition code
+# ret: the A64 condition, or an error naming the unrealized code
+fun fp_cond(cc: u8) R.Result[u32, str] {
+    if (cc == mir.FCC_EQ) { ret R.ok[u32, str](CC_EQ); }
+    if (cc == mir.FCC_NE) { ret R.ok[u32, str](CC_NE); }
+    if (cc == mir.FCC_LT) { ret R.ok[u32, str](CC_MI); }
+    if (cc == mir.FCC_LE) { ret R.ok[u32, str](CC_LS); }
+    if (cc == mir.FCC_GT) { ret R.ok[u32, str](CC_GT); }
+    if (cc == mir.FCC_GE) { ret R.ok[u32, str](CC_GE); }
+    ret R.err[u32, str]("encode: aarch64 has no float comparison condition for this condition code");
 }
 
 # true when a surviving opcode is one of the scalar float
@@ -2167,7 +2404,9 @@ fun encode_fp_arith(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIn
     if (R.is_err[i32, str](rmr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rmr)); }
     val rm: u32 = R.unwrap_ok[i32, str](rmr)::u32;
 
-    val base: u32 = fp_arith_base(mi.opcode, dbl);
+    val baser: R.Result[u32, str] = fp_arith_base(mi.opcode, dbl);
+    if (R.is_err[u32, str](baser)) { ret R.err[bool, str](R.unwrap_err[u32, str](baser)); }
+    val base: u32 = R.unwrap_ok[u32, str](baser);
     val dst: *mir.MirOperand = ?mi.operands[0];
     if (dst.kind == mir.MIR_OP_MEM) {
         emit_alu3(st, base, FP_SCRATCH0, rn, rm);
@@ -2462,7 +2701,9 @@ fun encode_fp_cmp(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInst
     var base: u32 = FCMP_S;
     if (w == 8) { base = FCMP_D; }
     emit_alu3(st, base, 0, rn, rm);
-    emit_cset(st, CSINC_W, rd, fp_cond(cc));
+    val ccr: R.Result[u32, str] = fp_cond(cc);
+    if (R.is_err[u32, str](ccr)) { ret R.err[bool, str](R.unwrap_err[u32, str](ccr)); }
+    emit_cset(st, CSINC_W, rd, R.unwrap_ok[u32, str](ccr));
     ret R.ok[bool, str](true);
 }
 
@@ -2712,13 +2953,20 @@ fun encode_fmov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
 # EQ / NE / LT / LE forms exist in the generic opcode space (the lowerer
 # canonicalizes GT/GE by swapping operands); signedness selects the signed
 # (LT/LE) versus unsigned (CC/LS) condition
-fun cmp_cond(op: mir.MirOpcode) u32 {
-    if (op == mir.MIR_SEL_CMP_EQ)   { ret CC_EQ; }
-    if (op == mir.MIR_SEL_CMP_NE)   { ret CC_NE; }
-    if (op == mir.MIR_SEL_CMP_LT_S) { ret CC_LT; }
-    if (op == mir.MIR_SEL_CMP_LT_U) { ret CC_CC; }
-    if (op == mir.MIR_SEL_CMP_LE_S) { ret CC_LE; }
-    ret CC_LS;
+# Every relation is named; an unmatched opcode is refused rather than taking the
+# trailing `CC_LS`, which would silently capture some other comparison as unsigned
+# less-or-equal (#2435).
+# ---
+# op:  the surviving comparison sentinel
+# ret: the A64 condition, or an error naming the unrealized relation
+fun cmp_cond(op: mir.MirOpcode) R.Result[u32, str] {
+    if (op == mir.MIR_SEL_CMP_EQ)   { ret R.ok[u32, str](CC_EQ); }
+    if (op == mir.MIR_SEL_CMP_NE)   { ret R.ok[u32, str](CC_NE); }
+    if (op == mir.MIR_SEL_CMP_LT_S) { ret R.ok[u32, str](CC_LT); }
+    if (op == mir.MIR_SEL_CMP_LT_U) { ret R.ok[u32, str](CC_CC); }
+    if (op == mir.MIR_SEL_CMP_LE_S) { ret R.ok[u32, str](CC_LE); }
+    if (op == mir.MIR_SEL_CMP_LE_U) { ret R.ok[u32, str](CC_LS); }
+    ret R.err[u32, str]("encode: aarch64 has no comparison condition for this relation");
 }
 
 # true when a post-isel opcode is a surviving generic comparison
@@ -2841,7 +3089,9 @@ fun encode_compare(st: *encode.EncodeState, mi: *mir.MirInstr) R.Result[bool, st
     val rc: R.Result[bool, str] = emit_flag_cmp(st, ?mi.operands[1], ?mi.operands[2], mi.width, mir.is_signed_cmp(mi.opcode));
     if (R.is_err[bool, str](rc)) { ret rc; }
 
-    emit_cset(st, CSINC_W, rd, cmp_cond(mi.opcode));
+    val ccr: R.Result[u32, str] = cmp_cond(mi.opcode);
+    if (R.is_err[u32, str](ccr)) { ret R.err[bool, str](R.unwrap_err[u32, str](ccr)); }
+    emit_cset(st, CSINC_W, rd, R.unwrap_ok[u32, str](ccr));
     ret R.ok[bool, str](true);
 }
 
@@ -2899,13 +3149,22 @@ fun encode_cbr(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R.Resul
 # EQ / NE / LT / LE forms exist in the fused opcode space (the lowerer
 # canonicalizes GT/GE by swapping operands); signedness selects the signed
 # (LT/LE) versus unsigned (CC/LS) condition, mirroring cmp_cond
-fun fused_cbr_cond(op: mir.MirOpcode) u32 {
-    if (op == mir.MIR_SEL_CBR_EQ)   { ret CC_EQ; }
-    if (op == mir.MIR_SEL_CBR_NE)   { ret CC_NE; }
-    if (op == mir.MIR_SEL_CBR_LT_S) { ret CC_LT; }
-    if (op == mir.MIR_SEL_CBR_LT_U) { ret CC_CC; }
-    if (op == mir.MIR_SEL_CBR_LE_S) { ret CC_LE; }
-    ret CC_LS;
+# Every relation is named; an unmatched opcode is refused rather than taking the
+# trailing `CC_LS` and branching on a different relation with no diagnostic
+# (#2435). The set is bounded by `mir.is_fused_cbr`, whose test is a RANGE over a
+# contiguous opcode block, so a relation added to that block would reach here
+# admitted and unnamed.
+# ---
+# op:  the fused terminator opcode
+# ret: the A64 branch condition, or an error naming the unrealized relation
+fun fused_cbr_cond(op: mir.MirOpcode) R.Result[u32, str] {
+    if (op == mir.MIR_SEL_CBR_EQ)   { ret R.ok[u32, str](CC_EQ); }
+    if (op == mir.MIR_SEL_CBR_NE)   { ret R.ok[u32, str](CC_NE); }
+    if (op == mir.MIR_SEL_CBR_LT_S) { ret R.ok[u32, str](CC_LT); }
+    if (op == mir.MIR_SEL_CBR_LT_U) { ret R.ok[u32, str](CC_CC); }
+    if (op == mir.MIR_SEL_CBR_LE_S) { ret R.ok[u32, str](CC_LE); }
+    if (op == mir.MIR_SEL_CBR_LE_U) { ret R.ok[u32, str](CC_LS); }
+    ret R.err[u32, str]("encode: aarch64 has no fused compare-and-branch condition for this relation");
 }
 
 # materialize a fused compare-and-branch terminator
@@ -2942,7 +3201,9 @@ fun encode_fused_cbr(st: *encode.EncodeState, fn_base: u32, mi: *mir.MirInstr) R
 
     # B.cc then_block (a zero imm19 placeholder; pass 2 inserts the displacement).
     val bcc_pos: u32 = st.buf.len::u32;
-    emit_branch_block(st, BCOND | (fused_cbr_cond(mi.opcode) & 0xF), 0, false, then_block);
+    val ccr: R.Result[u32, str] = fused_cbr_cond(mi.opcode);
+    if (R.is_err[u32, str](ccr)) { ret R.err[bool, str](R.unwrap_err[u32, str](ccr)); }
+    emit_branch_block(st, BCOND | (R.unwrap_ok[u32, str](ccr) & 0xF), 0, false, then_block);
     val bcc_next: u32 = st.buf.len::u32;
     val f1: R.Result[bool, str] = encode.push_fixup(st, bcc_pos, bcc_next, then_block, fn_base);
     if (R.is_err[bool, str](f1)) { ret f1; }
@@ -4200,8 +4461,8 @@ fun a64_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, s
     }
     if (pat == A64P_MSR) {
         if (n != 2) { ret R.err[bool, str]("encode: inline-asm msr expects a system register or PSTATE field and a source"); }
-        var nbuf: [16]u8;
-        if (!iasm.copy_region(c.body, s.arg_lo[0], s.arg_hi[0], ?nbuf[0], 16)) {
+        var nbuf: [A64_SYSREG_NAME_MAX]u8;
+        if (!iasm.copy_region(c.body, s.arg_lo[0], s.arg_hi[0], ?nbuf[0], A64_SYSREG_NAME_MAX)) {
             ret R.err[bool, str]("encode: inline-asm msr destination name is too long");
         }
         # the SECOND operand picks the form, and with it which table names the first:
@@ -4232,8 +4493,8 @@ fun a64_parse(c: *iasm.Cursor, s: *iasm.Stmt, item: *iasm.Item) R.Result[bool, s
     if (pat == A64P_MRS) {
         if (n != 2)                           { ret R.err[bool, str]("encode: inline-asm mrs expects Xt, <sysreg>"); }
         if (item.ops[0].kind != iasm.AOP_REG) { ret R.err[bool, str]("encode: inline-asm mrs destination must be a register"); }
-        var mbuf: [16]u8;
-        if (!iasm.copy_region(c.body, s.arg_lo[1], s.arg_hi[1], ?mbuf[0], 16)) {
+        var mbuf: [A64_SYSREG_NAME_MAX]u8;
+        if (!iasm.copy_region(c.body, s.arg_lo[1], s.arg_hi[1], ?mbuf[0], A64_SYSREG_NAME_MAX)) {
             ret R.err[bool, str]("encode: inline-asm mrs system register name is too long");
         }
         var m0: u32 = 0; var m1: u32 = 0; var mn: u32 = 0; var mm: u32 = 0; var m2: u32 = 0;
@@ -4671,18 +4932,24 @@ fun a64_patch(st: *encode.EncodeState, patch_pos: u32, target_off: u32) R.Result
 # the AArch64 inline-assembly grammar
 fun a64_grammar() iasm.Grammar {
     var g: iasm.Grammar;
-    g.isa       = "aarch64";
-    g.unknown   = "unknown aarch64 inline-asm instruction '";
-    g.rows      = ?A64_MNEMONICS[0];
-    g.row_count = A64_MNEMONIC_COUNT;
-    g.decode    = a64_decode_bcond;
-    g.parse     = a64_parse;
-    g.emit      = a64_emit;
-    g.patch     = a64_patch;
-    g.slot      = frame_slot_offset;
-    g.all_gp    = 0xFFFFFFFF;
-    g.all_fp    = 0xFFFFFFFF;
-    g.word      = 4;
+    g.isa        = "aarch64";
+    g.unknown    = "unknown aarch64 inline-asm instruction '";
+    g.rows       = ?A64_MNEMONICS[0];
+    g.row_count  = A64_MNEMONIC_COUNT;
+    # aarch64's `.word` is one instruction word, as GNU as spells it here (#2479).
+    g.data       = ?iasm.DIRECTIVES_WORD32[0];
+    g.data_count = iasm.DIRECTIVE_COUNT;
+    g.decode     = a64_decode_bcond;
+    g.parse      = a64_parse;
+    g.emit       = a64_emit;
+    g.patch      = a64_patch;
+    g.slot       = frame_slot_offset;
+    g.all_gp     = 0xFFFFFFFF;
+    g.all_fp     = 0xFFFFFFFF;
+    g.word       = 4;
+    g.endian     = isa.ENDIAN_LITTLE;
+    g.ct_class   = asm_ct_class;
+    g.note_bytes = asm_note_bytes;
     ret g;
 }
 
@@ -6344,6 +6611,423 @@ test "mach.lang.target.isa.arm64.encode:inline_asm_sysreg_moves" {
     ret bad;
 }
 
+# the data directives emit raw instruction words, byte-exact, and `.word` is FOUR
+# bytes on this target (#2479)
+#
+# THE DERIVATION IS THE ENCODER BESIDE IT: `nop` is `0xD503201F` in the aarch64
+# manual, and the mnemonic row already emits that word, so a `.word 0xd503201f` that
+# does not produce the identical four bytes is wrong by comparison rather than by
+# assertion. That is also the whole point of the escape - an instruction the mnemonic
+# table does not name is reachable by writing its encoding, which on a fixed-width
+# target had no spelling at all before.
+#
+# `.word` IS FOUR BYTES HERE AND TWO ON x86-64, which is GNU as's own per-target
+# definition; the x86-64 encoder pins the other half of that divergence.
+test "mach.lang.target.isa.arm64.encode:inline_asm_data_directives" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: iasm.Labels;
+    iasm.labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+
+    a64_asm_text(?st, ?f, ?labels, "nop");                            # 0
+    a64_asm_text(?st, ?f, ?labels, ".word 0xd503201f");                # 4
+    a64_asm_text(?st, ?f, ?labels, ".long 0xd503201f");                # 8
+    a64_asm_text(?st, ?f, ?labels, ".byte 0x1f, 0x20, 0x03, 0xd5");    # 12
+    a64_asm_text(?st, ?f, ?labels, ".quad 0xd503201fd503201f");        # 16, 20
+    # a raw encoding the mnemonic table does not name: `mrs x0, cntvct_el0`
+    # (0xD53BE040), which is exactly what #2480 exists to spell by name.
+    a64_asm_text(?st, ?f, ?labels, ".word 0xd53be040");                # 24
+
+    # every word is the same `nop` the mnemonic emits, whatever spelling produced it.
+    if (read_word(?st.buf, 0)  != 0xD503201F) { bad = 1; }
+    if (read_word(?st.buf, 4)  != 0xD503201F) { bad = 1; }
+    if (read_word(?st.buf, 8)  != 0xD503201F) { bad = 1; }
+    if (read_word(?st.buf, 12) != 0xD503201F) { bad = 1; }
+    if (read_word(?st.buf, 16) != 0xD503201F) { bad = 1; }
+    if (read_word(?st.buf, 20) != 0xD503201F) { bad = 1; }
+    if (read_word(?st.buf, 24) != 0xD53BE040) { bad = 1; }
+    # `.word` consumed four bytes per value, not two: seven words in all.
+    if (st.buf.len != 28) { bad = 1; }
+
+    iasm.labels_dnit(?labels);
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# a payload that is not a whole number of instruction words is refused, and so is a
+# value the directive's width cannot hold
+#
+# A three-byte `.byte` would misalign every instruction after it - inside the block
+# and in the compiler-emitted code following it - and a fixed-width machine has no
+# unaligned instruction to fall back on. Refusing names the statement; emitting would
+# silently shift the whole instruction stream.
+test "mach.lang.target.isa.arm64.encode:inline_asm_data_directive_refusals" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: iasm.Labels;
+    iasm.labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+
+    val r1: R.Result[bool, str] = a64_asm_text(?st, ?f, ?labels, ".byte 0x1f");
+    if (!R.is_err[bool, str](r1))                                                                { bad = 1; }
+    or { if (!str_contains(R.unwrap_err[bool, str](r1), "whole number of instruction words")) { bad = 1; } }
+
+    val r2: R.Result[bool, str] = a64_asm_text(?st, ?f, ?labels, ".byte 0x1f, 0x20, 0x03");
+    if (!R.is_err[bool, str](r2))                                                                { bad = 1; }
+    or { if (!str_contains(R.unwrap_err[bool, str](r2), "whole number of instruction words")) { bad = 1; } }
+
+    # a value wider than the directive is refused rather than truncated to its low
+    # word, which would be an instruction nobody wrote.
+    val r3: R.Result[bool, str] = a64_asm_text(?st, ?f, ?labels, ".word 0x1d503201f");
+    if (!R.is_err[bool, str](r3))                                                    { bad = 1; }
+    or { if (!str_contains(R.unwrap_err[bool, str](r3), "cannot hold")) { bad = 1; } }
+
+    # a directive is not a mnemonic: `.hword` is in no table and is refused by name.
+    val r4: R.Result[bool, str] = a64_asm_text(?st, ?f, ?labels, ".hword 0x1234");
+    if (!R.is_err[bool, str](r4))                                                                       { bad = 1; }
+    or { if (!str_contains(R.unwrap_err[bool, str](r4), "unknown aarch64 inline-asm instruction")) { bad = 1; } }
+
+    iasm.labels_dnit(?labels);
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# a data directive's payload is an instruction stream the parser cannot read, so it
+# reaches every register in every bank - on this target as on x86-64
+#
+# The conservative answer is the same for every spelling of the family: `.word` is no
+# more readable than `.byte`, so widening the escape (#2479) cannot narrow a clobber
+# set. A body naming only real mnemonics beside it stays precise.
+test "mach.lang.target.isa.arm64.encode:asm_clobbers_data_directives_are_opaque" {
+    var gp: u32 = 0;
+    var fp: u32 = 0;
+    var bad: i32 = 0;
+
+    asm_clobbers(".word 0xd503201f", ?gp, ?fp);
+    if (gp != 0xFFFFFFFF) { bad = 1; }
+    if (fp != 0xFFFFFFFF) { bad = 1; }
+
+    asm_clobbers(".quad 0xd503201fd503201f", ?gp, ?fp);
+    if (gp != 0xFFFFFFFF) { bad = 1; }
+    if (fp != 0xFFFFFFFF) { bad = 1; }
+
+    # the `nop` the same bytes spell is read, and writes nothing.
+    asm_clobbers("nop", ?gp, ?fp);
+    if (gp != 0) { bad = 1; }
+    if (fp != 0) { bad = 1; }
+
+    ret bad;
+}
+
+# assemble one inline-asm statement and compare its single word against `want` (test
+# helper)
+#
+# Runs the whole block path a real body takes, so a golden is a fact about the shipping
+# parser and emitter rather than about a test-only path beside them.
+fun t_word(text: str, want: u32) bool {
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: iasm.Labels;
+    iasm.labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+
+    val r: R.Result[bool, str] = a64_asm_text(?st, ?f, ?labels, text);
+    var ok: bool = false;
+    if (!R.is_err[bool, str](r) && st.buf.len == 4) { ok = read_word(?st.buf, 0) == want; }
+
+    iasm.labels_dnit(?labels);
+    encode.buf_dnit(?st.buf);
+    ret ok;
+}
+
+# true when one inline-asm statement is refused with a message naming `want` (test
+# helper)
+#
+# Matching on a substring of the diagnostic, not merely on failure, is what keeps a
+# refusal test from passing on the wrong refusal.
+fun t_word_refused(text: str, want: str) bool {
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: iasm.Labels;
+    iasm.labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+
+    val r: R.Result[bool, str] = a64_asm_text(?st, ?f, ?labels, text);
+    var ok: bool = false;
+    if (R.is_err[bool, str](r)) { ok = str_contains(R.unwrap_err[bool, str](r), want); }
+
+    iasm.labels_dnit(?labels);
+    encode.buf_dnit(?st.buf);
+    ret ok;
+}
+
+# every system register the name table holds reads back byte-exact (#2480)
+#
+# EVERY WORD BELOW CAME FROM `llvm-mc -triple=aarch64 --show-encoding`, one statement at a
+# time, and each table row was DECODED FROM that word rather than derived on paper. That
+# direction matters: a wrong op1 or CRm produces a program that assembles, runs, returns a
+# plausible number and reads the wrong register - a defect no amount of reasoning beside
+# the same table would catch, and the reason #2236 wanted an independent assembler in the
+# loop.
+#
+# The table is not exhaustive and cannot be; what it names is what freestanding code
+# reaches for. The escape below covers the rest.
+test "mach.lang.target.isa.arm64.encode:inline_asm_sysreg_reads_are_byte_exact" {
+    var bad: i32 = 0;
+
+    # timer
+    if (!t_word("mrs x0, cntvct_el0", 0xD53BE040)) { bad = 1; }
+    if (!t_word("mrs x0, cntpct_el0", 0xD53BE020)) { bad = 1; }
+    if (!t_word("mrs x0, cntfrq_el0", 0xD53BE000)) { bad = 1; }
+    if (!t_word("mrs x0, cntv_ctl_el0", 0xD53BE320)) { bad = 1; }
+    if (!t_word("mrs x0, cntv_cval_el0", 0xD53BE340)) { bad = 1; }
+    if (!t_word("mrs x0, cntv_tval_el0", 0xD53BE300)) { bad = 1; }
+    if (!t_word("mrs x0, cntp_ctl_el0", 0xD53BE220)) { bad = 1; }
+    if (!t_word("mrs x0, cntp_cval_el0", 0xD53BE240)) { bad = 1; }
+    if (!t_word("mrs x0, cntp_tval_el0", 0xD53BE200)) { bad = 1; }
+    if (!t_word("mrs x0, cntkctl_el1", 0xD538E100)) { bad = 1; }
+    # exception
+    if (!t_word("mrs x0, vbar_el1", 0xD538C000)) { bad = 1; }
+    if (!t_word("mrs x0, elr_el1", 0xD5384020)) { bad = 1; }
+    if (!t_word("mrs x0, spsr_el1", 0xD5384000)) { bad = 1; }
+    if (!t_word("mrs x0, esr_el1", 0xD5385200)) { bad = 1; }
+    if (!t_word("mrs x0, far_el1", 0xD5386000)) { bad = 1; }
+    if (!t_word("mrs x0, sp_el0", 0xD5384100)) { bad = 1; }
+    if (!t_word("mrs x0, sp_el1", 0xD53C4100)) { bad = 1; }
+    if (!t_word("mrs x0, spsel", 0xD5384200)) { bad = 1; }
+    if (!t_word("mrs x0, currentel", 0xD5384240)) { bad = 1; }
+    if (!t_word("mrs x0, daif", 0xD53B4220)) { bad = 1; }
+    if (!t_word("mrs x0, nzcv", 0xD53B4200)) { bad = 1; }
+    if (!t_word("mrs x0, dit", 0xD53B42A0)) { bad = 1; }
+    # el2
+    if (!t_word("mrs x0, vbar_el2", 0xD53CC000)) { bad = 1; }
+    if (!t_word("mrs x0, elr_el2", 0xD53C4020)) { bad = 1; }
+    if (!t_word("mrs x0, spsr_el2", 0xD53C4000)) { bad = 1; }
+    if (!t_word("mrs x0, esr_el2", 0xD53C5200)) { bad = 1; }
+    if (!t_word("mrs x0, far_el2", 0xD53C6000)) { bad = 1; }
+    if (!t_word("mrs x0, sctlr_el2", 0xD53C1000)) { bad = 1; }
+    if (!t_word("mrs x0, hcr_el2", 0xD53C1100)) { bad = 1; }
+    # mmu
+    if (!t_word("mrs x0, sctlr_el1", 0xD5381000)) { bad = 1; }
+    if (!t_word("mrs x0, tcr_el1", 0xD5382040)) { bad = 1; }
+    if (!t_word("mrs x0, ttbr0_el1", 0xD5382000)) { bad = 1; }
+    if (!t_word("mrs x0, ttbr1_el1", 0xD5382020)) { bad = 1; }
+    if (!t_word("mrs x0, mair_el1", 0xD538A200)) { bad = 1; }
+    # tls
+    if (!t_word("mrs x0, tpidr_el0", 0xD53BD040)) { bad = 1; }
+    if (!t_word("mrs x0, tpidrro_el0", 0xD53BD060)) { bad = 1; }
+    if (!t_word("mrs x0, tpidr_el1", 0xD538D080)) { bad = 1; }
+    # id
+    if (!t_word("mrs x0, midr_el1", 0xD5380000)) { bad = 1; }
+    if (!t_word("mrs x0, mpidr_el1", 0xD53800A0)) { bad = 1; }
+    if (!t_word("mrs x0, ctr_el0", 0xD53B0020)) { bad = 1; }
+    if (!t_word("mrs x0, dczid_el0", 0xD53B00E0)) { bad = 1; }
+    if (!t_word("mrs x0, id_aa64pfr0_el1", 0xD5380400)) { bad = 1; }
+    if (!t_word("mrs x0, id_aa64isar0_el1", 0xD5380600)) { bad = 1; }
+    if (!t_word("mrs x0, id_aa64mmfr0_el1", 0xD5380700)) { bad = 1; }
+
+    ret bad;
+}
+
+# the writable registers encode their `msr <sysreg>, Xt` direction byte-exact
+#
+# Read and write share one field layout and differ only in the base word, so a swapped
+# base is the one mistake the read goldens above could not catch. `llvm-mc` refuses a
+# write to a register that is read-only at every exception level (CNTVCT_EL0, the ID
+# registers), so those are absent here by construction rather than by choice.
+test "mach.lang.target.isa.arm64.encode:inline_asm_sysreg_writes_are_byte_exact" {
+    var bad: i32 = 0;
+
+    if (!t_word("msr cntfrq_el0, x1", 0xD51BE001)) { bad = 1; }
+    if (!t_word("msr cntv_ctl_el0, x1", 0xD51BE321)) { bad = 1; }
+    if (!t_word("msr cntv_cval_el0, x1", 0xD51BE341)) { bad = 1; }
+    if (!t_word("msr cntv_tval_el0, x1", 0xD51BE301)) { bad = 1; }
+    if (!t_word("msr cntp_ctl_el0, x1", 0xD51BE221)) { bad = 1; }
+    if (!t_word("msr cntp_cval_el0, x1", 0xD51BE241)) { bad = 1; }
+    if (!t_word("msr cntp_tval_el0, x1", 0xD51BE201)) { bad = 1; }
+    if (!t_word("msr cntkctl_el1, x1", 0xD518E101)) { bad = 1; }
+    if (!t_word("msr vbar_el1, x1", 0xD518C001)) { bad = 1; }
+    if (!t_word("msr elr_el1, x1", 0xD5184021)) { bad = 1; }
+    if (!t_word("msr spsr_el1, x1", 0xD5184001)) { bad = 1; }
+    if (!t_word("msr esr_el1, x1", 0xD5185201)) { bad = 1; }
+    if (!t_word("msr far_el1, x1", 0xD5186001)) { bad = 1; }
+    if (!t_word("msr sp_el0, x1", 0xD5184101)) { bad = 1; }
+    if (!t_word("msr sp_el1, x1", 0xD51C4101)) { bad = 1; }
+    if (!t_word("msr spsel, x1", 0xD5184201)) { bad = 1; }
+    if (!t_word("msr daif, x1", 0xD51B4221)) { bad = 1; }
+    if (!t_word("msr nzcv, x1", 0xD51B4201)) { bad = 1; }
+    if (!t_word("msr dit, x1", 0xD51B42A1)) { bad = 1; }
+    if (!t_word("msr vbar_el2, x1", 0xD51CC001)) { bad = 1; }
+    if (!t_word("msr elr_el2, x1", 0xD51C4021)) { bad = 1; }
+    if (!t_word("msr spsr_el2, x1", 0xD51C4001)) { bad = 1; }
+    if (!t_word("msr esr_el2, x1", 0xD51C5201)) { bad = 1; }
+    if (!t_word("msr far_el2, x1", 0xD51C6001)) { bad = 1; }
+    if (!t_word("msr sctlr_el2, x1", 0xD51C1001)) { bad = 1; }
+    if (!t_word("msr hcr_el2, x1", 0xD51C1101)) { bad = 1; }
+    if (!t_word("msr sctlr_el1, x1", 0xD5181001)) { bad = 1; }
+    if (!t_word("msr tcr_el1, x1", 0xD5182041)) { bad = 1; }
+    if (!t_word("msr ttbr0_el1, x1", 0xD5182001)) { bad = 1; }
+    if (!t_word("msr ttbr1_el1, x1", 0xD5182021)) { bad = 1; }
+    if (!t_word("msr mair_el1, x1", 0xD518A201)) { bad = 1; }
+    if (!t_word("msr tpidr_el0, x1", 0xD51BD041)) { bad = 1; }
+    if (!t_word("msr tpidrro_el0, x1", 0xD51BD061)) { bad = 1; }
+    if (!t_word("msr tpidr_el1, x1", 0xD518D081)) { bad = 1; }
+
+    ret bad;
+}
+
+# every PSTATE field the `msr <field>, #imm` form defines, byte-exact (#2480)
+#
+# The immediate rides CRm, so each golden pins the field's op1 / op2 AND the immediate's
+# placement at once. DAIFSet / DAIFClr are what a trap handler masks interrupts with,
+# which is the half of #2480 that had no workaround at all: unlike a register move, the
+# MSR-immediate form has no numeric escape in the architecture, so a missing field name is
+# a missing capability.
+test "mach.lang.target.isa.arm64.encode:inline_asm_pstate_fields_are_byte_exact" {
+    var bad: i32 = 0;
+
+    if (!t_word("msr daifset, 0xf", 0xD5034FDF)) { bad = 1; }
+    if (!t_word("msr daifclr, 0xf", 0xD5034FFF)) { bad = 1; }
+    if (!t_word("msr daifset, 2", 0xD50342DF)) { bad = 1; }
+    if (!t_word("msr spsel, 1", 0xD50041BF)) { bad = 1; }
+    if (!t_word("msr pan, 1", 0xD500419F)) { bad = 1; }
+    if (!t_word("msr uao, 1", 0xD500417F)) { bad = 1; }
+    if (!t_word("msr ssbs, 1", 0xD503413F)) { bad = 1; }
+    if (!t_word("msr dit, 1", 0xD503415F)) { bad = 1; }
+    if (!t_word("msr tco, 1", 0xD503419F)) { bad = 1; }
+    if (!t_word("msr daifclr, 0", 0xD50340FF)) { bad = 1; }
+
+    ret bad;
+}
+
+# `mrs`/`msr` reach the assembly printer instead of refusing the build (#2501)
+#
+# Before the fix, `emit_msr_imm` and `a64_emit_sysreg` emitted their word without
+# notifying the sink: the bytes were unaccounted, and `check_accounted` refused the
+# whole `--emit-asm` run. This drives all three encoded shapes - `msr <pstatefield>,
+# #imm`, `msr <sysreg>, Xt`, and `mrs Xt, <sysreg>` - through a real sink and checks
+# the rendered text. A system register renders through its numeric
+# `s<op0>_<op1>_c<CRn>_c<CRm>_<op2>` spelling regardless of which name parsed it,
+# since that is the one spelling the printer can always produce without a reverse
+# name table (#2501).
+test "mach.lang.target.isa.arm64.encode:emit_asm_renders_sysreg_instructions" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: iasm.Labels;
+    iasm.labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+
+    var w: writer.Writer;
+    w.ctx     = nil;
+    w.f_write = printer.test_sink_write;
+    printer.test_sink_reset();
+    var sink: encode.AsmSink = encode.sink_init(?w, ?interner);
+    st.buf.asm = ?sink;
+
+    val r1: R.Result[bool, str] = a64_asm_text(?st, ?f, ?labels, "mrs x0, cntvct_el0");
+    if (R.is_err[bool, str](r1)) { bad = 1; }
+    val r2: R.Result[bool, str] = a64_asm_text(?st, ?f, ?labels, "msr cntv_ctl_el0, x1");
+    if (R.is_err[bool, str](r2)) { bad = 1; }
+    val r3: R.Result[bool, str] = a64_asm_text(?st, ?f, ?labels, "msr daifset, 1");
+    if (R.is_err[bool, str](r3)) { bad = 1; }
+
+    # the shared byte-accounting guard `check_accounted` reads: nothing emitted was
+    # left unclaimed.
+    if (encode.sink_unaccounted(?st.buf) != 0) { bad = 1; }
+
+    val text: str = printer.test_sink_text();
+    if (!str_contains(text, "mrs x0, s3_3_c14_c0_2")) { bad = 1; }
+    if (!str_contains(text, "msr s3_3_c14_c3_1, x1")) { bad = 1; }
+    if (!str_contains(text, "msr daifset, #1"))       { bad = 1; }
+
+    iasm.labels_dnit(?labels);
+    encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# a system register is named by its ENCODING when no name is listed, and the two
+# spellings produce the same word (#2480)
+#
+# This is what makes the surface finite. A name table can never be complete - the
+# architecture keeps adding registers, and an implementation may define its own - so the
+# general answer is `s<op0>_<op1>_c<CRn>_c<CRm>_<op2>`, exactly as ARM and GNU as spell
+# it. The equivalence is asserted against the named row beside it, not assumed.
+test "mach.lang.target.isa.arm64.encode:inline_asm_sysreg_numeric_escape" {
+    var bad: i32 = 0;
+
+    # the escape and the name are the same instruction.
+    if (!t_word("mrs x0, s3_3_c14_c0_2", 0xD53BE040))  { bad = 1; }
+    if (!t_word("mrs x19, s3_3_c14_c0_2", 0xD53BE053)) { bad = 1; }
+    if (!t_word("msr s3_0_c12_c0_0, x1", 0xD518C001))  { bad = 1; }
+
+    # op0 = 2 is the other half of the register space, and every field at its maximum
+    # still encodes: `s3_7_c15_c15_7` fills op1, CRn, CRm and op2.
+    if (!t_word("mrs x0, s2_0_c0_c0_0", 0xD5300000))   { bad = 1; }
+    if (!t_word("mrs x5, s3_7_c15_c15_7", 0xD53FFFE5)) { bad = 1; }
+
+    # ARM capitalizes; assembly sources usually do not. both spellings are one register,
+    # for the escape and for a name.
+    if (!t_word("mrs x0, S3_3_C14_C0_2", 0xD53BE040)) { bad = 1; }
+    if (!t_word("mrs x0, CNTVCT_EL0", 0xD53BE040))    { bad = 1; }
+    if (!t_word("mrs x0, CntVct_El0", 0xD53BE040))    { bad = 1; }
+
+    # A FIELD THE ARCHITECTURE CANNOT HOLD IS REFUSED, NOT MASKED. `a64_sysreg_pack`
+    # truncates each selector, so every one of these would otherwise encode a DIFFERENT
+    # register than the text names - `s3_9_...` as op1 = 1, `s1_...` as op0 = 3.
+    if (!t_word_refused("mrs x0, s3_9_c0_c0_0", "unsupported inline-asm mrs system register"))  { bad = 1; }
+    if (!t_word_refused("mrs x0, s3_0_c16_c0_0", "unsupported inline-asm mrs system register")) { bad = 1; }
+    if (!t_word_refused("mrs x0, s3_0_c0_c16_0", "unsupported inline-asm mrs system register")) { bad = 1; }
+    if (!t_word_refused("mrs x0, s3_0_c0_c0_8", "unsupported inline-asm mrs system register"))  { bad = 1; }
+    if (!t_word_refused("mrs x0, s1_0_c0_c0_0", "unsupported inline-asm mrs system register"))  { bad = 1; }
+    if (!t_word_refused("mrs x0, s0_0_c0_c0_0", "unsupported inline-asm mrs system register"))  { bad = 1; }
+
+    # a malformed escape is not a register either: a missing field, a missing `c`, and
+    # trailing text after a complete one.
+    if (!t_word_refused("mrs x0, s3_3_c14_c0", "unsupported inline-asm mrs system register"))    { bad = 1; }
+    if (!t_word_refused("mrs x0, s3_3_14_c0_2", "unsupported inline-asm mrs system register"))   { bad = 1; }
+    if (!t_word_refused("mrs x0, s3_3_c14_c0_2x", "unsupported inline-asm mrs system register")) { bad = 1; }
+    if (!t_word_refused("mrs x0, s_3_c14_c0_2", "unsupported inline-asm mrs system register"))   { bad = 1; }
+
+    # and a name nobody defined is still refused, which is what keeps a typo from
+    # becoming a silent register read.
+    if (!t_word_refused("mrs x0, cntvct_el9", "unsupported inline-asm mrs system register")) { bad = 1; }
+    if (!t_word_refused("msr frobnicate, x1", "unsupported inline-asm msr system register")) { bad = 1; }
+    # a PSTATE field is a separate table with no escape, so an unknown one says so.
+    if (!t_word_refused("msr frobnicate, 1", "unsupported inline-asm msr PSTATE field")) { bad = 1; }
+
+    ret bad;
+}
+
+# the longest register names in the table fit the parser's name buffer (#2480)
+#
+# `id_aa64isar0_el1` is sixteen characters, one past the buffer this replaced, so before
+# `A64_SYSREG_NAME_MAX` the table could list a register the parser would then refuse as
+# "too long" - a table row that reads as support and is not. The refusal for a genuinely
+# oversized name still fires.
+test "mach.lang.target.isa.arm64.encode:inline_asm_sysreg_name_length" {
+    var bad: i32 = 0;
+
+    if (!t_word("mrs x0, id_aa64isar0_el1", 0xD5380600)) { bad = 1; }
+    if (!t_word("mrs x0, id_aa64mmfr0_el1", 0xD5380700)) { bad = 1; }
+    if (!t_word_refused("mrs x0, this_name_is_far_longer_than_any_system_register", "too long")) { bad = 1; }
+
+    ret bad;
+}
+
 # `cset Xd/Wd, <cond>` round-trips through the inline-asm assembler, byte-exact
 # against llvm-mc. darwin's aarch64 syscall wrappers use `cset x9, cs` to capture the
 # carry-on-error flag (#1714)
@@ -7077,5 +7761,376 @@ test "mach.lang.target.isa.arm64.encode:emitters_notify_once_per_word" {
 
     if (sink.failed) { bad = 1; }
     encode.buf_dnit(?st.buf);
+    ret bad;
+}
+
+# a classifier's value, or a marker no encoding field can hold (test helper)
+#
+# An A64 condition is 4 bits and a base word is a fixed 32-bit pattern with no
+# all-ones form, so the marker cannot collide with a real answer: an accidentally
+# refused form fails the comparison rather than matching an expected value.
+# ---
+# r:   the classifier's result
+# ret: the value, or 0xFFFFFFFF when it refused
+fun t_cc(r: R.Result[u32, str]) u32 {
+    if (R.is_err[u32, str](r)) { ret 0xFFFFFFFF; }
+    ret R.unwrap_ok[u32, str](r);
+}
+
+# every relation, opcode and scale the classifiers model maps to the A64 value the
+# architecture names for it - the totality half of the #2435 audit
+#
+# The default arms these replaced returned a real encoding for an unmatched input,
+# so the claim being pinned is not "the named ones work" but "the named ones are
+# the ONLY ones", which the refusal test beside this closes. The unsigned relations
+# are the ones a wrong default is quietest about: CC (unsigned <) and LS (unsigned
+# <=) are perfectly ordinary conditions on a signed comparison's flags.
+test "mach.lang.target.isa.arm64.encode:classifiers_are_total_over_named_forms" {
+    var bad: i32 = 0;
+
+    # the six comparison relations, signed and unsigned.
+    if (t_cc(cmp_cond(mir.MIR_SEL_CMP_EQ))   != CC_EQ) { bad = 1; }
+    if (t_cc(cmp_cond(mir.MIR_SEL_CMP_NE))   != CC_NE) { bad = 1; }
+    if (t_cc(cmp_cond(mir.MIR_SEL_CMP_LT_S)) != CC_LT) { bad = 1; }
+    if (t_cc(cmp_cond(mir.MIR_SEL_CMP_LT_U)) != CC_CC) { bad = 1; }
+    if (t_cc(cmp_cond(mir.MIR_SEL_CMP_LE_S)) != CC_LE) { bad = 1; }
+    if (t_cc(cmp_cond(mir.MIR_SEL_CMP_LE_U)) != CC_LS) { bad = 1; }
+
+    # the six fused-branch relations, which must agree with the split pair above.
+    if (t_cc(fused_cbr_cond(mir.MIR_SEL_CBR_EQ))   != CC_EQ) { bad = 1; }
+    if (t_cc(fused_cbr_cond(mir.MIR_SEL_CBR_NE))   != CC_NE) { bad = 1; }
+    if (t_cc(fused_cbr_cond(mir.MIR_SEL_CBR_LT_S)) != CC_LT) { bad = 1; }
+    if (t_cc(fused_cbr_cond(mir.MIR_SEL_CBR_LT_U)) != CC_CC) { bad = 1; }
+    if (t_cc(fused_cbr_cond(mir.MIR_SEL_CBR_LE_S)) != CC_LE) { bad = 1; }
+    if (t_cc(fused_cbr_cond(mir.MIR_SEL_CBR_LE_U)) != CC_LS) { bad = 1; }
+
+    # the six float conditions. `<` is MI, not LT: an unordered FCMP leaves N=0, so
+    # MI is true only for an ordered less-than.
+    if (t_cc(fp_cond(mir.FCC_EQ)) != CC_EQ) { bad = 1; }
+    if (t_cc(fp_cond(mir.FCC_NE)) != CC_NE) { bad = 1; }
+    if (t_cc(fp_cond(mir.FCC_LT)) != CC_MI) { bad = 1; }
+    if (t_cc(fp_cond(mir.FCC_LE)) != CC_LS) { bad = 1; }
+    if (t_cc(fp_cond(mir.FCC_GT)) != CC_GT) { bad = 1; }
+    if (t_cc(fp_cond(mir.FCC_GE)) != CC_GE) { bad = 1; }
+
+    # the four float arithmetic base words, single and double.
+    if (t_cc(fp_arith_base(mir.MIR_FADD, false)) != FADD_S) { bad = 1; }
+    if (t_cc(fp_arith_base(mir.MIR_FADD, true))  != FADD_D) { bad = 1; }
+    if (t_cc(fp_arith_base(mir.MIR_FSUB, false)) != FSUB_S) { bad = 1; }
+    if (t_cc(fp_arith_base(mir.MIR_FSUB, true))  != FSUB_D) { bad = 1; }
+    if (t_cc(fp_arith_base(mir.MIR_FMUL, false)) != FMUL_S) { bad = 1; }
+    if (t_cc(fp_arith_base(mir.MIR_FMUL, true))  != FMUL_D) { bad = 1; }
+    if (t_cc(fp_arith_base(mir.MIR_FDIV, false)) != FDIV_S) { bad = 1; }
+    if (t_cc(fp_arith_base(mir.MIR_FDIV, true))  != FDIV_D) { bad = 1; }
+
+    # the four SIB-legal index scales.
+    if (t_cc(scale_shift(1)) != 0) { bad = 1; }
+    if (t_cc(scale_shift(2)) != 1) { bad = 1; }
+    if (t_cc(scale_shift(4)) != 2) { bad = 1; }
+    if (t_cc(scale_shift(8)) != 3) { bad = 1; }
+
+    ret bad;
+}
+
+# an input no classifier names is REFUSED, not defaulted - the half of the #2435
+# audit a trailing `ret <some real condition>` cannot satisfy
+#
+# Each of these used to return a valid encoding: an unnamed relation became an
+# unsigned less-or-equal branch, an unnamed float opcode an FDIV, an unnamed
+# condition code a GE, and an unrepresentable scale the same shift as scale 1 - so
+# `base + index*3` addressed `base + index`.
+test "mach.lang.target.isa.arm64.encode:unnamed_forms_are_refused" {
+    var bad: i32 = 0;
+
+    if (!R.is_err[u32, str](cmp_cond(mir.MIR_ADD)))                    { bad = 1; }
+    if (!R.is_err[u32, str](cmp_cond(mir.MIR_SEL_CBR_EQ)))             { bad = 1; }
+    if (!R.is_err[u32, str](fused_cbr_cond(mir.MIR_ADD)))              { bad = 1; }
+    # the relation one past the fused block: `is_fused_cbr` admits by RANGE, so
+    # this is the shape a seventh relation would arrive in.
+    if (!R.is_err[u32, str](fused_cbr_cond(mir.MIR_SEL_CBR_LE_U + 1))) { bad = 1; }
+    if (!R.is_err[u32, str](fp_arith_base(mir.MIR_ADD, false)))        { bad = 1; }
+    if (!R.is_err[u32, str](fp_arith_base(mir.MIR_FNEG, true)))        { bad = 1; }
+
+    # one past FCC_GE: the condition rides `mi.src_width`, a byte field nothing
+    # bounds to the FCC alphabet.
+    if (!R.is_err[u32, str](fp_cond(mir.FCC_GE + 1))) { bad = 1; }
+    if (!R.is_err[u32, str](fp_cond(200)))            { bad = 1; }
+
+    # a scale the SIB-legal lowering never produces.
+    if (!R.is_err[u32, str](scale_shift(0)))  { bad = 1; }
+    if (!R.is_err[u32, str](scale_shift(3)))  { bad = 1; }
+    if (!R.is_err[u32, str](scale_shift(16))) { bad = 1; }
+
+    ret bad;
+}
+
+# the constant-time classification of every aarch64 inline-asm mnemonic (#2230)
+#
+# Read by the `#[oblivious]` asm walk. Every row the grammar admits is classified
+# here; anything unclassified returns `ct.asm_unknown()` and refuses the moment a
+# secret reaches it.
+#
+# CONDITIONAL BRANCHES ARE CHECKED HERE, NOT REFUSED. This grammar carries no `b.cc`
+# row at all - its only conditional forms are `cbz` / `cbnz`, whose condition is a
+# REGISTER operand and therefore visible to the taint walk. x86-64 must refuse its
+# `jcc` family because the condition rides FLAGS, which the effect model does not
+# represent (#2460); aarch64 has no such gap and gets the full three checks.
+#
+# That is what makes the LL/SC atomic loop CHECKED rather than asserted: `stlxr Ws,
+# Xt, [Xn]` writes its status register and the retry `cbnz Ws` reads it, both plain
+# register operands, so the walk sees mechanically that the retry conditions on the
+# CONTENTION status and not on a taint. A `cbnz` on a secret-bound register in the
+# same block still refuses.
+#
+# ATOMICS AND FENCES ARE CONSTANT-TIME HERE, CONDITIONALLY. An LL/SC pair's retry
+# count varies with CONTENTION, not with the value carried, and contention at a
+# PUBLIC address is other threads' public behaviour - the class the leakage model
+# already accepts for cache state on a public-address load. This holds ONLY BECAUSE
+# check (b) refuses a secret address. DELETING OR WEAKENING THE SECRET-ADDRESS CHECK
+# INVALIDATES EVERY ATOMIC AND FENCE ROW BELOW.
+#
+# VARIABLE-LATENCY OPS ARE NEARLY ABSENT ON THIS TARGET: the aarch64 grammar carries
+# no divide, no multiply and no floating-point row, so check (c) reaches only the
+# register-count shifts (`lslv` / `lsrv` / `asrv`). riscv64 is the target where check
+# (c) is substantive.
+# ---
+# code: the mnemonic's aarch64 code
+# ret:  its classification, or `ct.asm_unknown()` when unclassified
+pub fun asm_ct_class(code: u32, flags: u16) ct.AsmClass {
+    # data movement, address formation, loads and stores: constant-time.
+    if (code == A64M_MOV  || code == A64M_MOVZ || code == A64M_MOVK ||
+        code == A64M_ADRP || code == A64M_LDR  || code == A64M_STR  ||
+        code == A64M_LDRB || code == A64M_STRB || code == A64M_LDRH ||
+        code == A64M_STRH || code == A64M_LDP  || code == A64M_STP) {
+        ret ct.asm_op(ct.CT_OP_NONE);
+    }
+    # integer add / sub / bitwise / compare, and the CSET boolean materializer.
+    if (code == A64M_ADD || code == A64M_SUB || code == A64M_AND ||
+        code == A64M_ORR || code == A64M_EOR || code == A64M_CMP ||
+        code == A64M_CSET) {
+        ret ct.asm_op(ct.CT_OP_NONE);
+    }
+    # the IMMEDIATE-count shifts are constant-time; the REGISTER-count forms are the
+    # only variable-latency shape this grammar can express, and the shared gate reads
+    # the count operand alone.
+    if (code == A64M_LSL || code == A64M_LSR || code == A64M_ASR) {
+        ret ct.asm_op(ct.CT_OP_NONE);
+    }
+    if (code == A64M_LSLV || code == A64M_LSRV || code == A64M_ASRV) {
+        ret ct.asm_op(ct.CT_OP_VAR_SHIFT);
+    }
+    # atomics and fences: see the conditional row above.
+    if (code == A64M_LDAXR || code == A64M_LDAR || code == A64M_STLXR ||
+        code == A64M_STLR  || code == A64M_DMB  || code == A64M_YIELD) {
+        ret ct.asm_op(ct.CT_OP_NONE);
+    }
+    # A FLAGS-CONDITIONED BRANCH IS REFUSED, and it must be tested BEFORE the code
+    # groups below. `a64_decode_bcond` admits `b.<cond>` with `A64M_B` - the
+    # unconditional branch's own code - and carries the condition in flags alone, so a
+    # code-keyed test reads it as unconditional and lets a secret-dependent branch
+    # through (#2477). Same reasoning as x86-64's `jcc` family: the condition rides
+    # NZCV, which the inline-asm effect model does not represent (#2460).
+    # NOTE the equality: A64P_* are ENUMERATED pattern values in the low byte, not bit
+    # flags, so a bitwise test here would match every pattern sharing a set bit.
+    if (a64_pattern(flags) == A64P_BCOND) { ret ct.asm_branch_flags(); }
+
+    # unconditional control transfer and the traps: the target of each is public by
+    # construction.
+    #
+    # THE SYSTEM-REGISTER MOVES ARE HERE FOR A DIFFERENT REASON, and it is worth stating
+    # now that the name table reaches a whole architecture's worth of registers rather
+    # than DIT alone (#2480). WHICH register a move names is part of the instruction
+    # word, fixed at assembly time and never an operand, so it cannot be secret; and the
+    # move's latency does not vary with the value it carries. That holds for a counter
+    # read (`mrs Xt, CNTVCT_EL0`) exactly as for any other: the read is fixed-latency in
+    # its operands, and observing a clock is not a channel that reveals a secret THIS
+    # program holds - a secret reaching a branch or an address is, and both are checked
+    # separately. What would change the answer is a register whose access time depended
+    # on a value the program supplies; the architecture defines none.
+    if (code == A64M_B   || code == A64M_BL  || code == A64M_BLR || code == A64M_BR ||
+        code == A64M_RET || code == A64M_SVC || code == A64M_BRK ||
+        code == A64M_NOP || code == A64M_MSR || code == A64M_MRS) {
+        ret ct.asm_op(ct.CT_OP_NONE);
+    }
+    # the register-conditioned branches: checked against taint, not refused.
+    if (code == A64M_CBZ || code == A64M_CBNZ) {
+        ret ct.asm_branch_reg();
+    }
+    ret ct.asm_unknown();
+}
+
+# every mnemonic the aarch64 grammar admits carries a constant-time classification
+#
+# Walks the shipping grammar table, so adding a mnemonic without classifying it fails
+# here rather than becoming a row `#[oblivious]` silently cannot use (#2230).
+test "mach.lang.target.isa.arm64.encode.asm_ct_class:every_grammar_row_is_classified" {
+    var bad: i32 = 0;
+    var i: usize = 0;
+    for (i < A64_MNEMONIC_COUNT) {
+        if (!asm_ct_class(A64_MNEMONICS[i].code, A64_MNEMONICS[i].flags).known) { bad = 1; }
+        i = i + 1;
+    }
+    ret bad;
+}
+
+# aarch64's REGISTER-conditioned branches are checked, not refused - the property
+# that makes the LL/SC atomic loop analyzable rather than merely asserted
+#
+# SCOPE, corrected by #2477: this walks the STATIC mnemonic table, and what it proves
+# is a fact about that table only. aarch64 also admits `b.<cond>` through the
+# grammar's DECODE hook, which is flags-conditioned and refused; the sibling
+# `decode_channel_is_classified` covers that channel. Read alone this test once
+# looked like proof that aarch64 has no flags-conditioned branch at all, which is
+# what let one through.
+#
+# `stlxr Ws, Xt, [Xn]` writes its status register and the retry `cbnz Ws` reads it,
+# both plain register operands, so the walk sees mechanically that the retry
+# conditions on CONTENTION status rather than on a taint. x86-64 cannot do this: its
+# `jcc` family conditions on FLAGS, which the effect model does not represent (#2460).
+test "mach.lang.target.isa.arm64.encode.asm_ct_class:branches_are_register_conditioned" {
+    var bad: i32 = 0;
+
+    # the only conditional forms this grammar has, and both are register-conditioned.
+    if (!asm_ct_class(A64M_CBZ, 0).cond_reg)   { bad = 1; }
+    if (!asm_ct_class(A64M_CBNZ, 0).cond_reg)  { bad = 1; }
+    # no STATIC row is flags-conditioned. that is a fact about the table, not about
+    # the grammar: `b.<cond>` arrives through the decode hook (#2477).
+    var i: usize = 0;
+    for (i < A64_MNEMONIC_COUNT) {
+        if (asm_ct_class(A64_MNEMONICS[i].code, A64_MNEMONICS[i].flags).cond_flags) { bad = 1; }
+        i = i + 1;
+    }
+    # the unconditional transfers are not conditional branches.
+    if (asm_ct_class(A64M_B, 0).cond_reg)  { bad = 1; }
+    if (asm_ct_class(A64M_BL, 0).cond_reg) { bad = 1; }
+
+    # check (c) is near-vacuous HERE: no divide, multiply or float row exists, and the
+    # register-count shifts are the only variable-latency shape.
+    if (asm_ct_class(A64M_LSLV, 0).op != ct.CT_OP_VAR_SHIFT) { bad = 1; }
+    if (asm_ct_class(A64M_LSRV, 0).op != ct.CT_OP_VAR_SHIFT) { bad = 1; }
+    if (asm_ct_class(A64M_ASRV, 0).op != ct.CT_OP_VAR_SHIFT) { bad = 1; }
+    # the immediate-count forms are not.
+    if (asm_ct_class(A64M_LSL, 0).op != ct.CT_OP_NONE) { bad = 1; }
+    i = 0;
+    for (i < A64_MNEMONIC_COUNT) {
+        val op: ct.CtOp = asm_ct_class(A64_MNEMONICS[i].code, A64_MNEMONICS[i].flags).op;
+        if (op == ct.CT_OP_INT_DIVMOD) { bad = 1; }
+        if (op == ct.CT_OP_INT_MUL)    { bad = 1; }
+        if (op == ct.CT_OP_FLOAT)      { bad = 1; }
+        i = i + 1;
+    }
+    ret bad;
+}
+
+# the `AsmCtScanFn` the aarch64 ISA vtable exposes - the `#[oblivious]` leakage checks
+# run over the instructions an inline-asm body parses to (#2230)
+#
+# The ISA half is the grammar; the walk itself is shared, so all three targets run
+# identical checks over their own instruction streams.
+pub fun asm_ct_scan(body: str, secret_names: *str, n_secret: u32,
+                    trust_mul: bool, trust_shift: bool, alloc: *A.Allocator) R.Result[bool, str] {
+    var g: iasm.Grammar = a64_grammar();
+    ret iasm.ct_scan(?g, body, secret_names, n_secret, trust_mul, trust_shift);
+}
+
+# every form the DECODE channel admits is classified - probed against the decoder
+# itself, not against a copy of its accepted list
+#
+# This is the test #2477 needed and #2230 lacked. The old coverage test walked
+# `A64_MNEMONICS` and asserted no row is flags-conditioned. That is TRUE of the static
+# table and false of the grammar: a grammar admits forms through TWO channels, and
+# `a64_decode_bcond` synthesizes `b.<cond>` rows that never appear in the table. So
+# the assertion held while `cmp {secret}, x1 ; b.eq` walked as leak-free.
+#
+# The fix is to probe the DECODER over a generated alphabet rather than enumerate what
+# it is believed to accept: every two-letter suffix is offered, and whatever the
+# decoder ACCEPTS must classify as a flags-conditioned branch. A condition added to
+# `asm_parse_cond` later is picked up automatically, because the test asks the decoder
+# rather than a list beside it.
+test "mach.lang.target.isa.arm64.encode.asm_ct_class:decode_channel_is_classified" {
+    var bad: i32 = 0;
+    var accepted: u32 = 0;
+
+    var a: u32 = 0;
+    for (a < 26) {
+        var b: u32 = 0;
+        for (b < 26) {
+            var buf: [8]u8;
+            buf[0] = 98;                      # 'b'
+            buf[1] = 46;                      # '.'
+            buf[2] = (97 + a)::u8;
+            buf[3] = (97 + b)::u8;
+            buf[4] = 0;
+            val body: str = (?buf[0])::str;
+
+            var m: iasm.Mnemonic;
+            var n: usize = 0;
+            if (a64_decode_bcond(body, 0, 4, ?m, ?n)) {
+                accepted = accepted + 1;
+                # whatever the decoder admits must be refused as flags-conditioned.
+                val cls: ct.AsmClass = asm_ct_class(m.code, m.flags);
+                if (!cls.cond_flags) { bad = 1; }
+                # and it must NOT read as the unconditional branch it shares a code
+                # with - the exact confusion that opened the hole.
+                if (m.code != A64M_B) { bad = 1; }
+            }
+            b = b + 1;
+        }
+        a = a + 1;
+    }
+
+    # the probe must actually have exercised the channel: a decoder that accepted
+    # nothing would satisfy every assertion above vacuously.
+    if (accepted == 0) { bad = 1; }
+    ret bad;
+}
+
+# the `NoteBytesFn` the aarch64 grammar wires: this printer renders on the spot, so the
+# directive is written as its bytes are emitted and lands in program order (#2467)
+fun asm_note_bytes(st: *encode.EncodeState, bytes: *u8, n: usize, start: usize) R.Result[bool, str] {
+    ret encode.render_bytes_directive(?st.buf, bytes, n, start);
+}
+
+# a `.byte` payload REACHES THE ASSEMBLY SINK and renders as a directive (#2467)
+#
+# The defect this pins: `emit_one` wrote a directive's payload straight into the
+# buffer and never notified the sink, so those bytes were never accounted. The
+# encoder's own guard then refused the whole `--emit-asm` run - blaming the enclosing
+# ASM_BLOCK when the directive stood alone, and blaming the NEXT instruction for bytes
+# it never emitted when one followed. One cause, two diagnostics.
+#
+# The rendering is SHARED (`encode.render_bytes_directive`); only the timing is
+# per-ISA. Tested here because this printer carries a capture sink; the round-trip
+# half - that what is rendered assembles back to the same bytes - is in `x64.encode`.
+test "mach.lang.target.isa.arm64.encode.render_bytes_directive:reaches_the_sink" {
+    var bad: i32 = 0;
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var interner: intern.Interner;
+    var st: encode.EncodeState;
+    tasm(?st, ?alloc, ?interner);
+
+    var w: writer.Writer;
+    w.ctx     = nil;
+    w.f_write = printer.test_sink_write;
+    printer.test_sink_reset();
+    var sink: encode.AsmSink = encode.sink_init(?w, ?interner);
+    st.buf.asm = ?sink;
+
+    var payload: [3]u8;
+    payload[0] = 0xEC; payload[1] = 0x90; payload[2] = 0x0F;
+    val start: usize = st.buf.len;
+    var i: usize = 0;
+    for (i < 3) { encode.emit_byte(?st.buf, payload[i]); i = i + 1; }
+
+    # before the notification the bytes are emitted but unaccounted - the state that
+    # made the encoder refuse.
+    if (encode.sink_unaccounted(?st.buf) == 0) { bad = 1; }
+
+    if (R.is_err[bool, str](encode.render_bytes_directive(?st.buf, ?payload[0], 3, start))) { ret 1; }
+
+    # and after it, every byte is accounted for.
+    if (encode.sink_unaccounted(?st.buf) != 0) { bad = 1; }
+
     ret bad;
 }

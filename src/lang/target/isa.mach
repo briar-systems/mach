@@ -230,20 +230,6 @@ pub rec RegClass {
 # pointer_width:     pointer width in bytes
 # gpr_width:         general-purpose / machine-word width in bytes
 # spill_width:       spill / reload move width in bytes
-# move_extends_from: the narrowest byte width at which a register-to-register move
-#                    WRITES THE WHOLE destination register, clearing the bits above
-#                    its own width, or 0 on an ISA where no move does. this is the
-#                    fact that decides whether a move from a register to itself is
-#                    observable: one that extends is a zero-extension and must be
-#                    kept, one that does not is a no-op and can be deleted. x86-64
-#                    is 4 (a 32-bit write zero-extends into the 64-bit register; a
-#                    1- or 2-byte write preserves the bits above it), aarch64 is 1
-#                    (every non-64-bit move encodes as `ORR_W` and so zero-extends
-#                    into X), riscv64 and mos6502 are 0 (a move is `addi rd,rs,0` /
-#                    a byte transfer at the machine width, extending nothing).
-#                    read by `regalloc.drop_self_copies` (#2275); a width at or
-#                    above `spill_width` is full-width and extends nothing by
-#                    definition, so this only ever governs the sub-word case
 # endianness:        byte order of scalar storage (ENDIAN_*)
 # reg_classes:       borrowed array of the ISA's register classes
 # reg_class_len:     number of register classes
@@ -299,7 +285,6 @@ pub rec MachineModel {
     gpr_width:     u32;
     max_alu_width: u32;
     spill_width:   u32;
-    move_extends_from: u32;
     endianness:    Endian;
 
     reg_classes:    *RegClass;
@@ -336,6 +321,15 @@ pub rec MachineModel {
     # register (aarch64) and on one with no variable shift at all
     has_var_shift:     bool;
 
+    # whether the ISA has a hardware integer multiply instruction at all (#2344).
+    # false on a machine with no multiply of any width (mos6502), where
+    # `be.codegen.legalize` owns every `MIR_MUL` - native-width included, unlike the
+    # width-driven gates above - and rewrites it into a straight-line double-and-add
+    # sequence over the operation's own width, so no multiply ever reaches selection.
+    # true on every ISA this compiler otherwise targets (x86-64 IMUL, aarch64 MUL,
+    # rv64 MUL, and SPIR-V's OpIMul), so the gate is dead everywhere but mos6502.
+    has_mul: bool;
+
     # the second constant-time capability fact (#1646): true when the ISA shifts by a
     # variable count in constant time (a barrel shifter), so a secret shift COUNT is
     # permitted; false gates a shift by a secret count as a variable-latency leak (an
@@ -359,6 +353,29 @@ pub rec MachineModel {
 # gp_out: receives the GP-register clobber bitmask (index n -> bit n)
 # fp_out: receives the vector-register clobber bitmask (index n -> bit n)
 pub def AsmClobbersFn: fun(str, *u32, *u32);
+
+# the concrete signature the erased `RegMachine.asm_ct_scan` pointer is cast back to
+#
+# Walks an inline-asm body for the constant-time leakage checks `#[oblivious]`
+# enforces everywhere else, so a block can be VALIDATED rather than refused (#2230).
+# `secret_names` names the `{name}` bindings whose storage is secret; taint enters
+# the walk through those and propagates by the effect model.s register-write facts.
+#
+# Returns the FIRST leak found, so a diagnostic can name the offending instruction,
+# or ok(true) when the body leaks nothing. FAILS CLOSED in every unmodeled case: a
+# body that does not parse, an instruction whose constant-time class is unclassified,
+# and (on x86-64 only) any conditional branch, whose condition rides FLAGS - which
+# the effect model does not represent (#2460).
+# ---
+# body:         raw inline-asm body text
+# secret_names: the `{name}` binding names whose storage is secret, as text - the
+#               scan compares them against the names it reads out of the body, so
+#               the ISA contract needs no interner
+# n_secret:     number of entries in `secret_names`
+# trust_mul:    the target's `ct_trust_mul` capability flag
+# trust_shift:  the target's `ct_trust_var_shift` capability flag
+# alloc:        allocator for the returned diagnostic
+pub def AsmCtScanFn: fun(str, *str, u32, bool, bool, *A.Allocator) R.Result[bool, str];
 
 # the concrete signature the erased `RegMachine.is_reg_move` pointer is cast back to
 #
@@ -517,6 +534,11 @@ pub def CvRegFn: fun(i32) i32;
 #                       preserves any callee-saved register a body writes. nil when
 #                       the ISA supplies no analyzer, which regalloc treats
 #                       conservatively (every register potentially clobbered)
+# asm_ct_scan:          OPTIONAL capability - walk an inline-asm body for the
+#                       constant-time leakage checks, so `#[oblivious]` can validate
+#                       a block instead of refusing it (#2230). nil when the ISA
+#                       supplies no scanner, which `ctvalidate` treats as the old
+#                       blanket refusal - the fail-closed default
 # dwarf_reg:            OPTIONAL capability - map a physical register id to its
 #                       DWARF register number, the ISA-specific numbering the
 #                       `DW_OP_reg*` / `DW_OP_breg*` variable locations use; the
@@ -546,6 +568,7 @@ pub rec RegMachine {
 
     emit_asm:     *u8;
     asm_clobbers: AsmClobbersFn;
+    asm_ct_scan:  AsmCtScanFn;
     dwarf_reg:    DwarfRegFn;
     cv_reg:       CvRegFn;
 }
@@ -669,9 +692,9 @@ pub rec IsaVTable {
 # built results in XMM14 - the declared and the real primary had drifted apart with
 # no way to observe it. A slot belongs here only once something reads it.
 #
-# The four optional capabilities are cleared here and added afterwards through the
-# `with_*` setters, so an ISA that wires none of them still leaves no field reading
-# stack garbage (`var` does not zero).
+# The four optional capabilities are left at their zero default here and added
+# afterwards through the `with_*` setters: nil is the zero value for a function
+# pointer, so a bare `var` already leaves each one absent before any setter runs.
 # ---
 # select:               instruction selector, erased (the arch's `SelectFn`)
 # encode:               byte encoder, erased (the arch's `EncodeFn`)
@@ -711,11 +734,6 @@ pub fun reg_machine(select: *u8, encode: *u8, is_reg_move: IsRegMoveFn,
     m.div_reg              = div_reg;
     m.div_hi_reg           = div_hi_reg;
     m.shift_count_reg      = shift_count_reg;
-
-    m.emit_asm     = nil;
-    m.asm_clobbers = nil;
-    m.dwarf_reg    = nil;
-    m.cv_reg       = nil;
     ret m;
 }
 
@@ -738,6 +756,17 @@ pub fun with_asm_printer(m: *RegMachine, emit_asm: *u8) {
 # f: the clobber analyzer
 pub fun with_asm_clobbers(m: *RegMachine, f: AsmClobbersFn) {
     m.asm_clobbers = f;
+}
+
+# declare the optional inline-asm constant-time scanner
+#
+# Without it `#[oblivious]` refuses every inline-asm block outright, which is the
+# fail-closed default this capability relaxes (#2230).
+# ---
+# m: the register-machine contract to extend
+# f: the constant-time scanner
+pub fun with_asm_ct_scan(m: *RegMachine, f: AsmCtScanFn) {
+    m.asm_ct_scan = f;
 }
 
 # declare the optional DWARF register numbering
@@ -781,9 +810,9 @@ pub fun module_emitter(emit_module: *u8) ModuleEmitter {
 # relocatable objects are not ELF may still pass a deliberate nil for
 # `elf_reloc_type`.
 #
-# The one optional capability is cleared here and added afterwards through
-# `with_elf_attributes`, so an arch that declares none still leaves no field
-# reading stack garbage (`var` does not zero).
+# The one optional capability is left at its zero default here and added afterwards
+# through `with_elf_attributes`: nil is the zero value for this erased fn ptr, so a
+# bare `var` already leaves it absent before the setter runs.
 # ---
 # apply_reloc:    the relocation applier, erased (`of.reloc.ApplyRelocFn`)
 # reloc_traits:   the relocation-traits source, erased
@@ -797,8 +826,6 @@ pub fun reloc_seam(apply_reloc: *u8, reloc_traits: *u8,
     s.apply_reloc    = apply_reloc;
     s.reloc_traits   = reloc_traits;
     s.elf_reloc_type = elf_reloc_type;
-
-    s.elf_attributes = nil;
     ret s;
 }
 
@@ -864,11 +891,12 @@ pub fun emitter_isa(id: u32, name: str, pointer_width: u32,
     ret vt;
 }
 
-# the family-agnostic half of a composed vtable: identity, description, and a
-# cleared relocatable-object seam
+# the family-agnostic half of a composed vtable: identity, description, and both
+# family payloads at their zero default
 #
-# Shared by `machine_isa` and `emitter_isa` so neither can forget to clear a slot
-# the other fills - `var` does not zero, so an unwritten field reads stack garbage.
+# Shared by `machine_isa` and `emitter_isa` so neither can forget to leave the
+# slot the other fills at nil, its zero value - a bare `var` already leaves both
+# family-payload pointers there before either caller names the one it owns.
 # ---
 # id:              architecture id
 # name:            interned architecture name
@@ -884,10 +912,6 @@ fun isa_common(id: u32, name: str, elf_machine: u32, pointer_width: u32,
     vt.elf_machine     = elf_machine;
     vt.pointer_width   = pointer_width;
     vt.model           = model;
-
-    vt.reloc   = nil;
-    vt.machine = nil;
-    vt.emitter = nil;
     ret vt;
 }
 
@@ -1282,11 +1306,15 @@ pub fun make_sym_mod(sym_id: u32, size: u8, mod: SymModifier) Operand {
 # its form uses, so an unset field never reads as a live operand.
 #
 # EVERY `Inst` IN THE BACK END STARTS HERE, and that is what makes adding a field
-# additive: `var` does not zero, so a construction site that cleared its fields by
-# hand would leave any later field holding whatever the frame held. That is not
-# hypothetical - `Operand.sym_mod` was added and three hand-written clears did not
-# learn about it. One constructor means a new field is neutral at every site by
-# construction, and a target that wants a value sets it deliberately.
+# additive: a hand-written clear, built directly rather than through this
+# constructor, would not learn about a field added later - not hypothetical,
+# `Operand.sym_mod` was added and three hand-written clears did not learn about it.
+# It also matters HOW `dst` / `src1` / `src2` clear: `make_none()` sets `reg` /
+# `base` / `index` to their `-1` ABSENT sentinels, not to 0 - and 0 is a live
+# register / base / index id, so a bare declaration's zero-fill would read as
+# "operand 0", a plausible wrong value, not as "no operand". One constructor means
+# a new field is neutral at every site by construction, and a target that wants a
+# value sets it deliberately.
 # ---
 # ret: an Inst with opcode 0 and three absent operands
 pub fun inst_blank() Inst {
@@ -1436,8 +1464,8 @@ test "mach.lang.target.isa.family:payloads_are_exclusive" {
 
 # `reloc_seam` takes each required member positionally, so an arch that omits one
 # is an arity error rather than a hook discovered missing at link time, and it
-# clears the optional descriptor so a declaring arch leaves no field reading stack
-# garbage (`var` does not zero)
+# leaves the optional descriptor at its zero default (nil), which a declaring
+# arch never named, before `with_elf_attributes` turns it on
 test "mach.lang.target.isa.reloc_seam:required_then_optional" {
     var s: RelocSeam = t_reloc();
     if (s.apply_reloc == nil)    { ret 1; }
@@ -1458,13 +1486,14 @@ test "mach.lang.target.isa.reloc_seam:required_then_optional" {
     ret 0;
 }
 
-# `reg_machine` clears every optional capability, so an ISA that declares none
-# leaves no field reading stack garbage (`var` does not zero). each `with_*` setter
-# then turns exactly one on
+# `reg_machine` leaves every optional capability at its zero default (nil), which
+# an ISA that declares none never named. each `with_*` setter then turns exactly
+# one on
 test "mach.lang.target.isa.reg_machine:optionals_cleared_then_declared" {
     var m: RegMachine = t_machine();
     if (m.emit_asm != nil)     { ret 1; }
     if (m.asm_clobbers != nil) { ret 1; }
+    if (m.asm_ct_scan != nil)  { ret 1; }
     if (m.dwarf_reg != nil)    { ret 1; }
     if (m.cv_reg != nil)       { ret 1; }
 

@@ -136,7 +136,11 @@ caller's instruction cache, or to hold code size down on a constrained target.
 
 Sets the alignment of a global variable or a record/union type. `expr` must
 be a comptime integer — either a literal or a comptime expression such as
-`$size_of(T)` or `$align_of(T)`.
+`$size_of(T)` or `$align_of(T)`, in both positions.
+
+A type's alignment is settled during type resolution, before layouts are otherwise
+known; the measured type's layout is established on demand when the intrinsic asks
+for it, so the answer does not depend on whether `T` is declared above or below.
 
 ```mach
 #[align(64)]
@@ -145,9 +149,13 @@ pub var cache_line: u8 = 0;
 #[align($size_of(Pair))]
 pub var g_cmp: u8 = 0;
 
-#[align(32)]
+#[align($align_of(Pair))]
 rec Over { a: u8; }
 ```
+
+A type aligned to a measurement of itself — `#[align($size_of(Self))]`, or two
+types each aligned to the other's size — is a layout cycle and is reported as one,
+naming the type that closes it.
 
 - On a `var` / `val`, sets the global's section alignment and address
   alignment.
@@ -176,10 +184,22 @@ ordinary relocations.
 
 Marks a function as a constant-time boundary. Applies to functions only; takes
 no arguments. Inside it the backend must not introduce a secret-dependent
-branch, select a variable-latency instruction on a secret operand, or eliminate
-a zeroizing write to secret storage; a translation validator re-derives the
-secret taint over the lowered MIR and rejects any such leak. Inline `asm` is
-rejected inside an `#[oblivious]` function, since a type system cannot check it.
+branch or select a variable-latency instruction on a secret operand; a
+translation validator re-derives the secret taint over the lowered MIR and
+rejects any such leak.
+
+Inline `asm` inside such a function is **validated rather than rejected**: the
+block is parsed and walked for the same leaks, and refused only where a leak is
+found or where the construct cannot be modelled. See
+[secrecy.md](secrecy.md#oblivious--the-codegen-contract) for what is checked and
+what is refused, including the x86-64 conditional-branch limitation.
+
+The **zeroizing-write** guarantee is *not* one of the decorator's obligations,
+and describing it as one understates it. A write into secret storage carries a
+taint applied at lowering, keyed on the storage's secrecy rather than on any
+decorator, so a zeroizing wipe is protected in a function carrying no
+`#[oblivious]` at all. See [secrecy.md](secrecy.md#the-zeroizing-write-guarantee)
+for what that covers and what it does not.
 
 ```mach
 #[oblivious]
