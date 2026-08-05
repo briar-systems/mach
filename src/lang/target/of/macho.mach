@@ -166,6 +166,9 @@ val X86_64_RELOC_SIGNED:   u32 = 1;
 val X86_64_RELOC_BRANCH:   u32 = 2;
 val X86_64_RELOC_GOT_LOAD: u32 = 3;
 val X86_64_RELOC_GOT:      u32 = 4;
+val X86_64_RELOC_SIGNED_1: u32 = 6;
+val X86_64_RELOC_SIGNED_2: u32 = 7;
+val X86_64_RELOC_SIGNED_4: u32 = 8;
 
 # arm64 relocation types (ARM64_RELOC_*)
 val ARM64_RELOC_UNSIGNED:  u32 = 0;
@@ -387,11 +390,40 @@ fun reloc_kind_for(itn: *intern.Interner, alloc: *A.Allocator, cputype: u32, r_t
         ret R.err[of.RelocKind, str](unsupported_type_message(itn, alloc, r_type::u64));
     }
     if (r_type == X86_64_RELOC_UNSIGNED) { ret unsigned_kind(r_length); }
-    if (r_type == X86_64_RELOC_SIGNED)   { ret R.ok[of.RelocKind, str](of.RK_PC32); }
+    if (x64_is_signed(r_type)) {
+        if (r_length != 2) { ret R.err[of.RelocKind, str]("macho: x86_64 signed relocation field is not 4 bytes"); }
+        ret R.ok[of.RelocKind, str](of.RK_PC32);
+    }
     if (r_type == X86_64_RELOC_BRANCH)   { ret R.ok[of.RelocKind, str](of.RK_PLT32); }
     if (r_type == X86_64_RELOC_GOT_LOAD) { ret R.ok[of.RelocKind, str](of.RK_GOTPCREL); }
     if (r_type == X86_64_RELOC_GOT)      { ret R.ok[of.RelocKind, str](of.RK_GOTPCREL); }
     ret R.err[of.RelocKind, str](unsupported_type_message(itn, alloc, r_type::u64));
+}
+
+# whether an x86_64 relocation is one of the four signed RIP-relative forms
+# ---
+# r_type: the X86_64_RELOC_* type
+# ret:    true for SIGNED, SIGNED_1, SIGNED_2, or SIGNED_4
+fun x64_is_signed(r_type: u32) bool {
+    ret r_type == X86_64_RELOC_SIGNED || r_type == X86_64_RELOC_SIGNED_1
+        || r_type == X86_64_RELOC_SIGNED_2 || r_type == X86_64_RELOC_SIGNED_4;
+}
+
+# the instruction-tail bias encoded by an x86_64 signed relocation type
+#
+# Darwin's SIGNED_N forms say that N instruction bytes follow the four-byte
+# displacement. LLVM therefore recovers `raw + N` as the embedded addend and
+# relocates relative to `P + 4 + N`. Both terms are retained while translating
+# to mach's field-relative RK_PC32 contract; they algebraically cancel only after
+# the target or addend has been recovered. Non-SIGNED_N types have no extra bias.
+# ---
+# r_type: the X86_64_RELOC_* type
+# ret:    1, 2, or 4 for SIGNED_N; zero for every other type
+fun x64_pcrel_bias(r_type: u32) i64 {
+    if (r_type == X86_64_RELOC_SIGNED_1) { ret 1; }
+    if (r_type == X86_64_RELOC_SIGNED_2) { ret 2; }
+    if (r_type == X86_64_RELOC_SIGNED_4) { ret 4; }
+    ret 0;
 }
 
 # resolve an UNSIGNED relocation's abstract kind from its on-wire length: length=3
@@ -3835,6 +3867,9 @@ fun populate_relocs(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_si
                         r = r + 1;
                         cnt;
                     }
+                    if (cputype == CPU_TYPE_X86_64 && x64_is_signed(r_type) && pcrel == 0) {
+                        ret R.err[bool, str]("macho: x86_64 signed relocation is not pc-relative");
+                    }
                     if (extn != 0 && symnum >= nsyms) { ret R.err[bool, str]("macho: relocation symbol index out of range"); }
 
                     var insn: u32 = 0;
@@ -3848,12 +3883,15 @@ fun populate_relocs(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_si
                     var target: u32 = symnum;
                     var addend: i64 = 0;
                     if (extn != 0) {
-                        addend = recover_addend(out, sec_i, address, cputype, kind, pcrel, pending, have_pending);
+                        val ra: R.Result[i64, str] = recover_addend(out, sec_i, address, cputype, kind,
+                                                                    r_type, pcrel, pending, have_pending);
+                        if (R.is_err[i64, str](ra)) { ret R.err[bool, str](R.unwrap_err[i64, str](ra)); }
+                        addend = R.unwrap_ok[i64, str](ra);
                     } or {
                         val tsec: u32 = symnum - 1;
                         target = nsyms + sec_anchor[tsec];
                         val sa: R.Result[i64, str] = section_addend(itn, alloc, out, sec_base, sec_i, tsec,
-                                                                    address, cputype, kind, pcrel);
+                                                                    address, cputype, kind, r_type, pcrel);
                         if (R.is_err[i64, str](sa)) { ret R.err[bool, str](R.unwrap_err[i64, str](sa)); }
                         addend = R.unwrap_ok[i64, str](sa);
                     }
@@ -3894,39 +3932,52 @@ fun sign_extend24(v: u32) i64 {
 #
 # An 8-byte UNSIGNED (RK_ABS64) field holds the full addend and a 4-byte UNSIGNED
 # (RK_ABS32) field the sign-extended 32-bit one, both in-place on either arch; an
-# x86_64 pc-relative field is next-instruction-relative, so the abstract addend is
-# `field - 4`. arm64 page/page-offset/branch kinds take the paired addend (0 when
-# none was present).
+# x86_64 pc-relative field is next-instruction-relative. SIGNED_N additionally
+# records N trailing instruction bytes: its embedded addend is `field + N` and its
+# PC is `P + 4 + N`, yielding the abstract field-relative addend `field - 4` only
+# after both biases have been applied. Each recovered in-place field is cleared so
+# the ObjectImage holds the writer's neutral placeholder form; emitting a parsed
+# object then folds its abstract addend exactly once. arm64 page/page-offset/branch
+# kinds take the paired addend (0 when none was present).
 # ---
 # out:          the image (its section bytes carry the in-place field)
 # sec_i:        the section the relocation patches
 # address:      the in-section patch offset
 # cputype:      the header cputype
 # kind:         the abstract relocation kind
+# r_type:       the on-wire machine relocation type
 # pcrel:        the on-wire pc-relative bit
 # pending:      the paired ARM64_RELOC_ADDEND value
 # have_pending: whether a paired addend entry preceded this relocation
-# ret:          the abstract addend
+# ret:          ok(the abstract addend), or an out-of-bounds field error
 fun recover_addend(out: *of.ObjectImage, sec_i: u32, address: u32, cputype: u32, kind: of.RelocKind,
-                   pcrel: u32, pending: i64, have_pending: bool) i64 {
+                   r_type: u32, pcrel: u32, pending: i64, have_pending: bool) R.Result[i64, str] {
     val bytes: *u8 = out.sections[sec_i].bytes;
     val len:   usize = out.sections[sec_i].len::usize;
     if (kind == of.RK_ABS64) {
-        if (bytes != nil && (address::usize + 8) <= len) { ret bin.read_u64_le(bytes, address::usize)::i64; }
-        ret 0;
+        if (bytes == nil || (address::usize + 8) > len) { ret R.err[i64, str]("macho: relocation field out of bounds"); }
+        val addend: i64 = bin.read_u64_le(bytes, address::usize)::i64;
+        bin.write_u64_le(bytes, address::usize, 0);
+        ret R.ok[i64, str](addend);
     }
     if (kind == of.RK_ABS32) {
-        if (bytes != nil && (address::usize + 4) <= len) { ret (bin.read_u32_le(bytes, address::usize)::i32)::i64; }
-        ret 0;
+        if (bytes == nil || (address::usize + 4) > len) { ret R.err[i64, str]("macho: relocation field out of bounds"); }
+        val addend: i64 = (bin.read_u32_le(bytes, address::usize)::i32)::i64;
+        bin.write_u32_le(bytes, address::usize, 0);
+        ret R.ok[i64, str](addend);
     }
     if (cputype == CPU_TYPE_ARM64) {
-        if (have_pending) { ret pending; }
-        ret 0;
+        if (have_pending) { ret R.ok[i64, str](pending); }
+        ret R.ok[i64, str](0);
     }
     if (pcrel != 0) {
-        if (bytes != nil && (address::usize + 4) <= len) { ret (bin.read_u32_le(bytes, address::usize)::i32)::i64 - 4; }
+        if (bytes == nil || (address::usize + 4) > len) { ret R.err[i64, str]("macho: relocation field out of bounds"); }
+        val raw:  i64 = (bin.read_u32_le(bytes, address::usize)::i32)::i64;
+        val bias: i64 = x64_pcrel_bias(r_type);
+        bin.write_u32_le(bytes, address::usize, 0);
+        ret R.ok[i64, str]((raw + bias) - (4 + bias));
     }
-    ret 0;
+    ret R.ok[i64, str](0);
 }
 
 # recover a section-based relocation's abstract addend: the target's byte offset
@@ -3937,8 +3988,10 @@ fun recover_addend(out: *of.ObjectImage, sec_i: u32, address: u32, cputype: u32,
 # its sections out at ascending addresses and the field names a point in that
 # layout. Subtracting the named section's base address turns the address into the
 # offset from its anchor. A pc-relative field is stored relative to the next
-# instruction, so the patch site's own object address is added back first and the
-# `- 4` of the abstract field-relative convention reapplied.
+# instruction. SIGNED_N counts its N trailing instruction bytes in both the
+# embedded addend and the relocation PC, so the patch site's own object address
+# plus `4 + N` is added back first and the same `4 + N` is subtracted when the
+# target offset becomes an abstract field-relative addend.
 #
 # Only the kinds whose field carries a whole address are recoverable this way. An
 # arm64 page / page-offset / branch field carries a fragment of one packed into an
@@ -3956,32 +4009,53 @@ fun recover_addend(out: *of.ObjectImage, sec_i: u32, address: u32, cputype: u32,
 # address:  the in-section patch offset
 # cputype:  the header cputype
 # kind:     the abstract relocation kind
+# r_type:   the on-wire machine relocation type
 # pcrel:    the on-wire pc-relative bit
 # ret:      ok(the abstract addend), or an error naming the unsupported kind
 fun section_addend(itn: *intern.Interner, alloc: *A.Allocator, out: *of.ObjectImage, sec_base: *u64,
                    sec_i: u32, tsec: u32, address: u32, cputype: u32, kind: of.RelocKind,
-                   pcrel: u32) R.Result[i64, str] {
+                   r_type: u32, pcrel: u32) R.Result[i64, str] {
     val bytes: *u8 = out.sections[sec_i].bytes;
     val len:   usize = out.sections[sec_i].len::usize;
-    var target: i64 = 0;
+    var target: u64 = 0;
     if (pcrel == 0 && kind == of.RK_ABS64) {
         if (bytes == nil || (address::usize + 8) > len) { ret R.err[i64, str]("macho: section-relative relocation field out of bounds"); }
-        target = bin.read_u64_le(bytes, address::usize)::i64;
+        target = bin.read_u64_le(bytes, address::usize);
+        bin.write_u64_le(bytes, address::usize, 0);
     } or (pcrel == 0 && kind == of.RK_ABS32) {
         if (bytes == nil || (address::usize + 4) > len) { ret R.err[i64, str]("macho: section-relative relocation field out of bounds"); }
-        target = bin.read_u32_le(bytes, address::usize)::i64;
+        target = bin.read_u32_le(bytes, address::usize)::u64;
+        bin.write_u32_le(bytes, address::usize, 0);
     } or (pcrel != 0 && cputype != CPU_TYPE_ARM64 && (kind == of.RK_PC32 || kind == of.RK_PLT32)) {
         if (bytes == nil || (address::usize + 4) > len) { ret R.err[i64, str]("macho: section-relative relocation field out of bounds"); }
         val disp: i64 = (bin.read_u32_le(bytes, address::usize)::i32)::i64;
-        target = (sec_base[sec_i] + address::u64 + 4)::i64 + disp;
+        val bias: i64 = x64_pcrel_bias(r_type);
+        val tail: u64 = address::u64 + (4 + bias)::u64;
+        if (sec_base[sec_i] > 0xFFFFFFFFFFFFFFFF - tail) {
+            ret R.err[i64, str]("macho: section-relative relocation target overflows address space");
+        }
+        val pc: u64 = sec_base[sec_i] + tail;
+        if (disp >= 0) {
+            if (pc > 0xFFFFFFFFFFFFFFFF - disp::u64) {
+                ret R.err[i64, str]("macho: section-relative relocation target overflows address space");
+            }
+            target = pc + disp::u64;
+        } or {
+            val magnitude: u64 = (-disp)::u64;
+            if (pc < magnitude) { ret R.err[i64, str]("macho: section-relative relocation targets before its section"); }
+            target = pc - magnitude;
+        }
+        bin.write_u32_le(bytes, address::usize, 0);
     } or {
         ret R.err[i64, str](unsupported_section_kind_message(itn, alloc, kind));
     }
 
-    val base: i64 = sec_base[tsec]::i64;
+    val base: u64 = sec_base[tsec];
     if (target < base) { ret R.err[i64, str]("macho: section-relative relocation targets before its section"); }
-    if (pcrel != 0) { ret R.ok[i64, str](target - base - 4); }
-    ret R.ok[i64, str](target - base);
+    val offset: u64 = target - base;
+    if (offset > 0x7FFFFFFFFFFFFFFF) { ret R.err[i64, str]("macho: section-relative relocation addend overflows i64"); }
+    if (pcrel != 0) { ret R.ok[i64, str](offset::i64 - (4 + x64_pcrel_bias(r_type))); }
+    ret R.ok[i64, str](offset::i64);
 }
 
 # an ISA vtable that describes an architecture and binds no back half (test helper)
@@ -4162,6 +4236,137 @@ fun ts_x64_roundtrip() u8 {
         rj = rj + 1;
     }
     if (!ok_plt || !ok_pc || !ok_abs) { ret 1; }
+    ret 0;
+}
+
+# all four x86_64 SIGNED forms normalize to the field-relative RK_PC32 contract
+# without losing their in-place addends. the writer deliberately canonicalizes
+# the three instruction-tail variants back to plain SIGNED; reparsing that object
+# must preserve the same abstract relocations and exact encoded fields
+fun ts_x64_signed_variants() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0; k = k + 1; }
+    var data_bytes: [8]u8;
+    k = 0;
+    for (k < 8) { data_bytes[k] = 0; k = k + 1; }
+
+    var secs: [2]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
+    secs[1].name = t_intern(?i, ".data"); secs[1].kind = of.SK_DATA;
+    secs[1].bytes = ?data_bytes[0]; secs[1].len = 8; secs[1].align = 8;
+
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "_main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, "g"); syms[1].section = 1; syms[1].offset = 0;
+    syms[1].size = 8; syms[1].flags = of.SYM_OBJ_FLAG_OBJECT;
+
+    # The canonical writer first emits plain SIGNED. Its field is abstract A + 4,
+    # so these become raw -1/-2/-4, exactly the fields clang emits beside the
+    # SIGNED_1/_2/_4 types for immediate stores.
+    var relocs: [3]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_PC32;
+    relocs[0].sym = 1; relocs[0].addend = -5;
+    relocs[1].section = 0; relocs[1].offset = 4; relocs[1].kind = of.RK_PC32;
+    relocs[1].sym = 1; relocs[1].addend = -6;
+    relocs[2].section = 0; relocs[2].offset = 8; relocs[2].kind = of.RK_PC32;
+    relocs[2].sym = 1; relocs[2].addend = -8;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "signed");
+    img.sections = ?secs[0]; img.section_count = 2;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = ?relocs[0]; img.reloc_count = 3;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_signed");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+    val em: R.Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    val seg: usize = t_find_lc(buf.data, LC_SEGMENT_64);
+    if (seg == 0) { ret 1; }
+    val sh0: usize = seg + SEGMENT_CMD_64_SIZE;
+    val text_off: usize = bin.read_u32_le(buf.data, sh0 + 48)::usize;
+    if (!t_set_reloc_type(buf.data, sh0, 0, X86_64_RELOC_SIGNED_1)) { ret 1; }
+    if (!t_set_reloc_type(buf.data, sh0, 4, X86_64_RELOC_SIGNED_2)) { ret 1; }
+    if (!t_set_reloc_type(buf.data, sh0, 8, X86_64_RELOC_SIGNED_4)) { ret 1; }
+    if (bin.read_u32_le(buf.data, text_off)     != 0xFFFFFFFF) { ret 1; }
+    if (bin.read_u32_le(buf.data, text_off + 4) != 0xFFFFFFFE) { ret 1; }
+    if (bin.read_u32_le(buf.data, text_off + 8) != 0xFFFFFFFC) { ret 1; }
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+    val r1: *of.Relocation = t_reloc_at(?out, 0, 0);
+    val r2: *of.Relocation = t_reloc_at(?out, 0, 4);
+    val r4: *of.Relocation = t_reloc_at(?out, 0, 8);
+    if (r1 == nil || r2 == nil || r4 == nil) { ret 1; }
+    if (r1.kind != of.RK_PC32 || r1.addend != -5) { ret 1; }
+    if (r2.kind != of.RK_PC32 || r2.addend != -6) { ret 1; }
+    if (r4.kind != of.RK_PC32 || r4.addend != -8) { ret 1; }
+
+    # Re-emission uses the canonical plain SIGNED encoding. The encoded fields and
+    # a second parse remain exact, proving normalization is link-equivalent.
+    val tf2_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_signed_rt");
+    if (R.is_err[fs.TempFile, str](tf2_r)) { ret 1; }
+    var tf2: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf2_r);
+    val tpath2: str = fs.temp_path(?tf2);
+    val em2: R.Result[bool, str] = emit_object(?isa_vt, ?out, tpath2::*u8);
+    if (R.is_err[bool, str](em2)) { fs.temp_close_and_remove(?tf2); ret 1; }
+    val rb2: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath2);
+    fs.temp_close_and_remove(?tf2);
+    if (R.is_err[Vector[u8], str](rb2)) { ret 1; }
+    val buf2: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb2);
+    val seg2: usize = t_find_lc(buf2.data, LC_SEGMENT_64);
+    if (seg2 == 0) { ret 1; }
+    val sh2: usize = seg2 + SEGMENT_CMD_64_SIZE;
+    val e1: usize = t_find_reloc(buf2.data, sh2, 0);
+    val e2: usize = t_find_reloc(buf2.data, sh2, 4);
+    val e4: usize = t_find_reloc(buf2.data, sh2, 8);
+    if (e1 == 0 || e2 == 0 || e4 == 0) { ret 1; }
+    if (((bin.read_u32_le(buf2.data, e1 + 4) >> 28) & 0xF) != X86_64_RELOC_SIGNED) { ret 1; }
+    if (((bin.read_u32_le(buf2.data, e2 + 4) >> 28) & 0xF) != X86_64_RELOC_SIGNED) { ret 1; }
+    if (((bin.read_u32_le(buf2.data, e4 + 4) >> 28) & 0xF) != X86_64_RELOC_SIGNED) { ret 1; }
+    var out2: of.ObjectImage;
+    val pr2: R.Result[bool, str] = parse_object(?alloc, ?i, buf2.data, buf2.len, ?out2);
+    if (R.is_err[bool, str](pr2)) { ret 1; }
+    if (t_reloc_at(?out2, 0, 0).addend != -5 || t_reloc_at(?out2, 0, 4).addend != -6
+        || t_reloc_at(?out2, 0, 8).addend != -8) { ret 1; }
+
+    # Malformed variants fail at their own boundary: the four-byte field may not
+    # run past the section, and the on-wire shape must remain 4-byte pc-relative.
+    val original_word: u32 = bin.read_u32_le(buf.data, t_find_reloc(buf.data, sh0, 8) + 4);
+    bin.write_u32_le(buf.data, t_find_reloc(buf.data, sh0, 8), 14);
+    var bad_bounds: of.ObjectImage;
+    val pb: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?bad_bounds);
+    if (R.is_ok[bool, str](pb) || !str_contains(R.unwrap_err[bool, str](pb), "out of bounds")) { ret 1; }
+    bin.write_u32_le(buf.data, t_find_reloc(buf.data, sh0, 14), 8);
+    val e_bad: usize = t_find_reloc(buf.data, sh0, 8);
+    bin.write_u32_le(buf.data, e_bad + 4, (original_word & 0xF9FFFFFF) | (1 << 25));
+    var bad_width: of.ObjectImage;
+    val pw: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?bad_width);
+    if (R.is_ok[bool, str](pw) || !str_contains(R.unwrap_err[bool, str](pw), "not 4 bytes")) { ret 1; }
+    bin.write_u32_le(buf.data, e_bad + 4, original_word & 0xFEFFFFFF);
+    var bad_pcrel: of.ObjectImage;
+    val pp: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?bad_pcrel);
+    if (R.is_ok[bool, str](pp) || !str_contains(R.unwrap_err[bool, str](pp), "not pc-relative")) { ret 1; }
     ret 0;
 }
 
@@ -5299,6 +5504,7 @@ fun ts_bad_input() u8 {
 # forward map, and the PAGEOFF12 instruction-decode reverse map
 test "mach.lang.target.of.macho:object_round_trip_and_reloc_maps" {
     if (ts_x64_roundtrip() != 0)         { ret 1; }
+    if (ts_x64_signed_variants() != 0)   { ret 1; }
     if (ts_relro_roundtrip() != 0)       { ret 1; }
     if (ts_arm64_roundtrip() != 0)       { ret 1; }
     if (ts_many_sections_coalesce() != 0) { ret 1; }
@@ -5561,19 +5767,43 @@ test "mach.lang.target.of.macho.emit_object:debug_dwarf_roundtrip" {
 # sect:    the 1-based section index the entry is to name
 # ret:     true when the entry was found and rewritten
 fun t_make_section_based(buf: *u8, sh: usize, address: u32, sect: u32) bool {
+    val e: usize = t_find_reloc(buf, sh, address);
+    if (e == 0) { ret false; }
+    # keep bits 24..31 except r_extern (bit 27), and replace r_symbolnum.
+    bin.write_u32_le(buf, e + 4, (bin.read_u32_le(buf, e + 4) & 0xF7000000) | sect);
+    ret true;
+}
+
+# locate a section's relocation_info entry at `address`; returns 0 when absent
+# ---
+# buf:     the Mach-O bytes
+# sh:      the section_64 entry
+# address: the in-section patch offset to find
+# ret:     the relocation_info file offset, or zero
+fun t_find_reloc(buf: *u8, sh: usize, address: u32) usize {
     val reloff: usize = bin.read_u32_le(buf, sh + 56)::usize;
     val nreloc: u32 = bin.read_u32_le(buf, sh + 60);
     var r: u32 = 0;
     for (r < nreloc) {
         val e: usize = reloff + r::usize * RELOC_INFO_SIZE;
-        if (bin.read_u32_le(buf, e) == address) {
-            # keep bits 24..31 except r_extern (bit 27), and replace r_symbolnum.
-            bin.write_u32_le(buf, e + 4, (bin.read_u32_le(buf, e + 4) & 0xF7000000) | sect);
-            ret true;
-        }
+        if (bin.read_u32_le(buf, e) == address) { ret e; }
         r = r + 1;
     }
-    ret false;
+    ret 0;
+}
+
+# rewrite one test relocation's machine type, preserving every other bit
+# ---
+# buf:     the Mach-O bytes
+# sh:      the section_64 entry owning the relocation
+# address: the in-section patch offset to find
+# r_type:  replacement X86_64_RELOC_* type
+# ret:     true when the relocation was found and rewritten
+fun t_set_reloc_type(buf: *u8, sh: usize, address: u32, r_type: u32) bool {
+    val e: usize = t_find_reloc(buf, sh, address);
+    if (e == 0) { ret false; }
+    bin.write_u32_le(buf, e + 4, (bin.read_u32_le(buf, e + 4) & 0x0FFFFFFF) | (r_type << 28));
+    ret true;
 }
 
 # the parsed relocation patching section `sec` at offset `off`, or nil
@@ -5709,6 +5939,99 @@ fun ts_section_reloc_x64() u8 {
     if (pc32.sym >= out.symbol_count)    { ret 1; }
     if (out.symbols[pc32.sym].name != anchor.name) { ret 1; }
     if (pc32.addend != 2)                { ret 1; }
+    ret 0;
+}
+
+# section-based SIGNED_N entries recover the target through the named section
+# while retaining the N-byte instruction-tail bias in the abstract addend. The
+# same target therefore becomes offsets 6-(4+1), 6-(4+2), and 6-(4+4) for the
+# three forms, and each canonical round-trip remains link-equivalent
+fun ts_section_signed_variants() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+    var text_bytes: [16]u8;
+    var data_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0; data_bytes[k] = 0; k = k + 1; }
+
+    var secs: [2]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
+    secs[1].name = t_intern(?i, ".data"); secs[1].kind = of.SK_DATA;
+    secs[1].bytes = ?data_bytes[0]; secs[1].len = 16; secs[1].align = 8;
+
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "_main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, "g"); syms[1].section = 1; syms[1].offset = 6;
+    syms[1].size = 4; syms[1].flags = of.SYM_OBJ_FLAG_OBJECT;
+
+    var relocs: [3]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_PC32;
+    relocs[0].sym = 1; relocs[0].addend = 0;
+    relocs[1].section = 0; relocs[1].offset = 4; relocs[1].kind = of.RK_PC32;
+    relocs[1].sym = 1; relocs[1].addend = 0;
+    relocs[2].section = 0; relocs[2].offset = 8; relocs[2].kind = of.RK_PC32;
+    relocs[2].sym = 1; relocs[2].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "section_signed");
+    img.sections = ?secs[0]; img.section_count = 2;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = ?relocs[0]; img.reloc_count = 3;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_secsigned");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+    val em: R.Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    val seg: usize = t_find_lc(buf.data, LC_SEGMENT_64);
+    if (seg == 0) { ret 1; }
+    val sh0: usize = seg + SEGMENT_CMD_64_SIZE;
+    val sh1: usize = sh0 + SECTION_64_SIZE;
+    val text_addr: u64 = bin.read_u64_le(buf.data, sh0 + 32);
+    val text_off: usize = bin.read_u32_le(buf.data, sh0 + 48)::usize;
+    val target: u64 = bin.read_u64_le(buf.data, sh1 + 32) + 6;
+    if (!t_make_section_based(buf.data, sh0, 0, 2)
+        || !t_make_section_based(buf.data, sh0, 4, 2)
+        || !t_make_section_based(buf.data, sh0, 8, 2)) { ret 1; }
+    if (!t_set_reloc_type(buf.data, sh0, 0, X86_64_RELOC_SIGNED_1)
+        || !t_set_reloc_type(buf.data, sh0, 4, X86_64_RELOC_SIGNED_2)
+        || !t_set_reloc_type(buf.data, sh0, 8, X86_64_RELOC_SIGNED_4)) { ret 1; }
+    bin.write_u32_le(buf.data, text_off,     (target::i64 - (text_addr + 0 + 4 + 1)::i64)::u32);
+    bin.write_u32_le(buf.data, text_off + 4, (target::i64 - (text_addr + 4 + 4 + 2)::i64)::u32);
+    bin.write_u32_le(buf.data, text_off + 8, (target::i64 - (text_addr + 8 + 4 + 4)::i64)::u32);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+    val anchor: *of.Symbol = t_sym_named(?out, t_intern(?i, "__DATA,__data"));
+    if (anchor == nil) { ret 1; }
+    val r1: *of.Relocation = t_reloc_at(?out, 0, 0);
+    val r2: *of.Relocation = t_reloc_at(?out, 0, 4);
+    val r4: *of.Relocation = t_reloc_at(?out, 0, 8);
+    if (r1 == nil || r2 == nil || r4 == nil) { ret 1; }
+    if (r1.sym >= out.symbol_count || out.symbols[r1.sym].name != anchor.name || r1.addend != 1) { ret 1; }
+    if (r2.sym >= out.symbol_count || out.symbols[r2.sym].name != anchor.name || r2.addend != 0) { ret 1; }
+    if (r4.sym >= out.symbol_count || out.symbols[r4.sym].name != anchor.name || r4.addend != -2) { ret 1; }
+
+    # An object-space PC whose `P + 4 + N + raw` calculation would wrap is
+    # rejected rather than selecting a low-address target after unsigned wrap.
+    bin.write_u64_le(buf.data, sh0 + 32, 0xFFFFFFFFFFFFFFF8);
+    var overflow: of.ObjectImage;
+    val po: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?overflow);
+    if (R.is_ok[bool, str](po) || !str_contains(R.unwrap_err[bool, str](po), "overflows address space")) { ret 1; }
     ret 0;
 }
 
@@ -5861,6 +6184,7 @@ fun ts_section_reloc_out_of_range() u8 {
 # recovering the target's in-section offset from the in-place field
 test "mach.lang.target.of.macho.parse_object:section_reloc_x64" {
     if (ts_section_reloc_x64() != 0) { ret 1; }
+    if (ts_section_signed_variants() != 0) { ret 1; }
     ret 0;
 }
 
