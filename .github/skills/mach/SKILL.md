@@ -195,6 +195,12 @@ For a bare `-l name`, every target probes `.o`/`.a`; only PE/COFF also probes
 the `.obj`/`.lib` spellings. Explicit paths retain their spelling so a format
 mismatch produces a direct diagnostic.
 
+Windows COFF inputs compiled with C/C++ `dllimport` may leave `__imp_X`
+undefined. Attribute the real export X normally; the linker strips the object
+prefix for loader lookup and points the foreign reference at X's IAT cell. A
+direct X reference and `__imp_X` share one import entry — never map `__imp_X` as
+a separate loader export.
+
 ### `val` / `var`
 
 ```mach

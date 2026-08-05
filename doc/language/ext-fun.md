@@ -87,6 +87,14 @@ under the renamed symbol within the named library.
 ext fun ws2_socket(af: i32, kind: i32, proto: i32) i64;
 ```
 
+A linked Windows COFF object compiled with C/C++ `dllimport` commonly refers to
+`__imp_X`, the address of X's Import Address Table cell, instead of calling X
+directly. The PE linker applies X's normal `#[library]` or manifest `symbols`
+attribution, emits the undecorated loader import X, and resolves the object
+reference to that IAT cell. If another object also refers to X directly, both
+spellings share one import and one IAT entry; do not declare or map `__imp_X` as
+a separate export.
+
 On a format whose loader resolves imports by global search (ELF), an import is
 not bound to a single dependency, so `library` has no effect on the emitted
 binary — the value is still validated against the link's dependencies, but every
