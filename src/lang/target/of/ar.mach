@@ -5,7 +5,7 @@
 # uid, gid, mode, decimal-ASCII size, and the `\x60\n` terminator) immediately
 # followed by `size` content bytes, padded with a single `\n` to an even
 # boundary. The reader is format-agnostic: it only frames the archive and yields
-# each ordinary member as a `(data, len)` byte slice into the original buffer.
+# each ordinary member as bounded name and payload slices into the original buffer.
 # The linker hands each slice to the active object format's `parse_object`, so an
 # archive joins the link as the same `of.ObjectImage` stream a loose `.o` does.
 #
@@ -14,9 +14,8 @@
 # archive symbol table and pull only needed members - is a deliberate non-goal
 # here; the linker already rejects only duplicate *strong* definitions, and an
 # archive's members rarely collide, so pulling all members links correctly at the
-# cost of carrying unreferenced ones. The reader skips the bookkeeping members an
-# archiver inserts (the `/` symbol directory and the `//` long-name table), since
-# those are not objects.
+# cost of carrying unreferenced ones. The reader skips the GNU and BSD bookkeeping
+# members archivers insert, since those are not objects.
 
 use std.allocator.page;
 use fs: std.filesystem;
@@ -46,16 +45,23 @@ val SIZE_OFFSET: usize = 48;
 # width of the size field, in bytes
 val SIZE_LEN:    usize = 10;
 
-# one archive member yielded by the cursor: a byte slice into the archive buffer
+# one archive member yielded by the cursor: bounded name and payload slices into
+# the archive buffer
 #
-# The slice is borrowed - it points into the caller's buffer and is valid only
-# while that buffer lives.
+# Both slices are borrowed - they point into the caller's buffer and are valid
+# only while that buffer lives. For BSD `#1/<length>` members, `name` points at
+# the body prefix and `data` begins immediately after it. For every other member,
+# `name` points at the fixed header field and `data` spans the complete body.
 # ---
-# data: pointer to the member's first content byte
-# len:  member content length in bytes
+# name:     pointer to the member name bytes
+# name_len: member name length in bytes
+# data:     pointer to the member's first payload byte
+# len:      member payload length in bytes
 pub rec Member {
-    data: *u8;
-    len:  usize;
+    name:     *u8;
+    name_len: usize;
+    data:     *u8;
+    len:      usize;
 }
 
 # the result of advancing the cursor
@@ -101,12 +107,14 @@ pub fun first_member() usize {
 # read the member header at `pos` and yield its content slice
 #
 # Parses the 60-byte header, validates the `\x60\n` terminator, decodes the
-# decimal-ASCII size, and returns the member's `(data, len)` slice plus the
-# offset of the following header (the member is padded to an even boundary).
+# decimal-ASCII size, decodes a BSD `#1/<length>` name when present, and returns
+# the member's bounded name and payload slices plus the offset of the following
+# header (the raw member body is padded to an even boundary).
 # `pos == len` is the clean end of iteration (`done` true); a truncated header,
-# missing terminator, non-numeric size, out-of-bounds body, or missing pad byte
-# is a hard stop (`ok` false). Bookkeeping members are still yielded here - the
-# caller filters them via `is_special` - so offsets stay exact.
+# missing terminator, non-numeric size, malformed or out-of-bounds extended name,
+# out-of-bounds body, or missing pad byte is a hard stop (`ok` false).
+# Bookkeeping members are still yielded here - the caller filters them via
+# `is_special` - so offsets stay exact.
 # ---
 # buf: the archive bytes
 # len: length of `buf`
@@ -114,11 +122,13 @@ pub fun first_member() usize {
 # ret: a `Step` describing the member and the next position
 pub fun next_member(buf: *u8, len: usize, pos: usize) Step {
     var step: Step;
-    step.member.data = nil;
-    step.member.len  = 0;
-    step.next        = pos;
-    step.done        = false;
-    step.ok          = true;
+    step.member.name     = nil;
+    step.member.name_len = 0;
+    step.member.data     = nil;
+    step.member.len      = 0;
+    step.next            = pos;
+    step.done            = false;
+    step.ok              = true;
 
     # exactly at the end: a clean end of iteration.
     if (pos == len) {
@@ -153,8 +163,28 @@ pub fun next_member(buf: *u8, len: usize, pos: usize) Step {
         ret step;
     }
 
-    step.member.data = (buf::usize + data_start)::*u8;
-    step.member.len  = size;
+    step.member.name     = (buf::usize + pos)::*u8;
+    step.member.name_len = inline_name_len(buf, pos);
+    step.member.data     = (buf::usize + data_start)::*u8;
+    step.member.len      = size;
+
+    # BSD stores a long member name at the start of the body and writes its byte
+    # length as `#1/<length>` in the fixed name field. The header's size covers
+    # BOTH that prefix and the object payload, so expose only the bytes after the
+    # bounded name. The raw `size` below remains the authority for padding and
+    # the following-header offset.
+    if (buf[pos] == '#' && buf[pos + 1] == '1' && buf[pos + 2] == '/') {
+        var ok_name: bool = false;
+        val name_len: usize = parse_extended_name_len(buf, pos, size, ?ok_name);
+        if (!ok_name) {
+            step.ok = false;
+            ret step;
+        }
+        step.member.name     = (buf::usize + data_start)::*u8;
+        step.member.name_len = name_len;
+        step.member.data     = (buf::usize + data_start + name_len)::*u8;
+        step.member.len      = size - name_len;
+    }
 
     # members are padded to an even boundary with a trailing `\n`; an odd-sized
     # member that runs to the very end is missing its pad - truncated.
@@ -170,47 +200,105 @@ pub fun next_member(buf: *u8, len: usize, pos: usize) Step {
     ret step;
 }
 
+# the bounded length of an inline name field after removing its space padding
+fun inline_name_len(buf: *u8, pos: usize) usize {
+    var n: usize = 16;
+    for (n > 0 && buf[pos + n - 1] == ' ') { n = n - 1; }
+    ret n;
+}
+
+# decode the decimal suffix of a BSD `#1/<length>` header name
+#
+# The suffix must contain at least one digit and only trailing spaces after the
+# digit run. Every accumulation is compared with the already-bounded raw member
+# size before multiplication, so an oversized field is rejected without integer
+# overflow and without using bytes outside the member.
+# ---
+# buf:   archive bytes
+# pos:   member-header offset
+# limit: raw member-body size
+# ok:    out - true when the suffix is numeric and does not exceed `limit`
+# ret:   decoded name-prefix length
+fun parse_extended_name_len(buf: *u8, pos: usize, limit: usize, ok: *bool) usize {
+    var value:  usize = 0;
+    var digits: usize = 0;
+    var i:      usize = 3;
+
+    for (i < 16) {
+        val c: u8 = buf[pos + i];
+        if (c == ' ') { brk; }
+        if (c < '0' || c > '9') {
+            @ok = false;
+            ret 0;
+        }
+        val digit: usize = (c - '0')::usize;
+        if (value > limit / 10 || (value == limit / 10 && digit > limit % 10)) {
+            @ok = false;
+            ret 0;
+        }
+        value  = value * 10 + digit;
+        digits = digits + 1;
+        i      = i + 1;
+    }
+
+    # once the digit run ends, the rest of the fixed field must be padding.
+    for (i < 16) {
+        if (buf[pos + i] != ' ') {
+            @ok = false;
+            ret 0;
+        }
+        i = i + 1;
+    }
+
+    @ok = digits > 0;
+    ret value;
+}
+
 # whether a member is archive bookkeeping rather than an object
 #
 # An archiver prepends a symbol directory and, under GNU ar, a long-name table;
-# neither is an object and both must be skipped. The member name is the first 16
-# header bytes, space-padded. The recognized bookkeeping names are:
+# neither is an object and both must be skipped. `next_member` has already
+# bounded the name, whether it came from the fixed field or a BSD body prefix.
+# The recognized bookkeeping names are:
 #   `/`       - GNU symbol table (`/` then spaces)
 #   `/SYM64/` - GNU 64-bit symbol table
 #   `//`      - GNU long-name table
-#   `__.SYMDEF`, `__.SYMDEF SORTED` - BSD symbol table
+#   `__.SYMDEF`, `__.SYMDEF SORTED` and `_64` variants - BSD symbol table
 # A `/<digit>` name is a long-name reference to a real object, so a `/` followed
 # by a digit is deliberately not treated as special.
 # ---
-# buf: the archive bytes
-# pos: offset of the member header
+# member: decoded archive member
 # ret: true if the member is a symbol table or long-name table
-pub fun is_special(buf: *u8, pos: usize) bool {
-    val c0: u8 = buf[pos];
-    val c1: u8 = buf[pos + 1];
-
-    if (c0 == '/') {
-        if (c1 == ' ' || c1 == '/')               { ret true; }
-        if (name_has_prefix(buf, pos, "/SYM64/")) { ret true; }
-        ret false;
-    }
-
-    # BSD symbol table, matched by its exact name prefix.
-    if (name_has_prefix(buf, pos, "__.SYMDEF")) { ret true; }
+pub fun is_special(member: Member) bool {
+    if (member_name_equals(member, "/"))                 { ret true; }
+    if (member_name_equals(member, "//"))                { ret true; }
+    if (member_name_equals(member, "/SYM64/"))           { ret true; }
+    if (member_name_equals(member, "__.SYMDEF"))          { ret true; }
+    if (member_name_equals(member, "__.SYMDEF SORTED"))   { ret true; }
+    if (member_name_equals(member, "__.SYMDEF_64"))       { ret true; }
+    if (member_name_equals(member, "__.SYMDEF_64 SORTED")) { ret true; }
     ret false;
 }
 
-# whether the member name at `pos` begins with the literal `pre`
+# whether a bounded member name exactly equals `want`
 #
-# The name occupies the first 16 header bytes; this compares only `pre`'s bytes,
-# so a longer name sharing the prefix (e.g. `__.SYMDEF SORTED`) still matches.
-# ---
-# buf: the archive bytes
-# pos: offset of the member header
-# pre: NUL-terminated prefix to test against
-# ret: true if the name begins with `pre`
-fun name_has_prefix(buf: *u8, pos: usize, pre: *u8) bool {
-    ret str_starts_with((buf::usize + pos)::str, pre::str);
+# BSD archivers round an extended name prefix up and fill the unused suffix with
+# NUL bytes. Those bytes belong to the encoded prefix length but not the logical
+# name, so trim them before comparing bookkeeping names.
+fun member_name_equals(member: Member, want: str) bool {
+    if (member.name == nil) { ret false; }
+    var actual_len: usize = member.name_len;
+    for (actual_len > 0 && member.name[actual_len - 1] == 0) {
+        actual_len = actual_len - 1;
+    }
+    val want_len: usize = str_len(want);
+    if (actual_len != want_len) { ret false; }
+    var i: usize = 0;
+    for (i < want_len) {
+        if (member.name[i] != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
 }
 
 # decode the space-padded decimal-ASCII size field at `at`
@@ -444,6 +532,132 @@ pub fun write_archive(alloc: *A.Allocator, members: *ArMember, count: u32, out_p
     ret R.ok[bool, str](true);
 }
 
+# initialize one synthetic archive member for reader tests
+fun test_member_header(buf: *u8, cap: usize, name: str, size: usize) {
+    var i: usize = 0;
+    for (i < cap) { buf[i] = 0; i = i + 1; }
+    i = 0;
+    for (i < MAGIC_LEN) { buf[i] = MAGIC[i]; i = i + 1; }
+    put_header(buf, MAGIC_LEN, size);
+    val name_len: usize = str_len(name);
+    i = 0;
+    for (i < name_len) { buf[MAGIC_LEN + i] = name[i]; i = i + 1; }
+}
+
+# whether a synthetic member is rejected when only `visible_len` bytes of its
+# backing array belong to the archive
+fun rejects_test_member(name: str, size: usize, visible_len: usize) bool {
+    var buf: [96]u8;
+    test_member_header(?buf[0], 96, name, size);
+    val step: Step = next_member(?buf[0], visible_len, first_member());
+    ret !step.ok;
+}
+
+# a BSD extended name is removed from the yielded payload while the raw member
+# size still controls odd-byte padding and the next header offset
+test "mach.lang.target.of.ar.next_member:bsd_extended_name_payload" {
+    # 8-byte encoded name + 5-byte object payload = 13-byte odd raw body.
+    var buf: [82]u8;
+    test_member_header(?buf[0], 82, "#1/8", 13);
+    val body: usize = MAGIC_LEN + HEADER_LEN;
+    buf[body + 0] = 'l'; buf[body + 1] = 'o'; buf[body + 2] = 'n';
+    buf[body + 3] = 'g'; buf[body + 4] = '.'; buf[body + 5] = 'o';
+    buf[body + 6] = 0;   buf[body + 7] = 0;
+    buf[body + 8] = 0xCF; buf[body + 9] = 0xFA; buf[body + 10] = 0xED;
+    buf[body + 11] = 0xFE; buf[body + 12] = 7;
+    buf[body + 13] = 0x0A;
+
+    val step: Step = next_member(?buf[0], 82, first_member());
+    if (!step.ok || step.done || step.next != 82) { ret 1; }
+    if (step.member.name_len != 8 || step.member.name[0] != 'l' || step.member.name[5] != 'o') { ret 1; }
+    if (step.member.len != 5 || step.member.data[0] != 0xCF || step.member.data[4] != 7) { ret 1; }
+    if (is_special(step.member)) { ret 1; }
+
+    val done: Step = next_member(?buf[0], 82, step.next);
+    if (!done.ok || !done.done) { ret 1; }
+    ret 0;
+}
+
+# Darwin encodes both BSD symbol-directory spellings through `#1/<length>`;
+# their NUL-rounded names are bookkeeping, while a long ordinary member is not
+test "mach.lang.target.of.ar.is_special:bsd_extended_symdef" {
+    var sym: [84]u8;
+    test_member_header(?sym[0], 84, "#1/12", 16);
+    val sb: usize = MAGIC_LEN + HEADER_LEN;
+    val sym_name: str = "__.SYMDEF";
+    var i: usize = 0;
+    for (i < str_len(sym_name)) { sym[sb + i] = sym_name[i]; i = i + 1; }
+    sym[sb + 12] = 1; sym[sb + 13] = 2; sym[sb + 14] = 3; sym[sb + 15] = 4;
+    val ss: Step = next_member(?sym[0], 84, first_member());
+    if (!ss.ok || ss.member.len != 4 || !is_special(ss.member)) { ret 1; }
+
+    var sorted: [90]u8;
+    test_member_header(?sorted[0], 90, "#1/20", 22);
+    val sorted_name: str = "__.SYMDEF SORTED";
+    i = 0;
+    for (i < str_len(sorted_name)) { sorted[sb + i] = sorted_name[i]; i = i + 1; }
+    sorted[sb + 20] = 5; sorted[sb + 21] = 6;
+    val so: Step = next_member(?sorted[0], 90, first_member());
+    if (!so.ok || so.member.len != 2 || !is_special(so.member)) { ret 1; }
+
+    var sorted64: [94]u8;
+    test_member_header(?sorted64[0], 94, "#1/24", 26);
+    val sorted64_name: str = "__.SYMDEF_64 SORTED";
+    i = 0;
+    for (i < str_len(sorted64_name)) { sorted64[sb + i] = sorted64_name[i]; i = i + 1; }
+    sorted64[sb + 24] = 7; sorted64[sb + 25] = 8;
+    val so64: Step = next_member(?sorted64[0], 94, first_member());
+    if (!so64.ok || so64.member.len != 2 || !is_special(so64.member)) { ret 1; }
+
+    var ordinary: [76]u8;
+    test_member_header(?ordinary[0], 76, "#1/4", 8);
+    ordinary[sb + 0] = 'x'; ordinary[sb + 1] = '.'; ordinary[sb + 2] = 'o'; ordinary[sb + 3] = 0;
+    val os: Step = next_member(?ordinary[0], 76, first_member());
+    if (!os.ok || is_special(os.member)) { ret 1; }
+
+    # Traditional BSD also permits a short, space-padded name directly in the
+    # fixed field. It remains special without using the extended-name path.
+    var short_sym: [68]u8;
+    test_member_header(?short_sym[0], 68, "__.SYMDEF", 0);
+    val shs: Step = next_member(?short_sym[0], 68, first_member());
+    if (!shs.ok || !is_special(shs.member)) { ret 1; }
+
+    var short_sym64: [68]u8;
+    test_member_header(?short_sym64[0], 68, "__.SYMDEF_64", 0);
+    val sh64: Step = next_member(?short_sym64[0], 68, first_member());
+    if (!sh64.ok || !is_special(sh64.member)) { ret 1; }
+
+    # a real member that merely shares the prefix is not a symbol directory.
+    var prefix_obj: [72]u8;
+    test_member_header(?prefix_obj[0], 72, "__.SYMDEFAULT", 4);
+    val po: Step = next_member(?prefix_obj[0], 72, first_member());
+    if (!po.ok || is_special(po.member)) { ret 1; }
+
+    # A short ordinary BSD name has no GNU `/` terminator; its payload remains
+    # untouched and its name is not mistaken for bookkeeping.
+    var short_obj: [72]u8;
+    test_member_header(?short_obj[0], 72, "short.o", 4);
+    short_obj[sb + 0] = 9; short_obj[sb + 1] = 8;
+    short_obj[sb + 2] = 7; short_obj[sb + 3] = 6;
+    val sho: Step = next_member(?short_obj[0], 72, first_member());
+    if (!sho.ok || is_special(sho.member) || sho.member.len != 4 || sho.member.data[3] != 6) { ret 1; }
+    ret 0;
+}
+
+# malformed BSD extended-name fields never escape the fixed header or raw body:
+# require digits only, reject lengths beyond the member, reject a truncated raw
+# body, and continue requiring the pad byte for odd raw sizes
+test "mach.lang.target.of.ar.next_member:bsd_extended_name_malformed" {
+    if (!rejects_test_member("#1/",                4, 72)) { ret 1; }
+    if (!rejects_test_member("#1/x",               4, 72)) { ret 1; }
+    if (!rejects_test_member("#1/1x",              4, 72)) { ret 1; }
+    if (!rejects_test_member("#1/5",               4, 72)) { ret 1; }
+    if (!rejects_test_member("#1/9999999999999",   4, 72)) { ret 1; }
+    if (!rejects_test_member("#1/4",               5, 72)) { ret 1; }
+    if (!rejects_test_member("#1/4",               5, 73)) { ret 1; }
+    ret 0;
+}
+
 # a written archive round-trips through the reader: valid magic, the `/` symbol index
 # and `//` long-name table are skipped as specials, and exactly the two object members
 # are yielded with their bytes intact - including a member whose name needs the
@@ -486,7 +700,7 @@ test "mach.lang.target.of.ar.write_roundtrip" {
         if (!step.ok) { code = 1; walking = false; }
         or (step.done) { walking = false; }
         or {
-            if (!is_special(b.data, pos)) {
+            if (!is_special(step.member)) {
                 objs = objs + 1;
                 if (step.member.len == 4 && step.member.data[0] == 1::u8 && step.member.data[3] == 4::u8) { m0_ok = true; }
                 if (step.member.len == 3 && step.member.data[0] == 9::u8 && step.member.data[2] == 7::u8) { m1_ok = true; }
