@@ -122,6 +122,22 @@ val BIGOBJ_MIN_VERSION:         u16   = 2;
 val BIGOBJ_HEADER_SIZE:         usize = 56;
 val BIGOBJ_SYMBOL_SIZE:         usize = 20;
 
+# the short import record (`IMPORT_OBJECT_HEADER`), the member an import library
+# carries instead of an object: it defines nothing and states that one symbol is
+# provided by one DLL. it opens with the SAME Sig1/Sig2 pair as /bigobj, so the
+# two are told apart by the field directly after it - a /bigobj header carries
+# Version >= BIGOBJ_MIN_VERSION, a short import record always carries 0. Version
+# is the discriminator rather than /bigobj's ClassID because it sits at a fixed
+# offset present in both shapes, so no size check has to precede the test.
+#
+# header: Sig1, Sig2, Version, Machine, TimeDateStamp, SizeOfData, OrdinalOrHint,
+# then a bitfield of Type (2 bits) and NameType (3 bits). `SizeOfData` bytes
+# follow, holding the NUL-terminated symbol name then the NUL-terminated DLL name.
+val IMPORT_OBJECT_VERSION:     u16   = 0;
+val IMPORT_OBJECT_HEADER_SIZE: usize = 20;
+val IMPORT_OBJECT_TYPE_CODE:   u16   = 0;
+val IMPORT_OBJECT_ORDINAL:     u16   = 0;
+
 # COFF file-header characteristics for a linked PE image
 val IMAGE_FILE_RELOCS_STRIPPED:     u16 = 0x0001;
 val IMAGE_FILE_EXECUTABLE_IMAGE:    u16 = 0x0002;
@@ -1588,6 +1604,112 @@ fun comdat_select_any_for_section(buf: *u8, symtab_off: usize, num_records: u32,
 # buf_size: length of `buf`
 # out:      image to populate (its arrays are allocated here)
 # ret:      ok(true) on success, or an error string
+# parse a short import record into an image that DECLARES one import
+#
+# The record is an import library's unit of content: it defines no code or data,
+# so the image carries no sections, symbols or relocations and exactly one
+# `of.ImportDecl`. That declaration is the authoritative symbol->library mapping
+# for a two-level namespace, carrying the loader's own DLL name and ordinal.
+#
+# The two NUL-terminated names live in the `SizeOfData` payload after the header,
+# symbol first then DLL. Both are bounded against the payload before being read,
+# so a truncated or hostile member errors here rather than running off the end.
+# ---
+# alloc:    allocator recorded on the image for its arrays
+# itn:      interner the two names are interned into
+# buf:      the member bytes
+# buf_size: length of `buf`
+# out:      image to populate
+# ret:      ok(true) on success, or an error string
+fun coff_parse_import_record(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8,
+                             buf_size: usize, out: *of.ObjectImage) R.Result[bool, str] {
+    if (buf_size < IMPORT_OBJECT_HEADER_SIZE) {
+        ret R.err[bool, str]("coff: import record too small");
+    }
+    if (itn == nil) { ret R.err[bool, str]("coff: no interner for parse"); }
+    if (bin.read_u16_le(buf, 6) != IMAGE_FILE_MACHINE_AMD64) {
+        ret R.err[bool, str]("coff: not an x86-64 import record");
+    }
+
+    val data_size: usize = bin.read_u32_le(buf, 12)::usize;
+    val vr: R.Result[bool, str] = bin.require_region(buf_size, IMPORT_OBJECT_HEADER_SIZE,
+        data_size, "coff: import record name data out of bounds");
+    if (R.is_err[bool, str](vr)) { ret R.err[bool, str](R.unwrap_err[bool, str](vr)); }
+
+    val hint_ord: u16 = bin.read_u16_le(buf, 16);
+    val flags:    u16 = bin.read_u16_le(buf, 18);
+
+    # the symbol name, then the DLL name, each NUL-terminated within the payload
+    val base: usize = IMPORT_OBJECT_HEADER_SIZE;
+    val limit: usize = base + data_size;
+    var sym_end: usize = base;
+    for (sym_end < limit && buf[sym_end] != 0) { sym_end = sym_end + 1; }
+    if (sym_end >= limit) { ret R.err[bool, str]("coff: import record symbol name is unterminated"); }
+    val dll_start: usize = sym_end + 1;
+    var dll_end: usize = dll_start;
+    for (dll_end < limit && buf[dll_end] != 0) { dll_end = dll_end + 1; }
+    if (dll_end >= limit) { ret R.err[bool, str]("coff: import record library name is unterminated"); }
+    if (sym_end == base)      { ret R.err[bool, str]("coff: import record has an empty symbol name"); }
+    if (dll_end == dll_start) { ret R.err[bool, str]("coff: import record has an empty library name"); }
+
+    # both names are NUL-terminated inside the payload, checked above, so each can
+    # be interned in place without copying
+    val sym_r: R.Result[intern.StrId, str] = intern.intern(itn, (?buf[base])::str);
+    if (R.is_err[intern.StrId, str](sym_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sym_r)); }
+    val dll_r: R.Result[intern.StrId, str] = intern.intern(itn, (?buf[dll_start])::str);
+    if (R.is_err[intern.StrId, str](dll_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](dll_r)); }
+
+    val ir: R.Result[*of.ImportDecl, str] = A.zallocate[of.ImportDecl](alloc, 1::usize);
+    if (R.is_err[*of.ImportDecl, str](ir)) { ret R.err[bool, str](R.unwrap_err[*of.ImportDecl, str](ir)); }
+
+    out.alloc         = alloc;
+    out.interner      = itn;
+    out.sections      = nil;
+    out.section_count = 0;
+    out.symbols       = nil;
+    out.symbol_count  = 0;
+    out.relocations   = nil;
+    out.reloc_count   = 0;
+    out.imports       = R.unwrap_ok[*of.ImportDecl, str](ir);
+    out.import_count  = 1;
+
+    out.imports[0].symbol  = R.unwrap_ok[intern.StrId, str](sym_r);
+    out.imports[0].library = R.unwrap_ok[intern.StrId, str](dll_r);
+    # NameType 0 (ORDINAL) is the only spelling that binds by ordinal; every other
+    # value names the export and the hint field is only a lookup accelerator.
+    out.imports[0].by_name = ((flags >> 2) & 0x7) != IMPORT_OBJECT_ORDINAL;
+    out.imports[0].ordinal = hint_ord;
+    out.imports[0].is_code = (flags & 0x3) == IMPORT_OBJECT_TYPE_CODE;
+    ret R.ok[bool, str](true);
+}
+
+# whether every section this object carries is an `.idata$` fragment - the shape
+# of an import library's import-directory bookkeeping members, which hold no code
+# or data of the program's own. an ordinary object never carries only these
+# ---
+# buf:          the object bytes
+# secthdr_base: offset of the section header table, already bounds-checked
+# num_secs:     number of section headers
+# ret:          true when the object is import-directory bookkeeping only
+fun coff_is_idata_bookkeeping(buf: *u8, secthdr_base: usize, num_secs: u32) bool {
+    if (num_secs == 0) { ret false; }
+    var i: u32 = 0;
+    for (i < num_secs) {
+        val off: usize = secthdr_base + i::usize * SECTION_HEADER_SIZE;
+        # the inline 8-byte name field; `.idata$<n>` always fits, so a long-name
+        # ("/nnn") indirection never spells one
+        if (buf[off]     != 0x2E) { ret false; }   # '.'
+        if (buf[off + 1] != 0x69) { ret false; }   # 'i'
+        if (buf[off + 2] != 0x64) { ret false; }   # 'd'
+        if (buf[off + 3] != 0x61) { ret false; }   # 'a'
+        if (buf[off + 4] != 0x74) { ret false; }   # 't'
+        if (buf[off + 5] != 0x61) { ret false; }   # 'a'
+        if (buf[off + 6] != 0x24) { ret false; }   # '$'
+        i = i + 1;
+    }
+    ret true;
+}
+
 fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_size: usize, out: *of.ObjectImage) R.Result[bool, str] {
     if (buf == nil || out == nil || buf_size < 4) {
         ret R.err[bool, str]("coff: object too small");
@@ -1600,7 +1722,14 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
     # tell the formats apart.
     val sig1: u16 = bin.read_u16_le(buf, 0);
     val sig2: u16 = bin.read_u16_le(buf, 2);
-    val bigobj: bool = sig1 == IMAGE_FILE_MACHINE_UNKNOWN && sig2 == BIGOBJ_SIG2;
+    val anon: bool = sig1 == IMAGE_FILE_MACHINE_UNKNOWN && sig2 == BIGOBJ_SIG2;
+
+    # an import library's member shares that signature pair; Version separates it
+    # from a /bigobj object before either header shape is otherwise read.
+    if (anon && buf_size >= 6 && bin.read_u16_le(buf, 4) == IMPORT_OBJECT_VERSION) {
+        ret coff_parse_import_record(alloc, itn, buf, buf_size, out);
+    }
+    val bigobj: bool = anon;
 
     var num_secs:     u32   = 0;
     var symtab_off:   usize = 0;
@@ -1656,6 +1785,19 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
     out.sections = nil;
     out.symbols = nil;
     out.relocations = nil;
+    out.imports = nil;
+    out.import_count = 0;
+
+    # an import library also carries the traditional import-directory construction:
+    # `.idata$` fragments wired together by ADDR32NB relocations, which a linker that
+    # merges them would assemble into the import table. mach synthesizes its whole
+    # `.idata` from the dynamic plan instead, and the short import records already
+    # carried the mapping, so those members contribute nothing and are dropped whole
+    # rather than merged into an image that would then conflict with the synthesized
+    # directory.
+    if (coff_is_idata_bookkeeping(buf, secthdr_base, num_secs)) {
+        ret R.ok[bool, str](true);
+    }
 
     # count total relocations across sections and total non-aux symbol records.
     var rel_n: u32 = 0;
