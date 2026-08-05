@@ -71,6 +71,11 @@ ext fun WSAStartup(ver: u16, data: *u8) i32;
 - An `ext` import with no `library` is unattributed. PE and Mach-O require every
   dynamic import to identify its provider, so an unattributed import is a hard
   link error on those targets.
+- A symbol with **no `ext` declaration at all** — one a linked static archive
+  leaves undefined — has nothing to decorate. Its provider is named from the
+  manifest instead, by the `symbols` key on the `[link.X]` entry that supplies
+  it; see [manifest.md](../manifest.md#linkname--link-requirements). The two
+  declarations write the same attribution, so a symbol may be claimed only once.
 
 `library` composes with `symbol`: the rename sets the imported symbol's name,
 `library` sets the dependency it is imported from. On one decl the import is emitted
