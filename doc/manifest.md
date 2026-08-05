@@ -73,6 +73,7 @@ out     = "bin/demo"                   # output path, relative to the project ou
 targets = ["*"]                        # which declared targets build it ("*" = all)
 link    = []                           # [link.X] names this artifact links
 need    = []                           # [step.X] names this artifact demands directly
+# subsystem = "gui"                    # optional: windows console/GUI selector
 
 [dep.std]                              # a dependency
 git = "https://github.com/briar-systems/mach-std"
@@ -352,6 +353,7 @@ reads the selected artifact's name.
 | `targets` | yes | Array of declared target names this artifact builds for; `["*"]` means every declared target. |
 | `link`    | yes | Array of `[link.X]` names this artifact links (see below). `[]` for none. |
 | `need`    | yes | Array of `[step.X]` names this artifact demands directly, for step outputs that are not themselves link inputs. `[]` for none. |
+| `subsystem` | no | `"console"` (default) or `"gui"` — the environment a windows executable declares it runs under (see below). |
 
 - **`bin`** links an executable at the resolved `out` path.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
@@ -362,6 +364,36 @@ reads the selected artifact's name.
 
 Per-target extension or per-target entry is not a per-cell exception table — it is a
 second artifact stanza, so the condition stays visible like everything else.
+
+### `subsystem` — the windows console/GUI selector
+
+```toml
+[artifact.game]
+kind = "bin"
+entry = "main.mach"
+out = "bin/game.exe"
+targets = ["*"]
+link = []
+need = []
+subsystem = "gui"
+```
+
+A PE executable records in its optional header which environment it wants, and the
+Windows loader honours it: `"console"` gets a console window attached to the
+process, `"gui"` does not. mach defaults to `"console"`, which is what every PE it
+has ever emitted declares, so an artifact that omits the key is byte-identical to
+one built before the key existed. A graphical application sets `"gui"` to stop an
+empty console from opening behind it on launch.
+
+The key takes no `os` filter, and it is not an error on a linux or darwin target.
+Only the PE writer consumes it — ELF, Mach-O, and flat images have no such field —
+so on any other target the key is accepted and inert, changing nothing about the
+output. That matches how `[link.X]` entries carry `os`/`isa`/`abi` axes on every
+declaration and simply do not apply to the cells they do not match: the manifest
+stays one declaration read by every build, rather than a per-platform file.
+
+`--subsystem console|gui` overrides the key for one invocation; see
+[cli.md](cli.md#mach-build).
 
 ## `[link.<name>]` — link requirements
 
@@ -378,6 +410,7 @@ the same entries, so nothing behaves differently as a dependency.
 | `name`    | shape | Library/framework name — required for `source = "system"`/`"framework"`, forbidden for `"local"`. |
 | `path`    | shape | File path — required for `source = "local"`, forbidden otherwise. A template (see below). |
 | `library` | no | Stable logical name used by `#[library("...")]`; defaults to the `[link.<name>]` table name. |
+| `symbols` | no | Array of symbol names this dependency provides, attributing imports that have no `ext` declaration to decorate (see below). Omit for none. |
 | `os`      | yes | Filter axis: a canonical `os` value, `"*"` (any), an array of values, or `[]` (none). |
 | `isa`     | yes | Filter axis over `isa`, same forms. |
 | `abi`     | yes | Filter axis over `abi`, same forms. |
@@ -402,6 +435,37 @@ compatibility. Selecting two dependencies that map the same logical name to
 different loader names in one build is an error. A logical name that equals a
 different dependency's canonical loader name is likewise rejected, so
 attribution never depends on requirement order.
+
+`symbols` names the symbols the dependency provides. On a two-level-namespace
+format (PE, Mach-O) every import must identify its provider, and `#[library]` can
+only attribute a symbol your Mach source declares. A **vendored static archive**
+leaves its own undefined references — the Win32 calls inside a `glfw3.a`, say —
+with no declaration to decorate, so the entry that provides them claims them:
+
+```toml
+[link.kernel32]
+source  = "system"
+name    = "kernel32.dll"
+library = "kernel32"
+symbols = ["Sleep", "CreateFileW", "CloseHandle"]
+os      = "windows"
+isa     = "*"
+abi     = "*"
+export  = true
+```
+
+Nothing reads a library's export table to derive this, so the claim is what makes
+cross-linking a PE from a Linux host work with no target DLL present. Claims
+travel with the entry, so `export = true` cascades them to consumers and a
+C-binding project declares them once.
+
+A symbol may be claimed only once per link: two selected entries claiming it, or a
+claim contradicting a `#[library]` decorator, is an error naming both claimants
+rather than an order-dependent win — repeating the *same* claim is fine. Listing a
+symbol twice within one entry is rejected, and so is a claim on an entry that
+resolves to a **static** input, which defines symbols rather than importing them.
+On ELF the key is accepted and validated but changes no emitted bytes, since that
+loader resolves imports by global search.
 
 Whether an input links **statically** or **dynamically** follows the resolved file
 — a loose `.o` or static `.a` links statically; ELF `.so`, Mach-O `.dylib`,
