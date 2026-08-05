@@ -1,0 +1,263 @@
+# the `#[embed(...)]` declaration pass: resolve each named file and size the
+# constant it backs
+#
+# Runs before type resolution, because a `[_]u8` annotation has no length of its
+# own and the array resolver sees a type node rather than the declaration that
+# carries the decorator. This pass reads the file's size out of the session's
+# embed cache (the driver refreshed it before sema) and records the count against
+# the annotation's node id, so the resolver finds it already there.
+#
+# It also owns the whole `#[embed]` rule set - argument shape, target kind, the
+# absence of an initializer, the element type, and the length agreement of an
+# explicitly sized annotation - rather than sharing it with the general decorator
+# validation that runs on the later body pass. Splitting the two would report the
+# same mistake from both.
+
+use std.format;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.char.char;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use std.types.string.str_region_equals;
+
+use A: std.allocator;
+use O: std.types.option;
+use R: std.types.result;
+
+use mach.lang.embed;
+use mach.lang.fe.ast;
+use mach.lang.fe.ast.decl;
+use mach.lang.fe.ast.expr;
+use atype: mach.lang.fe.ast.type;
+use mach.lang.fe.ast.id;
+use mach.lang.fe.sema.context;
+use mach.lang.fe.token;
+use mach.lang.intern;
+use mach.lang.source;
+
+# resolve the `#[embed(...)]` on decl `d`, sizing its annotation and recording the
+# file as one of this module's build inputs
+#
+# Reported failures leave the annotation unsized: the array resolver then yields
+# TYPE_ERROR for it and the declaration is skipped downstream, so one bad path
+# produces one diagnostic rather than a cascade.
+# ---
+# sc:  the context
+# did: the decorated decl's id
+# d:   the decorated decl
+# dec: the `embed` decorator
+# ret: true once handled, or an allocation error
+pub fun resolve_one(sc: *context.SemaContext, did: id.DeclId, d: *decl.Decl,
+                    dec: *decl.Decorator) R.Result[bool, str] {
+    if (!check_target(sc, d, dec)) { ret R.ok[bool, str](true); }
+
+    val opt_arg: O.Option[str] = string_arg(sc, dec);
+    if (O.is_none[str](opt_arg)) { ret R.ok[bool, str](true); }
+    val arg: str = O.unwrap[str](opt_arg);
+
+    val opt_file: O.Option[str] = module_file(sc);
+    if (O.is_none[str](opt_file)) {
+        context.report(sc, dec.name, "`embed` decorator cannot resolve a path: the declaring file has no on-disk location");
+        ret R.ok[bool, str](true);
+    }
+
+    val pr: R.Result[str, str] = embed.resolve_path(sc.s.alloc, O.unwrap[str](opt_file), arg);
+    if (R.is_err[str, str](pr)) { ret R.err[bool, str](R.unwrap_err[str, str](pr)); }
+    val resolved: str = R.unwrap_ok[str, str](pr);
+
+    val ir: R.Result[intern.StrId, str] = intern.intern(?sc.s.interner, resolved);
+    str_free(sc.s.alloc, resolved);
+    if (R.is_err[intern.StrId, str](ir)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](ir)); }
+    val path_id: intern.StrId = R.unwrap_ok[intern.StrId, str](ir);
+
+    # the path is a build input whether or not the read succeeded, so a missing
+    # asset that later appears re-semas this module instead of staying missing.
+    val rp: R.Result[bool, str] = context.record_embed_path(sc, path_id);
+    if (R.is_err[bool, str](rp)) { ret rp; }
+
+    val opt_entry: O.Option[*embed.EmbedFile] = embed.get(?sc.s.embeds, path_id);
+    if (O.is_none[*embed.EmbedFile](opt_entry)) {
+        report_path(sc, d, dec, path_id, "was not read for this build");
+        ret R.ok[bool, str](true);
+    }
+    val e: *embed.EmbedFile = O.unwrap[*embed.EmbedFile](opt_entry);
+    if (e.status != embed.EMBED_OK) {
+        report_path(sc, d, dec, path_id, e.reason);
+        ret R.ok[bool, str](true);
+    }
+
+    size_annotation(sc, did, d, dec, e.len);
+    ret R.ok[bool, str](true);
+}
+
+# check that decl `d` is a shape `#[embed]` can apply to
+#
+# The constant's storage IS the file's bytes, so a mutable binding (whose storage
+# is writable data), a foreign import (which has no storage here), and an
+# initializer (which would be a second, contradictory source for the same bytes)
+# are each refused rather than silently ranked against the file.
+# ---
+# sc:  the context
+# d:   the decorated decl
+# dec: the `embed` decorator
+# ret: true when the declaration can carry the decorator
+fun check_target(sc: *context.SemaContext, d: *decl.Decl, dec: *decl.Decorator) bool {
+    if (d.kind != decl.DECL_KIND_VAL) {
+        context.report(sc, dec.name, "`embed` decorator applies only to a `val`");
+        ret false;
+    }
+    if ((d.flags & decl.DECL_FLAG_EXT) != 0) {
+        context.report(sc, dec.name, "`embed` decorator cannot apply to an `ext` data import");
+        ret false;
+    }
+    if (d.data.bind.init != id.EXPR_NIL) {
+        context.report(sc, dec.name, "an `embed` declaration cannot also have an initializer; the file's content is the initializer");
+        ret false;
+    }
+    ret true;
+}
+
+# the decorator's sole string-literal argument, with its quotes stripped
+#
+# Escapes are not decoded, matching `#[symbol]` and `#[section]`: a path is taken
+# as written so a backslash in it stays a path separator rather than opening an
+# escape.
+# ---
+# sc:  the context
+# dec: the `embed` decorator
+# ret: some(the argument text, borrowed from the module source), or none after a
+#      reported shape error
+fun string_arg(sc: *context.SemaContext, dec: *decl.Decorator) O.Option[str] {
+    if (dec.args_len != 1) {
+        context.report(sc, dec.name, "`embed` decorator takes one string argument");
+        ret O.none[str]();
+    }
+    val opt_e: O.Option[*expr.Expr] = ast.get_expr(sc.a, sc.a.expr_ids[dec.args_start]);
+    if (O.is_none[*expr.Expr](opt_e)) { ret O.none[str](); }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](opt_e);
+    if (e.kind != expr.EXPR_KIND_LIT_STR || e.span.len < 2::usize) {
+        context.report(sc, e.span, "`embed` decorator argument must be a string literal");
+        ret O.none[str]();
+    }
+    if (e.span.len == 2::usize) {
+        context.report(sc, e.span, "`embed` decorator path must not be empty");
+        ret O.none[str]();
+    }
+
+    var inner: token.Span = e.span;
+    inner.offset = inner.offset + 1::usize;
+    inner.len    = inner.len - 2::usize;
+
+    val ir: R.Result[intern.StrId, str] = intern.intern_span(?sc.s.interner, sc.source, inner);
+    if (R.is_err[intern.StrId, str](ir)) { ret O.none[str](); }
+    ret intern.lookup(?sc.s.interner, R.unwrap_ok[intern.StrId, str](ir));
+}
+
+# the on-disk path of the module being analysed, or none when it has none
+# ---
+# sc:  the context
+# ret: some(the borrowed path), or none
+fun module_file(sc: *context.SemaContext) O.Option[str] {
+    val opt: O.Option[*source.SourceFile] = source.get(?sc.s.sources, sc.a.file_id);
+    if (O.is_none[*source.SourceFile](opt)) { ret O.none[str](); }
+    val f: *source.SourceFile = O.unwrap[*source.SourceFile](opt);
+    if (f.path == nil) { ret O.none[str](); }
+    ret O.some[str](f.path);
+}
+
+# fill in (or check) the declared array length against the file's `len` bytes
+#
+# `[_]u8` takes the count from the file. An explicitly sized `[N]u8` keeps its own
+# count and is checked against the file instead, which is how a declaration pins a
+# fixed-size asset - a boot sector, a fixed ROM image - and fails the build when
+# the asset stops being that size.
+# ---
+# sc:  the context
+# did: the decorated decl's id
+# d:   the decorated decl
+# dec: the `embed` decorator
+# len: the embedded file's byte count
+fun size_annotation(sc: *context.SemaContext, did: id.DeclId, d: *decl.Decl,
+                    dec: *decl.Decorator, len: u32) {
+    val tid: id.TypeId = d.data.bind.ty;
+    val opt_t: O.Option[*atype.Type] = ast.get_type(sc.a, tid);
+    if (O.is_none[*atype.Type](opt_t)) { ret; }
+    val t: *atype.Type = O.unwrap[*atype.Type](opt_t);
+
+    if (t.kind != atype.TYPE_KIND_ARRAY) {
+        context.report(sc, dec.name, "an `embed` declaration must be annotated `[_]u8` or `[N]u8`");
+        ret;
+    }
+    if (!is_u8_element(sc, t.data.array.element)) {
+        context.report(sc, t.span, "an `embed` declaration's element type must be `u8`");
+        ret;
+    }
+    if (t.data.array.length == id.EXPR_NIL) {
+        context.set_embed_len(sc, tid, len);
+        ret;
+    }
+
+    # an explicit length is resolved by the array resolver on the next pass, so the
+    # comparison happens there (it owns the fold); flag the node as embed-backed
+    # with the file's count so it can report a disagreement naming both.
+    context.set_embed_len(sc, tid, len);
+}
+
+# whether syntactic type node `tid` names `u8`
+#
+# Matched on the annotation as written rather than on a resolved TypeId: this pass
+# runs before type resolution, which is the whole reason it exists.
+# ---
+# sc:  the context
+# tid: the element type node
+# ret: true when the element is spelled `u8`
+fun is_u8_element(sc: *context.SemaContext, tid: id.TypeId) bool {
+    val opt_t: O.Option[*atype.Type] = ast.get_type(sc.a, tid);
+    if (O.is_none[*atype.Type](opt_t)) { ret false; }
+    val t: *atype.Type = O.unwrap[*atype.Type](opt_t);
+    if (t.kind != atype.TYPE_KIND_NAMED) { ret false; }
+    ret str_region_equals(sc.source, t.data.named.name.offset, t.data.named.name.len, "u8");
+}
+
+# report a path failure against the declaration, naming both the binding and the
+# resolved path the compiler actually tried
+# ---
+# sc:      the context
+# d:       the decorated decl
+# dec:     the `embed` decorator
+# path_id: the interned resolved path
+# reason:  why the read did not deliver bytes
+fun report_path(sc: *context.SemaContext, d: *decl.Decl, dec: *decl.Decorator,
+                path_id: intern.StrId, reason: str) {
+    val opt_p: O.Option[str] = intern.lookup(?sc.s.interner, path_id);
+    var p: str = "<unknown>";
+    if (O.is_some[str](opt_p)) { p = O.unwrap[str](opt_p); }
+
+    val name: str = span_text(sc, d.data.bind.name, "<binding>");
+    val r: R.Result[str, str] = format.sprint(sc.s.alloc, "`embed` on `{}` cannot read \"{}\": {}", name, p, reason);
+    if (R.is_err[str, str](r)) {
+        context.report(sc, dec.name, "`embed` decorator cannot read the file it names");
+        ret;
+    }
+    val msg: str = R.unwrap_ok[str, str](r);
+    context.report(sc, dec.name, msg);
+    A.deallocate[char](sc.s.alloc, msg, str_len(msg) + 1);
+}
+
+# the source text `span` covers, interned so it outlives this frame
+# ---
+# sc:       the context
+# span:     the span to read
+# fallback: text to return when interning is impossible
+# ret:      the interned text, or `fallback`
+fun span_text(sc: *context.SemaContext, span: token.Span, fallback: str) str {
+    val ir: R.Result[intern.StrId, str] = intern.intern_span(?sc.s.interner, sc.source, span);
+    if (R.is_err[intern.StrId, str](ir)) { ret fallback; }
+    val opt: O.Option[str] = intern.lookup(?sc.s.interner, R.unwrap_ok[intern.StrId, str](ir));
+    if (O.is_none[str](opt)) { ret fallback; }
+    ret O.unwrap[str](opt);
+}
