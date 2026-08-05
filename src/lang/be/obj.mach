@@ -149,6 +149,166 @@ pub fun add_relocation(o: *of.ObjectImage, rel: of.Relocation) R.Result[bool, st
     ret R.ok[bool, str](true);
 }
 
+# the index of the image symbol named `name`, or `of.SYMBOL_NONE` when the image
+# carries no such symbol
+#
+# Only sound on an image whose symbol names are unique, which every image this
+# builder assembles is: the back end names each function, global, and extern
+# once. A parsed foreign image is not searched this way - its relocations already
+# carry indices, and its section symbols share the empty name (#2520).
+# ---
+# o:    the image whose symbol table is searched
+# name: the interned symbol name to find
+# ret:  the symbol's index, or of.SYMBOL_NONE
+pub fun symbol_index(o: *of.ObjectImage, name: intern.StrId) u32 {
+    if (name == intern.STR_NIL) { ret of.SYMBOL_NONE; }
+    var i: u32 = 0;
+    for (i < o.symbol_count) {
+        if (o.symbols[i].name == name) { ret i; }
+        i = i + 1;
+    }
+    ret of.SYMBOL_NONE;
+}
+
+# one relocation recorded before its target symbol is known to the image
+# ---
+# section:      index of the section being patched
+# offset:       byte offset of the patch site within that section
+# kind:         abstract relocation kind (one of of.RK_*)
+# name:         interned name of the target symbol
+# addend:       constant added to the resolved symbol address
+# extern_flags: the symbol flags the target is declared with when no pass in this
+#               image ever defines it
+pub rec DeferredReloc {
+    section:      u32;
+    offset:       u32;
+    kind:         of.RelocKind;
+    name:         intern.StrId;
+    addend:       i64;
+    extern_flags: u32;
+}
+
+# relocations awaiting a complete symbol table
+#
+# `of.Relocation` binds its target by symbol index, but the back end emits
+# relocations before the pass that defines their targets has run - a global's
+# aggregate initializer can point at a global packed later in the same pass. The
+# relocations therefore accumulate here by name and bind in one pass once every
+# defining pass has run, which is also the point at which a target that is still
+# undeclared is known to be genuinely external.
+# ---
+# alloc: allocator backing `items`
+# items: the recorded relocations, `count` of them in `cap` slots
+# count: number of recorded relocations
+# cap:   allocated slot count
+pub rec DeferredRelocs {
+    alloc: *A.Allocator;
+    items: *DeferredReloc;
+    count: u32;
+    cap:   u32;
+}
+
+# an empty deferred-relocation list; allocates nothing until the first record
+# ---
+# a:   allocator every growth of the list draws from
+# ret: the empty list
+pub fun deferred_init(a: *A.Allocator) DeferredRelocs {
+    var d: DeferredRelocs;
+    d.alloc = a;
+    d.items = nil;
+    d.count = 0;
+    d.cap   = 0;
+    ret d;
+}
+
+# release the list's storage and reset it to empty
+# ---
+# d: the list to tear down
+pub fun deferred_dnit(d: *DeferredRelocs) {
+    if (d.items != nil && d.cap > 0) {
+        A.deallocate[DeferredReloc](d.alloc, d.items, d.cap::usize);
+    }
+    d.items = nil;
+    d.count = 0;
+    d.cap   = 0;
+}
+
+# record one relocation to bind later, growing the list by doubling
+# ---
+# d:   the list to record into
+# rec: the relocation to record
+# ret: true on success, or an allocation error
+pub fun defer_relocation(d: *DeferredRelocs, rec: DeferredReloc) R.Result[bool, str] {
+    if (d.count == d.cap) {
+        var next: u32 = 8;
+        if (d.cap > 0) { next = d.cap * 2; }
+        var grown: *DeferredReloc = nil;
+        if (d.items == nil) {
+            val ar: R.Result[*DeferredReloc, str] = A.allocate[DeferredReloc](d.alloc, next::usize);
+            if (R.is_err[*DeferredReloc, str](ar)) { ret R.err[bool, str](R.unwrap_err[*DeferredReloc, str](ar)); }
+            grown = R.unwrap_ok[*DeferredReloc, str](ar);
+        }
+        or {
+            val rr: R.Result[*DeferredReloc, str] =
+                A.reallocate[DeferredReloc](d.alloc, d.items, d.cap::usize, next::usize);
+            if (R.is_err[*DeferredReloc, str](rr)) { ret R.err[bool, str](R.unwrap_err[*DeferredReloc, str](rr)); }
+            grown = R.unwrap_ok[*DeferredReloc, str](rr);
+        }
+        d.items = grown;
+        d.cap   = next;
+    }
+    d.items[d.count] = rec;
+    d.count = d.count + 1;
+    ret R.ok[bool, str](true);
+}
+
+# bind every recorded relocation onto the image and clear the list
+#
+# A target the image already carries binds to that symbol's index. A target it
+# does not is declared as an undefined external from the record's `extern_flags`
+# and bound to the new entry, so a relocation never reaches the writer pointing
+# at a symbol the image does not hold. A record with no target name is a producer
+# bug and is rejected rather than bound to symbol 0.
+# ---
+# o:   the image the relocations are appended to
+# d:   the recorded relocations; emptied on success
+# ret: true once every record is bound, or the first error
+pub fun flush_deferred(o: *of.ObjectImage, d: *DeferredRelocs) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < d.count) {
+        val pend: *DeferredReloc = ?d.items[i];
+        if (pend.name == intern.STR_NIL) {
+            ret R.err[bool, str]("codegen: relocation has no target symbol");
+        }
+
+        var sym_ix: u32 = symbol_index(o, pend.name);
+        if (sym_ix == of.SYMBOL_NONE) {
+            var ext: of.Symbol;
+            ext.name    = pend.name;
+            ext.section = of.SECTION_EXTERNAL;
+            ext.offset  = 0;
+            ext.size    = 0;
+            ext.flags   = pend.extern_flags;
+            val sa: R.Result[u32, str] = add_symbol(o, ext);
+            if (R.is_err[u32, str](sa)) { ret R.err[bool, str](R.unwrap_err[u32, str](sa)); }
+            sym_ix = R.unwrap_ok[u32, str](sa);
+        }
+
+        var rel: of.Relocation;
+        rel.section = pend.section;
+        rel.offset  = pend.offset;
+        rel.kind    = pend.kind;
+        rel.sym     = sym_ix;
+        rel.addend  = pend.addend;
+        val ar: R.Result[bool, str] = add_relocation(o, rel);
+        if (R.is_err[bool, str](ar)) { ret R.err[bool, str](R.unwrap_err[bool, str](ar)); }
+
+        i = i + 1;
+    }
+    d.count = 0;
+    ret R.ok[bool, str](true);
+}
+
 # map a name id from a child interner's id space into its base's id space
 #
 # Ids below `base_len` are already base ids and pass through; ids at or above it
@@ -171,9 +331,10 @@ fun remap_name(id: intern.StrId, base_len: usize, remap: *intern.StrId) intern.S
 #
 # A parallel-codegen worker builds its module's image in a private arena against a
 # child interner; this re-homes that image onto the destination (session)
-# allocator and rewrites its four name fields - the image name, each section name,
-# each symbol name, and each relocation's target symbol - through `remap` so they
-# resolve against the shared interner the linker keys on. Section byte buffers are
+# allocator and rewrites its three name fields - the image name, each section name,
+# and each symbol name - through `remap` so they resolve against the shared
+# interner the linker keys on. A relocation carries a symbol index rather than a
+# name, and the copy preserves symbol positions, so it needs no remap. Section byte buffers are
 # copied verbatim (they encode no interned ids - only self-contained bytes and
 # per-section offsets), so the re-homed image is byte-for-byte what a serial build
 # would have produced. The source image is left intact for the caller to free with
@@ -233,13 +394,9 @@ pub fun rehome_remap(dst_alloc: *A.Allocator, dst_interner: *intern.Interner,
         val rr: R.Result[*of.Relocation, str] = A.allocate[of.Relocation](dst_alloc, src.reloc_count::usize);
         if (R.is_err[*of.Relocation, str](rr)) { dnit(?img); ret R.err[of.ObjectImage, str](R.unwrap_err[*of.Relocation, str](rr)); }
         img.relocations = R.unwrap_ok[*of.Relocation, str](rr);
-        var i: u32 = 0;
-        for (i < src.reloc_count) {
-            var rel: of.Relocation = src.relocations[i];
-            rel.symbol = remap_name(src.relocations[i].symbol, base_len, remap);
-            img.relocations[i] = rel;
-            i = i + 1;
-        }
+        # a relocation's target is a symbol index into this same image, which the
+        # copy preserves position-for-position, so nothing about it is remapped.
+        memory.copy[of.Relocation](img.relocations, src.relocations, src.reloc_count::usize);
         img.reloc_count = src.reloc_count;
     }
 
@@ -333,7 +490,7 @@ fun t_debug_produce(img: *of.ObjectImage) R.Result[bool, str] {
     rel.section = sec_idx;
     rel.offset  = 0;
     rel.kind    = of.RK_ABS32;
-    rel.symbol  = sym.name;
+    rel.sym     = R.unwrap_ok[u32, str](yr);
     rel.addend  = 0;
     ret add_relocation(img, rel);
 }
