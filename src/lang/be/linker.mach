@@ -221,6 +221,27 @@ rec DynState {
     active:      bool;
 }
 
+# one deduplicated in-image GOT slot. Object-private targets key on their exact
+# module/symbol pair; externally visible targets key on the effective global name
+# after weak-fallback resolution. The slot lives in the merged RELRO section.
+rec LocalGotSlot {
+    module:      u32;
+    symbol:      u32;
+    name:        intern.StrId;
+    offset:      u32;
+    vaddr:       u64;
+    local:       bool;
+    initialized: bool;
+}
+
+# transient plan for GOT slots whose target is defined by the linked inputs.
+# Imported targets remain writer-owned and never enter this array.
+rec LocalGotPlan {
+    slots: *LocalGotSlot;
+    count: u32;
+    cap:   u32;
+}
+
 # the deduped `.debug_str` string table and the map from an interned string to its
 # byte offset within it, built once per link before section accumulation. every
 # module's `.debug_str` holds the same names redundantly (10k unique of ~38k on a
@@ -594,6 +615,8 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
                       subsystem: of.Subsystem,
                       pre_atoms: *AtomPlan) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
+    var local_got: LocalGotPlan;
+    init_local_got_plan(?local_got);
     # a shared object is always position-independent: the loader maps it at an
     # arbitrary base and slides its in-image absolute pointers, so it takes the same
     # PIE-relative layout and base-relocation collection as a PIE executable.
@@ -769,9 +792,43 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
         collect_symbols(s, modules, module_count, placements, sec_base, ?sym_locs,
                         assign_vaddrs, ?atoms);
     if (R.is_err[bool, str](collect_r)) {
+        free_local_got_plan(alloc, ?local_got);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
         free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[bool, str](collect_r));
+    }
+
+    # a final x86_64 image retains one real, deduplicated GOT slot for each
+    # in-graph target referenced through GOT_LOAD/GOT. Reserving it now changes the
+    # RELRO span, so virtual addresses and the symbol table are recomputed once
+    # after the exact slot set is known.
+    if ((mode == LINK_EXE || shared) && tgt.isa.id == isa.ARCH_X86_64) {
+        val gp_r: R.Result[bool, str] = build_local_got_plan(
+            s, modules, module_count, ?sym_locs, sec_base, ?atoms,
+            merged, ?local_got);
+        if (R.is_err[bool, str](gp_r)) {
+            free_local_got_plan(alloc, ?local_got);
+            map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+            free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms);
+            ret R.err[bool, str](R.unwrap_err[bool, str](gp_r));
+        }
+        if (local_got.count > 0) {
+            assign_section_vaddrs(tgt, merged, position_independent);
+            finalize_placement_vaddrs(merged, placements, sec_total);
+            finalize_local_got_vaddrs(merged, ?local_got);
+
+            map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+            sym_locs = map.init[intern.StrId, SymbolLoc](alloc, map.hash_u32, map.eq_u32);
+            val recollect: R.Result[bool, str] = collect_symbols(
+                s, modules, module_count, placements, sec_base, ?sym_locs,
+                assign_vaddrs, ?atoms);
+            if (R.is_err[bool, str](recollect)) {
+                free_local_got_plan(alloc, ?local_got);
+                map.dnit[intern.StrId, SymbolLoc](?sym_locs);
+                free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms);
+                ret R.err[bool, str](R.unwrap_err[bool, str](recollect));
+            }
+        }
     }
 
     # A final executable uses the dynamic writer for explicit dependencies, PIE,
@@ -788,6 +845,7 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
     var out_img: of.ObjectImage;
     val img_r: R.Result[of.ObjectImage, str] = obj.init(alloc, ?s.interner, image_name(modules, module_count));
     if (R.is_err[of.ObjectImage, str](img_r)) {
+        free_local_got_plan(alloc, ?local_got);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
         free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[of.ObjectImage, str](img_r));
@@ -799,6 +857,7 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
     val mto_r: R.Result[*u32, str] = A.zallocate[u32](alloc, merged_count::usize);
     if (R.is_err[*u32, str](mto_r)) {
         obj.dnit(?out_img);
+        free_local_got_plan(alloc, ?local_got);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
         free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[*u32, str](mto_r));
@@ -810,6 +869,7 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
                            placements, sec_base, merged_to_out, sym_base, sym_out, ?strm, ?atoms);
     if (R.is_err[bool, str](build_r)) {
         obj.dnit(?out_img);
+        free_local_got_plan(alloc, ?local_got);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
         free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[bool, str](build_r));
@@ -837,6 +897,7 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
             if (R.is_err[bool, str](dr)) {
                 free_dynstate(alloc, ?dyn);
                 obj.dnit(?out_img);
+                free_local_got_plan(alloc, ?local_got);
                 map.dnit[intern.StrId, SymbolLoc](?sym_locs);
                 free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms);
                 ret R.err[bool, str](R.unwrap_err[bool, str](dr));
@@ -846,11 +907,12 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
         val patch_r: R.Result[bool, str] =
             patch_relocations(s, ?out_img, modules, module_count, codegen_count,
                               placements, sec_base, merged_to_out, ?sym_locs,
-                              ?dyn, ?strm, tgt.of,
+                              ?dyn, ?local_got, ?strm, tgt.of,
                               tgt.isa, os_base_addr(tgt), ?atoms);
         if (R.is_err[bool, str](patch_r)) {
             free_dynstate(alloc, ?dyn);
             obj.dnit(?out_img);
+            free_local_got_plan(alloc, ?local_got);
             map.dnit[intern.StrId, SymbolLoc](?sym_locs);
             free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms);
             ret R.err[bool, str](R.unwrap_err[bool, str](patch_r));
@@ -869,6 +931,7 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
 
         free_dynstate(alloc, ?dyn);
         obj.dnit(?out_img);
+        free_local_got_plan(alloc, ?local_got);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
         free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms);
 
@@ -885,6 +948,7 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
                           sym_base, sym_out);
     if (R.is_err[bool, str](carry_r)) {
         obj.dnit(?out_img);
+        free_local_got_plan(alloc, ?local_got);
         map.dnit[intern.StrId, SymbolLoc](?sym_locs);
         free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[bool, str](carry_r));
@@ -893,6 +957,7 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
     val obj_r: R.Result[bool, str] = obj.emit(?out_img, tgt, out_path);
 
     obj.dnit(?out_img);
+    free_local_got_plan(alloc, ?local_got);
     map.dnit[intern.StrId, SymbolLoc](?sym_locs);
     free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms);
 
@@ -3468,6 +3533,7 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
 # merged_to_out: per-merged-slot output-section index (from build_merged_image)
 # sym_locs:      the global symbol table, for GLOBAL/extern target resolution
 # dyn:           dynamic-link state; out - collects deferred import fixups
+# local_got:     defined-symbol GOT plan; out - initializes each slot once
 # strm:          the deduped .debug_str table, for strp remap (inactive to skip)
 # format:        active object-format vtable, owning final executable-section layout
 # arch:          active instruction-set vtable, owning the relocation packer
@@ -3477,13 +3543,14 @@ fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
                      modules: *of.ObjectImage, module_count: u32, codegen_count: u32,
                      placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                      sym_locs: *map.Map[intern.StrId, SymbolLoc],
-                     dyn: *DynState, strm: *StrMerge, format: *of.OfVTable,
+                     dyn: *DynState, local_got: *LocalGotPlan,
+                     strm: *StrMerge, format: *of.OfVTable,
                      arch: *isa.IsaVTable,
                      image_base: u64, atoms: *AtomPlan) R.Result[bool, str] {
     var m: u32 = 0;
     for (m < module_count) {
         val pr: R.Result[bool, str] = patch_module_relocations(s, out_img, modules, m,
-            placements, sec_base, merged_to_out, sym_locs, dyn, strm,
+            placements, sec_base, merged_to_out, sym_locs, dyn, local_got, strm,
             format, arch, image_base, m < codegen_count, atoms);
         if (R.is_err[bool, str](pr)) { ret R.err[bool, str](R.unwrap_err[bool, str](pr)); }
 
@@ -3560,6 +3627,7 @@ fun module_weak_function_is_dead(modules: *of.ObjectImage, m: u32, name: intern.
 # merged_to_out: per-merged-slot output-section index (from build_merged_image)
 # sym_locs:      the global symbol table, for GLOBAL/extern target resolution
 # dyn:           dynamic-link state; out - collects deferred import fixups
+# local_got:     defined-symbol GOT plan; out - initializes each slot once
 # strm:          the deduped .debug_str table, for strp remap (inactive to skip)
 # format:        active object-format vtable, owning import aliases and final sections
 # arch:          active instruction-set vtable, owning the relocation packer
@@ -3570,7 +3638,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                              modules: *of.ObjectImage, m: u32,
                              placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                              sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState,
-                             strm: *StrMerge, format: *of.OfVTable,
+                             local_got: *LocalGotPlan, strm: *StrMerge, format: *of.OfVTable,
                              arch: *isa.IsaVTable, image_base: u64, codegen_image: bool,
                              atoms: *AtomPlan) R.Result[bool, str] {
     # locate module m's .debug_str section once: a strp relocation is exactly one
@@ -3729,8 +3797,8 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
             or {
                 # not defined anywhere: a dynamic import, or a hard error. a
                 # pc-relative call to a FUNCTION import is deferred to the writer as
-                # a PLT fixup; a GOT-indirect access to a DATA import is deferred as
-                # a GOT fixup (the writer builds its GOT slot + GLOB_DAT). any other
+                # a PLT fixup; a GOT-indirect import access is deferred as a GOT fixup
+                # whose writer-owned slot dyld binds. any other
                 # unresolved reference - a call against a data import, an absolute
                 # reference to any import - is rejected as undefined.
                 val cn_r: R.Result[ImportName, str] =
@@ -3761,8 +3829,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                     if (R.is_err[bool, str](rec_r)) { ret R.err[bool, str](R.unwrap_err[bool, str](rec_r)); }
                     ri = ri + 1; cnt;
                 }
-                if (R.is_ok[u32, str](imp) && is_got_kind(r.kind)
-                    && !dynstate_import_is_func(dyn, R.unwrap_ok[u32, str](imp))) {
+                if (R.is_ok[u32, str](imp) && is_got_kind(r.kind)) {
                     val rec_g: R.Result[bool, str] = dynstate_add_import_addr_fixup(s, dyn,
                         segment_index_for(out_img, out_ix), patch_off,
                         R.unwrap_ok[u32, str](imp), patch_va, r.kind, r.addend);
@@ -3771,6 +3838,61 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                 }
                 ret R.err[bool, str](undef_message(s, resolved_name));
             }
+        }
+
+        # a defined x86_64 GOT target is represented by one real pointer cell in
+        # RELRO. initialize that cell once, record its PIE rebase once, then patch
+        # every reference to the cell's address. the symbol itself is deliberately
+        # not substituted at the use site: both GOT_LOAD and GOT expect indirection.
+        if (is_x64_got_kind(r.kind)) {
+            val local: bool = target.section != of.SECTION_EXTERNAL
+                && (target.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0;
+            var effective: intern.StrId = target_name;
+            if (!local) {
+                val er: R.Result[intern.StrId, str] =
+                    resolved_symbol_name(sym_locs, target_name);
+                if (R.is_err[intern.StrId, str](er)) {
+                    ret R.err[bool, str](R.unwrap_err[intern.StrId, str](er));
+                }
+                effective = R.unwrap_ok[intern.StrId, str](er);
+            }
+            val slot_i: u32 = local_got_slot_index(
+                local_got, m, r.sym, effective, local);
+            if (slot_i == 0xFFFFFFFF) {
+                ret R.err[bool, str]("linker: defined GOT target has no synthesized slot");
+            }
+            val got_out: u32 = merged_to_out[of.SK_RELRO::u32];
+            if (got_out == 0xFFFFFFFF || got_out >= out_img.section_count
+                || out_img.sections[got_out].bytes == nil) {
+                ret R.err[bool, str]("linker: synthesized GOT has no RELRO output section");
+            }
+            val slot: *LocalGotSlot = ?local_got.slots[slot_i];
+            if (slot.offset::u64 + 8 > out_img.sections[got_out].len::u64) {
+                ret R.err[bool, str]("linker: synthesized GOT slot is outside RELRO");
+            }
+            if (!slot.initialized) {
+                bin.write_u64_le(out_img.sections[got_out].bytes,
+                                 slot.offset::usize, resolved.vaddr);
+                if (dyn.info.pie) {
+                    val br: R.Result[bool, str] = dynstate_add_base_reloc(
+                        s, dyn, segment_index_for(out_img, got_out),
+                        slot.offset, resolved.vaddr);
+                    if (R.is_err[bool, str](br)) {
+                        ret R.err[bool, str](R.unwrap_err[bool, str](br));
+                    }
+                }
+                slot.initialized = true;
+            }
+            val got_section: of.ExecutableSectionLocation = final_section_location_for(
+                format, image_base, out_img, got_out, slot.vaddr - slot.offset::u64);
+            val gr: R.Result[bool, str] = apply_one(
+                s, r.kind, dst, patch_off, out_img.sections[out_ix].len,
+                rel.target(slot.vaddr, got_section.vaddr, got_section.ordinal),
+                r.addend, patch_va, target_name, arch, image_base);
+            if (R.is_err[bool, str](gr)) {
+                ret R.err[bool, str](R.unwrap_err[bool, str](gr));
+            }
+            ri = ri + 1; cnt;
         }
 
         val pr: R.Result[bool, str] =
@@ -4265,10 +4387,9 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             or {
                 dyn.info.imports[idx].lib_index = of.DYNLIB_ANY;
             }
-            # a function import gets a PLT call-thunk; a data import (no FUNCTION
-            # flag) is recorded but not yet bound - its abs reference still hits
-            # the undefined-symbol error in patch_relocations, since data imports
-            # (GLOB_DAT) are deferred.
+            # a function import gets a PLT call-thunk. any function or data import
+            # referenced through a supported GOT relocation gets a bound pointer
+            # slot later, while unsupported absolute references remain errors.
             dyn.info.imports[idx].is_func = !cn.indirect
                 && (((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0)
                     || has_call_reloc(modules, module_count, cn.canonical,
@@ -5030,14 +5151,163 @@ fun is_call_kind(kind: of.RelocKind) bool {
     ret kind == of.RK_PC32 || kind == of.RK_PLT32;
 }
 
-# whether an abstract relocation kind is a GOT-indirect address load - the shape
-# an imported-data reference lowers to (#2026). a GOT-kind reloc against a data
-# import is resolved to the import's GOT slot by the writer, not patched here
+# whether an abstract relocation kind is a GOT-indirect address load. a GOT-kind
+# relocation against an import is resolved to the writer-owned slot, not patched
+# here; a defined x86_64 target uses a linker-synthesized RELRO slot
 # ---
 # kind: the abstract relocation kind to test
 # ret:  true for a GOT-indirect kind (aarch64 page21/lo12 pair, x86_64 GOTPCREL)
 fun is_got_kind(kind: of.RelocKind) bool {
-    ret kind == of.RK_GOT_PAGE21 || kind == of.RK_GOT_LO12 || kind == of.RK_GOTPCREL;
+    ret kind == of.RK_GOT_PAGE21 || kind == of.RK_GOT_LO12
+        || kind == of.RK_GOTPCREL || kind == of.RK_GOTPCREL_NORELAX
+        || kind == of.RK_GOTPCREL64_NORELAX;
+}
+
+# whether a relocation is one of x86_64's single-field GOT references. The
+# aarch64 page/lo12 pair remains writer-owned for imports and is not synthesized
+# into this plan.
+fun is_x64_got_kind(kind: of.RelocKind) bool {
+    ret kind == of.RK_GOTPCREL || kind == of.RK_GOTPCREL_NORELAX
+        || kind == of.RK_GOTPCREL64_NORELAX;
+}
+
+# reset a local GOT plan to its empty, allocation-free state
+fun init_local_got_plan(plan: *LocalGotPlan) {
+    plan.slots = nil;
+    plan.count = 0;
+    plan.cap = 0;
+}
+
+# release a local GOT plan's slot array
+fun free_local_got_plan(alloc: *A.Allocator, plan: *LocalGotPlan) {
+    if (plan.slots != nil && plan.cap > 0) {
+        A.deallocate[LocalGotSlot](alloc, plan.slots, plan.cap::usize);
+    }
+    init_local_got_plan(plan);
+}
+
+# find a slot by its local module/symbol identity or effective global name
+fun local_got_slot_index(plan: *LocalGotPlan, module: u32, symbol: u32,
+                         name: intern.StrId, local: bool) u32 {
+    var i: u32 = 0;
+    for (i < plan.count) {
+        if (plan.slots[i].local == local) {
+            if (local && plan.slots[i].module == module && plan.slots[i].symbol == symbol) { ret i; }
+            if (!local && plan.slots[i].name == name) { ret i; }
+        }
+        i = i + 1;
+    }
+    ret 0xFFFFFFFF;
+}
+
+# append one unique defined-symbol GOT slot, growing the plan geometrically
+fun local_got_add(s: *session.Session, plan: *LocalGotPlan,
+                  module: u32, symbol: u32, name: intern.StrId,
+                  local: bool) R.Result[bool, str] {
+    if (local_got_slot_index(plan, module, symbol, name, local) != 0xFFFFFFFF) {
+        ret R.ok[bool, str](true);
+    }
+    if (plan.count == plan.cap) {
+        if (plan.cap > 0x7FFFFFFF) {
+            ret R.err[bool, str]("linker: synthesized GOT slot count overflow");
+        }
+        var next: u32 = plan.cap * 2;
+        if (next == 0) { next = 8; }
+        val gr: R.Result[*LocalGotSlot, str] = A.reallocate[LocalGotSlot](
+            s.alloc, plan.slots, plan.cap::usize, next::usize);
+        if (R.is_err[*LocalGotSlot, str](gr)) {
+            ret R.err[bool, str](R.unwrap_err[*LocalGotSlot, str](gr));
+        }
+        plan.slots = R.unwrap_ok[*LocalGotSlot, str](gr);
+        plan.cap = next;
+    }
+    val i: u32 = plan.count;
+    plan.slots[i].module = module;
+    plan.slots[i].symbol = symbol;
+    plan.slots[i].name = name;
+    plan.slots[i].offset = 0;
+    plan.slots[i].vaddr = 0;
+    plan.slots[i].local = local;
+    plan.slots[i].initialized = false;
+    plan.count = i + 1;
+    ret R.ok[bool, str](true);
+}
+
+# discover every live x86_64 GOT reference whose effective target is defined in
+# the input graph, deduplicate it, and reserve one pointer-sized cell per target
+# at the end of the merged RELRO section. Undefined targets are dynamic imports;
+# their slots remain owned by the executable writer.
+fun build_local_got_plan(s: *session.Session, modules: *of.ObjectImage,
+                         module_count: u32, sym_locs: *map.Map[intern.StrId, SymbolLoc],
+                         sec_base: *u32, atoms: *AtomPlan,
+                         merged: *MergedSection, plan: *LocalGotPlan) R.Result[bool, str] {
+    var m: u32 = 0;
+    for (m < module_count) {
+        var ri: u32 = 0;
+        for (ri < modules[m].reloc_count) {
+            val r: *of.Relocation = ?modules[m].relocations[ri];
+            if (!is_x64_got_kind(r.kind)
+                || !reloc_source_live(modules, m, r, sec_base, atoms)
+                || r.sym >= modules[m].symbol_count) {
+                ri = ri + 1; cnt;
+            }
+            val target: *of.Symbol = ?modules[m].symbols[r.sym];
+            if (target.section != of.SECTION_EXTERNAL
+                && target.section >= modules[m].section_count) {
+                ri = ri + 1; cnt;
+            }
+            val local: bool = target.section != of.SECTION_EXTERNAL
+                && (target.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0;
+            var effective: intern.StrId = target.name;
+            if (!local) {
+                val rr: R.Result[intern.StrId, str] =
+                    resolved_symbol_name(sym_locs, target.name);
+                if (R.is_err[intern.StrId, str](rr)) {
+                    ret R.err[bool, str](R.unwrap_err[intern.StrId, str](rr));
+                }
+                effective = R.unwrap_ok[intern.StrId, str](rr);
+                if (R.is_err[*SymbolLoc, str](
+                        map.get[intern.StrId, SymbolLoc](sym_locs, ?effective))) {
+                    ri = ri + 1; cnt;
+                }
+            }
+            val ar: R.Result[bool, str] =
+                local_got_add(s, plan, m, r.sym, effective, local);
+            if (R.is_err[bool, str](ar)) {
+                ret R.err[bool, str](R.unwrap_err[bool, str](ar));
+            }
+            ri = ri + 1;
+        }
+        m = m + 1;
+    }
+    if (plan.count == 0) { ret R.ok[bool, str](true); }
+
+    val relro: u32 = of.SK_RELRO::u32;
+    val start: u64 = bin.align_up_u64(merged[relro].len::u64, 8);
+    val end: u64 = start + plan.count::u64 * 8;
+    if (end > 0xFFFFFFFF) {
+        ret R.err[bool, str]("linker: synthesized GOT exceeds the maximum section size");
+    }
+    var i: u32 = 0;
+    for (i < plan.count) {
+        plan.slots[i].offset = (start + i::u64 * 8)::u32;
+        i = i + 1;
+    }
+    merged[relro].used = true;
+    if (merged[relro].align < 8) { merged[relro].align = 8; }
+    merged[relro].len = end::u32;
+    ret R.ok[bool, str](true);
+}
+
+# fill every planned slot's final virtual address after the RELRO reservation has
+# been included in the section layout
+fun finalize_local_got_vaddrs(merged: *MergedSection, plan: *LocalGotPlan) {
+    val base: u64 = merged[of.SK_RELRO::u32].vaddr;
+    var i: u32 = 0;
+    for (i < plan.count) {
+        plan.slots[i].vaddr = base + plan.slots[i].offset::u64;
+        i = i + 1;
+    }
 }
 
 # the load-segment index a merged output section maps to in the
@@ -8428,6 +8698,78 @@ test "mach.lang.be.linker.dynstate_add_import_addr_fixup:preserves_addend" {
         || dyn.info.import_addr_fixups[0].addend != -4) { ret 1; }
 
     free_dynstate(?alloc, ?dyn);
+    session.dnit(?s);
+    ret 0;
+}
+
+# repeated GOT_LOAD/GOT32/GOT64 references to one effective global target reserve
+# exactly one aligned RELRO cell, whose virtual address follows the final layout
+test "mach.lang.be.linker.local_got_plan:deduplicates_effective_target" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val target_name: intern.StrId = lt_name(?s, "got_target");
+    val text_name: intern.StrId = lt_name(?s, ".text");
+    if (target_name == intern.STR_NIL || text_name == intern.STR_NIL) { ret 1; }
+
+    var text_bytes: [24]u8;
+    var sections: [1]of.Section;
+    sections[0].name = text_name;
+    sections[0].kind = of.SK_TEXT;
+    sections[0].bytes = ?text_bytes[0];
+    sections[0].len = 24;
+    sections[0].align = 8;
+    var symbols: [1]of.Symbol;
+    symbols[0].name = target_name;
+    symbols[0].section = of.SECTION_EXTERNAL;
+    symbols[0].flags = of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL
+        | of.SYM_OBJ_FLAG_OBJECT;
+    var relocs: [3]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0;
+    relocs[0].kind = of.RK_GOTPCREL; relocs[0].sym = 0; relocs[0].addend = -4;
+    relocs[1].section = 0; relocs[1].offset = 8;
+    relocs[1].kind = of.RK_GOTPCREL_NORELAX; relocs[1].sym = 0; relocs[1].addend = -4;
+    relocs[2].section = 0; relocs[2].offset = 16;
+    relocs[2].kind = of.RK_GOTPCREL64_NORELAX; relocs[2].sym = 0; relocs[2].addend = -8;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "got-user"), ?sections[0], 1,
+        ?symbols[0], 1, ?relocs[0], 3);
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var loc: SymbolLoc;
+    loc.vaddr = 0x7000;
+    loc.section_vaddr = 0x7000;
+    loc.merged_index = of.SK_DATA::u32;
+    loc.weak = false;
+    loc.fallback = intern.STR_NIL;
+    if (R.is_err[bool, str](map.insert[intern.StrId, SymbolLoc](
+        ?locs, target_name, loc))) { ret 1; }
+
+    var merged: [7]MergedSection;
+    merged[of.SK_RELRO::u32].len = 3;
+    var sec_base: [1]u32;
+    sec_base[0] = 0;
+    var plan: LocalGotPlan;
+    init_local_got_plan(?plan);
+    val built: R.Result[bool, str] = build_local_got_plan(
+        ?s, ?module, 1, ?locs, ?sec_base[0], nil::*AtomPlan,
+        ?merged[0], ?plan);
+    if (R.is_err[bool, str](built) || plan.count != 1
+        || plan.slots[0].offset != 8
+        || merged[of.SK_RELRO::u32].len != 16
+        || merged[of.SK_RELRO::u32].align != 8
+        || !merged[of.SK_RELRO::u32].used) { ret 1; }
+
+    merged[of.SK_RELRO::u32].vaddr = 0x5000;
+    finalize_local_got_vaddrs(?merged[0], ?plan);
+    if (plan.slots[0].vaddr != 0x5008) { ret 1; }
+
+    free_local_got_plan(?alloc, ?plan);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
     session.dnit(?s);
     ret 0;
 }
