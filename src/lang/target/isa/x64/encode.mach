@@ -1290,6 +1290,51 @@ fun encode_call(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     ret (buf.len - start)::i32;
 }
 
+# encode `in` / `out` (#2468)
+#
+# The accumulator is ARCHITECTURAL on both forms - AL / AX / EAX by access width - so
+# it is never encoded; only the PORT is, and it selects the opcode rather than a
+# ModR/M byte. An immediate port takes the 8-bit-immediate form, DX the register
+# form. A 16-bit access takes the 0x66 operand-size prefix like any other.
+#
+# `mi.dst` is the port for `out` and the accumulator for `in`, matching the source
+# order the grammar parses; the port operand is whichever of the two is not a
+# register-class accumulator.
+# ---
+# mi:  the instruction to encode
+# buf: byte sink
+# ret: number of bytes emitted, or 0 on an operand shape this form does not model
+fun encode_portio(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
+    val start: usize = buf.len;
+    val is_in: bool = mi.opcode == x64.IN;
+    var port: *isa.Operand = ?mi.dst;
+    var acc:  *isa.Operand = ?mi.src1;
+    if (is_in) { port = ?mi.src1; acc = ?mi.dst; }
+
+    # the access width comes from the accumulator operand: al / ax / eax.
+    val w: u8 = acc.size;
+    if (w != 1 && w != 2 && w != 4) { ret 0; }
+    if (w == 2) { enc.emit_byte(buf, 0x66); }
+
+    if (port.kind == isa.OPK_IMM) {
+        if (port.imm < 0 || port.imm > 255) { ret 0; }
+        var op: u8 = 0xE4;                       # in  al, imm8
+        if (!is_in) { op = 0xE6; }               # out imm8, al
+        if (w != 1) { op = op + 1; }             # the word / dword form
+        enc.emit_byte(buf, op);
+        enc.emit_byte(buf, (port.imm & 0xFF)::u8);
+        ret (buf.len - start)::i32;
+    }
+    if (port.kind == isa.OPK_REG) {
+        var op: u8 = 0xEC;                       # in  al, dx
+        if (!is_in) { op = 0xEE; }               # out dx, al
+        if (w != 1) { op = op + 1; }
+        enc.emit_byte(buf, op);
+        ret (buf.len - start)::i32;
+    }
+    ret 0;
+}
+
 # encode a near RET
 fun encode_ret(buf: *enc.ByteBuf) i32 {
     enc.emit_byte(buf, 0xC3);
@@ -1960,6 +2005,36 @@ fun encode_inst_one(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     if (opcode == x64.HLT) {
         enc.emit_byte(buf, 0xF4);
         ret 1;
+    }
+
+    # the no-operand privileged / timer instructions (#2468). each is a fixed byte
+    # sequence with no operand encoding: the registers they touch are architectural
+    # (EDX:EAX for the counter and MSR reads, ECX for the MSR selector) and ride the
+    # mnemonic's `implicit` write set rather than any operand.
+    if (opcode == x64.CLI)   { enc.emit_byte(buf, 0xFA); ret 1; }
+    if (opcode == x64.STI)   { enc.emit_byte(buf, 0xFB); ret 1; }
+    if (opcode == x64.RDTSC) { enc.emit_byte(buf, 0x0F); enc.emit_byte(buf, 0x31); ret 2; }
+    if (opcode == x64.RDMSR) { enc.emit_byte(buf, 0x0F); enc.emit_byte(buf, 0x32); ret 2; }
+    if (opcode == x64.WRMSR) { enc.emit_byte(buf, 0x0F); enc.emit_byte(buf, 0x30); ret 2; }
+
+    # `lidt m` - group-15 /3 on a memory operand (privileged).
+    if (opcode == x64.LIDT) {
+        val dst: *isa.Operand = ?mi.dst;
+        if (dst.kind != isa.OPK_MEM) { ret 0; }
+        val lidt_start: usize = buf.len;
+        emit_rex_mem(buf, 0, 3, dst);
+        enc.emit_byte(buf, 0x0F);
+        enc.emit_byte(buf, 0x01);
+        encode_mem_operand(buf, 3, dst);
+        ret (buf.len - lidt_start)::i32;
+    }
+
+    # port i/o. the ACCUMULATOR is architectural on both forms and never encoded; the
+    # PORT is either an 8-bit immediate or DX, which selects the opcode rather than a
+    # ModR/M byte. operand width picks the byte vs word/dword form, and a 16-bit
+    # access takes the 0x66 prefix like any other.
+    if (opcode == x64.IN || opcode == x64.OUT) {
+        ret encode_portio(mi, buf);
     }
 
     if (opcode == x64.NEG || opcode == x64.NOT) {
@@ -4918,6 +4993,11 @@ fun frame_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
 val X64P_NONE:   u16 = 1;  # the mnemonic is the whole statement
 val X64P_ONE:    u16 = 2;  # one operand
 val X64P_TWO:    u16 = 3;  # `dst, src`
+# `in acc, port` / `out port, acc` - the ONE form whose two operands carry INDEPENDENT
+# widths. `dx` is always the 16-bit port register while the accumulator's width IS the
+# access width, so the shared "one size for both operands" rule would read `out dx, al`
+# as a 16-bit access and emit `66 ef` instead of `ee` (#2468).
+val X64P_PORTIO: u16 = 8;
 val X64P_BRANCH: u16 = 4;  # a branch target: a symbol or a numeric local label
 val X64P_CALL:   u16 = 5;  # a call target: a branch target, a register, or a memory operand
 
@@ -4938,6 +5018,10 @@ val X64F_INDIRECT: u16 = 0x0200;
 # the registers the syscall ABI destroys: the kernel's return register plus the two
 # the instruction itself overwrites (RAX, RCX, R11)
 val X64_SYSCALL_WRITES: u32 = 0x803;
+
+# the registers `rdtsc` / `rdmsr` write: the counter and MSR value land in EDX:EAX
+# regardless of any operand, so the write rides here rather than on an operand (#2468)
+val X64_EDX_EAX_WRITES: u32 = 0x5;
 # the implicit accumulator a compare-exchange writes (RAX)
 val X64_RAX_WRITE: u32 = 0x1;
 
@@ -4950,7 +5034,7 @@ val X64_ALL_FP: u32 = 0xFFFF;
 fun x64_pattern(flags: u16) u16 { ret flags & 0x00FF; }
 
 # number of rows in the x86-64 inline-asm mnemonic table
-val X64_MNEMONIC_COUNT: usize = 47;
+val X64_MNEMONIC_COUNT: usize = 55;
 
 # the x86-64 inline-asm instruction surface
 #
@@ -4967,6 +5051,18 @@ val X64_MNEMONICS: [X64_MNEMONIC_COUNT]iasm.Mnemonic = [X64_MNEMONIC_COUNT]iasm.
     iasm.Mnemonic{ name: "syscall", code: x64.SYSCALL::u32, form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_SYSCALL_WRITES, flags: X64P_NONE, words: 0 },
     iasm.Mnemonic{ name: "ret",     code: x64.RET::u32,     form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
     iasm.Mnemonic{ name: "hlt",     code: x64.HLT::u32,     form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
+    # port i/o and the privileged set (#2468). `in` / `out` name the accumulator
+    # explicitly so the width is readable at the call site, but it is architectural and
+    # never encoded. `rdtsc` / `rdmsr` write EDX:EAX implicitly; `wrmsr` READS them, so
+    # it writes nothing.
+    iasm.Mnemonic{ name: "cli",     code: x64.CLI::u32,     form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
+    iasm.Mnemonic{ name: "sti",     code: x64.STI::u32,     form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
+    iasm.Mnemonic{ name: "rdtsc",   code: x64.RDTSC::u32,   form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_EDX_EAX_WRITES, flags: X64P_NONE, words: 0 },
+    iasm.Mnemonic{ name: "rdmsr",   code: x64.RDMSR::u32,   form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: X64_EDX_EAX_WRITES, flags: X64P_NONE, words: 0 },
+    iasm.Mnemonic{ name: "wrmsr",   code: x64.WRMSR::u32,   form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
+    iasm.Mnemonic{ name: "lidt",    code: x64.LIDT::u32,    form: iasm.AF_OPS,  writes: iasm.AW_NONE, implicit: 0, flags: X64P_ONE,  words: 0 },
+    iasm.Mnemonic{ name: "in",      code: x64.IN::u32,      form: iasm.AF_OPS,  writes: iasm.AW_OP0,  implicit: 0, flags: X64P_PORTIO, words: 0 },
+    iasm.Mnemonic{ name: "out",     code: x64.OUT::u32,     form: iasm.AF_OPS,  writes: iasm.AW_NONE, implicit: 0, flags: X64P_PORTIO, words: 0 },
     iasm.Mnemonic{ name: "mfence",  code: x64.MFENCE::u32,  form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
     iasm.Mnemonic{ name: "pause",   code: x64.PAUSE::u32,   form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
     iasm.Mnemonic{ name: "nop",     code: x64.NOP::u32,     form: iasm.AF_NONE, writes: iasm.AW_NONE, implicit: 0, flags: X64P_NONE, words: 0 },
@@ -5466,6 +5562,15 @@ fun x64_build(item: *iasm.Item) isa.Inst {
         mi.size  = 8;
         mi.flags = enc_flags | x64.FLAG_INDIRECT::u16;
         mi.dst   = x64_to_isa(?item.ops[0], 8);
+        ret mi;
+    }
+
+    # port i/o keeps each operand at its OWN parsed width: the accumulator carries the
+    # access width and `dx` is always 16-bit, so collapsing them loses the access size.
+    if (pat == X64P_PORTIO) {
+        mi.flags = enc_flags;
+        mi.dst   = x64_to_isa(?item.ops[0], item.ops[0].size);
+        mi.src1  = x64_to_isa(?item.ops[1], item.ops[1].size);
         ret mi;
     }
 
@@ -7019,6 +7124,29 @@ pub fun asm_ct_class(code: u32, flags: u16) ct.AsmClass {
         code == x64.MFENCE::u32  || code == x64.PAUSE::u32) {
         ret ct.asm_op(ct.CT_OP_NONE);
     }
+    # PORT I/O AND THE PRIVILEGED SET (#2468). None of these has an operand-dependent
+    # latency, which is what `CtOp` classifies, so all are CT_OP_NONE - but two deserve
+    # to be named rather than defaulted.
+    #
+    # `in` / `out` take as long as the DEVICE takes, which is a property of the port
+    # and the bus, not of the value moved. A secret VALUE written to a port is a
+    # disclosure the type system already governs; a secret PORT NUMBER would be an
+    # address-shaped leak, and it is refused by check (b) exactly as a secret memory
+    # address is - the port is an operand, and the walk sees it.
+    #
+    # `rdtsc` reads a timer. That is worth a deliberate note inside an oblivious block:
+    # its LATENCY does not depend on any operand, so it is constant-time in the sense
+    # this table classifies, and refusing it here would be classifying the wrong
+    # property. What it enables - a function timing its own secret-dependent work and
+    # branching on the result - is a leak the OTHER checks catch, because the branch or
+    # the address is where the secret actually escapes. Reading a clock is not itself a
+    # disclosure of the secret.
+    if (code == x64.IN::u32    || code == x64.OUT::u32   || code == x64.CLI::u32 ||
+        code == x64.STI::u32   || code == x64.LIDT::u32  || code == x64.RDTSC::u32 ||
+        code == x64.RDMSR::u32 || code == x64.WRMSR::u32) {
+        ret ct.asm_op(ct.CT_OP_NONE);
+    }
+
     # control transfer with no condition: the target is public by construction (a
     # symbol or a numeric local label), so it reveals nothing about a secret.
     if (code == x64.JMP::u32 || code == x64.CALL::u32 || code == x64.RET::u32 ||
@@ -7123,4 +7251,86 @@ test "mach.lang.target.isa.x64.encode.render_bytes_directive:round_trips" {
     one[0] = 0xEC;
     if (!t_asm_bytes(".byte 0xec", ?one[0], 1)) { ret 1; }
     ret 0;
+}
+
+# the port-i/o and privileged mnemonics encode to the bytes an independent assembler
+# produces for the same spellings (#2468)
+#
+# These were written as `.byte` payloads before they existed, which cost more than
+# ergonomics: a raw payload degrades the block's clobber set to every register in
+# every bank, so the allocator spilled everything live across each port access.
+#
+# The port forms are where a wrong byte hides. The ACCUMULATOR is architectural and
+# never encoded - only its WIDTH is, and it picks the opcode - while the PORT selects
+# between the immediate form and the DX form. So `in al, dx` and `in eax, dx` differ
+# by one in the opcode and by nothing else, and a 16-bit access is the dword opcode
+# under a 0x66 prefix.
+test "mach.lang.target.isa.x64.encode.portio:byte_exact" {
+    var bad: i32 = 0;
+
+    # the no-operand privileged set.
+    var b1: [1]u8; b1[0] = 0xFA;
+    if (!t_asm_bytes("cli", ?b1[0], 1)) { bad = 1; }
+    b1[0] = 0xFB;
+    if (!t_asm_bytes("sti", ?b1[0], 1)) { bad = 1; }
+
+    var b2: [2]u8;
+    b2[0] = 0x0F; b2[1] = 0x31;
+    if (!t_asm_bytes("rdtsc", ?b2[0], 2)) { bad = 1; }
+    b2[1] = 0x32;
+    if (!t_asm_bytes("rdmsr", ?b2[0], 2)) { bad = 1; }
+    b2[1] = 0x30;
+    if (!t_asm_bytes("wrmsr", ?b2[0], 2)) { bad = 1; }
+
+    # `in` / `out` through DX: the width picks the opcode, the accumulator is implied.
+    b1[0] = 0xEC;
+    if (!t_asm_bytes("in al, dx", ?b1[0], 1))   { bad = 1; }
+    b1[0] = 0xED;
+    if (!t_asm_bytes("in eax, dx", ?b1[0], 1))  { bad = 1; }
+    b1[0] = 0xEE;
+    if (!t_asm_bytes("out dx, al", ?b1[0], 1))  { bad = 1; }
+    b1[0] = 0xEF;
+    if (!t_asm_bytes("out dx, eax", ?b1[0], 1)) { bad = 1; }
+
+    # a 16-bit access is the dword opcode under the operand-size prefix.
+    b2[0] = 0x66; b2[1] = 0xED;
+    if (!t_asm_bytes("in ax, dx", ?b2[0], 2))   { bad = 1; }
+
+    # the immediate-port forms.
+    b2[0] = 0xE4; b2[1] = 0x60;
+    if (!t_asm_bytes("in al, 0x60", ?b2[0], 2))   { bad = 1; }
+    b2[0] = 0xE6; b2[1] = 0x60;
+    if (!t_asm_bytes("out 0x60, al", ?b2[0], 2))  { bad = 1; }
+    b2[0] = 0xE5; b2[1] = 0x60;
+    if (!t_asm_bytes("in eax, 0x60", ?b2[0], 2))  { bad = 1; }
+
+    # `lidt m` is group-15 /3 on a memory operand.
+    var b3: [3]u8; b3[0] = 0x0F; b3[1] = 0x01; b3[2] = 0x18;
+    if (!t_asm_bytes("lidt [rax]", ?b3[0], 3)) { bad = 1; }
+
+    ret bad;
+}
+
+# the new mnemonics are classified for the constant-time walk, and `rdtsc` is a
+# deliberate call rather than a default (#2468)
+#
+# Every mnemonic a grammar admits must carry a classification or `#[oblivious]`
+# silently cannot use it - the fail-closed default from #2230. `rdtsc` is the one
+# worth naming: it reads a TIMER, but what this table classifies is whether an
+# operation's LATENCY depends on its operands, and `rdtsc`'s does not.
+test "mach.lang.target.isa.x64.encode.portio:classified_for_the_ct_walk" {
+    var bad: i32 = 0;
+    if (asm_ct_class(x64.IN::u32, 0).op    != ct.CT_OP_NONE) { bad = 1; }
+    if (asm_ct_class(x64.OUT::u32, 0).op   != ct.CT_OP_NONE) { bad = 1; }
+    if (asm_ct_class(x64.CLI::u32, 0).op   != ct.CT_OP_NONE) { bad = 1; }
+    if (asm_ct_class(x64.STI::u32, 0).op   != ct.CT_OP_NONE) { bad = 1; }
+    if (asm_ct_class(x64.LIDT::u32, 0).op  != ct.CT_OP_NONE) { bad = 1; }
+    if (asm_ct_class(x64.RDTSC::u32, 0).op != ct.CT_OP_NONE) { bad = 1; }
+    if (asm_ct_class(x64.RDMSR::u32, 0).op != ct.CT_OP_NONE) { bad = 1; }
+    if (asm_ct_class(x64.WRMSR::u32, 0).op != ct.CT_OP_NONE) { bad = 1; }
+
+    # and none of them is a branch of either kind, so none is refused on that path.
+    if (asm_ct_class(x64.IN::u32, 0).cond_flags)  { bad = 1; }
+    if (asm_ct_class(x64.RDTSC::u32, 0).cond_reg) { bad = 1; }
+    ret bad;
 }

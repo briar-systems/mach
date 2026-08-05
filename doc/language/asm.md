@@ -110,6 +110,45 @@ set becomes **every register in every bank**, and an `#[oblivious]` function may
 contain one at all — which is why a real mnemonic is always preferable where one
 exists.
 
+## System registers (aarch64)
+
+`mrs` and `msr` name a system register by its architectural name, in either case:
+
+```mach
+asm aarch64 {
+    mrs x0, cntvct_el0        # the virtual counter
+    mrs x1, CNTFRQ_EL0        # ... and its frequency, capitalized as ARM spells it
+    msr vbar_el1, x2          # install an exception vector base
+    msr daifset, 0xf          # mask every interrupt
+}
+```
+
+The named set covers what freestanding code reaches for — the generic timer, the
+exception vectors and their syndrome registers, the MMU control registers, the thread
+pointers, and enough identification registers to detect a CPU. It is deliberately not
+exhaustive: **any** system register is also nameable by its encoding, exactly as ARM and
+GNU as spell it, which is what makes the surface complete rather than a list that always
+lags the architecture:
+
+```mach
+asm aarch64 {
+    mrs x0, s3_3_c14_c0_2     # the same register as `mrs x0, cntvct_el0`
+}
+```
+
+`op0` must be 2 or 3 — the whole of the `mrs` / `msr` register space — and each remaining
+field is bounded by its own width. A field the architecture cannot hold is refused rather
+than truncated, because a truncated selector would name a *different* register than the
+text does.
+
+`msr <field>, #imm` writes a PSTATE field (`daifset`, `daifclr`, `spsel`, `pan`, `uao`,
+`ssbs`, `dit`, `tco`). The architecture spells these by name only, so there is no numeric
+escape for this form.
+
+Access permission is not checked: whether a register is writable depends on the exception
+level the code runs at, which the compiler does not know. Writing a register that is
+read-only at the current level traps at run time, as the architecture defines.
+
 ## Control-and-status registers (riscv64)
 
 The Zicsr extension's six instructions — read-write, read-set and read-clear, each
