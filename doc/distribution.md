@@ -470,7 +470,7 @@ Subsystem		00000003	(Windows CUI)
 
 ```
 $ llvm-objdump --macho --private-headers \
-    out/darwin-x86_64/release/Demo.app/Contents/MacOS/Demo
+    out/darwin-x86_64/release/Demo.app/Contents/MacOS/Demo | head -4
 out/darwin-x86_64/release/Demo.app/Contents/MacOS/Demo:
 Mach header
       magic cputype cpusubtype  caps    filetype ncmds sizeofcmds      flags
@@ -484,8 +484,10 @@ Name"`, above) is the PE equivalent — it enumerates exactly what the loader wi
 be asked for. Between them you know the binary is well-formed and complete
 without ever launching it.
 
-GNU `objdump` reads ELF and PE but not Mach-O; `llvm-objdump` reads all three, so
-one tool covers every target if you prefer that.
+The Mach-O dump continues into every load command; the header is the part that
+answers the question, hence the `head`. GNU `objdump` reads ELF and PE but not
+Mach-O, while `llvm-objdump` reads all three, so one tool covers every target if
+you prefer that.
 
 > `mach run` and `mach test` accept `--runner <cmd>`, which hands a foreign
 > binary to a host-side launcher instead of exec'ing it. That is a property of
