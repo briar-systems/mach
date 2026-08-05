@@ -202,6 +202,8 @@ direct X reference and `__imp_X` share one import entry — never map `__imp_X` 
 a separate loader export. If the same link graph instead supplies a strong X,
 `__imp_X` is a local pointer cell initialized to X: it creates no loader import
 and needs no `#[library]` attribution, while direct references still target X.
+An import-library record selected before that later definition becomes inert,
+and an alias referenced only by a discarded weak COMDAT creates no cell.
 
 ### `val` / `var`
 
