@@ -117,7 +117,7 @@ unit's inputs — prints it, and exits without compiling or linking.
 | `-L <dir>`     | dir            | add a search directory for `-l`-resolved inputs; repeatable |
 | `-l <name>`    | name           | link a named object, archive, or target-format shared library, resolved through the `-L` dirs (see below); repeatable |
 | `--explain`    | —              | print the resolved build plan and exit without building |
-| *(positional)* | input path     | a bare argument that contains `/`, ends in `.o` / `.a`, or names a `.so`, `.dylib`, or `.dll` is linked explicitly |
+| *(positional)* | input path     | a bare argument that contains `/`, ends in `.o` / `.obj` / `.a` / `.lib`, or names a `.so`, `.dylib`, or `.dll` is linked explicitly |
 
 Plus the global flags above.
 
@@ -140,24 +140,25 @@ output — the same inertness the manifest key has.
 ### External link inputs
 
 `ext fun` declarations are forward references whose definitions are supplied at
-link time by external precompiled code — a loose `.o` object, a static `.a`
-archive, or a target-format shared library. Those inputs come from the command line and
+link time by external precompiled code — a loose `.o`/`.obj` object, a static
+`.a`/`.lib` archive, or a target-format shared library. Those inputs come from the command line and
 from the manifest's matching `[link.X]` entries — an artifact's referenced entries
 plus exported dependency entries whose `os`/`isa`/`abi` filters match the build
 (see [manifest.md](manifest.md)); both sets are linked. An input that resolves to no
 existing file is a hard error, so a typo never silently drops a dependency.
 
 - **Explicit input path** — a bare (non-flag) argument that contains a `/`, ends
-  in `.o` (object) or `.a` (archive), or names an ELF `.so`, Mach-O `.dylib`,
+  in `.o`/`.obj` (object) or `.a`/`.lib` (archive), or names an ELF `.so`, Mach-O `.dylib`,
   or PE `.dll` is
   treated as an input path. The first non-flag positional after `build` is the
   project root and is skipped; remaining input-path positionals are link inputs.
   A relative path is tried verbatim against the working directory first, then
   rooted at the project root.
 - **`-l <name>`** — resolves to an object, archive, or shared library. Each
-  `-L <dir>` is searched for `<dir>/lib<name>.o`, `<dir>/<name>.o`,
-  `<dir>/lib<name>.a`, then `<dir>/<name>.a`; if none hit, the same four
-  candidates relative to the working directory are tried. Only if no static
+  `-L <dir>` is searched for the `lib<name>` and `<name>` forms of `.o` and
+  `.a`; a PE/COFF target additionally probes `.obj` and `.lib`. If none hit,
+  the same target-appropriate candidates relative to the working directory are
+  tried. Only if no static
   object or archive is found does resolution fall back to the selected target's
   shared-library spelling: `lib<name>.so[.N]` for ELF or
   `lib<name>[.<N>].dylib` for Mach-O. The `-L` directories are searched first,
@@ -170,10 +171,13 @@ existing file is a hard error, so a typo never silently drops a dependency.
 
 How an input resolves decides whether the link is static or dynamic:
 
-- A loose **`.o`** object or static **`.a`** archive is a **static** input,
-  merged into the executable at link time. An `.a` contributes every one of its
-  member objects (all members are pulled, not just those satisfying an undefined
-  symbol). With only static inputs the output is a fully static binary, and any
+- A loose **`.o`/`.obj`** object or static **`.a`/`.lib`** archive is a
+  **static** input, merged into the executable at link time. An archive contributes
+  only members that define a global currently undefined by the objects and
+  members preceding it. Selection repeats within that archive to a fixed point,
+  so a selected member may pull a dependency located earlier in the same archive;
+  an archive is not revisited after the next input begins. With only static inputs
+  the output is a fully static binary, and any
   undefined `ext` that no input defines is a hard error.
 - A shared **`.so`**, **`.dylib`**, or **`.dll`** is a **dynamic** dependency.
   ELF records the library's `DT_SONAME`, Mach-O records its `LC_ID_DYLIB`
@@ -185,13 +189,52 @@ How an input resolves decides whether the link is static or dynamic:
   framework paths. Undefined `ext` functions are then emitted as imports for the
   target format. A static definition of the same symbol always wins.
 
-`-l <name>` prefers a static `.o`/`.a` over a shared library, so an `-l name`
-that has a local object is resolved statically exactly as before; the `.so`
-or `.dylib` fallback only applies when no static candidate exists. A bare `-l`
+Archive members are currently all parsed and validated before selection. An
+unused member is never linked, but it must still be a parseable object for the
+selected target; keep an archive target-homogeneous. This preserves the existing
+archive-parser constraint while changing which members reach symbol resolution.
+
+`-l <name>` prefers a target-appropriate static object/archive over a shared
+library, so an `-l name` that has a local object is resolved statically exactly
+as before; PE/COFF adds `.obj`/`.lib` to the portable `.o`/`.a` probes, while an
+ELF or Mach-O plan ignores those COFF-only bare-name candidates. The `.so` or
+`.dylib` fallback only applies when no static candidate exists. A bare `-l`
 name is also the logical identity accepted by `#[library("name")]`; manifest
 requirements can set a cross-platform logical identity explicitly with their
 `library` key. Manifest requirements are resolved before CLI inputs, giving a
 stable, deterministic link order.
+
+##### Toolchain runtime archives
+
+A cross-target C binding can expose its toolchain's static runtime through an
+ordinary build-step-produced local archive. Materialize the archives into the
+project output tree, then list them in linker order:
+
+```toml
+[step.mingw-runtime]
+cmd  = "tools/materialize-mingw-runtime.sh {project.out}/crt/mingw32.lib {project.out}/crt/compiler_rt.lib"
+in   = ["tools/materialize-mingw-runtime.sh"]
+out  = ["{project.out}/crt/mingw32.lib", "{project.out}/crt/compiler_rt.lib"]
+need = []
+
+[link.mingw32]
+source = "local"
+path   = "{project.out}/crt/mingw32.lib"
+os     = "windows"
+
+[link.compiler_rt]
+source = "local"
+path   = "{project.out}/crt/compiler_rt.lib"
+os     = "windows"
+```
+
+The project-owned script should use its configured compiler's supported
+discovery/output mechanism and copy or build the exact target archives at those
+declared paths. Mach neither searches compiler installations nor relies on a
+compiler's private cache layout. Archive definitions such as `memcpy`, `strlen`,
+or `vsnprintf` then remain static definitions; do not claim them in a DLL entry's
+`symbols`. Only imports left undefined after archive selection need normal
+two-level-namespace attribution below.
 
 ##### Attributing imports on a two-level namespace
 

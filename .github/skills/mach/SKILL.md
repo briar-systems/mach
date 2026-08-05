@@ -185,11 +185,15 @@ pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 
 Body-less, ends in `;`, C ABI is the contract. Provide the definition at link
 time (`mach build . -l c`, a `[link.X]` manifest requirement, or an explicit
-`.o`/`.a`/`.so`/`.dylib`/`.dll`). On PE and Mach-O targets, pin each dynamic
+`.o`/`.obj`/`.a`/`.lib`/`.so`/`.dylib`/`.dll`). On PE and Mach-O targets, pin each dynamic
 import with `#[library("name")]`. The value is the requirement's stable
 `library` identity (defaulting to the `[link.X]` table name); exact loader names
 remain accepted. A discovered Darwin `@rpath/` install name retains its selected
 library directory as an `LC_RPATH` command.
+
+For a bare `-l name`, every target probes `.o`/`.a`; only PE/COFF also probes
+the `.obj`/`.lib` spellings. Explicit paths retain their spelling so a format
+mismatch produces a direct diagnostic.
 
 Windows COFF inputs compiled with C/C++ `dllimport` may leave `__imp_X`
 undefined. Attribute the real export X normally; the linker strips the object
