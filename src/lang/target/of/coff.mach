@@ -92,6 +92,11 @@ val IMAGE_SYM_CLASS_EXTERNAL:      u8 = 2;
 val IMAGE_SYM_CLASS_STATIC:        u8 = 3;
 val IMAGE_SYM_CLASS_WEAK_EXTERNAL: u8 = 105;
 
+# weak-external resolution modes (IMAGE_WEAK_EXTERN_SEARCH_*)
+val IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY: u32 = 1;
+val IMAGE_WEAK_EXTERN_SEARCH_LIBRARY:   u32 = 2;
+val IMAGE_WEAK_EXTERN_SEARCH_ALIAS: u32 = 3;
+
 # the undefined / special section number (SectionNumber is 1-based and signed;
 # values <= 0 are undefined or absolute)
 val IMAGE_SYM_UNDEFINED: i16 = 0;
@@ -1072,6 +1077,60 @@ fun sym_naux_off(sym_off: usize, bigobj: bool) usize {
     ret sym_off + 17;
 }
 
+# preserve COFF weak-external fallback relations
+#
+# A weak external's aux record names the symbol to use when the public name has
+# no real definition. The characteristics distinguish no-library, library-search,
+# and alias modes. Keep the target as an ObjectImage symbol index so archive
+# selection, final resolution, and relocatable output all retain the relation;
+# eager same-object normalization would lose external targets and alias chains.
+# ---
+# buf:         complete object bytes; the caller validated the symbol-table span
+# symtab_off:  byte offset of the COFF symbol table
+# num_records: raw record count, including aux records
+# bigobj:      whether records use the 20-byte /bigobj shape
+# rec_map:     raw record index -> ObjectImage symbol index
+# out:         populated image whose weak fallback metadata is filled in place
+# ret:         ok(true), or an error for a malformed fallback aux reference
+fun preserve_weak_external_fallbacks(buf: *u8, symtab_off: usize,
+                                     num_records: u32, bigobj: bool,
+                                     rec_map: *i32,
+                                     out: *of.ObjectImage) R.Result[bool, str] {
+    val symbol_size: usize = sym_record_size(bigobj);
+    var ri: u32 = 0;
+    for (ri < num_records) {
+        val so: usize = symtab_off + ri::usize * symbol_size;
+        val aux: u8 = buf[sym_naux_off(so, bigobj)];
+        val scl: u8 = buf[sym_storage_class_off(so, bigobj)];
+        if (scl == IMAGE_SYM_CLASS_WEAK_EXTERNAL
+            && read_sym_section_number(buf, so, bigobj) == IMAGE_SYM_UNDEFINED::i32) {
+            if (aux == 0 || ri + 1 >= num_records) {
+                ret R.err[bool, str]("coff: weak external has no aux record");
+            }
+            val ao: usize = so + symbol_size;
+            val target_rec: u32 = bin.read_u32_le(buf, ao);
+            val search: u32 = bin.read_u32_le(buf, ao + 4);
+            if (target_rec >= num_records || rec_map[ri] < 0
+                || rec_map[target_rec] < 0) {
+                ret R.err[bool, str]("coff: weak external fallback target is invalid");
+            }
+            val public: *of.Symbol = ?out.symbols[rec_map[ri]::u32];
+            val target: *of.Symbol = ?out.symbols[rec_map[target_rec]::u32];
+            public.fallback = rec_map[target_rec]::u32;
+            public.flags = public.flags | of.SYM_OBJ_FLAG_FALLBACK
+                | (target.flags & (of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_OBJECT));
+            if (search == IMAGE_WEAK_EXTERN_SEARCH_LIBRARY) {
+                public.flags = public.flags | of.SYM_OBJ_FLAG_SEARCH;
+            }
+            if (search == IMAGE_WEAK_EXTERN_SEARCH_ALIAS) {
+                public.flags = public.flags | of.SYM_OBJ_FLAG_ALIAS;
+            }
+        }
+        ri = ri + 1 + aux::u32;
+    }
+    ret R.ok[bool, str](true);
+}
+
 # serialize a COMDAT-prepared object image to a relocatable x86-64 COFF object
 #
 # Writes the file header, section-header table, per-section raw data, per-section
@@ -1090,6 +1149,18 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) R.Resul
 
     val num_secs: u32 = img.section_count;
     val num_syms: u32 = img.symbol_count;
+    var weak_aux_count: u32 = 0;
+    var wi: u32 = 0;
+    for (wi < num_syms) {
+        if ((img.symbols[wi].flags & of.SYM_OBJ_FLAG_FALLBACK) != 0) {
+            if (img.symbols[wi].fallback >= num_syms
+                || img.symbols[wi].fallback == of.SYMBOL_NONE) {
+                ret R.err[bool, str]("coff: weak external fallback index is out of range");
+            }
+            weak_aux_count = weak_aux_count + 1;
+        }
+        wi = wi + 1;
+    }
 
     # map every relocation kind to a machine type first, so an unmapped kind fails
     # the emit naming the kind (never silently serialized as ADDR64) and the range
@@ -1199,11 +1270,10 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) R.Resul
         s = s + 1;
     }
 
-    # symbol table: one section symbol (+ one aux record) per section, then one
-    # record per image symbol. the COFF symbol-table index of the i-th image
-    # symbol is therefore `2*num_secs + i`.
+    # symbol table: one section symbol (+ one aux record) per section, then each
+    # image symbol and its optional weak-external aux record.
     val symtab_offset: usize = cursor;
-    val total_sym_records: u32 = num_secs * 2 + num_syms;
+    val total_sym_records: u32 = num_secs * 2 + num_syms + weak_aux_count;
     val symtab_size: usize = total_sym_records::usize * symbol_size;
     val strtab_offset: usize = symtab_offset + symtab_size;
     val strtab_sz: usize = strtab_size(img);
@@ -1223,8 +1293,13 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) R.Resul
         sym_remap = R.unwrap_ok[*u32, str](res_remap);
     }
     var i: u32 = 0;
+    var raw_sym: u32 = num_secs * 2;
     for (i < num_syms) {
-        sym_remap[i] = num_secs * 2 + i;
+        sym_remap[i] = raw_sym;
+        raw_sym = raw_sym + 1;
+        if ((img.symbols[i].flags & of.SYM_OBJ_FLAG_FALLBACK) != 0) {
+            raw_sym = raw_sym + 1;
+        }
         i = i + 1;
     }
 
@@ -1436,19 +1511,35 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) R.Resul
             sym_ty = IMAGE_SYM_DTYPE_FUNCTION;
         }
 
-        # global, weak, and external-undefined symbols are class EXTERNAL; a
-        # local definition is class STATIC. a defined weak symbol is class
-        # EXTERNAL too - its weak/dedup attribute is carried by the COMDAT section
-        # it was moved into (LNK_COMDAT + a SELECT_ANY section-symbol aux record),
-        # which the reader recovers. the weak-external aux form is reserved for the
-        # #1159 import work and unused here.
+        # Global and external-undefined symbols are class EXTERNAL; a local
+        # definition is STATIC. Defined weak symbols carry their binding through
+        # COMDAT. An undefined symbol with a format-neutral fallback uses COFF's
+        # WEAK_EXTERNAL class and one aux record so relocatable output preserves
+        # its target and archive-search policy.
         var scl: u8 = IMAGE_SYM_CLASS_STATIC;
         if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_GLOBAL) != 0
             || (img.symbols[symi].flags & of.SYM_OBJ_FLAG_EXTERN) != 0) {
             scl = IMAGE_SYM_CLASS_EXTERNAL;
         }
-        write_sym_tail(buf, sym_off, bigobj, sec_num, sym_ty, scl, 0);
+        var naux: u8 = 0;
+        if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_FALLBACK) != 0) {
+            scl = IMAGE_SYM_CLASS_WEAK_EXTERNAL;
+            naux = 1;
+        }
+        write_sym_tail(buf, sym_off, bigobj, sec_num, sym_ty, scl, naux);
         sym_off = sym_off + symbol_size;
+        if (naux == 1) {
+            bin.write_u32_le(buf, sym_off, sym_remap[img.symbols[symi].fallback]);
+            var search: u32 = IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY;
+            if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_SEARCH) != 0) {
+                search = IMAGE_WEAK_EXTERN_SEARCH_LIBRARY;
+            }
+            if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_ALIAS) != 0) {
+                search = IMAGE_WEAK_EXTERN_SEARCH_ALIAS;
+            }
+            bin.write_u32_le(buf, sym_off + 4, search);
+            sym_off = sym_off + symbol_size;
+        }
         symi = symi + 1;
     }
 
@@ -1993,6 +2084,16 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
             a = a + 1;
         }
         ri = ri + 1 + aux::u32;
+    }
+
+    # preserve weak fallbacks only after every raw record has an image-symbol
+    # mapping: an aux entry may point forward in the table.
+    val wa: R.Result[bool, str] =
+        preserve_weak_external_fallbacks(buf, symtab_off, num_records,
+                                         bigobj, rec_map, out);
+    if (R.is_err[bool, str](wa)) {
+        A.deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
+        ret R.err[bool, str](R.unwrap_err[bool, str](wa));
     }
 
     # relocations: each section header points at its IMAGE_RELOCATION array.
@@ -4153,6 +4254,148 @@ test "mach.lang.target.of.coff:relro_round_trip" {
     # the abs64 addend carried in the RELRO section round-trips.
     if (out.reloc_count != 1) { ret 1; }
     if (out.relocations[0].kind != of.RK_ABS64 || out.relocations[0].addend != 0x20) { ret 1; }
+    ret 0;
+}
+
+# all three COFF weak-external modes retain the aux target as an image-local
+# fallback index. Same-object targets stay relations rather than being flattened,
+# so external targets and forward chains have identical semantics.
+test "mach.lang.target.of.coff.preserve_weak_external_fallbacks:modes" {
+    var records: [54]u8;
+    var z: usize = 0;
+    for (z < 54) { records[z] = 0; z = z + 1; }
+
+    write_sym_tail(?records[0], 0, false, IMAGE_SYM_UNDEFINED::i32, 0,
+                   IMAGE_SYM_CLASS_WEAK_EXTERNAL, 1);
+    bin.write_u32_le(?records[0], SYMBOL_SIZE, 2);
+    write_sym_tail(?records[0], SYMBOL_SIZE * 2, false, 1,
+                   IMAGE_SYM_DTYPE_FUNCTION, IMAGE_SYM_CLASS_EXTERNAL, 0);
+
+    var rec_map: [3]i32;
+    rec_map[0] = 0; rec_map[1] = 0; rec_map[2] = 1;
+    var symbols: [2]of.Symbol;
+    symbols[0].name = intern.STR_NIL; symbols[0].section = of.SECTION_EXTERNAL;
+    symbols[0].offset = 0; symbols[0].size = 0;
+    symbols[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK
+        | of.SYM_OBJ_FLAG_EXTERN;
+    symbols[0].fallback = of.SYMBOL_NONE;
+    symbols[1].name = intern.STR_NIL; symbols[1].section = 0;
+    symbols[1].offset = 17; symbols[1].size = 23;
+    symbols[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    symbols[1].fallback = of.SYMBOL_NONE;
+    var img: of.ObjectImage;
+    img.symbols = ?symbols[0]; img.symbol_count = 2;
+
+    var modes: [3]u32;
+    modes[0] = IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY;
+    modes[1] = IMAGE_WEAK_EXTERN_SEARCH_LIBRARY;
+    modes[2] = IMAGE_WEAK_EXTERN_SEARCH_ALIAS;
+    var mi: u32 = 0;
+    for (mi < 3) {
+        bin.write_u32_le(?records[0], SYMBOL_SIZE + 4, modes[mi]);
+        symbols[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK
+            | of.SYM_OBJ_FLAG_EXTERN;
+        symbols[0].fallback = of.SYMBOL_NONE;
+        val nr: R.Result[bool, str] = preserve_weak_external_fallbacks(
+            ?records[0], 0, 3, false, ?rec_map[0], ?img);
+        if (R.is_err[bool, str](nr) || symbols[0].section != of.SECTION_EXTERNAL
+            || symbols[0].fallback != 1
+            || (symbols[0].flags & of.SYM_OBJ_FLAG_FALLBACK) == 0
+            || (symbols[0].flags & of.SYM_OBJ_FLAG_FUNCTION) == 0) { ret 1; }
+        if (((symbols[0].flags & of.SYM_OBJ_FLAG_SEARCH) != 0) != (mi == 1)) { ret 1; }
+        if (((symbols[0].flags & of.SYM_OBJ_FLAG_ALIAS) != 0) != (mi == 2)) { ret 1; }
+        mi = mi + 1;
+    }
+
+    # A malformed TagIndex is rejected instead of aliasing an arbitrary record.
+    bin.write_u32_le(?records[0], SYMBOL_SIZE, 99);
+    val malformed: R.Result[bool, str] = preserve_weak_external_fallbacks(
+        ?records[0], 0, 3, false, ?rec_map[0], ?img);
+    if (!R.is_err[bool, str](malformed)) { ret 1; }
+    ret 0;
+}
+
+# Forward alias chains remain explicit and therefore need no parser fixed point.
+test "mach.lang.target.of.coff.preserve_weak_external_fallbacks:forward_chain" {
+    var records: [90]u8;
+    var z: usize = 0;
+    for (z < 90) { records[z] = 0; z = z + 1; }
+    write_sym_tail(?records[0], 0, false, 1, IMAGE_SYM_DTYPE_FUNCTION,
+                   IMAGE_SYM_CLASS_EXTERNAL, 0);
+    write_sym_tail(?records[0], SYMBOL_SIZE, false, IMAGE_SYM_UNDEFINED::i32, 0,
+                   IMAGE_SYM_CLASS_WEAK_EXTERNAL, 1);
+    bin.write_u32_le(?records[0], SYMBOL_SIZE * 2, 3);
+    bin.write_u32_le(?records[0], SYMBOL_SIZE * 2 + 4, IMAGE_WEAK_EXTERN_SEARCH_ALIAS);
+    write_sym_tail(?records[0], SYMBOL_SIZE * 3, false, IMAGE_SYM_UNDEFINED::i32, 0,
+                   IMAGE_SYM_CLASS_WEAK_EXTERNAL, 1);
+    bin.write_u32_le(?records[0], SYMBOL_SIZE * 4, 0);
+    bin.write_u32_le(?records[0], SYMBOL_SIZE * 4 + 4, IMAGE_WEAK_EXTERN_SEARCH_ALIAS);
+
+    var rec_map: [5]i32;
+    rec_map[0] = 0; rec_map[1] = 1; rec_map[2] = 1; rec_map[3] = 2; rec_map[4] = 2;
+    var symbols: [3]of.Symbol;
+    var i: u32 = 0;
+    for (i < 3) {
+        symbols[i].name = (i + 1)::intern.StrId;
+        symbols[i].section = of.SECTION_EXTERNAL;
+        symbols[i].offset = 0; symbols[i].size = 0;
+        symbols[i].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK
+            | of.SYM_OBJ_FLAG_EXTERN;
+        symbols[i].fallback = of.SYMBOL_NONE;
+        i = i + 1;
+    }
+    symbols[0].section = 0;
+    symbols[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var img: of.ObjectImage; img.symbols = ?symbols[0]; img.symbol_count = 3;
+    val nr: R.Result[bool, str] = preserve_weak_external_fallbacks(
+        ?records[0], 0, 5, false, ?rec_map[0], ?img);
+    if (R.is_err[bool, str](nr) || symbols[1].fallback != 2
+        || symbols[2].fallback != 0) { ret 1; }
+    ret 0;
+}
+
+# Relocatable COFF output re-emits the weak aux record and remaps TagIndex to
+# the target's raw symbol-table position instead of silently losing the relation.
+test "mach.lang.target.of.coff:weak_fallback_round_trip" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "public");
+    syms[0].section = of.SECTION_EXTERNAL; syms[0].offset = 0; syms[0].size = 0;
+    syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK
+        | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_FALLBACK | of.SYM_OBJ_FLAG_SEARCH;
+    syms[0].fallback = 1;
+    syms[1].name = t_intern(?i, "fallback");
+    syms[1].section = of.SECTION_EXTERNAL; syms[1].offset = 0; syms[1].size = 0;
+    syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
+    syms[1].fallback = of.SYMBOL_NONE;
+    var img: of.ObjectImage;
+    img.alloc = ?alloc; img.interner = ?i; img.name = t_intern(?i, "weak_rt");
+    img.sections = nil; img.section_count = 0;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = nil; img.reloc_count = 0;
+    img.imports = nil; img.import_count = 0;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_weak_rt");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val em: R.Result[bool, str] =
+        coff_emit_object(?isa_vt, ?img, fs.temp_path(?tf)::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] =
+        coff_parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr) || out.symbol_count != 2
+        || out.symbols[0].fallback != 1
+        || (out.symbols[0].flags & of.SYM_OBJ_FLAG_FALLBACK) == 0
+        || (out.symbols[0].flags & of.SYM_OBJ_FLAG_SEARCH) == 0
+        || (out.symbols[0].flags & of.SYM_OBJ_FLAG_ALIAS) != 0) { ret 1; }
     ret 0;
 }
 
