@@ -22,6 +22,7 @@ use std.types.string.str;
 use std.types.string.str_compare;
 use std.types.string.str_ends_with;
 use std.types.string.str_len;
+use std.types.string.str_region_equals;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -29,6 +30,7 @@ use R: std.types.result;
 use sysos: std.system.os;
 
 use mach.lang.diagnostic;
+use mach.lang.embed;
 use mach.lang.fe.ast;
 use mach.lang.fe.ast.decl;
 use mach.lang.fe.ast.expr;
@@ -571,4 +573,120 @@ fun register_ext_global(p: *project.Project, mid: session.ModuleId, source: str,
     val name_r: R.Result[intern.StrId, str] = intern.intern_span(?p.s.interner, source, d.data.bind.name);
     if (R.is_err[intern.StrId, str](name_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](name_r)); }
     ret session.register_export_name(p.s, mid, did::u32, R.unwrap_ok[intern.StrId, str](name_r));
+}
+
+# re-read every file an `#[embed(...)]` names into the session's embed cache,
+# publishing each one's Q_EMBED_FILE input
+#
+# Runs once per build between the load walk and resolve, for the reason the whole
+# input exists: a module whose Q_SEMA revalidates never executes the code that
+# would look at its assets, so nothing downstream would notice an edited one. The
+# read has to happen unconditionally, ahead of the consumers, exactly as the load
+# walk re-reads every source file into Q_FILE_TEXT.
+#
+# Every comptime-if arm is walked, not only the selected one. The refresh only
+# populates inputs - sema records dependencies on the paths it actually resolves -
+# so covering the dead arms costs a read and buys a refreshed-path set that does
+# not shift with the target.
+# ---
+# p:   the project whose modules to scan
+# ret: true once every embedded file is refreshed, or the first read/alloc error
+pub fun register_embed_inputs(p: *project.Project) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < p.module_len) {
+        val m: *project.ModuleEntry = ?p.modules[i];
+        val m_opt: O.Option[*module.Module] = ast.get_module(m.a, m.a.root_module);
+        if (O.is_some[*module.Module](m_opt)) {
+            val mod_node: *module.Module = O.unwrap[*module.Module](m_opt);
+            val r: R.Result[bool, str] = refresh_embeds_in(p, m, mod_node.decls_start, mod_node.decls_len);
+            if (R.is_err[bool, str](r)) { ret r; }
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# walk a decl list, refreshing each `#[embed]` path and recursing into every
+# comptime-if arm
+# ---
+# p:     the project
+# m:     the module entry owning the decls
+# start: index of the first DeclId in the list
+# len:   number of decls in the list
+# ret:   true once the list is walked, or the first error
+fun refresh_embeds_in(p: *project.Project, m: *project.ModuleEntry, start: u32, len: u32) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < len) {
+        val did: id.DeclId = m.a.decl_ids[start + i];
+        val d_opt: O.Option[*decl.Decl] = ast.get_decl(m.a, did);
+        if (O.is_none[*decl.Decl](d_opt)) { i = i + 1; cnt; }
+        val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+
+        if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
+            var b: u32 = 0;
+            for (b < d.data.comptime_if.branches_len) {
+                val br: *decl.ComptimeBranch = ?m.a.comptime_branches[d.data.comptime_if.branches_start + b];
+                val r: R.Result[bool, str] = refresh_embeds_in(p, m, br.body_start, br.body_len);
+                if (R.is_err[bool, str](r)) { ret r; }
+                b = b + 1;
+            }
+            i = i + 1;
+            cnt;
+        }
+
+        var di: u32 = 0;
+        for (di < d.decorators_len) {
+            val dec: *decl.Decorator = ?m.a.decorators[d.decorators_start + di];
+            if (embed_named(p, m, dec)) {
+                val r: R.Result[bool, str] = refresh_one(p, m, dec);
+                if (R.is_err[bool, str](r)) { ret r; }
+            }
+            di = di + 1;
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# whether decorator `dec` is named `embed`
+fun embed_named(p: *project.Project, m: *project.ModuleEntry, dec: *decl.Decorator) bool {
+    val src_opt: O.Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
+    if (O.is_none[*src.SourceFile](src_opt)) { ret false; }
+    val source: str = O.unwrap[*src.SourceFile](src_opt).text;
+    ret str_region_equals(source, dec.name.offset, dec.name.len, "embed");
+}
+
+# resolve one `#[embed]` decorator's path and refresh the cache entry behind it
+#
+# A malformed decorator (no argument, a non-literal argument) is skipped rather
+# than reported: sema owns the shape diagnostics, and reporting here would double
+# every one of them.
+# ---
+# p:   the project
+# m:   the module entry carrying the decorator
+# dec: the `embed` decorator
+# ret: true once refreshed (or skipped), or a read/alloc error
+fun refresh_one(p: *project.Project, m: *project.ModuleEntry, dec: *decl.Decorator) R.Result[bool, str] {
+    val src_opt: O.Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
+    if (O.is_none[*src.SourceFile](src_opt)) { ret R.ok[bool, str](true); }
+    val f: *src.SourceFile = O.unwrap[*src.SourceFile](src_opt);
+    if (f.path == nil) { ret R.ok[bool, str](true); }
+
+    val span_opt: O.Option[token.Span] = embed.path_arg_span(m.a, dec);
+    if (O.is_none[token.Span](span_opt)) { ret R.ok[bool, str](true); }
+    val span: token.Span = O.unwrap[token.Span](span_opt);
+
+    val ir: R.Result[intern.StrId, str] = intern.intern_span(?p.s.interner, f.text, span);
+    if (R.is_err[intern.StrId, str](ir)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](ir)); }
+    val arg_opt: O.Option[str] = intern.lookup(?p.s.interner, R.unwrap_ok[intern.StrId, str](ir));
+    if (O.is_none[str](arg_opt)) { ret R.ok[bool, str](true); }
+
+    val pr: R.Result[str, str] = embed.resolve_path(p.s.alloc, f.path, O.unwrap[str](arg_opt));
+    if (R.is_err[str, str](pr)) { ret R.err[bool, str](R.unwrap_err[str, str](pr)); }
+    val resolved: str = R.unwrap_ok[str, str](pr);
+
+    val rr: R.Result[intern.StrId, str] = embed.refresh(?p.s.embeds, ?p.s.queries, ?p.s.interner, resolved);
+    str_free(p.s.alloc, resolved);
+    if (R.is_err[intern.StrId, str](rr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](rr)); }
+    ret R.ok[bool, str](true);
 }
