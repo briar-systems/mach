@@ -122,6 +122,28 @@ val BIGOBJ_MIN_VERSION:         u16   = 2;
 val BIGOBJ_HEADER_SIZE:         usize = 56;
 val BIGOBJ_SYMBOL_SIZE:         usize = 20;
 
+# the short import record (`IMPORT_OBJECT_HEADER`), the member an import library
+# carries instead of an object: it defines nothing and states that one symbol is
+# provided by one DLL. it opens with the SAME Sig1/Sig2 pair as /bigobj, so the
+# two are told apart by the complete /bigobj discriminator: a sufficiently large
+# header with Version >= BIGOBJ_MIN_VERSION and the fixed /bigobj ClassID. Every
+# other member with the shared signature is a short import record. This mirrors
+# the format's structural discriminator without constraining future import-header
+# versions.
+#
+# header: Sig1, Sig2, Version, Machine, TimeDateStamp, SizeOfData, OrdinalOrHint,
+# then a bitfield of Type (2 bits) and NameType (3 bits). `SizeOfData` bytes
+# follow, holding the NUL-terminated symbol name then the NUL-terminated DLL name;
+# `IMPORT_OBJECT_NAME_EXPORTAS` adds the distinct export name as a third string.
+val IMPORT_OBJECT_HEADER_SIZE: usize = 20;
+val IMPORT_OBJECT_TYPE_CODE:       u16 = 0;
+val IMPORT_OBJECT_TYPE_CONST:      u16 = 2;
+val IMPORT_OBJECT_ORDINAL:         u16 = 0;
+val IMPORT_OBJECT_NAME:            u16 = 1;
+val IMPORT_OBJECT_NAME_NOPREFIX:   u16 = 2;
+val IMPORT_OBJECT_NAME_UNDECORATE: u16 = 3;
+val IMPORT_OBJECT_NAME_EXPORTAS:   u16 = 4;
+
 # COFF file-header characteristics for a linked PE image
 val IMAGE_FILE_RELOCS_STRIPPED:     u16 = 0x0001;
 val IMAGE_FILE_EXECUTABLE_IMAGE:    u16 = 0x0002;
@@ -171,6 +193,7 @@ val PE_FILE_ALIGN:       u64   = 0x200;
 # one IMAGE_IMPORT_DESCRIPTOR (20 bytes) and one PE thunk slot (8 bytes, PE32+)
 val IMPORT_DESCRIPTOR_SIZE: usize = 20;
 val THUNK_SIZE:             usize = 8;
+val IMPORT_ORDINAL_FLAG64:  u64   = 0x8000000000000000;
 # the per-function import stub: `jmp qword [rip+disp32]` through the IAT slot
 val IMPORT_STUB_SIZE:       usize = 6;
 # one RUNTIME_FUNCTION table row (`BeginAddress`, `EndAddress`, `UnwindInfoAddress`)
@@ -387,43 +410,17 @@ fun write_decimal(buf: *u8, off: usize, width: usize, value: u32) {
     }
 }
 
-# build a name->index map over the image symbol table so the relocation passes
-# resolve targets in O(reloc + symbol) rather than O(reloc x symbol). the first
-# symbol of a given name wins, matching the lowest-index scan a linear lookup
-# would return; a STR_NIL-named symbol is skipped so a STR_NIL relocation target
-# stays unresolved. the caller owns the returned map and must `map.dnit` it
-fun build_reloc_sym_map(img: *of.ObjectImage) R.Result[map.Map[intern.StrId, u32], str] {
-    var idx: map.Map[intern.StrId, u32] =
-        map.init[intern.StrId, u32](img.alloc, map.hash_u32, map.eq_u32);
-    var i: u32 = 0;
-    for (i < img.symbol_count) {
-        if (img.symbols[i].name != intern.STR_NIL
-            && !map.contains[intern.StrId, u32](?idx, ?img.symbols[i].name)) {
-            val ins: R.Result[bool, str] =
-                map.insert[intern.StrId, u32](?idx, img.symbols[i].name, i);
-            if (R.is_err[bool, str](ins)) {
-                map.dnit[intern.StrId, u32](?idx);
-                ret R.err[map.Map[intern.StrId, u32], str](R.unwrap_err[bool, str](ins));
-            }
-        }
-        i = i + 1;
-    }
-    ret R.ok[map.Map[intern.StrId, u32], str](idx);
-}
-
-# resolve a relocation's target symbol to its index in the image symbol table via
-# a prebuilt name->index map. every relocation must name a symbol the image
-# defines or declares extern (the back end guarantees this - `pack_reloc_externs`
-# declares an extern for any named target the module did not define, and lowering
-# panics before emitting a nameless target). a miss is therefore a back-end
-# invariant violation, returned as an error naming the symbol rather than silently
-# aliased to index 0 (the first section symbol), which would corrupt the link
-fun reloc_sym_index(img: *of.ObjectImage, idx: *map.Map[intern.StrId, u32], sym: intern.StrId) R.Result[u32, str] {
-    if (sym != intern.STR_NIL) {
-        val g: R.Result[*u32, str] = map.get[intern.StrId, u32](idx, ?sym);
-        if (!R.is_err[*u32, str](g)) { ret R.ok[u32, str](@R.unwrap_ok[*u32, str](g)); }
-    }
-    ret R.err[u32, str](unresolved_reloc_message(img.interner, img.alloc, sym));
+# resolve a relocation's target to its index in the image symbol table. every
+# relocation must reference a symbol the image defines or declares extern (the
+# back end guarantees this - relocation binding declares an extern for any named
+# target the module did not define, and lowering panics before emitting a nameless
+# target). an out-of-range index is therefore a producer invariant violation,
+# returned as an error rather than silently aliased to index 0 (the first section
+# symbol), which would corrupt the link
+fun reloc_sym_index(img: *of.ObjectImage, r: *of.Relocation) R.Result[u32, str] {
+    if (r.sym < img.symbol_count) { ret R.ok[u32, str](r.sym); }
+    ret R.err[u32, str](unresolved_reloc_message(img.interner, img.alloc,
+        of.reloc_symbol_name(img, r)));
 }
 
 # build the "coff: unresolved relocation symbol: <name>" diagnostic, interned so
@@ -439,21 +436,12 @@ fun unresolved_reloc_message(itn: *intern.Interner, alloc: *A.Allocator, sym: in
 # unresolved target fails the emit naming the symbol instead of silently writing
 # a relocation against the first section symbol
 fun validate_reloc_symbols(img: *of.ObjectImage) R.Result[bool, str] {
-    val mr: R.Result[map.Map[intern.StrId, u32], str] = build_reloc_sym_map(img);
-    if (R.is_err[map.Map[intern.StrId, u32], str](mr)) {
-        ret R.err[bool, str](R.unwrap_err[map.Map[intern.StrId, u32], str](mr));
-    }
-    var idx: map.Map[intern.StrId, u32] = R.unwrap_ok[map.Map[intern.StrId, u32], str](mr);
     var i: u32 = 0;
     for (i < img.reloc_count) {
-        val r: R.Result[u32, str] = reloc_sym_index(img, ?idx, img.relocations[i].symbol);
-        if (R.is_err[u32, str](r)) {
-            map.dnit[intern.StrId, u32](?idx);
-            ret R.err[bool, str](R.unwrap_err[u32, str](r));
-        }
+        val r: R.Result[u32, str] = reloc_sym_index(img, ?img.relocations[i]);
+        if (R.is_err[u32, str](r)) { ret R.err[bool, str](R.unwrap_err[u32, str](r)); }
         i = i + 1;
     }
-    map.dnit[intern.StrId, u32](?idx);
     ret R.ok[bool, str](true);
 }
 
@@ -1370,19 +1358,7 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) R.Resul
     # relocation lands in its owning section's slot, advancing that section's reloc
     # cursor. `reloc_offsets` is no longer read after the section-header pass, so it
     # doubles as the per-section write cursor (each starts at the section's reloc
-    # base from the layout pass and ends one past its last record). a name->index
-    # map resolves each target in O(1), keeping the pass O(reloc + symbol).
-    val smr: R.Result[map.Map[intern.StrId, u32], str] = build_reloc_sym_map(img);
-    if (R.is_err[map.Map[intern.StrId, u32], str](smr)) {
-        A.deallocate[u32](alloc, counts, num_secs::usize);
-        A.deallocate[usize](alloc, data_offsets, (num_secs + 1)::usize);
-        A.deallocate[usize](alloc, reloc_offsets, (num_secs + 1)::usize);
-        A.deallocate[u32](alloc, sec_name_offsets, (num_secs + 1)::usize);
-        if (sym_remap != nil) { A.deallocate[u32](alloc, sym_remap, num_syms::usize); }
-        A.deallocate[u8](alloc, buf, total_file_size);
-        ret R.err[bool, str](R.unwrap_err[map.Map[intern.StrId, u32], str](smr));
-    }
-    var sym_map: map.Map[intern.StrId, u32] = R.unwrap_ok[map.Map[intern.StrId, u32], str](smr);
+    # base from the layout pass and ends one past its last record).
     var ri: u32 = 0;
     for (ri < img.reloc_count) {
         val rsec: u32 = img.relocations[ri].section;
@@ -1391,7 +1367,7 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) R.Resul
         # validate_reloc_symbols proved every reloc resolves, and a relocated
         # section implies symbols, so sym_remap is non-nil and the lookup cannot
         # miss; the first section symbol is never silently aliased.
-        val rsi: u32 = R.unwrap_ok[u32, str](reloc_sym_index(img, ?sym_map, img.relocations[ri].symbol));
+        val rsi: u32 = R.unwrap_ok[u32, str](reloc_sym_index(img, ?img.relocations[ri]));
         bin.write_u32_le(buf, ro + 4, sym_remap[rsi]);
         # validate_reloc_kinds proved every kind maps, so this lookup cannot miss;
         # ADDR64 is never silently substituted.
@@ -1399,7 +1375,6 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) R.Resul
         reloc_offsets[rsec] = ro + RELOCATION_SIZE;
         ri = ri + 1;
     }
-    map.dnit[intern.StrId, u32](?sym_map);
 
     # symbol table: a section symbol (+ aux record) per section, then the image
     # symbols. the section symbol is class STATIC, value 0, 1-based section
@@ -1588,6 +1563,158 @@ fun comdat_select_any_for_section(buf: *u8, symtab_off: usize, num_records: u32,
 # buf_size: length of `buf`
 # out:      image to populate (its arrays are allocated here)
 # ret:      ok(true) on success, or an error string
+# parse a short import record into an image that DECLARES one import
+#
+# The record is an import library's unit of content: it defines no code or data,
+# so the image carries no sections, symbols or relocations and exactly one
+# `of.ImportDecl`. That declaration is the authoritative symbol->library mapping
+# for a two-level namespace, carrying the loader's own DLL name and ordinal.
+#
+# The NUL-terminated names live in the `SizeOfData` payload after the header:
+# symbol first, then DLL, then a distinct export name for NAME_EXPORTAS. Every
+# string is bounded against the payload before being read, so a truncated or
+# hostile member errors here rather than running off the end.
+# ---
+# alloc:    allocator recorded on the image for its arrays
+# itn:      interner the two names are interned into
+# buf:      the member bytes
+# buf_size: length of `buf`
+# out:      image to populate
+# ret:      ok(true) on success, or an error string
+fun coff_parse_import_record(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8,
+                             buf_size: usize, out: *of.ObjectImage) R.Result[bool, str] {
+    if (buf_size < IMPORT_OBJECT_HEADER_SIZE) {
+        ret R.err[bool, str]("coff: import record too small");
+    }
+    if (itn == nil) { ret R.err[bool, str]("coff: no interner for parse"); }
+    if (bin.read_u16_le(buf, 6) != IMAGE_FILE_MACHINE_AMD64) {
+        ret R.err[bool, str]("coff: not an x86-64 import record");
+    }
+
+    val data_size: usize = bin.read_u32_le(buf, 12)::usize;
+    val vr: R.Result[bool, str] = bin.require_region(buf_size, IMPORT_OBJECT_HEADER_SIZE,
+        data_size, "coff: import record name data out of bounds");
+    if (R.is_err[bool, str](vr)) { ret R.err[bool, str](R.unwrap_err[bool, str](vr)); }
+
+    val hint_ord: u16 = bin.read_u16_le(buf, 16);
+    val flags:    u16 = bin.read_u16_le(buf, 18);
+    val import_type: u16 = flags & 0x3;
+    val name_type:   u16 = (flags >> 2) & 0x7;
+    if (import_type > IMPORT_OBJECT_TYPE_CONST) {
+        ret R.err[bool, str]("coff: import record has an invalid import type");
+    }
+    if (name_type > IMPORT_OBJECT_NAME_EXPORTAS) {
+        ret R.err[bool, str]("coff: import record has an invalid name type");
+    }
+    if ((flags & 0xFFE0) != 0) {
+        ret R.err[bool, str]("coff: import record has nonzero reserved flags");
+    }
+
+    # the symbol name, then the DLL name, each NUL-terminated within the payload
+    val base: usize = IMPORT_OBJECT_HEADER_SIZE;
+    val limit: usize = base + data_size;
+    var sym_end: usize = base;
+    for (sym_end < limit && buf[sym_end] != 0) { sym_end = sym_end + 1; }
+    if (sym_end >= limit) { ret R.err[bool, str]("coff: import record symbol name is unterminated"); }
+    val dll_start: usize = sym_end + 1;
+    var dll_end: usize = dll_start;
+    for (dll_end < limit && buf[dll_end] != 0) { dll_end = dll_end + 1; }
+    if (dll_end >= limit) { ret R.err[bool, str]("coff: import record library name is unterminated"); }
+    if (sym_end == base)      { ret R.err[bool, str]("coff: import record has an empty symbol name"); }
+    if (dll_end == dll_start) { ret R.err[bool, str]("coff: import record has an empty library name"); }
+
+    # both required names are NUL-terminated inside the payload, checked above, so
+    # each can be interned in place without copying
+    val sym_r: R.Result[intern.StrId, str] = intern.intern(itn, (?buf[base])::str);
+    if (R.is_err[intern.StrId, str](sym_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sym_r)); }
+    val dll_r: R.Result[intern.StrId, str] = intern.intern(itn, (?buf[dll_start])::str);
+    if (R.is_err[intern.StrId, str](dll_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](dll_r)); }
+
+    # the first string is the public/link symbol. NameType selects the export name
+    # placed in the PE hint/name table: unchanged, with one decoration prefix
+    # removed, undecorated through the first '@', or an explicit third string.
+    var import_name_r: R.Result[intern.StrId, str] = sym_r;
+    if (name_type == IMPORT_OBJECT_NAME_NOPREFIX || name_type == IMPORT_OBJECT_NAME_UNDECORATE) {
+        var name_start: usize = base;
+        if (buf[name_start] == '?'::u8 || buf[name_start] == '@'::u8 || buf[name_start] == '_'::u8) {
+            name_start = name_start + 1;
+        }
+        var name_end: usize = sym_end;
+        if (name_type == IMPORT_OBJECT_NAME_UNDECORATE) {
+            name_end = name_start;
+            for (name_end < sym_end && buf[name_end] != '@'::u8) { name_end = name_end + 1; }
+        }
+        if (name_end == name_start) {
+            ret R.err[bool, str]("coff: import record resolves to an empty export name");
+        }
+        import_name_r = intern.intern_bytes(itn, (?buf[name_start])::str, name_end - name_start);
+    }
+    or (name_type == IMPORT_OBJECT_NAME_EXPORTAS) {
+        val export_start: usize = dll_end + 1;
+        var export_end: usize = export_start;
+        for (export_end < limit && buf[export_end] != 0) { export_end = export_end + 1; }
+        if (export_end >= limit) {
+            ret R.err[bool, str]("coff: import record export name is unterminated");
+        }
+        if (export_end == export_start) {
+            ret R.err[bool, str]("coff: import record has an empty export name");
+        }
+        import_name_r = intern.intern(itn, (?buf[export_start])::str);
+    }
+    if (R.is_err[intern.StrId, str](import_name_r)) {
+        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](import_name_r));
+    }
+
+    val ir: R.Result[*of.ImportDecl, str] = A.zallocate[of.ImportDecl](alloc, 1::usize);
+    if (R.is_err[*of.ImportDecl, str](ir)) { ret R.err[bool, str](R.unwrap_err[*of.ImportDecl, str](ir)); }
+
+    out.alloc         = alloc;
+    out.interner      = itn;
+    out.sections      = nil;
+    out.section_count = 0;
+    out.symbols       = nil;
+    out.symbol_count  = 0;
+    out.relocations   = nil;
+    out.reloc_count   = 0;
+    out.imports       = R.unwrap_ok[*of.ImportDecl, str](ir);
+    out.import_count  = 1;
+
+    out.imports[0].symbol      = R.unwrap_ok[intern.StrId, str](sym_r);
+    out.imports[0].import_name = R.unwrap_ok[intern.StrId, str](import_name_r);
+    out.imports[0].library     = R.unwrap_ok[intern.StrId, str](dll_r);
+    out.imports[0].by_name     = name_type != IMPORT_OBJECT_ORDINAL;
+    out.imports[0].ordinal     = hint_ord;
+    out.imports[0].is_code     = import_type == IMPORT_OBJECT_TYPE_CODE;
+    ret R.ok[bool, str](true);
+}
+
+# whether every section this object carries is an `.idata$` fragment - the shape
+# of an import library's import-directory bookkeeping members, which hold no code
+# or data of the program's own. an ordinary object never carries only these
+# ---
+# buf:          the object bytes
+# secthdr_base: offset of the section header table, already bounds-checked
+# num_secs:     number of section headers
+# ret:          true when the object is import-directory bookkeeping only
+fun coff_is_idata_bookkeeping(buf: *u8, secthdr_base: usize, num_secs: u32) bool {
+    if (num_secs == 0) { ret false; }
+    var i: u32 = 0;
+    for (i < num_secs) {
+        val off: usize = secthdr_base + i::usize * SECTION_HEADER_SIZE;
+        # the inline 8-byte name field; `.idata$<n>` always fits, so a long-name
+        # ("/nnn") indirection never spells one
+        if (buf[off]     != 0x2E) { ret false; }   # '.'
+        if (buf[off + 1] != 0x69) { ret false; }   # 'i'
+        if (buf[off + 2] != 0x64) { ret false; }   # 'd'
+        if (buf[off + 3] != 0x61) { ret false; }   # 'a'
+        if (buf[off + 4] != 0x74) { ret false; }   # 't'
+        if (buf[off + 5] != 0x61) { ret false; }   # 'a'
+        if (buf[off + 6] != 0x24) { ret false; }   # '$'
+        i = i + 1;
+    }
+    ret true;
+}
+
 fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_size: usize, out: *of.ObjectImage) R.Result[bool, str] {
     if (buf == nil || out == nil || buf_size < 4) {
         ret R.err[bool, str]("coff: object too small");
@@ -1600,7 +1727,18 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
     # tell the formats apart.
     val sig1: u16 = bin.read_u16_le(buf, 0);
     val sig2: u16 = bin.read_u16_le(buf, 2);
-    val bigobj: bool = sig1 == IMAGE_FILE_MACHINE_UNKNOWN && sig2 == BIGOBJ_SIG2;
+    val anon: bool = sig1 == IMAGE_FILE_MACHINE_UNKNOWN && sig2 == BIGOBJ_SIG2;
+
+    # an import library's member shares that signature pair. /bigobj is the more
+    # restrictive shape: it must be large enough for its header, carry a supported
+    # version, and carry the fixed ClassID. Anything else with the pair is a short
+    # import record, as specified for import-library pseudo-objects.
+    val bigobj: bool = anon && buf_size >= BIGOBJ_HEADER_SIZE
+        && bin.read_u16_le(buf, 4) >= BIGOBJ_MIN_VERSION
+        && bigobj_class_id_matches(buf, 12);
+    if (anon && !bigobj) {
+        ret coff_parse_import_record(alloc, itn, buf, buf_size, out);
+    }
 
     var num_secs:     u32   = 0;
     var symtab_off:   usize = 0;
@@ -1656,6 +1794,19 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
     out.sections = nil;
     out.symbols = nil;
     out.relocations = nil;
+    out.imports = nil;
+    out.import_count = 0;
+
+    # an import library also carries the traditional import-directory construction:
+    # `.idata$` fragments wired together by ADDR32NB relocations, which a linker that
+    # merges them would assemble into the import table. mach synthesizes its whole
+    # `.idata` from the dynamic plan instead, and the short import records already
+    # carried the mapping, so those members contribute nothing and are dropped whole
+    # rather than merged into an image that would then conflict with the synthesized
+    # directory.
+    if (coff_is_idata_bookkeeping(buf, secthdr_base, num_secs)) {
+        ret R.ok[bool, str](true);
+    }
 
     # count total relocations across sections and total non-aux symbol records.
     var rel_n: u32 = 0;
@@ -1697,8 +1848,8 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
     out.symbol_count  = sym_n;
     out.reloc_count   = rel_n;
 
-    # map a COFF symbol-table record index -> ObjectImage symbol index, so a
-    # relocation's SymbolTableIndex resolves to the interned symbol name.
+    # map a COFF symbol-table record index -> ObjectImage symbol index, preserving
+    # the relocation target's identity even when several symbols share a name.
     val res_map: R.Result[*i32, str] = A.zallocate[i32](alloc, (num_records + 1)::usize);
     if (R.is_err[*i32, str](res_map)) { ret R.err[bool, str]("coff: symbol map alloc failed"); }
     var rec_map: *i32 = R.unwrap_ok[*i32, str](res_map);
@@ -1875,10 +2026,12 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
             out.relocations[idx].addend = read_inplace_addend(?out.sections[s], r_type, r_off);
 
             val rec: u32 = bin.read_u32_le(buf, ro + 4);
+            # rec_map already resolves the COFF record to its ObjectImage symbol
+            # index, which is what the relocation carries.
             if (rec < num_records && rec_map[rec] >= 0) {
-                out.relocations[idx].symbol = out.symbols[rec_map[rec]::u32].name;
+                out.relocations[idx].sym = rec_map[rec]::u32;
             } or {
-                out.relocations[idx].symbol = intern.STR_NIL;
+                out.relocations[idx].sym = of.SYMBOL_NONE;
             }
             rel_i = rel_i + 1;
             k = k + 1;
@@ -1891,8 +2044,8 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
     # even when every reference is a call relocation. recover the function bit from
     # the reloc stream so dynamic-import discovery can still bind those call targets
     # through import stubs. mach's own emitter always stamps DT_FUNCTION on a
-    # call-target import (codegen `pack_reloc_externs`), so this never fires for
-    # mach-produced objects - see issue #1231.
+    # call-target import (codegen's deferred relocation binding), so this never
+    # fires for mach-produced objects - see issue #1231.
     val inf: R.Result[bool, str] = infer_extern_function_flags_from_calls(out);
 
     A.deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
@@ -1913,47 +2066,21 @@ fun is_flagless_extern(sym: *of.Symbol) bool {
 # preceded by a `call`/`jmp rel32` opcode, 0xE8/0xE9) but whose symbol record
 # encodes Type 0. this serves foreign COFF inputs from toolchains that leave an
 # undefined import's type at 0; mach's own emitter already stamps DT_FUNCTION on
-# such imports (codegen `pack_reloc_externs`), so the candidate set below is empty
-# for mach-produced objects and the pass returns before allocating. the flagless
-# undefined externs are indexed by name once, so each call reloc is an O(1) lookup
-# rather than a full symbol-table scan (issue #1231)
+# such imports (codegen's relocation binding), so the pass changes nothing for
+# mach-produced objects. each relocation names its target by index, so the sweep
+# is a single O(relocation) pass with no side table (issue #1231)
 fun infer_extern_function_flags_from_calls(out: *of.ObjectImage) R.Result[bool, str] {
     if (out == nil || out.reloc_count == 0 || out.symbol_count == 0) {
         ret R.ok[bool, str](true);
     }
 
-    # candidates are undefined externs still missing the function bit - the only
-    # symbols inference can change. mach objects have none, so the common path
-    # returns here without allocating.
-    var candidates: u32 = 0;
-    var si: u32 = 0;
-    for (si < out.symbol_count) {
-        if (is_flagless_extern(?out.symbols[si])) { candidates = candidates + 1; }
-        si = si + 1;
-    }
-    if (candidates == 0) { ret R.ok[bool, str](true); }
-
-    # index those candidates by name so each call reloc is an O(1) lookup rather
-    # than a full symbol-table scan.
-    var idx: map.Map[intern.StrId, u32] =
-        map.init[intern.StrId, u32](out.alloc, map.hash_u32, map.eq_u32);
-    si = 0;
-    for (si < out.symbol_count) {
-        if (is_flagless_extern(?out.symbols[si])) {
-            val ins: R.Result[bool, str] =
-                map.insert[intern.StrId, u32](?idx, out.symbols[si].name, si);
-            if (R.is_err[bool, str](ins)) {
-                map.dnit[intern.StrId, u32](?idx);
-                ret R.err[bool, str](R.unwrap_err[bool, str](ins));
-            }
-        }
-        si = si + 1;
-    }
-
     var ri: u32 = 0;
     for (ri < out.reloc_count) {
         val r: *of.Relocation = ?out.relocations[ri];
-        if (r.symbol == intern.STR_NIL)                    { ri = ri + 1; cnt; }
+        if (r.sym >= out.symbol_count)                     { ri = ri + 1; cnt; }
+        # the only symbols inference can change are undefined externs still
+        # missing the function bit; mach objects have none.
+        if (!is_flagless_extern(?out.symbols[r.sym]))      { ri = ri + 1; cnt; }
         if (r.kind != of.RK_PC32 && r.kind != of.RK_PLT32) { ri = ri + 1; cnt; }
         if (r.section >= out.section_count)                { ri = ri + 1; cnt; }
         val sec: *of.Section = ?out.sections[r.section];
@@ -1962,15 +2089,11 @@ fun infer_extern_function_flags_from_calls(out: *of.ObjectImage) R.Result[bool, 
         val op: u8 = sec.bytes[r.offset::usize - 1];
         if (op != 0xE8 && op != 0xE9) { ri = ri + 1; cnt; }
 
-        val g: R.Result[*u32, str] = map.get[intern.StrId, u32](?idx, ?r.symbol);
-        if (R.is_err[*u32, str](g)) { ri = ri + 1; cnt; }
-        val sidx: u32 = @R.unwrap_ok[*u32, str](g);
-        out.symbols[sidx].flags =
-            out.symbols[sidx].flags | of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_GLOBAL;
+        out.symbols[r.sym].flags =
+            out.symbols[r.sym].flags | of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_GLOBAL;
         ri = ri + 1;
     }
 
-    map.dnit[intern.StrId, u32](?idx);
     ret R.ok[bool, str](true);
 }
 
@@ -2563,11 +2686,12 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
         lay.iat_size = (lay.nimp + dyn.lib_count)::usize * THUNK_SIZE::u64;
         ioff = ioff + (lay.nimp + dyn.lib_count)::usize * THUNK_SIZE;
 
-        # hint/name table: one (hint:u16 + name + NUL, 2-byte aligned) per import.
+        # hint/name table: one (hint:u16 + name + NUL, 2-byte aligned) per
+        # by-name import. Ordinal imports encode the ordinal directly in the thunk.
         ioff = bin.align_up(ioff, 2);
         var i: u32 = 0;
         for (i < dyn.import_count) {
-            if (dyn.imports[i].is_func) {
+            if (dyn.imports[i].is_func && !dyn.imports[i].by_ordinal) {
                 ioff = ioff + 2 + name_len_z(itn, dyn.imports[i].symbol);
                 ioff = bin.align_up(ioff, 2);
             }
@@ -2891,10 +3015,9 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
 # RVAs are recovered by `write_pe_stubs` and `patch_pe_fixups` (recomputed by the
 # same import ordinal), so this lays the same offsets `compute_pe_layout` used
 #
-# the ILT and IAT are identical on disk (both are by-name thunks pointing at the
-# hint/name entries); the loader overwrites each IAT thunk with the resolved
-# function address. a thunk with bit 63 set would be an import-by-ordinal; every
-# thunk here is an RVA into the hint/name table (import-by-name).
+# the ILT and IAT are identical on disk. A by-name thunk points at its hint/name
+# entry; an ordinal thunk carries bit 63 plus the 16-bit ordinal directly. The
+# loader overwrites each IAT thunk with the resolved function address.
 fun write_pe_imports(itn: *intern.Interner, buf: *u8, lay: *PeLayout, dyn: *of.DynamicInfo) {
     val sec_off: usize = lay.idata_sec.file_off;
     val sec_rva: u64   = lay.idata_sec.rva;
@@ -2928,16 +3051,21 @@ fun write_pe_imports(itn: *intern.Interner, buf: *u8, lay: *PeLayout, dyn: *of.D
         var imp: u32 = 0;
         for (imp < dyn.import_count) {
             if (dyn.imports[imp].is_func && import_lib_of(dyn, imp) == lib) {
-                val hint_rva: u64 = sec_rva + hcur::u64;
-                # hint = 0; the loader falls back to a binary search by name.
-                bin.write_u16_le(buf, sec_off + hcur, 0);
-                hcur = hcur + 2;
-                hcur = hcur + bin.write_str(buf, sec_off + hcur, bin.resolve_name(itn, dyn.imports[imp].symbol));
-                hcur = bin.align_up(hcur, 2);
+                var thunk: u64 = 0;
+                if (dyn.imports[imp].by_ordinal) {
+                    thunk = IMPORT_ORDINAL_FLAG64 | dyn.imports[imp].ordinal::u64;
+                }
+                or {
+                    thunk = sec_rva + hcur::u64;
+                    bin.write_u16_le(buf, sec_off + hcur, dyn.imports[imp].ordinal);
+                    hcur = hcur + 2;
+                    hcur = hcur + bin.write_str(buf, sec_off + hcur,
+                        bin.resolve_name(itn, dyn.imports[imp].symbol));
+                    hcur = bin.align_up(hcur, 2);
+                }
 
-                # ILT[thunk_ix] and IAT[thunk_ix] = RVA of the hint/name entry.
-                bin.write_u64_le(buf, sec_off + ilt_off + thunk_ix::usize * THUNK_SIZE, hint_rva);
-                bin.write_u64_le(buf, sec_off + iat_off + thunk_ix::usize * THUNK_SIZE, hint_rva);
+                bin.write_u64_le(buf, sec_off + ilt_off + thunk_ix::usize * THUNK_SIZE, thunk);
+                bin.write_u64_le(buf, sec_off + iat_off + thunk_ix::usize * THUNK_SIZE, thunk);
                 thunk_ix = thunk_ix + 1;
             }
             imp = imp + 1;
@@ -3558,9 +3686,9 @@ test "mach.lang.target.of.coff:emit_parse_round_trip" {
     # placeholder so the byte round-trip below holds.
     var relocs: [2]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = syms[2].name; relocs[0].addend = -4;
+    relocs[0].sym = 2; relocs[0].addend = -4;
     relocs[1].section = 0; relocs[1].offset = 4; relocs[1].kind = of.RK_ABS64;
-    relocs[1].symbol = syms[1].name; relocs[1].addend = 0;
+    relocs[1].sym = 1; relocs[1].addend = 0;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -3654,9 +3782,9 @@ test "mach.lang.target.of.coff:emit_parse_round_trip" {
     for (rj < out.reloc_count) {
         if (out.relocations[rj].section != 0) { ret 1; }
         if (out.relocations[rj].offset == 1 && out.relocations[rj].kind == of.RK_PC32
-            && out.relocations[rj].symbol == syms[2].name) { saw_pc32 = true; }
+            && of.reloc_symbol_name(?out, ?out.relocations[rj]) == syms[2].name) { saw_pc32 = true; }
         if (out.relocations[rj].offset == 4 && out.relocations[rj].kind == of.RK_ABS64
-            && out.relocations[rj].symbol == syms[1].name) { saw_abs64 = true; }
+            && of.reloc_symbol_name(?out, ?out.relocations[rj]) == syms[1].name) { saw_abs64 = true; }
         rj = rj + 1;
     }
     if (!saw_pc32 || !saw_abs64) { ret 1; }
@@ -3696,7 +3824,7 @@ test "mach.lang.target.of.coff:relro_round_trip" {
     # an abs64 relocated pointer in the RELRO section, carrying a non-zero addend.
     var relocs: [1]of.Relocation;
     relocs[0].section = 2; relocs[0].offset = 0; relocs[0].kind = of.RK_ABS64;
-    relocs[0].symbol = syms[0].name; relocs[0].addend = 0x20;
+    relocs[0].sym = 0; relocs[0].addend = 0x20;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -3736,6 +3864,177 @@ test "mach.lang.target.of.coff:relro_round_trip" {
 
 # a REL32 addend translates the COFF next-byte-relative (P+4) convention on both
 # parse and emit (#1409)
+# a short import record parses to a declaration rather than an object, and is told
+# apart from /bigobj by the latter's version and ClassID - the two share the
+# Sig1/Sig2 pair, and before #2525 the record was misclassified as /bigobj and
+# rejected for being smaller than a /bigobj header
+test "mach.lang.target.of.coff.coff_parse_object:short_import_record" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    # header + "Sleep\0kernel32.dll\0"
+    var rec: [39]u8;
+    var z: usize = 0;
+    for (z < 39) { rec[z] = 0; z = z + 1; }
+    rec[2] = 0xFF; rec[3] = 0xFF;          # Sig2
+    rec[6] = 0x64; rec[7] = 0x86;          # Machine = AMD64
+    rec[12] = 19;                          # SizeOfData = 19
+    rec[18] = 0x04;                        # NameType = 1 (by name), Type = 0 (code)
+    val sym: str = "Sleep";
+    val dll: str = "kernel32.dll";
+    var k: usize = 0;
+    for (k < 5)  { rec[20 + k] = sym[k]::u8; k = k + 1; }
+    k = 0;
+    for (k < 12) { rec[26 + k] = dll[k]::u8; k = k + 1; }
+
+    var img: of.ObjectImage;
+    val pr: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?rec[0], 39, ?img);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+
+    # it declares an import and defines nothing
+    if (img.import_count != 1)  { ret 1; }
+    if (img.section_count != 0) { ret 1; }
+    if (img.symbol_count != 0)  { ret 1; }
+    if (img.reloc_count != 0)   { ret 1; }
+
+    val sn: O.Option[str] = intern.lookup(?i, img.imports[0].symbol);
+    val en: O.Option[str] = intern.lookup(?i, img.imports[0].import_name);
+    val ln: O.Option[str] = intern.lookup(?i, img.imports[0].library);
+    if (!O.is_some[str](sn) || !str_equals(O.unwrap[str](sn), "Sleep"))        { ret 1; }
+    if (!O.is_some[str](en) || !str_equals(O.unwrap[str](en), "Sleep"))        { ret 1; }
+    if (!O.is_some[str](ln) || !str_equals(O.unwrap[str](ln), "kernel32.dll")) { ret 1; }
+    if (!img.imports[0].by_name) { ret 1; }
+    if (!img.imports[0].is_code) { ret 1; }
+
+    # Version alone cannot make this a /bigobj header. Without the fixed ClassID it
+    # remains an import record, so a future header version with the same payload
+    # shape is not misclassified.
+    rec[4] = BIGOBJ_MIN_VERSION::u8;
+    var img2: of.ObjectImage;
+    val br: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?rec[0], 39, ?img2);
+    if (R.is_err[bool, str](br)) { ret 1; }
+    if (img2.import_count != 1) { ret 1; }
+    ret 0;
+}
+
+# short-import NameType values preserve the public/link symbol while deriving the
+# possibly different export name the PE loader must resolve
+test "mach.lang.target.of.coff.coff_parse_object:short_import_name_types" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    # NAME_NOPREFIX: "_Sleep" is referenced publicly but binds export "Sleep".
+    var np: [40]u8;
+    var z: usize = 0;
+    for (z < 40) { np[z] = 0; z = z + 1; }
+    np[2] = 0xFF; np[3] = 0xFF; np[6] = 0x64; np[7] = 0x86;
+    np[12] = 20; np[18] = (IMPORT_OBJECT_NAME_NOPREFIX << 2)::u8;
+    val np_sym: str = "_Sleep";
+    val dll: str = "kernel32.dll";
+    var k: usize = 0;
+    for (k < 6)  { np[20 + k] = np_sym[k]::u8; k = k + 1; }
+    k = 0;
+    for (k < 12) { np[27 + k] = dll[k]::u8; k = k + 1; }
+    var np_img: of.ObjectImage;
+    val np_r: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?np[0], 40, ?np_img);
+    if (R.is_err[bool, str](np_r)) { ret 1; }
+    val np_public: O.Option[str] = intern.lookup(?i, np_img.imports[0].symbol);
+    val np_export: O.Option[str] = intern.lookup(?i, np_img.imports[0].import_name);
+    if (!O.is_some[str](np_public) || !str_equals(O.unwrap[str](np_public), "_Sleep")) { ret 1; }
+    if (!O.is_some[str](np_export) || !str_equals(O.unwrap[str](np_export), "Sleep"))  { ret 1; }
+
+    # NAME_UNDECORATE additionally truncates the stdcall suffix at the first '@'.
+    var ud: [42]u8;
+    z = 0;
+    for (z < 42) { ud[z] = 0; z = z + 1; }
+    ud[2] = 0xFF; ud[3] = 0xFF; ud[6] = 0x64; ud[7] = 0x86;
+    ud[12] = 22; ud[18] = (IMPORT_OBJECT_NAME_UNDECORATE << 2)::u8;
+    val ud_sym: str = "_Sleep@4";
+    k = 0;
+    for (k < 8)  { ud[20 + k] = ud_sym[k]::u8; k = k + 1; }
+    k = 0;
+    for (k < 12) { ud[29 + k] = dll[k]::u8; k = k + 1; }
+    var ud_img: of.ObjectImage;
+    val ud_r: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?ud[0], 42, ?ud_img);
+    if (R.is_err[bool, str](ud_r)) { ret 1; }
+    val ud_public: O.Option[str] = intern.lookup(?i, ud_img.imports[0].symbol);
+    val ud_export: O.Option[str] = intern.lookup(?i, ud_img.imports[0].import_name);
+    if (!O.is_some[str](ud_public) || !str_equals(O.unwrap[str](ud_public), "_Sleep@4")) { ret 1; }
+    if (!O.is_some[str](ud_export) || !str_equals(O.unwrap[str](ud_export), "Sleep"))    { ret 1; }
+
+    # NAME_EXPORTAS carries an explicit third string, as emitted by llvm-dlltool
+    # for an x86-64 `PublicName == ExportName` definition.
+    var ea: [51]u8;
+    z = 0;
+    for (z < 51) { ea[z] = 0; z = z + 1; }
+    ea[2] = 0xFF; ea[3] = 0xFF; ea[6] = 0x64; ea[7] = 0x86;
+    ea[12] = 31; ea[18] = (IMPORT_OBJECT_NAME_EXPORTAS << 2)::u8;
+    val ea_sym: str = "PublicName";
+    val ea_dll: str = "demo.dll";
+    val ea_export_name: str = "ExportName";
+    k = 0;
+    for (k < 10) { ea[20 + k] = ea_sym[k]::u8; k = k + 1; }
+    k = 0;
+    for (k < 8)  { ea[31 + k] = ea_dll[k]::u8; k = k + 1; }
+    k = 0;
+    for (k < 10) { ea[40 + k] = ea_export_name[k]::u8; k = k + 1; }
+    var ea_img: of.ObjectImage;
+    val ea_r: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?ea[0], 51, ?ea_img);
+    if (R.is_err[bool, str](ea_r)) { ret 1; }
+    val ea_public: O.Option[str] = intern.lookup(?i, ea_img.imports[0].symbol);
+    val ea_export: O.Option[str] = intern.lookup(?i, ea_img.imports[0].import_name);
+    if (!O.is_some[str](ea_public) || !str_equals(O.unwrap[str](ea_public), "PublicName")) { ret 1; }
+    if (!O.is_some[str](ea_export) || !str_equals(O.unwrap[str](ea_export), "ExportName")) { ret 1; }
+    ret 0;
+}
+
+# a truncated or unterminated record is rejected rather than read past its payload
+test "mach.lang.target.of.coff.coff_parse_object:malformed_import_record" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    # SizeOfData claims more bytes than the buffer holds
+    var over: [24]u8;
+    var z: usize = 0;
+    for (z < 24) { over[z] = 0; z = z + 1; }
+    over[2] = 0xFF; over[3] = 0xFF;
+    over[6] = 0x64; over[7] = 0x86;
+    over[12] = 64;
+    var img1: of.ObjectImage;
+    val r1: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?over[0], 24, ?img1);
+    if (R.is_ok[bool, str](r1)) { ret 1; }
+
+    # the payload never terminates the symbol name, so no library name follows
+    var unterm: [24]u8;
+    z = 0;
+    for (z < 24) { unterm[z] = 0x41; z = z + 1; }
+    unterm[0] = 0; unterm[1] = 0;
+    unterm[2] = 0xFF; unterm[3] = 0xFF;
+    unterm[4] = 0; unterm[5] = 0;
+    unterm[6] = 0x64; unterm[7] = 0x86;
+    unterm[8] = 0; unterm[9] = 0; unterm[10] = 0; unterm[11] = 0;
+    unterm[12] = 4; unterm[13] = 0; unterm[14] = 0; unterm[15] = 0;
+    unterm[16] = 0; unterm[17] = 0; unterm[18] = 4; unterm[19] = 0;
+    var img2: of.ObjectImage;
+    val r2: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?unterm[0], 24, ?img2);
+    if (R.is_ok[bool, str](r2)) { ret 1; }
+
+    # the three reserved NameType values and the high reserved bits are rejected
+    # instead of silently changing the loader binding.
+    unterm[18] = (5 << 2)::u8;
+    var img3: of.ObjectImage;
+    val r3: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?unterm[0], 24, ?img3);
+    if (R.is_ok[bool, str](r3)) { ret 1; }
+    unterm[18] = 0x20;
+    var img4: of.ObjectImage;
+    val r4: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?unterm[0], 24, ?img4);
+    if (R.is_ok[bool, str](r4)) { ret 1; }
+    ret 0;
+}
+
 test "mach.lang.target.of.coff.read_inplace_addend:rel32_p4_convention" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -3795,7 +4094,7 @@ test "mach.lang.target.of.coff.read_inplace_addend:rel32_p4_convention" {
 
     var relocs: [1]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = syms[1].name; relocs[0].addend = 0;
+    relocs[0].sym = 1; relocs[0].addend = 0;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -3868,13 +4167,12 @@ test "mach.lang.target.of.coff.coff_emit_object:unresolved_reloc_symbol" {
     syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
     syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
 
-    # the relocation targets a symbol interned but absent from the image symbol
-    # table - the back-end-invariant violation #1196 must surface as an error,
-    # not silently alias the first section symbol.
-    val ghost: intern.StrId = t_intern(?i, "ghost_symbol");
+    # the relocation indexes past the image symbol table - the producer-invariant
+    # violation #1196 must surface as an error, not silently alias
+    # the first section symbol.
     var relocs: [1]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = ghost; relocs[0].addend = 0;
+    relocs[0].sym = 1; relocs[0].addend = 0;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -3893,7 +4191,7 @@ test "mach.lang.target.of.coff.coff_emit_object:unresolved_reloc_symbol" {
     fs.temp_close_and_remove(?tf);
 
     if (!R.is_err[bool, str](em))                                   { ret 1; }
-    if (!str_contains(R.unwrap_err[bool, str](em), "ghost_symbol")) { ret 1; }
+    if (!str_contains(R.unwrap_err[bool, str](em), "unresolved symbol")) { ret 1; }
     ret 0;
 }
 
@@ -3939,7 +4237,7 @@ test "mach.lang.target.of.coff:defined_weak_comdat_round_trip" {
     # weak body bytes are unchanged and the carve's byte round-trip holds.
     var relocs: [1]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 12; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = syms[2].name; relocs[0].addend = -4;
+    relocs[0].sym = 2; relocs[0].addend = -4;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -4018,7 +4316,7 @@ test "mach.lang.target.of.coff:defined_weak_comdat_round_trip" {
     var saw_reloc: bool = false;
     var rj: u32 = 0;
     for (rj < out.reloc_count) {
-        if (out.relocations[rj].symbol == syms[2].name && out.relocations[rj].offset == 4) {
+        if (of.reloc_symbol_name(?out, ?out.relocations[rj]) == syms[2].name && out.relocations[rj].offset == 4) {
             # its section must be the COMDAT carrier, i.e. the weak symbol's section.
             var wsec: u32 = of.SECTION_EXTERNAL;
             var sj: u32 = 0;
@@ -4573,7 +4871,7 @@ test "mach.lang.target.of.coff:call_target_import_function_flag" {
 
     var relocs: [1]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = syms[1].name; relocs[0].addend = -4;
+    relocs[0].sym = 1; relocs[0].addend = -4;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -4651,7 +4949,7 @@ test "mach.lang.target.of.coff.infer_extern_function_flags_from_calls:foreign_ca
 
     var relocs: [1]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = syms[1].name; relocs[0].addend = -4;
+    relocs[0].sym = 1; relocs[0].addend = -4;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -5008,7 +5306,7 @@ test "mach.lang.target.of.coff.coff_emit_object:unsupported_reloc_kind" {
     # over the 4-byte field); it must now fail naming the kind.
     var relocs: [1]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_GOTPCREL;
-    relocs[0].symbol = syms[0].name; relocs[0].addend = 0;
+    relocs[0].sym = 0; relocs[0].addend = 0;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -5090,7 +5388,7 @@ test "mach.lang.target.of.coff.coff_parse_object:rejects_unmapped_type" {
 
     var relocs: [1]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = syms[0].name; relocs[0].addend = 0;
+    relocs[0].sym = 0; relocs[0].addend = 0;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -5166,7 +5464,7 @@ test "mach.lang.target.of.coff.coff_emit_object:reloc_count_overflow" {
     var r: u32 = 0;
     for (r < nrel) {
         relocs[r].section = 0; relocs[r].offset = 0; relocs[r].kind = of.RK_PC32;
-        relocs[r].symbol = syms[0].name; relocs[r].addend = 0;
+        relocs[r].sym = 0; relocs[r].addend = 0;
         r = r + 1;
     }
 
@@ -5268,6 +5566,8 @@ fun t_iat_slots_exact(i: *intern.Interner, counts: *u32, nlib: u32) bool {
             imports[total].symbol = t_intern(i, "fn");
             imports[total].lib_index = l;
             imports[total].is_func = true;
+            imports[total].ordinal = 0;
+            imports[total].by_ordinal = false;
             total = total + 1;
             j = j + 1;
         }
