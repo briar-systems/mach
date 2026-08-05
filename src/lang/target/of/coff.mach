@@ -2103,17 +2103,22 @@ fun infer_extern_function_flags_from_calls(out: *of.ObjectImage) R.Result[bool, 
 
 # the resolved layout of one PE section: its in-memory RVA (relative to ImageBase)
 # and file offset, plus the virtual and on-disk sizes. the writer fills a section
-# table from these and copies the section bytes to `file_off`
+# table from these and copies linker-segment bytes to `content_file_off`
 # ---
-# rva:       in-memory address relative to ImageBase (SectionAlignment-aligned)
-# vsize:     in-memory size in bytes (before file alignment)
-# file_off:  file offset of the section's raw data (FileAlignment-aligned)
-# file_size: on-disk raw-data size (vsize rounded up to FileAlignment)
+# rva:              section start relative to ImageBase (SectionAlignment-aligned)
+# vsize:            in-memory section size in bytes (before file alignment)
+# file_off:         file offset of the section's raw data (FileAlignment-aligned)
+# file_size:        on-disk raw-data size (vsize rounded up to FileAlignment)
+# content_rva:      linker segment content start (equal to rva except when the first
+#                   segment needs prefix padding to follow the headers contiguously)
+# content_file_off: file offset corresponding to content_rva
 rec PeSection {
-    rva:       u64;
-    vsize:     u64;
-    file_off:  usize;
-    file_size: usize;
+    rva:              u64;
+    vsize:            u64;
+    file_off:         usize;
+    file_size:        usize;
+    content_rva:      u64;
+    content_file_off: usize;
 }
 
 # the resolved layout of a PE32+ image: ImageBase, the header span, the linker's
@@ -2295,10 +2300,10 @@ fun base_reloc_cmp(a: *of.BaseReloc, b: *of.BaseReloc) i64 {
     ret 0;
 }
 
-# the image RVA of a base relocation's fixup slot: the patched segment's RVA plus the
-# slot's byte offset within it
+# the image RVA of a base relocation's fixup slot: the patched segment content's
+# RVA plus the slot's byte offset within it
 fun base_reloc_rva(br: *of.BaseReloc, seg_secs: *PeSection) u64 {
-    ret seg_secs[br.seg_index].rva + br.seg_offset::u64;
+    ret seg_secs[br.seg_index].content_rva + br.seg_offset::u64;
 }
 
 # the 4-KiB page base RVA a fixup falls in (the IMAGE_BASE_RELOCATION block key)
@@ -2669,10 +2674,11 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
         + OPTIONAL_HEADER_SIZE + nsec::usize * SECTION_HEADER_SIZE;
     lay.header_size = bin.align_up(headers_raw, PE_FILE_ALIGN::usize);
 
-# the explicit image base is the same value relocation application used. headers
-# map at RVA 0 and the first linker segment starts after the section-aligned header
-# reserve, leaving no header-to-section gap. the caller later verifies that this
-# reserve fits the one page the Windows linker layout set aside
+    # the explicit image base is the same value relocation application used. headers
+    # map at RVA 0 and the first PE section starts after the section-aligned header
+    # reserve, leaving no header-to-section gap. when the generic linker aligned its
+    # first content above that address, prefix padding inside the section preserves
+    # the content's exact RVA without recreating the loader-rejected gap from #1374
     val header_reserve: u64 = bin.align_up_u64(lay.header_size::u64, PE_SECTION_ALIGN);
     lay.image_base = image_base;
 
@@ -2684,10 +2690,16 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
     var li: u32 = 0;
     for (li < seg_count) {
         val seg_rva: u64 = segs[li].vaddr - lay.image_base;
-        seg_secs[li].rva       = seg_rva;
-        seg_secs[li].vsize     = segs[li].memsz::u64;
-        seg_secs[li].file_off  = file_off;
-        seg_secs[li].file_size = bin.align_up(segs[li].filesz, PE_FILE_ALIGN::usize);
+        var sec_rva: u64 = seg_rva;
+        if (li == 0) { sec_rva = header_reserve; }
+        val prefix: u64 = seg_rva - sec_rva;
+        seg_secs[li].rva              = sec_rva;
+        seg_secs[li].vsize            = prefix + segs[li].memsz::u64;
+        seg_secs[li].file_off         = file_off;
+        seg_secs[li].file_size        = bin.align_up(prefix::usize + segs[li].filesz,
+                                                     PE_FILE_ALIGN::usize);
+        seg_secs[li].content_rva      = seg_rva;
+        seg_secs[li].content_file_off = file_off + prefix::usize;
         file_off = file_off + seg_secs[li].file_size;
         # the next synthesized section starts above this segment's mapped span.
         val seg_end: u64 = bin.align_up_u64(seg_rva + segs[li].memsz::u64, PE_SECTION_ALIGN);
@@ -3019,7 +3031,8 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
     var li: u32 = 0;
     for (li < seg_count) {
         if (segs[li].bytes != nil && segs[li].filesz > 0) {
-            memory.raw_copy((buf::usize + seg_secs[li].file_off)::ptr, segs[li].bytes::ptr, segs[li].filesz);
+            memory.raw_copy((buf::usize + seg_secs[li].content_file_off)::ptr,
+                            segs[li].bytes::ptr, segs[li].filesz);
         }
         li = li + 1;
     }
@@ -3371,7 +3384,7 @@ fun write_pe_unwind(buf: *u8, lay: *PeLayout, uws: *FunctionUnwind, uw_count: u3
     i = 0;
     for (i < uw_count) {
         val poff: usize = lay.pdata_sec.file_off + row::usize * RUNTIME_FUNCTION_SIZE;
-        val seg_rva: u64 = lay.seg_secs[uws[i].seg_index].rva;
+        val seg_rva: u64 = lay.seg_secs[uws[i].seg_index].content_rva;
         val begin_rva: u32 = (seg_rva + uws[i].seg_offset::u64)::u32;
         bin.write_u32_le(buf, poff, begin_rva);
         bin.write_u32_le(buf, poff + 4, begin_rva + uws[i].size);
@@ -3413,7 +3426,7 @@ fun patch_pe_fixups(buf: *u8, lay: *PeLayout, dyn: *of.DynamicInfo, fixups: *of.
             ret R.err[bool, str]("coff: dynamic call-site displacement overflows 32 bits");
         }
 
-        val file_off: usize = lay.seg_secs[fx.seg_index].file_off + fx.seg_offset::usize;
+        val file_off: usize = lay.seg_secs[fx.seg_index].content_file_off + fx.seg_offset::usize;
         bin.write_u32_le(buf, file_off, (disp::u64)::u32);
         i = i + 1;
     }
@@ -5301,8 +5314,9 @@ test "mach.lang.target.of.coff.coff_emit_exec:foreign_pdata_authoritative" {
 
     val image_base: u64 = 0x140000000;
     var segs: [2]of.LoadSegment;
-    # deliberately leave a two-page header gap: a valid 8 KiB-aligned input text
-    # section lands here, so deriving ImageBase as seg0-page would corrupt its RVAs.
+    # a valid 8 KiB-aligned input text section lands at RVA 0x2000. the PE section
+    # itself must still start immediately after the headers at RVA 0x1000 (#1374),
+    # with prefix padding up to the exact content RVA used by ADDR32NB relocations
     segs[0].vaddr = image_base + 0x2000; segs[0].filesz = 14; segs[0].memsz = 14;
     segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text_bytes[0];
     segs[1].vaddr = image_base + 0x3000; segs[1].filesz = 8; segs[1].memsz = 8;
@@ -5341,7 +5355,12 @@ test "mach.lang.target.of.coff.coff_emit_exec:foreign_pdata_authoritative" {
     if (bin.read_u16_le(buf.data, ch + 2) != 3) { ret 1; }
     val oh: usize = ch + COFF_HEADER_SIZE;
     if (bin.read_u64_le(buf.data, oh + 24) != image_base) { ret 1; }
-    if (bin.read_u32_le(buf.data, oh + OPTIONAL_HEADER_SIZE + 12) != 0x2000) { ret 1; }
+    val text_sh: usize = oh + OPTIONAL_HEADER_SIZE;
+    if (bin.read_u32_le(buf.data, text_sh + 12) != 0x1000) { ret 1; }
+    if (bin.read_u32_le(buf.data, text_sh + 8) != 0x100E) { ret 1; }
+    val text_ptr: usize = bin.read_u32_le(buf.data, text_sh + 20)::usize;
+    if (buf.data[text_ptr + 0x1000] != text_bytes[0]
+        || buf.data[text_ptr + 0x100D] != text_bytes[13]) { ret 1; }
     val dd: usize = oh + 112;
     val exc_rva: u32 = bin.read_u32_le(buf.data, dd + IMAGE_DIRECTORY_ENTRY_EXCEPTION::usize * DATA_DIR_SIZE);
     val exc_size: u32 = bin.read_u32_le(buf.data, dd + IMAGE_DIRECTORY_ENTRY_EXCEPTION::usize * DATA_DIR_SIZE + 4);
