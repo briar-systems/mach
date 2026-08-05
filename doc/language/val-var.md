@@ -62,8 +62,9 @@ ext var errno: i32;                        # imported mutable datum
 
 - No initializer. `ext val x: T = ...;` is an error — the definition, and its
   value, live in the providing object (mirrors `ext fun`'s absent body).
-- The `symbol` and `library` decorators and the static/dynamic linking inputs
-  work exactly as for [`ext fun`](ext-fun.md).
+- The symbol name (the target's C spelling of the identifier), the `symbol` and
+  `library` decorators, and the static/dynamic linking inputs all work exactly as
+  for [`ext fun`](ext-fun.md).
 - On a dynamic target the reference is emitted GOT-indirect so the loader binds
   it to the runtime definition (ELF: an `R_*_GLOB_DAT` GOT slot); an ordinary
   cross-module reference to a `val`/`var` defined elsewhere in the same artifact

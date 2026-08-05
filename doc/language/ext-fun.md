@@ -23,15 +23,25 @@ pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ext fun strlen(s: *u8) i64;             # private, file-local
 ```
 
-## Symbol rename
+## Symbol name
 
-By default the linker symbol matches the Mach name. Override it with the
-`symbol` decorator:
+The declaration names a C declaration, so its linker symbol is whatever the
+target's C toolchain emits for that identifier. On Linux and Windows that is the
+name as written; on Darwin the C ABI prefixes an underscore, so `ext fun
+mad_open` binds the `_mad_open` a C object there defines. You write the C name
+either way — the prefix is never spelled in source.
+
+Override the symbol outright with the `symbol` decorator:
 
 ```mach
 #[symbol("write")]
 pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ```
+
+An overridden name is taken **literally**: it is the object symbol, so no
+platform prefix is applied to it and you spell the exact name the object carries
+(`_write` on Darwin, `write` elsewhere). That is what lets inline asm and the
+runtime entry points name a symbol exactly.
 
 Common reasons to rename:
 
