@@ -42,9 +42,10 @@
 #                 is exactly the regression this guards.
 #   debuginfo   — build the case with and without `-g` (run.sh builds both) and
 #                 assert over the artifacts: llvm-dwarfdump --verify accepts the `-g`
-#                 image and `-g` is loadable-byte additive (PT_LOAD segments identical).
-#                 the one producer that needs external validators (llvm-dwarfdump,
-#                 readelf); it runs only on the ELF debug-info legs, which install them.
+#                 image, `-g` is loadable-byte additive, discarded weak templates do
+#                 not alias live line/location metadata, and live names symbolize.
+#                 requires llvm-dwarfdump, llvm-symbolizer, and readelf; it runs only
+#                 on the ELF debug-info legs, which install them.
 #   spirv-val   — validate every `.spv` module a finished-module target delivered
 #                 with the Khronos validator (spirv-tools). the target links
 #                 nothing, so there is no binary to run and the module tree is the
@@ -935,6 +936,15 @@ resolve_dwarfdump() {
     return 1
 }
 
+# resolve_symbolizer — print an llvm-symbolizer on PATH, preferring the unversioned
+# name and falling back to the highest-versioned one from the llvm package.
+resolve_symbolizer() {
+    if command -v llvm-symbolizer >/dev/null 2>&1; then echo llvm-symbolizer; return 0; fi
+    newest=$(compgen -c 'llvm-symbolizer-' 2>/dev/null | sort -t- -k3 -n | tail -1)
+    [ -n "$newest" ] && { echo "$newest"; return 0; }
+    return 1
+}
+
 # _norm_shdr_fields <in> <out> — copy <in> to <out> zeroing the ELF header's
 # section-table bookkeeping (e_shoff @40 8B, e_shnum @60 2B, e_shstrndx @62 2B), which
 # legitimately differs once `-g` adds named debug sections. everything else — every
@@ -970,15 +980,20 @@ elf_seg_identical() {
 # produce_debuginfo <runmode> <target> <nog_binary> <g_binary>
 # the binary-inspection producer for the debuginfo case kind (#2039): asserts, purely
 # host-side over the artifacts run.sh built with and without `-g`, that (1) the
-# standard structural validator accepts the whole `-g` image and (2) `-g` is loadable-
-# byte additive. the two facts are ISA-independent, so the golden is one shared
-# expect.txt. requires llvm-dwarfdump and readelf on the leg (the ELF debug-info legs
-# install them); a missing validator is a hard error, never a silent skip.
+# standard structural validator accepts the whole `-g` image, (2) `-g` is loadable-
+# byte additive, and (3) duplicate generic, comptime-value, and pack instances retain
+# one live, symbolizable DIE while each discarded copy carries DWARF's dead-code address,
+# has no line-table sequence at the winner, and has no location list at the winner.
+# the facts are ISA-independent, so the golden is shared. requires llvm-dwarfdump,
+# llvm-symbolizer, and readelf on the leg; a missing validator is a hard error.
 produce_debuginfo() {
     nog=$3
     g=$4
     dd_tool=$(resolve_dwarfdump) || {
         echo "int: debuginfo: llvm-dwarfdump not found (install the 'llvm' package)" >&2; return 2
+    }
+    sym_tool=$(resolve_symbolizer) || {
+        echo "int: debuginfo: llvm-symbolizer not found (install the 'llvm' package)" >&2; return 2
     }
     command -v readelf >/dev/null 2>&1 || {
         echo "int: debuginfo: readelf not found (install 'binutils')" >&2; return 2
@@ -995,6 +1010,61 @@ produce_debuginfo() {
     else
         echo "g_additive=no"
     fi
+
+    # helper and main instantiate all three weak template forms. each winner must
+    # symbolize by source name while the losing atom's DIE retains a dead low_pc.
+    info=$("$dd_tool" --debug-info "$g") || return 1
+    lines=$("$dd_tool" --debug-line "$g") || return 1
+    locations=$("$dd_tool" --debug-loclists "$g") || return 1
+    for spec in ident:ident value:add_n pack:pack_sum; do
+        label=${spec%%:*}
+        want=${spec#*:}
+        counts=$(printf '%s\n' "$info" | awk -v want="$want" '
+            index($0, "DW_AT_name") && index($0, "(\"" want "\")") {
+                getline
+                if ($0 ~ /dead code/) { dead++ }
+                else if ($0 ~ /DW_AT_low_pc.*0x/) {
+                    live++
+                    if (addr == "" && match($0, /0x[0-9a-fA-F]+/)) {
+                        addr = substr($0, RSTART, RLENGTH)
+                    }
+                }
+            }
+            END { printf "%d %d %s", live, dead, addr }
+        ')
+        set -- $counts
+        printf 'weak_%s_dies=live:%s,dead:%s\n' "$label" "$1" "$2"
+        symbol=missing
+        if [ -n "$3" ]; then
+            resolved=$("$sym_tool" --obj="$g" "$3" | sed -n '1p')
+            if [ "$resolved" = "$want" ]; then symbol=$resolved; fi
+        fi
+        printf 'weak_%s_symbol=%s\n' "$label" "$symbol"
+
+        # every live template has exactly one sequence beginning at its entry. a
+        # losing weak set_address that resolves to the winner creates a second
+        # prologue_end row at that address while remaining validator-clean.
+        line_starts=$(printf '%s\n' "$lines" | awk -v addr="$3" '
+            $1 == addr && /prologue_end/ { n++ }
+            END { print n + 0 }
+        ')
+        line_state="count:$line_starts"
+        [ "$line_starts" -eq 1 ] && line_state=unique
+        printf 'weak_%s_lines=%s\n' "$label" "$line_state"
+
+        # pack_sum's changing accumulator home gives it a location list in debug
+        # builds. release may optimize that list away, so the invariant is that at
+        # most one list starts at the winner; a losing base_address alias makes two.
+        if [ "$label" = pack ]; then
+            loc_starts=$(printf '%s\n' "$locations" | awk -v addr="$3" '
+                index($0, "[" addr ",") { n++ }
+                END { print n + 0 }
+            ')
+            loc_state="aliased:$loc_starts"
+            [ "$loc_starts" -le 1 ] && loc_state=not-aliased
+            printf 'weak_pack_locations=%s\n' "$loc_state"
+        fi
+    done
 }
 
 # resolve_objdump — print an llvm-objdump on PATH, preferring the unversioned name
