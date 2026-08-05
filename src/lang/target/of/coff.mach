@@ -92,6 +92,9 @@ val IMAGE_SYM_CLASS_EXTERNAL:      u8 = 2;
 val IMAGE_SYM_CLASS_STATIC:        u8 = 3;
 val IMAGE_SYM_CLASS_WEAK_EXTERNAL: u8 = 105;
 
+# weak-external resolution modes (IMAGE_WEAK_EXTERN_SEARCH_*)
+val IMAGE_WEAK_EXTERN_SEARCH_ALIAS: u32 = 3;
+
 # the undefined / special section number (SectionNumber is 1-based and signed;
 # values <= 0 are undefined or absolute)
 val IMAGE_SYM_UNDEFINED: i16 = 0;
@@ -1072,6 +1075,61 @@ fun sym_naux_off(sym_off: usize, bigobj: bool) usize {
     ret sym_off + 17;
 }
 
+# normalize COFF weak-external aliases into ordinary weak definitions
+#
+# MinGW's compiler runtime publishes names such as `strlen` as undefined
+# IMAGE_SYM_CLASS_WEAK_EXTERNAL records whose aux entry aliases a separately
+# named definition in the same object. The generic linker has no COFF alias
+# node, so recover the public symbol's target section/offset/type here. Search
+# modes other than ALIAS retain their ordinary undefined-weak semantics.
+# ---
+# buf:         complete object bytes; the caller validated the symbol-table span
+# symtab_off:  byte offset of the COFF symbol table
+# num_records: raw record count, including aux records
+# bigobj:      whether records use the 20-byte /bigobj shape
+# rec_map:     raw record index -> ObjectImage symbol index
+# out:         populated image whose alias symbols are normalized in place
+# ret:         ok(true), or an error for a malformed ALIAS aux reference
+fun normalize_weak_external_aliases(buf: *u8, symtab_off: usize,
+                                    num_records: u32, bigobj: bool,
+                                    rec_map: *i32,
+                                    out: *of.ObjectImage) R.Result[bool, str] {
+    val symbol_size: usize = sym_record_size(bigobj);
+    var ri: u32 = 0;
+    for (ri < num_records) {
+        val so: usize = symtab_off + ri::usize * symbol_size;
+        val aux: u8 = buf[sym_naux_off(so, bigobj)];
+        val scl: u8 = buf[sym_storage_class_off(so, bigobj)];
+        if (scl == IMAGE_SYM_CLASS_WEAK_EXTERNAL
+            && read_sym_section_number(buf, so, bigobj) == IMAGE_SYM_UNDEFINED::i32) {
+            if (aux == 0 || ri + 1 >= num_records) {
+                ret R.err[bool, str]("coff: weak external has no aux record");
+            }
+            val ao: usize = so + symbol_size;
+            val target_rec: u32 = bin.read_u32_le(buf, ao);
+            val search: u32 = bin.read_u32_le(buf, ao + 4);
+            if (search == IMAGE_WEAK_EXTERN_SEARCH_ALIAS) {
+                if (target_rec >= num_records || rec_map[ri] < 0
+                    || rec_map[target_rec] < 0) {
+                    ret R.err[bool, str]("coff: weak external alias target is invalid");
+                }
+                val public: *of.Symbol = ?out.symbols[rec_map[ri]::u32];
+                val target: *of.Symbol = ?out.symbols[rec_map[target_rec]::u32];
+                if (target.section == of.SECTION_EXTERNAL) {
+                    ret R.err[bool, str]("coff: weak external alias target is undefined");
+                }
+                public.section = target.section;
+                public.offset = target.offset;
+                public.size = target.size;
+                public.flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK
+                    | (target.flags & (of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_OBJECT));
+            }
+        }
+        ri = ri + 1 + aux::u32;
+    }
+    ret R.ok[bool, str](true);
+}
+
 # serialize a COMDAT-prepared object image to a relocatable x86-64 COFF object
 #
 # Writes the file header, section-header table, per-section raw data, per-section
@@ -1993,6 +2051,16 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
             a = a + 1;
         }
         ri = ri + 1 + aux::u32;
+    }
+
+    # resolve MinGW/compiler-rt weak aliases only after every raw record has an
+    # image-symbol mapping: an alias aux entry may point forward in the table.
+    val wa: R.Result[bool, str] =
+        normalize_weak_external_aliases(buf, symtab_off, num_records,
+                                        bigobj, rec_map, out);
+    if (R.is_err[bool, str](wa)) {
+        A.deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
+        ret R.err[bool, str](R.unwrap_err[bool, str](wa));
     }
 
     # relocations: each section header points at its IMAGE_RELOCATION array.
@@ -4042,6 +4110,48 @@ test "mach.lang.target.of.coff:relro_round_trip" {
     # the abs64 addend carried in the RELRO section round-trips.
     if (out.reloc_count != 1) { ret 1; }
     if (out.relocations[0].kind != of.RK_ABS64 || out.relocations[0].addend != 0x20) { ret 1; }
+    ret 0;
+}
+
+# an IMAGE_WEAK_EXTERN_SEARCH_ALIAS record becomes a defined weak public symbol
+# at its linked target. This is the shape Zig's MinGW compiler_rt archive uses
+# for fallback CRT functions such as strlen.
+test "mach.lang.target.of.coff.normalize_weak_external_aliases:alias" {
+    var records: [54]u8;
+    var z: usize = 0;
+    for (z < 54) { records[z] = 0; z = z + 1; }
+
+    # record 0 is the public weak external, record 1 its aux alias descriptor,
+    # and record 2 the differently named implementation definition.
+    write_sym_tail(?records[0], 0, false, IMAGE_SYM_UNDEFINED::i32, 0,
+                   IMAGE_SYM_CLASS_WEAK_EXTERNAL, 1);
+    bin.write_u32_le(?records[0], SYMBOL_SIZE, 2);
+    bin.write_u32_le(?records[0], SYMBOL_SIZE + 4, IMAGE_WEAK_EXTERN_SEARCH_ALIAS);
+    write_sym_tail(?records[0], SYMBOL_SIZE * 2, false, 1,
+                   IMAGE_SYM_DTYPE_FUNCTION, IMAGE_SYM_CLASS_EXTERNAL, 0);
+
+    var rec_map: [3]i32;
+    rec_map[0] = 0; rec_map[1] = 0; rec_map[2] = 1;
+    var symbols: [2]of.Symbol;
+    symbols[0].name = intern.STR_NIL; symbols[0].section = of.SECTION_EXTERNAL;
+    symbols[0].offset = 0; symbols[0].size = 0;
+    symbols[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK
+        | of.SYM_OBJ_FLAG_EXTERN;
+    symbols[1].name = intern.STR_NIL; symbols[1].section = 0;
+    symbols[1].offset = 17; symbols[1].size = 23;
+    symbols[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var img: of.ObjectImage;
+    img.symbols = ?symbols[0]; img.symbol_count = 2;
+
+    val nr: R.Result[bool, str] = normalize_weak_external_aliases(
+        ?records[0], 0, 3, false, ?rec_map[0], ?img);
+    if (R.is_err[bool, str](nr)) { ret 1; }
+    if (symbols[0].section != 0 || symbols[0].offset != 17
+        || symbols[0].size != 23) { ret 1; }
+    if ((symbols[0].flags & of.SYM_OBJ_FLAG_GLOBAL) == 0
+        || (symbols[0].flags & of.SYM_OBJ_FLAG_WEAK) == 0
+        || (symbols[0].flags & of.SYM_OBJ_FLAG_FUNCTION) == 0
+        || (symbols[0].flags & of.SYM_OBJ_FLAG_EXTERN) != 0) { ret 1; }
     ret 0;
 }
 

@@ -39,7 +39,10 @@ use std.types.size.usize;
 use std.types.string.str;
 use std.types.string.str_empty;
 use std.types.string.str_equals;
+use std.types.string.str_join;
 use std.types.string.str_len;
+use std.types.string.str_starts_with;
+use std.text.string.str_free;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -227,6 +230,20 @@ rec StrMerge {
     active: bool;
 }
 
+# the symbol frontier used while consuming ordered static link inputs
+#
+# Loose objects always join the link and seed this state. An archive member joins
+# only when it provides a name currently in `unresolved`; accepting it adds its
+# definitions/import declarations and any new undefined globals. The state lives
+# only while files are read, before the ordinary symbol merge.
+# ---
+# providers:  names already supplied by an accepted object or import record
+# unresolved: accepted objects' global undefined names not yet supplied
+rec ArchiveResolution {
+    providers:  map.Map[intern.StrId, u32];
+    unresolved: map.Map[intern.StrId, u32];
+}
+
 # read the input object files from disk and combine them into the
 # requested artifact
 #
@@ -276,12 +293,24 @@ pub fun link(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
 
     val alloc: *A.Allocator = s.alloc;
 
+    var required: intern.StrId = intern.STR_NIL;
+    if (mode == LINK_EXE) {
+        val er: R.Result[intern.StrId, str] =
+            intern.intern(?s.interner, tgt.os.entry_symbol);
+        if (R.is_err[intern.StrId, str](er)) {
+            ret R.err[bool, str](R.unwrap_err[intern.StrId, str](er));
+        }
+        required = R.unwrap_ok[intern.StrId, str](er);
+    }
+
     # read and parse every input object file into an in-memory image array. an
     # `.a` archive input expands into one image per member object, so the parsed
     # image count can exceed the input-path count - `read_objects` reports the
     # true module count through `module_count`.
     var module_count: u32 = 0;
-    val read_r: R.Result[*of.ObjectImage, str] = read_objects(s, tgt, obj_paths, obj_count, ?module_count);
+    val read_r: R.Result[*of.ObjectImage, str] =
+        read_objects(s, tgt, obj_paths, obj_count, nil::*of.ObjectImage, 0,
+                     required, ?module_count);
     if (R.is_err[*of.ObjectImage, str](read_r)) {
         ret R.err[bool, str](R.unwrap_err[*of.ObjectImage, str](read_r));
     }
@@ -381,12 +410,24 @@ pub fun link_mixed(s: *session.Session, tgt: *target.Target,
 
     val alloc: *A.Allocator = s.alloc;
 
+    var required: intern.StrId = intern.STR_NIL;
+    if (mode == LINK_EXE) {
+        val er: R.Result[intern.StrId, str] =
+            intern.intern(?s.interner, tgt.os.entry_symbol);
+        if (R.is_err[intern.StrId, str](er)) {
+            ret R.err[bool, str](R.unwrap_err[intern.StrId, str](er));
+        }
+        required = R.unwrap_ok[intern.StrId, str](er);
+    }
+
     # read and parse the external inputs from disk into their own owned array; with
     # none, this stays an empty set and the link is a pure in-memory one.
     var ext_count: u32 = 0;
     var ext: *of.ObjectImage = nil;
     if (obj_paths != nil && obj_count > 0) {
-        val read_r: R.Result[*of.ObjectImage, str] = read_objects(s, tgt, obj_paths, obj_count, ?ext_count);
+        val read_r: R.Result[*of.ObjectImage, str] =
+            read_objects(s, tgt, obj_paths, obj_count, images, image_count,
+                         required, ?ext_count);
         if (R.is_err[*of.ObjectImage, str](read_r)) {
             ret R.err[bool, str](R.unwrap_err[*of.ObjectImage, str](read_r));
         }
@@ -750,26 +791,33 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
     ret R.ok[bool, str](true);
 }
 
-# read and parse every input file into a fresh image array
+# read ordered object/archive inputs into a fresh image array
 #
-# grows an `of.ObjectImage` array one slot at a time. for each path it reads the
-# whole file (`fs.read_bytes`) and either parses it directly through the
-# active format's `parse_object` (a loose `.o`) or, when the file opens with the
-# `ar` magic, expands every ordinary member object of the archive into its own
-# image. an `.a` therefore contributes one module per member, so the final image
-# count - written through `module_count` - can exceed `obj_count`. on any failure
-# every image parsed so far and the array itself are released before returning the
-# error, so the caller never inherits a partial array. each read buffer is freed
-# after its objects are parsed - `parse_object` copies the section bytes it keeps.
+# Loose objects always join the result and update the symbol frontier. An archive
+# contributes only members that provide a currently unresolved global; newly
+# selected members may create more unresolved names, so that one archive is
+# rescanned to a fixed point. Earlier archives are never revisited after the next
+# path begins, preserving ordinary command-line archive order. COFF short-import
+# members participate as providers without becoming static definitions.
+#
+# `seed` supplies caller-owned project images already ahead of these disk inputs
+# (the mixed link path). They update selection state but never enter the returned
+# array. Every parsed member copies the bytes it keeps, so each file buffer can be
+# released before the next path.
 # ---
 # s:            shared session (allocator, interner)
 # tgt:          active target - supplies the format parser
 # obj_paths:    array of null-terminated input-file paths
 # obj_count:    number of paths
-# module_count: out - the number of images produced (>= obj_count with archives)
+# seed:         accepted images ordered before `obj_paths`, or nil
+# seed_count:   number of seed images
+# required:     root name that may pull an archive member (entry), or STR_NIL
+# module_count: out - number of loose objects + selected archive members
 # ret:          the populated image array, or an error string
 fun read_objects(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
-                 obj_count: u32, module_count: *u32) R.Result[*of.ObjectImage, str] {
+                 obj_count: u32, seed: *of.ObjectImage, seed_count: u32,
+                 required: intern.StrId,
+                 module_count: *u32) R.Result[*of.ObjectImage, str] {
     @module_count = 0;
     if (tgt.of.parse_object == nil) {
         ret R.err[*of.ObjectImage, str]("link: object format has no parser");
@@ -784,9 +832,29 @@ fun read_objects(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
     var count: u32 = 0;
     var cap:   u32 = 0;
 
+    var state: ArchiveResolution;
+    init_archive_resolution(alloc, ?state);
+    if (required != intern.STR_NIL) {
+        val rr: R.Result[bool, str] = archive_require(?state, required);
+        if (R.is_err[bool, str](rr)) {
+            free_archive_resolution(?state);
+            ret R.err[*of.ObjectImage, str](R.unwrap_err[bool, str](rr));
+        }
+    }
+    var si: u32 = 0;
+    for (si < seed_count) {
+        val nr: R.Result[bool, str] = archive_note_image(s, ?state, ?seed[si]);
+        if (R.is_err[bool, str](nr)) {
+            free_archive_resolution(?state);
+            ret R.err[*of.ObjectImage, str](R.unwrap_err[bool, str](nr));
+        }
+        si = si + 1;
+    }
+
     var i: u32 = 0;
     for (i < obj_count) {
         if (obj_paths[i] == nil) {
+            free_archive_resolution(?state);
             free_modules_to(alloc, modules, count, cap);
             ret R.err[*of.ObjectImage, str]("link: nil object path");
         }
@@ -800,6 +868,7 @@ fun read_objects(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
         # mis-parse the object.
         val rb: R.Result[Vector[u8], str] = fs.read_bytes(alloc, path);
         if (R.is_err[Vector[u8], str](rb)) {
+            free_archive_resolution(?state);
             free_modules_to(alloc, modules, count, cap);
             ret R.err[*of.ObjectImage, str](read_message(s, path, R.unwrap_err[Vector[u8], str](rb)));
         }
@@ -807,16 +876,22 @@ fun read_objects(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
 
         var input_r: R.Result[bool, str] = R.ok[bool, str](true);
         if (ar.is_archive(buf.data, buf.len)) {
-            input_r = parse_archive(s, tgt, path, buf.data, buf.len, ?modules, ?count, ?cap);
+            input_r = parse_archive(s, tgt, path, buf.data, buf.len,
+                                    ?state, ?modules, ?count, ?cap);
         }
         or {
             input_r = parse_loose(alloc, ?s.interner, tgt, buf.data, buf.len, ?modules, ?count, ?cap);
+            if (R.is_ok[bool, str](input_r)) {
+                val accepted: *of.ObjectImage = modules;
+                input_r = archive_note_image(s, ?state, ?accepted[count - 1]);
+            }
         }
 
         # the parser copies any bytes it keeps; the file buffer is no longer needed
         # regardless of success. read_bytes grows in chunks, so free at true capacity.
         vector.dnit[u8](?buf);
         if (R.is_err[bool, str](input_r)) {
+            free_archive_resolution(?state);
             free_modules_to(alloc, modules, count, cap);
             ret R.err[*of.ObjectImage, str](R.unwrap_err[bool, str](input_r));
         }
@@ -832,14 +907,157 @@ fun read_objects(s: *session.Session, tgt: *target.Target, obj_paths: **u8,
         val sr: R.Result[*of.ObjectImage, str] =
             A.reallocate[of.ObjectImage](alloc, modules, cap::usize, count::usize);
         if (R.is_err[*of.ObjectImage, str](sr)) {
+            free_archive_resolution(?state);
             free_modules_to(alloc, modules, count, cap);
             ret R.err[*of.ObjectImage, str](R.unwrap_err[*of.ObjectImage, str](sr));
         }
         modules = R.unwrap_ok[*of.ObjectImage, str](sr);
     }
 
+    free_archive_resolution(?state);
     @module_count = count;
     ret R.ok[*of.ObjectImage, str](modules);
+}
+
+# initialize/release the transient archive symbol frontier
+fun init_archive_resolution(alloc: *A.Allocator, state: *ArchiveResolution) {
+    state.providers  = map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+    state.unresolved = map.init[intern.StrId, u32](alloc, map.hash_u32, map.eq_u32);
+}
+
+fun free_archive_resolution(state: *ArchiveResolution) {
+    map.dnit[intern.StrId, u32](?state.providers);
+    map.dnit[intern.StrId, u32](?state.unresolved);
+}
+
+# add an entry/root requirement to the unresolved archive frontier
+fun archive_require(state: *ArchiveResolution,
+                    name: intern.StrId) R.Result[bool, str] {
+    if (map.contains[intern.StrId, u32](?state.providers, ?name)) {
+        ret R.ok[bool, str](true);
+    }
+    ret map.insert[intern.StrId, u32](?state.unresolved, name, 1);
+}
+
+# whether `sym` is a runtime-visible definition an archive can provide
+#
+# Local and undefined symbols are not providers. A global anchored only in a
+# non-allocated debug section cannot satisfy a runtime reference and must not
+# make an otherwise-unused member eligible. Weak definitions still provide a
+# name; ordinary global resolution later lets a strong definition override one.
+fun archive_symbol_provides(img: *of.ObjectImage, sym: *of.Symbol) bool {
+    if (sym.section == of.SECTION_EXTERNAL)        { ret false; }
+    if ((sym.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0) { ret false; }
+    if (sym.section < img.section_count
+        && img.sections[sym.section].kind == of.SK_DEBUG) { ret false; }
+    ret true;
+}
+
+# intern the PE import-address spelling corresponding to an import declaration
+#
+# A MinGW object references `__imp_X`, while the short import record advertises
+# the public export X. Archive selection treats that record as providing either
+# spelling; the dynamic-link stage retains the original declaration and owns the
+# eventual IAT indirection semantics.
+fun archive_import_alias(s: *session.Session,
+                         symbol: intern.StrId) R.Result[intern.StrId, str] {
+    val no: O.Option[str] = intern.lookup(?s.interner, symbol);
+    if (O.is_none[str](no)) { ret R.err[intern.StrId, str]("link: import name not interned"); }
+    val name: str = O.unwrap[str](no);
+    if (str_starts_with(name, "__imp_")) { ret R.ok[intern.StrId, str](symbol); }
+    val jr: R.Result[str, str] = str_join(s.alloc, "__imp_", name);
+    if (R.is_err[str, str](jr)) { ret R.err[intern.StrId, str](R.unwrap_err[str, str](jr)); }
+    val joined: str = R.unwrap_ok[str, str](jr);
+    val ir: R.Result[intern.StrId, str] = intern.intern(?s.interner, joined);
+    str_free(s.alloc, joined);
+    ret ir;
+}
+
+# record one provider and retire the matching unresolved name
+fun archive_note_provider(state: *ArchiveResolution,
+                          name: intern.StrId) R.Result[bool, str] {
+    val ir: R.Result[bool, str] =
+        map.insert[intern.StrId, u32](?state.providers, name, 1);
+    if (R.is_err[bool, str](ir)) { ret R.err[bool, str](R.unwrap_err[bool, str](ir)); }
+    val rr: R.Result[bool, str] =
+        map.remove[intern.StrId, u32](?state.unresolved, ?name);
+    if (R.is_err[bool, str](rr)) { ret R.err[bool, str](R.unwrap_err[bool, str](rr)); }
+    ret R.ok[bool, str](true);
+}
+
+# add one accepted image's definitions/imports and then its undefined globals
+# to the archive-selection frontier
+fun archive_note_image(s: *session.Session, state: *ArchiveResolution,
+                       img: *of.ObjectImage) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < img.symbol_count) {
+        val sym: *of.Symbol = ?img.symbols[i];
+        if (archive_symbol_provides(img, sym)) {
+            val nr: R.Result[bool, str] = archive_note_provider(state, sym.name);
+            if (R.is_err[bool, str](nr)) { ret nr; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < img.import_count) {
+        val nr: R.Result[bool, str] = archive_note_provider(state, img.imports[i].symbol);
+        if (R.is_err[bool, str](nr)) { ret nr; }
+        val ar: R.Result[intern.StrId, str] = archive_import_alias(s, img.imports[i].symbol);
+        if (R.is_err[intern.StrId, str](ar)) {
+            ret R.err[bool, str](R.unwrap_err[intern.StrId, str](ar));
+        }
+        val an: R.Result[bool, str] =
+            archive_note_provider(state, R.unwrap_ok[intern.StrId, str](ar));
+        if (R.is_err[bool, str](an)) { ret an; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < img.symbol_count) {
+        val sym: *of.Symbol = ?img.symbols[i];
+        # An undefined weak is an optional reference: classic archive semantics
+        # do not extract a member solely to satisfy it. COFF ALIAS fallbacks are
+        # normalized by the object parser into defined weak public symbols, so
+        # skipping unresolved weak records here does not suppress those providers.
+        if (is_undefined_extern(sym)
+            && (sym.flags & of.SYM_OBJ_FLAG_WEAK) == 0
+            && !map.contains[intern.StrId, u32](?state.providers, ?sym.name)) {
+            val ur: R.Result[bool, str] =
+                map.insert[intern.StrId, u32](?state.unresolved, sym.name, 1);
+            if (R.is_err[bool, str](ur)) { ret R.err[bool, str](R.unwrap_err[bool, str](ur)); }
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# whether an archive candidate supplies any name currently unresolved
+fun archive_image_needed(s: *session.Session, state: *ArchiveResolution,
+                         img: *of.ObjectImage) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < img.symbol_count) {
+        val sym: *of.Symbol = ?img.symbols[i];
+        if (archive_symbol_provides(img, sym)
+            && map.contains[intern.StrId, u32](?state.unresolved, ?sym.name)) {
+            ret R.ok[bool, str](true);
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < img.import_count) {
+        if (map.contains[intern.StrId, u32](?state.unresolved, ?img.imports[i].symbol)) {
+            ret R.ok[bool, str](true);
+        }
+        val ar: R.Result[intern.StrId, str] = archive_import_alias(s, img.imports[i].symbol);
+        if (R.is_err[intern.StrId, str](ar)) {
+            ret R.err[bool, str](R.unwrap_err[intern.StrId, str](ar));
+        }
+        val alias: intern.StrId = R.unwrap_ok[intern.StrId, str](ar);
+        if (map.contains[intern.StrId, u32](?state.unresolved, ?alias)) {
+            ret R.ok[bool, str](true);
+        }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](false);
 }
 
 # append one empty image slot to the module array, doubling the
@@ -913,49 +1131,125 @@ fun parse_loose(alloc: *A.Allocator, itn: *intern.Interner, tgt: *target.Target,
     ret tgt.of.parse_object(alloc, itn, buf, buf_len, ?arr[ix]);
 }
 
-# expand every ordinary member of an `ar` archive into the image
-# array
+# select the needed members of one `ar` archive
 #
-# walks the archive members (`ar.next_member`), skipping the bookkeeping members
-# (`ar.is_special`), and parses each remaining member's object bytes into a new
-# image slot through the active format's `parse_object`. the member slices borrow
-# the archive buffer, which the caller keeps alive across this call. a malformed
-# member header is a hard error. this implements the v1 member-selection policy:
-# every object member is pulled (see `of.ar`).
+# Every ordinary member is parsed into a temporary candidate image, then the
+# archive is scanned in member order until a pass selects nothing. A candidate is
+# selected only when one of its runtime globals (or COFF import declarations)
+# supplies the current unresolved frontier. Selecting a member updates that
+# frontier immediately, allowing later members in the same pass and earlier
+# members in the next pass to satisfy its dependencies. The caller advances to
+# the next input after this returns, so no later object causes this archive to be
+# revisited.
 # ---
 # s:       shared session (diagnostics)
 # tgt:     active target - supplies the format parser
 # path:    archive path, for the diagnostic on a malformed member
 # buf:     the archive bytes
 # buf_len: length of `buf`
+# state:   symbol frontier from inputs accepted before this archive
 # modules: in/out - the image array, rebound on growth
 # count:   in/out - current image count
 # cap:     in/out - current backing capacity
-# ret:     ok(true) once every member is parsed, or an error string
+# ret:     ok(true) once every needed member is appended, or an error string
 fun parse_archive(s: *session.Session, tgt: *target.Target, path: str, buf: *u8, buf_len: usize,
-                  modules: **of.ObjectImage, count: *u32, cap: *u32) R.Result[bool, str] {
+                  state: *ArchiveResolution, modules: **of.ObjectImage,
+                  count: *u32, cap: *u32) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
+    var candidates: *of.ObjectImage = nil;
+    var candidate_count: u32 = 0;
+    var candidate_cap:   u32 = 0;
     var pos: usize = ar.first_member();
     for (true) {
         val st: ar.Step = ar.next_member(buf, buf_len, pos);
         if (!st.ok) {
+            free_modules_to(alloc, candidates, candidate_count, candidate_cap);
             ret R.err[bool, str](read_message(s, path, "malformed archive member header"));
         }
-        if (st.done) { ret R.ok[bool, str](true); }
+        if (st.done) { brk; }
 
         if (!ar.is_special(st.member)) {
-            val gr: R.Result[u32, str] = grow_modules(alloc, modules, count, cap);
-            if (R.is_err[u32, str](gr)) { ret R.err[bool, str](R.unwrap_err[u32, str](gr)); }
+            val gr: R.Result[u32, str] =
+                grow_modules(alloc, ?candidates, ?candidate_count, ?candidate_cap);
+            if (R.is_err[u32, str](gr)) {
+                free_modules_to(alloc, candidates, candidate_count, candidate_cap);
+                ret R.err[bool, str](R.unwrap_err[u32, str](gr));
+            }
             val ix: u32 = R.unwrap_ok[u32, str](gr);
-            val arr: *of.ObjectImage = @modules;
             val pr: R.Result[bool, str] =
-                tgt.of.parse_object(alloc, ?s.interner, st.member.data, st.member.len, ?arr[ix]);
-            if (R.is_err[bool, str](pr)) { ret R.err[bool, str](R.unwrap_err[bool, str](pr)); }
+                tgt.of.parse_object(alloc, ?s.interner, st.member.data, st.member.len,
+                                    ?candidates[ix]);
+            if (R.is_err[bool, str](pr)) {
+                free_modules_to(alloc, candidates, candidate_count, candidate_cap);
+                ret R.err[bool, str](R.unwrap_err[bool, str](pr));
+            }
         }
 
         pos = st.next;
     }
+
+    if (candidate_count == 0) {
+        free_modules_to(alloc, candidates, candidate_count, candidate_cap);
+        ret R.ok[bool, str](true);
+    }
+    val sr: R.Result[*bool, str] = A.zallocate[bool](alloc, candidate_count::usize);
+    if (R.is_err[*bool, str](sr)) {
+        free_modules_to(alloc, candidates, candidate_count, candidate_cap);
+        ret R.err[bool, str](R.unwrap_err[*bool, str](sr));
+    }
+    val selected: *bool = R.unwrap_ok[*bool, str](sr);
+
+    var progress: bool = true;
+    for (progress) {
+        progress = false;
+        var i: u32 = 0;
+        for (i < candidate_count) {
+            if (selected[i]) { i = i + 1; cnt; }
+            val needed_r: R.Result[bool, str] =
+                archive_image_needed(s, state, ?candidates[i]);
+            if (R.is_err[bool, str](needed_r)) {
+                free_archive_candidates(alloc, candidates, candidate_count,
+                                        candidate_cap, selected);
+                ret R.err[bool, str](R.unwrap_err[bool, str](needed_r));
+            }
+            if (!R.unwrap_ok[bool, str](needed_r)) { i = i + 1; cnt; }
+
+            val gr: R.Result[u32, str] = grow_modules(alloc, modules, count, cap);
+            if (R.is_err[u32, str](gr)) {
+                free_archive_candidates(alloc, candidates, candidate_count,
+                                        candidate_cap, selected);
+                ret R.err[bool, str](R.unwrap_err[u32, str](gr));
+            }
+            val dst: u32 = R.unwrap_ok[u32, str](gr);
+            val accepted: *of.ObjectImage = @modules;
+            accepted[dst] = candidates[i];
+            selected[i] = true;
+            val nr: R.Result[bool, str] = archive_note_image(s, state, ?accepted[dst]);
+            if (R.is_err[bool, str](nr)) {
+                free_archive_candidates(alloc, candidates, candidate_count,
+                                        candidate_cap, selected);
+                ret R.err[bool, str](R.unwrap_err[bool, str](nr));
+            }
+            progress = true;
+            i = i + 1;
+        }
+    }
+
+    free_archive_candidates(alloc, candidates, candidate_count,
+                            candidate_cap, selected);
     ret R.ok[bool, str](true);
+}
+
+# release the archive candidate wrapper and every image not moved to `modules`
+fun free_archive_candidates(alloc: *A.Allocator, candidates: *of.ObjectImage,
+                            count: u32, cap: u32, selected: *bool) {
+    var i: u32 = 0;
+    for (i < count) {
+        if (!selected[i]) { obj.dnit(?candidates[i]); }
+        i = i + 1;
+    }
+    A.deallocate[bool](alloc, selected, count::usize);
+    A.deallocate[of.ObjectImage](alloc, candidates, cap::usize);
 }
 
 # lay the merged sections out as load segments and write the executable
@@ -4624,6 +4918,366 @@ fun lt_isa(reg: *target.TargetRegistry, name: str) *isa.IsaVTable {
     val found: O.Option[*isa.IsaVTable] = isa.lookup(?reg.isa, name);
     if (!O.is_some[*isa.IsaVTable](found)) { ret nil; }
     ret O.unwrap[*isa.IsaVTable](found);
+}
+
+# archive selection follows the unresolved frontier, admits weak providers, and
+# reaches dependencies earlier in the same archive only on the fixed-point pass.
+# A duplicate, unused startup, or debug-only definition is never eligible.
+test "mach.lang.be.linker.archive_resolution:ordered_fixed_point" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    val root: intern.StrId = lt_name(?s, "root");
+    val dep: intern.StrId = lt_name(?s, "dependency");
+    val common: intern.StrId = lt_name(?s, "common_data");
+    val startup: intern.StrId = lt_name(?s, "WinMainCRTStartup");
+    if (root == intern.STR_NIL || dep == intern.STR_NIL || common == intern.STR_NIL
+        || startup == intern.STR_NIL) { session.dnit(?s); ret 1; }
+
+    val undef_flags: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
+    val def_flags: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var seed_syms: [2]of.Symbol;
+    seed_syms[0].name = root; seed_syms[0].section = of.SECTION_EXTERNAL;
+    seed_syms[0].offset = 0; seed_syms[0].size = 0; seed_syms[0].flags = undef_flags;
+    # COFF common data is an undefined external with a non-zero Value. It still
+    # needs a real archive definition and must therefore join the frontier.
+    seed_syms[1].name = common; seed_syms[1].section = of.SECTION_EXTERNAL;
+    seed_syms[1].offset = 8; seed_syms[1].size = 8;
+    seed_syms[1].flags = undef_flags | of.SYM_OBJ_FLAG_OBJECT;
+    var seed: of.ObjectImage = lt_image(?s, lt_name(?s, "seed"),
+        nil::*of.Section, 0, ?seed_syms[0], 2, nil::*of.Relocation, 0);
+
+    # member 0 is earlier than the member that creates its unresolved name.
+    var early_sym: of.Symbol;
+    early_sym.name = dep; early_sym.section = 0; early_sym.offset = 0;
+    early_sym.size = 0; early_sym.flags = def_flags | of.SYM_OBJ_FLAG_WEAK;
+    var early: of.ObjectImage = lt_image(?s, lt_name(?s, "early"),
+        nil::*of.Section, 0, ?early_sym, 1, nil::*of.Relocation, 0);
+
+    var late_syms: [3]of.Symbol;
+    late_syms[0].name = root; late_syms[0].section = 0; late_syms[0].offset = 0;
+    late_syms[0].size = 0; late_syms[0].flags = def_flags;
+    late_syms[1].name = dep; late_syms[1].section = of.SECTION_EXTERNAL;
+    late_syms[1].offset = 0; late_syms[1].size = 0; late_syms[1].flags = undef_flags;
+    # A member may reference the same name it defines. Providers are recorded
+    # before undefineds, so this must not recreate the root requirement.
+    late_syms[2].name = root; late_syms[2].section = of.SECTION_EXTERNAL;
+    late_syms[2].offset = 0; late_syms[2].size = 0; late_syms[2].flags = undef_flags;
+    var late: of.ObjectImage = lt_image(?s, lt_name(?s, "late"),
+        nil::*of.Section, 0, ?late_syms[0], 3, nil::*of.Relocation, 0);
+
+    var common_sym: of.Symbol;
+    common_sym.name = common; common_sym.section = 0; common_sym.offset = 0;
+    common_sym.size = 8;
+    common_sym.flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+    var common_def: of.ObjectImage = lt_image(?s, lt_name(?s, "common-def"),
+        nil::*of.Section, 0, ?common_sym, 1, nil::*of.Relocation, 0);
+
+    var unused_sym: of.Symbol;
+    unused_sym.name = startup; unused_sym.section = 0; unused_sym.offset = 0;
+    unused_sym.size = 0; unused_sym.flags = def_flags;
+    var unused: of.ObjectImage = lt_image(?s, lt_name(?s, "startup"),
+        nil::*of.Section, 0, ?unused_sym, 1, nil::*of.Relocation, 0);
+
+    var dbg_sec: of.Section;
+    dbg_sec.name = lt_name(?s, ".debug_info"); dbg_sec.kind = of.SK_DEBUG;
+    dbg_sec.bytes = nil; dbg_sec.len = 0; dbg_sec.align = 1;
+    var dbg_sym: of.Symbol = late_syms[0];
+    var debug_only: of.ObjectImage = lt_image(?s, lt_name(?s, "debug"),
+        ?dbg_sec, 1, ?dbg_sym, 1, nil::*of.Relocation, 0);
+
+    var state: ArchiveResolution;
+    init_archive_resolution(?alloc, ?state);
+    if (R.is_err[bool, str](archive_note_image(?s, ?state, ?seed))) { ret 1; }
+    val e0: R.Result[bool, str] = archive_image_needed(?s, ?state, ?early);
+    val u0: R.Result[bool, str] = archive_image_needed(?s, ?state, ?unused);
+    val d0: R.Result[bool, str] = archive_image_needed(?s, ?state, ?debug_only);
+    val l0: R.Result[bool, str] = archive_image_needed(?s, ?state, ?late);
+    if (R.is_err[bool, str](e0) || R.unwrap_ok[bool, str](e0)
+        || R.is_err[bool, str](u0) || R.unwrap_ok[bool, str](u0)
+        || R.is_err[bool, str](d0) || R.unwrap_ok[bool, str](d0)
+        || R.is_err[bool, str](l0) || !R.unwrap_ok[bool, str](l0)) { ret 1; }
+    if (R.is_err[bool, str](archive_note_image(?s, ?state, ?late))) { ret 1; }
+    val e1: R.Result[bool, str] = archive_image_needed(?s, ?state, ?early);
+    val c1: R.Result[bool, str] = archive_image_needed(?s, ?state, ?common_def);
+    if (R.is_err[bool, str](e1) || !R.unwrap_ok[bool, str](e1)
+        || R.is_err[bool, str](c1) || !R.unwrap_ok[bool, str](c1)) { ret 1; }
+    if (R.is_err[bool, str](archive_note_image(?s, ?state, ?early))) { ret 1; }
+    if (R.is_err[bool, str](archive_note_image(?s, ?state, ?common_def))) { ret 1; }
+    # the same name's later strong definition is not pulled after the weak one
+    # satisfied it; ordinary symbol resolution still handles a loose strong.
+    var duplicate: of.ObjectImage = late;
+    duplicate.symbols = ?late_syms[1]; duplicate.symbol_count = 1;
+    late_syms[1].section = 0; late_syms[1].flags = def_flags;
+    val dupe: R.Result[bool, str] = archive_image_needed(?s, ?state, ?duplicate);
+    if (R.is_err[bool, str](dupe) || R.unwrap_ok[bool, str](dupe)
+        || state.unresolved.len != 0) { ret 1; }
+
+    free_archive_resolution(?state);
+    session.dnit(?s);
+    ret 0;
+}
+
+# the executable entry is itself an archive root even when no loose object has
+# referenced it yet; otherwise an archive-first link would select no member.
+test "mach.lang.be.linker.archive_resolution:entry_root" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    val entry: intern.StrId = lt_name(?s, "mainCRTStartup");
+    var sym: of.Symbol;
+    sym.name = entry; sym.section = 0; sym.offset = 0; sym.size = 0;
+    sym.flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var member: of.ObjectImage = lt_image(?s, lt_name(?s, "entry-member"),
+        nil::*of.Section, 0, ?sym, 1, nil::*of.Relocation, 0);
+
+    var state: ArchiveResolution;
+    init_archive_resolution(?alloc, ?state);
+    if (R.is_err[bool, str](archive_require(?state, entry))) { ret 1; }
+    val needed: R.Result[bool, str] = archive_image_needed(?s, ?state, ?member);
+    if (R.is_err[bool, str](needed) || !R.unwrap_ok[bool, str](needed)) { ret 1; }
+    if (R.is_err[bool, str](archive_note_image(?s, ?state, ?member))
+        || state.unresolved.len != 0) { ret 1; }
+
+    free_archive_resolution(?state);
+    session.dnit(?s);
+    ret 0;
+}
+
+# An unresolved weak reference is optional and does not pull an archive member;
+# a strong unresolved reference to the same provider still does.
+test "mach.lang.be.linker.archive_resolution:undefined_weak_does_not_extract" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    val name: intern.StrId = lt_name(?s, "optional_hook");
+    val undef: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
+    var weak_ref: of.Symbol;
+    weak_ref.name = name; weak_ref.section = of.SECTION_EXTERNAL;
+    weak_ref.offset = 0; weak_ref.size = 0;
+    weak_ref.flags = undef | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+    var provider: of.Symbol;
+    provider.name = name; provider.section = 0; provider.offset = 0; provider.size = 0;
+    provider.flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var weak_img: of.ObjectImage = lt_image(?s, lt_name(?s, "weak-user"),
+        nil::*of.Section, 0, ?weak_ref, 1, nil::*of.Relocation, 0);
+    var provider_img: of.ObjectImage = lt_image(?s, lt_name(?s, "provider"),
+        nil::*of.Section, 0, ?provider, 1, nil::*of.Relocation, 0);
+
+    var state: ArchiveResolution;
+    init_archive_resolution(?alloc, ?state);
+    if (R.is_err[bool, str](archive_note_image(?s, ?state, ?weak_img))) { ret 1; }
+    val optional: R.Result[bool, str] = archive_image_needed(?s, ?state, ?provider_img);
+    if (R.is_err[bool, str](optional) || R.unwrap_ok[bool, str](optional)
+        || state.unresolved.len != 0) { ret 1; }
+
+    weak_ref.flags = undef | of.SYM_OBJ_FLAG_FUNCTION;
+    if (R.is_err[bool, str](archive_note_image(?s, ?state, ?weak_img))) { ret 1; }
+    val required: R.Result[bool, str] = archive_image_needed(?s, ?state, ?provider_img);
+    if (R.is_err[bool, str](required) || !R.unwrap_ok[bool, str](required)) { ret 1; }
+
+    free_archive_resolution(?state);
+    session.dnit(?s);
+    ret 0;
+}
+
+# The disk path applies ordered archive semantics end to end: an archive-first
+# executable root selects its member, that member pulls an earlier dependency on
+# the fixed-point pass, and a later loose object's new undefined name does not
+# revisit the archive to select either its provider or an unrelated startup.
+test "mach.lang.be.linker.read_objects:ordered_archive_end_to_end" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val tr: R.Result[target.Target, str] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+
+    val root: intern.StrId = lt_name(?s, "archive_entry");
+    val dep: intern.StrId = lt_name(?s, "earlier_dependency");
+    val late: intern.StrId = lt_name(?s, "late_requirement");
+    val call: intern.StrId = lt_name(?s, "loose_call");
+    val startup: intern.StrId = lt_name(?s, "WinMainCRTStartup");
+    val text_name: intern.StrId = lt_name(?s, ".text");
+    if (root == intern.STR_NIL || dep == intern.STR_NIL || late == intern.STR_NIL
+        || call == intern.STR_NIL || startup == intern.STR_NIL
+        || text_name == intern.STR_NIL) { ret 1; }
+
+    var code: [1]u8; code[0] = 0xC3;
+    var sec: of.Section;
+    sec.name = text_name; sec.kind = of.SK_TEXT; sec.bytes = ?code[0];
+    sec.len = 1; sec.align = 1;
+    val def: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    val undef: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var early_sym: of.Symbol;
+    early_sym.name = dep; early_sym.section = 0; early_sym.offset = 0;
+    early_sym.size = 1; early_sym.flags = def;
+    var root_syms: [2]of.Symbol;
+    root_syms[0].name = root; root_syms[0].section = 0; root_syms[0].offset = 0;
+    root_syms[0].size = 1; root_syms[0].flags = def;
+    root_syms[1].name = dep; root_syms[1].section = of.SECTION_EXTERNAL;
+    root_syms[1].offset = 0; root_syms[1].size = 0; root_syms[1].flags = undef;
+    var late_sym: of.Symbol;
+    late_sym.name = late; late_sym.section = 0; late_sym.offset = 0;
+    late_sym.size = 1; late_sym.flags = def;
+    var startup_sym: of.Symbol;
+    startup_sym.name = startup; startup_sym.section = 0; startup_sym.offset = 0;
+    startup_sym.size = 1; startup_sym.flags = def;
+
+    var images: [4]of.ObjectImage;
+    images[0] = lt_image(?s, lt_name(?s, "early"), ?sec, 1,
+                         ?early_sym, 1, nil::*of.Relocation, 0);
+    images[1] = lt_image(?s, lt_name(?s, "root"), ?sec, 1,
+                         ?root_syms[0], 2, nil::*of.Relocation, 0);
+    images[2] = lt_image(?s, lt_name(?s, "late"), ?sec, 1,
+                         ?late_sym, 1, nil::*of.Relocation, 0);
+    images[3] = lt_image(?s, lt_name(?s, "startup"), ?sec, 1,
+                         ?startup_sym, 1, nil::*of.Relocation, 0);
+
+    # Emit real COFF members, then package them with the production ar writer.
+    var member_bytes: [4]Vector[u8];
+    var mi: u32 = 0;
+    for (mi < 4) {
+        val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "archive_member");
+        if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+        var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+        val er: R.Result[bool, str] = obj.emit(?images[mi], ?tgt, fs.temp_path(?tf)::*u8);
+        if (R.is_err[bool, str](er)) { fs.temp_close_and_remove(?tf); ret 1; }
+        val br: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
+        fs.temp_close_and_remove(?tf);
+        if (R.is_err[Vector[u8], str](br)) { ret 1; }
+        member_bytes[mi] = R.unwrap_ok[Vector[u8], str](br);
+        mi = mi + 1;
+    }
+    var n0: [1]str; n0[0] = "earlier_dependency";
+    var n1: [1]str; n1[0] = "archive_entry";
+    var n2: [1]str; n2[0] = "late_requirement";
+    var n3: [1]str; n3[0] = "WinMainCRTStartup";
+    var members: [4]ar.ArMember;
+    members[0].name = "early.o"; members[0].data = member_bytes[0].data;
+    members[0].len = member_bytes[0].len; members[0].sym_names = ?n0[0]; members[0].sym_count = 1;
+    members[1].name = "root.o"; members[1].data = member_bytes[1].data;
+    members[1].len = member_bytes[1].len; members[1].sym_names = ?n1[0]; members[1].sym_count = 1;
+    members[2].name = "late.o"; members[2].data = member_bytes[2].data;
+    members[2].len = member_bytes[2].len; members[2].sym_names = ?n2[0]; members[2].sym_count = 1;
+    members[3].name = "startup.o"; members[3].data = member_bytes[3].data;
+    members[3].len = member_bytes[3].len; members[3].sym_names = ?n3[0]; members[3].sym_count = 1;
+
+    val at_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "ordered_archive");
+    if (R.is_err[fs.TempFile, str](at_r)) { ret 1; }
+    var at: fs.TempFile = R.unwrap_ok[fs.TempFile, str](at_r);
+    if (R.is_err[bool, str](ar.write_archive(?alloc, ?members[0], 4, fs.temp_path(?at)))) {
+        fs.temp_close_and_remove(?at);
+        ret 1;
+    }
+
+    # This object arrives after the archive and creates `late_requirement`.
+    # Ordinary linker order forbids using late.o to satisfy it retroactively.
+    var loose_syms: [2]of.Symbol;
+    loose_syms[0].name = call; loose_syms[0].section = 0; loose_syms[0].offset = 0;
+    loose_syms[0].size = 1; loose_syms[0].flags = def;
+    loose_syms[1].name = late; loose_syms[1].section = of.SECTION_EXTERNAL;
+    loose_syms[1].offset = 0; loose_syms[1].size = 0; loose_syms[1].flags = undef;
+    var loose: of.ObjectImage = lt_image(?s, lt_name(?s, "loose"), ?sec, 1,
+        ?loose_syms[0], 2, nil::*of.Relocation, 0);
+    val lt_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "late_loose");
+    if (R.is_err[fs.TempFile, str](lt_r)) { fs.temp_close_and_remove(?at); ret 1; }
+    var lt: fs.TempFile = R.unwrap_ok[fs.TempFile, str](lt_r);
+    if (R.is_err[bool, str](obj.emit(?loose, ?tgt, fs.temp_path(?lt)::*u8))) {
+        fs.temp_close_and_remove(?at); fs.temp_close_and_remove(?lt); ret 1;
+    }
+
+    var paths: [2]*u8;
+    paths[0] = fs.temp_path(?at)::*u8;
+    paths[1] = fs.temp_path(?lt)::*u8;
+    var module_count: u32 = 0;
+    val rr: R.Result[*of.ObjectImage, str] = read_objects(?s, ?tgt, ?paths[0], 2,
+        nil::*of.ObjectImage, 0, root, ?module_count);
+    fs.temp_close_and_remove(?at);
+    fs.temp_close_and_remove(?lt);
+    mi = 0;
+    for (mi < 4) { vector.dnit[u8](?member_bytes[mi]); mi = mi + 1; }
+    if (R.is_err[*of.ObjectImage, str](rr) || module_count != 3) { ret 1; }
+    val modules: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](rr);
+
+    var saw_root: bool = false;
+    var saw_early: bool = false;
+    var saw_late: bool = false;
+    var saw_startup: bool = false;
+    mi = 0;
+    for (mi < module_count) {
+        var si: u32 = 0;
+        for (si < modules[mi].symbol_count) {
+            val sym: *of.Symbol = ?modules[mi].symbols[si];
+            if (sym.section != of.SECTION_EXTERNAL) {
+                if (sym.name == root)    { saw_root = true; }
+                if (sym.name == dep)     { saw_early = true; }
+                if (sym.name == late)    { saw_late = true; }
+                if (sym.name == startup) { saw_startup = true; }
+            }
+            si = si + 1;
+        }
+        mi = mi + 1;
+    }
+    free_modules(?alloc, modules, module_count);
+    session.dnit(?s);
+    if (!saw_root || !saw_early || saw_late || saw_startup) { ret 1; }
+    ret 0;
+}
+
+# a COFF short-import record advertising X is an archive provider for both a
+# direct X reference and MinGW's import-address spelling __imp_X.
+test "mach.lang.be.linker.archive_resolution:import_address_alias" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    val public: intern.StrId = lt_name(?s, "Sleep");
+    val indirect: intern.StrId = lt_name(?s, "__imp_Sleep");
+    val dll: intern.StrId = lt_name(?s, "kernel32.dll");
+    if (public == intern.STR_NIL || indirect == intern.STR_NIL
+        || dll == intern.STR_NIL) { session.dnit(?s); ret 1; }
+
+    var sym: of.Symbol;
+    sym.name = indirect; sym.section = of.SECTION_EXTERNAL;
+    sym.offset = 0; sym.size = 0;
+    sym.flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_OBJECT;
+    var seed: of.ObjectImage = lt_image(?s, lt_name(?s, "dll-user"),
+        nil::*of.Section, 0, ?sym, 1, nil::*of.Relocation, 0);
+    var decl: of.ImportDecl;
+    decl.symbol = public; decl.import_name = public; decl.library = dll;
+    decl.ordinal = 0; decl.by_name = true; decl.is_code = true;
+    var record: of.ObjectImage = lt_image(?s, lt_name(?s, "import-record"),
+        nil::*of.Section, 0, nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+    record.imports = ?decl; record.import_count = 1;
+
+    var state: ArchiveResolution;
+    init_archive_resolution(?alloc, ?state);
+    if (R.is_err[bool, str](archive_note_image(?s, ?state, ?seed))) { ret 1; }
+    val needed: R.Result[bool, str] = archive_image_needed(?s, ?state, ?record);
+    if (R.is_err[bool, str](needed) || !R.unwrap_ok[bool, str](needed)) { ret 1; }
+    if (R.is_err[bool, str](archive_note_image(?s, ?state, ?record))) { ret 1; }
+    if (state.unresolved.len != 0
+        || !map.contains[intern.StrId, u32](?state.providers, ?public)
+        || !map.contains[intern.StrId, u32](?state.providers, ?indirect)) { ret 1; }
+
+    free_archive_resolution(?state);
+    session.dnit(?s);
+    ret 0;
 }
 
 # library attribution accepts both a portable logical name and the exact loader
