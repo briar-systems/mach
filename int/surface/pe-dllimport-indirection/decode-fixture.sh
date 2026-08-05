@@ -4,8 +4,8 @@
 #   clang --target=x86_64-pc-windows-msvc -c -O2 -g0 -fno-ident \
 #     -o qz.o qz.c
 #   base64 -w 76 qz.o > qz.o.b64
-# qz_indirect's stable bytes end in `jmpq *__imp_Sleep(%rip)`, the real
-# IMAGE_REL_AMD64_REL32 dllimport shape this case exercises.
+# qz_indirect carries real IMAGE_REL_AMD64_REL32 dllimport references to
+# `__imp_Sleep` and indirect-only `__imp_GetTickCount`.
 set -eu
 out=$1
 mkdir -p "$(dirname "$out")"

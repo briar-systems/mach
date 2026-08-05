@@ -259,6 +259,24 @@ pe_off_to_rva() {
     return 1
 }
 
+# find_unique_hex <file> <lowercase-hex-bytes>
+# print the byte offset when the exact byte sequence occurs once in the file.
+find_unique_hex() {
+    bin=$1; want=$2
+    od -An -v -tx1 "$bin" | awk -v want="$want" '
+        BEGIN { width = length(want); bytes = width / 2 }
+        {
+            for (i = 1; i <= NF; i++) {
+                tail = tail $i
+                if (length(tail) > width) tail = substr(tail, length(tail) - width + 1)
+                if (tail == want) { count++; found = n - bytes + 1 }
+                n++
+            }
+        }
+        END { if (count == 1) print found; else exit 1 }
+    '
+}
+
 # produce_pe_imports <runmode> <target> <binary>
 # emit the PE import table's symbol->DLL bindings, one `<dll>:<symbol>` line per
 # imported function, sorted. this is the fact the two-level-namespace attribution
@@ -338,12 +356,12 @@ produce_pe_imports() {
 }
 
 # produce_pe_dllimport <runmode> <target> <binary>
-# Verify the checked-in qz.o's IMAGE_REL_AMD64_REL32 against `__imp_Sleep` was
-# normalized to Sleep and patched directly to its IAT cell. qz_indirect starts
-# with a stable eight-byte signature; its four-byte displacement immediately
-# follows, so S = P + 4 + disp proves the recovered COFF -4 addend as well as the
-# target. The Mach module also calls Sleep directly, and an IAT size of two thunks
-# (one binding + one descriptor terminator) proves both spellings deduplicated.
+# Verify qz.o's IMAGE_REL_AMD64_REL32 sites against `__imp_Sleep` and indirect-only
+# `__imp_GetTickCount` target their IAT cells. Stable byte signatures locate each
+# four-byte displacement, so S = P + 4 + disp proves the recovered COFF -4 addend
+# as well as the target. Mach also calls Sleep directly; an IAT size of three
+# thunks (two bindings + one descriptor terminator) proves that pair deduplicated
+# while the indirect-only export still receives a slot and no call stub.
 produce_pe_dllimport() {
     bin=$3
     elfanew=$(read_le_uint "$bin" 60 4)
@@ -357,48 +375,49 @@ produce_pe_dllimport() {
     fi
 
     imports=$(produce_pe_imports "$@") || return $?
-    if [ "$imports" != "kernel32.dll:Sleep" ]; then
-        echo "int: pe-dllimport: imports are '$imports', want kernel32.dll:Sleep" >&2
+    want_imports='kernel32.dll:GetTickCount
+kernel32.dll:Sleep'
+    if [ "$imports" != "$want_imports" ]; then
+        echo "int: pe-dllimport: imports are '$imports', want two canonical exports" >&2
         return 2
     fi
 
     iat_dir=$((elfanew + 24 + 112 + 12 * 8))
     iat_rva=$(read_le_uint "$bin" "$iat_dir" 4)
     iat_size=$(read_le_uint "$bin" $((iat_dir + 4)) 4)
-    if [ "$iat_rva" -eq 0 ] || [ "$iat_size" -ne 16 ]; then
-        echo "int: pe-dllimport: IAT is RVA=$iat_rva size=$iat_size, want one entry" >&2
+    if [ "$iat_rva" -eq 0 ] || [ "$iat_size" -ne 24 ]; then
+        echo "int: pe-dllimport: IAT is RVA=$iat_rva size=$iat_size, want two entries" >&2
         return 2
     fi
 
-    qz_off=$(od -An -v -tx1 "$bin" | awk '
-        {
-            for (i = 1; i <= NF; i++) {
-                tail = tail $i
-                if (length(tail) > 16) tail = substr(tail, length(tail) - 15)
-                if (tail == "b90700000048ff25") { count++; found = n - 7 }
-                n++
-            }
-        }
-        END { if (count == 1) print found; else exit 1 }
-    ') || {
-        echo "int: pe-dllimport: qz_indirect signature is not unique" >&2
+    sleep_off=$(find_unique_hex "$bin" 4883ec28b907000000ff15) || {
+        echo "int: pe-dllimport: qz_indirect Sleep signature is not unique" >&2
         return 2
     }
-    patch_off=$((qz_off + 8))
-    patch_rva=$(pe_off_to_rva "$bin" "$sec" "$nsec" "$patch_off") || {
-        echo "int: pe-dllimport: qz_indirect rel32 is in no PE section" >&2
+    tick_off=$(find_unique_hex "$bin" 904883c42848ff25) || {
+        echo "int: pe-dllimport: qz_indirect GetTickCount signature is not unique" >&2
         return 2
     }
-    disp=$(read_le_uint "$bin" "$patch_off" 4)
-    [ "$disp" -ge 2147483648 ] && disp=$((disp - 4294967296))
-    target_rva=$((patch_rva + 4 + disp))
-    if [ "$target_rva" -ne "$iat_rva" ]; then
-        echo "int: pe-dllimport: qz_indirect targets RVA=$target_rva, IAT=$iat_rva" >&2
+
+    sleep_patch=$((sleep_off + 11))
+    tick_patch=$((tick_off + 8))
+    sleep_rva=$(pe_off_to_rva "$bin" "$sec" "$nsec" "$sleep_patch") || return 2
+    tick_rva=$(pe_off_to_rva "$bin" "$sec" "$nsec" "$tick_patch") || return 2
+    sleep_disp=$(read_le_uint "$bin" "$sleep_patch" 4)
+    tick_disp=$(read_le_uint "$bin" "$tick_patch" 4)
+    [ "$sleep_disp" -ge 2147483648 ] && sleep_disp=$((sleep_disp - 4294967296))
+    [ "$tick_disp" -ge 2147483648 ] && tick_disp=$((tick_disp - 4294967296))
+    sleep_target=$((sleep_rva + 4 + sleep_disp))
+    tick_target=$((tick_rva + 4 + tick_disp))
+    second_iat=$((iat_rva + 8))
+    if ! { [ "$sleep_target" -eq "$iat_rva" ] && [ "$tick_target" -eq "$second_iat" ]; } \
+       && ! { [ "$tick_target" -eq "$iat_rva" ] && [ "$sleep_target" -eq "$second_iat" ]; }; then
+        echo "int: pe-dllimport: foreign targets $sleep_target/$tick_target miss IAT $iat_rva/$second_iat" >&2
         return 2
     fi
 
     echo "$imports"
-    echo "iat_entries=1"
+    echo "iat_entries=2"
     echo "foreign_indirect_target=iat"
 }
 
