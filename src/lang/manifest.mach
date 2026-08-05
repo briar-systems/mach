@@ -141,6 +141,10 @@ pub rec LinkDef {
     library:     intern.StrId;
     lib_name:    intern.StrId;
     path:        intern.StrId;
+    # symbols this dependency claims to provide, attributing imports that reach the
+    # link from a static archive member and so carry no `#[library]` decl
+    symbols:      *intern.StrId;
+    symbol_count: u32;
     os:          *intern.StrId;
     os_count:    u32;
     os_present:  bool;
@@ -155,13 +159,18 @@ pub rec LinkDef {
 
 # one target-matched link requirement carried into a build
 # ---
-# source:  the declared local, system, or framework semantics
-# text:    expanded local path or concrete system/framework name
-# library: stable logical name used by `#[library]` attribution
+# source:       the declared local, system, or framework semantics
+# text:         expanded local path or concrete system/framework name
+# library:      stable logical name used by `#[library]` attribution
+# symbols:      symbols this dependency claims to provide
+# symbol_count: number of claimed symbols
 pub rec LinkRequirement {
     source:  LinkSource;
     text:    intern.StrId;
     library: intern.StrId;
+
+    symbols:      *intern.StrId;
+    symbol_count: u32;
 }
 
 pub rec StepDef {
@@ -582,6 +591,7 @@ fun key_known(kind: TableKind, k: str, as_root: bool) bool {
     }
     if (kind == TK_LINK) {
         ret str_equals(k, "source") || str_equals(k, "name") || str_equals(k, "path") || str_equals(k, "library")
+            || str_equals(k, "symbols")
             || str_equals(k, "os") || str_equals(k, "isa") || str_equals(k, "abi") || str_equals(k, "export");
     }
     if (kind == TK_STEP) {
@@ -997,6 +1007,36 @@ fun parse_links(alloc: *A.Allocator, itn: *intern.Interner, t: *toml.Table, m: *
             d.library = intern_unwrap(itn, library_s);
         }
 
+        d.symbols      = nil;
+        d.symbol_count = 0;
+        val symbols_v: *toml.Value = toml.get(sub, "symbols");
+        if (symbols_v != nil) {
+            if (symbols_v.tag != toml.TYPE_ARRAY) {
+                ret R.err[bool, str](sfmt(alloc, "mach.toml: {}.symbols must be an array of strings", label));
+            }
+            val res_syms: R.Result[StrArr, str] = parse_str_array(alloc, itn, ?symbols_v.data.array,
+                sfmt(alloc, "mach.toml: {}.symbols must be an array of strings", label));
+            if (R.is_err[StrArr, str](res_syms)) { ret R.err[bool, str](R.unwrap_err[StrArr, str](res_syms)); }
+            val syms: StrArr = R.unwrap_ok[StrArr, str](res_syms);
+            var si: u32 = 0;
+            for (si < syms.count) {
+                if (str_empty(idstr(itn, syms.items[si]))) {
+                    ret R.err[bool, str](sfmt(alloc, "mach.toml: {}.symbols has an empty symbol name", label));
+                }
+                var sj: u32 = 0;
+                for (sj < si) {
+                    if (syms.items[sj] == syms.items[si]) {
+                        ret R.err[bool, str](sfmt(alloc, "mach.toml: {}.symbols lists '{}' twice",
+                                                  label, idstr(itn, syms.items[si])));
+                    }
+                    sj = sj + 1;
+                }
+                si = si + 1;
+            }
+            d.symbols      = syms.items;
+            d.symbol_count = syms.count;
+        }
+
         val name_val: str = toml.get_str(sub, "name");
         val path_val: str = toml.get_str(sub, "path");
 
@@ -1186,6 +1226,7 @@ pub fun dnit(m: *Manifest, alloc: *A.Allocator) {
             free_strarr(alloc, l.os, l.os_count);
             free_strarr(alloc, l.isa, l.isa_count);
             free_strarr(alloc, l.abi, l.abi_count);
+            free_strarr(alloc, l.symbols, l.symbol_count);
             i = i + 1;
         }
         A.deallocate[LinkDef](alloc, m.links, m.link_count::usize);
@@ -1210,6 +1251,26 @@ pub fun dnit(m: *Manifest, alloc: *A.Allocator) {
 fun free_strarr(alloc: *A.Allocator, items: *intern.StrId, count: u32) {
     if (items != nil && count > 0) {
         A.deallocate[intern.StrId](alloc, items, count::usize);
+    }
+}
+
+# release the claim arrays `link_requirement` copied onto `alloc` for the first
+# `count` populated requirements; the caller still owns the requirement array
+#
+# `count` is the populated prefix, not the allocation's capacity: a partly filled
+# buffer would otherwise read claim pointers out of uninitialized entries.
+# ---
+# alloc: allocator the claim copies were made on
+# items: the requirement array, or nil
+# count: number of populated requirements to release
+pub fun free_link_claims(alloc: *A.Allocator, items: *LinkRequirement, count: u32) {
+    if (items == nil) { ret; }
+    var i: u32 = 0;
+    for (i < count) {
+        free_strarr(alloc, items[i].symbols, items[i].symbol_count);
+        items[i].symbols      = nil;
+        items[i].symbol_count = 0;
+        i = i + 1;
     }
 }
 
@@ -1519,8 +1580,14 @@ fun join_path_canonical(alloc: *A.Allocator, a: str, b: str) str {
 }
 
 # resolve a matched link entry without discarding its declared source semantics
+#
+# The requirement owns its claim array rather than borrowing the entry's. A
+# requirement outlives the manifest it came from on the export cascade, which
+# tears down the dependency manifests before the link reads the claims, so a
+# borrow would dangle. Release it with `free_link_claims` when the requirement
+# is dropped.
 # ---
-# alloc:    allocator used while expanding a local path
+# alloc:    allocator used while expanding a local path and owning the claim copy
 # itn:      interner owning the requirement text and stable library name
 # l:        target-matched manifest entry
 # proj_out: expanded project output root for a local path
@@ -1531,14 +1598,28 @@ pub fun link_requirement(alloc: *A.Allocator, itn: *intern.Interner, l: *LinkDef
     var req: LinkRequirement;
     req.source  = l.source;
     req.library = l.library;
+    req.symbols      = nil;
+    req.symbol_count = 0;
+    if (l.symbol_count > 0) {
+        val cr: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](alloc, l.symbol_count::usize);
+        if (R.is_err[*intern.StrId, str](cr)) { ret R.err[LinkRequirement, str](R.unwrap_err[*intern.StrId, str](cr)); }
+        req.symbols = R.unwrap_ok[*intern.StrId, str](cr);
+        var si: u32 = 0;
+        for (si < l.symbol_count) { req.symbols[si] = l.symbols[si]; si = si + 1; }
+        req.symbol_count = l.symbol_count;
+    }
     if (l.source == LINK_LOCAL) {
         val raw_path: str = idstr(itn, l.path);
         val expanded_r: R.Result[str, str] = expand(alloc, raw_path, proj_out, v);
-        if (R.is_err[str, str](expanded_r)) { ret R.err[LinkRequirement, str](R.unwrap_err[str, str](expanded_r)); }
+        if (R.is_err[str, str](expanded_r)) {
+            free_strarr(alloc, req.symbols, req.symbol_count);
+            ret R.err[LinkRequirement, str](R.unwrap_err[str, str](expanded_r));
+        }
         val expanded: str = R.unwrap_ok[str, str](expanded_r);
         val res_int: R.Result[intern.StrId, str] = intern.intern(itn, expanded);
         str_free(alloc, expanded);
         if (R.is_err[intern.StrId, str](res_int)) {
+            free_strarr(alloc, req.symbols, req.symbol_count);
             ret R.err[LinkRequirement, str](R.unwrap_err[intern.StrId, str](res_int));
         }
         req.text = R.unwrap_ok[intern.StrId, str](res_int);
@@ -1987,11 +2068,14 @@ pub fun resolve_test_libs(alloc: *A.Allocator, itn: *intern.Interner, m: *Manife
                 if (link_matches_target(itn, found_l, t)) {
                     val req_r: R.Result[LinkRequirement, str] = link_requirement(alloc, itn, found_l, proj_out, v);
                     if (R.is_err[LinkRequirement, str](req_r)) {
+                        free_link_claims(alloc, buf, w);
                         A.deallocate[LinkRequirement](alloc, buf, max::usize);
                         ret R.err[bool, str](R.unwrap_err[LinkRequirement, str](req_r));
                     }
-                    val req: LinkRequirement = R.unwrap_ok[LinkRequirement, str](req_r);
+                    var req: LinkRequirement = R.unwrap_ok[LinkRequirement, str](req_r);
                     if (!requirement_in_buf(buf, w, ?req)) { buf[w] = req; w = w + 1; }
+                    # a duplicate is dropped here, so its claim copy is released
+                    or { free_link_claims(alloc, ?req, 1); }
                 }
             }
             li = li + 1;
@@ -3191,6 +3275,116 @@ test "mach.lang.manifest.parse:link_library_requires_nonempty_string" {
     val want: str = "mach.toml: [link.bad].library must be a non-empty string";
     if (R.is_ok[Manifest, str](empty) || !str_equals(R.unwrap_err[Manifest, str](empty), want)) { code = 1; }
     if (R.is_ok[Manifest, str](typed) || !str_equals(R.unwrap_err[Manifest, str](typed), want)) { code = 1; }
+    arena.dnit(?ar);
+    ret code;
+}
+
+# the `symbols` claim list (#2510): absent leaves the entry claiming nothing (the
+# behaviour every pre-existing manifest must keep), a listed array parses in order,
+# and the malformed shapes are strict errors rather than partially-read lists
+test "mach.lang.manifest.parse:link_symbols_claim" {
+    var backing: A.Allocator; var ar: arena.Arena; var alloc: A.Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+    val head: str = "[project]\nid=\"x\"\nversion=\"1\"\nsrc=\"src\"\nout=\"out\"\n";
+
+    # absent: no claims, so an existing manifest attributes exactly as before.
+    val none: R.Result[Manifest, str] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n"));
+    if (R.is_err[Manifest, str](none)) { code = 1; }
+    or {
+        val m: Manifest = R.unwrap_ok[Manifest, str](none);
+        if (m.links[0].symbol_count != 0 || m.links[0].symbols != nil) { code = 1; }
+    }
+
+    # listed: parsed in declaration order and interned.
+    val two: R.Result[Manifest, str] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\nsymbols=[\"Sleep\",\"ExitProcess\"]\nos=\"*\"\nisa=[\"*\"]\nabi=[\"*\"]\nexport=false\n"));
+    if (R.is_err[Manifest, str](two)) { code = 1; }
+    or {
+        val m: Manifest = R.unwrap_ok[Manifest, str](two);
+        if (m.links[0].symbol_count != 2) { code = 1; }
+        or {
+            if (!str_equals(idstr(?itn, m.links[0].symbols[0]), "Sleep")) { code = 1; }
+            if (!str_equals(idstr(?itn, m.links[0].symbols[1]), "ExitProcess")) { code = 1; }
+        }
+    }
+
+    # a bare string is not accepted: one symbol is still a list, so the shape never
+    # depends on the count.
+    val scalar: R.Result[Manifest, str] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\nsymbols=\"Sleep\"\n"));
+    if (R.is_ok[Manifest, str](scalar)
+        || !str_equals(R.unwrap_err[Manifest, str](scalar), "mach.toml: [link.k].symbols must be an array of strings")) { code = 1; }
+
+    # a non-string element is rejected rather than skipped.
+    val typed: R.Result[Manifest, str] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\nsymbols=[\"Sleep\",1]\n"));
+    if (R.is_ok[Manifest, str](typed)
+        || !str_equals(R.unwrap_err[Manifest, str](typed), "mach.toml: [link.k].symbols must be an array of strings")) { code = 1; }
+
+    # an empty name would claim nothing under a name no symbol carries.
+    val blank: R.Result[Manifest, str] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\nsymbols=[\"\"]\n"));
+    if (R.is_ok[Manifest, str](blank)
+        || !str_equals(R.unwrap_err[Manifest, str](blank), "mach.toml: [link.k].symbols has an empty symbol name")) { code = 1; }
+
+    # a repeat inside one entry is a manifest mistake, not a silent dedup.
+    val dup: R.Result[Manifest, str] = tparse(?alloc, ?itn, sfmt(?alloc, "{}{}", head,
+        "[link.k]\nsource=\"system\"\nname=\"kernel32.dll\"\nsymbols=[\"Sleep\",\"Sleep\"]\n"));
+    if (R.is_ok[Manifest, str](dup)
+        || !str_equals(R.unwrap_err[Manifest, str](dup), "mach.toml: [link.k].symbols lists 'Sleep' twice")) { code = 1; }
+
+    arena.dnit(?ar);
+    ret code;
+}
+
+# a requirement must OWN its claim array, not borrow the entry's (#2510). on the
+# export cascade the dependency manifest is torn down before the link reads the
+# claims, so a borrow dangles - and a behavioural test cannot see that, since
+# freed storage usually still holds the old bytes. this asserts the invariant
+# directly: distinct storage, and the values survive the entry's array being
+# freed and its slots overwritten
+test "mach.lang.manifest.link_requirement:owns_its_claim_array" {
+    var backing: A.Allocator; var ar: arena.Arena; var alloc: A.Allocator; var itn: intern.Interner;
+    if (!tinit(?backing, ?ar, ?alloc, ?itn)) { ret 1; }
+    var code: i32 = 0;
+
+    val sleep_r: R.Result[intern.StrId, str] = intern.intern(?itn, "Sleep");
+    val k32_r:   R.Result[intern.StrId, str] = intern.intern(?itn, "kernel32");
+    if (R.is_err[intern.StrId, str](sleep_r) || R.is_err[intern.StrId, str](k32_r)) { arena.dnit(?ar); ret 1; }
+    val sleep: intern.StrId = R.unwrap_ok[intern.StrId, str](sleep_r);
+
+    val owned_r: R.Result[*intern.StrId, str] = A.allocate[intern.StrId](?alloc, 1::usize);
+    if (R.is_err[*intern.StrId, str](owned_r)) { arena.dnit(?ar); ret 1; }
+    var l: LinkDef;
+    l.source       = LINK_SYSTEM;
+    l.name         = R.unwrap_ok[intern.StrId, str](k32_r);
+    l.library      = R.unwrap_ok[intern.StrId, str](k32_r);
+    l.lib_name     = R.unwrap_ok[intern.StrId, str](k32_r);
+    l.path         = intern.STR_NIL;
+    l.symbols      = R.unwrap_ok[*intern.StrId, str](owned_r);
+    l.symbol_count = 1;
+    l.symbols[0]   = sleep;
+
+    var v: TmplVars;
+    val req_r: R.Result[LinkRequirement, str] = link_requirement(?alloc, ?itn, ?l, "", ?v);
+    if (R.is_err[LinkRequirement, str](req_r)) { arena.dnit(?ar); ret 1; }
+    var req: LinkRequirement = R.unwrap_ok[LinkRequirement, str](req_r);
+
+    # distinct storage is the invariant; a borrow would alias here
+    if (req.symbols == l.symbols) { code = 1; }
+    if (req.symbol_count != 1 || req.symbols[0] != sleep) { code = 1; }
+
+    # release the entry's array as `dnit` does, then overwrite the slot it held.
+    # an aliasing requirement would read the overwrite back.
+    free_strarr(?alloc, l.symbols, l.symbol_count);
+    l.symbols[0] = intern.STR_NIL;
+    if (req.symbols[0] != sleep) { code = 1; }
+
+    free_link_claims(?alloc, ?req, 1);
+    if (req.symbols != nil || req.symbol_count != 0) { code = 1; }
+
     arena.dnit(?ar);
     ret code;
 }
