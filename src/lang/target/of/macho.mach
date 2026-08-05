@@ -5528,3 +5528,327 @@ test "mach.lang.target.of.macho.emit_object:debug_dwarf_roundtrip" {
     if (ts_object_debug_roundtrip() != 0) { ret 1; }
     ret 0;
 }
+
+# rewrite the relocation entry at in-section patch offset `address` of section
+# header `sh` into the section-based form naming the 1-based section `sect`,
+# leaving the type / length / pc-relative bits as emitted
+# ---
+# buf:     the emitted object bytes
+# sh:      file offset of the patched section's section_64 entry
+# address: the relocation's in-section patch offset
+# sect:    the 1-based section index the entry is to name
+# ret:     true when the entry was found and rewritten
+fun t_make_section_based(buf: *u8, sh: usize, address: u32, sect: u32) bool {
+    val reloff: usize = bin.read_u32_le(buf, sh + 56)::usize;
+    val nreloc: u32 = bin.read_u32_le(buf, sh + 60);
+    var r: u32 = 0;
+    for (r < nreloc) {
+        val e: usize = reloff + r::usize * RELOC_INFO_SIZE;
+        if (bin.read_u32_le(buf, e) == address) {
+            # keep bits 24..31 except r_extern (bit 27), and replace r_symbolnum.
+            bin.write_u32_le(buf, e + 4, (bin.read_u32_le(buf, e + 4) & 0xF7000000) | sect);
+            ret true;
+        }
+        r = r + 1;
+    }
+    ret false;
+}
+
+# the parsed relocation patching section `sec` at offset `off`, or nil
+# ---
+# img: the parsed image to search
+# sec: the patched section index
+# off: the in-section patch offset
+# ret: the matching relocation, or nil when the image holds none
+fun t_reloc_at(img: *of.ObjectImage, sec: u32, off: u32) *of.Relocation {
+    var r: u32 = 0;
+    for (r < img.reloc_count) {
+        if (img.relocations[r].section == sec && img.relocations[r].offset == off) { ret ?img.relocations[r]; }
+        r = r + 1;
+    }
+    ret nil;
+}
+
+# the parsed symbol named `name`, or nil
+# ---
+# img:  the parsed image to search
+# name: the interned symbol name to find
+# ret:  the matching symbol, or nil when the image holds none
+fun t_sym_named(img: *of.ObjectImage, name: intern.StrId) *of.Symbol {
+    var s: u32 = 0;
+    for (s < img.symbol_count) {
+        if (img.symbols[s].name == name) { ret ?img.symbols[s]; }
+        s = s + 1;
+    }
+    ret nil;
+}
+
+# a section-based (r_extern = 0) x86_64 relocation parses through a synthetic
+# anchor for the section it names, with the target's in-section offset recovered
+# as the abstract addend: the absolute form reads the whole address out of its
+# 8-byte field, the pc-relative form reads a next-instruction-relative
+# displacement and is returned in the abstract field-relative convention. this is
+# the form every normally-compiled clang object uses for its __compact_unwind and
+# __debug_* references (#2521)
+fun ts_section_reloc_x64() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+
+    var text_bytes: [24]u8;
+    var k: usize = 0;
+    for (k < 24) { text_bytes[k] = 0; k = k + 1; }
+    var data_bytes: [8]u8;
+    k = 0;
+    for (k < 8) { data_bytes[k] = 0; k = k + 1; }
+
+    var secs: [2]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 24; secs[0].align = 16;
+    secs[1].name = t_intern(?i, ".data"); secs[1].kind = of.SK_DATA;
+    secs[1].bytes = ?data_bytes[0]; secs[1].len = 8; secs[1].align = 8;
+
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "_main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 24; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, "g"); syms[1].section = 1; syms[1].offset = 0;
+    syms[1].size = 8; syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+
+    var relocs: [2]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 8;  relocs[0].kind = of.RK_PC32;
+    relocs[0].symbol = syms[1].name; relocs[0].addend = -4;
+    relocs[1].section = 0; relocs[1].offset = 16; relocs[1].kind = of.RK_ABS64;
+    relocs[1].symbol = syms[1].name; relocs[1].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 2;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = ?relocs[0]; img.reloc_count = 2;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_secrel");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    # the writer never emits the section-based form, so the two entries are
+    # rewritten in place to name `.data` (section 2, 1-based) and their fields
+    # rewritten to the object-space address of `.data` + 6 the form carries.
+    val seg: usize = t_find_lc(buf.data, LC_SEGMENT_64);
+    if (seg == 0) { ret 1; }
+    val sh0: usize = seg + SEGMENT_CMD_64_SIZE;
+    val sh1: usize = sh0 + SECTION_64_SIZE;
+    val text_addr: u64 = bin.read_u64_le(buf.data, sh0 + 32);
+    val text_off:  usize = bin.read_u32_le(buf.data, sh0 + 48)::usize;
+    val data_addr: u64 = bin.read_u64_le(buf.data, sh1 + 32);
+    val target:    u64 = data_addr + 6;
+
+    if (!t_make_section_based(buf.data, sh0, 8, 2))  { ret 1; }
+    if (!t_make_section_based(buf.data, sh0, 16, 2)) { ret 1; }
+    bin.write_u64_le(buf.data, text_off + 16, target);
+    bin.write_u32_le(buf.data, text_off + 8, (target::i64 - (text_addr + 8 + 4)::i64)::u32);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+
+    # the anchor is appended past the object's own two symbols, named by the
+    # section's (segname, sectname) identity and inert: local, zero-sized, flagless.
+    if (out.symbol_count != 3) { ret 1; }
+    val anchor: *of.Symbol = t_sym_named(?out, t_intern(?i, "__DATA,__data"));
+    if (anchor == nil)                             { ret 1; }
+    if (anchor.section != 1 || anchor.offset != 0) { ret 1; }
+    if (anchor.size != 0 || anchor.flags != 0)     { ret 1; }
+
+    # both entries resolve through that anchor: the absolute one at the target's
+    # in-section offset, the pc-relative one at that offset less the field bias.
+    val abs64: *of.Relocation = t_reloc_at(?out, 0, 16);
+    if (abs64 == nil)                    { ret 1; }
+    if (abs64.kind != of.RK_ABS64)       { ret 1; }
+    if (abs64.symbol != anchor.name)     { ret 1; }
+    if (abs64.addend != 6)               { ret 1; }
+
+    val pc32: *of.Relocation = t_reloc_at(?out, 0, 8);
+    if (pc32 == nil)                     { ret 1; }
+    if (pc32.kind != of.RK_PC32)         { ret 1; }
+    if (pc32.symbol != anchor.name)      { ret 1; }
+    if (pc32.addend != 2)                { ret 1; }
+    ret 0;
+}
+
+# a section-based relocation resolves through a section anchor on both arches, and
+# a section-based arm64 page/page-offset/branch entry - whose field carries only a
+# fragment of the target address, packed into an instruction immediate - is
+# rejected by name rather than guessed at
+fun ts_section_reloc_arm64() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_AARCH64);
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0; k = k + 1; }
+    # an ADRP at offset 0, so the PAGE21 entry decodes as an instruction site.
+    text_bytes[3] = 0x90;
+    var data_bytes: [8]u8;
+    k = 0;
+    for (k < 8) { data_bytes[k] = 0; k = k + 1; }
+
+    var secs: [2]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
+    secs[1].name = t_intern(?i, ".data"); secs[1].kind = of.SK_DATA;
+    secs[1].bytes = ?data_bytes[0]; secs[1].len = 8; secs[1].align = 8;
+
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "_main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, "g"); syms[1].section = 1; syms[1].offset = 0;
+    syms[1].size = 8; syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+
+    var relocs: [2]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_PAGE21;
+    relocs[0].symbol = syms[1].name; relocs[0].addend = 0;
+    relocs[1].section = 0; relocs[1].offset = 8; relocs[1].kind = of.RK_ABS64;
+    relocs[1].symbol = syms[1].name; relocs[1].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 2;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = ?relocs[0]; img.reloc_count = 2;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_secrela");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    val seg: usize = t_find_lc(buf.data, LC_SEGMENT_64);
+    if (seg == 0) { ret 1; }
+    val sh0: usize = seg + SEGMENT_CMD_64_SIZE;
+    val sh1: usize = sh0 + SECTION_64_SIZE;
+    val text_off:  usize = bin.read_u32_le(buf.data, sh0 + 48)::usize;
+    val data_addr: u64 = bin.read_u64_le(buf.data, sh1 + 32);
+
+    if (!t_make_section_based(buf.data, sh0, 8, 2)) { ret 1; }
+    bin.write_u64_le(buf.data, text_off + 8, data_addr + 3);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+    val anchor: *of.Symbol = t_sym_named(?out, t_intern(?i, "__DATA,__data"));
+    if (anchor == nil)                   { ret 1; }
+    val abs64: *of.Relocation = t_reloc_at(?out, 0, 8);
+    if (abs64 == nil)                    { ret 1; }
+    if (abs64.symbol != anchor.name)     { ret 1; }
+    if (abs64.addend != 3)               { ret 1; }
+
+    # the PAGE21 entry made section-based is refused, not silently mis-resolved.
+    if (!t_make_section_based(buf.data, sh0, 0, 2)) { ret 1; }
+    var out2: of.ObjectImage;
+    val pr2: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out2);
+    if (R.is_ok[bool, str](pr2)) { ret 1; }
+    if (!str_contains(R.unwrap_err[bool, str](pr2), "page21")) { ret 1; }
+    ret 0;
+}
+
+# a section-based entry naming a section the object does not have is rejected
+# rather than read past the section table
+fun ts_section_reloc_out_of_range() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+
+    var text_bytes: [24]u8;
+    var k: usize = 0;
+    for (k < 24) { text_bytes[k] = 0; k = k + 1; }
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 24; secs[0].align = 16;
+
+    var syms: [1]of.Symbol;
+    syms[0].name = t_intern(?i, "_main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 24; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 16; relocs[0].kind = of.RK_ABS64;
+    relocs[0].symbol = syms[0].name; relocs[0].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 1;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_secrelo");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    val seg: usize = t_find_lc(buf.data, LC_SEGMENT_64);
+    if (seg == 0) { ret 1; }
+    if (!t_make_section_based(buf.data, seg + SEGMENT_CMD_64_SIZE, 16, 7)) { ret 1; }
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_ok[bool, str](pr)) { ret 1; }
+    ret 0;
+}
+
+# a section-based x86_64 relocation resolves through a synthetic section anchor,
+# recovering the target's in-section offset from the in-place field
+test "mach.lang.target.of.macho.parse_object:section_reloc_x64" {
+    if (ts_section_reloc_x64() != 0) { ret 1; }
+    ret 0;
+}
+
+# a section-based arm64 relocation resolves the same way, and the page/branch
+# forms whose field carries no whole address are refused by name
+test "mach.lang.target.of.macho.parse_object:section_reloc_arm64" {
+    if (ts_section_reloc_arm64() != 0) { ret 1; }
+    ret 0;
+}
+
+# a section-based entry naming a section outside the object's section table is an
+# error, not an out-of-range read
+test "mach.lang.target.of.macho.parse_object:section_reloc_out_of_range" {
+    if (ts_section_reloc_out_of_range() != 0) { ret 1; }
+    ret 0;
+}
