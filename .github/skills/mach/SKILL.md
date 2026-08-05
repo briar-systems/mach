@@ -199,7 +199,9 @@ Windows COFF inputs compiled with C/C++ `dllimport` may leave `__imp_X`
 undefined. Attribute the real export X normally; the linker strips the object
 prefix for loader lookup and points the foreign reference at X's IAT cell. A
 direct X reference and `__imp_X` share one import entry — never map `__imp_X` as
-a separate loader export.
+a separate loader export. If the same link graph instead supplies a strong X,
+`__imp_X` is a local pointer cell initialized to X: it creates no loader import
+and needs no `#[library]` attribution, while direct references still target X.
 
 ### `val` / `var`
 
