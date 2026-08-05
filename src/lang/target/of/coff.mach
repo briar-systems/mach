@@ -55,6 +55,7 @@ use mach.lang.intern;
 use mach.lang.target.isa;
 use mach.lang.target.of;
 use mach.lang.target.of.bin;
+use rs: mach.lang.target.of.rsrc;
 
 # COFF machine type for x86-64
 val IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
@@ -140,6 +141,7 @@ val IMAGE_DLLCHARACTERISTICS_NX_COMPAT: u16 = 0x0100;
 
 # data-directory indices in the PE32+ optional header
 val IMAGE_DIRECTORY_ENTRY_IMPORT:    u32 = 1;
+val IMAGE_DIRECTORY_ENTRY_RESOURCE:  u32 = 2;
 val IMAGE_DIRECTORY_ENTRY_EXCEPTION: u32 = 3;
 val IMAGE_DIRECTORY_ENTRY_BASERELOC: u32 = 5;
 val IMAGE_DIRECTORY_ENTRY_IAT:       u32 = 12;
@@ -2005,6 +2007,7 @@ rec PeSection {
 # import_dir_*:  the import directory span within .idata (the IMPORT directory)
 # nimp:          number of function imports (IAT/stub/hint-name entries)
 # exception_*:   the .pdata span (EXCEPTION data directory target)
+# resource_*:    the .rsrc span (RESOURCE data directory target)
 # sec_total:     number of section-table entries
 rec PeLayout {
     image_base:  u64;
@@ -2016,6 +2019,7 @@ rec PeLayout {
     xdata_sec:   PeSection;
     pdata_sec:   PeSection;
     reloc_sec:   PeSection;
+    rsrc_sec:    PeSection;
     iat_rva:     u64;
     iat_size:    u64;
     import_dir_rva:  u64;
@@ -2024,12 +2028,15 @@ rec PeLayout {
     exception_size:  u64;
     basereloc_rva:   u64;
     basereloc_size:  u64;
+    resource_rva:    u64;
+    resource_size:   u64;
     nimp:        u32;
     have_stub:   bool;
     have_idata:  bool;
     have_xdata:  bool;
     have_pdata:  bool;
     have_reloc:  bool;
+    have_rsrc:   bool;
     sec_total:   u32;
     # non-allocated debug sections (discardable), placed above the loaded sections;
     # `debug_secs` is a caller-provided array of `debug_count` entries. a debug name
@@ -2466,7 +2473,8 @@ fun collect_function_unwind(segs: *of.LoadSegment, seg_count: u32, funcs: *of.Ex
 fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32,
                       dyn: *of.DynamicInfo, seg_secs: *PeSection,
                       xdata_vsize: usize, pdata_vsize: usize,
-                      debug: *of.Section, debug_count: u32, debug_secs: *PeSection) usize {
+                      debug: *of.Section, debug_count: u32, debug_secs: *PeSection,
+                      res_img: *rs.RsrcImage) usize {
     lay.nimp      = func_import_count(dyn);
     lay.seg_secs  = seg_secs;
     lay.have_stub = lay.nimp > 0;
@@ -2474,6 +2482,7 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
     lay.have_xdata = xdata_vsize > 0;
     lay.have_pdata = pdata_vsize > 0;
     lay.have_reloc = dyn != nil && dyn.base_reloc_count > 0;
+    lay.have_rsrc  = res_img != nil;
     lay.debug_secs  = debug_secs;
     lay.debug_count = debug_count;
     lay.strtab_off  = 0;
@@ -2486,6 +2495,7 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
     if (lay.have_idata) { nsec = nsec + 1; }
     if (lay.have_xdata) { nsec = nsec + 1; }
     if (lay.have_pdata) { nsec = nsec + 1; }
+    if (lay.have_rsrc)  { nsec = nsec + 1; }
     if (lay.have_reloc) { nsec = nsec + 1; }
     nsec = nsec + debug_count;
     lay.sec_total = nsec;
@@ -2611,6 +2621,22 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
         rva = rva + bin.align_up_u64(lay.pdata_sec.vsize, PE_SECTION_ALIGN);
     }
 
+    # the .rsrc section (read-only): the resource directory tree. its data entries
+    # carry image RVAs, so the blob can only be serialized once this assigns the
+    # section's own RVA - measured here, written in `write_pe`.
+    if (lay.have_rsrc) {
+        rva = bin.align_up_u64(rva, PE_SECTION_ALIGN);
+        val res_size: usize = rs.size(res_img);
+        lay.rsrc_sec.rva       = rva;
+        lay.rsrc_sec.vsize     = res_size::u64;
+        lay.rsrc_sec.file_off  = file_off;
+        lay.rsrc_sec.file_size = bin.align_up(res_size, PE_FILE_ALIGN::usize);
+        lay.resource_rva       = rva;
+        lay.resource_size      = res_size::u64;
+        file_off = file_off + lay.rsrc_sec.file_size;
+        rva = rva + bin.align_up_u64(res_size::u64, PE_SECTION_ALIGN);
+    }
+
     # the .reloc section (read-only, discardable): the base-relocation blocks the loader
     # applies after ASLR slides the image. the fixup RVAs read the segment RVAs assigned
     # above, so the base_relocs must already be sorted (the writer sorts before this).
@@ -2687,10 +2713,11 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
 # ret:        ok(true) on success, or an error string
 fun coff_emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
                    seg_count: u32, page_size: u64, entry: u64, funcs: *of.ExecFunction,
-                   func_count: u32, debug: *of.Section, debug_count: u32, path: *u8, name: *u8) R.Result[bool, str] {
+                   func_count: u32, debug: *of.Section, debug_count: u32, path: *u8, name: *u8,
+                   rsrc: *of.ResourceInfo) R.Result[bool, str] {
     # a static PE carries no dynamic plan, so it resolves no interned names; the
     # interner is forwarded only so a write failure can be located on its path.
-    ret write_pe(alloc, itn, isa_vt, segs, seg_count, entry, funcs, func_count, nil, nil, 0, debug, debug_count, path);
+    ret write_pe(alloc, itn, isa_vt, segs, seg_count, entry, funcs, func_count, nil, nil, 0, debug, debug_count, path, rsrc);
 }
 
 # serialize laid-out load segments into a dynamically-linked
@@ -2723,8 +2750,8 @@ fun coff_emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.
                        seg_count: u32, page_size: u64, entry: u64, funcs: *of.ExecFunction,
                        func_count: u32, dyn: *of.DynamicInfo,
                        fixups: *of.PltFixup, fixup_count: u32, debug: *of.Section, debug_count: u32,
-                       path: *u8, name: *u8) R.Result[bool, str] {
-    ret write_pe(alloc, itn, isa_vt, segs, seg_count, entry, funcs, func_count, dyn, fixups, fixup_count, debug, debug_count, path);
+                       path: *u8, name: *u8, rsrc: *of.ResourceInfo) R.Result[bool, str] {
+    ret write_pe(alloc, itn, isa_vt, segs, seg_count, entry, funcs, func_count, dyn, fixups, fixup_count, debug, debug_count, path, rsrc);
 }
 
 # the shared PE32+ executable writer behind `coff_emit_exec` (static)
@@ -2737,7 +2764,8 @@ fun coff_emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.
 fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
              seg_count: u32, entry: u64, funcs: *of.ExecFunction, func_count: u32,
              dyn: *of.DynamicInfo,
-             fixups: *of.PltFixup, fixup_count: u32, debug: *of.Section, debug_count: u32, path: *u8) R.Result[bool, str] {
+             fixups: *of.PltFixup, fixup_count: u32, debug: *of.Section, debug_count: u32, path: *u8,
+             rsrc: *of.ResourceInfo) R.Result[bool, str] {
     if (isa_vt == nil) { ret R.err[bool, str]("coff: nil exec isa"); }
     if (path == nil)   { ret R.err[bool, str]("coff: nil exec path"); }
     if (isa_vt.id != isa.ARCH_X86_64) {
@@ -2793,12 +2821,32 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
         sort.sort[of.BaseReloc](dyn.base_relocs, dyn.base_reloc_count::usize, base_reloc_cmp);
     }
 
+    # the resource blob is built once: the layout needs its size and the section
+    # write needs its bytes, and a second build could disagree with the first. a nil
+    # plan leaves `have_rsrc` false and the image identical to a resourceless one.
+    var res_img: rs.RsrcImage;
+    var res_ptr: *rs.RsrcImage = nil;
+    if (rsrc != nil) {
+        val rr: R.Result[rs.RsrcImage, str] = rs.build(alloc, rsrc.icon, rsrc.icon_len,
+                                                       rsrc.app_manifest, rsrc.app_manifest_len,
+                                                       rsrc.version, rsrc.product);
+        if (R.is_err[rs.RsrcImage, str](rr)) {
+            if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
+            A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
+            if (uw_all != nil && func_count > 0) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
+            ret R.err[bool, str](R.unwrap_err[rs.RsrcImage, str](rr));
+        }
+        res_img = R.unwrap_ok[rs.RsrcImage, str](rr);
+        res_ptr = ?res_img;
+    }
+
     var lay: PeLayout;
     val total_size: usize = compute_pe_layout(itn, ?lay, segs, seg_count, dyn, seg_secs, xdata_vsize, pdata_vsize,
-                                              debug, debug_count, debug_secs);
+                                              debug, debug_count, debug_secs, res_ptr);
 
     val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_size);
     if (R.is_err[*u8, str](res_buf)) {
+        if (res_ptr != nil) { rs.dnit(alloc, res_ptr); }
         if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
         A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
         if (uw_all != nil && func_count > 0) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
@@ -2850,12 +2898,14 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
     if (lay.have_idata)                   { write_pe_imports(itn, buf, ?lay, dyn); }
     if (lay.have_stub)                    { write_pe_stubs(buf, ?lay, dyn); }
     if (lay.have_xdata || lay.have_pdata) { write_pe_unwind(buf, ?lay, uw_all, uw_count); }
+    if (lay.have_rsrc)                    { rs.emit(res_ptr, buf, lay.rsrc_sec.file_off, lay.rsrc_sec.rva); }
     if (lay.have_reloc)                   { write_reloc_section(buf, lay.reloc_sec.file_off, dyn, seg_secs); }
 
     # redirect each import call site to its stub (a non-import call site never
     # reaches here - the linker only records fixups for function imports).
     val fx_r: R.Result[bool, str] = patch_pe_fixups(buf, ?lay, dyn, fixups, fixup_count, segs, seg_count);
     if (R.is_err[bool, str](fx_r)) {
+        if (res_ptr != nil) { rs.dnit(alloc, res_ptr); }
         A.deallocate[u8](alloc, buf, total_size);
         if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
         A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
@@ -2868,6 +2918,7 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
     val pie: bool = dyn != nil && dyn.pie;
     write_pe_headers(buf, ?lay, segs, seg_count, entry, pie, itn, dyn, debug, debug_count);
 
+    if (res_ptr != nil) { rs.dnit(alloc, res_ptr); }
     if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
     A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
     if (uw_all != nil && func_count > 0) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
@@ -3297,6 +3348,12 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
         bin.write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_IAT::usize * DATA_DIR_SIZE, lay.iat_rva::u32);
         bin.write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_IAT::usize * DATA_DIR_SIZE + 4, lay.iat_size::u32);
     }
+    # RESOURCE directory (index 2) - the .rsrc resource tree the loader and the
+    # shell read the icon, version block, and application manifest out of.
+    if (lay.have_rsrc) {
+        bin.write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_RESOURCE::usize * DATA_DIR_SIZE, lay.resource_rva::u32);
+        bin.write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_RESOURCE::usize * DATA_DIR_SIZE + 4, lay.resource_size::u32);
+    }
     # EXCEPTION directory (index 3) - the RUNTIME_FUNCTION table in .pdata.
     if (lay.have_pdata) {
         bin.write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_EXCEPTION::usize * DATA_DIR_SIZE, lay.exception_rva::u32);
@@ -3342,6 +3399,11 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
     }
     if (lay.have_pdata) {
         write_pe_section_header(buf, pos, ".pdata", ?str_pos, ?lay.pdata_sec,
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
+        pos = pos + SECTION_HEADER_SIZE;
+    }
+    if (lay.have_rsrc) {
+        write_pe_section_header(buf, pos, ".rsrc", ?str_pos, ?lay.rsrc_sec,
             IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
         pos = pos + SECTION_HEADER_SIZE;
     }
@@ -4410,7 +4472,7 @@ test "mach.lang.target.of.coff.coff_emit_exec:pe32plus_header" {
     if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
 
-    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 2, 4096, entry, nil, 0, nil::*of.Section, 0, fs.temp_path(?tf)::*u8, "coffexe"::*u8);
+    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 2, 4096, entry, nil, 0, nil::*of.Section, 0, fs.temp_path(?tf)::*u8, "coffexe"::*u8, nil);
     if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
 
     val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
@@ -4651,7 +4713,7 @@ test "mach.lang.target.of.coff.coff_emit_exec:unwind_xdata_pdata" {
     if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
 
-    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1, 4096, entry, ?funcs[0], 1, nil::*of.Section, 0, fs.temp_path(?tf)::*u8, "coffunwind"::*u8);
+    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1, 4096, entry, ?funcs[0], 1, nil::*of.Section, 0, fs.temp_path(?tf)::*u8, "coffunwind"::*u8, nil);
     if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
 
     val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
@@ -5294,7 +5356,7 @@ fun ts_pe_debug_sections() u8 {
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
 
     val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1, 4096, entry,
-                                                 nil, 0, ?dbg[0], 2, fs.temp_path(?tf)::*u8, "coffdbg"::*u8);
+                                                 nil, 0, ?dbg[0], 2, fs.temp_path(?tf)::*u8, "coffdbg"::*u8, nil);
     if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
 
     val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
@@ -5422,7 +5484,7 @@ fun ts_dyn_exec_relro_naming() u8 {
     val em: R.Result[bool, str] = coff_emit_dyn_exec(?alloc, ?i, ?isa_vt, ?segs[0], 5, 4096, base,
                                                       nil::*of.ExecFunction, 0, ?dyn,
                                                       nil::*of.PltFixup, 0, nil::*of.Section, 0,
-                                                      fs.temp_path(?tf)::*u8, "coffrelro"::*u8);
+                                                      fs.temp_path(?tf)::*u8, "coffrelro"::*u8, nil);
     if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
 
     val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
