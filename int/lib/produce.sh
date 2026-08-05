@@ -12,6 +12,9 @@
 #                 execution cannot observe (PE ASLR bit, macho PIE bit). dispatched
 #                 on the artifact's own magic, so it is independent of how the case
 #                 maps to a leg. no LLVM; reads little-endian fields (every runner is LE).
+#   macho-signed— structurally resolve the three x86_64 immediate-store displacements
+#                 and compare them with independent initialized-data markers, proving
+#                 SIGNED_1/_2/_4 each linked to its exact target without a mac runner.
 #   pe-imports  — like field, but walks the PE import directory and reports every
 #                 `<dll>:<symbol>` binding (#2510). PE-only; the observable for
 #                 two-level-namespace attribution, which execution cannot check.
@@ -170,7 +173,7 @@ produce_panic_exit() {
 }
 
 # read_le_uint <file> <offset> <size>
-# print the unsigned little-endian integer of <size> bytes (1, 2, or 4) at <offset>.
+# print the unsigned little-endian integer of <size> bytes (1, 2, 4, or 8) at <offset>.
 # od reads in host byte order; every CI runner is little-endian.
 read_le_uint() {
     dd if="$1" bs=1 skip="$2" count="$3" 2>/dev/null | od -An -tu"$3" | tr -d ' \n'
@@ -193,6 +196,113 @@ field_macho() {
     bin=$1
     flags=$(read_le_uint "$bin" 24 4)
     echo "PIE=$(( (flags & 0x200000) != 0 ))"
+}
+
+# macho_segment_fields <file> <segname> — print a segment's
+# "vmaddr vmsize fileoff filesize" tuple from LC_SEGMENT_64, or fail when absent.
+# The executable writer emits section-header-less load segments, so the load
+# commands are the independent file-offset-to-VA map structural checks must use.
+macho_segment_fields() {
+    bin=$1
+    want=$2
+    ncmds=$(read_le_uint "$bin" 16 4)
+    off=32
+    i=0
+    while [ "$i" -lt "$ncmds" ]; do
+        cmd=$(read_le_uint "$bin" "$off" 4)
+        cmdsize=$(read_le_uint "$bin" $((off + 4)) 4)
+        if [ "$cmd" -eq 25 ]; then
+            name=$(dd if="$bin" bs=1 skip=$((off + 8)) count=16 2>/dev/null | tr '\0' '\n' | head -n 1)
+            if [ "$name" = "$want" ]; then
+                vmaddr=$(read_le_uint "$bin" $((off + 24)) 8)
+                vmsize=$(read_le_uint "$bin" $((off + 32)) 8)
+                fileoff=$(read_le_uint "$bin" $((off + 40)) 8)
+                filesize=$(read_le_uint "$bin" $((off + 48)) 8)
+                printf '%s %s %s %s\n' "$vmaddr" "$vmsize" "$fileoff" "$filesize"
+                return 0
+            fi
+        fi
+        [ "$cmdsize" -ge 8 ] || return 2
+        off=$((off + cmdsize))
+        i=$((i + 1))
+    done
+    echo "int: macho-signed: segment '$want' not found" >&2
+    return 2
+}
+
+# produce_macho_signed <runmode> <target> <binary>
+# Locate the checked-in clang fixture's initialized target bytes in __DATA, then
+# decode the linked disp32 fields of its byte/word/dword immediate stores in
+# __TEXT. The instruction-tail constants (7, 9, 10 bytes from instruction start)
+# independently embody SIGNED_1/_2/_4's P+4+N convention. Exact equality with
+# the three marker VAs proves more than a successful cross-link: every relocation
+# selected the intended target byte.
+produce_macho_signed() {
+    bin=$3
+    text_fields=$(macho_segment_fields "$bin" __TEXT) || return 2
+    set -- $text_fields
+    text_vm=$1; text_file=$3; text_size=$4
+    data_fields=$(macho_segment_fields "$bin" __DATA) || return 2
+    set -- $data_fields
+    data_vm=$1; data_file=$3; data_size=$4
+
+    marker_file=$(od -An -v -tu1 -j "$data_file" -N "$data_size" "$bin" | awk -v base="$data_file" '
+        { for (i = 1; i <= NF; i++) b[++n] = $i }
+        END {
+            found = 0
+            for (i = 1; i + 7 <= n; i++) {
+                if (b[i] == 165 && b[i+1] == 0 && b[i+2] == 239 && b[i+3] == 190 &&
+                    b[i+4] == 190 && b[i+5] == 186 && b[i+6] == 254 && b[i+7] == 202) {
+                    found++; pos = base + i - 1
+                }
+            }
+            if (found != 1) {
+                print "int: macho-signed: expected one initialized target marker, found " found > "/dev/stderr"
+                exit 2
+            }
+            printf "%.0f\n", pos
+        }
+    ') || return 2
+    target1=$((data_vm + marker_file - data_file))
+    target2=$((target1 + 2))
+    target4=$((target1 + 4))
+
+    stores=$(od -An -v -tu1 -j "$text_file" -N "$text_size" "$bin" | awk -v vm="$text_vm" '
+        function disp32(i, u) {
+            u = b[i] + 256*b[i+1] + 65536*b[i+2] + 16777216*b[i+3]
+            return u >= 2147483648 ? u - 4294967296 : u
+        }
+        { for (i = 1; i <= NF; i++) b[++n] = $i }
+        END {
+            n1 = n2 = n4 = 0
+            for (i = 1; i <= n; i++) {
+                insn = vm + i - 1
+                if (i + 6 <= n && b[i] == 198 && b[i+1] == 5 && b[i+6] == 1) {
+                    n1++; v1 = insn + 7 + disp32(i + 2)
+                }
+                if (i + 8 <= n && b[i] == 102 && b[i+1] == 199 && b[i+2] == 5 && b[i+7] == 52 && b[i+8] == 18) {
+                    n2++; v2 = insn + 9 + disp32(i + 3)
+                }
+                if (i + 9 <= n && b[i] == 199 && b[i+1] == 5 && b[i+6] == 120 && b[i+7] == 86 && b[i+8] == 52 && b[i+9] == 18) {
+                    n4++; v4 = insn + 10 + disp32(i + 2)
+                }
+            }
+            if (n1 != 1 || n2 != 1 || n4 != 1) {
+                print "int: macho-signed: expected one store of each width, found " n1 "/" n2 "/" n4 > "/dev/stderr"
+                exit 2
+            }
+            printf "SIGNED_1 %.0f SIGNED_2 %.0f SIGNED_4 %.0f\n", v1, v2, v4
+        }
+    ') || return 2
+    set -- $stores
+    [ "$1" = SIGNED_1 ] && [ "$3" = SIGNED_2 ] && [ "$5" = SIGNED_4 ] || return 2
+
+    [ "$2" -eq "$target1" ] || { echo "int: macho-signed: SIGNED_1 resolved to $2, expected $target1" >&2; return 1; }
+    [ "$4" -eq "$target2" ] || { echo "int: macho-signed: SIGNED_2 resolved to $4, expected $target2" >&2; return 1; }
+    [ "$6" -eq "$target4" ] || { echo "int: macho-signed: SIGNED_4 resolved to $6, expected $target4" >&2; return 1; }
+    echo "SIGNED_1=exact"
+    echo "SIGNED_2=exact"
+    echo "SIGNED_4=exact"
 }
 
 # field_elf <binary> — the ELF position-independence fact. e_type is a u16 at offset
@@ -798,6 +908,7 @@ produce() {
         relro-fault) produce_relro_fault "$@" ;;
         panic-exit)  produce_panic_exit "$@" ;;
         field)       produce_field "$@" ;;
+        macho-signed) produce_macho_signed "$@" ;;
         pe-imports)  produce_pe_imports "$@" ;;
         relro)       produce_relro "$@" ;;
         flat-loader) produce_flat_loader "$@" ;;
