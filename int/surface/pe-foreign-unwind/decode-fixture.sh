@@ -5,7 +5,7 @@
 #     -falign-functions=8192 -o qz.o qz.c
 #   base64 -w 76 qz.o > qz.o.b64
 # COFF records its compile timestamp, so regeneration is structurally equivalent
-# rather than byte-identical. The deliberately over-page-aligned text section
+# rather than byte-identical. the deliberately over-page-aligned text section
 # proves ADDR32NB patching and PE framing use the same explicit image base.
 set -eu
 out=$1
