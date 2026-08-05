@@ -71,8 +71,11 @@ fun entry(argc: i64, argv: **u8) i64 { ... }
 ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ```
 
-Without `symbol`, the compiler mangles the Mach name. `symbol` gives the
-exact name the linker sees.
+Without `symbol`, the compiler mangles the Mach name — except on an `ext`
+declaration, which names a C declaration and takes the target's C symbol name for
+it (Darwin's underscore prefix, nothing elsewhere; see
+[ext-fun.md](ext-fun.md)). `symbol` gives the exact name the linker sees, with no
+platform prefix applied to it.
 
 ### `library(str)` — dynamic import attribution
 

@@ -25,6 +25,16 @@
 # `RK_LDST*_LO12` kind the linker's `apply_reloc` needs - the disambiguation
 # lives entirely in this substrate, never in the shared linker.
 #
+# A relocation entry also has a second, symbol-less form: `r_extern` = 0 makes
+# `r_symbolnum` a 1-based section index, and the in-place field holds the target's
+# address in the object's own address space rather than a plain addend. Every
+# normally-compiled clang object uses it - the `__compact_unwind` and `__debug_*`
+# references into `__text` are all section-based. The parser translates that form
+# into the abstract model by giving each named section one synthetic local anchor
+# symbol at its offset zero (the same shape COFF's full-section weak carrier
+# anchor takes) and resolving the relocation through the anchor plus the target's
+# in-section offset, so nothing outside this file learns a second target form.
+#
 # Section/symbol names are `intern.StrId`, resolved through the interner each
 # `of.ObjectImage` carries; the parser takes the interner as a parameter and
 # records it on `out`. register interns nothing - the vtable name fields are
@@ -176,6 +186,14 @@ val DYLIB_CMD_BASE:      usize = 24;   # the dylib lc_str, then 3 version words
 val RPATH_CMD_BASE:      usize = 12;   # cmd + cmdsize + path lc_str offset
 val NLIST_64_SIZE:       usize = 16;
 val RELOC_INFO_SIZE:     usize = 8;
+
+# per-section anchor slot for a section no section-based relocation names, so no
+# synthetic symbol is created for it
+val ANCHOR_NONE: u32 = 0xFFFFFFFF;
+
+# byte length of a "<segname>,<sectname>" section identity buffer: two 16-byte
+# fixed fields, the comma, and the NUL
+val SECTION_IDENTITY_SIZE: usize = 34;
 
 # dyld bind-opcode bytes (the high nibble is the opcode, the low nibble an
 # immediate). a non-lazy pointer is bound by selecting the dylib, naming the
@@ -432,6 +450,18 @@ fun pageoff12_kind(itn: *intern.Interner, alloc: *A.Allocator, insn: u32) R.Resu
 fun unsupported_kind_message(itn: *intern.Interner, alloc: *A.Allocator, kind: of.RelocKind) str {
     ret bin.name_message(itn, alloc, "macho: unsupported relocation kind: ",
                          of.reloc_kind_name(kind), "macho: unsupported relocation kind");
+}
+
+# build "macho: unsupported section-relative relocation kind: <name>" for a
+# section-based entry whose kind carries no recoverable in-place target address
+# ---
+# itn:   interner backing the message
+# alloc: allocator backing the message
+# kind:  the abstract kind of the section-based relocation
+# ret:   the diagnostic string
+fun unsupported_section_kind_message(itn: *intern.Interner, alloc: *A.Allocator, kind: of.RelocKind) str {
+    ret bin.name_message(itn, alloc, "macho: unsupported section-relative relocation kind: ",
+                         of.reloc_kind_name(kind), "macho: unsupported section-relative relocation kind");
 }
 
 # build "macho: unsupported relocation type <n>" for a machine type the parser
@@ -696,6 +726,30 @@ fun canonical_sectname(raw: str, out: *u8) str {
     var j: usize = 0;
     for (raw[j] != 0) { out[j] = raw[j]; j = j + 1; }
     out[j] = 0;
+    ret out::str;
+}
+
+# write a parsed section's "<segname>,<sectname>" identity into `out`
+# (>= SECTION_IDENTITY_SIZE bytes) and return it as a NUL-terminated str
+#
+# The pair is a section's unique name within an object - Mach-O lets two segments
+# each hold a `__const`, so the section name alone is not unique - which is what a
+# synthetic anchor symbol needs: one anchor per section, never two sections'
+# anchors colliding in the linker's name-keyed local index. The comma also keeps
+# the anchor out of the C identifier space, so it can never shadow a real symbol.
+# ---
+# buf: the object bytes
+# sh:  file offset of the section_64 entry (sectname at +0, segname at +16)
+# out: destination buffer (>= SECTION_IDENTITY_SIZE bytes)
+# ret: `out` as a NUL-terminated str
+fun section_identity(buf: *u8, sh: usize, out: *u8) str {
+    var w: usize = 0;
+    var i: usize = 0;
+    for (i < 16 && buf[sh + 16 + i] != 0) { out[w] = buf[sh + 16 + i]; w = w + 1; i = i + 1; }
+    out[w] = ','; w = w + 1;
+    i = 0;
+    for (i < 16 && buf[sh + i] != 0) { out[w] = buf[sh + i]; w = w + 1; i = i + 1; }
+    out[w] = 0;
     ret out::str;
 }
 
@@ -3406,21 +3460,41 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
         if (R.is_err[*of.Section, str](rsec)) { ret R.err[bool, str]("macho: section array alloc failed"); }
         out.sections = R.unwrap_ok[*of.Section, str](rsec);
     }
-    if (nsyms > 0) {
-        val rsym: R.Result[*of.Symbol, str] = A.zallocate[of.Symbol](alloc, nsyms::usize);
-        if (R.is_err[*of.Symbol, str](rsym)) { ret R.err[bool, str]("macho: symbol array alloc failed"); }
-        out.symbols = R.unwrap_ok[*of.Symbol, str](rsym);
-    }
-    out.section_count = sec_n;
-    out.symbol_count  = nsyms;
 
-    # per-mach-section in-segment base address, for recovering symbol offsets.
-    var sec_base: *u64 = nil;
+    # per-mach-section scratch: the in-segment base address (for recovering symbol
+    # and section-based relocation offsets) and the synthetic anchor slot each
+    # section-based relocation resolves through.
+    var sec_base:   *u64 = nil;
+    var sec_anchor: *u32 = nil;
     if (sec_n > 0) {
         val rb: R.Result[*u64, str] = A.zallocate[u64](alloc, sec_n::usize);
         if (R.is_err[*u64, str](rb)) { ret R.err[bool, str]("macho: section base table alloc failed"); }
         sec_base = R.unwrap_ok[*u64, str](rb);
+        val ra: R.Result[*u32, str] = A.zallocate[u32](alloc, sec_n::usize);
+        if (R.is_err[*u32, str](ra)) {
+            free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
+            ret R.err[bool, str]("macho: section anchor table alloc failed");
+        }
+        sec_anchor = R.unwrap_ok[*u32, str](ra);
     }
+
+    val plan: R.Result[u32, str] = plan_section_anchors(buf, buf_size, cputype, ncmds, sec_n, sec_anchor);
+    if (R.is_err[u32, str](plan)) {
+        free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
+        ret R.err[bool, str](R.unwrap_err[u32, str](plan));
+    }
+    val anchor_n: u32 = R.unwrap_ok[u32, str](plan);
+
+    if (nsyms + anchor_n > 0) {
+        val rsym: R.Result[*of.Symbol, str] = A.zallocate[of.Symbol](alloc, (nsyms + anchor_n)::usize);
+        if (R.is_err[*of.Symbol, str](rsym)) {
+            free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
+            ret R.err[bool, str]("macho: symbol array alloc failed");
+        }
+        out.symbols = R.unwrap_ok[*of.Symbol, str](rsym);
+    }
+    out.section_count = sec_n;
+    out.symbol_count  = nsyms + anchor_n;
 
     # second pass: populate sections from every LC_SEGMENT_64.
     var sec_i: u32 = 0;
@@ -3457,7 +3531,7 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
                 val canon: str = canonical_sectname((?name_buf[0])::str, ?canon_buf[0]);
                 val rin: R.Result[intern.StrId, str] = intern.intern(itn, canon);
                 if (R.is_err[intern.StrId, str](rin)) {
-                    if (sec_base != nil) { A.deallocate[u64](alloc, sec_base, sec_n::usize); }
+                    free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
                     ret R.err[bool, str](R.unwrap_err[intern.StrId, str](rin));
                 }
 
@@ -3468,14 +3542,34 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
                 out.sections[sec_i].bytes = nil;
                 sec_base[sec_i] = addr;
 
+                # a section named by a section-based relocation gets its anchor here,
+                # where the section_64 entry (and so the segment name the identity
+                # needs) is in hand: a local, zero-sized, flagless symbol at offset
+                # zero, inert to the linker beyond being a resolvable name.
+                if (sec_anchor[sec_i] != ANCHOR_NONE) {
+                    var ident_buf: [SECTION_IDENTITY_SIZE]u8;
+                    val ident: str = section_identity(buf, sh, ?ident_buf[0]);
+                    val rid: R.Result[intern.StrId, str] = intern.intern(itn, ident);
+                    if (R.is_err[intern.StrId, str](rid)) {
+                        free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
+                        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](rid));
+                    }
+                    val ax: u32 = nsyms + sec_anchor[sec_i];
+                    out.symbols[ax].name    = R.unwrap_ok[intern.StrId, str](rid);
+                    out.symbols[ax].section = sec_i;
+                    out.symbols[ax].offset  = 0;
+                    out.symbols[ax].size    = 0;
+                    out.symbols[ax].flags   = 0;
+                }
+
                 if (kind != of.SK_BSS && size > 0) {
                     if (!bin.region_ok(buf_size, sec_off, size::usize)) {
-                        if (sec_base != nil) { A.deallocate[u64](alloc, sec_base, sec_n::usize); }
+                        free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
                         ret R.err[bool, str]("macho: section data out of bounds");
                     }
                     val rbytes: R.Result[*u8, str] = A.allocate[u8](alloc, size::usize);
                     if (R.is_err[*u8, str](rbytes)) {
-                        if (sec_base != nil) { A.deallocate[u64](alloc, sec_base, sec_n::usize); }
+                        free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
                         ret R.err[bool, str]("macho: section bytes alloc failed");
                     }
                     out.sections[sec_i].bytes = R.unwrap_ok[*u8, str](rbytes);
@@ -3503,12 +3597,12 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
 
         val rnm: R.Result[str, str] = bin.cstr_at(buf, buf_size, stroff + n_strx::usize);
         if (R.is_err[str, str](rnm)) {
-            if (sec_base != nil) { A.deallocate[u64](alloc, sec_base, sec_n::usize); }
+            free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
             ret R.err[bool, str](R.unwrap_err[str, str](rnm));
         }
         val rin: R.Result[intern.StrId, str] = intern.intern(itn, R.unwrap_ok[str, str](rnm));
         if (R.is_err[intern.StrId, str](rin)) {
-            if (sec_base != nil) { A.deallocate[u64](alloc, sec_base, sec_n::usize); }
+            free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
             ret R.err[bool, str](R.unwrap_err[intern.StrId, str](rin));
         }
         out.symbols[si].name = R.unwrap_ok[intern.StrId, str](rin);
@@ -3542,24 +3636,103 @@ pub fun parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_s
     # then populate, folding each addend back into the abstract record.
     val rel_total: R.Result[u32, str] = count_relocs(buf, buf_size, cputype, ncmds);
     if (R.is_err[u32, str](rel_total)) {
-        if (sec_base != nil) { A.deallocate[u64](alloc, sec_base, sec_n::usize); }
+        free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
         ret R.err[bool, str](R.unwrap_err[u32, str](rel_total));
     }
     val rel_n: u32 = R.unwrap_ok[u32, str](rel_total);
     if (rel_n > 0) {
         val rrel: R.Result[*of.Relocation, str] = A.zallocate[of.Relocation](alloc, rel_n::usize);
         if (R.is_err[*of.Relocation, str](rrel)) {
-            if (sec_base != nil) { A.deallocate[u64](alloc, sec_base, sec_n::usize); }
+            free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
             ret R.err[bool, str]("macho: reloc array alloc failed");
         }
         out.relocations = R.unwrap_ok[*of.Relocation, str](rrel);
     }
     out.reloc_count = rel_n;
 
-    val rp: R.Result[bool, str] = populate_relocs(alloc, itn, buf, buf_size, cputype, ncmds, out);
-    if (sec_base != nil) { A.deallocate[u64](alloc, sec_base, sec_n::usize); }
+    val rp: R.Result[bool, str] = populate_relocs(alloc, itn, buf, buf_size, cputype, ncmds,
+                                                  sec_base, sec_anchor, nsyms, out);
+    free_parse_scratch(alloc, sec_base, sec_anchor, sec_n);
     if (R.is_err[bool, str](rp)) { ret R.err[bool, str](R.unwrap_err[bool, str](rp)); }
     ret R.ok[bool, str](true);
+}
+
+# release the per-section parse scratch tables
+# ---
+# alloc:      the allocator both tables came from
+# sec_base:   the section base-address table (nil when the object has no sections)
+# sec_anchor: the section anchor-slot table (nil when the object has no sections)
+# sec_n:      the section count both tables are sized by
+fun free_parse_scratch(alloc: *A.Allocator, sec_base: *u64, sec_anchor: *u32, sec_n: u32) {
+    if (sec_base != nil)   { A.deallocate[u64](alloc, sec_base, sec_n::usize); }
+    if (sec_anchor != nil) { A.deallocate[u32](alloc, sec_anchor, sec_n::usize); }
+}
+
+# assign a synthetic anchor slot to every section a section-based relocation names
+#
+# A relocation entry with `r_extern` = 0 names a section (`r_symbolnum` is the
+# 1-based section index) rather than a symbol, so the abstract model - which
+# addresses a target only by symbol name - needs one local anchor symbol per named
+# section. This pass is what decides how many, run before the symbol array is
+# allocated so the anchors are appended to it rather than grown into it later. An
+# object with no section-based entry grows no symbols at all. arm64's
+# ARM64_RELOC_ADDEND entries carry their addend in `r_symbolnum` with `r_extern`
+# clear, so they are skipped here exactly as the populate pass skips them - reading
+# one as a section index would anchor an unrelated section
+# ---
+# buf:      the object bytes
+# buf_size: length of `buf`
+# cputype:  the header cputype (selects addend-entry accounting)
+# ncmds:    the load-command count
+# sec_n:    the object's section count
+# out:      out - per-section anchor slot, densely numbered from zero, ANCHOR_NONE
+#           for a section no section-based relocation names
+# ret:      ok(anchor count), or a bounds / section-range error
+fun plan_section_anchors(buf: *u8, buf_size: usize, cputype: u32, ncmds: u32, sec_n: u32,
+                         out: *u32) R.Result[u32, str] {
+    var i: u32 = 0;
+    for (i < sec_n) { out[i] = ANCHOR_NONE; i = i + 1; }
+
+    var anchors: u32 = 0;
+    var off: usize = MACH_HEADER_64_SIZE;
+    var c: u32 = 0;
+    for (c < ncmds) {
+        val cmd:     u32 = bin.read_u32_le(buf, off);
+        val cmdsize: usize = bin.read_u32_le(buf, off + 4)::usize;
+        if (cmd == LC_SEGMENT_64) {
+            val nsects: u32 = bin.read_u32_le(buf, off + 64);
+            var sh: usize = off + SEGMENT_CMD_64_SIZE;
+            var k: u32 = 0;
+            for (k < nsects) {
+                val reloff: usize = bin.read_u32_le(buf, sh + 56)::usize;
+                val nreloc: u32 = bin.read_u32_le(buf, sh + 60);
+                val vr: R.Result[bool, str] = bin.require_region(buf_size, reloff, nreloc::usize * RELOC_INFO_SIZE, "macho: relocation array out of bounds");
+                if (R.is_err[bool, str](vr)) { ret R.err[u32, str](R.unwrap_err[bool, str](vr)); }
+                var r: u32 = 0;
+                for (r < nreloc) {
+                    val word: u32 = bin.read_u32_le(buf, reloff + r::usize * RELOC_INFO_SIZE + 4);
+                    val r_type: u32 = (word >> 28) & 0xF;
+                    if (cputype == CPU_TYPE_ARM64 && r_type == ARM64_RELOC_ADDEND) { r = r + 1; cnt; }
+                    if (((word >> 27) & 0x1) == 0) {
+                        val symnum: u32 = word & 0xFFFFFF;
+                        if (symnum < 1 || symnum > sec_n) {
+                            ret R.err[u32, str]("macho: section-relative relocation names an out-of-range section");
+                        }
+                        if (out[symnum - 1] == ANCHOR_NONE) {
+                            out[symnum - 1] = anchors;
+                            anchors = anchors + 1;
+                        }
+                    }
+                    r = r + 1;
+                }
+                sh = sh + SECTION_64_SIZE;
+                k = k + 1;
+            }
+        }
+        off = off + cmdsize;
+        c = c + 1;
+    }
+    ret R.ok[u32, str](anchors);
 }
 
 # count the real relocations across every section, excluding ARM64_RELOC_ADDEND
@@ -3606,16 +3779,24 @@ fun count_relocs(buf: *u8, buf_size: usize, cputype: u32, ncmds: u32) R.Result[u
 
 # populate the relocation array from every section's relocation_info array,
 # pairing ARM64_RELOC_ADDEND entries and recovering each addend
+#
+# A symbol-based entry (`r_extern` = 1) names its target directly. A section-based
+# entry names a section instead, and resolves through that section's synthetic
+# anchor with the target's in-section offset as the addend.
 # ---
-# alloc:    allocator backing reloc-kind error messages
-# itn:      interner backing reloc-kind error messages
-# buf:      the object bytes
-# buf_size: length of `buf`
-# cputype:  the header cputype (selects the reverse reloc map)
-# ncmds:    the load-command count
-# out:      the image being populated (sections/symbols already filled)
-# ret:      ok(true), or an error string
-fun populate_relocs(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_size: usize, cputype: u32, ncmds: u32, out: *of.ObjectImage) R.Result[bool, str] {
+# alloc:      allocator backing reloc-kind error messages
+# itn:        interner backing reloc-kind error messages
+# buf:        the object bytes
+# buf_size:   length of `buf`
+# cputype:    the header cputype (selects the reverse reloc map)
+# ncmds:      the load-command count
+# sec_base:   per-section in-segment base address
+# sec_anchor: per-section anchor slot from plan_section_anchors
+# nsyms:      the object's own symbol count (the anchors follow it)
+# out:        the image being populated (sections/symbols already filled)
+# ret:        ok(true), or an error string
+fun populate_relocs(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_size: usize, cputype: u32, ncmds: u32,
+                    sec_base: *u64, sec_anchor: *u32, nsyms: u32, out: *of.ObjectImage) R.Result[bool, str] {
     var rel_i: u32 = 0;
     var sec_i: u32 = 0;
     var off: usize = MACH_HEADER_64_SIZE;
@@ -3649,8 +3830,7 @@ fun populate_relocs(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_si
                         r = r + 1;
                         cnt;
                     }
-                    if (extn == 0) { ret R.err[bool, str]("macho: section-relative relocation unsupported"); }
-                    if (symnum >= out.symbol_count) { ret R.err[bool, str]("macho: relocation symbol index out of range"); }
+                    if (extn != 0 && symnum >= nsyms) { ret R.err[bool, str]("macho: relocation symbol index out of range"); }
 
                     var insn: u32 = 0;
                     if (out.sections[sec_i].bytes != nil && (address::usize + 4) <= out.sections[sec_i].len::usize) {
@@ -3660,11 +3840,24 @@ fun populate_relocs(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_si
                     if (R.is_err[of.RelocKind, str](rk)) { ret R.err[bool, str](R.unwrap_err[of.RelocKind, str](rk)); }
                     val kind: of.RelocKind = R.unwrap_ok[of.RelocKind, str](rk);
 
+                    var target: u32 = symnum;
+                    var addend: i64 = 0;
+                    if (extn != 0) {
+                        addend = recover_addend(out, sec_i, address, cputype, kind, pcrel, pending, have_pending);
+                    } or {
+                        val tsec: u32 = symnum - 1;
+                        target = nsyms + sec_anchor[tsec];
+                        val sa: R.Result[i64, str] = section_addend(itn, alloc, out, sec_base, sec_i, tsec,
+                                                                    address, cputype, kind, pcrel);
+                        if (R.is_err[i64, str](sa)) { ret R.err[bool, str](R.unwrap_err[i64, str](sa)); }
+                        addend = R.unwrap_ok[i64, str](sa);
+                    }
+
                     out.relocations[rel_i].section = sec_i;
                     out.relocations[rel_i].offset  = address;
                     out.relocations[rel_i].kind    = kind;
-                    out.relocations[rel_i].sym     = symnum;
-                    out.relocations[rel_i].addend  = recover_addend(out, sec_i, address, cputype, kind, pcrel, pending, have_pending);
+                    out.relocations[rel_i].sym     = target;
+                    out.relocations[rel_i].addend  = addend;
                     rel_i = rel_i + 1;
                     pending = 0;
                     have_pending = false;
@@ -3729,6 +3922,61 @@ fun recover_addend(out: *of.ObjectImage, sec_i: u32, address: u32, cputype: u32,
         if (bytes != nil && (address::usize + 4) <= len) { ret (bin.read_u32_le(bytes, address::usize)::i32)::i64 - 4; }
     }
     ret 0;
+}
+
+# recover a section-based relocation's abstract addend: the target's byte offset
+# within the section the entry names, measured from that section's anchor
+#
+# Where a symbol-based entry's field holds a plain addend, a section-based entry's
+# holds the target's address in the object's own address space - the object lays
+# its sections out at ascending addresses and the field names a point in that
+# layout. Subtracting the named section's base address turns the address into the
+# offset from its anchor. A pc-relative field is stored relative to the next
+# instruction, so the patch site's own object address is added back first and the
+# `- 4` of the abstract field-relative convention reapplied.
+#
+# Only the kinds whose field carries a whole address are recoverable this way. An
+# arm64 page / page-offset / branch field carries a fragment of one packed into an
+# instruction immediate (the abstract addend of the symbol-based form comes from a
+# paired ARM64_RELOC_ADDEND entry, not the field), so a section-based entry of
+# those kinds is rejected by name rather than guessed at. No compiler emits one:
+# arm64 objects use the section-based form for UNSIGNED only.
+# ---
+# itn:      interner backing the error message
+# alloc:    allocator backing the error message
+# out:      the image (its section bytes carry the in-place field)
+# sec_base: per-section in-segment base address
+# sec_i:    the section the relocation patches
+# tsec:     the section the relocation names
+# address:  the in-section patch offset
+# cputype:  the header cputype
+# kind:     the abstract relocation kind
+# pcrel:    the on-wire pc-relative bit
+# ret:      ok(the abstract addend), or an error naming the unsupported kind
+fun section_addend(itn: *intern.Interner, alloc: *A.Allocator, out: *of.ObjectImage, sec_base: *u64,
+                   sec_i: u32, tsec: u32, address: u32, cputype: u32, kind: of.RelocKind,
+                   pcrel: u32) R.Result[i64, str] {
+    val bytes: *u8 = out.sections[sec_i].bytes;
+    val len:   usize = out.sections[sec_i].len::usize;
+    var target: i64 = 0;
+    if (pcrel == 0 && kind == of.RK_ABS64) {
+        if (bytes == nil || (address::usize + 8) > len) { ret R.err[i64, str]("macho: section-relative relocation field out of bounds"); }
+        target = bin.read_u64_le(bytes, address::usize)::i64;
+    } or (pcrel == 0 && kind == of.RK_ABS32) {
+        if (bytes == nil || (address::usize + 4) > len) { ret R.err[i64, str]("macho: section-relative relocation field out of bounds"); }
+        target = bin.read_u32_le(bytes, address::usize)::i64;
+    } or (pcrel != 0 && cputype != CPU_TYPE_ARM64 && (kind == of.RK_PC32 || kind == of.RK_PLT32)) {
+        if (bytes == nil || (address::usize + 4) > len) { ret R.err[i64, str]("macho: section-relative relocation field out of bounds"); }
+        val disp: i64 = (bin.read_u32_le(bytes, address::usize)::i32)::i64;
+        target = (sec_base[sec_i] + address::u64 + 4)::i64 + disp;
+    } or {
+        ret R.err[i64, str](unsupported_section_kind_message(itn, alloc, kind));
+    }
+
+    val base: i64 = sec_base[tsec]::i64;
+    if (target < base) { ret R.err[i64, str]("macho: section-relative relocation targets before its section"); }
+    if (pcrel != 0) { ret R.ok[i64, str](target - base - 4); }
+    ret R.ok[i64, str](target - base);
 }
 
 # an ISA vtable that describes an architecture and binds no back half (test helper)
@@ -5289,5 +5537,332 @@ fun ts_object_debug_roundtrip() u8 {
 # one __debug section) and round-trips the RK_ABS32 cross-section addend
 test "mach.lang.target.of.macho.emit_object:debug_dwarf_roundtrip" {
     if (ts_object_debug_roundtrip() != 0) { ret 1; }
+    ret 0;
+}
+
+# rewrite the relocation entry at in-section patch offset `address` of section
+# header `sh` into the section-based form naming the 1-based section `sect`,
+# leaving the type / length / pc-relative bits as emitted
+# ---
+# buf:     the emitted object bytes
+# sh:      file offset of the patched section's section_64 entry
+# address: the relocation's in-section patch offset
+# sect:    the 1-based section index the entry is to name
+# ret:     true when the entry was found and rewritten
+fun t_make_section_based(buf: *u8, sh: usize, address: u32, sect: u32) bool {
+    val reloff: usize = bin.read_u32_le(buf, sh + 56)::usize;
+    val nreloc: u32 = bin.read_u32_le(buf, sh + 60);
+    var r: u32 = 0;
+    for (r < nreloc) {
+        val e: usize = reloff + r::usize * RELOC_INFO_SIZE;
+        if (bin.read_u32_le(buf, e) == address) {
+            # keep bits 24..31 except r_extern (bit 27), and replace r_symbolnum.
+            bin.write_u32_le(buf, e + 4, (bin.read_u32_le(buf, e + 4) & 0xF7000000) | sect);
+            ret true;
+        }
+        r = r + 1;
+    }
+    ret false;
+}
+
+# the parsed relocation patching section `sec` at offset `off`, or nil
+# ---
+# img: the parsed image to search
+# sec: the patched section index
+# off: the in-section patch offset
+# ret: the matching relocation, or nil when the image holds none
+fun t_reloc_at(img: *of.ObjectImage, sec: u32, off: u32) *of.Relocation {
+    var r: u32 = 0;
+    for (r < img.reloc_count) {
+        if (img.relocations[r].section == sec && img.relocations[r].offset == off) { ret ?img.relocations[r]; }
+        r = r + 1;
+    }
+    ret nil;
+}
+
+# the parsed symbol named `name`, or nil
+# ---
+# img:  the parsed image to search
+# name: the interned symbol name to find
+# ret:  the matching symbol, or nil when the image holds none
+fun t_sym_named(img: *of.ObjectImage, name: intern.StrId) *of.Symbol {
+    var s: u32 = 0;
+    for (s < img.symbol_count) {
+        if (img.symbols[s].name == name) { ret ?img.symbols[s]; }
+        s = s + 1;
+    }
+    ret nil;
+}
+
+# a section-based (r_extern = 0) x86_64 relocation parses through a synthetic
+# anchor for the section it names, with the target's in-section offset recovered
+# as the abstract addend: the absolute form reads the whole address out of its
+# 8-byte field, the pc-relative form reads a next-instruction-relative
+# displacement and is returned in the abstract field-relative convention. this is
+# the form every normally-compiled clang object uses for its __compact_unwind and
+# __debug_* references (#2521)
+fun ts_section_reloc_x64() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+
+    var text_bytes: [24]u8;
+    var k: usize = 0;
+    for (k < 24) { text_bytes[k] = 0; k = k + 1; }
+    var data_bytes: [8]u8;
+    k = 0;
+    for (k < 8) { data_bytes[k] = 0; k = k + 1; }
+
+    var secs: [2]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 24; secs[0].align = 16;
+    secs[1].name = t_intern(?i, ".data"); secs[1].kind = of.SK_DATA;
+    secs[1].bytes = ?data_bytes[0]; secs[1].len = 8; secs[1].align = 8;
+
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "_main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 24; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, "g"); syms[1].section = 1; syms[1].offset = 0;
+    syms[1].size = 8; syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+
+    var relocs: [2]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 8;  relocs[0].kind = of.RK_PC32;
+    relocs[0].sym = 1; relocs[0].addend = -4;
+    relocs[1].section = 0; relocs[1].offset = 16; relocs[1].kind = of.RK_ABS64;
+    relocs[1].sym = 1; relocs[1].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 2;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = ?relocs[0]; img.reloc_count = 2;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_secrel");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    # the writer never emits the section-based form, so the two entries are
+    # rewritten in place to name `.data` (section 2, 1-based) and their fields
+    # rewritten to the object-space address of `.data` + 6 the form carries.
+    val seg: usize = t_find_lc(buf.data, LC_SEGMENT_64);
+    if (seg == 0) { ret 1; }
+    val sh0: usize = seg + SEGMENT_CMD_64_SIZE;
+    val sh1: usize = sh0 + SECTION_64_SIZE;
+    val text_addr: u64 = bin.read_u64_le(buf.data, sh0 + 32);
+    val text_off:  usize = bin.read_u32_le(buf.data, sh0 + 48)::usize;
+    val data_addr: u64 = bin.read_u64_le(buf.data, sh1 + 32);
+    val target:    u64 = data_addr + 6;
+
+    if (!t_make_section_based(buf.data, sh0, 8, 2))  { ret 1; }
+    if (!t_make_section_based(buf.data, sh0, 16, 2)) { ret 1; }
+    bin.write_u64_le(buf.data, text_off + 16, target);
+    bin.write_u32_le(buf.data, text_off + 8, (target::i64 - (text_addr + 8 + 4)::i64)::u32);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+
+    # the anchor is appended past the object's own two symbols, named by the
+    # section's (segname, sectname) identity and inert: local, zero-sized, flagless.
+    if (out.symbol_count != 3) { ret 1; }
+    val anchor: *of.Symbol = t_sym_named(?out, t_intern(?i, "__DATA,__data"));
+    if (anchor == nil)                             { ret 1; }
+    if (anchor.section != 1 || anchor.offset != 0) { ret 1; }
+    if (anchor.size != 0 || anchor.flags != 0)     { ret 1; }
+
+    # both entries resolve through that anchor: the absolute one at the target's
+    # in-section offset, the pc-relative one at that offset less the field bias.
+    val abs64: *of.Relocation = t_reloc_at(?out, 0, 16);
+    if (abs64 == nil)                    { ret 1; }
+    if (abs64.kind != of.RK_ABS64)       { ret 1; }
+    if (abs64.sym >= out.symbol_count)   { ret 1; }
+    if (out.symbols[abs64.sym].name != anchor.name) { ret 1; }
+    if (abs64.addend != 6)               { ret 1; }
+
+    val pc32: *of.Relocation = t_reloc_at(?out, 0, 8);
+    if (pc32 == nil)                     { ret 1; }
+    if (pc32.kind != of.RK_PC32)         { ret 1; }
+    if (pc32.sym >= out.symbol_count)    { ret 1; }
+    if (out.symbols[pc32.sym].name != anchor.name) { ret 1; }
+    if (pc32.addend != 2)                { ret 1; }
+    ret 0;
+}
+
+# a section-based relocation resolves through a section anchor on both arches, and
+# a section-based arm64 page/page-offset/branch entry - whose field carries only a
+# fragment of the target address, packed into an instruction immediate - is
+# rejected by name rather than guessed at
+fun ts_section_reloc_arm64() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_AARCH64);
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0; k = k + 1; }
+    # an ADRP at offset 0, so the PAGE21 entry decodes as an instruction site.
+    text_bytes[3] = 0x90;
+    var data_bytes: [8]u8;
+    k = 0;
+    for (k < 8) { data_bytes[k] = 0; k = k + 1; }
+
+    var secs: [2]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 16; secs[0].align = 16;
+    secs[1].name = t_intern(?i, ".data"); secs[1].kind = of.SK_DATA;
+    secs[1].bytes = ?data_bytes[0]; secs[1].len = 8; secs[1].align = 8;
+
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "_main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = t_intern(?i, "g"); syms[1].section = 1; syms[1].offset = 0;
+    syms[1].size = 8; syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_OBJECT;
+
+    var relocs: [2]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_PAGE21;
+    relocs[0].sym = 1; relocs[0].addend = 0;
+    relocs[1].section = 0; relocs[1].offset = 8; relocs[1].kind = of.RK_ABS64;
+    relocs[1].sym = 1; relocs[1].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 2;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = ?relocs[0]; img.reloc_count = 2;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_secrela");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    val seg: usize = t_find_lc(buf.data, LC_SEGMENT_64);
+    if (seg == 0) { ret 1; }
+    val sh0: usize = seg + SEGMENT_CMD_64_SIZE;
+    val sh1: usize = sh0 + SECTION_64_SIZE;
+    val text_off:  usize = bin.read_u32_le(buf.data, sh0 + 48)::usize;
+    val data_addr: u64 = bin.read_u64_le(buf.data, sh1 + 32);
+
+    if (!t_make_section_based(buf.data, sh0, 8, 2)) { ret 1; }
+    bin.write_u64_le(buf.data, text_off + 8, data_addr + 3);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+    val anchor: *of.Symbol = t_sym_named(?out, t_intern(?i, "__DATA,__data"));
+    if (anchor == nil)                   { ret 1; }
+    val abs64: *of.Relocation = t_reloc_at(?out, 0, 8);
+    if (abs64 == nil)                    { ret 1; }
+    if (abs64.sym >= out.symbol_count)   { ret 1; }
+    if (out.symbols[abs64.sym].name != anchor.name) { ret 1; }
+    if (abs64.addend != 3)               { ret 1; }
+
+    # the PAGE21 entry made section-based is refused, not silently mis-resolved.
+    if (!t_make_section_based(buf.data, sh0, 0, 2)) { ret 1; }
+    var out2: of.ObjectImage;
+    val pr2: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out2);
+    if (R.is_ok[bool, str](pr2)) { ret 1; }
+    if (!str_contains(R.unwrap_err[bool, str](pr2), "page21")) { ret 1; }
+    ret 0;
+}
+
+# a section-based entry naming a section the object does not have is rejected
+# rather than read past the section table
+fun ts_section_reloc_out_of_range() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+
+    var text_bytes: [24]u8;
+    var k: usize = 0;
+    for (k < 24) { text_bytes[k] = 0; k = k + 1; }
+
+    var secs: [1]of.Section;
+    secs[0].name = t_intern(?i, ".text"); secs[0].kind = of.SK_TEXT;
+    secs[0].bytes = ?text_bytes[0]; secs[0].len = 24; secs[0].align = 16;
+
+    var syms: [1]of.Symbol;
+    syms[0].name = t_intern(?i, "_main"); syms[0].section = 0; syms[0].offset = 0;
+    syms[0].size = 24; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 16; relocs[0].kind = of.RK_ABS64;
+    relocs[0].sym = 0; relocs[0].addend = 0;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc;
+    img.interner = ?i;
+    img.name = t_intern(?i, "test");
+    img.sections = ?secs[0]; img.section_count = 1;
+    img.symbols = ?syms[0]; img.symbol_count = 1;
+    img.relocations = ?relocs[0]; img.reloc_count = 1;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "macho_secrelo");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val tpath: str = fs.temp_path(?tf);
+
+    val em: R.Result[bool, str] = emit_object(?isa_vt, ?img, tpath::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, tpath);
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    val seg: usize = t_find_lc(buf.data, LC_SEGMENT_64);
+    if (seg == 0) { ret 1; }
+    if (!t_make_section_based(buf.data, seg + SEGMENT_CMD_64_SIZE, 16, 7)) { ret 1; }
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_ok[bool, str](pr)) { ret 1; }
+    ret 0;
+}
+
+# a section-based x86_64 relocation resolves through a synthetic section anchor,
+# recovering the target's in-section offset from the in-place field
+test "mach.lang.target.of.macho.parse_object:section_reloc_x64" {
+    if (ts_section_reloc_x64() != 0) { ret 1; }
+    ret 0;
+}
+
+# a section-based arm64 relocation resolves the same way, and the page/branch
+# forms whose field carries no whole address are refused by name
+test "mach.lang.target.of.macho.parse_object:section_reloc_arm64" {
+    if (ts_section_reloc_arm64() != 0) { ret 1; }
+    ret 0;
+}
+
+# a section-based entry naming a section outside the object's section table is an
+# error, not an out-of-range read
+test "mach.lang.target.of.macho.parse_object:section_reloc_out_of_range" {
+    if (ts_section_reloc_out_of_range() != 0) { ret 1; }
     ret 0;
 }
