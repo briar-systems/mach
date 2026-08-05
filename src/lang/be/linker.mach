@@ -14,13 +14,14 @@
 #   1. collect/merge symbols keyed by `intern.StrId` - duplicate strong
 #      definitions are an error.
 #   2. lay out same-kind sections, concatenated with per-section alignment, and
-#      assign virtual addresses from the OS base address, page-aligned per
-#      section group (executables only).
+#      assign virtual addresses from the OS base address to loadable groups only
+#      (executables only). debug and writer-owned metadata remain non-allocated.
 #   3. resolve each relocation to a final symbol virtual address and patch the
 #      laid-out bytes in place (executables only).
-#   4a. executable: lay the merged sections out as page-aligned load segments
-#       (one per kind) and write them through `tgt.of.emit_exec`, with the
-#       entry point at the OS entry symbol (`_start`).
+#   4a. executable: lay the loadable merged sections out as page-aligned load
+#       segments, pass exception/debug metadata through their dedicated writer
+#       channels, and write through `tgt.of.emit_exec`, with the entry point at
+#       the OS entry symbol (`_start`).
 #   4b. library (relocatable): carry the input relocations forward unpatched and
 #       write the single merged object through `obj.emit`.
 
@@ -66,13 +67,12 @@ pub val LINK_RELOCATABLE: LinkMode = 1;
 pub val LINK_SHARED:      LinkMode = 2;
 
 # number of fixed, kind-keyed merged output sections - one per `of.SK_*` kind. the
-# merge concatenates every input section of an allocatable kind into that kind's
-# single output section, in the canonical order TEXT, DATA, RODATA, RELRO, BSS (the
-# `of.SK_*` numeric order; RELRO sits before BSS so a read-only-natured RELRO
-# segment is laid out with the constants). the `SK_DEBUG` kind slot stays unused:
-# non-allocated debug sections do not collapse by kind but are kept distinct by
-# NAME in name-keyed slots appended past this prefix (see `discover_debug_names`),
-# so `.debug_info`/`.debug_line`/... each survive as their own output section
+# merge concatenates every input section of a fixed kind into that kind's single
+# output section, in `of.SK_*` numeric order. the `SK_DEBUG` kind slot stays
+# unused: non-allocated debug sections do not collapse by kind but are kept
+# distinct by name in slots appended past this prefix (see `discover_debug_names`).
+# `SK_EXCEPTION` does use its fixed slot, but remains non-allocated so the active
+# executable writer can frame and publish the relocated metadata itself
 val MERGED_KIND_COUNT: u32 = of.SK_COUNT;
 
 # placement of one input section within the merged image: which merged output
@@ -92,14 +92,13 @@ rec Placement {
 # kind, the maximum alignment demanded by any contributing input section, the
 # running content length, and the assigned base virtual address
 #
-# The first `MERGED_KIND_COUNT` accumulators are the fixed kind slots (index i
-# merges kind i) and carry `name = STR_NIL` - their output name derives from the
-# kind. Any accumulators past that prefix are name-keyed debug slots: non-allocated
-# `SK_DEBUG` sections kept distinct by name (`.debug_info`, `.debug_line`, ...) so
-# each survives the merge as its own output section rather than collapsing into one.
+# the first `MERGED_KIND_COUNT` accumulators are fixed kind slots (index i merges
+# kind i). their output name derives from the kind, except writer-owned exception
+# metadata preserves its first input name. accumulators past that prefix are
+# name-keyed debug slots, so `.debug_info`, `.debug_line`, and peers remain distinct
 # ---
 # kind:  the section kind this accumulator merges
-# name:  interned output name for a name-keyed debug slot, or STR_NIL for a kind slot
+# name:  interned output name for a debug slot or exception carrier; otherwise STR_NIL
 # align: largest alignment any contributing section requires
 # len:   total content length accumulated so far
 # vaddr: base virtual address assigned to this merged section (0 if unassigned)
@@ -1016,9 +1015,19 @@ fun emit_executable(s: *session.Session, tgt: *target.Target, out_img: *of.Objec
     }
     val funcs: *of.ExecFunction = R.unwrap_ok[*of.ExecFunction, str](fr);
 
+    var exc_count: u32 = 0;
+    val xr: R.Result[*of.Section, str] = collect_exception_sections(alloc, out_img, ?exc_count);
+    if (R.is_err[*of.Section, str](xr)) {
+        if (funcs != nil && func_count > 0) { A.deallocate[of.ExecFunction](alloc, funcs, func_count::usize); }
+        A.deallocate[of.LoadSegment](alloc, segs, seg_count::usize);
+        ret R.err[bool, str](R.unwrap_err[*of.Section, str](xr));
+    }
+    val exc: *of.Section = R.unwrap_ok[*of.Section, str](xr);
+
     var dbg_count: u32 = 0;
     val dr: R.Result[*of.Section, str] = collect_debug_sections(alloc, out_img, ?dbg_count);
     if (R.is_err[*of.Section, str](dr)) {
+        if (exc != nil && exc_count > 0) { A.deallocate[of.Section](alloc, exc, exc_count::usize); }
         if (funcs != nil && func_count > 0) { A.deallocate[of.ExecFunction](alloc, funcs, func_count::usize); }
         A.deallocate[of.LoadSegment](alloc, segs, seg_count::usize);
         ret R.err[bool, str](R.unwrap_err[*of.Section, str](dr));
@@ -1027,14 +1036,18 @@ fun emit_executable(s: *session.Session, tgt: *target.Target, out_img: *of.Objec
 
     var emit_r: R.Result[bool, str] = R.ok[bool, str](true);
     if (dyn == nil) {
-        emit_r = tgt.of.emit_exec(alloc, ?s.interner, tgt.isa, segs, seg_count, os_page_size(tgt), entry, funcs, func_count, dbg, dbg_count, out_path, name, subsystem);
+        emit_r = tgt.of.emit_exec(alloc, ?s.interner, tgt.isa, segs, seg_count,
+                                  os_page_size(tgt), entry, funcs, func_count,
+                                  exc, exc_count, dbg, dbg_count, out_path, name, subsystem);
     }
     or {
         emit_r = tgt.of.emit_dyn_exec(alloc, ?s.interner, tgt.isa, segs, seg_count, os_page_size(tgt), entry,
-                                      funcs, func_count, ?dyn.info, dyn.fixups, dyn.fixup_count, dbg, dbg_count, out_path, name, subsystem);
+                                      funcs, func_count, ?dyn.info, dyn.fixups, dyn.fixup_count,
+                                      exc, exc_count, dbg, dbg_count, out_path, name, subsystem);
     }
 
     if (dbg != nil && dbg_count > 0) { A.deallocate[of.Section](alloc, dbg, dbg_count::usize); }
+    if (exc != nil && exc_count > 0) { A.deallocate[of.Section](alloc, exc, exc_count::usize); }
     if (funcs != nil && func_count > 0) {
         A.deallocate[of.ExecFunction](alloc, funcs, func_count::usize);
     }
@@ -1261,6 +1274,37 @@ fun collect_debug_sections(alloc: *A.Allocator, out_img: *of.ObjectImage, count:
     ret R.ok[*of.Section, str](out);
 }
 
+# collect writer-owned exception metadata from the merged image into a compact
+# shallow-copy array. the section bytes remain owned by `out_img`; the executable
+# writer consumes the relocated rows and the caller frees only this array
+fun collect_exception_sections(alloc: *A.Allocator, out_img: *of.ObjectImage,
+                               count: *u32) R.Result[*of.Section, str] {
+    @count = 0;
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < out_img.section_count) {
+        if (out_img.sections[i].kind == of.SK_EXCEPTION) { n = n + 1; }
+        i = i + 1;
+    }
+    if (n == 0) { ret R.ok[*of.Section, str](nil); }
+
+    val ar: R.Result[*of.Section, str] = A.allocate[of.Section](alloc, n::usize);
+    if (R.is_err[*of.Section, str](ar)) { ret R.err[*of.Section, str](R.unwrap_err[*of.Section, str](ar)); }
+    val out: *of.Section = R.unwrap_ok[*of.Section, str](ar);
+
+    var w: u32 = 0;
+    i = 0;
+    for (i < out_img.section_count) {
+        if (out_img.sections[i].kind == of.SK_EXCEPTION) {
+            out[w] = out_img.sections[i];
+            w = w + 1;
+        }
+        i = i + 1;
+    }
+    @count = n;
+    ret R.ok[*of.Section, str](out);
+}
+
 # resolve the program entry point to the OS entry symbol's virtual
 # address. an undefined or missing entry symbol is an error
 # ---
@@ -1448,7 +1492,7 @@ fun build_exec_functions(alloc: *A.Allocator, out_img: *of.ObjectImage,
 # kind: the merged section kind to classify
 # ret:  true when the kind maps to a loadable segment
 fun is_loadable_kind(kind: of.SectionKind) bool {
-    ret kind != of.SK_DEBUG;
+    ret kind != of.SK_DEBUG && kind != of.SK_EXCEPTION;
 }
 
 # the load-segment permissions for a merged section kind. text is
@@ -2469,6 +2513,11 @@ fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_co
             }
             or {
                 var a: u32 = sec.align;
+                # PE runtime-function rows are copied into the writer-owned final
+                # table, where their required alignment is four bytes. Packing their
+                # input carriers without larger object-file alignment gaps keeps the
+                # merged metadata a contiguous row stream.
+                if (sec.kind == of.SK_EXCEPTION) { a = 4; }
                 if (a == 0)               { a = 1; }
                 if (a > merged[ki].align) { merged[ki].align = a; }
 
@@ -2489,6 +2538,9 @@ fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_co
 
                 merged[ki].len  = newlen::u32;
                 merged[ki].used = true;
+                if (sec.kind == of.SK_EXCEPTION && merged[ki].name == intern.STR_NIL) {
+                    merged[ki].name = sec.name;
+                }
             }
 
             flat = flat + 1;
@@ -2606,7 +2658,7 @@ fun assign_section_vaddrs(tgt: *target.Target, merged: *MergedSection, pie: bool
     if (pie) { va = base + page; }
     var i: u32 = 0;
     for (i < MERGED_KIND_COUNT) {
-        if (merged[i].used) {
+        if (merged[i].used && is_loadable_kind(merged[i].kind)) {
             var seg_align: u64 = merged[i].align::u64;
             if (seg_align < page) { seg_align = page; }
             va = bin.align_up_u64(va, seg_align);
@@ -4083,7 +4135,8 @@ fun intern_or_nil(s: *session.Session, name: str) intern.StrId {
 }
 
 # interned canonical name for a merged output section of a
-# given kind (".text", ".rodata", ".data.rel.ro", ".data", ".bss", ".debug")
+# given kind (".text", ".rodata", ".data.rel.ro", ".data", ".bss", ".debug",
+# or the writer-owned metadata fallback ".exception")
 # ---
 # s:    shared session holding the interner
 # kind: the merged section kind to name
@@ -4094,7 +4147,8 @@ fun merged_section_name(s: *session.Session, kind: of.SectionKind) intern.StrId 
     if (kind == of.SK_RELRO)  { ret intern_or_nil(s, ".data.rel.ro"); }
     if (kind == of.SK_DATA)   { ret intern_or_nil(s, ".data"); }
     if (kind == of.SK_BSS)    { ret intern_or_nil(s, ".bss"); }
-    ret intern_or_nil(s, ".debug");
+    if (kind == of.SK_DEBUG)  { ret intern_or_nil(s, ".debug"); }
+    ret intern_or_nil(s, ".exception");
 }
 
 # pick a name for the merged image - the first input image's name,
