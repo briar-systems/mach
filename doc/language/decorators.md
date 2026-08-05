@@ -333,8 +333,9 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
   read-only data placement within a module, so their addresses compare equal.
   This is specific to embedded data — an ordinary global is never merged this
   way, and a named object's address is otherwise its own.
-- A missing file, a directory where a file is required, and an unreadable file
-  each report once, naming the declaration and the resolved path.
+- A missing file, a directory where a file is required, an unreadable file, and
+  a file larger than the 4,294,967,295-byte array/section limit each report once,
+  naming the declaration and the resolved path.
 - The embedded file is a build input: its content digest feeds the embedding
   module's incremental cutoff, so editing the asset invalidates that module
   and an untouched asset stays a cache hit — see
