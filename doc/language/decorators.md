@@ -329,10 +329,11 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
 - Bytes are placed in read-only data exactly like any other constant byte
   array: no runtime I/O, no copy. Works for every artifact kind and target,
   freestanding included.
-- Two `#[embed]` globals whose files hold byte-identical content share **one**
-  read-only data placement within a module, so their addresses compare equal.
-  This is specific to embedded data — an ordinary global is never merged this
-  way, and a named object's address is otherwise its own.
+- Two `#[embed]` globals whose files hold byte-identical content and whose final
+  section name, kind, and alignment match share **one** read-only data placement
+  within a module, so their addresses compare equal. This is specific to
+  embedded data — an ordinary global is never merged this way, and a named
+  object's address is otherwise its own.
 - A missing file, a directory where a file is required, an unreadable file, and
   a file larger than the 4,294,967,295-byte array/section limit each report once,
   naming the declaration and the resolved path.
