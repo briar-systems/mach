@@ -497,29 +497,63 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
                  dynlibs: *of.DynLib, dynlib_count: u32,
                  out_path: *u8, name: *u8, mode: LinkMode, pie_opt_in: bool,
                  subsystem: of.Subsystem) R.Result[bool, str] {
+    val alloc: *A.Allocator = s.alloc;
+    var local_atoms: AtomPlan;
+    init_atom_plan(?local_atoms);
+    var pre_atoms: *AtomPlan = nil;
+    var local_sec_base: *u32 = nil;
+    if (!str_empty(tgt.of.import_address_prefix) && mode != LINK_RELOCATABLE
+        && modules != nil && module_count > 0) {
+        val sb_r: R.Result[*u32, str] =
+            A.zallocate[u32](alloc, module_count::usize);
+        if (R.is_err[*u32, str](sb_r)) {
+            ret R.err[bool, str](R.unwrap_err[*u32, str](sb_r));
+        }
+        local_sec_base = R.unwrap_ok[*u32, str](sb_r);
+        val atom_r: R.Result[bool, str] = build_atom_plan(
+            s, modules, module_count, codegen_count, local_sec_base,
+            total_sections(modules, module_count), true, tgt.isa, ?local_atoms);
+        if (R.is_err[bool, str](atom_r)) {
+            A.deallocate[u32](alloc, local_sec_base, module_count::usize);
+            free_atom_plan(alloc, ?local_atoms);
+            ret R.err[bool, str](R.unwrap_err[bool, str](atom_r));
+        }
+        pre_atoms = ?local_atoms;
+    }
+
     var local_imports: of.ObjectImage;
     val sr: R.Result[bool, str] = synthesize_local_imports(
-        s, tgt.of.import_address_prefix, modules, module_count, mode, ?local_imports);
+        s, tgt.of.import_address_prefix, modules, module_count, mode,
+        local_sec_base, ?local_atoms, ?local_imports);
+    if (local_sec_base != nil) {
+        A.deallocate[u32](alloc, local_sec_base, module_count::usize);
+    }
     if (R.is_err[bool, str](sr)) {
+        free_atom_plan(alloc, ?local_atoms);
         ret R.err[bool, str](R.unwrap_err[bool, str](sr));
     }
     if (!R.unwrap_ok[bool, str](sr)) {
-        ret link_modules_core(s, tgt, modules, module_count, codegen_count,
-            dynlibs, dynlib_count, out_path, name, mode, pie_opt_in, subsystem);
+        val linked: R.Result[bool, str] = link_modules_core(
+            s, tgt, modules, module_count, codegen_count,
+            dynlibs, dynlib_count, out_path, name, mode, pie_opt_in, subsystem,
+            pre_atoms);
+        free_atom_plan(alloc, ?local_atoms);
+        ret linked;
     }
 
     # The synthesized cells are an ordinary final input image. Keeping them in
     # the regular merge means symbol resolution, relocation bounds checking, and
     # every format's base-relocation collection apply without a PE-only side path.
-    val alloc: *A.Allocator = s.alloc;
     if (module_count == 0xFFFFFFFF) {
         obj.dnit(?local_imports);
+        free_atom_plan(alloc, ?local_atoms);
         ret R.err[bool, str]("link: too many input objects for local import pointers");
     }
     val all_r: R.Result[*of.ObjectImage, str] =
         A.allocate[of.ObjectImage](alloc, (module_count + 1)::usize);
     if (R.is_err[*of.ObjectImage, str](all_r)) {
         obj.dnit(?local_imports);
+        free_atom_plan(alloc, ?local_atoms);
         ret R.err[bool, str](R.unwrap_err[*of.ObjectImage, str](all_r));
     }
     val all: *of.ObjectImage = R.unwrap_ok[*of.ObjectImage, str](all_r);
@@ -532,19 +566,24 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
 
     val linked: R.Result[bool, str] = link_modules_core(
         s, tgt, all, module_count + 1, codegen_count,
-        dynlibs, dynlib_count, out_path, name, mode, pie_opt_in, subsystem);
+        dynlibs, dynlib_count, out_path, name, mode, pie_opt_in, subsystem,
+        pre_atoms);
     A.deallocate[of.ObjectImage](alloc, all, (module_count + 1)::usize);
     obj.dnit(?local_imports);
+    free_atom_plan(alloc, ?local_atoms);
     ret linked;
 }
 
 # link the prepared image set after format-owned synthetic inputs have been
-# appended by `link_modules`; ownership remains with the wrapper and its caller
+# appended by `link_modules`; ownership remains with the wrapper and its caller.
+# `pre_atoms`, when non-nil, transfers the original-graph plan built before the
+# synthetic append; flat indices of the original sections remain unchanged
 fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.ObjectImage,
                       module_count: u32, codegen_count: u32,
                       dynlibs: *of.DynLib, dynlib_count: u32,
                       out_path: *u8, name: *u8, mode: LinkMode, pie_opt_in: bool,
-                      subsystem: of.Subsystem) R.Result[bool, str] {
+                      subsystem: of.Subsystem,
+                      pre_atoms: *AtomPlan) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
     # a shared object is always position-independent: the loader maps it at an
     # arbitrary base and slides its in-image absolute pointers, so it takes the same
@@ -555,13 +594,6 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
     # set. PIE is requested either because the OS requires it for this arch (e.g. arm64
     # Darwin) or because the build opted in via `--pie` (linux ASLR).
     val pie: bool = (mode == LINK_EXE) && (target_requires_pie(tgt) || pie_opt_in);
-    # a dynamic link is requested when shared dependencies are present or the image
-    # is position-independent, and the output is an executable; libraries/
-    # relocatables ignore dependencies. an import library brings its dependencies in
-    # through its members rather than the link inputs, so a declared import counts
-    # the same as a shared-library input here (#2525).
-    val dynamic: bool = (mode == LINK_EXE)
-        && (dynlib_count > 0 || pie || has_declared_imports(modules, module_count));
     # both a PIE executable and a shared object need a position-independent layout
     # (based a page above the OS base, with a base-relocation set collected during
     # patching).
@@ -668,9 +700,20 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
     # Final executable/shared links may discard only function atoms whose weak
     # definition actually lost global resolution. A relocatable link receives an
     # inert plan and preserves its native weak/group representation byte-for-byte.
-    val atom_r: R.Result[bool, str] =
-        build_atom_plan(s, modules, module_count, codegen_count, sec_base,
-                        sec_total, patching, tgt.isa, ?atoms);
+    var atom_r: R.Result[bool, str] = R.ok[bool, str](true);
+    if (pre_atoms != nil) {
+        # The wrapper planned the original PE graph before appending its synthetic
+        # pointer-cell image. Existing flat section indices are unchanged; appended
+        # sections lie beyond the plan and are live by definition. Transfer the
+        # allocation so the core's ordinary scratch cleanup remains authoritative.
+        atoms = @pre_atoms;
+        init_atom_plan(pre_atoms);
+        fill_section_bases(modules, module_count, sec_base);
+    }
+    or {
+        atom_r = build_atom_plan(s, modules, module_count, codegen_count, sec_base,
+                                 sec_total, patching, tgt.isa, ?atoms);
+    }
     if (R.is_err[bool, str](atom_r)) {
         free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[bool, str](atom_r));
@@ -721,6 +764,15 @@ fun link_modules_core(s: *session.Session, tgt: *target.Target, modules: *of.Obj
         free_scratch(alloc, placements, sec_total, sec_base, module_count, merged, merged_count, debug_names, debug_count, merged_to_out, sym_base, sym_out, sym_total, ?strm, ?atoms);
         ret R.err[bool, str](R.unwrap_err[bool, str](collect_r));
     }
+
+    # A final executable uses the dynamic writer for explicit dependencies, PIE,
+    # or an import-library declaration that remains unresolved after local symbol
+    # collection. A selected short-import member whose symbol is defined later in
+    # the graph is inert: it must not create an empty loader dependency (#2552).
+    val dynamic: bool = (mode == LINK_EXE)
+        && (dynlib_count > 0 || pie
+            || has_unresolved_declared_imports(
+                modules, module_count, ?sym_locs));
 
     # build the merged output image. allocate each merged section's byte buffer
     # and copy every contributing input section into place.
@@ -3887,7 +3939,8 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
     # an import library names its DLLs in its members rather than as link inputs, so
     # a DLL only a declared import mentions still becomes a dependency (#2525)
     val declared_libs: u32 =
-        declared_library_count(modules, module_count, dynlibs, dynlib_count, implicit_ptr);
+        declared_library_count(modules, module_count, dynlibs, dynlib_count,
+                               implicit_ptr, sym_locs);
     val total_libs: u32 = explicit_libs + implicit + declared_libs;
     if (total_libs > 0) {
         val lr: R.Result[*of.DynLib, str] = A.zallocate[of.DynLib](alloc, total_libs::usize);
@@ -3928,6 +3981,10 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
         for (dm < module_count) {
             var di: u32 = 0;
             for (di < modules[dm].import_count) {
+                if (!declared_import_unresolved(
+                    ?modules[dm].imports[di], sym_locs)) {
+                    di = di + 1; cnt;
+                }
                 val lib: intern.StrId = modules[dm].imports[di].library;
                 if (!dynlib_name_present(dynlibs, dynlib_count, implicit_ptr, lib)
                     && !emitted_lib_present(dyn.info.libs, dw, lib)) {
@@ -3952,6 +4009,9 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
         var ai: u32 = 0;
         for (ai < modules[am].import_count) {
             val d: *of.ImportDecl = ?modules[am].imports[ai];
+            if (!declared_import_unresolved(d, sym_locs)) {
+                ai = ai + 1; cnt;
+            }
             val prev: O.Option[intern.StrId] = session.import_library(s, d.symbol);
             if (O.is_some[intern.StrId](prev)
                 && !declared_attribution_matches(dynlibs, dynlib_count, implicit_ptr,
@@ -4069,7 +4129,7 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             val idx: u32 = dyn.info.import_count;
             dyn.info.imports[idx].symbol    = cn.canonical;
             val decl: *of.ImportDecl =
-                declared_import_for(modules, module_count, cn.canonical);
+                declared_import_for(modules, module_count, cn.canonical, sym_locs);
             # pin the import to the library its `#[library]` attribution named, when
             # present. a directive naming a library not among this link's
             # dependencies is a hard error. an unattributed import stays DYNLIB_ANY
@@ -4268,13 +4328,40 @@ fun dynlib_soname_present(dynlibs: *of.DynLib, count: u32,
     ret false;
 }
 
-# whether any input image declares an import, i.e. an import library member was
-# among the link inputs. the dependency it names makes the link dynamic even when
-# no shared library was passed as an input
-fun has_declared_imports(modules: *of.ObjectImage, module_count: u32) bool {
+# whether `name` terminates at an in-graph definition after weak-fallback
+# resolution. A malformed cycle stays unresolved here so the authoritative symbol
+# resolution path can diagnose it
+fun symbol_locally_resolved(sym_locs: *map.Map[intern.StrId, SymbolLoc],
+                            name: intern.StrId) bool {
+    val rr: R.Result[intern.StrId, str] = resolved_symbol_name(sym_locs, name);
+    if (R.is_err[intern.StrId, str](rr)) { ret false; }
+    val effective: intern.StrId = R.unwrap_ok[intern.StrId, str](rr);
+    ret R.is_ok[*SymbolLoc, str](map.get[intern.StrId, SymbolLoc](
+        sym_locs, ?effective));
+}
+
+# whether an import-library declaration still needs loader resolution. A short
+# import member can be selected by an earlier alias before a later loose object
+# defines the same public symbol; that declaration is then inert
+fun declared_import_unresolved(d: *of.ImportDecl,
+                               sym_locs: *map.Map[intern.StrId, SymbolLoc]) bool {
+    ret !symbol_locally_resolved(sym_locs, d.symbol);
+}
+
+# whether any input image carries a still-unresolved import declaration. Only
+# those declarations make an otherwise static executable use the dynamic writer
+fun has_unresolved_declared_imports(
+        modules: *of.ObjectImage, module_count: u32,
+        sym_locs: *map.Map[intern.StrId, SymbolLoc]) bool {
     var m: u32 = 0;
     for (m < module_count) {
-        if (modules[m].import_count > 0) { ret true; }
+        var i: u32 = 0;
+        for (i < modules[m].import_count) {
+            if (declared_import_unresolved(?modules[m].imports[i], sym_locs)) {
+                ret true;
+            }
+            i = i + 1;
+        }
         m = m + 1;
     }
     ret false;
@@ -4284,12 +4371,16 @@ fun has_declared_imports(modules: *of.ObjectImage, module_count: u32) bool {
 # source/manifest attribution alone. Conflicting libraries were rejected before
 # dynamic-plan construction, so the first matching declaration is authoritative.
 fun declared_import_for(modules: *of.ObjectImage, module_count: u32,
-                        symbol: intern.StrId) *of.ImportDecl {
+                        symbol: intern.StrId,
+                        sym_locs: *map.Map[intern.StrId, SymbolLoc]) *of.ImportDecl {
     var m: u32 = 0;
     for (m < module_count) {
         var i: u32 = 0;
         for (i < modules[m].import_count) {
-            if (modules[m].imports[i].symbol == symbol) { ret ?modules[m].imports[i]; }
+            if (modules[m].imports[i].symbol == symbol
+                && declared_import_unresolved(?modules[m].imports[i], sym_locs)) {
+                ret ?modules[m].imports[i];
+            }
             i = i + 1;
         }
         m = m + 1;
@@ -4357,15 +4448,20 @@ fun emitted_lib_index(libs: *of.DynLib, start: u32, count: u32,
 # here and the append below must agree on what counts as already present
 fun declared_library_count(modules: *of.ObjectImage, module_count: u32,
                            dynlibs: *of.DynLib, dynlib_count: u32,
-                           implicit: *of.DynLib) u32 {
+                           implicit: *of.DynLib,
+                           sym_locs: *map.Map[intern.StrId, SymbolLoc]) u32 {
     var n: u32 = 0;
     var m: u32 = 0;
     for (m < module_count) {
         var i: u32 = 0;
         for (i < modules[m].import_count) {
+            if (!declared_import_unresolved(?modules[m].imports[i], sym_locs)) {
+                i = i + 1; cnt;
+            }
             val lib: intern.StrId = modules[m].imports[i].library;
             if (!dynlib_name_present(dynlibs, dynlib_count, implicit, lib)
-                && !declared_library_seen_before(modules, module_count, m, i, lib)) {
+                && !declared_library_seen_before(
+                    modules, module_count, m, i, lib, sym_locs)) {
                 n = n + 1;
             }
             i = i + 1;
@@ -4378,14 +4474,18 @@ fun declared_library_count(modules: *of.ObjectImage, module_count: u32,
 # whether an earlier declared import already named this library, in the same
 # module-then-index order the append walks
 fun declared_library_seen_before(modules: *of.ObjectImage, module_count: u32,
-                                 upto_m: u32, upto_i: u32, lib: intern.StrId) bool {
+                                 upto_m: u32, upto_i: u32, lib: intern.StrId,
+                                 sym_locs: *map.Map[intern.StrId, SymbolLoc]) bool {
     var m: u32 = 0;
     for (m <= upto_m && m < module_count) {
         var i: u32 = 0;
         var end: u32 = modules[m].import_count;
         if (m == upto_m) { end = upto_i; }
         for (i < end) {
-            if (modules[m].imports[i].library == lib) { ret true; }
+            if (modules[m].imports[i].library == lib
+                && declared_import_unresolved(?modules[m].imports[i], sym_locs)) {
+                ret true;
+            }
             i = i + 1;
         }
         m = m + 1;
@@ -4500,6 +4600,33 @@ fun local_import_storage_size(count: u32) R.Result[u32, str] {
     ret R.ok[u32, str](count * 8);
 }
 
+# whether an import-address alias is referenced by at least one relocation whose
+# patch field survives final weak-atom selection. A declaration with no patch site
+# needs no pointer cell; references owned only by discarded COMDATs must not leave
+# an orphan section or ASLR base relocation behind
+fun local_import_referenced(modules: *of.ObjectImage, module_count: u32,
+                            alias: intern.StrId, sec_base: *u32,
+                            atoms: *AtomPlan) bool {
+    var m: u32 = 0;
+    for (m < module_count) {
+        var ri: u32 = 0;
+        for (ri < modules[m].reloc_count) {
+            val r: *of.Relocation = ?modules[m].relocations[ri];
+            if (r.sym < modules[m].symbol_count) {
+                val target: *of.Symbol = ?modules[m].symbols[r.sym];
+                if (target.name == alias && is_undefined_extern(target)
+                    && (target.flags & of.SYM_OBJ_FLAG_FALLBACK) == 0
+                    && reloc_source_live(modules, m, r, sec_base, atoms)) {
+                    ret true;
+                }
+            }
+            ri = ri + 1;
+        }
+        m = m + 1;
+    }
+    ret false;
+}
+
 # lower COFF DefinedLocalImport semantics into one ordinary synthetic object.
 # Every distinct undefined `__imp_X` whose X has a strong in-graph
 # definition becomes an eight-byte global cell symbol with an ABS64 relocation
@@ -4513,11 +4640,14 @@ fun local_import_storage_size(count: u32) R.Result[u32, str] {
 # modules:      complete archive-resolved input graph
 # module_count: number of input images
 # mode:         requested link mode; relocatable output preserves the alias
+# sec_base:     per-module section bases used by the final atom plan
+# atoms:        final weak-atom liveness for the original input graph
 # out:          receives the owned synthetic image when the result is true
 # ret:          true when an image was produced, false when no alias qualifies
 fun synthesize_local_imports(s: *session.Session, prefix: str,
                              modules: *of.ObjectImage, module_count: u32,
-                             mode: LinkMode, out: *of.ObjectImage) R.Result[bool, str] {
+                             mode: LinkMode, sec_base: *u32, atoms: *AtomPlan,
+                             out: *of.ObjectImage) R.Result[bool, str] {
     if (str_empty(prefix) || mode == LINK_RELOCATABLE || modules == nil
         || module_count == 0) {
         ret R.ok[bool, str](false);
@@ -4586,6 +4716,8 @@ fun synthesize_local_imports(s: *session.Session, prefix: str,
             }
             val cn: ImportName = R.unwrap_ok[ImportName, str](cn_r);
             if (cn.indirect
+                && local_import_referenced(
+                    modules, module_count, sym.name, sec_base, atoms)
                 && R.is_err[*u32, str](map.get[intern.StrId, u32](?seen, ?sym.name))) {
                 if (count == 0x1FFFFFFF) {
                     map.dnit[intern.StrId, u32](?seen);
@@ -4699,6 +4831,8 @@ fun synthesize_local_imports(s: *session.Session, prefix: str,
             }
             val cn: ImportName = R.unwrap_ok[ImportName, str](cn_r);
             if (!cn.indirect
+                || !local_import_referenced(
+                    modules, module_count, sym.name, sec_base, atoms)
                 || R.is_ok[*u32, str](map.get[intern.StrId, u32](?seen, ?sym.name))) {
                 sy = sy + 1; cnt;
             }
@@ -6259,6 +6393,63 @@ test "mach.lang.be.linker.build_dynamic_info:declared_import_is_link_local" {
     ret 0;
 }
 
+# An import-library member selected before a later local provider becomes inert.
+# It contributes no loader dependency, does not validate a stale attribution,
+# and does not make an otherwise static executable dynamic.
+test "mach.lang.be.linker.build_dynamic_info:locally_resolved_declaration" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val tr: R.Result[target.Target, str] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+
+    val symbol: intern.StrId = lt_name(?s, "local_add");
+    val declared: intern.StrId = lt_name(?s, "demo.dll");
+    val stale: intern.StrId = lt_name(?s, "stale.dll");
+    if (symbol == intern.STR_NIL || declared == intern.STR_NIL
+        || stale == intern.STR_NIL
+        || R.is_err[bool, str](session.register_import_library(
+            ?s, symbol, stale))) { ret 1; }
+
+    var decl: of.ImportDecl;
+    decl.symbol = symbol; decl.import_name = symbol; decl.library = declared;
+    decl.ordinal = 0; decl.by_name = true; decl.is_code = true;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "selected-import-record"), nil::*of.Section, 0,
+        nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+    module.imports = ?decl;
+    module.import_count = 1;
+
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var loc: SymbolLoc;
+    loc.vaddr = 0x1000; loc.weak = false; loc.fallback = intern.STR_NIL;
+    if (R.is_err[bool, str](map.insert[intern.StrId, SymbolLoc](
+        ?locs, symbol, loc))) { ret 1; }
+    var dyn: DynState;
+    init_dynstate(?dyn);
+    val built: R.Result[bool, str] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    val remains_dynamic: bool = has_unresolved_declared_imports(
+        ?module, 1, ?locs);
+    if (R.is_err[bool, str](built) || dyn.info.lib_count != 0
+        || dyn.info.import_count != 0 || remains_dynamic) {
+        ret 1;
+    }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
 # PE's object-level `__imp_X` spelling shares one loader import with a direct X
 # reference. Attribution and the emitted name use X, while the direct reference
 # alone upgrades the shared row to a function import
@@ -6375,15 +6566,24 @@ test "mach.lang.be.linker.synthesize_local_imports:defined_local_import" {
     refs[5].flags = external | of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FALLBACK;
     refs[5].fallback = 4;
 
+    var ref_code: [4]u8;
+    var ref_text: of.Section;
+    ref_text.name = lt_name(?s, ".text"); ref_text.kind = of.SK_TEXT;
+    ref_text.bytes = ?ref_code[0]; ref_text.len = 4; ref_text.align = 1;
+    var ref_reloc: of.Relocation;
+    ref_reloc.section = 0; ref_reloc.offset = 0;
+    ref_reloc.kind = of.RK_PC32; ref_reloc.sym = 0; ref_reloc.addend = 0;
+
     var modules: [2]of.ObjectImage;
     modules[0] = lt_image(?s, lt_name(?s, "local-defs"), ?text, 1,
                           ?defs[0], 4, nil::*of.Relocation, 0);
-    modules[1] = lt_image(?s, lt_name(?s, "local-refs"), nil::*of.Section, 0,
-                          ?refs[0], 6, nil::*of.Relocation, 0);
+    modules[1] = lt_image(?s, lt_name(?s, "local-refs"), ?ref_text, 1,
+                          ?refs[0], 6, ?ref_reloc, 1);
 
     var synth: of.ObjectImage;
     val made: R.Result[bool, str] = synthesize_local_imports(
-        ?s, "__imp_", ?modules[0], 2, LINK_EXE, ?synth);
+        ?s, "__imp_", ?modules[0], 2, LINK_EXE,
+        nil::*u32, nil::*AtomPlan, ?synth);
     if (R.is_err[bool, str](made) || !R.unwrap_ok[bool, str](made)
         || synth.section_count != 1 || synth.sections[0].kind != of.SK_RELRO
         || synth.sections[0].len != 8 || synth.sections[0].align != 8
@@ -6404,7 +6604,8 @@ test "mach.lang.be.linker.synthesize_local_imports:defined_local_import" {
 
     var untouched: of.ObjectImage;
     val relocatable: R.Result[bool, str] = synthesize_local_imports(
-        ?s, "__imp_", ?modules[0], 2, LINK_RELOCATABLE, ?untouched);
+        ?s, "__imp_", ?modules[0], 2, LINK_RELOCATABLE,
+        nil::*u32, nil::*AtomPlan, ?untouched);
     if (R.is_err[bool, str](relocatable)
         || R.unwrap_ok[bool, str](relocatable)) {
         session.dnit(?s);
@@ -6420,7 +6621,8 @@ test "mach.lang.be.linker.synthesize_local_imports:defined_local_import" {
                                   ?corrupt_def, 1, nil::*of.Relocation, 0);
     corrupt_modules[1] = modules[1];
     val malformed: R.Result[bool, str] = synthesize_local_imports(
-        ?s, "__imp_", ?corrupt_modules[0], 2, LINK_EXE, ?untouched);
+        ?s, "__imp_", ?corrupt_modules[0], 2, LINK_EXE,
+        nil::*u32, nil::*AtomPlan, ?untouched);
     var corrupt_locs: map.Map[intern.StrId, SymbolLoc] =
         map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
     val diagnosed: R.Result[bool, str] = collect_symbols(
@@ -6436,6 +6638,100 @@ test "mach.lang.be.linker.synthesize_local_imports:defined_local_import" {
         || R.is_err[u32, str](max_size)
         || R.unwrap_ok[u32, str](max_size) != 0xFFFFFFF8
         || !R.is_err[u32, str](overflow)) { ret 1; }
+    ret 0;
+}
+
+# A local import-address reference owned only by a losing weak COMDAT does not
+# survive atom selection and therefore must not synthesize storage or a base
+# relocation. The inert-plan control proves the symbol graph itself qualifies.
+test "mach.lang.be.linker.synthesize_local_imports:dead_weak_comdat" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val tr: R.Result[target.Target, str] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+
+    val choice: intern.StrId = lt_name(?s, "qz_select_any");
+    val local: intern.StrId = lt_name(?s, "dead_local");
+    val alias: intern.StrId = lt_name(?s, "__imp_dead_local");
+    if (choice == intern.STR_NIL || local == intern.STR_NIL
+        || alias == intern.STR_NIL) { ret 1; }
+
+    var winner_bytes: [4]u8;
+    var loser_bytes: [8]u8;
+    var provider_bytes: [1]u8;
+    var sections: [3]of.Section;
+    sections[0].name = lt_name(?s, ".text$winner");
+    sections[0].kind = of.SK_TEXT; sections[0].bytes = ?winner_bytes[0];
+    sections[0].len = 4; sections[0].align = 1;
+    sections[1].name = lt_name(?s, ".text$loser");
+    sections[1].kind = of.SK_TEXT; sections[1].bytes = ?loser_bytes[0];
+    sections[1].len = 8; sections[1].align = 1;
+    sections[2].name = lt_name(?s, ".text");
+    sections[2].kind = of.SK_TEXT; sections[2].bytes = ?provider_bytes[0];
+    sections[2].len = 1; sections[2].align = 1;
+
+    val weak_fn: u32 = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK
+        | of.SYM_OBJ_FLAG_FUNCTION;
+    var winner: of.Symbol;
+    winner.name = choice; winner.section = 0; winner.offset = 0;
+    winner.size = 4; winner.flags = weak_fn;
+    var loser_syms: [2]of.Symbol;
+    loser_syms[0].name = choice; loser_syms[0].section = 0;
+    loser_syms[0].offset = 0; loser_syms[0].size = 8;
+    loser_syms[0].flags = weak_fn;
+    loser_syms[1].name = alias;
+    loser_syms[1].section = of.SECTION_EXTERNAL;
+    loser_syms[1].offset = 0; loser_syms[1].size = 0;
+    loser_syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+        | of.SYM_OBJ_FLAG_OBJECT;
+    var provider: of.Symbol;
+    provider.name = local; provider.section = 0; provider.offset = 0;
+    provider.size = 1;
+    provider.flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var loser_reloc: of.Relocation;
+    loser_reloc.section = 0; loser_reloc.offset = 0;
+    loser_reloc.kind = of.RK_PC32; loser_reloc.sym = 1;
+    loser_reloc.addend = 0;
+
+    var modules: [3]of.ObjectImage;
+    modules[0] = lt_image(?s, lt_name(?s, "winner"), ?sections[0], 1,
+                          ?winner, 1, nil::*of.Relocation, 0);
+    modules[1] = lt_image(?s, lt_name(?s, "loser"), ?sections[1], 1,
+                          ?loser_syms[0], 2, ?loser_reloc, 1);
+    modules[2] = lt_image(?s, lt_name(?s, "provider"), ?sections[2], 1,
+                          ?provider, 1, nil::*of.Relocation, 0);
+
+    var sec_base: [3]u32;
+    var atoms: AtomPlan;
+    init_atom_plan(?atoms);
+    val planned: R.Result[bool, str] = build_atom_plan(
+        ?s, ?modules[0], 3, 0, ?sec_base[0], 3, true, tgt.isa, ?atoms);
+    var synth: of.ObjectImage;
+    val dead: R.Result[bool, str] = synthesize_local_imports(
+        ?s, "__imp_", ?modules[0], 3, LINK_EXE,
+        ?sec_base[0], ?atoms, ?synth);
+    var control: of.ObjectImage;
+    val inert: R.Result[bool, str] = synthesize_local_imports(
+        ?s, "__imp_", ?modules[0], 3, LINK_EXE,
+        nil::*u32, nil::*AtomPlan, ?control);
+    if (R.is_ok[bool, str](inert) && R.unwrap_ok[bool, str](inert)) {
+        obj.dnit(?control);
+    }
+    val discarded: bool = atoms.active;
+    free_atom_plan(?alloc, ?atoms);
+    session.dnit(?s);
+    if (R.is_err[bool, str](planned) || !discarded
+        || R.is_err[bool, str](dead) || R.unwrap_ok[bool, str](dead)
+        || R.is_err[bool, str](inert) || !R.unwrap_ok[bool, str](inert)) {
+        ret 1;
+    }
     ret 0;
 }
 
