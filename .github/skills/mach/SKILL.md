@@ -191,6 +191,12 @@ import with `#[library("name")]`. The value is the requirement's stable
 remain accepted. A discovered Darwin `@rpath/` install name retains its selected
 library directory as an `LC_RPATH` command.
 
+Windows COFF inputs compiled with C/C++ `dllimport` may leave `__imp_X`
+undefined. Attribute the real export X normally; the linker strips the object
+prefix for loader lookup and points the foreign reference at X's IAT cell. A
+direct X reference and `__imp_X` share one import entry — never map `__imp_X` as
+a separate loader export.
+
 ### `val` / `var`
 
 ```mach
