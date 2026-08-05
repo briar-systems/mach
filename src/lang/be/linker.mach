@@ -40,6 +40,7 @@ use std.types.string.str;
 use std.types.string.str_empty;
 use std.types.string.str_equals;
 use std.types.string.str_len;
+use std.types.string.str_starts_with;
 
 use A: std.allocator;
 use O: std.types.option;
@@ -195,6 +196,7 @@ rec AtomRelocRef {
 # fixups:         collected import call-site fixups
 # fixup_count:    number of fixups
 # fixup_cap:      capacity of the fixup array
+# import_cap:     allocation size of `info.imports`, including a partial plan
 # base_reloc_cap: capacity of the `info.base_relocs` array (count lives on `info`)
 # active:         true once `build_dynamic_info` populated the plan (a dynamic link)
 rec DynState {
@@ -203,8 +205,9 @@ rec DynState {
     fixups:      *of.PltFixup;
     fixup_count: u32;
     fixup_cap:   u32;
+    import_cap:  u32;
     base_reloc_cap: u32;
-    got_fixup_cap:  u32;
+    import_addr_fixup_cap: u32;
     active:      bool;
 }
 
@@ -695,7 +698,8 @@ fun link_modules(s: *session.Session, tgt: *target.Target, modules: *of.ObjectIm
         val patch_r: R.Result[bool, str] =
             patch_relocations(s, ?out_img, modules, module_count, codegen_count,
                               placements, sec_base, merged_to_out, ?sym_locs,
-                              ?dyn, ?strm, tgt.isa, os_base_addr(tgt), ?atoms);
+                              ?dyn, ?strm, tgt.of.import_address_prefix,
+                              tgt.isa, os_base_addr(tgt), ?atoms);
         if (R.is_err[bool, str](patch_r)) {
             free_dynstate(alloc, ?dyn);
             obj.dnit(?out_img);
@@ -2906,9 +2910,9 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
 # virtual address and write the patched value into the merged section bytes.
 # absolute kinds store `sym + addend`; pc-relative kinds store
 # `sym + addend - patch_addr`. an undefined target symbol is an error UNLESS it is
-# a dynamic import (`dyn.active`), in which case a pc-relative call site is
-# recorded as a `PltFixup` for the writer to redirect to the import's PLT stub
-# and patching is deferred
+# a dynamic import (`dyn.active`), in which case a direct pc-relative call is
+# deferred to the import's PLT stub, while a format-declared import-address alias
+# is deferred to its loader-filled slot
 #
 # a relocation in module `m` references its target by index into `m`'s own symbol
 # array. a LOCAL (object-private) target is therefore resolved directly against
@@ -2927,8 +2931,9 @@ fun build_merged_image(s: *session.Session, out_img: *of.ObjectImage,
 # sec_base:      per-module prefix offset into `placements`
 # merged_to_out: per-merged-slot output-section index (from build_merged_image)
 # sym_locs:      the global symbol table, for GLOBAL/extern target resolution
-# dyn:           dynamic-link state; out - collects import call-site fixups
+# dyn:           dynamic-link state; out - collects deferred import fixups
 # strm:          the deduped .debug_str table, for strp remap (inactive to skip)
+# import_address_prefix: active format's slot-reference symbol prefix, or empty
 # arch:          active instruction-set vtable, owning the relocation packer
 # image_base:    base virtual address of the linked image
 # ret:           ok(true) on success, or an error string
@@ -2936,13 +2941,14 @@ fun patch_relocations(s: *session.Session, out_img: *of.ObjectImage,
                      modules: *of.ObjectImage, module_count: u32, codegen_count: u32,
                      placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                      sym_locs: *map.Map[intern.StrId, SymbolLoc],
-                     dyn: *DynState, strm: *StrMerge, arch: *isa.IsaVTable,
+                     dyn: *DynState, strm: *StrMerge, import_address_prefix: str,
+                     arch: *isa.IsaVTable,
                      image_base: u64, atoms: *AtomPlan) R.Result[bool, str] {
     var m: u32 = 0;
     for (m < module_count) {
         val pr: R.Result[bool, str] = patch_module_relocations(s, out_img, modules, m,
             placements, sec_base, merged_to_out, sym_locs, dyn, strm,
-            arch, image_base, m < codegen_count, atoms);
+            import_address_prefix, arch, image_base, m < codegen_count, atoms);
         if (R.is_err[bool, str](pr)) { ret R.err[bool, str](R.unwrap_err[bool, str](pr)); }
 
         m = m + 1;
@@ -2977,7 +2983,7 @@ fun local_symbol_vaddr(modules: *of.ObjectImage, m: u32, sy: u32, placements: *P
 # apply every relocation in module `m` into the merged
 # bytes. a LOCAL target resolves directly from module `m`'s own symbol array;
 # a GLOBAL target (or an undefined extern) resolves by name through `sym_locs`, and
-# an unresolved pc-relative call to a function import is deferred as a PltFixup
+# unresolved dynamic calls and import-address references are deferred to the writer
 # ---
 # s:            shared session, for diagnostics
 # out_img:      the merged image whose section bytes are patched in place
@@ -2987,8 +2993,9 @@ fun local_symbol_vaddr(modules: *of.ObjectImage, m: u32, sy: u32, placements: *P
 # sec_base:      per-module prefix offset into `placements`
 # merged_to_out: per-merged-slot output-section index (from build_merged_image)
 # sym_locs:      the global symbol table, for GLOBAL/extern target resolution
-# dyn:           dynamic-link state; out - collects import call-site fixups
+# dyn:           dynamic-link state; out - collects deferred import fixups
 # strm:          the deduped .debug_str table, for strp remap (inactive to skip)
+# import_address_prefix: active format's slot-reference symbol prefix, or empty
 # arch:          active instruction-set vtable, owning the relocation packer
 # image_base:    base virtual address of the linked image
 # codegen_image: true when module `m` is an in-memory compiler image
@@ -2997,7 +3004,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                              modules: *of.ObjectImage, m: u32,
                              placements: *Placement, sec_base: *u32, merged_to_out: *u32,
                              sym_locs: *map.Map[intern.StrId, SymbolLoc], dyn: *DynState,
-                             strm: *StrMerge,
+                             strm: *StrMerge, import_address_prefix: str,
                              arch: *isa.IsaVTable, image_base: u64, codegen_image: bool,
                              atoms: *AtomPlan) R.Result[bool, str] {
     # locate module m's .debug_str section once: a strp relocation is exactly one
@@ -3098,7 +3105,26 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                 # a GOT fixup (the writer builds its GOT slot + GLOB_DAT). any other
                 # unresolved reference - a call against a data import, an absolute
                 # reference to any import - is rejected as undefined.
+                val cn_r: R.Result[ImportName, str] =
+                    canonical_import_name(s, import_address_prefix, target_name);
+                if (R.is_err[ImportName, str](cn_r)) {
+                    ret R.err[bool, str](R.unwrap_err[ImportName, str](cn_r));
+                }
+                val cn: ImportName = R.unwrap_ok[ImportName, str](cn_r);
                 val imp: R.Result[u32, str] = dynstate_import_index(dyn, target_name);
+                # A format-owned import-address alias (PE's `__imp_X`) is already
+                # one level of indirection: its PC-relative field addresses X's
+                # loader-filled slot directly, regardless of whether another site
+                # also made X a function import with a call stub.
+                if (R.is_ok[u32, str](imp) && cn.indirect && r.kind == of.RK_PC32) {
+                    val rec_i: R.Result[bool, str] = dynstate_add_import_addr_fixup(
+                        s, dyn, segment_index_for(out_img, out_ix), patch_off,
+                        R.unwrap_ok[u32, str](imp), patch_va, r.kind, r.addend);
+                    if (R.is_err[bool, str](rec_i)) {
+                        ret R.err[bool, str](R.unwrap_err[bool, str](rec_i));
+                    }
+                    ri = ri + 1; cnt;
+                }
                 if (R.is_ok[u32, str](imp) && is_call_kind(r.kind)
                     && dynstate_import_is_func(dyn, R.unwrap_ok[u32, str](imp))) {
                     val rec_r: R.Result[bool, str] = dynstate_add_fixup(s, dyn,
@@ -3109,9 +3135,9 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                 }
                 if (R.is_ok[u32, str](imp) && is_got_kind(r.kind)
                     && !dynstate_import_is_func(dyn, R.unwrap_ok[u32, str](imp))) {
-                    val rec_g: R.Result[bool, str] = dynstate_add_got_fixup(s, dyn,
+                    val rec_g: R.Result[bool, str] = dynstate_add_import_addr_fixup(s, dyn,
                         segment_index_for(out_img, out_ix), patch_off,
-                        R.unwrap_ok[u32, str](imp), patch_va, r.kind);
+                        R.unwrap_ok[u32, str](imp), patch_va, r.kind, r.addend);
                     if (R.is_err[bool, str](rec_g)) { ret R.err[bool, str](R.unwrap_err[bool, str](rec_g)); }
                     ri = ri + 1; cnt;
                 }
@@ -3209,13 +3235,14 @@ fun init_dynstate(dyn: *DynState) {
     dyn.info.base_relocs      = nil;
     dyn.info.base_reloc_count = 0;
     dyn.info.pie              = false;
-    dyn.info.got_fixups       = nil;
-    dyn.info.got_fixup_count  = 0;
+    dyn.info.import_addr_fixups       = nil;
+    dyn.info.import_addr_fixup_count  = 0;
     dyn.fixups            = nil;
     dyn.fixup_count       = 0;
     dyn.fixup_cap         = 0;
+    dyn.import_cap        = 0;
     dyn.base_reloc_cap    = 0;
-    dyn.got_fixup_cap     = 0;
+    dyn.import_addr_fixup_cap = 0;
     dyn.active            = false;
 }
 
@@ -3228,8 +3255,8 @@ fun free_dynstate(alloc: *A.Allocator, dyn: *DynState) {
     if (dyn.info.libs != nil && dyn.info.lib_count > 0) {
         A.deallocate[of.DynLib](alloc, dyn.info.libs, dyn.info.lib_count::usize);
     }
-    if (dyn.info.imports != nil && dyn.info.import_count > 0) {
-        A.deallocate[of.DynImport](alloc, dyn.info.imports, dyn.info.import_count::usize);
+    if (dyn.info.imports != nil && dyn.import_cap > 0) {
+        A.deallocate[of.DynImport](alloc, dyn.info.imports, dyn.import_cap::usize);
     }
     if (dyn.fixups != nil && dyn.fixup_cap > 0) {
         A.deallocate[of.PltFixup](alloc, dyn.fixups, dyn.fixup_cap::usize);
@@ -3237,8 +3264,9 @@ fun free_dynstate(alloc: *A.Allocator, dyn: *DynState) {
     if (dyn.info.base_relocs != nil && dyn.base_reloc_cap > 0) {
         A.deallocate[of.BaseReloc](alloc, dyn.info.base_relocs, dyn.base_reloc_cap::usize);
     }
-    if (dyn.info.got_fixups != nil && dyn.got_fixup_cap > 0) {
-        A.deallocate[of.GotFixup](alloc, dyn.info.got_fixups, dyn.got_fixup_cap::usize);
+    if (dyn.info.import_addr_fixups != nil && dyn.import_addr_fixup_cap > 0) {
+        A.deallocate[of.ImportAddrFixup](alloc, dyn.info.import_addr_fixups,
+                                        dyn.import_addr_fixup_cap::usize);
     }
     if (dyn.active) {
         map.dnit[intern.StrId, u32](?dyn.import_map);
@@ -3303,11 +3331,13 @@ fun has_call_reloc(modules: *of.ObjectImage, module_count: u32,
 #
 # every distinct loader name becomes a `DynLib` dependency in first-seen order;
 # additional logical aliases map to that same emitted index. every global `ext`
-# symbol that no input object defines (not in `sym_locs`) becomes a function
-# `DynImport`, deduplicated by name through `import_map`; a relocation targeting
-# it is later bound to its PLT stub. an import is pinned when `#[library]`
-# attributed it (the session's `import_library` map, keyed by the import's link
-# name). otherwise it stays `DYNLIB_ANY` on a global-search format and is rejected
+# symbol that no input object defines (not in `sym_locs`) becomes a `DynImport`,
+# deduplicated by its loader-facing name through `import_map`. A format-declared
+# address alias such as PE's `__imp_X` canonicalizes to X for loader lookup and
+# attribution, while both spellings map to the same plan row. Direct functions get
+# call stubs; address aliases bind to the row's loader-filled slot. an import is
+# pinned when `#[library]` attributed its canonical name. otherwise it stays
+# `DYNLIB_ANY` on a global-search format and is rejected
 # on a two-level format. an attribution naming no dependency is a hard link error.
 # the interpreter path comes from the OS vtable - a real loader path for ELF
 # (PT_INTERP), or STR_NIL for a format that embeds the loader differently (PE's
@@ -3476,8 +3506,18 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             if (!is_undefined_extern(sym))                                                       { sy = sy + 1; cnt; }
             if (R.is_ok[*SymbolLoc, str](map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name))) { sy = sy + 1; cnt; }
             if (!import_symbol_live(modules, module_count, sym.name, sec_base, atoms))            { sy = sy + 1; cnt; }
-            if (R.is_ok[*u32, str](map.get[intern.StrId, u32](?seen, ?sym.name)))                { sy = sy + 1; cnt; }
-            val ins: R.Result[bool, str] = map.insert[intern.StrId, u32](?seen, sym.name, n_imports);
+            val cn_r: R.Result[ImportName, str] =
+                canonical_import_name(s, tgt.of.import_address_prefix, sym.name);
+            if (R.is_err[ImportName, str](cn_r)) {
+                map.dnit[intern.StrId, u32](?seen);
+                ret R.err[bool, str](R.unwrap_err[ImportName, str](cn_r));
+            }
+            val cn: ImportName = R.unwrap_ok[ImportName, str](cn_r);
+            if (R.is_ok[*u32, str](map.get[intern.StrId, u32](?seen, ?cn.canonical))) {
+                sy = sy + 1; cnt;
+            }
+            val ins: R.Result[bool, str] =
+                map.insert[intern.StrId, u32](?seen, cn.canonical, n_imports);
             if (R.is_err[bool, str](ins)) { map.dnit[intern.StrId, u32](?seen); ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
             n_imports = n_imports + 1;
             sy = sy + 1;
@@ -3491,6 +3531,7 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
     val ir: R.Result[*of.DynImport, str] = A.zallocate[of.DynImport](alloc, n_imports::usize);
     if (R.is_err[*of.DynImport, str](ir)) { ret R.err[bool, str](R.unwrap_err[*of.DynImport, str](ir)); }
     dyn.info.imports = R.unwrap_ok[*of.DynImport, str](ir);
+    dyn.import_cap = n_imports;
 
     # populate the imports and the name->index map (dedup by name).
     m = 0;
@@ -3501,11 +3542,41 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             if (!is_undefined_extern(sym))                                                       { sy = sy + 1; cnt; }
             if (R.is_ok[*SymbolLoc, str](map.get[intern.StrId, SymbolLoc](sym_locs, ?sym.name))) { sy = sy + 1; cnt; }
             if (!import_symbol_live(modules, module_count, sym.name, sec_base, atoms))            { sy = sy + 1; cnt; }
-            if (R.is_ok[*u32, str](map.get[intern.StrId, u32](?dyn.import_map, ?sym.name)))      { sy = sy + 1; cnt; }
+
+            val cn_r: R.Result[ImportName, str] =
+                canonical_import_name(s, tgt.of.import_address_prefix, sym.name);
+            if (R.is_err[ImportName, str](cn_r)) {
+                ret R.err[bool, str](R.unwrap_err[ImportName, str](cn_r));
+            }
+            val cn: ImportName = R.unwrap_ok[ImportName, str](cn_r);
+            val existing: R.Result[*u32, str] =
+                map.get[intern.StrId, u32](?dyn.import_map, ?cn.canonical);
+            if (R.is_ok[*u32, str](existing)) {
+                val existing_idx: u32 = @R.unwrap_ok[*u32, str](existing);
+                # Every source spelling resolves to the same canonical plan row.
+                # A later direct X reference may upgrade an __imp_X-only data-like
+                # row to a function import, but the indirect site's fixup remains
+                # an IAT reference and never becomes a call-stub reference.
+                if (R.is_err[*u32, str](map.get[intern.StrId, u32](?dyn.import_map, ?sym.name))) {
+                    val alias_r: R.Result[bool, str] =
+                        map.insert[intern.StrId, u32](?dyn.import_map, sym.name, existing_idx);
+                    if (R.is_err[bool, str](alias_r)) {
+                        ret R.err[bool, str](R.unwrap_err[bool, str](alias_r));
+                    }
+                }
+                if (!cn.indirect
+                    && (((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0)
+                        || has_call_reloc(modules, module_count, cn.canonical,
+                                          sec_base, atoms))) {
+                    dyn.info.imports[existing_idx].is_func = true;
+                }
+                sy = sy + 1; cnt;
+            }
 
             val idx: u32 = dyn.info.import_count;
-            dyn.info.imports[idx].symbol    = sym.name;
-            val decl: *of.ImportDecl = declared_import_for(modules, module_count, sym.name);
+            dyn.info.imports[idx].symbol    = cn.canonical;
+            val decl: *of.ImportDecl =
+                declared_import_for(modules, module_count, cn.canonical);
             # pin the import to the library its `#[library]` attribution named, when
             # present. a directive naming a library not among this link's
             # dependencies is a hard error. an unattributed import stays DYNLIB_ANY
@@ -3513,7 +3584,8 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             # namespace (PE, Mach-O) where the image must name a providing library
             # per import. a short import declaration overrides an equivalent
             # source/manifest alias with its exact loader spelling for this link.
-            var lib_opt: O.Option[intern.StrId] = session.import_library(s, sym.name);
+            var lib_opt: O.Option[intern.StrId] =
+                session.import_library(s, cn.canonical);
             if (decl != nil) { lib_opt = O.some[intern.StrId](decl.library); }
             if (O.is_some[intern.StrId](lib_opt)) {
                 val want: intern.StrId = O.unwrap[intern.StrId](lib_opt);
@@ -3525,11 +3597,14 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
                     li_opt = emitted_lib_index(dyn.info.libs, explicit_libs + implicit,
                                                dyn.info.lib_count, want);
                 }
-                if (!O.is_some[u32](li_opt)) { ret R.err[bool, str](pinned_lib_message(s, sym.name, want)); }
+                if (!O.is_some[u32](li_opt)) {
+                    ret R.err[bool, str](pinned_lib_message(s, cn.canonical, want));
+                }
                 dyn.info.imports[idx].lib_index = O.unwrap[u32](li_opt);
             }
             or (tgt.of.two_level_namespace) {
-                ret R.err[bool, str](unattributed_import_message(s, sym.name, dynlibs, dynlib_count));
+                ret R.err[bool, str](unattributed_import_message(
+                    s, cn.canonical, dynlibs, dynlib_count));
             }
             or {
                 dyn.info.imports[idx].lib_index = of.DYNLIB_ANY;
@@ -3538,9 +3613,10 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
             # flag) is recorded but not yet bound - its abs reference still hits
             # the undefined-symbol error in patch_relocations, since data imports
             # (GLOB_DAT) are deferred.
-            dyn.info.imports[idx].is_func   =
-                ((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0)
-                || has_call_reloc(modules, module_count, sym.name, sec_base, atoms);
+            dyn.info.imports[idx].is_func = !cn.indirect
+                && (((sym.flags & of.SYM_OBJ_FLAG_FUNCTION) != 0)
+                    || has_call_reloc(modules, module_count, cn.canonical,
+                                      sec_base, atoms));
             # short import records also carry the loader's hint or ordinal. Keep
             # that binding metadata beside the source symbol so the PE writer can
             # emit an ordinal thunk instead of silently changing it to by-name.
@@ -3551,8 +3627,18 @@ fun build_dynamic_info(s: *session.Session, tgt: *target.Target, dyn: *DynState,
                 dyn.info.imports[idx].ordinal = decl.ordinal;
                 dyn.info.imports[idx].by_ordinal = !decl.by_name;
             }
-            val ins: R.Result[bool, str] = map.insert[intern.StrId, u32](?dyn.import_map, sym.name, idx);
-            if (R.is_err[bool, str](ins)) { ret R.err[bool, str](R.unwrap_err[bool, str](ins)); }
+            val ins: R.Result[bool, str] =
+                map.insert[intern.StrId, u32](?dyn.import_map, cn.canonical, idx);
+            if (R.is_err[bool, str](ins)) {
+                ret R.err[bool, str](R.unwrap_err[bool, str](ins));
+            }
+            if (sym.name != cn.canonical) {
+                val alias_r: R.Result[bool, str] =
+                    map.insert[intern.StrId, u32](?dyn.import_map, sym.name, idx);
+                if (R.is_err[bool, str](alias_r)) {
+                    ret R.err[bool, str](R.unwrap_err[bool, str](alias_r));
+                }
+            }
             dyn.info.import_count = idx + 1;
 
             sy = sy + 1;
@@ -3832,6 +3918,49 @@ fun unique_dynlib_count(dynlibs: *of.DynLib, count: u32) u32 {
     ret unique;
 }
 
+# one object-level import spelling normalized for the loader-facing plan
+# ---
+# canonical: export name the loader resolves and attribution keys use
+# indirect:  true when the object spelling denotes the export's address slot
+rec ImportName {
+    canonical: intern.StrId;
+    indirect:  bool;
+}
+
+# normalize a format-declared import-address alias. PE/COFF's undefined
+# `__imp_X` names the IAT slot for export X; other formats declare an empty prefix
+# and preserve every name. A bare prefix is not an alias because it has no export
+# suffix. The canonical suffix is interned so all later maps remain StrId-keyed.
+# ---
+# s:      shared session carrying the interner
+# prefix: active format's import-address prefix, or empty
+# name:   object symbol spelling
+# ret:    canonical loader name plus whether this was an indirect spelling
+fun canonical_import_name(s: *session.Session, prefix: str,
+                          name: intern.StrId) R.Result[ImportName, str] {
+    var out: ImportName;
+    out.canonical = name;
+    out.indirect = false;
+    if (str_empty(prefix)) { ret R.ok[ImportName, str](out); }
+
+    val text_o: O.Option[str] = intern.lookup(?s.interner, name);
+    if (!O.is_some[str](text_o)) { ret R.ok[ImportName, str](out); }
+    val text: str = O.unwrap[str](text_o);
+    val prefix_len: usize = str_len(prefix);
+    if (!str_starts_with(text, prefix) || str_len(text) <= prefix_len) {
+        ret R.ok[ImportName, str](out);
+    }
+
+    val cr: R.Result[intern.StrId, str] =
+        intern.intern(?s.interner, (text::usize + prefix_len)::str);
+    if (R.is_err[intern.StrId, str](cr)) {
+        ret R.err[ImportName, str](R.unwrap_err[intern.StrId, str](cr));
+    }
+    out.canonical = R.unwrap_ok[intern.StrId, str](cr);
+    out.indirect = true;
+    ret R.ok[ImportName, str](out);
+}
+
 # whether an object symbol is an undefined external - a
 # reference the owning object does not define. these are the candidates for a
 # dynamic import when no input object supplies the definition
@@ -3940,37 +4069,43 @@ fun dynstate_add_fixup(s: *session.Session, dyn: *DynState, seg_index: u32, seg_
     ret R.ok[bool, str](true);
 }
 
-# append one GOT-indirect data-import access site, growing the array
-# geometrically. the writer resolves each to its import's GOT slot and emits the
-# slot's GLOB_DAT dynamic relocation (#2026)
+# append one import-address access site, growing the array geometrically. the
+# format writer resolves it to the loader-filled slot it owns (#2026, #2526)
 # ---
 # s:            shared session (allocator), backing the fixup array
-# dyn:          out - the dynamic-link state whose GOT-fixup array grows
+# dyn:          out - the dynamic-link state whose import-address array grows
 # seg_index:    load-segment index of the patched instruction
 # seg_offset:   byte offset of the patched instruction within its segment
-# import_index: plan import index (a data import) this access binds to
-# patch_vaddr:  the patched instruction's virtual address
-# kind:         the GOT relocation kind (page-high vs scaled-lo12 half)
+# import_index: dynamic import whose loader-filled address slot is referenced
+# patch_vaddr:  virtual address of the patched instruction or relocation field
+# kind:         relocation kind used to address the slot
+# addend:       relocation addend to preserve for writer-owned patching
 # ret:          ok(true) once recorded, or an allocation error
-fun dynstate_add_got_fixup(s: *session.Session, dyn: *DynState, seg_index: u32, seg_offset: u32,
-                           import_index: u32, patch_vaddr: u64, kind: of.RelocKind) R.Result[bool, str] {
+fun dynstate_add_import_addr_fixup(s: *session.Session, dyn: *DynState,
+                                   seg_index: u32, seg_offset: u32,
+                                   import_index: u32, patch_vaddr: u64,
+                                   kind: of.RelocKind, addend: i64) R.Result[bool, str] {
     val alloc: *A.Allocator = s.alloc;
-    if (dyn.info.got_fixup_count == dyn.got_fixup_cap) {
-        var new_cap: u32 = dyn.got_fixup_cap * 2;
+    if (dyn.info.import_addr_fixup_count == dyn.import_addr_fixup_cap) {
+        var new_cap: u32 = dyn.import_addr_fixup_cap * 2;
         if (new_cap == 0) { new_cap = 4; }
-        val gr: R.Result[*of.GotFixup, str] =
-            A.reallocate[of.GotFixup](alloc, dyn.info.got_fixups, dyn.got_fixup_cap::usize, new_cap::usize);
-        if (R.is_err[*of.GotFixup, str](gr)) { ret R.err[bool, str](R.unwrap_err[*of.GotFixup, str](gr)); }
-        dyn.info.got_fixups = R.unwrap_ok[*of.GotFixup, str](gr);
-        dyn.got_fixup_cap = new_cap;
+        val gr: R.Result[*of.ImportAddrFixup, str] =
+            A.reallocate[of.ImportAddrFixup](alloc, dyn.info.import_addr_fixups,
+                dyn.import_addr_fixup_cap::usize, new_cap::usize);
+        if (R.is_err[*of.ImportAddrFixup, str](gr)) {
+            ret R.err[bool, str](R.unwrap_err[*of.ImportAddrFixup, str](gr));
+        }
+        dyn.info.import_addr_fixups = R.unwrap_ok[*of.ImportAddrFixup, str](gr);
+        dyn.import_addr_fixup_cap = new_cap;
     }
-    val ix: u32 = dyn.info.got_fixup_count;
-    dyn.info.got_fixups[ix].seg_index    = seg_index;
-    dyn.info.got_fixups[ix].seg_offset   = seg_offset;
-    dyn.info.got_fixups[ix].import_index = import_index;
-    dyn.info.got_fixups[ix].patch_vaddr  = patch_vaddr;
-    dyn.info.got_fixups[ix].kind         = kind;
-    dyn.info.got_fixup_count = ix + 1;
+    val ix: u32 = dyn.info.import_addr_fixup_count;
+    dyn.info.import_addr_fixups[ix].seg_index    = seg_index;
+    dyn.info.import_addr_fixups[ix].seg_offset   = seg_offset;
+    dyn.info.import_addr_fixups[ix].import_index = import_index;
+    dyn.info.import_addr_fixups[ix].patch_vaddr  = patch_vaddr;
+    dyn.info.import_addr_fixups[ix].kind         = kind;
+    dyn.info.import_addr_fixups[ix].addend       = addend;
+    dyn.info.import_addr_fixup_count = ix + 1;
     ret R.ok[bool, str](true);
 }
 
@@ -4740,6 +4875,109 @@ test "mach.lang.be.linker.build_dynamic_info:declared_import_is_link_local" {
         || O.is_some[intern.StrId](session.import_library(?s, symbol))) { ret 1; }
 
     free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+# PE's object-level `__imp_X` spelling shares one loader import with a direct X
+# reference. Attribution and the emitted name use X, while the direct reference
+# alone upgrades the shared row to a function import
+test "mach.lang.be.linker.build_dynamic_info:coff_import_address_alias" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val tr: R.Result[target.Target, str] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+
+    val direct: intern.StrId = lt_name(?s, "Sleep");
+    val indirect: intern.StrId = lt_name(?s, "__imp_Sleep");
+    val library: intern.StrId = lt_name(?s, "kernel32.dll");
+    if (direct == intern.STR_NIL || indirect == intern.STR_NIL
+        || library == intern.STR_NIL
+        || R.is_err[bool, str](session.register_import_library(
+            ?s, direct, library))) { ret 1; }
+
+    var syms: [2]of.Symbol;
+    syms[0].name = indirect; syms[0].section = of.SECTION_EXTERNAL;
+    syms[0].offset = 0; syms[0].size = 0;
+    syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+                    | of.SYM_OBJ_FLAG_FUNCTION;
+    syms[1].name = direct; syms[1].section = of.SECTION_EXTERNAL;
+    syms[1].offset = 0; syms[1].size = 0;
+    syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+                    | of.SYM_OBJ_FLAG_FUNCTION;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "dllimport-user"), nil::*of.Section, 0,
+        ?syms[0], 2, nil::*of.Relocation, 0);
+    var dep: of.DynLib;
+    dep.name = library; dep.soname = library; dep.rpath = intern.STR_NIL;
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+
+    val built: R.Result[bool, str] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs, ?dep, 1,
+        nil::*u32, nil::*AtomPlan);
+    val direct_idx: R.Result[u32, str] = dynstate_import_index(?dyn, direct);
+    val indirect_idx: R.Result[u32, str] = dynstate_import_index(?dyn, indirect);
+    if (R.is_err[bool, str](built) || dyn.info.import_count != 1
+        || dyn.info.imports[0].symbol != direct
+        || dyn.info.imports[0].lib_index != 0
+        || !dyn.info.imports[0].is_func
+        || R.is_err[u32, str](direct_idx) || R.is_err[u32, str](indirect_idx)
+        || R.unwrap_ok[u32, str](direct_idx) != 0
+        || R.unwrap_ok[u32, str](indirect_idx) != 0) { ret 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    map.dnit[intern.StrId, SymbolLoc](?locs);
+    session.dnit(?s);
+    ret 0;
+}
+
+# a population error before the first import row still owns the exact allocation
+# capacity, so free_dynstate can release the unpopulated array
+test "mach.lang.be.linker.build_dynamic_info:partial_import_cleanup" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val tr: R.Result[target.Target, str] =
+        target.select(?reg, "x86_64", "windows", "win64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+
+    var sym: of.Symbol;
+    sym.name = lt_name(?s, "NoLibrary");
+    sym.section = of.SECTION_EXTERNAL; sym.offset = 0; sym.size = 0;
+    sym.flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN
+                | of.SYM_OBJ_FLAG_FUNCTION;
+    var module: of.ObjectImage = lt_image(
+        ?s, lt_name(?s, "unattributed-user"), nil::*of.Section, 0,
+        ?sym, 1, nil::*of.Relocation, 0);
+    var locs: map.Map[intern.StrId, SymbolLoc] =
+        map.init[intern.StrId, SymbolLoc](?alloc, map.hash_u32, map.eq_u32);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+
+    val built: R.Result[bool, str] = build_dynamic_info(
+        ?s, ?tgt, ?dyn, ?module, 1, ?locs,
+        nil::*of.DynLib, 0, nil::*u32, nil::*AtomPlan);
+    if (!R.is_err[bool, str](built) || dyn.info.imports == nil
+        || dyn.info.import_count != 0 || dyn.import_cap != 1) { ret 1; }
+    free_dynstate(?alloc, ?dyn);
+    if (dyn.info.imports != nil || dyn.import_cap != 0) { ret 1; }
+
     map.dnit[intern.StrId, SymbolLoc](?locs);
     session.dnit(?s);
     ret 0;
@@ -5891,5 +6129,32 @@ test "mach.lang.be.linker.atom_plan:rv64_plt_pair_boundary" {
     val rv: R.Result[bool, str] =
         build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, rv64, ?plan);
     if (R.is_err[bool, str](rv) || plan.active) { ret 1; }
+    ret 0;
+}
+
+# deferred import-address fixups retain every field the format writer needs,
+# including a negative pc-relative addend
+test "mach.lang.be.linker.dynstate_add_import_addr_fixup:preserves_addend" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+    var dyn: DynState;
+    init_dynstate(?dyn);
+
+    val added: R.Result[bool, str] = dynstate_add_import_addr_fixup(
+        ?s, ?dyn, 2, 8, 3, 0x1234, of.RK_PC32, -4);
+    if (R.is_err[bool, str](added)
+        || dyn.info.import_addr_fixup_count != 1
+        || dyn.info.import_addr_fixups[0].seg_index != 2
+        || dyn.info.import_addr_fixups[0].seg_offset != 8
+        || dyn.info.import_addr_fixups[0].import_index != 3
+        || dyn.info.import_addr_fixups[0].patch_vaddr != 0x1234
+        || dyn.info.import_addr_fixups[0].kind != of.RK_PC32
+        || dyn.info.import_addr_fixups[0].addend != -4) { ret 1; }
+
+    free_dynstate(?alloc, ?dyn);
+    session.dnit(?s);
     ret 0;
 }
