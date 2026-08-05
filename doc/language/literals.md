@@ -26,6 +26,10 @@ val c: u8 = 'M';
 
 Char escapes: `\n` `\t` `\r` `\\` `\'` `\0` `\xHH`.
 
+This set is deliberately minimal — there is no `\a` `\b` `\f` `\v`. Any other
+byte, control characters included, is written `\xHH` (e.g. `\x08` for
+backspace, `\x07` for bell).
+
 ## String
 
 A sequence of characters in double quotes, producing a `*u8` pointing at
