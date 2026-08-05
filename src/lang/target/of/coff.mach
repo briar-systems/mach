@@ -133,10 +133,16 @@ val BIGOBJ_SYMBOL_SIZE:         usize = 20;
 #
 # header: Sig1, Sig2, Version, Machine, TimeDateStamp, SizeOfData, OrdinalOrHint,
 # then a bitfield of Type (2 bits) and NameType (3 bits). `SizeOfData` bytes
-# follow, holding the NUL-terminated symbol name then the NUL-terminated DLL name.
+# follow, holding the NUL-terminated symbol name then the NUL-terminated DLL name;
+# `IMPORT_OBJECT_NAME_EXPORTAS` adds the distinct export name as a third string.
 val IMPORT_OBJECT_HEADER_SIZE: usize = 20;
-val IMPORT_OBJECT_TYPE_CODE:   u16   = 0;
-val IMPORT_OBJECT_ORDINAL:     u16   = 0;
+val IMPORT_OBJECT_TYPE_CODE:       u16 = 0;
+val IMPORT_OBJECT_TYPE_CONST:      u16 = 2;
+val IMPORT_OBJECT_ORDINAL:         u16 = 0;
+val IMPORT_OBJECT_NAME:            u16 = 1;
+val IMPORT_OBJECT_NAME_NOPREFIX:   u16 = 2;
+val IMPORT_OBJECT_NAME_UNDECORATE: u16 = 3;
+val IMPORT_OBJECT_NAME_EXPORTAS:   u16 = 4;
 
 # COFF file-header characteristics for a linked PE image
 val IMAGE_FILE_RELOCS_STRIPPED:     u16 = 0x0001;
@@ -1612,9 +1618,10 @@ fun comdat_select_any_for_section(buf: *u8, symtab_off: usize, num_records: u32,
 # `of.ImportDecl`. That declaration is the authoritative symbol->library mapping
 # for a two-level namespace, carrying the loader's own DLL name and ordinal.
 #
-# The two NUL-terminated names live in the `SizeOfData` payload after the header,
-# symbol first then DLL. Both are bounded against the payload before being read,
-# so a truncated or hostile member errors here rather than running off the end.
+# The NUL-terminated names live in the `SizeOfData` payload after the header:
+# symbol first, then DLL, then a distinct export name for NAME_EXPORTAS. Every
+# string is bounded against the payload before being read, so a truncated or
+# hostile member errors here rather than running off the end.
 # ---
 # alloc:    allocator recorded on the image for its arrays
 # itn:      interner the two names are interned into
@@ -1639,6 +1646,17 @@ fun coff_parse_import_record(alloc: *A.Allocator, itn: *intern.Interner, buf: *u
 
     val hint_ord: u16 = bin.read_u16_le(buf, 16);
     val flags:    u16 = bin.read_u16_le(buf, 18);
+    val import_type: u16 = flags & 0x3;
+    val name_type:   u16 = (flags >> 2) & 0x7;
+    if (import_type > IMPORT_OBJECT_TYPE_CONST) {
+        ret R.err[bool, str]("coff: import record has an invalid import type");
+    }
+    if (name_type > IMPORT_OBJECT_NAME_EXPORTAS) {
+        ret R.err[bool, str]("coff: import record has an invalid name type");
+    }
+    if ((flags & 0xFFE0) != 0) {
+        ret R.err[bool, str]("coff: import record has nonzero reserved flags");
+    }
 
     # the symbol name, then the DLL name, each NUL-terminated within the payload
     val base: usize = IMPORT_OBJECT_HEADER_SIZE;
@@ -1653,12 +1671,47 @@ fun coff_parse_import_record(alloc: *A.Allocator, itn: *intern.Interner, buf: *u
     if (sym_end == base)      { ret R.err[bool, str]("coff: import record has an empty symbol name"); }
     if (dll_end == dll_start) { ret R.err[bool, str]("coff: import record has an empty library name"); }
 
-    # both names are NUL-terminated inside the payload, checked above, so each can
-    # be interned in place without copying
+    # both required names are NUL-terminated inside the payload, checked above, so
+    # each can be interned in place without copying
     val sym_r: R.Result[intern.StrId, str] = intern.intern(itn, (?buf[base])::str);
     if (R.is_err[intern.StrId, str](sym_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sym_r)); }
     val dll_r: R.Result[intern.StrId, str] = intern.intern(itn, (?buf[dll_start])::str);
     if (R.is_err[intern.StrId, str](dll_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](dll_r)); }
+
+# the first string is the public/link symbol. NameType selects the export name
+    # placed in the PE hint/name table: unchanged, with one decoration prefix
+    # removed, undecorated through the first '@', or an explicit third string.
+    var import_name_r: R.Result[intern.StrId, str] = sym_r;
+    if (name_type == IMPORT_OBJECT_NAME_NOPREFIX || name_type == IMPORT_OBJECT_NAME_UNDECORATE) {
+        var name_start: usize = base;
+        if (buf[name_start] == '?'::u8 || buf[name_start] == '@'::u8 || buf[name_start] == '_'::u8) {
+            name_start = name_start + 1;
+        }
+        var name_end: usize = sym_end;
+        if (name_type == IMPORT_OBJECT_NAME_UNDECORATE) {
+            name_end = name_start;
+            for (name_end < sym_end && buf[name_end] != '@'::u8) { name_end = name_end + 1; }
+        }
+        if (name_end == name_start) {
+            ret R.err[bool, str]("coff: import record resolves to an empty export name");
+        }
+        import_name_r = intern.intern_bytes(itn, (?buf[name_start])::str, name_end - name_start);
+    }
+    or (name_type == IMPORT_OBJECT_NAME_EXPORTAS) {
+        val export_start: usize = dll_end + 1;
+        var export_end: usize = export_start;
+        for (export_end < limit && buf[export_end] != 0) { export_end = export_end + 1; }
+        if (export_end >= limit) {
+            ret R.err[bool, str]("coff: import record export name is unterminated");
+        }
+        if (export_end == export_start) {
+            ret R.err[bool, str]("coff: import record has an empty export name");
+        }
+        import_name_r = intern.intern(itn, (?buf[export_start])::str);
+    }
+    if (R.is_err[intern.StrId, str](import_name_r)) {
+        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](import_name_r));
+    }
 
     val ir: R.Result[*of.ImportDecl, str] = A.zallocate[of.ImportDecl](alloc, 1::usize);
     if (R.is_err[*of.ImportDecl, str](ir)) { ret R.err[bool, str](R.unwrap_err[*of.ImportDecl, str](ir)); }
@@ -1674,13 +1727,12 @@ fun coff_parse_import_record(alloc: *A.Allocator, itn: *intern.Interner, buf: *u
     out.imports       = R.unwrap_ok[*of.ImportDecl, str](ir);
     out.import_count  = 1;
 
-    out.imports[0].symbol  = R.unwrap_ok[intern.StrId, str](sym_r);
-    out.imports[0].library = R.unwrap_ok[intern.StrId, str](dll_r);
-    # NameType 0 (ORDINAL) is the only spelling that binds by ordinal; every other
-    # value names the export and the hint field is only a lookup accelerator.
-    out.imports[0].by_name = ((flags >> 2) & 0x7) != IMPORT_OBJECT_ORDINAL;
-    out.imports[0].ordinal = hint_ord;
-    out.imports[0].is_code = (flags & 0x3) == IMPORT_OBJECT_TYPE_CODE;
+    out.imports[0].symbol      = R.unwrap_ok[intern.StrId, str](sym_r);
+    out.imports[0].import_name = R.unwrap_ok[intern.StrId, str](import_name_r);
+    out.imports[0].library     = R.unwrap_ok[intern.StrId, str](dll_r);
+    out.imports[0].by_name     = name_type != IMPORT_OBJECT_ORDINAL;
+    out.imports[0].ordinal     = hint_ord;
+    out.imports[0].is_code     = import_type == IMPORT_OBJECT_TYPE_CODE;
     ret R.ok[bool, str](true);
 }
 
@@ -3923,8 +3975,10 @@ test "mach.lang.target.of.coff.coff_parse_object:short_import_record" {
     if (img.reloc_count != 0)   { ret 1; }
 
     val sn: O.Option[str] = intern.lookup(?i, img.imports[0].symbol);
+    val en: O.Option[str] = intern.lookup(?i, img.imports[0].import_name);
     val ln: O.Option[str] = intern.lookup(?i, img.imports[0].library);
     if (!O.is_some[str](sn) || !str_equals(O.unwrap[str](sn), "Sleep"))        { ret 1; }
+    if (!O.is_some[str](en) || !str_equals(O.unwrap[str](en), "Sleep"))        { ret 1; }
     if (!O.is_some[str](ln) || !str_equals(O.unwrap[str](ln), "kernel32.dll")) { ret 1; }
     if (!img.imports[0].by_name) { ret 1; }
     if (!img.imports[0].is_code) { ret 1; }
@@ -3937,6 +3991,78 @@ test "mach.lang.target.of.coff.coff_parse_object:short_import_record" {
     val br: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?rec[0], 39, ?img2);
     if (R.is_err[bool, str](br)) { ret 1; }
     if (img2.import_count != 1) { ret 1; }
+    ret 0;
+}
+
+# short-import NameType values preserve the public/link symbol while deriving the
+# possibly different export name the PE loader must resolve
+test "mach.lang.target.of.coff.coff_parse_object:short_import_name_types" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    # NAME_NOPREFIX: "_Sleep" is referenced publicly but binds export "Sleep".
+    var np: [40]u8;
+    var z: usize = 0;
+    for (z < 40) { np[z] = 0; z = z + 1; }
+    np[2] = 0xFF; np[3] = 0xFF; np[6] = 0x64; np[7] = 0x86;
+    np[12] = 20; np[18] = (IMPORT_OBJECT_NAME_NOPREFIX << 2)::u8;
+    val np_sym: str = "_Sleep";
+    val dll: str = "kernel32.dll";
+    var k: usize = 0;
+    for (k < 6)  { np[20 + k] = np_sym[k]::u8; k = k + 1; }
+    k = 0;
+    for (k < 12) { np[27 + k] = dll[k]::u8; k = k + 1; }
+    var np_img: of.ObjectImage;
+    val np_r: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?np[0], 40, ?np_img);
+    if (R.is_err[bool, str](np_r)) { ret 1; }
+    val np_public: O.Option[str] = intern.lookup(?i, np_img.imports[0].symbol);
+    val np_export: O.Option[str] = intern.lookup(?i, np_img.imports[0].import_name);
+    if (!O.is_some[str](np_public) || !str_equals(O.unwrap[str](np_public), "_Sleep")) { ret 1; }
+    if (!O.is_some[str](np_export) || !str_equals(O.unwrap[str](np_export), "Sleep"))  { ret 1; }
+
+    # NAME_UNDECORATE additionally truncates the stdcall suffix at the first '@'.
+    var ud: [42]u8;
+    z = 0;
+    for (z < 42) { ud[z] = 0; z = z + 1; }
+    ud[2] = 0xFF; ud[3] = 0xFF; ud[6] = 0x64; ud[7] = 0x86;
+    ud[12] = 22; ud[18] = (IMPORT_OBJECT_NAME_UNDECORATE << 2)::u8;
+    val ud_sym: str = "_Sleep@4";
+    k = 0;
+    for (k < 8)  { ud[20 + k] = ud_sym[k]::u8; k = k + 1; }
+    k = 0;
+    for (k < 12) { ud[29 + k] = dll[k]::u8; k = k + 1; }
+    var ud_img: of.ObjectImage;
+    val ud_r: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?ud[0], 42, ?ud_img);
+    if (R.is_err[bool, str](ud_r)) { ret 1; }
+    val ud_public: O.Option[str] = intern.lookup(?i, ud_img.imports[0].symbol);
+    val ud_export: O.Option[str] = intern.lookup(?i, ud_img.imports[0].import_name);
+    if (!O.is_some[str](ud_public) || !str_equals(O.unwrap[str](ud_public), "_Sleep@4")) { ret 1; }
+    if (!O.is_some[str](ud_export) || !str_equals(O.unwrap[str](ud_export), "Sleep"))    { ret 1; }
+
+    # NAME_EXPORTAS carries an explicit third string, as emitted by llvm-dlltool
+    # for an x86-64 `PublicName == ExportName` definition.
+    var ea: [51]u8;
+    z = 0;
+    for (z < 51) { ea[z] = 0; z = z + 1; }
+    ea[2] = 0xFF; ea[3] = 0xFF; ea[6] = 0x64; ea[7] = 0x86;
+    ea[12] = 31; ea[18] = (IMPORT_OBJECT_NAME_EXPORTAS << 2)::u8;
+    val ea_sym: str = "PublicName";
+    val ea_dll: str = "demo.dll";
+    val ea_export_name: str = "ExportName";
+    k = 0;
+    for (k < 10) { ea[20 + k] = ea_sym[k]::u8; k = k + 1; }
+    k = 0;
+    for (k < 8)  { ea[31 + k] = ea_dll[k]::u8; k = k + 1; }
+    k = 0;
+    for (k < 10) { ea[40 + k] = ea_export_name[k]::u8; k = k + 1; }
+    var ea_img: of.ObjectImage;
+    val ea_r: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?ea[0], 51, ?ea_img);
+    if (R.is_err[bool, str](ea_r)) { ret 1; }
+    val ea_public: O.Option[str] = intern.lookup(?i, ea_img.imports[0].symbol);
+    val ea_export: O.Option[str] = intern.lookup(?i, ea_img.imports[0].import_name);
+    if (!O.is_some[str](ea_public) || !str_equals(O.unwrap[str](ea_public), "PublicName")) { ret 1; }
+    if (!O.is_some[str](ea_export) || !str_equals(O.unwrap[str](ea_export), "ExportName")) { ret 1; }
     ret 0;
 }
 
@@ -3971,6 +4097,17 @@ test "mach.lang.target.of.coff.coff_parse_object:malformed_import_record" {
     var img2: of.ObjectImage;
     val r2: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?unterm[0], 24, ?img2);
     if (R.is_ok[bool, str](r2)) { ret 1; }
+
+    # the three reserved NameType values and the high reserved bits are rejected
+    # instead of silently changing the loader binding.
+    unterm[18] = (5 << 2)::u8;
+    var img3: of.ObjectImage;
+    val r3: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?unterm[0], 24, ?img3);
+    if (R.is_ok[bool, str](r3)) { ret 1; }
+    unterm[18] = 0x20;
+    var img4: of.ObjectImage;
+    val r4: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?unterm[0], 24, ?img4);
+    if (R.is_ok[bool, str](r4)) { ret 1; }
     ret 0;
 }
 

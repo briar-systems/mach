@@ -1,19 +1,22 @@
 #!/bin/sh
 # build an import library the way llvm-dlltool would, using coreutils alone so the
 # case needs no LLVM on the leg. each member is a COFF short import record
-# (IMPORT_OBJECT_HEADER): Sig1=0, Sig2=0xFFFF, Version=0 (what separates it from a
-# /bigobj object), Machine=0x8664, then SizeOfData bytes holding the NUL-terminated
-# symbol name followed by the NUL-terminated DLL name. The records cover both
-# by-name and by-ordinal loader bindings.
+# (IMPORT_OBJECT_HEADER): Sig1=0, Sig2=0xFFFF, Version=0, Machine=0x8664, then
+# SizeOfData bytes holding the NUL-terminated public symbol name followed by the
+# NUL-terminated DLL name and, for EXPORTAS, the distinct loader export name. a
+# /bigobj header shares the signature but carries its fixed ClassID. the records
+# cover direct name, explicit export-name, and ordinal loader bindings.
 set -eu
 out=$1
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-# record <file> <symbol> <dll> <hint-or-ordinal> <flags>
+# record <file> <symbol> <dll> <hint-or-ordinal> <flags> [export-name]
 record() {
     f=$1; sym=$2; dll=$3; hint=$4; flags=$5
+    export_name=${6-}
     n=$(( ${#sym} + 1 + ${#dll} + 1 ))
+    if [ -n "$export_name" ]; then n=$(( n + ${#export_name} + 1 )); fi
     # header: sig1, sig2, version, machine(0x8664 LE), timestamp, size(LE u32),
     # ordinal/hint, then type/name-type
     printf '\000\000\377\377\000\000\144\206\000\000\000\000' >"$f"
@@ -23,15 +26,17 @@ record() {
         $(( hint & 255 )) $(( (hint >> 8) & 255 )) \
         $(( flags & 255 )) $(( (flags >> 8) & 255 )))" >>"$f"
     printf '%s\000%s\000' "$sym" "$dll" >>"$f"
+    if [ -n "$export_name" ]; then printf '%s\000' "$export_name" >>"$f"; fi
 }
 
 record "$tmp/a" Sleep       kernel32.dll 0   4  # code, by name
 record "$tmp/b" ExitProcess kernel32.dll 0   4  # code, by name
 record "$tmp/c" MessageBeep user32.dll   123 0  # code, by ordinal
+record "$tmp/d" PublicName  demo.dll     7   16 ExportName # code, EXPORTAS
 
 mkdir -p "$(dirname "$out")"
 printf '!<arch>\n' >"$out"
-for m in a b c; do
+for m in a b c d; do
     sz=$(wc -c <"$tmp/$m")
     # ar member header: 16 name, 12 mtime, 6 uid, 6 gid, 8 mode, 10 size, 2 magic.
     # a fixed mtime/uid/gid keeps the generated archive byte-stable across runs.
