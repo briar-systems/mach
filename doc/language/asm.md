@@ -110,6 +110,44 @@ set becomes **every register in every bank**, and an `#[oblivious]` function may
 contain one at all — which is why a real mnemonic is always preferable where one
 exists.
 
+## Control-and-status registers (riscv64)
+
+The Zicsr extension's six instructions — read-write, read-set and read-clear, each
+taking its source from a register or a five-bit immediate — reach a CSR by name:
+
+```mach
+asm riscv64 {
+    csrrw a0, mstatus, a1   # read mstatus into a0, write a1 into it
+    csrr  a0, mtvec         # csrrs a0, mtvec, x0 - the read-only pseudo
+    csrw  stvec, a1         # csrrw x0, stvec, a1 - install a trap vector
+    rdtime a0               # csrrs a0, time, x0  - the unprivileged counters
+}
+```
+
+The named set covers what freestanding code reaches for — the machine and supervisor
+trap vector / exception-PC / cause registers, the interrupt enable / pending pairs, the
+address-translation root, the hart id an SMP boot path reads to tell cores apart, and
+the three unprivileged counters `rdtime` / `rdcycle` / `rdinstret` name. It is
+deliberately not exhaustive: the privileged spec defines several hundred addresses
+across three privilege levels, so **any** CSR is also reachable by its numeric address,
+exactly as a name resolves to one:
+
+```mach
+asm riscv64 {
+    csrr a0, 0xc01   # the same register as `csrr a0, time`
+}
+```
+
+Unlike aarch64's system registers, RISC-V spells no separate escape syntax for this —
+a CSR operand simply parses as the ordinary integer literal it looks like, bounded to
+the twelve bits a CSR address occupies. `csrrwi` / `csrrsi` / `csrrci` (and their
+`csrwi` / `csrsi` / `csrci` pseudos) take a five-bit unsigned immediate in the same
+position a register would occupy in the non-`i` form.
+
+Access permission is not checked: whether a CSR is readable or writable depends on the
+privilege level the code runs at, which the compiler does not know. Accessing a CSR the
+current level cannot reach traps at run time, as the architecture defines.
+
 ## What the compiler infers
 
 - **Operand direction.** Position within an instruction determines whether
