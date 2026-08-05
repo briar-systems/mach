@@ -17,6 +17,8 @@
 #                 two-level-namespace attribution, which execution cannot check.
 #   pe-exceptions — walks the PE exception directory and verifies the linked
 #                 clang fixture's runtime-function row and foreign UNWIND_INFO.
+#   pe-dllimport — verifies a real Clang `__imp_X` rel32 targets X's IAT slot,
+#                 with one undecorated import shared by a direct X call.
 #   relro       — like field, but walks the ELF program headers for a PT_GNU_RELRO
 #                 (the static-PIE RELRO region). ELF-only; used by the elf-relro guard.
 #   flat-loader — load an os=freestanding, of=raw flat image via a tiny C loader
@@ -238,6 +240,25 @@ pe_rva_to_off() {
     return 1
 }
 
+# pe_off_to_rva <file> <sec_table_off> <nsec> <offset>
+# inverse of pe_rva_to_off for bytes backed by a section's raw-data window.
+pe_off_to_rva() {
+    bin=$1; sec=$2; nsec=$3; off=$4
+    i=0
+    while [ "$i" -lt "$nsec" ]; do
+        base=$((sec + i * 40))
+        vaddr=$(read_le_uint "$bin" $((base + 12)) 4)
+        rsize=$(read_le_uint "$bin" $((base + 16)) 4)
+        praw=$(read_le_uint "$bin" $((base + 20)) 4)
+        if [ "$off" -ge "$praw" ] && [ "$off" -lt $((praw + rsize)) ]; then
+            echo $((vaddr + off - praw))
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
 # produce_pe_imports <runmode> <target> <binary>
 # emit the PE import table's symbol->DLL bindings, one `<dll>:<symbol>` line per
 # imported function, sorted. this is the fact the two-level-namespace attribution
@@ -314,6 +335,71 @@ produce_pe_imports() {
 
     LC_ALL=C sort "$out"
     rm -f "$out"
+}
+
+# produce_pe_dllimport <runmode> <target> <binary>
+# Verify the checked-in qz.o's IMAGE_REL_AMD64_REL32 against `__imp_Sleep` was
+# normalized to Sleep and patched directly to its IAT cell. qz_indirect starts
+# with a stable eight-byte signature; its four-byte displacement immediately
+# follows, so S = P + 4 + disp proves the recovered COFF -4 addend as well as the
+# target. The Mach module also calls Sleep directly, and an IAT size of two thunks
+# (one binding + one descriptor terminator) proves both spellings deduplicated.
+produce_pe_dllimport() {
+    bin=$3
+    elfanew=$(read_le_uint "$bin" 60 4)
+    nsec=$(read_le_uint "$bin" $((elfanew + 6)) 2)
+    optsize=$(read_le_uint "$bin" $((elfanew + 20)) 2)
+    sec=$((elfanew + 24 + optsize))
+    magic=$(read_le_uint "$bin" $((elfanew + 24)) 2)
+    if [ "$magic" != "523" ]; then
+        echo "int: pe-dllimport: not a PE32+ image (optional-header magic $magic)" >&2
+        return 2
+    fi
+
+    imports=$(produce_pe_imports "$@") || return $?
+    if [ "$imports" != "kernel32.dll:Sleep" ]; then
+        echo "int: pe-dllimport: imports are '$imports', want kernel32.dll:Sleep" >&2
+        return 2
+    fi
+
+    iat_dir=$((elfanew + 24 + 112 + 12 * 8))
+    iat_rva=$(read_le_uint "$bin" "$iat_dir" 4)
+    iat_size=$(read_le_uint "$bin" $((iat_dir + 4)) 4)
+    if [ "$iat_rva" -eq 0 ] || [ "$iat_size" -ne 16 ]; then
+        echo "int: pe-dllimport: IAT is RVA=$iat_rva size=$iat_size, want one entry" >&2
+        return 2
+    fi
+
+    qz_off=$(od -An -v -tx1 "$bin" | awk '
+        {
+            for (i = 1; i <= NF; i++) {
+                tail = tail $i
+                if (length(tail) > 16) tail = substr(tail, length(tail) - 15)
+                if (tail == "b90700000048ff25") { count++; found = n - 7 }
+                n++
+            }
+        }
+        END { if (count == 1) print found; else exit 1 }
+    ') || {
+        echo "int: pe-dllimport: qz_indirect signature is not unique" >&2
+        return 2
+    }
+    patch_off=$((qz_off + 8))
+    patch_rva=$(pe_off_to_rva "$bin" "$sec" "$nsec" "$patch_off") || {
+        echo "int: pe-dllimport: qz_indirect rel32 is in no PE section" >&2
+        return 2
+    }
+    disp=$(read_le_uint "$bin" "$patch_off" 4)
+    [ "$disp" -ge 2147483648 ] && disp=$((disp - 4294967296))
+    target_rva=$((patch_rva + 4 + disp))
+    if [ "$target_rva" -ne "$iat_rva" ]; then
+        echo "int: pe-dllimport: qz_indirect targets RVA=$target_rva, IAT=$iat_rva" >&2
+        return 2
+    fi
+
+    echo "$imports"
+    echo "iat_entries=1"
+    echo "foreign_indirect_target=iat"
 }
 
 # produce_pe_exceptions <runmode> <target> <binary>
@@ -874,6 +960,7 @@ produce() {
         field)       produce_field "$@" ;;
         pe-imports)  produce_pe_imports "$@" ;;
         pe-exceptions) produce_pe_exceptions "$@" ;;
+        pe-dllimport) produce_pe_dllimport "$@" ;;
         relro)       produce_relro "$@" ;;
         flat-loader) produce_flat_loader "$@" ;;
         built)       produce_built "$@" ;;
