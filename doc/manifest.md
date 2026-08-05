@@ -468,7 +468,7 @@ On ELF the key is accepted and validated but changes no emitted bytes, since tha
 loader resolves imports by global search.
 
 Whether an input links **statically** or **dynamically** follows the resolved file
-— a loose `.o` or static `.a` links statically; ELF `.so`, Mach-O `.dylib`,
+— a loose `.o`/`.obj` or static `.a`/`.lib` links statically; ELF `.so`, Mach-O `.dylib`,
 and PE `.dll` inputs are recorded using their format's canonical loader name.
 An `@rpath/` Mach-O install name also retains the directory where resolution found
 the dylib, which the executable records as `LC_RPATH`. Darwin frameworks use a
