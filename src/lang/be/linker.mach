@@ -127,6 +127,9 @@ rec SymbolLoc {
     fallback: intern.StrId;
 }
 
+# the DWARF dead-code address used for a discarded weak function's address fields
+val DWARF_TOMBSTONE_ADDRESS: u64 = 0xFFFFFFFFFFFFFFFF;
+
 # one losing weak function's byte interval in a flat input section. final-image
 # links remove [start,end); resume is the compressed offset at which the first
 # surviving byte after the interval lands
@@ -3399,6 +3402,23 @@ fun local_symbol_vaddr(modules: *of.ObjectImage, m: u32, sy: u32, placements: *P
     ret true;
 }
 
+# whether module m's own weak function definition named name was atom-dropped
+fun module_weak_function_is_dead(modules: *of.ObjectImage, m: u32, name: intern.StrId,
+                                 sec_base: *u32, atoms: *AtomPlan) bool {
+    var sy: u32 = 0;
+    for (sy < modules[m].symbol_count) {
+        val sym: *of.Symbol = ?modules[m].symbols[sy];
+        if (sym.name == name && sym.section != of.SECTION_EXTERNAL
+            && sym.section < modules[m].section_count) {
+            val need: u32 = of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
+            if ((sym.flags & need) != need) { ret false; }
+            ret atom_offset_dead(atoms, sec_base[m] + sym.section, sym.offset);
+        }
+        sy = sy + 1;
+    }
+    ret false;
+}
+
 # apply every relocation in module `m` into the merged
 # bytes. a LOCAL target resolves directly from module `m`'s own symbol array;
 # a GLOBAL target (or an undefined extern) resolves by name through `sym_locs`, and
@@ -3434,6 +3454,31 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         var scx: u32 = 0;
         for (scx < modules[m].section_count) {
             if (modules[m].sections[scx].kind == of.SK_DEBUG && modules[m].sections[scx].name == strm.name) { str_sec = scx; }
+            scx = scx + 1;
+        }
+    }
+    # compiler-produced .debug_info and .debug_rnglists use ABS64 symbol relocations
+    # for code addresses. identify them independently of .debug_str merging so a
+    # losing weak function can use DWARF's dead-code sentinel (#2384).
+    var info_sec: u32 = 0xFFFFFFFF;
+    var rnglists_sec: u32 = 0xFFFFFFFF;
+    if (codegen_image) {
+        val info_name_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, ".debug_info");
+        if (R.is_err[intern.StrId, str](info_name_r)) {
+            ret R.err[bool, str](R.unwrap_err[intern.StrId, str](info_name_r));
+        }
+        val rnglists_name_r: R.Result[intern.StrId, str] = intern.intern(?s.interner, ".debug_rnglists");
+        if (R.is_err[intern.StrId, str](rnglists_name_r)) {
+            ret R.err[bool, str](R.unwrap_err[intern.StrId, str](rnglists_name_r));
+        }
+        val info_name: intern.StrId = R.unwrap_ok[intern.StrId, str](info_name_r);
+        val rnglists_name: intern.StrId = R.unwrap_ok[intern.StrId, str](rnglists_name_r);
+        var scx: u32 = 0;
+        for (scx < modules[m].section_count) {
+            if (modules[m].sections[scx].kind == of.SK_DEBUG) {
+                if (modules[m].sections[scx].name == info_name)            { info_sec = scx; }
+                or (modules[m].sections[scx].name == rnglists_name) { rnglists_sec = scx; }
+            }
             scx = scx + 1;
         }
     }
@@ -3522,6 +3567,11 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                 map.get[intern.StrId, SymbolLoc](sym_locs, ?resolved_name);
             if (R.is_ok[*SymbolLoc, str](sl)) {
                 sym_va = R.unwrap_ok[*SymbolLoc, str](sl).vaddr;
+                if ((r.section == info_sec || r.section == rnglists_sec)
+                    && r.kind == of.RK_ABS64 && r.addend == 0
+                    && module_weak_function_is_dead(modules, m, target_name, sec_base, atoms)) {
+                    sym_va = DWARF_TOMBSTONE_ADDRESS;
+                }
             }
             or {
                 # not defined anywhere: a dynamic import, or a hard error. a
@@ -6589,6 +6639,8 @@ test "mach.lang.be.linker.atom_plan:resolution_and_inert_gate" {
     if (R.is_err[bool, str](ww) || !plan.active || plan.drop_count != 1) { ret 1; }
     if (plan.drops[0].section != 1 || plan.drops[0].start != 0
         || plan.drops[0].end != 8 || plan.removed_bytes != 8) { ret 1; }
+    if (module_weak_function_is_dead(?mods[0], 0, dup, ?bases[0], ?plan)
+        || !module_weak_function_is_dead(?mods[0], 1, dup, ?bases[0], ?plan)) { ret 1; }
     free_atom_plan(?alloc, ?plan);
 
     # a later strong replaces and discards the earlier weak winner.
@@ -6596,6 +6648,10 @@ test "mach.lang.be.linker.atom_plan:resolution_and_inert_gate" {
     val ws: R.Result[bool, str] =
         build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
     if (R.is_err[bool, str](ws) || !plan.active || plan.drops[0].section != 0) { ret 1; }
+    # the global winner is strong here, but the defining module's own weak flag
+    # still identifies the discarded copy whose debug low_pc must be tombstoned.
+    if (!module_weak_function_is_dead(?mods[0], 0, dup, ?bases[0], ?plan)
+        || module_weak_function_is_dead(?mods[0], 1, dup, ?bases[0], ?plan)) { ret 1; }
     free_atom_plan(?alloc, ?plan);
 
     # a strong seen first remains the winner and the later weak is discarded.
@@ -6604,6 +6660,8 @@ test "mach.lang.be.linker.atom_plan:resolution_and_inert_gate" {
     val sw: R.Result[bool, str] =
         build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
     if (R.is_err[bool, str](sw) || !plan.active || plan.drops[0].section != 1) { ret 1; }
+    if (module_weak_function_is_dead(?mods[0], 0, dup, ?bases[0], ?plan)
+        || !module_weak_function_is_dead(?mods[0], 1, dup, ?bases[0], ?plan)) { ret 1; }
     free_atom_plan(?alloc, ?plan);
 
     # two strong definitions remain a hard error.
