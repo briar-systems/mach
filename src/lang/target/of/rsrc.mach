@@ -1,0 +1,1193 @@
+# PE `.rsrc` resource-blob builder
+#
+# `build` parses a Windows ICO container and packages it, a generated
+# VS_VERSIONINFO block, and an optional caller-supplied manifest into a sorted
+# leaf list; `size` / `emit` lay that list out as the three-level
+# (type/name/lang) resource directory tree a PE loader walks. Both share one
+# layout pass (`walk`) so they cannot disagree on a byte.
+#
+# The one invariant worth remembering throughout: every `IMAGE_RESOURCE_
+# DIRECTORY_ENTRY.OffsetToData` (at all three directory levels) is relative to
+# the start of the `.rsrc` section, but the `OffsetToData` inside the leaf
+# `IMAGE_RESOURCE_DATA_ENTRY` is an absolute image RVA (`base_rva` plus the
+# section-relative payload offset) - the one asymmetry the format has.
+
+use std.allocator.page;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.char.char;
+use std.types.char.char_is_digit;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use R: std.types.result;
+
+use mach.lang.target.of.bin;
+
+# resource type IDs (RT_*)
+pub val RT_ICON:       u32 = 3;
+pub val RT_GROUP_ICON: u32 = 14;
+pub val RT_VERSION:    u32 = 16;
+pub val RT_MANIFEST:   u32 = 24;
+
+# fixed on-disk structure sizes for the resource directory tree
+val DIR_HEADER_SIZE:  usize = 16; # IMAGE_RESOURCE_DIRECTORY
+val DIR_ENTRY_SIZE:   usize = 8;  # IMAGE_RESOURCE_DIRECTORY_ENTRY
+val DATA_ENTRY_SIZE:  usize = 16; # IMAGE_RESOURCE_DATA_ENTRY
+
+# marks a directory entry's OffsetToData as pointing at a child directory
+# rather than an IMAGE_RESOURCE_DATA_ENTRY
+val SUBDIR_FLAG: u32 = 0x80000000;
+
+val ICONDIR_SIZE:         usize = 6;
+val ICONDIRENTRY_SIZE:    usize = 16;
+val GRPICONDIRENTRY_SIZE: usize = 14;
+
+# one resource leaf: its three-level coordinate and its payload bytes
+pub rec ResEntry {
+    type_id: u32;
+    name_id: u32;
+    lang_id: u32;
+    bytes:   *u8;
+    len:     usize;
+}
+
+# a built resource image: the sorted leaf list plus the buffers `build` generated
+pub rec RsrcImage {
+    entries:     *ResEntry;
+    entry_count: u32;
+    group_icon:     *u8;
+    group_icon_len: usize;
+    version:        *u8;
+    version_len:    usize;
+}
+
+# a heap buffer and its length, the shape `build_group_icon` / `build_version` hand back
+rec Bytes {
+    bytes: *u8;
+    len:   usize;
+}
+
+# a manifest version string's leading four dot-separated numeric components
+rec ParsedVersion {
+    major: u16;
+    minor: u16;
+    patch: u16;
+    build: u16;
+}
+
+rec Utf8Rune {
+    value: u32;
+    width: usize;
+}
+
+# the distinct type_id groups and (type_id, name_id) groups in a sorted entries array
+rec GroupCounts {
+    n_types: u32;
+    n_names: u32;
+}
+
+# parse up to four leading dot-separated decimal components of a manifest
+# version string ("4.5.0") into (major, minor, patch, build). stops at the
+# first character that is neither a digit nor '.'; a missing, empty, or
+# non-numeric component is 0. A numeric component larger than the 16-bit
+# VS_FIXEDFILEINFO field is rejected instead of truncated.
+# ---
+# version: the manifest version string (may be nil)
+# ret:     the parsed components, all zero for nil or non-numeric input
+fun parse_version(version: str) R.Result[ParsedVersion, str] {
+    var v: ParsedVersion;
+    v.major = 0; v.minor = 0; v.patch = 0; v.build = 0;
+    if (version == nil) { ret R.ok[ParsedVersion, str](v); }
+
+    var comps: [4]u16;
+    comps[0] = 0; comps[1] = 0; comps[2] = 0; comps[3] = 0;
+
+    val len: usize = str_len(version);
+    var idx: usize = 0;
+    var cur: u32 = 0;
+    var i: usize = 0;
+    for (i < len && idx < 4) {
+        val c: char = version[i];
+        if (char_is_digit(c)) {
+            val digit: u32 = (c - '0')::u32;
+            if (cur > 6553 || (cur == 6553 && digit > 5)) {
+                ret R.err[ParsedVersion, str]("rsrc: version component exceeds 65535");
+            }
+            cur = cur * 10 + digit;
+            i = i + 1;
+            cnt;
+        }
+        if (c == '.') {
+            comps[idx] = cur::u16;
+            idx = idx + 1;
+            cur = 0;
+            i = i + 1;
+            cnt;
+        }
+        brk;
+    }
+    if (idx < 4) { comps[idx] = cur::u16; }
+
+    v.major = comps[0]; v.minor = comps[1]; v.patch = comps[2]; v.build = comps[3];
+    ret R.ok[ParsedVersion, str](v);
+}
+
+# decode one strict UTF-8 scalar, rejecting truncated, overlong, surrogate, and
+# out-of-range encodings
+fun decode_utf8(s: str, off: usize) R.Result[Utf8Rune, str] {
+    val len: usize = str_len(s);
+    if (off >= len) { ret R.err[Utf8Rune, str]("rsrc: truncated UTF-8 metadata"); }
+    val b0: u32 = s[off]::u32;
+    var r: Utf8Rune;
+    if (b0 <= 0x7F) { r.value = b0; r.width = 1; ret R.ok[Utf8Rune, str](r); }
+
+    var need: usize = 0;
+    var cp: u32 = 0;
+    var min: u32 = 0;
+    if (b0 >= 0xC2 && b0 <= 0xDF) { need = 1; cp = b0 & 0x1F; min = 0x80; }
+    or (b0 >= 0xE0 && b0 <= 0xEF) { need = 2; cp = b0 & 0x0F; min = 0x800; }
+    or (b0 >= 0xF0 && b0 <= 0xF4) { need = 3; cp = b0 & 0x07; min = 0x10000; }
+    or { ret R.err[Utf8Rune, str]("rsrc: invalid UTF-8 metadata"); }
+
+    if (need > len - off - 1) { ret R.err[Utf8Rune, str]("rsrc: truncated UTF-8 metadata"); }
+    var i: usize = 1;
+    for (i <= need) {
+        val bx: u32 = s[off + i]::u32;
+        if (bx < 0x80 || bx > 0xBF) { ret R.err[Utf8Rune, str]("rsrc: invalid UTF-8 metadata"); }
+        cp = (cp << 6) | (bx & 0x3F);
+        i = i + 1;
+    }
+    if (cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+        ret R.err[Utf8Rune, str]("rsrc: invalid UTF-8 metadata");
+    }
+    r.value = cp;
+    r.width = need + 1;
+    ret R.ok[Utf8Rune, str](r);
+}
+
+# count UTF-16 code units including the terminator, validating UTF-8 and the
+# 16-bit wValueLength field used by version string nodes
+fun utf16_units(s: str) R.Result[usize, str] {
+    if (s == nil) { ret R.err[usize, str]("rsrc: nil version metadata"); }
+    val len: usize = str_len(s);
+    var off: usize = 0;
+    var units: usize = 1;
+    for (off < len) {
+        val rr: R.Result[Utf8Rune, str] = decode_utf8(s, off);
+        if (R.is_err[Utf8Rune, str](rr)) { ret R.err[usize, str](R.unwrap_err[Utf8Rune, str](rr)); }
+        val rune: Utf8Rune = R.unwrap_ok[Utf8Rune, str](rr);
+        val add: usize = 1 + (rune.value > 0xFFFF)::usize;
+        if (units > 65535 - add) { ret R.err[usize, str]("rsrc: UTF-16 metadata exceeds 65535 code units"); }
+        units = units + add;
+        off = off + rune.width;
+    }
+    ret R.ok[usize, str](units);
+}
+
+# validate an ICONDIR + ICONDIRENTRY[] container without dereferencing anything
+# out of bounds
+# ---
+# icon:     the ICO container bytes
+# icon_len: length of icon
+# ret:      the image count on success, or a "rsrc: " prefixed diagnostic
+fun validate_ico(icon: *u8, icon_len: usize) R.Result[u16, str] {
+    if (!bin.region_ok(icon_len, 0, ICONDIR_SIZE)) {
+        ret R.err[u16, str]("rsrc: icon buffer too small for header");
+    }
+    val reserved: u16 = bin.read_u16_le(icon, 0);
+    val itype:    u16 = bin.read_u16_le(icon, 2);
+    val count:    u16 = bin.read_u16_le(icon, 4);
+    if (reserved != 0) { ret R.err[u16, str]("rsrc: icon reserved field must be 0"); }
+    if (itype != 1)    { ret R.err[u16, str]("rsrc: icon type field must be 1"); }
+    if (count == 0)    { ret R.err[u16, str]("rsrc: icon directory is empty"); }
+
+    val dir_len: usize = count::usize * ICONDIRENTRY_SIZE;
+    if (!bin.region_ok(icon_len, ICONDIR_SIZE, dir_len)) {
+        ret R.err[u16, str]("rsrc: icon directory runs past end of buffer");
+    }
+
+    val payload_floor: usize = ICONDIR_SIZE + dir_len;
+    var i: u32 = 0;
+    for (i < count::u32) {
+        val ent_off:       usize = ICONDIR_SIZE + i::usize * ICONDIRENTRY_SIZE;
+        val bytes_in_res:  u32   = bin.read_u32_le(icon, ent_off + 8);
+        val image_offset:  u32   = bin.read_u32_le(icon, ent_off + 12);
+        if (bytes_in_res == 0) {
+            ret R.err[u16, str]("rsrc: icon image data is empty");
+        }
+        if (image_offset::usize < payload_floor) {
+            ret R.err[u16, str]("rsrc: icon image data overlaps its directory");
+        }
+        if (!bin.region_ok(icon_len, image_offset::usize, bytes_in_res::usize)) {
+            ret R.err[u16, str]("rsrc: icon image data runs past end of buffer");
+        }
+        i = i + 1;
+    }
+
+    ret R.ok[u16, str](count);
+}
+
+# generate a GRPICONDIR + GRPICONDIRENTRY[] payload from a validated ICO's
+# per-image metadata
+# ---
+# alloc: allocator for the generated buffer
+# icon:  the validated ICO container bytes
+# count: image count, as returned by validate_ico
+# ret:   the generated buffer and its length, or an allocation error
+fun build_group_icon(alloc: *A.Allocator, icon: *u8, count: u16) R.Result[Bytes, str] {
+    val len: usize = ICONDIR_SIZE + count::usize * GRPICONDIRENTRY_SIZE;
+    val res: R.Result[*u8, str] = A.zallocate[u8](alloc, len);
+    if (R.is_err[*u8, str](res)) { ret R.err[Bytes, str](R.unwrap_err[*u8, str](res)); }
+    val buf: *u8 = R.unwrap_ok[*u8, str](res);
+
+    bin.write_u16_le(buf, 0, 0);     # reserved
+    bin.write_u16_le(buf, 2, 1);     # type
+    bin.write_u16_le(buf, 4, count);
+
+    var i: u32 = 0;
+    for (i < count::u32) {
+        val src_off: usize = ICONDIR_SIZE + i::usize * ICONDIRENTRY_SIZE;
+        val dst_off: usize = ICONDIR_SIZE + i::usize * GRPICONDIRENTRY_SIZE;
+        buf[dst_off]     = icon[src_off];     # width
+        buf[dst_off + 1] = icon[src_off + 1]; # height
+        buf[dst_off + 2] = icon[src_off + 2]; # color_count
+        buf[dst_off + 3] = icon[src_off + 3]; # reserved
+        bin.write_u16_le(buf, dst_off + 4,  bin.read_u16_le(icon, src_off + 4)); # planes
+        bin.write_u16_le(buf, dst_off + 6,  bin.read_u16_le(icon, src_off + 6)); # bit_count
+        bin.write_u32_le(buf, dst_off + 8,  bin.read_u32_le(icon, src_off + 8)); # bytes_in_res
+        bin.write_u16_le(buf, dst_off + 12, (i + 1)::u16);                       # id
+        i = i + 1;
+    }
+
+    var out: Bytes;
+    out.bytes = buf;
+    out.len   = len;
+    ret R.ok[Bytes, str](out);
+}
+
+# UTF-16LE byte length of a string already validated by utf16_units
+fun wide_len(s: str) usize {
+    val ur: R.Result[usize, str] = utf16_units(s);
+    if (R.is_err[usize, str](ur)) { ret 0; }
+    ret R.unwrap_ok[usize, str](ur) * 2;
+}
+
+# write a validated UTF-8 string as UTF-16LE with a NUL terminator
+fun write_wide(buf: *u8, off: usize, s: str) usize {
+    val len: usize = str_len(s);
+    var src: usize = 0;
+    var units: usize = 0;
+    for (src < len) {
+        val rr: R.Result[Utf8Rune, str] = decode_utf8(s, src);
+        if (R.is_err[Utf8Rune, str](rr)) { ret 0; }
+        val rune: Utf8Rune = R.unwrap_ok[Utf8Rune, str](rr);
+        if (rune.value <= 0xFFFF) {
+            bin.write_u16_le(buf, off + units * 2, rune.value::u16);
+            units = units + 1;
+        }
+        or {
+            val cp: u32 = rune.value - 0x10000;
+            bin.write_u16_le(buf, off + units * 2, (0xD800 | (cp >> 10))::u16);
+            bin.write_u16_le(buf, off + (units + 1) * 2, (0xDC00 | (cp & 0x3FF))::u16);
+            units = units + 2;
+        }
+        src = src + rune.width;
+    }
+    bin.write_u16_le(buf, off + units * 2, 0);
+    ret (units + 1) * 2;
+}
+
+# a childless VS_VERSIONINFO node's own content length: header + widened key
+# (padded to 4) + value, not yet padded for any children
+fun node_own_len(key: str, value_len: usize) usize {
+    val after_key: usize = bin.align_up(6 + wide_len(key), 4);
+    ret after_key + value_len;
+}
+
+# the size of a back-to-back run of children, each individually 4-byte
+# aligned relative to the block start, with no trailing padding after the
+# last one - mirrors a node's own wLength excluding its trailing pad
+fun children_block_len(lens: *usize, count: usize) usize {
+    var total: usize = 0;
+    var i: usize = 0;
+    for (i < count) {
+        if (i > 0) { total = bin.align_up(total, 4); }
+        total = total + lens[i];
+        i = i + 1;
+    }
+    ret total;
+}
+
+# write a VS_VERSIONINFO node's wLength/wValueLength/wType header and widened
+# key; returns the (4-byte-aligned) offset where its value begins
+fun write_node_head(buf: *u8, off: usize, w_length: usize, w_value_length: usize,
+                     w_type: u16, key: str) usize {
+    bin.write_u16_le(buf, off,     w_length::u16);
+    bin.write_u16_le(buf, off + 2, w_value_length::u16);
+    bin.write_u16_le(buf, off + 4, w_type);
+    val key_len: usize = write_wide(buf, off + 6, key);
+    ret bin.align_up(off + 6 + key_len, 4);
+}
+
+# write the 13-u32 VS_FIXEDFILEINFO value at buf[off..off+52]
+fun write_fixedfileinfo(buf: *u8, off: usize, v: ParsedVersion) {
+    val vms: u32 = (v.major::u32 << 16) | v.minor::u32;
+    val vls: u32 = (v.patch::u32 << 16) | v.build::u32;
+    bin.write_u32_le(buf, off,      0xFEEF04BD); # dwSignature
+    bin.write_u32_le(buf, off + 4,  0x00010000); # dwStrucVersion
+    bin.write_u32_le(buf, off + 8,  vms);        # dwFileVersionMS
+    bin.write_u32_le(buf, off + 12, vls);        # dwFileVersionLS
+    bin.write_u32_le(buf, off + 16, vms);        # dwProductVersionMS
+    bin.write_u32_le(buf, off + 20, vls);        # dwProductVersionLS
+    bin.write_u32_le(buf, off + 24, 0x3F);       # dwFileFlagsMask
+    bin.write_u32_le(buf, off + 28, 0);          # dwFileFlags
+    bin.write_u32_le(buf, off + 32, 0x00040004); # dwFileOS (VOS_NT_WINDOWS32)
+    bin.write_u32_le(buf, off + 36, 1);          # dwFileType (VFT_APP)
+    bin.write_u32_le(buf, off + 40, 0);          # dwFileSubtype
+    bin.write_u32_le(buf, off + 44, 0);          # dwFileDateMS
+    bin.write_u32_le(buf, off + 48, 0);          # dwFileDateLS
+}
+
+# generate a VS_VERSIONINFO payload: VS_FIXEDFILEINFO, a StringFileInfo /
+# StringTable("040904B0") with five String children, and a VarFileInfo / Var
+# translation pair
+# ---
+# alloc:   allocator for the generated buffer
+# version: manifest version string ("4.5.0"), used verbatim for the
+#          FileVersion/ProductVersion strings and parsed for VS_FIXEDFILEINFO
+# product: product name, used for InternalName/OriginalFilename/ProductName
+# ret:     the generated buffer and its length, or an allocation error
+fun build_version(alloc: *A.Allocator, version: str, internal_name: str,
+                  original_filename: str, product_name: str) R.Result[Bytes, str] {
+    val pvr: R.Result[ParsedVersion, str] = parse_version(version);
+    if (R.is_err[ParsedVersion, str](pvr)) { ret R.err[Bytes, str](R.unwrap_err[ParsedVersion, str](pvr)); }
+    val parsed: ParsedVersion = R.unwrap_ok[ParsedVersion, str](pvr);
+
+    var str_keys: [5]str;
+    var str_vals: [5]str;
+    str_keys[0] = "FileVersion";      str_vals[0] = version;
+    str_keys[1] = "InternalName";     str_vals[1] = internal_name;
+    str_keys[2] = "OriginalFilename"; str_vals[2] = original_filename;
+    str_keys[3] = "ProductName";      str_vals[3] = product_name;
+    str_keys[4] = "ProductVersion";   str_vals[4] = version;
+
+    var str_val_lens: [5]usize; # each String's value, widened + NUL, in bytes
+    var str_lens:     [5]usize; # each String node's own wLength (leaf: no children)
+    var i: usize = 0;
+    for (i < 5) {
+        val ur: R.Result[usize, str] = utf16_units(str_vals[i]);
+        if (R.is_err[usize, str](ur)) { ret R.err[Bytes, str](R.unwrap_err[usize, str](ur)); }
+        str_val_lens[i] = R.unwrap_ok[usize, str](ur) * 2;
+        str_lens[i]     = node_own_len(str_keys[i], str_val_lens[i]);
+        if (str_lens[i] > 65535) { ret R.err[Bytes, str]("rsrc: version string node exceeds 65535 bytes"); }
+        i = i + 1;
+    }
+
+    val langcp_key: str = "040904B0";
+    val stringtable_own_len:      usize = node_own_len(langcp_key, 0);
+    val stringtable_children_len: usize = children_block_len(?str_lens[0], 5);
+    val stringtable_len:          usize = bin.align_up(stringtable_own_len, 4) + stringtable_children_len;
+
+    val stringfileinfo_own_len: usize = node_own_len("StringFileInfo", 0);
+    var stringtable_lens: [1]usize;
+    stringtable_lens[0] = stringtable_len;
+    val stringfileinfo_children_len: usize = children_block_len(?stringtable_lens[0], 1);
+    val stringfileinfo_len: usize = bin.align_up(stringfileinfo_own_len, 4) + stringfileinfo_children_len;
+
+    val var_len: usize = node_own_len("Translation", 4); # leaf, no children
+
+    val varfileinfo_own_len: usize = node_own_len("VarFileInfo", 0);
+    var var_lens: [1]usize;
+    var_lens[0] = var_len;
+    val varfileinfo_children_len: usize = children_block_len(?var_lens[0], 1);
+    val varfileinfo_len: usize = bin.align_up(varfileinfo_own_len, 4) + varfileinfo_children_len;
+
+    val root_own_len: usize = node_own_len("VS_VERSION_INFO", 52);
+    var root_lens: [2]usize;
+    root_lens[0] = stringfileinfo_len;
+    root_lens[1] = varfileinfo_len;
+    val root_children_len: usize = children_block_len(?root_lens[0], 2);
+    val total_len: usize = bin.align_up(root_own_len, 4) + root_children_len;
+    if (stringtable_len > 65535 || stringfileinfo_len > 65535
+        || var_len > 65535 || varfileinfo_len > 65535 || total_len > 65535) {
+        ret R.err[Bytes, str]("rsrc: version information exceeds 65535 bytes");
+    }
+
+    val res: R.Result[*u8, str] = A.zallocate[u8](alloc, total_len);
+    if (R.is_err[*u8, str](res)) { ret R.err[Bytes, str](R.unwrap_err[*u8, str](res)); }
+    val buf: *u8 = R.unwrap_ok[*u8, str](res);
+
+    val root_value_off: usize = write_node_head(buf, 0, total_len, 52, 0, "VS_VERSION_INFO");
+    write_fixedfileinfo(buf, root_value_off, parsed);
+    val root_children_off: usize = bin.align_up(root_value_off + 52, 4);
+
+    val sfi_off: usize = root_children_off;
+    val sfi_value_off: usize = write_node_head(buf, sfi_off, stringfileinfo_len, 0, 1, "StringFileInfo");
+    val st_off: usize = bin.align_up(sfi_value_off, 4);
+    val st_value_off: usize = write_node_head(buf, st_off, stringtable_len, 0, 1, langcp_key);
+
+    var cursor: usize = bin.align_up(st_value_off, 4);
+    i = 0;
+    for (i < 5) {
+        # wValueLength for a String node is the value's UTF-16 CHARACTER count
+        # including the NUL terminator, not a byte count - the classic mistake
+        # this structure invites.
+        val chars: usize = str_val_lens[i] / 2;
+        val value_off: usize = write_node_head(buf, cursor, str_lens[i], chars, 1, str_keys[i]);
+        write_wide(buf, value_off, str_vals[i]);
+        cursor = cursor + str_lens[i];
+        if (i < 4) { cursor = bin.align_up(cursor, 4); }
+        i = i + 1;
+    }
+
+    val vfi_off: usize = bin.align_up(sfi_off + stringfileinfo_len, 4);
+    val vfi_value_off: usize = write_node_head(buf, vfi_off, varfileinfo_len, 0, 1, "VarFileInfo");
+    val var_off: usize = bin.align_up(vfi_value_off, 4);
+    val var_value_off: usize = write_node_head(buf, var_off, var_len, 4, 0, "Translation");
+    bin.write_u32_le(buf, var_value_off, 0x04B00409); # Translation: langid 0x0409, codepage 0x04B0
+
+    var out: Bytes;
+    out.bytes = buf;
+    out.len   = total_len;
+    ret R.ok[Bytes, str](out);
+}
+
+# build the sorted leaf list and generated payloads for a `.rsrc` section
+# ---
+# alloc:        allocator that owns the returned image's entries/group_icon/version
+# icon:         an ICO container's bytes, or nil to omit RT_ICON/RT_GROUP_ICON
+# icon_len:     length of icon
+# manifest:     an application manifest's bytes, or nil to omit RT_MANIFEST
+# manifest_len: length of manifest
+# version:      manifest version string ("4.5.0") for VS_VERSIONINFO
+# internal_name: artifact identity for InternalName
+# original_filename: resolved output basename for OriginalFilename
+# product_name: artifact identity for ProductName
+# ret:          the built image, or a "rsrc: " prefixed diagnostic
+pub fun build(alloc: *A.Allocator, icon: *u8, icon_len: usize, manifest: *u8, manifest_len: usize,
+              version: str, internal_name: str, original_filename: str,
+              product_name: str) R.Result[RsrcImage, str] {
+    if (icon == nil && icon_len != 0) { ret R.err[RsrcImage, str]("rsrc: nil icon has non-zero length"); }
+    if (manifest == nil && manifest_len != 0) { ret R.err[RsrcImage, str]("rsrc: nil manifest has non-zero length"); }
+    if (manifest != nil && manifest_len == 0) { ret R.err[RsrcImage, str]("rsrc: application manifest is empty"); }
+    if (manifest_len > 0xFFFFFFFF::usize) { ret R.err[RsrcImage, str]("rsrc: application manifest exceeds PE's 32-bit size field"); }
+    val has_icon: bool = icon != nil;
+    var icon_count: u16 = 0;
+    if (has_icon) {
+        val vr: R.Result[u16, str] = validate_ico(icon, icon_len);
+        if (R.is_err[u16, str](vr)) { ret R.err[RsrcImage, str](R.unwrap_err[u16, str](vr)); }
+        icon_count = R.unwrap_ok[u16, str](vr);
+    }
+    val has_manifest: bool = manifest != nil;
+
+    var entry_count: u32 = 1; # RT_VERSION is always present
+    if (has_icon)     { entry_count = entry_count + icon_count::u32 + 1; } # icons + group icon
+    if (has_manifest) { entry_count = entry_count + 1; }
+
+    val res_entries: R.Result[*ResEntry, str] = A.zallocate[ResEntry](alloc, entry_count::usize);
+    if (R.is_err[*ResEntry, str](res_entries)) {
+        ret R.err[RsrcImage, str](R.unwrap_err[*ResEntry, str](res_entries));
+    }
+    val entries: *ResEntry = R.unwrap_ok[*ResEntry, str](res_entries);
+
+    var group_icon:     *u8   = nil;
+    var group_icon_len: usize = 0;
+    var idx: u32 = 0;
+
+    # leaves come out in (type_id, name_id, lang_id) ascending order by
+    # construction: RT_ICON(3) < RT_GROUP_ICON(14) < RT_VERSION(16) <
+    # RT_MANIFEST(24), and icon name_ids already ascend 1..count
+    if (has_icon) {
+        var i: u32 = 0;
+        for (i < icon_count::u32) {
+            val ent_off: usize = ICONDIR_SIZE + i::usize * ICONDIRENTRY_SIZE;
+            entries[idx].type_id = RT_ICON;
+            entries[idx].name_id = i + 1;
+            entries[idx].lang_id = 0;
+            entries[idx].bytes   = (icon::usize + bin.read_u32_le(icon, ent_off + 12)::usize)::*u8;
+            entries[idx].len     = bin.read_u32_le(icon, ent_off + 8)::usize;
+            idx = idx + 1;
+            i = i + 1;
+        }
+
+        val gi_r: R.Result[Bytes, str] = build_group_icon(alloc, icon, icon_count);
+        if (R.is_err[Bytes, str](gi_r)) {
+            A.deallocate[ResEntry](alloc, entries, entry_count::usize);
+            ret R.err[RsrcImage, str](R.unwrap_err[Bytes, str](gi_r));
+        }
+        val gi: Bytes = R.unwrap_ok[Bytes, str](gi_r);
+        group_icon     = gi.bytes;
+        group_icon_len = gi.len;
+
+        entries[idx].type_id = RT_GROUP_ICON;
+        entries[idx].name_id = 1;
+        entries[idx].lang_id = 0;
+        entries[idx].bytes   = group_icon;
+        entries[idx].len     = group_icon_len;
+        idx = idx + 1;
+    }
+
+    val ver_r: R.Result[Bytes, str] = build_version(alloc, version, internal_name,
+                                                    original_filename, product_name);
+    if (R.is_err[Bytes, str](ver_r)) {
+        if (group_icon != nil) { A.deallocate[u8](alloc, group_icon, group_icon_len); }
+        A.deallocate[ResEntry](alloc, entries, entry_count::usize);
+        ret R.err[RsrcImage, str](R.unwrap_err[Bytes, str](ver_r));
+    }
+    val ver: Bytes = R.unwrap_ok[Bytes, str](ver_r);
+
+    entries[idx].type_id = RT_VERSION;
+    entries[idx].name_id = 1;
+    entries[idx].lang_id = 0;
+    entries[idx].bytes   = ver.bytes;
+    entries[idx].len     = ver.len;
+    idx = idx + 1;
+
+    if (has_manifest) {
+        entries[idx].type_id = RT_MANIFEST;
+        entries[idx].name_id = 1;
+        entries[idx].lang_id = 0;
+        entries[idx].bytes   = manifest;
+        entries[idx].len     = manifest_len;
+        idx = idx + 1;
+    }
+
+    var img: RsrcImage;
+    img.entries        = entries;
+    img.entry_count    = entry_count;
+    img.group_icon     = group_icon;
+    img.group_icon_len = group_icon_len;
+    img.version        = ver.bytes;
+    img.version_len    = ver.len;
+    ret R.ok[RsrcImage, str](img);
+}
+
+# count the distinct type_id groups and (type_id, name_id) groups across a
+# sorted, duplicate-free entries array in one forward pass
+fun count_groups(entries: *ResEntry, entry_count: u32) GroupCounts {
+    var c: GroupCounts;
+    c.n_types = 0; c.n_names = 0;
+    var i: u32 = 0;
+    for (i < entry_count) {
+        val new_type: bool = i == 0 || entries[i].type_id != entries[i - 1].type_id;
+        val new_name: bool = new_type || entries[i].name_id != entries[i - 1].name_id;
+        if (new_type) { c.n_types = c.n_types + 1; }
+        if (new_name) { c.n_names = c.n_names + 1; }
+        i = i + 1;
+    }
+    ret c;
+}
+
+# number of distinct name_ids in the type group starting at entries[i]
+fun names_in_type_at(entries: *ResEntry, entry_count: u32, i: u32) u32 {
+    val t: u32 = entries[i].type_id;
+    var n: u32 = 0;
+    var j: u32 = i;
+    for (j < entry_count && entries[j].type_id == t) {
+        if (j == i || entries[j].name_id != entries[j - 1].name_id) { n = n + 1; }
+        j = j + 1;
+    }
+    ret n;
+}
+
+# number of lang entries in the (type, name) group starting at entries[i]
+fun langs_in_name_at(entries: *ResEntry, entry_count: u32, i: u32) u32 {
+    val t:  u32 = entries[i].type_id;
+    val nm: u32 = entries[i].name_id;
+    var n: u32 = 0;
+    var j: u32 = i;
+    for (j < entry_count && entries[j].type_id == t && entries[j].name_id == nm) {
+        n = n + 1;
+        j = j + 1;
+    }
+    ret n;
+}
+
+# lay out the three-level resource directory tree and, when buf is non-nil,
+# write it at buf[off..]; returns the total blob size either way, so `size`
+# and `emit` cannot disagree
+# ---
+# img:      the built image, entries already sorted by (type_id, name_id, lang_id)
+# buf:      destination buffer, or nil to only measure
+# off:      byte offset of the `.rsrc` section within buf (ignored when buf is nil)
+# base_rva: the `.rsrc` section's image RVA (ignored when buf is nil)
+# ret:      the total blob size
+fun walk(img: *RsrcImage, buf: *u8, off: usize, base_rva: u64) R.Result[usize, str] {
+    if (img == nil || img.entries == nil || img.entry_count == 0) {
+        ret R.err[usize, str]("rsrc: empty resource image");
+    }
+    val entries:     *ResEntry = img.entries;
+    val entry_count: u32       = img.entry_count;
+    val do_write:    bool      = buf != nil;
+
+    val counts: GroupCounts = count_groups(entries, entry_count);
+    if (counts.n_types > 65535 || counts.n_names > 65535) {
+        ret R.err[usize, str]("rsrc: resource directory exceeds 65535 entries");
+    }
+
+    val root_size:    usize = DIR_HEADER_SIZE + DIR_ENTRY_SIZE * counts.n_types::usize;
+    val level2_off:   usize = root_size;
+    val level2_size:  usize = DIR_HEADER_SIZE * counts.n_types::usize + DIR_ENTRY_SIZE * counts.n_names::usize;
+    val level3_off:   usize = level2_off + level2_size;
+    val level3_size:  usize = DIR_HEADER_SIZE * counts.n_names::usize + DIR_ENTRY_SIZE * entry_count::usize;
+    val data_off:     usize = level3_off + level3_size;
+    val data_size:    usize = DATA_ENTRY_SIZE * entry_count::usize;
+    val payload_off0: usize = data_off + data_size;
+    if (payload_off0 > 0x7FFFFFFF::usize) {
+        ret R.err[usize, str]("rsrc: resource directory exceeds PE's 31-bit subdirectory offsets");
+    }
+    if (do_write && base_rva > 0xFFFFFFFF) {
+        ret R.err[usize, str]("rsrc: resource section RVA exceeds PE's 32-bit field");
+    }
+
+    if (do_write) {
+        bin.write_u32_le(buf, off,      0);                    # Characteristics
+        bin.write_u32_le(buf, off + 4,  0);                    # TimeDateStamp
+        bin.write_u16_le(buf, off + 8,  0);                    # MajorVersion
+        bin.write_u16_le(buf, off + 10, 0);                    # MinorVersion
+        bin.write_u16_le(buf, off + 12, 0);                    # NumberOfNamedEntries
+        bin.write_u16_le(buf, off + 14, counts.n_types::u16);  # NumberOfIdEntries
+    }
+
+    var root_entry_off: usize = DIR_HEADER_SIZE; # next free slot in the root's entry array
+    var l2_dir_off:     usize = level2_off;       # current type's level-2 directory offset
+    var l2_entry_off:   usize = 0;                # next free slot in that directory's entry array
+    var l3_dir_off:     usize = level3_off;       # current name's level-3 directory offset
+    var l3_entry_off:   usize = 0;                # next free slot in that directory's entry array
+    var payload_cursor: usize = payload_off0;
+
+    var cur_type_names: u32 = 0;
+    var cur_name_langs: u32 = 0;
+
+    var i: u32 = 0;
+    for (i < entry_count) {
+        val t:  u32 = entries[i].type_id;
+        val nm: u32 = entries[i].name_id;
+        val new_type: bool = i == 0 || t != entries[i - 1].type_id;
+        val new_name: bool = new_type || nm != entries[i - 1].name_id;
+
+        if (new_type) {
+            cur_type_names = names_in_type_at(entries, entry_count, i);
+            if (cur_type_names > 65535 || l2_dir_off > 0x7FFFFFFF::usize) {
+                ret R.err[usize, str]("rsrc: resource name directory exceeds PE limits");
+            }
+            if (do_write) {
+                bin.write_u32_le(buf, off + root_entry_off,     t);
+                bin.write_u32_le(buf, off + root_entry_off + 4, (l2_dir_off::u32) | SUBDIR_FLAG);
+                bin.write_u32_le(buf, off + l2_dir_off,      0);
+                bin.write_u32_le(buf, off + l2_dir_off + 4,  0);
+                bin.write_u16_le(buf, off + l2_dir_off + 8,  0);
+                bin.write_u16_le(buf, off + l2_dir_off + 10, 0);
+                bin.write_u16_le(buf, off + l2_dir_off + 12, 0);
+                bin.write_u16_le(buf, off + l2_dir_off + 14, cur_type_names::u16);
+            }
+            root_entry_off = root_entry_off + DIR_ENTRY_SIZE;
+            l2_entry_off   = l2_dir_off + DIR_HEADER_SIZE;
+        }
+
+        if (new_name) {
+            cur_name_langs = langs_in_name_at(entries, entry_count, i);
+            if (cur_name_langs > 65535 || l3_dir_off > 0x7FFFFFFF::usize) {
+                ret R.err[usize, str]("rsrc: resource language directory exceeds PE limits");
+            }
+            if (do_write) {
+                bin.write_u32_le(buf, off + l2_entry_off,     nm);
+                bin.write_u32_le(buf, off + l2_entry_off + 4, (l3_dir_off::u32) | SUBDIR_FLAG);
+                bin.write_u32_le(buf, off + l3_dir_off,      0);
+                bin.write_u32_le(buf, off + l3_dir_off + 4,  0);
+                bin.write_u16_le(buf, off + l3_dir_off + 8,  0);
+                bin.write_u16_le(buf, off + l3_dir_off + 10, 0);
+                bin.write_u16_le(buf, off + l3_dir_off + 12, 0);
+                bin.write_u16_le(buf, off + l3_dir_off + 14, cur_name_langs::u16);
+            }
+            l2_entry_off = l2_entry_off + DIR_ENTRY_SIZE;
+            l3_entry_off = l3_dir_off + DIR_HEADER_SIZE;
+        }
+
+        val this_data_off: usize = data_off + i::usize * DATA_ENTRY_SIZE;
+        payload_cursor = bin.align_up(payload_cursor, 4);
+        val this_payload_off: usize = payload_cursor;
+        if (this_data_off > 0xFFFFFFFF::usize || this_payload_off > 0xFFFFFFFF::usize
+            || entries[i].len > 0xFFFFFFFF::usize
+            || entries[i].len > 0xFFFFFFFF::usize - this_payload_off) {
+            ret R.err[usize, str]("rsrc: resource payload exceeds PE's 32-bit offsets or sizes");
+        }
+        if (do_write && base_rva > 0xFFFFFFFF - this_payload_off::u64) {
+            ret R.err[usize, str]("rsrc: resource data RVA exceeds PE's 32-bit field");
+        }
+
+        if (do_write) {
+            bin.write_u32_le(buf, off + l3_entry_off,     entries[i].lang_id);
+            bin.write_u32_le(buf, off + l3_entry_off + 4, this_data_off::u32);
+
+            # OffsetToData here is an image RVA (base_rva + this payload's
+            # section-relative offset) - every directory-entry offset above is
+            # section-relative instead; this is the one asymmetry in the format.
+            bin.write_u32_le(buf, off + this_data_off,      (base_rva + this_payload_off::u64)::u32);
+            bin.write_u32_le(buf, off + this_data_off + 4,  entries[i].len::u32);
+            bin.write_u32_le(buf, off + this_data_off + 8,  0);
+            bin.write_u32_le(buf, off + this_data_off + 12, 0);
+
+            if (entries[i].len > 0) {
+                memory.raw_copy((buf::usize + off + this_payload_off)::ptr, entries[i].bytes::ptr, entries[i].len);
+            }
+        }
+        l3_entry_off   = l3_entry_off + DIR_ENTRY_SIZE;
+        payload_cursor = payload_cursor + entries[i].len;
+
+        val last_in_name: bool = i + 1 == entry_count || entries[i + 1].type_id != t || entries[i + 1].name_id != nm;
+        val last_in_type: bool = i + 1 == entry_count || entries[i + 1].type_id != t;
+        if (last_in_name) { l3_dir_off = l3_dir_off + DIR_HEADER_SIZE + DIR_ENTRY_SIZE * cur_name_langs::usize; }
+        if (last_in_type) { l2_dir_off = l2_dir_off + DIR_HEADER_SIZE + DIR_ENTRY_SIZE * cur_type_names::usize; }
+
+        i = i + 1;
+    }
+
+    ret R.ok[usize, str](payload_cursor);
+}
+
+# total byte size of the `.rsrc` blob `emit` would write for img
+# ---
+# img: the built image
+# ret: the total blob size, including inter-payload alignment padding
+pub fun size(img: *RsrcImage) R.Result[usize, str] {
+    ret walk(img, nil, 0, 0);
+}
+
+# write the `.rsrc` blob for img at buf[off..off+size(img)]
+# ---
+# img:      the built image
+# buf:      destination buffer
+# off:      byte offset of the `.rsrc` section within buf
+# base_rva: the `.rsrc` section's image RVA
+pub fun emit(img: *RsrcImage, buf: *u8, off: usize, base_rva: u64) R.Result[usize, str] {
+    ret walk(img, buf, off, base_rva);
+}
+
+# free the entries/group_icon/version buffers build allocated
+# ---
+# alloc: the allocator build was given
+# img:   the image to release
+pub fun dnit(alloc: *A.Allocator, img: *RsrcImage) {
+    if (img == nil) { ret; }
+    A.deallocate[ResEntry](alloc, img.entries, img.entry_count::usize);
+    A.deallocate[u8](alloc, img.group_icon, img.group_icon_len);
+    A.deallocate[u8](alloc, img.version, img.version_len);
+}
+
+# build a synthetic 2-image ICO buffer: ICONDIR + 2 ICONDIRENTRY, then the two
+# images' raw bytes back to back
+fun ts_make_two_image_ico(buf: *u8) {
+    var z: usize = 0;
+    for (z < 48) { buf[z] = 0; z = z + 1; }
+
+    bin.write_u16_le(buf, 0, 0); # reserved
+    bin.write_u16_le(buf, 2, 1); # type
+    bin.write_u16_le(buf, 4, 2); # count
+
+    buf[6] = 16; buf[7] = 16; buf[8] = 0; buf[9] = 0;   # 16x16
+    bin.write_u16_le(buf, 10, 1);  # planes
+    bin.write_u16_le(buf, 12, 32); # bit_count
+    bin.write_u32_le(buf, 14, 4);  # bytes_in_res
+    bin.write_u32_le(buf, 18, 38); # image_offset
+
+    buf[22] = 32; buf[23] = 32; buf[24] = 0; buf[25] = 0; # 32x32
+    bin.write_u16_le(buf, 26, 1);  # planes
+    bin.write_u16_le(buf, 28, 32); # bit_count
+    bin.write_u32_le(buf, 30, 6);  # bytes_in_res
+    bin.write_u32_le(buf, 34, 42); # image_offset
+
+    buf[38] = 0xAA; buf[39] = 0xBB; buf[40] = 0xCC; buf[41] = 0xDD;
+    buf[42] = 1; buf[43] = 2; buf[44] = 3; buf[45] = 4; buf[46] = 5; buf[47] = 6;
+}
+
+fun ts_two_image_group_icon() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var ico: [48]u8;
+    ts_make_two_image_ico(?ico[0]);
+
+    val r: R.Result[RsrcImage, str] = build(?alloc, ?ico[0], 48, nil, 0, "1.0.0", "TestApp", "TestApp.exe", "TestApp");
+    if (R.is_err[RsrcImage, str](r)) { ret 1; }
+    var img: RsrcImage = R.unwrap_ok[RsrcImage, str](r);
+
+    var bad: u8 = 0;
+    if (img.entry_count != 4) { bad = 1; }
+    or (img.entries[0].type_id != RT_ICON || img.entries[0].name_id != 1 || img.entries[0].len != 4) { bad = 1; }
+    or (img.entries[1].type_id != RT_ICON || img.entries[1].name_id != 2 || img.entries[1].len != 6) { bad = 1; }
+    or (img.entries[2].type_id != RT_GROUP_ICON || img.entries[2].name_id != 1)                      { bad = 1; }
+    or (img.entries[3].type_id != RT_VERSION)                                                        { bad = 1; }
+    or (img.group_icon_len != 6 + 2 * 14)                                                             { bad = 1; }
+
+    if (bad == 0) {
+        val gi: *u8 = img.group_icon;
+        if (bin.read_u16_le(gi, 4) != 2)          { bad = 1; } # count
+        or (gi[6] != 16)                          { bad = 1; } # icon 0 width
+        or (bin.read_u32_le(gi, 6 + 8) != 4)      { bad = 1; } # icon 0 bytes_in_res
+        or (bin.read_u16_le(gi, 6 + 12) != 1)     { bad = 1; } # icon 0 id
+        or (gi[6 + 14] != 32)                     { bad = 1; } # icon 1 width
+        or (bin.read_u32_le(gi, 6 + 14 + 8) != 6) { bad = 1; } # icon 1 bytes_in_res
+        or (bin.read_u16_le(gi, 6 + 14 + 12) != 2){ bad = 1; } # icon 1 id
+    }
+
+    dnit(?alloc, ?img);
+    ret bad;
+}
+
+# a synthetic 2-image ICO builds one RT_ICON leaf per image plus one
+# RT_GROUP_ICON, with id/bytes_in_res carried across into the group directory
+test "mach.lang.target.of.rsrc:build_two_image_ico" {
+    if (ts_two_image_group_icon() != 0) { ret 1; }
+    ret 0;
+}
+
+fun ts_malformed_ico() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    # bad magic: type field must be 1
+    var bad_magic: [6]u8;
+    bin.write_u16_le(?bad_magic[0], 0, 0); # reserved
+    bin.write_u16_le(?bad_magic[0], 2, 2); # type (invalid)
+    bin.write_u16_le(?bad_magic[0], 4, 1); # count
+    val r1: R.Result[RsrcImage, str] = build(?alloc, ?bad_magic[0], 6, nil, 0, "1.0", "x", "x.exe", "x");
+    if (R.is_ok[RsrcImage, str](r1)) { ret 1; }
+
+    # image data runs past the end of the buffer
+    var overrun: [22]u8;
+    var z: usize = 0;
+    for (z < 22) { overrun[z] = 0; z = z + 1; }
+    bin.write_u16_le(?overrun[0], 0, 0);    # reserved
+    bin.write_u16_le(?overrun[0], 2, 1);    # type
+    bin.write_u16_le(?overrun[0], 4, 1);    # count
+    bin.write_u32_le(?overrun[0], 14, 100); # bytes_in_res, far larger than the buffer
+    bin.write_u32_le(?overrun[0], 18, 22);  # image_offset: right at the buffer's end
+    val r2: R.Result[RsrcImage, str] = build(?alloc, ?overrun[0], 22, nil, 0, "1.0", "x", "x.exe", "x");
+    if (R.is_ok[RsrcImage, str](r2)) { ret 1; }
+
+    ret 0;
+}
+
+# a bad-magic ICO and one whose image data runs past the buffer end are both
+# rejected, never producing a partial or corrupt image
+test "mach.lang.target.of.rsrc:build_rejects_malformed_ico" {
+    if (ts_malformed_ico() != 0) { ret 1; }
+    ret 0;
+}
+
+fun ts_version_parsing() u8 {
+    val r1: R.Result[ParsedVersion, str] = parse_version("4.5.0");
+    if (R.is_err[ParsedVersion, str](r1)) { ret 1; }
+    val v1: ParsedVersion = R.unwrap_ok[ParsedVersion, str](r1);
+    if (((v1.major::u32 << 16) | v1.minor::u32) != 0x00040005) { ret 1; }
+    or (((v1.patch::u32 << 16) | v1.build::u32) != 0x00000000) { ret 1; }
+
+    val r2: R.Result[ParsedVersion, str] = parse_version("1.2.3-alpha");
+    if (R.is_err[ParsedVersion, str](r2)) { ret 1; }
+    val v2: ParsedVersion = R.unwrap_ok[ParsedVersion, str](r2);
+    if (((v2.major::u32 << 16) | v2.minor::u32) != 0x00010002) { ret 1; }
+    or (((v2.patch::u32 << 16) | v2.build::u32) != 0x00030000) { ret 1; }
+
+    val r3: R.Result[ParsedVersion, str] = parse_version("not-a-version");
+    if (R.is_err[ParsedVersion, str](r3)) { ret 1; }
+    val v3: ParsedVersion = R.unwrap_ok[ParsedVersion, str](r3);
+    if (v3.major != 0 || v3.minor != 0 || v3.patch != 0 || v3.build != 0) { ret 1; }
+
+    ret 0;
+}
+
+# manifest version strings parse into dwFileVersionMS/LS: a full triple, a
+# string with a trailing non-numeric suffix, and non-numeric junk (all zeros)
+test "mach.lang.target.of.rsrc:parse_version_components" {
+    if (ts_version_parsing() != 0) { ret 1; }
+    ret 0;
+}
+
+fun ts_version_signature_and_length() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    val r: R.Result[RsrcImage, str] = build(?alloc, nil, 0, nil, 0, "2.3.4", "App", "App.exe", "App");
+    if (R.is_err[RsrcImage, str](r)) { ret 1; }
+    var img: RsrcImage = R.unwrap_ok[RsrcImage, str](r);
+
+    var bad: u8 = 0;
+    if (img.entry_count != 1)                                       { bad = 1; }
+    or (img.entries[0].type_id != RT_VERSION)                       { bad = 1; }
+    or (bin.read_u32_le(img.version, 40) != 0xFEEF04BD)             { bad = 1; } # dwSignature
+    or (bin.read_u16_le(img.version, 0)::usize != img.version_len)  { bad = 1; } # root wLength
+
+    dnit(?alloc, ?img);
+    ret bad;
+}
+
+# the VS_FIXEDFILEINFO signature lands at the fixed offset right after the
+# root key ("VS_VERSION_INFO" always widens to the same length), and the
+# root node's own wLength equals the whole generated buffer's length
+test "mach.lang.target.of.rsrc:version_signature_and_root_length" {
+    if (ts_version_signature_and_length() != 0) { ret 1; }
+    ret 0;
+}
+
+fun ts_size_matches_emit() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var manifest: [16]u8;
+    var z: usize = 0;
+    for (z < 16) { manifest[z] = (z + 1)::u8; z = z + 1; }
+
+    val r: R.Result[RsrcImage, str] = build(?alloc, nil, 0, ?manifest[0], 16, "1.0.0", "App", "App.exe", "App");
+    if (R.is_err[RsrcImage, str](r)) { ret 1; }
+    var img: RsrcImage = R.unwrap_ok[RsrcImage, str](r);
+
+    val sr: R.Result[usize, str] = size(?img);
+    if (R.is_err[usize, str](sr)) { dnit(?alloc, ?img); ret 1; }
+    val sz: usize = R.unwrap_ok[usize, str](sr);
+
+    val buf_r: R.Result[*u8, str] = A.zallocate[u8](?alloc, sz + 16);
+    if (R.is_err[*u8, str](buf_r)) { dnit(?alloc, ?img); ret 1; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](buf_r);
+
+    var z2: usize = 0;
+    for (z2 < 16) { buf[sz + z2] = 0xAB; z2 = z2 + 1; }
+
+    val er: R.Result[usize, str] = emit(?img, buf, 0, 0x9000);
+    if (R.is_err[usize, str](er) || R.unwrap_ok[usize, str](er) != sz) {
+        A.deallocate[u8](?alloc, buf, sz + 16); dnit(?alloc, ?img); ret 1;
+    }
+
+    var bad: u8 = 0;
+    var z3: usize = 0;
+    for (z3 < 16) {
+        if (buf[sz + z3] != 0xAB) { bad = 1; }
+        z3 = z3 + 1;
+    }
+
+    A.deallocate[u8](?alloc, buf, sz + 16);
+    dnit(?alloc, ?img);
+    ret bad;
+}
+
+# size(img) matches the byte count emit actually writes: a sentinel planted
+# just past the reported size survives emitting into an oversized buffer
+test "mach.lang.target.of.rsrc:size_matches_emit_no_overrun" {
+    if (ts_size_matches_emit() != 0) { ret 1; }
+    ret 0;
+}
+
+fun ts_manifest_referenced() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var manifest: [12]u8;
+    var z: usize = 0;
+    for (z < 12) { manifest[z] = (0x40 + z)::u8; z = z + 1; }
+
+    val r: R.Result[RsrcImage, str] = build(?alloc, nil, 0, ?manifest[0], 12, "1.0.0", "App", "App.exe", "App");
+    if (R.is_err[RsrcImage, str](r)) { ret 1; }
+    var img: RsrcImage = R.unwrap_ok[RsrcImage, str](r);
+
+    var bad: u8 = 0;
+    if (img.entry_count != 2)                                     { bad = 1; }
+    or (img.entries[1].type_id != RT_MANIFEST)                    { bad = 1; }
+    or (img.entries[1].bytes::usize != (?manifest[0])::usize)     { bad = 1; } # referenced, not copied
+    or (img.entries[1].len != 12)                                 { bad = 1; }
+
+    if (bad == 0) {
+        var z2: usize = 0;
+        for (z2 < 12) {
+            if (img.entries[1].bytes[z2] != manifest[z2]) { bad = 1; }
+            z2 = z2 + 1;
+        }
+    }
+
+    dnit(?alloc, ?img);
+    ret bad;
+}
+
+# the RT_MANIFEST leaf points directly at the caller's buffer - same address,
+# same length, unmodified content - never a copy
+test "mach.lang.target.of.rsrc:manifest_bytes_referenced_unmodified" {
+    if (ts_manifest_referenced() != 0) { ret 1; }
+    ret 0;
+}
+
+fun ts_full_tree_walk() u8 {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+
+    var ico: [26]u8;
+    var z: usize = 0;
+    for (z < 26) { ico[z] = 0; z = z + 1; }
+    bin.write_u16_le(?ico[0], 0, 0);
+    bin.write_u16_le(?ico[0], 2, 1);
+    bin.write_u16_le(?ico[0], 4, 1);
+    ico[6] = 16; ico[7] = 16;
+    bin.write_u16_le(?ico[0], 10, 1);
+    bin.write_u16_le(?ico[0], 12, 32);
+    bin.write_u32_le(?ico[0], 14, 4);  # bytes_in_res
+    bin.write_u32_le(?ico[0], 18, 22); # image_offset
+    ico[22] = 0x11; ico[23] = 0x22; ico[24] = 0x33; ico[25] = 0x44;
+
+    var manifest: [8]u8;
+    var m: usize = 0;
+    for (m < 8) { manifest[m] = (0x50 + m)::u8; m = m + 1; }
+
+    val r: R.Result[RsrcImage, str] = build(?alloc, ?ico[0], 26, ?manifest[0], 8, "3.1.4", "TreeApp", "TreeApp.exe", "TreeApp");
+    if (R.is_err[RsrcImage, str](r)) { ret 1; }
+    var img: RsrcImage = R.unwrap_ok[RsrcImage, str](r);
+    if (img.entry_count != 4) { dnit(?alloc, ?img); ret 1; }
+
+    val sr: R.Result[usize, str] = size(?img);
+    if (R.is_err[usize, str](sr)) { dnit(?alloc, ?img); ret 1; }
+    val sz: usize = R.unwrap_ok[usize, str](sr);
+    val buf_r: R.Result[*u8, str] = A.zallocate[u8](?alloc, sz);
+    if (R.is_err[*u8, str](buf_r)) { dnit(?alloc, ?img); ret 1; }
+    val buf: *u8 = R.unwrap_ok[*u8, str](buf_r);
+
+    val base_rva: u64 = 0x9000; # a realistic small section RVA, not an absolute VA
+    val er: R.Result[usize, str] = emit(?img, buf, 0, base_rva);
+    if (R.is_err[usize, str](er)) { A.deallocate[u8](?alloc, buf, sz); dnit(?alloc, ?img); ret 1; }
+
+    var bad: u8 = 0;
+    val n_types: u16 = bin.read_u16_le(buf, 14);
+    if (n_types != 4) { bad = 1; }
+
+    var seen_icon:  u8 = 0;
+    var seen_group: u8 = 0;
+    var seen_ver:   u8 = 0;
+    var seen_man:   u8 = 0;
+
+    if (bad == 0) {
+        var k: u16 = 0;
+        for (k < n_types) {
+            val root_ent: usize = 16 + k::usize * 8;
+            val tid:      u32   = bin.read_u32_le(buf, root_ent);
+            val l2_raw:   u32   = bin.read_u32_le(buf, root_ent + 4);
+            val l2_off:   usize = (l2_raw & ~SUBDIR_FLAG)::usize;
+
+            val l2_names: u16 = bin.read_u16_le(buf, l2_off + 14);
+            if (l2_names != 1) { bad = 1; }
+
+            val l2_ent:  usize = l2_off + 16;
+            val name_id: u32   = bin.read_u32_le(buf, l2_ent);
+            if (name_id != 1) { bad = 1; }
+            val l3_raw: u32   = bin.read_u32_le(buf, l2_ent + 4);
+            val l3_off: usize = (l3_raw & ~SUBDIR_FLAG)::usize;
+
+            val l3_langs: u16 = bin.read_u16_le(buf, l3_off + 14);
+            if (l3_langs != 1) { bad = 1; }
+
+            val l3_ent:   usize = l3_off + 16;
+            val lang_id:  u32   = bin.read_u32_le(buf, l3_ent);
+            if (lang_id != 0) { bad = 1; }
+            val data_off: usize = bin.read_u32_le(buf, l3_ent + 4)::usize;
+
+            val data_rva:    u32   = bin.read_u32_le(buf, data_off);
+            val data_size:   u32   = bin.read_u32_le(buf, data_off + 4);
+            val payload_off: usize = (data_rva::u64 - base_rva)::usize;
+
+            if (payload_off + data_size::usize > sz) { bad = 1; }
+
+            var expect_len: usize = 0;
+            if (tid == RT_ICON)       { expect_len = img.entries[0].len; seen_icon = 1; }
+            or (tid == RT_GROUP_ICON) { expect_len = img.group_icon_len; seen_group = 1; }
+            or (tid == RT_VERSION)    { expect_len = img.version_len;    seen_ver = 1; }
+            or (tid == RT_MANIFEST)   { expect_len = 8;                  seen_man = 1; }
+            or                        { bad = 1; }
+
+            if (data_size::usize != expect_len) { bad = 1; }
+
+            if (tid == RT_MANIFEST) {
+                var mi: usize = 0;
+                for (mi < 8) {
+                    if (buf[payload_off + mi] != manifest[mi]) { bad = 1; }
+                    mi = mi + 1;
+                }
+            }
+
+            k = k + 1;
+        }
+    }
+
+    if (seen_icon == 0 || seen_group == 0 || seen_ver == 0 || seen_man == 0) { bad = 1; }
+
+    A.deallocate[u8](?alloc, buf, sz);
+    dnit(?alloc, ?img);
+    ret bad;
+}
+
+# a full tree walk of a self-emitted blob: the three directory levels resolve
+# to exactly the expected (type, name, lang) triples, and each leaf's data
+# entry OffsetToData - base_rva lands inside the blob at that leaf's payload
+# with the right length (and, for the manifest, the right content)
+test "mach.lang.target.of.rsrc:full_tree_walk_round_trip" {
+    if (ts_full_tree_walk() != 0) { ret 1; }
+    ret 0;
+}
+
+# strict UTF-8 conversion emits BMP and supplementary characters as their real
+# UTF-16LE code units rather than widening source bytes
+test "mach.lang.target.of.rsrc:version_strings_encode_utf16" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val r: R.Result[RsrcImage, str] = build(?alloc, nil, 0, nil, 0, "1.0",
+        "Café😀", "Café😀.exe", "Café😀");
+    if (R.is_err[RsrcImage, str](r)) { ret 1; }
+    var img: RsrcImage = R.unwrap_ok[RsrcImage, str](r);
+    var found: bool = false;
+    var i: usize = 0;
+    for (i + 11 < img.version_len) {
+        if (bin.read_u16_le(img.version, i) == 'C'::u16
+            && bin.read_u16_le(img.version, i + 2) == 'a'::u16
+            && bin.read_u16_le(img.version, i + 4) == 'f'::u16
+            && bin.read_u16_le(img.version, i + 6) == 0x00E9
+            && bin.read_u16_le(img.version, i + 8) == 0xD83D
+            && bin.read_u16_le(img.version, i + 10) == 0xDE00) { found = true; brk; }
+        i = i + 2;
+    }
+    dnit(?alloc, ?img);
+    if (!found) { ret 1; }
+    ret 0;
+}
+
+# malformed metadata, overflowing fixed-version components, and empty declared
+# manifests fail before any partial image escapes
+test "mach.lang.target.of.rsrc:rejects_malformed_metadata_and_manifest" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var invalid: [3]u8;
+    invalid[0] = 0xC0; invalid[1] = 0x80; invalid[2] = 0;
+    val u: R.Result[RsrcImage, str] = build(?alloc, nil, 0, nil, 0, "1.0",
+        (?invalid[0])::str, "x.exe", "x");
+    if (R.is_ok[RsrcImage, str](u)) { ret 1; }
+    val v: R.Result[RsrcImage, str] = build(?alloc, nil, 0, nil, 0, "65536.0",
+        "x", "x.exe", "x");
+    if (R.is_ok[RsrcImage, str](v)) { ret 1; }
+    var byte: u8 = 0;
+    val m: R.Result[RsrcImage, str] = build(?alloc, nil, 0, ?byte, 0, "1.0",
+        "x", "x.exe", "x");
+    if (R.is_ok[RsrcImage, str](m)) { ret 1; }
+    ret 0;
+}
+
+# the resource data entry's 32-bit offset and size fields are validated during
+# measurement, not truncated during emission
+test "mach.lang.target.of.rsrc:rejects_payload_offset_overflow" {
+    var entry: ResEntry;
+    entry.type_id = RT_MANIFEST; entry.name_id = 1; entry.lang_id = 0;
+    entry.bytes = nil; entry.len = 0xFFFFFFFF::usize;
+    var img: RsrcImage;
+    img.entries = ?entry; img.entry_count = 1;
+    img.group_icon = nil; img.group_icon_len = 0; img.version = nil; img.version_len = 0;
+    val sr: R.Result[usize, str] = size(?img);
+    if (R.is_ok[usize, str](sr)) { ret 1; }
+    ret 0;
+}
