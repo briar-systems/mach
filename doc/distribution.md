@@ -567,26 +567,27 @@ need = []
 ```sh
 #!/bin/sh
 # compile the vendored C for this build cell's target and archive it.
+# MACH_TARGET_ISA / MACH_TARGET_OS are exported by mach for every step.
 set -eu
 out="$1"
 obj="${out%.a}.o"
-mkdir -p "$(dirname "$out")"
 case "$MACH_TARGET_OS" in
-    linux)   cc -c -O2 -Ivendor/qz -o "$obj" vendor/qz/qz.c ;;
-    windows) clang --target="$MACH_TARGET_ISA-pc-windows-msvc" \
-                 -c -O2 -Ivendor/qz -o "$obj" vendor/qz/qz.c ;;
-    darwin)  clang --target="$MACH_TARGET_ISA-apple-darwin" \
-                 -c -O2 -Ivendor/qz -o "$obj" vendor/qz/qz.c ;;
-    *) echo "no C toolchain configured for $MACH_TARGET_OS" >&2; exit 1 ;;
+    linux)   triple="$MACH_TARGET_ISA-unknown-linux-gnu" ;;
+    windows) triple="$MACH_TARGET_ISA-pc-windows-msvc"   ;;
+    darwin)  triple="$MACH_TARGET_ISA-apple-darwin"      ;;
+    *) echo "no C target configured for $MACH_TARGET_OS" >&2; exit 1 ;;
 esac
+mkdir -p "$(dirname "$out")"
+clang --target="$triple" -c -O2 -Ivendor/qz -o "$obj" vendor/qz/qz.c
 rm -f "$out"
 ar rcs "$out" "$obj"
 ```
 
-A single `clang` cross-compiles to all three object formats, which is why it is
-the easy answer here; a per-target gcc cross-toolchain works equally well. What
-you cannot do is skip the question. **This is the one part of cross-building
-mach does not do for you**, and it applies to every dependency that vendors C.
+One `clang` covers all three object formats, so the only thing that varies per
+cell is the triple — which is why it is the easy answer here; a per-target gcc
+cross-toolchain works equally well. What you cannot do is skip the question.
+**This is the one part of cross-building mach does not do for you**, and it
+applies to every dependency that vendors C.
 
 Note what the script above is getting away with: `qz.c` includes no system
 headers, so a target triple is the whole story. C that includes system headers
