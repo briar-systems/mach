@@ -71,6 +71,15 @@ ext var errno: i32;                        # imported mutable datum
   stays directly addressed. Executed dynamic-import resolution is proven on the
   native ELF legs.
 
+## `#[embed(...)]` — the other exemption to "requires an initializer"
+
+A `val` carrying `#[embed("path")]` also carries no initializer — the named
+file's content **is** the initializer, read at compile time. It is the second
+(and only other) exemption to `val`'s initializer requirement, alongside `ext`
+above; unlike `ext`, the binding still owns real storage, placed in read-only
+data. See [decorators.md](decorators.md#embedstr--compile-time-file-embedding)
+for the full rule set.
+
 ## No inference
 
 Every binding declares its type. An untyped numeric literal is checked
@@ -89,3 +98,4 @@ typed suffix (`42i64`).
 
 - [literals.md](literals.md) — numeric / string / char literal forms
 - [types.md](types.md) — the type grammar for the annotation
+- [decorators.md](decorators.md#embedstr--compile-time-file-embedding) — `#[embed]`, the other initializer exemption

@@ -635,6 +635,87 @@ fun section_bytes_copy(image: *of.ObjectImage, src: *u8, len: u32) R.Result[*u8,
     ret R.ok[*u8, str](buf);
 }
 
+# add global `g`'s defining symbol, pointing at section `sec_idx`
+#
+# A named user global is given GLOBAL linkage - its name is module-path-mangled
+# and globally unique, so it resolves cross-object without collision (mirroring
+# every defined function). Only a compiler-synthesized anonymous data global
+# (`is_local`, a string / byte-blob literal) stays object-private.
+# ---
+# image:   object image being built
+# g:       the global being defined
+# sec_idx: index of the section holding its bytes
+# sec_len: the symbol's size in bytes
+# ret:     true on success, or an error string
+fun add_global_symbol(image: *of.ObjectImage, g: *ir.Global, sec_idx: u32, sec_len: u32) R.Result[bool, str] {
+    var flags: u32 = of.SYM_OBJ_FLAG_OBJECT;
+    if (!g.is_local) { flags = flags | of.SYM_OBJ_FLAG_GLOBAL; }
+
+    var sym: of.Symbol;
+    sym.name    = g.name;
+    sym.section = sec_idx;
+    sym.offset  = 0;
+    sym.size    = sec_len;
+    sym.flags   = flags;
+
+    val res: R.Result[u32, str] = obj.add_symbol(image, sym);
+    if (R.is_err[u32, str](res)) { ret R.err[bool, str](R.unwrap_err[u32, str](res)); }
+    ret R.ok[bool, str](true);
+}
+
+# the index of a section already packed for an earlier `#[embed]` global whose
+# bytes, length, section name, and kind all match, or -1 when there is none
+#
+# Scans the globals packed before index `upto`, so the match is against sections
+# this loop has already added and the first embed of a given content owns the
+# placement. Content is compared in full rather than by digest: the digest lives
+# in the frontend's cache and the equality that matters here is of the bytes about
+# to be written.
+# ---
+# image:    object image being built
+# irmod:    the IR module being packed
+# upto:     index of the global currently being packed
+# bytes:    its initializer bytes
+# len:      their length
+# sec_name: the interned section name it would use
+# kind:     the section kind it would use
+# align:    the alignment it requires
+# ret:      the matching section index, or -1
+fun embed_section_of(image: *of.ObjectImage, irmod: *ir.Module, upto: u32, bytes: *u8, len: u32,
+                     sec_name: intern.StrId, kind: of.SectionKind, align: u32) i64 {
+    var j: u32 = 0;
+    for (j < upto) {
+        val o: *ir.Global = ?irmod.globals[j];
+        if (!o.is_embed || o.is_extern)               { j = j + 1; cnt; }
+        if (o.init.kind != value.VAL_CONST_BYTES)     { j = j + 1; cnt; }
+        if (o.init.data.bytes.len != len)             { j = j + 1; cnt; }
+        if (o.section != sec_name && o.section != intern.STR_NIL) { j = j + 1; cnt; }
+
+        val si: i64 = section_index_of(image, o.name);
+        if (si < 0)                                   { j = j + 1; cnt; }
+        val sec: *of.Section = ?image.sections[si::u32];
+        if (sec.kind != kind || sec.name != sec_name || sec.len != len) { j = j + 1; cnt; }
+        if (sec.align != align)                                         { j = j + 1; cnt; }
+        if (len > 0 && !memory.raw_equal(sec.bytes::ptr, bytes::ptr, len::usize)) { j = j + 1; cnt; }
+        ret si;
+    }
+    ret -1;
+}
+
+# the index of the section the symbol named `name` defines, or -1
+# ---
+# image: object image being built
+# name:  the interned symbol name
+# ret:   the section index, or -1
+fun section_index_of(image: *of.ObjectImage, name: intern.StrId) i64 {
+    var i: u32 = 0;
+    for (i < image.symbol_count) {
+        if (image.symbols[i].name == name) { ret image.symbols[i].section::i64; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
 fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImage,
                  deferred: *obj.DeferredRelocs, irmod: *ir.Module) R.Result[bool, str] {
     var i: u32 = 0;
@@ -728,15 +809,14 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
             }
         }
 
-        # a global with an initializer (a non-nil byte image) is initialized data
-        # and belongs in .data/.rodata; only a global with no initializer at all
-        # (bytes == nil) is a zero-filled .bss reservation. routing on `len > 0`
-        # instead would misclassify an empty-but-present initializer (e.g. the
-        # "" string literal, a single '\0' byte) as bss, emitting a malformed
-        # section (kind bss yet bytes non-nil) whose symbol resolves to null.
+        # a global with an initializer is initialized data and belongs in
+        # .data/.rodata; only one with no initializer is a zero-filled .bss
+        # reservation. An empty embed has a nil, zero-length byte image but is
+        # still a present read-only initializer, which its explicit IR flag keeps
+        # out of bss.
         var kind:  of.SectionKind = of.SK_BSS;
         var sname: str            = ".bss";
-        if (bytes != nil) {
+        if (bytes != nil || g.is_embed) {
             if (g.is_mut) {
                 kind  = of.SK_DATA;
                 sname = ".data";
@@ -779,20 +859,42 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
             sec_len = type.byte_size(?irmod.types, g.ty, tgt);
         }
 
-        var sec: of.Section;
-        sec.name  = sec_name;
-        sec.kind  = kind;
-        sec.bytes = bytes;
-        sec.len   = sec_len;
         # the section is aligned to the strictest of: the 8-byte default, the
         # global's own type alignment (which an `#[align(...)]` decorator on the
         # type can raise - natural alignment never exceeds 8, so un-decorated
         # globals stay at 8), and an `#[align(...)]` decorator on the global
         # itself.
-        sec.align = 8;
+        var sec_align: u32 = 8;
         val tya: u32 = type.byte_align(?irmod.types, g.ty, tgt);
-        if (tya > sec.align)     { sec.align = tya; }
-        if (g.align > sec.align) { sec.align = g.align; }
+        if (tya > sec_align)     { sec_align = tya; }
+        if (g.align > sec_align) { sec_align = g.align; }
+
+        # two `#[embed]` globals naming byte-identical files share one placement
+        # (#2507): the section is emitted once and both symbols point at it. Sound
+        # only for embedded data - a named object's address is otherwise its own,
+        # and merging two ordinary globals would make `?A == ?B` observably true -
+        # so the scan is gated on `is_embed` at both ends. Alignment is part of the
+        # match: a stricter `#[align(...)]` on the second global would otherwise
+        # silently inherit the first section's weaker one.
+        if (g.is_embed) {
+            val dup: i64 = embed_section_of(image, irmod, i, bytes, sec_len, sec_name, kind, sec_align);
+            if (dup >= 0) {
+                if (bytes != nil && sec_len > 0) {
+                    A.deallocate[u8](image.alloc, bytes, sec_len::usize);
+                }
+                val res_alias: R.Result[bool, str] = add_global_symbol(image, g, dup::u32, sec_len);
+                if (R.is_err[bool, str](res_alias)) { ret res_alias; }
+                i = i + 1;
+                cnt;
+            }
+        }
+
+        var sec: of.Section;
+        sec.name  = sec_name;
+        sec.kind  = kind;
+        sec.bytes = bytes;
+        sec.len   = sec_len;
+        sec.align = sec_align;
 
         val res_section: R.Result[u32, str] = obj.add_section(image, sec);
         if (R.is_err[u32, str](res_section)) {
@@ -800,25 +902,8 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
         }
         val sec_idx: u32 = R.unwrap_ok[u32, str](res_section);
 
-        # a named user global is given GLOBAL linkage - its name is module-path-
-        # mangled and globally unique, so it resolves cross-object without
-        # collision (mirroring every defined function). only a compiler-
-        # synthesized anonymous data global (`is_local`, a string / byte-blob
-        # literal) stays object-private.
-        var flags: u32 = of.SYM_OBJ_FLAG_OBJECT;
-        if (!g.is_local) { flags = flags | of.SYM_OBJ_FLAG_GLOBAL; }
-
-        var sym: of.Symbol;
-        sym.name    = g.name;
-        sym.section = sec_idx;
-        sym.offset  = 0;
-        sym.size    = sec_len;
-        sym.flags   = flags;
-
-        val res_sym: R.Result[u32, str] = obj.add_symbol(image, sym);
-        if (R.is_err[u32, str](res_sym)) {
-            ret R.err[bool, str](R.unwrap_err[u32, str](res_sym));
-        }
+        val res_sym: R.Result[bool, str] = add_global_symbol(image, g, sec_idx, sec_len);
+        if (R.is_err[bool, str](res_sym)) { ret res_sym; }
 
         # an aggregate constant's pointer leaves (a `str` / address-of-global) are
         # patched at link time: each side-table entry becomes an abs64 relocation
@@ -1174,5 +1259,80 @@ test "mach.lang.be.codegen.pack_rows:rehomes_sectioned_and_text" {
     if (enc.rows[1].sec != 5 || enc.rows[1].text_offset != 2)  { ret 1; }
     # blob 20: `.text` after the 8-byte excised range -> section 1 at offset 20 - 8 = 12.
     if (enc.rows[2].sec != 1 || enc.rows[2].text_offset != 12) { ret 1; }
+    ret 0;
+}
+
+# embed dedup: an embed global whose bytes, length, section, kind, and alignment
+# all match an already-packed embed reuses that section; content, section, and
+# alignment differences each keep it separate (#2507)
+#
+# Structural, so it holds for every object format: the decision is made against
+# the format-neutral ObjectImage, before any writer sees it. That matters for the
+# targets whose emission cannot be executed on the build host.
+test "mach.lang.be.codegen.embed_section_of:shares_only_on_a_full_match" {
+    val rodata: intern.StrId = 7::intern.StrId;
+    val other:  intern.StrId = 9::intern.StrId;
+
+    var abc: [3]u8;
+    abc[0] = 'a'; abc[1] = 'b'; abc[2] = 'c';
+    var xyz: [3]u8;
+    xyz[0] = 'x'; xyz[1] = 'y'; xyz[2] = 'z';
+
+    # the image already holds the first embed's placement, plus its defining symbol.
+    var secs: [1]of.Section;
+    secs[0].name  = rodata;
+    secs[0].kind  = of.SK_RODATA;
+    secs[0].bytes = ?abc[0];
+    secs[0].len   = 3;
+    secs[0].align = 8;
+
+    var syms: [1]of.Symbol;
+    syms[0].name    = 100::intern.StrId;
+    syms[0].section = 0;
+    syms[0].offset  = 0;
+    syms[0].size    = 3;
+    syms[0].flags   = of.SYM_OBJ_FLAG_OBJECT;
+
+    var image: of.ObjectImage;
+    image.sections      = ?secs[0];
+    image.section_count = 1;
+    image.symbols       = ?syms[0];
+    image.symbol_count  = 1;
+
+    var globals: [1]ir.Global;
+    globals[0].name      = 100::intern.StrId;
+    globals[0].init      = value.const_bytes(?abc[0], 3, 0::type.IrTypeId);
+    globals[0].is_embed  = true;
+    globals[0].is_extern = false;
+    globals[0].section   = intern.STR_NIL;
+
+    var irmod: ir.Module;
+    irmod.globals = ?globals[0];
+
+    # identical in every axis: shares the placement.
+    if (embed_section_of(?image, ?irmod, 1, ?abc[0], 3, rodata, of.SK_RODATA, 8) != 0) { ret 1; }
+
+    # different content of the same length: its own placement.
+    if (embed_section_of(?image, ?irmod, 1, ?xyz[0], 3, rodata, of.SK_RODATA, 8) != -1) { ret 1; }
+
+    # a stricter alignment must not inherit the existing section's weaker one.
+    if (embed_section_of(?image, ?irmod, 1, ?abc[0], 3, rodata, of.SK_RODATA, 64) != -1) { ret 1; }
+
+    # a `#[section(...)]` override puts it elsewhere.
+    if (embed_section_of(?image, ?irmod, 1, ?abc[0], 3, other, of.SK_RODATA, 8) != -1) { ret 1; }
+
+    # a non-embed global is never a dedup candidate, however identical its bytes.
+    globals[0].is_embed = false;
+    if (embed_section_of(?image, ?irmod, 1, ?abc[0], 3, rodata, of.SK_RODATA, 8) != -1) { ret 1; }
+
+    # an empty embed is still a present read-only initializer, and two empty
+    # embeds share the same zero-length placement without dereferencing nil.
+    globals[0].is_embed       = true;
+    globals[0].init           = value.const_bytes(nil, 0, 0::type.IrTypeId);
+    secs[0].bytes              = nil;
+    secs[0].len                = 0;
+    syms[0].size               = 0;
+    if (embed_section_of(?image, ?irmod, 1, nil, 0, rodata, of.SK_RODATA, 8) != 0) { ret 1; }
+
     ret 0;
 }

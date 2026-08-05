@@ -37,6 +37,7 @@ A decorator is written as an attribute:
 #[oblivious]         # constant-time boundary (no arguments)
 #[scalar]            # opt out of auto-vectorization (no arguments)
 #[naked]             # no prologue or epilogue; body as written (no arguments)
+#[embed("path")]     # compile-time file embedding (val only)
 ```
 
 Decorators appear **before** the declaration they target, one per line or
@@ -294,6 +295,57 @@ also makes a call gets one, since an unaligned call boundary (x86-64) or a
 clobbered link register (aarch64, riscv64) is not something the author asked
 for by writing assembly.
 
+### `embed(str)` — compile-time file embedding
+
+Sources a `val`'s bytes from a file at compile time: the file's content **is**
+the initializer. Applies to `val` only — not `var` (the storage is read-only
+data) and not an `ext` data import (which has no storage here). Takes one
+string-literal argument.
+
+```mach
+#[embed("assets/logo.qoi")]
+val LOGO: [_]u8;          # length taken from the file's byte count
+
+#[embed("boot/sector.bin")]
+val SECTOR: [512]u8;      # length pinned; a size change fails the build
+```
+
+- The declaration carries no initializer of its own; writing one alongside
+  `embed` is rejected. This is a second exemption to `val`'s
+  requires-an-initializer rule, alongside `ext` (see
+  [val-var.md](val-var.md#ext--foreign-data-imports)).
+- Exactly one argument, a string literal. Escapes are **not** decoded, matching
+  `symbol` and `section` — the path is taken as written.
+- The path resolves relative to the **declaring source file's** directory. An
+  absolute path is taken as written.
+- The annotation must be `[_]u8` or `[N]u8`; the element type must be `u8`.
+  `[_]` is an inferred array length, legal **only** on an `#[embed]`
+  declaration — written anywhere else it is rejected (see
+  [grammar.md](grammar.md#types)). Mach has no intrinsic that measures a
+  value's type (`$size_of` takes a type, not a value), so a program cannot ask
+  a `[_]u8` embed for its own length; use the explicit `[N]u8` form when the
+  count is needed, or declare it alongside.
+- An explicit `[N]u8` whose `N` disagrees with the file is rejected, naming
+  both counts. This is how a declaration pins a fixed-size asset — a boot
+  sector, a ROM image — so the build fails the moment it stops being that
+  size.
+- Bytes are placed in read-only data exactly like any other constant byte
+  array: no runtime I/O, no copy. Works for every artifact kind and target,
+  freestanding included.
+- Two `#[embed]` globals whose files hold byte-identical content and whose final
+  section name, kind, and alignment match share **one** read-only data placement
+  within a module, so their addresses compare equal. This is specific to
+  embedded data — an ordinary global is never merged this way, and a named
+  object's address is otherwise its own.
+- A missing file, a directory where a file is required, an unreadable file, and
+  a file larger than the 4,294,967,295-byte array/section limit each report once,
+  naming the declaration and the resolved path.
+- The embedded file is a build input: its content digest feeds the embedding
+  module's incremental cutoff, so editing the asset invalidates that module
+  and an untouched asset stays a cache hit — see
+  [manifest.md](../manifest.md#stepname--build-steps) for the equivalent
+  guarantee on `[step]` `in` entries.
+
 ## Applicability
 
 | Directive   | `fun` | `ext fun` | `val` / `var` | `rec` / `uni` |
@@ -307,6 +359,10 @@ for by writing assembly.
 | `oblivious` |  yes  |    no     |      no       |      no       |
 | `scalar`    |  yes  |    no     |      no       |      no       |
 | `naked`     |  yes  |    no     |      no       |      no       |
+| `embed`     |  no   |    no     |      yes      |      no       |
+
+The `val` / `var` column is shared, but `embed` accepts only `val` — a `var`
+is refused (see [`embed`](#embedstr--compile-time-file-embedding) above).
 
 The set is closed. New directives require a compiler change.
 
@@ -317,4 +373,6 @@ The set is closed. New directives require a compiler change.
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$size_of` / `$align_of` as `align` arguments
 - [secrecy.md](secrecy.md) — `^` secret types and the `oblivious` constant-time contract
 - [asm.md](asm.md) — inline `asm`, the only body a `naked` function may have
-- [../manifest.md](../manifest.md) — the `vectorize` profile key `scalar` opts out of
+- [val-var.md](val-var.md) — `val` / `var` bindings, and the `embed` exemption to `val`'s initializer requirement
+- [grammar.md](grammar.md#types) — the `[_]` inferred array length `embed` introduces
+- [../manifest.md](../manifest.md) — the `vectorize` profile key `scalar` opts out of, and content-fingerprinted build inputs (`embed`, `[step]` `in`)

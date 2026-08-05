@@ -21,6 +21,10 @@ authoritative reference and wins on any disagreement.
 - **Decorators are `#[...]` attributes** on the line(s) above a declaration:
   `#[symbol("main")]`, `#[inline]`, `#[align(64)]`. The backtick form was
   removed in v2.4.0 and is a migration error - never emit backticks.
+- **File embeds are typed byte arrays.** `#[embed("asset.bin")]` applies only
+  to an uninitialized `val` declared as `[_]u8` (length from the file) or
+  `[N]u8` (length checked). The path is relative to the declaring source file;
+  bytes become read-only data at compile time, with no runtime I/O.
 - **Variadics are comptime packs.** A trailing `va: ...` parameter, consumed by
   `$each a in va`. There is no `va_list`/`va_start`/`va_arg` and the C-style
   bare `...` parameter is a removed-syntax error.
@@ -231,6 +235,7 @@ Compiler-seeded primitives (the complete set): `u8 u16 u32 u64`,
 ```mach
 *T                  # pointer          ?x address-of, @p dereference
 [N]T  [N][M]T       # array            val a: [4]i64 = [4]i64{1, 2, 3, 4};
+[_]u8               # inferred array   only on a #[embed("path")] val
 fun(T1, T2) R       # function pointer val op: BinOp = add;  op(2, 3)
 ^T                  # secret-qualified (see below)
 ```
