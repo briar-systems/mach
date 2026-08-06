@@ -43,6 +43,7 @@ use mach.lang.fe.comptime;
 use mach.lang.fe.resolve;
 use mach.lang.fe.sema.check;
 use mach.lang.fe.sema.context;
+use mach.lang.fe.sema.embed;
 use mach.lang.fe.sema.generics;
 use mach.lang.fe.sema.infer;
 use mach.lang.fe.token;
@@ -117,6 +118,15 @@ pub fun sema(
     # positions in bodies stay unresolved at sema and fold against the lowering-
     # installed resolver instead. cleared after so the borrowed ctx never keeps a
     # dangling `sc` pointer.
+    # before any type is resolved: a `[_]u8` annotation has no length until the
+    # `#[embed]` on its declaration supplies one, and the array resolver below sees
+    # only the type node (#2507).
+    val res_embeds: R.Result[bool, str] = resolve_all_embeds(?sc);
+    if (R.is_err[bool, str](res_embeds)) {
+        dnit_context(?sc);
+        ret R.err[context.SemaResult, str](R.unwrap_err[bool, str](res_embeds));
+    }
+
     val scp_types: *context.SemaContext = ?sc;
     comptime.set_member_resolver(ctx, context.resolve_module_member_const::*u8, scp_types::ptr);
     val res_types: R.Result[bool, str] = resolve_all_types(?sc);
@@ -728,6 +738,12 @@ pub fun dnit_result(r: *context.SemaResult) {
     if (r.decl_type != nil && r.decl_count > 0) {
         A.deallocate[type.TypeId](r.alloc, r.decl_type, r.decl_count::usize);
     }
+    if (r.embed_paths != nil && r.embed_path_cap > 0) {
+        A.deallocate[intern.StrId](r.alloc, r.embed_paths, r.embed_path_cap::usize);
+    }
+    r.embed_paths      = nil;
+    r.embed_path_count = 0;
+    r.embed_path_cap   = 0;
     r.expr_type        = nil;
     r.type_resolved_ty = nil;
     r.decl_type        = nil;
@@ -772,6 +788,10 @@ fun init_context(
     sc.type_resolved_memo = nil;
     sc.layout_state       = nil;
     sc.decl_type        = nil;
+    sc.embed_len        = nil;
+    sc.embed_paths      = nil;
+    sc.embed_path_len   = 0;
+    sc.embed_path_cap   = 0;
 
     sc.callee_eid       = id.EXPR_NIL;
     sc.in_comptime_gate = false;
@@ -816,6 +836,14 @@ fun init_context(
             ret R.err[bool, str](R.unwrap_err[*u8, str](res_memo));
         }
         sc.type_resolved_memo = R.unwrap_ok[*u8, str](res_memo);
+
+        # the embed pass writes into this before any type is resolved (#2507).
+        val res_emb: R.Result[*u64, str] = embed_len_array_alloc(s.alloc, a.type_len);
+        if (R.is_err[*u64, str](res_emb)) {
+            dnit_context(sc);
+            ret R.err[bool, str](R.unwrap_err[*u64, str](res_emb));
+        }
+        sc.embed_len = R.unwrap_ok[*u64, str](res_emb);
     }
     if (a.decl_len > 0) {
         val res_decl: R.Result[*type.TypeId, str] = typeid_array_alloc(s.alloc, a.decl_len);
@@ -882,6 +910,24 @@ fun layout_state_alloc(a: *A.Allocator, len: usize) R.Result[*u8, str] {
     ret R.ok[*u8, str](arr);
 }
 
+# allocate a u64 array of `len` slots, each prefilled with EMBED_LEN_NONE
+# ---
+# a:   allocator
+# len: number of slots
+# ret: the allocated array, or an allocation error
+fun embed_len_array_alloc(a: *A.Allocator, len: usize) R.Result[*u64, str] {
+    val res_arr: R.Result[*u64, str] = A.allocate[u64](a, len);
+    if (R.is_err[*u64, str](res_arr)) { ret res_arr; }
+    val arr: *u64 = R.unwrap_ok[*u64, str](res_arr);
+
+    var i: u32 = 0;
+    for (i < len::u32) {
+        arr[i] = context.EMBED_LEN_NONE;
+        i = i + 1;
+    }
+    ret R.ok[*u64, str](arr);
+}
+
 # allocate a `len`-slot memo-state array, each slot TYPE_MEMO_NONE
 # ---
 # a:   allocator
@@ -943,6 +989,19 @@ fun dnit_context(sc: *context.SemaContext) {
     if (sc.layout_state != nil && sc.a.decl_len > 0) {
         A.deallocate[u8](sc.s.alloc, sc.layout_state, sc.a.decl_len);
     }
+    # main-pass only like the memo: the sized annotations are already interned into
+    # `type_resolved_ty`, so no later episode needs the counts again (#2507).
+    if (sc.embed_len != nil && sc.a.type_len > 0) {
+        A.deallocate[u64](sc.s.alloc, sc.embed_len, sc.a.type_len);
+    }
+    # `build_result` clears this handle when it transfers the list to the result.
+    if (sc.embed_paths != nil && sc.embed_path_cap > 0) {
+        A.deallocate[intern.StrId](sc.s.alloc, sc.embed_paths, sc.embed_path_cap::usize);
+    }
+    sc.embed_len          = nil;
+    sc.embed_paths        = nil;
+    sc.embed_path_len     = 0;
+    sc.embed_path_cap     = 0;
     sc.expr_type          = nil;
     sc.type_resolved_ty   = nil;
     sc.type_resolved_memo = nil;
@@ -1007,6 +1066,85 @@ fun resolve_all_types(sc: *context.SemaContext) R.Result[bool, str] {
     var i: u32 = 0;
     for (i < sc.a.type_len::u32) {
         sc.type_resolved_ty[i] = infer.resolve_type_ref(sc, i);
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# resolve every `#[embed(...)]` in the module before any type is resolved
+#
+# Walks the same decl set the type pass will: top-level declarations plus the
+# selected arm of each declaration-scope comptime-if, so an `#[embed]` in a dead
+# arm records no dependency and reports nothing. The earlier input scan may have
+# refreshed its cache entry, but sema does not consume it.
+# ---
+# sc:  the context
+# ret: true once every embed is resolved, or the first allocation error
+fun resolve_all_embeds(sc: *context.SemaContext) R.Result[bool, str] {
+    val opt_module: O.Option[*module.Module] = ast.get_module(sc.a, sc.a.root_module);
+    if (O.is_none[*module.Module](opt_module)) {
+        ret R.err[bool, str]("root_module is not set on this Ast");
+    }
+    val mnode: *module.Module = O.unwrap[*module.Module](opt_module);
+    ret resolve_embeds_in_list(sc, mnode.decls_start, mnode.decls_len);
+}
+
+# walk a decl list in source order, resolving each `#[embed]` it carries
+# ---
+# sc:    the context
+# start: index of the first DeclId in the list
+# len:   number of decls in the list
+# ret:   true once the list is walked, or the first allocation error
+fun resolve_embeds_in_list(sc: *context.SemaContext, start: u32, len: u32) R.Result[bool, str] {
+    var i: u32 = 0;
+    for (i < len) {
+        val did: id.DeclId = sc.a.decl_ids[start + i];
+        val r: R.Result[bool, str] = resolve_embeds_one(sc, did);
+        if (R.is_err[bool, str](r)) { ret r; }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# resolve decl `did`'s `#[embed]`, recursing into a comptime-if's selected arm
+# ---
+# sc:  the context
+# did: the decl to inspect
+# ret: true once handled, or an allocation error
+fun resolve_embeds_one(sc: *context.SemaContext, did: id.DeclId) R.Result[bool, str] {
+    val opt_decl: O.Option[*decl.Decl] = ast.get_decl(sc.a, did);
+    if (O.is_none[*decl.Decl](opt_decl)) { ret R.err[bool, str]("DeclId out of range"); }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](opt_decl);
+
+    if (d.kind == decl.DECL_KIND_COMPTIME_IF) {
+        val ci: *decl.DeclComptimeIf = ?d.data.comptime_if;
+        var b: u32 = 0;
+        for (b < ci.branches_len) {
+            val br: *decl.ComptimeBranch = ?sc.a.comptime_branches[ci.branches_start + b];
+            val ra: R.Result[bool, str] = comptime_branch_active(sc, br);
+            if (R.is_err[bool, str](ra)) { ret ra; }
+            if (R.unwrap_ok[bool, str](ra)) {
+                ret resolve_embeds_in_list(sc, br.body_start, br.body_len);
+            }
+            b = b + 1;
+        }
+        ret R.ok[bool, str](true);
+    }
+
+    var found: bool = false;
+    var i: u32 = 0;
+    for (i < d.decorators_len) {
+        val dec: *decl.Decorator = ?sc.a.decorators[d.decorators_start + i];
+        if (decorator_named(sc, dec, "embed")) {
+            if (found) {
+                context.report(sc, dec.name, "a declaration can carry only one `embed` decorator");
+            }
+            or {
+                val r: R.Result[bool, str] = embed.resolve_one(sc, did, d, dec);
+                if (R.is_err[bool, str](r)) { ret r; }
+                found = true;
+            }
+        }
         i = i + 1;
     }
     ret R.ok[bool, str](true);
@@ -1420,7 +1558,11 @@ fun validate_one_decorator(sc: *context.SemaContext, d: *decl.Decl, dec: *decl.D
         validate_naked(sc, d, dec);
         ret;
     }
-    context.report(sc, dec.name, "unknown decorator; valid directives are symbol, section, inline, noinline, align, library, oblivious, scalar, naked");
+    # `embed`'s whole rule set - argument shape, target, element type, length
+    # agreement - is checked by the pre-type-resolution pass that has to read the
+    # file anyway (#2507). Re-checking any of it here would report it twice.
+    if (decorator_named(sc, dec, "embed")) { ret; }
+    context.report(sc, dec.name, "unknown decorator; valid directives are symbol, section, inline, noinline, align, library, oblivious, scalar, naked, embed");
 }
 
 # validate a `#[naked]` decorator: its argument shape, its target, the decorators it
@@ -2353,10 +2495,18 @@ fun build_result(sc: *context.SemaContext) R.Result[context.SemaResult, str] {
     out.expr_count       = sc.a.expr_len::u32;
     out.type_count       = sc.a.type_len::u32;
     out.decl_count       = sc.a.decl_len::u32;
+    out.embed_paths      = sc.embed_paths;
+    out.embed_path_count = sc.embed_path_len;
 
     sc.expr_type        = nil;
     sc.type_resolved_ty = nil;
     sc.decl_type        = nil;
+    # the list is transferred, not copied; `dnit_context` must not free it, and its
+    # capacity travels to the result so `dnit_result` frees exactly what was taken.
+    out.embed_path_cap  = sc.embed_path_cap;
+    sc.embed_paths      = nil;
+    sc.embed_path_cap   = 0;
+    sc.embed_path_len   = 0;
     dnit_context(sc);
 
     ret R.ok[context.SemaResult, str](out);

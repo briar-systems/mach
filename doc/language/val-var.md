@@ -62,13 +62,23 @@ ext var errno: i32;                        # imported mutable datum
 
 - No initializer. `ext val x: T = ...;` is an error — the definition, and its
   value, live in the providing object (mirrors `ext fun`'s absent body).
-- The `symbol` and `library` decorators and the static/dynamic linking inputs
-  work exactly as for [`ext fun`](ext-fun.md).
+- The symbol name (the target's C spelling of the identifier), the `symbol` and
+  `library` decorators, and the static/dynamic linking inputs all work exactly as
+  for [`ext fun`](ext-fun.md).
 - On a dynamic target the reference is emitted GOT-indirect so the loader binds
   it to the runtime definition (ELF: an `R_*_GLOB_DAT` GOT slot); an ordinary
   cross-module reference to a `val`/`var` defined elsewhere in the same artifact
   stays directly addressed. Executed dynamic-import resolution is proven on the
   native ELF legs.
+
+## `#[embed(...)]` — the other exemption to "requires an initializer"
+
+A `val` carrying `#[embed("path")]` also carries no initializer — the named
+file's content **is** the initializer, read at compile time. It is the second
+(and only other) exemption to `val`'s initializer requirement, alongside `ext`
+above; unlike `ext`, the binding still owns real storage, placed in read-only
+data. See [decorators.md](decorators.md#embedstr--compile-time-file-embedding)
+for the full rule set.
 
 ## No inference
 
@@ -88,3 +98,4 @@ typed suffix (`42i64`).
 
 - [literals.md](literals.md) — numeric / string / char literal forms
 - [types.md](types.md) — the type grammar for the annotation
+- [decorators.md](decorators.md#embedstr--compile-time-file-embedding) — `#[embed]`, the other initializer exemption

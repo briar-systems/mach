@@ -74,6 +74,8 @@ targets = ["*"]                        # which declared targets build it ("*" = 
 link    = []                           # [link.X] names this artifact links
 need    = []                           # [step.X] names this artifact demands directly
 # subsystem = "gui"                    # optional: windows console/GUI selector
+# icon = "assets/demo.ico"             # optional: PE executable icon
+# manifest = "assets/demo.manifest"    # optional: PE application manifest
 
 [dep.std]                              # a dependency
 git = "https://github.com/briar-systems/mach-std"
@@ -354,6 +356,8 @@ reads the selected artifact's name.
 | `link`    | yes | Array of `[link.X]` names this artifact links (see below). `[]` for none. |
 | `need`    | yes | Array of `[step.X]` names this artifact demands directly, for step outputs that are not themselves link inputs. `[]` for none. |
 | `subsystem` | no | `"console"` (default) or `"gui"` — the environment a windows executable declares it runs under (see below). |
+| `icon` | no | Project-root-relative `.ico` path embedded in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
+| `manifest` | no | Project-root-relative application-manifest path embedded byte-for-byte in a Windows executable's PE resources. Non-empty path string; `bin` artifacts only. |
 
 - **`bin`** links an executable at the resolved `out` path.
 - **`static`** materialises a real `ar` archive at the resolved `out` path — the
@@ -394,6 +398,48 @@ stays one declaration read by every build, rather than a per-platform file.
 
 `--subsystem console|gui` overrides the key for one invocation; see
 [cli.md](cli.md#mach-build).
+
+### `icon` / `manifest` — Windows executable resources
+
+```toml
+[artifact.game]
+kind = "bin"
+entry = "main.mach"
+out = "bin/game.exe"
+targets = ["*"]
+link = []
+need = []
+icon = "assets/game.ico"
+manifest = "assets/game.manifest"
+```
+
+On a Windows target, either key adds a `.rsrc` section. `icon` must name a valid
+ICO container; mach emits each contained image as `RT_ICON` and an
+`RT_GROUP_ICON` that indexes them. `manifest` is emitted unchanged as
+`RT_MANIFEST`. A `VS_VERSIONINFO` (`RT_VERSION`) accompanies the declared
+resources with these schema-derived values:
+
+| Version field | Value |
+|---------------|-------|
+| `FileVersion`, `ProductVersion` | `[project].version` |
+| `InternalName`, `ProductName` | the `[artifact.<name>]` table key |
+| `OriginalFilename` | basename of the resolved executable output, retaining an extension such as `.exe` |
+
+There is no `FileDescription`: the live manifest schema has no accepted
+description field for an artifact. Strings are converted from strict UTF-8 to
+UTF-16, including surrogate pairs; malformed text, malformed/empty resources,
+and values that exceed PE's 16/32-bit fields fail the build instead of being
+truncated.
+
+Paths use the same portable `/` spelling as other manifest paths and are resolved
+against the project root. A generating `[step.X]` must appear in `need` and write
+the named path before linking. Resource paths and contents participate in the
+link fingerprint, so changing an asset at the same path relinks a warm build.
+
+The keys remain valid in a multi-target artifact, but are completely inert off
+Windows: mach does not resolve or read either path and ELF, Mach-O, and raw output
+remain unchanged. `static` and `shared` artifacts reject these executable-only
+keys.
 
 ## `[link.<name>]` — link requirements
 
@@ -468,7 +514,7 @@ On ELF the key is accepted and validated but changes no emitted bytes, since tha
 loader resolves imports by global search.
 
 Whether an input links **statically** or **dynamically** follows the resolved file
-— a loose `.o` or static `.a` links statically; ELF `.so`, Mach-O `.dylib`,
+— a loose `.o`/`.obj` or static `.a`/`.lib` links statically; ELF `.so`, Mach-O `.dylib`,
 and PE `.dll` inputs are recorded using their format's canonical loader name.
 An `@rpath/` Mach-O install name also retains the directory where resolution found
 the dylib, which the executable records as `LC_RPATH`. Darwin frameworks use a
@@ -505,10 +551,25 @@ A step is cached by content: its `in` contents plus its expanded `cmd` fingerpri
 the step (the query engine's `Q_LINK_CONFIG` pattern). An unchanged step whose
 outputs still exist is skipped; change an input or the command and it re-runs.
 
+A source file's `#[embed(...)]` decorator (see
+[decorators.md](language/decorators.md#embedstr--compile-time-file-embedding))
+is a build input under the same content-based principle, by a different
+mechanism: it has no `[step]` stanza of its own. The embedded file's content
+digest is published into a `Q_EMBED_FILE` query input that the embedding
+module's sema depends on, so an edited asset invalidates that module's cached
+sema and an untouched asset is a cache hit — the same guarantee `in` gives a
+step, keyed to one file instead of a step's whole input list, and by digest
+rather than timestamp either way.
+
 **Output homing.** `{project.out}` resolves to the **root** project's expanded
 `out` in every manifest of the closure. A dependency's step outputs land in the
 consumer's output tree — exactly as a dependency's compiled modules do — and the
-dependency's own checkout is never written to.
+dependency's own checkout is never written to. For an exported dependency step,
+the command receives `{project.out}` as an absolute path rooted at the consumer;
+it does not depend on whether `dep/<alias>` is a directory or a local-path symlink,
+nor on the directory from which the consumer was invoked. An ordinary relative
+consumer root (including `./` segments) and its normalized absolute spelling produce
+the same expanded command and cache key.
 
 **Target environment.** Every step process additionally inherits the active
 build cell's target tuple as `MACH_TARGET_ISA`, `MACH_TARGET_OS`, and

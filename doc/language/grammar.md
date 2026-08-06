@@ -395,7 +395,7 @@ type ::= secret-type
 
 secret-type ::= "^" type
 ptr-type    ::= "*" type
-array-type  ::= "[" expr "]" type
+array-type  ::= "[" ( expr | "_" ) "]" type
 named-type  ::= dotted-path [ type-args ]
 type-args   ::= "[" [ type { "," type } [ "," ] ] "]"
 
@@ -422,6 +422,12 @@ Notes:
   constant), including `$size_of(T)` / `$align_of(T)` — see
   [comptime-intrinsics.md](comptime-intrinsics.md). Nesting (`[N][M]T`) falls out
   of the recursion.
+- `[_]T` is an inferred array length (#2507): the length is not written but taken
+  from elsewhere. It is legal **only** on a `val` carrying `#[embed(...)]`, where
+  the length comes from the embedded file's byte count; written anywhere else it
+  is rejected — "an inferred array length `[_]` is only valid on an
+  `#[embed(...)]` declaration". See
+  [decorators.md](decorators.md#embedstr--compile-time-file-embedding).
 - `named-type` covers both plain names (`i64`, `Point`) and generic
   instantiations (`Pair[i64, u8]`, `Map[str, u32]`). The dotted path allows
   module-qualified names (`core.Thing`).

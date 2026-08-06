@@ -3,7 +3,8 @@
 # Builds relocatable debug sections into the per-module `of.ObjectImage` through the
 # `be.obj` builder, alongside `pack_text`: `.debug_abbrev`, a `.debug_info` compile
 # unit with a `DW_TAG_subprogram` per function and a `DW_TAG_base_type` per primitive
-# return type, a `.debug_str` string table, and a DWARF 5 `.debug_line` program. It
+# return type, `.debug_str` / `.debug_rnglists` tables, and a DWARF 5 `.debug_line`
+# program. It
 # speaks only the abstract object model - SK_DEBUG sections, anchor symbols, and
 # `RK_*` relocations - so the same bytes serve every container: the active `OfVTable`
 # writer maps the kinds and carries the sections, and no ELF/Mach-O knowledge lives
@@ -11,9 +12,9 @@
 # target's object format is DWARF-based.
 #
 # The line program is driven by the encoder's retained PC<->source rows (#1691),
-# resolved to file/line through `source.position`. Function ranges (low_pc/high_pc,
-# per-function `DW_LNE_set_address`) come from the `of.Symbol` marks the encoder
-# emitted; each subprogram's readable name and return type come from the `ir.Module`
+# resolved to file/line through `source.position`. Exact CU ranges, subprogram
+# low_pc/high_pc pairs, and per-function `DW_LNE_set_address` entries come from the
+# `of.Symbol` marks the encoder emitted; each readable name and return type come from the `ir.Module`
 # (`Function.disp` / `Function.ret_sem`, #1703). Names are deduplicated through
 # `.debug_str` (`DW_FORM_strp`); addresses stay direct (`DW_FORM_addr`) with no
 # `.debug_addr`/`.debug_str_offsets` indirection.
@@ -132,12 +133,13 @@ val DW_LLE_end_of_list:  u8 = 0x00;
 val DW_LLE_base_address: u8 = 0x06;
 val DW_LLE_offset_pair:  u8 = 0x04;
 
-# DWARF 5 range-list entry codes for `.debug_rnglists`; an inlined instance's
-# DW_AT_ranges names a list of DW_RLE_base_address (its enclosing function's low_pc)
-# then DW_RLE_offset_pair per contiguous `.text` extent, closed by DW_RLE_end_of_list
+# DWARF 5 range-list entry codes for `.debug_rnglists`; a compilation unit uses one
+# DW_RLE_start_length per function, while an inlined instance uses DW_RLE_base_address
+# then DW_RLE_offset_pair per contiguous `.text` extent. each list ends explicitly.
 val DW_RLE_end_of_list:  u8 = 0x00;
 val DW_RLE_base_address: u8 = 0x05;
 val DW_RLE_offset_pair:  u8 = 0x04;
+val DW_RLE_start_length: u8 = 0x07;
 
 val DW_OP_reg0:        u8 = 0x50;
 val DW_OP_breg0:       u8 = 0x70;
@@ -779,18 +781,17 @@ fun push_loc_reloc(list: *LocReloc, count: *u32, off: u32, sym: intern.StrId) {
     @count = @count + 1;
 }
 
-# one `.debug_rnglists` base-address relocation: a DW_RLE_base_address address field
-# resolves to the enclosing function symbol, so an instance's offset-pair ranges are
-# relative to that function's low_pc (identical shape to LocReloc).
+# one `.debug_rnglists` address relocation: either a CU's DW_RLE_start_length start or
+# an inline list's DW_RLE_base_address resolves to its function symbol
 # ---
 # off: patch-site byte offset within `.debug_rnglists`
-# sym: enclosing function symbol name
+# sym: target function symbol name
 rec RngReloc {
     off: u32;
     sym: intern.StrId;
 }
 
-# append a `.debug_rnglists` base-address relocation to the growing list
+# append a `.debug_rnglists` address relocation to the growing list
 fun push_rng_reloc(list: *RngReloc, count: *u32, off: u32, sym: intern.StrId) {
     list[@count].off = off;
     list[@count].sym = sym;
@@ -1113,8 +1114,7 @@ fun build_abbrev(b: *enc.ByteBuf) {
     emit_attr(b, DW_AT_name,     DW_FORM_string);
     emit_attr(b, DW_AT_comp_dir, DW_FORM_string);
     emit_attr(b, DW_AT_language, DW_FORM_data2);
-    emit_attr(b, DW_AT_low_pc,   DW_FORM_addr);
-    emit_attr(b, DW_AT_high_pc,  DW_FORM_data8);
+    emit_attr(b, DW_AT_ranges,   DW_FORM_sec_offset);
     emit_attr(b, DW_AT_stmt_list, DW_FORM_sec_offset);
     uleb(b, 0); uleb(b, 0);
 
@@ -1614,30 +1614,28 @@ fun resolve_type_fixups(b: *enc.ByteBuf, tc: *TypeCtx, fixups: *TypeFixup, nfix:
 }
 
 # build the `.debug_info` compile unit: the DWARF 5 unit header, the CU DIE
-# (producer / name / comp_dir strings, language, code range, stmt_list), then a type DIE
+# (producer / name / comp_dir strings, language, exact code ranges, stmt_list), then a type DIE
 # per gathered type (base scalars + composite records / unions / arrays / pointers) and a
-# `DW_TAG_subprogram` DIE per function, closed by a null DIE. Records the CU low_pc /
-# stmt_list field offsets and appends an `InfoReloc` for every strp (name) and addr
-# (low_pc) field
+# `DW_TAG_subprogram` DIE per function, closed by a null DIE. Appends an `InfoReloc`
+# for the CU range-list pointer and every strp (name) and addr (low_pc) field.
 # ---
 # b:            the buffer the info bytes are appended to
 # address_size: target pointer width in bytes
 # producer:     DW_AT_producer text
 # name:         DW_AT_name text (the CU's primary source path)
 # comp_dir:     DW_AT_comp_dir text
-# high_pc:      code span in bytes (high_pc - low_pc)
+# cu_rnglist_off: byte offset of the CU's list in `.debug_rnglists`
 # fb_reg:       frame-base DWARF register number for a function with a frame
 # fb_omit_reg:  frame-base DWARF register number for a frame-omitting function
 # funcs/nfuncs: the module's functions (with resolved decl / return metadata)
 # tc:           the gathered type table (with resolved DIE / string offsets)
 # relocs:       out - the InfoReloc list
 # reloc_count:  out - number of InfoRelocs appended
-# low_off:      out - byte offset of the CU 8-byte low_pc field
 # stmt_off:     out - byte offset of the CU 4-byte stmt_list field
 # fixups:       scratch - the type-DIE ref4 patch list (cap >= type count + member count)
 fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp_dir: str,
-               high_pc: u64, fb_reg: i32, fb_omit_reg: i32, funcs: *DwFunc, nfuncs: u32, tc: *TypeCtx,
-               vars: *DwVar, relocs: *InfoReloc, reloc_count: *u32, low_off: *u32, stmt_off: *u32,
+               cu_rnglist_off: u32, fb_reg: i32, fb_omit_reg: i32, funcs: *DwFunc, nfuncs: u32, tc: *TypeCtx,
+               vars: *DwVar, relocs: *InfoReloc, reloc_count: *u32, stmt_off: *u32,
                s: *session.Session, irmod: *ir.Module, strtab: *StrTab,
                inlines: *DwInline, ninl: u32, iranges: *DwInlineRange, fixups: *TypeFixup) {
     val len_pos: usize = b.len;
@@ -1653,9 +1651,9 @@ fun build_info(b: *enc.ByteBuf, address_size: u8, producer: str, name: str, comp
     emit_cstr(b, name);
     emit_cstr(b, comp_dir);
     enc.emit_u16(b, DW_LANG_C);
-    @low_off = b.len::u32;
-    enc.emit_u64(b, 0);                 # low_pc (relocated)
-    enc.emit_u64(b, high_pc);           # high_pc (offset from low_pc)
+    push_info_reloc(relocs, reloc_count, b.len::u32, of.RK_ABS32, IRLT_RNGLIST,
+                    intern.STR_NIL, cu_rnglist_off::i64);
+    enc.emit_u32(b, 0);                 # ranges (relocated to .debug_rnglists)
     @stmt_off = b.len::u32;
     enc.emit_u32(b, 0);                 # stmt_list (relocated to .debug_line)
 
@@ -2144,21 +2142,23 @@ fun build_loclists(b: *enc.ByteBuf, funcs: *DwFunc, nfuncs: u32, vars: *DwVar, r
 }
 
 # build the DWARF 5 `.debug_rnglists` section: the unit header (offset_entry_count 0,
-# direct sec_offset) then one range list per multi-extent inlined instance. Each list is
-# a DW_RLE_base_address (the enclosing function's low_pc, relocated) then a
-# DW_RLE_offset_pair per contiguous extent, closed by DW_RLE_end_of_list; `rnglist_off`
-# is stamped so build_info patches the instance's DW_AT_ranges sec_offset. Single-extent
-# and nested instances are handled elsewhere. Range accuracy inherits the #1904 caveat.
+# direct sec_offset), an exact compilation-unit list with one DW_RLE_start_length per
+# function, then one range list per multi-extent inlined instance. each inline list is
+# a DW_RLE_base_address followed by DW_RLE_offset_pair entries. list offsets are stamped
+# so build_info can relocate each DW_AT_ranges sec_offset. range accuracy inherits the
+# #1904 caveat.
 # ---
 # b:            the buffer the rnglists bytes are appended to
-# funcs/nfuncs: the subprograms (for the enclosing function symbol + low_pc)
+# funcs/nfuncs: the subprograms and their exact function extents
 # inlines/ninl: the gathered instances (rnglist_off filled in place)
 # iranges:      the shared extent array
 # address_size: target pointer width
-# rng_relocs:   out - the base-address relocation list
+# rng_relocs:   out - the function-address relocation list
 # rng_reloc_count: out - number of RngRelocs appended
+# cu_rnglist_off: out - byte offset of the compilation-unit range list
 fun build_rnglists(b: *enc.ByteBuf, funcs: *DwFunc, nfuncs: u32, inlines: *DwInline, ninl: u32,
-                   iranges: *DwInlineRange, address_size: u8, rng_relocs: *RngReloc, rng_reloc_count: *u32) {
+                   iranges: *DwInlineRange, address_size: u8, rng_relocs: *RngReloc,
+                   rng_reloc_count: *u32, cu_rnglist_off: *u32) {
     val len_pos: usize = b.len;
     enc.emit_u32(b, 0);             # unit_length (backpatched)
     val body: usize = b.len;
@@ -2166,6 +2166,17 @@ fun build_rnglists(b: *enc.ByteBuf, funcs: *DwFunc, nfuncs: u32, inlines: *DwInl
     enc.emit_byte(b, address_size);
     enc.emit_byte(b, 0);           # segment_selector_size
     enc.emit_u32(b, 0);            # offset_entry_count (0 = direct sec_offset)
+
+    @cu_rnglist_off = b.len::u32;
+    var fi: u32 = 0;
+    for (fi < nfuncs) {
+        enc.emit_byte(b, DW_RLE_start_length);
+        push_rng_reloc(rng_relocs, rng_reloc_count, b.len::u32, funcs[fi].name);
+        emit_addr(b, address_size);
+        uleb(b, funcs[fi].size::u64);
+        fi = fi + 1;
+    }
+    enc.emit_byte(b, DW_RLE_end_of_list);
 
     var i: u32 = 0;
     for (i < ninl) {
@@ -2512,9 +2523,9 @@ fun gather_funcs(image: *of.ObjectImage, mirmod: *mir.MirModule, text_sec: u32, 
     }
 }
 
-# intern "<base>#suffix", a per-module-unique local name for a debug-section anchor
-# (the linker keys relocations on the symbol name, so the anchor must not collide
-# across objects)
+# intern "<base>#suffix", a per-module-unique name for a debug-section anchor
+# (global targets resolve across objects by symbol name, so the anchor must not
+# collide across objects)
 # ---
 # itn:     the session interner
 # base:    the module name text
@@ -2561,11 +2572,20 @@ fun add_reloc(image: *of.ObjectImage, sec: u32, offset: u32, kind: of.RelocKind,
 # ret:    ok(true), or an allocation error
 fun add_reloc_addend(image: *of.ObjectImage, sec: u32, offset: u32, kind: of.RelocKind,
                      sym: intern.StrId, addend: i64) R.Result[bool, str] {
+    # every debug relocation targets a symbol this image already carries: a
+    # function packed before the producer ran, or a section anchor the producer
+    # itself added. a target that is not there is a producer bug, not a symbol to
+    # declare extern.
+    val sym_ix: u32 = obj.symbol_index(image, sym);
+    if (sym_ix == of.SYMBOL_NONE) {
+        ret R.err[bool, str]("dwarf: relocation target absent from the image symbol table");
+    }
+
     var rel: of.Relocation;
     rel.section = sec;
     rel.offset  = offset;
     rel.kind    = kind;
-    rel.symbol  = sym;
+    rel.sym     = sym_ix;
     rel.addend  = addend;
     ret obj.add_relocation(image, rel);
 }
@@ -2650,29 +2670,17 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, mir
     var name: str = comp_dir;
     if (ft.count > 0) { name = file_path(s, ft.ids[0]); }
 
-    # subprograms cover only this module's own (non-weak) functions. a weak
-    # generic-instance copy is deduplicated by the linker to one winner, so a
-    # non-winning object's subprogram DIE would relocate outside its CU's contiguous
-    # range - an invalid parent/child range. their names return with COMDAT-style
-    # debug info in the multi-TU increment. the line table still covers every function.
+    # every function gets a subprogram DIE. final linking tombstones the low_pc of
+    # a weak copy whose atom loses deduplication, while the winning copy retains the
+    # live address and readable name (#2384).
     val rs2: R.Result[*DwFunc, str] = A.allocate[DwFunc](s.alloc, nfuncs::usize);
     if (R.is_err[*DwFunc, str](rs2)) { A.deallocate[DwFunc](s.alloc, funcs, nfuncs::usize); ret R.err[bool, str](R.unwrap_err[*DwFunc, str](rs2)); }
     val subs: *DwFunc = R.unwrap_ok[*DwFunc, str](rs2);
     var nsub: u32 = 0;
     var si: u32 = 0;
     for (si < nfuncs) {
-        if (!funcs[si].weak) { subs[nsub] = funcs[si]; nsub = nsub + 1; }
+        subs[nsub] = funcs[si]; nsub = nsub + 1;
         si = si + 1;
-    }
-
-    # the CU code range spans the subprogram functions (the ones this object keeps),
-    # so every emitted subprogram is contained; a module of only weak instances keeps
-    # the full-range fallback and emits no subprograms.
-    var cu_low_name: intern.StrId = funcs[0].name;
-    var high_pc: u64 = (funcs[nfuncs - 1].offset + funcs[nfuncs - 1].size - funcs[0].offset)::u64;
-    if (nsub > 0) {
-        cu_low_name = subs[0].name;
-        high_pc = (subs[nsub - 1].offset + subs[nsub - 1].size - subs[0].offset)::u64;
     }
 
     # variable capacity: an upper bound is the total variable-location record count
@@ -2816,12 +2824,10 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, mir
         ret rgi;
     }
 
-    # a `.debug_rnglists` section only when some instance (nested or not) is multi-extent.
-    var has_rnglists: bool = false;
-    var hr: u32 = 0;
-    for (hr < ninl) { if (inlines[hr].range_count > 1) { has_rnglists = true; } hr = hr + 1; }
-    # one DW_RLE_base_address reloc per multi-extent instance (bounded by the count).
-    val rng_reloc_cap: u32 = inl_cap + 1;
+    # every CU has an exact function range list; multi-extent inline instances append
+    # their own lists to the same contribution.
+    val has_rnglists: bool = true;
+    val rng_reloc_cap: u32 = nsub + inl_cap + 1;
     val rrr: R.Result[*RngReloc, str] = A.allocate[RngReloc](s.alloc, rng_reloc_cap::usize);
     if (R.is_err[*RngReloc, str](rrr)) {
         A.deallocate[DwInlineRange](s.alloc, iranges, ir_cap::usize); A.deallocate[DwInline](s.alloc, inlines, inl_cap::usize);
@@ -2858,19 +2864,18 @@ pub fun produce(s: *session.Session, tgt: *target.Target, irmod: *ir.Module, mir
     if (has_loclists) {
         build_loclists(?b_loclists, subs, nsub, vars, ranges, address_size, loc_relocs, ?loc_reloc_count);
     }
-    if (has_rnglists) {
-        build_rnglists(?b_rnglists, subs, nsub, inlines, ninl, iranges, address_size, rng_relocs, ?rng_reloc_count);
-    }
-    var low_off:  u32 = 0;
+    var cu_rnglist_off: u32 = 0;
+    build_rnglists(?b_rnglists, subs, nsub, inlines, ninl, iranges, address_size,
+                   rng_relocs, ?rng_reloc_count, ?cu_rnglist_off);
     var stmt_off: u32 = 0;
-    build_info(?b_info, address_size, producer, name, comp_dir, high_pc,
+    build_info(?b_info, address_size, producer, name, comp_dir, cu_rnglist_off,
                frame_base_reg(tgt), frame_base_omit_reg(tgt),
-               subs, nsub, ?tc, vars, info_relocs, ?info_reloc_count, ?low_off, ?stmt_off,
+               subs, nsub, ?tc, vars, info_relocs, ?info_reloc_count, ?stmt_off,
                s, irmod, ?strtab, inlines, ninl, iranges, type_fixups);
 
-    val pr: R.Result[bool, str] = install(s, image, itn, funcs, nfuncs, cu_low_name,
+    val pr: R.Result[bool, str] = install(s, image, itn, funcs, nfuncs,
                                           ?b_abbrev, ?b_line, ?b_info, ?strtab.buf, ?b_loclists, has_loclists,
-                                          ?b_rnglists, has_rnglists, addr_off, low_off, stmt_off, info_relocs, info_reloc_count,
+                                          ?b_rnglists, has_rnglists, addr_off, stmt_off, info_relocs, info_reloc_count,
                                           loc_relocs, loc_reloc_count, rng_relocs, rng_reloc_count);
 
     enc.buf_dnit(?b_abbrev);
@@ -3727,21 +3732,19 @@ fun first_row_loc(rows: *enc.LineRow, row_count: u32, text_sec: u32, start: u32,
 # itn:      the session interner
 # funcs:    the sorted function ranges (every function, for the line table)
 # nfuncs:   number of functions
-# cu_low_name: symbol the CU DW_AT_low_pc relocates to (the lowest subprogram)
 # b_abbrev/b_line/b_info/b_str: the built section bytes
 # b_loclists: the built `.debug_loclists` bytes (empty when has_loclists is false)
 # has_loclists: true when some variable's home moves (install the loclists section)
 # addr_off: per-function set_address field offsets in `.debug_line`
-# low_off:  low_pc field offset in `.debug_info`
 # stmt_off: stmt_list field offset in `.debug_info`
 # info_relocs/info_reloc_count: the deferred `.debug_info` relocations
 # loc_relocs/loc_reloc_count:   the deferred `.debug_loclists` base-address relocations
 # ret:      ok(true), or an allocation error
 fun install(s: *session.Session, image: *of.ObjectImage, itn: *intern.Interner,
-            funcs: *DwFunc, nfuncs: u32, cu_low_name: intern.StrId, b_abbrev: *enc.ByteBuf, b_line: *enc.ByteBuf,
+            funcs: *DwFunc, nfuncs: u32, b_abbrev: *enc.ByteBuf, b_line: *enc.ByteBuf,
             b_info: *enc.ByteBuf, b_str: *enc.ByteBuf, b_loclists: *enc.ByteBuf, has_loclists: bool,
             b_rnglists: *enc.ByteBuf, has_rnglists: bool,
-            addr_off: *u32, low_off: u32, stmt_off: u32,
+            addr_off: *u32, stmt_off: u32,
             info_relocs: *InfoReloc, info_reloc_count: u32,
             loc_relocs: *LocReloc, loc_reloc_count: u32,
             rng_relocs: *RngReloc, rng_reloc_count: u32) R.Result[bool, str] {
@@ -3798,9 +3801,9 @@ fun install(s: *session.Session, image: *of.ObjectImage, itn: *intern.Interner,
         if (R.is_err[u32, str](llar)) { ret R.err[bool, str](R.unwrap_err[u32, str](llar)); }
     }
 
-    # `.debug_rnglists` + its anchor, only when some inlined instance is multi-extent;
-    # the anchor at offset 0 lets each inlined_subroutine's DW_AT_ranges sec_offset (abs32
-    # + addend) resolve into this module's contribution after the linker concatenates it.
+    # `.debug_rnglists` + its anchor; the anchor at offset 0 lets the CU and each
+    # inlined_subroutine's DW_AT_ranges sec_offset resolve into this module's
+    # contribution after the linker concatenates it.
     var rnglists_sec: u32 = 0;
     var rnglists_anchor: intern.StrId = intern.STR_NIL;
     if (has_rnglists) {
@@ -3816,10 +3819,7 @@ fun install(s: *session.Session, image: *of.ObjectImage, itn: *intern.Interner,
         if (R.is_err[u32, str](rlar)) { ret R.err[bool, str](R.unwrap_err[u32, str](rlar)); }
     }
 
-    # .debug_info: low_pc -> the CU's lowest subprogram function (abs64), stmt_list ->
-    # .debug_line (abs32).
-    val r1: R.Result[bool, str] = add_reloc(image, info_sec, low_off, of.RK_ABS64, cu_low_name);
-    if (R.is_err[bool, str](r1)) { ret r1; }
+    # .debug_info: stmt_list -> .debug_line (abs32).
     val r2: R.Result[bool, str] = add_reloc(image, info_sec, stmt_off, of.RK_ABS32, anchor);
     if (R.is_err[bool, str](r2)) { ret r2; }
 
@@ -3847,7 +3847,7 @@ fun install(s: *session.Session, image: *of.ObjectImage, itn: *intern.Interner,
         li = li + 1;
     }
 
-    # .debug_rnglists: each DW_RLE_base_address -> its instance's enclosing function (abs64).
+    # .debug_rnglists: each list address -> its function symbol (abs64).
     var ri3: u32 = 0;
     for (ri3 < rng_reloc_count) {
         val rr3: *RngReloc = ?rng_relocs[ri3];
@@ -3866,9 +3866,9 @@ fun install(s: *session.Session, image: *of.ObjectImage, itn: *intern.Interner,
     ret R.ok[bool, str](true);
 }
 
-# add a per-module-unique GLOBAL anchor symbol at offset 0 of a debug section (the
-# linker keys relocations on the symbol name, so relocs into a concatenated debug
-# section resolve to this module's contribution)
+# add a per-module-unique GLOBAL anchor symbol at offset 0 of a debug section
+# (global targets resolve across objects by symbol name, so relocs into a
+# concatenated debug section resolve to this module's contribution)
 # ---
 # image: the object image
 # name:  the interned anchor name
@@ -4150,7 +4150,14 @@ test "mach.lang.be.codegen.dwarf.build_abbrev:golden" {
     # ABBREV_VECTOR_ARRAY (0x1f): DW_TAG_array_type, children, element type ref4, DW_AT_GNU_vector (0x2107 -> uleb 0x87 0x42) flag_present.
     e[416]=0x1f; e[417]=0x01; e[418]=0x01; e[419]=0x49; e[420]=0x13; e[421]=0x87; e[422]=0x42; e[423]=0x19; e[424]=0x00; e[425]=0x00;
     e[426]=0x00;   # null abbrev code terminates the table
-    val ok: bool = buf_eq(?b, ?e[0], 427);
+    # the CU replaces the old low_pc/high_pc pairs at e[11..15) with one ranges pair;
+    # every later abbreviation byte is otherwise unchanged.
+    var ok: bool = b.len == 425;
+    var bi: usize = 0;
+    for (ok && bi < 11) { if (b.data[bi] != e[bi]) { ok = false; } bi = bi + 1; }
+    if (ok && (b.data[11] != DW_AT_ranges || b.data[12] != DW_FORM_sec_offset)) { ok = false; }
+    bi = 13;
+    for (ok && bi < 425) { if (b.data[bi] != e[bi + 2]) { ok = false; } bi = bi + 1; }
     enc.buf_dnit(?b);
     if (!ok) { ret 1; }
     ret 0;
@@ -4626,17 +4633,15 @@ test "mach.lang.be.codegen.dwarf.build_loclists:ranges" {
     ret code;
 }
 
-# build_rnglists emits the DWARF 5 header and, for one multi-extent inlined instance
-# with two extents, a DW_RLE_base_address (with a recorded relocation), a
-# DW_RLE_offset_pair per extent (function-relative), and a DW_RLE_end_of_list - byte for
-# byte, with the instance's rnglist_off stamped for its DW_AT_ranges sec_offset
+# build_rnglists emits the DWARF 5 header, an exact CU start/length list, and one
+# multi-extent inline list byte for byte, recording both address relocations and offsets
 test "mach.lang.be.codegen.dwarf.build_rnglists:ranges" {
     var alloc: A.Allocator;
     page.make(?alloc);
     var code: i32 = 0;
 
     var funcs: [1]DwFunc;
-    funcs[0].name = intern.STR_NIL; funcs[0].offset = 0;
+    funcs[0].name = intern.STR_NIL; funcs[0].offset = 0; funcs[0].size = 12;
     var inls: [1]DwInline;
     inls[0].func_idx = 0; inls[0].parent = 0; inls[0].range_start = 0; inls[0].range_count = 2; inls[0].rnglist_off = 0;
     var irng: [2]DwInlineRange;
@@ -4645,24 +4650,28 @@ test "mach.lang.be.codegen.dwarf.build_rnglists:ranges" {
 
     var relocs: [4]RngReloc;
     var nrel: u32 = 0;
+    var cu_off: u32 = 0;
     var b: enc.ByteBuf = enc.buf_init(?alloc);
-    build_rnglists(?b, ?funcs[0], 1, ?inls[0], 1, ?irng[0], 8, ?relocs[0], ?nrel);
+    build_rnglists(?b, ?funcs[0], 1, ?inls[0], 1, ?irng[0], 8, ?relocs[0], ?nrel, ?cu_off);
 
-    var e: [28]u8;
-    e[0]=0x18; e[1]=0x00; e[2]=0x00; e[3]=0x00;                      # unit_length = 24
+    var e: [39]u8;
+    e[0]=0x23; e[1]=0x00; e[2]=0x00; e[3]=0x00;                      # unit_length = 35
     e[4]=0x05; e[5]=0x00;                                            # version 5
     e[6]=0x08; e[7]=0x00;                                            # address_size, segment_selector_size
     e[8]=0x00; e[9]=0x00; e[10]=0x00; e[11]=0x00;                    # offset_entry_count 0
-    e[12]=0x05;                                                      # DW_RLE_base_address
+    e[12]=0x07;                                                      # DW_RLE_start_length
     e[13]=0x00; e[14]=0x00; e[15]=0x00; e[16]=0x00; e[17]=0x00; e[18]=0x00; e[19]=0x00; e[20]=0x00;
-    e[21]=0x04; e[22]=0x00; e[23]=0x04;                             # offset_pair [0,4)
-    e[24]=0x04; e[25]=0x08; e[26]=0x0C;                             # offset_pair [8,12)
-    e[27]=0x00;                                                      # DW_RLE_end_of_list
-    val ok: bool = buf_eq(?b, ?e[0], 28);
+    e[21]=0x0C; e[22]=0x00;                                         # length 12, end of CU list
+    e[23]=0x05;                                                      # DW_RLE_base_address
+    e[24]=0x00; e[25]=0x00; e[26]=0x00; e[27]=0x00; e[28]=0x00; e[29]=0x00; e[30]=0x00; e[31]=0x00;
+    e[32]=0x04; e[33]=0x00; e[34]=0x04;                             # offset_pair [0,4)
+    e[35]=0x04; e[36]=0x08; e[37]=0x0C;                             # offset_pair [8,12)
+    e[38]=0x00;                                                      # DW_RLE_end_of_list
+    val ok: bool = buf_eq(?b, ?e[0], 39);
     enc.buf_dnit(?b);
     if (!ok) { code = 1; }
-    if (nrel != 1) { code = 1; }
-    if (relocs[0].off != 13) { code = 1; }       # the base-address address field
-    if (inls[0].rnglist_off != 12) { code = 1; } # the list begins at DW_RLE_base_address
+    if (nrel != 2) { code = 1; }
+    if (relocs[0].off != 13 || relocs[1].off != 24) { code = 1; }
+    if (cu_off != 12 || inls[0].rnglist_off != 23) { code = 1; }
     ret code;
 }

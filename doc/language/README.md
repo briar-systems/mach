@@ -17,7 +17,7 @@ neighboring links; start from the index below.
 ## Declarations
 
 - [visibility.md](visibility.md) — `pub` and `ext` modifiers
-- [decorators.md](decorators.md) — codegen decorators, `#[name]` (`symbol`, `library`, `inline`, `align`, `section`)
+- [decorators.md](decorators.md) — codegen decorators, `#[name]` (`symbol`, `library`, `inline`, `align`, `section`, `embed`)
 - [def.md](def.md) — type alias
 - [rec.md](rec.md) — record
 - [uni.md](uni.md) — raw union and the discriminated-value convention
