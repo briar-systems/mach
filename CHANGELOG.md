@@ -5,6 +5,54 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.7.0] - 2026-08-06
+
+Adds compile-time file embedding, Windows executable resources, and PE subsystem
+selection, and makes linking foreign C objects correct on every object format —
+the static vendored-C path a real application needs. The foreign-object
+relocation core was re-keyed after mis-relocating section symbols, and the
+Windows target now reads import libraries, the MinGW static CRT, dllimport
+indirection, and x64 unwind tables; Mach-O links real clang output end to end.
+
+### Added
+- lang: `#[embed("path")]` embeds a file as a typed byte array at compile time,
+  with no runtime I/O (#2507, #2518).
+- link: PE executables carry `.rsrc` resources — icon, version info, and an
+  application manifest — validated and fingerprinted for warm relinking
+  (#2509, #2561).
+- link: PE subsystem selection for Windows executables (#2508, #2519).
+- link: symbol→DLL import mapping is pinnable per static archive on PE
+  (`symbols = [...]`), attributing each import to its loader library (#2514).
+- link: COFF short import records are read from import libraries, so archives
+  derived from real Windows import libraries link without hand-written symbol
+  lists (#2525, #2542).
+- link: PE dllimport indirection — `__imp_X` references address X's loader-
+  filled slot directly (#2526, #2549); duplicate `__imp_X` references to an
+  in-image X share one local pointer cell (#2552, #2555).
+- driver: dependency step outputs root at the dependency's own output directory
+  instead of clobbering module objects (#2558, #2560).
+
+### Fixed
+- link: foreign C objects no longer mis-relocate — relocations key on symbol
+  index rather than symbol name, repairing section-symbol resolution across
+  ELF, COFF, and Mach-O alike (#2520, #2537).
+- link: the MinGW static CRT archives link as vendored Windows CRT (#2530,
+  #2551); `mach test` satisfies its generated entrypoint's `main` before
+  archive selection, so an unrelated CRT startup member stays unselected
+  (#2562, #2564).
+- link: foreign x64 unwind tables (`.pdata`/`.xdata`) publish into PE output
+  (#2535, #2545), and COFF section-relative debug relocations apply (#2553,
+  #2554).
+- link: BSD ar extended member names decode (#2543, #2544).
+- macho: foreign clang objects link on Mach-O (#2521, #2533) with x86_64
+  SIGNED_1/2/4 immediate-store relocations parsed (#2546, #2550), x64
+  GOT/GOT_LOAD relocations resolved through synthesized, dyld-bound slots
+  (#2557, #2559), and absolute 64-bit references to imports bound in place by
+  dyld — the ObjC class-metadata shape (#2563, #2565).
+- elf: the object reader admits x86_64's SHT_X86_64_UNWIND `.eh_frame` (#2531).
+- codegen: weak-function DWARF entries retain their winning addresses (#2384,
+  #2556).
+
 ## [4.6.0] - 2026-08-05
 
 Opens inline assembly to the privileged and system instruction families on every
