@@ -18,6 +18,10 @@
 #   macho-got   — resolve real clang GOT_LOAD plus non-relaxable GOT32/GOT64 sites,
 #                 prove local/import slot deduplication and exact dyld rebase/bind
 #                 rows, and execute the same PIE on the native Intel macOS leg.
+#   macho-abs-bind — resolve real clang absolute 64-bit references to libSystem
+#                 data imports, prove each cell carries its own in-place dyld
+#                 bind row (no GOT indirection), and execute the same PIE on the
+#                 native Intel macOS leg.
 #   pe-imports  — like field, but walks the PE import directory and reports every
 #                 `<dll>:<symbol>` binding (#2510). PE-only; the observable for
 #                 two-level-namespace attribution, which execution cannot check.
@@ -328,7 +332,7 @@ macho_objdump() {
     elif command -v xcrun >/dev/null 2>&1; then
         xcrun llvm-objdump "$@"
     else
-        echo "int: macho-got: llvm-objdump is required" >&2
+        echo "int: macho: llvm-objdump is required" >&2
         return 2
     fi
 }
@@ -484,6 +488,75 @@ produce_macho_got() {
     echo "import_slots=deduplicated"
     echo "import_slot=libSystem-bind"
 }
+
+# produce_macho_abs_bind <runmode> <target> <binary>
+#
+# Walk the dyld bind rows for the fixture's two absolute 64-bit references to
+# libSystem's __stdoutp/__stderrp. Each must bind in place inside __DATA (the
+# cell itself is bound - no __GOT slot), one row per site, and the on-disk cell
+# content must be the relocation's zero addend. On the native Intel macOS leg
+# the same PIE is executed and its dereference contract compared exactly.
+produce_macho_abs_bind() {
+    target=$2
+    bin=$3
+
+    flags=$(read_le_uint "$bin" 24 4)
+    [ $((flags & 0x200000)) -ne 0 ] || {
+        echo "int: macho-abs-bind: executable is not PIE" >&2
+        return 1
+    }
+
+    data_fields=$(macho_segment_fields "$bin" __DATA) || return 2
+    set -- $data_fields
+    data_vm=$1; data_file=$3; data_size=$4
+
+    binds=$(macho_objdump --macho --bind "$bin" | tr 'A-F' 'a-f') || return 2
+
+    check_slot() {
+        sym=$1
+        rows=$(printf '%s\n' "$binds" | grep -F "$sym" | grep -v "__got" || true)
+        [ "$(printf '%s\n' "$rows" | grep -c .)" -eq 1 ] || {
+            echo "int: macho-abs-bind: $sym does not have exactly one in-place bind row" >&2
+            return 1
+        }
+        addr=$(printf '%s\n' "$rows" | awk '{for (i = 1; i <= NF; i++) if ($i ~ /^0x[0-9a-f]+$/) { print $i; exit }}')
+        [ -n "$addr" ] || {
+            echo "int: macho-abs-bind: $sym bind row carries no address" >&2
+            return 1
+        }
+        [ $((addr)) -ge "$data_vm" ] && [ $((addr)) -lt $((data_vm + data_size)) ] || {
+            echo "int: macho-abs-bind: $sym bind address is outside __DATA" >&2
+            return 1
+        }
+        cell=$(read_le_uint "$bin" $((data_file + addr - data_vm)) 8)
+        [ "$cell" -eq 0 ] || {
+            echo "int: macho-abs-bind: $sym cell is not the zero addend on disk" >&2
+            return 1
+        }
+        return 0
+    }
+
+    check_slot ___stdoutp || return 1
+    check_slot ___stderrp || return 1
+
+    if [ "$target" = darwin-x86_64 ]; then
+        runtime=$("$bin") || {
+            echo "int: macho-abs-bind: native PIE execution failed" >&2
+            return 1
+        }
+        [ "$runtime" = "abs-bind=1" ] || {
+            echo "int: macho-abs-bind: native PIE output was not exact" >&2
+            printf '%s\n' "$runtime" >&2
+            return 1
+        }
+    fi
+
+    echo "PIE=1"
+    echo "out_slot=libSystem-bind-in-place"
+    echo "err_slot=libSystem-bind-in-place"
+    echo "slots=addend-zero"
+}
+
 
 # field_elf <binary> — the ELF position-independence fact. e_type is a u16 at offset
 # 16; ET_DYN (3) is a position-independent (PIE) executable, ET_EXEC (2) a
@@ -1673,6 +1746,7 @@ produce() {
         field)       produce_field "$@" ;;
         macho-signed) produce_macho_signed "$@" ;;
         macho-got)   produce_macho_got "$@" ;;
+        macho-abs-bind) produce_macho_abs_bind "$@" ;;
         pe-imports)  produce_pe_imports "$@" ;;
         pe-exceptions) produce_pe_exceptions "$@" ;;
         pe-codeview) produce_pe_codeview "$@" ;;
