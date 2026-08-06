@@ -23,7 +23,7 @@
 # `coff_emit_dyn_exec` (with a dynamic-import plan). The writer frames the
 # linker's load segments in a PE container: DOS header + stub, PE signature, COFF
 # file header, the PE32+ optional header (ImageBase, SectionAlignment/
-# FileAlignment, console subsystem, data directories), the section table, and the
+# FileAlignment, the declared subsystem, data directories), the section table, and the
 # `.idata` import directory + IAT built from the `of.DynamicInfo` plan (one
 # IMAGE_IMPORT_DESCRIPTOR per DynLib, an ILT/IAT thunk per DynImport, a hint/name
 # table). Each `PltFixup` call site is redirected to an import stub that jumps
@@ -55,6 +55,7 @@ use mach.lang.intern;
 use mach.lang.target.isa;
 use mach.lang.target.of;
 use mach.lang.target.of.bin;
+use rs: mach.lang.target.of.rsrc;
 
 # COFF machine type for x86-64
 val IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
@@ -92,6 +93,11 @@ val IMAGE_SYM_CLASS_EXTERNAL:      u8 = 2;
 val IMAGE_SYM_CLASS_STATIC:        u8 = 3;
 val IMAGE_SYM_CLASS_WEAK_EXTERNAL: u8 = 105;
 
+# weak-external resolution modes (IMAGE_WEAK_EXTERN_SEARCH_*)
+val IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY: u32 = 1;
+val IMAGE_WEAK_EXTERN_SEARCH_LIBRARY:   u32 = 2;
+val IMAGE_WEAK_EXTERN_SEARCH_ALIAS: u32 = 3;
+
 # the undefined / special section number (SectionNumber is 1-based and signed;
 # values <= 0 are undefined or absolute)
 val IMAGE_SYM_UNDEFINED: i16 = 0;
@@ -122,6 +128,28 @@ val BIGOBJ_MIN_VERSION:         u16   = 2;
 val BIGOBJ_HEADER_SIZE:         usize = 56;
 val BIGOBJ_SYMBOL_SIZE:         usize = 20;
 
+# the short import record (`IMPORT_OBJECT_HEADER`), the member an import library
+# carries instead of an object: it defines nothing and states that one symbol is
+# provided by one DLL. it opens with the SAME Sig1/Sig2 pair as /bigobj, so the
+# two are told apart by the complete /bigobj discriminator: a sufficiently large
+# header with Version >= BIGOBJ_MIN_VERSION and the fixed /bigobj ClassID. Every
+# other member with the shared signature is a short import record. This mirrors
+# the format's structural discriminator without constraining future import-header
+# versions.
+#
+# header: Sig1, Sig2, Version, Machine, TimeDateStamp, SizeOfData, OrdinalOrHint,
+# then a bitfield of Type (2 bits) and NameType (3 bits). `SizeOfData` bytes
+# follow, holding the NUL-terminated symbol name then the NUL-terminated DLL name;
+# `IMPORT_OBJECT_NAME_EXPORTAS` adds the distinct export name as a third string.
+val IMPORT_OBJECT_HEADER_SIZE: usize = 20;
+val IMPORT_OBJECT_TYPE_CODE:       u16 = 0;
+val IMPORT_OBJECT_TYPE_CONST:      u16 = 2;
+val IMPORT_OBJECT_ORDINAL:         u16 = 0;
+val IMPORT_OBJECT_NAME:            u16 = 1;
+val IMPORT_OBJECT_NAME_NOPREFIX:   u16 = 2;
+val IMPORT_OBJECT_NAME_UNDECORATE: u16 = 3;
+val IMPORT_OBJECT_NAME_EXPORTAS:   u16 = 4;
+
 # COFF file-header characteristics for a linked PE image
 val IMAGE_FILE_RELOCS_STRIPPED:     u16 = 0x0001;
 val IMAGE_FILE_EXECUTABLE_IMAGE:    u16 = 0x0002;
@@ -132,6 +160,7 @@ val IMAGE_FILE_LARGE_ADDRESS_AWARE: u16 = 0x0020;
 # PE32+ optional-header magic and Windows-subsystem / DLL-characteristics fields
 # the loader reads to map and start the image
 val PE32PLUS_MAGIC:                u16 = 0x020B;
+val IMAGE_SUBSYSTEM_WINDOWS_GUI:   u16 = 2;
 val IMAGE_SUBSYSTEM_WINDOWS_CUI:   u16 = 3;
 # the image opts in to ASLR (the loader maps it at a randomized base and applies the
 # `.reloc` fixups) and is compatible with hardware DEP / no-execute data pages
@@ -140,6 +169,7 @@ val IMAGE_DLLCHARACTERISTICS_NX_COMPAT: u16 = 0x0100;
 
 # data-directory indices in the PE32+ optional header
 val IMAGE_DIRECTORY_ENTRY_IMPORT:    u32 = 1;
+val IMAGE_DIRECTORY_ENTRY_RESOURCE:  u32 = 2;
 val IMAGE_DIRECTORY_ENTRY_EXCEPTION: u32 = 3;
 val IMAGE_DIRECTORY_ENTRY_BASERELOC: u32 = 5;
 val IMAGE_DIRECTORY_ENTRY_IAT:       u32 = 12;
@@ -170,6 +200,7 @@ val PE_FILE_ALIGN:       u64   = 0x200;
 # one IMAGE_IMPORT_DESCRIPTOR (20 bytes) and one PE thunk slot (8 bytes, PE32+)
 val IMPORT_DESCRIPTOR_SIZE: usize = 20;
 val THUNK_SIZE:             usize = 8;
+val IMPORT_ORDINAL_FLAG64:  u64   = 0x8000000000000000;
 # the per-function import stub: `jmp qword [rip+disp32]` through the IAT slot
 val IMPORT_STUB_SIZE:       usize = 6;
 # one RUNTIME_FUNCTION table row (`BeginAddress`, `EndAddress`, `UnwindInfoAddress`)
@@ -285,7 +316,7 @@ fun section_characteristics_for(kind: of.SectionKind) u32 {
     if (kind == of.SK_DATA) {
         ret IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
     }
-    if (kind == of.SK_RODATA || kind == of.SK_RELRO) {
+    if (kind == of.SK_RODATA || kind == of.SK_RELRO || kind == of.SK_EXCEPTION) {
         ret IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
     }
     if (kind == of.SK_BSS) {
@@ -386,43 +417,17 @@ fun write_decimal(buf: *u8, off: usize, width: usize, value: u32) {
     }
 }
 
-# build a name->index map over the image symbol table so the relocation passes
-# resolve targets in O(reloc + symbol) rather than O(reloc x symbol). the first
-# symbol of a given name wins, matching the lowest-index scan a linear lookup
-# would return; a STR_NIL-named symbol is skipped so a STR_NIL relocation target
-# stays unresolved. the caller owns the returned map and must `map.dnit` it
-fun build_reloc_sym_map(img: *of.ObjectImage) R.Result[map.Map[intern.StrId, u32], str] {
-    var idx: map.Map[intern.StrId, u32] =
-        map.init[intern.StrId, u32](img.alloc, map.hash_u32, map.eq_u32);
-    var i: u32 = 0;
-    for (i < img.symbol_count) {
-        if (img.symbols[i].name != intern.STR_NIL
-            && !map.contains[intern.StrId, u32](?idx, ?img.symbols[i].name)) {
-            val ins: R.Result[bool, str] =
-                map.insert[intern.StrId, u32](?idx, img.symbols[i].name, i);
-            if (R.is_err[bool, str](ins)) {
-                map.dnit[intern.StrId, u32](?idx);
-                ret R.err[map.Map[intern.StrId, u32], str](R.unwrap_err[bool, str](ins));
-            }
-        }
-        i = i + 1;
-    }
-    ret R.ok[map.Map[intern.StrId, u32], str](idx);
-}
-
-# resolve a relocation's target symbol to its index in the image symbol table via
-# a prebuilt name->index map. every relocation must name a symbol the image
-# defines or declares extern (the back end guarantees this - `pack_reloc_externs`
-# declares an extern for any named target the module did not define, and lowering
-# panics before emitting a nameless target). a miss is therefore a back-end
-# invariant violation, returned as an error naming the symbol rather than silently
-# aliased to index 0 (the first section symbol), which would corrupt the link
-fun reloc_sym_index(img: *of.ObjectImage, idx: *map.Map[intern.StrId, u32], sym: intern.StrId) R.Result[u32, str] {
-    if (sym != intern.STR_NIL) {
-        val g: R.Result[*u32, str] = map.get[intern.StrId, u32](idx, ?sym);
-        if (!R.is_err[*u32, str](g)) { ret R.ok[u32, str](@R.unwrap_ok[*u32, str](g)); }
-    }
-    ret R.err[u32, str](unresolved_reloc_message(img.interner, img.alloc, sym));
+# resolve a relocation's target to its index in the image symbol table. every
+# relocation must reference a symbol the image defines or declares extern (the
+# back end guarantees this - relocation binding declares an extern for any named
+# target the module did not define, and lowering panics before emitting a nameless
+# target). an out-of-range index is therefore a producer invariant violation,
+# returned as an error rather than silently aliased to index 0 (the first section
+# symbol), which would corrupt the link
+fun reloc_sym_index(img: *of.ObjectImage, r: *of.Relocation) R.Result[u32, str] {
+    if (r.sym < img.symbol_count) { ret R.ok[u32, str](r.sym); }
+    ret R.err[u32, str](unresolved_reloc_message(img.interner, img.alloc,
+        of.reloc_symbol_name(img, r)));
 }
 
 # build the "coff: unresolved relocation symbol: <name>" diagnostic, interned so
@@ -438,21 +443,12 @@ fun unresolved_reloc_message(itn: *intern.Interner, alloc: *A.Allocator, sym: in
 # unresolved target fails the emit naming the symbol instead of silently writing
 # a relocation against the first section symbol
 fun validate_reloc_symbols(img: *of.ObjectImage) R.Result[bool, str] {
-    val mr: R.Result[map.Map[intern.StrId, u32], str] = build_reloc_sym_map(img);
-    if (R.is_err[map.Map[intern.StrId, u32], str](mr)) {
-        ret R.err[bool, str](R.unwrap_err[map.Map[intern.StrId, u32], str](mr));
-    }
-    var idx: map.Map[intern.StrId, u32] = R.unwrap_ok[map.Map[intern.StrId, u32], str](mr);
     var i: u32 = 0;
     for (i < img.reloc_count) {
-        val r: R.Result[u32, str] = reloc_sym_index(img, ?idx, img.relocations[i].symbol);
-        if (R.is_err[u32, str](r)) {
-            map.dnit[intern.StrId, u32](?idx);
-            ret R.err[bool, str](R.unwrap_err[u32, str](r));
-        }
+        val r: R.Result[u32, str] = reloc_sym_index(img, ?img.relocations[i]);
+        if (R.is_err[u32, str](r)) { ret R.err[bool, str](R.unwrap_err[u32, str](r)); }
         i = i + 1;
     }
-    map.dnit[intern.StrId, u32](?idx);
     ret R.ok[bool, str](true);
 }
 
@@ -1083,6 +1079,60 @@ fun sym_naux_off(sym_off: usize, bigobj: bool) usize {
     ret sym_off + 17;
 }
 
+# preserve COFF weak-external fallback relations
+#
+# A weak external's aux record names the symbol to use when the public name has
+# no real definition. The characteristics distinguish no-library, library-search,
+# and alias modes. Keep the target as an ObjectImage symbol index so archive
+# selection, final resolution, and relocatable output all retain the relation;
+# eager same-object normalization would lose external targets and alias chains.
+# ---
+# buf:         complete object bytes; the caller validated the symbol-table span
+# symtab_off:  byte offset of the COFF symbol table
+# num_records: raw record count, including aux records
+# bigobj:      whether records use the 20-byte /bigobj shape
+# rec_map:     raw record index -> ObjectImage symbol index
+# out:         populated image whose weak fallback metadata is filled in place
+# ret:         ok(true), or an error for a malformed fallback aux reference
+fun preserve_weak_external_fallbacks(buf: *u8, symtab_off: usize,
+                                     num_records: u32, bigobj: bool,
+                                     rec_map: *i32,
+                                     out: *of.ObjectImage) R.Result[bool, str] {
+    val symbol_size: usize = sym_record_size(bigobj);
+    var ri: u32 = 0;
+    for (ri < num_records) {
+        val so: usize = symtab_off + ri::usize * symbol_size;
+        val aux: u8 = buf[sym_naux_off(so, bigobj)];
+        val scl: u8 = buf[sym_storage_class_off(so, bigobj)];
+        if (scl == IMAGE_SYM_CLASS_WEAK_EXTERNAL
+            && read_sym_section_number(buf, so, bigobj) == IMAGE_SYM_UNDEFINED::i32) {
+            if (aux == 0 || ri + 1 >= num_records) {
+                ret R.err[bool, str]("coff: weak external has no aux record");
+            }
+            val ao: usize = so + symbol_size;
+            val target_rec: u32 = bin.read_u32_le(buf, ao);
+            val search: u32 = bin.read_u32_le(buf, ao + 4);
+            if (target_rec >= num_records || rec_map[ri] < 0
+                || rec_map[target_rec] < 0) {
+                ret R.err[bool, str]("coff: weak external fallback target is invalid");
+            }
+            val public: *of.Symbol = ?out.symbols[rec_map[ri]::u32];
+            val target: *of.Symbol = ?out.symbols[rec_map[target_rec]::u32];
+            public.fallback = rec_map[target_rec]::u32;
+            public.flags = public.flags | of.SYM_OBJ_FLAG_FALLBACK
+                | (target.flags & (of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_OBJECT));
+            if (search == IMAGE_WEAK_EXTERN_SEARCH_LIBRARY) {
+                public.flags = public.flags | of.SYM_OBJ_FLAG_SEARCH;
+            }
+            if (search == IMAGE_WEAK_EXTERN_SEARCH_ALIAS) {
+                public.flags = public.flags | of.SYM_OBJ_FLAG_ALIAS;
+            }
+        }
+        ri = ri + 1 + aux::u32;
+    }
+    ret R.ok[bool, str](true);
+}
+
 # serialize a COMDAT-prepared object image to a relocatable x86-64 COFF object
 #
 # Writes the file header, section-header table, per-section raw data, per-section
@@ -1101,6 +1151,18 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) R.Resul
 
     val num_secs: u32 = img.section_count;
     val num_syms: u32 = img.symbol_count;
+    var weak_aux_count: u32 = 0;
+    var wi: u32 = 0;
+    for (wi < num_syms) {
+        if ((img.symbols[wi].flags & of.SYM_OBJ_FLAG_FALLBACK) != 0) {
+            if (img.symbols[wi].fallback >= num_syms
+                || img.symbols[wi].fallback == of.SYMBOL_NONE) {
+                ret R.err[bool, str]("coff: weak external fallback index is out of range");
+            }
+            weak_aux_count = weak_aux_count + 1;
+        }
+        wi = wi + 1;
+    }
 
     # map every relocation kind to a machine type first, so an unmapped kind fails
     # the emit naming the kind (never silently serialized as ADDR64) and the range
@@ -1210,11 +1272,10 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) R.Resul
         s = s + 1;
     }
 
-    # symbol table: one section symbol (+ one aux record) per section, then one
-    # record per image symbol. the COFF symbol-table index of the i-th image
-    # symbol is therefore `2*num_secs + i`.
+    # symbol table: one section symbol (+ one aux record) per section, then each
+    # image symbol and its optional weak-external aux record.
     val symtab_offset: usize = cursor;
-    val total_sym_records: u32 = num_secs * 2 + num_syms;
+    val total_sym_records: u32 = num_secs * 2 + num_syms + weak_aux_count;
     val symtab_size: usize = total_sym_records::usize * symbol_size;
     val strtab_offset: usize = symtab_offset + symtab_size;
     val strtab_sz: usize = strtab_size(img);
@@ -1234,8 +1295,13 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) R.Resul
         sym_remap = R.unwrap_ok[*u32, str](res_remap);
     }
     var i: u32 = 0;
+    var raw_sym: u32 = num_secs * 2;
     for (i < num_syms) {
-        sym_remap[i] = num_secs * 2 + i;
+        sym_remap[i] = raw_sym;
+        raw_sym = raw_sym + 1;
+        if ((img.symbols[i].flags & of.SYM_OBJ_FLAG_FALLBACK) != 0) {
+            raw_sym = raw_sym + 1;
+        }
         i = i + 1;
     }
 
@@ -1369,19 +1435,7 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) R.Resul
     # relocation lands in its owning section's slot, advancing that section's reloc
     # cursor. `reloc_offsets` is no longer read after the section-header pass, so it
     # doubles as the per-section write cursor (each starts at the section's reloc
-    # base from the layout pass and ends one past its last record). a name->index
-    # map resolves each target in O(1), keeping the pass O(reloc + symbol).
-    val smr: R.Result[map.Map[intern.StrId, u32], str] = build_reloc_sym_map(img);
-    if (R.is_err[map.Map[intern.StrId, u32], str](smr)) {
-        A.deallocate[u32](alloc, counts, num_secs::usize);
-        A.deallocate[usize](alloc, data_offsets, (num_secs + 1)::usize);
-        A.deallocate[usize](alloc, reloc_offsets, (num_secs + 1)::usize);
-        A.deallocate[u32](alloc, sec_name_offsets, (num_secs + 1)::usize);
-        if (sym_remap != nil) { A.deallocate[u32](alloc, sym_remap, num_syms::usize); }
-        A.deallocate[u8](alloc, buf, total_file_size);
-        ret R.err[bool, str](R.unwrap_err[map.Map[intern.StrId, u32], str](smr));
-    }
-    var sym_map: map.Map[intern.StrId, u32] = R.unwrap_ok[map.Map[intern.StrId, u32], str](smr);
+    # base from the layout pass and ends one past its last record).
     var ri: u32 = 0;
     for (ri < img.reloc_count) {
         val rsec: u32 = img.relocations[ri].section;
@@ -1390,7 +1444,7 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) R.Resul
         # validate_reloc_symbols proved every reloc resolves, and a relocated
         # section implies symbols, so sym_remap is non-nil and the lookup cannot
         # miss; the first section symbol is never silently aliased.
-        val rsi: u32 = R.unwrap_ok[u32, str](reloc_sym_index(img, ?sym_map, img.relocations[ri].symbol));
+        val rsi: u32 = R.unwrap_ok[u32, str](reloc_sym_index(img, ?img.relocations[ri]));
         bin.write_u32_le(buf, ro + 4, sym_remap[rsi]);
         # validate_reloc_kinds proved every kind maps, so this lookup cannot miss;
         # ADDR64 is never silently substituted.
@@ -1398,7 +1452,6 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) R.Resul
         reloc_offsets[rsec] = ro + RELOCATION_SIZE;
         ri = ri + 1;
     }
-    map.dnit[intern.StrId, u32](?sym_map);
 
     # symbol table: a section symbol (+ aux record) per section, then the image
     # symbols. the section symbol is class STATIC, value 0, 1-based section
@@ -1460,19 +1513,35 @@ fun coff_serialize_image(img: *of.ObjectImage, comdat: *bool, path: *u8) R.Resul
             sym_ty = IMAGE_SYM_DTYPE_FUNCTION;
         }
 
-        # global, weak, and external-undefined symbols are class EXTERNAL; a
-        # local definition is class STATIC. a defined weak symbol is class
-        # EXTERNAL too - its weak/dedup attribute is carried by the COMDAT section
-        # it was moved into (LNK_COMDAT + a SELECT_ANY section-symbol aux record),
-        # which the reader recovers. the weak-external aux form is reserved for the
-        # #1159 import work and unused here.
+        # Global and external-undefined symbols are class EXTERNAL; a local
+        # definition is STATIC. Defined weak symbols carry their binding through
+        # COMDAT. An undefined symbol with a format-neutral fallback uses COFF's
+        # WEAK_EXTERNAL class and one aux record so relocatable output preserves
+        # its target and archive-search policy.
         var scl: u8 = IMAGE_SYM_CLASS_STATIC;
         if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_GLOBAL) != 0
             || (img.symbols[symi].flags & of.SYM_OBJ_FLAG_EXTERN) != 0) {
             scl = IMAGE_SYM_CLASS_EXTERNAL;
         }
-        write_sym_tail(buf, sym_off, bigobj, sec_num, sym_ty, scl, 0);
+        var naux: u8 = 0;
+        if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_FALLBACK) != 0) {
+            scl = IMAGE_SYM_CLASS_WEAK_EXTERNAL;
+            naux = 1;
+        }
+        write_sym_tail(buf, sym_off, bigobj, sec_num, sym_ty, scl, naux);
         sym_off = sym_off + symbol_size;
+        if (naux == 1) {
+            bin.write_u32_le(buf, sym_off, sym_remap[img.symbols[symi].fallback]);
+            var search: u32 = IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY;
+            if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_SEARCH) != 0) {
+                search = IMAGE_WEAK_EXTERN_SEARCH_LIBRARY;
+            }
+            if ((img.symbols[symi].flags & of.SYM_OBJ_FLAG_ALIAS) != 0) {
+                search = IMAGE_WEAK_EXTERN_SEARCH_ALIAS;
+            }
+            bin.write_u32_le(buf, sym_off + 4, search);
+            sym_off = sym_off + symbol_size;
+        }
         symi = symi + 1;
     }
 
@@ -1587,6 +1656,158 @@ fun comdat_select_any_for_section(buf: *u8, symtab_off: usize, num_records: u32,
 # buf_size: length of `buf`
 # out:      image to populate (its arrays are allocated here)
 # ret:      ok(true) on success, or an error string
+# parse a short import record into an image that DECLARES one import
+#
+# The record is an import library's unit of content: it defines no code or data,
+# so the image carries no sections, symbols or relocations and exactly one
+# `of.ImportDecl`. That declaration is the authoritative symbol->library mapping
+# for a two-level namespace, carrying the loader's own DLL name and ordinal.
+#
+# The NUL-terminated names live in the `SizeOfData` payload after the header:
+# symbol first, then DLL, then a distinct export name for NAME_EXPORTAS. Every
+# string is bounded against the payload before being read, so a truncated or
+# hostile member errors here rather than running off the end.
+# ---
+# alloc:    allocator recorded on the image for its arrays
+# itn:      interner the two names are interned into
+# buf:      the member bytes
+# buf_size: length of `buf`
+# out:      image to populate
+# ret:      ok(true) on success, or an error string
+fun coff_parse_import_record(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8,
+                             buf_size: usize, out: *of.ObjectImage) R.Result[bool, str] {
+    if (buf_size < IMPORT_OBJECT_HEADER_SIZE) {
+        ret R.err[bool, str]("coff: import record too small");
+    }
+    if (itn == nil) { ret R.err[bool, str]("coff: no interner for parse"); }
+    if (bin.read_u16_le(buf, 6) != IMAGE_FILE_MACHINE_AMD64) {
+        ret R.err[bool, str]("coff: not an x86-64 import record");
+    }
+
+    val data_size: usize = bin.read_u32_le(buf, 12)::usize;
+    val vr: R.Result[bool, str] = bin.require_region(buf_size, IMPORT_OBJECT_HEADER_SIZE,
+        data_size, "coff: import record name data out of bounds");
+    if (R.is_err[bool, str](vr)) { ret R.err[bool, str](R.unwrap_err[bool, str](vr)); }
+
+    val hint_ord: u16 = bin.read_u16_le(buf, 16);
+    val flags:    u16 = bin.read_u16_le(buf, 18);
+    val import_type: u16 = flags & 0x3;
+    val name_type:   u16 = (flags >> 2) & 0x7;
+    if (import_type > IMPORT_OBJECT_TYPE_CONST) {
+        ret R.err[bool, str]("coff: import record has an invalid import type");
+    }
+    if (name_type > IMPORT_OBJECT_NAME_EXPORTAS) {
+        ret R.err[bool, str]("coff: import record has an invalid name type");
+    }
+    if ((flags & 0xFFE0) != 0) {
+        ret R.err[bool, str]("coff: import record has nonzero reserved flags");
+    }
+
+    # the symbol name, then the DLL name, each NUL-terminated within the payload
+    val base: usize = IMPORT_OBJECT_HEADER_SIZE;
+    val limit: usize = base + data_size;
+    var sym_end: usize = base;
+    for (sym_end < limit && buf[sym_end] != 0) { sym_end = sym_end + 1; }
+    if (sym_end >= limit) { ret R.err[bool, str]("coff: import record symbol name is unterminated"); }
+    val dll_start: usize = sym_end + 1;
+    var dll_end: usize = dll_start;
+    for (dll_end < limit && buf[dll_end] != 0) { dll_end = dll_end + 1; }
+    if (dll_end >= limit) { ret R.err[bool, str]("coff: import record library name is unterminated"); }
+    if (sym_end == base)      { ret R.err[bool, str]("coff: import record has an empty symbol name"); }
+    if (dll_end == dll_start) { ret R.err[bool, str]("coff: import record has an empty library name"); }
+
+    # both required names are NUL-terminated inside the payload, checked above, so
+    # each can be interned in place without copying
+    val sym_r: R.Result[intern.StrId, str] = intern.intern(itn, (?buf[base])::str);
+    if (R.is_err[intern.StrId, str](sym_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sym_r)); }
+    val dll_r: R.Result[intern.StrId, str] = intern.intern(itn, (?buf[dll_start])::str);
+    if (R.is_err[intern.StrId, str](dll_r)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](dll_r)); }
+
+    # the first string is the public/link symbol. NameType selects the export name
+    # placed in the PE hint/name table: unchanged, with one decoration prefix
+    # removed, undecorated through the first '@', or an explicit third string.
+    var import_name_r: R.Result[intern.StrId, str] = sym_r;
+    if (name_type == IMPORT_OBJECT_NAME_NOPREFIX || name_type == IMPORT_OBJECT_NAME_UNDECORATE) {
+        var name_start: usize = base;
+        if (buf[name_start] == '?'::u8 || buf[name_start] == '@'::u8 || buf[name_start] == '_'::u8) {
+            name_start = name_start + 1;
+        }
+        var name_end: usize = sym_end;
+        if (name_type == IMPORT_OBJECT_NAME_UNDECORATE) {
+            name_end = name_start;
+            for (name_end < sym_end && buf[name_end] != '@'::u8) { name_end = name_end + 1; }
+        }
+        if (name_end == name_start) {
+            ret R.err[bool, str]("coff: import record resolves to an empty export name");
+        }
+        import_name_r = intern.intern_bytes(itn, (?buf[name_start])::str, name_end - name_start);
+    }
+    or (name_type == IMPORT_OBJECT_NAME_EXPORTAS) {
+        val export_start: usize = dll_end + 1;
+        var export_end: usize = export_start;
+        for (export_end < limit && buf[export_end] != 0) { export_end = export_end + 1; }
+        if (export_end >= limit) {
+            ret R.err[bool, str]("coff: import record export name is unterminated");
+        }
+        if (export_end == export_start) {
+            ret R.err[bool, str]("coff: import record has an empty export name");
+        }
+        import_name_r = intern.intern(itn, (?buf[export_start])::str);
+    }
+    if (R.is_err[intern.StrId, str](import_name_r)) {
+        ret R.err[bool, str](R.unwrap_err[intern.StrId, str](import_name_r));
+    }
+
+    val ir: R.Result[*of.ImportDecl, str] = A.zallocate[of.ImportDecl](alloc, 1::usize);
+    if (R.is_err[*of.ImportDecl, str](ir)) { ret R.err[bool, str](R.unwrap_err[*of.ImportDecl, str](ir)); }
+
+    out.alloc         = alloc;
+    out.interner      = itn;
+    out.sections      = nil;
+    out.section_count = 0;
+    out.symbols       = nil;
+    out.symbol_count  = 0;
+    out.relocations   = nil;
+    out.reloc_count   = 0;
+    out.imports       = R.unwrap_ok[*of.ImportDecl, str](ir);
+    out.import_count  = 1;
+
+    out.imports[0].symbol      = R.unwrap_ok[intern.StrId, str](sym_r);
+    out.imports[0].import_name = R.unwrap_ok[intern.StrId, str](import_name_r);
+    out.imports[0].library     = R.unwrap_ok[intern.StrId, str](dll_r);
+    out.imports[0].by_name     = name_type != IMPORT_OBJECT_ORDINAL;
+    out.imports[0].ordinal     = hint_ord;
+    out.imports[0].is_code     = import_type == IMPORT_OBJECT_TYPE_CODE;
+    ret R.ok[bool, str](true);
+}
+
+# whether every section this object carries is an `.idata$` fragment - the shape
+# of an import library's import-directory bookkeeping members, which hold no code
+# or data of the program's own. an ordinary object never carries only these
+# ---
+# buf:          the object bytes
+# secthdr_base: offset of the section header table, already bounds-checked
+# num_secs:     number of section headers
+# ret:          true when the object is import-directory bookkeeping only
+fun coff_is_idata_bookkeeping(buf: *u8, secthdr_base: usize, num_secs: u32) bool {
+    if (num_secs == 0) { ret false; }
+    var i: u32 = 0;
+    for (i < num_secs) {
+        val off: usize = secthdr_base + i::usize * SECTION_HEADER_SIZE;
+        # the inline 8-byte name field; `.idata$<n>` always fits, so a long-name
+        # ("/nnn") indirection never spells one
+        if (buf[off]     != 0x2E) { ret false; }   # '.'
+        if (buf[off + 1] != 0x69) { ret false; }   # 'i'
+        if (buf[off + 2] != 0x64) { ret false; }   # 'd'
+        if (buf[off + 3] != 0x61) { ret false; }   # 'a'
+        if (buf[off + 4] != 0x74) { ret false; }   # 't'
+        if (buf[off + 5] != 0x61) { ret false; }   # 'a'
+        if (buf[off + 6] != 0x24) { ret false; }   # '$'
+        i = i + 1;
+    }
+    ret true;
+}
+
 fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_size: usize, out: *of.ObjectImage) R.Result[bool, str] {
     if (buf == nil || out == nil || buf_size < 4) {
         ret R.err[bool, str]("coff: object too small");
@@ -1599,7 +1820,18 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
     # tell the formats apart.
     val sig1: u16 = bin.read_u16_le(buf, 0);
     val sig2: u16 = bin.read_u16_le(buf, 2);
-    val bigobj: bool = sig1 == IMAGE_FILE_MACHINE_UNKNOWN && sig2 == BIGOBJ_SIG2;
+    val anon: bool = sig1 == IMAGE_FILE_MACHINE_UNKNOWN && sig2 == BIGOBJ_SIG2;
+
+    # an import library's member shares that signature pair. /bigobj is the more
+    # restrictive shape: it must be large enough for its header, carry a supported
+    # version, and carry the fixed ClassID. Anything else with the pair is a short
+    # import record, as specified for import-library pseudo-objects.
+    val bigobj: bool = anon && buf_size >= BIGOBJ_HEADER_SIZE
+        && bin.read_u16_le(buf, 4) >= BIGOBJ_MIN_VERSION
+        && bigobj_class_id_matches(buf, 12);
+    if (anon && !bigobj) {
+        ret coff_parse_import_record(alloc, itn, buf, buf_size, out);
+    }
 
     var num_secs:     u32   = 0;
     var symtab_off:   usize = 0;
@@ -1655,6 +1887,19 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
     out.sections = nil;
     out.symbols = nil;
     out.relocations = nil;
+    out.imports = nil;
+    out.import_count = 0;
+
+    # an import library also carries the traditional import-directory construction:
+    # `.idata$` fragments wired together by ADDR32NB relocations, which a linker that
+    # merges them would assemble into the import table. mach synthesizes its whole
+    # `.idata` from the dynamic plan instead, and the short import records already
+    # carried the mapping, so those members contribute nothing and are dropped whole
+    # rather than merged into an image that would then conflict with the synthesized
+    # directory.
+    if (coff_is_idata_bookkeeping(buf, secthdr_base, num_secs)) {
+        ret R.ok[bool, str](true);
+    }
 
     # count total relocations across sections and total non-aux symbol records.
     var rel_n: u32 = 0;
@@ -1696,8 +1941,8 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
     out.symbol_count  = sym_n;
     out.reloc_count   = rel_n;
 
-    # map a COFF symbol-table record index -> ObjectImage symbol index, so a
-    # relocation's SymbolTableIndex resolves to the interned symbol name.
+    # map a COFF symbol-table record index -> ObjectImage symbol index, preserving
+    # the relocation target's identity even when several symbols share a name.
     val res_map: R.Result[*i32, str] = A.zallocate[i32](alloc, (num_records + 1)::usize);
     if (R.is_err[*i32, str](res_map)) { ret R.err[bool, str]("coff: symbol map alloc failed"); }
     var rec_map: *i32 = R.unwrap_ok[*i32, str](res_map);
@@ -1724,7 +1969,11 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
 
         val chars: u32 = bin.read_u32_le(buf, sh + 36);
         var kind: of.SectionKind = of.SK_DATA;
-        if ((chars & IMAGE_SCN_CNT_CODE) != 0)               { kind = of.SK_TEXT; }
+        # `.pdata` is not ordinary read-only content: the PE writer owns its final
+        # placement and exception-directory publication, so preserve it as
+        # writer-framed metadata through the generic linker.
+        if (str_equals(sname, ".pdata"))                     { kind = of.SK_EXCEPTION; }
+        or ((chars & IMAGE_SCN_CNT_CODE) != 0)               { kind = of.SK_TEXT; }
         or ((chars & IMAGE_SCN_CNT_UNINITIALIZED_DATA) != 0) { kind = of.SK_BSS; }
         or ((chars & IMAGE_SCN_MEM_DISCARDABLE) != 0)        { kind = of.SK_DEBUG; }
         or ((chars & IMAGE_SCN_MEM_WRITE) == 0) {
@@ -1839,6 +2088,16 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
         ri = ri + 1 + aux::u32;
     }
 
+    # preserve weak fallbacks only after every raw record has an image-symbol
+    # mapping: an aux entry may point forward in the table.
+    val wa: R.Result[bool, str] =
+        preserve_weak_external_fallbacks(buf, symtab_off, num_records,
+                                         bigobj, rec_map, out);
+    if (R.is_err[bool, str](wa)) {
+        A.deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
+        ret R.err[bool, str](R.unwrap_err[bool, str](wa));
+    }
+
     # relocations: each section header points at its IMAGE_RELOCATION array.
     var rel_i: u32 = 0;
     s = 0;
@@ -1874,10 +2133,12 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
             out.relocations[idx].addend = read_inplace_addend(?out.sections[s], r_type, r_off);
 
             val rec: u32 = bin.read_u32_le(buf, ro + 4);
+            # rec_map already resolves the COFF record to its ObjectImage symbol
+            # index, which is what the relocation carries.
             if (rec < num_records && rec_map[rec] >= 0) {
-                out.relocations[idx].symbol = out.symbols[rec_map[rec]::u32].name;
+                out.relocations[idx].sym = rec_map[rec]::u32;
             } or {
-                out.relocations[idx].symbol = intern.STR_NIL;
+                out.relocations[idx].sym = of.SYMBOL_NONE;
             }
             rel_i = rel_i + 1;
             k = k + 1;
@@ -1890,8 +2151,8 @@ fun coff_parse_object(alloc: *A.Allocator, itn: *intern.Interner, buf: *u8, buf_
     # even when every reference is a call relocation. recover the function bit from
     # the reloc stream so dynamic-import discovery can still bind those call targets
     # through import stubs. mach's own emitter always stamps DT_FUNCTION on a
-    # call-target import (codegen `pack_reloc_externs`), so this never fires for
-    # mach-produced objects - see issue #1231.
+    # call-target import (codegen's deferred relocation binding), so this never
+    # fires for mach-produced objects - see issue #1231.
     val inf: R.Result[bool, str] = infer_extern_function_flags_from_calls(out);
 
     A.deallocate[i32](alloc, rec_map, (num_records + 1)::usize);
@@ -1912,47 +2173,21 @@ fun is_flagless_extern(sym: *of.Symbol) bool {
 # preceded by a `call`/`jmp rel32` opcode, 0xE8/0xE9) but whose symbol record
 # encodes Type 0. this serves foreign COFF inputs from toolchains that leave an
 # undefined import's type at 0; mach's own emitter already stamps DT_FUNCTION on
-# such imports (codegen `pack_reloc_externs`), so the candidate set below is empty
-# for mach-produced objects and the pass returns before allocating. the flagless
-# undefined externs are indexed by name once, so each call reloc is an O(1) lookup
-# rather than a full symbol-table scan (issue #1231)
+# such imports (codegen's relocation binding), so the pass changes nothing for
+# mach-produced objects. each relocation names its target by index, so the sweep
+# is a single O(relocation) pass with no side table (issue #1231)
 fun infer_extern_function_flags_from_calls(out: *of.ObjectImage) R.Result[bool, str] {
     if (out == nil || out.reloc_count == 0 || out.symbol_count == 0) {
         ret R.ok[bool, str](true);
     }
 
-    # candidates are undefined externs still missing the function bit - the only
-    # symbols inference can change. mach objects have none, so the common path
-    # returns here without allocating.
-    var candidates: u32 = 0;
-    var si: u32 = 0;
-    for (si < out.symbol_count) {
-        if (is_flagless_extern(?out.symbols[si])) { candidates = candidates + 1; }
-        si = si + 1;
-    }
-    if (candidates == 0) { ret R.ok[bool, str](true); }
-
-    # index those candidates by name so each call reloc is an O(1) lookup rather
-    # than a full symbol-table scan.
-    var idx: map.Map[intern.StrId, u32] =
-        map.init[intern.StrId, u32](out.alloc, map.hash_u32, map.eq_u32);
-    si = 0;
-    for (si < out.symbol_count) {
-        if (is_flagless_extern(?out.symbols[si])) {
-            val ins: R.Result[bool, str] =
-                map.insert[intern.StrId, u32](?idx, out.symbols[si].name, si);
-            if (R.is_err[bool, str](ins)) {
-                map.dnit[intern.StrId, u32](?idx);
-                ret R.err[bool, str](R.unwrap_err[bool, str](ins));
-            }
-        }
-        si = si + 1;
-    }
-
     var ri: u32 = 0;
     for (ri < out.reloc_count) {
         val r: *of.Relocation = ?out.relocations[ri];
-        if (r.symbol == intern.STR_NIL)                    { ri = ri + 1; cnt; }
+        if (r.sym >= out.symbol_count)                     { ri = ri + 1; cnt; }
+        # the only symbols inference can change are undefined externs still
+        # missing the function bit; mach objects have none.
+        if (!is_flagless_extern(?out.symbols[r.sym]))      { ri = ri + 1; cnt; }
         if (r.kind != of.RK_PC32 && r.kind != of.RK_PLT32) { ri = ri + 1; cnt; }
         if (r.section >= out.section_count)                { ri = ri + 1; cnt; }
         val sec: *of.Section = ?out.sections[r.section];
@@ -1961,31 +2196,32 @@ fun infer_extern_function_flags_from_calls(out: *of.ObjectImage) R.Result[bool, 
         val op: u8 = sec.bytes[r.offset::usize - 1];
         if (op != 0xE8 && op != 0xE9) { ri = ri + 1; cnt; }
 
-        val g: R.Result[*u32, str] = map.get[intern.StrId, u32](?idx, ?r.symbol);
-        if (R.is_err[*u32, str](g)) { ri = ri + 1; cnt; }
-        val sidx: u32 = @R.unwrap_ok[*u32, str](g);
-        out.symbols[sidx].flags =
-            out.symbols[sidx].flags | of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_GLOBAL;
+        out.symbols[r.sym].flags =
+            out.symbols[r.sym].flags | of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_GLOBAL;
         ri = ri + 1;
     }
 
-    map.dnit[intern.StrId, u32](?idx);
     ret R.ok[bool, str](true);
 }
 
 # the resolved layout of one PE section: its in-memory RVA (relative to ImageBase)
 # and file offset, plus the virtual and on-disk sizes. the writer fills a section
-# table from these and copies the section bytes to `file_off`
+# table from these and copies linker-segment bytes to `content_file_off`
 # ---
-# rva:       in-memory address relative to ImageBase (SectionAlignment-aligned)
-# vsize:     in-memory size in bytes (before file alignment)
-# file_off:  file offset of the section's raw data (FileAlignment-aligned)
-# file_size: on-disk raw-data size (vsize rounded up to FileAlignment)
+# rva:              section start relative to ImageBase (SectionAlignment-aligned)
+# vsize:            in-memory section size in bytes (before file alignment)
+# file_off:         file offset of the section's raw data (FileAlignment-aligned)
+# file_size:        on-disk raw-data size (vsize rounded up to FileAlignment)
+# content_rva:      linker segment content start (equal to rva except when the first
+#                   segment needs prefix padding to follow the headers contiguously)
+# content_file_off: file offset corresponding to content_rva
 rec PeSection {
-    rva:       u64;
-    vsize:     u64;
-    file_off:  usize;
-    file_size: usize;
+    rva:              u64;
+    vsize:            u64;
+    file_off:         usize;
+    file_size:        usize;
+    content_rva:      u64;
+    content_file_off: usize;
 }
 
 # the resolved layout of a PE32+ image: ImageBase, the header span, the linker's
@@ -1995,7 +2231,7 @@ rec PeSection {
 # the section-table entries (linker segments + synthesized stubs/import/unwind
 # sections, present only when used)
 # ---
-# image_base:    PE ImageBase (64 KiB-aligned, one header span below seg[0])
+# image_base:    exact linker PE ImageBase (64 KiB-aligned; segment RVAs subtract it)
 # header_size:   SizeOfHeaders (file-aligned span of DOS+PE+section headers)
 # image_size:    SizeOfImage (section-aligned span covering every section)
 # seg_secs:      per-linker-segment PeSection (rva/file_off/sizes)
@@ -2003,8 +2239,9 @@ rec PeSection {
 # idata_sec:     the import directory + ILT/IAT + hint-name + dll-name section
 # iat_rva/size:  the IAT span within .idata (the IAT data directory)
 # import_dir_*:  the import directory span within .idata (the IMPORT directory)
-# nimp:          number of function imports (IAT/stub/hint-name entries)
+# nimp:          number of function imports (call-stub entries)
 # exception_*:   the .pdata span (EXCEPTION data directory target)
+# resource_*:    the .rsrc span (RESOURCE data directory target)
 # sec_total:     number of section-table entries
 rec PeLayout {
     image_base:  u64;
@@ -2015,6 +2252,7 @@ rec PeLayout {
     idata_sec:   PeSection;
     xdata_sec:   PeSection;
     pdata_sec:   PeSection;
+    rsrc_sec:    PeSection;
     reloc_sec:   PeSection;
     iat_rva:     u64;
     iat_size:    u64;
@@ -2022,6 +2260,8 @@ rec PeLayout {
     import_dir_size: u64;
     exception_rva:   u64;
     exception_size:  u64;
+    resource_rva:    u64;
+    resource_size:   u64;
     basereloc_rva:   u64;
     basereloc_size:  u64;
     nimp:        u32;
@@ -2029,6 +2269,7 @@ rec PeLayout {
     have_idata:  bool;
     have_xdata:  bool;
     have_pdata:  bool;
+    have_rsrc:   bool;
     have_reloc:  bool;
     sec_total:   u32;
     # non-allocated debug sections (discardable), placed above the loaded sections;
@@ -2069,9 +2310,43 @@ rec FunctionUnwind {
     codes:       [32]UnwindCode;
 }
 
-# the number of function imports in a dynamic plan - only these
-# get an IAT slot, an import stub, and a hint/name entry. a data import binds
-# through an IAT slot too in a full implementation, but none are emitted today
+# validate the linker-supplied exception metadata and count its runtime-function
+# rows. each input section is a packed array of 12-byte RUNTIME_FUNCTION records
+fun foreign_runtime_count(exceptions: *of.Section, exception_count: u32) R.Result[u32, str] {
+    var total: u64 = 0;
+    var i: u32 = 0;
+    for (i < exception_count) {
+        if (exceptions == nil || exceptions[i].kind != of.SK_EXCEPTION
+            || exceptions[i].len::usize % RUNTIME_FUNCTION_SIZE != 0
+            || (exceptions[i].len > 0 && exceptions[i].bytes == nil)) {
+            ret R.err[u32, str]("coff: malformed exception metadata");
+        }
+        total = total + (exceptions[i].len::usize / RUNTIME_FUNCTION_SIZE)::u64;
+        if (total > 0xFFFFFFFF) { ret R.err[u32, str]("coff: too many runtime functions"); }
+        i = i + 1;
+    }
+    ret R.ok[u32, str](total::u32);
+}
+
+# whether a foreign runtime-function table already owns a function start. the
+# foreign row is authoritative, so the prologue recognizer must not synthesize a
+# duplicate entry for the same function
+fun foreign_runtime_has_begin(exceptions: *of.Section, exception_count: u32,
+                              begin_rva: u32) bool {
+    var s: u32 = 0;
+    for (s < exception_count) {
+        var off: usize = 0;
+        for (off + RUNTIME_FUNCTION_SIZE <= exceptions[s].len::usize) {
+            if (bin.read_u32_le(exceptions[s].bytes, off) == begin_rva) { ret true; }
+            off = off + RUNTIME_FUNCTION_SIZE;
+        }
+        s = s + 1;
+    }
+    ret false;
+}
+
+# the number of function imports in a dynamic plan - only these need a direct-call
+# stub. Every import, including data and `__imp_X`-only rows, gets an IAT slot
 fun func_import_count(dyn: *of.DynamicInfo) u32 {
     if (dyn == nil) { ret 0; }
     var n: u32 = 0;
@@ -2132,10 +2407,10 @@ fun base_reloc_cmp(a: *of.BaseReloc, b: *of.BaseReloc) i64 {
     ret 0;
 }
 
-# the image RVA of a base relocation's fixup slot: the patched segment's RVA plus the
-# slot's byte offset within it
+# the image RVA of a base relocation's fixup slot: the patched segment content's
+# RVA plus the slot's byte offset within it
 fun base_reloc_rva(br: *of.BaseReloc, seg_secs: *PeSection) u64 {
-    ret seg_secs[br.seg_index].rva + br.seg_offset::u64;
+    ret seg_secs[br.seg_index].content_rva + br.seg_offset::u64;
 }
 
 # the 4-KiB page base RVA a fixup falls in (the IMAGE_BASE_RELOCATION block key)
@@ -2446,11 +2721,19 @@ fun parse_function_unwind(uw: *FunctionUnwind, segs: *of.LoadSegment, seg_count:
 # parse every emitted function into `out`, returning the
 # count whose prologue matched and that carry unwind data
 fun collect_function_unwind(segs: *of.LoadSegment, seg_count: u32, funcs: *of.ExecFunction,
-                            func_count: u32, out: *FunctionUnwind) u32 {
+                            func_count: u32, exceptions: *of.Section, exception_count: u32,
+                            image_base: u64, out: *FunctionUnwind) u32 {
     var n: u32 = 0;
     var i: u32 = 0;
     for (i < func_count) {
-        if (parse_function_unwind(?out[n], segs, seg_count, funcs, i)) { n = n + 1; }
+        if (parse_function_unwind(?out[n], segs, seg_count, funcs, i)) {
+            val begin: u64 = segs[out[n].seg_index].vaddr - image_base
+                            + out[n].seg_offset::u64;
+            if (begin <= 0xFFFFFFFF
+                && !foreign_runtime_has_begin(exceptions, exception_count, begin::u32)) {
+                n = n + 1;
+            }
+        }
         i = i + 1;
     }
     ret n;
@@ -2465,7 +2748,8 @@ fun collect_function_unwind(segs: *of.LoadSegment, seg_count: u32, funcs: *of.Ex
 # in memory). returns the total file size
 fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32,
                       dyn: *of.DynamicInfo, seg_secs: *PeSection,
-                      xdata_vsize: usize, pdata_vsize: usize,
+                      image_base: u64,
+                      xdata_vsize: usize, pdata_vsize: usize, resource_vsize: usize,
                       debug: *of.Section, debug_count: u32, debug_secs: *PeSection) usize {
     lay.nimp      = func_import_count(dyn);
     lay.seg_secs  = seg_secs;
@@ -2473,6 +2757,7 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
     lay.have_idata = dyn != nil && (dyn.lib_count > 0 || dyn.import_count > 0);
     lay.have_xdata = xdata_vsize > 0;
     lay.have_pdata = pdata_vsize > 0;
+    lay.have_rsrc = resource_vsize > 0;
     lay.have_reloc = dyn != nil && dyn.base_reloc_count > 0;
     lay.debug_secs  = debug_secs;
     lay.debug_count = debug_count;
@@ -2486,6 +2771,7 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
     if (lay.have_idata) { nsec = nsec + 1; }
     if (lay.have_xdata) { nsec = nsec + 1; }
     if (lay.have_pdata) { nsec = nsec + 1; }
+    if (lay.have_rsrc)  { nsec = nsec + 1; }
     if (lay.have_reloc) { nsec = nsec + 1; }
     nsec = nsec + debug_count;
     lay.sec_total = nsec;
@@ -2497,17 +2783,13 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
         + OPTIONAL_HEADER_SIZE + nsec::usize * SECTION_HEADER_SIZE;
     lay.header_size = bin.align_up(headers_raw, PE_FILE_ALIGN::usize);
 
-    # ImageBase: the headers map at RVA 0, so ImageBase sits one header span (the
-    # section-aligned SizeOfHeaders) below the first segment - mirroring the ELF
-    # header reserve. the first segment then maps immediately after the headers,
-    # leaving no unmapped gap (the Windows loader rejects a header->section gap with
-    # ERROR_BAD_EXE_FORMAT, even though wine tolerates it). ImageBase stays
-    # 64 KiB-aligned because the OS places the first segment one header span above a
-    # 64 KiB boundary (see target.os.windows base_addr).
-    var seg0: u64 = 0x140000000 + PE_SECTION_ALIGN;
-    if (seg_count > 0) { seg0 = segs[0].vaddr; }
+    # the explicit image base is the same value relocation application used. headers
+    # map at RVA 0 and the first PE section starts after the section-aligned header
+    # reserve, leaving no header-to-section gap. when the generic linker aligned its
+    # first content above that address, prefix padding inside the section preserves
+    # the content's exact RVA without recreating the loader-rejected gap from #1374
     val header_reserve: u64 = bin.align_up_u64(lay.header_size::u64, PE_SECTION_ALIGN);
-    lay.image_base = seg0 - header_reserve;
+    lay.image_base = image_base;
 
     var file_off: usize = lay.header_size;
     var rva: u64 = header_reserve;
@@ -2517,10 +2799,16 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
     var li: u32 = 0;
     for (li < seg_count) {
         val seg_rva: u64 = segs[li].vaddr - lay.image_base;
-        seg_secs[li].rva       = seg_rva;
-        seg_secs[li].vsize     = segs[li].memsz::u64;
-        seg_secs[li].file_off  = file_off;
-        seg_secs[li].file_size = bin.align_up(segs[li].filesz, PE_FILE_ALIGN::usize);
+        var sec_rva: u64 = seg_rva;
+        if (li == 0) { sec_rva = header_reserve; }
+        val prefix: u64 = seg_rva - sec_rva;
+        seg_secs[li].rva              = sec_rva;
+        seg_secs[li].vsize            = prefix + segs[li].memsz::u64;
+        seg_secs[li].file_off         = file_off;
+        seg_secs[li].file_size        = bin.align_up(prefix::usize + segs[li].filesz,
+                                                     PE_FILE_ALIGN::usize);
+        seg_secs[li].content_rva      = seg_rva;
+        seg_secs[li].content_file_off = file_off + prefix::usize;
         file_off = file_off + seg_secs[li].file_size;
         # the next synthesized section starts above this segment's mapped span.
         val seg_end: u64 = bin.align_up_u64(seg_rva + segs[li].memsz::u64, PE_SECTION_ALIGN);
@@ -2551,22 +2839,23 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
         lay.import_dir_size = import_dir_bytes(dyn)::u64;
         ioff = ioff + import_dir_bytes(dyn);
 
-        # ILT (import lookup / import name table): one thunk per function import +
+        # ILT (import lookup / import name table): one thunk per import +
         # a null terminator per dependency.
         ioff = bin.align_up(ioff, 8);
-        ioff = ioff + (lay.nimp + dyn.lib_count)::usize * THUNK_SIZE;
+        ioff = ioff + (dyn.import_count + dyn.lib_count)::usize * THUNK_SIZE;
 
         # IAT: identical shape to the ILT; the IAT data directory points here.
         ioff = bin.align_up(ioff, 8);
         lay.iat_rva  = rva + ioff::u64;
-        lay.iat_size = (lay.nimp + dyn.lib_count)::usize * THUNK_SIZE::u64;
-        ioff = ioff + (lay.nimp + dyn.lib_count)::usize * THUNK_SIZE;
+        lay.iat_size = (dyn.import_count + dyn.lib_count)::usize * THUNK_SIZE::u64;
+        ioff = ioff + (dyn.import_count + dyn.lib_count)::usize * THUNK_SIZE;
 
-        # hint/name table: one (hint:u16 + name + NUL, 2-byte aligned) per import.
+        # hint/name table: one (hint:u16 + name + NUL, 2-byte aligned) per
+        # by-name import. Ordinal imports encode the ordinal directly in the thunk.
         ioff = bin.align_up(ioff, 2);
         var i: u32 = 0;
         for (i < dyn.import_count) {
-            if (dyn.imports[i].is_func) {
+            if (!dyn.imports[i].by_ordinal) {
                 ioff = ioff + 2 + name_len_z(itn, dyn.imports[i].symbol);
                 ioff = bin.align_up(ioff, 2);
             }
@@ -2609,6 +2898,20 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
         lay.exception_size      = pdata_vsize::u64;
         file_off = file_off + lay.pdata_sec.file_size;
         rva = rva + bin.align_up_u64(lay.pdata_sec.vsize, PE_SECTION_ALIGN);
+    }
+
+    # read-only resource directory and payloads. It precedes .reloc so base
+    # relocations remain the last ordinary loaded section.
+    if (lay.have_rsrc) {
+        rva = bin.align_up_u64(rva, PE_SECTION_ALIGN);
+        lay.rsrc_sec.rva       = rva;
+        lay.rsrc_sec.vsize     = resource_vsize::u64;
+        lay.rsrc_sec.file_off  = file_off;
+        lay.rsrc_sec.file_size = bin.align_up(resource_vsize, PE_FILE_ALIGN::usize);
+        lay.resource_rva       = rva;
+        lay.resource_size      = resource_vsize::u64;
+        file_off = file_off + lay.rsrc_sec.file_size;
+        rva = rva + bin.align_up_u64(resource_vsize::u64, PE_SECTION_ALIGN);
     }
 
     # the .reloc section (read-only, discardable): the base-relocation blocks the loader
@@ -2668,6 +2971,43 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
     ret file_off;
 }
 
+# whether every PE32+/COFF field written for one section can be represented
+# without narrowing or range overflow
+fun pe_section_fits(sec: *PeSection) bool {
+    if (sec.rva > 0xFFFFFFFF || sec.vsize > 0xFFFFFFFF
+        || sec.file_off > 0xFFFFFFFF::usize || sec.file_size > 0xFFFFFFFF::usize
+        || sec.content_rva > 0xFFFFFFFF || sec.content_file_off > 0xFFFFFFFF::usize) { ret false; }
+    if (sec.vsize > 0xFFFFFFFF - sec.rva) { ret false; }
+    if (sec.file_size > 0xFFFFFFFF::usize - sec.file_off) { ret false; }
+    ret true;
+}
+
+# validate every 16/32-bit PE layout field before the writer casts it
+fun validate_pe_layout(lay: *PeLayout, seg_count: u32, total_size: usize) R.Result[bool, str] {
+    if (lay.sec_total > 65535) { ret R.err[bool, str]("coff: PE section count exceeds 65535"); }
+    if (lay.header_size > 0xFFFFFFFF::usize || lay.image_size > 0xFFFFFFFF
+        || total_size > 0xFFFFFFFF::usize) {
+        ret R.err[bool, str]("coff: PE image exceeds 32-bit header fields");
+    }
+    var i: u32 = 0;
+    for (i < seg_count) {
+        if (!pe_section_fits(?lay.seg_secs[i])) { ret R.err[bool, str]("coff: PE segment layout exceeds 32-bit fields"); }
+        i = i + 1;
+    }
+    if (lay.have_stub && !pe_section_fits(?lay.stub_sec))   { ret R.err[bool, str]("coff: PE import-stub layout exceeds 32-bit fields"); }
+    if (lay.have_idata && !pe_section_fits(?lay.idata_sec)) { ret R.err[bool, str]("coff: PE import layout exceeds 32-bit fields"); }
+    if (lay.have_xdata && !pe_section_fits(?lay.xdata_sec)) { ret R.err[bool, str]("coff: PE unwind layout exceeds 32-bit fields"); }
+    if (lay.have_pdata && !pe_section_fits(?lay.pdata_sec)) { ret R.err[bool, str]("coff: PE exception layout exceeds 32-bit fields"); }
+    if (lay.have_rsrc && !pe_section_fits(?lay.rsrc_sec))   { ret R.err[bool, str]("coff: PE resource layout exceeds 32-bit fields"); }
+    if (lay.have_reloc && !pe_section_fits(?lay.reloc_sec)) { ret R.err[bool, str]("coff: PE relocation layout exceeds 32-bit fields"); }
+    i = 0;
+    for (i < lay.debug_count) {
+        if (!pe_section_fits(?lay.debug_secs[i])) { ret R.err[bool, str]("coff: PE debug layout exceeds 32-bit fields"); }
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
 # serialize laid-out load segments into a static PE32+ executable.
 # installed in the COFF `of.OfVTable` as its `of.ExecFn`. a static link (no
 # imports) is the dynamic write with an empty plan, so this delegates to the
@@ -2677,20 +3017,27 @@ fun compute_pe_layout(itn: *intern.Interner, lay: *PeLayout, segs: *of.LoadSegme
 # isa_vt:     the instruction-set vtable describing the machine (must be x86-64)
 # segs:       the loadable segments, in ascending virtual-address order
 # seg_count:  number of load segments
-# entry:      program entry-point virtual address
 # page_size:  segment-alignment page (unused; PE uses its own fixed section/file
 #             alignment - PE_SECTION_ALIGN / PE_FILE_ALIGN)
+# image_base: exact image base used when the linker applied ADDR32NB relocations
+# entry:      program entry-point virtual address
 # funcs:      per-function metadata for unwind-table emission
 # func_count: number of entries in funcs
 # path:       null-terminated output file path
 # name:       product name; accepted for of.ExecFn conformance (PE does not sign here)
+# image_options: PE subsystem and optional resource payloads
 # ret:        ok(true) on success, or an error string
 fun coff_emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
-                   seg_count: u32, page_size: u64, entry: u64, funcs: *of.ExecFunction,
-                   func_count: u32, debug: *of.Section, debug_count: u32, path: *u8, name: *u8) R.Result[bool, str] {
+                   seg_count: u32, page_size: u64, image_base: u64, entry: u64,
+                   funcs: *of.ExecFunction,
+                   func_count: u32, exceptions: *of.Section, exception_count: u32,
+                   debug: *of.Section, debug_count: u32, path: *u8, name: *u8,
+                   image_options: of.ImageOptions) R.Result[bool, str] {
     # a static PE carries no dynamic plan, so it resolves no interned names; the
     # interner is forwarded only so a write failure can be located on its path.
-    ret write_pe(alloc, itn, isa_vt, segs, seg_count, entry, funcs, func_count, nil, nil, 0, debug, debug_count, path);
+    ret write_pe(alloc, itn, isa_vt, segs, seg_count, image_base, entry, funcs, func_count,
+                 nil, nil, 0, exceptions, exception_count,
+                 debug, debug_count, path, image_options);
 }
 
 # serialize laid-out load segments into a dynamically-linked
@@ -2708,6 +3055,7 @@ fun coff_emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaV
 # seg_count:   number of load segments
 # page_size:   segment-alignment page (unused; PE uses its own fixed section/file
 #              alignment - PE_SECTION_ALIGN / PE_FILE_ALIGN)
+# image_base:  exact image base used when the linker applied ADDR32NB relocations
 # entry:       program entry-point virtual address
 # funcs:       per-function metadata for unwind-table emission
 # func_count:  number of entries in funcs
@@ -2718,13 +3066,19 @@ fun coff_emit_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaV
 # debug_count: number of debug sections
 # path:        null-terminated output file path
 # name:        product name; accepted for of.DynExecFn conformance (PE does not sign)
+# image_options: PE subsystem and optional resource payloads
 # ret:         ok(true) on success, or an error string
 fun coff_emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
-                       seg_count: u32, page_size: u64, entry: u64, funcs: *of.ExecFunction,
+                       seg_count: u32, page_size: u64, image_base: u64, entry: u64,
+                       funcs: *of.ExecFunction,
                        func_count: u32, dyn: *of.DynamicInfo,
-                       fixups: *of.PltFixup, fixup_count: u32, debug: *of.Section, debug_count: u32,
-                       path: *u8, name: *u8) R.Result[bool, str] {
-    ret write_pe(alloc, itn, isa_vt, segs, seg_count, entry, funcs, func_count, dyn, fixups, fixup_count, debug, debug_count, path);
+                       fixups: *of.PltFixup, fixup_count: u32,
+                       exceptions: *of.Section, exception_count: u32,
+                       debug: *of.Section, debug_count: u32,
+                       path: *u8, name: *u8, image_options: of.ImageOptions) R.Result[bool, str] {
+    ret write_pe(alloc, itn, isa_vt, segs, seg_count, image_base, entry, funcs, func_count,
+                 dyn, fixups, fixup_count, exceptions, exception_count,
+                 debug, debug_count, path, image_options);
 }
 
 # the shared PE32+ executable writer behind `coff_emit_exec` (static)
@@ -2735,15 +3089,43 @@ fun coff_emit_dyn_exec(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.
 # data directories), the section table, and every section's bytes. each `PltFixup`
 # call site is redirected to its import stub
 fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable, segs: *of.LoadSegment,
-             seg_count: u32, entry: u64, funcs: *of.ExecFunction, func_count: u32,
+             seg_count: u32, image_base: u64, entry: u64,
+             funcs: *of.ExecFunction, func_count: u32,
              dyn: *of.DynamicInfo,
-             fixups: *of.PltFixup, fixup_count: u32, debug: *of.Section, debug_count: u32, path: *u8) R.Result[bool, str] {
+             fixups: *of.PltFixup, fixup_count: u32,
+             exceptions: *of.Section, exception_count: u32,
+             debug: *of.Section, debug_count: u32, path: *u8,
+             image_options: of.ImageOptions) R.Result[bool, str] {
     if (isa_vt == nil) { ret R.err[bool, str]("coff: nil exec isa"); }
     if (path == nil)   { ret R.err[bool, str]("coff: nil exec path"); }
     if (isa_vt.id != isa.ARCH_X86_64) {
         ret R.err[bool, str]("coff: PE emission is only implemented for x86-64");
     }
     if (seg_count == 0) { ret R.err[bool, str]("coff: no loadable segments"); }
+
+    val frr: R.Result[u32, str] = foreign_runtime_count(exceptions, exception_count);
+    if (R.is_err[u32, str](frr)) { ret R.err[bool, str](R.unwrap_err[u32, str](frr)); }
+    val foreign_count: u32 = R.unwrap_ok[u32, str](frr);
+    if ((image_base & 0xFFFF) != 0) {
+        ret R.err[bool, str]("coff: PE image base is not 64 KiB-aligned");
+    }
+    if (segs[0].vaddr < image_base
+        || segs[0].vaddr - image_base < PE_SECTION_ALIGN) {
+        ret R.err[bool, str]("coff: first segment precedes the PE header page");
+    }
+    if (entry < image_base || entry - image_base > 0xFFFFFFFF) {
+        ret R.err[bool, str]("coff: PE entry point exceeds the 32-bit RVA field");
+    }
+    var vsi: u32 = 0;
+    for (vsi < seg_count) {
+        if (segs[vsi].vaddr < image_base || segs[vsi].vaddr - image_base > 0xFFFFFFFF
+            || segs[vsi].filesz > 0xFFFFFFFF::usize
+            || segs[vsi].memsz > 0xFFFFFFFF::usize
+            || segs[vsi].memsz::u64 > 0xFFFFFFFFFFFFFFFF - segs[vsi].vaddr) {
+            ret R.err[bool, str]("coff: PE load segment exceeds representable offsets or sizes");
+        }
+        vsi = vsi + 1;
+    }
     # the of.ExecFn/DynExecFn debug-section channel is framed into the PE image as
     # non-loaded discardable sections below; native PE-loader / debugger verification
     # is pending the Windows runner (#1698), and the structure round-trips in the
@@ -2777,13 +3159,17 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
             ret R.err[bool, str]("coff: unwind table alloc failed");
         }
         uw_all = R.unwrap_ok[*FunctionUnwind, str](ur);
-        uw_count = collect_function_unwind(segs, seg_count, funcs, func_count, uw_all);
+        uw_count = collect_function_unwind(segs, seg_count, funcs, func_count,
+                                           exceptions, exception_count, image_base, uw_all);
         var ui: u32 = 0;
         for (ui < uw_count) {
             xdata_vsize = xdata_vsize + uw_all[ui].xdata_size;
             ui = ui + 1;
         }
-        pdata_vsize = uw_count::usize * RUNTIME_FUNCTION_SIZE;
+        pdata_vsize = (uw_count + foreign_count)::usize * RUNTIME_FUNCTION_SIZE;
+    }
+    or {
+        pdata_vsize = foreign_count::usize * RUNTIME_FUNCTION_SIZE;
     }
 
     # sort the base relocations by ascending image location so the per-page .reloc block
@@ -2793,12 +3179,60 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
         sort.sort[of.BaseReloc](dyn.base_relocs, dyn.base_reloc_count::usize, base_reloc_cmp);
     }
 
+    # Build the resource image once. Layout measures this exact image and emit
+    # later serializes it, preventing a size/write disagreement.
+    var resource_image: rs.RsrcImage;
+    var resource_ptr: *rs.RsrcImage = nil;
+    var resource_size: usize = 0;
+    if (image_options.resources != nil) {
+        val info: *of.ResourceInfo = image_options.resources;
+        val rr: R.Result[rs.RsrcImage, str] = rs.build(alloc, info.icon, info.icon_len,
+            info.app_manifest, info.app_manifest_len, info.version, info.internal_name,
+            info.original_filename, info.product_name);
+        if (R.is_err[rs.RsrcImage, str](rr)) {
+            if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
+            A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
+            if (uw_all != nil && func_count > 0) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
+            ret R.err[bool, str](R.unwrap_err[rs.RsrcImage, str](rr));
+        }
+        resource_image = R.unwrap_ok[rs.RsrcImage, str](rr);
+        resource_ptr = ?resource_image;
+        val sr: R.Result[usize, str] = rs.size(resource_ptr);
+        if (R.is_err[usize, str](sr)) {
+            rs.dnit(alloc, resource_ptr);
+            if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
+            A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
+            if (uw_all != nil && func_count > 0) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
+            ret R.err[bool, str](R.unwrap_err[usize, str](sr));
+        }
+        resource_size = R.unwrap_ok[usize, str](sr);
+    }
+
     var lay: PeLayout;
-    val total_size: usize = compute_pe_layout(itn, ?lay, segs, seg_count, dyn, seg_secs, xdata_vsize, pdata_vsize,
-                                              debug, debug_count, debug_secs);
+    val total_size: usize = compute_pe_layout(itn, ?lay, segs, seg_count, dyn, seg_secs,
+                                              image_base, xdata_vsize, pdata_vsize,
+                                              resource_size, debug, debug_count, debug_secs);
+
+    val layout_r: R.Result[bool, str] = validate_pe_layout(?lay, seg_count, total_size);
+    if (R.is_err[bool, str](layout_r)) {
+        if (resource_ptr != nil) { rs.dnit(alloc, resource_ptr); }
+        if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
+        A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
+        if (uw_all != nil && func_count > 0) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
+        ret R.err[bool, str](R.unwrap_err[bool, str](layout_r));
+    }
+
+    if (lay.header_size::u64 > PE_SECTION_ALIGN) {
+        if (resource_ptr != nil) { rs.dnit(alloc, resource_ptr); }
+        if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
+        A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
+        if (uw_all != nil && func_count > 0) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
+        ret R.err[bool, str]("coff: PE headers exceed the reserved image page");
+    }
 
     val res_buf: R.Result[*u8, str] = A.zallocate[u8](alloc, total_size);
     if (R.is_err[*u8, str](res_buf)) {
+        if (resource_ptr != nil) { rs.dnit(alloc, resource_ptr); }
         if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
         A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
         if (uw_all != nil && func_count > 0) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
@@ -2810,7 +3244,8 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
     var li: u32 = 0;
     for (li < seg_count) {
         if (segs[li].bytes != nil && segs[li].filesz > 0) {
-            memory.raw_copy((buf::usize + seg_secs[li].file_off)::ptr, segs[li].bytes::ptr, segs[li].filesz);
+            memory.raw_copy((buf::usize + seg_secs[li].content_file_off)::ptr,
+                            segs[li].bytes::ptr, segs[li].filesz);
         }
         li = li + 1;
     }
@@ -2849,13 +3284,34 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
     # jump through the IAT slots the import section owns.
     if (lay.have_idata)                   { write_pe_imports(itn, buf, ?lay, dyn); }
     if (lay.have_stub)                    { write_pe_stubs(buf, ?lay, dyn); }
-    if (lay.have_xdata || lay.have_pdata) { write_pe_unwind(buf, ?lay, uw_all, uw_count); }
+    if (lay.have_xdata || lay.have_pdata) {
+        write_pe_unwind(buf, ?lay, uw_all, uw_count, exceptions, exception_count);
+    }
+    if (lay.have_rsrc) {
+        val er: R.Result[usize, str] = rs.emit(resource_ptr, buf, lay.rsrc_sec.file_off,
+                                               lay.rsrc_sec.rva);
+        if (R.is_err[usize, str](er) || R.unwrap_ok[usize, str](er) != resource_size) {
+            var msg: str = "coff: resource size changed during emission";
+            if (R.is_err[usize, str](er)) { msg = R.unwrap_err[usize, str](er); }
+            rs.dnit(alloc, resource_ptr);
+            A.deallocate[u8](alloc, buf, total_size);
+            if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
+            A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
+            if (uw_all != nil && func_count > 0) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
+            ret R.err[bool, str](msg);
+        }
+    }
     if (lay.have_reloc)                   { write_reloc_section(buf, lay.reloc_sec.file_off, dyn, seg_secs); }
 
     # redirect each import call site to its stub (a non-import call site never
     # reaches here - the linker only records fixups for function imports).
-    val fx_r: R.Result[bool, str] = patch_pe_fixups(buf, ?lay, dyn, fixups, fixup_count, segs, seg_count);
+    var fx_r: R.Result[bool, str] =
+        patch_pe_fixups(buf, ?lay, dyn, fixups, fixup_count, segs, seg_count);
+    if (R.is_ok[bool, str](fx_r)) {
+        fx_r = patch_pe_import_addr_fixups(buf, ?lay, dyn, segs, seg_count);
+    }
     if (R.is_err[bool, str](fx_r)) {
+        if (resource_ptr != nil) { rs.dnit(alloc, resource_ptr); }
         A.deallocate[u8](alloc, buf, total_size);
         if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
         A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
@@ -2866,8 +3322,18 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
     # the headers, then the section table. a position-independent image (Windows ASLR)
     # clears RELOCS_STRIPPED and sets DYNAMIC_BASE.
     val pie: bool = dyn != nil && dyn.pie;
-    write_pe_headers(buf, ?lay, segs, seg_count, entry, pie, itn, dyn, debug, debug_count);
+    val header_r: R.Result[bool, str] = write_pe_headers(buf, ?lay, segs, seg_count, entry,
+        pie, itn, dyn, debug, debug_count, image_options.subsystem);
+    if (R.is_err[bool, str](header_r)) {
+        if (resource_ptr != nil) { rs.dnit(alloc, resource_ptr); }
+        A.deallocate[u8](alloc, buf, total_size);
+        if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
+        A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
+        if (uw_all != nil && func_count > 0) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
+        ret R.err[bool, str](R.unwrap_err[bool, str](header_r));
+    }
 
+    if (resource_ptr != nil) { rs.dnit(alloc, resource_ptr); }
     if (debug_secs != nil) { A.deallocate[PeSection](alloc, debug_secs, debug_count::usize); }
     A.deallocate[PeSection](alloc, seg_secs, seg_count::usize);
     if (uw_all != nil && func_count > 0) { A.deallocate[FunctionUnwind](alloc, uw_all, func_count::usize); }
@@ -2883,13 +3349,12 @@ fun write_pe(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
 # serialize the `.idata` section - the import directory table,
 # the ILT (import lookup) and IAT thunk arrays, the hint/name table, and the
 # dll-name strings - so the loader binds every import at load time. the IAT slot
-# RVAs are recovered by `write_pe_stubs` and `patch_pe_fixups` (recomputed by the
-# same import ordinal), so this lays the same offsets `compute_pe_layout` used
+# RVAs are recovered by the stub and import-address fixup patchers, so this lays
+# the same dependency-major offsets `compute_pe_layout` used
 #
-# the ILT and IAT are identical on disk (both are by-name thunks pointing at the
-# hint/name entries); the loader overwrites each IAT thunk with the resolved
-# function address. a thunk with bit 63 set would be an import-by-ordinal; every
-# thunk here is an RVA into the hint/name table (import-by-name).
+# the ILT and IAT are identical on disk. A by-name thunk points at its hint/name
+# entry; an ordinal thunk carries bit 63 plus the 16-bit ordinal directly. The
+# loader overwrites each IAT thunk with the resolved export address.
 fun write_pe_imports(itn: *intern.Interner, buf: *u8, lay: *PeLayout, dyn: *of.DynamicInfo) {
     val sec_off: usize = lay.idata_sec.file_off;
     val sec_rva: u64   = lay.idata_sec.rva;
@@ -2901,16 +3366,16 @@ fun write_pe_imports(itn: *intern.Interner, buf: *u8, lay: *PeLayout, dyn: *of.D
 
     ioff = bin.align_up(ioff, 8);
     val ilt_off: usize = ioff;
-    ioff = ioff + (lay.nimp + dyn.lib_count)::usize * THUNK_SIZE;
+    ioff = ioff + (dyn.import_count + dyn.lib_count)::usize * THUNK_SIZE;
 
     ioff = bin.align_up(ioff, 8);
     val iat_off: usize = ioff;
-    ioff = ioff + (lay.nimp + dyn.lib_count)::usize * THUNK_SIZE;
+    ioff = ioff + (dyn.import_count + dyn.lib_count)::usize * THUNK_SIZE;
 
     ioff = bin.align_up(ioff, 2);
     val hint_off: usize = ioff;
 
-    # the hint/name entry RVA of each function import, recorded so the ILT/IAT
+    # the hint/name entry RVA of each by-name import, recorded so the ILT/IAT
     # thunks point at them. walk imports in order, advancing the hint cursor.
     var hcur: usize = hint_off;
     # write the ILT/IAT thunks and hint/name entries per dependency, then the
@@ -2922,17 +3387,22 @@ fun write_pe_imports(itn: *intern.Interner, buf: *u8, lay: *PeLayout, dyn: *of.D
         val first_thunk: u32 = thunk_ix;
         var imp: u32 = 0;
         for (imp < dyn.import_count) {
-            if (dyn.imports[imp].is_func && import_lib_of(dyn, imp) == lib) {
-                val hint_rva: u64 = sec_rva + hcur::u64;
-                # hint = 0; the loader falls back to a binary search by name.
-                bin.write_u16_le(buf, sec_off + hcur, 0);
-                hcur = hcur + 2;
-                hcur = hcur + bin.write_str(buf, sec_off + hcur, bin.resolve_name(itn, dyn.imports[imp].symbol));
-                hcur = bin.align_up(hcur, 2);
+            if (import_lib_of(dyn, imp) == lib) {
+                var thunk: u64 = 0;
+                if (dyn.imports[imp].by_ordinal) {
+                    thunk = IMPORT_ORDINAL_FLAG64 | dyn.imports[imp].ordinal::u64;
+                }
+                or {
+                    thunk = sec_rva + hcur::u64;
+                    bin.write_u16_le(buf, sec_off + hcur, dyn.imports[imp].ordinal);
+                    hcur = hcur + 2;
+                    hcur = hcur + bin.write_str(buf, sec_off + hcur,
+                        bin.resolve_name(itn, dyn.imports[imp].symbol));
+                    hcur = bin.align_up(hcur, 2);
+                }
 
-                # ILT[thunk_ix] and IAT[thunk_ix] = RVA of the hint/name entry.
-                bin.write_u64_le(buf, sec_off + ilt_off + thunk_ix::usize * THUNK_SIZE, hint_rva);
-                bin.write_u64_le(buf, sec_off + iat_off + thunk_ix::usize * THUNK_SIZE, hint_rva);
+                bin.write_u64_le(buf, sec_off + ilt_off + thunk_ix::usize * THUNK_SIZE, thunk);
+                bin.write_u64_le(buf, sec_off + iat_off + thunk_ix::usize * THUNK_SIZE, thunk);
                 thunk_ix = thunk_ix + 1;
             }
             imp = imp + 1;
@@ -2960,7 +3430,7 @@ fun write_pe_imports(itn: *intern.Interner, buf: *u8, lay: *PeLayout, dyn: *of.D
     # the null import descriptor terminates the directory (zeroed by alloc).
 }
 
-# the dependency index a function import binds to. an import pinned
+# the dependency index an import binds to. an import pinned
 # to a specific DynLib uses that index; an unpinned import (DYNLIB_ANY) binds to
 # the first dependency, which on Windows is the canonical system import library
 fun import_lib_of(dyn: *of.DynamicInfo, imp: u32) u32 {
@@ -2974,11 +3444,12 @@ fun import_lib_of(dyn: *of.DynamicInfo, imp: u32) u32 {
 # order write_pe_imports laid them). the stub for this import jumps through this
 # slot, which the loader fills with the resolved address
 fun pe_iat_slot_rva(lay: *PeLayout, dyn: *of.DynamicInfo, ord: u32) u64 {
-    # mirror write_pe_imports' thunk indexing: function imports per dependency in
-    # import order, with one null terminator slot after each dependency.
+    # mirror write_pe_imports' thunk indexing: every import is present per
+    # dependency, with one null terminator slot after each dependency. `ord`
+    # counts only the function subset used by call stubs.
     var ioff: usize = import_dir_bytes(dyn);
     ioff = bin.align_up(ioff, 8);
-    ioff = ioff + (lay.nimp + dyn.lib_count)::usize * THUNK_SIZE;
+    ioff = ioff + (dyn.import_count + dyn.lib_count)::usize * THUNK_SIZE;
     ioff = bin.align_up(ioff, 8);
     val iat_off: usize = ioff;
 
@@ -2988,11 +3459,46 @@ fun pe_iat_slot_rva(lay: *PeLayout, dyn: *of.DynamicInfo, ord: u32) u64 {
     for (lib < dyn.lib_count) {
         var imp: u32 = 0;
         for (imp < dyn.import_count) {
-            if (dyn.imports[imp].is_func && import_lib_of(dyn, imp) == lib) {
-                if (fn_ord == ord) {
-                    ret lay.idata_sec.rva + iat_off::u64 + thunk_ix::u64 * THUNK_SIZE::u64;
+            if (import_lib_of(dyn, imp) == lib) {
+                if (dyn.imports[imp].is_func) {
+                    if (fn_ord == ord) {
+                        ret lay.idata_sec.rva + iat_off::u64
+                            + thunk_ix::u64 * THUNK_SIZE::u64;
+                    }
+                    fn_ord = fn_ord + 1;
                 }
-                fn_ord = fn_ord + 1;
+                thunk_ix = thunk_ix + 1;
+            }
+            imp = imp + 1;
+        }
+        thunk_ix = thunk_ix + 1;
+        lib = lib + 1;
+    }
+    ret 0;
+}
+
+# the IAT-slot RVA for the dynamic plan's raw import index. Unlike
+# `pe_iat_slot_rva`, this addresses function and data rows alike, which is the
+# target of a deferred import-address fixup
+fun pe_import_iat_slot_rva(lay: *PeLayout, dyn: *of.DynamicInfo,
+                           idx: u32) u64 {
+    if (dyn == nil || idx >= dyn.import_count) { ret 0; }
+    var ioff: usize = import_dir_bytes(dyn);
+    ioff = bin.align_up(ioff, 8);
+    ioff = ioff + (dyn.import_count + dyn.lib_count)::usize * THUNK_SIZE;
+    ioff = bin.align_up(ioff, 8);
+    val iat_off: usize = ioff;
+
+    var thunk_ix: u32 = 0;
+    var lib: u32 = 0;
+    for (lib < dyn.lib_count) {
+        var imp: u32 = 0;
+        for (imp < dyn.import_count) {
+            if (import_lib_of(dyn, imp) == lib) {
+                if (imp == idx) {
+                    ret lay.idata_sec.rva + iat_off::u64
+                        + thunk_ix::u64 * THUNK_SIZE::u64;
+                }
                 thunk_ix = thunk_ix + 1;
             }
             imp = imp + 1;
@@ -3091,12 +3597,43 @@ fun write_unwind_xdata(buf: *u8, lay: *PeLayout, uw: *FunctionUnwind) {
     }
 }
 
-# emit the .xdata UNWIND_INFO records and the .pdata
-# RUNTIME_FUNCTION table for every collected function. parse_function_unwind has
-# already rejected any out-of-range seg_index, so every entry maps to a segment
-fun write_pe_unwind(buf: *u8, lay: *PeLayout, uws: *FunctionUnwind, uw_count: u32) {
-    if (uw_count == 0 || uws == nil)        { ret; }
-    if (!lay.have_xdata || !lay.have_pdata) { ret; }
+# order packed RUNTIME_FUNCTION rows by begin address, then end/unwind address.
+# insertion sort is sufficient here: exception tables are small and already near
+# link order, while sorting in place avoids another allocation in the writer
+fun sort_runtime_functions(buf: *u8, off: usize, count: u32) {
+    var i: u32 = 1;
+    for (i < count) {
+        val at: usize = off + i::usize * RUNTIME_FUNCTION_SIZE;
+        val kb: u32 = bin.read_u32_le(buf, at);
+        val ke: u32 = bin.read_u32_le(buf, at + 4);
+        val ku: u32 = bin.read_u32_le(buf, at + 8);
+        var j: u32 = i;
+        for (j > 0) {
+            val prev: usize = off + (j - 1)::usize * RUNTIME_FUNCTION_SIZE;
+            val pb: u32 = bin.read_u32_le(buf, prev);
+            val pe: u32 = bin.read_u32_le(buf, prev + 4);
+            val pu: u32 = bin.read_u32_le(buf, prev + 8);
+            if (pb < kb || (pb == kb && (pe < ke || (pe == ke && pu <= ku)))) { brk; }
+            val dst: usize = off + j::usize * RUNTIME_FUNCTION_SIZE;
+            bin.write_u32_le(buf, dst, pb);
+            bin.write_u32_le(buf, dst + 4, pe);
+            bin.write_u32_le(buf, dst + 8, pu);
+            j = j - 1;
+        }
+        val dst: usize = off + j::usize * RUNTIME_FUNCTION_SIZE;
+        bin.write_u32_le(buf, dst, kb);
+        bin.write_u32_le(buf, dst + 4, ke);
+        bin.write_u32_le(buf, dst + 8, ku);
+        i = i + 1;
+    }
+}
+
+# emit generated UNWIND_INFO records and one combined RUNTIME_FUNCTION table.
+# Foreign, already-relocated rows are authoritative and precede generated rows
+# before the final table is sorted as required by the x64 exception dispatcher
+fun write_pe_unwind(buf: *u8, lay: *PeLayout, uws: *FunctionUnwind, uw_count: u32,
+                    exceptions: *of.Section, exception_count: u32) {
+    if (!lay.have_pdata) { ret; }
 
     var xcur: usize = 0;
     var i: u32 = 0;
@@ -3107,17 +3644,33 @@ fun write_pe_unwind(buf: *u8, lay: *PeLayout, uws: *FunctionUnwind, uw_count: u3
         i = i + 1;
     }
 
+    var row: u32 = 0;
+    var s: u32 = 0;
+    for (s < exception_count) {
+        var src: usize = 0;
+        for (src < exceptions[s].len::usize) {
+            val poff: usize = lay.pdata_sec.file_off + row::usize * RUNTIME_FUNCTION_SIZE;
+            bin.write_u32_le(buf, poff, bin.read_u32_le(exceptions[s].bytes, src));
+            bin.write_u32_le(buf, poff + 4, bin.read_u32_le(exceptions[s].bytes, src + 4));
+            bin.write_u32_le(buf, poff + 8, bin.read_u32_le(exceptions[s].bytes, src + 8));
+            row = row + 1;
+            src = src + RUNTIME_FUNCTION_SIZE;
+        }
+        s = s + 1;
+    }
+
     i = 0;
     for (i < uw_count) {
-        val poff: usize = lay.pdata_sec.file_off + i::usize * RUNTIME_FUNCTION_SIZE;
-        val seg_rva: u64 = lay.seg_secs[uws[i].seg_index].rva;
+        val poff: usize = lay.pdata_sec.file_off + row::usize * RUNTIME_FUNCTION_SIZE;
+        val seg_rva: u64 = lay.seg_secs[uws[i].seg_index].content_rva;
         val begin_rva: u32 = (seg_rva + uws[i].seg_offset::u64)::u32;
-        val end_rva: u32 = begin_rva + uws[i].size;
         bin.write_u32_le(buf, poff, begin_rva);
-        bin.write_u32_le(buf, poff + 4, end_rva);
+        bin.write_u32_le(buf, poff + 4, begin_rva + uws[i].size);
         bin.write_u32_le(buf, poff + 8, uws[i].xdata_rva::u32);
+        row = row + 1;
         i = i + 1;
     }
+    sort_runtime_functions(buf, lay.pdata_sec.file_off, row);
 }
 
 # rewrite each import call site (a `PltFixup` the linker could not
@@ -3145,14 +3698,85 @@ fun patch_pe_fixups(buf: *u8, lay: *PeLayout, dyn: *of.DynamicInfo, fixups: *of.
             ret R.err[bool, str]("coff: dynamic call-site fixup offset out of range");
         }
 
-        val stub_va: u64 = lay.image_base + lay.stub_sec.rva + ord::u64 * IMPORT_STUB_SIZE::u64;
-        val disp: i64 = (stub_va::i64) + fx.addend - (fx.patch_vaddr::i64);
-        if (disp > 2147483647 || disp < -2147483648) {
+        val stub_va: u64 = lay.image_base + lay.stub_sec.rva
+                           + ord::u64 * IMPORT_STUB_SIZE::u64;
+        val disp_r: R.Result[i64, str] =
+            pe_rel32_disp(stub_va, fx.addend, fx.patch_vaddr);
+        if (R.is_err[i64, str](disp_r)) {
             ret R.err[bool, str]("coff: dynamic call-site displacement overflows 32 bits");
         }
+        val disp: i64 = R.unwrap_ok[i64, str](disp_r);
 
-        val file_off: usize = lay.seg_secs[fx.seg_index].file_off + fx.seg_offset::usize;
+        val file_off: usize = lay.seg_secs[fx.seg_index].content_file_off + fx.seg_offset::usize;
         bin.write_u32_le(buf, file_off, (disp::u64)::u32);
+        i = i + 1;
+    }
+    ret R.ok[bool, str](true);
+}
+
+# compute a PE/x64 signed rel32 value (`S + A - P`) without allowing either the
+# u64 addresses or the intermediate signed addition to wrap
+fun pe_rel32_disp(target_va: u64, addend: i64,
+                  patch_va: u64) R.Result[i64, str] {
+    val i64_max: i64 = 9223372036854775807;
+    val i64_min: i64 = -9223372036854775807 - 1;
+    if (target_va > i64_max::u64 || patch_va > i64_max::u64) {
+        ret R.err[i64, str]("coff: PE rel32 address exceeds the signed range");
+    }
+    val delta: i64 = target_va::i64 - patch_va::i64;
+    if ((addend > 0 && delta > i64_max - addend)
+        || (addend < 0 && delta < i64_min - addend)) {
+        ret R.err[i64, str]("coff: PE rel32 signed arithmetic overflow");
+    }
+    val disp: i64 = delta + addend;
+    if (disp > 2147483647 || disp < -2147483648) {
+        ret R.err[i64, str]("coff: PE rel32 displacement overflows 32 bits");
+    }
+    ret R.ok[i64, str](disp);
+}
+
+# resolve every PE import-address reference directly to its import's IAT slot.
+# Unlike a direct call fixup, an `__imp_X` relocation does not target a stub: its
+# x64 instruction already performs the indirection through the loader-filled cell.
+fun patch_pe_import_addr_fixups(buf: *u8, lay: *PeLayout, dyn: *of.DynamicInfo,
+                                segs: *of.LoadSegment,
+                                seg_count: u32) R.Result[bool, str] {
+    if (dyn == nil || dyn.import_addr_fixup_count == 0) {
+        ret R.ok[bool, str](true);
+    }
+    if (dyn.import_addr_fixups == nil) {
+        ret R.err[bool, str]("coff: nil import-address fixup array");
+    }
+    var i: u32 = 0;
+    for (i < dyn.import_addr_fixup_count) {
+        val fx: *of.ImportAddrFixup = ?dyn.import_addr_fixups[i];
+        if (fx.kind != of.RK_PC32) {
+            ret R.err[bool, str]("coff: unsupported import-address relocation kind");
+        }
+        if (fx.import_index >= dyn.import_count) {
+            ret R.err[bool, str]("coff: import-address fixup targets an out-of-range import");
+        }
+        if (fx.seg_index >= seg_count) {
+            ret R.err[bool, str]("coff: import-address fixup references an out-of-range segment");
+        }
+        if (fx.seg_offset::usize + 4 > segs[fx.seg_index].filesz) {
+            ret R.err[bool, str]("coff: import-address fixup offset out of range");
+        }
+
+        val slot_rva: u64 = pe_import_iat_slot_rva(lay, dyn, fx.import_index);
+        if (slot_rva == 0 || lay.image_base > 0xFFFFFFFFFFFFFFFF - slot_rva) {
+            ret R.err[bool, str]("coff: import-address fixup has no valid IAT slot");
+        }
+        val disp_r: R.Result[i64, str] =
+            pe_rel32_disp(lay.image_base + slot_rva, fx.addend, fx.patch_vaddr);
+        if (R.is_err[i64, str](disp_r)) {
+            ret R.err[bool, str]("coff: import-address displacement overflows 32 bits");
+        }
+
+        val file_off: usize = lay.seg_secs[fx.seg_index].content_file_off
+                              + fx.seg_offset::usize;
+        bin.write_u32_le(buf, file_off,
+                         (R.unwrap_ok[i64, str](disp_r)::u64)::u32);
         i = i + 1;
     }
     ret R.ok[bool, str](true);
@@ -3206,7 +3830,8 @@ fun write_pe_section_header(buf: *u8, pos: usize, name: str, str_pos: *usize, se
 # entry vaddr relative to ImageBase. called last so the section RVAs/offsets the
 # layout fixed are known
 fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count: u32, entry: u64, pie: bool,
-                     itn: *intern.Interner, dyn: *of.DynamicInfo, debug: *of.Section, debug_count: u32) {
+                     itn: *intern.Interner, dyn: *of.DynamicInfo, debug: *of.Section, debug_count: u32,
+                     subsystem: of.Subsystem) R.Result[bool, str] {
     # DOS header: 'MZ', e_lfanew (offset 0x3C) -> the PE signature. the rest of
     # the DOS stub is left zero - Windows reads only the magic and e_lfanew.
     buf[0] = 'M'; buf[1] = 'Z';
@@ -3249,6 +3874,19 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
         if (segs[li].bytes == nil) { udata_size = udata_size + segs[li].memsz::u64; }
         li = li + 1;
     }
+    if (lay.have_idata) { idata_size = idata_size + lay.idata_sec.file_size::u64; }
+    if (lay.have_xdata) { idata_size = idata_size + lay.xdata_sec.file_size::u64; }
+    if (lay.have_pdata) { idata_size = idata_size + lay.pdata_sec.file_size::u64; }
+    if (lay.have_rsrc)  { idata_size = idata_size + lay.rsrc_sec.file_size::u64; }
+    if (lay.have_reloc) { idata_size = idata_size + lay.reloc_sec.file_size::u64; }
+    var dsi: u32 = 0;
+    for (dsi < debug_count) {
+        idata_size = idata_size + lay.debug_secs[dsi].file_size::u64;
+        dsi = dsi + 1;
+    }
+    if (code_size > 0xFFFFFFFF || idata_size > 0xFFFFFFFF || udata_size > 0xFFFFFFFF) {
+        ret R.err[bool, str]("coff: PE aggregate section sizes exceed 32-bit header fields");
+    }
     bin.write_u32_le(buf, oh + 4, code_size::u32);
     bin.write_u32_le(buf, oh + 8, idata_size::u32);
     bin.write_u32_le(buf, oh + 12, udata_size::u32);
@@ -3273,9 +3911,12 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
     bin.write_u32_le(buf, oh + 60, lay.header_size::u32);
     bin.write_u32_le(buf, oh + 64, 0);
 
-    # Subsystem (console), DllCharacteristics (NX-compatible always; DYNAMIC_BASE / ASLR
-    # for a position-independent image).
-    bin.write_u16_le(buf, oh + 68, IMAGE_SUBSYSTEM_WINDOWS_CUI);
+    # Subsystem (GUI suppresses the console the loader would otherwise attach),
+    # DllCharacteristics (NX-compatible always; DYNAMIC_BASE / ASLR for a
+    # position-independent image).
+    var subsys: u16 = IMAGE_SUBSYSTEM_WINDOWS_CUI;
+    if (subsystem == of.SUBSYSTEM_GUI) { subsys = IMAGE_SUBSYSTEM_WINDOWS_GUI; }
+    bin.write_u16_le(buf, oh + 68, subsys);
     var dllchars: u16 = IMAGE_DLLCHARACTERISTICS_NX_COMPAT;
     if (pie) { dllchars = dllchars | IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE; }
     bin.write_u16_le(buf, oh + 70, dllchars);
@@ -3296,6 +3937,11 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
         # IAT directory (index 12) - the loader-writable IAT span.
         bin.write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_IAT::usize * DATA_DIR_SIZE, lay.iat_rva::u32);
         bin.write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_IAT::usize * DATA_DIR_SIZE + 4, lay.iat_size::u32);
+    }
+    # RESOURCE directory (index 2) - the loader-visible .rsrc tree.
+    if (lay.have_rsrc) {
+        bin.write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_RESOURCE::usize * DATA_DIR_SIZE, lay.resource_rva::u32);
+        bin.write_u32_le(buf, dd + IMAGE_DIRECTORY_ENTRY_RESOURCE::usize * DATA_DIR_SIZE + 4, lay.resource_size::u32);
     }
     # EXCEPTION directory (index 3) - the RUNTIME_FUNCTION table in .pdata.
     if (lay.have_pdata) {
@@ -3345,6 +3991,11 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
             IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
         pos = pos + SECTION_HEADER_SIZE;
     }
+    if (lay.have_rsrc) {
+        write_pe_section_header(buf, pos, ".rsrc", ?str_pos, ?lay.rsrc_sec,
+            IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ);
+        pos = pos + SECTION_HEADER_SIZE;
+    }
     if (lay.have_reloc) {
         write_pe_section_header(buf, pos, ".reloc", ?str_pos, ?lay.reloc_sec,
             IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_DISCARDABLE);
@@ -3369,6 +4020,7 @@ fun write_pe_headers(buf: *u8, lay: *PeLayout, segs: *of.LoadSegment, seg_count:
         pos = pos + SECTION_HEADER_SIZE;
         di = di + 1;
     }
+    ret R.ok[bool, str](true);
 }
 
 # whether the linker's base-relocation set touches load segment `ls` - the
@@ -3425,6 +4077,34 @@ fun segment_name(flags: u32, has_data: bool, relro: bool) str {
     ret ".rdata";
 }
 
+# map a linker load segment to the PE section that contains it
+#
+# `compute_pe_layout` starts the first PE section immediately after the one-page
+# header reservation, then represents any stronger linker alignment as prefix
+# padding inside that section. Later PE sections begin at their segment content.
+# This must mirror that layout so IMAGE_REL_AMD64_SECREL measures from the section
+# header's VirtualAddress rather than from the first non-padding byte.
+fun pe_executable_section_location(image_base: u64, content_vaddr: u64,
+                                   segment_index: u32) of.ExecutableSectionLocation {
+    var loc: of.ExecutableSectionLocation;
+    loc.vaddr = content_vaddr;
+    if (segment_index == 0) { loc.vaddr = image_base + PE_SECTION_ALIGN; }
+    loc.ordinal = segment_index + 1;
+    ret loc;
+}
+
+# the first PE section owns the alignment prefix before its linker content; later
+# sections start at their content and every ordinal is one-based
+test "mach.lang.target.of.coff.pe_executable_section_location:alignment_prefix" {
+    val first: of.ExecutableSectionLocation =
+        pe_executable_section_location(0x140000000, 0x140002000, 0);
+    val second: of.ExecutableSectionLocation =
+        pe_executable_section_location(0x140000000, 0x140005000, 1);
+    if (first.vaddr != 0x140001000 || first.ordinal != 1) { ret 1; }
+    if (second.vaddr != 0x140005000 || second.ordinal != 2) { ret 1; }
+    ret 0;
+}
+
 # the COFF OF vtable. populated by register on first call and handed out as a
 # borrowed pointer to the registry
 var coff_vtable: of.OfVTable;
@@ -3467,6 +4147,8 @@ pub fun register_coff(reg: *of.OfRegistry) R.Result[bool, str] {
     # PE/COFF has no DWARF (CodeView lands with #1595); it consumes `.dll` inputs.
     coff_vtable.default_debug    = "";
     coff_vtable.shared_input_ext = ".dll";
+    coff_vtable.import_address_prefix = "__imp_";
+    coff_vtable.executable_section_location = pe_executable_section_location;
 
     # the COFF relocation mapping and writer cover x86-64 only today.
     coff_vtable.covers_isa_any   = false;
@@ -3549,9 +4231,9 @@ test "mach.lang.target.of.coff:emit_parse_round_trip" {
     # placeholder so the byte round-trip below holds.
     var relocs: [2]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = syms[2].name; relocs[0].addend = -4;
+    relocs[0].sym = 2; relocs[0].addend = -4;
     relocs[1].section = 0; relocs[1].offset = 4; relocs[1].kind = of.RK_ABS64;
-    relocs[1].symbol = syms[1].name; relocs[1].addend = 0;
+    relocs[1].sym = 1; relocs[1].addend = 0;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -3645,9 +4327,9 @@ test "mach.lang.target.of.coff:emit_parse_round_trip" {
     for (rj < out.reloc_count) {
         if (out.relocations[rj].section != 0) { ret 1; }
         if (out.relocations[rj].offset == 1 && out.relocations[rj].kind == of.RK_PC32
-            && out.relocations[rj].symbol == syms[2].name) { saw_pc32 = true; }
+            && of.reloc_symbol_name(?out, ?out.relocations[rj]) == syms[2].name) { saw_pc32 = true; }
         if (out.relocations[rj].offset == 4 && out.relocations[rj].kind == of.RK_ABS64
-            && out.relocations[rj].symbol == syms[1].name) { saw_abs64 = true; }
+            && of.reloc_symbol_name(?out, ?out.relocations[rj]) == syms[1].name) { saw_abs64 = true; }
         rj = rj + 1;
     }
     if (!saw_pc32 || !saw_abs64) { ret 1; }
@@ -3659,6 +4341,47 @@ test "mach.lang.target.of.coff:emit_parse_round_trip" {
 # `.rdata` SK_RODATA: emit keeps the input name + read-only characteristics, and
 # parse recovers the RELRO kind from the name rather than collapsing it into RODATA,
 # so the in-memory image and its re-parsed object are link-equivalent (#1865)
+# `.pdata` round-trips as writer-owned exception metadata rather than ordinary
+# read-only data, preserving the distinction the executable writer needs
+test "mach.lang.target.of.coff:exception_section_round_trip" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+
+    var pdata: [12]u8;
+    bin.write_u32_le(?pdata[0], 0, 0x1000);
+    bin.write_u32_le(?pdata[0], 4, 0x1010);
+    bin.write_u32_le(?pdata[0], 8, 0x2000);
+    var sec: of.Section;
+    sec.name = t_intern(?i, ".pdata"); sec.kind = of.SK_EXCEPTION;
+    sec.bytes = ?pdata[0]; sec.len = 12; sec.align = 4;
+
+    var img: of.ObjectImage;
+    img.alloc = ?alloc; img.interner = ?i; img.name = t_intern(?i, "pdata_test");
+    img.sections = ?sec; img.section_count = 1;
+    img.symbols = nil; img.symbol_count = 0;
+    img.relocations = nil; img.reloc_count = 0;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_pdata_rt");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val em: R.Result[bool, str] = coff_emit_object(?isa_vt, ?img, fs.temp_path(?tf)::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] = coff_parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+    if (out.section_count != 1 || out.sections[0].kind != of.SK_EXCEPTION) { ret 1; }
+    if (out.sections[0].len != 12 || out.sections[0].bytes == nil) { ret 1; }
+    if (bin.read_u32_le(out.sections[0].bytes, 0) != 0x1000) { ret 1; }
+    ret 0;
+}
+
 test "mach.lang.target.of.coff:relro_round_trip" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -3687,7 +4410,7 @@ test "mach.lang.target.of.coff:relro_round_trip" {
     # an abs64 relocated pointer in the RELRO section, carrying a non-zero addend.
     var relocs: [1]of.Relocation;
     relocs[0].section = 2; relocs[0].offset = 0; relocs[0].kind = of.RK_ABS64;
-    relocs[0].symbol = syms[0].name; relocs[0].addend = 0x20;
+    relocs[0].sym = 0; relocs[0].addend = 0x20;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -3725,8 +4448,321 @@ test "mach.lang.target.of.coff:relro_round_trip" {
     ret 0;
 }
 
+# all three COFF weak-external modes retain the aux target as an image-local
+# fallback index. Same-object targets stay relations rather than being flattened,
+# so external targets and forward chains have identical semantics.
+test "mach.lang.target.of.coff.preserve_weak_external_fallbacks:modes" {
+    var records: [54]u8;
+    var z: usize = 0;
+    for (z < 54) { records[z] = 0; z = z + 1; }
+
+    write_sym_tail(?records[0], 0, false, IMAGE_SYM_UNDEFINED::i32, 0,
+                   IMAGE_SYM_CLASS_WEAK_EXTERNAL, 1);
+    bin.write_u32_le(?records[0], SYMBOL_SIZE, 2);
+    write_sym_tail(?records[0], SYMBOL_SIZE * 2, false, 1,
+                   IMAGE_SYM_DTYPE_FUNCTION, IMAGE_SYM_CLASS_EXTERNAL, 0);
+
+    var rec_map: [3]i32;
+    rec_map[0] = 0; rec_map[1] = 0; rec_map[2] = 1;
+    var symbols: [2]of.Symbol;
+    symbols[0].name = intern.STR_NIL; symbols[0].section = of.SECTION_EXTERNAL;
+    symbols[0].offset = 0; symbols[0].size = 0;
+    symbols[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK
+        | of.SYM_OBJ_FLAG_EXTERN;
+    symbols[0].fallback = of.SYMBOL_NONE;
+    symbols[1].name = intern.STR_NIL; symbols[1].section = 0;
+    symbols[1].offset = 17; symbols[1].size = 23;
+    symbols[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    symbols[1].fallback = of.SYMBOL_NONE;
+    var img: of.ObjectImage;
+    img.symbols = ?symbols[0]; img.symbol_count = 2;
+
+    var modes: [3]u32;
+    modes[0] = IMAGE_WEAK_EXTERN_SEARCH_NOLIBRARY;
+    modes[1] = IMAGE_WEAK_EXTERN_SEARCH_LIBRARY;
+    modes[2] = IMAGE_WEAK_EXTERN_SEARCH_ALIAS;
+    var mi: u32 = 0;
+    for (mi < 3) {
+        bin.write_u32_le(?records[0], SYMBOL_SIZE + 4, modes[mi]);
+        symbols[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK
+            | of.SYM_OBJ_FLAG_EXTERN;
+        symbols[0].fallback = of.SYMBOL_NONE;
+        val nr: R.Result[bool, str] = preserve_weak_external_fallbacks(
+            ?records[0], 0, 3, false, ?rec_map[0], ?img);
+        if (R.is_err[bool, str](nr) || symbols[0].section != of.SECTION_EXTERNAL
+            || symbols[0].fallback != 1
+            || (symbols[0].flags & of.SYM_OBJ_FLAG_FALLBACK) == 0
+            || (symbols[0].flags & of.SYM_OBJ_FLAG_FUNCTION) == 0) { ret 1; }
+        if (((symbols[0].flags & of.SYM_OBJ_FLAG_SEARCH) != 0) != (mi == 1)) { ret 1; }
+        if (((symbols[0].flags & of.SYM_OBJ_FLAG_ALIAS) != 0) != (mi == 2)) { ret 1; }
+        mi = mi + 1;
+    }
+
+    # A malformed TagIndex is rejected instead of aliasing an arbitrary record.
+    bin.write_u32_le(?records[0], SYMBOL_SIZE, 99);
+    val malformed: R.Result[bool, str] = preserve_weak_external_fallbacks(
+        ?records[0], 0, 3, false, ?rec_map[0], ?img);
+    if (!R.is_err[bool, str](malformed)) { ret 1; }
+    ret 0;
+}
+
+# Forward alias chains remain explicit and therefore need no parser fixed point.
+test "mach.lang.target.of.coff.preserve_weak_external_fallbacks:forward_chain" {
+    var records: [90]u8;
+    var z: usize = 0;
+    for (z < 90) { records[z] = 0; z = z + 1; }
+    write_sym_tail(?records[0], 0, false, 1, IMAGE_SYM_DTYPE_FUNCTION,
+                   IMAGE_SYM_CLASS_EXTERNAL, 0);
+    write_sym_tail(?records[0], SYMBOL_SIZE, false, IMAGE_SYM_UNDEFINED::i32, 0,
+                   IMAGE_SYM_CLASS_WEAK_EXTERNAL, 1);
+    bin.write_u32_le(?records[0], SYMBOL_SIZE * 2, 3);
+    bin.write_u32_le(?records[0], SYMBOL_SIZE * 2 + 4, IMAGE_WEAK_EXTERN_SEARCH_ALIAS);
+    write_sym_tail(?records[0], SYMBOL_SIZE * 3, false, IMAGE_SYM_UNDEFINED::i32, 0,
+                   IMAGE_SYM_CLASS_WEAK_EXTERNAL, 1);
+    bin.write_u32_le(?records[0], SYMBOL_SIZE * 4, 0);
+    bin.write_u32_le(?records[0], SYMBOL_SIZE * 4 + 4, IMAGE_WEAK_EXTERN_SEARCH_ALIAS);
+
+    var rec_map: [5]i32;
+    rec_map[0] = 0; rec_map[1] = 1; rec_map[2] = 1; rec_map[3] = 2; rec_map[4] = 2;
+    var symbols: [3]of.Symbol;
+    var i: u32 = 0;
+    for (i < 3) {
+        symbols[i].name = (i + 1)::intern.StrId;
+        symbols[i].section = of.SECTION_EXTERNAL;
+        symbols[i].offset = 0; symbols[i].size = 0;
+        symbols[i].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK
+            | of.SYM_OBJ_FLAG_EXTERN;
+        symbols[i].fallback = of.SYMBOL_NONE;
+        i = i + 1;
+    }
+    symbols[0].section = 0;
+    symbols[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
+    var img: of.ObjectImage; img.symbols = ?symbols[0]; img.symbol_count = 3;
+    val nr: R.Result[bool, str] = preserve_weak_external_fallbacks(
+        ?records[0], 0, 5, false, ?rec_map[0], ?img);
+    if (R.is_err[bool, str](nr) || symbols[1].fallback != 2
+        || symbols[2].fallback != 0) { ret 1; }
+    ret 0;
+}
+
+# Relocatable COFF output re-emits the weak aux record and remaps TagIndex to
+# the target's raw symbol-table position instead of silently losing the relation.
+test "mach.lang.target.of.coff:weak_fallback_round_trip" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+    var syms: [2]of.Symbol;
+    syms[0].name = t_intern(?i, "public");
+    syms[0].section = of.SECTION_EXTERNAL; syms[0].offset = 0; syms[0].size = 0;
+    syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_WEAK
+        | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_FALLBACK | of.SYM_OBJ_FLAG_SEARCH;
+    syms[0].fallback = 1;
+    syms[1].name = t_intern(?i, "fallback");
+    syms[1].section = of.SECTION_EXTERNAL; syms[1].offset = 0; syms[1].size = 0;
+    syms[1].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_EXTERN;
+    syms[1].fallback = of.SYMBOL_NONE;
+    var img: of.ObjectImage;
+    img.alloc = ?alloc; img.interner = ?i; img.name = t_intern(?i, "weak_rt");
+    img.sections = nil; img.section_count = 0;
+    img.symbols = ?syms[0]; img.symbol_count = 2;
+    img.relocations = nil; img.reloc_count = 0;
+    img.imports = nil; img.import_count = 0;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_weak_rt");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val em: R.Result[bool, str] =
+        coff_emit_object(?isa_vt, ?img, fs.temp_path(?tf)::*u8);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+    var out: of.ObjectImage;
+    val pr: R.Result[bool, str] =
+        coff_parse_object(?alloc, ?i, buf.data, buf.len, ?out);
+    if (R.is_err[bool, str](pr) || out.symbol_count != 2
+        || out.symbols[0].fallback != 1
+        || (out.symbols[0].flags & of.SYM_OBJ_FLAG_FALLBACK) == 0
+        || (out.symbols[0].flags & of.SYM_OBJ_FLAG_SEARCH) == 0
+        || (out.symbols[0].flags & of.SYM_OBJ_FLAG_ALIAS) != 0) { ret 1; }
+    ret 0;
+}
+
 # a REL32 addend translates the COFF next-byte-relative (P+4) convention on both
 # parse and emit (#1409)
+# a short import record parses to a declaration rather than an object, and is told
+# apart from /bigobj by the latter's version and ClassID - the two share the
+# Sig1/Sig2 pair, and before #2525 the record was misclassified as /bigobj and
+# rejected for being smaller than a /bigobj header
+test "mach.lang.target.of.coff.coff_parse_object:short_import_record" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    # header + "Sleep\0kernel32.dll\0"
+    var rec: [39]u8;
+    var z: usize = 0;
+    for (z < 39) { rec[z] = 0; z = z + 1; }
+    rec[2] = 0xFF; rec[3] = 0xFF;          # Sig2
+    rec[6] = 0x64; rec[7] = 0x86;          # Machine = AMD64
+    rec[12] = 19;                          # SizeOfData = 19
+    rec[18] = 0x04;                        # NameType = 1 (by name), Type = 0 (code)
+    val sym: str = "Sleep";
+    val dll: str = "kernel32.dll";
+    var k: usize = 0;
+    for (k < 5)  { rec[20 + k] = sym[k]::u8; k = k + 1; }
+    k = 0;
+    for (k < 12) { rec[26 + k] = dll[k]::u8; k = k + 1; }
+
+    var img: of.ObjectImage;
+    val pr: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?rec[0], 39, ?img);
+    if (R.is_err[bool, str](pr)) { ret 1; }
+
+    # it declares an import and defines nothing
+    if (img.import_count != 1)  { ret 1; }
+    if (img.section_count != 0) { ret 1; }
+    if (img.symbol_count != 0)  { ret 1; }
+    if (img.reloc_count != 0)   { ret 1; }
+
+    val sn: O.Option[str] = intern.lookup(?i, img.imports[0].symbol);
+    val en: O.Option[str] = intern.lookup(?i, img.imports[0].import_name);
+    val ln: O.Option[str] = intern.lookup(?i, img.imports[0].library);
+    if (!O.is_some[str](sn) || !str_equals(O.unwrap[str](sn), "Sleep"))        { ret 1; }
+    if (!O.is_some[str](en) || !str_equals(O.unwrap[str](en), "Sleep"))        { ret 1; }
+    if (!O.is_some[str](ln) || !str_equals(O.unwrap[str](ln), "kernel32.dll")) { ret 1; }
+    if (!img.imports[0].by_name) { ret 1; }
+    if (!img.imports[0].is_code) { ret 1; }
+
+    # Version alone cannot make this a /bigobj header. Without the fixed ClassID it
+    # remains an import record, so a future header version with the same payload
+    # shape is not misclassified.
+    rec[4] = BIGOBJ_MIN_VERSION::u8;
+    var img2: of.ObjectImage;
+    val br: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?rec[0], 39, ?img2);
+    if (R.is_err[bool, str](br)) { ret 1; }
+    if (img2.import_count != 1) { ret 1; }
+    ret 0;
+}
+
+# short-import NameType values preserve the public/link symbol while deriving the
+# possibly different export name the PE loader must resolve
+test "mach.lang.target.of.coff.coff_parse_object:short_import_name_types" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    # NAME_NOPREFIX: "_Sleep" is referenced publicly but binds export "Sleep".
+    var np: [40]u8;
+    var z: usize = 0;
+    for (z < 40) { np[z] = 0; z = z + 1; }
+    np[2] = 0xFF; np[3] = 0xFF; np[6] = 0x64; np[7] = 0x86;
+    np[12] = 20; np[18] = (IMPORT_OBJECT_NAME_NOPREFIX << 2)::u8;
+    val np_sym: str = "_Sleep";
+    val dll: str = "kernel32.dll";
+    var k: usize = 0;
+    for (k < 6)  { np[20 + k] = np_sym[k]::u8; k = k + 1; }
+    k = 0;
+    for (k < 12) { np[27 + k] = dll[k]::u8; k = k + 1; }
+    var np_img: of.ObjectImage;
+    val np_r: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?np[0], 40, ?np_img);
+    if (R.is_err[bool, str](np_r)) { ret 1; }
+    val np_public: O.Option[str] = intern.lookup(?i, np_img.imports[0].symbol);
+    val np_export: O.Option[str] = intern.lookup(?i, np_img.imports[0].import_name);
+    if (!O.is_some[str](np_public) || !str_equals(O.unwrap[str](np_public), "_Sleep")) { ret 1; }
+    if (!O.is_some[str](np_export) || !str_equals(O.unwrap[str](np_export), "Sleep"))  { ret 1; }
+
+    # NAME_UNDECORATE additionally truncates the stdcall suffix at the first '@'.
+    var ud: [42]u8;
+    z = 0;
+    for (z < 42) { ud[z] = 0; z = z + 1; }
+    ud[2] = 0xFF; ud[3] = 0xFF; ud[6] = 0x64; ud[7] = 0x86;
+    ud[12] = 22; ud[18] = (IMPORT_OBJECT_NAME_UNDECORATE << 2)::u8;
+    val ud_sym: str = "_Sleep@4";
+    k = 0;
+    for (k < 8)  { ud[20 + k] = ud_sym[k]::u8; k = k + 1; }
+    k = 0;
+    for (k < 12) { ud[29 + k] = dll[k]::u8; k = k + 1; }
+    var ud_img: of.ObjectImage;
+    val ud_r: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?ud[0], 42, ?ud_img);
+    if (R.is_err[bool, str](ud_r)) { ret 1; }
+    val ud_public: O.Option[str] = intern.lookup(?i, ud_img.imports[0].symbol);
+    val ud_export: O.Option[str] = intern.lookup(?i, ud_img.imports[0].import_name);
+    if (!O.is_some[str](ud_public) || !str_equals(O.unwrap[str](ud_public), "_Sleep@4")) { ret 1; }
+    if (!O.is_some[str](ud_export) || !str_equals(O.unwrap[str](ud_export), "Sleep"))    { ret 1; }
+
+    # NAME_EXPORTAS carries an explicit third string, as emitted by llvm-dlltool
+    # for an x86-64 `PublicName == ExportName` definition.
+    var ea: [51]u8;
+    z = 0;
+    for (z < 51) { ea[z] = 0; z = z + 1; }
+    ea[2] = 0xFF; ea[3] = 0xFF; ea[6] = 0x64; ea[7] = 0x86;
+    ea[12] = 31; ea[18] = (IMPORT_OBJECT_NAME_EXPORTAS << 2)::u8;
+    val ea_sym: str = "PublicName";
+    val ea_dll: str = "demo.dll";
+    val ea_export_name: str = "ExportName";
+    k = 0;
+    for (k < 10) { ea[20 + k] = ea_sym[k]::u8; k = k + 1; }
+    k = 0;
+    for (k < 8)  { ea[31 + k] = ea_dll[k]::u8; k = k + 1; }
+    k = 0;
+    for (k < 10) { ea[40 + k] = ea_export_name[k]::u8; k = k + 1; }
+    var ea_img: of.ObjectImage;
+    val ea_r: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?ea[0], 51, ?ea_img);
+    if (R.is_err[bool, str](ea_r)) { ret 1; }
+    val ea_public: O.Option[str] = intern.lookup(?i, ea_img.imports[0].symbol);
+    val ea_export: O.Option[str] = intern.lookup(?i, ea_img.imports[0].import_name);
+    if (!O.is_some[str](ea_public) || !str_equals(O.unwrap[str](ea_public), "PublicName")) { ret 1; }
+    if (!O.is_some[str](ea_export) || !str_equals(O.unwrap[str](ea_export), "ExportName")) { ret 1; }
+    ret 0;
+}
+
+# a truncated or unterminated record is rejected rather than read past its payload
+test "mach.lang.target.of.coff.coff_parse_object:malformed_import_record" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    # SizeOfData claims more bytes than the buffer holds
+    var over: [24]u8;
+    var z: usize = 0;
+    for (z < 24) { over[z] = 0; z = z + 1; }
+    over[2] = 0xFF; over[3] = 0xFF;
+    over[6] = 0x64; over[7] = 0x86;
+    over[12] = 64;
+    var img1: of.ObjectImage;
+    val r1: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?over[0], 24, ?img1);
+    if (R.is_ok[bool, str](r1)) { ret 1; }
+
+    # the payload never terminates the symbol name, so no library name follows
+    var unterm: [24]u8;
+    z = 0;
+    for (z < 24) { unterm[z] = 0x41; z = z + 1; }
+    unterm[0] = 0; unterm[1] = 0;
+    unterm[2] = 0xFF; unterm[3] = 0xFF;
+    unterm[4] = 0; unterm[5] = 0;
+    unterm[6] = 0x64; unterm[7] = 0x86;
+    unterm[8] = 0; unterm[9] = 0; unterm[10] = 0; unterm[11] = 0;
+    unterm[12] = 4; unterm[13] = 0; unterm[14] = 0; unterm[15] = 0;
+    unterm[16] = 0; unterm[17] = 0; unterm[18] = 4; unterm[19] = 0;
+    var img2: of.ObjectImage;
+    val r2: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?unterm[0], 24, ?img2);
+    if (R.is_ok[bool, str](r2)) { ret 1; }
+
+    # the three reserved NameType values and the high reserved bits are rejected
+    # instead of silently changing the loader binding.
+    unterm[18] = (5 << 2)::u8;
+    var img3: of.ObjectImage;
+    val r3: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?unterm[0], 24, ?img3);
+    if (R.is_ok[bool, str](r3)) { ret 1; }
+    unterm[18] = 0x20;
+    var img4: of.ObjectImage;
+    val r4: R.Result[bool, str] = coff_parse_object(?alloc, ?i, ?unterm[0], 24, ?img4);
+    if (R.is_ok[bool, str](r4)) { ret 1; }
+    ret 0;
+}
+
 test "mach.lang.target.of.coff.read_inplace_addend:rel32_p4_convention" {
     var alloc: A.Allocator;
     page.make(?alloc);
@@ -3786,7 +4822,7 @@ test "mach.lang.target.of.coff.read_inplace_addend:rel32_p4_convention" {
 
     var relocs: [1]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = syms[1].name; relocs[0].addend = 0;
+    relocs[0].sym = 1; relocs[0].addend = 0;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -3859,13 +4895,12 @@ test "mach.lang.target.of.coff.coff_emit_object:unresolved_reloc_symbol" {
     syms[0].name = t_intern(?i, "main"); syms[0].section = 0; syms[0].offset = 0;
     syms[0].size = 16; syms[0].flags = of.SYM_OBJ_FLAG_GLOBAL | of.SYM_OBJ_FLAG_FUNCTION;
 
-    # the relocation targets a symbol interned but absent from the image symbol
-    # table - the back-end-invariant violation #1196 must surface as an error,
-    # not silently alias the first section symbol.
-    val ghost: intern.StrId = t_intern(?i, "ghost_symbol");
+    # the relocation indexes past the image symbol table - the producer-invariant
+    # violation #1196 must surface as an error, not silently alias
+    # the first section symbol.
     var relocs: [1]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = ghost; relocs[0].addend = 0;
+    relocs[0].sym = 1; relocs[0].addend = 0;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -3884,7 +4919,7 @@ test "mach.lang.target.of.coff.coff_emit_object:unresolved_reloc_symbol" {
     fs.temp_close_and_remove(?tf);
 
     if (!R.is_err[bool, str](em))                                   { ret 1; }
-    if (!str_contains(R.unwrap_err[bool, str](em), "ghost_symbol")) { ret 1; }
+    if (!str_contains(R.unwrap_err[bool, str](em), "unresolved symbol")) { ret 1; }
     ret 0;
 }
 
@@ -3930,7 +4965,7 @@ test "mach.lang.target.of.coff:defined_weak_comdat_round_trip" {
     # weak body bytes are unchanged and the carve's byte round-trip holds.
     var relocs: [1]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 12; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = syms[2].name; relocs[0].addend = -4;
+    relocs[0].sym = 2; relocs[0].addend = -4;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -4009,7 +5044,7 @@ test "mach.lang.target.of.coff:defined_weak_comdat_round_trip" {
     var saw_reloc: bool = false;
     var rj: u32 = 0;
     for (rj < out.reloc_count) {
-        if (out.relocations[rj].symbol == syms[2].name && out.relocations[rj].offset == 4) {
+        if (of.reloc_symbol_name(?out, ?out.relocations[rj]) == syms[2].name && out.relocations[rj].offset == 4) {
             # its section must be the COMDAT carrier, i.e. the weak symbol's section.
             var wsec: u32 = of.SECTION_EXTERNAL;
             var sj: u32 = 0;
@@ -4410,7 +5445,10 @@ test "mach.lang.target.of.coff.coff_emit_exec:pe32plus_header" {
     if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
 
-    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 2, 4096, entry, nil, 0, nil::*of.Section, 0, fs.temp_path(?tf)::*u8, "coffexe"::*u8);
+    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 2,
+                                                 4096, base - PE_SECTION_ALIGN, entry,
+                                                 nil, 0, nil::*of.Section, 0, nil::*of.Section, 0,
+                                                 fs.temp_path(?tf)::*u8, "coffexe"::*u8, of.image_options_default(of.SUBSYSTEM_CONSOLE));
     if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
 
     val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
@@ -4454,6 +5492,79 @@ test "mach.lang.target.of.coff.coff_emit_exec:pe32plus_header" {
     ret 0;
 }
 
+# the #2508 subsystem knob: a GUI selection stamps IMAGE_SUBSYSTEM_WINDOWS_GUI and
+# changes NOTHING else. emitting the same segments twice - once console, once GUI -
+# must produce images of equal length differing at exactly the two Subsystem bytes,
+# which proves both halves of the contract at once: the selection reaches the
+# optional header, and the console default is the image mach has always written
+test "mach.lang.target.of.coff.coff_emit_exec:subsystem_selection" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+
+    var text_bytes: [16]u8;
+    var k: usize = 0;
+    for (k < 16) { text_bytes[k] = 0x90; k = k + 1; }
+
+    val base:  u64 = 0x140001000;
+    val entry: u64 = base + 4;
+
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = base; segs[0].filesz = 16; segs[0].memsz = 16;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text_bytes[0];
+
+    val cui: R.Result[Vector[u8], str] = emit_subsystem_image(?alloc, ?i, ?isa_vt, ?segs[0], entry, of.SUBSYSTEM_CONSOLE);
+    if (R.is_err[Vector[u8], str](cui)) { ret 1; }
+    val con: Vector[u8] = R.unwrap_ok[Vector[u8], str](cui);
+
+    val gr: R.Result[Vector[u8], str] = emit_subsystem_image(?alloc, ?i, ?isa_vt, ?segs[0], entry, of.SUBSYSTEM_GUI);
+    if (R.is_err[Vector[u8], str](gr)) { ret 1; }
+    val gui: Vector[u8] = R.unwrap_ok[Vector[u8], str](gr);
+
+    if (con.len != gui.len) { ret 1; }
+
+    val pe_off: usize = bin.read_u32_le(con.data, 0x3C)::usize;
+    val oh:     usize = pe_off + PE_SIGNATURE_SIZE + COFF_HEADER_SIZE;
+    if (bin.read_u16_le(con.data, oh + 68) != IMAGE_SUBSYSTEM_WINDOWS_CUI) { ret 1; }
+    if (bin.read_u16_le(gui.data, oh + 68) != IMAGE_SUBSYSTEM_WINDOWS_GUI) { ret 1; }
+
+    # every byte outside the Subsystem field is identical.
+    var b: usize = 0;
+    for (b < con.len) {
+        if (b != oh + 68 && b != oh + 69) {
+            if (con.data[b] != gui.data[b]) { ret 1; }
+        }
+        b = b + 1;
+    }
+    ret 0;
+}
+
+# emit a one-segment static PE under `subsystem` and read it back, so the
+# subsystem test can compare two whole images byte for byte
+fun emit_subsystem_image(alloc: *A.Allocator, itn: *intern.Interner, isa_vt: *isa.IsaVTable,
+                         segs: *of.LoadSegment, entry: u64, subsystem: of.Subsystem) R.Result[Vector[u8], str] {
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "coff_subsys");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret R.err[Vector[u8], str]("temp create failed"); }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+
+    val em: R.Result[bool, str] = coff_emit_exec(alloc, itn, isa_vt, segs, 1,
+                                                 4096, segs[0].vaddr - PE_SECTION_ALIGN,
+                                                 entry, nil, 0,
+                                                 nil::*of.Section, 0, nil::*of.Section, 0,
+                                                 fs.temp_path(?tf)::*u8, "coffsubsys"::*u8,
+                                                 of.image_options_default(subsystem));
+    if (R.is_err[bool, str](em)) {
+        fs.temp_close_and_remove(?tf);
+        ret R.err[Vector[u8], str](R.unwrap_err[bool, str](em));
+    }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    ret rb;
+}
+
 # the real #1211 path: mach's codegen stamps DT_FUNCTION on a call-target import,
 # and emit/parse must preserve it without any inference. this guards the actual
 # mechanism the inference is wrongly credited with - the import keeps its function
@@ -4494,7 +5605,7 @@ test "mach.lang.target.of.coff:call_target_import_function_flag" {
 
     var relocs: [1]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = syms[1].name; relocs[0].addend = -4;
+    relocs[0].sym = 1; relocs[0].addend = -4;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -4572,7 +5683,7 @@ test "mach.lang.target.of.coff.infer_extern_function_flags_from_calls:foreign_ca
 
     var relocs: [1]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 1; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = syms[1].name; relocs[0].addend = -4;
+    relocs[0].sym = 1; relocs[0].addend = -4;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -4651,7 +5762,11 @@ test "mach.lang.target.of.coff.coff_emit_exec:unwind_xdata_pdata" {
     if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
 
-    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1, 4096, entry, ?funcs[0], 1, nil::*of.Section, 0, fs.temp_path(?tf)::*u8, "coffunwind"::*u8);
+    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1,
+                                                 4096, base - PE_SECTION_ALIGN, entry,
+                                                 ?funcs[0], 1, nil::*of.Section, 0,
+                                                 nil::*of.Section, 0, fs.temp_path(?tf)::*u8,
+                                                 "coffunwind"::*u8, of.image_options_default(of.SUBSYSTEM_CONSOLE));
     if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
 
     val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
@@ -4716,6 +5831,137 @@ test "mach.lang.target.of.coff.coff_emit_exec:unwind_xdata_pdata" {
     if (buf.data[uw_ptr + 10] != 0x01) { ret 1; }            # PUSH_NONVOL end_off = 1
     if (buf.data[uw_ptr + 11] != 0x50) { ret 1; }            # op 0 (PUSH_NONVOL), info 5 (rbp)
 
+    ret 0;
+}
+
+# foreign `.pdata` owns its runtime-function row when the same function also
+# matches mach's prologue recognizer. the writer publishes exactly one copied row
+# and keeps the foreign `.xdata` in its ordinary read-only segment instead of
+# synthesizing a duplicate unwind record
+test "mach.lang.target.of.coff.coff_emit_exec:foreign_pdata_authoritative" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+
+    # push rbp; mov rbp,rsp; sub rsp,0x20; mov [rbp-8],rbx; nop; ret
+    var text_bytes: [14]u8;
+    text_bytes[0] = 0x55;
+    text_bytes[1] = 0x48; text_bytes[2] = 0x89; text_bytes[3] = 0xE5;
+    text_bytes[4] = 0x48; text_bytes[5] = 0x83; text_bytes[6] = 0xEC; text_bytes[7] = 0x20;
+    text_bytes[8] = 0x48; text_bytes[9] = 0x89; text_bytes[10] = 0x5D; text_bytes[11] = 0xF8;
+    text_bytes[12] = 0x90; text_bytes[13] = 0xC3;
+
+    # a real x64 UNWIND_INFO shape, carried by the foreign read-only segment
+    var xdata_bytes: [8]u8;
+    xdata_bytes[0] = 0x01; xdata_bytes[1] = 0x04; xdata_bytes[2] = 0x01; xdata_bytes[3] = 0;
+    xdata_bytes[4] = 0x04; xdata_bytes[5] = 0x42; xdata_bytes[6] = 0; xdata_bytes[7] = 0;
+
+    val image_base: u64 = 0x140000000;
+    var segs: [2]of.LoadSegment;
+    # a valid 8 KiB-aligned input text section lands at RVA 0x2000. the PE section
+    # itself must still start immediately after the headers at RVA 0x1000 (#1374),
+    # with prefix padding up to the exact content RVA used by ADDR32NB relocations
+    segs[0].vaddr = image_base + 0x2000; segs[0].filesz = 14; segs[0].memsz = 14;
+    segs[0].flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; segs[0].bytes = ?text_bytes[0];
+    segs[1].vaddr = image_base + 0x3000; segs[1].filesz = 8; segs[1].memsz = 8;
+    segs[1].flags = of.SEG_FLAG_READ; segs[1].bytes = ?xdata_bytes[0];
+
+    var funcs: [1]of.ExecFunction;
+    funcs[0].seg_index = 0; funcs[0].seg_offset = 0; funcs[0].size = 14;
+
+    var pdata_bytes: [12]u8;
+    bin.write_u32_le(?pdata_bytes[0], 0, 0x2000);
+    bin.write_u32_le(?pdata_bytes[0], 4, 0x200E);
+    bin.write_u32_le(?pdata_bytes[0], 8, 0x3000);
+    var exceptions: [1]of.Section;
+    exceptions[0].name = t_intern(?i, ".pdata");
+    exceptions[0].kind = of.SK_EXCEPTION;
+    exceptions[0].bytes = ?pdata_bytes[0]; exceptions[0].len = 12; exceptions[0].align = 4;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_foreign_unw");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 2, 4096,
+                                                 image_base, segs[0].vaddr, ?funcs[0], 1,
+                                                 ?exceptions[0], 1, nil::*of.Section, 0,
+                                                 fs.temp_path(?tf)::*u8, "coffforeignunwind"::*u8,
+                                                 of.image_options_default(of.SUBSYSTEM_CONSOLE));
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val buf: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    val pe_off: usize = bin.read_u32_le(buf.data, 0x3C)::usize;
+    val ch: usize = pe_off + PE_SIGNATURE_SIZE;
+    # text + foreign xdata carrier + the one synthesized/published .pdata table.
+    if (bin.read_u16_le(buf.data, ch + 2) != 3) { ret 1; }
+    val oh: usize = ch + COFF_HEADER_SIZE;
+    if (bin.read_u64_le(buf.data, oh + 24) != image_base) { ret 1; }
+    val text_sh: usize = oh + OPTIONAL_HEADER_SIZE;
+    if (bin.read_u32_le(buf.data, text_sh + 12) != 0x1000) { ret 1; }
+    if (bin.read_u32_le(buf.data, text_sh + 8) != 0x100E) { ret 1; }
+    val text_ptr: usize = bin.read_u32_le(buf.data, text_sh + 20)::usize;
+    if (buf.data[text_ptr + 0x1000] != text_bytes[0]
+        || buf.data[text_ptr + 0x100D] != text_bytes[13]) { ret 1; }
+    val dd: usize = oh + 112;
+    val exc_rva: u32 = bin.read_u32_le(buf.data, dd + IMAGE_DIRECTORY_ENTRY_EXCEPTION::usize * DATA_DIR_SIZE);
+    val exc_size: u32 = bin.read_u32_le(buf.data, dd + IMAGE_DIRECTORY_ENTRY_EXCEPTION::usize * DATA_DIR_SIZE + 4);
+    if (exc_size != RUNTIME_FUNCTION_SIZE::u32) { ret 1; }
+
+    var pdata_ptr: u32 = 0;
+    var pdata_rva: u32 = 0;
+    var saw_xdata: bool = false;
+    var si: u32 = 0;
+    var sh: usize = oh + OPTIONAL_HEADER_SIZE;
+    for (si < 3) {
+        if (buf.data[sh] == '.' && buf.data[sh + 1] == 'p'
+            && buf.data[sh + 2] == 'd' && buf.data[sh + 3] == 'a'
+            && buf.data[sh + 4] == 't' && buf.data[sh + 5] == 'a') {
+            pdata_rva = bin.read_u32_le(buf.data, sh + 12);
+            pdata_ptr = bin.read_u32_le(buf.data, sh + 20);
+        }
+        if (buf.data[sh] == '.' && buf.data[sh + 1] == 'x'
+            && buf.data[sh + 2] == 'd' && buf.data[sh + 3] == 'a'
+            && buf.data[sh + 4] == 't' && buf.data[sh + 5] == 'a') { saw_xdata = true; }
+        sh = sh + SECTION_HEADER_SIZE;
+        si = si + 1;
+    }
+    if (pdata_ptr == 0 || pdata_rva != exc_rva || saw_xdata) { ret 1; }
+    if (bin.read_u32_le(buf.data, pdata_ptr::usize) != 0x2000)     { ret 1; }
+    if (bin.read_u32_le(buf.data, pdata_ptr::usize + 4) != 0x200E) { ret 1; }
+    if (bin.read_u32_le(buf.data, pdata_ptr::usize + 8) != 0x3000) { ret 1; }
+    ret 0;
+}
+
+# malformed foreign exception metadata is rejected before PE framing
+test "mach.lang.target.of.coff.coff_emit_exec:rejects_malformed_foreign_pdata" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var i: intern.Interner = intern.init(?alloc);
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+    var text: [1]u8; text[0] = 0xC3;
+    var seg: of.LoadSegment;
+    seg.vaddr = 0x140001000; seg.filesz = 1; seg.memsz = 1;
+    seg.flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; seg.bytes = ?text[0];
+    var bad_bytes: [11]u8;
+    var exception: of.Section;
+    exception.name = t_intern(?i, ".pdata"); exception.kind = of.SK_EXCEPTION;
+    exception.bytes = ?bad_bytes[0]; exception.len = 11; exception.align = 4;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_bad_foreign_unw");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?seg, 1, 4096,
+                                                 0x140000000, seg.vaddr, nil::*of.ExecFunction, 0,
+                                                 ?exception, 1, nil::*of.Section, 0,
+                                                 fs.temp_path(?tf)::*u8, "coffbadforeignunwind"::*u8,
+                                                 of.image_options_default(of.SUBSYSTEM_CONSOLE));
+    fs.temp_close_and_remove(?tf);
+    if (!R.is_err[bool, str](em)) { ret 1; }
+    if (!str_contains(R.unwrap_err[bool, str](em), "malformed exception metadata")) { ret 1; }
     ret 0;
 }
 
@@ -4929,7 +6175,7 @@ test "mach.lang.target.of.coff.coff_emit_object:unsupported_reloc_kind" {
     # over the 4-byte field); it must now fail naming the kind.
     var relocs: [1]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_GOTPCREL;
-    relocs[0].symbol = syms[0].name; relocs[0].addend = 0;
+    relocs[0].sym = 0; relocs[0].addend = 0;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -5011,7 +6257,7 @@ test "mach.lang.target.of.coff.coff_parse_object:rejects_unmapped_type" {
 
     var relocs: [1]of.Relocation;
     relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_PC32;
-    relocs[0].symbol = syms[0].name; relocs[0].addend = 0;
+    relocs[0].sym = 0; relocs[0].addend = 0;
 
     var img: of.ObjectImage;
     img.alloc = ?alloc;
@@ -5087,7 +6333,7 @@ test "mach.lang.target.of.coff.coff_emit_object:reloc_count_overflow" {
     var r: u32 = 0;
     for (r < nrel) {
         relocs[r].section = 0; relocs[r].offset = 0; relocs[r].kind = of.RK_PC32;
-        relocs[r].symbol = syms[0].name; relocs[r].addend = 0;
+        relocs[r].sym = 0; relocs[r].addend = 0;
         r = r + 1;
     }
 
@@ -5189,6 +6435,8 @@ fun t_iat_slots_exact(i: *intern.Interner, counts: *u32, nlib: u32) bool {
             imports[total].symbol = t_intern(i, "fn");
             imports[total].lib_index = l;
             imports[total].is_func = true;
+            imports[total].ordinal = 0;
+            imports[total].by_ordinal = false;
             total = total + 1;
             j = j + 1;
         }
@@ -5250,6 +6498,79 @@ test "mach.lang.target.of.coff.pe_iat_slot_rva:per_descriptor_range" {
     ret 0;
 }
 
+# data and function imports share the same dependency-major IAT, while the
+# function ordinal used for stubs skips data without collapsing its slot
+test "mach.lang.target.of.coff.pe_import_iat_slot_rva:mixed_imports" {
+    var libs: [2]of.DynLib;
+    var imports: [3]of.DynImport;
+    imports[0].lib_index = 1; imports[0].is_func = false;
+    imports[1].lib_index = 0; imports[1].is_func = true;
+    imports[2].lib_index = 1; imports[2].is_func = true;
+    var dyn: of.DynamicInfo;
+    dyn.libs = ?libs[0]; dyn.lib_count = 2;
+    dyn.imports = ?imports[0]; dyn.import_count = 3;
+    var lay: PeLayout;
+    lay.nimp = 2;
+    lay.idata_sec.rva = 0x10000;
+
+    val base: u64 = pe_import_iat_slot_rva(?lay, ?dyn, 1);
+    if (base == 0
+        || pe_iat_slot_rva(?lay, ?dyn, 0) != base
+        || pe_import_iat_slot_rva(?lay, ?dyn, 0)
+            != base + 2 * THUNK_SIZE::u64
+        || pe_import_iat_slot_rva(?lay, ?dyn, 2)
+            != base + 3 * THUNK_SIZE::u64
+        || pe_iat_slot_rva(?lay, ?dyn, 1)
+            != base + 3 * THUNK_SIZE::u64) { ret 1; }
+    ret 0;
+}
+
+# PE import-address patching applies the COFF -4 addend to the raw import's IAT
+# slot and rejects malformed bounds, kinds, and signed-rel32 overflow
+test "mach.lang.target.of.coff.patch_pe_import_addr_fixups:checked_rel32" {
+    var bytes: [32]u8;
+    var segs: [1]of.LoadSegment;
+    segs[0].vaddr = 0x140001000; segs[0].filesz = 8; segs[0].memsz = 8;
+    var seg_secs: [1]PeSection;
+    seg_secs[0].content_file_off = 8;
+    var libs: [1]of.DynLib;
+    var imports: [1]of.DynImport;
+    imports[0].lib_index = 0; imports[0].is_func = false;
+    var fx: [1]of.ImportAddrFixup;
+    fx[0].seg_index = 0; fx[0].seg_offset = 0; fx[0].import_index = 0;
+    fx[0].patch_vaddr = segs[0].vaddr; fx[0].kind = of.RK_PC32;
+    fx[0].addend = -4;
+    var dyn: of.DynamicInfo;
+    dyn.libs = ?libs[0]; dyn.lib_count = 1;
+    dyn.imports = ?imports[0]; dyn.import_count = 1;
+    dyn.import_addr_fixups = ?fx[0]; dyn.import_addr_fixup_count = 1;
+    var lay: PeLayout;
+    lay.image_base = 0x140000000;
+    lay.idata_sec.rva = 0x5000;
+    lay.seg_secs = ?seg_secs[0];
+
+    val slot_va: u64 = lay.image_base
+        + pe_import_iat_slot_rva(?lay, ?dyn, 0);
+    val patched: R.Result[bool, str] = patch_pe_import_addr_fixups(
+        ?bytes[0], ?lay, ?dyn, ?segs[0], 1);
+    val want: i64 = slot_va::i64 - 4 - fx[0].patch_vaddr::i64;
+    if (R.is_err[bool, str](patched)
+        || bin.read_u32_le(?bytes[0], 8) != (want::u64)::u32) { ret 1; }
+
+    fx[0].seg_offset = 5;
+    if (!R.is_err[bool, str](patch_pe_import_addr_fixups(
+        ?bytes[0], ?lay, ?dyn, ?segs[0], 1))) { ret 1; }
+    fx[0].seg_offset = 0;
+    fx[0].kind = of.RK_ABS64;
+    if (!R.is_err[bool, str](patch_pe_import_addr_fixups(
+        ?bytes[0], ?lay, ?dyn, ?segs[0], 1))) { ret 1; }
+    fx[0].kind = of.RK_PC32;
+    fx[0].patch_vaddr = 0;
+    if (!R.is_err[bool, str](patch_pe_import_addr_fixups(
+        ?bytes[0], ?lay, ?dyn, ?segs[0], 1))) { ret 1; }
+    ret 0;
+}
+
 # coff_emit_exec frames the linker's non-allocated debug sections as read-only
 # discardable PE sections above the loaded sections: a name that fits the 8-byte
 # field is written inline (`.debug$S`, the CodeView convention), and a longer name
@@ -5293,8 +6614,10 @@ fun ts_pe_debug_sections() u8 {
     if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
 
-    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1, 4096, entry,
-                                                 nil, 0, ?dbg[0], 2, fs.temp_path(?tf)::*u8, "coffdbg"::*u8);
+    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?i, ?isa_vt, ?segs[0], 1,
+                                                 4096, base - PE_SECTION_ALIGN, entry,
+                                                 nil, 0, nil::*of.Section, 0, ?dbg[0], 2,
+                                                 fs.temp_path(?tf)::*u8, "coffdbg"::*u8, of.image_options_default(of.SUBSYSTEM_CONSOLE));
     if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
 
     val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
@@ -5419,10 +6742,12 @@ fun ts_dyn_exec_relro_naming() u8 {
     if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
     var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
 
-    val em: R.Result[bool, str] = coff_emit_dyn_exec(?alloc, ?i, ?isa_vt, ?segs[0], 5, 4096, base,
+    val em: R.Result[bool, str] = coff_emit_dyn_exec(?alloc, ?i, ?isa_vt, ?segs[0], 5,
+                                                      4096, base - PE_SECTION_ALIGN, base,
                                                       nil::*of.ExecFunction, 0, ?dyn,
                                                       nil::*of.PltFixup, 0, nil::*of.Section, 0,
-                                                      fs.temp_path(?tf)::*u8, "coffrelro"::*u8);
+                                                      nil::*of.Section, 0,
+                                                      fs.temp_path(?tf)::*u8, "coffrelro"::*u8, of.image_options_default(of.SUBSYSTEM_CONSOLE));
     if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
 
     val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
@@ -5527,6 +6852,94 @@ fun ts_write_section_name_field() u8 {
 # a name that exactly fills the field stays inline
 test "mach.lang.target.of.coff.write_section_name_field:long_name_no_overflow" {
     if (ts_write_section_name_field() != 0) { ret 1; }
+    ret 0;
+}
+
+# PE resource options add one read-only initialized `.rsrc` section, publish its
+# data directory, and carry the manifest leaf byte-for-byte. The initialized-data
+# aggregate includes the synthesized section's aligned raw size.
+test "mach.lang.target.of.coff.coff_emit_exec:resource_directory_and_accounting" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    var itn: intern.Interner = intern.init(?alloc);
+    var isa_vt: isa.IsaVTable = t_isa(isa.ARCH_X86_64);
+
+    var text: [16]u8;
+    var i: usize = 0;
+    for (i < 16) { text[i] = 0x90; i = i + 1; }
+    val base: u64 = 0x140001000;
+    var seg: of.LoadSegment;
+    seg.vaddr = base; seg.filesz = 16; seg.memsz = 16;
+    seg.flags = of.SEG_FLAG_READ | of.SEG_FLAG_EXECUTE; seg.bytes = ?text[0];
+
+    val manifest: str = "<assembly resource-test='yes'/>";
+    var info: of.ResourceInfo;
+    info.icon = nil; info.icon_len = 0;
+    info.app_manifest = manifest::*u8; info.app_manifest_len = str_len(manifest);
+    info.version = "7.8.9"; info.internal_name = "resource-test";
+    info.original_filename = "renamed-resource-test.exe";
+    info.product_name = "resource-test";
+    var opts: of.ImageOptions = of.image_options_default(of.SUBSYSTEM_CONSOLE);
+    opts.resources = ?info;
+
+    val tf_r: R.Result[fs.TempFile, str] = fs.temp_create(?alloc, "coff_resource");
+    if (R.is_err[fs.TempFile, str](tf_r)) { ret 1; }
+    var tf: fs.TempFile = R.unwrap_ok[fs.TempFile, str](tf_r);
+    val em: R.Result[bool, str] = coff_emit_exec(?alloc, ?itn, ?isa_vt, ?seg, 1,
+        4096, base - PE_SECTION_ALIGN, base, nil, 0, nil::*of.Section, 0,
+        nil::*of.Section, 0, fs.temp_path(?tf)::*u8, "resource-test"::*u8, opts);
+    if (R.is_err[bool, str](em)) { fs.temp_close_and_remove(?tf); ret 1; }
+    val rb: R.Result[Vector[u8], str] = fs.read_bytes(?alloc, fs.temp_path(?tf));
+    fs.temp_close_and_remove(?tf);
+    if (R.is_err[Vector[u8], str](rb)) { ret 1; }
+    val file: Vector[u8] = R.unwrap_ok[Vector[u8], str](rb);
+
+    val pe: usize = bin.read_u32_le(file.data, 0x3C)::usize;
+    val ch: usize = pe + PE_SIGNATURE_SIZE;
+    val oh: usize = ch + COFF_HEADER_SIZE;
+    if (bin.read_u16_le(file.data, ch + 2) != 2) { ret 1; }
+    val rsh: usize = oh + OPTIONAL_HEADER_SIZE + SECTION_HEADER_SIZE;
+    if (file.data[rsh] != '.' || file.data[rsh + 1] != 'r'
+        || file.data[rsh + 2] != 's' || file.data[rsh + 3] != 'r'
+        || file.data[rsh + 4] != 'c') { ret 1; }
+    val rsrc_vsize: u32 = bin.read_u32_le(file.data, rsh + 8);
+    val rsrc_rva: u32 = bin.read_u32_le(file.data, rsh + 12);
+    val rsrc_raw_size: u32 = bin.read_u32_le(file.data, rsh + 16);
+    val rsrc_raw: usize = bin.read_u32_le(file.data, rsh + 20)::usize;
+    val dd: usize = oh + 112 + IMAGE_DIRECTORY_ENTRY_RESOURCE::usize * DATA_DIR_SIZE;
+    if (bin.read_u32_le(file.data, dd) != rsrc_rva
+        || bin.read_u32_le(file.data, dd + 4) != rsrc_vsize) { ret 1; }
+    if (bin.read_u32_le(file.data, oh + 8) != rsrc_raw_size) { ret 1; }
+
+    # Root entries are RT_VERSION then RT_MANIFEST. Follow the manifest's
+    # type/name/language directories to its data entry and payload.
+    if (bin.read_u16_le(file.data, rsrc_raw + 14) != 2) { ret 1; }
+    val root_manifest: usize = rsrc_raw + 16 + 8;
+    if (bin.read_u32_le(file.data, root_manifest) != rs.RT_MANIFEST) { ret 1; }
+    val l2: usize = rsrc_raw + (bin.read_u32_le(file.data, root_manifest + 4) & 0x7FFFFFFF)::usize;
+    val l3: usize = rsrc_raw + (bin.read_u32_le(file.data, l2 + 16 + 4) & 0x7FFFFFFF)::usize;
+    val de: usize = rsrc_raw + bin.read_u32_le(file.data, l3 + 16 + 4)::usize;
+    val payload: usize = rsrc_raw + (bin.read_u32_le(file.data, de) - rsrc_rva)::usize;
+    if (bin.read_u32_le(file.data, de + 4)::usize != str_len(manifest)) { ret 1; }
+    i = 0;
+    for (i < str_len(manifest)) {
+        if (file.data[payload + i] != manifest[i]) { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# layout validation rejects both the 16-bit section-count narrowing and a
+# resource section whose fields exceed PE32+'s 32-bit RVAs
+test "mach.lang.target.of.coff.validate_pe_layout:rejects_narrowing" {
+    var lay: PeLayout;
+    lay.sec_total = 65536;
+    val count_r: R.Result[bool, str] = validate_pe_layout(?lay, 0, 0);
+    if (R.is_ok[bool, str](count_r)) { ret 1; }
+    lay.sec_total = 1; lay.have_rsrc = true;
+    lay.rsrc_sec.rva = 0x100000000; lay.rsrc_sec.vsize = 1;
+    val rsrc_r: R.Result[bool, str] = validate_pe_layout(?lay, 0, 1);
+    if (R.is_ok[bool, str](rsrc_r)) { ret 1; }
     ret 0;
 }
 

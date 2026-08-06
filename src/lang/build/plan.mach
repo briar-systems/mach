@@ -132,6 +132,8 @@ pub rec LinkInput {
 # sel_artifact: the cell's artifact selector
 # want_lib:     the selected artifact is a `[lib.*]` (disambiguates a name)
 # has_artifact: an artifact is named
+# subsystem:    the environment this cell's executable declares it runs under,
+#               settled from `--subsystem` over the artifact's `subsystem` key
 pub rec BuildUnit {
     target_entry: *project.TargetEntry;
     profile:      str;
@@ -148,6 +150,7 @@ pub rec BuildUnit {
     sel_artifact: str;
     want_lib:     bool;
     has_artifact: bool;
+    subsystem:    of.Subsystem;
 }
 
 # the settled request the planner consumes, re-exported for the RFC spelling
@@ -403,6 +406,15 @@ fun plan_unit(a: *A.Allocator, itn: *intern.Interner, reg: *target.TargetRegistr
     u.sel_artifact = aname;
     u.want_lib     = want_lib;
     u.has_artifact = has_artifact;
+
+    # the subsystem this cell declares: an explicit `--subsystem` is a
+    # per-invocation override that wins outright, else the artifact's key (which
+    # defaults to console). the key is accepted on every target and consumed only
+    # by the PE writer, so a non-windows cell settles it and emits as before.
+    u.subsystem = of.SUBSYSTEM_CONSOLE;
+    if (bu.artifact != nil) { u.subsystem = bu.artifact.subsystem; }
+    if (req.subsystem_flag == request.SUBSYSTEM_FLAG_CONSOLE) { u.subsystem = of.SUBSYSTEM_CONSOLE; }
+    if (req.subsystem_flag == request.SUBSYSTEM_FLAG_GUI)     { u.subsystem = of.SUBSYSTEM_GUI; }
 
     val pn_opt: O.Option[str] = intern.lookup(itn, bu.profile_name);
     if (O.is_none[str](pn_opt)) { ret R.err[BuildUnit, outcome.Fail](outcome.user("internal: profile name not interned")); }
@@ -702,9 +714,10 @@ fun steps_demanded(a: *A.Allocator, itn: *intern.Interner, m: *manifest.Manifest
 # probe; a `.dylib` is a Mach-O dependency whose LC_ID_DYLIB is retained when
 # the file exists and whose explicit spelling is retained on a cross host.
 # Both are gated to their object format. Anything else probes the filesystem:
-# an explicit `.o`/`.a` path verbatim (then
+# an explicit `.o`/`.obj`/`.a`/`.lib` path verbatim (then
 # retried against the project root), a bare name through the `-L` dirs and
-# working directory as `lib<name>.o`/`<name>.o`/`lib<name>.a`/`<name>.a`, a
+# working directory under Unix object/archive spellings plus COFF spellings only
+# for a PE/COFF target, a
 # shared object by reading its DT_SONAME, and a bare name lastly as the
 # target format's `.so` or `.dylib` through the `-L` dirs and the target OS's
 # library directories. An input that resolves to no existing file is a hard
@@ -773,7 +786,8 @@ pub fun resolve_token(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
     }
 
     var buf: [4096]u8;
-    var found: bool = resolve_input_into(tok, dirs, ?buf[0], 4096);
+    var found: bool = resolve_input_into(tok, dirs, ?buf[0], 4096,
+        str_equals(tgt.of.shared_input_ext, ".dll"));
 
     # a relative explicit path that misses the working directory is retried rooted
     # at the project root, so manifest `libs` paths are project-relative.
@@ -799,7 +813,7 @@ pub fun resolve_token(a: *A.Allocator, tgt: *target.Target, dirs: *Vector[str],
         ret R.err[LinkInput, outcome.Fail](outcome.user(join_msg(a, "'", (?buf[0])::str, "' is not a loadable ELF shared object (an ld script or unsupported '.so')")));
     }
 
-    # a bare `-l` name with no static `.o`/`.a` falls back to the selected
+    # a bare `-l` name with no static object/archive falls back to the selected
     # format's shared library in the `-L` dirs and target system directories;
     # `resolve_shared_into` writes the library's own canonical loader name.
     if (!found && !request.is_object_path(tok) && !is_shared_path(tok)) {
@@ -940,10 +954,13 @@ fun join_msg(al: *A.Allocator, va: ...) str {
 #
 # An explicit link-file path (`is_object_path`) is taken verbatim. A bare
 # `-l`-style name is searched in each `-L <dir>` as
-# `<dir>/lib<name>.o`, `<dir>/<name>.o`, `<dir>/lib<name>.a`, `<dir>/<name>.a`,
-# then the same four candidates relative to the working directory. A shared
+# `<dir>/lib<name>.o`, `<dir>/<name>.o`, and the corresponding `.a` archive
+# names. A COFF target additionally probes `.obj`/`.lib`; those suffixes are
+# never selected by a bare Unix-target name. The same candidates are then tried
+# relative to the working directory. A shared
 # library path is returned verbatim for the caller's format-specific handling.
-fun resolve_input_into(tok: *u8, dirs: *Vector[str], buf: *u8, cap: usize) bool {
+fun resolve_input_into(tok: *u8, dirs: *Vector[str], buf: *u8, cap: usize,
+                       coff_names: bool) bool {
     if (tok == nil || str_empty(tok::str)) { ret false; }
 
     if (request.is_object_path(tok)) {
@@ -956,27 +973,33 @@ fun resolve_input_into(tok: *u8, dirs: *Vector[str], buf: *u8, cap: usize) bool 
     }
 
     # bare name: search each `-L` dir, then the working directory, for the
-    # `lib<name>.o` and `<name>.o` candidates in turn.
+    # object and archive candidates in turn.
     var i: usize = 0;
     for (i < dirs.len) {
-        if (try_named_object(dirs.data[i]::*u8, tok, buf, cap)) { ret true; }
+        if (try_named_object(dirs.data[i]::*u8, tok, buf, cap, coff_names)) { ret true; }
         i = i + 1;
     }
-    if (try_named_object(nil, tok, buf, cap)) { ret true; }
+    if (try_named_object(nil, tok, buf, cap, coff_names)) { ret true; }
     ret false;
 }
 
-# probe the `lib<name>` / `<name>` candidates with a `.o` then `.a` extension,
+# probe the `lib<name>` / `<name>` candidates with the Unix and COFF object
+# spellings, then the Unix and COFF archive spellings,
 # writing the first existing hit into `buf`
 #
 # A nil `dir` probes them relative to the working directory; a non-nil `dir`
 # roots them under it. Loose objects are preferred over archives so resolution
-# is unchanged for an `-l` name that has a loose `.o`.
-fun try_named_object(dir: *u8, name: *u8, buf: *u8, cap: usize) bool {
+# is unchanged for an `-l` name that has a loose object.
+fun try_named_object(dir: *u8, name: *u8, buf: *u8, cap: usize,
+                     coff_names: bool) bool {
     if (write_named_candidate(dir, "lib", name, "o", buf, cap) && fs.is_file(buf)) { ret true; }
     if (write_named_candidate(dir, "", name, "o", buf, cap) && fs.is_file(buf))    { ret true; }
+    if (coff_names && write_named_candidate(dir, "lib", name, "obj", buf, cap) && fs.is_file(buf)) { ret true; }
+    if (coff_names && write_named_candidate(dir, "", name, "obj", buf, cap) && fs.is_file(buf))    { ret true; }
     if (write_named_candidate(dir, "lib", name, "a", buf, cap) && fs.is_file(buf)) { ret true; }
     if (write_named_candidate(dir, "", name, "a", buf, cap) && fs.is_file(buf))    { ret true; }
+    if (coff_names && write_named_candidate(dir, "lib", name, "lib", buf, cap) && fs.is_file(buf)) { ret true; }
+    if (coff_names && write_named_candidate(dir, "", name, "lib", buf, cap) && fs.is_file(buf))    { ret true; }
     ret false;
 }
 
@@ -1633,6 +1656,83 @@ fun ut_temp_dir(a: *A.Allocator) R.Result[str, str] {
     val mk: O.Option[str] = fs.create_dir_all(a, root, 493);
     if (O.is_some[str](mk)) { ret R.err[str, str](O.unwrap[str](mk)); }
     ret R.ok[str, str](root);
+}
+
+# COFF's conventional `.obj`/`.lib` spellings participate in the same explicit
+# and `-L`-named static-input resolution as `.o`/`.a`.
+test "mach.lang.build.plan.resolve_input_into:coff_static_suffixes" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    val root_r: R.Result[str, str] = ut_temp_dir(?alloc);
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val lib_r: R.Result[str, str] = path.join(?alloc, root, "libmingw32.lib");
+    if (R.is_err[str, str](lib_r)) { fs.remove_all(?alloc, root); ret 1; }
+    val lib: str = R.unwrap_ok[str, str](lib_r);
+    if (O.is_some[str](fs.write_bytes(lib, "!<arch>\n", 8, 420))) {
+        fs.remove_all(?alloc, root);
+        ret 1;
+    }
+
+    var dirs: Vector[str] = vector.init[str](?alloc);
+    if (R.is_err[usize, str](vector.push[str](?dirs, root))) {
+        fs.remove_all(?alloc, root);
+        ret 1;
+    }
+    var buf: [4096]u8;
+    val named: bool = resolve_input_into("mingw32"::*u8, ?dirs, ?buf[0], 4096, true);
+    val explicit: bool = resolve_input_into(lib::*u8, ?dirs, ?buf[0], 4096, false);
+    fs.remove_all(?alloc, root);
+    if (!named || !explicit) { ret 1; }
+    ret 0;
+}
+
+# A bare ELF library name ignores a same-directory COFF `.lib` and reaches the
+# valid `.so`; explicit `.lib` paths remain available for format diagnostics.
+test "mach.lang.build.plan.resolve_token:linux_ignores_bare_coff_lib" {
+    var alloc: A.Allocator;
+    if (O.is_some[str](page.make(?alloc))) { ret 1; }
+    var reg: target.TargetRegistry = target.registry_init();
+    if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
+    val tr: R.Result[target.Target, str] =
+        target.select(?reg, "x86_64", "linux", "sysv64");
+    if (R.is_err[target.Target, str](tr)) { ret 1; }
+    var tgt: target.Target = R.unwrap_ok[target.Target, str](tr);
+
+    val root_r: R.Result[str, str] = ut_temp_dir(?alloc);
+    if (R.is_err[str, str](root_r)) { ret 1; }
+    val root: str = R.unwrap_ok[str, str](root_r);
+    val lib_r: R.Result[str, str] = path.join(?alloc, root, "libfoo.lib");
+    val so_r: R.Result[str, str] = path.join(?alloc, root, "libfoo.so");
+    if (R.is_err[str, str](lib_r) || R.is_err[str, str](so_r)) {
+        fs.remove_all(?alloc, root); ret 1;
+    }
+    val lib: str = R.unwrap_ok[str, str](lib_r);
+    val so: str = R.unwrap_ok[str, str](so_r);
+    var elf: [64]u8;
+    var i: usize = 0;
+    for (i < 64) { elf[i] = 0; i = i + 1; }
+    elf[0] = 0x7F; elf[1] = 0x45; elf[2] = 0x4C; elf[3] = 0x46;
+    bin.write_u16_le(?elf[0], 16, 3);
+    if (O.is_some[str](fs.write_bytes(lib, "!<arch>\n", 8, 420))
+        || O.is_some[str](fs.write_bytes(so, ?elf[0], 64, 420))) {
+        fs.remove_all(?alloc, root); ret 1;
+    }
+
+    var dirs: Vector[str] = vector.init[str](?alloc);
+    if (R.is_err[usize, str](vector.push[str](?dirs, root))) {
+        fs.remove_all(?alloc, root); ret 1;
+    }
+    val rr: R.Result[LinkInput, outcome.Fail] =
+        resolve_token(?alloc, ?tgt, ?dirs, "", "foo"::*u8);
+    var explicit_buf: [4096]u8;
+    val explicit: bool =
+        resolve_input_into(lib::*u8, ?dirs, ?explicit_buf[0], 4096, false);
+    fs.remove_all(?alloc, root);
+    if (R.is_err[LinkInput, outcome.Fail](rr) || !explicit) { ret 1; }
+    val input: LinkInput = R.unwrap_ok[LinkInput, outcome.Fail](rr);
+    if (input.kind != LINK_DYNAMIC || !str_equals(input.text, "libfoo.so")) { ret 1; }
+    ret 0;
 }
 
 # a named Darwin system requirement probes `.dylib`, reads LC_ID_DYLIB, and

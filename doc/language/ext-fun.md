@@ -23,15 +23,25 @@ pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ext fun strlen(s: *u8) i64;             # private, file-local
 ```
 
-## Symbol rename
+## Symbol name
 
-By default the linker symbol matches the Mach name. Override it with the
-`symbol` decorator:
+The declaration names a C declaration, so its linker symbol is whatever the
+target's C toolchain emits for that identifier. On Linux and Windows that is the
+name as written; on Darwin the C ABI prefixes an underscore, so `ext fun
+mad_open` binds the `_mad_open` a C object there defines. You write the C name
+either way — the prefix is never spelled in source.
+
+Override the symbol outright with the `symbol` decorator:
 
 ```mach
 #[symbol("write")]
 pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ```
+
+An overridden name is taken **literally**: it is the object symbol, so no
+platform prefix is applied to it and you spell the exact name the object carries
+(`_write` on Darwin, `write` elsewhere). That is what lets inline asm and the
+runtime entry points name a symbol exactly.
 
 Common reasons to rename:
 
@@ -61,6 +71,11 @@ ext fun WSAStartup(ver: u16, data: *u8) i32;
 - An `ext` import with no `library` is unattributed. PE and Mach-O require every
   dynamic import to identify its provider, so an unattributed import is a hard
   link error on those targets.
+- A symbol with **no `ext` declaration at all** — one a linked static archive
+  leaves undefined — has nothing to decorate. Its provider is named from the
+  manifest instead, by the `symbols` key on the `[link.X]` entry that supplies
+  it; see [manifest.md](../manifest.md#linkname--link-requirements). The two
+  declarations write the same attribution, so a symbol may be claimed only once.
 
 `library` composes with `symbol`: the rename sets the imported symbol's name,
 `library` sets the dependency it is imported from. On one decl the import is emitted
@@ -71,6 +86,14 @@ under the renamed symbol within the named library.
 #[library("ws2_32.dll")] #[symbol("socket")]
 ext fun ws2_socket(af: i32, kind: i32, proto: i32) i64;
 ```
+
+A linked Windows COFF object compiled with C/C++ `dllimport` commonly refers to
+`__imp_X`, the address of X's Import Address Table cell, instead of calling X
+directly. The PE linker applies X's normal `#[library]` or manifest `symbols`
+attribution, emits the undecorated loader import X, and resolves the object
+reference to that IAT cell. If another object also refers to X directly, both
+spellings share one import and one IAT entry; do not declare or map `__imp_X` as
+a separate export.
 
 On a format whose loader resolves imports by global search (ELF), an import is
 not bound to a single dependency, so `library` has no effect on the emitted

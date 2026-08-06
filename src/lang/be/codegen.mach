@@ -329,37 +329,36 @@ fun pack_image(s: *session.Session, tgt: *target.Target, irmod: *ir.Module,
         ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_symbols));
     }
 
-    val res_relocs: R.Result[bool, str] = pack_relocs(?image, enc, text_sec, placements, placement_count);
+    # relocations are recorded by target name and bound to symbol indices only
+    # after pack_globals, because a global's aggregate initializer may point at a
+    # global that pass has not packed yet. binding also declares any target no
+    # pass defined, which is what makes it genuinely external.
+    var deferred: obj.DeferredRelocs = obj.deferred_init(s.alloc);
+
+    val res_relocs: R.Result[bool, str] = pack_relocs(?deferred, enc, text_sec, placements, placement_count);
     # re-home the retained PC<->source rows the same way symbols are, while the
     # placements are still live, so the #1699 line producer reads final section
     # offsets. infallible (in-place offset math), so no error to thread.
     pack_rows(enc, placements, placement_count, text_sec);
     if (placements != nil) { A.deallocate[SectionPlacement](s.alloc, placements, enc.symbol_count::usize); }
     if (R.is_err[bool, str](res_relocs)) {
+        obj.deferred_dnit(?deferred);
         obj.dnit(?image);
         ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_relocs));
     }
 
-    val res_globals: R.Result[bool, str] = pack_globals(s, tgt, ?image, irmod);
+    val res_globals: R.Result[bool, str] = pack_globals(s, tgt, ?image, ?deferred, irmod);
     if (R.is_err[bool, str](res_globals)) {
+        obj.deferred_dnit(?deferred);
         obj.dnit(?image);
         ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_globals));
     }
 
-    val res_reloc_externs: R.Result[bool, str] = pack_reloc_externs(?image, enc);
-    if (R.is_err[bool, str](res_reloc_externs)) {
+    val res_bind: R.Result[bool, str] = obj.flush_deferred(?image, ?deferred);
+    obj.deferred_dnit(?deferred);
+    if (R.is_err[bool, str](res_bind)) {
         obj.dnit(?image);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_reloc_externs));
-    }
-
-    # an aggregate constant's `&G` / function-pointer leaf may target a symbol
-    # defined in another module (cross-object reference). every such data-section
-    # relocation target that this object has not defined is declared undefined so
-    # the linker binds it - the data analog of pack_reloc_externs.
-    val res_data_externs: R.Result[bool, str] = pack_data_reloc_externs(?image);
-    if (R.is_err[bool, str](res_data_externs)) {
-        obj.dnit(?image);
-        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_data_externs));
+        ret R.err[of.ObjectImage, str](R.unwrap_err[bool, str](res_bind));
     }
 
     # when `-g` is on and the target resolved a debug-info producer (elf / mach-o ->
@@ -513,20 +512,23 @@ fun pack_symbols(image: *of.ObjectImage, irmod: *ir.Module,
     ret R.ok[bool, str](true);
 }
 
-# attach every pending relocation from the encoder to its section
+# record every pending relocation from the encoder against its section
 #
 # The encoder tags each relocation with its abstract kind (`of.RK_*`) and the
 # interned target-symbol name; the format writer maps the kind to its machine
 # type at emit time. The symbol target is unchanged (resolved by the linker), so
-# a cross-section call from a re-homed site just works.
+# a cross-section call from a re-homed site just works. A target this image never
+# defines - a symbol named only from an inline-asm body, like the entry `main`
+# called from the runtime `_start` asm - is declared a STT_FUNC extern when the
+# records bind.
 # ---
-# image:           object image being built
+# deferred:        out - the recorded relocations, bound once symbols are complete
 # enc:             encoder output supplying the pending relocations
 # text_sec:        index of the `.text` section a non-sectioned site patches
 # placements:      the sectioned-function ranges, in increasing text offset
 # placement_count: number of placements
 # ret:             true on success, or an error string
-fun pack_relocs(image: *of.ObjectImage, enc: *encode.EncoderOutput,
+fun pack_relocs(deferred: *obj.DeferredRelocs, enc: *encode.EncoderOutput,
                 text_sec: u32, placements: *SectionPlacement, placement_count: u32) R.Result[bool, str] {
     var i: u32 = 0;
     for (i < enc.reloc_count) {
@@ -534,14 +536,15 @@ fun pack_relocs(image: *of.ObjectImage, enc: *encode.EncoderOutput,
 
         val site: PlacedSite = site_placed(placements, placement_count, text_sec, pr.offset);
 
-        var rel: of.Relocation;
-        rel.section = site.sec;
-        rel.offset  = site.off;
-        rel.kind    = pr.kind;
-        rel.symbol  = pr.sym;
-        rel.addend  = pr.addend::i64;
+        var rec: obj.DeferredReloc;
+        rec.section      = site.sec;
+        rec.offset       = site.off;
+        rec.kind         = pr.kind;
+        rec.name         = pr.sym;
+        rec.addend       = pr.addend::i64;
+        rec.extern_flags = of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL;
 
-        val res_rel: R.Result[bool, str] = obj.add_relocation(image, rel);
+        val res_rel: R.Result[bool, str] = obj.defer_relocation(deferred, rec);
         if (R.is_err[bool, str](res_rel)) {
             ret R.err[bool, str](R.unwrap_err[bool, str](res_rel));
         }
@@ -632,8 +635,89 @@ fun section_bytes_copy(image: *of.ObjectImage, src: *u8, len: u32) R.Result[*u8,
     ret R.ok[*u8, str](buf);
 }
 
+# add global `g`'s defining symbol, pointing at section `sec_idx`
+#
+# A named user global is given GLOBAL linkage - its name is module-path-mangled
+# and globally unique, so it resolves cross-object without collision (mirroring
+# every defined function). Only a compiler-synthesized anonymous data global
+# (`is_local`, a string / byte-blob literal) stays object-private.
+# ---
+# image:   object image being built
+# g:       the global being defined
+# sec_idx: index of the section holding its bytes
+# sec_len: the symbol's size in bytes
+# ret:     true on success, or an error string
+fun add_global_symbol(image: *of.ObjectImage, g: *ir.Global, sec_idx: u32, sec_len: u32) R.Result[bool, str] {
+    var flags: u32 = of.SYM_OBJ_FLAG_OBJECT;
+    if (!g.is_local) { flags = flags | of.SYM_OBJ_FLAG_GLOBAL; }
+
+    var sym: of.Symbol;
+    sym.name    = g.name;
+    sym.section = sec_idx;
+    sym.offset  = 0;
+    sym.size    = sec_len;
+    sym.flags   = flags;
+
+    val res: R.Result[u32, str] = obj.add_symbol(image, sym);
+    if (R.is_err[u32, str](res)) { ret R.err[bool, str](R.unwrap_err[u32, str](res)); }
+    ret R.ok[bool, str](true);
+}
+
+# the index of a section already packed for an earlier `#[embed]` global whose
+# bytes, length, section name, and kind all match, or -1 when there is none
+#
+# Scans the globals packed before index `upto`, so the match is against sections
+# this loop has already added and the first embed of a given content owns the
+# placement. Content is compared in full rather than by digest: the digest lives
+# in the frontend's cache and the equality that matters here is of the bytes about
+# to be written.
+# ---
+# image:    object image being built
+# irmod:    the IR module being packed
+# upto:     index of the global currently being packed
+# bytes:    its initializer bytes
+# len:      their length
+# sec_name: the interned section name it would use
+# kind:     the section kind it would use
+# align:    the alignment it requires
+# ret:      the matching section index, or -1
+fun embed_section_of(image: *of.ObjectImage, irmod: *ir.Module, upto: u32, bytes: *u8, len: u32,
+                     sec_name: intern.StrId, kind: of.SectionKind, align: u32) i64 {
+    var j: u32 = 0;
+    for (j < upto) {
+        val o: *ir.Global = ?irmod.globals[j];
+        if (!o.is_embed || o.is_extern)               { j = j + 1; cnt; }
+        if (o.init.kind != value.VAL_CONST_BYTES)     { j = j + 1; cnt; }
+        if (o.init.data.bytes.len != len)             { j = j + 1; cnt; }
+        if (o.section != sec_name && o.section != intern.STR_NIL) { j = j + 1; cnt; }
+
+        val si: i64 = section_index_of(image, o.name);
+        if (si < 0)                                   { j = j + 1; cnt; }
+        val sec: *of.Section = ?image.sections[si::u32];
+        if (sec.kind != kind || sec.name != sec_name || sec.len != len) { j = j + 1; cnt; }
+        if (sec.align != align)                                         { j = j + 1; cnt; }
+        if (len > 0 && !memory.raw_equal(sec.bytes::ptr, bytes::ptr, len::usize)) { j = j + 1; cnt; }
+        ret si;
+    }
+    ret -1;
+}
+
+# the index of the section the symbol named `name` defines, or -1
+# ---
+# image: object image being built
+# name:  the interned symbol name
+# ret:   the section index, or -1
+fun section_index_of(image: *of.ObjectImage, name: intern.StrId) i64 {
+    var i: u32 = 0;
+    for (i < image.symbol_count) {
+        if (image.symbols[i].name == name) { ret image.symbols[i].section::i64; }
+        i = i + 1;
+    }
+    ret -1;
+}
+
 fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImage,
-                 irmod: *ir.Module) R.Result[bool, str] {
+                 deferred: *obj.DeferredRelocs, irmod: *ir.Module) R.Result[bool, str] {
     var i: u32 = 0;
     for (i < irmod.global_len) {
         val g: *ir.Global = ?irmod.globals[i];
@@ -646,7 +730,7 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
             # GLOBAL binding is required: an undefined symbol the linker resolves
             # against another object's definition cannot be local. without it the
             # ELF writer emits STB_LOCAL and the reference fails to bind. matches
-            # the extern function decls and pack_data_reloc_externs.
+            # the extern function decls and the deferred-relocation binding.
             val flags: u32 = of.SYM_OBJ_FLAG_OBJECT | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL;
             val res_extern: R.Result[bool, str] = image_extern_symbol_add(image, g.name, flags);
             if (R.is_err[bool, str](res_extern)) { ret res_extern; }
@@ -725,15 +809,14 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
             }
         }
 
-        # a global with an initializer (a non-nil byte image) is initialized data
-        # and belongs in .data/.rodata; only a global with no initializer at all
-        # (bytes == nil) is a zero-filled .bss reservation. routing on `len > 0`
-        # instead would misclassify an empty-but-present initializer (e.g. the
-        # "" string literal, a single '\0' byte) as bss, emitting a malformed
-        # section (kind bss yet bytes non-nil) whose symbol resolves to null.
+        # a global with an initializer is initialized data and belongs in
+        # .data/.rodata; only one with no initializer is a zero-filled .bss
+        # reservation. An empty embed has a nil, zero-length byte image but is
+        # still a present read-only initializer, which its explicit IR flag keeps
+        # out of bss.
         var kind:  of.SectionKind = of.SK_BSS;
         var sname: str            = ".bss";
-        if (bytes != nil) {
+        if (bytes != nil || g.is_embed) {
             if (g.is_mut) {
                 kind  = of.SK_DATA;
                 sname = ".data";
@@ -776,20 +859,42 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
             sec_len = type.byte_size(?irmod.types, g.ty, tgt);
         }
 
-        var sec: of.Section;
-        sec.name  = sec_name;
-        sec.kind  = kind;
-        sec.bytes = bytes;
-        sec.len   = sec_len;
         # the section is aligned to the strictest of: the 8-byte default, the
         # global's own type alignment (which an `#[align(...)]` decorator on the
         # type can raise - natural alignment never exceeds 8, so un-decorated
         # globals stay at 8), and an `#[align(...)]` decorator on the global
         # itself.
-        sec.align = 8;
+        var sec_align: u32 = 8;
         val tya: u32 = type.byte_align(?irmod.types, g.ty, tgt);
-        if (tya > sec.align)     { sec.align = tya; }
-        if (g.align > sec.align) { sec.align = g.align; }
+        if (tya > sec_align)     { sec_align = tya; }
+        if (g.align > sec_align) { sec_align = g.align; }
+
+        # two `#[embed]` globals naming byte-identical files share one placement
+        # (#2507): the section is emitted once and both symbols point at it. Sound
+        # only for embedded data - a named object's address is otherwise its own,
+        # and merging two ordinary globals would make `?A == ?B` observably true -
+        # so the scan is gated on `is_embed` at both ends. Alignment is part of the
+        # match: a stricter `#[align(...)]` on the second global would otherwise
+        # silently inherit the first section's weaker one.
+        if (g.is_embed) {
+            val dup: i64 = embed_section_of(image, irmod, i, bytes, sec_len, sec_name, kind, sec_align);
+            if (dup >= 0) {
+                if (bytes != nil && sec_len > 0) {
+                    A.deallocate[u8](image.alloc, bytes, sec_len::usize);
+                }
+                val res_alias: R.Result[bool, str] = add_global_symbol(image, g, dup::u32, sec_len);
+                if (R.is_err[bool, str](res_alias)) { ret res_alias; }
+                i = i + 1;
+                cnt;
+            }
+        }
+
+        var sec: of.Section;
+        sec.name  = sec_name;
+        sec.kind  = kind;
+        sec.bytes = bytes;
+        sec.len   = sec_len;
+        sec.align = sec_align;
 
         val res_section: R.Result[u32, str] = obj.add_section(image, sec);
         if (R.is_err[u32, str](res_section)) {
@@ -797,25 +902,8 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
         }
         val sec_idx: u32 = R.unwrap_ok[u32, str](res_section);
 
-        # a named user global is given GLOBAL linkage - its name is module-path-
-        # mangled and globally unique, so it resolves cross-object without
-        # collision (mirroring every defined function). only a compiler-
-        # synthesized anonymous data global (`is_local`, a string / byte-blob
-        # literal) stays object-private.
-        var flags: u32 = of.SYM_OBJ_FLAG_OBJECT;
-        if (!g.is_local) { flags = flags | of.SYM_OBJ_FLAG_GLOBAL; }
-
-        var sym: of.Symbol;
-        sym.name    = g.name;
-        sym.section = sec_idx;
-        sym.offset  = 0;
-        sym.size    = sec_len;
-        sym.flags   = flags;
-
-        val res_sym: R.Result[u32, str] = obj.add_symbol(image, sym);
-        if (R.is_err[u32, str](res_sym)) {
-            ret R.err[bool, str](R.unwrap_err[u32, str](res_sym));
-        }
+        val res_sym: R.Result[bool, str] = add_global_symbol(image, g, sec_idx, sec_len);
+        if (R.is_err[bool, str](res_sym)) { ret res_sym; }
 
         # an aggregate constant's pointer leaves (a `str` / address-of-global) are
         # patched at link time: each side-table entry becomes an abs64 relocation
@@ -823,7 +911,7 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
         # rodata global already packed in this same loop). the ELF writer emits a
         # `.rela.<section>` for any section carrying these.
         if (g.init.kind == value.VAL_CONST_AGG) {
-            val res_agg: R.Result[bool, str] = pack_agg_relocs(image, ?g.init, sec_idx);
+            val res_agg: R.Result[bool, str] = pack_agg_relocs(deferred, ?g.init, sec_idx);
             if (R.is_err[bool, str](res_agg)) { ret R.err[bool, str](R.unwrap_err[bool, str](res_agg)); }
         }
         i = i + 1;
@@ -837,90 +925,32 @@ fun pack_globals(s: *session.Session, tgt: *target.Target, image: *of.ObjectImag
 # address of its target symbol plus the recorded addend. The abstract abs64 kind
 # is format-independent, so no target is needed.
 # ---
-# image:   object image being built
-# init:    the VAL_CONST_AGG initializer carrying the side-table
-# sec_idx: index of the section the relocations patch
-# ret:     true on success, or an error string
-fun pack_agg_relocs(image: *of.ObjectImage, init: *value.Value, sec_idx: u32) R.Result[bool, str] {
+# deferred: out - the recorded relocations, bound once symbols are complete
+# init:     the VAL_CONST_AGG initializer carrying the side-table
+# sec_idx:  index of the section the relocations patch
+# ret:      true on success, or an error string
+fun pack_agg_relocs(deferred: *obj.DeferredRelocs, init: *value.Value, sec_idx: u32) R.Result[bool, str] {
     var i: u32 = 0;
     for (i < init.data.agg.reloc_count) {
         val ar: *value.AggReloc = ?init.data.agg.relocs[i];
 
-        var rel: of.Relocation;
-        rel.section = sec_idx;
-        rel.offset  = ar.offset;
-        rel.kind    = of.RK_ABS64;
-        rel.symbol  = ar.symbol;
-        rel.addend  = ar.addend;
+        # a leaf may name a symbol packed later in this same pass, or one defined
+        # in another module entirely; either way the record binds after every
+        # defining pass has run. the leaf's own flavour picks the flags the target
+        # is declared with if it turns out to be the cross-module case.
+        var flags: u32 = of.SYM_OBJ_FLAG_OBJECT | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL;
+        if (ar.is_fn) { flags = of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL; }
 
-        val res_rel: R.Result[bool, str] = obj.add_relocation(image, rel);
+        var rec: obj.DeferredReloc;
+        rec.section      = sec_idx;
+        rec.offset       = ar.offset;
+        rec.kind         = of.RK_ABS64;
+        rec.name         = ar.symbol;
+        rec.addend       = ar.addend;
+        rec.extern_flags = flags;
+
+        val res_rel: R.Result[bool, str] = obj.defer_relocation(deferred, rec);
         if (R.is_err[bool, str](res_rel)) { ret R.err[bool, str](R.unwrap_err[bool, str](res_rel)); }
-
-        # a function-pointer leaf targeting a symbol this object has not defined is
-        # a cross-module reference: declare a STT_FUNC extern stub now. every local
-        # function is already defined (pack_symbols ran before pack_globals), so an
-        # undefined fn-target is genuinely external. object (global) targets are
-        # left to pack_data_reloc_externs, which a later-packed global may still
-        # define.
-        if (ar.is_fn && ar.symbol != intern.STR_NIL && !image_has_symbol(image, ar.symbol)) {
-            val flags: u32 = of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL;
-            val res_extern: R.Result[bool, str] = image_extern_symbol_add(image, ar.symbol, flags);
-            if (R.is_err[bool, str](res_extern)) { ret res_extern; }
-        }
-        i = i + 1;
-    }
-    ret R.ok[bool, str](true);
-}
-
-# declare an undefined extern symbol for every function-relocation target this
-# image references but has not declared
-#
-# Covers a symbol named only from an inline-asm body (e.g. the entry `main`,
-# called from the runtime `_start` asm), which leaves no IR function or global
-# declaration for the earlier symbol passes to catch. Without a matching
-# symbol-table entry the object writer would map the relocation to the null
-# symbol (index 0), so the linker would see no target name. A target already
-# defined or declared here is left alone, so a symbol is never declared twice.
-# ---
-# image: object image being built (its symbol table already holds every defined
-#        and IR-declared extern symbol)
-# enc:   encoder output supplying the pending relocations
-# ret:   true on success, or an error string
-fun pack_reloc_externs(image: *of.ObjectImage, enc: *encode.EncoderOutput) R.Result[bool, str] {
-    var i: u32 = 0;
-    for (i < enc.reloc_count) {
-        val name: intern.StrId = enc.relocations[i].sym;
-        if (name == intern.STR_NIL)        { i = i + 1; cnt; }
-        if (image_has_symbol(image, name)) { i = i + 1; cnt; }
-
-        val flags: u32 = of.SYM_OBJ_FLAG_FUNCTION | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL;
-        val res_extern: R.Result[bool, str] = image_extern_symbol_add(image, name, flags);
-        if (R.is_err[bool, str](res_extern)) { ret res_extern; }
-        i = i + 1;
-    }
-    ret R.ok[bool, str](true);
-}
-
-# declare an undefined extern symbol for every data-relocation target this image
-# references but has not defined
-#
-# Covers aggregate-constant data relocations whose `&G` / function-pointer leaf
-# names a symbol defined in another module; a target already defined or declared
-# here is left alone (no double declaration). The data analog of
-# pack_reloc_externs.
-# ---
-# image: object image being built (its symbol table holds every defined symbol)
-# ret:   true on success, or an error string
-fun pack_data_reloc_externs(image: *of.ObjectImage) R.Result[bool, str] {
-    var i: u32 = 0;
-    for (i < image.reloc_count) {
-        val name: intern.StrId = image.relocations[i].symbol;
-        if (name == intern.STR_NIL)        { i = i + 1; cnt; }
-        if (image_has_symbol(image, name)) { i = i + 1; cnt; }
-
-        val flags: u32 = of.SYM_OBJ_FLAG_OBJECT | of.SYM_OBJ_FLAG_EXTERN | of.SYM_OBJ_FLAG_GLOBAL;
-        val res_extern: R.Result[bool, str] = image_extern_symbol_add(image, name, flags);
-        if (R.is_err[bool, str](res_extern)) { ret res_extern; }
         i = i + 1;
     }
     ret R.ok[bool, str](true);
@@ -1027,21 +1057,6 @@ fun image_extern_symbol_add(image: *of.ObjectImage, name: intern.StrId, flags: u
     val res_sym: R.Result[u32, str] = obj.add_symbol(image, sym);
     if (R.is_err[u32, str](res_sym)) { ret R.err[bool, str](R.unwrap_err[u32, str](res_sym)); }
     ret R.ok[bool, str](true);
-}
-
-# true when the image's symbol table already holds a symbol named `name`
-# (defined here or already declared extern)
-# ---
-# image: object image being searched
-# name:  the symbol name to match
-# ret:   true when a symbol of that name is present
-fun image_has_symbol(image: *of.ObjectImage, name: intern.StrId) bool {
-    var i: u32 = 0;
-    for (i < image.symbol_count) {
-        if (image.symbols[i].name == name) { ret true; }
-        i = i + 1;
-    }
-    ret false;
 }
 
 # resolve the section and offset an encoder-blob site maps to after excision
@@ -1244,5 +1259,80 @@ test "mach.lang.be.codegen.pack_rows:rehomes_sectioned_and_text" {
     if (enc.rows[1].sec != 5 || enc.rows[1].text_offset != 2)  { ret 1; }
     # blob 20: `.text` after the 8-byte excised range -> section 1 at offset 20 - 8 = 12.
     if (enc.rows[2].sec != 1 || enc.rows[2].text_offset != 12) { ret 1; }
+    ret 0;
+}
+
+# embed dedup: an embed global whose bytes, length, section, kind, and alignment
+# all match an already-packed embed reuses that section; content, section, and
+# alignment differences each keep it separate (#2507)
+#
+# Structural, so it holds for every object format: the decision is made against
+# the format-neutral ObjectImage, before any writer sees it. That matters for the
+# targets whose emission cannot be executed on the build host.
+test "mach.lang.be.codegen.embed_section_of:shares_only_on_a_full_match" {
+    val rodata: intern.StrId = 7::intern.StrId;
+    val other:  intern.StrId = 9::intern.StrId;
+
+    var abc: [3]u8;
+    abc[0] = 'a'; abc[1] = 'b'; abc[2] = 'c';
+    var xyz: [3]u8;
+    xyz[0] = 'x'; xyz[1] = 'y'; xyz[2] = 'z';
+
+    # the image already holds the first embed's placement, plus its defining symbol.
+    var secs: [1]of.Section;
+    secs[0].name  = rodata;
+    secs[0].kind  = of.SK_RODATA;
+    secs[0].bytes = ?abc[0];
+    secs[0].len   = 3;
+    secs[0].align = 8;
+
+    var syms: [1]of.Symbol;
+    syms[0].name    = 100::intern.StrId;
+    syms[0].section = 0;
+    syms[0].offset  = 0;
+    syms[0].size    = 3;
+    syms[0].flags   = of.SYM_OBJ_FLAG_OBJECT;
+
+    var image: of.ObjectImage;
+    image.sections      = ?secs[0];
+    image.section_count = 1;
+    image.symbols       = ?syms[0];
+    image.symbol_count  = 1;
+
+    var globals: [1]ir.Global;
+    globals[0].name      = 100::intern.StrId;
+    globals[0].init      = value.const_bytes(?abc[0], 3, 0::type.IrTypeId);
+    globals[0].is_embed  = true;
+    globals[0].is_extern = false;
+    globals[0].section   = intern.STR_NIL;
+
+    var irmod: ir.Module;
+    irmod.globals = ?globals[0];
+
+    # identical in every axis: shares the placement.
+    if (embed_section_of(?image, ?irmod, 1, ?abc[0], 3, rodata, of.SK_RODATA, 8) != 0) { ret 1; }
+
+    # different content of the same length: its own placement.
+    if (embed_section_of(?image, ?irmod, 1, ?xyz[0], 3, rodata, of.SK_RODATA, 8) != -1) { ret 1; }
+
+    # a stricter alignment must not inherit the existing section's weaker one.
+    if (embed_section_of(?image, ?irmod, 1, ?abc[0], 3, rodata, of.SK_RODATA, 64) != -1) { ret 1; }
+
+    # a `#[section(...)]` override puts it elsewhere.
+    if (embed_section_of(?image, ?irmod, 1, ?abc[0], 3, other, of.SK_RODATA, 8) != -1) { ret 1; }
+
+    # a non-embed global is never a dedup candidate, however identical its bytes.
+    globals[0].is_embed = false;
+    if (embed_section_of(?image, ?irmod, 1, ?abc[0], 3, rodata, of.SK_RODATA, 8) != -1) { ret 1; }
+
+    # an empty embed is still a present read-only initializer, and two empty
+    # embeds share the same zero-length placement without dereferencing nil.
+    globals[0].is_embed       = true;
+    globals[0].init           = value.const_bytes(nil, 0, 0::type.IrTypeId);
+    secs[0].bytes              = nil;
+    secs[0].len                = 0;
+    syms[0].size               = 0;
+    if (embed_section_of(?image, ?irmod, 1, nil, 0, rodata, of.SK_RODATA, 8) != 0) { ret 1; }
+
     ret 0;
 }
