@@ -1542,7 +1542,17 @@ rec A64Mem {
 # physical-register base (carrying MIR_VREG_NIL) never matches. mirrors the x86-64
 # encoder's twin, reading the laid-out frame directly
 fun frame_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
+    if (codegen_frame.slots_from_sp(?f.frame)) {
+        ret codegen_frame.slot_sp_offset(?f.frame, v);
+    }
     ret codegen_frame.slot_offset(?f.frame, v, 0);
+}
+
+# the register a frame slot is addressed from: X29 normally, SP in a realigned frame,
+# where the mask put a run-time distance between the two (#2735)
+fun slot_base_reg(f: *mir.MirFunction) u32 {
+    if (codegen_frame.slots_from_sp(?f.frame)) { ret ZR; }
+    ret arm64.FP::u32;
 }
 
 # the STACK-pointer offset of the slot a MIR value owns, for an inline-asm
@@ -1560,9 +1570,7 @@ fun frame_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
 # lowering, and an asm body that writes SP is refused by the shared `writes_sp` check
 # whenever it binds a `{name}`.
 fun asm_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
-    val fp_off: O.Option[i64] = codegen_frame.slot_offset(?f.frame, v, 0);
-    if (!O.is_some[i64](fp_off)) { ret O.none[i64](); }
-    ret O.some[i64](frame_subsize(f)::i64 + O.unwrap[i64](fp_off));
+    ret codegen_frame.slot_sp_offset(?f.frame, v);
 }
 
 # lower a post-regalloc MIR_OP_MEM operand to its A64 base / offset /
@@ -1590,7 +1598,7 @@ fun resolve_mem(f: *mir.MirFunction, op: *mir.MirOperand) R.Result[A64Mem, str] 
         if (!O.is_some[i64](slot)) {
             ret R.err[A64Mem, str]("encode: value vreg survived in a memory-operand base");
         }
-        m.base = arm64.FP::u32;
+        m.base = slot_base_reg(f);
         m.off  = O.unwrap[i64](slot) + op.imm;
         ret R.ok[A64Mem, str](m);
     }
@@ -1673,6 +1681,13 @@ fun emit_add_imm(st: *encode.EncodeState, rd: u32, rn: u32, off: i64) {
         ret;
     }
     emit_movewide_seq(st, SCRATCH0, off::u64, true);
+    # register index 31 is SP in an ADD-immediate and XZR in an ADD-register, so an SP
+    # base has to come out to a register before the register form can name it.
+    if (rn == ZR) {
+        emit_addsub_imm(st, ADDI_X, SCRATCH1, ZR, 0, 0);
+        emit_alu3(st, ADD_X, rd, SCRATCH1, SCRATCH0);
+        ret;
+    }
     emit_alu3(st, ADD_X, rd, rn, SCRATCH0);
 }
 
@@ -2169,11 +2184,18 @@ fun encode_addr(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
     val shr: R.Result[u32, str] = scale_shift(m.scale);
     if (R.is_err[u32, str](shr)) { ret R.err[bool, str](R.unwrap_err[u32, str](shr)); }
     val sh: u32 = R.unwrap_ok[u32, str](shr);
+    # index 31 reads as XZR in the ADD-register form, so an SP base (a realigned frame's
+    # slot base, #2735) is copied out first; IP0 rather than `rd`, which may BE the index.
+    var ibase: u32 = m.base;
+    if (ibase == ZR) {
+        emit_addsub_imm(st, ADDI_X, SCRATCH0, ZR, 0, 0);
+        ibase = SCRATCH0;
+    }
     if (m.off == 0) {
-        emit_alu3_sh(st, ADD_X, rd, m.base, m.index, sh);
+        emit_alu3_sh(st, ADD_X, rd, ibase, m.index, sh);
         ret R.ok[bool, str](true);
     }
-    emit_add_imm(st, rd, m.base, m.off);
+    emit_add_imm(st, rd, ibase, m.off);
     emit_alu3_sh(st, ADD_X, rd, rd, m.index, sh);
     ret R.ok[bool, str](true);
 }
@@ -3387,7 +3409,16 @@ fun frame_subsize(f: *mir.MirFunction) u32 {
     # only the low 64 bits (Dn) of V8-V15 are callee-saved under AAPCS64, so each FP
     # callee-save occupies 8 bytes (a D register), not a full 16-byte Q register.
     val fp_bytes: u32 = popcount32(f.callee_mask_fp) * 8;
-    ret align16(gp_bytes + fp_bytes + f.frame.size + f.frame.outgoing_size);
+    val n: u32 = align16(gp_bytes + fp_bytes + f.frame.size + f.frame.outgoing_size);
+    # in a realigned frame (`MirFrame.realign`, decided once by the frame phase) this is
+    # also the distance from the masked SP up to the slot region's base, so it is what
+    # carries the alignment there: masking SP without rounding this aligns a base nothing
+    # is measured from (#2735).
+    if (f.frame.realign != 0) {
+        val rmask: u32 = f.frame.realign - 1;
+        ret (n + rmask) & ~rmask;
+    }
+    ret n;
 }
 
 # subtract a 16-aligned frame size from SP. a frame within 12 bits folds
@@ -3423,9 +3454,39 @@ fun emit_sp_sub(st: *encode.EncodeState, subsize: u32) {
 fun emit_prologue(st: *encode.EncodeState, f: *mir.MirFunction, subsize: u32) {
     emit_ldstp(st, STP_PRE_X, 29, 30, ZR, (0::u32 - 2) & 0x7F);
     emit_addsub_imm(st, ADDI_X, 29, ZR, 0, 0);
+    emit_sp_realign(st, f.frame.realign);
     if (subsize > 0) { emit_sp_sub(st, subsize); }
     save_callee_gp(st, f, true);
     save_callee_fp(st, f, true);
+}
+
+# mask SP down to `realign` bytes, or emit nothing when the frame needs no realignment
+#
+# X29 IS SET BEFORE THIS AND IS DELIBERATELY LEFT WHERE THE ABI PUT IT (#2735). Incoming
+# stack arguments and the FP/LR record are addressed from it and belong to the caller,
+# and after a mask only one of the two pointers is still a fixed distance from the
+# caller's stack - so the slot region is what moves to SP, and `MOV SP, X29` in the
+# epilogue undoes the mask for free, whatever it discarded.
+#
+# The mask is a shift pair rather than an AND. `AND (immediate)` cannot name SP as its
+# source operand, so the value has to come out to a scratch register anyway, and
+# `lsr`/`lsl` by log2 needs no mask constant materialized beside it. IP0 is reserved from
+# allocation and the prologue is before any value is live in it.
+fun emit_sp_realign(st: *encode.EncodeState, realign: u32) {
+    if (realign == 0) { ret; }
+    val k: u32 = log2_u32(realign);
+    emit_addsub_imm(st, ADDI_X, SCRATCH0, ZR, 0, 0);
+    emit_bitfield(st, UBFM_X, SCRATCH0, SCRATCH0, k, 63);
+    emit_bitfield(st, UBFM_X, SCRATCH0, SCRATCH0, (64 - k) & 63, 63 - k);
+    emit_addsub_imm(st, ADDI_X, ZR, SCRATCH0, 0, 0);
+}
+
+# the base-2 logarithm of a power of two
+fun log2_u32(n: u32) u32 {
+    var k: u32 = 0;
+    var v: u32 = n;
+    for (v > 1) { v = v >> 1; k = k + 1; }
+    ret k;
 }
 
 # the AArch64 record-at-top epilogue. it restores the callee-saved FP
@@ -3477,7 +3538,13 @@ fun save_callee_gp(st: *encode.EncodeState, f: *mir.MirFunction, store: bool) {
     # area start (anchor = 0).
     var base_reg: u32 = 29;
     var anchor: i32 = fs + 16;
-    if (f.frame.size + gp_bytes > MAX_CALLEE_SAVE_REACH) {
+    if (codegen_frame.slots_from_sp(?f.frame)) {
+        # a realigned frame's save area sits inside the region the mask aligned, which
+        # X29 no longer has a fixed distance to; anchor it on SP instead (#2735).
+        emit_add_imm(st, SCRATCH0, ZR, frame_subsize(f)::i64 - (fs + 16)::i64);
+        base_reg = SCRATCH0;
+        anchor = 0;
+    } or (f.frame.size + gp_bytes > MAX_CALLEE_SAVE_REACH) {
         emit_add_imm(st, SCRATCH0, 29, 0 - ((fs + 16)::i64));
         base_reg = SCRATCH0;
         anchor = 0;
@@ -3521,7 +3588,11 @@ fun save_callee_fp(st: *encode.EncodeState, f: *mir.MirFunction, store: bool) {
 
     var base_reg: u32 = 29;
     var anchor: i32 = fs + gp_bytes::i32 + 16;
-    if (f.frame.size + gp_bytes + fp_bytes > MAX_CALLEE_SAVE_REACH) {
+    if (codegen_frame.slots_from_sp(?f.frame)) {
+        emit_add_imm(st, SCRATCH0, ZR, frame_subsize(f)::i64 - (fs + gp_bytes::i32 + 16)::i64);
+        base_reg = SCRATCH0;
+        anchor = 0;
+    } or (f.frame.size + gp_bytes + fp_bytes > MAX_CALLEE_SAVE_REACH) {
         emit_add_imm(st, SCRATCH0, 29, 0 - ((fs + gp_bytes::i32 + 16)::i64));
         base_reg = SCRATCH0;
         anchor = 0;
@@ -3666,6 +3737,11 @@ fun encode_function_arm64(st: *encode.EncodeState, f: *mir.MirFunction) R.Result
 
     val naked: bool = f.frame.omit;
     val subsize: u32 = frame_subsize(f);
+
+    # the distance from SP to the slot region's base, stamped before any operand is
+    # resolved (`mir.MirFrame.base_dist`). on this target the base is X29, which sits
+    # exactly `subsize` above SP once the prologue has reserved.
+    f.frame.base_dist = subsize;
 
     if (encode.sink_active(?st.buf)) {
         val rh: R.Result[bool, str] = printer.note_function(?st.buf, st.interner, f);
@@ -5062,6 +5138,9 @@ fun a64_patch(st: *encode.EncodeState, patch_pos: u32, target_off: u32) R.Result
 #
 # A raw byte payload writes it exactly as it writes every other register - the compiler
 # does not decode the payload - unless the statement declared a set that omits it.
+# aarch64 measures every `{name}` from SP, realigned frame or not (#2689)
+fun a64_slot_from_sp(f: *mir.MirFunction) bool { ret true; }
+
 fun a64_writes_sp(item: *iasm.Item) bool {
     if (item.kind == iasm.AI_LABEL) { ret false; }
     if (item.kind == iasm.AI_BYTES) {
@@ -5098,6 +5177,7 @@ fun a64_grammar() iasm.Grammar {
     g.emit       = a64_emit;
     g.patch      = a64_patch;
     g.slot       = asm_slot_offset;
+    g.slot_sp    = a64_slot_from_sp;
     g.writes_sp  = a64_writes_sp;
     g.all_gp     = 0xFFFFFFFF;
     g.all_fp     = 0xFFFFFFFF;
@@ -7526,8 +7606,12 @@ test "mach.lang.target.isa.arm64.encode:inline_asm_name_local_resolves_to_a_fram
     f.frame.slot_count    = 1;
     f.frame.size          = 8192;
     f.frame.outgoing_size = 64;
+    f.frame.realign       = 0;
     f.callee_mask         = 0;
     f.callee_mask_fp      = 0;
+    # what `encode_function_arm64` stamps: the distance from SP up to X29, which is what
+    # turns a slot offset into the stack-pointer displacement a `{name}` takes.
+    f.frame.base_dist     = frame_subsize(?f);
 
     # SP = X29 - align16(8192 + 64), so the slot at X29-8192 is SP+64.
     if (frame_subsize(?f) != 8256) { bad = 1; }

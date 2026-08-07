@@ -1,22 +1,31 @@
-# assign each MIR frame slot a frame-pointer offset, size the frame, and decide
-# whether the function needs a frame at all
+# assign each MIR frame slot an offset from the slot region's base, size the frame,
+# and decide whether the function needs a frame at all - and what base it gets
 #
-# Assigns each MIR frame slot a negative offset from the frame pointer, sizes
+# Assigns each MIR frame slot a negative offset from the slot region's base, sizes
 # the frame to the ABI stack alignment, and rounds the outgoing-argument region
 # to the call-boundary alignment. The slots themselves - allocas plus the
 # small-aggregate param, aggregate-load, and aggregate-return spill slots - are
 # materialized into `mir.MirFrame` during instruction selection; this pass only
 # computes their final offsets and the total frame size.
 #
-# It then records, in `MirFrame.omit`, whether the function needs a compiler-
-# generated prologue and epilogue at all (#1940). This is the single decision
-# point for frame suppression across every target: each encoder reads the flag
-# instead of re-deriving the answer from its own copy of the rule.
+# WHAT THE BASE IS, AND WHAT IT IS ALIGNED TO. Normally the base is the frame pointer,
+# and the only alignment that reaches the frame pointer is the ABI's 16-byte call
+# boundary - so a slot offset being a multiple of 32 said nothing about the address
+# until #2735. `MirFrame.realign` records, per function, the largest slot alignment
+# above the ABI's; a function that has one gets a prologue that masks the STACK pointer
+# down to it and addresses its slot region from there instead. The frame pointer keeps
+# the caller's business - incoming stack arguments and the frame record - because after
+# a mask only one of the two pointers is still a fixed distance from the caller's stack.
+#
+# It also records, in `MirFrame.omit`, whether the function needs a compiler-
+# generated prologue and epilogue at all (#1940). Both are single decision
+# points across every target: each encoder reads the field instead of re-deriving
+# the answer from its own copy of the rule.
 #
 # Target-agnostic but for three reads through the target - the ABI stack
 # alignment, and the frame- and stack-pointer register ids the frame-reference
 # scan recognizes. The resulting offsets are consumed by the encoder when it
-# forms `[rbp + disp]` memory operands.
+# forms `[rbp + disp]` (or, in a realigned frame, `[rsp + disp]`) memory operands.
 
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -186,6 +195,47 @@ pub fun slot_offset(frame: *mir.MirFrame, v: u32, bias: i64) O.Option[i64] {
     ret O.some[i64](O.unwrap[*mir.MirSlot](opt_slot).offset - bias);
 }
 
+# look up the STACK-pointer displacement of a MIR value's slot
+#
+# The twin of `slot_offset` on the other base. A slot offset is measured from the slot
+# region's base and is negative; `MirFrame.base_dist` is how far that base sits above
+# the stack pointer, so their sum is the positive displacement from it. There is no
+# per-target bias here because `base_dist` already is the per-target part - which is the
+# point of stamping it: the two targets that address an inline-asm `{name}` from the
+# stack pointer each carried their own copy of this sum (#2689), and a realigned frame
+# needs the same number for every access, not just an asm-bound one.
+#
+# The stack pointer is fixed from prologue to epilogue - a variable-length alloca is
+# refused at lowering, the outgoing-argument region is preallocated, and an asm body that
+# writes it is refused whenever it binds a `{name}` - so this displacement is as constant
+# as the frame-pointer one.
+# ---
+# frame: the laid-out frame to search, with `base_dist` already stamped
+# v:     the MIR value id whose slot displacement is requested
+# ret:   the displacement, or none if `v` owns no frame slot
+pub fun slot_sp_offset(frame: *mir.MirFrame, v: u32) O.Option[i64] {
+    val opt_slot: O.Option[*mir.MirSlot] = slot_find(frame, v);
+    if (!O.is_some[*mir.MirSlot](opt_slot)) { ret O.none[i64](); }
+    ret O.some[i64](frame.base_dist::i64 + O.unwrap[*mir.MirSlot](opt_slot).offset);
+}
+
+# report whether the slot region is addressed from the stack pointer rather than the
+# frame pointer
+#
+# True exactly when the frame was realigned. Realigning masks the stack pointer down to
+# a boundary the caller did not promise, which makes the distance between the two
+# pointers a run-time quantity: after it, only one of them can still be a statically
+# known distance from the caller's stack. It has to be the frame pointer, because
+# incoming stack arguments and the frame record are addressed from it and both belong
+# to the caller. So the slot region moves to the stack pointer, which is the register
+# that was masked and therefore the one that carries the alignment.
+# ---
+# frame: the laid-out frame
+# ret:   true when slots, spills and the callee-save area are stack-pointer relative
+pub fun slots_from_sp(frame: *mir.MirFrame) bool {
+    ret frame.realign != 0;
+}
+
 # report whether a MIR value owns a frame slot
 # ---
 # frame: the laid-out frame to search
@@ -219,14 +269,14 @@ fun stack_align(tgt: *target.Target) u32 {
     ret tgt.abi.stack_align;
 }
 
-# lay out one function's frame: assign each slot a frame-pointer offset, size the
-# frame, and round the outgoing-argument region to the stack alignment
+# lay out one function's frame: assign each slot an offset from the slot region's
+# base, size the frame, and round the outgoing-argument region to the stack alignment
 #
-# The frame grows downward from the frame pointer:
+# The frame grows downward from the slot region's base:
 #
-#   [rbp - ..]                    locals, spills, two-register-param copies (the slots)
+#   [base - ..]                   locals, spills, two-register-param copies (the slots)
 #   ---- the slot region, rounded up to `align`, is `frame.size` ----
-#   [rbp - (frame.size + 8) ..]   callee-saved registers (reserved by the encoder)
+#   [base - (frame.size + 8) ..]  callee-saved registers (reserved by the encoder)
 #   [rsp .. rsp + outgoing_size)  outgoing call-argument region (lowest)
 #
 # The encoder reserves the callee-save and outgoing regions below `frame.size`
@@ -235,12 +285,37 @@ fun stack_align(tgt: *target.Target) u32 {
 # stack alignment keeps the encoder's RSP subtraction 16-byte aligned at every
 # call site: `frame.size` plus the callee region is aligned on its own, and a
 # 16-aligned outgoing region added below preserves the call-boundary invariant.
+#
+# WHAT THE SLOT OFFSETS ARE ALIGNED RELATIVE TO. Each offset is a multiple of its own
+# slot's alignment, which is a statement about the BASE plus the offset only if the
+# base carries that alignment too. The base is normally the frame pointer, and the only
+# alignment that reaches the frame pointer is the ABI's call-boundary minimum - 16 on
+# every target here. So a slot asking for more than 16 got an offset that was a correct
+# multiple of nothing (#2735): the address was a multiple of 32 exactly when the process
+# stack happened to start on one, which varies with the environment block and therefore
+# from run to run of the same binary.
+#
+# `frame.realign` is what closes that. When some slot needs more than the ABI gives, the
+# largest such alignment is recorded there and the function's prologue masks the STACK
+# pointer down to it, making `sp + <the target's slot-base distance>` the base every
+# offset is measured from. The stack pointer is the one that can move: it is provably
+# fixed from prologue to epilogue (a variable-length alloca is refused at lowering, an
+# asm body that writes it is refused whenever it binds a `{name}`), whereas the frame
+# pointer must stay where the ABI put it because incoming stack arguments and the frame
+# record are addressed from it. Only one of the two can sit a statically known distance
+# from the caller's stack once a mask has been applied, and it has to be the frame
+# pointer.
+#
+# The DECISION lives here and only here. Each encoder reads `frame.realign` and applies
+# it; none re-derives it from the slots, which would be a second copy of a layout policy
+# agreeing with this one by accident - the shape #2715 and #2725 both came from.
 # ---
 # func:  function to lay out; its `frame` is filled in place
 # align: stack alignment to round the frame size up to
 fun layout_function(func: *mir.MirFunction, align: u32) {
     val frame: *mir.MirFrame = ?func.frame;
     frame.align = align;
+    frame.realign = over_alignment(frame, align);
 
     var offset: i64 = 0;
 
@@ -299,6 +374,33 @@ fun layout_function(func: *mir.MirFunction, align: u32) {
         val align_mask: u32 = align - 1;
         frame.outgoing_size = (frame.outgoing_size + align_mask) & ~align_mask;
     }
+}
+
+# the alignment the slot region's base must be given, or 0 when `align` already covers
+# every slot
+#
+# The largest slot alignment in the function, reported only when it exceeds what the ABI
+# guarantees the frame pointer. Read as a whole rather than per slot: the base is one
+# address, so the strongest request in the frame is what it has to satisfy, and every
+# weaker one is satisfied by the same mask because alignments are powers of two.
+#
+# A spill slot asks with the same voice as a declared local. That is deliberate and is
+# the member this is designed against: an over-width vector spilled to the stack (#2727)
+# wants a 32-byte base for a machine reason, and it never appears in source at all.
+# ---
+# frame: the frame whose slots have been recorded (offsets need not be assigned yet)
+# align: the ABI stack alignment the frame pointer already carries
+# ret:   the required base alignment, or 0 when none exceeds `align`
+fun over_alignment(frame: *mir.MirFrame, align: u32) u32 {
+    if (frame.slots == nil) { ret 0; }
+    var most: u32 = align;
+    var i: u32 = 0;
+    for (i < frame.slot_count) {
+        if (frame.slots[i].align > most) { most = frame.slots[i].align; }
+        i = i + 1;
+    }
+    if (most <= align) { ret 0; }
+    ret most;
 }
 
 # assign `slot` the next address below `offset`, returning the new watermark
@@ -414,6 +516,8 @@ test "mach.lang.be.codegen.frame.slot_offset:alloca_and_spill_lookup" {
     frame.size          = 0;
     frame.align         = 0;
     frame.outgoing_size = 0;
+    frame.realign       = 0;
+    frame.base_dist     = 0;
 
     val opt_off10: O.Option[i64] = slot_offset(?frame, 10, 0);
     if (!O.is_some[i64](opt_off10))      { ret 1; }
@@ -654,6 +758,114 @@ test "mach.lang.be.codegen.frame.place_slot:rounds_down_without_dropping_a_unit"
     ret 0;
 }
 
+# the realignment decision is the LARGEST slot alignment above the ABI's, recorded on
+# the frame, and 0 when nothing asks for more (#2735)
+#
+# THE OFFSETS ALONE CANNOT SHOW THIS. Every offset here is a multiple of its own
+# alignment with or without the decision - they were on the bug too. What the decision
+# changes is the BASE those offsets are measured from, which is a fact about the
+# prologue, so the assertion has to be on the recorded number rather than on the layout.
+#
+# The 128 is deliberately not the last slot recorded: taking the largest means taking it
+# whatever order the slots arrive in, and a rule that read the final slot, or the first
+# over-aligned one, would pass a frame ordered the convenient way.
+test "mach.lang.be.codegen.frame.layout_function:records_the_largest_over_alignment" {
+    var instrs: [1]mir.MirInstr;
+    mk_instr(?instrs[0], mir.MIR_MOV);
+
+    var blk: mir.MirBlock;
+    var func: mir.MirFunction;
+    mk_func(?blk, ?func, ?instrs[0], 1);
+
+    var aligns: [4]u32;
+    aligns[0] = 8; aligns[1] = 128; aligns[2] = 32; aligns[3] = 8;
+
+    var slots: [4]mir.MirSlot;
+    var i: usize = 0;
+    for (i < 4) {
+        slots[i].value  = i::u32;
+        slots[i].kind   = mir.SLOT_ALLOCA;
+        slots[i].offset = 0;
+        slots[i].size   = aligns[i];
+        slots[i].align  = aligns[i];
+        i = i + 1;
+    }
+
+    func.frame.slots      = ?slots[0];
+    func.frame.slot_count = 4;
+    func.frame.slot_cap   = 4;
+
+    layout_function(?func, 16);
+    if (func.frame.realign != 128) { ret 51; }
+    if (!slots_from_sp(?func.frame)) { ret 52; }
+
+    # a frame nothing over-aligns records 0 and stays frame-pointer based, so an ordinary
+    # function emits the prologue it always did.
+    var plain: [3]mir.MirSlot;
+    var j: usize = 0;
+    for (j < 3) {
+        plain[j].value  = j::u32;
+        plain[j].kind   = mir.SLOT_ALLOCA;
+        plain[j].offset = 0;
+        plain[j].size   = 16;
+        plain[j].align  = 16;
+        j = j + 1;
+    }
+    mk_func(?blk, ?func, ?instrs[0], 1);
+    func.frame.slots      = ?plain[0];
+    func.frame.slot_count = 3;
+    func.frame.slot_cap   = 3;
+    layout_function(?func, 16);
+    if (func.frame.realign != 0)    { ret 53; }
+    if (slots_from_sp(?func.frame)) { ret 54; }
+    ret 0;
+}
+
+# a slot's stack-pointer displacement is its offset from the slot region's base plus the
+# distance the encoder stamped between that base and the stack pointer
+#
+# The two halves have to be added by one function, because a caller that took the offset
+# from here and the distance from its own arithmetic is the second copy the whole
+# `base_dist` field exists to prevent - aarch64 and riscv64 each had one (#2689).
+test "mach.lang.be.codegen.frame.slot_sp_offset:adds_the_stamped_base_distance" {
+    var slots: [2]mir.MirSlot;
+    slots[0].value  = 10;
+    slots[0].kind   = mir.SLOT_ALLOCA;
+    slots[0].offset = -32;
+    slots[0].size   = 32;
+    slots[0].align  = 32;
+
+    slots[1].value  = 20;
+    slots[1].kind   = mir.SLOT_SPILL;
+    slots[1].offset = -40;
+    slots[1].size   = 8;
+    slots[1].align  = 8;
+
+    var frame: mir.MirFrame;
+    frame.slots         = ?slots[0];
+    frame.slot_count    = 2;
+    frame.slot_cap      = 2;
+    frame.size          = 64;
+    frame.align         = 16;
+    frame.outgoing_size = 0;
+    frame.realign       = 32;
+    frame.base_dist     = 96;
+    frame.omit          = false;
+
+    val a: O.Option[i64] = slot_sp_offset(?frame, 10);
+    if (!O.is_some[i64](a))     { ret 61; }
+    if (O.unwrap[i64](a) != 64) { ret 62; }
+
+    val b: O.Option[i64] = slot_sp_offset(?frame, 20);
+    if (!O.is_some[i64](b))     { ret 63; }
+    if (O.unwrap[i64](b) != 56) { ret 64; }
+
+    # a value that owns no slot answers none rather than the base distance, which would
+    # be a plausible-looking address into the frame.
+    if (O.is_some[i64](slot_sp_offset(?frame, 99))) { ret 65; }
+    ret 0;
+}
+
 # the frame-pointer and stack-pointer register ids the omission tests use. arbitrary
 # distinct values: `omits_frame` compares operand register fields against whatever it
 # is handed, so the numbering matters only in being distinguishable from a third id
@@ -690,6 +902,8 @@ fun mk_func(blk: *mir.MirBlock, func: *mir.MirFunction, instrs: *mir.MirInstr, n
     func.frame.size          = 0;
     func.frame.align         = 16;
     func.frame.outgoing_size = 0;
+    func.frame.realign       = 0;
+    func.frame.base_dist     = 0;
     func.frame.omit          = false;
     func.callee_mask         = 0;
     func.callee_mask_fp      = 0;

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### An over-aligned stack local is over-aligned at run time (#2735)
+`#[align(32)]` and above worked on a global and did nothing on a local. The slot's offset was a correct multiple of the requested alignment, but it was measured from the frame pointer, and the only alignment that reaches the frame pointer is the ABI's 16-byte call boundary. So the address was a multiple of 32 exactly when the process stack happened to start on one — which depends on the environment block, and therefore changes between runs of the same binary. `$size_of` already reported the padded size, so the storage was sized for a promise the placement did not keep.
+
+A function whose frame contains an over-aligned slot now gets a prologue that masks the stack pointer down to the largest alignment that frame needs, and its locals, spills and callee-save area are addressed from there. The frame pointer stays exactly where the ABI put it: incoming stack arguments and the frame record hang off it and belong to the caller, and after a mask only one of the two pointers is still a fixed distance from the caller's stack. Debug info follows the same split — such a function's `DW_AT_frame_base` names the stack pointer, which is the register its recorded offsets are measured from.
+
+The decision is recorded once, on `MirFrame`, and every encoder reads it. So is the distance from the stack pointer to the slot region's base, which aarch64 and riscv64 had each been re-deriving for inline-asm `{name}` operands since #2689.
+
+The cost falls only on functions that ask: one masking instruction and up to `N - 16` bytes of frame. A function with nothing over-aligned emits a byte-identical prologue to before.
+
 #### A sub-width vector can cross a function boundary (#2687)
 4.15.0 shipped `f32x3` working inside a function and refused at every call boundary. Passing or returning one reported `CLASS_FP scalar of unsupported size`, which made the shape unusable in practice: a shader-math or vertex-building library is nothing but functions taking and returning these.
 
