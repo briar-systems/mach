@@ -85,6 +85,22 @@
 #                 nothing, so there is no binary to run and the module tree is the
 #                 artifact; the external validator is what makes this a validity
 #                 check rather than a round-trip through mach's own reader.
+#   spirv-shader— validate the module tree AND report the instructions the emitter
+#                 actually produced for it (#2688). "the validator was happy" is not
+#                 evidence that a `sqrt` became a `Sqrt`: an emitter that stopped
+#                 substituting and left an ordinary call, or one that substituted the
+#                 wrong instruction number, produces a module spirv-val accepts. so
+#                 this disassembles each module and prints every OpExtInst by SET and
+#                 INSTRUCTION NAME with its operand count, plus every core OpDot, in
+#                 emission order, alongside the module's OpExtInstImport count - which
+#                 is what makes "imported only when used" an assertion rather than a
+#                 claim. the environment is chosen PER MODULE rather than per case:
+#                 a module carrying entry points is a shader and is validated under
+#                 vulkan1.3, and one without is a library, which declares the Linkage
+#                 capability Vulkan forbids outright and is validated universally. a
+#                 case that consumes a library dependency delivers both at once, so
+#                 one environment for the whole tree cannot be right. needs spirv-val
+#                 and spirv-dis.
 #   vector-emit — disassemble the case's own objects and report, per function,
 #                 whether the compiler EMITTED packed SIMD (#2207). the observable
 #                 execution cannot produce: a vectorizer that silently stops firing
@@ -1803,6 +1819,81 @@ spirv_val_env() {
     printf 'modules=%d validator=clean\n' "$n"
 }
 
+# produce_spirv_shader <runmode> <target> <binary>
+# validate the delivered module tree and report the instructions the emitter put in
+# it.
+#
+# spirv-val alone cannot see this case's subject. A `sh.sqrt(x)` that stopped being
+# substituted and came out as an ordinary OpFunctionCall validates. One substituted
+# with the wrong instruction number validates too, as whichever instruction that
+# number names. So the observable is the disassembly, normalized: per module, the
+# number of extended sets imported, then one line per OpExtInst naming the SET it
+# indexes and the INSTRUCTION within it, and one per core OpDot, in emission order.
+# Result ids are dropped (they renumber whenever anything else in the module
+# changes); operand COUNTS are kept, because an instruction given the wrong arity is
+# the other way to be wrong here.
+#
+# The environment is per module. A module with entry points is a shader and gets the
+# strict vulkan1.3 rules; a module without them is a library, whose Linkage
+# capability Vulkan rejects outright. A case that depends on a library delivers one
+# of each, so no single environment covers the tree.
+produce_spirv_shader() {
+    out_dir=$(dirname "$3")
+    if ! command -v spirv-val >/dev/null 2>&1; then
+        echo "int: spirv-shader: the validator is not installed (spirv-tools)" >&2
+        return 2
+    fi
+    if ! command -v spirv-dis >/dev/null 2>&1; then
+        echo "int: spirv-shader: the disassembler is not installed (spirv-tools)" >&2
+        return 2
+    fi
+    n=0
+    for m in $(find "$out_dir" -name '*.spv' | sort); do
+        dis=$(spirv-dis --no-header "$m") || return 1
+        # the module's own name, relative to the output root, so the observable does
+        # not carry the mktemp path the case was built under.
+        rel=${m#"$out_dir"/}
+        if printf '%s\n' "$dis" | grep -q '^ *OpEntryPoint '; then
+            kind=shader
+            spirv-val --target-env vulkan1.3 "$m" || return 1
+            env=vulkan1.3
+        else
+            kind=library
+            spirv-val "$m" || return 1
+            env=universal
+        fi
+        imports=$(printf '%s\n' "$dis" | grep -c 'OpExtInstImport' || true)
+        printf 'module=%s kind=%s env=%s validator=clean extimports=%d\n' \
+            "$rel" "$kind" "$env" "$imports"
+        printf '%s\n' "$dis" | awk '
+            # "%29 = OpExtInstImport "GLSL.std.450"" — remember which set each id is,
+            # so an OpExtInst can be reported by set NAME rather than by an id that
+            # renumbers on every unrelated change.
+            $3 == "OpExtInstImport" {
+                name = $4; gsub(/"/, "", name)
+                setname[$1] = name
+                printf "  import %s\n", name
+                next
+            }
+            # "%28 = OpExtInst %v4float %29 Normalize %27" — result type, set id and
+            # instruction name, then the operands.
+            $3 == "OpExtInst" {
+                s = setname[$5]; if (s == "") { s = "<unimported>" }
+                printf "  extinst %s %s operands=%d\n", s, $6, NF - 6
+                next
+            }
+            # "%33 = OpDot %float %31 %32" — core, no set involved.
+            $3 == "OpDot" { printf "  core OpDot operands=%d\n", NF - 4; next }
+        '
+        n=$((n + 1))
+    done
+    if [ "$n" -eq 0 ]; then
+        echo "int: spirv-shader: the build delivered no .spv module" >&2
+        return 2
+    fi
+    printf 'modules=%d\n' "$n"
+}
+
 # resolve_dwarfdump — print an llvm-dwarfdump on PATH, preferring the unversioned
 # name and falling back to the highest-versioned one (ubuntu ships llvm-dwarfdump-NN).
 # empty output (return 1) when none is installed.
@@ -2305,6 +2396,7 @@ produce() {
         debuginfo)   produce_debuginfo "$@" ;;
         spirv-val)   produce_spirv_val "$@" ;;
         spirv-val-vulkan) produce_spirv_val_vulkan "$@" ;;
+        spirv-shader) produce_spirv_shader "$@" ;;
         vector-emit) produce_vector_emit "$@" ;;
         vector-lanes) produce_vector_lanes "$@" ;;
         frame-elision) produce_frame_elision "$@" ;;

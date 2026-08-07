@@ -45,6 +45,7 @@ A decorator is written as an attribute:
 #[builtin("name")]   # pipeline built-in variable (global only)
 #[uniform(set, bnd)] # descriptor-bound uniform block, read-only (global only)
 #[storage(set, bnd)] # descriptor-bound storage buffer, read-write (global only)
+#[spirv_op(set,name)] # the SPIR-V instruction this function is (fun only)
 ```
 
 Decorators appear **before** the declaration they target, one per line or
@@ -482,6 +483,59 @@ target that forms pipeline stages. On `spirv` each becomes an `OpVariable` in th
 matching storage class, carrying the matching decoration, and the Input and Output
 variables are named in every entry point's interface list.
 
+### `spirv_op(set, name)` — a function that *is* a SPIR-V instruction
+
+A shader needs `sqrt`, `normalize`, `dot` and `mix`. None of them is an operator,
+and none of them is a call SPIR-V can make: each is one instruction. This directive
+says which one a function is, so that on a `spirv` target a call to it becomes that
+instruction, inline, rather than a call.
+
+```mach
+#[spirv_op("GLSL.std.450", "Sqrt")]
+pub fun sqrt(x: f32) f32;
+
+#[spirv_op("GLSL.std.450", "Normalize")]
+pub fun normalize(v: f32x4) f32x4;
+
+#[spirv_op("core", "OpDot")]
+pub fun dot(a: f32x4, b: f32x4) f32;
+```
+
+The first argument names the instruction set and the second the instruction within
+it. Both value sets are closed and checked at compile time, on **every** target —
+the directive is legal everywhere, so a typo caught only where it is acted on would
+go unreported on a CPU build.
+
+| Set              | Meaning                                                     |
+|------------------|-------------------------------------------------------------|
+| `"core"`         | the core opcode space; needs no import                       |
+| `"GLSL.std.450"` | the standard extended set; imported once per module, on use  |
+
+The substitution is uniform: the emitted instruction's **result type is the
+function's declared return type** and its **operands are the function's parameters
+in declaration order**. That is what lets `dot` and `length` return a scalar from
+vectors, and `refract` mix a scalar operand with vector ones, without any of them
+being a special case.
+
+`OpExtInstImport "GLSL.std.450"` is emitted **once per module and only when that
+module uses the set**. A module that calls none of these carries no import.
+
+Note that `dot` is **core `OpDot`**, not a GLSL.std.450 instruction, even though
+GLSL spells it beside `normalize` and `length`. Check each function against the
+specification rather than against GLSL's surface.
+
+On every target other than `spirv` the directive is inert, and a decorated function
+is an ordinary function. A **bodiless** one — which is what the shader-side maths
+library uses — is then an undefined symbol, so a CPU build that calls it fails at
+link time naming the symbol. That is a deliberate design choice on the library's
+part, not a property of the directive: a decorated function may have a body, and if
+it does, that body is what every non-`spirv` target runs while `spirv` substitutes
+the instruction. A `spirv` build never emits the body at all.
+
+The set of accepted instruction names is a table in `mach.lang.spirvop`, which also
+records why each omission from GLSL.std.450 is one. Adding an instruction is a row
+in it.
+
 ## Applicability
 
 | Directive   | `fun` | `ext fun` | `val` / `var` | `rec` / `uni` |
@@ -503,6 +557,7 @@ variables are named in every entry point's interface list.
 | `builtin`   |  no   |    no     |      yes      |      no       |
 | `uniform`   |  no   |    no     |      yes      |      no       |
 | `storage`   |  no   |    no     |      yes      |      no       |
+| `spirv_op`  |  yes  |    no     |      no       |      no       |
 
 The `val` / `var` column is shared, but `embed` accepts only `val` — a `var`
 is refused (see [`embed`](#embedstr--compile-time-file-embedding) above).
@@ -518,5 +573,5 @@ The set is closed. New directives require a compiler change.
 - [asm.md](asm.md) — inline `asm`, the only body a `naked` function may have
 - [val-var.md](val-var.md) — `val` / `var` bindings, and the `embed` exemption to `val`'s initializer requirement
 - [grammar.md](grammar.md#types) — the `[_]` inferred array length `embed` introduces
-- [types.md](types.md) — the SIMD vector types a shader stage computes over
+- [types.md](types.md) — the SIMD vector types a shader stage computes over and `spirv_op` operates on
 - [../manifest.md](../manifest.md) — the `vectorize` profile key `scalar` opts out of, and content-fingerprinted build inputs (`embed`, `[step]` `in`)
