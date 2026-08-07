@@ -2195,9 +2195,119 @@ fun section_group_add(alloc: *A.Allocator, g: *SectionGroups, slot: u32,
 # sec_base:     per-module prefix offset into the flat placement array
 # groups:       out - the planned groups
 # ret:          ok(true) on success, or an error string
+# sentinel `dup_of` entry: the section owns its own placement
+val EMBED_OWNS: u32 = 0xFFFFFFFF;
+
+# whether an input section is an embed atom eligible to share another's placement
+#
+# The `SEC_FLAG_EMBED` marker is the whole authority: an ordinary global's address
+# is observably its own, so nothing else may coalesce however identical its bytes
+# (#2541). Two further conditions are the writer's, not the marker's. A section
+# carrying relocations is refused, because byte-identical content does not imply
+# identical relocation targets and the surviving copy would be patched for the
+# wrong module. A section the atom planner has shortened is refused, because the
+# bytes compared below are no longer the bytes emitted
+# ---
+# modules: the input image array
+# m:       the owning module index
+# sc:      the section index within that module
+# atoms:   the atom plan, for the section's live contribution length
+# flat:    the section's flat placement index
+# ret:     true when the section may take part in embed coalescing
+fun embed_atom_eligible(modules: *of.ObjectImage, m: u32, sc: u32,
+                        atoms: *AtomPlan, flat: u32) bool {
+    val sec: *of.Section = ?modules[m].sections[sc];
+    if ((sec.flags & of.SEC_FLAG_EMBED) == 0)      { ret false; }
+    if (!is_loadable_kind(sec.kind))               { ret false; }
+    if (atom_live_len(atoms, flat, sec.len) != sec.len) { ret false; }
+    var ri: u32 = 0;
+    for (ri < modules[m].reloc_count) {
+        if (modules[m].relocations[ri].section == sc) { ret false; }
+        ri = ri + 1;
+    }
+    ret true;
+}
+
+# whether two embed atoms may share one placement
+#
+# Everything that makes the two placements interchangeable has to match, not just
+# the bytes: the section name and kind decide where the content lands, and the
+# alignment decides what the surviving placement guarantees - a stricter second
+# atom sharing a weaker first one would silently inherit the weaker guarantee
+# ---
+# a: the earlier atom
+# b: the candidate that would share its placement
+# ret: true when one placement serves both
+fun embed_atoms_match(a: *of.Section, b: *of.Section) bool {
+    if (a.name != b.name || a.kind != b.kind) { ret false; }
+    if (a.len != b.len || a.align != b.align) { ret false; }
+    if (a.len == 0)                           { ret true; }
+    if (a.bytes == nil || b.bytes == nil)     { ret false; }
+    ret memory.raw_equal(a.bytes::ptr, b.bytes::ptr, a.len::usize);
+}
+
+# decide, for every input section, whether it shares an earlier section's placement
+#
+# Byte-identical `#[embed]` content declared by two MODULES of one artifact must
+# occupy one final placement, so that the two symbols compare equal - #2518
+# deduplicated only within a module, and the linker is the first place that sees
+# them all (#2541). The first atom of a given content owns the placement and every
+# later match points at it; the merge then contributes the winner's bytes once and
+# resolves every alias to its address.
+#
+# The result is consulted by both merge passes, so the measuring pass and the
+# placing pass can never disagree about which sections carry bytes
+# ---
+# alloc:        allocator backing the returned array
+# modules:      the input image array
+# module_count: number of input images
+# sec_base:     per-module prefix offset into the flat placement array
+# sec_total:    total number of input sections
+# atoms:        the atom plan
+# ret:          per-flat-section winner index, or EMBED_OWNS; freed by the caller
+fun plan_embed_coalescing(alloc: *A.Allocator, modules: *of.ObjectImage, module_count: u32,
+                          sec_base: *u32, sec_total: u32,
+                          atoms: *AtomPlan) R.Result[*u32, str] {
+    if (sec_total == 0) { ret R.ok[*u32, str](nil); }
+    val ar: R.Result[*u32, str] = A.allocate[u32](alloc, sec_total::usize);
+    if (R.is_err[*u32, str](ar)) { ret ar; }
+    val dup: *u32 = R.unwrap_ok[*u32, str](ar);
+    var i: u32 = 0;
+    for (i < sec_total) { dup[i] = EMBED_OWNS; i = i + 1; }
+
+    var m: u32 = 0;
+    for (m < module_count) {
+        var sc: u32 = 0;
+        for (sc < modules[m].section_count) {
+            val flat: u32 = sec_base[m] + sc;
+            if (!embed_atom_eligible(modules, m, sc, atoms, flat)) { sc = sc + 1; cnt; }
+            val sec: *of.Section = ?modules[m].sections[sc];
+
+            # the earliest matching atom owns the placement, so the scan stops at the
+            # first hit and a chain of duplicates all point at one winner.
+            var wm: u32 = 0;
+            for (wm <= m && dup[flat] == EMBED_OWNS) {
+                var wc: u32 = 0;
+                for (wc < modules[wm].section_count && dup[flat] == EMBED_OWNS) {
+                    val wflat: u32 = sec_base[wm] + wc;
+                    if (wflat >= flat)                                          { wc = wc + 1; cnt; }
+                    if (dup[wflat] != EMBED_OWNS)                               { wc = wc + 1; cnt; }
+                    if (!embed_atom_eligible(modules, wm, wc, atoms, wflat))    { wc = wc + 1; cnt; }
+                    if (embed_atoms_match(?modules[wm].sections[wc], sec))      { dup[flat] = wflat; }
+                    wc = wc + 1;
+                }
+                wm = wm + 1;
+            }
+            sc = sc + 1;
+        }
+        m = m + 1;
+    }
+    ret R.ok[*u32, str](dup);
+}
+
 fun plan_section_groups(alloc: *A.Allocator, modules: *of.ObjectImage, module_count: u32,
                         merged: *MergedSection, atoms: *AtomPlan, sec_base: *u32,
-                        groups: *SectionGroups) R.Result[bool, str] {
+                        dup: *u32, groups: *SectionGroups) R.Result[bool, str] {
     var m: u32 = 0;
     for (m < module_count) {
         var sc: u32 = 0;
@@ -2205,6 +2315,9 @@ fun plan_section_groups(alloc: *A.Allocator, modules: *of.ObjectImage, module_co
             val sec: *of.Section = ?modules[m].sections[sc];
             if (sec.kind::u32 >= MERGED_KIND_COUNT) { sc = sc + 1; cnt; }
             if (!is_loadable_kind(sec.kind))        { sc = sc + 1; cnt; }
+            # a coalesced embed atom contributes no bytes: it takes the placement the
+            # winner already measured into this group.
+            if (dup != nil && dup[sec_base[m] + sc] != EMBED_OWNS) { sc = sc + 1; cnt; }
 
             val slot: u32 = sec.kind::u32;
             var gi: u32 = section_group_index(groups, slot, sec.name);
@@ -3229,8 +3342,18 @@ fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_co
     # below fixes each group's offset; the loop then replays the same arithmetic
     # per member from the group's cursor.
     fill_section_bases(modules, module_count, sec_base);
+    var sec_total: u32 = 0;
+    var tm: u32 = 0;
+    for (tm < module_count) { sec_total = sec_total + modules[tm].section_count; tm = tm + 1; }
+    val dr: R.Result[*u32, str] =
+        plan_embed_coalescing(s.alloc, modules, module_count, sec_base, sec_total, atoms);
+    if (R.is_err[*u32, str](dr)) { ret R.err[bool, str](R.unwrap_err[*u32, str](dr)); }
+    val dup: *u32 = R.unwrap_ok[*u32, str](dr);
+    fin {
+        if (dup != nil && sec_total > 0) { A.deallocate[u32](s.alloc, dup, sec_total::usize); }
+    }
     val gp: R.Result[bool, str] =
-        plan_section_groups(s.alloc, modules, module_count, merged, atoms, sec_base, groups);
+        plan_section_groups(s.alloc, modules, module_count, merged, atoms, sec_base, dup, groups);
     if (R.is_err[bool, str](gp)) { ret R.err[bool, str](R.unwrap_err[bool, str](gp)); }
 
     # .debug_abbrev is byte-identical across every module (a deterministic, complete
@@ -3296,6 +3419,13 @@ fun accumulate_sections(s: *session.Session, modules: *of.ObjectImage, module_co
                 placements[flat].merged_index = ki;
                 placements[flat].offset       = 0;
                 placements[flat].vaddr        = 0;
+            }
+            or (dup != nil && dup[flat] != EMBED_OWNS) {
+                # a coalesced embed atom shares the winning atom's placement, so every
+                # symbol defined in it resolves to that address and its bytes are
+                # written once. the winner has a lower flat index, so its placement is
+                # already final by the time this runs.
+                placements[flat] = placements[dup[flat]];
             }
             or {
                 var a: u32 = sec.align;
@@ -8399,6 +8529,120 @@ fun lt_fixed16_is(buf: *u8, off: usize, name: str) bool {
 # The plain `.data` inputs still merge together and still come out spelled `__data`,
 # the Mach-O canonical name for their kind - identity is preserved for a name that
 # CARRIES identity, not invented for one that does not.
+# fill one test embed section
+fun lt_embed_sec(sec: *of.Section, name: intern.StrId, kind: of.SectionKind,
+                 bytes: *u8, len: u32, align: u32, embed: bool) {
+    sec.name  = name;
+    sec.kind  = kind;
+    sec.bytes = bytes;
+    sec.len   = len;
+    sec.align = align;
+    sec.flags = 0;
+    if (embed) { sec.flags = of.SEC_FLAG_EMBED; }
+}
+
+# byte-identical `#[embed]` atoms in different modules share one placement, and
+# everything that is not a byte-identical embed atom keeps its own (#2541)
+#
+# The whole risk of this feature is over-merging. An ordinary global's address is
+# observably its own, so `?A == ?B` becoming true is a miscompile, not an
+# optimization - which is why the marker, and not byte equality, is the authority.
+# The cases below are the ways two sections can look alike and still have to stay
+# apart: same bytes but not marked, different bytes, a stricter alignment (the
+# second atom would silently inherit the first's weaker guarantee), a different
+# section name or kind (the content would land somewhere else), and a section
+# carrying a relocation (identical bytes do not imply identical relocation targets,
+# so the survivor would be patched for the wrong module).
+test "mach.lang.be.linker.plan_embed_coalescing:only_matching_embed_atoms" {
+    var alloc: A.Allocator;
+    page.make(?alloc);
+    val sr: R.Result[session.Session, str] = session.init(?alloc);
+    if (R.is_err[session.Session, str](sr)) { ret 1; }
+    var s: session.Session = R.unwrap_ok[session.Session, str](sr);
+
+    val rodata: intern.StrId = lt_name(?s, ".rodata");
+    val other:  intern.StrId = lt_name(?s, ".rodata.assets");
+    if (rodata == intern.STR_NIL || other == intern.STR_NIL) { ret 1; }
+
+    var abc: [4]u8;
+    var xyz: [4]u8;
+    var i: u32 = 0;
+    for (i < 4) { abc[i] = 0xA0 + i::u8; xyz[i] = 0xF0 + i::u8; i = i + 1; }
+
+    # module 0 owns the content; module 1 declares six lookalikes of which only the
+    # first is a genuine duplicate.
+    var secs0: [1]of.Section;
+    lt_embed_sec(?secs0[0], rodata, of.SK_RODATA, ?abc[0], 4, 8, true);
+
+    var secs1: [6]of.Section;
+    lt_embed_sec(?secs1[0], rodata, of.SK_RODATA, ?abc[0], 4, 8,  true);   # the duplicate
+    lt_embed_sec(?secs1[1], rodata, of.SK_RODATA, ?abc[0], 4, 8,  false);  # not marked
+    lt_embed_sec(?secs1[2], rodata, of.SK_RODATA, ?xyz[0], 4, 8,  true);   # different bytes
+    lt_embed_sec(?secs1[3], rodata, of.SK_RODATA, ?abc[0], 4, 64, true);   # stricter alignment
+    lt_embed_sec(?secs1[4], other,  of.SK_RODATA, ?abc[0], 4, 8,  true);   # different section
+    lt_embed_sec(?secs1[5], rodata, of.SK_DATA,   ?abc[0], 4, 8,  true);   # different kind
+
+    var mods: [2]of.ObjectImage;
+    mods[0] = lt_image(?s, lt_name(?s, "m0"), ?secs0[0], 1, nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+    mods[1] = lt_image(?s, lt_name(?s, "m1"), ?secs1[0], 6, nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+
+    var sec_base: [2]u32;
+    sec_base[0] = 0;
+    sec_base[1] = 1;
+
+    val dr: R.Result[*u32, str] =
+        plan_embed_coalescing(?alloc, ?mods[0], 2, ?sec_base[0], 7, nil::*AtomPlan);
+    if (R.is_err[*u32, str](dr)) { ret 1; }
+    val dup: *u32 = R.unwrap_ok[*u32, str](dr);
+
+    # the owner keeps its own placement, and only the true duplicate points at it.
+    if (dup[0] != EMBED_OWNS) { ret 1; }
+    if (dup[1] != 0)          { ret 1; }
+    i = 2;
+    for (i < 7) {
+        if (dup[i] != EMBED_OWNS) { ret 1; }
+        i = i + 1;
+    }
+    A.deallocate[u32](?alloc, dup, 7::usize);
+
+    # a third module repeating the content joins the same winner rather than chaining
+    # onto the second module's duplicate, so every alias resolves to one address.
+    var secs2: [1]of.Section;
+    lt_embed_sec(?secs2[0], rodata, of.SK_RODATA, ?abc[0], 4, 8, true);
+    var mods3: [3]of.ObjectImage;
+    mods3[0] = mods[0];
+    mods3[1] = mods[1];
+    mods3[2] = lt_image(?s, lt_name(?s, "m2"), ?secs2[0], 1, nil::*of.Symbol, 0, nil::*of.Relocation, 0);
+    var base3: [3]u32;
+    base3[0] = 0; base3[1] = 1; base3[2] = 7;
+    val dr3: R.Result[*u32, str] =
+        plan_embed_coalescing(?alloc, ?mods3[0], 3, ?base3[0], 8, nil::*AtomPlan);
+    if (R.is_err[*u32, str](dr3)) { ret 1; }
+    val dup3: *u32 = R.unwrap_ok[*u32, str](dr3);
+    if (dup3[7] != 0) { ret 1; }
+    A.deallocate[u32](?alloc, dup3, 8::usize);
+
+    # a relocation inside an atom takes it out of the running entirely: byte-identical
+    # content can still point at different targets.
+    var relocs: [1]of.Relocation;
+    relocs[0].section = 0; relocs[0].offset = 0; relocs[0].kind = of.RK_ABS64;
+    relocs[0].sym = of.SYMBOL_NONE; relocs[0].addend = 0;
+    var mods_r: [2]of.ObjectImage;
+    mods_r[0] = mods[0];
+    mods_r[1] = lt_image(?s, lt_name(?s, "m1r"), ?secs1[0], 1, nil::*of.Symbol, 0, ?relocs[0], 1);
+    var base_r: [2]u32;
+    base_r[0] = 0; base_r[1] = 1;
+    val drr: R.Result[*u32, str] =
+        plan_embed_coalescing(?alloc, ?mods_r[0], 2, ?base_r[0], 2, nil::*AtomPlan);
+    if (R.is_err[*u32, str](drr)) { ret 1; }
+    val dupr: *u32 = R.unwrap_ok[*u32, str](drr);
+    if (dupr[1] != EMBED_OWNS) { ret 1; }
+    A.deallocate[u32](?alloc, dupr, 2::usize);
+
+    session.dnit(?s);
+    ret 0;
+}
+
 test "mach.lang.be.linker.link_modules:input_section_names_survive" {
     var reg: target.TargetRegistry = target.registry_init();
     if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
