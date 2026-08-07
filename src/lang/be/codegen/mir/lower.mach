@@ -2372,8 +2372,8 @@ fun lower_load(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
     # the mirror of the store: a vector narrower than its register cannot be read in
     # one access either, and over-reading to the register's width would fault at a
     # page boundary rather than merely read rubbish.
-    if (acc_w != reg_w) {
-        ret load_subwidth_vector(ctx, mb, inst, ops[0], ops[1], acc_w, reg_w);
+    if (lctx.subwidth_vector_memory(ctx, inst.ty)) {
+        ret lctx.load_subwidth_vector(ctx, mb, ops[0], ops[1], inst.ty);
     }
     var mi: mir.MirInstr = mir.instr(mir.MIR_LOAD, ops, 2,
                                      lctx.clamp_alu_width(ctx.tgt.model.gpr_width, reg_w), acc_w);
@@ -2446,192 +2446,11 @@ fun lower_store(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction
     # a sub-register-width vector cannot be stored in one access: the register is
     # wider than the object, and writing the register's width overruns the
     # neighbour.
-    if (st_w != src_w) {
-        ret store_subwidth_vector(ctx, mb, inst, ops[0], ops[1], st_w, src_w);
+    if (lctx.subwidth_vector_memory(ctx, inst.operands[0].ty)) {
+        ret lctx.store_subwidth_vector(ctx, mb, ops[0], ops[1], inst.operands[0].ty);
     }
     var mi: mir.MirInstr = mir.instr(mir.MIR_STORE, ops, 2, st_w, src_w);
     ret lctx.push_instr(ctx, mb, mi);
-}
-
-# store a vector whose memory footprint is narrower than its register (#2697)
-#
-# `i32x3` is 16 bytes in a vector register and 12 in memory. Neither width alone is
-# a legal store: at 16 it overruns whatever follows the object - `rec Packed { v:
-# i32x3; guard: i32; }` reads `guard` back as 0 - and at 12 no ISA here can issue
-# the access in one go.
-#
-# So the register is spilled WHOLE to a scratch slot of its own full width, and the
-# object's own bytes are then copied out of that scratch with the same 8/4/2/1
-# chunk walk `lower_store_aggregate` uses. That walk already runs on every target
-# and is exercised by every aggregate copy, so this adds no new expansion.
-#
-# WHY NOT A DIRECT 8 + 4. It does not generalize. The tail would have to come out of
-# the vector register as lane extracts, and the chunk boundaries do not fall on lane
-# boundaries for every shape: `i16x7` is 14 bytes, whose tail after an 8-byte chunk
-# is 6 bytes spanning lanes 4 through 6, and a 4-byte chunk of it is half of one
-# lane and half of another. The scratch round trip is uniform across every shape,
-# which is what makes it the mechanism rather than the fallback. A direct
-# lane-aligned store for the shapes that admit one is a follow-on.
-#
-# ALIGNMENT is not assumed: the chunk walk is the same one aggregates of every
-# alignment already use, and a sub-width vector aligns to one lane (#2695), so the
-# destination can be as weakly aligned as 1. OVERLAP cannot arise: the source is a
-# scratch slot minted here and dead after, so it aliases nothing the caller named.
-# ---
-# ctx:   the per-function lowering context
-# mb:    the destination MIR block
-# inst:  the IR OP_STORE instruction
-# dest:  the already-lowered destination memory operand
-# value: the already-lowered stored value operand
-# mem_w: the object's footprint in bytes
-# reg_w: the vector register's width in bytes
-# ret:   true on success, or a lowering / allocation error
-fun store_subwidth_vector(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
-                          dest: mir.MirOperand, value: mir.MirOperand,
-                          mem_w: u8, reg_w: u8) R.Result[bool, str] {
-    # the scratch is the REGISTER's width and the vector's own alignment, so the
-    # whole-register spill into it is a legal aligned access.
-    val align: u32 = ir_type.byte_align(ctx.types, inst.operands[0].ty, ctx.tgt);
-    val skr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-    if (R.is_err[u32, str](skr)) { ret R.err[bool, str](R.unwrap_err[u32, str](skr)); }
-    val sk: u32 = R.unwrap_ok[u32, str](skr);
-    val ar: R.Result[bool, str] = lctx.add_alloca_slot(ctx, sk, reg_w::u64, align, inst.operands[0].ty::u32);
-    if (R.is_err[bool, str](ar)) { ret ar; }
-
-    # spill the register whole into the scratch.
-    val spr: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-    if (R.is_err[*mir.MirOperand, str](spr)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](spr)); }
-    val spops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](spr);
-    spops[0] = mir.op_mem_slot(sk, 0);
-    spops[1] = value;
-    var sp: mir.MirInstr = mir.instr(mir.MIR_STORE, spops, 2, reg_w, reg_w);
-    sp.vec_lane = lctx.vec_lane_for_type(ctx, inst.operands[0].ty);
-    val psp: R.Result[bool, str] = lctx.push_instr(ctx, mb, sp);
-    if (R.is_err[bool, str](psp)) { ret psp; }
-
-    # copy the object's own bytes out of the scratch, 8/4/2/1 at a time.
-    var off: i64 = 0;
-    for (off::u32 < mem_w::u32) {
-        val remaining: u32 = mem_w::u32 - off::u32;
-        var chunk: u8 = 1;
-        if (remaining >= 8) { chunk = 8; }
-        or (remaining >= 4) { chunk = 4; }
-        or (remaining >= 2) { chunk = 2; }
-
-        val tr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-        if (R.is_err[u32, str](tr)) { ret R.err[bool, str](R.unwrap_err[u32, str](tr)); }
-        val tmp: u32 = R.unwrap_ok[u32, str](tr);
-
-        val ldr: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-        if (R.is_err[*mir.MirOperand, str](ldr)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](ldr)); }
-        val ldops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ldr);
-        ldops[0] = mir.op_vreg(tmp);
-        ldops[1] = mir.op_mem_slot(sk, off);
-        var ld: mir.MirInstr = mir.instr(mir.MIR_LOAD, ldops, 2, chunk, chunk);
-        val pl: R.Result[bool, str] = lctx.push_instr(ctx, mb, ld);
-        if (R.is_err[bool, str](pl)) { ret pl; }
-
-        val st: R.Result[bool, str] = lctx.push_store_chunk(ctx, mb, mem_at(dest, off), mir.op_vreg(tmp), chunk);
-        if (R.is_err[bool, str](st)) { ret st; }
-
-        off = off + chunk::i64;
-    }
-    ret R.ok[bool, str](true);
-}
-
-# load a vector whose memory footprint is narrower than its register (#2697)
-#
-# The mirror of `store_subwidth_vector`, and it exists for a sharper reason than
-# symmetry: reading a 12-byte object at the register's 16 bytes is not merely
-# sloppy, it reads 4 bytes the object does not own and FAULTS when the object ends
-# at a page boundary. So the object's own bytes are gathered into a scratch slot of
-# the register's full width with the same 8/4/2/1 chunk walk, and the vector is then
-# loaded whole out of the scratch.
-#
-# The scratch is zeroed first, so the bytes past the object's footprint are a
-# defined 0 rather than whatever the frame held. Those lanes are never read by
-# well-typed code - the type has no lane there - but leaving stack residue in a
-# register is how a value that is merely unused becomes a value that leaks.
-# ---
-# ctx:   the per-function lowering context
-# mb:    the destination MIR block
-# inst:  the IR OP_LOAD instruction
-# dst:   the already-lowered destination register operand
-# src:   the already-lowered source memory operand
-# mem_w: the object's footprint in bytes
-# reg_w: the vector register's width in bytes
-# ret:   true on success, or a lowering / allocation error
-fun load_subwidth_vector(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instruction,
-                         dst: mir.MirOperand, src: mir.MirOperand,
-                         mem_w: u8, reg_w: u8) R.Result[bool, str] {
-    val align: u32 = ir_type.byte_align(ctx.types, inst.ty, ctx.tgt);
-    val skr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-    if (R.is_err[u32, str](skr)) { ret R.err[bool, str](R.unwrap_err[u32, str](skr)); }
-    val sk: u32 = R.unwrap_ok[u32, str](skr);
-    val ar: R.Result[bool, str] = lctx.add_alloca_slot(ctx, sk, reg_w::u64, align, inst.ty::u32);
-    if (R.is_err[bool, str](ar)) { ret ar; }
-
-    # clear the whole scratch, so the lanes past the object's footprint are a
-    # defined zero rather than frame residue.
-    var zoff: i64 = 0;
-    for (zoff::u32 < reg_w::u32) {
-        val zr: u32 = reg_w::u32 - zoff::u32;
-        var zc: u8 = 1;
-        if (zr >= 8) { zc = 8; } or (zr >= 4) { zc = 4; } or (zr >= 2) { zc = 2; }
-        val zs: R.Result[bool, str] = lctx.push_store_chunk(ctx, mb, mir.op_mem_slot(sk, zoff), mir.op_imm(0), zc);
-        if (R.is_err[bool, str](zs)) { ret zs; }
-        zoff = zoff + zc::i64;
-    }
-
-    # gather the object's own bytes into the scratch.
-    var off: i64 = 0;
-    for (off::u32 < mem_w::u32) {
-        val remaining: u32 = mem_w::u32 - off::u32;
-        var chunk: u8 = 1;
-        if (remaining >= 8) { chunk = 8; }
-        or (remaining >= 4) { chunk = 4; }
-        or (remaining >= 2) { chunk = 2; }
-
-        val tr: R.Result[u32, str] = lctx.new_vreg(ctx, mir.REG_CLASS_GP);
-        if (R.is_err[u32, str](tr)) { ret R.err[bool, str](R.unwrap_err[u32, str](tr)); }
-        val tmp: u32 = R.unwrap_ok[u32, str](tr);
-
-        val ldr: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-        if (R.is_err[*mir.MirOperand, str](ldr)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](ldr)); }
-        val ldops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](ldr);
-        ldops[0] = mir.op_vreg(tmp);
-        ldops[1] = mem_at(src, off);
-        var ld: mir.MirInstr = mir.instr(mir.MIR_LOAD, ldops, 2, chunk, chunk);
-        val pl: R.Result[bool, str] = lctx.push_instr(ctx, mb, ld);
-        if (R.is_err[bool, str](pl)) { ret pl; }
-
-        val st: R.Result[bool, str] = lctx.push_store_chunk(ctx, mb, mir.op_mem_slot(sk, off), mir.op_vreg(tmp), chunk);
-        if (R.is_err[bool, str](st)) { ret st; }
-
-        off = off + chunk::i64;
-    }
-
-    # read the vector out whole.
-    val fr: R.Result[*mir.MirOperand, str] = A.allocate[mir.MirOperand](ctx.alloc, 2::usize);
-    if (R.is_err[*mir.MirOperand, str](fr)) { ret R.err[bool, str](R.unwrap_err[*mir.MirOperand, str](fr)); }
-    val fops: *mir.MirOperand = R.unwrap_ok[*mir.MirOperand, str](fr);
-    fops[0] = dst;
-    fops[1] = mir.op_mem_slot(sk, 0);
-    var fi: mir.MirInstr = mir.instr(mir.MIR_LOAD, fops, 2, reg_w, reg_w);
-    fi.vec_lane = lctx.vec_lane_for_type(ctx, inst.ty);
-    ret lctx.push_instr(ctx, mb, fi);
-}
-
-# the same memory operand displaced by `off`
-# ---
-# m:   the base memory operand
-# off: the byte displacement to add
-# ret: the displaced operand
-fun mem_at(m: mir.MirOperand, off: i64) mir.MirOperand {
-    var o: mir.MirOperand = m;
-    if (o.kind == mir.MIR_OP_MEM) { o.imm = o.imm + off; ret o; }
-    if (o.kind == mir.MIR_OP_SYM) { o.sym_off = o.sym_off + off::i32; ret o; }
-    ret o;
 }
 
 # expand an OP_STORE of an aggregate into a memcpy between two storage pointers
@@ -2652,15 +2471,7 @@ fun lower_store_aggregate(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.I
     val size: u32 = ir_type.byte_size(ctx.types, inst.operands[0].ty, ctx.tgt);
     var off: i64 = 0;
     for (off::u32 < size) {
-        val remaining: u32 = size - off::u32;
-        var chunk: u8 = 1;
-        if (remaining >= 8) {
-            chunk = 8;
-        } or (remaining >= 4) {
-            chunk = 4;
-        } or (remaining >= 2) {
-            chunk = 2;
-        }
+        val chunk: u8 = lctx.copy_chunk_width((size - off::u32)::u64);
 
         val src: mir.MirOperand = agg_pointer_mem(ctx, inst.operands[0], off);
         val dst: mir.MirOperand = agg_pointer_mem(ctx, inst.operands[1], off);
@@ -2729,15 +2540,7 @@ fun lower_memzero(ctx: *lctx.LowerCtx, mb: *mir.MirBlock, inst: *instr.Instructi
 
     var off: i64 = 0;
     for (off::u32 < size) {
-        val remaining: u32 = size - off::u32;
-        var chunk: u8 = 1;
-        if (remaining >= 8) {
-            chunk = 8;
-        } or (remaining >= 4) {
-            chunk = 4;
-        } or (remaining >= 2) {
-            chunk = 2;
-        }
+        val chunk: u8 = lctx.copy_chunk_width((size - off::u32)::u64);
 
         val dst: mir.MirOperand = agg_pointer_mem(ctx, inst.operands[0], off);
         val st: R.Result[bool, str] = lctx.push_store_chunk(ctx, mb, dst, mir.op_imm(0), chunk);
