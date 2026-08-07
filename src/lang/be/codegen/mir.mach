@@ -654,14 +654,13 @@ pub rec MirInstr {
     dbg_binding_count: u32;
     inline_site:       u32;
 
-    # the 128-bit vector lane descriptor for a vector-typed op (#1965), or 0 for a
-    # non-vector instruction. `width` alone is 16 for every vector, so it cannot
-    # distinguish the ten shapes; this carries the lane element kind + byte-width the
-    # backend selectors need to pick a NEON arrangement / SSE packed form. built in
-    # the shared MIR lowering from the operand's IRT_VECTOR type (`vec_lane_make`),
-    # read target-locally by each backend's isel. stamped at the push_instr
-    # chokepoint like `loc`, so non-vector code is unaffected.
-    vec_lane:          u8;
+    # the vector lane descriptor for a vector-typed op (#1965), or 0 for a non-vector
+    # instruction. `width` cannot say what a vector's lanes are, so this carries the
+    # whole shape: the lane element kind, the lane byte-width, and the LANE COUNT.
+    # built in the shared MIR lowering from the operand's IRT_VECTOR type
+    # (`vec_lane_make`), read target-locally by each backend's isel. stamped at the
+    # push_instr chokepoint like `loc`, so non-vector code is unaffected.
+    vec_lane:          u32;
 
     # constant-time SEED: true when this is a store / memzero writing SECRET storage
     # (#1646), forwarded once at lowering from the IR store's destination secrecy. The
@@ -740,32 +739,51 @@ pub fun instr_like(src: *MirInstr, operands: *MirOperand, operand_count: u32) Mi
 # lane-descriptor field: it rides the consuming opcode (a signed vs unsigned
 # compare, an SMOV vs UMOV lane read), consistent with IRT_INT holding no
 # signedness of its own
-pub val VEC_LANE_NONE:  u8 = 0;
-pub val VEC_LANE_FLOAT: u8 = 1;  # float lanes  (f32x4 / f64x2)
-pub val VEC_LANE_INT:   u8 = 2;  # integer lanes (i*/u*; the opcode carries signedness)
+pub val VEC_LANE_NONE:  u32 = 0;  # the WHOLE descriptor for a non-vector instruction
+pub val VEC_LANE_FLOAT: u8  = 1;  # float lanes
+pub val VEC_LANE_INT:   u8  = 2;  # integer lanes (i*/u*; the opcode carries signedness)
 
-# pack a lane descriptor: the element kind in the high nibble, the element
-# byte-width (1/2/4/8) in the low nibble. the lane count is implied - every seeded
-# vector is 128-bit, so it is 16 / element-bytes
-pub fun vec_lane_make(kind: u8, elem_bytes: u8) u8 {
-    ret ((kind & 0xF) << 4) | (elem_bytes & 0xF);
+# the widest lane count a descriptor can carry. a vector past this is 256 KiB of
+# value at the narrowest lane, far beyond anything a target realizes, and #2727
+# leaves a surface cap open rather than promising one
+pub val VEC_LANE_MAX_LANES: u32 = 0xFFFF;
+
+# pack a lane descriptor: the element kind in bits 24-27, the element byte-width in
+# bits 16-23, and the LANE COUNT in bits 0-15.
+#
+# The count is a supplied fact, never a derived one. It used to be implied as
+# `16 / element-bytes`, which was the 128-bit assumption #2687 deleted from the
+# language surviving in MIR, and it mistyped every operation on a vector that is
+# not exactly one 128-bit register (#2743). The count is a positional parameter for
+# the same reason `MirInstr.instr`'s widths are: a descriptor that cannot be built
+# without a count cannot be built with a plausible wrong one.
+#
+# Sixteen bits of count rather than the four a 128-bit register would need, because
+# the hardest member is the OVER-width vector of #2727 (`f32x8`, `f32x1024`), which
+# a count spanning 1..16 could not name at all. The kind and width keep whole bytes
+# of their own so the packing has no interaction with a lane width above 8 either.
+# ---
+# kind:       VEC_LANE_FLOAT or VEC_LANE_INT
+# elem_bytes: the lane's byte-width
+# lanes:      the lane count, 1..VEC_LANE_MAX_LANES
+# ret:        the packed descriptor
+pub fun vec_lane_make(kind: u8, elem_bytes: u8, lanes: u32) u32 {
+    ret ((kind & 0xF)::u32 << 24)
+      | ((elem_bytes)::u32 << 16)
+      | (lanes & VEC_LANE_MAX_LANES);
 }
 
 # the element kind of a lane descriptor (VEC_LANE_NONE / FLOAT / INT)
-pub fun vec_lane_kind(v: u8) u8 { ret (v >> 4) & 0xF; }
+pub fun vec_lane_kind(v: u32) u8 { ret ((v >> 24) & 0xF)::u8; }
 
 # the element byte-width of a lane descriptor (1/2/4/8), or 0 for a non-vector
-pub fun vec_lane_elem_bytes(v: u8) u8 { ret v & 0xF; }
+pub fun vec_lane_elem_bytes(v: u32) u8 { ret ((v >> 16) & 0xFF)::u8; }
 
 # whether a lane descriptor names a vector (any nonzero descriptor)
-pub fun vec_lane_is_vector(v: u8) bool { ret v != 0; }
+pub fun vec_lane_is_vector(v: u32) bool { ret v != 0; }
 
-# the lane count of a vector descriptor (16 / element-bytes), or 0 for a non-vector
-pub fun vec_lane_count(v: u8) u32 {
-    val eb: u8 = vec_lane_elem_bytes(v);
-    if (eb == 0) { ret 0; }
-    ret 16 / eb::u32;
-}
+# the lane count a vector descriptor carries, or 0 for a non-vector
+pub fun vec_lane_count(v: u32) u32 { ret v & VEC_LANE_MAX_LANES; }
 
 # one `-g` source-variable binding attached to a MirInstr: the OP_DBG_VALUE identity
 # `iid` (joining the IR dbg-var / dbg-expr side tables) and the MIR `vreg` holding the
@@ -1630,35 +1648,56 @@ test "mach.lang.be.codegen.mir.fused_cbr:mapping" {
     ret 0;
 }
 
-# the vec_lane descriptor packs the element kind (high nibble) and byte-width (low
-# nibble), with 0 the non-vector sentinel and the lane count implied by 16 / bytes.
+# the vec_lane descriptor carries three INDEPENDENT facts - kind, lane byte-width,
+# lane count - and reads each one back unchanged, with 0 the non-vector sentinel.
+#
+# The expectations here come from the language rule that a `TxN` has N lanes,
+# NOT from anything the packing computes. The version of this test that these
+# replace asserted `vec_lane_count(INT, 1) == 16` and `(FLOAT, 8) == 2`, which is
+# the derivation `16 / element-bytes` restating itself: it held for every shape
+# that happens to be 128 bits and pinned the mistyping of every shape that is not
+# (#2743). So the cases below are deliberately the ones the old rule got wrong -
+# a 3-lane and a 2-lane vector at a width whose 128-bit count is 4, and an
+# over-width count from #2727 - alongside the 128-bit shapes it got right.
 test "mach.lang.be.codegen.mir.vec_lane:pack_unpack" {
     # the non-vector sentinel.
     if (vec_lane_is_vector(VEC_LANE_NONE))  { ret 1; }
     if (vec_lane_count(VEC_LANE_NONE) != 0) { ret 1; }
 
     # f32x4: float lanes, 4-byte element, 4 lanes.
-    val f4: u8 = vec_lane_make(VEC_LANE_FLOAT, 4);
+    val f4: u32 = vec_lane_make(VEC_LANE_FLOAT, 4, 4);
     if (!vec_lane_is_vector(f4))             { ret 1; }
     if (vec_lane_kind(f4) != VEC_LANE_FLOAT) { ret 1; }
     if (vec_lane_elem_bytes(f4) != 4)        { ret 1; }
     if (vec_lane_count(f4) != 4)             { ret 1; }
 
-    # f64x2: float lanes, 8-byte element, 2 lanes.
-    val f8: u8 = vec_lane_make(VEC_LANE_FLOAT, 8);
-    if (vec_lane_kind(f8) != VEC_LANE_FLOAT) { ret 1; }
-    if (vec_lane_count(f8) != 2)             { ret 1; }
+    # f32x3 and f32x2 share f32x4's kind and width and differ only in count.
+    val f3: u32 = vec_lane_make(VEC_LANE_FLOAT, 4, 3);
+    if (vec_lane_kind(f3) != VEC_LANE_FLOAT) { ret 1; }
+    if (vec_lane_elem_bytes(f3) != 4)        { ret 1; }
+    if (vec_lane_count(f3) != 3)             { ret 1; }
+    if (vec_lane_count(vec_lane_make(VEC_LANE_FLOAT, 4, 2)) != 2) { ret 1; }
+    if (f3 == f4)                            { ret 1; }
 
-    # every integer element width recovers its lane count (i8x16 / i16x8 / i32x4 / i64x2).
-    if (vec_lane_count(vec_lane_make(VEC_LANE_INT, 1)) != 16) { ret 1; }
-    if (vec_lane_count(vec_lane_make(VEC_LANE_INT, 2)) != 8)  { ret 1; }
-    if (vec_lane_count(vec_lane_make(VEC_LANE_INT, 4)) != 4)  { ret 1; }
-    if (vec_lane_count(vec_lane_make(VEC_LANE_INT, 8)) != 2)  { ret 1; }
+    # the 128-bit shapes: the count is supplied, and agrees with what they are.
+    if (vec_lane_count(vec_lane_make(VEC_LANE_FLOAT, 8, 2)) != 2)  { ret 1; }
+    if (vec_lane_count(vec_lane_make(VEC_LANE_INT, 1, 16)) != 16) { ret 1; }
+    if (vec_lane_count(vec_lane_make(VEC_LANE_INT, 2, 8))  != 8)  { ret 1; }
+    if (vec_lane_count(vec_lane_make(VEC_LANE_INT, 4, 4))  != 4)  { ret 1; }
+    if (vec_lane_count(vec_lane_make(VEC_LANE_INT, 8, 2))  != 2)  { ret 1; }
 
-    # kind and byte-width are independent nibbles.
-    val i2: u8 = vec_lane_make(VEC_LANE_INT, 2);
+    # an over-width count survives the packing, which is what #2727 will need.
+    val f32x1024: u32 = vec_lane_make(VEC_LANE_FLOAT, 4, 1024);
+    if (vec_lane_count(f32x1024) != 1024)          { ret 1; }
+    if (vec_lane_elem_bytes(f32x1024) != 4)        { ret 1; }
+    if (vec_lane_kind(f32x1024) != VEC_LANE_FLOAT) { ret 1; }
+    if (vec_lane_count(vec_lane_make(VEC_LANE_INT, 8, VEC_LANE_MAX_LANES)) != VEC_LANE_MAX_LANES) { ret 1; }
+
+    # kind, byte-width and count are independent fields.
+    val i2: u32 = vec_lane_make(VEC_LANE_INT, 2, 5);
     if (vec_lane_kind(i2) != VEC_LANE_INT) { ret 1; }
     if (vec_lane_elem_bytes(i2) != 2)      { ret 1; }
+    if (vec_lane_count(i2) != 5)           { ret 1; }
     ret 0;
 }
 
