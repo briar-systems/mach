@@ -166,6 +166,14 @@ reference to that IAT cell. If another object also refers to X directly, both
 spellings share one import and one IAT entry; do not declare or map `__imp_X` as
 a separate export.
 
+`__imp_X` names that IAT cell, which the import table synthesizes — it is never
+itself an export, so no library provides a symbol under that name. An import
+whose loader-facing name still carries the prefix is a hard link error naming the
+export it denotes, not something the image is allowed to carry: such an image
+links clean and fails only when Windows loads it, with a missing-entry-point
+error. Attribute and import the undecorated `X`; every `__imp_X` reference
+resolves to its address cell from there.
+
 On a format whose loader resolves imports by global search (ELF), an import is
 not bound to a single dependency, so `library` has no effect on the emitted
 binary — the value is still validated against the link's dependencies, but every
