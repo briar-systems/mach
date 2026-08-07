@@ -508,18 +508,59 @@ fun round_up_i64(value: i64, align: u64) i64 {
 # regardless of the aggregate's alignment. On x86 every stack argument is
 # <=8-aligned, so this is always eight and the round-up is identity; AAPCS64 honors
 # a 16-byte-aligned by-value argument.
+#
+# `natural` drops the eight-byte clamp for a by-value slot, leaving the value's own
+# alignment: the Apple arm64 rule for a FIXED argument, where a `u32` is 4-aligned and
+# a `u8` 1-aligned rather than both being 8-aligned (#2598). A by-reference spill is
+# unaffected either way - the pointer it holds is genuinely 8 bytes and 8-aligned.
 # ---
-# class: the slot's classification (CLASS_STACK, CLASS_STACK_BYREF, or CLASS_VEC_STACK_BYREF)
-# align: the value's natural alignment in bytes
-# ret:   the slot's stack alignment in bytes
-fun stack_arg_align(class: abi.ParamClass, align: u64) u64 {
+# class:   the slot's classification (CLASS_STACK, CLASS_STACK_BYREF, or CLASS_VEC_STACK_BYREF)
+# align:   the value's natural alignment in bytes
+# natural: whether this argument's slot takes the value's natural alignment with no minimum
+# ret:     the slot's stack alignment in bytes
+fun stack_arg_align(class: abi.ParamClass, align: u64, natural: bool) u64 {
     # both by-reference stack spills carry only an 8-byte pointer, so they round to 8
     # regardless of the referent's alignment (CLASS_VEC_STACK_BYREF's referent is the
     # spilled vector temp, aligned at its own frame slot, not this outgoing pointer slot).
     if (class == abi.CLASS_STACK_BYREF)     { ret 8; }
     if (class == abi.CLASS_VEC_STACK_BYREF) { ret 8; }
+    if (natural)                            { ret align; }
     if (align < 8)                          { ret 8; }
     ret align;
+}
+
+# the outgoing stack bytes one by-value stack argument consumes
+#
+# The convention's rule is an eight-byte-granular slot (`context.stack_slot_bytes`): a
+# value narrower than the machine word still consumes a whole slot. `natural` selects
+# the Apple arm64 FIXED-argument rule instead, where the argument consumes exactly its
+# own size and the next one packs against it, so two `i32`s land at [sp+0] and [sp+4].
+#
+# It is asked per ARGUMENT rather than read off the target, because Apple runs both
+# rules at once: a variadic tail argument keeps the eight-byte slot on the very target
+# where a fixed one does not, so the caller passes which rule this argument is under.
+# ---
+# size:    the argument's value size in bytes (from its ABI ParamSlot)
+# natural: whether this argument's slot takes its natural size with no minimum
+# ret:     the outgoing stack bytes the argument consumes
+fun stack_arg_bytes(size: u64, natural: bool) i64 {
+    if (natural) { ret size::i64; }
+    ret context.stack_slot_bytes(size);
+}
+
+# whether one argument's outgoing stack slot takes its natural size and alignment
+#
+# The single statement of Apple arm64's two-rule split (#2598, #2575): a FIXED argument
+# takes its natural size there, and the variadic tail keeps the eight-byte minimum the
+# calling convention gives it. Every other platform answers false for both. The target
+# fact is resolved once from the (os, isa) pair by `target.select`, so this names no os.
+# ---
+# tgt:      the resolved target
+# variadic: whether the argument sits in the call's variadic tail
+# ret:      true when the slot takes the value's natural size and alignment
+fun natural_stack_slot(tgt: *target.Target, variadic: bool) bool {
+    if (variadic) { ret false; }
+    ret tgt.fixed_args_natural_size;
 }
 
 # rewrite a variadic-tail placement into its stack form, for a platform that passes
@@ -539,8 +580,10 @@ fun stack_arg_align(class: abi.ParamClass, align: u64) u64 {
 # register-borne placement -- a scalar, a register pair, an HFA's V-register run, a
 # register-plus-stack split -- becomes one by-value stack slot of the value's own size.
 # A placement the classifier already put on the stack is returned untouched. The slot's
-# natural alignment and eight-byte-minimum granularity come from the shared
-# `stack_arg_align` / `stack_slot_bytes` walk, which is already the Apple rule.
+# alignment and eight-byte-minimum granularity come from the shared `stack_arg_align` /
+# `stack_arg_bytes` walk under `natural = false`, which is already the Apple rule for a
+# variadic tail argument -- and is why Apple's natural-size FIXED rule (#2598) is a
+# separate fact and never applies here.
 # ---
 # slot: the placement the convention classifier returned for a tail argument
 # ret:  the same value's stack placement
@@ -633,6 +676,10 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
     if (wants_agg) { ret_agg = agg_layout(ctx, ret_type, ret_aggr); }
     out.ret_slot = classify_ret(ret_size, 0, ret_float, ret_eb, ret_aggr, ret_vec, ret_hm, ret_he, ret_agg);
 
+    # every parameter this walk places is a fixed one, so the fixed rule governs all of
+    # them; the variadic tail is placed by `lower_call` under the other one.
+    val fixed_natural: bool = natural_stack_slot(ctx.tgt, false);
+
     var gp_used:   i32 = 0;
     var fp_used:   i32 = 0;
     # outgoing stack arguments start above the ABI's caller shadow space (win64's
@@ -699,10 +746,13 @@ pub fun classify_signature(ctx: *context.LowerCtx, sig: type.IrTypeId, ret_type:
         # GP/SSE aggregate consumes one of each). a by-value stack slot is first
         # rounded up to the value's alignment (identity on x86, where every stack
         # argument is <=8-aligned; honors a 16-aligned AAPCS64 by-value argument).
+        # every parameter here is FIXED, so a platform that gives a fixed stack argument
+        # its natural size (Apple arm64) packs it against its neighbour rather than
+        # rounding both the alignment and the footprint up to eight.
         if (is_stack_slot_class(slot.class)) {
-            stack_off   = round_up_i64(stack_off, stack_arg_align(slot.class, pal));
+            stack_off   = round_up_i64(stack_off, stack_arg_align(slot.class, pal, fixed_natural));
             slot.offset = stack_off;
-            stack_off   = stack_off + context.stack_slot_bytes(slot.size);
+            stack_off   = stack_off + stack_arg_bytes(slot.size, fixed_natural);
         } or {
             advance_arg_cursors(?slot, ?gp_used, ?fp_used);
             # a register-plus-stack split also reserves an outgoing stack slot for its
@@ -976,8 +1026,10 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
             # round a stack-passed tail argument up to its slot alignment before
             # placing it (identity on x86; honors a 16-aligned AAPCS64 by-value arg).
             # a register-plus-stack split's tail stack chunk is eight-byte-granular.
+            # the tail is never under the natural-size rule: Apple arm64 keeps the
+            # eight-byte minimum here even though a fixed argument there does not (#2598).
             if (is_stack_slot_class(slot.class)) {
-                stack_off = round_up_i64(stack_off, stack_arg_align(slot.class, aal));
+                stack_off = round_up_i64(stack_off, stack_arg_align(slot.class, aal, false));
             } or (slot_has_stack_piece(?slot)) {
                 stack_off = round_up_i64(stack_off, 8);
             }
@@ -993,7 +1045,8 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         }
         val argop: mir.MirOperand = R.unwrap_ok[mir.MirOperand, str](aor);
 
-        val er: R.Result[bool, str] = emit_arg_slot(ctx, mb, slot, argop, soff, aag, asz);
+        val er: R.Result[bool, str] = emit_arg_slot(ctx, mb, slot, argop, soff, aag, asz,
+                                                    natural_stack_slot(ctx.tgt, pidx >= layout.param_count));
         if (R.is_err[bool, str](er)) {
             sig_layout_free(ctx, ?layout);
             ret er;
@@ -1036,7 +1089,7 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
         # advances each assigned register's bank; a stack slot advances the offset.
         if (pidx >= layout.param_count) {
             if (is_stack_slot_class(slot.class)) {
-                stack_off = stack_off + context.stack_slot_bytes(slot.size);
+                stack_off = stack_off + stack_arg_bytes(slot.size, false);
             } or {
                 advance_arg_cursors(?slot, ?gp_used, ?fp_used);
                 # a split tail also consumes its stack chunk's outgoing slot.
@@ -1243,9 +1296,12 @@ fun materialize_pieces(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.Para
 # stack_off: the slot's outgoing stack base (a STACK slot, or a split's stack chunk)
 # is_aggr:   whether the argument is an aggregate flowing by address
 # size:      the argument's byte size (the copy length for a by-value aggregate)
+# natural:   whether the outgoing slot is exactly the value's size, so a narrow scalar
+#            must be stored at its own width or it overwrites the argument packed
+#            against it (the Apple arm64 fixed rule)
 # ret:       ok(true) on success, or a loud error
 fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot, argop: mir.MirOperand,
-                  stack_off: i64, is_aggr: bool, size: u64) R.Result[bool, str] {
+                  stack_off: i64, is_aggr: bool, size: u64, natural: bool) R.Result[bool, str] {
     # a register-resident value marshalled by reference (a 128-bit vector at a win64 `ext`
     # boundary, #2058): unlike an aggregate or a scalarized rv64 vector -- already
     # memory-resident, its argop a storage pointer -- the value is in a register, so the
@@ -1286,7 +1342,7 @@ fun emit_arg_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSlot
         # is the scalar's own width when that exceeds the machine word (the read twin
         # in `emit_param_slot`), so an 8-bit target passes all of a wide argument.
         ret context.emit_store_to_w(ctx, mb, mir.op_mem_preg(sp, stack_off), argop,
-                                    scalar_mem_move_width(ctx.tgt.model.gpr_width, size));
+                                    scalar_mem_move_width(ctx.tgt.model.gpr_width, size, natural));
     }
     if (slot.class == abi.CLASS_BYREF) {
         # the aggregate is passed by hidden pointer; move its address into the
@@ -1419,11 +1475,17 @@ fun scalar_reg_move_width(gpr_width: u32, size: u64) u8 {
 # preserved exactly. The one rule it adds is the same: a scalar wider than the machine
 # word is accessed at its own size, so an 8-bit target reads all four bytes of a `u32`
 # stack parameter instead of its low byte.
+#
+# `natural` accesses the scalar at exactly its own width instead. That is not an
+# optimization: under Apple arm64's natural-size FIXED rule the next argument packs
+# against this one, so a machine-word store into a 4-byte slot would overwrite it.
 # ---
 # gpr_width: the target's machine word in bytes
 # size:      the scalar's byte size
+# natural:   whether this argument's slot is exactly its own size
 # ret:       the access width in bytes
-fun scalar_mem_move_width(gpr_width: u32, size: u64) u8 {
+fun scalar_mem_move_width(gpr_width: u32, size: u64, natural: bool) u8 {
+    if (natural)               { ret size::u8; }
     if (size > gpr_width::u64) { ret size::u8; }
     ret gpr_width::u8;
 }
@@ -1615,8 +1677,12 @@ fun emit_param_slot(ctx: *context.LowerCtx, mb: *mir.MirBlock, slot: abi.ParamSl
         # pointer, addressed through the physical frame pointer at the running offset.
         # the read is the scalar's own width when that exceeds the machine word, so an
         # 8-bit target loads all of a wide parameter rather than its low byte.
+        # the read twin of `emit_arg_slot`'s store: a declared parameter is always a
+        # fixed one, so a platform that sizes a fixed stack slot naturally reads exactly
+        # the parameter's own bytes and not the neighbouring argument's.
         ret context.emit_mov_w(ctx, mb, mir.op_vreg(pv), mir.op_mem_preg(fp, arg_base + stack_off),
-                               scalar_mem_move_width(ctx.tgt.model.gpr_width, size));
+                               scalar_mem_move_width(ctx.tgt.model.gpr_width, size,
+                                                     natural_stack_slot(ctx.tgt, false)));
     }
     if (slot.class == abi.CLASS_BYREF) {
         ret context.emit_mov_w(ctx, mb, mir.op_vreg(pv), mir.op_preg(slot.reg::u32), ptr_move_width(ctx));
@@ -1837,9 +1903,9 @@ test "mach.lang.be.codegen.mir.abi:scalar_move_widths" {
     if (scalar_reg_move_width(8, 2) != 8) { ret 1; }
     if (scalar_reg_move_width(8, 4) != 4) { ret 1; }
     if (scalar_reg_move_width(8, 8) != 8) { ret 1; }
-    if (scalar_mem_move_width(8, 1) != 8) { ret 1; }
-    if (scalar_mem_move_width(8, 4) != 8) { ret 1; }
-    if (scalar_mem_move_width(8, 8) != 8) { ret 1; }
+    if (scalar_mem_move_width(8, 1, false) != 8) { ret 1; }
+    if (scalar_mem_move_width(8, 4, false) != 8) { ret 1; }
+    if (scalar_mem_move_width(8, 8, false) != 8) { ret 1; }
 
     # a 1-byte machine word: every wider scalar carries its own size, so the width
     # legalizer downstream sees the whole value rather than its low byte.
@@ -1847,10 +1913,10 @@ test "mach.lang.be.codegen.mir.abi:scalar_move_widths" {
     if (scalar_reg_move_width(1, 2) != 2) { ret 1; }
     if (scalar_reg_move_width(1, 4) != 4) { ret 1; }
     if (scalar_reg_move_width(1, 8) != 8) { ret 1; }
-    if (scalar_mem_move_width(1, 1) != 1) { ret 1; }
-    if (scalar_mem_move_width(1, 2) != 2) { ret 1; }
-    if (scalar_mem_move_width(1, 4) != 4) { ret 1; }
-    if (scalar_mem_move_width(1, 8) != 8) { ret 1; }
+    if (scalar_mem_move_width(1, 1, false) != 1) { ret 1; }
+    if (scalar_mem_move_width(1, 2, false) != 2) { ret 1; }
+    if (scalar_mem_move_width(1, 4, false) != 4) { ret 1; }
+    if (scalar_mem_move_width(1, 8, false) != 8) { ret 1; }
     ret 0;
 }
 
@@ -1877,10 +1943,78 @@ test "mach.lang.be.codegen.mir.abi:stack_arg_alignment" {
     if (round_up_i64(24, 16) != 32) { ret 1; }
     # a by-reference spill holds an 8-byte pointer, so it rounds to 8 regardless of
     # the aggregate's natural alignment.
-    if (stack_arg_align(abi.CLASS_STACK_BYREF, 16) != 8) { ret 1; }
+    if (stack_arg_align(abi.CLASS_STACK_BYREF, 16, false) != 8) { ret 1; }
     # a by-value slot honors the value's alignment, clamped to the 8-byte minimum.
-    if (stack_arg_align(abi.CLASS_STACK, 16) != 16) { ret 1; }
-    if (stack_arg_align(abi.CLASS_STACK, 4) != 8)   { ret 1; }
+    if (stack_arg_align(abi.CLASS_STACK, 16, false) != 16) { ret 1; }
+    if (stack_arg_align(abi.CLASS_STACK, 4, false) != 8)   { ret 1; }
+    ret 0;
+}
+
+# APPLE ARM64'S FIXED STACK ARGUMENT TAKES ITS NATURAL SIZE AND ALIGNMENT (#2598).
+#
+# The base standard's 8-byte minimum is what puts a narrow argument at an offset an
+# Apple-built callee does not read: three trailing i32s land at 0/4/8 there and at
+# 0/8/16 under AAPCS64. Both the alignment and the footprint have to drop the minimum
+# together - keeping either one alone still misplaces the third argument - so both are
+# asserted against the exact offsets clang emits for the issue's repro.
+test "mach.lang.be.codegen.mir.abi:natural_stack_args_pack_a_narrow_argument" {
+    # alignment: the value's own, with no clamp. a u8 argument is 1-aligned here and
+    # 8-aligned under the base rule.
+    if (stack_arg_align(abi.CLASS_STACK, 4, true) != 4) { ret 1; }
+    if (stack_arg_align(abi.CLASS_STACK, 1, true) != 1) { ret 1; }
+    # a 16-aligned by-value aggregate is 16-aligned under BOTH rules: natural size is
+    # not "no alignment", it is the value's own.
+    if (stack_arg_align(abi.CLASS_STACK, 16, true) != 16) { ret 1; }
+    # a by-reference spill is exempt under both: the pointer it holds really is 8/8.
+    if (stack_arg_align(abi.CLASS_STACK_BYREF, 16, true) != 8) { ret 1; }
+
+    # footprint: exactly the value's size, so the next argument packs against it.
+    if (stack_arg_bytes(4, true) != 4) { ret 1; }
+    if (stack_arg_bytes(1, true) != 1) { ret 1; }
+    if (stack_arg_bytes(8, true) != 8) { ret 1; }
+    # and the convention's rule is untouched where it applies.
+    if (stack_arg_bytes(4, false) != 8) { ret 1; }
+    if (stack_arg_bytes(1, false) != 8) { ret 1; }
+
+    # the access width follows the slot: a machine-word store into a 4-byte slot would
+    # write over the argument packed at the next offset.
+    if (scalar_mem_move_width(8, 4, true) != 4) { ret 1; }
+    if (scalar_mem_move_width(8, 1, true) != 1) { ret 1; }
+    if (scalar_mem_move_width(8, 8, true) != 8) { ret 1; }
+
+    # the issue's repro, walked end to end: three i32s past the eight GP registers.
+    # 0/4/8 is clang's Apple-arm64 output; 0/8/16 is what mach emitted before the fix
+    # and what linux-arm64 must keep emitting.
+    var off:  i64 = 0;
+    var boff: i64 = 0;
+    var n:    u32 = 0;
+    for (n < 3) {
+        off = round_up_i64(off, stack_arg_align(abi.CLASS_STACK, 4, true));
+        boff = round_up_i64(boff, stack_arg_align(abi.CLASS_STACK, 4, false));
+        if (n == 0 && (off != 0 || boff != 0))   { ret 1; }
+        if (n == 1 && (off != 4 || boff != 8))   { ret 1; }
+        if (n == 2 && (off != 8 || boff != 16))  { ret 1; }
+        off  = off + stack_arg_bytes(4, true);
+        boff = boff + stack_arg_bytes(4, false);
+        n = n + 1;
+    }
+    if (off != 12 || boff != 24) { ret 1; }
+    ret 0;
+}
+
+# the two Apple arm64 rules are separate: a FIXED argument takes its natural size, and
+# the variadic tail keeps the convention's eight-byte minimum. `natural_stack_slot` is
+# the single place that says so, so a tail argument answers false even on the target
+# that answers true for a fixed one
+test "mach.lang.be.codegen.mir.abi.natural_stack_slot:fixed_diverges_variadic_does_not" {
+    var tgt: target.Target;
+    tgt.fixed_args_natural_size = true;
+    if (!natural_stack_slot(?tgt, false)) { ret 1; }
+    if (natural_stack_slot(?tgt, true))   { ret 1; }
+    # every other target: neither half diverges.
+    tgt.fixed_args_natural_size = false;
+    if (natural_stack_slot(?tgt, false)) { ret 1; }
+    if (natural_stack_slot(?tgt, true))  { ret 1; }
     ret 0;
 }
 
