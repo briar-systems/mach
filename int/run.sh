@@ -53,6 +53,15 @@
 # (#2592). the pin is the root lock rather than a file of its own precisely so it
 # cannot rot against the compiler's: bumping the dependency bumps both at once.
 #
+# float resolves ONCE PER RUN, not once per case (#2619). the first case to declare a
+# dep resolves it fresh and every case after it is handed that same commit, so a run
+# is one coherent experiment: before this, each case resolved at the moment its own
+# build started, and a suite spanning a mach-std merge compiled some cases against one
+# standard library and some against another while still reporting a single verdict.
+# the harness never maps a ref to a commit itself - it reuses the lock `mach dep pull`
+# wrote for the first case, so resolution stays the compiler's job and there is no
+# second implementation to drift from it.
+#
 # both modes write int/out/deps.txt naming the commit every case actually compiled
 # against. the PASS/FAIL lines have carried that since #2387, but a log line only
 # answers the question while the log exists, and "what did the run that cut this tag
@@ -181,36 +190,98 @@ case_deps() {
 #           deliberately not a new pin file: that would be a second thing to bump and
 #           could rot against the compiler's, where the root lock is already advanced
 #           deliberately and already means "the mach-std this release is built on".
-prepare_case_deps() {
+# root_dep_commit <name> — the commit this repo's own mach.lock records for <name>.
+root_dep_commit() {
+    lock_commit "$root_lock" "$1"
+}
+
+# run_dep_commit <name> — the commit THIS RUN has already resolved for <name>, if any.
+run_dep_commit() {
+    [ -f "$run_deps" ] || return 0
+    awk -v n="$1" '$1 == n { print $4; exit }' "$run_deps"
+}
+
+# case_lock_from <case-dir> <resolver> — write the case's mach.lock, taking each git
+# dep's commit from `<resolver> <name>`.
+#
+# Returns 1 when the resolver has no commit for some git dep, naming it in
+# `missing_dep` and leaving no lock behind, so a caller can either fail (pin) or fall
+# back to resolving fresh (float). A case declaring no git dep correctly ends with no
+# lock at all.
+case_lock_from() {
     dir=$1
-    if [ "$deps_mode" = float ]; then
-        rm -f "$dir/mach.lock"
-        return 0
-    fi
+    resolver=$2
+    missing_dep=
     tmplock=$dir/mach.lock.new
-    echo "# written by int/run.sh --deps pin from the repo root mach.lock; not tracked." >"$tmplock"
-    pinned=0
+    echo "# written by int/run.sh; not tracked." >"$tmplock"
+    written=0
     for name in $(case_deps "$dir"); do
         # only a git dep floats. a `path =` dep (surface/pe-import-claim-cascade's
         # `prov`) is a directory inside this repo, so it is already exactly as
         # reproducible as the checkout and has no commit to record.
         url=$(dep_field "$dir/mach.toml" "$name" git)
-        [ -n "$url" ] || continue
-        commit=$(lock_commit "$root_lock" "$name")
+        if [ -z "$url" ]; then continue; fi
+        commit=$("$resolver" "$name")
         if [ -z "$commit" ]; then
-            echo "run.sh: --deps pin: mach.lock records no commit for git dep '$name', declared by ${dir#"$here"/}" >&2
+            missing_dep=$name
             rm -f "$tmplock"
             return 1
         fi
         printf '\n[dep.%s]\nurl = "%s"\nref = "%s"\ncommit = "%s"\n' \
             "$name" "$url" "$(dep_field "$dir/mach.toml" "$name" ref)" "$commit" >>"$tmplock"
-        pinned=$((pinned + 1))
+        written=$((written + 1))
     done
-    if [ "$pinned" -eq 0 ]; then
+    if [ "$written" -eq 0 ]; then
         rm -f "$tmplock" "$dir/mach.lock"
         return 0
     fi
     mv "$tmplock" "$dir/mach.lock"
+}
+
+prepare_case_deps() {
+    dir=$1
+    if [ "$deps_mode" = float ]; then
+        # ONE RESOLUTION PER RUN, not one per case (#2619). The first case to declare
+        # a dep resolves it fresh, which is float's whole point; every case after it
+        # is handed that same commit. Before this, each case resolved independently at
+        # the moment its own build started, so a suite run spanning a mach-std merge
+        # compiled some cases against one standard library and some against another
+        # and still reported one verdict.
+        #
+        # The harness never maps a ref to a commit itself - it only reuses what `mach
+        # dep pull` wrote for the first case. Resolution stays the compiler's job, so
+        # there is no second implementation to drift.
+        if ! case_lock_from "$dir" run_dep_commit; then
+            rm -f "$dir/mach.lock"
+        fi
+        return 0
+    fi
+    if ! case_lock_from "$dir" root_dep_commit; then
+        echo "run.sh: --deps pin: mach.lock records no commit for git dep '$missing_dep', declared by ${dir#"$here"/}" >&2
+        return 1
+    fi
+}
+
+# record_run_deps <case-dir> — remember what this case's `dep pull` resolved, so every
+# later case in the run is given the same commit.
+#
+# Reads the lock `dep pull` just wrote rather than the checked-out tree, so what is
+# recorded is exactly what the compiler decided the ref meant. First writer wins: once
+# a name is recorded the run holds that commit even if the remote moves mid-run, which
+# is the whole point.
+record_run_deps() {
+    dir=$1
+    if [ "$deps_mode" != float ]; then return 0; fi
+    if [ ! -f "$dir/mach.lock" ]; then return 0; fi
+    for name in $(case_deps "$dir"); do
+        url=$(dep_field "$dir/mach.toml" "$name" git)
+        if [ -z "$url" ]; then continue; fi
+        if [ -n "$(run_dep_commit "$name")" ]; then continue; fi
+        commit=$(lock_commit "$dir/mach.lock" "$name")
+        if [ -z "$commit" ]; then continue; fi
+        printf '%s %s %s %s\n' \
+            "$name" "$url" "$(dep_field "$dir/mach.toml" "$name" ref)" "$commit" >>"$run_deps"
+    done
 }
 
 # dep_commits <case-dir> — print "name@shortsha ..." for every git dep checked
@@ -291,6 +362,13 @@ root_lock=$here/../mach.lock
 # the rest of the run's artifacts (#2592). it lives under the gitignored int/out/.
 manifest=$here/out/deps.txt
 mkdir -p "$here/out"
+
+# the run's own float resolution, one line per git dep: "<name> <url> <ref> <commit>".
+# written by record_run_deps once the first case resolves, read by prepare_case_deps
+# for every case after it. truncated per run, so a run never inherits the previous
+# run's resolution - float still tracks the tip, it just does so once (#2619).
+run_deps=$here/out/run-deps.txt
+: >"$run_deps"
 {
     echo "# int dependency resolution"
     echo "# target: $target"
@@ -387,6 +465,11 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
         else
             build_ok=0
         fi
+
+        # what this case resolved becomes the run's resolution for every case after
+        # it. done after `dep pull` and regardless of whether the build itself
+        # succeeded, since a failed build still resolved its dependencies (#2619).
+        record_run_deps "$dir"
 
         # a label suffix naming what mach-std commit `dep pull` resolved (#2387),
         # once one exists to report; every PASS/FAIL line from here on carries it.
