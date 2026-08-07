@@ -12,6 +12,10 @@
 #                 execution cannot observe (PE ASLR bit, macho PIE bit). dispatched
 #                 on the artifact's own magic, so it is independent of how the case
 #                 maps to a leg. no LLVM; reads little-endian fields (every runner is LE).
+#   embed-dedup — count each embedded asset's byte sequence in the final image and
+#                 then run the program. byte-identical #[embed] content from several
+#                 modules must occupy ONE placement (#2541); an in-program address
+#                 comparison cannot see the duplicate copies, only a file scan can.
 #   macho-framing— walk a Mach-O executable's load commands and report how the image
 #                 is framed: the __PAGEZERO span, __TEXT's base, and the section
 #                 commands on every segment, plus which entry command it carries.
@@ -350,6 +354,70 @@ macho_segment_fields() {
     done
     echo "int: macho: segment '$want' not found" >&2
     return 2
+}
+
+# count_byte_sequence <file> <hex-bytes> — print how many times the byte sequence
+# (given as contiguous hex digit pairs) occurs in the file. od reads the whole
+# file once; awk slides a window over it, so overlapping occurrences all count.
+count_byte_sequence() {
+    od -An -v -tu1 "$1" | awk -v want="$2" '
+        BEGIN {
+            n = length(want) / 2
+            for (i = 1; i <= n; i++) {
+                pair = substr(want, i * 2 - 1, 2)
+                need[i] = strtonum("0x" pair)
+            }
+        }
+        { for (i = 1; i <= NF; i++) b[++len] = $i }
+        END {
+            hits = 0
+            for (i = 1; i + n - 1 <= len; i++) {
+                ok = 1
+                for (j = 1; j <= n && ok; j++) { if (b[i + j - 1] != need[j]) ok = 0 }
+                if (ok) hits++
+            }
+            print hits
+        }
+    '
+}
+
+# produce_embed_dedup <runmode> <target> <binary>
+# Count each embedded asset's byte sequence in the FINAL IMAGE, then run the
+# program.
+#
+# The observable has to be the emitted bytes. Three modules embed byte-identical
+# content, and #2518 already made their addresses compare equal WITHIN a module,
+# so an in-program address comparison cannot see the defect #2541 is about: the
+# object boundary lost the embed marker and the linker concatenated the same bytes
+# once per module, leaving copies nobody references. Counting occurrences in the
+# file is what distinguishes one placement from several.
+#
+# The fourth asset differs in its last byte only, so it also pins the other half of
+# the contract: content that is not identical must stay distinct, and a scan that
+# merged on length or section alone would report it missing.
+produce_embed_dedup() {
+    runmode=$1
+    target=$2
+    bin=$3
+
+    shared=9E2D41770BC35AE13684F21C60ABD94E73
+    other=9E2D41770BC35AE13684F21C60ABD94E74
+
+    shared_hits=$(count_byte_sequence "$bin" "$shared") || return 2
+    other_hits=$(count_byte_sequence "$bin" "$other") || return 2
+
+    [ "$shared_hits" -eq 1 ] || {
+        echo "int: embed-dedup: the shared 17-byte asset occurs $shared_hits times, expected one placement for all three modules" >&2
+        return 1
+    }
+    [ "$other_hits" -eq 1 ] || {
+        echo "int: embed-dedup: the differing 17-byte asset occurs $other_hits times, expected exactly its own placement" >&2
+        return 1
+    }
+
+    produce_exec "$runmode" "$target" "$bin"
+    echo "shared_placements=$shared_hits"
+    echo "distinct_placements=$other_hits"
 }
 
 # produce_macho_framing <runmode> <target> <binary>
@@ -2089,6 +2157,7 @@ produce() {
         field)       produce_field "$@" ;;
         macho-signed) produce_macho_signed "$@" ;;
         macho-got)   produce_macho_got "$@" ;;
+        embed-dedup) produce_embed_dedup "$@" ;;
         macho-framing) produce_macho_framing "$@" ;;
         macho-sections) produce_macho_sections "$@" ;;
         macho-abs-bind) produce_macho_abs_bind "$@" ;;
