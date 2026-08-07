@@ -19,12 +19,17 @@ use std.types.bool.false;
 use std.types.bool.true;
 use std.types.size.usize;
 use std.types.string.str;
+use std.types.string.str_contains;
 
 use A: std.allocator;
 use O: std.types.option;
 use R: std.types.result;
 
+use std.format;
+
 use mach.lang.intern;
+use mach.lang.query;
+use mach.lang.source;
 use semtype: mach.lang.type;
 use mach.lang.me.ir;
 use mach.lang.me.ir.builder;
@@ -199,6 +204,102 @@ pub fun describe(check: VerifyCheck) str {
     if (check == VC_TYPE_AGREE)      { ret "type agreement: operand types violate the opcode's typing contract"; }
     if (check == VC_CALL_ARG_TYPE)   { ret "call argument typing: a call argument's type disagrees with the callee's declared parameter"; }
     ret "unknown verification check";
+}
+
+# the source location of the instruction a violation names, or loc_nil
+#
+# A function- or block-level violation carries INSTR_NIL and has no instruction to
+# read a location from; so does a violation whose instruction lowered from
+# compiler-synthesized IR the builder stamped no location onto.
+# ---
+# m: the module the violation was recorded against
+# v: the violation to locate
+# ret: the offending instruction's location, or loc_nil when there is none
+pub fun violation_loc(m: *ir.Module, v: *Violation) source.SrcLoc {
+    if (m == nil || v == nil)              { ret source.loc_nil(); }
+    if (v.function >= m.function_len)      { ret source.loc_nil(); }
+    val fn: *ir.Function = ?m.functions[v.function];
+    if (v.instr == id.INSTR_NIL)           { ret source.loc_nil(); }
+    if (v.instr::u32 >= fn.instr_len)      { ret source.loc_nil(); }
+    ret fn.instrs[v.instr].loc;
+}
+
+# render `<module>.<function>` for the function a violation fired in
+#
+# Falls back to a placeholder per component rather than dropping the qualifier, so
+# the shape of the name is the same whether or not the interner can resolve it.
+fun violation_scope(m: *ir.Module, v: *Violation, itn: *intern.Interner, alloc: *A.Allocator) str {
+    var mod: str = "<unknown module>";
+    val om: O.Option[str] = intern.lookup(itn, m.name);
+    if (O.is_some[str](om)) { mod = O.unwrap[str](om); }
+
+    # prefer the bare source name over the mangled linkage symbol: this message is
+    # read by a developer looking for a function in a file. the same fallback the
+    # dwarf producer uses, since `disp` is unset for a synthesized function.
+    var fname: str = "<unknown function>";
+    if (v.function < m.function_len) {
+        val fn: *ir.Function = ?m.functions[v.function];
+        var nm: intern.StrId = fn.disp;
+        if (nm == intern.STR_NIL) { nm = fn.name; }
+        val of: O.Option[str] = intern.lookup(itn, nm);
+        if (O.is_some[str](of)) { fname = O.unwrap[str](of); }
+    }
+
+    val rj: R.Result[str, str] = format.sprint(alloc, "{}.{}", mod, fname);
+    if (R.is_err[str, str](rj)) { ret fname; }
+    ret R.unwrap_ok[str, str](rj);
+}
+
+# render `<path>:<line>:<col>` for a location, or none when it names no loaded file
+fun violation_where(l: source.SrcLoc, srcmap: *source.SourceMap, alloc: *A.Allocator) O.Option[str] {
+    if (!source.loc_is_valid(l)) { ret O.none[str](); }
+    if (srcmap == nil)           { ret O.none[str](); }
+    val of: O.Option[*source.SourceFile] = source.get(srcmap, l.file);
+    if (O.is_none[*source.SourceFile](of)) { ret O.none[str](); }
+    val f: *source.SourceFile = O.unwrap[*source.SourceFile](of);
+
+    val p: source.Position = source.position(f, l.offset);
+    val rj: R.Result[str, str] = format.sprint(alloc, "{}:{}:{}", f.path, p.line, p.col);
+    if (R.is_err[str, str](rj)) { ret O.none[str](); }
+    ret O.some[str](R.unwrap_ok[str, str](rj));
+}
+
+# format a violation as a located internal-compiler-error message
+#
+# A verifier failure is a compiler bug, so this is the message a developer bisects
+# with: it names the check, the module and function it fired in, and the source
+# location of the offending instruction. The location is what makes the message
+# greppable - without it every occurrence of a given check reads identically no
+# matter which function is at fault (#2538).
+#
+# A location is not always available: a function- or block-level check names no
+# instruction, and compiler-synthesized IR carries no source origin. That case says
+# so explicitly rather than silently degrading to a message that reads as though it
+# forgot, which is the outcome #2538 rules out.
+# ---
+# m:      the module the violation was recorded against
+# v:      the violation to format
+# itn:    interner resolving module and function names
+# srcmap: source map resolving a SrcLoc to path:line:col, or nil when unavailable
+# alloc:  allocator the returned message is built on
+# ret:    the formatted message (on `alloc`), or a static fallback on format failure
+pub fun describe_located(m: *ir.Module, v: *Violation, itn: *intern.Interner,
+                         srcmap: *source.SourceMap, alloc: *A.Allocator) str {
+    val what: str = describe(v.check);
+    if (m == nil || v == nil) { ret what; }
+
+    val scope: str = violation_scope(m, v, itn, alloc);
+    val where: O.Option[str] = violation_where(violation_loc(m, v), srcmap, alloc);
+
+    var rj: R.Result[str, str];
+    if (O.is_some[str](where)) {
+        rj = format.sprint(alloc, "{} (in {}, at {})", what, scope, O.unwrap[str](where));
+    }
+    or {
+        rj = format.sprint(alloc, "{} (in {}; no source location available for this check)", what, scope);
+    }
+    if (R.is_err[str, str](rj)) { ret what; }
+    ret R.unwrap_ok[str, str](rj);
 }
 
 # validates one function, recording violations into the report. extern functions
@@ -2236,4 +2337,119 @@ test "mach.lang.me.ir.verify.check_call_arg_types:vector_param_accepts_by_addres
     env.m.functions[0].instrs[cid].operands[1].ty = env.i64ty;
     if (t_count(?env, false, false, VC_CALL_ARG_TYPE) < 1) { ret 1; }
     ret 0;
+}
+
+# a verifier failure names the module, the function, and the source location of the
+# offending instruction (#2538)
+#
+# The spanless form this replaces ("constant typing: constant carries an
+# incompatible type" and nothing else) is identical no matter which function is at
+# fault, so it can only be localized by bisecting the module. Asserting each
+# component of the location separately is what keeps a future check from regressing
+# to that: dropping the srcmap lookup, the interner lookup, or the whole qualifier
+# each fails a different line here.
+test "mach.lang.me.ir.verify.describe_located:names_module_function_and_position" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+
+    var itn: intern.Interner = intern.init(?env.alloc);
+    val res_db: R.Result[query.QueryDb, str] = query.init(?env.alloc);
+    if (R.is_err[query.QueryDb, str](res_db)) { ret 1; }
+    var db: query.QueryDb = R.unwrap_ok[query.QueryDb, str](res_db);
+    var smap: source.SourceMap = source.init(?env.alloc);
+
+    val res_fid: R.Result[source.FileId, str] = source.add(?smap, ?db, "./src/probe.mach", "ab\ncde\nf");
+    if (R.is_err[source.FileId, str](res_fid)) { ret 1; }
+    val fid: source.FileId = R.unwrap_ok[source.FileId, str](res_fid);
+
+    val res_mod: R.Result[intern.StrId, str] = intern.intern(?itn, "probe.mod");
+    if (R.is_err[intern.StrId, str](res_mod)) { ret 1; }
+    env.m.name = R.unwrap_ok[intern.StrId, str](res_mod);
+
+    val res_fn: R.Result[intern.StrId, str] = intern.intern(?itn, "offender");
+    if (R.is_err[intern.StrId, str](res_fn)) { ret 1; }
+    env.m.functions[0].disp = R.unwrap_ok[intern.StrId, str](res_fn);
+
+    val b0: id.BlockId = t_block(?env);
+    if (b0 != 0) { ret 1; }
+    builder.set_block(?env.bld, b0);
+
+    # offset 4 is 'd', the second character of the second line of the file above.
+    builder.set_loc(?env.bld, source.loc(fid, 4));
+    # a store whose destination operand is an integer rather than an address: an
+    # invariant violation the repr checks record against this instruction.
+    if (R.is_err[bool, str](builder.emit_store(?env.bld, t_ci(?env, 1), t_ci(?env, 0)))) { ret 1; }
+    if (R.is_err[bool, str](builder.emit_ret_void(?env.bld)))                            { ret 1; }
+
+    val rr: R.Result[VerifyReport, str] = verify_module_ext(?env.m, ?env.alloc, false, true);
+    if (R.is_err[VerifyReport, str](rr)) { ret 1; }
+    var rep: VerifyReport = R.unwrap_ok[VerifyReport, str](rr);
+    if (rep.len == 0) { dnit_report(?rep); ret 1; }
+
+    val msg: str = describe_located(?env.m, ?rep.violations[0], ?itn, ?smap, ?env.alloc);
+    dnit_report(?rep);
+
+    var code: i32 = 0;
+    # the check itself still names the invariant
+    if (!str_contains(msg, "type agreement"))         { code = 1; }
+    # the module and function it fired in
+    if (!str_contains(msg, "probe.mod.offender"))     { code = 1; }
+    # the file, and the line:col the byte offset resolves to
+    if (!str_contains(msg, "./src/probe.mach"))       { code = 1; }
+    if (!str_contains(msg, "2:2"))                    { code = 1; }
+    # and it does not claim a location is missing while carrying one
+    if (str_contains(msg, "no source location"))      { code = 1; }
+
+    source.dnit(?smap);
+    query.dnit(?db);
+    intern.dnit(?itn);
+    ret code;
+}
+
+# a violation with no instruction to locate says so, rather than degrading to a
+# message that reads as though it forgot (#2538)
+#
+# A function- or block-level check names no instruction, and a compiler-synthesized
+# instruction carries no source origin, so a spanless message is legitimately
+# reachable. The acceptance is that it is explicit about it: silence here is exactly
+# what made the original diagnostic unactionable.
+test "mach.lang.me.ir.verify.describe_located:spanless_says_so" {
+    var env: TEnv;
+    if (!t_env(?env)) { ret 1; }
+
+    var itn: intern.Interner = intern.init(?env.alloc);
+    var smap: source.SourceMap = source.init(?env.alloc);
+
+    val res_mod: R.Result[intern.StrId, str] = intern.intern(?itn, "probe.mod");
+    if (R.is_err[intern.StrId, str](res_mod)) { ret 1; }
+    env.m.name = R.unwrap_ok[intern.StrId, str](res_mod);
+
+    val res_fn: R.Result[intern.StrId, str] = intern.intern(?itn, "offender");
+    if (R.is_err[intern.StrId, str](res_fn)) { ret 1; }
+    env.m.functions[0].disp = R.unwrap_ok[intern.StrId, str](res_fn);
+
+    # a block-level violation: block 0 has no terminator, so the check records
+    # INSTR_NIL and there is no instruction whose loc could be read.
+    val b0: id.BlockId = t_block(?env);
+    if (b0 != 0) { ret 1; }
+
+    val rr: R.Result[VerifyReport, str] = verify_module_ext(?env.m, ?env.alloc, false, false);
+    if (R.is_err[VerifyReport, str](rr)) { ret 1; }
+    var rep: VerifyReport = R.unwrap_ok[VerifyReport, str](rr);
+    if (rep.len == 0) { dnit_report(?rep); ret 1; }
+    if (rep.violations[0].instr != id.INSTR_NIL) { dnit_report(?rep); ret 1; }
+
+    val msg: str = describe_located(?env.m, ?rep.violations[0], ?itn, ?smap, ?env.alloc);
+    dnit_report(?rep);
+
+    var code: i32 = 0;
+    if (!str_contains(msg, "terminator presence"))                              { code = 1; }
+    # the scope is still named: a missing location does not cost the function name
+    if (!str_contains(msg, "probe.mod.offender"))                               { code = 1; }
+    # and the absence is stated, not implied by omission
+    if (!str_contains(msg, "no source location available for this check"))      { code = 1; }
+
+    source.dnit(?smap);
+    intern.dnit(?itn);
+    ret code;
 }

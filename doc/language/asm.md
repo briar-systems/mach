@@ -42,10 +42,10 @@ pub fun add_via_asm(a: i64, b: i64) i64 {
 }
 ```
 
-## Calls (x86-64)
+## Calls and jumps (x86-64)
 
-`call` takes three shapes, and which one a statement means is read off the
-operand:
+`call` and `jmp` take the same three shapes, and which one a statement means is
+read off the operand:
 
 ```mach
 asm x86_64 {
@@ -53,6 +53,10 @@ asm x86_64 {
     call rax             # indirect through a register: FF /2, mod=11
     call [0x100018]      # indirect through an absolute address: ff 14 25 <disp32>
     call [rax + 8]       # indirect through a computed address
+
+    jmp  some_symbol     # direct: E9 rel32
+    jmp  rax             # indirect through a register: FF /4
+    jmp  [rax + 8]       # ... and the same memory forms
 }
 ```
 
@@ -60,12 +64,90 @@ The absolute form exists for a fixed-address ABI — one whose entry points are
 addresses rather than symbols, like BareMetal's kernel call table at
 `0x100010..0x100040`. Its displacement is sign-extended to 64 bits, so an address
 outside signed 32-bit range is refused rather than silently truncated. `call
-[symbol]` is refused too: the rip-relative form would mean "call the pointer
-*stored* at the symbol", which is not what the `call symbol` beside it means.
+[symbol]` and `jmp [symbol]` are refused too: the rip-relative form would mean
+"transfer to the pointer *stored* at the symbol", which is not what the direct
+form beside it means.
+
+Both indirect operands are fixed 64-bit in long mode, so a narrower register
+(`jmp eax`) is refused rather than widened.
 
 An indirect call clobbers exactly as a direct one does — the callee's caller-saved
 registers, which the surrounding block's barrier already covers. The register or
 memory holding the target is **read**, not written.
+
+## Operand sizes (x86-64)
+
+A register operand states its own width, so `mov eax, [rcx]` is a four-byte load
+and needs nothing else. A memory operand states none, and where the instruction
+does not settle it either the width must be written out, in nasm's spelling:
+
+```mach
+asm x86_64 {
+    movzx eax, word [rcx]     # a two-byte load, zero-extended into eax
+    movsx rax, dword [rcx]    # a four-byte load, sign-extended (movsxd)
+    mov dword [rcx], 1        # a four-byte store, not the machine word
+    neg qword [rcx]           # an eight-byte read-modify-write
+}
+```
+
+`byte`, `word`, `dword` and `qword` are accepted before a memory operand and
+nowhere else — on a register they would be redundant or contradictory, so
+`mov qword rax, rcx` is refused rather than ignored.
+
+**A prefix that contradicts the instruction is a build error, not a dropped
+token.** What counts as a contradiction is per mnemonic:
+
+| shape | rule |
+|---|---|
+| most instructions | every operand shares one width, so a prefix must agree with any register operand; with no register operand it *sets* the width |
+| `movzx` / `movsx` | the source is narrower by design, so a memory source **must** be sized, and the size must be strictly narrower than the destination |
+| `push` / `pop`, indirect `call` / `jmp` | fixed 64-bit in long mode, so any narrower prefix names no instruction |
+| `lidt` | its pseudo-descriptor is ten bytes, which no keyword names |
+
+So `mov eax, word [rcx]` is refused (two widths for one access), and
+`movzx eax, [rcx]` is refused too — an unsized source names no width at all, and
+reading it as a same-width move would silently assemble a plain `mov` where a
+zero-extending load was written.
+
+## Privileged and systems instructions (x86-64)
+
+Beyond the ordinary surface, an OS-level block reaches:
+
+```mach
+asm x86_64 {
+    cli / sti                 # the interrupt flag
+    cld                       # clear DF before entering a program
+    hlt                       # park the core
+    in al, dx / out dx, al    # port i/o, by immediate port or through dx
+    rdtsc / rdmsr / wrmsr     # the counter and the model-specific registers
+    lidt [rax]                # install an interrupt descriptor table
+    pushfq / popfq            # save and restore RFLAGS
+    swapgs                    # per-CPU state on a syscall entry
+    iretq                     # return from an interrupt handler
+    mov rax, cr2              # the faulting address in a page-fault handler
+    mov cr3, rax              # switch page tables
+    mov eax, cs               # the live selector, for programming STAR
+}
+```
+
+Control registers are `cr0`, `cr2`, `cr3`, `cr4` and `cr8` — CR1 and CR5–CR7 are
+reserved and have no spelling. A control-register move takes a 64-bit
+general-purpose register on its other side, since there is no narrower form.
+Segment registers (`es`, `cs`, `ss`, `ds`, `fs`, `gs`) can be **read** into a
+general-purpose register; writing one through `mov` is not supported, because
+long mode does not admit it for CS and SS at all and the remaining loads carry
+descriptor-cache and interrupt-shadow effects.
+
+None of these writes a register the allocator tracks: the interrupt and direction
+flags, RFLAGS, the stack pointer and a segment base are all outside the allocated
+file, and `mov cr3, rax` writes a control register rather than any general-purpose
+one. `rdtsc` and `rdmsr` are the exceptions — both land their result in EDX:EAX,
+which the effect model reports.
+
+`iretq` does not fall through, and the effect model has no way to say so: a
+`Mnemonic` names registers written and nothing else. That is sound — nothing can
+survive an instruction control never returns from — but it means statements after
+an `iretq` are unreachable without the compiler saying so.
 
 ## Raw encodings
 
@@ -148,6 +230,43 @@ escape for this form.
 Access permission is not checked: whether a register is writable depends on the exception
 level the code runs at, which the compiler does not know. Writing a register that is
 read-only at the current level traps at run time, as the architecture defines.
+
+## Exception conduits and waits (aarch64)
+
+Three instructions generate an exception at a higher level, and they differ only in
+which level answers:
+
+```mach
+asm aarch64 {
+    svc 0                     # the kernel, at EL1
+    hvc 0                     # the hypervisor, at EL2
+    smc 0                     # the secure monitor, at EL3
+}
+```
+
+`hvc` and `smc` are how PSCI is reached, which is the only way to power off or
+restart a `virt` board — `SYSTEM_OFF` and `SYSTEM_RESET` go through whichever
+conduit the firmware provides.
+
+Both follow the SMC Calling Convention, so the compiler declares them as
+destroying **x0–x17**: the result and scratch registers a service may use. x18–x30
+and SP survive, which makes a conduit *cheaper* than an ordinary `bl` — a
+procedure call destroys x0–x18 and x30. Spelling the same instruction as
+`.word 0xd4000002` instead costs every register in every bank, because a raw
+payload is a stream the parser cannot read.
+
+The two waiting hints suspend the core until something wakes it:
+
+```mach
+asm aarch64 {
+    wfi                       # ... until an interrupt: the correct idle loop
+    wfe                       # ... until an event
+}
+```
+
+Neither writes anything, so an idle loop holds every live value across it. `yield`
+is the weaker hint of the three — it asks a hypervisor to schedule elsewhere and
+may do nothing at all, which is why `wfi` is what an idle loop should say.
 
 ## Control-and-status registers (riscv64)
 
