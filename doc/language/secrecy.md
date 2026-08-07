@@ -184,18 +184,37 @@ declared type. What the walk cannot model, it refuses:
 | a body that does not parse | nothing to analyze |
 | a data directive (`.byte`, `.word`, `.long`, `.quad`) | its payload can encode any instruction |
 | a mnemonic the target has not classified | its timing behaviour is unknown |
-| **a flags-conditioned branch** (x86-64 `jcc`, aarch64 `b.<cond>`) | its condition rides the flags register, which the inline-asm effect model does not represent (#2460) |
+| **a flags-conditioned branch on a secret** (x86-64 `jcc`, aarch64 `b.<cond>`) | the flags it reads were filled from a secret |
 
 That last row is a per-target asymmetry worth stating precisely, because getting it
 wrong was a real hole (#2477). A branch whose condition is a **register operand** is
 visible to the walk and is checked: aarch64's `cbz`/`cbnz`, and every riscv64 branch,
 which compares two registers — RISC-V has no flags register at all. A branch whose
-condition rides the **flags register** cannot be checked, because the effect model
-carries no flags, so a `cmp` of a secret before it would be invisible: those are
-refused. x86-64's `jcc` family is flags-conditioned, and so is **aarch64's
-`b.<cond>`** — which is easy to miss, because `b.<cond>` does not appear in aarch64's
-mnemonic table at all. It is admitted by the grammar's *decode hook*, carrying the
-unconditional branch's own opcode with the condition in its flags.
+condition rides the **flags register** is checked against a separate flags-taint
+state (#2460): a `cmp` of a secret marks the flags secret-derived, and a later `jcc`
+reading them is refused, while a compare-and-branch over public data is accepted.
+x86-64's `jcc` family is flags-conditioned, and so is **aarch64's `b.<cond>`** —
+which is easy to miss, because `b.<cond>` does not appear in aarch64's mnemonic table
+at all. It is admitted by the grammar's *decode hook*, carrying the unconditional
+branch's own opcode with the condition in its flags.
+
+The flags model is deliberately more than a single "writes flags" bit, because one
+bit has no correct value for two families. `inc` and `dec` write every status flag
+**except** carry, and the shifts write nothing at all when the count is zero — so
+neither can be taken to have refreshed the flags. A secret `cmp`, a public `inc`, and
+a `jc` is therefore still refused: the carry the branch reads is the secret one. Only
+an instruction that unconditionally overwrites every flag this grammar can read
+(`add`, `sub`, `cmp`, `test`, `and`, `or`, `xor`, `neg`, `cmpxchg`, `xadd`) clears
+the taint. `popfq`, `iretq` and `syscall` load or mask flags from somewhere the model
+does not represent, so they taint unconditionally and never clear.
+
+A `setcc` **consumes** a flag into a register, so with secret-derived flags its
+destination is secret too — otherwise a secret could be laundered out of the flags
+and used as a memory index, which the address check would then miss.
+
+On a target whose grammar has no flag reader at all, every one of these facts is
+vacuous, and that vacuity is asserted per target rather than assumed: adding an
+aarch64 `cset` later has to state its facts deliberately.
 
 The variable-latency check also bites unevenly: x86-64's and aarch64's asm grammars
 carry no divide, multiply or float instruction at all, so it reaches only their
