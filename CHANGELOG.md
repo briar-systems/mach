@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+#### A constant out-of-bounds index is refused, on every target (#2751)
+`var xs: [4]i32; ret xs[9];` compiled cleanly on x86-64, aarch64 and riscv64, and on SPIR-V emitted an `OpAccessChain` with `%uint_9` into a four-element array that `spirv-val` did not catch either. The length is part of the type and the index is a constant, so the violation was decidable with no analysis at all. It had simply never been asked.
+
+Sema now asks it, keyed on `type.element_count` — the one definition of "how many elements a type holds", the same answer `$length_of` gives. Keying on the count rather than on the syntax is what makes the spellings free: a `def` alias, an array field of a generic instance, an array nested in a record or in another array, and a `^`-qualified array all name the same interned array type, and all get the same refusal. A vector's lane count is a statically known length too and now takes the identical rule and the identical message, replacing the vector-only wording it had before.
+
+The diagnostic names the index, the type and the length: ``index 9 is out of bounds for `[4]i32` of length 4``.
+
+Scope is deliberate. Only a **constant** index against a **fixed** length is checked, which needs no dataflow. A runtime index is not checked, and a pointer is not checked at all — `*T` carries no length to measure against.
+
+Folding the index now decides on **resolution identity** rather than on name text. The comptime environment is keyed by name, so a block-local `var n` that shares its name with a module-level `val n` used to fold to the module constant. That was already visible on the vector path, where `v[n]` with a local `n = 1` was reported as an out-of-bounds lane against a module-level `n = 9`; it now reports the dynamic-lane refusal it should always have given, and an array indexed by such a local is correctly left alone rather than refused. The runtime-binding rule the `$if` gate check already carried is now one shared definition.
+
 ### Added
 
 #### A constant pool, so a float constant is loaded rather than rebuilt (#2248, #2700)

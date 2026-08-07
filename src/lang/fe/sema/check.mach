@@ -402,6 +402,135 @@ pub fun check_index(sc: *context.SemaContext, object: type.TypeId, index: type.T
     ret O.some[type.TypeId](elem);
 }
 
+# GATE (#2751): a CONSTANT index outside a STATICALLY KNOWN element count
+#
+# A fixed array's length and a vector's lane count are both part of the type, so
+# an index the compiler can fold is decidable here on every target with no
+# dataflow at all. Keyed on `type.element_count`, which is the ONE definition of
+# "how many elements a type holds" and the same answer `$length_of` gives, so an
+# array and a vector cannot drift into different bounds rules and a `^` wrapper
+# is seen through by exactly the rule that makes `$length_of(^[4]u8)` four.
+#
+# Keying on the count rather than on the syntax is what makes the alias, the
+# generic field and the nested-aggregate spellings free: `def Buf: [4]i32;` and
+# `Box[i64].xs` both name the same interned array type, and the count is read off
+# that type rather than off the expression that reached it.
+#
+# A pointer is deliberately NOT covered: `*T` carries no length, so `p[9]` has
+# nothing to be measured against. A non-constant index is likewise out of scope,
+# that one needs dataflow.
+# ---
+# sc:     the active sema context
+# object: the indexed object's type
+# idx:    the index expression
+# span:   source range of the access
+# ret:    true when the access is in bounds or not decidable here, false (with a
+#         diagnostic) when a folded index falls outside the element count
+pub fun check_const_index(sc: *context.SemaContext, object: type.TypeId, idx: id.ExprId, span: token.Span) bool {
+    val n_opt: O.Option[u32] = type.element_count(?sc.s.types, object);
+    if (O.is_none[u32](n_opt)) { ret true; }
+
+    val cv_opt: O.Option[comptime.CTValue] = const_index_value(sc, idx);
+    if (O.is_none[comptime.CTValue](cv_opt)) { ret true; }
+
+    val n:  u32              = O.unwrap[u32](n_opt);
+    val cv: comptime.CTValue = O.unwrap[comptime.CTValue](cv_opt);
+
+    if (!comptime.ct_is_negative(cv) && cv.data.i:~u64 < n::u64) { ret true; }
+
+    report_index_oob(sc, span, cv, object, n);
+    ret false;
+}
+
+# the constant value of an index expression, or none when this layer cannot
+# decide it
+#
+# Folds through `comptime.eval`, but only once resolution identity has said that
+# no leaf names a runtime binding. The comptime environment is keyed by NAME, so
+# a block-local `var n` that shares its name with a module-level `val n` folds to
+# the module constant, and a bound rule that trusted the fold would refuse a
+# legal access against a value the program never reads.
+# ---
+# sc:  the active sema context
+# eid: the index expression
+# ret: some(value) for a decidable integer index, none otherwise
+pub fun const_index_value(sc: *context.SemaContext, eid: id.ExprId) O.Option[comptime.CTValue] {
+    if (eid == id.EXPR_NIL)                { ret O.none[comptime.CTValue](); }
+    if (references_runtime_binding(sc, eid)) { ret O.none[comptime.CTValue](); }
+
+    val cr: R.Result[comptime.CTValue, str] =
+        comptime.eval(sc.ctx, sc.a, sc.source, eid, ?sc.s.interner);
+    if (R.is_err[comptime.CTValue, str](cr)) { ret O.none[comptime.CTValue](); }
+
+    val cv: comptime.CTValue = R.unwrap_ok[comptime.CTValue, str](cr);
+    if (cv.kind != comptime.CT_KIND_INT) { ret O.none[comptime.CTValue](); }
+    ret O.some[comptime.CTValue](cv);
+}
+
+# walks `eid` reporting whether any leaf identifier resolves to a runtime binding
+# ---
+# sc:  the active sema context
+# eid: the expression to walk (EXPR_NIL terminates it)
+# ret: true when any leaf names storage decided at runtime
+fun references_runtime_binding(sc: *context.SemaContext, eid: id.ExprId) bool {
+    if (eid == id.EXPR_NIL) { ret false; }
+    val opt_expr: O.Option[*expr.Expr] = ast.get_expr(sc.a, eid);
+    if (O.is_none[*expr.Expr](opt_expr)) { ret false; }
+    val e: *expr.Expr = O.unwrap[*expr.Expr](opt_expr);
+
+    if (e.kind == expr.EXPR_KIND_IDENT) {
+        val opt_sym: O.Option[*resolve.Symbol] = context.symbol_for_expr(sc, eid);
+        if (O.is_none[*resolve.Symbol](opt_sym)) { ret false; }
+        ret resolve.symbol_is_runtime(O.unwrap[*resolve.Symbol](opt_sym));
+    }
+    if (e.kind == expr.EXPR_KIND_BINARY) {
+        ret references_runtime_binding(sc, e.data.binary.lhs)
+         || references_runtime_binding(sc, e.data.binary.rhs);
+    }
+    if (e.kind == expr.EXPR_KIND_UNARY) {
+        ret references_runtime_binding(sc, e.data.unary.operand);
+    }
+    ret false;
+}
+
+# report `index N is out of bounds for `T` of length L` at `span`
+#
+# degrades to a static message on any allocation failure so the refusal always
+# lands.
+# ---
+# sc:     the active sema context
+# span:   source range of the access
+# cv:     the folded index
+# object: the indexed object's type
+# n:      its element count
+fun report_index_oob(sc: *context.SemaContext, span: token.Span, cv: comptime.CTValue, object: type.TypeId, n: u32) {
+    val res_type: R.Result[str, str] = type_to_str(sc, object);
+    if (R.is_err[str, str](res_type)) {
+        report(sc, span, "index out of bounds for the element count");
+        ret;
+    }
+    val type_str: str = R.unwrap_ok[str, str](res_type);
+
+    var res_msg: R.Result[str, str] = R.err[str, str]("unformatted");
+    if (cv.int_unsigned) {
+        res_msg = format.sprint(sc.s.alloc, "index {} is out of bounds for `{}` of length {}",
+            cv.data.i:~u64, type_str, n);
+    }
+    or {
+        res_msg = format.sprint(sc.s.alloc, "index {} is out of bounds for `{}` of length {}",
+            cv.data.i, type_str, n);
+    }
+    if (R.is_err[str, str](res_msg)) {
+        report(sc, span, "index out of bounds for the element count");
+        type_str_free(sc, type_str);
+        ret;
+    }
+    val msg: str = R.unwrap_ok[str, str](res_msg);
+    report(sc, span, msg);
+    A.deallocate[char](sc.s.alloc, msg, str_len(msg) + 1);
+    type_str_free(sc, type_str);
+}
+
 # GATE (#2191): reject a value used as a MEMORY ADDRESS whose own type is secret
 #
 # The address half of the leakage model's memory rule, and the exact counterpart of
