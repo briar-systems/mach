@@ -23,6 +23,55 @@ Three refusals, and one of them turned out to be two:
 Also refused on a `#[uniform]` / `#[storage]` interface block, whose member offsets are fixed by std140 / std430.
 
 **riscv64 gets a written claim rather than a green tick.** Unaligned access there is permitted-but-may-trap and Linux emulates a trapping one in the kernel, so a packed field access is expected to be correct and pathologically slow. That cost cannot be measured under qemu-user, which emulates the misaligned load directly and never takes the kernel path. The decorator docs say so rather than leaving a passing correctness leg to be read as a usability result.
+#### `$length_of`, and a type operand may be a value binding (#2536)
+A program could not ask a value how long it is. `$size_of` took a **type**, and a binding's type has no spelling -- `val LOGO: [_]u8` really is a concrete `[7194]u8` that is simply never written -- so an `#[embed]` could be indexed and passed around and never **iterated**. The only way to learn an embed's length was to declare it as an explicit `[N]u8`, which defeats the inferred form for any asset whose size is not fixed by contract.
+
+Two changes, and they are separable on purpose.
+
+**`$length_of(T)` counts elements where `$size_of(T)` counts bytes.** For `[N]u8` the two answers are equal, and for everything else they are not. Making the caller divide by an element size is exactly the silent-arithmetic error this codebase keeps finding, and the equality at `u8` is what hides it during development, so the distinction belongs in the surface rather than in the caller's head. A vector's length is its **lane count**, which is decided rather than incidental.
+
+Only a fixed array and a vector have an answer. Everything else is **refused rather than guessed**, naming the type: a pointer (`str` included) has a length the compiler does not know, and a record has a field count rather than an element count.
+
+**A value binding is accepted in a comptime intrinsic's type-operand slot**, denoting that binding's type:
+
+```mach
+#[embed("assets/logo.qoi")]
+val LOGO: [_]u8;
+
+var i: u64 = 0;
+for (i < $length_of(LOGO)) { ... }     # 7194 elements
+$size_of(LOGO)                         # 7194 bytes
+```
+
+This is the **operand slot's** rule rather than a per-intrinsic one -- "does this name a type" is the slot's question, and every intrinsic that takes one asks it identically -- and it is *only* that slot. A name written where a type is expected and resolving to a value is still a mistake in every other position, and accepting it there would turn a typo into a silently-typed binding. The slot is marked where it is produced, by the parser, rather than inferred later from context.
+
+The issue's premise that "a value name and a type name occupy separate registries" does **not** hold: both live in one scope chain, so a name is either a type or a value and never both. There is no ambiguity to resolve, which is why the scoping is by position rather than by lookup order.
+
+A local binding's operand resolves the binding's **annotation node** rather than reading the parallel `decl_type` array, because the operand is reached from `resolve_all_types`, which runs before that array is filled -- reading it would answer TYPE_ERROR for every binding declared after the measurement. Pinned by a case that measures a binding declared later in the file.
+
+The `#[embed]` limitation note on the decorators page comes out with this.
+
+#### `$pointee_of(T)` makes a reference field traversable (#2693)
+`$is_pointer(f.type)` told a reflection walk that a field was a reference, and that is where the walk stopped: there was no way to ask what a typed reference points at. `std.derive` refused every reference field at comptime as a result, which blocked the whole family that wants one -- deep equality, owning clone, a hash over pointed-to contents, and a formatter that renders a `str` field, since `str` is `def str: *char` and so a reference field like any other.
+
+`$pointee_of` is a type **constructor**, in the same family as `*`, `[N]` and `^`, rather than an intrinsic call. That is what makes it nest, and nesting is the requirement rather than a nicety: the descent a walk actually performs is `$fields($pointee_of(f.type))`, an operand inside an operand, and a call cannot appear where a type is required.
+
+```mach
+$each f in $fields(Node) {
+    $if ($is_pointer(f.type)) {
+        $each g in $fields($pointee_of(f.type)) { total = total + (@(n.[f])).[g]; }
+    }
+    $or { total = total + n.[f]; }
+}
+```
+
+**Everything that is not a typed reference is refused, and the refusal names what it was handed**: the raw `ptr` with its own cause (it is untyped and carries no pointee), `^*U` because `$is_pointer` answers false for it and descending would put the intrinsic back into the disagreement with its own gate that #2692 closed, and any other type by name. A plausible wrong answer here flows into a `$fields` walk that then reports about the wrong record, which is the failure class a refusal exists to prevent.
+
+**`$pointee_of(**U)` is `*U`, one level and not all of them.** An implementation that peeled to the innermost non-pointer passes every single-level case and is wrong here, so it is pinned by value rather than by compiling.
+
+**A latent memo bug surfaced with it and is fixed.** `resolve_type_ref` skipped its memo for `f.type`, whose answer changes per `$each` iteration -- but the rule was written as "this node IS `f.type`" when the real rule is "this node's answer is not fixed by its source text". The two agreed only because `f.type` was spellable at two leaf sites and nowhere else. `$pointee_of(f.type)` is a composite containing one, so the memo would have handed every iteration after the first the first field's pointee. Pinned by a record with two reference fields at *different* pointees, where a stale answer is a clean compile with a wrong field count.
+
+Termination is the caller's problem and is stated as such: unlike the by-value walk of #2691, following references does not terminate structurally, since `rec Grow[T] { p: *Grow[*T]; }` has unboundedly many instances reachable through its pointer.
 
 ### Fixed
 

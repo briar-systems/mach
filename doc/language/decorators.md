@@ -440,10 +440,11 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
 - The annotation must be `[_]u8` or `[N]u8`; the element type must be `u8`.
   `[_]` is an inferred array length, legal **only** on an `#[embed]`
   declaration — written anywhere else it is rejected (see
-  [grammar.md](grammar.md#types)). Mach has no intrinsic that measures a
-  value's type (`$size_of` takes a type, not a value), so a program cannot ask
-  a `[_]u8` embed for its own length; use the explicit `[N]u8` form when the
-  count is needed, or declare it alongside.
+  [grammar.md](grammar.md#types)). A `[_]u8` embed can be asked for its own
+  length: `$length_of(LOGO)` is its element count and `$size_of(LOGO)` its byte
+  count, both folded at compile time (see
+  [comptime-intrinsics.md](comptime-intrinsics.md)). The explicit `[N]u8` form
+  is for pinning a size by contract, not for recovering one.
 - An explicit `[N]u8` whose `N` disagrees with the file is rejected, naming
   both counts. This is how a declaration pins a fixed-size asset — a boot
   sector, a ROM image — so the build fails the moment it stops being that

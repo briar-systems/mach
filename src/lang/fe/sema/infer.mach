@@ -437,7 +437,8 @@ pub fun answer_type_query(s: *session.Session, tid: u32, which: u8) R.Result[O.O
 fun fold_layout_intrinsic(sc: *context.SemaContext, eid: id.ExprId, span: token.Span) O.Option[O.Option[comptime.CTValue]] {
     val is_size:  bool = comptime.is_size_of_call(sc.a, sc.source, eid);
     val is_align: bool = comptime.is_align_of_call(sc.a, sc.source, eid);
-    if (!is_size && !is_align) { ret O.none[O.Option[comptime.CTValue]](); }
+    val is_len:   bool = comptime.is_length_of_call(sc.a, sc.source, eid);
+    if (!is_size && !is_align && !is_len) { ret O.none[O.Option[comptime.CTValue]](); }
 
     val arg: id.ExprId = comptime.layout_intrinsic_type_arg(sc.a, eid);
     if (arg == id.EXPR_NIL) {
@@ -449,6 +450,22 @@ fun fold_layout_intrinsic(sc: *context.SemaContext, eid: id.ExprId, span: token.
     # already on the sink and must not be doubled.
     val tid: type.TypeId = intrinsic_operand_type(sc, arg, span);
     if (tid == type.TYPE_ERROR) { ret O.some[O.Option[comptime.CTValue]](O.none[comptime.CTValue]()); }
+
+    # `$length_of` counts elements and never asks for storage, so it neither forces
+    # layout nor can close a layout cycle. It is answered before the forcing below
+    # rather than after it, which is what keeps `[$length_of(A)]u8` measurable inside
+    # a type whose own layout is still being decided.
+    if (is_len) {
+        val n_opt: O.Option[u32] = type.element_count(?sc.s.types, tid);
+        if (O.is_none[u32](n_opt)) {
+            check.report_typed(sc, span, "`$length_of` has no answer for `", tid,
+                "`: only a fixed array and a vector carry a statically known element count",
+                "`$length_of` expects a fixed array or a vector");
+            ret O.some[O.Option[comptime.CTValue]](O.none[comptime.CTValue]());
+        }
+        ret O.some[O.Option[comptime.CTValue]](
+            O.some[comptime.CTValue](comptime.ct_uint(O.unwrap[u32](n_opt)::u64)));
+    }
 
     val cyc: O.Option[intern.StrId] = ensure_layout_ready(sc, tid);
     if (O.is_some[intern.StrId](cyc)) {
@@ -2156,6 +2173,14 @@ fun infer_comptime_intrinsic(sc: *context.SemaContext, c: *expr.ExprCall, span: 
         ret type.TYPE_ERROR;
     }
 
+    # `$pointee_of(T)` is a type CONSTRUCTOR read by the type grammar (#2693), so
+    # reaching here at all means it was written where a value is expected. Reported
+    # precisely rather than left to surface as a bare-comptime-ident error.
+    if (name == interned(sc, "pointee_of")) {
+        context.report(sc, span, "`$pointee_of` names a type, not a value; write it where a type is expected");
+        ret type.TYPE_ERROR;
+    }
+
     # the type queries (#2128) take the same single type-naming argument and answer
     # about its SHAPE rather than its storage: three bool predicates and the string
     # `$type_name`. Typed here so the operand's expr_type is stamped for the
@@ -2192,7 +2217,8 @@ fun infer_comptime_intrinsic(sc: *context.SemaContext, c: *expr.ExprCall, span: 
     val is_size:   bool = name == interned(sc, "size_of");
     val is_align:  bool = name == interned(sc, "align_of");
     val is_offset: bool = name == interned(sc, "offset_of");
-    if (!is_size && !is_align && !is_offset) { ret type.TYPE_NIL; }
+    val is_len:    bool = name == interned(sc, "length_of");
+    if (!is_size && !is_align && !is_offset && !is_len) { ret type.TYPE_NIL; }
 
     var need: u32 = 1;
     if (is_offset) { need = 2; }
@@ -2200,6 +2226,7 @@ fun infer_comptime_intrinsic(sc: *context.SemaContext, c: *expr.ExprCall, span: 
         var iname: str = "$size_of: expected ";
         if (is_align)  { iname = "$align_of: expected "; }
         if (is_offset) { iname = "$offset_of: expected "; }
+        if (is_len)    { iname = "$length_of: expected "; }
         context.report_numbered(sc, span, iname, need::usize, " argument(s)", "comptime intrinsic: wrong number of arguments");
         ret type.TYPE_ERROR;
     }
@@ -2214,6 +2241,16 @@ fun infer_comptime_intrinsic(sc: *context.SemaContext, c: *expr.ExprCall, span: 
     val op_ty: type.TypeId = intrinsic_operand_type(sc, arg0, span);
     set_expr_type(sc, arg0, op_ty);
     if (op_ty == type.TYPE_ERROR) { ret type.TYPE_ERROR; }
+
+    # `$length_of` REFUSES rather than guesses: only a fixed array and a vector carry
+    # a statically known element count, and reported here means the value position is
+    # refused with a span rather than reaching the lowering fold, which has none.
+    if (is_len && O.is_none[u32](type.element_count(?sc.s.types, op_ty))) {
+        check.report_typed(sc, span, "`$length_of` has no answer for `", op_ty,
+            "`: only a fixed array and a vector carry a statically known element count",
+            "`$length_of` expects a fixed array or a vector");
+        ret type.TYPE_ERROR;
+    }
     ret prim_or_error(sc, type.TYPE_U64);
 }
 
@@ -3038,11 +3075,13 @@ fun infer_struct_lit(sc: *context.SemaContext, sl: *expr.ExprStructLit, span: to
 # tid: syntactic AstType id to resolve
 # ret: the interned semantic TypeId (TYPE_ERROR on failure)
 pub fun resolve_type_ref(sc: *context.SemaContext, tid: id.TypeId) type.TypeId {
-    # `f.type` (#2691) is answered from the LIVE `$each` binding, so one syntactic
-    # node has a different answer per iteration and neither reads nor writes the
-    # memo. every other kind's answer is fixed by its source text, which is what
-    # makes memoizing them sound.
-    if (is_field_type_node(sc, tid)) { ret resolve_type_ref_raw(sc, tid); }
+    # a node whose answer is not fixed by its source text neither reads nor writes
+    # the memo. that is the real rule; `f.type` being a leaf was only how it looked
+    # while `f.type` was spellable at two leaf sites and nowhere else (#2691). a type
+    # CONSTRUCTOR can now take one as its operand (#2693), so `$pointee_of(f.type)`
+    # is a composite with a different answer per iteration, and memoizing it would
+    # hand every later iteration the first one's field - present, plausible, wrong.
+    if (type_is_per_iteration(sc, tid)) { ret resolve_type_ref_raw(sc, tid); }
 
     # a node already resolved by this pass yields the answer it yielded then, without
     # re-running the resolution or re-emitting its diagnostics (#2334). The memo exists
@@ -3071,6 +3110,38 @@ fun is_field_type_node(sc: *context.SemaContext, tid: id.TypeId) bool {
     val t_opt: O.Option[*atype.Type] = ast.get_type(sc.a, tid);
     if (O.is_none[*atype.Type](t_opt)) { ret false; }
     ret O.unwrap[*atype.Type](t_opt).kind == atype.TYPE_KIND_FIELD_TYPE;
+}
+
+# whether `tid`'s resolution depends on the live `$each` binding rather than only
+# on its source text, and is therefore not memoizable (#2693)
+#
+# `f.type` itself, or any constructor spelled around one. Only the constructors that
+# can actually enclose a `f.type` operand are walked - `$pointee_of` today - because
+# the other composites take their operands from the ordinary type grammar, where
+# `f.type` is reachable through this same predicate and would be caught by the same
+# recursion if it ever appeared there.
+# ---
+# sc:  the context
+# tid: the syntactic type node
+# ret: true when the node must be resolved fresh at every use
+pub fun type_is_per_iteration(sc: *context.SemaContext, tid: id.TypeId) bool {
+    if (tid == id.TYPE_NIL) { ret false; }
+    val t_opt: O.Option[*atype.Type] = ast.get_type(sc.a, tid);
+    if (O.is_none[*atype.Type](t_opt)) { ret false; }
+    val t: *atype.Type = O.unwrap[*atype.Type](t_opt);
+    if (t.kind == atype.TYPE_KIND_FIELD_TYPE) { ret true; }
+    if (t.kind == atype.TYPE_KIND_POINTEE_OF) { ret type_is_per_iteration(sc, t.data.pointee_of.inner); }
+    if (t.kind == atype.TYPE_KIND_PTR)        { ret type_is_per_iteration(sc, t.data.ptr.pointee); }
+    if (t.kind == atype.TYPE_KIND_SECRET)     { ret type_is_per_iteration(sc, t.data.secret.inner); }
+    if (t.kind == atype.TYPE_KIND_ARRAY)      { ret type_is_per_iteration(sc, t.data.array.element); }
+    if (t.kind == atype.TYPE_KIND_NAMED) {
+        var i: u32 = 0;
+        for (i < t.data.named.args_len) {
+            if (type_is_per_iteration(sc, sc.a.type_ids[t.data.named.args_start + i])) { ret true; }
+            i = i + 1;
+        }
+    }
+    ret false;
 }
 
 # `tid`'s memo state for this pass (#2334)
@@ -3139,6 +3210,7 @@ fun resolve_type_ref_raw(sc: *context.SemaContext, tid: id.TypeId) type.TypeId {
     if (t.kind == atype.TYPE_KIND_PTR)    { ret resolve_type_ptr(sc, ?t.data.ptr); }
     if (t.kind == atype.TYPE_KIND_SECRET) { ret resolve_type_secret(sc, ?t.data.secret); }
     if (t.kind == atype.TYPE_KIND_FIELD_TYPE) { ret resolve_type_field_type(sc, ?t.data.field_type, t.span); }
+    if (t.kind == atype.TYPE_KIND_POINTEE_OF) { ret resolve_type_pointee_of(sc, ?t.data.pointee_of, t.span); }
     if (t.kind == atype.TYPE_KIND_ARRAY)  { ret resolve_type_array(sc, tid, ?t.data.array, t.span); }
     if (t.kind == atype.TYPE_KIND_FUN)   { ret resolve_type_fun(sc, ?t.data.fun_); }
     if (t.kind == atype.TYPE_KIND_REC)   { ret resolve_type_anon(sc, tid, t.data.rec_.fields_start, t.data.rec_.fields_len, type.TYPE_REC); }
@@ -3177,6 +3249,60 @@ fun resolve_type_field_type(sc: *context.SemaContext, ft: *atype.TypeFieldType, 
     ret O.unwrap[u32](got)::type.TypeId;
 }
 
+# POINTEE_OF: the type a typed reference `*U` refers to (#2693)
+#
+# The descent half of the gate-then-descend pair `$is_pointer` opens: a walk that
+# detects a reference field can now read through it. Refusal is the answer for
+# everything that is not a typed reference, and each refusal names the type it was
+# handed, because the alternative is a plausible wrong type flowing into a `$fields`
+# walk that then reports about the wrong record.
+#
+# THE RAW `ptr` IS REFUSED, not resolved to anything. It carries no pointee, and the
+# only types that could stand in for one - `u8`, the operand itself - would each be
+# a silently wrong answer at a site whose whole purpose is to be followed.
+#
+# `^` IS NOT STRIPPED, which agrees with `$is_pointer` rather than with `$size_of`
+# (#2692): `^*U` answers false to the gate, so descending through it would put the
+# intrinsic and the gate that guards it back into the disagreement #2692 closed, and
+# would hand a walk secret storage it was refused at the gate.
+#
+# An unbound generic parameter yields TYPE_ERROR WITHOUT a diagnostic, matching the
+# `f.type` leaf: the template has no answer, and the per-instance episode re-resolves
+# with the argument substituted, which is where the answer - or the refusal - exists.
+# ---
+# sc:   the context
+# po:   the syntactic node's payload
+# span: the spelling's span, for diagnostics
+# ret:  the pointee type, or TYPE_ERROR
+fun resolve_type_pointee_of(sc: *context.SemaContext, po: *atype.TypePointeeOf, span: token.Span) type.TypeId {
+    val inner: type.TypeId = resolve_type_ref(sc, po.inner);
+    if (inner == type.TYPE_ERROR || inner == type.TYPE_NIL) { ret type.TYPE_ERROR; }
+
+    val k: type.TypeKind = type.shape_kind(?sc.s.types, inner);
+    if (k == type.TYPE_GENERIC_PARAM) { ret type.TYPE_ERROR; }
+
+    if (type.is_secret(?sc.s.types, inner)) {
+        check.report_typed(sc, span, "`$pointee_of` refuses `", inner,
+            "`: a `^` secret is not a reference, and `$is_pointer` answers false for it",
+            "`$pointee_of` refuses a `^` secret operand");
+        ret type.TYPE_ERROR;
+    }
+
+    val t_opt: O.Option[*type.Type] = type.get(?sc.s.types, inner);
+    if (O.is_some[*type.Type](t_opt) && O.unwrap[*type.Type](t_opt).kind == type.TYPE_POINTER) {
+        ret O.unwrap[*type.Type](t_opt).data.pointer.base;
+    }
+
+    if (k == type.TYPE_PTR) {
+        context.report(sc, span, "`$pointee_of(ptr)` has no answer: the raw `ptr` is untyped and carries no pointee type");
+        ret type.TYPE_ERROR;
+    }
+
+    check.report_typed(sc, span, "`$pointee_of` expects a typed reference `*U`, but this names `", inner, "`",
+        "`$pointee_of` expects a typed reference `*U`");
+    ret type.TYPE_ERROR;
+}
+
 # NAMED: resolve the symbol the name refers to and map it to the type it names
 #
 # The symbol is recorded by resolve in type_resolved; it maps to the nominal /
@@ -3212,7 +3338,73 @@ fun resolve_type_named(sc: *context.SemaContext, tid: id.TypeId, named: *atype.T
         ret instantiate_named(sc, sym, named, span);
     }
 
+    # IN A COMPTIME INTRINSIC'S OPERAND SLOT ONLY, a name that resolves to a value
+    # binding denotes that binding's type (#2536). A binding's type has no spelling -
+    # `val LOGO: [_]u8` really is a concrete `[7194]u8` that cannot be written - so
+    # without this a program can index an embed and pass it around and never learn
+    # its length.
+    #
+    # Scoped by the slot rather than by the intrinsic, because the question "does
+    # this name a type" is the operand slot's, and every intrinsic that takes one
+    # asks it identically. NOT widened to type positions generally: a name written
+    # where a type is expected and resolving to a value is a mistake everywhere else,
+    # and accepting it there would turn that mistake into a silently-typed binding.
+    if (named.operand && is_value_binding(sym)) { ret binding_type_for(sc, sym, span); }
+
     ret type_for_symbol(sc, sym, span);
+}
+
+# whether `sym` is a value binding whose type a type-operand slot can denote (#2536)
+#
+# A `val` / `var` / parameter, or a cross-module import of one. A COMPTIME binding is
+# excluded: a `$each` field descriptor is a SYM_VAL with no declaration behind it and
+# no type of its own, and `f.type` is already the spelling for the type it carries.
+# ---
+# sym: the resolved symbol
+# ret: true when the symbol names a runtime value with a declared type
+fun is_value_binding(sym: *resolve.Symbol) bool {
+    if ((sym.flags & resolve.SYM_FLAG_COMPTIME) != 0) { ret false; }
+    if (sym.decl == id.DECL_NIL)                      { ret false; }
+    if (sym.kind == resolve.SYM_VAL)   { ret true; }
+    if (sym.kind == resolve.SYM_VAR)   { ret true; }
+    if (sym.kind == resolve.SYM_PARAM) { ret true; }
+    ret false;
+}
+
+# the semantic type of a value binding named in a type-operand slot (#2536)
+#
+# A LOCAL binding resolves its annotation node rather than reading `decl_type`, the
+# same recomputation `def_underlying` performs and for the same reason: the operand
+# is reached from `resolve_all_types`, which runs before the parallel array is
+# filled, so reading it would answer TYPE_ERROR for every binding declared after the
+# measurement. A parameter has no annotation node of its own on this path and reads
+# through `decl_type_for`, which recovers it from the function declaration.
+#
+# The annotation is guaranteed by the parser - a binding without one is rejected
+# where it is written - so the TYPE_NIL arm is an assertion of that, not a case a
+# program can reach.
+# ---
+# sc:   sema context
+# sym:  the resolved binding symbol
+# span: the spelling's span, for diagnostics
+# ret:  the binding's type, or TYPE_ERROR
+fun binding_type_for(sc: *context.SemaContext, sym: *resolve.Symbol, span: token.Span) type.TypeId {
+    if (sym.kind == resolve.SYM_PARAM || sym.origin != sc.own_module) {
+        val t: type.TypeId = context.decl_type_for(sc, sym);
+        if (t == type.TYPE_NIL || t == type.TYPE_ERROR) {
+            check.report_named(sc, span, "`", sym.name, "` has no type a comptime intrinsic can measure here",
+                "binding has no type a comptime intrinsic can measure here");
+            ret type.TYPE_ERROR;
+        }
+        ret t;
+    }
+
+    val d_opt: O.Option[*decl.Decl] = ast.get_decl(sc.a, sym.decl);
+    if (O.is_none[*decl.Decl](d_opt)) { ret type.TYPE_ERROR; }
+    val d: *decl.Decl = O.unwrap[*decl.Decl](d_opt);
+    if (d.kind != decl.DECL_KIND_VAL && d.kind != decl.DECL_KIND_VAR) { ret type.TYPE_ERROR; }
+    if (d.data.bind.ty == id.TYPE_NIL) { ret type.TYPE_ERROR; }
+    ret resolve_type_ref(sc, d.data.bind.ty);
 }
 
 # map a resolved type-name symbol to the semantic type it names
