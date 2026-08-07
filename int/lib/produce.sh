@@ -94,7 +94,11 @@
 #                 INSTRUCTION NAME with its operand count, plus every core OpDot, in
 #                 emission order, alongside the module's OpExtInstImport count - which
 #                 is what makes "imported only when used" an assertion rather than a
-#                 claim. the environment is chosen PER MODULE rather than per case:
+#                 claim, and its OpCompositeConstruct / Function-storage OpAccessChain
+#                 counts, which
+#                 are what distinguish a vector literal built in one step from the
+#                 storage round trip it replaced (#2640) - both being valid SPIR-V,
+#                 so the verdict cannot tell them apart. the environment is chosen PER MODULE rather than per case:
 #                 a module carrying entry points is a shader and is validated under
 #                 vulkan1.3, and one without is a library, which declares the Linkage
 #                 capability Vulkan forbids outright and is validated universally. a
@@ -1948,8 +1952,20 @@ produce_spirv_shader() {
             env=universal
         fi
         imports=$(printf '%s\n' "$dis" | grep -c 'OpExtInstImport' || true)
-        printf 'module=%s kind=%s env=%s validator=clean extimports=%d\n' \
-            "$rel" "$kind" "$env" "$imports"
+        # the vector-construction shape (#2640). a literal built in one step is an
+        # OpCompositeConstruct and no access chain; the storage form it replaced is a
+        # Function OpVariable plus one OpAccessChain and OpStore per lane, which is
+        # equally VALID SPIR-V - so counting both is what tells the two apart, where
+        # the validator's verdict cannot.
+        builds=$(printf '%s\n' "$dis" | grep -c 'OpCompositeConstruct' || true)
+        # only the FUNCTION-storage chains, which are the per-lane writes a vector
+        # assembled through a stack slot produces. a plain OpAccessChain count would
+        # also sweep up uniform and storage-buffer member walks, which are a different
+        # feature and are optimizer-sensitive - one of them is CSE'd at opt 2, so the
+        # raw count differs between profiles and cannot be a golden shared by both.
+        lanechains=$(printf '%s\n' "$dis" | awk '$3 == "OpAccessChain" && $4 ~ /_ptr_Function_/ { n++ } END { print n + 0 }')
+        printf 'module=%s kind=%s env=%s validator=clean extimports=%d composites=%d lanechains=%d\n' \
+            "$rel" "$kind" "$env" "$imports" "$builds" "$lanechains"
         printf '%s\n' "$dis" | awk '
             # "%29 = OpExtInstImport "GLSL.std.450"" — remember which set each id is,
             # so an OpExtInst can be reported by set NAME rather than by an id that
