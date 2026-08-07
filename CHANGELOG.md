@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+#### `$pointee_of(T)` makes a reference field traversable (#2693)
+`$is_pointer(f.type)` told a reflection walk that a field was a reference, and that is where the walk stopped: there was no way to ask what a typed reference points at. `std.derive` refused every reference field at comptime as a result, which blocked the whole family that wants one -- deep equality, owning clone, a hash over pointed-to contents, and a formatter that renders a `str` field, since `str` is `def str: *char` and so a reference field like any other.
+
+`$pointee_of` is a type **constructor**, in the same family as `*`, `[N]` and `^`, rather than an intrinsic call. That is what makes it nest, and nesting is the requirement rather than a nicety: the descent a walk actually performs is `$fields($pointee_of(f.type))`, an operand inside an operand, and a call cannot appear where a type is required.
+
+```mach
+$each f in $fields(Node) {
+    $if ($is_pointer(f.type)) {
+        $each g in $fields($pointee_of(f.type)) { total = total + (@(n.[f])).[g]; }
+    }
+    $or { total = total + n.[f]; }
+}
+```
+
+**Everything that is not a typed reference is refused, and the refusal names what it was handed**: the raw `ptr` with its own cause (it is untyped and carries no pointee), `^*U` because `$is_pointer` answers false for it and descending would put the intrinsic back into the disagreement with its own gate that #2692 closed, and any other type by name. A plausible wrong answer here flows into a `$fields` walk that then reports about the wrong record, which is the failure class a refusal exists to prevent.
+
+**`$pointee_of(**U)` is `*U`, one level and not all of them.** An implementation that peeled to the innermost non-pointer passes every single-level case and is wrong here, so it is pinned by value rather than by compiling.
+
+**A latent memo bug surfaced with it and is fixed.** `resolve_type_ref` skipped its memo for `f.type`, whose answer changes per `$each` iteration -- but the rule was written as "this node IS `f.type`" when the real rule is "this node's answer is not fixed by its source text". The two agreed only because `f.type` was spellable at two leaf sites and nowhere else. `$pointee_of(f.type)` is a composite containing one, so the memo would have handed every iteration after the first the first field's pointee. Pinned by a record with two reference fields at *different* pointees, where a stale answer is a clean compile with a wrong field count.
+
+Termination is the caller's problem and is stated as such: unlike the by-value walk of #2691, following references does not terminate structurally, since `rec Grow[T] { p: *Grow[*T]; }` has unboundedly many instances reachable through its pointer.
+
 ## [4.14.0] - 2026-08-07
 
 ### Added

@@ -398,13 +398,17 @@ type ::= secret-type
        | fun-type
        | rec-type
        | uni-type
+       | pointee-of-type
+       | field-type
        | named-type
 
-secret-type ::= "^" type
-ptr-type    ::= "*" type
-array-type  ::= "[" ( expr | "_" ) "]" type
-named-type  ::= dotted-path [ type-args ]
-type-args   ::= "[" [ type { "," type } [ "," ] ] "]"
+secret-type     ::= "^" type
+ptr-type        ::= "*" type
+array-type      ::= "[" ( expr | "_" ) "]" type
+pointee-of-type ::= "$" "pointee_of" "(" type ")"
+field-type      ::= IDENT "." "type"
+named-type      ::= dotted-path [ type-args ]
+type-args       ::= "[" [ type { "," type } [ "," ] ] "]"
 
 fun-type ::= "fun" "(" [ fun-type-params ] ")" [ type ]
 fun-type-params ::= "..."
@@ -425,6 +429,15 @@ Notes:
   [secrecy.md](secrecy.md).
 - `*T` is a pointer; the untyped pointer type is the primitive name `ptr`
   (an ordinary `named-type`, not its own syntax).
+- `$pointee_of(T)` is the type a typed reference `*U` refers to (#2693). It is a
+  type **constructor** rather than an intrinsic call, which is what lets it nest
+  inside another intrinsic's operand and inside a generic argument list. `ptr`,
+  `^*U`, and any non-reference operand are refused by sema, each with its own
+  cause — see [comptime-intrinsics.md](comptime-intrinsics.md).
+- `f.type` is a field descriptor's own type inside a `$each` body (#2691), and is
+  a type spelling in its own right so a constructor can take one
+  (`$pointee_of(f.type)`). `type` is contextual, not a keyword: a module or record
+  member genuinely named `type` still reads as a path (`mod.type.T`, `mod.type[A]`).
 - `[N]T` is a fixed-length array; `N` is a full expression (a comptime
   constant), including `$size_of(T)` / `$align_of(T)` — see
   [comptime-intrinsics.md](comptime-intrinsics.md). Nesting (`[N][M]T`) falls out

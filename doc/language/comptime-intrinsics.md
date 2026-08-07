@@ -121,6 +121,65 @@ $each f in $fields(Outer) {
 }
 ```
 
+## `$pointee_of(T)` — descend through a reference
+
+`$is_pointer` tells a walk that a field is a reference. `$pointee_of` says what it
+refers to, which is what makes the reference traversable rather than merely
+detectable:
+
+```mach
+$pointee_of(*U)         # U
+$pointee_of(**U)        # *U — one level, not all of them
+```
+
+It is a type **constructor**, in the same family as `*`, `[N]` and `^`, not a call
+that returns a value. So it is written wherever a type is written, including nested
+inside another intrinsic's operand and inside a generic argument list:
+
+```mach
+rec Node { value: i64; next: *Inner; }
+
+$each f in $fields(Node) {
+    $if ($is_pointer(f.type)) {
+        $each g in $fields($pointee_of(f.type)) {    # gate, then descend
+            total = total + (@(n.[f])).[g];
+        }
+    }
+    $or { total = total + n.[f]; }
+}
+```
+
+Because `str` is `def str: *char`, a `str` field is a reference field, and
+`$pointee_of(str)` is `u8` — which is what a formatter that renders a `str` field
+needs.
+
+**Everything that is not a typed reference is refused, and the refusal names what
+it was handed.** A plausible wrong type here flows into a `$fields` walk that then
+reports about the wrong record, so refusing is the only safe answer:
+
+| operand | result |
+|---|---|
+| `*U` | `U` |
+| `ptr` | refused — the raw pointer is untyped and carries no pointee |
+| `^*U` | refused — a `^` secret is not a reference |
+| anything else | refused, naming the type |
+
+`^` is **not** stripped, which puts `$pointee_of` with the predicates rather than
+with `$size_of`: `$is_pointer(^*U)` answers false, so descending through `^*U` would
+put the intrinsic and the gate that guards it back into disagreement, and would hand
+a walk secret storage the gate refused it.
+
+**Following references does not terminate structurally.** The by-value walk `$fields`
+supports does: a record cannot contain itself by value, so descending on `$is_record`
+reaches a finite set of types. A reference graph has no such property —
+`rec Grow[T] { p: *Grow[*T]; n: i64; }` is legal and has unboundedly many distinct
+instances, and a walk that follows `p` generates `Grow[i64]`, `Grow[*i64]`,
+`Grow[**i64]` without end. The compiler's generic-instantiation guard turns that into
+a diagnostic naming the derivation chain rather than a hang, but that is a backstop,
+not a termination story. A library that walks references owes its callers one of its
+own, which is why `std.derive` refuses reference fields by default and offers
+following as a separately named member.
+
 ## `$type_name(T)` — a type's spelling
 
 ```mach
@@ -143,6 +202,7 @@ about storage.**
 |---|---|
 | `$size_of` / `$align_of` / `$offset_of` | yes — a secret occupies its base type's storage |
 | `$is_record` / `$is_union` / `$is_pointer` | no — `^T` is a secret, not a `T` |
+| `$pointee_of` | no — `^*U` is a secret, and is refused rather than followed |
 | `$type_name` | no — the spelling is `^T` |
 | `$fields` | no — a secret record is refused, not walked |
 | type comparison (`f.type == u64`) | no — `^u64` is not `u64` |
@@ -151,7 +211,9 @@ about storage.**
 
 `$size_of` / `$align_of` / `$offset_of` / `$fields` and the queries above all take a
 **type** in argument 0, written with the ordinary type grammar — plus one extra
-form: a field descriptor's `f.type` inside a `$each` body.
+form: a field descriptor's `f.type` inside a `$each` body. `$pointee_of` is part of
+that grammar rather than one of its consumers, so it composes with every one of
+them (`$size_of($pointee_of(f.type))`, `$fields($pointee_of(f.type))`).
 
 ```mach
 $each f in $fields(T) {
