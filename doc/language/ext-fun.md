@@ -23,6 +23,77 @@ pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ext fun strlen(s: *u8) i64;             # private, file-local
 ```
 
+## C-variadic imports
+
+A C function declared `int open(const char *, int, ...)` is **C-variadic**: its
+parameter list ends in `...` and a call may pass further arguments the declaration
+does not type. Spell it the same way:
+
+```mach
+ext fun open(path: *u8, flags: i32, ...) i32;
+ext fun fcntl(fd: i32, cmd: i32, ...) i32;
+```
+
+- The `...` is a **bare** trailing marker written after the last fixed parameter.
+  It is not a named parameter and has no type.
+- **`ext` only.** A mach-bodied `fun` has no C-variadic form — its variadic is the
+  comptime pack `va: ...`, an ordinary *named* parameter with an entirely different
+  meaning (see [variadics.md](variadics.md)). A bare `...` in a non-`ext` parameter
+  list is an error that names the pack.
+- **At least one fixed parameter** must precede the `...`, as in C. Every psABI
+  defines its variadic rule relative to the named arguments.
+- Only the **call** side exists. Mach cannot *define* a C-variadic function: there
+  is no `va_list` and no `va_arg`, so such a declaration cannot carry a body.
+
+The declared parameters are the *fixed* arity. A call must supply all of them and
+may supply any number of further arguments, including none.
+
+### Arguments in the variadic tail
+
+A tail argument has no declared parameter type to check against, so it is checked
+against the C variadic contract directly. C applies **default argument promotions**
+there: an integer narrower than `int` arrives as an `int`, and a `float` arrives as
+a `double`. Mach inserts no implicit conversions anywhere and makes no exception
+here — a narrow argument is **rejected**, naming the cast:
+
+```mach
+var c: u8  = 65;
+var f: f32 = 1.5;
+
+log(fmt, c);                 # error: cast it to `i32` / `u32`
+log(fmt, f);                 # error: cast it to `f64`
+log(fmt, c::i32, f::f64);    # correct
+```
+
+An argument of 32 bits or wider passes as written: `i32`/`u32`, `i64`/`u64`, `f64`,
+any pointer, and a record or vector passed by value. A **secret** (`^T`) may not
+enter a variadic tail: the callee is foreign code that prints or logs the value, so
+it is an observation boundary — declassify with `:^` first.
+
+### Per-target argument passing
+
+The fixed parameters always follow the target's ordinary calling convention. The
+*tail* is where targets differ:
+
+| Target | Variadic tail |
+|--------|---------------|
+| **Apple arm64** (`darwin` + `aarch64`) | **Every** tail argument is passed on the **stack**, naturally aligned with an 8-byte minimum. There is no register phase at all — not for integers, not for floats. |
+| **Other AAPCS64** (`linux` + `aarch64`) | Ordinary rule: register-then-stack, exactly as for a named argument. |
+| **System V x86-64** (`linux` / `darwin` + `x86_64`) | Ordinary rule, plus `AL` set to the number of vector registers the call uses. It is set for **every** call to a C-variadic callee, including one whose tail is empty. |
+| **Microsoft x64** (`windows`) | Ordinary rule. A tail float rides **both** its XMM register and the integer register of the same positional slot, since a `va_arg` reader walks only the integer slots. The `ext`-boundary vector-by-reference rule below is unchanged. |
+
+A tail argument keeps its *form* on every target: a record too large to pass by
+value is still passed by reference, and only the hidden pointer's location moves.
+
+Apple arm64 is the reason this form exists. The obvious workaround — declaring the
+call at its fixed arity, `ext fun open(path: *u8, flags: i32, mode: u32) i32` —
+works on Linux and on x86-64 and is **silently wrong** there: the fixed-arity
+lowering puts `mode` in `x2` while libSystem reads it off the stack, so the callee
+sees an uninitialized value. That is a wrong value, not a link error and not a
+crash. Mach cannot detect the mistake, because nothing in a fixed-arity declaration
+says the callee is variadic — so **declare every C-variadic callee with `...`**, on
+every target.
+
 ## Symbol name
 
 The declaration names a C declaration, so its linker symbol is whatever the

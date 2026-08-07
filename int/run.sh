@@ -226,6 +226,17 @@ for dir in "$here"/surface/$filter "$here"/regression/$filter; do
         rm -rf "$dir/out/int"
         mkdir -p "$dir/out/int"
 
+        # drop the step stamp cache so every `[step]` re-runs for this build.
+        # mach skips a step whose stamp matches and whose outputs all exist, and
+        # neither depends on the compiler, so a stamp written by an EARLIER
+        # harness run made later runs skip the step engine entirely - a case that
+        # asserts on step output kept passing against a compiler that could no
+        # longer run a step at all, which is the exact defect #2578 is. CI never
+        # saw it (fresh checkout, no stamps); only local iteration did, in the
+        # direction that reports green. the outputs are left alone: with no stamp
+        # the step always runs, and a step that fails is a build failure.
+        rm -rf "$dir/out/.steps"
+
         # the compiler that builds the case. normally the from-source compiler
         # itself; a self-host case first cross-builds that compiler to the leg
         # target and drives it under the leg's run-mode, so the case is compiled by

@@ -26,8 +26,10 @@ authoritative reference and wins on any disagreement.
   `[N]u8` (length checked). The path is relative to the declaring source file;
   bytes become read-only data at compile time, with no runtime I/O.
 - **Variadics are comptime packs.** A trailing `va: ...` parameter, consumed by
-  `$each a in va`. There is no `va_list`/`va_start`/`va_arg` and the C-style
-  bare `...` parameter is a removed-syntax error.
+  `$each a in va`. There is no `va_list`/`va_start`/`va_arg`. A bare `...` is a
+  different thing entirely: the C-variadic marker, legal only on an `ext fun`
+  (`ext fun open(path: *u8, flags: i32, ...) i32`), and a removed-syntax error
+  anywhere else.
 - **Strings are `*u8`, single-line.** `"hello"` is a pointer to null-terminated
   bytes. No fat-pointer string type (`str` is `def str: *char;`); no multi-line
   string literal - use `\n` escapes.
@@ -207,7 +209,22 @@ instantiation; call sites always supply the types explicitly.
 pub ext fun libc_write(fd: i64, buf: *u8, n: i64) i64;
 ```
 
-Body-less, ends in `;`, C ABI is the contract. Provide the definition at link
+Body-less, ends in `;`, C ABI is the contract.
+
+A C-variadic callee ends its parameter list in a bare `...`, after at least one
+fixed parameter — `ext` only, call side only (mach defines no `va_arg` callee):
+
+```mach
+ext fun open(path: *u8, flags: i32, ...) i32;
+```
+
+Tail arguments get no implicit conversion, so write C's default argument
+promotions yourself: an integer narrower than 32 bits and an `f32` are rejected
+with the cast to apply (`x::i32`, `x::f64`), and a secret may not enter a tail.
+Declaring a variadic callee at fixed arity instead is **silently wrong on Apple
+arm64**, which passes the whole tail on the stack. See `doc/language/ext-fun.md`.
+
+Provide the definition at link
 time (`mach build . -l c`, a `[link.X]` manifest requirement, or an explicit
 `.o`/`.obj`/`.a`/`.lib`/`.so`/`.dylib`/`.dll`). On PE and Mach-O targets, pin each dynamic
 import with `#[library("name")]`. The value is the requirement's stable
