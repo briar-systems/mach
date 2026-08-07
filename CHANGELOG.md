@@ -5,6 +5,50 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.14.0] - 2026-08-07
+
+### Added
+
+#### A field descriptor's `f.type` is accepted as a generic type argument (#2691)
+A reflection walk could descend one syntactic level per hand-written `$each`, because there was no way to re-enter a generic at a field's type. `eq[f.type](...)` was a parse error, `eq(...)` resolved against the template instead of instantiating, and `$type_of(x)` yields a comptime type rather than a value. All three doors were shut, so a recursive derive had to be a hand-unrolled ladder with a depth cap.
+
+`f.type` in a generic argument list now becomes a node carrying the **loop variable's name** rather than a resolved type, because which field it names is decided per iteration by the unroll. A walk is written once and reaches any depth:
+
+```mach
+fun eq[T](a: *T, b: *T) bool {
+    $each f in $fields(T) {
+        $if ($is_record(f.type)) {
+            if (!eq[f.type](?a.[f], ?b.[f])) { ret false; }
+        }
+        $or { if (a.[f] != b.[f]) { ret false; } }
+    }
+    ret true;
+}
+```
+
+**Termination is structural rather than bounded by a counter**, and this was verified against the compiler rather than argued from the spec: direct, mutual, and generic-growing-by-value self-containment are all refused as "recursive type has infinite size". A self-reference must go through a pointer, and `$is_record` does not select one. Note `rec Grow[T] { p: *Grow[*T]; }` is accepted and has unboundedly many instances reachable through its pointer -- the by-value walk never follows it, but termination stops being structural the moment `$pointee_of` lands, which is recorded as a precondition on #2693.
+
+If the argument were ever wrong the failure is a diagnostic naming the derivation chain, not a hang: `MAX_CT_INSTANCE_DEPTH = 32` reports "a generic instantiates itself at a growing type argument".
+
+#### A vector literal is built in one instruction where the ISA can (#2640)
+A vector literal round-tripped through an array alloca -- four stores and a frame slot to materialize a constant -- which SPIR-V's logical addressing cannot express at all. `OP_VEC_BUILD` takes N lane values and produces the vector, lowering to `OpCompositeConstruct`.
+
+The capability is read at lowering (`has_vec_build`) rather than legalized afterwards, so **no target ever sees an `OP_VEC_BUILD` it cannot select**. Native targets keep the storage path unchanged and their emitted assembly is byte-identical. A malformed build is refused at construction with no flags required, not only by the opt-in verifier.
+
+#### Condition-flag effects are modeled in the asm effect model (#2460)
+`#[oblivious]` inline asm refused every conditional branch on x86-64, because the model had no notion of what an instruction does to FLAGS. It now carries five facts per grammar row -- `writes_flags`, `defines_flags`, `opaque_flags`, `reads_flags`, `flags_stated` -- with defaults inverted so the security-relevant surface is 18 rows rather than 60.
+
+A branch on flags derived from a secret is still refused; a branch on flags an instruction fully **defines** from public operands is not. The `defines_flags` distinction is load-bearing and subtle: `inc` and `dec` write ZF but **preserve** CF, so treating "writes flags" as "defines flags" would have accepted `cmp {secret}` / `inc` / `jc`.
+
+**The facts are measured against the CPU, not inferred.** `int/surface/ct-flags-hardware` presets RFLAGS both ways and reads back RFLAGS and the destination register, and its golden is the measurement. Three rows (`popfq`, `iretq`, `syscall`) print `NOT MEASURABLE` -- `popfq` passes the probe as "defines both", which is correct on its own terms and wrong as a classification, because the value comes from the stack.
+
+`setcc` laundering FLAGS taint into a general-purpose register is closed by `reads_flags`. General memory laundering is not, and is unchanged by this work: see #2706.
+
+### Changed
+
+#### mach-std advanced to 0.25.0 (#2710)
+Brings `exec.resolve` / `exec.resolve_in`, the `std.derive` recursive tier, and riscv64 library coverage. The manifest already tracked `branch/main`; the lock had simply not been advanced.
+
 ## [4.13.0] - 2026-08-07
 
 **Two source-compatibility changes.** A type may no longer be declared with a vector form's name, and the comptime shape predicates no longer see through `^`.
