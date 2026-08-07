@@ -114,20 +114,114 @@ qemu_bin() {
     esac
 }
 
+# is_signal_exit <status> — true when a wait status is a signal death rather than a
+# deliberate return. a signal death is 128 + N with N in 1..64 (POSIX real-time
+# signals cap there). the two are completely different defects - a process that
+# faulted versus one that ran to completion and returned nonzero because it computed
+# a wrong value - so nothing that reports a failed run may collapse them (#2593,
+# #2369).
+is_signal_exit() {
+    [ "$1" -ge 129 ] && [ "$1" -le 192 ]
+}
+
+# describe_exit <status> — a nonzero wait status as a diagnostic phrase, naming a
+# signal death separately from a deliberate return. for the golden-observable form
+# of the same distinction see produce_panic_exit, whose `exit=signal(N)` token this
+# deliberately does not share: that one is diffed text, this one is prose for a
+# human reading a failure.
+describe_exit() {
+    if is_signal_exit "$1"; then
+        echo "died on signal $(($1 - 128)) (exit $1)"
+    else
+        echo "returned $1"
+    fi
+}
+
+# run_captured <runmode> <target> <binary> <stdout-file> [<stderr-file>]
+# run a built binary, writing its stdout to <stdout-file> and its exit status to
+# `run_status`. with a fifth argument stderr goes to that file, otherwise it is
+# merged into <stdout-file>. `run_out` is the stdout as a string, for producers that
+# compare it; a producer forwarding stdout as its observable must cat the file
+# instead, since `$(...)` strips trailing newlines the golden may carry.
+# always returns 0 unless the run could not be attempted: classifying the status is
+# the caller's job, and every executed case has to be able to see it.
+#
+# captured to a file rather than through `$(...)` so the status read sits on the line
+# directly after the command, the shape that survives this harness's `set -e` (see
+# produce_panic_exit). `$(...)` cannot carry the status either: after
+# `if ! v=$(cmd)`, `$?` inside the branch is the negation's 0, not the command's.
+run_captured() {
+    if [ "$1" = "qemu" ]; then
+        _rc_interp=$(qemu_bin "$2") || return 1
+        if [ $# -ge 5 ]; then
+            "$_rc_interp" "$3" >"$4" 2>"$5"
+        else
+            "$_rc_interp" "$3" >"$4" 2>&1
+        fi
+    else
+        if [ $# -ge 5 ]; then
+            "$3" >"$4" 2>"$5"
+        else
+            "$3" >"$4" 2>&1
+        fi
+    fi
+    run_status=$?
+    run_out=$(cat "$4")
+    return 0
+}
+
+# report_run_failure <label> <status> <output>
+# report a failed execution of a built binary: what the status actually was, and
+# everything the program printed before it stopped. the output is the evidence -
+# #2586 was a program that printed four correct values and one wrong one, and the
+# harness discarded the line naming the defect and said "execution failed" (#2593).
+report_run_failure() {
+    echo "int: $1: $(describe_exit "$2")" >&2
+    if [ -n "$3" ]; then
+        printf '%s\n' "$3" | sed 's/^/    /' >&2
+    else
+        echo "    (the program printed nothing)" >&2
+    fi
+}
+
+# diff_expected_actual <expected> <actual>
+# report a runtime contract mismatch as a diff. a producer that compares a program's
+# output against a fixed contract must show WHICH line disagreed: #2586 was one wrong
+# value among five correct ones, and naming it is the whole diagnosis (#2593).
+diff_expected_actual() {
+    _de=$(mktemp)
+    _da=$(mktemp)
+    printf '%s\n' "$1" >"$_de"
+    printf '%s\n' "$2" >"$_da"
+    diff -u --label expected --label actual "$_de" "$_da" | sed 's/^/    /' >&2
+    rm -f "$_de" "$_da"
+}
+
 # produce_exec <runmode> <target> <binary>
 # runs the built binary and forwards its stdout as the observable. native mode runs
 # it directly; qemu mode runs it under the matching qemu-user (qemu_bin). the
 # producer's exit status is the program's, so a crash (nonzero) fails the case.
+#
+# on failure run.sh discards this producer's stdout and shows only its stderr, so a
+# failing run reports the status and the program's own stdout there instead - without
+# it a crashed exec case says only "producer exit 139" and throws away how far the
+# program got (#2593).
 produce_exec() {
     runmode=$1
     target=$2
     bin=$3
-    if [ "$runmode" = "qemu" ]; then
-        interp=$(qemu_bin "$target") || return 1
-        "$interp" "$bin"
-    else
-        "$bin"
+    out=$(mktemp)
+    err=$(mktemp)
+    run_captured "$runmode" "$target" "$bin" "$out" "$err" || { rm -f "$out" "$err"; return 1; }
+    if [ "$run_status" -ne 0 ]; then
+        report_run_failure "exec" "$run_status" "$run_out"
+        [ -s "$err" ] && sed 's/^/    /' "$err" >&2
+        rm -f "$out" "$err"
+        return "$run_status"
     fi
+    cat "$err" >&2
+    cat "$out"
+    rm -f "$out" "$err"
 }
 
 # produce_relro_fault <runmode> <target> <binary>
@@ -137,21 +231,25 @@ produce_exec() {
 # both natively and under qemu-user; any other status means the region stayed writable.
 # the program's own stdout is discarded - the observable is purely the fault fact - so
 # this is a runtime (exec-like) producer sharing one target-independent golden.
+#
+# on the expected fault the program's output is noise and stays out of the way. on any
+# other status it is evidence - how far the program got before the write that should
+# have faulted did not - so it is reported to stderr, leaving the observable the golden
+# pins byte-identical (#2593).
 produce_relro_fault() {
     runmode=$1
     target=$2
     bin=$3
-    if [ "$runmode" = "qemu" ]; then
-        interp=$(qemu_bin "$target") || return 1
-        "$interp" "$bin" >/dev/null 2>&1
-    else
-        "$bin" >/dev/null 2>&1
-    fi
-    ec=$?
+    out=$(mktemp)
+    run_captured "$runmode" "$target" "$bin" "$out" || { rm -f "$out"; return 1; }
+    ec=$run_status
+    rm -f "$out"
     if [ "$ec" -eq 139 ]; then
         echo "relro_write=faulted"
     else
         echo "relro_write=exit$ec"
+        report_run_failure "relro-fault: expected the RELRO write to fault, but the program" \
+            "$ec" "$run_out"
     fi
 }
 
@@ -175,16 +273,11 @@ produce_panic_exit() {
     target=$2
     bin=$3
     out=$(mktemp)
-    if [ "$runmode" = "qemu" ]; then
-        interp=$(qemu_bin "$target") || { rm -f "$out"; return 1; }
-        "$interp" "$bin" >"$out" 2>&1
-    else
-        "$bin" >"$out" 2>&1
-    fi
-    ec=$?
+    run_captured "$runmode" "$target" "$bin" "$out" || { rm -f "$out"; return 1; }
+    ec=$run_status
     cat "$out"
     rm -f "$out"
-    if [ "$ec" -ge 129 ] && [ "$ec" -le 192 ]; then
+    if is_signal_exit "$ec"; then
         echo "exit=signal($((ec - 128)))"
     else
         echo "exit=$ec"
@@ -474,16 +567,19 @@ produce_macho_got() {
     }
 
     if [ "$target" = darwin-x86_64 ]; then
-        runtime=$("$bin") || {
-            echo "int: macho-got: native PIE execution failed" >&2
-            return 1
-        }
+        out=$(mktemp)
+        run_captured native "$target" "$bin" "$out" || { rm -f "$out"; return 1; }
+        rm -f "$out"
         expected=$(printf '%s\n' \
             'local-load=40' 'local-got=40' 'local-got64=40' \
             'import-load=1' 'import-got=1')
-        [ "$runtime" = "$expected" ] || {
-            echo "int: macho-got: native PIE output was not exact" >&2
-            printf '%s\n' "$runtime" >&2
+        if [ "$run_status" -ne 0 ]; then
+            report_run_failure "macho-got: the native PIE" "$run_status" "$run_out"
+            return 1
+        fi
+        [ "$run_out" = "$expected" ] || {
+            echo "int: macho-got: the native PIE ran to completion but computed wrong values" >&2
+            diff_expected_actual "$expected" "$run_out"
             return 1
         }
     fi
@@ -546,13 +642,16 @@ produce_macho_abs_bind() {
     check_slot ___stderrp || return 1
 
     if [ "$target" = darwin-x86_64 ]; then
-        runtime=$("$bin") || {
-            echo "int: macho-abs-bind: native PIE execution failed" >&2
+        out=$(mktemp)
+        run_captured native "$target" "$bin" "$out" || { rm -f "$out"; return 1; }
+        rm -f "$out"
+        if [ "$run_status" -ne 0 ]; then
+            report_run_failure "macho-abs-bind: the native PIE" "$run_status" "$run_out"
             return 1
-        }
-        [ "$runtime" = "abs-bind=1" ] || {
-            echo "int: macho-abs-bind: native PIE output was not exact" >&2
-            printf '%s\n' "$runtime" >&2
+        fi
+        [ "$run_out" = "abs-bind=1" ] || {
+            echo "int: macho-abs-bind: the native PIE ran to completion but computed wrong values" >&2
+            diff_expected_actual "abs-bind=1" "$run_out"
             return 1
         }
     fi

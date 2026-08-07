@@ -37,7 +37,7 @@ The parser distinguishes these by structure:
 | `$project.{id,version,name,description}` | project metadata | `[project]` in `mach.toml` |
 | `$project.version.{major,minor,patch}` | structured version components | `[project].version` |
 | `$project.target.{os,arch,abi}` | the selected target's declared tuple, as strings | the selected `mach.toml` target |
-| `$bin.name` | the artifact being built | the selected build unit (`[bin.*]` / `[lib.*]`) |
+| `$bin.name` | the artifact being built | the selected build unit (`[artifact.*]`) |
 
 `$project.target.*` carries the manifest's declared **string** spellings
 (`"linux"`, `"x86_64"`, `"sysv64"`), distinct from `$mach.build.*`'s numeric tags
