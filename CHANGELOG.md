@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+#### The pinned integration lane can run (#2729)
+`int/run.sh --deps pin` stopped on the first SPIR-V case on every target, because no lock recorded a commit for `mach-shader`. The lock was not stale, it was the wrong set: the root `mach.lock` is written by `mach dep pull` from the **root manifest**, so it can only ever cover the compiler's own dependency closure, while `int` builds a larger one. Two cases declared a dep the root has no reason to.
+
+So the pin now reads two sources with disjoint coverage. The root `mach.lock` stays authoritative for anything the compiler also builds against, which is what keeps `mach-std` to one place to bump, and the new `int/deps.lock` covers only the difference. `int/lib/update-deps.sh` writes it from what `mach dep pull` resolves, so no ref-to-commit mapping is reimplemented outside the compiler.
+
+The lane failing was the smaller half. `--deps pin` exists because a case floating a ref can change verdict with zero changes in this repo (#2592), and it is what a release gate and a bisect run, yet its inputs were only ever validated by running it, and the one pinned run in CI is the main-cadence darwin gate, whose leg set contains neither case that declares the missing dep. `int/lib/check-deps.sh` now checks the whole condition statically on every PR - coverage, that the two locks stay disjoint, that no pin outlives the case that asked for it, that cases declaring one dep agree about it, and that a branch ref is `branch/main` - and a pinned linux run of the full suite joins the PR lane. Every run also prints the mode and, when pinned, every lock entry it consulted, so a floating run cannot be read afterwards as a pinned one.
+
 #### A sub-width vector can cross a function boundary (#2687)
 4.15.0 shipped `f32x3` working inside a function and refused at every call boundary. Passing or returning one reported `CLASS_FP scalar of unsupported size`, which made the shape unusable in practice: a shader-math or vertex-building library is nothing but functions taking and returning these.
 
