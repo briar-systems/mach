@@ -2109,9 +2109,12 @@ fun reg_tainted(taint: u32, r: i32) bool {
     ret (taint & (1::u32 << r::u32)) != 0;
 }
 
-# true when any operand of `item` carries a secret - a secret `{name}` binding, or a
-# register the walk has already tainted
-fun item_reads_secret(body: str, item: *Item, taint: u32, secret_names: *str, n_secret: u32) bool {
+# true when any operand of `item` carries a secret - a secret `{name}` binding, a
+# register the walk has already tainted, or any memory read once memory is tainted
+#
+# `mem_taint` is a SINGLE bit covering all of memory, and reading one memory operand
+# is enough. See `ct_scan` for why the domain has no finer resolution than that.
+fun item_reads_secret(body: str, item: *Item, taint: u32, mem_taint: bool, secret_names: *str, n_secret: u32) bool {
     var i: u32 = 0;
     for (i < item.nops) {
         val op: *Operand = ?item.ops[i::usize];
@@ -2120,7 +2123,38 @@ fun item_reads_secret(body: str, item: *Item, taint: u32, secret_names: *str, n_
         if (op.kind == AOP_MEM) {
             if (reg_tainted(taint, op.reg))   { ret true; }
             if (reg_tainted(taint, op.index)) { ret true; }
+            # a `{name}` binding substitutes to a fixed frame slot the compiler owns,
+            # not to a location this body can have stored a secret into, so it is not
+            # a read of the tainted memory domain. its secrecy is decided by
+            # `bind_is_secret` above.
+            if (mem_taint) { ret true; }
         }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# true when `item` has any memory operand at all
+#
+# THE `writes` MASK CANNOT ANSWER THIS AND MUST NOT BE USED FOR IT. `writes` names the
+# form's REGISTER OPERANDS, which is what the allocator needs: aarch64 `str x0, [x1]`
+# and riscv64 `sd a0, 0(sp)` both carry `AW_NONE`, because neither writes a register,
+# and both are stores. Deriving "is a store" from that mask produces a check that fires
+# on x86-64's `mov [rsp], rax` and silently passes every store on the other two targets.
+#
+# So the question asked here is the coarser, target-independent one: does this
+# instruction touch memory? An item that reads a secret and touches memory is treated
+# as having stored that secret. That over-taints a secret-reading LOAD, which only
+# refuses more, and it is the right trade at this domain's one-bit resolution.
+#
+# IT ALSO FAILS CLOSED ALONG THE GROWTH AXIS, which the alternative does not. A store
+# mnemonic added to any grammar later is covered the moment it parses a memory operand.
+# Had this been a per-mnemonic `stores` fact instead, a new row that forgot to set it
+# would launder secrets exactly as this issue describes, and nothing would report it.
+fun item_touches_memory(item: *Item) bool {
+    var i: u32 = 0;
+    for (i < item.nops) {
+        if (item.ops[i::usize].kind == AOP_MEM) { ret true; }
         i = i + 1;
     }
     ret false;
@@ -2163,6 +2197,33 @@ pub fun ct_scan(g: *Grammar, body: str, secret_names: *str, n_secret: u32,
     # the register bitmask because x86-64 conditions its branches on it and nothing
     # in the register model represents it (#2460)
     var flags_taint: bool = false;
+    # whether ANY secret has been stored to memory in this body (#2706). the third
+    # domain, beside the register set and FLAGS, and the reason a spill no longer
+    # launders: before this, a secret stored and reloaded came back in a register the
+    # model believed public, defeating all three leak checks at once.
+    #
+    # ONE BIT FOR ALL OF MEMORY, AND THAT IS DELIBERATE. The obvious refinement -
+    # track `[base + literal]` slots and taint only those - is NOT SOUND here, for two
+    # independent reasons, and both have to be answered before any finer domain ships:
+    #
+    #   1. ALIASING ACROSS BASES. `[rsp + k]` and `[rbp + j]` can name the same byte,
+    #      and nothing in this walk knows the relationship between two base registers.
+    #      A per-base or per-slot set would miss a secret stored through one base and
+    #      reloaded through the other.
+    #   2. PARTIAL OVERLAP. A slot key is an address, not an extent. An 8-byte store to
+    #      `[rsp]` and a 4-byte load from `[rsp + 4]` overlap, and the parsed item does
+    #      not carry a reliable access width to compare.
+    #
+    # So the resolution the walk can actually justify is "memory holds a secret, or it
+    # does not". The cost is over-refusal, never under-refusal, and it is narrower than
+    # it first looks: a body only loses by this if it stores a secret AND later reloads
+    # some other public value AND then branches on, addresses with, or variable-latency
+    # operates on what it reloaded. The last of those is the thing an `#[oblivious]`
+    # body must not do regardless.
+    #
+    # MONOTONE - set once, never cleared. A later store of a PUBLIC value cannot clear
+    # it, because "the same slot" is exactly the question this domain cannot answer.
+    var mem_taint: bool = false;
     var item: Item;
     var done: bool = false;
     for (!done) {
@@ -2172,7 +2233,7 @@ pub fun ct_scan(g: *Grammar, body: str, secret_names: *str, n_secret: u32,
         }
         if (!R.unwrap_ok[bool, str](pr)) { done = true; }
         or {
-            val vr: R.Result[bool, str] = ct_check_item(g, body, ?item, ?taint, ?flags_taint, secret_names, n_secret, trust_mul, trust_shift);
+            val vr: R.Result[bool, str] = ct_check_item(g, body, ?item, ?taint, ?flags_taint, ?mem_taint, secret_names, n_secret, trust_mul, trust_shift);
             if (R.is_err[bool, str](vr)) { ret vr; }
         }
     }
@@ -2183,7 +2244,7 @@ pub fun ct_scan(g: *Grammar, body: str, secret_names: *str, n_secret: u32,
 #
 # Split out so the walk above reads as the loop it is. `taint` is updated in place:
 # an instruction that reads a secret taints the registers it writes.
-fun ct_check_item(g: *Grammar, body: str, item: *Item, taint: *u32, flags_taint: *bool,
+fun ct_check_item(g: *Grammar, body: str, item: *Item, taint: *u32, flags_taint: *bool, mem_taint: *bool,
                   secret_names: *str, n_secret: u32,
                   trust_mul: bool, trust_shift: bool) R.Result[bool, str] {
     if (item.kind == AI_LABEL) { ret R.ok[bool, str](true); }
@@ -2207,7 +2268,7 @@ fun ct_check_item(g: *Grammar, body: str, item: *Item, taint: *u32, flags_taint:
     }
 
     val cls: ct.AsmClass = g.ct_class(item.code, item.flags);
-    val reads_secret: bool = item_reads_secret(body, item, @taint, secret_names, n_secret);
+    val reads_secret: bool = item_reads_secret(body, item, @taint, @mem_taint, secret_names, n_secret);
 
     # a conditional branch whose condition rides the flags register is refused when
     # FLAGS holds a secret-derived value, and accepted otherwise. before #2460 the
@@ -2296,6 +2357,11 @@ fun ct_check_item(g: *Grammar, body: str, item: *Item, taint: *u32, flags_taint:
         @taint = @taint | item.implicit;
         if ((item.writes & AW_OP0) != 0 && item.nops > 0) { taint_written(?item.ops[0], taint); }
         if ((item.writes & AW_OP1) != 0 && item.nops > 1) { taint_written(?item.ops[1], taint); }
+        # and the MEMORY domain: an instruction that carries a secret and touches
+        # memory taints all of memory, so a later reload comes back secret instead of
+        # laundered public (#2706). the address is public here - a secret address was
+        # already refused by check (b) above - so this is about the VALUE, not the slot.
+        if (item_touches_memory(item)) { @mem_taint = true; }
     }
 
     # fold the FLAGS taint. the arms are ordered, and the order is the model:

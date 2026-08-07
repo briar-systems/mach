@@ -224,21 +224,38 @@ classification: `popfq`, `iretq` and `syscall` take their flags from the stack,
 the interrupt frame, or a masked prior RFLAGS, and no experiment of that shape can
 tell you where a value came *from*.
 
-**What the walk does not model is memory.** A secret spilled to the stack and
-reloaded comes back in a register the walk believes is public, and every check
-downstream of it is defeated:
+**Memory is the third taint domain**, beside the register set and the flags bit
+(#2706). A secret spilled to the stack and reloaded comes back **secret**:
 
 ```
 mov rax, {r}
 mov [rsp], rax
 mov rbx, [rsp]
-mov rcx, [rbx]     # a secret-derived address, accepted
+mov rcx, [rbx]     # error: addresses memory with a secret value
 ```
 
-The direct form of that — `mov rax, {r}` then `mov rbx, [rax]` — *is* refused, so
-the gate works and this path specifically escapes it. Taint is a register set with
-no memory domain, on every target, and closing it is tracked as #2706. Reading the
-flags model above as evidence that laundering is closed in general would be wrong.
+Before this domain existed the reload came back in a register the walk believed
+public, and all three checks downstream of it were defeated at once — a branch
+condition, a memory address, and a variable-latency operand alike. The direct form
+(`mov rax, {r}` then `mov rbx, [rax]`) was always refused, which made the gate look
+sound while an ordinary spill walked straight through it.
+
+The domain is **one bit covering all of memory**: either a secret has been stored in
+this body or it has not. That is coarser than it could be, and deliberately so. The
+obvious refinement — taint individual `[base + literal]` slots — is not sound here,
+because `[rsp + k]` and `[rbp + j]` can name the same byte with nothing in the walk
+relating two base registers, and because a slot key is an address rather than an
+extent, so an 8-byte store and an overlapping 4-byte load compare as different slots.
+Both would be laundering paths again.
+
+The bit is **monotone**: a later store of a public value does not clear it, since
+"the same slot" is precisely the question the domain cannot answer. So a body loses
+by this only if it stores a secret, later reloads some *other* public value, and then
+branches on, addresses with, or variable-latency operates on what it reloaded. The
+failure direction is refusal, never acceptance.
+
+A store through an address the walk cannot resolve needs no special case: there is no
+slot to fail to identify.
 
 The variable-latency check also bites unevenly: x86-64's and aarch64's asm grammars
 carry no divide, multiply or float instruction at all, so it reaches only their
