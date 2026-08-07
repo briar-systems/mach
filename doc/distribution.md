@@ -68,8 +68,9 @@ abi    = "*"
 export = false
 ```
 
-An `.a` contributes *every* member object, not just the ones satisfying an
-undefined symbol, so what you vendor is what you ship.
+An `.a` joins with classic archive semantics: a member object is pulled in only
+to satisfy an undefined symbol, transitively to a fixed point, so an archive you
+vendor costs the binary exactly the members it uses and no more.
 
 **No rpath is needed, and none is emitted.** `rpath` exists to tell a dynamic
 loader where to look; a static executable never invokes one. There is no
@@ -100,7 +101,7 @@ export  = false
 ```
 $ file out/linux-x86_64/release/bin/demo-x11
 ELF 64-bit LSB executable, x86-64, version 1 (SYSV), dynamically linked,
-interpreter /lib64/ld-linux-x86-64.so.2, stripped
+interpreter /lib64/ld-linux-x86-64.so.2, no section header
 $ readelf -dW out/linux-x86_64/release/bin/demo-x11 | grep NEEDED
  0x0000000000000001 (NEEDED)             Shared library: [libX11.so.6]
 ```
@@ -183,6 +184,61 @@ does, only what Windows hands it at startup. Note the consequence for a `gui`
 image: it starts with no console attached, so anything the program writes to
 stdout goes nowhere by default. A graphical application that also wants
 diagnostics should write them to a file rather than assume a stream is there.
+
+### Icon and version resources
+
+Without resources, a shipped `.exe` shows the generic application icon in
+Explorer and an empty Details tab in its properties dialog. Two artifact keys
+fix both:
+
+```toml
+[artifact.game]
+kind     = "bin"
+entry    = "main.mach"
+out      = "bin/game.exe"
+targets  = ["windows-x86_64"]
+link     = ["kernel32"]
+need     = []
+icon     = "assets/game.ico"
+manifest = "assets/game.manifest"
+```
+
+On a windows target either key adds a `.rsrc` section to the PE. `icon` must
+name a valid ICO container; mach unpacks it, emits each contained image as
+`RT_ICON`, and adds the `RT_GROUP_ICON` that indexes them — which is what
+Explorer, the taskbar, and the window chrome pick their icon from. `manifest`
+is embedded unchanged as `RT_MANIFEST`; that is where UAC elevation requests
+and DPI-awareness declarations live, if your application needs them.
+
+Either resource also gets a `VS_VERSIONINFO` (`RT_VERSION`) whose values are
+derived rather than repeated: `FileVersion` and `ProductVersion` come from
+`[project].version`, `InternalName` and `ProductName` from the artifact's table
+key, and `OriginalFilename` from the basename of `out`. Version your project in
+one place and the exe metadata follows it. There is deliberately no
+`FileDescription` — the manifest schema has no description field, so there is
+nothing to set.
+
+Like `subsystem`, both keys are **inert off windows** — the paths are not even
+read — so one artifact stanza still serves every target. If a `[step]`
+generates the resource (an icon rendered at build time, a manifest stamped
+with a CI version), name the step in the artifact's `need` so it runs before
+the link. The linker fingerprints resource contents, so editing the asset
+relinks a warm build.
+
+Confirm what landed with `llvm-readobj --coff-resources` — one entry each of
+`ICON`, `GROUP_ICON`, `MANIFEST`, and `VERSIONINFO` for the stanza above:
+
+```
+$ llvm-readobj --coff-resources out/windows-x86_64/release/bin/demo.exe | grep "Type:"
+  Type: ICON (ID 3) [
+  Type: GROUP_ICON (ID 14) [
+  Type: VERSIONINFO (ID 16) [
+  Type: MANIFEST (ID 24) [
+```
+
+(The version strings are UTF-16, so `strings -e l` reads them; `FileVersion`
+and `ProductVersion` will read back the `[project].version` they were derived
+from.)
 
 ### DLLs beside the exe
 
@@ -468,7 +524,33 @@ Loose assets stop being the right answer when the deliverable is a **single
 file** — a CLI tool people drop on their `PATH`, something distributed by copying
 one binary — or when an asset is load-bearing for correctness and must not drift
 out of sync with the code that reads it. Compiling those into the binary is what
-`#[embed]` is for.
+`#[embed]` is for:
+
+```mach
+#[embed("../assets/logo.qoi")]
+val LOGO: [_]u8;          # length taken from the file's byte count
+
+#[embed("../assets/font.bin")]
+val FONT: [65536]u8;      # length pinned; a size change fails the build
+```
+
+The bytes are placed in read-only data at compile time, exactly like any other
+constant byte array — no runtime I/O, no copy, no asset path to resolve. Two
+rules matter when you lay the project out. The path resolves relative to the
+**declaring source file**, not the project root, hence the `../` above for a
+`src/` module embedding from a project-root `assets/`. And the embedded file is
+a build input whose content digest feeds incremental compilation, so editing
+the asset rebuilds the embedding module — the binary cannot silently go stale
+against the file it claims to contain. `[_]u8` infers the length; `[N]u8` pins
+it, which is how a fixed-format asset (a boot sector, a ROM image, a header you
+parse by offset) fails the build the moment it stops being that size. See
+[language/decorators.md](language/decorators.md#embedstr--compile-time-file-embedding)
+for the full rules.
+
+The trade is the archive layouts above: an embedded asset cannot be patched
+without a rebuild, and a large one inflates the binary and its link time. Keep
+big, optional, or user-replaceable data loose; embed what the program cannot
+correctly run without.
 
 ## Cross-building from one host
 
@@ -649,6 +731,8 @@ cell alone, while linux and windows link.
 
 ## See also
 
-- [manifest.md](manifest.md) — `[artifact.*]`, `[link.*]`, and `[step.*]`
+- [manifest.md](manifest.md) — `[artifact.*]` (including `subsystem`, `icon`,
+  and `manifest`), `[link.*]`, and `[step.*]`
 - [cli.md](cli.md) — `--all-targets`, `--runner`, and link-input resolution
 - [language/ext-fun.md](language/ext-fun.md) — `ext fun`, `#[symbol]`, `#[library]`
+- [language/decorators.md](language/decorators.md) — `#[embed]`
