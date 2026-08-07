@@ -24,6 +24,26 @@ Also refused on a `#[uniform]` / `#[storage]` interface block, whose member offs
 
 **riscv64 gets a written claim rather than a green tick.** Unaligned access there is permitted-but-may-trap and Linux emulates a trapping one in the kernel, so a packed field access is expected to be correct and pathologically slow. That cost cannot be measured under qemu-user, which emulates the misaligned load directly and never takes the kernel path. The decorator docs say so rather than leaving a passing correctness leg to be read as a usability result.
 
+### Changed
+
+#### Vector operation legality is target-independent, so an unpacked lane op scalarizes instead of being refused (#2726)
+`i32x4 * i32x4` was refused at the language level, citing x86-64's SSE2 baseline (`pmulld` is SSE4.1). That refused it on **riscv64** — a target with no vector unit, which scalarizes `i32x4 + i32x4` one line up and would lower the multiply to four ordinary scalar multiplies — and on **aarch64**, whose NEON `MUL` supports `.4s` in hardware. The rule refused work on the targets least able to benefit from the refusal.
+
+The legality of a vector type and of a vector operation are now both target-independent; only the **realization** is target-dependent. Integer `*` is legal at every lane width on every target, and the backend picks the packed form where one exists and the per-lane scalar expansion where one does not.
+
+The rule's three homes collapse onto one authority. `isa.packed_width` answers a realization question — "how wide is this target's packed form for this operation at this lane width, or 0 for none" — declared per ISA beside the other capability facts and reached through the single mid-end door `me.vecform`. **Sema stops asking entirely**, because it was never a legality question. It returns a *width* rather than a bool so #2727 has the number to split by, and it is keyed on the lane width and never the lane count, so a vector wider than the register splits into chunks that each get the same answer.
+
+**`simd = "require"` now applies per operation on every target**, not only where there is no vector unit, and names the lane width:
+
+```
+error: simd = "require": vector multiply on 64-bit lanes in '_M4case4mainN5mul64' would scalarize on aarch64
+       (target has no packed form for this operation at this lane width); set simd = "scalarize" to build with the scalar expansion
+```
+
+A project that set the lever precisely to refuse a silent scalar expansion was previously told nothing about the ones x86-64 and aarch64 perform.
+
+The auto-vectorizer consults the same authority, so it forms a vector multiply only where the target packs one rather than forming one the realization stage would immediately take apart.
+
 ### Fixed
 
 #### The NEON integer-multiply arrangement rule was wrong in both directions (#2721)
