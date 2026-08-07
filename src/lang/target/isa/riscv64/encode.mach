@@ -2183,16 +2183,70 @@ fun fmv_f2i_funct7(width: u8) u32 {
     ret F7_FMV_F2I | 1;
 }
 
-# materialize a float-constant bit pattern into float register index `vd`. the bits -
-# a 32-bit pattern for an f32, a 64-bit pattern for an f64 (the shape a float CONSTANT
-# carries through lowering) - are materialized into the GP scratch via `emit_li`, then
-# bit-copied into `vd` with the GP->FP reinterpret (`fmv.w.x` for an f32, `fmv.d.x`
-# for an f64). the RV64 analogue of x86-64's float-constant load (MOVABS R11 + MOVQ
-# xmm); the GP scratch is the reserved encoder register, so a single instruction's
+# the number of instruction words `emit_li` spends on a value, mirroring its own
+# recursion
+#
+# The cost half of the constant-materialization decision, so the decision compares
+# real instruction counts rather than a rule of thumb about widths. It has to track
+# `emit_li` exactly - a count that drifted from the emitter would choose the wrong
+# form silently
+fun li_words(value: i64) u32 {
+    if (value >= -2048 && value <= 2047) { ret 1; }
+    if (value >= -2147483648 && value <= 2147483647) {
+        val v: i32 = value::i32;
+        if ((v::u32 & 0xFFF) == 0) { ret 1; }
+        ret 2;
+    }
+    val lo12: i64 = sext12(value);
+    var n: u32 = li_words((value - lo12) >> 12) + 1;
+    if (lo12 != 0) { n = n + 1; }
+    ret n;
+}
+
+# materialize a float-constant bit pattern into float register index `vd`
+#
+# Three forms, chosen by which is cheapest for the pattern in hand rather than by a
+# blanket rule - RV64, unlike x86-64, can build some constants in fewer instructions
+# than a load takes, so pooling unconditionally would be a pessimisation for those.
+#
+#   - all-zero bits: `fmv.d.x fd, x0` (`fmv.w.x`), ONE instruction reading the zero
+#     register. nothing can beat it, so a zero is never pooled;
+#   - a pattern one `lui` or one `addi` builds: that word plus the `fmv`, two
+#     instructions and no memory reference. an `auipc` + `fld` pair is also two
+#     instructions but touches memory and carries two relocations, so the register
+#     form wins;
+#   - anything else - an arbitrary f64 bit pattern costs `emit_li` five to seven
+#     words on RV64, since its widest immediate is 32 bits and the rest is built by
+#     repeated shift-and-add: the module's constant pool, reached as `auipc t0,
+#     %pcrel_hi(.Lconst.N) ; fld fd, %pcrel_lo(.Lconst.N)(t0)` - two instructions
+#     whatever the pattern.
+#
+# t0 is the reserved encoder scratch in both the register and the pool form, so a
 # materialization never collides with a live value. `width` is 4 (S) or 8 (D)
-fun emit_fp_imm(st: *encode.EncodeState, vd: u32, bits: i64, width: u8) {
-    emit_li(st, SCRATCH, bits);
-    emit_r(st, OPC_OP_FP, RM_RNE, fmv_i2f_funct7(width), vd, SCRATCH, 0);
+fun emit_fp_const(st: *encode.EncodeState, vd: u32, bits: i64, width: u8) R.Result[bool, str] {
+    var pattern: i64 = bits;
+    if (width == 4) { pattern = bits & 0xFFFFFFFF; }
+
+    if (pattern == 0) {
+        emit_r(st, OPC_OP_FP, RM_RNE, fmv_i2f_funct7(width), vd, RZERO, 0);
+        ret R.ok[bool, str](true);
+    }
+    if (li_words(pattern) <= 1) {
+        emit_li(st, SCRATCH, pattern);
+        emit_r(st, OPC_OP_FP, RM_RNE, fmv_i2f_funct7(width), vd, SCRATCH, 0);
+        ret R.ok[bool, str](true);
+    }
+
+    val sr: R.Result[intern.StrId, str] = encode.intern_float_const(st, pattern::u64, width);
+    if (R.is_err[intern.StrId, str](sr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sr)); }
+    val sym: intern.StrId = R.unwrap_ok[intern.StrId, str](sr);
+
+    val hr: R.Result[bool, str] = emit_pcrel_hi(st, SCRATCH, sym, 0);
+    if (R.is_err[bool, str](hr)) { ret hr; }
+    val lo_pos: u32 = st.buf.len::u32;
+    emit_i(st, OPC_LOAD_FP, fp_mem_funct3(width), vd, SCRATCH, 0);
+    note_sym_target(st, sym, isa.SYM_MOD_PCREL_LO);
+    ret encode.push_reloc(st, lo_pos, of.RK_PCREL_LO12_I, sym, 0);
 }
 
 # the float register index a float source operand contributes. a physical float
@@ -2211,7 +2265,8 @@ fun resolve_fp_source(st: *encode.EncodeState, f: *mir.MirFunction, op: *mir.Mir
         ret R.ok[i32, str](scratch::i32);
     }
     if (op.kind == mir.MIR_OP_IMM) {
-        emit_fp_imm(st, scratch, op.imm, width);
+        val cr: R.Result[bool, str] = emit_fp_const(st, scratch, op.imm, width);
+        if (R.is_err[bool, str](cr)) { ret R.err[i32, str](R.unwrap_err[bool, str](cr)); }
         ret R.ok[i32, str](scratch::i32);
     }
     ret req_fpr(op);
@@ -2491,7 +2546,7 @@ fun encode_fp_conv(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
 # CLASS, and spill state:
 #   - immediate source (a float CONSTANT): the bit pattern is materialized into the
 #     destination float register (or f31 then stored for a spilled destination) via
-#     the GP scratch + a GP->FP fmv - see `emit_fp_imm`.
+#     the cheapest form for its bit pattern - see `emit_fp_const`.
 #   - float <- float: `fmv.d` / `fmv.s` (the `fsgnj fd, fn, fn` alias, a float copy).
 #   - float <- GP / GP <- float: the cross-bank `fmv.d.x` / `fmv.w.x` and `fmv.x.d` /
 #     `fmv.x.w` bit reinterprets.
@@ -2510,13 +2565,13 @@ fun encode_fmov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
     # a float-constant immediate source reaches here as `FMV float <- imm`.
     if (src.kind == mir.MIR_OP_IMM) {
         if (dst.kind == mir.MIR_OP_MEM) {
-            emit_fp_imm(st, FP_SCRATCH, src.imm, w);
+            val cr: R.Result[bool, str] = emit_fp_const(st, FP_SCRATCH, src.imm, w);
+            if (R.is_err[bool, str](cr)) { ret cr; }
             ret emit_fp_slot_store(st, f, dst, FP_SCRATCH, w);
         }
         val rdr: R.Result[i32, str] = req_fpr(dst);
         if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
-        emit_fp_imm(st, R.unwrap_ok[i32, str](rdr)::u32, src.imm, w);
-        ret R.ok[bool, str](true);
+        ret emit_fp_const(st, R.unwrap_ok[i32, str](rdr)::u32, src.imm, w);
     }
 
     if (dst.kind != mir.MIR_OP_MEM && src.kind != mir.MIR_OP_MEM) {
@@ -4595,7 +4650,15 @@ fun rv_asm_text(st: *encode.EncodeState, f: *mir.MirFunction, l: *iasm.Labels, t
 # emit-level helpers (packers / prologue / epilogue / branch patch) directly
 fun tbuf(st: *encode.EncodeState, alloc: *A.Allocator) {
     page.make(alloc);
-    st.buf = encode.buf_init(alloc);
+    encode.state_blank(st, alloc);
+}
+
+# the same, plus a live interner, for a test whose path mints a constant-pool symbol
+fun tbuf_interned(st: *encode.EncodeState, alloc: *A.Allocator, itn: *intern.Interner) {
+    page.make(alloc);
+    @itn = intern.init(alloc);
+    encode.state_blank(st, alloc);
+    st.interner = itn;
 }
 
 # the R/I/S/U-type packers are byte-exact against `llvm-mc -triple=riscv64
@@ -7006,4 +7069,111 @@ fun asm_note_bytes(st: *encode.EncodeState, bytes: *u8, n: usize, start: usize) 
         j = j + 1;
     }
     ret encode.note_push(?st.buf, ?note);
+}
+
+# float-constant materialization: `emit_fp_const` picks the CHEAPEST of three forms
+# for a bit pattern - the zero register, one `emit_li` word plus the bank move, or a
+# constant-pool load.
+#
+# the decision matters more on RV64 than anywhere else: its widest immediate is 32
+# bits, so an arbitrary f64 pattern is built by repeated shift-and-add and costs
+# `emit_li` five to seven words. `li_words` has to track `emit_li`'s own recursion
+# exactly - a count that drifted from the emitter would silently choose the wrong
+# form - so the two are checked against each other here rather than against a table.
+#
+# the pooled form's two RELOCATIONS are asserted alongside its words. both immediates
+# are zero placeholders, so a pool load that recorded no relocation encodes to
+# exactly these bytes and loads from the wrong address.
+# float-constant materialization matches llvm-mc
+test "mach.lang.target.isa.riscv64.encode:float_constant_materialization" {
+    var bad: i32 = 0;
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    var itn: intern.Interner;
+    tbuf_interned(?st, ?alloc, ?itn);
+
+    # `li_words` agrees with what `emit_li` actually emits, for a spread of patterns
+    # spanning all three of its arms
+    var probe: [6]i64;
+    probe[0] = 7;                        # the 12-bit addi arm
+    probe[1] = 0x12345000;               # the lui-only arm (low twelve bits clear)
+    probe[2] = 0x12345678;               # the lui + addiw arm
+    probe[3] = 0x4000000000000000;       # f64 2.0, the recursive arm
+    probe[4] = 0x3FB999999999999A;       # f64 0.1, the recursive arm at its worst
+    probe[5] = 0x3FC0000000000000;       # f64 0.125
+    var pi: u32 = 0;
+    for (pi < 6) {
+        st.buf.len = 0;
+        emit_li(?st, SCRATCH, probe[pi]);
+        if ((st.buf.len / 4)::u32 != li_words(probe[pi])) { bad = 1; }
+        pi = pi + 1;
+    }
+
+    var ops: [3]mir.MirOperand;
+    var mi: mir.MirInstr = mir.instr(mir.MIR_MOV, ?ops[0], 2, 8, 0);
+
+    # +0.0 -> fa0: fmv.d.x fa0, x0 = 0xf2000553. ONE instruction reading the zero
+    # register, no pool entry and no relocation
+    ops[0] = fp_op(10); ops[1] = mir.op_imm(0);
+    st.buf.len = 0;
+    encode_fmov(?st, nil, ?mi);
+    if (st.buf.len != 4)                     { bad = 1; }
+    if (read_word(?st.buf, 0) != 0xF2000553) { bad = 1; }
+    if (st.const_count != 0)                 { bad = 1; }
+    if (st.reloc_count != 0)                 { bad = 1; }
+
+    # a pattern one `addi` builds stays in the register form: addi t0, x0, 7 ;
+    # fmv.d.x fa0, t0 = 0x00700293 ; 0xf2028553
+    ops[1] = mir.op_imm(7);
+    st.buf.len = 0;
+    encode_fmov(?st, nil, ?mi);
+    if (st.buf.len != 8)                     { bad = 1; }
+    if (read_word(?st.buf, 0) != 0x00700293) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0xF2028553) { bad = 1; }
+    if (st.const_count != 0)                 { bad = 1; }
+
+    # f64 0.1 costs `emit_li` far more than a load, so it pools:
+    #   auipc t0, %pcrel_hi(.Lconst.0) = 0x00000297
+    #   fld fa0, %pcrel_lo(.Lconst.0)(t0) = 0x0002b507
+    ops[1] = mir.op_imm(0x3FB999999999999A);
+    st.buf.len = 0;
+    encode_fmov(?st, nil, ?mi);
+    if (st.buf.len != 8)                     { bad = 1; }
+    if (read_word(?st.buf, 0) != 0x00000297) { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x0002B507) { bad = 1; }
+    if (st.const_count != 1)                 { bad = 1; }
+    if (st.reloc_count != 2)                 { bad = 1; }
+    or {
+        if (st.relocs[0].kind != of.RK_PCREL_HI20)   { bad = 1; }
+        if (st.relocs[1].kind != of.RK_PCREL_LO12_I) { bad = 1; }
+        # both halves name the SAME entry: the linker measures the low half from
+        # the auipc that carries the matching high half
+        if (st.relocs[0].sym != st.relocs[1].sym)  { bad = 1; }
+        if (st.relocs[0].sym != st.consts[0].sym)  { bad = 1; }
+    }
+    if (st.consts[0].len != 8 || st.consts[0].align != 8) { bad = 1; }
+    or {
+        if (st.consts[0].bytes[0] != 0x9A) { bad = 1; }
+        if (st.consts[0].bytes[7] != 0x3F) { bad = 1; }
+    }
+
+    # the same constant again is the same entry
+    st.buf.len = 0;
+    encode_fmov(?st, nil, ?mi);
+    if (st.const_count != 1) { bad = 1; }
+
+    # at f32 width the pooled load is `flw` (funct3 2) rather than `fld`, and the
+    # entry is FOUR bytes: 0x0002a507
+    mi.width = 4;
+    ops[1] = mir.op_imm(0x3DCCCCCD);
+    st.buf.len = 0;
+    encode_fmov(?st, nil, ?mi);
+    if (read_word(?st.buf, 4) != 0x0002A507) { bad = 1; }
+    if (st.const_count != 2)                 { bad = 1; }
+    if (st.consts[1].len != 4 || st.consts[1].align != 4) { bad = 1; }
+
+    encode.consts_free(?alloc, st.consts, st.const_count, st.const_cap);
+    encode.buf_dnit(?st.buf);
+    intern.dnit(?itn);
+    ret bad;
 }
