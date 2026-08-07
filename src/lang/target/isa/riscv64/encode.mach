@@ -1197,7 +1197,15 @@ fun emit_mem_access(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width
 pub fun frame_reserved_top(f: *mir.MirFunction) i64 {
     val gp_bytes: u32 = popcount32(f.callee_mask) * 8;
     val fp_bytes: u32 = popcount32(f.callee_mask_fp) * 8;
-    ret (16 + gp_bytes + fp_bytes)::i64;
+    val n: u32 = 16 + gp_bytes + fp_bytes;
+    # in a realigned frame the slot region's base is `sp + total - this`, so BOTH have to
+    # be multiples of the requested alignment for the base to carry it (#2735). the
+    # padding lands between the callee-save areas and the locals, where nothing reads it.
+    if (f.frame.realign != 0) {
+        val rmask: u32 = f.frame.realign - 1;
+        ret ((n + rmask) & ~rmask)::i64;
+    }
+    ret n::i64;
 }
 
 # the frame-pointer (s0) relative offset of the slot a MIR value owns, or none when
@@ -1208,7 +1216,17 @@ pub fun frame_reserved_top(f: *mir.MirFunction) i64 {
 # table is keyed on the slot-owning vreg ids, so a physical-register base (carrying
 # MIR_VREG_NIL) never matches
 fun frame_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
+    if (codegen_frame.slots_from_sp(?f.frame)) {
+        ret codegen_frame.slot_sp_offset(?f.frame, v);
+    }
     ret codegen_frame.slot_offset(?f.frame, v, frame_reserved_top(f));
+}
+
+# the register a frame slot is addressed from: s0 normally, sp in a realigned frame,
+# where the mask put a run-time distance between the two (#2735)
+fun slot_base_reg(f: *mir.MirFunction) u32 {
+    if (codegen_frame.slots_from_sp(?f.frame)) { ret RSP; }
+    ret RFP;
 }
 
 # the STACK-pointer offset of the slot a MIR value owns, for an inline-asm
@@ -1228,9 +1246,7 @@ fun frame_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
 # epilogue moves it - a variable-length alloca is refused at lowering, and an asm body
 # that writes sp is refused by the shared `writes_sp` check whenever it binds a `{name}`.
 fun asm_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
-    val fp_off: O.Option[i64] = codegen_frame.slot_offset(?f.frame, v, frame_reserved_top(f));
-    if (!O.is_some[i64](fp_off)) { ret O.none[i64](); }
-    ret O.some[i64](frame_total(f)::i64 + O.unwrap[i64](fp_off));
+    ret codegen_frame.slot_sp_offset(?f.frame, v);
 }
 
 # a resolved memory operand - a base register, a constant byte displacement folded
@@ -1277,7 +1293,7 @@ fun resolve_mem(f: *mir.MirFunction, op: *mir.MirOperand) R.Result[RvMem, str] {
         if (!O.is_some[i64](slot)) {
             ret R.err[RvMem, str]("encode: value vreg survived in a memory-operand base");
         }
-        m.base = RFP;
+        m.base = slot_base_reg(f);
         m.off  = O.unwrap[i64](slot) + op.imm;
         ret R.ok[RvMem, str](m);
     }
@@ -2676,9 +2692,13 @@ fun align16(n: u32) u32 {
 # each callee-saved register (GP or FP) takes one 8-byte slot. pub so the assembly
 # printer renders the exact reservation the encoder subtracts from sp
 pub fun frame_total(f: *mir.MirFunction) u32 {
-    val gp_bytes: u32 = popcount32(f.callee_mask) * 8;
-    val fp_bytes: u32 = popcount32(f.callee_mask_fp) * 8;
-    ret align16(16 + gp_bytes + fp_bytes + f.frame.size + f.frame.outgoing_size);
+    val reserved: u32 = frame_reserved_top(f)::u32;
+    val n: u32 = align16(reserved + f.frame.size + f.frame.outgoing_size);
+    if (f.frame.realign != 0) {
+        val rmask: u32 = f.frame.realign - 1;
+        ret (n + rmask) & ~rmask;
+    }
+    ret n;
 }
 
 # adjust SP by `delta` bytes (subtract on entry, add on exit). a delta within the
@@ -2738,6 +2758,19 @@ fun save_callee_fp(st: *encode.EncodeState, f: *mir.MirFunction, total: u32, sto
 # the entry stack pointer (so incoming stack arguments sit at `[s0+0]`), and the
 # callee-saved GP registers are saved just below the record
 fun emit_prologue(st: *encode.EncodeState, f: *mir.MirFunction, total: u32) {
+    if (f.frame.realign != 0) {
+        # the record and s0 are placed from the ENTRY stack pointer, before the mask
+        # moves it: s0 must keep pointing at the frame top, because incoming stack
+        # arguments sit at `[s0+0]` and belong to the caller (#2735).
+        emit_mem_access(st, RRA, RSP, 0 - 8, 8, false);           # sd ra, -8(sp)
+        emit_mem_access(st, RFP, RSP, 0 - 16, 8, false);          # sd s0, -16(sp)
+        emit_addi(st, RFP, RSP, 0);                               # addi s0, sp, 0
+        emit_sp_realign(st, f.frame.realign);
+        emit_sp_adjust(st, total, true);
+        save_callee_gp(st, f, total, true);
+        save_callee_fp(st, f, total, true);
+        ret;
+    }
     emit_sp_adjust(st, total, true);
     emit_mem_access(st, RRA, RSP, (total::i64) - 8, 8, false);   # sd ra, total-8(sp)
     emit_mem_access(st, RFP, RSP, (total::i64) - 16, 8, false);  # sd s0, total-16(sp)
@@ -2746,12 +2779,41 @@ fun emit_prologue(st: *encode.EncodeState, f: *mir.MirFunction, total: u32) {
     save_callee_fp(st, f, total, true);
 }
 
+# mask sp down to `realign` bytes, or emit nothing when the frame needs no realignment
+#
+# S0 IS PINNED AT THE ENTRY STACK POINTER AFTERWARDS AND IS DELIBERATELY LEFT THERE
+# (#2735): incoming stack arguments sit at `[s0+0]` and belong to the caller, and after
+# a mask only one of the two pointers is still a fixed distance from the caller's stack.
+# So the slot region moves to sp, and the epilogue's `addi sp, sp, total` is unaffected -
+# the frame is torn down from s0's record, not by undoing the mask.
+#
+# The mask runs BEFORE the reservation, so `sp + total` - the slot region's base once
+# `frame_reserved_top` is subtracted off it - carries the alignment.
+fun emit_sp_realign(st: *encode.EncodeState, realign: u32) {
+    if (realign == 0) { ret; }
+    val m: i64 = 0 - realign::i64;
+    if (m >= -2048) {
+        emit_i(st, OPC_OP_IMM, F3_AND, RSP, RSP, m::u32 & 0xFFF);
+        ret;
+    }
+    emit_li(st, SCRATCH, m);
+    emit_r(st, OPC_OP, F3_AND, F7_ZERO, RSP, RSP, SCRATCH);
+}
+
 # the RISC-V epilogue. it restores the callee-saved GP registers, reloads the ra / s0
 # record, then deallocates the frame with `addi sp, sp, total`. the RET that follows
 # returns through ra
 fun emit_epilogue(st: *encode.EncodeState, f: *mir.MirFunction, total: u32) {
     save_callee_gp(st, f, total, false);
     save_callee_fp(st, f, total, false);
+    if (f.frame.realign != 0) {
+        # the mask is undone by restoring sp from s0, which the mask never touched, so
+        # whatever it discarded is irrelevant. s0 is reloaded last, after sp names it.
+        emit_addi(st, RSP, RFP, 0);                              # addi sp, s0, 0
+        emit_mem_access(st, RRA, RSP, 0 - 8, 8, true);           # ld ra, -8(sp)
+        emit_mem_access(st, RFP, RSP, 0 - 16, 8, true);          # ld s0, -16(sp)
+        ret;
+    }
     emit_mem_access(st, RRA, RSP, (total::i64) - 8, 8, true);    # ld ra, total-8(sp)
     emit_mem_access(st, RFP, RSP, (total::i64) - 16, 8, true);   # ld s0, total-16(sp)
     emit_sp_adjust(st, total, false);
@@ -3130,6 +3192,10 @@ fun encode_function_body(st: *encode.EncodeState, f: *mir.MirFunction) R.Result[
 
     val naked: bool = f.frame.omit;
     val total: u32 = frame_total(f);
+    # the distance from sp to the slot region's base, stamped before any operand is
+    # resolved (`mir.MirFrame.base_dist`). s0 is pinned at the frame TOP here, with the
+    # record and the callee-save areas beneath it, so the base sits that much lower.
+    f.frame.base_dist = total - frame_reserved_top(f)::u32;
     if (!naked) { emit_prologue(st, f, total); }
     val rp: R.Result[bool, str] = check_accounted(st, fn_base, PROLOGUE_REGION);
     if (R.is_err[bool, str](rp)) { ret rp; }
@@ -4519,6 +4585,9 @@ fun rv_patch(st: *encode.EncodeState, patch_pos: u32, target_off: u32) R.Result[
 #
 # A raw byte payload writes it exactly as it writes every other register - the compiler
 # does not decode the payload - unless the statement declared a set that omits it.
+# riscv64 measures every `{name}` from sp, realigned frame or not (#2689)
+fun rv_slot_from_sp(f: *mir.MirFunction) bool { ret true; }
+
 fun rv_writes_sp(item: *iasm.Item) bool {
     if (item.kind == iasm.AI_LABEL) { ret false; }
     if (item.kind == iasm.AI_BYTES) {
@@ -4551,6 +4620,7 @@ fun rv_grammar() iasm.Grammar {
     g.emit       = rv_emit;
     g.patch      = rv_patch;
     g.slot       = asm_slot_offset;
+    g.slot_sp    = rv_slot_from_sp;
     g.writes_sp  = rv_writes_sp;
     g.all_gp     = 0xFFFFFFFF;
     g.all_fp     = 0xFFFFFFFF;

@@ -177,6 +177,17 @@ naming the type that closes it.
 - `align` does not apply to `def` aliases (transparent, no layout of their
   own).
 
+The alignment holds for **every** object of the type, including a local on the
+stack. An ABI only promises the stack 16 bytes at a call boundary, so a function
+holding a local that asks for more gets a prologue that masks the stack pointer
+down to the largest alignment its frame contains, and addresses its locals and
+spills from there. The cost falls on those functions alone: one masking
+instruction and up to `N - 16` bytes of frame. A function with nothing
+over-aligned emits exactly the prologue it always did.
+
+The frame pointer stays where the ABI put it, so incoming stack arguments, the
+frame record and a stack walk through it are unaffected.
+
 ### `packed` — no padding
 
 Lays a `rec` or `uni` out with no padding: every field sits immediately after the

@@ -41,6 +41,14 @@ The refusal itself is unchanged. Its diagnostic and `doc/language/decorators.md`
 
 ### Fixed
 
+#### An over-aligned stack local is over-aligned at run time (#2735)
+`#[align(32)]` and above worked on a global and did nothing on a local. The slot's offset was a correct multiple of the requested alignment, but it was measured from the frame pointer, and the only alignment that reaches the frame pointer is the ABI's 16-byte call boundary. So the address was a multiple of 32 exactly when the process stack happened to start on one, which depends on the environment block and therefore changes between runs of the same binary. `$size_of` already reported the padded size, so the storage was sized for a promise the placement did not keep.
+
+A function whose frame contains an over-aligned slot now gets a prologue that masks the stack pointer down to the largest alignment that frame needs, and its locals, spills and callee-save area are addressed from there. The frame pointer stays exactly where the ABI put it: incoming stack arguments and the frame record hang off it and belong to the caller, and after a mask only one of the two pointers is still a fixed distance from the caller's stack. Debug info follows the same split: such a function's `DW_AT_frame_base` names the stack pointer, which is the register its recorded offsets are measured from.
+
+The decision is recorded once, on `MirFrame`, and every encoder reads it. So is the distance from the stack pointer to the slot region's base, which aarch64 and riscv64 had each been re-deriving for inline-asm `{name}` operands since #2689.
+
+The cost falls only on functions that ask: one masking instruction and up to `N - 16` bytes of frame. A function with nothing over-aligned emits a byte-identical prologue to before.
 #### Every SPIR-V operation on a sub-width vector was mistyped (#2743)
 A vector narrower than 128 bits reached the SPIR-V target correctly as a type and was computed on as if it had four lanes. `fun add3(a: f32x3, b: f32x3) f32x3 { ret a + b; }` built with no diagnostic and emitted `OpFAdd %v4float` inside a function declared `%v3float`, which the Khronos validator rejects. Arithmetic, bitwise, comparison-to-mask and lane writes were all affected, on every shape that is not exactly one 128-bit register, and a vector literal was the single spelling that failed loudly - as an internal error with no source location, because it is the one site that counted operands.
 

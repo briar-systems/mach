@@ -2194,14 +2194,49 @@ fun count_callee_saved(abi_vt: *abi.AbiVTable, mask: u32) i32 {
 # the outgoing region as the bottommost slice puts its base exactly at the new
 # RSP, so a caller's `[rsp + off]` argument store lands in it, and keeping every
 # addend 16-aligned holds RSP 16-byte aligned at each call boundary.
-pub fun frame_total(abi_vt: *abi.AbiVTable, frame_size: u32, callee_mask: u32, callee_mask_fp: u32, outgoing_size: u32) usize {
+pub fun frame_total(abi_vt: *abi.AbiVTable, frame_size: u32, callee_mask: u32, callee_mask_fp: u32, outgoing_size: u32, realign: u32) usize {
     var base: usize = fp_save_base(abi_vt, frame_size, callee_mask);
     # the callee-saved XMM save area (16 bytes per register, MOVAPS-aligned) sits
     # below the 16-aligned GP-area base. `fp_save_base` is already 16-aligned, so
     # adding 16-byte slots keeps the whole area 16-aligned.
     base = base + popcount32(callee_mask_fp)::usize * 16;
     if (base > 0 && (base & 15) != 0) { base = (base + 15) & ~15::usize; }
-    ret base + outgoing_size::usize;
+    var total: usize = base + outgoing_size::usize;
+    # a realigned frame (`MirFrame.realign`, decided once by the frame phase) is
+    # addressed as `RSP + total + slot.offset`, so the total is what carries the
+    # alignment from the masked RSP up to the slot region's base. rounding it to the
+    # requested boundary is therefore not padding for its own sake - it is the second
+    # half of the mask, and without it the mask aligns a base nothing is measured from.
+    if (realign != 0) {
+        val rmask: usize = realign::usize - 1;
+        total = (total + rmask) & ~rmask;
+    }
+    ret total;
+}
+
+# the register a frame slot and the callee-save area are addressed from, and how far the
+# slot region's base sits above it
+#
+# RBP and 0 for an ordinary frame - byte-identical to what this encoder always emitted.
+# RSP and the reservation for a realigned one, where the save area sits inside the region
+# the mask aligned and RBP no longer has a fixed distance to it (#2735). The two are a
+# pair: a caller that took the register from one and the bias from the other would form
+# an address that is right only when the mask discarded nothing.
+fun slot_base_reg(f: *mir.MirFunction) i32 {
+    if (codegen_frame.slots_from_sp(?f.frame)) { ret x64.RSP; }
+    ret x64.RBP;
+}
+
+fun slot_base_bias(f: *mir.MirFunction) i64 {
+    if (!codegen_frame.slots_from_sp(?f.frame)) { ret 0; }
+    ret f.frame.base_dist::i64;
+}
+
+# the bytes between RSP and the slot region's base - RBP's distance from RSP, which on
+# this target is the whole reservation because nothing sits between RBP and the locals
+fun slot_base_dist(abi_vt: *abi.AbiVTable, f: *mir.MirFunction) usize {
+    ret frame_total(abi_vt, f.frame.size, f.callee_mask, f.callee_mask_fp,
+                    f.frame.outgoing_size, f.frame.realign);
 }
 
 # the 16-byte-aligned offset (from RBP) at which the callee-saved
@@ -2234,25 +2269,26 @@ fun emit_inst(st: *enc.EncodeState, mi: *isa.Inst) {
     encode_inst(mi, ?st.buf);
 }
 
-# encode a `mov [rbp+disp], reg` saving a callee-saved register
-# into the frame
-fun emit_frame_store(st: *enc.EncodeState, reg: i32, disp: i32) {
+# encode a `mov [base+disp], reg` saving a callee-saved register
+# into the frame. `base` is RBP normally and RSP in a realigned frame, whose save area
+# is measured from the masked stack pointer like every other slot in it (#2735)
+fun emit_frame_store(st: *enc.EncodeState, reg: i32, base: i32, disp: i32) {
     var mi: isa.Inst = isa.inst_blank();
     mi.opcode = x64.MOV;
-    mi.dst    = isa.make_mem(x64.RBP, disp, -1, 0, 8);
+    mi.dst    = isa.make_mem(base, disp, -1, 0, 8);
     mi.src1   = isa.make_reg(reg, 8);
     mi.size   = 8;
     mi.flags  = x64.FLAG_REX_W;
     emit_inst(st, ?mi);
 }
 
-# encode a `mov reg, [rbp+disp]` restoring a callee-saved
-# register from the frame
-fun emit_frame_load(st: *enc.EncodeState, reg: i32, disp: i32) {
+# encode a `mov reg, [base+disp]` restoring a callee-saved
+# register from the frame, mirroring emit_frame_store's base choice
+fun emit_frame_load(st: *enc.EncodeState, reg: i32, base: i32, disp: i32) {
     var mi: isa.Inst = isa.inst_blank();
     mi.opcode = x64.MOV;
     mi.dst    = isa.make_reg(reg, 8);
-    mi.src1   = isa.make_mem(x64.RBP, disp, -1, 0, 8);
+    mi.src1   = isa.make_mem(base, disp, -1, 0, 8);
     mi.size   = 8;
     mi.flags  = x64.FLAG_REX_W;
     emit_inst(st, ?mi);
@@ -2262,10 +2298,10 @@ fun emit_frame_load(st: *enc.EncodeState, reg: i32, disp: i32) {
 # register into the frame. `idx` is the XMM within-bank index (0-15); the operand
 # is built on its composite SSE id so the encoder selects the SSE form. `disp` must
 # be 16-aligned (the frame layout guarantees it) for the aligned MOVAPS
-fun emit_xmm_store(st: *enc.EncodeState, idx: i32, disp: i32) {
+fun emit_xmm_store(st: *enc.EncodeState, idx: i32, base: i32, disp: i32) {
     var mi: isa.Inst = isa.inst_blank();
     mi.opcode = x64.MOVAPS;
-    mi.dst    = isa.make_mem(x64.RBP, disp, -1, 0, 16);
+    mi.dst    = isa.make_mem(base, disp, -1, 0, 16);
     mi.src1   = isa.make_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, idx), 16);
     mi.size   = 16;
     emit_inst(st, ?mi);
@@ -2273,11 +2309,11 @@ fun emit_xmm_store(st: *enc.EncodeState, idx: i32, disp: i32) {
 
 # encode a `movaps xmm, [rbp+disp]` restoring a callee-saved vector
 # register from the frame, mirroring emit_xmm_store
-fun emit_xmm_load(st: *enc.EncodeState, idx: i32, disp: i32) {
+fun emit_xmm_load(st: *enc.EncodeState, idx: i32, base: i32, disp: i32) {
     var mi: isa.Inst = isa.inst_blank();
     mi.opcode = x64.MOVAPS;
     mi.dst    = isa.make_reg(isa.regid_make(isa.REG_CLASS_ID_XMM, idx), 16);
-    mi.src1   = isa.make_mem(x64.RBP, disp, -1, 0, 16);
+    mi.src1   = isa.make_mem(base, disp, -1, 0, 16);
     mi.size   = 16;
     emit_inst(st, ?mi);
 }
@@ -2393,13 +2429,23 @@ fun emit_stack_probe(st: *enc.EncodeState, total: usize, page_bytes: usize) {
 # the call. the callee-save offsets are frame_size-relative and so are unaffected
 # by the outgoing region reserved below them.
 # ---
-# st:             encoder state whose byte sink the prologue bytes are appended to
-# frame_size:     size of the local frame in bytes (locals + va-save; pre callee-save)
-# callee_mask:    bitmask of callee-saved GP registers regalloc assigned
-# callee_mask_fp: bitmask of callee-saved XMM register indices regalloc assigned
-#                 (win64 only; 0 under SysV, where the XMM save path is inert)
-# outgoing_size:  bytes reserved at the bottom of the frame for stack-passed call args
-fun emit_prologue(st: *enc.EncodeState, frame_size: u32, callee_mask: u32, callee_mask_fp: u32, outgoing_size: u32) {
+# REALIGNMENT SITS BETWEEN THE FRAME POINTER AND THE RESERVATION (#2735). When the
+# frame carries a slot that needs more than the ABI's 16 bytes, `AND RSP, -N` masks the
+# stack pointer down to that boundary before the reservation, so `RSP + total` - the slot
+# region's base, and what every slot offset in a realigned function is measured from - is
+# N-aligned however the process stack happened to start. RBP is set BEFORE the mask and
+# is deliberately left where the ABI put it: incoming stack arguments and the frame
+# record are addressed from it and belong to the caller, and after a mask only one of the
+# two pointers can still be a fixed distance from the caller's stack.
+# ---
+# st: encoder state whose byte sink the prologue bytes are appended to
+# f:  the laid-out function whose frame facts drive the reservation
+fun emit_prologue(st: *enc.EncodeState, f: *mir.MirFunction) {
+    val frame_size: u32     = f.frame.size;
+    val callee_mask: u32    = f.callee_mask;
+    val callee_mask_fp: u32 = f.callee_mask_fp;
+    val outgoing_size: u32  = f.frame.outgoing_size;
+
     var push_rbp: isa.Inst = isa.inst_blank();
     push_rbp.opcode = x64.PUSH;
     push_rbp.dst    = isa.make_reg(x64.RBP, 8);
@@ -2415,7 +2461,17 @@ fun emit_prologue(st: *enc.EncodeState, frame_size: u32, callee_mask: u32, calle
     mov_rbp.flags  = x64.FLAG_REX_W;
     emit_inst(st, ?mov_rbp);
 
-    val total: usize = frame_total(st.abi, frame_size, callee_mask, callee_mask_fp, outgoing_size);
+    if (f.frame.realign != 0) {
+        var and_rsp: isa.Inst = isa.inst_blank();
+        and_rsp.opcode = x64.AND;
+        and_rsp.dst    = isa.make_reg(x64.RSP, 8);
+        and_rsp.src1   = isa.make_imm(0 - f.frame.realign::i64, 8);
+        and_rsp.size   = 8;
+        and_rsp.flags  = x64.FLAG_REX_W;
+        emit_inst(st, ?and_rsp);
+    }
+
+    val total: usize = frame_total(st.abi, frame_size, callee_mask, callee_mask_fp, outgoing_size, f.frame.realign);
     if (total > 0) {
         # on an OS that commits the stack one guard page at a time (Windows), a
         # frame larger than a page must walk each page down or the allocation skips
@@ -2435,26 +2491,29 @@ fun emit_prologue(st: *enc.EncodeState, frame_size: u32, callee_mask: u32, calle
         }
     }
 
+    val sbase: i32 = slot_base_reg(f);
+    val sbias: i64 = slot_base_bias(f);
+
     var list: [16]i32;
     val ln: i32 = x64.callee_saved_gp_list(st.abi, ?list[0]);
     var coff: i32 = frame_size::i32 + 8;
     var i: i32 = 0;
     for (i < ln) {
         if ((callee_mask & (1::u32 << list[i]::u32)) != 0) {
-            emit_frame_store(st, list[i], -coff);
+            emit_frame_store(st, list[i], sbase, (sbias - coff::i64)::i32);
             coff = coff + 8;
         }
         i = i + 1;
     }
 
-    # callee-saved XMM saves (win64): each at a 16-aligned `[rbp - (base + 16*k)]`
+    # callee-saved XMM saves (win64): each at a 16-aligned `[base - (fp_save_base + 16*k)]`
     # below the GP save area, in ascending index order (matching the epilogue).
     val xbase: i32 = fp_save_base(st.abi, frame_size, callee_mask)::i32;
     var xoff: i32 = xbase + 16;
     var x: i32 = 0;
     for (x < 16) {
         if ((callee_mask_fp & (1::u32 << x::u32)) != 0) {
-            emit_xmm_store(st, x, -xoff);
+            emit_xmm_store(st, x, sbase, (sbias - xoff::i64)::i32);
             xoff = xoff + 16;
         }
         x = x + 1;
@@ -2470,11 +2529,18 @@ fun emit_prologue(st: *enc.EncodeState, frame_size: u32, callee_mask: u32, calle
 # so each is reloaded from the slot it was saved into. the RET itself is encoded
 # from the MIR_RET instruction that follows.
 # ---
-# st:             encoder state whose byte sink the epilogue bytes are appended to
-# frame_size:     size of the local frame in bytes (locals + va-save; pre callee-save)
-# callee_mask:    bitmask of callee-saved GP registers regalloc assigned
-# callee_mask_fp: bitmask of callee-saved XMM register indices regalloc assigned
-fun emit_epilogue(st: *enc.EncodeState, frame_size: u32, callee_mask: u32, callee_mask_fp: u32) {
+# The realignment needs no undoing: `MOV RSP, RBP` restores the stack pointer from a
+# frame pointer the mask never touched, whatever the mask discarded (#2735).
+# ---
+# st: encoder state whose byte sink the epilogue bytes are appended to
+# f:  the laid-out function, read for the same frame facts the prologue read
+fun emit_epilogue(st: *enc.EncodeState, f: *mir.MirFunction) {
+    val frame_size: u32     = f.frame.size;
+    val callee_mask: u32    = f.callee_mask;
+    val callee_mask_fp: u32 = f.callee_mask_fp;
+    val sbase: i32 = slot_base_reg(f);
+    val sbias: i64 = slot_base_bias(f);
+
     # restore the callee-saved XMM registers first (the reverse of the prologue's
     # last stores), from the same 16-aligned slots in ascending index order.
     val xbase: i32 = fp_save_base(st.abi, frame_size, callee_mask)::i32;
@@ -2482,7 +2548,7 @@ fun emit_epilogue(st: *enc.EncodeState, frame_size: u32, callee_mask: u32, calle
     var x: i32 = 0;
     for (x < 16) {
         if ((callee_mask_fp & (1::u32 << x::u32)) != 0) {
-            emit_xmm_load(st, x, -xoff);
+            emit_xmm_load(st, x, sbase, (sbias - xoff::i64)::i32);
             xoff = xoff + 16;
         }
         x = x + 1;
@@ -2494,7 +2560,7 @@ fun emit_epilogue(st: *enc.EncodeState, frame_size: u32, callee_mask: u32, calle
     var i: i32 = 0;
     for (i < ln) {
         if ((callee_mask & (1::u32 << list[i]::u32)) != 0) {
-            emit_frame_load(st, list[i], -coff);
+            emit_frame_load(st, list[i], sbase, (sbias - coff::i64)::i32);
             coff = coff + 8;
         }
         i = i + 1;
@@ -2686,12 +2752,18 @@ fun encode_function(st: *enc.EncodeState, f: *mir.MirFunction) R.Result[bool, st
     val callee_mask_fp: u32 = f.callee_mask_fp;
     val outgoing_size: u32 = f.frame.outgoing_size;
 
+    # the distance from RSP to the slot region's base, stamped before any operand is
+    # resolved. it is what an inline-asm `{name}` and every access in a realigned frame
+    # are measured with, and it is written once here rather than recomputed at each
+    # reader (`mir.MirFrame.base_dist`).
+    f.frame.base_dist = slot_base_dist(st.abi, f)::u32;
+
     if (enc.sink_active(?st.buf)) {
         val rh: R.Result[bool, str] = printer.note_function(?st.buf, st.interner, f);
         if (R.is_err[bool, str](rh)) { ret rh; }
     }
 
-    if (!naked) { emit_prologue(st, frame_size, callee_mask, callee_mask_fp, outgoing_size); }
+    if (!naked) { emit_prologue(st, f); }
     val rp: R.Result[bool, str] = check_accounted(st, PROLOGUE_REGION);
     if (R.is_err[bool, str](rp)) { ret rp; }
 
@@ -2724,7 +2796,7 @@ fun encode_function(st: *enc.EncodeState, f: *mir.MirFunction) R.Result[bool, st
             # the function epilogue precedes every RET: restore callee-saved
             # registers and tear down the frame, then encode the RET itself.
             if (mi.opcode::u16 == x64.RET::u16 && !naked) {
-                emit_epilogue(st, frame_size, callee_mask, callee_mask_fp);
+                emit_epilogue(st, f);
             }
             enc.sink_set_mir(?st.buf, mi);
             val ei: R.Result[bool, str] = encode_mir_instr(st, f, fn_base, mi);
@@ -5177,7 +5249,7 @@ fun mir_to_operand(f: *mir.MirFunction, op: *mir.MirOperand, width: u8) R.Result
             }
             val off: i64 = O.unwrap[i64](slot);
             ret R.ok[isa.Operand, str](
-                isa.make_mem(x64.RBP, (off + op.imm)::i32, index, scale, width));
+                isa.make_mem(slot_base_reg(f), (off + op.imm)::i32, index, scale, width));
         }
         # a physical-register base addresses `[preg + index*scale + disp]` directly.
         ret R.ok[isa.Operand, str](
@@ -5210,6 +5282,9 @@ fun mir_to_operand(f: *mir.MirFunction, op: *mir.MirOperand, width: u8) R.Result
 # `frame.slot_offset` but reads the function's already-laid-out frame directly so
 # the encoder need not depend on the frame module
 fun frame_slot_offset(f: *mir.MirFunction, v: u32) O.Option[i64] {
+    if (codegen_frame.slots_from_sp(?f.frame)) {
+        ret codegen_frame.slot_sp_offset(?f.frame, v);
+    }
     ret codegen_frame.slot_offset(?f.frame, v, 0);
 }
 
@@ -5586,7 +5661,7 @@ fun x64_operand(c: *iasm.Cursor, lo: usize, hi: usize, role: str, op: *iasm.Oper
         if (R.unwrap_ok[bool, str](br)) {
             # unsized, like any other memory operand: the frame slot the binding names
             # states an ADDRESS, and the access width is the instruction's.
-            @op = iasm.op_mem(x64.RBP, off, -1, 0, 0);
+            @op = iasm.op_mem(slot_base_reg(c.f), off, -1, 0, 0);
             ret R.ok[bool, str](true);
         }
         op.kind     = iasm.AOP_BIND;
@@ -6274,11 +6349,15 @@ fun x64_grammar() iasm.Grammar {
     g.emit       = x64_emit;
     g.patch      = x64_patch;
     g.slot       = frame_slot_offset;
-    # RBP, not RSP, and so no `writes_sp`: a disp32 reaches either end of any frame this
-    # target can build, so the reach that forced aarch64 and riscv64 onto the stack
-    # pointer (#2689) is not a constraint here, and staying on the base x86-64's own
-    # loads and stores use keeps an asm body that pushes working as it always has.
-    g.writes_sp  = nil;
+    # RBP WHEREVER IT CAN BE. A disp32 reaches either end of any frame this target can
+    # build, so the reach that forced aarch64 and riscv64 onto the stack pointer (#2689)
+    # is not a constraint here, and staying on the base x86-64's own loads and stores use
+    # keeps an asm body that pushes working as it always has. A REALIGNED frame is the
+    # one case it cannot be (#2735): the mask puts a run-time distance between RBP and
+    # the slot region, so a `{name}` there measures from RSP like every other access in
+    # that frame - and only there does the body have a stable-SP obligation to keep.
+    g.slot_sp    = x64_slot_from_sp;
+    g.writes_sp  = x64_writes_sp;
     g.all_gp     = X64_ALL_GP;
     g.all_fp     = X64_ALL_FP;
     g.word       = 0;
@@ -6287,6 +6366,37 @@ fun x64_grammar() iasm.Grammar {
     g.note_bytes = asm_note_bytes;
     g.decl_reg   = x64_decl_reg;
     ret g;
+}
+
+# true when this function's `{name}` measures from RSP - exactly when its frame was
+# realigned, which is the one case RBP is not a fixed distance from the slot region
+fun x64_slot_from_sp(f: *mir.MirFunction) bool {
+    ret codegen_frame.slots_from_sp(?f.frame);
+}
+
+# true when one x86-64 statement writes RSP
+#
+# Read off the SAME write facts the effect model folds, so a form added to the mnemonic
+# table is covered the moment it declares what it writes. PUSH and POP move the stack
+# pointer without naming it in an operand, which is what `implicit` carries.
+#
+# A raw byte payload writes it exactly as it writes every other register - the compiler
+# does not decode the payload - unless the statement declared a set that omits it.
+fun x64_writes_sp(item: *iasm.Item) bool {
+    if (item.kind == iasm.AI_LABEL) { ret false; }
+    if (item.kind == iasm.AI_BYTES) {
+        if (item.declared) { ret (item.decl_gp & (1::u32 << x64.RSP::u32)) != 0; }
+        ret true;
+    }
+    if ((item.implicit & (1::u32 << x64.RSP::u32)) != 0) { ret true; }
+    if ((item.writes & iasm.AW_OP0) != 0 && item.nops > 0 && x64_op_is_sp(?item.ops[0])) { ret true; }
+    if ((item.writes & iasm.AW_OP1) != 0 && item.nops > 1 && x64_op_is_sp(?item.ops[1])) { ret true; }
+    ret false;
+}
+
+# true when an operand names RSP as a register (not as an address base, which reads it)
+fun x64_op_is_sp(op: *iasm.Operand) bool {
+    ret op.kind == iasm.AOP_REG && op.reg == x64.RSP;
 }
 
 # the register a declared clobber set names, in its bank (#2594)
