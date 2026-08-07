@@ -59,6 +59,24 @@ $each f in $fields(Node) {
 
 Termination is the caller's problem and is stated as such: unlike the by-value walk of #2691, following references does not terminate structurally, since `rec Grow[T] { p: *Grow[*T]; }` has unboundedly many instances reachable through its pointer.
 
+### Fixed
+
+#### A secret spilled to memory no longer launders past the `#[oblivious]` asm walk (#2706)
+The `#[oblivious]` inline-asm walk carried taint as a register bitmask with **no memory domain**, so a secret stored to the stack and reloaded came back in a register the model believed public. That defeated all three leak checks at once - a branch condition, a memory address, and a variable-latency operand:
+
+```
+mov rax, {r}
+mov [rsp], rax
+mov rbx, [rsp]
+mov rcx, [rbx]     # a secret-derived address, accepted
+```
+
+The direct form was always refused, which made the gate look sound while an ordinary spill walked through it. Memory is now the third taint domain beside the register set and the flags bit, shared across x86-64, aarch64 and riscv64 as the walk itself is.
+
+The domain is one bit for all of memory, and monotone. Per-slot tracking is not sound at this layer: `[rsp + k]` and `[rbp + j]` can name the same byte with nothing relating two base registers, and a slot key is an address rather than an extent, so overlapping accesses of different widths compare as different slots. The failure direction is over-refusal, never acceptance, and a body only loses by it if it stores a secret, reloads some other public value, and then leaks through what it reloaded.
+
+Note for anyone extending the walk: "does this instruction store" cannot be read from the `writes` mask, which names register operands. aarch64 `str` and riscv64 `sd` both declare `AW_NONE`, so a memory domain derived from that mask fires on x86-64 and silently passes every store on the other two targets.
+
 ## [4.14.0] - 2026-08-07
 
 ### Added
