@@ -17,6 +17,11 @@
 #                 commands on every segment, plus which entry command it carries.
 #                 the static and dyld-loaded layouts must agree on all of it except
 #                 the entry command (#2599). no LLVM; od/dd reads only.
+#   macho-sections— assert a linked darwin image kept its inputs' (segment, section)
+#                 names, the identity a name-based runtime scan needs: __objc_classlist
+#                 concatenated contiguously from two objects, __objc_imageinfo's flags
+#                 intact, and a rebased __mod_init_func entry (#2606). on a darwin
+#                 runner it also RUNS the image, the only way to see the initializer fire.
 #   macho-signed— structurally resolve the three x86_64 immediate-store displacements
 #                 and compare them with independent initialized-data markers, proving
 #                 SIGNED_1/_2/_4 each linked to its exact target without a mac runner.
@@ -411,6 +416,141 @@ produce_macho_framing() {
     cat "$segs"
     rm -f "$segs"
     printf 'entry=%s\n' "$entry"
+}
+
+# macho_section_fields <file> <segname> <sectname> — print a section's
+# "addr size fileoff align" tuple from its section_64 entry, or fail when absent.
+macho_section_fields() {
+    bin=$1
+    want_seg=$2
+    want_sect=$3
+    ncmds=$(read_le_uint "$bin" 16 4)
+    off=32
+    i=0
+    while [ "$i" -lt "$ncmds" ]; do
+        cmd=$(read_le_uint "$bin" "$off" 4)
+        cmdsize=$(read_le_uint "$bin" $((off + 4)) 4)
+        if [ "$cmd" -eq 25 ]; then
+            segname=$(dd if="$bin" bs=1 skip=$((off + 8)) count=16 2>/dev/null | tr '\0' '\n' | head -n 1)
+            nsects=$(read_le_uint "$bin" $((off + 64)) 4)
+            k=0
+            while [ "$k" -lt "$nsects" ]; do
+                sh=$((off + 72 + k * 80))
+                sectname=$(dd if="$bin" bs=1 skip="$sh" count=16 2>/dev/null | tr '\0' '\n' | head -n 1)
+                if [ "$segname" = "$want_seg" ] && [ "$sectname" = "$want_sect" ]; then
+                    printf '%s %s %s %s\n' \
+                        "$(read_le_uint "$bin" $((sh + 32)) 8)" \
+                        "$(read_le_uint "$bin" $((sh + 40)) 8)" \
+                        "$(read_le_uint "$bin" $((sh + 48)) 4)" \
+                        "$(read_le_uint "$bin" $((sh + 52)) 4)"
+                    return 0
+                fi
+                k=$((k + 1))
+            done
+        fi
+        [ "$cmdsize" -ge 8 ] || return 2
+        off=$((off + cmdsize))
+        i=$((i + 1))
+    done
+    echo "int: macho: section '$want_seg,$want_sect' not found" >&2
+    return 2
+}
+
+# produce_macho_sections <runmode> <target> <binary>
+# Assert that a linked darwin image kept the (segment, section) identity of its
+# inputs, which is what a name-based runtime scan needs: libobjc walks
+# __DATA,__objc_classlist and reads __DATA,__objc_imageinfo, and dyld calls every
+# pointer in __DATA,__mod_init_func (#2606). Merging inputs by KIND alone drops the
+# names and the sections do not exist in the output at all, even though their bytes
+# are still mapped somewhere inside __data.
+#
+# Presence is not enough, so this also reads the bytes back. Two clang objects each
+# contribute one __objc_classlist pointer, and the section must be ONE contiguous
+# 16-byte pointer-aligned run holding both markers in link order - not two sections
+# sharing a name, which is what a per-input section would produce and what libobjc's
+# single-array walk cannot read.
+#
+# On a darwin runner the same image is executed, which is the only way to see
+# whether dyld actually CALLED the __mod_init_func entry: unlike a missing objc
+# section, a dropped initializer fails silently and the program runs on regardless.
+produce_macho_sections() {
+    target=$2
+    bin=$3
+
+    fields=$(macho_section_fields "$bin" __DATA __objc_classlist) || return 2
+    set -- $fields
+    cl_size=$2; cl_off=$3; cl_align=$4
+    [ "$cl_size" -eq 16 ] || {
+        echo "int: macho-sections: __objc_classlist is $cl_size bytes, expected the two inputs concatenated into 16" >&2
+        return 1
+    }
+    [ "$cl_align" -ge 3 ] || {
+        echo "int: macho-sections: __objc_classlist is 2^$cl_align aligned, expected at least pointer alignment" >&2
+        return 1
+    }
+    [ $((cl_off % 8)) -eq 0 ] || {
+        echo "int: macho-sections: __objc_classlist lands at file offset $cl_off, not pointer-aligned" >&2
+        return 1
+    }
+    marker_a=$(read_le_uint "$bin" "$cl_off" 8)
+    marker_b=$(read_le_uint "$bin" $((cl_off + 8)) 8)
+    [ "$marker_a" -eq 9734 ] && [ "$marker_b" -eq 9739 ] || {
+        echo "int: macho-sections: __objc_classlist holds $marker_a,$marker_b; expected the probe-a then probe-b markers 9734,9739" >&2
+        return 1
+    }
+
+    fields=$(macho_section_fields "$bin" __DATA __objc_imageinfo) || return 2
+    set -- $fields
+    ii_size=$2; ii_off=$3
+    [ "$ii_size" -eq 8 ] || {
+        echo "int: macho-sections: __objc_imageinfo is $ii_size bytes, expected 8" >&2
+        return 1
+    }
+    ii_version=$(read_le_uint "$bin" "$ii_off" 4)
+    ii_flags=$(read_le_uint "$bin" $((ii_off + 4)) 4)
+    [ "$ii_version" -eq 0 ] && [ "$ii_flags" -eq 64 ] || {
+        echo "int: macho-sections: __objc_imageinfo holds version=$ii_version flags=$ii_flags; libobjc validates these and the input set 0/64" >&2
+        return 1
+    }
+
+    fields=$(macho_section_fields "$bin" __DATA __mod_init_func) || return 2
+    set -- $fields
+    mi_addr=$1; mi_size=$2; mi_align=$4
+    [ "$mi_size" -eq 8 ] || {
+        echo "int: macho-sections: __mod_init_func is $mi_size bytes, expected one 8-byte entry" >&2
+        return 1
+    }
+    [ "$mi_align" -ge 3 ] || {
+        echo "int: macho-sections: __mod_init_func is 2^$mi_align aligned, expected at least pointer alignment" >&2
+        return 1
+    }
+    # the entry is an in-image pointer, so a PIE must slide it: without a rebase row
+    # dyld would call whatever the unslid address happens to land on.
+    mi_hex=$(printf '0x%X' "$mi_addr")
+    rebases=$(macho_objdump --macho --rebase "$bin") || return 2
+    [ "$(printf '%s\n' "$rebases" | grep -F -c "$mi_hex")" -eq 1 ] || {
+        echo "int: macho-sections: __mod_init_func has no rebase row at $mi_hex" >&2
+        return 1
+    }
+
+    if [ "$target" = darwin-x86_64 ]; then
+        out=$(mktemp)
+        run_captured native "$target" "$bin" "$out" || { rm -f "$out"; return 1; }
+        rm -f "$out"
+        if [ "$run_status" -ne 0 ]; then
+            report_run_failure "macho-sections: the native PIE" "$run_status" "$run_out"
+            return 1
+        fi
+        [ "$run_out" = "init ok" ] || {
+            echo "int: macho-sections: dyld did not run the __mod_init_func entry" >&2
+            diff_expected_actual "init ok" "$run_out"
+            return 1
+        }
+    fi
+
+    echo "objc_classlist=concatenated-16-pointer-aligned"
+    echo "objc_imageinfo=version0-flags64"
+    echo "mod_init_func=present-rebased"
 }
 
 # produce_macho_signed <runmode> <target> <binary>
@@ -1950,6 +2090,7 @@ produce() {
         macho-signed) produce_macho_signed "$@" ;;
         macho-got)   produce_macho_got "$@" ;;
         macho-framing) produce_macho_framing "$@" ;;
+        macho-sections) produce_macho_sections "$@" ;;
         macho-abs-bind) produce_macho_abs_bind "$@" ;;
         pe-imports)  produce_pe_imports "$@" ;;
         pe-exceptions) produce_pe_exceptions "$@" ;;
