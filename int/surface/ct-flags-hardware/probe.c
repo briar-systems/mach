@@ -27,7 +27,7 @@
          __asm__ volatile ("push %[p]\n\tpopfq\n\t" INSN                       \
                            "\n\tpushfq\n\tpop %[o]"                            \
              : [o]"=&r"(_o), [d]"+r"(_d), [x]"+r"(_a), [y]"+r"(_b)             \
-             : [p]"r"((uint64_t)(PRE)) : "cc", "memory");                      \
+             : [p]"r"((uint64_t)(PRE)) : "cc", "memory", "rax");                      \
          (OUTF) = _o; (OUTD) = _d; } while (0)
 
 static const char *verdict(uint64_t hi, uint64_t lo, uint64_t bit) {
@@ -59,6 +59,12 @@ void ct_flags_probe(void) {
     W2("neg",     "neg %[x]",                  5, 0);
     W2("neg0",    "neg %[x]",                  0, 0);
     W2("xadd",    "xadd %[y], %[x]",           5, 3);
+    /* cmpxchg compares RAX against the destination, so RAX is part of the input and
+       both outcomes must be measured: the equal path stores the source and sets ZF,
+       the not-equal path loads the destination into RAX and clears it. A row that
+       defined flags on only one of its two paths would not be a definer at all. */
+    W2("cmpxchgeq", "mov %[x], %%rax\n\tcmpxchg %[y], %[x]", 5, 3);
+    W2("cmpxchgne", "mov $9, %%rax\n\tcmpxchg %[y], %[x]",   5, 3);
 
     /* the traps: partial writers that must NOT be read as defining */
     W2("inc",     "inc %[x]",                  5, 0);
