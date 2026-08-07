@@ -522,6 +522,39 @@ fun stack_arg_align(class: abi.ParamClass, align: u64) u64 {
     ret align;
 }
 
+# rewrite a variadic-tail placement into its stack form, for a platform that passes
+# the whole C variadic tail on the stack
+#
+# Apple's arm64 ABI passes EVERY argument in the variadic part of an argument list on
+# the stack, with no register phase -- a documented divergence from the AAPCS64 base
+# standard, which places a variadic argument by the same register-then-stack rule as a
+# named one. The convention classifier is asked for its ordinary answer first and the
+# placement is moved here, rather than teaching the classifier a per-platform variant:
+# darwin and linux compose the very same "aapcs64" vtable, so the convention cannot
+# tell the two apart, and the divergence is about WHERE the argument goes, not what
+# form it takes.
+#
+# That is exactly what is preserved: a by-reference argument stays by reference and its
+# hidden POINTER moves to the stack (CLASS_BYREF -> CLASS_STACK_BYREF); every
+# register-borne placement -- a scalar, a register pair, an HFA's V-register run, a
+# register-plus-stack split -- becomes one by-value stack slot of the value's own size.
+# A placement the classifier already put on the stack is returned untouched. The slot's
+# natural alignment and eight-byte-minimum granularity come from the shared
+# `stack_arg_align` / `stack_slot_bytes` walk, which is already the Apple rule.
+# ---
+# slot: the placement the convention classifier returned for a tail argument
+# ret:  the same value's stack placement
+fun stack_only_tail_slot(slot: abi.ParamSlot) abi.ParamSlot {
+    if (is_stack_slot_class(slot.class)) { ret slot; }
+    if (slot.class == abi.CLASS_BYREF) {
+        ret abi.make_slot(abi.CLASS_STACK_BYREF, -1, -1, 0, slot.size);
+    }
+    if (slot.class == abi.CLASS_VEC_BYREF) {
+        ret abi.make_slot(abi.CLASS_VEC_STACK_BYREF, -1, -1, 0, slot.size);
+    }
+    ret abi.make_slot(abi.CLASS_STACK, -1, -1, 0, slot.size);
+}
+
 # whether a placement occupies an outgoing stack slot the signature walk assigns and
 # advances a stack offset for (a by-value stack argument or either by-reference stack
 # spill). the register and register-plus-stack-split placements are handled off the
@@ -816,17 +849,22 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
 
     # whether this call reaches the variadic / unprototyped region, the sole condition
     # under which the SysV vector-count register (AL) is a live hidden argument (#1939):
-    # a call passing arguments past its declared fixed parameters, or a prototype-less
-    # indirect call whose callee carries no IRT_FN (SysV's `%al` rule covers both). a
-    # fully-prototyped fixed-arity call - every mach-to-mach call and every non-variadic
-    # C extern - never reads it, so it stages no vector-count write. captured here before
-    # the layout is freed, since it reads `layout.param_count`.
-    val sig_it:      O.Option[*type.IrType] = type.get(ctx.types, sig);
-    var sig_is_fn:   bool = false;
+    # a call to a DECLARED C-variadic callee (whose tail may be EMPTY - the register is
+    # still a live hidden argument its callee reads), a call passing arguments past its
+    # declared fixed parameters, or a prototype-less indirect call whose callee carries
+    # no IRT_FN (SysV's `%al` rule covers all three). a fully-prototyped fixed-arity call
+    # - every mach-to-mach call and every non-variadic C extern - never reads it, so it
+    # stages no vector-count write. captured here before the layout is freed, since it
+    # reads `layout.param_count`.
+    val sig_it:    O.Option[*type.IrType] = type.get(ctx.types, sig);
+    var sig_is_fn: bool = false;
+    var sig_is_va: bool = false;
     if (O.is_some[*type.IrType](sig_it)) {
-        sig_is_fn = O.unwrap[*type.IrType](sig_it).kind == type.IRT_FN;
+        val sig_t: *type.IrType = O.unwrap[*type.IrType](sig_it);
+        sig_is_fn = sig_t.kind == type.IRT_FN;
+        sig_is_va = sig_is_fn && sig_t.data.fn.variadic;
     }
-    val variadic_call: bool = !sig_is_fn || ((inst.operand_count - 1) > layout.param_count);
+    val variadic_call: bool = !sig_is_fn || sig_is_va || ((inst.operand_count - 1) > layout.param_count);
 
     # the call's result type sizes the caller-owned aggregate result storage.
     val ret_size:  u64 = type.byte_size(ctx.types, ret_type, ctx.tgt)::u64;
@@ -929,6 +967,12 @@ pub fun lower_call(ctx: *context.LowerCtx, mb: *mir.MirBlock, inst: *instruction
             # MS passes an __m128 vararg by reference too, so a tail vector at an ext
             # boundary marshals exactly like a fixed one (#2058).
             slot = classify_arg(pidx::i32, asz, aal, afl, 0, aag, avec, is_ext, gp_used, fp_used, 0, 0, abi.agg_none());
+            # a platform that passes the WHOLE variadic tail on the stack (Apple arm64,
+            # and only there) overrides the convention's placement here: the classifier
+            # answers for a named argument, and the tail's location moves. resolved once
+            # onto the target from the (os, isa) pair, so this reads a target fact and
+            # names no os. false everywhere else, leaving the placement untouched.
+            if (ctx.tgt.variadic_args_on_stack) { slot = stack_only_tail_slot(slot); }
             # round a stack-passed tail argument up to its slot alignment before
             # placing it (identity on x86; honors a 16-aligned AAPCS64 by-value arg).
             # a register-plus-stack split's tail stack chunk is eight-byte-granular.
@@ -1837,6 +1881,43 @@ test "mach.lang.be.codegen.mir.abi:stack_arg_alignment" {
     # a by-value slot honors the value's alignment, clamped to the 8-byte minimum.
     if (stack_arg_align(abi.CLASS_STACK, 16) != 16) { ret 1; }
     if (stack_arg_align(abi.CLASS_STACK, 4) != 8)   { ret 1; }
+    ret 0;
+}
+
+# the stack-only variadic tail (Apple arm64) moves a register-borne placement to the
+# stack and keeps a by-reference one by reference, with its POINTER on the stack
+test "mach.lang.be.codegen.mir.abi.stack_only_tail_slot:moves_placement_not_form" {
+    # a scalar in X1 becomes an 8-byte by-value stack slot.
+    val gp: abi.ParamSlot = stack_only_tail_slot(abi.make_slot(abi.CLASS_GP, 1, -1, 0, 8));
+    if (gp.class != abi.CLASS_STACK) { ret 1; }
+    if (gp.reg != -1)                { ret 1; }
+    if (gp.piece_count != 0)         { ret 1; }
+    if (gp.size != 8)                { ret 1; }
+    # a float in V0 too: the Apple rule has no register phase for the tail at all, so
+    # the FP bank is no more available to it than the GP bank.
+    val fp: abi.ParamSlot = stack_only_tail_slot(abi.make_slot(abi.CLASS_FP, isa.regid_make(isa.REG_CLASS_ID_XMM, 0), -1, 0, 8));
+    if (fp.class != abi.CLASS_STACK) { ret 1; }
+    # a 16-byte aggregate in an X0:X1 pair becomes ONE by-value stack slot of the
+    # aggregate's own size - not two - and carries no register pieces.
+    val pair: abi.ParamSlot = stack_only_tail_slot(abi.make_slot(abi.CLASS_GP, 0, 1, 0, 16));
+    if (pair.class != abi.CLASS_STACK) { ret 1; }
+    if (pair.piece_count != 0)         { ret 1; }
+    if (pair.size != 16)               { ret 1; }
+    # an HFA's V-register run collapses the same way.
+    val hfa: abi.ParamSlot = stack_only_tail_slot(abi.make_slot_hfa(isa.regid_make(isa.REG_CLASS_ID_XMM, 0), 4, 8, 32));
+    if (hfa.class != abi.CLASS_STACK) { ret 1; }
+    if (hfa.piece_count != 0)         { ret 1; }
+    # a >16-byte aggregate stays BY REFERENCE; only its hidden pointer moves, so the
+    # slot is the 8-byte pointer rather than the aggregate's bytes.
+    val byref: abi.ParamSlot = stack_only_tail_slot(abi.make_slot(abi.CLASS_BYREF, 0, -1, 0, 8));
+    if (byref.class != abi.CLASS_STACK_BYREF) { ret 1; }
+    if (byref.size != 8)                      { ret 1; }
+    val vbyref: abi.ParamSlot = stack_only_tail_slot(abi.make_slot(abi.CLASS_VEC_BYREF, 0, -1, 0, 8));
+    if (vbyref.class != abi.CLASS_VEC_STACK_BYREF) { ret 1; }
+    # a placement the classifier already put on the stack is returned untouched.
+    val stk: abi.ParamSlot = stack_only_tail_slot(abi.make_slot(abi.CLASS_STACK, -1, -1, 24, 16));
+    if (stk.class != abi.CLASS_STACK) { ret 1; }
+    if (stk.offset != 24)             { ret 1; }
     ret 0;
 }
 

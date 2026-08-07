@@ -5,6 +5,11 @@ a variable number of call-site arguments into a compile-time sequence. The
 compiler monomorphizes the function once per distinct argument type-list at
 each call site; there is no runtime structure, no `va_list`, and no `any`.
 
+This is unrelated to C's varargs, which share only the spelling. A pack is a
+*named* parameter (`va: ...`) on a mach function; the C form is a *bare* trailing
+`...` and may be declared only on an `ext fun`, where it describes a foreign
+callee's ABI — see [ext-fun.md](ext-fun.md#c-variadic-imports).
+
 ## Declaring a pack parameter
 
 A pack parameter is written as a named parameter whose type is `...`:
@@ -186,3 +191,4 @@ arg sequence is consumed entirely at compile time.
 - [fun.md](fun.md) — function declarations, generic and comptime parameters
 - [comptime-intrinsics.md](comptime-intrinsics.md) — `$type_of`, `$fields`, `$each`
 - [comptime-control.md](comptime-control.md) — `$if` / `$or` used inside pack bodies
+- [ext-fun.md](ext-fun.md#c-variadic-imports) — C varargs, the unrelated `ext`-only form

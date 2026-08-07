@@ -101,12 +101,20 @@ pub fun check_coercible(sc: *context.SemaContext, expected: type.TypeId, eid: id
 # checks a call against the callee's function signature
 #
 # the callee type must be a function, the argument count must match the fixed
-# parameter count (or be at least that many for a pack-tailed function), and
-# each fixed argument must be assignable to its parameter. trailing pack
-# arguments carry their inferred types unchecked here; their element types are
+# parameter count (or be at least that many for a pack-tailed or C-variadic
+# function), and each fixed argument must be assignable to its parameter. trailing
+# pack arguments carry their inferred types unchecked here; their element types are
 # fixed per call site at monomorphization. argument expressions are taken from
 # `sc.a.expr_ids[args_start ..]`, which lets untyped-literal arguments coerce to
 # their parameter type.
+#
+# A C-VARIADIC callee (`ext fun f(a: T, ...)`) has no declared type for its tail, so
+# each tail argument is checked against the C variadic contract instead of a
+# parameter: it must already be a type C could pass unpromoted. mach performs no
+# implicit conversion anywhere, so it does not silently apply C's default argument
+# promotions either - a narrow argument is REPORTED with the cast that fixes it
+# (`x::i32`, `x::f64`), which is the only spelling that survives a callee reading
+# `va_arg(ap, int)`.
 # ---
 # sc:         the active sema context
 # callee_sig: the callee's type; must be TYPE_FUN
@@ -128,8 +136,9 @@ pub fun check_call(sc: *context.SemaContext, callee_sig: type.TypeId, args_start
         ret false;
     }
 
-    val params_len:   u32 = fun_type.data.fn.params_len;
-    val params_start: u32 = fun_type.data.fn.params_start;
+    val params_len:   u32  = fun_type.data.fn.params_len;
+    val params_start: u32  = fun_type.data.fn.params_start;
+    val c_variadic:   bool = fun_type.data.fn.c_variadic;
 
     # a trailing comptime variadic pack param absorbs every trailing argument:
     # arity is `>= the leading fixed count`, and the collected args carry their
@@ -150,6 +159,13 @@ pub fun check_call(sc: *context.SemaContext, callee_sig: type.TypeId, args_start
     if (has_pack) {
         if (args_len < fixed_len) {
             report_arity(sc, span, fixed_len, args_len, true);
+            ret false;
+        }
+    }
+    or (c_variadic) {
+        # the fixed arity is a lower bound; the tail may be empty.
+        if (args_len < params_len) {
+            report_arity(sc, span, params_len, args_len, true);
             ret false;
         }
     }
@@ -174,6 +190,16 @@ pub fun check_call(sc: *context.SemaContext, callee_sig: type.TypeId, args_start
             all_ok = false;
         }
         i = i + 1;
+    }
+
+    # a C-variadic tail: no parameter type to check against, so each argument is
+    # checked against the C variadic contract itself.
+    if (c_variadic) {
+        var vi: u32 = params_len;
+        for (vi < args_len) {
+            if (!check_c_variadic_arg(sc, sc.a.expr_ids[args_start + vi], span)) { all_ok = false; }
+            vi = vi + 1;
+        }
     }
 
     # GATE (#2162): a secret value cannot enter a `...` variadic pack. A pack's
@@ -883,6 +909,56 @@ pub fun report_typed2(sc: *context.SemaContext, span: token.Span, prefix: str, a
     A.deallocate[char](sc.s.alloc, msg, str_len(msg) + 1);
     type_str_free(sc, a_str);
     type_str_free(sc, b_str);
+}
+
+# checks one argument in a C-variadic callee's tail against the C variadic contract
+#
+# A tail argument has no declared parameter type, so what constrains it is the shape
+# C guarantees a `va_arg` reader on the other side. C applies DEFAULT ARGUMENT
+# PROMOTIONS there: an integer narrower than `int` arrives as an `int`, and a
+# `float` arrives as a `double`. mach has no implicit conversions, so it does not
+# insert those promotions silently - it rejects the narrow argument and names the
+# cast, because the alternative is the exact failure shape #2575 exists to close: a
+# value the callee reads at a width the caller never wrote.
+#
+# A secret is rejected for the reason a pack argument is (#2162): a C variadic is an
+# observation boundary - the callee is libc, which prints or logs the value - so the
+# secrecy must be dropped deliberately with `:^`.
+#
+# Everything at least four bytes wide passes: an i32/u32/i64/u64, an f64, any
+# pointer, and an aggregate or vector (which C passes by value in a variadic
+# position under every psABI mach targets).
+# ---
+# sc:  the active sema context
+# eid: the tail argument's expression id
+# ret: true when the argument may cross a C variadic boundary as written
+fun check_c_variadic_arg(sc: *context.SemaContext, eid: id.ExprId, span: token.Span) bool {
+    val actual:   type.TypeId  = expr_type_of(sc, eid);
+    if (actual == type.TYPE_ERROR) { ret true; }
+    val arg_span: token.Span   = expr_span_of(sc, eid, span);
+
+    if (generics.contains_secret_deep(sc.s, actual)) {
+        report_note(sc, arg_span, "a secret value cannot be passed to a C-variadic `...` argument",
+            "a C variadic is an observation boundary (the callee is foreign code that prints or logs it); declassify with `:^` first");
+        ret false;
+    }
+
+    val bare: type.TypeId  = type.strip_secret(?sc.s.types, actual);
+    val opt:  O.Option[*type.Type] = type.get(?sc.s.types, bare);
+    if (O.is_none[*type.Type](opt)) { ret true; }
+    val d: type.PrimDesc = type.prim_desc(O.unwrap[*type.Type](opt).kind);
+
+    if (d.class == type.PRIM_CLASS_FLOAT && d.bits < 64) {
+        report_typed(sc, arg_span, "`", actual, "` is promoted to `f64` in a C-variadic argument; write the cast (`x::f64`)",
+            "a float narrower than `f64` cannot be passed to a C-variadic `...` argument; cast it to `f64`");
+        ret false;
+    }
+    if (d.class == type.PRIM_CLASS_INT && d.bits < 32) {
+        report_typed(sc, arg_span, "`", actual, "` is promoted to a 32-bit integer in a C-variadic argument; write the cast (`x::i32` / `x::u32`)",
+            "an integer narrower than 32 bits cannot be passed to a C-variadic `...` argument; cast it to `i32` or `u32`");
+        ret false;
+    }
+    ret true;
 }
 
 # whether the parameter interned at `param_idx` is a comptime variadic pack
