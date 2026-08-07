@@ -1575,11 +1575,36 @@ fun resolve_mem(f: *mir.MirFunction, op: *mir.MirOperand) R.Result[A64Mem, str] 
     ret R.ok[A64Mem, str](m);
 }
 
+# true when `off` fits one of the two immediate forms and needs no scratch register
+#
+# THE PREDICATE THE INLINE-ASM PATH GATES ON. `emit_mem_access` legalizes anything
+# larger by materializing the offset into IP0, which is sound for a COMPILER-emitted
+# access (the back end reserves IP0) and is a silent miscompile for an author-written
+# one, because an `asm aarch64` body may hold a live value in x16 and nothing tells it
+# not to. Stated here rather than duplicated at the call site so the two can never
+# drift: whatever `emit_mem_access` can encode without reaching for a scratch is
+# exactly what the inline-asm path may hand it (#2231).
+fun mem_access_needs_no_scratch(off: i64, width: u8) bool {
+    var w: u8 = width;
+    if (w == 0) { w = 8; }
+    val sh: u32 = width_shift(w);
+    if (off >= 0) {
+        val mask: i64 = (1::i64 << sh::i64) - 1;
+        if ((off & mask) == 0 && (off >> sh::i64) <= 4095) { ret true; }
+    }
+    ret off >= -256 && off <= 255;
+}
+
 # emit a width-sized integer load or store of register `rt` at the
 # legalized address `[base + off]`, choosing the scaled unsigned-offset (imm12),
 # unscaled signed-offset (imm9 / LDUR-STUR), or register-offset form. an offset
 # outside both immediate ranges is materialized into IP0 and addressed `[base, IP0]`.
 # loads use the zero-extending forms, so a sub-word load defines the full register
+#
+# THE IP0 FALLBACK IS ONLY SOUND FOR A COMPILER-EMITTED ACCESS. IP0 is reserved from
+# allocation, so no value the compiler placed can be sitting in it. An inline-asm
+# `{name}` access has no such guarantee, and must gate on
+# `mem_access_needs_no_scratch` before calling here.
 fun emit_mem_access(st: *encode.EncodeState, rt: u32, base: u32, off: i64, width: u8, is_load: bool) {
     var w: u8 = width;
     if (w == 0) { w = 8; }
@@ -4876,8 +4901,35 @@ fun a64_emit_ldst(st: *encode.EncodeState, c: *iasm.Cursor, item: *iasm.Item) R.
         emit_ldst_reg(st, ldst_base_reg(w, is_load), rt.reg::u32, mem.reg::u32, mem.index::u32);
         ret R.ok[bool, str](true);
     }
+    # an offset neither immediate form can hold would be legalized through IP0, which
+    # this body may be using: refuse rather than silently destroy it (#2231). riscv64's
+    # inline-asm load/store already refuses the same way for the same reason, so the two
+    # targets fail the same shape of program instead of one of them miscompiling it.
+    if (!mem_access_needs_no_scratch(mem.imm, w)) {
+        ret R.err[bool, str](a64_offset_message(c, mem.imm));
+    }
     emit_mem_access(st, rt.reg::u32, mem.reg::u32, mem.imm, w, is_load);
     ret R.ok[bool, str](true);
+}
+
+# the diagnostic for an inline-asm ldr/str whose offset needs an address scratch
+#
+# A `{name}` offset lands here when the enclosing frame outgrew the immediate range, so
+# the message names the frame rather than the number: the author wrote `{name}`, not an
+# offset, and what they can act on is the size of the function's locals.
+fun a64_offset_message(c: *iasm.Cursor, off: i64) str {
+    if (c.interner == nil) {
+        ret "encode: inline-asm ldr/str offset is out of range for both immediate forms; addressing it would need a scratch register this body may be using, so reduce the function's frame or stage the address into a register first";
+    }
+    var buf: [24]u8;
+    var v: i64 = off;
+    if (v < 0) { v = 0 - v; }
+    val n: usize = u64_to_dec(v::u64, ?buf[0]);
+    buf[n] = 0;
+    ret iasm.named_message(c.alloc, c.interner,
+        "encode: inline-asm ldr/str offset ", (?buf[0])::str,
+        " is out of range for both immediate forms; addressing it would need a scratch register this body may be using, so reduce the function's frame or stage the address into a register first",
+        "encode: inline-asm ldr/str offset is out of range for both immediate forms; addressing it would need a scratch register this body may be using, so reduce the function's frame or stage the address into a register first");
 }
 
 # `stp` / `ldp Xa, Xb, [mem]` in the signed-offset, pre-index and post-index forms
@@ -7734,6 +7786,91 @@ test "mach.lang.target.isa.arm64.encode:declared_raw_encodings_emit_unchanged" {
     iasm.labels_dnit(?labels);
     encode.buf_dnit(?st.buf);
     ret bad;
+}
+
+# an inline-asm ldr/str offset that would need an address scratch is REFUSED, because
+# the scratch it would take is one the body may be using (#2231)
+#
+# THIS WAS A SILENT WRONG ANSWER, not a missing feature. `emit_mem_access` legalizes an
+# out-of-range offset by materializing it into IP0, which is correct for a
+# compiler-emitted access because IP0 is reserved from allocation - and wrong for an
+# author-written one, because nothing stops an `asm aarch64` body from keeping a live
+# value in x16. A `{name}` in a function whose frame outgrew the immediate range hit
+# exactly that: the legalization overwrote the body's own x16 between the `mov` that
+# set it and the `add` that read it, so the block computed with the frame offset in
+# place of the author's value and no diagnostic was produced.
+#
+# The boundaries are asserted on both sides, so the gate cannot be widened or narrowed
+# without failing: 32760 is the largest 8-byte-scaled imm12, 255 the largest unscaled
+# imm9, and -256 its negative limit.
+test "mach.lang.target.isa.arm64.encode:asm_ldst_offset_needing_a_scratch_is_refused" {
+    var bad: i32 = 0;
+
+    # in range through the scaled imm12 form, at its top.
+    if (!t_a64_accepts("ldr x9, [x12, 32760]"))  { bad = 1; }
+    if (!t_a64_accepts("str x9, [x12, 32760]"))  { bad = 1; }
+    # one slot past it needs a scratch, so it is refused rather than legalized.
+    if (!t_a64_refuses("ldr x9, [x12, 32768]"))  { bad = 1; }
+    if (!t_a64_refuses("str x9, [x12, 32768]"))  { bad = 1; }
+
+    # an unaligned offset cannot use the scaled form and falls to the unscaled imm9,
+    # which reaches 255 either way.
+    if (!t_a64_accepts("ldr x9, [x12, 255]"))    { bad = 1; }
+    if (!t_a64_accepts("ldr x9, [x12, -256]"))   { bad = 1; }
+    if (!t_a64_refuses("ldr x9, [x12, 257]"))    { bad = 1; }
+    if (!t_a64_refuses("ldr x9, [x12, -257]"))   { bad = 1; }
+
+    # a narrower access scales by its own width, so its imm12 reach is smaller.
+    if (!t_a64_accepts("ldrb w9, [x12, 4095]"))  { bad = 1; }
+    if (!t_a64_refuses("ldrb w9, [x12, 4096]"))  { bad = 1; }
+    if (!t_a64_accepts("ldrh w9, [x12, 8190]"))  { bad = 1; }
+    if (!t_a64_refuses("ldrh w9, [x12, 8192]"))  { bad = 1; }
+
+    # the ordinary in-range forms every body already uses are untouched.
+    if (!t_a64_accepts("ldr x9, [x12]"))         { bad = 1; }
+    if (!t_a64_accepts("ldr x9, [x12, 8]"))      { bad = 1; }
+    if (!t_a64_accepts("str x9, [x12, 16]"))     { bad = 1; }
+
+    ret bad;
+}
+
+# true when the aarch64 inline-asm assembler accepts `text` (test helper)
+fun t_a64_accepts(text: str) bool {
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: iasm.Labels;
+    iasm.labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+    val r: R.Result[bool, str] = a64_asm_text(?st, ?f, ?labels, text);
+    val ok: bool = !R.is_err[bool, str](r) && st.buf.len == 4;
+    iasm.labels_dnit(?labels);
+    encode.buf_dnit(?st.buf);
+    ret ok;
+}
+
+# true when the aarch64 inline-asm assembler refuses `text` naming the scratch reason
+# (test helper)
+#
+# Matching the message, not merely the failure, is what keeps this from passing on an
+# unrelated refusal - a malformed operand would fail too and prove nothing.
+fun t_a64_refuses(text: str) bool {
+    var st: encode.EncodeState;
+    var alloc: A.Allocator;
+    var interner: intern.Interner;
+    tasm(?st, ?alloc, ?interner);
+    var labels: iasm.Labels;
+    iasm.labels_init(?labels, ?alloc);
+    var f: mir.MirFunction;
+    val r: R.Result[bool, str] = a64_asm_text(?st, ?f, ?labels, text);
+    var ok: bool = false;
+    if (R.is_err[bool, str](r)) {
+        ok = str_contains(R.unwrap_err[bool, str](r), "scratch register this body may be using");
+    }
+    iasm.labels_dnit(?labels);
+    encode.buf_dnit(?st.buf);
+    ret ok;
 }
 
 # the parse accounts for every byte of a statement or refuses it: an operand the
