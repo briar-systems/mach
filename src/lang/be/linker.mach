@@ -3607,9 +3607,25 @@ fun local_symbol_target(modules: *of.ObjectImage, m: u32, sy: u32,
     ret true;
 }
 
-# whether module m's own weak function definition named name was atom-dropped
-fun module_weak_function_is_dead(modules: *of.ObjectImage, m: u32, name: intern.StrId,
-                                 sec_base: *u32, atoms: *AtomPlan) bool {
+# whether a reference to module m's own weak function definition named `name`, offset
+# by `addend`, describes code the atom plan discarded
+#
+# the question is asked of the EFFECTIVE location (the definition's offset plus the
+# addend), not of the anchor symbol. DWARF describes the interior of a body as
+# `anchor + inner_offset`, so an inlined scope's low_pc / high_pc, a `.debug_line`
+# row, and a loclist / rnglist entry all reach a discarded body through a nonzero
+# addend; testing only the anchor missed every one of them (#2583). an addend that
+# leaves the section is not a reference into a discarded interval either way.
+# ---
+# modules:  the input image array
+# m:        index of the module owning the reference
+# name:     the referenced symbol's interned name
+# addend:   the reference's addend, in bytes from the definition
+# sec_base: per-module prefix offset into the flat section space
+# atoms:    the dead-atom plan
+# ret:      true when the effective location falls in a discarded weak body
+fun module_weak_function_ref_is_dead(modules: *of.ObjectImage, m: u32, name: intern.StrId,
+                                     addend: i64, sec_base: *u32, atoms: *AtomPlan) bool {
     var sy: u32 = 0;
     for (sy < modules[m].symbol_count) {
         val sym: *of.Symbol = ?modules[m].symbols[sy];
@@ -3617,7 +3633,9 @@ fun module_weak_function_is_dead(modules: *of.ObjectImage, m: u32, name: intern.
             && sym.section < modules[m].section_count) {
             val need: u32 = of.SYM_OBJ_FLAG_WEAK | of.SYM_OBJ_FLAG_FUNCTION;
             if ((sym.flags & need) != need) { ret false; }
-            ret atom_offset_dead(atoms, sec_base[m] + sym.section, sym.offset);
+            val eff: i64 = sym.offset::i64 + addend;
+            if (eff < 0 || eff > 0xFFFFFFFF) { ret false; }
+            ret atom_offset_dead(atoms, sec_base[m] + sym.section, eff::u32);
         }
         sy = sy + 1;
     }
@@ -3775,6 +3793,10 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
         # target resolves straight from its own definition in module `m`. GLOBAL
         # targets (and undefined externs) resolve the entire winning location by name.
         var resolved: rel.RelocTarget = rel.target(0, 0, 0);
+        # the addend the patch actually applies. a tombstoned DWARF address zeroes it:
+        # the sentinel IS the value the field must hold, and apply_reloc adds the addend
+        # to whatever target it is given, which would wrap 0xFFFF... into a low address.
+        var apply_addend: i64 = r.addend;
         if ((target.flags & of.SYM_OBJ_FLAG_GLOBAL) == 0
             && target.section != of.SECTION_EXTERNAL) {
             if (!local_symbol_target(modules, m, r.sym, placements, sec_base,
@@ -3798,11 +3820,24 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
                 val section: of.ExecutableSectionLocation = final_section_location_for(
                     format, image_base, out_img, target_out_ix, loc.section_vaddr);
                 resolved = rel.target(loc.vaddr, section.vaddr, section.ordinal);
+                # a DWARF code address describing a body the atom plan discarded is not
+                # representable: this module's copy is gone, and the winner that kept
+                # the name is a different sequence of bytes whenever the two duplicates
+                # were not identical. it resolves to the dead-code sentinel instead.
+                #
+                # the test is on the EFFECTIVE location - the definition's offset plus
+                # the addend - not on the anchor. `anchor + inner_offset` is how DWARF
+                # names the interior of a body, so an inlined scope's low_pc / high_pc,
+                # a line row, and a loclist entry all carry a nonzero addend; an
+                # anchor-only test tombstoned none of them and let them resolve to
+                # winner_vaddr + addend, an offset into (or past the end of) an
+                # unrelated body (#2583).
                 if ((r.section == info_sec || r.section == line_sec
                      || r.section == loclists_sec || r.section == rnglists_sec)
-                    && r.kind == of.RK_ABS64 && r.addend == 0
-                    && module_weak_function_is_dead(modules, m, target_name, sec_base, atoms)) {
+                    && r.kind == of.RK_ABS64
+                    && module_weak_function_ref_is_dead(modules, m, target_name, r.addend, sec_base, atoms)) {
                     resolved.vaddr = DWARF_TOMBSTONE_ADDRESS;
+                    apply_addend = 0;
                 }
             }
             or {
@@ -3925,7 +3960,7 @@ fun patch_module_relocations(s: *session.Session, out_img: *of.ObjectImage,
 
         val pr: R.Result[bool, str] =
             apply_one(s, r.kind, dst, patch_off, out_img.sections[out_ix].len, resolved,
-                      r.addend, patch_va, target_name, arch, image_base);
+                      apply_addend, patch_va, target_name, arch, image_base);
         if (R.is_err[bool, str](pr)) {
             ret R.err[bool, str](R.unwrap_err[bool, str](pr));
         }
@@ -6180,6 +6215,13 @@ fun lt_marker_tombstoned(bytes: *u8, len: usize, marker: u8) bool {
 # round-trip a synthetic producer image through one target's object writer/parser,
 # final-link it against an identical weak definition, and prove every winning debug
 # address remains live while every losing address becomes the tombstone
+#
+# each of the four DWARF code-address sections carries two references to the weak
+# body: one at the function's entry (addend 0) and one four bytes into it (addend 4),
+# the shape every inlined-scope low_pc, line row, and loclist entry has. the winner's
+# interior reference must track its live body; the loser's must be the tombstone
+# EXACTLY - an anchor-only test never tombstones it at all, and a tombstone that still
+# has its addend applied wraps to 3 rather than staying the sentinel (#2583).
 fun lt_parsed_weak_dwarf_target(s: *session.Session, tgt: *target.Target) bool {
     val alloc: *A.Allocator = s.alloc;
     val text: intern.StrId = lt_name(s, ".text");
@@ -6194,21 +6236,24 @@ fun lt_parsed_weak_dwarf_target(s: *session.Session, tgt: *target.Target) bool {
 
     var winner_text: [16]u8;
     var loser_text: [8]u8;
-    var winner_debug: [4][16]u8;
-    var loser_debug: [4][16]u8;
+    var winner_debug: [4][32]u8;
+    var loser_debug: [4][32]u8;
     var d: u32 = 0;
     for (d < 4) {
         if (debug_names[d] == intern.STR_NIL) { ret false; }
         var i: u32 = 0;
-        for (i < 16) {
+        for (i < 32) {
             winner_debug[d][i] = 0;
             loser_debug[d][i] = 0;
             i = i + 1;
         }
+        # [0,8) and [16,24) are the two markers; the relocated u64 follows each.
         i = 0;
         for (i < 8) {
             winner_debug[d][i] = (0xA0 + d)::u8;
             loser_debug[d][i] = (0xD0 + d)::u8;
+            winner_debug[d][16 + i] = (0xB0 + d)::u8;
+            loser_debug[d][16 + i] = (0xE0 + d)::u8;
             i = i + 1;
         }
         d = d + 1;
@@ -6224,10 +6269,10 @@ fun lt_parsed_weak_dwarf_target(s: *session.Session, tgt: *target.Target) bool {
     for (d < 4) {
         winner_secs[d + 1].name = debug_names[d]; winner_secs[d + 1].kind = of.SK_DEBUG;
         winner_secs[d + 1].bytes = ?winner_debug[d][0];
-        winner_secs[d + 1].len = 16; winner_secs[d + 1].align = 1;
+        winner_secs[d + 1].len = 32; winner_secs[d + 1].align = 1;
         loser_secs[d + 1].name = debug_names[d]; loser_secs[d + 1].kind = of.SK_DEBUG;
         loser_secs[d + 1].bytes = ?loser_debug[d][0];
-        loser_secs[d + 1].len = 16; loser_secs[d + 1].align = 1;
+        loser_secs[d + 1].len = 32; loser_secs[d + 1].align = 1;
         d = d + 1;
     }
 
@@ -6243,8 +6288,8 @@ fun lt_parsed_weak_dwarf_target(s: *session.Session, tgt: *target.Target) bool {
     loser_syms[0].name = dup; loser_syms[0].section = 0;
     loser_syms[0].offset = 0; loser_syms[0].size = 8; loser_syms[0].flags = weak_flags;
 
-    var winner_relocs: [4]of.Relocation;
-    var loser_relocs: [4]of.Relocation;
+    var winner_relocs: [8]of.Relocation;
+    var loser_relocs: [8]of.Relocation;
     d = 0;
     for (d < 4) {
         winner_relocs[d].section = d + 1; winner_relocs[d].offset = 8;
@@ -6253,14 +6298,20 @@ fun lt_parsed_weak_dwarf_target(s: *session.Session, tgt: *target.Target) bool {
         loser_relocs[d].section = d + 1; loser_relocs[d].offset = 8;
         loser_relocs[d].kind = of.RK_ABS64; loser_relocs[d].sym = 0;
         loser_relocs[d].addend = 0;
+        winner_relocs[4 + d].section = d + 1; winner_relocs[4 + d].offset = 24;
+        winner_relocs[4 + d].kind = of.RK_ABS64; winner_relocs[4 + d].sym = 0;
+        winner_relocs[4 + d].addend = 4;
+        loser_relocs[4 + d].section = d + 1; loser_relocs[4 + d].offset = 24;
+        loser_relocs[4 + d].kind = of.RK_ABS64; loser_relocs[4 + d].sym = 0;
+        loser_relocs[4 + d].addend = 4;
         d = d + 1;
     }
 
     var modules: [2]of.ObjectImage;
     modules[0] = lt_image(s, lt_name(s, "parsed-winner"), ?winner_secs[0], 5,
-                          ?winner_syms[0], 2, ?winner_relocs[0], 4);
+                          ?winner_syms[0], 2, ?winner_relocs[0], 8);
     modules[1] = lt_image(s, lt_name(s, "parsed-loser"), ?loser_secs[0], 5,
-                          ?loser_syms[0], 1, ?loser_relocs[0], 4);
+                          ?loser_syms[0], 1, ?loser_relocs[0], 8);
 
     val wtf_r: R.Result[fs.TempFile, str] = fs.temp_create(alloc, "weak_dwarf_winner");
     if (R.is_err[fs.TempFile, str](wtf_r)) { ret false; }
@@ -6310,6 +6361,17 @@ fun lt_parsed_weak_dwarf_target(s: *session.Session, tgt: *target.Target) bool {
                 if (!lt_marker_tombstoned(out.data, out.len, (0xD0 + d)::u8)) {
                     ok = false;
                 }
+
+                # the interior references: the winner's tracks its live body, the
+                # loser's is the sentinel itself with no addend added back onto it.
+                var winner_inner: u64 = 0;
+                if (!lt_marker_live_value(out.data, out.len, (0xB0 + d)::u8, ?winner_inner)) {
+                    ok = false;
+                }
+                if (winner_inner != live_addr + 4) { ok = false; }
+                if (!lt_marker_tombstoned(out.data, out.len, (0xE0 + d)::u8)) {
+                    ok = false;
+                }
                 d = d + 1;
             }
             vector.dnit[u8](?out);
@@ -6324,7 +6386,8 @@ fun lt_parsed_weak_dwarf_target(s: *session.Session, tgt: *target.Target) bool {
 
 # mach-produced ELF and Mach-O objects retain the same atom-aware DWARF semantics
 # after their writer/parser round trips. all four winning weak-function addresses
-# remain live and equal while all four losing addresses become the tombstone
+# remain live and equal while all four losing addresses become the tombstone, at the
+# body's entry (addend 0) and four bytes into it (addend 4) alike
 test "mach.lang.be.linker.patch_relocations:parsed_weak_dwarf_tombstones" {
     var reg: target.TargetRegistry = target.registry_init();
     if (R.is_err[bool, str](target.register_all(?reg))) { ret 1; }
@@ -8330,8 +8393,8 @@ test "mach.lang.be.linker.atom_plan:resolution_and_inert_gate" {
     if (R.is_err[bool, str](ww) || !plan.active || plan.drop_count != 1) { ret 1; }
     if (plan.drops[0].section != 1 || plan.drops[0].start != 0
         || plan.drops[0].end != 8 || plan.removed_bytes != 8) { ret 1; }
-    if (module_weak_function_is_dead(?mods[0], 0, dup, ?bases[0], ?plan)
-        || !module_weak_function_is_dead(?mods[0], 1, dup, ?bases[0], ?plan)) { ret 1; }
+    if (module_weak_function_ref_is_dead(?mods[0], 0, dup, 0, ?bases[0], ?plan)
+        || !module_weak_function_ref_is_dead(?mods[0], 1, dup, 0, ?bases[0], ?plan)) { ret 1; }
     free_atom_plan(?alloc, ?plan);
 
     # a later strong replaces and discards the earlier weak winner.
@@ -8341,8 +8404,8 @@ test "mach.lang.be.linker.atom_plan:resolution_and_inert_gate" {
     if (R.is_err[bool, str](ws) || !plan.active || plan.drops[0].section != 0) { ret 1; }
     # the global winner is strong here, but the defining module's own weak flag
     # still identifies the discarded copy whose debug low_pc must be tombstoned.
-    if (!module_weak_function_is_dead(?mods[0], 0, dup, ?bases[0], ?plan)
-        || module_weak_function_is_dead(?mods[0], 1, dup, ?bases[0], ?plan)) { ret 1; }
+    if (!module_weak_function_ref_is_dead(?mods[0], 0, dup, 0, ?bases[0], ?plan)
+        || module_weak_function_ref_is_dead(?mods[0], 1, dup, 0, ?bases[0], ?plan)) { ret 1; }
     free_atom_plan(?alloc, ?plan);
 
     # a strong seen first remains the winner and the later weak is discarded.
@@ -8351,8 +8414,8 @@ test "mach.lang.be.linker.atom_plan:resolution_and_inert_gate" {
     val sw: R.Result[bool, str] =
         build_atom_plan(?s, ?mods[0], 2, 0, ?bases[0], 2, true, nil::*isa.IsaVTable, ?plan);
     if (R.is_err[bool, str](sw) || !plan.active || plan.drops[0].section != 1) { ret 1; }
-    if (module_weak_function_is_dead(?mods[0], 0, dup, ?bases[0], ?plan)
-        || !module_weak_function_is_dead(?mods[0], 1, dup, ?bases[0], ?plan)) { ret 1; }
+    if (module_weak_function_ref_is_dead(?mods[0], 0, dup, 0, ?bases[0], ?plan)
+        || !module_weak_function_ref_is_dead(?mods[0], 1, dup, 0, ?bases[0], ?plan)) { ret 1; }
     free_atom_plan(?alloc, ?plan);
 
     # two strong definitions remain a hard error.
