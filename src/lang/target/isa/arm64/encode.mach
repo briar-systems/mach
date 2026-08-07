@@ -2374,20 +2374,71 @@ fun is_fp_slot(f: *mir.MirFunction, op: *mir.MirOperand) bool {
     ret op.kind == mir.MIR_OP_MEM && op.vreg != mir.MIR_VREG_NIL && mir.vreg_is_fp(f, op.vreg);
 }
 
-# materialize a float-constant bit pattern into vector register index
-# `vd`. the bits - a 32-bit pattern for an f32, a 64-bit pattern for an f64 (the
-# shape a float CONSTANT carries through lowering) - are materialized into the IP0 GP
-# scratch via the shared movewide sequence, then bit-copied into `vd` with the GP->FP
-# reinterpret FMOV (Sd,Wn for an f32, Dd,Xn for an f64). the AArch64 twin of x86-64's
-# float-constant load (MOVABS R11 + MOVQ xmm); IP0 is the reserved encoder scratch,
-# so a single instruction's materialization never collides with a live value.
-# `width` is 4 (S) or 8 (D)
-fun emit_fp_imm(st: *encode.EncodeState, vd: u32, bits: u64, width: u8) {
+# the number of instruction words `emit_movewide_seq` spends on a bit pattern - one
+# MOVZ or MOVK per non-zero 16-bit chunk, and one MOVZ for a zero value
+#
+# The cost half of the constant-materialization decision, so the decision compares
+# real instruction counts rather than a rule of thumb about widths
+fun movewide_words(bits: u64, use64: bool) u32 {
+    var v: u64 = bits;
+    if (!use64) { v = bits & 0xFFFFFFFF; }
+    if (v == 0) { ret 1; }
+    var chunks: u32 = 2;
+    if (use64) { chunks = 4; }
+    var n: u32 = 0;
+    var i: u32 = 0;
+    for (i < chunks) {
+        if (((v >> (16::u64 * i::u64)) & 0xFFFF) != 0) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# materialize a float-constant bit pattern into vector register index `vd`
+#
+# Three forms, chosen by which is cheapest for the pattern in hand rather than by a
+# blanket rule - AArch64, unlike x86-64, can build some constants in fewer
+# instructions than a load takes, so pooling unconditionally would be a
+# pessimisation for those.
+#
+#   - all-zero bits: `fmov Dd, XZR` (`Sd, WZR`), ONE instruction reading the zero
+#     register. nothing can beat it, so a zero is never pooled;
+#   - a pattern one MOVZ builds: `movz IP0, #imm ; fmov Dd, X16`, two instructions
+#     and no memory reference. an ADRP + LDR pair is also two instructions but
+#     touches memory and carries two relocations, so the register form wins;
+#   - anything else (two to four MOVZ/MOVK words plus the FMOV, so three to five
+#     instructions): the module's constant pool, reached as `adrp IP0, .Lconst.N ;
+#     ldr Dd, [IP0, :lo12:.Lconst.N]` - two instructions whatever the pattern.
+#
+# IP0 is the reserved encoder scratch in both the register and the pool form, so a
+# materialization never collides with a live value. `width` is 4 (S) or 8 (D)
+fun emit_fp_const(st: *encode.EncodeState, vd: u32, bits: u64, width: u8) R.Result[bool, str] {
     val use64: bool = width == 8;
-    emit_movewide_seq(st, SCRATCH0, bits, use64);
-    var base: u32 = FMOV_S_FROM_W;
-    if (use64) { base = FMOV_D_FROM_X; }
-    emit_alu3(st, base, vd, SCRATCH0, 0);
+    var pattern: u64 = bits;
+    if (!use64) { pattern = bits & 0xFFFFFFFF; }
+
+    var fmov_base: u32 = FMOV_S_FROM_W;
+    if (use64) { fmov_base = FMOV_D_FROM_X; }
+
+    if (pattern == 0) {
+        emit_alu3(st, fmov_base, vd, ZR, 0);
+        ret R.ok[bool, str](true);
+    }
+    if (movewide_words(pattern, use64) <= 1) {
+        emit_movewide_seq(st, SCRATCH0, pattern, use64);
+        emit_alu3(st, fmov_base, vd, SCRATCH0, 0);
+        ret R.ok[bool, str](true);
+    }
+
+    val sr: R.Result[intern.StrId, str] = encode.intern_float_const(st, pattern, width);
+    if (R.is_err[intern.StrId, str](sr)) { ret R.err[bool, str](R.unwrap_err[intern.StrId, str](sr)); }
+    val sym: intern.StrId = R.unwrap_ok[intern.StrId, str](sr);
+
+    val ar: R.Result[bool, str] = emit_adrp_reloc(st, SCRATCH0, sym, 0);
+    if (R.is_err[bool, str](ar)) { ret ar; }
+    val pos: u32 = st.buf.len::u32;
+    emit_ldst_sym(st, fp_mem_scaled_base(use64, true), vd, SCRATCH0, sym, printer.MOD_PCREL_LO);
+    ret encode.push_reloc(st, arm64_reloc_offset(pos), ldst_lo12_kind(width), sym, 0);
 }
 
 # the vector register index a float source operand contributes.
@@ -2407,7 +2458,8 @@ fun resolve_fp_source(st: *encode.EncodeState, f: *mir.MirFunction, op: *mir.Mir
         ret R.ok[i32, str](scratch::i32);
     }
     if (op.kind == mir.MIR_OP_IMM) {
-        emit_fp_imm(st, scratch, op.imm::u64, width);
+        val cr: R.Result[bool, str] = emit_fp_const(st, scratch, op.imm::u64, width);
+        if (R.is_err[bool, str](cr)) { ret R.err[i32, str](R.unwrap_err[bool, str](cr)); }
         ret R.ok[i32, str](scratch::i32);
     }
     ret req_vec(op);
@@ -2929,7 +2981,7 @@ fun encode_fp_conv(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirIns
 # shape, operand register CLASS, and spill state:
 #   - immediate source (a float CONSTANT): the bit pattern is materialized into the
 #     destination vector register (or V31 then stored for a spilled destination) via
-#     IP0 + a GP->FP FMOV - see `emit_fp_imm`.
+#     the cheapest form for its bit pattern - see `emit_fp_const`.
 #   - vector <- vector: `fmov Sd|Dd, Sn|Dn` (float copy).
 #   - vector <- GP / GP <- vector: the cross-bank `fmov Sd,Wn` / `fmov Dd,Xn` and
 #     `fmov Wd,Sn` / `fmov Xd,Dn` bit reinterprets.
@@ -2971,18 +3023,18 @@ fun encode_fmov(st: *encode.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr)
 
     # a float-constant immediate source: the FP isel's CONSTANT move and the pre-colored
     # FP return move to V0 both reach here as `FMOV vec <- imm`. materialize the bit
-    # pattern into the destination vector register (the register IS the target, IP0 for
-    # the bits + a GP->FP FMOV), or into V31 then store for a spilled destination - never
+    # pattern into the destination vector register (the register IS the target), or into
+    # V31 then store for a spilled destination - never
     # routed to the GP req_* paths, which would mis-read the float constant.
     if (src.kind == mir.MIR_OP_IMM) {
         if (dst.kind == mir.MIR_OP_MEM) {
-            emit_fp_imm(st, FP_SCRATCH0, src.imm::u64, w);
+            val cr: R.Result[bool, str] = emit_fp_const(st, FP_SCRATCH0, src.imm::u64, w);
+            if (R.is_err[bool, str](cr)) { ret cr; }
             ret emit_fp_slot_store(st, f, dst, FP_SCRATCH0, w);
         }
         val rdr: R.Result[i32, str] = req_vec(dst);
         if (R.is_err[i32, str](rdr)) { ret R.err[bool, str](R.unwrap_err[i32, str](rdr)); }
-        emit_fp_imm(st, R.unwrap_ok[i32, str](rdr)::u32, src.imm::u64, w);
-        ret R.ok[bool, str](true);
+        ret emit_fp_const(st, R.unwrap_ok[i32, str](rdr)::u32, src.imm::u64, w);
     }
 
     if (dst.kind != mir.MIR_OP_MEM && src.kind != mir.MIR_OP_MEM) {
@@ -5317,7 +5369,15 @@ fun a64_asm_text(st: *encode.EncodeState, f: *mir.MirFunction, l: *iasm.Labels, 
 # the emit-level helpers (prologue / epilogue / branch patch) directly
 fun tbuf(st: *encode.EncodeState, alloc: *A.Allocator) {
     page.make(alloc);
-    st.buf = encode.buf_init(alloc);
+    encode.state_blank(st, alloc);
+}
+
+# the same, plus a live interner, for a test whose path mints a constant-pool symbol
+fun tbuf_interned(st: *encode.EncodeState, alloc: *A.Allocator, itn: *intern.Interner) {
+    page.make(alloc);
+    @itn = intern.init(alloc);
+    encode.state_blank(st, alloc);
+    st.interner = itn;
 }
 
 # a composite vector-bank physical-register operand (V`n`), the post-regalloc
@@ -6109,53 +6169,118 @@ test "mach.lang.target.isa.arm64.encode:fcvt_s_d_and_gp_fp_bitcast_fmov" {
     ret bad;
 }
 
-# float-constant immediate materialization: a float CONSTANT reaches the encoder as a
+# float-constant materialization: a float CONSTANT reaches the encoder as a
 # MIR_OP_IMM carrying the value's bit pattern (an f32's 32-bit / an f64's 64-bit
-# pattern). a `FMOV vec <- imm` (the FP isel's CONSTANT move and the pre-colored FP
-# return move) materializes the bits into IP0 with the movewide sequence then bit-
-# copies them into the destination vector register with the GP->FP FMOV; an FP-arith
-# immediate operand routes the same materialization into the held-back FP scratch.
-# float-constant immediate materialization matches llvm-mc
-test "mach.lang.target.isa.arm64.encode:float_constant_immediate_materialization" {
+# pattern), and `emit_fp_const` picks the CHEAPEST of three forms for that pattern -
+# the zero register, a MOVZ plus the bank move, or a constant-pool load. every one of
+# the three is pinned here, because the decision is the whole point: a rule that
+# pooled unconditionally would spend two instructions and a memory reference where
+# one register-building instruction serves, and one that never pooled would spend up
+# to five.
+#
+# the pooled form's two RELOCATIONS are asserted alongside its words. the words alone
+# say nothing - both immediates are zero placeholders, so a pool load that recorded
+# no relocation encodes to exactly these bytes and loads from the wrong address.
+# float-constant materialization matches llvm-mc
+test "mach.lang.target.isa.arm64.encode:float_constant_materialization" {
     var bad: i32 = 0;
     var st: encode.EncodeState;
     var alloc: A.Allocator;
-    tbuf(?st, ?alloc);
+    var itn: intern.Interner;
+    tbuf_interned(?st, ?alloc, ?itn);
     var f: mir.MirFunction;
     var ops: [3]mir.MirOperand;
     var mi: mir.MirInstr = mir.instr(mir.MIR_ADD, ?ops[0], 2, 0, 0);
 
-    # f64 0.1 = 0x3FB999999999999A -> v0:
-    #   movz x16,#0x999a ; movk x16,#0x9999,lsl#16 ; movk x16,#0x9999,lsl#32 ;
-    #   movk x16,#0x3fb9,lsl#48 ; fmov d0, x16
-    ops[0] = tvec(0); ops[1] = mir.op_imm(0x3FB999999999999A);
+    # +0.0 -> v0: fmov d0, xzr. ONE instruction reading the zero register, no pool
+    # entry and no relocation - the cheapest form there is
+    ops[0] = tvec(0); ops[1] = mir.op_imm(0);
     mi.opcode = arm64.FMOV::u32; mi.width = 8; st.buf.len = 0;
     encode_fmov(?st, ?f, ?mi);
-    if (read_word(?st.buf, 0)  != 0xD2933350) { bad = 1; }
-    if (read_word(?st.buf, 4)  != 0xF2B33330) { bad = 1; }
-    if (read_word(?st.buf, 8)  != 0xF2D33330) { bad = 1; }
-    if (read_word(?st.buf, 12) != 0xF2E7F730) { bad = 1; }
-    if (read_word(?st.buf, 16) != 0x9E670200) { bad = 1; }
+    if (st.buf.len != 4)                      { bad = 1; }
+    if (read_word(?st.buf, 0) != 0x9E6703E0)  { bad = 1; }
+    if (st.const_count != 0)                  { bad = 1; }
+    if (st.reloc_count != 0)                  { bad = 1; }
 
-    # f32 0.1 = 0x3DCCCCCD -> v0: movz w16,#0xcccd ; movk w16,#0x3dcc,lsl#16 ; fmov s0, w16
+    # f64 2.0 = 0x4000000000000000 -> v0: one MOVZ builds it, so it stays in the
+    # register form: movz x16,#0x4000,lsl#48 ; fmov d0, x16. two instructions, which
+    # a pooled load only equals while also touching memory
+    ops[1] = mir.op_imm(0x4000000000000000);
+    st.buf.len = 0;
+    encode_fmov(?st, ?f, ?mi);
+    if (st.buf.len != 8)                      { bad = 1; }
+    if (read_word(?st.buf, 0) != 0xD2E80010)  { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x9E670200)  { bad = 1; }
+    if (st.const_count != 0)                  { bad = 1; }
+    if (st.reloc_count != 0)                  { bad = 1; }
+
+    # f64 0.1 = 0x3FB999999999999A needs four MOVZ/MOVK words, so it pools:
+    #   adrp x16, .Lconst.0 ; ldr d0, [x16, :lo12:.Lconst.0]
+    # ADRP_BASE | x16 = 0x90000010; LDR_D_OFF | rn=16 | rt=0 = 0xFD400200. both
+    # immediates are zero placeholders the two relocations fill.
+    ops[1] = mir.op_imm(0x3FB999999999999A);
+    st.buf.len = 0;
+    encode_fmov(?st, ?f, ?mi);
+    if (st.buf.len != 8)                      { bad = 1; }
+    if (read_word(?st.buf, 0) != 0x90000010)  { bad = 1; }
+    if (read_word(?st.buf, 4) != 0xFD400200)  { bad = 1; }
+    if (st.const_count != 1)                  { bad = 1; }
+    if (st.reloc_count != 2)                  { bad = 1; }
+    or {
+        if (st.relocs[0].kind != of.RK_PAGE21)       { bad = 1; }
+        if (st.relocs[0].offset != 0)                { bad = 1; }
+        if (st.relocs[1].kind != of.RK_LDST64_LO12)  { bad = 1; }
+        if (st.relocs[1].offset != 4)                { bad = 1; }
+        # both halves name the SAME entry: a pair naming two symbols resolves to
+        # two different pages and loads from neither constant
+        if (st.relocs[0].sym != st.relocs[1].sym)    { bad = 1; }
+        if (st.relocs[0].sym != st.consts[0].sym)    { bad = 1; }
+    }
+    # the entry is the constant, little-endian, at f64 width and alignment
+    if (st.consts[0].len != 8 || st.consts[0].align != 8) { bad = 1; }
+    or {
+        if (st.consts[0].bytes[0] != 0x9A) { bad = 1; }
+        if (st.consts[0].bytes[7] != 0x3F) { bad = 1; }
+    }
+
+    # f32 0.1 = 0x3DCCCCCD needs two MOVZ/MOVK words, so it pools too, through the
+    # single-precision load: LDR_S_OFF | rn=16 | rt=0 = 0xBD400200, with the
+    # word-width LO12 relocation rather than the doubleword one
     ops[1] = mir.op_imm(0x3DCCCCCD);
     mi.width = 4; st.buf.len = 0;
+    val reloc_before: u32 = st.reloc_count;
     encode_fmov(?st, ?f, ?mi);
-    if (read_word(?st.buf, 0) != 0x529999B0) { bad = 1; }
-    if (read_word(?st.buf, 4) != 0x72A7B990) { bad = 1; }
-    if (read_word(?st.buf, 8) != 0x1E270200) { bad = 1; }
+    if (st.buf.len != 8)                      { bad = 1; }
+    if (read_word(?st.buf, 0) != 0x90000010)  { bad = 1; }
+    if (read_word(?st.buf, 4) != 0xBD400200)  { bad = 1; }
+    if (st.const_count != 2)                  { bad = 1; }
+    if (st.reloc_count != reloc_before + 2)   { bad = 1; }
+    or {
+        if (st.relocs[reloc_before + 1].kind != of.RK_LDST32_LO12) { bad = 1; }
+    }
+    # an f32 entry is FOUR bytes, not the low four of an eight-byte image
+    if (st.consts[1].len != 4 || st.consts[1].align != 4) { bad = 1; }
 
-    # FP-arith immediate operand: a * 2.0 (rhs 2.0 = 0x4000000000000000) -> fmul d0, d1, d30
-    #   movz x16,#0x4000,lsl#48 ; fmov d30, x16 ; fmul d0, d1, d30
+    # the same constant again is the same entry, and adds no third one
+    st.buf.len = 0;
+    encode_fmov(?st, ?f, ?mi);
+    if (st.const_count != 2) { bad = 1; }
+
+    # FP-arith immediate operand: a * 2.0 -> the cheap register form feeding the
+    # held-back FP scratch, unchanged. movz x16,#0x4000,lsl#48 ; fmov d30, x16 ;
+    # fmul d0, d1, d30
     mi.operand_count = 3;
     ops[0] = tvec(0); ops[1] = tvec(1); ops[2] = mir.op_imm(0x4000000000000000);
     mi.opcode = mir.MIR_FMUL; mi.width = 8; mi.src_width = 8; st.buf.len = 0;
     encode_fp_arith(?st, ?f, ?mi);
-    if (read_word(?st.buf, 0) != 0xD2E80010) { bad = 1; }
-    if (read_word(?st.buf, 4) != 0x9E67021E) { bad = 1; }
-    if (read_word(?st.buf, 8) != 0x1E7E0820) { bad = 1; }
+    if (st.buf.len != 12)                     { bad = 1; }
+    if (read_word(?st.buf, 0) != 0xD2E80010)  { bad = 1; }
+    if (read_word(?st.buf, 4) != 0x9E67021E)  { bad = 1; }
+    if (read_word(?st.buf, 8) != 0x1E7E0820)  { bad = 1; }
 
+    encode.consts_free(?alloc, st.consts, st.const_count, st.const_cap);
     encode.buf_dnit(?st.buf);
+    intern.dnit(?itn);
     ret bad;
 }
 

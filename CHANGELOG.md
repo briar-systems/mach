@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### A constant pool, so a float constant is loaded rather than rebuilt (#2248, #2700)
+A constant wider than an ISA's immediate forms has to live in memory somewhere. Every back end here instead rebuilt one from instructions at every use, inside loop bodies included: x86-64 spent `movabs r11 ; movq xmm, r11` (two instructions, 15 bytes, and a general-purpose scratch) because SSE has no immediate form at all, aarch64 spent up to four `movz`/`movk` words plus a bank move, and riscv64 spent `emit_li`'s recursive shift-and-add - five to seven words for an arbitrary `f64`, since its widest immediate is 32 bits.
+
+The pool lives in the **shared encode state**, not in a back end. It interns a constant under its full identity - kind, width, alignment, and every byte - so two uses share one entry while constants that merely resemble each other do not, and bit patterns are compared rather than the values they denote, so `-0.0` and `+0.0` stay distinct. Each entry is packed into its own read-only section with a local symbol and marked coalescable, so byte-identical entries from **different modules** collapse to one placement at link time, reusing the machinery `#[embed]` dedup already had.
+
+Alignment is decided in one place and carried to the section unchanged. No encoder re-derives it, which is what will keep an aligned load legal at a width **wider than a register**, where an entry is read in register-width pieces at power-of-two offsets from its own base.
+
+Pooling is a decision, not a reflex, and the targets disagree on purpose. x86-64 pools every non-zero constant, because with no immediate form the alternative is never cheaper even at a single use, and folds the entry straight into the operation that reads it: `mulsd xmm, [rip + .Lconst.0]`. aarch64 and riscv64 pool only what they cannot build in fewer instructions than a load takes - an all-zero constant reads the zero register in **one** instruction, and a pattern one `movz` or one `lui` builds stays in registers rather than touching memory for the same two instructions.
+
+Measured, on programs that run:
+
+| | before | after |
+|---|---:|---:|
+| five-term Horner loop body, x86-64 | 31 instructions / 164 bytes | 22 / 109 |
+| the same program's wall time | 60.1 ms | **41.9 ms** (1.43x) |
+| a four-constant kernel, x86-64 | 17 instructions | 9 |
+| the same kernel, aarch64 | 25 | 13 |
+| the same kernel, riscv64 | 41 | 13 |
+
+The compiler's own code is not float-heavy, so it barely moves: compiling one source tree with both compilers, `.text` falls 354 bytes for 24 bytes of new `.rodata`, and every one of the 58 float-constant rebuild pairs in its objects is gone. The win is in numeric code, and this is what it is worth there.
+
+### Changed
+
+#### The `#[packed]` vector refusal now waits on one thing, not two (#2728)
+The refusal is sequencing rather than policy, and it was waiting on two conditions: evidence that an unaligned vector access is correct on real silicon, and #2687's aggregate-layout half. The first is now settled.
+
+`int/surface/unaligned-vector` stores and loads `i32x4`, `f32x4`, `i32x3` and `f32x3` at deliberately misaligned offsets. A store probe reassembles every lane from four byte loads and a load probe writes the bytes by hand, so neither reads back through the access it measures, and a sentinel in the bytes on both sides of each extent catches the truncated and over-wide stores a lane check alone cannot see. It is correct in both profiles on every **native** leg: `linux-arm64` on `ubuntu-24.04-arm`, which is the row that matters because aarch64 has 128-bit forms with alignment requirements, plus `linux` and `windows` on x86-64. Nothing faults, no lane is dropped, no neighbour is disturbed. `linux-riscv64` passes and is deliberately not counted: it runs under qemu-user, and riscv64 declares no 128-bit vector support, so the access there is a scalar expansion rather than a vector access.
+
+The refusal itself is unchanged. Its diagnostic and `doc/language/decorators.md` now name what actually remains.
+
 ### Fixed
 
 #### An over-aligned stack local is over-aligned at run time (#2735)

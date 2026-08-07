@@ -269,12 +269,23 @@ an atomic has to a field, and there is no pointer to hand it.
 **Vector fields.** A vector in a packed record is refused for now, including one
 reached through an array or a nested record. The reason is evidence rather than
 arithmetic: an unaligned **scalar** access is measured on real hardware, and that
-measurement is what `#[packed]` rests on, but there is no equivalent measurement for a
-vector — the widest access, the one with alignment-requiring ISA forms, and the case
-where an emulator is least trustworthy about what silicon does.
-[#2687](https://github.com/briar-systems/mach/issues/2687) carries the other half, a
-lane-dependent vector footprint through aggregate layout and ABI classification. This
-is a sequencing decision and is expected to be lifted, not a permanent rule.
+measurement is what `#[packed]` rests on.
+
+The vector measurement now exists too. `int/surface/unaligned-vector` stores and
+loads `i32x4`, `f32x4`, `i32x3` and `f32x3` at deliberately misaligned offsets,
+checks every lane by hand against a byte image rather than through the access being
+measured, and asserts a sentinel in the bytes on both sides of each extent. It is
+**correct in both profiles on every native leg**: `linux-arm64` on `ubuntu-24.04-arm`,
+which is the row that matters because aarch64 has 128-bit forms with alignment
+requirements, plus `linux` and `windows` on x86-64. Nothing faults, no lane is
+dropped, and no neighbouring byte is disturbed. `linux-riscv64` also passes but is
+not evidence: it runs under qemu-user, and riscv64 declares no 128-bit vector
+support, so the access there is a scalar expansion rather than a vector access.
+
+What the refusal still waits on is the other half,
+[#2687](https://github.com/briar-systems/mach/issues/2687) — a lane-dependent vector
+footprint through aggregate layout and ABI classification. This is a sequencing
+decision and is expected to be lifted, not a permanent rule.
 
 **Interface blocks.** `packed` cannot apply to a `#[uniform]` or `#[storage]` block:
 its member offsets are fixed by the std140 / std430 layout rules and emitted as

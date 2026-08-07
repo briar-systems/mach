@@ -569,7 +569,7 @@ fun encode_fp_mov(mi: *isa.Inst, buf: *enc.ByteBuf) i32 {
     # returning zero bytes the driver would report as the generic "produced no bytes",
     # matching encode_mem_operand's handling of the same class of backend bug.
     if (reg_is_xmm(dst)) {
-        val ld: R.Result[bool, str] = emit_float_load(@src1, dst.reg, w, buf);
+        val ld: R.Result[bool, str] = emit_float_reg_or_slot_load(@src1, dst.reg, w, buf);
         if (R.is_err[bool, str](ld)) { panic(R.unwrap_err[bool, str](ld)::*u8); }
         ret (buf.len - start)::i32;
     }
@@ -2952,17 +2952,17 @@ fun encode_mir_instr(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi
     # SSE op in place). like the compare family they reference no branch target or
     # relocatable symbol, so no fixup / reloc applies.
     if (is_mir_float_arith(mi.opcode)) {
-        ret encode_float_arith(f, mi, ?st.buf);
+        ret encode_float_arith(st, f, mi);
     }
     if (mi.opcode == mir.MIR_FCMP) {
-        ret encode_float_cmp(f, mi, ?st.buf);
+        ret encode_float_cmp(st, f, mi);
     }
     # a float negate survives selection keeping its MIR_FNEG opcode; the encoder
     # materializes the sign-bit XOR byte sequence here (the value seeded into the
     # destination register, XORPS against a width-selected sign mask), flipping the
     # IEEE-754 sign bit. it references no relocatable symbol.
     if (mi.opcode == mir.MIR_FNEG) {
-        ret encode_float_neg(f, mi, ?st.buf);
+        ret encode_float_neg(st, f, mi);
     }
     # a float register copy, a scalar float load / store, and a same-bank or
     # cross-bank bitcast all arrive as a plain MOV; the encoder dispatches the move
@@ -2976,7 +2976,17 @@ fun encode_mir_instr(st: *enc.EncodeState, f: *mir.MirFunction, fn_base: u32, mi
     # `encode_cvt` path has no memory form) and selecting the SS vs SD form from the
     # carried float-side width.
     if (is_mir_float_conv(mi.opcode)) {
-        ret encode_float_conv(f, mi, ?st.buf);
+        ret encode_float_conv(st, f, mi);
+    }
+
+    # a float constant moved into an XMM register arrives as a plain MOV and would
+    # otherwise take the generic move path below. it is dispatched here instead
+    # because materializing it mints a constant-pool symbol, and the generic path's
+    # relocation recording reads the MIR instruction's own operands - which never
+    # mention it. every other float move (register copy, spill, reload, bitcast)
+    # invents nothing and still falls through.
+    if (is_float_const_move(f, mi)) {
+        ret encode_float_const_mov(st, f, mi);
     }
 
     # division / remainder survive selection as a single `[RAX, divisor]`
@@ -3279,19 +3289,39 @@ fun float_alu_opcode(op: mir.MirOpcode, w: u8) u16 {
 #   - a frame slot (the allocator spilled the float vreg, or it is an addressed
 #     storage slot): a MOVSS / MOVSD reg <- `[rbp + off]` load;
 #   - an immediate (a float CONSTANT, whose raw bit pattern `lower_value` carried):
-#     the bit pattern is materialized into the R11 GP scratch (MOVABS) and moved
-#     into `xmm` with MOVQ - R11 is reserved from GP allocation, so no live value
-#     collides. x86-64 has no SSE immediate form, so a constant that is not already
-#     in memory costs this pair at every use. Routing them through a read-only
-#     constant pool instead - `mulsd xmm, [rip + .LCPI]` - was designed and
-#     measured in #2248 and deliberately NOT pursued: the performance program it
-#     belonged to (#2199) COMPLETED its goals, and the pool was separately judged
-#     not worth reopening it for. #2248 is closed not-planned and holds the design,
-#     the measurement, and the reopen decision.
+#     resolved through `float_const_operand` into either a register-zeroing XORPS
+#     or a `[rip + .Lconst.N]` load out of the module's constant pool.
 # `w` is 4 (f32, MOVSS) or 8 (f64, MOVSD). a GP-register operand would mean a float
 # value the allocator placed in the wrong bank - rejected loudly rather than
 # mis-encoded
-fun emit_float_load(op: isa.Operand, xmm: i32, w: u8, buf: *enc.ByteBuf) R.Result[bool, str] {
+fun emit_float_load(st: *enc.EncodeState, op: isa.Operand, xmm: i32, w: u8) R.Result[bool, str] {
+    if (op.kind != isa.OPK_IMM) { ret emit_float_reg_or_slot_load(op, xmm, w, ?st.buf); }
+
+    val cr: R.Result[isa.Operand, str] = float_const_operand(st, op.imm::u64, xmm, w);
+    if (R.is_err[isa.Operand, str](cr)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](cr)); }
+    val src: isa.Operand = R.unwrap_ok[isa.Operand, str](cr);
+    # a zeroed register IS the value; nothing is left to move.
+    if (src.kind == isa.OPK_NONE) { ret R.ok[bool, str](true); }
+
+    var mov_op: u16 = x64.MOVSD;
+    if (w == 4) { mov_op = x64.MOVSS; }
+    var ld: isa.Inst = isa.inst_blank();
+    ld.opcode = mov_op;
+    ld.dst    = isa.make_reg(xmm, 16);
+    ld.src1   = src;
+    ld.size   = w;
+    ret encode_inst_sym(st, ?ld);
+}
+
+# load a float that is ALREADY in a register or a frame slot into `xmm`
+#
+# The half of the load that needs no encode state: it emits one MOVSS / MOVSD and
+# invents no symbol, so the generic move path - which reaches the encoder with a
+# byte sink and nothing else - can use it. A float immediate is not modelled here
+# and never arrives: `encode_instruction` routes an XMM-destination constant move
+# to `encode_float_const_mov` before the generic path can see it, because pooling
+# the constant mints a symbol whose relocation only the encode state can record
+fun emit_float_reg_or_slot_load(op: isa.Operand, xmm: i32, w: u8, buf: *enc.ByteBuf) R.Result[bool, str] {
     var mov_op: u16 = x64.MOVSD;
     if (w == 4) { mov_op = x64.MOVSS; }
 
@@ -3313,23 +3343,129 @@ fun emit_float_load(op: isa.Operand, xmm: i32, w: u8, buf: *enc.ByteBuf) R.Resul
         encode_inst(?mv, buf);
         ret R.ok[bool, str](true);
     }
-    if (op.kind == isa.OPK_IMM) {
-        var mi_imm: isa.Inst = isa.inst_blank();
-        mi_imm.opcode = x64.MOVABS;
-        mi_imm.dst    = isa.make_reg(x64.R11, 8);
-        mi_imm.src1   = isa.make_imm(op.imm, 8);
-        mi_imm.size   = 8;
-        encode_inst(?mi_imm, buf);
+    ret R.err[bool, str]("encode: float operand is not a register or a frame slot");
+}
 
-        var mq: isa.Inst = isa.inst_blank();
-        mq.opcode = x64.MOVQ;
-        mq.dst    = isa.make_reg(xmm, 16);
-        mq.src1   = isa.make_reg(x64.R11, 8);
-        mq.size   = 8;
-        encode_inst(?mq, buf);
-        ret R.ok[bool, str](true);
+# resolve a float constant's bit pattern into the operand an SSE instruction reads
+# it from
+#
+# The one place x86-64 decides how a float constant is materialized, so the load,
+# the seed, and a folded arithmetic source all take the same decision rather than
+# three copies of it.
+#
+# Two outcomes. All-zero bits become `XORPS xmm, xmm` and the returned operand is
+# NONE, meaning the value is already in `zero_reg` and no move follows: that is one
+# instruction, no memory reference, and no relocation, which no pool entry can
+# beat - so pooling a zero would be a pessimisation and is not done. Anything else
+# is interned into the module's pool and returned as `[rip + .Lconst.N]`, which the
+# caller either loads from or names directly as an SSE memory source.
+#
+# Pooling every non-zero constant is unconditional and needs no use-count rule
+# here, because on x86-64 it is never a loss even at one use: there is no SSE
+# immediate form at all, so the alternative is `movabs` + `movq` (15 bytes, two
+# instructions, and a GP scratch) against a folded 8-byte memory operand.
+# ---
+# st:       the encode state owning the pool
+# bits:     the constant's raw bit pattern, as `lower_value` carried it
+# zero_reg: the XMM register an all-zero constant is materialized into
+# w:        4 for an f32 constant, 8 for an f64
+# ret:      the `[rip + sym]` source operand, or NONE when `zero_reg` now holds it
+fun float_const_operand(st: *enc.EncodeState, bits: u64, zero_reg: i32, w: u8) R.Result[isa.Operand, str] {
+    var pattern: u64 = bits;
+    if (w == 4) { pattern = bits & 0xFFFFFFFF; }
+
+    if (pattern == 0) {
+        var zero: isa.Inst = isa.inst_blank();
+        zero.opcode = x64.XORPS;
+        zero.dst    = isa.make_reg(zero_reg, 16);
+        zero.src1   = isa.make_reg(zero_reg, 16);
+        zero.size   = 16;
+        encode_inst(?zero, ?st.buf);
+        ret R.ok[isa.Operand, str](isa.make_none());
     }
-    ret R.err[bool, str]("encode: float operand is not a register, frame slot, or immediate");
+
+    val sr: R.Result[intern.StrId, str] = enc.intern_float_const(st, pattern, w);
+    if (R.is_err[intern.StrId, str](sr)) { ret R.err[isa.Operand, str](R.unwrap_err[intern.StrId, str](sr)); }
+
+    var mem: isa.Operand = isa.make_mem(-1, 0, -1, 0, w);
+    mem.sym_id = R.unwrap_ok[intern.StrId, str](sr);
+    ret R.ok[isa.Operand, str](mem);
+}
+
+# the constant-pool symbol a float operand references, or STR_NIL when it
+# references none
+#
+# `sym_id` has no "unset" spelling - `operand_blank` leaves it 0, which is a valid
+# interned id - so the question is answered from the addressing form instead. In
+# the float encode paths the base-less, index-less rip form can only be one
+# `float_const_operand` produced: an XMM value is a register operand, a spilled one
+# is an `[rbp + off]` slot, and a MIR symbol operand never reaches these helpers
+fun const_ref_sym(op: *isa.Operand) intern.StrId {
+    if (is_rip_mem(op)) { ret op.sym_id; }
+    ret intern.STR_NIL;
+}
+
+# encode one instruction and record the relocation a rip-relative operand naming a
+# symbol needs
+#
+# The encoder-synthesized counterpart of the reloc recording `encode_instruction`
+# does for a MIR symbol operand: a constant-pool reference is invented here, not
+# carried on the MIR instruction, so `classify_refs` cannot see it and the patch
+# site has to be recorded where the bytes are emitted. The addend rule is the same
+# one - the PC correction from the disp32 field to the end of the instruction, so
+# `S + A - P` resolves to `S - next_ip`.
+#
+# An instruction with no symbol-naming rip operand encodes exactly as it would
+# through `encode_inst`, so a caller can route every instruction it emits through
+# this without knowing which of them reference the pool.
+# ---
+# st: the encode state receiving the bytes and the relocation
+# mi: the instruction to encode
+# ret: ok(true) on success, or an error naming the failure
+fun encode_inst_sym(st: *enc.EncodeState, mi: *isa.Inst) R.Result[bool, str] {
+    val start: usize = st.buf.len;
+    val n: i32 = encode_inst(mi, ?st.buf);
+    if (n <= 0) {
+        ret R.err[bool, str]("encode: a constant-pool reference produced no bytes");
+    }
+
+    var sym: intern.StrId = const_ref_sym(?mi.dst);
+    if (sym == intern.STR_NIL) { sym = const_ref_sym(?mi.src1); }
+    if (sym == intern.STR_NIL) { ret R.ok[bool, str](true); }
+
+    val reloc_off: i32 = x86_reloc_offset(nil, mi, n);
+    if (reloc_off < 0) {
+        ret R.err[bool, str]("encode: a symbol-naming instruction has no relocation patch site");
+    }
+    ret enc.push_reloc(st, (start + reloc_off::usize)::u32, of.RK_PC32, sym, -(n - reloc_off));
+}
+
+# whether an instruction moves a float CONSTANT into an XMM register
+#
+# The exact shape `encode_fp_mov`'s immediate arm used to serve: after register
+# allocation the destination is a physical register in the XMM bank and the source
+# is the constant's raw bit pattern as an immediate. A float move between registers
+# or slots, and an integer immediate move to a GP register, both answer false
+fun is_float_const_move(f: *mir.MirFunction, mi: *mir.MirInstr) bool {
+    if (mi.opcode::u16 != x64.MOV::u16) { ret false; }
+    if (mi.operand_count < 2)           { ret false; }
+    val dst: *mir.MirOperand = ?mi.operands[0];
+    val src: *mir.MirOperand = ?mi.operands[1];
+    if (src.kind != mir.MIR_OP_IMM)  { ret false; }
+    if (dst.kind != mir.MIR_OP_PREG) { ret false; }
+    ret isa.regid_class(dst.preg::i32) == isa.REG_CLASS_ID_XMM;
+}
+
+# materialize a float constant into its allocated XMM register
+#
+# One `movss` / `movsd` out of the constant pool, or an `XORPS` for a zero. The
+# width comes from the instruction rather than the register, because an XMM
+# register is 16 bytes wide whatever the value in it is
+fun encode_float_const_mov(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
+    var w: u8 = mi.width;
+    if (w != 4 && w != 8) { w = 8; }
+    ret emit_float_load(st, isa.make_imm(mi.operands[1].imm, w),
+                        mi.operands[0].preg::i32, w);
 }
 
 # the XMM register a float operation computes in. x86-64
@@ -3346,20 +3482,32 @@ fun float_work_reg(dst: isa.Operand) i32 {
 # operand, skipping the copy when the operand already resolves to that register -
 # the float analogue of `encode_binary`'s `skip_mov`, and what makes an
 # allocator-tied `dst == lhs` pair emit the bare SSE operation with no move at all
-fun emit_float_seed(op: isa.Operand, xmm: i32, w: u8, buf: *enc.ByteBuf) R.Result[bool, str] {
+fun emit_float_seed(st: *enc.EncodeState, op: isa.Operand, xmm: i32, w: u8) R.Result[bool, str] {
     if (op.kind == isa.OPK_REG && op.reg == xmm) { ret R.ok[bool, str](true); }
-    ret emit_float_load(op, xmm, w, buf);
+    ret emit_float_load(st, op, xmm, w);
 }
 
 # resolve a float operand to a source form the SSE two-operand
 # encodings can name in place. an XMM register and a frame slot are both native
 # source operands (`mulss xmm, xmm` / `mulss xmm, [rbp + off]`), so they are used as
-# they stand; only a float immediate, which x86-64 has no SSE form for, is
-# materialized - into `scratch`
-fun float_src_operand(op: isa.Operand, scratch: i32, w: u8, buf: *enc.ByteBuf) R.Result[isa.Operand, str] {
+# they stand.
+#
+# a float immediate becomes the pool's `[rip + .Lconst.N]`, which is also a native
+# SSE memory source, so the constant is FOLDED INTO THE OPERATION rather than
+# staged: `mulsd xmm, [rip + .Lconst.0]` in place of `movabs r11 ; movq xmm, r11 ;
+# mulsd xmm, xmm`. that is the whole of #2248's win, and the reason `scratch` is
+# consumed only by the zero constant, which materializes into it with an XORPS
+fun float_src_operand(st: *enc.EncodeState, op: isa.Operand, scratch: i32, w: u8) R.Result[isa.Operand, str] {
     if (op.kind == isa.OPK_REG || op.kind == isa.OPK_MEM) { ret R.ok[isa.Operand, str](op); }
+    if (op.kind == isa.OPK_IMM) {
+        val cr: R.Result[isa.Operand, str] = float_const_operand(st, op.imm::u64, scratch, w);
+        if (R.is_err[isa.Operand, str](cr)) { ret cr; }
+        val c: isa.Operand = R.unwrap_ok[isa.Operand, str](cr);
+        if (c.kind == isa.OPK_NONE) { ret R.ok[isa.Operand, str](isa.make_reg(scratch, 16)); }
+        ret R.ok[isa.Operand, str](c);
+    }
 
-    val ld: R.Result[bool, str] = emit_float_load(op, scratch, w, buf);
+    val ld: R.Result[bool, str] = emit_float_load(st, op, scratch, w);
     if (R.is_err[bool, str](ld)) { ret R.err[isa.Operand, str](R.unwrap_err[bool, str](ld)); }
     ret R.ok[isa.Operand, str](isa.make_reg(scratch, 16));
 }
@@ -3370,23 +3518,23 @@ fun float_src_operand(op: isa.Operand, scratch: i32, w: u8, buf: *enc.ByteBuf) R
 # with the left operand before the operation reads its source, so a `dst == rhs`
 # assignment would otherwise read back the seeded value. must be emitted BEFORE the
 # seed for exactly that reason
-fun float_rhs_operand(rhs: isa.Operand, work: i32, w: u8, buf: *enc.ByteBuf) R.Result[isa.Operand, str] {
+fun float_rhs_operand(st: *enc.EncodeState, rhs: isa.Operand, work: i32, w: u8) R.Result[isa.Operand, str] {
     if (rhs.kind == isa.OPK_REG && rhs.reg == work) {
-        val ld: R.Result[bool, str] = emit_float_load(rhs, FLOAT_SCRATCH1, w, buf);
+        val ld: R.Result[bool, str] = emit_float_load(st, rhs, FLOAT_SCRATCH1, w);
         if (R.is_err[bool, str](ld)) { ret R.err[isa.Operand, str](R.unwrap_err[bool, str](ld)); }
         ret R.ok[isa.Operand, str](isa.make_reg(FLOAT_SCRATCH1, 16));
     }
-    ret float_src_operand(rhs, FLOAT_SCRATCH1, w, buf);
+    ret float_src_operand(st, rhs, FLOAT_SCRATCH1, w);
 }
 
 # resolve a float operand the encoder must name as a REGISTER
 # (the ModRM reg operand of UCOMIS and of every CVT form, neither of which has a
 # memory-operand encoding here). an XMM register is used as it stands; a frame slot
 # or an immediate is loaded into `scratch` first
-fun float_reg_operand(op: isa.Operand, scratch: i32, w: u8, buf: *enc.ByteBuf) R.Result[i32, str] {
+fun float_reg_operand(st: *enc.EncodeState, op: isa.Operand, scratch: i32, w: u8) R.Result[i32, str] {
     if (op.kind == isa.OPK_REG) { ret R.ok[i32, str](op.reg); }
 
-    val ld: R.Result[bool, str] = emit_float_load(op, scratch, w, buf);
+    val ld: R.Result[bool, str] = emit_float_load(st, op, scratch, w);
     if (R.is_err[bool, str](ld)) { ret R.err[i32, str](R.unwrap_err[bool, str](ld)); }
     ret R.ok[i32, str](scratch);
 }
@@ -3435,7 +3583,7 @@ fun emit_float_store(dst: isa.Operand, xmm: i32, w: u8, buf: *enc.ByteBuf) R.Res
 # the destination - so no float value ever needs a GP register (#2237).
 #
 # the width (`mi.width`: 4 for f32, 8 for f64) selects the SS vs SD form throughout
-fun encode_float_arith(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) R.Result[bool, str] {
+fun encode_float_arith(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 3) {
         ret R.err[bool, str]("encode: float arithmetic missing operands");
     }
@@ -3455,14 +3603,15 @@ fun encode_float_arith(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf
     val rhs: isa.Operand = R.unwrap_ok[isa.Operand, str](rr);
 
     val work: i32 = float_work_reg(dst);
+    val buf: *enc.ByteBuf = ?st.buf;
 
     # resolve the source before seeding: staging an aliasing source must happen while
     # the working register still holds it.
-    val rs: R.Result[isa.Operand, str] = float_rhs_operand(rhs, work, w, buf);
+    val rs: R.Result[isa.Operand, str] = float_rhs_operand(st, rhs, work, w);
     if (R.is_err[isa.Operand, str](rs)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](rs)); }
     val src: isa.Operand = R.unwrap_ok[isa.Operand, str](rs);
 
-    val sd: R.Result[bool, str] = emit_float_seed(lhs, work, w, buf);
+    val sd: R.Result[bool, str] = emit_float_seed(st, lhs, work, w);
     if (R.is_err[bool, str](sd)) { ret sd; }
 
     var alu: isa.Inst = isa.inst_blank();
@@ -3470,7 +3619,8 @@ fun encode_float_arith(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf
     alu.dst    = isa.make_reg(work, 16);
     alu.src1   = src;
     alu.size   = w;
-    encode_inst(?alu, buf);
+    val ae: R.Result[bool, str] = encode_inst_sym(st, ?alu);
+    if (R.is_err[bool, str](ae)) { ret ae; }
 
     if (dst.kind == isa.OPK_REG) { ret R.ok[bool, str](true); }
     ret emit_float_store(dst, work, w, buf);
@@ -3496,7 +3646,7 @@ fun float_sign_mask(w: u8) i64 {
 # place. the width (`mi.width`: 4 for f32, 8 for f64) selects the f32 vs f64 sign
 # mask. XORPS (a 128-bit bitwise XOR) is correct for both widths: the mask only sets
 # the value's sign bit in the low lane and the XOR is purely bitwise
-fun encode_float_neg(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) R.Result[bool, str] {
+fun encode_float_neg(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 2) {
         ret R.err[bool, str]("encode: float negate missing operands");
     }
@@ -3514,7 +3664,8 @@ fun encode_float_neg(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) 
 
     # seed the working register with the value.
     val work: i32 = float_work_reg(dst);
-    val ld: R.Result[bool, str] = emit_float_seed(src, work, w, buf);
+    val buf: *enc.ByteBuf = ?st.buf;
+    val ld: R.Result[bool, str] = emit_float_seed(st, src, work, w);
     if (R.is_err[bool, str](ld)) { ret ld; }
 
     # materialize the sign-bit mask into FLOAT_SCRATCH1 via the R11 GP scratch.
@@ -3754,10 +3905,11 @@ fun emit_u64_to_fp(dst: isa.Operand, work: i32, dst_w: u8, cvt_op: u16, buf: *en
 # 64-bit conversion needs a range-fixup sequence x86-64 lacks a single instruction
 # for; the signed form is correct for every value in signed range, which is what the
 # language's reachable conversions produce, and matches the prior selection.
-fun encode_float_conv(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) R.Result[bool, str] {
+fun encode_float_conv(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 2) {
         ret R.err[bool, str]("encode: float conversion missing operands");
     }
+    val buf: *enc.ByteBuf = ?st.buf;
     val op: mir.MirOpcode = mi.opcode;
     val dst_w: u8 = mi.width;
     val src_w: u8 = mi.src_width;
@@ -3771,7 +3923,7 @@ fun encode_float_conv(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf)
         if (R.is_err[isa.Operand, str](rs)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](rs)); }
         val src: isa.Operand = R.unwrap_ok[isa.Operand, str](rs);
 
-        val sr: R.Result[i32, str] = float_reg_operand(src, FLOAT_SCRATCH1, src_w, buf);
+        val sr: R.Result[i32, str] = float_reg_operand(st, src, FLOAT_SCRATCH1, src_w);
         if (R.is_err[i32, str](sr)) { ret R.err[bool, str](R.unwrap_err[i32, str](sr)); }
         val src_reg: i32 = R.unwrap_ok[i32, str](sr);
         val work: i32 = float_work_reg(dst);
@@ -3818,7 +3970,7 @@ fun encode_float_conv(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf)
     if (R.is_err[isa.Operand, str](rs)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](rs)); }
     val src: isa.Operand = R.unwrap_ok[isa.Operand, str](rs);
 
-    val sr: R.Result[i32, str] = float_reg_operand(src, FLOAT_SCRATCH0, src_w, buf);
+    val sr: R.Result[i32, str] = float_reg_operand(st, src, FLOAT_SCRATCH0, src_w);
     if (R.is_err[i32, str](sr)) { ret R.err[bool, str](R.unwrap_err[i32, str](sr)); }
     val src_reg: i32 = R.unwrap_ok[i32, str](sr);
     var cvt_op: u16 = x64.CVTTSD2SI;
@@ -3896,10 +4048,11 @@ fun float_setcc_opcode(cc: u8) u16 {
 #     the parity flag is folded in - `==` is ordered-and-equal (ZF & !PF), `!=` is
 #     unordered-or-unequal (!ZF | PF) - by capturing PF into the reserved R11 scratch
 #     (SETNP / SETP) and combining it with the primary byte (AND / OR) before MOVZX.
-fun encode_float_cmp(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) R.Result[bool, str] {
+fun encode_float_cmp(st: *enc.EncodeState, f: *mir.MirFunction, mi: *mir.MirInstr) R.Result[bool, str] {
     if (mi.operand_count < 3) {
         ret R.err[bool, str]("encode: float comparison missing operands");
     }
+    val buf: *enc.ByteBuf = ?st.buf;
     val w: u8 = mi.width;
     if (w != 4 && w != 8) {
         ret R.err[bool, str]("internal compiler error: float comparison has a non-float operand width (expected 4 or 8)");
@@ -3929,10 +4082,10 @@ fun encode_float_cmp(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) 
         second = lhs;
     }
 
-    val fr: R.Result[i32, str] = float_reg_operand(first, FLOAT_SCRATCH0, w, buf);
+    val fr: R.Result[i32, str] = float_reg_operand(st, first, FLOAT_SCRATCH0, w);
     if (R.is_err[i32, str](fr)) { ret R.err[bool, str](R.unwrap_err[i32, str](fr)); }
     val first_reg: i32 = R.unwrap_ok[i32, str](fr);
-    val sr: R.Result[isa.Operand, str] = float_src_operand(second, FLOAT_SCRATCH1, w, buf);
+    val sr: R.Result[isa.Operand, str] = float_src_operand(st, second, FLOAT_SCRATCH1, w);
     if (R.is_err[isa.Operand, str](sr)) { ret R.err[bool, str](R.unwrap_err[isa.Operand, str](sr)); }
     val second_op: isa.Operand = R.unwrap_ok[isa.Operand, str](sr);
 
@@ -3943,7 +4096,8 @@ fun encode_float_cmp(f: *mir.MirFunction, mi: *mir.MirInstr, buf: *enc.ByteBuf) 
     ucom.dst  = isa.make_reg(first_reg, 16);
     ucom.src1 = second_op;
     ucom.size = w;
-    encode_inst(?ucom, buf);
+    val ue: R.Result[bool, str] = encode_inst_sym(st, ?ucom);
+    if (R.is_err[bool, str](ue)) { ret ue; }
 
     # SETcc dst  (one byte; the NaN-false UNSIGNED condition from the FCC_* code)
     var setcc: isa.Inst = isa.inst_blank();
@@ -7752,7 +7906,9 @@ fun xmm_op(idx: i32) mir.MirOperand {
 test "mach.lang.target.isa.x64.encode.encode_float_arith:two_address_shapes" {
     var alloc: A.Allocator;
     page.make(?alloc);
-    var buf: enc.ByteBuf = enc.buf_init(?alloc);
+    var st: enc.EncodeState;
+    enc.state_blank(?st, ?alloc);
+    val buf: *enc.ByteBuf = ?st.buf;
     var f: mir.MirFunction;
     var bad: i32 = 0;
 
@@ -7761,7 +7917,7 @@ test "mach.lang.target.isa.x64.encode.encode_float_arith:two_address_shapes" {
     mops[0] = xmm_op(x64.XMM2); mops[1] = xmm_op(x64.XMM0); mops[2] = xmm_op(x64.XMM1);
     var mul: mir.MirInstr = mir.instr(mir.MIR_FMUL, ?mops[0], 3, 4, 0);
     buf.len = 0;
-    encode_float_arith(?f, ?mul, ?buf);
+    encode_float_arith(?st, ?f, ?mul);
     if (buf.len != 8)         { bad = 1; }
     or (buf.data[0] != 0xF3)  { bad = 1; }
     or (buf.data[1] != 0x0F)  { bad = 1; }
@@ -7777,7 +7933,7 @@ test "mach.lang.target.isa.x64.encode.encode_float_arith:two_address_shapes" {
     aops[0] = xmm_op(x64.XMM3); aops[1] = xmm_op(x64.XMM3); aops[2] = xmm_op(x64.XMM1);
     var add: mir.MirInstr = mir.instr(mir.MIR_FADD, ?aops[0], 3, 4, 0);
     buf.len = 0;
-    encode_float_arith(?f, ?add, ?buf);
+    encode_float_arith(?st, ?f, ?add);
     if (buf.len != 4)         { bad = 1; }
     or (buf.data[0] != 0xF3)  { bad = 1; }
     or (buf.data[1] != 0x0F)  { bad = 1; }
@@ -7791,7 +7947,7 @@ test "mach.lang.target.isa.x64.encode.encode_float_arith:two_address_shapes" {
     sops[0] = xmm_op(x64.XMM1); sops[1] = xmm_op(x64.XMM0); sops[2] = xmm_op(x64.XMM1);
     var sub: mir.MirInstr = mir.instr(mir.MIR_FSUB, ?sops[0], 3, 4, 0);
     buf.len = 0;
-    encode_float_arith(?f, ?sub, ?buf);
+    encode_float_arith(?st, ?f, ?sub);
     if (buf.len != 14)         { bad = 1; }
     or (buf.data[0]  != 0xF3)  { bad = 1; }
     or (buf.data[1]  != 0x44)  { bad = 1; }   # REX.R: the reg field names XMM15
@@ -7815,7 +7971,7 @@ test "mach.lang.target.isa.x64.encode.encode_float_arith:two_address_shapes" {
     dops[2] = mir.op_mem_preg(x64.RBP::u32, -8);
     var dv: mir.MirInstr = mir.instr(mir.MIR_FDIV, ?dops[0], 3, 8, 0);
     buf.len = 0;
-    encode_float_arith(?f, ?dv, ?buf);
+    encode_float_arith(?st, ?f, ?dv);
     if (buf.len != 9)         { bad = 1; }
     or (buf.data[0] != 0xF2)  { bad = 1; }
     or (buf.data[1] != 0x0F)  { bad = 1; }
@@ -7827,7 +7983,7 @@ test "mach.lang.target.isa.x64.encode.encode_float_arith:two_address_shapes" {
     or (buf.data[7] != 0x55)  { bad = 1; }   # ModRM mod=1 reg=xmm2 rm=rbp
     or (buf.data[8] != 0xF8)  { bad = 1; }   # disp8 = -8
 
-    enc.buf_dnit(?buf);
+    enc.buf_dnit(buf);
     ret bad;
 }
 
@@ -7837,7 +7993,9 @@ test "mach.lang.target.isa.x64.encode.encode_float_arith:two_address_shapes" {
 test "mach.lang.target.isa.x64.encode.encode_float_cmp:operands_in_place" {
     var alloc: A.Allocator;
     page.make(?alloc);
-    var buf: enc.ByteBuf = enc.buf_init(?alloc);
+    var st: enc.EncodeState;
+    enc.state_blank(?st, ?alloc);
+    val buf: *enc.ByteBuf = ?st.buf;
     var f: mir.MirFunction;
     var bad: i32 = 0;
 
@@ -7846,7 +8004,7 @@ test "mach.lang.target.isa.x64.encode.encode_float_cmp:operands_in_place" {
     gops[0] = mir.op_preg(x64.RAX::u32); gops[1] = xmm_op(x64.XMM0); gops[2] = xmm_op(x64.XMM1);
     var gt: mir.MirInstr = mir.instr(mir.MIR_FCMP, ?gops[0], 3, 4, mir.FCC_GT);
     buf.len = 0;
-    encode_float_cmp(?f, ?gt, ?buf);
+    encode_float_cmp(?st, ?f, ?gt);
     if (buf.len != 10)        { bad = 1; }
     or (buf.data[0] != 0x0F)  { bad = 1; }   # ucomiss xmm0, xmm1
     or (buf.data[1] != 0x2E)  { bad = 1; }
@@ -7858,13 +8016,13 @@ test "mach.lang.target.isa.x64.encode.encode_float_cmp:operands_in_place" {
     lops[0] = mir.op_preg(x64.RAX::u32); lops[1] = xmm_op(x64.XMM0); lops[2] = xmm_op(x64.XMM1);
     var lt: mir.MirInstr = mir.instr(mir.MIR_FCMP, ?lops[0], 3, 4, mir.FCC_LT);
     buf.len = 0;
-    encode_float_cmp(?f, ?lt, ?buf);
+    encode_float_cmp(?st, ?f, ?lt);
     if (buf.len != 10)        { bad = 1; }
     or (buf.data[0] != 0x0F)  { bad = 1; }   # ucomiss xmm1, xmm0
     or (buf.data[1] != 0x2E)  { bad = 1; }
     or (buf.data[2] != 0xC8)  { bad = 1; }
 
-    enc.buf_dnit(?buf);
+    enc.buf_dnit(buf);
     ret bad;
 }
 
