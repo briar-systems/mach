@@ -14,7 +14,13 @@
 # pipeline re-runs mem2reg immediately afterward (so a caller alloca whose address
 # only stops escaping once a callee is inlined gets promoted to SSA), then a late
 # constfold / algebraic / cse / constfold / dce sweep to tidy it. Recursive
-# functions and calls reaching through inline asm are never inlined.
+# functions are never inlined.
+#
+# A callee containing inline asm IS inlined, and its `asm` statements ride across with
+# their bodies and `{name}` bindings intact (#2231). That removes the call an atomic
+# used to cost without touching what the block itself guarantees: the OP_ASM survives
+# into the caller, and every pass that could move memory around it treats OP_ASM
+# exactly as it treats OP_CALL.
 
 use std.allocator.page;
 use std.types.bool.bool;
@@ -186,12 +192,26 @@ fun callee_index(call: *instruction.Instruction) u32 {
 #
 # A direct call to a non-extern, non-recursive callee is inlined when the callee
 # is flagged INLINE, is small (under the instruction threshold), or is called
-# exactly once across the module. A callee containing inline asm is never
-# inlined: its OP_ASM payload lives in the callee's Function.asm map keyed by the
-# callee-side InstructionId, which the clone does not carry over, so inlining it
-# would silently drop the asm body. A recursion-cycle member is never inlined --
+# exactly once across the module. A recursion-cycle member is never inlined --
 # direct or mutual -- because inlining one re-introduces a call into the cycle
 # every iteration, leaving the budget as the only thing stopping the loop.
+#
+# A CALLEE CONTAINING INLINE ASM IS NOW INLINABLE (#2231), and it was not before for a
+# purely mechanical reason: the OP_ASM payload lives in `Function.asm_blocks` keyed by
+# the callee-side instruction id, and the clone carried only the pool entry, so the
+# body text would have been dropped. `ir.clone_asm_payload` carries it, remapping both
+# the key and each `{name}` binding's alloca, so the restriction is gone.
+#
+# WHAT THAT DOES NOT CHANGE IS THE MEMORY MODEL, and that is worth being explicit about
+# because it is the thing an inliner could plausibly break. Inlining removes the CALL;
+# the OP_ASM survives into the caller unchanged. Every middle-end pass that could move
+# memory keys on `instruction.is_pure`, which excludes OP_ASM exactly as it excludes
+# OP_CALL, and the two passes that name opcodes directly - `licm.mach`'s loop-hoisting
+# guard and `dependence.mach`'s memory-dependence walk - list both. So every barrier the
+# call provided, the asm statement provides in its place. The ordering behaviour of a
+# `std.sync.atomic` body is exactly as strong after inlining as before, which is the
+# only claim this change makes about it: `asm_op_is_barrier_like` pins that agreement
+# so a later edit cannot weaken OP_ASM without failing a test.
 # ---
 # recursive: per-function recursion-cycle flags, length function_len
 # counts:    live per-callee direct-call counts, length function_len
@@ -223,28 +243,9 @@ fun should_inline(recursive: *bool, counts: *u32, callee_ix: u32, callee: *ir.Fu
     if ((callee.flags & ir.FN_FLAG_NAKED) != 0)              { ret false; }
     if (recursive[callee_ix])                                { ret false; }
     if (callee.block_count == 0)                             { ret false; }
-    if (callee_has_asm(callee))                              { ret false; }
     if ((callee.flags & ir.FN_FLAG_INLINE) != 0)             { ret true; }
     if (callee_instr_count(callee) < INLINE_INSTR_THRESHOLD) { ret true; }
     if (counts[callee_ix] == 1)                              { ret true; }
-    ret false;
-}
-
-# true when the callee contains any OP_ASM instruction in its pool
-#
-# clone copies the whole instruction pool, so any OP_ASM -- live in a block or
-# orphaned by a prior pass -- would be carried over without its Function.asm
-# payload; refusing to inline such a callee preserves the asm intact.
-# ---
-# callee: the callee function
-# ret:    true when an OP_ASM instruction is present
-fun callee_has_asm(callee: *ir.Function) bool {
-    var i: u32 = 0;
-    for (i < callee.instr_len) {
-        val inst: *instruction.Instruction = ?callee.instrs[i];
-        if (inst.kind == instruction.OP_ASM) { ret true; }
-        i = i + 1;
-    }
     ret false;
 }
 
@@ -675,17 +676,16 @@ fun peel_all(m: *ir.Module, budget: *u32) R.Result[bool, str] {
 
 # whether a function is a candidate for the self-recursion peel
 #
-# Only a function with a body, no inline asm (the clone drops the asm payload), a size
-# under the inline threshold, and at least one live direct self-call is peeled. The asm
-# and size gates mirror should_inline; mutual recursion is never peeled because only the
-# direct self-call edge is expanded.
+# Only a function with a body, a size under the inline threshold, and at least one live
+# direct self-call is peeled. The size gate mirrors should_inline; mutual recursion is
+# never peeled because only the direct self-call edge is expanded. Inline asm is no
+# longer a gate: the snapshot carries the payload, so a peeled body keeps it (#2231).
 # ---
 # fn:   the function to test
 # f_ix: its index in the module
 # ret:  true when the function should be peeled
 fun peel_eligible(fn: *ir.Function, f_ix: u32) bool {
     if (fn.block_count == 0)                              { ret false; }
-    if (callee_has_asm(fn))                               { ret false; }
     if (callee_instr_count(fn) >= INLINE_INSTR_THRESHOLD) { ret false; }
     ret has_direct_self_call(fn, f_ix);
 }
@@ -799,6 +799,9 @@ fun build_snapshot(m: *ir.Module, fn: *ir.Function, snap: *ir.Function) R.Result
         if (R.is_err[id.InstructionId, str](rc)) { ret R.err[bool, str](R.unwrap_err[id.InstructionId, str](rc)); }
         val rd: R.Result[bool, str] = ir.clone_dbg_metadata(m, fn, snap, i::id.InstructionId, i::id.InstructionId);
         if (R.is_err[bool, str](rd)) { ret rd; }
+        # the ids are identical here, so the asm payload's bindings need no remap.
+        val ra: R.Result[bool, str] = ir.clone_asm_payload(m, fn, snap, i::id.InstructionId, i::id.InstructionId, nil, 0);
+        if (R.is_err[bool, str](ra)) { ret ra; }
         i = i + 1;
     }
 
@@ -952,6 +955,11 @@ fun stamp_inline_metadata(m: *ir.Module, cx: *InlineCtx, call_loc: source.SrcLoc
         # inlined local keeps its name/type; the #1707 producer nests it under its instance.
         val rc: R.Result[bool, str] = ir.clone_dbg_metadata(m, callee, caller, i::id.InstructionId, cloned_iid);
         if (R.is_err[bool, str](rc)) { if (site_map != nil) { A.deallocate[u32](m.alloc, site_map, (nsite + 1)::usize); } ret rc; }
+        # and the inline-asm body, whose payload is the other instruction-keyed side
+        # table. without this an inlined `asm` statement arrives with no body (#2231).
+        val ra: R.Result[bool, str] = ir.clone_asm_payload(m, callee, caller, i::id.InstructionId, cloned_iid,
+                                                          cx.instr_map, callee.instr_len);
+        if (R.is_err[bool, str](ra)) { if (site_map != nil) { A.deallocate[u32](m.alloc, site_map, (nsite + 1)::usize); } ret ra; }
         i = i + 1;
     }
     if (site_map != nil) { A.deallocate[u32](m.alloc, site_map, (nsite + 1)::usize); }
