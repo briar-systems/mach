@@ -950,6 +950,11 @@ produce_macho_got() {
 # Both tables carry the dylib in the second-to-last column and the symbol in the
 # last, so one rule reads either; a data row is recognized by its leading segment
 # name, which no header line has.
+#
+# The sort is pinned to the C collation, as produce_pe_imports's is: a dylib list
+# mixing cases (`libSystem`, `libcurses`) orders differently under a UTF-8 locale
+# than under C, so an unpinned sort makes the golden depend on the runner's
+# environment rather than on the emitted image.
 produce_macho_imports() {
     _runmode=$1
     _target=$2
@@ -959,7 +964,7 @@ produce_macho_imports() {
     lazy=$(macho_objdump --macho --lazy-bind "$bin") || return 2
     printf '%s\n%s\n' "$binds" "$lazy" |
         awk '$1 ~ /^__/ && NF >= 5 { print $(NF-1) ":" $NF }' |
-        sort -u
+        LC_ALL=C sort -u
 }
 
 # produce_macho_abs_bind <runmode> <target> <binary>
