@@ -456,7 +456,7 @@ the same entries, so nothing behaves differently as a dependency.
 | `name`    | shape | Library/framework name — required for `source = "system"`/`"framework"`, forbidden for `"local"`. |
 | `path`    | shape | File path — required for `source = "local"`, forbidden otherwise. A template (see below). |
 | `library` | no | Stable logical name used by `#[library("...")]`; defaults to the `[link.<name>]` table name. |
-| `symbols` | no | Array of symbol names this dependency provides, attributing imports that have no `ext` declaration to decorate (see below). Omit for none. |
+| `symbols` | no | Array of symbol names this dependency provides, attributing imports that have no `ext` declaration to decorate (see below). Written as **source-level** names; the target's C symbol prefix is applied by Mach. Omit for none. |
 | `os`      | yes | Filter axis: a canonical `os` value, `"*"` (any), an array of values, or `[]` (none). |
 | `isa`     | yes | Filter axis over `isa`, same forms. |
 | `abi`     | yes | Filter axis over `abi`, same forms. |
@@ -499,6 +499,16 @@ isa     = "*"
 abi     = "*"
 export  = true
 ```
+
+Each name is written the way you would write it in **source**, without the
+target's C symbol prefix. Mach applies that prefix itself, exactly as it does for
+an `ext fun` declaration, so `symbols = ["Sleep"]` attributes the `Sleep` a Linux
+or Windows object names and the `_Sleep` a Mach-O object names, and one manifest
+is correct on every target. The prefix is only ever added, never stripped: `_exit`
+is a real C symbol whose Mach-O object spelling is `__exit`, so "already
+prefixed" is not something a spelling can be checked for. Writing the mangled
+form yourself therefore does not work — on darwin `symbols = ["_Sleep"]` claims
+`__Sleep`, which nothing imports.
 
 Nothing reads a library's export table to derive this, so the claim is what makes
 cross-linking a PE from a Linux host work with no target DLL present. Claims
