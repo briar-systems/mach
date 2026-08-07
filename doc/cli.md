@@ -258,9 +258,13 @@ Two declarations supply it:
 Both write the same attribution, so a symbol may be claimed only once: a
 `symbols` entry that contradicts another entry's claim, or a `#[library]`
 decorator's, is an error naming both claimants rather than a silent
-order-dependent win. Repeating an identical claim is accepted, which is what an
+order-dependent win. The same holds between two `#[library]` decorators: two
+`ext` declarations resolving to one link name under different libraries are an
+error naming both declarations, so no attribution is decided by module load
+order. Repeating an identical claim is accepted, which is what an
 `export = true` entry reaching a consumer through both the cascade and its own
-manifest does.
+manifest does, and what two modules declaring the same binding under the same
+library do.
 
 On ELF the loader resolves imports by global search, so neither declaration
 changes the emitted binary; both are still validated against the link's

@@ -8,6 +8,7 @@
 # and `ext` import libraries onto the session. Sits above the load walk it
 # drives, below the facade orchestration that invokes it.
 
+use std.collections.map;
 use std.collections.sort;
 use std.collections.vector;
 use std.format;
@@ -394,24 +395,55 @@ fun register_module_export_names(p: *project.Project, mid: session.ModuleId) R.R
     ret scan_export_directives(p, mid, source, mod_node.decls_start, mod_node.decls_len);
 }
 
+# the declaration one `#[library(...)]` attribution came from, so a second,
+# contradicting attribution of the same link name can name both
+# ---
+# module: declaring module's FQN
+# decl:   declaration's bare source identifier
+# lib:    the library it pinned the import to
+rec ImportAttribution {
+    module: intern.StrId;
+    decl:   intern.StrId;
+    lib:    intern.StrId;
+}
+
 # project the per-decl `#[library(...)]` attributions
 # (keyed by decl) onto the session's link-name-keyed `import_libraries` map. run
 # after every `#[symbol]`/`#[library]` decorator and `ext fun` default is recorded,
 # so each import's final link name is settled. for every `ext` decl pinned to a
 # library, the binding `<final link name> -> <library>` lets the back-end linker
 # route the import to a specific PE import descriptor rather than the first one
+#
+# a link name is attributed at most once. two declarations pinning one name to
+# different libraries are a hard error naming both, matching the manifest claim
+# paths (#2510) - the session map overwrites on a repeated key, so without this
+# the emitted import table would depend on module load order (#2529). an
+# identical repeat is accepted, exactly as a repeated manifest claim is.
 pub fun register_import_libraries(p: *project.Project) R.Result[bool, str] {
+    var attrs: map.Map[intern.StrId, ImportAttribution] =
+        map.init[intern.StrId, ImportAttribution](p.alloc, map.hash_u32, map.eq_u32);
     var i: u32 = 0;
     for (i < p.module_len) {
         val m: *project.ModuleEntry = ?p.modules[i];
         val m_opt: O.Option[*module.Module] = ast.get_module(m.a, m.a.root_module);
         if (O.is_some[*module.Module](m_opt)) {
             val mod_node: *module.Module = O.unwrap[*module.Module](m_opt);
-            val r: R.Result[bool, str] = bind_import_libraries(p, i::session.ModuleId, mod_node.decls_start, mod_node.decls_len);
-            if (R.is_err[bool, str](r)) { ret r; }
+            val src_opt: O.Option[*src.SourceFile] = src.get(?p.s.sources, m.file_id);
+            if (O.is_none[*src.SourceFile](src_opt)) {
+                map.dnit[intern.StrId, ImportAttribution](?attrs);
+                ret R.err[bool, str]("internal: loaded module has no source text");
+            }
+            val source: str = O.unwrap[*src.SourceFile](src_opt).text;
+            val r: R.Result[bool, str] = bind_import_libraries(p, i::session.ModuleId,
+                source, ?attrs, mod_node.decls_start, mod_node.decls_len);
+            if (R.is_err[bool, str](r)) {
+                map.dnit[intern.StrId, ImportAttribution](?attrs);
+                ret r;
+            }
         }
         i = i + 1;
     }
+    map.dnit[intern.StrId, ImportAttribution](?attrs);
     ret R.ok[bool, str](true);
 }
 
@@ -420,8 +452,11 @@ pub fun register_import_libraries(p: *project.Project) R.Result[bool, str] {
 # pinned by a `#[library(...)]` decorator, record `<final link name> -> <library>`
 # on the session. the final link name is the decl's `export_name` (the `#[symbol]`
 # value when present, else the bare identifier), so the key matches the object
-# symbol the linker later sees
-fun bind_import_libraries(p: *project.Project, mid: session.ModuleId, start: u32, len: u32) R.Result[bool, str] {
+# symbol the linker later sees. `attrs` carries each name's first attribution
+# across the whole walk so a contradicting second one is refused by name
+fun bind_import_libraries(p: *project.Project, mid: session.ModuleId, source: str,
+                          attrs: *map.Map[intern.StrId, ImportAttribution],
+                          start: u32, len: u32) R.Result[bool, str] {
     val m: *project.ModuleEntry = ?p.modules[mid::u32];
     var i: u32 = 0;
     for (i < len) {
@@ -434,12 +469,18 @@ fun bind_import_libraries(p: *project.Project, mid: session.ModuleId, start: u32
                 && (d.flags & decl.DECL_FLAG_EXT) != 0) {
                 val lib_opt: O.Option[intern.StrId] = session.export_library(p.s, mid, did::u32);
                 if (O.is_some[intern.StrId](lib_opt)) {
+                    # register_ext_fun / register_ext_global default every ext
+                    # decl's link name before this pass runs, so a decl carrying a
+                    # library but no name means that invariant broke upstream.
+                    # dropping the attribution here would silently unpin the import
                     val name_opt: O.Option[intern.StrId] = session.export_name(p.s, mid, did::u32);
-                    if (O.is_some[intern.StrId](name_opt)) {
-                        val r: R.Result[bool, str] = session.register_import_library(p.s,
-                            O.unwrap[intern.StrId](name_opt), O.unwrap[intern.StrId](lib_opt));
-                        if (R.is_err[bool, str](r)) { ret r; }
+                    if (O.is_none[intern.StrId](name_opt)) {
+                        ret R.err[bool, str]("internal: ext decl carries a #[library] attribution but no link name");
                     }
+                    val r: R.Result[bool, str] = bind_one_import_library(p, mid, source,
+                        attrs, d, O.unwrap[intern.StrId](name_opt),
+                        O.unwrap[intern.StrId](lib_opt));
+                    if (R.is_err[bool, str](r)) { ret r; }
                 }
             }
             or (d.kind == decl.DECL_KIND_COMPTIME_IF) {
@@ -447,7 +488,8 @@ fun bind_import_libraries(p: *project.Project, mid: session.ModuleId, start: u32
                 var bi: u32 = 0;
                 for (bi < ci.branches_len) {
                     val br: *decl.ComptimeBranch = ?m.a.comptime_branches[ci.branches_start + bi];
-                    val rb: R.Result[bool, str] = bind_import_libraries(p, mid, br.body_start, br.body_len);
+                    val rb: R.Result[bool, str] = bind_import_libraries(p, mid, source, attrs,
+                                                                       br.body_start, br.body_len);
                     if (R.is_err[bool, str](rb)) { ret rb; }
                     bi = bi + 1;
                 }
@@ -456,6 +498,83 @@ fun bind_import_libraries(p: *project.Project, mid: session.ModuleId, start: u32
         i = i + 1;
     }
     ret R.ok[bool, str](true);
+}
+
+# record one declaration's `<link name> -> <library>` attribution, refusing a
+# second declaration that pins the same link name to a different library
+#
+# The session map overwrites on a repeated key, so the alternative is an emitted
+# import table decided by module load order. An identical repeat is accepted for
+# the same reason a repeated manifest claim is: it names no second provider.
+# ---
+# p:      the project carrying the session that owns the attribution map
+# mid:    ModuleId owning the declaration
+# source: the module's source text, for the declaration's own identifier
+# attrs:  first-attribution record for every link name seen so far
+# d:      the `ext` declaration carrying the decorator
+# name:   the declaration's final link name (the map key)
+# lib:    the library the decorator pins it to
+# ret:    ok(true) once recorded, or the conflict as a user-facing string
+fun bind_one_import_library(p: *project.Project, mid: session.ModuleId, source: str,
+                            attrs: *map.Map[intern.StrId, ImportAttribution],
+                            d: *decl.Decl, name: intern.StrId,
+                            lib: intern.StrId) R.Result[bool, str] {
+    var here: ImportAttribution;
+    here.module = session.module_fqn(p.s, mid);
+    here.decl   = attribution_decl_name(p, source, d);
+    here.lib    = lib;
+
+    val prev: R.Result[*ImportAttribution, str] =
+        map.get[intern.StrId, ImportAttribution](attrs, ?name);
+    if (R.is_ok[*ImportAttribution, str](prev)) {
+        val had: *ImportAttribution = R.unwrap_ok[*ImportAttribution, str](prev);
+        if (had.lib == lib) { ret R.ok[bool, str](true); }
+        ret R.err[bool, str](attribution_conflict_message(p, name, had, ?here));
+    }
+
+    val ins: R.Result[bool, str] =
+        map.insert[intern.StrId, ImportAttribution](attrs, name, here);
+    if (R.is_err[bool, str](ins)) { ret ins; }
+    ret session.register_import_library(p.s, name, lib);
+}
+
+# the bare source identifier of an `ext` declaration, or STR_NIL when it cannot be
+# interned. only ever read by a diagnostic, so an unresolvable name degrades the
+# message rather than failing the build
+fun attribution_decl_name(p: *project.Project, source: str, d: *decl.Decl) intern.StrId {
+    var span: token.Span;
+    if (d.kind == decl.DECL_KIND_FUN) { span = d.data.fun_.name; }
+    or { span = d.data.bind.name; }
+    val r: R.Result[intern.StrId, str] = intern.intern_span(?p.s.interner, source, span);
+    if (R.is_err[intern.StrId, str](r)) { ret intern.STR_NIL; }
+    ret R.unwrap_ok[intern.StrId, str](r);
+}
+
+# name both declarations so the source edit that resolves the ambiguity is obvious
+fun attribution_conflict_message(p: *project.Project, name: intern.StrId,
+                                 first: *ImportAttribution,
+                                 second: *ImportAttribution) str {
+    val n:  O.Option[str] = intern.lookup(?p.s.interner, name);
+    val am: O.Option[str] = intern.lookup(?p.s.interner, first.module);
+    val ad: O.Option[str] = intern.lookup(?p.s.interner, first.decl);
+    val al: O.Option[str] = intern.lookup(?p.s.interner, first.lib);
+    val bm: O.Option[str] = intern.lookup(?p.s.interner, second.module);
+    val bd: O.Option[str] = intern.lookup(?p.s.interner, second.decl);
+    val bl: O.Option[str] = intern.lookup(?p.s.interner, second.lib);
+    if (!O.is_some[str](n) || !O.is_some[str](am) || !O.is_some[str](ad)
+        || !O.is_some[str](al) || !O.is_some[str](bm) || !O.is_some[str](bd)
+        || !O.is_some[str](bl)) {
+        ret "one import is attributed to two libraries by #[library]";
+    }
+    val r: R.Result[str, str] = str_join(p.s.build_alloc,
+        "import '", O.unwrap[str](n), "' is attributed to library '",
+        O.unwrap[str](al), "' by declaration '", O.unwrap[str](ad),
+        "' in module '", O.unwrap[str](am), "' and to library '",
+        O.unwrap[str](bl), "' by declaration '", O.unwrap[str](bd),
+        "' in module '", O.unwrap[str](bm),
+        "'; a symbol may name only one providing library");
+    if (R.is_err[str, str](r)) { ret R.unwrap_err[str, str](r); }
+    ret R.unwrap_ok[str, str](r);
 }
 
 # walk a decl list (recursing into comptime-if branch
