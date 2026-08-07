@@ -157,6 +157,14 @@ ext fun WSAStartup(ver: u16, data: *u8) i32;
   manifest instead, by the `symbols` key on the `[link.X]` entry that supplies
   it; see [manifest.md](../manifest.md#linkname--link-requirements). The two
   declarations write the same attribution, so a symbol may be claimed only once.
+- "Only once" is checked across every declaration, and two `#[library]`
+  decorators are no exception. Two `ext` declarations that resolve to the same
+  link name but name different libraries are a hard error identifying both
+  (`import '<sym>' is attributed to library '<a>' by declaration '<d>' in module
+  '<m>' and to library '<b>' by declaration ...`), so which library the import
+  table names never depends on module load order. Two declarations naming the
+  *same* library are accepted: they name one provider, which is what a shared
+  binding declared in two modules does.
 
 `library` composes with `symbol`: the rename sets the imported symbol's name,
 `library` sets the dependency it is imported from. On one decl the import is emitted
