@@ -2142,6 +2142,31 @@ fun report_expr(ctx: *context.LowerContext, eid: id.ExprId, message: str) R.Resu
 # e:    the resolved call node
 # argc: number of call-site type arguments
 # ret:  the owned type-argument sequence (nil when argc is 0), or an error
+# the field type a `f.type` generic argument names, read from the active `$each`
+# binding (#2691)
+#
+# None for every other type spelling, which keeps the caller on its stamped-type
+# path unchanged. The lookup itself is `comptime.field_type_of_binding`, the same
+# one sema uses, so a descriptor resolved at sema and the same descriptor resolved
+# here cannot land on different fields.
+# ---
+# ctx: per-module lowering context
+# tid: the syntactic type node of one generic argument
+# ret: some(field type) for a `f.type` spelling, none otherwise
+fun field_type_arg_of(ctx: *context.LowerContext, tid: id.TypeId) O.Option[type.TypeId] {
+    val t_opt: O.Option[*atype.Type] = ast.get_type(ctx.a, tid);
+    if (O.is_none[*atype.Type](t_opt)) { ret O.none[type.TypeId](); }
+    val t: *atype.Type = O.unwrap[*atype.Type](t_opt);
+    if (t.kind != atype.TYPE_KIND_FIELD_TYPE) { ret O.none[type.TypeId](); }
+
+    val r: R.Result[intern.StrId, str] =
+        intern.intern_span(?ctx.s.interner, context.module_source(ctx), t.data.field_type.var_name);
+    if (R.is_err[intern.StrId, str](r)) { ret O.none[type.TypeId](); }
+    val got: O.Option[u32] = comptime.field_type_of_binding(ctx.ctx, R.unwrap_ok[intern.StrId, str](r));
+    if (O.is_none[u32](got)) { ret O.none[type.TypeId](); }
+    ret O.some[type.TypeId](O.unwrap[u32](got)::type.TypeId);
+}
+
 fun collect_call_type_args(ctx: *context.LowerContext, e: *expr.Expr, argc: u32) R.Result[*type.TypeId, str] {
     if (argc == 0) { ret R.ok[*type.TypeId, str](nil); }
 
@@ -2156,7 +2181,18 @@ fun collect_call_type_args(ctx: *context.LowerContext, e: *expr.Expr, argc: u32)
             A.deallocate[type.TypeId](ctx.s.alloc, args, argc::usize);
             ret R.err[*type.TypeId, str]("lower: call type-argument index out of range");
         }
-        var at: type.TypeId = context.type_resolved_of(ctx, ctx.a.type_ids[pool_ix]);
+        # `f.type` (#2691) has no single stamped answer: it names whichever field the
+        # enclosing `$each` is on, so it is read from the live binding here the same
+        # way it is at sema. this path is what a walk over `$fields(T)` for a generic
+        # `T` needs, since that unroll is deferred to monomorphization and runs here.
+        var at: type.TypeId = type.TYPE_ERROR;
+        val ft: O.Option[type.TypeId] = field_type_arg_of(ctx, ctx.a.type_ids[pool_ix]);
+        if (O.is_some[type.TypeId](ft)) {
+            at = O.unwrap[type.TypeId](ft);
+        }
+        or {
+            at = context.type_resolved_of(ctx, ctx.a.type_ids[pool_ix]);
+        }
         if (ctx.subst != nil && ctx.subst_len > 0) {
             at = generics.substitute(ctx.s, at, ctx.subst, ctx.subst_len);
         }
@@ -3279,16 +3315,33 @@ fun lower_array_lit(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) R
     ret R.ok[value.Value, str](value.retype(slot, arr_ir));
 }
 
-# lower a full-arity vector literal `f32x4{a, b, c, d}` (#1965)
+# lower a full-arity vector literal `f32x4{a, b, c, d}` (#1965, #2640)
 #
-# The lanes are assembled through backing storage of the vector's OWN type and
-# loaded back as the vector value. Allocating `[lanes]elem` instead would have the
-# same 16-byte layout, but it makes the load a reinterpretation of the allocation
-# through its pointer: the slot is an array and the load reads a vector. A target
-# under a logical addressing model gives a pointer exactly one pointee type and has
-# no pointer bitcast, so it cannot express that at all (#2640). The lane gep and the
-# whole-vector load of a vector-typed slot are the same shape lane assignment onto a
-# `var` already lowers to, so nothing downstream is new.
+# Two shapes, chosen by a declared machine-model capability.
+#
+# A target that builds a whole vector from its lanes in one step (`has_vec_build` -
+# SPIR-V's OpCompositeConstruct) gets `OP_VEC_BUILD`: the literal is a VALUE, with no
+# alloca, no store and no load. Every other target keeps assembling it through
+# backing storage of the vector's OWN type, which is what this did before and is
+# byte-for-byte the same code below, so nothing about those targets changes.
+#
+# The capability is read HERE rather than legalized away in a later pass, and that is
+# deliberate. `OP_VEC_EXTRACT` / `OP_VEC_INSERT` are user-visible operations - `v[0]`
+# and `v[1] = x` - so they must exist in the IR whatever the target can encode, and
+# `me.pass.scalarize.expand_lane_ops` is what makes that true. A literal is not an
+# operation, it is a CONSTRUCTION, and how it is built is a free choice with no
+# source-level spelling to preserve. Choosing the representation where the choice is
+# actually made keeps the alternative from being introduced and then immediately
+# undone for four targets out of five. It is the same shape as the `flat_addressing`
+# gate on float address materialization (#2655).
+#
+# Why the storage form is not simply removed: the value form needs an
+# `OP_VEC_BUILD`, and the obvious alternative - an `OP_VEC_INSERT` chain from a zero
+# vector - is not expressible, because that zero would have to be a vector-typed
+# constant VALUE and there is none (#2700). Why the storage form allocates at the
+# vector's own type rather than `[lanes]elem`: the latter has the same 16-byte layout
+# but makes the load a reinterpretation of the allocation through its pointer, which
+# a logical-addressing target cannot express at all.
 # ---
 # ctx: per-module lowering context
 # eid: the vector-literal expression (supplies the vector type)
@@ -3308,6 +3361,28 @@ fun lower_vector_lit(ctx: *context.LowerContext, eid: id.ExprId, e: *expr.Expr) 
     val res_xty: R.Result[ir_type.IrTypeId, str] = index_type(ctx);
     if (R.is_err[ir_type.IrTypeId, str](res_xty)) { ret R.err[value.Value, str](R.unwrap_err[ir_type.IrTypeId, str](res_xty)); }
     val xty: ir_type.IrTypeId = R.unwrap_ok[ir_type.IrTypeId, str](res_xty);
+
+    # the value form: the lanes are the operands, so they are evaluated into a small
+    # buffer first. 16 covers every shape, since a mach vector is 128 bits and its
+    # narrowest lane is 8.
+    if (ctx.tgt != nil && ctx.tgt.model.has_vec_build) {
+        if (e.data.vector_lit.elems_len > 16) {
+            ret R.err[value.Value, str]("lower: vector literal has more lanes than any 128-bit vector");
+        }
+        var lanes: [16]value.Value;
+        var li: u32 = 0;
+        for (li < e.data.vector_lit.elems_len) {
+            val lpool_ix: u32 = e.data.vector_lit.elems_start + li;
+            if (lpool_ix::usize >= ctx.a.expr_id_len) {
+                ret R.err[value.Value, str]("lower: vector literal element index out of range");
+            }
+            val lres: R.Result[value.Value, str] = lower_rvalue(ctx, ctx.a.expr_ids[lpool_ix]);
+            if (R.is_err[value.Value, str](lres)) { ret lres; }
+            lanes[li] = R.unwrap_ok[value.Value, str](lres);
+            li = li + 1;
+        }
+        ret builder.emit_vec_build(?ctx.builder, vec_ir, ?lanes[0], e.data.vector_lit.elems_len);
+    }
 
     val res_slot: R.Result[value.Value, str] = builder.emit_alloca(?ctx.builder, vec_ir, value.const_int(1, xty));
     if (R.is_err[value.Value, str](res_slot)) { ret res_slot; }
