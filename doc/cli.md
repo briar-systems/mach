@@ -261,7 +261,9 @@ decorator's, is an error naming both claimants rather than a silent
 order-dependent win. The same holds between two `#[library]` decorators: two
 `ext` declarations resolving to one link name under different libraries are an
 error naming both declarations, so no attribution is decided by module load
-order. Repeating an identical claim is accepted, which is what an
+order. Declarations under different arms of one `$if` chain are exempt: no target
+selects both arms, so they never both apply. Repeating an identical claim is
+accepted, which is what an
 `export = true` entry reaching a consumer through both the cascade and its own
 manifest does, and what two modules declaring the same binding under the same
 library do.
