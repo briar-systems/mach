@@ -2196,9 +2196,11 @@ produce_vector_emit() {
     dis_case_objects vector-emit "$3" | vector_emit_scan
 }
 
-# dis_case_objects <producer> <binary>
+# dis_case_objects <producer> <binary> [objdump-flag]
 # disassemble the case's OWN module objects (not its dependencies') to stdout, the
-# shared front half of every emitted-shape producer.
+# shared front half of every emitted-shape producer. the optional third argument is
+# one extra objdump flag - `-r`, for a producer whose observable is which SYMBOL an
+# instruction references rather than which instruction it is.
 #
 # the objects rather than the linked binary: mach's linker emits no symbol table, so
 # per-function attribution exists only before the link. they sit beside the artifact
@@ -2208,6 +2210,7 @@ produce_vector_emit() {
 dis_case_objects() {
     who=$1
     bin=$2
+    extra=${3:-}
     dir=$(dirname "$(dirname "$(dirname "$bin")")")
     id=$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$dir/mach.toml" | head -1)
     if [ -z "$id" ]; then
@@ -2221,7 +2224,7 @@ dis_case_objects() {
         echo "int: $who: llvm-objdump not found (install the 'llvm' package)" >&2; return 2
     }
     find "$objdir" -name '*.o' | sort | while IFS= read -r o; do
-        "$tool" -d --no-show-raw-insn "$o"
+        "$tool" -d --no-show-raw-insn ${extra:+"$extra"} "$o"
     done
 }
 
@@ -2243,6 +2246,94 @@ dis_case_objects() {
 # pins the release profile and keeps its kernels under register pressure.
 produce_float_emit() {
     dis_case_objects float-emit "$3" | float_emit_scan
+}
+
+# produce_const_pool <runmode> <target> <binary>
+# the CONSTANT-POOL observable (#2248, #2700): which pool entries the module holds
+# and which of them each function references.
+#
+# the same argument as vector-emit and float-emit. a back end that stops pooling
+# rebuilds every constant from instructions and still computes exactly the right
+# answer, so a run-and-compare case is vacuously green against it; and a pool whose
+# interning key stopped deduplicating emits one entry per USE while every value it
+# loads stays correct. neither is visible in a result, only in the emitted shape.
+#
+# two facts, kept in separate accumulators so neither can mask the other:
+#   entries=<n>       distinct pool entries in the module - the dedup observable. a
+#                     key that stopped merging raises it; one that merged too much
+#                     lowers it, and the sibling exec case then reports a wrong value
+#   <fn> pool=<n>     distinct entries the function references - the pooling
+#                     observable. a back end that reverted to rebuilding drops it to
+#                     zero, and a constant the cost rule declines to pool (a zero,
+#                     or a pattern one instruction builds) never contributes to it
+#
+# a reference is counted by NAME, not by relocation record, so the number means the
+# same thing on all three ISAs: x86-64 spells one reference as a single PC32 against
+# a rip-relative operand, while aarch64 and riscv64 each spell it as a HI/LO
+# relocation pair. needs llvm-objdump.
+produce_const_pool() {
+    dis_case_objects const-pool "$3" -r | const_pool_scan
+}
+
+# const_pool_scan — read a `-d -r` disassembly on stdin and print the pool observable
+const_pool_scan() {
+    awk '
+    function demangle(s,   i, len, c, out) {
+        if (substr(s, 1, 2) != "_M") { return s }
+        i = 3
+        out = ""
+        while (i <= length(s)) {
+            c = substr(s, i, 1)
+            if (c == "N") { i++; continue }
+            if (c !~ /[0-9]/) { return s }
+            len = 0
+            while (i <= length(s) && substr(s, i, 1) ~ /[0-9]/) { len = len * 10 + substr(s, i, 1); i++ }
+            out = substr(s, i, len)
+            i += len
+        }
+        if (out == "") { return s }
+        return out
+    }
+    /file format/ {
+        if      ($0 ~ /x86-64/)   { isa = "x86_64" }
+        else if ($0 ~ /aarch64/)  { isa = "aarch64" }
+        else if ($0 ~ /riscv/)    { isa = "riscv64" }
+        else                      { bad = $0 }
+        # a pool symbol name is per-MODULE, so the same name in two objects is two
+        # entries. qualify every name with the object it came from before counting.
+        obj++
+        next
+    }
+    /^[0-9a-f]+ <.*>:$/ {
+        sym = $0
+        sub(/^[0-9a-f]+ </, "", sym)
+        sub(/>:$/, "", sym)
+        sym = demangle(sym)
+        if (!(sym in seen)) { names[++n] = sym; seen[sym] = 1 }
+        cur = sym
+        next
+    }
+    cur != "" && /R_[A-Z0-9_]+[[:space:]]+\.Lconst\./ {
+        ref = $0
+        sub(/^.*[[:space:]]/, "", ref)
+        sub(/[-+].*$/, "", ref)
+        key = obj ":" ref
+        if (!((cur SUBSEP key) in fnref)) { fnref[cur, key] = 1; fncount[cur]++ }
+        if (!(key in allref))             { allref[key] = 1; entries++ }
+    }
+    END {
+        if (bad != "") { print "int: const-pool: scan hit an unrecognized object format (" bad ")" > "/dev/stderr"; exit 2 }
+        for (i = 2; i <= n; i++) {
+            k = names[i]
+            j = i - 1
+            while (j >= 1 && names[j] > k) { names[j + 1] = names[j]; j-- }
+            names[j + 1] = k
+        }
+        print "arch=" isa
+        print "entries=" entries + 0
+        for (i = 1; i <= n; i++) { print names[i] " pool=" fncount[names[i]] + 0 }
+    }
+    '
 }
 
 # vector_emit_scan — `<function> simd|scalar` per function (see emit_scan)
@@ -2503,6 +2594,7 @@ produce() {
         vector-lanes) produce_vector_lanes "$@" ;;
         frame-elision) produce_frame_elision "$@" ;;
         float-emit)  produce_float_emit "$@" ;;
+        const-pool)  produce_const_pool "$@" ;;
         *) echo "int: unknown run mode '$run'" >&2; return 2 ;;
     esac
 }
