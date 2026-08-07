@@ -38,6 +38,8 @@ A decorator is written as an attribute:
 #[scalar]            # opt out of auto-vectorization (no arguments)
 #[naked]             # no prologue or epilogue; body as written (no arguments)
 #[embed("path")]     # compile-time file embedding (val only)
+#[stage("name")]     # GPU pipeline stage; makes the function an entry point
+#[workgroup(x,y,z)]  # compute workgroup dimensions (with #[stage("compute")])
 ```
 
 Decorators appear **before** the declaration they target, one per line or
@@ -346,6 +348,66 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
   [manifest.md](../manifest.md#stepname--build-steps) for the equivalent
   guarantee on `[step]` `in` entries.
 
+### `stage(str)` — GPU pipeline stage
+
+Marks a function as the entry point of a graphics or compute pipeline stage. The
+argument names the stage and the set is closed:
+
+| Value        | Stage                     |
+|--------------|---------------------------|
+| `"vertex"`   | vertex shader             |
+| `"fragment"` | fragment (pixel) shader   |
+| `"compute"`  | compute shader            |
+
+An unrecognized value is a compile error, not a module that quietly forms no
+stage.
+
+```mach
+#[stage("vertex")]
+fun vertex_main() { }
+
+#[stage("fragment")]
+fun fragment_main() { }
+```
+
+A staged function **takes no parameters and returns nothing**. A pipeline stage
+does not have a caller: its inputs arrive through input interface variables and
+its results leave through output ones, so there is no argument list or return
+value to carry them. A staged function with either is rejected.
+
+The decorator is accepted on every target, because which target a module is built
+for is not a property of its source. Only a target that has pipeline stages acts
+on it: on `spirv` a staged function becomes an `OpEntryPoint` with the matching
+execution model, and on a machine target the stage is ignored and the function is
+compiled normally.
+
+A module that declares any stage is a **shader module**, and that changes the whole
+artifact rather than just the one function. A shader module carries entry points
+and no external linkage at all; a module with no stage is a **library module**,
+which publishes each function as a linkage export so a consumer can find it. The
+two are exclusive — a Vulkan consumer refuses a module carrying linkage — so
+adding the first `#[stage(...)]` to a module stops it exporting its functions.
+
+The entry point's name, as a pipeline-creation call looks it up, is the function's
+**bare source name** (`vertex_main` above), not a mangled linker symbol. A shader
+module has no linker symbols to mangle.
+
+### `workgroup(x, y, z)` — compute workgroup dimensions
+
+Sizes the workgroup of a `#[stage("compute")]` function. The three arguments are
+comptime integers giving the x, y and z dimensions.
+
+```mach
+#[stage("compute")] #[workgroup(64, 1, 1)]
+fun compute_main() { }
+```
+
+It requires a stage on the same function — without one it would silently mean
+nothing — and it applies only to the compute stage. When it is omitted, a compute
+stage takes the single-invocation default `(1, 1, 1)`; the dimensions are always
+declared in the emitted module, since a compute stage that does not state its
+workgroup size is not one a consumer can dispatch.
+
 ## Applicability
 
 | Directive   | `fun` | `ext fun` | `val` / `var` | `rec` / `uni` |
@@ -360,6 +422,8 @@ val SECTOR: [512]u8;      # length pinned; a size change fails the build
 | `scalar`    |  yes  |    no     |      no       |      no       |
 | `naked`     |  yes  |    no     |      no       |      no       |
 | `embed`     |  no   |    no     |      yes      |      no       |
+| `stage`     |  yes  |    no     |      no       |      no       |
+| `workgroup` |  yes  |    no     |      no       |      no       |
 
 The `val` / `var` column is shared, but `embed` accepts only `val` — a `var`
 is refused (see [`embed`](#embedstr--compile-time-file-embedding) above).
@@ -375,4 +439,5 @@ The set is closed. New directives require a compiler change.
 - [asm.md](asm.md) — inline `asm`, the only body a `naked` function may have
 - [val-var.md](val-var.md) — `val` / `var` bindings, and the `embed` exemption to `val`'s initializer requirement
 - [grammar.md](grammar.md#types) — the `[_]` inferred array length `embed` introduces
+- [types.md](types.md) — the SIMD vector types a shader stage computes over
 - [../manifest.md](../manifest.md) — the `vectorize` profile key `scalar` opts out of, and content-fingerprinted build inputs (`embed`, `[step]` `in`)
