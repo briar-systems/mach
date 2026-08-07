@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+#### A sub-width vector can cross a function boundary (#2687)
+4.15.0 shipped `f32x3` working inside a function and refused at every call boundary. Passing or returning one reported `CLASS_FP scalar of unsupported size`, which made the shape unusable in practice: a shader-math or vertex-building library is nothing but functions taking and returning these.
+
+The cause was the same one #2697 fixed one layer down, and there turned out to be **three** layers of it. A value's register width and its memory footprint are different numbers that agreed for every vector until lane-derived layout made them differ, and each layer answered both questions with one fixed-size ladder:
+
+- `op_width_of` fell through to the general-purpose word, losing lanes (fixed in 4.15.0)
+- `fp_move_width` refused outright, which was honest and total
+- `encode_fp_mov` **silently narrowed** a 12-byte move to 8
+
+The middle one was masking the third. Widening it alone compiled and then dropped the top lane of every stack-passed vector with no diagnostic. So the ABI now asks the two questions separately: a register move uses the target's vector width, and every register-to-memory access uses the value's own extent through the scratch round trip, because no ISA here can issue a 12-byte access and the encoder quietly narrows one that claims to.
+
+Classified per target from `MachineModel` facts rather than assumed to follow x86-64, and **nothing is refused**. Apple aarch64 is the case that breaks the obvious fix: it gives a fixed stack argument its natural size, so the slot is exactly 12 bytes with the next argument packed against it.
+
+The SPIR-V half of #2687 remains open.
+
 ## [4.15.0] - 2026-08-07
 
 ### Added
