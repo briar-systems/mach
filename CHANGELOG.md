@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+#### `^` is stripped only where the question is about storage (#2692)
+
+**This is a contract change, and the contract it changes was unsound.**
+
+`comptime-intrinsics.md` documented `^` as stripped before a shape predicate answers, so `^Pair` was a record. `$fields(^Pair)` refuses, and the doc's own descent idiom pairs the two:
+
+```mach
+$if ($is_record(f.type)) {
+    $each g in $fields(f.type) { ... }   # descend
+} $or { ... }
+```
+
+The rule and its counterexample were nine lines apart in the same section. For a `^`-wrapped record field the gate answered yes and the intrinsic it gates then refused the same operand, so a walk written exactly as prescribed failed with `$fields requires a record type` — a message asserting the operand is not a record, immediately after a predicate said it was. No gate could prevent it, because no predicate distinguished `^Inner` from `Inner`.
+
+`$is_record` / `$is_union` / `$is_pointer` now answer about the **outermost** constructor, and `^` is a constructor. All three answer false for `^T`, so a reflection walk refuses a secret rather than descending into secret storage. `$type_name` stops stripping too and spells `^Pair` — its stated purpose is to be the spelling diagnostics print, and a diagnostic prints `^Pair`, so stripping was a drift on the one qualifier where drift matters most.
+
+That leaves one rule for the whole surface: **`^` is stripped only where the question is about storage.** `$size_of` / `$align_of` / `$offset_of` strip, because storage is exactly what they ask. Nothing else does.
+
+Outermost means outermost, which is `type.is_secret` and not `type.carries_secret`: `^*u8` is a secret pointer and answers false, while `*^u8` is a public pointer to secret storage and is still a pointer. `Box[^u64]` is a record, because the instance is not itself secret — its field is, and the field is where a walk meets the question.
+
+**Why this direction rather than making `$fields` accept `^Rec`.** Under that alternative a walk descends into a secret record and each leaf action meets the secrecy gates on its own: formatting is refused at the variadic boundary, comparison is refused as a branch on a secret, hashing is refused as a cast that drops `^`. All true — and a memberwise **copy** is accepted, correctly, since secret to secret is what the lattice permits. Safety would then be a property of which leaf actions happen to exist rather than of the contract, and the next walk whose leaf touches no gate descends into a secret with nothing to stop it. Refusing at the gate puts the guarantee in the contract.
+
+Reasoning by analogy to #2297 (field resolution) and #2373 (cast width) is what produced the old rule. Those are storage questions — a secret occupies its base type's storage and has its base type's fields — and stripping is right for both. A predicate that gates a walk is not a storage question, and carrying the analogy across is the defect.
+
+A walk still has to classify **positively** for this to refuse rather than skip: gate on the shapes you handle and refuse the fallthrough, which is what `std.derive` does and what the docs now prescribe. Because all three predicates answer false for `^T`, "nothing classifies it" is a usable secrecy signal on its own.
+
+Blast radius: no user-level consumer in this repo. In mach-std every consumer is `std.derive`, where a `^`-wrapped record field now fails with derive's own written message instead of the raw intrinsic error.
+
 ## [4.12.0] - 2026-08-07
 
 **Contains a critical correctness fix. Anyone on 4.11.0 or earlier should upgrade.**
